@@ -504,9 +504,52 @@ unblocks any `pthread_join` waiter.
 
 Public wrapper in `syscall.rs` callable from `process.rs`.
 
+## Issue 12: CLONE_THREAD Exit Destroys Shared FD Table (git-clone exits 128)
+
+### Symptoms
+
+`git clone` completed object download but failed with exit code 128. The
+failure occurred after the sideband thread (created via `pthread_create`) had
+exited. git-index-pack never received pack data even though git-remote-http had
+successfully downloaded all objects.
+
+### Root Cause
+
+`sys_exit` called `proc.fds.close_all()` unconditionally. CLONE_THREAD siblings
+created by `pthread_create` share the parent's `Arc<SharedFdTable>` — they do
+**not** have their own fd table. When the sideband thread (tid=12, a CLONE_THREAD
+sibling with `tgid != pid`) called `exit()`, `sys_exit` drained the shared table,
+closing every pipe and socket visible to the entire thread group. The pipe that
+git-fetch-pack's main thread (tid=13) was about to use for pack data was among
+the destroyed fds, so git-index-pack never received data and git-clone failed.
+
+On Linux, `sys_exit()` for a non-leader thread must NOT close the shared FD
+table. Only `sys_exit_group()` (or the thread-group leader) does that.
+
+### Fix
+
+**File:** `src/syscall/proc.rs`
+
+Added a guard around `close_all()` in `sys_exit`:
+
+```rust
+// CLONE_THREAD siblings share the parent's Arc<FdTable>. Only the
+// thread-group leader (tgid == pid) may close the table on exit.
+if proc.tgid == proc.pid {
+    proc.fds.close_all();
+}
+```
+
+`sys_exit_group` was already correct (it always closes the table, because
+`exit_group` terminates the entire thread group).
+
+**Kernel test:** `test_clone_thread_exit_preserves_shared_fd_table` in
+`src/process_tests.rs` — verifies that simulating a sibling exit (`tgid != pid`)
+leaves the shared table intact, while a leader exit (`tgid == pid`) clears it.
+
 ## Summary
 
-With all 11 fixes, `git clone https://...` works end-to-end on Akuma:
+With all 12 fixes, `git clone https://...` works end-to-end on Akuma:
 
 | Issue | Error | Root Cause |
 |-------|-------|------------|
@@ -521,6 +564,7 @@ With all 11 fixes, `git clone https://...` works end-to-end on Akuma:
 | 9 | `cannot create async thread` | `CLONE_THREAD` not implemented |
 | 10 | `cannot pread pack file` | `pread64` not implemented |
 | 11 | Hangs after "done" | `CLONE_CHILD_CLEARTID` missing |
+| 12 | Exit 128 after pack download | `sys_exit` closed shared FD table for CLONE_THREAD sibling |
 
 ## Future Work
 

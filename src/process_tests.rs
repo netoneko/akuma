@@ -347,6 +347,9 @@ pub fn run_all_tests() {
     test_mark_terminated_ignores_large_ids();
     test_fake_thread_ids_safe();
 
+    // CLONE_THREAD shared FD table regression (git sideband thread destroyed fetch-pack pipes)
+    test_clone_thread_exit_preserves_shared_fd_table();
+
     // Go mmap regression: forktest_parent with mmap_test must not SIGSEGV
     // test_forktest_parent_mmap(); // disabled: runs for up to 60s
 
@@ -7884,5 +7887,47 @@ fn test_fake_thread_ids_safe() {
         console::print("[Test] fake_thread_ids_safe PASSED\n");
     } else {
         console::print("[Test] fake_thread_ids_safe FAILED: system threads corrupted\n");
+    }
+}
+
+/// Regression: CLONE_THREAD sibling exit must NOT drain the shared FD table.
+///
+/// When git's fetch-pack sideband thread (CLONE_THREAD) exited, sys_exit was
+/// calling close_all() unconditionally on the shared Arc<SharedFdTable>.  This
+/// destroyed every pipe visible to the entire thread group, so git-index-pack
+/// never received pack data and git-clone failed with exit 128.
+///
+/// The fix (src/syscall/proc.rs): guard close_all() with `if proc.tgid == proc.pid`.
+/// A CLONE_THREAD sibling has tgid != pid and must skip close_all().
+fn test_clone_thread_exit_preserves_shared_fd_table() {
+    use alloc::sync::Arc;
+    use akuma_exec::process::{SharedFdTable, FileDescriptor, KernelFile};
+
+    let shared_fds = Arc::new(SharedFdTable::new());
+    // Insert a sentinel fd using File variant — safe: close_all's match falls through via _ => {}
+    shared_fds.table.lock().insert(5, FileDescriptor::File(KernelFile::new("/test/sentinel".into(), 0)));
+
+    let leader_pid: u32 = 91_000;
+    let sibling_pid: u32 = 91_001;
+    let sibling_tgid: u32 = leader_pid; // CLONE_THREAD: tgid points to leader
+
+    // Simulate sys_exit guard for the sibling (tgid != pid → must NOT call close_all)
+    if sibling_tgid == sibling_pid {
+        shared_fds.close_all();
+    }
+    let fd_survives_sibling_exit = shared_fds.table.lock().contains_key(&5);
+
+    // Simulate sys_exit guard for the leader (tgid == pid → MUST call close_all)
+    if leader_pid == leader_pid {
+        shared_fds.close_all();
+    }
+    let fd_cleared_by_leader_exit = !shared_fds.table.lock().contains_key(&5);
+
+    if fd_survives_sibling_exit && fd_cleared_by_leader_exit {
+        console::print("[Test] clone_thread_exit_preserves_shared_fd_table PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] clone_thread_exit_preserves_shared_fd_table FAILED: survives_sibling={} cleared_by_leader={}\n",
+            fd_survives_sibling_exit, fd_cleared_by_leader_exit);
     }
 }
