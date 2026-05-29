@@ -216,7 +216,17 @@ pub(super) fn sys_exit(code: i32) -> u64 {
         // Close all fds NOW so the SharedFdTable is empty before the thread
         // terminates.  on_thread_cleanup → unregister_process → Box drop runs
         // in scheduler context; if close_all runs there, it can deadlock.
-        proc.fds.close_all();
+        //
+        // CLONE_THREAD (pthread) siblings share the parent's Arc<FdTable>.
+        // Calling close_all() here would drain the shared table and close
+        // every pipe and socket visible to the entire thread group — observed
+        // as git's sideband thread destroying all of fetch-pack's pipes on
+        // exit, so git-index-pack never receives pack data.  On Linux,
+        // sys_exit() for a non-leader thread must NOT close the shared FD
+        // table; only sys_exit_group() (or the last thread) does that.
+        if proc.tgid == proc.pid {
+            proc.fds.close_all();
+        }
         notify_child_channel_exited(pid, code);
         vfork_complete(pid);
 
