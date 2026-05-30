@@ -473,6 +473,9 @@ rustc shares/demotes the whole ~75k-page address space (~30 s `mmap` + ~32 s
 Both rewrite a critical path (a bug here breaks *all* process spawning), so they
 were deferred until the toolchain worked — which it now does.
 
+**Full analysis (cost breakdown, the O(n²) `munmap`, and a ranked fix plan):
+[`docs/COW_OPTIMIZATIONS.md`](COW_OPTIMIZATIONS.md).**
+
 ### 5c. Eager-copy (non-CoW) `fork` path only half-updated
 
 **Status: inert path, noted for consistency.** `fork_process` has a legacy
