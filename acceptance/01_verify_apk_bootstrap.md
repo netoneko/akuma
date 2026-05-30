@@ -64,7 +64,7 @@ ssh("apk add busybox")
 ### 6. Verify busybox works
 
 ```python
-ssh("busybox sh -c 'echo busybox OK'")
+ssh("busybox echo busybox OK")
 ```
 
 ## Expected Result
