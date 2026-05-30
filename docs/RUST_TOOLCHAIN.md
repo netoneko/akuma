@@ -1,8 +1,18 @@
 # Rust Toolchain (`rustc`) on Akuma — Missing Syscalls & Fixes
 
-Syscalls and kernel changes needed to run the Rust compiler (`rustc`, the
-`aarch64-alpine-linux-musl` toolchain) on Akuma, plus the known issues that
-still block a full compile-and-link.
+The Rust compiler (`rustc`, the `aarch64-alpine-linux-musl` toolchain) **runs
+end-to-end on Akuma**: as of 2026-05-31,
+`rustc -C linker=clang hello.rs -o /tmp/hello_rust` compiles, links via
+`clang-21`→`ld`, and the resulting binary executes (`/tmp/hello_rust` →
+`Hello from Akuma!`).
+
+This doc records the syscalls and kernel changes that got it there. The fixes
+landed in dependency order — each unblocked the next failure: `socketpair` (§1),
+the `lseek`/`readlinkat` EINVAL audit and `lseek`→`ESPIPE` fix (§4a), CLOEXEC
+close-on-success ordering (§4c), the multithreaded-`fork` address-space
+replication (§4b′), and `UnixSocket` routing in the socket recv/send syscalls
+(§4d). The only open item is **performance** (slow fork CoW — §5b); correctness
+is solid.
 
 ## Status
 
@@ -200,11 +210,11 @@ stale instance):
 
 ---
 
-## 3. Known remaining blockers (out of scope for the socketpair fix)
+## 3. Blockers found while bringing up the toolchain (all resolved)
 
-### 3a. Userspace `SIGSEGV` during link (older trace — now masked by §4)
+### 3a. Userspace `SIGSEGV` during link — RESOLVED (was the multithreaded-fork bug)
 
-An earlier trace, after `socketpair` succeeded and rustc forked to spawn the
+An early trace, after `socketpair` succeeded and rustc forked to spawn the
 linker, showed `rustc` (pid 77) hitting a userspace data abort:
 
 ```
@@ -213,19 +223,19 @@ linker, showed `rustc` (pid 77) hitting a userspace data abort:
 [Fault] Process 77 (rustc) SIGSEGV after 0.02s
 ```
 
-This is an **EL0 (userspace) fault** — the faulting PC (`~0x30048a90`) is in the
-musl/libc region and the accessed address (`0xf0f1a298`) maps to no region
-("WILD-DA"). It is *not* a kernel crash (the VM stayed up). **As of the
-2026-05-30 runs (§4) this is no longer the symptom reached** — the spawn now
-fails earlier, in the libstd `fork`+exec handshake (EBADF). Keep this note for
-history; revisit only once §4 is resolved.
+This `WILD-DA` (faulting PC `~0x30048a90` in `ld-musl`, accessed address mapping
+to no region) was later **caught live under gdb and identified as the
+multithreaded-`fork` bug** — the forked child walking musl's thread list into a
+sibling thread's stack that `fork` hadn't replicated. **Fixed in §4b′.** Kept
+here because this is the trace that first pointed at it.
 
 ### 3b. `clang` — installed and works for C
 
 The earlier claim that `clang` was not installed is **outdated**. `clang` is
-present and compiles C fine inside the VM (verified: `clang hello.c` produces a
-working binary). So `rustc -C linker=clang` does reach the linker — the current
-blocker is *not* a missing `clang`, it is the libstd spawn handshake (§4).
+present and compiles C fine inside the VM (verified: `clang hello.c` →
+`Hello, Akuma!`), and `rustc -C linker=clang` now drives it through to a working
+binary. The blocker was never a missing `clang` — it was the libstd spawn path
+(§4b′ + §4d), now fixed.
 
 ---
 
@@ -427,30 +437,41 @@ with no `EBADF`.
 
 ---
 
-## 5. Flagged but NOT fixed (open follow-ups)
+## 5. Follow-ups flagged during the investigation
 
-Issues surfaced during this investigation that were deliberately left unfixed,
-with the rationale. Listed worst-first.
+Issues surfaced while bringing up the toolchain that were deliberately *not*
+fixed in the main push, with the rationale and current status. With rustc now
+working end-to-end, the only genuinely open item is **5b (fork performance)**;
+the rest are resolved, intentional, or minor.
 
-### 5a. `SIGSEGV` during the actual link (`cc`/`ld` invocation) — §3a
+### 5a. `SIGSEGV` during the actual link (`cc`/`ld` invocation) — RESOLVED
 
-**Status: blocked, not skipped.** The older `WILD-DA` at `FAR=0xf0f1a298`/
-`ELR≈0x30048a90` (§3a) is unreachable until the spawn `fork` works, because the
-forked child SIGSEGVs *before* it can exec the linker (§4b′). Once the
-multithreaded-fork fix is confirmed end-to-end, the link will actually run and
-this is the next thing to check — it may reproduce, or it may have been the same
-fork bug observed one step earlier. Re-evaluate after a clean spawn.
+**Status: resolved.** This was the open question of whether the §3a `WILD-DA`
+would reproduce once the spawn `fork` worked. It did **not** — the `WILD-DA`
+*was* the multithreaded-fork bug (§4b′), and with that fixed the link runs to
+completion: `clang-21`→`ld` produces a working binary (verified 2026-05-31).
+There is no separate link-stage SIGSEGV.
 
-### 5b. Fully-faithful `fork` = page-table walk (not region enumeration)
+### 5b. `fork` memory-copy: performance (top open item) + robustness
 
-**Status: deferred (larger, higher blast radius).** §4b′ fixes the multithreaded
-`fork` by enumerating *tracked regions* (lazy-by-`tgid` + every sibling thread's
-eager `mmap_regions`). This still misses any present user page that no region
-tracks — e.g. internal TLS / `process_info` pages mapped outside `mmap_regions`.
-None are implicated in the rustc fault, but the robust long-term fix is a
-page-table walk that CoW-shares **every present user page** (matching Linux
-`fork` semantics), making fork independent of region bookkeeping. Deferred
-because it rewrites a critical path (a bug here breaks *all* process spawning).
+**Status: open — the main thing left.** Correct but slow. An end-to-end rustc
+compile takes ~3 min, dominated by the `fork` CoW: each `fork` of multithreaded
+rustc shares/demotes the whole ~75k-page address space (~30 s `mmap` + ~32 s
+`munmap` per the PSTATS). Two distinct follow-ups, somewhat opposed:
+
+- **Performance (priority):** a child that immediately `exec`s doesn't need a
+  full address-space copy at all. A vfork-style fast path (share, suspend the
+  parent thread, throw the copy away on `exec`) or coarser CoW (share whole
+  page-table subtrees by bumping refcounts on L1/L2 tables instead of per-page)
+  would cut the per-`fork` cost dramatically.
+- **Robustness (secondary):** §4b′ enumerates *tracked regions* (lazy-by-`tgid`
+  + sibling threads' eager `mmap_regions`), so it still misses any present page
+  no region tracks (internal TLS / `process_info` pages). None are implicated in
+  the rustc path, but a page-table walk that shares **every present user page**
+  would make `fork` independent of region bookkeeping.
+
+Both rewrite a critical path (a bug here breaks *all* process spawning), so they
+were deferred until the toolchain worked — which it now does.
 
 ### 5c. Eager-copy (non-CoW) `fork` path only half-updated
 

@@ -1,6 +1,6 @@
 # Akuma OS
 
-**Bare-metal AArch64 OS in Rust — preemptive kernel, Linux-compatible syscalls, SSH, containers, apk, TCC/Clang/GCC, JS runtime, Git**
+**Bare-metal AArch64 OS in Rust — preemptive kernel, Linux-compatible syscalls, SSH, containers, apk, TCC/Clang/GCC/rustc, JS runtime, Git**
 
 ```
                                              %#%:                +
@@ -87,6 +87,8 @@
 | Feature | Details |
 |---|---|
 | **C compiler (TCC)** | Tiny C Compiler with musl libc — compile and run C programs on-target |
+| **Rust compiler (rustc)** | Alpine `rustc` 1.91 runs on-target — `rustc -C linker=clang hello.rs` compiles, links via `clang`→`ld`, and produces a runnable native binary (needs ≥2 GB RAM). See [`docs/RUST_TOOLCHAIN.md`](docs/RUST_TOOLCHAIN.md) |
+| **C compiler (Clang/GCC)** | LLVM `clang`/`clang-21` and GCC/binutils (`cc`, `ld`, `as`) from Alpine apk |
 | **JavaScript (Bun)** | Bun runtime for running JS/TS scripts |
 | **JavaScript (QuickJS)** | ES2020 runtime — BigInt, Promises, async/await, console API |
 | **Git** | `git` from Alpine apk — `apk add git` |
