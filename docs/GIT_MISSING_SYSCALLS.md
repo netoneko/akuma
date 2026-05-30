@@ -612,9 +612,64 @@ remote-https). Once both exit and are reaped, `has_children` returns false and
 `wait4(-1)` returns `ECHILD`. git proceeds to rename the pack files and
 populate the working tree.
 
+## Issue 14: `futex_wake` Missed Private-Futex Waiters (pthread_join hangs again)
+
+### Symptoms
+
+After issues 11–13 were fixed, `git clone` hung again in some configurations.
+`pthread_join` blocked forever even though the child thread had exited and
+`clear_child_tid` had been written.
+
+### Root Cause
+
+Two related bugs:
+
+1. **`futex_wake` only woke the shared (tgid=0) queue.** The old signature
+   `futex_wake(uaddr, max_wake)` called `futex_do_wake(0, uaddr, ...)`.
+   musl's `pthread_join` uses `FUTEX_WAIT_PRIVATE`, which queues the waiter
+   under `(tgid, uaddr)` not `(0, uaddr)`. The wake call from
+   `return_to_kernel` hit a completely different queue bucket — the waiter
+   was never woken.
+
+2. **`sys_exit` never performed `clear_child_tid` cleanup.** The write-zero
+   and futex-wake for `CLONE_CHILD_CLEARTID` only happened in
+   `return_to_kernel()`. But `sys_exit` does not reach `return_to_kernel` —
+   it loops in `yield_now` instead of returning through the EL0→EL1→EL0
+   trampoline. Threads that called `exit()` directly (rather than returning
+   from their start function) therefore never unblocked their `pthread_join`
+   waiter.
+
+### Fix
+
+**Files:** `src/syscall/sync.rs`, `src/syscall/proc.rs`,
+`crates/akuma-exec/src/process/mod.rs`, `crates/akuma-exec/src/runtime.rs`
+
+**1. `futex_wake(tgid, uaddr, max_wake)` wakes both queues**
+
+Changed the signature to accept a `tgid`. The function now calls
+`futex_do_wake(0, uaddr, n)` (shared futex waiters) **and**, when
+`tgid != 0`, also `futex_do_wake(tgid, uaddr, n)` (private futex waiters
+such as `pthread_join`). This covers all waiting conventions without needing
+to know which one the waiter used.
+
+**2. `sys_exit` performs `clear_child_tid` cleanup**
+
+Added the write-zero + `futex_wake(tgid, tid_addr, INT_MAX)` block to
+`sys_exit` (in `src/syscall/proc.rs`), executed while the user address
+space is still active. Mirrors the same logic already in `return_to_kernel`.
+
+**3. Three new sync tests**
+
+- `test_futex_wake_tgid_wakes_shared_waiter` — `futex_wake(N, addr, MAX)`
+  must wake a shared (tgid=0) waiter placed by `FUTEX_WAIT`.
+- `test_futex_do_wake_zero_misses_nonzero_tgid_waiter` — `futex_do_wake(0)`
+  alone must not wake a `(42, addr)` waiter; `futex_wake(42, ...)` must.
+- `test_futex_wake_zero_tgid_no_double_fire` — `futex_wake(0, addr, 1)` must
+  wake exactly one waiter (the tgid=0 branch), not double-fire.
+
 ## Summary
 
-With all 13 fixes, `git clone https://...` works end-to-end on Akuma:
+With all 14 fixes, `git clone https://...` works end-to-end on Akuma:
 
 | Issue | Error | Root Cause |
 |-------|-------|------------|
@@ -631,6 +686,7 @@ With all 13 fixes, `git clone https://...` works end-to-end on Akuma:
 | 11 | Hangs after "done" | `CLONE_CHILD_CLEARTID` missing |
 | 12 | Exit 128 after pack download | `sys_exit` closed shared FD table for CLONE_THREAD sibling |
 | 13 | Hangs 110 s, no working tree | `clone_thread` registered pthread in `CHILD_CHANNELS`; `wait4(-1)` blocked on it forever |
+| 14 | `pthread_join` hangs (repro) | `futex_wake` only woke tgid=0 queue; `sys_exit` never did `clear_child_tid` cleanup |
 
 ## Future Work
 
