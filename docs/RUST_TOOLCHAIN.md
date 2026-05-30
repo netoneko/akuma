@@ -13,7 +13,12 @@ still block a full compile-and-link.
 | `lseek`/`readlinkat` EINVAL during link probe | ✅ benign or **fixed** (§4) |
 | Linker spawn fork (multithreaded rustc) | ✅ **fixed** (§4b′) — fork now replicates the whole thread group's address space (lazy regions by `tgid` + every sibling thread's eager `mmap_regions`); child no longer SIGSEGVs and exec's `clang-21` → `ld` |
 | CLOEXEC handshake read (`recvmsg` on the socketpair) | ✅ **fixed** (§4d) — socket recv/send syscalls now route `UnixSocket` fds to the backing pipes; was the real `the CLOEXEC pipe failed: … Bad file descriptor` |
-| Final link (invoking `clang`→`ld`) | ❓ both spawn blockers fixed; needs an end-to-end re-run to see whether the link completes or hits a further issue |
+| Final link (invoking `clang`→`ld`) | ✅ **works** — completes and produces a runnable binary |
+| **End-to-end `rustc hello.rs`** | ✅ **WORKS (verified 2026-05-31)** — `rustc -C linker=clang hello.rs -o /tmp/hello_rust` compiles, links via `clang-21`→`ld`, and the binary runs: `/tmp/hello_rust` → `Hello from Akuma!` |
+
+> **Perf caveat:** an end-to-end compile takes ~3 min, dominated by the fork
+> CoW copying the whole ~75k-page address space on each `fork` (~30 s `mmap` +
+> ~32 s `munmap`). Correctness is solid; speed is the open item — see §5b.
 
 ---
 
