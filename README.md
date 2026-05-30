@@ -1,6 +1,6 @@
 # Akuma OS
 
-**A bare-metal AArch64 operating system written in Rust — preemptive kernel, Linux-compatible syscalls, SSH server, containers, package managers, a C compiler, a JS runtime, a Git client, and an AI coding assistant**
+**Bare-metal AArch64 OS in Rust — preemptive kernel, Linux-compatible syscalls, SSH, containers, apk, TCC, JS runtime, Git**
 
 ```
                                              %#%:                +
@@ -37,12 +37,6 @@
 
 ---
 
-## What is Akuma?
-
-Akuma is a bare-metal operating system for the **AArch64** architecture, written entirely in **Rust** (`no_std`, ~36k lines of code across kernel and 8 extracted crates, plus ~7k lines of tests). It runs on QEMU's `virt` machine, booting into a preemptively multitasking kernel that executes standard ELF binaries via a Linux-compatible syscall interface.
-
-The system provides a Unix-like environment with multiple shells, 100+ standard utilities, networking, filesystems, containers, development tools, and even games — all accessible over SSH.
-
 ## Capabilities
 
 ### Kernel
@@ -54,7 +48,6 @@ The system provides a Unix-like environment with multiple shells, 100+ standard 
 | **Process model** | fork, execve, wait, signals, process groups, parent-child relationships, per-process file descriptor tables, `CLONE_VM` threads |
 | **Linux syscall ABI** | ~140 AArch64 Linux-compatible syscalls covering files, networking, memory, processes, and IPC |
 | **ELF loader** | Static, static-PIE, and dynamically linked ELF binaries; loads `ld-musl-aarch64.so.1` for dynamic linking |
-| **Demand paging** | Lazy anonymous and file-backed page allocation on first access, readahead, partial munmap with region splitting |
 | **Pipes & IPC** | Kernel pipes (`pipe2`), `eventfd2`, `futex`, `pselect6`, `ppoll` |
 | **Signals** | `kill`, SIGSEGV handling, Ctrl+C interrupt propagation |
 | **Containers** | Lightweight process isolation ("boxes") with per-container root filesystems, process namespaces, and socket isolation |
@@ -82,7 +75,7 @@ The system provides a Unix-like environment with multiple shells, 100+ standard 
 
 | Feature | Details |
 |---|---|
-| **Interactive shell** | Built-in kernel shell with pipelines (`\|`), redirection (`>`, `>>`), chaining (`;`, `&&`), variable expansion |
+| **Built-in shell** | Pipelines (`\|`), redirection (`>`, `>>`), chaining (`;`, `&&`), variable expansion |
 | **dash** | POSIX-compliant shell (static musl binary) |
 | **paws** | Main interactive shell |
 | **sbase** | 100+ Unix utilities — `grep`, `sed`, `awk`, `find`, `sort`, `tar`, `diff`, `wc`, `xargs`, `tee`, and many more |
@@ -96,46 +89,24 @@ The system provides a Unix-like environment with multiple shells, 100+ standard 
 | **C compiler (TCC)** | Tiny C Compiler with musl libc — compile and run C programs on-target |
 | **JavaScript (Bun)** | Bun runtime for running JS/TS scripts |
 | **JavaScript (QuickJS)** | ES2020 runtime — BigInt, Promises, async/await, console API |
-| **Git client** | `git` from Alpine apk — full Git support via `apk add git` |
+| **Git** | `git` from Alpine apk — `apk add git` |
 | **Vi editor (neatvi)** | Vi-like text editor, compilable on-target with TCC |
 
 ### Services & Applications
 
 | Feature | Details |
 |---|---|
-| **Process supervisor (herd)** | Manages background services with auto-restart, logging, config files in `/etc/herd/` |
-| **Container manager (box)** | `box open/close/stop/ps/inspect` for managing isolated containers |
+| **Process supervisor (herd)** | Background services with auto-restart, logging, config in `/etc/herd/` |
+| **Container manager (box)** | `box open/close/stop/ps/inspect` |
 | **AI assistant (meow)** | LLM chat client connecting to Ollama — streaming responses, filesystem and network tool calling |
-| **Package managers** | Built-in `pkg install`, plus `xbps` (Void Linux) and `apk` (Alpine Linux) for real package repositories |
+| **Package managers** | Built-in `pkg install`, plus `apk` (Alpine Linux) |
 
-### Terminal
-
-| Feature | Details |
-|---|---|
-| **Rich terminal** | Raw and cooked modes, cursor control, screen clearing, ONLCR translation |
-| **SSH terminal** | Full interactive terminal over SSH with per-session state |
-
-## Getting Started
-
-### Prerequisites
-- Rust nightly toolchain (`rust-toolchain.toml` will handle this)
-- The `aarch64-unknown-none` Rust target
-- QEMU for AArch64 (`qemu-system-aarch64`)
+## Build & Run
 
 ```bash
-# Install the required Rust target
 rustup target add aarch64-unknown-none
+# macOS: brew install qemu  |  Ubuntu: sudo apt-get install qemu-system-arm
 
-# Install QEMU (macOS)
-brew install qemu
-
-# Install QEMU (Ubuntu/Debian)
-sudo apt-get install qemu-system-arm
-```
-
-### Build & Run
-
-```bash
 git clone https://github.com/netoneko/akuma.git
 cd akuma
 cargo run --release
@@ -144,107 +115,42 @@ cargo run --release
 To build and populate the userspace disk image:
 
 ```bash
-scripts/create_disk.sh       # Create ext2 disk image
-userspace/build.sh           # Build all userspace binaries
-scripts/populate_disk.sh     # Populate disk with binaries
+scripts/create_disk.sh
+userspace/build.sh
+scripts/populate_disk.sh
 ```
 
-### Run Tests
-
-The extracted crates in `crates/` have host-runnable test suites (~165 tests). Since the kernel build target is `aarch64-unknown-none`, pass the host target explicitly:
+Tests (host target required since kernel target is `aarch64-unknown-none`):
 
 ```bash
 cargo test --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)
 ```
 
-Tests run automatically as a pre-commit hook (along with clippy).
-
-### Connect via SSH
+Connect via SSH:
 
 ```bash
 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@localhost -p 2222
 ```
 
-## Architecture
+## Crate Structure
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                          Userspace                               │
-│  ┌──────┐ ┌─────┐ ┌─────┐ ┌───────┐ ┌─────┐ ┌──────┐ ┌──────┐  │
-│  │ dash │ │ tcc │ │ bun │ │ meow │ │ sbase│                   │
-│  └──────┘ └─────┘ └─────┘ └───────┘ └─────┘ └──────┘ └──────┘  │
-│  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────────────┐  │
-│  │ herd │ │ box  │ │ httpd│ │ xbps │ │ apk  │                  │
-│  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └──────────────┘  │
-├──────────────────────────────────────────────────────────────────┤
-│  Syscall Interface (Linux AArch64 ABI, ~140 syscalls)            │
-├──────────────────────────────────────────────────────────────────┤
-│                      Kernel  (~18k lines)                        │
-│  ┌──────────┐ ┌──────────────┐ ┌──────────┐ ┌───────────────┐   │
-│  │Exceptions│ │ Syscalls     │ │ IRQ      │ │ SSH Server    │   │
-│  │ (EL0/EL1)│ │ (140 calls)  │ │ dispatch │ │ (SSH-2)       │   │
-│  └──────────┘ └──────────────┘ └──────────┘ └───────────────┘   │
-│  ┌──────────┐ ┌──────────────┐ ┌──────────┐ ┌───────────────┐   │
-│  │ GIC      │ │ VirtIO       │ │ Timer    │ │ Console       │   │
-│  │ (GICv2)  │ │ net/blk/rng  │ │ PL031    │ │ PL011 UART    │   │
-│  │          │ │              │ │ ARM CNTP │ │               │   │
-│  └──────────┘ └──────────────┘ └──────────┘ └───────────────┘   │
-├──────────────────────────────────────────────────────────────────┤
-│               Extracted Crates  (~17k lines)                     │
-│  ┌───────────────────────────────────────────────────────────┐   │
-│  │  akuma-exec (8.7k) — threading, process, MMU, ELF loader  │   │
-│  └───────────────────────────────────────────────────────────┘   │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌───────────────────┐   │
-│  │akuma-net │ │akuma-ext2│ │akuma-vfs │ │ akuma-shell       │   │
-│  │ (2.9k)   │ │ (1.7k)   │ │ (0.8k)   │ │ (1.1k)            │   │
-│  └──────────┘ └──────────┘ └──────────┘ └───────────────────┘   │
-│  ┌──────────┐ ┌──────────────┐ ┌────────────────────────────┐   │
-│  │akuma-ssh │ │akuma-ssh-    │ │ akuma-terminal (0.5k)      │   │
-│  │ (0.7k)   │ │crypto (0.7k) │ │                            │   │
-│  └──────────┘ └──────────────┘ └────────────────────────────┘   │
-├──────────────────────────────────────────────────────────────────┤
-│  Hardware: QEMU virt — VirtIO-net, VirtIO-blk, VirtIO-rng,      │
-│            GICv2, PL011 UART, PL031 RTC, ramfb                   │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### Crate Structure
-
-The kernel is split into a monolithic core (`src/`, ~18k lines) and 8 extracted crates (`crates/`, ~17k lines), with ~7k lines of tests:
-
-| Crate | Lines | Purpose |
-|---|---|---|
-| `akuma-exec` | 8,730 | Threading, process management, MMU page tables, ELF loader — the execution engine |
-| `akuma-net` | 2,940 | Socket layer, TCP/UDP abstractions, smoltcp integration |
-| `akuma-ext2` | 1,746 | ext2 filesystem implementation with read/write support |
-| `akuma-shell` | 1,050 | Shell parser, command pipeline, redirection, variable expansion |
-| `akuma-vfs` | 838 | Virtual filesystem types, mount table, path resolution |
-| `akuma-ssh-crypto` | 670 | SSH cryptographic primitives (Ed25519, x25519, AES-128-CTR, HMAC) |
-| `akuma-ssh` | 733 | SSH-2 protocol handling, channel management, auth |
-| `akuma-terminal` | 538 | Terminal emulation, raw/cooked modes, escape sequences |
-
-### Memory Layout
-
-```
-0x40000000  ┌──────────────────┐
-            │ Kernel code+stack│  32 MB
-0x42000000  ├──────────────────┤
-            │ Kernel heap      │  ~63 MB (talc allocator)
-0x45FC0000  ├──────────────────┤
-            │ User pages (PMM) │  ~159 MB (demand-paged)
-0x4FF00000  ├──────────────────┤
-            │ DTB              │
-0x50000000  └──────────────────┘
-```
-
-User processes get isolated virtual address spaces (up to 4 GB) with demand-paged anonymous and file-backed memory. The kernel uses identity mapping; device MMIO is accessed via remapped VAs under L0[1].
+| Crate | Purpose |
+|---|---|
+| `akuma-exec` | Threading, process management, MMU page tables, ELF loader |
+| `akuma-net` | Socket layer, TCP/UDP abstractions, smoltcp integration |
+| `akuma-ext2` | ext2 filesystem read/write |
+| `akuma-shell` | Shell parser, command pipeline, redirection, variable expansion |
+| `akuma-vfs` | Virtual filesystem types, mount table, path resolution |
+| `akuma-ssh-crypto` | SSH cryptographic primitives (Ed25519, x25519, AES-128-CTR, HMAC) |
+| `akuma-ssh` | SSH-2 protocol handling, channel management, auth |
+| `akuma-terminal` | Terminal emulation, raw/cooked modes, escape sequences |
 
 ## Project Layout
 
 ```
-src/              Kernel source (~18k lines of no_std Rust, ~5k lines of tests)
-crates/           Extracted kernel crates (8 crates, ~17k lines, ~1k lines of tests)
-userspace/        Userspace applications and libraries
+src/              Kernel source (no_std Rust)
+crates/           Extracted kernel crates
+userspace/
   libakuma/         Rust syscall wrapper library
   meow/             AI coding assistant
   quickjs/          JavaScript interpreter
@@ -261,6 +167,4 @@ linker.ld         Kernel linker script
 
 ## License
 
-MIT
-
-If a userspace application is under a license different from MIT (like GPL2 or LGPL2), then the associated userspace programs and the code around them follows their respective license.
+MIT. Userspace components under different licenses (GPL2, LGPL2) follow their respective licenses.
