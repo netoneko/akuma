@@ -89,9 +89,15 @@ print(f"rc={rc}\n{out}")
 
 ### 6. Verify git installed and clone the playground repo
 
+Clean up any artifact from a previous run first (busybox rm works even though the
+mini-shell lacks a built-in rm):
+
 ```python
 rc, out, err = ssh("git --version")
 print(f"git version: {out}")
+
+# Remove stale clone from any previous run; ignore errors
+ssh("busybox rm -rf akuma-playground")
 
 rc, out, err = ssh("git clone https://github.com/netoneko/akuma-playground.git", timeout=180)
 print(f"clone rc={rc}\n{out}\n{err}")
@@ -114,9 +120,13 @@ print(f"rc={rc}\n{out}")
 
 ### 8. Compile hello.c with tcc
 
+The Alpine `tcc` package installs its runtime library to `/usr/lib/tcc/libtcc1.a`.
+Pass `-B /usr/lib/tcc` so tcc can find it. Compile to `/usr/bin/hello` so the
+mini-shell can execute it via PATH lookup (the shell cannot exec arbitrary paths
+like `/tmp/hello` — only commands resolvable via PATH work).
+
 ```python
-ssh("mkdir /tmp")  # /tmp may not exist; ignore error if it does
-rc, out, err = ssh("tcc -o /tmp/hello akuma-playground/hello.c")
+rc, out, err = ssh("tcc -B /usr/lib/tcc -o /usr/bin/hello akuma-playground/hello.c")
 print(f"compile rc={rc} | out={out!r} | err={err!r}")
 # Success: rc=255 (SSH drop), out and err empty
 ```
@@ -124,9 +134,9 @@ print(f"compile rc={rc} | out={out!r} | err={err!r}")
 ### 9. Run the compiled binary
 
 ```python
-rc, out, err = ssh("/tmp/hello")
+rc, out, err = ssh("hello")
 print(f"run rc={rc} | out={out!r}")
-# Success: out == "Hello, World!"
+# Success: out == "Hello, Akuma!" (or whatever hello.c prints)
 ```
 
 ## Expected Result
@@ -154,10 +164,11 @@ Step 7 installs tcc and musl-dev (rc=255 is normal):
 OK: ... KiB in ... packages
 ```
 
-Step 8 produces no output (compile succeeds silently).
+Step 8 produces no output (compile succeeds silently). If `libtcc1.a not found`
+appears, verify `/usr/lib/tcc/` exists and contains `libtcc1.a` after `apk add tcc`.
 
 Step 9 prints:
 
 ```
-Hello, World!
+Hello, Akuma!
 ```
