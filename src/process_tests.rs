@@ -133,6 +133,7 @@ pub fn run_all_tests() {
     test_socketpair_domain_rejected();
     test_socketpair_bidirectional();
     test_socketpair_close_refcount();
+    test_socketpair_recv_send_via_socket_syscalls();
 
     // Test exit_group sibling behavior (Fix 1)
     test_exit_group_does_not_unregister_while_siblings_running();
@@ -2757,6 +2758,112 @@ fn test_socketpair_close_refcount() {
     pipe_close_write(px);
     pipe_close_read(py);
     console::print("[Test] socketpair_close_refcount PASSED\n");
+}
+
+/// AF_UNIX socketpair endpoints must work via the **socket** send/recv syscalls
+/// (`recvmsg`/`recvfrom`/`sendmsg`/`sendto`), not just `read`/`write`.
+///
+/// libstd's `fork`+exec child-spawn handshake reads its `SOCK_SEQPACKET`
+/// socketpair via `recvmsg`. Before the fix those syscalls resolved the fd with
+/// `get_socket_from_fd` (smoltcp sockets only) → `None` → `EBADF` for a
+/// `UnixSocket` endpoint, surfacing as rustc's
+/// `the CLOEXEC pipe failed: … Bad file descriptor` and aborting the link. The
+/// fix routes `UnixSocket` fds in those syscalls to the backing pipes. This test
+/// drives all four via `handle_syscall` and asserts data flows both ways with no
+/// `EBADF`. See `docs/RUST_TOOLCHAIN.md` §4d.
+fn test_socketpair_recv_send_via_socket_syscalls() {
+    use akuma_exec::process::FileDescriptor;
+    use akuma_exec::threading::current_thread_id;
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid};
+    use core::sync::atomic::Ordering;
+    const NR_SENDTO: u64 = 206;
+    const NR_RECVFROM: u64 = 207;
+    const NR_SENDMSG: u64 = 211;
+    const NR_RECVMSG: u64 = 212;
+    const EBADF: u64 = (-9i64) as u64;
+
+    // Local mirrors of the kernel's #[repr(C)] MsgHdr / IoVec layouts.
+    #[repr(C)]
+    #[derive(Default)]
+    struct MsgHdr {
+        msg_name: u64, msg_namelen: u32, _pad1: u32,
+        msg_iov: u64, msg_iovlen: u32, _pad2: u32,
+        msg_control: u64, msg_controllen: u64, msg_flags: i32,
+    }
+    #[repr(C)]
+    struct IoVec { iov_base: u64, iov_len: u64 }
+
+    if akuma_exec::process::current_process().is_some() {
+        console::print("[Test] socketpair_recv_send_via_socket_syscalls SKIP (process already current)\n");
+        return;
+    }
+    let tid = current_thread_id();
+    let pid = 6103;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+
+    // Two pipes back the pair; pipe_create starts each at read=1,write=1, which
+    // is exactly one reader + one writer endpoint per direction (no clone_ref).
+    let px = crate::syscall::pipe::pipe_create();
+    let py = crate::syscall::pipe::pipe_create();
+    let proc = akuma_exec::process::current_process().unwrap();
+    let fd_a = proc.alloc_fd(FileDescriptor::UnixSocket { rx: px, tx: py });
+    let fd_b = proc.alloc_fd(FileDescriptor::UnixSocket { rx: py, tx: px });
+
+    // Test buffers/structs live on the kernel stack; bypass user-ptr validation.
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+    // sendto/recvfrom: A --"ping"--> B  (A.tx == py == B.rx)
+    let sbuf = *b"ping";
+    let sendto_ret = crate::syscall::handle_syscall(
+        NR_SENDTO, &[fd_a as u64, sbuf.as_ptr() as u64, 4, 0, 0, 0]);
+    let mut rbuf = [0u8; 8];
+    let recvfrom_ret = crate::syscall::handle_syscall(
+        NR_RECVFROM, &[fd_b as u64, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0]);
+    let st_ok = sendto_ret == 4 && recvfrom_ret == 4 && &rbuf[..4] == b"ping";
+
+    // sendmsg/recvmsg: B --"pong"--> A  (B.tx == px == A.rx)
+    let mbuf = *b"pong";
+    let send_iov = IoVec { iov_base: mbuf.as_ptr() as u64, iov_len: 4 };
+    let mut send_msg = MsgHdr::default();
+    send_msg.msg_iov = &send_iov as *const IoVec as u64;
+    send_msg.msg_iovlen = 1;
+    let sendmsg_ret = crate::syscall::handle_syscall(
+        NR_SENDMSG, &[fd_b as u64, &send_msg as *const MsgHdr as u64, 0, 0, 0, 0]);
+    let mut mrbuf = [0u8; 8];
+    let recv_iov = IoVec { iov_base: mrbuf.as_mut_ptr() as u64, iov_len: 8 };
+    let mut recv_msg = MsgHdr::default();
+    recv_msg.msg_iov = &recv_iov as *const IoVec as u64;
+    recv_msg.msg_iovlen = 1;
+    let recvmsg_ret = crate::syscall::handle_syscall(
+        NR_RECVMSG, &[fd_a as u64, &recv_msg as *const MsgHdr as u64, 0, 0, 0, 0]);
+    let msg_ok = sendmsg_ret == 4 && recvmsg_ret == 4 && &mrbuf[..4] == b"pong";
+
+    let no_ebadf = sendto_ret != EBADF && recvfrom_ret != EBADF
+        && sendmsg_ret != EBADF && recvmsg_ret != EBADF;
+
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+
+    // Cleanup: drop fds, tear down both pipes, unregister.
+    if let Some(p) = akuma_exec::process::current_process() {
+        p.remove_fd(fd_a);
+        p.remove_fd(fd_b);
+    }
+    crate::syscall::pipe::pipe_close_read(px);
+    crate::syscall::pipe::pipe_close_write(px);
+    crate::syscall::pipe::pipe_close_read(py);
+    crate::syscall::pipe::pipe_close_write(py);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    if st_ok && msg_ok && no_ebadf {
+        console::print("[Test] socketpair_recv_send_via_socket_syscalls PASSED\n");
+    } else {
+        crate::safe_print!(
+            224,
+            "[Test] socketpair_recv_send_via_socket_syscalls FAILED: sendto={} recvfrom={} sendmsg={} recvmsg={} (EBADF={})\n",
+            sendto_ret as i64, recvfrom_ret as i64, sendmsg_ret as i64, recvmsg_ret as i64, EBADF as i64);
+    }
 }
 
 /// Write data, close write end, read all data, then read again → EOF.

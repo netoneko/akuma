@@ -11,8 +11,9 @@ still block a full compile-and-link.
 | `rustc` loads + runs codegen (`.rcgu.o` produced) | ✅ works (needs ≥2 GB RAM) |
 | Linker spawn handshake (`socketpair`) | ✅ **fixed** (this doc, §1) |
 | `lseek`/`readlinkat` EINVAL during link probe | ✅ benign or **fixed** (§4) |
-| Linker spawn (libstd `fork` in multithreaded rustc) | ⚠️ child SIGSEGV'd in musl thread-list fixup (sibling stacks not forked); surfaced as parent `the CLOEXEC pipe failed: … Bad file descriptor`. **Two-part fix landed** (§4b′) — fork enumerates lazy regions by `tgid` **and** unions every sibling thread's eager `mmap_regions`; the confirmed faulting region (`0xee402000`, eager, leader-thread) is now covered. Needs an end-to-end re-run to confirm |
-| Final link (invoking `cc`/`ld`) | ❓ older `SIGSEGV` trace (§3a); reachable only once the spawn fork is confirmed fixed |
+| Linker spawn fork (multithreaded rustc) | ✅ **fixed** (§4b′) — fork now replicates the whole thread group's address space (lazy regions by `tgid` + every sibling thread's eager `mmap_regions`); child no longer SIGSEGVs and exec's `clang-21` → `ld` |
+| CLOEXEC handshake read (`recvmsg` on the socketpair) | ✅ **fixed** (§4d) — socket recv/send syscalls now route `UnixSocket` fds to the backing pipes; was the real `the CLOEXEC pipe failed: … Bad file descriptor` |
+| Final link (invoking `clang`→`ld`) | ❓ both spawn blockers fixed; needs an end-to-end re-run to see whether the link completes or hits a further issue |
 
 ---
 
@@ -379,9 +380,45 @@ back. **Fixed:** the CLOEXEC sweep now runs only after `replace_image` succeeds.
 Guard: `test_failed_exec_preserves_cloexec_fds` (stages a non-ELF file, attempts
 `do_execve`, asserts the cloexec fd survives the failure).
 
-This is correct hygiene for failed execs, but it is **not** the `clang` blocker —
-that is the multithreaded-fork bug in §4b′ (the child never reaches a successful
-or failed `exec`; it SIGSEGVs first).
+This is correct hygiene for failed execs, but it is **not** the `clang` blocker.
+
+### 4d. The CLOEXEC-pipe `EBADF`, finally — `recvmsg` on the socketpair
+
+With the multithreaded-fork fix (§4b′) the spawned child no longer SIGSEGVs: it
+exec's `clang-21`, which itself forks and exec's `ld` — visible in `rustc5.log`
+(`[FORK-COW] shared 75049 pages`, then `execve(".../clang-21")`,
+`execve(".../bin/ld")`, no `WILD-DA`/SIGSEGV). But rustc still panicked with the
+same `the CLOEXEC pipe failed: … Bad file descriptor` — so the `EBADF` was a
+**second, independent** bug that the child-SIGSEGV had been masking all along.
+
+Pinning it: the added `read()` diagnostic (`[read-ebadf]`) **never fired**, so
+the `EBADF` did not come from `read(2)`. The handshake fd is the
+`socketpair(AF_UNIX, SOCK_SEQPACKET)` rust created for child-spawn IPC (§1), and
+**libstd reads it with `recvmsg`, not `read`**. Akuma's socket recv/send
+syscalls (`sys_recvmsg`/`sys_recvfrom`/`sys_sendmsg`/`sys_sendto`) resolved the
+fd via `get_socket_from_fd`, which only matches smoltcp `Socket(idx)` — a
+`UnixSocket{rx,tx}` endpoint fell through to `None → EBADF`. So the parent's
+`recvmsg` on its socketpair end returned `EBADF`, and libstd turned that into the
+panic. (`read`/`write` already handled `UnixSocket`, which is why the
+shell-driven `clang hello.c` — plain exec, no recvmsg handshake — always worked.)
+
+**Fix (`src/syscall/net.rs`):** all four socket send/recv syscalls now detect a
+`UnixSocket` fd up front (`fd_is_unix_socket`) and route to the backing pipes via
+the existing `sys_read`/`sys_write` paths:
+`recvfrom`/`recvmsg` → read the `rx` pipe, `sendto`/`sendmsg` → write the `tx`
+pipe (`recvmsg`/`sendmsg` operate on the first iovec, sufficient for libstd's
+single fixed-size handshake message). On a successful child `exec`, the child's
+CLOEXEC close drops the socketpair's writer, so the parent's `recvmsg` reads EOF
+(`0`) = "exec succeeded" — exactly what libstd expects.
+
+Guard: `test_socketpair_recv_send_via_socket_syscalls` drives all four syscalls
+over a `UnixSocket` pair via `handle_syscall` and asserts data flows both ways
+with no `EBADF`.
+
+> Two distinct bugs hid behind one panic message: a multithreaded-`fork`
+> address-space miss (§4b′) that killed the child, and — once the child
+> survived — a missing `UnixSocket` case in the socket recv/send syscalls (this
+> section). Both had to be fixed before the handshake could complete.
 
 ---
 
@@ -449,6 +486,7 @@ not a conformant SEQPACKET. Unchanged.
 - socketpair handler: `src/syscall/net.rs`
 - Pipe backing: `src/syscall/pipe.rs`
 - `read()` EBADF diagnostic, `sys_lseek` (ESPIPE), `sys_readlinkat`: `src/syscall/fs.rs`
+- **`UnixSocket` routing in socket recv/send** (`fd_is_unix_socket`, `sys_recvmsg`/`sys_recvfrom`/`sys_sendmsg`/`sys_sendto`): `src/syscall/net.rs`; guard `test_socketpair_recv_send_via_socket_syscalls` in `src/process_tests.rs`
 - `do_execve` CLOEXEC-on-success ordering: `src/syscall/proc.rs`
 - **Multithreaded-fork lazy-region `tgid` fix**: `fork_process` in `crates/akuma-exec/src/process/mod.rs` (lazy regions keyed by `parent.tgid`, not `parent.pid`)
 - mmap region/pid attribution: `src/syscall/mem.rs` (`push_lazy_region(proc.tgid, …)`), `clone_thread` in `crates/akuma-exec/src/process/mod.rs`

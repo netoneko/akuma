@@ -292,6 +292,10 @@ pub(super) fn sys_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
 }
 
 pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_addr: u64, addr_len: usize) -> u64 {
+    // AF_UNIX socketpair endpoint: send == write to the tx pipe.
+    if fd_is_unix_socket(fd) {
+        return super::fs::sys_write(fd as u64, buf_ptr, len);
+    }
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
     let mut kernel_buf = alloc::vec![0u8; len.min(64 * 1024)];
     let chunk_len = kernel_buf.len();
@@ -350,6 +354,10 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
 }
 
 pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_addr: u64, addr_len_ptr: u64) -> u64 {
+    // AF_UNIX socketpair endpoint: recv == read from the rx pipe.
+    if fd_is_unix_socket(fd) {
+        return super::fs::sys_read(fd as u64, buf_ptr, len);
+    }
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
     let mut kernel_buf = alloc::vec![0u8; len.min(64 * 1024)];
     let idx = match get_socket_from_fd(fd) {
@@ -592,6 +600,13 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     let iov = &iovs[0];
     if iov.iov_len == 0 { return 0; }
     if !validate_user_ptr(iov.iov_base, iov.iov_len as usize) { return EFAULT; }
+
+    // AF_UNIX socketpair endpoint: sendmsg == write the first iovec to the tx
+    // pipe. (libstd's handshake uses a single small message.)
+    if fd_is_unix_socket(fd) {
+        return super::fs::sys_write(fd as u64, iov.iov_base, iov.iov_len as usize);
+    }
+
     let mut kernel_buf = alloc::vec![0u8; iov.iov_len.min(64 * 1024)];
     if unsafe { copy_from_user_safe(kernel_buf.as_mut_ptr(), iov.iov_base as *const u8, kernel_buf.len()).is_err() } {
         return EFAULT;
@@ -651,6 +666,20 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     let iov = &mut iovs[0];
     if iov.iov_len == 0 { return 0; }
     if !validate_user_ptr(iov.iov_base, iov.iov_len as usize) { return EFAULT; }
+
+    // AF_UNIX socketpair endpoint: recvmsg == read into the first iovec from the
+    // rx pipe. (libstd's handshake uses a single small message.) On success,
+    // clear the ancillary/flags fields and write the header back.
+    if fd_is_unix_socket(fd) {
+        let n = super::fs::sys_read(fd as u64, iov.iov_base, iov.iov_len as usize);
+        if (n as i64) >= 0 {
+            msg.msg_controllen = 0;
+            msg.msg_flags = 0;
+            let _ = unsafe { copy_to_user_safe(msg_ptr as *mut u8, &msg as *const MsgHdr as *const u8, core::mem::size_of::<MsgHdr>()) };
+        }
+        return n;
+    }
+
     let mut kernel_buf = alloc::vec![0u8; iov.iov_len.min(64 * 1024)];
 
     let idx = match get_socket_from_fd(fd) {
@@ -730,6 +759,19 @@ pub(super) fn get_socket_from_fd(fd: u32) -> Option<usize> {
 
 pub(super) fn fd_is_nonblock(fd: u32) -> bool {
     akuma_exec::process::current_process().map_or(false, |p| p.is_nonblock(fd))
+}
+
+/// True if `fd` is one endpoint of an AF_UNIX socketpair (backed by two kernel
+/// pipes, not a smoltcp `Socket`). The socket send/recv syscalls route these to
+/// the backing pipes with plain read(2)/write(2) semantics — libstd's
+/// `fork`+exec child-spawn handshake reads its `SOCK_SEQPACKET` socketpair via
+/// `recvmsg`, which otherwise hit the `get_socket_from_fd` → `None` → `EBADF`
+/// path and surfaced as `the CLOEXEC pipe failed: … Bad file descriptor`
+/// (docs/RUST_TOOLCHAIN.md §4d).
+pub(super) fn fd_is_unix_socket(fd: u32) -> bool {
+    akuma_exec::process::current_process().map_or(false, |p| {
+        matches!(p.get_fd(fd), Some(akuma_exec::process::FileDescriptor::UnixSocket { .. }))
+    })
 }
 
 pub(super) fn socket_get_udp_handle(idx: usize) -> Option<akuma_net::smoltcp_net::SocketHandle> {
