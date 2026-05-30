@@ -512,7 +512,15 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         akuma_exec::process::FileDescriptor::EpollFd(_) => EINVAL,
         // Catch-all for fd types that don't support read(2) — Linux returns EBADF.
-        _ => EBADF
+        // This fires when an fd *exists* in the table but its type can't be read
+        // (e.g. a PipeWrite end, a raw Socket, Stderr). A libstd spawn parent
+        // reading its CLOEXEC handshake pipe should never land here; if it does,
+        // it points at a wrong-direction/wrong-type fd (see RUST_TOOLCHAIN.md §4).
+        other => {
+            trace_read_ebadf("fd-type-not-readable", fd_num, buf_ptr);
+            let _ = other;
+            EBADF
+        }
     }
 }
 

@@ -11,8 +11,8 @@ still block a full compile-and-link.
 | `rustc` loads + runs codegen (`.rcgu.o` produced) | ✅ works (needs ≥2 GB RAM) |
 | Linker spawn handshake (`socketpair`) | ✅ **fixed** (this doc, §1) |
 | `lseek`/`readlinkat` EINVAL during link probe | ✅ benign or **fixed** (§4) |
-| Linker spawn handshake (libstd `fork` + O_CLOEXEC error pipe) | ❌ parent panics `the CLOEXEC pipe failed: … Bad file descriptor` (EBADF) — under investigation (§4) |
-| Final link (invoking `cc`/`ld`) | ❌ userspace `SIGSEGV` in `rustc` (older trace; now masked by the EBADF above) |
+| Linker spawn (libstd `fork` in multithreaded rustc) | ⚠️ child SIGSEGV'd in musl thread-list fixup (sibling stacks not forked); surfaced as parent `the CLOEXEC pipe failed: … Bad file descriptor`. **Two-part fix landed** (§4b′) — fork enumerates lazy regions by `tgid` **and** unions every sibling thread's eager `mmap_regions`; the confirmed faulting region (`0xee402000`, eager, leader-thread) is now covered. Needs an end-to-end re-run to confirm |
+| Final link (invoking `cc`/`ld`) | ❓ older `SIGSEGV` trace (§3a); reachable only once the spawn fork is confirmed fixed |
 
 ---
 
@@ -276,19 +276,96 @@ What the investigation established:
   read-path handles both `PipeRead` and `UnixSocket`, so this is not a
   missing-fd-type fallthrough.
 
-Conclusion: the parent's CLOEXEC pipe read-end is being removed from its fd
-table by something at the process/threading level (rustc is multithreaded; the
-spawn is from a worker thread sharing the fd-table `Arc`). The exact remover is
-not determinable from static analysis alone, so a **bounded, always-on
-diagnostic** was added: `read()` returning `EBADF` now logs the first 32
-occurrences as
+The `EBADF` is a **downstream symptom**: the spawned child crashes before it can
+`exec`, so the handshake never completes. The kernel log of the failing run
+(`rustc2.log`) shows it directly — right after `fork_process` (parent pid 72)
+the child **pid 77 takes a fatal data abort**:
 
 ```
-[read-ebadf] <reason> pid=… tid=… fd=… buf=…
+[FORK-DBG] fork_process EXIT ok
+[DA-MISS] pid=77 ppid=72 va=0xf0f1a298 ... parent_has_va=false
+[WILD-DA] pid=77 FAR=0xf0f1a298 ELR=0x30048a90 last_sc=...
+  # child's last syscalls: 96 set_tid_address → 77, 135 rt_sigprocmask → 0
+[Fault] Process 77 (rustc) SIGSEGV after 0.01s
 ```
 
-where `<reason>` is `no-current-process` or `fd-not-in-table`. The next run will
-name the exact pid/tid/fd and which of the two paths fires — that pins the bug.
+(A bounded `[read-ebadf]` diagnostic was added to `read()` to confirm the parent
+side; it does *not* fire on the two `fd-absent` paths, consistent with the EBADF
+being a consequence of the dead child rather than a lost parent fd.)
+
+### 4b′. Root cause (caught live under gdb): multithreaded-fork drops sibling thread stacks
+
+Reproduced the crash under QEMU's gdbstub (`INSTANCE=1 GDB=1`, lldb over the
+gdb-remote protocol), breaking at the fatal-fault handler. Disassembling the
+faulting child code at `ELR=0x30048a90` (in `ld-musl`) shows a **circular
+thread-list walk**:
+
+```
+mrs  x24, TPIDR_EL0 ; sub x24, x24, #0xc8   ; x24 = list anchor (this pthread)
+ldr  x20, [x24, #0x10]                       ; x20 = first node (->next)
+loop:
+  str  w0,  [x20, #0x20]                      ; <-- FAULTS: node->field@0x20 = w0  (FAR = x20+0x20)
+  ldr  x20, [x20, #0x10]                      ; x20 = node->next
+  cmp  x20, x24 ; b.ne loop                   ; until back to anchor
+```
+
+Combined with the child's last two syscalls (`set_tid_address`, `rt_sigprocmask`)
+this is **musl's `fork()` child-side thread-list fixup**: the forked child walks
+the thread list it inherited from the parent — which still links the parent's
+*other* rustc worker threads' `pthread` structs — and faults on a sibling node
+(`0xf0f1a278`) whose page is **not present in the child**.
+
+Why it's absent — the kernel-side bug (`crates/akuma-exec/src/process/mod.rs`):
+
+- Each `clone_thread` worker gets its **own `Process` struct with its own `pid`**
+  but a **shared address space** and shared `tgid`. Its `mmap_regions` is a
+  private `Vec`, and the *leader* thread (`pid == tgid`) is the one that runs
+  `pthread_create` and therefore `mmap`s the worker stacks.
+- `mmap` splits its bookkeeping by tracking path:
+  - **lazy** anonymous regions (>256 pages, `MAP_NORESERVE`, …) go to
+    `LAZY_REGION_TABLE` keyed by **`proc.tgid`** (shared across the group);
+  - **eager** regions — including the *small* anonymous mappings musl uses for
+    pthread stacks/TLS (e.g. `len=0x6000`, `0x100000`) — are pushed onto the
+    **calling thread's** private `proc.mmap_regions`.
+- `fork_process` enumerated lazy regions under **`parent.pid`** and CoW-shared
+  only the **forking thread's own** `mmap_regions`. When the forking thread is a
+  *worker* (`pid 72`, `tgid 70`):
+  - the lazy lookup under `pid 72` missed the group's `tgid 70` regions, and
+  - the eager pthread stacks (mmap'd by the leader, **pid 70**) were on pid 70's
+    struct, never copied.
+
+  Confirmed from the log: the faulting `va=0xee402058` lies in
+  `[mmap] pid=70 … = 0xee402000 (eager)` — a leader-thread eager anon mapping,
+  invisible to a fork from pid 72. (`parent_has_va=false` only reports that the
+  *forking thread's lazy table* lacks it; the page is live in the shared page
+  tables.)
+
+On Linux, `fork()` duplicates the entire address space, so all sibling stacks
+(inert but mapped) survive and the walk succeeds. Akuma's region-enumerated CoW
+was lossy for a multithreaded parent on **two** axes.
+
+**Fix (two parts, both in `fork_process`, CoW + eager-copy paths):**
+
+1. Enumerate lazy regions by **`parent.tgid`** (not `parent.pid`) — captures the
+   whole group's lazy mappings.
+2. CoW-share (and RO-demote) the **eager `mmap_regions` of every sibling thread**
+   in the group: iterate `table::for_each_process`, match `p.tgid == parent.tgid`,
+   union their `mmap_regions`. (`for_each_process` runs IRQs-disabled and forbids
+   allocation in its callback — and Akuma is single-CPU — so ranges are collected
+   into a pre-reserved `Vec` with no in-callback allocation, then shared after.)
+
+Together these replicate every sibling thread's stack/TLS into the child, so
+musl's thread-list fixup dereferences valid (CoW) memory. For a single-threaded
+process `pid == tgid` and there are no siblings, so both parts are **no-ops** on
+the common path (no regression risk).
+
+> **Remaining (theoretical) gap:** this still enumerates *tracked regions* rather
+> than walking the page tables, so any present page not covered by a lazy region
+> or some thread's `mmap_regions` (e.g. internal TLS/`process_info` pages) would
+> still be missed. None are implicated in the rustc fault. The fully-robust
+> long-term fix is a page-table walk that CoW-shares every present user page;
+> left as follow-up since it is a larger, higher-blast-radius change to a
+> critical path.
 
 ### 4c. Fix landed alongside — CLOEXEC closed only on successful `exec`
 
@@ -302,9 +379,67 @@ back. **Fixed:** the CLOEXEC sweep now runs only after `replace_image` succeeds.
 Guard: `test_failed_exec_preserves_cloexec_fds` (stages a non-ELF file, attempts
 `do_execve`, asserts the cloexec fd survives the failure).
 
-This is correct hygiene and matters for failed execs, but note it does **not**
-by itself explain the `clang` `EBADF` (there the child's exec *succeeds*) — that
-remains pending the §4b diagnostic.
+This is correct hygiene for failed execs, but it is **not** the `clang` blocker —
+that is the multithreaded-fork bug in §4b′ (the child never reaches a successful
+or failed `exec`; it SIGSEGVs first).
+
+---
+
+## 5. Flagged but NOT fixed (open follow-ups)
+
+Issues surfaced during this investigation that were deliberately left unfixed,
+with the rationale. Listed worst-first.
+
+### 5a. `SIGSEGV` during the actual link (`cc`/`ld` invocation) — §3a
+
+**Status: blocked, not skipped.** The older `WILD-DA` at `FAR=0xf0f1a298`/
+`ELR≈0x30048a90` (§3a) is unreachable until the spawn `fork` works, because the
+forked child SIGSEGVs *before* it can exec the linker (§4b′). Once the
+multithreaded-fork fix is confirmed end-to-end, the link will actually run and
+this is the next thing to check — it may reproduce, or it may have been the same
+fork bug observed one step earlier. Re-evaluate after a clean spawn.
+
+### 5b. Fully-faithful `fork` = page-table walk (not region enumeration)
+
+**Status: deferred (larger, higher blast radius).** §4b′ fixes the multithreaded
+`fork` by enumerating *tracked regions* (lazy-by-`tgid` + every sibling thread's
+eager `mmap_regions`). This still misses any present user page that no region
+tracks — e.g. internal TLS / `process_info` pages mapped outside `mmap_regions`.
+None are implicated in the rustc fault, but the robust long-term fix is a
+page-table walk that CoW-shares **every present user page** (matching Linux
+`fork` semantics), making fork independent of region bookkeeping. Deferred
+because it rewrites a critical path (a bug here breaks *all* process spawning).
+
+### 5c. Eager-copy (non-CoW) `fork` path only half-updated
+
+**Status: inert path, noted for consistency.** `fork_process` has a legacy
+eager-copy branch (`else` of `config().cow_fork_enabled`). Its lazy lookup was
+switched to `tgid`, but the sibling-`mmap_regions` union (§4b′ part 2) was **not**
+added there. The CoW path is the active one (`[FORK-COW] shared … pages` appears
+in every trace), so the eager path is currently dead code — but if it is ever
+re-enabled it carries the same sibling-stack bug.
+
+### 5d. Child `mmap_regions` *metadata* for sibling ranges
+
+**Status: moot for the spawn, minor otherwise.** The fork fix CoW-shares sibling
+threads' *pages* into the child but does not add those ranges to the child's
+`mmap_regions` *metadata*. A libstd fork child execs immediately (which clears
+the table), so it does not matter here; a forked child that *doesn't* exec would
+have incomplete `munmap`/`mremap` bookkeeping for inherited sibling ranges.
+
+### 5e. `readlinkat` EINVAL flood — intentionally unchanged
+
+**Status: working as intended (no fix needed).** ~337 `readlinkat` calls return
+`EINVAL` during a rustc run; this is POSIX-correct (`readlink` on a non-symlink
+*is* `EINVAL`) and rustc tolerates it. Listed only so it is not mistaken for a
+defect on a future log read. See §4a.
+
+### 5f. `SEQPACKET` socketpair approximation
+
+**Status: pre-existing, acceptable.** The `socketpair` shim (§1) backs an
+`AF_UNIX`/`SOCK_SEQPACKET` pair with two byte-stream pipes, which does not
+preserve message boundaries. Sufficient for libstd's fixed-size errno handshake;
+not a conformant SEQPACKET. Unchanged.
 
 ---
 
@@ -315,6 +450,8 @@ remains pending the §4b diagnostic.
 - Pipe backing: `src/syscall/pipe.rs`
 - `read()` EBADF diagnostic, `sys_lseek` (ESPIPE), `sys_readlinkat`: `src/syscall/fs.rs`
 - `do_execve` CLOEXEC-on-success ordering: `src/syscall/proc.rs`
-- FD table / fork: `crates/akuma-exec/src/process/{types,fd}.rs`, `fork_process`/`replace_image` in `crates/akuma-exec/src/process/{mod,image}.rs`
+- **Multithreaded-fork lazy-region `tgid` fix**: `fork_process` in `crates/akuma-exec/src/process/mod.rs` (lazy regions keyed by `parent.tgid`, not `parent.pid`)
+- mmap region/pid attribution: `src/syscall/mem.rs` (`push_lazy_region(proc.tgid, …)`), `clone_thread` in `crates/akuma-exec/src/process/mod.rs`
+- FD table / fork: `crates/akuma-exec/src/process/{types,fd}.rs`, `replace_image` in `crates/akuma-exec/src/process/image.rs`
 - Self-tests: `src/process_tests.rs` (`test_lseek_nonseekable_returns_espipe`, `test_failed_exec_preserves_cloexec_fds`, `test_pipe_clone_ref_then_double_close`)
 - Related: `docs/APK_MISSING_SYSCALLS.md`, `docs/FORK_MMAP_AND_WAIT_STATUS_FIX.md`

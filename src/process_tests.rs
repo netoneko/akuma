@@ -2327,28 +2327,40 @@ fn test_pipe_dup3_atomically_replaces_and_closes_old() {
 /// be `EBADF`. See `docs/RUST_TOOLCHAIN.md` (lseek EINVAL→ESPIPE).
 fn test_lseek_nonseekable_returns_espipe() {
     use akuma_exec::process::FileDescriptor;
+    use akuma_exec::threading::current_thread_id;
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid};
     const NR_LSEEK: u64 = 62;
     const SEEK_CUR: u64 = 1;
     const ESPIPE: u64 = (-29i64) as u64;
     const EBADF: u64 = (-9i64) as u64;
     const EINVAL: u64 = (-22i64) as u64;
 
-    let proc = match akuma_exec::process::current_process() {
-        Some(p) => p,
-        None => {
-            console::print("[Test] lseek_nonseekable_returns_espipe SKIP (no current process)\n");
-            return;
-        }
-    };
+    // The boot suite has no current process; register a throwaway one bound to
+    // this thread so the lseek syscall has a process/fd-table to operate on.
+    if akuma_exec::process::current_process().is_some() {
+        console::print("[Test] lseek_nonseekable_returns_espipe SKIP (process already current)\n");
+        return;
+    }
+    let tid = current_thread_id();
+    let pid = 6101;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
 
     // Install a pipe read-end fd on the current process (read=1, write=1).
     let pipe_id = crate::syscall::pipe::pipe_create();
-    let fd = proc.alloc_fd(FileDescriptor::PipeRead(pipe_id));
+    let fd = akuma_exec::process::current_process().unwrap().alloc_fd(FileDescriptor::PipeRead(pipe_id));
 
     // lseek on a pipe → ESPIPE (non-seekable), NOT the old EINVAL.
     let pipe_ret = crate::syscall::handle_syscall(NR_LSEEK, &[fd as u64, 0, SEEK_CUR, 0, 0, 0]);
     // lseek on an absent fd → EBADF (the non-seekable path must not mask this).
     let bad_ret = crate::syscall::handle_syscall(NR_LSEEK, &[9999, 0, SEEK_CUR, 0, 0, 0]);
+
+    // Cleanup: drop the fd, tear down the pipe, and unregister the process.
+    if let Some(p) = akuma_exec::process::current_process() { p.remove_fd(fd); }
+    crate::syscall::pipe::pipe_close_read(pipe_id);  // read=0
+    crate::syscall::pipe::pipe_close_write(pipe_id); // write=0 → destroyed
+    unregister_thread_pid(tid);
+    unregister_process(pid);
 
     if pipe_ret == ESPIPE && bad_ret == EBADF {
         console::print("[Test] lseek_nonseekable_returns_espipe PASSED\n");
@@ -2359,11 +2371,6 @@ fn test_lseek_nonseekable_returns_espipe() {
             pipe_ret as i64, ESPIPE as i64, EINVAL as i64, bad_ret as i64, EBADF as i64,
         );
     }
-
-    // Cleanup: drop the fd and tear down the pipe.
-    proc.remove_fd(fd);
-    crate::syscall::pipe::pipe_close_read(pipe_id);  // read=0
-    crate::syscall::pipe::pipe_close_write(pipe_id); // write=0 → destroyed
 }
 
 /// A FAILED `execve` (image load fails) must NOT close the process's
@@ -2379,15 +2386,9 @@ fn test_lseek_nonseekable_returns_espipe() {
 /// `docs/RUST_TOOLCHAIN.md`.
 fn test_failed_exec_preserves_cloexec_fds() {
     use akuma_exec::process::FileDescriptor;
+    use akuma_exec::threading::current_thread_id;
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid};
     const TMP_PATH: &str = "/tmp/akuma_cloexec_exec_test.bin";
-
-    let proc = match akuma_exec::process::current_process() {
-        Some(p) => p,
-        None => {
-            console::print("[Test] failed_exec_preserves_cloexec_fds SKIP (no current process)\n");
-            return;
-        }
-    };
 
     // Stage a regular file that is neither a shebang script nor a valid ELF, so
     // `do_execve` reads it fine but `replace_image` fails fast at the ELF magic
@@ -2398,10 +2399,22 @@ fn test_failed_exec_preserves_cloexec_fds() {
         return;
     }
 
+    // The boot suite has no current process; register a throwaway one bound to
+    // this thread so do_execve has a process to operate on.
+    if akuma_exec::process::current_process().is_some() {
+        console::print("[Test] failed_exec_preserves_cloexec_fds SKIP (process already current)\n");
+        let _ = crate::fs::remove_file(TMP_PATH);
+        return;
+    }
+    let tid = current_thread_id();
+    let pid = 6102;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+
     // Install a close-on-exec pipe write-end (mirrors libstd's CLOEXEC pipe).
     let pipe_id = crate::syscall::pipe::pipe_create(); // read=1, write=1
-    let fd = proc.alloc_fd(FileDescriptor::PipeWrite(pipe_id));
-    proc.set_cloexec(fd);
+    let fd = akuma_exec::process::current_process().unwrap().alloc_fd(FileDescriptor::PipeWrite(pipe_id));
+    akuma_exec::process::current_process().unwrap().set_cloexec(fd);
 
     // Attempt the doomed execve. `do_execve` returns an errno on failure (it
     // only enters user mode on success), so it is safe to call here.
@@ -2413,8 +2426,21 @@ fn test_failed_exec_preserves_cloexec_fds() {
     // The exec must have FAILED (a successful one never returns) and the
     // close-on-exec fd must survive intact.
     let failed = (ret as i64) < 0;
-    let still_present = proc.get_fd(fd).is_some();
-    let still_cloexec = proc.is_cloexec(fd);
+    let (still_present, still_cloexec) = match akuma_exec::process::current_process() {
+        Some(p) => (p.get_fd(fd).is_some(), p.is_cloexec(fd)),
+        None => (false, false),
+    };
+
+    // Cleanup: drop the fd + pipe, remove the temp file, unregister the process.
+    if let Some(p) = akuma_exec::process::current_process() {
+        p.clear_cloexec(fd);
+        p.remove_fd(fd);
+    }
+    crate::syscall::pipe::pipe_close_write(pipe_id); // write=0
+    crate::syscall::pipe::pipe_close_read(pipe_id);  // read=0 → destroyed
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+    let _ = crate::fs::remove_file(TMP_PATH);
 
     if failed && still_present && still_cloexec {
         console::print("[Test] failed_exec_preserves_cloexec_fds PASSED\n");
@@ -2425,13 +2451,6 @@ fn test_failed_exec_preserves_cloexec_fds() {
             ret as i64, still_present, still_cloexec,
         );
     }
-
-    // Cleanup: drop the fd + pipe, remove the temp file.
-    proc.clear_cloexec(fd);
-    proc.remove_fd(fd);
-    crate::syscall::pipe::pipe_close_write(pipe_id); // write=0
-    crate::syscall::pipe::pipe_close_read(pipe_id);  // read=0 → destroyed
-    let _ = crate::fs::remove_file(TMP_PATH);
 }
 
 /// Directly exercise the CLONE_VFORK race-fix mechanism:

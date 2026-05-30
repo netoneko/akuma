@@ -1173,7 +1173,17 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     }
     let parent = current_process().ok_or("No current process")?;
     let parent_pid = parent.pid;
-    
+    // Lazy mmap regions are keyed by *thread-group id* (see `mmap` →
+    // `push_lazy_region(proc.tgid, …)`): every thread sharing this address space
+    // registers its anonymous mappings (including each pthread's stack) under
+    // the one tgid. fork must enumerate lazy regions by tgid, NOT by the forking
+    // thread's pid — otherwise a worker-thread fork (pid != tgid) drops every
+    // *sibling* thread's stack from the child, and the child's libc `fork()`
+    // thread-list fixup faults dereferencing a sibling pthread node that was
+    // never replicated (docs/RUST_TOOLCHAIN.md §4). For a single-threaded
+    // process pid == tgid, so this is a no-op there.
+    let parent_tgid = parent.tgid;
+
     // #region agent log
     {
         let mut buf = [0u8; 128];
@@ -1401,6 +1411,43 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                     &mut new_proc.address_space, "mmap")?;
             }
         }
+
+        // Share EAGER mmap regions owned by *sibling threads* of the same thread
+        // group.  Each thread has its own `Process` with a private `mmap_regions`
+        // Vec, and `mmap` pushes eager mappings (e.g. a small pthread stack ≤256
+        // pages) onto the *calling* thread's struct.  When a worker thread forks
+        // we must replicate every sibling's eager mappings too — otherwise the
+        // child's libc `fork()` thread-list fixup faults dereferencing a sibling
+        // pthread node whose stack was never copied (docs/RUST_TOOLCHAIN.md §4b′).
+        // All threads share one address space (`parent_l0`), so the same CoW
+        // share applies.  `for_each_process` runs IRQs-disabled and forbids
+        // allocation in its callback, so collect (va,len) into a pre-reserved Vec
+        // (push within capacity does not allocate), then share afterwards.
+        let sibling_ranges: alloc::vec::Vec<(usize, usize)> = {
+            let mut ranges: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(2048);
+            let mut overflow = false;
+            table::for_each_process(|p| {
+                if p.tgid == parent_tgid && p.pid != parent_pid {
+                    for (va, frames) in &p.mmap_regions {
+                        if !frames.is_empty() {
+                            if ranges.len() < ranges.capacity() {
+                                ranges.push((*va, frames.len() * mmu::PAGE_SIZE));
+                            } else {
+                                overflow = true;
+                            }
+                        }
+                    }
+                }
+            });
+            if overflow {
+                (runtime().print_str)("[FORK-COW] WARNING: sibling mmap region list truncated (>2048 regions)\n");
+            }
+            ranges
+        };
+        for (va_start, len) in &sibling_ranges {
+            total_shared += cow_share_range(parent_l0, *va_start, *len,
+                &mut new_proc.address_space, "sibling-mmap")?;
+        }
         // CoW fork doesn't track per-region frame lists — frames are shared,
         // not owned.  On write fault, new frames are allocated and tracked in
         // user_frames.  We keep the mmap region VA ranges for munmap.
@@ -1412,7 +1459,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         {
             let lazy_ranges: alloc::vec::Vec<(usize, usize)> = with_irqs_disabled(|| {
                 let table = LAZY_REGION_TABLE.lock();
-                table.get(&parent_pid)
+                table.get(&parent_tgid)
                     .map(|regions| regions.values().map(|r| (r.start_va, r.size)).collect())
                     .unwrap_or_default()
             });
@@ -1443,9 +1490,17 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 mmu::demote_range_to_ro(parent_l0_mut, *va_start, parent_frames.len());
             }
 
+            // Demote sibling-thread eager mmap regions we just CoW-shared, so a
+            // sibling thread's later write also triggers a CoW fault instead of
+            // silently mutating a page the child still references.
+            for (va_start, len) in &sibling_ranges {
+                let pages = fork_page_count_for_len(*len).unwrap_or(0);
+                mmu::demote_range_to_ro(parent_l0_mut, *va_start, pages);
+            }
+
             let lazy_ranges2: alloc::vec::Vec<(usize, usize)> = with_irqs_disabled(|| {
                 let table = LAZY_REGION_TABLE.lock();
-                table.get(&parent_pid)
+                table.get(&parent_tgid)
                     .map(|regions| regions.values().map(|r| (r.start_va, r.size)).collect())
                     .unwrap_or_default()
             });
@@ -1602,7 +1657,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             let lazy_start_us = (runtime().uptime_us)();
             let lazy_ranges: alloc::vec::Vec<(usize, usize)> = with_irqs_disabled(|| {
                 let table = LAZY_REGION_TABLE.lock();
-                table.get(&parent_pid)
+                table.get(&parent_tgid)
                     .map(|regions| regions.values().map(|r| (r.start_va, r.size)).collect())
                     .unwrap_or_default()
             });
