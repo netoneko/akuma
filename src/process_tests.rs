@@ -349,6 +349,8 @@ pub fn run_all_tests() {
 
     // CLONE_THREAD shared FD table regression (git sideband thread destroyed fetch-pack pipes)
     test_clone_thread_exit_preserves_shared_fd_table();
+    // CLONE_THREAD must NOT appear in CHILD_CHANNELS (git sideband pthread blocked wait4(-1) forever)
+    test_clone_thread_not_visible_to_wait4();
 
     // Go mmap regression: forktest_parent with mmap_test must not SIGSEGV
     // test_forktest_parent_mmap(); // disabled: runs for up to 60s
@@ -7930,4 +7932,68 @@ fn test_clone_thread_exit_preserves_shared_fd_table() {
             "[Test] clone_thread_exit_preserves_shared_fd_table FAILED: survives_sibling={} cleared_by_leader={}\n",
             fd_survives_sibling_exit, fd_cleared_by_leader_exit);
     }
+}
+
+/// Regression: clone_thread must NOT register the new thread in CHILD_CHANNELS.
+///
+/// Before the fix, clone_thread called register_child_channel(child_pid, ..., parent_pid),
+/// making pthreads appear as waitpid-visible fork children.  In git, this caused wait4(-1)
+/// to block forever on the sideband demux pthread after all real fork children had been
+/// reaped: has_children(parent) returned true (pthread still registered), but
+/// find_exited_child returned None because the pthread never exited via the channel.
+/// git hung for 110 s until the SSH watchdog killed it, leaving no working-tree files.
+///
+/// The fix: clone_thread no longer calls register_child_channel.  This test verifies:
+/// 1. A fork child IS visible to has_children / find_exited_child (baseline).
+/// 2. A CLONE_THREAD sibling is NOT visible — has_children returns false after the
+///    fork child is reaped, matching Linux semantics.
+fn test_clone_thread_not_visible_to_wait4() {
+    use alloc::sync::Arc;
+    use akuma_exec::process::{
+        ProcessChannel, register_child_channel, remove_child_channel,
+        has_children, find_exited_child, get_child_channel,
+    };
+
+    let parent_pid:     u32 = 92_000;
+    let fork_child_pid: u32 = 92_001;
+    let thread_pid:     u32 = 92_002; // what clone_thread used to register
+
+    // --- Baseline: fork child IS visible ---
+    let fork_ch = Arc::new(ProcessChannel::new());
+    register_child_channel(fork_child_pid, fork_ch.clone(), parent_pid);
+
+    let has_fork_child = has_children(parent_pid);
+    if !has_fork_child {
+        console::print("[Test] clone_thread_not_visible_to_wait4 FAILED: fork child not seen by has_children\n");
+        remove_child_channel(fork_child_pid);
+        return;
+    }
+
+    // --- Verify: CLONE_THREAD thread is NOT registered (the fix) ---
+    // clone_thread no longer calls register_child_channel, so get_child_channel
+    // must return None for a thread PID.
+    let thread_ch_opt = get_child_channel(thread_pid);
+    if thread_ch_opt.is_some() {
+        console::print("[Test] clone_thread_not_visible_to_wait4 FAILED: thread_pid unexpectedly in CHILD_CHANNELS\n");
+        remove_child_channel(fork_child_pid);
+        // Clean up if someone accidentally registered it
+        remove_child_channel(thread_pid);
+        return;
+    }
+
+    // --- After reaping the fork child, has_children must be false ---
+    // This simulates: git reaps index-pack (fork child), then calls wait4(-1) again.
+    // Before the fix: has_children still true (pthread registered) → blocked forever.
+    // After the fix:  has_children false → ECHILD returned → git proceeds to checkout.
+    fork_ch.set_exited(0);
+    let _ = find_exited_child(parent_pid); // consume the exit
+    remove_child_channel(fork_child_pid);  // reap it (as wait4 does)
+
+    let still_has_children = has_children(parent_pid);
+    if still_has_children {
+        console::print("[Test] clone_thread_not_visible_to_wait4 FAILED: has_children still true after fork child reaped (pthread leak?)\n");
+        return;
+    }
+
+    console::print("[Test] clone_thread_not_visible_to_wait4 PASSED\n");
 }

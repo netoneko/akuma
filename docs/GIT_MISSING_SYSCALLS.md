@@ -547,9 +547,74 @@ if proc.tgid == proc.pid {
 `src/process_tests.rs` — verifies that simulating a sibling exit (`tgid != pid`)
 leaves the shared table intact, while a leader exit (`tgid == pid`) clears it.
 
+## Issue 13: CLONE_THREAD Registered as waitpid Child (git hangs 110 s)
+
+### Symptoms
+
+`git clone` transferred the pack successfully (index-pack exited normally,
+pack/idx files written) but never populated the working tree. The SSH session
+ran for ~110 seconds then was killed by the Python `subprocess.run(timeout=120)`
+watchdog. No `hello.c` or other working-tree files existed afterward; only
+the `.git` directory was present.
+
+Kernel PSTATS showed git (PID 118) frozen at exactly 948 syscalls from T+20s
+through T+110s — zero new syscalls, constant `in_kernel` time. The sideband
+demux pthread (tid=11, created by `start_async`) was alive in the scheduler
+but never recycled.
+
+### Root Cause
+
+`clone_thread()` (called for `CLONE_THREAD | CLONE_VM`) called
+`register_child_channel(child_pid, exit_channel, parent_pid)`, registering
+the new pthread as a waitpid-able "child" of the calling process.
+
+On Linux, `CLONE_THREAD` threads belong to the same thread group and are
+**never** visible to `waitpid` / `wait4`. Programs that call `wait4(-1, ...)`
+only expect fork-created children to appear.
+
+In git's `fetch-pack` flow:
+
+1. git calls `start_async(&demux)` → `pthread_create` → `clone_thread` → demux
+   thread (tid=11) registered in `CHILD_CHANNELS` with `ppid = PID 118`.
+2. git calls `wait4(-1, ...)` waiting for real subprocesses (index-pack, remote-https).
+3. `has_children(118)` returns true (demux thread is in `CHILD_CHANNELS`).
+4. `find_exited_child(118)` correctly returns index-pack (PID 122) once it exits.
+5. After reaping index-pack, git calls `wait4(-1, ...)` again.
+6. `has_children(118)` still true — the demux thread (clone_pid) is still in
+   `CHILD_CHANNELS` and has never exited.
+7. `find_exited_child(118)` returns None; git blocks forever.
+
+git never reached the pack-rename or checkout steps; the SSH watchdog killed
+it 110 seconds later.
+
+### Fix
+
+**File:** `crates/akuma-exec/src/process/mod.rs`
+
+Removed the `register_child_channel` call from `clone_thread`:
+
+```rust
+// CLONE_THREAD threads are NOT visible to waitpid on Linux — they belong
+// to the same thread group and are never reaped by the parent.
+// Registering them in CHILD_CHANNELS caused wait4(-1) to block forever
+// on git's sideband demux pthread.
+let exit_channel = Arc::new(ProcessChannel::new());
+register_channel(tid, exit_channel.clone());
+// register_child_channel(child_pid, exit_channel, parent_pid);  ← REMOVED
+```
+
+`register_channel(tid, ...)` is kept so the thread's own exit notification
+channel works correctly (for `set_tid_address` / `CLONE_CHILD_CLEARTID`
+wakeups). Only the `wait4`-visible "child" entry is removed.
+
+After this fix, `wait4(-1)` from PID 118 only sees fork children (index-pack,
+remote-https). Once both exit and are reaped, `has_children` returns false and
+`wait4(-1)` returns `ECHILD`. git proceeds to rename the pack files and
+populate the working tree.
+
 ## Summary
 
-With all 12 fixes, `git clone https://...` works end-to-end on Akuma:
+With all 13 fixes, `git clone https://...` works end-to-end on Akuma:
 
 | Issue | Error | Root Cause |
 |-------|-------|------------|
@@ -565,6 +630,7 @@ With all 12 fixes, `git clone https://...` works end-to-end on Akuma:
 | 10 | `cannot pread pack file` | `pread64` not implemented |
 | 11 | Hangs after "done" | `CLONE_CHILD_CLEARTID` missing |
 | 12 | Exit 128 after pack download | `sys_exit` closed shared FD table for CLONE_THREAD sibling |
+| 13 | Hangs 110 s, no working tree | `clone_thread` registered pthread in `CHILD_CHANNELS`; `wait4(-1)` blocked on it forever |
 
 ## Future Work
 

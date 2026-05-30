@@ -93,8 +93,12 @@ print(f"rc={rc}\n{out}")
 rc, out, err = ssh("git --version")
 print(f"git version: {out}")
 
-rc, out, err = ssh("git clone https://github.com/netoneko/akuma-playground.git")
+rc, out, err = ssh("git clone https://github.com/netoneko/akuma-playground.git", timeout=180)
 print(f"clone rc={rc}\n{out}\n{err}")
+# Verify that working-tree files were actually checked out (not just .git/)
+rc2, ls_out, _ = ssh("ls akuma-playground/")
+print(f"ls rc={rc2}: {ls_out}")
+assert "hello.c" in ls_out, f"Expected hello.c in working tree, got: {ls_out}"
 ```
 
 ### 7. Install tcc and musl-dev

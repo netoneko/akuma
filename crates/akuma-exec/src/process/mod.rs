@@ -1862,8 +1862,11 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     crate::threading::update_thread_context(tid, &child_ctx);
 
     let exit_channel = Arc::new(ProcessChannel::new());
-    register_channel(tid, exit_channel.clone());
-    register_child_channel(child_pid, exit_channel, parent_pid);
+    register_channel(tid, exit_channel);
+    // CLONE_THREAD threads are NOT visible to waitpid on Linux — they belong to the same
+    // thread group and are never reaped by the parent. Registering them in CHILD_CHANNELS
+    // caused wait4(-1) to block forever on git's sideband demux pthread, which never exited
+    // because it was waiting for data from a pipe whose write-end git itself held open.
 
     // Register in THREAD_PID_MAP so current_process() works for this thread
     with_irqs_disabled(|| {
