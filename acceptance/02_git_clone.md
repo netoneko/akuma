@@ -107,13 +107,13 @@ print(f"ls rc={rc2}: {ls_out}")
 assert "hello.c" in ls_out, f"Expected hello.c in working tree, got: {ls_out}"
 ```
 
-### 7. Install tcc and musl-dev
+### 7. Install tcc and musl-dev tcc-libs tcc-libs-static
 
 `musl-dev` provides the C runtime startup files (`crt1.o`, `crti.o`, `crtn.o`),
 standard headers (`stdio.h`, etc.), and static libc — all required for tcc to link.
 
 ```python
-rc, out, err = ssh("apk add tcc musl-dev")
+rc, out, err = ssh("apk add tcc musl-dev tcc-libs tcc-libs-static")
 print(f"rc={rc}\n{out}")
 # rc=255 is normal; success if "OK:" appears in out
 ```
@@ -126,7 +126,7 @@ mini-shell can execute it via PATH lookup (the shell cannot exec arbitrary paths
 like `/tmp/hello` — only commands resolvable via PATH work).
 
 ```python
-rc, out, err = ssh("tcc -B /usr/lib/tcc -o /usr/bin/hello akuma-playground/hello.c")
+rc, out, err = ssh("tcc -B /usr/lib/tcc -o /tmp/hello_c akuma-playground/hello.c")
 print(f"compile rc={rc} | out={out!r} | err={err!r}")
 # Success: rc=255 (SSH drop), out and err empty
 ```
@@ -134,7 +134,7 @@ print(f"compile rc={rc} | out={out!r} | err={err!r}")
 ### 9. Run the compiled binary
 
 ```python
-rc, out, err = ssh("hello")
+rc, out, err = ssh("/tmp/hello_c")
 print(f"run rc={rc} | out={out!r}")
 # Success: out == "Hello, Akuma!" (or whatever hello.c prints)
 ```

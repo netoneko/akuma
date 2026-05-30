@@ -1,6 +1,6 @@
 # Akuma OS
 
-**Bare-metal AArch64 OS in Rust — preemptive kernel, Linux-compatible syscalls, SSH, containers, apk, TCC, JS runtime, Git**
+**Bare-metal AArch64 OS in Rust — preemptive kernel, Linux-compatible syscalls, SSH, containers, apk, TCC/Clang/GCC, JS runtime, Git**
 
 ```
                                              %#%:                +
