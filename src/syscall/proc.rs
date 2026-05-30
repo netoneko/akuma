@@ -227,6 +227,17 @@ pub(super) fn sys_exit(code: i32) -> u64 {
         if proc.tgid == proc.pid {
             proc.fds.close_all();
         }
+        // CLONE_CHILD_CLEARTID: write 0 to the TID address and wake any
+        // pthread_join waiters.  This must happen here, while the user address
+        // space is still active, because return_to_kernel is never reached from
+        // the sys_exit path (the thread loops in yield_now instead of returning
+        // through the normal EL0→EL1→EL0 trampoline).
+        let tid_addr = proc.clear_child_tid;
+        if tid_addr != 0 && crate::mmu::is_current_user_page_mapped(tid_addr as usize) {
+            unsafe { core::ptr::write(tid_addr as *mut u32, 0); }
+            crate::syscall::futex_wake(proc.tgid, tid_addr as usize, i32::MAX);
+        }
+
         notify_child_channel_exited(pid, code);
         vfork_complete(pid);
 

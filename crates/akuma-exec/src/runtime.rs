@@ -125,7 +125,7 @@ pub struct ExecRuntime {
     pub remove_socket: fn(usize),
 
     // Syscall helpers
-    pub futex_wake: fn(usize, i32),
+    pub futex_wake: fn(u32, usize, i32),
     pub pipe_close_write: fn(u32),
     pub pipe_close_read: fn(u32),
     pub pipe_clone_ref: fn(u32, bool),

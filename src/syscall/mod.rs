@@ -32,6 +32,7 @@ mod timerfd;
 
 pub use sync::futex_wake;
 pub(crate) use sync::futex_do_wake;
+pub(crate) use sync::futex_wait_at_tgid_for_test;
 pub use mem::membarrier_cmd;
 pub(crate) use fs::sys_close_range;
 

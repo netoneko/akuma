@@ -42,9 +42,37 @@ pub(crate) fn futex_do_wake(tgid: u32, uaddr: usize, max_wake: u32) -> u64 {
     woken
 }
 
-/// Kernel-internal futex wake (clear_child_tid, robust futex). Uses tgid=0 (shared).
-pub fn futex_wake(uaddr: usize, max_wake: i32) {
-    futex_do_wake(0, uaddr, max_wake as u32);
+/// Kernel-internal futex wake (clear_child_tid, robust futex).
+/// Wakes both tgid=0 (shared futex waiters) and tgid=tgid (FUTEX_PRIVATE waiters such
+/// as pthread_join), since we cannot know which variant the waiter used.
+pub fn futex_wake(tgid: u32, uaddr: usize, max_wake: i32) {
+    let n0 = futex_do_wake(0, uaddr, max_wake as u32);
+    let n1 = if tgid != 0 {
+        futex_do_wake(tgid, uaddr, max_wake as u32)
+    } else {
+        0
+    };
+    tprint!(128, "[clear_child_tid] tgid={} addr={:#x} woke shared={} private={}\n", tgid, uaddr, n0, n1);
+}
+
+/// Test helper: insert the current thread into the futex waiter table at an
+/// explicit (tgid, uaddr) key and block until woken.
+///
+/// `FUTEX_WAIT_PRIVATE` in the test environment always resolves to tgid=0
+/// (because `read_current_pid()` returns None with no user address space).
+/// This helper lets tests place a waiter at a non-zero tgid so we can
+/// verify that `futex_wake(tgid, ...)` correctly reaches private-futex
+/// queues (the fix for the `clear_child_tid` / `pthread_join` hang).
+#[allow(dead_code)]
+pub(crate) fn futex_wait_at_tgid_for_test(tgid: u32, uaddr: usize) {
+    let tid = akuma_exec::threading::current_thread_id();
+    let key = (tgid, uaddr);
+    {
+        let mut waiters = FUTEX_WAITERS.lock();
+        waiters.entry(key).or_insert_with(Vec::new).push(tid);
+    }
+    akuma_exec::threading::schedule_blocking(u64::MAX);
+    // futex_do_wake removed us from the queue before calling wake()
 }
 
 pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr2: usize, val3: u32) -> u64 {

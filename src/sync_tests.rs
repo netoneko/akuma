@@ -1981,6 +1981,130 @@ fn test_futex_private_tgid_isolation() {
     console::print("  [PASS] test_futex_private_tgid_isolation\n");
 }
 
+/// futex_wake(tgid, addr, MAX) must wake a FUTEX_WAIT (shared, tgid=0) waiter.
+/// In test context every FUTEX_WAIT_PRIVATE resolves to tgid=0, so this
+/// exercises the first (tgid=0) branch of the new futex_wake().
+fn test_futex_wake_tgid_wakes_shared_waiter() {
+    static FUTEX_WORD_WS: AtomicU32 = AtomicU32::new(0);
+    static REACHED_WS: AtomicBool = AtomicBool::new(false);
+
+    FUTEX_WORD_WS.store(0, Ordering::SeqCst);
+    REACHED_WS.store(false, Ordering::SeqCst);
+
+    threading::spawn_fn(|| {
+        crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+        let uaddr = FUTEX_WORD_WS.as_ptr() as usize;
+        let ts = Timespec { tv_sec: 2, tv_nsec: 0 };
+        let timeout_ptr = &ts as *const Timespec as u64;
+        crate::syscall::handle_syscall(NR_FUTEX, &[uaddr as u64, FUTEX_WAIT, 0, timeout_ptr, 0, 0]);
+        REACHED_WS.store(true, Ordering::Release);
+        crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); }
+    }).expect("test_futex_wake_tgid_wakes_shared_waiter: spawn failed");
+
+    for _ in 0..15 { threading::yield_now(); }
+
+    let uaddr = FUTEX_WORD_WS.as_ptr() as usize;
+    // futex_wake with a non-zero tgid must still wake the shared (tgid=0) waiter.
+    crate::syscall::futex_wake(42, uaddr, i32::MAX);
+
+    let mut woke = false;
+    for _ in 0..50 {
+        threading::yield_now();
+        if REACHED_WS.load(Ordering::Acquire) { woke = true; break; }
+    }
+    assert!(woke, "test_futex_wake_tgid_wakes_shared_waiter: shared waiter not woken by futex_wake(tgid=42)");
+    console::print("  [PASS] test_futex_wake_tgid_wakes_shared_waiter\n");
+}
+
+/// futex_do_wake(42, addr, MAX) alone must NOT wake a (0, addr) waiter —
+/// the two queues are independent.  This demonstrates why the old
+/// futex_wake() = futex_do_wake(0, ...) missed private-futex waiters at
+/// tgid != 0, and that the fix (waking both queues) is necessary.
+fn test_futex_do_wake_zero_misses_nonzero_tgid_waiter() {
+    static FUTEX_WORD_MN: AtomicU32 = AtomicU32::new(0);
+    static REACHED_MN: AtomicBool = AtomicBool::new(false);
+
+    FUTEX_WORD_MN.store(0, Ordering::SeqCst);
+    REACHED_MN.store(false, Ordering::SeqCst);
+
+    let uaddr = FUTEX_WORD_MN.as_ptr() as usize;
+
+    // Thread blocks with explicit tgid=42 (simulating FUTEX_WAIT_PRIVATE in a
+    // process whose read_current_pid() returns 42).
+    threading::spawn_fn(move || {
+        crate::syscall::futex_wait_at_tgid_for_test(42, uaddr);
+        REACHED_MN.store(true, Ordering::Release);
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); }
+    }).expect("test_futex_do_wake_zero_misses_nonzero_tgid_waiter: spawn failed");
+
+    for _ in 0..15 { threading::yield_now(); }
+
+    // Wake only the (0, addr) queue — must miss our (42, addr) waiter.
+    let woken = crate::syscall::futex_do_wake(0, uaddr, u32::MAX);
+    assert_eq!(woken, 0,
+        "test_futex_do_wake_zero_misses_nonzero_tgid_waiter: do_wake(0) should miss (42,addr), got {}",
+        woken);
+    for _ in 0..10 { threading::yield_now(); }
+    assert!(!REACHED_MN.load(Ordering::Acquire),
+        "test_futex_do_wake_zero_misses_nonzero_tgid_waiter: thread must not wake on do_wake(0)");
+
+    // Now futex_wake(42, ...) must reach the (42, addr) queue and wake it.
+    crate::syscall::futex_wake(42, uaddr, i32::MAX);
+    let mut woke = false;
+    for _ in 0..50 {
+        threading::yield_now();
+        if REACHED_MN.load(Ordering::Acquire) { woke = true; break; }
+    }
+    assert!(woke,
+        "test_futex_do_wake_zero_misses_nonzero_tgid_waiter: futex_wake(42) must wake (42,addr) waiter");
+    console::print("  [PASS] test_futex_do_wake_zero_misses_nonzero_tgid_waiter\n");
+}
+
+/// futex_wake(0, addr, n) must not double-fire the (0,addr) queue: when
+/// tgid=0 the second branch is skipped, so exactly n waiters are woken.
+fn test_futex_wake_zero_tgid_no_double_fire() {
+    static FUTEX_WORD_DF: AtomicU32 = AtomicU32::new(0);
+    static COUNT_DF: AtomicU32 = AtomicU32::new(0);
+
+    FUTEX_WORD_DF.store(0, Ordering::SeqCst);
+    COUNT_DF.store(0, Ordering::SeqCst);
+
+    let uaddr = FUTEX_WORD_DF.as_ptr() as usize;
+
+    for _ in 0..2 {
+        threading::spawn_fn(|| {
+            crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+            let uaddr2 = FUTEX_WORD_DF.as_ptr() as usize;
+            let ts = Timespec { tv_sec: 2, tv_nsec: 0 };
+            let timeout_ptr = &ts as *const Timespec as u64;
+            crate::syscall::handle_syscall(NR_FUTEX, &[uaddr2 as u64, FUTEX_WAIT, 0, timeout_ptr, 0, 0]);
+            COUNT_DF.fetch_add(1, Ordering::SeqCst);
+            crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+            threading::mark_current_terminated();
+            loop { threading::yield_now(); }
+        }).expect("test_futex_wake_zero_tgid_no_double_fire: spawn failed");
+    }
+
+    for _ in 0..20 { threading::yield_now(); }
+
+    // Wake exactly 1 — tgid=0 means only the (0,addr) branch fires once.
+    crate::syscall::futex_wake(0, uaddr, 1);
+
+    for _ in 0..30 { threading::yield_now(); }
+    let woken = COUNT_DF.load(Ordering::Acquire);
+    assert_eq!(woken, 1,
+        "test_futex_wake_zero_tgid_no_double_fire: expected 1 woken, got {} (double-fire?)", woken);
+
+    // Clean up the remaining waiter.
+    crate::syscall::futex_wake(0, uaddr, 1);
+    for _ in 0..20 { threading::yield_now(); }
+
+    console::print("  [PASS] test_futex_wake_zero_tgid_no_double_fire\n");
+}
+
 // ============================================================================
 // clock_gettime / clock_getres Tests
 // ============================================================================
@@ -2218,6 +2342,11 @@ pub fn run_all_tests() {
     test_futex_private_flag_basic_wake();
     test_futex_private_flag_wake_one_of_two();
     test_futex_private_tgid_isolation();
+    // clear_child_tid / pthread_join fix: futex_wake(tgid, ...) must reach both
+    // the shared (tgid=0) and private (tgid=N) queues.
+    test_futex_wake_tgid_wakes_shared_waiter();
+    test_futex_do_wake_zero_misses_nonzero_tgid_waiter();
+    test_futex_wake_zero_tgid_no_double_fire();
     console::print("--- Futex Sync Tests Done ---
 
 ");

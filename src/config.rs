@@ -102,7 +102,7 @@ pub const CANARY_WORDS: usize = 8;
 
 /// Enable [futex-dbg] trace logging for wait/wake pairs with timestamps.
 /// Zero cost when false (LLVM eliminates const-false branches).
-pub const FUTEX_DBG_ENABLED: bool = false;
+pub const FUTEX_DBG_ENABLED: bool = true;
 
 /// Fail tests if test binaries are missing
 ///

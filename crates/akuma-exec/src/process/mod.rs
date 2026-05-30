@@ -886,7 +886,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             let tid_addr = proc.clear_child_tid;
             if tid_addr != 0 && crate::mmu::is_current_user_page_mapped(tid_addr as usize) {
                 unsafe { core::ptr::write(tid_addr as *mut u32, 0); }
-                (runtime().futex_wake)(tid_addr as usize, i32::MAX);
+                (runtime().futex_wake)(proc.tgid, tid_addr as usize, i32::MAX);
             }
 
             // Robust futex list cleanup: walk the list and mark owned futexes
@@ -896,6 +896,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
                 const FUTEX_OWNER_DIED: u32 = 0x40000000;
                 const ROBUST_LIST_LIMIT: usize = 2048;
                 let my_tid = proc.pid;
+                let my_tgid = proc.tgid;
                 // robust_list_head layout: { next: *mut robust_list, futex_offset: long, list_op_pending: *mut robust_list }
                 if crate::mmu::is_current_user_page_mapped(robust_head as usize) {
                     let futex_offset = unsafe {
@@ -915,7 +916,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
                                 let word = unsafe { core::ptr::read(futex_addr as *const u32) };
                                 if (word & 0x3FFFFFFF) == my_tid {
                                     unsafe { core::ptr::write(futex_addr as *mut u32, word | FUTEX_OWNER_DIED); }
-                                    (runtime().futex_wake)(futex_addr, 1);
+                                    (runtime().futex_wake)(my_tgid, futex_addr, 1);
                                 }
                             }
                             entry = unsafe { core::ptr::read(entry as *const u64) };
@@ -932,7 +933,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
                             let word = unsafe { core::ptr::read(futex_addr as *const u32) };
                             if (word & 0x3FFFFFFF) == my_tid {
                                 unsafe { core::ptr::write(futex_addr as *mut u32, word | FUTEX_OWNER_DIED); }
-                                (runtime().futex_wake)(futex_addr, 1);
+                                (runtime().futex_wake)(my_tgid, futex_addr, 1);
                             }
                         }
                     }
