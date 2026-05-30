@@ -4,6 +4,31 @@ use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 const EROFS: u64 = (-30i64) as u64;
 
+/// Bounded, always-on diagnostic counter for `read()` returning EBADF.
+///
+/// A process calling `read()` on a descriptor that is *absent* from its fd
+/// table is abnormal and is the exact symptom of a fork/CLOEXEC-handshake
+/// fd-table bug — e.g. rustc's libstd `fork`+exec child-spawn, where the parent
+/// reads its O_CLOEXEC error pipe and panics with
+/// `the CLOEXEC pipe failed: ... Bad file descriptor`. Logging the first few
+/// occurrences (with pid/tid/fd and the precise reason) localizes which fd
+/// disappeared from which process without flooding the console on programs that
+/// legitimately probe closed fds. See `docs/RUST_TOOLCHAIN.md`.
+static READ_EBADF_TRACE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn trace_read_ebadf(reason: &str, fd: u64, buf_ptr: u64) {
+    use core::sync::atomic::Ordering;
+    if READ_EBADF_TRACE.fetch_add(1, Ordering::Relaxed) < 32 {
+        let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+        let tid = akuma_exec::threading::current_thread_id();
+        crate::safe_print!(
+            192,
+            "[read-ebadf] {} pid={} tid={} fd={} buf={:#x}\n",
+            reason, pid, tid, fd, buf_ptr,
+        );
+    }
+}
+
 pub(crate) fn fs_error_to_errno(e: crate::vfs::FsError) -> u64 {
     use crate::vfs::FsError;
     match e {
@@ -86,29 +111,14 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     let proc = match akuma_exec::process::current_process() {
         Some(p) => p,
         None => {
-            if crate::config::SYSCALL_DEBUG_PIPE_READ {
-                crate::tprint!(
-                    128,
-                    "[pipe-read] EBADF no current_process fd={} buf={:#x}\n",
-                    fd_num,
-                    buf_ptr,
-                );
-            }
+            trace_read_ebadf("no-current-process", fd_num, buf_ptr);
             return EBADF;
         }
     };
     let fd = match proc.get_fd(fd_num as u32) {
         Some(e) => e,
         None => {
-            if crate::config::SYSCALL_DEBUG_PIPE_READ {
-                crate::tprint!(
-                    160,
-                    "[pipe-read] EBADF bad fd pid={} fd={} buf={:#x}\n",
-                    proc.pid,
-                    fd_num,
-                    buf_ptr,
-                );
-            }
+            trace_read_ebadf("fd-not-in-table", fd_num, buf_ptr);
             return EBADF;
         }
     };
@@ -1133,9 +1143,11 @@ pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
         let mut new_pos = 0i64;
         let mut success = false;
         let mut bad_fd = true;
+        let mut is_file = false;
         proc.update_fd(fd, |entry| {
             bad_fd = false;
             if let akuma_exec::process::FileDescriptor::File(f) = entry {
+                is_file = true;
                 let size = crate::fs::file_size(&f.path).unwrap_or(0) as i64;
                 new_pos = match whence { 0 => offset, 1 => f.position as i64 + offset, 2 => size + offset, _ => -1 };
                 if new_pos >= 0 {
@@ -1145,7 +1157,21 @@ pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
                 }
             }
         });
-        if success { new_pos as u64 } else if bad_fd { EBADF } else { EINVAL }
+        if success {
+            new_pos as u64
+        } else if bad_fd {
+            EBADF
+        } else if is_file {
+            // The fd is a real, seekable file but the requested offset/whence is
+            // invalid (negative result or unknown `whence`) → EINVAL.
+            EINVAL
+        } else {
+            // The fd exists but refers to a pipe, socket, terminal, eventfd, etc.
+            // POSIX requires `lseek` on a non-seekable object to return ESPIPE,
+            // not EINVAL. Rust/musl probe stderr with `lseek(fd, 0, SEEK_CUR)` to
+            // test seekability and expect ESPIPE on a pipe/tty.
+            ESPIPE
+        }
     } else { ESRCH }
 }
 

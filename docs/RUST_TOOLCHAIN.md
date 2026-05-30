@@ -9,9 +9,10 @@ still block a full compile-and-link.
 | Stage | State |
 |-------|-------|
 | `rustc` loads + runs codegen (`.rcgu.o` produced) | ✅ works (needs ≥2 GB RAM) |
-| Linker spawn handshake (`socketpair`) | ✅ **fixed** (this doc) |
-| Final link (invoking `cc`/`ld`) | ❌ userspace `SIGSEGV` in `rustc` (separate, pre-existing) |
-| `-C linker=clang` | ❌ `clang` not installed (only gcc/binutils) |
+| Linker spawn handshake (`socketpair`) | ✅ **fixed** (this doc, §1) |
+| `lseek`/`readlinkat` EINVAL during link probe | ✅ benign or **fixed** (§4) |
+| Linker spawn handshake (libstd `fork` + O_CLOEXEC error pipe) | ❌ parent panics `the CLOEXEC pipe failed: … Bad file descriptor` (EBADF) — under investigation (§4) |
+| Final link (invoking `cc`/`ld`) | ❌ userspace `SIGSEGV` in `rustc` (older trace; now masked by the EBADF above) |
 
 ---
 
@@ -195,10 +196,10 @@ stale instance):
 
 ## 3. Known remaining blockers (out of scope for the socketpair fix)
 
-### 3a. Userspace `SIGSEGV` during link
+### 3a. Userspace `SIGSEGV` during link (older trace — now masked by §4)
 
-After `socketpair` succeeds and rustc forks to spawn the linker, `rustc`
-(pid 77 in the trace) hits a userspace data abort:
+An earlier trace, after `socketpair` succeeded and rustc forked to spawn the
+linker, showed `rustc` (pid 77) hitting a userspace data abort:
 
 ```
 [T93.93] [WILD-DA] pid=77 FAR=0xf0f1a298 ELR=0x30048a90 last_sc=...
@@ -208,24 +209,112 @@ After `socketpair` succeeds and rustc forks to spawn the linker, `rustc`
 
 This is an **EL0 (userspace) fault** — the faulting PC (`~0x30048a90`) is in the
 musl/libc region and the accessed address (`0xf0f1a298`) maps to no region
-("WILD-DA"). It is a **separate, pre-existing** userspace/toolchain crash,
-reached only now that socketpair no longer blocks earlier. It is *not* a kernel
-crash (the VM stayed up) and not related to the socketpair change. Tracking this
-likely overlaps with the existing `*_SIGSEGV_COMPILE*` investigations.
+("WILD-DA"). It is *not* a kernel crash (the VM stayed up). **As of the
+2026-05-30 runs (§4) this is no longer the symptom reached** — the spawn now
+fails earlier, in the libstd `fork`+exec handshake (EBADF). Keep this note for
+history; revisit only once §4 is resolved.
 
-### 3b. `clang` not installed
+### 3b. `clang` — installed and works for C
 
-The bootstrap apk run installs **gcc/binutils** (`cc`, `ld`, `as`, `ar`, `nm`),
-not LLVM/clang. `rustc -C linker=clang` would fail with `ENOENT` on the exec
-even with socketpair working. Use the default linker (`cc`) or `apk add clang`.
+The earlier claim that `clang` was not installed is **outdated**. `clang` is
+present and compiles C fine inside the VM (verified: `clang hello.c` produces a
+working binary). So `rustc -C linker=clang` does reach the linker — the current
+blocker is *not* a missing `clang`, it is the libstd spawn handshake (§4).
+
+---
+
+## 4. EINVAL audit + libstd-spawn `EBADF` (2026-05-30)
+
+Triggered by `rustc -v -C linker=clang hello.rs`, which panics:
+
+```
+thread 'rustc' panicked at library/std/src/sys/process/unix/unix.rs:154:
+the CLOEXEC pipe failed: Os { code: 9, kind: Uncategorized, message: "Bad file descriptor" }
+  … rustc_codegen_ssa::back::link::link_binary …
+error: the compiler unexpectedly panicked. this is a bug.
+```
+
+### 4a. EINVAL audit (`rustc1.log`) — not the cause
+
+All `EINVAL`s in the log fall into three buckets; none break rustc:
+
+1. **Boot self-tests** (`pid=0 tid=0 ELR=?`) — the kernel deliberately drives
+   `mmap`/`futex`/`io_setup` to their EINVAL paths. Expected.
+2. **`readlinkat` (nr 78), ~337×, runtime** — `args=[AT_FDCWD, path, buf, bufsz]`
+   with `bufsz` cycling `0xff8→0x1000` (a path-canonicalization buffer loop).
+   `sys_readlinkat` returns `EINVAL` when the path **exists but is not a
+   symlink** (`src/syscall/fs.rs`), which is exactly POSIX `readlink(2)`
+   behavior. rustc tolerates it and continues (`PSTATS` shows `readlinkat`
+   taking <100 ms total). **Benign — no change.**
+3. **`lseek` (nr 62), 1×** — `lseek(fd=2 /*stderr*/, 0, SEEK_CUR)`, the standard
+   "is stderr seekable?" probe. The handler returned `EINVAL` for every
+   non-`File` fd. POSIX requires **`ESPIPE`** on a pipe/tty/socket. **Fixed:**
+   `sys_lseek` now returns `ESPIPE` for non-seekable fd types and keeps `EINVAL`
+   only for a real file with an invalid offset/whence. Guard:
+   `test_lseek_nonseekable_returns_espipe`.
+
+### 4b. The real blocker — `EBADF` reading the libstd CLOEXEC error pipe
+
+`code: 9` is `EBADF`, **not** `EINVAL`. This is libstd's `fork`+exec fallback
+(not `posix_spawn`): the parent reads the read-end of an `O_CLOEXEC` pipe that
+the child either closes on a successful `exec` (→ parent reads EOF = success) or
+writes the exec errno into. The parent's `read()` returning `EBADF` means **the
+read-end fd is absent from the parent's fd table** at read time.
+
+What the investigation established:
+
+- **Pipe refcounting is correct.** `test_pipe_clone_ref_then_double_close`
+  models the exact spawn lifecycle (fork clone_ref → child dup3/close → child
+  exec closes its CLOEXEC end → parent close) and passes. A *destroyed* pipe
+  would surface as `read()→0` (EOF), **not** `EBADF`.
+- **`clang` itself works** (`clang hello.c` succeeds), so the child's `execve`
+  succeeds — the parent *should* read EOF, yet gets `EBADF`. That isolates the
+  fault to libstd's `fork`+CLOEXEC-pipe handshake (the in-kernel shell's exec
+  path, which does **not** use this handshake, runs clang fine).
+- **`fork` deep-clones the fd table** (`fork_process` →
+  `clone_deep_for_fork`), so the child cannot remove the parent's entry. The
+  read-path handles both `PipeRead` and `UnixSocket`, so this is not a
+  missing-fd-type fallthrough.
+
+Conclusion: the parent's CLOEXEC pipe read-end is being removed from its fd
+table by something at the process/threading level (rustc is multithreaded; the
+spawn is from a worker thread sharing the fd-table `Arc`). The exact remover is
+not determinable from static analysis alone, so a **bounded, always-on
+diagnostic** was added: `read()` returning `EBADF` now logs the first 32
+occurrences as
+
+```
+[read-ebadf] <reason> pid=… tid=… fd=… buf=…
+```
+
+where `<reason>` is `no-current-process` or `fd-not-in-table`. The next run will
+name the exact pid/tid/fd and which of the two paths fires — that pins the bug.
+
+### 4c. Fix landed alongside — CLOEXEC closed only on successful `exec`
+
+`do_execve` previously called `close_cloexec_fds()` **before** `replace_image`.
+A failed image load (bad ELF → `ENOEXEC`, OOM → `ENOMEM`) then returned to a
+process whose close-on-exec fds had already been torn down. POSIX closes
+`O_CLOEXEC` fds only at the **point of no return** (a *committed* image
+replacement); a failed `execve` must leave the fd table intact — for a libstd
+child that is what preserves its error-report pipe so it can hand the errno
+back. **Fixed:** the CLOEXEC sweep now runs only after `replace_image` succeeds.
+Guard: `test_failed_exec_preserves_cloexec_fds` (stages a non-ELF file, attempts
+`do_execve`, asserts the cloexec fd survives the failure).
+
+This is correct hygiene and matters for failed execs, but note it does **not**
+by itself explain the `clang` `EBADF` (there the child's exec *succeeds*) — that
+remains pending the §4b diagnostic.
 
 ---
 
 ## References
 
-- Syscall dispatch: `src/syscall/mod.rs`
+- Syscall dispatch + errno consts (`ESPIPE`): `src/syscall/mod.rs`
 - socketpair handler: `src/syscall/net.rs`
 - Pipe backing: `src/syscall/pipe.rs`
-- FD table / fork: `crates/akuma-exec/src/process/{types,fd}.rs`
-- Self-tests: `src/process_tests.rs`
+- `read()` EBADF diagnostic, `sys_lseek` (ESPIPE), `sys_readlinkat`: `src/syscall/fs.rs`
+- `do_execve` CLOEXEC-on-success ordering: `src/syscall/proc.rs`
+- FD table / fork: `crates/akuma-exec/src/process/{types,fd}.rs`, `fork_process`/`replace_image` in `crates/akuma-exec/src/process/{mod,image}.rs`
+- Self-tests: `src/process_tests.rs` (`test_lseek_nonseekable_returns_espipe`, `test_failed_exec_preserves_cloexec_fds`, `test_pipe_clone_ref_then_double_close`)
 - Related: `docs/APK_MISSING_SYSCALLS.md`, `docs/FORK_MMAP_AND_WAIT_STATUS_FIX.md`

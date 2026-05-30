@@ -112,6 +112,10 @@ pub fn run_all_tests() {
     test_pipe_clone_ref_then_double_close();
     test_pipe_dupfd_bumps_refcount();
     test_pipe_dup3_atomically_replaces_and_closes_old();
+    // execve fd-table semantics: lseek on a pipe is ESPIPE not EINVAL;
+    // a FAILED execve must leave close-on-exec fds intact (see RUST_TOOLCHAIN.md).
+    test_lseek_nonseekable_returns_espipe();
+    test_failed_exec_preserves_cloexec_fds();
 
     // Test atomic pipe_check_set_reader (race fix for blocking read hang)
     test_pipe_check_set_reader_data_available();
@@ -2311,6 +2315,123 @@ fn test_pipe_dup3_atomically_replaces_and_closes_old() {
     pipe_close_write(id_b); // write=2-1=1
     pipe_close_write(id_b); // write=0
     pipe_close_read(id_b);  // read=0, pipe_b destroyed
+}
+
+/// `lseek` on a non-seekable descriptor (pipe, socket, terminal, eventfd, …)
+/// must return ESPIPE, not EINVAL.
+///
+/// Rust/musl probe a descriptor's seekability with `lseek(fd, 0, SEEK_CUR)` and
+/// expect `ESPIPE` on a pipe/tty; the old handler returned `EINVAL` for every
+/// non-`File` fd, which misreports the error class. `EINVAL` remains correct for
+/// a *real* file given an invalid offset/whence. A genuinely bad fd must still
+/// be `EBADF`. See `docs/RUST_TOOLCHAIN.md` (lseek EINVAL→ESPIPE).
+fn test_lseek_nonseekable_returns_espipe() {
+    use akuma_exec::process::FileDescriptor;
+    const NR_LSEEK: u64 = 62;
+    const SEEK_CUR: u64 = 1;
+    const ESPIPE: u64 = (-29i64) as u64;
+    const EBADF: u64 = (-9i64) as u64;
+    const EINVAL: u64 = (-22i64) as u64;
+
+    let proc = match akuma_exec::process::current_process() {
+        Some(p) => p,
+        None => {
+            console::print("[Test] lseek_nonseekable_returns_espipe SKIP (no current process)\n");
+            return;
+        }
+    };
+
+    // Install a pipe read-end fd on the current process (read=1, write=1).
+    let pipe_id = crate::syscall::pipe::pipe_create();
+    let fd = proc.alloc_fd(FileDescriptor::PipeRead(pipe_id));
+
+    // lseek on a pipe → ESPIPE (non-seekable), NOT the old EINVAL.
+    let pipe_ret = crate::syscall::handle_syscall(NR_LSEEK, &[fd as u64, 0, SEEK_CUR, 0, 0, 0]);
+    // lseek on an absent fd → EBADF (the non-seekable path must not mask this).
+    let bad_ret = crate::syscall::handle_syscall(NR_LSEEK, &[9999, 0, SEEK_CUR, 0, 0, 0]);
+
+    if pipe_ret == ESPIPE && bad_ret == EBADF {
+        console::print("[Test] lseek_nonseekable_returns_espipe PASSED\n");
+    } else {
+        crate::safe_print!(
+            192,
+            "[Test] lseek_nonseekable_returns_espipe FAILED: pipe_lseek={} (want ESPIPE={}; EINVAL={} was the bug), bad_fd={} (want EBADF={})\n",
+            pipe_ret as i64, ESPIPE as i64, EINVAL as i64, bad_ret as i64, EBADF as i64,
+        );
+    }
+
+    // Cleanup: drop the fd and tear down the pipe.
+    proc.remove_fd(fd);
+    crate::syscall::pipe::pipe_close_read(pipe_id);  // read=0
+    crate::syscall::pipe::pipe_close_write(pipe_id); // write=0 → destroyed
+}
+
+/// A FAILED `execve` (image load fails) must NOT close the process's
+/// close-on-exec descriptors.
+///
+/// On Linux, `execve` closes O_CLOEXEC fds only once it commits to replacing the
+/// image — the "point of no return". A failure (bad ELF, OOM) must leave the fd
+/// table untouched so the caller can recover. For a libstd `fork`+exec child,
+/// this is exactly what keeps its O_CLOEXEC error-report pipe alive so the child
+/// can hand the exec errno back to the parent. The previous `do_execve` closed
+/// CLOEXEC fds *before* `replace_image`, so a failed exec left the table
+/// corrupted. Regression guard for that ordering bug — see
+/// `docs/RUST_TOOLCHAIN.md`.
+fn test_failed_exec_preserves_cloexec_fds() {
+    use akuma_exec::process::FileDescriptor;
+    const TMP_PATH: &str = "/tmp/akuma_cloexec_exec_test.bin";
+
+    let proc = match akuma_exec::process::current_process() {
+        Some(p) => p,
+        None => {
+            console::print("[Test] failed_exec_preserves_cloexec_fds SKIP (no current process)\n");
+            return;
+        }
+    };
+
+    // Stage a regular file that is neither a shebang script nor a valid ELF, so
+    // `do_execve` reads it fine but `replace_image` fails fast at the ELF magic
+    // check (before mutating the address space — verified in image.rs).
+    let bogus = b"not-an-elf-binary: plain text so load_elf_with_stack rejects it";
+    if crate::fs::write_file(TMP_PATH, bogus).is_err() {
+        console::print("[Test] failed_exec_preserves_cloexec_fds SKIP (/tmp not writable)\n");
+        return;
+    }
+
+    // Install a close-on-exec pipe write-end (mirrors libstd's CLOEXEC pipe).
+    let pipe_id = crate::syscall::pipe::pipe_create(); // read=1, write=1
+    let fd = proc.alloc_fd(FileDescriptor::PipeWrite(pipe_id));
+    proc.set_cloexec(fd);
+
+    // Attempt the doomed execve. `do_execve` returns an errno on failure (it
+    // only enters user mode on success), so it is safe to call here.
+    let mut argv = alloc::vec::Vec::new();
+    argv.push(alloc::string::String::from(TMP_PATH));
+    let env: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    let ret = crate::syscall::proc::do_execve(alloc::string::String::from(TMP_PATH), argv, env);
+
+    // The exec must have FAILED (a successful one never returns) and the
+    // close-on-exec fd must survive intact.
+    let failed = (ret as i64) < 0;
+    let still_present = proc.get_fd(fd).is_some();
+    let still_cloexec = proc.is_cloexec(fd);
+
+    if failed && still_present && still_cloexec {
+        console::print("[Test] failed_exec_preserves_cloexec_fds PASSED\n");
+    } else {
+        crate::safe_print!(
+            192,
+            "[Test] failed_exec_preserves_cloexec_fds FAILED: execve={} (want <0), fd_present={} cloexec={}\n",
+            ret as i64, still_present, still_cloexec,
+        );
+    }
+
+    // Cleanup: drop the fd + pipe, remove the temp file.
+    proc.clear_cloexec(fd);
+    proc.remove_fd(fd);
+    crate::syscall::pipe::pipe_close_write(pipe_id); // write=0
+    crate::syscall::pipe::pipe_close_read(pipe_id);  // read=0 → destroyed
+    let _ = crate::fs::remove_file(TMP_PATH);
 }
 
 /// Directly exercise the CLONE_VFORK race-fix mechanism:

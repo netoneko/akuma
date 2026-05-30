@@ -552,7 +552,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     do_execve(resolved_path, args, env)
 }
 
-fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 {
+pub(crate) fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 {
     let file_data = match crate::fs::read_file(&resolved_path) {
         Ok(data) => Some(data),
         Err(crate::vfs::FsError::Internal) => None,
@@ -573,26 +573,6 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
         None => return ESRCH,
     };
 
-    let closed_fds = proc.close_cloexec_fds();
-    for (_fd, entry) in closed_fds {
-        match entry {
-            akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => super::pipe::pipe_close_write(pipe_id),
-            akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => super::pipe::pipe_close_read(pipe_id),
-            akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
-                super::pipe::pipe_close_read(rx);
-                super::pipe::pipe_close_write(tx);
-            }
-            akuma_exec::process::FileDescriptor::Socket(idx) => akuma_net::socket::remove_socket(idx),
-            akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
-                akuma_exec::process::remove_child_channel(child_pid);
-            }
-            akuma_exec::process::FileDescriptor::EventFd(efd_id) => super::eventfd::eventfd_close(efd_id),
-            akuma_exec::process::FileDescriptor::EpollFd(epoll_id) => super::poll::epoll_destroy(epoll_id),
-            akuma_exec::process::FileDescriptor::PidFd(pidfd_id) => super::pidfd::pidfd_close(pidfd_id),
-            _ => {}
-        }
-    }
-
     let replace_result = if let Some(ref data) = file_data {
         proc.replace_image(data, &args, &env)
     } else {
@@ -611,7 +591,39 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
         // `replace_image` returns a stringly-typed error from the ELF loader;
         // a "Failed to load ELF: ..." message means the binary is malformed
         // (missing PT_LOAD, bad magic, etc.) — Linux returns ENOEXEC for that.
+        //
+        // NOTE: close-on-exec fds are *not* closed until after this point.  On
+        // Linux, `execve` only closes O_CLOEXEC descriptors once it has
+        // committed to replacing the image (the point of no return).  If we
+        // closed them earlier and then failed here, the process would resume at
+        // the failed `execve` with a corrupted fd table.  For a libstd
+        // fork+exec child that means its O_CLOEXEC error-report pipe would
+        // already be gone, so it could neither report the exec failure to the
+        // parent nor leave the parent's handshake pipe in a coherent state.
         return if e.contains("Failed to load ELF") { ENOEXEC } else { ENOMEM };
+    }
+
+    // Image replacement committed — *now* close the close-on-exec descriptors.
+    // This is the POSIX "point of no return": a successful execve closes every
+    // O_CLOEXEC fd, while a failed one (handled above) leaves them untouched.
+    let closed_fds = proc.close_cloexec_fds();
+    for (_fd, entry) in closed_fds {
+        match entry {
+            akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => super::pipe::pipe_close_write(pipe_id),
+            akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => super::pipe::pipe_close_read(pipe_id),
+            akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+                super::pipe::pipe_close_read(rx);
+                super::pipe::pipe_close_write(tx);
+            }
+            akuma_exec::process::FileDescriptor::Socket(idx) => akuma_net::socket::remove_socket(idx),
+            akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
+                akuma_exec::process::remove_child_channel(child_pid);
+            }
+            akuma_exec::process::FileDescriptor::EventFd(efd_id) => super::eventfd::eventfd_close(efd_id),
+            akuma_exec::process::FileDescriptor::EpollFd(epoll_id) => super::poll::epoll_destroy(epoll_id),
+            akuma_exec::process::FileDescriptor::PidFd(pidfd_id) => super::pidfd::pidfd_close(pidfd_id),
+            _ => {}
+        }
     }
 
     proc.name = resolved_path.clone();

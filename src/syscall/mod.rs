@@ -349,6 +349,7 @@ const EISDIR: u64 = (-21i64) as u64;
 const EINVAL: u64 = (-22i64) as u64;
 const EMFILE: u64 = (-24i64) as u64;
 const ENOSPC: u64 = (-28i64) as u64;
+const ESPIPE: u64 = (-29i64) as u64;
 const ENOSYS: u64 = (-38i64) as u64;
 const ENOTEMPTY: u64 = (-39i64) as u64;
 const EAFNOSUPPORT: u64 = (-97i64) as u64;
