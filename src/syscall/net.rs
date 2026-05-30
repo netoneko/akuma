@@ -28,6 +28,73 @@ pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
     EMFILE
 }
 
+/// AF_UNIX `socketpair` (syscall 199).
+///
+/// Rust std uses this to build the IPC channel that relays a spawned child's
+/// exec errno back to the parent. `rustc` calls it before exec'ing the linker,
+/// so without it `rustc -C linker=...` fails with ENOSYS ("could not exec the
+/// linker: Function not implemented").
+///
+/// Backed by two unidirectional kernel pipes (px carries endpoint0 -> endpoint1,
+/// py carries endpoint1 -> endpoint0). Each endpoint reads from one pipe and
+/// writes to the other. NOTE: this approximates SOCK_SEQPACKET with a byte
+/// stream — message boundaries are not preserved. That is sufficient for
+/// libstd's single fixed-size handshake (and EOF-on-success) but is not a fully
+/// conformant SEQPACKET.
+pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: u64) -> u64 {
+    let base_type = sock_type & 0xFF;
+    let cloexec = sock_type & 0x80000 != 0;
+    let nonblock = sock_type & 0x800 != 0;
+    // Only AF_UNIX (1); accept SOCK_STREAM (1) and SOCK_SEQPACKET (5).
+    if domain != 1 || (base_type != 1 && base_type != 5) {
+        crate::safe_print!(96, "[syscall] socketpair(domain={}, type=0x{:x}): unsupported\n", domain, sock_type);
+        return EAFNOSUPPORT;
+    }
+    if !validate_user_ptr(sv_ptr, 8) {
+        return EFAULT;
+    }
+    let proc = match akuma_exec::process::current_process() {
+        Some(p) => p,
+        None => return ESRCH,
+    };
+
+    // Two unidirectional pipes; each pipe_create() starts at write_count=1,
+    // read_count=1, which is exactly one writer + one reader per direction.
+    let px = super::pipe::pipe_create();
+    let py = super::pipe::pipe_create();
+
+    let fd0 = proc.alloc_fd(akuma_exec::process::FileDescriptor::UnixSocket { rx: px, tx: py });
+    let fd1 = proc.alloc_fd(akuma_exec::process::FileDescriptor::UnixSocket { rx: py, tx: px });
+
+    if cloexec {
+        proc.set_cloexec(fd0);
+        proc.set_cloexec(fd1);
+    }
+    if nonblock {
+        proc.set_nonblock(fd0);
+        proc.set_nonblock(fd1);
+    }
+
+    let fds = [fd0 as i32, fd1 as i32];
+    if unsafe { copy_to_user_safe(sv_ptr as *mut u8, fds.as_ptr() as *const u8, 8).is_err() } {
+        // Roll back so we don't leak fds or pipe slots. Closing both directions
+        // of each pipe drives its ref counts to zero and destroys it.
+        proc.remove_fd(fd0);
+        proc.remove_fd(fd1);
+        proc.clear_cloexec(fd0);
+        proc.clear_cloexec(fd1);
+        proc.clear_nonblock(fd0);
+        proc.clear_nonblock(fd1);
+        super::pipe::pipe_close_read(px);
+        super::pipe::pipe_close_write(px);
+        super::pipe::pipe_close_read(py);
+        super::pipe::pipe_close_write(py);
+        return EFAULT;
+    }
+    crate::safe_print!(96, "[syscall] socketpair(AF_UNIX) = ({}, {})\n", fd0, fd1);
+    0
+}
+
 pub(super) fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     if len < 16 { return EINVAL; }
     if !validate_user_ptr(addr_ptr, len) { return EFAULT; }

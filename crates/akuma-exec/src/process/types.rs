@@ -144,6 +144,10 @@ pub enum FileDescriptor {
     ChildStdout(Pid),
     PipeRead(u32),
     PipeWrite(u32),
+    /// AF_UNIX socketpair endpoint, backed by two unidirectional kernel pipes.
+    /// `rx` is the pipe this endpoint reads from; `tx` is the pipe it writes to.
+    /// The peer endpoint has rx/tx swapped.
+    UnixSocket { rx: u32, tx: u32 },
     EventFd(u32),
     DevNull,
     DevUrandom,

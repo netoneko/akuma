@@ -124,6 +124,12 @@ pub fn run_all_tests() {
     test_pipe_double_close_no_panic();
     test_pipe_eof_after_data_flush();
 
+    // socketpair (syscall 199) — rustc's linker spawn needs AF_UNIX socketpair
+    test_socketpair_not_enosys();
+    test_socketpair_domain_rejected();
+    test_socketpair_bidirectional();
+    test_socketpair_close_refcount();
+
     // Test exit_group sibling behavior (Fix 1)
     test_exit_group_does_not_unregister_while_siblings_running();
     test_rt_sigaction_after_exit_group_not_enosys();
@@ -2533,6 +2539,84 @@ fn test_pipe_double_close_no_panic() {
     // Second close_write on a gone pipe — must not panic
     pipe_close_write(id);
     console::print("[Test] pipe_double_close_no_panic PASSED\n");
+}
+
+/// Regression for the rustc linker-spawn failure: socketpair (nr 199) must be
+/// dispatched, not return ENOSYS. (A null sv pointer yields EFAULT, which still
+/// proves the arm is wired — same shape as test_vfork_dispatch.)
+fn test_socketpair_not_enosys() {
+    const ENOSYS: u64 = (-38i64) as u64;
+    // socketpair(AF_UNIX=1, SOCK_STREAM=1, proto=0, sv=NULL)
+    let result = crate::syscall::handle_syscall(199, &[1, 1, 0, 0, 0, 0]);
+    if result != ENOSYS {
+        console::print("[Test] socketpair_not_enosys PASSED\n");
+    } else {
+        console::print("[Test] socketpair_not_enosys FAILED: returned ENOSYS (arm not wired)\n");
+    }
+}
+
+/// Only AF_UNIX is supported; AF_INET must be rejected with EAFNOSUPPORT.
+fn test_socketpair_domain_rejected() {
+    const EAFNOSUPPORT: u64 = (-97i64) as u64;
+    // socketpair(AF_INET=2, SOCK_STREAM=1, 0, NULL)
+    let result = crate::syscall::handle_syscall(199, &[2, 1, 0, 0, 0, 0]);
+    if result == EAFNOSUPPORT {
+        console::print("[Test] socketpair_domain_rejected PASSED\n");
+    } else {
+        crate::safe_print!(96, "[Test] socketpair_domain_rejected FAILED: expected EAFNOSUPPORT, got 0x{:x}\n", result);
+    }
+}
+
+/// The two-pipe backing must carry data independently in both directions:
+/// endpoint A = {rx:px, tx:py}, endpoint B = {rx:py, tx:px}.
+fn test_socketpair_bidirectional() {
+    use crate::syscall::pipe::*;
+    let px = pipe_create();
+    let py = pipe_create();
+
+    // A writes to its tx (py); B reads from its rx (py).
+    let _ = pipe_write(py, b"ping");
+    let mut buf = [0u8; 8];
+    let (n1, _) = pipe_read(py, &mut buf);
+    let dir_a_to_b = n1 == 4 && &buf[..4] == b"ping";
+
+    // B writes to its tx (px); A reads from its rx (px).
+    let _ = pipe_write(px, b"pong");
+    let mut buf2 = [0u8; 8];
+    let (n2, _) = pipe_read(px, &mut buf2);
+    let dir_b_to_a = n2 == 4 && &buf2[..4] == b"pong";
+
+    // Clean up both pipes (drive each direction's ref counts to zero).
+    pipe_close_read(px);
+    pipe_close_write(px);
+    pipe_close_read(py);
+    pipe_close_write(py);
+
+    if dir_a_to_b && dir_b_to_a {
+        console::print("[Test] socketpair_bidirectional PASSED\n");
+    } else {
+        crate::safe_print!(96, "[Test] socketpair_bidirectional FAILED: a->b={} b->a={}\n", dir_a_to_b, dir_b_to_a);
+    }
+}
+
+/// Closing both endpoints drives both backing pipes to DESTROY, and a redundant
+/// close after teardown must not panic (mirrors test_pipe_double_close_no_panic).
+fn test_socketpair_close_refcount() {
+    use crate::syscall::pipe::*;
+    let px = pipe_create(); // write=1, read=1
+    let py = pipe_create(); // write=1, read=1
+
+    // Close endpoint A = {rx:px, tx:py}
+    pipe_close_read(px);  // px read=0
+    pipe_close_write(py); // py write=0
+    // Close endpoint B = {rx:py, tx:px}
+    pipe_close_read(py);  // py read=0 → py DESTROY
+    pipe_close_write(px); // px write=0 → px DESTROY
+
+    // Redundant closes on gone pipes must not panic.
+    pipe_close_write(px);
+    pipe_close_read(py);
+    console::print("[Test] socketpair_close_refcount PASSED\n");
 }
 
 /// Write data, close write end, read all data, then read again → EOF.

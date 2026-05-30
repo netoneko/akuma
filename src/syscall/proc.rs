@@ -578,6 +578,10 @@ fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 
         match entry {
             akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => super::pipe::pipe_close_write(pipe_id),
             akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => super::pipe::pipe_close_read(pipe_id),
+            akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+                super::pipe::pipe_close_read(rx);
+                super::pipe::pipe_close_write(tx);
+            }
             akuma_exec::process::FileDescriptor::Socket(idx) => akuma_net::socket::remove_socket(idx),
             akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
                 akuma_exec::process::remove_child_channel(child_pid);

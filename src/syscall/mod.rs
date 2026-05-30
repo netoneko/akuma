@@ -169,6 +169,7 @@ pub mod nr {
     pub const FSTAT: u64 = 80;
     pub const NANOSLEEP: u64 = 101;
     pub const SOCKET: u64 = 198;
+    pub const SOCKETPAIR: u64 = 199;
     pub const BIND: u64 = 200;
     pub const LISTEN: u64 = 201;
     pub const ACCEPT: u64 = 202;
@@ -595,6 +596,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FSTAT => fs::sys_fstat(args[0] as u32, args[1]),
         nr::NANOSLEEP => time::sys_nanosleep(args[0], args[1]),
         nr::SOCKET => net::sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),
+        nr::SOCKETPAIR => net::sys_socketpair(args[0] as i32, args[1] as i32, args[2] as i32, args[3]),
         nr::BIND => net::sys_bind(args[0] as u32, args[1], args[2] as usize),
         nr::LISTEN => net::sys_listen(args[0] as u32, args[1] as i32),
         nr::ACCEPT => net::sys_accept(args[0] as u32, args[1], args[2]),

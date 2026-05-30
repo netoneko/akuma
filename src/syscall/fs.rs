@@ -426,6 +426,33 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
             }
         }
+        // AF_UNIX socketpair endpoint: read from this endpoint's `rx` pipe.
+        akuma_exec::process::FileDescriptor::UnixSocket { rx, .. } => {
+            let nonblock = super::net::fd_is_nonblock(fd_num as u32);
+            let mut temp = alloc::vec![0u8; count];
+            loop {
+                let (n, eof) = super::pipe::pipe_read(rx, &mut temp);
+                if n > 0 {
+                    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                        return EFAULT;
+                    }
+                    return n as u64;
+                }
+                if eof {
+                    return 0;
+                }
+                if nonblock {
+                    return EAGAIN;
+                }
+                if akuma_exec::process::is_current_interrupted() {
+                    return EINTR;
+                }
+                let tid = akuma_exec::threading::current_thread_id();
+                if !super::pipe::pipe_check_set_reader(rx, tid) {
+                    akuma_exec::threading::schedule_blocking(u64::MAX);
+                }
+            }
+        }
         akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
             if count < 8 { return EINVAL; }
             let nonblock = super::eventfd::eventfd_is_nonblock(efd_id) || super::net::fd_is_nonblock(fd_num as u32);
@@ -674,6 +701,16 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     }
                 }
             }
+            // AF_UNIX socketpair endpoint: write to this endpoint's `tx` pipe.
+            akuma_exec::process::FileDescriptor::UnixSocket { tx, .. } => {
+                match super::pipe::pipe_write(tx, buf_slice) {
+                    Ok(n) => n as u64,
+                    Err(e) => {
+                        if total_written > 0 { return total_written as u64; }
+                        return (-(e as i64)) as u64;
+                    }
+                }
+            }
             akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
                 if this_chunk < 8 { return EINVAL; } // Should enforce 8 byte writes
                 let val = unsafe { core::ptr::read(buf_slice.as_ptr() as *const u64) };
@@ -810,6 +847,10 @@ pub(super) fn sys_dup(oldfd: u32) -> u64 {
     match &entry {
         akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_clone_ref(*id, true),
         akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_clone_ref(*id, false),
+        akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+            super::pipe::pipe_clone_ref(*rx, false);
+            super::pipe::pipe_clone_ref(*tx, true);
+        }
         _ => {}
     }
     let newfd = proc.alloc_fd(entry);
@@ -839,6 +880,10 @@ pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
     match &entry {
         akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_clone_ref(*id, true),
         akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_clone_ref(*id, false),
+        akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+            super::pipe::pipe_clone_ref(*rx, false);
+            super::pipe::pipe_clone_ref(*tx, true);
+        }
         _ => {}
     }
 
@@ -857,6 +902,10 @@ pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
         match old {
             akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_close_write(id),
             akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_close_read(id),
+            akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+                super::pipe::pipe_close_read(rx);
+                super::pipe::pipe_close_write(tx);
+            }
             akuma_exec::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
             akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
                 super::eventfd::eventfd_close(efd_id);
@@ -1011,6 +1060,10 @@ pub(crate) fn sys_close(fd: u32) -> u64 {
                 akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
                     super::pipe::pipe_close_read(pipe_id);
                 }
+                akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+                    super::pipe::pipe_close_read(rx);
+                    super::pipe::pipe_close_write(tx);
+                }
                 akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
                     super::eventfd::eventfd_close(efd_id);
                 }
@@ -1055,6 +1108,10 @@ pub(crate) fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
                     }
                     akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
                         super::pipe::pipe_close_read(pipe_id);
+                    }
+                    akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+                        super::pipe::pipe_close_read(rx);
+                        super::pipe::pipe_close_write(tx);
                     }
                     akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
                         super::eventfd::eventfd_close(efd_id);

@@ -59,6 +59,10 @@ impl SharedFdTable {
             match entry {
                 FileDescriptor::PipeWrite(id) => (crate::runtime::runtime().pipe_clone_ref)(*id, true),
                 FileDescriptor::PipeRead(id) => (crate::runtime::runtime().pipe_clone_ref)(*id, false),
+                FileDescriptor::UnixSocket { rx, tx } => {
+                    (crate::runtime::runtime().pipe_clone_ref)(*rx, false);
+                    (crate::runtime::runtime().pipe_clone_ref)(*tx, true);
+                }
                 FileDescriptor::EventFd(id) => (crate::runtime::runtime().eventfd_clone_ref)(*id),
                 _ => {}
             }
@@ -95,6 +99,10 @@ impl SharedFdTable {
                 }
                 FileDescriptor::PipeRead(pipe_id) => {
                     (runtime().pipe_close_read)(pipe_id);
+                }
+                FileDescriptor::UnixSocket { rx, tx } => {
+                    (runtime().pipe_close_read)(rx);
+                    (runtime().pipe_close_write)(tx);
                 }
                 FileDescriptor::EventFd(efd_id) => {
                     (runtime().eventfd_close)(efd_id);

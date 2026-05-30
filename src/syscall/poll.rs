@@ -340,6 +340,24 @@ pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Optio
                 }
             }
         }
+        // AF_UNIX socketpair endpoint: readable when `rx` has data, writable
+        // when `tx`'s peer is still open.
+        akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+            if requested & EPOLLIN != 0 {
+                if waker.is_some() {
+                    super::pipe::pipe_add_poller(rx, tid);
+                }
+                if super::pipe::pipe_can_read(rx) {
+                    ready |= EPOLLIN;
+                }
+            }
+            if requested & EPOLLOUT != 0 {
+                super::pipe::pipe_add_poller(tx, tid);
+                if super::pipe::pipe_can_write(tx) {
+                    ready |= EPOLLOUT;
+                }
+            }
+        }
         akuma_exec::process::FileDescriptor::TimerFd(timer_id) => {
             if requested & EPOLLIN != 0 {
                 if waker.is_some() {

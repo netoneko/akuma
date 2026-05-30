@@ -119,6 +119,7 @@ impl ProcFilesystem {
             FileDescriptor::Socket(_) => format!("socket:[{}]", fd),
             FileDescriptor::PipeRead(id) => format!("pipe:[{}]", id),
             FileDescriptor::PipeWrite(id) => format!("pipe:[{}]", id),
+            FileDescriptor::UnixSocket { rx, .. } => format!("socket:[{}]", rx),
             FileDescriptor::EpollFd(_) => String::from("anon_inode:[eventpoll]"),
             FileDescriptor::TimerFd(_) => String::from("anon_inode:[timerfd]"),
             FileDescriptor::EventFd(_) => String::from("anon_inode:[eventfd]"),
