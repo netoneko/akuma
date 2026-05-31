@@ -39,7 +39,9 @@ pub(crate) fn mmap_fixed_overlaps_kernel_va(addr: usize, len: usize) -> bool {
     use akuma_exec::process::types::ProcessMemory;
     let pages = (len + 4095) / 4096;
     let map_end = addr.saturating_add(pages * 4096);
-    addr < ProcessMemory::KERNEL_VA_END && map_end > ProcessMemory::KERNEL_VA_START
+    // kernel_va_end() scales with detected RAM so this guard catches MAP_FIXED
+    // overlaps with the full RAM identity map, not just a fixed 2GB window.
+    addr < akuma_exec::mmu::kernel_va_end() && map_end > ProcessMemory::KERNEL_VA_START
 }
 
 pub(super) fn sys_brk(new_brk: usize) -> u64 {

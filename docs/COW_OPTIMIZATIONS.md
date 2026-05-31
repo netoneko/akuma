@@ -290,16 +290,20 @@ memory), plus an O(1) registration instead of O(n) up-front population.
 signature: pages that eager mmap would have allocated up front are now allocated
 only when touched.  All boot self-tests stay green.
 
-> **Known limitation — `MEMORY` > 2 GB:** the kernel/user VA split is hardcoded
-> at `ProcessMemory::KERNEL_VA_END = 0xC000_0000` (3 GB), which assumes RAM
-> ≤ 2 GB (identity map `[1 GB, 3 GB)`).  With `MEMORY=4096` the kernel
-> identity-maps physical RAM over `[1 GB, 5 GB)` as **EL1-only** pages, so a
-> user mmap placed at ≥ 3 GB (rustc's allocator does this) collides with the
-> identity map and an EL0 access takes a **permission fault → SIGSEGV** (observed
-> at `FAR≈0xfecb2bf8`).  This is independent of Fix F (it does not change mmap
-> placement or the identity map) and pre-exists it; running rustc requires
-> `MEMORY=2048` until `KERNEL_VA_END` is scaled with RAM (or the user mmap base
-> is moved above the identity map).
+> **`MEMORY` > 2 GB — FIXED (was a hard limitation).** The kernel/user VA split
+> was hardcoded at `KERNEL_VA_END = 0xC000_0000` (3 GB), assuming RAM ≤ 2 GB.
+> With larger RAM the kernel identity-maps physical RAM as **EL1-only** pages
+> beyond 3 GB, so a user mmap placed at ≥ 3 GB (rustc's linker reservation, which
+> `alloc_mmap` jumps to `KERNEL_VA_END`) collided with it → EL0 permission fault
+> → SIGSEGV at `FAR≈0xfecb2bf8`; and the kernel zeroing a frame ≥ 3 GB on the
+> 3 GB boot map faulted in EL1 (`FAR≈0xc1573000`), killing clang/ld during exec.
+> **Both are now fixed:** `KERNEL_VA_END` is the dynamic
+> `mmu::kernel_va_end()` (scales with detected RAM) and
+> `mmu::extend_boot_ram_identity_map()` extends the boot map to cover all RAM.
+> rustc now compiles+links+runs at `MEMORY` up to 6 GB, with free RAM scaling
+> with the configured size. Full design + verification: `docs/MEMORY_LAYOUT.md`
+> ("RAM > 2 GB"). This is independent of Fix F (it changes neither mmap
+> population nor the identity map).
 
 ---
 

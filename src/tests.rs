@@ -110,6 +110,7 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_map_pages_survive_subsequent_allocs, "map_pages_survive_subsequent_allocs");
     run_test!(test_map_interleaved_regions_same_l3, "map_interleaved_regions_same_l3");
     run_test!(test_kernel_identity_mapping_full_ram, "kernel_identity_mapping_full_ram");
+    run_test!(test_boot_map_covers_full_ram, "boot_map_covers_full_ram");
     run_test!(test_mmap_does_not_overlap_identity_map, "mmap_does_not_overlap_identity_map");
 
     // Bug 10: partial munmap of eager regions
@@ -3872,6 +3873,47 @@ fn test_kernel_identity_mapping_full_ram() -> bool {
     true
 }
 
+/// The boot TTBR0 identity map must cover *all* detected RAM, not just the
+/// static 3GB from boot.rs. Regression for the MEMORY>2GB EL1 fault: the kernel
+/// zeroes PMM frames via phys_to_virt while the boot table is the active TTBR0
+/// (e.g. replace_image's deactivate→swap window), so a frame at PA>=3GB on a
+/// >2GB machine faulted (killed clang/ld). `mmu::extend_boot_ram_identity_map`
+/// (called from `mmu::init`) maps the rest of RAM as 1GB blocks. This walks the
+/// boot L1 and asserts every 1GB entry covering [ram_base, ram_end) is valid —
+/// it passes at any MEMORY size and fails if the high-RAM mapping is missing.
+fn test_boot_map_covers_full_ram() -> bool {
+    console::print("\n[TEST] boot identity map covers full detected RAM\n");
+    let ram_base = akuma_exec::mmu::ram_base();
+    let ram_end = akuma_exec::mmu::ram_end();
+    let l0_phys = (akuma_exec::mmu::get_boot_ttbr0() & 0x0000_FFFF_FFFF_F000) as usize;
+    if l0_phys == 0 {
+        console::print("  SKIP: boot ttbr0 unavailable\n");
+        return true;
+    }
+    let l0 = akuma_exec::mmu::phys_to_virt(l0_phys) as *const u64;
+    let l0e = unsafe { core::ptr::read_volatile(l0) };
+    if l0e & 1 == 0 {
+        console::print("  FAIL: boot L0[0] not valid\n");
+        return false;
+    }
+    let l1 = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+
+    let start = ram_base >> 30;
+    let end = (ram_end - 1) >> 30;
+    let mut pass = true;
+    for idx in start..=end {
+        let e = unsafe { core::ptr::read_volatile(l1.add(idx)) };
+        if e & 1 == 0 {
+            crate::safe_print!(128, "  FAIL: boot L1[{}] (VA {:#x}) not mapped — RAM frame there is unreachable in boot context\n",
+                idx, idx << 30);
+            pass = false;
+        }
+    }
+    crate::safe_print!(128, "  RAM [{:#x},{:#x}) covered by boot L1[{}..={}]  Result: {}\n",
+        ram_base, ram_end, start, end, if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
 /// Bug 8: CLONE_VM child's mmap_regions is empty — lookups must use owner PID.
 ///
 /// Registers a parent and a CLONE_VM child in PROCESS_TABLE. Adds mmap_regions
@@ -4091,7 +4133,11 @@ fn test_map_127_pages_all_ptes_exist() -> bool {
     // contamination through shared L1/L2 entries. Page table frames are
     // intentionally LEAKED (not freed) — this matches real kernel behavior
     // where map_user_page's return value is dropped and PhysFrame has no Drop.
-    let base_va: usize = 0x1_0000_0000; // L1[4], unique to this test
+    // Scratch VA at 256GB (L1[256]), unique to this test. Must stay ABOVE the
+    // kernel RAM identity map (extended to cover all RAM in the boot table by
+    // mmu::extend_boot_ram_identity_map) — a base in [3GB, ram_end) would now
+    // collide with a 1GB identity block on >2GB machines.
+    let base_va: usize = 0x40_0000_0000;
     let pages = 127usize;
     let mut frames = Vec::new();
 
@@ -4143,7 +4189,7 @@ fn test_map_pages_survive_subsequent_allocs() -> bool {
     unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
     let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
 
-    let base_va: usize = 0x1_4000_0000; // L1[5], unique to this test
+    let base_va: usize = 0x40_4000_0000; // 257GB (L1[257]), above the RAM identity map
     let pages = 127usize;
     let mut frames = Vec::new();
 
@@ -4196,8 +4242,8 @@ fn test_map_interleaved_regions_same_l3() -> bool {
     unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
     let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
 
-    // L1[6], unique to this test. Offsets within a single 2MB range.
-    let base_2mb: usize = 0x1_8000_0000;
+    // 258GB (L1[258]), above the RAM identity map. Offsets within a single 2MB range.
+    let base_2mb: usize = 0x40_8000_0000;
     let regions: [(usize, usize); 4] = [
         (0x94000, 1),   // L3[148]
         (0x95000, 3),   // L3[149-151]
@@ -4740,7 +4786,7 @@ fn test_readahead_race_phantom_frames() -> bool {
     console::print("\n[TEST] Bug 5: readahead race → phantom frame waste\n");
 
     const NUM_PAGES: usize = 8;
-    let base_va: usize = 0x1_D000_0000;
+    let base_va: usize = 0x40_C000_0000; // 259GB, above the RAM identity map
 
     // "Thread A" readahead: map NUM_PAGES pages normally
     let mut frames_a = Vec::new();
@@ -6627,10 +6673,12 @@ fn test_pmm_contiguous_double_stack_size_no_overlap() -> bool {
 /// skip [0x4000_0000, 0x5000_0000) when the bump pointer would otherwise
 /// land there. Previously allocations could land in the kernel VA and crash.
 fn test_alloc_mmap_skips_kernel_va_hole() -> bool {
-    console::print("\n[TEST] alloc_mmap: skips kernel VA hole 0x4000_0000–0xC000_0000\n");
-
     const KERNEL_VA_START: usize = 0x4000_0000;
-    const KERNEL_VA_END:   usize = 0xC000_0000;
+    // Dynamic: the hole now spans the real RAM identity map, which scales with
+    // detected RAM (was hardcoded 0xC000_0000 = 2GB machine).
+    let kernel_va_end: usize = akuma_exec::mmu::kernel_va_end();
+    crate::safe_print!(96, "\n[TEST] alloc_mmap: skips kernel VA hole 0x{:x}-0x{:x}\n",
+        KERNEL_VA_START, kernel_va_end);
 
     // Place next_mmap just before the hole so the next alloc would enter it
     // without the skip logic.
@@ -6654,14 +6702,14 @@ fn test_alloc_mmap_skips_kernel_va_hole() -> bool {
         }
     };
 
-    let inside_hole = addr < KERNEL_VA_END && addr + 2 * 4096 > KERNEL_VA_START;
+    let inside_hole = addr < kernel_va_end && addr + 2 * 4096 > KERNEL_VA_START;
     if inside_hole {
         crate::safe_print!(128, "  FAIL: alloc_mmap returned {:#x} inside kernel VA hole\n", addr);
     } else {
         crate::safe_print!(128, "  alloc_mmap returned {:#x} (hole avoided)\n", addr);
     }
 
-    let pass = !inside_hole && addr >= KERNEL_VA_END;
+    let pass = !inside_hole && addr >= kernel_va_end;
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }
@@ -7507,8 +7555,10 @@ fn test_oom_crash_pattern_documentation() -> bool {
 fn test_safe_user_access_fault() -> bool {
     console::print("\n[TEST] Safe user access fault redirection\n");
     
-    // Address that is definitely not mapped
-    let invalid_addr = 0xdead0000usize as *mut u8;
+    // Address that is definitely not mapped: just above the kernel RAM identity
+    // map (which scales with RAM — a fixed low address like 0xdead0000 lands
+    // *inside* the EL1-only identity map on >2GB machines and no longer faults).
+    let invalid_addr = (akuma_exec::mmu::kernel_va_end() + 0x4000_0000) as *mut u8;
     let kernel_buf = [0u8; 16];
     
     // This should NOT crash/kill kernel, but return Err(14) (EFAULT)
@@ -7537,7 +7587,9 @@ fn test_safe_user_access_fault() -> bool {
 fn test_copy_from_user_str_fault() -> bool {
     console::print("\n[TEST] copy_from_user_str fault handling\n");
     
-    let invalid_addr = 0xdead0000u64;
+    // Unmapped VA above the (RAM-size-dependent) kernel identity map; see
+    // test_safe_user_access_fault for why a fixed low address no longer works.
+    let invalid_addr = (akuma_exec::mmu::kernel_va_end() + 0x4000_0000) as u64;
     let res = crate::syscall::copy_from_user_str(invalid_addr, 1024);
     
     let ok = match res {
@@ -8064,18 +8116,21 @@ fn test_mmap_fixed_kernel_va_guard() -> bool {
     console::print("\n[TEST] mmap MAP_FIXED: kernel VA range guard logic\n");
     use akuma_exec::process::types::ProcessMemory;
     let kva_start = ProcessMemory::KERNEL_VA_START;
-    let kva_end   = ProcessMemory::KERNEL_VA_END;
+    // Dynamic: the guard now tracks the real RAM identity-map extent, which
+    // scales with detected RAM (kernel_va_end >= KERNEL_VA_START always).
+    let kva_end   = akuma_exec::mmu::kernel_va_end();
+    let mid = (kva_start + (kva_end - kva_start) / 2) & !0xFFF;
 
     // (addr, len, should_reject)
     let cases: &[(usize, usize, bool)] = &[
-        (0x8000_0000, 0x1000, true),   // mid-range
+        (mid,         0x1000, true),   // mid-range
         (kva_start,   0x1000, true),   // at exact start
         (kva_end - 0x1000, 0x1000, true), // last page in range
         (kva_end - 0x1000, 0x2000, true), // straddles end
         (kva_start - 0x1000, 0x2000, true), // straddles start
-        (0x3000_0000, 0x1000, false),  // well below
+        (0x3000_0000, 0x1000, false),  // well below (256 MB, under RAM base)
         (kva_end,     0x1000, false),  // first page above range
-        (0xD000_0000, 0x1000, false),  // well above
+        (kva_end + 0x1000_0000, 0x1000, false),  // well above
     ];
 
     let mut pass = true;
@@ -8092,28 +8147,31 @@ fn test_mmap_fixed_kernel_va_guard() -> bool {
     pass
 }
 
-/// Regression: Go SIGSEGV at PC=0x80000000 — lazy fault kernel VA guard.
+/// Lazy-fault kernel-VA guard, dynamic-RAM aware.
 ///
-/// Verifies that `far_in_kernel_identity_user_range` covers the full
-/// kernel identity-map range up to KERNEL_VA_END (0xC000_0000), not
-/// just the lower half (the old upper bound was 0x8000_0000).
+/// `far_in_kernel_identity_user_range` must cover the *full* kernel RAM
+/// identity-map VA window `[KERNEL_VA_START, kernel_va_end())`, where
+/// `kernel_va_end()` scales with detected RAM (it was hardcoded to 0xC000_0000,
+/// which only fit a 2GB machine and made MEMORY>2GB SIGSEGV; see
+/// docs/COW_OPTIMIZATIONS.md).  Cases are derived from the dynamic bound so this
+/// passes at any `MEMORY` size.
 fn test_lazy_fault_kernel_va_guard() -> bool {
-    console::print("\n[TEST] lazy fault: far_in_kernel_identity_user_range covers full range\n");
+    console::print("\n[TEST] lazy fault: far_in_kernel_identity_user_range covers RAM identity map\n");
     use crate::exceptions::far_in_kernel_identity_user_range;
     use akuma_exec::process::types::ProcessMemory;
     let kva_start = ProcessMemory::KERNEL_VA_START as u64;
-    let kva_end   = ProcessMemory::KERNEL_VA_END as u64;
+    let kva_end   = akuma_exec::mmu::kernel_va_end() as u64; // dynamic: tracks detected RAM
+    let mid = kva_start + (kva_end - kva_start) / 2;
 
     // (far, expected_in_range)
     let cases: &[(u64, bool)] = &[
         (kva_start,       true),
-        (0x6000_0000,     true),
-        (0x8000_0000,     true),  // was false with old 0x8000_0000 bound — regression case
+        (mid,             true),
         (kva_end - 1,     true),
-        (kva_end,         false), // first address above range
+        (kva_end,         false), // first address above the identity map
         (kva_start - 1,   false),
-        (0x1009_ee90,     false),
-        (0xD000_0000,     false),
+        (0x1009_ee90,     false), // user low VA, below RAM base
+        (kva_end + 0x1000_0000, false), // well above
     ];
 
     let mut pass = true;
@@ -8136,10 +8194,11 @@ fn test_fork_mmap_skips_kernel_va() -> bool {
     console::print("\n[TEST] fork mmap copy: skips pages in kernel VA range\n");
     use akuma_exec::process::types::ProcessMemory;
     let kva_start = ProcessMemory::KERNEL_VA_START;
-    let kva_end   = ProcessMemory::KERNEL_VA_END;
+    let kva_end   = akuma_exec::mmu::kernel_va_end(); // dynamic: tracks detected RAM
+    let mid = (kva_start + (kva_end - kva_start) / 2) & !0xFFF;
 
-    let bad_vas:  &[usize] = &[kva_start, 0x6000_0000, 0x8000_0000, kva_end - 0x1000];
-    let ok_vas:   &[usize] = &[kva_start - 0x1000, kva_end, 0x1000_0000, 0xD000_0000];
+    let bad_vas:  &[usize] = &[kva_start, mid, kva_end - 0x1000];
+    let ok_vas:   &[usize] = &[kva_start - 0x1000, kva_end, 0x1000_0000, kva_end + 0x1000_0000];
 
     let mut pass = true;
     for &va in bad_vas {

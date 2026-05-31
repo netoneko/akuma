@@ -30,6 +30,91 @@ pub fn init(ram_base: usize, ram_size: usize) {
     RAM_BASE.store(ram_base, Ordering::Release);
     RAM_SIZE.store(ram_size, Ordering::Release);
     MMU_INITIALIZED.store(true, Ordering::Release);
+    #[cfg(target_os = "none")]
+    extend_boot_ram_identity_map(ram_base, ram_size);
+}
+
+/// Top (exclusive) of the RAM range that `src/boot.rs` statically identity-maps:
+/// L1[0]=device [0,1GB), L1[1]=[1GB,2GB), L1[2]=[2GB,3GB). Anything above this
+/// must be mapped at runtime once the detected RAM size is known.
+const BOOT_STATIC_MAP_END: usize = 0xC000_0000; // 3 GB
+
+/// Extend the boot TTBR0 identity map to cover ALL detected RAM.
+///
+/// `boot.rs` statically maps only `[0, 3GB)`. The PMM, however, hands out frames
+/// across the full detected RAM, and the kernel zeroes/accesses any such frame
+/// via `phys_to_virt` (VA == PA) while the boot table may be the active TTBR0
+/// (e.g. the deactivate→swap window in `replace_image`). On a >2GB machine a
+/// frame at PA >= 3GB then hits an unmapped boot-table entry → EL1 translation
+/// fault (observed killing clang/ld during exec at MEMORY>=3.5G; see
+/// docs/COW_OPTIMIZATIONS.md). Map the remaining RAM as 1GB NORMAL blocks
+/// (EL1-only, matching boot.rs's L1[1]/L1[2]) so kernel-context access to any
+/// valid frame works regardless of which TTBR0 is active. Per-AS user mappings
+/// already cover full RAM via `add_kernel_mappings`; this fixes the *boot* table.
+#[cfg(target_os = "none")]
+fn extend_boot_ram_identity_map(ram_base: usize, ram_size: usize) {
+    let _ = ram_base;
+    let ram_end = ram_base.saturating_add(ram_size);
+    if ram_end <= BOOT_STATIC_MAP_END {
+        return; // RAM fits within the static boot map; nothing to do.
+    }
+
+    // boot L0[0] -> the 1GB-block identity L1 table. get_boot_ttbr0 carries
+    // ASID 0, so its value is the L0 physical address directly.
+    let l0_phys = (get_boot_ttbr0() & 0x0000_FFFF_FFFF_F000) as usize;
+    if l0_phys == 0 { return; }
+    let l0 = phys_to_virt(l0_phys) as *const u64;
+    let l0_0 = unsafe { core::ptr::read_volatile(l0) };
+    let l1_phys = (l0_0 & 0x0000_FFFF_FFFF_F000) as usize;
+    let l1 = phys_to_virt(l1_phys) as *mut u64;
+
+    // 1GB NORMAL block, EL1 RW / EL0 none — same attributes boot.rs uses.
+    let block_flags =
+        flags::VALID | flags::BLOCK | flags::AF | flags::SH_INNER | attr_index(MAIR_NORMAL_WB);
+
+    let start_idx = BOOT_STATIC_MAP_END >> 30;        // 3
+    let end_idx = ((ram_end - 1) >> 30).min(511);     // last 1GB L1 entry for RAM
+    for idx in start_idx..=end_idx {
+        let pa = (idx << 30) as u64;
+        unsafe { core::ptr::write_volatile(l1.add(idx), pa | block_flags); }
+    }
+    unsafe {
+        core::arch::asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb");
+    }
+}
+
+/// Fallback kernel-RAM window bounds used before `init` (host unit tests, early
+/// boot). These match the historical hardcoded 2GB-RAM identity map so behavior
+/// is unchanged when RAM bounds aren't known yet.
+const FALLBACK_RAM_BASE: usize = 0x4000_0000;
+const FALLBACK_RAM_END: usize = 0xC000_0000;
+
+/// Physical base of usable RAM (where the PMM allocates from).
+pub fn ram_base() -> usize {
+    let b = RAM_BASE.load(Ordering::Acquire);
+    if b == 0 { FALLBACK_RAM_BASE } else { b }
+}
+
+/// Physical end (exclusive) of usable RAM.
+pub fn ram_end() -> usize {
+    let size = RAM_SIZE.load(Ordering::Acquire);
+    if size == 0 { FALLBACK_RAM_END } else { ram_base() + size }
+}
+
+/// Top (exclusive) of the kernel RAM identity-map VA window, rounded up to a 1GB
+/// boundary.  `add_kernel_mappings` identity-maps `[ram_base, ram_end)` as
+/// EL1-only 2MB blocks in every user address space, so user VA allocation must
+/// avoid `[KERNEL_VA_START, kernel_va_end())` — otherwise a user mapping lands on
+/// top of those kernel blocks and an EL0 access permission-faults (the MEMORY>2GB
+/// SIGSEGV; see docs/COW_OPTIMIZATIONS.md).  Scaling this with detected RAM is
+/// what lets `MEMORY` exceed 2GB.  Rounding up to 1GB keeps user VAs out of any
+/// L1 entry that holds a kernel RAM L2 table, so user page tables never share an
+/// L2 with the kernel identity map.
+pub fn kernel_va_end() -> usize {
+    let size = RAM_SIZE.load(Ordering::Acquire);
+    if size == 0 { return FALLBACK_RAM_END; }
+    const GB: usize = 1 << 30;
+    (ram_end() + GB - 1) & !(GB - 1)
 }
 
 /// Physical address of the shared device L1 table (under L0[1]).

@@ -678,7 +678,7 @@ pub(crate) const TEST_SIGFRAME_UC_SIGMASK: usize = SIGFRAME_UCONTEXT + 40;
 pub(crate) fn far_in_kernel_identity_user_range(far: u64) -> bool {
     let a = far as usize;
     a >= akuma_exec::process::types::ProcessMemory::KERNEL_VA_START
-        && a < akuma_exec::process::types::ProcessMemory::KERNEL_VA_END
+        && a < akuma_exec::mmu::kernel_va_end()
 }
 
 /// Emulate `DC ZVA` for EL0 when QEMU TCG still traps it despite SCTLR_EL1.DZE=1.

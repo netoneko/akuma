@@ -1607,11 +1607,14 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             let mut ok = true;
             for (i, pf) in parent_frames.iter().enumerate() {
                 let page_va = va_start + i * mmu::PAGE_SIZE;
-                if pf.addr < 0x4000_0000 || pf.addr >= 0xC000_0000 {
+                // Reject frames outside usable RAM, or VAs inside the kernel RAM
+                // identity map. Both bounds scale with detected RAM (were hardcoded
+                // to a 2GB machine, which mis-rejected valid frames/VAs at >2GB).
+                if pf.addr < mmu::ram_base() || pf.addr >= mmu::ram_end() {
                     ok = false;
                     break;
                 }
-                if page_va >= ProcessMemory::KERNEL_VA_START && page_va < ProcessMemory::KERNEL_VA_END {
+                if page_va >= ProcessMemory::KERNEL_VA_START && page_va < mmu::kernel_va_end() {
                     ok = false;
                     break;
                 }

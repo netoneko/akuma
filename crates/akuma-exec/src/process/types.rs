@@ -341,14 +341,21 @@ impl ProcessMemory {
     }
 
     pub const KERNEL_VA_START: usize = 0x4000_0000;
+    /// Fallback top of the kernel-RAM identity-map VA hole, used only before the
+    /// MMU knows the real RAM size (host unit tests).  At runtime the kernel uses
+    /// the dynamic `crate::mmu::kernel_va_end()`, which scales with detected RAM —
+    /// the 0xC000_0000 value here corresponds to a 2GB-RAM machine.  See
+    /// `kernel_va_end()` for why this must track RAM size.
     pub const KERNEL_VA_END: usize   = 0xC000_0000;
 
     pub fn alloc_mmap(&mut self, size: usize) -> Option<usize> {
+        // Dynamic top of the kernel identity-map hole (scales with RAM size).
+        let kva_end = crate::mmu::kernel_va_end();
         for i in 0..self.free_regions.len() {
             let (start, f_size) = self.free_regions[i];
-            
-            // Skip regions that overlap with the 2GB kernel identity map
-            if start < Self::KERNEL_VA_END && start + f_size > Self::KERNEL_VA_START {
+
+            // Skip regions that overlap the kernel RAM identity map.
+            if start < kva_end && start + f_size > Self::KERNEL_VA_START {
                 continue;
             }
 
@@ -369,9 +376,12 @@ impl ProcessMemory {
             let cur = self.next_mmap.load(Ordering::Relaxed);
             let mut candidate = cur;
 
-            // Skip over the kernel reserved range if the allocation would overlap it
-            if candidate < Self::KERNEL_VA_END && candidate + size > Self::KERNEL_VA_START {
-                candidate = Self::KERNEL_VA_END;
+            // Skip over the kernel RAM identity-map range if the allocation would
+            // overlap it. Jump to the dynamic top (kva_end), NOT the 2GB-machine
+            // const — otherwise the bump pointer lands at 0xC000_0000 inside the
+            // real identity map on >2GB-RAM machines (the rustc MEMORY>2GB crash).
+            if candidate < kva_end && candidate + size > Self::KERNEL_VA_START {
+                candidate = kva_end;
             }
 
             if self.overlaps_stack(candidate, size) {
