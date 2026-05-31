@@ -110,6 +110,22 @@ pub fn interrupt_thread(thread_id: usize) {
 ///
 /// Returns None if TTBR0 points to boot page tables (no user process context).
 pub fn read_current_pid() -> Option<Pid> {
+    // vfork fast-path: a shared-AS child reads the *parent's* PROCESS_INFO page,
+    // so the page no longer uniquely identifies the caller.  THREAD_PID_MAP is
+    // authoritative for every user thread; resolve it to the owning process's
+    // tgid.  This is behavior-preserving for normal threads (page pid == tgid
+    // leader, so callers including getpid see the same value) and gives a vfork
+    // child its own pid (its tgid == its pid).  Gated so toggling the fast-path
+    // off restores the exact prior page-only behavior.
+    if crate::runtime::config().vfork_fastpath_enabled {
+        let tid = crate::threading::current_thread_id();
+        let mapped = with_irqs_disabled(|| THREAD_PID_MAP.lock().get(&tid).copied());
+        if let Some(pid) = mapped {
+            return Some(crate::process::table::with_process(pid, |p| p.tgid).unwrap_or(pid));
+        }
+        // No THREAD_PID_MAP entry → fall through to the page read below
+        // (early boot, or a thread not yet registered).
+    }
     // CRITICAL: Check TTBR0 before reading from user address space!
     //
     // PROCESS_INFO_ADDR (0x1000) is only mapped in USER page tables.

@@ -1810,7 +1810,129 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // #region agent log
     (runtime().print_str)("[FORK-DBG] fork_process EXIT ok\n");
     // #endregion
-    
+
+    Ok(child_pid)
+}
+
+/// vfork fast-path (docs/COW_OPTIMIZATIONS.md Fix B).
+///
+/// Creates a child that **shares** the parent's address space (same L0 page
+/// tables, via `new_shared`) instead of replicating it.  This is sound only for
+/// the `CLONE_VFORK` contract — the parent is suspended until the child execs or
+/// `_exit`s, so they never run concurrently, and the child runs on a
+/// caller-provided stack and must not disturb the parent's live memory.
+///
+/// Compared to `fork_process` this skips the entire CoW share, the RW→RO demote
+/// of the parent, the parent TLB flush, and the later teardown.  Because the
+/// parent is never demoted, it takes **zero CoW faults** when it resumes.  On
+/// `exec`, `replace_image` installs a fresh address space and drops this shared
+/// view (refcount--), leaving the parent's pages untouched.
+///
+/// Identity: the child shares the parent's `PROCESS_INFO` page, so it is
+/// resolved via `THREAD_PID_MAP` (see `read_current_pid`, which prefers the map
+/// → tgid when the fast-path is enabled).  We deliberately do **not** remap
+/// `PROCESS_INFO_ADDR` (that would corrupt the parent's pid in the shared L0)
+/// and do **not** clone lazy regions (the child shares the parent's already
+/// mapped pages; faulting new memory before exec would violate the vfork
+/// contract and mutate the shared L0 — a stray fault instead fails safely).
+pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str> {
+    if (runtime().is_memory_low)() {
+        return Err("Kernel memory low, cannot vfork");
+    }
+    let parent = current_process().ok_or("No current process")?;
+    let parent_pid = parent.pid;
+
+    // Share the parent's L0 page table (same mechanism as CLONE_THREAD).
+    let parent_l0_phys = parent.address_space.l0_phys();
+    let new_address_space = mmu::UserAddressSpace::new_shared(parent_l0_phys)
+        .ok_or("Failed to create shared address space")?;
+
+    let mut new_proc = Box::try_new(Process {
+        pid: child_pid,
+        pgid: parent.pgid,
+        tgid: child_pid, // a new process (own thread group), not a thread
+        name: parent.name.clone(),
+        parent_pid,
+        state: ProcessState::Ready,
+        context: UserContext::default(), // set below
+        address_space: new_address_space,
+        entry_point: parent.entry_point,
+        brk: parent.brk,
+        initial_brk: parent.initial_brk,
+        memory: parent.memory.clone(),
+        // Shares the parent's ProcessInfo page; identity comes from
+        // THREAD_PID_MAP.  exec installs a fresh page.
+        process_info_phys: parent.process_info_phys,
+        args: parent.args.clone(),
+        cwd: parent.cwd.clone(),
+        stdin: parent.stdin.clone(),
+        stdout: parent.stdout.clone(),
+        exited: false,
+        exit_code: 0,
+        dynamic_page_tables: Vec::new(),
+        mmap_regions: Vec::new(),  // shares parent's via the shared L0
+        lazy_regions: Vec::new(),
+        fds: Arc::new(parent.fds.clone_deep_for_fork()),
+        thread_id: None,
+        spawner_pid: parent.spawner_pid,
+        terminal_state: parent.terminal_state.clone(),
+        box_id: parent.box_id,
+        namespace: parent.namespace.clone(),
+        channel: parent.channel.clone(),
+        delegate_pid: None,
+        clear_child_tid: 0,
+        robust_list_head: 0,
+        robust_list_len: 0,
+        signal_actions: Arc::new(SharedSignalTable::new()),
+        signal_mask: parent.signal_mask,
+        fault_mutex: Spinlock::new(BTreeSet::new()),
+        sigaltstack_sp: parent.sigaltstack_sp,
+        sigaltstack_flags: parent.sigaltstack_flags,
+        sigaltstack_size: parent.sigaltstack_size,
+        start_time_us: (runtime().uptime_us)(),
+        current_syscall: core::sync::atomic::AtomicU64::new(!0),
+        last_syscall: core::sync::atomic::AtomicU64::new(0),
+        syscall_stats: ProcessSyscallStats::new(),
+    }).map_err(|_| "Failed to allocate Process struct (ENOMEM)")?;
+
+    // Child context: inherit the parent's, return 0, clean EL0t, optional new SP.
+    let parent_tid = crate::threading::current_thread_id();
+    let parent_ctx = crate::threading::get_saved_user_context(parent_tid).ok_or("No saved context")?;
+    let mut child_ctx = parent_ctx;
+    child_ctx.x0 = 0;
+    child_ctx.spsr = 0;
+    if stack_ptr != 0 {
+        child_ctx.sp = stack_ptr;
+    }
+    new_proc.context = child_ctx;
+
+    let tid = crate::threading::spawn_user_thread_initializing(
+        entry_point_trampoline as extern "C" fn() -> !,
+        core::ptr::null_mut(),
+        false,
+    )?;
+    new_proc.thread_id = Some(tid);
+
+    // Register tid→pid BEFORE the thread runs so read_current_pid/current_process
+    // resolve the child's identity from its first instruction (the shared
+    // ProcessInfo page shows the parent's pid).
+    with_irqs_disabled(|| {
+        THREAD_PID_MAP.lock().insert(tid, child_pid);
+    });
+
+    let (parent_sp, parent_size, parent_flags) = crate::threading::get_sigaltstack(parent_tid);
+    crate::threading::set_sigaltstack(tid, parent_sp, parent_size, parent_flags);
+    crate::threading::update_thread_context(tid, &child_ctx);
+
+    let exit_channel = Arc::new(ProcessChannel::new());
+    register_channel(tid, exit_channel.clone());
+    register_child_channel(child_pid, exit_channel, parent_pid);
+
+    // register_process must complete before mark_thread_ready so the child's
+    // first read_current_pid → THREAD_PID_MAP → with_process(child_pid) resolves.
+    register_process(child_pid, new_proc);
+
+    crate::threading::mark_thread_ready(tid);
     Ok(child_pid)
 }
 

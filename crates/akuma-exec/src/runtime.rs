@@ -175,6 +175,9 @@ pub struct ExecConfig {
     pub proc_stdin_max_size: usize,
     pub proc_stdout_max_size: usize,
     pub cow_fork_enabled: bool,
+    /// Enable the vfork fast-path (shared-AS child for CLONE_VFORK). See
+    /// `config::VFORK_FASTPATH_ENABLED`.
+    pub vfork_fastpath_enabled: bool,
 }
 
 // Lock-free single-shot cells: must be safe to read from IRQ context.

@@ -184,6 +184,29 @@ is dwarfed by the teardown win and is what C/D address next.
 > emulation than on real AArch64 silicon, so the Phase 2 TLB wins — especially
 > the full-flush threshold — understate the real-hardware benefit.
 
+### End-to-end `rustc hello.rs` (Fix A + E + B, 2026-05-31)
+
+`rustc -C linker=clang /akuma-playground/hello.rs` on the VM (`MEMORY=2048`),
+PSTATS from the rustc/clang/ld processes:
+
+| Quantity | Baseline (rustc6.log) | After A+E+B |
+|---|---|---|
+| Wall-clock (one compile) | ~180 s | **~118 s** |
+| `fork` CoW share (per spawn) | 75,049 pages, ~50 ms | **0 for rustc spawns** (shared-AS vfork) |
+| rustc `clone` total | (full copy each) | **7 clones / 78 ms** (~11 ms ea) |
+| rustc `munmap` | 148 / 29,500 ms | **209 / 88 ms** |
+| rustc `mmap` | 158 / 30,446 ms | 216 / 27,138 ms |
+
+`fork`/`munmap` are no longer the bottleneck: Fix B removed the per-spawn CoW
+replication (zero `FORK-COW` shares from rustc), and Fix A+E cut `munmap` from
+~199 ms/call to ~0.4 ms/call (29.5 s → 88 ms total). Memory returns to the
+pre-compile baseline (no leak from the shared-AS path) and all 196 boot
+self-tests + 98 host tests stay green.
+
+**The remaining cost is now `mmap`** (~27 s, eager page allocation + zeroing),
+a separate axis from fork/CoW — the next thing to attack if compile time still
+matters (e.g. lazy/zero-on-demand population, huge-page zeroing).
+
 ---
 
 ## Optimization options (ranked by leverage / cost)
@@ -209,7 +232,7 @@ Result: the 16k-page teardown went **195 ms → 13.5 ms (14.5×)** and per-page
 cost is now flat in `n` (see the benchmark table above).  Boot fork/clone/pipe
 self-tests stay green and host unit tests pass.
 
-### B. `vfork` fast-path for `fork`+`exec` — *structural, biggest absolute win*
+### B. `vfork` fast-path for `fork`+`exec` — *structural, biggest absolute win* ✅ DONE
 
 For `CLONE_VFORK|CLONE_VM` (what `posix_spawn`/libstd's spawn uses), don't copy
 the address space at all:
@@ -222,6 +245,24 @@ the address space at all:
 This removes the entire replicate-then-discard cycle for the spawn path, which is
 the *only* path rustc exercises. Care: while shared, the child must not write
 parent memory before `exec` (the vfork contract — libstd respects it).
+
+**Implemented** as `process::vfork_process` (gated by
+`config::VFORK_FASTPATH_ENABLED`, default on). `sys_clone` routes a
+`CLONE_VFORK` child to it: the child gets a `new_shared(parent_l0)` address
+space (no CoW share, no demote, no parent TLB flush), runs on its caller-provided
+stack, and on `execve` `replace_image` drops the shared view (refcount--),
+leaving the parent's pages untouched — so the **parent takes zero CoW faults**
+when it resumes. Because the shared L0 already contains every sibling thread's
+stack, the fast-path also satisfies the §4b′ multithreaded-fork correctness
+guarantee *for free* (no replication needed).
+
+Identity: a shared-AS child reads the parent's `PROCESS_INFO` page, so
+`read_current_pid` now resolves via `THREAD_PID_MAP → tgid` when the flag is on.
+This is behavior-preserving for normal threads (`getpid` still returns the tgid)
+and gives the vfork child its own pid. **Verified end-to-end:**
+`rustc -C linker=clang hello.rs` compiles → links (`clang-21`→`ld`) → runs
+(`Hello from Akuma!`), with **zero** `FORK-COW` shares attributable to rustc
+(all 7 rustc `clone`s + clang's `clone` took the shared-AS path).
 
 ### C. Coarse-grained CoW — share page-table subtrees, not pages
 
@@ -265,7 +306,8 @@ Combines well with B/C.
    and helps all process exit/`munmap`, not just fork. ✅ **Done** — 14.5× on
    the large unmap; per-page teardown now flat in `n` (see benchmark table).
 2. **B next** (vfork fast-path) — eliminates the wasted copy for every spawn,
-   which is the entire rustc/clang/ld pipeline.
+   which is the entire rustc/clang/ld pipeline. ✅ **Done** — see end-to-end
+   results below.
 3. **C/D later** if `fork` of a *non-exec* child (rare here) still matters.
 
 A + B together should take a `rustc` compile from minutes to seconds without

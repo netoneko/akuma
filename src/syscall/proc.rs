@@ -395,7 +395,19 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
             });
         }
 
-        match akuma_exec::process::fork_process(child_pid, stack) {
+        // vfork fast-path (docs/COW_OPTIMIZATIONS.md Fix B): a CLONE_VFORK child
+        // shares the parent's address space instead of replicating it.  Only
+        // safe for CLONE_VFORK (the parent blocks below until the child
+        // execs/_exits) — plain SIGCHLD fork (0x11) runs concurrently and must
+        // use the full copy.  Gated by config so it can be toggled off.
+        let use_vfork_fastpath = flags & CLONE_VFORK != 0
+            && akuma_exec::runtime::config().vfork_fastpath_enabled;
+        let fork_result = if use_vfork_fastpath {
+            akuma_exec::process::vfork_process(child_pid, stack)
+        } else {
+            akuma_exec::process::fork_process(child_pid, stack)
+        };
+        match fork_result {
             Ok(new_pid) => {
                 // CLONE_PIDFD: atomically create a pidfd for the child and write the fd number
                 // back to the caller. Go 1.22+ uses this to get the pidfd in a single syscall.

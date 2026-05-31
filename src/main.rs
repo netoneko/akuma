@@ -437,6 +437,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
             proc_stdin_max_size: config::PROC_STDIN_MAX_SIZE,
             proc_stdout_max_size: config::PROC_STDOUT_MAX_SIZE,
             cow_fork_enabled: config::COW_FORK_ENABLED,
+            vfork_fastpath_enabled: config::VFORK_FASTPATH_ENABLED,
         },
     );
     akuma_exec::process::enable_process_syscall_stats(config::PROCESS_SYSCALL_STATS);

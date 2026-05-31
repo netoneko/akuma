@@ -214,6 +214,16 @@ pub const FORK_BRK_SERIAL_PROGRESS: bool = true;
 /// Set to false to fall back to the old eager-copy fork if regressions appear.
 pub const COW_FORK_ENABLED: bool = true;
 
+/// Enable the `vfork` fast-path (docs/COW_OPTIMIZATIONS.md Fix B).  When true, a
+/// `CLONE_VFORK` child SHARES the parent's address space (no CoW copy, no
+/// demote) instead of routing through the full `fork_process` replication — the
+/// parent is suspended until the child execs/_exits, so sharing is safe and the
+/// child's immediate `exec` discards the shared view without ever copying.
+/// Also makes `read_current_pid` resolve identity via THREAD_PID_MAP→tgid so a
+/// child sharing the parent's ProcessInfo page still reports its own pid.
+/// Set to false to fall back to copy-fork for vfork (clean kill switch).
+pub const VFORK_FASTPATH_ENABLED: bool = true;
+
 /// Emit per-process syscall stats on exit (total + breakdown by category).
 pub const PROCESS_SYSCALL_STATS: bool = true;
 
