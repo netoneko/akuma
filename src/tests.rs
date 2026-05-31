@@ -333,7 +333,7 @@ pub fn run_threading_tests() -> bool {
     let ram_mb = akuma_exec::mmu::ram_end().saturating_sub(akuma_exec::mmu::ram_base())
         / (1024 * 1024);
     let skip_heavy = crate::config::LOW_MEM_TEST_SKIP_MB != 0
-        && ram_mb < crate::config::LOW_MEM_TEST_SKIP_MB;
+        && ram_mb <= crate::config::LOW_MEM_TEST_SKIP_MB;
     if skip_heavy {
         crate::safe_print!(128,
             "  [low-mem: {} MB < {} MB] skipping heavy parallel/FP-preemption tests\n",

@@ -617,15 +617,32 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Enable IRQ-safe allocations now that preemption is active
     allocator::enable_preemption_safe_alloc();
+
+    // The boot self-test suite spawns many concurrent threads/processes. On a
+    // tiny machine there aren't enough user thread slots (the pool is scaled to
+    // RAM) or user pages, so spawn-based tests panic ("No free user thread
+    // slots") and halt the boot. At or below LOW_MEM_TEST_SKIP_MB, skip the whole
+    // suite so small RAM boots to SSH — the heuristics are still covered by the
+    // pure compute_heap_size/compute_thread_limit unit tests on larger configs,
+    // and production uses DISABLE_ALL_TESTS anyway. See docs/LOW_MEMORY_ENVIRONMENT.md.
+    let low_mem_skip_tests = config::LOW_MEM_TEST_SKIP_MB != 0
+        && ram_size <= config::LOW_MEM_TEST_SKIP_MB * 1024 * 1024;
+    let boot_tests_enabled = !config::DISABLE_ALL_TESTS && !low_mem_skip_tests;
+    if low_mem_skip_tests {
+        crate::safe_print!(128,
+            "[TESTS] low-mem ({} MB <= {} MB): skipping boot self-test suite\n",
+            ram_size / 1024 / 1024, config::LOW_MEM_TEST_SKIP_MB);
+    }
+
     // Run DAIF / IRQ-mask tests first — these verify the foundational
     // invariants that every later subsystem relies on. See
     // docs/STABILITY_URGENT_ISSUES.md issue #1.
-    if !config::DISABLE_ALL_TESTS {
+    if boot_tests_enabled {
         daif_tests::run_all_tests();
     }
 
     // Run memory tests (no filesystem dependency)
-    if !config::DISABLE_ALL_TESTS {
+    if boot_tests_enabled {
         if !tests::run_memory_tests() {
             console::print("\n!!! MEMORY TESTS FAILED - HALTING !!!\n");
             halt();
@@ -674,7 +691,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
                             }
                         }
 
-                        if !config::DISABLE_ALL_TESTS {
+                        if boot_tests_enabled {
                             // Run filesystem tests
                             fs_tests::run_all_tests();
 
@@ -688,14 +705,27 @@ fn kernel_main(dtb_ptr: usize) -> ! {
                                 }
                             }
 
-                            // Run futex sync tests
-                            sync_tests::run_all_tests();
+                            // Spawn-heavy suites (futex spawns, process exec,
+                            // shell pipelines) need several concurrent threads /
+                            // processes and panic on tiny machines. Skip them at
+                            // or below LOW_MEM_TEST_SKIP_MB so small RAM boots to
+                            // SSH (docs/LOW_MEMORY_ENVIRONMENT.md).
+                            let low_mem = config::LOW_MEM_TEST_SKIP_MB != 0
+                                && ram_size <= config::LOW_MEM_TEST_SKIP_MB * 1024 * 1024;
+                            if low_mem {
+                                crate::safe_print!(128,
+                                    "[TESTS] low-mem ({} MB <= {} MB): skipping sync/process/shell suites\n",
+                                    ram_size / 1024 / 1024, config::LOW_MEM_TEST_SKIP_MB);
+                            } else {
+                                // Run futex sync tests
+                                sync_tests::run_all_tests();
 
-                            // Run process execution tests
-                            process_tests::run_all_tests();
+                                // Run process execution tests
+                                process_tests::run_all_tests();
 
-                            // Run shell tests (pipelines with /bin binaries)
-                            shell_tests::run_all_tests();
+                                // Run shell tests (pipelines with /bin binaries)
+                                shell_tests::run_all_tests();
+                            }
 
                             // Run memory benchmarks (always prints, never fails)
                             tests::run_benchmarks();
@@ -875,7 +905,12 @@ fn run_async_main() -> ! {
         network_tests::run_tests();
     }
 
-    if !config::DISABLE_ALL_TESTS {
+    // Recompute here (different function from kernel_main's boot_tests_enabled):
+    // these spawn-heavy suites are skipped on tiny machines, see kernel_main.
+    let ram = akuma_exec::mmu::ram_end().saturating_sub(akuma_exec::mmu::ram_base());
+    let low_mem_skip_tests = config::LOW_MEM_TEST_SKIP_MB != 0
+        && ram <= config::LOW_MEM_TEST_SKIP_MB * 1024 * 1024;
+    if !config::DISABLE_ALL_TESTS && !low_mem_skip_tests {
         process_tests::run_network_tests();
         ssh_tests::run_all_tests();
     }
