@@ -240,7 +240,13 @@ pub(crate) fn compute_heap_size(ram_size: usize, code_and_stack: usize) -> usize
         // panics "Stack memory exceeds heap" otherwise) plus ~2 MB of boot-time
         // allocations. So the floor is 16 MB (covers the pool with headroom),
         // scaled up by ram/8; but never consume the last MIN_USER of user pages.
-        const SMALL_FLOOR: usize = 16 * MB;
+        // 8 MB floor: the kernel boots on ~2.2 MB and grows modestly under the
+        // small workloads that fit in <256 MB. Thread stacks are NOT in the heap
+        // (they come from PMM), so the heap no longer has to cover them — keeping
+        // it small leaves more user pages for the thread pool + processes.
+        // For RAM >= 128 MB, ram/8 dominates the floor (16 MB+), so this only
+        // shrinks the heap below 128 MB.
+        const SMALL_FLOOR: usize = 8 * MB;
         const MIN_USER: usize = 4 * MB;
         let cap = ram_size
             .saturating_sub(code_and_stack)
@@ -250,6 +256,27 @@ pub(crate) fn compute_heap_size(ram_size: usize, code_and_stack: usize) -> usize
             core::cmp::max(cap, MB),
         )
     }
+}
+
+/// Decide how many thread slots get a stack allocated (`thread_limit`, capped at
+/// `MAX_THREADS`). Thread stacks come from PMM (the user-pages pool), so on a
+/// small machine the full 64-thread pool (~9 MB) is the real boot floor. Give the
+/// pool at most ~half of user pages (leaving the rest for processes), keeping the
+/// `reserved` system threads plus at least a couple of user threads. See
+/// docs/LOW_MEMORY_ENVIRONMENT.md.
+pub(crate) fn compute_thread_limit(user_pages_size: usize) -> usize {
+    if config::THREAD_LIMIT_OVERRIDE != 0 {
+        return config::THREAD_LIMIT_OVERRIDE.min(config::MAX_THREADS);
+    }
+    let reserved = config::RESERVED_THREADS;
+    let sys_total = reserved.saturating_sub(1) * config::SYSTEM_THREAD_STACK_SIZE;
+    // The pool gets at most 1/4 of user pages — processes (their ELF images,
+    // heaps, page tables) need the rest, and one process ELF load OOMs if the
+    // pool is too greedy (observed at MEMORY=32M when the pool took half).
+    let stack_budget = user_pages_size / 4;
+    let user_budget = stack_budget.saturating_sub(sys_total);
+    let n_user = user_budget / config::USER_THREAD_STACK_SIZE;
+    (reserved + n_user).clamp(reserved + 2, config::MAX_THREADS)
 }
 
 /// Main kernel initialization - all safe code
@@ -555,6 +582,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print("Uptime: ");
     safe_print!(32, "{}", timer::uptime_us() / 1_000_000);
     console::print(" seconds\n");
+
+    // Scale the thread-stack pool to RAM before threading allocates it from PMM.
+    let tl = compute_thread_limit(user_pages_size);
+    threading::set_thread_limit(tl);
+    crate::safe_print!(96, "Thread limit: {} slots (stack pool from PMM)\n", tl);
 
     // Initialize threading (but don't enable timer yet!)
     console::print("Initializing threading...\n");

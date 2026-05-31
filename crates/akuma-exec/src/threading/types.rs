@@ -236,15 +236,21 @@ pub struct StackAllocationSummary {
     pub usable_kernel_stack: usize,
 }
 
-/// Calculate the total stack memory required based on kernel config
+/// Calculate the total stack memory required based on kernel config.
+///
+/// `thread_limit` is the number of thread slots that actually get a stack
+/// allocated (`reserved..thread_limit` user slots); it scales with RAM, see
+/// `compute_thread_limit` in src/main.rs. Clamped to `[reserved, MAX_THREADS]`.
 pub fn calculate_stack_requirements(
     reserved_threads: usize,
     kernel_stack_size: usize,
     system_thread_stack_size: usize,
     user_thread_stack_size: usize,
+    thread_limit: usize,
 ) -> StackAllocationSummary {
+    let limit = thread_limit.clamp(reserved_threads, MAX_THREADS);
     let system_thread_count = reserved_threads - 1;
-    let user_thread_count = MAX_THREADS - reserved_threads;
+    let user_thread_count = limit - reserved_threads;
 
     let system_total = system_thread_count * system_thread_stack_size;
     let user_total = user_thread_count * user_thread_stack_size;
@@ -268,19 +274,25 @@ pub fn calculate_stack_requirements(
     }
 }
 
-/// Verify that stack allocations fit within available heap memory
+/// Verify that the thread-stack pool fits in the memory it is actually
+/// allocated from. Stacks come from **PMM** (`alloc_pages_contiguous_zeroed`),
+/// not the kernel heap, so `available_mem` should be the free PMM byte count at
+/// init time (callers historically passed the heap size — that was the bug that
+/// made small-RAM boots panic; see docs/LOW_MEMORY_ENVIRONMENT.md).
 pub fn verify_stack_memory_params(
-    available_heap: usize,
+    available_mem: usize,
     reserved_threads: usize,
     kernel_stack_size: usize,
     system_thread_stack_size: usize,
     user_thread_stack_size: usize,
+    thread_limit: usize,
 ) -> Result<StackAllocationSummary, String> {
     let summary = calculate_stack_requirements(
         reserved_threads,
         kernel_stack_size,
         system_thread_stack_size,
         user_thread_stack_size,
+        thread_limit,
     );
 
     const MIN_USABLE_KERNEL_STACK: usize = 8 * 1024;
@@ -292,13 +304,13 @@ pub fn verify_stack_memory_params(
         ));
     }
 
-    let heap_required = summary.system_total + summary.user_total;
+    let pool_required = summary.system_total + summary.user_total;
 
-    if heap_required > available_heap {
+    if pool_required > available_mem {
         return Err(alloc::format!(
-            "Stack memory exceeds heap! Required: {} KB, Available: {} KB",
-            heap_required / 1024,
-            available_heap / 1024,
+            "Thread-stack pool exceeds free RAM! Required: {} KB, Available: {} KB (reduce thread_limit)",
+            pool_required / 1024,
+            available_mem / 1024,
         ));
     }
 
@@ -464,6 +476,7 @@ mod tests {
             kernel_stack,
             system_stack,
             user_stack,
+            MAX_THREADS,
         );
 
         assert_eq!(summary.system_thread_count, 3, "reserved - 1");
@@ -485,13 +498,13 @@ mod tests {
         let min_stack = system_stack.min(user_stack);
         let expected_usable = min_stack.saturating_sub(EXCEPTION_STACK_SIZE);
 
-        let summary = calculate_stack_requirements(4, 64 * 1024, system_stack, user_stack);
+        let summary = calculate_stack_requirements(4, 64 * 1024, system_stack, user_stack, MAX_THREADS);
         assert_eq!(summary.usable_kernel_stack, expected_usable);
     }
 
     #[test]
     fn calculate_stack_requirements_single_system_thread() {
-        let summary = calculate_stack_requirements(2, 32 * 1024, 16 * 1024, 32 * 1024);
+        let summary = calculate_stack_requirements(2, 32 * 1024, 16 * 1024, 32 * 1024, MAX_THREADS);
         assert_eq!(summary.system_thread_count, 1);
         assert_eq!(summary.user_thread_count, 62);
     }
@@ -502,21 +515,21 @@ mod tests {
     fn verify_stack_memory_params_ok_when_enough_heap() {
         let heap = 128 * 1024 * 1024;
         let stack = EXCEPTION_STACK_SIZE + 16 * 1024;
-        let result = verify_stack_memory_params(heap, 4, 64 * 1024, stack, stack);
-        assert!(result.is_ok(), "should succeed with 128MB heap");
+        let result = verify_stack_memory_params(heap, 4, 64 * 1024, stack, stack, MAX_THREADS);
+        assert!(result.is_ok(), "should succeed with 128MB available");
     }
 
     #[test]
     fn verify_stack_memory_params_err_when_heap_too_small() {
         let stack = EXCEPTION_STACK_SIZE + 16 * 1024;
-        let summary = calculate_stack_requirements(4, 64 * 1024, stack, stack);
-        let heap_required = summary.system_total + summary.user_total;
-        let tiny_heap = heap_required / 2;
+        let summary = calculate_stack_requirements(4, 64 * 1024, stack, stack, MAX_THREADS);
+        let pool_required = summary.system_total + summary.user_total;
+        let tiny_mem = pool_required / 2;
 
-        let result = verify_stack_memory_params(tiny_heap, 4, 64 * 1024, stack, stack);
+        let result = verify_stack_memory_params(tiny_mem, 4, 64 * 1024, stack, stack, MAX_THREADS);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("exceeds heap") || err.contains("Stack memory"));
+        assert!(err.contains("exceeds free RAM") || err.contains("stack pool"));
     }
 
     #[test]
@@ -530,6 +543,7 @@ mod tests {
                 64 * 1024,
                 system_stack,
                 user_stack,
+                MAX_THREADS,
             );
             assert!(result.is_err(), "usable stack < 8KB should fail");
             let err = result.unwrap_err();

@@ -112,6 +112,7 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_kernel_identity_mapping_full_ram, "kernel_identity_mapping_full_ram");
     run_test!(test_boot_map_covers_full_ram, "boot_map_covers_full_ram");
     run_test!(test_compute_heap_size, "compute_heap_size");
+    run_test!(test_compute_thread_limit, "compute_thread_limit");
     run_test!(test_mmap_does_not_overlap_identity_map, "mmap_does_not_overlap_identity_map");
 
     // Bug 10: partial munmap of eager regions
@@ -230,7 +231,7 @@ pub fn run_memory_tests() -> bool {
 
     // Bun install fixes (improve-dash-compatibility branch)
     run_test!(test_user_stack_size_is_2mb, "user_stack_size_is_2mb");
-    run_test!(test_kernel_heap_size_is_16mb, "kernel_heap_size_is_16mb");
+    run_test!(test_kernel_heap_matches_heuristic, "kernel_heap_matches_heuristic");
     run_test!(test_direntry_has_is_symlink_field, "direntry_has_is_symlink_field");
     run_test!(test_procfs_fd_symlink_resolution, "procfs_fd_symlink_resolution");
     run_test!(test_map_user_page_already_mapped, "map_user_page_already_mapped");
@@ -327,6 +328,24 @@ pub fn run_threading_tests() -> bool {
         };
     }
 
+    // On tiny machines, skip the resource-heavy tests (they spawn several
+    // parallel processes/threads and can't fit — see docs/LOW_MEMORY_ENVIRONMENT.md).
+    let ram_mb = akuma_exec::mmu::ram_end().saturating_sub(akuma_exec::mmu::ram_base())
+        / (1024 * 1024);
+    let skip_heavy = crate::config::LOW_MEM_TEST_SKIP_MB != 0
+        && ram_mb < crate::config::LOW_MEM_TEST_SKIP_MB;
+    if skip_heavy {
+        crate::safe_print!(128,
+            "  [low-mem: {} MB < {} MB] skipping heavy parallel/FP-preemption tests\n",
+            ram_mb, crate::config::LOW_MEM_TEST_SKIP_MB);
+    }
+    // Like run_test!, but skipped on low-memory machines.
+    macro_rules! run_test_heavy {
+        ($test_fn:expr, $name:expr) => {
+            if !skip_heavy { run_test!($test_fn, $name); }
+        };
+    }
+
     // Threading tests (no fs dependency)
     run_test!(test_scheduler_init, "scheduler_init");
     run_test!(test_thread_stats, "thread_stats");
@@ -336,11 +355,11 @@ pub fn run_threading_tests() -> bool {
     run_test!(test_spawn_thread, "spawn_thread");
     run_test!(test_spawn_and_run, "spawn_and_run");
     run_test!(test_spawn_and_cleanup, "spawn_and_cleanup");
-    run_test!(test_spawn_multiple, "spawn_multiple");
-    run_test!(test_spawn_and_yield, "spawn_and_yield");
-    run_test!(test_spawn_cooperative, "spawn_cooperative");
-    run_test!(test_yield_cycle, "yield_cycle");
-    run_test!(test_mixed_cooperative_preemptible, "mixed_cooperative_preemptible");
+    run_test_heavy!(test_spawn_multiple, "spawn_multiple");
+    run_test_heavy!(test_spawn_and_yield, "spawn_and_yield");
+    run_test_heavy!(test_spawn_cooperative, "spawn_cooperative");
+    run_test_heavy!(test_yield_cycle, "yield_cycle");
+    run_test_heavy!(test_mixed_cooperative_preemptible, "mixed_cooperative_preemptible");
     
     // Waker mechanism tests
     run_test!(test_waker_mechanism, "waker_mechanism");
@@ -352,12 +371,12 @@ pub fn run_threading_tests() -> bool {
 
     // NEON/FP register save/restore tests
     run_test!(test_neon_regs_across_yield, "neon_regs_across_yield");
-    run_test!(test_neon_regs_across_preemption, "neon_regs_across_preemption");
-    run_test!(test_fpcr_fpsr_across_yield, "fpcr_fpsr_across_yield");
-    run_test!(test_fp_arithmetic_across_preemption, "fp_arithmetic_across_preemption");
+    run_test_heavy!(test_neon_regs_across_preemption, "neon_regs_across_preemption");
+    run_test_heavy!(test_fpcr_fpsr_across_yield, "fpcr_fpsr_across_yield");
+    run_test_heavy!(test_fp_arithmetic_across_preemption, "fp_arithmetic_across_preemption");
 
     // Parallel process tests (requires /bin/hello)
-    run_test!(test_parallel_processes, "parallel_processes");
+    run_test_heavy!(test_parallel_processes, "parallel_processes");
     run_test!(test_terminal_syscalls, "terminal_syscalls");
     
     // Orphaned lock recovery tests
@@ -3944,12 +3963,9 @@ fn test_compute_heap_size() -> bool {
         }
     }
 
-    // Small RAM (< 256MB): heap must (a) leave > 0 user pages and (b) be large
-    // enough to hold the thread-stack pool + boot heap, or threading init panics
-    // ("Stack memory exceeds heap"). The empirical requirement is ~11 MB
-    // (8960 KB stacks + ~2 MB boot); assert a 12 MB lower bound. 32 MB is the
-    // smallest size that satisfies both with the default 64-thread pool.
-    const POOL_FLOOR_MB: usize = 12;
+    // Small RAM (< 256MB): heap must leave > 0 user pages and keep a sane floor
+    // (>= 4 MB; boot uses ~2.2 MB). Thread stacks live in PMM, not the heap, so
+    // the heap no longer has to cover them (see compute_thread_limit).
     for &ram_mb in &[32usize, 48, 64, 96, 128, 192] {
         let ram = ram_mb * MB;
         let c = cs(ram);
@@ -3959,9 +3975,53 @@ fn test_compute_heap_size() -> bool {
             crate::safe_print!(96, "  FAIL: {}MB RAM -> 0 user pages (heap {}MB)\n", ram_mb, h / MB);
             pass = false;
         }
-        if h < POOL_FLOOR_MB * MB {
-            crate::safe_print!(96, "  FAIL: {}MB RAM -> heap {}MB < thread-pool floor {}MB\n",
-                ram_mb, h / MB, POOL_FLOOR_MB);
+        if h < 4 * MB {
+            crate::safe_print!(96, "  FAIL: {}MB RAM -> heap {}MB below 4MB floor\n", ram_mb, h / MB);
+            pass = false;
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify the thread-limit auto-scaling heuristic (`crate::compute_thread_limit`):
+/// the stack pool fits in ~half the user pages (or hits the reserved+2 floor),
+/// stays within [reserved+2, MAX_THREADS], and uses the full pool on large RAM.
+/// Skipped if a manual override is configured.
+fn test_compute_thread_limit() -> bool {
+    console::print("\n[TEST] compute_thread_limit heuristic\n");
+    const MB: usize = 1024 * 1024;
+    if crate::config::THREAD_LIMIT_OVERRIDE != 0 {
+        console::print("  SKIP: THREAD_LIMIT_OVERRIDE set\n");
+        return true;
+    }
+    let reserved = crate::config::RESERVED_THREADS;
+    let maxt = crate::config::MAX_THREADS;
+    let sys_total = reserved.saturating_sub(1) * crate::config::SYSTEM_THREAD_STACK_SIZE;
+    let ustack = crate::config::USER_THREAD_STACK_SIZE;
+    let mut pass = true;
+
+    // Large user-pages → full MAX_THREADS.
+    let big = crate::compute_thread_limit(1024 * MB);
+    if big != maxt {
+        crate::safe_print!(96, "  FAIL: large RAM -> {} threads, expected MAX {}\n", big, maxt);
+        pass = false;
+    }
+
+    // Small user-pages → bounded, and pool fits in half the user pages unless at
+    // the reserved+2 floor.
+    for &up_mb in &[4usize, 8, 16, 32, 64, 128] {
+        let up = up_mb * MB;
+        let n = crate::compute_thread_limit(up);
+        if n < reserved + 2 || n > maxt {
+            crate::safe_print!(96, "  FAIL: {}MB userpages -> {} threads out of [{},{}]\n",
+                up_mb, n, reserved + 2, maxt);
+            pass = false;
+        }
+        let pool = sys_total + (n - reserved) * ustack;
+        if n > reserved + 2 && pool > up / 4 {
+            crate::safe_print!(96, "  FAIL: {}MB userpages -> pool {}KB > quarter {}KB\n",
+                up_mb, pool / 1024, (up / 4) / 1024);
             pass = false;
         }
     }
@@ -7182,21 +7242,25 @@ fn test_user_stack_size_is_2mb() -> bool {
     pass
 }
 
-/// Test: Kernel heap is at least 16MB (required for bun's 40+ TCP sockets)
-///
-/// Bun opens 40+ concurrent TCP connections to npm registry. Each socket
-/// uses 32KB of buffers (16KB RX + 16KB TX), totaling 1.25MB+ just for
-/// socket buffers. The 8MB heap was insufficient.
-fn test_kernel_heap_size_is_16mb() -> bool {
-    console::print("\n[TEST] Kernel heap is at least 16MB\n");
+/// Test: Kernel heap matches the `compute_heap_size` heuristic for the detected
+/// RAM. On large machines (>= 128 MB) this is >= 16 MB — enough for bun's 40+ TCP
+/// sockets (~1.25 MB of buffers), the original reason for the floor. On small
+/// machines the heap scales down on purpose (thread stacks live in PMM, not the
+/// heap), so a flat 16 MB assertion no longer holds — validate against the
+/// heuristic instead. See docs/LOW_MEMORY_ENVIRONMENT.md.
+fn test_kernel_heap_matches_heuristic() -> bool {
+    console::print("\n[TEST] Kernel heap matches compute_heap_size heuristic\n");
 
-    let heap_stats = crate::allocator::stats();
-    let heap_size = heap_stats.heap_size;
-    let min_expected = 16 * 1024 * 1024; // 16MB
+    let heap_size = crate::allocator::stats().heap_size;
+    let ram = akuma_exec::mmu::ram_end().saturating_sub(akuma_exec::mmu::ram_base());
+    let code_and_stack = core::cmp::max(ram / 16, 8 * 1024 * 1024);
+    let expected = crate::compute_heap_size(ram, code_and_stack);
 
-    let pass = heap_size >= min_expected;
-    crate::safe_print!(128, "  heap_size = {} bytes ({} MB), min expected {} MB\n",
-        heap_size, heap_size / 1024 / 1024, min_expected / 1024 / 1024);
+    // The heap region is sized by compute_heap_size in main.rs; allow 1 MB slack
+    // for allocator bookkeeping, and require a sane 4 MB floor.
+    let pass = heap_size + 1024 * 1024 >= expected && heap_size >= 4 * 1024 * 1024;
+    crate::safe_print!(160, "  heap_size={} MB, heuristic={} MB (RAM {} MB)\n",
+        heap_size / 1024 / 1024, expected / 1024 / 1024, ram / 1024 / 1024);
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }

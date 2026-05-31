@@ -248,6 +248,19 @@ pub const MMAP_EAGER_MAX_PAGES: usize = 16;
 /// rarely needed.
 pub const KERNEL_HEAP_SIZE_MB: usize = 0;
 
+/// Below this detected-RAM threshold (MiB), skip the resource-heavy boot
+/// self-tests (parallel multi-process / FP-across-preemption) that need to spawn
+/// several processes at once — they can't fit on tiny machines and would halt the
+/// boot. Core tests still run. `0` disables the skip (always run everything).
+/// See docs/LOW_MEMORY_ENVIRONMENT.md.
+pub const LOW_MEM_TEST_SKIP_MB: usize = 32;
+
+/// Override for the number of thread slots that get a stack allocated at boot.
+/// `0` = auto-scale from RAM (see `compute_thread_limit` in src/main.rs and
+/// docs/LOW_MEMORY_ENVIRONMENT.md). Capped at `MAX_THREADS`. The thread-stack
+/// pool comes from PMM, so on tiny machines fewer slots = more usable RAM.
+pub const THREAD_LIMIT_OVERRIDE: usize = 0;
+
 /// Emit per-process syscall stats on exit (total + breakdown by category).
 pub const PROCESS_SYSCALL_STATS: bool = true;
 

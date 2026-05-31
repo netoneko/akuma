@@ -87,6 +87,26 @@ pub fn set_network_thread_id(tid: usize) {
     NETWORK_THREAD_ID.store(tid, Ordering::Relaxed);
 }
 
+/// Number of thread slots that actually get a stack allocated — the user-process
+/// slots `[reserved_threads, thread_limit())` plus the reserved system slots.
+/// `MAX_THREADS` stays the compile-time array size; this is the runtime cap so
+/// the PMM-backed stack pool fits on small machines (see `compute_thread_limit`
+/// in src/main.rs and docs/LOW_MEMORY_ENVIRONMENT.md). Defaults to the full
+/// `MAX_THREADS` until `set_thread_limit` is called during early boot.
+static THREAD_LIMIT: AtomicUsize = AtomicUsize::new(MAX_THREADS);
+
+/// Set the runtime thread-slot limit. Clamped to `[reserved+1, MAX_THREADS]` so
+/// there is always the full system-thread set plus at least one user slot.
+pub fn set_thread_limit(limit: usize) {
+    let lo = config().reserved_threads + 1;
+    THREAD_LIMIT.store(limit.clamp(lo, MAX_THREADS), Ordering::Release);
+}
+
+/// Current runtime thread-slot limit (`<= MAX_THREADS`).
+pub fn thread_limit() -> usize {
+    THREAD_LIMIT.load(Ordering::Acquire)
+}
+
 /// Atomic thread states - lock-free access
 /// Each thread's state can be read/modified without holding any lock
 static THREAD_STATES: [AtomicU8; MAX_THREADS] = {
@@ -262,7 +282,7 @@ impl ThreadPool {
     ) -> Result<usize, &'static str> {
         if !self.initialized { return Err("Thread pool not initialized"); }
 
-        for i in config().reserved_threads..MAX_THREADS {
+        for i in config().reserved_threads..thread_limit() {
             if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE {
                 // Claim the slot atomically
                 if THREAD_STATES[i].compare_exchange(thread_state::FREE, thread_state::INITIALIZING, Ordering::SeqCst, Ordering::SeqCst).is_err() {
@@ -366,7 +386,7 @@ pub fn set_thread_state(idx: usize, state: u8) {
 /// each slot with `release_test_thread_slot` when the test finishes.
 pub fn claim_test_thread_slots(n: usize) -> Vec<usize> {
     let mut out = Vec::new();
-    for i in config().reserved_threads..MAX_THREADS {
+    for i in config().reserved_threads..thread_limit() {
         if out.len() == n { break; }
         if THREAD_STATES[i]
             .compare_exchange(
@@ -1127,7 +1147,7 @@ impl ThreadPool {
 
         // Threads RESERVED_THREADS to MAX_THREADS-1: User process threads with smaller stacks (128KB)
         // Used for running user processes
-        for i in config().reserved_threads..MAX_THREADS {
+        for i in config().reserved_threads..thread_limit() {
             self.allocate_stack_for_slot(i, config().user_thread_stack_size);
         }
 
@@ -1381,7 +1401,7 @@ impl ThreadPool {
         }
 
         // Only search in user thread range
-        for i in config().reserved_threads..MAX_THREADS {
+        for i in config().reserved_threads..thread_limit() {
             if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE {
                 // User thread stacks should be pre-allocated at correct size
                 debug_assert!(
@@ -1689,9 +1709,12 @@ pub fn init() {
     // Print stack requirements before initialization
     print_stack_requirements();
     
-    // Verify stack memory fits in available heap
-    let heap_size = (runtime().heap_stats)().0;
-    if let Err(msg) = verify_stack_memory(heap_size) {
+    // Verify the thread-stack pool fits in free PMM (stacks are allocated from
+    // PMM via alloc_pages_contiguous_zeroed, NOT the kernel heap). The pool size
+    // tracks thread_limit(), which is scaled to RAM before this runs.
+    let (_total, _alloc, free_pages) = (runtime().pmm_stats)();
+    let free_bytes = free_pages.saturating_mul(crate::mmu::PAGE_SIZE);
+    if let Err(msg) = verify_stack_memory(free_bytes) {
         panic!("Stack allocation failed: {}", msg);
     }
     
@@ -2659,7 +2682,7 @@ where
     F: FnOnce() -> ! + Send + 'static,
 {
     // Step 1: Atomically claim a free slot (lock-free)
-    let slot_idx = match claim_free_slot(config().reserved_threads, MAX_THREADS) {
+    let slot_idx = match claim_free_slot(config().reserved_threads, thread_limit()) {
         Some(idx) => idx,
         None => return Err("No free user thread slots"),
     };
@@ -2733,7 +2756,7 @@ where
 /// Returns the number of free slots in the user thread range (RESERVED_THREADS..MAX_THREADS).
 pub fn user_threads_available() -> usize {
     // Lock-free: count free user thread slots
-    count_free_slots(config().reserved_threads, MAX_THREADS)
+    count_free_slots(config().reserved_threads, thread_limit())
 }
 
 /// Count active user threads
@@ -2741,7 +2764,7 @@ pub fn user_threads_available() -> usize {
 /// Returns the number of non-free slots in the user thread range.
 pub fn user_threads_active() -> usize {
     // Lock-free: count non-free user thread slots
-    (config().reserved_threads..MAX_THREADS)
+    (config().reserved_threads..thread_limit())
         .filter(|&i| THREAD_STATES[i].load(Ordering::Relaxed) != thread_state::FREE)
         .count()
 }
@@ -3098,17 +3121,20 @@ pub fn calculate_stack_requirements() -> StackAllocationSummary {
         config().kernel_stack_size,
         config().system_thread_stack_size,
         config().user_thread_stack_size,
+        thread_limit(),
     )
 }
 
-/// Verify that stack allocations fit within available heap memory
-pub fn verify_stack_memory(available_heap: usize) -> Result<StackAllocationSummary, alloc::string::String> {
+/// Verify that the thread-stack pool fits in `available_mem` (free PMM bytes —
+/// stacks come from PMM, not the heap), for the current `thread_limit()`.
+pub fn verify_stack_memory(available_mem: usize) -> Result<StackAllocationSummary, alloc::string::String> {
     types::verify_stack_memory_params(
-        available_heap,
+        available_mem,
         config().reserved_threads,
         config().kernel_stack_size,
         config().system_thread_stack_size,
         config().user_thread_stack_size,
+        thread_limit(),
     )
 }
 
