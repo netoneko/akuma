@@ -34,7 +34,6 @@ MEMBERS=(
     "allocstress"
     "top"
     "box"
-    "musl"
     "tcc"
     "tar"
     "sshd"
