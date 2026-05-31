@@ -241,6 +241,13 @@ pub const VFORK_FASTPATH_ENABLED: bool = true;
 /// Set high (e.g. 256) to restore the old mostly-eager behaviour.
 pub const MMAP_EAGER_MAX_PAGES: usize = 16;
 
+/// Kernel heap size override, in **MiB**. `0` = auto-size from detected RAM
+/// (see `compute_heap_size` in `src/main.rs`). Set a fixed value to pin the heap
+/// — useful for squeezing onto very small machines or reproducing a layout.
+/// The auto heuristic already scales down for RAM < 256 MB, so an override is
+/// rarely needed.
+pub const KERNEL_HEAP_SIZE_MB: usize = 0;
+
 /// Emit per-process syscall stats on exit (total + breakdown by category).
 pub const PROCESS_SYSCALL_STATS: bool = true;
 

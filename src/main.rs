@@ -213,6 +213,45 @@ fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
     }
 }
 
+/// Decide the kernel heap size (bytes) for a given RAM size and code+stack reserve.
+///
+/// Pure function so it can be unit-tested without booting (see
+/// `tests::test_compute_heap_size`).
+///
+/// - `config::KERNEL_HEAP_SIZE_MB != 0` → use that fixed value (manual override).
+/// - **RAM ≥ 256 MB** → the historical generous heap: `1/8 of RAM, clamped to
+///   [64 MB, 256 MB]`. Unchanged so the common 256 MB+ configs and memory-hungry
+///   workloads (go build, bun, rustc metadata) behave exactly as before.
+/// - **RAM < 256 MB** → scale down: target `1/8 of RAM` with an 8 MB floor (the
+///   kernel boots using only ~2 MB of heap), but **never more than half of the
+///   memory left after code+stack**, so user pages always survive. The old code
+///   used a flat 64 MB floor here, which left 0 user pages below ~72 MB (no boot)
+///   and starved user RAM at 128 MB.
+pub(crate) fn compute_heap_size(ram_size: usize, code_and_stack: usize) -> usize {
+    const MB: usize = 1024 * 1024;
+    if config::KERNEL_HEAP_SIZE_MB != 0 {
+        return config::KERNEL_HEAP_SIZE_MB * MB;
+    }
+    if ram_size >= 256 * MB {
+        core::cmp::min(core::cmp::max(ram_size / 8, 64 * MB), 256 * MB)
+    } else {
+        // Small RAM. The heap must still hold the fixed thread-stack pool
+        // (~9 MB for the default 64-thread config — see threading::mod, which
+        // panics "Stack memory exceeds heap" otherwise) plus ~2 MB of boot-time
+        // allocations. So the floor is 16 MB (covers the pool with headroom),
+        // scaled up by ram/8; but never consume the last MIN_USER of user pages.
+        const SMALL_FLOOR: usize = 16 * MB;
+        const MIN_USER: usize = 4 * MB;
+        let cap = ram_size
+            .saturating_sub(code_and_stack)
+            .saturating_sub(MIN_USER);
+        core::cmp::min(
+            core::cmp::max(ram_size / 8, SMALL_FLOOR),
+            core::cmp::max(cap, MB),
+        )
+    }
+}
+
 /// Main kernel initialization - all safe code
 fn kernel_main(dtb_ptr: usize) -> ! {
     // Detect memory from DTB (must be done before heap init, so print first)
@@ -281,16 +320,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Memory layout:
     // - Code + Stack: max(1/16 of RAM, 8MB) - kernel binary and boot stack
-    // - Heap: 1/8 of RAM (min 64MB, max 256MB) - kernel data structures
-    //   Sized dynamically so that memory-hungry workloads (go build, bun, etc.)
-    //   don't exhaust kernel metadata allocations, but capped to save user RAM.
+    // - Heap: see compute_heap_size() - kernel data structures
     // - User pages: remaining - for user processes
     let code_and_stack = core::cmp::max(ram_size / 16, MIN_CODE_AND_STACK);
     let heap_start = ram_base + code_and_stack;
-    let heap_size = core::cmp::min(
-        core::cmp::max(ram_size / 8, 64 * 1024 * 1024),
-        256 * 1024 * 1024
-    );
+    let heap_size = compute_heap_size(ram_size, code_and_stack);
     let user_pages_start = heap_start + heap_size;
     let user_pages_size = ram_size.saturating_sub(code_and_stack + heap_size);
 
@@ -316,7 +350,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print_hex(heap_start as u64);
     console::print(" - 0x");
     console::print_hex(user_pages_start as u64);
-    console::print(") [fixed 8MB]\n");
+    console::print(") [auto]\n");
 
     console::print("User pages: ");
     console::print_dec(user_pages_size / 1024 / 1024);

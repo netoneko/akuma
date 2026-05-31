@@ -111,6 +111,7 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_map_interleaved_regions_same_l3, "map_interleaved_regions_same_l3");
     run_test!(test_kernel_identity_mapping_full_ram, "kernel_identity_mapping_full_ram");
     run_test!(test_boot_map_covers_full_ram, "boot_map_covers_full_ram");
+    run_test!(test_compute_heap_size, "compute_heap_size");
     run_test!(test_mmap_does_not_overlap_identity_map, "mmap_does_not_overlap_identity_map");
 
     // Bug 10: partial munmap of eager regions
@@ -3911,6 +3912,60 @@ fn test_boot_map_covers_full_ram() -> bool {
     }
     crate::safe_print!(128, "  RAM [{:#x},{:#x}) covered by boot L1[{}..={}]  Result: {}\n",
         ram_base, ram_end, start, end, if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify the kernel heap auto-sizing heuristic (`crate::compute_heap_size`):
+/// large RAM keeps the historical generous heap, and small RAM (< 256 MB) always
+/// leaves user pages (the old flat 64 MB floor gave 0 user pages below ~72 MB →
+/// no boot). Pure-function test; skipped if a manual override is configured.
+fn test_compute_heap_size() -> bool {
+    console::print("\n[TEST] compute_heap_size heuristic\n");
+    const MB: usize = 1024 * 1024;
+    if crate::config::KERNEL_HEAP_SIZE_MB != 0 {
+        console::print("  SKIP: KERNEL_HEAP_SIZE_MB override set\n");
+        return true;
+    }
+    // Mirror main.rs's code_and_stack reserve.
+    let cs = |ram: usize| core::cmp::max(ram / 16, 8 * MB);
+    let mut pass = true;
+
+    // Large RAM (>= 256MB): exact historical values must be preserved.
+    let exact: &[(usize, usize)] = &[
+        (256, 64), (512, 64), (1024, 128), (2048, 256), (4096, 256),
+    ];
+    for &(ram_mb, exp_mb) in exact {
+        let ram = ram_mb * MB;
+        let h = crate::compute_heap_size(ram, cs(ram));
+        if h != exp_mb * MB {
+            crate::safe_print!(96, "  FAIL: {}MB RAM -> heap {}MB, expected {}MB\n",
+                ram_mb, h / MB, exp_mb);
+            pass = false;
+        }
+    }
+
+    // Small RAM (< 256MB): heap must (a) leave > 0 user pages and (b) be large
+    // enough to hold the thread-stack pool + boot heap, or threading init panics
+    // ("Stack memory exceeds heap"). The empirical requirement is ~11 MB
+    // (8960 KB stacks + ~2 MB boot); assert a 12 MB lower bound. 32 MB is the
+    // smallest size that satisfies both with the default 64-thread pool.
+    const POOL_FLOOR_MB: usize = 12;
+    for &ram_mb in &[32usize, 48, 64, 96, 128, 192] {
+        let ram = ram_mb * MB;
+        let c = cs(ram);
+        let h = crate::compute_heap_size(ram, c);
+        let user = ram.saturating_sub(c + h);
+        if user == 0 {
+            crate::safe_print!(96, "  FAIL: {}MB RAM -> 0 user pages (heap {}MB)\n", ram_mb, h / MB);
+            pass = false;
+        }
+        if h < POOL_FLOOR_MB * MB {
+            crate::safe_print!(96, "  FAIL: {}MB RAM -> heap {}MB < thread-pool floor {}MB\n",
+                ram_mb, h / MB, POOL_FLOOR_MB);
+            pass = false;
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }
 
