@@ -366,7 +366,153 @@ pub fn run_all_tests() {
     // Go mmap regression: forktest_parent with mmap_test must not SIGSEGV
     // test_forktest_parent_mmap(); // disabled: runs for up to 60s
 
+    // CoW / munmap performance benchmarks (docs/COW_OPTIMIZATIONS.md).
+    // Enabled by default for now; gate behind a config flag once the numbers
+    // are stable.  Prints grep-able `[BENCH]` lines.
+    run_cow_benchmarks();
+
     console::print("--- Process Execution Tests Done ---\n\n");
+}
+
+// ── CoW / munmap performance benchmarks ───────────────────────────────────
+//
+// These measure the costs called out in docs/COW_OPTIMIZATIONS.md so we can
+// see before/after numbers as the fixes land.  They allocate real frames and
+// are memory-adaptive (capped by free RAM with headroom), so they run safely
+// at the default 256M as well as larger configs.  To see the full O(n²)
+// teardown signal, boot with more RAM (e.g. `MEMORY=2048 cargo run --release`)
+// so the larger working-set size isn't capped.
+//
+// Output:
+//   [BENCH] munmap-teardown n=<frames> pages=<P> total=<us> per_page=<ns>
+//   [BENCH] fork-cow-share  pages=<P> total=<us> per_page=<ns>
+//
+// `per_page` is the headline: under the O(n²) teardown (issue #1) it grows with
+// the working-set size; after Fix A it should be flat.
+
+/// User VA base for benchmark mappings.  64 GiB: well clear of the RAM
+/// identity map (RAM at 0x4000_0000, L1 index 1) and the device window
+/// (under L0[1] at 0x80_0000_0000+), so map_page builds fresh page tables
+/// without aliasing anything.
+const BENCH_VA_BASE: usize = 0x10_0000_0000;
+
+/// Keep at least this many physical pages free so a benchmark can never
+/// drive the kernel out of memory (16 MiB of headroom).
+const BENCH_FREE_HEADROOM_PAGES: usize = 4096;
+
+pub fn run_cow_benchmarks() {
+    console::print("\n--- CoW / munmap Benchmarks ---\n");
+    bench_munmap_teardown();
+    bench_fork_cow_share();
+    console::print("--- CoW / munmap Benchmarks Done ---\n\n");
+}
+
+/// BENCH-1: teardown cost — the O(n²) `munmap`/exit path (issue #1, Fix A).
+///
+/// Maps and tracks `n` pages, then tears them all down via the exact munmap
+/// primitives (`unmap_and_free_page` → `remove_user_frame` + per-page TLB
+/// flush + `free_page`).  Runs at two working-set sizes so the O(n²) signature
+/// (per-page cost rising with `n`) is visible before Fix A and flat after.
+fn bench_munmap_teardown() {
+    use akuma_exec::mmu::user_flags;
+    for &target_n in &[2000usize, 16000usize] {
+        let mut p = make_test_process(990_000 + target_n as u32);
+
+        // Cap the working set by free memory so we never OOM the kernel.
+        let (_total, _alloc, free) = crate::pmm::stats();
+        let cap = free.saturating_sub(BENCH_FREE_HEADROOM_PAGES);
+        let want = target_n.min(cap);
+
+        let mut mapped = 0usize;
+        for i in 0..want {
+            let va = BENCH_VA_BASE + i * 4096;
+            let Some(frame) = crate::pmm::alloc_page_zeroed() else { break; };
+            if p.address_space.map_page(va, frame.addr, user_flags::RW).is_err() {
+                crate::pmm::free_page(frame);
+                break;
+            }
+            p.address_space.track_user_frame(frame);
+            mapped += 1;
+        }
+        if mapped == 0 {
+            console::print("[BENCH] munmap-teardown: SKIPPED (no memory)\n");
+            continue;
+        }
+
+        let start = crate::timer::uptime_us();
+        for i in 0..mapped {
+            let va = BENCH_VA_BASE + i * 4096;
+            if let Some(frame) = p.address_space.unmap_and_free_page(va) {
+                crate::pmm::free_page(frame);
+            }
+        }
+        let elapsed = crate::timer::uptime_us() - start;
+        let per_page_ns = (elapsed.saturating_mul(1000)) / mapped as u64;
+        crate::safe_print!(160,
+            "[BENCH] munmap-teardown n={} pages={} total={}us per_page={}ns\n",
+            mapped, mapped, elapsed, per_page_ns);
+        // `p` drops here, freeing the page-table frames.
+    }
+}
+
+/// BENCH-2: per-`fork` CoW-share cost (informational; targets Fix C/D/E).
+///
+/// Builds a parent address space with `M` mapped pages, then runs the same
+/// per-page primitives `fork_process`'s `cow_share_range` uses
+/// (`collect_mapped_pages_with_flags` → `cow_ref_inc` + child `map_page` +
+/// `track_user_frame`), plus the parent `demote_range_to_ro` and TLB flush.
+/// Also guards against Fix A regressing the fork path: `track_user_frame` is
+/// called per page here, so if it ever became super-linear this number moves.
+/// The shared frames are CoW-refcounted, so parent and child drops free each
+/// page exactly once (no leak / no double free).
+fn bench_fork_cow_share() {
+    use akuma_exec::mmu::{self, user_flags, flags};
+    let target_m = 8000usize;
+
+    let (_total, _alloc, free) = crate::pmm::stats();
+    let want = target_m.min(free.saturating_sub(BENCH_FREE_HEADROOM_PAGES));
+
+    let mut parent = make_test_process(991_001);
+    let mut mapped = 0usize;
+    for i in 0..want {
+        let va = BENCH_VA_BASE + i * 4096;
+        let Some(frame) = crate::pmm::alloc_page_zeroed() else { break; };
+        if parent.address_space.map_page(va, frame.addr, user_flags::RW).is_err() {
+            crate::pmm::free_page(frame);
+            break;
+        }
+        parent.address_space.track_user_frame(frame);
+        mapped += 1;
+    }
+    if mapped == 0 {
+        console::print("[BENCH] fork-cow-share: SKIPPED (no memory)\n");
+        return;
+    }
+
+    let Some(mut child) = mmu::UserAddressSpace::new() else {
+        console::print("[BENCH] fork-cow-share: SKIPPED (child AS alloc failed)\n");
+        // parent drops, freeing its frames (not CoW-shared yet → freed once).
+        return;
+    };
+    let parent_l0 = mmu::phys_to_virt(parent.address_space.l0_phys()) as *const u64;
+
+    let start = crate::timer::uptime_us();
+    let pages = mmu::collect_mapped_pages_with_flags(parent_l0, BENCH_VA_BASE, mapped);
+    let shared = pages.len();
+    for (va, pa, pte_flags) in pages {
+        crate::pmm::cow_ref_inc(pa);
+        let child_flags = pte_flags | flags::AP_RO_ALL;
+        let _ = child.map_page(va, pa, child_flags);
+        child.track_user_frame(crate::pmm::PhysFrame::new(pa));
+    }
+    unsafe { mmu::demote_range_to_ro(parent_l0 as *mut u64, BENCH_VA_BASE, mapped); }
+    mmu::flush_tlb_asid(0);
+    let elapsed = crate::timer::uptime_us() - start;
+    let per_page_ns = (elapsed.saturating_mul(1000)) / shared.max(1) as u64;
+    crate::safe_print!(160,
+        "[BENCH] fork-cow-share pages={} total={}us per_page={}ns\n",
+        shared, elapsed, per_page_ns);
+    // child drops (cow_ref 2→1, no free), then parent drops (1→0, freed once).
 }
 
 /// Run forktest_parent with mmap_test enabled to catch SIGSEGV on lazy-region demand paging.

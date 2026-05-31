@@ -145,11 +145,44 @@ The per-`fork` share (~50 ms) is *not* the headline; the headline is the
 ~60 s spent in large `mmap`/`munmap` whose per-page cost is amplified by the
 O(n) frame bookkeeping over a now-much-larger tracked-frame list.
 
+### Kernel benchmark (boot self-test)
+
+`src/process_tests.rs::run_cow_benchmarks()` measures the two costs directly at
+boot and prints grep-able `[BENCH]` lines.  It allocates real frames and is
+memory-adaptive (capped by free RAM with headroom), so it is safe at the default
+256M; boot with `MEMORY=2048` to reach the larger working-set size uncapped.
+
+- **BENCH-1 `munmap-teardown`** — maps+tracks `n` pages, then tears them all
+  down via the exact `munmap` primitives (`unmap_and_free_page` →
+  `remove_user_frame` + per-page TLB flush + `free_page`).  Run at `n=2000` and
+  `n=16000`.  The headline is `per_page`: under the O(n²) teardown it *grows*
+  with `n`; once teardown is O(log n) it is *flat*.
+- **BENCH-2 `fork-cow-share`** — runs the per-page primitives
+  `fork_process`'s `cow_share_range` uses (`collect_mapped_pages_with_flags` →
+  `cow_ref_inc` + child `map_page` + `track_user_frame`) plus the parent
+  `demote_range_to_ro` + TLB flush, over 8000 pages.  Informational (targets
+  C/D/E) and a guard that Fix A doesn't regress the fork path.
+
+| Benchmark (`MEMORY=2048`) | Baseline | After Fix A |
+|---|---|---|
+| `munmap-teardown` n=2000, per page | 1,902 ns | 898 ns |
+| `munmap-teardown` n=16000, per page | **12,220 ns** | **843 ns** |
+| `munmap-teardown` n=16000, total | 195,531 µs | **13,494 µs** |
+| `fork-cow-share` 8000 pages, per page | 576 ns | 792 ns |
+
+Baseline per-page cost scales with `n` (1,902 → 12,220 ns as n goes 8×) — the
+O(n²) signature, and the 16k total (~195 ms) matches the ~190 ms `munmap`s seen
+in the rustc trace.  After Fix A, per-page teardown is **flat in `n`** (898 vs
+843 ns) — a **14.5× speedup** on the large unmap.  `fork-cow-share` rose
+slightly (576 → 792 ns/page) because `track_user_frame` went from `Vec::push`
+(O(1)) to a map insert (O(log n)); this is dwarfed by the teardown win (~16 ms
+more per fork vs ~180 ms saved per large unmap) and is what C/D/E address next.
+
 ---
 
 ## Optimization options (ranked by leverage / cost)
 
-### A. Make frame teardown not O(n²) — *quick, biggest immediate win*
+### A. Make frame teardown not O(n²) — *quick, biggest immediate win* ✅ DONE
 
 `user_frames` should not be a `Vec` scanned per page. Options:
 - Replace the linear scan with a `BTreeSet<usize>`/hash set keyed by PA → O(log n)
@@ -160,6 +193,15 @@ O(n) frame bookkeeping over a now-much-larger tracked-frame list.
 
 This alone should turn the ~190 ms unmaps into single-digit ms and is the
 lowest-risk change. It also helps every process, not just `fork`.
+
+**Implemented** (`mmu/mod.rs`): `user_frames` is now a
+`BTreeMap<usize, u32>` (PA → in-AS refcount), so `remove_user_frame` is
+O(log n) instead of an O(n) scan.  A *map with a count* (not a plain set)
+preserves exact free multiplicity if a PA is ever tracked at multiple VAs, so
+the CoW-refcounted free path stays balanced (no leak / no double-free).
+Result: the 16k-page teardown went **195 ms → 13.5 ms (14.5×)** and per-page
+cost is now flat in `n` (see the benchmark table above).  Boot fork/clone/pipe
+self-tests stay green and host unit tests pass.
 
 ### B. `vfork` fast-path for `fork`+`exec` — *structural, biggest absolute win*
 
@@ -202,7 +244,8 @@ Combines well with B/C.
 ## Recommended path
 
 1. **A first** (frame teardown O(1)) — small, safe, kills the dominant ~60 s
-   and helps all process exit/`munmap`, not just fork.
+   and helps all process exit/`munmap`, not just fork. ✅ **Done** — 14.5× on
+   the large unmap; per-page teardown now flat in `n` (see benchmark table).
 2. **B next** (vfork fast-path) — eliminates the wasted copy for every spawn,
    which is the entire rustc/clang/ld pipeline.
 3. **C/D later** if `fork` of a *non-exec* child (rare here) still matters.

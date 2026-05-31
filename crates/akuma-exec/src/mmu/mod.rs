@@ -173,7 +173,7 @@ static ASID_ALLOCATOR: Spinlock<AsidAllocator> = Spinlock::new(AsidAllocator::ne
 /// for the last shared view to free.
 struct SharedL0Entry {
     ref_count: usize,
-    deferred_user_frames: Option<Vec<PhysFrame>>,
+    deferred_user_frames: Option<BTreeMap<usize, u32>>,
     deferred_pt_frames: Option<Vec<PhysFrame>>,
     deferred_l0: Option<PhysFrame>,
 }
@@ -184,7 +184,12 @@ static SHARED_L0_TABLE: Spinlock<BTreeMap<usize, SharedL0Entry>> =
 pub struct UserAddressSpace {
     l0_frame: PhysFrame,
     page_table_frames: Spinlock<Vec<PhysFrame>>,
-    user_frames: Spinlock<Vec<PhysFrame>>,
+    /// Tracked user data frames, keyed by physical address → reference count
+    /// *within this address space* (a PA can be tracked more than once if it is
+    /// mapped at multiple VAs).  A map (not a `Vec`) so `remove_user_frame` is
+    /// O(log n) instead of an O(n) linear scan — `munmap`/exit tears down
+    /// `P` pages in O(P·log n) instead of O(P·n).  See docs/COW_OPTIMIZATIONS.md.
+    user_frames: Spinlock<BTreeMap<usize, u32>>,
     asid: u16,
     shared: bool,
 }
@@ -198,7 +203,7 @@ impl UserAddressSpace {
         let mut addr_space = Self {
             l0_frame,
             page_table_frames: Spinlock::new(Vec::new()),
-            user_frames: Spinlock::new(Vec::new()),
+            user_frames: Spinlock::new(BTreeMap::new()),
             asid,
             shared: false,
         };
@@ -224,7 +229,7 @@ impl UserAddressSpace {
         Some(Self {
             l0_frame: PhysFrame { addr: parent_l0_phys },
             page_table_frames: Spinlock::new(Vec::new()),
-            user_frames: Spinlock::new(Vec::new()),
+            user_frames: Spinlock::new(BTreeMap::new()),
             asid,
             shared: true,
         })
@@ -377,7 +382,7 @@ impl UserAddressSpace {
         let rt = runtime();
         let frame = (rt.alloc_page_zeroed)().ok_or("Out of memory for user page")?;
         (rt.track_frame)(frame, FrameSource::ElfLoader);
-        { let _irq = IrqGuard::new(); self.user_frames.lock().push(frame); }
+        { let _irq = IrqGuard::new(); *self.user_frames.lock().entry(frame.addr).or_insert(0) += 1; }
         self.map_page(va, frame.addr, user_flags)?;
         Ok(frame)
     }
@@ -421,16 +426,23 @@ impl UserAddressSpace {
     /// to another thread which tries to lock → spins forever).
     pub fn track_user_frame(&self, frame: PhysFrame) {
         let _irq = IrqGuard::new();
-        self.user_frames.lock().push(frame);
+        *self.user_frames.lock().entry(frame.addr).or_insert(0) += 1;
     }
     pub fn track_page_table_frame(&self, frame: PhysFrame) {
         let _irq = IrqGuard::new();
         self.page_table_frames.lock().push(frame);
     }
+    /// Drop one tracked reference to `frame`'s physical address.  O(log n) map
+    /// lookup (was an O(n) linear scan — the dominant `munmap`/exit cost, see
+    /// docs/COW_OPTIMIZATIONS.md).  A PA can be tracked more than once (mapped
+    /// at multiple VAs), so we decrement the count and only drop the entry at 0.
     pub fn remove_user_frame(&self, frame: PhysFrame) {
         let _irq = IrqGuard::new();
         let mut frames = self.user_frames.lock();
-        if let Some(idx) = frames.iter().position(|f| f.addr == frame.addr) { frames.swap_remove(idx); }
+        if let Some(count) = frames.get_mut(&frame.addr) {
+            *count -= 1;
+            if *count == 0 { frames.remove(&frame.addr); }
+        }
     }
 
     pub fn unmap_page(&mut self, va: usize) -> Result<(), &'static str> {
@@ -691,7 +703,9 @@ impl Drop for UserAddressSpace {
                 let rt = runtime();
                 {
                     let _irq = IrqGuard::new();
-                    for frame in &*self.user_frames.lock() { (rt.free_page)(*frame); }
+                    for (&addr, &count) in &*self.user_frames.lock() {
+                        for _ in 0..count { (rt.free_page)(PhysFrame::new(addr)); }
+                    }
                 }
                 {
                     let _irq = IrqGuard::new();
@@ -729,7 +743,9 @@ impl Drop for UserAddressSpace {
             }
             if let (Some(uf), Some(pf), Some(l0)) = deferred {
                 let rt = runtime();
-                for frame in &uf { (rt.free_page)(*frame); }
+                for (&addr, &count) in &uf {
+                    for _ in 0..count { (rt.free_page)(PhysFrame::new(addr)); }
+                }
                 for frame in &pf { (rt.free_page)(*frame); }
                 (rt.free_page)(l0);
             }
