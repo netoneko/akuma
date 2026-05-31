@@ -38,7 +38,6 @@ MEMBERS=(
     "tcc"
     "tar"
     "sshd"
-    "dash"
     "llama-cpp"
     "crush"
     "stp_test"
@@ -112,12 +111,6 @@ done
 
 # Copy hello world example
 cp tcc/examples/hello_world/hello.c ../bootstrap/hello.c
-
-# Link sh to dash
-DASH_BIN="../bootstrap/bin/dash"
-if [ -f "$DASH_BIN" ]; then
-    cp "$DASH_BIN" "../bootstrap/bin/sh"
-fi
 
 # Build forktest (Go, opt-in via --with-forktest)
 if [ "$WITH_FORKTEST" = true ]; then
