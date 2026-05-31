@@ -119,10 +119,16 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
 
     // MAP_POPULATE requests eager pre-faulting; it suppresses lazy allocation.
     // MADV_WILLNEED can also trigger pre-faulting on existing lazy regions.
+    // Anonymous private mappings above MMAP_EAGER_MAX_PAGES are demand-paged
+    // (zero-fill on first touch) rather than eagerly allocated+zeroed+mapped.
+    // This is the "lazy/zero-on-demand population" win from COW_OPTIMIZATIONS.md:
+    // pages that are never touched are never allocated, which cuts the physical
+    // footprint (the rustc trace ended near OOM from eager over-commit). Small
+    // mappings stay eager — see config::MMAP_EAGER_MAX_PAGES for the rationale.
     let use_lazy = !is_file_backed && !map_populate && (
         is_lazy ||
         (flags & MAP_NORESERVE != 0) ||
-        pages > 256
+        pages > crate::config::MMAP_EAGER_MAX_PAGES
     );
 
     if use_lazy {

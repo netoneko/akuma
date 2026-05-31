@@ -404,6 +404,7 @@ pub fn run_cow_benchmarks() {
     console::print("\n--- CoW / munmap Benchmarks ---\n");
     bench_munmap_teardown();
     bench_fork_cow_share();
+    bench_mmap_populate();
     console::print("--- CoW / munmap Benchmarks Done ---\n\n");
 }
 
@@ -516,6 +517,120 @@ fn bench_fork_cow_share() {
         "[BENCH] fork-cow-share pages={} total={}us per_page={}ns\n",
         shared, elapsed, per_page_ns);
     // child drops (cow_ref 2→1, no free), then parent drops (1→0, freed once).
+}
+
+/// BENCH-3: `mmap` populate cost — eager vs lazy (docs/COW_OPTIMIZATIONS.md,
+/// "lazy/zero-on-demand population").
+///
+/// `sys_mmap`'s eager path pays, *at mmap time, for every page* in the mapping:
+/// a batched `alloc_pages_zeroed` (one PMM lock + zero-fill), a `map_page` (page
+/// table install), a `track_user_frame`, and one TLB range flush.  The lazy path
+/// pays only an O(1) `push_lazy_region` registration at mmap time, then the exact
+/// same per-page populate cost *at fault time* — but only for pages actually
+/// touched.  So the lazy win is entirely "untouched pages cost nothing"; the
+/// per-page populate work itself is comparable (the fault path additionally pays
+/// an EL0→EL1 round-trip + a single-page TLB flush, which a microbenchmark in the
+/// kernel's own address space cannot reproduce — see caveat below).
+///
+/// This measures, at two sizes:
+///   [BENCH] mmap-eager-populate  n=<P> per_page=<ns>   (batched alloc + 1 flush)
+///   [BENCH] mmap-lazy-fault      n=<P> per_page=<ns>   (per-page alloc + per-page flush)
+///   [BENCH] mmap-lazy-register   n=<P> total=<ns>      (push_lazy_region, O(1) in n)
+///
+/// Headline: `mmap-lazy-register` is flat in `n` (it is the only mmap-time cost a
+/// lazy mapping pays), and `mmap-eager-populate × n` is what eager spends up front
+/// regardless of how much of the mapping is ever used.
+///
+/// > QEMU/TCG caveat: per-page TLB flushes (`tlbi`) and the exception round-trip
+/// > are far cheaper under emulation than on real AArch64, so the real-hardware
+/// > gap between eager (batched flush) and per-fault (per-page flush) is wider
+/// > than these numbers show — which only strengthens the case for not faulting
+/// > pages that are never touched.
+fn bench_mmap_populate() {
+    use akuma_exec::mmu::{self, user_flags};
+    for &target_n in &[256usize, 2048usize] {
+        let mut p = make_test_process(992_000 + target_n as u32);
+
+        // Cap the working set by free memory so we never OOM the kernel.
+        let (_total, _alloc, free) = crate::pmm::stats();
+        let want = target_n.min(free.saturating_sub(BENCH_FREE_HEADROOM_PAGES));
+        if want == 0 {
+            console::print("[BENCH] mmap-populate: SKIPPED (no memory)\n");
+            continue;
+        }
+
+        // ── Eager populate: mirror sys_mmap's eager path. ──────────────────
+        let start = crate::timer::uptime_us();
+        let mut mapped = 0usize;
+        if let Some(frames) = crate::pmm::alloc_pages_zeroed(want) {
+            for (i, frame) in frames.into_iter().enumerate() {
+                let va = BENCH_VA_BASE + i * 4096;
+                if p.address_space.map_page(va, frame.addr, user_flags::RW).is_err() {
+                    crate::pmm::free_page(frame);
+                    break;
+                }
+                p.address_space.track_user_frame(frame);
+                mapped += 1;
+            }
+            mmu::flush_tlb_range_all_asid(BENCH_VA_BASE, mapped);
+        }
+        let eager_us = crate::timer::uptime_us() - start;
+        if mapped == 0 {
+            console::print("[BENCH] mmap-populate: SKIPPED (alloc failed)\n");
+            continue;
+        }
+        crate::safe_print!(160,
+            "[BENCH] mmap-eager-populate n={} per_page={}ns\n",
+            mapped, (eager_us.saturating_mul(1000)) / mapped as u64);
+
+        // Tear the eager mapping down before the lazy measurement.
+        for i in 0..mapped {
+            let va = BENCH_VA_BASE + i * 4096;
+            if let Some(frame) = p.address_space.unmap_and_free_page_no_flush(va) {
+                crate::pmm::free_page(frame);
+            }
+        }
+        mmu::flush_tlb_range_all_asid(BENCH_VA_BASE, mapped);
+
+        // ── Lazy register: the ONLY mmap-time cost a lazy mapping pays. ─────
+        let start = crate::timer::uptime_us();
+        akuma_exec::process::push_lazy_region(p.tgid, BENCH_VA_BASE, mapped * 4096, user_flags::RW);
+        let register_us = crate::timer::uptime_us() - start;
+        crate::safe_print!(160,
+            "[BENCH] mmap-lazy-register n={} total={}ns\n",
+            mapped, register_us.saturating_mul(1000));
+        // Drop the lazy region; we measure the fault-time populate separately.
+        let _ = akuma_exec::process::munmap_lazy_regions_in_range(p.tgid, BENCH_VA_BASE, mapped * 4096);
+
+        // ── Lazy fault populate: per-page alloc + map + per-page flush, the
+        //    work the demand-fault handler does for each *touched* page. ─────
+        let start = crate::timer::uptime_us();
+        let mut faulted = 0usize;
+        for i in 0..mapped {
+            let va = BENCH_VA_BASE + i * 4096;
+            let Some(frame) = crate::pmm::alloc_page_zeroed() else { break; };
+            if p.address_space.map_page(va, frame.addr, user_flags::RW).is_err() {
+                crate::pmm::free_page(frame);
+                break;
+            }
+            p.address_space.track_user_frame(frame);
+            mmu::flush_tlb_range_all_asid(va, 1);
+            faulted += 1;
+        }
+        let lazy_us = crate::timer::uptime_us() - start;
+        crate::safe_print!(160,
+            "[BENCH] mmap-lazy-fault n={} per_page={}ns\n",
+            faulted, (lazy_us.saturating_mul(1000)) / faulted.max(1) as u64);
+
+        // Tear down; `p` drops here freeing its page-table frames.
+        for i in 0..faulted {
+            let va = BENCH_VA_BASE + i * 4096;
+            if let Some(frame) = p.address_space.unmap_and_free_page_no_flush(va) {
+                crate::pmm::free_page(frame);
+            }
+        }
+        mmu::flush_tlb_range_all_asid(BENCH_VA_BASE, faulted);
+    }
 }
 
 /// Run forktest_parent with mmap_test enabled to catch SIGSEGV on lazy-region demand paging.

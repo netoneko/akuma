@@ -162,6 +162,14 @@ memory-adaptive (capped by free RAM with headroom), so it is safe at the default
   `cow_ref_inc` + child `map_page` + `track_user_frame`) plus the parent
   `demote_range_to_ro` + TLB flush, over 8000 pages.  Informational (targets
   C/D/E) and a guard that Fix A doesn't regress the fork path.
+- **BENCH-3 `mmap-populate`** — the true per-page cost of `sys_mmap`'s eager
+  path (batched `alloc_pages_zeroed` + `map_page` + one TLB flush) vs the
+  per-page demand-fault populate, plus the O(1) `push_lazy_region` registration
+  a lazy mapping pays at mmap time.  Run at `n=256` and `n=2048`.  Backs Fix F:
+  it shows eager and lazy per-page populate cost are equal (~2 µs), so the lazy
+  win is "untouched pages cost nothing," not a cheaper per-page path.  Added
+  because the per-syscall PSTATS `mmap` time is preemption-inflated (see the
+  correction in the end-to-end section) and so can't be trusted as the cost.
 
 | Benchmark (`MEMORY=2048`) | Baseline | After Fix A | After Phase 2 (E) |
 |---|---|---|---|
@@ -203,9 +211,95 @@ replication (zero `FORK-COW` shares from rustc), and Fix A+E cut `munmap` from
 pre-compile baseline (no leak from the shared-AS path) and all 196 boot
 self-tests + 98 host tests stay green.
 
-**The remaining cost is now `mmap`** (~27 s, eager page allocation + zeroing),
-a separate axis from fork/CoW — the next thing to attack if compile time still
-matters (e.g. lazy/zero-on-demand population, huge-page zeroing).
+**The remaining headline cost *appeared* to be `mmap`** (~27 s) — but see the
+correction below: most of that number is a **preemption-accounting artifact**,
+not real zeroing work.  The genuinely actionable residue is the physical-memory
+footprint of eager mmap, addressed by Fix F (lazy anonymous mmap) below.
+
+### Correction: the "~27 s in `mmap`" is mostly a measurement artifact
+
+The per-syscall time in PSTATS is wall-clock (`uptime_us()` taken before and
+after the syscall body), and QEMU runs **single-core** with **IRQs enabled
+during syscalls** (`src/exceptions.rs` "Enable IRQs during syscall handling to
+allow preemption").  So when a thread is preempted *inside* `mmap`, the clock
+keeps running while *other threads — and other processes —* execute, and all of
+that time is charged to `mmap`.
+
+Two pieces of evidence make this conclusive:
+
+1. **clang logged 53 s of `mmap` time while existing for only ~30 s of
+   wall-clock** on one core (`mmap=101(53726ms)` between two PSTATS snapshots
+   30 s apart).  That is impossible as real CPU cost.
+2. **157 of the eager mmaps are 2 pages (8 KB)** yet the per-call average is
+   ~140 ms.  Zeroing 8 KB cannot take 140 ms; the eager path is already
+   well-batched (one PMM-lock `alloc_pages_zeroed`, `no_flush` mapping, one TLB
+   range flush).
+3. After Fix F made *most* anonymous mmaps lazy, the reported `mmap` time barely
+   moved (30,450 → 30,070 ms) even though the eager zeroing was largely
+   eliminated — if the 27 s had been zeroing, lazy would have slashed it.  It
+   didn't, because the time is preemption inflation, not zeroing.
+
+So optimizing the `mmap` *code path* does not move wall-clock.  What eager mmap
+*does* cost for real is **physical memory**: it commits pages that may never be
+touched, and the baseline trace ended at ~3 % free RAM (`pmm=17498free`).  That
+footprint — not a 27 s zeroing bill — is what Fix F targets.
+
+### F. Lazy anonymous mmap (zero-on-demand population) — *memory footprint* ✅ DONE
+
+Option D, applied to the `mmap` path.  An anonymous `MAP_PRIVATE` mapping larger
+than `config::MMAP_EAGER_MAX_PAGES` (default **16**) is now registered as a lazy
+region and zero-filled **on first touch** instead of eagerly allocated + zeroed
++ mapped in the syscall.  This reuses the demand-paging machinery that already
+backed `>256`-page mmaps, the heap, and the stack (`push_lazy_region` →
+`ensure_user_page_mapped`), so it is the *same proven path* applied to smaller
+mappings — only the threshold changed (`src/syscall/mem.rs`, `src/config.rs`).
+
+Small mappings stay eager on purpose: each demand fault is an EL0→EL1 round-trip
++ `fault_mutex` + a single-page TLB flush, so for a *fully-touched* region eager
+batching is cheaper, and the 1–8 page mmaps (which dominate by count) free
+little memory if deferred.
+
+**BENCH-3 `mmap-populate`** (boot self-test, `MEMORY=2048`) measures the true
+per-page cost in isolation (no preemption):
+
+| Benchmark | n=256 | n=2048 |
+|---|---|---|
+| `mmap-eager-populate` (batched alloc + 1 flush), per page | 2,355 ns | 1,882 ns |
+| `mmap-lazy-fault` (per-page alloc + per-page flush), per page | 2,171 ns | 2,122 ns |
+| `mmap-lazy-register` (`push_lazy_region`), **total** | 17 µs¹ | 6 µs |
+
+¹ first-call allocation noise; the steady-state register cost is flat in `n`
+(~5–6 µs) — it is the *only* mmap-time cost a lazy mapping pays.
+
+The takeaway: **per-page populate cost is the same** for eager and lazy (~2 µs);
+the lazy win is entirely "untouched pages cost nothing" (both work *and*
+memory), plus an O(1) registration instead of O(n) up-front population.
+
+**End-to-end (`MEMORY=2048`, Fix A+E+B+F, 2026-05-31):**
+`rustc -C linker=clang -o /tmp/hello /akuma-playground/hello.rs` →
+`exec /tmp/hello` → **`Hello from Akuma!`**.
+
+| Quantity | After A+E+B | After A+E+B+F |
+|---|---|---|
+| rustc `pgfault` | 385 pages | **3,560 pages** (work shifted from eager mmap to on-demand faults) |
+| rustc `munmap` | 209 / 88 ms | 209 / 78 ms |
+| rustc `mmap` (wall, preemption-inflated) | 216 / 27,138 ms | 216 / 30,070 ms (≈unchanged — confirms artifact) |
+| Compile correctness | Hello from Akuma! | **Hello from Akuma!** (no regression) |
+
+`pgfault` rising 385 → 3,560 (~14 MB faulted in) is the expected, *correct*
+signature: pages that eager mmap would have allocated up front are now allocated
+only when touched.  All boot self-tests stay green.
+
+> **Known limitation — `MEMORY` > 2 GB:** the kernel/user VA split is hardcoded
+> at `ProcessMemory::KERNEL_VA_END = 0xC000_0000` (3 GB), which assumes RAM
+> ≤ 2 GB (identity map `[1 GB, 3 GB)`).  With `MEMORY=4096` the kernel
+> identity-maps physical RAM over `[1 GB, 5 GB)` as **EL1-only** pages, so a
+> user mmap placed at ≥ 3 GB (rustc's allocator does this) collides with the
+> identity map and an EL0 access takes a **permission fault → SIGSEGV** (observed
+> at `FAR≈0xfecb2bf8`).  This is independent of Fix F (it does not change mmap
+> placement or the identity map) and pre-exists it; running rustc requires
+> `MEMORY=2048` until `KERNEL_VA_END` is scaled with RAM (or the user mmap base
+> is moved above the identity map).
 
 ---
 

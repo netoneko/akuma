@@ -224,6 +224,23 @@ pub const COW_FORK_ENABLED: bool = true;
 /// Set to false to fall back to copy-fork for vfork (clean kill switch).
 pub const VFORK_FASTPATH_ENABLED: bool = true;
 
+/// Eager/lazy threshold for **anonymous private** `mmap` (docs/COW_OPTIMIZATIONS.md,
+/// "lazy/zero-on-demand population").  An anonymous mapping of more than this many
+/// pages is registered as a lazy region and demand-paged (zero-fill on first touch)
+/// instead of eagerly allocating + zeroing + mapping every page in the syscall.
+///
+/// Why a threshold rather than always-lazy (Linux's behaviour): each demand fault
+/// is an EL0→EL1 round-trip + `fault_mutex` + a single-page TLB flush, so for a
+/// *fully-touched* region eager batching (one PMM-lock alloc, `no_flush` maps, one
+/// range TLB flush) is cheaper.  Keeping small mappings eager avoids per-fault
+/// overhead on the common 1–8 page case (which dominates by count and frees little
+/// memory if deferred); deferring the larger mappings is where the
+/// physical-footprint win is — the rustc trace ended at ~3% free RAM because eager
+/// mmap commits pages that may never be touched.
+///
+/// Set high (e.g. 256) to restore the old mostly-eager behaviour.
+pub const MMAP_EAGER_MAX_PAGES: usize = 16;
+
 /// Emit per-process syscall stats on exit (total + breakdown by category).
 pub const PROCESS_SYSCALL_STATS: bool = true;
 
