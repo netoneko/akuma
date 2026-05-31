@@ -446,6 +446,16 @@ impl UserAddressSpace {
     }
 
     pub fn unmap_page(&mut self, va: usize) -> Result<(), &'static str> {
+        let r = self.unmap_page_no_flush(va);
+        flush_tlb_page(va);
+        r
+    }
+
+    /// Clear the L3 PTE for `va` **without** flushing the TLB.  The caller must
+    /// issue `flush_tlb_range_all_asid` (or equivalent) over the range before
+    /// the unmapped VAs could be accessed again.  Used by `munmap`/teardown to
+    /// batch one barrier per region instead of one per page.
+    pub fn unmap_page_no_flush(&mut self, va: usize) -> Result<(), &'static str> {
         let _irq_guard = IrqGuard::new();
         let l0_idx = (va >> 39) & 0x1FF;
         let l1_idx = (va >> 30) & 0x1FF;
@@ -464,7 +474,6 @@ impl UserAddressSpace {
             let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
             l3_ptr.add(l3_idx).write_volatile(0);
         }
-        flush_tlb_page(va);
         Ok(())
     }
 
@@ -472,6 +481,16 @@ impl UserAddressSpace {
     /// Returns `Some(PhysFrame)` if the page was mapped, `None` if it wasn't.
     /// The caller is responsible for freeing the returned frame via PMM.
     pub fn unmap_and_free_page(&mut self, va: usize) -> Option<PhysFrame> {
+        let frame = self.unmap_and_free_page_no_flush(va);
+        flush_tlb_page(va);
+        frame
+    }
+
+    /// Like `unmap_and_free_page` but **without** the per-page TLB flush — the
+    /// caller batches a single `flush_tlb_range_all_asid` over the whole region
+    /// after the loop.  This is the hot path for large `munmap`s (the trace
+    /// showed single 12,426-page unmaps); per-page barriers dominated otherwise.
+    pub fn unmap_and_free_page_no_flush(&mut self, va: usize) -> Option<PhysFrame> {
         let _irq_guard = IrqGuard::new();
         let l0_idx = (va >> 39) & 0x1FF;
         let l1_idx = (va >> 30) & 0x1FF;
@@ -493,7 +512,6 @@ impl UserAddressSpace {
             l3_ptr.add(l3_idx).write_volatile(0);
             (l3_entry & 0x0000_FFFF_FFFF_F000) as usize
         };
-        flush_tlb_page(va);
         let frame = PhysFrame::new(pa);
         self.remove_user_frame(frame);
         Some(frame)
@@ -898,6 +916,45 @@ pub fn flush_tlb_range(start_va: usize, pages: usize) {
     }
     #[cfg(not(target_os = "none"))]
     let _ = (start_va, pages);
+}
+
+/// Flush TLB entries for a contiguous VA range across **all** ASIDs, with a
+/// single barrier pair for the whole range.
+///
+/// Issues `tlbi vaae1` (VA, All-ASID, EL1) per page — exactly the instruction
+/// `flush_tlb_page` uses, so unmap semantics are unchanged — but with one
+/// `dsb ish` + `isb` after the batch instead of a `dsb`/`isb` per page.  Use
+/// after a batch of `unmap_page_no_flush` / `unmap_and_free_page_no_flush`
+/// calls to avoid O(pages) barrier sequences during a large `munmap`/teardown.
+/// See docs/COW_OPTIMIZATIONS.md (cheap-win E).
+#[inline]
+pub fn flush_tlb_range_all_asid(start_va: usize, pages: usize) {
+    // Above this many pages, one full-TLB flush (a single `tlbi vmalle1`) is
+    // cheaper than issuing `tlbi` per page — the same trade-off Linux makes via
+    // `tlb_single_page_flush_ceiling`.  A full flush is a correct (more
+    // aggressive) superset of a per-VA range flush; the cost is that unrelated
+    // TLB entries refill, which is worth it for a large `munmap`.
+    const FULL_FLUSH_THRESHOLD: usize = 512;
+    if pages == 0 {
+        return;
+    }
+    if pages > FULL_FLUSH_THRESHOLD {
+        flush_tlb_all();
+        return;
+    }
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!("dsb ishst");
+        let mut va = start_va;
+        for _ in 0..pages {
+            core::arch::asm!("tlbi vaae1, {}", in(reg) (va >> 12) as u64);
+            va += 0x1000;
+        }
+        core::arch::asm!("dsb ish");
+        core::arch::asm!("isb");
+    }
+    #[cfg(not(target_os = "none"))]
+    let _ = start_va;
 }
 
 /// Atomically get or create a page table at `table_ptr[idx]`.

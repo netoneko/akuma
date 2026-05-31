@@ -439,13 +439,16 @@ fn bench_munmap_teardown() {
             continue;
         }
 
+        // Mirror sys_munmap's batched teardown: clear each PTE without a
+        // per-page barrier, then one `flush_tlb_range_all_asid` for the region.
         let start = crate::timer::uptime_us();
         for i in 0..mapped {
             let va = BENCH_VA_BASE + i * 4096;
-            if let Some(frame) = p.address_space.unmap_and_free_page(va) {
+            if let Some(frame) = p.address_space.unmap_and_free_page_no_flush(va) {
                 crate::pmm::free_page(frame);
             }
         }
+        akuma_exec::mmu::flush_tlb_range_all_asid(BENCH_VA_BASE, mapped);
         let elapsed = crate::timer::uptime_us() - start;
         let per_page_ns = (elapsed.saturating_mul(1000)) / mapped as u64;
         crate::safe_print!(160,

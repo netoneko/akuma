@@ -163,20 +163,26 @@ memory-adaptive (capped by free RAM with headroom), so it is safe at the default
   `demote_range_to_ro` + TLB flush, over 8000 pages.  Informational (targets
   C/D/E) and a guard that Fix A doesn't regress the fork path.
 
-| Benchmark (`MEMORY=2048`) | Baseline | After Fix A |
-|---|---|---|
-| `munmap-teardown` n=2000, per page | 1,902 ns | 898 ns |
-| `munmap-teardown` n=16000, per page | **12,220 ns** | **843 ns** |
-| `munmap-teardown` n=16000, total | 195,531 µs | **13,494 µs** |
-| `fork-cow-share` 8000 pages, per page | 576 ns | 792 ns |
+| Benchmark (`MEMORY=2048`) | Baseline | After Fix A | After Phase 2 (E) |
+|---|---|---|---|
+| `munmap-teardown` n=2000, per page | 1,902 ns | 898 ns | 828 ns |
+| `munmap-teardown` n=16000, per page | **12,220 ns** | 843 ns | **664 ns** |
+| `munmap-teardown` n=16000, total | 195,531 µs | 13,494 µs | **10,636 µs** |
+| `fork-cow-share` 8000 pages, per page | 576 ns | 792 ns | ~800 ns |
 
 Baseline per-page cost scales with `n` (1,902 → 12,220 ns as n goes 8×) — the
 O(n²) signature, and the 16k total (~195 ms) matches the ~190 ms `munmap`s seen
 in the rustc trace.  After Fix A, per-page teardown is **flat in `n`** (898 vs
-843 ns) — a **14.5× speedup** on the large unmap.  `fork-cow-share` rose
-slightly (576 → 792 ns/page) because `track_user_frame` went from `Vec::push`
-(O(1)) to a map insert (O(log n)); this is dwarfed by the teardown win (~16 ms
-more per fork vs ~180 ms saved per large unmap) and is what C/D/E address next.
+843 ns) — a **14.5× speedup** on the large unmap.  After Phase 2 (batched TLB
+flush + full-flush threshold) the 16k unmap is **664 ns/page** — **18.4×** vs the
+original baseline.  `fork-cow-share` rose with Fix A (576 → ~800 ns/page) because
+`track_user_frame` went from `Vec::push` (O(1)) to a map insert (O(log n)); this
+is dwarfed by the teardown win and is what C/D address next.
+
+> **QEMU caveat:** these are TCG-emulated numbers.  TLB-maintenance
+> instructions (`tlbi`) and barriers (`dsb`/`isb`) are far cheaper under
+> emulation than on real AArch64 silicon, so the Phase 2 TLB wins — especially
+> the full-flush threshold — understate the real-hardware benefit.
 
 ---
 
@@ -234,10 +240,22 @@ Combines well with B/C.
 
 ### E. Cheap wins
 
-- Per-ASID TLB flush instead of `flush_tlb_asid(0)` (all ASIDs) after fork.
-- Batch TLB maintenance in `unmap_page` (one barrier per range, not per page).
-- Skip unmapped gaps: drive `cow_share_range`/demote from the page-table walk's
-  *present* entries rather than re-scanning whole VA spans.
+- **Batch TLB maintenance in `munmap`** ✅ **Done.** Added `unmap_page_no_flush`
+  / `unmap_and_free_page_no_flush` and `flush_tlb_range_all_asid`; `sys_munmap`
+  now clears all PTEs in a region with no per-page barrier, then flushes the
+  region once.  Above a 512-page threshold it does a single full-TLB flush
+  (`tlbi vmalle1`) instead of one `tlbi vaae1` per page — like Linux's
+  `tlb_single_page_flush_ceiling`.  16k-page teardown: 843 → 664 ns/page (the
+  gain is larger on real hardware; see the QEMU caveat above).
+- **Skip unmapped gaps** ✅ **Already done.**  `collect_mapped_pages_with_flags`
+  and `demote_range_to_ro` both already skip absent L0/L1/L2 subtrees by block
+  boundary, so the fork share/demote walks only touch present entries.
+- Per-ASID TLB flush instead of `flush_tlb_asid(0)` after fork — **skipped on
+  purpose.**  `flush_tlb_asid(0)` is `tlbi aside1` with ASID 0, and sibling
+  threads of a multithreaded process each hold a *different* ASID over the same
+  L0; a naive per-ASID flush would leave stale RW entries in siblings' TLBs and
+  reintroduce the §4b′ multithreaded-fork corruption.  It is also just one flush
+  per fork (~negligible).  Not worth the risk; left as-is.
 
 ---
 

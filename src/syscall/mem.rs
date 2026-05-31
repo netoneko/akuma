@@ -473,14 +473,18 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
         let region_pages = proc.mmap_regions[idx].1.len();
         if unmap_pages >= region_pages {
             let (_, frames) = proc.mmap_regions.remove(idx);
-            let freed_size = frames.len() * 4096;
+            let n = frames.len();
+            let freed_size = n * 4096;
             crate::tprint!(128, "[munmap] pid={} addr=0x{:x} full ({} pages)\n",
-                proc.pid, addr, frames.len());
+                proc.pid, addr, n);
+            // Defer the TLB flush: clear each PTE without a per-page barrier,
+            // then flush the whole region once (cheap-win E, COW_OPTIMIZATIONS.md).
             for (i, frame) in frames.into_iter().enumerate() {
-                let _ = proc.address_space.unmap_page(addr + i * 4096);
+                let _ = proc.address_space.unmap_page_no_flush(addr + i * 4096);
                 proc.address_space.remove_user_frame(frame);
                 crate::pmm::free_page(frame);
             }
+            akuma_exec::mmu::flush_tlb_range_all_asid(addr, n);
             proc.memory.free_regions.push((addr, freed_size));
         } else {
             let (old_start, old_frames) = proc.mmap_regions.remove(idx);
@@ -489,11 +493,12 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
             let mut iter = old_frames.into_iter();
             for i in 0..unmap_pages {
                 if let Some(frame) = iter.next() {
-                    let _ = proc.address_space.unmap_page(old_start + i * 4096);
+                    let _ = proc.address_space.unmap_page_no_flush(old_start + i * 4096);
                     proc.address_space.remove_user_frame(frame);
                     crate::pmm::free_page(frame);
                 }
             }
+            akuma_exec::mmu::flush_tlb_range_all_asid(old_start, unmap_pages);
             let remaining: Vec<crate::pmm::PhysFrame> = iter.collect();
             if !remaining.is_empty() {
                 let new_start = old_start + unmap_pages * 4096;
@@ -509,11 +514,12 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
         for &(freed_start, freed_pages) in &results {
             let mut had_physical = false;
             for i in 0..freed_pages {
-                if let Some(frame) = proc.address_space.unmap_and_free_page(freed_start + i * 4096) {
+                if let Some(frame) = proc.address_space.unmap_and_free_page_no_flush(freed_start + i * 4096) {
                     crate::pmm::free_page(frame);
                     had_physical = true;
                 }
             }
+            akuma_exec::mmu::flush_tlb_range_all_asid(freed_start, freed_pages);
             // Only recycle the VA range when physical pages were actually freed.
             // Pure lazy (PROT_NONE, never demand-paged) regions must NOT be put
             // back in free_regions: alloc_mmap prefers free_regions over
@@ -534,10 +540,16 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
             va >= *start && va < *start + frames.len() * 4096
         });
         if !in_eager {
-            if let Some(frame) = proc.address_space.unmap_and_free_page(va) {
+            if let Some(frame) = proc.address_space.unmap_and_free_page_no_flush(va) {
                 crate::pmm::free_page(frame);
             }
         }
+    }
+    // Some VAs in [addr, addr+unmap_len) may have been skipped (in_eager) or
+    // never mapped, but flushing the whole span once is correct and cheaper
+    // than tracking which pages we actually cleared.
+    if total_pages > 0 {
+        akuma_exec::mmu::flush_tlb_range_all_asid(addr, total_pages);
     }
     0
 }
