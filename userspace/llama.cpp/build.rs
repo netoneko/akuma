@@ -52,11 +52,14 @@ fn main() {
         panic!("cmake configure failed");
     }
 
-    // Build only llama-cli
-    println!("cargo:warning=Building llama-cli...");
     let num_jobs = std::thread::available_parallelism()
         .map(|n| n.get().to_string())
         .unwrap_or_else(|_| "4".to_string());
+
+    fs::create_dir_all(&target_bin_dir).expect("Failed to create bootstrap/bin");
+
+    // Build and install llama-cli
+    println!("cargo:warning=Building llama-cli...");
     let status = Command::new("cmake")
         .arg("--build")
         .arg(&build_dir)
@@ -71,25 +74,39 @@ fn main() {
         panic!("Failed to build llama-cli");
     }
 
-    // Copy binary to bootstrap/bin
-    let compiled_bin = build_dir.join("bin/llama-cli");
-    if !compiled_bin.exists() {
-        panic!(
-            "llama-cli binary not found at {}",
-            compiled_bin.display()
-        );
+    let compiled_cli = build_dir.join("bin/llama-cli");
+    if !compiled_cli.exists() {
+        panic!("llama-cli binary not found at {}", compiled_cli.display());
+    }
+    let dest_cli = target_bin_dir.join("llama-cli");
+    fs::copy(&compiled_cli, &dest_cli).expect("Failed to copy llama-cli");
+    let _ = Command::new("aarch64-linux-musl-strip").arg(&dest_cli).status();
+    println!("cargo:warning=Installed llama-cli to bootstrap/bin/llama-cli");
+
+    // Build and install llama-server
+    println!("cargo:warning=Building llama-server...");
+    let status = Command::new("cmake")
+        .arg("--build")
+        .arg(&build_dir)
+        .arg("--target")
+        .arg("llama-server")
+        .arg("-j")
+        .arg(&num_jobs)
+        .status()
+        .expect("Failed to execute cmake --build");
+
+    if !status.success() {
+        panic!("Failed to build llama-server");
     }
 
-    fs::create_dir_all(&target_bin_dir).expect("Failed to create bootstrap/bin");
-    let dest = target_bin_dir.join("llama-cli");
-    fs::copy(&compiled_bin, &dest).expect("Failed to copy llama-cli");
+    let compiled_server = build_dir.join("bin/llama-server");
+    if !compiled_server.exists() {
+        panic!("llama-server binary not found at {}", compiled_server.display());
+    }
+    let dest_server = target_bin_dir.join("llama-server");
+    fs::copy(&compiled_server, &dest_server).expect("Failed to copy llama-server");
+    let _ = Command::new("aarch64-linux-musl-strip").arg(&dest_server).status();
+    println!("cargo:warning=Installed llama-server to bootstrap/bin/llama-server");
 
-    let _ = Command::new("aarch64-linux-musl-strip")
-        .arg(&dest)
-        .status();
-
-    println!(
-        "cargo:warning=Successfully built llama-cli and installed to bootstrap/bin/llama-cli"
-    );
     println!("cargo:rerun-if-changed=build.rs");
 }
