@@ -152,6 +152,101 @@ into a safe, counted no-op.
 
 ---
 
+## The fix, part 2: refcount-aware unmap (session 2) — Bug 1 prevented at source
+
+The PMM-layer defense above *contains* the over-free; session 2 *prevents* it.
+The "faster munmap" refactor added a refcount to `remove_user_frame` but never
+wired it into the **free decision**:
+
+- `unmap_and_free_page` called `remove_user_frame` (which decremented the count)
+  and then returned the frame **unconditionally** — so the caller freed it even
+  when the count was still > 0 (page still mapped at another VA).
+- The eager munmap loops (`syscall/mem.rs`) did `remove_user_frame(frame);
+  free_page(frame);` unconditionally.
+- `UserAddressSpace::drop` freed each PA **`count` times** (`for _ in 0..count`).
+
+A PA mapped at N VAs is **allocated once** but freed N times — the over-free.
+
+**Fix (`crates/akuma-exec/src/mmu/mod.rs`, `src/syscall/mem.rs`):**
+
+- `remove_user_frame` now returns `bool` (and is `#[must_use]`): `true` iff it
+  dropped the **last** reference (count hit 0) — i.e. the caller now owns the
+  free. `false` means "still mapped elsewhere, or not tracked in this AS"
+  (e.g. a `new_shared` vfork view, whose frames the L0 owner frees).
+- `unmap_and_free_page` returns `Some(frame)` **only when `remove_user_frame`
+  returned true**; otherwise `None` (PTE cleared, frame not freed).
+- The eager munmap loops free `only if remove_user_frame(frame)`.
+- `UserAddressSpace::drop` frees each distinct PA **once** (the count is a
+  *mapping* refcount, not an alloc count).
+- CoW call sites (`exceptions.rs`) keep their existing behavior via `let _ =`
+  (their free is governed by `cow_ref_dec`, not `user_frames`).
+
+Untracked-frame policy: **don't free** (return `None`/`false`). A leak is
+recoverable and visible in the counters; an over-free hands a live page to a new
+owner and crashes the kernel. Shared (vfork) views legitimately have an empty
+`user_frames`, so "untracked here" is the normal, correct case for them.
+
+---
+
+## Bug 2: the ELF heap-slurp — the *actual* `EC=0x22` cause
+
+After Bug 1 was fixed, `apk search`@64 MB still crashed with the **identical**
+`EC=0x22` and byte-identical garbage registers. Bisecting by binary size and
+boot-fresh runs isolated it:
+
+- `/bin/hello` (72 KB), `/bin/echo2` — run clean at 64 MB.
+- `apk` (**5 MB**) — crashes, **even as the very first command**, with PMM
+  **unchanged from boot** (no physical pages allocated yet) but the **kernel heap
+  at 7.2 MB / 8 MB (86 %)**.
+- apk runs fine at 256 MB (64 MB heap).
+
+Root cause: `spawn_process_with_channel_ext` (`crates/akuma-exec/src/process/spawn.rs`)
+loaded the ELF via `read_file(elf_path)`, which returns the **entire binary as a
+`Vec<u8>` on the kernel heap**. For a 5 MB executable that alone consumes most of
+the 8 MB `MEMORY=64` heap (the heap scales with RAM, hence 64 MB-only). The
+deferred, demand-paged loader (`from_elf_path`) already existed but was only a
+*fallback* used when `read_file` **failed**.
+
+This explains every observation the double-free theory could not: apk-specific
+(size), 64 MB-only (heap size), reproduces as first command, **PMM untouched**
+(heap — not PMM — exhausted), deterministic.
+
+**Fix (`spawn.rs`):** size-gate the loader. Files larger than `HEAP_SLURP_MAX`
+(1 MiB) use the demand-paged `from_elf_path` path (segments mapped lazily from
+the file, flat heap use regardless of binary size); smaller binaries keep the
+well-trodden whole-file path. Both the interactive (`spawn_process_with_channel_cwd`)
+and non-interactive (`exec_streaming_cwd`) SSH exec paths funnel through this one
+function, so the single change covers both.
+
+**Result:** apk now loads with the heap at ~2 MB (not 7.2 MB) and executes — it
+gets through 55 mmap regions / ~27 MB before hitting Bug 3.
+
+---
+
+## Bug 3 (open): crash under heavy mmap churn
+
+With Bugs 1 + 2 fixed, `apk search llama`@64 MB now runs substantially, then:
+
+```
+[Exception] Sync from EL1: EC=0x21, ISS=0x4
+  ELR=0xb69c09c86dc7f288, FAR=0xb69c09c86dc7f288, SPSR=0x50100345
+  Thread=0, TTBR0=0x404d4000, SP=0x409ff580, SP_EL0=0xcbf20bfb29ba4724
+  Heap: 2.0/8 MB used   PMM: 3424/16384 free (~13 MB)   (NOT OOM)
+```
+
+- `EC=0x21 ISS=0x4` = instruction abort, translation fault L0 — the kernel
+  fetched an instruction from an **unmapped** garbage PC (vs Bug 1/2's `EC=0x22`
+  misaligned PC). Same class: a corrupted return/function pointer on Thread0.
+- Happens after ~55 mmap regions and ~27 MB allocated (13 MB still free — not OOM).
+- apk is mmap-heavy (282 mmap / 47 munmap at the crash) and **re-munmaps the same
+  VA repeatedly** (e.g. `0x207b3000 full (4 pages)` ×4) — worth checking whether
+  that churn drives a stale-PTE / aliasing / over-free reachable only at scale.
+
+Deterministic ⇒ ideal for lldb+gdbstub: break at the EL1 instruction-abort
+vector, walk back to the trampled kernel structure. See "Remaining work".
+
+---
+
 ## Tests (`src/process_tests.rs`, boot self-test suite)
 
 Both run under IRQs-disabled so PMM accounting is deterministic (no concurrent
