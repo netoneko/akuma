@@ -1119,12 +1119,21 @@ async fn memory_monitor() -> ! {
         let threads_max = akuma_exec::threading::max_threads();
 
         let uptime_us = timer::uptime_us();
+        // Only shown when non-zero: a detected double-free means some caller's
+        // free obligations are out of sync with allocations (track_user_frame/
+        // cow_ref desync) — see pmm::DOUBLE_FREE_COUNT.
+        let dfree = pmm::double_free_count();
+        let dfree_marker = if dfree > 0 {
+            alloc::format!(" | DOUBLE-FREE={}", dfree)
+        } else {
+            alloc::string::String::new()
+        };
         buf.clear();
         let _ = write!(
             buf,
-            "[Mem] Uptime {} | RAM: {}/{}MB free | Heap: {}/{}MB free ({} KB used, {} KB peak) | Allocs: {} | Threads: {}/{} ({}r {}rd)\n",
+            "[Mem] Uptime {} | RAM: {}/{}MB free | Heap: {}/{}MB free ({} KB used, {} KB peak) | Allocs: {} | Threads: {}/{} ({}r {}rd){}\n",
             uptime_us, free_ram_mb, total_ram_mb, free_kb / 1024, heap_mb, allocated_kb, peak_kb, stats.allocation_count,
-            threads_used, threads_max, threads_running, threads_ready
+            threads_used, threads_max, threads_running, threads_ready, dfree_marker
         );
         console::print(buf.as_str());
 

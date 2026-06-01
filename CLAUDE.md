@@ -24,7 +24,8 @@ GDB=1 cargo run --release              # QEMU gdbstub on :1234
 scripts/create_disk.sh                 # (Re)create ext2 disk image
 scripts/populate_disk.sh               # Populate disk with userspace binaries
 userspace/build.sh                     # Build all userspace binaries
-userspace/build.sh --apk-only          # Build apk bootstrap assets only
+userspace/build.sh --apk-tools-only    # Build apk bootstrap assets only
+userspace/build.sh --meow-only         # Build a single member (--<name>-only)
 cargo check                            # Fast diagnostics
 ```
 

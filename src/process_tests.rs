@@ -366,6 +366,12 @@ pub fn run_all_tests() {
     // Go mmap regression: forktest_parent with mmap_test must not SIGSEGV
     // test_forktest_parent_mmap(); // disabled: runs for up to 60s
 
+    // munmap / user_frames refcount conservation (commits 8e2f625 "faster
+    // munmap" + ba60d72 "even faster munmap"). Guards the PMM-free invariant of
+    // the BTreeMap user_frames refcount and deferred-TLB teardown path.
+    test_munmap_teardown_conserves_pmm();
+    test_aliased_pa_not_double_freed();
+
     // CoW / munmap performance benchmarks (docs/COW_OPTIMIZATIONS.md).
     // Enabled by default for now; gate behind a config flag once the numbers
     // are stable.  Prints grep-able `[BENCH]` lines.
@@ -399,6 +405,127 @@ const BENCH_VA_BASE: usize = 0x10_0000_0000;
 /// Keep at least this many physical pages free so a benchmark can never
 /// drive the kernel out of memory (16 MiB of headroom).
 const BENCH_FREE_HEADROOM_PAGES: usize = 4096;
+
+// ── munmap / user_frames refcount regression tests ────────────────────────
+//
+// These pin the physical-memory accounting invariants of the munmap teardown
+// path that commits 8e2f625 ("faster munmap", user_frames Vec→BTreeMap<PA,
+// refcount>) and ba60d72 ("even faster munmap", deferred per-region TLB flush)
+// reworked. They are spawn-free (pure address-space manipulation) and run
+// under IRQs-disabled so a concurrent allocation on another thread can't make
+// the PMM free-count comparison flaky — the measurement is then deterministic.
+//
+// Motivation: the EL1 crash in meow.log (Thread0, EC=0x22, garbage ELR/SP) is
+// the signature of a still-live physical page being returned to the PMM and
+// re-handed to a second owner. `pmm::free_page` decrements ALLOCATED_PAGES
+// *unconditionally* (even when the bitmap "already free" guard makes the actual
+// free a no-op), so any over-free is observable as the free-count drifting up.
+
+/// Positive control: mapping N distinct pages and tearing them down via the
+/// real munmap primitive (`unmap_and_free_page` → `free_page`) must return the
+/// PMM to exactly its starting free count — no leak, no over-free. Expected to
+/// PASS on a correct teardown path; fails if the refcount/free pairing drifts.
+fn test_munmap_teardown_conserves_pmm() {
+    use akuma_exec::mmu::user_flags;
+    const N: usize = 64;
+
+    let (free_before, free_after) = crate::irq::with_irqs_disabled(|| {
+        let (_t, _a, free_before) = crate::pmm::stats();
+        {
+            let mut p = make_test_process(992_000);
+            let mut mapped = 0usize;
+            for i in 0..N {
+                let va = BENCH_VA_BASE + i * 0x1000;
+                let Some(frame) = crate::pmm::alloc_page_zeroed() else { break; };
+                if p.address_space.map_page(va, frame.addr, user_flags::RW).is_err() {
+                    crate::pmm::free_page(frame);
+                    break;
+                }
+                p.address_space.track_user_frame(frame);
+                mapped += 1;
+            }
+            // Tear down through the deferred-flush munmap primitive (ba60d72):
+            // each call drops the user_frames refcount to 0 and returns the
+            // frame for the caller to free exactly once.
+            for i in 0..mapped {
+                let va = BENCH_VA_BASE + i * 0x1000;
+                if let Some(frame) = p.address_space.unmap_and_free_page(va) {
+                    crate::pmm::free_page(frame);
+                }
+            }
+            // `p` drops here: user_frames is empty, so Drop frees only the
+            // page-table frames + L0 it allocated — net zero against setup.
+        }
+        let (_t, _a, free_after) = crate::pmm::stats();
+        (free_before, free_after)
+    });
+
+    if free_after == free_before {
+        console::print("[Test] munmap_teardown_conserves_pmm PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] munmap_teardown_conserves_pmm FAILED: free_before={} free_after={} (leak or over-free)\n",
+            free_before, free_after);
+    }
+}
+
+/// Reproducer for the user_frames over-free (commit 8e2f625). A physical page
+/// the kernel allocated **once** must be returned to the PMM **once** when its
+/// address space is torn down — even when it is tracked more than once. The
+/// BTreeMap design explicitly admits a PA tracked `count` times ("mapped at
+/// multiple VAs", mmu/mod.rs `remove_user_frame`), and `Drop` frees each such
+/// PA `count` times. With no matching CoW refcount, that frees a singly-
+/// allocated page twice: the bitmap "already free" guard hides the second
+/// free, but `ALLOCATED_PAGES.fetch_sub` still runs, and under real allocation
+/// pressure the page is handed to a second owner while still mapped — the
+/// Thread0 garbage-context EL1 fault seen in meow.log.
+///
+/// Expected to FAIL on the buggy teardown (free count drifts up by 1); the fix
+/// is to free each distinct tracked PA once, or to keep the CoW refcount in
+/// lockstep with the user_frames count. This test gates that fix.
+fn test_aliased_pa_not_double_freed() {
+    use akuma_exec::mmu::user_flags;
+
+    let result = crate::irq::with_irqs_disabled(|| {
+        let (_t, _a, free_before) = crate::pmm::stats();
+        let df_before = crate::pmm::double_free_count();
+        let Some(frame) = crate::pmm::alloc_page_zeroed() else { return None; };
+        {
+            let mut p = make_test_process(992_100);
+            let va1 = BENCH_VA_BASE;
+            let va2 = BENCH_VA_BASE + 0x1000;
+            // Map the same physical page at two VAs and track it for each
+            // mapping — the count>1 state the refcount design admits. va1/va2
+            // share the same L1/L2/L3 tables, so the second map allocates no
+            // new page-table frames (keeps the accounting balanced).
+            let _ = p.address_space.map_page(va1, frame.addr, user_flags::RW);
+            p.address_space.track_user_frame(frame);
+            let _ = p.address_space.map_page(va2, frame.addr, user_flags::RW);
+            p.address_space.track_user_frame(frame);
+            // `p` drops here: Drop frees user_frames[frame] == 2 times. The
+            // second free hits an already-free page; pmm::free_page must refuse
+            // the re-mark (counting it) instead of corrupting the free list.
+        }
+        let (_t, _a, free_after) = crate::pmm::stats();
+        let df_delta = crate::pmm::double_free_count() - df_before;
+        // This test deliberately triggered the double-free to verify the guard;
+        // discount it so the [Mem] DOUBLE-FREE signal only flags real desyncs.
+        crate::pmm::discount_double_frees(df_delta);
+        Some((free_before, free_after, df_delta))
+    });
+
+    match result {
+        None => console::print("[Test] aliased_pa_not_double_freed SKIPPED (no memory)\n"),
+        // Allocated 1 page → must remain freed exactly once: the free list and
+        // ALLOCATED_PAGES are conserved, and the redundant free is detected and
+        // refused (df_delta == 1) rather than corrupting the allocator.
+        Some((before, after, df_delta)) if after == before && df_delta == 1 =>
+            console::print("[Test] aliased_pa_not_double_freed PASSED (double-free refused)\n"),
+        Some((before, after, df_delta)) => crate::safe_print!(192,
+            "[Test] aliased_pa_not_double_freed FAILED: free_before={} free_after={} (delta={}) df_delta={} (expected delta=0, df_delta=1)\n",
+            before, after, after as i64 - before as i64, df_delta),
+    }
+}
 
 pub fn run_cow_benchmarks() {
     console::print("\n--- CoW / munmap Benchmarks ---\n");

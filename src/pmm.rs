@@ -403,24 +403,44 @@ impl BitmapAllocator {
         }
     }
 
-    /// Free a single page
-    fn free_page(&mut self, frame: PhysFrame) {
+    /// Free a single page. Returns the outcome so the caller can keep
+    /// `ALLOCATED_PAGES` exact (decrement only on a real allocated→free
+    /// transition) and observe double-frees instead of corrupting the counter.
+    fn free_page(&mut self, frame: PhysFrame) -> FreeOutcome {
         if frame.addr < self.base_addr {
-            return;
+            return FreeOutcome::OutOfRange;
         }
-
         let page_idx = (frame.addr - self.base_addr) / PAGE_SIZE;
-        if page_idx < self.total_pages && !self.is_free(page_idx) {
-            self.mark_free(page_idx);
-            self.free_pages += 1;
-
-            // Update hint if this is before current hint
-            if page_idx < self.next_free_hint {
-                self.next_free_hint = page_idx;
-            }
+        if page_idx >= self.total_pages {
+            return FreeOutcome::OutOfRange;
         }
+        if self.is_free(page_idx) {
+            // Already free: re-marking it would double the page on the free
+            // list and, after a reallocation, hand a live page to a second
+            // owner — the heap corruption behind the Thread0 EL1 fault. Refuse
+            // the re-mark and report it to the caller.
+            return FreeOutcome::DoubleFree;
+        }
+        self.mark_free(page_idx);
+        self.free_pages += 1;
+        // Update hint if this is before current hint
+        if page_idx < self.next_free_hint {
+            self.next_free_hint = page_idx;
+        }
+        FreeOutcome::Freed
     }
 
+}
+
+/// Result of returning a page to the bitmap allocator.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum FreeOutcome {
+    /// Page transitioned allocated→free (the normal case).
+    Freed,
+    /// Page was already free — a double-free, refused (see `free_page`).
+    DoubleFree,
+    /// Address is outside managed RAM (e.g. below base) — ignored, as before.
+    OutOfRange,
 }
 
 /// Global physical memory allocator
@@ -429,6 +449,15 @@ static PMM: Spinlock<BitmapAllocator> = Spinlock::new(BitmapAllocator::new());
 /// Statistics
 static TOTAL_PAGES: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATED_PAGES: AtomicUsize = AtomicUsize::new(0);
+
+/// Count of detected double-frees: a page returned to the PMM while already
+/// free. The bitmap guard in `BitmapAllocator::free_page` refuses the re-mark,
+/// so this is contained, but any non-zero value means some caller's free
+/// obligations are out of sync with its allocations (a `track_user_frame` /
+/// `cow_ref` desync) — the latent cause of heap corruption and the Thread0
+/// EL1 fault. Surfaced in the periodic `[Mem]` stats line so it is visible
+/// under load instead of silently corrupting the heap and faulting later.
+static DOUBLE_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Initialize the physical memory manager
 ///
@@ -476,11 +505,33 @@ pub fn free_page(frame: PhysFrame) {
     untrack_frame(frame);
 
     // CRITICAL: Disable IRQs to prevent deadlock!
-    crate::irq::with_irqs_disabled(|| {
+    let outcome = crate::irq::with_irqs_disabled(|| {
         let mut pmm = PMM.lock();
-        pmm.free_page(frame);
-        ALLOCATED_PAGES.fetch_sub(1, Ordering::Relaxed);
-    })
+        pmm.free_page(frame)
+    });
+    match outcome {
+        // Only a real allocated→free transition adjusts the counter. The old
+        // code decremented unconditionally, so a double-free silently drifted
+        // ALLOCATED_PAGES even when the bitmap guard made the free a no-op.
+        FreeOutcome::Freed => { ALLOCATED_PAGES.fetch_sub(1, Ordering::Relaxed); }
+        FreeOutcome::DoubleFree => { DOUBLE_FREE_COUNT.fetch_add(1, Ordering::Relaxed); }
+        FreeOutcome::OutOfRange => {}
+    }
+}
+
+/// Number of double-frees detected since boot (see `DOUBLE_FREE_COUNT`).
+/// Non-zero indicates a `track_user_frame`/`cow_ref` desync in some caller.
+pub fn double_free_count() -> usize {
+    DOUBLE_FREE_COUNT.load(Ordering::Relaxed)
+}
+
+/// Discount `n` double-frees from the running total. Only for boot self-tests
+/// that deliberately trigger a double-free to exercise the guard, so the
+/// `[Mem]` signal keeps reflecting only *real* desyncs and operators aren't
+/// misled by a test artifact.
+#[doc(hidden)]
+pub fn discount_double_frees(n: usize) {
+    DOUBLE_FREE_COUNT.fetch_sub(n, Ordering::Relaxed);
 }
 
 /// Allocate `count` contiguous zeroed physical pages.
