@@ -521,13 +521,29 @@ impl UserAddressSpace {
     /// lookup (was an O(n) linear scan — the dominant `munmap`/exit cost, see
     /// docs/COW_OPTIMIZATIONS.md).  A PA can be tracked more than once (mapped
     /// at multiple VAs), so we decrement the count and only drop the entry at 0.
-    pub fn remove_user_frame(&self, frame: PhysFrame) {
+    ///
+    /// Returns `true` iff this call dropped the **last** reference (count
+    /// reached 0) — i.e. the caller now owns the obligation to free the
+    /// physical frame.  Returns `false` when the frame is still referenced at
+    /// another VA, **or** when this address space does not track the frame at
+    /// all (e.g. a `new_shared` vfork view, whose `user_frames` is empty and
+    /// whose frames are owned by the L0 owner).  Freeing on a `false` result
+    /// would be a double-free — the historical bug behind the EL1 EC=0x22
+    /// crashes under memory pressure (a still-live page handed back to the PMM
+    /// and re-mapped into a kernel allocation).
+    #[must_use = "free the frame only when this returns true; freeing otherwise is a double-free"]
+    pub fn remove_user_frame(&self, frame: PhysFrame) -> bool {
         let _irq = IrqGuard::new();
         let mut frames = self.user_frames.lock();
         if let Some(count) = frames.get_mut(&frame.addr) {
             *count -= 1;
-            if *count == 0 { frames.remove(&frame.addr); }
+            if *count == 0 {
+                frames.remove(&frame.addr);
+                return true; // last reference dropped — caller owns the free
+            }
+            return false; // still mapped at another VA — must not free yet
         }
+        false // untracked here — not this address space's free obligation
     }
 
     pub fn unmap_page(&mut self, va: usize) -> Result<(), &'static str> {
@@ -598,8 +614,18 @@ impl UserAddressSpace {
             (l3_entry & 0x0000_FFFF_FFFF_F000) as usize
         };
         let frame = PhysFrame::new(pa);
-        self.remove_user_frame(frame);
-        Some(frame)
+        // Only hand the frame back for freeing when we dropped its *last*
+        // reference.  If it is still mapped at another VA (refcount > 1) or is
+        // owned by the L0 owner (shared view, untracked here), `remove_user_frame`
+        // returns false and we must NOT free it — doing so was the double-free
+        // that produced the EL1 EC=0x22 crashes under low memory.  The PTE is
+        // already cleared above; the surviving reference (or the owner's Drop)
+        // frees the physical frame exactly once.
+        if self.remove_user_frame(frame) {
+            Some(frame)
+        } else {
+            None
+        }
     }
 
     /// Zero the physical page backing `va` without unmapping it.
@@ -806,8 +832,15 @@ impl Drop for UserAddressSpace {
                 let rt = runtime();
                 {
                     let _irq = IrqGuard::new();
-                    for (&addr, &count) in &*self.user_frames.lock() {
-                        for _ in 0..count { (rt.free_page)(PhysFrame::new(addr)); }
+                    // Free each distinct physical page exactly ONCE.  `user_frames`
+                    // counts how many VAs map a PA, not how many times it was
+                    // allocated — a page mapped at N VAs was still allocated once.
+                    // The old `for _ in 0..count` freed aliased pages N times, an
+                    // over-free that only the PMM double-free guard hid (and that
+                    // handed live pages to new owners under memory pressure — the
+                    // EL1 EC=0x22 crash).
+                    for (&addr, &_count) in &*self.user_frames.lock() {
+                        (rt.free_page)(PhysFrame::new(addr));
                     }
                 }
                 {
@@ -846,8 +879,11 @@ impl Drop for UserAddressSpace {
             }
             if let (Some(uf), Some(pf), Some(l0)) = deferred {
                 let rt = runtime();
-                for (&addr, &count) in &uf {
-                    for _ in 0..count { (rt.free_page)(PhysFrame::new(addr)); }
+                // Free each distinct physical page exactly once (see owner-drop
+                // branch above): the count is a mapping refcount, not an alloc
+                // count.
+                for (&addr, &_count) in &uf {
+                    (rt.free_page)(PhysFrame::new(addr));
                 }
                 for frame in &pf { (rt.free_page)(*frame); }
                 (rt.free_page)(l0);

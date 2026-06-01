@@ -371,6 +371,7 @@ pub fn run_all_tests() {
     // the BTreeMap user_frames refcount and deferred-TLB teardown path.
     test_munmap_teardown_conserves_pmm();
     test_aliased_pa_not_double_freed();
+    test_unmap_and_free_respects_refcount();
 
     // CoW / munmap performance benchmarks (docs/COW_OPTIMIZATIONS.md).
     // Enabled by default for now; gate behind a config flag once the numbers
@@ -472,17 +473,18 @@ fn test_munmap_teardown_conserves_pmm() {
 /// Reproducer for the user_frames over-free (commit 8e2f625). A physical page
 /// the kernel allocated **once** must be returned to the PMM **once** when its
 /// address space is torn down — even when it is tracked more than once. The
-/// BTreeMap design explicitly admits a PA tracked `count` times ("mapped at
-/// multiple VAs", mmu/mod.rs `remove_user_frame`), and `Drop` frees each such
-/// PA `count` times. With no matching CoW refcount, that frees a singly-
-/// allocated page twice: the bitmap "already free" guard hides the second
-/// free, but `ALLOCATED_PAGES.fetch_sub` still runs, and under real allocation
-/// pressure the page is handed to a second owner while still mapped — the
-/// Thread0 garbage-context EL1 fault seen in meow.log.
+/// BTreeMap design admits a PA tracked `count` times ("mapped at multiple VAs",
+/// mmu/mod.rs `remove_user_frame`); `count` is a *mapping* refcount, not an
+/// alloc count, so the page must still be freed exactly once.
 ///
-/// Expected to FAIL on the buggy teardown (free count drifts up by 1); the fix
-/// is to free each distinct tracked PA once, or to keep the CoW refcount in
-/// lockstep with the user_frames count. This test gates that fix.
+/// Before the fix, `Drop` freed each such PA `count` times: the bitmap "already
+/// free" guard hid the second free, but `ALLOCATED_PAGES.fetch_sub` still ran,
+/// and under real allocation pressure the page was handed to a second owner
+/// while still mapped — the Thread0 garbage-context EL1 fault seen in meow.log.
+///
+/// The fix frees each distinct tracked PA once in `UserAddressSpace::drop`, so
+/// no double-free occurs at all (`df_delta == 0`) — the PMM guard is now a
+/// backstop, not a crutch. This test gates that behavior.
 fn test_aliased_pa_not_double_freed() {
     use akuma_exec::mmu::user_flags;
 
@@ -516,14 +518,64 @@ fn test_aliased_pa_not_double_freed() {
 
     match result {
         None => console::print("[Test] aliased_pa_not_double_freed SKIPPED (no memory)\n"),
-        // Allocated 1 page → must remain freed exactly once: the free list and
-        // ALLOCATED_PAGES are conserved, and the redundant free is detected and
-        // refused (df_delta == 1) rather than corrupting the allocator.
-        Some((before, after, df_delta)) if after == before && df_delta == 1 =>
-            console::print("[Test] aliased_pa_not_double_freed PASSED (double-free refused)\n"),
+        // Allocated 1 page, mapped at 2 VAs (count==2) → must be freed exactly
+        // once at teardown: the free list and ALLOCATED_PAGES are conserved AND
+        // no double-free is even attempted (df_delta == 0).
+        Some((before, after, df_delta)) if after == before && df_delta == 0 =>
+            console::print("[Test] aliased_pa_not_double_freed PASSED (freed once, no over-free)\n"),
         Some((before, after, df_delta)) => crate::safe_print!(192,
-            "[Test] aliased_pa_not_double_freed FAILED: free_before={} free_after={} (delta={}) df_delta={} (expected delta=0, df_delta=1)\n",
+            "[Test] aliased_pa_not_double_freed FAILED: free_before={} free_after={} (delta={}) df_delta={} (expected delta=0, df_delta=0)\n",
             before, after, after as i64 - before as i64, df_delta),
+    }
+}
+
+/// Direct test of the refcount-aware `unmap_and_free_page` return value — the
+/// munmap-path half of the over-free fix. A PA mapped at two VAs (count==2)
+/// must be handed back for freeing exactly once: on the **second** unmap (last
+/// reference). The first unmap clears its PTE but must return `None`, so the
+/// caller does not free a page still mapped at the other VA. Before the fix,
+/// `unmap_and_free_page` returned `Some` on every call, freeing the still-live
+/// page on the first unmap and again on the second — the over-free that, under
+/// memory pressure, handed a mapped page to a new owner (EL1 EC=0x22 crash).
+fn test_unmap_and_free_respects_refcount() {
+    use akuma_exec::mmu::user_flags;
+
+    let result = crate::irq::with_irqs_disabled(|| {
+        let (_t, _a, free_before) = crate::pmm::stats();
+        let df_before = crate::pmm::double_free_count();
+        let Some(frame) = crate::pmm::alloc_page_zeroed() else { return None; };
+        let (first, second) = {
+            let mut p = make_test_process(992_200);
+            let va1 = BENCH_VA_BASE;
+            let va2 = BENCH_VA_BASE + 0x1000;
+            // Same PA mapped (and tracked) at two VAs → user_frames count == 2.
+            let _ = p.address_space.map_page(va1, frame.addr, user_flags::RW);
+            p.address_space.track_user_frame(frame);
+            let _ = p.address_space.map_page(va2, frame.addr, user_flags::RW);
+            p.address_space.track_user_frame(frame);
+            // First unmap: still referenced at va2 → must NOT yield a frame.
+            let first = p.address_space.unmap_and_free_page(va1);
+            // Second unmap: last reference → yields the frame to free exactly once.
+            let second = p.address_space.unmap_and_free_page(va2);
+            if let Some(f) = second { crate::pmm::free_page(f); }
+            // `p` drops with empty user_frames — nothing left to free.
+            (first.is_some(), second.is_some())
+        };
+        let (_t, _a, free_after) = crate::pmm::stats();
+        let df_delta = crate::pmm::double_free_count() - df_before;
+        Some((free_before, free_after, first, second, df_delta))
+    });
+
+    match result {
+        None => console::print("[Test] unmap_and_free_respects_refcount SKIPPED (no memory)\n"),
+        // First unmap returns None (still mapped), second returns Some (freed
+        // once), PMM conserved, and no double-free attempted.
+        Some((before, after, first, second, df_delta))
+            if after == before && !first && second && df_delta == 0 =>
+            console::print("[Test] unmap_and_free_respects_refcount PASSED\n"),
+        Some((before, after, first, second, df_delta)) => crate::safe_print!(240,
+            "[Test] unmap_and_free_respects_refcount FAILED: free_before={} free_after={} first_yielded={} second_yielded={} df_delta={} (expected first=false second=true delta=0 df=0)\n",
+            before, after, first, second, df_delta),
     }
 }
 

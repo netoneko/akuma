@@ -291,8 +291,11 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
             let freed_size = old_frames.len() * 4096;
             for (i, frame) in old_frames.into_iter().enumerate() {
                 let _ = proc.address_space.unmap_page(old_addr + i * 4096);
-                proc.address_space.remove_user_frame(frame);
-                crate::pmm::free_page(frame);
+                // Free only when this drops the frame's last reference; an
+                // aliased/shared PA is freed by its surviving owner instead.
+                if proc.address_space.remove_user_frame(frame) {
+                    crate::pmm::free_page(frame);
+                }
             }
             proc.memory.free_regions.push((old_addr, freed_size));
             found_eager = true;
@@ -489,8 +492,11 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
             // then flush the whole region once (cheap-win E, COW_OPTIMIZATIONS.md).
             for (i, frame) in frames.into_iter().enumerate() {
                 let _ = proc.address_space.unmap_page_no_flush(addr + i * 4096);
-                proc.address_space.remove_user_frame(frame);
-                crate::pmm::free_page(frame);
+                // Free only when this drops the frame's last reference; an
+                // aliased/shared PA is freed by its surviving owner instead.
+                if proc.address_space.remove_user_frame(frame) {
+                    crate::pmm::free_page(frame);
+                }
             }
             akuma_exec::mmu::flush_tlb_range_all_asid(addr, n);
             proc.memory.free_regions.push((addr, freed_size));
@@ -502,8 +508,11 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
             for i in 0..unmap_pages {
                 if let Some(frame) = iter.next() {
                     let _ = proc.address_space.unmap_page_no_flush(old_start + i * 4096);
-                    proc.address_space.remove_user_frame(frame);
-                    crate::pmm::free_page(frame);
+                    // Free only when this drops the frame's last reference; an
+                    // aliased/shared PA is freed by its surviving owner instead.
+                    if proc.address_space.remove_user_frame(frame) {
+                        crate::pmm::free_page(frame);
+                    }
                 }
             }
             akuma_exec::mmu::flush_tlb_range_all_asid(old_start, unmap_pages);

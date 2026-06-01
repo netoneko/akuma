@@ -130,21 +130,39 @@ pub fn spawn_process_with_channel_ext(
         }
     }
 
-    let mut process = match (runtime().read_file)(elf_path) {
-        Ok(elf_data) => {
-            let result = Process::from_elf(elf_path, &full_args, &full_env, &elf_data, None);
-            if use_ns_override { (runtime().clear_spawn_namespace)(); }
-            result.map_err(|e| format!("Failed to load ELF: {}", e))?
-        }
-        Err(_) => {
-            let file_size = (runtime().file_size)(elf_path)
-                .map_err(|e| {
-                    if use_ns_override { (runtime().clear_spawn_namespace)(); }
-                    format!("Failed to stat {}: {}", elf_path, e)
-                })? as usize;
-            let result = Process::from_elf_path(elf_path, elf_path, file_size, &full_args, &full_env, None);
-            if use_ns_override { (runtime().clear_spawn_namespace)(); }
-            result.map_err(|e| format!("Failed to load ELF: {}", e))?
+    // Cap how large an ELF we slurp whole into the kernel heap.  `read_file`
+    // returns the entire binary as a Vec<u8>; for a multi-MB executable (apk is
+    // ~5 MB) that alone exhausted the 8 MB heap at MEMORY=64 and crashed the
+    // kernel with a garbage-PC EL1 fault (EC=0x22) — reproducible only at low
+    // RAM because the heap scales with RAM.  Above this threshold use the
+    // demand-paged path loader (`from_elf_path`), which maps segments lazily
+    // from the file and keeps heap use flat regardless of binary size.  Small
+    // binaries keep the well-trodden whole-file path.
+    const HEAP_SLURP_MAX: usize = 1024 * 1024; // 1 MiB
+    let stat_size = (runtime().file_size)(elf_path).ok().map(|s| s as usize);
+
+    let mut process = if matches!(stat_size, Some(sz) if sz > HEAP_SLURP_MAX) {
+        let result = Process::from_elf_path(elf_path, elf_path, stat_size.unwrap(), &full_args, &full_env, None);
+        if use_ns_override { (runtime().clear_spawn_namespace)(); }
+        result.map_err(|e| format!("Failed to load ELF: {}", e))?
+    } else {
+        match (runtime().read_file)(elf_path) {
+            Ok(elf_data) => {
+                let result = Process::from_elf(elf_path, &full_args, &full_env, &elf_data, None);
+                if use_ns_override { (runtime().clear_spawn_namespace)(); }
+                result.map_err(|e| format!("Failed to load ELF: {}", e))?
+            }
+            Err(_) => {
+                let file_size = stat_size
+                    .or_else(|| (runtime().file_size)(elf_path).ok().map(|s| s as usize))
+                    .ok_or_else(|| {
+                        if use_ns_override { (runtime().clear_spawn_namespace)(); }
+                        format!("Failed to stat {}", elf_path)
+                    })?;
+                let result = Process::from_elf_path(elf_path, elf_path, file_size, &full_args, &full_env, None);
+                if use_ns_override { (runtime().clear_spawn_namespace)(); }
+                result.map_err(|e| format!("Failed to load ELF: {}", e))?
+            }
         }
     };
 

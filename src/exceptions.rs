@@ -817,7 +817,9 @@ fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
         );
         akuma_exec::mmu::flush_tlb_page(page_va);
         owner.address_space.track_user_frame(new_frame);
-        owner.address_space.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
+        // CoW: old page freed via the global CoW refcount (cow_ref_dec), not
+        // user_frames — drop the bookkeeping ref but never free here.
+        let _ = owner.address_space.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
         crate::pmm::cow_ref_dec(old_pa);
         true
     } else {
@@ -1513,7 +1515,9 @@ fn try_resolve_el1_cow_fault() -> bool {
         let _ = owner.address_space.map_page(page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
         akuma_exec::mmu::flush_tlb_page(page_va);
         owner.address_space.track_user_frame(new_frame);
-        owner.address_space.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
+        // CoW: old page freed via the global CoW refcount (cow_ref_dec), not
+        // user_frames — drop the bookkeeping ref but never free here.
+        let _ = owner.address_space.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
         crate::pmm::cow_ref_dec(old_pa);
         true // Caller returns; ERET retries the faulting instruction
     } else {
@@ -2331,7 +2335,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     akuma_exec::mmu::flush_tlb_page(page_va);
                                     // Track new frame, remove old shared frame
                                     owner.address_space.track_user_frame(new_frame);
-                                    owner.address_space.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
+                                    // CoW: old page freed via the global CoW refcount
+                                    // (cow_ref_dec), not user_frames — drop the bookkeeping
+                                    // ref but never free here.
+                                    let _ = owner.address_space.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
                                 }
                                 // Decrement CoW refcount (may free old page if last ref)
                                 crate::pmm::cow_ref_dec(old_pa);
