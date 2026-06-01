@@ -239,11 +239,38 @@ With Bugs 1 + 2 fixed, `apk search llama`@64 MB now runs substantially, then:
   misaligned PC). Same class: a corrupted return/function pointer on Thread0.
 - Happens after ~55 mmap regions and ~27 MB allocated (13 MB still free — not OOM).
 - apk is mmap-heavy (282 mmap / 47 munmap at the crash) and **re-munmaps the same
-  VA repeatedly** (e.g. `0x207b3000 full (4 pages)` ×4) — worth checking whether
-  that churn drives a stale-PTE / aliasing / over-free reachable only at scale.
+  VA repeatedly** (e.g. `0x207b3000 full (4 pages)` ×4).
 
-Deterministic ⇒ ideal for lldb+gdbstub: break at the EL1 instruction-abort
-vector, walk back to the trampled kernel structure. See "Remaining work".
+**Reproduced controllably with `forktest` (the userspace stressor).** Installed via
+`pkg install forktest_parent forktest_child` (host serves `bootstrap/` on `:8000`;
+the guest fetches `10.0.2.2:8000` directly — no Docker, no hostfwd):
+
+- `forktest_child -mmap_test -mmap_alloc_mb 8` (few large allocs) — runs **clean**.
+- `forktest_parent -num_children 2 -combined_stress -mmap_test -mmap_alloc_mb 4
+  -goroutine_stress -duration 20s` — **crashes** at MEMORY=64, `EC=0x22`, Thread0,
+  **at an `execve` of a forked child**.
+
+**It is a use-after-free, not a double-free.** The `DOUBLE-FREE` counter stayed
+**0** through the crash, and `free_page` correctly gates on CoW (`cow_ref_dec`).
+The decisive evidence: the crash registers are **ASCII bytes from the child's Go
+binary** — `ELR=0x722f6372732f6365` = `"ec/src/r"`, `SP_EL0=0x6f6c6c6165676170`
+= `"pageallo"` (Go embeds `runtime/mpagealloc.go` source paths in rodata). So
+Thread0's saved return address was overwritten with the **new process's user
+data** → a physical page is **aliased between a kernel structure and the freshly
+loaded user image**.
+
+Mechanism (hypothesis): `execve`/`replace_image` (`image.rs:43`, dropping the old
+AS) frees a page, but the **deferred TLB flush** (`ba60d72`, `*_no_flush`) can
+leave a stale PTE; the page returns to the PMM and is reallocated for the Go
+image while still aliased, and the kernel later reads Go data where a return
+address should be. This is exactly the "deferred-TLB-flush + fork/exec churn"
+variant called out in "Remaining work" as *detected but not prevented* — and the
+`DOUBLE-FREE` guard does not catch it because the page is freed exactly **once**
+(the alias is a stale *mapping*, not a second free).
+
+Deterministic + fast repro ⇒ ideal for lldb+gdbstub: a hardware watchpoint on
+Thread0's saved-context region to catch the alias write, or break at the EL1
+vector and walk back. See "Remaining work".
 
 ---
 
@@ -257,42 +284,58 @@ allocation noise):
   drops the AS, asserts the PMM free count returns to baseline. **PASSES.**
 - `test_aliased_pa_not_double_freed` — reproducer. Allocates **one** page, maps
   it at two VAs and tracks it for each (the `count>1` state the design admits),
-  drops the AS so `Drop` frees it twice. Asserts (a) the free list / counter are
-  conserved and (b) the redundant free was *detected and refused*
-  (`df_delta == 1`); then discounts its own double-free so `[Mem]` stays clean.
-  **FAILED before the fix** (free count drifted +1); **PASSES after.**
+  drops the AS. After the session-2 refcount fix, `Drop` frees it **once**, so
+  the test now asserts the free list / counter are conserved **and no double-free
+  is even attempted (`df_delta == 0`)** — the PMM guard is a backstop, not a
+  crutch. (Was asserting `df_delta == 1` against the PMM-guard-only fix.) **PASSES.**
+- `test_unmap_and_free_respects_refcount` (session 2) — covers the munmap-path
+  half. Maps one PA at two VAs (count == 2), then `unmap_and_free_page(va1)` must
+  return `None` (still referenced) and `unmap_and_free_page(va2)` must return
+  `Some` (last reference, freed once). Asserts PMM conserved, first→None,
+  second→Some, `df_delta == 0`. **PASSES.**
 
-Verified on a 256 MB boot: both PASS, boot reaches SSH, no EL1/panic, and
+Verified at **MEMORY=64**: all three PASS, boot reaches SSH, no spurious EL1/panic,
 `DOUBLE-FREE` never appears in any runtime `[Mem]` line (real paths balanced).
 
 ---
 
-## Remaining work (tomorrow)
+## Remaining work
 
-1. **Decide on commit.** The PMM hardening is self-contained and safe; commit it
-   (with the two tests) on `expand-acceptance`.
-2. **The concurrency variant is detected, not prevented.** Deferred TLB flush
-   (`ba60d72`: `unmap_*_no_flush` clears the PTE, frees the page, and flushes the
-   TLB only once per region *after* the loop) combined with the vfork shared-AS
-   fast-path (`8cf6144`) means a sibling/child thread sharing the L0 can still
-   hold a stale TLB entry for a page that was already returned to the PMM and
-   reallocated. That realloc-interleaving double-free is *not* caught by the
-   `is_free` guard (the page looks legitimately allocated to its new owner). The
-   `DOUBLE-FREE` counter is now the instrument to catch a desync; run the
-   suspected workload at 128 MB and watch for it.
-3. **Optional deeper hardening** (only if (2) reproduces): either flush the TLB
-   *before* returning each page to the PMM on the shared-AS path, or make the
-   refcount self-enforcing so `track_user_frame`/`cow_ref` cannot desync.
-4. **Repro under lldb+gdbstub** at 128 MB (`MEMORY=128`, `INSTANCE=1 GDB=1`,
-   `:1235`) with a hardware watchpoint on Thread0's saved-context region to catch
-   the stray write in the act and confirm which path frees the live page.
+1. **Bug 3 (open) is the priority.** Deterministic `EC=0x21` garbage-PC on Thread0
+   under apk's heavy mmap/munmap churn, not OOM. Approaches:
+   - **lldb+gdbstub** (`MEMORY=64`, `INSTANCE=1 GDB=1`, `:1235`): break at the EL1
+     instruction-abort vector, walk back to the corrupted return/fn-ptr and the
+     kernel structure apk trampled.
+   - Audit the **mmap-churn** paths: repeated same-VA munmap (observed
+     `0x207b3000` ×4), lazy-region split/merge, deferred-TLB-flush windows.
+   - Drive it under **`userspace/forktest` + `userspace/allocstress`** load so
+     concurrent pressure is in play while apk churns.
+2. **The concurrency variant of Bug 1 is detected, not fully prevented.** Deferred
+   TLB flush (`ba60d72`) + vfork shared-AS (`8cf6144`): a sibling sharing the L0
+   can hold a stale TLB entry for a page already freed and reallocated — not
+   caught by the `is_free` guard. The refcount-aware free (part 2) closes the
+   single-AS over-free; the cross-thread stale-TLB window may still exist and is a
+   candidate for Bug 3. Watch the `DOUBLE-FREE` counter under load.
+3. **Decide on commit.** Bug 1 fix (PMM hardening + refcount-aware unmap + 3
+   tests) and Bug 2 fix (deferred loader) are self-contained; commit on
+   `expand-acceptance` once Bug 3 direction is settled.
 
 ## Files touched
 
+Bug 1 — PMM hardening + refcount-aware unmap:
 - `src/pmm.rs` — `FreeOutcome`, `DOUBLE_FREE_COUNT`, fixed decrement, accessors.
 - `src/main.rs` — `[Mem]` `DOUBLE-FREE=N` marker.
+- `crates/akuma-exec/src/mmu/mod.rs` — `remove_user_frame -> bool` (`#[must_use]`);
+  `unmap_and_free_page` returns `Some` only on last ref; `Drop` frees once per PA.
+- `src/syscall/mem.rs` — eager munmap loops free only when `remove_user_frame` true.
+- `src/exceptions.rs` — `let _ =` on CoW `remove_user_frame` (free via `cow_ref_dec`).
 - `src/process_tests.rs` — `test_munmap_teardown_conserves_pmm`,
-  `test_aliased_pa_not_double_freed`.
+  `test_aliased_pa_not_double_freed` (now `df_delta==0`),
+  `test_unmap_and_free_respects_refcount` (new).
+
+Bug 2 — ELF heap-slurp:
+- `crates/akuma-exec/src/process/spawn.rs` — size-gated deferred loader (`>1 MiB`
+  uses `from_elf_path`).
 
 See also: `docs/COW_OPTIMIZATIONS.md` (the munmap/vfork work), `docs/AI_DEBUGGING.md`
 (lldb+gdbstub setup).
