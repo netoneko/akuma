@@ -342,18 +342,81 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     let (ram_base, ram_size) = detect_memory(dtb_ptr);
 
-    // Memory layout constants
-    const MIN_CODE_AND_STACK: usize = 8 * 1024 * 1024; // 8MB for kernel binary (~2MB) + 1MB boot stack
+    // Memory layout constants.
+    //
+    // CRITICAL: `code_and_stack` must cover the *boot stack*, or the kernel heap
+    // is placed on top of the live boot stack and the heap allocator hands out
+    // the stack's own pages under memory pressure — kernel-corrupts-kernel
+    // (the MMU can't protect the kernel from itself). This is the Thread0
+    // EC=0x21/0x22 stack-corruption crash seen at MEMORY=64 (see
+    // docs/PMM_DOUBLE_FREE_AND_EL1_CRASH.md, docs/STACK_CORRUPTION_ANALYSIS.md).
+    //
+    // The boot stack lives just below BOOT_STACK_TOP = KERNEL_BASE + 8 MB (see
+    // boot.rs). Because KERNEL_BASE = ram_base + 2 MB, the stack TOP is at
+    // ram_base + 10 MB — so the old flat 8 MB reserve fell 2 MB short and the
+    // heap (heap_start = ram_base + 8 MB) overlapped the stack. At >=256 MB,
+    // ram/16 (>=16 MB) hid the bug; at 64 MB the 8 MB floor exposed it.
+    //
+    // Reserve through the boot stack top plus a 1 MB guard so the heap can never
+    // reach the stack regardless of RAM size.
+    const BOOT_STACK_TOP: usize = KERNEL_BASE + 8 * 1024 * 1024; // 0x40A00000, matches boot.rs
+    const MIN_CODE_AND_STACK: usize = 8 * 1024 * 1024; // floor for kernel binary (~3 MB)
+    let stack_cover = (BOOT_STACK_TOP - ram_base) + 1024 * 1024; // through stack top + 1 MB guard
 
     // Memory layout:
-    // - Code + Stack: max(1/16 of RAM, 8MB) - kernel binary and boot stack
+    // - Code + Stack: max(1/16 of RAM, 8MB floor, boot-stack cover) - kernel binary and boot stack
     // - Heap: see compute_heap_size() - kernel data structures
     // - User pages: remaining - for user processes
-    let code_and_stack = core::cmp::max(ram_size / 16, MIN_CODE_AND_STACK);
+    let code_and_stack = core::cmp::max(
+        core::cmp::max(ram_size / 16, MIN_CODE_AND_STACK),
+        stack_cover,
+    );
     let heap_start = ram_base + code_and_stack;
     let heap_size = compute_heap_size(ram_size, code_and_stack);
     let user_pages_start = heap_start + heap_size;
     let user_pages_size = ram_size.saturating_sub(code_and_stack + heap_size);
+
+    // ---- Layout sanity guard (runs AFTER all region calculations) ----
+    // The kernel address space is laid out as three contiguous regions:
+    //   [ram_base .. heap_start)            code + boot stack
+    //   [heap_start .. heap_end)            kernel heap
+    //   [user_pages_start .. user_end)      user pages (PMM pool)
+    // Verify they are contiguous, non-overlapping, in-bounds, and that NONE
+    // collides with the fixed boot stack [BOOT_STACK_TOP-1MB, BOOT_STACK_TOP).
+    // A failure means a memory-calc constant is wrong; refuse to boot rather
+    // than silently corrupt kernel memory under load — that is exactly the
+    // MEMORY=64 Thread0 EC=0x21/0x22 crash (heap overlapped the boot stack
+    // because the reserve forgot the 2 MB KERNEL_BASE offset). The MMU cannot
+    // protect the kernel from its own allocator, so this check must be explicit.
+    let ram_end = ram_base + ram_size;
+    let heap_end = heap_start + heap_size;
+    let user_end = user_pages_start + user_pages_size;
+    let boot_stack_bottom = BOOT_STACK_TOP - 1024 * 1024;
+    let layout_ok =
+        kernel_end <= heap_start &&                // kernel binary fits in code+stack
+        boot_stack_bottom >= ram_base &&           // boot stack starts within RAM
+        BOOT_STACK_TOP <= heap_start &&            // boot stack ends at/before heap (no overlap)
+        heap_size > 0 &&
+        heap_start == ram_base + code_and_stack && // contiguous: code+stack -> heap
+        user_pages_start == heap_end &&            // contiguous: heap -> user pages
+        user_pages_size > 0 &&
+        user_end <= ram_end;                       // everything fits in RAM
+    if !layout_ok {
+        console::print("\n!!! FATAL: kernel memory layout invalid (overlap / out of bounds) !!!\n");
+        console::print("  ram:        0x"); console::print_hex(ram_base as u64);
+        console::print(" - 0x"); console::print_hex(ram_end as u64); console::print("\n");
+        console::print("  code+stack: 0x"); console::print_hex(ram_base as u64);
+        console::print(" - 0x"); console::print_hex(heap_start as u64); console::print("\n");
+        console::print("  boot stack: 0x"); console::print_hex(boot_stack_bottom as u64);
+        console::print(" - 0x"); console::print_hex(BOOT_STACK_TOP as u64); console::print("\n");
+        console::print("  heap:       0x"); console::print_hex(heap_start as u64);
+        console::print(" - 0x"); console::print_hex(heap_end as u64); console::print("\n");
+        console::print("  user pages: 0x"); console::print_hex(user_pages_start as u64);
+        console::print(" - 0x"); console::print_hex(user_end as u64); console::print("\n");
+        console::print("  kernel_end: 0x"); console::print_hex(kernel_end as u64); console::print("\n");
+        console::print("HALTING.\n");
+        halt();
+    }
 
     // Log memory layout decisions (using print_hex/print_dec since heap not yet initialized)
     console::print("\n=== Memory Layout ===\n");

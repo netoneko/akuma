@@ -250,27 +250,51 @@ the guest fetches `10.0.2.2:8000` directly — no Docker, no hostfwd):
   -goroutine_stress -duration 20s` — **crashes** at MEMORY=64, `EC=0x22`, Thread0,
   **at an `execve` of a forked child**.
 
-**It is a use-after-free, not a double-free.** The `DOUBLE-FREE` counter stayed
-**0** through the crash, and `free_page` correctly gates on CoW (`cow_ref_dec`).
-The decisive evidence: the crash registers are **ASCII bytes from the child's Go
-binary** — `ELR=0x722f6372732f6365` = `"ec/src/r"`, `SP_EL0=0x6f6c6c6165676170`
-= `"pageallo"` (Go embeds `runtime/mpagealloc.go` source paths in rodata). So
-Thread0's saved return address was overwritten with the **new process's user
-data** → a physical page is **aliased between a kernel structure and the freshly
-loaded user image**.
+**It is NOT a double-free, NOT a use-after-free, and NOT user-touches-kernel.**
+The `DOUBLE-FREE` counter stayed **0**, `free_page` correctly gates on CoW, and
+the faulting context is the **kernel's own boot stack** (`Thread=0`, `SPSR=EL1h`,
+`SP_EL1=0x409ffb00`, "No current user process"). It is **kernel-corrupts-kernel**.
 
-Mechanism (hypothesis): `execve`/`replace_image` (`image.rs:43`, dropping the old
-AS) frees a page, but the **deferred TLB flush** (`ba60d72`, `*_no_flush`) can
-leave a stale PTE; the page returns to the PMM and is reallocated for the Go
-image while still aliased, and the kernel later reads Go data where a return
-address should be. This is exactly the "deferred-TLB-flush + fork/exec churn"
-variant called out in "Remaining work" as *detected but not prevented* — and the
-`DOUBLE-FREE` guard does not catch it because the page is freed exactly **once**
-(the alias is a stale *mapping*, not a second free).
+### Root cause (CONFIRMED via lldb+gdbstub): kernel heap overlaps the boot stack
 
-Deterministic + fast repro ⇒ ideal for lldb+gdbstub: a hardware watchpoint on
-Thread0's saved-context region to catch the alias write, or break at the EL1
-vector and walk back. See "Remaining work".
+gdbstub on the wedged VM showed `x29` **and** `x30` of the faulting frame both
+garbage, and the kernel stack at `SP_EL1` filled with **uniform high-entropy data,
+no call-frame structure** — i.e. `SP` pointed into a *data buffer*, and a function
+epilogue `ldp x29,x30,[sp]; ret` loaded garbage → jumped to garbage.
+
+The boot stack is fixed at `0x40900000–0x40A00000` (`BOOT_STACK_TOP =
+KERNEL_BASE + 8 MB`, boot.rs). But `main.rs` reserved only `code_and_stack =
+max(ram/16, 8 MB)`. The 8 MB constant **forgot the 2 MB `KERNEL_BASE` offset**:
+the stack top is at `ram_base + 10 MB`, so at 64 MB `heap_start = ram_base + 8 MB
+= 0x40800000` and the heap span (`0x40800000–0x41000000`) **contained the live
+boot stack**. As kernel-heap usage climbed past ~1 MB under apk/forktest churn,
+`Box`/`Vec`/path-string/header allocations landed at `0x409xxxxx` — on top of
+thread 0's stack frames. The MMU protects kernel-from-user but **cannot protect
+the kernel from its own allocator** when two kernel regions overlap.
+
+The "Go binary" ASCII bytes (`"ec/src/r"`, `"pageallo"`) and apk code bytes were
+**kernel-heap copies the kernel made while servicing the process** (lazy-region
+path `String`s, ELF headers via `file_read_exact`, args/env, crypto buffers) —
+kernel-owned data, not the user's pages.
+
+Why 64-only: at ≥256 MB, `ram/16 ≥ 16 MB` so `heap_start = 0x41000000`, above the
+stack — no overlap. The bug is the *low-memory sibling* of the high-memory VA
+collision (`memory_over_2gb_va_collision`) and the `DEFERRED_THREAD_CLEANUP` stack
+race (docs/STACK_CORRUPTION_ANALYSIS.md): the same "region boundary computed with
+a wrong constant" class.
+
+### Fix (applied, `src/main.rs`)
+
+`code_and_stack` now also covers `BOOT_STACK_TOP + 1 MB guard`
+(`stack_cover = (BOOT_STACK_TOP - ram_base) + 1 MB`), so `heap_start` is always
+above the boot stack. A boot-time guard halts if `heap_start < BOOT_STACK_TOP`.
+At 64 MB the layout is now Code+Stack **11 MB** (`…–0x40b00000`), Heap
+`0x40b00000–0x41300000`, User 45 MB.
+
+**Verified:** 5× `apk search` (llama ×4 + tcc) at MEMORY=64 — **zero kernel
+crashes, zero double-frees, QEMU stays up**, uptime 49 s. apk's own userspace
+SIGSEGV is now cleanly contained as `[exit code: -11]` (a separate, lower-severity
+userspace matter — the kernel survives and reaps the process correctly).
 
 ---
 
