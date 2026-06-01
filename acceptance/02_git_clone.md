@@ -25,7 +25,7 @@ cp ~/.ssh/id_ed25519.pub bootstrap/etc/sshd/authorized_keys
 ### 2. Build apk-tools and stage bootstrap assets
 
 ```bash
-cd userspace && ./build.sh --apk-only && cd ..
+cd userspace && ./build.sh --apk-tools-only && cd ..
 ```
 
 This downloads the static apk binary, Alpine signing keys, repo config, and CA

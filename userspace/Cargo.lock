@@ -232,13 +232,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dash"
-version = "0.1.0"
-dependencies = [
- "libakuma",
-]
-
-[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -578,10 +571,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "musl"
-version = "1.2.4"
-
-[[package]]
 name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -846,7 +835,6 @@ version = "0.9.27"
 dependencies = [
  "cc",
  "libakuma",
- "musl",
 ]
 
 [[package]]

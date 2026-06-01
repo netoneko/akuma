@@ -17,11 +17,9 @@ members = [
     "termtest",
     "allocstress",
     "top",
-    "musl",
     "tcc",
     "tar",
     "sshd",
-    "dash",
     "llama.cpp",
     "crush",
     "stp_test"

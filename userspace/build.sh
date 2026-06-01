@@ -2,18 +2,49 @@
 set -e
 
 WITH_FORKTEST=false
-APK_ONLY=false
+MEMBER_ONLY=""
 for arg in "$@"; do
     case "$arg" in
         --with-forktest) WITH_FORKTEST=true ;;
-        --apk-only) APK_ONLY=true ;;
+        --*-only)
+            member="${arg#--}"
+            MEMBER_ONLY="${member%-only}"
+            ;;
     esac
 done
 
-if [ "$APK_ONLY" = true ]; then
-    echo "Building apk-tools only..."
-    cargo build --release -p apk-tools
-    echo "apk-tools bootstrap assets ready."
+if [ -n "$MEMBER_ONLY" ]; then
+    echo "Building $MEMBER_ONLY only..."
+    cargo build --release -p "$MEMBER_ONLY"
+    if [ "$MEMBER_ONLY" == "tcc" ]; then
+        LIBC_ARCHIVE="tcc/dist/libc.tar"
+        if [ -f "$LIBC_ARCHIVE" ]; then
+            mkdir -p ../bootstrap/archives/
+            cp "$LIBC_ARCHIVE" ../bootstrap/archives/libc.tar
+        fi
+        LIBTCC1_ARCHIVE="tcc/dist/libtcc1.tar"
+        if [ -f "$LIBTCC1_ARCHIVE" ]; then
+            mkdir -p ../bootstrap/archives/
+            cp "$LIBTCC1_ARCHIVE" ../bootstrap/archives/libtcc1.tar
+        fi
+    fi
+    # Members that produce no binary (build output handled by their build script)
+    NO_BIN_MEMBERS=("apk-tools" "libakuma" "libakuma-tls" "crush")
+    is_no_bin=false
+    for m in "${NO_BIN_MEMBERS[@]}"; do
+        [ "$MEMBER_ONLY" == "$m" ] && is_no_bin=true && break
+    done
+    if [ "$is_no_bin" = false ]; then
+        mkdir -p ../bootstrap/bin
+        if [ "$MEMBER_ONLY" == "quickjs" ] && [ -f "target/aarch64-unknown-none/release/qjs" ]; then
+            cp "target/aarch64-unknown-none/release/qjs" ../bootstrap/bin/
+        elif [ -f "target/aarch64-unknown-none/release/$MEMBER_ONLY" ]; then
+            cp "target/aarch64-unknown-none/release/$MEMBER_ONLY" ../bootstrap/bin/
+        else
+            echo "Warning: Binary $MEMBER_ONLY not found"
+        fi
+    fi
+    echo "Build process completed."
     exit 0
 fi
 
