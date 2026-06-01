@@ -6,12 +6,31 @@
 
 ## Status
 
-- ✅ Crash analyzed, mechanism identified, deterministic reproducer written.
-- ✅ PMM-layer fix landed (accounting correctness + double-free detection).
-- ✅ Boot healthy, both self-tests pass, no real-path double-frees at runtime.
-- 🔲 **Open for tomorrow:** the concurrency variant (deferred TLB flush + vfork
-  shared-AS) is *detected* but not *prevented*; decide whether to commit and
-  whether to harden the refcount further. See "Remaining work".
+- ✅ Crash analyzed, mechanism identified, deterministic reproducers written.
+- ✅ PMM-layer hardening (accounting correctness + double-free detection).
+- ✅ **Session 2:** refcount-aware unmap (over-free *prevented*, not just guarded);
+  3 teardown self-tests pass at 64 MB.
+- ✅ **Session 2:** found and fixed the *actual* `EC=0x22` cause — the ELF
+  **heap-slurp** in `spawn.rs` (unrelated to the double-free). apk now loads & runs.
+- 🔲 **Open:** a *third* crash remains — `EC=0x21` garbage-PC on Thread0 under
+  apk's heavy mmap/munmap churn (~55 regions / 27 MB, not OOM). See "Remaining work".
+
+> **Important correction (session 2).** This doc originally attributed the
+> `meow.log` `EC=0x22` crash to the `user_frames` double-free. That was wrong.
+> Fixing the double-free did **not** stop `apk search`@64 MB crashing (identical
+> `EC=0x22`, byte-identical garbage registers). The real cause was the ELF
+> heap-slurp (Bug 2 below). The double-free was a genuine, separate bug — now
+> properly fixed — but it was **not** this crash. Lesson: any corrupted-PC kernel
+> fault produces a similar `EC=0x22` "garbage ELR/SP" signature, so the signature
+> alone does not identify the culprit.
+
+## Summary: three distinct bugs
+
+| # | Bug | Status | Effect |
+|---|---|---|---|
+| 1 | `user_frames` refcount over-free (unmap/Drop ignore the refcount) | ✅ fixed | aliased PA freed N times; latent, PMM-guard-hidden |
+| 2 | ELF **heap-slurp**: `spawn.rs` reads whole binary into the 8 MB heap | ✅ fixed | **the actual `EC=0x22`**; 5 MB apk exhausts heap @ MEMORY=64 |
+| 3 | apk crashes under heavy mmap churn after Bugs 1+2 fixed | 🔲 open | `EC=0x21` garbage-PC Thread0, ~27 MB used, not OOM |
 
 ---
 
