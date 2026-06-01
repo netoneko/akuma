@@ -12,3 +12,4 @@ bootstrap/
 *.log
 tmp
 __pycache__
+models
