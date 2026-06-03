@@ -159,6 +159,12 @@ Free-for-procs = user pages − stack pool (boot-time static); each process load
 `meow -m qwen3-yolo:latest -c "compile /akuma-playground/hello.c with /usr/bin/tcc -B /usr/lib/tcc -o /tmp/hello_c, run /tmp/hello_c"`.
 Prerequisites on disk: `apk add tcc musl-dev tcc-libs tcc-libs-static` (installs `/usr/bin/tcc`).
 
+**Test setup notes:** disk must be clean before each sweep — multiple `pkill -9` kills corrupt
+ext2, leaving stale `/tmp/hello_c` that masks compile failures. Recreate with
+`scripts/create_disk.sh && scripts/populate_disk.sh`, then `apk add tcc musl-dev tcc-libs tcc-libs-static`
+at a high-memory boot before sweeping down. The sweep prompt must use `/usr/bin/tcc`
+(apk-installed, has headers) not `/bin/tcc` (bootstrap binary, missing `tccdefs.h`).
+
 **release profile, `SYSTEM_THREAD_STACK_SIZE = 256 KB` (original):**
 
 | RAM | meow+tcc | notes |
@@ -178,6 +184,24 @@ Prerequisites on disk: `apk add tcc musl-dev tcc-libs tcc-libs-static` (installs
 | 12 MB | FAIL | 2.8 MB | 1 MB (cap) | kernel heap collapses to 1 MB (`code+stack=7, cap=1`); meow peaks at 2.8 MB → OOM |
 
 12 MB is a layout floor for `release`: `code+stack=7 MB` (driven by the 3 MB binary + `stack_cover`) leaves only 1 MB for heap — below meow's 2.8 MB kernel-heap peak. Not fixable by stack tuning alone; needs a smaller binary (→ `size` profile) or a different allocator.
+
+**size profile, `SYSTEM_THREAD_STACK_SIZE = 128 KB` (64 KB caused kernel stack overflow at -Oz):**
+
+| RAM | meow+tcc | RAM free during run | Heap free | notes |
+|-----|---------|-------------------|-----------|-------|
+| 16 MB | needs clean disk | 4/16 MB | 1/4 MB | tcc compiles directly; stale `/tmp` from ext2 corruption masked meow results |
+| 12 MB | needs clean disk | 2/12 MB | 0/3 MB | heap nearly exhausted during meow LLM call |
+| 8 MB | FAIL (boot) | — | 1 MB heap (cap) | SSH rejected: memory low |
+
+Size profile at 8 MB: `code+stack=5 MB`, heap collapses to 1 MB (`cap=8−5−4`), SSH rejects
+the connection. The `size` floor with current Talc allocator is theoretically **12 MB**
+(4 MB user pages, 3 MB heap — barely enough for meow's 2.4 MB heap peak + tcc spawn),
+but needs a clean-disk re-run to confirm.
+
+**Blocked by Talc's fixed reservation below 12 MB.** At 8 MB the heap cap formula yields
+1 MB — not enough for SSH + meow. A dynamic allocator that draws from the same physical
+pool as user pages (instead of a fixed upfront reservation) would let heap and processes
+share the remaining RAM, potentially pushing the floor to 6–8 MB.
 
 ### Gains from `USER_STACK_SIZE_OVERRIDE` 8 MB → 0 (auto-scale)
 

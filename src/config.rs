@@ -77,7 +77,13 @@ pub const MAX_PROCESSES: usize = 64;
 ///
 /// Used for threads 1 through RESERVED_THREADS-1.
 /// Handles SSH/HTTP async call chains and the async main loop.
+/// 64 KB is sufficient on release (opt-level=3 inlines aggressively, shallow frames).
+/// Size profile (opt-level=z, inlining off) has deeper frames on the SSH exec path —
+/// observed ELR=0x0 crash (stack overflow → corrupted return addr) at 64 KB.
+#[cfg(not(kernel_profile_size))]
 pub const SYSTEM_THREAD_STACK_SIZE: usize = 64 * 1024;
+#[cfg(kernel_profile_size)]
+pub const SYSTEM_THREAD_STACK_SIZE: usize = 128 * 1024;
 
 /// Stack size for user process threads (128KB release, 64KB size profile)
 ///
