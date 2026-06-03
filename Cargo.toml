@@ -59,7 +59,7 @@ panic = "immediate-abort"
 
 [features]
 firecracker = []
-no-tests = []
+no-tests = ["akuma-net/small-sockets"]
 
 [lints]
 workspace = true
@@ -83,7 +83,7 @@ once_cell = { version = "1", default-features = false, features = ["alloc", "rac
 fdt = "0.1"
 smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"] }
 virtio-drivers = { version = "0.7", default-features = false }
-arm_pl031 = "0.2"
+arm_pl031 = { version = "0.2", default-features = false }
 
 # SSH crypto dependencies (no_std compatible)
 sha2 = { version = "0.10", default-features = false }
@@ -91,7 +91,7 @@ hmac = { version = "0.12", default-features = false }
 aes = { version = "0.8", default-features = false }
 ctr = { version = "0.9", default-features = false }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize", "fast"] }
 rand_core = { version = "0.6", default-features = false }
 
 critical-section = { version = "1.2", default-features = false }

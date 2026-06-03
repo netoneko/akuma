@@ -190,9 +190,6 @@ name = "arm_pl031"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13696b1c2b59992f4223e0ae5bb173c81c63039367ca90eee845346ad2a13421"
-dependencies = [
- "chrono",
-]
 
 [[package]]
 name = "as-slice"
@@ -265,15 +262,6 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
-
-[[package]]
-name = "chrono"
-version = "0.4.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "145052bdd345b87320e369255277e3fb5152762ad123a901ef5c262dd38fe8d2"
-dependencies = [
- "num-traits",
-]
 
 [[package]]
 name = "cipher"
@@ -1064,7 +1052,6 @@ dependencies = [
  "cfg-if",
  "defmt 0.3.100",
  "heapless 0.8.0",
- "log",
  "managed",
 ]
 
