@@ -257,11 +257,10 @@ pub(crate) fn compute_heap_size(ram_size: usize, code_and_stack: usize) -> usize
         //
         // For RAM >= 128 MB, ram/8 dominates the floor (16 MB+), so this only
         // shrinks the heap below 128 MB.
-        // On the size profile, seed the heap with only 1 MB — the PmmOomHandler
-        // grows it on demand from PMM, so we don't burn 4 MB upfront regardless
-        // of actual use.  On release keep 4 MB (was 8 MB) for a modest saving.
+        // On the size profile, seed the heap with only 512 KB — the PmmOomHandler
+        // grows it on demand from PMM.  On release keep 4 MB (was 8 MB) for headroom.
         #[cfg(kernel_profile_size)]
-        const SMALL_FLOOR: usize = 1 * MB;
+        const SMALL_FLOOR: usize = 512 * 1024;
         #[cfg(not(kernel_profile_size))]
         const SMALL_FLOOR: usize = 4 * MB;
         const MIN_USER: usize = 4 * MB;
@@ -519,6 +518,19 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Signal that PMM is ready - allocator will switch to page mode
     allocator::mark_pmm_ready();
     console::print("PMM initialized, allocator switched to page mode\n");
+
+    // Reclaim the pre-kernel region.  On QEMU virt the ARM64 Image header sets
+    // text_offset = 2 MB, so the kernel binary is always loaded at ram_base + 2 MB
+    // (0x40200000).  The first 2 MB — firmware reservation / QEMU DTB area — is
+    // fully consumed by detect_memory() before PMM init and is safe to give back.
+    // This hands ~512 pages (2 MB) back to the user-page pool at zero cost.
+    #[cfg(not(feature = "firecracker"))]
+    {
+        const KERNEL_IMAGE_OFFSET: usize = 0x20_0000; // 2 MB text_offset
+        let pages = KERNEL_IMAGE_OFFSET / 4096;
+        pmm::free_pages_contiguous(pmm::PhysFrame::new(ram_base), pages);
+        console::print("[PMM] Reclaimed pre-kernel region: 2 MB\n");
+    }
 
     // Initialize MMU with identity mapping for kernel
     console::print("Initializing MMU...\n");

@@ -32,6 +32,7 @@ missing_panics_doc = "allow"
 dead_code = "deny"
 unused_imports = "deny"
 unused_variables = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_profile_size)'] }
 
 [package]
 name = "akuma"
