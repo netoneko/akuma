@@ -1104,11 +1104,16 @@ impl ThreadPool {
             boot_ctx.is_user_process = 0;
         }
 
-        // Boot stack info (fixed location from boot.rs)
-        // The boot stack was already in use before threading init, starting at
-        // 0x40800000 and growing down. We CANNOT reserve space at the top.
-        let _boot_stack_top = 0x40800000u64; // STACK_TOP from boot.rs
-        let boot_stack_base = 0x40700000usize; // STACK_TOP - STACK_SIZE = 0x40800000 - 0x100000
+        // Boot stack info — bounds come from the kernel via ExecConfig because they
+        // are profile-dependent (boot.rs / build.rs / linker.ld place the boot stack
+        // right after the reserved image region, which differs between the `size` and
+        // `release` images). These MUST NOT be hardcoded: when the boot stack was
+        // relocated, a stale 0x40700000 constant stamped the canary into the kernel
+        // heap at low RAM. See docs/LOW_MEMORY_ENVIRONMENT.md "Known bug".
+        // The boot stack was already in use before threading init; we CANNOT reserve
+        // space at the top.
+        let _boot_stack_top = config().boot_stack_top as u64; // STACK_TOP from boot.rs
+        let boot_stack_base = config().boot_stack_base; // STACK_TOP - STACK_SIZE
         self.stacks[IDLE_THREAD_IDX] = StackInfo::new(
             boot_stack_base,
             config().kernel_stack_size,

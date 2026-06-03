@@ -244,17 +244,22 @@ pub(crate) fn compute_heap_size(ram_size: usize, code_and_stack: usize) -> usize
     if ram_size >= 256 * MB {
         core::cmp::min(core::cmp::max(ram_size / 8, 64 * MB), 256 * MB)
     } else {
-        // Small RAM. The heap must still hold the fixed thread-stack pool
-        // (~9 MB for the default 64-thread config — see threading::mod, which
-        // panics "Stack memory exceeds heap" otherwise) plus ~2 MB of boot-time
-        // allocations. So the floor is 16 MB (covers the pool with headroom),
-        // scaled up by ram/8; but never consume the last MIN_USER of user pages.
-        // 8 MB floor: the kernel boots on ~2.2 MB and grows modestly under the
-        // small workloads that fit in <256 MB. Thread stacks are NOT in the heap
-        // (they come from PMM), so the heap no longer has to cover them — keeping
-        // it small leaves more user pages for the thread pool + processes.
+        // Small RAM. The kernel boots on ~2.2 MB of heap. Thread stacks are NOT
+        // in the heap (they come from PMM), so the heap doesn't have to cover
+        // them — keeping it small leaves more user pages for the thread pool +
+        // processes.
+        //
+        // On the `size` profile (small-RAM target) we drop the floor to 4 MB:
+        // that frees 4 MB that would otherwise be wasted on heap that the kernel
+        // doesn't use, and on a 24 MB box nearly doubles the user-page pool
+        // (5 MB → 9 MB), which is the difference between tcc's ELF load
+        // failing and fitting.  On release we keep the 8 MB floor for headroom.
+        //
         // For RAM >= 128 MB, ram/8 dominates the floor (16 MB+), so this only
         // shrinks the heap below 128 MB.
+        #[cfg(kernel_profile_size)]
+        const SMALL_FLOOR: usize = 4 * MB;
+        #[cfg(not(kernel_profile_size))]
         const SMALL_FLOOR: usize = 8 * MB;
         const MIN_USER: usize = 4 * MB;
         let cap = ram_size
@@ -285,7 +290,10 @@ pub(crate) fn compute_thread_limit(user_pages_size: usize) -> usize {
     let stack_budget = user_pages_size / 4;
     let user_budget = stack_budget.saturating_sub(sys_total);
     let n_user = user_budget / config::USER_THREAD_STACK_SIZE;
-    (reserved + n_user).clamp(reserved + 2, config::MAX_THREADS)
+    // Floor: reserved + 6 so a minimal session (shell + SSH thread + tcc +
+    // a couple of sub-processes) can coexist without hitting "no free user
+    // thread slots".  Cost at 64 KB/slot: 4 × 64 KB = 256 KB extra pool.
+    (reserved + n_user).clamp(reserved + 6, config::MAX_THREADS)
 }
 
 /// Main kernel initialization - all safe code
@@ -296,9 +304,16 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // =========================================================================
     // CRITICAL: Verify kernel binary doesn't overlap with boot stack
     // =========================================================================
-    // Stack layout: STACK_TOP = KERNEL_BASE + 8 MB, STACK_SIZE = 1 MB
-    //   QEMU:        KERNEL_BASE=0x40200000, STACK_BOTTOM=0x40900000
-    //   Firecracker: KERNEL_BASE=0x80000000, STACK_BOTTOM=0x80700000
+    // Boot stack is placed immediately after the reserved image region by boot.rs:
+    //   BOOT_STACK_TOP = KERNEL_PHYS_LOAD + IMAGE_SIZE + BOOT_STACK_SIZE (1 MB)
+    //   STACK_BOTTOM   = KERNEL_PHYS_LOAD + IMAGE_SIZE
+    //
+    //   size profile (IMAGE_SIZE=1MB):
+    //     STACK_BOTTOM   = 0x40200000 + 0x100000 = 0x40300000
+    //     BOOT_STACK_TOP = 0x40300000 + 0x100000 = 0x40400000
+    //   release profile (IMAGE_SIZE=3MB):
+    //     STACK_BOTTOM   = 0x40200000 + 0x300000 = 0x40500000
+    //     BOOT_STACK_TOP = 0x40500000 + 0x100000 = 0x40600000
     //
     // QEMU virt loads flat binary with ARM64 Image header at RAM_BASE + 2MB
     // (0x40200000). The first 2MB (0x40000000-0x401FFFFF) contains DTB.
@@ -307,8 +322,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     #[cfg(feature = "firecracker")]
     const KERNEL_BASE: usize = 0x8000_0000;
 
-    #[cfg(not(feature = "firecracker"))]
-    const STACK_BOTTOM: usize = 0x4090_0000;
+    // STACK_BOTTOM = KERNEL_PHYS_LOAD + IMAGE_SIZE (matches boot.rs + build.rs)
+    #[cfg(all(not(feature = "firecracker"), kernel_profile_size))]
+    const STACK_BOTTOM: usize = 0x4030_0000; // 0x40200000 + 0x100000
+    #[cfg(all(not(feature = "firecracker"), not(kernel_profile_size)))]
+    const STACK_BOTTOM: usize = 0x4050_0000; // 0x40200000 + 0x300000
     #[cfg(feature = "firecracker")]
     const STACK_BOTTOM: usize = 0x8070_0000;
 
@@ -360,16 +378,18 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // EC=0x21/0x22 stack-corruption crash seen at MEMORY=64 (see
     // docs/PMM_DOUBLE_FREE_AND_EL1_CRASH.md, docs/STACK_CORRUPTION_ANALYSIS.md).
     //
-    // The boot stack lives just below BOOT_STACK_TOP = KERNEL_BASE + 8 MB (see
-    // boot.rs). Because KERNEL_BASE = ram_base + 2 MB, the stack TOP is at
-    // ram_base + 10 MB — so the old flat 8 MB reserve fell 2 MB short and the
-    // heap (heap_start = ram_base + 8 MB) overlapped the stack. At >=256 MB,
-    // ram/16 (>=16 MB) hid the bug; at 64 MB the 8 MB floor exposed it.
+    // BOOT_STACK_TOP = STACK_BOTTOM + 1 MB (boot stack size, matches boot.rs).
+    //   size profile:    0x40300000 + 0x100000 = 0x40400000
+    //   release profile: 0x40500000 + 0x100000 = 0x40600000
     //
     // Reserve through the boot stack top plus a 1 MB guard so the heap can never
     // reach the stack regardless of RAM size.
-    const BOOT_STACK_TOP: usize = KERNEL_BASE + 8 * 1024 * 1024; // 0x40A00000, matches boot.rs
-    const MIN_CODE_AND_STACK: usize = 8 * 1024 * 1024; // floor for kernel binary (~3 MB)
+    const BOOT_STACK_TOP: usize = STACK_BOTTOM + 1024 * 1024; // matches boot.rs per-profile value
+    // MIN_CODE_AND_STACK: floor so the kernel binary always fits, even if RAM
+    // is very large (where stack_cover = fixed offset + 1MB guard is small
+    // relative to ram/16).  The actual cover is computed as stack_cover below
+    // and dominates on small RAM.
+    const MIN_CODE_AND_STACK: usize = 4 * 1024 * 1024;
     let stack_cover = (BOOT_STACK_TOP - ram_base) + 1024 * 1024; // through stack top + 1 MB guard
 
     // Memory layout:
@@ -441,7 +461,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print_hex(ram_base as u64);
     console::print(" - 0x");
     console::print_hex(heap_start as u64);
-    console::print(") [min 8MB]\n");
+    console::print(") [stack-cover+1MB guard]\n");
 
     console::print("Heap:       ");
     console::print_dec(heap_size / 1024 / 1024);
@@ -554,6 +574,13 @@ fn kernel_main(dtb_ptr: usize) -> ! {
             max_threads: config::MAX_THREADS,
             reserved_threads: config::RESERVED_THREADS,
             kernel_stack_size: config::KERNEL_STACK_SIZE,
+            // Real, profile-aware boot-stack bounds (see the STACK_BOTTOM /
+            // BOOT_STACK_TOP consts above). The threading crate must NOT hardcode
+            // these — when the boot stack was relocated, a stale constant stamped
+            // the stack canary into the kernel heap at low RAM (release boot floor
+            // jumped to 128 MB). See docs/LOW_MEMORY_ENVIRONMENT.md "Known bug".
+            boot_stack_base: STACK_BOTTOM,
+            boot_stack_top: BOOT_STACK_TOP,
             default_thread_stack_size: config::DEFAULT_THREAD_STACK_SIZE,
             system_thread_stack_size: config::SYSTEM_THREAD_STACK_SIZE,
             user_thread_stack_size: config::USER_THREAD_STACK_SIZE,

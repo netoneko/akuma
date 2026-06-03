@@ -158,6 +158,14 @@ pub struct ExecConfig {
     pub max_threads: usize,
     pub reserved_threads: usize,
     pub kernel_stack_size: usize,
+    /// Boot (thread 0) stack bounds, supplied by the kernel because they are
+    /// profile-dependent (see boot.rs / build.rs / linker.ld). `boot_stack_base`
+    /// is the lowest address (where the stack canary is written); `boot_stack_top`
+    /// is the highest. Hardcoding these in the crate caused the canary to be
+    /// stamped into the kernel heap once the boot stack was relocated — see
+    /// docs/LOW_MEMORY_ENVIRONMENT.md "Known bug".
+    pub boot_stack_base: usize,
+    pub boot_stack_top: usize,
     pub default_thread_stack_size: usize,
     pub system_thread_stack_size: usize,
     pub user_thread_stack_size: usize,

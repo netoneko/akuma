@@ -10,21 +10,32 @@ Set RAM with the `MEMORY` env var: `MEMORY=64M cargo run --release`.
 Verified with `scripts/test_memory_split.py` + the small-RAM sweeps in `logs/`
 (tcc compiling `/akuma-playground/hello.c`):
 
-| RAM | boots to SSH? | runs tcc `hello.c`? | heap / user / threads | notes |
-|---|---|---|---|---|
-| ≥ 256 MB | yes | **yes** | 64 MB / large / 64 | generous heap, full pool (unchanged) |
-| 48–128 MB | yes | not yet¹ | 8 MB / 32 MB / 58 (@48M) | boots fine; tcc run not completing — see Future work |
-| 32 MB | yes | not yet¹ | 8 MB / 16 MB / 26 | boots (self-tests auto-skipped ≤32 MB) |
-| 16–24 MB | yes | no¹ | 4–8 MB / 4–8 MB / 10 | boots; only **2 user thread slots** — see Future work |
-| 12 MB | **no** | — | 1 MB / 3 MB / 10 | heap cap starves it; below the floor |
+**Measured `size`-profile sweep (June 2026, 883 KB binary, `tcc /akuma-playground/hello.c -o /tmp/hello`).** The action plan below (items 1–5) has since landed; these are the **post-fix** numbers:
 
-¹ **Boot ("boot at all") works down to 16 MB.** Running `tcc` on 16–128 MB does
-not complete yet — at 16–24 MB there are only 2 user thread slots, and the small
-heap/user split is tight. This is tracked under **Future work** below; the focus
-of this change was making the kernel *boot* across the range, which it now does
-from 16 MB up. tcc is verified working at ≥ 256 MB.
+| RAM | boots to SSH? | SSH usable? | runs tcc `hello.c`? | code+stack / heap / user / thread-limit | notes |
+|---|---|---|---|---|---|
+| 48 MB | yes | yes | **yes** | 5 / 6 / 37 / 64 | — |
+| 32 MB | yes | yes | **yes** | 5 / 4 / 23 / 64 | was **no** (anon alloc OOM) before the fixes |
+| 24 MB | yes | yes | **yes** | 5 / 4 / 15 / 40 | was **no** (ELF load OOM) before |
+| 16 MB | yes | yes | **yes** | 5 / 4 / 7 / 14 | was **no** (SSH rejected, "memory low") before |
+| 12 MB | yes | yes | **no** | 3 / 3 / 4 / 14 | OOM spawning the tcc process — new tcc floor is just above here |
 
-Two things were hardcoded for "≥ 256 MB machines" and have been made to scale:
+So on the `size` profile after the fixes: **boot/usable-SSH floor ≤ 12 MB, tcc floor
+16 MB** — down from a 48 MB tcc floor (a 3-tier improvement). For reference, the
+**pre-fix** floors were boot 16 MB / usable-SSH 24 MB / tcc 48 MB, with `code+stack`
+a flat **11 MB** at every size. (`tcc -run` is separately broken at *all* sizes —
+`runmain.o not found`, a TCC runtime-install issue, not RAM; use `tcc … -o out` then
+exec `out`.) On the `release` profile tcc is verified at ≥ 256 MB via
+`scripts/test_memory_split.py`.
+
+What moved the floor: four over-provisioned "≥ 256 MB" reservations were cut on the
+`size` profile — the 8 MB **eager** user stack → 128 KB (item 1), the 8 MB heap floor
+→ 4 MB (item 5), 128 KB → 64 KB per-user-thread kernel stacks (item 3), and most
+decisively the **`code+stack` region 11 MB → 5 MB** by removing the stale 8 MB
+boot-stack gap (item 4). `code+stack` is now a flat ~5 MB instead of 11 MB.
+
+Two things were originally hardcoded for "≥ 256 MB machines" and made to scale (the
+earlier change that got the kernel *booting* across the range):
 
 1. **Kernel heap** — was a flat 64 MB floor below 512 MB RAM (left 0 user pages
    below ~72 MB → no boot). Now `compute_heap_size()` scales it down under 256 MB.
@@ -34,16 +45,95 @@ Two things were hardcoded for "≥ 256 MB machines" and have been made to scale:
    real boot floor. Now the number of slots that get stacks scales with RAM
    (`compute_thread_limit()`).
 
+## Boot-stack bug — stale hardcoded address corrupted the heap (FIXED 2026-06-03)
+
+**Status: FIXED.** Before the fix, `release` failed to boot at 16/24/32/64 MB; after
+the fix it boots at all of them (verified 16/24/32, tcc `hello.c` runs at 32 MB) and
+`size` is unregressed. **Release boot floor: 128 MB → ≤ 16 MB.**
+
+**Matrix sweep that pinned it (both profiles × {16,24,32,64,128,256,1024,4096 MB},
+shared apk-seeded disk):** the `size` profile booted + ran tcc at **every** size down
+to 16 MB; the `release` profile failed to boot at **16 / 24 / 32 / 64 MB** (all four
+the identical crash below) and booted only at **≥ 128 MB** — and the four release
+failures were all this one bug.
+
+**Symptom.** On the **`release`** profile, low-RAM boots crash **during
+"Initializing threading…"** with a data abort:
+`[Exception] Sync from EL1: EC=0x25, ISS=0x4 … FAR=0xdeadbeefcafebace`, then the
+scheduler spins on `yield_now with IRQs masked tid=0` (hung, never reaches SSH).
+`FAR` is `STACK_CANARY (0xDEAD_BEEF_CAFE_BABE) + 0x10`, and `ELR` lands inside
+`talc::Talc::malloc` — i.e. the heap allocator dereferenced a free-list pointer that
+held the **stack-canary** value. (Earlier `size`-profile sweeps that reported tcc at
+16 MB likely hit the same corruption nondeterministically; the matrix sweep is
+re-measuring both profiles to confirm exactly which cells crash.)
+
+**Root cause (theory).** `crates/akuma-exec/src/threading/mod.rs:1110-1111` still
+hardcodes the **old** boot-stack location:
+
+```rust
+let _boot_stack_top = 0x40800000u64; // STACK_TOP from boot.rs
+let boot_stack_base = 0x40700000usize; // STACK_TOP - STACK_SIZE
+```
+
+…and line 1138-1139 does `init_stack_canary(boot_stack_base)` → writes 8 ×
+`0xDEAD_BEEF_CAFE_BABE` at `0x40700000`. But the boot stack was **relocated** when the
+profile-aware image layout landed (`boot.rs`/`build.rs`/`linker.ld`): it now lives at
+`0x40500000–0x40600000` on `release` and `0x40300000–0x40400000` on `size`. This
+constant in the threading crate was **never updated** — and `ExecConfig` doesn't pass
+the boot-stack address in, so the crate has no way to know the real one.
+
+**Why it's RAM-dependent (the "layout" part).** `heap_start = ram_base +
+code_and_stack`. With the item-4 shrink (`MIN_CODE_AND_STACK = 4 MB`, `stack_cover ≈
+7 MB` on release), for any RAM where `ram/16 < ~7 MB` (**≤ 64 MB**) the heap starts at
+exactly **`0x40700000`** — the release@32 log shows `Heap: 8 MB (0x40700000 -
+0x40f00000)`, heap byte 0. So the stale canary write stamps directly onto **talc's
+arena header**; the next `malloc` walks the corrupted free list and faults. At **≥ 128
+MB**, `ram/16 ≥ 8 MB` pushes `heap_start` above `0x40700000`, so the stray write lands
+in dead space inside the oversized code+stack reservation and boot survives — which is
+exactly the observed floor (boots at 128/256/1024/4096, crashes at 16/24/32/64).
+
+**Why `size` dodges it.** The `size` profile's `code+stack` is **5 MB** (smaller
+binary → `IMAGE_SIZE = 1 MB` → `stack_cover ≈ 4 MB`), so its `heap_start` is
+`0x40500000`. The stale `0x40700000` write therefore lands **2 MB into** the heap —
+past talc's arena header that `malloc` walks first — so it corrupts a less-critical
+region and boot happens to survive. That's luck, not correctness: the same stale write
+is still firing on `size` too, just not onto the byte that crashes. The fix removes the
+hazard from both profiles.
+
+**The fix (applied).** Stop hardcoding the boot-stack address in the threading crate:
+
+- `ExecConfig` gained `boot_stack_base` / `boot_stack_top` fields
+  (`crates/akuma-exec/src/runtime.rs`).
+- `main.rs` populates them from the per-profile `STACK_BOTTOM` / `BOOT_STACK_TOP`
+  consts it already computes, so the crate gets the *real* address.
+- `threading::init` (`crates/akuma-exec/src/threading/mod.rs` ~1110) uses
+  `config().boot_stack_base/top` instead of `0x40700000`/`0x40800000`, so
+  `init_stack_canary` writes into the actual boot stack (code+stack region), never the
+  heap.
+- `exceptions.rs::init_exception_stack` had the **same** stale `0x40800000` for the
+  boot thread's early exception stack; it's now profile-aware
+  (size `0x40400000` / release `0x40600000` / firecracker `0x80800000`), so an early
+  exception can't scribble into the heap either.
+
+**Verification.** `release` now boots to SSH at 16/24/32 MB (was: hang at all of them);
+`tcc /akuma-playground/hello.c` compiles + runs at release@32 → "Hello, Akuma!";
+`size` still boots at 16 MB (no regression). Release boot floor dropped 128 MB → ≤ 16
+MB.
+
 ## The three regions
 
 `src/main.rs::kernel_main` splits detected RAM into:
 
 ```
 [ Code + Stack ] [ Heap ] [ User pages (PMM) ]
-  max(ram/16,8M)  see below   remainder
+   ~5 MB const   see below   remainder
 ```
 
-- **Code + Stack** — kernel binary (~3 MB) + boot stack. `max(ram/16, 8 MB)`.
+- **Code + Stack** — kernel binary + boot stack, now placed **adjacent** to the binary
+  (`STACK_BOTTOM = ram_base + IMAGE_SIZE`, `BOOT_STACK_TOP = STACK_BOTTOM + 1 MB`). With
+  `MIN_CODE_AND_STACK = 4 MB` this works out to a flat **~5 MB** at every RAM size. (It
+  was `max(ram/16, 8 MB)` with the boot stack hardcoded 8 MB above the base — an 11 MB
+  region — until action plan item 4 removed that gap.)
 - **Heap** — kernel data structures (`alloc`). Boot uses only ~2.2 MB; it grows
   under load (VFS, process tables). Sized by `compute_heap_size()`.
 - **User pages** — the PMM free pool. Backs **both** user process memory **and the
@@ -55,9 +145,11 @@ Two things were hardcoded for "≥ 256 MB machines" and have been made to scale:
 - `config::KERNEL_HEAP_SIZE_MB != 0` → fixed override (in MiB).
 - **RAM ≥ 256 MB**: `clamp(ram/8, 64 MB, 256 MB)` — unchanged; preserves the
   proven default and headroom for go/bun/rustc kernel metadata.
-- **RAM < 256 MB**: `clamp(ram/8, 8 MB, ram − code_stack − MIN_USER)` — 8 MB floor
-  (kernel boots on ~2.2 MB), scaling by `ram/8`, never eating the last few MB of
-  user pages.
+- **RAM < 256 MB**: `clamp(ram/8, SMALL_FLOOR, ram − code_stack − MIN_USER)` — scaling
+  by `ram/8`, never eating the last few MB of user pages. `SMALL_FLOOR` is **8 MB** on
+  `release` but **4 MB** on the `size` profile (item 5): the kernel boots on ~2.2 MB, so
+  on a 24 MB box the lower floor hands the freed 4 MB straight to user pages (5 → 15 MB),
+  which is what let tcc's ELF load fit.
 
 ## Thread-pool heuristic — `compute_thread_limit(user_pages_size)`
 
@@ -67,12 +159,15 @@ runtime `thread_limit ≤ MAX_THREADS` set before `threading::init`:
 
 - The `reserved` (8) low slots are kernel/system threads (idle, network, SSH,
   async executor) and always get stacks (`7 × 256 KB = 1.75 MB` pool minimum).
-- User-process slots `[reserved, thread_limit)` get `128 KB` stacks.
+- User-process slots `[reserved, thread_limit)` get `128 KB` stacks on `release`, but
+  **64 KB** on the `size` profile (item 3) — halving the per-slot PMM cost so more slots
+  fit the same budget.
 - `thread_limit` is chosen so the stack pool uses **at most ~1/4 of user pages**,
-  leaving the rest for actual processes — with a floor of `reserved + 2` so a
-  shell + child can still run. (An earlier 1/2 budget was too greedy: on a 32 MB
-  box it allocated 58 threads / 8 MB of stacks and the first process ELF load
-  then OOM'd.)
+  leaving the rest for actual processes — with a floor of `reserved + 6` (item 2) so a
+  shell + SSH session + tcc + a subprocess can coexist. (Earlier floors were too low:
+  `reserved + 2` left only 2 user slots at 16–24 MB; an even earlier 1/2 *budget* was
+  too greedy — on a 32 MB box it allocated 58 threads / 8 MB of stacks and the first
+  process ELF load then OOM'd.)
 
 `config::THREAD_LIMIT_OVERRIDE` (0 = auto) pins it for testing.
 
@@ -146,20 +241,118 @@ cargo run --profile size --features no-tests -Z build-std=core,alloc  # to run i
 | `LOW_MEM_TEST_SKIP_MB` | 32 | Skip heavy boot self-tests below this RAM. |
 | `DISABLE_ALL_TESTS` | false | Skip the entire boot self-test suite. |
 
-## Future work — more user thread slots for 16/32 MB
+## How tcc reached 16 MB — the changes (landed June 2026)
 
-The kernel now **boots to SSH from 16 MB up**, but `tcc` doesn't run yet on the
-16–32 MB tier. The `compute_thread_limit` 1/4-budget gives those tiers very few
-**user** thread slots (only 2 at 16–24 MB), which is too few once you account for
-the shell, the in-kernel SSH session, and the compiler process — and the small
-user-page pool leaves little for the process image.
+**Status: items 1–5 landed and verified; tcc floor 48 MB → 16 MB.** This section
+records what was done and why; the per-item **Done** notes give the actual file and
+fix. For perspective: a 1998-era Linux box compiled C in 32 MB with room to spare —
+there was no fundamental reason a 948 KB kernel + tcc couldn't do the same. What had
+been eating the RAM was a handful of fixed, over-provisioned reservations sized for
+"≥ 256 MB machines," not the working set of a compile. Each item below reclaimed one.
+(Item 6, the `tcc -run` bug, is unrelated to memory and is still open.)
 
-Next time, for the 16/32 MB profiles specifically: **raise the user-thread floor**
-(e.g. `reserved + 6..8` instead of `reserved + 2`) so a shell + SSH + tcc can
-coexist, and/or trim per-thread stack sizes on small RAM (a smaller
-`USER_THREAD_STACK_SIZE` would let more slots fit in the same pool). Likely also
-worth confirming the 8 MB user-stack reservation is fully lazy so a process image
-doesn't pre-commit it. Goal: actually compile `hello.c` at 16/32 MB, not just boot.
+The items are ordered by **payoff ÷ effort**. The measured sweep pinned what each
+fixed: **items 1–3 + 5 (user-page pressure) unlocked the 24–32 MB tiers**, where tcc
+had been dying on `anon alloc failed` / ELF-load OOM after the thread pool + mmap
+arenas exhausted the user pool; **item 4 (the flat 11 MB code+stack) unlocked 16 MB**,
+where there simply wasn't enough RAM left for a usable heap. All five were applied on
+the `size` profile (gated on `kernel_profile_size`); `release` is unchanged.
+
+### 1. Confirm the 8 MB user stack is fully lazy — *highest payoff, highest uncertainty*
+
+> **Done — it was EAGER.** `load_elf_with_stack` (`crates/akuma-exec/src/elf/mod.rs`
+> ~611–618) calls `alloc_and_map()` → `alloc_page_zeroed()` for **every** page of
+> `stack_size`, i.e. 2048 PMM pages committed per process spawn at the 8 MB override.
+> Fix: under `#[cfg(kernel_profile_size)]` set `USER_STACK_SIZE_OVERRIDE = 0`, so
+> `compute_user_stack_size()` returns its 128 KB minimum on small RAM — 2048 → 32
+> pages, ~7.9 MB freed per process. *(The eager path is why this was the biggest win;
+> a fully-lazy stack would have made it a no-op.)*
+
+`config::USER_STACK_SIZE_OVERRIDE` is currently pinned to **`8 * 1024 * 1024`**
+(`src/config.rs`). This **overrides** `compute_user_stack_size()` entirely — the
+RAM-scaling that would hand out a 128 KB stack at 256 MB is dead code while the
+override is non-zero, so **every** user process is given an 8 MB user-space stack
+regardless of detected RAM. On a 16 MB box that is half the machine.
+
+This is only survivable if the 8 MB is a *lazy* mapping (reserved VA, demand-paged,
+zero-fill on first touch) so a freshly-loaded process commits only the few pages it
+actually touches. **Verify this first** — trace `USER_STACK_SIZE_OVERRIDE` through
+the ELF loader / `mmap` stack setup and confirm it goes through the lazy-region path
+(`MMAP_EAGER_MAX_PAGES` gate, demand fault handler), not an eager
+`alloc_pages_contiguous_zeroed`. If it pre-commits even partially, tcc cannot fit and
+nothing else on this list matters.
+
+- **If lazy:** leave the override, move on — the cost is address space, not RAM.
+- **If eager (or partly):** set the override to `0` (→ 128 KB floor via
+  `compute_user_stack_size`) for the low-mem / `size` profile, or make the stack
+  reservation lazy. This is the single biggest RAM win on the list.
+
+### 2. Raise the user-thread floor in `compute_thread_limit`
+
+The 1/4-of-user-pages budget gives the small tiers almost no **user** thread slots —
+only **2 at 16–24 MB**. A working session needs: the shell, the in-kernel SSH
+session thread, and the `tcc` process — so 2 user slots is structurally too few
+before the compile even starts.
+
+Bump the floor from `reserved + 2` to **`reserved + 6`** (`compute_thread_limit` in
+`src/main.rs`) so shell + SSH + tcc can coexist. Cost is `4 × USER_THREAD_STACK_SIZE`
+= 512 KB of extra PMM pool at 128 KB/slot — cheap once item 3 shrinks the per-slot
+size. Re-check `verify_stack_memory()` still passes against PMM free pages at the new
+floor.
+
+### 3. Shrink `USER_THREAD_STACK_SIZE` on the small-RAM / `size` profile
+
+`USER_THREAD_STACK_SIZE` is **128 KB** (`src/config.rs`) — this is the *kernel-side*
+syscall stack per user slot, not the process's own user stack. tcc's syscall depth is
+shallow (open/read/write/mmap/brk); 128 KB is generous. Halving it to **64 KB** under
+`kernel_profile_size` doubles how many slots fit the same pool, paying for item 2 and
+then some. The stack-pool formula `1.75 MB + (N−8) × stack` is what to recompute; the
+reserved system threads (256 KB) stay as-is since they run the deep async SSH chains.
+Validate with the boot stack-canary check enabled (`ENABLE_STACK_CANARIES`) so a too-
+small stack trips a canary rather than corrupting silently.
+
+### 4. Close the 8 MB boot-stack gap — *structural, unlocks below 16 MB*
+
+Even at a 948 KB binary, `code_and_stack` reserves **~11–16 MB** because
+`BOOT_STACK_TOP` is hardcoded at `KERNEL_BASE + 8 MB` in `boot.rs` and `linker.ld`
+(the `size` profile already moved `IMAGE_SIZE` 3 MB → 1 MB, but the 8 MB stack offset
+above the base is untouched). Moving the boot stack adjacent to the kernel binary
+frees most of that gap for user pages. Requires coordinated changes to **`boot.rs`**
+(the `BOOT_STACK_TOP`/`STACK_BOTTOM` derivation), **`linker.ld`** (the
+`PROVIDE(STACK_BOTTOM = …)` fallback + `ASSERT(. < STACK_BOTTOM)`), and **`main.rs`**
+(the `code_and_stack` split). This is the change that takes the boot floor below
+16 MB; it's also the riskiest (get the stack address wrong and boot silently corrupts).
+
+### 5. Lower the heap floor on small RAM — *the 24 MB quick win*
+
+`compute_heap_size` clamps to an **8 MB floor** (`clamp(ram/8, 8 MB, …)`). The sweep
+shows the cost: at 24 MB RAM the kernel hands the heap 8 MB (floor) while user pages get
+only **5 MB** — and tcc's ELF load then fails with `Out of memory for user page`. The
+kernel only needs ~2.2 MB of heap at boot, so the 8 MB floor is over-provisioned for
+this tier. Drop the floor to **~4 MB** under `kernel_profile_size` (or scale it as
+`max(ram/8, 4 MB)` below ~32 MB) and the freed 4 MB goes straight to the user pool — on
+the 24 MB box that nearly doubles user pages (5 → 9 MB), which is the difference between
+tcc's ELF load failing and fitting. Cheapest change on the list; re-pin the
+`compute_heap_size` unit test in `src/tests.rs`.
+
+### 6. (separate bug) Fix `tcc -run` — `runmain.o not found`
+
+Not a memory issue, but it surfaced in the sweep and blocks the most ergonomic test
+path: `tcc -run /akuma-playground/hello.c` fails at **every** RAM size with
+`tcc: error: file 'runmain.o' not found`. tcc's `-run` mode needs its runtime objects
+(`runmain.o`/`libtcc1.a`) installed where tcc looks (`-B`/lib path). Fixing it would let
+the test loop use `tcc -run` directly instead of compile-then-exec. Track separately
+from the low-mem work.
+
+### Sequencing & verification
+
+5 and 1 → 2 → 3 are independent enough to land together and re-test as a unit (all are
+config/heuristic changes); 4 is a separate, riskier change; 6 is unrelated. After 1–3+5,
+re-run the `size`-profile sweep (`tcc /akuma-playground/hello.c -o /tmp/hello && /tmp/hello`
+at 16/24/32 MB) and update the measured table above — **goal: the "runs tcc" column reads
+`yes` at 32 MB, then 24 MB**; 16 MB needs item 4. Pin the heuristics with the
+`compute_heap_size` / `compute_thread_limit` unit tests in `src/tests.rs` so the new
+floors don't regress.
 
 ## Profile-aware image layout
 

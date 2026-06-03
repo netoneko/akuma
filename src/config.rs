@@ -41,13 +41,21 @@ pub const ASYNC_THREAD_STACK_SIZE: usize = 512 * 1024;
 ///   - 256 MB RAM → 128 KB stack (minimum for basic apps)
 ///   - 512 MB RAM → 256 KB stack
 ///   - 1 GB RAM   → 512 KB stack
-///   - 2 GB RAM   → 1 MB stack  
+///   - 2 GB RAM   → 1 MB stack
 ///   - 4 GB+ RAM  → 2 MB stack (maximum, needed for heavy runtimes like bun/JSC)
 ///
 /// Set to a non-zero value to override automatic scaling.
 /// Bun's JSC initialization uses ~600KB of stack, and complex dependency
 /// resolution (like @google/gemini-cli with 263 packages) may need more.
+///
+/// On the `size` profile (small-RAM targets) we let the RAM-scaling run — the
+/// stack is eagerly committed from PMM, so pinning it to 8 MB would consume
+/// 2048 pages per process before any work is done.  Auto-scaling gives 128 KB
+/// (the minimum) on ≤ 256 MB boxes, which is sufficient for tcc and dash.
+#[cfg(not(kernel_profile_size))]
 pub const USER_STACK_SIZE_OVERRIDE: usize = 8 * 1024 * 1024;
+#[cfg(kernel_profile_size)]
+pub const USER_STACK_SIZE_OVERRIDE: usize = 0; // let compute_user_stack_size scale with RAM
 
 /// Maximum kernel threads
 ///
@@ -74,12 +82,20 @@ pub const MAX_PROCESSES: usize = 64;
 /// Handles SSH/HTTP async call chains and the async main loop.
 pub const SYSTEM_THREAD_STACK_SIZE: usize = 256 * 1024;
 
-/// Stack size for user process threads (128KB)
+/// Stack size for user process threads (128KB release, 64KB size profile)
 ///
 /// Used for threads RESERVED_THREADS through MAX_THREADS-1.
 /// User processes have their own user-space stack; this is for kernel-side
-/// syscall handling only.
+/// syscall handling only.  tcc's syscall depth is shallow (open/read/write/
+/// mmap/brk); 64 KB is sufficient.  Keep `ENABLE_STACK_CANARIES` true so an
+/// undersized stack trips a canary rather than corrupting silently.
+///
+/// Halving the per-slot cost doubles how many user-thread slots fit the same
+/// PMM budget, paying for the `reserved + 6` floor in compute_thread_limit.
+#[cfg(not(kernel_profile_size))]
 pub const USER_THREAD_STACK_SIZE: usize = 128 * 1024;
+#[cfg(kernel_profile_size)]
+pub const USER_THREAD_STACK_SIZE: usize = 64 * 1024;
 
 /// Enable stack canary checking
 ///

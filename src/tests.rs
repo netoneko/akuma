@@ -3985,8 +3985,8 @@ fn test_compute_heap_size() -> bool {
 }
 
 /// Verify the thread-limit auto-scaling heuristic (`crate::compute_thread_limit`):
-/// the stack pool fits in ~half the user pages (or hits the reserved+2 floor),
-/// stays within [reserved+2, MAX_THREADS], and uses the full pool on large RAM.
+/// the stack pool fits in ~1/4 of the user pages (or hits the reserved+6 floor),
+/// stays within [reserved+6, MAX_THREADS], and uses the full pool on large RAM.
 /// Skipped if a manual override is configured.
 fn test_compute_thread_limit() -> bool {
     console::print("\n[TEST] compute_thread_limit heuristic\n");
@@ -4008,18 +4008,18 @@ fn test_compute_thread_limit() -> bool {
         pass = false;
     }
 
-    // Small user-pages → bounded, and pool fits in half the user pages unless at
-    // the reserved+2 floor.
+    // Small user-pages → bounded, and pool fits in 1/4 of the user pages unless
+    // at the reserved+6 floor (raised from +2 so shell+SSH+tcc can coexist).
     for &up_mb in &[4usize, 8, 16, 32, 64, 128] {
         let up = up_mb * MB;
         let n = crate::compute_thread_limit(up);
-        if n < reserved + 2 || n > maxt {
+        if n < reserved + 6 || n > maxt {
             crate::safe_print!(96, "  FAIL: {}MB userpages -> {} threads out of [{},{}]\n",
-                up_mb, n, reserved + 2, maxt);
+                up_mb, n, reserved + 6, maxt);
             pass = false;
         }
         let pool = sys_total + (n - reserved) * ustack;
-        if n > reserved + 2 && pool > up / 4 {
+        if n > reserved + 6 && pool > up / 4 {
             crate::safe_print!(96, "  FAIL: {}MB userpages -> pool {}KB > quarter {}KB\n",
                 up_mb, pool / 1024, (up / 4) / 1024);
             pass = false;
