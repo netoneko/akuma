@@ -63,6 +63,21 @@ if [ ! -f "$BIN" ] || [ "$ELF" -nt "$BIN" ]; then
   rust-objcopy -O binary "$ELF" "$BIN"
 fi
 
+# Size guard: catch binary bloat before it silently breaks boot.
+BIN_BYTES=$(wc -c < "$BIN")
+if echo "$ELF" | grep -q "/size/"; then
+  SIZE_LIMIT=$((1 * 1024 * 1024))   # 1 MB for size profile
+  SIZE_LABEL="1 MB"
+else
+  SIZE_LIMIT=$((3 * 1024 * 1024))   # 3 MB for release profile
+  SIZE_LABEL="3 MB"
+fi
+if [ "$BIN_BYTES" -gt "$SIZE_LIMIT" ]; then
+  echo "[cargo_runner] ERROR: kernel binary is $(( BIN_BYTES / 1024 )) KB, exceeds ${SIZE_LABEL} limit" >&2
+  exit 1
+fi
+echo "[cargo_runner] kernel size: $(( BIN_BYTES / 1024 )) KB (limit ${SIZE_LABEL})" >&2
+
 GDB_ARGS=()
 if [ -n "$GDB_WAIT" ]; then
   GDB_ARGS+=(-gdb "tcp::$GDB_PORT" -S)
