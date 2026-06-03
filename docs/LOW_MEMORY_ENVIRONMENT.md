@@ -261,6 +261,50 @@ At 32 MB release only 12.75 MB is free for processes → OOM loading meow alongs
 At 64 MB release (not in table): user pages ≈ 49 MB, free ≈ 40 MB → fits 4 concurrent procs.
 **Minimum for meow+tcc on `release` profile: 64 MB** (32 MB is borderline; avoid it).
 
+## apk command memory floor (June 2026)
+
+`apk search` and `apk add busybox` tested at each RAM tier with `SNAPSHOT=1` (disk
+writes discarded) so the disk is never modified between runs. The bottleneck is
+**apk's own working set** — the package manager faults in ~48 MB of anonymous
+user pages during a run (TLS, zlib, resolver, package index fetch), which dwarfs
+the per-profile kernel overhead. Consequently, both profiles share the same floor.
+
+**Measured sweep (June 2026, `scripts/apk_memory_sweep.py`, both profiles):**
+
+| RAM | profile | boots? | `apk search busybox` | `apk add busybox` | notes |
+|-----|---------|--------|---------------------|-------------------|-------|
+| ≤ 64 MB | release | yes | **no** | **no** | `/bin/apk` SIGSEGV — PMM exhausted during ELF mapping |
+| 72 MB | release | yes | **no** | **no** | PMM still exhausted |
+| **80 MB** | release | yes | **yes** (2 s) | **yes** (63 s) | floor — 7 MB RAM headroom |
+| ≥ 96 MB | release | yes | yes (2 s) | yes (63 s) | comfortable |
+| ≤ 64 MB | size | yes | **no** | **no** | same SIGSEGV; smaller kernel saves < 2 MB vs apk's 48 MB need |
+| 72 MB | size | yes | **no** | **no** | PMM still exhausted |
+| **80 MB** | size | yes | **yes** (2 s) | **yes** (910 s) | floor — only 7 MB RAM free; network stack starved → 14-min wait |
+| ≥ 96 MB | size | yes | yes (3 s) | yes (64 s) | comfortable |
+
+**Why 80 MB for both profiles.** At 80 MB the user-page pool is just large enough
+for apk's ~48 MB working set plus the thread stack pool. The `size` profile's
+5 MB smaller kernel overhead (`code+stack 5 MB vs 7 MB`) does not shift the
+threshold — apk's demand dominates. At exactly 80 MB (`RAM: 7/80 MB free`) the
+`size` profile squeezes through, but with so little headroom that apk's
+`pselect6` network wait balloons to 14 minutes (vs 63 s at ≥96 MB); use **96 MB
+as the practical floor for reliable apk use on either profile**.
+
+**Root cause: apk's PMM demand.** The SIGSEGV failures at ≤ 72 MB come from PMM
+exhaustion (`pmm=0free` in kernel stats): apk maps memory via many `mmap` calls
+(TLS, heap, package-index buffers), each demand-paged; when the PMM runs dry the
+next page fault has no backing page → SIGSEGV. This is the same mechanism as an
+OOM kill but without a dedicated OOM handler — the kernel just signals the process.
+
+**Comparison with tcc.**
+
+| workload | release floor | size floor |
+|----------|--------------|-----------|
+| boot + SSH | 16 MB | 12 MB |
+| `tcc hello.c -o /tmp/h && /tmp/h` | 32 MB | 16 MB |
+| `apk search busybox` | 80 MB | 80 MB |
+| `apk add busybox` | 80 MB | 80 MB (reliable: 96 MB) |
+
 ## The three regions
 
 `src/main.rs::kernel_main` splits detected RAM into:
