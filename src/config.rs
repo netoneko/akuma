@@ -77,7 +77,7 @@ pub const MAX_PROCESSES: usize = 64;
 ///
 /// Used for threads 1 through RESERVED_THREADS-1.
 /// Handles SSH/HTTP async call chains and the async main loop.
-pub const SYSTEM_THREAD_STACK_SIZE: usize = 256 * 1024;
+pub const SYSTEM_THREAD_STACK_SIZE: usize = 64 * 1024;
 
 /// Stack size for user process threads (128KB release, 64KB size profile)
 ///

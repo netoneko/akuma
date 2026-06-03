@@ -154,6 +154,31 @@ Thread pool comes from user pages (PMM), not the heap.
 Stack pool formula: `7 × 256 KB + (threads − 8) × USER_THREAD_STACK_SIZE`.
 Free-for-procs = user pages − stack pool (boot-time static); each process load = ELF mapped pages + user stack + runtime heap drawn from this pool at runtime.
 
+### meow+tcc sweep results (June 2026, `SYSTEM_THREAD_STACK_SIZE` tuning)
+
+`meow -m qwen3-yolo:latest -c "compile /akuma-playground/hello.c with /usr/bin/tcc -B /usr/lib/tcc -o /tmp/hello_c, run /tmp/hello_c"`.
+Prerequisites on disk: `apk add tcc musl-dev tcc-libs tcc-libs-static` (installs `/usr/bin/tcc`).
+
+**release profile, `SYSTEM_THREAD_STACK_SIZE = 256 KB` (original):**
+
+| RAM | meow+tcc | notes |
+|-----|---------|-------|
+| 32 MB | PASS | 12/32 MB RAM free during run |
+| 24 MB | PASS | — |
+| 16 MB | FAIL | `RAM: 0/16MB free` — meow exhausts all 1.5 MB free-for-procs; no room to spawn tcc |
+| 12 MB | — | not tested |
+
+**release profile, `SYSTEM_THREAD_STACK_SIZE = 64 KB` (−1.3 MB pool, June 2026):**
+
+| RAM | meow+tcc | free-for-procs | heap peak | notes |
+|-----|---------|---------------|-----------|-------|
+| 32 MB | PASS | 16.2 MB | 2.8 MB | — |
+| 24 MB | PASS | 8.2 MB | 2.8 MB | — |
+| 16 MB | **PASS** | 2.8 MB | 2.8 MB | unlocked by 64 KB system stacks |
+| 12 MB | FAIL | 2.8 MB | 1 MB (cap) | kernel heap collapses to 1 MB (`code+stack=7, cap=1`); meow peaks at 2.8 MB → OOM |
+
+12 MB is a layout floor for `release`: `code+stack=7 MB` (driven by the 3 MB binary + `stack_cover`) leaves only 1 MB for heap — below meow's 2.8 MB kernel-heap peak. Not fixable by stack tuning alone; needs a smaller binary (→ `size` profile) or a different allocator.
+
 ### Gains from `USER_STACK_SIZE_OVERRIDE` 8 MB → 0 (auto-scale)
 
 The `% of RAM` column above is **identical before and after** — the boot-time pool doesn't change.
