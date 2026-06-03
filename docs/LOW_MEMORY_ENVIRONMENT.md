@@ -171,3 +171,35 @@ layout + the RAM > 2 GB identity-map fix).
 
 > Results table to be filled after the thread-scaling change lands and the
 > small-RAM matrix (16/24/32/48/64/96/128 MB) is re-run.
+
+## Last run
+
+**`src/boot.rs`**
+- Added `IMAGE_SIZE` const: `0x100000` (1 MB) for `profile.size`, `0x300000` (3 MB) for release
+- Derived `BOOT_STACK_TOP = KERNEL_PHYS_LOAD + IMAGE_SIZE + BOOT_STACK_SIZE` instead of hardcoding `0x40A00000`
+  - size profile: `0x40400000`; release: `0x40600000`
+- ARM64 Image header `image_size` field now uses this const
+
+**`build.rs`** (new)
+- Detects `profile.size` via `OPT_LEVEL=z` (PROFILE is always `"release"` for inherited profiles)
+- Sets `cargo:rustc-cfg=kernel_profile_size`
+- Emits `--defsym=STACK_BOTTOM=<addr>` to the linker (tight per-profile assertion)
+
+**`linker.ld`**
+- Changed `STACK_BOTTOM = 0x40900000` → `PROVIDE(STACK_BOTTOM = 0x40500000)` so build.rs `--defsym` can override it per profile
+
+**`src/*.rs` (9 files)**
+- All `feature = "no-tests"` checks extended to `any(feature = "no-tests", kernel_profile_size)` — size profile auto-excludes test code
+
+**`crates/akuma-net/build.rs`** (new) + **`smoltcp_net.rs`**
+- Same `OPT_LEVEL=z` → `kernel_profile_size` detection; `MAX_SOCKETS` uses `small-sockets` or `kernel_profile_size`
+
+**`Cargo.toml`**
+- Restored `cargo-features = ["panic-immediate-abort"]` and `panic = "immediate-abort"` for `profile.size`
+
+**`.cargo/config.toml`**
+- Added `[unstable] build-std = ["core", "alloc", "compiler_builtins"]` — required for `immediate-abort` to work with the pre-built `aarch64-unknown-none` core
+
+**Verification:**
+- size profile: 883 KB binary, 1 MB image_size, stack top `0x40400000` — SSH + hello ✓
+- release profile: 2833 KB binary, 3 MB image_size, stack top `0x40600000` — SSH + hello ✓

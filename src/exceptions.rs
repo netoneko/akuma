@@ -664,16 +664,16 @@ const SIGFRAME_FPSIMD: usize = SIGFRAME_MCONTEXT + 280;   // 584
 const FPSIMD_MAGIC: u32 = 0x46508001;
 
 // Exposed for kernel layout tests.
-#[cfg(not(feature = "no-tests"))]
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub(crate) const TEST_SIGFRAME_SIZE: usize = SIGFRAME_SIZE;
-#[cfg(not(feature = "no-tests"))]
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub(crate) const TEST_SIGFRAME_UCONTEXT: usize = SIGFRAME_UCONTEXT;
-#[cfg(not(feature = "no-tests"))]
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub(crate) const TEST_SIGFRAME_MCONTEXT: usize = SIGFRAME_MCONTEXT;
-#[cfg(not(feature = "no-tests"))]
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub(crate) const TEST_SIGFRAME_FPSIMD: usize = SIGFRAME_FPSIMD;
 /// Byte offset of uc_sigmask within the signal frame (ucontext_t + 40).
-#[cfg(not(feature = "no-tests"))]
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub(crate) const TEST_SIGFRAME_UC_SIGMASK: usize = SIGFRAME_UCONTEXT + 40;
 
 /// True if `far` is in the kernel identity-RAM VA window (normally UXN for EL0 execute).

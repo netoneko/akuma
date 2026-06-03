@@ -26,9 +26,9 @@ use crate::runtime::runtime;
 // Constants
 // ============================================================================
 
-#[cfg(not(feature = "small-sockets"))]
+#[cfg(not(any(feature = "small-sockets", kernel_profile_size)))]
 const MAX_SOCKETS: usize = 256;
-#[cfg(feature = "small-sockets")]
+#[cfg(any(feature = "small-sockets", kernel_profile_size))]
 const MAX_SOCKETS: usize = 32;
 // Reduced from 64KB to 16KB per direction to save heap memory.
 // 40 sockets × 32KB = 1.25MB vs 40 × 128KB = 5MB.

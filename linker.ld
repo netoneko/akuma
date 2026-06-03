@@ -88,15 +88,15 @@ SECTIONS
 }
 
 /*
- * Boot stack layout check:
- *   KERNEL_PHYS_BASE = 0x40200000
- *   STACK_TOP        = 0x40A00000 (8MB from kernel base)
- *   STACK_SIZE       = 0x100000   (1MB)
- *   STACK_BOTTOM     = 0x40900000 (7MB from kernel base)
+ * Boot stack layout check.
+ * STACK_BOTTOM = KERNEL_PHYS_LOAD + IMAGE_SIZE, set per profile by build.rs via
+ * --defsym=STACK_BOTTOM=VALUE. PROVIDE here is a fallback for manual ld invocations.
+ *   size profile:    0x40200000 + 0x100000 = 0x40300000
+ *   release profile: 0x40200000 + 0x300000 = 0x40500000
  *
  * Kernel binary must fit below STACK_BOTTOM.
  * This assertion fails the build if kernel is too large.
  */
-STACK_BOTTOM = 0x40900000;
-ASSERT(_kernel_phys_end < STACK_BOTTOM, 
-    "FATAL: Kernel binary overlaps boot stack! Kernel end must be < 0x40900000 (7MB from base). Reduce kernel size or increase STACK_TOP in boot.rs.")
+PROVIDE(STACK_BOTTOM = 0x40500000);
+ASSERT(_kernel_phys_end < STACK_BOTTOM,
+    "FATAL: Kernel binary overlaps boot stack! Kernel binary too large for declared IMAGE_SIZE. Reduce kernel size or increase IMAGE_SIZE in boot.rs.")

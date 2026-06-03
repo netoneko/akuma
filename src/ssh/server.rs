@@ -114,13 +114,13 @@ pub(crate) fn note_auth_fail() {
 /// Test entry point: simulate the counter bookkeeping that
 /// `SessionGuard::drop` does, without touching a real socket. Called from
 /// `ssh_tests.rs`.
-#[cfg(not(feature = "no-tests"))]
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub(crate) fn test_note_session_open() {
     ACTIVE_SESSIONS.fetch_add(1, Ordering::AcqRel);
     SESSIONS_OPENED.fetch_add(1, Ordering::Relaxed);
 }
 
-#[cfg(not(feature = "no-tests"))]
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub(crate) fn test_note_session_close(panicked: bool) {
     ACTIVE_SESSIONS.fetch_sub(1, Ordering::AcqRel);
     SESSIONS_CLOSED.fetch_add(1, Ordering::Relaxed);

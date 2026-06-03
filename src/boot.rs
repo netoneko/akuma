@@ -20,22 +20,38 @@ const PHYS_BASE: usize = 0x4000_0000;
 #[cfg(feature = "firecracker")]
 const PHYS_BASE: usize = 0x8000_0000;
 
-// Boot stack top = kernel base + 8 MB
-// With ARM64 Image header, kernel is at 0x40200000, so stack top is at 0x40A00000
+// Reserved image size declared in the ARM64 Image header.
+// QEMU uses this to know where it's safe to place the DTB.
+// profile.size targets a sub-1 MB binary; release targets sub-3 MB.
+#[cfg(kernel_profile_size)]
+const IMAGE_SIZE: usize = 0x10_0000; // 1 MB
+#[cfg(not(kernel_profile_size))]
+const IMAGE_SIZE: usize = 0x30_0000; // 3 MB
+
+// Physical address where QEMU loads the kernel binary (PHYS_BASE + 2 MB).
 #[cfg(not(feature = "firecracker"))]
-const BOOT_STACK_TOP: usize = 0x40A0_0000;
+const KERNEL_PHYS_LOAD: usize = 0x4020_0000;
 #[cfg(feature = "firecracker")]
-const BOOT_STACK_TOP: usize = 0x8080_0000;
+const KERNEL_PHYS_LOAD: usize = 0x8020_0000;
+
+const BOOT_STACK_SIZE: usize = 0x10_0000; // 1 MB boot stack
+
+// Boot stack top = kernel load address + declared image size + 1 MB stack.
+// Placing the stack immediately after the reserved image region keeps the
+// memory map tight and prevents heap/PMM memory from being trapped above.
+//   size profile:    0x40200000 + 0x100000 + 0x100000 = 0x40400000
+//   release profile: 0x40200000 + 0x300000 + 0x100000 = 0x40600000
+const BOOT_STACK_TOP: usize = KERNEL_PHYS_LOAD + IMAGE_SIZE + BOOT_STACK_SIZE;
 
 global_asm!(
     r#"
 .section .text._boot
 .global _boot
 
-// Constants (values injected by Rust feature flags at compile time)
+// Constants (values injected by Rust at compile time)
 .equ KERNEL_PHYS_BASE,  {phys_base}
 .equ STACK_SIZE,        0x100000        // 1MB stack
-.equ STACK_TOP,         {stack_top}     // 8MB from kernel base (end of Code+Stack region)
+.equ STACK_TOP,         {stack_top}     // kernel_load + image_size + stack_size
 
 // Page table constants
 .equ PAGE_SIZE,         4096
@@ -75,7 +91,7 @@ _boot:
     b       _boot_code          // code0: branch past header
     .word   0                   // code1 (not used)
     .quad   0                   // text_offset = 0 (QEMU adds 2MB)
-    .quad   0x300000            // image_size = 3MB (non-zero to enable text_offset)
+    .quad   {image_size}        // image_size: 1 MB (size profile) or 3 MB (release)
     .quad   0                   // flags: little-endian, 4K pages
     .quad   0                   // res2
     .quad   0                   // res3
@@ -321,4 +337,5 @@ boot_page_tables:
 "#,
     phys_base = const PHYS_BASE,
     stack_top = const BOOT_STACK_TOP,
+    image_size = const IMAGE_SIZE,
 );

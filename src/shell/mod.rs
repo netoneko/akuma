@@ -25,13 +25,13 @@ pub use akuma_shell::{
     InteractiveRead, ShellContext, ShellError,
     StreamableCommand, VecWriter,
 };
-#[cfg(not(feature = "no-tests"))]
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub use akuma_shell::parse_pipeline;
 
 pub use akuma_shell::exec::{
     check_streamable_command, execute_command_chain, ShellBackend,
 };
-#[cfg(not(feature = "no-tests"))]
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub use akuma_shell::exec::execute_pipeline;
 
 use core::sync::atomic::{AtomicBool, Ordering};

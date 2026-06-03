@@ -38,14 +38,14 @@ pub(crate) fn vfork_complete(child_pid: u32) {
 }
 
 /// Number of entries currently in VFORK_WAITERS.  Used only by kernel tests.
-#[cfg(not(feature = "no-tests"))]
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub(crate) fn vfork_waiters_len() -> usize {
     crate::irq::with_irqs_disabled(|| VFORK_WAITERS.lock().len())
 }
 
 /// Kernel test helper: insert a fake pending vfork for `child_pid`, invoke
 /// `vfork_complete`, and return whether the entry was cleanly removed.
-#[cfg(not(feature = "no-tests"))]
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub(crate) fn test_vfork_complete_mechanism(child_pid: u32) -> bool {
     let tid = akuma_exec::threading::current_thread_id();
     crate::irq::with_irqs_disabled(|| {
@@ -59,14 +59,14 @@ pub(crate) fn test_vfork_complete_mechanism(child_pid: u32) -> bool {
 }
 
 /// Kernel test helper: insert a fake vfork entry without invoking vfork_complete.
-#[cfg(not(feature = "no-tests"))]
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub(crate) fn vfork_waiters_insert_for_test(child_pid: u32) {
     let tid = akuma_exec::threading::current_thread_id();
     VFORK_WAITERS.lock().insert(child_pid, tid);
 }
 
 /// Kernel test helper: check whether a child PID is still in VFORK_WAITERS.
-#[cfg(not(feature = "no-tests"))]
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub(crate) fn vfork_waiters_contains_for_test(child_pid: u32) -> bool {
     VFORK_WAITERS.lock().contains_key(&child_pid)
 }
