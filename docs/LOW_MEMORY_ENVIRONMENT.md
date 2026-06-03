@@ -110,6 +110,33 @@ skipped (`run_test_heavy!`); the core correctness tests still run. This is a
 *test-harness* concession, not a kernel limit — production builds typically set
 `config::DISABLE_ALL_TESTS`. Set `LOW_MEM_TEST_SKIP_MB = 0` to always run them.
 
+## Size-optimized build profile
+
+For the absolute smallest binary, use the `size` Cargo profile with the `no-tests` feature:
+
+```bash
+cargo build --profile size --features no-tests
+# or
+scripts/build_size.sh
+```
+
+**Baseline vs. size build (June 2026):**
+
+| Build | Size |
+|---|---|
+| `cargo build --release` | 3.6 MB |
+| `cargo build --profile size --features no-tests` | 1.1 MB |
+
+The `size` profile (defined in `Cargo.toml`) sets `opt-level = "z"`, `lto = true`,
+`codegen-units = 1`, and `strip = "symbols"`. The `no-tests` feature gates out
+all `*_tests` modules at compile time — they are not merely skipped at runtime
+but excluded from the binary entirely, along with all test-only exported symbols
+scattered across `syscall/`, `ssh/`, `exceptions.rs`, `pmm.rs`, etc.
+
+The `size` profile is appropriate for any environment where binary footprint
+matters: flash storage, ROM, or just tighter boot-time constraints.
+`cargo run --profile size --features no-tests` works for QEMU as-is.
+
 ## Config knobs (all in `src/config.rs`)
 
 | Const | Default | Effect |

@@ -216,6 +216,7 @@ pub struct MemoryStats {
 }
 
 /// Get current allocated bytes (live allocations)
+#[cfg(not(feature = "no-tests"))]
 pub fn allocated_bytes() -> usize {
     ALLOCATED_BYTES.load(Ordering::Relaxed)
 }

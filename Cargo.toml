@@ -47,8 +47,16 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 
+[profile.size]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"
+
 [features]
 firecracker = []
+no-tests = []
 
 [lints]
 workspace = true

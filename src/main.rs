@@ -9,12 +9,14 @@ mod akuma;
 mod allocator;
 mod async_fs;
 // mod async_net;
+#[cfg(not(feature = "no-tests"))]
 mod async_tests;
 mod block;
 mod boot;
 mod config;
 #[macro_use]
 mod console;
+#[cfg(not(feature = "no-tests"))]
 mod daif_tests;
 mod editor;
 // mod embassy_net_driver;
@@ -24,20 +26,27 @@ mod exceptions;
 mod fw_cfg;
 mod kernel_timer;
 mod fs;
+#[cfg(not(feature = "no-tests"))]
 mod fs_tests;
 mod gic;
 mod irq;
+#[cfg(not(feature = "no-tests"))]
 mod network_tests;
 mod pmm;
+#[cfg(not(feature = "no-tests"))]
 mod process_tests;
 mod ramfb;
 mod rng;
 mod shell;
+#[cfg(not(feature = "no-tests"))]
 mod shell_tests;
+#[cfg(not(feature = "no-tests"))]
 mod sync_tests;
 mod ssh;
+#[cfg(not(feature = "no-tests"))]
 mod ssh_tests;
 mod syscall;
+#[cfg(not(feature = "no-tests"))]
 mod tests;
 mod timer;
 mod vfs;
@@ -690,6 +699,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // and production uses DISABLE_ALL_TESTS anyway. See docs/LOW_MEMORY_ENVIRONMENT.md.
     let low_mem_skip_tests = config::LOW_MEM_TEST_SKIP_MB != 0
         && ram_size <= config::LOW_MEM_TEST_SKIP_MB * 1024 * 1024;
+    #[cfg(not(feature = "no-tests"))]
     let boot_tests_enabled = !config::DISABLE_ALL_TESTS && !low_mem_skip_tests;
     if low_mem_skip_tests {
         crate::safe_print!(128,
@@ -700,26 +710,30 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Run DAIF / IRQ-mask tests first — these verify the foundational
     // invariants that every later subsystem relies on. See
     // docs/STABILITY_URGENT_ISSUES.md issue #1.
+    #[cfg(not(feature = "no-tests"))]
     if boot_tests_enabled {
         daif_tests::run_all_tests();
     }
 
     // Run memory tests (no filesystem dependency)
-    if boot_tests_enabled {
-        if !tests::run_memory_tests() {
-            console::print("\n!!! MEMORY TESTS FAILED - HALTING !!!\n");
-            halt();
-        }
+    #[cfg(not(feature = "no-tests"))]
+    {
+        if boot_tests_enabled {
+            if !tests::run_memory_tests() {
+                console::print("\n!!! MEMORY TESTS FAILED - HALTING !!!\n");
+                halt();
+            }
 
-        // =========================================================================
-        // Run async tests (before network takes over the main loop)
-        // =========================================================================
-        if !async_tests::run_all() {
-            console::print("\n!!! ASYNC TESTS FAILED - HALTING !!!\n");
-            halt();
+            // =========================================================================
+            // Run async tests (before network takes over the main loop)
+            // =========================================================================
+            if !async_tests::run_all() {
+                console::print("\n!!! ASYNC TESTS FAILED - HALTING !!!\n");
+                halt();
+            }
+        } else {
+            console::print("[TESTS] All tests DISABLED via config::DISABLE_ALL_TESTS\n");
         }
-    } else {
-        console::print("[TESTS] All tests DISABLED via config::DISABLE_ALL_TESTS\n");
     }
 
     // =========================================================================
@@ -754,6 +768,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
                             }
                         }
 
+                        #[cfg(not(feature = "no-tests"))]
                         if boot_tests_enabled {
                             // Run filesystem tests
                             fs_tests::run_all_tests();
@@ -964,18 +979,22 @@ fn run_async_main() -> ! {
     console::print("--- Network Initialization Done ---\n\n");
 
     // Run network self-tests if enabled
+    #[cfg(not(feature = "no-tests"))]
     if config::RUN_NETWORK_TESTS {
         network_tests::run_tests();
     }
 
     // Recompute here (different function from kernel_main's boot_tests_enabled):
     // these spawn-heavy suites are skipped on tiny machines, see kernel_main.
-    let ram = akuma_exec::mmu::ram_end().saturating_sub(akuma_exec::mmu::ram_base());
-    let low_mem_skip_tests = config::LOW_MEM_TEST_SKIP_MB != 0
-        && ram <= config::LOW_MEM_TEST_SKIP_MB * 1024 * 1024;
-    if !config::DISABLE_ALL_TESTS && !low_mem_skip_tests {
-        process_tests::run_network_tests();
-        ssh_tests::run_all_tests();
+    #[cfg(not(feature = "no-tests"))]
+    {
+        let ram = akuma_exec::mmu::ram_end().saturating_sub(akuma_exec::mmu::ram_base());
+        let low_mem_skip_tests = config::LOW_MEM_TEST_SKIP_MB != 0
+            && ram <= config::LOW_MEM_TEST_SKIP_MB * 1024 * 1024;
+        if !config::DISABLE_ALL_TESTS && !low_mem_skip_tests {
+            process_tests::run_network_tests();
+            ssh_tests::run_all_tests();
+        }
     }
 
     // Initialize SSH host key

@@ -31,16 +31,23 @@ mod time;
 mod timerfd;
 
 pub use sync::futex_wake;
+#[cfg(not(feature = "no-tests"))]
 pub(crate) use sync::futex_do_wake;
+#[cfg(not(feature = "no-tests"))]
 pub(crate) use sync::futex_wait_at_tgid_for_test;
+#[cfg(not(feature = "no-tests"))]
 pub use mem::membarrier_cmd;
+#[cfg(not(feature = "no-tests"))]
 pub(crate) use fs::sys_close_range;
 
 // Re-export the mmap alignment-EINVAL helper + the flag bits used by kernel
 // tests. `mod mem` is private; these wrappers keep the module boundary intact.
+#[cfg(not(feature = "no-tests"))]
 pub(crate) use mem::mmap_fixed_addr_unaligned_einval;
+#[cfg(not(feature = "no-tests"))]
 pub(crate) use mem::{MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE};
 
+#[cfg(not(feature = "no-tests"))]
 pub(crate) fn epoll_wait_deadline_for_test(timeout: i32, start_time: u64, timeout_us: u64, now: u64) -> u64 {
     poll::epoll_wait_deadline(timeout, start_time, timeout_us, now)
 }
@@ -107,6 +114,7 @@ pub mod syscall_counters {
     pub fn inc_pagefault(pages_mapped: u64) { PAGEFAULT_COUNT.fetch_add(1, Ordering::Relaxed); PAGEFAULT_PAGES.fetch_add(pages_mapped, Ordering::Relaxed); }
     pub fn inc_qemu_dc_zva_ec15() { QEMU_DC_ZVA_EC15_COUNT.fetch_add(1, Ordering::Relaxed); }
     pub fn inc_qemu_stp_xzr_ec15() { QEMU_STP_XZR_EC15_COUNT.fetch_add(1, Ordering::Relaxed); }
+    #[cfg(not(feature = "no-tests"))]
     pub fn get_qemu_stp_xzr_ec15() -> u64 { QEMU_STP_XZR_EC15_COUNT.load(Ordering::Relaxed) }
 
     pub fn dump() {
@@ -375,6 +383,7 @@ struct Timespec {
 }
 
 /// Exposed for kernel tests only.
+#[cfg(not(feature = "no-tests"))]
 pub(crate) fn user_va_limit_value() -> u64 {
     user_va_limit()
 }

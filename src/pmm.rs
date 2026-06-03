@@ -530,6 +530,7 @@ pub fn double_free_count() -> usize {
 /// `[Mem]` signal keeps reflecting only *real* desyncs and operators aren't
 /// misled by a test artifact.
 #[doc(hidden)]
+#[cfg(not(feature = "no-tests"))]
 pub fn discount_double_frees(n: usize) {
     DOUBLE_FREE_COUNT.fetch_sub(n, Ordering::Relaxed);
 }

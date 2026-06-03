@@ -171,6 +171,7 @@ pub(crate) fn pipe_check_set_reader(id: u32, tid: usize) -> bool {
 
 /// Test helper: return the current reader_thread tid registered on `id`.
 /// For the new poller-based implementation, we return true if tid is in the set.
+#[cfg(not(feature = "no-tests"))]
 pub(crate) fn pipe_is_poller_registered(id: u32, tid: usize) -> bool {
     crate::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).map_or(false, |p| p.pollers.contains(&tid))
@@ -178,6 +179,7 @@ pub(crate) fn pipe_is_poller_registered(id: u32, tid: usize) -> bool {
 }
 
 /// Test helper: return how many pollers are registered on `id`.
+#[cfg(not(feature = "no-tests"))]
 pub(crate) fn pipe_pollers_count(id: u32) -> usize {
     crate::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).map_or(0, |p| p.pollers.len())

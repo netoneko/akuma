@@ -19,16 +19,20 @@ use akuma_exec::process;
 use crate::ssh::protocol::SshChannelStream;
 
 pub use akuma_shell::{
-    expand_variables, parse_pipeline,
+    expand_variables,
     split_first_word, trim_bytes, translate_input_keys,
     ChainExecutionResult, Command, CommandRegistry,
     InteractiveRead, ShellContext, ShellError,
     StreamableCommand, VecWriter,
 };
+#[cfg(not(feature = "no-tests"))]
+pub use akuma_shell::parse_pipeline;
 
 pub use akuma_shell::exec::{
-    check_streamable_command, execute_command_chain, execute_pipeline, ShellBackend,
+    check_streamable_command, execute_command_chain, ShellBackend,
 };
+#[cfg(not(feature = "no-tests"))]
+pub use akuma_shell::exec::execute_pipeline;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
