@@ -19,11 +19,15 @@ Verified with `scripts/test_memory_split.py` + the small-RAM sweeps in `logs/`
 | 24 MB | yes | yes | **yes** | 5 / 4 / 15 / 40 | was **no** (ELF load OOM) before |
 | 16 MB | yes | yes | **yes** | 5 / 4 / 7 / 14 | was **no** (SSH rejected, "memory low") before |
 | 12 MB | yes | yes | **no** | 3 / 3 / 4 / 14 | OOM spawning the tcc process — new tcc floor is just above here |
+| **8 MB** | **yes** | **yes** | **no** | 5 / 1 / 2 / 14 | **first time 8 MB boots to SSH** (June 2026, PmmOomHandler); 716 KB free, tcc ELF alone is 723 KB |
 
-So on the `size` profile after the fixes: **boot/usable-SSH floor ≤ 12 MB, tcc floor
-16 MB** — down from a 48 MB tcc floor (a 3-tier improvement). For reference, the
+So on the `size` profile after the fixes: **boot/usable-SSH floor ≤ 8 MB, tcc floor
+16 MB** — down from a 48 MB tcc floor. For reference, the
 **pre-fix** floors were boot 16 MB / usable-SSH 24 MB / tcc 48 MB, with `code+stack`
-a flat **11 MB** at every size. (`tcc -run` is separately broken at *all* sizes —
+a flat **11 MB** at every size. The 8 MB SSH floor is new as of the `PmmOomHandler`
+change (heap seed 4 MB → 1 MB, grows on demand from PMM): previously SSH was
+rejected at 8 MB with "kernel memory low" because `is_memory_low()` compared against
+a 2 MB watermark on the 1 MB seeded slab. (`tcc -run` is separately broken at *all* sizes —
 `runmain.o not found`, a TCC runtime-install issue, not RAM; use `tcc … -o out` then
 exec `out`.) On the `release` profile tcc is verified at ≥ 256 MB via
 `scripts/test_memory_split.py`.
@@ -32,7 +36,8 @@ What moved the floor: four over-provisioned "≥ 256 MB" reservations were cut o
 `size` profile — the 8 MB **eager** user stack → 128 KB (item 1), the 8 MB heap floor
 → 4 MB (item 5), 128 KB → 64 KB per-user-thread kernel stacks (item 3), and most
 decisively the **`code+stack` region 11 MB → 5 MB** by removing the stale 8 MB
-boot-stack gap (item 4). `code+stack` is now a flat ~5 MB instead of 11 MB.
+boot-stack gap (item 4). `code+stack` is now a flat ~5 MB instead of 11 MB. The
+`PmmOomHandler` then dropped the heap seed to 1 MB (was 4 MB), unlocking SSH at 8 MB.
 
 Two things were originally hardcoded for "≥ 256 MB machines" and made to scale (the
 earlier change that got the kernel *booting* across the range):
@@ -127,17 +132,21 @@ and `src/config.rs` (`USER_THREAD_STACK_SIZE`, `USER_STACK_SIZE_OVERRIDE`).
 Layout constants: size profile `stack_cover = 5 MB`; release profile `stack_cover = 7 MB`.
 Thread pool comes from user pages (PMM), not the heap.
 
-**size profile** — 883 KB binary, `IMAGE_SIZE` 1 MB, `USER_THREAD_STACK_SIZE` 64 KB, user-stack auto-scales (≤ 256 MB → 128 KB):
+**size profile** — 883 KB binary, `IMAGE_SIZE` 1 MB, `USER_THREAD_STACK_SIZE` 64 KB, user-stack auto-scales (≤ 256 MB → 128 KB). Heap seed is now 1 MB (grows on demand via `PmmOomHandler`):
 
-| RAM | code+stack | heap | user pages | threads | stack pool | free for procs | % of RAM | user stack/proc | notes |
+| RAM | code+stack | heap seed | user pages | threads | stack pool | free for procs | % of RAM | user stack/proc | notes |
 |-----|-----------|------|-----------|---------|-----------|---------------|---------|----------------|-------|
-| 16 MB | 5 MB | 4 MB | 7 MB | 14 | 2.1 MB | 4.9 MB | 30% | 128 KB | tcc: yes; meow+tcc: fits |
-| 24 MB | 5 MB | 4 MB | 15 MB | 40 | 3.75 MB | 11.3 MB | 47% | 128 KB | meow+tcc: yes |
-| 32 MB | 5 MB | 4 MB | 23 MB | 64 | 5.25 MB | 17.8 MB | 55% | 128 KB | comfortable |
+| 8 MB | 5 MB | 1 MB | 2 MB | 14 | 1.28 MB | 0.72 MB | 9% | 128 KB | **SSH works** (June 2026); 716 KB free; tcc ELF 723 KB → OOM |
+| 16 MB | 5 MB | 1 MB | 10 MB | 14 | 1.28 MB | 8.7 MB | 54% | 128 KB | tcc: yes |
+| 24 MB | 5 MB | 1 MB | 18 MB | 40 | 3.75 MB | 14.3 MB | 60% | 128 KB | meow+tcc: yes |
+| 32 MB | 5 MB | 1 MB | 26 MB | 64 | 5.25 MB | 20.8 MB | 65% | 128 KB | comfortable |
 | 128 MB | 8 MB | 16 MB | 104 MB | 64 | 5.25 MB | 98.8 MB | 77% | 128 KB | — |
 | 256 MB | 16 MB | 64 MB | 176 MB | 64 | 5.25 MB | 170.8 MB | 67% | 128 KB | heap jump at 256 MB threshold |
 | 2048 MB | 128 MB | 256 MB | 1664 MB | 64 | 5.25 MB | 1659 MB | 81% | 1 MB | — |
 | 4096 MB | 256 MB | 256 MB | 3584 MB | 64 | 5.25 MB | 3579 MB | 87% | 2 MB | — |
+
+Note: for ≥ 16 MB the heap grows into the user-page pool via `PmmOomHandler` as needed,
+so "heap seed" is the initial reservation; effective heap ceiling is whatever PMM has free.
 
 **release profile** — 2833 KB binary, `IMAGE_SIZE` 3 MB, `USER_THREAD_STACK_SIZE` 128 KB, user-stack auto-scales (`USER_STACK_SIZE_OVERRIDE = 0` as of June 2026):
 

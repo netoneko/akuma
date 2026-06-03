@@ -1,8 +1,7 @@
-//! Kernel memory allocator with page-based and talc-based options
+//! Kernel memory allocator — Talc with on-demand PMM growth.
 //!
-//! The page-based allocator is ported from libakuma's mmap allocator.
-//! It allocates whole pages for each allocation, fixing layout-sensitive
-//! heap corruption bugs at the cost of higher memory usage.
+//! The heap is seeded with a small bootstrap arena (~1 MB) and grows on
+//! demand by claiming contiguous pages from the PMM once it is ready.
 //!
 //! Debug features:
 //! - ENABLE_ALLOCATION_REGISTRY: Track all allocations to detect overlaps, double frees
@@ -12,13 +11,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use spinning_top::Spinlock;
-use talc::ErrOnOom;
 use talc::{Span, Talc};
-
-/// Set to true to use page-based allocation (like userspace mmap allocator)
-/// This fixes layout-sensitive heap corruption bugs but uses more memory.
-/// Deallocation properly returns pages to PMM.
-pub const USE_PAGE_ALLOCATOR: bool = false; // DOES NOT ACTUALLY WORK
 
 /// Enable allocation registry for debugging heap corruption
 /// This tracks all allocations and detects overlaps, double frees, and invalid frees
@@ -38,17 +31,37 @@ const CANARY_SIZE: usize = 8;
 
 const PAGE_SIZE: usize = 4096;
 
-/// Flag indicating PMM is ready for use (set after PMM init completes)
+/// Flag indicating PMM is ready — the OOM handler checks this before growing.
 static PMM_READY: AtomicBool = AtomicBool::new(false);
 
-/// Signal that PMM is ready for use by the page allocator
 pub fn mark_pmm_ready() {
     PMM_READY.store(true, Ordering::Release);
 }
 
-/// Check if PMM is ready
 fn is_pmm_ready() -> bool {
     PMM_READY.load(Ordering::Acquire)
+}
+
+// ============================================================================
+// PMM-backed OOM handler — grows the Talc arena on demand
+// ============================================================================
+
+struct PmmOomHandler;
+
+impl talc::OomHandler for PmmOomHandler {
+    fn handle_oom(talc: &mut Talc<Self>, layout: Layout) -> Result<(), ()> {
+        if !is_pmm_ready() {
+            return Err(());
+        }
+        // Grow by at least 256 KB (64 pages) to amortise per-OOM overhead.
+        const GROW_PAGES: usize = 64;
+        let needed = (layout.size() + PAGE_SIZE - 1) / PAGE_SIZE;
+        let n = needed.max(GROW_PAGES);
+        let frame = crate::pmm::alloc_pages_contiguous_zeroed(n).ok_or(())?;
+        let ptr = akuma_exec::mmu::phys_to_virt(frame.addr) as *mut u8;
+        let span = Span::from_base_size(ptr, n * PAGE_SIZE);
+        unsafe { talc.claim(span).map(|_| ()).map_err(|_| ()) }
+    }
 }
 
 // ============================================================================
@@ -176,7 +189,7 @@ fn registry_remove(addr: usize) -> bool {
 }
 
 #[global_allocator]
-static ALLOCATOR: HybridAllocator = HybridAllocator;
+static ALLOCATOR: KernelAllocator = KernelAllocator;
 
 /// OOM handler: kill the current userspace process instead of panicking the kernel.
 /// If there is no current process (pure kernel context), fall through to panic.
@@ -197,7 +210,7 @@ fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
     panic!("kernel OOM: allocation of {} bytes failed", layout.size());
 }
 
-static TALC: Spinlock<Talc<ErrOnOom>> = Spinlock::new(Talc::new(ErrOnOom));
+static TALC: Spinlock<Talc<PmmOomHandler>> = Spinlock::new(Talc::new(PmmOomHandler));
 
 // Memory tracking
 static HEAP_SIZE: AtomicUsize = AtomicUsize::new(0);
@@ -234,16 +247,18 @@ pub fn stats() -> MemoryStats {
     }
 }
 
-/// Heap low watermark - when free heap drops below this, memory is considered low.
-const HEAP_LOW_WATERMARK: usize = 2 * 1024 * 1024; // 2 MB
-
-/// Returns true if the kernel heap is running low on free space.
-/// Used by subsystems to reject new work before hitting OOM.
+/// Returns true if the system is running low on physical memory.
+/// Pre-PMM: checks heap slab free space. Post-PMM: checks PMM free pages,
+/// since the heap now grows on demand and the seeded slab size is irrelevant.
 pub fn is_memory_low() -> bool {
-    let heap_size = HEAP_SIZE.load(Ordering::Relaxed);
-    let allocated = ALLOCATED_BYTES.load(Ordering::Relaxed);
-    let free = heap_size.saturating_sub(allocated);
-    free < HEAP_LOW_WATERMARK
+    const LOW_PAGES: usize = 128; // 512 KB threshold
+    if is_pmm_ready() {
+        crate::pmm::free_count() < LOW_PAGES
+    } else {
+        let heap_size = HEAP_SIZE.load(Ordering::Relaxed);
+        let allocated = ALLOCATED_BYTES.load(Ordering::Relaxed);
+        heap_size.saturating_sub(allocated) < 256 * 1024
+    }
 }
 
 /// No-op for backwards compatibility - IRQs are now always disabled during allocation
@@ -277,156 +292,32 @@ pub fn init(heap_start: usize, heap_size: usize) -> Result<(), &'static str> {
 }
 
 // ============================================================================
-// Hybrid Allocator (switches between page-based and talc-based)
+// Global allocator — delegates directly to Talc
 // ============================================================================
 
-struct HybridAllocator;
+struct KernelAllocator;
 
-unsafe impl GlobalAlloc for HybridAllocator {
+unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe {
-            // Use page allocator only if enabled AND PMM is ready
-            if USE_PAGE_ALLOCATOR && is_pmm_ready() {
-                page_alloc(layout)
-            } else {
-                talc_alloc(layout)
-            }
-        }
+        unsafe { talc_alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         unsafe {
-            let ptr = self.alloc(layout);
+            let ptr = talc_alloc(layout);
             if !ptr.is_null() {
-                // Page allocator already returns zeroed pages
-                if !(USE_PAGE_ALLOCATOR && is_pmm_ready()) {
-                    ptr::write_bytes(ptr, 0, layout.size());
-                }
+                ptr::write_bytes(ptr, 0, layout.size());
             }
             ptr
         }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe {
-            // For dealloc, we need to handle both cases since memory might
-            // have been allocated with either allocator
-            if USE_PAGE_ALLOCATOR && is_pmm_ready() {
-                page_dealloc(ptr, layout);
-            } else {
-                talc_dealloc(ptr, layout);
-            }
-        }
+        unsafe { talc_dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        unsafe {
-            if USE_PAGE_ALLOCATOR && is_pmm_ready() {
-                page_realloc(ptr, layout, new_size)
-            } else {
-                talc_realloc(ptr, layout, new_size)
-            }
-        }
-    }
-}
-
-// ============================================================================
-// Page-based allocator (ported from libakuma mmap allocator)
-// ============================================================================
-
-/// Allocate using PMM pages directly
-unsafe fn page_alloc(layout: Layout) -> *mut u8 {
-    with_irqs_disabled(|| {
-        let size = layout.size().max(layout.align());
-        let alloc_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let pages = alloc_size / PAGE_SIZE;
-
-        // Allocate contiguous pages from PMM
-        // For simplicity, allocate pages one at a time and use the first one's address
-        // This works because PMM allocates from a contiguous region
-        let mut first_addr: Option<*mut u8> = None;
-
-        for i in 0..pages {
-            if let Some(frame) = crate::pmm::alloc_page_zeroed() {
-                // Track as kernel allocation (PID=0 for kernel)
-                crate::pmm::track_frame(frame, crate::pmm::FrameSource::Kernel);
-                if i == 0 {
-                    // Convert physical address to kernel virtual address
-                    first_addr = Some(akuma_exec::mmu::phys_to_virt(frame.addr));
-                }
-                // Track allocation
-                ALLOCATED_BYTES.fetch_add(PAGE_SIZE, Ordering::Relaxed);
-            } else {
-                // Allocation failed
-                return ptr::null_mut();
-            }
-        }
-
-        ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
-
-        // Update peak
-        let new_allocated = ALLOCATED_BYTES.load(Ordering::Relaxed);
-        let mut peak = PEAK_ALLOCATED.load(Ordering::Relaxed);
-        while new_allocated > peak {
-            match PEAK_ALLOCATED.compare_exchange_weak(
-                peak,
-                new_allocated,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(p) => peak = p,
-            }
-        }
-
-        first_addr.unwrap_or(ptr::null_mut())
-    })
-}
-
-/// Deallocate pages - returns pages to PMM
-unsafe fn page_dealloc(ptr: *mut u8, layout: Layout) {
-    with_irqs_disabled(|| {
-        let size = layout.size().max(layout.align());
-        let alloc_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let pages = alloc_size / PAGE_SIZE;
-
-        // Convert virtual address back to physical and free each page
-        let phys_addr = akuma_exec::mmu::virt_to_phys(ptr as usize);
-        for i in 0..pages {
-            let frame = crate::pmm::PhysFrame::new(phys_addr + i * PAGE_SIZE);
-            crate::pmm::free_page(frame);
-        }
-
-        ALLOCATED_BYTES.fetch_sub(alloc_size, Ordering::Relaxed);
-    })
-}
-
-/// Realloc using page allocation
-unsafe fn page_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-    unsafe {
-        if new_size == 0 {
-            page_dealloc(ptr, layout);
-            return ptr::null_mut();
-        }
-
-        let new_layout = match Layout::from_size_align(new_size, layout.align()) {
-            Ok(l) => l,
-            Err(_) => return ptr::null_mut(),
-        };
-
-        let new_ptr = page_alloc(new_layout);
-        if new_ptr.is_null() {
-            return ptr::null_mut();
-        }
-
-        // Copy old data and free old allocation
-        if !ptr.is_null() {
-            let copy_size = layout.size().min(new_size);
-            ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
-            page_dealloc(ptr, layout);
-        }
-
-        new_ptr
+        unsafe { talc_realloc(ptr, layout, new_size) }
     }
 }
 

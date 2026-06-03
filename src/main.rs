@@ -257,10 +257,13 @@ pub(crate) fn compute_heap_size(ram_size: usize, code_and_stack: usize) -> usize
         //
         // For RAM >= 128 MB, ram/8 dominates the floor (16 MB+), so this only
         // shrinks the heap below 128 MB.
+        // On the size profile, seed the heap with only 1 MB — the PmmOomHandler
+        // grows it on demand from PMM, so we don't burn 4 MB upfront regardless
+        // of actual use.  On release keep 4 MB (was 8 MB) for a modest saving.
         #[cfg(kernel_profile_size)]
-        const SMALL_FLOOR: usize = 4 * MB;
+        const SMALL_FLOOR: usize = 1 * MB;
         #[cfg(not(kernel_profile_size))]
-        const SMALL_FLOOR: usize = 8 * MB;
+        const SMALL_FLOOR: usize = 4 * MB;
         const MIN_USER: usize = 4 * MB;
         let cap = ram_size
             .saturating_sub(code_and_stack)
