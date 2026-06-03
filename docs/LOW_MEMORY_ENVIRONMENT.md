@@ -115,27 +115,27 @@ skipped (`run_test_heavy!`); the core correctness tests still run. This is a
 For the absolute smallest binary, use the `size` Cargo profile with the `no-tests` feature:
 
 ```bash
-cargo build --profile size --features no-tests
-# or
-scripts/build_size.sh
+scripts/build_size.sh          # uses cargo +nightly, build-std, no-tests
+cargo run --profile size --features no-tests -Z build-std=core,alloc  # to run in QEMU
 ```
 
-**Baseline vs. size build (June 2026):**
+**Size reduction journey (June 2026):**
 
-| Build | Size |
+| Change | Binary size |
 |---|---|
-| `cargo build --release` | 3.6 MB |
-| `cargo build --profile size --features no-tests` | 1.1 MB |
+| `cargo build --release` baseline | 3.6 MB |
+| `[profile.size]` + `no-tests` feature (gate all `*_tests` modules) | 1.1 MB |
+| `-Z build-std=core,alloc`, `panic = "immediate-abort"`, remove smoltcp `log` | 1.0 MB |
+| `no-tests` activates `akuma-net/small-sockets` (MAX_SOCKETS 256→32) | **948 KB** |
 
-The `size` profile (defined in `Cargo.toml`) sets `opt-level = "z"`, `lto = true`,
-`codegen-units = 1`, and `strip = "symbols"`. The `no-tests` feature gates out
-all `*_tests` modules at compile time — they are not merely skipped at runtime
-but excluded from the binary entirely, along with all test-only exported symbols
-scattered across `syscall/`, `ssh/`, `exceptions.rs`, `pmm.rs`, etc.
+**What each layer does:**
 
-The `size` profile is appropriate for any environment where binary footprint
-matters: flash storage, ROM, or just tighter boot-time constraints.
-`cargo run --profile size --features no-tests` works for QEMU as-is.
+- **`[profile.size]`** — `opt-level = "z"`, `lto = true`, `codegen-units = 1`, `strip = "symbols"`, `panic = "immediate-abort"`. The last flag converts every panic site into a single `udf` instruction, eliminating the panic formatting infrastructure.
+- **`no-tests` feature** — gates all `*_tests` modules and their test-only exported symbols out of the binary entirely (not just skipped at runtime). Also activates `akuma-net/small-sockets`.
+- **`-Z build-std=core,alloc`** (nightly) — rebuilds `core` and `alloc` with `opt-level = "z"` instead of the precompiled defaults.
+- **`akuma-net/small-sockets`** — reduces `MAX_SOCKETS` from 256 to 32. Each socket slot is a 464-byte static `SocketStorage` entry; 256 of them occupied 116 KB of the binary's `.data` section regardless of how many sockets are actually open at runtime.
+
+**Note on memory layout:** even at 948 KB, the kernel's boot-time memory reservation (`code_and_stack`) stays at ~11–16 MB because the boot stack is hardcoded at `KERNEL_BASE + 8 MB` in `boot.rs` and `linker.ld`. Moving the stack closer to the kernel binary would free several MB for user processes but requires changes to `boot.rs`, `linker.ld`, and `main.rs` — tracked as future work.
 
 ## Config knobs (all in `src/config.rs`)
 
