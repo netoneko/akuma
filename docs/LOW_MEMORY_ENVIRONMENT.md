@@ -120,6 +120,98 @@ hazard from both profiles.
 `size` still boots at 16 MB (no regression). Release boot floor dropped 128 MB → ≤ 16
 MB.
 
+## Per-RAM memory statistics (June 2026)
+
+Computed from the live heuristics in `src/main.rs` (`compute_heap_size`, `compute_thread_limit`)
+and `src/config.rs` (`USER_THREAD_STACK_SIZE`, `USER_STACK_SIZE_OVERRIDE`).
+Layout constants: size profile `stack_cover = 5 MB`; release profile `stack_cover = 7 MB`.
+Thread pool comes from user pages (PMM), not the heap.
+
+**size profile** — 883 KB binary, `IMAGE_SIZE` 1 MB, `USER_THREAD_STACK_SIZE` 64 KB, user-stack auto-scales (≤ 256 MB → 128 KB):
+
+| RAM | code+stack | heap | user pages | threads | stack pool | free for procs | % of RAM | user stack/proc | notes |
+|-----|-----------|------|-----------|---------|-----------|---------------|---------|----------------|-------|
+| 16 MB | 5 MB | 4 MB | 7 MB | 14 | 2.1 MB | 4.9 MB | 30% | 128 KB | tcc: yes; meow+tcc: fits |
+| 24 MB | 5 MB | 4 MB | 15 MB | 40 | 3.75 MB | 11.3 MB | 47% | 128 KB | meow+tcc: yes |
+| 32 MB | 5 MB | 4 MB | 23 MB | 64 | 5.25 MB | 17.8 MB | 55% | 128 KB | comfortable |
+| 128 MB | 8 MB | 16 MB | 104 MB | 64 | 5.25 MB | 98.8 MB | 77% | 128 KB | — |
+| 256 MB | 16 MB | 64 MB | 176 MB | 64 | 5.25 MB | 170.8 MB | 67% | 128 KB | heap jump at 256 MB threshold |
+| 2048 MB | 128 MB | 256 MB | 1664 MB | 64 | 5.25 MB | 1659 MB | 81% | 1 MB | — |
+| 4096 MB | 256 MB | 256 MB | 3584 MB | 64 | 5.25 MB | 3579 MB | 87% | 2 MB | — |
+
+**release profile** — 2833 KB binary, `IMAGE_SIZE` 3 MB, `USER_THREAD_STACK_SIZE` 128 KB, user-stack auto-scales (`USER_STACK_SIZE_OVERRIDE = 0` as of June 2026):
+
+| RAM | code+stack | heap | user pages | threads | stack pool | free for procs | % of RAM | user stack/proc | notes |
+|-----|-----------|------|-----------|---------|-----------|---------------|---------|----------------|-------|
+| 16 MB | 7 MB | 5 MB | 4 MB | 14 | 2.5 MB | 1.5 MB | 9% | 128 KB | very tight |
+| 24 MB | 7 MB | 8 MB | 9 MB | 14 | 2.5 MB | 6.5 MB | 27% | 128 KB | — |
+| 32 MB | 7 MB | 8 MB | 17 MB | 28 | 4.25 MB | 12.75 MB | 40% | 128 KB | meow+tcc: fits |
+| 128 MB | 8 MB | 16 MB | 104 MB | 64 | 8.75 MB | 95.3 MB | 74% | 128 KB | — |
+| 256 MB | 16 MB | 64 MB | 176 MB | 64 | 8.75 MB | 167.3 MB | 65% | 128 KB | heap jump at 256 MB threshold |
+| 2048 MB | 128 MB | 256 MB | 1664 MB | 64 | 8.75 MB | 1655 MB | 81% | 1 MB | — |
+| 4096 MB | 256 MB | 256 MB | 3584 MB | 64 | 8.75 MB | 3575 MB | 87% | 8 MB | auto-scaled max |
+
+Stack pool formula: `7 × 256 KB + (threads − 8) × USER_THREAD_STACK_SIZE`.
+Free-for-procs = user pages − stack pool (boot-time static); each process load = ELF mapped pages + user stack + runtime heap drawn from this pool at runtime.
+
+### Gains from `USER_STACK_SIZE_OVERRIDE` 8 MB → 0 (auto-scale)
+
+The `% of RAM` column above is **identical before and after** — the boot-time pool doesn't change.
+What changes is the per-process runtime cost: 8 MB + ~0.5 MB ELF = **~8.5 MB/proc before** vs
+128 KB + ~0.5 MB ELF = **~0.6 MB/proc after** (at ≤ 256 MB RAM). Gains in max concurrent
+user processes (capped at available user thread slots = `thread_limit − 8`):
+
+| RAM | before (8 MB stacks) | after (128 KB stacks) | gain |
+|-----|---------------------|-----------------------|------|
+| 16 MB | **0** (8.5 MB > 1.5 MB free) | **2** | — → 2 |
+| 24 MB | **0** (8.5 MB > 6.5 MB free) | **6** (slot-capped) | — → 6 |
+| 32 MB | **1** | **20** (slot-capped) | 1 → 20 |
+| 128 MB | **11** | **56** (slot-capped) | 11 → 56 |
+| 256 MB | **19** | **56** (slot-capped) | 19 → 56 |
+| 2048 MB | **56** (slot-capped) | **56** (slot-capped) | unchanged |
+| 4096 MB | **56** (slot-capped) | **56** (slot-capped) | unchanged |
+
+**Rustc regression note:** `rustc hello.rs` was verified working on `release` at 2048 MB prior
+to the `USER_STACK_SIZE_OVERRIDE = 0` change. Re-verify this after the change — rustc's codegen
+threads are stack-hungry and may need a larger override than the 1 MB auto-scaled value at 2 GB.
+If it regresses, try `USER_STACK_SIZE_OVERRIDE = 2 * 1024 * 1024` before reaching for 8 MB.
+
+Below 256 MB the gains are dramatic because 8 MB stacks were consuming the entire free pool
+for 1–2 processes. Above 256 MB the thread-slot limit (56 user slots) is the binding
+constraint either way. The override was a debugging artefact from crush/bun work — it had
+no benefit for any workload that doesn't actually touch 8 MB of stack depth.
+
+### meow → Qwen → tcc hello.c — minimum viable RAM
+
+Binary sizes: `meow` 403 KB, `tcc` 589 KB, `dash` ~100 KB, compiled `hello` 71 KB.
+The pipeline is sequential (dash forks meow; waits; then forks tcc; waits) so the peak
+concurrent load is dash + one child, never meow + tcc simultaneously.
+
+**size profile (128 KB user stacks, all RAM tiers):**
+
+| process | ELF | stack | est. runtime heap | total |
+|---------|-----|-------|------------------|-------|
+| dash (shell) | ~100 KB | 128 KB | ~100 KB | ~328 KB |
+| meow (HTTP + JSON) | 403 KB | 128 KB | ~512 KB | ~1 MB |
+| tcc (compile hello.c) | 589 KB | 128 KB | ~512 KB | ~1.2 MB |
+| hello (run output) | 71 KB | 128 KB | minimal | ~200 KB |
+
+Peak concurrent: dash + meow ≈ 1.3 MB; all fit comfortably within the 4.9 MB free at 16 MB.
+**Minimum for meow+tcc on `size` profile: 16 MB** (same floor as tcc alone).
+
+**release profile (8 MB eager user stacks):**
+
+| process | ELF | stack (eager) | est. total |
+|---------|-----|--------------|-----------|
+| dash | ~100 KB | 8 MB | ~8.1 MB |
+| meow | 403 KB | 8 MB | ~8.5 MB |
+| tcc | 589 KB | 8 MB | ~8.6 MB |
+
+Peak concurrent: dash + meow = ~16.6 MB user pages needed.
+At 32 MB release only 12.75 MB is free for processes → OOM loading meow alongside dash.
+At 64 MB release (not in table): user pages ≈ 49 MB, free ≈ 40 MB → fits 4 concurrent procs.
+**Minimum for meow+tcc on `release` profile: 64 MB** (32 MB is borderline; avoid it).
+
 ## The three regions
 
 `src/main.rs::kernel_main` splits detected RAM into:

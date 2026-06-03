@@ -52,10 +52,7 @@ pub const ASYNC_THREAD_STACK_SIZE: usize = 512 * 1024;
 /// stack is eagerly committed from PMM, so pinning it to 8 MB would consume
 /// 2048 pages per process before any work is done.  Auto-scaling gives 128 KB
 /// (the minimum) on ≤ 256 MB boxes, which is sufficient for tcc and dash.
-#[cfg(not(kernel_profile_size))]
-pub const USER_STACK_SIZE_OVERRIDE: usize = 8 * 1024 * 1024;
-#[cfg(kernel_profile_size)]
-pub const USER_STACK_SIZE_OVERRIDE: usize = 0; // let compute_user_stack_size scale with RAM
+pub const USER_STACK_SIZE_OVERRIDE: usize = 0; // auto-scale; set to e.g. 8MB to debug crush/bun/JSC stack depth
 
 /// Maximum kernel threads
 ///
