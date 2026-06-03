@@ -39,6 +39,33 @@ decisively the **`code+stack` region 11 MB → 5 MB** by removing the stale 8 MB
 boot-stack gap (item 4). `code+stack` is now a flat ~5 MB instead of 11 MB. The
 `PmmOomHandler` then dropped the heap seed to 1 MB (was 4 MB), unlocking SSH at 8 MB.
 
+## What landed in the `even-smaller-kernel` branch (June 2026)
+
+All changes are gated on `kernel_profile_size` (emitted by `build.rs` when `OPT_LEVEL=z`),
+so `--release` is unaffected unless stated.
+
+| Change | File | Before | After |
+|--------|------|--------|-------|
+| **Heap seed (`SMALL_FLOOR`)** | `src/main.rs` | 8 MB (both profiles) | 1 MB (`size`), 4 MB (`release`) |
+| **`MIN_CODE_AND_STACK`** | `src/main.rs` | 8 MB | 4 MB |
+| **`STACK_BOTTOM`** per-profile | `src/main.rs` | hardcoded `0x4090_0000` | `0x4030_0000` (`size`) / `0x4050_0000` (`release`) |
+| **Boot stack address in threading** | `ExecConfig` fields in `crates/akuma-exec/src/runtime.rs` | hardcoded `0x40700000` in threading crate | passed from `main.rs` as `boot_stack_base/top` |
+| **`USER_STACK_SIZE_OVERRIDE`** | `src/config.rs` | 8 MB (all profiles) | 0 / auto-scale (128 KB at ≤256 MB) |
+| **`SYSTEM_THREAD_STACK_SIZE`** | `src/config.rs` | 256 KB (all profiles) | 64 KB (`release`), 128 KB (`size`) |
+| **`USER_THREAD_STACK_SIZE`** | `src/config.rs` | 128 KB (all profiles) | 64 KB (`size`), 128 KB (`release`) |
+| **`compute_thread_limit` floor** | `src/main.rs` | `reserved + 2` | `reserved + 6` |
+| **Demand-paged ELF loader** | `crates/akuma-exec/src/process/spawn.rs` | `HEAP_SLURP_MAX = 1 MB` | 0 on `size` profile — every binary uses `from_elf_path`; heap never needs a scratch buffer sized to the binary (tcc is 723 KB) |
+| **Test modules excluded from binary** | `src/main.rs` | test modules always compiled in | all `*_tests` modules gated on `#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]` |
+
+**Why the demand-paged loader was the 8 MB unlock.** At 8 MB the heap seed is 1 MB
+(`SMALL_FLOOR`). Before this change, spawning tcc would call `read_file` and slurp the
+entire 723 KB ELF into the heap — exceeding the 1 MB seed before `PmmOomHandler` could
+grow it. With `HEAP_SLURP_MAX = 0`, tcc goes through `from_elf_path` which maps ELF
+segments lazily from the file with no heap scratch buffer; the heap stays flat and SSH
+succeeds. (716 KB PMM is still too small for tcc's runtime pages, so tcc itself still
+fails at 8 MB — the ELF *load* now fits, but page-faulting the full binary at runtime
+exhausts the 2 MB user pool.)
+
 Two things were originally hardcoded for "≥ 256 MB machines" and made to scale (the
 earlier change that got the kernel *booting* across the range):
 
