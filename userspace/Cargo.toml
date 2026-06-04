@@ -31,5 +31,7 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 lto = true
-opt-level = "s"
+opt-level = "z"        # optimize for size (smallest code); userspace is mostly I/O-bound
+codegen-units = 1      # better cross-unit optimization under LTO, smaller output
+strip = true           # drop symbol tables from the shipped ELF
 
