@@ -95,6 +95,20 @@ pub fn set_network_thread_id(tid: usize) {
 /// `MAX_THREADS` until `set_thread_limit` is called during early boot.
 static THREAD_LIMIT: AtomicUsize = AtomicUsize::new(MAX_THREADS);
 
+// ── Lazy thread-stack allocation (size profile) ──────────────────────────────
+// On the size profile the per-slot stacks (128 KB system / 64 KB user from PMM)
+// are not all pre-allocated at boot — that reserved ~1.28 MB at thread_limit=14
+// while only ~3 threads run at idle. Instead we keep a small WARM FLOOR of FREE
+// pre-allocated stacks per class so the common single-session/single-process
+// spawn is always warm and can't fail, and allocate/free the rest on demand
+// (ensure_slot_stack on claim, free-above-floor in cleanup_terminated). On
+// release every slot is still pre-allocated (no per-spawn alloc, guaranteed
+// availability). Idle saving at 8 MB ≈ 0.8 MB. See docs/LOW_MEMORY_ENVIRONMENT.md.
+#[cfg(kernel_profile_size)]
+const WARM_FREE_SYSTEM: usize = 1;
+#[cfg(kernel_profile_size)]
+const WARM_FREE_USER: usize = 1;
+
 /// Set the runtime thread-slot limit. Clamped to `[reserved+1, MAX_THREADS]` so
 /// there is always the full system-thread set plus at least one user slot.
 pub fn set_thread_limit(limit: usize) {
@@ -232,6 +246,19 @@ fn claim_free_slot(start: usize, end: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Ensure a just-claimed slot has a stack allocated (lazy stacks). A no-op when
+/// the stack is already present — always the case on release (every slot is
+/// pre-allocated) and for warm-floor slots on the size profile. Returns false if
+/// the PMM cannot back the stack, in which case the caller must release the slot.
+fn ensure_slot_stack(slot_idx: usize, size: usize) -> bool {
+    let _guard = IrqGuard::new();
+    let mut pool = POOL.lock();
+    if pool.stacks[slot_idx].is_allocated() {
+        return true;
+    }
+    pool.allocate_stack_for_slot(slot_idx, size)
 }
 
 /// Per-thread termination timestamp (for cooldown tracking)
@@ -559,6 +586,35 @@ fn cleanup_terminated_internal(force: bool) -> usize {
             THREAD_SIGALTSTACK_SP[i].store(0, Ordering::Release);
             THREAD_SIGALTSTACK_SIZE[i].store(0, Ordering::Release);
             THREAD_SIGALTSTACK_FLAGS[i].store(2, Ordering::Release); // SS_DISABLE
+
+            // Lazy stacks (size profile): return this slot's stack to the PMM
+            // unless that would drop the warm free-stack floor for its class.
+            // Safe here — the thread has terminated and cooled down, so it is no
+            // longer executing on this stack. Done BEFORE the canary re-init
+            // below, which then naturally skips the now-empty stack (base == 0).
+            #[cfg(kernel_profile_size)]
+            {
+                let _guard = IrqGuard::new();
+                let mut pool = POOL.lock();
+                let reserved = config().reserved_threads;
+                let (start, end, floor) = if i < reserved {
+                    (1, reserved, WARM_FREE_SYSTEM)
+                } else {
+                    (reserved, thread_limit(), WARM_FREE_USER)
+                };
+                // Count stacks already kept warm (FREE + allocated) in this class,
+                // excluding slot `i` which is still TERMINATED at this point.
+                let warm_free = (start..end)
+                    .filter(|&j| {
+                        j != i
+                            && THREAD_STATES[j].load(Ordering::SeqCst) == thread_state::FREE
+                            && pool.stacks[j].is_allocated()
+                    })
+                    .count();
+                if warm_free >= floor {
+                    pool.free_stack_for_slot(i);
+                }
+            }
 
             // Re-initialize canary for reuse
             if config().enable_stack_canaries {
@@ -1144,16 +1200,48 @@ impl ThreadPool {
             init_stack_canary(boot_stack_base);
         }
 
-        // Threads 1 to RESERVED_THREADS-1: System threads with large stacks (256KB)
-        // Used for shell, SSH sessions, async executor, etc.
-        for i in 1..config().reserved_threads {
-            self.allocate_stack_for_slot(i, config().system_thread_stack_size);
+        // Stack pre-allocation.
+        //
+        // release: pre-allocate every slot up to thread_limit (system stacks for
+        // 1..reserved, user stacks for reserved..thread_limit) — guaranteed
+        // available, no per-spawn allocation.
+        //
+        // size profile: lazy stacks. Pre-allocate only a small WARM FLOOR of FREE
+        // stacks per class; ensure_slot_stack grows the rest on demand at spawn
+        // and cleanup_terminated frees back to the floor on recycle. This avoids
+        // reserving ~1 MB of PMM for slots that are idle most of the time.
+        #[cfg(not(kernel_profile_size))]
+        {
+            for i in 1..config().reserved_threads {
+                assert!(
+                    self.allocate_stack_for_slot(i, config().system_thread_stack_size),
+                    "boot: failed to allocate system thread stack for slot {}", i
+                );
+            }
+            for i in config().reserved_threads..thread_limit() {
+                assert!(
+                    self.allocate_stack_for_slot(i, config().user_thread_stack_size),
+                    "boot: failed to allocate user thread stack for slot {}", i
+                );
+            }
         }
-
-        // Threads RESERVED_THREADS to MAX_THREADS-1: User process threads with smaller stacks (128KB)
-        // Used for running user processes
-        for i in config().reserved_threads..thread_limit() {
-            self.allocate_stack_for_slot(i, config().user_thread_stack_size);
+        #[cfg(kernel_profile_size)]
+        {
+            let sys_end = (1 + WARM_FREE_SYSTEM).min(config().reserved_threads);
+            for i in 1..sys_end {
+                assert!(
+                    self.allocate_stack_for_slot(i, config().system_thread_stack_size),
+                    "boot: failed to allocate warm system thread stack for slot {}", i
+                );
+            }
+            let user_start = config().reserved_threads;
+            let user_end = (user_start + WARM_FREE_USER).min(thread_limit());
+            for i in user_start..user_end {
+                assert!(
+                    self.allocate_stack_for_slot(i, config().user_thread_stack_size),
+                    "boot: failed to allocate warm user thread stack for slot {}", i
+                );
+            }
         }
 
         self.initialized = true;
@@ -1169,14 +1257,20 @@ impl ThreadPool {
     /// | Kernel stack     |  Rest of stack for normal kernel code
     /// |------------------| <- stack_base (lowest address)
     /// ```
-    fn allocate_stack_for_slot(&mut self, slot_idx: usize, size: usize) {
+    /// Allocate a PMM-backed stack for a slot. Returns `false` if the PMM has no
+    /// room (lazy callers release the slot and report ENOMEM; boot callers treat
+    /// it as fatal). Previously this `.expect()`-panicked — fine when only ever
+    /// called at boot, but lazy allocation can hit a genuinely exhausted PMM.
+    fn allocate_stack_for_slot(&mut self, slot_idx: usize, size: usize) -> bool {
         let page_size = 4096;
         let pages = (size + page_size - 1) / page_size;
         let alloc_size = pages * page_size;
 
         // Allocate contiguous physical pages from PMM (bypasses kernel heap)
-        let frame = (runtime().alloc_pages_contiguous_zeroed)(pages)
-            .expect("Failed to allocate thread stack from PMM");
+        let frame = match (runtime().alloc_pages_contiguous_zeroed)(pages) {
+            Some(f) => f,
+            None => return false,
+        };
         let stack_ptr = crate::mmu::phys_to_virt(frame.addr) as usize;
         let stack_info = StackInfo::new(stack_ptr, alloc_size);
 
@@ -1190,6 +1284,7 @@ impl ThreadPool {
         // Set exception stack top (top of the reserved 1KB area)
         // The exception stack is at the very top of the kernel stack
         self.slots[slot_idx].exception_stack_top = (stack_info.top & !0xF) as u64;
+        true
     }
 
     /// Free a PMM-backed stack for a specific slot.
@@ -1221,7 +1316,9 @@ impl ThreadPool {
         self.free_stack_for_slot(slot_idx);
 
         // Allocate new stack from PMM
-        self.allocate_stack_for_slot(slot_idx, new_size);
+        if !self.allocate_stack_for_slot(slot_idx, new_size) {
+            return Err("Failed to allocate thread stack from PMM");
+        }
 
         Ok(())
     }
@@ -2562,7 +2659,15 @@ where
         Some(idx) => idx,
         None => return Err("No free system thread slots"),
     };
-    
+
+    // Lazy stacks: ensure this slot has a stack (no-op if pre-allocated). On a
+    // genuinely exhausted PMM this fails — release the slot and report ENOMEM
+    // rather than running on a zero stack pointer.
+    if !ensure_slot_stack(slot_idx, config().system_thread_stack_size) {
+        THREAD_STATES[slot_idx].store(thread_state::FREE, Ordering::SeqCst);
+        return Err("Failed to allocate system thread stack from PMM");
+    }
+
     // Step 2: Box the closure (heap allocation - no lock held!)
     let boxed: Box<F> = Box::new(f);
     let closure_ptr = Box::into_raw(boxed) as *mut ();
@@ -2691,7 +2796,13 @@ where
         Some(idx) => idx,
         None => return Err("No free user thread slots"),
     };
-    
+
+    // Lazy stacks: ensure this slot has a stack (no-op if pre-allocated).
+    if !ensure_slot_stack(slot_idx, config().user_thread_stack_size) {
+        THREAD_STATES[slot_idx].store(thread_state::FREE, Ordering::SeqCst);
+        return Err("Failed to allocate user thread stack from PMM");
+    }
+
     // Step 2: Box the closure (heap allocation - no lock held!)
     let boxed: Box<F> = Box::new(f);
     let closure_ptr = Box::into_raw(boxed) as *mut ();

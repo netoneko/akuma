@@ -590,6 +590,41 @@ runtime `thread_limit ≤ MAX_THREADS` set before `threading::init`:
 
 `config::THREAD_LIMIT_OVERRIDE` (0 = auto) pins it for testing.
 
+### Lazy thread-stack allocation (size profile, 2026-06-04)
+
+`thread_limit` bounds how many slots *may* get a stack; it does **not** mean they're
+all allocated up front. On **release** they still are (pre-allocated at boot, guaranteed
+available, no per-spawn cost). On the **size profile** stacks are now lazy:
+
+- **init** pre-allocates only a *warm floor* of FREE stacks per class —
+  `WARM_FREE_SYSTEM = 1` + `WARM_FREE_USER = 1` (`crates/akuma-exec/src/threading/mod.rs`).
+- **`ensure_slot_stack`** allocates a slot's stack on `claim` if absent; on a genuinely
+  exhausted PMM the spawn fails cleanly (slot released, ENOMEM) instead of running on a
+  null stack. (No-op on release — all slots are pre-allocated.)
+- **`cleanup_terminated`** frees a recycled slot's stack back to the PMM *unless* that
+  would drop the class below its warm floor. Safe point: the thread has terminated and
+  cooled down, so it is no longer on its stack.
+
+Why: at 8 MB, `thread_limit = 14` reserved **1280 KB** of PMM for stacks while only ~3
+threads run at idle — ~1 MB sat idle. Lazy holds only `infra (2×128 KB) + warm floor
+(128 KB + 64 KB) ≈ 448 KB` at idle and rents the rest while in use.
+
+**Measured (size profile):**
+
+| | idle RAM free | notes |
+|---|---|---|
+| 8 MB, pre-alloc (before) | 2 / 8 MB | — |
+| 8 MB, lazy (after) | **3 / 8 MB** | **+1 MB at idle**; tcc still compiles+runs ×5; 34 spawn/recycle cycles, 0 canary faults, 0 spawn failures |
+| 6 MB, lazy | 1 / 6 MB | boots to usable SSH; tcc OOMs **gracefully** (process SIGSEGV, kernel survives) — 6 MB lacks room for tcc's ~1.5–2 MB working set |
+
+Release (64 MB) is unregressed: Memory + Threading boot tests pass, heap-reclaim
+self-test passes. **Trade-off:** a lazy spawn does a 128 KB-contiguous PMM alloc that can
+fail under fragmentation (mitigated by the warm floor for the common single-session/
+single-process path + the heap→PMM reclaim retry); `verify_stack_memory`'s boot-time
+"full pool fits" guarantee weakens to "fits if spawned now," and spawns return `Err`
+gracefully on failure. The lazy path is size-profile-only, so it's validated by live
+boots rather than the boot self-test suite (which is excluded on `size`).
+
 Stack pool for `N` total threads: `1.75 MB + (N − 8) × 128 KB`. Examples:
 
 | threads N | pool |
