@@ -19,7 +19,7 @@ Verified with `scripts/test_memory_split.py` + the small-RAM sweeps in `logs/`
 | 24 MB | yes | yes | **yes** | 5 / 4 / 15 / 40 | was **no** (ELF load OOM) before |
 | 16 MB | yes | yes | **yes** | 5 / 4 / 7 / 14 | was **no** (SSH rejected, "memory low") before |
 | 12 MB | yes | yes | **no** | 3 / 3 / 4 / 14 | OOM spawning the tcc process — new tcc floor is just above here |
-| **8 MB** | **yes** | **yes** | marginal | 4 / 1 / ~2.08 / 14 | **first time 8 MB compiles + runs hello.c** (June 2026); free now **2844 KB** at boot after the 944 KB image-reserve fix (was 2764 KB). **tcc is currently OOM-marginal at 8 MB** — a fresh-boot first-spawn `tcc hello.c` reports `memory full`; verified compiling+running at **≥ 16 MB**. **Known issues:** heap watermark not reclaimed after process exit → subsequent spawns may get 0 PMM pages; meow `run` tool spawn regression (see Open Issues section) |
+| **8 MB** | **yes** | **yes** | marginal | 4 / 1 / ~2.08 / 14 | **first time 8 MB compiles + runs hello.c** (June 2026); free now **2844 KB** at boot after the 944 KB image-reserve fix (was 2764 KB). **tcc is currently OOM-marginal at 8 MB** — a fresh-boot first-spawn `tcc hello.c` reports `memory full`; verified compiling+running at **≥ 16 MB**. **Known issues:** heap watermark not reclaimed after process exit → subsequent spawns may get 0 PMM pages (this is also what makes a *late* meow spawn fail — see Open Issues §2; a fresh-boot meow spawn of `/tmp/hello` succeeds, verified 2026-06-04) |
 
 So on the `size` profile after the fixes: **boot/usable-SSH floor ≤ 8 MB, tcc floor
 8 MB** (down from 48 MB). For reference, the **pre-fix** floors were boot 16 MB /
@@ -111,32 +111,43 @@ SIGSEGV. This makes the 8 MB tcc result non-repeatable without a reboot between 
 requires either a talc `unclaim` API or a custom trim pass. Workaround: reduce
 `TCP_RX_BUFFER_SIZE` / `TCP_TX_BUFFER_SIZE` further under `kernel_profile_size`.
 
-### 2. Process spawn regression — meow `run` tool fails to exec
+### 2. meow spawn — NOT a regression; it was the issue-#1 OOM (resolved 2026-06-04)
 
-After the 8 MB fixes, meow's `run` tool fails to spawn child processes:
+**Status: meow's Shell-tool spawn works at 8 MB (`size`) and 16 MB (`release`).**
+Verified 2026-06-04 with `meow -c "execute /tmp/hello"` against host Ollama
+(`qwen3-yolo:latest` at `10.0.2.2:11434`): the model emits a `Shell` tool call, meow's
+`tool_shell` (`userspace/meow/src/tools/shell.rs`) spawns the child via the **SPAWN
+syscall #301** (`spawn_process_with_channel_cwd`, *not* fork+`execve`), drains its stdout
+pipe, observes exit, and reports `Exit code: 0` / `Tool Status: Success`. Kernel PSTATS
+for the meow PID confirms the spawn succeeded:
 
 ```
-akuma:/> meow -c "run /tmp/hello"
-Failed to spawn '/tmp/hello' (not found?)
-akuma:/> /tmp/hello
-Hello, Akuma!
+[PSTATS] PID 3 (/bin/meow) ... nr301=1(4ms) ... nr303=20(0ms) ...
 ```
 
-The binary exists and executes fine when invoked directly from the shell. The regression
-is attributed to the `do_execve` path change in `src/syscall/proc.rs` for
-`kernel_profile_size`: the new code reads only 256 bytes for shebang detection and then
-unconditionally calls `replace_image_from_path`. When a forked child calls `execve` via
-meow's spawn machinery (which may differ from a plain shell fork), the ELF loader path
-appears to fail and returns an error that meow surfaces as "not found?".
+`nr301` = SPAWN #301 (one call, 4 ms, no `ENOMEM`); `nr303` = the child-stdout drain
+reads. Output captured at 8 MB (size profile): `hello (1/10) … (10/10) … Exit code: 0`.
 
-**Suspected root cause:** either `replace_image_from_path` fails for TCC-compiled static
-binaries in the child context (address space state after fork + low PMM), or the error
-path returns the wrong errno and meow maps ENOEXEC/ENOMEM to "not found?". Could also
-be an OOM fork failure masked by a generic error message. Needs a kernel log capture
-from the failing spawn to distinguish.
+**The earlier "Failed to spawn '…' (not found?)" was issue #1, not a `do_execve`
+regression.** meow's Shell tool does **not** go through `do_execve` — it uses SPAWN #301,
+which calls `spawn_process_with_channel_cwd` directly. The "not found?" message is what
+`tool_shell` prints whenever `libakuma::spawn()` returns `None`, and `spawn()` returns
+`None` for **any** negative syscall result — including `ENOMEM` (`src/syscall/proc.rs::
+sys_spawn` returns `ENOMEM` when the spawn fails for lack of PMM pages). So the prior
+failure was a low-PMM spawn after the heap watermark had eaten the free pool (issue #1
+above), surfaced through a generic error string — not the demand-paged ELF loader. On a
+reasonably-fresh boot with PMM available, the spawn succeeds.
 
-**Not yet fixed.** The regression is in `src/syscall/proc.rs::do_execve` under
-`#[cfg(kernel_profile_size)]`.
+**Caveat:** this is still gated by issue #1. After enough socket/heap churn (e.g. several
+meow LLM round-trips on an 8 MB box) the PMM pool can drop low enough that a *subsequent*
+SPAWN returns `ENOMEM` and meow again prints "not found?". The fix is the issue-#1
+PMM-reclaim work, not anything in the spawn/exec path.
+
+**Note on the release profile at 8 MB:** `--release` does not boot at 8 MB at all — the
+3 MB image reserve makes `code+stack` 7 MB, leaving **0 user pages**, so the layout guard
+in `src/main.rs` halts with `FATAL: kernel memory layout invalid`. For ≤ 8 MB build the
+`size` profile (`scripts/build_size.sh`); release's boot floor is higher (see the
+boot-floor tables above).
 
 Two things were originally hardcoded for "≥ 256 MB machines" and made to scale (the
 earlier change that got the kernel *booting* across the range):
