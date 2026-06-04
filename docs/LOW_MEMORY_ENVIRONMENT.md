@@ -21,8 +21,17 @@ Verified with `scripts/test_memory_split.py` + the small-RAM sweeps in `logs/`
 | 12 MB | yes | yes | **yes** | 3 / 3 / 4 / 14 | now fits (no whole-binary slurp) |
 | **8 MB** | **yes** | **yes** | **yes (repeatable)** | 4 / 1 / ~2.08 / 14 | **`tcc hello.c -o /tmp/h && /tmp/h` compiles + runs repeatedly** (6 cycles verified, 2026-06-04). Earlier "marginal / `memory full`" was the dormant-cfg slurp bug (akuma-exec had no build.rs → `HEAP_SLURP_MAX` was 1 MiB, so the 723 KB tcc binary was slurped whole). Fixed by `crates/akuma-exec/build.rs` + heap→PMM reclaim — see *`tcc hello.c` now runs repeatedly at 8 MB* below |
 
-So on the `size` profile after the fixes: **boot/usable-SSH floor ≤ 8 MB, tcc floor
-8 MB** (down from 48 MB). For reference, the **pre-fix** floors were boot 16 MB /
+So on the `size` profile after the fixes: **boot/usable-SSH floor 6 MB, tcc floor
+8 MB** (tcc down from 48 MB). Probed 2026-06-04: 6 MB and 7 MB both boot to a usable
+SSH, but **tcc needs 8 MB** — at 7 MB user pages are only ~1 MB, below tcc's ~1.5–2 MB
+working set, so a clean compile SIGSEGVs (`anon alloc failed, 0 free pages`). 5 MB does
+not boot (the layout guard trips with 0 user pages). Pushing tcc below 8 MB would mean
+clawing user pages out of the fixed ~4.92 MB `code+stack` reserve (1 MB heap seed / 1 MB
+boot-stack guard / 2 MB pre-kernel region) — a layout change, not a loader one.
+
+> Gotcha while probing: `/tmp` is **ext2-backed and persists across reboots**, so a
+> `/tmp/h` left by a successful higher-RAM run masks a failed low-RAM compile (the old
+> binary still runs `Hello, Akuma!`). Always `rm /tmp/h` before testing a new floor. For reference, the **pre-fix** floors were boot 16 MB /
 usable-SSH 24 MB / tcc 48 MB, with `code+stack` a flat **11 MB** at every size.
 (`tcc -run` is separately broken at *all* sizes — `runmain.o not found`, a TCC
 runtime-install issue, not RAM; use `tcc … -o out` then exec `out`.) On the `release`
