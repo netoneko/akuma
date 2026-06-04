@@ -18,6 +18,6 @@ pkg install tcc tar libc
 ```bash
 # compile neatvi
 
-tcc -I/src/github.com/neatvi /src/github.com/neatvi/cmd.c /src/github.com/neatvi/conf.c /src/github.com/neatvi/dir.c /src/github.com/neatvi/ex.c /src/github.com/neatvi/lbuf.c /src/github.com/neatvi/led.c /src/github.com/neatvi/mot.c /src/github.com/neatvi/reg.c /src/github.com/neatvi/regex.c /src/github.com/neatvi/ren.c /src/github.com/neatvi/rset.c /src/github.com/neatvi/rstr.c /src/github.com/neatvi/sbuf.c /src/github.com/neatvi/syn.c /src/github.com/neatvi/tag.c /src/github.com/neatvi/term.c /src/github.com/neatvi/uc.c /src/github.com/neatvi/vi.c -o /bin/vi
+tcc -I/neatvi /neatvi/cmd.c /neatvi/conf.c /neatvi/dir.c /neatvi/ex.c /neatvi/lbuf.c /neatvi/led.c /neatvi/mot.c /neatvi/reg.c /neatvi/regex.c /neatvi/ren.c /neatvi/rset.c /neatvi/rstr.c /neatvi/sbuf.c /neatvi/syn.c /neatvi/tag.c /neatvi/term.c /neatvi/uc.c /neatvi/vi.c -o /bin/vi
 ```
 

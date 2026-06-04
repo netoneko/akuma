@@ -19,7 +19,7 @@ Verified with `scripts/test_memory_split.py` + the small-RAM sweeps in `logs/`
 | 24 MB | yes | yes | **yes** | 5 / 4 / 15 / 40 | was **no** (ELF load OOM) before |
 | 16 MB | yes | yes | **yes** | 5 / 4 / 7 / 14 | was **no** (SSH rejected, "memory low") before |
 | 12 MB | yes | yes | **no** | 3 / 3 / 4 / 14 | OOM spawning the tcc process — new tcc floor is just above here |
-| **8 MB** | **yes** | **yes** | **yes** | 5 / 1 / 2 / 14 | **first time 8 MB compiles + runs hello.c** (June 2026); 2764 KB free at boot; linker OOMs but still produces output |
+| **8 MB** | **yes** | **yes** | **yes** | 5 / 1 / 2 / 14 | **first time 8 MB compiles + runs hello.c** (June 2026); 2764 KB free at boot; linker OOMs but still produces output. **Known issues:** heap watermark not reclaimed after process exit → subsequent spawns may get 0 PMM pages; meow `run` tool spawn regression (see Open Issues section) |
 
 So on the `size` profile after the fixes: **boot/usable-SSH floor ≤ 8 MB, tcc floor
 8 MB** (down from 48 MB). For reference, the **pre-fix** floors were boot 16 MB /
@@ -79,6 +79,63 @@ more large allocations that each individually exceeded the 1 MB heap seed:
 /tmp/hello` prints `Hello, Akuma!` at 8 MB. The linker subprocess still OOMs during
 the link step (heap fills to ~1.3 MB via `PmmOomHandler`) but produces the output
 binary before dying — a separate issue from spawning and running tcc itself.
+
+## Open issues at 8 MB (June 2026)
+
+### 1. Kernel heap watermark — memory not reclaimed after process exit
+
+After a process exits, PMM free pages recover only partially. Observed in `neatvi1.log`:
+
+```
+t=89s  (before meow):   RAM: 2/8MB free | Heap: 813 KB
+t=92s  (meow starts):   RAM: 1/8MB free | Heap: 865 KB
+t=110s (during meow):   RAM: 0/8MB free | Heap: 1686 KB
+t=200s (meow exits):    RAM: 1/8MB free | Heap: 1699 KB   ← only 1 MB back, not 2
+```
+
+**Root cause: `PmmOomHandler` growth is one-way.** Meow made 8 TCP connections to
+Ollama (10.0.2.2:11434). Each TCP socket carries a 16 KB RX + 16 KB TX buffer
+allocated on the kernel heap. When the heap ran short, `PmmOomHandler` consumed PMM
+pages to expand the talc arena. After meow exits and fds close, the socket buffers are
+freed back to talc, but talc never returns pages to PMM — so the ~1 MB consumed
+during the session stays permanently in the heap pool. This is the same high-watermark
+behaviour that any allocation peak leaves behind.
+
+**Consequence at 8 MB:** after one meow session, the free PMM pool drops from ~512 to
+~256 pages and stays there. A subsequent `tcc` spawn (observed in the same log at
+t=212s, pid=3) gets `0 free pages` on its first anonymous page fault and is killed with
+SIGSEGV. This makes the 8 MB tcc result non-repeatable without a reboot between runs.
+
+**No fix yet.** Heap shrinking (returning free talc pages to PMM) is the correct fix but
+requires either a talc `unclaim` API or a custom trim pass. Workaround: reduce
+`TCP_RX_BUFFER_SIZE` / `TCP_TX_BUFFER_SIZE` further under `kernel_profile_size`.
+
+### 2. Process spawn regression — meow `run` tool fails to exec
+
+After the 8 MB fixes, meow's `run` tool fails to spawn child processes:
+
+```
+akuma:/> meow -c "run /tmp/hello"
+Failed to spawn '/tmp/hello' (not found?)
+akuma:/> /tmp/hello
+Hello, Akuma!
+```
+
+The binary exists and executes fine when invoked directly from the shell. The regression
+is attributed to the `do_execve` path change in `src/syscall/proc.rs` for
+`kernel_profile_size`: the new code reads only 256 bytes for shebang detection and then
+unconditionally calls `replace_image_from_path`. When a forked child calls `execve` via
+meow's spawn machinery (which may differ from a plain shell fork), the ELF loader path
+appears to fail and returns an error that meow surfaces as "not found?".
+
+**Suspected root cause:** either `replace_image_from_path` fails for TCC-compiled static
+binaries in the child context (address space state after fork + low PMM), or the error
+path returns the wrong errno and meow maps ENOEXEC/ENOMEM to "not found?". Could also
+be an OOM fork failure masked by a generic error message. Needs a kernel log capture
+from the failing spawn to distinguish.
+
+**Not yet fixed.** The regression is in `src/syscall/proc.rs::do_execve` under
+`#[cfg(kernel_profile_size)]`.
 
 Two things were originally hardcoded for "≥ 256 MB machines" and made to scale (the
 earlier change that got the kernel *booting* across the range):
