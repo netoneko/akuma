@@ -910,6 +910,42 @@ impl<'a> HttpStreamTls<'a> {
         Ok(())
     }
 
+    /// POST with the body streamed from an already-open file descriptor.
+    ///
+    /// `body_fd` must be positioned at the start of the body and `content_length`
+    /// must equal the number of body bytes available from it. The body is read
+    /// and written in fixed-size chunks so the full request is never held in
+    /// memory at once — the caller only ever needs the file on disk.
+    pub fn post_from_fd(
+        &mut self,
+        host: &str,
+        path: &str,
+        content_length: usize,
+        body_fd: i32,
+        headers: &HttpHeaders,
+    ) -> Result<(), Error> {
+        let header = format!(
+            "POST {} HTTP/1.0\r\n\
+             Host: {}\r\n\
+             {}Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            path, host, headers.format(), content_length
+        );
+        self.tls.write_all(header.as_bytes())?;
+
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = libakuma::read_fd(body_fd, &mut buf);
+            if n <= 0 {
+                break;
+            }
+            self.tls.write_all(&buf[..n as usize])?;
+        }
+        self.tls.flush()?;
+        Ok(())
+    }
+
     /// Read the next chunk of data
     pub fn read_chunk(&mut self) -> StreamResult {
         let mut buf = [0u8; 4096];
