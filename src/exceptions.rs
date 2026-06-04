@@ -630,12 +630,10 @@ pub fn init_exception_stack() {
     // relocated — see docs/LOW_MEMORY_ENVIRONMENT.md "Known bug".
     //   size profile (IMAGE_SIZE=1MB):    0x40200000 + 0x100000 + 0x100000 = 0x40400000
     //   release profile (IMAGE_SIZE=3MB): 0x40200000 + 0x300000 + 0x100000 = 0x40600000
-    #[cfg(all(not(feature = "firecracker"), kernel_profile_size))]
+    #[cfg(kernel_profile_size)]
     let boot_stack_top = 0x4040_0000u64;
-    #[cfg(all(not(feature = "firecracker"), not(kernel_profile_size)))]
+    #[cfg(not(kernel_profile_size))]
     let boot_stack_top = 0x4060_0000u64;
-    #[cfg(feature = "firecracker")]
-    let boot_stack_top = 0x8080_0000u64;
     set_current_exception_stack(boot_stack_top);
 }
 

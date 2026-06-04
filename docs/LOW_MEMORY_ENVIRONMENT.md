@@ -215,7 +215,7 @@ hazard from both profiles.
   heap.
 - `exceptions.rs::init_exception_stack` had the **same** stale `0x40800000` for the
   boot thread's early exception stack; it's now profile-aware
-  (size `0x40400000` / release `0x40600000` / firecracker `0x80800000`), so an early
+  (size `0x40400000` / release `0x40600000`), so an early
   exception can't scribble into the heap either.
 
 **Verification.** `release` now boots to SSH at 16/24/32 MB (was: hang at all of them);
@@ -409,8 +409,23 @@ OOM kill but without a dedicated OOM handler — the kernel just signals the pro
 |----------|--------------|-----------|
 | boot + SSH | 16 MB | 12 MB |
 | `tcc hello.c -o /tmp/h && /tmp/h` | 32 MB | 16 MB |
+| `tcc` multi-file C project (neatvi, 18 files) | — | **16 MB** (verified June 2026) |
 | `apk search busybox` | 80 MB | 80 MB |
 | `apk add busybox` | 80 MB | 80 MB (reliable: 96 MB) |
+
+**neatvi compiled from source at 16 MB** (size profile, June 2026).
+Source: https://github.com/aligrudi/neatvi (cloned to `/neatvi`):
+
+```
+tcc -I/neatvi /neatvi/cmd.c /neatvi/conf.c /neatvi/dir.c /neatvi/ex.c \
+    /neatvi/lbuf.c /neatvi/led.c /neatvi/mot.c /neatvi/reg.c \
+    /neatvi/regex.c /neatvi/ren.c /neatvi/rset.c /neatvi/rstr.c \
+    /neatvi/sbuf.c /neatvi/syn.c /neatvi/tag.c /neatvi/term.c \
+    /neatvi/uc.c /neatvi/vi.c -o /bin/vi
+```
+
+This is the first verified multi-file C compilation on Akuma — 18 translation units
+compiled and linked in a single tcc invocation at 16 MB.
 
 ## The three regions
 
@@ -513,12 +528,14 @@ cargo run --profile size --features no-tests -Z build-std=core,alloc  # to run i
 | `cargo build --release` baseline | 3.6 MB |
 | `[profile.size]` + `no-tests` feature (gate all `*_tests` modules) | 1.1 MB |
 | `-Z build-std=core,alloc`, `panic = "immediate-abort"`, remove smoltcp `log` | 1.0 MB |
-| `no-tests` activates `akuma-net/small-sockets` (MAX_SOCKETS 256→32) | **948 KB** |
+| `no-tests` activates `akuma-net/small-sockets` (MAX_SOCKETS 256→32) | 948 KB |
+| `--no-default-features` drops the `neko` editor (gate `dep:akuma-editor`) | **940 KB** |
 
 **What each layer does:**
 
 - **`[profile.size]`** — `opt-level = "z"`, `lto = true`, `codegen-units = 1`, `strip = "symbols"`, `panic = "immediate-abort"`. The last flag converts every panic site into a single `udf` instruction, eliminating the panic formatting infrastructure.
 - **`no-tests` feature** — gates all `*_tests` modules and their test-only exported symbols out of the binary entirely (not just skipped at runtime). Also activates `akuma-net/small-sockets`.
+- **`neko` feature** (default-on; `dep:akuma-editor`) — the in-kernel `neko` text editor. `scripts/build_size.sh` passes `--no-default-features` so the size profile drops it: `akuma-editor` is no longer linked, removing **8,140 bytes of `.text`** (971,160 → 962,968 bytes total; `.data`/`.bss` unchanged, since neko allocates its line buffers on the heap only while running). Release builds keep neko via the default feature.
 - **`-Z build-std=core,alloc`** (nightly) — rebuilds `core` and `alloc` with `opt-level = "z"` instead of the precompiled defaults.
 - **`akuma-net/small-sockets`** — reduces `MAX_SOCKETS` from 256 to 32. Each socket slot is a 464-byte static `SocketStorage` entry; 256 of them occupied 116 KB of the binary's `.data` section regardless of how many sockets are actually open at runtime.
 

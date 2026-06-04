@@ -59,14 +59,17 @@ strip = "symbols"
 panic = "immediate-abort"
 
 [features]
-firecracker = []
+default = ["neko"]
 no-tests = ["akuma-net/small-sockets"]
+# In-kernel `neko` text editor. Enabled by default; the size profile drops it
+# via `--no-default-features` in scripts/build_size.sh.
+neko = ["dep:akuma-editor"]
 
 [lints]
 workspace = true
 
 [dependencies]
-akuma-editor = { path = "crates/akuma-editor" }
+akuma-editor = { path = "crates/akuma-editor", optional = true }
 akuma-terminal = { path = "crates/akuma-terminal" }
 akuma-ssh-crypto = { path = "crates/akuma-ssh-crypto" }
 akuma-ssh = { path = "crates/akuma-ssh" }

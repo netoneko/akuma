@@ -18,6 +18,7 @@ mod config;
 mod console;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod daif_tests;
+#[cfg(feature = "neko")]
 mod editor;
 // mod embassy_net_driver;
 // mod embassy_time_driver; // replaced by kernel_timer
@@ -146,7 +147,6 @@ pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
 ///
 /// When using ARM64 Image header boot, the kernel is at 0x40200000 and
 /// QEMU places DTB in the first 2MB at 0x40000000.
-#[cfg(not(feature = "firecracker"))]
 fn scan_for_dtb() -> usize {
     const FDT_MAGIC_LE: u32 = 0xedfe0dd0; // big-endian 0xd00dfeed read as little-endian
 
@@ -173,22 +173,15 @@ fn scan_for_dtb() -> usize {
 
 /// Detect memory from Device Tree Blob.
 ///
-/// Firecracker passes the FDT address in x0 per the ARM64 boot protocol.
 /// QEMU does NOT set x0 for ELF kernels, so we scan RAM for the
 /// QEMU-generated DTB when x0 is zero.
 fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
-    #[cfg(not(feature = "firecracker"))]
     const DEFAULT_RAM_BASE: usize = 0x4000_0000; // QEMU virt: 1 GB
-    #[cfg(feature = "firecracker")]
-    const DEFAULT_RAM_BASE: usize = 0x8000_0000; // Firecracker: 2 GB
 
     const DEFAULT_RAM_SIZE: usize = 256 * 1024 * 1024;
     const DTB_RESERVE: usize = 2 * 1024 * 1024; // 2 MB
 
-    #[cfg(not(feature = "firecracker"))]
     let actual_dtb_ptr = if dtb_ptr != 0 { dtb_ptr } else { scan_for_dtb() };
-    #[cfg(feature = "firecracker")]
-    let actual_dtb_ptr = dtb_ptr;
 
     if actual_dtb_ptr == 0 {
         console::print("[Memory] No DTB found, using default 256MB\n");
@@ -319,18 +312,13 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     //
     // QEMU virt loads flat binary with ARM64 Image header at RAM_BASE + 2MB
     // (0x40200000). The first 2MB (0x40000000-0x401FFFFF) contains DTB.
-    #[cfg(not(feature = "firecracker"))]
     const KERNEL_BASE: usize = 0x4020_0000;
-    #[cfg(feature = "firecracker")]
-    const KERNEL_BASE: usize = 0x8000_0000;
 
     // STACK_BOTTOM = KERNEL_PHYS_LOAD + IMAGE_SIZE (matches boot.rs + build.rs)
-    #[cfg(all(not(feature = "firecracker"), kernel_profile_size))]
+    #[cfg(kernel_profile_size)]
     const STACK_BOTTOM: usize = 0x4030_0000; // 0x40200000 + 0x100000
-    #[cfg(all(not(feature = "firecracker"), not(kernel_profile_size)))]
+    #[cfg(not(kernel_profile_size))]
     const STACK_BOTTOM: usize = 0x4050_0000; // 0x40200000 + 0x300000
-    #[cfg(feature = "firecracker")]
-    const STACK_BOTTOM: usize = 0x8070_0000;
 
     unsafe extern "C" {
         static _kernel_phys_end: u8;
@@ -524,7 +512,6 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // (0x40200000).  The first 2 MB — firmware reservation / QEMU DTB area — is
     // fully consumed by detect_memory() before PMM init and is safe to give back.
     // This hands ~512 pages (2 MB) back to the user-page pool at zero cost.
-    #[cfg(not(feature = "firecracker"))]
     {
         const KERNEL_IMAGE_OFFSET: usize = 0x20_0000; // 2 MB text_offset
         let pages = KERNEL_IMAGE_OFFSET / 4096;

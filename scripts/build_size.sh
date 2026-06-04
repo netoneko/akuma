@@ -2,6 +2,7 @@
 set -e
 cargo +nightly build \
     --profile size \
+    --no-default-features \
     --features no-tests \
     -Z build-std=core,alloc \
     "$@"

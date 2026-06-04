@@ -322,6 +322,7 @@ impl crate::shell::InteractiveRead for SshChannelStream<'_> {
     }
 }
 
+#[cfg(feature = "neko")]
 impl crate::editor::TermSizeProvider for SshChannelStream<'_> {
     fn get_term_size(&self) -> crate::editor::TermSize {
         crate::editor::TermSize::new(self.session.term_width, self.session.term_height)
@@ -606,6 +607,7 @@ async fn run_shell_session(
                                             }
                                             history_index = history.len();
 
+                                            #[cfg(feature = "neko")]
                                             if trimmed == b"neko" || trimmed.starts_with(b"neko ") {
                                                 let filepath = if trimmed.len() > 5 {
                                                     let path_bytes = trim_bytes(&trimmed[5..]);

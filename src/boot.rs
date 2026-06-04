@@ -12,13 +12,8 @@
 
 use core::arch::global_asm;
 
-// Physical base address differs between hypervisors:
-//   QEMU virt:   0x40000000 (1 GB)
-//   Firecracker: 0x80000000 (2 GB)
-#[cfg(not(feature = "firecracker"))]
+// Physical base address of RAM on QEMU virt (1 GB).
 const PHYS_BASE: usize = 0x4000_0000;
-#[cfg(feature = "firecracker")]
-const PHYS_BASE: usize = 0x8000_0000;
 
 // Reserved image size declared in the ARM64 Image header.
 // QEMU uses this to know where it's safe to place the DTB.
@@ -29,10 +24,7 @@ const IMAGE_SIZE: usize = 0x10_0000; // 1 MB
 const IMAGE_SIZE: usize = 0x30_0000; // 3 MB
 
 // Physical address where QEMU loads the kernel binary (PHYS_BASE + 2 MB).
-#[cfg(not(feature = "firecracker"))]
 const KERNEL_PHYS_LOAD: usize = 0x4020_0000;
-#[cfg(feature = "firecracker")]
-const KERNEL_PHYS_LOAD: usize = 0x8020_0000;
 
 const BOOT_STACK_SIZE: usize = 0x10_0000; // 1 MB boot stack
 
