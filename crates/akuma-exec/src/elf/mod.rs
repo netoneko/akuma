@@ -242,9 +242,14 @@ pub fn load_elf(elf_data: &[u8], interp_prefix: Option<&str>) -> Result<LoadedEl
         if DEBUG_ELF_LOADING {
             log::debug!("[ELF] Loading interpreter: {}", resolved_interp);
         }
-        let interp_data = (runtime().read_file)(&resolved_interp)
-            .map_err(|_| ElfError::InvalidFormat("Cannot read interpreter"))?;
-        let interp_info = load_interpreter(&interp_data, &mut address_space)?;
+        #[cfg(kernel_profile_size)]
+        let interp_info = load_interpreter_from_path(&resolved_interp, &mut address_space)?;
+        #[cfg(not(kernel_profile_size))]
+        let interp_info = {
+            let interp_data = (runtime().read_file)(&resolved_interp)
+                .map_err(|_| ElfError::InvalidFormat("Cannot read interpreter"))?;
+            load_interpreter(&interp_data, &mut address_space)?
+        };
         if DEBUG_ELF_LOADING {
             log::debug!("[ELF] Interpreter loaded at base=0x{:x} entry=0x{:x}",
                 interp_info.base_addr, interp_info.entry_point);
@@ -399,6 +404,164 @@ fn load_interpreter(elf_data: &[u8], address_space: &mut UserAddressSpace) -> Re
 
     if DEBUG_ELF_LOADING {
         log::debug!("[ELF] Interpreter: entry=0x{:x} pages={}", entry_point, mapped_pages.len());
+    }
+
+    Ok(InterpInfo { entry_point, base_addr: base })
+}
+
+/// Load the dynamic linker (interpreter) ELF page-by-page from a file path,
+/// without buffering the entire binary in the kernel heap.
+///
+/// On the `size` profile the heap seed is only 1 MB. Slurping a ~600 KB
+/// interpreter into the heap exhausts the seed before PmmOomHandler can grow
+/// it, leaving no room for the process being spawned. This variant reads each
+/// PT_LOAD page with a single `read_at` call (4 KB scratch buffer, immediately
+/// freed), keeping peak heap use under 10 KB regardless of interpreter size.
+#[cfg(kernel_profile_size)]
+fn load_interpreter_from_path(path: &str, address_space: &mut UserAddressSpace) -> Result<InterpInfo, ElfError> {
+    let hdr_buf = file_read_exact(path, 0, ELF64_EHDR_SIZE)?;
+    let ehdr = parse_elf64_ehdr_checked(&hdr_buf)?;
+
+    if ehdr.e_machine != EM_AARCH64 {
+        return Err(ElfError::WrongArchitecture);
+    }
+
+    // Section header fields not in Elf64Ehdr (ELF64 header offsets per spec)
+    let e_shoff     = read_u64_le(&hdr_buf, 40) as usize;
+    let e_shentsize = read_u16_le(&hdr_buf, 58) as usize;
+    let e_shnum     = read_u16_le(&hdr_buf, 60) as usize;
+
+    let base = INTERP_BASE;
+    let entry_point = base + ehdr.e_entry as usize;
+
+    let phdr_buf = file_read_exact(path, ehdr.e_phoff as usize,
+        ehdr.e_phnum as usize * ehdr.e_phentsize as usize)?;
+
+    let mut mapped_pages: BTreeMap<usize, usize> = BTreeMap::new();
+
+    for i in 0..ehdr.e_phnum as usize {
+        let phdr = match parse_elf64_phdr(&phdr_buf[i * ehdr.e_phentsize as usize..]) {
+            Some(p) => p,
+            None => continue,
+        };
+        if phdr.p_type != PT_LOAD { continue; }
+
+        let vaddr   = base + phdr.p_vaddr as usize;
+        let memsz   = phdr.p_memsz as usize;
+        let filesz  = phdr.p_filesz as usize;
+        let foffset = phdr.p_offset as usize;
+        let flags   = phdr.p_flags;
+
+        let page_flags = if (flags & PF_X) != 0 { user_flags::RX } else { user_flags::RW_NO_EXEC };
+
+        let start_page = vaddr & !(PAGE_SIZE - 1);
+        let end_page   = (vaddr + memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let num_pages  = (end_page - start_page) / PAGE_SIZE;
+
+        for page_i in 0..num_pages {
+            let page_va = start_page + page_i * PAGE_SIZE;
+
+            let frame_addr = if let Some(&pa) = mapped_pages.get(&page_va) {
+                pa
+            } else {
+                let frame = address_space
+                    .alloc_and_map(page_va, page_flags)
+                    .map_err(|e| ElfError::MappingFailed(e))?;
+                mapped_pages.insert(page_va, frame.addr);
+                frame.addr
+            };
+
+            // Offset of this page's start within the segment
+            let page_seg_offset = if page_va >= vaddr { page_va - vaddr } else { 0 };
+
+            if page_seg_offset < filesz {
+                // Byte within the page where the file data begins
+                let page_data_start = if page_va < vaddr { vaddr - page_va } else { 0 };
+                let copy_len = core::cmp::min(
+                    PAGE_SIZE - page_data_start,
+                    filesz.saturating_sub(page_seg_offset),
+                );
+                if copy_len > 0 {
+                    // Small scratch buffer: allocated here, freed at end of block
+                    let chunk = file_read_exact(path, foffset + page_seg_offset, copy_len)?;
+                    unsafe {
+                        let dst = crate::mmu::phys_to_virt(frame_addr + page_data_start);
+                        core::ptr::copy_nonoverlapping(chunk.as_ptr(), dst, copy_len);
+                    }
+                }
+            }
+        }
+    }
+
+    // Apply relocations from SHT_RELA sections (same logic as load_interpreter)
+    if e_shnum > 0 && e_shentsize >= 64 {
+        let shdr_buf = file_read_exact(path, e_shoff, e_shnum * e_shentsize)?;
+
+        // Locate DYNSYM first (needed for GLOB_DAT / JUMP_SLOT symbol lookup)
+        let mut dynsym_data: Option<Vec<u8>> = None;
+        for i in 0..e_shnum {
+            let soff = i * e_shentsize;
+            if soff + 64 > shdr_buf.len() { break; }
+            if read_u32_le(&shdr_buf, soff + 4) == elf::abi::SHT_DYNSYM {
+                let sh_offset = read_u64_le(&shdr_buf, soff + 24) as usize;
+                let sh_size   = read_u64_le(&shdr_buf, soff + 32) as usize;
+                dynsym_data = file_read_exact(path, sh_offset, sh_size).ok();
+                break;
+            }
+        }
+
+        for i in 0..e_shnum {
+            let soff = i * e_shentsize;
+            if soff + 64 > shdr_buf.len() { break; }
+            if read_u32_le(&shdr_buf, soff + 4) != elf::abi::SHT_RELA { continue; }
+
+            let sh_offset = read_u64_le(&shdr_buf, soff + 24) as usize;
+            let sh_size   = read_u64_le(&shdr_buf, soff + 32) as usize;
+            let rela_buf  = file_read_exact(path, sh_offset, sh_size)?;
+            let n_relas   = sh_size / 24; // sizeof(Rela64) = 24
+
+            for j in 0..n_relas {
+                let roff = j * 24;
+                if roff + 24 > rela_buf.len() { break; }
+
+                let r_offset = read_u64_le(&rela_buf, roff)      as usize;
+                let r_info   = read_u64_le(&rela_buf, roff + 8);
+                // r_addend is signed; cast through i64 so negative addends wrap correctly
+                let r_addend = read_u64_le(&rela_buf, roff + 16) as i64 as isize as usize;
+                let r_type   = (r_info & 0xffff_ffff) as u32;
+                let sym_idx  = (r_info >> 32) as usize;
+
+                let vaddr   = base + r_offset;
+                let page_va = vaddr & !(PAGE_SIZE - 1);
+
+                if let Some(&pa) = mapped_pages.get(&page_va) {
+                    let ptr = unsafe {
+                        crate::mmu::phys_to_virt(pa + (vaddr & (PAGE_SIZE - 1))) as *mut usize
+                    };
+                    match r_type {
+                        R_AARCH64_RELATIVE => unsafe { *ptr = base + r_addend },
+                        R_AARCH64_GLOB_DAT | R_AARCH64_JUMP_SLOT | R_AARCH64_ABS64 => {
+                            if sym_idx != 0 {
+                                if let Some(ref syms) = dynsym_data {
+                                    let sym_off = sym_idx * 24; // sizeof(Elf64Sym)
+                                    if sym_off + 24 <= syms.len() {
+                                        let st_value = read_u64_le(syms, sym_off + 8) as usize;
+                                        unsafe { *ptr = base + st_value + r_addend; }
+                                    }
+                                }
+                            } else if r_type == R_AARCH64_ABS64 {
+                                unsafe { *ptr = base + r_addend; }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    if DEBUG_ELF_LOADING {
+        log::debug!("[ELF] Interpreter (path): entry=0x{:x} pages={}", entry_point, mapped_pages.len());
     }
 
     Ok(InterpInfo { entry_point, base_addr: base })
@@ -866,9 +1029,14 @@ pub fn load_elf_from_path(path: &str, file_size: usize, interp_prefix: Option<&s
         if DEBUG_ELF_LOADING {
             log::debug!("[ELF] Loading interpreter: {}", resolved_interp);
         }
-        let interp_data = (runtime().read_file)(&resolved_interp)
-            .map_err(|_| ElfError::InvalidFormat("Cannot read interpreter"))?;
-        let interp_info = load_interpreter(&interp_data, &mut address_space)?;
+        #[cfg(kernel_profile_size)]
+        let interp_info = load_interpreter_from_path(&resolved_interp, &mut address_space)?;
+        #[cfg(not(kernel_profile_size))]
+        let interp_info = {
+            let interp_data = (runtime().read_file)(&resolved_interp)
+                .map_err(|_| ElfError::InvalidFormat("Cannot read interpreter"))?;
+            load_interpreter(&interp_data, &mut address_space)?
+        };
         if DEBUG_ELF_LOADING {
             log::debug!("[ELF] Interpreter loaded at base=0x{:x} entry=0x{:x}",
                 interp_info.base_addr, interp_info.entry_point);

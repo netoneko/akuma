@@ -561,6 +561,23 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 }
 
 pub(crate) fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 {
+    // On the size profile the heap seed is 1 MB. Reading a large binary
+    // (e.g. the 700+ KB system linker that tcc invokes) would exhaust it.
+    // Read just the first 256 bytes — enough for shebang detection — and
+    // use the path-based loader for the actual ELF.
+    #[cfg(kernel_profile_size)]
+    let file_data: Option<alloc::vec::Vec<u8>> = {
+        let mut head = alloc::vec![0u8; 256];
+        match crate::fs::read_at(&resolved_path, 0, &mut head) {
+            Ok(n) => { head.truncate(n); Some(head) }
+            Err(crate::vfs::FsError::Internal) => None,
+            Err(e) => {
+                crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
+                return super::fs::fs_error_to_errno(e);
+            }
+        }
+    };
+    #[cfg(not(kernel_profile_size))]
     let file_data = match crate::fs::read_file(&resolved_path) {
         Ok(data) => Some(data),
         Err(crate::vfs::FsError::Internal) => None,
@@ -580,6 +597,11 @@ pub(crate) fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<Strin
         Some(p) => p,
         None => return ESRCH,
     };
+
+    // On the size profile file_data only holds the 256-byte shebang probe —
+    // always use replace_image_from_path for the actual ELF load.
+    #[cfg(kernel_profile_size)]
+    let file_data: Option<alloc::vec::Vec<u8>> = None;
 
     let replace_result = if let Some(ref data) = file_data {
         proc.replace_image(data, &args, &env)

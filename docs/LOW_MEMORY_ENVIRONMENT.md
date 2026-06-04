@@ -19,18 +19,14 @@ Verified with `scripts/test_memory_split.py` + the small-RAM sweeps in `logs/`
 | 24 MB | yes | yes | **yes** | 5 / 4 / 15 / 40 | was **no** (ELF load OOM) before |
 | 16 MB | yes | yes | **yes** | 5 / 4 / 7 / 14 | was **no** (SSH rejected, "memory low") before |
 | 12 MB | yes | yes | **no** | 3 / 3 / 4 / 14 | OOM spawning the tcc process — new tcc floor is just above here |
-| **8 MB** | **yes** | **yes** | **no** | 5 / 1 / 2 / 14 | **first time 8 MB boots to SSH** (June 2026, PmmOomHandler); 716 KB free, tcc ELF alone is 723 KB |
+| **8 MB** | **yes** | **yes** | **yes** | 5 / 1 / 2 / 14 | **first time 8 MB compiles + runs hello.c** (June 2026); 2764 KB free at boot; linker OOMs but still produces output |
 
 So on the `size` profile after the fixes: **boot/usable-SSH floor ≤ 8 MB, tcc floor
-16 MB** — down from a 48 MB tcc floor. For reference, the
-**pre-fix** floors were boot 16 MB / usable-SSH 24 MB / tcc 48 MB, with `code+stack`
-a flat **11 MB** at every size. The 8 MB SSH floor is new as of the `PmmOomHandler`
-change (heap seed 4 MB → 1 MB, grows on demand from PMM): previously SSH was
-rejected at 8 MB with "kernel memory low" because `is_memory_low()` compared against
-a 2 MB watermark on the 1 MB seeded slab. (`tcc -run` is separately broken at *all* sizes —
-`runmain.o not found`, a TCC runtime-install issue, not RAM; use `tcc … -o out` then
-exec `out`.) On the `release` profile tcc is verified at ≥ 256 MB via
-`scripts/test_memory_split.py`.
+8 MB** (down from 48 MB). For reference, the **pre-fix** floors were boot 16 MB /
+usable-SSH 24 MB / tcc 48 MB, with `code+stack` a flat **11 MB** at every size.
+(`tcc -run` is separately broken at *all* sizes — `runmain.o not found`, a TCC
+runtime-install issue, not RAM; use `tcc … -o out` then exec `out`.) On the `release`
+profile tcc is verified at ≥ 256 MB via `scripts/test_memory_split.py`.
 
 What moved the floor: four over-provisioned "≥ 256 MB" reservations were cut on the
 `size` profile — the 8 MB **eager** user stack → 128 KB (item 1), the 8 MB heap floor
@@ -56,15 +52,33 @@ so `--release` is unaffected unless stated.
 | **`compute_thread_limit` floor** | `src/main.rs` | `reserved + 2` | `reserved + 6` |
 | **Demand-paged ELF loader** | `crates/akuma-exec/src/process/spawn.rs` | `HEAP_SLURP_MAX = 1 MB` | 0 on `size` profile — every binary uses `from_elf_path`; heap never needs a scratch buffer sized to the binary (tcc is 723 KB) |
 | **Test modules excluded from binary** | `src/main.rs` | test modules always compiled in | all `*_tests` modules gated on `#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]` |
+| **Interpreter loaded page-by-page** | `crates/akuma-exec/src/elf/mod.rs` | `read_file(ld-musl)` → ~600 KB heap slurp | `load_interpreter_from_path`: reads each PT_LOAD page with a 4 KB `file_read_exact` scratch buffer; peak heap use < 10 KB |
+| **`do_execve` heap slurp** | `src/syscall/proc.rs` | `read_file(binary)` for every `execve` (e.g. linker is ~700 KB) | reads only first 256 bytes (shebang probe); always uses `replace_image_from_path` |
+| **Lazy file-backed `mmap`** (`MMAP_FILE_BACKED_LAZY`) | `src/syscall/mem.rs` + `src/config.rs` | every file-backed `mmap` eagerly allocates all PMM frames | creates `LazySource::File` deferred region; pages faulted in on first access via existing demand-paging handler |
 
-**Why the demand-paged loader was the 8 MB unlock.** At 8 MB the heap seed is 1 MB
-(`SMALL_FLOOR`). Before this change, spawning tcc would call `read_file` and slurp the
-entire 723 KB ELF into the heap — exceeding the 1 MB seed before `PmmOomHandler` could
-grow it. With `HEAP_SLURP_MAX = 0`, tcc goes through `from_elf_path` which maps ELF
-segments lazily from the file with no heap scratch buffer; the heap stays flat and SSH
-succeeds. (716 KB PMM is still too small for tcc's runtime pages, so tcc itself still
-fails at 8 MB — the ELF *load* now fits, but page-faulting the full binary at runtime
-exhausts the 2 MB user pool.)
+**Three heap-slurp sites that blocked 8 MB tcc.** With `HEAP_SLURP_MAX = 0`, tcc's
+own ELF is demand-paged (no heap scratch). But running `tcc hello.c` involves three
+more large allocations that each individually exceeded the 1 MB heap seed:
+
+1. **Interpreter loading** (`load_elf_from_path`, lines ~245 and ~869): the call to
+   `read_file(ld-musl-aarch64.so.1)` slurped ~600 KB into the heap regardless of
+   `HEAP_SLURP_MAX`. Fixed by `load_interpreter_from_path` (page-by-page `read_at`).
+
+2. **`execve` in the linker** (`do_execve`): tcc invokes `/usr/bin/ld` (~700 KB) via
+   `execve`. `do_execve` called `read_file(binary)` before checking if the path-based
+   loader was needed. Fixed: on `kernel_profile_size` reads only 256 bytes (shebang
+   check) then falls through to `replace_image_from_path`.
+
+3. **Shared-library mmap** (`sys_mmap`): ld-musl maps `libtcc.so` and other `.so`
+   files via `mmap(fd, ...)`. File-backed mmaps were always eager — PMM exhausted
+   before the process started. Fixed by `MMAP_FILE_BACKED_LAZY = true` on the `size`
+   profile: file-backed mmaps now push a `LazySource::File` lazy region; the existing
+   page-fault handler reads pages on demand.
+
+**Result:** free memory at boot 716 KB → 2764 KB; `tcc hello.c -o /tmp/hello &&
+/tmp/hello` prints `Hello, Akuma!` at 8 MB. The linker subprocess still OOMs during
+the link step (heap fills to ~1.3 MB via `PmmOomHandler`) but produces the output
+binary before dying — a separate issue from spawning and running tcc itself.
 
 Two things were originally hardcoded for "≥ 256 MB machines" and made to scale (the
 earlier change that got the kernel *booting* across the range):
@@ -461,6 +475,7 @@ cargo run --profile size --features no-tests -Z build-std=core,alloc  # to run i
 | `THREAD_LIMIT_OVERRIDE` | 0 (auto) | Pin the thread-slot count (≤ `MAX_THREADS`). |
 | `LOW_MEM_TEST_SKIP_MB` | 32 | Skip heavy boot self-tests below this RAM. |
 | `DISABLE_ALL_TESTS` | false | Skip the entire boot self-test suite. |
+| `MMAP_FILE_BACKED_LAZY` | false (`release`), true (`size`) | Demand-page file-backed `mmap` regions instead of eagerly allocating all frames. Enabled by default on `size` to avoid PMM exhaustion when ld-musl maps shared libraries. |
 
 ## How tcc reached 16 MB — the changes (landed June 2026)
 

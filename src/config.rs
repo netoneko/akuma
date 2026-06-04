@@ -260,6 +260,19 @@ pub const VFORK_FASTPATH_ENABLED: bool = true;
 /// Set high (e.g. 256) to restore the old mostly-eager behaviour.
 pub const MMAP_EAGER_MAX_PAGES: usize = 16;
 
+/// Demand-page file-backed `mmap` regions instead of eagerly allocating all
+/// pages up front.  When `true`, `mmap(fd, ...)` creates a `LazySource::File`
+/// region; pages are faulted in one at a time via `read_at`.
+///
+/// Default **`false`** on `release` (eager batching is cheaper when pages are
+/// all touched).  Default **`true`** on the `size` profile — at 8 MB PMM,
+/// eagerly mapping a 600 KB shared library exhausts user pages before the
+/// process even starts.
+#[cfg(not(kernel_profile_size))]
+pub const MMAP_FILE_BACKED_LAZY: bool = false;
+#[cfg(kernel_profile_size)]
+pub const MMAP_FILE_BACKED_LAZY: bool = true;
+
 /// Kernel heap size override, in **MiB**. `0` = auto-size from detected RAM
 /// (see `compute_heap_size` in `src/main.rs`). Set a fixed value to pin the heap
 /// — useful for squeezing onto very small machines or reproducing a layout.

@@ -140,6 +140,30 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         return mmap_addr as u64;
     }
 
+    // When MMAP_FILE_BACKED_LAZY is set, demand-page file-backed mmaps instead
+    // of eagerly allocating all frames. Default on the size profile where PMM
+    // is tight (8 MB): eagerly mapping a 600 KB shared library exhausts user
+    // pages before the process can start. Pages are faulted in via
+    // LazySource::File, same mechanism as demand-paged ELFs.
+    if crate::config::MMAP_FILE_BACKED_LAZY && is_file_backed {
+        if let Some(akuma_exec::process::FileDescriptor::File(ref f)) = proc.get_fd(fd as u32) {
+            let path = f.path.clone();
+            let inode = crate::vfs::resolve_inode(&path).unwrap_or(0);
+            let source = akuma_exec::process::LazySource::File {
+                path: path.clone(),
+                inode,
+                file_offset: offset,
+                filesz: len,
+                segment_va: mmap_addr,
+            };
+            let count = akuma_exec::process::push_lazy_region_with_source(
+                proc.tgid, mmap_addr, pages * 4096, page_flags, source);
+            crate::tprint!(192, "[mmap] pid={} fd={} file={} off={} len=0x{:x} = 0x{:x} (lazy-file, {} regions)\n",
+                proc.pid, fd, &path, offset, len, mmap_addr, count);
+            return mmap_addr as u64;
+        }
+    }
+
     let initial_flags = if is_file_backed {
         akuma_exec::mmu::user_flags::RW_NO_EXEC
     } else {
