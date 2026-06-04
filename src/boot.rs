@@ -22,7 +22,14 @@ const PHYS_BASE: usize = 0x4000_0000;
 // current ~914 KB kernel) so the boot stack sits right above the binary and
 // the ~80 KB that 1 MB wasted goes to the user-page pool. If the kernel grows
 // past this, the linker ASSERT in linker.ld fails the build — bump it then.
-#[cfg(kernel_profile_size)]
+// MUST match the image_size values in build.rs (they feed STACK_BOTTOM / the
+// linker ASSERT). extreme-size drops the sc-* syscall families so its image is
+// smaller than `size`; the tighter reservation hands the freed RAM to the
+// user-page pool (lowers the boot floor). kernel_profile_extreme always implies
+// kernel_profile_size (both are opt-level=z), so it must be checked first.
+#[cfg(kernel_profile_extreme)]
+const IMAGE_SIZE: usize = 0xDC000; // 880 KB (covers _kernel_phys_end incl. .bss)
+#[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
 const IMAGE_SIZE: usize = 0xEC000; // 944 KB
 #[cfg(not(kernel_profile_size))]
 const IMAGE_SIZE: usize = 0x30_0000; // 3 MB

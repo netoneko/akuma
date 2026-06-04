@@ -487,6 +487,7 @@ impl Filesystem for ProcFilesystem {
             return Ok(String::from("LOCAL_PORT,REMOTE_ADDR,STATE,BOX\n").into_bytes());
         }
 
+        #[cfg(feature = "sc-sysv-ipc")]
         if path == "sysvipc/msg" && crate::config::PROC_SYSVIPC_ENABLED {
             let queues = crate::syscall::msgqueue::list_msg_queues();
             let mut out = String::from(

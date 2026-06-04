@@ -463,6 +463,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
             }
         }
+        #[cfg(feature = "sc-eventfd")]
         akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
             if count < 8 { return EINVAL; }
             let nonblock = super::eventfd::eventfd_is_nonblock(efd_id) || super::net::fd_is_nonblock(fd_num as u32);
@@ -498,6 +499,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 EIO
             }
         }
+        #[cfg(feature = "sc-timerfd")]
         akuma_exec::process::FileDescriptor::TimerFd(timer_id) => {
             let result = super::timerfd::timerfd_read(timer_id);
             if result == EAGAIN { return EAGAIN; }
@@ -510,6 +512,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 8
             } else { EINVAL }
         }
+        #[cfg(feature = "sc-epoll")]
         akuma_exec::process::FileDescriptor::EpollFd(_) => EINVAL,
         // Catch-all for fd types that don't support read(2) — Linux returns EBADF.
         // This fires when an fd *exists* in the table but its type can't be read
@@ -729,6 +732,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     }
                 }
             }
+            #[cfg(feature = "sc-eventfd")]
             akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
                 if this_chunk < 8 { return EINVAL; } // Should enforce 8 byte writes
                 let val = unsafe { core::ptr::read(buf_slice.as_ptr() as *const u64) };
@@ -925,6 +929,7 @@ pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
                 super::pipe::pipe_close_write(tx);
             }
             akuma_exec::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
+            #[cfg(feature = "sc-eventfd")]
             akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
                 super::eventfd::eventfd_close(efd_id);
             }
@@ -1082,12 +1087,15 @@ pub(crate) fn sys_close(fd: u32) -> u64 {
                     super::pipe::pipe_close_read(rx);
                     super::pipe::pipe_close_write(tx);
                 }
+                #[cfg(feature = "sc-eventfd")]
                 akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
                     super::eventfd::eventfd_close(efd_id);
                 }
+                #[cfg(feature = "sc-epoll")]
                 akuma_exec::process::FileDescriptor::EpollFd(epoll_id) => {
                     super::poll::epoll_destroy(epoll_id);
                 }
+                #[cfg(feature = "sc-pidfd")]
                 akuma_exec::process::FileDescriptor::PidFd(pidfd_id) => {
                     super::pidfd::pidfd_close(pidfd_id);
                 }
@@ -1131,6 +1139,7 @@ pub(crate) fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
                         super::pipe::pipe_close_read(rx);
                         super::pipe::pipe_close_write(tx);
                     }
+                    #[cfg(feature = "sc-eventfd")]
                     akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
                         super::eventfd::eventfd_close(efd_id);
                     }

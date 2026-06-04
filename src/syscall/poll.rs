@@ -1,38 +1,54 @@
 use super::*;
 use akuma_net::socket;
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
+#[cfg(feature = "sc-epoll")]
 use core::sync::atomic::AtomicU64;
 use core::task::Waker;
+#[cfg(feature = "sc-epoll")]
 use alloc::collections::BTreeMap;
 
+#[cfg(feature = "sc-epoll")]
 struct EpollEntry {
     events: u32,
     data: u64,
     last_ready: u32,
 }
 
+#[cfg(feature = "sc-epoll")]
 struct EpollInstance {
     interest_list: BTreeMap<u32, EpollEntry>,
 }
 
+#[cfg(feature = "sc-epoll")]
 static EPOLL_TABLE: Spinlock<BTreeMap<u32, EpollInstance>> = Spinlock::new(BTreeMap::new());
+#[cfg(feature = "sc-epoll")]
 static NEXT_EPOLL_ID: AtomicU32 = AtomicU32::new(1);
 /// Counts `epoll_pwait(timeout=0)` returns with `nready=0` for rate-limited logging.
+#[cfg(feature = "sc-epoll")]
 static EPOLL_PWAIT_ZERO_ZERO_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// EPOLLIN/OUT/ERR/HUP/RDHUP are generic poll-event bits shared by ppoll/pselect
+// and epoll_check_fd_readiness, so they stay regardless of sc-epoll. EPOLLET and
+// EPOLL_EVENT_MASK are only used by the epoll surface.
 const EPOLLIN: u32 = 0x001;
 const EPOLLOUT: u32 = 0x004;
 const EPOLLERR: u32 = 0x008;
 const EPOLLHUP: u32 = 0x010;
 const EPOLLRDHUP: u32 = 0x2000;
+#[cfg(feature = "sc-epoll")]
 const EPOLLET: u32 = 1 << 31;
+#[cfg(feature = "sc-epoll")]
 const EPOLL_EVENT_MASK: u32 = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
 
+#[cfg(feature = "sc-epoll")]
 const EPOLL_CTL_ADD: i32 = 1;
+#[cfg(feature = "sc-epoll")]
 const EPOLL_CTL_DEL: i32 = 2;
+#[cfg(feature = "sc-epoll")]
 const EPOLL_CTL_MOD: i32 = 3;
 const BLOCKING_POLL_INTERVAL_US: u64 = 10_000;
 
+#[cfg(feature = "sc-epoll")]
 pub(crate) fn epoll_wait_deadline(timeout: i32, start_time: u64, timeout_us: u64, now: u64) -> u64 {
     if timeout > 0 {
         start_time + timeout_us
@@ -53,6 +69,7 @@ struct PollFd {
 
 // On ARM64, epoll_event is NOT packed (unlike x86_64).
 // Layout: events (4 bytes) + padding (4 bytes) + data (8 bytes) = 16 bytes total
+#[cfg(feature = "sc-epoll")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct EpollEvent {
@@ -62,6 +79,7 @@ pub(crate) struct EpollEvent {
 }
 
 /// One line per epoll_pwait return. Suppresses most `timeout=0, nready=0` returns (see config).
+#[cfg(feature = "sc-epoll")]
 fn log_epoll_pwait_return(
     epfd: u32,
     timeout: i32,
@@ -130,14 +148,22 @@ fn log_epoll_pwait_return(
     }
 }
 
+#[cfg(feature = "sc-epoll")]
 pub fn epoll_destroy(epoll_id: u32) {
     EPOLL_TABLE.lock().remove(&epoll_id);
 }
+
+/// No-op when epoll is gated out: there is no interest table to reset, and the
+/// net/fs drain hooks call this unconditionally. Keeping the symbol avoids
+/// sprinkling `#[cfg]` across every caller in net.rs/fs.rs.
+#[cfg(not(feature = "sc-epoll"))]
+pub(super) fn epoll_on_fd_drained(_fd: u32) {}
 
 /// Called when a non-blocking socket read returns EAGAIN (socket fully drained).
 /// Resets the EPOLLET edge for this fd so the next data arrival fires a new EPOLLIN event.
 /// Without this, if new data arrives within the same 10ms poll window as the drain,
 /// the transition is missed and EPOLLIN never re-fires.
+#[cfg(feature = "sc-epoll")]
 pub(super) fn epoll_on_fd_drained(fd: u32) {
     // Snapshot IDs to avoid holding EPOLL_TABLE lock during the entire iteration
     // (though not strictly necessary for this simple function yet, good practice)
@@ -158,8 +184,10 @@ pub(super) fn epoll_on_fd_drained(fd: u32) {
     }
 }
 
+#[cfg(feature = "sc-epoll")]
 const EPOLL_CLOEXEC: u32 = 0o2000000;
 
+#[cfg(feature = "sc-epoll")]
 pub(crate) fn sys_epoll_create1(flags: u32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
         let epoll_id = NEXT_EPOLL_ID.fetch_add(1, Ordering::SeqCst);
@@ -181,6 +209,7 @@ pub(crate) fn sys_epoll_create1(flags: u32) -> u64 {
 /// (shared syscall trampoline). **`[sigsegv-syscall]`** serial (`src/exceptions.rs`) keys off **`x8`**.
 /// This path validates **`event_ptr`** and uses **`copy_from_user_safe`** for the 16-byte
 /// AArch64 **`epoll_event`** — see **`docs/GO_FORKTEST_DEBUG.md`** if **`x8==EPOLL_CTL`** at SIGSEGV.
+#[cfg(feature = "sc-epoll")]
 pub(crate) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
     let epoll_id = match akuma_exec::process::current_process().and_then(|p| p.get_fd(epfd)) {
         Some(akuma_exec::process::FileDescriptor::EpollFd(id)) => id,
@@ -295,6 +324,7 @@ pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Optio
                 }
             }
         }
+        #[cfg(feature = "sc-eventfd")]
         akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
             if waker.is_some() {
                 super::eventfd::eventfd_add_poller(efd_id, tid);
@@ -358,6 +388,7 @@ pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Optio
                 }
             }
         }
+        #[cfg(feature = "sc-timerfd")]
         akuma_exec::process::FileDescriptor::TimerFd(timer_id) => {
             if requested & EPOLLIN != 0 {
                 if waker.is_some() {
@@ -368,6 +399,7 @@ pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Optio
                 }
             }
         }
+        #[cfg(feature = "sc-pidfd")]
         akuma_exec::process::FileDescriptor::PidFd(pidfd_id) => {
             // A pidfd becomes readable (EPOLLIN) when the tracked process has exited.
             if requested & EPOLLIN != 0 {
@@ -409,6 +441,7 @@ pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Optio
     ready
 }
 
+#[cfg(feature = "sc-epoll")]
 pub(crate) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i32) -> u64 {
     const EPOLL_EVENT_SIZE: usize = core::mem::size_of::<EpollEvent>();  // 16 on ARM64
     

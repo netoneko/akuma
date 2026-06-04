@@ -24,6 +24,7 @@ mod editor;
 // mod embassy_time_driver; // replaced by kernel_timer
 // mod embassy_virtio_driver;
 mod exceptions;
+#[cfg(feature = "sc-framebuffer")]
 mod fw_cfg;
 mod kernel_timer;
 mod fs;
@@ -36,6 +37,7 @@ mod network_tests;
 mod pmm;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod process_tests;
+#[cfg(feature = "sc-framebuffer")]
 mod ramfb;
 mod rng;
 mod shell;
@@ -314,8 +316,14 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // (0x40200000). The first 2MB (0x40000000-0x401FFFFF) contains DTB.
     const KERNEL_BASE: usize = 0x4020_0000;
 
-    // STACK_BOTTOM = KERNEL_PHYS_LOAD + IMAGE_SIZE (matches boot.rs + build.rs)
-    #[cfg(kernel_profile_size)]
+    // STACK_BOTTOM = KERNEL_PHYS_LOAD + IMAGE_SIZE. MUST match IMAGE_SIZE in
+    // boot.rs and build.rs (all three are the same guardrail: this const feeds the
+    // runtime overlap halt + ExecConfig boot-stack bounds; boot.rs feeds the asm
+    // stack + Image header; build.rs feeds the linker ASSERT). extreme implies
+    // kernel_profile_size, so its branch must come first.
+    #[cfg(kernel_profile_extreme)]
+    const STACK_BOTTOM: usize = 0x402D_C000; // 0x40200000 + 0x0DC000 (880 KB)
+    #[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
     const STACK_BOTTOM: usize = 0x402E_C000; // 0x40200000 + 0x0EC000 (944 KB)
     #[cfg(not(kernel_profile_size))]
     const STACK_BOTTOM: usize = 0x4050_0000; // 0x40200000 + 0x300000
@@ -376,11 +384,25 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // reach the stack regardless of RAM size.
     const BOOT_STACK_TOP: usize = STACK_BOTTOM + 1024 * 1024; // matches boot.rs per-profile value
     // MIN_CODE_AND_STACK: floor so the kernel binary always fits, even if RAM
-    // is very large (where stack_cover = fixed offset + 1MB guard is small
-    // relative to ram/16).  The actual cover is computed as stack_cover below
-    // and dominates on small RAM.
+    // is very large (where stack_cover = fixed offset + guard is small relative
+    // to ram/16).  The actual cover is computed as stack_cover below and
+    // dominates on small RAM.
+    //
+    // STACK_GUARD is slack reserved ABOVE the boot stack top before the heap.
+    // The boot stack grows DOWN (toward the kernel, away from the heap that sits
+    // above it), so this margin is pure paranoia — the layout sanity guard below
+    // enforces BOOT_STACK_TOP <= heap_start unconditionally. extreme-size trims
+    // both the guard and the MIN floor to hand ~1 MB back to the user-page pool,
+    // which is what lets repeated tcc fit below 6 MB (see docs / memory note).
+    #[cfg(kernel_profile_extreme)]
+    const MIN_CODE_AND_STACK: usize = 0; // stack_cover is the effective floor
+    #[cfg(not(kernel_profile_extreme))]
     const MIN_CODE_AND_STACK: usize = 4 * 1024 * 1024;
-    let stack_cover = (BOOT_STACK_TOP - ram_base) + 1024 * 1024; // through stack top + 1 MB guard
+    #[cfg(kernel_profile_extreme)]
+    const STACK_GUARD: usize = 64 * 1024;
+    #[cfg(not(kernel_profile_extreme))]
+    const STACK_GUARD: usize = 1024 * 1024;
+    let stack_cover = (BOOT_STACK_TOP - ram_base) + STACK_GUARD; // through stack top + guard
 
     // Memory layout:
     // - Code + Stack: max(1/16 of RAM, 8MB floor, boot-stack cover) - kernel binary and boot stack
@@ -527,6 +549,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // the PMM callbacks via runtime(). The function pointers are just stored
     // here — subsystems like GIC/timer don't need to be initialized yet.
     console::print("Initializing exec subsystem...\n");
+
+    // No-op shim for gated-out Tier 2 FD-teardown callbacks (see ExecRuntime below).
+    #[cfg(not(all(feature = "sc-eventfd", feature = "sc-epoll", feature = "sc-pidfd")))]
+    fn noop_u32(_id: u32) {}
+
     akuma_exec::init(
         akuma_exec::ExecRuntime {
             uptime_us: timer::uptime_us,
@@ -558,10 +585,26 @@ fn kernel_main(dtb_ptr: usize) -> ! {
             pipe_close_write: crate::syscall::pipe::pipe_close_write,
             pipe_close_read: crate::syscall::pipe::pipe_close_read,
             pipe_clone_ref: crate::syscall::pipe::pipe_clone_ref,
+            // Tier 2 FD-teardown callbacks. akuma-exec calls these unconditionally
+            // during FD drop, but when a family is gated out its FileDescriptor
+            // variant is never constructed, so the no-op is never actually invoked
+            // — it only has to exist so the runtime struct compiles.
+            #[cfg(feature = "sc-eventfd")]
             eventfd_close: crate::syscall::eventfd::eventfd_close,
+            #[cfg(not(feature = "sc-eventfd"))]
+            eventfd_close: noop_u32,
+            #[cfg(feature = "sc-eventfd")]
             eventfd_clone_ref: crate::syscall::eventfd::eventfd_clone_ref,
+            #[cfg(not(feature = "sc-eventfd"))]
+            eventfd_clone_ref: noop_u32,
+            #[cfg(feature = "sc-epoll")]
             epoll_destroy: crate::syscall::poll::epoll_destroy,
+            #[cfg(not(feature = "sc-epoll"))]
+            epoll_destroy: noop_u32,
+            #[cfg(feature = "sc-pidfd")]
             pidfd_close: crate::syscall::pidfd::pidfd_close,
+            #[cfg(not(feature = "sc-pidfd"))]
+            pidfd_close: noop_u32,
             resolve_symlinks: |path| crate::vfs::resolve_symlinks(path),
             file_size: |path| crate::fs::file_size(path).map_err(|_| "fs error"),
             get_box_namespace: |box_id| crate::vfs::get_box_namespace(box_id),
@@ -649,6 +692,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // =========================================================================
     // Framebuffer initialization (ramfb via fw_cfg)
     // =========================================================================
+    #[cfg(feature = "sc-framebuffer")]
     match ramfb::init(320, 200) {
         Ok(()) => {
             console::print("[ramfb] Framebuffer ready\n");

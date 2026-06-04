@@ -90,13 +90,18 @@ SECTIONS
 /*
  * Boot stack layout check.
  * STACK_BOTTOM = KERNEL_PHYS_LOAD + IMAGE_SIZE, set per profile by build.rs via
- * --defsym=STACK_BOTTOM=VALUE. PROVIDE here is a fallback for manual ld invocations.
- *   size profile:    0x40200000 + 0x0EC000 = 0x402EC000
- *   release profile: 0x40200000 + 0x300000 = 0x40500000
+ * --defsym=STACK_BOTTOM=VALUE. We deliberately do NOT PROVIDE a fallback here:
+ * LLD lets a linker-script PROVIDE override an external --defsym, so a fallback
+ * would silently mask the real per-profile value and the ASSERT below would
+ * compare against the wrong (always-passing) bound. cargo always passes the
+ * --defsym (see build.rs), so STACK_BOTTOM is always defined for real builds; a
+ * manual `ld` without it fails loudly on the undefined symbol, which is correct.
+ *   size profile:        0x40200000 + 0x0EC000 = 0x402EC000
+ *   extreme-size profile:0x40200000 + 0x0DC000 = 0x402DC000
+ *   release profile:     0x40200000 + 0x300000 = 0x40500000
  *
  * Kernel binary must fit below STACK_BOTTOM.
  * This assertion fails the build if kernel is too large.
  */
-PROVIDE(STACK_BOTTOM = 0x40500000);
 ASSERT(_kernel_phys_end < STACK_BOTTOM,
-    "FATAL: Kernel binary overlaps boot stack! Kernel binary too large for declared IMAGE_SIZE. Reduce kernel size or increase IMAGE_SIZE in boot.rs.")
+    "FATAL: Kernel binary overlaps boot stack! Kernel binary too large for declared IMAGE_SIZE. Reduce kernel size or increase IMAGE_SIZE in boot.rs/build.rs.")

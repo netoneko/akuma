@@ -53,6 +53,7 @@ pub fn clear_spawn_namespace() {
 /// Create a new namespace for a box and return a shared reference.
 /// If `root_dir` is non-"/" and the global root filesystem is available,
 /// a `SubdirFs` scoped to `root_dir` is mounted at `/` in the new namespace.
+#[cfg(feature = "sc-containers")]
 pub fn create_box_namespace(box_id: u64, root_dir: &str) -> Arc<Namespace> {
     let ns = Arc::new(Namespace::new(box_id));
     if root_dir != "/" {
@@ -66,6 +67,7 @@ pub fn create_box_namespace(box_id: u64, root_dir: &str) -> Arc<Namespace> {
 }
 
 /// Remove a box's namespace from the registry.
+#[cfg(feature = "sc-containers")]
 pub fn remove_box_namespace(box_id: u64) {
     BOX_NAMESPACES.lock().remove(&box_id);
 }
@@ -76,6 +78,7 @@ pub fn get_box_namespace(box_id: u64) -> Option<Arc<Namespace>> {
 }
 
 /// Mount a filesystem into a specific box's namespace.
+#[cfg(feature = "sc-containers")]
 pub fn mount_in_namespace(box_id: u64, path: &str, fs: Arc<dyn Filesystem>) -> Result<(), FsError> {
     let namespaces = BOX_NAMESPACES.lock();
     let ns = namespaces.get(&box_id).ok_or(FsError::NotFound)?;
@@ -129,6 +132,8 @@ pub fn mount(path: &str, fs: Arc<dyn Filesystem>) -> Result<(), FsError> {
 }
 
 /// Get the `Arc<dyn Filesystem>` for a global mount point (e.g., "/" for ext2).
+/// Currently only consumed by `create_box_namespace`, so it follows the same gate.
+#[cfg(feature = "sc-containers")]
 pub fn get_root_fs() -> Option<Arc<dyn Filesystem>> {
     let table = MOUNT_TABLE.lock();
     table.as_ref().and_then(|t| t.get_fs("/"))

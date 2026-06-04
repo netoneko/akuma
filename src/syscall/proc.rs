@@ -328,7 +328,12 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
     const CLONE_VM: u64 = 0x100;
     const CLONE_THREAD: u64 = 0x10000;
     const CLONE_VFORK: u64 = 0x4000;
+    #[cfg(feature = "sc-pidfd")]
     const CLONE_PIDFD: u64 = 0x1000;
+    // pidfd_out_ptr is only consumed by the CLONE_PIDFD block below, which is
+    // gated out when pidfd support is compiled away.
+    #[cfg(not(feature = "sc-pidfd"))]
+    let _ = pidfd_out_ptr;
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED || crate::config::SYSCALL_DEBUG_NET_ENABLED {
         let tid = akuma_exec::threading::current_thread_id();
@@ -407,6 +412,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
             Ok(new_pid) => {
                 // CLONE_PIDFD: atomically create a pidfd for the child and write the fd number
                 // back to the caller. Go 1.22+ uses this to get the pidfd in a single syscall.
+                #[cfg(feature = "sc-pidfd")]
                 if flags & CLONE_PIDFD != 0 && pidfd_out_ptr != 0 {
                     if validate_user_ptr(pidfd_out_ptr, 4) {
                         let pidfd_fd = super::pidfd::sys_pidfd_open(new_pid, 0 /* no flags */);
@@ -649,8 +655,11 @@ pub(crate) fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<Strin
             akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
                 akuma_exec::process::remove_child_channel(child_pid);
             }
+            #[cfg(feature = "sc-eventfd")]
             akuma_exec::process::FileDescriptor::EventFd(efd_id) => super::eventfd::eventfd_close(efd_id),
+            #[cfg(feature = "sc-epoll")]
             akuma_exec::process::FileDescriptor::EpollFd(epoll_id) => super::poll::epoll_destroy(epoll_id),
+            #[cfg(feature = "sc-pidfd")]
             akuma_exec::process::FileDescriptor::PidFd(pidfd_id) => super::pidfd::pidfd_close(pidfd_id),
             _ => {}
         }
@@ -850,6 +859,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
     const SIGINFO_SIZE: usize = 128;
     const P_ALL: u32 = 0;
     const P_PID: u32 = 1;
+    #[cfg(feature = "sc-pidfd")]
     const P_PIDFD: u32 = 3;
     const WNOHANG: i32 = 1;
     const WNOWAIT: i32 = 0x0100_0000;
@@ -912,6 +922,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                 if akuma_exec::process::is_current_interrupted() { return EINTR; }
             }
         }
+        #[cfg(feature = "sc-pidfd")]
         P_PIDFD => {
             // `id` is the fd number of a pidfd; resolve it to a target PID.
             let target_pid = if let Some(proc) = akuma_exec::process::current_process() {

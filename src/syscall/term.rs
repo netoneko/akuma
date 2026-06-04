@@ -42,9 +42,11 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 Some(akuma_exec::process::FileDescriptor::Socket(idx)) => {
                     super::net::socket_recv_queue_size(idx) as i32
                 }
+                #[cfg(feature = "sc-eventfd")]
                 Some(akuma_exec::process::FileDescriptor::EventFd(efd_id)) => {
                     if super::eventfd::eventfd_can_read(efd_id) { 8 } else { 0 }
                 }
+                #[cfg(feature = "sc-timerfd")]
                 Some(akuma_exec::process::FileDescriptor::TimerFd(timer_id)) => {
                     if super::timerfd::timerfd_can_read(timer_id) { 8 } else { 0 }
                 }

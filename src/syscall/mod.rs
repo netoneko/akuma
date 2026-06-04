@@ -11,12 +11,18 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spinning_top::Spinlock;
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
+#[cfg(feature = "sc-aio")]
 mod aio;
+#[cfg(feature = "sc-containers")]
 mod container;
+#[cfg(feature = "sc-pidfd")]
 pub mod pidfd;
+#[cfg(feature = "sc-eventfd")]
 pub mod eventfd;
 pub(crate) mod log;
+#[cfg(feature = "sc-sysv-ipc")]
 pub(crate) mod msgqueue;
+#[cfg(feature = "sc-framebuffer")]
 mod fb;
 pub mod fs;
 mod mem;
@@ -28,6 +34,7 @@ pub mod signal;
 mod sync;
 mod term;
 mod time;
+#[cfg(feature = "sc-timerfd")]
 mod timerfd;
 
 pub use sync::futex_wake;
@@ -47,7 +54,7 @@ pub(crate) use mem::mmap_fixed_addr_unaligned_einval;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub(crate) use mem::{MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE};
 
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(all(feature = "sc-epoll", not(any(feature = "no-tests", kernel_profile_size))))]
 pub(crate) fn epoll_wait_deadline_for_test(timeout: i32, start_time: u64, timeout_us: u64, now: u64) -> u64 {
     poll::epoll_wait_deadline(timeout, start_time, timeout_us, now)
 }
@@ -240,13 +247,19 @@ pub mod nr {
     pub const POLL_INPUT_EVENT: u64 = 313;
     pub const GET_CPU_STATS: u64 = 314;
     pub const SPAWN_EXT: u64 = 315;
+    #[cfg(feature = "sc-containers")]
     pub const REGISTER_BOX: u64 = 316;
+    #[cfg(feature = "sc-containers")]
     pub const KILL_BOX: u64 = 317;
+    #[cfg(feature = "sc-containers")]
     pub const REATTACH: u64 = 318;
     pub const UPTIME: u64 = 319;
     pub const SET_TPIDR_EL0: u64 = 320;
+    #[cfg(feature = "sc-framebuffer")]
     pub const FB_INIT: u64 = 321;
+    #[cfg(feature = "sc-framebuffer")]
     pub const FB_DRAW: u64 = 322;
+    #[cfg(feature = "sc-framebuffer")]
     pub const FB_INFO: u64 = 323;
     pub const GETPID: u64 = 172;
     pub const GETPPID: u64 = 173;
@@ -279,6 +292,7 @@ pub mod nr {
     pub const SIGALTSTACK: u64 = 132;
     pub const GETRLIMIT: u64 = 163;
     pub const PRLIMIT64: u64 = 261;
+    #[cfg(feature = "sc-eventfd")]
     pub const EVENTFD2: u64 = 19;
     pub const PREAD64: u64 = 67;
     pub const PWRITE64: u64 = 68;
@@ -293,6 +307,7 @@ pub mod nr {
     pub const SCHED_GETAFFINITY: u64 = 123;
     pub const TKILL: u64 = 130;
     pub const TGKILL: u64 = 131;
+    #[cfg(feature = "sc-pidfd")]
     pub const PIDFD_OPEN: u64 = 434;
     pub const CLOSE_RANGE: u64 = 436;
     pub const SYSINFO: u64 = 179;
@@ -300,8 +315,11 @@ pub mod nr {
     pub const EPOLL_CREATE1: u64 = 20;
     pub const EPOLL_CTL: u64 = 21;
     pub const EPOLL_PWAIT: u64 = 22;
+    #[cfg(feature = "sc-timerfd")]
     pub const TIMERFD_CREATE: u64 = 85;
+    #[cfg(feature = "sc-timerfd")]
     pub const TIMERFD_SETTIME: u64 = 86;
+    #[cfg(feature = "sc-timerfd")]
     pub const TIMERFD_GETTIME: u64 = 87;
     pub const CAPGET: u64 = 90;
     pub const IO_URING_SETUP: u64 = 425;
@@ -312,15 +330,22 @@ pub mod nr {
     pub const INOTIFY_RM_WATCH: u64 = 28;
     pub const ACCEPT4: u64 = 242;
     pub const TIMES: u64 = 153;
+    #[cfg(feature = "sc-containers")]
     pub const MOUNT: u64 = 40;
+    #[cfg(feature = "sc-containers")]
     pub const UMOUNT2: u64 = 39;
+    #[cfg(feature = "sc-containers")]
     pub const MOUNT_IN_NS: u64 = 325;
     pub const RENAMEAT2: u64 = 276;
     pub const STATX: u64 = 291;
     pub const TRUNCATE: u64 = 45;
+    #[cfg(feature = "sc-sysv-ipc")]
     pub const MSGGET: u64 = 186;
+    #[cfg(feature = "sc-sysv-ipc")]
     pub const MSGCTL: u64 = 187;
+    #[cfg(feature = "sc-sysv-ipc")]
     pub const MSGRCV: u64 = 188;
+    #[cfg(feature = "sc-sysv-ipc")]
     pub const MSGSND: u64 = 189;
 }
 
@@ -351,6 +376,7 @@ const ENOMEM: u64 = (-12i64) as u64;
 const EACCES: u64 = (-13i64) as u64;
 const EFAULT: u64 = (-14i64) as u64;
 const EEXIST: u64 = (-17i64) as u64;
+#[cfg(feature = "sc-containers")]
 const ENODEV: u64 = (-19i64) as u64;
 const ENOTDIR: u64 = (-20i64) as u64;
 const EISDIR: u64 = (-21i64) as u64;
@@ -656,8 +682,11 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::POLL_INPUT_EVENT => term::sys_poll_input_event(args[0], args[1] as usize, args[2]),
         nr::GET_CPU_STATS => term::sys_get_cpu_stats(args[0], args[1] as usize),
         nr::SPAWN_EXT => proc::sys_spawn_ext(args[0], args[1], args[2], args[3], args[4], args[5]),
+        #[cfg(feature = "sc-containers")]
         nr::REGISTER_BOX => container::sys_register_box(args[0] as u64, args[1], args[2] as usize, args[3], args[4] as usize, args[5] as u32),
+        #[cfg(feature = "sc-containers")]
         nr::KILL_BOX => container::sys_kill_box(args[0] as u64),
+        #[cfg(feature = "sc-containers")]
         nr::REATTACH => container::sys_reattach(args[0] as u32),
         nr::SET_TID_ADDRESS => proc::sys_set_tid_address(args[0]),
         nr::EXIT_GROUP => proc::sys_exit_group(args[0] as i32),
@@ -675,8 +704,11 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::WAIT4 => proc::sys_wait4(args[0] as i32, args[1], args[2] as i32, args[3]),
         nr::WAITID => proc::sys_waitid(args[0] as u32, args[1] as u32, args[2], args[3] as i32),
         nr::SET_TPIDR_EL0 => proc::sys_set_tpidr_el0(args[0]),
+        #[cfg(feature = "sc-framebuffer")]
         nr::FB_INIT => fb::sys_fb_init(args[0] as u32, args[1] as u32),
+        #[cfg(feature = "sc-framebuffer")]
         nr::FB_DRAW => fb::sys_fb_draw(args[0], args[1] as usize),
+        #[cfg(feature = "sc-framebuffer")]
         nr::FB_INFO => fb::sys_fb_info(args[0]),
         nr::GETPID => proc::sys_getpid(),
         nr::GETPPID => proc::sys_getppid(),
@@ -709,6 +741,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SIGALTSTACK => signal::sys_sigaltstack(args[0], args[1]),
         nr::GETRLIMIT => proc::sys_prlimit64(0, args[0] as u32, 0, args[1]),
         nr::PRLIMIT64 => proc::sys_prlimit64(args[0] as u32, args[1] as u32, args[2], args[3]),
+        #[cfg(feature = "sc-eventfd")]
         nr::EVENTFD2 => eventfd::sys_eventfd2(args[0] as u32, args[1] as u32),
         nr::PREAD64 => fs::sys_pread64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
         nr::PWRITE64 => fs::sys_pwrite64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
@@ -746,9 +779,13 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         // best we can do is return EINTR so callers know to retry the operation.  Returning
         // ENOSYS causes Go's runtime to crash because it doesn't check for ENOSYS here.
         128 => EINTR,
+        #[cfg(feature = "sc-sysv-ipc")]
         nr::MSGGET => msgqueue::sys_msgget(args[0] as i32, args[1] as i32),
+        #[cfg(feature = "sc-sysv-ipc")]
         nr::MSGCTL => msgqueue::sys_msgctl(args[0] as u32, args[1] as i32, args[2]),
+        #[cfg(feature = "sc-sysv-ipc")]
         nr::MSGRCV => msgqueue::sys_msgrcv(args[0] as u32, args[1], args[2] as usize, args[3] as i64, args[4] as i32),
+        #[cfg(feature = "sc-sysv-ipc")]
         nr::MSGSND => msgqueue::sys_msgsnd(args[0] as u32, args[1], args[2] as usize, args[3] as i32),
         nr::SCHED_GETAFFINITY => {
             let mask_ptr = args[2] as usize;
@@ -764,6 +801,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
         nr::TKILL => signal::sys_tkill(args[0] as u32, args[1] as u32),
         nr::TGKILL => signal::sys_tgkill(args[0] as u32, args[1] as u32, args[2] as u32),
+        #[cfg(feature = "sc-pidfd")]
         nr::PIDFD_OPEN => pidfd::sys_pidfd_open(args[0] as u32, args[1] as u32),
         nr::CLOSE_RANGE => {
             fs::sys_close_range(args[0] as u32, args[1] as u32, args[2] as u32)
@@ -778,16 +816,22 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
         nr::SYSINFO => proc::sys_sysinfo(args[0] as usize),
         nr::CLOCK_GETRES => time::sys_clock_getres(args[0] as u32, args[1] as usize),
+        #[cfg(feature = "sc-epoll")]
         nr::EPOLL_CREATE1 => poll::sys_epoll_create1(args[0] as u32),
+        #[cfg(feature = "sc-epoll")]
         nr::EPOLL_CTL => poll::sys_epoll_ctl(args[0] as u32, args[1] as i32, args[2] as u32, args[3] as usize),
+        #[cfg(feature = "sc-epoll")]
         nr::EPOLL_PWAIT => {
             if crate::config::SYSCALL_DEBUG_NET_ENABLED && (args[4] != 0 || args[5] != 0) {
                 crate::safe_print!(128, "[epoll_pwait] sigmask=0x{:x} sigsetsize={}\n", args[4], args[5]);
             }
             poll::sys_epoll_pwait(args[0] as u32, args[1] as usize, args[2] as i32, args[3] as i32)
         }
+        #[cfg(feature = "sc-timerfd")]
         nr::TIMERFD_CREATE => timerfd::sys_timerfd_create(args[0] as i32, args[1] as i32),
+        #[cfg(feature = "sc-timerfd")]
         nr::TIMERFD_SETTIME => timerfd::sys_timerfd_settime(args[0] as u32, args[1] as i32, args[2] as usize, args[3] as usize),
+        #[cfg(feature = "sc-timerfd")]
         nr::TIMERFD_GETTIME => timerfd::sys_timerfd_gettime(args[0], args[1]),
         nr::IO_URING_SETUP | nr::IO_URING_ENTER | nr::IO_URING_REGISTER => {
             crate::tprint!(96, "[ENOSYS] nr={} (io_uring) pid={}\n", syscall_num,
@@ -795,10 +839,15 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             ENOSYS
         }
         // Linux AIO syscalls (io_setup=0, io_destroy=1, io_submit=2, io_cancel=3, io_getevents=4)
+        #[cfg(feature = "sc-aio")]
         0 => aio::sys_io_setup(args[0], args[1]),
+        #[cfg(feature = "sc-aio")]
         1 => aio::sys_io_destroy(args[0]),
+        #[cfg(feature = "sc-aio")]
         2 => aio::sys_io_submit(args[0], args[1] as i64, args[2]),
+        #[cfg(feature = "sc-aio")]
         3 => aio::sys_io_cancel(args[0], args[1], args[2]),
+        #[cfg(feature = "sc-aio")]
         4 => aio::sys_io_getevents(args[0], args[1] as i64, args[2] as i64, args[3], args[4]),
         // Extended attributes syscalls (5-16) - return EOPNOTSUPP (95) on Linux
         // AArch64. Must be encoded as `x0 = -95` (0xffffffa9), never `!95`
@@ -813,8 +862,11 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
                 akuma_exec::process::read_current_pid().unwrap_or(0));
             ENOSYS
         }
+        #[cfg(feature = "sc-containers")]
         nr::MOUNT => container::sys_mount(args[0], args[1], args[2], args[3] as u64, args[4]),
+        #[cfg(feature = "sc-containers")]
         nr::UMOUNT2 => container::sys_umount2(args[0], args[1] as i32),
+        #[cfg(feature = "sc-containers")]
         nr::MOUNT_IN_NS => container::sys_mount_in_ns(args[0], args[1], args[2] as usize, args[3], args[4] as usize),
         _ => {
             crate::safe_print!(128, "[ENOSYS] nr={} pid={} args=[0x{:x}, 0x{:x}, 0x{:x}]\n",
