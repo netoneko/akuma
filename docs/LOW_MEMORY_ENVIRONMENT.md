@@ -106,6 +106,49 @@ to ollama (`connect(10.0.2.2:11434) = OK`), streams a full response (25.2 TPS,
 ~3.8 MB free), zero `path=0x1` faults. Also verified on `size`/`extreme` at
 256 MB. Pre-fix it failed at all sizes on these profiles.
 
+## Heap retention after running meow — kernel-heap growth + per-run creep (OPEN, observed 2026-06-05)
+
+Observed on the **`extreme`** kernel at **7 MB** after running meow in prompt
+mode (`meow -c "…"`). Two separate effects, both leaving less free RAM than a
+fresh boot:
+
+**1. One-time kernel-heap growth (~256 KB), not returned to PMM.** A single
+agentic session (multiple ollama round-trips: ~17 KB×2 TLS record buffers,
+growing conversation history, JSON request/response) needs more than the 896 KB
+heap seed, so the allocator claims more pages from the PMM. After meow exits this
+growth is **not** released back to the free pool:
+
+| | total `free` (Mem) | Heap total | Heap used | Heap free |
+|---|---|---|---|---|
+| fresh boot (idle) | 3804 KB | 896 KB | ~195 KB | ~700 KB |
+| after one `meow -c "…compile+run…"` | **3548 KB** (−256) | **1152 KB** (+256) | ~962 KB | ~189 KB |
+
+`ps` reports **no processes running** afterwards, so this is retained kernel-side,
+not a live process. (Matches the user-reported `131 KB → 954 KB` heap-used jump.)
+
+**2. Per-run heap-used creep (~17–50 KB/run), not freed on process exit.** Once
+the heap has grown to 1152 KB, further runs do **not** grow it again (Mem `free`
+stays 3548 KB), but each `meow -c "hi"` leaves more heap *used* behind:
+
+| run | Heap used | Heap free |
+|---|---|---|
+| idle after 1st (heavy) run | 962 KB | 189 KB |
+| after `meow -c "hi"` | 1011 KB (+49) | 140 KB |
+| after `meow -c "hi again"` | 1028 KB (+17) | 123 KB |
+
+This is a slow **kernel-heap leak** in the process spawn/teardown path: heap
+`used` does not return to the idle baseline (~195 KB) even with zero processes
+running. The one-time +256 KB growth is benign on its own (peak demand), but the
+creep will eventually force another PMM claim — or, at 7 MB, OOM — if a long-lived
+box runs meow repeatedly. The `allocator::reclaim_to_pmm()` path (see *Heap→PMM
+reclaim*) cannot return the grown spans because they are never fully free.
+
+**Not yet root-caused.** Candidates to investigate: per-process teardown not
+freeing all kernel-side structures (address-space / fd / signal tables), retained
+`PROC_SYSCALL_LOG` entries, or VFS/socket buffers held past close. Reproduce with
+the before/after `free` above; `[Mem]` serial lines report live heap used/peak
+and cumulative `Allocs`.
+
 ## What landed in the `even-smaller-kernel` branch (June 2026)
 
 All changes are gated on `kernel_profile_size` (emitted by `build.rs` when `OPT_LEVEL=z`),
