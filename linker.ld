@@ -91,7 +91,7 @@ SECTIONS
  * Boot stack layout check.
  * STACK_BOTTOM = KERNEL_PHYS_LOAD + IMAGE_SIZE, set per profile by build.rs via
  * --defsym=STACK_BOTTOM=VALUE. PROVIDE here is a fallback for manual ld invocations.
- *   size profile:    0x40200000 + 0x100000 = 0x40300000
+ *   size profile:    0x40200000 + 0x0EC000 = 0x402EC000
  *   release profile: 0x40200000 + 0x300000 = 0x40500000
  *
  * Kernel binary must fit below STACK_BOTTOM.

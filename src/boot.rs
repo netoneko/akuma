@@ -17,9 +17,13 @@ const PHYS_BASE: usize = 0x4000_0000;
 
 // Reserved image size declared in the ARM64 Image header.
 // QEMU uses this to know where it's safe to place the DTB.
-// profile.size targets a sub-1 MB binary; release targets sub-3 MB.
+// profile.size targets a sub-945 KB binary; release targets sub-3 MB.
+// The size value is hand-tightened to 944 KB (page-aligned, ~30 KB over the
+// current ~914 KB kernel) so the boot stack sits right above the binary and
+// the ~80 KB that 1 MB wasted goes to the user-page pool. If the kernel grows
+// past this, the linker ASSERT in linker.ld fails the build — bump it then.
 #[cfg(kernel_profile_size)]
-const IMAGE_SIZE: usize = 0x10_0000; // 1 MB
+const IMAGE_SIZE: usize = 0xEC000; // 944 KB
 #[cfg(not(kernel_profile_size))]
 const IMAGE_SIZE: usize = 0x30_0000; // 3 MB
 
@@ -31,7 +35,7 @@ const BOOT_STACK_SIZE: usize = 0x10_0000; // 1 MB boot stack
 // Boot stack top = kernel load address + declared image size + 1 MB stack.
 // Placing the stack immediately after the reserved image region keeps the
 // memory map tight and prevents heap/PMM memory from being trapped above.
-//   size profile:    0x40200000 + 0x100000 + 0x100000 = 0x40400000
+//   size profile:    0x40200000 + 0x0EC000 + 0x100000 = 0x403EC000
 //   release profile: 0x40200000 + 0x300000 + 0x100000 = 0x40600000
 const BOOT_STACK_TOP: usize = KERNEL_PHYS_LOAD + IMAGE_SIZE + BOOT_STACK_SIZE;
 

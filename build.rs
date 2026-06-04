@@ -14,7 +14,10 @@ fn main() {
     // the reserved image region). The linker script uses PROVIDE(STACK_BOTTOM=...) as
     // a fallback that this --defsym overrides.
     let kernel_phys_load: usize = 0x4020_0000;
-    let image_size: usize = if size_profile { 0x10_0000 } else { 0x30_0000 };
+    // size profile is hand-tightened to 944 KB (page-aligned) to claw back the
+    // ~80 KB that a fixed 1 MB reserve wasted above the ~914 KB kernel; release
+    // keeps a roomy 3 MB. Must match IMAGE_SIZE in src/boot.rs.
+    let image_size: usize = if size_profile { 0xEC000 } else { 0x30_0000 };
     let stack_bottom = kernel_phys_load + image_size;
     println!("cargo:rustc-link-arg=--defsym=STACK_BOTTOM={stack_bottom:#x}");
 }

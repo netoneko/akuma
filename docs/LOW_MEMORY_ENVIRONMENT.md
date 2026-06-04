@@ -19,7 +19,7 @@ Verified with `scripts/test_memory_split.py` + the small-RAM sweeps in `logs/`
 | 24 MB | yes | yes | **yes** | 5 / 4 / 15 / 40 | was **no** (ELF load OOM) before |
 | 16 MB | yes | yes | **yes** | 5 / 4 / 7 / 14 | was **no** (SSH rejected, "memory low") before |
 | 12 MB | yes | yes | **no** | 3 / 3 / 4 / 14 | OOM spawning the tcc process — new tcc floor is just above here |
-| **8 MB** | **yes** | **yes** | **yes** | 5 / 1 / 2 / 14 | **first time 8 MB compiles + runs hello.c** (June 2026); 2764 KB free at boot; linker OOMs but still produces output. **Known issues:** heap watermark not reclaimed after process exit → subsequent spawns may get 0 PMM pages; meow `run` tool spawn regression (see Open Issues section) |
+| **8 MB** | **yes** | **yes** | marginal | 4 / 1 / ~2.08 / 14 | **first time 8 MB compiles + runs hello.c** (June 2026); free now **2844 KB** at boot after the 944 KB image-reserve fix (was 2764 KB). **tcc is currently OOM-marginal at 8 MB** — a fresh-boot first-spawn `tcc hello.c` reports `memory full`; verified compiling+running at **≥ 16 MB**. **Known issues:** heap watermark not reclaimed after process exit → subsequent spawns may get 0 PMM pages; meow `run` tool spawn regression (see Open Issues section) |
 
 So on the `size` profile after the fixes: **boot/usable-SSH floor ≤ 8 MB, tcc floor
 8 MB** (down from 48 MB). For reference, the **pre-fix** floors were boot 16 MB /
@@ -44,7 +44,8 @@ so `--release` is unaffected unless stated.
 |--------|------|--------|-------|
 | **Heap seed (`SMALL_FLOOR`)** | `src/main.rs` | 8 MB (both profiles) | 1 MB (`size`), 4 MB (`release`) |
 | **`MIN_CODE_AND_STACK`** | `src/main.rs` | 8 MB | 4 MB |
-| **`STACK_BOTTOM`** per-profile | `src/main.rs` | hardcoded `0x4090_0000` | `0x4030_0000` (`size`) / `0x4050_0000` (`release`) |
+| **`STACK_BOTTOM`** per-profile | `src/main.rs` | hardcoded `0x4090_0000` | `0x402E_C000` (`size`, see image-reserve note) / `0x4050_0000` (`release`) |
+| **`IMAGE_SIZE`** (boot-stack reserve) | `src/boot.rs` + `build.rs` | `0x10_0000` (1 MB, `size`) | `0xEC000` (944 KB, page-aligned) — hand-tightened to ~30 KB above the ~914 KB kernel; reclaims **80 KB** to user pages |
 | **Boot stack address in threading** | `ExecConfig` fields in `crates/akuma-exec/src/runtime.rs` | hardcoded `0x40700000` in threading crate | passed from `main.rs` as `boot_stack_base/top` |
 | **`USER_STACK_SIZE_OVERRIDE`** | `src/config.rs` | 8 MB (all profiles) | 0 / auto-scale (128 KB at ≤256 MB) |
 | **`SYSTEM_THREAD_STACK_SIZE`** | `src/config.rs` | 256 KB (all profiles) | 64 KB (`release`), 128 KB (`size`) |
@@ -181,7 +182,8 @@ let boot_stack_base = 0x40700000usize; // STACK_TOP - STACK_SIZE
 …and line 1138-1139 does `init_stack_canary(boot_stack_base)` → writes 8 ×
 `0xDEAD_BEEF_CAFE_BABE` at `0x40700000`. But the boot stack was **relocated** when the
 profile-aware image layout landed (`boot.rs`/`build.rs`/`linker.ld`): it now lives at
-`0x40500000–0x40600000` on `release` and `0x40300000–0x40400000` on `size`. This
+`0x40500000–0x40600000` on `release` and `0x402EC000–0x403EC000` on `size` (944 KB
+image reserve). This
 constant in the threading crate was **never updated** — and `ExecConfig` doesn't pass
 the boot-stack address in, so the crate has no way to know the real one.
 
@@ -215,13 +217,69 @@ hazard from both profiles.
   heap.
 - `exceptions.rs::init_exception_stack` had the **same** stale `0x40800000` for the
   boot thread's early exception stack; it's now profile-aware
-  (size `0x40400000` / release `0x40600000`), so an early
+  (size `0x403EC000` / release `0x40600000`), so an early
   exception can't scribble into the heap either.
 
 **Verification.** `release` now boots to SSH at 16/24/32 MB (was: hang at all of them);
 `tcc /akuma-playground/hello.c` compiles + runs at release@32 → "Hello, Akuma!";
 `size` still boots at 16 MB (no regression). Release boot floor dropped 128 MB → ≤ 16
 MB.
+
+## Tightening the boot-stack reserve (size profile, June 2026)
+
+The boot stack is placed immediately above the kernel image at
+`STACK_BOTTOM = KERNEL_PHYS_LOAD + IMAGE_SIZE`. The `size` profile reserved a flat
+**1 MB** `IMAGE_SIZE` even though the kernel is only ~914 KB
+(`_kernel_phys_end = 0x402E4650`), so ~110 KB of slack sat between the binary and the
+boot stack — and because `IMAGE_SIZE` is fixed, kernel growth (and the neko-editor
+feature drop) was *absorbed by that slack* rather than handed back to user pages.
+
+**Change:** hand-tighten the `size`-profile `IMAGE_SIZE` from `0x10_0000` (1 MB) to
+`0xEC000` (**944 KB**, page-aligned — ~30 KB over the current kernel). This is a single
+value mirrored across **five** locations that must stay in lockstep (the long-standing
+footgun behind the earlier heap/boot-stack overlap crash):
+
+| Location | Symbol | Value |
+|---|---|---|
+| `src/boot.rs` | `IMAGE_SIZE` (size) → ARM64 header + `BOOT_STACK_TOP` (SP) | `0xEC000` |
+| `build.rs` | `image_size` → `--defsym=STACK_BOTTOM` (linker `ASSERT`) | `0xEC000` |
+| `src/main.rs` | `STACK_BOTTOM` const (size) | `0x402E_C000` |
+| `src/main.rs` | `BOOT_STACK_TOP` = `STACK_BOTTOM + 1 MB` | `0x403E_C000` |
+| `src/exceptions.rs` | boot-thread exception stack top (size) | `0x403E_C000` |
+
+The linker `ASSERT(_kernel_phys_end < STACK_BOTTOM)` in `linker.ld` fails the build if
+the kernel ever outgrows the 944 KB reserve — bump the value then.
+
+**Measured at `MEMORY=8` (size profile, neko off, 940 KB binary):**
+
+| | 1 MB reserve | 944 KB reserve | Δ |
+|---|---|---|---|
+| `code+stack` region | `0x40000000–0x40500000` (5 MB) | `0x40000000–0x404EC000` (~4.92 MB) | −80 KB |
+| user pages | `0x40600000–0x40800000` (2.000 MB) | `0x405EC000–0x40800000` (2.078 MB) | **+80 KB** |
+| `free` (Mem) | 2764 KB | **2844 KB** | **+80 KB** |
+
+The whole layout shifts down exactly `0x14000` (80 KB) and that 80 KB lands entirely in
+the user-page pool. The runtime layout guard in `main.rs` passes (it prints the expected
+"within 4 MB of stack — 30 KB margin" advisory; that warning is informational, the
+kernel binary is static). Boots cleanly to SSH; binary size is unchanged (the reserve is
+RAM, not file).
+
+**tcc status at 8 MB.** With the kernel now ~914 KB (grown from the 883 KB that first
+verified 8 MB tcc), `tcc hello.c` is **OOM-marginal at 8 MB**: a fresh-boot first-spawn
+reports `memory full`, and after other process spawns it SIGSEGVs on
+`anon alloc failed, 0 free pages` (the documented "PMM pool not reclaimed after exit"
+issue — see *Open issues*). The 80 KB reclaim helps but doesn't close the gap.
+Verified compiling + running `hello.c` → "Hello, Akuma!" at **≥ 16 MB**. The reclaim is
+strictly memory-positive, so it cannot regress tcc; closing the 8 MB tcc gap needs the
+PMM-reclaim fix and/or further reservation cuts, not this knob.
+
+**Deferred — make it exact instead of hand-tuned.** The 944 KB is a manual high-water
+mark. The robust version computes `STACK_BOTTOM = ALIGN(_kernel_phys_end, 0x1000) +
+2 pages` **in `linker.ld`** (the only place that knows the linked size — `build.rs` runs
+pre-link), with `boot.rs` asm and `main.rs`/`exceptions.rs` reading `STACK_TOP`/
+`STACK_BOTTOM` as `extern` linker symbols. That would auto-track the binary (claw back
+the remaining ~14 KB and self-adjust on every build) **and** collapse the five-location
+sync into one source of truth. Not done yet.
 
 ## Per-RAM memory statistics (June 2026)
 
@@ -230,7 +288,7 @@ and `src/config.rs` (`USER_THREAD_STACK_SIZE`, `USER_STACK_SIZE_OVERRIDE`).
 Layout constants: size profile `stack_cover = 5 MB`; release profile `stack_cover = 7 MB`.
 Thread pool comes from user pages (PMM), not the heap.
 
-**size profile** — 883 KB binary, `IMAGE_SIZE` 1 MB, `USER_THREAD_STACK_SIZE` 64 KB, user-stack auto-scales (≤ 256 MB → 128 KB). Heap seed is now 1 MB (grows on demand via `PmmOomHandler`):
+**size profile** — 883 KB binary, `USER_THREAD_STACK_SIZE` 64 KB, user-stack auto-scales (≤ 256 MB → 128 KB). Heap seed is now 1 MB (grows on demand via `PmmOomHandler`). **Note:** the table below predates the 944 KB image-reserve fix (`IMAGE_SIZE` 1 MB → 944 KB, see the *Tightening the boot-stack reserve* section); that fix shifts `code+stack` down ~80 KB (5 MB → ~4.92 MB) and adds the same 80 KB to every row's user-page / free-for-procs column:
 
 | RAM | code+stack | heap seed | user pages | threads | stack pool | free for procs | % of RAM | user stack/proc | notes |
 |-----|-----------|------|-----------|---------|-----------|---------------|---------|----------------|-------|

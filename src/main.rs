@@ -303,9 +303,9 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     //   BOOT_STACK_TOP = KERNEL_PHYS_LOAD + IMAGE_SIZE + BOOT_STACK_SIZE (1 MB)
     //   STACK_BOTTOM   = KERNEL_PHYS_LOAD + IMAGE_SIZE
     //
-    //   size profile (IMAGE_SIZE=1MB):
-    //     STACK_BOTTOM   = 0x40200000 + 0x100000 = 0x40300000
-    //     BOOT_STACK_TOP = 0x40300000 + 0x100000 = 0x40400000
+    //   size profile (IMAGE_SIZE=944KB):
+    //     STACK_BOTTOM   = 0x40200000 + 0x0EC000 = 0x402EC000
+    //     BOOT_STACK_TOP = 0x402EC000 + 0x100000 = 0x403EC000
     //   release profile (IMAGE_SIZE=3MB):
     //     STACK_BOTTOM   = 0x40200000 + 0x300000 = 0x40500000
     //     BOOT_STACK_TOP = 0x40500000 + 0x100000 = 0x40600000
@@ -316,7 +316,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     // STACK_BOTTOM = KERNEL_PHYS_LOAD + IMAGE_SIZE (matches boot.rs + build.rs)
     #[cfg(kernel_profile_size)]
-    const STACK_BOTTOM: usize = 0x4030_0000; // 0x40200000 + 0x100000
+    const STACK_BOTTOM: usize = 0x402E_C000; // 0x40200000 + 0x0EC000 (944 KB)
     #[cfg(not(kernel_profile_size))]
     const STACK_BOTTOM: usize = 0x4050_0000; // 0x40200000 + 0x300000
 
@@ -369,7 +369,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // docs/PMM_DOUBLE_FREE_AND_EL1_CRASH.md, docs/STACK_CORRUPTION_ANALYSIS.md).
     //
     // BOOT_STACK_TOP = STACK_BOTTOM + 1 MB (boot stack size, matches boot.rs).
-    //   size profile:    0x40300000 + 0x100000 = 0x40400000
+    //   size profile:    0x402EC000 + 0x100000 = 0x403EC000
     //   release profile: 0x40500000 + 0x100000 = 0x40600000
     //
     // Reserve through the boot stack top plus a 1 MB guard so the heap can never
