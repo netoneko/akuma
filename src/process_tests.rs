@@ -373,6 +373,12 @@ pub fn run_all_tests() {
     test_aliased_pa_not_double_freed();
     test_unmap_and_free_respects_refcount();
 
+    // Kernel-heap → PMM reclaim: the heap grows one-way via PmmOomHandler;
+    // reclaim_to_pmm() must hand fully-free claimed spans back to the PMM so the
+    // free pool recovers between workloads (the watermark that starved tcc's
+    // repeat runs at 8 MB). See src/allocator.rs.
+    test_heap_reclaim_returns_pages_to_pmm();
+
     // CoW / munmap performance benchmarks (docs/COW_OPTIMIZATIONS.md).
     // Enabled by default for now; gate behind a config flag once the numbers
     // are stable.  Prints grep-able `[BENCH]` lines.
@@ -467,6 +473,61 @@ fn test_munmap_teardown_conserves_pmm() {
         crate::safe_print!(128,
             "[Test] munmap_teardown_conserves_pmm FAILED: free_before={} free_after={} (leak or over-free)\n",
             free_before, free_after);
+    }
+}
+
+/// The kernel heap grows on demand by claiming PMM pages (`PmmOomHandler`);
+/// those pages used to be one-way, so the free PMM pool ratcheted down after
+/// every memory-hungry process and a repeat `tcc` run hit "0 free pages".
+/// `allocator::reclaim_to_pmm()` truncates fully-free claimed spans out of Talc
+/// and returns them to the PMM. This gates that the pool actually recovers.
+///
+/// Forcing a PMM claim requires allocating past the current heap free space, so
+/// on big-heap boots (≥256 MB seed) we skip rather than make a huge transient
+/// allocation — the mechanism matters on small RAM, which is where it runs.
+fn test_heap_reclaim_returns_pages_to_pmm() {
+    let heap_free = crate::allocator::stats().free;
+    if heap_free > 8 * 1024 * 1024 {
+        crate::safe_print!(160,
+            "[Test] heap_reclaim_returns_pages_to_pmm SKIPPED (heap free {} KB > 8 MB; boot at e.g. MEMORY=48M to exercise)\n",
+            heap_free / 1024);
+        return;
+    }
+
+    let free_before = crate::pmm::free_count();
+
+    // Allocate past the current heap free space to force PmmOomHandler to claim
+    // a fresh span from the PMM, then drop it so the span becomes fully free.
+    let free_low;
+    {
+        let buf: alloc::vec::Vec<u8> = alloc::vec![0xABu8; heap_free + 512 * 1024];
+        core::hint::black_box(buf.as_ptr());
+        free_low = crate::pmm::free_count();
+    }
+
+    if free_low >= free_before {
+        crate::safe_print!(160,
+            "[Test] heap_reclaim_returns_pages_to_pmm INCONCLUSIVE: no PMM claim observed (before={} low={})\n",
+            free_before, free_low);
+        return;
+    }
+
+    let reclaimed = crate::allocator::reclaim_to_pmm();
+    let free_after = crate::pmm::free_count();
+
+    // The invariant: after dropping the buffer and reclaiming, the free pool
+    // recovers essentially back to baseline (within one grow chunk = 64 pages).
+    // `reclaimed == 0` is acceptable only if the periodic monitor already
+    // returned the span — but then the pool must still have recovered.
+    let recovered = free_after + 64 >= free_before;
+    if recovered && reclaimed > 0 {
+        crate::safe_print!(192,
+            "[Test] heap_reclaim_returns_pages_to_pmm PASSED (claim dropped free to {}, reclaimed {} pages, recovered to {} of {})\n",
+            free_low, reclaimed, free_after, free_before);
+    } else {
+        crate::safe_print!(192,
+            "[Test] heap_reclaim_returns_pages_to_pmm FAILED: before={} low={} after={} reclaimed={} (pool did not return cleanly)\n",
+            free_before, free_low, free_after, reclaimed);
     }
 }
 

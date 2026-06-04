@@ -57,11 +57,154 @@ impl talc::OomHandler for PmmOomHandler {
         const GROW_PAGES: usize = 64;
         let needed = (layout.size() + PAGE_SIZE - 1) / PAGE_SIZE;
         let n = needed.max(GROW_PAGES);
+        // NB: `alloc_pages_contiguous_zeroed` may try `reclaim_to_pmm()` on
+        // failure, which `TALC.try_lock()`s — that lock is held by us right now
+        // (we were called from inside `malloc`), so the try_lock fails and the
+        // reclaim is a no-op. No deadlock, no benefit; just don't rely on it here.
         let frame = crate::pmm::alloc_pages_contiguous_zeroed(n).ok_or(())?;
         let ptr = akuma_exec::mmu::phys_to_virt(frame.addr) as *mut u8;
         let span = Span::from_base_size(ptr, n * PAGE_SIZE);
-        unsafe { talc.claim(span).map(|_| ()).map_err(|_| ()) }
+        match unsafe { talc.claim(span) } {
+            Ok(_heap) => {
+                // Record the PMM-backed span so `reclaim_to_pmm()` can return it
+                // later once it is fully free. If the registry is full the span
+                // is still used as heap — it just becomes non-reclaimable (the
+                // pre-reclaim one-way behaviour).
+                register_claimed_span(frame.addr, n);
+                HEAP_SIZE.fetch_add(n * PAGE_SIZE, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(()) => {
+                // Couldn't establish a heap in the pages — return them to PMM
+                // rather than leaking (the old code dropped them on the floor).
+                crate::pmm::free_pages_contiguous(akuma_exec::PhysFrame::new(frame.addr), n);
+                Err(())
+            }
+        }
     }
+}
+
+// ============================================================================
+// Heap → PMM reclaim
+// ============================================================================
+//
+// `handle_oom` grows the kernel heap by claiming contiguous pages from the PMM.
+// Talc never returns those pages on its own, so on a small machine the heap's
+// high-water mark is permanent: after a memory-hungry process (tcc, meow) exits,
+// its kernel-side allocations are freed back into Talc's free list, but the
+// underlying PMM pages stay committed to the heap. The free PMM pool ratchets
+// down until the next spawn / demand page-fault gets "0 free pages".
+//
+// `reclaim_to_pmm()` walks the recorded PMM-backed spans and, for each one that
+// is now *entirely* free inside Talc, truncates it out of the heap and returns
+// the pages to the PMM. It is called:
+//   * from `pmm::alloc_*` on allocation failure (reclaim-under-pressure, the
+//     path that lets a single tcc compile fit at 8 MB), and
+//   * periodically from the memory monitor + on process reap (so back-to-back
+//     runs start from a clean pool).
+
+/// Max number of PMM-backed heap spans we track for reclaim. At the 256 KB grow
+/// granularity this covers 128 MB of heap growth, far beyond any small-RAM
+/// target. Overflow degrades to non-reclaimable (safe). Kept small because the
+/// array is static BSS and the size-profile kernel has a tight image reserve.
+const MAX_CLAIMED_SPANS: usize = 512;
+
+/// A heap region claimed from the PMM by `handle_oom`. We always claim
+/// page-aligned, page-multiple spans, and Talc's `claim()` word-aligns inward
+/// (a no-op for page alignment), so the Talc heap extent is exactly
+/// `[phys_to_virt(pmm_addr), +pages*PAGE_SIZE)` — no need to store it. `pages
+/// == 0` marks a free slot.
+#[derive(Clone, Copy)]
+struct ClaimedSpan {
+    pmm_addr: usize,
+    pages: usize,
+}
+
+impl ClaimedSpan {
+    const fn empty() -> Self {
+        Self { pmm_addr: 0, pages: 0 }
+    }
+    fn heap_span(&self) -> Span {
+        let base = akuma_exec::mmu::phys_to_virt(self.pmm_addr) as *mut u8;
+        Span::from_base_size(base, self.pages * PAGE_SIZE)
+    }
+}
+
+static CLAIMED_SPANS: Spinlock<[ClaimedSpan; MAX_CLAIMED_SPANS]> =
+    Spinlock::new([ClaimedSpan::empty(); MAX_CLAIMED_SPANS]);
+/// Running total of pages handed back to the PMM (for the `[Mem]` stats line).
+static RECLAIMED_PAGES_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+/// Record a heap span claimed from the PMM. Called from `handle_oom` with the
+/// `TALC` lock held → lock order is always TALC → CLAIMED_SPANS, matching
+/// `reclaim_to_pmm()`, so the two never deadlock.
+fn register_claimed_span(pmm_addr: usize, pages: usize) {
+    let mut spans = CLAIMED_SPANS.lock();
+    for s in spans.iter_mut() {
+        if s.pages == 0 {
+            *s = ClaimedSpan { pmm_addr, pages };
+            return;
+        }
+    }
+    // Registry full: leave the span claimed but untracked (non-reclaimable).
+}
+
+/// Return fully-free PMM-backed heap spans to the physical allocator.
+/// Returns the number of pages reclaimed. Safe to call from any non-allocator
+/// context; if the `TALC` lock is held (e.g. we are reentered from inside
+/// `handle_oom`) it bails immediately via `try_lock`.
+pub fn reclaim_to_pmm() -> usize {
+    if !is_pmm_ready() {
+        return 0;
+    }
+    let mut reclaimed_pages = 0usize;
+    // Free one span per lock cycle: keep the TALC/CLAIMED critical section tiny
+    // and release both locks before touching the PMM (lock order TALC → PMM is
+    // what `handle_oom` uses; we never invert it).
+    for _ in 0..MAX_CLAIMED_SPANS {
+        let to_free = with_irqs_disabled(|| {
+            // try_lock, not lock: if TALC is held we were reentered from the
+            // allocator itself — bail rather than self-deadlock on the spinlock.
+            let mut talc = match TALC.try_lock() {
+                Some(t) => t,
+                None => return None,
+            };
+            let mut spans = CLAIMED_SPANS.lock();
+            for s in spans.iter_mut() {
+                if s.pages == 0 {
+                    continue;
+                }
+                let heap = s.heap_span();
+                // get_allocated_span + truncate must be atomic w.r.t. other
+                // allocations; we hold TALC across both, so they are.
+                let allocated = unsafe { talc.get_allocated_span(heap) };
+                if allocated.is_empty() {
+                    unsafe { talc.truncate(heap, Span::empty()); }
+                    let result = (s.pmm_addr, s.pages);
+                    *s = ClaimedSpan::empty();
+                    return Some(result);
+                }
+            }
+            None
+        });
+        match to_free {
+            Some((addr, pages)) => {
+                crate::pmm::free_pages_contiguous(akuma_exec::PhysFrame::new(addr), pages);
+                HEAP_SIZE.fetch_sub(pages * PAGE_SIZE, Ordering::Relaxed);
+                reclaimed_pages += pages;
+            }
+            None => break,
+        }
+    }
+    if reclaimed_pages > 0 {
+        RECLAIMED_PAGES_TOTAL.fetch_add(reclaimed_pages, Ordering::Relaxed);
+    }
+    reclaimed_pages
+}
+
+/// Total pages returned to the PMM since boot (for stats / tests).
+pub fn reclaimed_pages_total() -> usize {
+    RECLAIMED_PAGES_TOTAL.load(Ordering::Relaxed)
 }
 
 // ============================================================================

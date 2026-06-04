@@ -18,8 +18,8 @@ Verified with `scripts/test_memory_split.py` + the small-RAM sweeps in `logs/`
 | 32 MB | yes | yes | **yes** | 5 / 4 / 23 / 64 | was **no** (anon alloc OOM) before the fixes |
 | 24 MB | yes | yes | **yes** | 5 / 4 / 15 / 40 | was **no** (ELF load OOM) before |
 | 16 MB | yes | yes | **yes** | 5 / 4 / 7 / 14 | was **no** (SSH rejected, "memory low") before |
-| 12 MB | yes | yes | **no** | 3 / 3 / 4 / 14 | OOM spawning the tcc process — new tcc floor is just above here |
-| **8 MB** | **yes** | **yes** | marginal | 4 / 1 / ~2.08 / 14 | **first time 8 MB compiles + runs hello.c** (June 2026); free now **2844 KB** at boot after the 944 KB image-reserve fix (was 2764 KB). **tcc is currently OOM-marginal at 8 MB** — a fresh-boot first-spawn `tcc hello.c` reports `memory full`; verified compiling+running at **≥ 16 MB**. **Known issues:** heap watermark not reclaimed after process exit → subsequent spawns may get 0 PMM pages (this is also what makes a *late* meow spawn fail — see Open Issues §2; a fresh-boot meow spawn of `/tmp/hello` succeeds, verified 2026-06-04) |
+| 12 MB | yes | yes | **yes** | 3 / 3 / 4 / 14 | now fits (no whole-binary slurp) |
+| **8 MB** | **yes** | **yes** | **yes (repeatable)** | 4 / 1 / ~2.08 / 14 | **`tcc hello.c -o /tmp/h && /tmp/h` compiles + runs repeatedly** (6 cycles verified, 2026-06-04). Earlier "marginal / `memory full`" was the dormant-cfg slurp bug (akuma-exec had no build.rs → `HEAP_SLURP_MAX` was 1 MiB, so the 723 KB tcc binary was slurped whole). Fixed by `crates/akuma-exec/build.rs` + heap→PMM reclaim — see *`tcc hello.c` now runs repeatedly at 8 MB* below |
 
 So on the `size` profile after the fixes: **boot/usable-SSH floor ≤ 8 MB, tcc floor
 8 MB** (down from 48 MB). For reference, the **pre-fix** floors were boot 16 MB /
@@ -81,35 +81,69 @@ more large allocations that each individually exceeded the 1 MB heap seed:
 the link step (heap fills to ~1.3 MB via `PmmOomHandler`) but produces the output
 binary before dying — a separate issue from spawning and running tcc itself.
 
-## Open issues at 8 MB (June 2026)
+## `tcc hello.c` now runs repeatedly at 8 MB (FIXED 2026-06-04)
 
-### 1. Kernel heap watermark — memory not reclaimed after process exit
+**`tcc /akuma-playground/hello.c -o /tmp/h && /tmp/h` now compiles + runs `Hello,
+Akuma!` repeatedly at MEMORY=8M (size profile), no reboot between runs.** Verified
+6 consecutive compile→run cycles, zero OOM, zero kernel faults. Two bugs were behind
+the prior "first compile = `memory full`, repeats SIGSEGV, kernel eventually panics"
+behaviour:
 
-After a process exits, PMM free pages recover only partially. Observed in `neatvi1.log`:
+### Root cause A — the size-profile ELF gates in `akuma-exec` were DEAD CODE
 
-```
-t=89s  (before meow):   RAM: 2/8MB free | Heap: 813 KB
-t=92s  (meow starts):   RAM: 1/8MB free | Heap: 865 KB
-t=110s (during meow):   RAM: 0/8MB free | Heap: 1686 KB
-t=200s (meow exits):    RAM: 1/8MB free | Heap: 1699 KB   ← only 1 MB back, not 2
-```
+`crates/akuma-exec` had **no `build.rs`**, so the `kernel_profile_size` cfg was never
+emitted for that crate — yet it contains **7** `#[cfg(kernel_profile_size)]` gates. Every
+one silently compiled the `not(kernel_profile_size)` branch *even on the size profile*.
+So the headline "even-smaller-kernel" ELF fixes attributed to akuma-exec (demand-paged
+loader threshold `HEAP_SLURP_MAX = 0`, page-by-page interpreter loader) **never actually
+took effect** — the kernel still ran with `HEAP_SLURP_MAX = 1 MiB` and the slurp-based
+interpreter loader. The bin crate and `akuma-net` each have a `build.rs` doing the
+`OPT_LEVEL == "z"` detection; akuma-exec was simply missing one.
 
-**Root cause: `PmmOomHandler` growth is one-way.** Meow made 8 TCP connections to
-Ollama (10.0.2.2:11434). Each TCP socket carries a 16 KB RX + 16 KB TX buffer
-allocated on the kernel heap. When the heap ran short, `PmmOomHandler` consumed PMM
-pages to expand the talc arena. After meow exits and fds close, the socket buffers are
-freed back to talc, but talc never returns pages to PMM — so the ~1 MB consumed
-during the session stays permanently in the heap pool. This is the same high-watermark
-behaviour that any allocation peak leaves behind.
+Consequence: spawning `/usr/bin/tcc` (723 480 bytes < 1 MiB) read the **entire binary**
+into the kernel heap (`spawn.rs` `read_file` path), and the dynamic linker was slurped
+too. That pushed the heap peak to ~2 MB on an 8 MB box, starving tcc's demand-paged
+user pages → `memory full` / SIGSEGV. Under fragmentation a later 723 KB slurp landed in
+a kernel thread with no current process, so `alloc_error_handler` had nothing to kill and
+**panicked the whole kernel** (`EC=0x3c` BRK).
 
-**Consequence at 8 MB:** after one meow session, the free PMM pool drops from ~512 to
-~256 pages and stays there. A subsequent `tcc` spawn (observed in the same log at
-t=212s, pid=3) gets `0 free pages` on its first anonymous page fault and is killed with
-SIGSEGV. This makes the 8 MB tcc result non-repeatable without a reboot between runs.
+**Fix:** added `crates/akuma-exec/build.rs` (mirrors `akuma-net`) emitting
+`kernel_profile_size` under `OPT_LEVEL=z`. All 7 gates now activate on the size profile:
+no binary slurp, interpreter loaded page-by-page. Heap peak during a tcc compile dropped
+~2005 KB → ~1583 KB and is stable across runs. `load_interpreter` (the slurp variant) is
+now `#[cfg(not(kernel_profile_size))]`.
 
-**No fix yet.** Heap shrinking (returning free talc pages to PMM) is the correct fix but
-requires either a talc `unclaim` API or a custom trim pass. Workaround: reduce
-`TCP_RX_BUFFER_SIZE` / `TCP_TX_BUFFER_SIZE` further under `kernel_profile_size`.
+Also hardened `spawn.rs`: the loader choice no longer falls back to a whole-file
+`read_file()` when `file_size()` returns `None` (a transient under memory pressure). On
+the size profile it now *always* uses the demand-paged path loader and re-stats if needed
+— so even a stat hiccup can't route a large binary into a heap slurp.
+
+### Root cause B — kernel heap watermark was one-way (now reclaimed)
+
+`PmmOomHandler` grows the heap by claiming ≥256 KB spans from the PMM (`alloc_pages_
+contiguous_zeroed` → `talc.claim`). Talc never returned them, so the free PMM pool
+ratcheted down after every memory-hungry process (e.g. meow's 8 TCP sockets × 32 KB
+buffers) and a later spawn / page-fault hit `0 free pages`.
+
+**Fix:** `allocator::reclaim_to_pmm()` (src/allocator.rs) records every PMM-backed span
+and, for each one that is *entirely* free inside Talc, `truncate`s it out of the heap and
+returns the pages to the PMM (talc 4.4.3's `get_allocated_span` + `truncate`). It is
+called:
+* from `pmm::alloc_page` / `alloc_pages_contiguous_zeroed` on allocation **failure**
+  (reclaim-under-pressure, then retry once) — deadlock-safe via `TALC.try_lock()`, which
+  is a no-op when reentered from inside `handle_oom`;
+* periodically from the memory monitor (idle watermark trim; surfaced as
+  `reclaimed=<N>KB` in the `[Mem]` line).
+
+Gated boot self-test: `test_heap_reclaim_returns_pages_to_pmm` in `src/process_tests.rs`
+forces a PMM claim, frees it, and asserts the pool returns to baseline (verified at
+MEMORY=48M: "reclaimed 1542 pages, recovered to 7548 of 7548"). Skips on ≥256 MB boots
+(heap seed too large to cheaply force a claim).
+
+> For the `tcc hello.c` workload, fix A is what makes repeats work — the heap peak now
+> stays ~1.5 MB and the ~2 MB user pool returns cleanly between runs, so no claimed span
+> is ever fully free for B to reclaim. Fix B is the safety net for socket-heavy workloads
+> (meow) where the heap genuinely frees large buffers on exit.
 
 ### 2. meow spawn — NOT a regression; it was the issue-#1 OOM (resolved 2026-06-04)
 

@@ -475,6 +475,21 @@ pub fn init(ram_base: usize, ram_size: usize, kernel_end: usize) {
 
 /// Allocate a single physical page
 pub fn alloc_page() -> Option<PhysFrame> {
+    if let Some(frame) = alloc_page_once() {
+        return Some(frame);
+    }
+    // Out of free pages: try clawing back fully-free kernel-heap spans (the
+    // heap grows one-way via the OOM handler; this returns the watermark), then
+    // retry once. `reclaim_to_pmm` is a no-op if the heap lock is already held
+    // (i.e. we were reentered from the allocator), so this can't deadlock.
+    if crate::allocator::reclaim_to_pmm() > 0 {
+        alloc_page_once()
+    } else {
+        None
+    }
+}
+
+fn alloc_page_once() -> Option<PhysFrame> {
     // CRITICAL: Disable IRQs to prevent deadlock!
     // If a timer fires while holding PMM lock, scheduler switches to another
     // thread which tries to allocate -> spins forever waiting for lock.
@@ -540,12 +555,26 @@ pub fn discount_double_frees(n: usize) {
 pub fn alloc_pages_contiguous_zeroed(count: usize) -> Option<PhysFrame> {
     use akuma_exec::mmu::phys_to_virt;
 
-    let frame = crate::irq::with_irqs_disabled(|| {
+    let alloc_once = || crate::irq::with_irqs_disabled(|| {
         let mut pmm = PMM.lock();
         let result = pmm.alloc_pages_contiguous(count)?;
         ALLOCATED_PAGES.fetch_add(count, Ordering::Relaxed);
         Some(result)
-    })?;
+    });
+
+    let frame = match alloc_once() {
+        Some(f) => f,
+        None => {
+            // No contiguous run available: reclaim fully-free heap spans (which
+            // returns whole 256 KB-aligned regions, helping contiguous demand)
+            // and retry once. No-op + no deadlock if the heap lock is held.
+            if crate::allocator::reclaim_to_pmm() > 0 {
+                alloc_once()?
+            } else {
+                return None;
+            }
+        }
+    };
 
     unsafe {
         let virt_addr = phys_to_virt(frame.addr);

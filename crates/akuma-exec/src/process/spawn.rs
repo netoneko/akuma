@@ -148,11 +148,35 @@ pub fn spawn_process_with_channel_ext(
     const HEAP_SLURP_MAX: usize = 1024 * 1024; // 1 MiB
     let stat_size = (runtime().file_size)(elf_path).ok().map(|s| s as usize);
 
-    let mut process = if matches!(stat_size, Some(sz) if sz > HEAP_SLURP_MAX) {
-        let result = Process::from_elf_path(elf_path, elf_path, stat_size.unwrap(), &full_args, &full_env, None);
+    // Pick the loader. Prefer the demand-paged path loader whenever slurping is
+    // disabled (size profile, HEAP_SLURP_MAX == 0) OR the binary is large.
+    //
+    // CRITICAL: this must NOT fall back to a whole-file read_file() merely
+    // because file_size() returned None. That hole meant a transient stat
+    // failure under memory pressure routed a 723 KB binary (tcc) into a single
+    // ~706 KB kernel-heap slurp; with the heap watermark already high the alloc
+    // failed in a kernel thread with no current process, so alloc_error_handler
+    // had nothing to kill and panicked the whole kernel (EC=0x3c BRK). On the
+    // size profile we now always use the path loader and re-stat if needed,
+    // never slurp.
+    let want_demand_paged =
+        HEAP_SLURP_MAX == 0 || matches!(stat_size, Some(sz) if sz > HEAP_SLURP_MAX);
+
+    let mut process = if want_demand_paged {
+        // The path loader needs a size; re-stat if the first stat failed rather
+        // than silently slurping the whole file.
+        let file_size = stat_size
+            .or_else(|| (runtime().file_size)(elf_path).ok().map(|s| s as usize))
+            .ok_or_else(|| {
+                if use_ns_override { (runtime().clear_spawn_namespace)(); }
+                format!("Failed to stat {}", elf_path)
+            })?;
+        let result = Process::from_elf_path(elf_path, elf_path, file_size, &full_args, &full_env, None);
         if use_ns_override { (runtime().clear_spawn_namespace)(); }
         result.map_err(|e| format!("Failed to load ELF: {}", e))?
     } else {
+        // Small binary on a profile that permits slurping: whole-file path, with
+        // a demand-paged fallback if the read itself fails.
         match (runtime().read_file)(elf_path) {
             Ok(elf_data) => {
                 let result = Process::from_elf(elf_path, &full_args, &full_env, &elf_data, None);

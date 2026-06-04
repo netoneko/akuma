@@ -1215,6 +1215,12 @@ async fn memory_monitor() -> ! {
     let mut buf = StackBuffer::new();
 
     loop {
+        // Proactively return fully-free kernel-heap spans to the PMM so the free
+        // pool recovers between workloads (idle watermark trimming). The
+        // reclaim-under-pressure path in pmm::alloc_* handles the acute case;
+        // this keeps the steady-state pool clean. See src/allocator.rs.
+        allocator::reclaim_to_pmm();
+
         let stats = allocator::stats();
         let allocated_kb = stats.allocated / 1024;
         let free_kb = stats.free / 1024;
@@ -1239,13 +1245,21 @@ async fn memory_monitor() -> ! {
         } else {
             alloc::string::String::new()
         };
+        let reclaimed_pages = allocator::reclaimed_pages_total();
         buf.clear();
         let _ = write!(
             buf,
-            "[Mem] Uptime {} | RAM: {}/{}MB free | Heap: {}/{}MB free ({} KB used, {} KB peak) | Allocs: {} | Threads: {}/{} ({}r {}rd){}\n",
+            "[Mem] Uptime {} | RAM: {}/{}MB free | Heap: {}/{}MB free ({} KB used, {} KB peak) | Allocs: {} | Threads: {}/{} ({}r {}rd){}",
             uptime_us, free_ram_mb, total_ram_mb, free_kb / 1024, heap_mb, allocated_kb, peak_kb, stats.allocation_count,
             threads_used, threads_max, threads_running, threads_ready, dfree_marker
         );
+        // Pages handed back from the heap to the PMM since boot — non-zero means
+        // the heap watermark is being trimmed (see allocator::reclaim_to_pmm).
+        // Written straight into the stack buffer; no heap alloc in the mem monitor.
+        if reclaimed_pages > 0 {
+            let _ = write!(buf, " | reclaimed={}KB", reclaimed_pages * 4);
+        }
+        let _ = write!(buf, "\n");
         console::print(buf.as_str());
 
         let ssh = ssh::server::stats();

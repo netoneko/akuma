@@ -272,6 +272,9 @@ pub fn load_elf(elf_data: &[u8], interp_prefix: Option<&str>) -> Result<LoadedEl
 }
 
 /// Load the dynamic linker (interpreter) ELF into an existing address space.
+/// Slurp-based; on the size profile the page-by-page `load_interpreter_from_path`
+/// is used instead, so this is only compiled off the size profile.
+#[cfg(not(kernel_profile_size))]
 fn load_interpreter(elf_data: &[u8], address_space: &mut UserAddressSpace) -> Result<InterpInfo, ElfError> {
     let elf = ElfBytes::<LittleEndian>::minimal_parse(elf_data)
         .map_err(|_| ElfError::InvalidFormat("Interpreter parse failed"))?;
