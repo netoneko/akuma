@@ -12,14 +12,21 @@ Verified with `scripts/test_memory_split.py` + the small-RAM sweeps in `logs/`
 
 **Measured `size`-profile sweep (June 2026, 883 KB binary, `tcc /akuma-playground/hello.c -o /tmp/hello`).** The action plan below (items 1–5) has since landed; these are the **post-fix** numbers:
 
-| RAM | boots to SSH? | SSH usable? | runs tcc `hello.c`? | code+stack / heap / user / thread-limit | notes |
-|---|---|---|---|---|---|
-| 48 MB | yes | yes | **yes** | 5 / 6 / 37 / 64 | — |
-| 32 MB | yes | yes | **yes** | 5 / 4 / 23 / 64 | was **no** (anon alloc OOM) before the fixes |
-| 24 MB | yes | yes | **yes** | 5 / 4 / 15 / 40 | was **no** (ELF load OOM) before |
-| 16 MB | yes | yes | **yes** | 5 / 4 / 7 / 14 | was **no** (SSH rejected, "memory low") before |
-| 12 MB | yes | yes | **yes** | 3 / 3 / 4 / 14 | now fits (no whole-binary slurp) |
-| **8 MB** | **yes** | **yes** | **yes (repeatable)** | 4 / 1 / ~2.08 / 14 | **`tcc hello.c -o /tmp/h && /tmp/h` compiles + runs repeatedly** (6 cycles verified, 2026-06-04). Earlier "marginal / `memory full`" was the dormant-cfg slurp bug (akuma-exec had no build.rs → `HEAP_SLURP_MAX` was 1 MiB, so the 723 KB tcc binary was slurped whole). Fixed by `crates/akuma-exec/build.rs` + heap→PMM reclaim — see *`tcc hello.c` now runs repeatedly at 8 MB* below |
+| RAM | boots to SSH? | SSH usable? | runs tcc `hello.c`? | meow → ollama? | code+stack / heap / user / thread-limit | notes |
+|---|---|---|---|---|---|---|
+| 48 MB | yes | yes | **yes** | yes | 5 / 6 / 37 / 64 | — |
+| 32 MB | yes | yes | **yes** | yes | 5 / 4 / 23 / 64 | was **no** (anon alloc OOM) before the fixes |
+| 24 MB | yes | yes | **yes** | yes | 5 / 4 / 15 / 40 | was **no** (ELF load OOM) before |
+| 16 MB | yes | yes | **yes** | yes | 5 / 4 / 7 / 14 | was **no** (SSH rejected, "memory low") before |
+| 12 MB | yes | yes | **yes** | yes | 3 / 3 / 4 / 14 | now fits (no whole-binary slurp) |
+| **8 MB** | **yes** | **yes** | **yes (repeatable)** | yes | 4 / 1 / ~2.08 / 14 | **`tcc hello.c -o /tmp/h && /tmp/h` compiles + runs repeatedly** (6 cycles verified, 2026-06-04). Earlier "marginal / `memory full`" was the dormant-cfg slurp bug (akuma-exec had no build.rs → `HEAP_SLURP_MAX` was 1 MiB, so the 723 KB tcc binary was slurped whole). Fixed by `crates/akuma-exec/build.rs` + heap→PMM reclaim — see *`tcc hello.c` now runs repeatedly at 8 MB* below |
+| **7 MB** | **yes** | **yes** | no (user pages ~1 MB < tcc working set) | **yes** | 4 / 1 / ~1 / 14 | **`meow -c` connects to ollama + streams a full reply** (verified 2026-06-05 on `extreme`, 25.2 TPS, ~3.8 MB free). Both meow and every userspace Rust ELF were broken at *all* RAM sizes on `size`/`extreme` until the lazy-ELF segment-boundary fix — see *meow → ollama runs at 7 MB* above |
+
+The **meow → ollama** column is directly verified at **7 MB** (`extreme`) and
+256 MB; the higher `size` tiers are inferred (meow's ~1 MB working set is smaller
+than tcc's ~1.5–2 MB, which is measured at each tier, and the segment-boundary
+fix is RAM-independent). meow needs less RAM than tcc, so its floor tracks the
+boot/SSH floor (~7 MB) rather than the tcc floor.
 
 So on the `size` profile after the fixes: **boot/usable-SSH floor 6 MB, tcc floor
 8 MB** (tcc down from 48 MB). Probed 2026-06-04: 6 MB and 7 MB both boot to a usable
@@ -43,6 +50,61 @@ What moved the floor: four over-provisioned "≥ 256 MB" reservations were cut o
 decisively the **`code+stack` region 11 MB → 5 MB** by removing the stale 8 MB
 boot-stack gap (item 4). `code+stack` is now a flat ~5 MB instead of 11 MB. The
 `PmmOomHandler` then dropped the heap seed to 1 MB (was 4 MB), unlocking SSH at 8 MB.
+
+## meow → ollama runs at 7 MB — lazy-ELF segment-boundary zeroing (FIXED 2026-06-05)
+
+**Symptom.** On the `size`/`extreme` kernel `meow -c "…"` failed immediately with
+`Failed to create request buffer` at every RAM size — even 256 MB — while the
+**byte-identical** `meow` binary worked fine on the `release` kernel. The error
+came from `libakuma::open`, which builds a NUL-terminated path with
+`format!("{}\0", path)` then calls `openat`. A userspace probe showed the
+formatted `String` was **empty** (`as_ptr() == 0x1`, the dangling empty-`Vec`
+pointer), so the kernel received path pointer `0x1` and returned `EFAULT` on
+every `open`/`mkdir`/`unlink` (`[EFAULT] nr=56 … args=[…, 0x1, …]`).
+
+**Root cause — the on-demand ELF loader zeroed a neighbour segment's `.rodata`.**
+`release` slurps the whole ELF and copies every PT_LOAD segment into its pages
+eagerly (`load_elf`, de-duplicating shared frames via `mapped_pages`). The
+`size`/`extreme` profiles demand-page instead (`load_elf_from_path` →
+`DeferredLazySegment`, faulted in by `exceptions.rs`). The demand-pager fills a
+faulting page from the file **only up to the faulting segment's `filesz`** and
+then **zero-fills the rest of the page**. When two PT_LOAD segments share a
+boundary page — the normal `.text`→`.rodata` case — this clobbers the second
+segment's file-backed bytes, and that segment's own lazy region then finds the
+page already mapped and never fills it.
+
+meow's layout (3 PT_LOAD segments) hits exactly this:
+
+| Segment | flags | virtual range | shared page |
+|---------|-------|---------------|-------------|
+| 1 | R-X (text + early rodata) | `0x400000` … ends `0x4375D8` | `0x437000` |
+| 2 | R-- (`.rodata`) | starts `0x437558` … `0x443274` | `0x437000` |
+| 3 | R-W (`.data`/`.bss`) | `0x444000` … (page-aligned) | — |
+
+Segments 1 and 2 share page `0x437000`. The first instruction fault read-aheads
+through segment 1, maps `0x437000`, fills `[0x437000, 0x4375D8)` from the file
+and **zeroes `[0x4375D8, 0x438000)`** — which is segment 2's `.rodata`. The ~2.6 KB
+zeroed there held string literals and `format!` argument *pieces*
+(`"https://"`, `"base_url"`, the template fragments). With the pieces zeroed,
+`format!` writes nothing and returns an empty `String` → path pointer `0x1` →
+`EFAULT`. Every userspace Rust ELF with a shared text/rodata boundary page was
+silently corrupted on these profiles (paws, dash, herd, quickjs, …), not just
+meow.
+
+**Fix.** `boundary_extended_filesz()` in `crates/akuma-exec/src/elf/mod.rs`: when
+a deferred segment's file data ends mid-page and the next PT_LOAD segment begins
+in that same page, extend this segment's fill to the shared-page end. ELF
+`p_offset`s are contiguous, so the next segment's bytes sit right after this
+one's in the file. The extension is **bounded by the next segment's own file
+extent**, so a final segment's trailing `.bss` is still zeroed (never filled
+with file garbage). Covered by host unit tests in the `boundary_tests` module
+(`cargo test -p akuma-exec boundary`). `release` (eager `load_elf`) is
+unaffected.
+
+**Verified (2026-06-05).** On the `extreme` kernel at **7 MB**: `meow -c` connects
+to ollama (`connect(10.0.2.2:11434) = OK`), streams a full response (25.2 TPS,
+~3.8 MB free), zero `path=0x1` faults. Also verified on `size`/`extreme` at
+256 MB. Pre-fix it failed at all sizes on these profiles.
 
 ## What landed in the `even-smaller-kernel` branch (June 2026)
 

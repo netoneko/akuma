@@ -873,6 +873,37 @@ fn file_read_exact(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, Elf
 /// Load an ELF binary on demand from a file path, reading segment data
 /// page-by-page via read_at() instead of buffering the entire file.
 /// Supports PIE (ET_DYN) and non-PIE (ET_EXEC) without relocations.
+/// Effective fill length for a deferred (demand-paged) PT_LOAD segment.
+///
+/// When a segment's file-backed data ends part-way through a page and a
+/// *following* PT_LOAD segment begins in that same page, the demand-pager
+/// maps the page on whichever segment faults first, fills it only up to that
+/// segment's `filesz`, and zero-fills the remainder of the page. For the
+/// earlier segment that zero-fill clobbers the next segment's file-backed
+/// bytes (whose own lazy region then sees the page already mapped and never
+/// fills it) — silently corrupting e.g. `.rodata` that abuts `.text`.
+///
+/// ELF `p_offset`s are contiguous, so the bytes the next segment needs sit
+/// right after this segment's in the file. We therefore extend this segment's
+/// fill to the end of the shared page (bounded by the next segment's own file
+/// extent, so we never read past real file data into what must stay zeroed
+/// `.bss`). `pt_loads` is `(start_va, file_end_va)` for every PT_LOAD segment.
+pub(crate) fn boundary_extended_filesz(
+    vaddr: usize,
+    filesz: usize,
+    pt_loads: &[(usize, usize)],
+) -> usize {
+    let seg_last_page_end = (vaddr + filesz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let mut eff = filesz;
+    for &(next_va, next_file_end) in pt_loads {
+        if next_va > vaddr && next_va < seg_last_page_end {
+            let extend_to = core::cmp::min(seg_last_page_end, next_file_end);
+            eff = eff.max(extend_to - vaddr);
+        }
+    }
+    eff
+}
+
 pub fn load_elf_from_path(path: &str, file_size: usize, interp_prefix: Option<&str>) -> Result<LoadedElf, ElfError> {
     let hdr_buf = file_read_exact(path, 0, ELF64_EHDR_SIZE)?;
     let ehdr = parse_elf64_ehdr_checked(&hdr_buf)?;
@@ -931,6 +962,13 @@ pub fn load_elf_from_path(path: &str, file_size: usize, interp_prefix: Option<&s
             file_size, file_size / 1024 / 1024, is_pie, file_inode);
     }
 
+    // (start_va, file_end) for every PT_LOAD segment, used below to detect
+    // boundary pages shared by two segments.
+    let pt_loads: Vec<(usize, usize)> = phdrs.iter()
+        .filter(|p| p.p_type == PT_LOAD)
+        .map(|p| (base + p.p_vaddr as usize, base + p.p_vaddr as usize + p.p_filesz as usize))
+        .collect();
+
     for phdr in &phdrs {
         if phdr.p_type != PT_LOAD {
             continue;
@@ -938,9 +976,16 @@ pub fn load_elf_from_path(path: &str, file_size: usize, interp_prefix: Option<&s
 
         let vaddr = base + phdr.p_vaddr as usize;
         let memsz = phdr.p_memsz as usize;
-        let filesz = phdr.p_filesz as usize;
+        let mut filesz = phdr.p_filesz as usize;
         let offset = phdr.p_offset as usize;
         let flags = phdr.p_flags;
+
+        // Boundary-page fix (see `boundary_extended_filesz`): when this
+        // segment's file-backed data ends mid-page and the *next* segment
+        // begins in that same page, the demand-pager would map the page on
+        // this segment's fault, fill only up to `filesz`, and zero the rest —
+        // clobbering the next segment's file-backed bytes.
+        filesz = boundary_extended_filesz(vaddr, filesz, &pt_loads);
 
         if phdr_addr == 0 && phdr.p_offset == 0 {
             phdr_addr = vaddr + ehdr.e_phoff as usize;
@@ -1135,4 +1180,60 @@ pub fn load_elf_with_stack_from_path(
     }
 
     Ok((actual_entry, loaded.address_space, sp, hs, stack_bottom, stack_top, mmap_floor, loaded.deferred_segments))
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::boundary_extended_filesz;
+    use crate::mmu::PAGE_SIZE;
+
+    // Regression: the demand-paged ELF loader zeroed a following segment's
+    // file-backed bytes that shared a page with the prior segment, corrupting
+    // .rodata (manifested as empty userspace `format!` output on the size/
+    // extreme kernel — meow's "Failed to create request buffer"). Mirrors
+    // meow's real layout: R-X seg ends at 0x4375D8, R-- seg starts at 0x437558
+    // (same page 0x437000), R-W seg is page-aligned at 0x444000.
+    #[test]
+    fn extends_fill_across_shared_boundary_page() {
+        let seg1 = (0x400000usize, 0x4375D8usize); // R-X, ends mid-page
+        let seg2 = (0x437558usize, 0x443274usize); // R--, starts in seg1's last page
+        let seg3 = (0x444000usize, 0x4441AAusize); // R-W, page-aligned
+        let pt = [seg1, seg2, seg3];
+
+        // seg1 must be extended to fill the whole shared page (0x438000) so the
+        // pager populates seg2's rodata bytes [0x4375D8, 0x438000) from file.
+        let f1 = boundary_extended_filesz(seg1.0, seg1.1 - seg1.0, &pt);
+        assert_eq!(seg1.0 + f1, 0x438000, "seg1 fill should reach shared page end");
+    }
+
+    #[test]
+    fn does_not_extend_when_next_segment_is_page_aligned() {
+        // seg3 is page-aligned and has trailing .bss; its fill must NOT be
+        // extended (extending would read file garbage into .bss).
+        let seg2 = (0x437558usize, 0x443274usize);
+        let seg3 = (0x444000usize, 0x4441AAusize);
+        let pt = [seg2, seg3];
+        let f3 = boundary_extended_filesz(seg3.0, seg3.1 - seg3.0, &pt);
+        assert_eq!(f3, seg3.1 - seg3.0, "page-aligned successor → no extension");
+    }
+
+    #[test]
+    fn caps_extension_at_next_segment_file_end() {
+        // If the next segment's file data ends before the page boundary, the
+        // extension must stop there (the tail is real .bss, must stay zero).
+        let a = (0x1000usize, 0x1f00usize);  // ends mid-page (page 0x1000-0x2000)
+        let b = (0x1f80usize, 0x1fc0usize);  // starts in same page, short filesz
+        let pt = [a, b];
+        let fa = boundary_extended_filesz(a.0, a.1 - a.0, &pt);
+        assert_eq!(a.0 + fa, 0x1fc0, "extension capped at next seg file end");
+        assert!(a.0 + fa < a.0 + PAGE_SIZE, "must not reach full page when capped");
+    }
+
+    #[test]
+    fn no_following_segment_is_unchanged() {
+        let only = (0x400000usize, 0x437000usize);
+        let pt = [only];
+        let f = boundary_extended_filesz(only.0, only.1 - only.0, &pt);
+        assert_eq!(f, only.1 - only.0);
+    }
 }
