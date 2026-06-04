@@ -20,7 +20,13 @@ Verified with `scripts/test_memory_split.py` + the small-RAM sweeps in `logs/`
 | 16 MB | yes | yes | **yes** | yes | 5 / 4 / 7 / 14 | was **no** (SSH rejected, "memory low") before |
 | 12 MB | yes | yes | **yes** | yes | 3 / 3 / 4 / 14 | now fits (no whole-binary slurp) |
 | **8 MB** | **yes** | **yes** | **yes (repeatable)** | yes | 4 / 1 / ~2.08 / 14 | **`tcc hello.c -o /tmp/h && /tmp/h` compiles + runs repeatedly** (6 cycles verified, 2026-06-04). Earlier "marginal / `memory full`" was the dormant-cfg slurp bug (akuma-exec had no build.rs → `HEAP_SLURP_MAX` was 1 MiB, so the 723 KB tcc binary was slurped whole). Fixed by `crates/akuma-exec/build.rs` + heap→PMM reclaim — see *`tcc hello.c` now runs repeatedly at 8 MB* below |
-| **7 MB** | **yes** | **yes** | no (user pages ~1 MB < tcc working set) | **yes** | 4 / 1 / ~1 / 14 | **`meow -c` connects to ollama + streams a full reply** (verified 2026-06-05 on `extreme`, 25.2 TPS, ~3.8 MB free). Both meow and every userspace Rust ELF were broken at *all* RAM sizes on `size`/`extreme` until the lazy-ELF segment-boundary fix — see *meow → ollama runs at 7 MB* above |
+| **7 MB** *(extreme)* | yes | yes | **yes** | **yes** | — (low-water 3 MB free) | direct `tcc hello.c -o out` + run prints `Hello, Akuma!`; **meow→tcc compile+run also works** here; `meow -c` → ollama streams a full reply (25.2 TPS). See *Extreme-profile compile floor* below |
+| **6 MB** *(extreme)* | yes | yes | **yes** (direct) | OOMs | — (low-water 2 MB free) | direct `tcc` compiles+runs; the **meow→tcc *agentic* path OOMs** (meow resident + compile peak > 6 MB free) |
+| **5 MB** *(extreme)* | yes | yes | no (`memory full`) | no | — (low-water 1 MB free) | boots + usable SSH, but tcc itself exhausts memory; **4 MB does not boot** |
+
+> Rows **≤ 7 MB** are `extreme`-profile (lighter reserve than `size`); the rows ≥ 8 MB
+> are the `size`-profile sweep. See *Extreme-profile compile floor (re-measured
+> 2026-06-05)* for the clean numbers and failure modes.
 
 The **meow → ollama** column is directly verified at **7 MB** (`extreme`) and
 256 MB; the higher `size` tiers are inferred (meow's ~1 MB working set is smaller
@@ -148,6 +154,43 @@ freeing all kernel-side structures (address-space / fd / signal tables), retaine
 `PROC_SYSCALL_LOG` entries, or VFS/socket buffers held past close. Reproduce with
 the before/after `free` above; `[Mem]` serial lines report live heap used/peak
 and cumulative `Allocs`.
+
+## Extreme-profile compile floor (re-measured 2026-06-05)
+
+Clean serial measurement on the **`extreme`** kernel (one VM at a time, no
+contention; `SNAPSHOT=1` so `/tmp` is pristine each boot — no stale-binary
+masking). The current `/usr/bin/tcc` is **`libtcc.so`-based** (loaded via
+lazy-file `mmap`), much lighter resident than the static tcc the `size`-profile
+"8 MB" figure was measured against — so the floor is lower here.
+
+**Deterministic `/usr/bin/tcc /akuma-playground/hello.c -o /tmp/d` then run `/tmp/d`:**
+
+| RAM | compile + run | free low-water during compile | failure mode |
+|---|---|---|---|
+| 8 MB | ✅ `Hello, Akuma!` | 4 MB | — |
+| 7 MB | ✅ `Hello, Akuma!` | 3 MB | — |
+| 6 MB | ✅ `Hello, Akuma!` | 2 MB | — |
+| 5 MB | ❌ | 1 MB | tcc prints `memory full`, exit 1, no binary (tcc's own allocator, not a kernel OOM) |
+| 4 MB | ❌ | — | does not boot |
+
+- **Direct tcc compile+run floor: 6 MB.** No kernel OOM markers at 6–8 MB.
+- **Boot + usable-SSH floor: 5 MB** (5 MB boots and runs SSH commands; only the
+  *compile* fails there). 4 MB does not boot.
+- **meow→tcc agentic floor (`meow -c "compile … and run it"`): 7 MB.** Verified
+  working at 7 MB (`7mb_meow0.log`: tcc spawns via `libtcc.so`, binary produced
+  and run). At **6 MB the agentic path OOMs** (`0 free pages` / dips to 1 MB
+  free) — meow's resident footprint *plus* the tcc compile peak together exceed
+  6 MB free, even though tcc *alone* compiles at 6 MB.
+
+Two gotchas that cost time here, recorded so they don't again:
+- **`ls <file>` is unreliable on akuma** — listing a *file* path returns
+  `Error listing directory: Not found` even when the file exists and runs.
+  Verify a produced binary by **executing it**, not by `ls`.
+- The agentic prompt's success is also gated by the **local model** reliably
+  emitting the tcc tool-call (the request goes to ollama on the host) — this is
+  independent of VM RAM. Drive these tests **serially**; concurrent meow→ollama
+  sessions starve each other and produce degraded completions that look like the
+  model "refusing" to call tools.
 
 ## What landed in the `even-smaller-kernel` branch (June 2026)
 
