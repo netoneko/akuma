@@ -1207,7 +1207,7 @@ async fn memory_monitor() -> ! {
 
     // Stack-allocated buffer to avoid heap allocation when printing stats
     struct StackBuffer {
-        buf: [u8; 256],
+        buf: [u8; 384],
         pos: usize,
     }
 
@@ -1225,7 +1225,7 @@ async fn memory_monitor() -> ! {
     impl StackBuffer {
         fn new() -> Self {
             Self {
-                buf: [0; 256],
+                buf: [0; 384],
                 pos: 0,
             }
         }
@@ -1261,7 +1261,12 @@ async fn memory_monitor() -> ! {
         
         let (total_pages, allocated_pages, _) = pmm::stats();
         let total_ram_mb = (total_pages * mmu::PAGE_SIZE) / 1024 / 1024;
-        let free_ram_mb = (total_pages.saturating_sub(allocated_pages) * mmu::PAGE_SIZE) / 1024 / 1024;
+        let free_pages = total_pages.saturating_sub(allocated_pages);
+        let free_ram_mb = (free_pages * mmu::PAGE_SIZE) / 1024 / 1024;
+        // Page-precise free RAM too: at the low-memory floor the MB figure can't
+        // show whether a dead process's pages actually came back (sub-MB), which
+        // is exactly the "post-OOM never recovered" symptom we chase here.
+        let free_ram_kb = (free_pages * mmu::PAGE_SIZE) / 1024;
 
         let (threads_ready, threads_running, _) = akuma_exec::threading::thread_stats();
         let threads_used = threads_ready + threads_running;
@@ -1281,8 +1286,8 @@ async fn memory_monitor() -> ! {
         buf.clear();
         let _ = write!(
             buf,
-            "[Mem] Uptime {} | RAM: {}/{}MB free | Heap: {}/{}MB free ({} KB used, {} KB peak) | Allocs: {} | Threads: {}/{} ({}r {}rd){}",
-            uptime_us, free_ram_mb, total_ram_mb, free_kb / 1024, heap_mb, allocated_kb, peak_kb, stats.allocation_count,
+            "[Mem] Uptime {} | RAM: {}/{}MB free ({}KB) | Heap: {}/{}MB free ({} KB used, {} KB peak) | Allocs: {} | Threads: {}/{} ({}r {}rd){}",
+            uptime_us, free_ram_mb, total_ram_mb, free_ram_kb, free_kb / 1024, heap_mb, allocated_kb, peak_kb, stats.allocation_count,
             threads_used, threads_max, threads_running, threads_ready, dfree_marker
         );
         // Pages handed back from the heap to the PMM since boot — non-zero means
@@ -1290,6 +1295,22 @@ async fn memory_monitor() -> ! {
         // Written straight into the stack buffer; no heap alloc in the mem monitor.
         if reclaimed_pages > 0 {
             let _ = write!(buf, " | reclaimed={}KB", reclaimed_pages * 4);
+        }
+        // Heap high-water diagnostic: how much PMM the heap is sitting on and how
+        // much of it is stuck (spans pinned by a live allocation, so reclaim
+        // can't return them). At the low-memory floor, `pinned` not falling back
+        // to 0 after a workload exits IS the "free PMM never recovered" bug —
+        // and `pinUsed` shows how few live bytes are holding it hostage
+        // (fragmentation). Only printed when something is actually committed.
+        let span = allocator::claimed_span_report();
+        if !span.busy && span.live_spans > 0 {
+            let _ = write!(
+                buf,
+                " | spans: {} live {}KB ({} pinned {}KB, pinUsed {}KB; {} free)",
+                span.live_spans, span.committed_pages * 4,
+                span.pinned_spans, span.pinned_pages * 4,
+                span.pinned_used_bytes / 1024, span.free_spans
+            );
         }
         let _ = write!(buf, "\n");
         console::print(buf.as_str());

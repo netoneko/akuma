@@ -383,6 +383,12 @@ pub fn run_all_tests() {
     // repeat runs at 8 MB). See src/allocator.rs.
     test_heap_reclaim_returns_pages_to_pmm();
 
+    // Page-precise process-exit teardown leak detector: spawn → exit → reap →
+    // reclaim, repeated, asserting the PMM free pool does not ratchet down. This
+    // is the low-memory-floor "free PMM never recovered after a process exited"
+    // symptom, measured at page granularity rather than the MB [Mem] line.
+    test_pmm_conserved_across_spawn_exit_reap();
+
     // Boot-stack reservation is now derived from the linked image size in
     // linker.ld (STACK_BOTTOM / STACK_TOP absolute symbols), replacing the old
     // 3-way per-profile IMAGE_SIZE lockstep. Guard the invariants so a linker.ld
@@ -576,6 +582,147 @@ fn test_heap_reclaim_returns_pages_to_pmm() {
         crate::safe_print!(192,
             "[Test] heap_reclaim_returns_pages_to_pmm FAILED: before={} low={} after={} reclaimed={} (pool did not return cleanly)\n",
             free_before, free_low, free_after, reclaimed);
+    }
+}
+
+/// Page-precise leak detector for the **process-exit teardown path** — the
+/// "extreme low-memory floor" symptom that free PMM doesn't fully recover after
+/// a process exits, so a later spawn / demand-fault hits "0 free pages".
+///
+/// Unlike the MB-granular `[Mem]` line, this measures `pmm::free_count()` in
+/// pages across a *real* spawn → exit → reap → reclaim cycle and asserts the
+/// pool does not ratchet down. The trick is the trajectory, not a single delta:
+/// the FIRST spawn of a binary legitimately fills size-independent caches (the
+/// VFS read-ahead of the ELF, shared file-backed pages), so we warm up once,
+/// take the baseline, then run several identical cycles. A one-time cache fill
+/// shows up as flat-after-warmup; a genuine per-process artifact (an untracked
+/// user page, an unfreed page-table frame, a non-reclaimable heap span) shows up
+/// as a monotonic decline of `free_count` across the repeated cycles.
+fn test_pmm_conserved_across_spawn_exit_reap() {
+    const HELLO_PATH: &str = "/bin/hello";
+    if !check_binary_exists(HELLO_PATH) {
+        return;
+    }
+
+    // One spawn → exit → reap cycle. Returns true if the process was both
+    // observed to exit and fully reaped (unregistered) within the timeout.
+    fn spawn_exit_reap_cycle() -> bool {
+        let args = &["1", "0"]; // 1 line, 0ms delay → exits almost immediately
+        let (_tid, ch, pid) = match process::spawn_process_with_channel(HELLO_PATH, Some(args), None) {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        // Wait for exit.
+        let t0 = crate::timer::uptime_us();
+        while !ch.has_exited() {
+            if crate::timer::uptime_us() - t0 > 5_000_000 {
+                return false;
+            }
+            akuma_exec::threading::yield_now();
+        }
+        // Wait for reap. A cleanly-exiting spawned process becomes a Zombie
+        // (exit_group leaves it for wait4); the AS is only freed when the thread
+        // slot is recycled → on_thread_cleanup → unregister_process →
+        // UserAddressSpace::drop. During the synchronous boot-test phase nothing
+        // drives that recycle, so we force it (bypasses the cooldown + main-thread
+        // gate — exactly the production reap path, just on demand). Until
+        // lookup_process(pid) is None the AS frames are still held.
+        let t1 = crate::timer::uptime_us();
+        while process::lookup_process(pid).is_some() {
+            akuma_exec::threading::cleanup_terminated_force();
+            if crate::timer::uptime_us() - t1 > 5_000_000 {
+                return false;
+            }
+            akuma_exec::threading::yield_now();
+        }
+        true
+    }
+
+    // One spawn → KILL (abnormal death) → reap cycle. This exercises the
+    // teardown path an OOM victim takes (`return_to_kernel(-11)` / kill_process →
+    // Zombie → recycle → Drop), frequently with a *partially* demand-faulted
+    // address space — the realistic shape of the low-memory-floor death. Returns
+    // true if the process was registered, killed, and fully reaped.
+    fn spawn_kill_reap_cycle() -> bool {
+        let args = &["100", "50"]; // long-running so it is alive (and faulting) when killed
+        let (_tid, _ch, pid) = match process::spawn_process_with_channel(HELLO_PATH, Some(args), None) {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        // Let it start and fault in a few pages before we kill it.
+        for _ in 0..50 {
+            akuma_exec::threading::yield_now();
+        }
+        if process::lookup_process(pid).is_none() {
+            return false; // already gone — can't exercise the kill path
+        }
+        if process::kill_process(pid).is_err() {
+            return false;
+        }
+        let t1 = crate::timer::uptime_us();
+        while process::lookup_process(pid).is_some() {
+            akuma_exec::threading::cleanup_terminated_force();
+            if crate::timer::uptime_us() - t1 > 5_000_000 {
+                return false;
+            }
+            akuma_exec::threading::yield_now();
+        }
+        true
+    }
+
+    // Warm up: first spawn fills the size-independent caches; reclaim afterward.
+    if !spawn_exit_reap_cycle() {
+        console::print("[Test] pmm_conserved_across_spawn_exit_reap INCONCLUSIVE (warmup spawn did not exit+reap)\n");
+        return;
+    }
+    crate::allocator::reclaim_to_pmm();
+
+    // Measure both teardown paths against the same baseline. A real per-process
+    // leak of N pages/cycle blows past the small async-reclaim slop; the trick is
+    // the *trajectory* across repeated identical cycles, not one delta.
+    const CYCLES: usize = 4;
+    const SLOP: usize = 4; // one-off async reclaim jitter, in pages
+
+    fn run_phase(baseline: usize, cycle: fn() -> bool) -> (usize, usize) {
+        let mut last = baseline;
+        let mut completed = 0usize;
+        for _ in 0..CYCLES {
+            if !cycle() {
+                break;
+            }
+            crate::allocator::reclaim_to_pmm();
+            last = crate::pmm::free_count();
+            completed += 1;
+        }
+        (last, completed)
+    }
+
+    let baseline = crate::pmm::free_count();
+    let span0 = crate::allocator::claimed_span_report();
+    let (clean_last, clean_n) = run_phase(baseline, spawn_exit_reap_cycle);
+    let (kill_last, kill_n) = run_phase(clean_last, spawn_kill_reap_cycle);
+    let span1 = crate::allocator::claimed_span_report();
+
+    if clean_n == 0 || kill_n == 0 {
+        crate::safe_print!(192,
+            "[Test] pmm_conserved_across_spawn_exit_reap INCONCLUSIVE (clean_cycles={} kill_cycles={})\n",
+            clean_n, kill_n);
+        return;
+    }
+
+    let clean_leak = baseline.saturating_sub(clean_last);
+    let kill_leak = clean_last.saturating_sub(kill_last);
+    let pinned_delta = span1.pinned_pages.saturating_sub(span0.pinned_pages);
+    if clean_leak <= SLOP && kill_leak <= SLOP {
+        crate::safe_print!(240,
+            "[Test] pmm_conserved_across_spawn_exit_reap PASSED (baseline={}; clean {}x drift={}p -> {}; kill {}x drift={}p -> {}; pinnedspans {}->{})\n",
+            baseline, clean_n, clean_leak, clean_last, kill_n, kill_leak, kill_last,
+            span0.pinned_spans, span1.pinned_spans);
+    } else {
+        crate::safe_print!(240,
+            "[Test] pmm_conserved_across_spawn_exit_reap FAILED: clean leaked {}p over {}x, kill leaked {}p over {}x ({} KB total); pinned spans {}->{} (+{}p heap-stuck)\n",
+            clean_leak, clean_n, kill_leak, kill_n, (clean_leak + kill_leak) * 4,
+            span0.pinned_spans, span1.pinned_spans, pinned_delta);
     }
 }
 

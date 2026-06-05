@@ -216,6 +216,70 @@ pub fn reclaimed_pages_total() -> usize {
     RECLAIMED_PAGES_TOTAL.load(Ordering::Relaxed)
 }
 
+/// Occupancy snapshot of the PMM-backed heap spans — the data needed to tell a
+/// genuine frame leak apart from the kernel-heap high-water mark.
+///
+/// `reclaim_to_pmm()` can only return a claimed span once it is *entirely* free
+/// inside Talc; a single surviving allocation pins the whole 256 KB span. After
+/// a workload exits, the leak you observe as "free PMM never recovered" is
+/// almost always this: many spans pinned by a few bytes each. This report makes
+/// that visible — `pinned_spans` * span size is the committed-but-stuck pool,
+/// and `pinned_used_bytes` is how little is actually keeping it hostage.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpanReport {
+    /// Claimed spans currently tracked in the registry.
+    pub live_spans: usize,
+    /// Total PMM pages committed to the heap via claims (== current heap growth).
+    pub committed_pages: usize,
+    /// Spans that are NOT fully free in Talc → cannot be reclaimed right now.
+    pub pinned_spans: usize,
+    /// Pages locked up in pinned spans (the recoverable-once-drained pool).
+    pub pinned_pages: usize,
+    /// Bounding extent of live allocations inside pinned spans, in bytes — the
+    /// "fragmentation tax": how few live bytes are holding `pinned_pages` hostage.
+    pub pinned_used_bytes: usize,
+    /// Spans fully free right now (reclaim_to_pmm would return these immediately).
+    pub free_spans: usize,
+    /// True if the report could not be taken because Talc was locked (reentrant
+    /// from the allocator) — all other fields are then meaningless.
+    pub busy: bool,
+}
+
+/// Take a [`SpanReport`]. Safe from any non-allocator context; if Talc is held
+/// (we were reentered from `handle_oom`) it returns `busy = true` rather than
+/// deadlocking, matching `reclaim_to_pmm`'s `try_lock` discipline.
+pub fn claimed_span_report() -> SpanReport {
+    if !is_pmm_ready() {
+        return SpanReport::default();
+    }
+    with_irqs_disabled(|| {
+        let talc = match TALC.try_lock() {
+            Some(t) => t,
+            None => return SpanReport { busy: true, ..SpanReport::default() },
+        };
+        let spans = CLAIMED_SPANS.lock();
+        let mut r = SpanReport::default();
+        for s in spans.iter() {
+            if s.pages == 0 {
+                continue;
+            }
+            r.live_spans += 1;
+            r.committed_pages += s.pages;
+            let heap = s.heap_span();
+            // Same primitive reclaim_to_pmm uses to decide reclaimability.
+            let allocated = unsafe { talc.get_allocated_span(heap) };
+            if allocated.is_empty() {
+                r.free_spans += 1;
+            } else {
+                r.pinned_spans += 1;
+                r.pinned_pages += s.pages;
+                r.pinned_used_bytes += allocated.size();
+            }
+        }
+        r
+    })
+}
+
 // ============================================================================
 // Allocation Registry - tracks all allocations to detect corruption
 // ============================================================================
