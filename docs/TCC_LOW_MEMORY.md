@@ -83,3 +83,10 @@ tcc's AArch64 backend has **no inline assembler** (`error: ARM asm not
 implemented`). So freestanding raw-syscall C, `nolibc`, and header-only libcs are
 impossible with tcc — any "no libc" path needs a **host-assembled** syscall stub
 `.a`. (Deferred; it would be for self-containment, not for the floor.)
+
+### When the box is too small (e.g. meow + tcc at 4.5 MB)
+
+tcc alone fits at 4.5 MB, but **meow + tcc** together need 5 MB. Below that the
+kernel used to abort under memory exhaustion; it now **OOM-kills the offending
+process and survives** (PMM emergency reserve — see the *OOM hardening* section
+in [LOW_MEMORY_ENVIRONMENT.md](LOW_MEMORY_ENVIRONMENT.md)).
