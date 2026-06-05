@@ -104,10 +104,180 @@ static THREAD_LIMIT: AtomicUsize = AtomicUsize::new(MAX_THREADS);
 // (ensure_slot_stack on claim, free-above-floor in cleanup_terminated). On
 // release every slot is still pre-allocated (no per-spawn alloc, guaranteed
 // availability). Idle saving at 8 MB ≈ 0.8 MB. See docs/LOW_MEMORY_ENVIRONMENT.md.
-#[cfg(kernel_profile_size)]
+// extreme: no warm floor at all. System threads (async-main, SSH) spawn once at
+// boot and never recycle, so a warm *system* reserve is dead weight. The warm
+// *user* stack is the 64 KB that lingers after a process exits (the post-workload
+// step we measured at the floor); free it too. The next user spawn re-allocates
+// its 16 contiguous pages — at the floor workloads are ~serial, so the just-freed
+// stack is immediately available. extreme implies kernel_profile_size, so the
+// size branch below must exclude it.
+#[cfg(kernel_profile_extreme)]
+const WARM_FREE_SYSTEM: usize = 0;
+#[cfg(kernel_profile_extreme)]
+const WARM_FREE_USER: usize = 0;
+#[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
 const WARM_FREE_SYSTEM: usize = 1;
-#[cfg(kernel_profile_size)]
+#[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
 const WARM_FREE_USER: usize = 1;
+
+// ── Stack high-water probe ───────────────────────────────────────────────────
+// To right-size the 128 KB system / 64 KB user kernel stacks for the extreme
+// target we need the *true* peak usage. When this is on, freshly-allocated
+// stacks are painted with `STACK_SENTINEL`; `stack_high_water` then scans for the
+// deepest write — an UPPER bound on usage (any write, even a zero, breaks the
+// sentinel), so sizing to peak+margin is safe. Costs a memset per stack alloc;
+// keep `false` in production and flip on only for a measurement boot.
+const STACK_USAGE_PROBE: bool = false;
+const STACK_SENTINEL: u64 = 0xABAB_ABAB_ABAB_ABAB;
+
+// Recorded peak usage per class (bytes), so a short-lived user thread's
+// high-water survives the free that WARM_FREE_USER=0 does immediately on exit.
+// Updated in `free_stack_for_slot` (teardown) and `report_stack_high_water`
+// (live long-running system threads). Only meaningful when STACK_USAGE_PROBE.
+static STACK_PEAK_SYSTEM: AtomicUsize = AtomicUsize::new(0);
+static STACK_PEAK_USER: AtomicUsize = AtomicUsize::new(0);
+// Boot-stack (thread 0) bounds, recorded by `paint_boot_stack` so the report can
+// scan it. The boot stack is the 1 MB elephant; its true high-water decides
+// whether it can be halved for the extreme target.
+static BOOT_STACK_BASE: AtomicUsize = AtomicUsize::new(0);
+static BOOT_STACK_TOP: AtomicUsize = AtomicUsize::new(0);
+
+/// Paint the *currently-unused* lower part of the boot stack with the sentinel so
+/// `report_stack_high_water` can later report thread 0's peak. Call once, early in
+/// boot (the deep work — tests, init — happens after and overwrites the sentinel
+/// down to the true high-water). Leaves a generous headroom below the live SP so
+/// this function's own frame is never clobbered. No-op unless STACK_USAGE_PROBE.
+pub fn paint_boot_stack(base: usize, top: usize) {
+    if !STACK_USAGE_PROBE || base == 0 || top <= base {
+        return;
+    }
+    BOOT_STACK_BASE.store(base, Ordering::Relaxed);
+    BOOT_STACK_TOP.store(top, Ordering::Relaxed);
+    let sp: usize;
+    #[cfg(target_os = "none")]
+    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp); }
+    #[cfg(not(target_os = "none"))]
+    { sp = top; }
+    let paint_end = sp.saturating_sub(8 * 1024) & !7; // 8 KB headroom below live SP
+    let mut addr = (base + 7) & !7;
+    if paint_end <= addr {
+        return;
+    }
+    unsafe {
+        while addr + 8 <= paint_end {
+            (addr as *mut u64).write_volatile(STACK_SENTINEL);
+            addr += 8;
+        }
+    }
+}
+
+fn record_stack_peak(slot: usize, used: usize) {
+    let reserved = config().reserved_threads;
+    let cell = if slot >= 1 && slot < reserved {
+        &STACK_PEAK_SYSTEM
+    } else if slot >= reserved {
+        &STACK_PEAK_USER
+    } else {
+        return; // slot 0 = boot stack, measured separately
+    };
+    cell.fetch_max(used, Ordering::Relaxed);
+}
+
+/// Paint `[base + canary, top)` with the sentinel (skips the canary words at the
+/// base so `check_stack_canary` still sees its own pattern).
+fn fill_stack_sentinel(base: usize, top: usize) {
+    if base == 0 || top <= base {
+        return;
+    }
+    let canary_bytes = config().canary_words * 8;
+    let start = (base + canary_bytes + 7) & !7; // 8-byte aligned
+    let mut addr = start;
+    unsafe {
+        while addr + 8 <= top {
+            (addr as *mut u64).write_volatile(STACK_SENTINEL);
+            addr += 8;
+        }
+    }
+}
+
+/// Peak stack usage for a slot, as `(used_bytes, total_bytes)`. Requires
+/// `STACK_USAGE_PROBE`; returns `None` if the slot has no painted stack. Scans up
+/// from the canary for the first broken sentinel word — the deepest (lowest) the
+/// stack ever reached — and returns `top - that_addr`.
+pub fn stack_high_water(slot: usize) -> Option<(usize, usize)> {
+    if !STACK_USAGE_PROBE || slot >= MAX_THREADS {
+        return None;
+    }
+    with_irqs_disabled(|| {
+        let pool = POOL.lock();
+        let stack = &pool.stacks[slot];
+        if !stack.is_allocated() {
+            return None;
+        }
+        let base = stack.base;
+        let size = stack.size;
+        let top = base + size;
+        let canary_bytes = config().canary_words * 8;
+        let mut addr = (base + canary_bytes + 7) & !7;
+        let mut first_used = top;
+        unsafe {
+            while addr + 8 <= top {
+                if (addr as *const u64).read_volatile() != STACK_SENTINEL {
+                    first_used = addr;
+                    break;
+                }
+                addr += 8;
+            }
+        }
+        Some((top - first_used, size))
+    })
+}
+
+/// Print a `[Stack]` high-water line: the deepest-used slot in each class and its
+/// peak vs the configured stack size. Drives the extreme stack right-sizing.
+pub fn report_stack_high_water() {
+    if !STACK_USAGE_PROBE {
+        return;
+    }
+    let limit = thread_limit();
+    // Fold currently-live slots into the global peaks (long-running system
+    // threads never recycle, so their high-water is only ever seen live).
+    for i in 1..limit {
+        if let Some((used, _size)) = stack_high_water(i) {
+            record_stack_peak(i, used);
+        }
+    }
+    let sys_peak = STACK_PEAK_SYSTEM.load(Ordering::Relaxed);
+    let usr_peak = STACK_PEAK_USER.load(Ordering::Relaxed);
+    // Boot stack: scan from base for the first broken sentinel = thread 0's peak.
+    let boot_base = BOOT_STACK_BASE.load(Ordering::Relaxed);
+    let boot_top = BOOT_STACK_TOP.load(Ordering::Relaxed);
+    let mut boot_used = 0usize;
+    let boot_size = boot_top.saturating_sub(boot_base);
+    if boot_base != 0 && boot_top > boot_base {
+        // Skip the canary words at the base (init_stack_canary writes them AFTER
+        // paint_boot_stack runs, so they read as non-sentinel and would otherwise
+        // pin the high-water at "full").
+        let canary_bytes = config().canary_words * 8;
+        let mut addr = (boot_base + canary_bytes + 7) & !7;
+        let mut first_used = boot_top;
+        unsafe {
+            while addr + 8 <= boot_top {
+                if (addr as *const u64).read_volatile() != STACK_SENTINEL {
+                    first_used = addr;
+                    break;
+                }
+                addr += 8;
+            }
+        }
+        boot_used = boot_top - first_used;
+    }
+    safe_print!(200,
+        "[Stack] sys peak {}KB/{}KB | user peak {}KB/{}KB | boot peak {}KB/{}KB (probe; lower=more trim headroom)\n",
+        sys_peak / 1024, config().system_thread_stack_size / 1024,
+        usr_peak / 1024, config().user_thread_stack_size / 1024,
+        boot_used / 1024, boot_size / 1024);
+}
 
 /// Set the runtime thread-slot limit. Clamped to `[reserved+1, MAX_THREADS]` so
 /// there is always the full system-thread set plus at least one user slot.
@@ -1279,6 +1449,13 @@ impl ThreadPool {
             init_stack_canary(stack_info.base);
         }
 
+        // Stack high-water probe: paint the stack with a sentinel so
+        // `stack_high_water` can report true peak usage (an UPPER bound, since any
+        // write — even a zero — breaks the sentinel). Gated off in production.
+        if STACK_USAGE_PROBE {
+            fill_stack_sentinel(stack_info.base, stack_info.top);
+        }
+
         self.stacks[slot_idx] = stack_info;
 
         // Set exception stack top (top of the reserved 1KB area)
@@ -1291,6 +1468,26 @@ impl ThreadPool {
     fn free_stack_for_slot(&mut self, slot_idx: usize) {
         let stack = &self.stacks[slot_idx];
         if stack.is_allocated() {
+            // Capture the high-water before the painted stack goes away, so a
+            // short-lived user thread's peak survives this free (WARM_FREE_USER=0
+            // frees on every exit). Cheap scan; only when the probe is on.
+            if STACK_USAGE_PROBE {
+                let base = stack.base;
+                let top = base + stack.size;
+                let canary_bytes = config().canary_words * 8;
+                let mut addr = (base + canary_bytes + 7) & !7;
+                let mut first_used = top;
+                unsafe {
+                    while addr + 8 <= top {
+                        if (addr as *const u64).read_volatile() != STACK_SENTINEL {
+                            first_used = addr;
+                            break;
+                        }
+                        addr += 8;
+                    }
+                }
+                record_stack_peak(slot_idx, top - first_used);
+            }
             let page_size = 4096;
             let pages = (stack.size + page_size - 1) / page_size;
             let phys_addr = crate::mmu::virt_to_phys(stack.base);

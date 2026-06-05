@@ -6,6 +6,13 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+# Profile discriminator forwarded from the bin crate's `extreme` feature
+# (build_extreme_size.sh). Lets this crate's build.rs emit
+# `cfg(kernel_profile_extreme)` so threading can trim the warm-stack floor and
+# right-size kernel stacks for the extreme low-memory target. NOT a syscall gate.
+extreme = []
+
 [dependencies]
 spinning_top = "0.3"
 lock_api = "0.4"

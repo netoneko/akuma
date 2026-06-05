@@ -82,8 +82,16 @@ pub const MAX_PROCESSES: usize = 64;
 /// observed ELR=0x0 crash (stack overflow → corrupted return addr) at 64 KB.
 #[cfg(not(kernel_profile_size))]
 pub const SYSTEM_THREAD_STACK_SIZE: usize = 64 * 1024;
-#[cfg(kernel_profile_size)]
+// size (non-extreme): 128 KB — the SSH exec path overflowed 64 KB (ELR=0x0).
+#[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
 pub const SYSTEM_THREAD_STACK_SIZE: usize = 128 * 1024;
+// extreme: 96 KB. The stack high-water probe (threading::report_stack_high_water)
+// measured a true peak of 79 KB across the SSH exec / busybox spawn paths at the
+// 6 MB floor, so 96 KB keeps a 17 KB (~21%) margin above observed worst-case while
+// reclaiming 32 KB per live system thread (~64 KB at the idle 2-thread floor). The
+// stack canary at the base trips first if a deeper path ever exceeds it.
+#[cfg(kernel_profile_extreme)]
+pub const SYSTEM_THREAD_STACK_SIZE: usize = 96 * 1024;
 
 /// Stack size for user process threads (128KB release, 64KB size profile)
 ///

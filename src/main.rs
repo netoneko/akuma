@@ -324,6 +324,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     let boot_stack_top = unsafe { &STACK_TOP as *const u8 as usize };
     let kernel_size = kernel_end - KERNEL_BASE;
 
+    // Stack high-water probe: paint the boot stack's unused lower region so the
+    // memory monitor can later report thread 0's true peak (drives whether the
+    // 1 MB boot stack can be trimmed). No-op unless the probe const is on.
+    akuma_exec::threading::paint_boot_stack(stack_bottom, boot_stack_top);
+
     console::print("Kernel binary: ");
     console::print_dec(kernel_size / 1024);
     console::print(" KB (0x");
@@ -1314,6 +1319,10 @@ async fn memory_monitor() -> ! {
         }
         let _ = write!(buf, "\n");
         console::print(buf.as_str());
+
+        // Stack high-water (no-op unless the probe const is on): right-sizing data
+        // for the extreme kernel stacks. Printed on its own line to keep [Mem] short.
+        akuma_exec::threading::report_stack_high_water();
 
         let ssh = ssh::server::stats();
         buf.clear();
