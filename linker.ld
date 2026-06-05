@@ -85,16 +85,23 @@ SECTIONS
     /* Boot-stack reservation, derived from the *actual* linked image size so it
      * auto-tracks the binary — there is no hand-tuned per-profile IMAGE_SIZE
      * constant anymore. The boot stack is placed immediately above the kernel
-     * image (page-aligned, with a 2-page guard gap) and is 1 MB:
+     * image (page-aligned, with a 2-page guard gap):
      *   STACK_BOTTOM  = first page above the image + 2-page guard
-     *   STACK_TOP     = initial SP (boot.rs asm loads it); 1 MB above STACK_BOTTOM
+     *   STACK_TOP     = initial SP (boot.rs asm loads it); BOOT_STACK_SIZE above
+     *                   STACK_BOTTOM
      *   IMAGE_RESERVE = bytes from the load address to STACK_BOTTOM, for the
      *                   ARM64 Image header (QEMU DTB placement)
      * boot.rs (asm SP + Image header), src/main.rs (overlap guard + heap reserve +
      * ExecConfig boot-stack bounds) and src/exceptions.rs (boot-thread exception
-     * stack) all read these as extern absolute symbols — one source of truth. */
+     * stack) all read these as extern absolute symbols — one source of truth.
+     *
+     * BOOT_STACK_SIZE is injected by build.rs via --defsym (always passed, no
+     * PROVIDE — a PROVIDE default would silently override the defsym under LLD,
+     * the bug that once made the STACK_BOTTOM defsym a no-op). 1 MB for
+     * release/size (their boot test suite runs deep on thread 0); trimmed for the
+     * extreme target, where thread 0's measured high-water is ~10 KB. */
     STACK_BOTTOM  = ALIGN(_kernel_phys_end, 0x1000) + 0x2000;
-    STACK_TOP     = STACK_BOTTOM + 0x100000;
+    STACK_TOP     = STACK_BOTTOM + BOOT_STACK_SIZE;
     IMAGE_RESERVE = STACK_BOTTOM - KERNEL_PHYS_BASE;
 
     /DISCARD/ : {

@@ -127,7 +127,7 @@ const WARM_FREE_USER: usize = 1;
 // deepest write — an UPPER bound on usage (any write, even a zero, breaks the
 // sentinel), so sizing to peak+margin is safe. Costs a memset per stack alloc;
 // keep `false` in production and flip on only for a measurement boot.
-const STACK_USAGE_PROBE: bool = false;
+const STACK_USAGE_PROBE: bool = true;
 const STACK_SENTINEL: u64 = 0xABAB_ABAB_ABAB_ABAB;
 
 // Recorded peak usage per class (bytes), so a short-lived user thread's

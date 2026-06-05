@@ -24,4 +24,17 @@ fn main() {
     if extreme_profile {
         println!("cargo:rustc-cfg=kernel_profile_extreme");
     }
+
+    // Boot-stack size, injected into linker.ld as the BOOT_STACK_SIZE symbol.
+    // ALWAYS passed (linker.ld has no PROVIDE default — a PROVIDE would override
+    // the defsym under LLD, the historical STACK_BOTTOM no-op bug).
+    //   release/size: 1 MB — the boot test suite runs deep on thread 0.
+    //   extreme:      32 KB — no test suite (no-tests); thread 0's measured stack
+    //                 high-water is ~10 KB (docs/EXTREME_STACK_TRIMMING.md), and
+    //                 its exception stack is a separate PMM allocation. Reclaims
+    //                 ~992 KB to the user-page pool (≈17% of RAM at the 4.5 MB
+    //                 floor). config::KERNEL_STACK_SIZE is NOT used for the boot
+    //                 stack bounds (main.rs derives them from STACK_TOP/BOTTOM).
+    let boot_stack_size: usize = if extreme_profile { 32 * 1024 } else { 1024 * 1024 };
+    println!("cargo:rustc-link-arg=--defsym=BOOT_STACK_SIZE={}", boot_stack_size);
 }

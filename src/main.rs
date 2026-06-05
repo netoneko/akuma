@@ -425,7 +425,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     let ram_end = ram_base + ram_size;
     let heap_end = heap_start + heap_size;
     let user_end = user_pages_start + user_pages_size;
-    let boot_stack_bottom = boot_stack_top - 1024 * 1024;
+    // The actual boot-stack bottom is the STACK_BOTTOM linker symbol, not a
+    // hardcoded `top - 1 MB` — the extreme profile shrinks BOOT_STACK_SIZE, so
+    // assuming 1 MB here would compute a bogus bottom (below the kernel image)
+    // and the overlap guard below would be checking the wrong region.
+    let boot_stack_bottom = stack_bottom;
     let layout_ok =
         kernel_end <= heap_start &&                // kernel binary fits in code+stack
         boot_stack_bottom >= ram_base &&           // boot stack starts within RAM
@@ -611,7 +615,12 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         akuma_exec::ExecConfig {
             max_threads: config::MAX_THREADS,
             reserved_threads: config::RESERVED_THREADS,
-            kernel_stack_size: config::KERNEL_STACK_SIZE,
+            // Derive the boot-stack size from the linker symbols (the single
+            // source of truth — BOOT_STACK_SIZE via --defsym, profile-dependent)
+            // rather than config::KERNEL_STACK_SIZE, so slot-0's StackInfo bounds
+            // and canary placement always match the actual reservation even when
+            // the extreme profile shrinks it. See linker.ld / build.rs.
+            kernel_stack_size: boot_stack_top - stack_bottom,
             // Real boot-stack bounds, read from the linker-derived STACK_BOTTOM /
             // STACK_TOP symbols above. The threading crate must NOT hardcode these
             // — when the boot stack was relocated, a stale constant stamped the
