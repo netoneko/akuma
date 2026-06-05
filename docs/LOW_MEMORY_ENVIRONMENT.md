@@ -20,10 +20,26 @@ the `extreme` profile with `scripts/our_tcc_floor.py`:
 | meow `-c "say hi"` (alone) | **4.5 MB** | |
 | **meow agentically drives `tcc -static` + runs the binary** | **4.5 MB** | clean, `panic=0` (`logs/4.5mb_meow5.log`, 2026-06-05). Low-water 1988 KB; settled 2520 KB free. SSH read gaps reached ~1.6 s in that log — caused by ext2 block-cache heap fragmentation (now fixed, see *ext2 block-cache fix* below) |
 
-So all three workload paths share the **4.5 MB floor**. The **kernel boot floor** itself
-was subsequently pushed to **4.0 MB** — see *Breaking the 4 MB boot wall* below. (The
-earlier 5 MB meow→tcc floor was verified in `logs/meow5mb.log`; the new 4.5 MB record
-is `logs/4.5mb_meow5.log`.)
+The earlier 5 MB meow→tcc floor was in `logs/meow5mb.log`. The 4.5 MB record
+is `logs/4.5mb_meow5.log`.
+
+### 🏁 Milestone — floor pushed to 4 MB (June 2026)
+
+Changing the ARM64 Image header `text_offset` from `0` to `0x100000` (1 MB) moves the
+QEMU kernel load point from `RAM_BASE + 2 MB` to `RAM_BASE + 1 MB`, which shifts the DTB
+placement from `0x40400000` to `0x40200000`. At 4 MB (ram_end `0x40400000`) the old DTB
+address was at the boundary (QEMU check: `dtb_start < ram_end` fails), preventing boot.
+The new placement `0x40200000 < 0x40400000` passes — **extreme boots at 4 MB**.
+
+Verified (`logs/4mb_meow0.log`, 2026-06-05, kernel 801 KB):
+
+| Workload | Result | Notes |
+|---|---|---|
+| boot + SSH | ✅ | 664 PMM free pages; DTB at 0x40200000 |
+| `meow -c "say hi"` | ✅ | 3 sessions; connects to ollama, streams reply; low-water 1804 KB free |
+
+meow's minimum floor is now the **kernel boot floor**: 4 MB. (tcc/libc compiles still need
+~6 MB for their working set; only the light single-request path drops here.)
 Full write-up: [TCC_LOW_MEMORY.md](TCC_LOW_MEMORY.md).
 
 ### 🛡️ OOM hardening — kernel survives, kills the process (June 2026)
@@ -265,16 +281,13 @@ lazy-file `mmap`), much lighter resident than the static tcc the `size`-profile
 | 7 MB | ✅ `Hello, Akuma!` | 3 MB | — |
 | 6 MB | ✅ `Hello, Akuma!` | 2 MB | — |
 | 5 MB | ❌ | 1 MB | tcc prints `memory full`, exit 1, no binary (tcc's own allocator, not a kernel OOM) |
-| 4 MB | ❌ | — | does not boot |
+| 4 MB | ❌ boots | — | tcc needs ~6 MB working set; kernel itself boots fine (664 PMM free pg) |
 
 - **Direct tcc compile+run floor: 6 MB.** No kernel OOM markers at 6–8 MB.
-- **Boot + usable-SSH floor: 5 MB** (5 MB boots and runs SSH commands; only the
-  *compile* fails there). 4 MB does not boot — and the failure is **QEMU's**
-  `Not enough space for DTB after kernel/initrd`, a guest-memory-layout limit (the
-  kernel loads at +2 MB, leaving too little room for the DTB at 4 MB), **not** a
-  kernel OOM. So further shrinking the kernel adds free pages at 5 MB+ but cannot
-  break the 5→4 MB wall. (Re-confirmed 2026-06-05 on the rsa-off / 848 KB-reserve
-  kernel — see *Tightening the extreme-profile reserve via the RSA feature gate*.)
+- **Boot + usable-SSH floor: 4 MB** — see *Breaking the 4 MB boot wall* below. The
+  earlier QEMU `Not enough space for DTB` barrier at 4 MB was broken by changing
+  `text_offset` to 1 MB in the ARM64 Image header (kernel now loads at RAM_BASE + 1 MB;
+  DTB lands at `0x40200000` which fits in 4 MB RAM).
 - **meow→tcc agentic floor (`meow -c "compile … and run it"`): 6 MB** (with the
   one-command-at-a-time prompt below — was 7 MB). Verified working at 7 MB
   (`7mb_meow0.log`) and now at **6 MB** (`6mb_meow8.log`, 2026-06-05, 807 KB
@@ -716,12 +729,9 @@ The `[Mem]` free RAM is MB-granular so the headline figure is unchanged; the gai
 is real and shows in the page-granular `PMM stats`. Boot reaches `[SSH Server]
 Listening` cleanly at 5/6/7/8 MB.
 
-**Boot-to-SSH floor unchanged at 5 MB.** Sweeping the tightened `extreme` kernel:
-5/6/7 MB boot to a usable SSH; **4 MB does not boot — but the failure is QEMU's
-`Not enough space for DTB after kernel/initrd`, a guest-memory-layout limit (the
-kernel loads at +2 MB), not a kernel OOM.** So the freed pages add headroom at
-every size but can't break the 5→4 MB wall, which is QEMU-imposed, not Akuma's.
-Logs: `logs/rsa-purge/`.
+**Boot-to-SSH floor: 5 MB** (at time of RSA removal). 4/5/6/7 MB all boot to usable SSH
+after the `text_offset` fix (see *Breaking the 4 MB boot wall* below). The RSA removal
+alone doesn't change the floor; the `text_offset` change did. Logs: `logs/rsa-purge/`.
 
 ## Dynamic boot-stack reservation (June 2026)
 
@@ -775,7 +785,7 @@ logs in `logs/rsa-purge/matrix_*.log`.
 
 | RAM | release | size | extreme |
 |-----|---------|------|---------|
-| 4.0 MB | — | ✗ QEMU DTB | ✗ QEMU DTB |
+| 4.0 MB | — | ✗ QEMU DTB | ✅ hello · 664 |
 | 4.5 MB | — | ✗ 0 user pages | ✅ hello · 527 |
 | 5 MB | — | ✗ 0 user pages | ✅ hello · 639 |
 | 6 MB | — | ✅ hello · 604 | ✅ hello · 863 |
@@ -796,23 +806,22 @@ debug-instrumentation row in *What landed in the even-smaller-kernel branch*);
 each extreme cell ≤ 16 MB gained +4 pages vs the pre-gate sweep (the gate frees
 16 KB, which lands in user pages while the heap is at its seed).
 
-**Boot-to-hello floors: extreme 4.5 MB, size 6 MB, release ≤ 16 MB.** Reading the
+**Boot-to-hello floors: extreme 4.0 MB, size 6 MB, release ≤ 16 MB.** Reading the
 failures bottom-up:
 
-- **≤ 4.0 MB — every profile fails identically on QEMU**, `Not enough space for
-  DTB after kernel/initrd`. The kernel loads at +2 MB and QEMU can't fit the DTB
-  in the remaining RAM; this is a guest-memory-layout limit, **not** a kernel OOM,
-  so no amount of kernel shrinking breaks the ≤4.0 MB wall.
-- **4.125–4.375 MB (extreme) — QEMU starts the kernel, but the kernel layout
-  guard halts** with 0 user pages: `code+stack` + heap seed consume all of RAM.
-- **4.5 MB — extreme boots and runs hello** (`busybox echo`): PMM 1152 total /
-  625 alloc / **527 free** (~2 MB usable from the reclaimed pre-kernel region,
-  even though the *layout* "User pages" region is only 64 KB). This is the exact
-  extreme floor — bisected at 4.0 / 4.125 / 4.25 / 4.375 / 4.5 MB
-  (`logs/rsa-purge/ext_*k.log`). `meow -c "say hi"` also still replies here.
+- **< 4.0 MB** — all profiles fail on QEMU `Not enough space for DTB after
+  kernel/initrd`. The kernel now loads at +1 MB (`text_offset = 0x100000`), so
+  DTB lands at `0x40200000`; below 4 MB even this doesn't fit.
+- **4.0 MB — extreme boots and runs hello**: PMM 1024 total / 360 alloc / **664
+  free**. `meow -c "say hi"` also connects to ollama and replies here
+  (`logs/4mb_meow0.log`, 2026-06-05). This is the new extreme floor following the
+  `text_offset` change (see *Breaking the 4 MB boot wall* below). The matrix
+  above uses the RSA-off dynamic-reserve kernel (801 KB) built with that change.
+- **4.5 MB — prior extreme floor** (before `text_offset` fix): PMM 1152 total /
+  625 alloc / **527 free** (`logs/rsa-purge/ext_*k.log`). Now superseded.
 - **5 MB — size still fails the kernel layout guard** (0 user pages): its larger
-  881 KB image makes `code+stack` ~4.87 MB. **size needs 6 MB**; extreme already
-  runs at 4.5.
+  881 KB image makes `code+stack` ~4.87 MB. **size needs 6 MB**; extreme runs at
+  4.0 MB.
 - **6 MB and up — all three (where they boot) run hello cleanly.**
 
 Two things the matrix makes visible:
@@ -831,26 +840,69 @@ at boot, ≈ ×4 KB), one VM at a time so ollama isn't contended:
 
 | Workload | Floor | At the floor | What gates it lower |
 |---|---|---|---|
-| **boot + SSH** | 4.5 MB | usable shell | kernel layout guard (0 user pages) at 4.125–4.375; QEMU DTB ≤ 4.0 |
-| **`busybox echo` (hello)** | 4.5 MB | 527 free pg (~2.1 MB) | same as boot — a short static spawn touches few pages |
-| **`meow -c "say hi"`** | **4.5 MB** | 527 free pg; real model reply | same as boot — one socket + HTTP + a short streamed reply ≈ as light as hello |
+| **boot + SSH** | **4.0 MB** | 664 free pg (~2.6 MB) | QEMU DTB placement (< 4.0 MB doesn't fit) |
+| **`busybox echo` (hello)** | **4.0 MB** | 664 free pg | same as boot |
+| **`meow -c "say hi"`** | **4.0 MB** | low-water 1804 KB free; real model reply | one socket + HTTP + streamed reply; `logs/4mb_meow0.log` |
 | **`tcc hello.c`** (apk / `libtcc.so`) | 6 MB | — | tcc's own working set: `libtcc.so` resident + compile buffers ≈ 3 MB |
-| **`tcc -static hello.c`** | **4.5 MB** | — | static binary; no libtcc.so → matches the boot floor |
-| **`meow` agentic (`tcc -static`)** | **4.5 MB** | 1988 KB low-water; 2520 KB settled | matches the tcc-alone floor; SSH responsiveness degraded at this edge (`logs/4.5mb_meow5.log`) |
+| **`tcc -static hello.c`** | **4.5 MB** | — | static binary; no libtcc.so; floor unchanged from pre-`text_offset` era |
+| **`meow` agentic (`tcc -static`)** | **4.5 MB** | 1988 KB low-water; 2520 KB settled | tcc-static is the bottleneck; SSH responsiveness degraded at this edge (`logs/4.5mb_meow5.log`) |
 
-`meow -c "say hi"` was verified replying at **4.5 / 5.0 / 5.5 / 6.0 MB**
-(`logs/rsa-purge/meow_*k.log`, model `qwen3-yolo:latest`) — i.e. a one-shot LLM
-chat runs at the absolute kernel floor. tcc fails below 6 MB by exhausting the
-PMM pool while demand-paging `libtcc.so`: at 4.5 MB it SIGSEGVs after ~12 syscalls
-(never starts compiling); at 5.5 MB it gets ~123 syscalls in (reads headers,
-starts codegen) before `0 free pages`; 6 MB is the first size its full resident
-set fits. So the earlier "meow needs ~6 MB" was really the *agentic-compile* path
-(meow **+** tcc); a bare prompt bottoms out with hello at 4.5 MB.
+`meow -c "say hi"` was re-verified at **4.0 MB** (`logs/4mb_meow0.log`, 3 sessions,
+`qwen3-yolo:latest`) after the `text_offset` change; previously verified at
+**4.5 / 5.0 / 5.5 / 6.0 MB** (`logs/rsa-purge/meow_*k.log`). tcc fails below 6 MB
+by exhausting the PMM pool while demand-paging `libtcc.so`: at 4.5 MB it SIGSEGVs
+after ~12 syscalls (never starts compiling); at 5.5 MB it gets ~123 syscalls in
+before `0 free pages`; 6 MB is the first size its full resident set fits. So the
+earlier "meow needs ~6 MB" was the *agentic-compile* path (meow **+** tcc); a bare
+LLM prompt now bottoms out at the kernel floor, 4.0 MB.
 
 **Rule of thumb:** lightweight userspace (shell, a static hello, a single LLM
 round-trip) runs at the 4.5 MB kernel floor; anything that demand-pages a large
 shared library or holds multi-MB buffers (tcc, sustained agentic sessions) is
 gated by its *own* footprint, around 6 MB.
+
+## Breaking the 4 MB boot wall — ARM64 Image text_offset (June 2026)
+
+**Previous state.** QEMU places the DTB at `ALIGN_UP(kernel_load + image_size, 2 MB)`.
+With `text_offset = 0`, QEMU adds 2 MB automatically (`if text_offset < 4KB`), loading
+the kernel at `RAM_BASE + 2 MB = 0x40200000`. At 4 MB RAM (ram_end `0x40400000`):
+`DTB = ALIGN_UP(0x40200000 + ~0xCB000, 2MB) = 0x40400000`. QEMU's check
+`dtb_start < ram_end` → `0x40400000 < 0x40400000` → **false** → `Not enough space for
+DTB after kernel/initrd`. So the old boot floor was 4.5 MB even though the kernel only
+occupies ~820 KB.
+
+**Fix.** Set `text_offset = 0x100000` (1 MB) in `boot.rs` → QEMU uses it as-is (≥ 4 KB
+threshold), loading the kernel at `RAM_BASE + 1 MB = 0x40100000`. Linker's
+`KERNEL_PHYS_BASE` updated to match. New DTB location:
+`ALIGN_UP(0x40100000 + ~0xCB000, 2MB) = 0x40200000`. Check: `0x40200000 < 0x40400000`
+→ **true**. Boots at 4 MB.
+
+| | Before (`text_offset = 0`) | After (`text_offset = 1 MB`) |
+|---|---|---|
+| Kernel load address | `0x40200000` (RAM_BASE + 2 MB) | `0x40100000` (RAM_BASE + 1 MB) |
+| DTB placement (extreme ~820 KB) | `0x40400000` | `0x40200000` |
+| QEMU check at 4 MB | ❌ `0x40400000 < 0x40400000` fails | ✅ `0x40200000 < 0x40400000` passes |
+| Pre-kernel reclaim | 2 MB (512 pages) | 1 MB (256 pages) |
+| `KERNEL_PHYS_BASE` | `0x4020_0000` | `0x4010_0000` |
+
+**Files changed:**
+- `src/boot.rs` — `.quad 0x100000` (was `.quad 0`)
+- `linker.ld` — `KERNEL_PHYS_BASE = 0x40100000` (was `0x40200000`)
+- `src/config.rs` — `pub const KERNEL_PHYS_BASE: usize = 0x4010_0000`; `pub const KERNEL_PHYS_OFFSET: usize = 0x10_0000`
+- `src/main.rs` — uses `config::KERNEL_PHYS_BASE` / `config::KERNEL_PHYS_OFFSET`
+- `src/exceptions.rs` — uses `crate::config::KERNEL_PHYS_BASE as u64`
+- `crates/akuma-exec/src/threading/mod.rs` — local `const KERNEL_PHYS_BASE` for TTBR0 range checks
+
+**Trade-off.** Pre-kernel reclaim drops from 2 MB to 1 MB (one fewer PMM page-spanning
+reclaim). At 4 MB this is offset by the 1 MB smaller `code+stack` region (STACK_TOP is
+1 MB lower), yielding **net +256 PMM pages** vs the old layout. The boot guard
+`WARNING: Kernel is within 4MB of stack! (10 KB margin)` fires at 4 MB — the image is
+tight, but the linker `ASSERT` still passes (`_kernel_phys_end < STACK_BOTTOM`).
+
+**Verified** (`logs/4mb_meow0.log`, extreme 801 KB, 2026-06-05):
+- Boots to SSH; PMM 1024 total / 360 alloc / **664 free**
+- `meow -c "say hi"` connects to ollama, receives a reply; low-water 1804 KB free
+- 3 independent meow sessions at 4 MB; zero crash markers; `panic=0` throughout
 
 ## Per-RAM memory statistics (June 2026)
 
@@ -1374,7 +1426,8 @@ exercise this. Boot self-tests `compute_heap_size` and `compute_thread_limit` (i
 `src/tests.rs`) pin the heuristics. See also `docs/MEMORY_LAYOUT.md` (general
 layout + the RAM > 2 GB identity-map fix).
 
-| Profile | Binary | `image_size` | `BOOT_STACK_TOP` | SSH + hello |
-|---------|--------|-------------|-----------------|-------------|
-| `size` | 883 KB | 1 MB | `0x40400000` | ✓ |
-| `release` | 2833 KB | 3 MB | `0x40600000` | ✓ |
+| Profile | Binary | `KERNEL_PHYS_BASE` | `IMAGE_RESERVE` | `BOOT_STACK_TOP` | SSH + hello |
+|---------|--------|-------------------|----------------|-----------------|-------------|
+| `extreme` | 801 KB | `0x40100000` | 832 KB (dynamic) | `0x402e3000` | ✓ @ 4 MB |
+| `size` | 881 KB | `0x40100000` | 892 KB (dynamic) | `0x402f3000` | ✓ @ 6 MB |
+| `release` | 2875 KB | `0x40100000` | 2884 KB (dynamic) | `0x40b03000` | ✓ @ 16 MB |
