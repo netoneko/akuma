@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -e
-# Re-add every sc-* gate so the `size` profile is functionally identical to
-# before the gates landed (only `neko` and tests are dropped via
-# --no-default-features + no-tests). extreme-size is the build that omits them.
+# Re-add every sc-* gate so the `size` profile keeps every syscall family.
+# Dropped vs the default build (via --no-default-features): `neko`, tests, and
+# `tls-rsa` (RSA cert verification — saves ~300 KB; ECDSA/Ed25519 HTTPS still
+# work, SSH is Ed25519-only and unaffected). extreme-size omits the sc-* too.
 cargo +nightly build \
     --profile size \
     --no-default-features \

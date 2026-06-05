@@ -5,6 +5,10 @@ edition = "2024"
 
 [features]
 small-sockets = []
+# RSA signature verification for TLS server certs (PKCS#1 v1.5 + PSS, SHA-2).
+# Pulls in the `rsa` crate + its bignum arithmetic (~300 KB of kernel .text).
+# Off in the size/extreme profiles; ECDSA-P256 and Ed25519 stay available.
+tls-rsa = ["dep:rsa"]
 
 [lints]
 workspace = true
@@ -23,4 +27,4 @@ der = { version = "0.7", default-features = false, features = ["alloc", "oid"] }
 const-oid = { version = "0.9", default-features = false }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize", "fast"] }
-rsa = { version = "0.9", default-features = false, features = ["sha2"] }
+rsa = { version = "0.9", default-features = false, features = ["sha2"], optional = true }

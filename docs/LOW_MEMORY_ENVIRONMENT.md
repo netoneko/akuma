@@ -175,7 +175,12 @@ lazy-file `mmap`), much lighter resident than the static tcc the `size`-profile
 
 - **Direct tcc compile+run floor: 6 MB.** No kernel OOM markers at 6–8 MB.
 - **Boot + usable-SSH floor: 5 MB** (5 MB boots and runs SSH commands; only the
-  *compile* fails there). 4 MB does not boot.
+  *compile* fails there). 4 MB does not boot — and the failure is **QEMU's**
+  `Not enough space for DTB after kernel/initrd`, a guest-memory-layout limit (the
+  kernel loads at +2 MB, leaving too little room for the DTB at 4 MB), **not** a
+  kernel OOM. So further shrinking the kernel adds free pages at 5 MB+ but cannot
+  break the 5→4 MB wall. (Re-confirmed 2026-06-05 on the rsa-off / 848 KB-reserve
+  kernel — see *Tightening the extreme-profile reserve via the RSA feature gate*.)
 - **meow→tcc agentic floor (`meow -c "compile … and run it"`): 6 MB** (with the
   one-command-at-a-time prompt below — was 7 MB). Verified working at 7 MB
   (`7mb_meow0.log`) and now at **6 MB** (`6mb_meow8.log`, 2026-06-05, 807 KB
@@ -571,6 +576,57 @@ pre-link), with `boot.rs` asm and `main.rs`/`exceptions.rs` reading `STACK_TOP`/
 `STACK_BOTTOM` as `extern` linker symbols. That would auto-track the binary (claw back
 the remaining ~14 KB and self-adjust on every build) **and** collapse the five-location
 sync into one source of truth. Not done yet.
+
+## Tightening the extreme-profile reserve via the RSA feature gate (June 2026)
+
+The same `IMAGE_SIZE`-tightening lever as the `size`-profile section above,
+applied to `extreme` after shrinking the kernel. RSA TLS-cert verification is now
+behind the `tls-rsa` Cargo feature (on by default, **off in `size`/`extreme`** —
+both build `--no-default-features`). SSH is Ed25519-only and never used RSA; the
+only consumer was outbound-HTTPS server-cert verification, where ECDSA/Ed25519
+stay available. Full design + size breakdown: **`docs/RSA_FEATURE_GATE.md`**.
+
+Dropping `rsa` (and its `num-bigint-dig` bignum code) shrank the `extreme` flat
+`.bin` from 807 KB → 776 KB (and `_kernel_phys_end` 853 KB → 821 KB incl. `.bss`).
+The image saving alone frees **no** RAM — the boot stack sits at a fixed
+`STACK_BOTTOM = KERNEL_PHYS_LOAD + IMAGE_SIZE`, and both images fit the old
+reserve. To hand the slack back, the `extreme` `IMAGE_SIZE` was tightened
+**880 KB → 848 KB** (`0xDC000 → 0xD4000`), keeping the original ~26 KB margin over
+`_kernel_phys_end` (821 KB). Mirrored across the **3-way lockstep** guardrail —
+all three must change together (updating only two leaves the heap reservation
+computing against the stale offset, so the freed pages never reach the pool —
+observed: PMM unchanged until `main.rs` was fixed):
+
+| Location | Symbol | Value |
+|---|---|---|
+| `src/boot.rs` | `IMAGE_SIZE` (extreme) → ARM64 header + `BOOT_STACK_TOP` | `0xD4000` |
+| `build.rs` | `image_size` (extreme) → `--defsym=STACK_BOTTOM` (linker `ASSERT`) | `0xD4000` |
+| `src/main.rs` | `STACK_BOTTOM` const (extreme) | `0x402D_4000` |
+
+**Measured free memory, before (rsa-on, 880 KB reserve) vs after (rsa-off, 848 KB
+reserve), same disk snapshot.** The whole layout shifts down exactly `0x8000`
+(32 KB) and all of it lands in the user-page pool:
+
+| MEM | | Code+Stack end | User pages | PMM free pages | `free` (Mem) |
+|---|---|---|---|---|---|
+| 8 MB | before | `0x403ec000` | `0x404ec000–0x40800000` (1104 KB) | 1295 | 4/8 MB |
+| 8 MB | **after** | `0x403e4000` | `0x404e4000–0x40800000` (**1136 KB**) | **1303** | 4/8 MB |
+| 6 MB | after | `0x403e4000` | `0x404a4000–0x40600000` (752 KB) | 855 | 2/6 MB |
+| 5 MB | before | `0x403ec000` | `0x4048c000–0x40500000` (464 KB) | 623 | 2/5 MB |
+| 5 MB | **after** | `0x403e4000` | `0x40484000–0x40500000` (**496 KB**) | **631** | 2/5 MB |
+
+**+8 PMM pages = +32 KB of user-page pool at every RAM size.** The `[Mem]` free
+RAM is MB-granular so the headline figure is unchanged; the gain is real and shows
+in the page-granular `PMM stats` / user-pages columns. The linker `ASSERT`
+validates the tighter reserve on every build; boot reaches `[SSH Server]
+Listening` cleanly at 5/6/7/8 MB.
+
+**Boot-to-SSH floor unchanged at 5 MB.** Sweeping the tightened `extreme` kernel:
+5/6/7 MB boot to a usable SSH; **4 MB does not boot — but the failure is QEMU's
+`Not enough space for DTB after kernel/initrd`, a guest-memory-layout limit (the
+kernel loads at +2 MB), not a kernel OOM.** So the 32 KB adds headroom at every
+size but can't break the 5→4 MB wall, which is QEMU-imposed, not Akuma's.
+Logs: `logs/rsa-purge/`.
 
 ## Per-RAM memory statistics (June 2026)
 

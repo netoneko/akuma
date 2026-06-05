@@ -322,7 +322,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // stack + Image header; build.rs feeds the linker ASSERT). extreme implies
     // kernel_profile_size, so its branch must come first.
     #[cfg(kernel_profile_extreme)]
-    const STACK_BOTTOM: usize = 0x402D_C000; // 0x40200000 + 0x0DC000 (880 KB)
+    const STACK_BOTTOM: usize = 0x402D_4000; // 0x40200000 + 0x0D4000 (848 KB)
     #[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
     const STACK_BOTTOM: usize = 0x402E_C000; // 0x40200000 + 0x0EC000 (944 KB)
     #[cfg(not(kernel_profile_size))]

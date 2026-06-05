@@ -28,7 +28,7 @@ const PHYS_BASE: usize = 0x4000_0000;
 // user-page pool (lowers the boot floor). kernel_profile_extreme always implies
 // kernel_profile_size (both are opt-level=z), so it must be checked first.
 #[cfg(kernel_profile_extreme)]
-const IMAGE_SIZE: usize = 0xDC000; // 880 KB (covers _kernel_phys_end incl. .bss)
+const IMAGE_SIZE: usize = 0xD4000; // 848 KB (covers _kernel_phys_end ~822 KB incl. .bss, ~26 KB margin)
 #[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
 const IMAGE_SIZE: usize = 0xEC000; // 944 KB
 #[cfg(not(kernel_profile_size))]

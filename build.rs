@@ -33,16 +33,17 @@ fn main() {
     // the build if the kernel outgrows the reserved region — bump the value here
     // AND in boot.rs together if that fires.
     let kernel_phys_load: usize = 0x4020_0000;
-    // - extreme-size: the sc-* families are gated out, so the image is smaller than
-    //   `size`; hand-tightened to 880 KB. This must cover `_kernel_phys_end`
-    //   (LOAD .bin ≈ 807 KB PLUS ~46 KB of NOLOAD .bss boot page tables → end at
-    //   ~853 KB), not just the .bin, leaving ~27 KB margin. The freed reservation
+    // - extreme-size: the sc-* families are gated out, AND `tls-rsa` is off
+    //   (no RSA cert verification), so the image is smaller than `size`;
+    //   hand-tightened to 848 KB. This must cover `_kernel_phys_end`
+    //   (LOAD .bin ≈ 776 KB PLUS ~46 KB of NOLOAD .bss boot page tables → end at
+    //   ~822 KB), not just the .bin, leaving ~26 KB margin. The freed reservation
     //   (vs size's 944 KB) goes to the user-page pool, lowering the RAM floor. If
     //   the kernel grows past this the linker ASSERT fails — measure and bump.
     // - size: hand-tightened to 944 KB (page-aligned) over the ~914 KB kernel.
     // - release: a roomy 3 MB.
     let image_size: usize = if extreme_profile {
-        0xDC000 // 880 KB
+        0xD4000 // 848 KB
     } else if size_profile {
         0xEC000 // 944 KB
     } else {

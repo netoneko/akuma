@@ -6,9 +6,11 @@
 //! Supports:
 //! - ECDSA P-256 with SHA-256
 //! - Ed25519
+//! - RSA (PKCS#1 v1.5 + PSS, SHA-2) — only when the `tls-rsa` feature is on;
+//!   off in the size/extreme kernel profiles to save ~300 KB. With it off,
+//!   RSA-signed certs are rejected as `InvalidSignatureScheme`.
 //!
 //! Limitations:
-//! - RSA signatures not supported (would need `rsa` crate)
 //! - No chain validation (trusts end-entity cert directly)
 //! - No revocation checking (CRL/OCSP)
 
@@ -131,21 +133,27 @@ where
                 verify_ecdsa_p256(&x509, &message, verify.signature)
             }
             SignatureScheme::Ed25519 => verify_ed25519(&x509, &message, verify.signature),
+            #[cfg(feature = "tls-rsa")]
             SignatureScheme::RsaPkcs1Sha256 => {
                 verify_rsa_pkcs1_sha256(&x509, &message, verify.signature)
             }
+            #[cfg(feature = "tls-rsa")]
             SignatureScheme::RsaPkcs1Sha384 => {
                 verify_rsa_pkcs1_sha384(&x509, &message, verify.signature)
             }
+            #[cfg(feature = "tls-rsa")]
             SignatureScheme::RsaPkcs1Sha512 => {
                 verify_rsa_pkcs1_sha512(&x509, &message, verify.signature)
             }
+            #[cfg(feature = "tls-rsa")]
             SignatureScheme::RsaPssRsaeSha256 => {
                 verify_rsa_pss_sha256(&x509, &message, verify.signature)
             }
+            #[cfg(feature = "tls-rsa")]
             SignatureScheme::RsaPssRsaeSha384 => {
                 verify_rsa_pss_sha384(&x509, &message, verify.signature)
             }
+            #[cfg(feature = "tls-rsa")]
             SignatureScheme::RsaPssRsaeSha512 => {
                 verify_rsa_pss_sha512(&x509, &message, verify.signature)
             }
@@ -315,6 +323,7 @@ fn verify_ed25519(
 }
 
 /// Verify RSA PKCS#1 v1.5 signature with SHA-256
+#[cfg(feature = "tls-rsa")]
 fn verify_rsa_pkcs1_sha256(
     cert: &X509Certificate,
     message: &[u8],
@@ -348,6 +357,7 @@ fn verify_rsa_pkcs1_sha256(
 }
 
 /// Verify RSA PKCS#1 v1.5 signature with SHA-384
+#[cfg(feature = "tls-rsa")]
 fn verify_rsa_pkcs1_sha384(
     cert: &X509Certificate,
     message: &[u8],
@@ -371,6 +381,7 @@ fn verify_rsa_pkcs1_sha384(
 }
 
 /// Verify RSA PKCS#1 v1.5 signature with SHA-512
+#[cfg(feature = "tls-rsa")]
 fn verify_rsa_pkcs1_sha512(
     cert: &X509Certificate,
     message: &[u8],
@@ -394,6 +405,7 @@ fn verify_rsa_pkcs1_sha512(
 }
 
 /// Verify RSA-PSS signature with SHA-256
+#[cfg(feature = "tls-rsa")]
 fn verify_rsa_pss_sha256(
     cert: &X509Certificate,
     message: &[u8],
@@ -417,6 +429,7 @@ fn verify_rsa_pss_sha256(
 }
 
 /// Verify RSA-PSS signature with SHA-384
+#[cfg(feature = "tls-rsa")]
 fn verify_rsa_pss_sha384(
     cert: &X509Certificate,
     message: &[u8],
@@ -440,6 +453,7 @@ fn verify_rsa_pss_sha384(
 }
 
 /// Verify RSA-PSS signature with SHA-512
+#[cfg(feature = "tls-rsa")]
 fn verify_rsa_pss_sha512(
     cert: &X509Certificate,
     message: &[u8],

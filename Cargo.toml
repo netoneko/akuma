@@ -68,10 +68,15 @@ inherits = "size"
 [features]
 default = [
     "neko",
+    "tls-rsa",
     "sc-aio", "sc-sysv-ipc", "sc-framebuffer", "sc-containers",
     "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
 ]
 no-tests = ["akuma-net/small-sockets"]
+# RSA cert verification for outbound HTTPS/TLS. Enabled by default; dropped by
+# the size/extreme profiles (their --no-default-features build omits it) to save
+# ~300 KB. SSH is Ed25519-only and unaffected; only RSA-only HTTPS hosts break.
+tls-rsa = ["akuma-net/tls-rsa", "dep:rsa"]
 # In-kernel `neko` text editor. Enabled by default; the size profile drops it
 # via `--no-default-features` in scripts/build_size.sh.
 neko = ["dep:akuma-editor"]
@@ -147,8 +152,10 @@ const-oid = { version = "0.9", default-features = false }
 # ECDSA P-256 signature verification
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 
-# RSA signature verification
-rsa = { version = "0.9", default-features = false, features = ["sha2"] }
+# RSA signature verification — gated behind the `tls-rsa` feature (off in
+# size/extreme profiles). The kernel proper does not use this directly; the
+# active consumer is akuma-net's TLS cert verifier.
+rsa = { version = "0.9", default-features = false, features = ["sha2"], optional = true }
 
 [patch.crates-io]
 # Fork based on v0.17.0 (commit 1eaaa136) with exposed handshake/extensions modules
