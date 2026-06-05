@@ -36,12 +36,78 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use spinning_top::{RwSpinlock, Spinlock};
+#[cfg(not(kernel_profile_extreme))]
+use spinning_top::Spinlock;
+use spinning_top::RwSpinlock;
 
 use akuma_vfs::{DirEntry, Filesystem, FsError, FsStats, Metadata, path_components, split_path};
 use crate::BlockDevice;
 
-const BLOCK_CACHE_MAX: usize = 512;
+/// Number of block slots in the ring cache. One contiguous backing allocation;
+/// linear-scan lookup is fine at this size (fits in L1).
+#[cfg(not(kernel_profile_extreme))]
+const BLOCK_CACHE_ENTRIES: usize = 64;
+
+/// Flat ring-buffer block cache. A single contiguous Vec<u8> holds all cached
+/// block data; a parallel tag array records which block number occupies each
+/// slot (u32::MAX = empty). Eviction is pure ring — no LRU bookkeeping.
+///
+/// Compared to the old BTreeMap<u32, Vec<u8>>: one heap allocation instead of
+/// N, so when the cache is dropped or pressure forces reclaim, the whole backing
+/// buffer frees in one shot rather than leaving N scattered Vec headers across
+/// the PMM-claimed heap span.
+#[cfg(not(kernel_profile_extreme))]
+struct BlockRingCache {
+    backing: Vec<u8>,
+    tags: [u32; BLOCK_CACHE_ENTRIES],
+    head: usize,
+    block_size: usize,
+}
+
+#[cfg(not(kernel_profile_extreme))]
+impl BlockRingCache {
+    fn new(block_size: usize) -> Self {
+        Self {
+            backing: vec![0u8; BLOCK_CACHE_ENTRIES * block_size],
+            tags: [u32::MAX; BLOCK_CACHE_ENTRIES],
+            head: 0,
+            block_size,
+        }
+    }
+
+    fn get(&self, block_num: u32) -> Option<&[u8]> {
+        for (i, &tag) in self.tags.iter().enumerate() {
+            if tag == block_num {
+                let s = i * self.block_size;
+                return Some(&self.backing[s..s + self.block_size]);
+            }
+        }
+        None
+    }
+
+    fn insert(&mut self, block_num: u32, data: &[u8]) {
+        // If already cached (another thread beat us to it), don't add a duplicate.
+        // Duplicates would let a stale copy survive a remove() that only clears
+        // the first match, which would poison later reads after a write.
+        if self.tags.contains(&block_num) {
+            return;
+        }
+        let slot = self.head;
+        self.tags[slot] = block_num;
+        let s = slot * self.block_size;
+        self.backing[s..s + self.block_size].copy_from_slice(data);
+        self.head = (self.head + 1) % BLOCK_CACHE_ENTRIES;
+    }
+
+    fn remove(&mut self, block_num: u32) {
+        for tag in &mut self.tags {
+            if *tag == block_num {
+                *tag = u32::MAX;
+                return;
+            }
+        }
+    }
+}
 
 /// Tracks which thread (by slot ID) currently holds the ext2 state write lock.
 /// 0 means no write lock is held. Used to detect orphaned locks from killed processes.
@@ -305,7 +371,8 @@ pub struct Ext2Filesystem<B: BlockDevice> {
     pub state: RwSpinlock<Ext2State>,
     #[cfg(not(test))]
     state: RwSpinlock<Ext2State>,
-    block_cache: Spinlock<alloc::collections::BTreeMap<u32, Vec<u8>>>,
+    #[cfg(not(kernel_profile_extreme))]
+    block_cache: Spinlock<BlockRingCache>,
 }
 
 impl<B: BlockDevice> Ext2Filesystem<B> {
@@ -357,7 +424,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             dev,
             time_fn: utc_time_us,
             state: RwSpinlock::new(state),
-            block_cache: Spinlock::new(alloc::collections::BTreeMap::new()),
+            #[cfg(not(kernel_profile_extreme))]
+            block_cache: Spinlock::new(BlockRingCache::new(block_size)),
         })
     }
 
@@ -465,10 +533,11 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     // ========================================================================
 
     fn read_block(&self, state: &Ext2State, block_num: u32) -> Result<Vec<u8>, FsError> {
+        #[cfg(not(kernel_profile_extreme))]
         {
             let cache = self.block_cache.lock();
-            if let Some(data) = cache.get(&block_num) {
-                return Ok(data.clone());
+            if let Some(data) = cache.get(block_num) {
+                return Ok(data.to_vec());
             }
         }
 
@@ -476,11 +545,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let offset = block_num as u64 * state.block_size as u64;
         self.dev.read_bytes(offset, &mut buf).map_err(|_| FsError::IoError)?;
 
+        #[cfg(not(kernel_profile_extreme))]
         {
-            let mut cache = self.block_cache.lock();
-            if cache.len() < BLOCK_CACHE_MAX {
-                cache.insert(block_num, buf.clone());
-            }
+            self.block_cache.lock().insert(block_num, &buf);
         }
 
         Ok(buf)
@@ -490,7 +557,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         if data.len() != state.block_size {
             return Err(FsError::Internal);
         }
-        { self.block_cache.lock().remove(&block_num); }
+        #[cfg(not(kernel_profile_extreme))]
+        { self.block_cache.lock().remove(block_num); }
         let offset = block_num as u64 * state.block_size as u64;
         self.dev.write_bytes(offset, data).map_err(|_| FsError::IoError)?;
         Ok(())

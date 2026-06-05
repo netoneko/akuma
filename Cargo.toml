@@ -84,9 +84,10 @@ neko = ["dep:akuma-editor"]
 # Profile discriminator (NOT a syscall gate). build_extreme_size.sh enables it so
 # build.rs can pick a tighter IMAGE_SIZE / STACK_BOTTOM than the `size` profile.
 # build.rs reads it via CARGO_FEATURE_EXTREME and emits cfg(kernel_profile_extreme).
-# Forwarded to akuma-exec so its build.rs emits the same cfg there (warm-stack
-# floor + kernel-stack right-sizing for the extreme target live in that crate).
-extreme = ["akuma-exec/extreme"]
+# Forwarded to akuma-exec and akuma-ext2 so their build.rs emits the same cfg
+# (warm-stack floor + kernel-stack right-sizing in akuma-exec; block-cache gate
+# in akuma-ext2).
+extreme = ["akuma-exec/extreme", "akuma-ext2/extreme"]
 
 # Per-family syscall gates. Default-on so `cargo build`/`run`/`test` keep every
 # syscall; the minimal builds use --no-default-features and re-add what they want.

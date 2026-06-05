@@ -7,7 +7,7 @@ Set RAM with the `MEMORY` env var: `MEMORY=64M cargo run --release`.
 
 ## TL;DR
 
-### 🏁 Milestone — agentic compile floor down to 5 MB (June 2026)
+### 🏁 Milestone — meow + tcc agentic floor down to 4.5 MB (June 2026)
 
 With the **optimized static tcc** (`userspace/tcc`, 603 KB → 291 KB), the
 **apk-musl toolchain** (musl from `apk add musl-dev`; we ship only `libtcc1.tar`),
@@ -18,11 +18,12 @@ the `extreme` profile with `scripts/our_tcc_floor.py`:
 |---|---|---|
 | `tcc -static` compiles + runs `hello.c` **and** `hello_stripped.c` (alone) | **4.5 MB** | identical floor for `printf` and bare-`write` → libc size doesn't move it; 4.0 MB fails to **boot** |
 | meow `-c "say hi"` (alone) | **4.5 MB** | |
-| **meow agentically drives `tcc -static` + runs the binary** | **5.0 MB** | clean, `panic=0`, ~48 s (`logs/meow5mb.log`, 2026-06-05). At **4.5 MB** the box can't fit both, but the kernel now **OOM-kills the process and survives** (was a whole-kernel abort before the OOM patch — see below) |
+| **meow agentically drives `tcc -static` + runs the binary** | **4.5 MB** | clean, `panic=0` (`logs/4.5mb_meow5.log`, 2026-06-05). Low-water 1988 KB; settled 2520 KB free. SSH read gaps reached ~1.6 s in that log — caused by ext2 block-cache heap fragmentation (now fixed, see *ext2 block-cache fix* below) |
 
-So the **meow→tcc agentic floor is 5 MB** (was ~6 MB) and the **tcc-alone floor is
-the kernel boot floor, 4.5 MB**. tcc/libc is no longer the bottleneck — the kernel
-is. Full write-up: [TCC_LOW_MEMORY.md](TCC_LOW_MEMORY.md).
+So all three paths now share the **4.5 MB kernel boot floor**. tcc/libc is no longer
+the bottleneck — the kernel is. (The earlier 5 MB meow→tcc floor was verified in
+`logs/meow5mb.log`; the new 4.5 MB record is `logs/4.5mb_meow5.log`.)
+Full write-up: [TCC_LOW_MEMORY.md](TCC_LOW_MEMORY.md).
 
 ### 🛡️ OOM hardening — kernel survives, kills the process (June 2026)
 
@@ -193,11 +194,20 @@ creep will eventually force another PMM claim — or, at 7 MB, OOM — if a long
 box runs meow repeatedly. The `allocator::reclaim_to_pmm()` path (see *Heap→PMM
 reclaim*) cannot return the grown spans because they are never fully free.
 
-**Not yet root-caused.** Candidates to investigate: per-process teardown not
-freeing all kernel-side structures (address-space / fd / signal tables), retained
-`PROC_SYSCALL_LOG` entries, or VFS/socket buffers held past close. Reproduce with
-the before/after `free` above; `[Mem]` serial lines report live heap used/peak
-and cumulative `Allocs`.
+**Partially root-caused.** The dominant one-time growth was the **ext2 block
+cache** — `BTreeMap<u32, Vec<u8>>` (cap 512). During a meow+tcc agentic run,
+~228 blocks (one per 1 KB block read) were inserted as individual heap Vecs
+scattered across the PMM-claimed 256 KB span. A single surviving entry pinned
+the entire span, so `reclaim_to_pmm()` could never return it. This also caused
+the SSH read-gap spikes (~1.6 s) seen in `logs/4.5mb_meow5.log`: allocations
+that couldn't fit in the fragmented span triggered slow reclaim cycles. **Fixed**
+(June 2026) — see *ext2 block-cache fix* below; the heap span now frees cleanly
+after a run on the `extreme` profile.
+
+Remaining candidates for the per-run creep: per-process teardown not freeing all
+kernel-side structures (address-space / fd / signal tables), or VFS/socket buffers
+held past close. Reproduce with the before/after `free` above; `[Mem]` serial
+lines report live heap used/peak and cumulative `Allocs`.
 
 ## Extreme-profile compile floor (re-measured 2026-06-05)
 
@@ -784,8 +794,9 @@ at boot, ≈ ×4 KB), one VM at a time so ollama isn't contended:
 | **boot + SSH** | 4.5 MB | usable shell | kernel layout guard (0 user pages) at 4.125–4.375; QEMU DTB ≤ 4.0 |
 | **`busybox echo` (hello)** | 4.5 MB | 527 free pg (~2.1 MB) | same as boot — a short static spawn touches few pages |
 | **`meow -c "say hi"`** | **4.5 MB** | 527 free pg; real model reply | same as boot — one socket + HTTP + a short streamed reply ≈ as light as hello |
-| **`tcc hello.c`** | 6 MB | — | tcc's own working set: `libtcc.so` resident + compile buffers ≈ 3 MB |
-| **`meow` agentic (spawns tcc)** | 6 MB | — | bounded by the tcc it spawns, not meow itself |
+| **`tcc hello.c`** (apk / `libtcc.so`) | 6 MB | — | tcc's own working set: `libtcc.so` resident + compile buffers ≈ 3 MB |
+| **`tcc -static hello.c`** | **4.5 MB** | — | static binary; no libtcc.so → matches the boot floor |
+| **`meow` agentic (`tcc -static`)** | **4.5 MB** | 1988 KB low-water; 2520 KB settled | matches the tcc-alone floor; SSH responsiveness degraded at this edge (`logs/4.5mb_meow5.log`) |
 
 `meow -c "say hi"` was verified replying at **4.5 / 5.0 / 5.5 / 6.0 MB**
 (`logs/rsa-purge/meow_*k.log`, model `qwen3-yolo:latest`) — i.e. a one-shot LLM
