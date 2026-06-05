@@ -649,6 +649,42 @@ pub fn alloc_page_zeroed() -> Option<PhysFrame> {
     Some(frame)
 }
 
+/// Pages held back from *user* demand-paging so kernel-critical work can always
+/// make progress when a process tries to consume all of RAM: the page tables to
+/// complete an in-flight fault, kernel-heap growth, and the OOM process-kill path
+/// itself. Without this, a memory-hungry process (tcc, meow) drains the PMM to
+/// near-zero and the kernel's *own* next allocation fails — and a failed kernel
+/// allocation aborts the whole kernel (a `BRK` trap) instead of the offending
+/// process being killed. 16 pages = 64 KB: small enough not to raise the working
+/// floor, large enough for one minimal heap-growth + the kill path's bookkeeping.
+pub const USER_PAGE_RESERVE: usize = 16;
+
+/// Reserve predicate: would handing a page to *user* demand-paging starve the
+/// kernel reserve? Pure fn over the free-page count so it can be unit-tested at
+/// the boundary without actually draining RAM.
+#[inline]
+pub fn user_alloc_would_starve(free: usize) -> bool {
+    free <= USER_PAGE_RESERVE
+}
+
+/// Allocate a zeroed page for a **user** demand-paging fault (anonymous fill,
+/// ELF demand-load, reserved-region commit). Returns `None` once free PMM has
+/// fallen to [`USER_PAGE_RESERVE`], so the caller treats it as OOM and SIGSEGVs
+/// the faulting process — leaving the reserve for page-table completion and the
+/// kill path. Kernel-internal callers (page tables, heap growth) keep calling
+/// [`alloc_page_zeroed`], which is allowed to dip into the reserve.
+pub fn alloc_page_zeroed_user() -> Option<PhysFrame> {
+    if user_alloc_would_starve(free_count()) {
+        // One reclaim attempt (return any fully-free heap watermark to the PMM)
+        // before giving up — mirrors `alloc_page`'s reclaim-under-pressure.
+        crate::allocator::reclaim_to_pmm();
+        if user_alloc_would_starve(free_count()) {
+            return None;
+        }
+    }
+    alloc_page_zeroed()
+}
+
 /// Allocate multiple zeroed pages in a single lock acquisition.
 /// All pages are zeroed and cache-cleaned with a single DSB at the end.
 /// Returns None (without partial allocation) if `count` pages aren't available.

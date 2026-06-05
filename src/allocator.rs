@@ -53,10 +53,19 @@ impl talc::OomHandler for PmmOomHandler {
         if !is_pmm_ready() {
             return Err(());
         }
-        // Grow by at least 256 KB (64 pages) to amortise per-OOM overhead.
+        // Grow by at least 256 KB (64 pages) to amortise per-OOM overhead —
+        // EXCEPT when the PMM is critically low (a process is exhausting RAM).
+        // Then grow by just what's needed, so the kernel heap can still satisfy
+        // small allocations from the thin `USER_PAGE_RESERVE` pool. This is what
+        // keeps the OOM process-kill path able to allocate instead of the kernel
+        // itself failing to grow the heap and aborting.
         const GROW_PAGES: usize = 64;
         let needed = (layout.size() + PAGE_SIZE - 1) / PAGE_SIZE;
-        let n = needed.max(GROW_PAGES);
+        let n = if crate::pmm::free_count() <= 2 * GROW_PAGES {
+            needed
+        } else {
+            needed.max(GROW_PAGES)
+        };
         // NB: `alloc_pages_contiguous_zeroed` may try `reclaim_to_pmm()` on
         // failure, which `TALC.try_lock()`s — that lock is held by us right now
         // (we were called from inside `malloc`), so the try_lock fails and the

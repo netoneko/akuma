@@ -7,6 +7,50 @@ Set RAM with the `MEMORY` env var: `MEMORY=64M cargo run --release`.
 
 ## TL;DR
 
+### 🏁 Milestone — agentic compile floor down to 5 MB (June 2026)
+
+With the **optimized static tcc** (`userspace/tcc`, 603 KB → 291 KB), the
+**apk-musl toolchain** (musl from `apk add musl-dev`; we ship only `libtcc1.tar`),
+and meow's **file-backed tool output**, the floors dropped again — re-measured on
+the `extreme` profile with `scripts/our_tcc_floor.py`:
+
+| Path | Floor | Notes |
+|---|---|---|
+| `tcc -static` compiles + runs `hello.c` **and** `hello_stripped.c` (alone) | **4.5 MB** | identical floor for `printf` and bare-`write` → libc size doesn't move it; 4.0 MB fails to **boot** |
+| meow `-c "say hi"` (alone) | **4.5 MB** | |
+| **meow agentically drives `tcc -static` + runs the binary** | **5.0 MB** | clean, `panic=0`, ~48 s (`logs/meow5mb.log`, 2026-06-05). At **4.5 MB** the box can't fit both, but the kernel now **OOM-kills the process and survives** (was a whole-kernel abort before the OOM patch — see below) |
+
+So the **meow→tcc agentic floor is 5 MB** (was ~6 MB) and the **tcc-alone floor is
+the kernel boot floor, 4.5 MB**. tcc/libc is no longer the bottleneck — the kernel
+is. Full write-up: [TCC_LOW_MEMORY.md](TCC_LOW_MEMORY.md).
+
+### 🛡️ OOM hardening — kernel survives, kills the process (June 2026)
+
+Previously, at 4.5 MB the meow→tcc path drained the PMM to ~0 and the kernel's
+*own* next allocation failed → whole-kernel `BRK` abort (`EC=0x3c` from EL1,
+`4.5mb_meow2.log`). Fixed by a small **PMM emergency reserve** that user
+demand-paging won't dip into:
+
+- `pmm::USER_PAGE_RESERVE` (16 pages) + `alloc_page_zeroed_user()` — user
+  demand-paging fault fills (anon + file, data + instruction abort) return `None`
+  once free PMM hits the reserve, so the faulting process is **SIGSEGV'd** via the
+  existing path. Page tables, kernel-heap growth, and the kill path stay on the
+  reserve-exempt `alloc_page_zeroed()`.
+- `allocator::handle_oom` grows the heap by just `needed` (not a 64-page chunk)
+  when PMM is critically low, so the kill path can still allocate from the reserve.
+- Self-test: `test_oom_user_page_reserve` (`src/process_tests.rs`).
+
+**Validated** (`logs/oom_patch_4p5mb.log`): 4.5 MB meow→tcc now shows **0** crash
+markers; the over-demanding processes SIGSEGV gracefully and SSH keeps serving.
+
+**Still open:** memory **reclaim after process death** is incomplete — post-OOM at
+4.5 MB even a trivial `busybox` SIGSEGVs because the dead processes' pages aren't
+fully returned to the PMM (the "permanent high-water" reclaim issue). So 4.5 MB
+stays *unusable* after an OOM, but the kernel no longer dies. That reclaim gap is
+the next lever below 5 MB — **not** the toolchain.
+
+### Earlier sweep (kept for history)
+
 Verified with `scripts/test_memory_split.py` + the small-RAM sweeps in `logs/`
 (tcc compiling `/akuma-playground/hello.c`):
 
@@ -22,7 +66,7 @@ Verified with `scripts/test_memory_split.py` + the small-RAM sweeps in `logs/`
 | **8 MB** | **yes** | **yes** | **yes (repeatable)** | yes | 4 / 1 / ~2.08 / 14 | **`tcc hello.c -o /tmp/h && /tmp/h` compiles + runs repeatedly** (6 cycles verified, 2026-06-04). Earlier "marginal / `memory full`" was the dormant-cfg slurp bug (akuma-exec had no build.rs → `HEAP_SLURP_MAX` was 1 MiB, so the 723 KB tcc binary was slurped whole). Fixed by `crates/akuma-exec/build.rs` + heap→PMM reclaim — see *`tcc hello.c` now runs repeatedly at 8 MB* below |
 | **7 MB** *(extreme)* | yes | yes | **yes** | **yes** | — (low-water 3 MB free) | direct `tcc hello.c -o out` + run prints `Hello, Akuma!`; **meow→tcc compile+run also works** here; `meow -c` → ollama streams a full reply (25.2 TPS). See *Extreme-profile compile floor* below |
 | **6 MB** *(extreme)* | yes | yes | **yes** | **yes** | — (low-water 1 MB free) | direct `tcc` compiles+runs; **meow→ollama streams AND the meow→tcc *agentic* compile+run path now works** when the prompt forces one-command-at-a-time shell calls (verified `6mb_meow8.log`, 2026-06-05, 807 KB kernel). Was previously documented as OOMing. See *meow→tcc agentic path at 6 MB* below |
-| **5 MB** *(extreme)* | yes | yes | no (`memory full`) | no | — (low-water 1 MB free) | boots + usable SSH, but tcc itself exhausts memory; **4 MB does not boot** |
+| **5 MB** *(extreme)* | yes | yes | no (`memory full`) | no | — (low-water 1 MB free) | **Superseded — see the milestone above.** Measured with the old non-static apk tcc; with the optimized `tcc -static` the compile-alone floor is now **4.5 MB** and the meow→tcc agentic floor is **5 MB**. **4 MB still does not boot** |
 
 > Rows **≤ 7 MB** are `extreme`-profile (lighter reserve than `size`); the rows ≥ 8 MB
 > are the `size`-profile sweep. See *Extreme-profile compile floor (re-measured

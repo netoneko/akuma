@@ -860,7 +860,7 @@ fn ensure_user_page_mapped(pid: u32, page_va: usize) -> bool {
         }
         if matches!(source, akuma_exec::process::LazySource::Zero) {
             let map_flags = if flags != 0 { flags } else { akuma_exec::mmu::user_flags::RW };
-            if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+            if let Some(page_frame) = crate::pmm::alloc_page_zeroed_user() {
                 let (table_frames, installed) = unsafe {
                     akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
                 };
@@ -2619,7 +2619,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             let (_, _, free) = crate::pmm::stats();
                             crate::tprint!(128, "[DA-DP] pid={} va=0x{:x} readahead pool exhausted, {} free pages — retrying single page\n",
                                 pid, far_usize, free);
-                            if let Some(pf) = crate::pmm::alloc_page_zeroed() {
+                            if let Some(pf) = crate::pmm::alloc_page_zeroed_user() {
                                 // Re-read file data for this single page
                                 let pg_data_start = core::cmp::max(page_va, segment_va);
                                 let pg_data_end = core::cmp::min(page_va + 0x1000, segment_va + filesz);
@@ -2676,7 +2676,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             }
                         }
                     } else {
-                        if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+                        if let Some(page_frame) = crate::pmm::alloc_page_zeroed_user() {
                             let (table_frames, installed) = unsafe {
                                 akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
                             };
@@ -3102,7 +3102,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             let (_, _, free) = crate::pmm::stats();
                             crate::tprint!(128, "[IA-DP] pid={} va=0x{:x} readahead pool exhausted, {} free pages — retrying single page\n",
                                 pid, far_usize, free);
-                            if let Some(pf) = crate::pmm::alloc_page_zeroed() {
+                            if let Some(pf) = crate::pmm::alloc_page_zeroed_user() {
                                 let pg_data_start = core::cmp::max(page_va, segment_va);
                                 let pg_data_end = core::cmp::min(page_va + 0x1000, segment_va + filesz);
                                 if pg_data_start < pg_data_end {
@@ -3156,7 +3156,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             }
                         }
                     } else {
-                        if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+                        if let Some(page_frame) = crate::pmm::alloc_page_zeroed_user() {
                             let (table_frames, installed) = unsafe {
                                 akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
                             };

@@ -92,6 +92,10 @@ pub fn run_all_tests() {
     test_far_kernel_identity_range_policy();
     test_sa_siginfo_frame_offsets_for_x1_x2();
 
+    // OOM hardening: user demand-paging respects the kernel PMM reserve so a
+    // memory-hungry process is killed instead of the kernel aborting.
+    test_oom_user_page_reserve();
+
     // EC=0x18 DC ZVA emulation (Go runtime memclrNoHeapPointers fix)
     test_dc_zva_emulation();
 
@@ -3575,6 +3579,48 @@ fn test_dup3_no_einval_for_valid_args() {
     );
 
     console::print("  [PASS] test_dup3_no_einval_for_valid_args\n");
+}
+
+/// OOM hardening: `alloc_page_zeroed_user()` must refuse a page once free PMM
+/// has fallen to the kernel reserve, while the critical allocator keeps working.
+/// This is what converts an OOM (a process trying to consume all of RAM) into a
+/// clean SIGSEGV of that process instead of a whole-kernel `BRK` abort — the
+/// 4.5 MB meow+tcc crash (`4.5mb_meow2.log`). We assert the reserve predicate at
+/// its boundary (cheap, deterministic) plus a live smoke test that the user
+/// allocator returns a usable zeroed page when memory is plentiful. Actually
+/// draining RAM to the reserve is unsafe inside the boot suite; the real drain
+/// is exercised by the 4.5 MB meow→tcc acceptance run.
+fn test_oom_user_page_reserve() {
+    use crate::pmm;
+
+    // Boundary predicate: deny at/below the reserve, allow one page above it.
+    assert!(pmm::user_alloc_would_starve(0),
+        "test_oom: must deny user alloc at 0 free pages");
+    assert!(pmm::user_alloc_would_starve(pmm::USER_PAGE_RESERVE),
+        "test_oom: must deny at exactly the reserve ({} pages)", pmm::USER_PAGE_RESERVE);
+    assert!(!pmm::user_alloc_would_starve(pmm::USER_PAGE_RESERVE + 1),
+        "test_oom: must allow one page above the reserve");
+
+    // Live smoke: with ample free pages (boot suite runs at >= 32 MB) the user
+    // allocator returns a usable, zeroed page; free it back.
+    let free = pmm::free_count();
+    assert!(free > pmm::USER_PAGE_RESERVE + 1,
+        "test_oom: boot suite should have ample free pages, got {}", free);
+    let f = pmm::alloc_page_zeroed_user()
+        .expect("test_oom: user alloc must succeed with ample free pages");
+    let first = unsafe {
+        core::ptr::read_volatile(akuma_exec::mmu::phys_to_virt(f.addr) as *const u8)
+    };
+    assert_eq!(first, 0, "test_oom: user page must be zeroed");
+    pmm::free_page(f);
+
+    // The critical (reserve-exempt) allocator — what page tables and the kill
+    // path use — must also work.
+    let c = pmm::alloc_page_zeroed()
+        .expect("test_oom: critical alloc must succeed");
+    pmm::free_page(c);
+
+    console::print("  [PASS] test_oom_user_page_reserve\n");
 }
 
 /// Verify that pipe_close_write both signals EOF (pipe_can_read returns true)
