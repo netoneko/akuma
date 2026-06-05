@@ -774,25 +774,31 @@ alignment, the exact 1 MB stack, and a sane guard — so a future `linker.ld` ed
 that breaks the derivation fails the boot suite instead of silently overlapping
 the image or the heap.
 
-### Full boot + hello matrix (June 2026, dynamic reserve)
+### Full boot + hello matrix (June 2026, post-text_offset)
 
 Every (profile, RAM) cell booted under QEMU `virt` with a fresh disk snapshot,
 then the **hello probe** `busybox echo HELLO_AKUMA_OK` was run over SSH — a real
 userspace process spawn (busybox-static via the demand-paged loader), so a ✅ means
 the kernel booted to SSH *and* can load+run a userspace binary. Numbers are PMM
-**free pages** at boot (×4 KB ≈ MB free). Driver: `scripts/boot_hello_matrix.py`;
-logs in `logs/rsa-purge/matrix_*.log`.
+**free pages** at boot (×4 KB ≈ MB free).
+
+Cells marked **†** were re-verified after the `text_offset = 1 MB` / `KERNEL_PHYS_BASE
+= 0x40100000` change (June 2026). Unmarked cells are from the earlier
+`scripts/boot_hello_matrix.py` sweep (`logs/rsa-purge/matrix_*.log`) and will differ
+by ±30 pages at the low end (pre-kernel reclaim shifted from 2 MB to 1 MB, offset by
+the 1 MB smaller `code+stack` region; net effect ≈ 0 but exact count varies by profile
+and heap-seed rounding).
 
 | RAM | release | size | extreme |
 |-----|---------|------|---------|
-| 4.0 MB | — | ✗ QEMU DTB | ✅ hello · 664 |
+| 4.0 MB | — | ✗ QEMU DTB | ✅ hello · 664 **†** |
 | 4.5 MB | — | ✗ 0 user pages | ✅ hello · 527 |
 | 5 MB | — | ✗ 0 user pages | ✅ hello · 639 |
-| 6 MB | — | ✅ hello · 604 | ✅ hello · 863 |
+| 6 MB | — | ✅ hello · 571 **†** | ✅ hello · 863 |
 | 7 MB | — | ✅ hello · 828 | ✅ hello · 1087 |
-| 8 MB | — | ✅ hello · 1052 | ✅ hello · 1311 |
-| 16 MB | ✅ hello · 1833 | ✅ hello · 2844 | ✅ hello · 3103 |
-| 32 MB | ✅ hello · 5929 | ✅ hello · 6428 | ✅ hello · 6683 |
+| 8 MB | — | ✅ hello · 1019 **†** | ✅ hello · 1311 |
+| 16 MB | ✅ hello · 1837 **†** | ✅ hello · 2844 | ✅ hello · 3103 |
+| 32 MB | ✅ hello · 5933 **†** | ✅ hello · 6428 | ✅ hello · 6683 |
 | 64 MB | ✅ hello · 13097 | ✅ hello · 13596 | ✅ hello · 13819 |
 | 128 MB | ✅ hello · 27130 | ✅ hello · 27131 | ✅ hello · 27131 |
 | 256 MB | ✅ hello · 45562 | ✅ hello · 45563 | ✅ hello · 45563 |
@@ -800,7 +806,7 @@ logs in `logs/rsa-purge/matrix_*.log`.
 | 4096 MB | ✅ hello · 918010 | ✅ hello · 918011 | ✅ hello · 918011 |
 
 (release was swept 16 MB and up, per its boot floor; size/extreme add the 4–8 MB
-low band.) Kernel images: release 2875 KB, size 881 KB, extreme **805 KB**. The
+low band.) Kernel images: release 2875 KB, size 881 KB, extreme **801 KB**. The
 extreme column is the shipped kernel with debug instrumentation gated off (see the
 debug-instrumentation row in *What landed in the even-smaller-kernel branch*);
 each extreme cell ≤ 16 MB gained +4 pages vs the pre-gate sweep (the gate frees
@@ -826,7 +832,7 @@ failures bottom-up:
 
 Two things the matrix makes visible:
 1. At small RAM the smaller kernel + tighter dynamic reserve wins monotonically:
-   **extreme > size > release** free pages (e.g. 16 MB: 3103 vs 2844 vs 1833).
+   **extreme > size > release** free pages (e.g. 16 MB: 3103 vs 2844 vs 1837 **†**).
 2. At **≥ 128 MB the three converge** to within one page of each other — the
    per-profile reservation is negligible against RAM, and `compute_heap_size()` /
    the thread-stack pool dominate. The profile choice only matters for the low-RAM
@@ -1426,8 +1432,15 @@ exercise this. Boot self-tests `compute_heap_size` and `compute_thread_limit` (i
 `src/tests.rs`) pin the heuristics. See also `docs/MEMORY_LAYOUT.md` (general
 layout + the RAM > 2 GB identity-map fix).
 
-| Profile | Binary | `KERNEL_PHYS_BASE` | `IMAGE_RESERVE` | `BOOT_STACK_TOP` | SSH + hello |
-|---------|--------|-------------------|----------------|-----------------|-------------|
-| `extreme` | 801 KB | `0x40100000` | 832 KB (dynamic) | `0x402e3000` | ✓ @ 4 MB |
-| `size` | 881 KB | `0x40100000` | 892 KB (dynamic) | `0x402f3000` | ✓ @ 6 MB |
-| `release` | 2875 KB | `0x40100000` | 2884 KB (dynamic) | `0x40b03000` | ✓ @ 16 MB |
+Verified post-`text_offset` change (June 2026):
+
+| Profile | Binary | `KERNEL_PHYS_BASE` | `IMAGE_RESERVE` | heap_start (observed) | boot floor | free pages |
+|---------|--------|-------------------|-----------------|-----------------------|-----------|-----------|
+| `extreme` | 801 KB | `0x40100000` | 832 KB (dynamic) | `0x401e3000` @ 4 MB | **4 MB** | 664 |
+| `size` | 881 KB | `0x40100000` | 892 KB (dynamic) | `0x40400000` @ 6–8 MB | **6 MB** | 571 (6M) / 1019 (8M) |
+| `release` | 2875 KB | `0x40100000` | 2884 KB (dynamic) | `0x405cd000` @ 16–32 MB | **16 MB** | 1837 (16M) / 5933 (32M) |
+
+`heap_start` = `RAM_BASE + code_and_stack` as reported in the boot layout banner.
+`IMAGE_RESERVE` auto-tracks the binary via `linker.ld` (`STACK_BOTTOM - KERNEL_PHYS_BASE`);
+no per-profile constant to maintain. All three profiles also pass `cargo check` and the
+47 ext2 + 4 ELF-boundary host unit tests.
