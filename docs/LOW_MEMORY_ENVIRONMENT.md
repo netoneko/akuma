@@ -21,18 +21,18 @@ Verified with `scripts/test_memory_split.py` + the small-RAM sweeps in `logs/`
 | 12 MB | yes | yes | **yes** | yes | 3 / 3 / 4 / 14 | now fits (no whole-binary slurp) |
 | **8 MB** | **yes** | **yes** | **yes (repeatable)** | yes | 4 / 1 / ~2.08 / 14 | **`tcc hello.c -o /tmp/h && /tmp/h` compiles + runs repeatedly** (6 cycles verified, 2026-06-04). Earlier "marginal / `memory full`" was the dormant-cfg slurp bug (akuma-exec had no build.rs → `HEAP_SLURP_MAX` was 1 MiB, so the 723 KB tcc binary was slurped whole). Fixed by `crates/akuma-exec/build.rs` + heap→PMM reclaim — see *`tcc hello.c` now runs repeatedly at 8 MB* below |
 | **7 MB** *(extreme)* | yes | yes | **yes** | **yes** | — (low-water 3 MB free) | direct `tcc hello.c -o out` + run prints `Hello, Akuma!`; **meow→tcc compile+run also works** here; `meow -c` → ollama streams a full reply (25.2 TPS). See *Extreme-profile compile floor* below |
-| **6 MB** *(extreme)* | yes | yes | **yes** (direct) | OOMs | — (low-water 2 MB free) | direct `tcc` compiles+runs; the **meow→tcc *agentic* path OOMs** (meow resident + compile peak > 6 MB free) |
+| **6 MB** *(extreme)* | yes | yes | **yes** | **yes** | — (low-water 1 MB free) | direct `tcc` compiles+runs; **meow→ollama streams AND the meow→tcc *agentic* compile+run path now works** when the prompt forces one-command-at-a-time shell calls (verified `6mb_meow8.log`, 2026-06-05, 807 KB kernel). Was previously documented as OOMing. See *meow→tcc agentic path at 6 MB* below |
 | **5 MB** *(extreme)* | yes | yes | no (`memory full`) | no | — (low-water 1 MB free) | boots + usable SSH, but tcc itself exhausts memory; **4 MB does not boot** |
 
 > Rows **≤ 7 MB** are `extreme`-profile (lighter reserve than `size`); the rows ≥ 8 MB
 > are the `size`-profile sweep. See *Extreme-profile compile floor (re-measured
 > 2026-06-05)* for the clean numbers and failure modes.
 
-The **meow → ollama** column is directly verified at **7 MB** (`extreme`) and
-256 MB; the higher `size` tiers are inferred (meow's ~1 MB working set is smaller
-than tcc's ~1.5–2 MB, which is measured at each tier, and the segment-boundary
-fix is RAM-independent). meow needs less RAM than tcc, so its floor tracks the
-boot/SSH floor (~7 MB) rather than the tcc floor.
+The **meow → ollama** column is directly verified at **6 MB** and **7 MB**
+(`extreme`) and 256 MB; the higher `size` tiers are inferred (meow's ~1 MB working
+set is smaller than tcc's ~1.5–2 MB, which is measured at each tier, and the
+segment-boundary fix is RAM-independent). meow needs less RAM than tcc, so its
+floor tracks the boot/SSH floor (~6 MB) rather than the tcc floor.
 
 So on the `size` profile after the fixes: **boot/usable-SSH floor 6 MB, tcc floor
 8 MB** (tcc down from 48 MB). Probed 2026-06-04: 6 MB and 7 MB both boot to a usable
@@ -176,11 +176,15 @@ lazy-file `mmap`), much lighter resident than the static tcc the `size`-profile
 - **Direct tcc compile+run floor: 6 MB.** No kernel OOM markers at 6–8 MB.
 - **Boot + usable-SSH floor: 5 MB** (5 MB boots and runs SSH commands; only the
   *compile* fails there). 4 MB does not boot.
-- **meow→tcc agentic floor (`meow -c "compile … and run it"`): 7 MB.** Verified
-  working at 7 MB (`7mb_meow0.log`: tcc spawns via `libtcc.so`, binary produced
-  and run). At **6 MB the agentic path OOMs** (`0 free pages` / dips to 1 MB
-  free) — meow's resident footprint *plus* the tcc compile peak together exceed
-  6 MB free, even though tcc *alone* compiles at 6 MB.
+- **meow→tcc agentic floor (`meow -c "compile … and run it"`): 6 MB** (with the
+  one-command-at-a-time prompt below — was 7 MB). Verified working at 7 MB
+  (`7mb_meow0.log`) and now at **6 MB** (`6mb_meow8.log`, 2026-06-05, 807 KB
+  kernel): tcc spawns via `libtcc.so`, the binary is produced and run, no kernel
+  OOM. The earlier "6 MB agentic path OOMs" finding held for a prompt that let the
+  model combine compile-and-run into one `tcc … && /tmp/h` shell command (compile
+  peak *plus* the run overlap meow's resident set > 6 MB free). Forcing the model
+  to issue **separate sequential shell tool-calls** keeps the peak under the
+  ceiling — see *meow→tcc agentic path at 6 MB* below.
 
 Two gotchas that cost time here, recorded so they don't again:
 - **`ls <file>` is unreliable on akuma** — listing a *file* path returns
@@ -191,6 +195,91 @@ Two gotchas that cost time here, recorded so they don't again:
   independent of VM RAM. Drive these tests **serially**; concurrent meow→ollama
   sessions starve each other and produce degraded completions that look like the
   model "refusing" to call tools.
+
+## meow→tcc agentic path at 6 MB (verified 2026-06-05)
+
+The full **agentic** compile-and-run pipeline — meow drives the local model, which
+emits tool-calls that spawn tcc and then run the output — now completes on the
+**`extreme`** kernel at **6 MB**, where it was previously documented as OOMing. The
+verified prompt (`6mb_meow8.log`, 807 KB kernel):
+
+```
+meow -c "compile /akuma-playground/hello.c with /usr/bin/tcc, put binary in /tmp/h6mb and run it, run commands one by one using shell tool"
+```
+
+**Why the prompt phrasing matters.** The decisive clause is *"run commands one by
+one using shell tool"*. It steers the model to emit **separate sequential shell
+tool-calls** (one to compile, a later one to run `/tmp/h6mb`) instead of a single
+combined `tcc … && /tmp/h6mb` line. With sequential calls the tcc compile peak and
+the binary-run never overlap, and meow's per-call working set is released between
+round-trips, so the agentic peak stays under the ~3.3 MB of free PMM at 6 MB. The
+earlier "6 MB agentic path OOMs" result came from a prompt that combined the two
+steps — that overlap, on top of meow's resident set, exceeded 6 MB free.
+
+**What the boot layout looks like at 6 MB extreme** (from the log header):
+
+```
+Code+Stack: 3 MB (0x40000000 - 0x403ec000) [stack-cover+1MB guard]
+Heap:       0 MB (0x403ec000 - 0x404ac000) [~768 KB seed, auto-grows]
+User pages: 1 MB (0x404ac000 - 0x40600000) [remaining]
+```
+
+After the PMM reclaims the 2 MB pre-kernel region the real free pool is **847 free
+pages ≈ 3.3 MB** (`[Mem]` rounds it to `2/6MB free`). The `extreme` profile's 3 MB
+`code+stack` (vs the `size` profile's 5 MB) and the 807 KB kernel are what free up
+enough PMM for the agentic peak to fit.
+
+**Trace through the log** (no `panic`, no `memory full`, no `0 free pages`, no
+SIGSEGV anywhere in 685 lines; `panic=0` throughout):
+
+1. meow (`PID 1`) connects to ollama (`connect 10.0.2.2:11434 = OK`), runs an LLM
+   exchange (`[PSTATS] PID 1 /bin/meow … 503 syscalls, recvfrom=200, mkdirat=1,
+   openat=10`).
+2. tcc spawns as **`pid=2`** via lazy-file `mmap` of `/usr/lib/libtcc.so`, does the
+   compile (heavy `mmap`/`munmap` churn), then exits cleanly (`Thread 9 recycled`).
+   A handful of benign `[EFAULT] nr=63 … args=[0x3,0x0,0x0,…]` (read with a NULL
+   buffer) appear during the compile — non-fatal, tcc continues.
+3. Free dips to its low-water **`1/6MB`** at the compile peak; kernel heap grows
+   `~768 KB → 1 MB` (used peaked **1038 KB**), then `reclaimed=256KB`→`512KB`.
+4. **`pid=3`** and **`pid=4`** are tiny static binaries (identical layout
+   `0x431000` / fault `0x410958`, no `libtcc.so`) spawned *after* tcc exits — i.e.
+   `/tmp/h6mb` being executed — each preceded by a fresh meow→ollama call (the
+   "one by one" steps).
+5. The box settles back to `2/6MB free` and stays idle and healthy.
+
+**Caveats.**
+- It's tight: the compile dips the free pool to ~1 MB. There is no headroom for a
+  second concurrent workload.
+- The same **kernel-heap retention** seen at 7 MB applies (heap grows ~256 KB and
+  is not fully returned to PMM after meow exits — see *Heap retention after running
+  meow*). At 6 MB this is the closest margin; repeated agentic runs on a long-lived
+  6 MB box could still OOM as the heap creeps.
+- Success is **reflected in the log** — the `pid=3`/`pid=4` spawns of the small
+  static binary (layout `0x431000` / fault `0x410958`, no `libtcc.so`) *are*
+  `/tmp/h6mb` executing — **and was independently confirmed by running the produced
+  `/tmp/h6mb` binary directly** (it executes and prints its output). The binary's
+  stdout flows over SSH to meow rather than to serial, so the serial log shows the
+  spawn/run events but not the program's printed text. It is also gated by the
+  local model reliably emitting the sequential tool-calls (host-side,
+  RAM-independent; drive serially).
+
+**The final frontier — fail *gracefully* under OOM in sequential tool calls.**
+6 MB works *when the run stays under the ceiling*, but the margin is ~1 MB and the
+kernel-heap creep means a long sequence of agentic tool-calls will eventually
+exhaust PMM on a 6 MB (and marginally 7–8 MB) box. The goal is no longer "never
+OOM" — it is that when a spawn/compile *does* run out of memory mid-sequence, it
+must **fail gracefully**: the failing `tcc`/spawn should return a clean `ENOMEM` to
+meow (which already surfaces it as a tool error, e.g. "not found?"/non-zero exit),
+the kernel must **not** panic or take down the whole VM, and the box must stay on a
+usable SSH session so the agent can retry or report. Today some low-PMM paths still
+degrade poorly (a heap slurp landing in a kernel thread with no current process can
+`alloc_error_handler`-panic the kernel — see *Root cause A*; and the unbounded
+heap creep has no back-pressure). Closing this means: bound/back-pressure the
+kernel-heap growth so a single tool-call can't ratchet the pool down permanently,
+make every spawn/`mmap`/page-fault OOM return `ENOMEM` to userspace instead of
+panicking, and ensure per-process teardown fully returns memory so the *next*
+sequential tool-call starts from a clean baseline. That turns 6 MB from "works if
+you're lucky" into "works, or fails cleanly and keeps the box alive."
 
 ## What landed in the `even-smaller-kernel` branch (June 2026)
 
