@@ -1,6 +1,26 @@
 #!/bin/bash
 set -e
 
+# meow ships size-optimized: rebuild core/alloc from source with the
+# immediate-abort panic strategy. This drops the residual panic plumbing the
+# precompiled core carries (panic_fmt landing pads, location records), saving a
+# full page off the binary. Costs a one-time core/alloc recompile (~8s). The
+# trade-off: panics trap immediately instead of printing via the panic handler.
+MEOW_SIZE_FLAGS=(
+    -Z build-std=core,alloc
+    --config 'target.aarch64-unknown-none.rustflags=["-Zunstable-options","-Cpanic=immediate-abort","-Crelocation-model=static"]'
+)
+
+# Build one workspace member, applying meow's size flags when appropriate.
+build_member() {
+    local m="$1"
+    if [ "$m" == "meow" ]; then
+        cargo build --release -p meow "${MEOW_SIZE_FLAGS[@]}"
+    else
+        cargo build --release -p "$m"
+    fi
+}
+
 WITH_FORKTEST=false
 MEMBER_ONLY=""
 for arg in "$@"; do
@@ -15,7 +35,7 @@ done
 
 if [ -n "$MEMBER_ONLY" ]; then
     echo "Building $MEMBER_ONLY only..."
-    cargo build --release -p "$MEMBER_ONLY"
+    build_member "$MEMBER_ONLY"
     if [ "$MEMBER_ONLY" == "tcc" ]; then
         LIBC_ARCHIVE="tcc/dist/libc.tar"
         if [ -f "$LIBC_ARCHIVE" ]; then
@@ -76,7 +96,7 @@ MEMBERS=(
 
 for member in "${MEMBERS[@]}"; do
     echo "Building $member..."
-    cargo build --release -p "$member"
+    build_member "$member"
     # Special handling for tcc to copy its sysroot archive
     if [ "$member" == "tcc" ]; then
         LIBC_ARCHIVE="tcc/dist/libc.tar"
