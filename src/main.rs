@@ -147,14 +147,14 @@ pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
 
 /// Scan RAM for a QEMU-generated DTB when x0 is zero.
 ///
-/// When using ARM64 Image header boot, the kernel is at 0x40200000 and
-/// QEMU places DTB in the first 2MB at 0x40000000.
+/// Kernel is at 0x40100000 (text_offset = 1 MB); DTB is placed at
+/// ALIGN_UP(kernel_load + image_size, 2MB) = 0x40200000.
 fn scan_for_dtb() -> usize {
     const FDT_MAGIC_LE: u32 = 0xedfe0dd0; // big-endian 0xd00dfeed read as little-endian
 
-    // With ARM64 Image header, DTB is placed at RAM_BASE (0x40000000)
-    // before the kernel which is at RAM_BASE + 2MB (0x40200000)
-    const DTB_LOCATION: usize = 0x4000_0000;
+    // DTB is at the 2MB-aligned address just above the kernel image
+    // (ALIGN_UP(0x40100000 + image_size, 2MB) = 0x40200000).
+    const DTB_LOCATION: usize = 0x4020_0000;
 
     let magic = unsafe { core::ptr::read_volatile(DTB_LOCATION as *const u32) };
     if magic == FDT_MAGIC_LE {
@@ -310,9 +310,10 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // linker symbols. Reading a symbol's address yields its absolute value (the
     // same trick used for _kernel_phys_end), so the layout auto-tracks the binary.
     //
-    // QEMU virt loads flat binary with ARM64 Image header at RAM_BASE + 2MB
-    // (0x40200000). The first 2MB (0x40000000-0x401FFFFF) contains DTB.
-    const KERNEL_BASE: usize = 0x4020_0000;
+    // QEMU virt loads flat binary with ARM64 Image header at RAM_BASE + 1MB
+    // (text_offset = 1MB >= 4KB so QEMU does not add 2MB).
+    // DTB goes to ALIGN_UP(kernel_load + image_size, 2MB) = 0x40200000.
+    const KERNEL_BASE: usize = config::KERNEL_PHYS_BASE;
 
     unsafe extern "C" {
         static _kernel_phys_end: u8;
@@ -526,16 +527,13 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     allocator::mark_pmm_ready();
     console::print("PMM initialized, allocator switched to page mode\n");
 
-    // Reclaim the pre-kernel region.  On QEMU virt the ARM64 Image header sets
-    // text_offset = 2 MB, so the kernel binary is always loaded at ram_base + 2 MB
-    // (0x40200000).  The first 2 MB — firmware reservation / QEMU DTB area — is
-    // fully consumed by detect_memory() before PMM init and is safe to give back.
-    // This hands ~512 pages (2 MB) back to the user-page pool at zero cost.
+    // Reclaim the pre-kernel region.  KERNEL_PHYS_OFFSET (1 MB) bytes before the
+    // kernel are unused space — fully consumed by detect_memory() before PMM init
+    // and safe to give back.  Hands ~256 pages (1 MB) to the user-page pool.
     {
-        const KERNEL_IMAGE_OFFSET: usize = 0x20_0000; // 2 MB text_offset
-        let pages = KERNEL_IMAGE_OFFSET / 4096;
+        let pages = config::KERNEL_PHYS_OFFSET / 4096;
         pmm::free_pages_contiguous(pmm::PhysFrame::new(ram_base), pages);
-        console::print("[PMM] Reclaimed pre-kernel region: 2 MB\n");
+        console::print("[PMM] Reclaimed pre-kernel region: 1 MB\n");
     }
 
     // Initialize MMU with identity mapping for kernel

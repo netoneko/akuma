@@ -16,13 +16,14 @@ the `extreme` profile with `scripts/our_tcc_floor.py`:
 
 | Path | Floor | Notes |
 |---|---|---|
-| `tcc -static` compiles + runs `hello.c` **and** `hello_stripped.c` (alone) | **4.5 MB** | identical floor for `printf` and bare-`write` → libc size doesn't move it; 4.0 MB fails to **boot** |
+| `tcc -static` compiles + runs `hello.c` **and** `hello_stripped.c` (alone) | **4.5 MB** | identical floor for `printf` and bare-`write` → libc size doesn't move it |
 | meow `-c "say hi"` (alone) | **4.5 MB** | |
 | **meow agentically drives `tcc -static` + runs the binary** | **4.5 MB** | clean, `panic=0` (`logs/4.5mb_meow5.log`, 2026-06-05). Low-water 1988 KB; settled 2520 KB free. SSH read gaps reached ~1.6 s in that log — caused by ext2 block-cache heap fragmentation (now fixed, see *ext2 block-cache fix* below) |
 
-So all three paths now share the **4.5 MB kernel boot floor**. tcc/libc is no longer
-the bottleneck — the kernel is. (The earlier 5 MB meow→tcc floor was verified in
-`logs/meow5mb.log`; the new 4.5 MB record is `logs/4.5mb_meow5.log`.)
+So all three workload paths share the **4.5 MB floor**. The **kernel boot floor** itself
+was subsequently pushed to **4.0 MB** — see *Breaking the 4 MB boot wall* below. (The
+earlier 5 MB meow→tcc floor was verified in `logs/meow5mb.log`; the new 4.5 MB record
+is `logs/4.5mb_meow5.log`.)
 Full write-up: [TCC_LOW_MEMORY.md](TCC_LOW_MEMORY.md).
 
 ### 🛡️ OOM hardening — kernel survives, kills the process (June 2026)
@@ -208,6 +209,45 @@ Remaining candidates for the per-run creep: per-process teardown not freeing all
 kernel-side structures (address-space / fd / signal tables), or VFS/socket buffers
 held past close. Reproduce with the before/after `free` above; `[Mem]` serial
 lines report live heap used/peak and cumulative `Allocs`.
+
+## ext2 block-cache fix — ring buffer + extreme no-cache (June 2026)
+
+**Root cause.** The ext2 block cache (`crates/akuma-ext2/src/ext2.rs`) was a
+`BTreeMap<u32, Vec<u8>>` capped at 512 entries. Each entry was a **separate
+heap allocation** (`Vec<u8>` of one ext2 block = 1 KB). After a meow+tcc agentic
+run, ~228 block entries had been inserted and never fully evicted — each one a
+live allocation scattered across the Talc PMM-claimed 256 KB span. As long as any
+single `Vec<u8>` in that span survived, `reclaim_to_pmm()` could not return the
+span to the PMM, and the heap grew permanently.
+
+This was also the root cause of the **SSH read-gap spikes** (~1.6 s) seen in
+`logs/4.5mb_meow5.log`: allocations that didn't fit in the fragmented span
+triggered slow Talc reclaim cycles, stalling the SSH thread.
+
+**Fix on `extreme` profile.** The cache is gated out entirely via
+`#[cfg(not(kernel_profile_extreme))]`. All block reads go directly to disk, no
+heap allocation at all. Zero heap impact at runtime.
+
+**Fix on `size` and `release` profiles.** Replaced `BTreeMap<u32, Vec<u8>>` with
+`BlockRingCache`:
+- **64-entry ring** (down from 512-entry BTreeMap cap).
+- **Single contiguous `Vec<u8>` backing** of `64 × block_size` bytes, allocated
+  once at mount time (typically `64 × 1024 = 64 KB`). Tag array is `[u32; 64]`
+  on the stack.
+- **Dedup in `insert`**: if the block tag is already present, the insert is a
+  no-op — prevents two threads racing on the same cold block from writing two
+  stale copies into successive ring slots (which old `remove` would only clear
+  the first of).
+- Because the backing is one allocation, Talc can reclaim the span as a unit
+  once the `Ext2Fs` is dropped — no fragmentation.
+
+**Infrastructure.** `crates/akuma-ext2/build.rs` was added (mirrors `akuma-exec`
+and `akuma-net`): emits `kernel_profile_size`/`kernel_profile_extreme` from
+`OPT_LEVEL` + `CARGO_FEATURE_EXTREME`. `akuma-ext2/extreme` feature wired through
+root `Cargo.toml` (`extreme = ["akuma-exec/extreme", "akuma-ext2/extreme"]`).
+
+**Verified.** 47 crate tests pass. Both `size` and `extreme` profiles build and
+boot; `busybox echo hello` (binary loaded from ext2) works on both.
 
 ## Extreme-profile compile floor (re-measured 2026-06-05)
 

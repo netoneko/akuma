@@ -14,6 +14,22 @@
 
 #![allow(dead_code)]
 
+/// Physical address where the kernel binary is loaded.
+///
+/// QEMU virt ARM64 Image boot: text_offset in the Image header controls load
+/// address. text_offset = 1 MB (≥ 4 KB, so QEMU does NOT add 2 MB) →
+/// kernel at RAM_BASE + 1 MB = 0x40100000.
+///
+/// DTB is placed at ALIGN_UP(KERNEL_PHYS_BASE + image_size, 2MB) = 0x40200000,
+/// which fits in 4 MB RAM (DTB end 0x40300000 < 0x40400000).
+///
+/// Must match `KERNEL_PHYS_BASE` in linker.ld and `text_offset` in boot.rs.
+pub const KERNEL_PHYS_BASE: usize = 0x4010_0000;
+
+/// Pre-kernel gap size: bytes from RAM_BASE to KERNEL_PHYS_BASE.
+/// This region is reclaimed to the PMM pool after early boot.
+pub const KERNEL_PHYS_OFFSET: usize = 0x10_0000; // 1 MB (= text_offset)
+
 /// Boot/kernel stack size (1MB default)
 ///
 /// Used by thread 0 (boot thread) and exception handlers.

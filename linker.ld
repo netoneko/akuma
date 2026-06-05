@@ -5,13 +5,20 @@ KERNEL_VIRT_BASE = 0xFFFF000040000000;
 
 /* Physical load address - where QEMU loads the kernel.
  * When using flat binary with ARM64 Image header, QEMU loads at
- * RAM_BASE + text_offset. With text_offset < 4KB, QEMU adds 2MB,
- * so we get RAM_BASE + 2MB = 0x40200000.
+ * RAM_BASE + text_offset (when text_offset >= 4 KB QEMU uses it as-is;
+ * when text_offset < 4 KB QEMU adds 2 MB instead).
  *
- * Note: The first 2MB of RAM (0x40000000-0x401FFFFF) can be used
- * for the DTB which QEMU places there for flat binary boots.
+ * text_offset = 1 MB (0x100000) → QEMU loads at RAM_BASE + 1 MB = 0x40100000.
+ *
+ * DTB placement: ALIGN_UP(kernel_load + image_size, 2MB).
+ * With kernel at 0x40100000 and image_size ≈ 0xCB000:
+ *   ALIGN_UP(0x401CB000, 2MB) = 0x40200000
+ * So DTB goes to [0x40200000, 0x40300000) — fits in 4 MB with 1 MB spare.
+ *
+ * Pre-kernel region [0x40000000, 0x40100000) (1 MB) is free space reclaimed
+ * to the PMM pool after early boot.
  */
-KERNEL_PHYS_BASE = 0x40200000;
+KERNEL_PHYS_BASE = 0x40100000;
 
 /* Offset to convert between physical and virtual */
 KERNEL_OFFSET = KERNEL_VIRT_BASE - KERNEL_PHYS_BASE;

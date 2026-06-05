@@ -63,17 +63,19 @@ _boot:
     // When QEMU detects this header in a flat binary, it:
     //   1. Checks for "ARM\x64" magic at offset 56
     //   2. If magic found AND image_size != 0, loads at RAM_BASE + text_offset
-    //   3. If text_offset < 4KB, QEMU adds 2MB to it
+    //   3. If text_offset < 4KB, QEMU adds 2MB to it instead
     //
-    // To load at 0x40200000 (RAM_BASE + 2MB), we use:
-    //   - ARM\x64 magic at offset 56
-    //   - image_size != 0 at offset 16
-    //   - text_offset = 0 (QEMU will add 2MB, resulting in RAM_BASE + 2MB)
+    // text_offset = 1 MB (0x100000) >= 4 KB so QEMU uses it as-is:
+    //   kernel loads at RAM_BASE + 1 MB = 0x40100000.
     //
-    // The kernel must be linked at 0x40200000 to match.
+    // DTB is placed at ALIGN_UP(kernel_load + image_size, 2MB):
+    //   ALIGN_UP(0x40100000 + ~0xCB000, 2MB) = 0x40200000
+    // This fits DTB in 4 MB RAM with 1 MB to spare.
+    //
+    // The kernel must be linked at 0x40100000 to match (see linker.ld).
     b       _boot_code          // code0: branch past header
     .word   0                   // code1 (not used)
-    .quad   0                   // text_offset = 0 (QEMU adds 2MB)
+    .quad   0x100000            // text_offset = 1 MB (QEMU loads at RAM_BASE + 1MB)
     .quad   IMAGE_RESERVE       // image_size: load-addr → boot-stack bottom (linker-derived)
     .quad   0                   // flags: little-endian, 4K pages
     .quad   0                   // res2

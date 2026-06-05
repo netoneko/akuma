@@ -1498,7 +1498,7 @@ fn try_resolve_el1_cow_fault() -> bool {
     // No FAR range check — user VA space spans 0..512GB; translate_user_va() handles
     // unmapped/kernel addresses by returning None.
     if ec != 0x25 || dfsc != 0x0F || (iss & (1 << 6)) == 0 { return false; }
-    if !((0x4020_0000..0x6000_0000).contains(&fault_pc)) { return false; }
+    if !((crate::config::KERNEL_PHYS_BASE as u64..0x6000_0000).contains(&fault_pc)) { return false; }
 
     let l0_addr = (fault_ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
     let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
@@ -1627,8 +1627,7 @@ extern "C" fn rust_sync_el1_handler() {
     // instead of halting the kernel.  This guards against validate_user_ptr letting a
     // kernel address slip through.
     if ec == 0x25 {
-        // Kernel is loaded at RAM_BASE+2MB (0x4020_0000) and extends to ~0x6000_0000.
-        let in_kernel_code = elr >= 0x4020_0000 && elr < 0x6000_0000;
+        let in_kernel_code = elr >= crate::config::KERNEL_PHYS_BASE as u64 && elr < 0x6000_0000;
         if in_kernel_code {
             // Check if thread has a registered fault handler for user copy operations
             let fault_handler = akuma_exec::threading::get_user_copy_fault_handler();

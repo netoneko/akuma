@@ -3,6 +3,10 @@
 
 #![allow(dead_code)]
 
+// Physical address where the kernel binary is loaded (RAM_BASE + text_offset).
+// Must match KERNEL_PHYS_BASE in src/config.rs and KERNEL_PHYS_BASE in linker.ld.
+const KERNEL_PHYS_BASE: usize = 0x4010_0000;
+
 pub mod types;
 
 pub use types::*;
@@ -2218,7 +2222,7 @@ pub fn sgi_scheduler_handler(irq: u32) {
             
             // For user process threads (8+), check for boot TTBR0 with user ELR
             if new_idx >= 8 && !is_new_thread {
-                let is_boot_ttbr0 = new_saved_ttbr0 >= 0x4020_0000 && new_saved_ttbr0 < 0x4040_0000;
+                let is_boot_ttbr0 = new_saved_ttbr0 >= KERNEL_PHYS_BASE as u64 && new_saved_ttbr0 < 0x4040_0000;
                 let is_user_elr = new_saved_elr > 0 && new_saved_elr < 0x4000_0000;
                 
                 if is_user_elr && is_user_spsr && is_boot_ttbr0 {
@@ -2270,8 +2274,7 @@ pub fn sgi_scheduler_handler(irq: u32) {
             
             // SPSR bits [3:0] = 0 means EL0 (user mode)
             let returning_to_user = (current_spsr & 0xF) == 0;
-            // Boot TTBR0 is typically in 0x402xxxxx range
-            let has_boot_ttbr0 = current_ttbr0 >= 0x4020_0000 && current_ttbr0 < 0x4040_0000;
+            let has_boot_ttbr0 = current_ttbr0 >= KERNEL_PHYS_BASE as u64 && current_ttbr0 < 0x4040_0000;
             
             if returning_to_user && has_boot_ttbr0 {
                 // Don't allocate in IRQ context!
