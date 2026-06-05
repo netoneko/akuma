@@ -81,27 +81,36 @@ SECTIONS
     
     /* Record where kernel ends (physical) */
     _kernel_phys_end = .;
-    
+
+    /* Boot-stack reservation, derived from the *actual* linked image size so it
+     * auto-tracks the binary — there is no hand-tuned per-profile IMAGE_SIZE
+     * constant anymore. The boot stack is placed immediately above the kernel
+     * image (page-aligned, with a 2-page guard gap) and is 1 MB:
+     *   STACK_BOTTOM  = first page above the image + 2-page guard
+     *   STACK_TOP     = initial SP (boot.rs asm loads it); 1 MB above STACK_BOTTOM
+     *   IMAGE_RESERVE = bytes from the load address to STACK_BOTTOM, for the
+     *                   ARM64 Image header (QEMU DTB placement)
+     * boot.rs (asm SP + Image header), src/main.rs (overlap guard + heap reserve +
+     * ExecConfig boot-stack bounds) and src/exceptions.rs (boot-thread exception
+     * stack) all read these as extern absolute symbols — one source of truth. */
+    STACK_BOTTOM  = ALIGN(_kernel_phys_end, 0x1000) + 0x2000;
+    STACK_TOP     = STACK_BOTTOM + 0x100000;
+    IMAGE_RESERVE = STACK_BOTTOM - KERNEL_PHYS_BASE;
+
     /DISCARD/ : {
         *(.eh_frame)
     }
 }
 
 /*
- * Boot stack layout check.
- * STACK_BOTTOM = KERNEL_PHYS_LOAD + IMAGE_SIZE, set per profile by build.rs via
- * --defsym=STACK_BOTTOM=VALUE. We deliberately do NOT PROVIDE a fallback here:
- * LLD lets a linker-script PROVIDE override an external --defsym, so a fallback
- * would silently mask the real per-profile value and the ASSERT below would
- * compare against the wrong (always-passing) bound. cargo always passes the
- * --defsym (see build.rs), so STACK_BOTTOM is always defined for real builds; a
- * manual `ld` without it fails loudly on the undefined symbol, which is correct.
- *   size profile:        0x40200000 + 0x0EC000 = 0x402EC000
- *   extreme-size profile:0x40200000 + 0x0DC000 = 0x402DC000
- *   release profile:     0x40200000 + 0x300000 = 0x40500000
- *
- * Kernel binary must fit below STACK_BOTTOM.
- * This assertion fails the build if kernel is too large.
+ * Boot stack layout.
+ * STACK_BOTTOM / STACK_TOP / IMAGE_RESERVE are derived from _kernel_phys_end in
+ * the SECTIONS block above, so the boot-stack reservation always sits above the
+ * kernel image by construction and auto-tracks the binary on every build. The
+ * old ASSERT(_kernel_phys_end < STACK_BOTTOM) and the per-profile IMAGE_SIZE /
+ * --defsym=STACK_BOTTOM machinery (build.rs + boot.rs constants) are gone — there
+ * is nothing left to keep in lockstep. The check below can no longer fail; it is
+ * kept only as a self-documenting invariant.
  */
 ASSERT(_kernel_phys_end < STACK_BOTTOM,
-    "FATAL: Kernel binary overlaps boot stack! Kernel binary too large for declared IMAGE_SIZE. Reduce kernel size or increase IMAGE_SIZE in boot.rs/build.rs.")
+    "FATAL: boot-stack reservation underflowed the kernel image (linker.ld bug)")

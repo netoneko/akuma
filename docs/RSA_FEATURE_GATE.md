@@ -72,28 +72,43 @@ why the saving there is modest and why ~30 KB is the honest budget for the
 low-RAM goal. (The bigger lever for the `release` image specifically would be
 enabling `lto`, which shrinks far more than just RSA.)
 
-## Turning the saving into freed RAM: `IMAGE_SIZE`
+## Turning the saving into freed RAM: dynamic boot-stack reservation
 
 Shrinking the binary alone does **not** free runtime RAM — the kernel reserves a
-fixed `IMAGE_SIZE` region (boot stack sits right above it), and both images fit
-inside the old reservation. To realize the gain, the `extreme-size` `IMAGE_SIZE`
-was tightened to match the smaller image.
+region for the boot stack (`STACK_BOTTOM = load + IMAGE_SIZE`), and both images
+fit inside the old reservation. To realize the gain, the reservation must shrink
+with the binary.
 
-`extreme-size` `IMAGE_SIZE`: **880 KB → 848 KB** (0xDC000 → 0xD4000). This is the
-3-way lockstep guardrail — all three were updated together:
+This was first done by hand-tightening the `extreme-size` `IMAGE_SIZE` 880 KB →
+848 KB, but that meant editing a **3-way lockstep** constant (build.rs +
+boot.rs + main.rs — and missing main.rs leaves the heap reservation on the stale
+offset so the freed pages never reach the pool; observed in practice).
 
-- `build.rs:44` — feeds the linker `--defsym STACK_BOTTOM` / linker ASSERT
-- `src/boot.rs:31` — feeds the ARM64 Image header + `BOOT_STACK_TOP`
-- `src/main.rs:325` — feeds the runtime overlap-halt + heap reservation
+That manual constant is now **gone**. `linker.ld` derives the reservation from
+the *actual* linked size and exports it as absolute symbols, so it auto-tracks
+the binary on every build with no per-profile constant to maintain:
 
-After the rsa-off shrink, `_kernel_phys_end` = 0x402cd580 → **821 KB** above the
-load base (776 KB `.bin` + ~46 KB NOLOAD `.bss` boot page tables). At 848 KB the
-margin is **~26 KB** — matching the original design margin. The linker ASSERT
-validates the fit on every build.
+```ld
+_kernel_phys_end = .;
+STACK_BOTTOM  = ALIGN(_kernel_phys_end, 0x1000) + 0x2000;  /* image end + 2-page guard */
+STACK_TOP     = STACK_BOTTOM + 0x100000;                   /* 1 MB boot stack */
+IMAGE_RESERVE = STACK_BOTTOM - KERNEL_PHYS_BASE;           /* ARM64 Image header */
+```
 
-> Note: `src/main.rs:325` is easy to miss — updating only `build.rs` + `boot.rs`
-> leaves the heap reservation computing against the stale offset, and the freed
-> pages never reach the pool (observed: PMM unchanged until main.rs was fixed).
+- `src/boot.rs` asm loads `STACK_TOP` for the initial SP and emits `IMAGE_RESERVE`
+  in the Image header — no Rust-injected `stack_top`/`image_size` constants.
+- `src/main.rs` and `src/exceptions.rs` read `STACK_BOTTOM`/`STACK_TOP` as extern
+  absolute symbols (the same trick already used for `_kernel_phys_end`).
+- `build.rs` no longer injects `--defsym=STACK_BOTTOM` and has no `IMAGE_SIZE`.
+- Boot self-test `test_boot_stack_reservation_invariants` (`src/process_tests.rs`)
+  asserts STACK_BOTTOM > image, page-aligned, 1 MB stack, sane guard.
+
+For `extreme-size` after the rsa-off shrink, `_kernel_phys_end` = 0x402cd580
+(**821 KB**), so the derivation yields `STACK_BOTTOM` = 0x402d0000 →
+**`IMAGE_RESERVE` = 832 KB** — i.e. the reservation auto-tracked to 832 KB, 16 KB
+tighter than the hand-tuned 848 KB, with no constant to touch. `size` likewise
+went 944 KB → 892 KB automatically. See
+`docs/LOW_MEMORY_ENVIRONMENT.md` *"Dynamic boot-stack reservation"*.
 
 ## Measured runtime gain (`extreme-size`)
 

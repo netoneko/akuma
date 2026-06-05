@@ -569,13 +569,18 @@ Verified compiling + running `hello.c` → "Hello, Akuma!" at **≥ 16 MB**. The
 strictly memory-positive, so it cannot regress tcc; closing the 8 MB tcc gap needs the
 PMM-reclaim fix and/or further reservation cuts, not this knob.
 
-**Deferred — make it exact instead of hand-tuned.** The 944 KB is a manual high-water
-mark. The robust version computes `STACK_BOTTOM = ALIGN(_kernel_phys_end, 0x1000) +
-2 pages` **in `linker.ld`** (the only place that knows the linked size — `build.rs` runs
-pre-link), with `boot.rs` asm and `main.rs`/`exceptions.rs` reading `STACK_TOP`/
-`STACK_BOTTOM` as `extern` linker symbols. That would auto-track the binary (claw back
-the remaining ~14 KB and self-adjust on every build) **and** collapse the five-location
-sync into one source of truth. Not done yet.
+**Done (June 2026) — the reservation is now exact, not hand-tuned.** The 944 KB
+(and the later extreme 848 KB) manual high-water marks have been **replaced** by a
+linker-derived reservation: `linker.ld` computes `STACK_BOTTOM =
+ALIGN(_kernel_phys_end, 0x1000) + 0x2000`, `STACK_TOP = STACK_BOTTOM + 1 MB`, and
+`IMAGE_RESERVE = STACK_BOTTOM - KERNEL_PHYS_BASE`, exporting them as absolute
+symbols. `boot.rs` asm loads `STACK_TOP` (initial SP) and emits `IMAGE_RESERVE`
+(Image header); `main.rs`/`exceptions.rs` read `STACK_BOTTOM`/`STACK_TOP` as
+`extern` symbols; `build.rs` no longer injects `--defsym=STACK_BOTTOM` or any
+`IMAGE_SIZE`. This auto-tracks the binary on every build and collapses the
+five-location sync into **one source of truth** (linker.ld). See *Dynamic
+boot-stack reservation* below for the resulting numbers; the boot self-test
+`test_boot_stack_reservation_invariants` guards the invariants.
 
 ## Tightening the extreme-profile reserve via the RSA feature gate (June 2026)
 
@@ -588,45 +593,127 @@ stay available. Full design + size breakdown: **`docs/RSA_FEATURE_GATE.md`**.
 
 Dropping `rsa` (and its `num-bigint-dig` bignum code) shrank the `extreme` flat
 `.bin` from 807 KB → 776 KB (and `_kernel_phys_end` 853 KB → 821 KB incl. `.bss`).
-The image saving alone frees **no** RAM — the boot stack sits at a fixed
+The image saving alone frees **no** RAM — the boot stack sits at
 `STACK_BOTTOM = KERNEL_PHYS_LOAD + IMAGE_SIZE`, and both images fit the old
-reserve. To hand the slack back, the `extreme` `IMAGE_SIZE` was tightened
-**880 KB → 848 KB** (`0xDC000 → 0xD4000`), keeping the original ~26 KB margin over
-`_kernel_phys_end` (821 KB). Mirrored across the **3-way lockstep** guardrail —
-all three must change together (updating only two leaves the heap reservation
-computing against the stale offset, so the freed pages never reach the pool —
-observed: PMM unchanged until `main.rs` was fixed):
+reserve. To hand the slack back, the reservation has to shrink with the binary.
 
-| Location | Symbol | Value |
-|---|---|---|
-| `src/boot.rs` | `IMAGE_SIZE` (extreme) → ARM64 header + `BOOT_STACK_TOP` | `0xD4000` |
-| `build.rs` | `image_size` (extreme) → `--defsym=STACK_BOTTOM` (linker `ASSERT`) | `0xD4000` |
-| `src/main.rs` | `STACK_BOTTOM` const (extreme) | `0x402D_4000` |
+This was first done by hand-tightening the `extreme` `IMAGE_SIZE` 880 KB → 848 KB
+(a 3-way-lockstep constant), then **superseded** by deriving the reservation in
+`linker.ld` (see *Dynamic boot-stack reservation* below), which auto-tracked it
+to **832 KB** — 16 KB tighter still, with no constant to maintain.
 
-**Measured free memory, before (rsa-on, 880 KB reserve) vs after (rsa-off, 848 KB
-reserve), same disk snapshot.** The whole layout shifts down exactly `0x8000`
-(32 KB) and all of it lands in the user-page pool:
+**Measured free memory, before (rsa-on, 880 KB reserve) vs after (rsa-off, dynamic
+832 KB reserve), same disk snapshot.** The layout shifts down and the freed bytes
+land entirely in the user-page pool:
 
-| MEM | | Code+Stack end | User pages | PMM free pages | `free` (Mem) |
-|---|---|---|---|---|---|
-| 8 MB | before | `0x403ec000` | `0x404ec000–0x40800000` (1104 KB) | 1295 | 4/8 MB |
-| 8 MB | **after** | `0x403e4000` | `0x404e4000–0x40800000` (**1136 KB**) | **1303** | 4/8 MB |
-| 6 MB | after | `0x403e4000` | `0x404a4000–0x40600000` (752 KB) | 855 | 2/6 MB |
-| 5 MB | before | `0x403ec000` | `0x4048c000–0x40500000` (464 KB) | 623 | 2/5 MB |
-| 5 MB | **after** | `0x403e4000` | `0x40484000–0x40500000` (**496 KB**) | **631** | 2/5 MB |
+| MEM | | Kernel binary | PMM free pages | `free` (Mem) |
+|---|---|---|---|---|
+| 8 MB | before | 853 KB | 1295 | 4/8 MB |
+| 8 MB | hand-tuned 848 KB | 821 KB | 1303 | 4/8 MB |
+| 8 MB | **dynamic 832 KB** | 821 KB | **1307** | 4/8 MB |
+| 5 MB | before | 853 KB | 623 | 2/5 MB |
+| 5 MB | **dynamic 832 KB** | 821 KB | **635** | 2/5 MB |
 
-**+8 PMM pages = +32 KB of user-page pool at every RAM size.** The `[Mem]` free
-RAM is MB-granular so the headline figure is unchanged; the gain is real and shows
-in the page-granular `PMM stats` / user-pages columns. The linker `ASSERT`
-validates the tighter reserve on every build; boot reaches `[SSH Server]
+**+12 PMM pages = +48 KB of user-page pool at every RAM size** vs the original
+rsa-on/880 KB kernel (+8 from rsa, +4 more from the dynamic-vs-848 tightening).
+The `[Mem]` free RAM is MB-granular so the headline figure is unchanged; the gain
+is real and shows in the page-granular `PMM stats`. Boot reaches `[SSH Server]
 Listening` cleanly at 5/6/7/8 MB.
 
 **Boot-to-SSH floor unchanged at 5 MB.** Sweeping the tightened `extreme` kernel:
 5/6/7 MB boot to a usable SSH; **4 MB does not boot — but the failure is QEMU's
 `Not enough space for DTB after kernel/initrd`, a guest-memory-layout limit (the
-kernel loads at +2 MB), not a kernel OOM.** So the 32 KB adds headroom at every
-size but can't break the 5→4 MB wall, which is QEMU-imposed, not Akuma's.
+kernel loads at +2 MB), not a kernel OOM.** So the freed pages add headroom at
+every size but can't break the 5→4 MB wall, which is QEMU-imposed, not Akuma's.
 Logs: `logs/rsa-purge/`.
+
+## Dynamic boot-stack reservation (June 2026)
+
+The per-profile `IMAGE_SIZE` constant — and the 3-way (`build.rs` / `boot.rs` /
+`main.rs`) lockstep footgun behind several past heap/boot-stack-overlap crashes —
+is **gone**. The boot-stack reservation is now derived from the *actual* linked
+image size in `linker.ld`, the one place that knows it (`build.rs` runs
+pre-link), and exported as absolute symbols every other site reads:
+
+```ld
+_kernel_phys_end = .;                                      /* end of image incl. .bss */
+STACK_BOTTOM  = ALIGN(_kernel_phys_end, 0x1000) + 0x2000;  /* page-align + 2-page guard */
+STACK_TOP     = STACK_BOTTOM + 0x100000;                   /* 1 MB boot stack */
+IMAGE_RESERVE = STACK_BOTTOM - KERNEL_PHYS_BASE;           /* ARM64 Image header field */
+```
+
+| Consumer | Was | Now |
+|---|---|---|
+| `src/boot.rs` asm SP | `ldr =STACK_TOP` from injected `BOOT_STACK_TOP` const | `ldr =STACK_TOP` (extern linker symbol) |
+| `src/boot.rs` Image header | `.quad {image_size}` (per-profile `IMAGE_SIZE`) | `.quad IMAGE_RESERVE` (linker symbol) |
+| `src/main.rs` overlap-halt + heap reserve + ExecConfig bounds | per-profile `STACK_BOTTOM`/`BOOT_STACK_TOP` consts | reads `STACK_BOTTOM`/`STACK_TOP` externs |
+| `src/exceptions.rs` boot-thread exception stack | per-profile hardcoded top | reads `STACK_TOP` extern |
+| `build.rs` | `--defsym=STACK_BOTTOM` + per-profile `image_size` | nothing (cfg emission only) |
+
+Result: the reservation auto-tracks the binary on every build, with **one** source
+of truth (`linker.ld`). Reclaimed automatically per profile — the boot
+`Kernel binary:` / `PMM stats` lines confirm the values:
+
+| profile | `_kernel_phys_end` | `IMAGE_RESERVE` (was) | reclaimed |
+|---|---|---|---|
+| `extreme` | 821 KB | 832 KB (was hand-tuned 848, orig 880) | +12 pages vs orig |
+| `size` | 881 KB | 892 KB (was 944) | +13 pages |
+| `release` | 2875 KB | 2884 KB (was 3072) | +47 pages |
+
+Verified booting to SSH: `release` @ 64 MB (full boot self-test suite),
+`size` @ 8 MB, `extreme` @ 8 MB (PMM 741 alloc / 1307 free) and @ 5 MB (645 /
+635, floor holds). The boot self-test **`test_boot_stack_reservation_invariants`**
+(`src/process_tests.rs`) asserts `STACK_BOTTOM > _kernel_phys_end`, page
+alignment, the exact 1 MB stack, and a sane guard — so a future `linker.ld` edit
+that breaks the derivation fails the boot suite instead of silently overlapping
+the image or the heap.
+
+### Full boot + hello matrix (June 2026, dynamic reserve)
+
+Every (profile, RAM) cell booted under QEMU `virt` with a fresh disk snapshot,
+then the **hello probe** `busybox echo HELLO_AKUMA_OK` was run over SSH — a real
+userspace process spawn (busybox-static via the demand-paged loader), so a ✅ means
+the kernel booted to SSH *and* can load+run a userspace binary. Numbers are PMM
+**free pages** at boot (×4 KB ≈ MB free). Driver: `scripts/boot_hello_matrix.py`;
+logs in `logs/rsa-purge/matrix_*.log`.
+
+| RAM | release | size | extreme |
+|-----|---------|------|---------|
+| 4 MB | — | ✗ QEMU DTB | ✗ QEMU DTB |
+| 5 MB | — | ✗ 0 user pages | ✅ hello · 635 |
+| 6 MB | — | ✅ hello · 604 | ✅ hello · 859 |
+| 7 MB | — | ✅ hello · 828 | ✅ hello · 1083 |
+| 8 MB | — | ✅ hello · 1052 | ✅ hello · 1307 |
+| 16 MB | ✅ hello · 1833 | ✅ hello · 2844 | ✅ hello · 3099 |
+| 32 MB | ✅ hello · 5929 | ✅ hello · 6428 | ✅ hello · 6683 |
+| 64 MB | ✅ hello · 13097 | ✅ hello · 13596 | ✅ hello · 13819 |
+| 128 MB | ✅ hello · 27130 | ✅ hello · 27131 | ✅ hello · 27131 |
+| 256 MB | ✅ hello · 45562 | ✅ hello · 45563 | ✅ hello · 45563 |
+| 1024 MB | ✅ hello · 213498 | ✅ hello · 213499 | ✅ hello · 213499 |
+| 4096 MB | ✅ hello · 918010 | ✅ hello · 918011 | ✅ hello · 918011 |
+
+(release was swept 16 MB and up, per its boot floor; size/extreme add the 4–8 MB
+low band.) Kernel images: release 2875 KB, size 881 KB, extreme 821 KB.
+
+**Boot-to-hello floors: extreme 5 MB, size 6 MB, release ≤ 16 MB.** Reading the
+failures bottom-up:
+
+- **4 MB — every profile fails identically on QEMU**, `Not enough space for DTB
+  after kernel/initrd`. The kernel loads at +2 MB and QEMU can't fit the DTB in
+  the remaining ~2 MB; this is a guest-memory-layout limit, **not** a kernel OOM,
+  so no amount of kernel shrinking breaks the 5→4 MB wall.
+- **5 MB — size fails the kernel layout guard** (`user pages: 0 bytes`): its
+  larger 881 KB image makes `code+stack` ~4.87 MB, leaving 0 user pages at 5 MB.
+  **extreme boots** (821 KB image, smaller reserve → 635 free pages).
+- **6 MB and up — all three (where they boot) run hello cleanly.**
+
+Two things the matrix makes visible:
+1. At small RAM the smaller kernel + tighter dynamic reserve wins monotonically:
+   **extreme > size > release** free pages (e.g. 16 MB: 3099 vs 2844 vs 1833).
+2. At **≥ 128 MB the three converge** to within one page of each other — the
+   per-profile reservation is negligible against RAM, and `compute_heap_size()` /
+   the thread-stack pool dominate. The profile choice only matters for the low-RAM
+   band, which is exactly where the dynamic reserve was aimed.
 
 ## Per-RAM memory statistics (June 2026)
 

@@ -15,36 +15,15 @@ use core::arch::global_asm;
 // Physical base address of RAM on QEMU virt (1 GB).
 const PHYS_BASE: usize = 0x4000_0000;
 
-// Reserved image size declared in the ARM64 Image header.
-// QEMU uses this to know where it's safe to place the DTB.
-// profile.size targets a sub-945 KB binary; release targets sub-3 MB.
-// The size value is hand-tightened to 944 KB (page-aligned, ~30 KB over the
-// current ~914 KB kernel) so the boot stack sits right above the binary and
-// the ~80 KB that 1 MB wasted goes to the user-page pool. If the kernel grows
-// past this, the linker ASSERT in linker.ld fails the build — bump it then.
-// MUST match the image_size values in build.rs (they feed STACK_BOTTOM / the
-// linker ASSERT). extreme-size drops the sc-* syscall families so its image is
-// smaller than `size`; the tighter reservation hands the freed RAM to the
-// user-page pool (lowers the boot floor). kernel_profile_extreme always implies
-// kernel_profile_size (both are opt-level=z), so it must be checked first.
-#[cfg(kernel_profile_extreme)]
-const IMAGE_SIZE: usize = 0xD4000; // 848 KB (covers _kernel_phys_end ~822 KB incl. .bss, ~26 KB margin)
-#[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
-const IMAGE_SIZE: usize = 0xEC000; // 944 KB
-#[cfg(not(kernel_profile_size))]
-const IMAGE_SIZE: usize = 0x30_0000; // 3 MB
-
-// Physical address where QEMU loads the kernel binary (PHYS_BASE + 2 MB).
-const KERNEL_PHYS_LOAD: usize = 0x4020_0000;
-
-const BOOT_STACK_SIZE: usize = 0x10_0000; // 1 MB boot stack
-
-// Boot stack top = kernel load address + declared image size + 1 MB stack.
-// Placing the stack immediately after the reserved image region keeps the
-// memory map tight and prevents heap/PMM memory from being trapped above.
-//   size profile:    0x40200000 + 0x0EC000 + 0x100000 = 0x403EC000
-//   release profile: 0x40200000 + 0x300000 + 0x100000 = 0x40600000
-const BOOT_STACK_TOP: usize = KERNEL_PHYS_LOAD + IMAGE_SIZE + BOOT_STACK_SIZE;
+// The boot-stack reservation is no longer a hand-tuned per-profile IMAGE_SIZE.
+// `linker.ld` derives it from the actual linked image size and exports three
+// absolute symbols that auto-track the binary:
+//   STACK_TOP     — initial SP, loaded by the asm below (`ldr x0, =STACK_TOP`)
+//   STACK_BOTTOM  — first page of the 1 MB boot stack (read by main.rs)
+//   IMAGE_RESERVE — load-addr → STACK_BOTTOM byte count, for the ARM64 Image
+//                   header field below (QEMU uses it for DTB placement)
+// The asm references STACK_TOP / IMAGE_RESERVE directly as external symbols, so
+// there is nothing to inject from Rust except PHYS_BASE.
 
 global_asm!(
     r#"
@@ -54,7 +33,8 @@ global_asm!(
 // Constants (values injected by Rust at compile time)
 .equ KERNEL_PHYS_BASE,  {phys_base}
 .equ STACK_SIZE,        0x100000        // 1MB stack
-.equ STACK_TOP,         {stack_top}     // kernel_load + image_size + stack_size
+// STACK_TOP and IMAGE_RESERVE are external absolute symbols from linker.ld,
+// derived from the actual linked image size (no per-profile constant).
 
 // Page table constants
 .equ PAGE_SIZE,         4096
@@ -94,7 +74,7 @@ _boot:
     b       _boot_code          // code0: branch past header
     .word   0                   // code1 (not used)
     .quad   0                   // text_offset = 0 (QEMU adds 2MB)
-    .quad   {image_size}        // image_size: 1 MB (size profile) or 3 MB (release)
+    .quad   IMAGE_RESERVE       // image_size: load-addr → boot-stack bottom (linker-derived)
     .quad   0                   // flags: little-endian, 4K pages
     .quad   0                   // res2
     .quad   0                   // res3
@@ -339,6 +319,4 @@ boot_page_tables:
     .space  4096 * 6
 "#,
     phys_base = const PHYS_BASE,
-    stack_top = const BOOT_STACK_TOP,
-    image_size = const IMAGE_SIZE,
 );

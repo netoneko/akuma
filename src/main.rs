@@ -301,37 +301,27 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // =========================================================================
     // CRITICAL: Verify kernel binary doesn't overlap with boot stack
     // =========================================================================
-    // Boot stack is placed immediately after the reserved image region by boot.rs:
-    //   BOOT_STACK_TOP = KERNEL_PHYS_LOAD + IMAGE_SIZE + BOOT_STACK_SIZE (1 MB)
-    //   STACK_BOTTOM   = KERNEL_PHYS_LOAD + IMAGE_SIZE
-    //
-    //   size profile (IMAGE_SIZE=944KB):
-    //     STACK_BOTTOM   = 0x40200000 + 0x0EC000 = 0x402EC000
-    //     BOOT_STACK_TOP = 0x402EC000 + 0x100000 = 0x403EC000
-    //   release profile (IMAGE_SIZE=3MB):
-    //     STACK_BOTTOM   = 0x40200000 + 0x300000 = 0x40500000
-    //     BOOT_STACK_TOP = 0x40500000 + 0x100000 = 0x40600000
+    // Boot stack is placed immediately above the kernel image by linker.ld, which
+    // derives the reservation from the actual linked size and exports it as the
+    // absolute symbols STACK_BOTTOM (first page of the 1 MB stack) and STACK_TOP
+    // (initial SP). There is no per-profile IMAGE_SIZE/STACK_BOTTOM constant to
+    // keep in lockstep anymore: boot.rs (asm SP + Image header), this file (overlap
+    // guard + heap reserve + ExecConfig bounds) and exceptions.rs all read the same
+    // linker symbols. Reading a symbol's address yields its absolute value (the
+    // same trick used for _kernel_phys_end), so the layout auto-tracks the binary.
     //
     // QEMU virt loads flat binary with ARM64 Image header at RAM_BASE + 2MB
     // (0x40200000). The first 2MB (0x40000000-0x401FFFFF) contains DTB.
     const KERNEL_BASE: usize = 0x4020_0000;
 
-    // STACK_BOTTOM = KERNEL_PHYS_LOAD + IMAGE_SIZE. MUST match IMAGE_SIZE in
-    // boot.rs and build.rs (all three are the same guardrail: this const feeds the
-    // runtime overlap halt + ExecConfig boot-stack bounds; boot.rs feeds the asm
-    // stack + Image header; build.rs feeds the linker ASSERT). extreme implies
-    // kernel_profile_size, so its branch must come first.
-    #[cfg(kernel_profile_extreme)]
-    const STACK_BOTTOM: usize = 0x402D_4000; // 0x40200000 + 0x0D4000 (848 KB)
-    #[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
-    const STACK_BOTTOM: usize = 0x402E_C000; // 0x40200000 + 0x0EC000 (944 KB)
-    #[cfg(not(kernel_profile_size))]
-    const STACK_BOTTOM: usize = 0x4050_0000; // 0x40200000 + 0x300000
-
     unsafe extern "C" {
         static _kernel_phys_end: u8;
+        static STACK_BOTTOM: u8;
+        static STACK_TOP: u8;
     }
     let kernel_end = unsafe { &_kernel_phys_end as *const u8 as usize };
+    let stack_bottom = unsafe { &STACK_BOTTOM as *const u8 as usize };
+    let boot_stack_top = unsafe { &STACK_TOP as *const u8 as usize };
     let kernel_size = kernel_end - KERNEL_BASE;
 
     console::print("Kernel binary: ");
@@ -342,12 +332,12 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print_hex(kernel_end as u64);
     console::print(")\n");
 
-    if kernel_end >= STACK_BOTTOM {
+    if kernel_end >= stack_bottom {
         console::print("\n!!! FATAL: Kernel binary overlaps with boot stack !!!\n");
         console::print("Kernel end:   0x");
         console::print_hex(kernel_end as u64);
         console::print("\nStack bottom: 0x");
-        console::print_hex(STACK_BOTTOM as u64);
+        console::print_hex(stack_bottom as u64);
         console::print("\n\nThe kernel has grown too large. Options:\n");
         console::print("  1. Increase STACK_TOP in boot.rs (move stack higher)\n");
         console::print("  2. Reduce kernel size (remove unused features)\n");
@@ -357,7 +347,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     }
 
     // Safety margin check - warn if kernel is getting close to stack
-    let margin = STACK_BOTTOM - kernel_end;
+    let margin = stack_bottom - kernel_end;
     if margin < 4 * 1024 * 1024 {
         // Less than 4MB margin
         console::print("WARNING: Kernel is within 4MB of stack! (");
@@ -376,13 +366,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // EC=0x21/0x22 stack-corruption crash seen at MEMORY=64 (see
     // docs/PMM_DOUBLE_FREE_AND_EL1_CRASH.md, docs/STACK_CORRUPTION_ANALYSIS.md).
     //
-    // BOOT_STACK_TOP = STACK_BOTTOM + 1 MB (boot stack size, matches boot.rs).
-    //   size profile:    0x402EC000 + 0x100000 = 0x403EC000
-    //   release profile: 0x40500000 + 0x100000 = 0x40600000
+    // boot_stack_top is the STACK_TOP linker symbol read above (= STACK_BOTTOM +
+    // 1 MB boot stack, derived from the linked image size in linker.ld).
     //
     // Reserve through the boot stack top plus a 1 MB guard so the heap can never
     // reach the stack regardless of RAM size.
-    const BOOT_STACK_TOP: usize = STACK_BOTTOM + 1024 * 1024; // matches boot.rs per-profile value
     // MIN_CODE_AND_STACK: floor so the kernel binary always fits, even if RAM
     // is very large (where stack_cover = fixed offset + guard is small relative
     // to ram/16).  The actual cover is computed as stack_cover below and
@@ -402,7 +390,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     const STACK_GUARD: usize = 64 * 1024;
     #[cfg(not(kernel_profile_extreme))]
     const STACK_GUARD: usize = 1024 * 1024;
-    let stack_cover = (BOOT_STACK_TOP - ram_base) + STACK_GUARD; // through stack top + guard
+    let stack_cover = (boot_stack_top - ram_base) + STACK_GUARD; // through stack top + guard
 
     // Memory layout:
     // - Code + Stack: max(1/16 of RAM, 8MB floor, boot-stack cover) - kernel binary and boot stack
@@ -432,11 +420,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     let ram_end = ram_base + ram_size;
     let heap_end = heap_start + heap_size;
     let user_end = user_pages_start + user_pages_size;
-    let boot_stack_bottom = BOOT_STACK_TOP - 1024 * 1024;
+    let boot_stack_bottom = boot_stack_top - 1024 * 1024;
     let layout_ok =
         kernel_end <= heap_start &&                // kernel binary fits in code+stack
         boot_stack_bottom >= ram_base &&           // boot stack starts within RAM
-        BOOT_STACK_TOP <= heap_start &&            // boot stack ends at/before heap (no overlap)
+        boot_stack_top <= heap_start &&            // boot stack ends at/before heap (no overlap)
         heap_size > 0 &&
         heap_start == ram_base + code_and_stack && // contiguous: code+stack -> heap
         user_pages_start == heap_end &&            // contiguous: heap -> user pages
@@ -449,7 +437,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         console::print("  code+stack: 0x"); console::print_hex(ram_base as u64);
         console::print(" - 0x"); console::print_hex(heap_start as u64); console::print("\n");
         console::print("  boot stack: 0x"); console::print_hex(boot_stack_bottom as u64);
-        console::print(" - 0x"); console::print_hex(BOOT_STACK_TOP as u64); console::print("\n");
+        console::print(" - 0x"); console::print_hex(boot_stack_top as u64); console::print("\n");
         console::print("  heap:       0x"); console::print_hex(heap_start as u64);
         console::print(" - 0x"); console::print_hex(heap_end as u64); console::print("\n");
         console::print("  user pages: 0x"); console::print_hex(user_pages_start as u64);
@@ -619,13 +607,13 @@ fn kernel_main(dtb_ptr: usize) -> ! {
             max_threads: config::MAX_THREADS,
             reserved_threads: config::RESERVED_THREADS,
             kernel_stack_size: config::KERNEL_STACK_SIZE,
-            // Real, profile-aware boot-stack bounds (see the STACK_BOTTOM /
-            // BOOT_STACK_TOP consts above). The threading crate must NOT hardcode
-            // these — when the boot stack was relocated, a stale constant stamped
-            // the stack canary into the kernel heap at low RAM (release boot floor
+            // Real boot-stack bounds, read from the linker-derived STACK_BOTTOM /
+            // STACK_TOP symbols above. The threading crate must NOT hardcode these
+            // — when the boot stack was relocated, a stale constant stamped the
+            // stack canary into the kernel heap at low RAM (release boot floor
             // jumped to 128 MB). See docs/LOW_MEMORY_ENVIRONMENT.md "Known bug".
-            boot_stack_base: STACK_BOTTOM,
-            boot_stack_top: BOOT_STACK_TOP,
+            boot_stack_base: stack_bottom,
+            boot_stack_top,
             default_thread_stack_size: config::DEFAULT_THREAD_STACK_SIZE,
             system_thread_stack_size: config::SYSTEM_THREAD_STACK_SIZE,
             user_thread_stack_size: config::USER_THREAD_STACK_SIZE,

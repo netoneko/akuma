@@ -19,11 +19,42 @@ QEMU to pass the DTB address in register `x0`. Key details:
 
 - **Kernel load address**: `0x40200000` (RAM_BASE + 2MB)
 - **DTB location**: `0x40000000` (first 2MB of RAM)
-- **Boot stack**: At kernel base + 8MB (`0x40A00000`)
+- **Boot stack**: 1 MB, placed immediately above the kernel image — *not* a fixed
+  address. Its location is derived from the actual linked image size (see
+  *Boot-stack reservation (linker-derived)* below).
 
 The ARM64 Image header (first 64 bytes of the binary) specifies:
-- `text_offset = 0` with `image_size != 0` → QEMU adds 2MB, loading at `0x40200000`
+- `text_offset = 0` with `image_size != 0` → QEMU adds 2MB, loading at `0x40200000`.
+  `image_size` is the linker symbol `IMAGE_RESERVE` (load address → boot-stack
+  bottom), so it tracks the real binary instead of a hand-tuned per-profile value.
 - `ARM\x64` magic at offset 56 enables DTB passing in `x0`
+
+## Boot-stack reservation (linker-derived)
+
+The 1 MB boot stack sits immediately above the kernel image, inside the
+Code + Stack region. Its bounds are **not** hardcoded — `linker.ld` derives them
+from `_kernel_phys_end` (the true end of the linked image, incl. `.bss`) and
+exports three absolute symbols that every consumer reads, so the reservation
+auto-tracks the binary on every build:
+
+```ld
+STACK_BOTTOM  = ALIGN(_kernel_phys_end, 0x1000) + 0x2000;  /* page-align + 2-page guard */
+STACK_TOP     = STACK_BOTTOM + 0x100000;                   /* 1 MB boot stack; initial SP */
+IMAGE_RESERVE = STACK_BOTTOM - KERNEL_PHYS_BASE;           /* ARM64 Image header image_size */
+```
+
+- `src/boot.rs` asm loads `STACK_TOP` as the initial SP and emits `IMAGE_RESERVE`
+  in the Image header.
+- `src/main.rs` reads `STACK_BOTTOM`/`STACK_TOP` for the kernel↔stack overlap
+  guard, the `code_and_stack` heap reservation, and the threading-crate
+  `ExecConfig` boot-stack bounds.
+- `src/exceptions.rs` reads `STACK_TOP` for the boot thread's exception stack.
+
+This replaced a per-profile `IMAGE_SIZE` constant that had to be kept in 3-way
+lockstep across `build.rs`/`boot.rs`/`main.rs` — a stale copy had previously
+stamped the boot-stack canary into the kernel heap at low RAM. The boot self-test
+`test_boot_stack_reservation_invariants` (`src/process_tests.rs`) guards the
+relationships. See `docs/LOW_MEMORY_ENVIRONMENT.md` for the per-profile numbers.
 
 ## Kernel Memory Regions
 
@@ -58,6 +89,24 @@ User pages: 944 MB (0x45000000 - 0x80000000) [remaining]
 =====================
 ```
 
+## Verified boot floors (measured June 2026)
+
+Every (profile, RAM) cell was booted and probed over SSH with `busybox echo`
+(a real userspace spawn). Full matrix + PMM free-page numbers:
+`docs/LOW_MEMORY_ENVIRONMENT.md` → *Full boot + hello matrix*.
+
+| Profile | Boot-to-hello floor | Notes |
+|---------|---------------------|-------|
+| `extreme` | **5 MB** | 821 KB image; smallest reserve → most free pages at low RAM |
+| `size`    | **6 MB** | 881 KB image; at 5 MB the layout guard trips (0 user pages) |
+| `release` | **≤ 16 MB** | 2875 KB image |
+
+**4 MB does not boot on any profile** — QEMU aborts with `Not enough space for DTB
+after kernel/initrd` (the kernel loads at +2 MB, leaving too little for the DTB).
+That is a QEMU guest-layout limit, not a kernel OOM, so shrinking the kernel
+cannot break the 5→4 MB wall. All profiles boot and run a userspace `hello` at
+every RAM size from their floor up to 4096 MB.
+
 ## Kernel Binary Size Limit
 
 **Important**: The kernel binary must fit within the Code + Stack region, with room for the stack.
@@ -68,7 +117,11 @@ User pages: 944 MB (0x45000000 - 0x80000000) [remaining]
 | 512MB | 32MB | ~24MB |
 | 1024MB | 64MB | ~56MB |
 
-The current kernel is ~2.2MB, well within limits.
+The current kernel is ~2.9MB (`release`); the `size`/`extreme` profiles are
+~0.8–0.9MB. The boot-stack reservation is no longer a fixed per-profile ceiling —
+`linker.ld` derives it from the actual linked size (see *Boot-stack reservation
+(linker-derived)*), so a larger binary simply pushes the 1 MB boot stack up by the
+same amount; it cannot silently collide with it.
 
 ## Boot Logging
 
@@ -238,7 +291,8 @@ goes from ~127 MB free at 2 GB to ~3.9 GB free at 6 GB).
 
 - **RAM size**: Set via `MEMORY` environment variable (e.g., `MEMORY=1024M cargo run --release`)
 - **Memory layout**: `src/main.rs` (kernel_main function)
-- **Linker script**: `linker.ld` (kernel load address 0x40200000)
+- **Linker script**: `linker.ld` (kernel load address 0x40200000; also derives the
+  boot-stack reservation symbols `STACK_BOTTOM`/`STACK_TOP`/`IMAGE_RESERVE`)
 - **Page tables**: `src/boot.rs` and `src/mmu.rs`
 - **Boot script**: `scripts/cargo_runner.sh` (invoked by `cargo run`)
 

@@ -379,6 +379,12 @@ pub fn run_all_tests() {
     // repeat runs at 8 MB). See src/allocator.rs.
     test_heap_reclaim_returns_pages_to_pmm();
 
+    // Boot-stack reservation is now derived from the linked image size in
+    // linker.ld (STACK_BOTTOM / STACK_TOP absolute symbols), replacing the old
+    // 3-way per-profile IMAGE_SIZE lockstep. Guard the invariants so a linker.ld
+    // edit can't silently put the boot stack inside the image or mis-size it.
+    test_boot_stack_reservation_invariants();
+
     // CoW / munmap performance benchmarks (docs/COW_OPTIMIZATIONS.md).
     // Enabled by default for now; gate behind a config flag once the numbers
     // are stable.  Prints grep-able `[BENCH]` lines.
@@ -473,6 +479,44 @@ fn test_munmap_teardown_conserves_pmm() {
         crate::safe_print!(128,
             "[Test] munmap_teardown_conserves_pmm FAILED: free_before={} free_after={} (leak or over-free)\n",
             free_before, free_after);
+    }
+}
+
+/// Boot-stack reservation invariants. `linker.ld` derives STACK_BOTTOM /
+/// STACK_TOP from the actual linked image size (`_kernel_phys_end`) and exports
+/// them as absolute symbols that boot.rs (asm SP + Image header), main.rs and
+/// exceptions.rs all read — replacing the old per-profile IMAGE_SIZE constants
+/// that had to be kept in 3-way lockstep. If a future linker.ld edit breaks the
+/// derivation (stack inside the image, wrong stack size, mis-aligned), the boot
+/// stack would overlap the kernel or the heap — so assert the relationships hold
+/// for the profile this kernel was actually built with.
+fn test_boot_stack_reservation_invariants() {
+    unsafe extern "C" {
+        static _kernel_phys_end: u8;
+        static STACK_BOTTOM: u8;
+        static STACK_TOP: u8;
+    }
+    let kernel_end = &raw const _kernel_phys_end as usize;
+    let stack_bottom = &raw const STACK_BOTTOM as usize;
+    let stack_top = &raw const STACK_TOP as usize;
+
+    // 1. The reservation sits strictly above the kernel image (no overlap).
+    let above_image = stack_bottom > kernel_end;
+    // 2. STACK_BOTTOM is page-aligned (it is ALIGN(_kernel_phys_end, 0x1000) + guard).
+    let aligned = stack_bottom % 0x1000 == 0;
+    // 3. The boot stack is exactly 1 MB (STACK_TOP = STACK_BOTTOM + 0x100000).
+    let one_mb_stack = stack_top - stack_bottom == 0x10_0000;
+    // 4. The guard gap between the image and the stack is sane (≥ 1 page, the 2
+    //    pages linker.ld adds, allowing for up-to-a-page alignment padding).
+    let guard = stack_bottom - kernel_end;
+    let guard_ok = guard >= 0x1000;
+
+    if above_image && aligned && one_mb_stack && guard_ok {
+        console::print("[Test] boot_stack_reservation_invariants PASSED\n");
+    } else {
+        crate::safe_print!(160,
+            "[Test] boot_stack_reservation_invariants FAILED: kernel_end=0x{:x} stack_bottom=0x{:x} stack_top=0x{:x} (above_image={} aligned={} one_mb={} guard={}B)\n",
+            kernel_end, stack_bottom, stack_top, above_image, aligned, one_mb_stack, guard);
     }
 }
 
