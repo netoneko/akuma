@@ -41,6 +41,12 @@
 
 ## Capabilities
 
+**Can run a coding client and tcc on 4mb of RAM:**
+
+```
+meow -c "statically compile /akuma-playground/hello.c with /bin/tcc, put binary in /tmp/h4mb and run it, run commands one by one using shell tool"
+```
+
 ### Kernel
 
 | Feature | Details |
