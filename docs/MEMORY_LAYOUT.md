@@ -97,15 +97,24 @@ Every (profile, RAM) cell was booted and probed over SSH with `busybox echo`
 
 | Profile | Boot-to-hello floor | Notes |
 |---------|---------------------|-------|
-| `extreme` | **5 MB** | 821 KB image; smallest reserve → most free pages at low RAM |
+| `extreme` | **4.5 MB** | 821 KB image; smallest reserve → boots+hello at 4.5 MB (523 free pages) |
 | `size`    | **6 MB** | 881 KB image; at 5 MB the layout guard trips (0 user pages) |
 | `release` | **≤ 16 MB** | 2875 KB image |
 
-**4 MB does not boot on any profile** — QEMU aborts with `Not enough space for DTB
-after kernel/initrd` (the kernel loads at +2 MB, leaving too little for the DTB).
-That is a QEMU guest-layout limit, not a kernel OOM, so shrinking the kernel
-cannot break the 5→4 MB wall. All profiles boot and run a userspace `hello` at
-every RAM size from their floor up to 4096 MB.
+**≤ 4.0 MB does not boot on any profile** — QEMU aborts with `Not enough space for
+DTB after kernel/initrd` (the kernel loads at +2 MB, leaving too little for the
+DTB). That is a QEMU guest-layout limit, not a kernel OOM, so shrinking the kernel
+cannot break the ≤4.0 MB wall. Between 4.125–4.375 MB the extreme kernel starts
+but its layout guard halts (0 user pages); 4.5 MB is the first size with usable
+user pages. All profiles boot and run a userspace `hello` from their floor up to
+4096 MB.
+
+Below ~6 MB the binding constraint is the *workload's* working set, not the
+kernel. On `extreme`, lightweight userspace runs at the 4.5 MB kernel floor —
+including a one-shot LLM chat (`meow -c "say hi"`, verified replying at
+4.5/5.0/5.5/6.0 MB) — while `tcc hello.c` needs 6 MB (it exhausts the PMM pool
+demand-paging `libtcc.so`). Full breakdown: `docs/LOW_MEMORY_ENVIRONMENT.md` →
+*Workload floors on extreme*.
 
 ## Kernel Binary Size Limit
 

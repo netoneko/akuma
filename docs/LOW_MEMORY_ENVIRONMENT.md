@@ -679,7 +679,8 @@ logs in `logs/rsa-purge/matrix_*.log`.
 
 | RAM | release | size | extreme |
 |-----|---------|------|---------|
-| 4 MB | — | ✗ QEMU DTB | ✗ QEMU DTB |
+| 4.0 MB | — | ✗ QEMU DTB | ✗ QEMU DTB |
+| 4.5 MB | — | ✗ 0 user pages | ✅ hello · 523 |
 | 5 MB | — | ✗ 0 user pages | ✅ hello · 635 |
 | 6 MB | — | ✅ hello · 604 | ✅ hello · 859 |
 | 7 MB | — | ✅ hello · 828 | ✅ hello · 1083 |
@@ -695,16 +696,23 @@ logs in `logs/rsa-purge/matrix_*.log`.
 (release was swept 16 MB and up, per its boot floor; size/extreme add the 4–8 MB
 low band.) Kernel images: release 2875 KB, size 881 KB, extreme 821 KB.
 
-**Boot-to-hello floors: extreme 5 MB, size 6 MB, release ≤ 16 MB.** Reading the
+**Boot-to-hello floors: extreme 4.5 MB, size 6 MB, release ≤ 16 MB.** Reading the
 failures bottom-up:
 
-- **4 MB — every profile fails identically on QEMU**, `Not enough space for DTB
-  after kernel/initrd`. The kernel loads at +2 MB and QEMU can't fit the DTB in
-  the remaining ~2 MB; this is a guest-memory-layout limit, **not** a kernel OOM,
-  so no amount of kernel shrinking breaks the 5→4 MB wall.
-- **5 MB — size fails the kernel layout guard** (`user pages: 0 bytes`): its
-  larger 881 KB image makes `code+stack` ~4.87 MB, leaving 0 user pages at 5 MB.
-  **extreme boots** (821 KB image, smaller reserve → 635 free pages).
+- **≤ 4.0 MB — every profile fails identically on QEMU**, `Not enough space for
+  DTB after kernel/initrd`. The kernel loads at +2 MB and QEMU can't fit the DTB
+  in the remaining RAM; this is a guest-memory-layout limit, **not** a kernel OOM,
+  so no amount of kernel shrinking breaks the ≤4.0 MB wall.
+- **4.125–4.375 MB (extreme) — QEMU starts the kernel, but the kernel layout
+  guard halts** with 0 user pages: `code+stack` + heap seed consume all of RAM.
+- **4.5 MB — extreme boots and runs hello** (`busybox echo`): PMM 1152 total /
+  629 alloc / **523 free** (~2 MB usable from the reclaimed pre-kernel region,
+  even though the *layout* "User pages" region is only 64 KB). This is the exact
+  extreme floor — bisected at 4.0 / 4.125 / 4.25 / 4.375 / 4.5 MB
+  (`logs/rsa-purge/ext_*k.log`).
+- **5 MB — size still fails the kernel layout guard** (0 user pages): its larger
+  881 KB image makes `code+stack` ~4.87 MB. **size needs 6 MB**; extreme already
+  runs at 4.5.
 - **6 MB and up — all three (where they boot) run hello cleanly.**
 
 Two things the matrix makes visible:
@@ -714,6 +722,34 @@ Two things the matrix makes visible:
    per-profile reservation is negligible against RAM, and `compute_heap_size()` /
    the thread-stack pool dominate. The profile choice only matters for the low-RAM
    band, which is exactly where the dynamic reserve was aimed.
+
+### Workload floors on `extreme` — it's the *workload's* working set, not the kernel
+
+Below ~6 MB the binding constraint is no longer the kernel: it's how much the
+program itself faults in. Measured on the `extreme` kernel (free = PMM free pages
+at boot, ≈ ×4 KB), one VM at a time so ollama isn't contended:
+
+| Workload | Floor | At the floor | What gates it lower |
+|---|---|---|---|
+| **boot + SSH** | 4.5 MB | usable shell | kernel layout guard (0 user pages) at 4.125–4.375; QEMU DTB ≤ 4.0 |
+| **`busybox echo` (hello)** | 4.5 MB | 523 free pg (~2.0 MB) | same as boot — a short static spawn touches few pages |
+| **`meow -c "say hi"`** | **4.5 MB** | 523 free pg; real model reply | same as boot — one socket + HTTP + a short streamed reply ≈ as light as hello |
+| **`tcc hello.c`** | 6 MB | — | tcc's own working set: `libtcc.so` resident + compile buffers ≈ 3 MB |
+| **`meow` agentic (spawns tcc)** | 6 MB | — | bounded by the tcc it spawns, not meow itself |
+
+`meow -c "say hi"` was verified replying at **4.5 / 5.0 / 5.5 / 6.0 MB**
+(`logs/rsa-purge/meow_*k.log`, model `qwen3-yolo:latest`) — i.e. a one-shot LLM
+chat runs at the absolute kernel floor. tcc fails below 6 MB by exhausting the
+PMM pool while demand-paging `libtcc.so`: at 4.5 MB it SIGSEGVs after ~12 syscalls
+(never starts compiling); at 5.5 MB it gets ~123 syscalls in (reads headers,
+starts codegen) before `0 free pages`; 6 MB is the first size its full resident
+set fits. So the earlier "meow needs ~6 MB" was really the *agentic-compile* path
+(meow **+** tcc); a bare prompt bottoms out with hello at 4.5 MB.
+
+**Rule of thumb:** lightweight userspace (shell, a static hello, a single LLM
+round-trip) runs at the 4.5 MB kernel floor; anything that demand-pages a large
+shared library or holds multi-MB buffers (tcc, sustained agentic sessions) is
+gated by its *own* footprint, around 6 MB.
 
 ## Per-RAM memory statistics (June 2026)
 
