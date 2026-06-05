@@ -97,7 +97,7 @@ Every (profile, RAM) cell was booted and probed over SSH with `busybox echo`
 
 | Profile | Boot-to-hello floor | Notes |
 |---------|---------------------|-------|
-| `extreme` | **4.5 MB** | 821 KB image; smallest reserve → boots+hello at 4.5 MB (523 free pages) |
+| `extreme` | **4.5 MB** | 805 KB image; smallest reserve + debug instrumentation off → boots+hello at 4.5 MB (527 free pages) |
 | `size`    | **6 MB** | 881 KB image; at 5 MB the layout guard trips (0 user pages) |
 | `release` | **≤ 16 MB** | 2875 KB image |
 

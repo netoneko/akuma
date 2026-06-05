@@ -294,19 +294,46 @@ pub const LOW_MEM_TEST_SKIP_MB: usize = 32;
 pub const THREAD_LIMIT_OVERRIDE: usize = 0;
 
 /// Emit per-process syscall stats on exit (total + breakdown by category).
+///
+/// Debug instrumentation: forced `false` on `kernel_profile_extreme`. With both
+/// this and `PROC_SYSCALL_LOG_ENABLED` off, `handle_syscall` also skips the
+/// per-syscall timing read (see `need_timing` in `src/syscall/mod.rs`).
+#[cfg(not(kernel_profile_extreme))]
 pub const PROCESS_SYSCALL_STATS: bool = true;
+#[cfg(kernel_profile_extreme)]
+pub const PROCESS_SYSCALL_STATS: bool = false;
 
 /// Enable per-process syscall ring-buffer log in procfs (/proc/<pid>/syscalls).
+///
+/// This is the real heap cost in the debug-instrumentation group: a per-process
+/// `VecDeque` of up to `PROC_SYSCALL_LOG_MAX_ENTRIES` entries, retained
+/// `PROC_SYSCALL_LOG_RETAIN_MS` after the process exits, scaling with process
+/// count. Forced `false` on `kernel_profile_extreme` — the recording call in
+/// `src/syscall/mod.rs` is gated on this, so the `SYSCALL_LOG` map is never
+/// populated (the MAX_ENTRIES / RETAIN_MS knobs below become inert).
+#[cfg(not(kernel_profile_extreme))]
 pub const PROC_SYSCALL_LOG_ENABLED: bool = true;
+#[cfg(kernel_profile_extreme)]
+pub const PROC_SYSCALL_LOG_ENABLED: bool = false;
 
-/// Number of most-recent syscall entries to retain per process.
-pub const PROC_SYSCALL_LOG_MAX_ENTRIES: usize = 500;
+/// Number of most-recent syscall entries to retain per process. Each entry is
+/// 32 B, so this caps the ring buffer at `N × 32 B` of heap per live/recently-dead
+/// process. 64 keeps the last ~64 syscalls — enough to see the lead-up to a fault
+/// — for ~2 KB/process (was 500 → ~16 KB/process, far more history than debugging
+/// needs). Only allocated when `PROC_SYSCALL_LOG_ENABLED` (off on extreme).
+pub const PROC_SYSCALL_LOG_MAX_ENTRIES: usize = 64;
 
 /// How long (ms) to keep a dead process's log after it exits.
 pub const PROC_SYSCALL_LOG_RETAIN_MS: u64 = 10_000; // 10 s
 
 /// Expose SysV IPC message queue state at /proc/sysvipc/msg.
+///
+/// Forced `false` on `kernel_profile_extreme` — that profile also gates out the
+/// `sc-sysv-ipc` syscall family, so the procfs view has nothing to show.
+#[cfg(not(kernel_profile_extreme))]
 pub const PROC_SYSVIPC_ENABLED: bool = true;
+#[cfg(kernel_profile_extreme)]
+pub const PROC_SYSVIPC_ENABLED: bool = false;
 
 /// Verbose file I/O logging (openat, read, readv, fstat paths + sizes).
 pub const SYSCALL_DEBUG_IO_ENABLED: bool = false;
@@ -320,8 +347,12 @@ pub const SYSCALL_DEBUG_IO_ENABLED: bool = false;
 ///
 /// Default `true` while the forktest mmap-stress investigation is active
 /// (see docs/GO_FORKTEST_DEBUG.md §E). Set to `false` to revert to the
-/// compact one-line format.
+/// compact one-line format. Forced `false` on `kernel_profile_extreme`
+/// (debug instrumentation — trims image size on the shipped low-RAM build).
+#[cfg(not(kernel_profile_extreme))]
 pub const SYSCALL_ERRNO_DIAG_EXTRA: bool = true;
+#[cfg(kernel_profile_extreme)]
+pub const SYSCALL_ERRNO_DIAG_EXTRA: bool = false;
 
 /// Log **`read()`** on **pipe reader FDs** (`PipeRead`): pid, tid, fd, pipe id, user
 /// buffer pointer and count on each syscall, plus **`validate_user_ptr`** /
@@ -341,7 +372,11 @@ pub const SYSCALL_DEBUG_PIPE_READ_SAMPLE: u64 = 1;
 /// logs **`[sigsegv-syscall]`** with **`x8`** (syscall number) and **`x0`–`x5`** — disambiguates
 /// **`read`** vs **`epoll_ctl`** vs other syscalls when Go reports **`PC≈0x13060`** (shared syscall
 /// trampoline). See **`docs/GO_FORKTEST_DEBUG.md`** (Pattern 2, Agent handoff).
+/// Forced `false` on `kernel_profile_extreme` (debug instrumentation).
+#[cfg(not(kernel_profile_extreme))]
 pub const DEBUG_SIGSEGV_SYSCALL_STUB: bool = true;
+#[cfg(kernel_profile_extreme)]
+pub const DEBUG_SIGSEGV_SYSCALL_STUB: bool = false;
 
 /// Inclusive minimum user **`ELR_EL1`** for **`[sigsegv-syscall]`** (static **`forktest_parent`**
 /// trampoline ~**`0x13060`**; widen if your binary's text mapping differs).

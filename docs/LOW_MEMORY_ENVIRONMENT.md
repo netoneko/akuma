@@ -307,6 +307,8 @@ so `--release` is unaffected unless stated.
 | **Interpreter loaded page-by-page** | `crates/akuma-exec/src/elf/mod.rs` | `read_file(ld-musl)` → ~600 KB heap slurp | `load_interpreter_from_path`: reads each PT_LOAD page with a 4 KB `file_read_exact` scratch buffer; peak heap use < 10 KB |
 | **`do_execve` heap slurp** | `src/syscall/proc.rs` | `read_file(binary)` for every `execve` (e.g. linker is ~700 KB) | reads only first 256 bytes (shebang probe); always uses `replace_image_from_path` |
 | **Lazy file-backed `mmap`** (`MMAP_FILE_BACKED_LAZY`) | `src/syscall/mem.rs` + `src/config.rs` | every file-backed `mmap` eagerly allocates all PMM frames | creates `LazySource::File` deferred region; pages faulted in on first access via existing demand-paging handler |
+| **Debug instrumentation gated off on extreme** | `src/config.rs` | `PROCESS_SYSCALL_STATS`, `PROC_SYSCALL_LOG_ENABLED`, `PROC_SYSVIPC_ENABLED`, `SYSCALL_ERRNO_DIAG_EXTRA`, `DEBUG_SIGSEGV_SYSCALL_STUB` all `true` (not profile-gated) | all `false` under `#[cfg(kernel_profile_extreme)]` — drops the per-process syscall ring-buffer heap + LTO-strips the disabled branches. **Extreme image 821 → 805 KB (−16 KB); +4 user pages at every RAM ≤ 16 MB** (e.g. 4.5 MB 523 → 527 free, 8 MB 1307 → 1311). Disabling the log also makes `handle_syscall` skip the per-syscall timing read |
+| **`PROC_SYSCALL_LOG_MAX_ENTRIES`** (all profiles where the log is on) | `src/config.rs` | 500 (~16 KB/process ring buffer) | **64** (~2 KB/process) — 64 recent syscalls is enough to see the lead-up to a fault |
 
 **Three heap-slurp sites that blocked 8 MB tcc.** With `HEAP_SLURP_MAX = 0`, tcc's
 own ELF is demand-paged (no heap scratch). But running `tcc hello.c` involves three
@@ -680,12 +682,12 @@ logs in `logs/rsa-purge/matrix_*.log`.
 | RAM | release | size | extreme |
 |-----|---------|------|---------|
 | 4.0 MB | — | ✗ QEMU DTB | ✗ QEMU DTB |
-| 4.5 MB | — | ✗ 0 user pages | ✅ hello · 523 |
-| 5 MB | — | ✗ 0 user pages | ✅ hello · 635 |
-| 6 MB | — | ✅ hello · 604 | ✅ hello · 859 |
-| 7 MB | — | ✅ hello · 828 | ✅ hello · 1083 |
-| 8 MB | — | ✅ hello · 1052 | ✅ hello · 1307 |
-| 16 MB | ✅ hello · 1833 | ✅ hello · 2844 | ✅ hello · 3099 |
+| 4.5 MB | — | ✗ 0 user pages | ✅ hello · 527 |
+| 5 MB | — | ✗ 0 user pages | ✅ hello · 639 |
+| 6 MB | — | ✅ hello · 604 | ✅ hello · 863 |
+| 7 MB | — | ✅ hello · 828 | ✅ hello · 1087 |
+| 8 MB | — | ✅ hello · 1052 | ✅ hello · 1311 |
+| 16 MB | ✅ hello · 1833 | ✅ hello · 2844 | ✅ hello · 3103 |
 | 32 MB | ✅ hello · 5929 | ✅ hello · 6428 | ✅ hello · 6683 |
 | 64 MB | ✅ hello · 13097 | ✅ hello · 13596 | ✅ hello · 13819 |
 | 128 MB | ✅ hello · 27130 | ✅ hello · 27131 | ✅ hello · 27131 |
@@ -694,7 +696,11 @@ logs in `logs/rsa-purge/matrix_*.log`.
 | 4096 MB | ✅ hello · 918010 | ✅ hello · 918011 | ✅ hello · 918011 |
 
 (release was swept 16 MB and up, per its boot floor; size/extreme add the 4–8 MB
-low band.) Kernel images: release 2875 KB, size 881 KB, extreme 821 KB.
+low band.) Kernel images: release 2875 KB, size 881 KB, extreme **805 KB**. The
+extreme column is the shipped kernel with debug instrumentation gated off (see the
+debug-instrumentation row in *What landed in the even-smaller-kernel branch*);
+each extreme cell ≤ 16 MB gained +4 pages vs the pre-gate sweep (the gate frees
+16 KB, which lands in user pages while the heap is at its seed).
 
 **Boot-to-hello floors: extreme 4.5 MB, size 6 MB, release ≤ 16 MB.** Reading the
 failures bottom-up:
@@ -706,10 +712,10 @@ failures bottom-up:
 - **4.125–4.375 MB (extreme) — QEMU starts the kernel, but the kernel layout
   guard halts** with 0 user pages: `code+stack` + heap seed consume all of RAM.
 - **4.5 MB — extreme boots and runs hello** (`busybox echo`): PMM 1152 total /
-  629 alloc / **523 free** (~2 MB usable from the reclaimed pre-kernel region,
+  625 alloc / **527 free** (~2 MB usable from the reclaimed pre-kernel region,
   even though the *layout* "User pages" region is only 64 KB). This is the exact
   extreme floor — bisected at 4.0 / 4.125 / 4.25 / 4.375 / 4.5 MB
-  (`logs/rsa-purge/ext_*k.log`).
+  (`logs/rsa-purge/ext_*k.log`). `meow -c "say hi"` also still replies here.
 - **5 MB — size still fails the kernel layout guard** (0 user pages): its larger
   881 KB image makes `code+stack` ~4.87 MB. **size needs 6 MB**; extreme already
   runs at 4.5.
@@ -717,7 +723,7 @@ failures bottom-up:
 
 Two things the matrix makes visible:
 1. At small RAM the smaller kernel + tighter dynamic reserve wins monotonically:
-   **extreme > size > release** free pages (e.g. 16 MB: 3099 vs 2844 vs 1833).
+   **extreme > size > release** free pages (e.g. 16 MB: 3103 vs 2844 vs 1833).
 2. At **≥ 128 MB the three converge** to within one page of each other — the
    per-profile reservation is negligible against RAM, and `compute_heap_size()` /
    the thread-stack pool dominate. The profile choice only matters for the low-RAM
@@ -732,8 +738,8 @@ at boot, ≈ ×4 KB), one VM at a time so ollama isn't contended:
 | Workload | Floor | At the floor | What gates it lower |
 |---|---|---|---|
 | **boot + SSH** | 4.5 MB | usable shell | kernel layout guard (0 user pages) at 4.125–4.375; QEMU DTB ≤ 4.0 |
-| **`busybox echo` (hello)** | 4.5 MB | 523 free pg (~2.0 MB) | same as boot — a short static spawn touches few pages |
-| **`meow -c "say hi"`** | **4.5 MB** | 523 free pg; real model reply | same as boot — one socket + HTTP + a short streamed reply ≈ as light as hello |
+| **`busybox echo` (hello)** | 4.5 MB | 527 free pg (~2.1 MB) | same as boot — a short static spawn touches few pages |
+| **`meow -c "say hi"`** | **4.5 MB** | 527 free pg; real model reply | same as boot — one socket + HTTP + a short streamed reply ≈ as light as hello |
 | **`tcc hello.c`** | 6 MB | — | tcc's own working set: `libtcc.so` resident + compile buffers ≈ 3 MB |
 | **`meow` agentic (spawns tcc)** | 6 MB | — | bounded by the tcc it spawns, not meow itself |
 
