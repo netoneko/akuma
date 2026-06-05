@@ -25,10 +25,23 @@ The kernel `elf_loader` supports dynamic relocations necessary for position-inde
 
 ## 2. Build and Distribution
 
-The Musl library is managed as a workspace package in `userspace/musl/`:
-- **Automation**: `build.rs` handles the cross-compilation of Musl from source.
-- **Packaging**: Musl artifacts are merged into a unified `libc.tar` archive alongside TCC internal headers.
-- **Deployment**: `libc.tar` is extracted to `/usr` during system bootstrap, providing a complete sysroot at `/usr/lib` and `/usr/include`.
+Musl is **sourced from Alpine's apk**, not built in-tree — there is no
+`userspace/musl` package anymore:
+- **Host build**: `userspace/tcc/build.rs` downloads the pinned Alpine aarch64
+  `musl-dev` apk and extracts only `usr/include`, which it uses to cross-compile
+  tcc (`-nostdinc -I <musl headers>`). The apk is cached under
+  `userspace/tcc/vendor/`.
+- **On Akuma**: install the libc + startup files + headers with
+  `apk add musl-dev` (same package/version the build pulls). Akuma no longer
+  ships a musl sysroot of its own (`libc.tar` was retired).
+- **What we ship**: only `libtcc1.tar` (tcc's runtime `libtcc1.a` + tcc's
+  internal headers like `tccdefs.h`). Combined with `apk add musl-dev`, that is
+  the complete toolchain for our tcc.
+
+> Rationale: Alpine's musl is already ABI-compatible with Akuma's Linux-AArch64
+> syscall layer (verified — a `tcc -static` binary linked against apk `libc.a`
+> runs on Akuma), so maintaining a separate in-tree musl build added cost with
+> no benefit.
 
 ## 3. TCC Integration
 

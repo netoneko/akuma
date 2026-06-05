@@ -37,11 +37,8 @@ if [ -n "$MEMBER_ONLY" ]; then
     echo "Building $MEMBER_ONLY only..."
     build_member "$MEMBER_ONLY"
     if [ "$MEMBER_ONLY" == "tcc" ]; then
-        LIBC_ARCHIVE="tcc/dist/libc.tar"
-        if [ -f "$LIBC_ARCHIVE" ]; then
-            mkdir -p ../bootstrap/archives/
-            cp "$LIBC_ARCHIVE" ../bootstrap/archives/libc.tar
-        fi
+        # tcc ships only libtcc1.tar (libtcc1.a + tcc's internal headers). The
+        # musl sysroot is NOT shipped — install it on Akuma with `apk add musl-dev`.
         LIBTCC1_ARCHIVE="tcc/dist/libtcc1.tar"
         if [ -f "$LIBTCC1_ARCHIVE" ]; then
             mkdir -p ../bootstrap/archives/
@@ -97,16 +94,10 @@ MEMBERS=(
 for member in "${MEMBERS[@]}"; do
     echo "Building $member..."
     build_member "$member"
-    # Special handling for tcc to copy its sysroot archive
+    # Special handling for tcc to copy its runtime archive. Only libtcc1.tar is
+    # shipped (libtcc1.a + tcc internal headers); musl comes from `apk add
+    # musl-dev` on Akuma, so there is no in-tree musl sysroot / libc.tar anymore.
     if [ "$member" == "tcc" ]; then
-        LIBC_ARCHIVE="tcc/dist/libc.tar"
-        if [ -f "$LIBC_ARCHIVE" ]; then
-            mkdir -p ../bootstrap/archives/
-            cp "$LIBC_ARCHIVE" ../bootstrap/archives/libc.tar
-            echo "Copied $LIBC_ARCHIVE to ../bootstrap/archives/libc.tar"
-        else
-            echo "Warning: libc archive not found at $LIBC_ARCHIVE"
-        fi
         LIBTCC1_ARCHIVE="tcc/dist/libtcc1.tar"
         if [ -f "$LIBTCC1_ARCHIVE" ]; then
             mkdir -p ../bootstrap/archives/

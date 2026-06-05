@@ -28,9 +28,8 @@ To provide a fully functional C development environment on Akuma OS. This is ach
 
 **Problem:** Managing separate archives for the compiler, its headers, and the C library was complex. Additionally, Alpine Linux's TCC package for aarch64 does not ship `libtcc1.a`, making TCC unusable without manual intervention.
 
-**Solution:** The build produces two tar archives in `userspace/tcc/build.rs`:
-- **`libc.tar`** — Full sysroot: merges Musl headers/libraries with TCC's internal headers and the `libtcc1.a` runtime library. Extracted to `/` on boot for a complete development environment.
-- **`libtcc1.tar`** — Standalone archive containing only `usr/lib/tcc/libtcc1.a`. Can be extracted on top of any system that has TCC installed but is missing the runtime library (e.g. Alpine aarch64 containers).
+**Solution:** The build produces one tar archive in `userspace/tcc/build.rs`:
+- **`libtcc1.tar`** — `usr/lib/tcc/libtcc1.a` plus TCC's internal headers (`usr/lib/tcc/include/`, incl. `tccdefs.h`). Everything our tcc needs beyond `apk add musl-dev`, which supplies the musl libc/crt/POSIX headers. (The old full-sysroot `libc.tar` was retired — musl is sourced from apk, see [../../../docs/MUSL_COMPATIBILITY.md](../../../docs/MUSL_COMPATIBILITY.md) and [../../../docs/TCC_LOW_MEMORY.md](../../../docs/TCC_LOW_MEMORY.md).)
 
 See `docs/LIBTCC1.md` for details on the `libtcc1.a` problem and usage.
 

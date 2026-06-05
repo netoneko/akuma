@@ -40,7 +40,7 @@ scripts/run_two_vms.sh --skip-build
 | Disk                      | Size   | Contents |
 |---------------------------|--------|----------|
 | `tmp/two_vms/llama.img`   | 1.8 GB | full bootstrap + 508 MB GGUF model + llama-server |
-| `tmp/two_vms/meow.img`    | 1 GB   | bootstrap without model, tcc + libc.tar, base_url patched to :8180 |
+| `tmp/two_vms/meow.img`    | 1 GB   | bootstrap without model, tcc + libtcc1.tar (musl via `apk add musl-dev`), base_url patched to :8180 |
 
 `run_two_vms.sh` creates both disks from `bootstrap/` via Docker ext2 mounts.
 The meow disk strips `.gguf` files to save space.
@@ -104,14 +104,14 @@ distributed as archives on the disk:
 
 | File                    | Purpose |
 |-------------------------|---------|
-| `/archives/libc.tar`    | musl libc headers + CRT objects (~3.8 MB) |
-| `/archives/libtcc1.tar` | `libtcc1.o` helper objects (~24 KB) |
+| `apk add musl-dev`      | musl libc + CRT objects + POSIX headers (from Alpine apk) |
+| `/archives/libtcc1.tar` | `libtcc1.a` helper objects + tcc internal headers (~60 KB) |
 
-The meow agent needs to unpack these before compiling with tcc (or the
-acceptance test should do it beforehand):
+The meow agent needs these before compiling with tcc (or the acceptance test
+should do it beforehand):
 
 ```bash
-cd / && tar xf /archives/libc.tar && tar xf /archives/libtcc1.tar
+apk add musl-dev && cd / && tar xf /archives/libtcc1.tar
 ```
 
 ## Performance Characteristics (QEMU TCG, Apple Silicon)

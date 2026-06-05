@@ -24,18 +24,21 @@ tcc: error: file 'libtcc1.a' not found
 This happens because:
 
 - **Alpine's `tcc` package (aarch64):** Does not ship `libtcc1.a`. The package build for AArch64 does not produce the runtime library, so `apk add tcc` gives you a compiler that cannot link.
-- **Akuma's TCC:** The `libtcc1.a` is built and included in the full `libc.tar` sysroot, but if that archive is not extracted (or was extracted before `libtcc1.a` was added to the build), the file is missing from `/usr/lib/tcc/`.
+- **Akuma's TCC:** `libtcc1.a` is built by `build.rs` and shipped in `libtcc1.tar`. Install it to `/usr/lib/tcc/` (see Installation below); the musl libc/crt it links alongside comes from `apk add musl-dev`.
 
 ## Build Artifacts
 
-The TCC build (`build.rs`) now produces two separate tar archives:
+The TCC build (`build.rs`) produces a **single** tar archive — the musl sysroot
+(`libc.tar`) was retired; musl is sourced from `apk add musl-dev` on Akuma.
 
 | Artifact | Contents | Use Case |
 |---|---|---|
-| `libc.tar` | Full sysroot: musl headers + musl libs (`libc.a`, `crt1.o`, etc.) + TCC internal headers + `libtcc1.a` | Fresh Akuma install, provides complete C development environment |
-| `libtcc1.tar` | Only `usr/lib/tcc/libtcc1.a` | Patching an existing system (e.g. Alpine container) that has TCC but is missing the runtime library |
+| `libtcc1.tar` | `usr/lib/tcc/libtcc1.a` **plus** `usr/lib/tcc/include/` (tcc's internal headers: `tccdefs.h`, `stddef.h`, `stdarg.h`, …) | Everything our tcc needs on top of `apk add musl-dev`. Also patches an Alpine container whose tcc package is missing the runtime library. |
 
-Both archives are placed in `userspace/tcc/dist/` after building, and `build.sh` copies them to `bootstrap/archives/`.
+It is placed in `userspace/tcc/dist/` after building, and `build.sh` copies it to `bootstrap/archives/`.
+
+> The tcc include dir **must** ride in `libtcc1.tar`: without `tccdefs.h` on the
+> tcc lib path, every compile fails with `include file 'tccdefs.h' not found`.
 
 ## How libtcc1.a is Built
 
@@ -49,17 +52,14 @@ In `build.rs`, the runtime library is cross-compiled for AArch64 from TCC's own 
 
 ### On Akuma
 
-Extract the full sysroot (done automatically on boot):
+Install the musl libc + crt + headers, then our tcc runtime + headers:
 
 ```sh
-tar xf /path/to/libc.tar -C /
+apk add musl-dev                 # crt1.o/crti.o/crtn.o, libc.a, POSIX headers
+busybox tar xf /archives/libtcc1.tar -C /   # /usr/lib/tcc/{libtcc1.a,include}
 ```
 
-Or install only the runtime library:
-
-```sh
-tar xf /path/to/libtcc1.tar -C /
-```
+Then compile with `tcc -static -B /usr/lib/tcc -o /bin/prog prog.c`.
 
 ### On Alpine Linux (aarch64)
 

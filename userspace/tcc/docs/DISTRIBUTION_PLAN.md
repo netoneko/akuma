@@ -1,5 +1,12 @@
 # TCC Distribution Plan for Akuma OS
 
+> **Superseded (June 2026).** The full-sysroot `libc.tar`/`libc.tar.gz` described
+> below was retired. musl now comes from Alpine apk on both sides (build-time
+> headers + `apk add musl-dev` on Akuma); we ship only `libtcc1.tar` (libtcc1.a +
+> tcc internal headers). See [../../../docs/TCC_LOW_MEMORY.md](../../../docs/TCC_LOW_MEMORY.md)
+> and [../../../docs/MUSL_COMPATIBILITY.md](../../../docs/MUSL_COMPATIBILITY.md).
+> Kept for historical context.
+
 This document outlines the plan for distributing and installing TinyCC (TCC) and its associated sysroot (headers and runtime libraries) on Akuma OS.
 
 ## 1. Build System Enhancements (`userspace/tcc/build.rs`)
