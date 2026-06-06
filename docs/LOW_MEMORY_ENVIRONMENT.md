@@ -122,7 +122,89 @@ boundaries are pinned without draining real RAM.
 than they exhaust it. Turning "no 64-page run" into "claim the page that *is*
 free" removes a whole class of spurious aborts where memory was actually
 available. The genuinely-out-of-contiguous-memory case remains, and is the OOM
-killer's job (see plan below / `docs/`).
+killer's job (see `docs/OOM_KILLER_PLAN.md`).
+
+**Validated (2026-06-06, live ollama, `logs/oomfix/boot_{3,4,5}mb.log`).** Three
+`extreme` VMs booted in parallel at 3 / 4 / 5 MB against a running ollama
+(`qwen3:4b` on the host gateway). Across the whole session — repeated
+`meow→ollama` streaming generations and direct `tcc` compiles — **all three
+reported `panic=0` and zero crash markers** (no `Sync from EL1`, no `EC=0x3c`, no
+`brk #1`):
+
+| RAM | boot + SSH | heavy `meow→ollama` stream | `tcc -static` compile **and run** | crash markers | peak heap |
+|-----|-----------|----------------------------|-----------------------------------|---------------|-----------|
+| 3 MB | ✅ (serves SSH) | — (not exercised) | — (not exercised) | **0** | 142 KB |
+| 4 MB | ✅ | ✅ (24 conns) | ✅ → `Hello, Akuma!` | **0** | 268 KB |
+| 5 MB | ✅ | ✅ | ✅ → `Hello, Akuma!` | **0** | 212 KB |
+
+Two notable observations with the backoff fix in place:
+- A **direct `tcc -static` compile + run succeeded at 4.0 MB**
+  (`/akuma-playground/hello.c` → `Hello, Akuma!`), below the previously documented
+  4.5 MB direct-tcc floor. Single-run observation — treat as "floor lowered,
+  confirm repeatability" rather than a hardened number.
+- **3 MB boots to a serving SSH** (below the documented 4.0 MB boot floor), though
+  meow / tcc were not exercised there.
+
+Caveat — the **full *agentic* meow+tcc pipeline** (meow writes the `.c`, then calls
+`tcc`) was *not* completed end-to-end at 4 MB: the model misbehaved (emitted a
+broken `sh -c` and a no-op edit, then hit max tool-iterations) and a JSON-unescape
+bug left literal `<` in its generated source. Those are userspace/model
+issues, not kernel aborts — the kernel stayed up throughout. The agentic floor
+headline above (4.5 MB) is therefore unchanged; only the *direct* tcc path was
+observed lower.
+
+### Network syscall allocations — "we have a fixed buffer, why does traffic allocate?"
+
+A natural question from the crash logs: the `Allocs:` counter explodes during a
+meow→ollama run (107 K → **2.6 M** allocations in `4mb_meow_tcc0.log`) even though
+the network stack uses *fixed* buffers. Both facts are true — they are about
+different buffers.
+
+**What is fixed.** The smoltcp socket ring buffers are allocated **once per
+socket** at creation (`TCP_RX_BUFFER_SIZE` / `TCP_TX_BUFFER_SIZE`,
+`crates/akuma-net/src/smoltcp_net.rs`), and the VirtIO device DMA buffers are
+fixed `[u8; 2048]` arrays inside `VirtioSmoltcpDevice`. The device RX/TX token
+path and `poll()` are allocation-free in steady state. So the *stack* is fixed —
+that part is correct.
+
+**What is not fixed — the syscall boundary.** Every `read`/`write`/`recv`/`send`
+on a socket fd allocates a **fresh transient kernel bounce buffer** to copy data
+across the user↔kernel address-space boundary:
+
+```rust
+// src/syscall/fs.rs  (socket branch of sys_read)
+let to_read = count.min(64 * 1024);
+let mut temp = alloc::vec![0u8; to_read];      // alloc
+socket::socket_recv(idx, &mut temp, nonblock); // smoltcp copies ring → temp
+copy_to_user_safe(buf_ptr, temp.as_ptr(), n);  // temp → user
+// temp dropped here                            // free
+```
+
+The same pattern is in `sys_write`, `sys_sendto`, and `sys_recvfrom`
+(`src/syscall/net.rs`). The buffer is **allocated and freed within the single
+syscall**, which is why **heap *used* stays flat (~124 KB) while the cumulative
+`Allocs` counter races** — this is allocation *churn*, not a leak.
+
+**Why so many.** An LLM streaming response arrives as many small HTTP/SSE chunks;
+meow's HTTP client issues a `read()` per chunk, and for a non-blocking client each
+*poll attempt* allocates the bounce buffer **before** the `EAGAIN` check — so a
+busy read loop allocates one buffer per attempt even when no data is ready. Tens
+of thousands of read attempts per second → millions of transient allocations.
+
+**Why this matters for OOM (the direct link to the crash).** When meow passes a
+large `count` (e.g. a 64 KB read buffer), `to_read = 64 KB` → a **16-contiguous-
+page** allocation. That is exactly the kind of multi-page contiguous request that
+`PmmOomHandler` cannot satisfy on a fragmented pool — and the crash dump shows the
+heap jumping **+64 KB right before the abort** (`124 → 188 KB used`, peak
+`181 → 222 KB`). The network bounce buffer is plausibly *both* the dominant
+allocation churn *and* the trigger of the fragmentation abort.
+
+**Mitigation (tracked, not yet done).** Replace the per-syscall `vec![0u8; count]`
+with a small pool of reused, pre-allocated bounce buffers, or copy in ≤ 4 KB
+chunks. Either shrinks the largest contiguous demand from 16 pages to 1, removing
+most of the pressure that the heap-growth backoff and the planned OOM killer exist
+to absorb. See `docs/OOM_KILLER_PLAN.md` → *Interaction with the network
+bounce-buffer churn*.
 
 ### Earlier sweep (kept for history)
 
