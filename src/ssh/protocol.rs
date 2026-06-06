@@ -541,7 +541,24 @@ async fn run_shell_session(
             welcome.push_str(line);
             welcome.push_str("\r\n");
         }
-        welcome.push_str("\r\n========================================\r\n      Welcome to Akuma SSH Server\r\n========================================\r\n\r\nType 'help' for available commands.\r\n\r\n");
+        // Banner soundtrack credit links to the album in README.md. The divider
+        // sizes to the longest boxed line + 1, capped at 50 columns.
+        let boxed = [
+            "      Welcome to Akuma SSH Server",
+            "   now with sick beats by Tokyo Rider",
+            " https://tokyorider.bandcamp.com/album/omegashima",
+        ];
+        let longest = boxed.iter().map(|l| l.len()).max().unwrap_or(0);
+        let divider = "=".repeat(core::cmp::min(longest + 1, 50));
+        welcome.push_str("\r\n");
+        welcome.push_str(&divider);
+        welcome.push_str("\r\n");
+        for line in boxed {
+            welcome.push_str(line);
+            welcome.push_str("\r\n");
+        }
+        welcome.push_str(&divider);
+        welcome.push_str("\r\n\r\nType 'help' for available commands.\r\n\r\n");
         let _ = channel_stream.write(welcome.as_bytes()).await;
         let prompt = generate_prompt(&ctx);
         let _ = channel_stream.write(prompt.as_bytes()).await;
