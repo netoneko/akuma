@@ -1374,6 +1374,57 @@ pub fn spawn_with_stdin(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>)
     Some(SpawnResult { pid, stdout_fd })
 }
 
+/// Spawn a child process with stdin data and extra environment variables.
+/// env is a list of "KEY=VALUE" strings to inject into the child's environment.
+pub fn spawn_with_env(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, env: &[&str]) -> Option<SpawnResult> {
+    let path_terminated = alloc::format!("{}\0", path);
+    let mut argv = alloc::vec::Vec::new();
+    argv.push(path_terminated.as_ptr());
+
+    let mut args_terminated = alloc::vec::Vec::new();
+    if let Some(slice) = args {
+        for a in slice {
+            let s = alloc::format!("{}\0", a);
+            args_terminated.push(s);
+        }
+    }
+    for s in &args_terminated {
+        argv.push(s.as_ptr());
+    }
+    argv.push(core::ptr::null());
+
+    let mut envp = alloc::vec::Vec::new();
+    let mut env_terminated = alloc::vec::Vec::new();
+    for e in env {
+        env_terminated.push(alloc::format!("{}\0", e));
+    }
+    for s in &env_terminated {
+        envp.push(s.as_ptr());
+    }
+    envp.push(core::ptr::null());
+
+    let stdin_ptr = stdin.map(|s| s.as_ptr() as u64).unwrap_or(0);
+    let stdin_len = stdin.map(|s| s.len() as u64).unwrap_or(0);
+
+    let result = syscall(
+        syscall::SPAWN,
+        path_terminated.as_ptr() as u64,
+        argv.as_ptr() as u64,
+        envp.as_ptr() as u64,
+        stdin_ptr,
+        stdin_len,
+        0,
+    );
+
+    if (result as i64) < 0 {
+        return None;
+    }
+
+    let pid = (result & 0xFFFF_FFFF) as u32;
+    let stdout_fd = ((result >> 32) & 0xFFFF_FFFF) as u32;
+    Some(SpawnResult { pid, stdout_fd })
+}
+
 /// Kill a process by PID
 ///
 /// Returns 0 on success, negative errno on error.
