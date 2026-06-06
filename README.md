@@ -1,5 +1,7 @@
 # Akuma OS
 
+Bohemian operating system, now with an official soundtrack, [*Omegashima*](https://tokyorider.bandcamp.com/album/omegashima) by *Tokyo Rider*.
+
 **This project is built with various AI tools as an experiment** to understand if models at the time could be used to produce some working software and dive into a domain I had some familiarity with but never got to explore. Reading Andrew Tannenbaum 20 years ago certainly helped but looking at the code and putting stuff togeter and getting to the point of running real software on custom bare bones kernel is an exciting hobby even if it only runs in QEMU.
 
 **Bare-metal AArch64 OS in Rust — preemptive kernel, Linux-compatible syscalls, SSH, containers, apk, TCC/Clang/GCC/rustc, JS runtime, Git**
