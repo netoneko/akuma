@@ -57,6 +57,9 @@ pub fn run_all_tests() {
     // (now modern, version 2) VirtIO transport — guards the force-legacy drop.
     test_rng_entropy_live();
 
+    // virtio-sound output path (skips cleanly when no device is on the bus).
+    test_virtio_sound_output();
+
     // Linux-compliance: failing syscalls return specific errnos (not -EPERM)
     test_syscall_errno_compliance();
 
@@ -2109,6 +2112,56 @@ fn test_rng_entropy_live() {
             not_all_zero,
             differ
         );
+    }
+}
+
+/// virtio-sound output path: when a device is present (runner started with
+/// SOUND=wav|coreaudio and the `sound` feature is on), set S16/stereo/44100 and
+/// play a couple of PCM periods of a sine tone — exercising
+/// set_params→prepare→start→pcm_xfer→stop end to end. When no device is on the
+/// bus (SOUND=none default, or feature off), it skips and passes, so the default
+/// boot suite is unaffected.
+fn test_virtio_sound_output() {
+    if !crate::audio::is_available() {
+        console::print("[Test] virtio-sound SKIPPED (no device)\n");
+        return;
+    }
+
+    // Configure the output stream.
+    let ok_params = crate::audio::set_channels(2).is_ok()
+        && crate::audio::set_rate(44100).is_ok()
+        && crate::audio::set_format_oss(crate::audio::AFMT_S16_LE).is_ok();
+    if !ok_params {
+        console::print("[Test] virtio-sound FAILED (set params)\n");
+        return;
+    }
+
+    // Two 8 KB periods of a ~440 Hz sine, S16-LE stereo. 16384 bytes / 4 bytes
+    // per frame = 4096 frames. Bounded stack-free buffer (heap Vec).
+    let frames = 4096usize;
+    let mut pcm = alloc::vec![0u8; frames * 4];
+    // Integer sine approximation via a small lookup over a quarter wave is
+    // overkill here; use a cheap triangle/ramp that produces real nonzero audio.
+    for n in 0..frames {
+        // Triangle wave, period 100 frames, amplitude ~6000.
+        let phase = (n % 100) as i32;
+        let tri = if phase < 50 { phase } else { 100 - phase }; // 0..50
+        let sample = ((tri - 25) * 240) as i16; // centered, ~±6000
+        let b = sample.to_le_bytes();
+        let off = n * 4;
+        pcm[off] = b[0];
+        pcm[off + 1] = b[1]; // left
+        pcm[off + 2] = b[0];
+        pcm[off + 3] = b[1]; // right
+    }
+
+    let played = crate::audio::play(&pcm);
+    crate::audio::stop();
+
+    match played {
+        Ok(n) if n == pcm.len() => console::print("[Test] virtio-sound output PASSED\n"),
+        Ok(_) => console::print("[Test] virtio-sound output FAILED (short play)\n"),
+        Err(_) => console::print("[Test] virtio-sound output FAILED (play error)\n"),
     }
 }
 

@@ -88,6 +88,7 @@ MEMBERS=(
     "llama-cpp"
     "crush"
     "stp_test"
+    "wavplay"
     )
 
 

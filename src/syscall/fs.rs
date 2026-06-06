@@ -746,9 +746,20 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
             }
             akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom => this_chunk as u64,
+            akuma_exec::process::FileDescriptor::DevDsp => {
+                // Blocking PCM playback. The audio driver re-chunks into bounded
+                // periods internally; consumes the whole slice or errors.
+                match crate::audio::play(buf_slice) {
+                    Ok(n) => n as u64,
+                    Err(_) => {
+                        if total_written > 0 { return total_written as u64; }
+                        return EIO;
+                    }
+                }
+            }
             _ => EBADF
         };
-        
+
         // If write failed or returned error code (large positive u64)
         if (written as i64) < 0 {
             if total_written > 0 { return total_written as u64; }
@@ -1012,6 +1023,23 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         return ESRCH;
     }
 
+    // /dev/dsp — virtio-sound output. Only opens when a sound device was found at
+    // boot (audio::is_available()); otherwise falls through to the normal path
+    // (→ ENOENT), so the node simply doesn't exist when the feature is off.
+    if (path == "/dev/dsp" || path == "/dev/audio") && crate::audio::is_available() {
+        if let Some(proc) = akuma_exec::process::current_process() {
+            let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevDsp);
+            if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
+                proc.set_cloexec(fd);
+            }
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
+            }
+            return fd as u64;
+        }
+        return ESRCH;
+    }
+
     let path = if path == "/proc/self/exe" {
         if let Some(proc) = akuma_exec::process::current_process() {
             proc.name.clone()
@@ -1098,6 +1126,9 @@ pub(crate) fn sys_close(fd: u32) -> u64 {
                 #[cfg(feature = "sc-pidfd")]
                 akuma_exec::process::FileDescriptor::PidFd(pidfd_id) => {
                     super::pidfd::pidfd_close(pidfd_id);
+                }
+                akuma_exec::process::FileDescriptor::DevDsp => {
+                    crate::audio::stop();
                 }
                 _ => {}
             }

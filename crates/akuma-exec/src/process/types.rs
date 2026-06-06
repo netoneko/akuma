@@ -151,6 +151,9 @@ pub enum FileDescriptor {
     EventFd(u32),
     DevNull,
     DevUrandom,
+    /// virtio-sound output device (`/dev/dsp`). Writes stream PCM frames to the
+    /// kernel audio driver; ioctl sets OSS format/channels/rate.
+    DevDsp,
     TimerFd(u32),
     EpollFd(u32),
     PidFd(u32),

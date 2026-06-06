@@ -22,7 +22,8 @@ members = [
     "sshd",
     "llama.cpp",
     "crush",
-    "stp_test"
+    "stp_test",
+    "wavplay"
 ]
 
 [profile.dev]

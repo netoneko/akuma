@@ -69,6 +69,7 @@ inherits = "size"
 default = [
     "neko",
     "tls-rsa",
+    "sound",
     "sc-aio", "sc-sysv-ipc", "sc-framebuffer", "sc-containers",
     "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
 ]
@@ -80,6 +81,12 @@ tls-rsa = ["akuma-net/tls-rsa", "dep:rsa"]
 # In-kernel `neko` text editor. Enabled by default; the size profile drops it
 # via `--no-default-features` in scripts/build_size.sh.
 neko = ["dep:akuma-editor"]
+
+# virtio-sound output driver (src/audio.rs + /dev/dsp). Enabled by default;
+# dropped by the size/extreme profiles' `--no-default-features` builds. Pulls in
+# virtio-drivers' `alloc` feature, which gates its `sound` module. Designed to be
+# small/bounded enough to opt back into `extreme` (4 MB) via `--features sound`.
+sound = ["virtio-drivers/alloc"]
 
 # Profile discriminator (NOT a syscall gate). build_extreme_size.sh enables it so
 # build.rs can pick a tighter IMAGE_SIZE / STACK_BOTTOM than the `size` profile.

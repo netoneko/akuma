@@ -15,6 +15,10 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const FIONREAD: u32 = 0x541B;
     const FIOCLEX: u32 = 0x5451;
     const FIONCLEX: u32 = 0x5450;
+    // OSS audio ioctls for /dev/dsp (mirror crate::audio constants).
+    const SNDCTL_DSP_SPEED: u32 = crate::audio::SNDCTL_DSP_SPEED;
+    const SNDCTL_DSP_SETFMT: u32 = crate::audio::SNDCTL_DSP_SETFMT;
+    const SNDCTL_DSP_CHANNELS: u32 = crate::audio::SNDCTL_DSP_CHANNELS;
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[syscall] ioctl(fd={}, cmd=0x{:x}, arg=0x{:x})\n", fd, cmd, arg);
@@ -74,6 +78,32 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         }
         FIONCLEX => {
             proc.clear_cloexec(fd);
+            return 0;
+        }
+        SNDCTL_DSP_SPEED | SNDCTL_DSP_SETFMT | SNDCTL_DSP_CHANNELS => {
+            // OSS audio params on /dev/dsp. arg is *mut i32 (in/out): the desired
+            // value in, the accepted value out (we accept what was requested).
+            if !matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::DevDsp)) {
+                return (-(25i64)) as u64; // ENOTTY — not a dsp fd
+            }
+            if !validate_user_ptr(arg, 4) { return EFAULT; }
+            let mut val: i32 = 0;
+            if unsafe { copy_from_user_safe(&mut val as *mut i32 as *mut u8, arg as *const u8, 4).is_err() } {
+                return EFAULT;
+            }
+            let res = match cmd {
+                SNDCTL_DSP_SPEED => crate::audio::set_rate(val),
+                SNDCTL_DSP_SETFMT => crate::audio::set_format_oss(val),
+                SNDCTL_DSP_CHANNELS => crate::audio::set_channels(val),
+                _ => unreachable!(),
+            };
+            if res.is_err() {
+                return EINVAL;
+            }
+            // Echo the accepted value back (OSS contract).
+            if unsafe { copy_to_user_safe(arg as *mut u8, &val as *const i32 as *const u8, 4).is_err() } {
+                return EFAULT;
+            }
             return 0;
         }
         _ => {}

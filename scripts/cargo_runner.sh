@@ -21,6 +21,11 @@
 #   SNAPSHOT  - "1" forces snapshot=on regardless of INSTANCE.
 #               "0" forces it off (DANGEROUS with parallel runs).
 #   DISK      - path to disk image. Default: ./disk.img.
+#   SOUND     - virtio-sound output backend on virtio-mmio-bus.3:
+#                 none      (default) no audio device
+#                 coreaudio audible playback on the host (macOS)
+#                 wav       dump guest audio to a WAV file (CI/headless-gradeable)
+#               SOUND_WAV  - output path for SOUND=wav. Default: ./qemu_audio.wav.
 #
 # Parallel hunt example (build once, then launch N boots in parallel —
 # don't call `cargo run` N times, it would serialize on the build lock):
@@ -100,6 +105,29 @@ fi
 
 echo "[cargo_runner] instance=$INSTANCE ssh=$SSH_PORT http=$HTTP_PORT tel=$TEL_PORT disk=$DISK_PATH" >&2
 
+# Optional virtio-sound device on bus 3 (slot free; net/blk/rng take 0/1/2).
+SOUND="${SOUND:-none}"
+SOUND_ARGS=()
+case "$SOUND" in
+  none)
+    ;;
+  coreaudio|wav)
+    if [ "$SOUND" = "wav" ]; then
+      SOUND_WAV="${SOUND_WAV:-qemu_audio.wav}"
+      SOUND_ARGS+=(-audiodev "wav,id=snd0,path=${SOUND_WAV}")
+      echo "[cargo_runner] virtio-sound: dumping guest audio to ${SOUND_WAV}" >&2
+    else
+      SOUND_ARGS+=(-audiodev "coreaudio,id=snd0")
+      echo "[cargo_runner] virtio-sound: audible via coreaudio" >&2
+    fi
+    SOUND_ARGS+=(-device "virtio-sound-device,audiodev=snd0,bus=virtio-mmio-bus.3")
+    ;;
+  *)
+    echo "[cargo_runner] ERROR: SOUND must be none|coreaudio|wav (got '$SOUND')" >&2
+    exit 1
+    ;;
+esac
+
 exec qemu-system-aarch64 \
   -semihosting \
   -machine virt \
@@ -114,5 +142,6 @@ exec qemu-system-aarch64 \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
   -device ramfb \
+  "${SOUND_ARGS[@]}" \
   -kernel "$BIN" \
   "${GDB_ARGS[@]}"

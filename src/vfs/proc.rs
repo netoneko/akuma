@@ -125,6 +125,7 @@ impl ProcFilesystem {
             FileDescriptor::EventFd(_) => String::from("anon_inode:[eventfd]"),
             FileDescriptor::DevNull => String::from("/dev/null"),
             FileDescriptor::DevUrandom => String::from("/dev/urandom"),
+            FileDescriptor::DevDsp => String::from("/dev/dsp"),
             FileDescriptor::Stdin => String::from("/dev/stdin"),
             FileDescriptor::Stdout => String::from("/dev/stdout"),
             FileDescriptor::Stderr => String::from("/dev/stderr"),

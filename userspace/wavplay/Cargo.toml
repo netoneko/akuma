@@ -1,0 +1,11 @@
+[package]
+name = "wavplay"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "wavplay"
+path = "src/main.rs"
+
+[dependencies]
+libakuma = { path = "../libakuma" }

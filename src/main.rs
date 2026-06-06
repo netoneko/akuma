@@ -8,6 +8,7 @@ extern crate alloc;
 mod akuma;
 mod allocator;
 mod async_fs;
+mod audio;
 // mod async_net;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod async_tests;
@@ -687,6 +688,14 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         Err(_e) => {
             console::print("[RNG] Hardware RNG not available\n");
         }
+    }
+
+    // =========================================================================
+    // VirtIO sound output initialization (non-fatal; /dev/dsp gated on success)
+    // =========================================================================
+    match audio::init() {
+        Ok(()) => console::print("[SND] virtio-sound ready (/dev/dsp)\n"),
+        Err(_e) => console::print("[SND] virtio-sound not available\n"),
     }
 
     // =========================================================================
