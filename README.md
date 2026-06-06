@@ -86,9 +86,7 @@ meow -c "statically compile /akuma-playground/hello.c with /bin/tcc, put binary 
 | Feature | Details |
 |---|---|
 | **Built-in shell** | Pipelines (`\|`), redirection (`>`, `>>`), chaining (`;`, `&&`), variable expansion |
-| **dash** | POSIX-compliant shell (static musl binary) |
-| **paws** | Main interactive shell |
-| **sbase** | 100+ Unix utilities — `grep`, `sed`, `awk`, `find`, `sort`, `tar`, `diff`, `wc`, `xargs`, `tee`, and many more |
+| **busybox** | Main interactive shell |
 | **System commands** | `ps`, `top`, `kill`, `free`, `df`, `mount`, `uname`, `env` |
 | **File commands** | `ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `chmod`, `ln`, `touch`, `find` |
 
@@ -168,9 +166,6 @@ userspace/
   quickjs/          JavaScript interpreter
   tcc/              Tiny C Compiler
   herd/             Process supervisor
-  sbase/            Unix utilities
-  dash/             POSIX shell
-  paws/             Interactive shell
 docs/             Architecture notes and design docs
 scripts/          Build and debug scripts
 config/           Configuration files
