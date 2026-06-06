@@ -166,6 +166,7 @@ userspace/
   quickjs/          JavaScript interpreter
   tcc/              Tiny C Compiler
   herd/             Process supervisor
+  scratch/          minimal Git implementation (HTTPS only)
 docs/             Architecture notes and design docs
 scripts/          Build and debug scripts
 config/           Configuration files
