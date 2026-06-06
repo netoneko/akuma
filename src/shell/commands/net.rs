@@ -64,7 +64,12 @@ pub struct CurlCommand;
 
 impl Command for CurlCommand {
     fn name(&self) -> &'static str { "curl" }
-    fn description(&self) -> &'static str { "HTTP/HTTPS GET request" }
+    fn description(&self) -> &'static str {
+        #[cfg(feature = "kernel-tls")]
+        { "HTTP/HTTPS GET request" }
+        #[cfg(not(feature = "kernel-tls"))]
+        { "HTTP GET request (HTTPS unavailable in this build)" }
+    }
     fn usage(&self) -> &'static str { "curl [-k] [-L] [-v] [-o <file>] <url>" }
 
     fn execute<'a>(
@@ -126,6 +131,16 @@ impl Command for CurlCommand {
                         return Ok(());
                     }
                 };
+
+                // The extreme profile builds without the in-kernel TLS client
+                // (`kernel-tls`), so https:// has no transport here. Fail with a
+                // clear message instead of a generic handshake error.
+                if url.is_https && !cfg!(feature = "kernel-tls") {
+                    let _ = stdout.write(
+                        b"Error: HTTPS is not supported in this build (kernel TLS disabled). Use a userspace HTTPS tool.\r\n",
+                    ).await;
+                    return Ok(());
+                }
 
                 if verbose {
                     let scheme = if url.is_https { "https" } else { "http" };

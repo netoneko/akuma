@@ -68,16 +68,29 @@ inherits = "size"
 [features]
 default = [
     "neko",
+    "kernel-tls",
     "tls-rsa",
     "sound",
     "sc-aio", "sc-sysv-ipc", "sc-framebuffer", "sc-containers",
     "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
 ]
 no-tests = ["akuma-net/small-sockets"]
+# In-kernel TLS client for the shell `curl` command's https:// branch (the
+# embedded-tls stack in akuma-net + its X.509 verifier — ~58 KB of kernel
+# .text). Enabled by default and kept by the `size` profile (ECDSA/Ed25519
+# HTTPS); the `extreme` profile omits it (build_extreme_size.sh does not re-add
+# it under --no-default-features), so 4 MB builds carry no built-in HTTPS — use
+# a userspace tool. Fully independent of SSH, which is Ed25519-only via
+# akuma-ssh-crypto and never gated by this.
+kernel-tls = [
+    "akuma-net/kernel-tls",
+    "dep:embedded-tls", "dep:x509-cert", "dep:der", "dep:const-oid", "dep:p256",
+]
 # RSA cert verification for outbound HTTPS/TLS. Enabled by default; dropped by
 # the size/extreme profiles (their --no-default-features build omits it) to save
-# ~300 KB. SSH is Ed25519-only and unaffected; only RSA-only HTTPS hosts break.
-tls-rsa = ["akuma-net/tls-rsa", "dep:rsa"]
+# ~300 KB. Implies `kernel-tls`. SSH is Ed25519-only and unaffected; only
+# RSA-only HTTPS hosts break.
+tls-rsa = ["kernel-tls", "akuma-net/tls-rsa", "dep:rsa"]
 # In-kernel `neko` text editor. Enabled by default; the size profile drops it
 # via `--no-default-features` in scripts/build_size.sh.
 neko = ["dep:akuma-editor"]
@@ -150,17 +163,19 @@ critical-section = { version = "1.2", default-features = false }
 embedded-io-async = { version = "0.6", default-features = false }
 
 
-# TLS support (no_std compatible)
+# TLS support (no_std compatible) — gated behind the `kernel-tls` feature so the
+# extreme profile drops the in-kernel HTTPS stack. The active consumer is
+# akuma-net; these are kept here to pin features/patch for the workspace.
 # Using fork with exposed handshake/extensions modules for custom TlsVerifier
-embedded-tls = { version = "0.17", default-features = false, features = ["alloc"] }
+embedded-tls = { version = "0.17", default-features = false, features = ["alloc"], optional = true }
 
 # X.509 certificate parsing (no_std compatible)
-x509-cert = { version = "0.2", default-features = false }
-der = { version = "0.7", default-features = false, features = ["alloc", "oid"] }
-const-oid = { version = "0.9", default-features = false }
+x509-cert = { version = "0.2", default-features = false, optional = true }
+der = { version = "0.7", default-features = false, features = ["alloc", "oid"], optional = true }
+const-oid = { version = "0.9", default-features = false, optional = true }
 
 # ECDSA P-256 signature verification
-p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"], optional = true }
 
 # RSA signature verification — gated behind the `tls-rsa` feature (off in
 # size/extreme profiles). The kernel proper does not use this directly; the

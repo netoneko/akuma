@@ -5,10 +5,13 @@
 
 use alloc::format;
 use alloc::string::String;
+// `vec!` is only used by the TLS record buffers in the https:// branch.
+#[cfg(feature = "kernel-tls")]
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::smoltcp_net;
+#[cfg(feature = "kernel-tls")]
 use crate::tls::{TlsOptions, TlsStream, TLS_RECORD_SIZE};
 
 /// Parsed URL with scheme awareness.
@@ -102,44 +105,54 @@ pub async fn http_get(url: &ParsedUrl, insecure: bool) -> Result<HttpResponse, &
     );
 
     let result = if url.is_https {
-        let mut read_buf = vec![0u8; TLS_RECORD_SIZE + 1024];
-        let mut write_buf = vec![0u8; TLS_RECORD_SIZE + 1024];
-        let tls_opts = if insecure {
-            TlsOptions::new().insecure()
-        } else {
-            TlsOptions::new()
-        };
-        let mut tls = TlsStream::connect_with_options(
-            stream,
-            &url.host,
-            &mut read_buf,
-            &mut write_buf,
-            tls_opts,
-        )
-        .await
-        .map_err(|e| {
-            log::warn!("[HTTP] TLS handshake failed: {e:?}");
-            "TLS handshake failed"
-        })?;
-
-        log::info!("[HTTP] TLS handshake complete, sending request");
-
-        let _ = embedded_io_async::Write::write(&mut tls, request.as_bytes())
+        // HTTPS requires the in-kernel TLS client (`kernel-tls`). The extreme
+        // profile builds without it; use a userspace HTTPS tool there instead.
+        #[cfg(not(feature = "kernel-tls"))]
+        {
+            let _ = (&mut stream, insecure);
+            Err("HTTPS not supported: kernel TLS is disabled in this build")
+        }
+        #[cfg(feature = "kernel-tls")]
+        {
+            let mut read_buf = vec![0u8; TLS_RECORD_SIZE + 1024];
+            let mut write_buf = vec![0u8; TLS_RECORD_SIZE + 1024];
+            let tls_opts = if insecure {
+                TlsOptions::new().insecure()
+            } else {
+                TlsOptions::new()
+            };
+            let mut tls = TlsStream::connect_with_options(
+                stream,
+                &url.host,
+                &mut read_buf,
+                &mut write_buf,
+                tls_opts,
+            )
             .await
             .map_err(|e| {
-                log::warn!("[HTTP] TLS send failed: {e:?}");
-                "TLS send failed"
+                log::warn!("[HTTP] TLS handshake failed: {e:?}");
+                "TLS handshake failed"
             })?;
-        let _ = embedded_io_async::Write::flush(&mut tls).await;
 
-        log::info!("[HTTP] Request sent, reading response...");
+            log::info!("[HTTP] TLS handshake complete, sending request");
 
-        let r = read_http_response(&mut tls).await;
-        if let Err(e) = &r {
-            log::warn!("[HTTP] TLS read result: {e}");
+            let _ = embedded_io_async::Write::write(&mut tls, request.as_bytes())
+                .await
+                .map_err(|e| {
+                    log::warn!("[HTTP] TLS send failed: {e:?}");
+                    "TLS send failed"
+                })?;
+            let _ = embedded_io_async::Write::flush(&mut tls).await;
+
+            log::info!("[HTTP] Request sent, reading response...");
+
+            let r = read_http_response(&mut tls).await;
+            if let Err(e) = &r {
+                log::warn!("[HTTP] TLS read result: {e}");
+            }
+            let _ = tls.close().await;
+            r
         }
-        let _ = tls.close().await;
-        r
     } else {
         let _ = embedded_io_async::Write::write(&mut stream, request.as_bytes())
             .await

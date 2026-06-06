@@ -5,10 +5,21 @@ edition = "2024"
 
 [features]
 small-sockets = []
+# In-kernel TLS client (embedded-tls) for outbound HTTPS — the only consumer is
+# the shell `curl` command's https:// branch (http::http_get). Pulls in
+# embedded-tls plus the X.509 cert verifier (x509-cert/der/p256/ed25519/sha2)
+# and the TLS RNG adapter (rand_core) — ~58 KB of kernel .text. Default-on for
+# normal/size builds; the extreme profile omits it to reclaim that space. This
+# stack is fully independent of SSH, which lives in `akuma-ssh-crypto`.
+kernel-tls = [
+    "dep:embedded-tls", "dep:sha2", "dep:x509-cert", "dep:der",
+    "dep:const-oid", "dep:p256", "dep:ed25519-dalek", "dep:rand_core",
+]
 # RSA signature verification for TLS server certs (PKCS#1 v1.5 + PSS, SHA-2).
 # Pulls in the `rsa` crate + its bignum arithmetic (~300 KB of kernel .text).
+# Implies `kernel-tls` (RSA verification is meaningless without the TLS client).
 # Off in the size/extreme profiles; ECDSA-P256 and Ed25519 stay available.
-tls-rsa = ["dep:rsa"]
+tls-rsa = ["kernel-tls", "dep:rsa"]
 
 [lints]
 workspace = true
@@ -17,14 +28,18 @@ workspace = true
 smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"] }
 virtio-drivers = { version = "0.7", default-features = false }
 embedded-io-async = { version = "0.6", default-features = false }
-embedded-tls = { version = "0.17", default-features = false, features = ["alloc"] }
 spinning_top = "0.3"
 log = { version = "0.4", default-features = false, features = ["max_level_off"] }
-rand_core = { version = "0.6", default-features = false }
-sha2 = { version = "0.10", default-features = false }
-x509-cert = { version = "0.2", default-features = false }
-der = { version = "0.7", default-features = false, features = ["alloc", "oid"] }
-const-oid = { version = "0.9", default-features = false }
-p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize", "fast"] }
+
+# TLS client + cert-verifier deps — gated behind the `kernel-tls` feature so the
+# extreme profile can drop the whole in-kernel HTTPS stack. SSH crypto lives in
+# `akuma-ssh-crypto` and is unaffected.
+embedded-tls = { version = "0.17", default-features = false, features = ["alloc"], optional = true }
+rand_core = { version = "0.6", default-features = false, optional = true }
+sha2 = { version = "0.10", default-features = false, optional = true }
+x509-cert = { version = "0.2", default-features = false, optional = true }
+der = { version = "0.7", default-features = false, features = ["alloc", "oid"], optional = true }
+const-oid = { version = "0.9", default-features = false, optional = true }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"], optional = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize", "fast"], optional = true }
 rsa = { version = "0.9", default-features = false, features = ["sha2"], optional = true }

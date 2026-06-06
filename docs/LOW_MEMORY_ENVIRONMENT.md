@@ -1638,8 +1638,38 @@ the kernel. There is no kTLS-style offload (no `SOL_TLS` setsockopt), so sendfil
 splice would not bypass TLS encryption — the streaming read loop is the right approach.
 
 **Relation to the kernel TLS duplication.** The kernel's built-in HTTPS (and its
-~58 KB of `embedded-tls` symbols) can be gated off (`tls-rsa` feature + disabling the
-HTTPS branch in the kernel curl command) without affecting SSH (which uses a separate
-`akuma-ssh-crypto` stack) or scratch (which is userspace). Doing so recovers ~58 KB
-from the kernel image and eliminates the duplicate TLS stack, at the cost of requiring
-a userspace tool for any HTTPS the kernel shell needs.
+~58 KB of `embedded-tls` symbols) can be gated off without affecting SSH (which uses a
+separate `akuma-ssh-crypto` stack) or scratch (which is userspace). Doing so recovers
+~58 KB from the kernel image and eliminates the duplicate TLS stack, at the cost of
+requiring a userspace tool for any HTTPS the kernel shell needs.
+
+### Landed: the `kernel-tls` feature (extreme profile drops in-kernel HTTPS)
+
+**Status: landed.** The gating is a dedicated Cargo feature, `kernel-tls`, rather than
+the originally-sketched reuse of `tls-rsa` (which only controlled the RSA verifier, not
+the whole TLS stack). The split:
+
+- **`akuma-net/kernel-tls`** — gates the `tls`, `tls_rng`, and `tls_verifier` modules
+  and makes the TLS-only dependencies (`embedded-tls`, `x509-cert`, `der`, `const-oid`,
+  `p256`, `ed25519-dalek`, `sha2`, `rand_core`) `optional`. With the feature off,
+  `http::http_get` returns `"HTTPS not supported: kernel TLS is disabled in this build"`
+  for any `https://` URL; the plain-HTTP path (and `http_get_streaming`, which was always
+  HTTP-only) is unaffected.
+- **Top-level `kernel-tls`** — enables `akuma-net/kernel-tls` and pins the matching
+  top-level `optional` TLS deps. The shell `curl` command (`src/shell/commands/net.rs`)
+  guards `https://` URLs with `cfg!(feature = "kernel-tls")`, printing a clear "use a
+  userspace HTTPS tool" message instead of a generic handshake failure; its description
+  drops "HTTPS" when the feature is off.
+- **`tls-rsa` now implies `kernel-tls`** — RSA cert verification is meaningless without
+  the TLS client, so enabling `tls-rsa` pulls `kernel-tls` in automatically.
+
+Profile matrix:
+
+| Profile | `kernel-tls` | In-kernel `curl https://` |
+|---------|--------------|---------------------------|
+| `release` / default | on (default feature) | yes (ECDSA/Ed25519 + RSA) |
+| `size` | on (`build_size.sh` re-adds it) | yes (ECDSA/Ed25519; no RSA) |
+| `extreme` | **off** (`build_extreme_size.sh` does not re-add it) | **no** — userspace tool only |
+
+SSH is Ed25519-only via `akuma-ssh-crypto` and shares none of these dependencies, so it
+keeps working on every profile.

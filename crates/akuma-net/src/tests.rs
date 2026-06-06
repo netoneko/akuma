@@ -146,7 +146,7 @@ mod net_holder_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "kernel-tls"))]
 mod tls_tests {
     use crate::tls::TlsOptions;
 
@@ -303,7 +303,7 @@ mod http_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "kernel-tls"))]
 mod tls_verifier_tests {
     use crate::tls_verifier::matches_hostname;
 
