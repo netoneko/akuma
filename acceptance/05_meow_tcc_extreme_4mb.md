@@ -179,7 +179,16 @@ from block reads.
 
 | Workload | Floor | Source |
 |---|---|---|
-| boot + SSH | **4.0 MB** | `logs/4mb_meow0.log`, `text_offset = 1 MB` fix |
+| boot + SSH | **4.0 MB** (3.0 MB observed) | `logs/4mb_meow0.log`, `text_offset = 1 MB` fix; 3 MB boots+serves SSH in `logs/oomfix/boot_3mb.log` (2026-06-06, unverified for workloads) |
 | `meow -c "say hi"` (LLM only) | **4.0 MB** | same log |
-| `tcc -static hello.c` (direct, no meow) | **4.5 MB** | `scripts/our_tcc_floor.py` |
+| `tcc -static hello.c` (direct, no meow) | **4.5 MB** (4.0 MB observed) | `scripts/our_tcc_floor.py`; direct compile+run succeeded at 4.0 MB in `logs/oomfix/boot_4mb.log` (2026-06-06) after the heap-growth backoff fix — single run, confirm repeatability |
 | **meow agentically writes + compiles + runs** | **4.5 MB** | `logs/4.5mb_meow5.log` |
+
+> **2026-06-06 — heap-growth backoff fix.** A second `EC=0x3c` `brk #1` abort
+> (`4mb_meow_tcc0.log`) was *not* PMM exhaustion — it was kernel-heap growth
+> failing on a **fragmented** pool (108 free pages, no contiguous run). Fixed by
+> backing off the contiguous run length toward `needed` in
+> `PmmOomHandler::handle_oom` (see `docs/LOW_MEMORY_ENVIRONMENT.md` → *Heap-growth
+> backoff*). Re-validated live at 3 / 4 / 5 MB: `panic=0`, zero crash markers; the
+> direct tcc path dropped to 4.0 MB. The genuine multi-page-contiguous OOM that
+> remains is the job of the planned OOM killer (`docs/OOM_KILLER_PLAN.md`).
