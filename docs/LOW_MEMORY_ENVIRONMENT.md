@@ -42,6 +42,37 @@ meow's minimum floor is now the **kernel boot floor**: 4 MB. (tcc/libc compiles 
 ~6 MB for their working set; only the light single-request path drops here.)
 Full write-up: [TCC_LOW_MEMORY.md](TCC_LOW_MEMORY.md).
 
+### 🏁 Milestone — full agentic pipeline (scratch + tcc) at 4 MB (June 2026)
+
+The full agentic pipeline — meow drives the local model, which uses **scratch** to
+clone `akuma-playground`, **tcc -static** to compile `hello.c`, and runs the
+output — now completes on the **extreme** kernel at **4 MB** RAM.
+
+Verified (`4mb_scratch.log`, 2026-06-06, extreme kernel):
+
+**Prompt:**
+```
+meow -m qwen3-yolo:latest -c "clone https://github.com/netoneko/akuma-playground.git using /bin/scratch as git-compatible substitute and statically compile /akuma-playground/hello.c with /bin/tcc, put binary in /tmp/h4mb and run it, run commands one by one using shell tool"
+```
+
+**Result:** `Hello, Akuma!` (exit 0). `panic=0`, zero crash markers throughout.
+
+| Stage | RAM free |
+|---|---|
+| idle (4 MB, post-boot) | 1904 KB |
+| during meow→ollama + scratch clone (github.com:443) | 1904 KB |
+| during tcc compile peak | **784 KB** (low-water, `0/4MB` in Mem line) |
+| settled after all exits | 2436 KB |
+
+Process trace: meow (pid=2) → scratch (pid=3, two connections to `github.com:443`)
+→ tcc (pid=4, connects to ollama for tool-call ack) → `/tmp/h4mb` (pid=5, 29 KB
+static binary, exits in ~10 ms) → meow exits (code 0). SSH remained responsive.
+The first meow run (pid=1) exited with code 130 (SIGINT) and is not part of this
+milestone; it was a cancelled interactive session before the successful agentic run.
+
+This lowers the agentic floor from **4.5 MB** (meow→tcc only, no scratch, no
+network clone) to **4.0 MB**. The boot floor itself is below 3 MB.
+
 ### 🛡️ OOM hardening — kernel survives, kills the process (June 2026)
 
 Previously, at 4.5 MB the meow→tcc path drained the PMM to ~0 and the kernel's
@@ -985,12 +1016,13 @@ at boot, ≈ ×4 KB), one VM at a time so ollama isn't contended:
 
 | Workload | Floor | At the floor | What gates it lower |
 |---|---|---|---|
-| **boot + SSH** | **4.0 MB** | 664 free pg (~2.6 MB) | QEMU DTB placement (< 4.0 MB doesn't fit) |
+| **boot + SSH** | **< 3 MB** | — | 3 MB verified (`logs/oomfix/boot_3mb.log`); actual floor not yet probed |
 | **`busybox echo` (hello)** | **4.0 MB** | 664 free pg | same as boot |
 | **`meow -c "say hi"`** | **4.0 MB** | low-water 1804 KB free; real model reply | one socket + HTTP + streamed reply; `logs/4mb_meow0.log` |
 | **`tcc hello.c`** (apk / `libtcc.so`) | 6 MB | — | tcc's own working set: `libtcc.so` resident + compile buffers ≈ 3 MB |
 | **`tcc -static hello.c`** | **4.5 MB** | — | static binary; no libtcc.so; floor unchanged from pre-`text_offset` era |
 | **`meow` agentic (`tcc -static`)** | **4.5 MB** | 1988 KB low-water; 2520 KB settled | tcc-static is the bottleneck; SSH responsiveness degraded at this edge (`logs/4.5mb_meow5.log`) |
+| **`meow` agentic (scratch clone + `tcc -static` + run)** | **4.0 MB** | 784 KB low-water; 2436 KB settled | full pipeline at the boot floor (`4mb_scratch.log`, 2026-06-06) |
 
 `meow -c "say hi"` was re-verified at **4.0 MB** (`logs/4mb_meow0.log`, 3 sessions,
 `qwen3-yolo:latest`) after the `text_offset` change; previously verified at

@@ -89,6 +89,7 @@ MEMBERS=(
     "crush"
     "stp_test"
     "wavplay"
+    "scratch"
     )
 
 

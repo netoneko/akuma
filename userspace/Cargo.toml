@@ -23,7 +23,8 @@ members = [
     "llama.cpp",
     "crush",
     "stp_test",
-    "wavplay"
+    "wavplay",
+    "scratch"
 ]
 
 [profile.dev]
