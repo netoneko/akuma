@@ -59,37 +59,96 @@ impl talc::OomHandler for PmmOomHandler {
         // small allocations from the thin `USER_PAGE_RESERVE` pool. This is what
         // keeps the OOM process-kill path able to allocate instead of the kernel
         // itself failing to grow the heap and aborting.
-        const GROW_PAGES: usize = 64;
         let needed = (layout.size() + PAGE_SIZE - 1) / PAGE_SIZE;
-        let n = if crate::pmm::free_count() <= 2 * GROW_PAGES {
-            needed
-        } else {
-            needed.max(GROW_PAGES)
-        };
+        let mut n = heap_grow_initial_pages(needed, crate::pmm::free_count());
+
+        // The kernel heap lives in the linear (`phys_to_virt`) map, so a heap
+        // span must be *physically* contiguous. On a fragmented small-RAM pool
+        // the amortised `n`-page run can fail to exist even though plenty of
+        // single pages are free — e.g. 2.6M tiny churning network-buffer allocs
+        // leave the PMM bitmap a checkerboard with 100+ free pages but no long
+        // run. Historically that made `handle_oom` return `Err`, which turns a
+        // *satisfiable* allocation into a whole-kernel `brk #1` abort (the
+        // EC=0x3c crash seen at the 4 MB meow+tcc floor). Instead, back off the
+        // run length toward `needed`: any layout that fits in one page
+        // (`needed == 1`, the dominant case) is then guaranteed to grow as long
+        // as *one* page is free; larger layouts get the largest run we can still
+        // form. Only a genuine multi-page-contiguous shortfall (true
+        // fragmentation OOM) falls through to `Err` — that case is the OOM
+        // killer's job (see docs/LOW_MEMORY_ENVIRONMENT.md).
+        //
         // NB: `alloc_pages_contiguous_zeroed` may try `reclaim_to_pmm()` on
         // failure, which `TALC.try_lock()`s — that lock is held by us right now
         // (we were called from inside `malloc`), so the try_lock fails and the
         // reclaim is a no-op. No deadlock, no benefit; just don't rely on it here.
-        let frame = crate::pmm::alloc_pages_contiguous_zeroed(n).ok_or(())?;
-        let ptr = akuma_exec::mmu::phys_to_virt(frame.addr) as *mut u8;
-        let span = Span::from_base_size(ptr, n * PAGE_SIZE);
-        match unsafe { talc.claim(span) } {
-            Ok(_heap) => {
-                // Record the PMM-backed span so `reclaim_to_pmm()` can return it
-                // later once it is fully free. If the registry is full the span
-                // is still used as heap — it just becomes non-reclaimable (the
-                // pre-reclaim one-way behaviour).
-                register_claimed_span(frame.addr, n);
-                HEAP_SIZE.fetch_add(n * PAGE_SIZE, Ordering::Relaxed);
-                Ok(())
+        loop {
+            if let Some(frame) = crate::pmm::alloc_pages_contiguous_zeroed(n) {
+                let ptr = akuma_exec::mmu::phys_to_virt(frame.addr) as *mut u8;
+                let span = Span::from_base_size(ptr, n * PAGE_SIZE);
+                return match unsafe { talc.claim(span) } {
+                    Ok(_heap) => {
+                        // Record the PMM-backed span so `reclaim_to_pmm()` can
+                        // return it later once it is fully free. If the registry
+                        // is full the span is still used as heap — it just
+                        // becomes non-reclaimable (the pre-reclaim one-way
+                        // behaviour).
+                        register_claimed_span(frame.addr, n);
+                        HEAP_SIZE.fetch_add(n * PAGE_SIZE, Ordering::Relaxed);
+                        Ok(())
+                    }
+                    Err(()) => {
+                        // Couldn't establish a heap in the pages — return them to
+                        // PMM rather than leaking (old code dropped them).
+                        crate::pmm::free_pages_contiguous(
+                            akuma_exec::PhysFrame::new(frame.addr), n);
+                        Err(())
+                    }
+                };
             }
-            Err(()) => {
-                // Couldn't establish a heap in the pages — return them to PMM
-                // rather than leaking (the old code dropped them on the floor).
-                crate::pmm::free_pages_contiguous(akuma_exec::PhysFrame::new(frame.addr), n);
-                Err(())
+            match heap_grow_backoff(n, needed) {
+                Some(next) => n = next,
+                // Can't even form the minimum contiguous span the layout needs:
+                // genuine fragmentation/exhaustion OOM. Returning Err here aborts
+                // the kernel today; the OOM killer will hook in at this point.
+                None => return Err(()),
             }
         }
+    }
+}
+
+/// Amortisation granularity for kernel-heap growth: claim 256 KB (64 pages) per
+/// OOM event when memory is ample, to spread the per-claim cost over many small
+/// allocations.
+pub const HEAP_GROW_PAGES: usize = 64;
+
+/// Initial contiguous-page request for a heap-growth that must satisfy a layout
+/// needing `needed` pages, given `free` PMM pages remain. Amortise to
+/// [`HEAP_GROW_PAGES`] when memory is ample; shrink to exactly `needed` under
+/// pressure (`free <= 2 * HEAP_GROW_PAGES`) so the thin `USER_PAGE_RESERVE` pool
+/// is preserved for the OOM-kill bookkeeping path. Pure fn over its inputs so the
+/// boundary is unit-testable without draining real RAM.
+#[inline]
+pub fn heap_grow_initial_pages(needed: usize, free: usize) -> usize {
+    if free <= 2 * HEAP_GROW_PAGES {
+        needed
+    } else {
+        needed.max(HEAP_GROW_PAGES)
+    }
+}
+
+/// Next contiguous-page request after a run of `n` pages failed to allocate, for
+/// a layout needing at least `needed` pages. Halves toward `needed` so a
+/// fragmented pool that can't yield the amortised run can still back off to the
+/// minimum the layout requires (and, when `needed == 1`, to a single page —
+/// satisfiable whenever any page is free). Returns `None` once `needed` itself
+/// has been tried, i.e. genuine multi-page-contiguous OOM. Pure + monotonically
+/// decreasing, so the `handle_oom` loop is guaranteed to terminate.
+#[inline]
+pub fn heap_grow_backoff(n: usize, needed: usize) -> Option<usize> {
+    if n <= needed {
+        None
+    } else {
+        Some((n / 2).max(needed))
     }
 }
 

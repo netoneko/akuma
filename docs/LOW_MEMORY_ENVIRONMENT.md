@@ -67,6 +67,63 @@ fully returned to the PMM (the "permanent high-water" reclaim issue). So 4.5 MB
 stays *unusable* after an OOM, but the kernel no longer dies. That reclaim gap is
 the next lever below 5 MB — **not** the toolchain.
 
+### 🛡️ Heap-growth backoff — fragmentation no longer aborts the kernel (June 2026)
+
+A *second* `EC=0x3c` `brk #1` abort surfaced at the 4 MB meow+tcc floor
+(`4mb_meow_tcc0.log`), and it is **not** the same as the reserve crash above. Here
+the PMM was **not** exhausted — the crash dump shows **108 free pages (432 KB)** —
+yet the kernel's own `Box`/`Vec` allocation aborted:
+
+```
+[Exception] Sync from EL1: EC=0x3c, ISS=0x1
+  ELR=0x4017ca98 … Instruction at ELR: 0xd4200020   ; brk #1
+  PMM: 108/1024 pages free (432 KB / 4096 KB)
+  Heap: 403349/1929216 bytes used (2649683 allocs, peak=543637)
+```
+
+**Root cause — physical fragmentation, not exhaustion.** The kernel heap lives in
+the linear (`phys_to_virt`) map, so a Talc heap span must be *physically*
+contiguous. `PmmOomHandler::handle_oom` grew the heap by claiming a contiguous run
+of pages from the PMM. After **2.6 M tiny, churning allocations** (the meow→ollama
+network-buffer path), the PMM bitmap is a checkerboard: 100+ pages free, but no
+long contiguous run. `alloc_pages_contiguous_zeroed(n)` returned `None`, so
+`handle_oom` returned `Err` → the global allocator returned null → Rust aborted
+the **whole kernel**, even though a single free page was available to satisfy the
+(small) allocation.
+
+The `USER_PAGE_RESERVE` from the previous section does not cover this: that
+reserve gates *user* demand-paging, but heap growth is a *kernel-internal*
+(reserve-exempt) caller. The reserve keeps single pages available — exactly the
+pages `handle_oom` then refused to use because it demanded them contiguous.
+
+**Fix — back off the contiguous run length toward `needed`** (`src/allocator.rs`,
+`handle_oom`):
+
+- Start at the amortised `HEAP_GROW_PAGES` (64) run when memory is ample, or
+  exactly `needed` under pressure (unchanged).
+- On a contiguous-allocation failure, **halve `n` toward `needed`** and retry,
+  instead of giving up. Any layout that fits in one page (`needed == 1` — the
+  dominant case) thus grows as long as *any* single page is free; larger layouts
+  get the largest run still formable.
+- Only a genuine **multi-page-contiguous shortfall** (true fragmentation OOM)
+  falls through to `Err`. That residual case is what the **user-process OOM
+  killer** (planned) will hook into — it is the one remaining path that can still
+  abort the kernel.
+
+The decision is split into two pure, unit-testable helpers —
+`heap_grow_initial_pages(needed, free)` and `heap_grow_backoff(n, needed)` — so the
+boundaries are pinned without draining real RAM.
+
+- Self-test: `test_heap_grow_backoff_plan` (`src/process_tests.rs`) — asserts the
+  single-page layout backs off all the way to 1, the multi-page layout clamps at
+  `needed`, and the loop always terminates.
+
+**Why this is the right floor fix:** small-RAM workloads fragment the PMM faster
+than they exhaust it. Turning "no 64-page run" into "claim the page that *is*
+free" removes a whole class of spurious aborts where memory was actually
+available. The genuinely-out-of-contiguous-memory case remains, and is the OOM
+killer's job (see plan below / `docs/`).
+
 ### Earlier sweep (kept for history)
 
 Verified with `scripts/test_memory_split.py` + the small-RAM sweeps in `logs/`

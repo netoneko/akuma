@@ -383,6 +383,11 @@ pub fn run_all_tests() {
     // repeat runs at 8 MB). See src/allocator.rs.
     test_heap_reclaim_returns_pages_to_pmm();
 
+    // PmmOomHandler must back off from the amortised 64-page grow toward `needed`
+    // contiguous pages so a fragmented pool with free single pages can still grow
+    // the heap instead of aborting the kernel (EC=0x3c brk #1, 4 MB meow+tcc).
+    test_heap_grow_backoff_plan();
+
     // Page-precise process-exit teardown leak detector: spawn → exit → reap →
     // reclaim, repeated, asserting the PMM free pool does not ratchet down. This
     // is the low-memory-floor "free PMM never recovered after a process exited"
@@ -583,6 +588,47 @@ fn test_heap_reclaim_returns_pages_to_pmm() {
             "[Test] heap_reclaim_returns_pages_to_pmm FAILED: before={} low={} after={} reclaimed={} (pool did not return cleanly)\n",
             free_before, free_low, free_after, reclaimed);
     }
+}
+
+/// `PmmOomHandler` backoff-plan boundaries (see `src/allocator.rs`). The handler
+/// requests an amortised 64-page run, then halves toward `needed` on failure so a
+/// fragmented PMM with free single pages still grows the heap rather than aborting
+/// the kernel with a `brk #1` (EC=0x3c) — the crash at the 4 MB meow+tcc floor
+/// where 108 free-but-scattered pages couldn't yield a contiguous run. Pure-fn
+/// boundaries, deterministic, no real RAM drained.
+fn test_heap_grow_backoff_plan() {
+    use crate::allocator::{heap_grow_initial_pages, heap_grow_backoff, HEAP_GROW_PAGES};
+
+    // Initial size: amortise when ample, shrink to `needed` under pressure.
+    assert_eq!(heap_grow_initial_pages(1, 10_000), HEAP_GROW_PAGES,
+        "ample memory + 1-page layout should amortise to the grow granularity");
+    assert_eq!(heap_grow_initial_pages(1, 2 * HEAP_GROW_PAGES), 1,
+        "at/below the pressure threshold a 1-page layout requests exactly 1 page");
+    assert_eq!(heap_grow_initial_pages(100, 10_000), 100,
+        "a layout larger than the grow granularity always requests at least `needed`");
+
+    // Backoff for a single-page layout (the dominant case): must descend all the
+    // way to 1, so growth succeeds whenever ANY page is free — the fix's core.
+    let mut n = heap_grow_initial_pages(1, 10_000); // 64
+    let mut steps = 0;
+    while let Some(next) = heap_grow_backoff(n, 1) {
+        assert!(next < n, "backoff must strictly decrease ({} -> {})", n, next);
+        n = next;
+        steps += 1;
+        assert!(steps < 64, "backoff must terminate, not loop");
+    }
+    assert_eq!(n, 1, "single-page layout must back off to a 1-page request");
+
+    // Backoff for a multi-page layout terminates exactly at `needed` (below that
+    // is genuine fragmentation OOM → the OOM killer's job, returns None).
+    assert_eq!(heap_grow_backoff(8, 5), Some(5),
+        "backoff toward needed clamps at needed, not below");
+    assert_eq!(heap_grow_backoff(5, 5), None,
+        "no backoff once the minimum (needed) run has been tried");
+    assert_eq!(heap_grow_backoff(1, 1), None,
+        "a 1-page request that failed is true OOM (no page free)");
+
+    console::print("  [PASS] test_heap_grow_backoff_plan\n");
 }
 
 /// Page-precise leak detector for the **process-exit teardown path** — the
