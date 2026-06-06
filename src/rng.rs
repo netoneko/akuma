@@ -6,7 +6,9 @@
 //!
 //! This is a minimal, standalone VirtIO RNG driver that directly accesses MMIO
 //! registers since virtio-drivers 0.7 doesn't expose an RNG device.
-//! Supports legacy VirtIO mode (used with QEMU's force-legacy=true).
+//! Supports both legacy (version 1) and modern (version 2) VirtIO MMIO
+//! transports, detected at runtime — so the kernel boots whether or not QEMU's
+//! force-legacy is set.
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, fence};
@@ -38,25 +40,40 @@ const VIRTIO_DEVICE_ID_RNG: u32 = 4;
 /// Queue size (must be power of 2)
 const QUEUE_SIZE: usize = 2;
 
-// Legacy VirtIO MMIO register offsets (version 1, force-legacy mode)
+// VirtIO MMIO register offsets. Common to both transports unless noted.
 const VIRTIO_MMIO_MAGIC_VALUE: usize = 0x000;
 const VIRTIO_MMIO_VERSION: usize = 0x004;
 const VIRTIO_MMIO_DEVICE_ID: usize = 0x008;
 const VIRTIO_MMIO_DEVICE_FEATURES: usize = 0x010;
+const VIRTIO_MMIO_DEVICE_FEATURES_SEL: usize = 0x014; // Modern only
 const VIRTIO_MMIO_DRIVER_FEATURES: usize = 0x020;
+const VIRTIO_MMIO_DRIVER_FEATURES_SEL: usize = 0x024; // Modern only
 const VIRTIO_MMIO_GUEST_PAGE_SIZE: usize = 0x028; // Legacy only
 const VIRTIO_MMIO_QUEUE_SEL: usize = 0x030;
 const VIRTIO_MMIO_QUEUE_NUM_MAX: usize = 0x034;
 const VIRTIO_MMIO_QUEUE_NUM: usize = 0x038;
 const VIRTIO_MMIO_QUEUE_ALIGN: usize = 0x03c; // Legacy only
 const VIRTIO_MMIO_QUEUE_PFN: usize = 0x040; // Legacy only
+const VIRTIO_MMIO_QUEUE_READY: usize = 0x044; // Modern only
 const VIRTIO_MMIO_QUEUE_NOTIFY: usize = 0x050;
 const VIRTIO_MMIO_STATUS: usize = 0x070;
+// Modern-only split-virtqueue address registers (64-bit, low/high halves).
+const VIRTIO_MMIO_QUEUE_DESC_LOW: usize = 0x080;
+const VIRTIO_MMIO_QUEUE_DESC_HIGH: usize = 0x084;
+const VIRTIO_MMIO_QUEUE_DRIVER_LOW: usize = 0x090; // avail ring
+const VIRTIO_MMIO_QUEUE_DRIVER_HIGH: usize = 0x094;
+const VIRTIO_MMIO_QUEUE_DEVICE_LOW: usize = 0x0a0; // used ring
+const VIRTIO_MMIO_QUEUE_DEVICE_HIGH: usize = 0x0a4;
 
 // VirtIO status bits
 const VIRTIO_STATUS_ACKNOWLEDGE: u32 = 1;
 const VIRTIO_STATUS_DRIVER: u32 = 2;
 const VIRTIO_STATUS_DRIVER_OK: u32 = 4;
+const VIRTIO_STATUS_FEATURES_OK: u32 = 8; // Modern only
+
+/// VIRTIO_F_VERSION_1 (feature bit 32 → word 1, bit 0). Must be negotiated to
+/// drive a modern (version 2) device.
+const VIRTIO_F_VERSION_1_WORD1: u32 = 1;
 
 // VirtIO descriptor flags
 const VIRTQ_DESC_F_WRITE: u16 = 2; // Device writes (vs read)
@@ -93,7 +110,7 @@ impl core::fmt::Display for RngError {
 }
 
 // ============================================================================
-// VirtIO Data Structures (matching legacy layout exactly)
+// VirtIO Data Structures (split-virtqueue layout; identical for v1 and v2)
 // ============================================================================
 
 /// VirtIO descriptor (16 bytes each)
@@ -138,7 +155,7 @@ struct VirtqUsed {
 // VirtIO RNG Device
 // ============================================================================
 
-/// VirtIO RNG device driver (legacy mode)
+/// VirtIO RNG device driver (legacy or modern transport)
 pub struct VirtioRngDevice {
     base_addr: usize,
     // Queue memory pointers (all in one page-aligned allocation)
@@ -186,7 +203,7 @@ fn calc_queue_layout(queue_size: usize) -> (usize, usize, usize, usize) {
 }
 
 impl VirtioRngDevice {
-    /// Create and initialize a new VirtIO RNG device (legacy mode)
+    /// Create and initialize a new VirtIO RNG device (legacy or modern transport)
     fn new(base_addr: usize) -> Result<Self, RngError> {
         // Verify magic value
         let magic = unsafe { read_volatile((base_addr + VIRTIO_MMIO_MAGIC_VALUE) as *const u32) };
@@ -195,12 +212,15 @@ impl VirtioRngDevice {
             return Err(RngError::TransportError);
         }
 
-        // Check version (1 = legacy, 2 = modern)
+        // Detect transport version: 1 = legacy (PFN-based queues), 2 = modern
+        // (split address registers + a FEATURES_OK handshake). We support both
+        // so a single kernel boots whether or not QEMU's force-legacy is set.
         let version = unsafe { read_volatile((base_addr + VIRTIO_MMIO_VERSION) as *const u32) };
-        if version != 1 {
-            // Only support legacy mode for now
-            return Err(RngError::TransportError);
-        }
+        let modern = match version {
+            1 => false,
+            2 => true,
+            _ => return Err(RngError::TransportError),
+        };
 
         // Reset the device
         unsafe {
@@ -226,22 +246,60 @@ impl VirtioRngDevice {
         }
         fence(Ordering::SeqCst);
 
-        // Read and acknowledge features (RNG has no required features, don't negotiate any)
-        let _features =
-            unsafe { read_volatile((base_addr + VIRTIO_MMIO_DEVICE_FEATURES) as *const u32) };
-        unsafe {
-            write_volatile((base_addr + VIRTIO_MMIO_DRIVER_FEATURES) as *mut u32, 0);
+        // Feature negotiation. The RNG device needs no feature bits of its own,
+        // but a modern device requires VIRTIO_F_VERSION_1 (bit 32) plus a
+        // FEATURES_OK handshake; a legacy device uses a single feature word.
+        if modern {
+            // Feature word 0: acknowledge nothing.
+            unsafe {
+                write_volatile((base_addr + VIRTIO_MMIO_DEVICE_FEATURES_SEL) as *mut u32, 0);
+                fence(Ordering::SeqCst);
+                let _ = read_volatile((base_addr + VIRTIO_MMIO_DEVICE_FEATURES) as *const u32);
+                write_volatile((base_addr + VIRTIO_MMIO_DRIVER_FEATURES_SEL) as *mut u32, 0);
+                write_volatile((base_addr + VIRTIO_MMIO_DRIVER_FEATURES) as *mut u32, 0);
+            }
+            fence(Ordering::SeqCst);
+            // Feature word 1: acknowledge VIRTIO_F_VERSION_1.
+            unsafe {
+                write_volatile((base_addr + VIRTIO_MMIO_DEVICE_FEATURES_SEL) as *mut u32, 1);
+                fence(Ordering::SeqCst);
+                let _ = read_volatile((base_addr + VIRTIO_MMIO_DEVICE_FEATURES) as *const u32);
+                write_volatile((base_addr + VIRTIO_MMIO_DRIVER_FEATURES_SEL) as *mut u32, 1);
+                write_volatile(
+                    (base_addr + VIRTIO_MMIO_DRIVER_FEATURES) as *mut u32,
+                    VIRTIO_F_VERSION_1_WORD1,
+                );
+            }
+            fence(Ordering::SeqCst);
+            // Latch FEATURES_OK and confirm the device kept it.
+            unsafe {
+                write_volatile(
+                    (base_addr + VIRTIO_MMIO_STATUS) as *mut u32,
+                    VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK,
+                );
+            }
+            fence(Ordering::SeqCst);
+            let s = unsafe { read_volatile((base_addr + VIRTIO_MMIO_STATUS) as *const u32) };
+            if s & VIRTIO_STATUS_FEATURES_OK == 0 {
+                return Err(RngError::TransportError);
+            }
+        } else {
+            // Legacy: single feature word, acknowledge none.
+            let _features =
+                unsafe { read_volatile((base_addr + VIRTIO_MMIO_DEVICE_FEATURES) as *const u32) };
+            unsafe {
+                write_volatile((base_addr + VIRTIO_MMIO_DRIVER_FEATURES) as *mut u32, 0);
+            }
+            fence(Ordering::SeqCst);
+            // Legacy requires the guest page size before queue setup.
+            unsafe {
+                write_volatile(
+                    (base_addr + VIRTIO_MMIO_GUEST_PAGE_SIZE) as *mut u32,
+                    PAGE_SIZE as u32,
+                );
+            }
+            fence(Ordering::SeqCst);
         }
-        fence(Ordering::SeqCst);
-
-        // Set guest page size (required for legacy mode)
-        unsafe {
-            write_volatile(
-                (base_addr + VIRTIO_MMIO_GUEST_PAGE_SIZE) as *mut u32,
-                PAGE_SIZE as u32,
-            );
-        }
-        fence(Ordering::SeqCst);
 
         // Set up virtqueue 0
         unsafe {
@@ -265,7 +323,10 @@ impl VirtioRngDevice {
         }
         fence(Ordering::SeqCst);
 
-        // Calculate queue layout
+        // Calculate queue layout. This single page-aligned region satisfies both
+        // transports: legacy needs the used ring page-aligned for its single-PFN
+        // window; modern only needs desc/avail/used at 16/2/4-byte alignment,
+        // which these offsets trivially exceed.
         let (desc_offset, avail_offset, used_offset, total_size) = calc_queue_layout(QUEUE_SIZE);
 
         // Allocate queue memory (must be page-aligned)
@@ -279,30 +340,65 @@ impl VirtioRngDevice {
         let avail = unsafe { queue_mem.add(avail_offset) } as *mut VirtqAvail;
         let used = unsafe { queue_mem.add(used_offset) } as *mut VirtqUsed;
 
-        // Set queue alignment (legacy mode)
-        unsafe {
-            write_volatile(
-                (base_addr + VIRTIO_MMIO_QUEUE_ALIGN) as *mut u32,
-                PAGE_SIZE as u32,
-            );
+        // Program the queue addresses for the active transport.
+        if modern {
+            // Modern: three independent 64-bit physical addresses, then READY.
+            let desc_phys = akuma_exec::mmu::virt_to_phys(desc as usize) as u64;
+            let avail_phys = akuma_exec::mmu::virt_to_phys(avail as usize) as u64;
+            let used_phys = akuma_exec::mmu::virt_to_phys(used as usize) as u64;
+            unsafe {
+                write_volatile(
+                    (base_addr + VIRTIO_MMIO_QUEUE_DESC_LOW) as *mut u32,
+                    desc_phys as u32,
+                );
+                write_volatile(
+                    (base_addr + VIRTIO_MMIO_QUEUE_DESC_HIGH) as *mut u32,
+                    (desc_phys >> 32) as u32,
+                );
+                write_volatile(
+                    (base_addr + VIRTIO_MMIO_QUEUE_DRIVER_LOW) as *mut u32,
+                    avail_phys as u32,
+                );
+                write_volatile(
+                    (base_addr + VIRTIO_MMIO_QUEUE_DRIVER_HIGH) as *mut u32,
+                    (avail_phys >> 32) as u32,
+                );
+                write_volatile(
+                    (base_addr + VIRTIO_MMIO_QUEUE_DEVICE_LOW) as *mut u32,
+                    used_phys as u32,
+                );
+                write_volatile(
+                    (base_addr + VIRTIO_MMIO_QUEUE_DEVICE_HIGH) as *mut u32,
+                    (used_phys >> 32) as u32,
+                );
+                fence(Ordering::SeqCst);
+                write_volatile((base_addr + VIRTIO_MMIO_QUEUE_READY) as *mut u32, 1);
+            }
+            fence(Ordering::SeqCst);
+        } else {
+            // Legacy: one contiguous region addressed by a page frame number.
+            unsafe {
+                write_volatile(
+                    (base_addr + VIRTIO_MMIO_QUEUE_ALIGN) as *mut u32,
+                    PAGE_SIZE as u32,
+                );
+            }
+            fence(Ordering::SeqCst);
+            let queue_phys = akuma_exec::mmu::virt_to_phys(queue_mem as usize);
+            let queue_pfn = queue_phys / PAGE_SIZE;
+            unsafe {
+                write_volatile(
+                    (base_addr + VIRTIO_MMIO_QUEUE_PFN) as *mut u32,
+                    queue_pfn as u32,
+                );
+            }
+            fence(Ordering::SeqCst);
         }
-        fence(Ordering::SeqCst);
-
-        // Set queue PFN (page frame number) - legacy mode
-        // VirtIO needs the physical address for DMA
-        let queue_phys = akuma_exec::mmu::virt_to_phys(queue_mem as usize);
-        let queue_pfn = queue_phys / PAGE_SIZE;
-        unsafe {
-            write_volatile(
-                (base_addr + VIRTIO_MMIO_QUEUE_PFN) as *mut u32,
-                queue_pfn as u32,
-            );
-        }
-        fence(Ordering::SeqCst);
 
         // Set DRIVER_OK to finish initialization
+        let features_ok = if modern { VIRTIO_STATUS_FEATURES_OK } else { 0 };
         let final_status =
-            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK;
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | features_ok | VIRTIO_STATUS_DRIVER_OK;
         unsafe {
             write_volatile((base_addr + VIRTIO_MMIO_STATUS) as *mut u32, final_status);
         }

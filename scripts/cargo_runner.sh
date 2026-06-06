@@ -108,7 +108,6 @@ exec qemu-system-aarch64 \
   -serial mon:stdio \
   -display none \
   -netdev "user,id=net0,hostfwd=tcp::${TEL_PORT}-:23,hostfwd=tcp::${SSH_PORT}-:22,hostfwd=tcp::${HTTP_PORT}-:8080,hostfwd=tcp::${P44_PORT}-:44,hostfwd=tcp::${P4444_PORT}-:4444" \
-  -global virtio-mmio.force-legacy=true \
   -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0 \
   -drive "$DRIVE_OPTS" \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \

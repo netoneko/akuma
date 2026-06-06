@@ -53,6 +53,10 @@ pub fn run_all_tests() {
     // Test tgkill (syscall 131) is wired — does not return ENOSYS
     test_tgkill_not_enosys();
 
+    // Regression: hardware RNG live + producing entropy on the negotiated
+    // (now modern, version 2) VirtIO transport — guards the force-legacy drop.
+    test_rng_entropy_live();
+
     // Linux-compliance: failing syscalls return specific errnos (not -EPERM)
     test_syscall_errno_compliance();
 
@@ -2075,6 +2079,36 @@ fn test_tgkill_not_enosys() {
         console::print("[Test] tgkill not-ENOSYS PASSED\n");
     } else {
         console::print("[Test] tgkill not-ENOSYS FAILED: returned ENOSYS\n");
+    }
+}
+
+/// Regression: the hardware RNG must be live and producing entropy through
+/// whichever VirtIO MMIO transport it negotiated. Since dropping QEMU's
+/// `force-legacy`, the device presents as modern (version 2); rng.rs now
+/// detects v1/v2 at runtime. If the modern queue setup silently failed,
+/// `fill_bytes` would return NotInitialized — and networking, which wires
+/// `rng::fill_bytes(...).expect("RNG required for networking")`, would panic
+/// at the first TLS/SSH key draw. Two non-empty fills that succeed and differ
+/// prove the device is delivering real entropy, not zeroed/stale buffers.
+fn test_rng_entropy_live() {
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    let ra = crate::rng::fill_bytes(&mut a);
+    let rb = crate::rng::fill_bytes(&mut b);
+    let both_ok = ra.is_ok() && rb.is_ok();
+    let not_all_zero = a.iter().any(|&x| x != 0) && b.iter().any(|&x| x != 0);
+    let differ = a != b;
+    if both_ok && not_all_zero && differ {
+        console::print("[Test] rng entropy-live PASSED\n");
+    } else {
+        console::print("[Test] rng entropy-live FAILED");
+        crate::safe_print!(
+            96,
+            " (ok={} nonzero={} differ={})\n",
+            both_ok,
+            not_all_zero,
+            differ
+        );
     }
 }
 
