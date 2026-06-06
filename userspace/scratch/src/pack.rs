@@ -120,7 +120,7 @@ impl<'a> PackParser<'a> {
     ///    Only objects that serve as delta bases are retained in memory.
     pub fn parse_all(&mut self, store: &ObjectStore) -> Result<Vec<Sha1Hash>> {
         use alloc::collections::BTreeSet;
-        use libakuma::print;
+        use libakuma::{print, print_dec};
 
         let total = self.object_count as usize;
 
@@ -153,9 +153,9 @@ impl<'a> PackParser<'a> {
         for (i, entry) in entries.iter().enumerate() {
             if i % 500 == 0 {
                 print("scratch: processing ");
-                print_num(i);
+                print_dec(i);
                 print("/");
-                print_num(total);
+                print_dec(total);
                 print("\n");
             }
 
@@ -249,7 +249,7 @@ impl<'a> PackParser<'a> {
         }
 
         print("scratch: resolved ");
-        print_num(shas.len());
+        print_dec(shas.len());
         print(" objects\n");
 
         Ok(shas)
@@ -485,23 +485,3 @@ fn parse_copy_instruction(cmd: u8, data: &[u8]) -> Result<(usize, usize, usize)>
     Ok((offset, size, pos))
 }
 
-fn print_num(n: usize) {
-    use libakuma::print;
-    if n == 0 {
-        print("0");
-        return;
-    }
-    let mut buf = [0u8; 20];
-    let mut i = 0;
-    let mut val = n;
-    while val > 0 {
-        buf[i] = b'0' + (val % 10) as u8;
-        val /= 10;
-        i += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        let s = core::str::from_utf8(&buf[i..i+1]).unwrap();
-        print(s);
-    }
-}

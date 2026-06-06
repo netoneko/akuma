@@ -145,9 +145,11 @@ impl ObjectStore {
 
         let mut state = zlib::InflateState::new_boxed(zlib::DataFormat::Zlib);
         let mut header_skipped = false;
-        let mut header_buf = Vec::new();
+        // Track bytes seen before the null without a heap allocation.
+        // Git object headers are at most ~25 bytes; 256 is a generous cap.
+        let mut header_bytes_seen: usize = 0;
         let mut compressed_buf = [0u8; 32768]; // 32KB compressed chunk
-        
+
         loop {
             let n = read_fd(fd, &mut compressed_buf);
             if n < 0 {
@@ -161,19 +163,17 @@ impl ObjectStore {
             let result = zlib::decompress_with_state_to_callback(&mut state, &compressed_buf[..n as usize], |chunk| {
                 if header_skipped {
                     callback(chunk)
+                } else if let Some(null_pos) = chunk.iter().position(|&b| b == 0) {
+                    header_skipped = true;
+                    if null_pos + 1 < chunk.len() {
+                        callback(&chunk[null_pos + 1..])?;
+                    }
+                    Ok(())
                 } else {
-                    header_buf.extend_from_slice(chunk);
-                    if let Some(null_pos) = header_buf.iter().position(|&b| b == 0) {
-                        header_skipped = true;
-                        if null_pos + 1 < header_buf.len() {
-                            callback(&header_buf[null_pos + 1..])?;
-                        }
-                        header_buf = Vec::new();
-                        Ok(())
+                    header_bytes_seen += chunk.len();
+                    if header_bytes_seen > 256 {
+                        Err(Error::invalid_object("header too long"))
                     } else {
-                        if header_buf.len() > 1024 {
-                            return Err(Error::invalid_object("header too long"));
-                        }
                         Ok(())
                     }
                 }

@@ -6,7 +6,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libakuma::{close, mkdir, open, open_flags, print, write_fd};
+use libakuma::{close, mkdir, open, open_flags, print, print_dec, write_fd};
 
 use crate::base64;
 use crate::config::GitConfig;
@@ -39,7 +39,7 @@ pub fn clone(url: &str) -> Result<()> {
     }
 
     print("scratch: found ");
-    print_num(refs.len());
+    print_dec(refs.len());
     print(" refs\n");
 
     // Find HEAD ref
@@ -68,7 +68,7 @@ pub fn clone(url: &str) -> Result<()> {
     }
 
     print("scratch: requesting ");
-    print_num(unique_wants.len());
+    print_dec(unique_wants.len());
     print(" objects\n");
 
     // Extract repo name from URL for directory
@@ -99,7 +99,7 @@ pub fn clone(url: &str) -> Result<()> {
     let object_count = client.fetch_pack_streaming(&unique_wants, &[], &caps, &git_dir)?;
 
     print("scratch: stored ");
-    print_num(object_count as usize);
+    print_dec(object_count as usize);
     print(" objects\n");
 
     // Create refs
@@ -207,14 +207,14 @@ pub fn fetch() -> Result<()> {
     }
 
     print("scratch: requesting ");
-    print_num(wants.len());
+    print_dec(wants.len());
     print(" new objects\n");
 
     // Fetch and parse using streaming
     let object_count = client.fetch_pack_streaming(&wants, &haves, &caps, &git_dir)?;
 
     print("scratch: stored ");
-    print_num(object_count as usize);
+    print_dec(object_count as usize);
     print(" objects\n");
 
     // Update remote tracking refs
@@ -307,14 +307,14 @@ pub fn pull() -> Result<()> {
 
         if !wants.is_empty() {
             print("scratch: requesting ");
-            print_num(wants.len());
+            print_dec(wants.len());
             print(" new objects\n");
 
             // Fetch and parse using streaming
             let object_count = client.fetch_pack_streaming(&wants, &haves, &caps, &git_dir)?;
 
             print("scratch: stored ");
-            print_num(object_count as usize);
+            print_dec(object_count as usize);
             print(" objects\n");
         }
     }
@@ -435,14 +435,14 @@ pub fn push(token: Option<&str>, branch: Option<&str>) -> Result<()> {
     let objects = pack_write::collect_objects_for_push(&local_sha, &have, &store)?;
 
     print("scratch: packing ");
-    print_num(objects.len());
+    print_dec(objects.len());
     print(" objects\n");
 
     // Create pack file
     let pack_data = pack_write::create_pack(&objects, &store)?;
 
     print("scratch: pack size ");
-    print_num(pack_data.len());
+    print_dec(pack_data.len());
     print(" bytes\n");
 
     // Push to remote
@@ -527,7 +527,7 @@ fn checkout_tree(store: &ObjectStore, commit_sha: &Sha1Hash, dest: &str) -> Resu
     let mut file_count: usize = 0;
     checkout_tree_recursive(store, &commit.tree, dest, &mut file_count)?;
     print("\nscratch: checked out ");
-    print_num(file_count);
+    print_dec(file_count);
     print(" files\n");
     Ok(())
 }
@@ -573,7 +573,7 @@ fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str,
                     print("\nscratch: warning: checking out large file ");
                     print(&entry.name);
                     print(" (");
-                    print_num(size / 1024);
+                    print_dec(size / 1024);
                     print(" KB)");
                     if size > 5 * 1024 * 1024 {
                         print(" - WARNING: MASSIVE FILE");
@@ -640,27 +640,3 @@ fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str,
     Ok(())
 }
 
-fn print_num(n: usize) {
-    if n == 0 {
-        print("0");
-        return;
-    }
-
-    let mut buf = [0u8; 20];
-    let mut i = 0;
-    let mut num = n;
-
-    while num > 0 {
-        buf[i] = b'0' + (num % 10) as u8;
-        num /= 10;
-        i += 1;
-    }
-
-    while i > 0 {
-        i -= 1;
-        let s = [buf[i]];
-        if let Ok(s) = core::str::from_utf8(&s) {
-            print(s);
-        }
-    }
-}

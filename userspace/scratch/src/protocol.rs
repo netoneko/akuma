@@ -10,7 +10,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libakuma::print;
+use libakuma::{print, print_dec};
 
 use crate::error::{Error, Result};
 use crate::stream::process_pack_streaming;
@@ -252,23 +252,22 @@ impl ProtocolClient {
         download_result?;
         
         print("scratch: downloaded ");
-        print_num(pack_data.len());
+        print_dec(pack_data.len());
         print(" bytes\n");
-        
-        // Parse pack directly from memory
+
         print("scratch: parsing pack file...\n");
-        
+
         let store = ObjectStore::new(git_dir);
         let mut parser = PackParser::new(&pack_data)?;
-        
+
         print("scratch: pack contains ");
-        print_num(parser.object_count() as usize);
+        print_dec(parser.object_count() as usize);
         print(" objects\n");
-        
+
         let shas = parser.parse_all(&store)?;
-        
+
         print("scratch: stored ");
-        print_num(shas.len());
+        print_dec(shas.len());
         print(" objects\n");
         
         Ok(shas.len() as u32)
@@ -404,27 +403,6 @@ fn find_pack_start(data: &[u8]) -> Option<usize> {
         }
     }
     None
-}
-
-fn print_num(n: usize) {
-    if n == 0 {
-        print("0");
-        return;
-    }
-    let mut buf = [0u8; 20];
-    let mut i = 0;
-    let mut val = n;
-    while val > 0 {
-        buf[i] = b'0' + (val % 10) as u8;
-        val /= 10;
-        i += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        if let Ok(s) = core::str::from_utf8(&buf[i..i+1]) {
-            print(s);
-        }
-    }
 }
 
 /// Parse ref discovery response

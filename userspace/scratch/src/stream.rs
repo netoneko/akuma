@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use alloc::vec;
 
 use libakuma::net::{resolve, TcpStream};
-use libakuma::print;
+use libakuma::{print, print_dec};
 use libakuma_tls::transport::TcpTransport;
 use libakuma_tls::{find_headers_end, TlsStream, TLS_RECORD_SIZE};
 
@@ -614,8 +614,7 @@ fn decode_chunked_inplace(data: &mut Vec<u8>) -> Result<()> {
 }
 
 fn print_size_kb(bytes: usize) {
-    let kb = bytes / 1024;
-    print_num(kb);
+    print_dec(bytes / 1024);
     print(" KB");
 }
 
@@ -624,29 +623,7 @@ fn print_speed_kbps(bytes: usize, elapsed_us: u64) {
         print("-- kbps");
         return;
     }
-    // kbps = (bytes / 1024) / (elapsed_us / 1_000_000) = bytes * 1_000_000 / (1024 * elapsed_us)
-    // Simplify to avoid overflow: bytes * 976 / elapsed_us (approx 1000000/1024)
     let kbps = (bytes as u64 * 976) / elapsed_us;
-    print_num(kbps as usize);
+    print_dec(kbps as usize);
     print(" kbps");
-}
-
-fn print_num(n: usize) {
-    if n == 0 {
-        print("0");
-        return;
-    }
-    let mut buf = [0u8; 20];
-    let mut i = 0;
-    let mut val = n;
-    while val > 0 {
-        buf[i] = b'0' + (val % 10) as u8;
-        val /= 10;
-        i += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        let s = core::str::from_utf8(&buf[i..i+1]).unwrap();
-        print(s);
-    }
 }

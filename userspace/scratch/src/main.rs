@@ -43,7 +43,7 @@ mod log;
 
 use alloc::format;
 use alloc::string::String;
-use libakuma::{arg, argc, exit, getcwd, print};
+use libakuma::{arg, argc, exit, getcwd, print, print_dec};
 
 // ============================================================================
 // Working Directory Support
@@ -386,7 +386,9 @@ fn cmd_status() -> i32 {
                     }
                     print("\n");
                 }
-                print(&format!("\n{} file(s) staged\n", idx.len()));
+                print("\n");
+            print_dec(idx.len());
+            print(" file(s) staged\n");
             }
         }
         Err(_) => {
@@ -420,7 +422,9 @@ fn cmd_reset() -> i32 {
                 return 1;
             }
             
-            print(&format!("Unstaged {} file(s).\n", count));
+            print("Unstaged ");
+            print_dec(count);
+            print(" file(s).\n");
             0
         }
         Err(_) => {
@@ -705,7 +709,7 @@ fn cmd_add() -> i32 {
     match idx.save(&git_dir) {
         Ok(()) => {
             print("scratch: staged ");
-            print_num(added_count);
+            print_dec(added_count);
             print(" file(s)\n");
             0
         }
@@ -753,27 +757,3 @@ fn cmd_log() -> i32 {
     }
 }
 
-fn print_num(n: usize) {
-    if n == 0 {
-        print("0");
-        return;
-    }
-
-    let mut buf = [0u8; 20];
-    let mut i = 0;
-    let mut num = n;
-
-    while num > 0 {
-        buf[i] = b'0' + (num % 10) as u8;
-        num /= 10;
-        i += 1;
-    }
-
-    while i > 0 {
-        i -= 1;
-        let s = [buf[i]];
-        if let Ok(s) = core::str::from_utf8(&s) {
-            print(s);
-        }
-    }
-}
