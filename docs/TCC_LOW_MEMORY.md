@@ -11,8 +11,10 @@ settled what does and doesn't move that floor.
 - Size-optimizing that binary cut it **603 KB → 291 KB** (PT_LOAD memsz
   ~500 KB → ~383 KB).
 - **Measured floor: 4.5 MB** for both a `printf` hello and a bare-`write` hello,
-  on the `extreme-size` kernel. 4.0 MB fails to **boot** — so the floor is the
-  kernel, not the compiler or libc.
+  on the `extreme-size` kernel — so the floor is the kernel, not the compiler or
+  libc. *(Update 2026-06-06: the boot floor later dropped — `text_offset = 1 MB`
+  boots at 4.0 MB and a direct tcc compile+run was observed at 4.0 MB after the
+  heap-growth backoff fix; see the compile-floor section.)*
 - musl is sourced from **apk** on both sides (headers at build time, libc on
   Akuma). No in-tree musl build, no shipped `libc.tar`.
 
@@ -62,7 +64,19 @@ SIGSEGV. `-static` links `libc.a` and runs.
 |----:|:---:|:---:|
 | 5.0 MB | ✅ | ✅ |
 | **4.5 MB** | ✅ | ✅ |
-| 4.0 MB | ❌ kernel won't boot | ❌ kernel won't boot |
+| 4.0 MB | ⚠️ see update below | ⚠️ see update below |
+
+> **Update 2026-06-06 — boot floor and direct-tcc floor both moved down.** The
+> `4.0 MB won't boot` row predates two later fixes: (1) the **`text_offset = 1 MB`**
+> change (`docs/LOW_MEMORY_ENVIRONMENT.md` → *floor pushed to 4 MB*) made the
+> `extreme` kernel **boot at 4.0 MB**, and (2) the **heap-growth backoff** fix in
+> `PmmOomHandler::handle_oom` removed a fragmentation `EC=0x3c` abort. With both in
+> place, a **direct `tcc -static` compile + run succeeded at 4.0 MB**
+> (`/akuma-playground/hello.c` → `Hello, Akuma!`, `logs/oomfix/boot_4mb.log`), and
+> 3.0 MB was observed booting to a serving SSH. These are single manual runs — the
+> `our_tcc_floor.py` sweep above should be re-run to harden the new numbers. The
+> "floor = kernel boot floor" conclusion below still holds; the boot floor itself
+> just dropped.
 
 ### What this proves
 
