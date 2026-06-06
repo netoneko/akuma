@@ -4,8 +4,7 @@
 
 use alloc::vec::Vec;
 
-use crate::error::{Error, Result};
-use crate::object::ObjectType;
+use crate::error::Result;
 use crate::sha1::{self, Sha1Hash};
 use crate::store::ObjectStore;
 use crate::zlib;

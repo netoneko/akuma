@@ -103,11 +103,7 @@ impl RefManager {
 
     /// Delete a branch
     pub fn delete_branch_ref(&self, name: &str) -> Result<()> {
-        let path = format!("{}/refs/heads/{}", self.git_dir, name);
-        // We can't actually delete files yet, so we'll just check if it exists
-        // and return an error if not
         let _ = self.read_branch(name)?;
-        // TODO: Actually delete the file when libakuma supports it
         Err(Error::io("file deletion not yet supported"))
     }
 
@@ -137,11 +133,6 @@ impl RefManager {
         let path = format!("{}/{}", dir, ref_name);
         let content = format!("{}\n", sha1::to_hex(sha));
         write_file_content(&path, &content)
-    }
-
-    /// Read a remote-tracking ref
-    pub fn read_remote_ref(&self, remote: &str, ref_name: &str) -> Result<Sha1Hash> {
-        self.resolve_ref(&format!("refs/remotes/{}/{}", remote, ref_name))
     }
 
     /// List all branches

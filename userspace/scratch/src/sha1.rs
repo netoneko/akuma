@@ -3,7 +3,6 @@
 //! Git uses SHA-1 to identify all objects. The hash is computed over:
 //! "{type} {size}\0{content}"
 
-use alloc::format;
 use alloc::string::String;
 
 /// SHA-1 hash (20 bytes)
@@ -13,18 +12,6 @@ pub type Sha1Hash = [u8; 20];
 pub fn hash(data: &[u8]) -> Sha1Hash {
     let digest = sha1_smol::Sha1::from(data).digest();
     digest.bytes()
-}
-
-/// Compute SHA-1 hash of a Git object
-///
-/// Git hashes include a header: "{type} {size}\0"
-pub fn hash_object(object_type: &str, data: &[u8]) -> Sha1Hash {
-    let header = format!("{} {}\0", object_type, data.len());
-    
-    let mut hasher = sha1_smol::Sha1::new();
-    hasher.update(header.as_bytes());
-    hasher.update(data);
-    hasher.digest().bytes()
 }
 
 /// Convert SHA-1 hash to hex string

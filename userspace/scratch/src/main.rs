@@ -32,7 +32,6 @@ mod pktline;
 mod protocol;
 mod http;
 mod stream;
-mod pack_stream;
 mod repository;
 mod commit;
 mod base64;

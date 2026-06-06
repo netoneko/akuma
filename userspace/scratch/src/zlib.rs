@@ -28,13 +28,6 @@ pub fn decompress_header(data: &[u8], out: &mut [u8]) -> Result<(usize, usize)> 
     }
 }
 
-/// Decompress a zlib stream incrementally and pass chunks to a callback.
-pub fn decompress_to_callback<F>(data: &[u8], mut callback: F) -> Result<()> 
-where F: FnMut(&[u8]) -> Result<()> {
-    let mut state = InflateState::new_boxed(DataFormat::Zlib);
-    decompress_with_state_to_callback(&mut state, data, callback)
-}
-
 /// Decompress using an existing state and pass chunks to a callback.
 pub fn decompress_with_state_to_callback<F>(state: &mut InflateState, data: &[u8], mut callback: F) -> Result<()>
 where F: FnMut(&[u8]) -> Result<()> {
@@ -72,13 +65,6 @@ where F: FnMut(&[u8]) -> Result<()> {
 /// Compress data with zlib
 pub fn compress(data: &[u8]) -> Vec<u8> {
     miniz_oxide::deflate::compress_to_vec_zlib(data, 6)
-}
-
-/// Decompress with a size hint for better allocation
-pub fn decompress_with_size(data: &[u8], _expected_size: usize) -> Result<Vec<u8>> {
-    // Just use the standard decompress function
-    // The allocator will handle sizing
-    decompress(data)
 }
 
 /// Decompress and return (decompressed_data, bytes_consumed_from_input)

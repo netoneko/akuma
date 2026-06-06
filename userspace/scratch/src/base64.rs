@@ -9,7 +9,7 @@ const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 
 /// Encode bytes to base64 string
 pub fn encode(data: &[u8]) -> String {
-    let mut result = Vec::with_capacity((data.len() + 2) / 3 * 4);
+    let mut result = Vec::with_capacity(data.len().div_ceil(3) * 4);
     
     let mut i = 0;
     while i + 3 <= data.len() {

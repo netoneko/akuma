@@ -108,11 +108,7 @@ impl GitConfig {
                 let (name, subsection) = if let Some(quote_start) = header.find('"') {
                     let name = String::from(header[..quote_start].trim());
                     let subsection_part = &header[quote_start + 1..];
-                    let subsection = if let Some(quote_end) = subsection_part.find('"') {
-                        Some(String::from(&subsection_part[..quote_end]))
-                    } else {
-                        None
-                    };
+                    let subsection = subsection_part.find('"').map(|quote_end| String::from(&subsection_part[..quote_end]));
                     (name, subsection)
                 } else {
                     (String::from(header.trim()), None)
@@ -140,11 +136,6 @@ impl GitConfig {
         }
 
         Ok(config)
-    }
-
-    /// Save configuration to .git/config
-    pub fn save(&self) -> Result<()> {
-        self.save_to(&crate::git_dir())
     }
 
     /// Save configuration to a specific git directory
@@ -302,21 +293,3 @@ fn write_file(path: &str, content: &str) -> Result<()> {
     Ok(())
 }
 
-// Helper for lowercase comparison
-trait ToLowerStr {
-    fn to_lower(&self) -> String;
-}
-
-impl ToLowerStr for str {
-    fn to_lower(&self) -> String {
-        self.chars()
-            .map(|c| {
-                if c.is_ascii_uppercase() {
-                    (c as u8 + 32) as char
-                } else {
-                    c
-                }
-            })
-            .collect()
-    }
-}

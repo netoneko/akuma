@@ -35,7 +35,7 @@ fn to_relative(path: &str) -> String {
     let cwd = getcwd();
     
     // If path starts with cwd, strip it
-    if let Some(relative) = path.strip_prefix(&cwd) {
+    if let Some(relative) = path.strip_prefix(cwd) {
         let relative = relative.strip_prefix('/').unwrap_or(relative);
         if relative.is_empty() {
             String::from(".")
@@ -296,7 +296,7 @@ impl Index {
                 }
                 
                 subdirs.entry(String::from(dir_name))
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(entry);
             } else {
                 // Entry is at root level - skip if name is empty
@@ -373,7 +373,7 @@ impl Index {
                 }
                 
                 subdirs.entry(String::from(dir_name))
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(*entry);
             } else {
                 // Entry is directly in this directory - skip if name is empty

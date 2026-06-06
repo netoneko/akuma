@@ -152,11 +152,6 @@ impl HttpClient {
         self.get_with_auth(path, None)
     }
 
-    /// Send POST request with body
-    pub fn post(&mut self, path: &str, content_type: &str, body: &[u8]) -> Result<Response> {
-        self.post_with_auth(path, content_type, body, None)
-    }
-
     /// Send POST request with optional authentication
     pub fn post_with_auth(
         &mut self,
@@ -240,10 +235,6 @@ impl HttpClient {
         }
     }
 
-    fn send_request(&mut self, request: &str) -> Result<Response> {
-        self.send_request_with_body(request, &[])
-    }
-
     fn send_request_with_body(&mut self, request: &str, body: &[u8]) -> Result<Response> {
         // Resolve host (uses cache)
         let ip = self.get_ip()?;
@@ -313,13 +304,11 @@ impl HttpClient {
 fn read_http_response(stream: &TcpStream) -> Result<Vec<u8>> {
     let mut response = Vec::new();
     let mut buf = [0u8; 4096];
-    let mut empty_reads = 0u32;
 
     loop {
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                empty_reads = 0;
                 response.extend_from_slice(&buf[..n]);
             }
             Err(ref e) if e.kind == libakuma::net::ErrorKind::WouldBlock ||
@@ -492,12 +481,7 @@ fn decode_chunked(data: &[u8]) -> Result<Vec<u8>> {
 
 /// Find CRLF in data, returns position of \r
 fn find_crlf(data: &[u8]) -> Option<usize> {
-    for i in 0..data.len().saturating_sub(1) {
-        if data[i] == b'\r' && data[i + 1] == b'\n' {
-            return Some(i);
-        }
-    }
-    None
+    (0..data.len().saturating_sub(1)).find(|&i| data[i] == b'\r' && data[i + 1] == b'\n')
 }
 
 // find_headers_end is imported from libakuma_tls
@@ -514,19 +498,3 @@ fn parse_status_line(line: &str) -> Result<u16> {
         .map_err(|_| Error::http("invalid status code"))
 }
 
-// Lowercase helper for no_std
-trait ToLowercase {
-    fn to_lowercase(&self) -> String;
-}
-
-impl ToLowercase for str {
-    fn to_lowercase(&self) -> String {
-        self.chars().map(|c| {
-            if c.is_ascii_uppercase() {
-                (c as u8 + 32) as char
-            } else {
-                c
-            }
-        }).collect()
-    }
-}

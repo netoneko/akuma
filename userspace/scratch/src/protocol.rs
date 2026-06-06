@@ -167,36 +167,6 @@ impl ProtocolClient {
         parse_ref_discovery(&response.body)
     }
 
-    /// Fetch a pack file with the given wants
-    ///
-    /// Returns the raw pack data
-    pub fn fetch_pack(&mut self, wants: &[Sha1Hash], haves: &[Sha1Hash], caps: &Capabilities) -> Result<Vec<u8>> {
-        let path = self.url.upload_pack_url();
-        
-        print("scratch: requesting pack from ");
-        print(&path);
-        print("\n");
-
-        // Build the request body
-        let body = build_upload_pack_request(wants, haves, caps);
-
-        let response = self.client.post(
-            &path,
-            "application/x-git-upload-pack-request",
-            &body,
-        )?;
-
-        if response.status != 200 {
-            return Err(Error::http(&format!("status {}", response.status)));
-        }
-
-        // Parse the response
-        // It's either:
-        // 1. Side-band multiplexed data (if we requested side-band)
-        // 2. NAK + pack data directly
-        parse_upload_pack_response(&response.body, caps)
-    }
-
     /// Fetch pack with streaming - downloads to memory, then parses
     /// Returns the number of objects parsed
     pub fn fetch_pack_streaming(
@@ -326,8 +296,7 @@ impl SidebandState {
             let len_hex = &self.buffer[..4];
 
             // All 4 bytes must be ASCII hex digits
-            let valid_hex = len_hex.iter().all(|b| matches!(b,
-                b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'));
+            let valid_hex = len_hex.iter().all(u8::is_ascii_hexdigit);
 
             if !valid_hex {
                 // Not a pkt-line. Scan for PACK magic to resynchronize.
@@ -501,60 +470,6 @@ fn build_upload_pack_request(wants: &[Sha1Hash], haves: &[Sha1Hash], caps: &Capa
     body.extend_from_slice(&pktline::write_pkt_line(b"done\n"));
 
     body
-}
-
-/// Parse upload-pack response
-fn parse_upload_pack_response(data: &[u8], caps: &Capabilities) -> Result<Vec<u8>> {
-    let mut pos = 0;
-
-    // First, read any NAK/ACK lines
-    while pos < data.len() {
-        let (content, consumed) = pktline::read_pkt_line(&data[pos..])?;
-        pos += consumed;
-
-        match content {
-            None => {
-                // Flush packet - pack data follows
-                break;
-            }
-            Some(line) => {
-                let line_str = pktline::line_to_str(line).unwrap_or("");
-                if line_str == "NAK" {
-                    // Continue to read pack
-                    continue;
-                }
-                if line_str.starts_with("ACK") {
-                    // Continue with multi_ack
-                    continue;
-                }
-                // Might be start of pack data
-                if line.starts_with(b"PACK") || (line.len() > 0 && line[0] <= 3) {
-                    // This is already pack data (or sideband)
-                    pos -= consumed; // Rewind
-                    break;
-                }
-            }
-        }
-    }
-
-    let remaining = &data[pos..];
-
-    // Check if it's sideband multiplexed
-    if caps.side_band || caps.side_band_64k {
-        let (pack_data, messages) = pktline::demux_sideband(remaining)?;
-        
-        // Print progress messages
-        for msg in messages {
-            print("remote: ");
-            print(&msg);
-            print("\n");
-        }
-        
-        Ok(pack_data)
-    } else {
-        // Raw pack data
-        Ok(remaining.to_vec())
-    }
 }
 
 // ============================================================================
@@ -792,16 +707,11 @@ fn parse_receive_pack_response(data: &[u8], caps: &ReceiveCapabilities) -> Resul
                     // Data channel - parse status
                     let payload = &line[1..];
                     if let Ok(status) = core::str::from_utf8(payload) {
-                        if status.starts_with("unpack ok") {
+                        if status.starts_with("unpack ok") || status.starts_with("ok ") {
                             // Good
-                        } else if status.starts_with("unpack ") {
+                        } else if status.starts_with("unpack ") || status.starts_with("ng ") {
                             had_error = true;
                             error_msg = String::from(status);
-                        } else if status.starts_with("ng ") {
-                            had_error = true;
-                            error_msg = String::from(status);
-                        } else if status.starts_with("ok ") {
-                            // Ref updated successfully
                         }
                     }
                 }
@@ -827,10 +737,7 @@ fn parse_receive_pack_response(data: &[u8], caps: &ReceiveCapabilities) -> Resul
                 let status = status.trim();
                 if status.starts_with("unpack ok") {
                     // Good
-                } else if status.starts_with("unpack ") {
-                    had_error = true;
-                    error_msg = String::from(status);
-                } else if status.starts_with("ng ") {
+                } else if status.starts_with("unpack ") || status.starts_with("ng ") {
                     had_error = true;
                     error_msg = String::from(status);
                 } else if status.starts_with("ok ") {

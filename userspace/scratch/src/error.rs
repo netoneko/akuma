@@ -5,7 +5,6 @@ use alloc::string::String;
 /// Error type for Git operations
 #[derive(Debug, Clone)]
 pub struct Error {
-    kind: ErrorKind,
     message: String,
 }
 
@@ -42,9 +41,8 @@ pub enum ErrorKind {
 }
 
 impl Error {
-    pub fn new(kind: ErrorKind, message: &str) -> Self {
+    pub fn new(_kind: ErrorKind, message: &str) -> Self {
         Self {
-            kind,
             message: String::from(message),
         }
     }
@@ -103,10 +101,6 @@ impl Error {
 
     pub fn delta_base_not_found() -> Self {
         Self::new(ErrorKind::DeltaBaseNotFound, "delta base not found")
-    }
-
-    pub fn kind(&self) -> ErrorKind {
-        self.kind
     }
 
     pub fn message(&self) -> &str {

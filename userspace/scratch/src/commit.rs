@@ -295,16 +295,14 @@ fn merge_subtree_with_staged(
             } else {
                 new_entries.push(parent_entry.clone());
             }
+        } else if let Some(staged_entry) = staged_files.get(&parent_entry.name) {
+            new_entries.push(TreeEntry {
+                mode: staged_entry.mode,
+                name: parent_entry.name.clone(),
+                sha: staged_entry.sha,
+            });
         } else {
-            if let Some(staged_entry) = staged_files.get(&parent_entry.name) {
-                new_entries.push(TreeEntry {
-                    mode: staged_entry.mode,
-                    name: parent_entry.name.clone(),
-                    sha: staged_entry.sha,
-                });
-            } else {
-                new_entries.push(parent_entry.clone());
-            }
+            new_entries.push(parent_entry.clone());
         }
     }
     

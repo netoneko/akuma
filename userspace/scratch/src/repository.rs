@@ -631,7 +631,7 @@ fn checkout_tree_recursive(store: &ObjectStore, tree_sha: &Sha1Hash, dest: &str,
             }
 
             *file_count += 1;
-            if *file_count % 50 == 0 {
+            if (*file_count).is_multiple_of(50) {
                 print(".");
             }
         }

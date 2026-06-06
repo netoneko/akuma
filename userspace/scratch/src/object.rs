@@ -51,15 +51,6 @@ impl ObjectType {
         }
     }
 
-    pub fn from_pack_type(t: u8) -> Option<Self> {
-        match t {
-            1 => Some(ObjectType::Commit),
-            2 => Some(ObjectType::Tree),
-            3 => Some(ObjectType::Blob),
-            4 => Some(ObjectType::Tag),
-            _ => None,
-        }
-    }
 }
 
 /// A Git object (parsed)
@@ -145,14 +136,6 @@ impl Object {
         }
     }
 
-    /// Get as blob content
-    pub fn as_blob(&self) -> Result<&[u8]> {
-        match self {
-            Object::Blob(data) => Ok(data),
-            _ => Err(Error::invalid_object("expected blob")),
-        }
-    }
-
     /// Get as tree
     pub fn as_tree(&self) -> Result<&Tree> {
         match self {
@@ -185,11 +168,6 @@ impl TreeEntry {
     /// Check if this entry is a directory (tree)
     pub fn is_dir(&self) -> bool {
         self.mode == 40000 || self.mode == 0o040000
-    }
-
-    /// Check if this entry is a regular file
-    pub fn is_file(&self) -> bool {
-        self.mode == 100644 || self.mode == 100755 || self.mode == 0o100644 || self.mode == 0o100755
     }
 
     /// Check if this entry is a submodule (gitlink)

@@ -41,7 +41,7 @@ impl PackObjectType {
         }
     }
 
-    pub fn to_object_type(&self) -> Option<ObjectType> {
+    pub fn to_object_type(self) -> Option<ObjectType> {
         match self {
             PackObjectType::Commit => Some(ObjectType::Commit),
             PackObjectType::Tree => Some(ObjectType::Tree),
@@ -73,7 +73,6 @@ pub struct PackParser<'a> {
     data: &'a [u8],
     pos: usize,
     object_count: u32,
-    version: u32,
 }
 
 impl<'a> PackParser<'a> {
@@ -101,7 +100,6 @@ impl<'a> PackParser<'a> {
             data,
             pos: 12, // Skip header
             object_count,
-            version,
         })
     }
 
@@ -447,7 +445,7 @@ fn parse_copy_instruction(cmd: u8, data: &[u8]) -> Result<(usize, usize, usize)>
 
     // Offset bytes (little-endian)
     if cmd & 0x01 != 0 {
-        offset |= (data[pos] as usize) << 0;
+        offset |= data[pos] as usize;
         pos += 1;
     }
     if cmd & 0x02 != 0 {
@@ -465,7 +463,7 @@ fn parse_copy_instruction(cmd: u8, data: &[u8]) -> Result<(usize, usize, usize)>
 
     // Size bytes (little-endian)
     if cmd & 0x10 != 0 {
-        size |= (data[pos] as usize) << 0;
+        size |= data[pos] as usize;
         pos += 1;
     }
     if cmd & 0x20 != 0 {
