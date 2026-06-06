@@ -1583,3 +1583,63 @@ Verified post-`text_offset` change (June 2026):
 `IMAGE_RESERVE` auto-tracks the binary via `linker.ld` (`STACK_BOTTOM - KERNEL_PHYS_BASE`);
 no per-profile constant to maintain. All three profiles also pass `cargo check` and the
 47 ext2 + 4 ELF-boundary host unit tests.
+
+## HTTPS git clone at 4 MB — the scratch path (planned)
+
+**Goal:** clone a git repository over HTTPS onto the machine within the 4 MB boot
+floor, without loading the full packfile into RAM.
+
+**Why it fits.** The git smart HTTP protocol is two sequential HTTP requests:
+
+1. `GET /info/refs?service=git-upload-pack` — tiny response (ref list)
+2. `POST /git-upload-pack` — client sends want/have negotiation; server streams a packfile
+
+Both are amenable to the file-backed streaming pattern already established by meow's
+`post_from_fd` (streaming the request body from an fd) and the `FileWriter` pattern in
+the kernel curl command (streaming the response body directly to disk in 8 KB chunks).
+The want/have negotiation payload is small (a few KB of text); only the packfile
+response is large, and it can be written incrementally to ext2 without ever being
+fully resident in RAM.
+
+**RAM budget at 4 MB extreme:**
+
+| Component | Cost |
+|---|---|
+| embedded-tls record buffers (2 × 16 KB) | ~32 KB |
+| 8 KB streaming read chunk | 8 KB |
+| Stack + process overhead | < 512 KB |
+| **Total** | **< 1 MB** |
+
+Leaves > 1.8 MB free at the 4 MB floor — well above what the kernel needs to stay
+responsive.
+
+**The pieces already in place:**
+
+- `userspace/libakuma-tls` — userspace TLS (embedded-tls) over plain TCP sockets;
+  `post_from_fd` streams a POST body from an open fd without buffering
+- `userspace/libakuma` — `read_fd`, `TcpStream`, ext2-backed file I/O via syscalls
+- Kernel ext2 VFS — append writes, so the packfile can land incrementally on disk
+- meow's `FileWriter` pattern — 8 KB streaming response → disk, no in-memory
+  accumulation
+
+**What scratch needs to add:**
+
+1. `GET /info/refs` → parse the ref list from the streaming response (line-at-a-time,
+   no full buffer needed)
+2. Build the want/have pkt-line payload in memory (small; a few refs × ~50 bytes)
+3. Write it to a temp file; `POST /git-upload-pack` via `post_from_fd` → stream the
+   packfile response directly to disk
+4. On-disk pack index resolution and object extraction (ext2 as the working buffer)
+
+**Why the kernel's TLS stack is not used here.** The kernel has its own `embedded-tls`
+in `crates/akuma-net` for in-kernel HTTPS (the shell `curl` command), but scratch is a
+userspace binary. Userspace TLS lives in `libakuma-tls` and runs in the process, not
+the kernel. There is no kTLS-style offload (no `SOL_TLS` setsockopt), so sendfile/
+splice would not bypass TLS encryption — the streaming read loop is the right approach.
+
+**Relation to the kernel TLS duplication.** The kernel's built-in HTTPS (and its
+~58 KB of `embedded-tls` symbols) can be gated off (`tls-rsa` feature + disabling the
+HTTPS branch in the kernel curl command) without affecting SSH (which uses a separate
+`akuma-ssh-crypto` stack) or scratch (which is userspace). Doing so recovers ~58 KB
+from the kernel image and eliminates the duplicate TLS stack, at the cost of requiring
+a userspace tool for any HTTPS the kernel shell needs.
