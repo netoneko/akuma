@@ -36,4 +36,5 @@ lto = true
 opt-level = "z"        # optimize for size (smallest code); userspace is mostly I/O-bound
 codegen-units = 1      # better cross-unit optimization under LTO, smaller output
 strip = true           # drop symbol tables from the shipped ELF
+overflow-checks = false # no checked-arith branches; reduces code size and frame depth
 

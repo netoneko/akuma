@@ -14,15 +14,17 @@ use alloc::vec::Vec;
 use alloc::vec;
 
 use libakuma::net::{TcpListener, TcpStream, Error, Shutdown};
-use libakuma::{print, open, read_fd, write_fd, fstat, close, open_flags, lseek, seek_mode};
-use libakuma::{spawn_with_env, waitpid, unlink};
+use libakuma::{print, open, read_fd, fstat, close, open_flags, lseek, seek_mode};
+use libakuma::{spawn_with_env, waitpid};
+#[cfg(feature = "cgi-log")]
+use libakuma::write_fd;
 
 const HTTP_PORT: u16 = 8080;
 
 /// CGI: reset idle timer after any data; bail if idle for this long
-const CGI_IDLE_TIMEOUT_MS: u32 = 60_000;
+const CGI_IDLE_TIMEOUT_MS: u32 = 60_000*3;
 /// CGI: hard wall-clock limit regardless of activity
-const CGI_WALL_TIMEOUT_MS: u32 = 300_000;
+const CGI_WALL_TIMEOUT_MS: u32 = 60_000*10;
 /// I/O chunk size for CGI reads and body streaming
 const CGI_BUF: usize = 4096;
 /// Max bytes to read from the temp file when scanning for CGI headers
@@ -61,7 +63,7 @@ pub extern "C" fn main() {
 }
 
 fn handle_connection(stream: TcpStream) {
-    let mut buf = [0u8; 8192];
+    let mut buf = alloc::vec![0u8; 8192];
     let n = match stream.read(&mut buf) {
         Ok(n) => n,
         Err(_) => return,
@@ -359,9 +361,12 @@ fn parse_path_and_query(path: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Handle a CGI request.
-/// CGI output is spooled to /tmp/cgi_<pid>.out (file-based, no heap Vec),
-/// then streamed to the client chunk by chunk.
+/// Handle a CGI request with streaming output.
+///
+/// Phase 1: buffer CGI output until the header/body boundary is found, then
+/// send HTTP response headers and flush any already-buffered body bytes.
+/// Phase 2: pipe remaining CGI stdout directly to the HTTP client as it arrives.
+/// No temp file — output reaches the client as soon as the CGI script writes it.
 fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str, body: Option<&[u8]>) {
     let (script_path, query_string) = parse_path_and_query(path);
     let fs_path = format!("/public{}", script_path);
@@ -380,7 +385,6 @@ fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str, body: Option
     let interpreter = get_interpreter(&fs_path);
     let query_str = query_string.unwrap_or("");
 
-    // Standard CGI environment variables
     let method_env = format!("REQUEST_METHOD={}", method);
     let query_env = format!("QUERY_STRING={}", query_str);
     let cgi_env: &[&str] = &[method_env.as_str(), query_env.as_str()];
@@ -401,134 +405,142 @@ fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str, body: Option
         }
     };
 
-    // Spool CGI stdout to a temp file — never buffers the whole response in heap
-    let tmp_path = format!("/tmp/cgi_{}.out", result.pid);
-    let tmp_fd = open(
-        &tmp_path,
-        open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC,
-    );
-    if tmp_fd < 0 {
-        let _ = send_error(stream, 500, "Internal Server Error");
-        return;
-    }
-
-    let mut io_buf = [0u8; CGI_BUF];
-    let mut process_exited = false;
+    let stdout = result.stdout_fd as i32;
+    let mut io_buf = alloc::vec![0u8; CGI_BUF];
     let mut idle_ms: u32 = 0;
     let mut total_ms: u32 = 0;
 
-    loop {
-        // Drain all available data from CGI stdout
-        let mut got_data = false;
-        loop {
-            let n = read_fd(result.stdout_fd as i32, &mut io_buf);
-            if n > 0 {
-                write_fd(tmp_fd, &io_buf[..n as usize]);
-                got_data = true;
-            } else {
-                break;
-            }
-        }
+    #[cfg(feature = "cgi-log")]
+    let tmp_path = alloc::format!("/tmp/cgi_{}.out", result.pid);
+    #[cfg(feature = "cgi-log")]
+    let tmp_fd = open(&tmp_path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
 
-        if got_data {
+    // Phase 1: accumulate output until the CGI header/body boundary appears.
+    let mut header_buf: Vec<u8> = Vec::new();
+    let mut body_offset: usize = 0;
+    let mut process_exited = false;
+    let mut timed_out = false;
+
+    'header: loop {
+        let n = read_fd(stdout, &mut io_buf);
+        if n > 0 {
             idle_ms = 0;
-        }
-
-        // Check if process exited
-        if let Some(_) = waitpid(result.pid) {
-            process_exited = true;
-            // Final drain
-            loop {
-                let n = read_fd(result.stdout_fd as i32, &mut io_buf);
-                if n <= 0 { break; }
-                write_fd(tmp_fd, &io_buf[..n as usize]);
+            header_buf.extend_from_slice(&io_buf[..n as usize]);
+            #[cfg(feature = "cgi-log")]
+            if tmp_fd >= 0 { write_fd(tmp_fd, &io_buf[..n as usize]); }
+            if let Some(off) = cgi_boundary(&header_buf) {
+                body_offset = off;
+                break 'header;
             }
-            break;
+            if header_buf.len() >= CGI_HEADER_SCAN {
+                break 'header; // no CGI headers — treat whole buffer as body
+            }
+        } else {
+            if let Some(_) = waitpid(result.pid) {
+                process_exited = true;
+                loop {
+                    let n = read_fd(stdout, &mut io_buf);
+                    if n <= 0 { break; }
+                    header_buf.extend_from_slice(&io_buf[..n as usize]);
+                    #[cfg(feature = "cgi-log")]
+                    if tmp_fd >= 0 { write_fd(tmp_fd, &io_buf[..n as usize]); }
+                }
+                if let Some(off) = cgi_boundary(&header_buf) {
+                    body_offset = off;
+                }
+                break 'header;
+            }
+            if idle_ms >= CGI_IDLE_TIMEOUT_MS || total_ms >= CGI_WALL_TIMEOUT_MS {
+                timed_out = true;
+                break 'header;
+            }
+            libakuma::sleep_ms(1);
+            idle_ms += 1;
+            total_ms += 1;
         }
-
-        if idle_ms >= CGI_IDLE_TIMEOUT_MS || total_ms >= CGI_WALL_TIMEOUT_MS {
-            break;
-        }
-
-        libakuma::sleep_ms(1);
-        idle_ms += 1;
-        total_ms += 1;
     }
 
-    close(result.stdout_fd as i32);
-    close(tmp_fd);
-
-    if !process_exited {
-        unlink(&tmp_path);
+    if timed_out {
+        close(stdout);
         let _ = send_error(stream, 504, "Gateway Timeout");
         return;
     }
 
-    // Parse CGI headers from the start of the temp file
-    let header_fd = open(&tmp_path, open_flags::O_RDONLY);
-    if header_fd < 0 {
-        let _ = send_error(stream, 500, "Internal Server Error");
-        return;
-    }
+    let (content_type, _) = parse_cgi_headers(&header_buf);
 
-    let mut scan_buf = [0u8; CGI_HEADER_SCAN];
-    let scan_n = read_fd(header_fd, &mut scan_buf);
-    close(header_fd);
-
-    let scan_bytes = if scan_n > 0 { &scan_buf[..scan_n as usize] } else { &[] };
-    let (content_type, body_offset) = parse_cgi_headers(scan_bytes);
-
-    // Compute body size from temp file stat
-    let stat_fd = open(&tmp_path, open_flags::O_RDONLY);
-    if stat_fd < 0 {
-        unlink(&tmp_path);
-        let _ = send_error(stream, 500, "Internal Server Error");
-        return;
-    }
-    let file_size = match fstat(stat_fd) {
-        Ok(s) => s.st_size as i64,
-        Err(_) => {
-            close(stat_fd);
-            unlink(&tmp_path);
-            let _ = send_error(stream, 500, "Internal Server Error");
-            return;
-        }
-    };
-    close(stat_fd);
-
-    let body_size = (file_size - body_offset as i64).max(0) as u64;
-
-    // Send HTTP response headers
+    // Send HTTP response headers — no Content-Length since we stream
     let date = format_time_rfc1123(libakuma::time());
     let http_header = format!(
         "HTTP/1.0 200 OK\r\n\
          Date: {}\r\n\
          Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n",
-        date, content_type, body_size
+        date, content_type
     );
     if stream.write_all(http_header.as_bytes()).is_err() {
-        unlink(&tmp_path);
+        close(stdout);
         return;
     }
 
-    // Stream body from temp file in 4 KB chunks — heap peak = one buffer
-    let body_fd = open(&tmp_path, open_flags::O_RDONLY);
-    if body_fd >= 0 {
-        lseek(body_fd, body_offset as i64, seek_mode::SEEK_SET);
-        let mut send_buf = [0u8; CGI_BUF];
-        loop {
-            let n = read_fd(body_fd, &mut send_buf);
-            if n <= 0 { break; }
-            if stream.write_all(&send_buf[..n as usize]).is_err() { break; }
+    // Flush body bytes already in the header buffer
+    if body_offset < header_buf.len() {
+        if stream.write_all(&header_buf[body_offset..]).is_err() {
+            close(stdout);
+            return;
         }
-        close(body_fd);
     }
 
+    // Phase 2: stream remaining CGI output directly to the client
+    if !process_exited {
+        idle_ms = 0;
+        loop {
+            let n = read_fd(stdout, &mut io_buf);
+            if n > 0 {
+                idle_ms = 0;
+                #[cfg(feature = "cgi-log")]
+                if tmp_fd >= 0 { write_fd(tmp_fd, &io_buf[..n as usize]); }
+                if stream.write_all(&io_buf[..n as usize]).is_err() {
+                    break;
+                }
+            } else {
+                if let Some(_) = waitpid(result.pid) {
+                    break;
+                }
+                if idle_ms >= CGI_IDLE_TIMEOUT_MS || total_ms >= CGI_WALL_TIMEOUT_MS {
+                    break;
+                }
+                libakuma::sleep_ms(1);
+                idle_ms += 1;
+                total_ms += 1;
+            }
+        }
+    }
+
+    close(stdout);
+    #[cfg(feature = "cgi-log")]
+    if tmp_fd >= 0 { close(tmp_fd); }
     let _ = stream.shutdown(Shutdown::Write);
-    unlink(&tmp_path);
+}
+
+fn cgi_boundary(data: &[u8]) -> Option<usize> {
+    // scan as bytes to avoid UTF-8 conversion overhead on each chunk
+    let len = data.len();
+    if len >= 4 {
+        for i in 0..len - 3 {
+            if data[i] == b'\r' && data[i+1] == b'\n' && data[i+2] == b'\r' && data[i+3] == b'\n' {
+                return Some(i + 4);
+            }
+        }
+    }
+    if len >= 2 {
+        for i in 0..len - 1 {
+            if data[i] == b'\n' && data[i+1] == b'\n' {
+                return Some(i + 2);
+            }
+        }
+    }
+    None
 }
 
 /// Find the CGI header/body boundary in the first scan_bytes of output.

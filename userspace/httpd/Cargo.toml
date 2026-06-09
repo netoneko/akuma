@@ -7,5 +7,9 @@ edition = "2021"
 name = "httpd"
 path = "src/main.rs"
 
+[features]
+default = ["cgi-log"]
+cgi-log = []
+
 [dependencies]
 libakuma = { path = "../libakuma" }
