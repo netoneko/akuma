@@ -304,6 +304,43 @@ pub const MMAP_FILE_BACKED_LAZY: bool = true;
 /// rarely needed.
 pub const KERNEL_HEAP_SIZE_MB: usize = 0;
 
+/// Clamp (in **MiB**) on the RAM size used to compute the kernel's *own*
+/// reserves — `code_and_stack` (the `ram/16` term) and the auto heap size. The
+/// user-page pool, PMM, thread limit and user-stack sizing always use the REAL
+/// detected RAM. `0` = no clamp (reserves scale with real RAM, the historical
+/// behaviour).
+///
+/// On the **extreme** profile we clamp to 4 MiB: the kernel boots and idles in
+/// ~2 MB of code+stack and a 512 KB seed heap (which grows on demand from PMM),
+/// so giving the box more RAM no longer inflates kernel overhead — the surplus
+/// all lands in the user-page pool. This is what lets a 64 MB box hand ~62 MB
+/// (instead of 52 MB) to userspace for LLM weights (e.g. llama.cpp models).
+/// The kernel still *sees* and uses the real RAM; only its internal reserve math
+/// is pinned to the small-machine numbers it was tuned for.
+#[cfg(kernel_profile_extreme)]
+pub const MEM_CALC_CLAMP_MB: usize = 4;
+#[cfg(not(kernel_profile_extreme))]
+pub const MEM_CALC_CLAMP_MB: usize = 0;
+
+/// Floor (bytes) on the `code_and_stack` region — guarantees the kernel binary
+/// always fits even when `ram/16` and the boot-stack cover are both small. On
+/// **extreme** this is 0: the boot-stack cover is the effective floor, handing
+/// the slack back to the user-page pool (lets repeated tcc fit below 6 MB).
+/// Consumed by `crate::compute_memory_layout`.
+#[cfg(kernel_profile_extreme)]
+pub const MIN_CODE_AND_STACK_BYTES: usize = 0;
+#[cfg(not(kernel_profile_extreme))]
+pub const MIN_CODE_AND_STACK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Slack (bytes) reserved ABOVE the boot-stack top before the heap. The boot
+/// stack grows DOWN (away from the heap), so this is pure paranoia — the boot
+/// layout sanity guard enforces `boot_stack_top <= heap_start` unconditionally.
+/// **extreme** trims it to 64 KB (vs 1 MB) to free user pages.
+#[cfg(kernel_profile_extreme)]
+pub const STACK_GUARD_BYTES: usize = 64 * 1024;
+#[cfg(not(kernel_profile_extreme))]
+pub const STACK_GUARD_BYTES: usize = 1024 * 1024;
+
 /// Below this detected-RAM threshold (MiB), skip the resource-heavy boot
 /// self-tests (parallel multi-process / FP-across-preemption) that need to spawn
 /// several processes at once — they can't fit on tiny machines and would halt the

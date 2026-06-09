@@ -232,6 +232,71 @@ fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
 ///   memory left after code+stack**, so user pages always survive. The old code
 ///   used a flat 64 MB floor here, which left 0 user pages below ~72 MB (no boot)
 ///   and starved user RAM at 128 MB.
+/// Kernel physical-RAM layout: three contiguous regions starting at `ram_base`
+/// — `[.. heap_start)` code+boot-stack, `[heap_start ..)` heap, then user pages.
+pub(crate) struct MemoryLayout {
+    pub code_and_stack: usize,
+    pub heap_start: usize,
+    pub heap_size: usize,
+    pub user_pages_start: usize,
+    pub user_pages_size: usize,
+}
+
+/// Compute the kernel memory layout for a detected RAM region.
+///
+/// All profile-specific policy lives in `config` (`MIN_CODE_AND_STACK_BYTES`,
+/// `STACK_GUARD_BYTES`, `MEM_CALC_CLAMP_MB`) rather than inline `#[cfg]` in the
+/// boot path, so the layout is one pure, unit-testable function
+/// (`tests::test_compute_memory_layout`).
+///
+/// CRITICAL: `code_and_stack` must cover the *boot stack* (`boot_stack_top` =
+/// the STACK_TOP linker symbol, absolute VA of the initial SP), or the heap is
+/// placed atop the live boot stack and the allocator hands out the stack's own
+/// pages under pressure — kernel-corrupts-kernel (the EC=0x21/0x22 crash; see
+/// docs/STACK_CORRUPTION_ANALYSIS.md). The boot layout sanity guard in
+/// `kernel_main` re-verifies the result before any allocation.
+///
+/// `calc_ram` (see `reserve_calc_ram`) sizes only the kernel's OWN reserves;
+/// `user_pages_size` is always carved from the REAL `ram_size`.
+pub(crate) fn compute_memory_layout(
+    ram_base: usize,
+    ram_size: usize,
+    boot_stack_top: usize,
+) -> MemoryLayout {
+    let stack_cover = (boot_stack_top - ram_base) + config::STACK_GUARD_BYTES;
+    let calc_ram = reserve_calc_ram(ram_size, config::MEM_CALC_CLAMP_MB);
+    let code_and_stack = core::cmp::max(
+        core::cmp::max(calc_ram / 16, config::MIN_CODE_AND_STACK_BYTES),
+        stack_cover,
+    );
+    let heap_start = ram_base + code_and_stack;
+    let heap_size = compute_heap_size(calc_ram, code_and_stack);
+    let user_pages_start = heap_start + heap_size;
+    let user_pages_size = ram_size.saturating_sub(code_and_stack + heap_size);
+    MemoryLayout {
+        code_and_stack,
+        heap_start,
+        heap_size,
+        user_pages_start,
+        user_pages_size,
+    }
+}
+
+/// RAM size used to compute the kernel's own reserves (code+stack, heap).
+///
+/// `clamp_mb == 0` → return the real `ram_size` (historical behaviour, used on
+/// release/size). Otherwise cap at `clamp_mb` MiB, so on a big box the kernel's
+/// reserve math stays pinned to the small-machine numbers it was tuned for and
+/// the surplus RAM flows to the user-page pool. See `config::MEM_CALC_CLAMP_MB`.
+/// Pure so it can be unit-tested (see `tests::test_reserve_calc_ram`).
+pub(crate) fn reserve_calc_ram(ram_size: usize, clamp_mb: usize) -> usize {
+    if clamp_mb != 0 {
+        core::cmp::min(ram_size, clamp_mb * 1024 * 1024)
+    } else {
+        ram_size
+    }
+}
+
 pub(crate) fn compute_heap_size(ram_size: usize, code_and_stack: usize) -> usize {
     const MB: usize = 1024 * 1024;
     if config::KERNEL_HEAP_SIZE_MB != 0 {
@@ -364,53 +429,18 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     let (ram_base, ram_size) = detect_memory(dtb_ptr);
 
-    // Memory layout constants.
-    //
-    // CRITICAL: `code_and_stack` must cover the *boot stack*, or the kernel heap
-    // is placed on top of the live boot stack and the heap allocator hands out
-    // the stack's own pages under memory pressure — kernel-corrupts-kernel
-    // (the MMU can't protect the kernel from itself). This is the Thread0
-    // EC=0x21/0x22 stack-corruption crash seen at MEMORY=64 (see
-    // docs/PMM_DOUBLE_FREE_AND_EL1_CRASH.md, docs/STACK_CORRUPTION_ANALYSIS.md).
-    //
-    // boot_stack_top is the STACK_TOP linker symbol read above (= STACK_BOTTOM +
-    // 1 MB boot stack, derived from the linked image size in linker.ld).
-    //
-    // Reserve through the boot stack top plus a 1 MB guard so the heap can never
-    // reach the stack regardless of RAM size.
-    // MIN_CODE_AND_STACK: floor so the kernel binary always fits, even if RAM
-    // is very large (where stack_cover = fixed offset + guard is small relative
-    // to ram/16).  The actual cover is computed as stack_cover below and
-    // dominates on small RAM.
-    //
-    // STACK_GUARD is slack reserved ABOVE the boot stack top before the heap.
-    // The boot stack grows DOWN (toward the kernel, away from the heap that sits
-    // above it), so this margin is pure paranoia — the layout sanity guard below
-    // enforces BOOT_STACK_TOP <= heap_start unconditionally. extreme-size trims
-    // both the guard and the MIN floor to hand ~1 MB back to the user-page pool,
-    // which is what lets repeated tcc fit below 6 MB (see docs / memory note).
-    #[cfg(kernel_profile_extreme)]
-    const MIN_CODE_AND_STACK: usize = 0; // stack_cover is the effective floor
-    #[cfg(not(kernel_profile_extreme))]
-    const MIN_CODE_AND_STACK: usize = 4 * 1024 * 1024;
-    #[cfg(kernel_profile_extreme)]
-    const STACK_GUARD: usize = 64 * 1024;
-    #[cfg(not(kernel_profile_extreme))]
-    const STACK_GUARD: usize = 1024 * 1024;
-    let stack_cover = (boot_stack_top - ram_base) + STACK_GUARD; // through stack top + guard
-
-    // Memory layout:
-    // - Code + Stack: max(1/16 of RAM, 8MB floor, boot-stack cover) - kernel binary and boot stack
-    // - Heap: see compute_heap_size() - kernel data structures
-    // - User pages: remaining - for user processes
-    let code_and_stack = core::cmp::max(
-        core::cmp::max(ram_size / 16, MIN_CODE_AND_STACK),
-        stack_cover,
-    );
-    let heap_start = ram_base + code_and_stack;
-    let heap_size = compute_heap_size(ram_size, code_and_stack);
-    let user_pages_start = heap_start + heap_size;
-    let user_pages_size = ram_size.saturating_sub(code_and_stack + heap_size);
+    // Memory layout. All the policy (boot-stack cover, code+stack floor, the
+    // extreme reserve-RAM clamp) lives in `compute_memory_layout` + `config`, so
+    // the boot path here is just "compute, then verify". The sanity guard below
+    // re-checks the result before any allocation — a wrong reserve constant must
+    // refuse to boot rather than silently corrupt kernel memory under load.
+    let MemoryLayout {
+        code_and_stack,
+        heap_start,
+        heap_size,
+        user_pages_start,
+        user_pages_size,
+    } = compute_memory_layout(ram_base, ram_size, boot_stack_top);
 
     // ---- Layout sanity guard (runs AFTER all region calculations) ----
     // The kernel address space is laid out as three contiguous regions:
@@ -472,7 +502,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print_hex(ram_base as u64);
     console::print(" - 0x");
     console::print_hex(heap_start as u64);
-    console::print(") [stack-cover+1MB guard]\n");
+    console::print(") [stack-cover + guard]\n");
 
     console::print("Heap:       ");
     console::print_dec(heap_size / 1024 / 1024);

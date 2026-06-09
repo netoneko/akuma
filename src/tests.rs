@@ -112,6 +112,8 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_kernel_identity_mapping_full_ram, "kernel_identity_mapping_full_ram");
     run_test!(test_boot_map_covers_full_ram, "boot_map_covers_full_ram");
     run_test!(test_compute_heap_size, "compute_heap_size");
+    run_test!(test_reserve_calc_ram, "reserve_calc_ram");
+    run_test!(test_compute_memory_layout, "compute_memory_layout");
     run_test!(test_compute_thread_limit, "compute_thread_limit");
     run_test!(test_mmap_does_not_overlap_identity_map, "mmap_does_not_overlap_identity_map");
 
@@ -3977,6 +3979,92 @@ fn test_compute_heap_size() -> bool {
         }
         if h < 4 * MB {
             crate::safe_print!(96, "  FAIL: {}MB RAM -> heap {}MB below 4MB floor\n", ram_mb, h / MB);
+            pass = false;
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify the reserve-RAM clamp (`crate::reserve_calc_ram`): with clamp 0 it is
+/// the identity (release/size behaviour preserved); with a non-zero clamp it caps
+/// the value used for the kernel's own reserves while never inflating a
+/// small-RAM box. Also checks the intended end-to-end effect: on a large box a
+/// clamp leaves strictly more user pages than no clamp.
+fn test_reserve_calc_ram() -> bool {
+    console::print("\n[TEST] reserve_calc_ram clamp\n");
+    const MB: usize = 1024 * 1024;
+    let mut pass = true;
+
+    // clamp == 0 is the identity for every RAM size.
+    for &ram_mb in &[4usize, 8, 16, 64, 256, 1024] {
+        let r = ram_mb * MB;
+        if crate::reserve_calc_ram(r, 0) != r {
+            crate::safe_print!(80, "  FAIL: clamp 0 changed {}MB\n", ram_mb);
+            pass = false;
+        }
+    }
+
+    // clamp == 4: cap above 4MB, untouched at/below 4MB (never inflate).
+    let cases: &[(usize, usize)] = &[(2, 2), (4, 4), (8, 4), (64, 4), (256, 4)];
+    for &(ram_mb, exp_mb) in cases {
+        let got = crate::reserve_calc_ram(ram_mb * MB, 4);
+        if got != exp_mb * MB {
+            crate::safe_print!(96, "  FAIL: clamp 4, {}MB RAM -> {}MB, expected {}MB\n",
+                ram_mb, got / MB, exp_mb);
+            pass = false;
+        }
+    }
+
+    // End-to-end: on a 64MB box, clamping the reserve RAM must leave strictly
+    // more user pages (the whole point — surplus RAM goes to userspace).
+    let ram = 64 * MB;
+    let cs = |cr: usize| core::cmp::max(cr / 16, 1 * MB); // approx code+stack
+    let up = |cr: usize| {
+        let c = cs(cr);
+        ram.saturating_sub(c + crate::compute_heap_size(cr, c))
+    };
+    let clamped = up(crate::reserve_calc_ram(ram, 4));
+    let unclamped = up(crate::reserve_calc_ram(ram, 0));
+    if clamped <= unclamped {
+        crate::safe_print!(96, "  FAIL: clamp gave {}MB user pages, no-clamp {}MB (expected more)\n",
+            clamped / MB, unclamped / MB);
+        pass = false;
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify the kernel memory-layout calculator (`crate::compute_memory_layout`):
+/// the three regions are contiguous, in-bounds, cover the boot stack, and leave
+/// a non-empty heap and user-page pool. Uses a synthetic boot-stack top so it is
+/// independent of the linked image size. Reflects the active profile's config.
+fn test_compute_memory_layout() -> bool {
+    console::print("\n[TEST] compute_memory_layout\n");
+    const MB: usize = 1024 * 1024;
+    if crate::config::KERNEL_HEAP_SIZE_MB != 0 {
+        console::print("  SKIP: KERNEL_HEAP_SIZE_MB override set\n");
+        return true;
+    }
+    let ram_base = 0x4000_0000usize;
+    let boot_stack_top = ram_base + 2 * MB; // plausible: kernel image + boot stack
+    let mut pass = true;
+    for &ram_mb in &[16usize, 32, 64, 128, 256, 1024] {
+        let ram = ram_mb * MB;
+        let l = crate::compute_memory_layout(ram_base, ram, boot_stack_top);
+        let ram_end = ram_base + ram;
+        let ok = l.heap_start == ram_base + l.code_and_stack
+            && l.user_pages_start == l.heap_start + l.heap_size
+            && l.user_pages_start + l.user_pages_size <= ram_end
+            && boot_stack_top <= l.heap_start          // code+stack covers boot stack
+            && l.heap_size > 0
+            && l.user_pages_size > 0;
+        if !ok {
+            crate::safe_print!(120,
+                "  FAIL: {}MB -> cs {}KB heap {}KB user {}KB (start {:#x})\n",
+                ram_mb, l.code_and_stack / 1024, l.heap_size / 1024,
+                l.user_pages_size / 1024, l.user_pages_start);
             pass = false;
         }
     }

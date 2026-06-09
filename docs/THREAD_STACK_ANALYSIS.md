@@ -101,6 +101,19 @@ let stack_bottom = guard_page + PAGE_SIZE;
 | Guard pages | ✅ One unmapped page at bottom |
 | Protection | ✅ Hardware fault on overflow |
 
+### Lazy (on-demand) thread stacks — extreme profile
+
+On the `size`/`extreme` profiles thread stacks are allocated lazily from PMM rather
+than pre-allocated (extreme keeps `WARM_FREE_*` = 0, no warm pool). Every spawn must
+therefore allocate (and zero-init the IRQ frame on) its stack *before* use. Both
+spawn paths now do so: `spawn_user_thread_fn_internal` via `ensure_slot_stack`, and
+the `clone`/pthread path `spawn_user_closure_initializing` via
+`allocate_stack_for_slot` (POOL lock already held).
+
+> A missing on-demand allocation on the closure path was the cause of the extreme
+> EC=0x25 thread-spawn crash (a `memset` on a wrapped near-null stack base). Fixed —
+> see [LOW_MEMORY_OPTIMIZATIONS.md](LOW_MEMORY_OPTIMIZATIONS.md) §1.
+
 ---
 
 ## Protection Mechanisms

@@ -89,6 +89,23 @@ User pages: 944 MB (0x45000000 - 0x80000000) [remaining]
 =====================
 ```
 
+### Reserve-RAM clamp (extreme profile)
+
+The layout above is computed by the pure function
+`compute_memory_layout(ram_base, ram_size, boot_stack_top)` in `src/main.rs`
+(profile-specific knobs live in `src/config.rs`, not inline `#[cfg]`).
+
+On the **extreme** profile the RAM value used to size the kernel's *own* reserves
+(`code_and_stack`'s `ram/16` term and the auto heap) is clamped to
+`config::MEM_CALC_CLAMP_MB` (4 MB), while User Pages, PMM, the thread limit and
+user-stack sizing keep the **real** detected RAM. The kernel idles in ~1.5 MB, so a
+big box no longer inflates kernel overhead — the surplus all becomes user pages.
+
+Example — 64 MB, extreme: Code+Stack ~1 MB, Heap 512 KB seed (grows on demand from
+PMM), **User pages 61 MB** (vs 52 MB without the clamp). Other profiles set the
+clamp to 0 (identity, historical behaviour). See
+[LOW_MEMORY_OPTIMIZATIONS.md](LOW_MEMORY_OPTIMIZATIONS.md) §2.
+
 ## Verified boot floors (measured June 2026)
 
 Every (profile, RAM) cell was booted and probed over SSH with `busybox echo`
