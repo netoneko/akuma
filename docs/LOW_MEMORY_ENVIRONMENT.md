@@ -389,11 +389,31 @@ regions and refuses to boot on any violation. Unit tests: `test_reserve_calc_ram
 
 Build `scripts/build_extreme_size.sh`; boot `MEMORY=64M scripts/cargo_runner.sh
 target/aarch64-unknown-none/extreme-size/akuma`; put models in `bootstrap/models/`
-(→ `/models/` on disk via `populate_disk.sh`); run e.g. `llama-cli -m
-/models/stories15M-q4_0.gguf -p "..." -n 32 -t 2 -c 256`. Notes: stories15M (18 MB)
-works at 64 MB; SmolLM2-135M (84 MB) has an open load-time SIGSEGV and won't fit
-64 MB anyway. The akuma shell does **not** support redirection (`2>&1` makes a file
-named `&1`); the VM regenerates its SSH host key (use `-o UserKnownHostsFile=/dev/null`).
+(→ `/models/` on disk via `populate_disk.sh`); run:
+
+```
+llama-cli -m /models/stories15M-q4_0.gguf -p "Once upon a time" -n 16 -t 1 -c 256 -st
+```
+
+Two flags matter for 64 MB:
+
+- **`-t 1`** — on single-core QEMU TCG this is **~30× faster** than `-t 2`
+  (~13–14 t/s gen / ~100 t/s prompt vs ~0.4 t/s): `-t 2` worker threads just thrash
+  on barriers on the one emulated core. (On multi-core HVF/Graviton, more threads help.)
+- **`-st` / `--single-turn`** — REQUIRED for reliable repeated runs. `llama-cli`
+  defaults to conversational mode and, after generating, parks waiting for stdin; when
+  the SSH session closes the process **does not exit — it orphans and keeps its ~49 MB
+  resident** (Akuma intentionally keeps SSH-spawned processes alive for reattach, so it
+  is not SIGHUP'd). The *next* run then OOMs with `[DA-DP] … anon alloc failed`. `-st`
+  makes it exit when the predefined `--prompt` turn finishes, returning all memory to
+  PMM (verified: idle free returns to ~62.6 MB after every run). This build rejects
+  `-no-cnv` ("use llama-completion"); use `-st`. The OOM is *not* a kernel reclaim leak
+  — `kill <pid>` of a lingering llama returns RAM straight to baseline.
+
+Notes: stories15M (18 MB) runs reliably at 64 MB with `-t 1 -st`; SmolLM2-135M (84 MB)
+OOMs (too big for 64 MB regardless). The akuma shell does **not** support redirection
+(`2>&1` makes a file named `&1`); the VM regenerates its SSH host key (use
+`ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no`).
 
 ## meow → ollama runs at 7 MB — lazy-ELF segment-boundary zeroing (FIXED 2026-06-05)
 
