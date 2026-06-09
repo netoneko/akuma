@@ -5,7 +5,7 @@
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use core::future::Future;
 use core::pin::Pin;
 
@@ -265,16 +265,20 @@ impl PkgCommand {
         stdout: &mut W,
         path: &str,
     ) -> Result<bool, ShellError> {
-        let bin_path = format!("/bin/{}", package);
-
-        let url_str = format!("{}{}", PKG_SERVER, bin_path);
+        // The server URL is always keyed by package name; `path` only changes the
+        // local destination (via `--as=`).
+        let url_str = format!("{}/bin/{}", PKG_SERVER, package);
         let url = parse_url(&url_str).ok_or(ShellError::ExecutionFailed("Invalid URL"))?;
 
         let msg = format!("pkg: downloading {}...\r\n", url_str);
         let _ = stdout.write(msg.as_bytes()).await;
 
-        let actual_bin_path = if path.is_empty() { format!("/bin/{}", package) } else { format!("{}", path) };
-        let mut writer = match FileWriter::create(&actual_bin_path).await {
+        let dest = if path.is_empty() {
+            format!("/bin/{}", package)
+        } else {
+            path.to_string()
+        };
+        let mut writer = match FileWriter::create(&dest).await {
             Ok(w) => w,
             Err(_) => return Err(ShellError::ExecutionFailed("Failed to create file")),
         };
@@ -283,25 +287,25 @@ impl PkgCommand {
             Ok((200, size)) => {
                 if size == 0 {
                     let _ = stdout.write(b"pkg: warning: downloaded binary is empty.\r\n").await;
-                    let _ = crate::async_fs::remove_file(&bin_path).await;
+                    let _ = crate::async_fs::remove_file(&dest).await;
                     return Ok(false);
                 }
-                let msg = format!("pkg: installed {} ({} KB) to {}\r\n", package, size / 1024, bin_path);
+                let msg = format!("pkg: installed {} ({} KB) to {}\r\n", package, size / 1024, dest);
                 let _ = stdout.write(msg.as_bytes()).await;
                 Ok(true)
             }
             Ok((404, _)) => {
-                let _ = crate::async_fs::remove_file(&bin_path).await;
+                let _ = crate::async_fs::remove_file(&dest).await;
                 Ok(false)
             }
             Ok((status, _)) => {
-                let _ = crate::async_fs::remove_file(&bin_path).await;
+                let _ = crate::async_fs::remove_file(&dest).await;
                 let msg = format!("pkg: failed to download binary (status: {})\r\n", status);
                 let _ = stdout.write(msg.as_bytes()).await;
                 Err(ShellError::ExecutionFailed("Binary download failed"))
             }
             Err(_) => {
-                let _ = crate::async_fs::remove_file(&bin_path).await;
+                let _ = crate::async_fs::remove_file(&dest).await;
                 Err(ShellError::ExecutionFailed("Download failed"))
             }
         }
@@ -406,10 +410,11 @@ impl PkgCommand {
     ) -> Result<(), ShellError> {
         let mut path = "";
         for package in packages.split_whitespace() {
+            if let Some(p) = package.strip_prefix("--as=") {
+                path = p;
+                continue;
+            }
             if package.starts_with("--") {
-                if package.starts_with("--as=") {
-                    path = package.strip_prefix("--as=").expect("binary name should not be null");
-                }
                 continue;
             }
             self.install_package_w(package, stdout, ctx, path).await?;
@@ -437,8 +442,7 @@ impl PkgCommand {
         }
 
         if !path.is_empty() {
-            let msg = format!("pkg: warning: archives do not support --as argument");
-            let _ = stdout.write(msg.as_bytes()).await;
+            let _ = stdout.write(b"pkg: warning: --as is ignored for archives\r\n").await;
         }
 
         if self.try_install_archive_w(package, stdout, ctx).await? {
