@@ -78,6 +78,29 @@ This only affects startup time, not inference throughput.
 
 Akuma uses a 10ms round-robin quantum. llama.cpp with `-t 2` spawns worker threads that synchronize via futexes. If the scheduler doesn't colocate related threads well, context switch overhead at quantum boundaries adds up. However, llama.cpp workers spend most of their time in compute, so preemption overhead is small relative to total runtime.
 
+#### Futex verified correct + debug logging fixed (2026-06-09)
+
+The ggml thread pool's `[futex-dbg] … result=ETIMEDOUT` ~1 s loops (visible during
+inference) looked like a possible wake bug, so the futex wake path was
+**measured**, not just assumed:
+
+- New boot self-tests in `src/sync_tests.rs`: `test_futex_genuine_wake_no_value_change`
+  (a genuine `FUTEX_WAKE`, with the futex word **never** changed, must return `0` —
+  the EAGAIN value-changed path and the timeout path cannot mask a broken/slow wake)
+  and `test_futex_wake_latency_prompt` (asserts wake latency ≪ timeout).
+- Result on the `release` kernel: **both PASS, measured wake latency ~401 µs.**
+  Genuine `FUTEX_WAKE` promptly unblocks a parked waiter. The ETIMEDOUT loops are
+  **benign idle-worker waits**, not a kernel bug. **Futex is not the bottleneck.**
+
+Separately, `config::FUTEX_DBG_ENABLED` was found set to `true` **globally** (not
+profile-gated), so every futex op printed an `[futex-dbg]` line to the slow serial
+UART, plus an *ungated* `[clear_child_tid]` print on every wake. Under inference
+(thousands of futex ops) that is pure overhead and log spam. Fixed: default
+`FUTEX_DBG_ENABLED = false` and gated the `[clear_child_tid]` print behind it.
+Measured effect on generation t/s: **none** (confirming generation is TCG-bound,
+not futex-bound) — but it removes the overhead and de-noises the logs. Flip the
+flag to `true` only when actively debugging futex wait/wake pairing.
+
 ### 6. Memory pressure
 
 With 256MB total RAM and ~127MB used by llama.cpp, only ~100MB remains for the kernel and other services. The kernel heap is 16MB. There's no swap. If the PMM runs low on free pages, demand-paging stalls can cause latency spikes during inference. The 135M model fits comfortably, but larger models would be constrained.
