@@ -54,6 +54,7 @@ fi
 PORT_SHIFT=$((100 * INSTANCE))
 SSH_PORT=$((2222 + PORT_SHIFT))
 HTTP_PORT=$((8080 + PORT_SHIFT))
+MODEL_PORT=$((21434 + PORT_SHIFT))
 TEL_PORT=$((2323 + PORT_SHIFT))
 P44_PORT=$((44 + PORT_SHIFT))
 P4444_PORT=$((4444 + PORT_SHIFT))
@@ -103,7 +104,7 @@ if [ "$SNAPSHOT" = "1" ]; then
   echo "[cargo_runner] $DISK_PATH mounted snapshot=on (writes discarded)" >&2
 fi
 
-echo "[cargo_runner] instance=$INSTANCE ssh=$SSH_PORT http=$HTTP_PORT tel=$TEL_PORT disk=$DISK_PATH" >&2
+echo "[cargo_runner] instance=$INSTANCE ssh=$SSH_PORT http=$HTTP_PORT model=$MODEL_PORT tel=$TEL_PORT disk=$DISK_PATH" >&2
 
 # Optional virtio-sound device on bus 3 (slot free; net/blk/rng take 0/1/2).
 SOUND="${SOUND:-none}"
@@ -135,7 +136,7 @@ exec qemu-system-aarch64 \
   -m "$MEMORY" \
   -serial mon:stdio \
   -display none \
-  -netdev "user,id=net0,hostfwd=tcp::${TEL_PORT}-:23,hostfwd=tcp::${SSH_PORT}-:22,hostfwd=tcp::${HTTP_PORT}-:8080,hostfwd=tcp::${P44_PORT}-:44,hostfwd=tcp::${P4444_PORT}-:4444" \
+  -netdev "user,id=net0,hostfwd=tcp::${TEL_PORT}-:23,hostfwd=tcp::${SSH_PORT}-:22,hostfwd=tcp::${HTTP_PORT}-:8080,hostfwd=tcp::${P44_PORT}-:44,hostfwd=tcp::${P4444_PORT}-:4444,hostfwd=tcp::${MODEL_PORT}-:11434" \
   -global virtio-mmio.force-legacy=false \
   -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0 \
   -drive "$DRIVE_OPTS" \
