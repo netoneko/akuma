@@ -96,7 +96,14 @@ cargo run --release
         → prints: "[Memory] Detected from DTB: base=0x40000000, size=1024 MB"
 ```
 
-## Known issue: RAM under-detected at large `MEMORY` (OPEN, 2026-06-09)
+## Known issue: RAM under-detected at large `MEMORY` (RESOLVED, 2026-06-09)
+
+> **RESOLVED — does not reproduce on current `main`.** A freshly-built
+> `extreme-size` kernel under HVF at `MEMORY=2048` now detects the full 2048 MB
+> across two deterministic boots (`size=2048 MB`, `Total RAM 2048 MB`, user
+> pages 2045 MB, `PMM stats: 524288 total` = exactly 2 GB at 4 KB/page). The
+> investigation below is kept for the record; see **Resolution** at the end for
+> what changed and why the original "HVF hands a corrupt DTB" theory is wrong.
 
 On the `extreme-size` kernel under HVF, the kernel detects **far less RAM than
 QEMU was given** once `MEMORY` is large. Observed with `MEMORY=2048M`:
@@ -151,6 +158,50 @@ boot `MEMORY=2048 GDB=1 INSTANCE=1`, attach lldb to the gdbstub (`:1235`, see
 (before any OOM). That settles whether the size cell is corrupted in guest RAM
 (→ fix DTB placement, e.g. via the boot header's `image_size` so QEMU stops
 parking the DTB inside live RAM) or HVF is the source.
+
+### Resolution (2026-06-09)
+
+Re-tested on current `main` (HEAD includes the day's `extreme`/HVF/GICv3 work).
+The `extreme-size` kernel under HVF at `MEMORY=2048` detects **2048 MB** on
+every boot:
+
+```
+DTB ptr from boot (x0 arg): 0x48000000        ← same pointer as the buggy report
+[Memory] Detected from DTB: base=0x40000000, size=2048 MB
+Total RAM: 2048 MB at 0x40000000
+User pages: 2045 MB (0x4024a000 - 0xc0000000)
+PMM stats: 524288 total, 335 allocated, 523953 free   ← 524288 × 4 KB = exactly 2 GB
+```
+
+**The "HVF hands the guest a corrupt DTB" prime suspect is disproven.** The same
+`x0 = 0x48000000` now yields a correct read, and the *release* kernel always read
+that same pointer correctly (see the user's 2048 MB llama.cpp boot log). QEMU's
+DTB at `0x48000000` is correct and readable from both profiles — the size cell is
+not perturbed in guest RAM.
+
+**What actually moved the numbers — per-build-size memory calc.** Commit
+`7042485` ("some fixes for extreme profile") reworked the layout math into the
+pure `compute_memory_layout` + `reserve_calc_ram` functions and added
+`config::MEM_CALC_CLAMP_MB` (4 MiB on `extreme`, 0 elsewhere):
+
+- **Before:** `heap_size = compute_heap_size(ram_size, …)` used the **raw** RAM
+  size, so on a big box `extreme`'s reserves scaled with RAM (`heap ≈ ram/8`
+  capped at 256 MB, `code_and_stack ≈ ram/16`). At 2 GB that buried hundreds of
+  MB in kernel reserves that never reached the user-page pool — the downstream
+  "the extra gigabyte never reaches the PMM" symptom.
+- **After:** the reserve/heap math runs on `reserve_calc_ram(ram_size, 4 MiB)`
+  while `user_pages_size` is carved from the **real** `ram_size`. The kernel
+  still sees and maps all RAM; the surplus now flows to userspace.
+
+**Caveat on the original symptom.** `detect_memory()` prints the *raw*
+`region.size` and was **not** changed by `7042485`, so that commit alone does
+not explain a *detect-print* reading `1048 MB`. If the original `[Memory]
+Detected from DTB: size=1048 MB` line was transcribed accurately it points to an
+even-older binary (e.g. pre-`text_offset = 1 MB` / `0x40100000` boot-layout
+move, where DTB placement/overlap differed); that path is also fixed today. The
+wrong read could not be reproduced on the current `extreme` build. If it ever
+resurfaces, capture the live DTB bytes via the "Next diagnostic" above before
+assuming the cause.
 
 ## Key Files
 
