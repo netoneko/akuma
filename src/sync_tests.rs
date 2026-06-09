@@ -3,7 +3,7 @@
 //! Tests for futex, signal-stack, and time-related primitives.
 //! Uses BYPASS_VALIDATION so kernel-stack addresses pass the user-pointer check.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use akuma_exec::threading;
 
@@ -488,6 +488,166 @@ fn test_futex_wake_one_of_two() {
     );
     console::print("  [PASS] test_futex_wake_one_of_two
 ");
+}
+
+/// A *genuine* FUTEX_WAKE must promptly unblock a parked waiter, returning 0.
+///
+/// This isolates the wake mechanism in a way the other tests do NOT:
+/// `test_futex_basic_wake` stores 1 into the word before waking, so it passes via
+/// the EAGAIN value-changed path even if FUTEX_WAKE never unblocks a parked
+/// thread; `test_futex_wake_one_of_two` even counts ETIMEDOUT as success. Here the
+/// futex word is **never changed**, so the ONLY way the waiter returns 0 is a real
+/// FUTEX_WAKE that dequeues and reschedules it. A broken or timeout-reliant wake
+/// (the ggml worker `result=ETIMEDOUT` symptom that throttled inference to ~0.5
+/// t/s) makes the waiter sit until its safety timeout → `ret == ETIMEDOUT` → FAIL.
+/// The bounded poll budget (50 yields ≪ 3 s timeout) also asserts promptness.
+fn test_futex_genuine_wake_no_value_change() {
+    static FW: AtomicU32 = AtomicU32::new(0);
+    static RET: AtomicU32 = AtomicU32::new(0xFFFF_FFFF); // sentinel
+    static DONE: AtomicBool = AtomicBool::new(false);
+
+    FW.store(0, Ordering::SeqCst);
+    RET.store(0xFFFF_FFFF, Ordering::SeqCst);
+    DONE.store(false, Ordering::SeqCst);
+
+    threading::spawn_fn(|| {
+        set_bypass(true);
+        let uaddr = FW.as_ptr() as usize;
+        let ts = Timespec { tv_sec: 3, tv_nsec: 0 }; // safety timeout only
+        let tp = &ts as *const Timespec as u64;
+        let ret = crate::syscall::handle_syscall(
+            NR_FUTEX,
+            &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, tp, 0, 0],
+        );
+        RET.store(ret as u32, Ordering::Release);
+        DONE.store(true, Ordering::Release);
+        set_bypass(false);
+        threading::mark_current_terminated();
+        loop {
+            threading::yield_now();
+        }
+    })
+    .expect("test_futex_genuine_wake_no_value_change: spawn failed");
+
+    // Let the waiter reach FUTEX_WAIT and enqueue.
+    for _ in 0..20 {
+        threading::yield_now();
+    }
+
+    // Genuine wake — do NOT touch the futex word.
+    set_bypass(true);
+    let uaddr = FW.as_ptr() as usize;
+    let woken = crate::syscall::handle_syscall(
+        NR_FUTEX,
+        &[uaddr as u64, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0],
+    );
+    set_bypass(false);
+    assert!(
+        woken == 1,
+        "test_futex_genuine_wake_no_value_change: FUTEX_WAKE dequeued {} (expected 1 — waiter not parked?)",
+        woken
+    );
+
+    // Must wake promptly (well within the poll budget, far below the 3 s timeout).
+    let mut done = false;
+    for _ in 0..50 {
+        threading::yield_now();
+        if DONE.load(Ordering::Acquire) {
+            done = true;
+            break;
+        }
+    }
+    assert!(
+        done,
+        "test_futex_genuine_wake_no_value_change: waiter did not return within the poll budget (timeout-reliant wake)"
+    );
+    let ret = RET.load(Ordering::Acquire) as i32 as i64;
+    assert!(
+        ret == 0,
+        "test_futex_genuine_wake_no_value_change: expected genuine wake (0), got {} \
+         (ETIMEDOUT means FUTEX_WAKE did not unblock the parked thread — the inference-throttling bug)",
+        ret
+    );
+    console::print("  [PASS] test_futex_genuine_wake_no_value_change
+");
+}
+
+/// A genuine FUTEX_WAKE must be delivered with low latency, not by the timeout.
+///
+/// Complements the test above with an explicit wall-clock check: the waiter parks
+/// with a long (5 s) safety timeout and records `uptime_us()` on return; the main
+/// thread records `uptime_us()` at the moment it issues FUTEX_WAKE. The measured
+/// wake latency must be far below the timeout (we require < 500 ms — in practice
+/// it is microseconds). If the wake silently fell back to the timeout, the latency
+/// would be ~5 s and this FAILs. This is the property ggml's per-token thread-pool
+/// resume depends on.
+fn test_futex_wake_latency_prompt() {
+    static FW: AtomicU32 = AtomicU32::new(0);
+    static RET: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
+    static RET_TS: AtomicU64 = AtomicU64::new(0);
+    static DONE: AtomicBool = AtomicBool::new(false);
+
+    FW.store(0, Ordering::SeqCst);
+    RET.store(0xFFFF_FFFF, Ordering::SeqCst);
+    RET_TS.store(0, Ordering::SeqCst);
+    DONE.store(false, Ordering::SeqCst);
+
+    threading::spawn_fn(|| {
+        set_bypass(true);
+        let uaddr = FW.as_ptr() as usize;
+        let ts = Timespec { tv_sec: 5, tv_nsec: 0 };
+        let tp = &ts as *const Timespec as u64;
+        let ret = crate::syscall::handle_syscall(
+            NR_FUTEX,
+            &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, tp, 0, 0],
+        );
+        RET_TS.store(crate::timer::uptime_us(), Ordering::Release);
+        RET.store(ret as u32, Ordering::Release);
+        DONE.store(true, Ordering::Release);
+        set_bypass(false);
+        threading::mark_current_terminated();
+        loop {
+            threading::yield_now();
+        }
+    })
+    .expect("test_futex_wake_latency_prompt: spawn failed");
+
+    for _ in 0..20 {
+        threading::yield_now();
+    }
+
+    set_bypass(true);
+    let uaddr = FW.as_ptr() as usize;
+    let wake_ts = crate::timer::uptime_us();
+    let woken = crate::syscall::handle_syscall(
+        NR_FUTEX,
+        &[uaddr as u64, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0],
+    );
+    set_bypass(false);
+    assert!(
+        woken == 1,
+        "test_futex_wake_latency_prompt: FUTEX_WAKE dequeued {} (expected 1)",
+        woken
+    );
+
+    let mut done = false;
+    for _ in 0..200 {
+        threading::yield_now();
+        if DONE.load(Ordering::Acquire) {
+            done = true;
+            break;
+        }
+    }
+    assert!(done, "test_futex_wake_latency_prompt: waiter never returned");
+    let ret = RET.load(Ordering::Acquire) as i32 as i64;
+    assert!(ret == 0, "test_futex_wake_latency_prompt: expected 0, got {}", ret);
+    let latency = RET_TS.load(Ordering::Acquire).saturating_sub(wake_ts);
+    assert!(
+        latency < 500_000,
+        "test_futex_wake_latency_prompt: wake latency {} us — wake fell back to the timeout, not delivered",
+        latency
+    );
+    crate::safe_print!(80, "  [PASS] test_futex_wake_latency_prompt (latency {} us)\n", latency);
 }
 
 /// FUTEX_REQUEUE moves waiters from one futex address to another.
@@ -2334,6 +2494,8 @@ pub fn run_all_tests() {
     test_futex_basic_wake();
     test_futex_wake_all();
     test_futex_wake_one_of_two();
+    test_futex_genuine_wake_no_value_change();
+    test_futex_wake_latency_prompt();
     test_futex_requeue();
     test_futex_wait_eintr_signal_preserved();
     test_futex_wake_sigurg_pending_x0_not_reused();

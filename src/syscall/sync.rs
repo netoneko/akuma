@@ -52,7 +52,9 @@ pub fn futex_wake(tgid: u32, uaddr: usize, max_wake: i32) {
     } else {
         0
     };
-    tprint!(128, "[clear_child_tid] tgid={} addr={:#x} woke shared={} private={}\n", tgid, uaddr, n0, n1);
+    if crate::config::FUTEX_DBG_ENABLED {
+        tprint!(128, "[clear_child_tid] tgid={} addr={:#x} woke shared={} private={}\n", tgid, uaddr, n0, n1);
+    }
 }
 
 /// Test helper: insert the current thread into the futex waiter table at an

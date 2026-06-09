@@ -145,7 +145,13 @@ pub const CANARY_WORDS: usize = 8;
 
 /// Enable [futex-dbg] trace logging for wait/wake pairs with timestamps.
 /// Zero cost when false (LLVM eliminates const-false branches).
-pub const FUTEX_DBG_ENABLED: bool = true;
+///
+/// Default **false**: every futex op otherwise prints to the (slow) serial UART,
+/// which is real overhead under futex-heavy workloads — llama.cpp's ggml thread
+/// pool issues thousands of wait/wake ops during inference. Flip to `true` only
+/// when actively debugging futex wait/wake pairing. (Verified separately that
+/// wake delivery is correct and prompt — ~401 µs — see `test_futex_wake_latency_prompt`.)
+pub const FUTEX_DBG_ENABLED: bool = false;
 
 /// Fail tests if test binaries are missing
 ///
