@@ -15,10 +15,21 @@
 - ✅ Verified: builds dev/`size`/`extreme-size`; boots clean to SSH on a copied
   disk; `[PASS] test_net_bounce_alloc_degradation`; zero `EC=0x3c`.
 - 🔲 **Open (broader):** the net buffer was only *one* unprotected multi-page
-  kernel allocation. At least one more infallible-alloc site still aborts the
-  kernel under OOM (observed with qwen3.5-0.8B @ 1 GB, `ELR=0x4012068c`). The
-  general fix — an OOM-killer hook for *any* failed multi-page kernel growth —
-  is still a TODO in `src/allocator.rs`. See "Remaining work".
+  kernel allocation. The general fix — an OOM-killer hook for *any* failed
+  multi-page kernel growth — is still a TODO in `src/allocator.rs`. See
+  "Remaining work".
+- ⚠️ **Re-test pending (qwen3.5-0.8B @ "2 GB"):** a `brk #1` at the **same**
+  `ELR=0x4012068c` was observed running `llama-server` + qwen3.5-0.8B-Q4. But
+  (a) that binary **did not include the net-bounce fix**, and (b) `ELR=0x4012068c`
+  is the *shared* abort landing pad — under `panic = "immediate-abort"` **every**
+  infallible alloc / `handle_alloc_error` lowers to that one `brk #1`, so the ELR
+  alone does **not** prove a distinct site. `llama-server` streams HTTP, so this
+  may simply be the **net-bounce path again**, not a new one. Re-run with the net
+  fix in the binary before concluding a second site exists. NOTE also: that run
+  was nominally `MEMORY=2048` but the kernel only detected ~1048 MB (see
+  `docs/DYNAMIC_DTB.md`), so it was effectively a ~1 GB run — qwen-0.8B-Q4
+  lazy-mmaps but never evicts, so its ~532 MB of weights stay resident and drain
+  the PMM regardless.
 
 > **Note.** The 84 MB model also simply does not fit a 64 MB VM — that part is
 > expected and unrelated. This fix is **not** about making the model run; it is
@@ -164,10 +175,13 @@ boot suites). It checks:
 
 The net buffer is fixed, but the **structural** hazard remains: *any* infallible
 kernel-heap allocation that needs a multi-page contiguous growth will still
-`brk #1` when the PMM is fragmented/exhausted. A second such site has been
-observed with qwen3.5-0.8B-Q4 at 1 GB (it lazy-mmaps but never evicts, so weights
-stay resident until the PMM is drained), crashing at the **same**
-`ELR=0x4012068c` after the net path is no longer the one that trips.
+`brk #1` when the PMM is fragmented/exhausted. qwen3.5-0.8B-Q4 at "1 GB" (it
+lazy-mmaps but never evicts, so weights stay resident until the PMM is drained)
+also crashes at `ELR=0x4012068c` — but as noted in **Status**, that binary
+*lacked the net-bounce fix* and `0x4012068c` is the shared abort landing pad, so
+it is **not yet confirmed** to be a distinct site. The audit below still applies
+either way; whether a *second* site exists is settled by re-running with the net
+fix compiled in.
 
 Two complementary directions:
 

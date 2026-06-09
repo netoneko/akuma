@@ -96,6 +96,62 @@ cargo run --release
         → prints: "[Memory] Detected from DTB: base=0x40000000, size=1024 MB"
 ```
 
+## Known issue: RAM under-detected at large `MEMORY` (OPEN, 2026-06-09)
+
+On the `extreme-size` kernel under HVF, the kernel detects **far less RAM than
+QEMU was given** once `MEMORY` is large. Observed with `MEMORY=2048M`:
+
+```
+(QEMU launched with -m 2048M)
+DTB ptr from boot (x0 arg): 0x48000000
+[Memory] Detected from DTB: base=0x40000000, size=1048 MB   ← should be 2048 MB
+User pages: 1045 MB (0x4024a000 - 0x81800000)
+PMM stats: 268288 total ...                                  ← 268288 pages = 1048 MB
+```
+
+`-m 1024M` detects ~1024 MB; `-m 2048M` detects only ~1048 MB. The extra
+gigabyte never reaches the PMM, so a "2 GB" run is really a ~1 GB run — and any
+workload sized for the larger figure (e.g. `llama-server` + a 532 MB model)
+exhausts the PMM and trips the OOM `brk #1` (see
+`docs/NET_BOUNCE_OOM_KERNEL_ABORT.md`).
+
+### What has been ruled out
+
+This is **not** the parser, **not** the launch command, and **not** a RAM cap:
+
+1. **We don't pass a DTB** — no `-dtb` flag, no `.dtb` in-repo; QEMU
+   auto-generates it and passes the pointer in `x0`.
+2. **QEMU's DTB is correct.** `qemu-system-aarch64 ... ,dumpdtb=...` with the full
+   runner device set yields `/memory reg = <0x0 0x40000000 0x0 0x80000000>` =
+   exactly 2048 MB.
+3. **The `fdt = "0.1"` crate parses it correctly** — running the *same* parse on
+   the host against QEMU's dumped DTB returns `size = Some(2147483648)` = 2048 MB.
+4. **No clamp** sits between the `fdt` read and the `[Memory] Detected ...` print
+   in `detect_memory()` (`src/main.rs`) — the printed value *is* the raw
+   `region.size`. (`MEM_CALC_CLAMP_MB` clamps only the kernel's *own* reserve math,
+   not `user_pages_size`.)
+
+### Conclusion / suspect
+
+The DTB bytes the kernel reads at runtime (`x0 = 0x48000000`) must differ from
+QEMU's pristine DTB — the `fdt::from_ptr` header check still passes, but the
+`/memory` size cell reads as `0x41800000` instead of `0x80000000`. Prime suspect:
+QEMU parks the DTB at `0x48000000`, which is **inside the kernel's own user-page
+region** (`0x4024a000 - 0x81800000`); something perturbs the size cell, or HVF
+hands the guest a different DTB than the TCG `dumpdtb` path. (Note the
+"Memory Layout" / load-address section above predates the `text_offset = 1 MB`
+move to `0x40100000` and the observed `0x48000000` DTB placement — treat those
+addresses as illustrative, not current.)
+
+### Next diagnostic
+
+Read the live DTB at `0x48000000` and diff against QEMU's pristine 2 GB DTB:
+boot `MEMORY=2048 GDB=1 INSTANCE=1`, attach lldb to the gdbstub (`:1235`, see
+`docs/` lldb+gdbstub notes), and dump the `/memory` node bytes right after boot
+(before any OOM). That settles whether the size cell is corrupted in guest RAM
+(→ fix DTB placement, e.g. via the boot header's `image_size` so QEMU stops
+parking the DTB inside live RAM) or HVF is the source.
+
 ## Key Files
 
 - `src/boot.rs` — ARM64 Image header and early boot assembly
