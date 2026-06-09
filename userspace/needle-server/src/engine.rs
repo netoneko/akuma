@@ -75,6 +75,7 @@ pub struct NeedleEngine {
 }
 
 impl NeedleEngine {
+    #[cfg(feature = "akuma")]
     pub fn load(weights_path: &str, vocab_path: &str) -> Result<Self, ParseError> {
         let st = SafeTensors::load(weights_path)?;
         let vocab = Vocabulary::load_text(vocab_path)?;

@@ -12,6 +12,11 @@ pub struct RouteRequest {
     pub stream: bool,
 }
 
+pub struct CompletionsRequest {
+    pub query: String,
+    pub tools_json: String,
+}
+
 pub struct RetrieveRequest {
     pub query: String,
     pub tools: Vec<String>,
@@ -25,6 +30,14 @@ pub fn parse_route_request(body: &str) -> Option<RouteRequest> {
     let tools_json = json_extract_raw(body, "tools")?;
     let stream = body.contains("\"stream\":true");
     Some(RouteRequest { query, tools_json, stream })
+}
+
+/// Parse an OpenAI-style chat completions request.
+/// Extracts the last user message as the query, and the tools array as raw JSON.
+pub fn parse_completions_request(body: &str) -> Option<CompletionsRequest> {
+    let query = extract_last_user_message(body)?;
+    let tools_json = json_extract_raw(body, "tools").unwrap_or_else(|| String::from("[]"));
+    Some(CompletionsRequest { query, tools_json })
 }
 
 pub fn parse_retrieve_request(body: &str) -> Option<RetrieveRequest> {
@@ -78,6 +91,30 @@ pub fn write_health_response(buf: &mut Vec<u8>, loaded: bool) {
     buf.extend_from_slice(s.as_bytes());
 }
 
+/// Write an OpenAI-compatible chat completion response.
+/// `tool_call_json` is what the engine produced: `{"name":"...","arguments":{...}}`.
+/// If it looks like a valid tool call, emit finish_reason=tool_calls; otherwise
+/// emit the text as content with finish_reason=stop.
+pub fn write_completions_response(buf: &mut Vec<u8>, tool_call_json: &str) {
+    let name = json_extract_string(tool_call_json, "name");
+    let args_raw = json_extract_raw(tool_call_json, "arguments");
+
+    if let (Some(name), Some(args_raw)) = (name, args_raw) {
+        // Tool call response
+        let args_escaped = json_stringify(&args_raw);
+        buf.extend_from_slice(b"{\"id\":\"chatcmpl-needle\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_0\",\"type\":\"function\",\"function\":{\"name\":\"");
+        write_json_str(buf, &name);
+        buf.extend_from_slice(b"\",\"arguments\":\"");
+        write_json_str(buf, &args_escaped);
+        buf.extend_from_slice(b"\"}}]},\"finish_reason\":\"tool_calls\"}]}");
+    } else {
+        // Plain text response
+        buf.extend_from_slice(b"{\"id\":\"chatcmpl-needle\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"");
+        write_json_str(buf, tool_call_json);
+        buf.extend_from_slice(b"\"},\"finish_reason\":\"stop\"}]}");
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn write_json_str(buf: &mut Vec<u8>, s: &str) {
@@ -93,9 +130,11 @@ fn write_json_str(buf: &mut Vec<u8>, s: &str) {
 }
 
 fn json_extract_string(obj: &str, field: &str) -> Option<String> {
-    let needle = alloc::format!("\"{}\":\"", field);
+    let needle = alloc::format!("\"{}\":", field);
     let pos = obj.find(&needle)?;
-    let after = &obj[pos + needle.len()..];
+    let after = obj[pos + needle.len()..].trim_start();
+    if !after.starts_with('"') { return None; }
+    let after = &after[1..];
     let bytes = after.as_bytes();
     let mut i = 0;
     let mut escape = false;
@@ -161,6 +200,59 @@ fn json_extract_usize(obj: &str, field: &str) -> Option<usize> {
     let after = obj[pos + needle.len()..].trim_start();
     let end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
     after[..end].parse().ok()
+}
+
+/// Extract the content of the last message with role "user" from a messages array.
+fn extract_last_user_message(body: &str) -> Option<String> {
+    let messages_raw = json_extract_raw(body, "messages")?;
+    let bytes = messages_raw.as_bytes();
+    let mut last_user_content: Option<String> = None;
+    let mut i = 0;
+    // Walk through each {...} object in the array
+    while i < bytes.len() {
+        if bytes[i] != b'{' { i += 1; continue; }
+        // Find matching closing brace
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut escape = false;
+        let start = i;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_str {
+                if escape { escape = false; }
+                else if b == b'\\' { escape = true; }
+                else if b == b'"' { in_str = false; }
+            } else if b == b'"' { in_str = true; }
+            else if b == b'{' { depth += 1; }
+            else if b == b'}' {
+                depth = depth.saturating_sub(1);
+                if depth == 0 { i += 1; break; }
+            }
+            i += 1;
+        }
+        let obj = core::str::from_utf8(&bytes[start..i]).unwrap_or("");
+        if let Some(role) = json_extract_string(obj, "role") {
+            if role == "user" {
+                last_user_content = json_extract_string(obj, "content");
+            }
+        }
+    }
+    last_user_content
+}
+
+/// Escape a raw JSON value as a JSON string (for embedding in "arguments" field).
+fn json_stringify(raw: &str) -> String {
+    let mut out = String::new();
+    for b in raw.bytes() {
+        match b {
+            b'"' => { out.push('\\'); out.push('"'); }
+            b'\\' => { out.push('\\'); out.push('\\'); }
+            b'\n' => { out.push('\\'); out.push('n'); }
+            b'\r' => { out.push('\\'); out.push('r'); }
+            _ => out.push(b as char),
+        }
+    }
+    out
 }
 
 fn parse_string_array(arr: &str) -> Vec<String> {

@@ -6,9 +6,19 @@ edition = "2021"
 [[bin]]
 name = "needle-server"
 path = "src/main.rs"
+test = false
+
+[lib]
+name = "needle_engine"
+path = "src/lib.rs"
+crate-type = ["lib"]
+
+[features]
+default = ["akuma"]
+akuma = ["dep:libakuma", "dep:libakuma-tls"]
 
 [dependencies]
-libakuma     = { path = "../libakuma" }
-libakuma-tls = { path = "../libakuma-tls" }
+libakuma     = { path = "../libakuma", optional = true }
+libakuma-tls = { path = "../libakuma-tls", optional = true }
 needle-core  = { git = "https://github.com/geekgineer/needle-rs", default-features = false }
 libm         = { version = "0.2", default-features = false }

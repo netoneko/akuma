@@ -25,6 +25,7 @@ pub struct Vocabulary {
 }
 
 impl Vocabulary {
+    #[cfg(feature = "akuma")]
     pub fn load_text(path: &str) -> Result<Self, i32> {
         let content = libakuma::fs::read_to_string(path)?;
         Ok(Self::parse(&content))

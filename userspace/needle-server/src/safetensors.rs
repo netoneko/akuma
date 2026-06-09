@@ -46,6 +46,7 @@ pub struct SafeTensors {
 }
 
 impl SafeTensors {
+    #[cfg(feature = "akuma")]
     pub fn load(path: &str) -> Result<Self, ParseError> {
         let raw = libakuma::fs::read(path)?;
         Self::from_bytes(raw)

@@ -34,7 +34,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use engine::NeedleEngine;
-use libakuma::net::{TcpListener};
+use libakuma::net::TcpListener;
 
 struct Config {
     port: u16,
@@ -134,7 +134,6 @@ fn print_usage() {
 pub extern "C" fn main() {
     let cfg = Config::from_args();
 
-    // Resolve weight paths
     let (weights_path, vocab_path) = if let (Some(w), Some(v)) = (&cfg.weights, &cfg.vocab) {
         (w.clone(), v.clone())
     } else if cfg.download {
@@ -179,6 +178,7 @@ pub extern "C" fn main() {
     loop {
         match listener.accept() {
             Ok((stream, _addr)) => handle_connection(&engine, stream),
+            Err(e) if e.kind() == libakuma::net::ErrorKind::Interrupted => libakuma::exit(0),
             Err(_) => libakuma::sleep_ms(1),
         }
     }
@@ -204,6 +204,8 @@ fn handle_connection(engine: &NeedleEngine, stream: libakuma::net::TcpStream) {
         }
     };
 
+    libakuma::println(&format!("[needle] {} {}", req.method, req.path));
+
     match (req.method, req.path) {
         ("GET", "/health") | ("GET", "/health/") => {
             let mut body = Vec::new();
@@ -221,6 +223,10 @@ fn handle_connection(engine: &NeedleEngine, stream: libakuma::net::TcpStream) {
 
         ("POST", "/v1/retrieve") | ("POST", "/v1/retrieve/") => {
             handle_retrieve(engine, &stream, req.body);
+        }
+
+        ("POST", "/v1/chat/completions") | ("POST", "/v1/chat/completions/") => {
+            handle_chat_completions(engine, &stream, req.body);
         }
 
         _ => {
@@ -249,7 +255,7 @@ fn handle_route(engine: &NeedleEngine, stream: &libakuma::net::TcpStream, body: 
             server::send_chunk(stream, &chunks);
         });
         let latency_ms = libakuma::time().saturating_sub(start_ms);
-        let _ = latency_ms; // streaming response doesn't include latency
+        libakuma::println(&format!("[needle] done in {}ms: {}", latency_ms / 1000, result.text));
         let mut done_buf: Vec<u8> = Vec::new();
         api::write_stream_done(&mut done_buf, &result.text);
         server::send_chunk(stream, &done_buf);
@@ -286,5 +292,25 @@ fn handle_retrieve(engine: &NeedleEngine, stream: &libakuma::net::TcpStream, bod
 
     let mut resp_body = Vec::new();
     api::write_retrieve_response(&mut resp_body, &named);
+    server::send_json(stream, 200, "OK", &resp_body);
+}
+
+fn handle_chat_completions(engine: &NeedleEngine, stream: &libakuma::net::TcpStream, body: &str) {
+    let req = match api::parse_completions_request(body) {
+        Some(r) => r,
+        None => {
+            server::send_bad_request(stream, "missing messages");
+            return;
+        }
+    };
+
+    let start_ms = libakuma::time();
+    let result = engine.run(&req.query, &req.tools_json);
+    let latency_ms = libakuma::time().saturating_sub(start_ms);
+
+    libakuma::println(&format!("[needle] done in {}ms: {}", latency_ms / 1000, result.text));
+
+    let mut resp_body = Vec::new();
+    api::write_completions_response(&mut resp_body, &result.text);
     server::send_json(stream, 200, "OK", &resp_body);
 }

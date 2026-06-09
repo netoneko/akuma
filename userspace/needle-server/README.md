@@ -6,6 +6,11 @@ Runs on Akuma OS as a bare-metal AArch64 binary. Weights are downloaded from the
 
 ## Usage
 
+Quickstart: 
+```
+needle-server --weights /models/needle.safetensors --vocab /models/vocab.txt --port 11434
+```
+
 ```
 needle-server [OPTIONS]
 
