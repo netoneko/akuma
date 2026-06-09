@@ -263,15 +263,18 @@ impl PkgCommand {
         &self,
         package: &str,
         stdout: &mut W,
+        path: &str,
     ) -> Result<bool, ShellError> {
         let bin_path = format!("/bin/{}", package);
+
         let url_str = format!("{}{}", PKG_SERVER, bin_path);
         let url = parse_url(&url_str).ok_or(ShellError::ExecutionFailed("Invalid URL"))?;
 
         let msg = format!("pkg: downloading {}...\r\n", url_str);
         let _ = stdout.write(msg.as_bytes()).await;
 
-        let mut writer = match FileWriter::create(&bin_path).await {
+        let actual_bin_path = if path.is_empty() { format!("/bin/{}", package) } else { format!("{}", path) };
+        let mut writer = match FileWriter::create(&actual_bin_path).await {
             Ok(w) => w,
             Err(_) => return Err(ShellError::ExecutionFailed("Failed to create file")),
         };
@@ -401,11 +404,16 @@ impl PkgCommand {
         stdout: &mut W,
         ctx: &mut ShellContext,
     ) -> Result<(), ShellError> {
+        let mut path = "";
         for package in packages.split_whitespace() {
             if package.starts_with("--") {
+                if package.starts_with("--as=") {
+                    path = package.strip_prefix("--as=").expect("binary name should not be null");
+                }
                 continue;
             }
-            self.install_package_w(package, stdout, ctx).await?;
+            self.install_package_w(package, stdout, ctx, path).await?;
+            path = "";
         }
         Ok(())
     }
@@ -415,6 +423,7 @@ impl PkgCommand {
         package: &str,
         stdout: &mut W,
         ctx: &mut ShellContext,
+        path: &str,
     ) -> Result<(), ShellError> {
         if package.is_empty() {
             return Ok(());
@@ -423,8 +432,13 @@ impl PkgCommand {
         let _ = crate::async_fs::create_dir("/bin").await;
         let _ = crate::async_fs::create_dir("/tmp").await;
 
-        if self.try_install_binary_w(package, stdout).await? {
+        if self.try_install_binary_w(package, stdout, path).await? {
             return Ok(());
+        }
+
+        if !path.is_empty() {
+            let msg = format!("pkg: warning: archives do not support --as argument");
+            let _ = stdout.write(msg.as_bytes()).await;
         }
 
         if self.try_install_archive_w(package, stdout, ctx).await? {
