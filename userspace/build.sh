@@ -90,6 +90,7 @@ MEMBERS=(
     "stp_test"
     "wavplay"
     "scratch"
+    "needle-server"
     )
 
 
@@ -134,6 +135,7 @@ BINARIES=(
     "sshd"
     "llama-cli"
     "crush"
+    "needle-server"
 )
 
 for bin in "${BINARIES[@]}"; do

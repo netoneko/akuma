@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+pub mod fs;
 pub mod net;
 
 use core::arch::asm;
