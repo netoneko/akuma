@@ -101,6 +101,14 @@ neko = ["dep:akuma-editor"]
 # small/bounded enough to opt back into `extreme` (4 MB) via `--features sound`.
 sound = ["virtio-drivers/alloc"]
 
+# Use the legacy GICv2 MMIO interrupt-controller driver (src/gic.rs) instead of
+# the default GICv3 driver (src/gic_v3.rs). GICv2 works under QEMU TCG
+# (`-machine virt` defaults to gic-version=2) but faults under QEMU HVF on Apple
+# Silicon, where only the GICv3 system-register CPU interface exists. Build the
+# kernel with `gic-version=3` in the QEMU command line when using the default
+# (GICv3) driver — see scripts/cargo_runner.sh.
+gic-v2 = []
+
 # Profile discriminator (NOT a syscall gate). build_extreme_size.sh enables it so
 # build.rs can pick a tighter IMAGE_SIZE / STACK_BOTTOM than the `size` profile.
 # build.rs reads it via CARGO_FEATURE_EXTREME and emits cfg(kernel_profile_extreme).

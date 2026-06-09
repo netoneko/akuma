@@ -1,11 +1,22 @@
-// ARM Generic Interrupt Controller (GIC) v2 driver
-// For QEMU ARM virt machine
+//! ARM Generic Interrupt Controller (GIC) driver for the QEMU `virt` machine.
+//!
+//! The public API (`init`, `enable_irq`, `acknowledge_irq`, `end_of_interrupt`,
+//! `trigger_sgi`, `set_priority`) is stable across two backends, selected at
+//! compile time:
+//!
+//! - **GICv3 (default)** — [`crate::gic_v3`]. The CPU interface is accessed via
+//!   EL1 system registers (`ICC_*_EL1`) and SGI/PPI config lives in the per-PE
+//!   redistributor. This is the model QEMU presents under HVF on Apple Silicon;
+//!   the legacy GICv2 MMIO CPU interface at `0x0801_0000` does not exist there.
+//! - **GICv2 (feature `gic-v2`)** — the legacy MMIO driver below. Works under
+//!   QEMU TCG (`-machine virt` defaults to GICv2) but faults under HVF.
 
 // ============================================================================
 // GIC Register Offsets
 // ============================================================================
 
 /// GIC Distributor register offsets
+#[cfg(feature = "gic-v2")]
 mod dist {
     pub const CTLR: usize = 0x000; // Control Register
     pub const ISENABLER: usize = 0x100; // Interrupt Set-Enable Registers
@@ -16,6 +27,7 @@ mod dist {
 }
 
 /// GIC CPU Interface register offsets
+#[cfg(feature = "gic-v2")]
 mod cpu {
     pub const CTLR: usize = 0x000; // CPU Interface Control Register
     pub const PMR: usize = 0x004; // Interrupt Priority Mask Register
@@ -28,11 +40,13 @@ mod cpu {
 // ============================================================================
 
 /// ARM GIC v2 driver that encapsulates all MMIO access
+#[cfg(feature = "gic-v2")]
 struct Gic {
     dist_base: usize,
     cpu_base: usize,
 }
 
+#[cfg(feature = "gic-v2")]
 impl Gic {
     /// Create a new GIC driver with the given base addresses
     const fn new(dist_base: usize, cpu_base: usize) -> Self {
@@ -167,10 +181,11 @@ impl Gic {
 }
 
 /// Global GIC instance at remapped VAs (physical 0x0800_0000 / 0x0801_0000 via L0[1])
+#[cfg(feature = "gic-v2")]
 static GIC: Gic = Gic::new(akuma_exec::mmu::DEV_GIC_DIST_VA, akuma_exec::mmu::DEV_GIC_CPU_VA);
 
 // ============================================================================
-// Public API - Safe wrappers around GIC operations
+// Public API - Safe wrappers around the selected GIC backend
 // ============================================================================
 
 /// SGI numbers (0-15)
@@ -178,33 +193,51 @@ pub const SGI_SCHEDULER: u32 = 0; // SGI 0 for scheduling
 
 /// Initialize the GIC
 pub fn init() {
+    #[cfg(feature = "gic-v2")]
     GIC.init();
+    #[cfg(not(feature = "gic-v2"))]
+    crate::gic_v3::init();
 }
 
 /// Enable a specific IRQ
 pub fn enable_irq(irq: u32) {
+    #[cfg(feature = "gic-v2")]
     GIC.enable_irq(irq);
+    #[cfg(not(feature = "gic-v2"))]
+    crate::gic_v3::enable_irq(irq);
 }
 
 /// Acknowledge an interrupt and return its IRQ number
 pub fn acknowledge_irq() -> Option<u32> {
-    GIC.acknowledge_irq()
+    #[cfg(feature = "gic-v2")]
+    { GIC.acknowledge_irq() }
+    #[cfg(not(feature = "gic-v2"))]
+    { crate::gic_v3::acknowledge_irq() }
 }
 
 /// Signal end of interrupt handling
 pub fn end_of_interrupt(irq: u32) {
+    #[cfg(feature = "gic-v2")]
     GIC.end_of_interrupt(irq);
+    #[cfg(not(feature = "gic-v2"))]
+    crate::gic_v3::end_of_interrupt(irq);
 }
 
 /// Trigger a Software Generated Interrupt (SGI)
 ///
 /// SGI 0-15 are available. This sends the interrupt to the current CPU.
 pub fn trigger_sgi(sgi_id: u32) {
+    #[cfg(feature = "gic-v2")]
     GIC.trigger_sgi(sgi_id);
+    #[cfg(not(feature = "gic-v2"))]
+    crate::gic_v3::trigger_sgi(sgi_id);
 }
 
 /// Set interrupt priority (0 = highest, 255 = lowest)
 #[allow(dead_code)]
 pub fn set_priority(irq: u32, priority: u8) {
+    #[cfg(feature = "gic-v2")]
     GIC.set_priority(irq, priority);
+    #[cfg(not(feature = "gic-v2"))]
+    crate::gic_v3::set_priority(irq, priority);
 }

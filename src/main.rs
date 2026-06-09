@@ -32,6 +32,8 @@ mod fs;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod fs_tests;
 mod gic;
+#[cfg(not(feature = "gic-v2"))]
+mod gic_v3;
 mod irq;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod network_tests;
@@ -786,13 +788,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     gic::enable_irq(gic::SGI_SCHEDULER);
 
     console::print("Registering timer IRQ...\n");
-    irq::register_handler(30, |irq| timer::timer_irq_handler(irq));
-    
-    // Register virtual timer IRQ (27) for kernel timer async wakeups
-    // CNTV (virtual timer) avoids conflict with scheduler's CNTP
-    irq::register_handler(27, |_irq| {
-        kernel_timer::on_timer_interrupt();
-    });
+    // Single hardware timer: the virtual timer (CNTV) fires PPI 27. Its handler
+    // drives preemption AND services the async alarm queue (kernel_timer). The
+    // physical timer (CNTP/PPI 30) is not used — it is inaccessible to the guest
+    // under QEMU HVF (programming it faults with EC=0x0).
+    irq::register_handler(27, |irq| timer::timer_irq_handler(irq));
     gic::enable_irq(27); // Enable virtual timer interrupt
 
     console::print("Enabling timer...\n");

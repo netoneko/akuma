@@ -2540,7 +2540,13 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     }
                                     unsafe { core::arch::asm!("dsb ish"); }
                                     for off in (0..0x1000_usize).step_by(64) {
-                                        unsafe { core::arch::asm!("ic ivau, {}", in(reg) cur_va + off); }
+                                        // IC IVAU by the kernel VA (kva), not the user VA: the
+                                        // user page is not mapped yet at this point (map happens
+                                        // below), so an IC IVAU on cur_va translation-faults on
+                                        // real hardware / HVF. I-cache invalidation to PoU is by
+                                        // physical address, so the kva alias of the same frame is
+                                        // equivalent and always mapped.
+                                        unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
                                     }
                                 }
 
@@ -2643,7 +2649,13 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     }
                                     unsafe { core::arch::asm!("dsb ish"); }
                                     for off in (0..0x1000_usize).step_by(64) {
-                                        unsafe { core::arch::asm!("ic ivau, {}", in(reg) page_va + off); }
+                                        // IC IVAU by the kernel VA (kva), not the user VA: the
+                                        // user page is not mapped yet at this point (map happens
+                                        // below), so an IC IVAU on page_va translation-faults on
+                                        // real hardware / HVF. I-cache invalidation to PoU is by
+                                        // physical address, so the kva alias of the same frame is
+                                        // equivalent and always mapped.
+                                        unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
                                     }
                                     unsafe { core::arch::asm!("dsb ish"); core::arch::asm!("isb"); }
                                 }
@@ -3028,7 +3040,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 }
                                 unsafe { core::arch::asm!("dsb ish"); }
                                 for off in (0..0x1000_usize).step_by(64) {
-                                    unsafe { core::arch::asm!("ic ivau, {}", in(reg) cur_va + off); }
+                                    // IC IVAU by kva, not the user VA — the page isn't mapped yet
+                                    // (see note at the other demand-paging sites); on HVF an IC
+                                    // IVAU on cur_va would translation-fault.
+                                    unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
                                 }
 
                                 // Use no_flush — TLB batched after the loop.
@@ -3124,7 +3139,10 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 }
                                 unsafe { core::arch::asm!("dsb ish"); }
                                 for off in (0..0x1000_usize).step_by(64) {
-                                    unsafe { core::arch::asm!("ic ivau, {}", in(reg) page_va + off); }
+                                    // IC IVAU by kva, not the user VA — the page isn't mapped yet
+                                    // (see note at the other demand-paging sites); on HVF an IC
+                                    // IVAU on page_va would translation-fault.
+                                    unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
                                 }
                                 let (table_frames, installed) = unsafe {
                                     akuma_exec::mmu::map_user_page(page_va, pf.addr, map_flags)

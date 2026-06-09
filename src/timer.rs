@@ -36,11 +36,11 @@ pub fn enable_timer_interrupts(interval_us: u64) {
     let new_cval = counter + ticks;
 
     unsafe {
-        // Set the timer compare value
-        asm!("msr cntp_cval_el0, {}", in(reg) new_cval);
+        // Set the timer compare value (virtual timer; fires PPI 27).
+        asm!("msr cntv_cval_el0, {}", in(reg) new_cval);
 
         // Enable the timer (bit 0 = enable, bit 1 = !mask)
-        asm!("msr cntp_ctl_el0, {}", in(reg) 1u64);
+        asm!("msr cntv_ctl_el0, {}", in(reg) 1u64);
     }
 }
 
@@ -54,13 +54,19 @@ pub fn timer_irq_handler(_irq: u32) {
     let new_cval = counter + interval_ticks;
 
     unsafe {
-        asm!("msr cntp_cval_el0, {}", in(reg) new_cval);
+        asm!("msr cntv_cval_el0, {}", in(reg) new_cval);
         // Defensively re-enable the timer on every tick: bit 0 = enable, bit 1 = !mask.
-        // If cntp_ctl_el0 ever gets corrupted (enable cleared or mask set), no further
+        // If cntv_ctl_el0 ever gets corrupted (enable cleared or mask set), no further
         // IRQs would fire, causing a permanent freeze. Writing 1 here ensures the timer
         // keeps ticking even if something corrupted the control register.
-        asm!("msr cntp_ctl_el0, {}", in(reg) 1u64);
+        asm!("msr cntv_ctl_el0, {}", in(reg) 1u64);
     }
+
+    // This periodic virtual-timer tick is the single hardware timer for the
+    // kernel. Besides driving preemption (the scheduler SGI below), it services
+    // the async alarm queue (SSH read timeouts, Timer::after) which no longer
+    // owns the timer hardware itself — see kernel_timer::update_hardware_timer.
+    crate::kernel_timer::on_timer_interrupt();
 
     // Check preemption watchdog - detect threads that hold preemption disabled too long
     if crate::config::ENABLE_PREEMPTION_WATCHDOG {
@@ -103,11 +109,18 @@ pub fn timer_irq_handler(_irq: u32) {
     crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
 }
 
-// Read the ARM Generic Timer counter
+// Read the ARM Generic Timer counter.
+//
+// Uses the VIRTUAL counter (CNTVCT) rather than the physical one (CNTPCT). The
+// physical timer/counter is owned by the hypervisor under QEMU HVF and trapping
+// to it faults the guest (EC=0x0); the virtual timer works under HVF, TCG, and
+// bare-metal EL1 alike. The preemption timer below programs CNTV_CVAL, so the
+// counter we compute deadlines against must be the same virtual time base
+// (CNTVOFF is nonzero under HVF, so CNTPCT and CNTVCT differ there).
 pub fn read_counter() -> u64 {
     let counter: u64;
     unsafe {
-        asm!("mrs {}, cntpct_el0", out(reg) counter);
+        asm!("mrs {}, cntvct_el0", out(reg) counter);
     }
     counter
 }

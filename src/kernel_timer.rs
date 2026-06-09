@@ -94,13 +94,6 @@ fn counter_to_us(counter: u64) -> u64 {
     }
 }
 
-/// Convert microseconds to hardware counter ticks
-#[inline]
-fn us_to_counter(us: u64) -> u64 {
-    let freq = read_frequency();
-    ((us as u128 * freq as u128) / TICK_HZ as u128) as u64
-}
-
 /// Get current time in microseconds (from virtual counter)
 #[inline]
 pub fn now_us() -> u64 {
@@ -181,29 +174,15 @@ pub fn schedule_wake(at_us: u64, waker: &Waker) {
     });
 }
 
-/// Update CNTV_CVAL to the earliest pending alarm
-fn update_hardware_timer(queue: &[ScheduledWake; QUEUE_SIZE]) {
-    let mut earliest = u64::MAX;
-
-    for entry in queue.iter() {
-        if entry.waker.is_some() && entry.at < earliest {
-            earliest = entry.at;
-        }
-    }
-
-    if earliest != u64::MAX {
-        let counter_target = us_to_counter(earliest);
-        unsafe {
-            asm!("msr cntv_cval_el0, {}", in(reg) counter_target);
-            asm!("msr cntv_ctl_el0, {}", in(reg) 1u64);
-        }
-    } else {
-        // No pending alarms -- disable virtual timer
-        unsafe {
-            asm!("msr cntv_ctl_el0, {}", in(reg) 0u64);
-        }
-    }
-}
+/// Alarm servicing is driven by the periodic preemption tick, which owns the
+/// virtual timer hardware (CNTV_CVAL) — see `timer::timer_irq_handler`. There is
+/// only one virtual timer compare register, and the scheduler must keep it armed
+/// at a fixed ~10ms period; if this queue also wrote CNTV_CVAL it would push the
+/// next tick out to a far-future alarm (e.g. a 5s `Timer::after`) and freeze
+/// preemption. So this is intentionally a no-op: alarms are checked every tick in
+/// `on_timer_interrupt`, giving them the scheduler quantum (~10ms) as resolution,
+/// which is fine for SSH read timeouts and periodic monitors.
+fn update_hardware_timer(_queue: &[ScheduledWake; QUEUE_SIZE]) {}
 
 /// Check and fire expired alarms. Call from IRQ 27 handler.
 ///

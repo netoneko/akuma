@@ -5572,11 +5572,17 @@ fn test_mprotect_flag_update_with_cache_maintenance() -> bool {
     // Update flags to RX (simulating mprotect PROT_READ|PROT_EXEC)
     let update_ok = addr_space.update_page_flags(test_va, akuma_exec::mmu::user_flags::RX).is_ok();
 
-    // Run the IC IALLU cache maintenance path (as sys_mprotect now does)
+    // Run the IC IALLU cache maintenance path (as sys_mprotect now does).
+    // Clean the data cache via the kernel-mapped address of the frame, NOT the
+    // user VA: `addr_space` is not the active TTBR0 here, so `test_va` is not
+    // translatable and `dc cvau` on it would fault on real hardware / HVF (it is
+    // only a silent no-op under QEMU TCG). The real sys_mprotect cleans via the
+    // same kernel VA — see the DC CVAU on `kva` in exceptions.rs.
+    let kva = akuma_exec::mmu::phys_to_virt(frame.addr) as usize;
     unsafe {
         let mut off = 0usize;
         while off < 4096 {
-            core::arch::asm!("dc cvau, {}", in(reg) (test_va + off) as u64);
+            core::arch::asm!("dc cvau, {}", in(reg) (kva + off) as u64);
             off += 64;
         }
         core::arch::asm!("dsb ish");
@@ -5630,13 +5636,16 @@ fn test_mprotect_large_region_completes() -> bool {
         let _ = addr_space.update_page_flags(va, akuma_exec::mmu::user_flags::RX);
     }
 
-    // Run the optimized cache maintenance path: DC CVAU loop + single IC IALLU
-    for i in 0..num_pages {
-        let va = base_va + i * 4096;
+    // Run the optimized cache maintenance path: DC CVAU loop + single IC IALLU.
+    // Clean via each frame's kernel-mapped address (not the user VA in the
+    // inactive `addr_space`), matching the real sys_mprotect path — see the
+    // companion note in test_mprotect_flag_update_with_cache_maintenance.
+    for f in frames.iter() {
+        let kva = akuma_exec::mmu::phys_to_virt(f.addr) as usize;
         unsafe {
             let mut off = 0usize;
             while off < 4096 {
-                core::arch::asm!("dc cvau, {}", in(reg) (va + off) as u64);
+                core::arch::asm!("dc cvau, {}", in(reg) (kva + off) as u64);
                 off += 64;
             }
         }

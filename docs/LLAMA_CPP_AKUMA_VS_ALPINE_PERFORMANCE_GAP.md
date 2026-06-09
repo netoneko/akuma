@@ -29,21 +29,27 @@ Akuma runs via `cargo run --release`, which uses the runner defined in `.cargo/c
 
 The generation phase (autoregressive, one token at a time) is even worse than prompt processing because TCG overhead is per-instruction and the compute-to-overhead ratio drops when doing less arithmetic per syscall/interrupt cycle.
 
-### Why Akuma can't use HVF (for now)
+### Akuma now runs under HVF (since 2026-06-09)
 
-`scripts/run.sh` does specify `-accel hvf`, but QEMU crashes on boot with:
+The TCG numbers above are no longer the only option. `cargo run --release` uses
+`-accel hvf` by default on Apple Silicon, and stories15M-q4_0 measures **~7000–7500
+t/s prompt and ~1300–1700 t/s generation** under HVF (vs ~100 / ~13–14 t/s under
+TCG with `-t 1`) — a ~70× / ~100× speedup. The `(isv)` assertion was **not** a
+QEMU bug and **not** the NEON `STP`/`LDP` save/restore (that earlier theory was
+wrong — NEON saves target the stack, which is RAM that HVF faults in without a
+trap to QEMU). It was three Akuma assumptions that only hold under TCG:
 
-```
-Assertion failed: (isv), function hvf_handle_exception, file hvf.c, line 1883.
-```
+1. **GICv2 MMIO programming model.** HVF presents GICv3; the GICv2 CPU-interface
+   MMIO at `0x0801_0000` does not exist there, and distributor writes faulted with
+   ISV=0 → assert. Fixed by a GICv3 driver (`src/gic_v3.rs`, default; GICv2 behind
+   the `gic-v2` feature).
+2. **Physical timer (`CNTP`).** Trapped under HVF; switched preemption to the
+   virtual timer (`CNTV`/PPI 27).
+3. **`IC IVAU` on a not-yet-mapped user VA** in the demand-pager; switched to the
+   kernel alias (`kva`).
 
-This is a **QEMU bug**, not an Akuma bug. When the guest executes certain AArch64 instructions that don't set the ISV (Instruction Syndrome Valid) bit in ESR_EL2 — notably `STP`/`LDP` of Q-registers — and those instructions trigger a VM exit (e.g. page fault during NEON save in the exception handler), QEMU's HVF backend asserts because it cannot decode the faulting instruction without ISV. The NEON save/restore code in `src/exceptions.rs` uses `stp q0, q1, [sp, #offset]` sequences, which are exactly the instructions that lack ISV information.
-
-Possible workarounds (not yet implemented):
-1. Pre-fault the exception handler stack pages so the NEON save instructions never trigger page faults during VM execution.
-2. Replace Q-register `STP`/`LDP` in exception handlers with `STR`/`LDR` (single-register variants may behave differently for ISV).
-3. Use `ST1`/`LD1` NEON store/load instructions instead, which may set ISV.
-4. Wait for upstream QEMU to fix the HVF ISV handling (QEMU issue tracker has reports of this).
+See `docs/QEMU_HVF_ISV_BUG.md` for the full writeup. Note `scripts/run.sh` is a
+separate, older script; the canonical runner is `scripts/cargo_runner.sh`.
 
 ## Secondary factors (Akuma kernel overhead)
 
@@ -122,15 +128,20 @@ Graviton 2/3 instances support NEON, FP16, and dot-product natively. With 1GB RA
 ## How to reproduce
 
 ```bash
-# TCG (slow) — default cargo runner
+# HVF (fast) — default on Apple Silicon
 cargo run --release
-# Inside Akuma:
-llama-cli -m /model.gguf -p "Hello" -n 16 -t 2 --no-mmap -c 256
+# Inside Akuma (single-core, so -t 1; -st for clean exit on repeated runs):
+llama-cli -m /models/stories15M-q4_0.gguf -p "Once upon a time" -n 16 -t 1 -c 256 -st
 
-# HVF (fast, currently crashes due to QEMU bug)
-scripts/run.sh
+# TCG (slow, portable) — force with HVF=0
+HVF=0 cargo run --release
 ```
 
 ## Summary
 
-The ~3000x performance gap is almost entirely explained by QEMU's TCG software emulation versus HVF hardware virtualization. The Akuma kernel adds minor overhead from eager NEON save/restore and syscall instrumentation, but these are negligible on real hardware. The path to fast inference is either fixing the QEMU HVF ISV assertion (a QEMU-side fix) or deploying to real AArch64 hardware.
+The ~3000x performance gap was almost entirely QEMU's TCG software emulation versus
+HVF hardware virtualization — and Akuma now runs under HVF by default on Apple
+Silicon, closing it (~70× prompt / ~100× generation on stories15M). The remaining
+kernel overhead (eager NEON save/restore, syscall instrumentation) is minor. The
+fix was Akuma-side (GICv3 driver + virtual timer + correct I-cache maintenance),
+not a QEMU patch; see `docs/QEMU_HVF_ISV_BUG.md`.

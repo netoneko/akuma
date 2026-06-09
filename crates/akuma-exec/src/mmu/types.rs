@@ -14,6 +14,11 @@ pub const DEV_GIC_CPU_VA: usize  = 0x80_0000_1000;
 pub const DEV_UART_VA: usize     = 0x80_0000_2000;
 pub const DEV_FW_CFG_VA: usize   = 0x80_0000_3000;
 pub const DEV_VIRTIO_VA: usize   = 0x80_0000_4000;
+/// GICv3 redistributor, CPU0 RD_base frame (PA 0x080A_0000). GICR_WAKER lives here.
+pub const DEV_GICR_RD_VA: usize  = 0x80_0000_5000;
+/// GICv3 redistributor, CPU0 SGI_base frame (PA 0x080B_0000). SGI/PPI enable,
+/// priority and group registers live here.
+pub const DEV_GICR_SGI_VA: usize = 0x80_0000_6000;
 
 pub const MAIR_DEVICE_NGNRNE: u64 = 0;
 pub const MAIR_NORMAL_NC: u64 = 1;

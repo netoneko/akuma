@@ -124,11 +124,13 @@ static SHARED_DEV_L1_PHYS: AtomicUsize = AtomicUsize::new(0);
 
 /// Device physical addresses and their L3 slot indices.
 const DEV_PAGES: &[(usize, usize)] = &[
-    (0, 0x0800_0000), // L3[0]: GIC distributor
-    (1, 0x0801_0000), // L3[1]: GIC CPU interface
+    (0, 0x0800_0000), // L3[0]: GIC distributor (GICD, shared by v2 & v3)
+    (1, 0x0801_0000), // L3[1]: GICv2 CPU interface (unused under GICv3)
     (2, 0x0900_0000), // L3[2]: UART PL011
     (3, 0x0902_0000), // L3[3]: fw_cfg
     (4, 0x0A00_0000), // L3[4]: VirtIO MMIO
+    (5, 0x080A_0000), // L3[5]: GICv3 redistributor CPU0 RD_base frame
+    (6, 0x080B_0000), // L3[6]: GICv3 redistributor CPU0 SGI_base frame
 ];
 
 /// Allocate the shared L1/L2/L3 device page tables that every user address

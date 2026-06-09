@@ -129,10 +129,46 @@ case "$SOUND" in
     ;;
 esac
 
+# Accelerator. Defaults to HVF (Apple Hypervisor.framework, near-native AArch64
+# execution) on Apple Silicon where it is available, falling back to TCG (portable
+# software emulation, ~3000x slower for NEON) elsewhere. Override with HVF=1 to
+# force it on, or HVF=0 to force TCG (e.g. for deterministic gdb crash repro — HVF
+# runs on real hardware timing and is non-deterministic).
+#
+# HVF notes (see docs/QEMU_HVF_ISV_BUG.md):
+#   - Requires -cpu host (HVF rejects -cpu max).
+#   - The default kernel build uses the GICv3 driver, which is why -machine virt
+#     carries gic-version=3 below; HVF only supports GICv3 anyway. A kernel built
+#     with --features gic-v2 needs gic-version=2 and will NOT run under HVF.
+#   - ramfb is dropped under HVF: its dirty-page tracking can trip QEMU's HVF
+#     data-abort path. -display none is already set, so it is unnecessary.
+HVF="${HVF:-auto}"
+use_hvf=0
+case "$HVF" in
+  1|on|yes|true|TRUE) use_hvf=1 ;;
+  0|off|no|false|FALSE) use_hvf=0 ;;
+  auto|*)
+    if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ] \
+       && qemu-system-aarch64 -accel help 2>/dev/null | grep -qw hvf; then
+      use_hvf=1
+    fi
+    ;;
+esac
+
+if [ "$use_hvf" = "1" ]; then
+  ACCEL_ARGS=(-accel hvf -cpu host)
+  FB_ARGS=()
+  echo "[cargo_runner] accelerator: HVF (-accel hvf -cpu host; ramfb disabled). HVF=0 to force TCG." >&2
+else
+  ACCEL_ARGS=(-accel tcg -cpu max)
+  FB_ARGS=(-device ramfb)
+  echo "[cargo_runner] accelerator: TCG (software emulation)." >&2
+fi
+
 exec qemu-system-aarch64 \
   -semihosting \
-  -machine virt \
-  -cpu max \
+  -machine virt,gic-version=3 \
+  "${ACCEL_ARGS[@]}" \
   -m "$MEMORY" \
   -serial mon:stdio \
   -display none \
@@ -142,7 +178,7 @@ exec qemu-system-aarch64 \
   -drive "$DRIVE_OPTS" \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
-  -device ramfb \
+  "${FB_ARGS[@]}" \
   "${SOUND_ARGS[@]}" \
   -kernel "$BIN" \
   "${GDB_ARGS[@]}"

@@ -1,98 +1,104 @@
-# QEMU HVF ISV Assertion Bug
+# QEMU HVF — Booting Akuma under Apple Hypervisor.framework (RESOLVED 2026-06-09)
 
-## Problem
+Akuma now boots and runs userspace under `-accel hvf` on Apple Silicon, and
+`scripts/cargo_runner.sh` **uses HVF by default** there (auto-detected; falls back
+to TCG on other hosts, and `HVF=0` forces TCG). Inference is ~70–120× faster than
+TCG (see "Result" below).
 
-Running Akuma with `-accel hvf` crashes QEMU on boot:
+The historical blocker was an assertion in QEMU's HVF backend:
 
 ```
 Assertion failed: (isv), function hvf_handle_exception, file hvf.c, line 1883.
 ```
 
-Without HVF, QEMU falls back to TCG (software emulation), which is ~3000x slower for NEON-heavy workloads like llama.cpp inference. See `LLAMA_CPP_AKUMA_VS_ALPINE_PERFORMANCE_GAP.md` for details.
+It turned out **not** to be a single QEMU bug, and **not** the NEON `STP`/`LDP`
+save/restore in `src/exceptions.rs` (an earlier version of this doc guessed that —
+it was wrong; NEON saves go to the stack, which is RAM that HVF faults in
+transparently without trapping to QEMU). It was three separate Akuma-side
+assumptions that only hold under QEMU TCG software emulation. All three are fixed.
 
-## Root Cause
+## Root cause 1 — GICv2 MMIO programming model (the `isv` assertion)
 
-QEMU's HVF backend has an `assert(isv)` in the `EC_DATAABORT` handler with a TODO comment acknowledging the gap:
+`assert(isv)` in QEMU's HVF `EC_DATAABORT` handler fires when a data abort traps
+to the hypervisor with ISV=0 (no decoded syndrome). Apple HVF reports ISV=0 for
+accesses to addresses it cannot resolve as plain RAM — including MMIO and faults
+to unmapped guest-physical addresses.
 
-```c
-/*
- * TODO: ISV will be 0 for SIMD or SVE accesses.
- * Inject the exception into the guest.
- */
-assert(isv);
+Under `-machine virt`, **TCG defaults to GICv2 but HVF presents GICv3**. The
+GICv2 driver (`src/gic.rs`) programmed:
+- the distributor's `GICD_IPRIORITYR`/`GICD_ITARGETSR` (GICv2 layout), and
+- the **GICv2 CPU interface MMIO at `0x0801_0000`**, which does not exist under
+  GICv3 (the CPU interface is a system-register interface, `ICC_*_EL1`).
+
+The first distributor write past the v2/v3-divergent region faulted with ISV=0 →
+assert. (Empirically the fault hit during the `GICD_IPRIORITYR` loop.)
+
+**Fix:** a proper **GICv3 driver**, `src/gic_v3.rs`, now the default. It uses the
+system-register CPU interface (`ICC_SRE/PMR/IGRPEN1/IAR1/EOIR1/SGI1R_EL1`) and the
+per-PE **redistributor** (GICR) for SGI/PPI config. The legacy GICv2 MMIO driver
+is kept behind the `gic-v2` Cargo feature for reference/fallback (it works under
+TCG with `gic-version=2`, never under HVF). The runner passes
+`-machine virt,gic-version=3` for both accelerators. Akuma uses only SGI 0 and
+PPIs 27/30, so no SPI routing (`GICD_IROUTER`) is needed. Two redistributor frames
+(`0x080A_0000` RD_base, `0x080B_0000` SGI_base) were added to the device mapping
+in `boot.rs` and `crates/akuma-exec/src/mmu/mod.rs` (`DEV_PAGES`).
+
+## Root cause 2 — physical timer (CNTP) is trapped under HVF
+
+After the GIC, the kernel crashed programming `CNTP_CVAL_EL0` (EC=0x0, undefined).
+The **physical** timer/counter belongs to the hypervisor under HVF; an EL1 guest
+must use the **virtual** timer (`CNTV_*`, PPI 27). Akuma had split the two: CNTP
+(PPI 30) for preemption, CNTV (PPI 27) for the async alarm queue (`kernel_timer`).
+
+**Fix:** unify onto the single virtual timer. `src/timer.rs` now programs
+`CNTV_CVAL_EL0`/`CNTV_CTL_EL0` and reads `CNTVCT_EL0` (the physical and virtual
+time bases differ under HVF because `CNTVOFF` is nonzero). The 10 ms preemption
+tick (PPI 27) owns the hardware and, on each tick, services the async alarm queue;
+`kernel_timer::update_hardware_timer` is now a no-op (it would otherwise push the
+next tick out to a far-future alarm and freeze preemption). Async timers get
+~10 ms resolution, which is fine for the SSH read timeouts and periodic monitors
+that use them. This is also more portable: EL1 guests use the virtual timer on
+real hardware too.
+
+## Root cause 3 — IC IVAU on the not-yet-mapped user VA
+
+Userspace ELF exec then failed (`busybox` → exit -14): the demand-pager loads a
+code page, runs cache maintenance, then maps the page. The maintenance did
+`DC CVAU` on the kernel alias (`kva`, correct) but `IC IVAU` on the **user VA**,
+which is not mapped until *after* the maintenance — so on real hardware/HVF the
+`IC IVAU` translation-faulted (EC=0x25, DFSC=translation fault L3). TCG treats
+cache ops as no-ops, so it never showed.
+
+**Fix:** I-cache invalidation to PoU is by physical address, so all four
+demand-paging sites in `src/exceptions.rs` now `IC IVAU` via `kva` (the always-
+mapped kernel alias of the same frame), matching the `DC CVAU` above them. The
+companion self-tests in `src/tests.rs` had the same mistake (cleaning a user VA in
+an inactive address space) and were corrected to use `kva`.
+
+## Result
+
+`llama-cli -m /models/stories15M-q4_0.gguf -p "Once upon a time" -n 16 -t 1 -c 256 -st`
+
+| Metric      | TCG (`-t 1`) | HVF (`-cpu host`) | Speedup |
+|-------------|--------------|-------------------|---------|
+| Prompt      | ~100 t/s     | ~7000–7500 t/s    | ~70×    |
+| Generation  | ~13–14 t/s   | ~1300–1700 t/s    | ~100×   |
+| Full run    | tens of s    | ~1.7 s wall       |         |
+
+(M4 Pro, QEMU 10.2.0, 256 MB, release build. The lingering-llama OOM on repeated
+runs without `-st` is unchanged — see docs/LOW_MEMORY_ENVIRONMENT.md.)
+
+## How to run
+
+```bash
+cargo run --release                # HVF auto-selected on Apple Silicon
+HVF=0 cargo run --release          # force TCG (e.g. deterministic gdb crash repro)
+ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -p 2222 root@localhost
 ```
 
-Per the ARM Architecture Reference Manual, the ISV (Instruction Syndrome Valid) bit in ESR_EL2 is NOT set for:
+The runner selects HVF when `uname` is `Darwin`/`arm64` and QEMU lists the `hvf`
+accelerator; otherwise it uses TCG. HVF runs on real-hardware timing and is
+non-deterministic, so prefer `HVF=0` for gdbstub-based deterministic crash repro.
 
-- STP/LDP (pair instructions, any register size)
-- Pre/post-indexed load/stores (writeback variants)
-- Any 128-bit SIMD/FP access (STR/LDR of Q-registers)
-- ST1/LD1 (NEON element/structure loads)
-
-When a stage 2 VM exit (e.g. dirty page tracking) coincides with one of these instructions, QEMU cannot decode the access from the syndrome alone and aborts. Akuma's exception handlers use `stp q0, q1, [sp, #offset]` extensively for NEON save/restore, triggering this.
-
-Replacing `stp` with single-register `str q0` would NOT help — 128-bit accesses never set ISV regardless of instruction form. `stp d0, d1` (64-bit pair) also fails because STP never sets ISV.
-
-Upstream issue: https://gitlab.com/qemu-project/qemu/-/issues/2312
-
-## Workarounds
-
-### 1. Patch QEMU locally (recommended)
-
-Replace the `assert(isv)` with a retry. When ISV=0 and the access is to RAM, the stage 2 mapping has already been fixed by QEMU's fault handler — retrying the instruction succeeds.
-
-In `target/arm/hvf/hvf.c`, `hvf_handle_exception()`, `EC_DATAABORT` case, replace:
-
-```c
-assert(isv);
-```
-
-with:
-
-```c
-if (!isv) {
-    break;  /* Retry — stage 2 mapping already fixed */
-}
-```
-
-Build QEMU from source with this change (`brew install --build-from-source qemu` after patching, or build from the GitLab repo).
-
-### 2. Remove `-device ramfb`
-
-The ramfb framebuffer device likely enables dirty-page tracking, which write-protects guest RAM pages at stage 2 and causes VM exits on first write. Since `-display none` is already set, ramfb is unnecessary.
-
-In `scripts/run.sh`, remove:
-```
--device ramfb
-```
-
-### 3. Pre-fault kernel stack pages
-
-Touch all kernel stack pages before installing exception vectors to ensure they are mapped in stage 2. This prevents stage 2 faults during NEON save in exception handlers.
-
-```rust
-// Before exceptions::init()
-unsafe {
-    let stack_base = 0x40700000u64;
-    let stack_top  = 0x40800000u64;
-    let mut addr = stack_base;
-    while addr < stack_top {
-        core::ptr::write_volatile(addr as *mut u8, 0);
-        addr += 4096;
-    }
-}
-```
-
-Only helps if the boot stack is the trigger; other pages could also fault.
-
-### 4. Use `-cpu host` instead of `-cpu max`
-
-`-cpu max` enables features the host may not fully support, potentially causing QEMU to set up extra memory protections. `-cpu host` passes through only actual hardware capabilities.
-
-### 5. Upstream fix
-
-File or comment on the existing QEMU issue. The TODO in the source says exactly what needs to happen. KVM already handles non-ISV data aborts by fetching and decoding the guest instruction or injecting an external abort.
-
-## Recommended approach
-
-Try removing ramfb first (one-line change). If that doesn't fix it, patch QEMU locally — the change is minimal and well-understood.
+Akuma is single-core, so HVF's gain is native instruction execution, not
+parallelism — keep `-t 1` for llama.

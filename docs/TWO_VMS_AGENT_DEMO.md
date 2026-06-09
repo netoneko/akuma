@@ -131,26 +131,27 @@ emulation mode (HVF acceleration is incompatible — see below).
 instruction on the host CPU. Even on Apple Silicon (AArch64 host), QEMU does
 not run the guest natively without explicit acceleration.
 
-## HVF Acceleration (NOT Currently Working)
+## HVF Acceleration (WORKING — default on Apple Silicon since 2026-06-09)
 
-QEMU supports Apple Hypervisor.framework (`-accel hvf`) for native-speed AArch64
-guests, which would make inference 10–50× faster. However, the akuma kernel
-triggers an assertion failure in QEMU's HVF exception handler:
+QEMU's Apple Hypervisor.framework backend (`-accel hvf`) now runs Akuma at
+near-native AArch64 speed. `scripts/cargo_runner.sh` enables it by default on
+Apple Silicon (auto-detected; `HVF=0` forces TCG). Measured ~70× prompt and ~100×
+generation speedup on stories15M vs TCG (see docs/QEMU_HVF_ISV_BUG.md for the full
+table and root-cause writeup).
 
-```
-Assertion failed: (isv), function hvf_handle_exception, file hvf.c, line 1883.
-```
+Getting there required three Akuma-side fixes, each masked by TCG's lack of real
+hardware behavior:
 
-The `isv` (Instruction Syndrome Valid) bit is unset in certain exception
-syndromes that the akuma kernel generates (likely related to semihosting or
-specific data abort patterns). This is a kernel/QEMU compatibility issue, not a
-QEMU bug per se.
+1. **GICv3 driver** (`src/gic_v3.rs`, now default; GICv2 behind the `gic-v2`
+   feature). HVF presents GICv3, whose CPU interface is system-register based; the
+   old GICv2 MMIO model triggered the `(isv)` assertion in `hvf_handle_exception`.
+2. **Virtual timer** (`CNTV`/PPI 27) for preemption — the physical timer (`CNTP`)
+   is trapped under HVF.
+3. **I-cache maintenance via the kernel alias** in the demand-pager — `IC IVAU` on
+   a not-yet-mapped user VA translation-faulted on real hardware.
 
-**To investigate:** compare the ESR_EL2 values that trigger the assertion and
-add handling in the kernel or disable the semihosting path when HVF is active.
-
-Once HVF is fixed, add `-accel hvf` to `scripts/cargo_runner.sh` (currently
-reverted). Expected speedup: 10–50× faster inference.
+The earlier guess that the `(isv)` assertion came from NEON `STP`/`LDP` in the
+exception handlers was incorrect.
 
 ## 64 MB meow VM Crash
 

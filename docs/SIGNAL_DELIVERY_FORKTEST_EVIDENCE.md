@@ -632,7 +632,7 @@ Old code wrote `(*frame).spsr_el1 = 0`, clearing NZCV and DAIF along with the ba
 | TCG boot — signal tests | All `[PASS]` unchanged from baseline |
 | TCG boot — SSH server | Listening on port 2222 |
 | New in-kernel failures | None |
-| HVF `(isv)` assertion | Pre-existing QEMU HVF bug, unrelated |
+| HVF `(isv)` assertion | Unrelated to this investigation (later root-caused to Akuma's GICv2 driver and fixed — see docs/QEMU_HVF_ISV_BUG.md) |
 
 ---
 

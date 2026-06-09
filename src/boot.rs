@@ -216,33 +216,44 @@ setup_boot_page_tables:
     str     x0, [x15, #0]           // dev_l2[0]
     
     // Device page entries in boot_dev_l3:
-    // L3[0] = GIC distributor  (PA 0x0800_0000)
-    // L3[1] = GIC CPU          (PA 0x0801_0000)
-    // L3[2] = UART PL011       (PA 0x0900_0000)
-    // L3[3] = fw_cfg           (PA 0x0902_0000)
-    // L3[4] = VirtIO MMIO      (PA 0x0A00_0000)
+    // L3[0] = GIC distributor       (PA 0x0800_0000)
+    // L3[1] = GICv2 CPU interface    (PA 0x0801_0000)
+    // L3[2] = UART PL011             (PA 0x0900_0000)
+    // L3[3] = fw_cfg                 (PA 0x0902_0000)
+    // L3[4] = VirtIO MMIO            (PA 0x0A00_0000)
+    // L3[5] = GICv3 redist RD_base   (PA 0x080A_0000)
+    // L3[6] = GICv3 redist SGI_base  (PA 0x080B_0000)
+    // Must mirror DEV_PAGES in crates/akuma-exec/src/mmu/mod.rs.
     ldr     x1, =DEVICE_PAGE
-    
+
     ldr     x0, =0x08000000
     orr     x0, x0, x1
     str     x0, [x16, #0]           // L3[0]: GIC dist
-    
+
     ldr     x0, =0x08010000
     orr     x0, x0, x1
-    str     x0, [x16, #8]           // L3[1]: GIC CPU
-    
+    str     x0, [x16, #8]           // L3[1]: GICv2 CPU iface
+
     ldr     x0, =0x09000000
     orr     x0, x0, x1
     str     x0, [x16, #16]          // L3[2]: UART
-    
+
     ldr     x0, =0x09020000
     orr     x0, x0, x1
     str     x0, [x16, #24]          // L3[3]: fw_cfg
-    
+
     ldr     x0, =0x0a000000
     orr     x0, x0, x1
     str     x0, [x16, #32]          // L3[4]: VirtIO MMIO
-    
+
+    ldr     x0, =0x080a0000
+    orr     x0, x0, x1
+    str     x0, [x16, #40]          // L3[5]: GICv3 redist RD_base
+
+    ldr     x0, =0x080b0000
+    orr     x0, x0, x1
+    str     x0, [x16, #48]          // L3[6]: GICv3 redist SGI_base
+
     // Store TTBR0 address
     adrp    x0, boot_ttbr0_addr
     add     x0, x0, :lo12:boot_ttbr0_addr
