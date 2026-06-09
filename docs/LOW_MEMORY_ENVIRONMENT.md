@@ -399,7 +399,8 @@ Two flags matter for 64 MB:
 
 - **`-t 1`** — on single-core QEMU TCG this is **~30× faster** than `-t 2`
   (~13–14 t/s gen / ~100 t/s prompt vs ~0.4 t/s): `-t 2` worker threads just thrash
-  on barriers on the one emulated core. (On multi-core HVF/Graviton, more threads help.)
+  on barriers on the one emulated core. Keep `-t 1` under HVF too — Akuma is
+  single-core, so HVF's gain is native instruction execution, not parallelism.
 - **`-st` / `--single-turn`** — REQUIRED for reliable repeated runs. `llama-cli`
   defaults to conversational mode and, after generating, parks waiting for stdin; when
   the SSH session closes the process **does not exit — it orphans and keeps its ~49 MB
@@ -414,6 +415,22 @@ Notes: stories15M (18 MB) runs reliably at 64 MB with `-t 1 -st`; SmolLM2-135M (
 OOMs (too big for 64 MB regardless). The akuma shell does **not** support redirection
 (`2>&1` makes a file named `&1`); the VM regenerates its SSH host key (use
 `ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no`).
+
+### stories15M performance: HVF vs TCG (2026-06-09)
+
+Since HVF now boots (`cargo run` auto-selects it on Apple Silicon — see
+`docs/QEMU_HVF_ISV_BUG.md`), the same `stories15M-q4_0` run is dramatically faster
+under HVF than the TCG numbers above:
+
+| Metric      | TCG (`-t 1`) | HVF (`-cpu host`) | Speedup |
+|-------------|--------------|-------------------|---------|
+| Prompt      | ~100 t/s     | ~7000–7500 t/s    | ~70×    |
+| Generation  | ~13–14 t/s   | ~1300–1700 t/s    | ~100×   |
+| Full run    | tens of s    | ~1.7 s wall       |         |
+
+Measured on an M4 Pro, QEMU 10.2.0, release build at 256 MB, with
+`llama-cli -m /models/stories15M-q4_0.gguf -p "Once upon a time" -n 16 -t 1 -c 256 -st`.
+The lingering-llama OOM on repeated runs without `-st` is unchanged.
 
 ## meow → ollama runs at 7 MB — lazy-ELF segment-boundary zeroing (FIXED 2026-06-05)
 

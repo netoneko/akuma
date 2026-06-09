@@ -14,8 +14,10 @@ Assertion failed: (isv), function hvf_handle_exception, file hvf.c, line 1883.
 It turned out **not** to be a single QEMU bug, and **not** the NEON `STP`/`LDP`
 save/restore in `src/exceptions.rs` (an earlier version of this doc guessed that —
 it was wrong; NEON saves go to the stack, which is RAM that HVF faults in
-transparently without trapping to QEMU). It was three separate Akuma-side
-assumptions that only hold under QEMU TCG software emulation. All three are fixed.
+transparently without trapping to QEMU). It was four separate Akuma-side
+assumptions that only hold under QEMU TCG software emulation. All four are fixed,
+and all three kernel profiles (`release`, `size`, `extreme-size`) boot to SSH and
+run userspace under both HVF and TCG.
 
 ## Root cause 1 — GICv2 MMIO programming model (the `isv` assertion)
 
@@ -74,6 +76,29 @@ demand-paging sites in `src/exceptions.rs` now `IC IVAU` via `kva` (the always-
 mapped kernel alias of the same frame), matching the `DC CVAU` above them. The
 companion self-tests in `src/tests.rs` had the same mistake (cleaning a user VA in
 an inactive address space) and were corrected to use `kva`.
+
+## Root cause 4 — post-indexed (writeback) MMIO store on the `extreme` profile
+
+After 1–3, `release` and `size` ran under HVF but the `extreme-size` profile still
+hit `(isv)` — during the GICR SGI-frame setup in `gic_v3::init` (the redistributor
+read fine; a *write* faulted). Cause: ISV is also 0 for **writeback (pre/post-indexed)
+and pair/SIMD** load/stores. The `GICR_IPRIORITYR` loop, written with
+`write_volatile`, was lowered by the `extreme-size` profile's optimizer to a
+post-indexed store:
+
+```
+str  w10, [x8], #0x4      ; ISV = 0  → HVF asserts
+```
+
+`release` happened to emit `str w10, [x8, #off]` (ISV=1), which is why only
+`extreme` crashed. `write_volatile` guarantees the access happens but **not** the
+addressing mode.
+
+**Fix:** `gic_v3.rs` does all GICv3 MMIO through small inline-asm helpers
+(`mmio_r32`/`mmio_w32`, and a `strb` for `set_priority`) that force a plain
+single-register `ldr`/`str` with base-register-only addressing — ISV=1 on every
+optimization level. This is the general rule for MMIO on hardware/HVF: never let
+the compiler pick the addressing mode for a device access.
 
 ## Result
 

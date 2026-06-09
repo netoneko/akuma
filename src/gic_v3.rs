@@ -20,7 +20,6 @@
 //!   ([`mmu::DEV_GICR_SGI_VA`]).
 
 use akuma_exec::mmu;
-use core::ptr::{read_volatile, write_volatile};
 
 // --- GICD (distributor) MMIO register offsets ---
 mod gicd {
@@ -50,16 +49,46 @@ mod gicr_sgi {
 }
 
 #[inline]
-fn gicd(off: usize) -> *mut u32 {
-    (mmu::DEV_GIC_DIST_VA + off) as *mut u32
+fn gicd(off: usize) -> usize {
+    mmu::DEV_GIC_DIST_VA + off
 }
 #[inline]
-fn gicr_rd(off: usize) -> *mut u32 {
-    (mmu::DEV_GICR_RD_VA + off) as *mut u32
+fn gicr_rd(off: usize) -> usize {
+    mmu::DEV_GICR_RD_VA + off
 }
 #[inline]
-fn gicr_sgi(off: usize) -> *mut u32 {
-    (mmu::DEV_GICR_SGI_VA + off) as *mut u32
+fn gicr_sgi(off: usize) -> usize {
+    mmu::DEV_GICR_SGI_VA + off
+}
+
+/// 32-bit MMIO read/write via explicit single-register `ldr`/`str` with plain
+/// base-register addressing.
+///
+/// We deliberately do NOT use `read_volatile`/`write_volatile` here: the
+/// optimizer is free to lower a `write_volatile` loop to a post-indexed
+/// (writeback) store, e.g. `str w, [x], #4`. Writeback and pair/SIMD forms set
+/// ESR ISV=0, and QEMU's HVF backend asserts (`hvf.c: assert(isv)`) on a data
+/// abort it cannot decode — so a GICR write would crash QEMU under HVF on the
+/// `extreme` profile (which chose that addressing mode) while working on
+/// `release` (which happened to emit `str w, [x, #off]`). Forcing the
+/// instruction form here makes GICv3 MMIO ISV-safe on every build profile.
+#[inline]
+fn mmio_w32(addr: usize, val: u32) {
+    // SAFETY: `addr` is a device-mapped GIC MMIO register.
+    unsafe {
+        core::arch::asm!("str {v:w}, [{a}]", v = in(reg) val, a = in(reg) addr,
+            options(nostack, preserves_flags));
+    }
+}
+#[inline]
+fn mmio_r32(addr: usize) -> u32 {
+    let val: u32;
+    // SAFETY: `addr` is a device-mapped GIC MMIO register.
+    unsafe {
+        core::arch::asm!("ldr {v:w}, [{a}]", v = out(reg) val, a = in(reg) addr,
+            options(nostack, preserves_flags, readonly));
+    }
+    val
 }
 
 // ============================================================================
@@ -120,36 +149,26 @@ pub fn init() {
     isb();
 
     // 2. Wake this PE's redistributor: clear ProcessorSleep, wait ChildrenAsleep.
-    // SAFETY: GICR RD_base frame is device-mapped for CPU0.
-    unsafe {
-        let waker = gicr_rd(gicr_rd::WAKER);
-        let v = read_volatile(waker) & !GICR_WAKER_PROCESSOR_SLEEP;
-        write_volatile(waker, v);
-        while read_volatile(waker) & GICR_WAKER_CHILDREN_ASLEEP != 0 {
-            core::hint::spin_loop();
-        }
+    let waker = gicr_rd(gicr_rd::WAKER);
+    mmio_w32(waker, mmio_r32(waker) & !GICR_WAKER_PROCESSOR_SLEEP);
+    while mmio_r32(waker) & GICR_WAKER_CHILDREN_ASLEEP != 0 {
+        core::hint::spin_loop();
     }
 
     // 3. Configure SGIs/PPIs (INTID 0-31) in the redistributor SGI frame.
-    // SAFETY: GICR SGI_base frame is device-mapped for CPU0.
-    unsafe {
-        // All Group 1 (Non-secure).
-        write_volatile(gicr_sgi(gicr_sgi::IGROUPR0), 0xFFFF_FFFF);
-        // Mid priority for every SGI/PPI (8 INTIDs per 32-bit IPRIORITYR word).
-        for i in 0..8 {
-            write_volatile(gicr_sgi(gicr_sgi::IPRIORITYR + i * 4), 0xA0A0_A0A0);
-        }
-        // Start with all SGIs/PPIs disabled; enable_irq() turns on what we use.
-        write_volatile(gicr_sgi(gicr_sgi::ICENABLER0), 0xFFFF_FFFF);
+    // All Group 1 (Non-secure).
+    mmio_w32(gicr_sgi(gicr_sgi::IGROUPR0), 0xFFFF_FFFF);
+    // Mid priority for every SGI/PPI (8 INTIDs per 32-bit IPRIORITYR word).
+    for i in 0..8 {
+        mmio_w32(gicr_sgi(gicr_sgi::IPRIORITYR + i * 4), 0xA0A0_A0A0);
     }
+    // Start with all SGIs/PPIs disabled; enable_irq() turns on what we use.
+    mmio_w32(gicr_sgi(gicr_sgi::ICENABLER0), 0xFFFF_FFFF);
 
     // 4. Enable the distributor: affinity routing + Non-secure Group 1.
-    // SAFETY: GICD is device-mapped.
-    unsafe {
-        write_volatile(gicd(gicd::CTLR), GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_GRP1);
-        while read_volatile(gicd(gicd::CTLR)) & GICD_CTLR_RWP != 0 {
-            core::hint::spin_loop();
-        }
+    mmio_w32(gicd(gicd::CTLR), GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_GRP1);
+    while mmio_r32(gicd(gicd::CTLR)) & GICD_CTLR_RWP != 0 {
+        core::hint::spin_loop();
     }
 
     // 5. Configure the CPU interface and enable Group 1 interrupts.
@@ -169,20 +188,15 @@ pub fn enable_irq(irq: u32) {
         return; // Invalid / special INTID
     }
     if irq < 32 {
-        // SAFETY: GICR SGI_base frame is device-mapped for CPU0.
-        unsafe {
-            write_volatile(gicr_sgi(gicr_sgi::ISENABLER0), 1u32 << irq);
-        }
+        // GICR SGI_base frame, device-mapped for CPU0.
+        mmio_w32(gicr_sgi(gicr_sgi::ISENABLER0), 1u32 << irq);
     } else {
         // SPI: GICD_ISENABLER<n> at 0x100 + (irq/32)*4 (best effort; Akuma uses
         // no SPIs, and affinity routing via GICD_IROUTER is not programmed).
         const GICD_ISENABLER: usize = 0x0100;
         let off = GICD_ISENABLER + ((irq / 32) as usize) * 4;
         let bit = 1u32 << (irq % 32);
-        // SAFETY: GICD is device-mapped; ISENABLER words live in the first page.
-        unsafe {
-            write_volatile(gicd(off), bit);
-        }
+        mmio_w32(gicd(off), bit);
     }
     dsb_ish();
 }
@@ -226,9 +240,12 @@ pub fn set_priority(irq: u32, priority: u8) {
     if irq >= 32 {
         return;
     }
-    // SAFETY: GICR SGI_base IPRIORITYR is a byte-addressable array, device-mapped.
+    // GICR SGI_base IPRIORITYR is a byte-addressable array, device-mapped.
+    // Single-register `strb` (no writeback) keeps ISV=1 under HVF.
+    let addr = mmu::DEV_GICR_SGI_VA + gicr_sgi::IPRIORITYR + irq as usize;
+    // SAFETY: `addr` is a device-mapped GIC MMIO register.
     unsafe {
-        let p = (mmu::DEV_GICR_SGI_VA + gicr_sgi::IPRIORITYR + irq as usize) as *mut u8;
-        write_volatile(p, priority);
+        core::arch::asm!("strb {v:w}, [{a}]", v = in(reg) priority as u32, a = in(reg) addr,
+            options(nostack, preserves_flags));
     }
 }
