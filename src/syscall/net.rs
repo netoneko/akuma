@@ -2,6 +2,53 @@ use super::*;
 use akuma_net::socket::{self, SockAddrIn, libc_errno};
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
+/// Largest bounce buffer a single net syscall will allocate (16 pages).
+const NET_BOUNCE_MAX: usize = 64 * 1024;
+
+/// Allocate a zeroed kernel bounce buffer of up to `want` bytes (capped at
+/// [`NET_BOUNCE_MAX`]) for a net syscall, **without** risking a whole-kernel
+/// abort under memory pressure.
+///
+/// `alloc::vec![0u8; N]` is an *infallible* allocation: when the kernel heap
+/// can't grow — e.g. a process paged in a model larger than RAM and the PMM is
+/// down to a fragmented handful of pages — Talc's `handle_oom` returns `Err`
+/// and Rust routes through `handle_alloc_error`, which under
+/// `panic = "immediate-abort"` (the size/extreme profiles) is a bare `brk #1`:
+/// EC=0x3c, the whole kernel dies. A 64 KiB buffer needs 16 *physically
+/// contiguous* pages — exactly the multi-page heap growth a fragmented pool
+/// can't satisfy (single-page growth always can, by the `handle_oom` backoff).
+///
+/// So allocate *fallibly* (`try_reserve_exact` returns `Err` instead of
+/// aborting) and degrade gracefully:
+///   1. try the full size — throughput in the common, memory-ample case;
+///   2. fall back to a single page (4 KiB needs only one free page, so it's
+///      satisfiable whenever any page is free; the syscall returns a short
+///      count and the caller loops — always-legal short read/write semantics);
+///   3. if even one page can't be had, return `None` → the caller reports
+///      ENOMEM instead of taking down the kernel.
+pub(crate) fn alloc_net_bounce(want: usize) -> Option<alloc::vec::Vec<u8>> {
+    for size in net_bounce_size_plan(want) {
+        let mut v = alloc::vec::Vec::<u8>::new();
+        if v.try_reserve_exact(size).is_ok() {
+            v.resize(size, 0);
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// The ordered sizes [`alloc_net_bounce`] attempts, largest first: the full
+/// (capped) request, then a single-page fallback that only needs one free
+/// page. Pure over its input so the degradation policy is unit-testable
+/// without draining real RAM. Both entries are `>= 1` so an empty request
+/// still yields a usable (zero-length-after-truncation) buffer rather than a
+/// zero-capacity `try_reserve_exact` that the caller can't short-read into.
+pub(crate) fn net_bounce_size_plan(want: usize) -> [usize; 2] {
+    let full = want.min(NET_BOUNCE_MAX).max(1);
+    let single_page = 4096usize.min(full);
+    [full, single_page]
+}
+
 pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
     let base_type = sock_type & 0xFF;
     let cloexec = sock_type & 0x80000 != 0;
@@ -297,7 +344,10 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
         return super::fs::sys_write(fd as u64, buf_ptr, len);
     }
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
-    let mut kernel_buf = alloc::vec![0u8; len.min(64 * 1024)];
+    let mut kernel_buf = match alloc_net_bounce(len) {
+        Some(b) => b,
+        None => return ENOMEM,
+    };
     let chunk_len = kernel_buf.len();
     if unsafe { copy_from_user_safe(kernel_buf.as_mut_ptr(), buf_ptr as *const u8, chunk_len).is_err() } {
         return EFAULT;
@@ -359,7 +409,10 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
         return super::fs::sys_read(fd as u64, buf_ptr, len);
     }
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
-    let mut kernel_buf = alloc::vec![0u8; len.min(64 * 1024)];
+    let mut kernel_buf = match alloc_net_bounce(len) {
+        Some(b) => b,
+        None => return ENOMEM,
+    };
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
         None => return EBADF,
@@ -607,7 +660,10 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         return super::fs::sys_write(fd as u64, iov.iov_base, iov.iov_len as usize);
     }
 
-    let mut kernel_buf = alloc::vec![0u8; iov.iov_len.min(64 * 1024)];
+    let mut kernel_buf = match alloc_net_bounce(iov.iov_len) {
+        Some(b) => b,
+        None => return ENOMEM,
+    };
     if unsafe { copy_from_user_safe(kernel_buf.as_mut_ptr(), iov.iov_base as *const u8, kernel_buf.len()).is_err() } {
         return EFAULT;
     }
@@ -680,7 +736,10 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         return n;
     }
 
-    let mut kernel_buf = alloc::vec![0u8; iov.iov_len.min(64 * 1024)];
+    let mut kernel_buf = match alloc_net_bounce(iov.iov_len) {
+        Some(b) => b,
+        None => return ENOMEM,
+    };
 
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
@@ -898,4 +957,47 @@ pub(super) fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> 
         // and is much more useful to userspace than a generic -EPERM).
         Err(_) => ENOENT,
     }
+}
+
+/// Boot self-test for the net bounce-buffer allocator. Verifies the
+/// degradation policy that keeps an oversized socket send/recv from aborting
+/// the whole kernel under PMM exhaustion (the EC=0x3c `brk #1` crash seen when
+/// llama-server streamed HTTP while an 84 MB model had drained a 64 MB VM —
+/// the 64 KiB bounce buffer needs 16 *contiguous* pages, which a fragmented
+/// pool can't grow into, so the infallible `vec![]` routed through
+/// `handle_alloc_error` → `brk #1`). The fix allocates *fallibly* and backs
+/// off to a single page, then to ENOMEM — never aborting.
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+pub(crate) fn run_net_bounce_tests() {
+    // --- Pure size-plan boundaries (no RAM touched) ---
+    // Empty request still yields a >=1-byte plan (never a zero-cap reserve).
+    assert_eq!(net_bounce_size_plan(0), [1, 1],
+        "empty request must still produce a usable 1-byte buffer");
+    // Sub-page request: both attempts are the same small size.
+    assert_eq!(net_bounce_size_plan(100), [100, 100],
+        "sub-page request needs no single-page fallback distinct from itself");
+    // Page-sized request: full == single-page.
+    assert_eq!(net_bounce_size_plan(4096), [4096, 4096],
+        "page-sized request's fallback equals the full size");
+    // Multi-page request: full first, then a single-page (1-free-page) fallback.
+    assert_eq!(net_bounce_size_plan(8192), [8192, 4096],
+        "multi-page request must fall back to exactly one page");
+    // 64 KiB (the dominant streaming case, 16 pages) — the exact size that
+    // crashed the kernel; must fall back to a single page.
+    assert_eq!(net_bounce_size_plan(NET_BOUNCE_MAX), [NET_BOUNCE_MAX, 4096],
+        "the 16-page bounce buffer must offer a single-page fallback");
+    // Over the cap: clamped to NET_BOUNCE_MAX, single-page fallback.
+    assert_eq!(net_bounce_size_plan(1 << 20), [NET_BOUNCE_MAX, 4096],
+        "oversized request is capped at the 64 KiB bounce maximum");
+
+    // --- Real allocation under ample boot memory: correct size + zeroed ---
+    let buf = alloc_net_bounce(8192).expect("8 KiB bounce alloc must succeed at boot");
+    assert_eq!(buf.len(), 8192, "ample-memory alloc returns the full requested size");
+    assert!(buf.iter().all(|&b| b == 0), "bounce buffer must be zero-initialised");
+
+    // Oversized request is capped, not failed.
+    let capped = alloc_net_bounce(1 << 20).expect("capped bounce alloc must succeed at boot");
+    assert_eq!(capped.len(), NET_BOUNCE_MAX, "oversized request is served at the cap");
+
+    crate::console::print("  [PASS] test_net_bounce_alloc_degradation\n");
 }

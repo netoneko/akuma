@@ -27,6 +27,9 @@ mod fb;
 pub mod fs;
 mod mem;
 mod net;
+/// Boot self-test for the net bounce-buffer allocator (see `net::alloc_net_bounce`).
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+pub(crate) use net::run_net_bounce_tests;
 pub(crate) mod pipe;
 pub mod poll;
 pub mod proc;

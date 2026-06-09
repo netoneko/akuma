@@ -23,6 +23,11 @@ pub fn run_network_tests() {
 pub fn run_all_tests() {
     console::print("\n--- Process Execution Tests ---\n");
 
+    // Net bounce-buffer OOM degradation (pure-fn boundaries + ample-mem alloc);
+    // guards against the EC=0x3c kernel abort when an oversized socket buffer
+    // can't grow the heap. No network stack required.
+    crate::syscall::run_net_bounce_tests();
+
     // Re-enabled to investigate EC=0x0 crash
     test_echo2();
 
