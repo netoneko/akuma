@@ -15,6 +15,7 @@ pub struct RouteRequest {
 pub struct CompletionsRequest {
     pub query: String,
     pub tools_json: String,
+    pub stream: bool,
 }
 
 pub struct RetrieveRequest {
@@ -34,10 +35,13 @@ pub fn parse_route_request(body: &str) -> Option<RouteRequest> {
 
 /// Parse an OpenAI-style chat completions request.
 /// Extracts the last user message as the query, and the tools array as raw JSON.
+/// Searches for "tools" only after the messages array to avoid matching
+/// "tool_calls" keys inside message objects.
 pub fn parse_completions_request(body: &str) -> Option<CompletionsRequest> {
     let query = extract_last_user_message(body)?;
-    let tools_json = json_extract_raw(body, "tools").unwrap_or_else(|| String::from("[]"));
-    Some(CompletionsRequest { query, tools_json })
+    let tools_json = extract_top_level_tools(body).unwrap_or_else(|| String::from("[]"));
+    let stream = body.contains("\"stream\":true");
+    Some(CompletionsRequest { query, tools_json, stream })
 }
 
 pub fn parse_retrieve_request(body: &str) -> Option<RetrieveRequest> {
@@ -89,6 +93,29 @@ pub fn write_health_response(buf: &mut Vec<u8>, loaded: bool) {
         "{\"status\":\"loading\",\"model\":\"needle\",\"loaded\":false}"
     };
     buf.extend_from_slice(s.as_bytes());
+}
+
+/// Write an OpenAI-compatible SSE streaming chat completion response.
+/// Wraps the engine result in the `data: {...}\n\ndata: [DONE]\n\n` format that
+/// meow's `read_streaming_response_with_progress` expects.
+pub fn write_completions_streaming_response(buf: &mut Vec<u8>, tool_call_json: &str) {
+    let name = json_extract_string(tool_call_json, "name");
+    let args_raw = json_extract_raw(tool_call_json, "arguments");
+
+    buf.extend_from_slice(b"data: ");
+    if let (Some(name), Some(args_raw)) = (name, args_raw) {
+        let args_escaped = json_stringify(&args_raw);
+        buf.extend_from_slice(b"{\"id\":\"chatcmpl-needle\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_0\",\"type\":\"function\",\"function\":{\"name\":\"");
+        write_json_str(buf, &name);
+        buf.extend_from_slice(b"\",\"arguments\":\"");
+        write_json_str(buf, &args_escaped);
+        buf.extend_from_slice(b"\"}}]},\"finish_reason\":\"tool_calls\"}]}");
+    } else {
+        buf.extend_from_slice(b"{\"id\":\"chatcmpl-needle\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"");
+        write_json_str(buf, tool_call_json);
+        buf.extend_from_slice(b"\"},\"finish_reason\":\"stop\"}]}");
+    }
+    buf.extend_from_slice(b"\n\ndata: [DONE]\n\n");
 }
 
 /// Write an OpenAI-compatible chat completion response.
@@ -253,6 +280,23 @@ fn json_stringify(raw: &str) -> String {
         }
     }
     out
+}
+
+/// Extract the top-level "tools" array from an OpenAI-style request body.
+/// Skips past the "messages" array first so that "tool_calls" keys nested
+/// inside message objects are never mistaken for the top-level "tools" key.
+fn extract_top_level_tools(body: &str) -> Option<String> {
+    // Find and skip past the messages array to avoid false matches on
+    // "tool_calls" keys nested inside message objects.
+    let search_from = if let Some(msg_raw) = json_extract_raw(body, "messages") {
+        // Find where messages ends in body, then search for "tools" after that.
+        let msg_pos = body.find(&msg_raw)?;
+        msg_pos + msg_raw.len()
+    } else {
+        0
+    };
+    let haystack = &body[search_from..];
+    json_extract_raw(haystack, "tools")
 }
 
 fn parse_string_array(arr: &str) -> Vec<String> {

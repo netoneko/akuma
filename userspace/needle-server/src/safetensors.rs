@@ -50,13 +50,39 @@ pub struct SafeTensors {
     pub metadata: BTreeMap<String, String>,
 }
 
+// Refuse to load a weights file larger than this — prevents silent OOM crashes
+// on memory-constrained systems (e.g. 100 MB QEMU instances).
+const MAX_SAFETENSORS_BYTES: usize = 60 * 1024 * 1024; // 60 MB
+
 impl SafeTensors {
     #[cfg(feature = "akuma")]
     pub fn load(path: &str) -> Result<Self, ParseError> {
+        // Check file size before attempting the allocation so we get a clear
+        // error message rather than a SIGSEGV from a null malloc return.
+        let fd = libakuma::open(path, libakuma::open_flags::O_RDONLY);
+        if fd < 0 {
+            return Err(ParseError::Io(-fd));
+        }
+        let file_size = match libakuma::fstat(fd) {
+            Ok(s) => s.st_size as usize,
+            Err(e) => { libakuma::close(fd); return Err(ParseError::Io(e)); }
+        };
+        libakuma::close(fd);
+
+        if file_size > MAX_SAFETENSORS_BYTES {
+            return Err(ParseError::InvalidDataOwned(alloc::format!(
+                "model file too large: {} MB (limit {} MB, increase MAX_SAFETENSORS_BYTES or add more RAM)",
+                file_size / (1024 * 1024),
+                MAX_SAFETENSORS_BYTES / (1024 * 1024),
+            )));
+        }
+
         let raw = libakuma::fs::read(path)?;
         Self::from_bytes(raw)
     }
 
+    /// Parse a safetensors buffer. The tensor data offsets are adjusted to be
+    /// absolute within `raw` so the header slice is never copied separately.
     pub fn from_bytes(raw: Vec<u8>) -> Result<Self, ParseError> {
         if raw.len() < 8 {
             return Err(ParseError::InvalidData("buffer too short"));
@@ -69,10 +95,16 @@ impl SafeTensors {
         let header_str = core::str::from_utf8(&raw[8..header_end])
             .map_err(|_| ParseError::InvalidData("invalid UTF-8 header"))?;
 
-        let (tensors, metadata) = parse_header(header_str)?;
-        let data = raw[header_end..].to_vec();
+        let (mut tensors, metadata) = parse_header(header_str)?;
+        // Adjust tensor byte offsets to be absolute within `raw` (they are
+        // relative to the data section start, i.e. raw[header_end..]).
+        // This lets us keep the original buffer without a second allocation.
+        for meta in tensors.values_mut() {
+            meta.data_start += header_end;
+            meta.data_end += header_end;
+        }
 
-        Ok(Self { data, tensors, metadata })
+        Ok(Self { data: raw, tensors, metadata })
     }
 
     pub fn get_f32(&self, name: &str) -> Option<Vec<f32>> {

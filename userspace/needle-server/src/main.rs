@@ -44,6 +44,7 @@ struct Config {
     download: bool,
     model: String,
     hf_token: Option<String>,
+    debug: bool,
 }
 
 impl Config {
@@ -56,6 +57,7 @@ impl Config {
             download: false,
             model: cactus::DEFAULT_MODEL.into(),
             hf_token: None,
+            debug: false,
         };
 
         let argc = libakuma::argc();
@@ -88,6 +90,7 @@ impl Config {
                     }
                 }
                 "--download" => cfg.download = true,
+                "--debug" => cfg.debug = true,
                 "--model" => {
                     if let Some(v) = libakuma::arg(i + 1) {
                         cfg.model = v.into();
@@ -123,6 +126,7 @@ fn print_usage() {
     libakuma::println("  --download           Download missing weights from Cactus API");
     libakuma::println("  --model <ID>         Model ID [default: Abdalrahman/needle-rs-safetensors]");
     libakuma::println("  --hf-token <TOKEN>   HuggingFace token for gated models");
+    libakuma::println("  --debug              Log requests and parse details to stdout");
     libakuma::println("");
     libakuma::println("EXAMPLES:");
     libakuma::println("  needle-server --weights /data/needle.safetensors --vocab /data/vocab.txt");
@@ -177,21 +181,23 @@ pub extern "C" fn main() {
 
     loop {
         match listener.accept() {
-            Ok((stream, _addr)) => handle_connection(&engine, stream),
+            Ok((stream, _addr)) => handle_connection(&engine, stream, cfg.debug),
             Err(e) if e.kind() == libakuma::net::ErrorKind::Interrupted => libakuma::exit(0),
             Err(_) => libakuma::sleep_ms(1),
         }
     }
 }
 
-fn handle_connection(engine: &NeedleEngine, stream: libakuma::net::TcpStream) {
+fn handle_connection(engine: &NeedleEngine, stream: libakuma::net::TcpStream, debug: bool) {
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     if !server::read_request(&stream, &mut buf) {
+        if debug { libakuma::println("[needle:debug] failed to read request"); }
         return;
     }
     let text = match core::str::from_utf8(&buf) {
         Ok(s) => s,
         Err(_) => {
+            if debug { libakuma::println("[needle:debug] request is not valid UTF-8"); }
             server::send_bad_request(&stream, "invalid UTF-8");
             return;
         }
@@ -199,12 +205,20 @@ fn handle_connection(engine: &NeedleEngine, stream: libakuma::net::TcpStream) {
     let req = match server::parse_request(text) {
         Some(r) => r,
         None => {
+            if debug {
+                let preview = &text[..text.len().min(256)];
+                libakuma::println(&format!("[needle:debug] malformed request, first 256 bytes: {:?}", preview));
+            }
             server::send_bad_request(&stream, "malformed request");
             return;
         }
     };
 
     libakuma::println(&format!("[needle] {} {}", req.method, req.path));
+    if debug {
+        let body_preview = &req.body[..req.body.len().min(512)];
+        libakuma::println(&format!("[needle:debug] body ({} bytes): {}", req.body.len(), body_preview));
+    }
 
     match (req.method, req.path) {
         ("GET", "/health") | ("GET", "/health/") => {
@@ -218,31 +232,38 @@ fn handle_connection(engine: &NeedleEngine, stream: libakuma::net::TcpStream) {
         }
 
         ("POST", "/v1/route") | ("POST", "/v1/route/") => {
-            handle_route(engine, &stream, req.body);
+            handle_route(engine, &stream, req.body, debug);
         }
 
         ("POST", "/v1/retrieve") | ("POST", "/v1/retrieve/") => {
-            handle_retrieve(engine, &stream, req.body);
+            handle_retrieve(engine, &stream, req.body, debug);
         }
 
         ("POST", "/v1/chat/completions") | ("POST", "/v1/chat/completions/") => {
-            handle_chat_completions(engine, &stream, req.body);
+            handle_chat_completions(engine, &stream, req.body, debug);
         }
 
         _ => {
+            if debug { libakuma::println(&format!("[needle:debug] no handler for {} {}", req.method, req.path)); }
             server::send_not_found(&stream);
         }
     }
 }
 
-fn handle_route(engine: &NeedleEngine, stream: &libakuma::net::TcpStream, body: &str) {
+fn handle_route(engine: &NeedleEngine, stream: &libakuma::net::TcpStream, body: &str, debug: bool) {
     let req = match api::parse_route_request(body) {
         Some(r) => r,
         None => {
+            if debug { libakuma::println("[needle:debug] parse_route_request failed: missing query or tools"); }
             server::send_bad_request(stream, "missing query or tools");
             return;
         }
     };
+
+    if debug {
+        libakuma::println(&format!("[needle:debug] route query: {:?}", &req.query[..req.query.len().min(200)]));
+        libakuma::println(&format!("[needle:debug] tools_json ({} bytes): {}", req.tools_json.len(), &req.tools_json[..req.tools_json.len().min(200)]));
+    }
 
     let start_ms = libakuma::time();
 
@@ -256,26 +277,33 @@ fn handle_route(engine: &NeedleEngine, stream: &libakuma::net::TcpStream, body: 
         });
         let latency_ms = libakuma::time().saturating_sub(start_ms);
         libakuma::println(&format!("[needle] done in {}ms: {}", latency_ms / 1000, result.text));
+        if debug { libakuma::println(&format!("[needle:debug] engine result: {:?}", result.text)); }
         let mut done_buf: Vec<u8> = Vec::new();
         api::write_stream_done(&mut done_buf, &result.text);
         server::send_chunk(stream, &done_buf);
     } else {
         let result = engine.run(&req.query, &req.tools_json);
         let latency_ms = libakuma::time().saturating_sub(start_ms);
+        if debug { libakuma::println(&format!("[needle:debug] engine result: {:?}", result.text)); }
         let mut body = Vec::new();
         api::write_route_response(&mut body, &result.text, latency_ms);
         server::send_json(stream, 200, "OK", &body);
     }
 }
 
-fn handle_retrieve(engine: &NeedleEngine, stream: &libakuma::net::TcpStream, body: &str) {
+fn handle_retrieve(engine: &NeedleEngine, stream: &libakuma::net::TcpStream, body: &str, debug: bool) {
     let req = match api::parse_retrieve_request(body) {
         Some(r) => r,
         None => {
+            if debug { libakuma::println("[needle:debug] parse_retrieve_request failed: missing query or tools"); }
             server::send_bad_request(stream, "missing query or tools");
             return;
         }
     };
+    if debug {
+        libakuma::println(&format!("[needle:debug] retrieve query: {:?}", &req.query[..req.query.len().min(200)]));
+        libakuma::println(&format!("[needle:debug] {} tools to search, top_k={}", req.tools.len(), req.top_k));
+    }
 
     if engine.contrastive_dim() == 0 {
         server::send_bad_request(stream, "model has no contrastive head");
@@ -295,22 +323,36 @@ fn handle_retrieve(engine: &NeedleEngine, stream: &libakuma::net::TcpStream, bod
     server::send_json(stream, 200, "OK", &resp_body);
 }
 
-fn handle_chat_completions(engine: &NeedleEngine, stream: &libakuma::net::TcpStream, body: &str) {
+fn handle_chat_completions(engine: &NeedleEngine, stream: &libakuma::net::TcpStream, body: &str, debug: bool) {
     let req = match api::parse_completions_request(body) {
         Some(r) => r,
         None => {
+            if debug { libakuma::println("[needle:debug] parse_completions_request failed: could not extract last user message"); }
             server::send_bad_request(stream, "missing messages");
             return;
         }
     };
+
+    if debug {
+        libakuma::println(&format!("[needle:debug] completions query: {:?}", &req.query[..req.query.len().min(200)]));
+        libakuma::println(&format!("[needle:debug] tools_json ({} bytes): {}", req.tools_json.len(), &req.tools_json[..req.tools_json.len().min(300)]));
+        let tool_count = req.tools_json.matches("\"name\"").count();
+        libakuma::println(&format!("[needle:debug] ~{} tool entries found in tools_json", tool_count));
+    }
 
     let start_ms = libakuma::time();
     let result = engine.run(&req.query, &req.tools_json);
     let latency_ms = libakuma::time().saturating_sub(start_ms);
 
     libakuma::println(&format!("[needle] done in {}ms: {}", latency_ms / 1000, result.text));
+    if debug { libakuma::println(&format!("[needle:debug] engine result: {:?}", result.text)); }
 
     let mut resp_body = Vec::new();
-    api::write_completions_response(&mut resp_body, &result.text);
-    server::send_json(stream, 200, "OK", &resp_body);
+    if req.stream {
+        api::write_completions_streaming_response(&mut resp_body, &result.text);
+        server::send_text_plain(stream, &resp_body);
+    } else {
+        api::write_completions_response(&mut resp_body, &result.text);
+        server::send_json(stream, 200, "OK", &resp_body);
+    }
 }

@@ -30,6 +30,16 @@ pub fn parse_request<'a>(buf: &'a str) -> Option<Request<'a>> {
     Some(Request { method, path, body })
 }
 
+pub fn send_text_plain(stream: &TcpStream, body: &[u8]) {
+    let header = format!(
+        "HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.shutdown(Shutdown::Write);
+}
+
 pub fn send_json(stream: &TcpStream, status: u16, reason: &str, body: &[u8]) {
     let header = format!(
         "HTTP/1.0 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
