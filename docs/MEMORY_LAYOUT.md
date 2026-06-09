@@ -104,7 +104,8 @@ big box no longer inflates kernel overhead — the surplus all becomes user page
 Example — 64 MB, extreme: Code+Stack ~1 MB, Heap 512 KB seed (grows on demand from
 PMM), **User pages 61 MB** (vs 52 MB without the clamp). Other profiles set the
 clamp to 0 (identity, historical behaviour). See
-[LOW_MEMORY_OPTIMIZATIONS.md](LOW_MEMORY_OPTIMIZATIONS.md) §2.
+[LOW_MEMORY_ENVIRONMENT.md](LOW_MEMORY_ENVIRONMENT.md) → *Running LLM inference on
+extreme* → Reserve-RAM clamp.
 
 ## Verified boot floors (measured June 2026)
 

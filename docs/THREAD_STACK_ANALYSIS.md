@@ -112,7 +112,8 @@ the `clone`/pthread path `spawn_user_closure_initializing` via
 
 > A missing on-demand allocation on the closure path was the cause of the extreme
 > EC=0x25 thread-spawn crash (a `memset` on a wrapped near-null stack base). Fixed —
-> see [LOW_MEMORY_OPTIMIZATIONS.md](LOW_MEMORY_OPTIMIZATIONS.md) §1.
+> see [LOW_MEMORY_ENVIRONMENT.md](LOW_MEMORY_ENVIRONMENT.md) → *Running LLM inference
+> on extreme* → Extreme thread-spawn crash.
 
 ---
 

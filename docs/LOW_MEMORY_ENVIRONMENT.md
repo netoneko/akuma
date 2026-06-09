@@ -289,6 +289,112 @@ decisively the **`code+stack` region 11 MB → 5 MB** by removing the stale 8 MB
 boot-stack gap (item 4). `code+stack` is now a flat ~5 MB instead of 11 MB. The
 `PmmOomHandler` then dropped the heap seed to 1 MB (was 4 MB), unlocking SSH at 8 MB.
 
+## Running LLM inference on extreme — thread-spawn fix + reserve-RAM clamp (June 2026)
+
+Two changes that let the **extreme** kernel run llama.cpp inference in little RAM
+(validated: stories15M loads + generates at **64 MB**, kernel idling in ~1.5 MB).
+Groundwork for the multi-VM cluster vision (lean agent box + LLM box). See also
+[MEMORY_LAYOUT.md](MEMORY_LAYOUT.md) (§ Reserve-RAM clamp) and
+[THREAD_STACK_ANALYSIS.md](THREAD_STACK_ANALYSIS.md) (§ Lazy on-demand stacks).
+
+### Extreme thread-spawn crash (EC=0x25) — FIXED
+
+**Symptom.** On **extreme**, the kernel took an EL1 data abort and died whenever a
+userspace process spawned a thread via `clone`/`pthread_create`:
+
+```
+[Exception] Sync from EL1: EC=0x25, ISS=0x44
+  FAR=0xffffffffffff7cc8   ELR=...  Thread=N
+  Instruction: 0xf8008509   (str x9, [x8], #8  — a memset word-fill loop)
+```
+
+It reproduced with plenty of free RAM (256 MB, 175 MB free) — **not** OOM. It blocked
+`apk`'s fork-to-run-post-install-triggers, and blocked llama.cpp entirely (`llama-cli`
+spawns ≥1 worker thread even with `-t 1`).
+
+**Root cause.** `ThreadPool::spawn_user_closure_initializing` (the `clone_thread` /
+pthread child path, `crates/akuma-exec/src/threading/mod.rs`) read `self.stacks[i]`
+and computed `stack_top = (stack.top - EXCEPTION_STACK_SIZE) & !0xF` **without first
+allocating the slot's stack on demand**. The sibling path
+`spawn_user_thread_fn_internal` already did this (via `ensure_slot_stack`); the
+closure path did not. On extreme `WARM_FREE_USER = 0` — no warm thread-stack pool —
+so a freshly claimed slot has `StackInfo::empty()` with `top == 0`. Then
+`0 - EXCEPTION_STACK_SIZE` wraps to a near-null VA (~`0xFFFF…F000`), and
+`setup_fake_irq_frame`'s `core::ptr::write_bytes(frame_base, 0, IRQ_FRAME_SIZE)` (the
+memset at the faulting PC) writes to that unmapped address → EL1 abort. On
+`size`/`release` the slot's stack is pre-allocated (warm floor ≥ 1, or all
+pre-allocated), so the bug was masked.
+
+**Fix.** Allocate the stack on demand right after claiming the slot. The POOL lock is
+already held on this path, so call the lock-free `allocate_stack_for_slot` directly
+(not `ensure_slot_stack`, which re-locks):
+
+```rust
+if !self.stacks[i].is_allocated()
+    && !self.allocate_stack_for_slot(i, config().user_thread_stack_size)
+{
+    THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
+    return Err("Failed to allocate user thread stack from PMM");
+}
+```
+
+No-op on `size`/`release` (stacks already allocated) and guarded by `is_allocated()`,
+so it never double-allocates. **Validated:** `llama-cli -t 2` runs on extreme;
+stories15M loads + generates at 64 MB and 256 MB (previously crashed even at `-t 1`).
+
+> Test note: the boot self-test suite runs on the `release` build, where all stacks
+> are pre-allocated — so it can't exercise the `WARM_FREE_USER = 0` on-demand path
+> that triggers this. A regression test would need to force on-demand allocation.
+> Flagged, not yet added.
+
+### Reserve-RAM clamp ("lock mem-calc as if 4 MB")
+
+**Motivation.** On extreme the kernel is tuned to boot tiny, but the memory-layout
+math scaled the kernel's *own* reserves with total RAM: `code_and_stack ≈ ram/16` and
+`heap ≈ ram/8` (below 256 MB). So a 64 MB box spent **4 MB + 8 MB = 12 MB** on kernel
+overhead, leaving only 52 MB for userspace — even though the kernel idles in ~1.5 MB.
+For LLM weights, every MB of user-page pool matters.
+
+**Change.** The RAM value used to size the kernel's *own* reserves is now clamped,
+while the user-page pool, PMM, thread limit and user-stack sizing keep the **real**
+detected RAM. Policy lives in `src/config.rs`:
+
+```rust
+pub const MEM_CALC_CLAMP_MB: usize        = 4;        // extreme (0 elsewhere = no clamp)
+pub const MIN_CODE_AND_STACK_BYTES: usize = 0;        // extreme (4 MB elsewhere)
+pub const STACK_GUARD_BYTES: usize        = 64*1024;  // extreme (1 MB elsewhere)
+```
+
+The whole layout is computed by one pure, unit-tested function
+`compute_memory_layout(ram_base, ram_size, boot_stack_top)` in `src/main.rs`
+(previously inline `#[cfg]` blocks in `kernel_main`); `reserve_calc_ram(ram, clamp_mb)`
+does the clamp (`clamp_mb == 0` → identity).
+
+**Effect (64 MB box, extreme):**
+
+| Region      | Before | After  |
+|-------------|--------|--------|
+| Code+Stack  | 4 MB   | ~1 MB  |
+| Heap (seed) | 8 MB   | 512 KB |
+| User pages  | 52 MB  | 61 MB  |
+
+The 512 KB seed heap grows on demand from PMM (`PmmOomHandler` / `reclaim_to_pmm`);
+under llama load it grew to ~960 KB with no OOM. Result: stories15M runs at 64 MB with
+~12 MB free (was ~2 MB). Other profiles set the clamp to 0 (identity, historical
+behaviour). The boot **layout sanity guard** in `kernel_main` re-verifies the computed
+regions and refuses to boot on any violation. Unit tests: `test_reserve_calc_ram`,
+`test_compute_memory_layout`, `test_compute_heap_size` (`src/tests.rs`).
+
+### Running an LLM on extreme
+
+Build `scripts/build_extreme_size.sh`; boot `MEMORY=64M scripts/cargo_runner.sh
+target/aarch64-unknown-none/extreme-size/akuma`; put models in `bootstrap/models/`
+(→ `/models/` on disk via `populate_disk.sh`); run e.g. `llama-cli -m
+/models/stories15M-q4_0.gguf -p "..." -n 32 -t 2 -c 256`. Notes: stories15M (18 MB)
+works at 64 MB; SmolLM2-135M (84 MB) has an open load-time SIGSEGV and won't fit
+64 MB anyway. The akuma shell does **not** support redirection (`2>&1` makes a file
+named `&1`); the VM regenerates its SSH host key (use `-o UserKnownHostsFile=/dev/null`).
+
 ## meow → ollama runs at 7 MB — lazy-ELF segment-boundary zeroing (FIXED 2026-06-05)
 
 **Symptom.** On the `size`/`extreme` kernel `meow -c "…"` failed immediately with
