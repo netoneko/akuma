@@ -490,6 +490,19 @@ impl ThreadPool {
                     continue;
                 }
 
+                // Lazy stacks: on the extreme profile WARM_FREE_USER=0, so a freshly
+                // claimed slot has no stack (StackInfo::empty(), top=0). Allocate it on
+                // demand before computing stack_top — otherwise `0 - EXCEPTION_STACK_SIZE`
+                // wraps to a near-null VA and setup_fake_irq_frame's write_bytes faults in
+                // EL1 (EC=0x25). The POOL lock is already held here, so call the
+                // lock-free allocate_stack_for_slot directly (not ensure_slot_stack).
+                if !self.stacks[i].is_allocated()
+                    && !self.allocate_stack_for_slot(i, config().user_thread_stack_size)
+                {
+                    THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
+                    return Err("Failed to allocate user thread stack from PMM");
+                }
+
                 let stack = &self.stacks[i];
                 let stack_top = ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64;
                 let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
