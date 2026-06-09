@@ -1006,6 +1006,20 @@ impl<'a> HttpStreamTls<'a> {
 // Download with Headers + Redirect Support
 // ============================================================================
 
+/// Resolve a redirect Location header value to an absolute URL.
+/// Handles relative paths (/path), protocol-relative (//host/path), and absolute URLs.
+fn resolve_redirect_url(location: &str, scheme: &str, host: &str) -> String {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        String::from(location)
+    } else if location.starts_with("//") {
+        format!("{}:{}", scheme, location)
+    } else if location.starts_with('/') {
+        format!("{}://{}{}", scheme, host, location)
+    } else {
+        String::from(location)
+    }
+}
+
 fn extract_location_header(headers: &str) -> Option<String> {
     for line in headers.lines() {
         let lower: Vec<u8> = line.as_bytes().iter().take(9).map(|b| b.to_ascii_lowercase()).collect();
@@ -1045,7 +1059,10 @@ pub fn download_file_with_headers(url: &str, dest_path: &str, headers: &HttpHead
 }
 
 fn download_with_redirects(url: &str, dest_path: &str, headers: &HttpHeaders, max_redirects: u8) -> Result<(), Error> {
-    let parsed = parse_url(url).ok_or(Error::InvalidUrl)?;
+    let parsed = parse_url(url).ok_or_else(|| {
+        libakuma::eprintln(&format!("[dl] InvalidUrl: {:?}", url));
+        Error::InvalidUrl
+    })?;
     let ip = resolve(parsed.host).map_err(|_| Error::DnsError)?;
     let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], parsed.port);
     let stream = TcpStream::connect(&addr_str)
@@ -1136,8 +1153,9 @@ fn download_redirects_tls(stream: TcpStream, host: &str, path: &str, dest_path: 
 
     if status >= 300 && status < 400 && max_redirects > 0 {
         if let Some(location) = extract_location_header(header_str) {
+            let absolute = resolve_redirect_url(&location, "https", host);
             let _ = tls.close();
-            return download_with_redirects(&location, dest_path, &HttpHeaders::new(), max_redirects - 1);
+            return download_with_redirects(&absolute, dest_path, &HttpHeaders::new(), max_redirects - 1);
         }
     }
 
@@ -1190,7 +1208,8 @@ fn download_redirects_tcp(stream: TcpStream, host: &str, path: &str, dest_path: 
 
     if status >= 300 && status < 400 && max_redirects > 0 {
         if let Some(location) = extract_location_header(header_str) {
-            return download_with_redirects(&location, dest_path, &HttpHeaders::new(), max_redirects - 1);
+            let absolute = resolve_redirect_url(&location, "http", host);
+            return download_with_redirects(&absolute, dest_path, &HttpHeaders::new(), max_redirects - 1);
         }
     }
 
