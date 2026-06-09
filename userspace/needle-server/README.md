@@ -146,3 +146,14 @@ cargo build --release -p needle-server
 ```
 
 The workspace release profile already applies `opt-level = "z"`, `lto = true`, `strip = true`, targeting a binary under 600 KB.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+This server vendors and adapts code from [needle-rs](https://github.com/geekgineer/needle-rs)
+(MIT, © 2026 Abdalrahman Ibrahim). The files `src/tokenizer.rs`, `src/constrained.rs`,
+`src/engine.rs`, and `src/safetensors.rs` are ported from its `crates/needle-infer` with
+minimal `no_std` changes, and `needle-core` is used as an upstream dependency. The Needle
+transformer model and weights served by this binary are by Cactus Compute
+(Henry Ndubuaku et al.), also MIT-licensed.

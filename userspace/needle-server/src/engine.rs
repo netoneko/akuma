@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Ported from needle-rs (crates/needle-infer), MIT-licensed.
+// Copyright (c) 2026 Abdalrahman Ibrahim — https://github.com/geekgineer/needle-rs
+// See LICENSE in this directory for the full notice.
+
 //! Needle inference engine — ported from needle-infer to no_std.
 //!
 //! Changes: std::path/io → libakuma::fs + custom error, eprintln → removed,
