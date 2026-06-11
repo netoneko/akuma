@@ -108,6 +108,10 @@ pub fn run_all_tests() {
     // memory-hungry process is killed instead of the kernel aborting.
     test_oom_user_page_reserve();
 
+    // OOM hardening (live): a file-backed mmap larger than RAM must SIGSEGV the
+    // process, not panic the kernel. Skips unless /models has a file > RAM.
+    test_mmap_file_oom_survives();
+
     // EC=0x18 DC ZVA emulation (Go runtime memclrNoHeapPointers fix)
     test_dc_zva_emulation();
 
@@ -3886,6 +3890,15 @@ fn test_oom_user_page_reserve() {
     assert!(!pmm::user_alloc_would_starve(pmm::USER_PAGE_RESERVE + 1),
         "test_oom: must allow one page above the reserve");
 
+    // Readahead budget: a file-backed fault may batch at most (free - reserve)
+    // pages, so it can never drain the PMM below the kernel reserve.
+    assert_eq!(pmm::user_readahead_budget(0), 0,
+        "test_oom: zero free -> zero readahead budget");
+    assert_eq!(pmm::user_readahead_budget(pmm::USER_PAGE_RESERVE), 0,
+        "test_oom: at the reserve -> zero readahead budget");
+    assert_eq!(pmm::user_readahead_budget(pmm::USER_PAGE_RESERVE + 5), 5,
+        "test_oom: 5 pages above the reserve -> budget of 5");
+
     // Live smoke: with ample free pages (boot suite runs at >= 32 MB) the user
     // allocator returns a usable, zeroed page; free it back.
     let free = pmm::free_count();
@@ -3906,6 +3919,101 @@ fn test_oom_user_page_reserve() {
     pmm::free_page(c);
 
     console::print("  [PASS] test_oom_user_page_reserve\n");
+}
+
+/// Live regression for the llama.cpp `mmap=true` kernel abort
+/// (docs/LLAMA_MMAP_OOM_KERNEL_ABORT.md): a process that file-backed-mmaps a file
+/// LARGER THAN RAM and touches every page must be killed with SIGSEGV (exit -11)
+/// while the kernel stays up. Before the readahead reserve clamp, file-backed
+/// demand paging drained the PMM to 0 and a background kernel alloc panicked into
+/// a whole-kernel `BRK` abort.
+///
+/// Gated on `file_size > total_RAM` (per the user: the big model in /models/), so
+/// at large MEMORY where the model fits this is a clean `[SKIP]`. Run the live
+/// repro at e.g. `MEMORY=512 cargo run --release`, where the ~500 MB model exceeds
+/// RAM. The fact that this function *returns at all* already proves the kernel
+/// survived the OOM; we additionally assert the process died (-11) and the frames
+/// it held were reclaimed.
+fn test_mmap_file_oom_survives() {
+    use crate::pmm;
+
+    // Candidate model files, largest first.
+    const CANDIDATES: &[&str] = &[
+        "/models/qwen3.5-0.8b-q4.gguf",
+        "/models/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    ];
+
+    let (total_pages, _, _) = pmm::stats();
+    let total_ram = (total_pages as u64).saturating_mul(4096);
+
+    let mut chosen: Option<(&str, u64)> = None;
+    for &path in CANDIDATES {
+        if crate::vfs::exists(path) {
+            if let Ok(sz) = crate::vfs::file_size(path) {
+                if sz > total_ram {
+                    chosen = Some((path, sz));
+                    break;
+                }
+            }
+        }
+    }
+
+    let (path, size) = match chosen {
+        Some(c) => c,
+        None => {
+            crate::safe_print!(96,
+                "  [SKIP] test_mmap_file_oom_survives: no /models file larger than RAM ({} MB)\n",
+                total_ram / 1024 / 1024);
+            return;
+        }
+    };
+
+    // The failure mode depends on how file-backed mmap is serviced:
+    //  - lazy (MMAP_FILE_BACKED_LAZY, the size/extreme profiles): the mmap
+    //    succeeds and pages fault in on touch; running out of RAM mid-touch
+    //    SIGSEGVs the process (exit -11). This is the path the readahead reserve
+    //    clamp protects.
+    //  - eager (release): the whole region is allocated up front, so a region
+    //    larger than RAM is rejected at the syscall with ENOMEM and mmap_file
+    //    exits 2 (mmap failed) without ever touching memory.
+    // Either way the kernel must stay up — which is the whole point — so we
+    // accept the profile-appropriate exit code and always assert survival.
+    let lazy = crate::config::MMAP_FILE_BACKED_LAZY;
+    crate::safe_print!(192,
+        "  [..] test_mmap_file_oom_survives: mmap {} ({} MB) vs {} MB RAM — expect {}\n",
+        path, size / 1024 / 1024, total_ram / 1024 / 1024,
+        if lazy { "SIGSEGV (-11)" } else { "mmap ENOMEM (exit 2)" });
+
+    let free_before = pmm::free_count();
+
+    match process::exec_with_io("/bin/mmap_file", Some(&[path]), None) {
+        Ok((exit_code, _stdout)) => {
+            // Reaching here at all proves the kernel did not abort.
+            let expected = if lazy { -11 } else { 2 };
+            assert_eq!(exit_code, expected,
+                "test_mmap_file_oom: oversized file mmap (lazy={}) expected exit {}, got {}",
+                lazy, expected, exit_code);
+
+            // The dead process's frames must be reclaimed and the kernel must
+            // still be able to hand out user pages.
+            let free_after = pmm::free_count();
+            assert!(free_after + pmm::USER_PAGE_RESERVE >= free_before,
+                "test_mmap_file_oom: PMM not reclaimed after kill: before={} after={}",
+                free_before, free_after);
+            let f = pmm::alloc_page_zeroed_user()
+                .expect("test_mmap_file_oom: user alloc must work after the OOM kill");
+            pmm::free_page(f);
+
+            crate::safe_print!(160,
+                "  [PASS] test_mmap_file_oom_survives: exit {} as expected, kernel alive, free {} -> {} pages\n",
+                exit_code, free_before, free_after);
+        }
+        Err(e) => {
+            // Missing binary or spawn failure — don't fail the suite, just report.
+            crate::safe_print!(96,
+                "  [SKIP] test_mmap_file_oom_survives: exec /bin/mmap_file failed: {}\n", e);
+        }
+    }
 }
 
 /// Verify that pipe_close_write both signals EOF (pipe_can_read returns true)

@@ -157,6 +157,19 @@ done
 # Copy hello world example
 cp tcc/examples/hello_world/hello.c ../bootstrap/hello.c
 
+# Build mmap_file: pure-C, static musl. Used by the kernel boot self-test
+# (test_mmap_file_oom_survives) to prove a file-backed mmap larger than RAM
+# SIGSEGVs the process instead of panicking the kernel
+# (docs/LLAMA_MMAP_OOM_KERNEL_ABORT.md). Built unconditionally — it is tiny and
+# the boot suite runs on every build.
+echo "Building mmap_file (C, file-backed mmap OOM probe)..."
+(
+    cd forktest/c_stress
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o mmap_file mmap_file.c
+)
+cp forktest/c_stress/mmap_file ../bootstrap/bin/
+echo "mmap_file (C) copied to bootstrap/bin/"
+
 # Build forktest (Go, opt-in via --with-forktest)
 if [ "$WITH_FORKTEST" = true ]; then
     echo "Building forktest (Go)..."

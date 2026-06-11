@@ -2482,13 +2482,25 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             }
                         }
 
+                        // Clamp the readahead batch so file-backed demand paging never
+                        // drains the PMM below USER_PAGE_RESERVE — the same floor the
+                        // anonymous path respects via alloc_page_zeroed_user(). Without
+                        // this an mmap larger than RAM drains PMM to 0, and a later
+                        // kernel-side alloc (IRQ/scheduler, no current process) panics
+                        // into a whole-kernel brk #1 abort instead of SIGSEGV-ing the
+                        // offending process. When the budget hits 0 (free <= reserve)
+                        // nothing maps and we fall through to the single-page fallback
+                        // below (alloc_page_zeroed_user -> None -> SIGSEGV).
+                        let needed = needed.min(crate::pmm::user_readahead_budget(crate::pmm::free_count()));
+
                         // Batch-allocate all needed frames in one lock acquisition
                         let frame_pool = if needed > 0 {
                             crate::pmm::alloc_pages_zeroed(needed).unwrap_or_else(|| {
-                                // Fallback: allocate what we can one at a time
+                                // Fallback: allocate what we can one at a time, still
+                                // honouring the reserve so we can't starve the kernel.
                                 let mut v = alloc::vec::Vec::new();
                                 for _ in 0..needed {
-                                    match crate::pmm::alloc_page_zeroed() {
+                                    match crate::pmm::alloc_page_zeroed_user() {
                                         Some(f) => v.push(f),
                                         None => break,
                                     }
@@ -2987,11 +2999,17 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                 va += 0x1000;
                             }
                         }
+                        // Clamp the readahead batch to the kernel reserve — see the
+                        // matching comment in the data-abort path. A file-backed exec
+                        // mapping larger than RAM must SIGSEGV the process, not drain
+                        // the PMM to 0 and panic the kernel from a background alloc.
+                        let needed = needed.min(crate::pmm::user_readahead_budget(crate::pmm::free_count()));
+
                         let ia_frame_pool = if needed > 0 {
                             crate::pmm::alloc_pages_zeroed(needed).unwrap_or_else(|| {
                                 let mut v = alloc::vec::Vec::new();
                                 for _ in 0..needed {
-                                    match crate::pmm::alloc_page_zeroed() {
+                                    match crate::pmm::alloc_page_zeroed_user() {
                                         Some(f) => v.push(f),
                                         None => break,
                                     }

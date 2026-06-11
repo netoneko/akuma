@@ -667,6 +667,18 @@ pub fn user_alloc_would_starve(free: usize) -> bool {
     free <= USER_PAGE_RESERVE
 }
 
+/// Max pages a *user* readahead batch may take right now without driving free
+/// PMM below [`USER_PAGE_RESERVE`]. File-backed demand paging batches many pages
+/// per fault (readahead), so it must clamp the batch to this budget — otherwise
+/// an mmap larger than RAM drains the PMM to 0 and a later kernel-side alloc
+/// (IRQ/scheduler, no current process) panics into a whole-kernel `BRK` abort
+/// instead of the offending process being SIGSEGV'd. Pure fn over the free count
+/// so the boundary is unit-testable without draining real RAM.
+#[inline]
+pub fn user_readahead_budget(free: usize) -> usize {
+    free.saturating_sub(USER_PAGE_RESERVE)
+}
+
 /// Allocate a zeroed page for a **user** demand-paging fault (anonymous fill,
 /// ELF demand-load, reserved-region commit). Returns `None` once free PMM has
 /// fallen to [`USER_PAGE_RESERVE`], so the caller treats it as OOM and SIGSEGVs

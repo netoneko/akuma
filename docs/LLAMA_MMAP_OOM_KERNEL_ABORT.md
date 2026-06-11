@@ -1,11 +1,52 @@
 # llama.cpp `mmap=true` → ~4 GB allocation spike → kernel OOM abort (EC=0x3c)
 
-**Status:** investigated, not yet fixed. Two confirmed kernel bugs + one strong
-hypothesis about the trigger.
+**Status:** **Partially addressed (2026-06-11). The llama `mmap=true` crash STILL
+reproduces.** The file-backed readahead reserve gap is fixed and verified in
+isolation, but it does NOT resolve this crash — re-running the exact repro below
+(extreme, `MEMORY=4048`, fix included) still aborts with the identical `brk #1`
+(EC=0x3c) signature, `PMM: 10/1036288 pages free`, ~580 MB process mmap vs ~4 GB
+physical used. Only 24–45 file-region faults occur, so the model's file-backed
+demand paging (the path that was hardened) is barely exercised; the ~3.4 GB spike
+goes through another path that drains *below* the 16-page reserve. Reproduced both
+with and without host sleep (`caffeinate`), so it is not a sleep/wake artifact (the
+`[WATCHDOG] Time jump` line is a symptom of the allocation burst starving the vCPU,
+not the cause). The real fix still needs the **open question** (instrument where the
+3.4 GB comes from) and likely **Priority 2** (`MADV_DONTNEED` reclaim).
 
-**Date:** 2026-06-10
+**Date:** 2026-06-10 (investigation), 2026-06-11 (Priority 1 fix)
 **Profile / RAM:** extreme, `MEMORY=4048` (QEMU virt, HVF)
 **Repro logs:** `4048mb_extreme_llama.cpp.log` (crash), `4048mb_extreme_llama.cpp_1.log` (`--no-mmap`, works)
+
+## File-backed readahead reserve fix (2026-06-11) — necessary but NOT sufficient
+
+This fix closes a real reserve-bypass in the file-readahead path and is verified in
+isolation (see the `mmap_file` probe below), but **it does not stop the llama
+`mmap=true` crash** — that exhausts memory through a different, still-unhardened path
+(see Status). Documented here for completeness.
+
+**Root cause (refined):** the file-backed demand-paging readahead path allocated
+its batch with the *critical* PMM allocators (`alloc_pages_zeroed` /
+`alloc_page_zeroed`) which bypass `USER_PAGE_RESERVE`, unlike the anonymous path
+(`alloc_page_zeroed_user`). A model mmap larger than RAM therefore drained the PMM
+to **0**, and the next *kernel-side* allocation (IRQ/scheduler/watchdog — note the
+`[WATCHDOG] Time jump` line right before the dump) failed with no current process,
+so `alloc_error_handler` `panic!`d → `brk #1` (EC=0x3c).
+
+**Fix:** clamp file-backed readahead to `pmm::user_readahead_budget(free)` in both
+the data-abort and instruction-abort handlers (`src/exceptions.rs`), and use the
+reserve-aware `alloc_page_zeroed_user()` in the one-at-a-time fallback. The PMM now
+floors at the 16-page reserve; the existing single-page fallback returns `None` and
+the process is SIGSEGV'd. New helper `pmm::user_readahead_budget()`
+(`src/pmm.rs`); boundary unit asserts + a live boot self-test
+`test_mmap_file_oom_survives` (`src/process_tests.rs`, runs on profiles where the
+suite is compiled in) backed by a new `/bin/mmap_file` probe.
+
+**Verified (extreme profile, `MEMORY=256M`, model 507 MB > RAM):** `/bin/mmap_file`
+on the model demand-pages until the PMM hits exactly `16 free pages`
+(`[DA-DP] ... single-page fallback OOM, 16 free pages`), the process is killed
+(`Process 3 (/bin/mmap_file) SIGSEGV after 13.70s`), **no `brk #1`/EC=0x3c**, and
+the kernel stays up — SSH still responds and `free` shows the ~507 MB of
+demand-paged frames fully reclaimed (259 MB free again, no leak).
 
 ## TL;DR
 
