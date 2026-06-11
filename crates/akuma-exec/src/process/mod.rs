@@ -175,6 +175,17 @@ pub struct Process {
     pub signal_actions: Arc<SharedSignalTable>,
     pub signal_mask: u64,
     pub fault_mutex: Spinlock<BTreeSet<usize>>,
+    /// Serializes all access to [`Process::mmap_regions`] across the thread group.
+    /// CLONE_VM threads share one address-space-owner Process, so concurrent
+    /// `sys_mmap`/`munmap`/`mremap` (push/remove) and the page-fault eager
+    /// fallback (iter) would otherwise race on the plain `Vec` — a half-completed
+    /// reallocation read by another thread corrupts it and hangs the kernel
+    /// (observed under llama's burst of graph-buffer mmaps). All access goes
+    /// through the `vm_*` helper methods, which hold this lock with IRQs disabled
+    /// for a *pure Vec operation only* — no allocation, file I/O, mapping, or
+    /// frame-free is performed while it is held (those happen on the returned
+    /// frames after the lock is released), so it can never be held across a yield.
+    pub vm_lock: Spinlock<()>,
     pub sigaltstack_sp: u64,
     pub sigaltstack_flags: i32,
     pub sigaltstack_size: u64,
@@ -210,6 +221,34 @@ pub fn kill_box(box_id: u64) -> Result<(), &'static str> {
 }
 
 impl Process {
+    /// Run `f` with exclusive access to [`Process::mmap_regions`], serialized by
+    /// [`Process::vm_lock`] with IRQs disabled. This is the ONLY sanctioned way to
+    /// touch `mmap_regions` — it prevents the data race where CLONE_VM threads
+    /// concurrently push/remove/iter the shared `Vec` and corrupt it (kernel hang
+    /// under llama's graph-buffer mmap burst).
+    ///
+    /// `f` MUST perform only pure `Vec` operations (push/remove/iter/clone) and
+    /// MUST NOT allocate frames, map pages, free frames, read files, or yield —
+    /// return any frames to unmap/free and do that work AFTER this returns, with
+    /// the lock released. Holding `vm_lock` across a yield/alloc would risk a
+    /// single-core deadlock.
+    pub fn vm_with_regions<R>(&self, f: impl FnOnce(&mut Vec<(usize, Vec<PhysFrame>)>) -> R) -> R {
+        with_irqs_disabled(|| {
+            let _g = self.vm_lock.lock();
+            // SAFETY: `vm_lock` (held here) serializes every `vm_with_regions`
+            // caller across the thread group, so this is the unique live
+            // reference to `mmap_regions` for the closure's duration. Interior
+            // mutability via raw pointer is required because the field is a plain
+            // `Vec` and callers hold only `&Process` (the address-space owner is
+            // already aliased `&mut` across CLONE_VM threads by `lookup_process`).
+            let regions = unsafe {
+                &mut *(core::ptr::addr_of!(self.mmap_regions)
+                    as *mut Vec<(usize, Vec<PhysFrame>)>)
+            };
+            f(regions)
+        })
+    }
+
     /// Create a new process from ELF data
     pub fn from_elf(name: &str, args: &[String], env: &[String], elf_data: &[u8], interp_prefix: Option<&str>) -> Result<Self, ElfError> {
         let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top, mmap_floor, _deferred) =
@@ -281,6 +320,7 @@ impl Process {
             signal_actions: Arc::new(SharedSignalTable::new()),
             signal_mask: 0,
             fault_mutex: Spinlock::new(BTreeSet::new()),
+            vm_lock: Spinlock::new(()),
             sigaltstack_sp: 0,
             sigaltstack_flags: 2, // SS_DISABLE
             sigaltstack_size: 0,
@@ -378,6 +418,7 @@ impl Process {
             signal_actions: Arc::new(SharedSignalTable::new()),
             signal_mask: 0,
             fault_mutex: Spinlock::new(BTreeSet::new()),
+            vm_lock: Spinlock::new(()),
             sigaltstack_sp: 0,
             sigaltstack_flags: 2, // SS_DISABLE
             sigaltstack_size: 0,
@@ -1251,6 +1292,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         signal_actions: Arc::new(SharedSignalTable::new()), // Fork creates fresh table
         signal_mask: parent.signal_mask,
         fault_mutex: Spinlock::new(BTreeSet::new()),
+        vm_lock: Spinlock::new(()),
         sigaltstack_sp: parent.sigaltstack_sp,
         sigaltstack_flags: parent.sigaltstack_flags,
         sigaltstack_size: parent.sigaltstack_size,
@@ -1889,6 +1931,7 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
         signal_actions: Arc::new(SharedSignalTable::new()),
         signal_mask: parent.signal_mask,
         fault_mutex: Spinlock::new(BTreeSet::new()),
+        vm_lock: Spinlock::new(()),
         sigaltstack_sp: parent.sigaltstack_sp,
         sigaltstack_flags: parent.sigaltstack_flags,
         sigaltstack_size: parent.sigaltstack_size,
@@ -1998,6 +2041,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         signal_actions: parent.signal_actions.clone(), // Shared table (Arc clone)
         signal_mask: parent.signal_mask,
         fault_mutex: Spinlock::new(BTreeSet::new()),
+        vm_lock: Spinlock::new(()),
         sigaltstack_sp: parent.sigaltstack_sp,
         sigaltstack_flags: parent.sigaltstack_flags,
         sigaltstack_size: parent.sigaltstack_size,

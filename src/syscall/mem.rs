@@ -237,7 +237,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             proc.pid, len, prot, flags, mmap_addr);
     }
 
-    proc.mmap_regions.push((mmap_addr, frames));
+    proc.vm_with_regions(|r| r.push((mmap_addr, frames)));
 
     mmap_addr as u64
 }
@@ -264,9 +264,9 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
         let is_mapped = akuma_exec::mmu::is_current_user_page_mapped(old_addr)
             || akuma_exec::process::lazy_region_lookup_for_pid(lazy_key, old_addr).is_some()
             || akuma_exec::process::lookup_process(owner_pid)
-                .map(|p| p.mmap_regions.iter().any(|(start, frames)| {
+                .map(|p| p.vm_with_regions(|r| r.iter().any(|(start, frames)| {
                     old_addr >= *start && old_addr < *start + frames.len() * 4096
-                }))
+                })))
                 .unwrap_or(false);
         return if is_mapped { ENOMEM } else { EFAULT };
     }
@@ -308,11 +308,15 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
             }
         }
 
-        proc.mmap_regions.push((new_addr, new_frames));
+        proc.vm_with_regions(|r| r.push((new_addr, new_frames)));
 
         let mut found_eager = false;
-        if let Some(idx) = proc.mmap_regions.iter().position(|(va, _)| *va == old_addr) {
-            let (_, old_frames) = proc.mmap_regions.remove(idx);
+        // Remove the old region under the lock, then unmap/free its frames after
+        // releasing it (unmap/free must not run while vm_lock is held).
+        let old_frames_opt = proc.vm_with_regions(|r| {
+            r.iter().position(|(va, _)| *va == old_addr).map(|idx| r.remove(idx).1)
+        });
+        if let Some(old_frames) = old_frames_opt {
             let freed_size = old_frames.len() * 4096;
             for (i, frame) in old_frames.into_iter().enumerate() {
                 let _ = proc.address_space.unmap_page(old_addr + i * 4096);
@@ -505,49 +509,44 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     let unmap_len = if len > 0 { (len + 4095) & !4095 } else { 4096 };
     let unmap_pages = unmap_len / 4096;
 
-    if let Some(idx) = proc.mmap_regions.iter().position(|(start, _)| *start == addr) {
-        let region_pages = proc.mmap_regions[idx].1.len();
+    // Locate & detach the eager region under vm_lock (pure Vec ops only): for a
+    // full unmap, remove it; for a partial prefix, remove it, split off the prefix
+    // frames, and re-push the remaining suffix. The actual page unmap + frame free
+    // happens AFTER the lock is released (it takes other locks and must not run
+    // while vm_lock is held). Returns (base_va, frames_to_unmap) or None.
+    let detached = proc.vm_with_regions(|r| {
+        let idx = r.iter().position(|(start, _)| *start == addr)?;
+        let region_pages = r[idx].1.len();
         if unmap_pages >= region_pages {
-            let (_, frames) = proc.mmap_regions.remove(idx);
-            let n = frames.len();
-            let freed_size = n * 4096;
-            crate::tprint!(128, "[munmap] pid={} addr=0x{:x} full ({} pages)\n",
-                proc.pid, addr, n);
-            // Defer the TLB flush: clear each PTE without a per-page barrier,
-            // then flush the whole region once (cheap-win E, COW_OPTIMIZATIONS.md).
-            for (i, frame) in frames.into_iter().enumerate() {
-                let _ = proc.address_space.unmap_page_no_flush(addr + i * 4096);
-                // Free only when this drops the frame's last reference; an
-                // aliased/shared PA is freed by its surviving owner instead.
-                if proc.address_space.remove_user_frame(frame) {
-                    crate::pmm::free_page(frame);
-                }
-            }
-            akuma_exec::mmu::flush_tlb_range_all_asid(addr, n);
-            proc.memory.free_regions.push((addr, freed_size));
+            let (_, frames) = r.remove(idx);
+            Some((addr, frames))
         } else {
-            let (old_start, old_frames) = proc.mmap_regions.remove(idx);
-            crate::tprint!(192, "[munmap] pid={} addr=0x{:x} partial prefix {}/{} pages\n",
-                proc.pid, addr, unmap_pages, old_frames.len());
+            let (old_start, old_frames) = r.remove(idx);
             let mut iter = old_frames.into_iter();
-            for i in 0..unmap_pages {
-                if let Some(frame) = iter.next() {
-                    let _ = proc.address_space.unmap_page_no_flush(old_start + i * 4096);
-                    // Free only when this drops the frame's last reference; an
-                    // aliased/shared PA is freed by its surviving owner instead.
-                    if proc.address_space.remove_user_frame(frame) {
-                        crate::pmm::free_page(frame);
-                    }
-                }
-            }
-            akuma_exec::mmu::flush_tlb_range_all_asid(old_start, unmap_pages);
+            let prefix: Vec<crate::pmm::PhysFrame> = (0..unmap_pages).filter_map(|_| iter.next()).collect();
             let remaining: Vec<crate::pmm::PhysFrame> = iter.collect();
             if !remaining.is_empty() {
-                let new_start = old_start + unmap_pages * 4096;
-                proc.mmap_regions.push((new_start, remaining));
+                r.push((old_start + unmap_pages * 4096, remaining));
             }
-            proc.memory.free_regions.push((addr, unmap_pages * 4096));
+            Some((old_start, prefix))
         }
+    });
+    if let Some((base, frames)) = detached {
+        let n = frames.len();
+        crate::tprint!(128, "[munmap] pid={} addr=0x{:x} ({} pages, base=0x{:x})\n",
+            proc.pid, addr, n, base);
+        // Defer the TLB flush: clear each PTE without a per-page barrier,
+        // then flush the whole region once (cheap-win E, COW_OPTIMIZATIONS.md).
+        for (i, frame) in frames.into_iter().enumerate() {
+            let _ = proc.address_space.unmap_page_no_flush(base + i * 4096);
+            // Free only when this drops the frame's last reference; an
+            // aliased/shared PA is freed by its surviving owner instead.
+            if proc.address_space.remove_user_frame(frame) {
+                crate::pmm::free_page(frame);
+            }
+        }
+        akuma_exec::mmu::flush_tlb_range_all_asid(base, n);
+        proc.memory.free_regions.push((addr, n * 4096));
         return 0;
     }
 
@@ -578,9 +577,9 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     let total_pages = unmap_len / 4096;
     for i in 0..total_pages {
         let va = addr + i * 4096;
-        let in_eager = proc.mmap_regions.iter().any(|(start, frames)| {
+        let in_eager = proc.vm_with_regions(|r| r.iter().any(|(start, frames)| {
             va >= *start && va < *start + frames.len() * 4096
-        });
+        }));
         if !in_eager {
             if let Some(frame) = proc.address_space.unmap_and_free_page_no_flush(va) {
                 crate::pmm::free_page(frame);

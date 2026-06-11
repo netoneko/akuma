@@ -3765,6 +3765,7 @@ fn make_test_process(
         lazy_regions: Vec::new(),
         fds: alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::new()),
         fault_mutex: Spinlock::new(BTreeSet::new()),
+        vm_lock: Spinlock::new(()),
         thread_id: None, spawner_pid: None,
         terminal_state: alloc::sync::Arc::new(Spinlock::new(
             akuma_terminal::TerminalState::default(),

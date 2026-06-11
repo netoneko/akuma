@@ -246,7 +246,7 @@ pub fn alloc_mmap(size: usize) -> usize {
 pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
     let pid = address_space_owner_pid_for_fault().unwrap_or(0);
     if let Some(proc) = lookup_process(pid) {
-        proc.mmap_regions.push((start_va, frames));
+        proc.vm_with_regions(|r| r.push((start_va, frames)));
     }
 }
 
@@ -299,6 +299,86 @@ pub fn lazy_region_lookup_for_pid(pid: Pid, va: usize) -> Option<(u64, LazySourc
         }
         None
     })
+}
+
+/// Rotating sweep cursor (VA) for [`reclaim_clean_file_pages`], so successive
+/// reclaims page out across the whole file region (clock-like) instead of always
+/// hitting the same low addresses.
+static RECLAIM_CURSOR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Evict up to `want` clean, read-only, **file-backed** pages of the current
+/// address space and return them to the PMM — the page-reclaim half of demand
+/// paging that lets a file mmap larger than physical RAM make progress under
+/// memory pressure (model weights are paged out and re-faulted from the file).
+///
+/// Only pages inside `LazySource::File` lazy regions are candidates, and only
+/// those still mapped read-only (`try_evict_ro_page` re-checks the PTE), so anon
+/// memory (stack/heap/compute buffers) and any CoW-dirtied page are never
+/// touched. Allocates nothing (it runs on the OOM path): regions are snapshotted
+/// onto the stack and frames are freed via the runtime hook. Returns the number
+/// of pages freed. Called from `pmm::alloc_page_zeroed_user` before it declares
+/// OOM.
+pub fn reclaim_clean_file_pages(want: usize) -> usize {
+    if want == 0 { return 0; }
+    use core::sync::atomic::Ordering;
+
+    let pid = match address_space_owner_pid_for_fault() {
+        Some(p) => p,
+        None => return 0,
+    };
+
+    // Snapshot the file-backed regions onto the stack — no heap allocation, since
+    // we are already under memory pressure and a Vec growth could recurse into
+    // the allocator's OOM handler. 64 regions is ample (llama uses ~37 total).
+    let mut regions: [(usize, usize); 64] = [(0, 0); 64];
+    let mut n = 0usize;
+    with_irqs_disabled(|| {
+        let table = LAZY_REGION_TABLE.lock();
+        if let Some(map) = table.get(&pid) {
+            for (_k, r) in map.iter() {
+                if matches!(r.source, LazySource::File { .. }) && n < regions.len() {
+                    regions[n] = (r.start_va, r.size);
+                    n += 1;
+                }
+            }
+        }
+    });
+    if n == 0 { return 0; }
+
+    let proc = match lookup_process(pid) {
+        Some(p) => p,
+        None => return 0,
+    };
+
+    // Cap pages scanned per call so a sparse (mostly-unmapped) region set can't
+    // spin; eviction is the slow path, but it must still bound its own work.
+    const MAX_SCAN: usize = 262_144; // up to ~1 GB of VA scanned per reclaim
+    let cursor = RECLAIM_CURSOR.load(Ordering::Relaxed);
+    let mut freed = 0usize;
+    let mut scanned = 0usize;
+    let mut next_cursor = 0usize; // 0 ⇒ wrap to the start next time
+
+    'sweep: for i in 0..n {
+        let (start, size) = regions[i];
+        let end = start + size;
+        // Resume from the cursor; regions are stored sorted by start_va.
+        let mut va = if start < cursor { cursor & !0xFFF } else { start };
+        if va >= end { continue; }
+        while va < end {
+            if freed >= want || scanned >= MAX_SCAN {
+                next_cursor = va;
+                break 'sweep;
+            }
+            scanned += 1;
+            if let Some(frame) = proc.address_space.try_evict_ro_page(va) {
+                (runtime().free_page)(frame);
+                freed += 1;
+            }
+            va += 0x1000;
+        }
+    }
+    RECLAIM_CURSOR.store(next_cursor, Ordering::Relaxed);
+    freed
 }
 
 /// Find the PID of the non-shared process whose address space's L0 page-table frame
@@ -599,16 +679,15 @@ pub fn remove_mmap_region(start_va: usize) -> Option<Vec<PhysFrame>> {
     let pid = address_space_owner_pid_for_fault().unwrap_or(0);
     let proc = lookup_process(pid)?;
     
-    // Find the region
-    let idx = proc.mmap_regions.iter().position(|(va, _)| *va == start_va)?;
-    
-    // Remove and return the frames
-    let (va, frames) = proc.mmap_regions.remove(idx);
-    
+    // Find & remove the region under vm_lock (pure Vec op).
+    let (va, frames) = proc.vm_with_regions(|r| {
+        r.iter().position(|(va, _)| *va == start_va).map(|idx| r.remove(idx))
+    })?;
+
     // RECLAIM: Add the freed range to free_regions
     let size: usize = frames.len() * 4096; // config::PAGE_SIZE
     proc.memory.free_regions.push((va, size));
-    
+
     Some(frames)
 }
 

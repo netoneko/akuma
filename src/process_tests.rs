@@ -1261,6 +1261,7 @@ pub(crate) fn make_test_process(pid: u32) -> alloc::boxed::Box<akuma_exec::proce
         lazy_regions: Vec::new(),
         fds: Arc::new(SharedFdTable::new()),
         fault_mutex: Spinlock::new(BTreeSet::new()),
+        vm_lock: Spinlock::new(()),
         thread_id: None, spawner_pid: None,
         terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),
         box_id: 0, namespace: akuma_isolation::global_namespace(),

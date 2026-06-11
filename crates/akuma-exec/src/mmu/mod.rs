@@ -649,6 +649,54 @@ impl UserAddressSpace {
         }
     }
 
+    /// Evict a clean, read-only page at `va`: if it maps a VALID page whose
+    /// permission bits are `AP_RO_ALL` (read-only at EL0/EL1), clear the L3 PTE,
+    /// flush the TLB, drop this address space's frame reference, and return the
+    /// freed frame (when this dropped the last reference) for the caller to
+    /// return to the PMM. Returns `None` if the page is unmapped, NOT read-only
+    /// (so possibly dirty — e.g. a CoW copy mapped `AP_RW_ALL`; never evicted to
+    /// avoid data loss), or still referenced at another VA.
+    ///
+    /// Read-only ⇒ the backing file is authoritative, so the next access
+    /// re-faults and re-reads the page. This is the mechanism that lets a
+    /// file-backed mmap larger than physical RAM make progress under pressure
+    /// (clean model-weight pages are paged out and back in) instead of OOM-ing.
+    /// TLB is flushed BEFORE the frame is freed — a stale TLB entry pointing at a
+    /// reallocated frame would corrupt memory (same hazard `munmap` guards).
+    pub fn try_evict_ro_page(&mut self, va: usize) -> Option<PhysFrame> {
+        let _irq_guard = IrqGuard::new();
+        let l0_idx = (va >> 39) & 0x1FF;
+        let l1_idx = (va >> 30) & 0x1FF;
+        let l2_idx = (va >> 21) & 0x1FF;
+        let l3_idx = (va >> 12) & 0x1FF;
+        let pa = unsafe {
+            let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
+            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
+            if l0_entry & flags::VALID == 0 { return None; }
+            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
+            if l1_entry & flags::VALID == 0 { return None; }
+            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
+            if l2_entry & flags::VALID == 0 { return None; }
+            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l3_entry = l3_ptr.add(l3_idx).read_volatile();
+            if l3_entry & flags::VALID == 0 { return None; }
+            // AP_RO_ALL (bits [7:6] == 0b11) is the only state guaranteed clean:
+            // a written CoW page is AP_RW_ALL and must never be re-read from file.
+            if (l3_entry & flags::AP_RO_ALL) != flags::AP_RO_ALL { return None; }
+            l3_ptr.add(l3_idx).write_volatile(0);
+            (l3_entry & 0x0000_FFFF_FFFF_F000) as usize
+        };
+        flush_tlb_page(va);
+        let frame = PhysFrame::new(pa);
+        if self.remove_user_frame(frame) {
+            Some(frame)
+        } else {
+            None
+        }
+    }
+
     /// Zero the physical page backing `va` without unmapping it.
     /// Returns true if a page was found and zeroed, false if no mapping exists.
     pub fn zero_mapped_page(&self, va: usize) -> bool {

@@ -1,12 +1,77 @@
 # llama.cpp `mmap=true` → ~4 GB allocation spike → kernel OOM abort (EC=0x3c)
 
-**Status:** **FIXED (2026-06-11).** Root cause was a **kernel-heap growth bug**, not
-the demand-paging path. `llama-server` with the default `mmap=true` now loads the
-full model, serves HTTP, and answers chat-completion requests at `MEMORY=4048`
-(extreme); the kernel heap stays at ~7 MB (was ballooning to 3.88 GB) and RAM
-settles at the same ~986 MB steady state as `--no-mmap`. See "Real root cause"
-below. The earlier file-backed readahead reserve clamp was a real fix for a
-different OOM path but had nothing to do with this crash.
+**Status:** **FIXED (2026-06-11), including true mmap-larger-than-RAM.** Three
+independent fixes landed:
+1. **Kernel-heap growth runaway** (the actual cause of the original `brk #1` crash)
+   — see "Real root cause" below.
+2. **File-backed readahead reserve clamp** — a real fix for a separate OOM path.
+3. **Clean file-page eviction** — the OS feature that makes an mmap *larger than
+   physical RAM* actually work (see "mmap bigger than RAM" below).
+
+With all three, `qwen3.5-0.8b-q4` (**532 MB**) loads, serves HTTP, and generates
+correct output **in a 256 MB VM** (≈2× model:RAM) — slow (~17 s/token, disk-bound)
+but stable, zero kernel crashes. At `MEMORY=4048` it runs at full speed. The model
+fitting comfortably in RAM (e.g. ~1 GB for a 532 MB model) is the sweet spot:
+eviction then only trims, no thrash.
+
+## Intermittent kernel hang under concurrent mmaps — FIXED (2026-06-11)
+
+Separate from the eviction work, a user hit an intermittent **kernel hang** (not a
+crash — periodic output just stops) during llama's burst of ~1262 small graph-buffer
+mmaps, with ~221 MB free (so NOT an OOM, and eviction never ran). Root cause: the
+thread-group-owner `Process.mmap_regions` (and the fault path's eager fallback that
+iterates it) is a plain `Vec` with **no synchronization**. llama's CLONE_VM threads
+share one address space, so a concurrent `sys_mmap` push (one thread) and `.iter()`
+read or `munmap` remove (another) can observe a half-completed `Vec` reallocation →
+corruption → hang. Timing-dependent, hence intermittent (the same command served
+fine on other runs).
+
+**Fix:** added `Process::vm_lock` (`crates/akuma-exec/src/process/mod.rs`) and a
+`vm_with_regions()` accessor that holds it with IRQs disabled for a **pure Vec op
+only** (no alloc/map/free/IO/yield under the lock — frames to unmap/free are returned
+and processed after release). All `mmap_regions` access (sys_mmap push, munmap/mremap
+remove+split, the data-abort eager fallback, `record_mmap_region`/`remove_mmap_region`)
+now goes through it. Validated: all VM self-tests pass (`munmap_teardown_conserves_pmm`,
+`test_alloc_mmap_resolves_tgid`, `lazy_region_lookup_resolves_tgid`, etc.), and the
+llama command serves at 256 MB. (Cold COW-fork copy paths read `mmap_regions` too but
+aren't exercised by CLONE_VM threads; left unchanged.)
+
+## mmap bigger than RAM — clean file-page eviction (2026-06-11)
+
+Akuma demand-pages file-backed mmaps *in* but, before this, never paged them *out*,
+so a model larger than RAM filled the PMM and OOM-killed the process. Added
+**clean read-only file-page reclaim**:
+
+- `UserAddressSpace::try_evict_ro_page(va)` (`crates/akuma-exec/src/mmu/mod.rs`):
+  if `va` maps a VALID, **`AP_RO_ALL` (read-only)** page, clears the L3 PTE, flushes
+  the TLB *before* freeing, and returns the frame (refcount-gated). Read-only ⇒
+  content is authoritative in the backing file, so the next touch re-faults and
+  re-reads. A CoW-dirtied page is `AP_RW_ALL` and is never evicted (no data loss).
+- `process::reclaim_clean_file_pages(want)` (`crates/akuma-exec/src/process/children.rs`):
+  snapshots the current address space's `LazySource::File` regions onto the stack
+  (no heap alloc — it runs on the OOM path), sweeps them with a rotating cursor,
+  evicts up to `want` read-only pages, frees via the runtime hook.
+- Hooked into `pmm::alloc_page_zeroed_user()` (`src/pmm.rs`): under pressure, after
+  heap reclaim, it evicts a batch (`USER_RECLAIM_BATCH = 512`) of clean file pages
+  and retries before declaring OOM. Works for both file-fault and anon-fault
+  pressure (evicting model weights to make room for anon compute buffers).
+
+**Verified:** `/bin/mmap_file` touches every page of the 532 MB model in 256 MB and
+**completes** (was a reserve SIGSEGV before). `llama-server --no-repack
+--kv-cache-file /cache.img --mmap -fit off -b 64 -ub 64 -c 4096` loads + serves +
+answers a chat request in 256 MB. To minimise the *non-evictable* (anon) footprint
+so eviction can do its job: `--no-repack` (drops the ~495 MB CPU_REPACK buffer),
+`--kv-cache-file <file>` (KV cache becomes file-backed, ~14 MB mmap vs ~519 MB anon),
+`-fit off -b/-ub small` (shrinks the compute buffer). Limitation: it's a simple
+rotating-cursor (FIFO-ish) replacement with no access-bit LRU, so a working set
+larger than RAM thrashes — fine for "make it work," not yet optimised for speed.
+
+## Original crash (kernel-heap runaway)
+
+`llama-server` with the default `mmap=true` now loads the full model, serves HTTP,
+and answers chat-completion requests at `MEMORY=4048` (extreme); the kernel heap
+stays at ~7 MB (was ballooning to 3.88 GB) and RAM settles at the same ~986 MB
+steady state as `--no-mmap`. See "Real root cause" below.
 
 ## Real root cause (2026-06-11) — kernel-heap growth runaway
 

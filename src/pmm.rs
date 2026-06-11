@@ -725,11 +725,25 @@ pub fn alloc_page_zeroed_user() -> Option<PhysFrame> {
         // before giving up — mirrors `alloc_page`'s reclaim-under-pressure.
         crate::allocator::reclaim_to_pmm();
         if user_alloc_would_starve(free_count()) {
-            return None;
+            // Still starved: page out clean, read-only file-backed pages (e.g.
+            // model weights mmap'd larger than RAM) and let them re-fault from
+            // the file. This is the page-reclaim half of demand paging — it is
+            // what lets a file mmap bigger than physical RAM make progress
+            // instead of the process OOM-ing here. Evict a batch to amortise the
+            // sweep over many subsequent faults.
+            akuma_exec::process::reclaim_clean_file_pages(USER_RECLAIM_BATCH);
+            if user_alloc_would_starve(free_count()) {
+                return None;
+            }
         }
     }
     alloc_page_zeroed()
 }
+
+/// Pages to reclaim per memory-pressure event in [`alloc_page_zeroed_user`].
+/// Sized to free a readahead batch (256) plus headroom, so a faulting process
+/// doesn't re-enter reclaim on every single page.
+const USER_RECLAIM_BATCH: usize = 512;
 
 /// Allocate multiple zeroed pages in a single lock acquisition.
 /// All pages are zeroed and cache-cleaned with a single DSB at the end.

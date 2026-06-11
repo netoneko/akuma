@@ -2773,22 +2773,29 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     let page_va = far_usize & !0xFFF;
                     let mut recovered = false;
                     if let Some(proc) = akuma_exec::process::lookup_process(as_owner) {
-                        for (start, frames) in &proc.mmap_regions {
-                            let region_end = *start + frames.len() * 4096;
-                            if page_va >= *start && page_va < region_end {
-                                let page_idx = (page_va - *start) / 4096;
-                                let phys = frames[page_idx];
-                                crate::tprint!(192, "[DP-eager] pid={} re-map va=0x{:x} frame=0x{:x}\n",
-                                    pid, page_va, phys.addr);
-                                let (table_frames, _) = unsafe {
-                                    akuma_exec::mmu::map_user_page(page_va, phys.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
-                                };
-                                for tf in table_frames {
-                                    proc.address_space.track_page_table_frame(tf);
+                        // Find the frame for this page under vm_lock (pure Vec read),
+                        // then map it AFTER releasing the lock (map allocs page
+                        // tables and must not run while vm_lock is held).
+                        let phys_opt = proc.vm_with_regions(|r| {
+                            r.iter().find_map(|(start, frames)| {
+                                let region_end = *start + frames.len() * 4096;
+                                if page_va >= *start && page_va < region_end {
+                                    Some(frames[(page_va - *start) / 4096])
+                                } else {
+                                    None
                                 }
-                                recovered = true;
-                                break;
+                            })
+                        });
+                        if let Some(phys) = phys_opt {
+                            crate::tprint!(192, "[DP-eager] pid={} re-map va=0x{:x} frame=0x{:x}\n",
+                                pid, page_va, phys.addr);
+                            let (table_frames, _) = unsafe {
+                                akuma_exec::mmu::map_user_page(page_va, phys.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
+                            };
+                            for tf in table_frames {
+                                proc.address_space.track_page_table_frame(tf);
                             }
+                            recovered = true;
                         }
                     }
                     if recovered {
@@ -2796,14 +2803,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     }
                     // Dump mmap_regions for debugging: shows what the eager fallback searched
                     if let Some(dbg_proc) = akuma_exec::process::lookup_process(as_owner) {
-                        let n = dbg_proc.mmap_regions.len();
+                        let n = dbg_proc.vm_with_regions(|r| r.len());
                         crate::tprint!(128, "[DP] eager miss: pid={} va=0x{:x} checked {} mmap_regions\n",
                             pid, far_usize, n);
-                        for (i, (start, fr)) in dbg_proc.mmap_regions.iter().enumerate() {
-                            if i >= 10 { crate::safe_print!(32, "  ...\n"); break; }
-                            crate::safe_print!(128, "  [{}] 0x{:x}-0x{:x} ({} pages)\n",
-                                i, start, start + fr.len() * 4096, fr.len());
-                        }
                     } else {
                         crate::tprint!(128, "[DP] eager miss: lookup_process({}) returned None!\n", pid);
                     }
