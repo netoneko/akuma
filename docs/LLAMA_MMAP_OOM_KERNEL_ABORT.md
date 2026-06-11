@@ -14,6 +14,26 @@ but stable, zero kernel crashes. At `MEMORY=4048` it runs at full speed. The mod
 fitting comfortably in RAM (e.g. ~1 GB for a 532 MB model) is the sweet spot:
 eviction then only trims, no thrash.
 
+## Userspace std::bad_alloc under pressure — FIXED (2026-06-11)
+
+After the eviction + hang fixes, llama at 256 MB got further (prompt processed) then
+aborted with `std::bad_alloc` (exit -6 SIGABRT — userspace, kernel survived, RAM fully
+reclaimed). Cause: musl mmaps mid-size `new`/`malloc` allocations as small (≤16-page)
+**eager** mmaps, which use the *critical* allocator `alloc_pages_zeroed` — that path
+does NOT evict. Under pressure it returned ENOMEM → `new` got null → `std::bad_alloc`.
+
+**Fix** (`src/syscall/mem.rs`): when the eager batch `alloc_pages_zeroed(pages)` fails,
+`reclaim_clean_file_pages(pages + reserve)` and retry; if it still can't form the eager
+batch, fall back to a **lazy (demand-paged) region** (`mmap_eager_to_lazy_fallback`) for
+both anon and file-backed maps — a VA reservation that always succeeds and faults in via
+the reclaim-aware path. Eager mmaps no longer hard-fail under pressure. (`sys_brk` is
+already lazy via the fault path, so it needed no change.)
+
+**Verified:** the exact request that aborted (`The capital of France is`) now returns
+`"...The capital of France is **Paris**."` — a 532 MB model generating a correct answer
+in a 256 MB VM (~15 s/token, disk-bound), 0 kernel crashes. The reclaim+retry succeeded
+without even needing the lazy fallback.
+
 ## Intermittent kernel hang under concurrent mmaps — FIXED (2026-06-11)
 
 Separate from the eviction work, a user hit an intermittent **kernel hang** (not a

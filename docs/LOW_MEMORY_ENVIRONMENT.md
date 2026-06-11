@@ -92,6 +92,15 @@ demand-paging won't dip into:
 **Validated** (`logs/oom_patch_4p5mb.log`): 4.5 MB meow→tcc now shows **0** crash
 markers; the over-demanding processes SIGSEGV gracefully and SSH keeps serving.
 
+Later hardening (2026-06-11) extended the same principle to the paths llama's
+`mmap=true` exercised — the file-backed readahead batch was clamped to the reserve,
+a kernel-heap growth runaway (talc span had no metadata headroom) was fixed, the
+shared `mmap_regions` `Vec` got a lock (`Process::vm_lock`), and the eager `sys_mmap`
+path was made reclaim-aware. Together with **clean file-page eviction** these let a
+model *larger than RAM* run — see *🏁 Milestone — a model LARGER than RAM runs via
+clean file-page eviction* below and
+[LLAMA_MMAP_OOM_KERNEL_ABORT.md](LLAMA_MMAP_OOM_KERNEL_ABORT.md).
+
 **Still open:** memory **reclaim after process death** is incomplete — post-OOM at
 4.5 MB even a trivial `busybox` SIGSEGVs because the dead processes' pages aren't
 fully returned to the PMM (the "permanent high-water" reclaim issue). So 4.5 MB
@@ -431,6 +440,71 @@ under HVF than the TCG numbers above:
 Measured on an M4 Pro, QEMU 10.2.0, release build at 256 MB, with
 `llama-cli -m /models/stories15M-q4_0.gguf -p "Once upon a time" -n 16 -t 1 -c 256 -st`.
 The lingering-llama OOM on repeated runs without `-st` is unchanged.
+
+### 🏁 Milestone — a model LARGER than RAM runs via clean file-page eviction (2026-06-11)
+
+The old rule "a model bigger than RAM just OOMs" no longer holds. Akuma now **pages
+file-backed mappings out as well as in**: under memory pressure it evicts clean,
+read-only file-backed pages (model weights, and a file-backed KV cache) and re-faults
+them from disk on next touch — so the resident working set is bounded by RAM instead of
+growing until OOM.
+
+**Verified:** `qwen3.5-0.8b-q4` (**532 MB**) loads, serves HTTP, and answers a chat
+request **in a 256 MB VM** (≈2× model:RAM):
+
+```
+The capital of France is → "...The capital of France is **Paris**."
+```
+0 kernel crashes; RAM returns to ~252 MB free after the process exits. It is **correct
+and stable, but slow** — ~1.3 s/token prompt, ~15 s/token generation — because every
+forward pass re-pages ~half the model from disk (the model is 2× RAM, so thrash is
+inherent). **Sweet spot: size RAM so the model mostly fits** (≈768 MB–1 GB for a 532 MB
+model); eviction then only trims the edges instead of thrashing, and you get full speed.
+
+**How to run it (256 MB), minimizing the *non-evictable* (anonymous) footprint so
+eviction can do its job:**
+
+```
+# one-time: create the KV-cache backing file inside disk.img (ext2 has no fallocate; dd it):
+#   docker run --rm --privileged -v "$PWD/disk.img:/disk.img" alpine sh -c \
+#     'mkdir -p /mnt/d && mount -o loop /disk.img /mnt/d && dd if=/dev/zero of=/mnt/d/cache.img bs=1M count=900 && sync && umount /mnt/d'
+
+llama-server --no-repack --kv-cache-file /cache.img \
+  --model /models/qwen3.5-0.8b-q4.gguf --host 0.0.0.0 --port 11434 \
+  --chat-template chatml --mmap -ngl 0 -fa 1 -ctk q4_0 -ctv q4_0 \
+  -fit off -b 64 -ub 64 -c 4096
+```
+
+| Flag | Why it matters at 256 MB |
+|---|---|
+| `--mmap` (default) | model weights are file-backed → **evictable**; without it the model is read into anon RAM (not evictable) |
+| `--no-repack` | drops the CPU weight-**repack** buffer (~495 MB anon — a *second* copy of the model); this is the single biggest non-evictable hog |
+| `--kv-cache-file /cache.img` | KV cache becomes a **file-backed** mmap (~14 MB resident, evictable) instead of ~519 MB **anonymous** |
+| `-fit off` | stops llama sizing the compute buffer to perceived free memory (over-commits under `--mmap`) |
+| `-b 64 -ub 64` | shrinks the graph compute buffer (anon, scales with batch) |
+| `-c 4096` | shrinks the KV cache (scales with context; default `-c 32128` is huge) |
+
+The principle: **evictable = file-backed**; **non-evictable = anonymous** (compute
+buffer, repack buffer, stacks, malloc heap). Eviction handles the model + KV; the flags
+keep the anonymous part small enough to fit. (`LLAMA_KV_CACHE_FILE=/cache.img` env var
+also works on this build, but the in-kernel SSH shell doesn't apply `export`/`VAR=val`
+prefixes — use the `--kv-cache-file` flag.)
+
+**Kernel mechanism** (full write-up: [LLAMA_MMAP_OOM_KERNEL_ABORT.md](LLAMA_MMAP_OOM_KERNEL_ABORT.md)):
+- `UserAddressSpace::try_evict_ro_page` + `process::reclaim_clean_file_pages`
+  (`crates/akuma-exec`): evict clean `AP_RO_ALL` file-backed pages, refcount-gated,
+  TLB-flush-before-free; rotating cursor; no heap alloc on the path.
+- Hooked into `pmm::alloc_page_zeroed_user` (demand-paging faults) **and** the eager
+  `sys_mmap` batch (`src/syscall/mem.rs`) — eager allocs that fail now reclaim+retry,
+  then fall back to a lazy region instead of returning ENOMEM (which had made musl's
+  mid-size `new` abort with `std::bad_alloc`).
+- `Process::vm_lock` serializes the shared `mmap_regions` `Vec` across CLONE_VM threads
+  (fixed an intermittent kernel hang during llama's concurrent graph-buffer mmap burst).
+
+**Limitation:** the replacement policy is a simple rotating-cursor (FIFO-ish) sweep with
+no access-bit LRU, so a working set well above RAM thrashes. It is correct, not fast; an
+AF-based clock would cut the re-fault rate. (This supersedes the earlier note that
+SmolLM2-135M / models larger than RAM "just OOM" — they now run, slowly.)
 
 ## meow → ollama runs at 7 MB — lazy-ELF segment-boundary zeroing (FIXED 2026-06-05)
 

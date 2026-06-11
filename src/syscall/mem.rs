@@ -52,6 +52,38 @@ pub(super) fn sys_brk(new_brk: usize) -> u64 {
     } else { 0 }
 }
 
+/// Fallback when an eager mmap can't get its frames even after reclaiming clean
+/// file pages: reserve the region lazily (demand-paged) instead of returning
+/// ENOMEM. A lazy region is just a VA reservation that always succeeds; its pages
+/// fault in later through the reclaim-aware fault path. Safe for both anonymous
+/// and file-backed mappings. Returns the mapped address (or ENOMEM only if a
+/// file-backed fd can't be resolved).
+fn mmap_eager_to_lazy_fallback(
+    proc: &akuma_exec::process::Process,
+    is_file_backed: bool, fd: i32, offset: usize, len: usize,
+    mmap_addr: usize, pages: usize, page_flags: u64,
+) -> u64 {
+    if is_file_backed {
+        if let Some(akuma_exec::process::FileDescriptor::File(ref f)) = proc.get_fd(fd as u32) {
+            let path = f.path.clone();
+            let inode = crate::vfs::resolve_inode(&path).unwrap_or(0);
+            let source = akuma_exec::process::LazySource::File {
+                path, inode, file_offset: offset, filesz: len, segment_va: mmap_addr,
+            };
+            let count = akuma_exec::process::push_lazy_region_with_source(
+                proc.tgid, mmap_addr, pages * 4096, page_flags, source);
+            crate::tprint!(128, "[mmap] eager OOM -> lazy-file fallback pid={} pages={} ({} regions)\n",
+                proc.pid, pages, count);
+            return mmap_addr as u64;
+        }
+        return ENOMEM;
+    }
+    let count = akuma_exec::process::push_lazy_region(proc.tgid, mmap_addr, pages * 4096, page_flags);
+    crate::tprint!(128, "[mmap] eager OOM -> lazy fallback pid={} pages={} ({} regions)\n",
+        proc.pid, pages, count);
+    mmap_addr as u64
+}
+
 pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usize) -> u64 {
     if len == 0 { return EINVAL; }
     let pages = (len + 4095) / 4096;
@@ -175,20 +207,29 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     let frame_batch = match crate::pmm::alloc_pages_zeroed(pages) {
         Some(b) => b,
         None => {
-            if map_populate {
-                // MAP_POPULATE is advisory — fall back to lazy rather than failing the call.
-                let count = akuma_exec::process::push_lazy_region(proc.tgid, mmap_addr, pages * 4096, page_flags);
-                crate::tprint!(128, "[mmap] MAP_POPULATE OOM, lazy fallback: pid={} pages={} ({} regions)\n",
-                    proc.pid, pages, count);
-                return mmap_addr as u64;
+            // The eager batch uses the *critical* allocator, which (unlike the
+            // demand-paging fault path) does not evict. Under memory pressure that
+            // makes a small eager mmap fail outright — userspace `new`/`malloc`
+            // then gets ENOMEM and aborts with std::bad_alloc. So mirror the fault
+            // path: evict clean file-backed pages (e.g. model weights mmap'd larger
+            // than RAM) and retry once.
+            let reclaimed = akuma_exec::process::reclaim_clean_file_pages(pages + crate::pmm::USER_PAGE_RESERVE);
+            if reclaimed > 0 {
+                if let Some(b) = crate::pmm::alloc_pages_zeroed(pages) {
+                    b
+                } else {
+                    // Still short of a contiguous eager batch: fall back to a lazy
+                    // (demand-paged) region, which always succeeds as a VA
+                    // reservation and faults in via the reclaim-aware path. Safe
+                    // for both anonymous and file-backed mappings.
+                    return mmap_eager_to_lazy_fallback(proc, is_file_backed, fd, offset, len, mmap_addr, pages, page_flags);
+                }
+            } else {
+                return mmap_eager_to_lazy_fallback(proc, is_file_backed, fd, offset, len, mmap_addr, pages, page_flags);
             }
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                crate::tprint!(128, "[mmap] pid={} len=0x{:x} FAIL OOM (batch alloc)\n",
-                    proc.pid, len);
-            }
-            return ENOMEM;
         }
     };
+    let _ = map_populate; // populate is now subsumed by the lazy fallback above
     let mut frames = alloc::vec::Vec::with_capacity(pages);
     for (i, frame) in frame_batch.into_iter().enumerate() {
         let (table_frames, _) = unsafe {
