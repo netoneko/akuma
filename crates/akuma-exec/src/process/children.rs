@@ -335,7 +335,7 @@ pub fn reclaim_clean_file_pages(want: usize) -> usize {
     with_irqs_disabled(|| {
         let table = LAZY_REGION_TABLE.lock();
         if let Some(map) = table.get(&pid) {
-            for (_k, r) in map.iter() {
+            for r in map.values() {
                 if matches!(r.source, LazySource::File { .. }) && n < regions.len() {
                     regions[n] = (r.start_va, r.size);
                     n += 1;
