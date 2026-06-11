@@ -1,17 +1,46 @@
 # llama.cpp `mmap=true` → ~4 GB allocation spike → kernel OOM abort (EC=0x3c)
 
-**Status:** **Partially addressed (2026-06-11). The llama `mmap=true` crash STILL
-reproduces.** The file-backed readahead reserve gap is fixed and verified in
-isolation, but it does NOT resolve this crash — re-running the exact repro below
-(extreme, `MEMORY=4048`, fix included) still aborts with the identical `brk #1`
-(EC=0x3c) signature, `PMM: 10/1036288 pages free`, ~580 MB process mmap vs ~4 GB
-physical used. Only 24–45 file-region faults occur, so the model's file-backed
-demand paging (the path that was hardened) is barely exercised; the ~3.4 GB spike
-goes through another path that drains *below* the 16-page reserve. Reproduced both
-with and without host sleep (`caffeinate`), so it is not a sleep/wake artifact (the
-`[WATCHDOG] Time jump` line is a symptom of the allocation burst starving the vCPU,
-not the cause). The real fix still needs the **open question** (instrument where the
-3.4 GB comes from) and likely **Priority 2** (`MADV_DONTNEED` reclaim).
+**Status:** **FIXED (2026-06-11).** Root cause was a **kernel-heap growth bug**, not
+the demand-paging path. `llama-server` with the default `mmap=true` now loads the
+full model, serves HTTP, and answers chat-completion requests at `MEMORY=4048`
+(extreme); the kernel heap stays at ~7 MB (was ballooning to 3.88 GB) and RAM
+settles at the same ~986 MB steady state as `--no-mmap`. See "Real root cause"
+below. The earlier file-backed readahead reserve clamp was a real fix for a
+different OOM path but had nothing to do with this crash.
+
+## Real root cause (2026-06-11) — kernel-heap growth runaway
+
+Instrumenting the crash dump (per-process tracked-frame counts + per-site
+demand-paging page counters + a heap-growth boundary log) showed the truth:
+
+- The crashing process tracked only **15,948 user frames (~62 MB)**; demand paging
+  mapped < 50 K pages total — the file/anon/mmap paths were innocent.
+- The crash dump's own heap line was the tell: `Heap: 1.6 MB used / 3.88 GB total`.
+  **The kernel heap had grown to 3.88 GB while only 1.6 MB was live.**
+- The `[HEAP-GROW]` instrument showed every single growth was driven by a
+  **262144-byte (256 KB / 64-page) allocation** that claimed exactly **64 pages**,
+  with live usage stuck at 1 MB the whole time.
+
+The bug: `handle_oom` claimed a span of *exactly* `needed` pages, but talc reserves
+a few bytes of per-span metadata, so a 64-page span can't hold a 64-page
+allocation. The request fell a few bytes short, talc re-invoked `handle_oom`, which
+claimed another just-too-small span … forever, until the PMM was drained and the
+next claim failed → `brk #1`. Any allocation whose size is an exact page multiple
+≥ 256 KB hit it; llama's model-load issues recurring 256 KB reads, so it triggered
+immediately. (The `[WATCHDOG] Time jump` was a *symptom* — the allocation burst
+starved the vCPU — not a host sleep/wake artifact; reproduced under `caffeinate`.)
+
+**Fix:** claim `HEAP_GROW_HEADROOM_PAGES` (2) pages above what the layout needs, so
+the allocation fits after talc's overhead and the freed span is reused for the next
+same-size request (`src/allocator.rs` — `handle_oom` + new `HEAP_GROW_HEADROOM_PAGES`
+const). Regression test `test_heap_no_runaway_on_page_multiple_alloc`
+(`src/process_tests.rs`) alloc/frees a 256 KB buffer 64× and asserts the heap total
+barely moves (observed: **grew 0 bytes**; pre-fix would grow ~16 MB and, at scale,
+all of RAM).
+
+**Verified:** extreme, `MEMORY=4048`, default `mmap=true` — model loads, server
+listens, a `/v1/chat/completions` request returns a valid response (~30 tok/s),
+heap bounded at 7 MB, no abort.
 
 **Date:** 2026-06-10 (investigation), 2026-06-11 (Priority 1 fix)
 **Profile / RAM:** extreme, `MEMORY=4048` (QEMU virt, HVF)

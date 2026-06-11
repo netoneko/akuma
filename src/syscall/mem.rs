@@ -200,6 +200,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         }
         frames.push(frame);
     }
+    crate::pmm::dp_count(&crate::pmm::EAGER_MMAP_PAGES, pages);
     // Single TLB flush for the entire mmap range.
     akuma_exec::mmu::flush_tlb_range(mmap_addr, pages);
     if is_file_backed {

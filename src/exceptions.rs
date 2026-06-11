@@ -1906,7 +1906,28 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
             mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit, mmap_used
         );
         w.flush();
-        
+
+        // Leak attribution: how many frames this process tracks vs the VA it
+        // mapped, and the global per-site demand-paging page tally.
+        let _ = write!(w, "    Tracked(cur pid={}): user_frames={} refs={} page_tables={}\n",
+            proc.pid,
+            proc.address_space.user_frame_count(),
+            proc.address_space.user_frame_total_refs(),
+            proc.address_space.page_table_frame_count(),
+        );
+        w.flush();
+        if let Some(owner) = akuma_exec::process::lookup_process(proc.tgid) {
+            let _ = write!(w, "    Tracked(owner tgid={}): user_frames={} refs={} page_tables={}\n",
+                proc.tgid,
+                owner.address_space.user_frame_count(),
+                owner.address_space.user_frame_total_refs(),
+                owner.address_space.page_table_frame_count(),
+            );
+            w.flush();
+        }
+        let _ = write!(w, "    DP pages (global): {}\n", crate::pmm::dp_counters_line());
+        w.flush();
+
         if user_sp < mem.stack_bottom as u64 {
             safe_print!(128, "    WARNING: User SP below stack bottom - STACK OVERFLOW!\n");
         } else if user_sp >= mem.stack_top as u64 {
@@ -2410,6 +2431,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     crate::pmm::free_page(page_frame);
                                     for tf in table_frames { crate::pmm::free_page(tf); }
                                 }
+                                crate::pmm::dp_count(&crate::pmm::DP_PROTNONE_PAGES, 1);
                                 crate::syscall::syscall_counters::inc_pagefault(1);
                             } else {
                                 // Race: another CPU already mapped this page.
@@ -2619,6 +2641,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         }
 
                         if any_mapped {
+                            crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, pages_mapped as usize);
                             crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
                             if crate::config::PROCESS_SYSCALL_STATS {
                                 if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
@@ -2690,6 +2713,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                         for tf in table_frames { crate::pmm::free_page(tf); }
                                     }
                                 }
+                                crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, 1);
                                 crate::syscall::syscall_counters::inc_pagefault(1);
                                 return unsafe { (*frame).x0 };
                             } else {
@@ -2713,6 +2737,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     crate::pmm::free_page(page_frame);
                                     for tf in table_frames { crate::pmm::free_page(tf); }
                                 }
+                                crate::pmm::dp_count(&crate::pmm::DP_ANON_PAGES, 1);
                                 crate::syscall::syscall_counters::inc_pagefault(1);
                                 if crate::config::PROCESS_SYSCALL_STATS {
                                     if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
@@ -3118,6 +3143,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         }
 
                         if any_mapped {
+                            crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, pages_mapped as usize);
                             crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
                             if crate::config::PROCESS_SYSCALL_STATS {
                                 if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
@@ -3182,6 +3208,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     }
                                 }
                                 unsafe { core::arch::asm!("dsb ish"); core::arch::asm!("isb"); }
+                                crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, 1);
                                 crate::syscall::syscall_counters::inc_pagefault(1);
                                 return unsafe { (*frame).x0 };
                             } else {
@@ -3205,6 +3232,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                                     crate::pmm::free_page(page_frame);
                                     for tf in table_frames { crate::pmm::free_page(tf); }
                                 }
+                                crate::pmm::dp_count(&crate::pmm::DP_ANON_PAGES, 1);
                                 crate::syscall::syscall_counters::inc_pagefault(1);
                                 if crate::config::PROCESS_SYSCALL_STATS {
                                     if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {

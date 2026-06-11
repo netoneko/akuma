@@ -459,6 +459,37 @@ static ALLOCATED_PAGES: AtomicUsize = AtomicUsize::new(0);
 /// under load instead of silently corrupting the heap and faulting later.
 static DOUBLE_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+// ============================================================================
+// Leak-debugging: per-site demand-paging frame counters (temporary instrument)
+// ============================================================================
+// Each demand-paging map site bumps the matching counter once per page it maps,
+// and the page-free path bumps PAGES_FREED. Dumped in the crash handler and the
+// periodic [Mem] line so a memory spike can be attributed to a specific path.
+pub static DP_FILE_PAGES: AtomicUsize = AtomicUsize::new(0);
+pub static DP_ANON_PAGES: AtomicUsize = AtomicUsize::new(0);
+pub static DP_COW_PAGES: AtomicUsize = AtomicUsize::new(0);
+pub static DP_PROTNONE_PAGES: AtomicUsize = AtomicUsize::new(0);
+pub static EAGER_MMAP_PAGES: AtomicUsize = AtomicUsize::new(0);
+pub static USER_PAGES_FREED: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+pub fn dp_count(counter: &AtomicUsize, n: usize) {
+    counter.fetch_add(n, Ordering::Relaxed);
+}
+
+/// One-line dump of the demand-paging frame attribution counters.
+pub fn dp_counters_line() -> alloc::string::String {
+    alloc::format!(
+        "file={} anon={} cow={} protnone={} eager={} freed={}",
+        DP_FILE_PAGES.load(Ordering::Relaxed),
+        DP_ANON_PAGES.load(Ordering::Relaxed),
+        DP_COW_PAGES.load(Ordering::Relaxed),
+        DP_PROTNONE_PAGES.load(Ordering::Relaxed),
+        EAGER_MMAP_PAGES.load(Ordering::Relaxed),
+        USER_PAGES_FREED.load(Ordering::Relaxed),
+    )
+}
+
 /// Initialize the physical memory manager
 ///
 /// # Arguments
@@ -528,7 +559,10 @@ pub fn free_page(frame: PhysFrame) {
         // Only a real allocated→free transition adjusts the counter. The old
         // code decremented unconditionally, so a double-free silently drifted
         // ALLOCATED_PAGES even when the bitmap guard made the free a no-op.
-        FreeOutcome::Freed => { ALLOCATED_PAGES.fetch_sub(1, Ordering::Relaxed); }
+        FreeOutcome::Freed => {
+            ALLOCATED_PAGES.fetch_sub(1, Ordering::Relaxed);
+            USER_PAGES_FREED.fetch_add(1, Ordering::Relaxed);
+        }
         FreeOutcome::DoubleFree => { DOUBLE_FREE_COUNT.fetch_add(1, Ordering::Relaxed); }
         FreeOutcome::OutOfRange => {}
     }

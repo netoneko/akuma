@@ -403,6 +403,7 @@ pub fn run_all_tests() {
     // contiguous pages so a fragmented pool with free single pages can still grow
     // the heap instead of aborting the kernel (EC=0x3c brk #1, 4 MB meow+tcc).
     test_heap_grow_backoff_plan();
+    test_heap_no_runaway_on_page_multiple_alloc();
 
     // Page-precise process-exit teardown leak detector: spawn → exit → reap →
     // reclaim, repeated, asserting the PMM free pool does not ratchet down. This
@@ -645,6 +646,50 @@ fn test_heap_grow_backoff_plan() {
         "a 1-page request that failed is true OOM (no page free)");
 
     console::print("  [PASS] test_heap_grow_backoff_plan\n");
+}
+
+/// Regression for the 4 GB kernel-heap runaway (docs/LLAMA_MMAP_OOM_KERNEL_ABORT.md):
+/// a recurring allocation whose size is an exact page multiple (llama issued 256 KB
+/// reads) must be reusable after free — i.e. the heap must NOT grow by the full
+/// size on every iteration. Before the HEAP_GROW_HEADROOM_PAGES fix, talc's
+/// per-span metadata meant a 64-page request never fit in a freshly-claimed
+/// 64-page span, so handle_oom re-grew forever and drained the PMM. Here we
+/// alloc+free a page-multiple buffer many times and assert the heap total barely
+/// moves (one initial claim, then pure reuse).
+fn test_heap_no_runaway_on_page_multiple_alloc() {
+    use alloc::vec::Vec;
+
+    // 256 KB = 64 pages, the exact size that triggered the runaway.
+    const SIZE: usize = 256 * 1024;
+    const ITERS: usize = 64;
+
+    // Warm up once so the first (legitimate) claim is already counted.
+    {
+        let mut v: Vec<u8> = Vec::with_capacity(SIZE);
+        v.resize(SIZE, 1);
+        core::hint::black_box(&v);
+    }
+
+    let before = crate::allocator::stats().heap_size;
+    for _ in 0..ITERS {
+        let mut v: Vec<u8> = Vec::with_capacity(SIZE);
+        v.resize(SIZE, 1);
+        core::hint::black_box(&v);
+        // dropped here → freed; the next iteration must reuse this span
+    }
+    let after = crate::allocator::stats().heap_size;
+
+    // With reuse, growth is at most a couple of claims (slack/alignment); the bug
+    // would grow by ITERS*SIZE (16 MB). Allow generous headroom but far below that.
+    let growth = after.saturating_sub(before);
+    assert!(growth < 8 * SIZE,
+        "heap runaway: {} alloc/free of {}KB grew heap by {} bytes (before={}, after={}) — \
+         talc span headroom regression",
+        ITERS, SIZE / 1024, growth, before, after);
+
+    crate::safe_print!(128,
+        "  [PASS] test_heap_no_runaway_on_page_multiple_alloc (grew {} bytes over {} iters)\n",
+        growth, ITERS);
 }
 
 /// Page-precise leak detector for the **process-exit teardown path** — the

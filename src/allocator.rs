@@ -59,7 +59,16 @@ impl talc::OomHandler for PmmOomHandler {
         // small allocations from the thin `USER_PAGE_RESERVE` pool. This is what
         // keeps the OOM process-kill path able to allocate instead of the kernel
         // itself failing to grow the heap and aborting.
-        let needed = (layout.size() + PAGE_SIZE - 1) / PAGE_SIZE;
+        // talc keeps a little per-span metadata at each claimed span, so a span
+        // of exactly `pages_for_layout` pages can NOT hold a `pages_for_layout`-page
+        // allocation — the request falls a few bytes short, talc re-invokes
+        // handle_oom, and we claim another just-too-small span … forever. That is
+        // the 4 GB heap runaway seen under llama's recurring 256 KB reads
+        // (`[HEAP-GROW] this_req=262144 claimed=64 pages`, used stuck at 1 MB).
+        // Claim `HEAP_GROW_HEADROOM_PAGES` extra so the allocation fits and the
+        // freed span is reusable for the next same-size request.
+        let pages_for_layout = (layout.size() + PAGE_SIZE - 1) / PAGE_SIZE;
+        let needed = pages_for_layout + HEAP_GROW_HEADROOM_PAGES;
         let mut n = heap_grow_initial_pages(needed, crate::pmm::free_count());
 
         // The kernel heap lives in the linear (`phys_to_virt`) map, so a heap
@@ -93,7 +102,20 @@ impl talc::OomHandler for PmmOomHandler {
                         // becomes non-reclaimable (the pre-reclaim one-way
                         // behaviour).
                         register_claimed_span(frame.addr, n);
-                        HEAP_SIZE.fetch_add(n * PAGE_SIZE, Ordering::Relaxed);
+                        let prev = HEAP_SIZE.fetch_add(n * PAGE_SIZE, Ordering::Relaxed);
+                        let now = prev + n * PAGE_SIZE;
+                        // Leak-debug: log the request driving growth each time the
+                        // heap crosses a 256 MB boundary, so a runaway grow is
+                        // attributable to a specific allocation size. safe_print
+                        // is alloc-free (used by the alloc error handler too).
+                        const STEP: usize = 256 * 1024 * 1024;
+                        if prev / STEP != now / STEP {
+                            crate::safe_print!(160,
+                                "[HEAP-GROW] total={}MB used={}MB this_req={} bytes claimed={} pages\n",
+                                now / 1024 / 1024,
+                                ALLOCATED_BYTES.load(Ordering::Relaxed) / 1024 / 1024,
+                                layout.size(), n);
+                        }
                         Ok(())
                     }
                     Err(()) => {
@@ -120,6 +142,15 @@ impl talc::OomHandler for PmmOomHandler {
 /// OOM event when memory is ample, to spread the per-claim cost over many small
 /// allocations.
 pub const HEAP_GROW_PAGES: usize = 64;
+
+/// Extra pages claimed above what a layout strictly needs, to cover talc's
+/// per-claimed-span metadata. Without this, an allocation whose size is an exact
+/// multiple of the page size (e.g. a recurring 256 KB / 64-page request) never
+/// fits in a span of exactly that many pages: handle_oom claims a just-too-small
+/// span, talc re-fails, and the heap grows without bound until the PMM is drained
+/// and the kernel aborts (`brk #1`). talc's overhead is a handful of tag words —
+/// well under one page — so 2 pages is ample headroom. See docs/LLAMA_MMAP_OOM_KERNEL_ABORT.md.
+pub const HEAP_GROW_HEADROOM_PAGES: usize = 2;
 
 /// Initial contiguous-page request for a heap-growth that must satisfy a layout
 /// needing `needed` pages, given `free` PMM pages remain. Amortise to

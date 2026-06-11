@@ -519,6 +519,25 @@ impl UserAddressSpace {
         let _irq = IrqGuard::new();
         self.page_table_frames.lock().push(frame);
     }
+
+    /// Number of distinct physical frames this address space tracks as user data
+    /// (one entry per PA, regardless of how many VAs map it). Leak-debugging:
+    /// compare against the VA actually mapped — a count far larger than the
+    /// mapped VA means frames are being tracked-but-orphaned (re-fault leak).
+    pub fn user_frame_count(&self) -> usize {
+        let _irq = IrqGuard::new();
+        self.user_frames.lock().len()
+    }
+    /// Sum of all per-PA reference counts (total VA→frame mappings tracked).
+    pub fn user_frame_total_refs(&self) -> usize {
+        let _irq = IrqGuard::new();
+        self.user_frames.lock().values().map(|&c| c as usize).sum()
+    }
+    /// Number of page-table frames (L1/L2/L3) this address space holds.
+    pub fn page_table_frame_count(&self) -> usize {
+        let _irq = IrqGuard::new();
+        self.page_table_frames.lock().len()
+    }
     /// Drop one tracked reference to `frame`'s physical address.  O(log n) map
     /// lookup (was an O(n) linear scan — the dominant `munmap`/exit cost, see
     /// docs/COW_OPTIMIZATIONS.md).  A PA can be tracked more than once (mapped
