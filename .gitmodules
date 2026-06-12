@@ -9,7 +9,7 @@
 	url = https://github.com/void-linux/xbps
 [submodule "userspace/llama.cpp/llama.cpp"]
 	path = userspace/llama.cpp/llama.cpp
-	url = https://github.com/ggerganov/llama.cpp.git
+	url = https://github.com/netoneko/llama.cpp.git
 [submodule "userspace/crush/crush"]
 	path = userspace/crush/crush
 	url = git@github.com:netoneko/crush.git
