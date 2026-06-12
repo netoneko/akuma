@@ -124,6 +124,10 @@ docker run --rm --privileged \
 
         $APK_CMD
 
+        # Create git -> scratch symlink so 'git clone' works without specifying scratch
+        ln -sf scratch /mnt/disk/bin/git
+        echo 'Created /bin/git -> scratch'
+
         # Sync and unmount
         sync
         umount /mnt/disk
