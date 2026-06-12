@@ -4019,26 +4019,32 @@ fn test_mmap_file_oom_survives() {
     //    succeeds and pages fault in on touch; running out of RAM mid-touch
     //    SIGSEGVs the process (exit -11). This is the path the readahead reserve
     //    clamp protects.
-    //  - eager (release): the whole region is allocated up front, so a region
-    //    larger than RAM is rejected at the syscall with ENOMEM and mmap_file
-    //    exits 2 (mmap failed) without ever touching memory.
+    //  - eager (release): the region is allocated up front. With file-page
+    //    eviction, the kernel can evict clean file pages during the eager walk,
+    //    so a file larger than RAM may succeed (exit 0) or fail with ENOMEM
+    //    (exit 2) depending on eviction pressure. Either outcome is valid.
     // Either way the kernel must stay up — which is the whole point — so we
-    // accept the profile-appropriate exit code and always assert survival.
+    // accept the profile-appropriate exit code(s) and always assert survival.
     let lazy = crate::config::MMAP_FILE_BACKED_LAZY;
     crate::safe_print!(192,
         "  [..] test_mmap_file_oom_survives: mmap {} ({} MB) vs {} MB RAM — expect {}\n",
         path, size / 1024 / 1024, total_ram / 1024 / 1024,
-        if lazy { "SIGSEGV (-11)" } else { "mmap ENOMEM (exit 2)" });
+        if lazy { "SIGSEGV (-11)" } else { "success or ENOMEM (exit 0 or 2)" });
 
     let free_before = pmm::free_count();
 
     match process::exec_with_io("/bin/mmap_file", Some(&[path]), None) {
         Ok((exit_code, _stdout)) => {
             // Reaching here at all proves the kernel did not abort.
-            let expected = if lazy { -11 } else { 2 };
-            assert_eq!(exit_code, expected,
-                "test_mmap_file_oom: oversized file mmap (lazy={}) expected exit {}, got {}",
-                lazy, expected, exit_code);
+            let ok = if lazy {
+                exit_code == -11
+            } else {
+                exit_code == 0 || exit_code == 2
+            };
+            assert!(ok,
+                "test_mmap_file_oom: oversized file mmap (lazy={}) unexpected exit {}, want {}",
+                lazy, exit_code,
+                if lazy { "-11" } else { "0 or 2" });
 
             // The dead process's frames must be reclaimed and the kernel must
             // still be able to hand out user pages.
