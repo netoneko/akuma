@@ -56,7 +56,8 @@ if [ -n "$MEMBER_ONLY" ]; then
         fi
     fi
     # Members that produce no binary (build output handled by their build script)
-    NO_BIN_MEMBERS=("apk-tools" "libakuma" "libakuma-tls" "crush")
+    # nca's build.rs deploys the binary directly to bootstrap/bin/nca
+    NO_BIN_MEMBERS=("apk-tools" "libakuma" "libakuma-tls" "crush" "nca")
     is_no_bin=false
     for m in "${NO_BIN_MEMBERS[@]}"; do
         [ "$MEMBER_ONLY" == "$m" ] && is_no_bin=true && break
@@ -101,6 +102,7 @@ MEMBERS=(
     "wavplay"
     "scratch"
     "needle-server"
+    "nca"
     )
 
 
@@ -146,6 +148,7 @@ BINARIES=(
     "llama-cli"
     "crush"
     "needle-server"
+    "nca"
 )
 
 for bin in "${BINARIES[@]}"; do

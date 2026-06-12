@@ -25,7 +25,8 @@ members = [
     "stp_test",
     "wavplay",
     "scratch",
-    "needle-server"
+    "needle-server",
+    "nca"
 ]
 
 [profile.dev]
