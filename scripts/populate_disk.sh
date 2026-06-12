@@ -65,6 +65,10 @@ if [ "$BIN_ONLY" = true ]; then
 else
     echo "Populating $DISK_IMG with contents of $BOOTSTRAP_DIR..."
     COPY_CMD='
+        # Wipe /tmp so VM-generated artifacts from prior runs do not persist.
+        # bootstrap/tmp/ is re-staged by the cp below.
+        rm -rf /mnt/disk/tmp
+
         # Copy all bootstrap files
         echo "Copying files..."
         cp -rv /bootstrap/* /mnt/disk/
@@ -79,7 +83,7 @@ fi
 # Build the apk pre-install command (runs inside the Docker container after copy)
 APK_CMD=''
 if [ "$WITH_APK" = true ] || [ "$WITH_MUSL_DEV" = true ]; then
-    APK_PKGS="busybox"
+    APK_PKGS="busybox-static"
     if [ "$WITH_MUSL_DEV" = true ]; then
         APK_PKGS="$APK_PKGS musl-dev"
     fi

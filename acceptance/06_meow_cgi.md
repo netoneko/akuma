@@ -89,7 +89,7 @@ rc, out, err = ssh("pkg install meow", timeout=60)
 assert rc == 0, f"pkg install meow failed: {out} {err}"
 print("meow installed")
 
-rc, out, err = ssh("pkg install scratch", timeout=60)
+rc, out, err = ssh("pkg install scratch --as=/bin/git", timeout=60)
 assert rc == 0, f"pkg install scratch failed: {out} {err}"
 print("scratch installed")
 
@@ -116,8 +116,11 @@ assert "httpd" in out, f"httpd not listed in herd status: {out}"
 
 ### 7. Clean up any stale state from prior runs
 
+`/tmp` is wiped by `populate_disk.sh` on every repopulation, so only the cloned
+repo needs clearing here.
+
 ```python
-ssh("rm -rf /akuma-playground /tmp/hello_c /tmp/cgi_*.out", timeout=15)
+ssh("rm -rf /akuma-playground", timeout=15)
 print("stale state cleared")
 ```
 

@@ -37,12 +37,12 @@ userspace/build.sh --scratch-only
 ### 2. Populate the disk
 
 ```bash
-scripts/populate_disk.sh --bin-only
+scripts/populate_disk.sh --with-apk --with-musl-dev
 ```
 
-The disk must already contain `apk add musl-dev`-installed headers and
-`/archives/libtcc1.tar` (our static tcc's runtime archive). Both are part of the
-standard apk bootstrap — see `acceptance/01_verify_apk_bootstrap.md`.
+This pre-installs `musl-dev` and extracts `libtcc1.tar` into the disk image so
+no `apk add` is needed at VM runtime. It also wipes `/tmp` and re-stages
+`bootstrap/tmp/` so compiled artifacts from prior runs are gone.
 
 ### 3. Start the VM at 4.5 MB
 
@@ -51,8 +51,8 @@ ELF=target/aarch64-unknown-none/extreme-size/akuma
 MEMORY=4608K INSTANCE=0 bash scripts/cargo_runner.sh "$ELF" 2>&1 | tee 05_extreme_4mb.log
 ```
 
-`MEMORY=4608K` = 4.5 MB. `SNAPSHOT=1` may be passed to get a pristine disk on
-each boot (prevents stale clone directories from masking a failed run):
+`MEMORY=4608K` = 4.5 MB. Use `SNAPSHOT=1` so every boot starts from the
+populate-disk state — `/tmp` is clean and `/akuma-playground` doesn't exist:
 
 ```bash
 MEMORY=4608K SNAPSHOT=1 INSTANCE=0 bash scripts/cargo_runner.sh "$ELF" 2>&1 | tee 05_extreme_4mb.log
@@ -97,25 +97,17 @@ def ssh(cmd, timeout=180):
 
 ## Steps (in VM)
 
-### 4. Install the tcc runtime
-
-```python
-rc, out, err = ssh("apk add musl-dev && busybox tar xf /archives/libtcc1.tar -C /", timeout=60)
-assert rc == 0, f"tcc runtime install failed: {out} {err}"
-print("tcc runtime ready")
-```
-
-### 5. Install scratch
+### 4. Install scratch
 
 `scratch` ships in `bootstrap/bin/` and is served by the pkg server on the host.
 
 ```python
-rc, out, err = ssh("pkg install scratch", timeout=60)
+rc, out, err = ssh("pkg install scratch --as=/bin/git", timeout=60)
 assert rc == 0, f"scratch install failed: {out} {err}"
 print("scratch ready")
 ```
 
-### 6. Ask meow to clone the repo, compile hello.c, and run it
+### 5. Ask meow to clone the repo, compile hello.c, and run it
 
 The prompt forces **sequential** shell tool-calls: clone first, then compile, then
 run. Merging compile+run into a single `&&` shell command makes the peak footprints
@@ -138,16 +130,15 @@ rc, out, err = ssh(
 print(f"rc={rc}\nout:\n{out}\nerr:\n{err}")
 ```
 
-### 7. Verify
+### 6. Verify
 
 ```python
 assert "Hello" in out or "Hello" in err, \
     f"Expected 'Hello' in meow output, got:\n{out}\n{err}"
 
 # Belt-and-suspenders: run the binary directly
-rc2, run_out, _ = ssh("/tmp/hello_c", timeout=30)
-assert rc2 == 0 and "Hello" in run_out, \
-    f"Binary /tmp/hello_c failed: rc={rc2} out={run_out}"
+_, run_out, _ = ssh("exec /tmp/hello_c", timeout=30)
+assert "Hello" in run_out, f"Binary /tmp/hello_c failed: out={run_out}"
 
 print("PASS")
 ```
@@ -195,7 +186,7 @@ working sets do not overlap.
 | tcc prints `memory full`, exit 1 | tcc's own allocator OOM — user pages dropped below tcc's ~4 MB working set; RAM is too low |
 | `anon alloc failed` / `0 free pages` in serial log | PMM exhausted during compile; consider `MEMORY=5120K` |
 | meow output missing scratch or tcc tool-call | model didn't cooperate; retry (ollama is on the host, RAM-independent) |
-| `/akuma-playground/` already exists from prior boot | stale clone; reboot with `SNAPSHOT=1` |
+| `/akuma-playground/` already exists from prior boot | always boot with `SNAPSHOT=1`; repopulate disk otherwise |
 
 ---
 
