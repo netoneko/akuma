@@ -14,6 +14,14 @@ MEOW_SIZE_FLAGS=(
 # Build one workspace member, applying meow's size flags when appropriate.
 build_member() {
     local m="$1"
+    # --force-rebuild: wipe this member's artifacts first so its build script
+    # re-runs. Needed for members whose build.rs drives an external build (e.g.
+    # llama-cpp's CMake) and only declares `rerun-if-changed=build.rs`, so edits
+    # to the vendored C/C++ sources are otherwise not picked up by cargo.
+    if [ "$FORCE_REBUILD" = true ]; then
+        echo "Force-rebuilding $m (cargo clean -p $m)..."
+        cargo clean --release -p "$m"
+    fi
     if [ "$m" == "meow" ]; then
         cargo build --release -p meow "${MEOW_SIZE_FLAGS[@]}"
     else
@@ -22,10 +30,12 @@ build_member() {
 }
 
 WITH_FORKTEST=false
+FORCE_REBUILD=false
 MEMBER_ONLY=""
 for arg in "$@"; do
     case "$arg" in
         --with-forktest) WITH_FORKTEST=true ;;
+        --force-rebuild) FORCE_REBUILD=true ;;
         --*-only)
             member="${arg#--}"
             MEMBER_ONLY="${member%-only}"

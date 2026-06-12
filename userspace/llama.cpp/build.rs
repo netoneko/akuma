@@ -108,5 +108,30 @@ fn main() {
     let _ = Command::new("aarch64-linux-musl-strip").arg(&dest_server).status();
     println!("cargo:warning=Installed llama-server to bootstrap/bin/llama-server");
 
+    // Build and install llama-bench
+    println!("cargo:warning=Building llama-bench...");
+    let status = Command::new("cmake")
+        .arg("--build")
+        .arg(&build_dir)
+        .arg("--target")
+        .arg("llama-bench")
+        .arg("-j")
+        .arg(&num_jobs)
+        .status()
+        .expect("Failed to execute cmake --build");
+
+    if !status.success() {
+        panic!("Failed to build llama-bench");
+    }
+
+    let compiled_bench = build_dir.join("bin/llama-bench");
+    if !compiled_bench.exists() {
+        panic!("llama-bench binary not found at {}", compiled_bench.display());
+    }
+    let dest_bench = target_bin_dir.join("llama-bench");
+    fs::copy(&compiled_bench, &dest_bench).expect("Failed to copy llama-bench");
+    let _ = Command::new("aarch64-linux-musl-strip").arg(&dest_bench).status();
+    println!("cargo:warning=Installed llama-bench to bootstrap/bin/llama-bench");
+
     println!("cargo:rerun-if-changed=build.rs");
 }

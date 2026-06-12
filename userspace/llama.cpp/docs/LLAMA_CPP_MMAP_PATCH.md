@@ -239,3 +239,141 @@ The patch grows the file as needed, but you can pre-reserve blocks (fallocate an
 ```
 mkfile 512m cache.img      # macOS, truly allocated; Linux: fallocate -l 512M cache.img
 ```
+
+## Low-memory inference: flags, limits, and measured TPS
+
+### Anatomy of anonymous (non-evictable) memory
+
+When running CPU-only with a model larger than or close to the RAM limit, three
+anonymous allocations compete for space. These cannot be evicted — they must fit
+in RAM:
+
+| Allocation | Size (qwen3.5-0.8b-q4, c=4096) | Eliminated by |
+|---|---|---|
+| Repack buffer | ~495 MB | `--no-repack` |
+| KV cache (anon) | ~192 MB (f16) | `--kv-cache-file <path>` |
+| Compute/graph buffers | ~50–200 MB | `-b 64 -ub 64`, `-c` reduction |
+
+Everything else (`--mmap` model weights) is file-backed → evictable by the OS.
+
+**Rule of thumb:** all anonymous allocations must fit in RAM. File-backed pages can
+exceed RAM but each eviction costs a disk round-trip.
+
+### Recommended flags for ≤ 1 GB RAM (CPU-only, `-ngl 0`)
+
+```
+llama-server \
+  --mmap                        # model weights are file-backed → evictable
+  --no-repack                   # drop ~495 MB anonymous repack buffer
+  --kv-cache-file /cache.img    # KV cache file-backed → evictable (~14 MB resident)
+  -fit off                      # prevent llama over-sizing buffers to "free" RAM
+  -b 64 -ub 64                  # shrink anonymous compute buffer
+  -c 4096                       # limit KV cache size (default 256K is too large)
+  -ngl 0
+```
+
+Pre-allocate the backing file before starting the server:
+```sh
+dd if=/dev/zero of=/cache.img bs=1M count=900
+```
+
+`LLAMA_KV_CACHE_FILE=/cache.img` is an equivalent environment variable.
+
+### TPS matrix — qwen3.5-0.8b-q4 (532 MB model) on Linux / Docker, ARM64, CPU-only
+
+Measured via `llama-server` + `/completion` endpoint, 5 requests × 32 tokens,
+no swap (`--memory-swap` = `--memory`). Flags: `--no-repack -b 64 -ub 64 -c 4096 -fit off`
+plus the `--mmap` / `--kv-cache-file` columns being tested.
+
+| RAM | `--mmap` | `--kv-cache-file` | boots? | pp t/s | tg t/s |
+|-----|----------|-------------------|--------|--------|--------|
+| 128m | off | off | OOM | — | — |
+| 128m | off | on  | OOM | — | — |
+| 128m | on  | off | OOM | — | — |
+| 128m | on  | on  | OOM† | — | — |
+| 256m | off | off | OOM | — | — |
+| 256m | off | on  | OOM | — | — |
+| 256m | on  | off | ✓ | 11.5 | 2.8 |
+| 256m | on  | on  | ✓ | 11.9 | 2.7 |
+| 512m | off | off | OOM | — | — |
+| 512m | off | on  | OOM | — | — |
+| 512m | on  | off | ✓ | 9.9  | 2.5 |
+| 512m | on  | on  | ✓ | 11.1 | 2.8 |
+| 1 GB | off | off | ✓ | 81.7 | 22.8 |
+| 1 GB | off | on  | ✓ | 61.1 | 17.2 |
+| 1 GB | on  | off | ✓ | 56.8 | 18.2 |
+| 1 GB | on  | on  | ✓ | 70.3 | 20.9 |
+
+† Server started (health check passed) but request timed out — too slow to respond.
+
+Key observations:
+- `--no-mmap` requires the model in anonymous RAM; OOMs at ≤ 512m (model = 532 MB).
+- `--mmap` enables 256m–512m operation, but at ~2.5–2.8 tg t/s: the working set
+  is ~4× RAM, so every forward pass re-pages a large fraction of the model from disk.
+- At 1 GB the model mostly fits; TPS jumps to 17–23 regardless of mmap setting.
+- `--kv-cache-file` alone is the margin that stretches 128m from OOM to almost-possible
+  (KV cache drops from ~192 MB anonymous to ~14 MB resident).
+- `llama-bench` (direct pp512/tg128) needs more contiguous memory than the server;
+  it only ran at 1 GB without `--kv-cache-file`.
+
+## Akuma OS disk bottleneck: why it's ~40× worse than Linux at low RAM
+
+### The fundamental path difference
+
+On **Linux** (Docker, no swap), when a file-backed mmap page is evicted and re-read:
+
+```
+page fault → OS page cache lookup → read from host FS → fault in → resume
+```
+
+The Linux page cache is the key: once a host (macOS) page is read, the guest Docker
+container's kernel caches it. Subsequent re-reads of the same page hit the in-kernel
+cache (DRAM speed), not the underlying storage. Clock/LRU eviction keeps hot pages
+resident.
+
+On **Akuma** (no page cache, virtio-blk), the same re-read costs:
+
+```
+guest page fault → PTE check → no cache → virtio-blk read request → VM exit
+  → QEMU services from host page cache → DMA into guest frame
+  → virtio completion IRQ → return to guest → resume
+```
+
+Every evicted page re-read incurs a **full virtio round-trip**: VM exit, QEMU
+context switch, DMA, completion IRQ — ~100–500 µs per 4 KiB page. Akuma also
+uses a **FIFO rotating-cursor eviction** (no LRU access-bit tracking), so it
+evicts pages in address order regardless of recency. A forward pass through the
+model therefore evicts hot pages that were just used, causing a cascade of
+re-faults on the next pass.
+
+### Measured comparison (256m, disk-bound)
+
+| Platform | RAM | tg t/s | notes |
+|----------|-----|--------|-------|
+| Linux Docker (no swap) | 256m | ~2.7 | LRU eviction, page cache |
+| Akuma OS (QEMU HVF) | 256m | ~0.067 (~15 s/tok) | FIFO eviction, virtio round-trips |
+
+**Akuma is ~40× slower** at 256m: same binary, same model, same host. The gap is
+entirely the page-fault path, not CPU throughput.
+
+### Why Akuma is better at > 1 GB RAM
+
+When the model fits in RAM, the disk path is inactive. At ≥ 1 GB:
+- Model pages (532 MB) stay resident after initial load — no eviction occurs.
+- KV cache (192 MB at c=4096) also stays resident.
+- Compute buffers are anonymous — never disk-backed.
+
+In this regime, Akuma's disk penalty disappears and the only overhead is the
+QEMU HVF VM-exit cost for syscalls and interrupts (~25% slower than bare Linux).
+
+| Platform | RAM | tg t/s | notes |
+|----------|-----|--------|-------|
+| Linux Docker (no swap, `--mmap`) | 4 GB | ~37.6 | model fits, disk inactive |
+| Akuma OS (QEMU HVF, `--mmap`)   | 4 GB | ~30   | same, QEMU HVF overhead only |
+
+At 4 GB the gap narrows to ~25%: pure VM-exit overhead, no disk bottleneck.
+The ~40× disk penalty at 256m collapses to ~1.25× when the working set fits.
+
+**Practical conclusion:** Akuma is viable for inference when RAM ≥ model size. The
+disk bottleneck is universal (Linux is slower too), but Akuma's FIFO eviction and
+virtio latency make it catastrophic below that threshold.

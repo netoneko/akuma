@@ -228,7 +228,12 @@ pub const SKIP_FILESYSTEM_INIT: bool = false;
 
 
 pub const MEM_MONITOR_PERIOD_SECONDS: u64 = 3;
-pub const MEM_MONITOR_ENABLED: bool = true;
+pub const MEM_MONITOR_ENABLED: bool = false;
+
+/// Gate demand-paging serial prints ([DA-DP] / [DP] / [DP-eager]).
+/// These fire on every page fault; disable for clean TPS benchmarks where the
+/// serial writes would pollute timing (especially during initial model load).
+pub const DEMAND_PAGE_LOG_ENABLED: bool = false;
 
 /// Enable preemption watchdog
 ///
