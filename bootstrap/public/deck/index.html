@@ -201,7 +201,7 @@
   <!-- 11 -->
   <section class="slide">
     <h2>How does that compare to Linux?</h2>
-    <p class="sub">What it takes to run a <i>working agent</i>, not a bare kernel.</p>
+    <p class="sub">Docker always wins</p>
     <table>
       <tr><th>Stack</th><th style="text-align:right">Practical RAM</th></tr>
       <tr><td>Bare Linux kernel (tinyconfig, no userspace)</td><td class="num">few MB — does nothing useful</td></tr>
@@ -210,19 +210,8 @@
       <tr><td>Python agent stack on Linux</td><td class="num">hundreds of MB</td></tr>
       <tr><td><b>Akuma: full clone + compile + run agent</b></td><td class="num good">4 MB</td></tr>
     </table>
-    <p class="note">Honest caveat: a Linux <i>kernel</i> boots tiny. The gap is <i>userspace</i> &mdash; add networking, a shell, a compiler, a container runtime and Linux lands 1–2 orders of magnitude higher. Akuma's 4 MB already includes all of that.</p>
   </section>
 
-  <!-- 12 -->
-  <section class="slide">
-    <h2>What's real vs. what's hard</h2>
-    <ul>
-      <li>A 25-min run stayed <i>stable</i>, but the model burned ~19 min probing for tools that don't exist (<span class="mono">git, curl, apt-get, chmod</span>). Fix: describe the sandbox in the system prompt.</li>
-      <li>A JSON-escaping bug corrupted a source file; a missing signal-aware exit code hid a compiler crash.</li>
-      <li>These are <b>agent-plumbing and prompt bugs, not memory bugs.</b> The OS held the whole time.</li>
-    </ul>
-    <p class="quote">At the edge, the agent's biggest enemy is not knowing what's in its sandbox &mdash; not RAM.</p>
-  </section>
 
   <!-- 13 LIVE DEMO -->
   <section class="slide center">
@@ -242,7 +231,7 @@
 
 </div>
 
-<div id="hud">1 / 14</div>
+<div id="hud">1 / 13</div>
 <div id="hint">← → / space &nbsp;·&nbsp; f fullscreen</div>
 
 <script>
