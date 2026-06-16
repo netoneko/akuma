@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Live demo &mdash; meow compiles C in 4 MB</title>
+<style>
+  :root{
+    --bg:#0b0e14; --bg2:#11151f; --fg:#e6e9ef; --dim:#8b94a7; --line:#222a39;
+    --accent:#7cc4ff; --good:#9bf6c9; --warn:#ffd479; --bad:#ff8d8d;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:var(--bg);color:var(--fg);
+    font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    display:flex;flex-direction:column;height:100%;
+  }
+  header{padding:14px 22px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  header h1{font-size:20px;margin:0;letter-spacing:-.01em}
+  header .tag{font-family:var(--mono);font-size:12px;color:var(--dim);border:1px solid var(--line);border-radius:999px;padding:.15em .7em}
+  header a{margin-left:auto;color:var(--accent);text-decoration:none;font-size:14px}
+  .controls{padding:14px 22px;display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap;border-bottom:1px solid var(--line)}
+  textarea{
+    flex:1;min-width:280px;min-height:78px;resize:vertical;background:var(--bg2);color:var(--fg);
+    border:1px solid var(--line);border-radius:10px;padding:.7em .8em;font-family:var(--mono);font-size:13px;line-height:1.45;
+  }
+  .side{display:flex;flex-direction:column;gap:8px;min-width:180px}
+  label{font-size:12px;color:var(--dim)}
+  input[type=text]{background:var(--bg2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:.5em .7em;font-family:var(--mono);font-size:13px}
+  .row{display:flex;gap:10px}
+  button{
+    border:0;border-radius:10px;padding:.7em 1.3em;font-weight:700;font-size:15px;cursor:pointer;
+  }
+  #run{background:var(--accent);color:#06223a}
+  #run:hover{filter:brightness(1.08)}
+  #stop{background:#2a2f3d;color:var(--fg)}
+  #stop:disabled,#run:disabled{opacity:.45;cursor:not-allowed}
+  .statusbar{padding:8px 22px;display:flex;gap:18px;align-items:center;font-family:var(--mono);font-size:13px;color:var(--dim);border-bottom:1px solid var(--line)}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--line);display:inline-block;margin-right:6px}
+  .dot.run{background:var(--warn);animation:pulse 1s infinite}
+  .dot.ok{background:var(--good)} .dot.err{background:var(--bad)}
+  @keyframes pulse{50%{opacity:.35}}
+  main{flex:1;overflow:auto;padding:0}
+  #out{
+    margin:0;padding:18px 22px;font-family:var(--mono);font-size:14px;line-height:1.5;
+    white-space:pre-wrap;word-break:break-word;color:#cdd6e6;min-height:100%;
+  }
+  #out .cursor{display:inline-block;width:8px;height:1.05em;background:var(--accent);vertical-align:text-bottom;animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .meta{color:var(--dim)}
+</style>
+</head>
+<body>
+<header>
+  <h1>meow compiles C in 4&nbsp;MB</h1>
+  <span class="tag" id="origin">POST /cgi-bin/meow</span>
+  <a href="index.html">&larr; back to deck</a>
+</header>
+
+<div class="controls">
+  <textarea id="prompt">clone https://github.com/netoneko/akuma-playground.git using /bin/scratch as git-compatible substitute and statically compile /akuma-playground/hello.c with /bin/tcc, put binary in /tmp/h4mb and run it, run commands one by one using shell tool</textarea>
+  <div class="side">
+    <div>
+      <label for="model">model (optional, query string)</label>
+      <input type="text" id="model" placeholder="e.g. qwen3:4b">
+    </div>
+    <div class="row">
+      <button id="run">Run &#9654;</button>
+      <button id="stop" disabled>Stop</button>
+    </div>
+  </div>
+</div>
+
+<div class="statusbar">
+  <span><span class="dot" id="dot"></span><span id="status">idle</span></span>
+  <span id="timer">0.0s</span>
+  <span id="bytes">0 B</span>
+</div>
+
+<main><pre id="out"><span class="meta">Press Run to stream the agent's output as it arrives.</span></pre></main>
+
+<script>
+(function(){
+  var out = document.getElementById('out');
+  var runBtn = document.getElementById('run');
+  var stopBtn = document.getElementById('stop');
+  var dot = document.getElementById('dot');
+  var statusEl = document.getElementById('status');
+  var timerEl = document.getElementById('timer');
+  var bytesEl = document.getElementById('bytes');
+  var origin = document.getElementById('origin');
+  origin.textContent = 'POST ' + location.origin + '/cgi-bin/meow';
+
+  var ctrl = null, t0 = 0, timerId = null, recv = 0;
+
+  function setStatus(cls, text){ dot.className = 'dot ' + (cls||''); statusEl.textContent = text; }
+  function fmtBytes(n){ return n < 1024 ? n+' B' : (n/1024).toFixed(1)+' KB'; }
+  function tick(){ timerEl.textContent = ((performance.now()-t0)/1000).toFixed(1)+'s'; }
+  function atBottom(){ return out.parentElement.scrollHeight - out.parentElement.scrollTop - out.parentElement.clientHeight < 60; }
+
+  function cursor(on){
+    var c = out.querySelector('.cursor');
+    if (on && !c){ c = document.createElement('span'); c.className='cursor'; out.appendChild(c); }
+    else if (!on && c){ c.remove(); }
+  }
+  function append(text){
+    var c = out.querySelector('.cursor');
+    var node = document.createTextNode(text);
+    if (c) out.insertBefore(node, c); else out.appendChild(node);
+  }
+
+  function finish(cls, text){
+    cursor(false);
+    if (timerId){ clearInterval(timerId); timerId = null; }
+    tick();
+    setStatus(cls, text);
+    runBtn.disabled = false; stopBtn.disabled = true; ctrl = null;
+  }
+
+  function run(){
+    var prompt = document.getElementById('prompt').value;
+    var model = document.getElementById('model').value.trim();
+    var url = '/cgi-bin/meow' + (model ? ('?model=' + encodeURIComponent(model)) : '');
+
+    out.textContent = '';
+    recv = 0; bytesEl.textContent = '0 B';
+    runBtn.disabled = true; stopBtn.disabled = false;
+    setStatus('run', 'connecting…');
+    t0 = performance.now(); timerId = setInterval(tick, 100);
+    cursor(true);
+
+    ctrl = new AbortController();
+    fetch(url, { method:'POST', body:prompt, signal:ctrl.signal, headers:{'Content-Type':'text/plain'} })
+      .then(function(resp){
+        setStatus('run', 'streaming (HTTP ' + resp.status + ')');
+        if (!resp.body || !resp.body.getReader){
+          // No streaming support — fall back to full text.
+          return resp.text().then(function(txt){ append(txt); recv += txt.length; bytesEl.textContent = fmtBytes(recv); finish('ok','done'); });
+        }
+        var reader = resp.body.getReader();
+        var dec = new TextDecoder();
+        function pump(){
+          return reader.read().then(function(r){
+            if (r.done){ finish('ok','done'); return; }
+            var stick = atBottom();
+            var chunk = dec.decode(r.value, {stream:true});
+            append(chunk);
+            recv += r.value.length; bytesEl.textContent = fmtBytes(recv);
+            if (stick) out.parentElement.scrollTop = out.parentElement.scrollHeight;
+            return pump();
+          });
+        }
+        return pump();
+      })
+      .catch(function(err){
+        if (err && err.name === 'AbortError') finish('', 'stopped');
+        else { append('\n\n[error] ' + (err && err.message ? err.message : err) + '\n'); finish('err','error'); }
+      });
+  }
+
+  runBtn.addEventListener('click', run);
+  stopBtn.addEventListener('click', function(){ if (ctrl) ctrl.abort(); });
+  // Ctrl/Cmd+Enter in the textarea runs it.
+  document.getElementById('prompt').addEventListener('keydown', function(e){
+    if ((e.metaKey||e.ctrlKey) && e.key==='Enter'){ if(!runBtn.disabled) run(); }
+  });
+})();
+</script>
+</body>
+</html>
