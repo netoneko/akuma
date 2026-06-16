@@ -592,6 +592,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "native-cli-ai"
+version = "0.3.0"
+
+[[package]]
 name = "needle-core"
 version = "0.1.0"
 source = "git+https://github.com/geekgineer/needle-rs#23a638b0e3a952f62d19190680676dc790fb0fbd"

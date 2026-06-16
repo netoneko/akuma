@@ -66,18 +66,15 @@ def ssh(cmd, timeout=120):
 
 ## Steps (in VM)
 
-### 3. Write hello.c
+### 3. Verify hello.c is present
 
-```python
-hello_c = '#include <stdio.h>\nint main() { printf("Hello, Akuma!\\n"); return 0; }\n'
-rc, out, err = ssh(f"echo '{hello_c}' > /tmp/hello.c")
-print(f"write rc={rc}")
-```
+`/tmp/hello.c` is pre-staged on the disk by `populate_disk.sh` from
+`bootstrap/tmp/hello.c` — no in-VM write needed.
 
-Or verify it already exists from a previous run:
 ```python
 rc, out, err = ssh("cat /tmp/hello.c")
 print(out)
+assert "Hello" in out, f"hello.c not found: {out}"
 ```
 
 ### 4. Run meow in non-interactive mode

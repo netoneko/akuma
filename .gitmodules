@@ -13,3 +13,7 @@
 [submodule "userspace/crush/crush"]
 	path = userspace/crush/crush
 	url = git@github.com:netoneko/crush.git
+[submodule "userspace/nca/native-cli-ai"]
+	path = userspace/nca/native-cli-ai
+	url = https://github.com/netoneko/native-cli-ai.git
+	branch = dev
