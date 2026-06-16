@@ -128,6 +128,12 @@ docker run --rm --privileged \
         ln -sf scratch /mnt/disk/bin/git
         echo 'Created /bin/git -> scratch'
 
+        # Create essential busybox symlinks (apk --no-scripts skips post-install triggers)
+        for cmd in sh chmod ls mkdir rm cat echo grep; do
+            ln -sf busybox.static /mnt/disk/bin/$cmd 2>/dev/null || true
+        done
+        echo 'Created busybox symlinks'
+
         # Sync and unmount
         sync
         umount /mnt/disk
