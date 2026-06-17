@@ -3570,7 +3570,9 @@ fn test_map_user_page_preserves_irq_state() -> bool {
         None => { console::print("  OOM\n"); return false; }
     };
 
-    let test_va: usize = 0x1_E000_0000;
+    // Above the RAM identity map (see test_map_user_page_roundtrip for why a fixed
+    // ~7.5GB VA crashes at MEMORY≥8G).
+    let test_va: usize = 0x41_4000_0000; // 261GB
 
     // Disable IRQs (simulating exception handler context)
     unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
@@ -3627,11 +3629,14 @@ fn test_map_user_page_roundtrip() -> bool {
         None => { console::print("  OOM\n"); return false; }
     };
 
-    // Use a VA unlikely to conflict with anything. The kernel test thread
-    // runs with the kernel TTBR0 so we need an address within the identity-
-    // mapped range. Pick a VA in an unused user-range gap if available,
-    // or use a high address.
-    let test_va: usize = 0x1_F000_0000;
+    // Pick a VA *above* the kernel RAM identity-map window. A fixed ~7.75GB VA
+    // (the old value) is a safe "high user VA" only while RAM ≲ 7GB; once RAM is
+    // large enough that the identity map reaches it (e.g. MEMORY=8G), this VA
+    // lands inside an identity 1GB block, and map_user_page splits that block and
+    // allocates its page-table frames from the very region it just unmapped —
+    // EC=0x25 translation fault at FAR≈7GB during boot. 256GB+ is always above the
+    // identity map (see docs/MEMORY_LAYOUT.md "Boot self-test VAs").
+    let test_va: usize = 0x41_0000_0000; // 260GB, above the RAM identity map
 
     let before = akuma_exec::mmu::is_current_user_page_mapped(test_va);
 
@@ -4881,7 +4886,9 @@ fn test_map_user_page_race_leaks_frame() -> bool {
         None => { crate::pmm::free_page(frame_a); console::print("  OOM\n"); return false; }
     };
 
-    let test_va: usize = 0x1_E000_0000;
+    // Above the RAM identity map (see test_map_user_page_roundtrip for why a fixed
+    // ~7.5GB VA crashes at MEMORY≥8G).
+    let test_va: usize = 0x41_8000_0000; // 262GB
 
     // Map frame_a at test_va (first mapper wins)
     let (table_frames_a, installed_a) = unsafe {

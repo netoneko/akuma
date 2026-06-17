@@ -5,7 +5,10 @@
 set -e
 
 SIZE_MB=${1:-1024}
-DISK_IMG="disk.img"
+# DISK env var overrides the output image path (default: disk.img). Lets you build
+# a separate image (e.g. DISK=disk_selfhost.img scripts/create_disk.sh 8192) without
+# clobbering the primary disk.img used by the other acceptance tests.
+DISK_IMG="${DISK:-disk.img}"
 
 echo "Creating ${SIZE_MB}MB ext2 disk image..."
 

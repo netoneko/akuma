@@ -309,10 +309,31 @@ goes from ~127 MB free at 2 GB to ~3.9 GB free at 6 GB).
   256 GB range (above any RAM identity map) so they don't collide with the
   extended boot map.
 
+#### Boot self-test VAs (the `MEMORY≥8G` `map_user_page` crash — fixed)
+
+Three `map_user_page` self-tests (`test_map_user_page_roundtrip`,
+`_preserves_irq_state`, `_race_leaks_frame`) had **not** been moved with the
+`map_127_pages` tests above — they still hardcoded a ~7.5–7.75 GB scratch VA
+(`0x1_E000_0000` / `0x1_F000_0000`). That is a safe "high user VA" only while
+RAM ≲ 7 GB. Once the identity map *reaches* that address (`MEMORY ≥ 8 GB`), the
+scratch VA lands inside a 1 GB identity block; `map_user_page` splits the block
+into L2/L3 tables and allocates the new table frames from the very region it just
+unmapped, so the next table write faults (`EC=0x25`, `FAR ≈ 7 GB`) and kills the
+boot thread → `yield_now`-spin hang. This was a **test bug, not a kernel limit**
+(real user mappings already worked at large RAM via `alloc_mmap`'s jump over the
+identity window). Fixed by moving the three scratch VAs above the identity map
+(`0x41_0000_0000` / `0x41_4000_0000` / `0x41_8000_0000`, i.e. 260/261/262 GB),
+matching the `map_127_pages` convention.
+
 > Verified across `MEMORY` = 256M/512M/1024M (tcc `hello.c`) and
 > 2048M/3584M/4096M/6144M (`rustc hello.rs`): all boot clean and the program
 > compiles, links, and prints `Hello from Akuma!`. Use `scripts/test_memory_split.py`
 > to re-run the matrix.
+>
+> Boot-to-SSH additionally verified at `MEMORY` = 6/8/10/12/14/16 GB after the
+> boot self-test VA fix (`scripts/boot_ram_sweep.sh`) — all reach the in-kernel
+> SSH server with full RAM detected. The boot identity map covers 1 GB blocks to
+> L1[511] (≈512 GB), so the ceiling is host RAM, not the kernel.
 
 ## Configuration Files
 
