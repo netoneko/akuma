@@ -24,6 +24,10 @@ pub enum SshState {
     Disconnected,
 }
 
+// Independent protocol flags (channel_open / channel_eof / channel_closed /
+// resize_pending) track distinct, orthogonal session states; folding them into
+// a single enum would conflate unrelated conditions for no clarity gain.
+#[allow(clippy::struct_excessive_bools)]
 pub struct SshSession {
     pub state: SshState,
     pub rng: SimpleRng,
@@ -38,11 +42,11 @@ pub struct SshSession {
     pub channel_open: bool,
     pub client_channel: u32,
     pub channel_data_buffer: Vec<u8>,
-    /// Client sent CHANNEL_EOF: its stdin is done, but the channel is still open
+    /// Client sent `CHANNEL_EOF`: its stdin is done, but the channel is still open
     /// and the client still wants the command's output. Must NOT be treated as a
     /// disconnect — see `channel_closed`.
     pub channel_eof: bool,
-    /// Client sent CHANNEL_CLOSE or DISCONNECT: the client is actually gone.
+    /// Client sent `CHANNEL_CLOSE` or `DISCONNECT`: the client is actually gone.
     /// Distinct from `channel_eof` so a long non-interactive command (e.g. a
     /// build) isn't killed merely because `ssh host cmd` closed its stdin.
     pub channel_closed: bool,
