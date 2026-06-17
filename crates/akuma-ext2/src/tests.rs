@@ -690,3 +690,98 @@ fn concurrent_create_and_lookup() {
         }
     }
 }
+
+// ============================================================================
+// ClockBlockCache (large block cache, feature `fs-cache`) unit tests.
+// Compiled whenever `cfg(test)` is active (the cache type is `cfg(any(ext2_fs_cache, test))`).
+// ============================================================================
+
+use crate::ext2::{ClockBlockCache, cache_stats, set_cache_cap_bytes};
+
+/// A distinct 4-byte-tagged block of `block_size` bytes for block number `n`.
+fn blk(n: u32, block_size: usize) -> Vec<u8> {
+    let mut v = vec![0u8; block_size];
+    v[0..4].copy_from_slice(&n.to_le_bytes());
+    v
+}
+
+#[test]
+fn clock_cache_basic_hit_and_miss() {
+    let bs = 1024;
+    let mut c = ClockBlockCache::with_capacity_blocks(bs, 8);
+    assert!(c.get(5).is_none(), "empty cache must miss");
+    c.insert(5, &blk(5, bs));
+    let got = c.get(5).expect("inserted block must hit");
+    assert_eq!(&got[0..4], &5u32.to_le_bytes(), "wrong block data returned");
+}
+
+#[test]
+fn clock_cache_dedup_insert() {
+    let bs = 1024;
+    let mut c = ClockBlockCache::with_capacity_blocks(bs, 8);
+    c.insert(7, &blk(7, bs));
+    c.insert(7, &blk(7, bs)); // duplicate: must not create a second slot
+    // Fill the rest; if the dup created a slot we'd evict 7 one round early.
+    for n in 100..107 {
+        c.insert(n, &blk(n, bs));
+    }
+    assert!(c.get(7).is_some(), "block 7 should still be resident (no dup slot)");
+}
+
+#[test]
+fn clock_cache_remove_invalidates() {
+    let bs = 512;
+    let mut c = ClockBlockCache::with_capacity_blocks(bs, 8);
+    c.insert(3, &blk(3, bs));
+    assert!(c.get(3).is_some());
+    c.remove(3);
+    assert!(c.get(3).is_none(), "removed block must miss");
+    // The freed slot must be reusable.
+    c.insert(9, &blk(9, bs));
+    assert!(c.get(9).is_some(), "freed slot must be reusable");
+}
+
+#[test]
+fn clock_cache_second_chance_spares_referenced_block() {
+    // The defining property of clock vs a pure ring: a *referenced* block gets a
+    // second chance and survives an eviction in favour of an unreferenced one.
+    let bs = 256;
+    let mut c = ClockBlockCache::with_capacity_blocks(bs, 4);
+    for n in 0..4 {
+        c.insert(n, &blk(n, bs)); // slots 0..3, all ref=1, hand=0
+    }
+    // Full + all bits set => first eviction is FIFO (block 0). This is correct
+    // clock behaviour, not a bug — every block had its chance.
+    c.insert(4, &blk(4, bs));
+    assert!(c.get(0).is_none(), "block 0 should be evicted (FIFO when all referenced)");
+    // Now present: 4,1,2,3 with ref=[1,0,0,0]. Touch 1 and 2; leave 3 cold.
+    assert!(c.get(1).is_some());
+    assert!(c.get(2).is_some());
+    // Insert 5: the hand clears 1 and 2 (second chance) and evicts the cold 3.
+    c.insert(5, &blk(5, bs));
+    assert!(c.get(3).is_none(), "cold block 3 should be evicted");
+    assert!(c.get(1).is_some(), "referenced block 1 must be spared");
+    assert!(c.get(2).is_some(), "referenced block 2 must be spared");
+    assert!(c.get(5).is_some(), "newly inserted block 5 present");
+}
+
+#[test]
+fn clock_cache_capacity_floor() {
+    // A tiny cap must still give at least the old ring's worth of slots (64).
+    let bs = 1024;
+    // new() applies the max(64, cap/bs) floor; a 1024-byte cap -> 64 slots.
+    set_cache_cap_bytes(1024);
+    let mut c = ClockBlockCache::new(bs);
+    for n in 0..64 {
+        c.insert(n, &blk(n, bs));
+    }
+    // All 64 fit (floor is 64 slots), so the first is still present.
+    assert!(c.get(0).is_some(), "64-slot floor not honored");
+}
+
+#[test]
+fn cache_stats_default_zero() {
+    // With no reads issued through a filesystem, the global counters report a
+    // valid tuple (exercises the public accessor under `cfg(test)`).
+    let (_h, _m) = cache_stats();
+}

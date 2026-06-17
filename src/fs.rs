@@ -81,6 +81,19 @@ pub fn init() -> Result<(), FsError> {
         );
     }
     
+    // Size the ext2 block cache from detected RAM before mounting (the cache is
+    // allocated in Ext2Filesystem::new). Cap at min(25% RAM, 512 MB): generous
+    // enough on a self-host VM (6–16 GB) to keep the read-only toolchain resident
+    // across the many rustc/cc/ld spawns, bounded so it can't starve user pages.
+    // No-op unless the kernel is built with the `fs-cache` feature.
+    {
+        const PAGE: usize = 4096;
+        const CACHE_CEILING: usize = 512 * 1024 * 1024;
+        let ram_bytes = crate::pmm::total_count().saturating_mul(PAGE);
+        let cap = core::cmp::min(ram_bytes / 4, CACHE_CEILING);
+        akuma_ext2::set_cache_cap_bytes(cap);
+    }
+
     // Mount ext2 filesystem at root
     let ext2_fs = vfs::ext2::mount()?;
     vfs::mount("/", ext2_fs)?;

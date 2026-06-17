@@ -32,7 +32,7 @@ missing_panics_doc = "allow"
 dead_code = "deny"
 unused_imports = "deny"
 unused_variables = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_profile_size)', 'cfg(kernel_profile_extreme)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_profile_size)', 'cfg(kernel_profile_extreme)', 'cfg(ext2_fs_cache)'] }
 
 [package]
 name = "akuma"
@@ -116,6 +116,13 @@ gic-v2 = []
 # (warm-stack floor + kernel-stack right-sizing in akuma-exec; block-cache gate
 # in akuma-ext2).
 extreme = ["akuma-exec/extreme", "akuma-ext2/extreme"]
+
+# Large RAM-sized ext2 block cache with clock eviction (crates/akuma-ext2). Keeps
+# the read-only toolchain resident across the many process spawns in a self-host
+# `cargo build`, instead of re-reading it off virtio-blk per spawn. Opt-in (not in
+# any default set); the cache cap is auto-derived from detected RAM at mount. Not
+# combined with `extreme` (the 4 MB profile has no cache at all).
+fs-cache = ["akuma-ext2/fs-cache"]
 
 # Per-family syscall gates. Default-on so `cargo build`/`run`/`test` keep every
 # syscall; the minimal builds use --no-default-features and re-add what they want.

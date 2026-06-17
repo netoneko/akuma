@@ -29,8 +29,13 @@
     clippy::missing_const_for_fn,
     clippy::no_effect_underscore_binding,
     clippy::manual_is_multiple_of,
+    clippy::redundant_pub_crate,
 )]
 
+#[cfg(any(ext2_fs_cache, test))]
+use alloc::collections::BTreeMap;
+#[cfg(any(ext2_fs_cache, test))]
+use core::cell::Cell;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -45,7 +50,7 @@ use crate::BlockDevice;
 
 /// Number of block slots in the ring cache. One contiguous backing allocation;
 /// linear-scan lookup is fine at this size (fits in L1).
-#[cfg(not(kernel_profile_extreme))]
+#[cfg(all(not(kernel_profile_extreme), not(ext2_fs_cache)))]
 const BLOCK_CACHE_ENTRIES: usize = 64;
 
 /// Flat ring-buffer block cache. A single contiguous Vec<u8> holds all cached
@@ -56,7 +61,7 @@ const BLOCK_CACHE_ENTRIES: usize = 64;
 /// N, so when the cache is dropped or pressure forces reclaim, the whole backing
 /// buffer frees in one shot rather than leaving N scattered Vec headers across
 /// the PMM-claimed heap span.
-#[cfg(not(kernel_profile_extreme))]
+#[cfg(all(not(kernel_profile_extreme), not(ext2_fs_cache)))]
 struct BlockRingCache {
     backing: Vec<u8>,
     tags: [u32; BLOCK_CACHE_ENTRIES],
@@ -64,7 +69,7 @@ struct BlockRingCache {
     block_size: usize,
 }
 
-#[cfg(not(kernel_profile_extreme))]
+#[cfg(all(not(kernel_profile_extreme), not(ext2_fs_cache)))]
 impl BlockRingCache {
     fn new(block_size: usize) -> Self {
         Self {
@@ -105,6 +110,165 @@ impl BlockRingCache {
                 *tag = u32::MAX;
                 return;
             }
+        }
+    }
+}
+
+// ============================================================================
+// Large clock-eviction block cache (feature `fs-cache` / cfg `ext2_fs_cache`)
+// ============================================================================
+//
+// The 64-slot ring above is ~256 KB — far smaller than a self-host build's
+// working set (the toolchain `.so`s + rlibs are a few hundred MB), so it gives
+// no reuse: every rustc/cc/ld spawn re-streams the toolchain off virtio-blk
+// (docs/AKUMA_SELF_HOSTING.md §7a — measured warm/cold ratio = 1.00x).
+//
+// This cache is sized from detected RAM (capped, set by the kernel before mount)
+// and evicts with a CLOCK (second-chance) policy so frequently-touched toolchain
+// blocks stay resident even while cold blocks stream past — a pure ring would
+// evict the hot set as soon as the working set exceeds the cache. Lookup is
+// O(log n) via a `block_num -> slot` BTreeMap (a linear scan over ~131 072 slots
+// per block read would dwarf the disk read it is trying to avoid).
+
+/// Default cap if the kernel never calls [`set_cache_cap_bytes`] (host tests):
+/// 16 MB — large enough to exercise eviction, small enough for `cargo test`.
+#[cfg(any(ext2_fs_cache, test))]
+const DEFAULT_CACHE_CAP_BYTES: usize = 16 * 1024 * 1024;
+
+#[cfg(any(ext2_fs_cache, test))]
+static CACHE_CAP_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_CACHE_CAP_BYTES);
+
+/// Cache instrumentation for the boot self-test (cache_hit_test) and PSTATS.
+#[cfg(any(ext2_fs_cache, test))]
+static CACHE_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(any(ext2_fs_cache, test))]
+static CACHE_MISSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Set the upper bound (bytes) on the ext2 block cache backing store.
+///
+/// The kernel derives this from detected RAM (e.g. `min(25% RAM, 512 MB)`) and
+/// calls it once before mounting the filesystem. No-op unless built with the
+/// `fs-cache` feature.
+#[allow(unused_variables)]
+pub fn set_cache_cap_bytes(bytes: usize) {
+    #[cfg(any(ext2_fs_cache, test))]
+    CACHE_CAP_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// `(hits, misses)` since boot for the large block cache. `(0, 0)` unless the
+/// `fs-cache` feature is built in.
+#[must_use]
+pub fn cache_stats() -> (u64, u64) {
+    #[cfg(any(ext2_fs_cache, test))]
+    {
+        (CACHE_HITS.load(Ordering::Relaxed), CACHE_MISSES.load(Ordering::Relaxed))
+    }
+    #[cfg(not(any(ext2_fs_cache, test)))]
+    {
+        (0, 0)
+    }
+}
+
+/// Clock (second-chance) block cache. Slots are allocated lazily (the backing
+/// `Vec` grows in block-size steps) up to `capacity_blocks`; thereafter the clock
+/// hand sweeps, clearing reference bits, and evicts the first unreferenced slot.
+#[cfg(any(ext2_fs_cache, test))]
+pub(crate) struct ClockBlockCache {
+    /// Contiguous slot data; `slot * block_size .. + block_size` per slot.
+    backing: Vec<u8>,
+    /// Block number occupying each slot; `u32::MAX` = empty hole.
+    tags: Vec<u32>,
+    /// Clock reference bit per slot. `Cell` so a read (`get`) can set the bit
+    /// through `&self` (it runs under the cache's spinlock, so no real sharing).
+    ref_bits: Vec<Cell<bool>>,
+    /// `block_num -> slot` for O(log n) lookup.
+    index: BTreeMap<u32, usize>,
+    hand: usize,
+    block_size: usize,
+    capacity_blocks: usize,
+}
+
+#[cfg(any(ext2_fs_cache, test))]
+impl ClockBlockCache {
+    pub(crate) fn new(block_size: usize) -> Self {
+        let cap_bytes = CACHE_CAP_BYTES.load(Ordering::Relaxed);
+        // At least the old ring's worth of slots; never zero.
+        let capacity_blocks = core::cmp::max(64, cap_bytes / block_size.max(1));
+        Self::with_capacity_blocks(block_size, capacity_blocks)
+    }
+
+    /// Construct with an explicit slot capacity (tests use this to avoid racing
+    /// on the global `CACHE_CAP_BYTES` when run in parallel).
+    pub(crate) fn with_capacity_blocks(block_size: usize, capacity_blocks: usize) -> Self {
+        Self {
+            backing: Vec::new(),
+            tags: Vec::new(),
+            ref_bits: Vec::new(),
+            index: BTreeMap::new(),
+            hand: 0,
+            block_size,
+            capacity_blocks,
+        }
+    }
+
+    pub(crate) fn get(&self, block_num: u32) -> Option<&[u8]> {
+        if let Some(&slot) = self.index.get(&block_num) {
+            self.ref_bits[slot].set(true);
+            let s = slot * self.block_size;
+            Some(&self.backing[s..s + self.block_size])
+        } else {
+            None
+        }
+    }
+
+    /// Pick a slot for a new block: grow the backing while under capacity (the
+    /// `Vec`s grow geometrically, so amortized O(1)), otherwise run the clock.
+    fn alloc_slot(&mut self) -> usize {
+        let slots = self.tags.len();
+        if slots < self.capacity_blocks {
+            self.backing.resize((slots + 1) * self.block_size, 0);
+            self.tags.push(u32::MAX);
+            self.ref_bits.push(Cell::new(false));
+            return slots;
+        }
+        loop {
+            if self.hand >= slots {
+                self.hand = 0;
+            }
+            if self.ref_bits[self.hand].get() {
+                self.ref_bits[self.hand].set(false);
+                self.hand = (self.hand + 1) % slots;
+            } else {
+                let victim = self.hand;
+                self.hand = (self.hand + 1) % slots;
+                return victim;
+            }
+        }
+    }
+
+    pub(crate) fn insert(&mut self, block_num: u32, data: &[u8]) {
+        // Already present (another thread beat us, or a re-read): don't duplicate.
+        if self.index.contains_key(&block_num) {
+            return;
+        }
+        let slot = self.alloc_slot();
+        // Evict the slot's prior occupant from the index, if any.
+        let prev = self.tags[slot];
+        if prev != u32::MAX {
+            self.index.remove(&prev);
+        }
+        let s = slot * self.block_size;
+        self.backing[s..s + self.block_size].copy_from_slice(data);
+        self.tags[slot] = block_num;
+        self.ref_bits[slot].set(true);
+        self.index.insert(block_num, slot);
+    }
+
+    /// Invalidate a block (on write-through) so a stale copy can't survive a write.
+    pub(crate) fn remove(&mut self, block_num: u32) {
+        if let Some(slot) = self.index.remove(&block_num) {
+            self.tags[slot] = u32::MAX;
+            self.ref_bits[slot].set(false);
         }
     }
 }
@@ -372,8 +536,15 @@ pub struct Ext2Filesystem<B: BlockDevice> {
     #[cfg(not(test))]
     state: RwSpinlock<Ext2State>,
     #[cfg(not(kernel_profile_extreme))]
-    block_cache: Spinlock<BlockRingCache>,
+    block_cache: Spinlock<BlockCache>,
 }
+
+/// The active block cache type: the large clock cache under the `fs-cache`
+/// feature, otherwise the tiny 64-slot ring. (`extreme` has neither.)
+#[cfg(all(not(kernel_profile_extreme), ext2_fs_cache))]
+type BlockCache = ClockBlockCache;
+#[cfg(all(not(kernel_profile_extreme), not(ext2_fs_cache)))]
+type BlockCache = BlockRingCache;
 
 impl<B: BlockDevice> Ext2Filesystem<B> {
     /// Create a new Ext2 filesystem backed by `dev`.
@@ -425,7 +596,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             time_fn: utc_time_us,
             state: RwSpinlock::new(state),
             #[cfg(not(kernel_profile_extreme))]
-            block_cache: Spinlock::new(BlockRingCache::new(block_size)),
+            block_cache: Spinlock::new(BlockCache::new(block_size)),
         })
     }
 
@@ -537,9 +708,13 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         {
             let cache = self.block_cache.lock();
             if let Some(data) = cache.get(block_num) {
+                #[cfg(any(ext2_fs_cache, test))]
+                CACHE_HITS.fetch_add(1, Ordering::Relaxed);
                 return Ok(data.to_vec());
             }
         }
+        #[cfg(any(ext2_fs_cache, test))]
+        CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
 
         let mut buf = vec![0u8; state.block_size];
         let offset = block_num as u64 * state.block_size as u64;
@@ -1445,16 +1620,43 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
             let run_start_phys = phys_blocks[block_idx].unwrap();
 
-            // Find contiguous run of physical blocks
+            // Cache hit: copy this block straight from the cache (the warm self-host
+            // path — the toolchain stays resident, so this is a memcpy, no disk I/O).
+            #[cfg(not(kernel_profile_extreme))]
+            {
+                let cache = self.block_cache.lock();
+                if let Some(data) = cache.get(run_start_phys) {
+                    let chunk = core::cmp::min(block_size - offset_in_block, end - pos);
+                    buf[total_read..total_read + chunk]
+                        .copy_from_slice(&data[offset_in_block..offset_in_block + chunk]);
+                    drop(cache);
+                    #[cfg(any(ext2_fs_cache, test))]
+                    CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                    pos += chunk;
+                    total_read += chunk;
+                    block_idx += 1;
+                    continue;
+                }
+            }
+
+            // Cache miss: extend a run of physically-contiguous blocks that are ALSO
+            // uncached, so one disk read batches only the bytes we actually need.
+            // (With no cache compiled in, the cache check is gone and this is the
+            // original whole-contiguous-run read.)
             let mut run_len = 1usize;
             while block_idx + run_len < num_blocks {
-                if let Some(next_phys) = phys_blocks[block_idx + run_len] {
-                    if next_phys == run_start_phys + run_len as u32 {
+                match phys_blocks[block_idx + run_len] {
+                    Some(next_phys) if next_phys == run_start_phys + run_len as u32 => {
+                        #[cfg(not(kernel_profile_extreme))]
+                        {
+                            if self.block_cache.lock().get(next_phys).is_some() {
+                                break;
+                            }
+                        }
                         run_len += 1;
-                        continue;
                     }
+                    _ => break,
                 }
-                break;
             }
 
             // Single disk read for the entire contiguous run
@@ -1462,14 +1664,21 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             let run_bytes = run_len * block_size;
             let mut run_buf = alloc::vec![0u8; run_bytes];
             self.dev.read_bytes(disk_offset, &mut run_buf).map_err(|_| FsError::IoError)?;
+            #[cfg(any(ext2_fs_cache, test))]
+            CACHE_MISSES.fetch_add(run_len as u64, Ordering::Relaxed);
 
-            // Copy relevant data from the run into output
+            // Copy relevant data from the run into output and populate the cache.
             let mut run_pos = 0usize;
             for _ in 0..run_len {
                 let off = if run_pos == 0 { offset_in_block } else { 0 };
                 let chunk = core::cmp::min(block_size - off, end - pos);
                 buf[total_read..total_read + chunk]
                     .copy_from_slice(&run_buf[run_pos + off..run_pos + off + chunk]);
+                #[cfg(not(kernel_profile_extreme))]
+                {
+                    let bn = run_start_phys + (run_pos / block_size) as u32;
+                    self.block_cache.lock().insert(bn, &run_buf[run_pos..run_pos + block_size]);
+                }
                 pos += chunk;
                 total_read += chunk;
                 run_pos += block_size;

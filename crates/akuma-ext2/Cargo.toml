@@ -9,6 +9,12 @@ workspace = true
 
 [features]
 extreme = []
+# Large, RAM-sized, clock-eviction block cache (replaces the tiny 64-slot ring).
+# Keeps the read-only toolchain (.so + rlibs) resident across the hundreds of
+# rustc/cc/ld spawns in a self-host build instead of re-streaming it off disk.
+# Off by default; opt in via the kernel's `fs-cache` feature. See
+# docs/AKUMA_SELF_HOSTING.md §7a/§7b.
+fs-cache = []
 
 [dependencies]
 akuma-vfs = { path = "../akuma-vfs" }

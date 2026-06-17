@@ -324,11 +324,14 @@ Measured on the **apk** toolchain (`/usr/bin/rustc` 1.96 stable; the nightly at
 Findings:
 - **Codegen (actual compile CPU) is ~0.1s — irrelevant.** rustc is slow here
   purely from moving bytes off ext2.
-- **No effective cache.** Repeated identical compiles take the *same* time
-  (`--version`: 11.56 / 11.74 / 11.77s). The ext2 "cache" is a 64-slot ring
-  (`BLOCK_CACHE_ENTRIES`, ~64–256 KB) — far smaller than a build's working set —
-  and file-backed mmap pages aren't cached by inode. Every spawn re-reads the
-  whole toolchain from disk.
+- **No effective cache (by default).** Repeated identical compiles take the *same*
+  time (`--version`: 11.56 / 11.74 / 11.77s). The default ext2 "cache" is a 64-slot
+  ring (`BLOCK_CACHE_ENTRIES`, ~64–256 KB) — far smaller than a build's working
+  set — and file-backed mmap pages aren't cached by inode. Every spawn re-reads the
+  whole toolchain from disk. The opt-in **`fs-cache`** feature replaces the ring
+  with a RAM-sized clock cache that fixes this — see §7c (warm re-reads become 0
+  disk reads; on HVF the wall-clock win is small because the disk isn't the
+  bottleneck there).
 - **Eager file-backed mmap was the big tax.** `libLLVM.so` (176 MB) +
   `librustc_driver.so` (63 MB) were read *in full* at `mmap()` time even though
   rustc touches only a fraction. Flipping `release` to lazy demand-paging (1 MB
@@ -367,27 +370,74 @@ itself — run tens of seconds to minutes), a clean `-j1` build lands at a rough
 **~30–60 minutes** (wide error bars; the kernel crate + the handful of large deps
 dominate). This is why the **ext2 / page cache is the right next lever**: most of
 that time is re-reading the *same* read-only toolchain and rlibs off disk N times.
+The **`fs-cache`** feature (§7c) is the first cut at this lever.
 
 Things to check later:
 - **`release` lazy default — DONE/SHIPPED.** `MMAP_FILE_BACKED_LAZY = true` on all
   profiles now. Eager only wins when *all* mapped pages are touched (e.g. model
   weights), not for big partially-used libs.
-- **ext2 / inode-keyed page cache — recommended next.** Biggest structural win:
-  keep the read-only toolchain (`.so`s + rlibs, a few hundred MB) resident and
-  shared across the 127+ rustc/cc/ld spawns instead of re-reading per spawn.
-  Cheapest first step: grow the 64-slot block ring (`BLOCK_CACHE_ENTRIES` in
-  `crates/akuma-ext2`) to cache the hot toolchain blocks; better is a real
-  per-inode page cache so warm reads become memory hits. Directly attacks the
-  "startup ×127 + rlib re-reads" cost above.
 - **Was `extreme` ever eager?** *No — resolved.* `build.rs` makes `extreme` imply
   `kernel_profile_size` (extreme ⇒ `OPT_LEVEL=z` ⇒ `size_profile` ⇒
   `kernel_profile_size` cfg), so the old `#[cfg(not(kernel_profile_size))]` already
   excluded it. `size` and `extreme` have used lazy all along; only `release` was
   eager. The gating is now written explicitly as `any(size, extreme)`.
-- **A real inode-keyed page cache / bigger block cache.** Biggest structural win:
-  let the read-only toolchain (`.so`s + rlibs, a few hundred MB) stay resident and
-  be shared across the hundreds of rustc/cc/ld spawns in a build, instead of
-  re-reading per spawn. Even bumping the 64-slot block ring would help.
+
+### 7c. The `fs-cache` feature: a large clock block cache — SHIPPED (opt-in)
+
+The 64-slot block ring (`BLOCK_CACHE_ENTRIES`, ~256 KB) is far smaller than a
+build's working set, so it gives no reuse: every spawn re-streams the toolchain
+off virtio-blk. The **`fs-cache`** cargo feature replaces it with a much larger,
+clock-eviction block cache that keeps the read-only toolchain resident across the
+many rustc/cc/ld spawns.
+
+- **Build it in:** `cargo build --release --features fs-cache`. Off by default; not
+  added to any default set and **never combined with `extreme`** (the 4 MB profile
+  keeps its no-cache path). Plumbing mirrors `extreme`: kernel feature
+  `fs-cache` → `akuma-ext2/fs-cache` → `build.rs` emits `cfg(ext2_fs_cache)`.
+- **Sizing:** RAM-derived, set in `src/fs.rs::init()` before mount via
+  `akuma_ext2::set_cache_cap_bytes(min(25% RAM, 512 MB))`. On a 6–16 GB self-host
+  VM that's the full 512 MB — enough to hold the hot toolchain set.
+- **Policy:** CLOCK / second-chance (one reference bit per slot via `Cell`, a
+  rotating hand), so frequently-touched toolchain blocks survive while cold blocks
+  stream past — a pure ring would evict the hot set as the working set overflows.
+  Lookup is O(log n) via a `block_num → slot` `BTreeMap` (a linear scan over the
+  ~131 072 slots of a 512 MB cache per block read would dwarf the disk read it
+  avoids). Write-through with per-block invalidation is preserved.
+- **Scope:** physical-block keyed; both `read_block` *and* `read_at_by_inode` (the
+  file-backed mmap fault path — `crate::vfs::read_at_by_inode`, previously
+  cache-bypassing) consult and populate it.
+- **Tests:** clock/second-chance/dedup/remove/floor unit tests in
+  `crates/akuma-ext2/src/tests.rs`; a boot self-test (`test_fs_cache_warm_reread_hits`
+  in `src/process_tests.rs`, gated on `feature = "fs-cache"`) reads a temp file twice
+  and asserts the second pass is **0 disk reads** (`warm misses=0`).
+
+**Measured (`scripts/ext2_cache_bench.sh`, 320 MB `librustc_driver.so`,
+MEMORY=6144M, HVF):**
+
+| kernel | cold | warm | warm | note |
+|---|---|---|---|---|
+| no cache (64-slot ring) | 4.47s | 4.48s | 4.48s | **warm/cold = 1.00× — no reuse (the floor)** |
+| `--features fs-cache`   | 6.38s | 4.41s | 4.32s | warm fully cached (`warm misses=0`) |
+
+The cache provably eliminates disk re-reads on warm access, but on **HVF** the
+wall-clock win is modest (warm 4.32s vs the 4.47s no-cache floor ≈ 6%) and cold
+*regresses* (~+1.9s) — because under HVF the "disk" is a host file already in the
+Mac's page cache, so virtio-blk reads are nearly free and this demand-paged mmap
+workload is **page-fault-bound, not disk-bound**. The extra memcpy into the cache
+backing is then pure overhead on the cold pass. The cache's real payoff is where
+I/O is the actual bottleneck — TCG emulation, slow/real storage, or a self-host
+build whose working set spills the host page cache (the cluster deployment
+target, not a dev Mac). It is therefore shipped **opt-in**.
+
+Still open / follow-ups:
+- **Memory-pressure shrink.** The cache is bounded by the RAM-derived cap but does
+  not yet shrink under `is_memory_low`. Wire a reclaim hook so a cache that grew to
+  512 MB can be dropped if user demand-paging needs the pages.
+- **Cold-path tax.** The per-block `BTreeMap` insert + the extra backing copy cost
+  ~+40% on the first read. An open-addressing index (no per-node alloc) would trim
+  it; tolerable for now since cold is paid once and warm 127× in a real build.
+- **Measure on a disk-bound path.** Re-run the bench under TCG / real storage to
+  quantify the win where reads aren't free.
 
 ---
 

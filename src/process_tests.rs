@@ -422,7 +422,57 @@ pub fn run_all_tests() {
     // are stable.  Prints grep-able `[BENCH]` lines.
     run_cow_benchmarks();
 
+    // ext2 large block cache (feature `fs-cache`): re-reading a file must hit the
+    // cache, not re-stream it off disk (docs/AKUMA_SELF_HOSTING.md §7a/§7b).
+    #[cfg(feature = "fs-cache")]
+    test_fs_cache_warm_reread_hits();
+
     console::print("--- Process Execution Tests Done ---\n\n");
+}
+
+/// The `fs-cache` block cache must turn a second read of the same file into cache
+/// hits (no disk re-read) — the whole point of keeping the toolchain resident
+/// across the many spawns in a self-host build. Writes a multi-block temp file,
+/// reads it twice, and asserts the second pass is served entirely from cache.
+#[cfg(feature = "fs-cache")]
+fn test_fs_cache_warm_reread_hits() {
+    const PATH: &str = "/tmp/fs_cache_selftest.bin";
+    const LEN: usize = 64 * 1024; // 16 × 4 KB blocks
+
+    let data = alloc::vec![0xA5u8; LEN];
+    if crate::fs::write_file(PATH, &data).is_err() {
+        console::print("[Test] fs_cache_warm_reread_hits SKIPPED (write failed)\n");
+        return;
+    }
+
+    let mut buf = alloc::vec![0u8; LEN];
+
+    // Pass 1: cold — populates the cache (write-through invalidated the blocks).
+    let (_, m0) = akuma_ext2::cache_stats();
+    let _ = crate::fs::read_at(PATH, 0, &mut buf);
+    let (h1, m1) = akuma_ext2::cache_stats();
+
+    // Pass 2: warm — every block should now be a hit, zero new misses.
+    let _ = crate::fs::read_at(PATH, 0, &mut buf);
+    let (h2, m2) = akuma_ext2::cache_stats();
+
+    let _ = crate::fs::remove_file(PATH);
+
+    let cold_misses = m1.saturating_sub(m0);
+    let warm_hits = h2.saturating_sub(h1);
+    let warm_misses = m2.saturating_sub(m1);
+
+    // The cold pass must have read blocks from disk; the warm pass must be all
+    // hits with no fresh disk reads.
+    if cold_misses > 0 && warm_hits >= cold_misses && warm_misses == 0 {
+        crate::safe_print!(192,
+            "[Test] fs_cache_warm_reread_hits PASSED (cold misses={}, warm hits={}, warm misses={})\n",
+            cold_misses, warm_hits, warm_misses);
+    } else {
+        crate::safe_print!(192,
+            "[Test] fs_cache_warm_reread_hits FAILED: cold_misses={} warm_hits={} warm_misses={}\n",
+            cold_misses, warm_hits, warm_misses);
+    }
 }
 
 // ── CoW / munmap performance benchmarks ───────────────────────────────────
