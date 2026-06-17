@@ -335,15 +335,50 @@ Findings:
   readahead) cut startup **6.9×** and the full compile **1.8×**. Raw sequential
   ext2 read is fine (~100 MB/s via `md5sum`); the eager-mmap *load path* was the
   problem, exactly as predicted.
-- **Link now dominates (~80% of the lazy compile, 15.6s).** Next lever: the
-  gcc→collect2→ld spawn chain re-reads the Rust staticlibs and re-loads its own
-  libs every invocation — same no-cache story, ×hundreds in a `-j1` build.
+- **Link dominates the lazy compile (~80%, 15.6s) — and it's libstd.**
+  `hello.rs` is a *std* program (`println!`), so the link statically pulls in
+  libstd. A `#![no_std]` binary links in ~5s vs ~15s (≈3× cheaper) — so for the
+  actual akuma kernel (which *is* `#![no_std]`) per-crate link is cheap; the std
+  link cost is an artifact of the hello-world test, not the real workload.
+  - `-C prefer-dynamic` (link libstd as `.so`) did **not** cut compile time
+    (~19.5s ≈ static), so the residual link cost is the gcc→collect2→ld toolchain
+    load + C-runtime reads, not the libstd archive read specifically.
+- **Alternative linkers make it WORSE on Akuma — do not use them.** A/B on the
+  std hello (default = gcc + GNU ld @ 19.3s):
+  - gcc + **lld** (`-fuse-ld=lld`): **>320 s (timeout)**
+  - clang + **lld**: **240 s**, and the output ELF won't even load ("Invalid ELF")
+  GNU ld (binutils) wins by 12–16×. lld is a large binary and its load/relocation
+  pattern thrashes the cacheless ext2. clang-as-linker-driver is also broken here.
+
+> **Measurement noise warning.** VM timings are unstable (single core, no cache,
+> preemption): obj-only was measured at 4.0 s and 14.6 s in different runs. Only
+> trust large effect sizes (lazy 1.8×, lld 12–16× worse). For fine-grained
+> numbers, take min-of-N samples on a freshly-rebooted snapshot.
+
+### 7b. How long to compile the whole kernel at current speed?
+
+`cargo build --release -j1` for akuma is **127 packages** (`Cargo.lock`) → one
+`rustc` per crate + build scripts + host proc-macros + one final link. The
+killer is **no cache**: the ~1.7 s lazy `rustc` startup is paid afresh for *every*
+crate (≈127 × 1.7 s ≈ **3.6 min just re-paging rustc's own `.so`s**), and each
+crate re-reads its upstream rlibs from ext2. Adding per-crate codegen (most are
+small no_std libs ~4–8 s; a few big ones — smoltcp, embedded-tls, the kernel crate
+itself — run tens of seconds to minutes), a clean `-j1` build lands at a rough
+**~30–60 minutes** (wide error bars; the kernel crate + the handful of large deps
+dominate). This is why the **ext2 / page cache is the right next lever**: most of
+that time is re-reading the *same* read-only toolchain and rlibs off disk N times.
 
 Things to check later:
-- **Confirm the `release` lazy default.** Experiment shows lazy ≫ eager for the
-  toolchain workload; decide whether to ship `MMAP_FILE_BACKED_LAZY = true` for
-  `release` (currently flipped TEMP for the A/B). Eager only wins when *all*
-  mapped pages are touched (e.g. model weights), not for big partially-used libs.
+- **`release` lazy default — DONE/SHIPPED.** `MMAP_FILE_BACKED_LAZY = true` on all
+  profiles now. Eager only wins when *all* mapped pages are touched (e.g. model
+  weights), not for big partially-used libs.
+- **ext2 / inode-keyed page cache — recommended next.** Biggest structural win:
+  keep the read-only toolchain (`.so`s + rlibs, a few hundred MB) resident and
+  shared across the 127+ rustc/cc/ld spawns instead of re-reading per spawn.
+  Cheapest first step: grow the 64-slot block ring (`BLOCK_CACHE_ENTRIES` in
+  `crates/akuma-ext2`) to cache the hot toolchain blocks; better is a real
+  per-inode page cache so warm reads become memory hits. Directly attacks the
+  "startup ×127 + rlib re-reads" cost above.
 - **Was `extreme` ever eager?** *No — resolved.* `build.rs` makes `extreme` imply
   `kernel_profile_size` (extreme ⇒ `OPT_LEVEL=z` ⇒ `size_profile` ⇒
   `kernel_profile_size` cfg), so the old `#[cfg(not(kernel_profile_size))]` already
