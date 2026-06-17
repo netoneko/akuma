@@ -668,9 +668,19 @@ lazy-file `mmap`), much lighter resident than the static tcc the `size`-profile
 | 7 MB | ✅ `Hello, Akuma!` | 3 MB | — |
 | 6 MB | ✅ `Hello, Akuma!` | 2 MB | — |
 | 5 MB | ❌ | 1 MB | tcc prints `memory full`, exit 1, no binary (tcc's own allocator, not a kernel OOM) |
-| 4 MB | ❌ boots | — | tcc needs ~6 MB working set; kernel itself boots fine (664 PMM free pg) |
+| 4 MB | ❌ boots | — | the dynamic tcc's working set exceeds the user pages left at 4 MB; kernel itself boots fine (664 PMM free pg) |
 
-- **Direct tcc compile+run floor: 6 MB.** No kernel OOM markers at 6–8 MB.
+> **⚠️ Superseded for the floor headline.** This table measures the **dynamic
+> `/usr/bin/tcc`** (apk stub + `libtcc.so` + musl loader) on 2026-06-05, *before* the
+> heap-growth backoff fix and the switch to our **static** `userspace/tcc`. With the
+> static tcc and the backoff fix, the **direct `tcc -static` compile+run floor is
+> 4.0 MB** (`scripts/our_tcc_floor.py`, 2026-06-06; see *The compile floor* in
+> [TCC_LOW_MEMORY.md](TCC_LOW_MEMORY.md) and the acceptance playbooks
+> `acceptance/05`/`07`/`08`). The 6 MB numbers below are the dynamic-tcc figures, kept
+> for history.
+
+- **Direct tcc compile+run floor (dynamic `/usr/bin/tcc`): 6 MB.** No kernel OOM
+  markers at 6–8 MB. (Static `userspace/tcc` later reached 4.0 MB — see note above.)
 - **Boot + usable-SSH floor: 4 MB** — see *Breaking the 4 MB boot wall* below. The
   earlier QEMU `Not enough space for DTB` barrier at 4 MB was broken by changing
   `text_offset` to 1 MB in the ARM64 Image header (kernel now loads at RAM_BASE + 1 MB;
@@ -694,6 +704,40 @@ Two gotchas that cost time here, recorded so they don't again:
   independent of VM RAM. Drive these tests **serially**; concurrent meow→ollama
   sessions starve each other and produce degraded completions that look like the
   model "refusing" to call tools.
+
+## For scale — gcc's floor in a Linux cgroup (2026-06-17)
+
+For context on how heavy a *conventional* toolchain is, we bisected stock **gcc
+15.2.0 + binutils** (Alpine `apk add gcc musl-dev`) compiling the **same trivial
+`hello.c`**, inside a Docker container whose memory was squeezed with
+`docker update --memory <N> --memory-swap <N>` (swap disabled). Method: coarse 1 MB
+sweep, then binary search 128 KB → 32 KB; an over-the-limit compile is OOM-killed by
+the cgroup (`cc1`/`as` reaped, compile exits non-zero). Reproducible at the boundary
+across repeated runs.
+
+> ⚠️ **The gcc number is pure-userspace — it does NOT account for a kernel.** The host
+> Linux kernel runs *outside* the measured cgroup, so none of its footprint is counted.
+> Akuma's floors below are **whole-VM (kernel + userspace)** and are *still lower*.
+
+| Toolchain | environment | `hello.c` compile+run floor | what's counted |
+|---|---|---|---|
+| **gcc 15.2.0 + binutils** | Alpine, Docker cgroup | **~7.8 MB** — OK at 7872 KB, OOM-killed at 7808 KB | userspace only, **no kernel** |
+| static **tcc** + musl | Alpine, Docker cgroup | **6 MB — Docker's hard minimum, *not* a tcc limit** (`rc=0`, never OOM-killed; Docker refuses a lower `--memory`) | userspace only, **no kernel** |
+| static **tcc** + musl | **Akuma whole VM**, `extreme` | **4.0 MB** direct compile+run (`scripts/our_tcc_floor.py`, 2026-06-06) | **kernel + userspace** |
+| **full agentic pipeline** (meow → model → `scratch` clone → tcc → run) | **Akuma whole VM**, `extreme` | **4.0 MB** (`4mb_scratch.log`, 2026-06-06) | **kernel + userspace** |
+
+Two things stand out:
+
+1. **gcc's compiler/assembler/linker need ~7.8 MB of userspace alone** — and that's
+   with the host kernel running for free outside the cgroup.
+2. **tcc in the *same* Docker environment never even reaches its own floor** — it
+   compiles cleanly at Docker's 6 MB hard minimum and Docker won't let the cap go
+   lower, so its true userspace floor is somewhere below 6 MB but unmeasurable there.
+   Akuma answers what Docker can't: the **whole system — kernel, tcc, musl, and the
+   full agentic meow→tcc pipeline — fits in 4.0 MB**, *below* the floor Docker imposes
+   on a bare userspace compile. The boot+SSH floor is lower still (3 MB boots to a
+   serving SSH). This is the gap that makes tcc, not gcc, the only viable in-VM
+   compiler at these tiers.
 
 ## meow→tcc agentic path at 6 MB (verified 2026-06-05)
 
