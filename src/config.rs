@@ -299,13 +299,16 @@ pub const MMAP_EAGER_MAX_PAGES: usize = 16;
 /// pages up front.  When `true`, `mmap(fd, ...)` creates a `LazySource::File`
 /// region; pages are faulted in one at a time via `read_at`.
 ///
-/// Default **`false`** on `release` (eager batching is cheaper when pages are
-/// all touched).  Default **`true`** on the `size` profile — at 8 MB PMM,
-/// eagerly mapping a 600 KB shared library exhausts user pages before the
-/// process even starts.
-#[cfg(not(kernel_profile_size))]
-pub const MMAP_FILE_BACKED_LAZY: bool = false;
-#[cfg(kernel_profile_size)]
+/// Demand-page file-backed `mmap` regions (1 MB readahead per fault) instead of
+/// eagerly reading every mapped page up front.
+///
+/// **`true`** on all profiles. `size`/`extreme` always needed it (eagerly mapping
+/// even a 600 KB library exhausts user pages at 8 MB PMM). `release` was eager
+/// until an A/B on the apk rustc toolchain showed lazy is **1.8× faster** full
+/// compile / **6.9× faster** process startup: eager read all ~240 MB of
+/// `libLLVM`+`librustc_driver` at `mmap()` time even though rustc touches only a
+/// fraction (docs/AKUMA_SELF_HOSTING.md §7a). Eager would only win for workloads
+/// that touch *every* mapped page (e.g. fully-read model weights).
 pub const MMAP_FILE_BACKED_LAZY: bool = true;
 
 /// Kernel heap size override, in **MiB**. `0` = auto-size from detected RAM

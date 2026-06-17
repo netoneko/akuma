@@ -294,6 +294,65 @@ papercut that "everyone expects" to work:
   live output) but "log persistence while detached" is TBD. With the §5 fix the
   session survives a build, so this is now optional, but it'd make long
   multi-crate builds robust to client drops.
+- **Fix all clippy warnings in the kernel (`src/`).** The pre-commit hook only
+  lints `crates/*/` with `-D warnings`; the kernel crate is unchecked. The
+  workspace enables `clippy::pedantic` + `nursery`, so `cargo clippy --release`
+  reports ~3580 warnings on the `akuma` bin (~299 are default `clippy::all`, the
+  rest pedantic/nursery — top offenders: `doc_markdown`, `items_after_statements`,
+  `uninlined_format_args`, `ptr_as_ptr`, `manual_let_else`). ~2373 are
+  machine-applicable via `cargo clippy --fix`. Worth burning down so the kernel
+  can eventually be added to the pre-commit gate alongside the crates — and a few
+  default lints (a dead `val = 1` write in `sync_tests.rs`, `unwrap()`-after-
+  `is_err()` in `process_tests.rs`) are worth fixing on their own merits. Do it in
+  batches by lint family, building under each profile (`release`/`size`/`extreme`)
+  since much kernel code is `cfg`-gated and `--fix` only touches the active config.
+
+### 7a. rustc compile time: it's ext2 read + library loading, not fork+exec or CPU
+
+Measured on the **apk** toolchain (`/usr/bin/rustc` 1.96 stable; the nightly at
+`/usr/local/bin` *segfaults* on a real compile — apk is the working one), 6 GB VM,
+`hello.rs`, HVF (near-native CPU). Ablation of one full compile:
+
+| phase | eager mmap | lazy mmap | note |
+|---|---|---|---|
+| rustc startup (`--version`) | 11.7s | **1.7s** | load+relocate `librustc_driver`+`libLLVM` |
+| read libstd metadata | 7.8s | 1.8s | ext2 read of rlibs |
+| codegen | 0.1s | 0.6s | **CPU is negligible** |
+| link (gcc→ld) | 16.1s | 15.6s | spawn + read rlibs + write output |
+| **full** | **35.6s** | **19.6s** | lazy output verified correct |
+
+Findings:
+- **Codegen (actual compile CPU) is ~0.1s — irrelevant.** rustc is slow here
+  purely from moving bytes off ext2.
+- **No effective cache.** Repeated identical compiles take the *same* time
+  (`--version`: 11.56 / 11.74 / 11.77s). The ext2 "cache" is a 64-slot ring
+  (`BLOCK_CACHE_ENTRIES`, ~64–256 KB) — far smaller than a build's working set —
+  and file-backed mmap pages aren't cached by inode. Every spawn re-reads the
+  whole toolchain from disk.
+- **Eager file-backed mmap was the big tax.** `libLLVM.so` (176 MB) +
+  `librustc_driver.so` (63 MB) were read *in full* at `mmap()` time even though
+  rustc touches only a fraction. Flipping `release` to lazy demand-paging (1 MB
+  readahead) cut startup **6.9×** and the full compile **1.8×**. Raw sequential
+  ext2 read is fine (~100 MB/s via `md5sum`); the eager-mmap *load path* was the
+  problem, exactly as predicted.
+- **Link now dominates (~80% of the lazy compile, 15.6s).** Next lever: the
+  gcc→collect2→ld spawn chain re-reads the Rust staticlibs and re-loads its own
+  libs every invocation — same no-cache story, ×hundreds in a `-j1` build.
+
+Things to check later:
+- **Confirm the `release` lazy default.** Experiment shows lazy ≫ eager for the
+  toolchain workload; decide whether to ship `MMAP_FILE_BACKED_LAZY = true` for
+  `release` (currently flipped TEMP for the A/B). Eager only wins when *all*
+  mapped pages are touched (e.g. model weights), not for big partially-used libs.
+- **Was `extreme` ever eager?** *No — resolved.* `build.rs` makes `extreme` imply
+  `kernel_profile_size` (extreme ⇒ `OPT_LEVEL=z` ⇒ `size_profile` ⇒
+  `kernel_profile_size` cfg), so the old `#[cfg(not(kernel_profile_size))]` already
+  excluded it. `size` and `extreme` have used lazy all along; only `release` was
+  eager. The gating is now written explicitly as `any(size, extreme)`.
+- **A real inode-keyed page cache / bigger block cache.** Biggest structural win:
+  let the read-only toolchain (`.so`s + rlibs, a few hundred MB) stay resident and
+  be shared across the hundreds of rustc/cc/ld spawns in a build, instead of
+  re-reading per spawn. Even bumping the 64-slot block ring would help.
 
 ---
 
