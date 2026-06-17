@@ -756,9 +756,39 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             + group as u64 * size_of::<BlockGroupDescriptor>() as u64
     }
 
+    /// Read a sub-block byte range *through the block cache* (feature `fs-cache`).
+    /// Caller guarantees the range lies within a single block — true for inode-table
+    /// and BGD-table entries (entry size divides the block size and the tables start
+    /// block-aligned, so neither ever straddles a block boundary).
+    #[cfg(ext2_fs_cache)]
+    fn read_range_cached(&self, state: &Ext2State, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        let bs = state.block_size as u64;
+        let block_num = (offset / bs) as u32;
+        let off = (offset % bs) as usize;
+        let block = self.read_block(state, block_num)?;
+        buf.copy_from_slice(&block[off..off + buf.len()]);
+        Ok(())
+    }
+
+    /// Write a sub-block byte range through the block cache via read-modify-write,
+    /// so a cached inode-table / BGD block can't go stale after a metadata write.
+    /// Same single-block invariant as `read_range_cached`.
+    #[cfg(ext2_fs_cache)]
+    fn write_range_cached(&self, state: &Ext2State, offset: u64, data: &[u8]) -> Result<(), FsError> {
+        let bs = state.block_size as u64;
+        let block_num = (offset / bs) as u32;
+        let off = (offset % bs) as usize;
+        let mut block = self.read_block(state, block_num)?;
+        block[off..off + data.len()].copy_from_slice(data);
+        self.write_block(state, block_num, &block)
+    }
+
     fn read_bgd(&self, state: &Ext2State, group: u32) -> Result<BlockGroupDescriptor, FsError> {
         let offset = Self::bgd_offset(state, group);
         let mut buf = [0u8; size_of::<BlockGroupDescriptor>()];
+        #[cfg(ext2_fs_cache)]
+        self.read_range_cached(state, offset, &mut buf)?;
+        #[cfg(not(ext2_fs_cache))]
         self.dev.read_bytes(offset, &mut buf).map_err(|_| FsError::IoError)?;
         Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const _) })
     }
@@ -771,6 +801,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 size_of::<BlockGroupDescriptor>(),
             )
         };
+        #[cfg(ext2_fs_cache)]
+        self.write_range_cached(state, offset, buf)?;
+        #[cfg(not(ext2_fs_cache))]
         self.dev.write_bytes(offset, buf).map_err(|_| FsError::IoError)?;
         Ok(())
     }
@@ -790,6 +823,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             + index_in_group as u64 * state.inode_size as u64;
 
         let mut buf = vec![0u8; state.inode_size as usize];
+        #[cfg(ext2_fs_cache)]
+        self.read_range_cached(state, inode_offset, &mut buf)?;
+        #[cfg(not(ext2_fs_cache))]
         self.dev.read_bytes(inode_offset, &mut buf).map_err(|_| FsError::IoError)?;
 
         Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const _) })
@@ -812,6 +848,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let buf = unsafe {
             core::slice::from_raw_parts(inode as *const Inode as *const u8, size_of::<Inode>())
         };
+        #[cfg(ext2_fs_cache)]
+        self.write_range_cached(state, inode_offset, buf)?;
+        #[cfg(not(ext2_fs_cache))]
         self.dev.write_bytes(inode_offset, buf).map_err(|_| FsError::IoError)?;
         Ok(())
     }

@@ -456,22 +456,35 @@ fn test_fs_cache_warm_reread_hits() {
     let _ = crate::fs::read_at(PATH, 0, &mut buf);
     let (h2, m2) = akuma_ext2::cache_stats();
 
-    let _ = crate::fs::remove_file(PATH);
-
     let cold_misses = m1.saturating_sub(m0);
     let warm_hits = h2.saturating_sub(h1);
     let warm_misses = m2.saturating_sub(m1);
 
     // The cold pass must have read blocks from disk; the warm pass must be all
     // hits with no fresh disk reads.
-    if cold_misses > 0 && warm_hits >= cold_misses && warm_misses == 0 {
-        crate::safe_print!(192,
-            "[Test] fs_cache_warm_reread_hits PASSED (cold misses={}, warm hits={}, warm misses={})\n",
-            cold_misses, warm_hits, warm_misses);
+    let data_ok = cold_misses > 0 && warm_hits >= cold_misses && warm_misses == 0;
+
+    // Metadata caching (inode table + BGD blocks): a repeated path resolution must
+    // also be served entirely from cache — proves read_inode/read_bgd now ride the
+    // block cache instead of issuing direct uncached dev reads.
+    let _ = crate::vfs::resolve_inode(PATH); // warm-up: cache inode/BGD/dir blocks
+    let (h3, m3) = akuma_ext2::cache_stats();
+    let _ = crate::vfs::resolve_inode(PATH); // re-resolve: must be all hits
+    let (h4, m4) = akuma_ext2::cache_stats();
+    let meta_hits = h4.saturating_sub(h3);
+    let meta_misses = m4.saturating_sub(m3);
+    let meta_ok = meta_hits > 0 && meta_misses == 0;
+
+    let _ = crate::fs::remove_file(PATH);
+
+    if data_ok && meta_ok {
+        crate::safe_print!(224,
+            "[Test] fs_cache_warm_reread_hits PASSED (data: cold_miss={} warm_hit={} warm_miss={}; meta: hit={} miss={})\n",
+            cold_misses, warm_hits, warm_misses, meta_hits, meta_misses);
     } else {
-        crate::safe_print!(192,
-            "[Test] fs_cache_warm_reread_hits FAILED: cold_misses={} warm_hits={} warm_misses={}\n",
-            cold_misses, warm_hits, warm_misses);
+        crate::safe_print!(224,
+            "[Test] fs_cache_warm_reread_hits FAILED: data_ok={} (cold_miss={} warm_hit={} warm_miss={}) meta_ok={} (hit={} miss={})\n",
+            data_ok, cold_misses, warm_hits, warm_misses, meta_ok, meta_hits, meta_misses);
     }
 }
 

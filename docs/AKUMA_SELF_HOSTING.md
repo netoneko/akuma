@@ -403,41 +403,71 @@ many rustc/cc/ld spawns.
   Lookup is O(log n) via a `block_num → slot` `BTreeMap` (a linear scan over the
   ~131 072 slots of a 512 MB cache per block read would dwarf the disk read it
   avoids). Write-through with per-block invalidation is preserved.
-- **Scope:** physical-block keyed; both `read_block` *and* `read_at_by_inode` (the
-  file-backed mmap fault path — `crate::vfs::read_at_by_inode`, previously
-  cache-bypassing) consult and populate it.
+- **Scope:** physical-block keyed; `read_block`, `read_at_by_inode` (the file-backed
+  mmap fault path, previously cache-bypassing), **and metadata** — `read_inode`,
+  `read_bgd`, `write_inode`, `write_bgd` — all consult and populate it. The metadata
+  functions used to issue direct sub-block `dev.read_bytes` for each inode/descriptor;
+  under the feature they read the *containing* block through the cache (`read_range_cached`),
+  and writes go read-modify-write through `write_block` so a cached inode/BGD block
+  can't go stale (the only correctness coupling — it's why metadata caching is part of
+  `fs-cache`, not a separate switch). Reading the 4 KB block is also a *prefetch*: it
+  pulls ~16 neighbouring inodes that a directory scan stats next. *Not* routed through
+  the cache: the inode/block bitmaps already go via `read_block`; the superblock is
+  read once at mount and never via `read_block`, so it stays direct.
 - **Tests:** clock/second-chance/dedup/remove/floor unit tests in
-  `crates/akuma-ext2/src/tests.rs`; a boot self-test (`test_fs_cache_warm_reread_hits`
-  in `src/process_tests.rs`, gated on `feature = "fs-cache"`) reads a temp file twice
-  and asserts the second pass is **0 disk reads** (`warm misses=0`).
+  `crates/akuma-ext2/src/tests.rs`; the full fs read/write suite run under
+  `--features fs-cache` exercises the cached inode/BGD RMW path (proves write
+  invalidation). A boot self-test (`test_fs_cache_warm_reread_hits` in
+  `src/process_tests.rs`, gated on `feature = "fs-cache"`) reads a temp file twice
+  (data: `warm misses=0`) **and** re-resolves a path twice (metadata: `hit>0, miss=0`).
 
-**Measured (`scripts/ext2_cache_bench.sh`, 320 MB `librustc_driver.so`,
-MEMORY=6144M, HVF):**
+**Two workloads, two very different stories (`scripts/ext2_cache_bench.sh` and
+`ext2_cache_meta_bench.sh`, MEMORY=6144M, HVF, `disk_selfhost.img`):**
 
-| kernel | cold | warm | warm | note |
-|---|---|---|---|---|
-| no cache (64-slot ring) | 4.47s | 4.48s | 4.48s | **warm/cold = 1.00× — no reuse (the floor)** |
-| `--features fs-cache`   | 6.38s | 4.41s | 4.32s | warm fully cached (`warm misses=0`) |
+*File data — mmap 320 MB `librustc_driver.so`, touch every page:*
 
-The cache provably eliminates disk re-reads on warm access, but on **HVF** the
-wall-clock win is modest (warm 4.32s vs the 4.47s no-cache floor ≈ 6%) and cold
-*regresses* (~+1.9s) — because under HVF the "disk" is a host file already in the
-Mac's page cache, so virtio-blk reads are nearly free and this demand-paged mmap
-workload is **page-fault-bound, not disk-bound**. The extra memcpy into the cache
-backing is then pure overhead on the cold pass. The cache's real payoff is where
-I/O is the actual bottleneck — TCG emulation, slow/real storage, or a self-host
-build whose working set spills the host page cache (the cluster deployment
-target, not a dev Mac). It is therefore shipped **opt-in**.
+| kernel | cold | warm | note |
+|---|---|---|---|
+| no cache (64-slot ring) | 4.47s | 4.48s | warm/cold = 1.00× (floor) |
+| `--features fs-cache`   | 6.38s | 4.32s | warm fully cached (`warm misses=0`) |
+
+Marginal on HVF — only ~6% on warm, and cold *regresses* ~+1.9s. Under HVF the
+"disk" is a host file already in the Mac's page cache, so this demand-paged mmap is
+**page-fault-bound, not disk-bound**; the extra copy into the cache is then mostly
+overhead. (It's the IOP/latency win below that matters, not file-data bandwidth.)
+
+*Metadata — `du -s /usr/local/lib/rustlib` (493 MB, thousands of files; pure stat
+walk):*
+
+| kernel / variant | cold | warm | speedup |
+|---|---|---|---|
+| no cache | 6.55s | 6.51s | 1.00× (floor) |
+| `fs-cache`, **data blocks only** (inode/BGD bypass) | 6.79s | 6.76s | **1.00× — none** |
+| `fs-cache`, **full** (inode/BGD cached) | 0.39s | 0.34s | **~19×** |
+
+**This is the real result.** A metadata-heavy walk — exactly what a `cargo build`
+*is* (open/stat hundreds of rlibs and re-walk the same prefix dirs across 127
+spawns) — goes **~19× faster, even cold**, and the isolation row proves it's *all*
+from the inode/BGD caching: caching directory *data* blocks alone does nothing,
+because the dominant cost was thousands of tiny separate `dev.read_bytes` IOPs for
+inodes/descriptors. The cache collapses them into a handful of 4 KB block reads
+(each prefetching 16 inodes) plus cache hits. And this is *under HVF* — the win is
+**IOP/latency**, not bandwidth, so it survives even when the host page-caches the
+disk. Expect it to be larger still on TCG / real storage.
+
+Takeaway: `fs-cache`'s payoff is **metadata / IOP reduction**, not file-data
+bandwidth. Shipped opt-in (it's not in any default set and never combines with
+`extreme`); on by intent for the self-host / cluster build path.
 
 Still open / follow-ups:
 - **Memory-pressure shrink.** The cache is bounded by the RAM-derived cap but does
   not yet shrink under `is_memory_low`. Wire a reclaim hook so a cache that grew to
   512 MB can be dropped if user demand-paging needs the pages.
-- **Cold-path tax.** The per-block `BTreeMap` insert + the extra backing copy cost
-  ~+40% on the first read. An open-addressing index (no per-node alloc) would trim
-  it; tolerable for now since cold is paid once and warm 127× in a real build.
-- **Measure on a disk-bound path.** Re-run the bench under TCG / real storage to
-  quantify the win where reads aren't free.
+- **Cold-path tax (file data).** The per-block `BTreeMap` insert + extra backing copy
+  cost ~+40% on the first *bulk* read (the metadata path has no such regression —
+  it's faster even cold). An open-addressing index would trim it.
+- **Measure a full `cargo build -j1`** with the cache on, now that the metadata path
+  — the build's real bottleneck — is cached.
 
 ---
 
