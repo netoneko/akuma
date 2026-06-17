@@ -141,6 +141,12 @@ impl<'a> SshChannelStream<'a> {
         self.session.channel_eof
     }
 
+    /// True only when the client actually went away (CHANNEL_CLOSE / DISCONNECT),
+    /// as opposed to merely closing its stdin (`channel_eof`).
+    pub fn channel_closed(&self) -> bool {
+        self.session.channel_closed
+    }
+
     async fn read_until_channel_data(&mut self) -> Result<(), TcpError> {
         let mut buf = [0u8; 512];
 
@@ -200,7 +206,11 @@ impl<'a> SshChannelStream<'a> {
             return Ok(len);
         }
 
-        if self.session.channel_eof {
+        // Short-circuit only when the client is truly gone — NOT on plain stdin
+        // EOF. After CHANNEL_EOF we keep polling the socket (non-blocking, 10ms)
+        // so a later CHANNEL_CLOSE / TCP-EOF is still noticed while the command
+        // continues to stream output.
+        if self.session.channel_closed {
             return Ok(0);
         }
 
@@ -213,7 +223,9 @@ impl<'a> SshChannelStream<'a> {
         match read_result {
             Err(_timeout) => Ok(0),
             Ok(Ok(0)) => {
+                // TCP read returned 0 = connection closed = client gone.
                 self.session.channel_eof = true;
+                self.session.channel_closed = true;
                 Ok(0)
             }
             Ok(Err(e)) => Err(e),
@@ -279,9 +291,18 @@ impl<'a> SshChannelStream<'a> {
                     }
                 }
             }
-            SSH_MSG_CHANNEL_EOF | SSH_MSG_CHANNEL_CLOSE => {
-                log("[SSH] Channel close/EOF received\n");
+            SSH_MSG_CHANNEL_EOF => {
+                // Client's stdin is done — but it still wants the command's output.
+                // NOT a disconnect: a long non-interactive command (e.g. a build)
+                // must keep running and streaming. See shell::execute_external_interactive.
+                log("[SSH] Channel EOF (client stdin closed)\n");
                 self.session.channel_eof = true;
+                return Ok(true);
+            }
+            SSH_MSG_CHANNEL_CLOSE => {
+                log("[SSH] Channel close received (client gone)\n");
+                self.session.channel_eof = true;
+                self.session.channel_closed = true;
                 return Ok(true);
             }
             SSH_MSG_GLOBAL_REQUEST => {
@@ -299,6 +320,7 @@ impl<'a> SshChannelStream<'a> {
                 log("[SSH] Client disconnected\n");
                 self.session.state = SshState::Disconnected;
                 self.session.channel_eof = true;
+                self.session.channel_closed = true;
                 return Ok(true);
             }
             _ => {

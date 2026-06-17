@@ -38,7 +38,14 @@ pub struct SshSession {
     pub channel_open: bool,
     pub client_channel: u32,
     pub channel_data_buffer: Vec<u8>,
+    /// Client sent CHANNEL_EOF: its stdin is done, but the channel is still open
+    /// and the client still wants the command's output. Must NOT be treated as a
+    /// disconnect — see `channel_closed`.
     pub channel_eof: bool,
+    /// Client sent CHANNEL_CLOSE or DISCONNECT: the client is actually gone.
+    /// Distinct from `channel_eof` so a long non-interactive command (e.g. a
+    /// build) isn't killed merely because `ssh host cmd` closed its stdin.
+    pub channel_closed: bool,
     pub term_width: u32,
     pub term_height: u32,
     pub resize_pending: bool,
@@ -86,6 +93,7 @@ impl SshSession {
             client_channel: 0,
             channel_data_buffer: Vec::new(),
             channel_eof: false,
+            channel_closed: false,
             term_width: 80,
             term_height: 24,
             resize_pending: false,

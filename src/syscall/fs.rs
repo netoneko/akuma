@@ -277,6 +277,19 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     akuma_exec::threading::enable_preemption();
                 }
 
+                // Re-check AFTER registering the waker to close a lost-wakeup race:
+                // stdin may have been closed (or data delivered) between the checks
+                // above and registering the waker, in which case the wake already
+                // fired to a not-yet-registered waker. Without this, a reader that
+                // races `close_process_stdin` (e.g. `cat` over `ssh host cmd` when
+                // the client closes stdin) parks forever. Re-loop instead of parking.
+                if ch.is_stdin_closed() || ch.has_stdin_data() {
+                    akuma_exec::threading::disable_preemption();
+                    term_state_lock.lock().input_waker.lock().take();
+                    akuma_exec::threading::enable_preemption();
+                    continue;
+                }
+
                 akuma_exec::threading::schedule_blocking(u64::MAX);
 
                 {

@@ -287,6 +287,70 @@ fn test_exec_handler_no_debug_string() {
     console::print("  [PASS] test_exec_handler_no_debug_string\n");
 }
 
+/// Client stdin-EOF (`CHANNEL_EOF`, which `ssh host cmd` sends immediately) must
+/// be distinguished from a real disconnect (`CHANNEL_CLOSE` / `DISCONNECT`).
+/// Conflating them is what made long non-interactive commands (a build) die at
+/// the first fork. Static guard on the protocol message handler.
+fn test_channel_eof_distinct_from_close() {
+    const PROTO_SRC: &str = include_str!("ssh/protocol.rs");
+
+    // The two messages must be handled in separate match arms, not merged.
+    assert!(
+        PROTO_SRC.contains("SSH_MSG_CHANNEL_EOF =>"),
+        "CHANNEL_EOF must have its own arm (stdin done != disconnect)"
+    );
+    // Only a real close/disconnect sets channel_closed.
+    assert!(
+        PROTO_SRC.contains("channel_closed = true"),
+        "CHANNEL_CLOSE / DISCONNECT must set channel_closed"
+    );
+    // Regression guard: EOF and CLOSE must NOT share one arm again.
+    assert!(
+        !PROTO_SRC.contains("SSH_MSG_CHANNEL_EOF | SSH_MSG_CHANNEL_CLOSE"),
+        "CHANNEL_EOF must not be merged with CHANNEL_CLOSE (kills long commands)"
+    );
+
+    console::print("  [PASS] test_channel_eof_distinct_from_close\n");
+}
+
+/// A streamed `ssh host cmd` must not be killed when the client closes its
+/// stdin: stdin-EOF should deliver EOF to the process (`close_stdin`) and keep
+/// streaming; only a real disconnect (`channel_closed`) ends the loop; only
+/// Ctrl-C interrupts. Static guard on the streaming exec loop.
+fn test_streaming_exec_survives_stdin_eof() {
+    const SHELL_SRC: &str = include_str!("shell/mod.rs");
+
+    let start = SHELL_SRC
+        .find("pub async fn execute_external_interactive(")
+        .expect("shell/mod.rs must define execute_external_interactive");
+    let end = SHELL_SRC[start..]
+        .find("\npub async fn ")
+        .map(|off| start + off)
+        .unwrap_or(SHELL_SRC.len());
+    let body = &SHELL_SRC[start..end];
+
+    assert!(
+        body.contains("close_process_stdin("),
+        "stdin-EOF must be delivered (and the reader woken) via close_process_stdin(), not by killing the process"
+    );
+    assert!(
+        body.contains("channel_closed()"),
+        "the loop must end on a real disconnect (channel_closed), not on stdin-EOF"
+    );
+
+    // Regression guard: the old band-aid interrupted the process the instant
+    // the client closed stdin (`if channel_eof() { set_interrupted; break }`),
+    // which killed long non-interactive commands. Ensure stdin-EOF no longer
+    // drives set_interrupted (whitespace-insensitive).
+    let collapsed: alloc::string::String = body.split_whitespace().collect();
+    assert!(
+        !collapsed.contains("channel_eof(){channel.set_interrupted"),
+        "stdin-EOF must NOT interrupt the process — regression of the long-build fix"
+    );
+
+    console::print("  [PASS] test_streaming_exec_survives_stdin_eof\n");
+}
+
 pub fn run_all_tests() {
     console::print("\n--- SSH Tests ---\n");
     test_block_on_uses_yield_now();
@@ -298,6 +362,8 @@ pub fn run_all_tests() {
     test_network_holder_snapshot_idle();
     test_poll_entered_exited_balanced();
     test_exec_handler_no_debug_string();
+    test_channel_eof_distinct_from_close();
+    test_streaming_exec_survives_stdin_eof();
     console::print("--- SSH tests complete ---\n");
 
     // Reset transient counters so the heartbeat in production isn't confused

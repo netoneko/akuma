@@ -122,7 +122,32 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str>
     
     if let Some(ref channel) = proc.channel {
         channel.write_stdin(data);
-        
+
+        crate::threading::disable_preemption();
+        if let Some(waker) = proc.terminal_state.lock().input_waker.lock().take() {
+            waker.wake();
+        }
+        crate::threading::enable_preemption();
+    }
+    Ok(())
+}
+
+/// Signal end-of-input on a process's stdin (the SSH client closed its stdin
+/// via CHANNEL_EOF). Marks the channel's stdin closed AND wakes a reader parked
+/// in `read(stdin)` so it re-checks and returns 0 (EOF). Without the wake, a
+/// blocked reader (e.g. `cat`) sleeps forever on `schedule_blocking(u64::MAX)` —
+/// the bug that made `exec cat` hang for the full idle timeout. Mirrors the wake
+/// path in `write_to_process_stdin`.
+pub fn close_process_stdin(pid: Pid) -> Result<(), &'static str> {
+    let proc = children::lookup_process(pid).ok_or("Process not found")?;
+
+    if let Some(target_pid) = proc.delegate_pid {
+        return close_process_stdin(target_pid);
+    }
+
+    if let Some(ref channel) = proc.channel {
+        channel.close_stdin();
+
         crate::threading::disable_preemption();
         if let Some(waker) = proc.terminal_state.lock().input_waker.lock().take() {
             waker.wake();

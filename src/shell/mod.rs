@@ -227,19 +227,34 @@ pub async fn execute_external_interactive(
     channel_stream.current_process_channel = Some(channel.clone());
 
     let mut read_buf = [0u8; 256];
+    let mut stdin_eof_delivered = false;
 
     loop {
         if channel.is_interrupted() {
             break;
         }
 
-        // The SSH client closed/EOF'd the channel. Interrupt the process so
-        // it exits and don't keep spinning waiting for stdin that will never
-        // come. Without this, `exec cat` over SSH hangs the session for the
-        // full SSH_IDLE_TIMEOUT (300s) after the client disconnects — see
-        // issue #5 in docs/STABILITY_URGENT_ISSUES.md.
-        if channel_stream.channel_eof() {
-            channel.set_interrupted();
+        // Client closed its stdin (CHANNEL_EOF) — deliver EOF to the process so
+        // stdin-readers (e.g. `cat`) finish, but DO NOT kill it: keep streaming
+        // the command's output until the process exits on its own. This is what
+        // lets a long non-interactive command (e.g. a build kicked off over
+        // `ssh host cmd`, which closes stdin immediately) actually complete with
+        // its output streamed instead of being interrupted at the first fork.
+        if channel_stream.channel_eof() && !stdin_eof_delivered {
+            // close_process_stdin (not channel.close_stdin) so a reader parked in
+            // read(stdin) is WOKEN and returns EOF — otherwise `cat` hangs forever.
+            let _ = process::close_process_stdin(pid);
+            stdin_eof_delivered = true;
+        }
+
+        // The client is actually gone (CHANNEL_CLOSE / DISCONNECT / TCP EOF).
+        // Stop streaming to a dead socket. Deliver stdin-EOF so a stdin-reader
+        // (e.g. `cat`) wakes and exits rather than orphaning forever; a
+        // compute-bound process (a build) ignores it and runs to completion
+        // (reattach via `box grab`). Disconnecting must NOT kill the process —
+        // only Ctrl-C (0x03 below) does.
+        if channel_stream.channel_closed() {
+            let _ = process::close_process_stdin(pid);
             break;
         }
 

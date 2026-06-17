@@ -184,94 +184,120 @@ Yes, up to a point. Findings (June 2026, `disk_selfhost.img`, nightly
 | `rustc --emit=obj hello.rs` (codegen only, **no linker**) | ✅ **completes**, produces a valid ELF `.o` (6344 B, magic `7f45 4c46`). ~24 s warm at 16 GB. |
 | `rustc hello.rs -o hello` (codegen **+ link**) | ❌ **does not complete** — the link step kills the session (see §6). 0-byte output. |
 
-So **codegen works end-to-end**; the wall is the **link step**, and it is a
-kernel-throughput problem, not a toolchain problem.
+So **codegen works end-to-end**; the original wall was the **link step** — fixed
+in §5.
 
 ---
 
-## 5. The link-step blocker (the project)
+## 5. The link step: stdin-EOF was killing the session (FIXED)
 
-A full `rustc hello.rs -o hello` reproducibly fails to produce a binary. Traced
-via the kernel serial log, the sequence is:
+`rustc hello.rs -o hello` *does* link inside Akuma (the chain
+`rustc` → `cc` → `collect2` → `execve …/bin/ld` is visible in the kernel log).
+It is slow — rustc forks to spawn the linker, and that fork CoW-shares rustc's
+~75k-page address space (libLLVM); on single-core QEMU it runs tens of seconds
+(`docs/RUST_TOOLCHAIN.md` §5b, `docs/COW_OPTIMIZATIONS.md`). But slow is fine. The
+*blocker* was a session bug, not throughput:
 
-1. rustc codegens (works), then **forks to spawn the linker**:
-   `rustc` → `cc` (gcc) → `collect2` → `execve /usr/aarch64-alpine-linux-musl/bin/ld`
-   (confirmed in the log: `[FORK-DBG] replace_image …`, `execve(".../collect2")`,
-   `execve(".../bin/ld")`).
-2. That first fork copies/CoW-shares rustc's **~75k-page address space** (libLLVM
-   mapped). On single-core QEMU this CoW takes ~30 s and **monopolizes the core**
-   (`docs/RUST_TOOLCHAIN.md` §5b — the known-open fork-perf item, and
-   `docs/COW_OPTIMIZATIONS.md`).
-3. While the fork stalls the core, the **in-kernel SSH server thread is starved**;
-   the connection drops (`Connection closed by remote host`) ~29–59 s in.
-4. The dropped session **SIGHUPs the build** → the linker is killed → 0-byte output.
-5. The build **does not survive the disconnect** — polled `/tmp/hr` for 744 s after
-   a forced disconnect: it never appeared. So "fire and poll" does not work either.
+**Root cause.** `ssh host cmd` closes its stdin immediately (sends
+`SSH_MSG_CHANNEL_EOF`). `src/shell/mod.rs` treated that EOF as a disconnect and
+**interrupted the foreground process** (a band-aid for an `exec cat` hang, issue
+#5 in `docs/STABILITY_URGENT_ISSUES.md`). So every long non-interactive command
+was cut at its first idle moment; the build then ran orphaned (which is why a
+binary sometimes appeared if you polled long enough) but the session and its
+streamed output were gone. Confirmed: the drop fired at stdin-EOF (14–59 s), far
+under the 60 s read / 300 s idle timeouts — **never a timeout.**
 
-### Why I can't just background it
+**Fix (commit on this branch).** Split `channel_eof` (stdin done) from
+`channel_closed` (real `CHANNEL_CLOSE` / `DISCONNECT` / TCP-EOF) in
+`crates/akuma-ssh` + `src/ssh/protocol.rs`, and in the streaming loop
+(`src/shell/mod.rs`):
 
-The in-kernel SSH shell is a **mini-shell**, not a POSIX shell. Established by
-experiment:
+- **stdin-EOF** → `process::close_process_stdin(pid)` (deliver EOF to the process
+  so stdin-readers finish) and **keep streaming** until the process exits;
+- **real disconnect** → deliver stdin-EOF then stop streaming, but **leave the
+  process running** (orphaned, reattachable via `box grab`) — disconnecting does
+  *not* kill it;
+- **Ctrl-C (0x03)** → still the explicit kill.
+
+A `close_process_stdin` that didn't wake a parked reader exposed a **lost-wakeup
+race** in `read(stdin)` (`src/syscall/fs.rs`): the reader checked
+`is_stdin_closed()`, *then* registered its waker, so a close in that window
+parked it forever. Fixed by re-checking after registering the waker. Guards:
+`test_channel_eof_distinct_from_close`, `test_streaming_exec_survives_stdin_eof`
+(`src/ssh_tests.rs`).
+
+**Result:** `ssh host '<build>'` now stays connected for the whole compile and
+returns the artifact. Verified repeatedly: nightly `rustc -C linker=clang
+hello.rs` holds the session ~120 s and the binary runs; apk rustc ~70 s.
+
+### Mini-shell constraints (still true, useful to know)
 
 | Want | Reality |
 |---|---|
-| `cmd &` (background) | ❌ `&` is passed as an argument (`multiple input filenames … '&'`) |
-| `busybox sh -c '…'` | ❌ forking rustc from busybox `sh` **segfaults rustc** (`EXIT=139`) |
-| `busybox sh script.sh` | ❌ same fork-segfault path |
-| `#!/bin/sh` linker/wrapper script | ❌ Akuma's `execve` doesn't honor shebang → `exit 127` |
-| `2>file` (stderr redirect) | ❌ unsupported; `2` leaks as an arg. Only `>file` (stdout) works |
-| `busybox env VAR=… cmd 2>f` | ⚠️ env works, but the multi-token line breaks `>` parsing |
-| `busybox env VAR=… cmd` | ✅ sets env + `execve`s (no fork) — this is how to give rustc a `PATH` |
+| `cmd &` (background) | ❌ `&` is passed as an argument |
+| `busybox sh -c '…'` / `sh script.sh` | ❌ forking rustc from busybox `sh` **segfaults rustc** |
+| `#!/bin/sh` wrapper script | ❌ `execve` doesn't honor shebang → `exit 127` |
+| `2>file` (stderr redirect) | ❌ unsupported; `2` leaks as an arg. Only `>file` works |
+| `busybox env VAR=… cmd` | ✅ sets env + `execve`s — use this to give rustc a `PATH` |
 
-Practical upshot for driving it now: use `… 2>/dev/null` is out; capture rustc
-errors only on **fast** commands (slow ones lose buffered output on the abrupt
-session close). To give rustc a `PATH` for the linker, prefix with
-`/bin/busybox env PATH=/usr/local/bin:/usr/bin:/bin`.
-
-### The fix is one of (this is the project)
-
-1. **Fork throughput (root cause, `docs/RUST_TOOLCHAIN.md` §5b).** A vfork-style
-   fast path (share + suspend parent, drop the copy on `exec`) or coarse CoW
-   (refcount L1/L2 page-table subtrees instead of per-page) would make the
-   link-fork cheap, so it neither takes 30 s nor stalls the SSH server.
-2. **Detached build execution.** A way to launch a build that survives session
-   disconnect — e.g. a `herd`-supervised one-shot job, or a small persistent
-   build-runner — then poll for completion.
-3. **SSH-server resilience under a stalled core.** Keep the listener/keepalive
-   alive (or the TCP connection from resetting) across a multi-second
-   single-core monopoly so the session isn't dropped mid-link.
-
-Until one lands, an in-VM `cargo build` of the kernel (hundreds of crates, each
-forking a linker) cannot complete.
+To compile inside the VM today: `/bin/busybox env PATH=/usr/local/bin:/usr/bin:/bin
+HOME=/root /usr/local/bin/rustc -C linker=clang /root/hello.rs -o /root/hello`,
+then run `/root/hello`.
 
 ---
 
 ## 6. Benchmarks (hello.rs)
 
-`hello.rs` = `fn main(){ println!("Hello from Akuma!"); }`. Compile time, then run.
+`hello.rs` = `fn main(){ println!("Hello from Akuma!"); }`. Compile, then run.
 
-| Environment | Toolchain | debug | `-O` | notes |
-|---|---|---|---|---|
-| **Mac native** (Apple Silicon, darwin) | rustc 1.95.0 | 0.67 s | 0.13 s | runs `Hello from Akuma!` |
-| **Docker Alpine** arm64 (native musl) | rustc 1.91.1 (apk) | 0.05 s | 0.04 s | runs `Hello from Akuma!` |
-| **Akuma** (16 GB) — codegen only (`--emit=obj`) | rustc 1.98.0-nightly | ~24 s | — | valid `.o`; **no link** |
-| **Akuma** (16 GB) — full compile (+link) | rustc 1.98.0-nightly | — | — | ❌ blocked (§5) |
+| Environment | Toolchain | compile | runs? |
+|---|---|---|---|
+| **Mac native** (Apple Silicon) | rustc 1.95.0 | debug 0.67 s / `-O` 0.13 s | ✅ |
+| **Docker Alpine** arm64 (native musl) | rustc 1.91.1 (apk) | debug 0.05 s / `-O` 0.04 s | ✅ |
+| **Akuma 16 GB** — codegen only (`--emit=obj`) | nightly 1.98 | ~24 s | (.o) |
+| **Akuma 16 GB** — full compile + link (apk) | apk 1.96 | **~70 s** | ✅ runs |
+| **Akuma 16 GB** — full compile + link (nightly) | nightly 1.98 | **~120 s** | ✅ runs |
 
-Akuma codegen alone is **~250–500× slower** than native, dominated by
-demand-paging the 305 MB `librustc_driver.so` + libLLVM off virtio-blk. The
-full compile is currently unmeasurable because the link can't complete. Re-run
-the baselines: `scripts/rustc_ram_sweep.sh` (in-VM probe) and the Mac/Docker
-one-liners in this section's history.
+Akuma is **~150–1000× slower** than native — dominated by demand-paging the
+305 MB `librustc_driver.so` + libLLVM off virtio-blk and the slow link-fork
+(§5b). A single dependency-free `hello.rs` now compiles, links, and runs over one
+SSH session.
 
-> **TODO (project):** once §5 is fixed — (a) compile+run hello.rs across
-> `MEMORY` 4→16 GB with timings, (b) find the RAM floor counting down from
-> 1.5 GB, (c) re-time against Mac/Docker. The harness for the RAM sweep already
-> exists (`scripts/rustc_ram_sweep.sh`); extend it to compile+run+time once the
-> link works.
+> **TODO (still open):** (a) compile+run hello.rs across `MEMORY` 4→16 GB with
+> timings, (b) find the RAM floor counting down from 1.5 GB, (c) tabulate vs
+> Mac/Docker. `scripts/rustc_ram_sweep.sh` already boots each size and runs a
+> probe — extend it to compile + run + time now that the link completes.
 
 ---
 
-## 7. Other known issues
+## 7. Future ideas (built-in shell / userspace gaps)
+
+Surfaced while bringing up the toolchain — none block self-hosting, but each is a
+papercut that "everyone expects" to work:
+
+- **Split stdout / stderr.** The mini-shell only honors `>` (stdout); `2>` leaks
+  `2` as an argument and `2>&1` is unsupported. Real shells separate the streams —
+  needed for `cmd 2>err.log` and for tools that distinguish the two. Today rustc's
+  errors can only be read off the live stderr channel on fast commands.
+- **`/dev/null`.** No null device, so the common `… 2>/dev/null` / `> /dev/null`
+  idioms don't work. Add a `/dev` null (and `/dev/zero`) device node.
+- **`ln` in the built-in shell.** No link command; symlinks/hardlinks must be
+  created out-of-band (host-side `populate_disk`). A built-in `ln`/`ln -s` would
+  let in-VM setup (e.g. toolchain shims) be scripted.
+- **Interactive stdin-readers over `ssh host cmd`.** With the §5 fix a
+  stdin-reader (e.g. `cat`) exits cleanly when the client *sends* `CHANNEL_EOF`
+  (piped input) or on real disconnect, but non-interactive `ssh host cat` where
+  the client never signals EOF still just waits — and `CHANNEL_EOF`/`CHANNEL_DATA`
+  delivery while the reader is parked is occasionally flaky. The canonical-mode
+  stdin path could use a hardening pass.
+- **A detached build runner.** `box use -d` + `box grab` exist (grab re-streams
+  live output) but "log persistence while detached" is TBD. With the §5 fix the
+  session survives a build, so this is now optional, but it'd make long
+  multi-crate builds robust to client drops.
+
+---
+
+## 8. Other known issues
 
 - **Intermittent kernel crash during exec at high RAM.** Once, during an
   interactive 16 GB session with concurrent herd/httpd activity, exec'ing rustc
@@ -282,7 +308,7 @@ one-liners in this section's history.
 
 ---
 
-## 8. References
+## 9. References
 
 - Playbook: `acceptance/10_selfhost_compile_akuma.md`
 - Single-file bring-up + the fork/socketpair fixes + **fork-perf §5b**: `docs/RUST_TOOLCHAIN.md`
