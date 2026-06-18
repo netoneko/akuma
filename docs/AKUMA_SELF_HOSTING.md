@@ -306,6 +306,11 @@ papercut that "everyone expects" to work:
   `is_err()` in `process_tests.rs`) are worth fixing on their own merits. Do it in
   batches by lint family, building under each profile (`release`/`size`/`extreme`)
   since much kernel code is `cfg`-gated and `--fix` only touches the active config.
+- **Clean up `userspace/libakuma` warnings + clippy.** Building any libakuma-linked
+  userspace crate (`hello`, `httpd`, …) currently emits ~7 `libakuma` warnings
+  (e.g. an elided-lifetime suggestion on `Spinlock::lock`). Burn these down and add
+  `userspace/libakuma` (and ideally the rest of the userspace workspace) to a
+  `-D warnings` clippy pass, so the in-VM self-host build of userspace is clean.
 
 ### 7a. rustc compile time: it's ext2 read + library loading, not fork+exec or CPU
 

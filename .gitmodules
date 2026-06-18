@@ -1,18 +1,15 @@
 [submodule "userspace/meow"]
 	path = userspace/meow
-	url = git@github.com:netoneko/meow.git
+	url = https://github.com/netoneko/meow.git
 [submodule "userspace/tcc/tinycc"]
 	path = userspace/tcc/tinycc
 	url = https://repo.or.cz/tinycc.git
-[submodule "userspace/xbps/xbps"]
-	path = userspace/xbps/xbps
-	url = https://github.com/void-linux/xbps
 [submodule "userspace/llama.cpp/llama.cpp"]
 	path = userspace/llama.cpp/llama.cpp
 	url = https://github.com/netoneko/llama.cpp.git
 [submodule "userspace/crush/crush"]
 	path = userspace/crush/crush
-	url = git@github.com:netoneko/crush.git
+	url = https://github.com/netoneko/crush.git
 [submodule "userspace/nca/native-cli-ai"]
 	path = userspace/nca/native-cli-ai
 	url = https://github.com/netoneko/native-cli-ai.git

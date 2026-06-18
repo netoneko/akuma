@@ -1,5 +1,11 @@
 [workspace]
 resolver = "2"
+# NOTE (self-hosting): the submodule-backed members — meow, tcc, llama.cpp, crush,
+# nca — are temporarily removed from the workspace so the first-party crates build
+# without every submodule checked out. Cargo requires *every* listed member's
+# Cargo.toml to be present just to load the workspace, so a missing submodule
+# blocked building even unrelated crates like `hello`. Re-add them (or build them
+# standalone) once the submodule + dep story for in-VM builds is settled.
 members = [
     "libakuma",
     "libakuma-tls",
@@ -10,23 +16,18 @@ members = [
     "hello",
     "herd",
     "httpd",
-    "meow",
     "quickjs",
     "stackstress",
     "stdcheck",
     "termtest",
     "allocstress",
     "top",
-    "tcc",
     "tar",
     "sshd",
-    "llama.cpp",
-    "crush",
     "stp_test",
     "wavplay",
     "scratch",
-    "needle-server",
-    "nca"
+    "needle-server"
 ]
 
 [profile.dev]
