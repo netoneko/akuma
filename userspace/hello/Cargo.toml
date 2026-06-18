@@ -8,6 +8,8 @@ name = "hello"
 path = "src/main.rs"
 
 [dependencies]
+# libakuma's `net-async` (embedded-io-async + its build.rs) is off by default, so
+# hello's dep tree stays minimal with no extra flags.
 libakuma = { path = "../libakuma" }
 format_no_std = { version = "1.2.0" }
 

@@ -78,6 +78,7 @@ impl Error {
     }
 }
 
+#[cfg(feature = "net-async")]
 impl embedded_io_async::Error for Error {
     fn kind(&self) -> embedded_io_async::ErrorKind {
         match self.kind {

@@ -44,11 +44,14 @@ need `build-std`, only the precompiled `aarch64-unknown-none` std.
 ### 1.3 Dependencies (offline)
 
 Building the workspace pulls ~real crates from crates.io plus one git fork
-(`embedded-tls`). cargo-over-TLS *inside Akuma* is unproven and may be the first
-wall, so the recommended setup **vendors** deps on the host (`cargo vendor`,
-~44 MB) and points `.cargo/config.toml` at `vendored-sources` so the in-VM build
-is fully offline. (If you clone the repo fresh inside the disk instead, the build
-will try the network — see the playbook's "offline fallback" note.)
+(`embedded-tls`). **cargo-over-TLS inside Akuma works** — proven June 2026 by an
+in-VM `cargo build` of the `userspace/hello` crate, which fetched all its deps
+(`format_no_std`, `talc`, `lock_api`, `scopeguard`) from `index.crates.io`/
+`static.crates.io` over HTTPS into `/root/.cargo/registry` (§7d). TLS/HTTPS is
+already used elsewhere in Akuma (apk-over-TLS, in-kernel SSH), so this was expected.
+Vendoring (`cargo vendor`, point `.cargo/config.toml` at `vendored-sources`) is
+therefore optional — a way to make the build fully offline/deterministic, not a
+requirement.
 
 ### 1.4 RAM
 
@@ -311,6 +314,10 @@ papercut that "everyone expects" to work:
   (e.g. an elided-lifetime suggestion on `Spinlock::lock`). Burn these down and add
   `userspace/libakuma` (and ideally the rest of the userspace workspace) to a
   `-D warnings` clippy pass, so the in-VM self-host build of userspace is clean.
+- **Housekeeping: drop `sshd` and `needle-server` from the userspace workspace.**
+  Candidates for removal from `userspace/Cargo.toml` `members` to slim the
+  self-host build surface (`sshd` is the lone `net-async` consumer; revisit whether
+  either is still needed in-tree).
 
 ### 7a. rustc compile time: it's ext2 read + library loading, not fork+exec or CPU
 
@@ -473,6 +480,51 @@ Still open / follow-ups:
   it's faster even cold). An open-addressing index would trim it.
 - **Measure a full `cargo build -j1`** with the cache on, now that the metadata path
   — the build's real bottleneck — is cached.
+
+### 7d. Compiling a userspace crate (libakuma `hello`) in-VM — IN PROGRESS
+
+A much smaller self-host target than the kernel: compile a `userspace/` crate that
+links `libakuma` directly in the VM (`hello` first, then `httpd`). Findings
+(June 2026, fs-cache kernel, `disk_selfhost.img`, 8 GB):
+
+- **Toolchain combo:** the **nightly `cargo`** (`/usr/local/bin/cargo`) **crashes**
+  at startup in Akuma (`[Exception] Unknown from EL0: EC=0x0`, ~31 syscalls in) — the
+  same "nightly segfaults" seen for a real `rustc` compile. The **apk `cargo` 1.96**
+  (`/usr/bin/cargo`) runs fine, but apk's rust only ships the `aarch64-alpine-linux-musl`
+  target. So the working combo is **apk cargo + `RUSTC=/usr/local/bin/rustc`** (nightly
+  rustc has the `aarch64-unknown-none` std the userspace target needs):
+  `busybox env PATH=/usr/local/bin:/usr/bin:/bin HOME=/root CARGO_HOME=/root/.cargo RUSTC=/usr/local/bin/rustc cargo build --release -p hello --manifest-path /root/akuma/userspace/Cargo.toml`
+- **Workspace must be loadable.** Cargo requires *every* listed workspace member's
+  `Cargo.toml` to be present just to *load* the workspace — so a missing submodule
+  (e.g. `meow`) blocks building even unrelated crates like `hello`. Fixed by
+  temporarily removing the submodule-backed members (`meow`, `tcc`, `llama.cpp`,
+  `crush`, `nca`) from `userspace/Cargo.toml`'s `members`, removing the stale `xbps`
+  submodule from `.gitmodules`, and repointing `meow`/`crush` from `git@github` to
+  `https` (so the in-VM checkout needs no SSH key).
+- **cargo-over-TLS works (the key result).** `cargo build -p hello` downloaded all
+  deps from crates.io over the VM's network (HTTPS) into `/root/.cargo/registry` and
+  began compiling them — no vendoring needed (updates §1.3).
+- **The build-script wall.** The build then parks on `embedded-io-async`'s `build.rs`
+  (a build script cargo compiles *and executes* on the build machine; it probes the
+  compiler by spawning `rustc`). Fork+exec-of-rustc-from-a-build-script is the sticky
+  point for in-VM builds. **Fixed by feature-gating** `embedded-io-async` in
+  `libakuma` behind a `net-async` feature that is **off by default** (it only gates
+  the `embedded_io_async::Error` impl in `net.rs`). Consumers that use the async IO
+  traits opt in with `features = ["net-async"]` — currently just **`sshd`**
+  (`embedded_io_async::{Read,Write}` + libakuma); `hello` and `httpd` use neither, so
+  they get a minimal tree with no flags. A fresh `hello` build is then just **6
+  crates, none with a rustc-probing build.rs**: `format_no_std`, `scopeguard`,
+  `lock_api`, `talc`, `libakuma`, `hello`. (`embedded-io-async` may be dropped from
+  `libakuma` entirely later if `sshd` can use its own copy.)
+- **Runtime verified.** The shipped `/bin/hello` (libakuma-linked) runs correctly in
+  the VM (`hello (1/10)`…`(10/10)`, `uptime≈expected`), confirming the libakuma
+  runtime/ABI on Akuma — independent of the in-VM compile.
+
+**Next session:** with the build-script crate gone from `hello`'s tree, resume the
+in-VM `cargo build -p hello` (should now reach codegen + link without the build.rs
+hang), run the produced binary, then repeat for `httpd`. Commit the local changes
+(`.gitmodules`, `userspace/Cargo.toml` members, `libakuma` `net-async` gate + dep
+made optional, `sshd` `features = ["net-async"]`).
 
 ---
 

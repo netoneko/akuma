@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-libakuma = { path = "../libakuma" }
+# net-async: sshd uses embedded_io_async::{Read,Write} with libakuma's net Error,
+# so it opts into libakuma's `net-async` feature (off by default).
+libakuma = { path = "../libakuma", features = ["net-async"] }
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
 aes = { version = "0.8", default-features = false }

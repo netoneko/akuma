@@ -6,7 +6,13 @@ edition = "2021"
 [features]
 default = ["chunked-allocator"]
 chunked-allocator = []
+# `net-async` pulls embedded-io-async, which ships a build.rs that probes rustc —
+# a slow/sticky step for in-VM self-host builds. It only gates the
+# `embedded_io_async::Error` impl in net.rs. OFF by default so the common case
+# (e.g. `hello`, `httpd`) skips the build-script crate; consumers that use the
+# async IO traits (e.g. `sshd`) opt in with `features = ["net-async"]`.
+net-async = ["dep:embedded-io-async"]
 
 [dependencies]
 talc = "4"
-embedded-io-async = { version = "0.6", default-features = false }
+embedded-io-async = { version = "0.6", default-features = false, optional = true }
