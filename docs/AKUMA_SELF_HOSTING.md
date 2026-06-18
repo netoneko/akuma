@@ -849,6 +849,67 @@ and `schedule_blocking` wake delivery when `current_syscall` has been cleared.
 Resolve user PC `0x30060cc4` against the in-VM rustc/musl binary to confirm it's the
 futex wait call site.
 
+#### 7g.1 — Refinement after futex tracing + binary analysis (June 19 2026, STILL OPEN)
+
+Ran the reliable repro with `FUTEX_DBG_ENABLED=true` + a per-exit `[cct-exit]` log
++ a serial `[THR-DUMP]`. New facts:
+
+- **cargo main is NOT stuck on a lost wake — it POLLS.** Its futex wait on
+  `0x1e0e89fb0` is a *timed* wait that returns `ETIMEDOUT` every ~520 ms and
+  re-waits forever. It's waiting for a child build unit that never reports done.
+- **`clear_child_tid` / `pthread_join` wakes WORK.** Every `[cct-exit]` showed
+  `mapped=true` and fired its `futex_wake`; whole rustc thread-groups (e.g. tgid
+  110, pids 158–176 + leader 115) exited cleanly. So the earlier "gated futex_wake"
+  hypothesis was **wrong** for the common case. (The fix — always `futex_wake`,
+  gate only the user-memory write — was kept anyway: it's correct in principle and
+  cheap. `src/syscall/proc.rs`, `crates/akuma-exec/src/process/mod.rs`.)
+- **The truly-stuck threads park at a libc/ld-musl PC, not in futex.** `ps` +
+  `[THR-DUMP]`: six processes — cargo's build-unit children (108, 180) and the
+  **orphaned** rustc probes (183/185/187/189, parents 182/184/186/188 already
+  exited) — are all in **WAITING** at the identical user PC `elr=0x30060cc4`,
+  `current_syscall = !0`, and `last_syscall = 0` (per `ps` `-`). i.e. blocked in a
+  syscall **without** `current_syscall` set, having (apparently) never completed
+  one.
+- **`/usr/local/bin/rustc` is a 72 KB dynamically-linked PIE** (interp
+  `/lib/ld-musl-aarch64.so.1`, needs `librustc_driver-*.so` (~221 MB, the
+  `filesz=0xd38c000` segment at `0x30100000`) + `libc.so`). `0x30060cc4` sits
+  *below* the 221 MB lib → it's in **libc/ld-musl** — a musl syscall-return site
+  shared across these statically-laid-out objects, which is why every stuck
+  process shows the *same* PC.
+- **Ruled out:** syscall `78` = `readlinkat` returning `EINVAL` in a loop at libc
+  PC `0x30069828` is **expected** (the path isn't a symlink) — a startup red
+  herring, not the hang.
+- **Also confirmed:** the `fault_mutex` poison fix never engaged here
+  (`[FAULT-RECLAIM]` never printed) — it's a real but *separate* latent bug.
+
+**Working theory (unconfirmed):** the stuck processes are **forked/cloned children
+of multithreaded rustc** parked at a libc syscall site and never woken — either a
+classic fork-in-a-multithreaded-program lock inheritance (child waits on a libc
+lock/futex whose owning thread doesn't exist in the child) or a `CLONE_VFORK`/
+`posix_spawn` handshake the kernel mishandles. The repeated orphaning (parents
+exited, children alive at the same PC) and Akuma's lack of orphan→init reparenting
+(§7e) are consistent with this.
+
+**Decisive next experiments:**
+1. Resolve `0x30060cc4` to a musl symbol: extract `/lib/ld-musl-aarch64.so.1` from
+   the disk (Docker loop-mount), find its load base from the boot mmap trace, and
+   `llvm-objdump` the function — names the exact wait primitive (lock vs futex vs
+   nanosleep vs clone-return).
+2. lldb single-step one stuck child (`INSTANCE=1 GDB=1`) to read x8 (syscall nr)
+   at the `svc` just before `0x30060cc4`, and whether it ever runs.
+3. Check `CLONE_VFORK`/`posix_spawn` handling in `sys_clone` and the fork child's
+   READY transition for a race.
+
+**Test asset added:** `userspace/selfhost_repro/futextest.rs` — a self-contained
+multi-thread/futex stress binary (spawn+join, fan-out, mutex+condvar, barrier,
+wake-before-wait, park/unpark), built in-VM via `rustc -O futextest.rs`. NOTE:
+building it in-VM currently **hangs rustc itself** (same bug), so cross-build the
+binary on a Linux/aarch64 musl host and stage it, rather than building in-VM.
+
+**Debug aids (gated OFF by default; flip on to resume):** `FUTEX_DBG_ENABLED` and
+`DEADLOCK_THREAD_DUMP_ENABLED` in `src/config.rs`; the `ps` builtin's saved-kernel-PC
+column and `threading::dump_thread_resume_points()` / `get_saved_kernel_resume()`.
+
 ---
 
 ## 8. Other known issues

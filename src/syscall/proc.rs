@@ -232,8 +232,15 @@ pub(super) fn sys_exit(code: i32) -> u64 {
         // the sys_exit path (the thread loops in yield_now instead of returning
         // through the normal EL0→EL1→EL0 trampoline).
         let tid_addr = proc.clear_child_tid;
-        if tid_addr != 0 && crate::mmu::is_current_user_page_mapped(tid_addr as usize) {
-            unsafe { core::ptr::write(tid_addr as *mut u32, 0); }
+        if tid_addr != 0 {
+            let mapped = crate::mmu::is_current_user_page_mapped(tid_addr as usize);
+            if crate::config::FUTEX_DBG_ENABLED {
+                tprint!(160, "[cct-exit] pid={} tgid={} tid_addr={:#x} mapped={} (sys_exit)\n",
+                    pid, proc.tgid, tid_addr, mapped);
+            }
+            if mapped {
+                unsafe { core::ptr::write(tid_addr as *mut u32, 0); }
+            }
             crate::syscall::futex_wake(proc.tgid, tid_addr as usize, i32::MAX);
         }
 

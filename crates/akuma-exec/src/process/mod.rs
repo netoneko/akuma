@@ -956,8 +956,14 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     if !already_terminated {
         if let Some(proc) = lookup_process(pid.unwrap_or(0)) {
             let tid_addr = proc.clear_child_tid;
-            if tid_addr != 0 && crate::mmu::is_current_user_page_mapped(tid_addr as usize) {
-                unsafe { core::ptr::write(tid_addr as *mut u32, 0); }
+            if tid_addr != 0 {
+                if crate::mmu::is_current_user_page_mapped(tid_addr as usize) {
+                    unsafe { core::ptr::write(tid_addr as *mut u32, 0); }
+                }
+                // Wake pthread_join waiters regardless of whether the page was
+                // mappable: futex_wake reads the kernel waiter table, not user
+                // memory, and a joiner must be woken even if we couldn't zero the
+                // word (else join() futex-waits forever).
                 (runtime().futex_wake)(proc.tgid, tid_addr as usize, i32::MAX);
             }
 

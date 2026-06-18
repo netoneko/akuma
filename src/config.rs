@@ -153,6 +153,12 @@ pub const CANARY_WORDS: usize = 8;
 /// wake delivery is correct and prompt — ~401 µs — see `test_futex_wake_latency_prompt`.)
 pub const FUTEX_DBG_ENABLED: bool = false;
 
+/// When true, the Thread-0 heartbeat periodically dumps every non-idle thread's
+/// saved kernel/user resume point (`[THR-DUMP]`) once `>= 2` threads are WAITING.
+/// A deadlock-hunt aid (docs §7g) for locating where parked threads are stuck
+/// without SSH (which can itself wedge). Off by default — noisy under normal load.
+pub const DEADLOCK_THREAD_DUMP_ENABLED: bool = false;
+
 /// Fail tests if test binaries are missing
 ///
 /// When enabled, tests that require binaries (elftest, stdcheck, hello, echo2)

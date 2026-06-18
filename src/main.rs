@@ -1003,11 +1003,13 @@ fn run_async_main_preemptive() -> ! {
                     // Deadlock-hunt aid: every ~8th heartbeat, dump where each
                     // non-idle thread is parked in kernel code. Only when there
                     // are blocked threads (a hang signature), to keep it quiet.
-                    HEARTBEAT_DUMP_CTR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    if HEARTBEAT_DUMP_CTR.load(core::sync::atomic::Ordering::Relaxed) % 8 == 0
-                        && stats.waiting >= 2
-                    {
-                        threading::dump_thread_resume_points();
+                    if crate::config::DEADLOCK_THREAD_DUMP_ENABLED {
+                        HEARTBEAT_DUMP_CTR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        if HEARTBEAT_DUMP_CTR.load(core::sync::atomic::Ordering::Relaxed) % 8 == 0
+                            && stats.waiting >= 2
+                        {
+                            threading::dump_thread_resume_points();
+                        }
                     }
                 }
 
