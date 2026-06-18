@@ -3154,6 +3154,57 @@ pub fn current_trap_frame_elr() -> Option<u64> {
 /// Get the saved user context for a thread.
 /// Used by fork() to duplicate the parent's state.
 /// Reads from the live trap frame on the stack when available (captures all registers).
+/// Debug: dump every non-FREE thread's saved kernel resume point to the console.
+/// Used by the heartbeat to locate where parked threads are stuck during a hang,
+/// without needing SSH (which can itself wedge). Resolve the x30/elr against the
+/// kernel symbol map. Compact, allocation-free.
+pub fn dump_thread_resume_points() {
+    safe_print!(16, "[THR-DUMP]\n");
+    for tid in 0..MAX_THREADS {
+        let st = THREAD_STATES[tid].load(Ordering::SeqCst);
+        if st == thread_state::FREE { continue; }
+        let (x30, elr, sp) = {
+            let ctx = unsafe { &*get_context(tid) };
+            (ctx.x30, ctx.elr, ctx.sp)
+        };
+        let stc = match st {
+            x if x == thread_state::READY => 'r',
+            x if x == thread_state::RUNNING => 'R',
+            x if x == thread_state::TERMINATED => 'T',
+            x if x == thread_state::INITIALIZING => 'I',
+            _ => '?',
+        };
+        // Correlate to a pid + its current syscall (which subsystem it's in).
+        let (pid, sc) = match crate::process::find_pid_by_thread(tid) {
+            Some(p) => {
+                let scn = crate::process::lookup_process(p)
+                    .map(|pr| pr.current_syscall.load(Ordering::Relaxed))
+                    .unwrap_or(!0);
+                (p as i64, scn)
+            }
+            None => (-1, !0),
+        };
+        safe_print!(160,
+            "  tid={} st={} pid={} sc={} x30={:#x} elr={:#x} sp={:#x}\n",
+            tid, stc, pid, sc as i64, x30, elr, sp);
+    }
+}
+
+/// Debug: saved kernel resume point of a context-switched-out thread, as
+/// `(x30 /* saved LR */, elr, sp)`. For a thread parked via the cooperative
+/// switch (yield_now/schedule_blocking), `x30` is where it will resume in kernel
+/// code — resolve it against the kernel symbol table to see *where* a stuck
+/// thread is blocked. Returns None for out-of-range ids.
+pub fn get_saved_kernel_resume(thread_id: usize) -> Option<(u64, u64, u64)> {
+    if thread_id >= MAX_THREADS {
+        return None;
+    }
+    with_irqs_disabled(|| {
+        let ctx = unsafe { &*get_context(thread_id) };
+        Some((ctx.x30, ctx.elr, ctx.sp))
+    })
+}
+
 pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserContext> {
     if thread_id >= MAX_THREADS {
         return None;

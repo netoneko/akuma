@@ -793,6 +793,62 @@ Working notes/commands for resuming: kernel built (`cargo build --release`); boo
 `MEMORY=6144 DISK=disk_selfhost.img INSTANCE=1 GDB=1 cargo run --release`; wait for
 `SSH Server] Listening` then drive the build over ssh :2322 from Python.
 
+### 7g. Repro v2 REPRODUCES the hang — root cause is a parked-thread missed wakeup, NOT the fault path (June 19 2026)
+
+Repro v2 (`do_compile_probe` with `--target aarch64-unknown-none`) **deterministically
+reproduces the hang within ~seconds** (no need to compile 11 deps first). It is the
+real proc-macro2 wall.
+
+**Findings (live, via in-VM `ps` + a serial `[THR-DUMP]` heartbeat dump):**
+
+- **The hang is a PARK, not a spin.** lldb PC-sampling (60 samples) caught only
+  background threads (`smoltcp_net::poll`, `ssh::server::run`, the SGI reschedule
+  path) — never a cargo/rustc thread. The CPU genuinely idles. So the stuck user
+  threads are blocked (`schedule_blocking`/WAITING), not busy-spinning.
+- **Process tree when hung:** cargo main (`pid 95`) parked in `futex` (sc=98);
+  build-script in `wait4`; the probe `rustc` chain (`pid 182 → 184 → 185 …`) and a
+  cargo worker parked **not in any syscall** (`sc = -`).
+- **`[THR-DUMP]` (saved kernel/user resume points) is the smoking gun:** **six**
+  threads — cargo worker `pid 108`/`180` and the rustc probes `183/185/187/189` —
+  are all in **WAITING** state parked at the **identical user PC `elr=0x30060cc4`**
+  with `current_syscall = !0` (not inside a syscall). cargo main is separately
+  parked in `futex` (sc=98). Six independent processes blocked at the *same* user
+  instruction = a shared wait/park primitive (a futex/`sched_yield`/park call site
+  in the rustc/musl binary) whose **wake is never delivered**.
+- rustc first demand-pages its ~**221 MB** `librustc_driver` (`filesz=0xd38c000`)
+  via ~1700 scattered instruction faults (normal, makes progress) and *then* parks.
+  So the hang is downstream of paging, in the wait/wake handoff.
+
+**This is (most likely) a futex / thread-park missed-wakeup**, exactly the
+"sc=98 classic hang" class. The earlier `fault_mutex` poison fix (§ below) is a
+real latent-deadlock fix but is **NOT** this bug (its `[FAULT-RECLAIM]` never fired
+here).
+
+**Fix committed regardless — `fault_mutex` poison recovery.** The per-page
+demand-paging serialization (`Process.fault_mutex`) was a `BTreeSet<page_va>` with
+no owner tracking: a thread that died mid-fault (RAII release guard never runs on
+kernel thread teardown) left the slot poisoned, so siblings faulting that page spun
+in `yield_now` forever. Now `BTreeMap<page_va, holder_tid>` with
+`fault_slot_acquire`/`fault_slot_release` (crates/akuma-exec/src/process/children.rs):
+a spinner reclaims the slot if the holder is `is_thread_terminated`, with a bounded
+fallback for a wedged/recycled holder. Wired into all 3 fault sites in
+`exceptions.rs` (CoW/DA/IA) + a `[FAULT-RECLAIM]` log. Regression self-test:
+`test_fault_mutex_insert_remove` in `src/process_tests.rs`.
+
+**Debugging aids added (keep until the futex bug is fixed):**
+- `ps` builtin prints each process's saved kernel resume point (`x30`/`elr`).
+- Heartbeat dumps `[THR-DUMP]` (per-thread state + pid + `current_syscall` +
+  `x30`/`elr`/`sp`) every ~8 heartbeats when `waiting >= 2` —
+  `threading::dump_thread_resume_points()`. Survives the SSH wedge (serial only).
+
+**Next:** build a **userspace futex test suite** (multi-thread WAIT/WAKE,
+WAIT_BITSET, requeue, wake-before-wait races, PI, timeouts) run as boot self-tests +
+a standalone userspace binary, to pin the missed-wakeup. Suspect areas: the
+futex hash-bucket match between waker and waiter, wake-before-wait (sticky wake),
+and `schedule_blocking` wake delivery when `current_syscall` has been cleared.
+Resolve user PC `0x30060cc4` against the in-VM rustc/musl binary to confirm it's the
+futex wait call site.
+
 ---
 
 ## 8. Other known issues

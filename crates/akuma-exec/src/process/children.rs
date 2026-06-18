@@ -172,6 +172,86 @@ pub fn lookup_process(pid: Pid) -> Option<&'static mut Process> {
     Some(unsafe { &mut *ptr })
 }
 
+/// Outcome of [`fault_slot_acquire`] — how the per-page demand-paging slot was won.
+pub enum FaultSlot {
+    /// No address-space-owner process is registered; caller skips serialization.
+    NoProc,
+    /// Slot was free (or already held by us) and acquired cleanly.
+    Acquired,
+    /// Slot was reclaimed from a holder thread that had already died
+    /// (TERMINATED/FREE) without releasing it — the root-cause poison recovery.
+    /// Carries the dead holder's thread id.
+    ReclaimedDead(usize),
+    /// Slot was force-reclaimed after spinning past the safety bound: the holder
+    /// neither released nor visibly died (wedged, or its slot was recycled to a
+    /// live thread). Carries the stale holder id. Should be vanishingly rare.
+    ReclaimedWedged(usize),
+}
+
+/// Spin bound before [`fault_slot_acquire`] force-reclaims a slot. Generous: any
+/// legitimate concurrent demand-paging of the same page completes in well under
+/// this many cooperative yields; reaching it means the holder is wedged.
+const FAULT_SLOT_SPIN_BOUND: u32 = 200_000;
+
+/// Acquire the per-page demand-paging serialization slot for `page_va` on the
+/// address-space-owner process `as_owner`, recording the calling thread as the
+/// holder. Serializes concurrent faults on the same page across CLONE_VM threads
+/// (the leader holds the shared `fault_mutex`).
+///
+/// Unlike the previous raw `BTreeSet` spin-loop, this can never deadlock: if the
+/// recorded holder thread has died (its RAII release guard never ran because a
+/// kernel thread teardown abandons the stack rather than unwinding), a sibling
+/// reclaims the slot instead of spinning forever. A bounded fallback also covers
+/// a wedged or slot-recycled holder.
+///
+/// The caller MUST pair a successful (`Acquired`/`Reclaimed*`) return with exactly
+/// one [`fault_slot_release`] — normally via an RAII guard.
+pub fn fault_slot_acquire(as_owner: Pid, page_va: usize) -> FaultSlot {
+    let my_tid = crate::threading::current_thread_id();
+    let mut spins: u32 = 0;
+    loop {
+        {
+            let proc = match lookup_process(as_owner) {
+                Some(p) => p,
+                None => return FaultSlot::NoProc,
+            };
+            let mut faults = proc.fault_mutex.lock();
+            match faults.get(&page_va).copied() {
+                None => {
+                    faults.insert(page_va, my_tid);
+                    return FaultSlot::Acquired;
+                }
+                Some(holder) if holder == my_tid => return FaultSlot::Acquired,
+                Some(holder) => {
+                    if crate::threading::is_thread_terminated(holder) {
+                        faults.insert(page_va, my_tid);
+                        return FaultSlot::ReclaimedDead(holder);
+                    }
+                    if spins >= FAULT_SLOT_SPIN_BOUND {
+                        faults.insert(page_va, my_tid);
+                        return FaultSlot::ReclaimedWedged(holder);
+                    }
+                }
+            }
+        }
+        spins = spins.wrapping_add(1);
+        crate::threading::yield_now();
+    }
+}
+
+/// Release the per-page demand-paging slot for `page_va`, but only if the calling
+/// thread still owns it. If a sibling reclaimed the slot (because we were assumed
+/// dead/wedged), we must NOT remove its entry — the reclaimer releases it.
+pub fn fault_slot_release(as_owner: Pid, page_va: usize) {
+    let my_tid = crate::threading::current_thread_id();
+    if let Some(proc) = lookup_process(as_owner) {
+        let mut faults = proc.fault_mutex.lock();
+        if faults.get(&page_va).copied() == Some(my_tid) {
+            faults.remove(&page_va);
+        }
+    }
+}
+
 /// Get the current process (for syscall handlers).
 ///
 /// For CLONE_THREAD children, uses the thread-to-PID map since they share

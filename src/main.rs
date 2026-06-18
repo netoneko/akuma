@@ -979,6 +979,8 @@ fn run_async_main_preemptive() -> ! {
                 }
                 
                 // Heartbeat every 1000 iterations to show thread 0 is alive
+                static HEARTBEAT_DUMP_CTR: core::sync::atomic::AtomicU64 =
+                    core::sync::atomic::AtomicU64::new(0);
                 if loop_counter % crate::config::THREADING_HEARTBEAT_INTERVAL == 0 {
                     // Safe print without heap allocation to prevent panics
                     let stats = threading::thread_stats_full();
@@ -997,8 +999,18 @@ fn run_async_main_preemptive() -> ! {
                     console::print(" free=");
                     console::print_dec(stats.free);
                     console::print("\n");
+
+                    // Deadlock-hunt aid: every ~8th heartbeat, dump where each
+                    // non-idle thread is parked in kernel code. Only when there
+                    // are blocked threads (a hang signature), to keep it quiet.
+                    HEARTBEAT_DUMP_CTR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if HEARTBEAT_DUMP_CTR.load(core::sync::atomic::Ordering::Relaxed) % 8 == 0
+                        && stats.waiting >= 2
+                    {
+                        threading::dump_thread_resume_points();
+                    }
                 }
-                
+
                 threading::yield_now();
             }
 

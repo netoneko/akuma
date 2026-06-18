@@ -7,7 +7,6 @@ use crate::console;
 use crate::fs;
 use akuma_exec::process;
 use alloc::string::ToString;
-use alloc::collections::BTreeSet;
 use alloc::format;
 
 /// Run process tests that require the network stack (call after network init)
@@ -1385,7 +1384,7 @@ pub(crate) fn make_test_process(pid: u32) -> alloc::boxed::Box<akuma_exec::proce
         dynamic_page_tables: Vec::new(), mmap_regions: Vec::new(),
         lazy_regions: Vec::new(),
         fds: Arc::new(SharedFdTable::new()),
-        fault_mutex: Spinlock::new(BTreeSet::new()),
+        fault_mutex: Spinlock::new(alloc::collections::BTreeMap::new()),
         vm_lock: Spinlock::new(()),
         thread_id: None, spawner_pid: None,
         terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),
@@ -4842,18 +4841,71 @@ fn test_lazy_region_lookup_resolves_tgid_for_demand_paging() {
     }
 }
 
-/// Demand-paging serialization: per-page `fault_mutex` set must not leak entries (forktest stress).
+/// Demand-paging serialization: the per-page `fault_mutex` slot must serialize
+/// concurrent faults AND never deadlock if a holder thread dies mid-fault.
+///
+/// Regression for the in-VM build-script deadlock (docs §7f/§7g): a build.rs
+/// child rustc faulted on a page, recorded itself as the holder, then the
+/// process was torn down before the RAII release guard ran — leaving the slot
+/// poisoned so every sibling fault on that page spun in `yield_now` forever
+/// (cargo's coordinator then futex-waited on a child that never finished). The
+/// holder-tracked `fault_slot_acquire` must reclaim a dead holder's slot.
 fn test_fault_mutex_insert_remove() {
-    let p = make_test_process(60_030);
+    use akuma_exec::process::{
+        register_process, unregister_process, lookup_process, fault_slot_acquire,
+        fault_slot_release, FaultSlot,
+    };
+    use akuma_exec::threading;
+
+    let pid = 60_030u32;
+    register_process(pid, make_test_process(pid));
+    let me = threading::current_thread_id();
+    let mut ok = true;
+
+    // (1) Clean acquire records us as holder; release clears it.
     let va = 0x5000usize;
-    {
-        let mut g = p.fault_mutex.lock();
-        g.insert(va);
-        assert!(g.contains(&va));
+    ok &= matches!(fault_slot_acquire(pid, va), FaultSlot::Acquired);
+    ok &= lookup_process(pid)
+        .map_or(false, |p| p.fault_mutex.lock().get(&va).copied() == Some(me));
+    fault_slot_release(pid, va);
+    ok &= lookup_process(pid).map_or(false, |p| p.fault_mutex.lock().is_empty());
+
+    // (2) Poison recovery: a slot held by a DEAD thread must be reclaimable,
+    // not an infinite spin. Simulate the dead holder with a parked test slot.
+    let claimed = threading::claim_test_thread_slots(1);
+    if claimed.len() == 1 {
+        let dead_tid = claimed[0];
+        threading::set_thread_state(dead_tid, threading::thread_state::TERMINATED);
+        let va2 = 0x6000usize;
+        if let Some(p) = lookup_process(pid) {
+            p.fault_mutex.lock().insert(va2, dead_tid); // poison: holder already dead
+        }
+        match fault_slot_acquire(pid, va2) {
+            FaultSlot::ReclaimedDead(h) => ok &= h == dead_tid,
+            _ => ok = false,
+        }
+        // Slot now belongs to us; releasing it empties the map.
+        ok &= lookup_process(pid)
+            .map_or(false, |p| p.fault_mutex.lock().get(&va2).copied() == Some(me));
+        fault_slot_release(pid, va2);
+        ok &= lookup_process(pid).map_or(false, |p| p.fault_mutex.lock().is_empty());
+        threading::release_test_thread_slot(dead_tid);
+    } else {
+        ok = false;
     }
-    p.fault_mutex.lock().remove(&va);
-    let empty = p.fault_mutex.lock().is_empty();
-    if empty {
+
+    // (3) A release by a non-owner must NOT remove someone else's entry.
+    let va3 = 0x7000usize;
+    if let Some(p) = lookup_process(pid) {
+        p.fault_mutex.lock().insert(va3, me.wrapping_add(0xDEAD)); // owned by a phantom tid
+    }
+    fault_slot_release(pid, va3); // we (tid `me`) don't own it -> no-op
+    ok &= lookup_process(pid)
+        .map_or(false, |p| p.fault_mutex.lock().get(&va3).copied().is_some());
+
+    unregister_process(pid);
+
+    if ok {
         console::print("[Test] fault_mutex_insert_remove PASSED\n");
     } else {
         console::print("[Test] fault_mutex_insert_remove FAILED\n");

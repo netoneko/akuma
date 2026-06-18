@@ -26,6 +26,7 @@ pub use exec::*;
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::sync::Arc;
@@ -199,7 +200,12 @@ pub struct Process {
     pub robust_list_len: usize,
     pub signal_actions: Arc<SharedSignalTable>,
     pub signal_mask: u64,
-    pub fault_mutex: Spinlock<BTreeSet<usize>>,
+    /// Per-page demand-paging serialization slots: `page_va -> holder_thread_id`.
+    /// Maps each in-flight faulting page to the thread currently resolving it so a
+    /// sibling faulting the same page can detect a holder that died mid-fault (its
+    /// RAII release guard never ran) and reclaim the slot instead of spinning
+    /// forever. See [`fault_slot_acquire`]/[`fault_slot_release`].
+    pub fault_mutex: Spinlock<BTreeMap<usize, usize>>,
     /// Serializes all access to [`Process::mmap_regions`] across the thread group.
     /// CLONE_VM threads share one address-space-owner Process, so concurrent
     /// `sys_mmap`/`munmap`/`mremap` (push/remove) and the page-fault eager
@@ -344,7 +350,7 @@ impl Process {
             robust_list_len: 0,
             signal_actions: Arc::new(SharedSignalTable::new()),
             signal_mask: 0,
-            fault_mutex: Spinlock::new(BTreeSet::new()),
+            fault_mutex: Spinlock::new(BTreeMap::new()),
             vm_lock: Spinlock::new(()),
             sigaltstack_sp: 0,
             sigaltstack_flags: 2, // SS_DISABLE
@@ -442,7 +448,7 @@ impl Process {
             robust_list_len: 0,
             signal_actions: Arc::new(SharedSignalTable::new()),
             signal_mask: 0,
-            fault_mutex: Spinlock::new(BTreeSet::new()),
+            fault_mutex: Spinlock::new(BTreeMap::new()),
             vm_lock: Spinlock::new(()),
             sigaltstack_sp: 0,
             sigaltstack_flags: 2, // SS_DISABLE
@@ -1316,7 +1322,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         robust_list_len: 0,
         signal_actions: Arc::new(SharedSignalTable::new()), // Fork creates fresh table
         signal_mask: parent.signal_mask,
-        fault_mutex: Spinlock::new(BTreeSet::new()),
+        fault_mutex: Spinlock::new(BTreeMap::new()),
         vm_lock: Spinlock::new(()),
         sigaltstack_sp: parent.sigaltstack_sp,
         sigaltstack_flags: parent.sigaltstack_flags,
@@ -1955,7 +1961,7 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
         robust_list_len: 0,
         signal_actions: Arc::new(SharedSignalTable::new()),
         signal_mask: parent.signal_mask,
-        fault_mutex: Spinlock::new(BTreeSet::new()),
+        fault_mutex: Spinlock::new(BTreeMap::new()),
         vm_lock: Spinlock::new(()),
         sigaltstack_sp: parent.sigaltstack_sp,
         sigaltstack_flags: parent.sigaltstack_flags,
@@ -2065,7 +2071,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         robust_list_len: 0,
         signal_actions: parent.signal_actions.clone(), // Shared table (Arc clone)
         signal_mask: parent.signal_mask,
-        fault_mutex: Spinlock::new(BTreeSet::new()),
+        fault_mutex: Spinlock::new(BTreeMap::new()),
         vm_lock: Spinlock::new(()),
         sigaltstack_sp: parent.sigaltstack_sp,
         sigaltstack_flags: parent.sigaltstack_flags,
