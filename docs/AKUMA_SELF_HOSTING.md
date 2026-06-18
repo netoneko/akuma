@@ -318,6 +318,22 @@ papercut that "everyone expects" to work:
   Candidates for removal from `userspace/Cargo.toml` `members` to slim the
   self-host build surface (`sshd` is the lone `net-async` consumer; revisit whether
   either is still needed in-tree).
+- **In-VM `git` is broken for pulling — fix it.** Two separate problems block
+  `git pull` of a branch into the on-disk `/root/akuma` (June 2026):
+  1. **`git-remote-https` (apk git 2.54) SIGSEGVs** — `git fetch` over https dies
+     with `git-remote-https died of signal 11`; the kernel log shows a wild
+     instruction-abort (`[WILD-IA] ELR=0x0`, jump to null) in the helper. So
+     git-over-https fails *even though cargo-over-https works* — different HTTP
+     client (libcurl vs cargo's). Likely the same exec/relocation corruption class
+     as the nightly-`cargo`/`rustc` `EC=0x0` crashes (§4, §8).
+  2. **`scratch` (Akuma's git client, `/bin/git`) discrepancies with real git** —
+     no `-C <dir>` flag; looks for lowercase `.git/head` instead of standard
+     `.git/HEAD`; and relies on CWD, which is itself broken: **`cd X && cmd` runs
+     `cmd` with CWD `/`** (chdir doesn't propagate through `exec` in Akuma — verified
+     `sh -c 'cd /root/akuma && pwd'` prints `/`). Fixing the chdir/exec CWD
+     inheritance is the prerequisite; then align scratch's `.git` layout + add `-C`
+     so it can stand in for real git in-VM. Workaround for now: pull on the host and
+     re-populate the disk, or apply changes to the on-disk tree directly.
 
 ### 7a. rustc compile time: it's ext2 read + library loading, not fork+exec or CPU
 
@@ -519,12 +535,55 @@ links `libakuma` directly in the VM (`hello` first, then `httpd`). Findings
 - **Runtime verified.** The shipped `/bin/hello` (libakuma-linked) runs correctly in
   the VM (`hello (1/10)`…`(10/10)`, `uptime≈expected`), confirming the libakuma
   runtime/ABI on Akuma — independent of the in-VM compile.
+- **The next wall: `rustc` futex deadlock — ROOT-CAUSED & FIXED.** With the
+  build-script crate gone, the build *does* reach codegen — and then **`rustc`
+  hung on a futex**. Observed building `scopeguard` (the first dep): kernel PSTATS
+  frozen across three 60 s samples — `rustc` PID stuck at `1448 syscalls`,
+  `futex=78 (440716ms)`, `in_kernel ≈ 441 s`, zero forward progress; `cargo`
+  parked waiting on it. It had paged in ~200 MB (the toolchain) and deadlocked
+  *mid-compile*, not at startup. **Not OOM** (6.3 GB free of 8 GB).
+  **Nondeterministic** and **got worse the deeper into the build it ran.**
 
-**Next session:** with the build-script crate gone from `hello`'s tree, resume the
-in-VM `cargo build -p hello` (should now reach codegen + link without the build.rs
-hang), run the produced binary, then repeat for `httpd`. Commit the local changes
-(`.gitmodules`, `userspace/Cargo.toml` members, `libakuma` `net-async` gate + dep
-made optional, `sshd` `features = ["net-async"]`).
+  - **Root cause — `FUTEX_WAIT_BITSET` absolute timeout treated as relative**
+    (NOT a lost-wakeup; the wait/wake core is sound — its sticky `WOKEN_STATES`
+    flag, re-checked after `mark_thread_waiting`, closes the wait-entry window).
+    Rust std emits an **absolute** `CLOCK_MONOTONIC` deadline (`now + dur`) via
+    `FUTEX_WAIT_BITSET` **without** the `CLOCK_REALTIME` flag for *every* timed
+    wait (`Condvar::wait_timeout`, `park_timeout`, `Mutex`/`Once` contention —
+    exactly rustc's rayon/jobserver idle loops). Akuma's `sys_futex` only treated
+    `FUTEX_WAIT_BITSET` timeouts as absolute when the realtime flag was set; the
+    monotonic case fell through to the relative branch and added `uptime_us()` to
+    an already-absolute, `uptime`-based deadline. Effective wait ≈ `2·uptime + dur`
+    — and since it scales with current uptime, a short timed wait silently became
+    an ~800 s one after the toolchain had paged in for ~400 s, presenting as a
+    nondeterministic, deeper-is-worse "deadlock."
+  - **Fix** (`src/syscall/sync.rs`): `FUTEX_WAIT_BITSET` deadlines are now
+    absolute (Linux semantics) for **both** clocks. Monotonic == `uptime_us`, used
+    directly; realtime is converted into uptime terms via `utc_time_us()`. Plain
+    `FUTEX_WAIT` stays relative.
+  - **Regression test** (`src/sync_tests.rs`):
+    `test_futex_wait_bitset_monotonic_absolute_deadline` parks on an absolute
+    monotonic deadline `uptime_now + 100 ms` and asserts the wait ends *near that
+    deadline*, not ~uptime later. Verified to **fail on the old code** (panic:
+    `overshoot 1,131,264 us` ≈ the uptime at call) and **pass after the fix**
+    (overshoot ~7.5 ms). All 30 boot-suite futex tests pass.
+
+**Disk refresh (how to get repo changes in-VM):** in-VM `git` can't pull (§7,
+git-remote-https SIGSEGV; scratch broken), so re-stage `/root/akuma` host-side via
+Docker — privileged Alpine, `mount -o loop disk_selfhost.img`, `git clone --depth 1
+--branch <branch> https://github.com/netoneko/akuma.git /mnt/disk/root/akuma`,
+`umount`. (`netoneko/akuma` is public; no token needed. No submodule init required —
+the workspace `members` no longer reference them.)
+
+**Next session:** the toolchain/workspace/dep path is clear up to codegen, and the
+**`rustc` futex deadlock** that blocked codegen is now root-caused and fixed (the
+`FUTEX_WAIT_BITSET` absolute-timeout bug above). Next: re-stage `/root/akuma` with
+this branch and re-run the in-VM `hello` compile end-to-end to confirm codegen now
+completes, run the binary, then repeat for `httpd`. Already committed:
+`.gitmodules`, `userspace/Cargo.toml` members, `libakuma` `net-async` gate + optional
+dep, `sshd` `features = ["net-async"]` (faedd3a/6ba831a). Uncommitted: the futex fix
+(`src/syscall/sync.rs`) + regression test (`src/sync_tests.rs`), doc updates +
+`scripts/ext2_cache_*bench.sh`.
 
 ---
 

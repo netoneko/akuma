@@ -1076,6 +1076,80 @@ fn test_futex_wait_bitset_absolute_past() {
 ");
 }
 
+/// FUTEX_WAIT_BITSET timeouts are ABSOLUTE against CLOCK_MONOTONIC (no
+/// CLOCK_REALTIME flag) — this is what Rust std emits for *every* timed wait
+/// (`Condvar::wait_timeout`, `park_timeout`, `Mutex`/`Once` contention): it
+/// computes `CLOCK_MONOTONIC::now() + dur` and passes FUTEX_WAIT_BITSET.
+///
+/// Regression for the rustc "futex deadlock" (docs/AKUMA_SELF_HOSTING.md §7d):
+/// the kernel used to treat the monotonic-absolute deadline as *relative* and
+/// add `uptime_us()` to it, so the effective wait became ≈ `2·uptime + dur` —
+/// growing the longer the VM runs. Here we park on a deadline `uptime_now + GAP`
+/// and require the wait to end *close to that absolute deadline*, not ~uptime
+/// later. With the bug the overshoot is ≈ current uptime and this FAILs.
+fn test_futex_wait_bitset_monotonic_absolute_deadline() {
+    set_bypass(true);
+
+    const FUTEX_WAIT_BITSET: u64 = 9;
+    const FUTEX_WAIT_BITSET_PRIVATE: u64 = FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG;
+    const FUTEX_BITSET_MATCH_ANY: u64 = 0xFFFF_FFFF;
+
+    const GAP_US: u64 = 100_000;        // intended wait: 100 ms past "now"
+    const UPTIME_FLOOR_US: u64 = 1_000_000; // ensure the bug's overshoot (≈uptime) is detectable
+    const MAX_OVERSHOOT_US: u64 = 300_000;  // tolerate scheduler jitter, catch the ≈uptime bug
+
+    // Make sure enough uptime has accrued that the buggy "+uptime" overshoot is
+    // unambiguously larger than scheduler jitter. By the time the boot suite runs
+    // this is usually already true, so the loop is typically a no-op.
+    while crate::timer::uptime_us() < UPTIME_FLOOR_US {
+        threading::yield_now();
+    }
+
+    let mut word: u32 = 0;
+    let uaddr = &mut word as *mut u32 as usize;
+
+    let t0 = crate::timer::uptime_us();
+    let abs_deadline_us = t0 + GAP_US;
+    let ts = Timespec {
+        tv_sec: (abs_deadline_us / 1_000_000) as i64,
+        tv_nsec: ((abs_deadline_us % 1_000_000) * 1_000) as i64,
+    };
+    let tp = &ts as *const Timespec as u64;
+
+    // val == word (0) so we actually park (no early EAGAIN); MATCH_ANY bitset.
+    let ret = crate::syscall::handle_syscall(
+        NR_FUTEX,
+        &[uaddr as u64, FUTEX_WAIT_BITSET_PRIVATE, 0, tp, 0, FUTEX_BITSET_MATCH_ANY],
+    );
+    let t1 = crate::timer::uptime_us();
+
+    set_bypass(false);
+
+    assert!(
+        ret == ETIMEDOUT,
+        "test_futex_wait_bitset_monotonic_absolute_deadline: expected ETIMEDOUT ({:#x}) got {:#x}",
+        ETIMEDOUT,
+        ret
+    );
+    // Woke no earlier than the absolute deadline (timeout was honored, not early).
+    assert!(
+        t1 >= abs_deadline_us,
+        "test_futex_wait_bitset_monotonic_absolute_deadline: woke at {} us, before absolute deadline {} us",
+        t1,
+        abs_deadline_us
+    );
+    // ...and not ≈uptime late (the relative-misinterpretation bug).
+    let overshoot = t1 - abs_deadline_us;
+    assert!(
+        overshoot < MAX_OVERSHOOT_US,
+        "test_futex_wait_bitset_monotonic_absolute_deadline: overshoot {} us (t0={} t1={} deadline={}) \
+         — absolute monotonic timeout was treated as relative (added uptime)",
+        overshoot, t0, t1, abs_deadline_us
+    );
+    crate::safe_print!(96,
+        "  [PASS] test_futex_wait_bitset_monotonic_absolute_deadline (overshoot {} us)\n", overshoot);
+}
+
 /// Pend a signal on the current thread slot while it would be in FUTEX_WAIT,
 /// verify the pending signal causes EINTR to be returned.
 /// (Single-threaded: we pend the signal before entering wait with mismatched
@@ -2470,6 +2544,7 @@ pub fn run_all_tests() {
     test_futex_cmp_requeue_mismatch();
     test_futex_wait_bitset_zero_bitset();
     test_futex_wait_bitset_absolute_past();
+    test_futex_wait_bitset_monotonic_absolute_deadline();
     test_per_thread_sigaltstack();
     test_peek_pending_signal();
     test_pending_signal_drained_by_take();

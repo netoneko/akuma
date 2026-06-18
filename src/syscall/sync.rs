@@ -163,12 +163,40 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                     return EFAULT;
                 }
                 let timeout_us = (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000;
-                if cmd == FUTEX_WAIT_BITSET && is_realtime {
-                    // FUTEX_WAIT_BITSET + CLOCK_REALTIME: timeout is an absolute wall-clock
-                    // value. We treat it as absolute uptime microseconds (imprecise but safe:
-                    // prevents sleeping far into the future compared to adding uptime).
-                    timeout_us
+                // Timeout interpretation per Linux semantics, NOT op-flag-agnostic:
+                //   - FUTEX_WAIT (plain): timeout is RELATIVE to now.
+                //   - FUTEX_WAIT_BITSET: timeout is ABSOLUTE. Default clock is
+                //     CLOCK_MONOTONIC; the CLOCK_REALTIME flag selects wall-clock.
+                // The wait loop below compares deadlines against `uptime_us()`, and our
+                // CLOCK_MONOTONIC == uptime_us (src/syscall/time.rs), so an absolute
+                // monotonic deadline is used directly.  This is exactly what Rust std
+                // emits for *every* timed wait (Condvar::wait_timeout, park_timeout,
+                // Mutex/Once contention): it computes `CLOCK_MONOTONIC::now() + dur`
+                // and passes FUTEX_WAIT_BITSET *without* CLOCK_REALTIME.  Treating that
+                // already-absolute value as relative (adding uptime again) made every
+                // std timed wait sleep ~2x current-uptime — growing the longer the VM
+                // runs — which manifested as the rustc "futex deadlock" (see
+                // docs/AKUMA_SELF_HOSTING.md §7d).
+                if cmd == FUTEX_WAIT_BITSET {
+                    if is_realtime {
+                        // Absolute CLOCK_REALTIME (wall-clock) deadline.  Convert into
+                        // uptime terms so the wait loop's uptime comparison is correct:
+                        // remaining = abs_realtime - utc_now; deadline = uptime_now + remaining.
+                        match crate::timer::utc_time_us() {
+                            Some(utc_now) if timeout_us > utc_now => {
+                                crate::timer::uptime_us() + (timeout_us - utc_now)
+                            }
+                            Some(_) => crate::timer::uptime_us(), // already past → immediate timeout
+                            // No wall clock available: fall back to treating the absolute
+                            // value as uptime microseconds (imprecise but bounded).
+                            None => timeout_us,
+                        }
+                    } else {
+                        // Absolute CLOCK_MONOTONIC deadline == absolute uptime.
+                        timeout_us
+                    }
                 } else {
+                    // Plain FUTEX_WAIT: relative timeout.
                     crate::timer::uptime_us() + timeout_us
                 }
             } else {
