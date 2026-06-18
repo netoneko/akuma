@@ -726,7 +726,8 @@ meanwhile: the demand-paging fault wait/wakeup path, and orphan reparenting
 ### 7f. Minimal repro built — the wall is NOT "build.rs spawns rustc" (June 18 2026, IN PROGRESS)
 
 Built the deterministic minimal repro the §7e plan called for, and it **narrowed
-the cause significantly**. Repro crate is in the host tree at `selfhost_repro/`
+the cause significantly**. Repro crate is in the host tree at `userspace/selfhost_repro/`
+(excluded from the userspace workspace — built only inside the VM)
 (`Cargo.toml`, `lib.rs`, `build.rs`) and staged on `disk_selfhost.img` at
 `/root/repro` via the Docker loop-mount.
 
@@ -765,7 +766,7 @@ be the trigger:
 - It runs the probe **up to twice** (with/without `RUSTC_BOOTSTRAP`) — matching
   the "two orphaned rustc probes" observation in §7e.
 
-**Next step (repro v2, staged but NOT yet run).** `selfhost_repro/build.rs` was
+**Next step (repro v2, staged but NOT yet run).** `userspace/selfhost_repro/build.rs` was
 rewritten to faithfully replay `do_compile_probe` — `--target aarch64-unknown-none`,
 the linker rustflag via `CARGO_ENCODED_RUSTFLAGS`, `--emit=dep-info,metadata`,
 `extern crate proc_macro`, the create_dir/remove_dir_all, run twice — with a
