@@ -602,6 +602,13 @@ links `libakuma` directly in the VM (`hello` first, then `httpd`). Findings
     `[munmap] … shared-writeback … 4128 bytes`), and **runs correctly**:
     `hello (1/10)`…`(10/10)`, `done`, `uptime=9007ms expected=9000ms overhead=+7ms`.
     This is the first full in-VM self-host compile **and run** of a userspace crate.
+  - **`httpd` too (VERIFIED).** The same flow compiles `httpd` in-VM (25.7 s,
+    writeback flushed a **41696-byte** binary) and it **serves**: after stopping the
+    autostarted `/bin/httpd` (kill `herd` first — it's a supervisor that respawns
+    its services), the freshly-compiled binary binds `0.0.0.0:8080` and answers host
+    `curl` — `GET /` → `200`, `index.html` (20595 B, exact match), `GET /onyxia.jpg`
+    → `200 image/jpeg` (430773 B), `GET /nope.txt` → `404`, and the accept loop keeps
+    serving across requests.
   - **In-VM build invocation (works today).** CWD is `/` over `ssh host cmd`
     (§7 chdir bug), so cargo can't find `userspace/.cargo/config.toml`; pass the
     target + rustflags via env instead, and call **apk** cargo explicitly (nightly
@@ -618,9 +625,9 @@ Docker — privileged Alpine, `mount -o loop disk_selfhost.img`, `git clone --de
 `umount`. (`netoneko/akuma` is public; no token needed. No submodule init required —
 the workspace `members` no longer reference them.)
 
-**Next session:** the in-VM `hello` self-host compile **and run** now works
-end-to-end (futex fix + `MAP_SHARED` writeback above). Next: repeat for **`httpd`**
-(a larger libakuma crate), then push toward the kernel itself. Watch for: (a) the
+**Next session:** the in-VM self-host compile **and run** now works end-to-end for
+both **`hello`** and **`httpd`** (futex fix + `MAP_SHARED` writeback above). Next:
+push toward larger crates / the kernel itself. Watch for: (a) the
 eager-only writable-`MAP_SHARED` limit on large link outputs under memory pressure;
 (b) the §7 chdir/CWD bug still forces the env-var build invocation; (c) the
 intermittent `EC=0x0` exec corruption (§8) seen once when an SSH command violated

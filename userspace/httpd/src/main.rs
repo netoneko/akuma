@@ -19,7 +19,7 @@ use libakuma::{spawn_with_env, waitpid};
 #[cfg(feature = "cgi-log")]
 use libakuma::write_fd;
 
-const HTTP_PORT: u16 = 8080;
+const DEFAULT_HTTP_PORT: u16 = 8080;
 
 /// CGI: reset idle timer after any data; bail if idle for this long
 const CGI_IDLE_TIMEOUT_MS: u32 = 60_000*3;
@@ -32,9 +32,17 @@ const CGI_HEADER_SCAN: usize = 4096;
 
 #[no_mangle]
 pub extern "C" fn main() {
-    print("httpd: Starting HTTP server on port 8080\n");
+    // Listen port resolution: `HTTP_PORT` env var, then the first CLI arg, then
+    // the default. This lets a second instance run on a non-default port (e.g. for
+    // testing a freshly-built binary alongside the autostarted server on 8080).
+    let port = libakuma::env("HTTP_PORT")
+        .or_else(|| libakuma::arg(1))
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(DEFAULT_HTTP_PORT);
 
-    let addr = format!("0.0.0.0:{}", HTTP_PORT);
+    print(&format!("httpd: Starting HTTP server on port {}\n", port));
+
+    let addr = format!("0.0.0.0:{}", port);
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,
         Err(e) => {
