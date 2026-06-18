@@ -25,7 +25,7 @@ pub(crate) mod msgqueue;
 #[cfg(feature = "sc-framebuffer")]
 mod fb;
 pub mod fs;
-mod mem;
+pub(crate) mod mem;
 mod net;
 /// Boot self-test for the net bounce-buffer allocator (see `net::alloc_net_bounce`).
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
@@ -757,7 +757,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::PRCTL => proc::sys_prctl(args[0] as i32, args[1], args[2], args[3], args[4]),
         nr::TIMES => time::sys_times(args[0] as usize),
         nr::GETRUSAGE => time::sys_getrusage(args[0] as i32, args[1] as usize),
-        nr::MSYNC => 0,
+        nr::MSYNC => mem::sys_msync(args[0] as usize, args[1] as usize, args[2] as u32),
         nr::PROCESS_VM_READV => {
             crate::tprint!(96, "[ENOSYS] nr=270 (process_vm_readv) pid={}\n",
                 akuma_exec::process::read_current_pid().unwrap_or(0));

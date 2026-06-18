@@ -568,6 +568,49 @@ links `libakuma` directly in the VM (`hello` first, then `httpd`). Findings
     `overshoot 1,131,264 us` ≈ the uptime at call) and **pass after the fix**
     (overshoot ~7.5 ms). All 30 boot-suite futex tests pass.
 
+- **The wall after that: the linker output was 0 bytes — `MAP_SHARED` writeback
+  (IMPLEMENTED).** With the futex fix the build now compiles all 6 crates
+  (`scopeguard`, `lock_api`, `talc`, `libakuma`, `format_no_std`, `hello`) and
+  reaches the **link step** — further than the futex deadlock ever allowed. `cargo`
+  reports `Finished`, but the linked `hello` landed on disk as **0 bytes**.
+  - **Root cause.** `rust-lld` (the default linker for `aarch64-unknown-none`)
+    writes its output through a writable `MAP_SHARED` file-backed `mmap`
+    (LLVM `FileOutputBuffer`), then `munmap`s + `renameat`s it into place. Akuma
+    had **no unified page cache**, so it silently downgraded writable `MAP_SHARED`
+    file mappings to `MAP_PRIVATE` (`src/syscall/mem.rs`) — lld's writes went to
+    private anonymous frames that were never flushed back, so the file stayed
+    empty.
+  - **Fix.** Implemented writable `MAP_SHARED` file-backed mappings with explicit
+    writeback (`src/syscall/mem.rs`): such a mapping is now allocated **eagerly**
+    (all pages resident, populated from the file, mapped RW) and tracked in
+    `SHARED_FILE_MAPPINGS` by `(tgid, base_va)`. Its resident pages are copied back
+    to the backing file on **`munmap`**, **`msync`** (was a no-op stub; now wired —
+    the POSIX flush point lld uses), and **process exit** (`sys_exit`/
+    `sys_exit_group`, so a process that drops the mapping by exiting still
+    persists, and stale `(tgid, base)` entries can't mis-fire after tgid reuse).
+    Read-only `MAP_SHARED` is unchanged (no writes → stays on the cheap lazy path).
+    Eager-only: a writable `MAP_SHARED` that can't get its frames returns `ENOMEM`
+    rather than silently dropping writes (so huge outputs under memory pressure are
+    the known limit; fine for userspace self-host binaries).
+  - **Test.** Boot self-test `test_shared_file_mmap_writeback`
+    (`src/process_tests.rs`): fills two resident pages with a pattern, calls the
+    writeback path, and verifies the file (incl. a partial last page) — `PASSED
+    (wrote 4196 bytes, pattern verified)`.
+  - **END-TO-END VERIFIED.** In-VM, `hello` now compiles (apk `cargo` +
+    `RUSTC=`nightly, `--target aarch64-unknown-none`), links to a **4128-byte**
+    binary (kernel log: `[mmap] … (shared-writable, writeback on)` →
+    `[munmap] … shared-writeback … 4128 bytes`), and **runs correctly**:
+    `hello (1/10)`…`(10/10)`, `done`, `uptime=9007ms expected=9000ms overhead=+7ms`.
+    This is the first full in-VM self-host compile **and run** of a userspace crate.
+  - **In-VM build invocation (works today).** CWD is `/` over `ssh host cmd`
+    (§7 chdir bug), so cargo can't find `userspace/.cargo/config.toml`; pass the
+    target + rustflags via env instead, and call **apk** cargo explicitly (nightly
+    cargo crashes at startup, §7d):
+    `busybox env PATH=/usr/local/bin:/usr/bin:/bin HOME=/root CARGO_HOME=/root/.cargo RUSTC=/usr/local/bin/rustc CARGO_BUILD_TARGET=aarch64-unknown-none CARGO_TARGET_AARCH64_UNKNOWN_NONE_RUSTFLAGS=-Crelocation-model=static /usr/bin/cargo build --release -p hello --manifest-path /root/akuma/userspace/Cargo.toml`
+    (note: cargo's incremental cache treats a previously-linked 0-byte `hello` as
+    fresh; `rm -rf target/aarch64-unknown-none` to force the relink that exercises
+    writeback).
+
 **Disk refresh (how to get repo changes in-VM):** in-VM `git` can't pull (§7,
 git-remote-https SIGSEGV; scratch broken), so re-stage `/root/akuma` host-side via
 Docker — privileged Alpine, `mount -o loop disk_selfhost.img`, `git clone --depth 1
@@ -575,15 +618,16 @@ Docker — privileged Alpine, `mount -o loop disk_selfhost.img`, `git clone --de
 `umount`. (`netoneko/akuma` is public; no token needed. No submodule init required —
 the workspace `members` no longer reference them.)
 
-**Next session:** the toolchain/workspace/dep path is clear up to codegen, and the
-**`rustc` futex deadlock** that blocked codegen is now root-caused and fixed (the
-`FUTEX_WAIT_BITSET` absolute-timeout bug above). Next: re-stage `/root/akuma` with
-this branch and re-run the in-VM `hello` compile end-to-end to confirm codegen now
-completes, run the binary, then repeat for `httpd`. Already committed:
-`.gitmodules`, `userspace/Cargo.toml` members, `libakuma` `net-async` gate + optional
-dep, `sshd` `features = ["net-async"]` (faedd3a/6ba831a). Uncommitted: the futex fix
-(`src/syscall/sync.rs`) + regression test (`src/sync_tests.rs`), doc updates +
-`scripts/ext2_cache_*bench.sh`.
+**Next session:** the in-VM `hello` self-host compile **and run** now works
+end-to-end (futex fix + `MAP_SHARED` writeback above). Next: repeat for **`httpd`**
+(a larger libakuma crate), then push toward the kernel itself. Watch for: (a) the
+eager-only writable-`MAP_SHARED` limit on large link outputs under memory pressure;
+(b) the §7 chdir/CWD bug still forces the env-var build invocation; (c) the
+intermittent `EC=0x0` exec corruption (§8) seen once when an SSH command violated
+the mini-shell grammar. Committed: the futex fix + regression test (`f7ea7dc`),
+plus the earlier workspace/gate work (faedd3a/6ba831a). Uncommitted: the
+`MAP_SHARED` writeback (`src/syscall/mem.rs`, `mod.rs`, `proc.rs`) + its self-test
+(`src/process_tests.rs`), these doc updates + `scripts/ext2_cache_*bench.sh`.
 
 ---
 

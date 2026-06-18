@@ -427,7 +427,69 @@ pub fn run_all_tests() {
     #[cfg(feature = "fs-cache")]
     test_fs_cache_warm_reread_hits();
 
+    // Writable MAP_SHARED file-backed mmap writeback: pages written through the
+    // mapping must be flushed back to the file (docs/AKUMA_SELF_HOSTING.md §7d —
+    // rust-lld writes its output via MAP_SHARED mmap; without writeback the linked
+    // binary lands on disk as zero bytes).
+    test_shared_file_mmap_writeback();
+
     console::print("--- Process Execution Tests Done ---\n\n");
+}
+
+/// Exercises the core of the writable MAP_SHARED writeback path: fill a resident
+/// physical page with a known pattern and confirm `writeback_shared_pages` copies
+/// it into the backing file at the right offset (overwriting prior content), so a
+/// later read sees the new bytes. This is the kernel half of what `sys_mmap` +
+/// `sys_munmap` do for a writable MAP_SHARED file mapping (the full syscall path
+/// additionally needs a user address space, which boot self-tests don't have).
+fn test_shared_file_mmap_writeback() {
+    const PATH: &str = "/tmp/shared_mmap_writeback.bin";
+    const LEN: usize = 4096 + 100; // spans two pages, partial second page
+
+    // Seed the file with a sentinel so we can prove writeback actually overwrites.
+    let seed = alloc::vec![0xEEu8; LEN];
+    if crate::fs::write_file(PATH, &seed).is_err() {
+        console::print("[Test] shared_file_mmap_writeback SKIPPED (write failed)\n");
+        return;
+    }
+
+    // Two resident pages filled with a distinct pattern, as if written through the
+    // mapping by userspace.
+    let f0 = match crate::pmm::alloc_page() { Some(f) => f, None => {
+        console::print("[Test] shared_file_mmap_writeback SKIPPED (no frame)\n"); return; } };
+    let f1 = match crate::pmm::alloc_page() { Some(f) => f, None => {
+        crate::pmm::free_page(f0);
+        console::print("[Test] shared_file_mmap_writeback SKIPPED (no frame)\n"); return; } };
+    unsafe {
+        let p0 = akuma_exec::mmu::phys_to_virt(f0.addr);
+        let p1 = akuma_exec::mmu::phys_to_virt(f1.addr);
+        for i in 0..4096 { core::ptr::write(p0.add(i), 0xAB); }
+        for i in 0..4096 { core::ptr::write(p1.add(i), 0xCD); }
+    }
+
+    let written = crate::syscall::mem::writeback_shared_pages(PATH, 0, LEN, &[f0.addr, f1.addr]);
+
+    let mut buf = alloc::vec![0u8; LEN];
+    let _ = crate::fs::read_at(PATH, 0, &mut buf);
+
+    // Page 0 (all 0xAB), then the first 100 bytes of page 1 (0xCD); nothing of the
+    // 0xEE sentinel must survive in the written range.
+    let page0_ok = buf[..4096].iter().all(|&b| b == 0xAB);
+    let page1_ok = buf[4096..LEN].iter().all(|&b| b == 0xCD);
+    let pass = written == LEN && page0_ok && page1_ok;
+
+    crate::pmm::free_page(f0);
+    crate::pmm::free_page(f1);
+    let _ = crate::fs::remove_file(PATH);
+
+    if pass {
+        crate::safe_print!(160, "[Test] shared_file_mmap_writeback PASSED (wrote {} bytes, pattern verified)\n", written);
+    } else {
+        crate::safe_print!(192,
+            "[Test] shared_file_mmap_writeback FAILED (written={} page0_ok={} page1_ok={})\n",
+            written, page0_ok, page1_ok);
+        panic!("shared_file_mmap_writeback: writeback did not persist correctly");
+    }
 }
 
 /// The `fs-cache` block cache must turn a second read of the same file into cache

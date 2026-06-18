@@ -221,6 +221,9 @@ pub(super) fn sys_exit(code: i32) -> u64 {
         // sys_exit() for a non-leader thread must NOT close the shared FD
         // table; only sys_exit_group() (or the last thread) does that.
         if proc.tgid == proc.pid {
+            // Flush any writable MAP_SHARED file mappings to disk before teardown,
+            // so a process that exits without munmap still persists its writes.
+            super::mem::flush_and_clear_shared_file_mappings(proc.tgid);
             proc.fds.close_all();
         }
         // CLONE_CHILD_CLEARTID: write 0 to the TID address and wake any
@@ -290,6 +293,9 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         if tgid != pid {
             notify_child_channel_exited(tgid, code);
         }
+        // Flush writable MAP_SHARED file mappings to disk while the address space
+        // is still intact (kill_thread_group below tears it down).
+        super::mem::flush_and_clear_shared_file_mappings(tgid);
         // Kill sibling threads FIRST, before closing FDs.
         // This prevents goroutines from being scheduled while we hold locks.
         // Pass the real exit_group code so the leader's channel (read by the
