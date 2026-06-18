@@ -641,6 +641,88 @@ plus the earlier workspace/gate work (faedd3a/6ba831a). Uncommitted: the
 `MAP_SHARED` writeback (`src/syscall/mem.rs`, `mod.rs`, `proc.rs`) + its self-test
 (`src/process_tests.rs`), these doc updates + `scripts/ext2_cache_*bench.sh`.
 
+### 7e. First in-VM **kernel** `cargo build` attempt — reaches dep compilation, walls on `proc-macro2`'s build script (June 18 2026)
+
+First attempt at building the **akuma kernel itself** inside the VM (the §7d work
+proved userspace crates; this is the kernel). Kernel boot: `--release
+--features fs-cache`; VM `MEMORY=12288M`, `disk_selfhost.img`, HVF.
+
+**Setup that got it building.** The kernel can't be driven by the nightly `cargo`
+(it still crashes at startup — see below), so the only working driver is the §7d
+combo **apk `cargo` 1.96 + `RUSTC=`nightly**. apk cargo is *stable*, so it refuses
+the workspace's nightly-only bits at manifest-parse time. Two edits to the on-disk
+`/root/akuma/Cargo.toml` make it stable-parseable for a **release** build (release
+is `panic="abort"`, so neither bit is actually needed by it):
+
+1. delete the top line `cargo-features = ["panic-immediate-abort"]`;
+2. change `profile.size`'s `panic = "immediate-abort"` → `panic = "abort"`.
+
+Edit the image host-side via the Docker loop-mount (the §7d disk-refresh
+mechanism); a backup is left at `Cargo.toml.selfhost-bak`. Then build with the
+env-var invocation (CWD-is-`/` over ssh, §7, means `.cargo/config.toml` is not
+read — pass target + the linker-script rustflag explicitly):
+
+```
+/bin/busybox env PATH=/usr/local/bin:/usr/bin:/bin HOME=/root CARGO_HOME=/root/.cargo \
+  RUSTC=/usr/local/bin/rustc CARGO_BUILD_TARGET=aarch64-unknown-none \
+  CARGO_TARGET_AARCH64_UNKNOWN_NONE_RUSTFLAGS=-Clink-arg=-T/root/akuma/linker.ld \
+  /usr/bin/cargo build --release -p akuma --manifest-path /root/akuma/Cargo.toml -j1
+```
+
+**What worked (further than ever):**
+- **apk cargo parses the kernel workspace** after the 2-line edit.
+- **cargo's own git-over-HTTPS fetch works in-VM** — it cloned the `embedded-tls`
+  GitHub fork (1437/1551 deltas, full checkout) and updated the crates.io index.
+  Notable because §7's `git-remote-https` *binary* SIGSEGVs; cargo uses its own
+  client (libgit2/gitoxide), which is fine. So git deps are **not** a blocker.
+- **~11 leaf deps compile cleanly** (zeroize, typenum, version_check,
+  generic-array, crypto-common, subtle, const-oid + their build scripts), driven
+  by apk-cargo-orchestrates + nightly-`rustc`-per-crate, host target
+  `aarch64-unknown-linux-musl`. Reached **step 12/147**.
+
+**The wall — `proc-macro2`'s compiler-probing build script deadlocks.** This is
+the §7d "build.rs that probes the compiler by spawning rustc **parks**" wall, now
+pinned to a crate that is **unavoidable for the kernel** (every derive macro —
+`zerocopy`, `thiserror`, `serde`-likes, etc. — depends on `proc-macro2`). The §7d
+workaround (delete the offending crate) is not an option here.
+
+Sequence from the kernel log: `[T200.20]` proc-macro2's `build-script-build` runs
+→ `[T200.82]` it execs a child `rustc --cfg=procmacro2_build_probe` → `[T201.75]`
+that probe rustc **exits cleanly** (teardown munmaps) → then **silence**; the build
+sits at `12/147: proc-macro2(build)` indefinitely with the **CPU fully idle**
+(heartbeat idle-loop spinning at 38M) — a hard **deadlock**, not slowness.
+
+Diagnosis via the in-VM `ps` builtin + PSTATS:
+- **cargo's main thread is blocked in `futex` (syscall 98)** — its coordinator
+  waiting on a worker that never reports completion.
+- **Two `rustc --cfg=procmacro2_build_probe` processes (pids 231, 233) are still
+  alive but orphaned** — their parents (230, 232) have exited. They are parked in
+  a **non-syscall kernel wait** (`ps` SYSCALL column `-`, i.e. `current_syscall ==
+  !0`, not futex, not any syscall) while the CPU is idle. A userspace thread can
+  only block via a syscall or a page fault, so this points at a **page-fault
+  (demand-paging) wait** or a scheduler-level park that never gets woken —
+  resolvable only with a live debugger.
+- The pipe machinery is **not** the cause: per-spawn build-script pipes close
+  cleanly (`[pipe] DESTROY`), and fork/exit pipe refcounting is symmetric
+  (`clone_deep_for_fork` bumps; `close_all` on exit decrements — `fd.rs`). The
+  jobserver pipe (id 63) shows an elevated `write_count` (~12, inherited by every
+  forked child) but it drains, so it's a suspect to confirm, not the proven cause.
+
+**Still-confirmed blocker:** nightly **`cargo`** still dies at startup with
+`[Exception] Unknown from EL0: EC=0x0` (~31 syscalls in, after paging ~11 MB) —
+unchanged by the futex/`MAP_SHARED` fixes. nightly **`rustc`** runs fine; only
+nightly cargo crashes. This is why apk cargo is the driver.
+
+**Next session — root-cause the build-script→rustc-probe deadlock.** It is THE
+blocker for kernel self-host (any proc-macro pulls in `proc-macro2`). Plan:
+build a *deterministic minimal repro* (a tiny crate whose `build.rs` just
+`Command::new("rustc").arg("--version").output()`s, or replays proc-macro2's
+probe), boot with `GDB=1`, and attach lldb (`docs/` lldb+gdbstub note) to a stuck
+orphaned `rustc` probe to read its actual kernel wait state (page-fault vs.
+futex/park) — that one fact picks the fix. Suspects to check statically
+meanwhile: the demand-paging fault wait/wakeup path, and orphan reparenting
+(`ps` shows orphans keeping a dead PPID — Akuma does not reparent to init).
+
 ---
 
 ## 8. Other known issues
