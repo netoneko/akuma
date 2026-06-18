@@ -602,13 +602,18 @@ links `libakuma` directly in the VM (`hello` first, then `httpd`). Findings
     `[munmap] … shared-writeback … 4128 bytes`), and **runs correctly**:
     `hello (1/10)`…`(10/10)`, `done`, `uptime=9007ms expected=9000ms overhead=+7ms`.
     This is the first full in-VM self-host compile **and run** of a userspace crate.
-  - **`httpd` too (VERIFIED).** The same flow compiles `httpd` in-VM (25.7 s,
-    writeback flushed a **41696-byte** binary) and it **serves**: after stopping the
-    autostarted `/bin/httpd` (kill `herd` first — it's a supervisor that respawns
-    its services), the freshly-compiled binary binds `0.0.0.0:8080` and answers host
-    `curl` — `GET /` → `200`, `index.html` (20595 B, exact match), `GET /onyxia.jpg`
-    → `200 image/jpeg` (430773 B), `GET /nope.txt` → `404`, and the accept loop keeps
-    serving across requests.
+  - **`httpd` too (VERIFIED, decisively).** The same flow compiles `httpd` in-VM
+    (~30 s, writeback flushed a ~42 KB binary) and it **serves**. `httpd` was made
+    to read its listen port from the `HTTP_PORT` env var (then argv[1], then the
+    8080 default) so the freshly-built binary can run **alongside** the autostarted
+    `/bin/httpd` (still on 8080) on a *different* port — proving the server that
+    answers is unambiguously the new build, since the old binary hardcodes 8080 and
+    has no env-port code. Running the rebuilt binary with `HTTP_PORT=4444`, it binds
+    4444 and serves: in-VM `busybox wget http://127.0.0.1:4444/` → `index.html`
+    (20595 B, exact match), `GET /nope.txt` → `404`, and host `curl localhost:4444`
+    (forwarded) → `200`/20595 B — while `/bin/httpd` keeps serving 8080 independently.
+    (Disk note: SSH-stdin file copy truncated the source; re-stage the file
+    host-side via the Docker loop-mount, or `git`-pull on the disk, then rebuild.)
   - **In-VM build invocation (works today).** CWD is `/` over `ssh host cmd`
     (§7 chdir bug), so cargo can't find `userspace/.cargo/config.toml`; pass the
     target + rustflags via env instead, and call **apk** cargo explicitly (nightly
