@@ -29,6 +29,13 @@ members = [
     "scratch",
     "needle-server"
 ]
+# selfhost_repro is intentionally NOT a member: it is a throwaway crate built
+# only *inside* the VM (via its own --manifest-path) to reproduce the
+# proc-macro2 build-script deadlock (docs §7f). Exclude it so the host workspace
+# never tries to build it.
+exclude = [
+    "selfhost_repro",
+]
 
 [profile.dev]
 panic = "abort"

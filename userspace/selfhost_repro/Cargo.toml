@@ -1,0 +1,11 @@
+[package]
+name = "buildrs-repro"
+version = "0.0.0"
+edition = "2021"
+build = "build.rs"
+
+# No deps: this crate exists only to make cargo compile + run build.rs,
+# which spawns a child rustc the way proc-macro2's build script does.
+
+[lib]
+path = "lib.rs"

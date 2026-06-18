@@ -723,6 +723,75 @@ futex/park) — that one fact picks the fix. Suspects to check statically
 meanwhile: the demand-paging fault wait/wakeup path, and orphan reparenting
 (`ps` shows orphans keeping a dead PPID — Akuma does not reparent to init).
 
+### 7f. Minimal repro built — the wall is NOT "build.rs spawns rustc" (June 18 2026, IN PROGRESS)
+
+Built the deterministic minimal repro the §7e plan called for, and it **narrowed
+the cause significantly**. Repro crate is in the host tree at `selfhost_repro/`
+(`Cargo.toml`, `lib.rs`, `build.rs`) and staged on `disk_selfhost.img` at
+`/root/repro` via the Docker loop-mount.
+
+**Build/run invocation (in-VM, over ssh on :2322 with `INSTANCE=1`):**
+```
+env PATH=/usr/local/bin:/usr/bin:/bin HOME=/root CARGO_HOME=/root/.cargo \
+  RUSTC=/usr/local/bin/rustc \
+  /usr/bin/cargo build -vv --manifest-path /root/repro/Cargo.toml
+```
+Note: the in-kernel SSH mini-shell does **not** support `2>&1`/fd redirection
+(it creates a literal file named `&1`); run the command bare and let the host
+capture both streams (e.g. Python `subprocess` `capture_output`). No `busybox
+sh -c` wrapper needed.
+
+**Result of the first repro (DID NOT deadlock).** A build.rs that does the
+"obvious" probes — `rustc --version`, `rustc -vV`, and a stdin-piped
+`rustc --emit=metadata -` compiling a snippet, **all for the host target** —
+**completes cleanly** (`child exited ok=true`, build `Finished` in ~28 s). So the
+wall is **not** the generic "a forked build script spawns a child rustc and waits"
+shape. That shape works on Akuma.
+
+**What's actually different about proc-macro2's probe** (read from the vendored
+`selfhost_vendor/proc-macro2/build.rs` → `do_compile_probe`), any of which could
+be the trigger:
+- **`--target $TARGET`** where, for the kernel build, `TARGET=aarch64-unknown-none`
+  (the bare-metal kernel target, **not** the host). The probe rustc therefore
+  loads that target's sysroot (libcore etc.) — a **different file-backed mmap /
+  demand-paging path** than the host-libstd path the first repro exercised. This
+  is the prime suspect (the kernel build sets `CARGO_BUILD_TARGET=aarch64-unknown-none`,
+  so build-script `TARGET` is the bare-metal triple).
+- It appends **`CARGO_ENCODED_RUSTFLAGS`** (the `-Clink-arg=-T/root/akuma/linker.ld`
+  rustflag from the env-var invocation) to the probe command.
+- `--emit=dep-info,metadata` (writes a `.d` file too), `--cfg=procmacro2_build_probe`,
+  `--cap-lints=allow`, compiling a real file containing `extern crate proc_macro;`.
+- It `fs::create_dir`s an OUT_DIR/probe subdir and `fs::remove_dir_all`s it after.
+- It runs the probe **up to twice** (with/without `RUSTC_BOOTSTRAP`) — matching
+  the "two orphaned rustc probes" observation in §7e.
+
+**Next step (repro v2, staged but NOT yet run).** `selfhost_repro/build.rs` was
+rewritten to faithfully replay `do_compile_probe` — `--target aarch64-unknown-none`,
+the linker rustflag via `CARGO_ENCODED_RUSTFLAGS`, `--emit=dep-info,metadata`,
+`extern crate proc_macro`, the create_dir/remove_dir_all, run twice — with a
+`[REPRO] …` marker before/after **each** step (write probe src, create_dir, spawn,
+return-from-wait, remove_dir_all) so the kernel console pins the exact walling
+step. Run it with `CARGO_BUILD_TARGET=aarch64-unknown-none` and the linker rustflag
+so the build-script `TARGET` is the bare-metal triple:
+```
+env PATH=/usr/local/bin:/usr/bin:/bin HOME=/root CARGO_HOME=/root/.cargo \
+  RUSTC=/usr/local/bin/rustc CARGO_BUILD_TARGET=aarch64-unknown-none \
+  CARGO_TARGET_AARCH64_UNKNOWN_NONE_RUSTFLAGS=-Clink-arg=-T/root/akuma/linker.ld \
+  /usr/bin/cargo build -vv --manifest-path /root/repro/Cargo.toml
+```
+(`REPRO_PROBES=N` controls how many times it loops the probe; `REPRO_MODE` from
+the first version is gone.) If v2 reproduces, boot `INSTANCE=1 GDB=1` and attach
+lldb (gdbstub :1235, ssh :2322) to the stuck rustc to read its kernel wait state
+(page-fault wait vs futex/park) per the §7e plan. If it still does **not** wall,
+the trigger is the **accumulated** state after ~11 prior crate compiles (a per-
+spawn leak — child-channel registry / fault-set / pid), and the next repro is a
+loop of N back-to-back rustc spawns, or a crate that path-depends on the vendored
+`proc-macro2` directly (also in `selfhost_vendor/`).
+
+Working notes/commands for resuming: kernel built (`cargo build --release`); boot
+`MEMORY=6144 DISK=disk_selfhost.img INSTANCE=1 GDB=1 cargo run --release`; wait for
+`SSH Server] Listening` then drive the build over ssh :2322 from Python.
+
 ---
 
 ## 8. Other known issues
