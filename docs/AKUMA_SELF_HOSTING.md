@@ -297,23 +297,12 @@ papercut that "everyone expects" to work:
   live output) but "log persistence while detached" is TBD. With the §5 fix the
   session survives a build, so this is now optional, but it'd make long
   multi-crate builds robust to client drops.
-- **Fix all clippy warnings in the kernel (`src/`).** The pre-commit hook only
-  lints `crates/*/` with `-D warnings`; the kernel crate is unchecked. The
-  workspace enables `clippy::pedantic` + `nursery`, so `cargo clippy --release`
-  reports ~3580 warnings on the `akuma` bin (~299 are default `clippy::all`, the
-  rest pedantic/nursery — top offenders: `doc_markdown`, `items_after_statements`,
-  `uninlined_format_args`, `ptr_as_ptr`, `manual_let_else`). ~2373 are
-  machine-applicable via `cargo clippy --fix`. Worth burning down so the kernel
-  can eventually be added to the pre-commit gate alongside the crates — and a few
-  default lints (a dead `val = 1` write in `sync_tests.rs`, `unwrap()`-after-
-  `is_err()` in `process_tests.rs`) are worth fixing on their own merits. Do it in
-  batches by lint family, building under each profile (`release`/`size`/`extreme`)
-  since much kernel code is `cfg`-gated and `--fix` only touches the active config.
-- **Clean up `userspace/libakuma` warnings + clippy.** Building any libakuma-linked
-  userspace crate (`hello`, `httpd`, …) currently emits ~7 `libakuma` warnings
-  (e.g. an elided-lifetime suggestion on `Spinlock::lock`). Burn these down and add
-  `userspace/libakuma` (and ideally the rest of the userspace workspace) to a
-  `-D warnings` clippy pass, so the in-VM self-host build of userspace is clean.
+- ~~**Fix all clippy warnings in the kernel (`src/`).**~~ **DONE (June 2026).** Both
+  the kernel crate and all workspace crates now pass clippy clean. The kernel is
+  included in the pre-commit gate alongside the crates.
+- ~~**Clean up `userspace/libakuma` warnings + clippy.**~~ **DONE (June 2026).** The
+  userspace workspace (libakuma + all linked crates) is now warning-free and passes
+  a `-D warnings` clippy pass, so in-VM self-host builds of userspace are clean.
 - **Housekeeping: drop `sshd` and `needle-server` from the userspace workspace.**
   Candidates for removal from `userspace/Cargo.toml` `members` to slim the
   self-host build surface (`sshd` is the lone `net-async` consumer; revisit whether
