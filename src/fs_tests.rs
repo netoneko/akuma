@@ -63,8 +63,7 @@ pub fn run_all_tests() {
     }
 
     log(&format!(
-        "\n[FS Tests] Complete: {} passed, {} failed\n",
-        passed, failed
+        "\n[FS Tests] Complete: {passed} passed, {failed} failed\n"
     ));
 }
 
@@ -90,10 +89,10 @@ fn test_create_tmp_directory() -> bool {
     // Create the directory
     match fs::create_dir(test_dir) {
         Ok(()) => {
-            log(&format!("  - Created: {}\n", test_dir));
+            log(&format!("  - Created: {test_dir}\n"));
         }
         Err(e) => {
-            log(&format!("  - FAILED to create {}: {}\n", test_dir, e));
+            log(&format!("  - FAILED to create {test_dir}: {e}\n"));
             return false;
         }
     }
@@ -101,8 +100,7 @@ fn test_create_tmp_directory() -> bool {
     // Verify the directory exists
     if !fs::exists(test_dir) {
         log(&format!(
-            "  - FAILED: {} does not exist after creation\n",
-            test_dir
+            "  - FAILED: {test_dir} does not exist after creation\n"
         ));
         return false;
     }
@@ -134,7 +132,7 @@ fn test_file_operations() -> bool {
             ));
         }
         Err(e) => {
-            log(&format!("    FAILED to create file: {}\n", e));
+            log(&format!("    FAILED to create file: {e}\n"));
             return false;
         }
     }
@@ -154,7 +152,7 @@ fn test_file_operations() -> bool {
             log("    Content verified\n");
         }
         Err(e) => {
-            log(&format!("    FAILED to read file: {}\n", e));
+            log(&format!("    FAILED to read file: {e}\n"));
             return false;
         }
     }
@@ -166,7 +164,7 @@ fn test_file_operations() -> bool {
             log(&format!("    Appended {} bytes\n", append_content.len()));
         }
         Err(e) => {
-            log(&format!("    FAILED to append: {}\n", e));
+            log(&format!("    FAILED to append: {e}\n"));
             return false;
         }
     }
@@ -194,7 +192,7 @@ fn test_file_operations() -> bool {
             ));
         }
         Err(e) => {
-            log(&format!("    FAILED to read after append: {}\n", e));
+            log(&format!("    FAILED to read after append: {e}\n"));
             return false;
         }
     }
@@ -206,7 +204,7 @@ fn test_file_operations() -> bool {
             log("    File deleted\n");
         }
         Err(e) => {
-            log(&format!("    FAILED to delete file: {}\n", e));
+            log(&format!("    FAILED to delete file: {e}\n"));
             return false;
         }
     }
@@ -239,21 +237,21 @@ fn test_long_filename_operations() -> bool {
             for entry in &entries {
                 // Check if filename contains lowercase or is longer than 8.3
                 let name = &entry.name;
-                let has_lowercase = name.chars().any(|c| c.is_lowercase());
+                let has_lowercase = name.chars().any(char::is_lowercase);
                 let is_long = name.len() > 12; // 8 + 1 + 3
 
                 if has_lowercase || is_long {
-                    log(&format!("    Found LFN: {}\n", name));
+                    log(&format!("    Found LFN: {name}\n"));
                     found_lfn = true;
 
                     // Try to read this file if it's not a directory
                     if !entry.is_dir {
-                        match fs::read_file(&format!("/{}", name)) {
+                        match fs::read_file(&format!("/{name}")) {
                             Ok(content) => {
                                 log(&format!("    Read {} bytes from LFN file\n", content.len()));
                             }
                             Err(e) => {
-                                log(&format!("    FAILED to read LFN file {}: {}\n", name, e));
+                                log(&format!("    FAILED to read LFN file {name}: {e}\n"));
                                 return false;
                             }
                         }
@@ -266,7 +264,7 @@ fn test_long_filename_operations() -> bool {
             }
         }
         Err(e) => {
-            log(&format!("  - FAILED to list directory: {}\n", e));
+            log(&format!("  - FAILED to list directory: {e}\n"));
             return false;
         }
     }
@@ -287,7 +285,7 @@ fn test_subdirectory_operations() -> bool {
     if !fs::exists("/tmp") {
         log("  - Creating /tmp directory\n");
         if let Err(e) = fs::create_dir("/tmp") {
-            log(&format!("  - FAILED to create /tmp: {}\n", e));
+            log(&format!("  - FAILED to create /tmp: {e}\n"));
             return false;
         }
     }
@@ -306,7 +304,7 @@ fn test_subdirectory_operations() -> bool {
             ));
         }
         Err(e) => {
-            log(&format!("    FAILED to create file: {}\n", e));
+            log(&format!("    FAILED to create file: {e}\n"));
             return false;
         }
     }
@@ -322,7 +320,7 @@ fn test_subdirectory_operations() -> bool {
             log("    Content verified\n");
         }
         Err(e) => {
-            log(&format!("    FAILED to read file: {}\n", e));
+            log(&format!("    FAILED to read file: {e}\n"));
             return false;
         }
     }
@@ -341,7 +339,7 @@ fn test_subdirectory_operations() -> bool {
             log(&format!("    Found {} entries in /tmp\n", entries.len()));
         }
         Err(e) => {
-            log(&format!("    FAILED to list directory: {}\n", e));
+            log(&format!("    FAILED to list directory: {e}\n"));
             return false;
         }
     }
@@ -353,7 +351,7 @@ fn test_subdirectory_operations() -> bool {
             log("    File deleted\n");
         }
         Err(e) => {
-            log(&format!("    FAILED to delete file: {}\n", e));
+            log(&format!("    FAILED to delete file: {e}\n"));
             return false;
         }
     }
@@ -378,12 +376,11 @@ fn test_subdirectory_operations() -> bool {
 fn test_rename_operations() -> bool {
     log("[FS Tests] Test: rename_operations\n");
 
-    if !fs::exists("/tmp") {
-        if let Err(e) = fs::create_dir("/tmp") {
-            log(&format!("  - FAILED to create /tmp: {}\n", e));
+    if !fs::exists("/tmp")
+        && let Err(e) = fs::create_dir("/tmp") {
+            log(&format!("  - FAILED to create /tmp: {e}\n"));
             return false;
         }
-    }
 
     let src = "/tmp/rename_src.txt";
     let dst = "/tmp/rename_dst.txt";
@@ -391,14 +388,14 @@ fn test_rename_operations() -> bool {
     // Step 1: Create source file
     log("  - Step 1: Create source file\n");
     if let Err(e) = fs::write_file(src, b"rename test data") {
-        log(&format!("    FAILED to create source: {}\n", e));
+        log(&format!("    FAILED to create source: {e}\n"));
         return false;
     }
 
     // Step 2: Rename src -> dst
     log("  - Step 2: Rename source to destination\n");
     if let Err(e) = fs::rename(src, dst) {
-        log(&format!("    FAILED to rename: {}\n", e));
+        log(&format!("    FAILED to rename: {e}\n"));
         let _ = fs::remove_file(src);
         return false;
     }
@@ -420,7 +417,7 @@ fn test_rename_operations() -> bool {
             }
         }
         Err(e) => {
-            log(&format!("    FAILED to read destination: {}\n", e));
+            log(&format!("    FAILED to read destination: {e}\n"));
             let _ = fs::remove_file(dst);
             return false;
         }
@@ -430,7 +427,7 @@ fn test_rename_operations() -> bool {
     log("  - Step 4: Test rename-noreplace (exists check)\n");
     let src2 = "/tmp/rename_src2.txt";
     if let Err(e) = fs::write_file(src2, b"should not overwrite") {
-        log(&format!("    FAILED to create second source: {}\n", e));
+        log(&format!("    FAILED to create second source: {e}\n"));
         let _ = fs::remove_file(dst);
         return false;
     }
@@ -456,7 +453,7 @@ fn test_rename_operations() -> bool {
             }
         }
         Err(e) => {
-            log(&format!("    FAILED to read destination: {}\n", e));
+            log(&format!("    FAILED to read destination: {e}\n"));
             let _ = fs::remove_file(src2);
             let _ = fs::remove_file(dst);
             return false;

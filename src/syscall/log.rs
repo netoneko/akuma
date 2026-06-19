@@ -2,6 +2,7 @@ use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use alloc::format;
+use core::fmt::Write as _;
 use spinning_top::Spinlock;
 
 struct SyscallEntry {
@@ -19,7 +20,7 @@ struct ProcessSyscallLog {
 static SYSCALL_LOG: Spinlock<BTreeMap<u32, ProcessSyscallLog>> =
     Spinlock::new(BTreeMap::new());
 
-pub(crate) fn record(pid: u32, nr: u64, timestamp_us: u64, duration_us: u64, result: u64) {
+pub fn record(pid: u32, nr: u64, timestamp_us: u64, duration_us: u64, result: u64) {
     crate::irq::with_irqs_disabled(|| {
         let mut log = SYSCALL_LOG.lock();
         let entry = log.entry(pid).or_insert_with(|| ProcessSyscallLog {
@@ -33,7 +34,7 @@ pub(crate) fn record(pid: u32, nr: u64, timestamp_us: u64, duration_us: u64, res
     });
 }
 
-pub(crate) fn mark_exited(pid: u32) {
+pub fn mark_exited(pid: u32) {
     let now = crate::timer::uptime_us();
     crate::irq::with_irqs_disabled(|| {
         let mut log = SYSCALL_LOG.lock();
@@ -43,7 +44,7 @@ pub(crate) fn mark_exited(pid: u32) {
     });
 }
 
-pub(crate) fn get_formatted(pid: u32) -> Option<Vec<u8>> {
+pub fn get_formatted(pid: u32) -> Option<Vec<u8>> {
     let now = crate::timer::uptime_us();
     let retain_us = crate::config::PROC_SYSCALL_LOG_RETAIN_MS * 1_000;
 
@@ -62,24 +63,23 @@ pub(crate) fn get_formatted(pid: u32) -> Option<Vec<u8>> {
         let entry = log.get(&pid)?;
 
         // Check if expired
-        if let Some(exited_at) = entry.exited_at_us {
-            if now.saturating_sub(exited_at) >= retain_us {
+        if let Some(exited_at) = entry.exited_at_us
+            && now.saturating_sub(exited_at) >= retain_us {
                 return None;
             }
-        }
 
-        let mut out = format!("# pid={}\n# TIMESTAMP_US       NR  DUR_US  RESULT\n", pid);
+        let mut out = format!("# pid={pid}\n# TIMESTAMP_US       NR  DUR_US  RESULT\n");
         for e in &entry.entries {
-            out.push_str(&format!(
-                "  {:19}  {:3}  {:6}  {:6}\n",
+            let _ = writeln!(out,
+                "  {:19}  {:3}  {:6}  {:6}",
                 e.timestamp_us, e.nr, e.duration_us, e.result
-            ));
+            );
         }
         Some(out.into_bytes())
     })
 }
 
-pub(crate) fn list_pids_with_logs() -> Vec<u32> {
+pub fn list_pids_with_logs() -> Vec<u32> {
     let now = crate::timer::uptime_us();
     let retain_us = crate::config::PROC_SYSCALL_LOG_RETAIN_MS * 1_000;
 

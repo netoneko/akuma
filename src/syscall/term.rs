@@ -30,7 +30,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         FIONBIO => {
             if !validate_user_ptr(arg, 4) { return EFAULT; }
             let mut val: i32 = 0;
-            if unsafe { copy_from_user_safe(&mut val as *mut i32 as *mut u8, arg as *const u8, 4).is_err() } {
+            if unsafe { copy_from_user_safe((&raw mut val).cast::<u8>(), arg as *const u8, 4).is_err() } {
                 return EFAULT;
             }
             if val != 0 { proc.set_nonblock(fd); } else { proc.clear_nonblock(fd); }
@@ -67,7 +67,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 Some(akuma_exec::process::FileDescriptor::PipeWrite(_)) => 0,
                 _ => 0,
             };
-            if unsafe { copy_to_user_safe(arg as *mut u8, &count as *const i32 as *const u8, 4).is_err() } {
+            if unsafe { copy_to_user_safe(arg as *mut u8, (&raw const count).cast::<u8>(), 4).is_err() } {
                 return EFAULT;
             }
             return 0;
@@ -88,7 +88,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             }
             if !validate_user_ptr(arg, 4) { return EFAULT; }
             let mut val: i32 = 0;
-            if unsafe { copy_from_user_safe(&mut val as *mut i32 as *mut u8, arg as *const u8, 4).is_err() } {
+            if unsafe { copy_from_user_safe((&raw mut val).cast::<u8>(), arg as *const u8, 4).is_err() } {
                 return EFAULT;
             }
             let res = match cmd {
@@ -101,7 +101,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 return EINVAL;
             }
             // Echo the accepted value back (OSS contract).
-            if unsafe { copy_to_user_safe(arg as *mut u8, &val as *const i32 as *const u8, 4).is_err() } {
+            if unsafe { copy_to_user_safe(arg as *mut u8, (&raw const val).cast::<u8>(), 4).is_err() } {
                 return EFAULT;
             }
             return 0;
@@ -127,9 +127,9 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             kernel_buf[2] = ts.cflag;
             kernel_buf[3] = ts.lflag;
             unsafe {
-                core::ptr::copy_nonoverlapping(ts.cc.as_ptr(), kernel_buf[4..].as_mut_ptr() as *mut u8, 20);
+                core::ptr::copy_nonoverlapping(ts.cc.as_ptr(), kernel_buf[4..].as_mut_ptr().cast::<u8>(), 20);
             }
-            if unsafe { copy_to_user_safe(arg as *mut u8, kernel_buf.as_ptr() as *const u8, 36).is_err() } {
+            if unsafe { copy_to_user_safe(arg as *mut u8, kernel_buf.as_ptr().cast::<u8>(), 36).is_err() } {
                 return EFAULT;
             }
             0
@@ -141,7 +141,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 None => return (-(12i64)) as u64,
             };
             let mut kernel_buf = [0u32; 9];
-            if unsafe { copy_from_user_safe(kernel_buf.as_mut_ptr() as *mut u8, arg as *const u8, 36).is_err() } {
+            if unsafe { copy_from_user_safe(kernel_buf.as_mut_ptr().cast::<u8>(), arg as *const u8, 36).is_err() } {
                 return EFAULT;
             }
             let mut ts = term_state_lock.lock();
@@ -156,7 +156,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             }
             
             unsafe {
-                core::ptr::copy_nonoverlapping(kernel_buf[4..].as_ptr() as *const u8, ts.cc.as_mut_ptr(), 20);
+                core::ptr::copy_nonoverlapping(kernel_buf[4..].as_ptr().cast::<u8>(), ts.cc.as_mut_ptr(), 20);
             }
 
             if let Some(ch) = akuma_exec::process::current_channel() {
@@ -175,7 +175,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             };
             let ts = term_state_lock.lock();
             let kernel_winsz = [ts.term_height, ts.term_width, 0, 0];
-            if unsafe { copy_to_user_safe(arg as *mut u8, kernel_winsz.as_ptr() as *const u8, 8).is_err() } {
+            if unsafe { copy_to_user_safe(arg as *mut u8, kernel_winsz.as_ptr().cast::<u8>(), 8).is_err() } {
                 return EFAULT;
             }
             0
@@ -191,7 +191,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                 crate::safe_print!(128, "[syscall] TIOCGPGRP: returning foreground_pgid {}\n", pgid);
             }
-            if unsafe { copy_to_user_safe(arg as *mut u8, &pgid as *const u32 as *const u8, 4).is_err() } {
+            if unsafe { copy_to_user_safe(arg as *mut u8, (&raw const pgid).cast::<u8>(), 4).is_err() } {
                 return EFAULT;
             }
             0
@@ -203,7 +203,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 None => return (-(12i64)) as u64,
             };
             let mut pgid: u32 = 0;
-            if unsafe { copy_from_user_safe(&mut pgid as *mut u32 as *mut u8, arg as *const u8, 4).is_err() } {
+            if unsafe { copy_from_user_safe((&raw mut pgid).cast::<u8>(), arg as *const u8, 4).is_err() } {
                 return EFAULT;
             }
             let mut ts = term_state_lock.lock();
@@ -225,7 +225,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
 fn write_to_process_channel(data: &[u8]) -> u64 {
     let proc_channel = match akuma_exec::process::current_channel() {
         Some(channel) => channel,
-        None => return (-libc_errno::ENOMEM as i64) as u64,
+        None => return i64::from(-libc_errno::ENOMEM) as u64,
     };
     proc_channel.write(data);
     data.len() as u64
@@ -234,7 +234,7 @@ fn write_to_process_channel(data: &[u8]) -> u64 {
 pub(super) fn sys_set_terminal_attributes(_fd: u64, action: u64, mode_flags_arg: u64) -> u64 {
     let term_state_lock = match akuma_exec::process::current_terminal_state() {
         Some(state) => state,
-        None => return (-libc_errno::ENOMEM as i64) as u64,
+        None => return i64::from(-libc_errno::ENOMEM) as u64,
     };
 
     let mut term_state = term_state_lock.lock();
@@ -248,7 +248,7 @@ pub(super) fn sys_set_terminal_attributes(_fd: u64, action: u64, mode_flags_arg:
 
     let proc_channel = match akuma_exec::process::current_channel() {
         Some(channel) => channel,
-        None => return (-libc_errno::ENOMEM as i64) as u64,
+        None => return i64::from(-libc_errno::ENOMEM) as u64,
     };
     proc_channel.set_raw_mode(!term_state.is_canonical());
 
@@ -261,18 +261,18 @@ pub(super) fn sys_set_terminal_attributes(_fd: u64, action: u64, mode_flags_arg:
 
 pub(super) fn sys_get_terminal_attributes(_fd: u64, attr_ptr: u64) -> u64 {
     if attr_ptr == 0 {
-        return (-libc_errno::EINVAL as i64) as u64;
+        return i64::from(-libc_errno::EINVAL) as u64;
     }
     if !validate_user_ptr(attr_ptr, 8) { return EFAULT; }
 
     let term_state_lock = match akuma_exec::process::current_terminal_state() {
         Some(state) => state,
-        None => return (-libc_errno::ENOMEM as i64) as u64,
+        None => return i64::from(-libc_errno::ENOMEM) as u64,
     };
 
     let term_state = term_state_lock.lock();
     let val = term_state.mode_flags;
-    if unsafe { copy_to_user_safe(attr_ptr as *mut u8, &val as *const u64 as *const u8, 8).is_err() } {
+    if unsafe { copy_to_user_safe(attr_ptr as *mut u8, (&raw const val).cast::<u8>(), 8).is_err() } {
         return EFAULT;
     }
 
@@ -285,7 +285,7 @@ pub(super) fn sys_set_cursor_position(col: u64, row: u64) -> u64 {
     }
     let row_1 = row + 1;
     let col_1 = col + 1;
-    let sequence = format!("\x1b[{};{}H", row_1, col_1);
+    let sequence = format!("\x1b[{row_1};{col_1}H");
     write_to_process_channel(sequence.as_bytes())
 }
 
@@ -312,21 +312,19 @@ pub(super) fn sys_clear_screen() -> u64 {
 
 pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64) -> u64 {
     if buf_ptr == 0 || buf_len == 0 {
-        return (-libc_errno::EINVAL as i64) as u64;
+        return i64::from(-libc_errno::EINVAL) as u64;
     }
     if !validate_user_ptr(buf_ptr, buf_len) { return EFAULT; }
 
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED && timeout_us > 0 && timeout_us != u64::MAX {
-    }
 
     let proc_channel = match akuma_exec::process::current_channel() {
         Some(channel) => channel,
-        None => return (-libc_errno::ENOMEM as i64) as u64,
+        None => return i64::from(-libc_errno::ENOMEM) as u64,
     };
 
     let term_state_lock = match akuma_exec::process::current_terminal_state() {
         Some(state) => state,
-        None => return (-libc_errno::EBADF as i64) as u64,
+        None => return i64::from(-libc_errno::EBADF) as u64,
     };
 
     let mut kernel_buf = alloc::vec![0u8; buf_len];
@@ -357,7 +355,7 @@ pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64
             }
 
             if akuma_exec::process::is_current_interrupted() {
-                return (-libc_errno::EINTR as i64) as u64;
+                return i64::from(-libc_errno::EINTR) as u64;
             }
 
             if crate::timer::uptime_us() >= deadline {
@@ -416,7 +414,7 @@ pub(super) fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
             for b in &mut stat.name { *b = 0; }
         }
 
-        if unsafe { copy_to_user_safe((ptr as usize + i * stat_size) as *mut u8, &stat as *const ThreadCpuStat as *const u8, stat_size).is_err() } {
+        if unsafe { copy_to_user_safe((ptr as usize + i * stat_size) as *mut u8, (&raw const stat).cast::<u8>(), stat_size).is_err() } {
             return EFAULT;
         }
     }

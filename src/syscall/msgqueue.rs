@@ -47,7 +47,7 @@ fn current_box_id() -> u64 {
     akuma_exec::process::current_process().map_or(0, |p| p.box_id)
 }
 
-pub(crate) fn sys_msgget(key: i32, flags: i32) -> u64 {
+pub fn sys_msgget(key: i32, flags: i32) -> u64 {
     let box_id = current_box_id();
     crate::irq::with_irqs_disabled(|| {
         let mut table = MSGQUEUE_TABLE.lock();
@@ -56,7 +56,7 @@ pub(crate) fn sys_msgget(key: i32, flags: i32) -> u64 {
             let mode = (flags & 0o777) as u32;
             table.insert((box_id, msqid), MsgQueue { key, mode, cbytes: 0, messages: VecDeque::new(), recv_pollers: BTreeSet::new(), send_pollers: BTreeSet::new() });
             crate::tprint!(96, "[msgget] box={} IPC_PRIVATE -> msqid={}\n", box_id, msqid);
-            msqid as u64
+            u64::from(msqid)
         } else {
             let found = table.iter()
                 .find(|((bid, _), q)| *bid == box_id && q.key == key)
@@ -66,13 +66,13 @@ pub(crate) fn sys_msgget(key: i32, flags: i32) -> u64 {
                     return EEXIST;
                 }
                 crate::tprint!(96, "[msgget] box={} key={} found msqid={}\n", box_id, key, msqid);
-                msqid as u64
+                u64::from(msqid)
             } else if flags & IPC_CREAT != 0 {
                 let msqid = NEXT_MSQID.fetch_add(1, Ordering::SeqCst);
                 let mode = (flags & 0o777) as u32;
                 table.insert((box_id, msqid), MsgQueue { key, mode, cbytes: 0, messages: VecDeque::new(), recv_pollers: BTreeSet::new(), send_pollers: BTreeSet::new() });
                 crate::tprint!(96, "[msgget] box={} IPC_CREAT key={} -> msqid={}\n", box_id, key, msqid);
-                msqid as u64
+                u64::from(msqid)
             } else {
                 ENOENT
             }
@@ -80,7 +80,7 @@ pub(crate) fn sys_msgget(key: i32, flags: i32) -> u64 {
     })
 }
 
-pub(crate) fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
+pub fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
     let box_id = current_box_id();
     match cmd {
         IPC_RMID => {
@@ -139,7 +139,7 @@ pub(crate) fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
             if unsafe { copy_from_user_safe(ds.as_mut_ptr(), buf as *const u8, 112).is_err() } {
                 return EFAULT;
             }
-            let mode = u16::from_ne_bytes([ds[20], ds[21]]) as u32;
+            let mode = u32::from(u16::from_ne_bytes([ds[20], ds[21]]));
             crate::irq::with_irqs_disabled(|| {
                 let mut table = MSGQUEUE_TABLE.lock();
                 if let Some(q) = table.get_mut(&(box_id, msqid)) {
@@ -154,7 +154,7 @@ pub(crate) fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
     }
 }
 
-pub(crate) fn sys_msgsnd(msqid: u32, msgp: u64, msgsz: usize, flags: i32) -> u64 {
+pub fn sys_msgsnd(msqid: u32, msgp: u64, msgsz: usize, flags: i32) -> u64 {
     let box_id = current_box_id();
     if msgsz > MSGMAX {
         return EINVAL;
@@ -197,22 +197,18 @@ pub(crate) fn sys_msgsnd(msqid: u32, msgp: u64, msgsz: usize, flags: i32) -> u64
             q.recv_pollers.clear();
             (Some(0u64), recv_tids)
         });
-        match result {
-            (Some(r), tids) => {
-                for wake_tid in tids {
-                    akuma_exec::threading::get_waker_for_thread(wake_tid).wake();
-                }
-                return r;
+        if let (Some(r), tids) = result {
+            for wake_tid in tids {
+                akuma_exec::threading::get_waker_for_thread(wake_tid).wake();
             }
-            (None, _) => {
-                let deadline = crate::timer::uptime_us() + 10_000;
-                akuma_exec::threading::schedule_blocking(deadline);
-            }
+            return r;
         }
+        let deadline = crate::timer::uptime_us() + 10_000;
+        akuma_exec::threading::schedule_blocking(deadline);
     }
 }
 
-pub(crate) fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags: i32) -> u64 {
+pub fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags: i32) -> u64 {
     let box_id = current_box_id();
     let tid = akuma_exec::threading::current_thread_id();
     if !validate_user_ptr(msgp, 8 + msgsz) {
@@ -226,33 +222,33 @@ pub(crate) fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags
                 None => return (Some(EINVAL), alloc::vec::Vec::new()),
             };
             // find matching message index
-            let idx = if msgtyp == 0 {
-                if q.messages.is_empty() { None } else { Some(0) }
-            } else if msgtyp > 0 {
-                q.messages.iter().position(|m| m.mtype == msgtyp)
-            } else {
-                // first message with lowest mtype <= |msgtyp|
-                let abs_typ = (-msgtyp) as i64;
-                let mut best: Option<(usize, i64)> = None;
-                for (i, m) in q.messages.iter().enumerate() {
-                    if m.mtype <= abs_typ {
-                        if best.is_none() || m.mtype < best.unwrap().1 {
-                            best = Some((i, m.mtype));
-                        }
-                    }
+            let idx = match msgtyp.cmp(&0) {
+                core::cmp::Ordering::Equal => {
+                    if q.messages.is_empty() { None } else { Some(0) }
                 }
-                best.map(|(i, _)| i)
+                core::cmp::Ordering::Greater => {
+                    q.messages.iter().position(|m| m.mtype == msgtyp)
+                }
+                core::cmp::Ordering::Less => {
+                    // first message with lowest mtype <= |msgtyp|
+                    let abs_typ = -msgtyp;
+                    let mut best: Option<(usize, i64)> = None;
+                    for (i, m) in q.messages.iter().enumerate() {
+                        if m.mtype <= abs_typ
+                            && (best.is_none() || m.mtype < best.unwrap().1) {
+                                best = Some((i, m.mtype));
+                            }
+                    }
+                    best.map(|(i, _)| i)
+                }
             };
-            let idx = match idx {
-                Some(i) => i,
-                None => {
-                    if flags & IPC_NOWAIT != 0 {
-                        return (Some(ENOMSG), alloc::vec::Vec::new());
-                    }
-                    // Atomically register as poller before releasing lock (TOCTOU prevention)
-                    q.recv_pollers.insert(tid);
-                    return (None, alloc::vec::Vec::new()); // retry
+            let idx = if let Some(i) = idx { i } else {
+                if flags & IPC_NOWAIT != 0 {
+                    return (Some(ENOMSG), alloc::vec::Vec::new());
                 }
+                // Atomically register as poller before releasing lock (TOCTOU prevention)
+                q.recv_pollers.insert(tid);
+                return (None, alloc::vec::Vec::new()); // retry
             };
             let msg = q.messages.remove(idx).unwrap();
             let actual_len = msg.data.len();
@@ -293,24 +289,20 @@ pub(crate) fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags
             q.send_pollers.clear();
             (Some(actual_len as u64), send_tids)
         });
-        match result {
-            (Some(r), tids) => {
-                for wake_tid in tids {
-                    akuma_exec::threading::get_waker_for_thread(wake_tid).wake();
-                }
-                return r;
+        if let (Some(r), tids) = result {
+            for wake_tid in tids {
+                akuma_exec::threading::get_waker_for_thread(wake_tid).wake();
             }
-            (None, _) => {
-                let deadline = crate::timer::uptime_us() + 10_000;
-                akuma_exec::threading::schedule_blocking(deadline);
-            }
+            return r;
         }
+        let deadline = crate::timer::uptime_us() + 10_000;
+        akuma_exec::threading::schedule_blocking(deadline);
     }
 }
 
 /// Register a thread as interested in receiving from this queue (for epoll/poll).
 #[allow(dead_code)]
-pub(crate) fn msgqueue_add_recv_poller(box_id: u64, msqid: u32, tid: usize) {
+pub fn msgqueue_add_recv_poller(box_id: u64, msqid: u32, tid: usize) {
     crate::irq::with_irqs_disabled(|| {
         let mut table = MSGQUEUE_TABLE.lock();
         if let Some(q) = table.get_mut(&(box_id, msqid)) {
@@ -321,7 +313,7 @@ pub(crate) fn msgqueue_add_recv_poller(box_id: u64, msqid: u32, tid: usize) {
 
 /// Register a thread as interested in sending to this queue (for epoll/poll).
 #[allow(dead_code)]
-pub(crate) fn msgqueue_add_send_poller(box_id: u64, msqid: u32, tid: usize) {
+pub fn msgqueue_add_send_poller(box_id: u64, msqid: u32, tid: usize) {
     crate::irq::with_irqs_disabled(|| {
         let mut table = MSGQUEUE_TABLE.lock();
         if let Some(q) = table.get_mut(&(box_id, msqid)) {
@@ -330,7 +322,7 @@ pub(crate) fn msgqueue_add_send_poller(box_id: u64, msqid: u32, tid: usize) {
     });
 }
 
-pub(crate) struct MsgQueueSnapshot {
+pub struct MsgQueueSnapshot {
     pub box_id: u64,
     pub key: i32,
     pub msqid: u32,
@@ -339,7 +331,7 @@ pub(crate) struct MsgQueueSnapshot {
     pub qnum: usize,
 }
 
-pub(crate) fn list_msg_queues() -> Vec<MsgQueueSnapshot> {
+pub fn list_msg_queues() -> Vec<MsgQueueSnapshot> {
     crate::irq::with_irqs_disabled(|| {
         MSGQUEUE_TABLE.lock().iter()
             .map(|((box_id, msqid), q)| MsgQueueSnapshot {
@@ -360,7 +352,7 @@ pub(crate) fn list_msg_queues() -> Vec<MsgQueueSnapshot> {
 
 /// Test helper: return the number of recv pollers registered on a queue.
 #[allow(dead_code)]
-pub(crate) fn msgqueue_recv_pollers_count(box_id: u64, msqid: u32) -> usize {
+pub fn msgqueue_recv_pollers_count(box_id: u64, msqid: u32) -> usize {
     crate::irq::with_irqs_disabled(|| {
         MSGQUEUE_TABLE.lock().get(&(box_id, msqid)).map_or(0, |q| q.recv_pollers.len())
     })
@@ -368,7 +360,7 @@ pub(crate) fn msgqueue_recv_pollers_count(box_id: u64, msqid: u32) -> usize {
 
 /// Test helper: return the number of send pollers registered on a queue.
 #[allow(dead_code)]
-pub(crate) fn msgqueue_send_pollers_count(box_id: u64, msqid: u32) -> usize {
+pub fn msgqueue_send_pollers_count(box_id: u64, msqid: u32) -> usize {
     crate::irq::with_irqs_disabled(|| {
         MSGQUEUE_TABLE.lock().get(&(box_id, msqid)).map_or(0, |q| q.send_pollers.len())
     })
@@ -376,15 +368,15 @@ pub(crate) fn msgqueue_send_pollers_count(box_id: u64, msqid: u32) -> usize {
 
 /// Test helper: check if a specific tid is registered as a recv poller.
 #[allow(dead_code)]
-pub(crate) fn msgqueue_is_recv_poller(box_id: u64, msqid: u32, tid: usize) -> bool {
+pub fn msgqueue_is_recv_poller(box_id: u64, msqid: u32, tid: usize) -> bool {
     crate::irq::with_irqs_disabled(|| {
-        MSGQUEUE_TABLE.lock().get(&(box_id, msqid)).map_or(false, |q| q.recv_pollers.contains(&tid))
+        MSGQUEUE_TABLE.lock().get(&(box_id, msqid)).is_some_and(|q| q.recv_pollers.contains(&tid))
     })
 }
 
 /// Test helper: directly push a message into a queue (bypasses userspace pointer validation).
 #[allow(dead_code)]
-pub(crate) fn msgqueue_push_direct(box_id: u64, msqid: u32, mtype: i64, data: &[u8]) -> bool {
+pub fn msgqueue_push_direct(box_id: u64, msqid: u32, mtype: i64, data: &[u8]) -> bool {
     crate::irq::with_irqs_disabled(|| {
         let mut table = MSGQUEUE_TABLE.lock();
         if let Some(q) = table.get_mut(&(box_id, msqid)) {
@@ -407,7 +399,7 @@ pub(crate) fn msgqueue_push_direct(box_id: u64, msqid: u32, mtype: i64, data: &[
 
 /// Test helper: pop a message from a queue (bypasses userspace pointer validation).
 #[allow(dead_code)]
-pub(crate) fn msgqueue_pop_direct(box_id: u64, msqid: u32) -> Option<(i64, alloc::vec::Vec<u8>)> {
+pub fn msgqueue_pop_direct(box_id: u64, msqid: u32) -> Option<(i64, alloc::vec::Vec<u8>)> {
     crate::irq::with_irqs_disabled(|| {
         let mut table = MSGQUEUE_TABLE.lock();
         if let Some(q) = table.get_mut(&(box_id, msqid)) {
@@ -432,7 +424,7 @@ pub(crate) fn msgqueue_pop_direct(box_id: u64, msqid: u32) -> Option<(i64, alloc
 
 /// Test helper: return the number of messages in the queue.
 #[allow(dead_code)]
-pub(crate) fn msgqueue_message_count(box_id: u64, msqid: u32) -> usize {
+pub fn msgqueue_message_count(box_id: u64, msqid: u32) -> usize {
     crate::irq::with_irqs_disabled(|| {
         MSGQUEUE_TABLE.lock().get(&(box_id, msqid)).map_or(0, |q| q.messages.len())
     })
@@ -440,7 +432,7 @@ pub(crate) fn msgqueue_message_count(box_id: u64, msqid: u32) -> usize {
 
 /// Called from sys_kill_box to remove all queues belonging to a box.
 #[allow(dead_code)]
-pub(crate) fn cleanup_box_queues(box_id: u64) {
+pub fn cleanup_box_queues(box_id: u64) {
     crate::irq::with_irqs_disabled(|| {
         let mut table = MSGQUEUE_TABLE.lock();
         table.retain(|(bid, _), _| *bid != box_id);

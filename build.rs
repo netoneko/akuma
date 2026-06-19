@@ -36,5 +36,5 @@ fn main() {
     //                 floor). config::KERNEL_STACK_SIZE is NOT used for the boot
     //                 stack bounds (main.rs derives them from STACK_TOP/BOTTOM).
     let boot_stack_size: usize = if extreme_profile { 32 * 1024 } else { 1024 * 1024 };
-    println!("cargo:rustc-link-arg=--defsym=BOOT_STACK_SIZE={}", boot_stack_size);
+    println!("cargo:rustc-link-arg=--defsym=BOOT_STACK_SIZE={boot_stack_size}");
 }

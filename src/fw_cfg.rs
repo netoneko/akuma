@@ -91,7 +91,7 @@ pub fn find_file(name: &str) -> Option<(u16, u32)> {
             crate::console::print("[fw_cfg] Found '");
             crate::console::print(entry_name);
             crate::console::print("' selector=0x");
-            crate::console::print_hex(sel as u64);
+            crate::console::print_hex(u64::from(sel));
             crate::console::print(" size=");
             crate::console::print_dec(size as usize);
             crate::console::print("\n");
@@ -115,7 +115,7 @@ pub fn find_file(name: &str) -> Option<(u16, u32)> {
 pub unsafe fn write_entry(selector: u16, data: &[u8]) {
     // Build DMA descriptor (all fields big-endian)
     let dma = FWCfgDmaAccess {
-        control: ((selector as u32) << 16
+        control: (u32::from(selector) << 16
             | FW_CFG_DMA_CTL_SELECT
             | FW_CFG_DMA_CTL_WRITE)
             .to_be(),

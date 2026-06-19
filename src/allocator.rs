@@ -67,7 +67,7 @@ impl talc::OomHandler for PmmOomHandler {
         // (`[HEAP-GROW] this_req=262144 claimed=64 pages`, used stuck at 1 MB).
         // Claim `HEAP_GROW_HEADROOM_PAGES` extra so the allocation fits and the
         // freed span is reusable for the next same-size request.
-        let pages_for_layout = (layout.size() + PAGE_SIZE - 1) / PAGE_SIZE;
+        let pages_for_layout = layout.size().div_ceil(PAGE_SIZE);
         let needed = pages_for_layout + HEAP_GROW_HEADROOM_PAGES;
         let mut n = heap_grow_initial_pages(needed, crate::pmm::free_count());
 
@@ -92,39 +92,36 @@ impl talc::OomHandler for PmmOomHandler {
         // reclaim is a no-op. No deadlock, no benefit; just don't rely on it here.
         loop {
             if let Some(frame) = crate::pmm::alloc_pages_contiguous_zeroed(n) {
-                let ptr = akuma_exec::mmu::phys_to_virt(frame.addr) as *mut u8;
+                let ptr = akuma_exec::mmu::phys_to_virt(frame.addr).cast::<u8>();
                 let span = Span::from_base_size(ptr, n * PAGE_SIZE);
-                return match unsafe { talc.claim(span) } {
-                    Ok(_heap) => {
-                        // Record the PMM-backed span so `reclaim_to_pmm()` can
-                        // return it later once it is fully free. If the registry
-                        // is full the span is still used as heap — it just
-                        // becomes non-reclaimable (the pre-reclaim one-way
-                        // behaviour).
-                        register_claimed_span(frame.addr, n);
-                        let prev = HEAP_SIZE.fetch_add(n * PAGE_SIZE, Ordering::Relaxed);
-                        let now = prev + n * PAGE_SIZE;
-                        // Leak-debug: log the request driving growth each time the
-                        // heap crosses a 256 MB boundary, so a runaway grow is
-                        // attributable to a specific allocation size. safe_print
-                        // is alloc-free (used by the alloc error handler too).
-                        const STEP: usize = 256 * 1024 * 1024;
-                        if prev / STEP != now / STEP {
-                            crate::safe_print!(160,
-                                "[HEAP-GROW] total={}MB used={}MB this_req={} bytes claimed={} pages\n",
-                                now / 1024 / 1024,
-                                ALLOCATED_BYTES.load(Ordering::Relaxed) / 1024 / 1024,
-                                layout.size(), n);
-                        }
-                        Ok(())
+                return if let Ok(_heap) = unsafe { talc.claim(span) } {
+                    // Record the PMM-backed span so `reclaim_to_pmm()` can
+                    // return it later once it is fully free. If the registry
+                    // is full the span is still used as heap — it just
+                    // becomes non-reclaimable (the pre-reclaim one-way
+                    // behaviour).
+                    register_claimed_span(frame.addr, n);
+                    let prev = HEAP_SIZE.fetch_add(n * PAGE_SIZE, Ordering::Relaxed);
+                    let now = prev + n * PAGE_SIZE;
+                    // Leak-debug: log the request driving growth each time the
+                    // heap crosses a 256 MB boundary, so a runaway grow is
+                    // attributable to a specific allocation size. safe_print
+                    // is alloc-free (used by the alloc error handler too).
+                    const STEP: usize = 256 * 1024 * 1024;
+                    if prev / STEP != now / STEP {
+                        crate::safe_print!(160,
+                            "[HEAP-GROW] total={}MB used={}MB this_req={} bytes claimed={} pages\n",
+                            now / 1024 / 1024,
+                            ALLOCATED_BYTES.load(Ordering::Relaxed) / 1024 / 1024,
+                            layout.size(), n);
                     }
-                    Err(()) => {
-                        // Couldn't establish a heap in the pages — return them to
-                        // PMM rather than leaking (old code dropped them).
-                        crate::pmm::free_pages_contiguous(
-                            akuma_exec::PhysFrame::new(frame.addr), n);
-                        Err(())
-                    }
+                    Ok(())
+                } else {
+                    // Couldn't establish a heap in the pages — return them to
+                    // PMM rather than leaking (old code dropped them).
+                    crate::pmm::free_pages_contiguous(
+                        akuma_exec::PhysFrame::new(frame.addr), n);
+                    Err(())
                 };
             }
             match heap_grow_backoff(n, needed) {
@@ -224,7 +221,7 @@ impl ClaimedSpan {
         Self { pmm_addr: 0, pages: 0 }
     }
     fn heap_span(&self) -> Span {
-        let base = akuma_exec::mmu::phys_to_virt(self.pmm_addr) as *mut u8;
+        let base = akuma_exec::mmu::phys_to_virt(self.pmm_addr).cast::<u8>();
         Span::from_base_size(base, self.pages * PAGE_SIZE)
     }
 }
@@ -591,7 +588,7 @@ pub fn init(heap_start: usize, heap_size: usize) -> Result<(), &'static str> {
         let span = Span::from_base_size(heap_ptr, heap_size);
         TALC.lock()
             .claim(span)
-            .map_err(|_| "Failed to claim heap memory")?;
+            .map_err(|()| "Failed to claim heap memory")?;
     }
 
     Ok(())
@@ -650,7 +647,7 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
         let result = TALC
             .lock()
             .malloc(actual_layout)
-            .map(|ptr| ptr.as_ptr())
+            .map(core::ptr::NonNull::as_ptr)
             .unwrap_or(ptr::null_mut());
 
         if result.is_null() {
@@ -673,14 +670,14 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
         // Set up canaries and calculate user pointer
         let user_ptr = if ENABLE_ALLOCATION_REGISTRY && ENABLE_CANARIES {
             // Write canary before
-            let canary_before_ptr = result as *mut u64;
+            let canary_before_ptr = result.cast::<u64>();
             core::ptr::write_volatile(canary_before_ptr, CANARY_BEFORE);
 
             // Calculate user pointer (after the before-canary)
             let user = result.add(CANARY_SIZE);
 
             // Write canary after
-            let canary_after_ptr = user.add(user_size) as *mut u64;
+            let canary_after_ptr = user.add(user_size).cast::<u64>();
             core::ptr::write_volatile(canary_after_ptr, CANARY_AFTER);
 
             user
@@ -787,7 +784,7 @@ unsafe fn talc_dealloc(ptr: *mut u8, layout: Layout) { unsafe {
         TALC.lock()
             .free(core::ptr::NonNull::new_unchecked(actual_ptr), actual_layout);
         ALLOCATED_BYTES.fetch_sub(user_size, Ordering::Relaxed);
-    })
+    });
 }}
 
 unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -857,7 +854,7 @@ unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
             let new_actual_ptr = TALC
                 .lock()
                 .malloc(new_actual_layout)
-                .map(|p| p.as_ptr())
+                .map(core::ptr::NonNull::as_ptr)
                 .unwrap_or(ptr::null_mut());
             
             if new_actual_ptr.is_null() {
@@ -866,9 +863,9 @@ unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
 
             // Set up canaries and get user pointer
             let new_user_ptr = if ENABLE_ALLOCATION_REGISTRY && ENABLE_CANARIES {
-                core::ptr::write_volatile(new_actual_ptr as *mut u64, CANARY_BEFORE);
+                core::ptr::write_volatile(new_actual_ptr.cast::<u64>(), CANARY_BEFORE);
                 let user = new_actual_ptr.add(CANARY_SIZE);
-                core::ptr::write_volatile(user.add(new_size) as *mut u64, CANARY_AFTER);
+                core::ptr::write_volatile(user.add(new_size).cast::<u64>(), CANARY_AFTER);
                 user
             } else {
                 new_actual_ptr

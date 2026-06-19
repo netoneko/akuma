@@ -15,11 +15,11 @@ pub(super) const EFD_SEMAPHORE: u32 = 1;
 pub(super) const EFD_NONBLOCK: u32 = 0x800;
 pub(super) const EFD_CLOEXEC: u32 = 0x80000;
 
-pub(crate) fn eventfd_create(initval: u32, flags: u32) -> u32 {
+pub fn eventfd_create(initval: u32, flags: u32) -> u32 {
     let id = NEXT_EVENTFD_ID.fetch_add(1, Ordering::SeqCst);
     crate::irq::with_irqs_disabled(|| {
         EVENTFDS.lock().insert(id, KernelEventFd {
-            counter: initval as u64,
+            counter: u64::from(initval),
             flags,
             pollers: BTreeSet::new(),
             ref_count: 1,
@@ -57,7 +57,7 @@ pub(super) fn eventfd_read(id: u32) -> Result<u64, i32> {
     })
 }
 
-pub(crate) fn eventfd_write(id: u32, val: u64) -> Result<(), i32> {
+pub fn eventfd_write(id: u32, val: u64) -> Result<(), i32> {
     crate::irq::with_irqs_disabled(|| {
         let mut table = EVENTFDS.lock();
         if let Some(efd) = table.get_mut(&id) {
@@ -80,13 +80,13 @@ pub(crate) fn eventfd_write(id: u32, val: u64) -> Result<(), i32> {
 
 pub(super) fn eventfd_can_read(id: u32) -> bool {
     crate::irq::with_irqs_disabled(|| {
-        EVENTFDS.lock().get(&id).map_or(false, |efd| efd.counter > 0)
+        EVENTFDS.lock().get(&id).is_some_and(|efd| efd.counter > 0)
     })
 }
 
 pub(super) fn eventfd_is_nonblock(id: u32) -> bool {
     crate::irq::with_irqs_disabled(|| {
-        EVENTFDS.lock().get(&id).map_or(false, |efd| efd.flags & EFD_NONBLOCK != 0)
+        EVENTFDS.lock().get(&id).is_some_and(|efd| efd.flags & EFD_NONBLOCK != 0)
     })
 }
 
@@ -117,7 +117,7 @@ pub fn eventfd_close(id: u32) {
     });
 }
 
-pub(crate) fn eventfd_add_poller(id: u32, tid: usize) {
+pub fn eventfd_add_poller(id: u32, tid: usize) {
     crate::irq::with_irqs_disabled(|| {
         if let Some(efd) = EVENTFDS.lock().get_mut(&id) {
             efd.pollers.insert(tid);
@@ -136,5 +136,5 @@ pub(super) fn sys_eventfd2(initval: u32, flags: u32) -> u64 {
         proc.set_nonblock(fd);
     }
     crate::tprint!(96, "[syscall] eventfd2(initval={}, flags=0x{:x}) = fd {} (id={})\n", initval, flags, fd, efd_id);
-    fd as u64
+    u64::from(fd)
 }

@@ -45,7 +45,7 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
     let mut existing: u64 = 0;
     if unsafe {
         copy_from_user_safe(
-            &mut existing as *mut u64 as *mut u8,
+            (&raw mut existing).cast::<u8>(),
             ctx_idp as *const u8,
             8,
         )
@@ -95,7 +95,7 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
     }
 
     // ── Write the ring header into kernel-virtual space ──────────────────────
-    let ring_kva = akuma_exec::mmu::phys_to_virt(ring_phys) as *mut AioRingHeader;
+    let ring_kva = akuma_exec::mmu::phys_to_virt(ring_phys).cast::<AioRingHeader>();
     unsafe {
         (*ring_kva).id = 0;
         (*ring_kva).nr = capped_nr;
@@ -118,7 +118,7 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
     if unsafe {
         copy_to_user_safe(
             ctx_idp as *mut u8,
-            &ring_va_u64 as *const u64 as *const u8,
+            (&raw const ring_va_u64).cast::<u8>(),
             8,
         )
         .is_err()
@@ -187,18 +187,15 @@ pub(super) fn sys_io_getevents(ctx: u64, _min_nr: i64, _nr: i64, _events: u64, _
 pub(super) fn sys_io_destroy(ctx: u64) -> u64 {
     let removed =
         crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().remove(&ctx));
-    match removed {
-        Some(_aio_ctx) => {
-            // The physical page is tracked in proc.address_space and will be
-            // freed when the process exits (or we could unmap it here, but
-            // leaving it mapped until exit is safe since bun never reuses the
-            // address and the page is read-only after io_destroy).
-            crate::tprint!(64, "[io_destroy] ctx=0x{:x} destroyed\n", ctx);
-            0
-        }
-        None => {
-            crate::tprint!(96, "[io_destroy] ctx=0x{:x} not found → 0 (avoid EINVAL for Go)\n", ctx);
-            0
-        }
+    if let Some(_aio_ctx) = removed {
+        // The physical page is tracked in proc.address_space and will be
+        // freed when the process exits (or we could unmap it here, but
+        // leaving it mapped until exit is safe since bun never reuses the
+        // address and the page is read-only after io_destroy).
+        crate::tprint!(64, "[io_destroy] ctx=0x{:x} destroyed\n", ctx);
+        0
+    } else {
+        crate::tprint!(96, "[io_destroy] ctx=0x{:x} not found → 0 (avoid EINVAL for Go)\n", ctx);
+        0
     }
 }

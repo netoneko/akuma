@@ -86,7 +86,7 @@ impl Command for LsCommand {
                     }
                 }
                 Err(e) => {
-                    let msg = format!("Error listing directory: {}\r\n", e);
+                    let msg = format!("Error listing directory: {e}\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
@@ -137,9 +137,9 @@ impl Command for FindCommand {
             }
 
             match find_recursive(&path, stdout).await {
-                Ok(_) => {}
+                Ok(()) => {}
                 Err(e) => {
-                    let msg = format!("Error finding files: {}\r\n", e);
+                    let msg = format!("Error finding files: {e}\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
@@ -170,7 +170,7 @@ async fn find_recursive(path: &str, stdout: &mut VecWriter) -> Result<(), crate:
         };
 
         // Print path
-        let line = format!("{}\r\n", full_path);
+        let line = format!("{full_path}\r\n");
         let _ = stdout.write(line.as_bytes()).await;
 
         // If directory, recurse
@@ -241,7 +241,7 @@ impl Command for CatCommand {
                     }
                 }
                 Err(e) => {
-                    let msg = format!("Error reading file: {}\r\n", e);
+                    let msg = format!("Error reading file: {e}\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
@@ -303,7 +303,7 @@ impl Command for WriteCommand {
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
                 Err(e) => {
-                    let msg = format!("Error writing file: {}\r\n", e);
+                    let msg = format!("Error writing file: {e}\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
@@ -369,7 +369,7 @@ impl Command for AppendCommand {
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
                 Err(e) => {
-                    let msg = format!("Error appending to file: {}\r\n", e);
+                    let msg = format!("Error appending to file: {e}\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
@@ -428,7 +428,7 @@ impl Command for RmCommand {
             // Check for -r or -rf flags
             if path_arg.starts_with("-r ") || path_arg.starts_with("-rf ") {
                 recursive = true;
-                path_arg = path_arg.split_once(' ').map(|(_, rest)| rest.trim()).unwrap_or("");
+                path_arg = path_arg.split_once(' ').map_or("", |(_, rest)| rest.trim());
             } else if path_arg == "-r" || path_arg == "-rf" {
                 let _ = stdout.write(b"Usage: rm [-r] <path>\r\n").await;
                 return Ok(());
@@ -446,7 +446,7 @@ impl Command for RmCommand {
 
             if is_dir {
                 if !recursive {
-                    let msg = format!("Error: '{}' is a directory, use -r to remove\r\n", path);
+                    let msg = format!("Error: '{path}' is a directory, use -r to remove\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                     return Ok(());
                 }
@@ -454,11 +454,11 @@ impl Command for RmCommand {
                 // Recursive directory removal
                 match remove_dir_recursive(&path).await {
                     Ok(()) => {
-                        let msg = format!("Removed: {}\r\n", path);
+                        let msg = format!("Removed: {path}\r\n");
                         let _ = stdout.write(msg.as_bytes()).await;
                     }
                     Err(e) => {
-                        let msg = format!("Error removing directory: {}\r\n", e);
+                        let msg = format!("Error removing directory: {e}\r\n");
                         let _ = stdout.write(msg.as_bytes()).await;
                     }
                 }
@@ -466,11 +466,11 @@ impl Command for RmCommand {
                 // Regular file removal
                 match async_fs::remove_file(&path).await {
                     Ok(()) => {
-                        let msg = format!("Removed: {}\r\n", path);
+                        let msg = format!("Removed: {path}\r\n");
                         let _ = stdout.write(msg.as_bytes()).await;
                     }
                     Err(e) => {
-                        let msg = format!("Error removing file: {}\r\n", e);
+                        let msg = format!("Error removing file: {e}\r\n");
                         let _ = stdout.write(msg.as_bytes()).await;
                     }
                 }
@@ -532,7 +532,7 @@ async fn remove_dir_recursive(path: &str) -> Result<(), RemoveError> {
             match async_fs::remove_file(&entry_path).await {
                 Ok(()) => {}
                 // Skip entries that don't exist or have invalid inodes
-                Err(crate::fs::FsError::NotFound) | Err(crate::fs::FsError::IoError) => {
+                Err(crate::fs::FsError::NotFound | crate::fs::FsError::IoError) => {
                     // Already removed or invalid inode, skip
                 }
                 Err(crate::fs::FsError::NotAFile) => {
@@ -607,11 +607,11 @@ impl Command for MkdirCommand {
             let path = ctx.resolve_path(arg_str);
             match async_fs::create_dir(&path).await {
                 Ok(()) => {
-                    let msg = format!("Created directory: {}\r\n", path);
+                    let msg = format!("Created directory: {path}\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
                 Err(e) => {
-                    let msg = format!("Error creating directory: {}\r\n", e);
+                    let msg = format!("Error creating directory: {e}\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
@@ -671,7 +671,7 @@ impl Command for DfCommand {
                     let _ = stdout.write(info.as_bytes()).await;
                 }
                 Err(e) => {
-                    let msg = format!("Error getting filesystem stats: {}\r\n", e);
+                    let msg = format!("Error getting filesystem stats: {e}\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
@@ -721,20 +721,14 @@ impl Command for MvCommand {
                 return Ok(());
             }
 
-            let source_str = match core::str::from_utf8(source) {
-                Ok(s) => s.trim(),
-                Err(_) => {
-                    let _ = stdout.write(b"Error: Invalid source path\r\n").await;
-                    return Ok(());
-                }
+            let source_str = if let Ok(s) = core::str::from_utf8(source) { s.trim() } else {
+                let _ = stdout.write(b"Error: Invalid source path\r\n").await;
+                return Ok(());
             };
 
-            let dest_str = match core::str::from_utf8(dest) {
-                Ok(s) => s.trim(),
-                Err(_) => {
-                    let _ = stdout.write(b"Error: Invalid destination path\r\n").await;
-                    return Ok(());
-                }
+            let dest_str = if let Ok(s) = core::str::from_utf8(dest) { s.trim() } else {
+                let _ = stdout.write(b"Error: Invalid destination path\r\n").await;
+                return Ok(());
             };
 
             let source_path = ctx.resolve_path(source_str);
@@ -742,7 +736,7 @@ impl Command for MvCommand {
 
             // Check if source exists
             if !async_fs::exists(&source_path).await {
-                let msg = format!("Error: '{}' not found\r\n", source_path);
+                let msg = format!("Error: '{source_path}' not found\r\n");
                 let _ = stdout.write(msg.as_bytes()).await;
                 return Ok(());
             }
@@ -750,7 +744,7 @@ impl Command for MvCommand {
             // Try atomic rename first
             match async_fs::rename(&source_path, &dest_path).await {
                 Ok(()) => {
-                    let msg = format!("Moved '{}' -> '{}'\r\n", source_path, dest_path);
+                    let msg = format!("Moved '{source_path}' -> '{dest_path}'\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
                 Err(crate::fs::FsError::NotSupported) => {
@@ -764,7 +758,7 @@ impl Command for MvCommand {
                     let data = match async_fs::read_file(&source_path).await {
                         Ok(d) => d,
                         Err(e) => {
-                            let msg = format!("Error reading '{}': {}\r\n", source_path, e);
+                            let msg = format!("Error reading '{source_path}': {e}\r\n");
                             let _ = stdout.write(msg.as_bytes()).await;
                             return Ok(());
                         }
@@ -772,23 +766,23 @@ impl Command for MvCommand {
 
                     // Write to destination
                     if let Err(e) = async_fs::write_file(&dest_path, &data).await {
-                        let msg = format!("Error writing '{}': {}\r\n", dest_path, e);
+                        let msg = format!("Error writing '{dest_path}': {e}\r\n");
                         let _ = stdout.write(msg.as_bytes()).await;
                         return Ok(());
                     }
 
                     // Remove source file
                     if let Err(e) = async_fs::remove_file(&source_path).await {
-                        let msg = format!("Error removing source '{}': {}\r\n", source_path, e);
+                        let msg = format!("Error removing source '{source_path}': {e}\r\n");
                         let _ = stdout.write(msg.as_bytes()).await;
                         return Ok(());
                     }
 
-                    let msg = format!("Moved '{}' -> '{}' (via copy)\r\n", source_path, dest_path);
+                    let msg = format!("Moved '{source_path}' -> '{dest_path}' (via copy)\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
                 Err(e) => {
-                    let msg = format!("Error moving '{}': {}\r\n", source_path, e);
+                    let msg = format!("Error moving '{source_path}': {e}\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
@@ -840,18 +834,15 @@ impl Command for CpCommand {
 
             if remaining_args.starts_with("-r ") {
                 recursive = true;
-                remaining_args = &remaining_args[3..].trim();
+                remaining_args = remaining_args[3..].trim();
             } else if remaining_args == "-r" {
                 let _ = stdout.write(b"Usage: cp [-r] <source> <destination>\r\n").await;
                 return Ok(());
             }
 
-            let (source_str, dest_str) = match remaining_args.split_once(' ') {
-                Some((s, d)) => (s.trim(), d.trim()),
-                None => {
-                    let _ = stdout.write(b"Usage: cp [-r] <source> <destination>\r\n").await;
-                    return Ok(());
-                }
+            let (source_str, dest_str) = if let Some((s, d)) = remaining_args.split_once(' ') { (s.trim(), d.trim()) } else {
+                let _ = stdout.write(b"Usage: cp [-r] <source> <destination>\r\n").await;
+                return Ok(());
             };
 
             if source_str.is_empty() || dest_str.is_empty() {
@@ -863,7 +854,7 @@ impl Command for CpCommand {
             let dest_path = ctx.resolve_path(dest_str);
 
             if !async_fs::exists(&source_path).await {
-                let msg = format!("Error: '{}' not found\r\n", source_path);
+                let msg = format!("Error: '{source_path}' not found\r\n");
                 let _ = stdout.write(msg.as_bytes()).await;
                 return Ok(());
             }
@@ -873,18 +864,18 @@ impl Command for CpCommand {
 
             if is_dir {
                 if !recursive {
-                    let msg = format!("Error: '{}' is a directory (use -r to copy recursively)\r\n", source_path);
+                    let msg = format!("Error: '{source_path}' is a directory (use -r to copy recursively)\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                     return Ok(());
                 }
 
                 match copy_dir_recursive(&source_path, &dest_path).await {
                     Ok(()) => {
-                        let msg = format!("Copied directory '{}' -> '{}'\r\n", source_path, dest_path);
+                        let msg = format!("Copied directory '{source_path}' -> '{dest_path}'\r\n");
                         let _ = stdout.write(msg.as_bytes()).await;
                     }
                     Err(e) => {
-                        let msg = format!("Error copying directory: {}\r\n", e);
+                        let msg = format!("Error copying directory: {e}\r\n");
                         let _ = stdout.write(msg.as_bytes()).await;
                     }
                 }
@@ -892,11 +883,11 @@ impl Command for CpCommand {
                 // Copy file
                 match copy_file(&source_path, &dest_path).await {
                     Ok(()) => {
-                        let msg = format!("Copied '{}' -> '{}'\r\n", source_path, dest_path);
+                        let msg = format!("Copied '{source_path}' -> '{dest_path}'\r\n");
                         let _ = stdout.write(msg.as_bytes()).await;
                     }
                     Err(e) => {
-                        let msg = format!("Error copying file: {}\r\n", e);
+                        let msg = format!("Error copying file: {e}\r\n");
                         let _ = stdout.write(msg.as_bytes()).await;
                     }
                 }
@@ -911,15 +902,16 @@ async fn copy_file(source: &str, dest: &str) -> Result<(), crate::fs::FsError> {
     let data = async_fs::read_file(source).await?;
     
     // If dest is a directory, append filename
-    let mut actual_dest = dest.to_string();
-    if async_fs::list_dir(dest).await.is_ok() {
+    let actual_dest = if async_fs::list_dir(dest).await.is_ok() {
         let (_, filename) = crate::vfs::split_path(source);
-        actual_dest = if dest.ends_with('/') {
-            format!("{}{}", dest, filename)
+        if dest.ends_with('/') {
+            format!("{dest}{filename}")
         } else {
-            format!("{}/{}", dest, filename)
-        };
-    }
+            format!("{dest}/{filename}")
+        }
+    } else {
+        dest.to_string()
+    };
     
     async_fs::write_file(&actual_dest, &data).await
 }
@@ -1003,7 +995,7 @@ impl Command for MountCommand {
                     }
                 }
                 Err(e) => {
-                    let msg = format!("Error listing mounts: {}\r\n", e);
+                    let msg = format!("Error listing mounts: {e}\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
             }

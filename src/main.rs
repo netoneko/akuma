@@ -2,6 +2,12 @@
 #![no_main]
 #![feature(never_type)]
 #![feature(alloc_error_handler)]
+// Kernel-specific: MMIO and error-code paths require these casts intentionally.
+#![allow(clippy::cast_ptr_alignment)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::wrong_self_convention)] // kernel types don't follow std naming
+#![allow(clippy::inline_always)] // used for hot syscall paths
+#![allow(clippy::needless_pass_by_value)] // trait bounds often require owned types
 
 extern crate alloc;
 
@@ -81,7 +87,7 @@ fn halt_with_code(code: u32) -> ! {
     // Use ARM semihosting SYS_EXIT_EXTENDED (0x20) to exit QEMU with a code
     // The parameter block contains [reason, exit_code]
     // ADP_Stopped_ApplicationExit = 0x20026
-    let block: [u64; 2] = [0x20026, code as u64];
+    let block: [u64; 2] = [0x20026, u64::from(code)];
 
     unsafe {
         core::arch::asm!(
@@ -162,7 +168,7 @@ fn scan_for_dtb() -> usize {
     let magic = unsafe { core::ptr::read_volatile(DTB_LOCATION as *const u32) };
     if magic == FDT_MAGIC_LE {
         let total_size = u32::from_be(unsafe { core::ptr::read_volatile((DTB_LOCATION + 4) as *const u32) });
-        if total_size >= 64 && total_size <= 16 * 1024 * 1024 {
+        if (64..=16 * 1024 * 1024).contains(&total_size) {
             console::print("[DTB] Found at 0x");
             console::print_hex(DTB_LOCATION as u64);
             console::print("\n");
@@ -194,12 +200,9 @@ fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
     }
 
     // SAFETY: We found a valid DTB magic at this address
-    let fdt = match unsafe { fdt::Fdt::from_ptr(actual_dtb_ptr as *const u8) } {
-        Ok(fdt) => fdt,
-        Err(_) => {
-            console::print("[Memory] Invalid DTB, using defaults\n");
-            return (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE);
-        }
+    let fdt = if let Ok(fdt) = unsafe { fdt::Fdt::from_ptr(actual_dtb_ptr as *const u8) } { fdt } else {
+        console::print("[Memory] Invalid DTB, using defaults\n");
+        return (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE);
     };
 
     // Get memory regions from DTB
@@ -234,8 +237,8 @@ fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
 ///   memory left after code+stack**, so user pages always survive. The old code
 ///   used a flat 64 MB floor here, which left 0 user pages below ~72 MB (no boot)
 ///   and starved user RAM at 128 MB.
-/// Kernel physical-RAM layout: three contiguous regions starting at `ram_base`
-/// — `[.. heap_start)` code+boot-stack, `[heap_start ..)` heap, then user pages.
+///   Kernel physical-RAM layout: three contiguous regions starting at `ram_base`
+///   — `[.. heap_start)` code+boot-stack, `[heap_start ..)` heap, then user pages.
 pub(crate) struct MemoryLayout {
     pub code_and_stack: usize,
     pub heap_start: usize,
@@ -305,7 +308,7 @@ pub(crate) fn compute_heap_size(ram_size: usize, code_and_stack: usize) -> usize
         return config::KERNEL_HEAP_SIZE_MB * MB;
     }
     if ram_size >= 256 * MB {
-        core::cmp::min(core::cmp::max(ram_size / 8, 64 * MB), 256 * MB)
+        (ram_size / 8).clamp(64 * MB, 256 * MB)
     } else {
         // Small RAM. The kernel boots on ~2.2 MB of heap. Thread stacks are NOT
         // in the heap (they come from PMM), so the heap doesn't have to cover
@@ -388,9 +391,9 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         static STACK_BOTTOM: u8;
         static STACK_TOP: u8;
     }
-    let kernel_end = unsafe { &_kernel_phys_end as *const u8 as usize };
-    let stack_bottom = unsafe { &STACK_BOTTOM as *const u8 as usize };
-    let boot_stack_top = unsafe { &STACK_TOP as *const u8 as usize };
+    let kernel_end = &raw const _kernel_phys_end as usize;
+    let stack_bottom = &raw const STACK_BOTTOM as usize;
+    let boot_stack_top = &raw const STACK_TOP as usize;
     let kernel_size = kernel_end - KERNEL_BASE;
 
     // Stack high-water probe: paint the boot stack's unused lower region so the
@@ -792,7 +795,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // drives preemption AND services the async alarm queue (kernel_timer). The
     // physical timer (CNTP/PPI 30) is not used — it is inaccessible to the guest
     // under QEMU HVF (programming it faults with EC=0x0).
-    irq::register_handler(27, |irq| timer::timer_irq_handler(irq));
+    irq::register_handler(27, timer::timer_irq_handler);
     gic::enable_irq(27); // Enable virtual timer interrupt
 
     console::print("Enabling timer...\n");
@@ -968,7 +971,7 @@ fn run_async_main_preemptive() -> ! {
                 
                 // Thread 0 is responsible for cleanup when DEFERRED_THREAD_CLEANUP is enabled
                 // Clean up every 10 iterations (not too frequent to avoid overhead)
-                if loop_counter % 10 == 0 {
+                if loop_counter.is_multiple_of(10) {
                     let cleaned = threading::cleanup_terminated();
                     if cleaned > 0 {
                         // Safe print without heap allocation to prevent panics
@@ -981,7 +984,7 @@ fn run_async_main_preemptive() -> ! {
                 // Heartbeat every 1000 iterations to show thread 0 is alive
                 static HEARTBEAT_DUMP_CTR: core::sync::atomic::AtomicU64 =
                     core::sync::atomic::AtomicU64::new(0);
-                if loop_counter % crate::config::THREADING_HEARTBEAT_INTERVAL == 0 {
+                if loop_counter.is_multiple_of(crate::config::THREADING_HEARTBEAT_INTERVAL) {
                     // Safe print without heap allocation to prevent panics
                     let stats = threading::thread_stats_full();
                     console::print("[Thread0] loop=");
@@ -1005,7 +1008,7 @@ fn run_async_main_preemptive() -> ! {
                     // are blocked threads (a hang signature), to keep it quiet.
                     if crate::config::DEADLOCK_THREAD_DUMP_ENABLED {
                         HEARTBEAT_DUMP_CTR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                        if HEARTBEAT_DUMP_CTR.load(core::sync::atomic::Ordering::Relaxed) % 8 == 0
+                        if HEARTBEAT_DUMP_CTR.load(core::sync::atomic::Ordering::Relaxed).is_multiple_of(8)
                             && stats.waiting >= 2
                         {
                             threading::dump_thread_resume_points();
@@ -1085,7 +1088,7 @@ fn run_async_main() -> ! {
             uptime_us: timer::uptime_us,
             utc_seconds: timer::utc_seconds,
             yield_now: threading::yield_now,
-            current_box_id: || process::current_process().map(|p| p.box_id).unwrap_or(0),
+            current_box_id: || process::current_process().map_or(0, |p| p.box_id),
             is_current_interrupted: process::is_current_interrupted,
             rng_fill: |buf| rng::fill_bytes(buf).expect("RNG required for networking"),
             current_thread_id: || threading::current_thread_id() as u32,
@@ -1100,7 +1103,7 @@ fn run_async_main() -> ! {
         loop {
             threading::yield_now();
         }
-    };
+    }
 
     console::print("--- Network Initialization Done ---\n\n");
 
@@ -1343,7 +1346,7 @@ async fn memory_monitor() -> ! {
         // cow_ref desync) — see pmm::DOUBLE_FREE_COUNT.
         let dfree = pmm::double_free_count();
         let dfree_marker = if dfree > 0 {
-            alloc::format!(" | DOUBLE-FREE={}", dfree)
+            alloc::format!(" | DOUBLE-FREE={dfree}")
         } else {
             alloc::string::String::new()
         };
@@ -1377,7 +1380,7 @@ async fn memory_monitor() -> ! {
                 span.pinned_used_bytes / 1024, span.free_spans
             );
         }
-        let _ = write!(buf, "\n");
+        let _ = writeln!(buf);
         console::print(buf.as_str());
 
         // Stack high-water (no-op unless the probe const is on): right-sizing data
@@ -1400,9 +1403,9 @@ async fn memory_monitor() -> ! {
             } else {
                 ""
             };
-            let _ = write!(
+            let _ = writeln!(
                 buf,
-                "[SSH]{} listening | active={} open={} close={} hs_fail={} auth_fail={} panic={} stall_us={}\n",
+                "[SSH]{} listening | active={} open={} close={} hs_fail={} auth_fail={} panic={} stall_us={}",
                 stall_marker, ssh.active, ssh.opened, ssh.closed, ssh.handshake_fail, ssh.auth_fail, ssh.panicked, stall_us
             );
             // Phase-1 instrumentation: when STALLED, dump the accept-loop
@@ -1422,9 +1425,9 @@ async fn memory_monitor() -> ! {
                 } else {
                     i64::from(holder)
                 };
-                let _ = write!(
+                let _ = writeln!(
                     buf,
-                    "[SSH] STALL DETAIL | step={}({}) listener_valid={} net_holder={} net_site={} net_held_us={} poll_in={} poll_out={} poll_gap={}\n",
+                    "[SSH] STALL DETAIL | step={}({}) listener_valid={} net_holder={} net_site={} net_held_us={} poll_in={} poll_out={} poll_gap={}",
                     ssh.last_step,
                     ssh::server::step::name(ssh.last_step),
                     ssh.listener_valid,
@@ -1437,9 +1440,9 @@ async fn memory_monitor() -> ! {
                 );
             }
         } else {
-            let _ = write!(
+            let _ = writeln!(
                 buf,
-                "[SSH] no listener | active={} open={} close={} hs_fail={} auth_fail={} panic={}\n",
+                "[SSH] no listener | active={} open={} close={} hs_fail={} auth_fail={} panic={}",
                 ssh.active, ssh.opened, ssh.closed, ssh.handshake_fail, ssh.auth_fail, ssh.panicked
             );
         }

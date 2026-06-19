@@ -4,6 +4,7 @@
 //! If tests fail, the kernel should halt.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::fmt::Write as _;
 
 use crate::config;
 use crate::console;
@@ -406,6 +407,7 @@ pub fn run_threading_tests() -> bool {
 ///
 /// This tests the new terminal control syscalls (raw mode, cursor, clear screen)
 /// and input polling.
+#[allow(clippy::useless_let_if_seq)]
 fn test_terminal_syscalls() -> bool {
     console::print("\n[TEST] Terminal Syscalls (Userspace)\n");
 
@@ -415,11 +417,10 @@ fn test_terminal_syscalls() -> bool {
             console::print("  /bin/terminal_test not found\n");
             console::print("  Result: FAIL\n");
             return false;
-        } else {
-            console::print("  Skipping: /bin/terminal_test not found\n");
-            console::print("  Result: SKIP\n");
-            return true; // Skip, don't fail
         }
+        console::print("  Skipping: /bin/terminal_test not found\n");
+        console::print("  Result: SKIP\n");
+        return true; // Skip, don't fail
     }
 
     let result = crate::async_tests::run_async_test(async {
@@ -438,13 +439,13 @@ fn test_terminal_syscalls() -> bool {
     let output_str = String::from_utf8_lossy(&output);
     crate::safe_print!(1024, "  Terminal Test Output:\n{}\n", output_str);
 
-    let mut all_ok = true;
-
     // Verify exit code
-    if exit_code != 0 {
+    let mut all_ok = if exit_code != 0 {
         crate::safe_print!(64, "  Test program exited with non-zero code: {}\n", exit_code);
-        all_ok = false;
-    }
+        false
+    } else {
+        true
+    };
 
     // Verify key messages in output
     if !output_str.contains("Terminal Test Program Started") {
@@ -688,11 +689,11 @@ fn test_realloc_preserves_data() -> bool {
 
     // Verify original data unchanged
     let mut original_ok = true;
-    for i in 0..INITIAL_SIZE {
-        if vec[i] != PATTERN {
-            crate::safe_print!(96, 
+    for (i, &item) in vec.iter().enumerate().take(INITIAL_SIZE) {
+        if item != PATTERN {
+            crate::safe_print!(96,
                 "  Corruption at byte {} (got 0x{:02X})\n",
-                i, vec[i]
+                i, item
             );
             original_ok = false;
             break;
@@ -701,8 +702,8 @@ fn test_realloc_preserves_data() -> bool {
 
     // Verify new data correct
     let mut new_ok = true;
-    for i in INITIAL_SIZE..FINAL_SIZE {
-        if vec[i] != 0xAD {
+    for &item in vec.iter().take(FINAL_SIZE).skip(INITIAL_SIZE) {
+        if item != 0xAD {
             new_ok = false;
             break;
         }
@@ -814,26 +815,26 @@ fn test_alignment_various() -> bool {
 
     // Allocate and check alignment
     let a8: Box<Align8> = Box::new(Align8([0; 8]));
-    let ptr8 = &*a8 as *const Align8 as usize;
-    let ok8 = ptr8 % 8 == 0;
+    let ptr8 = &raw const *a8 as usize;
+    let ok8 = ptr8.is_multiple_of(8);
     crate::safe_print!(96, "  Align 8: ptr=0x{:x}, ok={}\n", ptr8, ok8);
     all_aligned &= ok8;
 
     let a16: Box<Align16> = Box::new(Align16([0; 16]));
-    let ptr16 = &*a16 as *const Align16 as usize;
-    let ok16 = ptr16 % 16 == 0;
+    let ptr16 = &raw const *a16 as usize;
+    let ok16 = ptr16.is_multiple_of(16);
     crate::safe_print!(96, "  Align 16: ptr=0x{:x}, ok={}\n", ptr16, ok16);
     all_aligned &= ok16;
 
     let a32: Box<Align32> = Box::new(Align32([0; 32]));
-    let ptr32 = &*a32 as *const Align32 as usize;
-    let ok32 = ptr32 % 32 == 0;
+    let ptr32 = &raw const *a32 as usize;
+    let ok32 = ptr32.is_multiple_of(32);
     crate::safe_print!(96, "  Align 32: ptr=0x{:x}, ok={}\n", ptr32, ok32);
     all_aligned &= ok32;
 
     let a64: Box<Align64> = Box::new(Align64([0; 64]));
-    let ptr64 = &*a64 as *const Align64 as usize;
-    let ok64 = ptr64 % 64 == 0;
+    let ptr64 = &raw const *a64 as usize;
+    let ok64 = ptr64.is_multiple_of(64);
     crate::safe_print!(96, "  Align 64: ptr=0x{:x}, ok={}\n", ptr64, ok64);
     all_aligned &= ok64;
 
@@ -1052,7 +1053,7 @@ fn test_rapid_push_pop() -> bool {
             }
         }
 
-        if vec.len() != 0 {
+        if !vec.is_empty() {
             crate::safe_print!(64, "  Vec not empty after iteration {}\n", iter);
             all_ok = false;
         }
@@ -1086,7 +1087,7 @@ fn test_string_operations() -> bool {
     // Longer string building
     let mut long = String::new();
     for i in 0..50 {
-        long.push_str(&format!("{} ", i));
+        let _ = write!(long, "{i} ");
     }
     crate::safe_print!(64, "  Long string len: {}\n", long.len());
     let long_ok = long.starts_with("0 1 2 ");
@@ -1119,10 +1120,7 @@ fn test_string_push_str_realloc() -> bool {
 
     // Step 1: Vec allocation (like userspace test_vec)
     console::print("  Step 1: Vec allocation...\n");
-    let mut v: Vec<i32> = Vec::new();
-    v.push(1);
-    v.push(2);
-    v.push(3);
+    let v: Vec<i32> = alloc::vec![1, 2, 3];
     let v_ptr = v.as_ptr() as usize;
     crate::safe_print!(96, "    Vec ptr: {:#x}, len: {}\n", v_ptr, v.len());
 
@@ -1260,16 +1258,13 @@ fn test_vec_of_vecs() -> bool {
 
     // Verify data
     let mut all_ok = true;
-    for i in 0..OUTER {
-        for j in 0..INNER {
-            if outer[i][j] != (i * INNER + j) as u8 {
+    'outer_loop: for (i, row) in outer.iter().enumerate().take(OUTER) {
+        for (j, &val) in row.iter().enumerate().take(INNER) {
+            if val != (i * INNER + j) as u8 {
                 crate::safe_print!(96, "  Mismatch at [{i}][{j}]\n");
                 all_ok = false;
-                break;
+                break 'outer_loop;
             }
-        }
-        if !all_ok {
-            break;
         }
     }
 
@@ -1345,18 +1340,18 @@ fn test_mmap_single_page() -> bool {
 
     // Write pattern
     let mut buf = buf;
-    for i in 0..100 {
-        buf[i] = (i & 0xFF) as u8;
+    for (i, slot) in buf.iter_mut().enumerate().take(100) {
+        *slot = (i & 0xFF) as u8;
     }
 
     // Verify pattern
     let mut ok = true;
-    for i in 0..100 {
-        if buf[i] != (i & 0xFF) as u8 {
-            crate::safe_print!(128, 
+    for (i, &val) in buf.iter().enumerate().take(100) {
+        if val != (i & 0xFF) as u8 {
+            crate::safe_print!(128,
                 "  Mismatch at {}: got {}, expected {}\n",
                 i,
-                buf[i],
+                val,
                 i & 0xFF
             );
             ok = false;
@@ -1579,9 +1574,9 @@ fn test_mmap_vec_capacity_doubling() -> bool {
 
     // Verify all data
     let mut ok = true;
-    for i in 0..1024 {
-        if v[i] != i as u32 {
-            crate::safe_print!(96, "  Mismatch at {}: got {}\n", i, v[i]);
+    for (i, &val) in v.iter().enumerate().take(1024) {
+        if val != i as u32 {
+            crate::safe_print!(96, "  Mismatch at {}: got {}\n", i, val);
             ok = false;
             break;
         }
@@ -1677,7 +1672,7 @@ fn test_lifo_pattern() -> bool {
     all_ok
 }
 
-/// Test: FIFO (queue-like) allocation pattern  
+/// Test: FIFO (queue-like) allocation pattern\
 /// Common in: message queues, task schedulers, event handlers
 #[allow(dead_code)]
 fn test_fifo_pattern() -> bool {
@@ -1797,8 +1792,8 @@ fn test_resize_pattern() -> bool {
         buffer.resize(size, 0xAB);
 
         // Verify OLD content is preserved (should be index pattern)
-        for i in 0..prev_size {
-            if buffer[i] != (i & 0xFF) as u8 {
+        for (i, &val) in buffer.iter().enumerate().take(prev_size) {
+            if val != (i & 0xFF) as u8 {
                 console::print("  Old content mismatch\n");
                 all_ok = false;
                 break;
@@ -1806,8 +1801,8 @@ fn test_resize_pattern() -> bool {
         }
 
         // Verify NEW content is 0xAB
-        for i in prev_size..size {
-            if buffer[i] != 0xAB {
+        for &val in buffer.iter().take(size).skip(prev_size) {
+            if val != 0xAB {
                 console::print("  New content mismatch\n");
                 all_ok = false;
                 break;
@@ -1815,8 +1810,8 @@ fn test_resize_pattern() -> bool {
         }
 
         // Overwrite with index pattern
-        for i in 0..size {
-            buffer[i] = (i & 0xFF) as u8;
+        for (i, slot) in buffer.iter_mut().enumerate().take(size) {
+            *slot = (i & 0xFF) as u8;
         }
 
         prev_size = size;
@@ -1832,8 +1827,8 @@ fn test_resize_pattern() -> bool {
             break;
         }
         // Verify data preserved
-        for i in 0..size {
-            if buffer[i] != (i & 0xFF) as u8 {
+        for (i, &val) in buffer.iter().enumerate().take(size) {
+            if val != (i & 0xFF) as u8 {
                 all_ok = false;
                 break;
             }
@@ -1874,13 +1869,13 @@ fn test_temporary_buffers() -> bool {
         let mut temp: Vec<u8> = vec![0u8; size];
 
         // Use (write pattern)
-        for j in 0..size {
-            temp[j] = ((i + j) & 0xFF) as u8;
+        for (j, slot) in temp.iter_mut().enumerate().take(size) {
+            *slot = ((i + j) & 0xFF) as u8;
         }
 
         // Verify
-        for j in 0..size {
-            if temp[j] != ((i + j) & 0xFF) as u8 {
+        for (j, &val) in temp.iter().enumerate().take(size) {
+            if val != ((i + j) & 0xFF) as u8 {
                 console::print("  Temp buffer failed\n");
                 all_ok = false;
                 break;
@@ -1908,7 +1903,7 @@ fn test_linked_structure() -> bool {
     // Simple linked list node
     struct Node {
         value: u32,
-        next: Option<Box<Node>>,
+        next: Option<Box<Self>>,
     }
 
     // Build linked list (smaller size to reduce Box allocations)
@@ -2595,11 +2590,10 @@ fn test_parallel_processes() -> bool {
             console::print("  /bin/hello not found\n");
             console::print("  Result: FAIL\n");
             return false;
-        } else {
-            console::print("  Skipping: /bin/hello not found\n");
-            console::print("  Result: SKIP\n");
-            return true; // Skip, don't fail
         }
+        console::print("  Skipping: /bin/hello not found\n");
+        console::print("  Result: SKIP\n");
+        return true; // Skip, don't fail
     }
 
     let process_args: Option<&[&str]> = Some(&["10", "100"]);
@@ -2693,8 +2687,8 @@ fn test_parallel_processes() -> bool {
                     crate::async_tests::run_async_test(async { crate::shell_tests::execute_pipeline_test(b"kthreads").await });
                 if let Ok(value) = kthreads_result {
                     let value_as_str = String::from_utf8_lossy(&value);
-                    let tid1_str = format!("{:>4}", tid1);
-                    let tid2_str = format!("{:>4}", tid2);
+                    let tid1_str = format!("{tid1:>4}");
+                    let tid2_str = format!("{tid2:>4}");
                     let user_process = "user-process";
 
                     let has_tid1 = value_as_str.lines().any(|line|
@@ -2991,7 +2985,7 @@ fn test_btreemap_churn_no_leak() -> bool {
     for round in 0..100u32 {
         let mut map: BTreeMap<u32, u64> = BTreeMap::new();
         for i in 0..1000u32 {
-            map.insert(i + round * 1000, i as u64);
+            map.insert(i + round * 1000, u64::from(i));
         }
         for i in 0..1000u32 {
             let _ = map.get(&(i + round * 1000));
@@ -3056,7 +3050,7 @@ fn test_high_volume_small_allocs_no_leak() -> bool {
         set.remove(&(i % 64));
 
         if i % 10000 == 0 {
-            let s = format!("iter_{}", i);
+            let s = format!("iter_{i}");
             drop(s);
         }
     }
@@ -3087,13 +3081,10 @@ fn test_alloc_mmap_non_overlapping() -> bool {
     let mut addrs = Vec::new();
     let sizes = [0x1000, 0x4000, 0x10000, 0x1000, 0x8000, 0x7F000];
     for &sz in &sizes {
-        match mem.alloc_mmap(sz) {
-            Some(a) => addrs.push((a, sz)),
-            None => {
-                crate::safe_print!(192, "  alloc_mmap returned None for size {:#x} (next={:#x} limit={:#x})\n",
-                    sz, mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit);
-                return false;
-            }
+        if let Some(a) = mem.alloc_mmap(sz) { addrs.push((a, sz)) } else {
+            crate::safe_print!(192, "  alloc_mmap returned None for size {:#x} (next={:#x} limit={:#x})\n",
+                sz, mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit);
+            return false;
         }
     }
 
@@ -3101,8 +3092,7 @@ fn test_alloc_mmap_non_overlapping() -> bool {
     for i in 0..addrs.len() {
         let (a_start, a_sz) = addrs[i];
         let a_end = a_start + a_sz;
-        for j in (i + 1)..addrs.len() {
-            let (b_start, b_sz) = addrs[j];
+        for &(b_start, b_sz) in addrs.iter().skip(i + 1) {
             let b_end = b_start + b_sz;
             if a_start < b_end && b_start < a_end {
                 crate::safe_print!(192, "  OVERLAP: [{:#x}..{:#x}) vs [{:#x}..{:#x})\n",
@@ -3204,7 +3194,7 @@ fn test_lazy_region_munmap_full() -> bool {
 
     let remaining = crate::irq::with_irqs_disabled(|| {
         let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
-        table.get(&TEST_PID).map_or(0, |r| r.len())
+        table.get(&TEST_PID).map_or(0, alloc::collections::BTreeMap::len)
     });
 
     let ok = results.len() == 1 && results[0] == (0x5000_0000, 16) && remaining == 0;
@@ -3532,7 +3522,7 @@ fn test_with_irqs_disabled_nesting() -> bool {
     unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
 
     // Call with_irqs_disabled while already disabled
-    let inner_disabled = akuma_exec::runtime::with_irqs_disabled(|| read_daif_i());
+    let inner_disabled = akuma_exec::runtime::with_irqs_disabled(read_daif_i);
 
     // After return: must still be disabled
     let still_disabled = read_daif_i();
@@ -3564,10 +3554,7 @@ fn test_map_user_page_preserves_irq_state() -> bool {
         (daif >> 7) & 1 == 1
     }
 
-    let frame = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM\n"); return false; }
-    };
+    let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
 
     // Above the RAM identity map (see test_map_user_page_roundtrip for why a fixed
     // ~7.5GB VA crashes at MEMORY≥8G).
@@ -3592,16 +3579,16 @@ fn test_map_user_page_preserves_irq_state() -> bool {
         let ttbr0: u64;
         core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
         let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
-        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *mut u64;
+        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr).cast::<u64>();
         let l0e = l0_ptr.add((test_va >> 39) & 0x1FF).read_volatile();
         if l0e & 1 != 0 {
-            let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
             let l1e = l1_ptr.add((test_va >> 30) & 0x1FF).read_volatile();
             if l1e & 1 != 0 {
-                let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
                 let l2e = l2_ptr.add((test_va >> 21) & 0x1FF).read_volatile();
                 if l2e & 1 != 0 {
-                    let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                    let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
                     l3_ptr.add((test_va >> 12) & 0x1FF).write_volatile(0);
                     akuma_exec::mmu::flush_tlb_page(test_va);
                 }
@@ -3623,10 +3610,7 @@ fn test_map_user_page_preserves_irq_state() -> bool {
 fn test_map_user_page_roundtrip() -> bool {
     console::print("\n[TEST] map_user_page: map → verify → unmap → verify\n");
 
-    let frame = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM\n"); return false; }
-    };
+    let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
 
     // Pick a VA *above* the kernel RAM identity-map window. A fixed ~7.75GB VA
     // (the old value) is a safe "high user VA" only while RAM ≲ 7GB; once RAM is
@@ -3654,16 +3638,16 @@ fn test_map_user_page_roundtrip() -> bool {
         let ttbr0: u64;
         core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
         let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
-        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *mut u64;
+        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr).cast::<u64>();
         let l0e = l0_ptr.add((test_va >> 39) & 0x1FF).read_volatile();
         if l0e & 1 != 0 {
-            let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
             let l1e = l1_ptr.add((test_va >> 30) & 0x1FF).read_volatile();
             if l1e & 1 != 0 {
-                let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
                 let l2e = l2_ptr.add((test_va >> 21) & 0x1FF).read_volatile();
                 if l2e & 1 != 0 {
-                    let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                    let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
                     l3_ptr.add((test_va >> 12) & 0x1FF).write_volatile(0);
                     // Also clear L2 and L1 entries so freed table frames are no
                     // longer reachable from the boot TTBR0.
@@ -3704,10 +3688,7 @@ fn test_eager_mmap_pages_survive_subrange_munmap() -> bool {
     let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
     let mut frames = Vec::new();
     for _ in 0..pages {
-        match crate::pmm::alloc_page_zeroed() {
-            Some(f) => frames.push(f),
-            None => { console::print("  OOM\n"); return false; }
-        }
+        if let Some(f) = crate::pmm::alloc_page_zeroed() { frames.push(f) } else { console::print("  OOM\n"); return false; }
     }
     mmap_regions.push((base, frames));
 
@@ -3856,7 +3837,7 @@ fn test_kernel_identity_mapping_full_ram() -> bool {
 
     if let Some(f) = high_frame {
         crate::safe_print!(128, "  Found high frame at {:#x}, probing... ", f.addr);
-        let ptr = akuma_exec::mmu::phys_to_virt(f.addr) as *mut u64;
+        let ptr = akuma_exec::mmu::phys_to_virt(f.addr).cast::<u64>();
         unsafe {
             ptr.write_volatile(0xDEAD_BEEF_CAFE_BABE);
             let val = ptr.read_volatile();
@@ -3875,7 +3856,7 @@ fn test_kernel_identity_mapping_full_ram() -> bool {
             let ttbr0: u64;
             core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
             let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
-            let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *mut u64;
+            let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr).cast::<u64>();
             
             // L0[0] covers 0..512GB
             let l0e = l0_ptr.add(0).read_volatile();
@@ -3885,7 +3866,7 @@ fn test_kernel_identity_mapping_full_ram() -> bool {
             }
 
             let l1_addr = (l0e & 0x0000_FFFF_FFFF_F000) as usize;
-            let l1_ptr = akuma_exec::mmu::phys_to_virt(l1_addr) as *mut u64;
+            let l1_ptr = akuma_exec::mmu::phys_to_virt(l1_addr).cast::<u64>();
 
             // Check L1[2] (covers 2GB..3GB)
             let l1e = l1_ptr.add(2).read_volatile();
@@ -3906,9 +3887,9 @@ fn test_kernel_identity_mapping_full_ram() -> bool {
 /// zeroes PMM frames via phys_to_virt while the boot table is the active TTBR0
 /// (e.g. replace_image's deactivate→swap window), so a frame at PA>=3GB on a
 /// >2GB machine faulted (killed clang/ld). `mmu::extend_boot_ram_identity_map`
-/// (called from `mmu::init`) maps the rest of RAM as 1GB blocks. This walks the
-/// boot L1 and asserts every 1GB entry covering [ram_base, ram_end) is valid —
-/// it passes at any MEMORY size and fails if the high-RAM mapping is missing.
+/// > (called from `mmu::init`) maps the rest of RAM as 1GB blocks. This walks the
+/// > boot L1 and asserts every 1GB entry covering [ram_base, ram_end) is valid —
+/// > it passes at any MEMORY size and fails if the high-RAM mapping is missing.
 fn test_boot_map_covers_full_ram() -> bool {
     console::print("\n[TEST] boot identity map covers full detected RAM\n");
     let ram_base = akuma_exec::mmu::ram_base();
@@ -4025,7 +4006,7 @@ fn test_reserve_calc_ram() -> bool {
     // End-to-end: on a 64MB box, clamping the reserve RAM must leave strictly
     // more user pages (the whole point — surplus RAM goes to userspace).
     let ram = 64 * MB;
-    let cs = |cr: usize| core::cmp::max(cr / 16, 1 * MB); // approx code+stack
+    let cs = |cr: usize| core::cmp::max(cr / 16, MB); // approx code+stack
     let up = |cr: usize| {
         let c = cs(cr);
         ram.saturating_sub(c + crate::compute_heap_size(cr, c))
@@ -4134,27 +4115,15 @@ fn test_clone_vm_mmap_regions_on_owner() -> bool {
     let parent_pid = akuma_exec::process::allocate_pid();
     let child_pid = akuma_exec::process::allocate_pid();
 
-    let parent_as = match akuma_exec::mmu::UserAddressSpace::new() {
-        Some(a) => a,
-        None => { console::print("  OOM (parent AS)\n"); return false; }
-    };
+    let parent_as = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (parent AS)\n"); return false; };
     let l0 = parent_as.l0_phys();
-    let child_as = match akuma_exec::mmu::UserAddressSpace::new_shared(l0) {
-        Some(a) => a,
-        None => { console::print("  OOM (child AS)\n"); return false; }
-    };
-    let info = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM\n"); return false; }
-    };
+    let child_as = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new_shared(l0) { a } else { console::print("  OOM (child AS)\n"); return false; };
+    let info = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
 
     let mut parent_proc = make_test_process(parent_pid, 0, parent_as, info.addr);
 
     // Simulate an eager mmap on the parent
-    let test_frame = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM\n"); return false; }
-    };
+    let test_frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
     parent_proc.mmap_regions.push((0x6809_d000, vec![test_frame]));
 
     let child_proc = make_test_process(child_pid, parent_pid, child_as, info.addr);
@@ -4163,9 +4132,9 @@ fn test_clone_vm_mmap_regions_on_owner() -> bool {
     akuma_exec::process::register_process(child_pid, child_proc);
 
     let parent_regions = akuma_exec::process::lookup_process(parent_pid)
-        .map(|p| p.mmap_regions.len()).unwrap_or(0);
+        .map_or(0, |p| p.mmap_regions.len());
     let child_regions = akuma_exec::process::lookup_process(child_pid)
-        .map(|p| p.mmap_regions.len()).unwrap_or(0);
+        .map_or(0, |p| p.mmap_regions.len());
 
     // Cleanup
     let _ = akuma_exec::process::unregister_process(child_pid);
@@ -4198,19 +4167,10 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
     let owner_pid = akuma_exec::process::allocate_pid();
     let worker_pid = akuma_exec::process::allocate_pid();
 
-    let owner_as = match akuma_exec::mmu::UserAddressSpace::new() {
-        Some(a) => a,
-        None => { console::print("  OOM\n"); return false; }
-    };
+    let owner_as = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM\n"); return false; };
     let l0 = owner_as.l0_phys();
-    let worker_as = match akuma_exec::mmu::UserAddressSpace::new_shared(l0) {
-        Some(a) => a,
-        None => { console::print("  OOM\n"); return false; }
-    };
-    let info = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM\n"); return false; }
-    };
+    let worker_as = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new_shared(l0) { a } else { console::print("  OOM\n"); return false; };
+    let info = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
 
     let mut owner_proc = make_test_process(owner_pid, 0, owner_as, info.addr);
     let worker_proc = make_test_process(worker_pid, owner_pid, worker_as, info.addr);
@@ -4220,13 +4180,10 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
     let pages = 127usize;
     let mut frames = Vec::new();
     for _ in 0..pages {
-        match crate::pmm::alloc_page_zeroed() {
-            Some(f) => frames.push(f),
-            None => {
-                for f in frames { crate::pmm::free_page(f); }
-                console::print("  OOM (frames)\n");
-                return false;
-            }
+        if let Some(f) = crate::pmm::alloc_page_zeroed() { frames.push(f) } else {
+            for f in frames { crate::pmm::free_page(f); }
+            console::print("  OOM (frames)\n");
+            return false;
         }
     }
     owner_proc.mmap_regions.push((region_base, frames));
@@ -4322,7 +4279,7 @@ fn clear_pte(l0_phys: usize, va: usize) {
         let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
         let l2e = l2_ptr.add((va >> 21) & 0x1FF).read_volatile();
         if l2e & 1 == 0 { return; }
-        let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+        let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
         l3_ptr.add((va >> 12) & 0x1FF).write_volatile(0);
         akuma_exec::mmu::flush_tlb_page(va);
     }
@@ -4351,14 +4308,11 @@ fn test_map_127_pages_all_ptes_exist() -> bool {
     let mut frames = Vec::new();
 
     for i in 0..pages {
-        let frame = match crate::pmm::alloc_page_zeroed() {
-            Some(f) => f,
-            None => {
-                console::print("  OOM\n");
-                for j in 0..frames.len() { clear_pte(l0_phys, base_va + j * 4096); }
-                for f in frames { crate::pmm::free_page(f); }
-                return false;
-            }
+        let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else {
+            console::print("  OOM\n");
+            for j in 0..frames.len() { clear_pte(l0_phys, base_va + j * 4096); }
+            for f in frames { crate::pmm::free_page(f); }
+            return false;
         };
         // Drop the returned table frames — matches real kernel behavior
         let _ = unsafe {
@@ -4403,13 +4357,10 @@ fn test_map_pages_survive_subsequent_allocs() -> bool {
     let mut frames = Vec::new();
 
     for i in 0..pages {
-        let frame = match crate::pmm::alloc_page_zeroed() {
-            Some(f) => f,
-            None => {
-                for j in 0..frames.len() { clear_pte(l0_phys, base_va + j * 4096); }
-                for f in frames { crate::pmm::free_page(f); }
-                console::print("  OOM\n"); return false;
-            }
+        let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else {
+            for j in 0..frames.len() { clear_pte(l0_phys, base_va + j * 4096); }
+            for f in frames { crate::pmm::free_page(f); }
+            console::print("  OOM\n"); return false;
         };
         let _ = unsafe {
             akuma_exec::mmu::map_user_page(base_va + i * 4096, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
@@ -4464,14 +4415,11 @@ fn test_map_interleaved_regions_same_l3() -> bool {
 
     for &(offset, count) in &regions {
         for i in 0..count {
-            let frame = match crate::pmm::alloc_page_zeroed() {
-                Some(f) => f,
-                None => {
-                    console::print("  OOM\n");
-                    for (va, _) in &mappings { clear_pte(l0_phys, *va); }
-                    for (_, f) in mappings { crate::pmm::free_page(f); }
-                    return false;
-                }
+            let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else {
+                console::print("  OOM\n");
+                for (va, _) in &mappings { clear_pte(l0_phys, *va); }
+                for (_, f) in mappings { crate::pmm::free_page(f); }
+                return false;
             };
             let va = base_2mb + offset + i * 4096;
             let _ = unsafe {
@@ -4589,12 +4537,9 @@ fn test_eager_munmap_prefix_preserves_suffix() -> bool {
     let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
     let mut frames = Vec::new();
     for _ in 0..pages {
-        match crate::pmm::alloc_page_zeroed() {
-            Some(f) => frames.push(f),
-            None => {
-                for f in frames { crate::pmm::free_page(f); }
-                console::print("  OOM\n"); return false;
-            }
+        if let Some(f) = crate::pmm::alloc_page_zeroed() { frames.push(f) } else {
+            for f in frames { crate::pmm::free_page(f); }
+            console::print("  OOM\n"); return false;
         }
     }
     mmap_regions.push((base, frames));
@@ -4644,12 +4589,9 @@ fn test_eager_munmap_suffix_preserves_prefix() -> bool {
     let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
     let mut frames = Vec::new();
     for _ in 0..pages {
-        match crate::pmm::alloc_page_zeroed() {
-            Some(f) => frames.push(f),
-            None => {
-                for f in frames { crate::pmm::free_page(f); }
-                console::print("  OOM\n"); return false;
-            }
+        if let Some(f) = crate::pmm::alloc_page_zeroed() { frames.push(f) } else {
+            for f in frames { crate::pmm::free_page(f); }
+            console::print("  OOM\n"); return false;
         }
     }
     mmap_regions.push((base, frames));
@@ -4687,12 +4629,9 @@ fn test_eager_munmap_full_removes_all() -> bool {
     let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
     let mut frames = Vec::new();
     for _ in 0..pages {
-        match crate::pmm::alloc_page_zeroed() {
-            Some(f) => frames.push(f),
-            None => {
-                for f in frames { crate::pmm::free_page(f); }
-                console::print("  OOM\n"); return false;
-            }
+        if let Some(f) = crate::pmm::alloc_page_zeroed() { frames.push(f) } else {
+            for f in frames { crate::pmm::free_page(f); }
+            console::print("  OOM\n"); return false;
         }
     }
     mmap_regions.push((base, frames));
@@ -4725,12 +4664,9 @@ fn test_munmap_fallback_clears_stale_ptes() -> bool {
     let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
     let mut eager_frames = Vec::new();
     for _ in 0..eager_pages {
-        match crate::pmm::alloc_page_zeroed() {
-            Some(f) => eager_frames.push(f),
-            None => {
-                for f in eager_frames { crate::pmm::free_page(f); }
-                console::print("  OOM\n"); return false;
-            }
+        if let Some(f) = crate::pmm::alloc_page_zeroed() { eager_frames.push(f) } else {
+            for f in eager_frames { crate::pmm::free_page(f); }
+            console::print("  OOM\n"); return false;
         }
     }
     mmap_regions.push((eager_base, eager_frames));
@@ -4780,8 +4716,7 @@ fn test_mprotect_updates_lazy_flags() -> bool {
 
     // Verify initial flags are 0
     let initial_flags = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, va_start)
-        .map(|(f, _, _, _)| f)
-        .unwrap_or(0xDEAD);
+        .map_or(0xDEAD, |(f, _, _, _)| f);
     let initial_ok = initial_flags == 0;
 
     // mprotect updates flags to RW_NO_EXEC
@@ -4790,8 +4725,7 @@ fn test_mprotect_updates_lazy_flags() -> bool {
 
     // Verify flags are updated
     let updated_flags = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, va_start)
-        .map(|(f, _, _, _)| f)
-        .unwrap_or(0xDEAD);
+        .map_or(0xDEAD, |(f, _, _, _)| f);
     let updated_ok = updated_flags == new_flags;
 
     // Clean up
@@ -4823,14 +4757,8 @@ fn test_execve_clears_child_tid() -> bool {
     console::print("\n[TEST] Bug 2: execve must reset clear_child_tid\n");
 
     let pid = akuma_exec::process::allocate_pid();
-    let addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
-        Some(a) => a,
-        None => { console::print("  OOM (AS)\n"); return false; }
-    };
-    let info = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM\n"); return false; }
-    };
+    let addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (AS)\n"); return false; };
+    let info = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
 
     // Create Process with clear_child_tid set (simulating set_tid_address)
     let mut proc = make_test_process(pid, 0, addr_space, info.addr);
@@ -4877,14 +4805,8 @@ fn test_execve_clears_child_tid() -> bool {
 fn test_map_user_page_race_leaks_frame() -> bool {
     console::print("\n[TEST] Bug 3: map_user_page race → phantom frame leak\n");
 
-    let frame_a = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM\n"); return false; }
-    };
-    let frame_b = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { crate::pmm::free_page(frame_a); console::print("  OOM\n"); return false; }
-    };
+    let frame_a = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
+    let frame_b = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { crate::pmm::free_page(frame_a); console::print("  OOM\n"); return false; };
 
     // Above the RAM identity map (see test_map_user_page_roundtrip for why a fixed
     // ~7.5GB VA crashes at MEMORY≥8G).
@@ -4909,23 +4831,23 @@ fn test_map_user_page_race_leaks_frame() -> bool {
     // First call: installed_a should be true (we won the race).
     // Second call: installed_b should be false (we lost, frame_b is phantom).
     let pte_pa = get_mapped_pa(test_va);
-    let _frame_b_is_phantom = pte_pa == Some(frame_a.addr);
+    let _ = pte_pa == Some(frame_a.addr); // frame_b should be phantom (not installed)
 
     // Cleanup: clear the PTE manually
     unsafe {
         let ttbr0: u64;
         core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
         let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
-        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *mut u64;
+        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr).cast::<u64>();
         let l0e = l0_ptr.add((test_va >> 39) & 0x1FF).read_volatile();
         if l0e & 1 != 0 {
-            let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+            let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
             let l1e = l1_ptr.add((test_va >> 30) & 0x1FF).read_volatile();
             if l1e & 1 != 0 {
-                let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
                 let l2e = l2_ptr.add((test_va >> 21) & 0x1FF).read_volatile();
                 if l2e & 1 != 0 {
-                    let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                    let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
                     l3_ptr.add((test_va >> 12) & 0x1FF).write_volatile(0);
                     akuma_exec::mmu::flush_tlb_page(test_va);
                 }
@@ -5004,10 +4926,7 @@ fn test_readahead_race_phantom_frames() -> bool {
     let mut table_frames_all = Vec::new();
     let mut all_installed = true;
     for i in 0..NUM_PAGES {
-        let frame = match crate::pmm::alloc_page_zeroed() {
-            Some(f) => f,
-            None => { console::print("  OOM\n"); return false; }
-        };
+        let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
         let (tfs, installed) = unsafe {
             akuma_exec::mmu::map_user_page(base_va + i * 0x1000, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
         };
@@ -5035,16 +4954,16 @@ fn test_readahead_race_phantom_frames() -> bool {
             let ttbr0: u64;
             core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
             let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
-            let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *mut u64;
+            let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr).cast::<u64>();
             let l0e = l0_ptr.add((va >> 39) & 0x1FF).read_volatile();
             if l0e & 1 != 0 {
-                let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
                 let l1e = l1_ptr.add((va >> 30) & 0x1FF).read_volatile();
                 if l1e & 1 != 0 {
-                    let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                    let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
                     let l2e = l2_ptr.add((va >> 21) & 0x1FF).read_volatile();
                     if l2e & 1 != 0 {
-                        let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+                        let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
                         l3_ptr.add((va >> 12) & 0x1FF).write_volatile(0);
                         akuma_exec::mmu::flush_tlb_page(va);
                     }
@@ -5076,15 +4995,9 @@ fn test_readahead_race_phantom_frames() -> bool {
 fn test_unmap_and_free_page_returns_frame() -> bool {
     console::print("\n[TEST] unmap_and_free_page: returns frame and removes from user_frames\n");
 
-    let mut addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
-        Some(a) => a,
-        None => { console::print("  OOM (addr_space)\n"); return false; }
-    };
+    let mut addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (addr_space)\n"); return false; };
 
-    let frame = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM (frame)\n"); return false; }
-    };
+    let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM (frame)\n"); return false; };
 
     let test_va: usize = 0x1000_0000;
     if addr_space.map_page(test_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
@@ -5128,10 +5041,7 @@ fn test_lazy_munmap_frees_demand_paged_frames() -> bool {
     console::print("\n[TEST] lazy munmap: frees demand-paged physical frames\n");
 
     let test_pid = akuma_exec::process::allocate_pid();
-    let mut addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
-        Some(a) => a,
-        None => { console::print("  OOM (addr_space)\n"); return false; }
-    };
+    let mut addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (addr_space)\n"); return false; };
 
     let base_va: usize = 0x7000_0000;
     let num_pages: usize = 8;
@@ -5143,14 +5053,11 @@ fn test_lazy_munmap_frees_demand_paged_frames() -> bool {
 
     let mut page_frames = Vec::new();
     for i in 0..num_pages {
-        let f = match crate::pmm::alloc_page_zeroed() {
-            Some(f) => f,
-            None => {
-                for pf in &page_frames { crate::pmm::free_page(*pf); }
-                akuma_exec::process::clear_lazy_regions(test_pid);
-                console::print("  OOM\n");
-                return false;
-            }
+        let f = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else {
+            for pf in &page_frames { crate::pmm::free_page(*pf); }
+            akuma_exec::process::clear_lazy_regions(test_pid);
+            console::print("  OOM\n");
+            return false;
         };
         let va = base_va + i * 4096;
         if addr_space.map_page(va, f.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
@@ -5203,10 +5110,7 @@ fn test_madvise_dontneed_frees_pages() -> bool {
     console::print("\n[TEST] MADV_DONTNEED: zeroes pages in place, preserves mapping & lazy region\n");
 
     let test_pid = akuma_exec::process::allocate_pid();
-    let mut addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
-        Some(a) => a,
-        None => { console::print("  OOM (addr_space)\n"); return false; }
-    };
+    let mut addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (addr_space)\n"); return false; };
 
     let base_va: usize = 0xA000_0000;
     let num_pages: usize = 16;
@@ -5215,13 +5119,10 @@ fn test_madvise_dontneed_frees_pages() -> bool {
     akuma_exec::process::push_lazy_region(test_pid, base_va, region_size, 0);
 
     for i in 0..num_pages {
-        let f = match crate::pmm::alloc_page_zeroed() {
-            Some(f) => f,
-            None => {
-                akuma_exec::process::clear_lazy_regions(test_pid);
-                console::print("  OOM\n");
-                return false;
-            }
+        let f = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else {
+            akuma_exec::process::clear_lazy_regions(test_pid);
+            console::print("  OOM\n");
+            return false;
         };
         let va = base_va + i * 4096;
         if addr_space.map_page(va, f.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
@@ -5234,7 +5135,7 @@ fn test_madvise_dontneed_frees_pages() -> bool {
 
         // Write a non-zero pattern so we can verify zeroing
         unsafe {
-            let ptr = akuma_exec::mmu::phys_to_virt(f.addr) as *mut u8;
+            let ptr = akuma_exec::mmu::phys_to_virt(f.addr).cast::<u8>();
             core::ptr::write_bytes(ptr, 0xAB, 4096);
         }
     }
@@ -5258,7 +5159,7 @@ fn test_madvise_dontneed_frees_pages() -> bool {
     // Lazy region must still exist
     let region_exists = crate::irq::with_irqs_disabled(|| {
         let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
-        table.get(&test_pid).map_or(false, |r| {
+        table.get(&test_pid).is_some_and(|r| {
             r.values().any(|lr| lr.start_va == base_va && lr.size == region_size)
         })
     });
@@ -5278,16 +5179,10 @@ fn test_madvise_dontneed_frees_pages() -> bool {
 fn test_madvise_dontneed_loop_no_leak() -> bool {
     console::print("\n[TEST] MADV_DONTNEED loop: zero-in-place 50 iterations, no leak\n");
 
-    let mut addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
-        Some(a) => a,
-        None => { console::print("  OOM (addr_space)\n"); return false; }
-    };
+    let mut addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (addr_space)\n"); return false; };
 
     let test_va: usize = 0xB000_0000;
-    let f = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM\n"); return false; }
-    };
+    let f = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
     if addr_space.map_page(test_va, f.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
         crate::pmm::free_page(f);
         console::print("  map_page failed\n");
@@ -5301,7 +5196,7 @@ fn test_madvise_dontneed_loop_no_leak() -> bool {
     for _ in 0..iterations {
         // Write dirty data, then zero via MADV_DONTNEED semantics
         unsafe {
-            let ptr = akuma_exec::mmu::phys_to_virt(f.addr) as *mut u8;
+            let ptr = akuma_exec::mmu::phys_to_virt(f.addr).cast::<u8>();
             core::ptr::write_bytes(ptr, 0xCC, 4096);
         }
         addr_space.zero_mapped_page(test_va);
@@ -5329,7 +5224,7 @@ fn test_kill_process_clears_lazy_regions() -> bool {
 
     let before = crate::irq::with_irqs_disabled(|| {
         let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
-        table.get(&test_pid).map_or(0, |r| r.len())
+        table.get(&test_pid).map_or(0, alloc::collections::BTreeMap::len)
     });
 
     akuma_exec::process::clear_lazy_regions(test_pid);
@@ -5354,25 +5249,13 @@ fn test_kill_process_cascades_to_children() -> bool {
     let parent_pid = akuma_exec::process::allocate_pid();
     let child_pid = akuma_exec::process::allocate_pid();
 
-    let parent_as = match akuma_exec::mmu::UserAddressSpace::new() {
-        Some(a) => a,
-        None => { console::print("  OOM (parent AS)\n"); return false; }
-    };
-    let child_as = match akuma_exec::mmu::UserAddressSpace::new() {
-        Some(a) => a,
-        None => { console::print("  OOM (child AS)\n"); return false; }
-    };
-    let parent_info = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM (parent info)\n"); return false; }
-    };
-    let child_info = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => {
-            crate::pmm::free_page(parent_info);
-            console::print("  OOM (child info)\n");
-            return false;
-        }
+    let parent_as = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (parent AS)\n"); return false; };
+    let child_as = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (child AS)\n"); return false; };
+    let parent_info = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM (parent info)\n"); return false; };
+    let child_info = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else {
+        crate::pmm::free_page(parent_info);
+        console::print("  OOM (child info)\n");
+        return false;
     };
 
     let parent_proc = make_test_process(parent_pid, 0, parent_as, parent_info.addr);
@@ -5383,9 +5266,9 @@ fn test_kill_process_cascades_to_children() -> bool {
     let kill_ok = akuma_exec::process::kill_process(parent_pid).is_ok();
     // After kill, processes should be zombies (still in table, but exited=true)
     let parent_zombie = akuma_exec::process::lookup_process(parent_pid)
-        .map(|p| p.exited).unwrap_or(false);
+        .is_some_and(|p| p.exited);
     let child_zombie = akuma_exec::process::lookup_process(child_pid)
-        .map(|p| p.exited).unwrap_or(false);
+        .is_some_and(|p| p.exited);
 
     // Clean up zombies (simulates what wait4/on_thread_cleanup would do)
     let _ = akuma_exec::process::unregister_process(parent_pid);
@@ -5407,16 +5290,13 @@ fn test_alloc_pages_batch_basic() -> bool {
     console::print("\n[TEST] alloc_pages_zeroed: batch 64 pages, all distinct and zeroed\n");
 
     let count = 64usize;
-    let frames = match crate::pmm::alloc_pages_zeroed(count) {
-        Some(f) => f,
-        None => { console::print("  OOM\n"); return false; }
-    };
+    let frames = if let Some(f) = crate::pmm::alloc_pages_zeroed(count) { f } else { console::print("  OOM\n"); return false; };
 
     let got_count = frames.len() == count;
 
     // Verify all distinct addresses
     let mut addrs: Vec<usize> = frames.iter().map(|f| f.addr).collect();
-    addrs.sort();
+    addrs.sort_unstable();
     addrs.dedup();
     let all_distinct = addrs.len() == count;
 
@@ -5451,10 +5331,7 @@ fn test_alloc_pages_batch_free() -> bool {
 
     let free_before = crate::pmm::free_count();
 
-    let frames = match crate::pmm::alloc_pages_zeroed(128) {
-        Some(f) => f,
-        None => { console::print("  OOM\n"); return false; }
-    };
+    let frames = if let Some(f) = crate::pmm::alloc_pages_zeroed(128) { f } else { console::print("  OOM\n"); return false; };
 
     let free_during = crate::pmm::free_count();
     let allocated_128 = free_before - free_during == 128;
@@ -5499,28 +5376,19 @@ fn test_alloc_pages_batch_insufficient() -> bool {
 fn test_alloc_pages_batch_interleaved() -> bool {
     console::print("\n[TEST] alloc_pages_zeroed: interleaved with single allocs\n");
 
-    let batch1 = match crate::pmm::alloc_pages_zeroed(16) {
-        Some(f) => f,
-        None => { console::print("  OOM batch1\n"); return false; }
+    let batch1 = if let Some(f) = crate::pmm::alloc_pages_zeroed(16) { f } else { console::print("  OOM batch1\n"); return false; };
+
+    let single1 = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else {
+        for f in &batch1 { crate::pmm::free_page(*f); }
+        console::print("  OOM single1\n");
+        return false;
     };
 
-    let single1 = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => {
-            for f in &batch1 { crate::pmm::free_page(*f); }
-            console::print("  OOM single1\n");
-            return false;
-        }
-    };
-
-    let batch2 = match crate::pmm::alloc_pages_zeroed(16) {
-        Some(f) => f,
-        None => {
-            for f in &batch1 { crate::pmm::free_page(*f); }
-            crate::pmm::free_page(single1);
-            console::print("  OOM batch2\n");
-            return false;
-        }
+    let batch2 = if let Some(f) = crate::pmm::alloc_pages_zeroed(16) { f } else {
+        for f in &batch1 { crate::pmm::free_page(*f); }
+        crate::pmm::free_page(single1);
+        console::print("  OOM batch2\n");
+        return false;
     };
 
     let mut all_addrs: Vec<usize> = Vec::new();
@@ -5528,7 +5396,7 @@ fn test_alloc_pages_batch_interleaved() -> bool {
     all_addrs.push(single1.addr);
     for f in &batch2 { all_addrs.push(f.addr); }
 
-    all_addrs.sort();
+    all_addrs.sort_unstable();
     let before_dedup = all_addrs.len();
     all_addrs.dedup();
     let no_overlap = all_addrs.len() == before_dedup;
@@ -5551,15 +5419,9 @@ fn test_alloc_pages_batch_interleaved() -> bool {
 fn test_mprotect_flag_update_with_cache_maintenance() -> bool {
     console::print("\n[TEST] mprotect: flag update RW -> RX with cache maintenance\n");
 
-    let mut addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
-        Some(a) => a,
-        None => { console::print("  OOM (addr_space)\n"); return false; }
-    };
+    let mut addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (addr_space)\n"); return false; };
 
-    let frame = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM (frame)\n"); return false; }
-    };
+    let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM (frame)\n"); return false; };
 
     let test_va: usize = 0xC000_0000;
     if addr_space.map_page(test_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
@@ -5570,7 +5432,7 @@ fn test_mprotect_flag_update_with_cache_maintenance() -> bool {
     addr_space.track_user_frame(frame);
 
     // Write some data (simulating JIT code write)
-    let ptr = akuma_exec::mmu::phys_to_virt(frame.addr) as *mut u32;
+    let ptr = akuma_exec::mmu::phys_to_virt(frame.addr).cast::<u32>();
     unsafe {
         // AArch64 NOP = 0xD503201F, RET = 0xD65F03C0
         ptr.write_volatile(0xD503201F); // NOP
@@ -5615,18 +5477,12 @@ fn test_mprotect_flag_update_with_cache_maintenance() -> bool {
 fn test_mprotect_large_region_completes() -> bool {
     console::print("\n[TEST] mprotect: IC IALLU on 256-page region completes\n");
 
-    let mut addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
-        Some(a) => a,
-        None => { console::print("  OOM (addr_space)\n"); return false; }
-    };
+    let mut addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (addr_space)\n"); return false; };
 
     let num_pages: usize = 256;
     let base_va: usize = 0xD000_0000;
 
-    let frames = match crate::pmm::alloc_pages_zeroed(num_pages) {
-        Some(f) => f,
-        None => { console::print("  OOM (frames)\n"); return false; }
-    };
+    let frames = if let Some(f) = crate::pmm::alloc_pages_zeroed(num_pages) { f } else { console::print("  OOM (frames)\n"); return false; };
 
     for (i, f) in frames.iter().enumerate() {
         let va = base_va + i * 4096;
@@ -5648,7 +5504,7 @@ fn test_mprotect_large_region_completes() -> bool {
     // Clean via each frame's kernel-mapped address (not the user VA in the
     // inactive `addr_space`), matching the real sys_mprotect path — see the
     // companion note in test_mprotect_flag_update_with_cache_maintenance.
-    for f in frames.iter() {
+    for f in &frames {
         let kva = akuma_exec::mmu::phys_to_virt(f.addr) as usize;
         unsafe {
             let mut off = 0usize;
@@ -5699,12 +5555,9 @@ fn test_arena_trim_crash_pattern() -> bool {
     );
 
     // Step 1: alloc_mmap(8GB) — simulates bun's MAP_NORESERVE mmap
-    let base = match mem.alloc_mmap(LARGE_SIZE) {
-        Some(a) => a,
-        None => {
-            crate::safe_print!(128, "  alloc_mmap(8GB) returned None\n");
-            return false;
-        }
+    let base = if let Some(a) = mem.alloc_mmap(LARGE_SIZE) { a } else {
+        crate::safe_print!(128, "  alloc_mmap(8GB) returned None\n");
+        return false;
     };
     akuma_exec::process::push_lazy_region(test_pid, base, LARGE_SIZE, 0);
 
@@ -5721,13 +5574,10 @@ fn test_arena_trim_crash_pattern() -> bool {
     let mid_gone = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, mid).is_none();
 
     // Step 3: alloc_mmap(0x851000) — first-fit should return same base
-    let small_base = match mem.alloc_mmap(SMALL_SIZE) {
-        Some(a) => a,
-        None => {
-            crate::safe_print!(128, "  alloc_mmap(small) returned None\n");
-            akuma_exec::process::clear_lazy_regions(test_pid);
-            return false;
-        }
+    let small_base = if let Some(a) = mem.alloc_mmap(SMALL_SIZE) { a } else {
+        crate::safe_print!(128, "  alloc_mmap(small) returned None\n");
+        akuma_exec::process::clear_lazy_regions(test_pid);
+        return false;
     };
     let reused_base = small_base == base;
     akuma_exec::process::push_lazy_region(test_pid, small_base, SMALL_SIZE, 0);
@@ -5814,13 +5664,10 @@ fn test_multi_arena_trim_crash() -> bool {
     let mut region_bases: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
 
     for &sz in &region_sizes {
-        let base = match mem.alloc_mmap(sz) {
-            Some(a) => a,
-            None => {
-                crate::safe_print!(64, "  alloc_mmap(0x{:x}) failed\n", sz);
-                akuma_exec::process::clear_lazy_regions(test_pid);
-                return false;
-            }
+        let base = if let Some(a) = mem.alloc_mmap(sz) { a } else {
+            crate::safe_print!(64, "  alloc_mmap(0x{:x}) failed\n", sz);
+            akuma_exec::process::clear_lazy_regions(test_pid);
+            return false;
         };
         akuma_exec::process::push_lazy_region(test_pid, base, sz, 0);
         region_bases.push(base);
@@ -5830,13 +5677,10 @@ fn test_multi_arena_trim_crash() -> bool {
 
     // Phase 2: allocate 8 GB arena (becomes region 18)
     const LARGE_SIZE: usize = 0x2_0000_0000;
-    let arena_base = match mem.alloc_mmap(LARGE_SIZE) {
-        Some(a) => a,
-        None => {
-            crate::safe_print!(64, "  alloc_mmap(8GB) failed\n");
-            akuma_exec::process::clear_lazy_regions(test_pid);
-            return false;
-        }
+    let arena_base = if let Some(a) = mem.alloc_mmap(LARGE_SIZE) { a } else {
+        crate::safe_print!(64, "  alloc_mmap(8GB) failed\n");
+        akuma_exec::process::clear_lazy_regions(test_pid);
+        return false;
     };
     akuma_exec::process::push_lazy_region(test_pid, arena_base, LARGE_SIZE, 0);
     let has_18 = akuma_exec::process::lazy_region_count_for_pid(test_pid) == 18;
@@ -5858,13 +5702,10 @@ fn test_multi_arena_trim_crash() -> bool {
 
     // Phase 4: small PROT_NONE re-mmap (0x851000, exact value from crash log)
     const SMALL_SIZE: usize = 0x851000;
-    let small_base = match mem.alloc_mmap(SMALL_SIZE) {
-        Some(a) => a,
-        None => {
-            crate::safe_print!(64, "  alloc_mmap(small) failed\n");
-            akuma_exec::process::clear_lazy_regions(test_pid);
-            return false;
-        }
+    let small_base = if let Some(a) = mem.alloc_mmap(SMALL_SIZE) { a } else {
+        crate::safe_print!(64, "  alloc_mmap(small) failed\n");
+        akuma_exec::process::clear_lazy_regions(test_pid);
+        return false;
     };
     akuma_exec::process::push_lazy_region(test_pid, small_base, SMALL_SIZE, 0);
     let reused_base = small_base == arena_base;
@@ -5956,8 +5797,8 @@ fn test_mremap_lazy_region_shrink() -> bool {
 
     akuma_exec::process::push_lazy_region(test_pid, base_va, old_size, 0);
 
-    let old_pages = (old_size + 4095) / 4096;
-    let new_pages = (new_size + 4095) / 4096;
+    let old_pages = old_size.div_ceil(4096);
+    let new_pages = new_size.div_ceil(4096);
     let shrink_returns_old = new_pages <= old_pages;
 
     // Lazy region should still be present (shrink is a no-op for sys_mremap)
@@ -6013,15 +5854,9 @@ fn test_set_robust_list_stores_head() -> bool {
     console::print("\n[TEST] set_robust_list: stores head pointer\n");
 
     let test_pid = akuma_exec::process::allocate_pid();
-    let addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
-        Some(a) => a,
-        None => { console::print("  OOM\n"); return false; }
-    };
+    let addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM\n"); return false; };
 
-    let info_frame = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM\n"); return false; }
-    };
+    let info_frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
 
     let mut proc = make_test_process(test_pid, 0, addr_space, info_frame.addr);
     let initial_ok = proc.robust_list_head == 0;
@@ -6045,15 +5880,9 @@ fn test_robust_list_cleanup_wakes_futex() -> bool {
     console::print("\n[TEST] robust_list: fields initialized to zero\n");
 
     let test_pid = akuma_exec::process::allocate_pid();
-    let addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
-        Some(a) => a,
-        None => { console::print("  OOM\n"); return false; }
-    };
+    let addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM\n"); return false; };
 
-    let info_frame = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM\n"); return false; }
-    };
+    let info_frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
 
     let proc = make_test_process(test_pid, 0, addr_space, info_frame.addr);
     let head_zero = proc.robust_list_head == 0;
@@ -6563,7 +6392,7 @@ fn test_large_mmap_limit() -> bool {
         mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit);
     
     // Bun allocates a 1GB arena + 64GB Gigacage (not 128GB contiguous)
-    let arena_size = 1usize * 1024 * 1024 * 1024;
+    let arena_size = 1024 * 1024 * 1024;
     let gigacage_size = 64usize * 1024 * 1024 * 1024;
 
     let arena_addr = mem.alloc_mmap(arena_size);
@@ -6593,14 +6422,8 @@ fn test_close_range() -> bool {
     console::print("\n[TEST] sys_close_range\n");
 
     let test_pid = akuma_exec::process::allocate_pid();
-    let addr_space = match akuma_exec::mmu::UserAddressSpace::new() {
-        Some(a) => a,
-        None => { console::print("  OOM (addr space)\n"); return false; }
-    };
-    let info_frame = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM (info frame)\n"); return false; }
-    };
+    let addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (addr space)\n"); return false; };
+    let info_frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM (info frame)\n"); return false; };
 
     let test_proc = make_test_process(test_pid, 0, addr_space, info_frame.addr);
     akuma_exec::process::register_process(test_pid, test_proc);
@@ -6678,12 +6501,9 @@ fn test_pmm_contiguous_alloc_basic() -> bool {
     const PAGES: usize = 32; // 128KB — minimum thread stack size
     let before = crate::pmm::free_count();
 
-    let frame = match crate::pmm::alloc_pages_contiguous_zeroed(PAGES) {
-        Some(f) => f,
-        None => {
-            console::print("  OOM\n");
-            return false;
-        }
+    let frame = if let Some(f) = crate::pmm::alloc_pages_contiguous_zeroed(PAGES) { f } else {
+        console::print("  OOM\n");
+        return false;
     };
 
     let during = crate::pmm::free_count();
@@ -6712,12 +6532,9 @@ fn test_pmm_contiguous_alloc_zeroed() -> bool {
     console::print("\n[TEST] PMM contiguous alloc: all pages are zeroed\n");
 
     const PAGES: usize = 8;
-    let frame = match crate::pmm::alloc_pages_contiguous_zeroed(PAGES) {
-        Some(f) => f,
-        None => {
-            console::print("  OOM\n");
-            return false;
-        }
+    let frame = if let Some(f) = crate::pmm::alloc_pages_contiguous_zeroed(PAGES) { f } else {
+        console::print("  OOM\n");
+        return false;
     };
 
     let mut all_zero = true;
@@ -6747,16 +6564,13 @@ fn test_pmm_contiguous_free_restores_count() -> bool {
     const PAGES: usize = 64; // 256KB — system_thread_stack_size
     let before = crate::pmm::free_count();
 
-    let frame = match crate::pmm::alloc_pages_contiguous_zeroed(PAGES) {
-        Some(f) => f,
-        None => {
-            console::print("  OOM\n");
-            return false;
-        }
+    let frame = if let Some(f) = crate::pmm::alloc_pages_contiguous_zeroed(PAGES) { f } else {
+        console::print("  OOM\n");
+        return false;
     };
 
     // Write a sentinel to each page so we know they're all distinct
-    let base = akuma_exec::mmu::phys_to_virt(frame.addr) as *mut u64;
+    let base = akuma_exec::mmu::phys_to_virt(frame.addr).cast::<u64>();
     for i in 0..PAGES {
         unsafe { base.add(i * 512).write_volatile(0xDEAD_BEEF_0000_0000 | i as u64); }
     }
@@ -6789,14 +6603,11 @@ fn test_pmm_contiguous_stack_sized_no_overlap() -> bool {
     let mut oom = false;
 
     for _ in 0..NUM_SLOTS {
-        match crate::pmm::alloc_pages_contiguous_zeroed(STACK_PAGES) {
-            Some(f) => {
-                frames.push((f.addr, f.addr + STACK_PAGES * 4096));
-            }
-            None => {
-                oom = true;
-                break;
-            }
+        if let Some(f) = crate::pmm::alloc_pages_contiguous_zeroed(STACK_PAGES) {
+            frames.push((f.addr, f.addr + STACK_PAGES * 4096));
+        } else {
+            oom = true;
+            break;
         }
     }
 
@@ -6843,28 +6654,19 @@ fn test_pmm_contiguous_double_stack_size_no_overlap() -> bool {
     const SMALL_PAGES: usize = 32; // 128KB original
     const LARGE_PAGES: usize = 64; // 256KB reallocated
 
-    let frame_a = match crate::pmm::alloc_pages_contiguous_zeroed(SMALL_PAGES) {
-        Some(f) => f,
-        None => { console::print("  OOM\n"); return false; }
-    };
-    let frame_b = match crate::pmm::alloc_pages_contiguous_zeroed(SMALL_PAGES) {
-        Some(f) => f,
-        None => {
-            crate::pmm::free_pages_contiguous(frame_a, SMALL_PAGES);
-            console::print("  OOM\n");
-            return false;
-        }
+    let frame_a = if let Some(f) = crate::pmm::alloc_pages_contiguous_zeroed(SMALL_PAGES) { f } else { console::print("  OOM\n"); return false; };
+    let frame_b = if let Some(f) = crate::pmm::alloc_pages_contiguous_zeroed(SMALL_PAGES) { f } else {
+        crate::pmm::free_pages_contiguous(frame_a, SMALL_PAGES);
+        console::print("  OOM\n");
+        return false;
     };
 
     // Simulate reallocating frame_a: free it, then alloc a larger region
     crate::pmm::free_pages_contiguous(frame_a, SMALL_PAGES);
-    let frame_large = match crate::pmm::alloc_pages_contiguous_zeroed(LARGE_PAGES) {
-        Some(f) => f,
-        None => {
-            crate::pmm::free_pages_contiguous(frame_b, SMALL_PAGES);
-            console::print("  OOM\n");
-            return false;
-        }
+    let frame_large = if let Some(f) = crate::pmm::alloc_pages_contiguous_zeroed(LARGE_PAGES) { f } else {
+        crate::pmm::free_pages_contiguous(frame_b, SMALL_PAGES);
+        console::print("  OOM\n");
+        return false;
     };
 
     // frame_large must not overlap with frame_b (the surviving stack)
@@ -6914,12 +6716,9 @@ fn test_alloc_mmap_skips_kernel_va_hole() -> bool {
 
     // A 2-page alloc would straddle [KERNEL_VA_START-4096, KERNEL_VA_START+4096)
     // which enters the hole. The allocator must jump past KERNEL_VA_END.
-    let addr = match mem.alloc_mmap(2 * 4096) {
-        Some(a) => a,
-        None => {
-            console::print("  alloc_mmap returned None unexpectedly\n");
-            return false;
-        }
+    let addr = if let Some(a) = mem.alloc_mmap(2 * 4096) { a } else {
+        console::print("  alloc_mmap returned None unexpectedly\n");
+        return false;
     };
 
     let inside_hole = addr < kernel_va_end && addr + 2 * 4096 > KERNEL_VA_START;
@@ -7192,13 +6991,10 @@ fn test_go_binary_va_exhaustion_scenario() -> bool {
 
     let mut large_all_ok = true;
     for i in 0..NUM_PROBES {
-        match mem_large.alloc_mmap(PROBE_SIZE) {
-            Some(addr) => { mem_large.free_mmap(addr, PROBE_SIZE); }
-            None => {
-                crate::safe_print!(128, "  FAIL: large VA exhausted at probe {}\n", i);
-                large_all_ok = false;
-                break;
-            }
+        if let Some(addr) = mem_large.alloc_mmap(PROBE_SIZE) { mem_large.free_mmap(addr, PROBE_SIZE); } else {
+            crate::safe_print!(128, "  FAIL: large VA exhausted at probe {}\n", i);
+            large_all_ok = false;
+            break;
         }
     }
 
@@ -7576,6 +7372,7 @@ fn test_epoll_infinite_wait_uses_bounded_deadline() -> bool {
 ///
 /// This test verifies that our ENOSYS-returning syscalls return the correct
 /// value and documents which syscalls return ENOSYS for bun compatibility.
+#[allow(clippy::useless_let_if_seq)]
 fn test_enosys_syscalls_return_proper_errno() -> bool {
     console::print("\n[TEST] ENOSYS syscalls return proper errno\n");
 
@@ -7609,13 +7406,13 @@ fn test_enosys_syscalls_return_proper_errno() -> bool {
     crate::safe_print!(128, "  inotify_init1(26) = {:#x} (expect {:#x})\n",
         inotify_init1_result, ENOSYS);
 
-    let mut pass = true;
-
     // Verify all return ENOSYS
-    if io_uring_setup_result != ENOSYS {
+    let mut pass = if io_uring_setup_result != ENOSYS {
         console::print("  FAIL: io_uring_setup did not return ENOSYS\n");
-        pass = false;
-    }
+        false
+    } else {
+        true
+    };
     if io_uring_enter_result != ENOSYS {
         console::print("  FAIL: io_uring_enter did not return ENOSYS\n");
         pass = false;
@@ -7797,7 +7594,7 @@ fn test_safe_user_access_fault() -> bool {
             crate::safe_print!(64, "  FAILED: expected EFAULT (14), got {}\n", e);
             false
         }
-        Ok(_) => {
+        Ok(()) => {
             console::print("  FAILED: expected EFAULT, but copy succeeded?!\n");
             false
         }
@@ -7903,7 +7700,7 @@ fn test_mmap_allocator_skips_full_kernel_range() -> bool {
 
     for _ in 0..20 {
         if let Some(addr) = mem.alloc_mmap(0x100_0000) { // 16MB chunks
-            if addr >= 0x4000_0000 && addr < 0x8000_0000 {
+            if (0x4000_0000..0x8000_0000).contains(&addr) {
                 crate::safe_print!(96, "  FAIL: alloc_mmap returned {:#x} inside kernel range\n", addr);
                 pass = false;
                 break;
@@ -7925,12 +7722,9 @@ fn test_mmap_allocator_skips_full_kernel_range() -> bool {
 fn test_block_shatter_preserves_identity() -> bool {
     console::print("\n[TEST] block shatter preserves identity mapping\n");
 
-    let frame = match crate::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => {
-            console::print("  SKIP: out of memory\n");
-            return true;
-        }
+    let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else {
+        console::print("  SKIP: out of memory\n");
+        return true;
     };
 
     // Construct a fake 2MB block entry for PA 0x50000000 with typical kernel flags
@@ -8107,14 +7901,13 @@ fn test_alloc_mmap_free_region_skips_kernel_hole() -> bool {
 
     let result = mem.alloc_mmap(0x1000);
     let hole_consumed = mem.free_regions.iter()
-        .all(|&(s, _)| s < 0x4000_0000 || s >= 0x8000_0000);
+        .all(|&(s, _)| !(0x4000_0000..0x8000_0000).contains(&s));
 
-    if let Some(addr) = result {
-        if addr >= 0x4000_0000 && addr < 0x8000_0000 {
+    if let Some(addr) = result
+        && (0x4000_0000..0x8000_0000).contains(&addr) {
             crate::safe_print!(128, "  FAIL: alloc_mmap returned addr 0x{:x} inside kernel VA hole\n", addr);
             return false;
         }
-    }
 
     let region_preserved = mem.free_regions.iter()
         .any(|&(s, sz)| s == 0x5000_0000 && sz == 0x2000_0000);
@@ -8125,12 +7918,11 @@ fn test_alloc_mmap_free_region_skips_kernel_hole() -> bool {
 
     let bump_result = mem.alloc_mmap(0x1000);
     let pass = bump_result.is_some();
-    if let Some(addr) = bump_result {
-        if addr >= 0x4000_0000 && addr < 0x8000_0000 {
+    if let Some(addr) = bump_result
+        && (0x4000_0000..0x8000_0000).contains(&addr) {
             crate::safe_print!(128, "  FAIL: bump returned addr 0x{:x} inside kernel VA hole\n", addr);
             return false;
         }
-    }
 
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
@@ -8314,7 +8106,7 @@ fn test_mmap_einval_through_handle_syscall() -> bool {
 
     // mmap(addr=0xffffffffffffffea, len=0x1000, MAP_FIXED|ANON|PRIVATE) → EINVAL
     // (fixed+unaligned). Mirrors crash14: addr is a negative errno-shaped word.
-    let fixed_flags = (MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE) as u64;
+    let fixed_flags = u64::from(MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE);
     let fixed_unaligned = crate::syscall::handle_syscall(
         NR_MMAP,
         &[0xffffffffffffffea_u64, 0x1000, 0x3, fixed_flags, !0u64, 0],
@@ -8449,12 +8241,9 @@ fn test_timer_interval_no_overflow() -> bool {
     console::print("\n[TEST] Timer interval computation — no overflow\n");
     for freq in [1_000_000u64, 62_500_000, 100_000_000] {
         let interval_us = 10_000u64; // 10 ms
-        let ticks = match freq.checked_mul(interval_us) {
-            Some(v) => v / 1_000_000,
-            None => {
-                crate::safe_print!(96, "  FAIL: mul overflow at freq={}\n", freq);
-                return false;
-            }
+        let ticks = if let Some(v) = freq.checked_mul(interval_us) { v / 1_000_000 } else {
+            crate::safe_print!(96, "  FAIL: mul overflow at freq={}\n", freq);
+            return false;
         };
         let high_counter = u64::MAX / 2;
         if high_counter.checked_add(ticks).is_none() {
@@ -8673,17 +8462,11 @@ fn test_mmap_lazy_munmap_no_recycle() -> bool {
     );
 
     // Step 1: alloc → simulated lazy munmap (no free_mmap called)
-    let a1 = match mem.alloc_mmap(0x4000) {
-        Some(a) => a,
-        None => { console::print("  SKIP: alloc_mmap failed\n"); return true; }
-    };
+    let a1 = if let Some(a) = mem.alloc_mmap(0x4000) { a } else { console::print("  SKIP: alloc_mmap failed\n"); return true; };
     // Do NOT call mem.free_mmap(a1, ...) — this is the lazy-munmap path.
 
     // Step 2: next alloc must be a DIFFERENT address.
-    let a2 = match mem.alloc_mmap(0x4000) {
-        Some(a) => a,
-        None => { console::print("  SKIP: second alloc_mmap failed\n"); return true; }
-    };
+    let a2 = if let Some(a) = mem.alloc_mmap(0x4000) { a } else { console::print("  SKIP: second alloc_mmap failed\n"); return true; };
 
     if a1 == a2 {
         crate::safe_print!(128,
@@ -8692,15 +8475,9 @@ fn test_mmap_lazy_munmap_no_recycle() -> bool {
     }
 
     // Step 3: eager munmap (free_mmap called) → the address IS reused.
-    let b1 = match mem.alloc_mmap(0x4000) {
-        Some(a) => a,
-        None => { console::print("  SKIP: third alloc_mmap failed\n"); return true; }
-    };
+    let b1 = if let Some(a) = mem.alloc_mmap(0x4000) { a } else { console::print("  SKIP: third alloc_mmap failed\n"); return true; };
     mem.free_mmap(b1, 0x4000); // eager path: physical pages freed → recycle VA
-    let b2 = match mem.alloc_mmap(0x4000) {
-        Some(a) => a,
-        None => { console::print("  SKIP: fourth alloc_mmap failed\n"); return true; }
-    };
+    let b2 = if let Some(a) = mem.alloc_mmap(0x4000) { a } else { console::print("  SKIP: fourth alloc_mmap failed\n"); return true; };
 
     if b1 != b2 {
         crate::safe_print!(128,
@@ -9067,12 +8844,9 @@ fn bench_mmap_eager() {
     if let Some(f) = pmm::alloc_page_zeroed() { pmm::free_page(f); }
 
     let t0 = uptime_us();
-    let frames = match pmm::alloc_pages_zeroed(PAGES) {
-        Some(f) => f,
-        None => {
-            console::print("SKIP (OOM)\n");
-            return;
-        }
+    let frames = if let Some(f) = pmm::alloc_pages_zeroed(PAGES) { f } else {
+        console::print("SKIP (OOM)\n");
+        return;
     };
     let t_alloc = uptime_us();
 
@@ -9104,10 +8878,7 @@ fn bench_demand_page() {
     let t0 = uptime_us();
     let mut done = 0u64;
     for i in 0..ITERATIONS {
-        match pmm::alloc_page_zeroed() {
-            Some(f) => { pmm::free_page(f); done += 1; }
-            None    => { crate::safe_print!(32, "OOM at {}\n", i); break; }
-        }
+        if let Some(f) = pmm::alloc_page_zeroed() { pmm::free_page(f); done += 1; } else { crate::safe_print!(32, "OOM at {}\n", i); break; }
     }
     let elapsed_us = uptime_us().saturating_sub(t0);
     let per_page_ns = if done > 0 { elapsed_us * 1000 / done } else { 0 };
@@ -9127,10 +8898,7 @@ fn bench_fork_clone() {
     const PAGES: usize = 512; // 2 MB
     console::print("[BENCH] fork_copy (alloc+memcpy): ");
 
-    let src_frames = match pmm::alloc_pages_zeroed(PAGES) {
-        Some(f) => f,
-        None => { console::print("SKIP (OOM for src 2MB)\n"); return; }
-    };
+    let src_frames = if let Some(f) = pmm::alloc_pages_zeroed(PAGES) { f } else { console::print("SKIP (OOM for src 2MB)\n"); return; };
 
     let t0 = uptime_us();
     let mut copied = 0usize;
@@ -9139,8 +8907,8 @@ fn bench_fork_clone() {
     for src_frame in &src_frames {
         match pmm::alloc_page_zeroed() {
             Some(dst_frame) => {
-                let src = akuma_exec::mmu::phys_to_virt(src_frame.addr) as *const u8;
-                let dst = akuma_exec::mmu::phys_to_virt(dst_frame.addr) as *mut u8;
+                let src = akuma_exec::mmu::phys_to_virt(src_frame.addr).cast_const();
+                let dst = akuma_exec::mmu::phys_to_virt(dst_frame.addr).cast::<u8>();
                 unsafe { core::ptr::copy_nonoverlapping(src, dst, 4096); }
                 dst_frames.push(dst_frame);
                 copied += 1;
@@ -9213,12 +8981,9 @@ fn test_cow_free_page_respects_refcount() -> bool {
     use crate::pmm;
     console::print("\n[TEST] CoW free_page respects refcount\n");
 
-    let frame = match pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => {
-            console::print("  OOM\n  Result: FAIL\n");
-            return false;
-        }
+    let frame = if let Some(f) = pmm::alloc_page_zeroed() { f } else {
+        console::print("  OOM\n  Result: FAIL\n");
+        return false;
     };
     let free_before = pmm::free_count();
 
@@ -9315,12 +9080,9 @@ fn test_cow_dec_after_fault() -> bool {
     use crate::pmm;
     console::print("\n[TEST] CoW dec after fault lifecycle\n");
 
-    let (old_frame, new_frame) = match (pmm::alloc_page_zeroed(), pmm::alloc_page_zeroed()) {
-        (Some(o), Some(n)) => (o, n),
-        _ => {
-            console::print("  OOM\n  Result: FAIL\n");
-            return false;
-        }
+    let (old_frame, new_frame) = if let (Some(o), Some(n)) = (pmm::alloc_page_zeroed(), pmm::alloc_page_zeroed()) { (o, n) } else {
+        console::print("  OOM\n  Result: FAIL\n");
+        return false;
     };
     let free_before = pmm::free_count();
 
@@ -9355,23 +9117,17 @@ fn test_ensure_cow_writable_resolves_cow_page() -> bool {
     use crate::pmm;
     console::print("\n[TEST] ensure_cow_page_writable logic: resolves CoW frame\n");
 
-    let old_frame = match pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM\n  Result: FAIL\n"); return false; }
-    };
+    let old_frame = if let Some(f) = pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n  Result: FAIL\n"); return false; };
 
     // Simulate CoW share: two processes both track old_frame → refcount = 2
     pmm::cow_ref_inc(old_frame.addr);
     let mut ok = pmm::cow_ref_get(old_frame.addr) == 2;
 
     // Simulate ensure_cow_page_writable: allocate new frame, copy, dec refcount
-    let new_frame = match pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => {
-            pmm::free_page(old_frame);
-            console::print("  OOM\n  Result: FAIL\n");
-            return false;
-        }
+    let new_frame = if let Some(f) = pmm::alloc_page_zeroed() { f } else {
+        pmm::free_page(old_frame);
+        console::print("  OOM\n  Result: FAIL\n");
+        return false;
     };
     let free_after_alloc = pmm::free_count();
 
@@ -9402,10 +9158,7 @@ fn test_cow_el1_resolver_no_dec_on_fail() -> bool {
     use crate::pmm;
     console::print("\n[TEST] CoW EL1 resolver: no dec when lookup_process fails\n");
 
-    let frame = match pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM\n  Result: FAIL\n"); return false; }
-    };
+    let frame = if let Some(f) = pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n  Result: FAIL\n"); return false; };
     let free_before = pmm::free_count();
 
     // Simulate CoW share: refcount = 2
@@ -9414,13 +9167,10 @@ fn test_cow_el1_resolver_no_dec_on_fail() -> bool {
 
     // Simulate the "lookup_process failed" path in the fixed handler:
     // We allocated new_frame but cannot remap (no owner) → free new_frame, skip cow_ref_dec.
-    let new_frame = match pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => {
-            pmm::free_page(frame);
-            console::print("  OOM\n  Result: FAIL\n");
-            return false;
-        }
+    let new_frame = if let Some(f) = pmm::alloc_page_zeroed() { f } else {
+        pmm::free_page(frame);
+        console::print("  OOM\n  Result: FAIL\n");
+        return false;
     };
     // Fixed behavior: free new_frame, do NOT call cow_ref_dec
     pmm::free_page(new_frame);
@@ -9446,10 +9196,7 @@ fn test_cow_prefault_not_cow_page_no_op() -> bool {
     use crate::pmm;
     console::print("\n[TEST] ensure_cow_page_writable: no-op for non-CoW page\n");
 
-    let frame = match pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => { console::print("  OOM\n  Result: FAIL\n"); return false; }
-    };
+    let frame = if let Some(f) = pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n  Result: FAIL\n"); return false; };
     let free_after_alloc = pmm::free_count();
 
     // No cow_ref_inc → refcount = 0 (not a CoW page)
@@ -9484,12 +9231,9 @@ pub fn test_thread_waker_marks_ready() -> bool {
             break;
         }
     }
-    let tid = match test_tid {
-        Some(t) => t,
-        None => {
-            console::print("  No free thread slot available, skipping\n  Result: PASS\n");
-            return true;
-        }
+    let tid = if let Some(t) = test_tid { t } else {
+        console::print("  No free thread slot available, skipping\n  Result: PASS\n");
+        return true;
     };
 
     // Set thread to WAITING
@@ -9528,12 +9272,9 @@ pub fn test_thread_waker_idempotent() -> bool {
             break;
         }
     }
-    let tid = match test_tid {
-        Some(t) => t,
-        None => {
-            console::print("  No free thread slot, skipping\n  Result: PASS\n");
-            return true;
-        }
+    let tid = if let Some(t) = test_tid { t } else {
+        console::print("  No free thread slot, skipping\n  Result: PASS\n");
+        return true;
     };
 
     // Set thread to READY (not WAITING)
@@ -9574,12 +9315,9 @@ pub fn test_thread_waker_roundtrip() -> bool {
             break;
         }
     }
-    let tid = match test_tid {
-        Some(t) => t,
-        None => {
-            console::print("  No free thread slot, skipping\n  Result: PASS\n");
-            return true;
-        }
+    let tid = if let Some(t) = test_tid { t } else {
+        console::print("  No free thread slot, skipping\n  Result: PASS\n");
+        return true;
     };
 
     // Set thread to WAITING
@@ -9651,7 +9389,7 @@ pub fn test_block_on_real_waker() -> bool {
     for _ in 0..20 {
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(v) => { result = Some(v); break; }
-            Poll::Pending => continue,
+            Poll::Pending => {}
         }
     }
 

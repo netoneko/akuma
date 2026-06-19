@@ -42,19 +42,16 @@ pub(super) fn sys_clock_gettime(clock_id_arg: u64, tp_ptr: u64) -> u64 {
 
     if !validate_user_ptr(tp_ptr, 16) { return EFAULT; }
 
-    let (sec, nsec) = match clock_id {
-        0 => {
-            let us = crate::timer::utc_time_us().unwrap_or(0);
-            ((us / 1_000_000) as u64, ((us % 1_000_000) * 1_000) as u64)
-        }
-        1 | _ => {
-            let us = crate::timer::uptime_us();
-            ((us / 1_000_000) as u64, ((us % 1_000_000) * 1_000) as u64)
-        }
+    let (sec, nsec) = if clock_id == 0 {
+        let us = crate::timer::utc_time_us().unwrap_or(0);
+        ((us / 1_000_000) as u64, ((us % 1_000_000) * 1_000) as u64)
+    } else {
+        let us = crate::timer::uptime_us();
+        ((us / 1_000_000), ((us % 1_000_000) * 1_000))
     };
 
     let ts = LocalTimespec { tv_sec: sec, tv_nsec: nsec };
-    if unsafe { copy_to_user_safe(tp_ptr as *mut u8, &ts as *const LocalTimespec as *const u8, 16).is_err() } {
+    if unsafe { copy_to_user_safe(tp_ptr as *mut u8, (&raw const ts).cast::<u8>(), 16).is_err() } {
         return EFAULT;
     }
     0
@@ -64,7 +61,7 @@ pub(super) fn sys_clock_getres(clock_id: u32, res_ptr: usize) -> u64 {
     let _ = clock_id;
     if res_ptr != 0 && validate_user_ptr(res_ptr as u64, 16) {
         let ts = LocalTimespec { tv_sec: 0, tv_nsec: 1 };
-        let _ = unsafe { copy_to_user_safe(res_ptr as *mut u8, &ts as *const LocalTimespec as *const u8, 16) };
+        let _ = unsafe { copy_to_user_safe(res_ptr as *mut u8, (&raw const ts).cast::<u8>(), 16) };
     }
     0
 }
@@ -76,7 +73,7 @@ pub(super) fn sys_nanosleep(a0: u64, a1: u64) -> u64 {
     // Distinguish by checking if a0 looks like a user-space pointer (>= PAGE_SIZE).
     let (sec, nsec) = if a0 >= 4096 && validate_user_ptr(a0, 16) {
         let mut ts = LocalTimespec::default();
-        if unsafe { copy_from_user_safe(&mut ts as *mut LocalTimespec as *mut u8, a0 as *const u8, 16).is_ok() } {
+        if unsafe { copy_from_user_safe((&raw mut ts).cast::<u8>(), a0 as *const u8, 16).is_ok() } {
             (ts.tv_sec, ts.tv_nsec)
         } else {
             (a0, a1)
@@ -102,7 +99,7 @@ pub(super) fn sys_times(buf_ptr: usize) -> u64 {
         let _ = unsafe { copy_to_user_safe(buf_ptr as *mut u8, zero.as_ptr(), TMS_SIZE) };
     }
     let uptime_us = crate::timer::uptime_us();
-    (uptime_us / 10_000) as u64
+    uptime_us / 10_000 
 }
 
 pub(super) fn sys_getrusage(who: i32, usage_ptr: usize) -> u64 {

@@ -5,23 +5,23 @@ use super::EFAULT;
 
 pub(super) fn sys_fb_init(width: u32, height: u32) -> u64 {
     if width == 0 || height == 0 || width > 1920 || height > 1080 {
-        return (-libc_errno::EINVAL as i64) as u64;
+        return i64::from(-libc_errno::EINVAL) as u64;
     }
 
     match crate::ramfb::init(width, height) {
         Ok(()) => 0,
-        Err(_) => (-libc_errno::EIO as i64) as u64,
+        Err(_) => i64::from(-libc_errno::EIO) as u64,
     }
 }
 
 pub(super) fn sys_fb_draw(buf_ptr: u64, buf_len: usize) -> u64 {
     if buf_ptr == 0 || buf_len == 0 {
-        return (-libc_errno::EINVAL as i64) as u64;
+        return i64::from(-libc_errno::EINVAL) as u64;
     }
     if !validate_user_ptr(buf_ptr, buf_len) { return EFAULT; }
 
     if !crate::ramfb::is_initialized() {
-        return (-libc_errno::EIO as i64) as u64;
+        return i64::from(-libc_errno::EIO) as u64;
     }
 
     // Use a large kernel buffer for FB drawing (e.g. 1MB chunk)
@@ -38,7 +38,7 @@ pub(super) fn sys_fb_draw(buf_ptr: u64, buf_len: usize) -> u64 {
         let copied = crate::ramfb::draw(&kernel_buf[..this_chunk]);
         if copied == 0 {
             if total_copied > 0 { return total_copied as u64; }
-            return (-libc_errno::EIO as i64) as u64;
+            return i64::from(-libc_errno::EIO) as u64;
         }
         total_copied += this_chunk;
     }
@@ -47,17 +47,17 @@ pub(super) fn sys_fb_draw(buf_ptr: u64, buf_len: usize) -> u64 {
 
 pub(super) fn sys_fb_info(info_ptr: u64) -> u64 {
     if info_ptr == 0 {
-        return (-libc_errno::EINVAL as i64) as u64;
+        return i64::from(-libc_errno::EINVAL) as u64;
     }
     if !validate_user_ptr(info_ptr, core::mem::size_of::<crate::ramfb::FBInfo>()) { return EFAULT; }
 
     match crate::ramfb::info() {
         Some(info) => {
-            if unsafe { copy_to_user_safe(info_ptr as *mut u8, &info as *const crate::ramfb::FBInfo as *const u8, core::mem::size_of::<crate::ramfb::FBInfo>()).is_err() } {
+            if unsafe { copy_to_user_safe(info_ptr as *mut u8, (&raw const info).cast::<u8>(), core::mem::size_of::<crate::ramfb::FBInfo>()).is_err() } {
                 return EFAULT;
             }
             0
         }
-        None => (-libc_errno::EIO as i64) as u64,
+        None => i64::from(-libc_errno::EIO) as u64,
     }
 }

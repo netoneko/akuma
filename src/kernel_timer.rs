@@ -88,7 +88,7 @@ fn read_frequency() -> u64 {
 fn counter_to_us(counter: u64) -> u64 {
     let freq = read_frequency();
     if freq > 0 {
-        ((counter as u128 * TICK_HZ as u128) / freq as u128) as u64
+        ((u128::from(counter) * u128::from(TICK_HZ)) / u128::from(freq)) as u64
     } else {
         0
     }
@@ -152,7 +152,7 @@ pub fn schedule_wake(at_us: u64, waker: &Waker) {
             }
 
             // Same waker -- update in place
-            if entry.waker.as_ref().map_or(false, |w| w.will_wake(waker)) {
+            if entry.waker.as_ref().is_some_and(|w| w.will_wake(waker)) {
                 entry.at = at_us;
                 update_hardware_timer(&queue);
                 return;

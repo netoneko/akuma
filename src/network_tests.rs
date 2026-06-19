@@ -127,9 +127,7 @@ fn test_loopback_connection() {
         akuma_exec::threading::yield_now();
     }
 
-    if !received {
-        panic!("Network Test Failed: Loopback data transfer failed");
-    }
+    assert!(received, "Network Test Failed: Loopback data transfer failed");
 
     log("[NetTest] Data transfer verified. Closing...\n");
 

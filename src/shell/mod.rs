@@ -112,11 +112,10 @@ pub fn new_shell_context() -> ShellContext {
 
 async fn find_executable(name: &str) -> Option<String> {
     if name.starts_with('/') {
-        if crate::async_fs::exists(name).await {
-            if crate::async_fs::list_dir(name).await.is_err() {
+        if crate::async_fs::exists(name).await
+            && crate::async_fs::list_dir(name).await.is_err() {
                 return Some(String::from(name));
             }
-        }
         return None;
     }
 
@@ -342,7 +341,7 @@ pub async fn execute_external_interactive(
 pub async fn execute_command_streaming_interactive(
     line: &[u8],
     registry: &CommandRegistry,
-    ctx: &mut ShellContext,
+    ctx: &ShellContext,
     channel_stream: &mut SshChannelStream<'_>,
     stdin: Option<&[u8]>,
 ) -> Option<ChainExecutionResult> {
@@ -367,7 +366,7 @@ pub async fn execute_command_streaming_interactive(
             let trimmed = trim_bytes(line);
             let (_cmd_name, args_bytes) = split_first_word(trimmed);
             let arg_strings = akuma_shell::parse::parse_args(args_bytes);
-            let arg_refs: Vec<&str> = arg_strings.iter().map(|s| s.as_str()).collect();
+            let arg_refs: Vec<&str> = arg_strings.iter().map(alloc::string::String::as_str).collect();
             let args_slice: Option<&[&str]> = if arg_refs.is_empty() { None } else { Some(&arg_refs) };
 
             let env_vec = ctx.env_as_vec();

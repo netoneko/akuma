@@ -13,7 +13,7 @@ struct TimerFdState {
 static TIMERFD_TABLE: Spinlock<BTreeMap<u32, TimerFdState>> = Spinlock::new(BTreeMap::new());
 static TIMERFD_NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
-pub(crate) fn timerfd_add_poller(id: u32, tid: usize) {
+pub fn timerfd_add_poller(id: u32, tid: usize) {
     crate::irq::with_irqs_disabled(|| {
         if let Some(state) = TIMERFD_TABLE.lock().get_mut(&id) {
             state.pollers.insert(tid);
@@ -31,7 +31,7 @@ struct LocalTimespec {
 fn timespec_to_us_safe(ptr: usize) -> Result<u64, u64> {
     if ptr == 0 { return Ok(0); }
     let mut ts = LocalTimespec::default();
-    if unsafe { copy_from_user_safe(&mut ts as *mut LocalTimespec as *mut u8, ptr as *const u8, 16).is_err() } {
+    if unsafe { copy_from_user_safe((&raw mut ts).cast::<u8>(), ptr as *const u8, 16).is_err() } {
         return Err(EFAULT);
     }
     Ok(ts.tv_sec * 1_000_000 + ts.tv_nsec / 1_000)
@@ -42,7 +42,7 @@ fn us_to_timespec_safe(us: u64, ptr: usize) -> Result<(), u64> {
         tv_sec: us / 1_000_000,
         tv_nsec: (us % 1_000_000) * 1_000,
     };
-    if unsafe { copy_to_user_safe(ptr as *mut u8, &ts as *const LocalTimespec as *const u8, 16).is_err() } {
+    if unsafe { copy_to_user_safe(ptr as *mut u8, (&raw const ts).cast::<u8>(), 16).is_err() } {
         return Err(EFAULT);
     }
     Ok(())
@@ -50,7 +50,7 @@ fn us_to_timespec_safe(us: u64, ptr: usize) -> Result<(), u64> {
 
 pub(super) fn timerfd_can_read(timer_id: u32) -> bool {
     let now = crate::timer::uptime_us();
-    TIMERFD_TABLE.lock().get(&timer_id).map_or(false, |state| {
+    TIMERFD_TABLE.lock().get(&timer_id).is_some_and(|state| {
         if state.initial_us == 0 { return false; }
         let elapsed = now.saturating_sub(state.armed_at_us);
         if elapsed < state.initial_us { return false; }
@@ -68,7 +68,7 @@ pub(super) fn sys_timerfd_create(clockid: i32, flags: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
         let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::TimerFd(timer_id));
         crate::safe_print!(96, "[timerfd] create id={} fd={} clk={} fl={}\n", timer_id, fd, clockid, flags);
-        fd as u64
+        u64::from(fd)
     } else {
         EBADF
     }

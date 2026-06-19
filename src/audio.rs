@@ -39,10 +39,10 @@ pub enum AudioError {
 impl core::fmt::Display for AudioError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            AudioError::NotFound => write!(f, "Sound device not found"),
-            AudioError::NotInitialized => write!(f, "Sound device not initialized"),
-            AudioError::IoError => write!(f, "Sound I/O error"),
-            AudioError::InvalidParam => write!(f, "Invalid audio parameter"),
+            Self::NotFound => write!(f, "Sound device not found"),
+            Self::NotInitialized => write!(f, "Sound device not initialized"),
+            Self::IoError => write!(f, "Sound I/O error"),
+            Self::InvalidParam => write!(f, "Invalid audio parameter"),
         }
     }
 }
@@ -222,36 +222,24 @@ mod imp {
             };
 
             // SAFETY: building MmioTransport over a verified virtio device header.
-            let transport = match unsafe { MmioTransport::new(header_ptr) } {
-                Ok(t) => t,
-                Err(_) => {
-                    console::print("[SND] Failed to create transport\n");
-                    continue;
-                }
+            let transport = if let Ok(t) = unsafe { MmioTransport::new(header_ptr) } { t } else {
+                console::print("[SND] Failed to create transport\n");
+                continue;
             };
 
-            let mut snd = match VirtIOSound::<VirtioHal, MmioTransport>::new(transport) {
-                Ok(s) => s,
-                Err(_) => {
-                    console::print("[SND] Failed to init virtio-snd device\n");
-                    continue;
-                }
+            let mut snd = if let Ok(s) = VirtIOSound::<VirtioHal, MmioTransport>::new(transport) { s } else {
+                console::print("[SND] Failed to init virtio-snd device\n");
+                continue;
             };
 
-            let outputs = match snd.output_streams() {
-                Ok(v) => v,
-                Err(_) => {
-                    console::print("[SND] Failed to query output streams\n");
-                    continue;
-                }
+            let outputs = if let Ok(v) = snd.output_streams() { v } else {
+                console::print("[SND] Failed to query output streams\n");
+                continue;
             };
 
-            let out_stream = match outputs.first() {
-                Some(&s) => s,
-                None => {
-                    console::print("[SND] No output streams advertised\n");
-                    continue;
-                }
+            let out_stream = if let Some(&s) = outputs.first() { s } else {
+                console::print("[SND] No output streams advertised\n");
+                continue;
             };
 
             crate::safe_print!(

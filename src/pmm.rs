@@ -75,13 +75,13 @@ impl FrameTracker {
             match info.source {
                 FrameSource::Kernel => self.kernel_count = self.kernel_count.saturating_sub(1),
                 FrameSource::UserPageTable => {
-                    self.user_page_table_count = self.user_page_table_count.saturating_sub(1)
+                    self.user_page_table_count = self.user_page_table_count.saturating_sub(1);
                 }
                 FrameSource::UserData => {
-                    self.user_data_count = self.user_data_count.saturating_sub(1)
+                    self.user_data_count = self.user_data_count.saturating_sub(1);
                 }
                 FrameSource::ElfLoader => {
-                    self.elf_loader_count = self.elf_loader_count.saturating_sub(1)
+                    self.elf_loader_count = self.elf_loader_count.saturating_sub(1);
                 }
                 FrameSource::Unknown => self.unknown_count = self.unknown_count.saturating_sub(1),
             }
@@ -192,7 +192,7 @@ impl BitmapAllocator {
         self.total_pages = size / PAGE_SIZE;
 
         // Calculate bitmap size (64 pages per u64)
-        let bitmap_size = (self.total_pages + 63) / 64;
+        let bitmap_size = self.total_pages.div_ceil(64);
         self.bitmap = alloc::vec![0u64; bitmap_size];
 
         // Mark all pages as free initially
@@ -201,7 +201,7 @@ impl BitmapAllocator {
         }
 
         // Mark pages below kernel_end as used (kernel code/data/heap)
-        let kernel_pages = (kernel_end.saturating_sub(base) + PAGE_SIZE - 1) / PAGE_SIZE;
+        let kernel_pages = kernel_end.saturating_sub(base).div_ceil(PAGE_SIZE);
         for i in 0..kernel_pages {
             self.mark_used(i);
         }
@@ -632,7 +632,7 @@ pub fn free_pages_contiguous(frame: PhysFrame, count: usize) {
         let mut pmm = PMM.lock();
         pmm.free_pages_contiguous(frame, count);
         ALLOCATED_PAGES.fetch_sub(count, Ordering::Relaxed);
-    })
+    });
 }
 
 /// Get physical memory statistics

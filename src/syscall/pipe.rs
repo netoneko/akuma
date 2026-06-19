@@ -14,7 +14,7 @@ struct KernelPipe {
 static PIPES: Spinlock<BTreeMap<u32, KernelPipe>> = Spinlock::new(BTreeMap::new());
 static NEXT_PIPE_ID: AtomicU32 = AtomicU32::new(1);
 
-pub(crate) fn pipe_create() -> u32 {
+pub fn pipe_create() -> u32 {
     let id = NEXT_PIPE_ID.fetch_add(1, Ordering::SeqCst);
     crate::irq::with_irqs_disabled(|| {
         PIPES.lock().insert(id, KernelPipe {
@@ -45,7 +45,7 @@ pub fn pipe_clone_ref(id: u32, is_write: bool) {
 
 /// Register the current thread as interested in polling this pipe.
 /// Called by epoll/poll check logic.
-pub(crate) fn pipe_add_poller(id: u32, tid: usize) {
+pub fn pipe_add_poller(id: u32, tid: usize) {
     crate::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
@@ -57,14 +57,14 @@ pub(crate) fn pipe_add_poller(id: u32, tid: usize) {
 /// Write data to a pipe. Returns Ok(n) on success or Err(EPIPE) if the pipe
 /// has been destroyed (no readers left or pipe removed). On Linux, writing to
 /// a broken pipe delivers SIGPIPE and returns EPIPE; callers must replicate this.
-pub(crate) fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
+pub fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
     crate::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
             if pipe.read_count == 0 {
                 // Send SIGPIPE to current process (Linux behaviour)
                 super::signal::send_sigpipe();
-                return Err(libc_errno::EPIPE as i32);
+                return Err(libc_errno::EPIPE);
             }
             pipe.buffer.extend(data);
             
@@ -76,12 +76,12 @@ pub(crate) fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
             Ok(data.len())
         } else {
             crate::safe_print!(128, "[pipe] write WARN: pipe id={} not found (len={})\n", id, data.len());
-            Err(libc_errno::EPIPE as i32)
+            Err(libc_errno::EPIPE)
         }
     })
 }
 
-pub(crate) fn pipe_read(id: u32, buf: &mut [u8]) -> (usize, bool) {
+pub fn pipe_read(id: u32, buf: &mut [u8]) -> (usize, bool) {
     crate::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
@@ -154,7 +154,7 @@ pub fn pipe_close_read(id: u32) {
 ///   pipe_read() → (empty, no-eof) → pipe_set_reader_thread() → schedule_blocking()
 /// A concurrent write between the first and second step would fire the wakeup
 /// with no reader registered, causing the blocking thread to sleep forever.
-pub(crate) fn pipe_check_set_reader(id: u32, tid: usize) -> bool {
+pub fn pipe_check_set_reader(id: u32, tid: usize) -> bool {
     crate::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
@@ -172,27 +172,27 @@ pub(crate) fn pipe_check_set_reader(id: u32, tid: usize) -> bool {
 /// Test helper: return the current reader_thread tid registered on `id`.
 /// For the new poller-based implementation, we return true if tid is in the set.
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-pub(crate) fn pipe_is_poller_registered(id: u32, tid: usize) -> bool {
+pub fn pipe_is_poller_registered(id: u32, tid: usize) -> bool {
     crate::irq::with_irqs_disabled(|| {
-        PIPES.lock().get(&id).map_or(false, |p| p.pollers.contains(&tid))
+        PIPES.lock().get(&id).is_some_and(|p| p.pollers.contains(&tid))
     })
 }
 
 /// Test helper: return how many pollers are registered on `id`.
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-pub(crate) fn pipe_pollers_count(id: u32) -> usize {
+pub fn pipe_pollers_count(id: u32) -> usize {
     crate::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).map_or(0, |p| p.pollers.len())
     })
 }
 
-pub(crate) fn pipe_can_read(id: u32) -> bool {
+pub fn pipe_can_read(id: u32) -> bool {
     crate::irq::with_irqs_disabled(|| {
-        PIPES.lock().get(&id).map_or(false, |p| !p.buffer.is_empty() || p.write_count == 0)
+        PIPES.lock().get(&id).is_some_and(|p| !p.buffer.is_empty() || p.write_count == 0)
     })
 }
 
-pub(crate) fn pipe_bytes_available(id: u32) -> usize {
+pub fn pipe_bytes_available(id: u32) -> usize {
     crate::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).map_or(0, |p| p.buffer.len())
     })
@@ -200,7 +200,7 @@ pub(crate) fn pipe_bytes_available(id: u32) -> usize {
 
 pub(super) fn pipe_can_write(id: u32) -> bool {
     crate::irq::with_irqs_disabled(|| {
-        PIPES.lock().get(&id).map_or(false, |p| p.read_count > 0)
+        PIPES.lock().get(&id).is_some_and(|p| p.read_count > 0)
     })
 }
 
@@ -218,7 +218,7 @@ pub(super) fn sys_pipe2(fds_ptr: u64, flags: u32) -> u64 {
     }
 
     let fds = [fd_r as i32, fd_w as i32];
-    if unsafe { copy_to_user_safe(fds_ptr as *mut u8, fds.as_ptr() as *const u8, 8).is_err() } {
+    if unsafe { copy_to_user_safe(fds_ptr as *mut u8, fds.as_ptr().cast::<u8>(), 8).is_err() } {
         return EFAULT;
     }
     0

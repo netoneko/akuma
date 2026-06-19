@@ -120,8 +120,7 @@ impl Command for StatsCommand {
         Box::pin(async move {
             let (connections, bytes_rx, bytes_tx) = network::get_stats();
             let stats = format!(
-                "Network Statistics:\r\n  Connections: {}\r\n  Bytes RX: {}\r\n  Bytes TX: {}\r\n",
-                connections, bytes_rx, bytes_tx
+                "Network Statistics:\r\n  Connections: {connections}\r\n  Bytes RX: {bytes_rx}\r\n  Bytes TX: {bytes_tx}\r\n"
             );
             let _ = stdout.write(stats.as_bytes()).await;
             Ok(())
@@ -171,10 +170,8 @@ impl Command for FreeCommand {
 
             let info = format!(
 "              total      used      free\r\n\
-Mem:      {:>8} KB {:>8} KB {:>8} KB\r\n\
-Heap:     {:>8} KB {:>8} KB {:>8} KB\r\n",
-                total_kb, used_kb, free_kb,
-                heap_total_kb, heap_used_kb, heap_free_kb,
+Mem:      {total_kb:>8} KB {used_kb:>8} KB {free_kb:>8} KB\r\n\
+Heap:     {heap_total_kb:>8} KB {heap_used_kb:>8} KB {heap_free_kb:>8} KB\r\n",
             );
             let _ = stdout.write(info.as_bytes()).await;
             Ok(())
@@ -351,9 +348,9 @@ impl Command for GrepCommand {
             let mut i = 0;
             while i < parts.len() {
                 let part = parts[i];
-                if part.starts_with('-') {
+                if let Some(stripped) = part.strip_prefix('-') {
                     // Parse flags
-                    for c in part[1..].chars() {
+                    for c in stripped.chars() {
                         match c {
                             'i' => case_insensitive = true,
                             'v' => invert_match = true,
@@ -368,14 +365,11 @@ impl Command for GrepCommand {
                 i += 1;
             }
 
-            let pattern = match pattern {
-                Some(p) => p,
-                None => {
-                    let _ = stdout
-                        .write(b"Usage: grep [-i] [-v] <pattern> [file]\r\n")
-                        .await;
-                    return Ok(());
-                }
+            let pattern = if let Some(p) = pattern { p } else {
+                let _ = stdout
+                    .write(b"Usage: grep [-i] [-v] <pattern> [file]\r\n")
+                    .await;
+                return Ok(());
             };
 
             // Get input data - either from file or stdin
@@ -388,7 +382,7 @@ impl Command for GrepCommand {
                 match crate::async_fs::read_file(path).await {
                     Ok(data) => data,
                     Err(e) => {
-                        let msg = format!("Error reading file: {}\r\n", e);
+                        let msg = format!("Error reading file: {e}\r\n");
                         let _ = stdout.write(msg.as_bytes()).await;
                         return Ok(());
                     }
@@ -483,7 +477,7 @@ impl Command for PsCommand {
                     let box_str = if p.box_id == 0 { String::from("0") } else { format!("{:08x}", p.box_id) };
                     let sc_num = p.current_syscall;
                     let sc = if sc_num != !0u64 {
-                        format!("*{}", sc_num)
+                        format!("*{sc_num}")
                     } else if p.last_syscall > 0 {
                         format!("{:>3}", p.last_syscall)
                     } else {
@@ -507,7 +501,7 @@ impl Command for PsCommand {
                         .and_then(|pr| pr.thread_id)
                         .and_then(akuma_exec::threading::get_saved_kernel_resume);
                     let kpc_str = match kpc {
-                        Some((x30, elr, _sp)) => format!("x30={:#x} elr={:#x}", x30, elr),
+                        Some((x30, elr, _sp)) => format!("x30={x30:#x} elr={elr:#x}"),
                         None => alloc::string::String::from("-"),
                     };
                     let line = format!(
@@ -599,8 +593,7 @@ impl Command for KthreadsCommand {
             let (ready, running, terminated) = threading::thread_stats();
             let total = ready + running + terminated;
             let summary = format!(
-                "\r\nTotal: {} threads (ready: {}, running: {}, terminated: {})\r\n",
-                total, ready, running, terminated
+                "\r\nTotal: {total} threads (ready: {ready}, running: {running}, terminated: {terminated})\r\n"
             );
             let _ = stdout.write(summary.as_bytes()).await;
 
@@ -690,15 +683,12 @@ impl Command for CdCommand {
             }
 
             // Try to list the directory to verify it exists and is a directory
-            match crate::async_fs::list_dir(&target).await {
-                Ok(_) => {
-                    ctx.set_cwd(&target);
-                    // cd is silent on success (like in real shells)
-                }
-                Err(_) => {
-                    let msg = format!("cd: {}: No such directory\r\n", target);
-                    let _ = stdout.write(msg.as_bytes()).await;
-                }
+            if crate::async_fs::list_dir(&target).await.is_ok() {
+                ctx.set_cwd(&target);
+                // cd is silent on success (like in real shells)
+            } else {
+                let msg = format!("cd: {target}: No such directory\r\n");
+                let _ = stdout.write(msg.as_bytes()).await;
             }
 
             Ok(())
@@ -738,7 +728,7 @@ impl Command for UptimeCommand {
             let mins = (uptime_sec % 3600) / 60;
             let secs = uptime_sec % 60;
 
-            let msg = format!("up {}:{:02}:{:02}\r\n", hours, mins, secs);
+            let msg = format!("up {hours}:{mins:02}:{secs:02}\r\n");
             let _ = stdout.write(msg.as_bytes()).await;
             Ok(())
         })
@@ -778,79 +768,75 @@ impl Command for PmmCommand {
 
             let args_str = core::str::from_utf8(args).unwrap_or("").trim();
 
-            match args_str {
-                "leaks" => {
-                    // Show leak info (only meaningful if DEBUG_FRAME_TRACKING is enabled)
-                    if pmm::DEBUG_FRAME_TRACKING {
-                        let count = pmm::leak_count();
-                        if count == 0 {
-                            let _ = stdout.write(b"No tracked frame leaks detected.\r\n").await;
-                        } else {
-                            let msg = format!("Potentially leaked frames: {}\r\n", count);
-                            let _ = stdout.write(msg.as_bytes()).await;
-                        }
-
-                        // Show breakdown by source
-                        if let Some(stats) = pmm::tracking_stats() {
-                            let breakdown = format!(
-                                "Current allocations:\r\n\
-                                 \r\n\
-                                 Kernel:          {:>6}\r\n\
-                                 User Page Table: {:>6}\r\n\
-                                 User Data:       {:>6}\r\n\
-                                 ELF Loader:      {:>6}\r\n\
-                                 Unknown:         {:>6}\r\n\
-                                 \r\n\
-                                 Currently held:  {:>6}\r\n\
-                                 \r\n\
-                                 Cumulative (since boot):\r\n\
-                                   Allocated:     {:>6}\r\n\
-                                   Freed:         {:>6}\r\n",
-                                stats.kernel_count,
-                                stats.user_page_table_count,
-                                stats.user_data_count,
-                                stats.elf_loader_count,
-                                stats.unknown_count,
-                                stats.current_tracked,
-                                stats.total_tracked,
-                                stats.total_untracked
-                            );
-                            let _ = stdout.write(breakdown.as_bytes()).await;
-                        }
+            if args_str == "leaks" {
+                // Show leak info (only meaningful if DEBUG_FRAME_TRACKING is enabled)
+                if pmm::DEBUG_FRAME_TRACKING {
+                    let count = pmm::leak_count();
+                    if count == 0 {
+                        let _ = stdout.write(b"No tracked frame leaks detected.\r\n").await;
                     } else {
-                        let _ = stdout.write(b"DEBUG_FRAME_TRACKING is disabled.\r\n").await;
-                        let _ = stdout
-                            .write(b"Enable it in src/pmm.rs to track frame allocations.\r\n")
-                            .await;
+                        let msg = format!("Potentially leaked frames: {count}\r\n");
+                        let _ = stdout.write(msg.as_bytes()).await;
                     }
+
+                    // Show breakdown by source
+                    if let Some(stats) = pmm::tracking_stats() {
+                        let breakdown = format!(
+                            "Current allocations:\r\n\
+                             \r\n\
+                             Kernel:          {:>6}\r\n\
+                             User Page Table: {:>6}\r\n\
+                             User Data:       {:>6}\r\n\
+                             ELF Loader:      {:>6}\r\n\
+                             Unknown:         {:>6}\r\n\
+                             \r\n\
+                             Currently held:  {:>6}\r\n\
+                             \r\n\
+                             Cumulative (since boot):\r\n\
+                               Allocated:     {:>6}\r\n\
+                               Freed:         {:>6}\r\n",
+                            stats.kernel_count,
+                            stats.user_page_table_count,
+                            stats.user_data_count,
+                            stats.elf_loader_count,
+                            stats.unknown_count,
+                            stats.current_tracked,
+                            stats.total_tracked,
+                            stats.total_untracked
+                        );
+                        let _ = stdout.write(breakdown.as_bytes()).await;
+                    }
+                } else {
+                    let _ = stdout.write(b"DEBUG_FRAME_TRACKING is disabled.\r\n").await;
+                    let _ = stdout
+                        .write(b"Enable it in src/pmm.rs to track frame allocations.\r\n")
+                        .await;
                 }
-                _ => {
-                    // Default: show basic PMM stats
-                    let (total, allocated, free) = pmm::stats();
-                    let total_mb = (total * 4) / 1024; // 4KB pages to MB
-                    let allocated_mb = (allocated * 4) / 1024;
-                    let free_mb = (free * 4) / 1024;
+            } else {
+                // Default: show basic PMM stats
+                let (total, allocated, free) = pmm::stats();
+                let total_mb = (total * 4) / 1024; // 4KB pages to MB
+                let allocated_mb = (allocated * 4) / 1024;
+                let free_mb = (free * 4) / 1024;
 
-                    let stats_msg = format!(
-                        "Physical Memory Manager:\r\n\
-                         \r\n\
-                                     pages       MB\r\n\
-                         Total:      {:>5}      {:>3}\r\n\
-                         Allocated:  {:>5}      {:>3}\r\n\
-                         Free:       {:>5}      {:>3}\r\n",
-                        total, total_mb, allocated, allocated_mb, free, free_mb
-                    );
-                    let _ = stdout.write(stats_msg.as_bytes()).await;
+                let stats_msg = format!(
+                    "Physical Memory Manager:\r\n\
+                     \r\n\
+                                 pages       MB\r\n\
+                     Total:      {total:>5}      {total_mb:>3}\r\n\
+                     Allocated:  {allocated:>5}      {allocated_mb:>3}\r\n\
+                     Free:       {free:>5}      {free_mb:>3}\r\n"
+                );
+                let _ = stdout.write(stats_msg.as_bytes()).await;
 
-                    // Show tracking status
-                    if pmm::DEBUG_FRAME_TRACKING {
-                        let _ = stdout.write(b"\r\nFrame tracking: ENABLED\r\n").await;
-                        let _ = stdout
-                            .write(b"Use 'pmm leaks' to see allocation breakdown.\r\n")
-                            .await;
-                    } else {
-                        let _ = stdout.write(b"\r\nFrame tracking: DISABLED\r\n").await;
-                    }
+                // Show tracking status
+                if pmm::DEBUG_FRAME_TRACKING {
+                    let _ = stdout.write(b"\r\nFrame tracking: ENABLED\r\n").await;
+                    let _ = stdout
+                        .write(b"Use 'pmm leaks' to see allocation breakdown.\r\n")
+                        .await;
+                } else {
+                    let _ = stdout.write(b"\r\nFrame tracking: DISABLED\r\n").await;
                 }
             }
 
@@ -891,12 +877,9 @@ impl Command for KillCommand {
             use akuma_exec::process;
 
             // Parse the PID argument
-            let args_str = match core::str::from_utf8(args) {
-                Ok(s) => s.trim(),
-                Err(_) => {
-                    let _ = stdout.write(b"Error: Invalid UTF-8 in arguments\r\n").await;
-                    return Err(ShellError::ExecutionFailed("invalid UTF-8"));
-                }
+            let args_str = if let Ok(s) = core::str::from_utf8(args) { s.trim() } else {
+                let _ = stdout.write(b"Error: Invalid UTF-8 in arguments\r\n").await;
+                return Err(ShellError::ExecutionFailed("invalid UTF-8"));
             };
 
             if args_str.is_empty() {
@@ -904,24 +887,21 @@ impl Command for KillCommand {
                 return Err(ShellError::ExecutionFailed("missing PID argument"));
             }
 
-            let pid: u32 = match args_str.parse() {
-                Ok(p) => p,
-                Err(_) => {
-                    let msg = format!("Error: Invalid PID: {}\r\n", args_str);
-                    let _ = stdout.write(msg.as_bytes()).await;
-                    return Err(ShellError::ExecutionFailed("invalid PID"));
-                }
+            let pid: u32 = if let Ok(p) = args_str.parse() { p } else {
+                let msg = format!("Error: Invalid PID: {args_str}\r\n");
+                let _ = stdout.write(msg.as_bytes()).await;
+                return Err(ShellError::ExecutionFailed("invalid PID"));
             };
 
             // Try to kill the process
             match process::kill_process(pid) {
                 Ok(()) => {
-                    let msg = format!("Killed process {}\r\n", pid);
+                    let msg = format!("Killed process {pid}\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                     Ok(())
                 }
                 Err(e) => {
-                    let msg = format!("Failed to kill process {}: {}\r\n", pid, e);
+                    let msg = format!("Failed to kill process {pid}: {e}\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                     Err(ShellError::ExecutionFailed("kill failed"))
                 }
@@ -1036,18 +1016,17 @@ impl Command for ExportCommand {
 
             if args_str.is_empty() {
                 for (k, v) in ctx.env() {
-                    let line = format!("export {}=\"{}\"\r\n", k, v);
+                    let line = format!("export {k}=\"{v}\"\r\n");
                     let _ = stdout.write(line.as_bytes()).await;
                 }
                 return Ok(());
             }
 
             for assignment in args_str.split_whitespace() {
-                if let Some((key, value)) = assignment.split_once('=') {
-                    if !key.is_empty() {
+                if let Some((key, value)) = assignment.split_once('=')
+                    && !key.is_empty() {
                         ctx.set_env(key, value);
                     }
-                }
                 // `export KEY` with no value is a no-op (all vars are exported)
             }
             Ok(())
@@ -1086,18 +1065,17 @@ impl Command for SetCommand {
 
             if args_str.is_empty() {
                 for (k, v) in ctx.env() {
-                    let line = format!("{}={}\r\n", k, v);
+                    let line = format!("{k}={v}\r\n");
                     let _ = stdout.write(line.as_bytes()).await;
                 }
                 return Ok(());
             }
 
             for assignment in args_str.split_whitespace() {
-                if let Some((key, value)) = assignment.split_once('=') {
-                    if !key.is_empty() {
+                if let Some((key, value)) = assignment.split_once('=')
+                    && !key.is_empty() {
                         ctx.set_env(key, value);
                     }
-                }
             }
             Ok(())
         })
@@ -1174,7 +1152,7 @@ impl Command for EnvCommand {
     ) -> Pin<Box<dyn Future<Output = Result<(), ShellError>> + 'a>> {
         Box::pin(async move {
             for (k, v) in ctx.env() {
-                let line = format!("{}={}\r\n", k, v);
+                let line = format!("{k}={v}\r\n");
                 let _ = stdout.write(line.as_bytes()).await;
             }
             Ok(())

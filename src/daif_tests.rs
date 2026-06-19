@@ -34,8 +34,7 @@ fn test_irq_guard_masks_and_restores() {
     let before = read_daif();
     assert!(
         before & DAIF_I_BIT == 0,
-        "test precondition: IRQs should be enabled before guard (daif={:#x})",
-        before
+        "test precondition: IRQs should be enabled before guard (daif={before:#x})"
     );
 
     {
@@ -43,16 +42,14 @@ fn test_irq_guard_masks_and_restores() {
         let during = read_daif();
         assert!(
             during & DAIF_I_BIT != 0,
-            "IrqGuard must mask the I-bit (daif={:#x})",
-            during
+            "IrqGuard must mask the I-bit (daif={during:#x})"
         );
     }
 
     let after = read_daif();
     assert_eq!(
         after, before,
-        "IrqGuard Drop must restore DAIF to pre-guard state ({:#x} != {:#x})",
-        after, before
+        "IrqGuard Drop must restore DAIF to pre-guard state ({after:#x} != {before:#x})"
     );
     console::print("  [PASS] test_irq_guard_masks_and_restores\n");
 }
@@ -85,7 +82,7 @@ fn test_nested_irq_guard_preserves_outer() {
 
 fn test_with_irqs_disabled_matches_guard() {
     let before = read_daif();
-    let observed = with_irqs_disabled(|| read_daif());
+    let observed = with_irqs_disabled(read_daif);
     let after = read_daif();
 
     assert!(
@@ -111,9 +108,7 @@ fn test_yield_now_detects_masked_yield() {
     let after = YIELD_WITH_IRQS_MASKED.load(Ordering::Relaxed);
     assert!(
         after > initial,
-        "yield_now under IrqGuard must increment YIELD_WITH_IRQS_MASKED (was {}, now {})",
-        initial,
-        after
+        "yield_now under IrqGuard must increment YIELD_WITH_IRQS_MASKED (was {initial}, now {after})"
     );
     console::print("  [PASS] test_yield_now_detects_masked_yield\n");
 }
@@ -157,8 +152,7 @@ fn test_runtime_is_lock_free_under_masked_irqs() {
         let during = read_daif();
         assert!(
             during & DAIF_I_BIT != 0,
-            "precondition: IRQs masked inside the closure (daif={:#x})",
-            during
+            "precondition: IRQs masked inside the closure (daif={during:#x})"
         );
 
         // 10k iterations of the exact call shape the watchdog uses.
@@ -178,8 +172,7 @@ fn test_runtime_is_lock_free_under_masked_irqs() {
     let after = read_daif();
     assert!(
         after & DAIF_I_BIT == 0,
-        "DAIF.I must be cleared after with_irqs_disabled (daif={:#x})",
-        after
+        "DAIF.I must be cleared after with_irqs_disabled (daif={after:#x})"
     );
 
     // Sanity: this path must not yield (we never call yield_now), so the

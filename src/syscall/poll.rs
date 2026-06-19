@@ -49,13 +49,11 @@ const EPOLL_CTL_MOD: i32 = 3;
 const BLOCKING_POLL_INTERVAL_US: u64 = 10_000;
 
 #[cfg(feature = "sc-epoll")]
-pub(crate) fn epoll_wait_deadline(timeout: i32, start_time: u64, timeout_us: u64, now: u64) -> u64 {
-    if timeout > 0 {
-        start_time + timeout_us
-    } else if timeout == 0 {
-        0
-    } else {
-        now + BLOCKING_POLL_INTERVAL_US
+pub fn epoll_wait_deadline(timeout: i32, start_time: u64, timeout_us: u64, now: u64) -> u64 {
+    match timeout.cmp(&0) {
+        core::cmp::Ordering::Greater => start_time + timeout_us,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Less => now + BLOCKING_POLL_INTERVAL_US,
     }
 }
 
@@ -72,7 +70,7 @@ struct PollFd {
 #[cfg(feature = "sc-epoll")]
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub(crate) struct EpollEvent {
+pub struct EpollEvent {
     pub(crate) events: u32,
     pub(crate) _pad: u32,  // ARM64 ABI padding
     pub(crate) data: u64,
@@ -100,7 +98,7 @@ fn log_epoll_pwait_return(
 
     if timeout == 0 && nready == 0 && iterations == 1 && note.is_empty() {
         let n = EPOLL_PWAIT_ZERO_ZERO_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n % every != 0 {
+        if !n.is_multiple_of(every) {
             return;
         }
         crate::tprint!(
@@ -174,13 +172,11 @@ pub(super) fn epoll_on_fd_drained(fd: u32) {
 
     for epoll_id in ids {
         let mut table = EPOLL_TABLE.lock();
-        if let Some(inst) = table.get_mut(&epoll_id) {
-            if let Some(entry) = inst.interest_list.get_mut(&fd) {
-                if entry.events & EPOLLET != 0 {
+        if let Some(inst) = table.get_mut(&epoll_id)
+            && let Some(entry) = inst.interest_list.get_mut(&fd)
+                && entry.events & EPOLLET != 0 {
                     entry.last_ready &= !EPOLLIN;
                 }
-            }
-        }
     }
 }
 
@@ -188,7 +184,7 @@ pub(super) fn epoll_on_fd_drained(fd: u32) {
 const EPOLL_CLOEXEC: u32 = 0o2000000;
 
 #[cfg(feature = "sc-epoll")]
-pub(crate) fn sys_epoll_create1(flags: u32) -> u64 {
+pub fn sys_epoll_create1(flags: u32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
         let epoll_id = NEXT_EPOLL_ID.fetch_add(1, Ordering::SeqCst);
         EPOLL_TABLE.lock().insert(epoll_id, EpollInstance {
@@ -199,7 +195,7 @@ pub(crate) fn sys_epoll_create1(flags: u32) -> u64 {
             proc.set_cloexec(fd);
         }
         crate::tprint!(96, "[epoll] create1() id={} fd={} cloexec={}\n", epoll_id, fd, flags & EPOLL_CLOEXEC != 0);
-        fd as u64
+        u64::from(fd)
     } else {
         EBADF
     }
@@ -210,7 +206,7 @@ pub(crate) fn sys_epoll_create1(flags: u32) -> u64 {
 /// This path validates **`event_ptr`** and uses **`copy_from_user_safe`** for the 16-byte
 /// AArch64 **`epoll_event`** — see **`docs/GO_FORKTEST_DEBUG.md`** if **`x8==EPOLL_CTL`** at SIGSEGV.
 #[cfg(feature = "sc-epoll")]
-pub(crate) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
+pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
     let epoll_id = match akuma_exec::process::current_process().and_then(|p| p.get_fd(epfd)) {
         Some(akuma_exec::process::FileDescriptor::EpollFd(id)) => id,
         _ => return EBADF,
@@ -228,7 +224,7 @@ pub(crate) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u6
         EPOLL_CTL_ADD => {
             if !validate_user_ptr(event_ptr as u64, EPOLL_EVENT_SIZE) { return EFAULT; }
             let mut ev = EpollEvent { events: 0, _pad: 0, data: 0 };
-            if unsafe { copy_from_user_safe(&mut ev as *mut EpollEvent as *mut u8, event_ptr as *const u8, EPOLL_EVENT_SIZE).is_err() } {
+            if unsafe { copy_from_user_safe((&raw mut ev).cast::<u8>(), event_ptr as *const u8, EPOLL_EVENT_SIZE).is_err() } {
                 return EFAULT;
             }
             let ev_events = { ev.events };
@@ -251,7 +247,7 @@ pub(crate) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u6
         EPOLL_CTL_MOD => {
             if !validate_user_ptr(event_ptr as u64, EPOLL_EVENT_SIZE) { return EFAULT; }
             let mut ev = EpollEvent { events: 0, _pad: 0, data: 0 };
-            if unsafe { copy_from_user_safe(&mut ev as *mut EpollEvent as *mut u8, event_ptr as *const u8, EPOLL_EVENT_SIZE).is_err() } {
+            if unsafe { copy_from_user_safe((&raw mut ev).cast::<u8>(), event_ptr as *const u8, EPOLL_EVENT_SIZE).is_err() } {
                 return EFAULT;
             }
             let ev_events = { ev.events };
@@ -276,7 +272,7 @@ pub(crate) fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u6
     }
 }
 
-pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Waker>) -> u32 {
+pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Waker>) -> u32 {
     let fd_entry = akuma_exec::process::current_process().and_then(|p| p.get_fd(fd_num));
     let fd_entry = match fd_entry {
         Some(e) => e,
@@ -403,21 +399,19 @@ pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Optio
         akuma_exec::process::FileDescriptor::PidFd(pidfd_id) => {
             // A pidfd becomes readable (EPOLLIN) when the tracked process has exited.
             if requested & EPOLLIN != 0 {
-                if let Some(target_pid) = super::pidfd::pidfd_get_pid(pidfd_id) {
-                    if let Some(ch) = akuma_exec::process::get_child_channel(target_pid) {
-                        if waker.is_some() {
+                if let Some(target_pid) = super::pidfd::pidfd_get_pid(pidfd_id)
+                    && let Some(ch) = akuma_exec::process::get_child_channel(target_pid)
+                        && waker.is_some() {
                             ch.add_poller(tid);
                         }
-                    }
-                }
                 if super::pidfd::pidfd_can_read(pidfd_id) {
                     ready |= EPOLLIN;
                 }
             }
         }
         akuma_exec::process::FileDescriptor::Stdin => {
-            if requested & EPOLLIN != 0 {
-                if let Some(ch) = akuma_exec::process::current_channel() {
+            if requested & EPOLLIN != 0
+                && let Some(ch) = akuma_exec::process::current_channel() {
                     if waker.is_some() {
                         ch.add_poller(tid);
                     }
@@ -425,7 +419,6 @@ pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Optio
                         ready |= EPOLLIN;
                     }
                 }
-            }
         }
         akuma_exec::process::FileDescriptor::Stdout | akuma_exec::process::FileDescriptor::Stderr => {
             if requested & EPOLLOUT != 0 {
@@ -442,7 +435,7 @@ pub(crate) fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Optio
 }
 
 #[cfg(feature = "sc-epoll")]
-pub(crate) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i32) -> u64 {
+pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i32) -> u64 {
     const EPOLL_EVENT_SIZE: usize = core::mem::size_of::<EpollEvent>();  // 16 on ARM64
     
     if maxevents <= 0 { return EINVAL; }
@@ -530,26 +523,23 @@ pub(crate) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
                 // Update last_ready in the table
                 {
                     let mut table = EPOLL_TABLE.lock();
-                    if let Some(inst) = table.get_mut(&epoll_id) {
-                        if let Some(entry) = inst.interest_list.get_mut(&fd) {
+                    if let Some(inst) = table.get_mut(&epoll_id)
+                        && let Some(entry) = inst.interest_list.get_mut(&fd) {
                             entry.last_ready = revents;
                         }
-                    }
                 }
                 if new_bits != 0 {
                     kernel_events.push(EpollEvent { events: new_bits, _pad: 0, data });
                     ready_count += 1;
                 }
-            } else {
-                if revents != 0 {
-                    kernel_events.push(EpollEvent { events: revents, _pad: 0, data });
-                    ready_count += 1;
-                }
+            } else if revents != 0 {
+                kernel_events.push(EpollEvent { events: revents, _pad: 0, data });
+                ready_count += 1;
             }
         }
 
         if ready_count > 0 {
-            if unsafe { copy_to_user_safe(events_ptr as *mut u8, kernel_events.as_ptr() as *const u8, ready_count * EPOLL_EVENT_SIZE).is_err() } {
+            if unsafe { copy_to_user_safe(events_ptr as *mut u8, kernel_events.as_ptr().cast::<u8>(), ready_count * EPOLL_EVENT_SIZE).is_err() } {
                 return EFAULT;
             }
             log_epoll_pwait_return(
@@ -597,7 +587,7 @@ pub(crate) fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, time
         }
 
         // Periodic log for long waits (every ~5 seconds = 500 iterations × 10ms)
-        if crate::config::SYSCALL_DEBUG_NET_ENABLED && iterations % 500 == 0 {
+        if crate::config::SYSCALL_DEBUG_NET_ENABLED && iterations.is_multiple_of(500) {
             let elapsed = crate::timer::uptime_us() - start_time;
             let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
             crate::tprint!(192, "[epoll] pwait still waiting: pid={} epfd={} {}us elapsed\n", 
@@ -646,7 +636,7 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
     if nfds == 0 { return 0; }
     const MAX_FDS: usize = 1024;
     if nfds > MAX_FDS { return EINVAL; }
-    let nwords = (nfds + 63) / 64;
+    let nwords = nfds.div_ceil(64);
     let fd_set_bytes = nwords * 8;
 
     let mut orig_read = [0u64; MAX_FDS / 64];
@@ -654,13 +644,13 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
 
     if readfds_ptr != 0 {
         if !validate_user_ptr(readfds_ptr, fd_set_bytes) { return EFAULT; }
-        if unsafe { copy_from_user_safe(orig_read.as_mut_ptr() as *mut u8, readfds_ptr as *const u8, fd_set_bytes).is_err() } {
+        if unsafe { copy_from_user_safe(orig_read.as_mut_ptr().cast::<u8>(), readfds_ptr as *const u8, fd_set_bytes).is_err() } {
             return EFAULT;
         }
     }
     if writefds_ptr != 0 {
         if !validate_user_ptr(writefds_ptr, fd_set_bytes) { return EFAULT; }
-        if unsafe { copy_from_user_safe(orig_write.as_mut_ptr() as *mut u8, writefds_ptr as *const u8, fd_set_bytes).is_err() } {
+        if unsafe { copy_from_user_safe(orig_write.as_mut_ptr().cast::<u8>(), writefds_ptr as *const u8, fd_set_bytes).is_err() } {
             return EFAULT;
         }
     }
@@ -669,10 +659,10 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
     let timeout_us = if !infinite {
         if !validate_user_ptr(timeout_ptr, 16) { return EFAULT; }
         let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-        if unsafe { copy_from_user_safe(&mut ts as *mut Timespec as *mut u8, timeout_ptr as *const u8, 16).is_err() } {
+        if unsafe { copy_from_user_safe((&raw mut ts).cast::<u8>(), timeout_ptr as *const u8, 16).is_err() } {
             return EFAULT;
         }
-        (ts.tv_sec as u64) * 1000_000 + (ts.tv_nsec as u64) / 1000
+        (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000
     } else {
         0
     };
@@ -712,30 +702,26 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
         }
 
         if ready_count > 0 {
-            if readfds_ptr != 0 { 
-                if unsafe { copy_to_user_safe(readfds_ptr as *mut u8, out_read.as_ptr() as *const u8, fd_set_bytes).is_err() } {
+            if readfds_ptr != 0 
+                && unsafe { copy_to_user_safe(readfds_ptr as *mut u8, out_read.as_ptr().cast::<u8>(), fd_set_bytes).is_err() } {
                     return EFAULT;
                 }
-            }
-            if writefds_ptr != 0 { 
-                if unsafe { copy_to_user_safe(writefds_ptr as *mut u8, out_write.as_ptr() as *const u8, fd_set_bytes).is_err() } {
+            if writefds_ptr != 0 
+                && unsafe { copy_to_user_safe(writefds_ptr as *mut u8, out_write.as_ptr().cast::<u8>(), fd_set_bytes).is_err() } {
                     return EFAULT;
                 }
-            }
             return ready_count;
         }
 
         if !infinite && (crate::timer::uptime_us() - start_time) >= timeout_us {
-            if readfds_ptr != 0 { 
-                if unsafe { copy_to_user_safe(readfds_ptr as *mut u8, [0u8; MAX_FDS/8].as_ptr(), fd_set_bytes).is_err() } {
+            if readfds_ptr != 0 
+                && unsafe { copy_to_user_safe(readfds_ptr as *mut u8, [0u8; MAX_FDS/8].as_ptr(), fd_set_bytes).is_err() } {
                     return EFAULT;
                 }
-            }
-            if writefds_ptr != 0 { 
-                if unsafe { copy_to_user_safe(writefds_ptr as *mut u8, [0u8; MAX_FDS/8].as_ptr(), fd_set_bytes).is_err() } {
+            if writefds_ptr != 0 
+                && unsafe { copy_to_user_safe(writefds_ptr as *mut u8, [0u8; MAX_FDS/8].as_ptr(), fd_set_bytes).is_err() } {
                     return EFAULT;
                 }
-            }
             return 0;
         }
 
@@ -754,10 +740,10 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
     let timeout_us = if !infinite {
         if !validate_user_ptr(timeout_ptr, 16) { return EFAULT; }
         let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-        if unsafe { copy_from_user_safe(&mut ts as *mut Timespec as *mut u8, timeout_ptr as *const u8, 16).is_err() } {
+        if unsafe { copy_from_user_safe((&raw mut ts).cast::<u8>(), timeout_ptr as *const u8, 16).is_err() } {
             return EFAULT;
         }
-        (ts.tv_sec as u64) * 1000_000 + (ts.tv_nsec as u64) / 1000
+        (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000
     } else {
         0
     };
@@ -770,7 +756,7 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
 
     let start_time = crate::timer::uptime_us();
     let mut kernel_fds = alloc::vec![PollFd { fd: 0, events: 0, revents: 0 }; nfds];
-    if unsafe { copy_from_user_safe(kernel_fds.as_mut_ptr() as *mut u8, fds_ptr as *const u8, fds_size).is_err() } {
+    if unsafe { copy_from_user_safe(kernel_fds.as_mut_ptr().cast::<u8>(), fds_ptr as *const u8, fds_size).is_err() } {
         return EFAULT;
     }
 
@@ -778,7 +764,7 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
         akuma_net::smoltcp_net::poll();
         let mut ready_count = 0;
         
-        for fd in kernel_fds.iter_mut() {
+        for fd in &mut kernel_fds {
             fd.revents = 0;
             if fd.fd < 0 { continue; }
 
@@ -799,7 +785,7 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
         }
 
         if ready_count > 0 {
-            if unsafe { copy_to_user_safe(fds_ptr as *mut u8, kernel_fds.as_ptr() as *const u8, fds_size).is_err() } {
+            if unsafe { copy_to_user_safe(fds_ptr as *mut u8, kernel_fds.as_ptr().cast::<u8>(), fds_size).is_err() } {
                 return EFAULT;
             }
             return ready_count as u64;

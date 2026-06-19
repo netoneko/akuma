@@ -262,5 +262,5 @@ pub fn read_line(buffer: &mut Vec<u8>, with_echo: bool) -> usize {
 pub fn print_as_akuma(s: &str) {
     print("≽ܫ≼ ... ");
     print(s);
-    print("\n")
+    print("\n");
 }

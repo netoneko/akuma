@@ -18,6 +18,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
+use core::fmt::Write as _;
 
 use super::{DirEntry, Filesystem, FsError, FsStats, Metadata};
 use crate::config::PROC_STDOUT_MAX_SIZE;
@@ -116,10 +117,10 @@ impl ProcFilesystem {
         use akuma_exec::process::FileDescriptor;
         match fd_entry {
             FileDescriptor::File(f) => f.path.clone(),
-            FileDescriptor::Socket(_) => format!("socket:[{}]", fd),
-            FileDescriptor::PipeRead(id) => format!("pipe:[{}]", id),
-            FileDescriptor::PipeWrite(id) => format!("pipe:[{}]", id),
-            FileDescriptor::UnixSocket { rx, .. } => format!("socket:[{}]", rx),
+            FileDescriptor::Socket(_) => format!("socket:[{fd}]"),
+            FileDescriptor::PipeRead(id) => format!("pipe:[{id}]"),
+            FileDescriptor::PipeWrite(id) => format!("pipe:[{id}]"),
+            FileDescriptor::UnixSocket { rx, .. } => format!("socket:[{rx}]"),
             FileDescriptor::EpollFd(_) => String::from("anon_inode:[eventpoll]"),
             FileDescriptor::TimerFd(_) => String::from("anon_inode:[timerfd]"),
             FileDescriptor::EventFd(_) => String::from("anon_inode:[eventfd]"),
@@ -129,8 +130,8 @@ impl ProcFilesystem {
             FileDescriptor::Stdin => String::from("/dev/stdin"),
             FileDescriptor::Stdout => String::from("/dev/stdout"),
             FileDescriptor::Stderr => String::from("/dev/stderr"),
-            FileDescriptor::ChildStdout(child_pid) => format!("pipe:[child:{}]", child_pid),
-            FileDescriptor::PidFd(id) => format!("anon_inode:[pidfd:{}]", id),
+            FileDescriptor::ChildStdout(child_pid) => format!("pipe:[child:{child_pid}]"),
+            FileDescriptor::PidFd(id) => format!("anon_inode:[pidfd:{id}]"),
         }
     }
 }
@@ -152,7 +153,7 @@ pub fn proc_fd_description(path: &str) -> Option<String> {
     // Handle "self/fd/<n>"
     let path = if let Some(rest) = path.strip_prefix("self/") {
         let pid = process::current_process().map(|p| p.pid)?;
-        alloc::format!("{}/{}", pid, rest)
+        alloc::format!("{pid}/{rest}")
     } else {
         alloc::string::String::from(path)
     };
@@ -170,13 +171,13 @@ pub fn proc_fd_description(path: &str) -> Option<String> {
 }
 
 impl Filesystem for ProcFilesystem {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "proc"
     }
 
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
         let path = path.trim_matches('/');
-        let current_box_id = akuma_exec::process::current_process().map(|p| p.box_id).unwrap_or(0);
+        let current_box_id = akuma_exec::process::current_process().map_or(0, |p| p.box_id);
 
         if path.is_empty() {
             // Root: list all process PIDs as directories, filtered by box_id
@@ -187,12 +188,10 @@ impl Filesystem for ProcFilesystem {
                     // Box 0 (Host) sees everything. Box N only sees its own.
                     if current_box_id == 0 {
                         true
+                    } else if let Some(proc) = process::lookup_process(p.pid) {
+                        proc.box_id == current_box_id
                     } else {
-                        if let Some(proc) = process::lookup_process(p.pid) {
-                            proc.box_id == current_box_id
-                        } else {
-                            false
-                        }
+                        false
                     }
                 })
                 .map(|p| DirEntry {
@@ -230,7 +229,7 @@ impl Filesystem for ProcFilesystem {
                 for pid in logged_pids {
                     if !live_pids.contains(&pid) {
                         entries.push(DirEntry {
-                            name: format!("{}", pid),
+                            name: format!("{pid}"),
                             is_dir: true,
                             is_symlink: false,
                             size: 0,
@@ -322,7 +321,7 @@ impl Filesystem for ProcFilesystem {
             // Always include std fds (Stdin/Stdout/Stderr are not in the BTreeMap)
             for fd_num in [0u32, 1, 2] {
                 entries.push(DirEntry {
-                    name: format!("{}", fd_num),
+                    name: format!("{fd_num}"),
                     is_dir: false,
                     is_symlink: true,
                     size: 0,
@@ -332,7 +331,7 @@ impl Filesystem for ProcFilesystem {
             for &fd_num in proc.fds.table.lock().keys() {
                 if fd_num > 2 {
                     entries.push(DirEntry {
-                        name: format!("{}", fd_num),
+                        name: format!("{fd_num}"),
                         is_dir: false,
                         is_symlink: true,
                         size: 0,
@@ -362,8 +361,8 @@ impl Filesystem for ProcFilesystem {
         // Handle <pid>/syscalls
         if crate::config::PROC_SYSCALL_LOG_ENABLED {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
-            if parts.len() == 2 && parts[1] == "syscalls" {
-                if let Ok(pid) = parts[0].parse::<Pid>() {
+            if parts.len() == 2 && parts[1] == "syscalls"
+                && let Ok(pid) = parts[0].parse::<Pid>() {
                     let data = crate::syscall::log::get_formatted(pid)
                         .ok_or(FsError::NotFound)?;
                     if offset >= data.len() {
@@ -373,24 +372,23 @@ impl Filesystem for ProcFilesystem {
                     buf[..n].copy_from_slice(&data[offset..offset + n]);
                     return Ok(n);
                 }
-            }
         }
 
         // Handle <pid>/cmdline and <pid>/status
         {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
-            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status") {
-                if let Ok(pid) = parts[0].parse::<Pid>() {
+            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status")
+                && let Ok(pid) = parts[0].parse::<Pid>() {
                     let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
                     let current_box_id =
-                        akuma_exec::process::current_process().map(|p| p.box_id).unwrap_or(0);
+                        akuma_exec::process::current_process().map_or(0, |p| p.box_id);
                     if current_box_id != 0 && proc.box_id != current_box_id {
                         return Err(FsError::NotFound);
                     }
                     let data = if parts[1] == "cmdline" {
-                        proc_cmdline_bytes(&proc)
+                        proc_cmdline_bytes(proc)
                     } else {
-                        proc_status_text(&proc).into_bytes()
+                        proc_status_text(proc).into_bytes()
                     };
                     if offset >= data.len() {
                         return Ok(0);
@@ -399,12 +397,11 @@ impl Filesystem for ProcFilesystem {
                     buf[..n].copy_from_slice(&data[offset..offset + n]);
                     return Ok(n);
                 }
-            }
         }
 
         let (pid, fd_num) = Self::parse_fd_path(path)?;
         let current_proc = akuma_exec::process::current_process();
-        let current_box_id = current_proc.as_ref().map(|p| p.box_id).unwrap_or(0);
+        let current_box_id = current_proc.as_ref().map_or(0, |p| p.box_id);
 
         let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
         
@@ -451,7 +448,7 @@ impl Filesystem for ProcFilesystem {
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
         let path = path.trim_start_matches('/');
         let current_proc = akuma_exec::process::current_process();
-        let current_box_id = current_proc.as_ref().map(|p| p.box_id).unwrap_or(0);
+        let current_box_id = current_proc.as_ref().map_or(0, |p| p.box_id);
 
         // Handle /proc/boxes
         if path == "boxes" {
@@ -465,7 +462,7 @@ impl Filesystem for ProcFilesystem {
             }
             let mut out = String::from("ID,NAME,ROOT,CREATOR,PRIMARY\n");
             for b in boxes {
-                out.push_str(&format!("{},{},{},{},{}\n", b.id, b.name, b.root_dir, b.creator_pid, b.primary_pid));
+                let _ = writeln!(out, "{},{},{},{},{}", b.id, b.name, b.root_dir, b.creator_pid, b.primary_pid);
             }
             return Ok(out.into_bytes());
         }
@@ -474,12 +471,12 @@ impl Filesystem for ProcFilesystem {
             let sockets = akuma_net::socket::list_sockets();
             let mut out = String::from("LOCAL_PORT,REMOTE_ADDR,STATE,BOX\n");
             for s in sockets {
-                out.push_str(&format!("{},{}:{},{},{}\n", 
-                    s.local_port, 
-                    format!("{}.{}.{}.{}", s.remote_ip[0], s.remote_ip[1], s.remote_ip[2], s.remote_ip[3]),
+                let _ = writeln!(out, "{},{}.{}.{}.{}:{},{},{}",
+                    s.local_port,
+                    s.remote_ip[0], s.remote_ip[1], s.remote_ip[2], s.remote_ip[3],
                     s.remote_port,
                     s.state,
-                    s.box_id));
+                    s.box_id);
             }
             return Ok(out.into_bytes());
         }
@@ -499,10 +496,10 @@ impl Filesystem for ProcFilesystem {
                 if current_box_id != 0 && q.box_id != current_box_id {
                     continue;
                 }
-                out.push_str(&format!(
-                    "{:10} {:10} {:5o} {:10} {:10}     0     0       0       0       0\n",
+                let _ = writeln!(out,
+                    "{:10} {:10} {:5o} {:10} {:10}     0     0       0       0       0",
                     q.key, q.msqid, q.mode, q.cbytes, q.qnum
-                ));
+                );
             }
             return Ok(out.into_bytes());
         }
@@ -510,43 +507,39 @@ impl Filesystem for ProcFilesystem {
         // Handle <pid>/syscalls
         if crate::config::PROC_SYSCALL_LOG_ENABLED {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
-            if parts.len() == 2 && parts[1] == "syscalls" {
-                if let Ok(pid) = parts[0].parse::<Pid>() {
+            if parts.len() == 2 && parts[1] == "syscalls"
+                && let Ok(pid) = parts[0].parse::<Pid>() {
                     // Box isolation check: only allow if same box or host
-                    if current_box_id != 0 {
-                        if let Some(proc) = process::lookup_process(pid) {
-                            if proc.box_id != current_box_id {
+                    if current_box_id != 0
+                        && let Some(proc) = process::lookup_process(pid)
+                            && proc.box_id != current_box_id {
                                 return Err(FsError::NotFound);
                             }
-                        }
-                    }
                     return crate::syscall::log::get_formatted(pid)
                         .ok_or(FsError::NotFound);
                 }
-            }
         }
 
         // Handle <pid>/cmdline and <pid>/status
         {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
-            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status") {
-                if let Ok(pid) = parts[0].parse::<Pid>() {
+            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status")
+                && let Ok(pid) = parts[0].parse::<Pid>() {
                     let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
                     if current_box_id != 0 && proc.box_id != current_box_id {
                         return Err(FsError::NotFound);
                     }
                     if parts[1] == "cmdline" {
-                        return Ok(proc_cmdline_bytes(&proc));
+                        return Ok(proc_cmdline_bytes(proc));
                     }
-                    return Ok(proc_status_text(&proc).into_bytes());
+                    return Ok(proc_status_text(proc).into_bytes());
                 }
-            }
         }
 
         let (pid, fd_num) = Self::parse_fd_path(path)?;
 
         let current_proc = akuma_exec::process::current_process();
-        let current_box_id = current_proc.as_ref().map(|p| p.box_id).unwrap_or(0);
+        let current_box_id = current_proc.as_ref().map_or(0, |p| p.box_id);
 
         let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
         
@@ -567,7 +560,7 @@ impl Filesystem for ProcFilesystem {
         let (target_pid, fd_num) = Self::parse_fd_path(path)?;
         let caller_proc = akuma_exec::process::current_process();
         let caller_pid = process::read_current_pid();
-        let caller_box_id = caller_proc.as_ref().map(|p| p.box_id).unwrap_or(0);
+        let caller_box_id = caller_proc.as_ref().map_or(0, |p| p.box_id);
 
         let target = process::lookup_process(target_pid).ok_or(FsError::NotFound)?;
 
@@ -643,7 +636,7 @@ impl Filesystem for ProcFilesystem {
         }
 
         if path == "boxes" {
-            let current_box_id = akuma_exec::process::current_process().map(|p| p.box_id).unwrap_or(0);
+            let current_box_id = akuma_exec::process::current_process().map_or(0, |p| p.box_id);
             return current_box_id == 0;
         }
 
@@ -660,8 +653,7 @@ impl Filesystem for ProcFilesystem {
             if !Self::process_exists(pid) { return false; }
             if fd_num <= 1 { return true; }
             return process::lookup_process(pid)
-                .map(|p| p.get_fd(fd_num).is_some())
-                .unwrap_or(false);
+                .is_some_and(|p| p.get_fd(fd_num).is_some());
         }
 
         // Try to parse as pid path
@@ -683,7 +675,7 @@ impl Filesystem for ProcFilesystem {
                 }
                 if let Some(proc) = process::lookup_process(pid) {
                     let current_box_id =
-                        akuma_exec::process::current_process().map(|p| p.box_id).unwrap_or(0);
+                        akuma_exec::process::current_process().map_or(0, |p| p.box_id);
                     return current_box_id == 0 || proc.box_id == current_box_id;
                 }
                 return false;
@@ -702,7 +694,7 @@ impl Filesystem for ProcFilesystem {
         let inode = {
             let mut h: u64 = 0xcbf29ce484222325;
             for b in path.bytes() {
-                h ^= b as u64;
+                h ^= u64::from(b);
                 h = h.wrapping_mul(0x100000001b3);
             }
             h
@@ -721,7 +713,7 @@ impl Filesystem for ProcFilesystem {
         }
 
         if path == "boxes" {
-            let current_box_id = akuma_exec::process::current_process().map(|p| p.box_id).unwrap_or(0);
+            let current_box_id = akuma_exec::process::current_process().map_or(0, |p| p.box_id);
             if current_box_id != 0 {
                 return Err(FsError::NotFound);
             }
@@ -828,14 +820,14 @@ impl Filesystem for ProcFilesystem {
             if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status") {
                 let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
                 let current_box_id =
-                    akuma_exec::process::current_process().map(|p| p.box_id).unwrap_or(0);
+                    akuma_exec::process::current_process().map_or(0, |p| p.box_id);
                 if current_box_id != 0 && proc.box_id != current_box_id {
                     return Err(FsError::NotFound);
                 }
                 let size = if parts[1] == "cmdline" {
-                    proc_cmdline_bytes(&proc).len() as u64
+                    proc_cmdline_bytes(proc).len() as u64
                 } else {
-                    proc_status_text(&proc).len() as u64
+                    proc_status_text(proc).len() as u64
                 };
                 return Ok(Metadata {
                     is_dir: false,
@@ -882,7 +874,7 @@ impl Filesystem for ProcFilesystem {
         // Handle "self/fd/<n>" -> resolve to current process
         if let Some(rest) = path.strip_prefix("self/") {
             let pid = process::current_process().map(|p| p.pid).ok_or(FsError::NotFound)?;
-            let new_path = format!("{}/{}", pid, rest);
+            let new_path = format!("{pid}/{rest}");
             return self.read_symlink(&new_path);
         }
 
@@ -900,7 +892,7 @@ impl Filesystem for ProcFilesystem {
             if let Some(fd_entry) = proc.get_fd(fd) {
                 use akuma_exec::process::FileDescriptor;
                 if let FileDescriptor::File(f) = fd_entry {
-                    return Ok(f.path.clone());
+                    return Ok(f.path);
                 }
                 // Non-file fds: not a resolvable symlink target
                 return Err(FsError::NotFound);
@@ -920,12 +912,11 @@ impl Filesystem for ProcFilesystem {
         }
 
         // "self/fd/<n>" and "<pid>/fd/<n>" are symlinks
-        if let Some(rest) = path.strip_prefix("self/") {
-            if rest.starts_with("fd/") {
+        if let Some(rest) = path.strip_prefix("self/")
+            && rest.starts_with("fd/") {
                 let fd_part = &rest[3..];
                 return fd_part.parse::<u32>().is_ok();
             }
-        }
 
         let parts: Vec<&str> = path.split('/').collect();
         if parts.len() == 3 && parts[1] == "fd" {

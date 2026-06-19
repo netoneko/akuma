@@ -21,14 +21,14 @@ fn notify_child_channel_exited(pid: u32, code: i32) {
 /// Public wrapper for crash paths in exceptions.rs that need to notify the
 /// parent before `return_to_kernel` runs.  Idempotent — the second call from
 /// `return_to_kernel::remove_channel` is harmless.
-pub(crate) fn notify_child_channel_exited_pub(pid: u32, code: i32) {
+pub fn notify_child_channel_exited_pub(pid: u32, code: i32) {
     notify_child_channel_exited(pid, code);
 }
 
 /// Wake the vfork parent (if any) of the given child PID.
 /// Called from do_execve (on successful image replacement), sys_exit_group/sys_exit,
 /// and fault exit paths in exceptions.rs.
-pub(crate) fn vfork_complete(child_pid: u32) {
+pub fn vfork_complete(child_pid: u32) {
     let parent_tid = crate::irq::with_irqs_disabled(|| {
         VFORK_WAITERS.lock().remove(&child_pid)
     });
@@ -39,14 +39,14 @@ pub(crate) fn vfork_complete(child_pid: u32) {
 
 /// Number of entries currently in VFORK_WAITERS.  Used only by kernel tests.
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-pub(crate) fn vfork_waiters_len() -> usize {
+pub fn vfork_waiters_len() -> usize {
     crate::irq::with_irqs_disabled(|| VFORK_WAITERS.lock().len())
 }
 
 /// Kernel test helper: insert a fake pending vfork for `child_pid`, invoke
 /// `vfork_complete`, and return whether the entry was cleanly removed.
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-pub(crate) fn test_vfork_complete_mechanism(child_pid: u32) -> bool {
+pub fn test_vfork_complete_mechanism(child_pid: u32) -> bool {
     let tid = akuma_exec::threading::current_thread_id();
     crate::irq::with_irqs_disabled(|| {
         VFORK_WAITERS.lock().insert(child_pid, tid);
@@ -60,23 +60,23 @@ pub(crate) fn test_vfork_complete_mechanism(child_pid: u32) -> bool {
 
 /// Kernel test helper: insert a fake vfork entry without invoking vfork_complete.
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-pub(crate) fn vfork_waiters_insert_for_test(child_pid: u32) {
+pub fn vfork_waiters_insert_for_test(child_pid: u32) {
     let tid = akuma_exec::threading::current_thread_id();
     VFORK_WAITERS.lock().insert(child_pid, tid);
 }
 
 /// Kernel test helper: check whether a child PID is still in VFORK_WAITERS.
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-pub(crate) fn vfork_waiters_contains_for_test(child_pid: u32) -> bool {
+pub fn vfork_waiters_contains_for_test(child_pid: u32) -> bool {
     VFORK_WAITERS.lock().contains_key(&child_pid)
 }
 
 /// Linux `wait*status`: normal exit is `(code & 0xff) << 8` (WIFEXITED / WEXITSTATUS).
 /// Negative `code` is treated as stopped-by-signal: low 7 bits = signal number.
-pub(crate) fn encode_wait_status(code: i32) -> u32 {
+pub fn encode_wait_status(code: i32) -> u32 {
     if code < 0 {
-        let sig = (-code) as u32 & 0x7F;
-        sig
+        
+        (-code) as u32 & 0x7F
     } else {
         ((code as u32) & 0xFF) << 8
     }
@@ -128,7 +128,7 @@ pub(super) fn sys_getpgid(pid: u32) -> u64 {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED && pid == 0 {
             crate::safe_print!(128, "[syscall] getpgid(0) for PID {}: returning PGID {}\n", target_pid, proc.pgid);
         }
-        proc.pgid as u64
+        u64::from(proc.pgid)
     } else {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::safe_print!(128, "[syscall] getpgid({}) not found: ESRCH\n", target_pid);
@@ -140,7 +140,7 @@ pub(super) fn sys_getpgid(pid: u32) -> u64 {
 pub(super) fn sys_setsid() -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
         proc.pgid = proc.pid;
-        proc.pid as u64
+        u64::from(proc.pid)
     } else {
         // Per setsid(2): EPERM if the calling process is already a process
         // group leader. Here the caller has no current process at all, so
@@ -177,7 +177,7 @@ pub(super) fn sys_uname(buf: u64) -> u64 {
 pub(super) fn sys_set_tid_address(tidptr: u64) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
         proc.clear_child_tid = tidptr;
-        return proc.pid as u64;
+        return u64::from(proc.pid);
     }
     1
 }
@@ -381,7 +381,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED {
                     crate::tprint!(64, "[clone] new thread TID={}\n", tid);
                 }
-                return tid as u64;
+                return u64::from(tid);
             }
             Err(e) => {
                 crate::safe_print!(128, "[syscall] clone_thread failed: {}\n", e);
@@ -439,8 +439,8 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                 // CLONE_PIDFD: atomically create a pidfd for the child and write the fd number
                 // back to the caller. Go 1.22+ uses this to get the pidfd in a single syscall.
                 #[cfg(feature = "sc-pidfd")]
-                if flags & CLONE_PIDFD != 0 && pidfd_out_ptr != 0 {
-                    if validate_user_ptr(pidfd_out_ptr, 4) {
+                if flags & CLONE_PIDFD != 0 && pidfd_out_ptr != 0
+                    && validate_user_ptr(pidfd_out_ptr, 4) {
                         let pidfd_fd = super::pidfd::sys_pidfd_open(new_pid, 0 /* no flags */);
                         if (pidfd_fd as i64) >= 0 {
                             // Linux clone3 with CLONE_PIDFD always sets O_CLOEXEC.
@@ -451,14 +451,13 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                             let _ = unsafe {
                                 copy_to_user_safe(
                                     pidfd_out_ptr as *mut u8,
-                                    &fd_i32 as *const i32 as *const u8,
+                                    (&raw const fd_i32).cast::<u8>(),
                                     4,
                                 )
                             };
                             crate::tprint!(96, "[clone] CLONE_PIDFD: child={} pidfd={}\n", new_pid, pidfd_fd);
                         }
                     }
-                }
                 // CLONE_VFORK: block parent until child calls execve or exits.
                 // Without this, both parent and child run the Go runtime concurrently
                 // in the same address space, corrupting each other's state.
@@ -477,7 +476,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                         if !still_pending { break; }
                     }
                 }
-                return new_pid as u64;
+                return u64::from(new_pid);
             },
             Err(e) => {
                 // Fork failed: clean up the VFORK_WAITERS entry we pre-inserted.
@@ -518,7 +517,7 @@ pub(super) fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
     }
 
     let mut cl_args = CloneArgs::default();
-    if unsafe { copy_from_user_safe(&mut cl_args as *mut CloneArgs as *mut u8, cl_args_ptr as *const u8, struct_size).is_err() } {
+    if unsafe { copy_from_user_safe((&raw mut cl_args).cast::<u8>(), cl_args_ptr as *const u8, struct_size).is_err() } {
         return EFAULT;
     }
 
@@ -553,12 +552,10 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 
     let resolved_path = if path.starts_with('/') {
         path
+    } else if let Some(proc) = akuma_exec::process::current_process() {
+        crate::vfs::resolve_path(&proc.cwd, &path)
     } else {
-        if let Some(proc) = akuma_exec::process::current_process() {
-            crate::vfs::resolve_path(&proc.cwd, &path)
-        } else {
-            path
-        }
+        path
     };
     let resolved_path = crate::vfs::resolve_symlinks(&resolved_path);
 
@@ -568,7 +565,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         loop {
             if !validate_user_ptr(argv_ptr + i * 8, 8) { break; }
             let mut str_ptr: u64 = 0;
-            if unsafe { copy_from_user_safe(&mut str_ptr as *mut u64 as *mut u8, (argv_ptr + i * 8) as *const u8, 8).is_err() } {
+            if unsafe { copy_from_user_safe((&raw mut str_ptr).cast::<u8>(), (argv_ptr + i * 8) as *const u8, 8).is_err() } {
                 break;
             }
             if str_ptr == 0 { break; }
@@ -577,13 +574,10 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             // this `break`d, which silently dropped the over-long arg AND every arg
             // after it, then exec'd a corrupt argv (e.g. rustc saw `--check-cfg`
             // with its giant value truncated away → "Argument to option missing").
-            match copy_from_user_str(str_ptr, crate::config::MAX_ARG_STRLEN) {
-                Ok(s) => args.push(s),
-                Err(_) => {
-                    crate::safe_print!(96, "[syscall] execve: argv[{}] too long or unreadable (cap={}) — E2BIG\n",
-                        i, crate::config::MAX_ARG_STRLEN);
-                    return E2BIG;
-                }
+            if let Ok(s) = copy_from_user_str(str_ptr, crate::config::MAX_ARG_STRLEN) { args.push(s) } else {
+                crate::safe_print!(96, "[syscall] execve: argv[{}] too long or unreadable (cap={}) — E2BIG\n",
+                    i, crate::config::MAX_ARG_STRLEN);
+                return E2BIG;
             }
             i += 1;
         }
@@ -597,7 +591,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     do_execve(resolved_path, args, env)
 }
 
-pub(crate) fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 {
+pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 {
     // On the size profile the heap seed is 1 MB. Reading a large binary
     // (e.g. the 700+ KB system linker that tcc invokes) would exhaust it.
     // Read just the first 256 bytes — enough for shebang detection — and
@@ -624,11 +618,10 @@ pub(crate) fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<Strin
         }
     };
 
-    if let Some(ref data) = file_data {
-        if data.len() >= 2 && data[0] == b'#' && data[1] == b'!' {
+    if let Some(ref data) = file_data
+        && data.len() >= 2 && data[0] == b'#' && data[1] == b'!' {
             return exec_shebang(&resolved_path, data, args, env);
         }
-    }
 
     let proc = match akuma_exec::process::current_process() {
         Some(p) => p,
@@ -696,7 +689,7 @@ pub(crate) fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<Strin
         }
     }
 
-    proc.name = resolved_path.clone();
+    proc.name.clone_from(&resolved_path);
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[syscall] execve: replaced image for PID {} with {}\n", proc.pid, resolved_path);
@@ -715,13 +708,10 @@ pub(crate) fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<Strin
 }
 
 fn exec_shebang(script_path: &str, file_data: &[u8], original_args: Vec<String>, env: Vec<String>) -> u64 {
-    let line_end = file_data.iter().position(|&b| b == b'\n').unwrap_or(file_data.len().min(256));
-    let shebang_line = match core::str::from_utf8(&file_data[2..line_end]) {
-        Ok(s) => s.trim(),
-        Err(_) => {
-            crate::safe_print!(128, "[syscall] execve: invalid shebang in {}\n", script_path);
-            return ENOENT;
-        }
+    let line_end = file_data.iter().position(|&b| b == b'\n').unwrap_or_else(|| file_data.len().min(256));
+    let shebang_line = if let Ok(s) = core::str::from_utf8(&file_data[2..line_end]) { s.trim() } else {
+        crate::safe_print!(128, "[syscall] execve: invalid shebang in {}\n", script_path);
+        return ENOENT;
     };
 
     if shebang_line.is_empty() {
@@ -746,11 +736,10 @@ fn exec_shebang(script_path: &str, file_data: &[u8], original_args: Vec<String>,
 
     let mut new_args = Vec::new();
     new_args.push(interpreter.clone());
-    if let Some(arg) = shebang_arg {
-        if !arg.is_empty() {
+    if let Some(arg) = shebang_arg
+        && !arg.is_empty() {
             new_args.push(String::from(arg));
         }
-    }
     new_args.push(String::from(script_path));
     if original_args.len() > 1 {
         new_args.extend_from_slice(&original_args[1..]);
@@ -774,7 +763,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
 
     let current_pid = match akuma_exec::process::read_current_pid() {
         Some(p) => p,
-        None => return (-libc_errno::ECHILD as i64) as u64,
+        None => return i64::from(-libc_errno::ECHILD) as u64,
     };
 
     let waiter_tid = akuma_exec::threading::current_thread_id();
@@ -791,14 +780,14 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                     }
                     if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
                         let status = encode_wait_status(code);
-                        let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, &status as *const u32 as *const u8, 4) };
+                        let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, (&raw const status).cast::<u8>(), 4) };
                     }
                     // Reap the zombie: remove from process table + child channels.
                     // On Linux, waitpid is the only way to reap a zombie.
                     akuma_exec::process::clear_lazy_regions(p);
                     let _ = akuma_exec::process::unregister_process(p);
                     akuma_exec::process::remove_child_channel(p);
-                    return p as u64;
+                    return u64::from(p);
                 }
 
                 if wnohang {
@@ -811,12 +800,12 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                     let code = ch.exit_code();
                     if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
                         let status = encode_wait_status(code);
-                        let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, &status as *const u32 as *const u8, 4) };
+                        let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, (&raw const status).cast::<u8>(), 4) };
                     }
                     akuma_exec::process::clear_lazy_regions(p);
                     let _ = akuma_exec::process::unregister_process(p);
                     akuma_exec::process::remove_child_channel(p);
-                    return p as u64;
+                    return u64::from(p);
                 }
                 akuma_exec::threading::schedule_blocking(u64::MAX);
                 // If interrupted (signal or Ctrl+C), return EINTR so the caller retries.
@@ -830,7 +819,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                 crate::safe_print!(128, "[syscall] wait4: no children for PID {}\n", current_pid);
             }
-            return (-libc_errno::ECHILD as i64) as u64;
+            return i64::from(-libc_errno::ECHILD) as u64;
         }
 
         loop {
@@ -842,13 +831,13 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 }
                 if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
                     let status = encode_wait_status(code);
-                    let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, &status as *const u32 as *const u8, 4) };
+                    let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, (&raw const status).cast::<u8>(), 4) };
                 }
                 // Reap the zombie
                 akuma_exec::process::clear_lazy_regions(child_pid);
                 let _ = akuma_exec::process::unregister_process(child_pid);
                 akuma_exec::process::remove_child_channel(child_pid);
-                return child_pid as u64;
+                return u64::from(child_pid);
             }
 
             if wnohang {
@@ -865,13 +854,13 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 }
                 if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
                     let status = encode_wait_status(code);
-                    let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, &status as *const u32 as *const u8, 4) };
+                    let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, (&raw const status).cast::<u8>(), 4) };
                 }
                 // Reap the zombie
                 akuma_exec::process::clear_lazy_regions(child_pid);
                 let _ = akuma_exec::process::unregister_process(child_pid);
                 akuma_exec::process::remove_child_channel(child_pid);
-                return child_pid as u64;
+                return u64::from(child_pid);
             }
             akuma_exec::threading::schedule_blocking(u64::MAX);
             if akuma_exec::process::is_current_interrupted() {
@@ -883,7 +872,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[syscall] wait4: no child found for PID {}\n", pid);
     }
-    (-libc_errno::ECHILD as i64) as u64
+    i64::from(-libc_errno::ECHILD) as u64
 }
 
 pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 {
@@ -915,7 +904,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
 
     let current_pid = match akuma_exec::process::read_current_pid() {
         Some(p) => p,
-        None => return (-libc_errno::ECHILD as i64) as u64,
+        None => return i64::from(-libc_errno::ECHILD) as u64,
     };
 
     let waiter_tid = akuma_exec::threading::current_thread_id();
@@ -933,12 +922,12 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                     if akuma_exec::process::is_current_interrupted() { return EINTR; }
                 }
             } else {
-                return (-libc_errno::ECHILD as i64) as u64;
+                return i64::from(-libc_errno::ECHILD) as u64;
             }
         }
         P_ALL => {
             if !akuma_exec::process::has_children(current_pid) {
-                return (-libc_errno::ECHILD as i64) as u64;
+                return i64::from(-libc_errno::ECHILD) as u64;
             }
             loop {
                 if let Some((cpid, ch)) = akuma_exec::process::find_exited_child(current_pid) {
@@ -961,13 +950,13 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                     Some(akuma_exec::process::FileDescriptor::PidFd(pidfd_id)) => {
                         match super::pidfd::pidfd_get_pid(pidfd_id) {
                             Some(p) => p,
-                            None => return (-libc_errno::ECHILD as i64) as u64,
+                            None => return i64::from(-libc_errno::ECHILD) as u64,
                         }
                     }
                     _ => return EBADF,
                 }
             } else {
-                return (-libc_errno::ECHILD as i64) as u64;
+                return i64::from(-libc_errno::ECHILD) as u64;
             };
             if let Some(ch) = akuma_exec::process::get_child_channel(target_pid) {
                 loop {
@@ -981,10 +970,10 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                     if akuma_exec::process::is_current_interrupted() { return EINTR; }
                 }
             } else {
-                return (-libc_errno::ECHILD as i64) as u64;
+                return i64::from(-libc_errno::ECHILD) as u64;
             }
         }
-        _ => return (-libc_errno::EINVAL as i64) as u64,
+        _ => return i64::from(-libc_errno::EINVAL) as u64,
     };
 
     if let Some((child_pid, code)) = result {
@@ -1009,7 +998,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                                  si_pid: child_pid, si_uid: 0, si_status };
             let _ = unsafe {
                 copy_to_user_safe(infop as *mut u8,
-                                  &info as *const SigChld as *const u8,
+                                  (&raw const info).cast::<u8>(),
                                   core::mem::size_of::<SigChld>())
             };
         }
@@ -1044,7 +1033,7 @@ pub(super) fn sys_prlimit64(_pid: u32, resource: u32, _new_rlim: u64, old_rlim: 
             _ => (RLIM_INFINITY, RLIM_INFINITY),
         };
         let rlim = Rlimit { rlim_cur: cur, rlim_max: max };
-        if unsafe { copy_to_user_safe(old_rlim as *mut u8, &rlim as *const Rlimit as *const u8, 16).is_err() } {
+        if unsafe { copy_to_user_safe(old_rlim as *mut u8, (&raw const rlim).cast::<u8>(), 16).is_err() } {
             return EFAULT;
         }
     }
@@ -1063,13 +1052,13 @@ pub(super) fn sys_sysinfo(info_ptr: usize) -> u64 {
     //   80: procs (2), 82: pad (2), 84: [align 4], 88: totalhigh (8),
     //   96: freehigh (8), 104: mem_unit (4), 108: _f[0], pad to 112
     unsafe {
-        let ptr = info.as_mut_ptr() as *mut u64;
+        let ptr = info.as_mut_ptr().cast::<u64>();
         core::ptr::write(ptr.add(0), uptime_secs);          // offset 0
         core::ptr::write(ptr.add(4), total_pages * 4096);   // offset 32: totalram
         core::ptr::write(ptr.add(5), free_pages * 4096);    // offset 40: freeram
-        let procs_ptr = info.as_mut_ptr().add(80) as *mut u16;
+        let procs_ptr = info.as_mut_ptr().add(80).cast::<u16>();
         core::ptr::write(procs_ptr, 1);                     // offset 80: procs
-        let memunit_ptr = info.as_mut_ptr().add(104) as *mut u32;
+        let memunit_ptr = info.as_mut_ptr().add(104).cast::<u32>();
         core::ptr::write(memunit_ptr, 1);                   // offset 104: mem_unit
     }
     if unsafe { copy_to_user_safe(info_ptr as *mut u8, info.as_ptr(), 112).is_err() } {
@@ -1081,12 +1070,12 @@ pub(super) fn sys_sysinfo(info_ptr: usize) -> u64 {
 pub(super) fn sys_getpid() -> u64 {
     // Linux's getpid(2) cannot fail; we return ESRCH only as a defensive
     // sentinel for kernel paths where no current PID has been registered.
-    akuma_exec::process::read_current_pid().map_or(ESRCH, |pid| pid as u64)
+    akuma_exec::process::read_current_pid().map_or(ESRCH, u64::from)
 }
 
 pub(super) fn sys_getppid() -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
-        proc.parent_pid as u64
+        u64::from(proc.parent_pid)
     } else {
         ESRCH
     }
@@ -1135,11 +1124,10 @@ pub(super) fn parse_argv_array(ptr: u64) -> Vec<String> {
     let mut args = Vec::new();
     let mut i = 0;
     loop {
-        if !BYPASS_VALIDATION.load(Ordering::Acquire) {
-            if !validate_user_ptr(ptr + i * 8, 8) { break; }
-        }
+        if !BYPASS_VALIDATION.load(Ordering::Acquire)
+            && !validate_user_ptr(ptr + i * 8, 8) { break; }
         let mut str_ptr: u64 = 0;
-        if unsafe { copy_from_user_safe(&mut str_ptr as *mut u64 as *mut u8, (ptr + i * 8) as *const u8, 8).is_err() } {
+        if unsafe { copy_from_user_safe((&raw mut str_ptr).cast::<u8>(), (ptr + i * 8) as *const u8, 8).is_err() } {
             break;
         }
         if str_ptr == 0 { break; }
@@ -1163,15 +1151,14 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     let env_vec = parse_argv_array(envp_ptr);
     
     let args_refs: Vec<&str> = if args_vec.len() > 1 {
-        args_vec.iter().skip(1).map(|s| s.as_str()).collect()
+        args_vec.iter().skip(1).map(alloc::string::String::as_str).collect()
     } else {
         Vec::new()
     };
     
     let stdin_data = if stdin_ptr != 0 {
-        if !BYPASS_VALIDATION.load(Ordering::Acquire) {
-            if !validate_user_ptr(stdin_ptr, stdin_len) { return EFAULT; }
-        }
+        if !BYPASS_VALIDATION.load(Ordering::Acquire)
+            && !validate_user_ptr(stdin_ptr, stdin_len) { return EFAULT; }
         let mut data = alloc::vec![0u8; stdin_len];
         if unsafe { copy_from_user_safe(data.as_mut_ptr(), stdin_ptr as *const u8, stdin_len).is_err() } {
             return EFAULT;
@@ -1183,12 +1170,11 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     
     let stdin_slice = stdin_data.as_deref();
 
-    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_cwd(&path, Some(&args_refs), Some(&env_vec), stdin_slice, None) {
-        if let Some(proc) = akuma_exec::process::current_process() {
+    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_cwd(&path, Some(&args_refs), Some(&env_vec), stdin_slice, None)
+        && let Some(proc) = akuma_exec::process::current_process() {
             akuma_exec::process::register_child_channel(pid, ch, proc.pid);
-            return (pid as u64) | ((proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
+            return u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32);
         }
-    }
     ENOMEM
 }
 
@@ -1202,7 +1188,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
     if !validate_user_ptr(options_ptr, core::mem::size_of::<SpawnOptions>()) { return EFAULT; }
 
     let mut o = SpawnOptions { cwd_ptr: 0, cwd_len: 0, root_dir_ptr: 0, root_dir_len: 0, args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id: 0 };
-    if unsafe { copy_from_user_safe(&mut o as *mut SpawnOptions as *mut u8, options_ptr as *const u8, core::mem::size_of::<SpawnOptions>()).is_err() } {
+    if unsafe { copy_from_user_safe((&raw mut o).cast::<u8>(), options_ptr as *const u8, core::mem::size_of::<SpawnOptions>()).is_err() } {
         return EFAULT;
     }
 
@@ -1220,9 +1206,9 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
 
     let args_vec = parse_argv_array(o.args_ptr);
     let args_refs: Vec<&str> = if args_vec.len() > 1 {
-        args_vec.iter().skip(1).map(|s| s.as_str()).collect()
+        args_vec.iter().skip(1).map(alloc::string::String::as_str).collect()
     } else {
-        args_vec.iter().map(|s| s.as_str()).collect()
+        args_vec.iter().map(alloc::string::String::as_str).collect()
     };
     let args_opt = if args_refs.is_empty() { None } else { Some(args_refs.as_slice()) };
 
@@ -1238,12 +1224,11 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
     
     let stdin_slice = stdin_data.as_deref();
 
-    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(&path, args_opt, None, stdin_slice, cwd_ref, o.box_id) {
-        if let Some(proc) = akuma_exec::process::current_process() {
+    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(&path, args_opt, None, stdin_slice, cwd_ref, o.box_id)
+        && let Some(proc) = akuma_exec::process::current_process() {
             akuma_exec::process::register_child_channel(pid, ch, proc.pid);
-            return (pid as u64) | ((proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid)) as u64) << 32);
+            return u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32);
         }
-    }
     ENOMEM
 }
 
@@ -1288,11 +1273,10 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
         {
             let mut sibling_tids = alloc::vec::Vec::new();
             akuma_exec::process::table::for_each_process(|p| {
-                if p.pid != pid && p.tgid == tgid {
-                    if let Some(tid) = p.thread_id {
+                if p.pid != pid && p.tgid == tgid
+                    && let Some(tid) = p.thread_id {
                         sibling_tids.push(tid);
                     }
-                }
             });
             all_tids.extend(sibling_tids);
         }
@@ -1323,11 +1307,11 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
 pub fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
     if status_ptr != 0 && !validate_user_ptr(status_ptr, 4) { return EFAULT; }
 
-    if let Some(ch) = akuma_exec::process::get_child_channel(pid) {
-        if ch.has_exited() {
+    if let Some(ch) = akuma_exec::process::get_child_channel(pid)
+        && ch.has_exited() {
             if status_ptr != 0 {
                 let status = encode_wait_status(ch.exit_code());
-                if unsafe { copy_to_user_safe(status_ptr as *mut u8, &status as *const u32 as *const u8, 4).is_err() } {
+                if unsafe { copy_to_user_safe(status_ptr as *mut u8, (&raw const status).cast::<u8>(), 4).is_err() } {
                     return EFAULT;
                 }
             }
@@ -1335,9 +1319,8 @@ pub fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
             akuma_exec::process::clear_lazy_regions(pid);
             let _ = akuma_exec::process::unregister_process(pid);
             akuma_exec::process::remove_child_channel(pid);
-            return pid as u64;
+            return u64::from(pid);
         }
-    }
     0
 }
 
@@ -1368,18 +1351,17 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
                     return EFAULT;
                 }
                 let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
-                if let Ok(name) = core::str::from_utf8(&name_bytes[..end]) {
-                    if let Some(proc) = akuma_exec::process::current_process() {
+                if let Ok(name) = core::str::from_utf8(&name_bytes[..end])
+                    && let Some(proc) = akuma_exec::process::current_process() {
                         proc.name = alloc::string::String::from(name);
                     }
-                }
             }
             0
         }
         PR_GET_NAME => {
             // Get process name
-            if arg2 != 0 && validate_user_ptr(arg2, 16) {
-                if let Some(proc) = akuma_exec::process::current_process() {
+            if arg2 != 0 && validate_user_ptr(arg2, 16)
+                && let Some(proc) = akuma_exec::process::current_process() {
                     let name = proc.name.as_bytes();
                     let len = name.len().min(15);
                     let mut kernel_buf = [0u8; 16];
@@ -1388,7 +1370,6 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
                         return EFAULT;
                     }
                 }
-            }
             0
         }
         PR_SET_PDEATHSIG | PR_SET_DUMPABLE | PR_SET_NO_NEW_PRIVS | PR_SET_VMA => {
@@ -1399,7 +1380,7 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
             // Return 0 (no signal set)
             if arg2 != 0 && validate_user_ptr(arg2, 4) {
                 let zero: i32 = 0;
-                let _ = unsafe { copy_to_user_safe(arg2 as *mut u8, &zero as *const i32 as *const u8, 4) };
+                let _ = unsafe { copy_to_user_safe(arg2 as *mut u8, (&raw const zero).cast::<u8>(), 4) };
             }
             0
         }

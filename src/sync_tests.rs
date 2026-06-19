@@ -49,7 +49,7 @@ fn test_futex_eagain() {
     set_bypass(true);
 
     let mut val: u32 = 99;
-    let uaddr = &mut val as *mut u32 as usize;
+    let uaddr = &raw mut val as usize;
 
     // Wait expecting 0 but actual value is 99 → EAGAIN
     let ret = crate::syscall::handle_syscall(
@@ -61,9 +61,7 @@ fn test_futex_eagain() {
 
     assert!(
         ret == EAGAIN,
-        "test_futex_eagain: expected EAGAIN ({:#x}) got {:#x}",
-        EAGAIN,
-        ret
+        "test_futex_eagain: expected EAGAIN ({EAGAIN:#x}) got {ret:#x}"
     );
     console::print("  [PASS] test_futex_eagain
 ");
@@ -82,9 +80,7 @@ fn test_futex_null_addr() {
 
     assert!(
         ret == EINVAL,
-        "test_futex_null_addr: expected EINVAL ({:#x}) got {:#x}",
-        EINVAL,
-        ret
+        "test_futex_null_addr: expected EINVAL ({EINVAL:#x}) got {ret:#x}"
     );
     console::print("  [PASS] test_futex_null_addr
 ");
@@ -107,9 +103,7 @@ fn test_futex_unaligned_addr() {
 
     assert!(
         ret == EINVAL,
-        "test_futex_unaligned_addr: expected EINVAL ({:#x}) got {:#x}",
-        EINVAL,
-        ret
+        "test_futex_unaligned_addr: expected EINVAL ({EINVAL:#x}) got {ret:#x}"
     );
     console::print("  [PASS] test_futex_unaligned_addr
 ");
@@ -127,13 +121,13 @@ fn test_futex_timeout() {
     set_bypass(true);
 
     let mut val: u32 = 0;
-    let uaddr = &mut val as *mut u32 as usize;
+    let uaddr = &raw mut val as usize;
 
     let ts = Timespec {
         tv_sec: 0,
         tv_nsec: 10_000_000, // 10 ms
     };
-    let timeout_ptr = &ts as *const Timespec as u64;
+    let timeout_ptr = &raw const ts as u64;
 
     let ret = crate::syscall::handle_syscall(
         NR_FUTEX,
@@ -144,9 +138,7 @@ fn test_futex_timeout() {
 
     assert!(
         ret == ETIMEDOUT,
-        "test_futex_timeout: expected ETIMEDOUT ({:#x}) got {:#x}",
-        ETIMEDOUT,
-        ret
+        "test_futex_timeout: expected ETIMEDOUT ({ETIMEDOUT:#x}) got {ret:#x}"
     );
     console::print("  [PASS] test_futex_timeout
 ");
@@ -159,17 +151,18 @@ fn test_futex_wake_before_wait() {
     set_bypass(true);
 
     let mut val: u32 = 0;
-    let uaddr = &mut val as *mut u32 as usize;
+    let uaddr = &raw mut val as usize;
 
     // Wake with nobody waiting — returns 0
     let woken = crate::syscall::handle_syscall(
         NR_FUTEX,
         &[uaddr as u64, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0],
     );
-    assert!(woken == 0, "test_futex_wake_before_wait: expected 0 woken, got {}", woken);
+    assert!(woken == 0, "test_futex_wake_before_wait: expected 0 woken, got {woken}");
 
     // Waker changes the value (this is the typical Go pattern)
-    val = 1;
+    // SAFETY: we write via the raw pointer so the kernel (via uaddr) sees the new value.
+    unsafe { core::ptr::write_volatile(&raw mut val, 1u32); }
 
     // Now wait with the old value 0 — should detect mismatch and return EAGAIN
     let ret = crate::syscall::handle_syscall(
@@ -181,9 +174,7 @@ fn test_futex_wake_before_wait() {
 
     assert!(
         ret == EAGAIN,
-        "test_futex_wake_before_wait: expected EAGAIN ({:#x}) got {:#x}",
-        EAGAIN,
-        ret
+        "test_futex_wake_before_wait: expected EAGAIN ({EAGAIN:#x}) got {ret:#x}"
     );
     console::print("  [PASS] test_futex_wake_before_wait
 ");
@@ -194,7 +185,7 @@ fn test_futex_wake_zero() {
     set_bypass(true);
 
     let mut val: u32 = 0;
-    let uaddr = &mut val as *mut u32 as usize;
+    let uaddr = &raw mut val as usize;
 
     let woken = crate::syscall::handle_syscall(
         NR_FUTEX,
@@ -205,8 +196,7 @@ fn test_futex_wake_zero() {
 
     assert!(
         woken == 0,
-        "test_futex_wake_zero: expected 0 got {}",
-        woken
+        "test_futex_wake_zero: expected 0 got {woken}"
     );
     console::print("  [PASS] test_futex_wake_zero
 ");
@@ -218,8 +208,8 @@ fn test_futex_cmp_requeue_mismatch() {
 
     let mut src: u32 = 42;
     let mut dst: u32 = 0;
-    let uaddr = &mut src as *mut u32 as usize;
-    let uaddr2 = &mut dst as *mut u32 as usize;
+    let uaddr = &raw mut src as usize;
+    let uaddr2 = &raw mut dst as usize;
 
     // val3=99 but src==42 → EAGAIN
     let ret = crate::syscall::handle_syscall(
@@ -232,9 +222,7 @@ fn test_futex_cmp_requeue_mismatch() {
 
     assert!(
         ret == EAGAIN,
-        "test_futex_cmp_requeue_mismatch: expected EAGAIN ({:#x}) got {:#x}",
-        EAGAIN,
-        ret
+        "test_futex_cmp_requeue_mismatch: expected EAGAIN ({EAGAIN:#x}) got {ret:#x}"
     );
     console::print("  [PASS] test_futex_cmp_requeue_mismatch
 ");
@@ -252,8 +240,8 @@ fn test_futex_cmp_requeue_mismatch() {
 /// - Missed-wake path: main fires wake first AND changes word; when the waiter
 ///   eventually enters FUTEX_WAIT it reads 1 ≠ 0 and returns EAGAIN — still
 ///   not stuck.  EAGAIN is treated as success (woken via value change).
-/// A 1-second safety timeout is added as a belt-and-braces guard so a bug
-/// can never leave a thread permanently parked and consuming a slot.
+///   A 1-second safety timeout is added as a belt-and-braces guard so a bug
+///   can never leave a thread permanently parked and consuming a slot.
 fn test_futex_basic_wake() {
     static FUTEX_WORD: AtomicU32 = AtomicU32::new(0);
     static WOKEN_FLAG: AtomicBool = AtomicBool::new(false);
@@ -268,7 +256,7 @@ fn test_futex_basic_wake() {
 
         let uaddr = FUTEX_WORD.as_ptr() as usize;
         let ts = Timespec { tv_sec: 1, tv_nsec: 0 };
-        let timeout_ptr = &ts as *const Timespec as u64;
+        let timeout_ptr = &raw const ts as u64;
         let ret = crate::syscall::handle_syscall(
             NR_FUTEX,
             &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
@@ -340,7 +328,7 @@ fn test_futex_wake_all() {
 
             let uaddr = FUTEX_WORD2.as_ptr() as usize;
             let ts = Timespec { tv_sec: 2, tv_nsec: 0 };
-            let timeout_ptr = &ts as *const Timespec as u64;
+            let timeout_ptr = &raw const ts as u64;
             let ret = crate::syscall::handle_syscall(
                 NR_FUTEX,
                 &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
@@ -378,10 +366,8 @@ fn test_futex_wake_all() {
     // woken is the number actually dequeued; may be less than WAITERS if some
     // saw the value change and returned EAGAIN before being queued.
     assert!(
-        woken <= WAITERS as u64,
-        "test_futex_wake_all: woken={} > WAITERS={}",
-        woken,
-        WAITERS
+        woken <= u64::from(WAITERS),
+        "test_futex_wake_all: woken={woken} > WAITERS={WAITERS}"
     );
 
     // Wait for all threads to acknowledge
@@ -423,7 +409,7 @@ fn test_futex_wake_one_of_two() {
 
             let uaddr = FUTEX_WORD3.as_ptr() as usize;
             let ts = Timespec { tv_sec: 2, tv_nsec: 0 };
-            let timeout_ptr = &ts as *const Timespec as u64;
+            let timeout_ptr = &raw const ts as u64;
             let ret = crate::syscall::handle_syscall(
                 NR_FUTEX,
                 &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
@@ -459,8 +445,7 @@ fn test_futex_wake_one_of_two() {
 
     assert!(
         woken <= 1,
-        "test_futex_wake_one_of_two: FUTEX_WAKE(1) dequeued {}",
-        woken
+        "test_futex_wake_one_of_two: FUTEX_WAKE(1) dequeued {woken}"
     );
 
     // Release the remaining waiter by changing the value and waking all
@@ -514,7 +499,7 @@ fn test_futex_genuine_wake_no_value_change() {
         set_bypass(true);
         let uaddr = FW.as_ptr() as usize;
         let ts = Timespec { tv_sec: 3, tv_nsec: 0 }; // safety timeout only
-        let tp = &ts as *const Timespec as u64;
+        let tp = &raw const ts as u64;
         let ret = crate::syscall::handle_syscall(
             NR_FUTEX,
             &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, tp, 0, 0],
@@ -544,8 +529,7 @@ fn test_futex_genuine_wake_no_value_change() {
     set_bypass(false);
     assert!(
         woken == 1,
-        "test_futex_genuine_wake_no_value_change: FUTEX_WAKE dequeued {} (expected 1 — waiter not parked?)",
-        woken
+        "test_futex_genuine_wake_no_value_change: FUTEX_WAKE dequeued {woken} (expected 1 — waiter not parked?)"
     );
 
     // Must wake promptly (well within the poll budget, far below the 3 s timeout).
@@ -561,12 +545,11 @@ fn test_futex_genuine_wake_no_value_change() {
         done,
         "test_futex_genuine_wake_no_value_change: waiter did not return within the poll budget (timeout-reliant wake)"
     );
-    let ret = RET.load(Ordering::Acquire) as i32 as i64;
+    let ret = i64::from(RET.load(Ordering::Acquire) as i32);
     assert!(
         ret == 0,
-        "test_futex_genuine_wake_no_value_change: expected genuine wake (0), got {} \
-         (ETIMEDOUT means FUTEX_WAKE did not unblock the parked thread — the inference-throttling bug)",
-        ret
+        "test_futex_genuine_wake_no_value_change: expected genuine wake (0), got {ret} \
+         (ETIMEDOUT means FUTEX_WAKE did not unblock the parked thread — the inference-throttling bug)"
     );
     console::print("  [PASS] test_futex_genuine_wake_no_value_change
 ");
@@ -596,7 +579,7 @@ fn test_futex_wake_latency_prompt() {
         set_bypass(true);
         let uaddr = FW.as_ptr() as usize;
         let ts = Timespec { tv_sec: 5, tv_nsec: 0 };
-        let tp = &ts as *const Timespec as u64;
+        let tp = &raw const ts as u64;
         let ret = crate::syscall::handle_syscall(
             NR_FUTEX,
             &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, tp, 0, 0],
@@ -626,8 +609,7 @@ fn test_futex_wake_latency_prompt() {
     set_bypass(false);
     assert!(
         woken == 1,
-        "test_futex_wake_latency_prompt: FUTEX_WAKE dequeued {} (expected 1)",
-        woken
+        "test_futex_wake_latency_prompt: FUTEX_WAKE dequeued {woken} (expected 1)"
     );
 
     let mut done = false;
@@ -639,13 +621,12 @@ fn test_futex_wake_latency_prompt() {
         }
     }
     assert!(done, "test_futex_wake_latency_prompt: waiter never returned");
-    let ret = RET.load(Ordering::Acquire) as i32 as i64;
-    assert!(ret == 0, "test_futex_wake_latency_prompt: expected 0, got {}", ret);
+    let ret = i64::from(RET.load(Ordering::Acquire) as i32);
+    assert!(ret == 0, "test_futex_wake_latency_prompt: expected 0, got {ret}");
     let latency = RET_TS.load(Ordering::Acquire).saturating_sub(wake_ts);
     assert!(
         latency < 500_000,
-        "test_futex_wake_latency_prompt: wake latency {} us — wake fell back to the timeout, not delivered",
-        latency
+        "test_futex_wake_latency_prompt: wake latency {latency} us — wake fell back to the timeout, not delivered"
     );
     crate::safe_print!(80, "  [PASS] test_futex_wake_latency_prompt (latency {} us)\n", latency);
 }
@@ -669,7 +650,7 @@ fn test_futex_requeue() {
 
             let uaddr = SRC_WORD.as_ptr() as usize;
             let ts = Timespec { tv_sec: 2, tv_nsec: 0 };
-            let timeout_ptr = &ts as *const Timespec as u64;
+            let timeout_ptr = &raw const ts as u64;
             let ret = crate::syscall::handle_syscall(
                 NR_FUTEX,
                 &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
@@ -754,20 +735,20 @@ fn test_sigaltstack_syscall_roundtrip() {
     let ret = crate::syscall::handle_syscall(
         NR_SIGALTSTACK,
         &[
-            &new_stack as *const StackT as u64,
-            &mut old_stack as *mut StackT as u64,
+            &raw const new_stack as u64,
+            &raw mut old_stack as u64,
             0, 0, 0, 0,
         ],
     );
-    assert!(ret == 0, "test_sigaltstack_syscall_roundtrip: set returned {:#x}", ret);
+    assert!(ret == 0, "test_sigaltstack_syscall_roundtrip: set returned {ret:#x}");
 
     // Read back the current (newly set) stack.
     let mut cur_stack = StackT { sp: 0, flags: 0, _pad: 0, size: 0 };
     let ret2 = crate::syscall::handle_syscall(
         NR_SIGALTSTACK,
-        &[0u64 /* no new */, &mut cur_stack as *mut StackT as u64, 0, 0, 0, 0],
+        &[0u64 /* no new */, &raw mut cur_stack as u64, 0, 0, 0, 0],
     );
-    assert!(ret2 == 0, "test_sigaltstack_syscall_roundtrip: get returned {:#x}", ret2);
+    assert!(ret2 == 0, "test_sigaltstack_syscall_roundtrip: get returned {ret2:#x}");
     assert!(cur_stack.sp == 0xdead_0000, "sp mismatch: {:#x}", cur_stack.sp);
     assert!(cur_stack.size == 0x8000,    "size mismatch: {:#x}", cur_stack.size);
     assert!(cur_stack.flags == 0,        "flags mismatch: {}", cur_stack.flags);
@@ -776,17 +757,17 @@ fn test_sigaltstack_syscall_roundtrip() {
     let disable_stack = StackT { sp: 0, flags: SS_DISABLE, _pad: 0, size: 0 };
     let ret3 = crate::syscall::handle_syscall(
         NR_SIGALTSTACK,
-        &[&disable_stack as *const StackT as u64, 0, 0, 0, 0, 0],
+        &[&raw const disable_stack as u64, 0, 0, 0, 0, 0],
     );
-    assert!(ret3 == 0, "test_sigaltstack_syscall_roundtrip: disable returned {:#x}", ret3);
+    assert!(ret3 == 0, "test_sigaltstack_syscall_roundtrip: disable returned {ret3:#x}");
 
     // Verify disabled.
     let mut after_disable = StackT { sp: 0xffff, flags: 0, _pad: 0, size: 0xffff };
     let ret4 = crate::syscall::handle_syscall(
         NR_SIGALTSTACK,
-        &[0u64, &mut after_disable as *mut StackT as u64, 0, 0, 0, 0],
+        &[0u64, &raw mut after_disable as u64, 0, 0, 0, 0],
     );
-    assert!(ret4 == 0, "test_sigaltstack_syscall_roundtrip: get-after-disable returned {:#x}", ret4);
+    assert!(ret4 == 0, "test_sigaltstack_syscall_roundtrip: get-after-disable returned {ret4:#x}");
     assert!(after_disable.sp == 0, "sp should be 0 after disable, got {:#x}", after_disable.sp);
     assert!(after_disable.flags == SS_DISABLE, "flags should be SS_DISABLE after disable, got {}", after_disable.flags);
 
@@ -818,7 +799,7 @@ fn test_futex_wait_eintr_signal_preserved() {
         let uaddr = FUTEX_WORD_EINTR.as_ptr() as usize;
         // 500 ms timeout so the test doesn't hang on failure.
         let ts = Timespec { tv_sec: 0, tv_nsec: 500_000_000 };
-        let timeout_ptr = &ts as *const Timespec as u64;
+        let timeout_ptr = &raw const ts as u64;
         let ret = crate::syscall::handle_syscall(
             NR_FUTEX,
             &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
@@ -864,15 +845,13 @@ fn test_futex_wait_eintr_signal_preserved() {
                 || ret_raw == EAGAIN;
             assert!(
                 ok_ret,
-                "test_futex_wait_eintr: unexpected ret {:#x} ({})",
-                ret_raw, ret_as_i64
+                "test_futex_wait_eintr: unexpected ret {ret_raw:#x} ({ret_as_i64})"
             );
             // If EINTR, the signal MUST still be pending (peek doesn't consume).
             if ret_as_i64 == -4 {
                 assert!(
                     sig_val == 23,
-                    "test_futex_wait_eintr: EINTR but peek_pending_signal={} (expected 23)",
-                    sig_val
+                    "test_futex_wait_eintr: EINTR but peek_pending_signal={sig_val} (expected 23)"
                 );
             }
             break;
@@ -913,22 +892,22 @@ fn test_rt_sigreturn_restores_registers() {
     unsafe {
         let mc = base_ptr.add(TEST_SIGFRAME_MCONTEXT);
         // fault_address at mc+0 (u64, leave 0)
-        let regs = mc.add(8) as *mut u64;
+        let regs = mc.add(8).cast::<u64>();
         core::ptr::write(regs.add(0), 0xABCD_1234u64);   // x0 to restore
         core::ptr::write(regs.add(1), 0x1111_1111u64);   // x1
         // x2..x30 stay 0
         // sp (mc+256), pc (mc+264), pstate (mc+272)
-        core::ptr::write(mc.add(256) as *mut u64, base_ptr as u64); // sp
-        core::ptr::write(mc.add(264) as *mut u64, 0x1000u64);       // pc (arbitrary)
-        core::ptr::write(mc.add(272) as *mut u64, 0u64);             // pstate
+        core::ptr::write(mc.add(256).cast::<u64>(), base_ptr as u64); // sp
+        core::ptr::write(mc.add(264).cast::<u64>(), 0x1000u64);       // pc (arbitrary)
+        core::ptr::write(mc.add(272).cast::<u64>(), 0u64);             // pstate
 
         // uc_sigmask at SIGFRAME_UCONTEXT+40 (leave 0 = no blocked signals)
 
         // FPSIMD magic at SIGFRAME_FPSIMD (needed to avoid corrupting FP state restore)
         const FPSIMD_MAGIC: u32 = 0x46508001;
         let fp = base_ptr.add(TEST_SIGFRAME_FPSIMD);
-        core::ptr::write(fp as *mut u32, FPSIMD_MAGIC);
-        core::ptr::write(fp.add(4) as *mut u32, 528u32); // size
+        core::ptr::write(fp.cast::<u32>(), FPSIMD_MAGIC);
+        core::ptr::write(fp.add(4).cast::<u32>(), 528u32); // size
     }
 
     // The NR_RT_SIGRETURN handler reads sp_el0 from the current trap frame
@@ -945,29 +924,18 @@ fn test_rt_sigreturn_restores_registers() {
     // MCONTEXT starts at SIGFRAME_UCONTEXT (128) + 176 = 304.
     // The 176 offset includes: uc_flags(8) + uc_link(8) + uc_stack(24) + 
     // uc_sigmask(8) + _pad(120) + _pad2(8) = 176 bytes.
-    assert!(
-        TEST_SIGFRAME_MCONTEXT == 128 + 176,
-        "MCONTEXT offset wrong: {}",
-        TEST_SIGFRAME_MCONTEXT
-    );
+    const { assert!(TEST_SIGFRAME_MCONTEXT == 128 + 176, "MCONTEXT offset wrong"); }
     // uc_sigmask is at UCONTEXT+40 = 168.
-    assert!(
-        TEST_SIGFRAME_UCONTEXT + 40 == 168,
-        "uc_sigmask offset wrong"
-    );
+    const { assert!(TEST_SIGFRAME_UCONTEXT + 40 == 168, "uc_sigmask offset wrong"); }
     // FPSIMD block starts at MCONTEXT + 280 = 584.
-    assert!(
-        TEST_SIGFRAME_FPSIMD == 584,
-        "FPSIMD offset wrong: {}",
-        TEST_SIGFRAME_FPSIMD
-    );
+    const { assert!(TEST_SIGFRAME_FPSIMD == 584, "FPSIMD offset wrong"); }
     // mcontext.regs[0] is at MCONTEXT+8 — verify the write landed there.
     unsafe {
         let mc = base_ptr.add(TEST_SIGFRAME_MCONTEXT);
         let x0 = core::ptr::read(mc.add(8) as *const u64);
-        assert!(x0 == 0xABCD_1234, "x0 in frame: {:#x}", x0);
+        assert!(x0 == 0xABCD_1234, "x0 in frame: {x0:#x}");
         let sp_in_frame = core::ptr::read(mc.add(256) as *const u64);
-        assert!(sp_in_frame == base_ptr as u64, "sp in frame: {:#x}", sp_in_frame);
+        assert!(sp_in_frame == base_ptr as u64, "sp in frame: {sp_in_frame:#x}");
     }
 
     set_bypass(false);
@@ -987,8 +955,8 @@ fn test_uc_stack_uses_per_thread_sigaltstack() {
     threading::set_sigaltstack(0, 0xc0de_0000, 0x4000, 0);
 
     let (sp, size, _flags) = threading::get_sigaltstack(0);
-    assert!(sp   == 0xc0de_0000, "uc_stack sp mismatch: {:#x}", sp);
-    assert!(size == 0x4000,      "uc_stack size mismatch: {:#x}", size);
+    assert!(sp   == 0xc0de_0000, "uc_stack sp mismatch: {sp:#x}");
+    assert!(size == 0x4000,      "uc_stack size mismatch: {size:#x}");
 
     // If on_altstack = (SA_ONSTACK set) && alt_sp != 0, we'd write:
     //   uc.add(16) = sp        → 0xc0de_0000
@@ -998,16 +966,16 @@ fn test_uc_stack_uses_per_thread_sigaltstack() {
     // try_deliver_signal; here we just verify get_sigaltstack returns them).
     let mut uc_sim = [0u8; 48];
     unsafe {
-        core::ptr::write(uc_sim.as_mut_ptr().add(16) as *mut u64, sp);
-        core::ptr::write(uc_sim.as_mut_ptr().add(24) as *mut i32, 1i32);
-        core::ptr::write(uc_sim.as_mut_ptr().add(32) as *mut u64, size);
+        core::ptr::write(uc_sim.as_mut_ptr().add(16).cast::<u64>(), sp);
+        core::ptr::write(uc_sim.as_mut_ptr().add(24).cast::<i32>(), 1i32);
+        core::ptr::write(uc_sim.as_mut_ptr().add(32).cast::<u64>(), size);
     }
-    let uc_sp   = unsafe { core::ptr::read(uc_sim.as_ptr().add(16) as *const u64) };
-    let uc_flag = unsafe { core::ptr::read(uc_sim.as_ptr().add(24) as *const i32) };
-    let uc_size = unsafe { core::ptr::read(uc_sim.as_ptr().add(32) as *const u64) };
-    assert!(uc_sp   == 0xc0de_0000, "simulated uc_stack.ss_sp wrong: {:#x}", uc_sp);
-    assert!(uc_flag == 1,           "simulated uc_stack.ss_flags wrong: {}", uc_flag);
-    assert!(uc_size == 0x4000,      "simulated uc_stack.ss_size wrong: {:#x}", uc_size);
+    let uc_sp   = unsafe { core::ptr::read(uc_sim.as_ptr().add(16).cast::<u64>()) };
+    let uc_flag = unsafe { core::ptr::read(uc_sim.as_ptr().add(24).cast::<i32>()) };
+    let uc_size = unsafe { core::ptr::read(uc_sim.as_ptr().add(32).cast::<u64>()) };
+    assert!(uc_sp   == 0xc0de_0000, "simulated uc_stack.ss_sp wrong: {uc_sp:#x}");
+    assert!(uc_flag == 1,           "simulated uc_stack.ss_flags wrong: {uc_flag}");
+    assert!(uc_size == 0x4000,      "simulated uc_stack.ss_size wrong: {uc_size:#x}");
 
     // Restore.
     threading::set_sigaltstack(0, 0, 0, 2);
@@ -1023,7 +991,7 @@ fn test_futex_wait_bitset_zero_bitset() {
     const FUTEX_WAIT_BITSET_PRIVATE: u64 = FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG;
 
     let mut val: u32 = 0;
-    let uaddr = &mut val as *mut u32 as usize;
+    let uaddr = &raw mut val as usize;
 
     // val3=0 (bitset) is invalid
     let ret = crate::syscall::handle_syscall(
@@ -1035,9 +1003,7 @@ fn test_futex_wait_bitset_zero_bitset() {
 
     assert!(
         ret == EINVAL,
-        "test_futex_wait_bitset_zero_bitset: expected EINVAL ({:#x}) got {:#x}",
-        EINVAL,
-        ret
+        "test_futex_wait_bitset_zero_bitset: expected EINVAL ({EINVAL:#x}) got {ret:#x}"
     );
     console::print("  [PASS] test_futex_wait_bitset_zero_bitset
 ");
@@ -1054,11 +1020,11 @@ fn test_futex_wait_bitset_absolute_past() {
     const FUTEX_BITSET_MATCH_ANY: u64 = 0xFFFF_FFFF;
 
     let mut val: u32 = 0;
-    let uaddr = &mut val as *mut u32 as usize;
+    let uaddr = &raw mut val as usize;
 
     // Absolute deadline of 1 second (wall-clock epoch) — always in the past.
     let ts = Timespec { tv_sec: 1, tv_nsec: 0 };
-    let timeout_ptr = &ts as *const Timespec as u64;
+    let timeout_ptr = &raw const ts as u64;
 
     let ret = crate::syscall::handle_syscall(
         NR_FUTEX,
@@ -1069,8 +1035,7 @@ fn test_futex_wait_bitset_absolute_past() {
 
     assert!(
         ret == ETIMEDOUT || ret == EAGAIN,
-        "test_futex_wait_bitset_absolute_past: expected ETIMEDOUT or EAGAIN, got {:#x}",
-        ret
+        "test_futex_wait_bitset_absolute_past: expected ETIMEDOUT or EAGAIN, got {ret:#x}"
     );
     console::print("  [PASS] test_futex_wait_bitset_absolute_past
 ");
@@ -1106,7 +1071,7 @@ fn test_futex_wait_bitset_monotonic_absolute_deadline() {
     }
 
     let mut word: u32 = 0;
-    let uaddr = &mut word as *mut u32 as usize;
+    let uaddr = &raw mut word as usize;
 
     let t0 = crate::timer::uptime_us();
     let abs_deadline_us = t0 + GAP_US;
@@ -1114,7 +1079,7 @@ fn test_futex_wait_bitset_monotonic_absolute_deadline() {
         tv_sec: (abs_deadline_us / 1_000_000) as i64,
         tv_nsec: ((abs_deadline_us % 1_000_000) * 1_000) as i64,
     };
-    let tp = &ts as *const Timespec as u64;
+    let tp = &raw const ts as u64;
 
     // val == word (0) so we actually park (no early EAGAIN); MATCH_ANY bitset.
     let ret = crate::syscall::handle_syscall(
@@ -1127,24 +1092,19 @@ fn test_futex_wait_bitset_monotonic_absolute_deadline() {
 
     assert!(
         ret == ETIMEDOUT,
-        "test_futex_wait_bitset_monotonic_absolute_deadline: expected ETIMEDOUT ({:#x}) got {:#x}",
-        ETIMEDOUT,
-        ret
+        "test_futex_wait_bitset_monotonic_absolute_deadline: expected ETIMEDOUT ({ETIMEDOUT:#x}) got {ret:#x}"
     );
     // Woke no earlier than the absolute deadline (timeout was honored, not early).
     assert!(
         t1 >= abs_deadline_us,
-        "test_futex_wait_bitset_monotonic_absolute_deadline: woke at {} us, before absolute deadline {} us",
-        t1,
-        abs_deadline_us
+        "test_futex_wait_bitset_monotonic_absolute_deadline: woke at {t1} us, before absolute deadline {abs_deadline_us} us"
     );
     // ...and not ≈uptime late (the relative-misinterpretation bug).
     let overshoot = t1 - abs_deadline_us;
     assert!(
         overshoot < MAX_OVERSHOOT_US,
-        "test_futex_wait_bitset_monotonic_absolute_deadline: overshoot {} us (t0={} t1={} deadline={}) \
-         — absolute monotonic timeout was treated as relative (added uptime)",
-        overshoot, t0, t1, abs_deadline_us
+        "test_futex_wait_bitset_monotonic_absolute_deadline: overshoot {overshoot} us (t0={t0} t1={t1} deadline={abs_deadline_us}) \
+         — absolute monotonic timeout was treated as relative (added uptime)"
     );
     crate::safe_print!(96,
         "  [PASS] test_futex_wait_bitset_monotonic_absolute_deadline (overshoot {} us)\n", overshoot);
@@ -1163,13 +1123,13 @@ fn test_per_thread_sigaltstack() {
     let (sp0, sz0, fl0) = akuma_exec::threading::get_sigaltstack(0);
     let (sp1, sz1, fl1) = akuma_exec::threading::get_sigaltstack(1);
 
-    assert!(sp0 == 0xdead_0000, "slot 0 sp mismatch: {:#x}", sp0);
-    assert!(sz0 == 0x4000,      "slot 0 size mismatch: {:#x}", sz0);
-    assert!(fl0 == 0,           "slot 0 flags mismatch: {}", fl0);
+    assert!(sp0 == 0xdead_0000, "slot 0 sp mismatch: {sp0:#x}");
+    assert!(sz0 == 0x4000,      "slot 0 size mismatch: {sz0:#x}");
+    assert!(fl0 == 0,           "slot 0 flags mismatch: {fl0}");
 
-    assert!(sp1 == 0xbeef_0000, "slot 1 sp mismatch: {:#x}", sp1);
-    assert!(sz1 == 0x8000,      "slot 1 size mismatch: {:#x}", sz1);
-    assert!(fl1 == 0,           "slot 1 flags mismatch: {}", fl1);
+    assert!(sp1 == 0xbeef_0000, "slot 1 sp mismatch: {sp1:#x}");
+    assert!(sz1 == 0x8000,      "slot 1 size mismatch: {sz1:#x}");
+    assert!(fl1 == 0,           "slot 1 flags mismatch: {fl1}");
 
     // Slots must be independent — slot 0 must be unchanged after writing slot 1.
     let (sp0b, _, _) = akuma_exec::threading::get_sigaltstack(0);
@@ -1201,9 +1161,7 @@ fn test_futex_einval_uaddr_one() {
 
     assert!(
         ret == EINVAL,
-        "test_futex_einval_uaddr_one: expected EINVAL ({:#x}) got {:#x}",
-        EINVAL,
-        ret
+        "test_futex_einval_uaddr_one: expected EINVAL ({EINVAL:#x}) got {ret:#x}"
     );
     console::print("  [PASS] test_futex_einval_uaddr_one
 ");
@@ -1216,8 +1174,8 @@ fn test_futex_wake_valid_addr_no_waiters() {
     set_bypass(true);
 
     let mut val: u32 = 0;
-    let uaddr = &mut val as *mut u32 as usize;
-    assert!(uaddr & 3 == 0, "uaddr not 4-byte aligned in test");
+    let uaddr = &raw mut val as usize;
+    assert!(uaddr.trailing_zeros() >= 2, "uaddr not 4-byte aligned in test");
 
     let ret = crate::syscall::handle_syscall(
         NR_FUTEX,
@@ -1228,8 +1186,7 @@ fn test_futex_wake_valid_addr_no_waiters() {
 
     assert!(
         ret == 0,
-        "test_futex_wake_valid_addr_no_waiters: expected 0 (no waiters) got {:#x}",
-        ret
+        "test_futex_wake_valid_addr_no_waiters: expected 0 (no waiters) got {ret:#x}"
     );
     console::print("  [PASS] test_futex_wake_valid_addr_no_waiters
 ");
@@ -1260,16 +1217,14 @@ fn test_pending_signal_drained_by_take() {
     let first = akuma_exec::threading::take_pending_signal(NO_MASK);
     assert!(
         first == Some(23),
-        "test_pending_signal_drained_by_take: expected Some(23), got {:?}",
-        first
+        "test_pending_signal_drained_by_take: expected Some(23), got {first:?}"
     );
 
     // Second take: queue must be empty.
     let second = akuma_exec::threading::take_pending_signal(NO_MASK);
     assert!(
         second.is_none(),
-        "test_pending_signal_drained_by_take: expected None after drain, got {:?}",
-        second
+        "test_pending_signal_drained_by_take: expected None after drain, got {second:?}"
     );
 
     console::print("  [PASS] test_pending_signal_drained_by_take
@@ -1292,8 +1247,8 @@ fn test_peek_pending_signal() {
     akuma_exec::threading::pend_signal_for_thread(slot, 23);
     let first  = akuma_exec::threading::peek_pending_signal(slot);
     let second = akuma_exec::threading::peek_pending_signal(slot);
-    assert!(first == 23,  "peek_pending_signal: expected 23, got {}", first);
-    assert!(second == 23, "peek_pending_signal: not idempotent, got {}", second);
+    assert!(first == 23,  "peek_pending_signal: expected 23, got {first}");
+    assert!(second == 23, "peek_pending_signal: not idempotent, got {second}");
 
     // Clear it.
     akuma_exec::threading::pend_signal_for_thread(slot, 0);
@@ -1329,24 +1284,21 @@ fn test_take_pending_signal_sigurg_masked() {
     let taken_masked = akuma_exec::threading::take_pending_signal(SIGURG_BIT);
     assert!(
         taken_masked.is_none(),
-        "test_take_pending_signal_sigurg_masked: expected None with mask={:#x}, got {:?}",
-        SIGURG_BIT, taken_masked
+        "test_take_pending_signal_sigurg_masked: expected None with mask={SIGURG_BIT:#x}, got {taken_masked:?}"
     );
 
     // Signal must still be in the queue.
     let peeked = akuma_exec::threading::peek_pending_signal(slot);
     assert!(
         peeked == SIGURG,
-        "test_take_pending_signal_sigurg_masked: signal should remain after masked take, got {}",
-        peeked
+        "test_take_pending_signal_sigurg_masked: signal should remain after masked take, got {peeked}"
     );
 
     // With no mask: take must return Some(23).
     let taken_unmasked = akuma_exec::threading::take_pending_signal(0);
     assert!(
         taken_unmasked == Some(SIGURG),
-        "test_take_pending_signal_sigurg_masked: expected Some(23) with mask=0, got {:?}",
-        taken_unmasked
+        "test_take_pending_signal_sigurg_masked: expected Some(23) with mask=0, got {taken_unmasked:?}"
     );
 
     // Queue must now be empty.
@@ -1379,8 +1331,7 @@ fn test_take_pending_signal_sigkill_ignores_mask() {
     let taken = akuma_exec::threading::take_pending_signal(SIGKILL_BIT);
     assert!(
         taken == Some(SIGKILL),
-        "test_take_pending_signal_sigkill_ignores_mask: SIGKILL with sigkill_bit mask: expected Some(9), got {:?}",
-        taken
+        "test_take_pending_signal_sigkill_ignores_mask: SIGKILL with sigkill_bit mask: expected Some(9), got {taken:?}"
     );
 
     // Also with all-bits mask.
@@ -1388,8 +1339,7 @@ fn test_take_pending_signal_sigkill_ignores_mask() {
     let taken_all = akuma_exec::threading::take_pending_signal(ALL_MASK);
     assert!(
         taken_all == Some(SIGKILL),
-        "test_take_pending_signal_sigkill_ignores_mask: SIGKILL with ALL_MASK: expected Some(9), got {:?}",
-        taken_all
+        "test_take_pending_signal_sigkill_ignores_mask: SIGKILL with ALL_MASK: expected Some(9), got {taken_all:?}"
     );
 
     // ---- SIGSTOP ----
@@ -1399,16 +1349,14 @@ fn test_take_pending_signal_sigkill_ignores_mask() {
     let taken_stop = akuma_exec::threading::take_pending_signal(SIGSTOP_BIT);
     assert!(
         taken_stop == Some(SIGSTOP),
-        "test_take_pending_signal_sigkill_ignores_mask: SIGSTOP with sigstop_bit mask: expected Some(19), got {:?}",
-        taken_stop
+        "test_take_pending_signal_sigkill_ignores_mask: SIGSTOP with sigstop_bit mask: expected Some(19), got {taken_stop:?}"
     );
 
     akuma_exec::threading::pend_signal_for_thread(slot, SIGSTOP);
     let taken_stop_all = akuma_exec::threading::take_pending_signal(ALL_MASK);
     assert!(
         taken_stop_all == Some(SIGSTOP),
-        "test_take_pending_signal_sigkill_ignores_mask: SIGSTOP with ALL_MASK: expected Some(19), got {:?}",
-        taken_stop_all
+        "test_take_pending_signal_sigkill_ignores_mask: SIGSTOP with ALL_MASK: expected Some(19), got {taken_stop_all:?}"
     );
 
     // Clean up.
@@ -1437,15 +1385,13 @@ fn test_pending_signal_overwrite() {
     let first = akuma_exec::threading::take_pending_signal(0);
     assert!(
         first == Some(10),
-        "test_pending_signal_overwrite: expected Some(10) first, got {:?}",
-        first
+        "test_pending_signal_overwrite: expected Some(10) first, got {first:?}"
     );
 
     let second = akuma_exec::threading::take_pending_signal(0);
     assert!(
         second == Some(23),
-        "test_pending_signal_overwrite: expected Some(23) second, got {:?}",
-        second
+        "test_pending_signal_overwrite: expected Some(23) second, got {second:?}"
     );
 
     // Now empty.
@@ -1463,28 +1409,25 @@ fn test_pending_signal_overwrite() {
 /// Signal N uses bit `1u64 << (N-1)`.  Off-by-one errors in mask logic
 /// produce silent bugs that are very hard to reproduce, so we assert the
 /// expected bit positions for the most relevant signals explicitly.
+#[allow(clippy::assertions_on_constants, clippy::eq_op)]
 fn test_signal_mask_bit_numbering() {
-    // SIGHUP (1) → bit 0
-    assert!(1u64 << (1u32 - 1) == 0x0000_0000_0000_0001,
-        "SIGHUP bit wrong");
-    // SIGKILL (9) → bit 8 = 0x100
-    assert!(1u64 << (9u32 - 1) == 0x0000_0000_0000_0100,
-        "SIGKILL bit wrong");
-    // SIGSTOP (19) → bit 18 = 0x4_0000
-    assert!(1u64 << (19u32 - 1) == 0x0000_0000_0004_0000,
-        "SIGSTOP bit wrong");
-    // SIGURG (23) → bit 22 = 0x40_0000
-    assert!(1u64 << (23u32 - 1) == 0x0000_0000_0040_0000,
-        "SIGURG bit wrong");
+    // SIGHUP (1) → bit 0: 1u64 << 0 == 1
+    const { assert!(1u64 << 0 == 0x0000_0000_0000_0001, "SIGHUP bit wrong"); }
+    // SIGKILL (9) → bit 8: 1u64 << 8 == 0x100
+    const { assert!(1u64 << 8 == 0x0000_0000_0000_0100, "SIGKILL bit wrong"); }
+    // SIGSTOP (19) → bit 18: 1u64 << 18 == 0x4_0000
+    const { assert!(1u64 << 18 == 0x0000_0000_0004_0000, "SIGSTOP bit wrong"); }
+    // SIGURG (23) → bit 22: 1u64 << 22 == 0x40_0000
+    const { assert!(1u64 << 22 == 0x0000_0000_0040_0000, "SIGURG bit wrong"); }
 
     // Cross-check: if the mask has SIGURG's bit set, it is masked.
-    let sigurg_bit: u64 = 1u64 << (23u32 - 1);
+    let sigurg_bit: u64 = 1u64 << 22;
     assert!(sigurg_bit == 0x0040_0000,
-        "SIGURG bit value mismatch: {:#x}", sigurg_bit);
+        "SIGURG bit value mismatch: {sigurg_bit:#x}");
 
     // Signal 1 (bit 0) and signal 64 (bit 63) are at the extremes.
-    assert!(1u64 << (1u32 - 1) == 1u64,   "signal 1 bit != 1");
-    assert!(1u64 << (64u32 - 1) == 1u64 << 63, "signal 64 bit wrong");
+    const { assert!(1u64 << 0 == 1u64, "signal 1 bit != 1"); }
+    const { assert!(1u64 << 63 == 1u64 << 63, "signal 64 bit wrong"); }
 
     console::print("  [PASS] test_signal_mask_bit_numbering
 ");
@@ -1514,7 +1457,7 @@ fn test_futex_wake_sigurg_pending_x0_not_reused() {
 
         let uaddr = FUTEX_WORD_RX.as_ptr() as usize;
         let ts = Timespec { tv_sec: 1, tv_nsec: 0 };
-        let timeout_ptr = &ts as *const Timespec as u64;
+        let timeout_ptr = &raw const ts as u64;
         crate::syscall::handle_syscall(
             NR_FUTEX,
             &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
@@ -1546,8 +1489,7 @@ fn test_futex_wake_sigurg_pending_x0_not_reused() {
     // timing).  Either way it must NOT be used as a futex address.
     assert!(
         woken <= 1,
-        "test_futex_wake_sigurg_pending: FUTEX_WAKE(1) returned {} > 1",
-        woken
+        "test_futex_wake_sigurg_pending: FUTEX_WAKE(1) returned {woken} > 1"
     );
 
     // Now simulate what happens when SIGURG is pending on the waker thread
@@ -1564,24 +1506,21 @@ fn test_futex_wake_sigurg_pending_x0_not_reused() {
     let peeked = threading::peek_pending_signal(main_tid);
     assert!(
         peeked == 23,
-        "test_futex_wake_sigurg_pending: peek should be 23, got {}",
-        peeked
+        "test_futex_wake_sigurg_pending: peek should be 23, got {peeked}"
     );
 
     // take must consume it exactly once.
     let taken = threading::take_pending_signal(0);
     assert!(
         taken == Some(23),
-        "test_futex_wake_sigurg_pending: take should be Some(23), got {:?}",
-        taken
+        "test_futex_wake_sigurg_pending: take should be Some(23), got {taken:?}"
     );
 
     // Queue must be empty after the single take.
     let after = threading::peek_pending_signal(main_tid);
     assert!(
         after == 0,
-        "test_futex_wake_sigurg_pending: queue should be empty after take, got {}",
-        after
+        "test_futex_wake_sigurg_pending: queue should be empty after take, got {after}"
     );
 
     // Wait for the waiter to finish (belt-and-braces).
@@ -1618,7 +1557,7 @@ fn test_futex_wake_returns_exact_count_three_waiters() {
 
             let uaddr = FUTEX_WORD_EC.as_ptr() as usize;
             let ts = Timespec { tv_sec: 2, tv_nsec: 0 };
-            let timeout_ptr = &ts as *const Timespec as u64;
+            let timeout_ptr = &raw const ts as u64;
             let ret = crate::syscall::handle_syscall(
                 NR_FUTEX,
                 &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
@@ -1652,8 +1591,7 @@ fn test_futex_wake_returns_exact_count_three_waiters() {
     // Must be at most 1 (0 if all threads raced and returned EAGAIN before parking).
     assert!(
         woken <= 1,
-        "test_futex_wake_exact_count_three_waiters: FUTEX_WAKE(1) returned {} (expected <=1)",
-        woken
+        "test_futex_wake_exact_count_three_waiters: FUTEX_WAKE(1) returned {woken} (expected <=1)"
     );
 
     // Release the remaining waiters.
@@ -1752,7 +1690,7 @@ fn test_futex_sequential_wake_no_einval() {
         crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
         let uaddr = FUTEX_WORD_SEQ.as_ptr() as usize;
         let ts = Timespec { tv_sec: 1, tv_nsec: 0 };
-        let timeout_ptr = &ts as *const Timespec as u64;
+        let timeout_ptr = &raw const ts as u64;
         crate::syscall::handle_syscall(
             NR_FUTEX,
             &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
@@ -1778,7 +1716,7 @@ fn test_futex_sequential_wake_no_einval() {
     // Immediately call FUTEX_WAKE on a different valid address.
     // This must return 0 (no waiters), NOT EINVAL.
     let mut val2: u32 = 0;
-    let uaddr2 = &mut val2 as *mut u32 as usize;
+    let uaddr2 = &raw mut val2 as usize;
     let ret2 = crate::syscall::handle_syscall(
         NR_FUTEX,
         &[uaddr2 as u64, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0],
@@ -1787,8 +1725,7 @@ fn test_futex_sequential_wake_no_einval() {
 
     assert!(
         ret2 == 0,
-        "test_futex_sequential_wake_no_einval: second wake failed with {:#x}",
-        ret2
+        "test_futex_sequential_wake_no_einval: second wake failed with {ret2:#x}"
     );
 
     console::print("  [PASS] test_futex_sequential_wake_no_einval
@@ -1809,7 +1746,7 @@ fn test_pipe_epipe_for_nonexistent_pipe_id() {
     // 1. Write to a pipe ID that was never created.
     let buf = [0u8; 16];
     let ret = pipe_write(99999, &buf);
-    assert_eq!(ret, Err(libc_errno::EPIPE as i32), "write to nonexistent pipe id should be EPIPE");
+    assert_eq!(ret, Err(libc_errno::EPIPE), "write to nonexistent pipe id should be EPIPE");
 
     // 2. Create a pipe, close the read end, then write to the write end.
     let pipe_id = pipe_create();
@@ -1819,7 +1756,7 @@ fn test_pipe_epipe_for_nonexistent_pipe_id() {
 
     // Write to the writer — must return EPIPE.
     let ret_write = pipe_write(pipe_id, &buf);
-    assert_eq!(ret_write, Err(libc_errno::EPIPE as i32), "write to pipe with no reader should be EPIPE");
+    assert_eq!(ret_write, Err(libc_errno::EPIPE), "write to pipe with no reader should be EPIPE");
 // Clean up write end.
 pipe_close_write(pipe_id);
 
@@ -1857,7 +1794,7 @@ pipe_close_write(pipe_id);
 
 // 6. Now it should be gone.
 let ret2 = pipe_write(pipe_id, &buf);
-assert_eq!(ret2, Err(libc_errno::EPIPE as i32), "pipe should be gone after last references are closed");
+assert_eq!(ret2, Err(libc_errno::EPIPE), "pipe should be gone after last references are closed");
 
 set_bypass(false);
 console::print("  [PASS] test_pipe_multi_process_lifecycle\n");
@@ -2009,7 +1946,7 @@ fn test_epoll_eintr_when_signal_pending() {
     let ev = EpollEvent { events: EPOLLIN, _pad: 0, data: 0 };
     crate::syscall::handle_syscall(
         NR_EPOLL_CTL,
-        &[epoll_fd as u64, EPOLL_CTL_ADD, pipe_fd as u64, &ev as *const EpollEvent as u64, 0, 0],
+        &[u64::from(epoll_fd), EPOLL_CTL_ADD, u64::from(pipe_fd), &raw const ev as u64, 0, 0],
     );
 
     // Pre-set the interrupt flag so epoll_pwait returns EINTR on the first pass
@@ -2019,7 +1956,7 @@ fn test_epoll_eintr_when_signal_pending() {
     let mut events_buf = [0u8; 16]; // room for 1 epoll_event
     let ret = crate::syscall::handle_syscall(
         NR_EPOLL_PWAIT,
-        &[epoll_fd as u64, events_buf.as_mut_ptr() as u64, 1u64, (-1i64) as u64, 0, 0],
+        &[u64::from(epoll_fd), events_buf.as_mut_ptr() as u64, 1u64, (-1i64) as u64, 0, 0],
     );
 
     set_bypass(false);
@@ -2033,8 +1970,7 @@ fn test_epoll_eintr_when_signal_pending() {
 
     assert_eq!(
         ret, EINTR,
-        "test_epoll_eintr: expected EINTR ({:#x}) got {:#x}",
-        EINTR, ret
+        "test_epoll_eintr: expected EINTR ({EINTR:#x}) got {ret:#x}"
     );
     console::print("  [PASS] test_epoll_eintr_when_signal_pending\n");
 }
@@ -2052,7 +1988,7 @@ fn test_futex_private_flag_basic_wake() {
 
         let uaddr = FUTEX_WORD_PB.as_ptr() as usize;
         let ts = Timespec { tv_sec: 1, tv_nsec: 0 };
-        let timeout_ptr = &ts as *const Timespec as u64;
+        let timeout_ptr = &raw const ts as u64;
         let ret = crate::syscall::handle_syscall(
             NR_FUTEX,
             &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
@@ -2079,7 +2015,7 @@ fn test_futex_private_flag_basic_wake() {
     );
     crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
 
-    assert!(woken <= 1, "test_futex_private_flag_basic_wake: FUTEX_WAKE_PRIVATE returned {} > 1", woken);
+    assert!(woken <= 1, "test_futex_private_flag_basic_wake: FUTEX_WAKE_PRIVATE returned {woken} > 1");
 
     let mut woke = false;
     for _ in 0..50 {
@@ -2108,7 +2044,7 @@ fn test_futex_private_flag_wake_one_of_two() {
 
             let uaddr = FUTEX_WORD_PW.as_ptr() as usize;
             let ts = Timespec { tv_sec: 2, tv_nsec: 0 };
-            let timeout_ptr = &ts as *const Timespec as u64;
+            let timeout_ptr = &raw const ts as u64;
             let ret = crate::syscall::handle_syscall(
                 NR_FUTEX,
                 &[uaddr as u64, FUTEX_WAIT_PRIVATE, 0, timeout_ptr, 0, 0],
@@ -2134,7 +2070,7 @@ fn test_futex_private_flag_wake_one_of_two() {
         NR_FUTEX,
         &[uaddr as u64, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0],
     );
-    assert!(woken <= 1, "test_futex_private_flag_wake_one_of_two: FUTEX_WAKE_PRIVATE(1) dequeued {}", woken);
+    assert!(woken <= 1, "test_futex_private_flag_wake_one_of_two: FUTEX_WAKE_PRIVATE(1) dequeued {woken}");
 
     // Release the remaining waiter.
     FUTEX_WORD_PW.store(1, Ordering::SeqCst);
@@ -2173,7 +2109,7 @@ fn test_futex_private_tgid_isolation() {
 
         let uaddr = FUTEX_WORD_TI.as_ptr() as usize;
         let ts = Timespec { tv_sec: 2, tv_nsec: 0 };
-        let timeout_ptr = &ts as *const Timespec as u64;
+        let timeout_ptr = &raw const ts as u64;
         // FUTEX_WAIT_PRIVATE → tgid = read_current_pid() → 0 in kernel context
         crate::syscall::handle_syscall(
             NR_FUTEX,
@@ -2192,7 +2128,7 @@ fn test_futex_private_tgid_isolation() {
 
     // Wake with wrong tgid (99) — should find no waiters at (99, uaddr).
     let woken_wrong = crate::syscall::futex_do_wake(99, uaddr, u32::MAX);
-    assert!(woken_wrong == 0, "test_futex_private_tgid_isolation: wrong tgid should wake 0, got {}", woken_wrong);
+    assert!(woken_wrong == 0, "test_futex_private_tgid_isolation: wrong tgid should wake 0, got {woken_wrong}");
 
     for _ in 0..5 { threading::yield_now(); }
     assert!(!REACHED_TI.load(Ordering::Acquire),
@@ -2200,7 +2136,7 @@ fn test_futex_private_tgid_isolation() {
 
     // Wake with correct tgid (0) — wakes the thread.
     let woken_right = crate::syscall::futex_do_wake(0, uaddr, 1);
-    assert!(woken_right == 1, "test_futex_private_tgid_isolation: correct tgid should wake 1, got {}", woken_right);
+    assert!(woken_right == 1, "test_futex_private_tgid_isolation: correct tgid should wake 1, got {woken_right}");
 
     let mut done = false;
     for _ in 0..50 {
@@ -2229,7 +2165,7 @@ fn test_futex_wake_tgid_wakes_shared_waiter() {
         crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
         let uaddr = FUTEX_WORD_WS.as_ptr() as usize;
         let ts = Timespec { tv_sec: 2, tv_nsec: 0 };
-        let timeout_ptr = &ts as *const Timespec as u64;
+        let timeout_ptr = &raw const ts as u64;
         crate::syscall::handle_syscall(NR_FUTEX, &[uaddr as u64, FUTEX_WAIT, 0, timeout_ptr, 0, 0]);
         REACHED_WS.store(true, Ordering::Release);
         crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
@@ -2279,8 +2215,7 @@ fn test_futex_do_wake_zero_misses_nonzero_tgid_waiter() {
     // Wake only the (0, addr) queue — must miss our (42, addr) waiter.
     let woken = crate::syscall::futex_do_wake(0, uaddr, u32::MAX);
     assert_eq!(woken, 0,
-        "test_futex_do_wake_zero_misses_nonzero_tgid_waiter: do_wake(0) should miss (42,addr), got {}",
-        woken);
+        "test_futex_do_wake_zero_misses_nonzero_tgid_waiter: do_wake(0) should miss (42,addr), got {woken}");
     for _ in 0..10 { threading::yield_now(); }
     assert!(!REACHED_MN.load(Ordering::Acquire),
         "test_futex_do_wake_zero_misses_nonzero_tgid_waiter: thread must not wake on do_wake(0)");
@@ -2313,7 +2248,7 @@ fn test_futex_wake_zero_tgid_no_double_fire() {
             crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
             let uaddr2 = FUTEX_WORD_DF.as_ptr() as usize;
             let ts = Timespec { tv_sec: 2, tv_nsec: 0 };
-            let timeout_ptr = &ts as *const Timespec as u64;
+            let timeout_ptr = &raw const ts as u64;
             crate::syscall::handle_syscall(NR_FUTEX, &[uaddr2 as u64, FUTEX_WAIT, 0, timeout_ptr, 0, 0]);
             COUNT_DF.fetch_add(1, Ordering::SeqCst);
             crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
@@ -2330,7 +2265,7 @@ fn test_futex_wake_zero_tgid_no_double_fire() {
     for _ in 0..30 { threading::yield_now(); }
     let woken = COUNT_DF.load(Ordering::Acquire);
     assert_eq!(woken, 1,
-        "test_futex_wake_zero_tgid_no_double_fire: expected 1 woken, got {} (double-fire?)", woken);
+        "test_futex_wake_zero_tgid_no_double_fire: expected 1 woken, got {woken} (double-fire?)");
 
     // Clean up the remaining waiter.
     crate::syscall::futex_wake(0, uaddr, 1);
@@ -2361,7 +2296,7 @@ fn test_clock_gettime_realtime() {
     let mut ts = Timespec::default();
     let ret = crate::syscall::handle_syscall(
         NR_CLOCK_GETTIME,
-        &[CLOCK_REALTIME as u64, &mut ts as *mut Timespec as u64, 0, 0, 0, 0],
+        &[u64::from(CLOCK_REALTIME), &raw mut ts as u64, 0, 0, 0, 0],
     );
 
     set_bypass(false);
@@ -2380,7 +2315,7 @@ fn test_clock_gettime_monotonic() {
     let mut ts1 = Timespec::default();
     let ret1 = crate::syscall::handle_syscall(
         NR_CLOCK_GETTIME,
-        &[CLOCK_MONOTONIC as u64, &mut ts1 as *mut Timespec as u64, 0, 0, 0, 0],
+        &[u64::from(CLOCK_MONOTONIC), &raw mut ts1 as u64, 0, 0, 0, 0],
     );
 
     // Wait a bit
@@ -2389,7 +2324,7 @@ fn test_clock_gettime_monotonic() {
     let mut ts2 = Timespec::default();
     let ret2 = crate::syscall::handle_syscall(
         NR_CLOCK_GETTIME,
-        &[CLOCK_MONOTONIC as u64, &mut ts2 as *mut Timespec as u64, 0, 0, 0, 0],
+        &[u64::from(CLOCK_MONOTONIC), &raw mut ts2 as u64, 0, 0, 0, 0],
     );
 
     set_bypass(false);
@@ -2400,7 +2335,7 @@ fn test_clock_gettime_monotonic() {
     // Monotonic clock must not go backwards
     let t1_ns = ts1.tv_sec * 1_000_000_000 + ts1.tv_nsec;
     let t2_ns = ts2.tv_sec * 1_000_000_000 + ts2.tv_nsec;
-    assert!(t2_ns >= t1_ns, "CLOCK_MONOTONIC went backwards: {} -> {}", t1_ns, t2_ns);
+    assert!(t2_ns >= t1_ns, "CLOCK_MONOTONIC went backwards: {t1_ns} -> {t2_ns}");
 
     console::print("  [PASS] test_clock_gettime_monotonic\n");
 }
@@ -2424,7 +2359,7 @@ fn test_clock_gettime_all_clock_ids() {
         let mut ts = Timespec::default();
         let ret = crate::syscall::handle_syscall(
             NR_CLOCK_GETTIME,
-            &[clock_id as u64, &mut ts as *mut Timespec as u64, 0, 0, 0, 0],
+            &[u64::from(clock_id), &raw mut ts as u64, 0, 0, 0, 0],
         );
         // We accept the call - even if we map to monotonic internally
         assert!(ret == 0, "clock_gettime(clock_id={}) failed: ret={}", clock_id, ret as i64);
@@ -2441,7 +2376,7 @@ fn test_clock_gettime_efault_null_ptr() {
 
     let ret = crate::syscall::handle_syscall(
         NR_CLOCK_GETTIME,
-        &[CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0], // NULL pointer
+        &[u64::from(CLOCK_MONOTONIC), 0, 0, 0, 0, 0], // NULL pointer
     );
 
     // Should return -EFAULT
@@ -2458,7 +2393,7 @@ fn test_clock_gettime_efault_invalid_ptr() {
 
     let ret = crate::syscall::handle_syscall(
         NR_CLOCK_GETTIME,
-        &[CLOCK_MONOTONIC as u64, invalid_ptr, 0, 0, 0, 0],
+        &[u64::from(CLOCK_MONOTONIC), invalid_ptr, 0, 0, 0, 0],
     );
 
     // Should return -EFAULT
@@ -2473,7 +2408,7 @@ fn test_clock_getres_basic() {
     let mut res = Timespec::default();
     let ret = crate::syscall::handle_syscall(
         NR_CLOCK_GETRES,
-        &[CLOCK_MONOTONIC as u64, &mut res as *mut Timespec as u64, 0, 0, 0, 0],
+        &[u64::from(CLOCK_MONOTONIC), &raw mut res as u64, 0, 0, 0, 0],
     );
 
     set_bypass(false);
@@ -2481,7 +2416,7 @@ fn test_clock_getres_basic() {
     assert!(ret == 0, "clock_getres failed: ret={}", ret as i64);
     // Resolution should be > 0 (we return 1ns)
     let res_ns = res.tv_sec * 1_000_000_000 + res.tv_nsec;
-    assert!(res_ns > 0, "clock_getres should return positive resolution: {}", res_ns);
+    assert!(res_ns > 0, "clock_getres should return positive resolution: {res_ns}");
 
     console::print("  [PASS] test_clock_getres_basic\n");
 }
@@ -2490,7 +2425,7 @@ fn test_clock_getres_null_ptr() {
     // Linux allows NULL res pointer (just checks if clock is supported)
     let ret = crate::syscall::handle_syscall(
         NR_CLOCK_GETRES,
-        &[CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0],
+        &[u64::from(CLOCK_MONOTONIC), 0, 0, 0, 0, 0],
     );
 
     assert!(ret == 0, "clock_getres(NULL) should succeed, got {}", ret as i64);
@@ -2507,7 +2442,7 @@ fn test_clock_gettime_struct_layout() {
 
     // Verify field offsets
     let ts = Timespec { tv_sec: 0x1234_5678_9ABC_DEF0u64 as i64, tv_nsec: 0xFEDC_BA98_7654_3210u64 as i64 };
-    let bytes = unsafe { core::slice::from_raw_parts(&ts as *const Timespec as *const u8, 16) };
+    let bytes = unsafe { core::slice::from_raw_parts((&raw const ts).cast::<u8>(), 16) };
 
     // tv_sec at offset 0 (little-endian)
     assert!(bytes[0] == 0xF0, "tv_sec byte 0 mismatch");

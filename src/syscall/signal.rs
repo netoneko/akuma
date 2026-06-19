@@ -39,14 +39,14 @@ pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigs
             sa_restorer: old.restorer,
             sa_mask: if sigset_ok { old.mask } else { 0 },
         };
-        if unsafe { copy_to_user_safe(oldact_ptr as *mut u8, &out as *const KernelSigaction as *const u8, 32).is_err() } {
+        if unsafe { copy_to_user_safe(oldact_ptr as *mut u8, (&raw const out).cast::<u8>(), 32).is_err() } {
             return EFAULT;
         }
     }
 
     if act_ptr != 0 && validate_user_ptr(act_ptr as u64, 32) {
         let mut sa = KernelSigaction::default();
-        if unsafe { copy_from_user_safe(&mut sa as *mut KernelSigaction as *mut u8, act_ptr as *const u8, 32).is_err() } {
+        if unsafe { copy_from_user_safe((&raw mut sa).cast::<u8>(), act_ptr as *const u8, 32).is_err() } {
             return EFAULT;
         }
         let handler = match sa.sa_handler {
@@ -94,7 +94,7 @@ pub(super) fn sys_rt_sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigset
         if !validate_user_ptr(oldset_ptr, 8) {
             return EFAULT;
         }
-        if unsafe { copy_to_user_safe(oldset_ptr as *mut u8, &proc.signal_mask as *const u64 as *const u8, 8).is_err() } {
+        if unsafe { copy_to_user_safe(oldset_ptr as *mut u8, (&raw const proc.signal_mask).cast::<u8>(), 8).is_err() } {
             return EFAULT;
         }
     }
@@ -105,7 +105,7 @@ pub(super) fn sys_rt_sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigset
             return EFAULT;
         }
         let mut new_mask: u64 = 0;
-        if unsafe { copy_from_user_safe(&mut new_mask as *mut u64 as *mut u8, set_ptr as *const u8, 8).is_err() } {
+        if unsafe { copy_from_user_safe((&raw mut new_mask).cast::<u8>(), set_ptr as *const u8, 8).is_err() } {
             return EFAULT;
         }
 
@@ -151,7 +151,7 @@ pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
         struct StackT { sp: u64, flags: i32, _pad: i32, size: u64 }
         let (sp, size, flags) = akuma_exec::threading::get_sigaltstack(slot);
         let out = StackT { sp, flags, _pad: 0, size };
-        if unsafe { copy_to_user_safe(old_ss_ptr as *mut u8, &out as *const StackT as *const u8, STACK_T_SIZE).is_err() } {
+        if unsafe { copy_to_user_safe(old_ss_ptr as *mut u8, (&raw const out).cast::<u8>(), STACK_T_SIZE).is_err() } {
             return EFAULT;
         }
     }
@@ -164,7 +164,7 @@ pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
         #[repr(C)]
         struct StackT { sp: u64, flags: i32, _pad: i32, size: u64 }
         let mut ss = StackT { sp: 0, flags: 0, _pad: 0, size: 0 };
-        if unsafe { copy_from_user_safe(&mut ss as *mut StackT as *mut u8, ss_ptr as *const u8, STACK_T_SIZE).is_err() } {
+        if unsafe { copy_from_user_safe((&raw mut ss).cast::<u8>(), ss_ptr as *const u8, STACK_T_SIZE).is_err() } {
             return EFAULT;
         }
 
@@ -203,23 +203,24 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset
     }
 
     let mut wait_mask: u64 = 0;
-    if unsafe { copy_from_user_safe(&mut wait_mask as *mut u64 as *mut u8, set_ptr as *const u8, 8).is_err() } {
+    if unsafe { copy_from_user_safe((&raw mut wait_mask).cast::<u8>(), set_ptr as *const u8, 8).is_err() } {
         return EFAULT;
     }
 
-    let mut timeout_us = u64::MAX;
-    if timeout_ptr != 0 {
+    let timeout_us = if timeout_ptr != 0 {
         if !validate_user_ptr(timeout_ptr, 16) {
             return EFAULT;
         }
         #[repr(C)]
         struct Timespec { tv_sec: i64, tv_nsec: i64 }
         let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-        if unsafe { copy_from_user_safe(&mut ts as *mut Timespec as *mut u8, timeout_ptr as *const u8, 16).is_err() } {
+        if unsafe { copy_from_user_safe((&raw mut ts).cast::<u8>(), timeout_ptr as *const u8, 16).is_err() } {
             return EFAULT;
         }
-        timeout_us = (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000;
-    }
+        (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000
+    } else {
+        u64::MAX
+    };
 
     let start_time = crate::timer::uptime_us();
 
@@ -234,9 +235,9 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset
                 #[repr(C)]
                 struct Siginfo { si_signo: i32, si_errno: i32, si_code: i32, _pad: [i32; 29] }
                 let info = Siginfo { si_signo: sig as i32, si_errno: 0, si_code: 0, _pad: [0; 29] };
-                let _ = unsafe { copy_to_user_safe(info_ptr as *mut u8, &info as *const Siginfo as *const u8, 128) };
+                let _ = unsafe { copy_to_user_safe(info_ptr as *mut u8, (&raw const info).cast::<u8>(), 128) };
             }
-            return sig as u64;
+            return u64::from(sig);
         }
 
         let now = crate::timer::uptime_us();
@@ -317,7 +318,7 @@ pub(super) fn sys_tgkill(_tgid: u32, tid: u32, sig: u32) -> u64 {
 }
 
 /// Helper for other syscalls (like pipe write) to send SIGPIPE
-pub(crate) fn send_sigpipe() {
+pub fn send_sigpipe() {
     let tid = akuma_exec::threading::current_thread_id() as u32;
     // SIGPIPE is signal 13
     sys_tkill(tid, 13);

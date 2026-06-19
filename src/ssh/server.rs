@@ -39,7 +39,7 @@ static SERVER_TICK_US: AtomicU64 = AtomicU64::new(0);
 /// 5=create_listener, 6=poll, 7=yield. If the supervisor sees STALLED with
 /// step stuck at 2, candidate (a) (NETWORK contention) is the cause; at 6,
 /// candidate (b) (poll() stuck); at 5, candidate (c) (listener handle bad).
-pub(crate) static SERVER_STEP: AtomicU8 = AtomicU8::new(0);
+pub static SERVER_STEP: AtomicU8 = AtomicU8::new(0);
 
 /// True if the current `listen_handle` in the accept loop is still a valid
 /// smoltcp socket. Cleared if the GC ever frees it out from under us.
@@ -103,11 +103,11 @@ pub fn stats() -> SshStats {
     }
 }
 
-pub(crate) fn note_handshake_fail() {
+pub fn note_handshake_fail() {
     HANDSHAKE_FAIL.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn note_auth_fail() {
+pub fn note_auth_fail() {
     AUTH_FAIL.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -115,13 +115,13 @@ pub(crate) fn note_auth_fail() {
 /// `SessionGuard::drop` does, without touching a real socket. Called from
 /// `ssh_tests.rs`.
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-pub(crate) fn test_note_session_open() {
+pub fn test_note_session_open() {
     ACTIVE_SESSIONS.fetch_add(1, Ordering::AcqRel);
     SESSIONS_OPENED.fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-pub(crate) fn test_note_session_close(panicked: bool) {
+pub fn test_note_session_close(panicked: bool) {
     ACTIVE_SESSIONS.fetch_sub(1, Ordering::AcqRel);
     SESSIONS_CLOSED.fetch_add(1, Ordering::Relaxed);
     if panicked {
@@ -144,12 +144,9 @@ pub fn run() -> ! {
     super::init_host_key();
 
     // Create initial listening socket
-    let mut listen_handle = match create_listener() {
-        Some(h) => h,
-        None => {
-            log(&format!("[SSH Server] FATAL: Failed to create listener on port {}\n", crate::config::SSH_PORT));
-            loop { akuma_exec::threading::yield_now(); }
-        }
+    let mut listen_handle = if let Some(h) = create_listener() { h } else {
+        log(&format!("[SSH Server] FATAL: Failed to create listener on port {}\n", crate::config::SSH_PORT));
+        loop { akuma_exec::threading::yield_now(); }
     };
     LISTENER_HANDLE_VALID.store(true, Ordering::Relaxed);
 
@@ -242,17 +239,15 @@ fn recreate_listener_with_retry() -> SocketHandle {
         if let Some(h) = create_listener() {
             if attempts > 0 {
                 log(&format!(
-                    "[SSH Server] Recovered listener after {} attempts\n",
-                    attempts
+                    "[SSH Server] Recovered listener after {attempts} attempts\n"
                 ));
             }
             return h;
         }
         attempts = attempts.saturating_add(1);
-        if attempts % 100 == 0 {
+        if attempts.is_multiple_of(100) {
             log(&format!(
-                "[SSH Server] Listener creation still failing after {} attempts (socket pool exhausted; waiting for pending_removal GC)\n",
-                attempts
+                "[SSH Server] Listener creation still failing after {attempts} attempts (socket pool exhausted; waiting for pending_removal GC)\n"
             ));
         }
         // Drive poll() to advance the GC sweep, then yield so other threads
@@ -269,12 +264,9 @@ fn create_listener() -> Option<SocketHandle> {
         socket.listen(crate::config::SSH_PORT)
     });
     
-    match res {
-        Some(Ok(())) => Some(handle),
-        _ => {
-            smoltcp_net::socket_close(handle);
-            None
-        }
+    if res == Some(Ok(())) { Some(handle) } else {
+        smoltcp_net::socket_close(handle);
+        None
     }
 }
 

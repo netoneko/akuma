@@ -29,7 +29,7 @@ fn trace_read_ebadf(reason: &str, fd: u64, buf_ptr: u64) {
     }
 }
 
-pub(crate) fn fs_error_to_errno(e: crate::vfs::FsError) -> u64 {
+pub fn fs_error_to_errno(e: crate::vfs::FsError) -> u64 {
     use crate::vfs::FsError;
     match e {
         FsError::NotFound => ENOENT,
@@ -63,7 +63,7 @@ pub(super) fn resolve_path_at(dirfd: i32, raw_path: &str) -> String {
     } else if dirfd >= 0 {
         if let Some(proc) = akuma_exec::process::current_process() {
             if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                f.path.clone()
+                f.path
             } else {
                 String::from("/")
             }
@@ -108,19 +108,13 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         return EFAULT;
     }
-    let proc = match akuma_exec::process::current_process() {
-        Some(p) => p,
-        None => {
-            trace_read_ebadf("no-current-process", fd_num, buf_ptr);
-            return EBADF;
-        }
+    let proc = if let Some(p) = akuma_exec::process::current_process() { p } else {
+        trace_read_ebadf("no-current-process", fd_num, buf_ptr);
+        return EBADF;
     };
-    let fd = match proc.get_fd(fd_num as u32) {
-        Some(e) => e,
-        None => {
-            trace_read_ebadf("fd-not-in-table", fd_num, buf_ptr);
-            return EBADF;
-        }
+    let fd = if let Some(e) = proc.get_fd(fd_num as u32) { e } else {
+        trace_read_ebadf("fd-not-in-table", fd_num, buf_ptr);
+        return EBADF;
     };
     
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED && fd_num == 0 {
@@ -129,21 +123,17 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 
     match fd {
         akuma_exec::process::FileDescriptor::Stdin => {
-            let ch = match akuma_exec::process::current_channel() {
-                Some(c) => c,
-                None => {
-                    let mut temp = alloc::vec![0u8; count];
-                    let n = proc.read_stdin(&mut temp);
-                    if n > 0 { 
-                        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
-                            return EFAULT;
-                        }
+            let ch = if let Some(c) = akuma_exec::process::current_channel() { c } else {
+                let mut temp = alloc::vec![0u8; count];
+                let n = proc.read_stdin(&mut temp);
+                if n > 0 
+                    && unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                        return EFAULT;
                     }
-                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                        crate::safe_print!(128, "[syscall] read(stdin) fallback returned {}\n", n);
-                    }
-                    return n as u64;
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::safe_print!(128, "[syscall] read(stdin) fallback returned {}\n", n);
                 }
+                return n as u64;
             };
 
             let mut kernel_buf = alloc::vec![0u8; count];
@@ -204,13 +194,11 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                                     return to_read as u64;
                                 }
                                 continue;
-                            } else {
-                                if let Some(echo_buf) = ts.echo_noncanon(&kernel_buf[..n]) {
-                                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                                        crate::safe_print!(128, "[syscall] read: echoing {} bytes\n", echo_buf.len());
-                                    }
-                                    ch.write(&echo_buf);
+                            } else if let Some(echo_buf) = ts.echo_noncanon(&kernel_buf[..n]) {
+                                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                    crate::safe_print!(128, "[syscall] read: echoing {} bytes\n", echo_buf.len());
                                 }
+                                ch.write(&echo_buf);
                             }
                         }
                     }
@@ -259,14 +247,11 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     return EINTR;
                 }
 
-                let term_state_lock = match akuma_exec::process::current_terminal_state() {
-                    Some(state) => state,
-                    None => {
-                        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                            crate::safe_print!(128, "[syscall] read(stdin) no terminal state, EOF\n");
-                        }
-                        return 0;
+                let term_state_lock = if let Some(state) = akuma_exec::process::current_terminal_state() { state } else {
+                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                        crate::safe_print!(128, "[syscall] read(stdin) no terminal state, EOF\n");
                     }
+                    return 0;
                 };
 
                 {
@@ -337,16 +322,15 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     Err(e) if *e == akuma_net::socket::libc_errno::EAGAIN => {
                         crate::tprint!(64, "[sock] read fd={} EAGAIN (drained)\n", fd_num);
                     }
-                    Err(e) => crate::tprint!(128, "[sock] read fd={} err={}\n", fd_num, *e as i64),
+                    Err(e) => crate::tprint!(128, "[sock] read fd={} err={}\n", fd_num, i64::from(*e)),
                 }
             }
             match result {
                 Ok(n) => {
-                    if n > 0 {
-                        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                    if n > 0
+                        && unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
                             return EFAULT;
                         }
-                    }
                     // Reset EPOLLET edge after every successful TCP read. Go (and other callers
                     // using read() rather than recvfrom/recvmsg) do not always drain to EAGAIN
                     // before going back to epoll. Without this reset the EPOLLET "last_ready"
@@ -362,7 +346,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                         // Socket was drained — reset EPOLLET edge so next data arrival fires EPOLLIN.
                         super::poll::epoll_on_fd_drained(fd_num as u32);
                     }
-                    (-(e as i64)) as u64
+                    (-i64::from(e)) as u64
                 }
             }
         }
@@ -404,7 +388,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 static PIPE_READ_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
                 let sample = crate::config::SYSCALL_DEBUG_PIPE_READ_SAMPLE.max(1);
                 let seq = PIPE_READ_TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
-                if seq % sample == 0 {
+                if seq.is_multiple_of(sample) {
                     let tid = akuma_exec::threading::current_thread_id();
                     crate::tprint!(
                         224,
@@ -481,23 +465,19 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             if count < 8 { return EINVAL; }
             let nonblock = super::eventfd::eventfd_is_nonblock(efd_id) || super::net::fd_is_nonblock(fd_num as u32);
             loop {
-                match super::eventfd::eventfd_read(efd_id) {
-                    Ok(val) => {
-                        let mut temp = [0u8; 8];
-                        unsafe { core::ptr::write(temp.as_mut_ptr() as *mut u64, val); }
-                        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), 8).is_err() } {
-                            return EFAULT;
-                        }
-                        return 8;
+                if let Ok(val) = super::eventfd::eventfd_read(efd_id) {
+                    let mut temp = [0u8; 8];
+                    unsafe { core::ptr::write(temp.as_mut_ptr().cast::<u64>(), val); }
+                    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), 8).is_err() } {
+                        return EFAULT;
                     }
-                    Err(_) => {
-                        if nonblock { return EAGAIN; }
-                        if akuma_exec::process::is_current_interrupted() { return EINTR; }
-                        let tid = akuma_exec::threading::current_thread_id();
-                        super::eventfd::eventfd_add_poller(efd_id, tid);
-                        akuma_exec::threading::schedule_blocking(u64::MAX);
-                    }
+                    return 8;
                 }
+                if nonblock { return EAGAIN; }
+                if akuma_exec::process::is_current_interrupted() { return EINTR; }
+                let tid = akuma_exec::threading::current_thread_id();
+                super::eventfd::eventfd_add_poller(efd_id, tid);
+                akuma_exec::threading::schedule_blocking(u64::MAX);
             }
         }
         akuma_exec::process::FileDescriptor::DevNull => 0,
@@ -518,7 +498,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             if result == EAGAIN { return EAGAIN; }
             if count >= 8 && validate_user_ptr(buf_ptr, 8) {
                 let mut temp = [0u8; 8];
-                unsafe { core::ptr::write(temp.as_mut_ptr() as *mut u64, result); }
+                unsafe { core::ptr::write(temp.as_mut_ptr().cast::<u64>(), result); }
                 if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), 8).is_err() } {
                     return EFAULT;
                 }
@@ -553,11 +533,10 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
             let mut temp = alloc::vec![0u8; to_read];
             match crate::fs::read_at(&f.path, offset as usize, &mut temp) {
                 Ok(n) => {
-                    if n > 0 {
-                        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                    if n > 0
+                        && unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
                             return EFAULT;
                         }
-                    }
                     if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                         crate::safe_print!(256, "[syscall] pread64(fd={}, file={}, off={}, req={}) = {}\n", fd_num, &f.path, offset, to_read, n);
                     }
@@ -713,7 +692,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED && total_written == 0 {
                     match &result {
                         Ok(n) => crate::tprint!(96, "[TCP] write fd={} len={} sent={}\n", fd_num, count, n),
-                        Err(e) => crate::tprint!(96, "[TCP] write fd={} len={} err={}\n", fd_num, count, *e as i64),
+                        Err(e) => crate::tprint!(96, "[TCP] write fd={} len={} err={}\n", fd_num, count, i64::from(*e)),
                     }
                 }
                 
@@ -721,7 +700,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     Ok(n) => n as u64,
                     Err(e) => {
                         if total_written > 0 { return total_written as u64; }
-                        return (-(e as i64)) as u64;
+                        return (-i64::from(e)) as u64;
                     }
                 }
             }
@@ -731,7 +710,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     Err(e) => {
                         crate::safe_print!(128, "[syscall] write: PipeWrite fd={} pipe_id={} EPIPE ({} bytes)\n", fd_num, pipe_id, buf_slice.len());
                         if total_written > 0 { return total_written as u64; }
-                        return (-(e as i64)) as u64;
+                        return (-i64::from(e)) as u64;
                     }
                 }
             }
@@ -741,33 +720,30 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     Ok(n) => n as u64,
                     Err(e) => {
                         if total_written > 0 { return total_written as u64; }
-                        return (-(e as i64)) as u64;
+                        return (-i64::from(e)) as u64;
                     }
                 }
             }
             #[cfg(feature = "sc-eventfd")]
             akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
                 if this_chunk < 8 { return EINVAL; } // Should enforce 8 byte writes
-                let val = unsafe { core::ptr::read(buf_slice.as_ptr() as *const u64) };
+                let val = unsafe { core::ptr::read(buf_slice.as_ptr().cast::<u64>()) };
                 if val == u64::MAX { return EINVAL; }
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED {
                     crate::tprint!(96, "[eventfd] write via fd={} id={} val={}\n", fd_num, efd_id, val);
                 }
                 match super::eventfd::eventfd_write(efd_id, val) {
                     Ok(()) => 8,
-                    Err(e) => (-(e as i64)) as u64,
+                    Err(e) => (-i64::from(e)) as u64,
                 }
             }
             akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom => this_chunk as u64,
             akuma_exec::process::FileDescriptor::DevDsp => {
                 // Blocking PCM playback. The audio driver re-chunks into bounded
                 // periods internally; consumes the whole slice or errors.
-                match crate::audio::play(buf_slice) {
-                    Ok(n) => n as u64,
-                    Err(_) => {
-                        if total_written > 0 { return total_written as u64; }
-                        return EIO;
-                    }
+                if let Ok(n) = crate::audio::play(buf_slice) { n as u64 } else {
+                    if total_written > 0 { return total_written as u64; }
+                    return EIO;
                 }
             }
             _ => EBADF
@@ -800,13 +776,12 @@ pub(super) fn sys_readv(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
     if !validate_user_ptr(iov_ptr, iov_size) { return EFAULT; }
     
     let mut kernel_iovs = alloc::vec![IoVec { iov_base: 0, iov_len: 0 }; iov_cnt];
-    if unsafe { copy_from_user_safe(kernel_iovs.as_mut_ptr() as *mut u8, iov_ptr as *const u8, iov_size).is_err() } {
+    if unsafe { copy_from_user_safe(kernel_iovs.as_mut_ptr().cast::<u8>(), iov_ptr as *const u8, iov_size).is_err() } {
         return EFAULT;
     }
     
     let mut total_read: u64 = 0;
-    for i in 0..iov_cnt {
-        let iov = &kernel_iovs[i];
+    for iov in kernel_iovs.iter().take(iov_cnt) {
         if iov.iov_len == 0 { continue; }
         let n = sys_read(fd_num, iov.iov_base, iov.iov_len);
         if (n as i64) < 0 {
@@ -827,13 +802,12 @@ pub(super) fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
     if !validate_user_ptr(iov_ptr, iov_size) { return EFAULT; }
     
     let mut kernel_iovs = alloc::vec![IoVec { iov_base: 0, iov_len: 0 }; iov_cnt];
-    if unsafe { copy_from_user_safe(kernel_iovs.as_mut_ptr() as *mut u8, iov_ptr as *const u8, iov_size).is_err() } {
+    if unsafe { copy_from_user_safe(kernel_iovs.as_mut_ptr().cast::<u8>(), iov_ptr as *const u8, iov_size).is_err() } {
         return EFAULT;
     }
     
     let mut total_written: u64 = 0;
-    for i in 0..iov_cnt {
-        let iov = &kernel_iovs[i];
+    for iov in kernel_iovs.iter().take(iov_cnt) {
         let written = sys_write(fd_num, iov.iov_base, iov.iov_len);
         if (written as i64) < 0 {
             if total_written == 0 { return written; }
@@ -878,7 +852,7 @@ pub(super) fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
         f_flags: 0,
         f_spare: [0; 4],
     };
-    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, &st as *const Statfs as *const u8, core::mem::size_of::<Statfs>()).is_err() } {
+    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, (&raw const st).cast::<u8>(), core::mem::size_of::<Statfs>()).is_err() } {
         return EFAULT;
     }
     0
@@ -904,7 +878,7 @@ pub(super) fn sys_dup(oldfd: u32) -> u64 {
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[syscall] dup(oldfd={}) = {}\n", oldfd, newfd);
     }
-    newfd as u64
+    u64::from(newfd)
 }
 
 pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
@@ -961,7 +935,7 @@ pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
         }
     }
 
-    newfd as u64
+    u64::from(newfd)
 }
 
 pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
@@ -986,7 +960,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         } else if dirfd >= 0 {
             if let Some(proc) = akuma_exec::process::current_process() {
                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                    f.path.clone()
+                    f.path
                 } else {
                     if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                         crate::safe_print!(128, "[syscall] openat: bad dirfd={}\n", dirfd);
@@ -1017,7 +991,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(256, "[syscall] openat(/dev/null) = fd {} flags=0x{:x}\n", fd, flags);
             }
-            return fd as u64;
+            return u64::from(fd);
         }
         return ESRCH;
     }
@@ -1031,7 +1005,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
             }
-            return fd as u64;
+            return u64::from(fd);
         }
         return ESRCH;
     }
@@ -1048,7 +1022,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
             }
-            return fd as u64;
+            return u64::from(fd);
         }
         return ESRCH;
     }
@@ -1077,7 +1051,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             let parent_path = if parent_raw.starts_with('/') {
                 String::from(parent_raw)
             } else {
-                format!("/{}", parent_raw)
+                format!("/{parent_raw}")
             };
             if parent_path != "/" && !crate::fs::exists(&parent_path) {
                 if crate::config::SYSCALL_DEBUG_IO_ENABLED {
@@ -1105,11 +1079,11 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         if crate::config::SYSCALL_DEBUG_IO_ENABLED {
             crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
         }
-        fd as u64
+        u64::from(fd)
     } else { ESRCH }
 }
 
-pub(crate) fn sys_close(fd: u32) -> u64 {
+pub fn sys_close(fd: u32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
         if let Some(entry) = proc.remove_fd(fd) {
             proc.clear_cloexec(fd);
@@ -1151,7 +1125,7 @@ pub(crate) fn sys_close(fd: u32) -> u64 {
     } else { ESRCH }
 }
 
-pub(crate) fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
+pub fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
     const CLOSE_RANGE_CLOEXEC: u32 = 4;
     let proc = match akuma_exec::process::current_process() {
         Some(p) => p,
@@ -1165,32 +1139,30 @@ pub(crate) fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
     for fd in fds {
         if flags & CLOSE_RANGE_CLOEXEC != 0 {
             proc.set_cloexec(fd);
-        } else {
-            if let Some(entry) = proc.remove_fd(fd) {
-                proc.clear_cloexec(fd);
-                match entry {
-                    akuma_exec::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
-                    akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
-                        akuma_exec::process::remove_child_channel(child_pid);
-                    }
-                    akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
-                        super::pipe::pipe_close_write(pipe_id);
-                    }
-                    akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
-                        super::pipe::pipe_close_read(pipe_id);
-                    }
-                    akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
-                        super::pipe::pipe_close_read(rx);
-                        super::pipe::pipe_close_write(tx);
-                    }
-                    #[cfg(feature = "sc-eventfd")]
-                    akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
-                        super::eventfd::eventfd_close(efd_id);
-                    }
-                    _ => {}
+        } else if let Some(entry) = proc.remove_fd(fd) {
+            proc.clear_cloexec(fd);
+            match entry {
+                akuma_exec::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
+                akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
+                    akuma_exec::process::remove_child_channel(child_pid);
                 }
-                proc.clear_nonblock(fd);
+                akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
+                    super::pipe::pipe_close_write(pipe_id);
+                }
+                akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
+                    super::pipe::pipe_close_read(pipe_id);
+                }
+                akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+                    super::pipe::pipe_close_read(rx);
+                    super::pipe::pipe_close_write(tx);
+                }
+                #[cfg(feature = "sc-eventfd")]
+                akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
+                    super::eventfd::eventfd_close(efd_id);
+                }
+                _ => {}
             }
+            proc.clear_nonblock(fd);
         }
     }
     0
@@ -1198,7 +1170,7 @@ pub(crate) fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
 
 pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
-        if let Some(akuma_exec::process::FileDescriptor::DevNull) = proc.get_fd(fd) {
+        if matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::DevNull)) {
             return 0;
         }
         let mut new_pos = 0i64;
@@ -1260,26 +1232,29 @@ pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
             stat = Stat { st_dev: 0, st_ino: 9, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 9), st_blksize: 4096, ..Default::default() };
             0
         }
-        Some(akuma_exec::process::FileDescriptor::TimerFd(_)) | Some(akuma_exec::process::FileDescriptor::EpollFd(_)) => {
+        Some(akuma_exec::process::FileDescriptor::TimerFd(_) |
+akuma_exec::process::FileDescriptor::EpollFd(_)) => {
             stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o100600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
             0
         }
-        Some(akuma_exec::process::FileDescriptor::Stdin) | Some(akuma_exec::process::FileDescriptor::Stdout) | Some(akuma_exec::process::FileDescriptor::Stderr) => {
+        Some(akuma_exec::process::FileDescriptor::Stdin |
+akuma_exec::process::FileDescriptor::Stdout |
+akuma_exec::process::FileDescriptor::Stderr) => {
             stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o20620, st_nlink: 1, st_rdev: makedev(136, 0), st_blksize: 1024, ..Default::default() };
             0
         }
-        Some(akuma_exec::process::FileDescriptor::PipeRead(_)) | Some(akuma_exec::process::FileDescriptor::PipeWrite(_)) => {
+        Some(akuma_exec::process::FileDescriptor::PipeRead(_) |
+akuma_exec::process::FileDescriptor::PipeWrite(_)) => {
             stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o10600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
             0
         }
         _ => EBADF,
     };
     
-    if res == 0 {
-        if unsafe { copy_to_user_safe(stat_ptr as *mut u8, &stat as *const Stat as *const u8, stat_size).is_err() } {
+    if res == 0
+        && unsafe { copy_to_user_safe(stat_ptr as *mut u8, (&raw const stat).cast::<u8>(), stat_size).is_err() } {
             return EFAULT;
         }
-    }
     res
 }
 
@@ -1302,7 +1277,7 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
         } else if dirfd >= 0 {
              if let Some(proc) = akuma_exec::process::current_process() {
                  if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                     f.path.clone()
+                     f.path
                  } else {
                      return EBADF;
                  }
@@ -1383,7 +1358,7 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
 
     if res == 0 {
         let stat_size = core::mem::size_of::<Stat>();
-        if unsafe { copy_to_user_safe(stat_ptr as *mut u8, &stat as *const Stat as *const u8, stat_size).is_err() } {
+        if unsafe { copy_to_user_safe(stat_ptr as *mut u8, (&raw const stat).cast::<u8>(), stat_size).is_err() } {
             return EFAULT;
         }
     }
@@ -1422,7 +1397,7 @@ pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> u64 {
         } else if dirfd >= 0 {
             if let Some(proc) = akuma_exec::process::current_process() {
                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                    f.path.clone()
+                    f.path
                 } else {
                     return EBADF;
                 }
@@ -1510,7 +1485,7 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
         if flags & AT_EMPTY_PATH != 0 && dirfd >= 0 {
             if let Some(proc) = akuma_exec::process::current_process() {
                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                    f.path.clone()
+                    f.path
                 } else {
                     return EBADF;
                 }
@@ -1532,7 +1507,7 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
         } else if dirfd >= 0 {
             if let Some(proc) = akuma_exec::process::current_process() {
                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                    f.path.clone()
+                    f.path
                 } else {
                     return EBADF;
                 }
@@ -1572,7 +1547,7 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
         };
 
     let blksize: u32 = 4096;
-    let blocks: u64 = (size + 511) / 512;
+    let blocks: u64 = size.div_ceil(512);
 
     // STATX_BASIC_STATS covers type/mode/nlink/uid/gid/ino/size/blocks/times
     const STATX_BASIC_STATS: u32 = 0x07ff;
@@ -1581,40 +1556,40 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
     unsafe {
         let p = buf.as_mut_ptr();
         // stx_mask (u32 @ 0)
-        core::ptr::write(p.add(0) as *mut u32, STATX_BASIC_STATS);
+        core::ptr::write(p.add(0).cast::<u32>(), STATX_BASIC_STATS);
         // stx_blksize (u32 @ 4)
-        core::ptr::write(p.add(4) as *mut u32, blksize);
+        core::ptr::write(p.add(4).cast::<u32>(), blksize);
         // stx_attributes (u64 @ 8) — none
         // stx_nlink (u32 @ 16)
-        core::ptr::write(p.add(16) as *mut u32, nlink);
+        core::ptr::write(p.add(16).cast::<u32>(), nlink);
         // stx_uid (u32 @ 20)
         // stx_gid (u32 @ 24)
         // stx_mode (u16 @ 28)
-        core::ptr::write(p.add(28) as *mut u16, mode);
+        core::ptr::write(p.add(28).cast::<u16>(), mode);
         // stx_ino (u64 @ 32)
-        core::ptr::write(p.add(32) as *mut u64, ino);
+        core::ptr::write(p.add(32).cast::<u64>(), ino);
         // stx_size (u64 @ 40)
-        core::ptr::write(p.add(40) as *mut u64, size);
+        core::ptr::write(p.add(40).cast::<u64>(), size);
         // stx_blocks (u64 @ 48)
-        core::ptr::write(p.add(48) as *mut u64, blocks);
+        core::ptr::write(p.add(48).cast::<u64>(), blocks);
         // stx_attributes_mask (u64 @ 56) — none
         // stx_atime (statx_timestamp @ 64): tv_sec(i64) + tv_nsec(u32) + __reserved(i32) = 16 bytes
-        core::ptr::write(p.add(64) as *mut i64, atime);
+        core::ptr::write(p.add(64).cast::<i64>(), atime);
         // stx_btime (@ 80)
         // stx_ctime (@ 96)
-        core::ptr::write(p.add(96) as *mut i64, ctime);
+        core::ptr::write(p.add(96).cast::<i64>(), ctime);
         // stx_mtime (@ 112)
-        core::ptr::write(p.add(112) as *mut i64, mtime);
+        core::ptr::write(p.add(112).cast::<i64>(), mtime);
         // stx_rdev_major (u32 @ 128)
-        core::ptr::write(p.add(128) as *mut u32, rdev_major);
+        core::ptr::write(p.add(128).cast::<u32>(), rdev_major);
         // stx_rdev_minor (u32 @ 132)
-        core::ptr::write(p.add(132) as *mut u32, rdev_minor);
+        core::ptr::write(p.add(132).cast::<u32>(), rdev_minor);
         // stx_dev_major (u32 @ 136)
-        core::ptr::write(p.add(136) as *mut u32, 0);
+        core::ptr::write(p.add(136).cast::<u32>(), 0);
         // stx_dev_minor (u32 @ 140)
-        core::ptr::write(p.add(140) as *mut u32, 1);
+        core::ptr::write(p.add(140).cast::<u32>(), 1);
         // stx_mnt_id (u64 @ 144)
-        core::ptr::write(p.add(144) as *mut u64, 1);
+        core::ptr::write(p.add(144).cast::<u64>(), 1);
     }
 
     if unsafe { copy_to_user_safe(buf_ptr as *mut u8, buf.as_ptr(), STATX_SIZE).is_err() } {
@@ -1641,7 +1616,7 @@ pub(super) fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32)
         } else if dirfd >= 0 {
              if let Some(proc) = akuma_exec::process::current_process() {
                  if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                     f.path.clone()
+                     f.path
                  } else {
                      return EBADF;
                  }
@@ -1670,7 +1645,7 @@ pub(super) fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
         let cwd_bytes = proc.cwd.as_bytes();
         if cwd_bytes.len() + 1 > size {
-            return (-libc_errno::ERANGE as i64) as u64;
+            return i64::from(-libc_errno::ERANGE) as u64;
         }
         let mut temp = alloc::vec![0u8; cwd_bytes.len() + 1];
         temp[..cwd_bytes.len()].copy_from_slice(cwd_bytes);
@@ -1717,7 +1692,7 @@ pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
             if cmd == F_DUPFD_CLOEXEC {
                 proc.set_cloexec(new_fd);
             }
-            new_fd as u64
+            u64::from(new_fd)
         }
         F_GETFD => {
             if proc.is_cloexec(fd) { FD_CLOEXEC } else { 0 }
@@ -1769,7 +1744,7 @@ pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, _mode: u32) -> u64 {
         } else if dirfd >= 0 {
             if let Some(proc) = akuma_exec::process::current_process() {
                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                    f.path.clone()
+                    f.path
                 } else {
                     return EBADF;
                 }
@@ -1810,7 +1785,7 @@ pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> u64 {
         } else if dirfd >= 0 {
             if let Some(proc) = akuma_exec::process::current_process() {
                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                    f.path.clone()
+                    f.path
                 } else {
                     return EBADF;
                 }
@@ -1909,7 +1884,7 @@ pub(super) fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -
         crate::safe_print!(256, "[syscall] symlinkat: {} -> {}\n", link_path, target);
     }
     match crate::vfs::create_symlink(&link_path, &target) {
-        Ok(_) => 0,
+        Ok(()) => 0,
         Err(e) => fs_error_to_errno(e),
     }
 }
@@ -2014,9 +1989,9 @@ pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
         if written + reclen > size { break; }
         let p = unsafe { kernel_buf.as_mut_ptr().add(written) };
         unsafe {
-            core::ptr::write_unaligned(p as *mut u64, 1);
-            core::ptr::write_unaligned(p.add(8) as *mut u64, 1);
-            core::ptr::write_unaligned(p.add(16) as *mut u16, reclen as u16);
+            core::ptr::write_unaligned(p.cast::<u64>(), 1);
+            core::ptr::write_unaligned(p.add(8).cast::<u64>(), 1);
+            core::ptr::write_unaligned(p.add(16).cast::<u16>(), reclen as u16);
             p.add(18).write(entry.d_type);
             core::ptr::copy_nonoverlapping(entry.name.as_ptr(), p.add(19), entry.name.len());
             p.add(19 + entry.name.len()).write(0);
@@ -2031,11 +2006,10 @@ pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
             }
         });
     }
-    if written > 0 {
-        if unsafe { copy_to_user_safe(ptr as *mut u8, kernel_buf.as_ptr(), written).is_err() } {
+    if written > 0
+        && unsafe { copy_to_user_safe(ptr as *mut u8, kernel_buf.as_ptr(), written).is_err() } {
             return EFAULT;
         }
-    }
     written as u64
 }
 
@@ -2046,18 +2020,17 @@ pub(super) fn sys_fchdir(fd: u32) -> u64 {
         None => return EBADF,
     };
     let path = match entry {
-        akuma_exec::process::FileDescriptor::File(f) => f.path.clone(),
+        akuma_exec::process::FileDescriptor::File(f) => f.path,
         _ => return ENOTDIR,
     };
-    if let Ok(meta) = crate::vfs::metadata(&path) {
-        if meta.is_dir {
+    if let Ok(meta) = crate::vfs::metadata(&path)
+        && meta.is_dir {
             proc.set_cwd(&path);
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                 crate::safe_print!(128, "[syscall] fchdir(fd={}) -> \"{}\"\n", fd, path);
             }
             return 0;
         }
-    }
     ENOTDIR
 }
 
@@ -2070,14 +2043,12 @@ pub(super) fn sys_chdir(ptr: u64) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
         let new_cwd = crate::vfs::resolve_path(&proc.cwd, &path);
         
-        if crate::fs::exists(&new_cwd) {
-            if let Ok(meta) = crate::vfs::metadata(&new_cwd) {
-                if meta.is_dir {
+        if crate::fs::exists(&new_cwd)
+            && let Ok(meta) = crate::vfs::metadata(&new_cwd)
+                && meta.is_dir {
                     proc.set_cwd(&new_cwd);
                     return 0;
                 }
-            }
-        }
         return ENOENT;
     }
     ESRCH

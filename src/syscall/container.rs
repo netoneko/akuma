@@ -107,8 +107,7 @@ pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> u64 {
 
 pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, fstype_ptr: u64, fstype_len: usize) -> u64 {
     let caller_box = akuma_exec::process::current_process()
-        .map(|p| p.box_id)
-        .unwrap_or(0);
+        .map_or(0, |p| p.box_id);
     if caller_box != 0 {
         return EPERM;
     }

@@ -22,9 +22,7 @@ unsafe impl Hal for VirtioHal {
         let layout = Layout::from_size_align(pages * 4096, 4096).unwrap();
         let virt = unsafe { alloc_zeroed(layout) };
 
-        if virt.is_null() {
-            panic!("DMA allocation failed");
-        }
+        assert!(!virt.is_null(), "DMA allocation failed");
 
         // Convert virtual address to physical address for DMA
         let phys = virt_to_phys(virt as usize);
@@ -57,7 +55,7 @@ unsafe impl Hal for VirtioHal {
         _direction: virtio_drivers::BufferDirection,
     ) -> virtio_drivers::PhysAddr {
         // Convert virtual buffer address to physical for DMA
-        virt_to_phys(buffer.as_ptr() as *mut u8 as usize)
+        virt_to_phys(buffer.as_ptr().cast::<u8>() as usize)
     }
 
     unsafe fn unshare(

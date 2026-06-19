@@ -53,18 +53,15 @@ impl Command for ExecCommand {
 
             // Parse path and remaining args
             let (path_bytes, remaining_args) = split_first_word(args_trimmed);
-            let path = match core::str::from_utf8(path_bytes) {
-                Ok(s) => s.trim(),
-                Err(_) => {
-                    let _ = embedded_io_async::Write::write_all(stdout, b"Error: Invalid path\r\n")
-                        .await;
-                    return Ok(());
-                }
+            let path = if let Ok(s) = core::str::from_utf8(path_bytes) { s.trim() } else {
+                let _ = embedded_io_async::Write::write_all(stdout, b"Error: Invalid path\r\n")
+                    .await;
+                return Ok(());
             };
 
             // Parse remaining arguments (kernel adds argv[0] automatically)
             let arg_strings = parse_exec_args(remaining_args);
-            let arg_refs: Vec<&str> = arg_strings.iter().map(|s| s.as_str()).collect();
+            let arg_refs: Vec<&str> = arg_strings.iter().map(alloc::string::String::as_str).collect();
             let args_slice: Option<&[&str]> = if arg_refs.is_empty() { None } else { Some(&arg_refs) };
 
             // Check if user threads are available for process execution
@@ -94,7 +91,7 @@ impl Command for ExecCommand {
                     if exit_code != 0 {
                         let _ = embedded_io_async::Write::write_all(
                             stdout,
-                            format!("[exit code: {}]\r\n", exit_code).as_bytes(),
+                            format!("[exit code: {exit_code}]\r\n").as_bytes(),
                         )
                         .await;
                     }
@@ -102,7 +99,7 @@ impl Command for ExecCommand {
                 Err(e) => {
                     let _ = embedded_io_async::Write::write_all(
                         stdout,
-                        format!("Error: {}\r\n", e).as_bytes(),
+                        format!("Error: {e}\r\n").as_bytes(),
                     )
                     .await;
                 }
@@ -136,11 +133,10 @@ fn parse_exec_args(input: &[u8]) -> Vec<String> {
         }
     }
     
-    if !current.is_empty() {
-        if let Ok(s) = core::str::from_utf8(&current) {
+    if !current.is_empty()
+        && let Ok(s) = core::str::from_utf8(&current) {
             args.push(String::from(s));
         }
-    }
     
     args
 }

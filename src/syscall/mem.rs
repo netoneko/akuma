@@ -5,17 +5,17 @@ use super::*;
 // Lifted from `sys_mmap` to module scope so the same bits are used by both
 // `sys_mmap` and the diagnostic helpers below. Values match Linux AArch64.
 
-pub(crate) const MAP_SHARED: u32 = 0x01;
-pub(crate) const MAP_PRIVATE: u32 = 0x02;
-pub(crate) const MAP_FIXED: u32 = 0x10;
-pub(crate) const MAP_ANONYMOUS: u32 = 0x20;
-pub(crate) const MAP_NORESERVE: u32 = 0x4000;
-pub(crate) const MAP_POPULATE: u32 = 0x8000;
-pub(crate) const MAP_STACK: u32 = 0x20000; // hint-only on Linux; ignored here
-pub(crate) const MAP_FIXED_NOREPLACE: u32 = 0x100000;
+pub const MAP_SHARED: u32 = 0x01;
+pub const MAP_PRIVATE: u32 = 0x02;
+pub const MAP_FIXED: u32 = 0x10;
+pub const MAP_ANONYMOUS: u32 = 0x20;
+pub const MAP_NORESERVE: u32 = 0x4000;
+pub const MAP_POPULATE: u32 = 0x8000;
+pub const MAP_STACK: u32 = 0x20000; // hint-only on Linux; ignored here
+pub const MAP_FIXED_NOREPLACE: u32 = 0x100000;
 
-pub(crate) const PROT_NONE: u32 = 0;
-pub(crate) const PROT_WRITE: u32 = 0x2;
+pub const PROT_NONE: u32 = 0;
+pub const PROT_WRITE: u32 = 0x2;
 
 /// Writable `MAP_SHARED` file-backed mappings whose dirty pages must be flushed
 /// back to the backing file.
@@ -42,13 +42,13 @@ static SHARED_FILE_MAPPINGS: Spinlock<BTreeMap<(u32, usize), SharedFileMapping>>
 
 /// Copy `len` bytes from the resident pages at physical addresses `pas` back to
 /// `path`, starting at `file_offset`. Returns the number of bytes written.
-pub(crate) fn writeback_shared_pages(path: &str, file_offset: usize, len: usize, pas: &[usize]) -> usize {
+pub fn writeback_shared_pages(path: &str, file_offset: usize, len: usize, pas: &[usize]) -> usize {
     let mut off = file_offset;
     let mut written = 0usize;
     for (i, &pa) in pas.iter().enumerate() {
         let chunk = core::cmp::min(4096, len.saturating_sub(i * 4096));
         if chunk == 0 { break; }
-        let kva = akuma_exec::mmu::phys_to_virt(pa) as *const u8;
+        let kva = akuma_exec::mmu::phys_to_virt(pa).cast_const();
         let buf = unsafe { core::slice::from_raw_parts(kva, chunk) };
         match crate::fs::write_at(path, off, buf) {
             Ok(n) => { written += n; off += n; }
@@ -93,7 +93,7 @@ pub(super) fn flush_and_clear_shared_file_mappings(tgid: u32) {
 /// no-op (return success), matching Linux for clean/private ranges.
 pub(super) fn sys_msync(addr: usize, len: usize, _flags: u32) -> u64 {
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
     let proc = match akuma_exec::process::lookup_process(owner_pid) {
         Some(p) => p,
         None => return ESRCH,
@@ -125,7 +125,7 @@ pub(super) fn sys_msync(addr: usize, len: usize, _flags: u32) -> u64 {
 /// inputs so kernel tests can assert that errno-shaped argument values
 /// (e.g. crash14: `addr = 0xffffffffffffffea`) genuinely map to EINVAL when
 /// MAP_FIXED is set, and *do not* trip this branch when it is not.
-pub(crate) fn mmap_fixed_addr_unaligned_einval(addr: usize, flags: u32) -> bool {
+pub fn mmap_fixed_addr_unaligned_einval(addr: usize, flags: u32) -> bool {
     let is_fixed = (flags & MAP_FIXED) != 0;
     let is_fixed_noreplace = (flags & MAP_FIXED_NOREPLACE) != 0;
     (is_fixed || is_fixed_noreplace) && addr != 0 && (addr & 0xFFF) != 0
@@ -137,9 +137,9 @@ pub(crate) fn mmap_fixed_addr_unaligned_einval(addr: usize, flags: u32) -> bool 
 /// Same predicate as the in-line guard in `sys_mmap`; kept here so the
 /// diagnostic logger can derive a one-token reason hint without re-walking
 /// the syscall body.
-pub(crate) fn mmap_fixed_overlaps_kernel_va(addr: usize, len: usize) -> bool {
+pub fn mmap_fixed_overlaps_kernel_va(addr: usize, len: usize) -> bool {
     use akuma_exec::process::types::ProcessMemory;
-    let pages = (len + 4095) / 4096;
+    let pages = len.div_ceil(4096);
     let map_end = addr.saturating_add(pages * 4096);
     // kernel_va_end() scales with detected RAM so this guard catches MAP_FIXED
     // overlaps with the full RAM identity map, not just a fixed 2GB window.
@@ -148,7 +148,7 @@ pub(crate) fn mmap_fixed_overlaps_kernel_va(addr: usize, len: usize) -> bool {
 
 pub(super) fn sys_brk(new_brk: usize) -> u64 {
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
     if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
         if new_brk == 0 { proc.get_brk() as u64 } else { proc.set_brk(new_brk) as u64 }
     } else { 0 }
@@ -188,7 +188,7 @@ fn mmap_eager_to_lazy_fallback(
 
 pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usize) -> u64 {
     if len == 0 { return EINVAL; }
-    let pages = (len + 4095) / 4096;
+    let pages = len.div_ceil(4096);
     let page_flags = akuma_exec::mmu::user_flags::from_prot(prot);
 
     let _ = MAP_STACK; // silence unused-import lint; flag accepted but ignored
@@ -206,7 +206,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     }
 
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
     let proc = match akuma_exec::process::lookup_process(owner_pid) {
         Some(p) => p,
         None => return ESRCH,
@@ -230,17 +230,12 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             }
         }
         addr
-    } else {
-        match proc.memory.alloc_mmap(pages * 4096) {
-            Some(a) => a,
-            None => {
-                crate::safe_print!(192, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
-                    proc.pid, pages * 4096,
-                    proc.memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed),
-                    proc.memory.mmap_limit);
-                return ENOMEM;
-            }
-        }
+    } else if let Some(a) = proc.memory.alloc_mmap(pages * 4096) { a } else {
+        crate::safe_print!(192, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
+            proc.pid, pages * 4096,
+            proc.memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed),
+            proc.memory.mmap_limit);
+        return ENOMEM;
     };
 
     let is_file_backed = flags & MAP_ANONYMOUS == 0 && fd >= 0;
@@ -281,8 +276,8 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     // LazySource::File, same mechanism as demand-paged ELFs.
     // Writable MAP_SHARED is forced eager (see below) so its pages are all
     // resident for writeback; everything else may demand-page lazily.
-    if crate::config::MMAP_FILE_BACKED_LAZY && is_file_backed && !is_shared_writable {
-        if let Some(akuma_exec::process::FileDescriptor::File(ref f)) = proc.get_fd(fd as u32) {
+    if crate::config::MMAP_FILE_BACKED_LAZY && is_file_backed && !is_shared_writable
+        && let Some(akuma_exec::process::FileDescriptor::File(ref f)) = proc.get_fd(fd as u32) {
             let path = f.path.clone();
             let inode = crate::vfs::resolve_inode(&path).unwrap_or(0);
             let source = akuma_exec::process::LazySource::File {
@@ -298,7 +293,6 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 proc.pid, fd, &path, offset, len, mmap_addr, count);
             return mmap_addr as u64;
         }
-    }
 
     let initial_flags = if is_file_backed {
         akuma_exec::mmu::user_flags::RW_NO_EXEC
@@ -308,36 +302,33 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
 
     // Batch-allocate all pages in a single PMM lock acquisition, then map
     // them with no_flush and issue a single TLB flush after the loop.
-    let frame_batch = match crate::pmm::alloc_pages_zeroed(pages) {
-        Some(b) => b,
-        None => {
-            // The eager batch uses the *critical* allocator, which (unlike the
-            // demand-paging fault path) does not evict. Under memory pressure that
-            // makes a small eager mmap fail outright — userspace `new`/`malloc`
-            // then gets ENOMEM and aborts with std::bad_alloc. So mirror the fault
-            // path: evict clean file-backed pages (e.g. model weights mmap'd larger
-            // than RAM) and retry once.
-            let reclaimed = akuma_exec::process::reclaim_clean_file_pages(pages + crate::pmm::USER_PAGE_RESERVE);
-            if reclaimed > 0 {
-                if let Some(b) = crate::pmm::alloc_pages_zeroed(pages) {
-                    b
-                } else if is_shared_writable {
-                    // A writable MAP_SHARED mapping must stay eager so its pages are
-                    // tracked for writeback; the lazy fallback can't do that, so fail
-                    // rather than silently drop writes.
-                    return ENOMEM;
-                } else {
-                    // Still short of a contiguous eager batch: fall back to a lazy
-                    // (demand-paged) region, which always succeeds as a VA
-                    // reservation and faults in via the reclaim-aware path. Safe
-                    // for both anonymous and file-backed mappings.
-                    return mmap_eager_to_lazy_fallback(proc, is_file_backed, fd, offset, len, mmap_addr, pages, page_flags);
-                }
+    let frame_batch = if let Some(b) = crate::pmm::alloc_pages_zeroed(pages) { b } else {
+        // The eager batch uses the *critical* allocator, which (unlike the
+        // demand-paging fault path) does not evict. Under memory pressure that
+        // makes a small eager mmap fail outright — userspace `new`/`malloc`
+        // then gets ENOMEM and aborts with std::bad_alloc. So mirror the fault
+        // path: evict clean file-backed pages (e.g. model weights mmap'd larger
+        // than RAM) and retry once.
+        let reclaimed = akuma_exec::process::reclaim_clean_file_pages(pages + crate::pmm::USER_PAGE_RESERVE);
+        if reclaimed > 0 {
+            if let Some(b) = crate::pmm::alloc_pages_zeroed(pages) {
+                b
             } else if is_shared_writable {
+                // A writable MAP_SHARED mapping must stay eager so its pages are
+                // tracked for writeback; the lazy fallback can't do that, so fail
+                // rather than silently drop writes.
                 return ENOMEM;
             } else {
+                // Still short of a contiguous eager batch: fall back to a lazy
+                // (demand-paged) region, which always succeeds as a VA
+                // reservation and faults in via the reclaim-aware path. Safe
+                // for both anonymous and file-backed mappings.
                 return mmap_eager_to_lazy_fallback(proc, is_file_backed, fd, offset, len, mmap_addr, pages, page_flags);
             }
+        } else if is_shared_writable {
+            return ENOMEM;
+        } else {
+            return mmap_eager_to_lazy_fallback(proc, is_file_backed, fd, offset, len, mmap_addr, pages, page_flags);
         }
     };
     let _ = map_populate; // populate is now subsumed by the lazy fallback above
@@ -357,13 +348,13 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     akuma_exec::mmu::flush_tlb_range(mmap_addr, pages);
     if is_file_backed {
         if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
-            let path = f.path.clone();
+            let path = f.path;
             let mut file_off = offset;
             let mut bytes_read = 0usize;
-            for i in 0..pages {
+            for (i, frame) in frames.iter().enumerate().take(pages) {
                 let chunk = core::cmp::min(4096, len.saturating_sub(i * 4096));
                 if chunk == 0 { break; }
-                let page_kva = akuma_exec::mmu::phys_to_virt(frames[i].addr);
+                let page_kva = akuma_exec::mmu::phys_to_virt(frame.addr);
                 let page_buf = unsafe { core::slice::from_raw_parts_mut(page_kva, chunk) };
                 match crate::fs::read_at(&path, file_off, page_buf) {
                     Ok(n) => {
@@ -391,8 +382,8 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
 
     // Record writable MAP_SHARED file mappings so their pages get written back to
     // the file on munmap/msync/exit (Akuma has no shared page cache).
-    if is_shared_writable {
-        if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
+    if is_shared_writable
+        && let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
             SHARED_FILE_MAPPINGS.lock().insert(
                 (proc.tgid, mmap_addr),
                 SharedFileMapping { path: f.path.clone(), file_offset: offset, len },
@@ -400,7 +391,6 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             crate::tprint!(192, "[mmap] pid={} fd={} file={} off={} len=0x{:x} = 0x{:x} (shared-writable, writeback on)\n",
                 proc.pid, fd, &f.path, offset, len, mmap_addr);
         }
-    }
 
     proc.vm_with_regions(|r| r.push((mmap_addr, frames)));
 
@@ -415,8 +405,8 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
     let va_limit = user_va_limit() as usize;
     if old_addr >= va_limit { return EFAULT; }
 
-    let old_pages = (old_size + 4095) / 4096;
-    let new_pages = (new_size + 4095) / 4096;
+    let old_pages = old_size.div_ceil(4096);
+    let new_pages = new_size.div_ceil(4096);
 
     if new_pages <= old_pages {
         return old_addr as u64;
@@ -424,20 +414,19 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
 
     if flags & MREMAP_MAYMOVE == 0 {
         let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
-        let lazy_key = akuma_exec::process::lookup_process(owner_pid).map(|p| p.tgid).unwrap_or(owner_pid);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
+        let lazy_key = akuma_exec::process::lookup_process(owner_pid).map_or(owner_pid, |p| p.tgid);
         let is_mapped = akuma_exec::mmu::is_current_user_page_mapped(old_addr)
             || akuma_exec::process::lazy_region_lookup_for_pid(lazy_key, old_addr).is_some()
             || akuma_exec::process::lookup_process(owner_pid)
-                .map(|p| p.vm_with_regions(|r| r.iter().any(|(start, frames)| {
+                .is_some_and(|p| p.vm_with_regions(|r| r.iter().any(|(start, frames)| {
                     old_addr >= *start && old_addr < *start + frames.len() * 4096
-                })))
-                .unwrap_or(false);
+                })));
         return if is_mapped { ENOMEM } else { EFAULT };
     }
 
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
     let new_addr = match akuma_exec::process::lookup_process(owner_pid)
         .and_then(|p| p.memory.alloc_mmap(new_pages * 4096)) {
         Some(a) => a,
@@ -527,7 +516,7 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
             // Pre-fault pages in lazy regions that aren't yet mapped.
             // This is advisory; OOM during pre-faulting is silently ignored.
             let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
             let proc = match akuma_exec::process::lookup_process(owner_pid) {
                 Some(p) => p,
                 None => return 0,
@@ -539,13 +528,12 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
             let mut prefault: alloc::vec::Vec<(usize, u64)> = alloc::vec::Vec::new();
             let mut va = aligned_addr;
             while va < end {
-                if !akuma_exec::mmu::is_current_user_page_mapped(va) {
-                    if let Some((flags, _, _, _)) =
+                if !akuma_exec::mmu::is_current_user_page_mapped(va)
+                    && let Some((flags, _, _, _)) =
                         akuma_exec::process::lazy_region_lookup_for_pid(proc.tgid, va)
                     {
                         prefault.push((va, flags));
                     }
-                }
                 va += 4096;
             }
             if prefault.is_empty() {
@@ -573,7 +561,7 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
         }
         MADV_DONTNEED => {
             let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
             let proc = match akuma_exec::process::lookup_process(owner_pid) {
                 Some(p) => p,
                 None => return 0,
@@ -614,11 +602,11 @@ pub fn membarrier_cmd(cmd: u32) -> u64 {
 pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     if len == 0 { return 0; }
     if addr & 0xFFF != 0 { return EINVAL; }
-    let pages = (len + 4095) / 4096;
+    let pages = len.div_ceil(4096);
     let new_flags = akuma_exec::mmu::user_flags::from_prot(prot);
     let adding_exec = prot & 0x4 != 0;
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
     crate::tprint!(128, "[mprotect] pid={} owner={} addr=0x{:x} len=0x{:x} prot={:#x}\n",
         current_pid, owner_pid, addr, pages * 4096, prot);
     if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
@@ -665,7 +653,7 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
 
 pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map(|p| p.tgid).unwrap_or(current_pid);
+    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
     let proc = match akuma_exec::process::lookup_process(owner_pid) {
         Some(p) => p,
         None => return ESRCH,
@@ -755,11 +743,10 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
         let in_eager = proc.vm_with_regions(|r| r.iter().any(|(start, frames)| {
             va >= *start && va < *start + frames.len() * 4096
         }));
-        if !in_eager {
-            if let Some(frame) = proc.address_space.unmap_and_free_page_no_flush(va) {
+        if !in_eager
+            && let Some(frame) = proc.address_space.unmap_and_free_page_no_flush(va) {
                 crate::pmm::free_page(frame);
             }
-        }
     }
     // Some VAs in [addr, addr+unmap_len) may have been skipped (in_eager) or
     // never mapped, but flushing the whole span once is correct and cheaper

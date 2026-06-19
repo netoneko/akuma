@@ -19,18 +19,18 @@ mod container;
 pub mod pidfd;
 #[cfg(feature = "sc-eventfd")]
 pub mod eventfd;
-pub(crate) mod log;
+pub mod log;
 #[cfg(feature = "sc-sysv-ipc")]
-pub(crate) mod msgqueue;
+pub mod msgqueue;
 #[cfg(feature = "sc-framebuffer")]
 mod fb;
 pub mod fs;
-pub(crate) mod mem;
+pub mod mem;
 mod net;
 /// Boot self-test for the net bounce-buffer allocator (see `net::alloc_net_bounce`).
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-pub(crate) use net::run_net_bounce_tests;
-pub(crate) mod pipe;
+pub use net::run_net_bounce_tests;
+pub mod pipe;
 pub mod poll;
 pub mod proc;
 pub mod signal;
@@ -42,23 +42,23 @@ mod timerfd;
 
 pub use sync::futex_wake;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-pub(crate) use sync::futex_do_wake;
+pub use sync::futex_do_wake;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-pub(crate) use sync::futex_wait_at_tgid_for_test;
+pub use sync::futex_wait_at_tgid_for_test;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub use mem::membarrier_cmd;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-pub(crate) use fs::sys_close_range;
+pub use fs::sys_close_range;
 
 // Re-export the mmap alignment-EINVAL helper + the flag bits used by kernel
 // tests. `mod mem` is private; these wrappers keep the module boundary intact.
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-pub(crate) use mem::mmap_fixed_addr_unaligned_einval;
+pub use mem::mmap_fixed_addr_unaligned_einval;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-pub(crate) use mem::{MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE};
+pub use mem::{MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE};
 
 #[cfg(all(feature = "sc-epoll", not(any(feature = "no-tests", kernel_profile_size))))]
-pub(crate) fn epoll_wait_deadline_for_test(timeout: i32, start_time: u64, timeout_us: u64, now: u64) -> u64 {
+pub fn epoll_wait_deadline_for_test(timeout: i32, start_time: u64, timeout_us: u64, now: u64) -> u64 {
     poll::epoll_wait_deadline(timeout, start_time, timeout_us, now)
 }
 
@@ -402,8 +402,8 @@ const EINPROGRESS: u64 = (-115i64) as u64;
 /// Encode a positive `libc` errno value as the negated form expected on
 /// the AArch64 syscall ABI return register (`x0 = -errno`).
 #[inline]
-pub(crate) fn neg_errno(e: i32) -> u64 {
-    (-(e as i64)) as u64
+pub fn neg_errno(e: i32) -> u64 {
+    (-i64::from(e)) as u64
 }
 
 #[repr(C)]
@@ -414,7 +414,7 @@ struct Timespec {
 
 /// Exposed for kernel tests only.
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-pub(crate) fn user_va_limit_value() -> u64 {
+pub fn user_va_limit_value() -> u64 {
     user_va_limit()
 }
 
@@ -447,11 +447,10 @@ fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     // gracefully instead of panicking the kernel.
     if end > user_va_limit() { return false; }
 
-    if !akuma_exec::mmu::is_current_user_range_mapped(ptr as usize, len) {
-        if !ensure_user_pages_mapped(ptr as usize, len) {
+    if !akuma_exec::mmu::is_current_user_range_mapped(ptr as usize, len)
+        && !ensure_user_pages_mapped(ptr as usize, len) {
             return false;
         }
-    }
 
     true
 }
@@ -479,7 +478,7 @@ fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
                             let read_len = pg_data_end - pg_data_start;
                             let page_ptr = akuma_exec::mmu::phys_to_virt(page_frame.addr);
                             let page_buf = unsafe {
-                                core::slice::from_raw_parts_mut((page_ptr as *mut u8).add(dst_off), read_len)
+                                core::slice::from_raw_parts_mut(page_ptr.cast::<u8>().add(dst_off), read_len)
                             };
                             if inode != 0 {
                                 let _ = crate::vfs::read_at_by_inode(path, inode, file_off, page_buf);
@@ -522,7 +521,7 @@ fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
 /// Safely read a single byte from user memory.
 pub fn copy_from_user_byte(ptr: u64) -> Result<u8, u64> {
     let mut b: u8 = 0;
-    if unsafe { copy_from_user_safe(&mut b as *mut u8, ptr as *const u8, 1).is_err() } {
+    if unsafe { copy_from_user_safe(&raw mut b, ptr as *const u8, 1).is_err() } {
         return Err(EFAULT);
     }
     Ok(b)
@@ -530,9 +529,8 @@ pub fn copy_from_user_byte(ptr: u64) -> Result<u8, u64> {
 
 pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
     let limit = user_va_limit();
-    if !BYPASS_VALIDATION.load(Ordering::Acquire) {
-        if ptr < 0x1000 || ptr >= limit { return Err(EFAULT); }
-    }
+    if !BYPASS_VALIDATION.load(Ordering::Acquire)
+        && (ptr < 0x1000 || ptr >= limit) { return Err(EFAULT); }
     let mut bytes = Vec::new();
     let mut len = 0;
     while len < max_len {
@@ -550,12 +548,9 @@ pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
         return Err(EINVAL);
     }
     
-    match core::str::from_utf8(&bytes) {
-        Ok(s) => Ok(String::from(s)),
-        Err(_) => {
-            crate::safe_print!(64, "[syscall] copy_from_user_str: invalid UTF-8\n");
-            Err(EINVAL)
-        },
+    if let Ok(s) = core::str::from_utf8(&bytes) { Ok(String::from(s)) } else {
+        crate::safe_print!(64, "[syscall] copy_from_user_str: invalid UTF-8\n");
+        Err(EINVAL)
     }
 }
 
@@ -584,7 +579,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
 
     syscall_counters::inc_total();
     match syscall_num {
-        nr::MMAP => { syscall_counters::inc_mmap(((args[1] as usize) + 4095) / 4096); }
+        nr::MMAP => { syscall_counters::inc_mmap((args[1] as usize).div_ceil(4096)); }
         nr::MUNMAP => { syscall_counters::inc_munmap(); }
         nr::BRK => { syscall_counters::inc_brk(); }
         nr::READ | nr::READV | nr::PREAD64 => { syscall_counters::inc_read(); }
@@ -688,9 +683,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GET_CPU_STATS => term::sys_get_cpu_stats(args[0], args[1] as usize),
         nr::SPAWN_EXT => proc::sys_spawn_ext(args[0], args[1], args[2], args[3], args[4], args[5]),
         #[cfg(feature = "sc-containers")]
-        nr::REGISTER_BOX => container::sys_register_box(args[0] as u64, args[1], args[2] as usize, args[3], args[4] as usize, args[5] as u32),
+        nr::REGISTER_BOX => container::sys_register_box(args[0], args[1], args[2] as usize, args[3], args[4] as usize, args[5] as u32),
         #[cfg(feature = "sc-containers")]
-        nr::KILL_BOX => container::sys_kill_box(args[0] as u64),
+        nr::KILL_BOX => container::sys_kill_box(args[0]),
         #[cfg(feature = "sc-containers")]
         nr::REATTACH => container::sys_reattach(args[0] as u32),
         nr::SET_TID_ADDRESS => proc::sys_set_tid_address(args[0]),
@@ -780,7 +775,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             let param_ptr = args[1] as usize;
             if param_ptr != 0 && validate_user_ptr(param_ptr as u64, 4) {
                 let zero: i32 = 0;
-                let _ = unsafe { copy_to_user_safe(param_ptr as *mut u8, &zero as *const i32 as *const u8, 4) };
+                let _ = unsafe { copy_to_user_safe(param_ptr as *mut u8, (&raw const zero).cast::<u8>(), 4) };
             }
             0
         }
@@ -807,7 +802,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             if cpusetsize >= 8 && validate_user_ptr(mask_ptr as u64, cpusetsize) {
                 let mut kernel_mask = alloc::vec![0u8; cpusetsize];
                 if cpusetsize >= 8 {
-                    unsafe { core::ptr::write(kernel_mask.as_mut_ptr() as *mut u64, 1); }
+                    unsafe { core::ptr::write(kernel_mask.as_mut_ptr().cast::<u64>(), 1); }
                 }
                 let _ = unsafe { copy_to_user_safe(mask_ptr as *mut u8, kernel_mask.as_ptr(), cpusetsize) };
             }
@@ -866,7 +861,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         // Extended attributes syscalls (5-16) - return EOPNOTSUPP (95) on Linux
         // AArch64. Must be encoded as `x0 = -95` (0xffffffa9), never `!95`
         // which is `-96` (0xffffffa0 = EPFNOSUPPORT) and breaks musl/Go callers.
-        5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 => {
+        5..=16 => {
             // setxattr, lsetxattr, fsetxattr, getxattr, lgetxattr, fgetxattr
             // listxattr, llistxattr, flistxattr, removexattr, lremovexattr, fremovexattr
             neg_errno(95)
@@ -877,7 +872,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             ENOSYS
         }
         #[cfg(feature = "sc-containers")]
-        nr::MOUNT => container::sys_mount(args[0], args[1], args[2], args[3] as u64, args[4]),
+        nr::MOUNT => container::sys_mount(args[0], args[1], args[2], args[3], args[4]),
         #[cfg(feature = "sc-containers")]
         nr::UMOUNT2 => container::sys_umount2(args[0], args[1] as i32),
         #[cfg(feature = "sc-containers")]
@@ -898,11 +893,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     if need_timing {
         let elapsed = crate::timer::uptime_us().saturating_sub(t0);
         let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-        if track_time {
-            if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
+        if track_time
+            && let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
                 proc.syscall_stats.add_time_us(syscall_num, elapsed);
             }
-        }
         if crate::config::PROC_SYSCALL_LOG_ENABLED && owner_pid != 0 {
             log::record(owner_pid, syscall_num, t0, elapsed, result);
         }
@@ -964,7 +958,7 @@ struct ElrFmt(Option<u64>);
 impl core::fmt::Display for ElrFmt {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self.0 {
-            Some(v) => write!(f, "{:#x}", v),
+            Some(v) => write!(f, "{v:#x}"),
             None => f.write_str("?"),
         }
     }
@@ -987,7 +981,7 @@ impl core::fmt::Display for MmapFlagsFmt {
             (mem::MAP_FIXED_NOREPLACE, "FIXED_NOREPLACE"),
         ];
         let mut first = true;
-        for (bit, name) in entries.iter() {
+        for (bit, name) in &entries {
             if flags & *bit != 0 {
                 if !first { f.write_str("|")?; }
                 f.write_str(name)?;

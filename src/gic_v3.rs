@@ -215,7 +215,7 @@ pub fn acknowledge_irq() -> Option<u32> {
 
 /// Signal end of interrupt handling for `irq`.
 pub fn end_of_interrupt(irq: u32) {
-    write_sysreg!("S3_0_C12_C12_1", irq as u64); // ICC_EOIR1_EL1
+    write_sysreg!("S3_0_C12_C12_1", u64::from(irq)); // ICC_EOIR1_EL1
     let _ = ICC_EOIR1_EL1;
 }
 
@@ -226,7 +226,7 @@ pub fn trigger_sgi(sgi_id: u32) {
     }
     // ICC_SGI1R_EL1: IRM=0 (use target list), Aff3/2/1 = 0, INTID at [27:24],
     // TargetList bit 0 selects affinity-0 PE 0 (this CPU).
-    let val = ((sgi_id as u64) << 24) | 1;
+    let val = (u64::from(sgi_id) << 24) | 1;
     write_sysreg!("S3_0_C12_C11_5", val);
     let _ = ICC_SGI1R_EL1;
     dsb_ish();
@@ -245,7 +245,7 @@ pub fn set_priority(irq: u32, priority: u8) {
     let addr = mmu::DEV_GICR_SGI_VA + gicr_sgi::IPRIORITYR + irq as usize;
     // SAFETY: `addr` is a device-mapped GIC MMIO register.
     unsafe {
-        core::arch::asm!("strb {v:w}, [{a}]", v = in(reg) priority as u32, a = in(reg) addr,
+        core::arch::asm!("strb {v:w}, [{a}]", v = in(reg) u32::from(priority), a = in(reg) addr,
             options(nostack, preserves_flags));
     }
 }

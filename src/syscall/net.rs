@@ -26,7 +26,7 @@ const NET_BOUNCE_MAX: usize = 64 * 1024;
 ///      count and the caller loops — always-legal short read/write semantics);
 ///   3. if even one page can't be had, return `None` → the caller reports
 ///      ENOMEM instead of taking down the kernel.
-pub(crate) fn alloc_net_bounce(want: usize) -> Option<alloc::vec::Vec<u8>> {
+pub fn alloc_net_bounce(want: usize) -> Option<alloc::vec::Vec<u8>> {
     for size in net_bounce_size_plan(want) {
         let mut v = alloc::vec::Vec::<u8>::new();
         if v.try_reserve_exact(size).is_ok() {
@@ -43,8 +43,8 @@ pub(crate) fn alloc_net_bounce(want: usize) -> Option<alloc::vec::Vec<u8>> {
 /// without draining real RAM. Both entries are `>= 1` so an empty request
 /// still yields a usable (zero-length-after-truncation) buffer rather than a
 /// zero-capacity `try_reserve_exact` that the caller can't short-read into.
-pub(crate) fn net_bounce_size_plan(want: usize) -> [usize; 2] {
-    let full = want.min(NET_BOUNCE_MAX).max(1);
+pub fn net_bounce_size_plan(want: usize) -> [usize; 2] {
+    let full = want.clamp(1, NET_BOUNCE_MAX);
     let single_page = 4096usize.min(full);
     [full, single_page]
 }
@@ -67,7 +67,7 @@ pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
                 proc.set_nonblock(fd);
             }
             crate::safe_print!(96, "[syscall] socket(type={}) = fd {}\n", if base_type == 2 { "UDP" } else { "TCP" }, fd);
-            return fd as u64;
+            return u64::from(fd);
         }
         // Process gone between alloc_socket and current_process.
         return ESRCH;
@@ -123,7 +123,7 @@ pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: u
     }
 
     let fds = [fd0 as i32, fd1 as i32];
-    if unsafe { copy_to_user_safe(sv_ptr as *mut u8, fds.as_ptr() as *const u8, 8).is_err() } {
+    if unsafe { copy_to_user_safe(sv_ptr as *mut u8, fds.as_ptr().cast::<u8>(), 8).is_err() } {
         // Roll back so we don't leak fds or pipe slots. Closing both directions
         // of each pipe drives its ref counts to zero and destroys it.
         proc.remove_fd(fd0);
@@ -147,7 +147,7 @@ pub(super) fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
     let mut sa = SockAddrIn::default();
     let copy_len = len.min(core::mem::size_of::<SockAddrIn>());
-    if unsafe { copy_from_user_safe(&mut sa as *mut SockAddrIn as *mut u8, addr_ptr as *const u8, copy_len).is_err() } {
+    if unsafe { copy_from_user_safe((&raw mut sa).cast::<u8>(), addr_ptr as *const u8, copy_len).is_err() } {
         return EFAULT;
     }
     let addr = sa.to_addr();
@@ -192,9 +192,9 @@ pub(super) fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
             };
             if addr_ptr != 0 {
                 let sa = SockAddrIn::from_addr(&addr);
-                let _ = unsafe { copy_to_user_safe(addr_ptr as *mut u8, &sa as *const SockAddrIn as *const u8, core::mem::size_of::<SockAddrIn>()) };
+                let _ = unsafe { copy_to_user_safe(addr_ptr as *mut u8, (&raw const sa).cast::<u8>(), core::mem::size_of::<SockAddrIn>()) };
             }
-            proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx)) as u64
+            u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx)))
         }
         Err(e) => neg_errno(e),
     }
@@ -216,14 +216,14 @@ pub(super) fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u
             };
             if addr_ptr != 0 {
                 let sa = SockAddrIn::from_addr(&addr);
-                let _ = unsafe { copy_to_user_safe(addr_ptr as *mut u8, &sa as *const SockAddrIn as *const u8, core::mem::size_of::<SockAddrIn>()) };
+                let _ = unsafe { copy_to_user_safe(addr_ptr as *mut u8, (&raw const sa).cast::<u8>(), core::mem::size_of::<SockAddrIn>()) };
             }
             let new_fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx));
             const SOCK_CLOEXEC: u32 = 0x80000;
             const SOCK_NONBLOCK: u32 = 0x800;
             if flags & SOCK_CLOEXEC != 0 { proc.set_cloexec(new_fd); }
             if flags & SOCK_NONBLOCK != 0 { proc.set_nonblock(new_fd); }
-            new_fd as u64
+            u64::from(new_fd)
         }
         Err(e) => neg_errno(e),
     }
@@ -234,7 +234,7 @@ pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
     let mut sa = SockAddrIn::default();
     let copy_len = len.min(core::mem::size_of::<SockAddrIn>());
-    if unsafe { copy_from_user_safe(&mut sa as *mut SockAddrIn as *mut u8, addr_ptr as *const u8, copy_len).is_err() } {
+    if unsafe { copy_from_user_safe((&raw mut sa).cast::<u8>(), addr_ptr as *const u8, copy_len).is_err() } {
         return EFAULT;
     }
     let addr = sa.to_addr();
@@ -276,11 +276,11 @@ pub(super) fn sys_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
         sin_zero: [0u8; 8],
     };
     if validate_user_ptr(addr_ptr, core::mem::size_of::<SockAddrIn>()) {
-        if unsafe { copy_to_user_safe(addr_ptr as *mut u8, &sa as *const SockAddrIn as *const u8, core::mem::size_of::<SockAddrIn>()).is_err() } {
+        if unsafe { copy_to_user_safe(addr_ptr as *mut u8, (&raw const sa).cast::<u8>(), core::mem::size_of::<SockAddrIn>()).is_err() } {
             return EFAULT;
         }
         let out_len = core::mem::size_of::<SockAddrIn>() as u32;
-        if unsafe { copy_to_user_safe(len_ptr as *mut u8, &out_len as *const u32 as *const u8, 4).is_err() } {
+        if unsafe { copy_to_user_safe(len_ptr as *mut u8, (&raw const out_len).cast::<u8>(), 4).is_err() } {
             return EFAULT;
         }
     }
@@ -324,11 +324,11 @@ pub(super) fn sys_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
                 sin_zero: [0u8; 8],
             };
             if validate_user_ptr(addr_ptr, core::mem::size_of::<SockAddrIn>()) {
-                if unsafe { copy_to_user_safe(addr_ptr as *mut u8, &sa as *const SockAddrIn as *const u8, core::mem::size_of::<SockAddrIn>()).is_err() } {
+                if unsafe { copy_to_user_safe(addr_ptr as *mut u8, (&raw const sa).cast::<u8>(), core::mem::size_of::<SockAddrIn>()).is_err() } {
                     return EFAULT;
                 }
                 let out_len = core::mem::size_of::<SockAddrIn>() as u32;
-                if unsafe { copy_to_user_safe(len_ptr as *mut u8, &out_len as *const u32 as *const u8, 4).is_err() } {
+                if unsafe { copy_to_user_safe(len_ptr as *mut u8, (&raw const out_len).cast::<u8>(), 4).is_err() } {
                     return EFAULT;
                 }
             }
@@ -341,7 +341,7 @@ pub(super) fn sys_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
 pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_addr: u64, addr_len: usize) -> u64 {
     // AF_UNIX socketpair endpoint: send == write to the tx pipe.
     if fd_is_unix_socket(fd) {
-        return super::fs::sys_write(fd as u64, buf_ptr, len);
+        return super::fs::sys_write(u64::from(fd), buf_ptr, len);
     }
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
     let mut kernel_buf = match alloc_net_bounce(len) {
@@ -364,7 +364,7 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
             if !validate_user_ptr(dest_addr, addr_len) { return EFAULT; }
             let mut sa = SockAddrIn::default();
             let sa_copy_len = addr_len.min(core::mem::size_of::<SockAddrIn>());
-            if unsafe { copy_from_user_safe(&mut sa as *mut SockAddrIn as *mut u8, dest_addr as *const u8, sa_copy_len).is_err() } {
+            if unsafe { copy_from_user_safe((&raw mut sa).cast::<u8>(), dest_addr as *const u8, sa_copy_len).is_err() } {
                 return EFAULT;
             }
             let a = sa.to_addr();
@@ -406,7 +406,7 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
 pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_addr: u64, addr_len_ptr: u64) -> u64 {
     // AF_UNIX socketpair endpoint: recv == read from the rx pipe.
     if fd_is_unix_socket(fd) {
-        return super::fs::sys_read(fd as u64, buf_ptr, len);
+        return super::fs::sys_read(u64::from(fd), buf_ptr, len);
     }
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
     let mut kernel_buf = match alloc_net_bounce(len) {
@@ -433,16 +433,15 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
                 if unsafe { copy_to_user_safe(buf_ptr as *mut u8, kernel_buf.as_ptr(), n).is_err() } {
                     return EFAULT;
                 }
-                if src_addr != 0 && addr_len_ptr != 0 {
-                    if validate_user_ptr(src_addr, core::mem::size_of::<SockAddrIn>())
+                if src_addr != 0 && addr_len_ptr != 0
+                    && validate_user_ptr(src_addr, core::mem::size_of::<SockAddrIn>())
                         && validate_user_ptr(addr_len_ptr, core::mem::size_of::<u32>())
                     {
                         let sa = SockAddrIn::from_addr(&from);
-                        let _ = unsafe { copy_to_user_safe(src_addr as *mut u8, &sa as *const SockAddrIn as *const u8, core::mem::size_of::<SockAddrIn>()) };
+                        let _ = unsafe { copy_to_user_safe(src_addr as *mut u8, (&raw const sa).cast::<u8>(), core::mem::size_of::<SockAddrIn>()) };
                         let out_len = core::mem::size_of::<SockAddrIn>() as u32;
-                        let _ = unsafe { copy_to_user_safe(addr_len_ptr as *mut u8, &out_len as *const u32 as *const u8, 4) };
+                        let _ = unsafe { copy_to_user_safe(addr_len_ptr as *mut u8, (&raw const out_len).cast::<u8>(), 4) };
                     }
-                }
                 n as u64
             }
             Err(e) => {
@@ -499,11 +498,10 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
 
     // Read the value if provided
     let mut val: i32 = 0;
-    if optval != 0 && optlen >= 4 && validate_user_ptr(optval, 4) {
-        if unsafe { copy_from_user_safe(&mut val as *mut i32 as *mut u8, optval as *const u8, 4).is_err() } {
+    if optval != 0 && optlen >= 4 && validate_user_ptr(optval, 4)
+        && unsafe { copy_from_user_safe((&raw mut val).cast::<u8>(), optval as *const u8, 4).is_err() } {
             return EFAULT;
         }
-    }
 
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
@@ -571,7 +569,7 @@ pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
     if optval == 0 || optlen == 0 { return 0; }
     if !validate_user_ptr(optlen, 4) { return EFAULT; }
     let mut len: u32 = 0;
-    if unsafe { copy_from_user_safe(&mut len as *mut u32 as *mut u8, optlen as *const u8, 4).is_err() } {
+    if unsafe { copy_from_user_safe((&raw mut len).cast::<u8>(), optlen as *const u8, 4).is_err() } {
         return EFAULT;
     }
     if (len as usize) < 4 || !validate_user_ptr(optval, 4) { return EFAULT; }
@@ -611,11 +609,11 @@ pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
         0
     };
 
-    if unsafe { copy_to_user_safe(optval as *mut u8, &val as *const i32 as *const u8, 4).is_err() } {
+    if unsafe { copy_to_user_safe(optval as *mut u8, (&raw const val).cast::<u8>(), 4).is_err() } {
         return EFAULT;
     }
     let out_len: u32 = 4;
-    if unsafe { copy_to_user_safe(optlen as *mut u8, &out_len as *const u32 as *const u8, 4).is_err() } {
+    if unsafe { copy_to_user_safe(optlen as *mut u8, (&raw const out_len).cast::<u8>(), 4).is_err() } {
         return EFAULT;
     }
     0
@@ -638,7 +636,7 @@ struct MsgHdr {
 pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     if !validate_user_ptr(msg_ptr, core::mem::size_of::<MsgHdr>()) { return EFAULT; }
     let mut msg = MsgHdr::default();
-    if unsafe { copy_from_user_safe(&mut msg as *mut MsgHdr as *mut u8, msg_ptr as *const u8, core::mem::size_of::<MsgHdr>()).is_err() } {
+    if unsafe { copy_from_user_safe((&raw mut msg).cast::<u8>(), msg_ptr as *const u8, core::mem::size_of::<MsgHdr>()).is_err() } {
         return EFAULT;
     }
 
@@ -646,7 +644,7 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     let iov_size = msg.msg_iovlen as usize * core::mem::size_of::<super::fs::IoVec>();
     if !validate_user_ptr(msg.msg_iov, iov_size) { return EFAULT; }
     let mut iovs = alloc::vec![super::fs::IoVec { iov_base: 0, iov_len: 0 }; msg.msg_iovlen as usize];
-    if unsafe { copy_from_user_safe(iovs.as_mut_ptr() as *mut u8, msg.msg_iov as *const u8, iov_size).is_err() } {
+    if unsafe { copy_from_user_safe(iovs.as_mut_ptr().cast::<u8>(), msg.msg_iov as *const u8, iov_size).is_err() } {
         return EFAULT;
     }
 
@@ -657,7 +655,7 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     // AF_UNIX socketpair endpoint: sendmsg == write the first iovec to the tx
     // pipe. (libstd's handshake uses a single small message.)
     if fd_is_unix_socket(fd) {
-        return super::fs::sys_write(fd as u64, iov.iov_base, iov.iov_len as usize);
+        return super::fs::sys_write(u64::from(fd), iov.iov_base, iov.iov_len as usize);
     }
 
     let mut kernel_buf = match alloc_net_bounce(iov.iov_len) {
@@ -677,7 +675,7 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         let dest = if msg.msg_name != 0 && msg.msg_namelen >= 16 {
             if !validate_user_ptr(msg.msg_name, msg.msg_namelen as usize) { return EFAULT; }
             let mut sa = SockAddrIn::default();
-            let _ = unsafe { copy_from_user_safe(&mut sa as *mut SockAddrIn as *mut u8, msg.msg_name as *const u8, 16) };
+            let _ = unsafe { copy_from_user_safe((&raw mut sa).cast::<u8>(), msg.msg_name as *const u8, 16) };
             sa.to_addr()
         } else {
             match socket::udp_default_peer(idx) {
@@ -707,7 +705,7 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
 pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     if !validate_user_ptr(msg_ptr, core::mem::size_of::<MsgHdr>()) { return EFAULT; }
     let mut msg = MsgHdr::default();
-    if unsafe { copy_from_user_safe(&mut msg as *mut MsgHdr as *mut u8, msg_ptr as *const u8, core::mem::size_of::<MsgHdr>()).is_err() } {
+    if unsafe { copy_from_user_safe((&raw mut msg).cast::<u8>(), msg_ptr as *const u8, core::mem::size_of::<MsgHdr>()).is_err() } {
         return EFAULT;
     }
 
@@ -715,7 +713,7 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     let iov_size = msg.msg_iovlen as usize * core::mem::size_of::<super::fs::IoVec>();
     if !validate_user_ptr(msg.msg_iov, iov_size) { return EFAULT; }
     let mut iovs = alloc::vec![super::fs::IoVec { iov_base: 0, iov_len: 0 }; msg.msg_iovlen as usize];
-    if unsafe { copy_from_user_safe(iovs.as_mut_ptr() as *mut u8, msg.msg_iov as *const u8, iov_size).is_err() } {
+    if unsafe { copy_from_user_safe(iovs.as_mut_ptr().cast::<u8>(), msg.msg_iov as *const u8, iov_size).is_err() } {
         return EFAULT;
     }
 
@@ -727,11 +725,11 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     // rx pipe. (libstd's handshake uses a single small message.) On success,
     // clear the ancillary/flags fields and write the header back.
     if fd_is_unix_socket(fd) {
-        let n = super::fs::sys_read(fd as u64, iov.iov_base, iov.iov_len as usize);
+        let n = super::fs::sys_read(u64::from(fd), iov.iov_base, iov.iov_len as usize);
         if (n as i64) >= 0 {
             msg.msg_controllen = 0;
             msg.msg_flags = 0;
-            let _ = unsafe { copy_to_user_safe(msg_ptr as *mut u8, &msg as *const MsgHdr as *const u8, core::mem::size_of::<MsgHdr>()) };
+            let _ = unsafe { copy_to_user_safe(msg_ptr as *mut u8, (&raw const msg).cast::<u8>(), core::mem::size_of::<MsgHdr>()) };
         }
         return n;
     }
@@ -761,17 +759,16 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
                 if unsafe { copy_to_user_safe(iov.iov_base as *mut u8, kernel_buf.as_ptr(), n).is_err() } {
                     return EFAULT;
                 }
-                if msg.msg_name != 0 && msg.msg_namelen >= core::mem::size_of::<SockAddrIn>() as u32 {
-                    if validate_user_ptr(msg.msg_name, core::mem::size_of::<SockAddrIn>()) {
+                if msg.msg_name != 0 && msg.msg_namelen >= core::mem::size_of::<SockAddrIn>() as u32
+                    && validate_user_ptr(msg.msg_name, core::mem::size_of::<SockAddrIn>()) {
                         let sa = SockAddrIn::from_addr(&from);
-                        let _ = unsafe { copy_to_user_safe(msg.msg_name as *mut u8, &sa as *const SockAddrIn as *const u8, core::mem::size_of::<SockAddrIn>()) };
+                        let _ = unsafe { copy_to_user_safe(msg.msg_name as *mut u8, (&raw const sa).cast::<u8>(), core::mem::size_of::<SockAddrIn>()) };
                         msg.msg_namelen = core::mem::size_of::<SockAddrIn>() as u32;
                     }
-                }
                 msg.msg_controllen = 0;
                 msg.msg_flags = 0;
                 // Copy msg back to user
-                let _ = unsafe { copy_to_user_safe(msg_ptr as *mut u8, &msg as *const MsgHdr as *const u8, core::mem::size_of::<MsgHdr>()) };
+                let _ = unsafe { copy_to_user_safe(msg_ptr as *mut u8, (&raw const msg).cast::<u8>(), core::mem::size_of::<MsgHdr>()) };
                 n as u64
             }
             Err(e) => {
@@ -792,7 +789,7 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
                 }
                 msg.msg_controllen = 0;
                 msg.msg_flags = 0;
-                let _ = unsafe { copy_to_user_safe(msg_ptr as *mut u8, &msg as *const MsgHdr as *const u8, core::mem::size_of::<MsgHdr>()) };
+                let _ = unsafe { copy_to_user_safe(msg_ptr as *mut u8, (&raw const msg).cast::<u8>(), core::mem::size_of::<MsgHdr>()) };
                 // Reset EPOLLET edge — BoringSSL reads one TLS record at a time without
                 // draining to EAGAIN, so we reset after every successful read.
                 super::poll::epoll_on_fd_drained(fd);
@@ -817,7 +814,7 @@ pub(super) fn get_socket_from_fd(fd: u32) -> Option<usize> {
 }
 
 pub(super) fn fd_is_nonblock(fd: u32) -> bool {
-    akuma_exec::process::current_process().map_or(false, |p| p.is_nonblock(fd))
+    akuma_exec::process::current_process().is_some_and(|p| p.is_nonblock(fd))
 }
 
 /// True if `fd` is one endpoint of an AF_UNIX socketpair (backed by two kernel
@@ -828,7 +825,7 @@ pub(super) fn fd_is_nonblock(fd: u32) -> bool {
 /// path and surfaced as `the CLOEXEC pipe failed: … Bad file descriptor`
 /// (docs/RUST_TOOLCHAIN.md §4d).
 pub(super) fn fd_is_unix_socket(fd: u32) -> bool {
-    akuma_exec::process::current_process().map_or(false, |p| {
+    akuma_exec::process::current_process().is_some_and(|p| {
         matches!(p.get_fd(fd), Some(akuma_exec::process::FileDescriptor::UnixSocket { .. }))
     })
 }
@@ -968,7 +965,7 @@ pub(super) fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> 
 /// `handle_alloc_error` → `brk #1`). The fix allocates *fallibly* and backs
 /// off to a single page, then to ENOMEM — never aborting.
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-pub(crate) fn run_net_bounce_tests() {
+pub fn run_net_bounce_tests() {
     // --- Pure size-plan boundaries (no RAM touched) ---
     // Empty request still yields a >=1-byte plan (never a zero-cap reserve).
     assert_eq!(net_bounce_size_plan(0), [1, 1],

@@ -56,12 +56,11 @@ pub fn clear_spawn_namespace() {
 #[cfg(feature = "sc-containers")]
 pub fn create_box_namespace(box_id: u64, root_dir: &str) -> Arc<Namespace> {
     let ns = Arc::new(Namespace::new(box_id));
-    if root_dir != "/" {
-        if let Some(root_fs) = get_root_fs() {
+    if root_dir != "/"
+        && let Some(root_fs) = get_root_fs() {
             let subdir = Arc::new(akuma_isolation::subdir_fs::SubdirFs::new(root_fs, root_dir));
             let _ = ns.mount.lock().mount("/", subdir);
         }
-    }
     BOX_NAMESPACES.lock().insert(box_id, ns.clone());
     ns
 }
@@ -106,7 +105,7 @@ fn normalize_path_owned(path: &str) -> String {
     if trimmed.is_empty() {
         String::from("/")
     } else if !trimmed.starts_with('/') {
-        format!("/{}", trimmed)
+        format!("/{trimmed}")
     } else {
         String::from(trimmed)
     }
@@ -396,21 +395,20 @@ pub fn read_symlink(path: &str) -> Option<String> {
 
 pub fn is_symlink(path: &str) -> bool {
     // Try on-disk first
-    if let Ok(result) = with_fs(path, |fs, rel| Ok(fs.is_symlink(rel))) {
-        if result {
+    if let Ok(result) = with_fs(path, |fs, rel| Ok(fs.is_symlink(rel)))
+        && result {
             return true;
         }
-    }
     // Fallback to in-memory table
     let canonical = canonicalize_path(path);
     let table = SYMLINKS.lock();
-    table.as_ref().map_or(false, |t| t.contains_key(&canonical))
+    table.as_ref().is_some_and(|t| t.contains_key(&canonical))
 }
 
 pub fn remove_symlink(path: &str) -> bool {
     let canonical = canonicalize_path(path);
     let mut table = SYMLINKS.lock();
-    table.as_mut().map_or(false, |t| t.remove(&canonical).is_some())
+    table.as_mut().is_some_and(|t| t.remove(&canonical).is_some())
 }
 
 /// Resolve a path, following symlinks (up to 8 levels to prevent loops)
@@ -418,22 +416,19 @@ pub fn resolve_symlinks(path: &str) -> String {
     let mut resolved = canonicalize_path(path);
     for _ in 0..8 {
         let target = read_symlink(&resolved);
-        match target {
-            Some(t) => {
-                if t.starts_with('/') {
-                    resolved = canonicalize_path(&t);
-                } else {
-                    let (parent, _) = split_path(&resolved);
-                    resolved = resolve_path(parent, &t);
-                }
+        if let Some(t) = target {
+            if t.starts_with('/') {
+                resolved = canonicalize_path(&t);
+            } else {
+                let (parent, _) = split_path(&resolved);
+                resolved = resolve_path(parent, &t);
             }
-            None => {
-                if resolved == "/bin/sh" && crate::fs::exists("/bin/dash") {
-                    resolved = String::from("/bin/dash");
-                    continue;
-                }
-                break;
+        } else {
+            if resolved == "/bin/sh" && crate::fs::exists("/bin/dash") {
+                resolved = String::from("/bin/dash");
+                continue;
             }
+            break;
         }
     }
     resolved

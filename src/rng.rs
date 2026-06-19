@@ -98,10 +98,10 @@ pub enum RngError {
 impl core::fmt::Display for RngError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            RngError::NotFound => write!(f, "RNG device not found"),
-            RngError::NotInitialized => write!(f, "RNG device not initialized"),
-            RngError::ReadError => write!(f, "Failed to read random bytes"),
-            RngError::TransportError => write!(f, "VirtIO transport error"),
+            Self::NotFound => write!(f, "RNG device not found"),
+            Self::NotInitialized => write!(f, "RNG device not initialized"),
+            Self::ReadError => write!(f, "Failed to read random bytes"),
+            Self::TransportError => write!(f, "VirtIO transport error"),
         }
     }
 }
@@ -216,13 +216,10 @@ impl VirtioRngDevice {
         // so fail loud and early rather than limping into a later networking panic
         // ("RNG required for networking"). See docs/VIRTIO_MMIO_LEGACY_TO_MODERN.md.
         let version = unsafe { read_volatile((base_addr + VIRTIO_MMIO_VERSION) as *const u32) };
-        if version != 2 {
-            panic!(
-                "[RNG] virtio-rng MMIO version {} unsupported; modern v2 required \
-                 (is virtio-mmio.force-legacy set in the QEMU runner?)",
-                version
-            );
-        }
+        assert!(version == 2, 
+            "[RNG] virtio-rng MMIO version {version} unsupported; modern v2 required \
+             (is virtio-mmio.force-legacy set in the QEMU runner?)"
+        );
 
         // Reset the device
         unsafe {
@@ -320,9 +317,9 @@ impl VirtioRngDevice {
             return Err(RngError::TransportError);
         }
 
-        let desc = unsafe { queue_mem.add(desc_offset) } as *mut VirtqDesc;
-        let avail = unsafe { queue_mem.add(avail_offset) } as *mut VirtqAvail;
-        let used = unsafe { queue_mem.add(used_offset) } as *mut VirtqUsed;
+        let desc = unsafe { queue_mem.add(desc_offset) }.cast::<VirtqDesc>();
+        let avail = unsafe { queue_mem.add(avail_offset) }.cast::<VirtqAvail>();
+        let used = unsafe { queue_mem.add(used_offset) }.cast::<VirtqUsed>();
 
         // Program the queue with three independent 64-bit physical addresses,
         // then mark it ready.
@@ -447,7 +444,7 @@ impl VirtioRngDevice {
 
             loop {
                 fence(Ordering::SeqCst);
-                let used_idx = unsafe { read_volatile(&(*self.used).idx) };
+                let used_idx = unsafe { read_volatile(&raw const (*self.used).idx) };
                 if used_idx != self.last_used_idx {
                     break;
                 }
@@ -464,7 +461,7 @@ impl VirtioRngDevice {
             self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
             // Check that the device returned our descriptor
-            if used_elem.id != desc_idx as u32 {
+            if used_elem.id != u32::from(desc_idx) {
                 return Err(RngError::ReadError);
             }
 
@@ -539,7 +536,6 @@ pub fn init() -> Result<(), RngError> {
             Err(e) => {
                 log("[RNG] Failed to init virtio device: ");
                 crate::safe_print!(32, "{}\n", e);
-                continue;
             }
         }
     }

@@ -38,8 +38,7 @@ fn test_block_on_uses_yield_now() {
         .expect("ssh/server.rs must define block_on");
     let block_on_end = SERVER_SRC[block_on_start..]
         .find("\nfn ")
-        .map(|off| block_on_start + off)
-        .unwrap_or(SERVER_SRC.len());
+        .map_or(SERVER_SRC.len(), |off| block_on_start + off);
     let body = &SERVER_SRC[block_on_start..block_on_end];
 
     let mut found_yield = false;
@@ -57,8 +56,7 @@ fn test_block_on_uses_yield_now() {
         assert!(
             !code.contains("schedule_blocking("),
             "ssh/server.rs::block_on must NOT call schedule_blocking(); \
-             see SSH_STAGGERING.md and audit finding D2. Offending line: {:?}",
-            raw_line
+             see SSH_STAGGERING.md and audit finding D2. Offending line: {raw_line:?}"
         );
         if code.contains("yield_now(") {
             found_yield = true;
@@ -242,8 +240,7 @@ fn test_poll_entered_exited_balanced() {
     assert_eq!(
         in1 - in0,
         out1 - out0,
-        "POLL_ENTERED/EXITED must move in lockstep across normal polls (in: {} → {}, out: {} → {})",
-        in0, in1, out0, out1,
+        "POLL_ENTERED/EXITED must move in lockstep across normal polls (in: {in0} → {in1}, out: {out0} → {out1})",
     );
     assert!(in1 >= in0 + 4, "expected at least 4 polls (in0={in0} in1={in1})");
 
@@ -263,8 +260,7 @@ fn test_exec_handler_no_debug_string() {
         .expect("protocol.rs must define handle_exec");
     let handle_exec_end = PROTO_SRC[handle_exec_start..]
         .find("\nasync fn ")
-        .map(|off| handle_exec_start + off)
-        .unwrap_or(PROTO_SRC.len());
+        .map_or(PROTO_SRC.len(), |off| handle_exec_start + off);
     let body = &PROTO_SRC[handle_exec_start..handle_exec_end];
 
     for raw_line in body.lines() {
@@ -279,8 +275,7 @@ fn test_exec_handler_no_debug_string() {
         assert!(
             !code.contains("[DEBUG]"),
             "handle_exec must not emit [DEBUG] strings; \
-             see STABILITY_URGENT_ISSUES.md Issue #6. Offending line: {:?}",
-            raw_line
+             see STABILITY_URGENT_ISSUES.md Issue #6. Offending line: {raw_line:?}"
         );
     }
 
@@ -325,8 +320,7 @@ fn test_streaming_exec_survives_stdin_eof() {
         .expect("shell/mod.rs must define execute_external_interactive");
     let end = SHELL_SRC[start..]
         .find("\npub async fn ")
-        .map(|off| start + off)
-        .unwrap_or(SHELL_SRC.len());
+        .map_or(SHELL_SRC.len(), |off| start + off);
     let body = &SHELL_SRC[start..end];
 
     assert!(

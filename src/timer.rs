@@ -69,8 +69,8 @@ pub fn timer_irq_handler(_irq: u32) {
     crate::kernel_timer::on_timer_interrupt();
 
     // Check preemption watchdog - detect threads that hold preemption disabled too long
-    if crate::config::ENABLE_PREEMPTION_WATCHDOG {
-        if let Some(duration_us) = akuma_exec::threading::check_preemption_watchdog() {
+    if crate::config::ENABLE_PREEMPTION_WATCHDOG
+        && let Some(duration_us) = akuma_exec::threading::check_preemption_watchdog() {
             // Log warning
             // Use AtomicU64 instead of static mut to avoid data races
             static LAST_WARN_US: AtomicU64 = AtomicU64::new(0);
@@ -86,7 +86,6 @@ pub fn timer_irq_handler(_irq: u32) {
                     duration_us / 1000, step);
             }
         }
-    }
 
     // NOTE: cleanup_terminated() is NOT called here because it allocates/deallocates
     // memory which could deadlock if main code is in the middle of an allocation.
@@ -98,9 +97,9 @@ pub fn timer_irq_handler(_irq: u32) {
         let tick = TIMER_TICK.fetch_add(1, Ordering::Relaxed);
         let forking = akuma_exec::process::FORK_IN_PROGRESS.load(Ordering::Relaxed);
         let interval = if forking { 50 } else { 500 };
-        if tick % interval == 0 {
+        if tick.is_multiple_of(interval) {
             let tid = akuma_exec::threading::current_thread_id();
-            crate::safe_print!(64, "[TMR] t={} T={} f={}\n", tick, tid, forking as u8);
+            crate::safe_print!(64, "[TMR] t={} T={} f={}\n", tick, tid, u8::from(forking));
         }
     }
     // #endregion
@@ -141,7 +140,7 @@ pub fn get_time_us() -> u64 {
     let freq = read_frequency();
     if freq > 0 {
         // Use u128 to prevent overflow when multiplying counter * 1_000_000
-        ((counter as u128 * 1_000_000) / freq as u128) as u64
+        ((u128::from(counter) * 1_000_000) / u128::from(freq)) as u64
     } else {
         0
     }
@@ -157,7 +156,7 @@ pub fn uptime_us() -> u64 {
 // Returns None if RTC is not initialized
 pub fn read_rtc_timestamp() -> Option<u32> {
     let rtc = RTC.lock();
-    rtc.as_ref().map(|r| r.get_unix_timestamp())
+    rtc.as_ref().map(arm_pl031::Rtc::get_unix_timestamp)
 }
 
 // Initialize UTC time from PL031 RTC
@@ -165,7 +164,7 @@ pub fn read_rtc_timestamp() -> Option<u32> {
 pub fn init_utc_from_rtc() -> bool {
     if let Some(timestamp) = read_rtc_timestamp() {
         // Convert seconds to microseconds
-        let unix_epoch_us = (timestamp as u64) * 1_000_000;
+        let unix_epoch_us = u64::from(timestamp) * 1_000_000;
         set_utc_time_us(unix_epoch_us);
         true
     } else {
@@ -279,7 +278,7 @@ impl DateTime {
 
 // Check if a year is a leap year
 fn is_leap_year(year: u32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 // Get current UTC time as ISO 8601 string

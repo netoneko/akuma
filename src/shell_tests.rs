@@ -67,8 +67,7 @@ pub fn run_all_tests() {
     }
 
     log(&format!(
-        "\n[Shell Tests] Complete: {} passed, {} failed\n",
-        passed, failed
+        "\n[Shell Tests] Complete: {passed} passed, {failed} failed\n"
     ));
 }
 
@@ -123,9 +122,7 @@ where
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(result) => return result,
             Poll::Pending => {
-                if crate::timer::uptime_us() - start > timeout_us {
-                    panic!("Shell test timed out");
-                }
+                assert!(crate::timer::uptime_us() - start <= timeout_us, "Shell test timed out");
                 // Yield to allow spawned process threads to run
                 akuma_exec::threading::yield_now();
                 // Clean up any terminated threads
@@ -161,8 +158,8 @@ fn test_grep_with_akuma_pipe() -> bool {
                 .all(|line| line.contains("#*####%#**+**%@%**#"));
 
             log(&format!("  Output length: {} bytes\n", output.len()));
-            log(&format!("  Has content: {}\n", has_content));
-            log(&format!("  All lines match: {}\n", all_lines_match));
+            log(&format!("  Has content: {has_content}\n"));
+            log(&format!("  All lines match: {all_lines_match}\n"));
 
             if has_content && all_lines_match {
                 log("  Result: PASS\n");
@@ -176,7 +173,7 @@ fn test_grep_with_akuma_pipe() -> bool {
             }
         }
         Err(e) => {
-            log(&format!("  Error: {}\n", e));
+            log(&format!("  Error: {e}\n"));
             log("  Result: FAIL\n");
             false
         }
@@ -201,7 +198,7 @@ fn test_grep_case_insensitive() -> bool {
             let has_hello = output_str.to_lowercase().contains("hello");
 
             log(&format!("  Output: {}\n", output_str.trim()));
-            log(&format!("  Contains 'hello': {}\n", has_hello));
+            log(&format!("  Contains 'hello': {has_hello}\n"));
 
             if has_hello {
                 log("  Result: PASS\n");
@@ -212,7 +209,7 @@ fn test_grep_case_insensitive() -> bool {
             }
         }
         Err(e) => {
-            log(&format!("  Error: {}\n", e));
+            log(&format!("  Error: {e}\n"));
             log("  Result: FAIL\n");
             false
         }
@@ -245,8 +242,8 @@ fn test_grep_invert_match() -> bool {
         Err(_) => false,
     };
 
-    log(&format!("  Normal grep found match: {}\n", normal_ok));
-    log(&format!("  Inverted grep excluded match: {}\n", invert_ok));
+    log(&format!("  Normal grep found match: {normal_ok}\n"));
+    log(&format!("  Inverted grep excluded match: {invert_ok}\n"));
 
     if normal_ok && invert_ok {
         log("  Result: PASS\n");
@@ -279,7 +276,7 @@ fn test_multi_stage_pipeline() -> bool {
             let has_echo = output_str.contains("echo");
 
             log(&format!("  Output: {}\n", output_str.trim()));
-            log(&format!("  Contains 'echo': {}\n", has_echo));
+            log(&format!("  Contains 'echo': {has_echo}\n"));
 
             if has_echo {
                 log("  Result: PASS\n");
@@ -292,7 +289,7 @@ fn test_multi_stage_pipeline() -> bool {
             }
         }
         Err(e) => {
-            log(&format!("  Error: {}\n", e));
+            log(&format!("  Error: {e}\n"));
             log("  Result: FAIL\n");
             false
         }
@@ -314,11 +311,10 @@ fn test_external_binary_pipeline() -> bool {
             log("  /bin/echo2 not found\n");
             log("  Result: FAIL\n");
             return false;
-        } else {
-            log("  Skipping: /bin/echo2 not found\n");
-            log("  Result: SKIP (counted as pass)\n");
-            return true;
         }
+        log("  Skipping: /bin/echo2 not found\n");
+        log("  Result: SKIP (counted as pass)\n");
+        return true;
     }
 
     // echo2 outputs something like "echo2: hello" so grep for "echo" should match
@@ -330,7 +326,7 @@ fn test_external_binary_pipeline() -> bool {
             let has_echo = output_str.contains("echo");
 
             log(&format!("  Output: {}\n", output_str.trim()));
-            log(&format!("  Contains 'echo': {}\n", has_echo));
+            log(&format!("  Contains 'echo': {has_echo}\n"));
 
             if has_echo {
                 log("  Result: PASS\n");
@@ -341,7 +337,7 @@ fn test_external_binary_pipeline() -> bool {
             }
         }
         Err(e) => {
-            log(&format!("  Error: {}\n", e));
+            log(&format!("  Error: {e}\n"));
             log("  Result: FAIL\n");
             false
         }
@@ -363,11 +359,10 @@ fn test_mixed_pipeline() -> bool {
             log("  /bin/echo2 not found\n");
             log("  Result: FAIL\n");
             return false;
-        } else {
-            log("  Skipping: /bin/echo2 not found\n");
-            log("  Result: SKIP (counted as pass)\n");
-            return true;
         }
+        log("  Skipping: /bin/echo2 not found\n");
+        log("  Result: SKIP (counted as pass)\n");
+        return true;
     }
 
     // echo outputs "hello", echo2 echoes it, grep filters for "hello"
@@ -380,7 +375,7 @@ fn test_mixed_pipeline() -> bool {
             let has_hello = output_str.contains("hello");
 
             log(&format!("  Output: {}\n", output_str.trim()));
-            log(&format!("  Contains 'hello': {}\n", has_hello));
+            log(&format!("  Contains 'hello': {has_hello}\n"));
 
             if has_hello {
                 log("  Result: PASS\n");
@@ -391,7 +386,7 @@ fn test_mixed_pipeline() -> bool {
             }
         }
         Err(e) => {
-            log(&format!("  Error: {}\n", e));
+            log(&format!("  Error: {e}\n"));
             log("  Result: FAIL\n");
             false
         }

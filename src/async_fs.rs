@@ -49,7 +49,7 @@ impl Future for YieldOnce {
 
 /// Yield to allow other async tasks to run
 async fn yield_now() {
-    YieldOnce::new().await
+    YieldOnce::new().await;
 }
 
 // ============================================================================

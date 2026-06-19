@@ -112,24 +112,18 @@ impl Command for CurlCommand {
                 }
             }
 
-            let raw_url = match url_str {
-                Some(u) => u,
-                None => {
-                    let _ = stdout.write(b"Usage: curl [-k] [-L] [-v] [-o <file>] <url>\r\n").await;
-                    return Ok(());
-                }
+            let raw_url = if let Some(u) = url_str { u } else {
+                let _ = stdout.write(b"Usage: curl [-k] [-L] [-v] [-o <file>] <url>\r\n").await;
+                return Ok(());
             };
 
             let max_redirects = if follow_redirects { 10 } else { 0 };
             let mut current_url_string = String::from(raw_url);
 
             for redirect_count in 0..=max_redirects {
-                let url = match parse_url(&current_url_string) {
-                    Some(u) => u,
-                    None => {
-                        let _ = stdout.write(b"Error: Invalid URL\r\n").await;
-                        return Ok(());
-                    }
+                let url = if let Some(u) = parse_url(&current_url_string) { u } else {
+                    let _ = stdout.write(b"Error: Invalid URL\r\n").await;
+                    return Ok(());
                 };
 
                 // The extreme profile builds without the in-kernel TLS client
@@ -162,7 +156,7 @@ impl Command for CurlCommand {
                             }
                             if let Some(location) = resp.location() {
                                 if verbose {
-                                    let msg = format!("* Redirecting to {}\r\n", location);
+                                    let msg = format!("* Redirecting to {location}\r\n");
                                     let _ = stdout.write(msg.as_bytes()).await;
                                 }
                                 current_url_string = String::from(location);
@@ -172,14 +166,14 @@ impl Command for CurlCommand {
 
                         if let Some(path) = output_file {
                             match async_fs::write_file(path, &resp.body).await {
-                                Ok(_) => {
+                                Ok(()) => {
                                     if verbose {
                                         let msg = format!("* Saved {} bytes to {}\r\n", resp.body.len(), path);
                                         let _ = stdout.write(msg.as_bytes()).await;
                                     }
                                 }
                                 Err(e) => {
-                                    let msg = format!("Error: failed to write {}: {}\r\n", path, e);
+                                    let msg = format!("Error: failed to write {path}: {e}\r\n");
                                     let _ = stdout.write(msg.as_bytes()).await;
                                 }
                             }
@@ -191,7 +185,7 @@ impl Command for CurlCommand {
                         }
                     }
                     Err(e) => {
-                        let msg = format!("Error: {}\r\n", e);
+                        let msg = format!("Error: {e}\r\n");
                         let _ = stdout.write(msg.as_bytes()).await;
                     }
                 }
@@ -230,16 +224,16 @@ impl Command for NslookupCommand {
             }
 
             let _ = stdout.write(b"Server: 10.0.2.3\r\n").await;
-            let msg = format!("Name:   {}\r\n", hostname);
+            let msg = format!("Name:   {hostname}\r\n");
             let _ = stdout.write(msg.as_bytes()).await;
 
             match smoltcp_net::dns_query(hostname) {
                 Ok(ip) => {
-                    let msg = format!("Address: {}\r\n", ip);
+                    let msg = format!("Address: {ip}\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
                 Err(e) => {
-                    let msg = format!("** DNS lookup failed: {:?}\r\n", e);
+                    let msg = format!("** DNS lookup failed: {e:?}\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                 }
             }
@@ -267,14 +261,14 @@ impl PkgCommand {
     ) -> Result<bool, ShellError> {
         // The server URL is always keyed by package name; `path` only changes the
         // local destination (via `--as=`).
-        let url_str = format!("{}/bin/{}", PKG_SERVER, package);
+        let url_str = format!("{PKG_SERVER}/bin/{package}");
         let url = parse_url(&url_str).ok_or(ShellError::ExecutionFailed("Invalid URL"))?;
 
-        let msg = format!("pkg: downloading {}...\r\n", url_str);
+        let msg = format!("pkg: downloading {url_str}...\r\n");
         let _ = stdout.write(msg.as_bytes()).await;
 
         let dest = if path.is_empty() {
-            format!("/bin/{}", package)
+            format!("/bin/{package}")
         } else {
             path.to_string()
         };
@@ -300,7 +294,7 @@ impl PkgCommand {
             }
             Ok((status, _)) => {
                 let _ = crate::async_fs::remove_file(&dest).await;
-                let msg = format!("pkg: failed to download binary (status: {})\r\n", status);
+                let msg = format!("pkg: failed to download binary (status: {status})\r\n");
                 let _ = stdout.write(msg.as_bytes()).await;
                 Err(ShellError::ExecutionFailed("Binary download failed"))
             }
@@ -315,10 +309,10 @@ impl PkgCommand {
         &self,
         package: &str,
         stdout: &mut W,
-        ctx: &mut ShellContext,
+        ctx: &ShellContext,
     ) -> Result<bool, ShellError> {
-        let archive_path_gz = format!("/archives/{}.tar.gz", package);
-        let archive_path_tar = format!("/archives/{}.tar", package);
+        let archive_path_gz = format!("/archives/{package}.tar.gz");
+        let archive_path_tar = format!("/archives/{package}.tar");
         
         let extensions = [".tar.gz", ".tar"];
         let paths = [archive_path_gz.as_str(), archive_path_tar.as_str()];
@@ -326,15 +320,15 @@ impl PkgCommand {
         for i in 0..2 {
             let path = paths[i];
             let ext = extensions[i];
-            let tmp_path = format!("/tmp/{}{}", package, ext);
+            let tmp_path = format!("/tmp/{package}{ext}");
 
-            let url_str = format!("{}{}", PKG_SERVER, path);
+            let url_str = format!("{PKG_SERVER}{path}");
             let url = match parse_url(&url_str) {
                 Some(u) => u,
                 None => continue,
             };
 
-            let msg = format!("pkg: downloading {}...\r\n", url_str);
+            let msg = format!("pkg: downloading {url_str}...\r\n");
             let _ = stdout.write(msg.as_bytes()).await;
 
             match http_get_to_file(&url, &tmp_path).await {
@@ -350,17 +344,16 @@ impl PkgCommand {
                 }
                 Ok((404, _)) => {
                     let _ = crate::async_fs::remove_file(&tmp_path).await;
-                    continue;
                 }
                 Ok((status, _)) => {
                     let _ = crate::async_fs::remove_file(&tmp_path).await;
-                    let msg = format!("pkg: failed to download archive (status: {})\r\n", status);
+                    let msg = format!("pkg: failed to download archive (status: {status})\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                     return Err(ShellError::ExecutionFailed("Archive download failed"));
                 }
                 Err(e) => {
                     let _ = crate::async_fs::remove_file(&tmp_path).await;
-                    let msg = format!("pkg: download error: {}\r\n", e);
+                    let msg = format!("pkg: download error: {e}\r\n");
                     let _ = stdout.write(msg.as_bytes()).await;
                     return Err(ShellError::ExecutionFailed("Archive download failed"));
                 }
@@ -373,7 +366,7 @@ impl PkgCommand {
         &self,
         archive_path: &str,
         stdout: &mut W,
-        ctx: &mut ShellContext,
+        ctx: &ShellContext,
     ) -> Result<bool, ShellError> {
         if !crate::async_fs::exists("/bin/tar").await {
             let _ = stdout.write(b"pkg: 'tar' command not found. Please 'pkg install tar' first.\r\n").await;
@@ -382,11 +375,12 @@ impl PkgCommand {
         }
 
         let mut args = vec!["-xvf", archive_path, "-C", "/"];
-        if archive_path.ends_with(".gz") {
+        let ext_is_gz = archive_path.len() >= 3 && archive_path[archive_path.len()-3..].eq_ignore_ascii_case(".gz");
+        if ext_is_gz {
             args[0] = "-xzvf";
         }
         
-        let msg = format!("pkg: extracting {} to root...\r\n", archive_path);
+        let msg = format!("pkg: extracting {archive_path} to root...\r\n");
         let _ = stdout.write(msg.as_bytes()).await;
 
         let result = execute_external_streaming("/bin/tar", Some(&args), None, Some(b""), Some(ctx.cwd()), stdout).await;
@@ -406,7 +400,7 @@ impl PkgCommand {
         &self,
         packages: &str,
         stdout: &mut W,
-        ctx: &mut ShellContext,
+        ctx: &ShellContext,
     ) -> Result<(), ShellError> {
         let mut path = "";
         for package in packages.split_whitespace() {
@@ -427,7 +421,7 @@ impl PkgCommand {
         &self,
         package: &str,
         stdout: &mut W,
-        ctx: &mut ShellContext,
+        ctx: &ShellContext,
         path: &str,
     ) -> Result<(), ShellError> {
         if package.is_empty() {
@@ -449,7 +443,7 @@ impl PkgCommand {
             return Ok(());
         }
 
-        let msg = format!("pkg: unable to find package '{}'\r\n", package);
+        let msg = format!("pkg: unable to find package '{package}'\r\n");
         let _ = stdout.write(msg.as_bytes()).await;
 
         Ok(())

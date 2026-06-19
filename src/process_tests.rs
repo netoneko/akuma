@@ -455,11 +455,11 @@ fn test_shared_file_mmap_writeback() {
 
     // Two resident pages filled with a distinct pattern, as if written through the
     // mapping by userspace.
-    let f0 = match crate::pmm::alloc_page() { Some(f) => f, None => {
-        console::print("[Test] shared_file_mmap_writeback SKIPPED (no frame)\n"); return; } };
-    let f1 = match crate::pmm::alloc_page() { Some(f) => f, None => {
-        crate::pmm::free_page(f0);
-        console::print("[Test] shared_file_mmap_writeback SKIPPED (no frame)\n"); return; } };
+    let f0 = if let Some(f) = crate::pmm::alloc_page() { f } else {
+    console::print("[Test] shared_file_mmap_writeback SKIPPED (no frame)\n"); return; };
+    let f1 = if let Some(f) = crate::pmm::alloc_page() { f } else {
+    crate::pmm::free_page(f0);
+    console::print("[Test] shared_file_mmap_writeback SKIPPED (no frame)\n"); return; };
     unsafe {
         let p0 = akuma_exec::mmu::phys_to_virt(f0.addr);
         let p1 = akuma_exec::mmu::phys_to_virt(f1.addr);
@@ -660,7 +660,7 @@ fn test_boot_stack_reservation_invariants() {
     // 1. The reservation sits strictly above the kernel image (no overlap).
     let above_image = stack_bottom > kernel_end;
     // 2. STACK_BOTTOM is page-aligned (it is ALIGN(_kernel_phys_end, 0x1000) + guard).
-    let aligned = stack_bottom % 0x1000 == 0;
+    let aligned = stack_bottom.is_multiple_of(0x1000);
     // 3. The boot stack is exactly 1 MB (STACK_TOP = STACK_BOTTOM + 0x100000).
     let one_mb_stack = stack_top - stack_bottom == 0x10_0000;
     // 4. The guard gap between the image and the stack is sane (≥ 1 page, the 2
@@ -754,7 +754,7 @@ fn test_heap_grow_backoff_plan() {
     let mut n = heap_grow_initial_pages(1, 10_000); // 64
     let mut steps = 0;
     while let Some(next) = heap_grow_backoff(n, 1) {
-        assert!(next < n, "backoff must strictly decrease ({} -> {})", n, next);
+        assert!(next < n, "backoff must strictly decrease ({n} -> {next})");
         n = next;
         steps += 1;
         assert!(steps < 64, "backoff must terminate, not loop");
@@ -979,7 +979,7 @@ fn test_aliased_pa_not_double_freed() {
     let result = crate::irq::with_irqs_disabled(|| {
         let (_t, _a, free_before) = crate::pmm::stats();
         let df_before = crate::pmm::double_free_count();
-        let Some(frame) = crate::pmm::alloc_page_zeroed() else { return None; };
+        let frame = crate::pmm::alloc_page_zeroed()?;
         {
             let mut p = make_test_process(992_100);
             let va1 = BENCH_VA_BASE;
@@ -1031,7 +1031,7 @@ fn test_unmap_and_free_respects_refcount() {
     let result = crate::irq::with_irqs_disabled(|| {
         let (_t, _a, free_before) = crate::pmm::stats();
         let df_before = crate::pmm::double_free_count();
-        let Some(frame) = crate::pmm::alloc_page_zeroed() else { return None; };
+        let frame = crate::pmm::alloc_page_zeroed()?;
         let (first, second) = {
             let mut p = make_test_process(992_200);
             let va1 = BENCH_VA_BASE;
@@ -1176,7 +1176,7 @@ fn bench_fork_cow_share() {
         let _ = child.map_page(va, pa, child_flags);
         child.track_user_frame(crate::pmm::PhysFrame::new(pa));
     }
-    unsafe { mmu::demote_range_to_ro(parent_l0 as *mut u64, BENCH_VA_BASE, mapped); }
+    unsafe { mmu::demote_range_to_ro(parent_l0.cast_mut(), BENCH_VA_BASE, mapped); }
     mmu::flush_tlb_asid(0);
     let elapsed = crate::timer::uptime_us() - start;
     let per_page_ns = (elapsed.saturating_mul(1000)) / shared.max(1) as u64;
@@ -1360,7 +1360,7 @@ fn test_forktest_parent_mmap() {
 }
 
 /// Helper to create a minimal Process for testing logic without loading a real ELF.
-pub(crate) fn make_test_process(pid: u32) -> alloc::boxed::Box<akuma_exec::process::Process> {
+pub fn make_test_process(pid: u32) -> alloc::boxed::Box<akuma_exec::process::Process> {
     use akuma_exec::process::{Process, ProcessMemory, SharedFdTable, SharedSignalTable, ProcessSyscallStats};
     use akuma_exec::mmu::UserAddressSpace;
     use spinning_top::Spinlock;
@@ -1484,9 +1484,9 @@ fn test_rt_sigtimedwait_timeout() {
     // 4. Call sigtimedwait
     crate::syscall::BYPASS_VALIDATION.store(true, core::sync::atomic::Ordering::Release);
     let res = sys_rt_sigtimedwait(
-        &mut mask as *mut u64 as u64,
+        &raw mut mask as u64,
         0,
-        &ts as *const Timespec as u64,
+        &raw const ts as u64,
         8
     );
     crate::syscall::BYPASS_VALIDATION.store(false, core::sync::atomic::Ordering::Release);
@@ -1509,7 +1509,6 @@ fn test_current_syscall_visibility() {
     use core::sync::atomic::Ordering;
 
     // 1. Create a fake process
-    let _pid = 4000;
     let proc = make_test_process(4000);
     
     // 2. Initially it should be !0 (None)
@@ -1599,14 +1598,14 @@ fn test_rt_sigtimedwait() {
     // 3. Call sigtimedwait (bypass validation since we use kernel stack)
     crate::syscall::BYPASS_VALIDATION.store(true, core::sync::atomic::Ordering::Release);
     let mut mask_val = wait_mask;
-    let res = sys_rt_sigtimedwait(&mut mask_val as *mut u64 as u64, 0, 0, 8);
+    let res = sys_rt_sigtimedwait(&raw mut mask_val as u64, 0, 0, 8);
     crate::syscall::BYPASS_VALIDATION.store(false, core::sync::atomic::Ordering::Release);
 
     // Cleanup
     unregister_process(pid);
     unregister_thread_pid(tid);
 
-    if res == sig as u64 {
+    if res == u64::from(sig) {
         console::print("[Test] rt_sigtimedwait PASSED (found pending signal)\n");
     } else {
         crate::safe_print!(64, "[Test] rt_sigtimedwait FAILED: expected {}, got {}\n", sig, res);
@@ -1702,13 +1701,10 @@ fn test_exit_group_does_not_unregister_while_siblings_running() {
     let mut sib_proc = make_test_process(sib_pid);
     
     // Force share address space (simulating CLONE_VM)
-    let shared_as = match crate::mmu::UserAddressSpace::new_shared(l0_phys) {
-        Some(as_space) => as_space,
-        None => {
-            console::print("[Test] exit_group_siblings: failed to create shared AS\n");
-            unregister_process(main_pid);
-            return;
-        }
+    let shared_as = if let Some(as_space) = crate::mmu::UserAddressSpace::new_shared(l0_phys) { as_space } else {
+        console::print("[Test] exit_group_siblings: failed to create shared AS\n");
+        unregister_process(main_pid);
+        return;
     };
     sib_proc.address_space = shared_as;
     register_process(sib_pid, sib_proc);
@@ -1756,13 +1752,10 @@ fn test_rt_sigaction_after_exit_group_not_enosys() {
     let sib_pid = 1003;
     let mut sib_proc = make_test_process(sib_pid);
     
-    let shared_as = match crate::mmu::UserAddressSpace::new_shared(l0_phys) {
-        Some(as_space) => as_space,
-        None => {
-            console::print("[Test] sigaction_after_exit: failed to create shared AS\n");
-            unregister_process(main_pid);
-            return;
-        }
+    let shared_as = if let Some(as_space) = crate::mmu::UserAddressSpace::new_shared(l0_phys) { as_space } else {
+        console::print("[Test] sigaction_after_exit: failed to create shared AS\n");
+        unregister_process(main_pid);
+        return;
     };
     sib_proc.address_space = shared_as;
     
@@ -2056,7 +2049,7 @@ fn test_procfs_stdio() {
     }
 
     // 4. Read echo2's stdin via procfs: /proc/<echo2_pid>/fd/0
-    let stdin_path = format!("/proc/{}/fd/0", echo2_pid);
+    let stdin_path = format!("/proc/{echo2_pid}/fd/0");
     match fs::read_file(&stdin_path) {
         Ok(data) => {
             if data == stdin_data {
@@ -2076,7 +2069,7 @@ fn test_procfs_stdio() {
     }
 
     // 5. Read hello's stdout via procfs: /proc/<hello_pid>/fd/1
-    let stdout_path = format!("/proc/{}/fd/1", hello_pid);
+    let stdout_path = format!("/proc/{hello_pid}/fd/1");
     match fs::read_file(&stdout_path) {
         Ok(data) => {
             // Verify stdout contains expected content
@@ -2114,12 +2107,9 @@ fn test_signal_reset_on_exec() {
     use alloc::string::String;
 
     const ELF_PATH: &str = "/bin/elftest";
-    let elf_data = match fs::read_file(ELF_PATH) {
-        Ok(d) => d,
-        Err(_) => {
-            crate::safe_print!(96, "[Test] signal_reset_on_exec SKIPPED ({} not found)\n", ELF_PATH);
-            return;
-        }
+    let elf_data = if let Ok(d) = fs::read_file(ELF_PATH) { d } else {
+        crate::safe_print!(96, "[Test] signal_reset_on_exec SKIPPED ({} not found)\n", ELF_PATH);
+        return;
     };
 
     let mut proc = match process::Process::from_elf(
@@ -2180,12 +2170,9 @@ fn test_signal_ignore_preserved_on_exec() {
     use alloc::string::String;
 
     const ELF_PATH: &str = "/bin/elftest";
-    let elf_data = match fs::read_file(ELF_PATH) {
-        Ok(d) => d,
-        Err(_) => {
-            crate::safe_print!(96, "[Test] signal_ignore_preserved SKIPPED ({} not found)\n", ELF_PATH);
-            return;
-        }
+    let elf_data = if let Ok(d) = fs::read_file(ELF_PATH) { d } else {
+        crate::safe_print!(96, "[Test] signal_ignore_preserved SKIPPED ({} not found)\n", ELF_PATH);
+        return;
     };
 
     let mut proc = match process::Process::from_elf(
@@ -2596,7 +2583,7 @@ fn test_user_va_limit_48bit() {
     // 4 GB — the old wrong cap
     const OLD_CAP_4GB: u64 = 0x1_0000_0000u64;
     // Representative Go goroutine arena address (~130 GB) that must be allowed
-    const GO_GOROUTINE_ARENA: u64 = 0x203e_0000_00u64;
+    const GO_GOROUTINE_ARENA: u64 = 0x0020_3e00_0000_u64;
 
     let limit = crate::syscall::user_va_limit_value();
 
@@ -2685,19 +2672,20 @@ fn test_signal_mask_nodefer_flag_skips() {
 ///   total size    1120 bytes
 ///
 /// The `uc_sigmask` field lives at ucontext+40 → frame offset 168 (128+40).
+#[allow(clippy::useless_let_if_seq)]
 fn test_sigframe_layout_constants() {
     use crate::exceptions::{
         TEST_SIGFRAME_FPSIMD, TEST_SIGFRAME_MCONTEXT, TEST_SIGFRAME_SIZE,
         TEST_SIGFRAME_UC_SIGMASK, TEST_SIGFRAME_UCONTEXT,
     };
 
-    let mut ok = true;
-
     // siginfo_t: 128 bytes, starts at 0
-    if TEST_SIGFRAME_UCONTEXT != 128 {
+    let mut ok = if TEST_SIGFRAME_UCONTEXT != 128 {
         crate::safe_print!(64, "[Test] sigframe: UCONTEXT offset wrong: {}\n", TEST_SIGFRAME_UCONTEXT);
-        ok = false;
-    }
+        false
+    } else {
+        true
+    };
 
     // ucontext header: 176 bytes (Go's _pad + _pad2 for 16-byte alignment before sigcontext)
     if TEST_SIGFRAME_MCONTEXT != 128 + 176 {
@@ -2788,13 +2776,15 @@ fn test_icache_invalidate_page_va_smoke() {
 }
 
 /// Policy helper for EL0 IA replay: kernel identity RAM faults should not be treated as “stale TB”.
+#[allow(clippy::useless_let_if_seq)]
 fn test_far_kernel_identity_range_policy() {
     use crate::exceptions::far_in_kernel_identity_user_range;
-    let mut ok = true;
-    if !far_in_kernel_identity_user_range(0x6006_c15c) {
+    let mut ok = if !far_in_kernel_identity_user_range(0x6006_c15c) {
         crate::safe_print!(64, "[Test] far_kernel_identity_range: 0x6006c15c expected in range\n");
-        ok = false;
-    }
+        false
+    } else {
+        true
+    };
     if far_in_kernel_identity_user_range(0x1009_ee90) {
         crate::safe_print!(64, "[Test] far_kernel_identity_range: PIE should be out of range\n");
         ok = false;
@@ -2923,12 +2913,9 @@ fn test_stp_xzr_emulation() {
 
     // `stp xzr, xzr, [x0, #0x10]` — offset=16, Rn=0
     let instr: u32 = 0xa9017c1f;
-    let (rn, offset) = match decode_stp_xzr_xzr(instr) {
-        Some(v) => v,
-        None => {
-            console::print("[Test] stp_xzr_emulation FAILED: decode returned None\n");
-            return;
-        }
+    let (rn, offset) = if let Some(v) = decode_stp_xzr_xzr(instr) { v } else {
+        console::print("[Test] stp_xzr_emulation FAILED: decode returned None\n");
+        return;
     };
     if rn != 0 || offset != 16 {
         crate::safe_print!(96, "[Test] stp_xzr_emulation FAILED: expected (0,16) got ({},{})\n", rn, offset);
@@ -3067,14 +3054,14 @@ fn test_pipe_write_missing_returns_epipe() {
     crate::syscall::pipe::pipe_close_write(id);
     crate::syscall::pipe::pipe_close_read(id);
     let result = crate::syscall::pipe::pipe_write(id, b"should be lost");
-    if result.is_err() {
-        console::print("[Test] pipe_write_missing_returns_epipe PASSED\n");
-    } else {
+    if let Ok(val) = result {
         crate::safe_print!(
             64,
             "[Test] pipe_write_missing_returns_epipe FAILED: returned Ok({}) expected Err(EPIPE)\n",
-            result.unwrap(),
+            val,
         );
+    } else {
+        console::print("[Test] pipe_write_missing_returns_epipe PASSED\n");
     }
 }
 
@@ -3169,14 +3156,14 @@ fn test_pipe_write_returns_epipe_after_read_close() {
     crate::syscall::pipe::pipe_close_read(id);
     // write_count=1, read_count=0: pipe is still in PIPES but broken.
     let result = crate::syscall::pipe::pipe_write(id, b"should fail");
-    if result.is_err() {
-        console::print("[Test] pipe_write_returns_epipe_after_read_close PASSED\n");
-    } else {
+    if let Ok(val) = result {
         crate::safe_print!(
             64,
             "[Test] pipe_write_returns_epipe_after_read_close FAILED: returned Ok({}) expected Err(EPIPE)\n",
-            result.unwrap(),
+            val,
         );
+    } else {
+        console::print("[Test] pipe_write_returns_epipe_after_read_close PASSED\n");
     }
     crate::syscall::pipe::pipe_close_write(id);
 }
@@ -3325,13 +3312,13 @@ fn test_pipe_dup3_atomically_replaces_and_closes_old() {
 
     // pipe_a: read_count=0 → write should return EPIPE (no readers, Linux behavior)
     let a_write = pipe_write(id_a, b"to pipe_a");
-    if a_write.is_err() {
-        console::print("[Test] pipe_dup3_atomically_replaces_and_closes_old: old entry closed correctly PASSED\n");
-    } else {
+    if let Ok(val) = a_write {
         crate::safe_print!(128,
             "[Test] pipe_dup3_atomically_replaces_and_closes_old FAILED: pipe_write(id_a) returned Ok({}) expected Err(EPIPE)\n",
-            a_write.unwrap(),
+            val,
         );
+    } else {
+        console::print("[Test] pipe_dup3_atomically_replaces_and_closes_old: old entry closed correctly PASSED\n");
     }
 
     // pipe_b: write_count=2, read_count=1, should still be writable
@@ -3384,7 +3371,7 @@ fn test_lseek_nonseekable_returns_espipe() {
     let fd = akuma_exec::process::current_process().unwrap().alloc_fd(FileDescriptor::PipeRead(pipe_id));
 
     // lseek on a pipe → ESPIPE (non-seekable), NOT the old EINVAL.
-    let pipe_ret = crate::syscall::handle_syscall(NR_LSEEK, &[fd as u64, 0, SEEK_CUR, 0, 0, 0]);
+    let pipe_ret = crate::syscall::handle_syscall(NR_LSEEK, &[u64::from(fd), 0, SEEK_CUR, 0, 0, 0]);
     // lseek on an absent fd → EBADF (the non-seekable path must not mask this).
     let bad_ret = crate::syscall::handle_syscall(NR_LSEEK, &[9999, 0, SEEK_CUR, 0, 0, 0]);
 
@@ -3451,8 +3438,7 @@ fn test_failed_exec_preserves_cloexec_fds() {
 
     // Attempt the doomed execve. `do_execve` returns an errno on failure (it
     // only enters user mode on success), so it is safe to call here.
-    let mut argv = alloc::vec::Vec::new();
-    argv.push(alloc::string::String::from(TMP_PATH));
+    let argv = alloc::vec![alloc::string::String::from(TMP_PATH)];
     let env: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
     let ret = crate::syscall::proc::do_execve(alloc::string::String::from(TMP_PATH), argv, env);
 
@@ -3848,27 +3834,23 @@ fn test_socketpair_recv_send_via_socket_syscalls() {
     // sendto/recvfrom: A --"ping"--> B  (A.tx == py == B.rx)
     let sbuf = *b"ping";
     let sendto_ret = crate::syscall::handle_syscall(
-        NR_SENDTO, &[fd_a as u64, sbuf.as_ptr() as u64, 4, 0, 0, 0]);
+        NR_SENDTO, &[u64::from(fd_a), sbuf.as_ptr() as u64, 4, 0, 0, 0]);
     let mut rbuf = [0u8; 8];
     let recvfrom_ret = crate::syscall::handle_syscall(
-        NR_RECVFROM, &[fd_b as u64, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0]);
+        NR_RECVFROM, &[u64::from(fd_b), rbuf.as_mut_ptr() as u64, 8, 0, 0, 0]);
     let st_ok = sendto_ret == 4 && recvfrom_ret == 4 && &rbuf[..4] == b"ping";
 
     // sendmsg/recvmsg: B --"pong"--> A  (B.tx == px == A.rx)
     let mbuf = *b"pong";
     let send_iov = IoVec { iov_base: mbuf.as_ptr() as u64, iov_len: 4 };
-    let mut send_msg = MsgHdr::default();
-    send_msg.msg_iov = &send_iov as *const IoVec as u64;
-    send_msg.msg_iovlen = 1;
+    let send_msg = MsgHdr { msg_iov: &raw const send_iov as u64, msg_iovlen: 1, ..MsgHdr::default() };
     let sendmsg_ret = crate::syscall::handle_syscall(
-        NR_SENDMSG, &[fd_b as u64, &send_msg as *const MsgHdr as u64, 0, 0, 0, 0]);
+        NR_SENDMSG, &[u64::from(fd_b), &raw const send_msg as u64, 0, 0, 0, 0]);
     let mut mrbuf = [0u8; 8];
     let recv_iov = IoVec { iov_base: mrbuf.as_mut_ptr() as u64, iov_len: 8 };
-    let mut recv_msg = MsgHdr::default();
-    recv_msg.msg_iov = &recv_iov as *const IoVec as u64;
-    recv_msg.msg_iovlen = 1;
+    let recv_msg = MsgHdr { msg_iov: &raw const recv_iov as u64, msg_iovlen: 1, ..MsgHdr::default() };
     let recvmsg_ret = crate::syscall::handle_syscall(
-        NR_RECVMSG, &[fd_a as u64, &recv_msg as *const MsgHdr as u64, 0, 0, 0, 0]);
+        NR_RECVMSG, &[u64::from(fd_a), &raw const recv_msg as u64, 0, 0, 0, 0]);
     let msg_ok = sendmsg_ret == 4 && recvmsg_ret == 4 && &mrbuf[..4] == b"pong";
 
     let no_ebadf = sendto_ret != EBADF && recvfrom_ret != EBADF
@@ -3972,8 +3954,7 @@ fn test_child_stdout_blocking_read() {
     let exit_code = ch.exit_code();
     
     assert!(s.contains("hello"), 
-        "Did not find expected output 'hello'. Read '{}'. Child exited with: {}", 
-        s, exit_code
+        "Did not find expected output 'hello'. Read '{s}'. Child exited with: {exit_code}"
     );
 
     // Wait for exit
@@ -4020,13 +4001,13 @@ fn test_dup3_no_einval_for_valid_args() {
     // dup3(src_fd, src_fd, O_CLOEXEC) → EINVAL (same fd is the only valid EINVAL)
     let ret_einval = crate::syscall::handle_syscall(
         NR_DUP3,
-        &[src_fd as u64, src_fd as u64, O_CLOEXEC, 0, 0, 0],
+        &[u64::from(src_fd), u64::from(src_fd), O_CLOEXEC, 0, 0, 0],
     );
 
     // dup3(src_fd, src_fd+1, O_CLOEXEC) → src_fd+1 (success)
     let ret_ok = crate::syscall::handle_syscall(
         NR_DUP3,
-        &[src_fd as u64, (src_fd + 1) as u64, O_CLOEXEC, 0, 0, 0],
+        &[u64::from(src_fd), u64::from(src_fd + 1), O_CLOEXEC, 0, 0, 0],
     );
 
     // dup3(999, 1000, 0) → EBADF (invalid oldfd)
@@ -4043,19 +4024,16 @@ fn test_dup3_no_einval_for_valid_args() {
 
     assert_eq!(
         ret_einval, EINVAL,
-        "test_dup3: oldfd==newfd must return EINVAL, got {:#x}",
-        ret_einval
+        "test_dup3: oldfd==newfd must return EINVAL, got {ret_einval:#x}"
     );
     assert_eq!(
         ret_ok,
-        (src_fd + 1) as u64,
-        "test_dup3: valid dup3 must return newfd, got {:#x}",
-        ret_ok
+        u64::from(src_fd + 1),
+        "test_dup3: valid dup3 must return newfd, got {ret_ok:#x}"
     );
     assert_eq!(
         ret_ebadf, EBADF,
-        "test_dup3: invalid oldfd must return EBADF, got {:#x}",
-        ret_ebadf
+        "test_dup3: invalid oldfd must return EBADF, got {ret_ebadf:#x}"
     );
 
     console::print("  [PASS] test_dup3_no_einval_for_valid_args\n");
@@ -4094,11 +4072,11 @@ fn test_oom_user_page_reserve() {
     // allocator returns a usable, zeroed page; free it back.
     let free = pmm::free_count();
     assert!(free > pmm::USER_PAGE_RESERVE + 1,
-        "test_oom: boot suite should have ample free pages, got {}", free);
+        "test_oom: boot suite should have ample free pages, got {free}");
     let f = pmm::alloc_page_zeroed_user()
         .expect("test_oom: user alloc must succeed with ample free pages");
     let first = unsafe {
-        core::ptr::read_volatile(akuma_exec::mmu::phys_to_virt(f.addr) as *const u8)
+        core::ptr::read_volatile(akuma_exec::mmu::phys_to_virt(f.addr).cast_const())
     };
     assert_eq!(first, 0, "test_oom: user page must be zeroed");
     pmm::free_page(f);
@@ -4139,24 +4117,19 @@ fn test_mmap_file_oom_survives() {
 
     let mut chosen: Option<(&str, u64)> = None;
     for &path in CANDIDATES {
-        if crate::vfs::exists(path) {
-            if let Ok(sz) = crate::vfs::file_size(path) {
-                if sz > total_ram {
+        if crate::vfs::exists(path)
+            && let Ok(sz) = crate::vfs::file_size(path)
+                && sz > total_ram {
                     chosen = Some((path, sz));
                     break;
                 }
-            }
-        }
     }
 
-    let (path, size) = match chosen {
-        Some(c) => c,
-        None => {
-            crate::safe_print!(96,
-                "  [SKIP] test_mmap_file_oom_survives: no /models file larger than RAM ({} MB)\n",
-                total_ram / 1024 / 1024);
-            return;
-        }
+    let (path, size) = if let Some(c) = chosen { c } else {
+        crate::safe_print!(96,
+            "  [SKIP] test_mmap_file_oom_survives: no /models file larger than RAM ({} MB)\n",
+            total_ram / 1024 / 1024);
+        return;
     };
 
     // The failure mode depends on how file-backed mmap is serviced:
@@ -4195,8 +4168,7 @@ fn test_mmap_file_oom_survives() {
             // still be able to hand out user pages.
             let free_after = pmm::free_count();
             assert!(free_after + pmm::USER_PAGE_RESERVE >= free_before,
-                "test_mmap_file_oom: PMM not reclaimed after kill: before={} after={}",
-                free_before, free_after);
+                "test_mmap_file_oom: PMM not reclaimed after kill: before={free_before} after={free_after}");
             let f = pmm::alloc_page_zeroed_user()
                 .expect("test_mmap_file_oom: user alloc must work after the OOM kill");
             pmm::free_page(f);
@@ -4376,7 +4348,7 @@ fn test_epoll_socket_waker() {
 
     // Register socket for EPOLLIN
     let mut ev = crate::syscall::poll::EpollEvent { events: 0x001 /* EPOLLIN */, _pad: 0, data: 0xDEADBEEF };
-    sys_epoll_ctl(epfd as u32, 1 /* ADD */, fd, &mut ev as *mut _ as usize);
+    sys_epoll_ctl(epfd as u32, 1 /* ADD */, fd, &raw mut ev as usize);
 
     // In a background thread, wait 5ms then simulate data arrival
     akuma_exec::threading::spawn_user_thread_fn(move || {
@@ -4559,9 +4531,9 @@ fn test_epoll_multi_poller_pipe() {
 
     // Register pipe for EPOLLIN in both
     let mut ev1 = crate::syscall::poll::EpollEvent { events: 0x001 /* EPOLLIN */, _pad: 0, data: 1 };
-    sys_epoll_ctl(epfd1 as u32, 1 /* ADD */, fd_r, &mut ev1 as *mut _ as usize);
+    sys_epoll_ctl(epfd1 as u32, 1 /* ADD */, fd_r, &raw mut ev1 as usize);
     let mut ev2 = crate::syscall::poll::EpollEvent { events: 0x001 /* EPOLLIN */, _pad: 0, data: 2 };
-    sys_epoll_ctl(epfd2 as u32, 1 /* ADD */, fd_r, &mut ev2 as *mut _ as usize);
+    sys_epoll_ctl(epfd2 as u32, 1 /* ADD */, fd_r, &raw mut ev2 as usize);
 
     static WOKEN_COUNT: AtomicU32 = AtomicU32::new(0);
     WOKEN_COUNT.store(0, Ordering::SeqCst);
@@ -4887,9 +4859,9 @@ fn test_fault_mutex_insert_remove() {
     let va = 0x5000usize;
     ok &= matches!(fault_slot_acquire(pid, va), FaultSlot::Acquired);
     ok &= lookup_process(pid)
-        .map_or(false, |p| p.fault_mutex.lock().get(&va).copied() == Some(me));
+        .is_some_and(|p| p.fault_mutex.lock().get(&va).copied() == Some(me));
     fault_slot_release(pid, va);
-    ok &= lookup_process(pid).map_or(false, |p| p.fault_mutex.lock().is_empty());
+    ok &= lookup_process(pid).is_some_and(|p| p.fault_mutex.lock().is_empty());
 
     // (2) Poison recovery: a slot held by a DEAD thread must be reclaimable,
     // not an infinite spin. Simulate the dead holder with a parked test slot.
@@ -4907,9 +4879,9 @@ fn test_fault_mutex_insert_remove() {
         }
         // Slot now belongs to us; releasing it empties the map.
         ok &= lookup_process(pid)
-            .map_or(false, |p| p.fault_mutex.lock().get(&va2).copied() == Some(me));
+            .is_some_and(|p| p.fault_mutex.lock().get(&va2).copied() == Some(me));
         fault_slot_release(pid, va2);
-        ok &= lookup_process(pid).map_or(false, |p| p.fault_mutex.lock().is_empty());
+        ok &= lookup_process(pid).is_some_and(|p| p.fault_mutex.lock().is_empty());
         threading::release_test_thread_slot(dead_tid);
     } else {
         ok = false;
@@ -4922,7 +4894,7 @@ fn test_fault_mutex_insert_remove() {
     }
     fault_slot_release(pid, va3); // we (tid `me`) don't own it -> no-op
     ok &= lookup_process(pid)
-        .map_or(false, |p| p.fault_mutex.lock().get(&va3).copied().is_some());
+        .is_some_and(|p| p.fault_mutex.lock().get(&va3).copied().is_some());
 
     unregister_process(pid);
 
@@ -5201,7 +5173,7 @@ fn test_kill_thread_group_no_channel_lock_contention() {
     register_process(owner_pid, owner_proc);
 
     let owner_channel = Arc::new(ProcessChannel::new());
-    register_channel(owner_tid, owner_channel.clone());
+    register_channel(owner_tid, owner_channel);
 
     // Create sibling with a channel.
     let mut sib_proc = make_test_process(sib_pid);
@@ -5478,7 +5450,7 @@ fn test_zombie_process_unregistered_after_return_to_kernel() {
 
     // The caller remains a registered zombie; the sibling is auto-reaped.
     let still_registered = lookup_process(caller_pid).is_some();
-    let is_exited = lookup_process(caller_pid).map(|p| p.exited).unwrap_or(false);
+    let is_exited = lookup_process(caller_pid).is_some_and(|p| p.exited);
     let sibling_gone = lookup_process(sibling_pid).is_none();
 
     // return_to_kernel then unregisters the zombie caller.
@@ -5643,8 +5615,7 @@ fn test_blocked_sibling_woken_by_cross_thread_signal() {
         akuma_exec::threading::pend_signal_for_thread(sib_tid, SIGURG);
 
         let interrupted = akuma_exec::process::channel::get_channel(sib_tid)
-            .map(|c| c.is_interrupted())
-            .unwrap_or(false);
+            .is_some_and(|c| c.is_interrupted());
         let pending_ok = peek_pending_signal(sib_tid) == SIGURG;
         let woken_flag = get_woken_state(sib_tid);
         let now_ready = get_thread_state(sib_tid) == thread_state::READY;
@@ -5734,9 +5705,9 @@ fn test_tgid_inheritance() {
     fork.tgid = fork_pid; // fork child gets own tgid
     register_process(fork_pid, fork);
 
-    let leader_ok = lookup_process(leader_pid).map(|p| p.tgid == leader_pid).unwrap_or(false);
-    let thread_ok = lookup_process(thread_pid).map(|p| p.tgid == leader_pid).unwrap_or(false);
-    let fork_ok = lookup_process(fork_pid).map(|p| p.tgid == fork_pid && p.tgid != leader_pid).unwrap_or(false);
+    let leader_ok = lookup_process(leader_pid).is_some_and(|p| p.tgid == leader_pid);
+    let thread_ok = lookup_process(thread_pid).is_some_and(|p| p.tgid == leader_pid);
+    let fork_ok = lookup_process(fork_pid).is_some_and(|p| p.tgid == fork_pid && p.tgid != leader_pid);
 
     let _ = unregister_process(leader_pid);
     let _ = unregister_process(thread_pid);
@@ -5786,7 +5757,7 @@ fn test_fork_brk_cap_pages_ordering() {
     let pages_32g = fork_page_count_for_len(32 * GIB);
     let ok = pages_32g == Some(PAGES_32GIB)
         && PAGES_32GIB == 8 * 1024 * 1024
-        && fork_page_count_for_len(32 * GIB + 1).map(|p| p > PAGES_32GIB) == Some(true);
+        && fork_page_count_for_len(32 * GIB + 1).is_some_and(|p| p > PAGES_32GIB);
 
     if ok {
         console::print("[Test] fork_brk_cap_pages_ordering PASSED\n");
@@ -5909,7 +5880,7 @@ fn test_fork_thread_pid_map_invariant() {
     // We verify the logic symbolically — actual insertion is tested by the live fork path.
     let parent_pid: u32 = 53;
     let child_pid: u32 = 57;
-    let _child_tid: usize = 17; // symbolic — real tid assigned at runtime
+    // _child_tid: 17 — symbolic; real tid assigned at runtime
 
     // Simulate: before fix, the tid was NOT in THREAD_PID_MAP.
     // current_process() would fall back to PROCESS_INFO_ADDR and return parent_pid.
@@ -6254,11 +6225,11 @@ fn test_process_info_addr_cow_overwrite() {
 fn test_process_info_addr_not_in_code_range_standard() {
     use akuma_exec::process::PROCESS_INFO_ADDR;
 
-    let _code_end_musl: usize = 0x405000;
+    // code_end_musl: 0x405000 (typical end of musl binary)
     let code_start_musl: usize = 0x400000; // standard binary
     let no_overlap_musl = PROCESS_INFO_ADDR < code_start_musl;
 
-    let _code_end_pie: usize = 0x2000_0000;
+    // code_end_pie: 0x2000_0000 (typical end of PIE binary)
     let code_start_pie: usize = 0x1000_0000; // large PIE binary
     let no_overlap_pie = PROCESS_INFO_ADDR < code_start_pie;
 
@@ -6298,7 +6269,7 @@ fn test_fork_preserves_parent_cwd() {
     } else {
         let base = parent_cwd.trim_end_matches('/');
         let rel = relative_path.trim_start_matches("./");
-        alloc::format!("{}/{}", base, rel)
+        alloc::format!("{base}/{rel}")
     };
 
     if child_cwd == "/bin" && resolved == "/bin/forktest_child" {
@@ -6332,9 +6303,9 @@ fn test_encode_wait_status_clean_exit() {
     let status1 = crate::syscall::proc::encode_wait_status(1);
     let status253 = crate::syscall::proc::encode_wait_status(253);
 
-    let go_exit0 = (status0 & 0x7F == 0) && ((status0 >> 8) & 0xFF == 0);
-    let go_exit1 = (status1 & 0x7F == 0) && ((status1 >> 8) & 0xFF == 1);
-    let go_exit253 = (status253 & 0x7F == 0) && ((status253 >> 8) & 0xFF == 253);
+    let go_exit0 = status0.trailing_zeros() >= 7 && (status0 >> 8).trailing_zeros() >= 8;
+    let go_exit1 = status1.trailing_zeros() >= 7 && (status1 >> 8) & 0xFF == 1;
+    let go_exit253 = status253.trailing_zeros() >= 7 && (status253 >> 8) & 0xFF == 253;
 
     if go_exit0 && go_exit1 && go_exit253 {
         console::print("[Test] encode_wait_status_clean_exit PASSED\n");
@@ -6401,9 +6372,9 @@ fn test_sys_kill_delivers_signal_not_hardkill() {
     //   The signal is delivered on the next return to EL0.  If the process has
     //   a handler (Go does for SIGTERM), the handler runs.  If no handler,
     //   the default action terminates with exit_code=-(signal).
-    let _sigterm: u32 = 15;
-    let sigkill: u32 = 9;
-    let sigint: u32 = 2;
+    // _sigterm = 15 (not used in this test; SIGTERM handling is via handler)
+    let sigkill: i32 = 9;
+    let sigint: i32 = 2;
 
     // Verify: negative signal encoding for different signals
     fn encode(code: i32) -> u32 {
@@ -6415,11 +6386,11 @@ fn test_sys_kill_delivers_signal_not_hardkill() {
     let go_term = 128 + (term_status & 0x7F); // 143
 
     // SIGKILL: exit_code = -9 → wait_status signal=9 → Go: 128+9=137
-    let kill_status = encode(-(sigkill as i32));
+    let kill_status = encode(-sigkill);
     let go_kill = 128 + (kill_status & 0x7F); // 137
 
     // SIGINT: exit_code = -2 → wait_status signal=2 → Go: 128+2=130
-    let int_status = encode(-(sigint as i32));
+    let int_status = encode(-sigint);
     let go_int = 128 + (int_status & 0x7F); // 130
 
     if go_term == 143 && go_kill == 137 && go_int == 130 {
@@ -6443,7 +6414,7 @@ fn test_kill_process_exit_code_uses_negative_signal() {
     // Old: exit_code = 137 → encode_wait_status(137) = (137 & 0xFF) << 8 = 0x8900
     //   Go: WIFEXITED (low 7 bits = 0), ExitStatus = 137.  Reports "exit status 137".
     let old_status = encode(137);
-    let old_go = if old_status & 0x7F == 0 { (old_status >> 8) & 0xFF } else { 0 };
+    let old_go = if old_status.trailing_zeros() >= 7 { (old_status >> 8) & 0xFF } else { 0 };
 
     // New: exit_code = -9 → encode_wait_status(-9) = 9 & 0x7F = 9
     //   Go: WIFSIGNALED (low 7 bits = 9 ≠ 0), Signal = 9.  Reports "signal: killed".
@@ -6482,16 +6453,16 @@ fn test_exit_terminates_calling_thread() {
     register_process(pid, make_test_process(pid));
 
     // Before kill: not exited
-    let before = lookup_process(pid).map(|p| p.exited).unwrap_or(true);
+    let before = lookup_process(pid).is_none_or(|p| p.exited);
 
     // Kill it
     let _ = akuma_exec::process::kill_process(pid);
 
     // After kill: exited=true, state=Zombie
-    let after_exited = lookup_process(pid).map(|p| p.exited).unwrap_or(false);
-    let after_zombie = lookup_process(pid).map(|p|
+    let after_exited = lookup_process(pid).is_some_and(|p| p.exited);
+    let after_zombie = lookup_process(pid).is_some_and(|p|
         matches!(p.state, akuma_exec::process::ProcessState::Zombie(_))
-    ).unwrap_or(false);
+    );
 
     let _ = unregister_process(pid);
 
@@ -6641,7 +6612,7 @@ fn test_kill_child_processes_thread_group_matches_fork_parent() {
     register_process(compile_pid, compile);
 
     kill_child_processes(main_pid);
-    let missed_by_main = lookup_process(compile_pid).map(|p| !p.exited).unwrap_or(false);
+    let missed_by_main = lookup_process(compile_pid).is_some_and(|p| !p.exited);
 
     kill_child_processes_for_thread_group(l0);
     let compile_gone = lookup_process(compile_pid).is_none();
@@ -6756,8 +6727,8 @@ fn test_waitid_p_pid_exited_child() {
     // We call sys_waitid through handle_syscall which validates user pointers,
     // so instead we directly exercise the channel logic.
     let got_ch = akuma_exec::process::get_child_channel(child_pid);
-    let exited = got_ch.as_ref().map(|c| c.has_exited()).unwrap_or(false);
-    let code = got_ch.as_ref().map(|c| c.exit_code()).unwrap_or(-999);
+    let exited = got_ch.as_ref().is_some_and(|c| c.has_exited());
+    let code = got_ch.as_ref().map_or(-999, |c| c.exit_code());
 
     remove_child_channel(child_pid);
 
@@ -6781,9 +6752,9 @@ fn test_waitid_p_all_finds_among_multiple() {
     let ch1 = Arc::new(ProcessChannel::new());
     let ch2 = Arc::new(ProcessChannel::new());
     let ch3 = Arc::new(ProcessChannel::new());
-    register_child_channel(c1, ch1.clone(), parent);
+    register_child_channel(c1, ch1, parent);
     register_child_channel(c2, ch2.clone(), parent);
-    register_child_channel(c3, ch3.clone(), parent);
+    register_child_channel(c3, ch3, parent);
 
     assert_eq_print(has_children(parent), true, "p_all_multiple: has_children before exit");
 
@@ -7037,8 +7008,8 @@ fn test_epoll_pipe_close_write_triggers_epollin() {
     #[repr(C)]
     #[derive(Copy, Clone)]
     struct EpollEvent { events: u32, _pad: u32, data: u64 }
-    let ev = EpollEvent { events: EPOLLIN, _pad: 0, data: read_fd as u64 };
-    let ctl_ret = sys_epoll_ctl(epfd, EPOLL_CTL_ADD, read_fd, &ev as *const _ as usize);
+    let ev = EpollEvent { events: EPOLLIN, _pad: 0, data: u64::from(read_fd) };
+    let ctl_ret = sys_epoll_ctl(epfd, EPOLL_CTL_ADD, read_fd, &raw const ev as usize);
     if ctl_ret != 0 {
         crate::safe_print!(96, "[Test] epoll_pipe_close_write FAILED: ctl ADD err={:#x}\n", ctl_ret);
         unregister_process(pid);
@@ -7095,8 +7066,8 @@ fn test_epoll_eventfd_write_triggers_event() {
     #[repr(C)]
     #[derive(Copy, Clone)]
     struct EpollEvent { events: u32, _pad: u32, data: u64 }
-    let ev = EpollEvent { events: EPOLLIN, _pad: 0, data: efd_num as u64 };
-    sys_epoll_ctl(epfd, EPOLL_CTL_ADD, efd_num, &ev as *const _ as usize);
+    let ev = EpollEvent { events: EPOLLIN, _pad: 0, data: u64::from(efd_num) };
+    sys_epoll_ctl(epfd, EPOLL_CTL_ADD, efd_num, &raw const ev as usize);
 
     // Before write: no events
     let mut out = [EpollEvent { events: 0, _pad: 0, data: 0 }; 4];
@@ -7147,8 +7118,8 @@ fn test_epoll_del_removes_interest() {
     #[repr(C)]
     #[derive(Copy, Clone)]
     struct EpollEvent { events: u32, _pad: u32, data: u64 }
-    let ev = EpollEvent { events: EPOLLIN, _pad: 0, data: efd_num as u64 };
-    sys_epoll_ctl(epfd, EPOLL_CTL_ADD, efd_num, &ev as *const _ as usize);
+    let ev = EpollEvent { events: EPOLLIN, _pad: 0, data: u64::from(efd_num) };
+    sys_epoll_ctl(epfd, EPOLL_CTL_ADD, efd_num, &raw const ev as usize);
 
     // Write so event is pending
     let _ = eventfd_write(efd_id, 1);
@@ -7207,8 +7178,8 @@ fn test_epoll_multiple_ready_events() {
 
     let ev1 = EpollEvent { events: EPOLLIN, _pad: 0, data: 0xAA };
     let ev2 = EpollEvent { events: EPOLLIN, _pad: 0, data: 0xBB };
-    sys_epoll_ctl(epfd, EPOLL_CTL_ADD, fd1, &ev1 as *const _ as usize);
-    sys_epoll_ctl(epfd, EPOLL_CTL_ADD, fd2, &ev2 as *const _ as usize);
+    sys_epoll_ctl(epfd, EPOLL_CTL_ADD, fd1, &raw const ev1 as usize);
+    sys_epoll_ctl(epfd, EPOLL_CTL_ADD, fd2, &raw const ev2 as usize);
 
     // Make both ready
     let _ = eventfd_write(efd1, 1);
@@ -7398,13 +7369,10 @@ fn test_msgqueue_send_wakes_receiver() {
             break;
         }
     }
-    let tid = match test_tid {
-        Some(t) => t,
-        None => {
-            console::print("[Test] msgqueue_send_wakes_receiver SKIPPED: no free thread slot\n");
-            sys_msgctl(msqid, IPC_RMID, 0);
-            return;
-        }
+    let tid = if let Some(t) = test_tid { t } else {
+        console::print("[Test] msgqueue_send_wakes_receiver SKIPPED: no free thread slot\n");
+        sys_msgctl(msqid, IPC_RMID, 0);
+        return;
     };
 
     // Set thread to WAITING and register as recv poller
@@ -7463,13 +7431,10 @@ fn test_msgqueue_recv_wakes_sender() {
             break;
         }
     }
-    let tid = match test_tid {
-        Some(t) => t,
-        None => {
-            console::print("[Test] msgqueue_recv_wakes_sender SKIPPED: no free thread slot\n");
-            sys_msgctl(msqid, IPC_RMID, 0);
-            return;
-        }
+    let tid = if let Some(t) = test_tid { t } else {
+        console::print("[Test] msgqueue_recv_wakes_sender SKIPPED: no free thread slot\n");
+        sys_msgctl(msqid, IPC_RMID, 0);
+        return;
     };
 
     // Set thread to WAITING and register as send poller
@@ -7606,13 +7571,10 @@ fn test_msgqueue_waker_idempotent() {
             break;
         }
     }
-    let tid = match test_tid {
-        Some(t) => t,
-        None => {
-            console::print("[Test] msgqueue_waker_idempotent SKIPPED: no free thread slot\n");
-            sys_msgctl(msqid, IPC_RMID, 0);
-            return;
-        }
+    let tid = if let Some(t) = test_tid { t } else {
+        console::print("[Test] msgqueue_waker_idempotent SKIPPED: no free thread slot\n");
+        sys_msgctl(msqid, IPC_RMID, 0);
+        return;
     };
 
     // Register as recv poller
@@ -7724,9 +7686,9 @@ fn test_tgid_leader_vs_member_cleanup() {
 
     // Verify tgid values
     let leader_tgid_ok = lookup_process(leader_pid)
-        .map(|p| p.tgid == leader_pid).unwrap_or(false);
+        .is_some_and(|p| p.tgid == leader_pid);
     let member_tgid_ok = lookup_process(member_pid)
-        .map(|p| p.tgid == leader_pid && p.tgid != member_pid).unwrap_or(false);
+        .is_some_and(|p| p.tgid == leader_pid && p.tgid != member_pid);
 
     // Kill from leader — member should be cleaned up
     akuma_exec::process::kill_thread_group(leader_pid, 0, 0);
@@ -7848,14 +7810,14 @@ fn test_sigreturn_validates_spsr() {
 
 /// sigreturn should detect suspicious SP values.
 fn test_sigreturn_validates_sp() {
-    let _suspicious_sp: u64 = 0x80000000; // exactly 2GB — likely corruption
+    // _suspicious_sp: 0x80000000 — exactly 2GB, likely corruption; not tested directly
     let zero_sp: u64 = 0;
     let kernel_sp: u64 = 0x4020_0000; // kernel address
     let valid_sp: u64 = 0x1e0086000;  // typical Go user stack
 
     // All of these are suspicious (zero, kernel range, exact power-of-2)
     let zero_bad = zero_sp == 0;
-    let kernel_bad = kernel_sp >= 0x4000_0000 && kernel_sp < 0x8000_0000;
+    let kernel_bad = (0x4000_0000..0x8000_0000).contains(&kernel_sp);
     // Valid user SP is in the user VA range
     let valid_ok = valid_sp > 0 && valid_sp < 0x40_0000_0000; // below 256GB
 
@@ -7886,7 +7848,7 @@ fn test_spsr_el0t_bits() {
 
     let mut ok = true;
     for &(spsr, expected_valid) in test_cases {
-        let is_valid = (spsr & 0x1F) == 0;
+        let is_valid = spsr.trailing_zeros() >= 5;
         if is_valid != expected_valid {
             crate::safe_print!(128,
                 "[Test] spsr_el0t_bits FAILED: spsr={:#x} expected={} got={}\n",
@@ -7907,9 +7869,7 @@ fn test_replace_image_preserves_pid() {
     // It must NOT accidentally modify PID 23 (the parent).
     let parent_pid: u32 = 23;
     let child_pid: u32 = 25;
-    let _child_tid: usize = 30;
-
-    // THREAD_PID_MAP[30] = 25 → current_process() returns PID 25
+    // _child_tid: 30 — THREAD_PID_MAP[30] = 25 → current_process() returns PID 25
     let resolved_pid = child_pid; // via THREAD_PID_MAP
     let correct = resolved_pid == child_pid && resolved_pid != parent_pid;
 
@@ -8027,8 +7987,8 @@ fn test_sigterm_vs_sigkill_behavior() {
     let _ = akuma_exec::process::kill_process_with_signal(pid_term, 15);
     let _ = akuma_exec::process::kill_process_with_signal(pid_kill, 9);
 
-    let term_code = lookup_process(pid_term).map(|p| p.exit_code).unwrap_or(0);
-    let kill_code = lookup_process(pid_kill).map(|p| p.exit_code).unwrap_or(0);
+    let term_code = lookup_process(pid_term).map_or(0, |p| p.exit_code);
+    let kill_code = lookup_process(pid_kill).map_or(0, |p| p.exit_code);
 
     let _ = unregister_process(pid_term);
     let _ = unregister_process(pid_kill);
@@ -8119,8 +8079,7 @@ fn test_normal_goroutine_exit_does_not_kill_group() {
     // Replicate return_to_kernel's gate for the goroutine's normal exit: only an
     // address-space OWNER tears down the group. A shared goroutine must not.
     let (l0_phys, is_shared) = lookup_process(goroutine_pid)
-        .map(|p| (p.address_space.l0_phys(), p.address_space.is_shared()))
-        .unwrap_or((0, true));
+        .map_or((0, true), |p| (p.address_space.l0_phys(), p.address_space.is_shared()));
     if !is_shared && l0_phys != 0 {
         kill_thread_group(goroutine_pid, l0_phys, 0);
     }
@@ -8130,11 +8089,9 @@ fn test_normal_goroutine_exit_does_not_kill_group() {
     // Leader must still be alive and intact.
     let leader_alive = lookup_process(leader_pid).is_some();
     let leader_name_ok = lookup_process(leader_pid)
-        .map(|p| p.name == "leader_test")
-        .unwrap_or(false);
+        .is_some_and(|p| p.name == "leader_test");
     let leader_not_exited = lookup_process(leader_pid)
-        .map(|p| !p.exited)
-        .unwrap_or(false);
+        .is_some_and(|p| !p.exited);
     let goroutine_gone = lookup_process(goroutine_pid).is_none();
 
     // Cleanup — unregister anything still in the table
@@ -8244,16 +8201,13 @@ fn test_crash_goroutine_exit_kills_group() {
     // Parent must be completely unaffected
     let parent_alive = lookup_process(parent_pid).is_some();
     let parent_name = lookup_process(parent_pid)
-        .map(|p| p.name == "parent_survives")
-        .unwrap_or(false);
+        .is_some_and(|p| p.name == "parent_survives");
     let parent_not_exited = lookup_process(parent_pid)
-        .map(|p| !p.exited)
-        .unwrap_or(false);
+        .is_some_and(|p| !p.exited);
 
     // Child should be zombie
     let child_zombie = lookup_process(child_pid)
-        .map(|p| p.exited)
-        .unwrap_or(false);
+        .is_some_and(|p| p.exited);
 
     // Cleanup
     let _ = unregister_process(child_pid);
@@ -8302,8 +8256,7 @@ fn test_leader_exit_never_kills_group() {
     // Unrelated process must be unaffected
     let other_alive = lookup_process(other_pid).is_some();
     let other_not_exited = lookup_process(other_pid)
-        .map(|p| !p.exited)
-        .unwrap_or(false);
+        .is_some_and(|p| !p.exited);
 
     // Cleanup — unregister everything that might still be in the table
     let _ = unregister_process(leader_pid);
@@ -8719,7 +8672,7 @@ fn test_wait4_pid_neg1_finds_exited_child() {
     let child_b = 65_002u32;
     let ch_a = Arc::new(ProcessChannel::new());
     let ch_b = Arc::new(ProcessChannel::new());
-    register_child_channel(child_a, ch_a.clone(), parent_pid);
+    register_child_channel(child_a, ch_a, parent_pid);
     register_child_channel(child_b, ch_b.clone(), parent_pid);
 
     // No exits yet.
@@ -8839,7 +8792,7 @@ fn test_process_table_register_get_unregister() {
     register_process(pid, proc);
 
     // lookup_process returns &mut Process via raw pointer (lock-free)
-    let name_ok = lookup_process(pid).map(|p| p.name == "lockfree_test").unwrap_or(false);
+    let name_ok = lookup_process(pid).is_some_and(|p| p.name == "lockfree_test");
 
     // Unregister returns Box<Process>
     let removed = unregister_process(pid);
@@ -9025,8 +8978,7 @@ fn test_kill_process_notifies_child_channel() {
     // Zombie should still be in the table (wait4 needs to find it)
     let zombie_exists = akuma_exec::process::lookup_process(child_pid).is_some();
     let is_zombie = akuma_exec::process::lookup_process(child_pid)
-        .map(|p| p.exited)
-        .unwrap_or(false);
+        .is_some_and(|p| p.exited);
 
     // Clean up
     let _ = akuma_exec::process::unregister_process(child_pid);
@@ -9074,8 +9026,7 @@ fn test_sigkill_goroutine_does_not_kill_leader() {
 
     // Leader is zombie (killed by kill_process_with_signal)
     let leader_zombie = lookup_process(leader_pid)
-        .map(|p| p.exited)
-        .unwrap_or(false);
+        .is_some_and(|p| p.exited);
 
     // list_processes must not crash (no dangling pointers)
     let _procs = list_processes();
@@ -9110,10 +9061,10 @@ fn test_zombie_stays_for_wait4_reap() {
 
     // Zombie must be in the table
     let in_table = lookup_process(pid).is_some();
-    let is_exited = lookup_process(pid).map(|p| p.exited).unwrap_or(false);
-    let is_zombie_state = lookup_process(pid).map(|p| matches!(p.state, akuma_exec::process::ProcessState::Zombie(_))).unwrap_or(false);
-    let exit_code = lookup_process(pid).map(|p| p.exit_code).unwrap_or(0);
-    let tid_cleared = lookup_process(pid).map(|p| p.thread_id.is_none()).unwrap_or(false);
+    let is_exited = lookup_process(pid).is_some_and(|p| p.exited);
+    let is_zombie_state = lookup_process(pid).is_some_and(|p| matches!(p.state, akuma_exec::process::ProcessState::Zombie(_)));
+    let exit_code = lookup_process(pid).map_or(0, |p| p.exit_code);
+    let tid_cleared = lookup_process(pid).is_some_and(|p| p.thread_id.is_none());
 
     // Simulate wait4 reaping
     let _ = unregister_process(pid);
@@ -9148,10 +9099,10 @@ fn test_orphan_children_become_zombies() {
     let _ = akuma_exec::process::kill_process(parent_pid);
 
     // Parent should be zombie
-    let parent_zombie = lookup_process(parent_pid).map(|p| p.exited).unwrap_or(false);
+    let parent_zombie = lookup_process(parent_pid).is_some_and(|p| p.exited);
 
     // Child should also be zombie (kill_process cascades)
-    let child_zombie = lookup_process(child_pid).map(|p| p.exited).unwrap_or(false);
+    let child_zombie = lookup_process(child_pid).is_some_and(|p| p.exited);
 
     // Both still in table (no reaper)
     let parent_in_table = lookup_process(parent_pid).is_some();
@@ -9551,9 +9502,7 @@ fn test_clone_thread_exit_preserves_shared_fd_table() {
     let fd_survives_sibling_exit = shared_fds.table.lock().contains_key(&5);
 
     // Simulate sys_exit guard for the leader (tgid == pid → MUST call close_all)
-    if leader_pid == leader_pid {
-        shared_fds.close_all();
-    }
+    shared_fds.close_all();
     let fd_cleared_by_leader_exit = !shared_fds.table.lock().contains_key(&5);
 
     if fd_survives_sibling_exit && fd_cleared_by_leader_exit {

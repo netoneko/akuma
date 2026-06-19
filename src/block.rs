@@ -56,11 +56,11 @@ pub enum BlockError {
 impl core::fmt::Display for BlockError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            BlockError::NotFound => write!(f, "Block device not found"),
-            BlockError::ReadError => write!(f, "Read error"),
-            BlockError::WriteError => write!(f, "Write error"),
-            BlockError::NotInitialized => write!(f, "Device not initialized"),
-            BlockError::InvalidOffset => write!(f, "Invalid offset"),
+            Self::NotFound => write!(f, "Block device not found"),
+            Self::ReadError => write!(f, "Read error"),
+            Self::WriteError => write!(f, "Write error"),
+            Self::NotInitialized => write!(f, "Device not initialized"),
+            Self::InvalidOffset => write!(f, "Invalid offset"),
         }
     }
 }
@@ -119,7 +119,7 @@ impl VirtioBlockDevice {
     /// * `sector` - Starting sector number
     /// * `buf` - Buffer to read into (must be a multiple of SECTOR_SIZE)
     pub fn read_sectors(&self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-        if buf.len() % SECTOR_SIZE != 0 {
+        if !buf.len().is_multiple_of(SECTOR_SIZE) {
             crate::safe_print!(96, "[Block] read_sectors: buf len {} not sector-aligned\n", buf.len());
             return Err(BlockError::InvalidOffset);
         }
@@ -148,7 +148,7 @@ impl VirtioBlockDevice {
     /// * `sector` - Starting sector number
     /// * `buf` - Buffer to write from (must be a multiple of SECTOR_SIZE)
     pub fn write_sectors(&self, sector: u64, buf: &[u8]) -> Result<(), BlockError> {
-        if buf.len() % SECTOR_SIZE != 0 {
+        if !buf.len().is_multiple_of(SECTOR_SIZE) {
             crate::safe_print!(96, "[Block] write_sectors: buf len {} not sector-aligned\n", buf.len());
             return Err(BlockError::InvalidOffset);
         }
@@ -179,7 +179,7 @@ impl VirtioBlockDevice {
 
         let start_sector = offset / SECTOR_SIZE as u64;
         let end_offset = offset + buf.len() as u64;
-        let end_sector = (end_offset + SECTOR_SIZE as u64 - 1) / SECTOR_SIZE as u64;
+        let end_sector = end_offset.div_ceil(SECTOR_SIZE as u64);
         let num_sectors = (end_sector - start_sector) as usize;
 
         // Allocate temporary buffer for aligned read
@@ -201,7 +201,7 @@ impl VirtioBlockDevice {
 
         let start_sector = offset / SECTOR_SIZE as u64;
         let end_offset = offset + buf.len() as u64;
-        let end_sector = (end_offset + SECTOR_SIZE as u64 - 1) / SECTOR_SIZE as u64;
+        let end_sector = end_offset.div_ceil(SECTOR_SIZE as u64);
         let num_sectors = (end_sector - start_sector) as usize;
 
         // Read existing data for sectors we'll partially overwrite
@@ -253,20 +253,14 @@ pub fn init() -> Result<(), BlockError> {
         };
 
         // SAFETY: Creating MmioTransport for verified virtio device
-        let transport = match unsafe { MmioTransport::new(header_ptr) } {
-            Ok(t) => t,
-            Err(_) => {
-                log("[Block] Failed to create transport\n");
-                continue;
-            }
+        let transport = if let Ok(t) = unsafe { MmioTransport::new(header_ptr) } { t } else {
+            log("[Block] Failed to create transport\n");
+            continue;
         };
 
-        let blk = match VirtIOBlk::<VirtioHal, MmioTransport>::new(transport) {
-            Ok(b) => b,
-            Err(_) => {
-                log("[Block] Failed to init virtio device\n");
-                continue;
-            }
+        let blk = if let Ok(b) = VirtIOBlk::<VirtioHal, MmioTransport>::new(transport) { b } else {
+            log("[Block] Failed to init virtio device\n");
+            continue;
         };
 
         let device = VirtioBlockDevice::new(blk);

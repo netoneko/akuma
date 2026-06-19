@@ -60,7 +60,7 @@ pub fn init(width: u32, height: u32) -> Result<(), &'static str> {
     let fb_size = (stride as usize) * (height as usize);
 
     // Allocate framebuffer memory (page-aligned)
-    let fb_pages = (fb_size + 4095) / 4096;
+    let fb_pages = fb_size.div_ceil(4096);
     let fb_addr = {
         use alloc::alloc::{alloc_zeroed, Layout};
         let layout = Layout::from_size_align(fb_pages * 4096, 4096).unwrap();
@@ -85,7 +85,7 @@ pub fn init(width: u32, height: u32) -> Result<(), &'static str> {
     // Write configuration to QEMU via fw_cfg DMA
     let cfg_bytes = unsafe {
         core::slice::from_raw_parts(
-            &cfg as *const RamFBCfg as *const u8,
+            (&raw const cfg).cast::<u8>(),
             core::mem::size_of::<RamFBCfg>(),
         )
     };
@@ -130,7 +130,7 @@ pub fn draw(src: &[u8]) -> usize {
     }
 
     // Copy pixels to framebuffer (identity-mapped, so phys == virt)
-    let fb_ptr = akuma_exec::mmu::phys_to_virt(fb_addr) as *mut u8;
+    let fb_ptr = akuma_exec::mmu::phys_to_virt(fb_addr).cast::<u8>();
     unsafe {
         core::ptr::copy_nonoverlapping(src.as_ptr(), fb_ptr, copy_len);
     }

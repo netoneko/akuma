@@ -27,11 +27,11 @@ pub struct FsStats {
 
 impl FsStats {
     pub fn total_bytes(&self) -> u64 {
-        self.total_clusters as u64 * self.cluster_size as u64
+        u64::from(self.total_clusters) * u64::from(self.cluster_size)
     }
 
     pub fn free_bytes(&self) -> u64 {
-        self.free_clusters as u64 * self.cluster_size as u64
+        u64::from(self.free_clusters) * u64::from(self.cluster_size)
     }
 
     pub fn used_bytes(&self) -> u64 {
@@ -76,8 +76,8 @@ pub fn init() -> Result<(), FsError> {
     // and force-unlock to prevent permanent deadlock.
     unsafe {
         akuma_ext2::init_thread_hooks(
-            || akuma_exec::threading::current_thread_id(),
-            |tid| akuma_exec::threading::is_thread_terminated(tid),
+            akuma_exec::threading::current_thread_id,
+            akuma_exec::threading::is_thread_terminated,
         );
     }
     
@@ -252,7 +252,7 @@ pub fn stats() -> Result<FsStats, FsError> {
     if !is_initialized() {
         return Err(FsError::NotInitialized);
     }
-    vfs::stats("/").map(|s| s.into())
+    vfs::stats("/").map(core::convert::Into::into)
 }
 
 // ============================================================================

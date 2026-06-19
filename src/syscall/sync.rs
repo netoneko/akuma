@@ -22,10 +22,11 @@ fn futex_key_tgid(is_private: bool) -> u32 {
     }
 }
 
-pub(crate) fn futex_do_wake(tgid: u32, uaddr: usize, max_wake: u32) -> u64 {
+pub fn futex_do_wake(tgid: u32, uaddr: usize, max_wake: u32) -> u64 {
     let mut waiters = FUTEX_WAITERS.lock();
     let key = (tgid, uaddr);
-    let woken = if let Some(queue) = waiters.get_mut(&key) {
+    
+    if let Some(queue) = waiters.get_mut(&key) {
         let count = (max_wake as usize).min(queue.len());
         let to_wake: Vec<usize> = queue.drain(..count).collect();
         if queue.is_empty() {
@@ -38,8 +39,7 @@ pub(crate) fn futex_do_wake(tgid: u32, uaddr: usize, max_wake: u32) -> u64 {
         to_wake.len() as u64
     } else {
         0
-    };
-    woken
+    }
 }
 
 /// Kernel-internal futex wake (clear_child_tid, robust futex).
@@ -66,12 +66,12 @@ pub fn futex_wake(tgid: u32, uaddr: usize, max_wake: i32) {
 /// verify that `futex_wake(tgid, ...)` correctly reaches private-futex
 /// queues (the fix for the `clear_child_tid` / `pthread_join` hang).
 #[allow(dead_code)]
-pub(crate) fn futex_wait_at_tgid_for_test(tgid: u32, uaddr: usize) {
+pub fn futex_wait_at_tgid_for_test(tgid: u32, uaddr: usize) {
     let tid = akuma_exec::threading::current_thread_id();
     let key = (tgid, uaddr);
     {
         let mut waiters = FUTEX_WAITERS.lock();
-        waiters.entry(key).or_insert_with(Vec::new).push(tid);
+        waiters.entry(key).or_default().push(tid);
     }
     akuma_exec::threading::schedule_blocking(u64::MAX);
     // futex_do_wake removed us from the queue before calling wake()
@@ -140,20 +140,20 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 // value, so we see the new value and return EAGAIN) or after we insert
                 // our TID (so it finds us and calls wake, setting the sticky flag).
                 let mut current_val: u32 = 0;
-                if unsafe { copy_from_user_safe(&mut current_val as *mut u32 as *mut u8, uaddr as *const u8, 4).is_err() } {
+                if unsafe { copy_from_user_safe((&raw mut current_val).cast::<u8>(), uaddr as *const u8, 4).is_err() } {
                     return EFAULT;
                 }
                 if current_val != val {
                     return EAGAIN;
                 }
-                let queue = waiters.entry(key).or_insert_with(Vec::new);
+                let queue = waiters.entry(key).or_default();
                 queue.push(tid);
             }
 
             let is_realtime = (op & FUTEX_CLOCK_REALTIME) != 0;
             let deadline = if timeout_ptr != 0 && validate_user_ptr(timeout_ptr, 16) {
                 let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-                if unsafe { copy_from_user_safe(&mut ts as *mut Timespec as *mut u8, timeout_ptr as *const u8, 16).is_err() } {
+                if unsafe { copy_from_user_safe((&raw mut ts).cast::<u8>(), timeout_ptr as *const u8, 16).is_err() } {
                     // Remove ourselves from the waiter queue before returning.
                     let mut waiters = FUTEX_WAITERS.lock();
                     if let Some(queue) = waiters.get_mut(&key) {
@@ -215,7 +215,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 // Check whether we were genuinely woken (removed from queue by FUTEX_WAKE).
                 let woken_by_futex = {
                     let mut waiters = FUTEX_WAITERS.lock();
-                    let in_queue = waiters.get(&key).map_or(false, |q| q.contains(&tid));
+                    let in_queue = waiters.get(&key).is_some_and(|q| q.contains(&tid));
                     if in_queue {
                         // Spurious: remove ourselves so we can re-check / re-enqueue below.
                         if let Some(queue) = waiters.get_mut(&key) {
@@ -254,7 +254,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 {
                     let mut waiters = FUTEX_WAITERS.lock();
                     let mut current_val: u32 = 0;
-                    if unsafe { copy_from_user_safe(&mut current_val as *mut u32 as *mut u8, uaddr as *const u8, 4).is_err() } {
+                    if unsafe { copy_from_user_safe((&raw mut current_val).cast::<u8>(), uaddr as *const u8, 4).is_err() } {
                         return EFAULT;
                     }
                     if current_val != val {
@@ -262,7 +262,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                         // so the caller re-evaluates its own condition variable.
                         return EAGAIN;
                     }
-                    let queue = waiters.entry(key).or_insert_with(Vec::new);
+                    let queue = waiters.entry(key).or_default();
                     queue.push(tid);
                 }
             }
@@ -314,7 +314,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
 
             // Add requeued waiters to uaddr2
             if !to_requeue.is_empty() && uaddr2 != 0 {
-                let queue2 = waiters.entry(key2).or_insert_with(Vec::new);
+                let queue2 = waiters.entry(key2).or_default();
                 queue2.extend(to_requeue.iter().copied());
             }
 
@@ -341,7 +341,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
 
             // Check current value matches expected
             let mut current_val: u32 = 0;
-            if unsafe { copy_from_user_safe(&mut current_val as *mut u32 as *mut u8, uaddr as *const u8, 4).is_err() } {
+            if unsafe { copy_from_user_safe((&raw mut current_val).cast::<u8>(), uaddr as *const u8, 4).is_err() } {
                 return EFAULT;
             }
             if current_val != val3 {
@@ -376,7 +376,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             };
 
             if !to_requeue.is_empty() && uaddr2 != 0 {
-                let queue2 = waiters.entry(key2).or_insert_with(Vec::new);
+                let queue2 = waiters.entry(key2).or_default();
                 queue2.extend(to_requeue.iter().copied());
             }
 

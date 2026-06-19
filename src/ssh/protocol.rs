@@ -271,25 +271,23 @@ impl<'a> SshChannelStream<'a> {
             SSH_MSG_CHANNEL_REQUEST => {
                 let mut offset = 0;
                 let _recipient = read_u32(payload, &mut offset);
-                if let Some(req_type) = read_string(payload, &mut offset) {
-                    if req_type == b"window-change" {
+                if let Some(req_type) = read_string(payload, &mut offset)
+                    && req_type == b"window-change" {
                         let _want_reply = if offset < payload.len() {
                             payload[offset] != 0
                         } else {
                             false
                         };
                         offset += 1;
-                        if let Some(width) = read_u32(payload, &mut offset) {
-                            if let Some(height) = read_u32(payload, &mut offset) {
+                        if let Some(width) = read_u32(payload, &mut offset)
+                            && let Some(height) = read_u32(payload, &mut offset) {
                                 self.session.term_width = width;
                                 self.session.term_height = height;
                                 self.session.resize_pending = true;
-                                log(&format!("[SSH] Terminal resized: {}x{}\n", width, height));
+                                log(&format!("[SSH] Terminal resized: {width}x{height}\n"));
                                 return Ok(true);
                             }
-                        }
                     }
-                }
             }
             SSH_MSG_CHANNEL_EOF => {
                 // Client's stdin is done — but it still wants the command's output.
@@ -325,8 +323,7 @@ impl<'a> SshChannelStream<'a> {
             }
             _ => {
                 log(&format!(
-                    "[SSH] Ignoring message type {} during shell\n",
-                    msg_type
+                    "[SSH] Ignoring message type {msg_type} during shell\n"
                 ));
             }
         }
@@ -444,12 +441,12 @@ async fn bridge_process(
     process_channel: Arc<akuma_exec::process::ProcessChannel>,
     terminal_state: Arc<Spinlock<terminal::TerminalState>>,
 ) -> Result<(), TcpError> {
-    log(&format!("[SSH] Starting I/O bridge for PID {}\n", pid));
+    log(&format!("[SSH] Starting I/O bridge for PID {pid}\n"));
     let mut buf = [0u8; 1024];
 
     loop {
         if let Some((_, _exit_code)) = akuma_exec::process::waitpid(pid) {
-            log(&format!("[SSH] Process PID {} exited, ending bridge\n", pid));
+            log(&format!("[SSH] Process PID {pid} exited, ending bridge\n"));
             break;
         }
 
@@ -479,21 +476,19 @@ async fn bridge_process(
                     } else if msg_type == SSH_MSG_CHANNEL_REQUEST {
                         let mut offset = 0;
                         let _recipient = read_u32(&payload, &mut offset);
-                        if let Some(req_type) = read_string(&payload, &mut offset) {
-                            if req_type == b"window-change" {
+                        if let Some(req_type) = read_string(&payload, &mut offset)
+                            && req_type == b"window-change" {
                                 offset += 1;
-                                if let Some(width) = read_u32(&payload, &mut offset) {
-                                    if let Some(height) = read_u32(&payload, &mut offset) {
+                                if let Some(width) = read_u32(&payload, &mut offset)
+                                    && let Some(height) = read_u32(&payload, &mut offset) {
                                         session.term_width = width;
                                         session.term_height = height;
                                         let mut ts = terminal_state.lock();
                                         ts.term_width = width as u16;
                                         ts.term_height = height as u16;
-                                        log(&format!("[SSH] Bridge: terminal resized to {}x{}\n", width, height));
+                                        log(&format!("[SSH] Bridge: terminal resized to {width}x{height}\n"));
                                     }
-                                }
                             }
-                        }
                     } else if msg_type == SSH_MSG_CHANNEL_EOF || msg_type == SSH_MSG_CHANNEL_CLOSE {
                         log("[SSH] Channel closed, ending bridge\n");
                         return Ok(());
@@ -547,11 +542,11 @@ async fn run_shell_session(
     akuma_exec::process::register_terminal_state(tid, terminal_state.clone());
 
     if let Some(shell_path) = shell_path_opt {
-        log(&format!("[SSH] Spawning external shell: {}\n", shell_path));
+        log(&format!("[SSH] Spawning external shell: {shell_path}\n"));
         if let Ok((_tid, proc_channel, pid)) = akuma_exec::process::spawn_process_with_channel(&shell_path, None, None) {
             return bridge_process(stream, session, pid, proc_channel, terminal_state.clone()).await;
         }
-        log(&format!("[SSH] Failed to spawn external shell {}, falling back to built-in\n", shell_path));
+        log(&format!("[SSH] Failed to spawn external shell {shell_path}, falling back to built-in\n"));
     }
 
     let registry = create_default_registry();
@@ -666,7 +661,7 @@ async fn run_shell_session(
                                                     crate::editor::run(&mut channel_stream, filepath)
                                                         .await
                                                 {
-                                                    let msg = format!("Editor error: {}\r\n", e);
+                                                    let msg = format!("Editor error: {e}\r\n");
                                                     let _ = channel_stream.write(msg.as_bytes()).await;
                                                 }
 
@@ -679,7 +674,7 @@ async fn run_shell_session(
 
                                             let result = if let Some(streaming_result) =
                                                 shell::execute_command_streaming_interactive(
-                                                    trimmed, &registry, &mut ctx, &mut channel_stream, None,
+                                                    trimmed, &registry, &ctx, &mut channel_stream, None,
                                                 ).await
                                             {
                                                 streaming_result
@@ -774,7 +769,7 @@ async fn run_shell_session(
                                             cursor_pos = 0;
                                         }
                                     }
-                                    _ if byte >= 0x20 && byte < 0x7F => {
+                                    _ if (0x20..0x7F).contains(&byte) => {
                                         line_buffer.insert(cursor_pos, byte);
                                         cursor_pos += 1;
 
@@ -954,7 +949,7 @@ async fn handle_exec(
 
         if let Some(_streaming_result) =
             shell::execute_command_streaming_interactive(
-                trimmed, &registry, &mut exec_ctx, &mut channel_stream, None,
+                trimmed, &registry, &exec_ctx, &mut channel_stream, None,
             ).await
         {
             // Output was already streamed
@@ -990,8 +985,8 @@ pub async fn handle_connection(mut stream: TcpStream) {
     log("[SSH] Connection ended\n");
 }
 
-pub(crate) fn classify_session_exit(state: akuma_ssh::session::SshState) {
-    use akuma_ssh::session::SshState::*;
+pub fn classify_session_exit(state: akuma_ssh::session::SshState) {
+    use akuma_ssh::session::SshState::{AwaitingVersion, AwaitingKexInit, AwaitingKexEcdhInit, AwaitingNewKeys, AwaitingServiceRequest, AwaitingUserAuth, Authenticated, Disconnected};
     match state {
         AwaitingVersion | AwaitingKexInit | AwaitingKexEcdhInit
         | AwaitingNewKeys | AwaitingServiceRequest => {
