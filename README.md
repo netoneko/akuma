@@ -49,6 +49,12 @@ Bohemian operating system, now with an official soundtrack, [*Omegashima*](https
 meow -c "statically compile /akuma-playground/hello.c with /bin/tcc, put binary in /tmp/h4mb and run it, run commands one by one using shell tool"
 ```
 
+**Self-hosting — compiles its own kernel on-target:** a nightly musl Rust toolchain
+runs inside Akuma and builds the full Akuma kernel from source — all 147 crates
+plus the final link — over a single in-VM `cargo build --release`. The resulting
+ELF boots and reaches the SSH server. *Akuma compiles Akuma, and the result runs.*
+See [`docs/AKUMA_SELF_HOSTING.md`](docs/AKUMA_SELF_HOSTING.md).
+
 ### Kernel
 
 | Feature | Details |
@@ -95,7 +101,7 @@ meow -c "statically compile /akuma-playground/hello.c with /bin/tcc, put binary 
 | Feature | Details |
 |---|---|
 | **C compiler (TCC)** | Tiny C Compiler with musl libc — compile and run C programs on-target |
-| **Rust compiler (rustc)** | Alpine `rustc` 1.91 runs on-target — `rustc -C linker=clang hello.rs` compiles, links via `clang`→`ld`, and produces a runnable native binary (needs ≥2 GB RAM). See [`docs/RUST_TOOLCHAIN.md`](docs/RUST_TOOLCHAIN.md) |
+| **Rust compiler (rustc)** | Two toolchains run on-target: Alpine `rustc` 1.91 (`rustc -C linker=clang hello.rs` → runnable native binary) and a **nightly musl toolchain** with the `aarch64-unknown-none` std, which compiles and links the **entire Akuma kernel in-VM** (`cargo build --release` over a populated disk, ≥6 GB RAM). Needed in-kernel support: `MAP_SHARED` writeback for linker output, 128 KB argv strings, the futex/`exit_group` thread-group reaping fixes, and `getpriority`. See [`docs/AKUMA_SELF_HOSTING.md`](docs/AKUMA_SELF_HOSTING.md) and [`docs/RUST_TOOLCHAIN.md`](docs/RUST_TOOLCHAIN.md) |
 | **C compiler (Clang/GCC)** | LLVM `clang`/`clang-21` and GCC/binutils (`cc`, `ld`, `as`) from Alpine apk |
 | **JavaScript (Bun)** | Bun runtime for running JS/TS scripts |
 | **JavaScript (QuickJS)** | ES2020 runtime — BigInt, Promises, async/await, console API |

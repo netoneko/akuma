@@ -14,6 +14,17 @@ replication (§4b′), and `UnixSocket` routing in the socket recv/send syscalls
 (§4d). The only open item is **performance** (slow fork CoW — §5b); correctness
 is solid.
 
+> **Status update (2026-06-19): self-hosting reached.** This doc covers the
+> single-file `hello.rs` bring-up with the **apk** toolchain. Since then a
+> **nightly musl toolchain** (with the `aarch64-unknown-none` std) has gone all the
+> way to **compiling and linking the entire Akuma kernel in-VM** — all 147 crates
+> over one `cargo build --release -p akuma`, and the resulting ELF boots to the SSH
+> server. That work, the toolchain prep, and the additional in-kernel fixes it
+> needed (`MAP_SHARED` linker-output writeback, 128 KB argv strings, the
+> futex/`exit_group` thread-group reaping fixes, `getpriority`) live in
+> [`docs/AKUMA_SELF_HOSTING.md`](AKUMA_SELF_HOSTING.md). The sections below remain the
+> reference for the original `hello.rs` syscall bring-up.
+
 ## Status
 
 | Stage | State |
@@ -25,6 +36,7 @@ is solid.
 | CLOEXEC handshake read (`recvmsg` on the socketpair) | ✅ **fixed** (§4d) — socket recv/send syscalls now route `UnixSocket` fds to the backing pipes; was the real `the CLOEXEC pipe failed: … Bad file descriptor` |
 | Final link (invoking `clang`→`ld`) | ✅ **works** — completes and produces a runnable binary |
 | **End-to-end `rustc hello.rs`** | ✅ **WORKS (verified 2026-05-31)** — `rustc -C linker=clang hello.rs -o /tmp/hello_rust` compiles, links via `clang-21`→`ld`, and the binary runs: `/tmp/hello_rust` → `Hello from Akuma!` |
+| **Full Akuma kernel build in-VM** (nightly musl toolchain) | ✅ **WORKS (verified 2026-06-19)** — `cargo build --release -p akuma` compiles all 147 units + links via `rust-lld`; the self-built ELF boots to SSH. Details in [`docs/AKUMA_SELF_HOSTING.md`](AKUMA_SELF_HOSTING.md) §7j |
 
 > **Perf caveat:** an end-to-end compile takes ~3 min, dominated by the fork
 > CoW copying the whole ~75k-page address space on each `fork` (~30 s `mmap` +

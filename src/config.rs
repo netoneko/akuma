@@ -124,6 +124,23 @@ pub const USER_THREAD_STACK_SIZE: usize = 128 * 1024;
 #[cfg(kernel_profile_size)]
 pub const USER_THREAD_STACK_SIZE: usize = 64 * 1024;
 
+/// Maximum length (bytes) of a single `argv`/`envp` string copied in by
+/// `execve`/`spawn`. Linux's `MAX_ARG_STRLEN` is 32 pages (128 KB); cargo/rustc
+/// routinely pass multi-KB single arguments (e.g. smoltcp's build-script
+/// `--check-cfg 'cfg(feature, values(...))'` is ~5 KB), so the self-host build
+/// needs the full Linux cap. The small-memory profiles keep a tight cap to bound
+/// the per-arg heap copy — they never run a host toolchain.
+///
+/// NOTE: exceeding this is a hard `E2BIG` failure of the whole `execve` (matching
+/// Linux); it must NOT silently truncate the argument list (a too-short cap used
+/// to drop the over-long arg and every arg after it, exec'ing a corrupt argv).
+#[cfg(not(kernel_profile_size))]
+pub const MAX_ARG_STRLEN: usize = 128 * 1024; // Linux MAX_ARG_STRLEN
+#[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
+pub const MAX_ARG_STRLEN: usize = 8 * 1024;
+#[cfg(kernel_profile_extreme)]
+pub const MAX_ARG_STRLEN: usize = 4 * 1024;
+
 /// Enable stack canary checking
 ///
 /// When enabled, canary values are written at the bottom of each thread stack

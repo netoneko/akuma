@@ -967,6 +967,140 @@ residual hang).
 (holder-tracked per-page demand-paging serialization) + `clear_child_tid` always-wake.
 Self-test `test_fault_mutex_insert_remove` passes at boot.
 
+### 7j. 🎉 SELF-HOSTED — the Akuma kernel compiles AND links INSIDE Akuma (June 19 2026)
+
+**Akuma built its own kernel.** With the three fixes below stacked on §7h, the in-VM
+`cargo build --release -p akuma` ran to **`Finished \`release\` profile [optimized]
+target(s) in 8m 29s`** — all **147 build units**, including the `akuma(bin)` crate
+itself and the final `rust-lld` link. The output on `disk_selfhost.img` at
+`target/aarch64-unknown-none/release/akuma` is a valid **AArch64 ELF64 executable**
+(magic `7f454c46`, `e_machine=0xB7` EM_AARCH64, `e_type=2` ET_EXEC), **3,790,560
+bytes**. This is the first end-to-end self-host compile of the kernel.
+
+**Round-trip verified — the self-built kernel BOOTS.** Extracted off
+`disk_selfhost.img` host-side via the Docker loop-mount (`mount -o loop,ro` →
+`cp`; the SSH-`cat` copy still truncates at ~1 MB, §7d), `rust-objcopy`'d to a flat
+binary (2,958,944 bytes), and booted under QEMU/HVF: it detects the full 6144 MB,
+brings up PMM/MMU/exec, reaches `[SSH Server] Listening...` in ~3 s, and answers
+SSH (`uptime`, `uname -a` → `Akuma akuma 0.1.0 Akuma OS aarch64 Linux`). So:
+**Akuma compiled Akuma, and the result runs.** md5s (two independent builds of the
+same tree differ, as expected — in-VM nightly rustc + `-C strip=debuginfo`, no
+`fs-cache`, vs the host cross-build): in-VM `58436fbc0993698b10b312917cf784b6`,
+host fs-cache `f5dc8914b441d314ed1913c6912cb5cd`.
+
+**Exact in-VM build command (copy-paste).** Run over `ssh root@vm` against a
+`disk_selfhost.img` whose `/root/akuma` has the 2-line stable-parse edits applied
+(see "Prerequisites" below). The in-kernel mini-shell has no env/redirection, so
+`busybox env` sets up the environment and everything is passed on one line:
+
+```sh
+/bin/busybox env PATH=/usr/local/bin:/usr/bin:/bin HOME=/root CARGO_HOME=/root/.cargo \
+  RUSTC=/usr/local/bin/rustc CARGO_BUILD_TARGET=aarch64-unknown-none \
+  CARGO_TARGET_AARCH64_UNKNOWN_NONE_RUSTFLAGS=-Clink-arg=-T/root/akuma/linker.ld \
+  /usr/bin/cargo build --release -p akuma --manifest-path /root/akuma/Cargo.toml -j1
+```
+
+Why each piece:
+- **`/usr/bin/cargo`** = the **apk** cargo (stable 1.96). The nightly cargo at
+  `/usr/local/bin` still crashes at startup (`EC=0x0`), so apk cargo drives the build.
+- **`RUSTC=/usr/local/bin/rustc`** = the **nightly** rustc — it has the
+  `aarch64-unknown-none` precompiled std the kernel target needs (apk's rust only
+  ships the alpine triple). So: apk cargo orchestrates, nightly rustc compiles.
+- **`CARGO_BUILD_TARGET=aarch64-unknown-none`** + the linker-script
+  **`...RUSTFLAGS=-Clink-arg=-T/root/akuma/linker.ld`** are passed via env because
+  CWD is `/` over `ssh host cmd` (the §7 chdir bug), so `.cargo/config.toml` isn't read.
+- **`busybox env PATH=… HOME=/root CARGO_HOME=/root/.cargo`** — the mini-shell can't
+  set env; `busybox env` does it before `execve`.
+- **`-j1`** bounds peak memory.
+
+Prerequisites (not in the command itself):
+1. **Booted kernel must carry the §7h/§7i/§7j fixes** (exit_group reorder + 128 KB
+   `MAX_ARG_STRLEN` + `getpriority`) — these live in the *running* kernel, not the
+   source being compiled. Without them the build walls at proc-macro2 (12/147),
+   smoltcp (103/147), or the ENOSYS-as-pointer SIGSEGV.
+2. **On-disk `Cargo.toml` edits** so apk's *stable* cargo parses the workspace (apply
+   host-side via the Docker loop-mount; backup `Cargo.toml.selfhost-bak`): delete
+   line 1 `cargo-features = ["panic-immediate-abort"]`, and change `profile.size`'s
+   `panic = "immediate-abort"` → `"abort"`. (Release is `panic="abort"`, so neither
+   bit is actually needed by it.)
+3. **Boot with `SNAPSHOT=0 DISK=disk_selfhost.img`** so `target/` persists, and wrap
+   the command in a **retry loop** (`scripts/loop_selfhost_kernelbuild.py`) to ride
+   out the intermittent rustc SIGSEGV — each resume re-tries only the one crashed
+   crate (rest cached). Attempt 1 happened to go straight to `Finished`.
+
+Fixes that got from §7i's 102/147 to the finish line:
+1. **argv 1 KB truncation** → `MAX_ARG_STRLEN` 128 KB + `E2BIG` (the smoltcp wall, below).
+2. **`getpriority`/`setpriority` (140/141)** implemented (the ENOSYS-as-pointer crash, below).
+3. **A retry loop over the incremental build.** The remaining crashes (below) are
+   *intermittent*, so `scripts/loop_selfhost_kernelbuild.py` just re-runs the build;
+   each resume re-tries only the one crate whose rustc SIGSEGV'd (everything else is
+   cached) and continues. Attempt 1 of the loop went 104 → `Finished` in one pass
+   (num-bigint-dig, which had crashed the prior run, compiled fine on retry).
+
+**STILL-OPEN root cause — intermittent rustc SIGSEGV (ENOSYS-used-as-pointer).** A
+rustc rayon/codegen worker thread (tid 18/19/20) occasionally faults at the *same*
+`librustc_driver` site (`ELR=0x332461c8`) with the *same* arg pattern
+(`[ptr, -4096, size, region+0x10, region_end, 0]`) but a **varying syscall number**
+(seen as 141, then 70). A fixed call site issuing syscalls with a changing `x8`,
+intermittently, only on worker threads → smells like a **concurrency race in the
+EL0 syscall trap-frame path under multi-threaded rustc** (x8 read stale), NOT a
+specific missing syscall — so implementing 70 would just move it to the next number.
+Worked around for now by the retry loop (the crash is rare enough that the build
+completes within a few attempts; often in one). Likely the same family as the §7g/§7h
+multi-threaded-rustc concurrency bugs. **Next:** audit the EL0 sync handler's
+per-thread x8/trap-frame save under preemption; reproduce with a tight loop of a
+multi-threaded rustc compile and `THR-DUMP`/`FUTEX_DBG`.
+
+---
+
+### 7i. §7h fix breaks the proc-macro2 wall; kernel build reaches **102/147** (June 19 2026)
+
+With the §7h `exit_group` reaping-order fix in the booted kernel, the in-VM
+**kernel** `cargo build --release -p akuma` (apk cargo 1.96 + `RUSTC=`nightly, the
+§7e env-var invocation, `MEMORY=6144 DISK=disk_selfhost.img`, fs-cache) blew clean
+**past the old proc-macro2 deadlock** (which used to wedge forever at unit 12/147)
+and compiled **102 of 147 build units in ~9 min with zero hangs or crashes** —
+every proc-macro/derive crate (`proc-macro2`, `quote`, `syn`, `zerocopy-derive`,
+`der_derive`) plus the whole crypto/SSH stack (`curve25519-dalek`, `ecdsa`, `rsa`,
+`ed25519-dalek`, `crypto-bigint`, …). This is the **furthest the kernel self-host
+build has ever reached** and confirms §7h was THE proc-macro2 blocker.
+
+It then hit two *new* walls, both now fixed:
+
+**(a) `smoltcp` build script — argv truncated at 1 KB (FIXED).** Unit 103/147
+(`smoltcp(build.rs)`) failed with `error: Argument to option 'check-cfg' missing`.
+Root cause: the kernel's `execve` copied each argv string with a **1024-byte cap**
+(`copy_from_user_str(str_ptr, 1024)` in `sys_execve`) and, on a string that
+exceeded it, **`break`d the argv loop — silently dropping that arg AND every arg
+after it**, then exec'd a corrupt argv. smoltcp's build script passes a single
+`--check-cfg 'cfg(feature, values(...))'` argument ~5 KB long (every smoltcp
+feature listed), so rustc received a dangling `--check-cfg` with its value and all
+trailing flags gone. Fix: a profile-gated `config::MAX_ARG_STRLEN` (**128 KB in
+release** = Linux `MAX_ARG_STRLEN`; 8 KB size / 4 KB extreme) used for argv+envp,
+and `sys_execve` now **fails the whole exec with `E2BIG`** on an over-long arg
+instead of silently truncating (`src/config.rs`, `src/syscall/proc.rs`,
+`src/syscall/mod.rs` adds `E2BIG`).
+
+**(b) `getpriority` (syscall 141) unimplemented → ENOSYS-used-as-pointer SIGSEGV
+(intermittent).** On a re-run, a `curve25519-dalek` rustc (pid 647, in
+`librustc_driver` at `ELR=0x332461c8`) called **syscall 141 (`getpriority`)**,
+which fell through to the catch-all `ENOSYS` branch; the `-38` return was then used
+as a pointer (`FAR=0xffffffffffffffda`) → `[WILD-DA]` data abort, killing that build
+unit (and dropping the SSH session). **Intermittent** — rustc's rayon/threadpool
+calls it opportunistically, so the first run reached 102/147 without tripping it.
+Fix: implement `getpriority`/`setpriority` (return benign success) so the call can't
+ENOSYS-crash a build unit.
+
+**Build mechanics learned this session:** boot with **`SNAPSHOT=0`** (not the
+INSTANCE>0 default) so the build's `target/` persists on `disk_selfhost.img` across
+kernel iterations — each reboot then resumes the build incrementally instead of
+recompiling all ~100 deps from scratch (~9 min). The SSH-streamed build survives the
+whole compile (§5 fix); a dropped session leaves the build killed (not orphaned)
+when a build-unit rustc SIGSEGVs.
+
+**Next:** with both walls fixed, resume the incremental build and push past
+`smoltcp` → `embedded-tls` → the `akuma` kernel crate itself + the final link.
+
 ---
 
 ## 8. Other known issues

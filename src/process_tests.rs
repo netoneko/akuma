@@ -2397,14 +2397,34 @@ fn test_syscall_errno_compliance() {
 
     let no_eperm = mmap_ret != EPERM && bind_ret != EPERM && sp_ret != EPERM;
 
-    if mmap_ok && bind_ok && sp_ok && no_eperm && xa_ok && xa_no_off_by_one {
+    // getpriority(141)/setpriority(140) must NOT return ENOSYS: rustc's threadpool
+    // calls getpriority, and an ENOSYS (-38) return was used as a pointer →
+    // [WILD-DA] SIGSEGV that intermittently killed an in-VM build unit
+    // (docs/AKUMA_SELF_HOSTING.md §7i). getpriority returns the raw `20 - nice`
+    // form (>= 0 so it can't look like an errno); setpriority succeeds.
+    const NR_SETPRIORITY: u64 = 140;
+    const NR_GETPRIORITY: u64 = 141;
+    const ENOSYS: u64 = (-38i64) as u64;
+    let getprio_ret = crate::syscall::handle_syscall(NR_GETPRIORITY, &[0, 0, 0, 0, 0, 0]);
+    let setprio_ret = crate::syscall::handle_syscall(NR_SETPRIORITY, &[0, 0, 0, 0, 0, 0]);
+    let prio_ok = getprio_ret != ENOSYS && (getprio_ret as i64) >= 0
+        && setprio_ret != ENOSYS;
+
+    // The argv string cap must be at least Linux-ish in release so toolchain
+    // invocations with multi-KB single args (smoltcp's ~5 KB --check-cfg) survive
+    // (§7i). Small-memory profiles keep a tighter cap, but never below 4 KB.
+    let argv_cap_ok = crate::config::MAX_ARG_STRLEN >= 4 * 1024;
+
+    if mmap_ok && bind_ok && sp_ok && no_eperm && xa_ok && xa_no_off_by_one
+        && prio_ok && argv_cap_ok {
         console::print("[Test] syscall_errno_compliance PASSED\n");
     } else {
         crate::safe_print!(
-            160,
-            "[Test] syscall_errno_compliance FAILED: mmap={} bind={} setpgid={} setxattr={} lsetxattr={} fremovexattr={}\n",
+            224,
+            "[Test] syscall_errno_compliance FAILED: mmap={} bind={} setpgid={} setxattr={} lsetxattr={} fremovexattr={} getprio={} setprio={} argv_cap={}\n",
             mmap_ret as i64, bind_ret as i64, sp_ret as i64,
             xa_set as i64, xa_lset as i64, xa_frm as i64,
+            getprio_ret as i64, setprio_ret as i64, crate::config::MAX_ARG_STRLEN,
         );
     }
 }

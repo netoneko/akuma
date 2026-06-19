@@ -572,13 +572,18 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                 break;
             }
             if str_ptr == 0 { break; }
-            if let Ok(s) = copy_from_user_str(str_ptr, 1024) {
-                args.push(s);
-            } else {
-                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                    crate::safe_print!(64, "[syscall] execve: failed to copy argv[{}]\n", i);
+            // Fail the whole execve (E2BIG, Linux semantics) if an argument can't
+            // be copied — most often because it exceeds MAX_ARG_STRLEN. Previously
+            // this `break`d, which silently dropped the over-long arg AND every arg
+            // after it, then exec'd a corrupt argv (e.g. rustc saw `--check-cfg`
+            // with its giant value truncated away → "Argument to option missing").
+            match copy_from_user_str(str_ptr, crate::config::MAX_ARG_STRLEN) {
+                Ok(s) => args.push(s),
+                Err(_) => {
+                    crate::safe_print!(96, "[syscall] execve: argv[{}] too long or unreadable (cap={}) — E2BIG\n",
+                        i, crate::config::MAX_ARG_STRLEN);
+                    return E2BIG;
                 }
-                break;
             }
             i += 1;
         }
@@ -1139,7 +1144,7 @@ pub(super) fn parse_argv_array(ptr: u64) -> Vec<String> {
         }
         if str_ptr == 0 { break; }
         
-        match copy_from_user_str(str_ptr, 1024) {
+        match copy_from_user_str(str_ptr, crate::config::MAX_ARG_STRLEN) {
             Ok(s) => args.push(s),
             Err(_) => break,
         }

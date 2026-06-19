@@ -372,6 +372,7 @@ const ENOENT: u64 = (-2i64) as u64;
 const ESRCH: u64 = (-3i64) as u64;
 const EINTR: u64 = (-4i64) as u64;
 const EIO: u64 = (-5i64) as u64;
+const E2BIG: u64 = (-7i64) as u64;
 const ENOEXEC: u64 = (-8i64) as u64;
 const EBADF: u64 = (-9i64) as u64;
 const EAGAIN: u64 = (-11i64) as u64;
@@ -765,6 +766,15 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             ENOSYS
         }
         nr::SCHED_SETAFFINITY => 0,
+        // setpriority(which, who, prio) — we don't schedule by nice value; accept it.
+        140 => 0,
+        // getpriority(which, who) — the raw syscall returns `20 - nice` (kept >= 0 so
+        // a real nice can't look like an errno); musl computes the caller-visible nice
+        // as `20 - ret`. Return 20 => normal priority (nice 0). Leaving this
+        // unimplemented returned ENOSYS, which rustc's threadpool then used as a
+        // pointer → [WILD-DA] SIGSEGV that intermittently killed a build unit
+        // (docs/AKUMA_SELF_HOSTING.md §7i).
+        141 => 20,
         118 => { 0 }
         119 => {
             let param_ptr = args[1] as usize;
