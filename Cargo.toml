@@ -112,13 +112,12 @@ no-tests = ["akuma-net/small-sockets"]
 # akuma-ssh-crypto and never gated by this.
 kernel-tls = [
     "akuma-net/kernel-tls",
-    "dep:embedded-tls", "dep:x509-cert", "dep:der", "dep:const-oid", "dep:p256",
 ]
 # RSA cert verification for outbound HTTPS/TLS. Enabled by default; dropped by
 # the size/extreme profiles (their --no-default-features build omits it) to save
 # ~300 KB. Implies `kernel-tls`. SSH is Ed25519-only and unaffected; only
 # RSA-only HTTPS hosts break.
-tls-rsa = ["kernel-tls", "akuma-net/tls-rsa", "dep:rsa"]
+tls-rsa = ["kernel-tls", "akuma-net/tls-rsa"]
 # In-kernel `neko` text editor. Enabled by default; the size profile drops it
 # via `--no-default-features` in scripts/build_size.sh.
 neko = ["dep:akuma-editor"]
@@ -181,49 +180,13 @@ akuma-exec = { path = "crates/akuma-exec" }
 akuma-isolation = { path = "crates/akuma-isolation" }
 talc = "4"
 spinning_top = "0.3"
-# hashbrown without ahash (ahash requires CPU crypto extensions)
-hashbrown = { version = "0.14", default-features = false, features = ["allocator-api2"] }
-once_cell = { version = "1", default-features = false, features = ["alloc", "race"] }
 fdt = "0.1"
 smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"] }
 virtio-drivers = { version = "0.7", default-features = false }
 arm_pl031 = { version = "0.2", default-features = false }
-
-# SSH crypto dependencies (no_std compatible)
-sha2 = { version = "0.10", default-features = false }
-hmac = { version = "0.12", default-features = false }
-aes = { version = "0.8", default-features = false }
-ctr = { version = "0.9", default-features = false }
-x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize", "fast"] }
-rand_core = { version = "0.6", default-features = false }
-
 critical-section = { version = "1.2", default-features = false }
-
-# ext2 filesystem is implemented directly in src/vfs/ext2.rs
-# No external crate - custom implementation for better no_std compatibility
-
 embedded-io-async = { version = "0.6", default-features = false }
-
-
-# TLS support (no_std compatible) — gated behind the `kernel-tls` feature so the
-# extreme profile drops the in-kernel HTTPS stack. The active consumer is
-# akuma-net; these are kept here to pin features/patch for the workspace.
-# Using fork with exposed handshake/extensions modules for custom TlsVerifier
-embedded-tls = { version = "0.17", default-features = false, features = ["alloc"], optional = true }
-
-# X.509 certificate parsing (no_std compatible)
-x509-cert = { version = "0.2", default-features = false, optional = true }
-der = { version = "0.7", default-features = false, features = ["alloc", "oid"], optional = true }
-const-oid = { version = "0.9", default-features = false, optional = true }
-
-# ECDSA P-256 signature verification
-p256 = { version = "0.13", default-features = false, features = ["ecdsa"], optional = true }
-
-# RSA signature verification — gated behind the `tls-rsa` feature (off in
-# size/extreme profiles). The kernel proper does not use this directly; the
-# active consumer is akuma-net's TLS cert verifier.
-rsa = { version = "0.9", default-features = false, features = ["sha2"], optional = true }
 
 [patch.crates-io]
 # Fork based on v0.17.0 (commit 1eaaa136) with exposed handshake/extensions modules
