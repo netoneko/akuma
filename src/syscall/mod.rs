@@ -561,6 +561,7 @@ pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
 pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     CURRENT_SYSCALL_NR.store(syscall_num, Ordering::Relaxed);
 
+    akuma_exec::threading::set_thread_current_syscall(syscall_num);
     let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
         proc.last_syscall.store(syscall_num, Ordering::Relaxed);
@@ -879,6 +880,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
     };
 
+    akuma_exec::threading::set_thread_current_syscall(!0u64);
     if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
         proc.current_syscall.store(!0u64, Ordering::Relaxed);
     }

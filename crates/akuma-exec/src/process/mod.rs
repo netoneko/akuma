@@ -723,6 +723,12 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
             siblings.push((p.pid, p.thread_id));
         }
     });
+    {
+        let mut buf = [0u8; 96]; let mut pos = 0;
+        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+            format_args!("[ktg] my_pid={} tgid={} siblings={}\n", my_pid, tgid, siblings.len()));
+        if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+    }
 
     // PHASE 1: Mark ALL sibling threads as TERMINATED first.
     // This prevents them from running and acquiring locks while we clean up.

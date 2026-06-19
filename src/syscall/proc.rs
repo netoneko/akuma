@@ -194,6 +194,10 @@ pub(super) fn sys_set_robust_list(head: u64, len: usize) -> u64 {
 
 pub(super) fn sys_exit(code: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
+        if crate::config::FUTEX_DBG_ENABLED {
+            crate::tprint!(96, "[exit93] tid={} pid={} tgid={}\n",
+                akuma_exec::threading::current_thread_id(), proc.pid, proc.tgid);
+        }
         if crate::config::SYSCALL_DEBUG_NET_ENABLED {
             let elapsed_us = crate::timer::uptime_us().saturating_sub(proc.start_time_us);
             let secs = elapsed_us / 1_000_000;
@@ -274,6 +278,10 @@ pub fn sys_exit_group_pub(code: i32) -> ! {
 
 pub(super) fn sys_exit_group(code: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
+        if crate::config::FUTEX_DBG_ENABLED {
+            crate::tprint!(96, "[exit94] tid={} pid={} tgid={}\n",
+                akuma_exec::threading::current_thread_id(), proc.pid, proc.tgid);
+        }
         if crate::config::SYSCALL_DEBUG_NET_ENABLED {
             let elapsed_us = crate::timer::uptime_us().saturating_sub(proc.start_time_us);
             let secs = elapsed_us / 1_000_000;
@@ -291,23 +299,28 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         if crate::config::PROC_SYSCALL_LOG_ENABLED {
             crate::syscall::log::mark_exited(pid);
         }
-        notify_child_channel_exited(pid, code);
-        // If a goroutine thread (tgid != pid) is calling exit_group, the parent's
-        // wait4 waits on CHILD_CHANNELS[tgid], not CHILD_CHANNELS[pid].  Notify
-        // the tgid leader's channel now so the parent doesn't hang.
-        // kill_thread_group will remove the tgid leader's I/O channel (same Arc),
-        // but an explicit notify here is race-free and idempotent.
-        if tgid != pid {
-            notify_child_channel_exited(tgid, code);
-        }
         // Flush writable MAP_SHARED file mappings to disk while the address space
         // is still intact (kill_thread_group below tears it down).
         super::mem::flush_and_clear_shared_file_mappings(tgid);
-        // Kill sibling threads FIRST, before closing FDs.
-        // This prevents goroutines from being scheduled while we hold locks.
-        // Pass the real exit_group code so the leader's channel (read by the
-        // shell) reports the actual code, not a hardcoded -9.
+        // Reap sibling threads BEFORE notifying the parent.
+        //
+        // ORDERING IS LOAD-BEARING: notify_child_channel_exited() wakes the parent's
+        // wait4, which on a single core can immediately preempt us and reap THIS
+        // process (unregister_process), terminating the calling thread before it
+        // ever reaches kill_thread_group. Any sibling worker parked in FUTEX_WAIT
+        // (e.g. rustc's rayon pool) would then be orphaned — never terminated, never
+        // woken — hanging forever and keeping the process alive so the build driver
+        // (cargo) blocks indefinitely. This was the in-VM self-host deadlock
+        // (docs §7g). Killing the thread group first guarantees every sibling is
+        // terminated + woken regardless of when the parent runs.
         akuma_exec::process::kill_thread_group(pid, l0_phys, code);
+        notify_child_channel_exited(pid, code);
+        // If a goroutine thread (tgid != pid) is calling exit_group, the parent's
+        // wait4 waits on CHILD_CHANNELS[tgid], not CHILD_CHANNELS[pid].  Notify
+        // the tgid leader's channel too so the parent doesn't hang.
+        if tgid != pid {
+            notify_child_channel_exited(tgid, code);
+        }
         // Close all fds immediately so pipe write-ends are decremented and
         // epoll pollers (e.g. Go's parent waiting for compile stdout EOF) are
         // woken now. close_all() is idempotent — cleanup_process_fds() later

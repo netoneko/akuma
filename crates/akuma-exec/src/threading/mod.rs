@@ -322,6 +322,33 @@ static TOTAL_CPU_TIMES: [AtomicU64; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
+/// Per-THREAD current syscall number (`!0` = not in a syscall). Set by the
+/// syscall dispatch at entry and cleared at exit, keyed by thread id. Unlike
+/// `Process.current_syscall` (keyed by the address-space owner / leader, so a
+/// CLONE_VM/vfork child's syscalls are accounted to its parent), this is exact
+/// per-thread — needed to see which syscall a parked child is blocked in.
+static THREAD_CURRENT_SYSCALL: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(u64::MAX);
+    [INIT; MAX_THREADS]
+};
+
+/// Set the calling thread's current syscall number (or `!0` to clear at exit).
+pub fn set_thread_current_syscall(nr: u64) {
+    let tid = current_thread_id();
+    if tid < MAX_THREADS {
+        THREAD_CURRENT_SYSCALL[tid].store(nr, Ordering::Relaxed);
+    }
+}
+
+/// Read a thread's current syscall number (`!0` if not in a syscall).
+pub fn thread_current_syscall(tid: usize) -> u64 {
+    if tid < MAX_THREADS {
+        THREAD_CURRENT_SYSCALL[tid].load(Ordering::Relaxed)
+    } else {
+        u64::MAX
+    }
+}
+
 /// Atomic "sticky wake" flags - set when wake() is called, cleared when thread resumes
 static WOKEN_STATES: [AtomicBool; MAX_THREADS] = {
     const INIT: AtomicBool = AtomicBool::new(false);
@@ -3163,9 +3190,9 @@ pub fn dump_thread_resume_points() {
     for tid in 0..MAX_THREADS {
         let st = THREAD_STATES[tid].load(Ordering::SeqCst);
         if st == thread_state::FREE { continue; }
-        let (x30, elr, sp) = {
+        let elr = {
             let ctx = unsafe { &*get_context(tid) };
-            (ctx.x30, ctx.elr, ctx.sp)
+            ctx.elr
         };
         let stc = match st {
             x if x == thread_state::READY => 'r',
@@ -3175,18 +3202,31 @@ pub fn dump_thread_resume_points() {
             _ => '?',
         };
         // Correlate to a pid + its current syscall (which subsystem it's in).
-        let (pid, sc) = match crate::process::find_pid_by_thread(tid) {
+        let (pid, sc, tg, l0) = match crate::process::find_pid_by_thread(tid) {
             Some(p) => {
-                let scn = crate::process::lookup_process(p)
-                    .map(|pr| pr.current_syscall.load(Ordering::Relaxed))
-                    .unwrap_or(!0);
-                (p as i64, scn)
+                match crate::process::lookup_process(p) {
+                    Some(pr) => (p as i64, pr.current_syscall.load(Ordering::Relaxed),
+                                 pr.tgid as i64, pr.address_space.l0_phys() as u64),
+                    None => (p as i64, !0, -1, 0),
+                }
             }
-            None => (-1, !0),
+            None => (-1, !0, -1, 0),
         };
-        safe_print!(160,
-            "  tid={} st={} pid={} sc={} x30={:#x} elr={:#x} sp={:#x}\n",
-            tid, stc, pid, sc as i64, x30, elr, sp);
+        let _ = (tg, l0);
+        let tsc = thread_current_syscall(tid) as i64; // exact per-thread syscall
+        // For a thread parked in a syscall, its saved trap frame still holds the
+        // syscall args — x0 (futex uaddr), x1 (futex op). Lets us correlate a
+        // stuck FUTEX_WAIT to a (missing) FUTEX_WAKE on the same address.
+        let (a0, a1) = {
+            let fp = CURRENT_TRAP_FRAME[tid].load(Ordering::Acquire);
+            if fp != 0 {
+                let f = unsafe { &*(fp as *const UserTrapFrame) };
+                (f.x0, f.x1)
+            } else { (0, 0) }
+        };
+        safe_print!(255,
+            "  tid={} st={} pid={} tgid={} l0={:#x} sc={} tsc={} a0={:#x} a1={:#x} elr={:#x}\n",
+            tid, stc, pid, tg, l0, sc as i64, tsc, a0, a1, elr);
     }
 }
 
