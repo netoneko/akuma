@@ -723,7 +723,7 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
             siblings.push((p.pid, p.thread_id));
         }
     });
-    {
+    if crate::runtime::config().syscall_debug_info_enabled {
         let mut buf = [0u8; 96]; let mut pos = 0;
         let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
             format_args!("[ktg] my_pid={} tgid={} siblings={}\n", my_pid, tgid, siblings.len()));

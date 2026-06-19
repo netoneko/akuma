@@ -151,13 +151,13 @@ pub const CANARY_WORDS: usize = 8;
 /// pool issues thousands of wait/wake ops during inference. Flip to `true` only
 /// when actively debugging futex wait/wake pairing. (Verified separately that
 /// wake delivery is correct and prompt — ~401 µs — see `test_futex_wake_latency_prompt`.)
-pub const FUTEX_DBG_ENABLED: bool = true; // TEMP: deadlock hunt (docs §7g)
+pub const FUTEX_DBG_ENABLED: bool = false;
 
 /// When true, the Thread-0 heartbeat periodically dumps every non-idle thread's
 /// saved kernel/user resume point (`[THR-DUMP]`) once `>= 2` threads are WAITING.
 /// A deadlock-hunt aid (docs §7g) for locating where parked threads are stuck
 /// without SSH (which can itself wedge). Off by default — noisy under normal load.
-pub const DEADLOCK_THREAD_DUMP_ENABLED: bool = true; // TEMP: deadlock hunt (docs §7g)
+pub const DEADLOCK_THREAD_DUMP_ENABLED: bool = false;
 
 /// Fail tests if test binaries are missing
 ///

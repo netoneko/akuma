@@ -910,6 +910,63 @@ binary on a Linux/aarch64 musl host and stage it, rather than building in-VM.
 `DEADLOCK_THREAD_DUMP_ENABLED` in `src/config.rs`; the `ps` builtin's saved-kernel-PC
 column and `threading::dump_thread_resume_points()` / `get_saved_kernel_resume()`.
 
+### 7h. ROOT CAUSE FOUND + FIXED — exit_group reaped siblings AFTER notifying the parent (June 19 2026)
+
+Instrumentation drill-down (per-thread `current_syscall`, futex uaddr in `[THR-DUMP]`,
+full `FUTEX_DBG` WAIT/WAKE trace, `[exit93]`/`[exit94]`/`[ktg]`/`[eg-*]` markers) pinned
+the deadlock to an **ordering race in `sys_exit_group`**.
+
+**The mechanism.** rustc's rayon worker threads (CLONE_THREAD, sharing the leader's
+`tgid`/`l0_phys`) park in `FUTEX_WAIT`. When rustc finishes, its leader thread calls
+`exit_group`, whose job is to reap those siblings via `kill_thread_group` (which
+marks each sibling TERMINATED **and wakes it** so it leaves its futex wait and exits).
+But `sys_exit_group` did this in the wrong order:
+
+```
+proc.state = Zombie;
+notify_child_channel_exited(pid);   // <-- wakes the PARENT's wait4
+...
+kill_thread_group(pid, …);          // <-- reaps the worker siblings
+```
+
+On a single core, `notify_child_channel_exited` wakes the parent's `wait4`, which
+immediately preempts the exiting thread and **reaps the leader** (`unregister_process`),
+terminating the leader's `exit_group` thread **before it ever runs
+`kill_thread_group`**. The rayon workers are then orphaned: never terminated, never
+woken — stuck in `FUTEX_WAIT` forever. No `FUTEX_WAKE` is ever issued on their futex
+words (confirmed: the entire trace shows zero wakes on `0x3d3c5ec4`/`0x3d71c658`).
+The process never fully dies, so `cargo`'s `wait4`/jobserver poll blocks forever.
+
+Trace proof: leaders **with** stuck workers logged `[exit94]` but **no `[ktg]`** (the
+thread was killed between the two), while clean exits logged `[ktg … siblings=N]`.
+
+**The fix** (`src/syscall/proc.rs`, `sys_exit_group`): reap the thread group **before**
+notifying the parent — call `kill_thread_group` first, then
+`notify_child_channel_exited`. Now every sibling is terminated + woken regardless of
+when the parent runs. (Flush of writable `MAP_SHARED` mappings still precedes the kill,
+so the address space is intact for it.)
+
+**Validation.** After the fix, repro v2 runs to completion: `[REPRO] DONE — build.rs
+completed without deadlock`, the build proceeds to compile `lib.rs`, and fails with the
+**expected** `error[E0463]: can't find crate for std` (the repro's `lib.rs` needs std
+but the build target is bare-metal `aarch64-unknown-none`) — i.e. no hang, normal build
+progression. `[ktg] my_pid=182 siblings=3` / `my_pid=186 siblings=3` now fire (workers
+reaped); the post-build process table is clean (no orphans, `wait=1`).
+
+**Residual (still open).** A heavier multi-threaded rustc compile (building
+`userspace/selfhost_repro/futextest.rs` in-VM) **still wedges** — a *distinct*
+manifestation: a futex wait that hangs **during** rustc's run (workers waiting on the
+main thread mid-compile), not at thread-group exit. The §7h fix does not cover it.
+Next: re-run with `FUTEX_DBG`/`THR-DUMP` on and find which side fails to issue the
+`FUTEX_WAKE` while the leader is still alive. The userspace futex test suite
+(`futextest.rs`) is the tool to isolate it once it can be built (cross-build on a
+Linux/aarch64-musl host and stage the binary, since building it in-VM trips the
+residual hang).
+
+**Separately fixed (latent, not this bug):** `fault_mutex` poison recovery
+(holder-tracked per-page demand-paging serialization) + `clear_child_tid` always-wake.
+Self-test `test_fault_mutex_insert_remove` passes at boot.
+
 ---
 
 ## 8. Other known issues

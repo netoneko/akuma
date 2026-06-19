@@ -185,6 +185,7 @@ pub fn run_all_tests() {
     test_alloc_mmap_resolves_tgid();
     test_fault_mutex_insert_remove();
     test_kill_thread_group_marks_siblings_zombie();
+    test_kill_thread_group_reaps_futex_blocked_sibling();
     test_schedule_blocking_respects_terminated();
 
     // kill_thread_group deadlock fix (two-phase termination)
@@ -4952,6 +4953,69 @@ fn test_kill_thread_group_marks_siblings_zombie() {
         crate::safe_print!(96,
             "[Test] kill_thread_group_marks_siblings_zombie FAILED: sibling_exists={} leader_exists={}\n",
             sibling_exists, leader_exists);
+    }
+}
+
+/// Regression for the in-VM self-host deadlock (docs §7h): a sibling thread
+/// parked in FUTEX_WAIT (WAITING state) when its thread group exits MUST be
+/// terminated by `kill_thread_group`, not left orphaned. The bug left rustc's
+/// rayon worker threads stuck in WAITING forever — their leader exited via
+/// `exit_group`, but because `exit_group` notified the parent (which then reaped
+/// the leader) BEFORE reaping the siblings, the workers were never terminated or
+/// woken, hanging cargo's `wait4` indefinitely. (The fix reorders `exit_group` to
+/// reap the group before notifying the parent; this test guards the core
+/// `kill_thread_group` invariant it relies on.)
+fn test_kill_thread_group_reaps_futex_blocked_sibling() {
+    use akuma_exec::process::{register_process, unregister_process, kill_thread_group,
+        register_thread_pid, unregister_thread_pid};
+    use akuma_exec::threading;
+
+    let leader_pid = 60_120;
+    let leader_proc = make_test_process(leader_pid);
+    let l0 = leader_proc.address_space.l0_phys();
+    register_process(leader_pid, leader_proc);
+
+    let claimed = threading::claim_test_thread_slots(1);
+    if claimed.len() != 1 {
+        unregister_process(leader_pid);
+        console::print("[Test] kill_thread_group_reaps_futex_blocked_sibling SKIPPED (no free slot)\n");
+        return;
+    }
+    let sib_tid = claimed[0];
+
+    // A CLONE_THREAD sibling: same tgid as the leader, sharing its address space,
+    // with a real thread id — exactly the shape of a rustc rayon worker.
+    let sib_pid = 60_121;
+    let mut sib = make_test_process(sib_pid);
+    sib.tgid = leader_pid;
+    if let Some(shared) = crate::mmu::UserAddressSpace::new_shared(l0) {
+        sib.address_space = shared;
+    }
+    sib.thread_id = Some(sib_tid);
+    register_process(sib_pid, sib);
+    register_thread_pid(sib_tid, sib_pid);
+
+    // Simulate the sibling parked in FUTEX_WAIT (the state the bug left orphaned).
+    threading::set_thread_state(sib_tid, threading::thread_state::WAITING);
+
+    // Leader exits → must reap the whole thread group.
+    kill_thread_group(leader_pid, l0, 0);
+
+    let terminated = threading::is_thread_terminated(sib_tid);          // not stuck WAITING
+    let unregistered = akuma_exec::process::lookup_process(sib_pid).is_none(); // auto-reaped
+
+    // Cleanup
+    unregister_thread_pid(sib_tid);
+    unregister_process(leader_pid);
+    let _ = unregister_process(sib_pid);
+    threading::release_test_thread_slot(sib_tid);
+
+    if terminated && unregistered {
+        console::print("[Test] kill_thread_group_reaps_futex_blocked_sibling PASSED\n");
+    } else {
+        crate::safe_print!(112,
+            "[Test] kill_thread_group_reaps_futex_blocked_sibling FAILED: terminated={} unregistered={}\n",
+            terminated, unregistered);
     }
 }
 
