@@ -170,7 +170,7 @@ impl TcpListener {
                 continue;
             }
 
-            return Err(Error::from_errno(errno as i32));
+            return Err(Error::from_errno(errno));
         }
     }
 

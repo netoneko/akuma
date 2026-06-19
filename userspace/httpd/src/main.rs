@@ -200,7 +200,7 @@ fn format_time_rfc1123(us: u64) -> String {
 }
 
 fn is_leap_year(year: u64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 fn extract_post_body(initial_data: &[u8], stream: &TcpStream) -> Option<Vec<u8>> {
@@ -444,7 +444,7 @@ fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str, body: Option
                 break 'header; // no CGI headers — treat whole buffer as body
             }
         } else {
-            if let Some(_) = waitpid(result.pid) {
+            if waitpid(result.pid).is_some() {
                 process_exited = true;
                 loop {
                     let n = read_fd(stdout, &mut io_buf);
@@ -492,11 +492,9 @@ fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str, body: Option
     }
 
     // Flush body bytes already in the header buffer
-    if body_offset < header_buf.len() {
-        if stream.write_all(&header_buf[body_offset..]).is_err() {
-            close(stdout);
-            return;
-        }
+    if body_offset < header_buf.len() && stream.write_all(&header_buf[body_offset..]).is_err() {
+        close(stdout);
+        return;
     }
 
     // Phase 2: stream remaining CGI output directly to the client
@@ -512,7 +510,7 @@ fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str, body: Option
                     break;
                 }
             } else {
-                if let Some(_) = waitpid(result.pid) {
+                if waitpid(result.pid).is_some() {
                     break;
                 }
                 if idle_ms >= CGI_IDLE_TIMEOUT_MS || total_ms >= CGI_WALL_TIMEOUT_MS {

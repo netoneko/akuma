@@ -344,7 +344,6 @@ fn parse_oci_config(json: &str) -> OciConfig {
 // ============================================================================
 
 struct SupervisedProcess {
-    name: String,
     config: ServiceConfig,
     pid: Option<u32>,
     stdout_fd: Option<u32>,
@@ -356,9 +355,8 @@ struct SupervisedProcess {
 }
 
 impl SupervisedProcess {
-    fn new(name: String, config: ServiceConfig) -> Self {
+    fn new(_name: String, config: ServiceConfig) -> Self {
         Self {
-            name,
             config,
             pid: None,
             stdout_fd: None,
@@ -565,7 +563,7 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
 fn parse_u64(s: &str) -> Option<u64> {
     let mut result: u64 = 0;
     for c in s.bytes() {
-        if c < b'0' || c > b'9' {
+        if !c.is_ascii_digit() {
             return None;
         }
         result = result.checked_mul(10)?.checked_add((c - b'0') as u64)?;

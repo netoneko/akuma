@@ -4,6 +4,7 @@
 
 #![no_std]
 #![feature(alloc_error_handler)]
+#![deny(warnings)]
 
 extern crate alloc;
 
@@ -32,11 +33,17 @@ core::arch::global_asm!(
 static INITIAL_SP: AtomicUsize = AtomicUsize::new(0);
 
 /// Initialize libakuma with the stack pointer from the kernel
+///
+/// # Safety
+///
+/// Must be called exactly once, by `_start`, before any other libakuma function.
+/// `sp` must be the stack pointer as received from the kernel at entry.
 #[no_mangle]
 pub unsafe extern "C" fn libakuma_init(sp: usize) {
     INITIAL_SP.store(sp, Ordering::SeqCst);
 }
 
+#[allow(dead_code)] // called from _start assembly, not visible to Rust
 extern "C" {
     fn main();
 }
@@ -175,7 +182,7 @@ pub const PAGE_SIZE: usize = 4096;
 ///   - _reserved: 4 bytes (alignment padding)
 ///   - cwd_data: 256 bytes (current working directory)
 ///   - argv_data: 744 bytes (null-separated argument strings)
-/// Total: 24 + 256 + 744 = 1024 bytes
+///     Total: 24 + 256 + 744 = 1024 bytes
 #[repr(C)]
 pub struct ProcessInfo {
     /// Process ID
@@ -220,8 +227,8 @@ pub fn getcwd() -> &'static str {
         asm!(
             "svc #0",
             in("x8") syscall::GETCWD,
-            in("x0") CWD_BUF.as_mut_ptr(),
-            in("x1") CWD_BUF.len(),
+            in("x0") core::ptr::addr_of_mut!(CWD_BUF) as *mut u8,
+            in("x1") 256usize,
             lateout("x0") result,
             options(nostack)
         );
@@ -271,7 +278,7 @@ impl<T> Spinlock<T> {
         }
     }
 
-    pub fn lock(&self) -> SpinlockGuard<T> {
+    pub fn lock(&self) -> SpinlockGuard<'_, T> {
         while self.locked.compare_exchange_weak(
             false,
             true,
@@ -463,7 +470,6 @@ pub fn syscall(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
 
 /// Exit the program with the given status code
 #[no_mangle]
-#[inline(always)]
 pub extern "C" fn exit(code: i32) -> ! {
     syscall(syscall::EXIT, code as u64, 0, 0, 0, 0, 0);
     // Should not reach here, but just in case
@@ -559,6 +565,7 @@ pub fn munmap(addr: usize, len: usize) -> isize {
 ///
 /// CRITICAL: We use mov+svc to avoid inout on x0, which ensures the compiler
 /// knows x0 is clobbered and will save/restore any important values.
+#[cfg(not(feature = "chunked-allocator"))]
 #[inline(never)] // Prevent inlining to ensure proper call/return semantics
 fn munmap_void(addr: usize, len: usize) {
     unsafe {
@@ -594,7 +601,7 @@ pub fn sleep(seconds: u64) {
 /// Sleep for the specified number of milliseconds
 #[inline(never)]
 pub fn sleep_ms(milliseconds: u64) {
-    let nanos = milliseconds.saturating_mul(1000_000);
+    let nanos = milliseconds.saturating_mul(1_000_000);
     syscall(syscall::NANOSLEEP, 0, nanos, 0, 0, 0, 0);
 }
 
@@ -668,9 +675,9 @@ impl SocketAddrV4 {
         // Parse IP
         let mut ip = [0u8; 4];
         let mut octets = ip_str.split('.');
-        for i in 0..4 {
+        for byte in &mut ip {
             let octet_str = octets.next()?;
-            ip[i] = parse_u8(octet_str)?;
+            *byte = parse_u8(octet_str)?;
         }
 
         // Parse port
@@ -683,7 +690,7 @@ impl SocketAddrV4 {
 fn parse_u8(s: &str) -> Option<u8> {
     let mut result: u8 = 0;
     for c in s.bytes() {
-        if c < b'0' || c > b'9' {
+        if !c.is_ascii_digit() {
             return None;
         }
         result = result.checked_mul(10)?.checked_add(c - b'0')?;
@@ -694,7 +701,7 @@ fn parse_u8(s: &str) -> Option<u8> {
 fn parse_u16(s: &str) -> Option<u16> {
     let mut result: u16 = 0;
     for c in s.bytes() {
-        if c < b'0' || c > b'9' {
+        if !c.is_ascii_digit() {
             return None;
         }
         result = result.checked_mul(10)?.checked_add((c - b'0') as u16)?;
@@ -1526,8 +1533,8 @@ pub fn clear_screen() -> i32 {
 
 /// Checks for and returns pending input events.
 pub fn poll_input_event(timeout_ms: u64, event_buf: &mut [u8]) -> isize {
-    let timeout_us = if timeout_ms == core::u64::MAX {
-        core::u64::MAX
+    let timeout_us = if timeout_ms == u64::MAX {
+        u64::MAX
     } else {
         timeout_ms.saturating_mul(1000)
     };
@@ -1540,11 +1547,7 @@ pub fn poll_input_event(timeout_ms: u64, event_buf: &mut [u8]) -> isize {
         0, 0, 0,
     ) as i64;
 
-    if ret < 0 {
-        ret as isize // Return negative errno
-    } else {
-        ret as isize // Return bytes read
-    }
+    ret as isize
 }
 
 /// Get CPU statistics for all threads.
@@ -1668,7 +1671,7 @@ impl Iterator for ReadDir {
                 }
                 let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
                 let name = core::str::from_utf8(name_bytes)
-                    .map(|s| alloc::string::String::from(s))
+                    .map(alloc::string::String::from)
                     .unwrap_or_default();
                 
                 let is_dir = entry.d_type == file_type::DT_DIR;
@@ -1711,6 +1714,7 @@ mod allocator {
     use core::ptr;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(not(feature = "chunked-allocator"))]
     const PAGE_SIZE: usize = 4096;
     const CHUNK_SIZE: usize = 64 * 1024; // 64 KB chunks
     const MAP_FAILED: usize = usize::MAX;
@@ -1954,12 +1958,10 @@ mod allocator {
             };
 
             let new_ptr = self.mmap_alloc(new_layout);
-            if !new_ptr.is_null() {
-                if !ptr.is_null() {
-                    let copy_size = layout.size().min(new_size);
-                    ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
-                    self.mmap_dealloc(ptr, layout);
-                }
+            if !new_ptr.is_null() && !ptr.is_null() {
+                let copy_size = layout.size().min(new_size);
+                ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+                self.mmap_dealloc(ptr, layout);
             }
             new_ptr
         }
