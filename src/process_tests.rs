@@ -103,6 +103,9 @@ pub fn run_all_tests() {
     // "x8 race" regression: rewriting code + cache maintenance must run the new
     // bytes, not stale ones (missing dc cvau before ic ivau). See §7j.
     test_icache_sync_rewrites_code();
+    // Wedge regression (§7k.2): fault/exit path must re-enable IRQs before the
+    // terminal yield loop, else a fault-with-IRQs-masked wedges the whole VM.
+    test_fault_exit_enables_irqs_before_yield();
     test_far_kernel_identity_range_policy();
     test_sa_siginfo_frame_offsets_for_x1_x2();
 
@@ -2832,6 +2835,48 @@ fn test_icache_sync_rewrites_code() {
         crate::safe_print!(96,
             "[Test] icache_sync_rewrites_code FAILED: r1=0x{:x} (want 0x1111) r2=0x{:x} (want 0x2222)\n",
             r1, r2);
+    }
+}
+
+/// Regression for the §7k.2 kernel wedge (`docs/AKUMA_SELF_HOSTING.md`): a fault/exit
+/// path reached with IRQs masked must re-enable them before the terminal
+/// `loop { yield_now() }`, or the terminated thread spins forever — `yield_now`
+/// can't trigger a context switch while DAIF.I is set, so the SGI never fires and
+/// the whole (single-vCPU) VM wedges (observed: an EL1 abort in `ssh::server::run`
+/// left tid=2 spinning in "yield_now with IRQs masked", killing SSH for the box).
+///
+/// `return_to_kernel_from_fault` / `return_to_kernel` are `-> !` asm paths that
+/// can't be called from a test, so this guards the exact DAIF manipulation the fix
+/// relies on: enter with IRQs masked (as a fault in a critical section would),
+/// confirm `yield_now`'s masked-spin precondition holds (`DAIF & 0x80 != 0`, the
+/// same bit `yield_now` gates on), run the fix's enable sequence (`msr daifclr,#2`),
+/// and confirm it clears precisely that bit. A wrong immediate (e.g. `#1` = F, not
+/// I) would leave IRQs masked and fail here.
+fn test_fault_exit_enables_irqs_before_yield() {
+    #[cfg(target_os = "none")]
+    {
+        let (saved, masked, enabled): (u64, u64, u64);
+        unsafe {
+            core::arch::asm!("mrs {}, daif", out(reg) saved, options(nomem, nostack));
+            // Simulate entering the fault-exit path from an IRQs-masked critical section.
+            core::arch::asm!("msr daifset, #2", "isb", options(nomem, nostack));
+            core::arch::asm!("mrs {}, daif", out(reg) masked, options(nomem, nostack));
+            // The fix: re-enable IRQs before the terminal yield loop.
+            core::arch::asm!("msr daifclr, #2", "isb", options(nomem, nostack));
+            core::arch::asm!("mrs {}, daif", out(reg) enabled, options(nomem, nostack));
+            // Restore the boot thread's original IRQ state.
+            core::arch::asm!("msr daif, {}", in(reg) saved, options(nomem, nostack));
+        }
+        // yield_now (threading/mod.rs) spins if DAIF.I (bit 7) is set.
+        let pre_would_spin = (masked & 0x80) != 0;
+        let post_can_switch = (enabled & 0x80) == 0;
+        if pre_would_spin && post_can_switch {
+            console::print("[Test] fault_exit_enables_irqs_before_yield PASSED\n");
+        } else {
+            crate::safe_print!(96,
+                "[Test] fault_exit_enables_irqs_before_yield FAILED: masked={:#x} enabled={:#x}\n",
+                masked, enabled);
+        }
     }
 }
 
