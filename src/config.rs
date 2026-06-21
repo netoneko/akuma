@@ -96,8 +96,14 @@ pub const MAX_PROCESSES: usize = 64;
 /// 64 KB is sufficient on release (opt-level=3 inlines aggressively, shallow frames).
 /// Size profile (opt-level=z, inlining off) has deeper frames on the SSH exec path —
 /// observed ELR=0x0 crash (stack overflow → corrupted return addr) at 64 KB.
+// release: 512 KB (was 64 KB). Bumped while investigating the intermittent
+// self-host register/memory corruption (docs/AKUMA_SELF_HOSTING.md §7k): the SSH
+// system thread overflowed 64 KB on a deep streaming path (ELR=0x0 / x29→.text
+// corruption, §7k.2). 512 KB makes stack overflow implausible on any release path,
+// so a *persisting* crash decisively rules overflow out. Lazily allocated — only
+// touched pages cost RAM. (size/extreme keep their measured tighter sizes below.)
 #[cfg(not(kernel_profile_size))]
-pub const SYSTEM_THREAD_STACK_SIZE: usize = 64 * 1024;
+pub const SYSTEM_THREAD_STACK_SIZE: usize = 512 * 1024;
 // size (non-extreme): 128 KB — the SSH exec path overflowed 64 KB (ELR=0x0).
 #[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
 pub const SYSTEM_THREAD_STACK_SIZE: usize = 128 * 1024;
@@ -119,8 +125,11 @@ pub const SYSTEM_THREAD_STACK_SIZE: usize = 96 * 1024;
 ///
 /// Halving the per-slot cost doubles how many user-thread slots fit the same
 /// PMM budget, paying for the `reserved + 6` floor in compute_thread_limit.
+// release: 512 KB (was 128 KB). Bumped for the §7k stack-overflow experiment —
+// rustc worker threads do a deep demand-paging→ext2→readahead chain plus a nested
+// IRQ trap frame; 512 KB removes overflow as a variable. Lazily allocated.
 #[cfg(not(kernel_profile_size))]
-pub const USER_THREAD_STACK_SIZE: usize = 128 * 1024;
+pub const USER_THREAD_STACK_SIZE: usize = 512 * 1024;
 #[cfg(kernel_profile_size)]
 pub const USER_THREAD_STACK_SIZE: usize = 64 * 1024;
 

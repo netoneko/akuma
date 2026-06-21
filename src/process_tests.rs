@@ -106,6 +106,9 @@ pub fn run_all_tests() {
     // Wedge regression (§7k.2): fault/exit path must re-enable IRQs before the
     // terminal yield loop, else a fault-with-IRQs-masked wedges the whole VM.
     test_fault_exit_enables_irqs_before_yield();
+    // Stack-size inversion regression (§7k): release must not be provisioned with
+    // less kernel stack than the constrained size/extreme profiles.
+    test_kernel_stack_sizes_sane();
     test_far_kernel_identity_range_policy();
     test_sa_siginfo_frame_offsets_for_x1_x2();
 
@@ -2877,6 +2880,37 @@ fn test_fault_exit_enables_irqs_before_yield() {
                 "[Test] fault_exit_enables_irqs_before_yield FAILED: masked={:#x} enabled={:#x}\n",
                 masked, enabled);
         }
+    }
+}
+
+/// Regression for the §7k kernel-stack-size inversion (`docs/AKUMA_SELF_HOSTING.md`):
+/// the `release` profile is the full-capability one that runs the in-VM self-host
+/// toolchain (deep rustc demand-paging chains; the SSH thread streams large data),
+/// yet it originally had a *smaller* system-thread stack (64 KB) than `size`
+/// (128 KB) and even `extreme` (96 KB) — which overflowed and corrupted a saved
+/// return address (§7k.2). A constrained profile must never be provisioned *more*
+/// kernel stack than release. This asserts the running profile's stacks meet a
+/// floor; for release the floor is deliberately generous so it can't regress back
+/// below the constrained profiles.
+fn test_kernel_stack_sizes_sane() {
+    let sys = config::SYSTEM_THREAD_STACK_SIZE;
+    let usr = config::USER_THREAD_STACK_SIZE;
+    // (sys_floor, usr_floor) per profile. Release must dominate the constrained
+    // profiles (whose ceilings are 128 KB sys / 64 KB usr).
+    #[cfg(not(kernel_profile_size))]
+    let (sys_floor, usr_floor) = (256 * 1024usize, 256 * 1024usize); // release
+    #[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
+    let (sys_floor, usr_floor) = (128 * 1024usize, 64 * 1024usize); // size
+    #[cfg(kernel_profile_extreme)]
+    let (sys_floor, usr_floor) = (96 * 1024usize, 64 * 1024usize); // extreme
+    if sys >= sys_floor && usr >= usr_floor {
+        crate::safe_print!(96,
+            "[Test] kernel_stack_sizes_sane PASSED (system={}KB user={}KB)\n",
+            sys / 1024, usr / 1024);
+    } else {
+        crate::safe_print!(112,
+            "[Test] kernel_stack_sizes_sane FAILED: system={}KB (floor {}KB) user={}KB (floor {}KB)\n",
+            sys / 1024, sys_floor / 1024, usr / 1024, usr_floor / 1024);
     }
 }
 
