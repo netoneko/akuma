@@ -1070,6 +1070,85 @@ the `-38` was used as a pointer → `[WILD-DA]`.
 
 ---
 
+### 7k. Re-verifying the x8 fix in-VM + two new findings (June 21 2026)
+
+Booted the **x8-fixed kernel** (host `cargo build --release`, the §7j cache fix in
+the *running* kernel) on `disk_selfhost.img` (`MEMORY=6144 SNAPSHOT=0 INSTANCE=1`,
+SSH on :2322) and drove a **clean** in-VM kernel build (`rm -rf
+target/aarch64-unknown-none` first, then the §7j env-var invocation, `--offline`,
+`-j1`). The boot self-test `test_icache_sync_rewrites_code` **PASSED** in the suite.
+
+**Result on the x8 race: not reproduced.** The build blew past the old 12/147
+proc-macro2 wall and reached **62/147** with **zero** occurrences of the x8-race
+signature (`ELR=0x332461c8` / `FAR=0xffffffffffffffda` / varying `x8`) — confirming
+the §7j `dc cvau` fix neither regresses the build nor lets the specific crash recur.
+(This kernel was built **without** `fs-cache`, so it is markedly slower per crate —
+every rustc spawn re-reads the toolchain off uncached ext2.)
+
+The build then stopped on **two distinct, *non*-x8 issues**, each root-caused below.
+
+#### 7k.1 — Build-stopping crash: a null-pointer deref in a rustc worker (the §7g/§7h residual)
+
+`rustc` SIGSEGV'd compiling **`ppv-lite86` (62/147)**. Kernel log:
+`[WILD-DA] pid=522 FAR=0x938 ELR=0x30d746a8 … x0=0x0 x19=0x0` → `Process 524
+(rustc) SIGSEGV … SIGSEGV in clone_thread`. The faulting thread is a **rayon worker**
+(`clone_thread`) that is *fully* set up — valid `SP_EL0`, frame pointer (`x29`),
+`TPIDR_EL0` (TLS base), and call chain — so this is **not** a thread-setup failure.
+
+Extracting `librustc_driver-*.so` from the disk image (Docker loop-mount) and mapping
+`ELR=0x30d746a8` to file offset `0xc746a8` (first PT_LOAD `vaddr=0, off=0`, mmap base
+`0x30100000`) decoded the faulting instruction as:
+
+```
+ldr w0, [x0, #0x938]     ; x0 = NULL  →  FAR = 0x938
+```
+
+i.e. a **null object-pointer dereference** reading a 32-bit field at offset `0x938`
+(a method receiver / `&self` that should have been a valid object). This is the
+documented **intermittent multi-threaded-rustc SIGSEGV residual** (§7g/§7h family),
+**distinct from the x8 race** — the playbook rides it out with the retry loop
+(`scripts/loop_selfhost_kernelbuild.py`): each resume re-tries only the crashed crate
+(rest cached). Separating "rustc-internal startup race" from a possible kernel
+stale/lost-write on a shared rayon page needs the live `GDB=1` repro (rustc ships no
+debug symbols to name the function). **Still open.**
+
+#### 7k.2 — Kernel wedge on a fault-with-IRQs-masked (FIXED)
+
+While SSHing in to investigate (heavy `dd | base64` streaming of the 320 MB `.so` +
+rapid reconnects, concurrent with the crashed process's teardown), the **SSH server
+thread** took a kernel `EC=0x25` and the **whole VM wedged** (SSH dead):
+
+```
+[Exception] Sync from EL1: EC=0x25, ISS=0x4f
+  ELR=0x401bf8f0 (akuma::ssh::server::run+0x58c), FAR=0x40328d78, SPSR=0x200003c5
+  Thread=2, TTBR0=0x403e0000, TTBR1=0x403e0000   # kernel tables, NOT a stale user TTBR0
+[SCHED] WARNING: yield_now with IRQs masked tid=2 lr=…return_to_kernel_from_fault+0x488   (forever)
+```
+
+- **The wedge mechanism (root cause + FIX).** `return_to_kernel_from_fault` ends in
+  `loop { yield_now() }` to let the scheduler reap the now-terminated thread. It is
+  entered from the EL1 fault-recovery pad, which ERETs with the **faulting code's
+  DAIF**. The fault here happened with **IRQs masked** (`SPSR=…3c5`), so `yield_now`'s
+  scheduler SGI is never delivered → the terminated thread spins forever → the entire
+  box hangs (a process-local fault escalated to a VM-wide wedge). **Fix**
+  (`crates/akuma-exec/src/process/mod.rs`): re-enable IRQs (`msr daifclr,#2; isb`)
+  before the terminal yield loop in `return_to_kernel_from_fault` (and defensively in
+  `return_to_kernel`), so a fault taken in any IRQ state still resolves to a **clean
+  single-process kill**.
+- **The `x29` corruption (still open).** Disassembly showed the faulting store
+  `strb w11,[x29]` is an inlined `safe_print!`/UART loop: the compiler keeps the **UART
+  data-register VA `0x80_0000_2000`** (device-MMIO remap, `boot.rs`) in `x29`, set once
+  and reused across all four print loops in `ssh::server::run`. It was clobbered to
+  `0x40328d78` = `akuma_exec::threading::check_preemption_watchdog+0xe4` — a *return
+  address on the yield/preempt path* (the fingerprint of an `x29`/`x30` save-restore
+  edge or kernel-stack pressure). Both standard switch paths (`switch_context`,
+  `irq_handler`) preserve `x29` symmetrically on inspection, so this is a rarer edge,
+  most plausibly kernel-stack pressure in the SSH data path under the abnormal
+  concurrent streaming load. The §7k.2 wedge fix means even a recurrence no longer
+  hangs the box; pinning the corruption source needs the live repro.
+
+---
+
 ### 7i. §7h fix breaks the proc-macro2 wall; kernel build reaches **102/147** (June 19 2026)
 
 With the §7h `exit_group` reaping-order fix in the booted kernel, the in-VM
