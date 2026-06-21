@@ -1026,19 +1026,47 @@ Fixes that got from §7i's 102/147 to the finish line:
    cached) and continues. Attempt 1 of the loop went 104 → `Finished` in one pass
    (num-bigint-dig, which had crashed the prior run, compiled fine on retry).
 
-**STILL-OPEN root cause — intermittent rustc SIGSEGV (ENOSYS-used-as-pointer).** A
-rustc rayon/codegen worker thread (tid 18/19/20) occasionally faults at the *same*
-`librustc_driver` site (`ELR=0x332461c8`) with the *same* arg pattern
-(`[ptr, -4096, size, region+0x10, region_end, 0]`) but a **varying syscall number**
-(seen as 141, then 70). A fixed call site issuing syscalls with a changing `x8`,
-intermittently, only on worker threads → smells like a **concurrency race in the
-EL0 syscall trap-frame path under multi-threaded rustc** (x8 read stale), NOT a
-specific missing syscall — so implementing 70 would just move it to the next number.
-Worked around for now by the retry loop (the crash is rare enough that the build
-completes within a few attempts; often in one). Likely the same family as the §7g/§7h
-multi-threaded-rustc concurrency bugs. **Next:** audit the EL0 sync handler's
-per-thread x8/trap-frame save under preemption; reproduce with a tight loop of a
-multi-threaded rustc compile and `THR-DUMP`/`FUTEX_DBG`.
+**ROOT CAUSE FOUND + FIXED — the "x8 race" was a D-cache/I-cache coherency hole, not
+a trap-frame race.** Symptom: a rustc rayon/codegen worker thread (tid 18/19/20)
+occasionally faulted at the *same* `librustc_driver` site (`ELR=0x332461c8`) with the
+*same* arg pattern (`[ptr, -4096, size, region+0x10, region_end, 0]`) but a **varying
+syscall number** (seen as 141, then 70). A fixed call site issuing syscalls with a
+changing `x8`, intermittently, only on worker threads — which *looked* like a stale
+`x8` in the trap frame. It was not the trap-frame path (that captures `x8`
+synchronously at the `svc` and the EL0 IRQ save/restore is symmetric). It was the CPU
+**fetching a stale instruction** at that call site — a `mov x8, #imm` whose immediate
+was wrong — so the kernel dispatched the wrong (or unimplemented) syscall → `ENOSYS` →
+the `-38` was used as a pointer → `[WILD-DA]`.
+
+- **The bug.** `MmuAddressSpace::invalidate_icache_for_page_va`
+  (`crates/akuma-exec/src/mmu/mod.rs`) issued `ic ivau` **without** a preceding
+  `dc cvau`. Its doc comment even claimed it "matches the `dc cvau`/`ic ivau`
+  pattern used when demand-paging file-backed text" — but it only did the `ic`
+  half. `ic ivau` invalidates the I-cache; the refill then reads from the Point of
+  Unification. When the code bytes were freshly written **through the D-cache** —
+  a `RW`→`RX` permission flip (the instruction-abort permission-fault fast path,
+  `exceptions.rs` ~2915, e.g. musl applying dynamic relocations into a code page),
+  or the signal-handler/restorer pages (`exceptions.rs` ~1228) — the dirty line
+  may not have reached the PoU yet, so the I-cache refilled **stale** instructions.
+  Nondeterministic (depends on D-cache eviction timing) and worse under
+  multi-threaded load (more cache pressure), exactly matching the observed
+  intermittent, worker-thread-only signature. (The *demand-paging* text path always
+  did `dc cvau` + `ic ivau` correctly, which is why a first-touch fetch was fine and
+  only the permission-flip / relocation path tripped.)
+- **The fix.** Added `akuma_exec::mmu::sync_icache_range(kva, len)` — the full
+  `dc cvau` (clean to PoU) → `dsb ish` → `ic ivau` → `dsb ish` → `isb` sequence —
+  and routed `invalidate_icache_for_page_va` through it. (`mmu/mod.rs`.)
+- **Regression test** (`test_icache_sync_rewrites_code`, `src/process_tests.rs`):
+  identity-mapped RAM is EL1-executable (no PXN, `boot.rs` `NORMAL_BLOCK`), so the
+  test writes a `movz x0,#0x1111; ret` stub into a fresh PMM page, runs
+  `sync_icache_range`, calls it, then **overwrites the same page** with
+  `movz x0,#0x2222; ret`, flushes, and calls again — proving the rewritten body
+  executes (the rewrite-the-same-physical-line case is exactly where a missing
+  `dc cvau` returns the stale `0x1111`). Verified **PASSED** at boot.
+- **Status.** With the cache-maintenance fix the retry loop (§7j prerequisites) is
+  belt-and-suspenders for the *other* intermittent rustc SIGSEGV class (the §7g/§7h
+  multi-threaded-rustc concurrency family); the specific "varying-`x8`" crash is
+  fixed at the source.
 
 ---
 

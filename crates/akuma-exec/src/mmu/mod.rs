@@ -177,6 +177,51 @@ pub fn virt_to_phys(vaddr: usize) -> usize {
     vaddr
 }
 
+/// Make freshly-written instruction bytes in `[kva, kva + len)` visible to the
+/// instruction-fetch path. `kva` is a *kernel* (identity) virtual address that
+/// aliases the physical bytes.
+///
+/// **Both halves are required.** `ic ivau` only invalidates the I-cache; the
+/// refill then reads from the Point of Unification. If the bytes were written
+/// through the D-cache (dynamic relocations, a W^X `RW`→`RX` flip, demand-paged
+/// text) the dirty line may not have reached the PoU yet, so without the
+/// preceding `dc cvau` the CPU can fetch **stale** instructions. Under
+/// multi-threaded loads this surfaced as a fixed user call site issuing a
+/// syscall with a corrupted `x8` — a stale `mov x8, #imm` — i.e. the "x8 race"
+/// (see `docs/AKUMA_SELF_HOSTING.md` §7j). Sequence:
+/// `dc cvau` (clean to PoU) → `dsb ish` → `ic ivau` (invalidate I-cache) →
+/// `dsb ish` → `isb`.
+///
+/// `len == 0` is a no-op. The range is widened down to the 64-byte cache-line
+/// containing `kva` so a sub-line `len` still cleans/invalidates the whole line.
+pub fn sync_icache_range(kva: usize, len: usize) {
+    #[cfg(target_os = "none")]
+    unsafe {
+        if len == 0 {
+            return;
+        }
+        // Cache Writeback Granule is 64 bytes on every core Akuma targets; align
+        // the start down so a partial first line is still maintained.
+        let start = kva & !63;
+        let end = kva + len;
+        let mut p = start;
+        while p < end {
+            core::arch::asm!("dc cvau, {}", in(reg) p);
+            p += 64;
+        }
+        core::arch::asm!("dsb ish");
+        let mut p = start;
+        while p < end {
+            core::arch::asm!("ic ivau, {}", in(reg) p);
+            p += 64;
+        }
+        core::arch::asm!("dsb ish");
+        core::arch::asm!("isb");
+    }
+    #[cfg(not(target_os = "none"))]
+    let _ = (kva, len);
+}
+
 #[cfg(target_os = "none")]
 pub fn flush_tlb_all() {
     unsafe {
@@ -833,16 +878,7 @@ impl UserAddressSpace {
             return;
         };
         let kva = phys_to_virt(pa) as usize;
-        #[cfg(target_os = "none")]
-        unsafe {
-            for off in (0..PAGE_SIZE).step_by(64) {
-                core::arch::asm!("ic ivau, {}", in(reg) kva + off);
-            }
-            core::arch::asm!("dsb ish");
-            core::arch::asm!("isb");
-        }
-        #[cfg(not(target_os = "none"))]
-        let _ = kva;
+        sync_icache_range(kva, PAGE_SIZE);
     }
 
     /// Check whether a virtual address has a valid page table entry (public).
@@ -1558,5 +1594,23 @@ fn is_page_mapped_ptr(l0_ptr: *const u64, va: usize) -> bool {
         let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
         let l3_entry = l3_ptr.add(l3_idx).read_volatile();
         l3_entry & flags::VALID != 0
+    }
+}
+
+#[cfg(test)]
+mod icache_tests {
+    use super::*;
+
+    // On the host target the cache-maintenance asm is compiled out, so this only
+    // guards that `sync_icache_range` is callable and that the `len == 0` and
+    // sub-cache-line cases don't panic / over-run. The real coherency proof is the
+    // on-target boot self-test `test_icache_sync_rewrites_code` (src/process_tests.rs),
+    // which writes + rewrites executable code and runs it (docs/AKUMA_SELF_HOSTING.md §7j).
+    #[test]
+    fn sync_icache_range_handles_edge_lengths() {
+        sync_icache_range(0x4000_0000, 0); // no-op
+        sync_icache_range(0x4000_0000, 1); // sub-line: widened to the containing line
+        sync_icache_range(0x4000_0007, 64); // unaligned start
+        sync_icache_range(0x4000_0000, PAGE_SIZE); // whole page
     }
 }

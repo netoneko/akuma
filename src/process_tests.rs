@@ -100,6 +100,9 @@ pub fn run_all_tests() {
     // MMU: RX promotion + I-cache invalidate (PLAN_SIGSEGV_COMPILE_FIX)
     test_update_page_flags_rw_to_rx_clears_uxn();
     test_icache_invalidate_page_va_smoke();
+    // "x8 race" regression: rewriting code + cache maintenance must run the new
+    // bytes, not stale ones (missing dc cvau before ic ivau). See §7j.
+    test_icache_sync_rewrites_code();
     test_far_kernel_identity_range_policy();
     test_sa_siginfo_frame_offsets_for_x1_x2();
 
@@ -2773,6 +2776,63 @@ fn test_icache_invalidate_page_va_smoke() {
     }
     p.address_space.invalidate_icache_for_page_va(va);
     console::print("[Test] icache_invalidate_page_va_smoke PASSED\n");
+}
+
+/// Regression for the "x8 race" (`docs/AKUMA_SELF_HOSTING.md` §7j): rewriting the
+/// instructions in a page and running the D-cache→I-cache maintenance sequence
+/// must make the **new** instructions execute, never the stale ones.
+///
+/// The bug was `sync_icache_range` / `invalidate_icache_for_page_va` issuing
+/// `ic ivau` **without** a preceding `dc cvau`: code bytes written through the
+/// D-cache (a `RW`→`RX` flip, dynamic relocations) were still dirty, so the
+/// I-cache refilled from a stale Point of Unification. On a fixed user call site
+/// that decoded as a corrupted `mov x8, #imm` → wrong syscall number → ENOSYS →
+/// SIGSEGV, intermittently and only under multi-threaded load.
+///
+/// This runs entirely at EL1: identity-mapped RAM is executable at EL1 (no PXN,
+/// see `boot.rs` `NORMAL_BLOCK`), so we write a tiny `movz x0,#imm; ret` stub
+/// into a fresh PMM page, flush, call it, then **overwrite** the same page with a
+/// different constant, flush, and call again — proving the rewritten body runs.
+fn test_icache_sync_rewrites_code() {
+    // AArch64: `movz x0, #imm` = 0xD2800000 | (imm << 5); `ret` = 0xD65F03C0.
+    fn stub(imm: u16) -> [u32; 2] {
+        [0xD280_0000 | (u32::from(imm) << 5), 0xD65F_03C0]
+    }
+    let Some(pf) = crate::pmm::alloc_page_zeroed() else {
+        crate::safe_print!(64, "[Test] icache_sync_rewrites_code SKIPPED: no PMM page\n");
+        return;
+    };
+    let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
+    let write = |code: [u32; 2]| unsafe {
+        let p = kva as *mut u32;
+        p.write_volatile(code[0]);
+        p.add(1).write_volatile(code[1]);
+    };
+    let call = || -> u64 {
+        let p = kva as *const ();
+        let f: extern "C" fn() -> u64 = unsafe { core::mem::transmute(p) };
+        f()
+    };
+
+    write(stub(0x1111));
+    akuma_exec::mmu::sync_icache_range(kva, 8);
+    let r1 = call();
+
+    // Reuse the SAME page with different code — this is where a missing dc cvau
+    // bites: the I-cache may still hold the 0x1111 stub for this physical line.
+    write(stub(0x2222));
+    akuma_exec::mmu::sync_icache_range(kva, 8);
+    let r2 = call();
+
+    crate::pmm::free_page(pf);
+
+    if r1 == 0x1111 && r2 == 0x2222 {
+        console::print("[Test] icache_sync_rewrites_code PASSED\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] icache_sync_rewrites_code FAILED: r1=0x{:x} (want 0x1111) r2=0x{:x} (want 0x2222)\n",
+            r1, r2);
+    }
 }
 
 /// Policy helper for EL0 IA replay: kernel identity RAM faults should not be treated as “stale TB”.
