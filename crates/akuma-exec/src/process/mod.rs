@@ -1126,7 +1126,14 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     crate::threading::mark_current_terminated();
     
     // Yield forever - thread is terminated, scheduler will reclaim it
-    // Thread 0's cleanup routine will free the thread slot
+    // Thread 0's cleanup routine will free the thread slot.
+    // Defensive (mirrors return_to_kernel_from_fault): if this exit was reached
+    // with IRQs masked, the yield loop could never switch away. Re-enable IRQs so
+    // the terminated thread is always schedulable off-CPU.
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!("msr daifclr, #2", "isb", options(nomem, nostack));
+    }
     loop {
         crate::threading::yield_now();
     }
@@ -1215,6 +1222,20 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
     }
 
     crate::threading::mark_current_terminated();
+
+    // CRITICAL: this path is entered from the EL1 fault-recovery pad, which ERETs
+    // with the *faulting* code's DAIF. If the fault hit a kernel critical section
+    // (IRQs masked, SPSR.I=1), the terminal yield loop below can never switch away
+    // — `yield_now` triggers the scheduler SGI, but a masked IRQ is never taken, so
+    // the now-terminated thread spins forever and wedges the whole VM (observed:
+    // an EL1 abort in ssh::server::run left tid=2 spinning in `yield_now with IRQs
+    // masked`, killing SSH for the entire box). Re-enable IRQs so the scheduler can
+    // preempt this terminated thread and reclaim it — turning a VM-wide hang back
+    // into a clean single-process kill.
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!("msr daifclr, #2", "isb", options(nomem, nostack));
+    }
 
     loop {
         crate::threading::yield_now();
