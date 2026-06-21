@@ -636,8 +636,108 @@ Old code wrote `(*frame).spsr_el1 = 0`, clearing NZCV and DAIF along with the ba
 
 ---
 
+## Evidence D: the rustc self-host build is a *reliable* reproducer (2026-06-22)
+
+The Go forktest repro was always flaky. The **in-VM rustc kernel self-host build**
+(`docs/AKUMA_SELF_HOSTING.md` §7k) turns out to be a far better trigger for this
+exact "register file corrupt after signal" class, and finally pins the shape:
+
+- **Volume:** one `cargo build -p akuma` issues **~10,400 `tkill(tid=N, sig=10)`
+  (SIGUSR1)** to a single worker thread (rustc's parallel front-end / codegen
+  thread coordination). Massive, steady signal traffic — exactly the load that
+  turns a rare delivery/restore race into ~**1 corruption per build**.
+- **Crash shape (identical to Evidence A/B/C):** an LTO/codegen `clone_thread`
+  faults with `last_sc` idle and a register holding an **errno-shaped value used
+  as a pointer**. Captured signatures this session:
+  - `futex(uaddr, op=0xffffffff, …)` → kernel logs `[futex] unsupported op=-1`
+    → returns `ENOSYS (-38)` → `[WILD-DA] FAR=0xffffffffffffffda` (`str w1,[x0]`,
+    `x0=-38`). **Only the `op` register (`x1`) is garbage**; uaddr/val/timeout/
+    uaddr2 are all valid → *single-register* corruption of a syscall argument.
+  - `x0=0` deref at `[x0,#0x938]` where disassembly proved the caller passed a
+    valid stack pointer → `x0` zeroed between the call and first use.
+  - `x0=-4096` loaded from a heap lookup-table entry.
+- **Ruled out this session:**
+  - **Stack overflow** — the crash *recurs* with kernel stacks bumped to 512 KB
+    (release was 64 KB system / 128 KB user). It also exposed a real **stack-size
+    inversion oversight** (release < extreme), now fixed; but it is **not** the
+    cause of this corruption.
+  - **A missing/zero-returning syscall** — the syscall *fails because its argument
+    is corrupt* (`op=-1`), not because it's unimplemented; the syscall log shows
+    `mmap`/`munmap`/`futex` all succeeding around the crash.
+  - **QEMU instruction misroute** — runs on **HVF** (hardware `svc`), and the
+    corruption is single-register, not a leftover-`x8` spurious syscall.
+
+### Root-cause candidate: the signal mask is **per-process, not per-thread**
+
+`Process::signal_mask` (`crates/akuma-exec/src/process/mod.rs:202`) is a single
+field. Both the delivery check (`exceptions.rs`, `take_pending_signal(p.signal_mask)`
+via `lookup_process(read_current_pid())`) and `sys_rt_sigprocmask`
+(`src/syscall/signal.rs`) operate on it through `current_process()`. But
+`read_current_pid()` **returns the address-space *owner* PID for every CLONE_THREAD
+sibling** (comment at `exceptions.rs` ~2851). So **all sibling threads share one
+signal mask** — a violation of POSIX/Linux semantics, where the signal mask is
+**per-thread** (`pthread_sigmask`).
+
+Why this matches the corruption: rust's parallel front-end uses **per-thread**
+masking to gate the SIGUSR1 storm so a thread is only interrupted at safe points.
+With a *shared* mask, one sibling's `rt_sigprocmask`/`sigreturn` (which restores
+`uc_sigmask` into the shared field, `exceptions.rs:1351`) **clears the block that a
+*different* sibling installed**, so SIGUSR1 is delivered to a thread *inside* its
+critical section / between setting a syscall arg and the `svc`. The resulting
+sigframe save/restore around that unsafe point is what corrupts a single register
+(`x1`/`x0`). It is single-vCPU (a race between siblings' mask ops, not SMP), rare
+per signal but ~1 per 10⁴ deliveries → ~1/build — all consistent.
+
+### Fix — per-thread signal mask (IMPLEMENTED 2026-06-22)
+
+Made the signal mask per-thread: `THREAD_SIGNAL_MASK: [AtomicU64; MAX_THREADS]`
+in `crates/akuma-exec/src/threading/mod.rs`, with `thread_signal_mask()` /
+`set_thread_signal_mask()` / `or_thread_signal_mask()` / `seed_thread_signal_mask()`
+/ `thread_signal_mask_of()` accessors keyed by `current_thread_id()`. All readers of
+the old shared `Process::signal_mask` were converted:
+
+- **Delivery** (`exceptions.rs`): the `take_pending_signal(mask)` checks (syscall-
+  return, JIT/IC-flush, and rt_sigreturn paths) read `thread_signal_mask()`; the
+  `uc_sigmask` saved into the sigframe is the per-thread mask; the delivered signal +
+  `sa_mask` are OR'd into the per-thread mask via `or_thread_signal_mask`.
+- **`sigreturn`** (`exceptions.rs` `do_rt_sigreturn`): restores `uc_sigmask` into the
+  per-thread mask (`set_thread_signal_mask`), not the shared field.
+- **`rt_sigprocmask`** (`src/syscall/signal.rs`): BLOCK/UNBLOCK/SETMASK all operate
+  on the calling thread's mask.
+- **`tkill`/`tgkill`**: read the *target* thread's mask for the fatal-default
+  blocked check (handler stays process-wide, since `sigaction` is process-wide).
+- **Lifecycle**: the mask is reset to 0 when a thread slot is recycled
+  (`claim_free_slot`) so a fresh thread can't inherit a dead thread's blocked set,
+  and seeded from the parent thread's mask at `clone(CLONE_THREAD)` (POSIX).
+
+`Process::signal_mask` is now vestigial (still copied at fork, no longer read for
+masking).
+
+**Verification:** kernel builds + clippy clean; all boot signal self-tests pass
+(`rt_sigreturn_restores_registers`, `pending_signal*`, `signal_mask_bit_numbering`,
+`take_pending_signal_sigurg_masked`); new host unit tests
+`per_thread_masks_are_independent` + `signal_mask_out_of_range_is_zero`
+(`threading::signal_mask_tests`) pass.
+
+**⚠️ This fix did NOT resolve the corruption.** End-to-end validation (clean in-VM
+self-host builds on the fixed kernel under the SIGUSR1 storm) **still crashed** — at
+crate 54/147, `[WILD-DA] FAR=0x0 x0=0 x1=0xfffffffffffff000 ELR=0x332461c8` (the
+original §7j site; a *null* deref, so it doesn't even match the errno-as-pointer
+shape). So the shared per-process mask was a real POSIX bug but **not** the (sole) root
+cause of the register corruption. The per-thread mask is **kept** as a correctness fix.
+The corruption is still open — see `docs/AKUMA_SELF_HOSTING.md` §7k.4 for the full
+hand-off (confirmed manifestations table, ruled-out list, remaining hypotheses
+[preemption register save/restore vs. kernel-corrupted heap], reproduce/catch recipe).
+The broadened `[WILD-DA-diag]`/`[futex-diag]` dumps remain in the tree — but note the
+WILD-DA-diag only fires on errno-shaped FAR, **not** the `FAR=0` null-deref variant
+(broaden its trigger to `|far| < 0x10000`).
+
+---
+
 ## Document history
 
 - **2026-05-10:** Initial write-up after analysis of `crash27.log` and user-reported Pattern 2 stacks; supports rollback of narrow `SIGURG` stub deferral and shift to signal-path audit.
 - **2026-05-10:** Code audit and fix plan added (findings F1.1–F5.2, fixes 1–6, eight new kernel tests).
 - **2026-05-10:** Fixes 1, 3, 5, 6 implemented in `src/exceptions.rs`; boot verified; fixes 2 and 4 deferred.
+- **2026-06-22:** Evidence D added — the rustc self-host build reliably reproduces the corruption (~1/build via a ~10,400× SIGUSR1 storm); ruled out stack overflow / missing-syscall / QEMU-misroute; identified the **per-process (shared) signal mask** as the root-cause candidate (should be per-thread).
+- **2026-06-22:** **Per-thread signal mask implemented** (`THREAD_SIGNAL_MASK[MAX_THREADS]`); all delivery / `rt_sigprocmask` / `sigreturn` / `tkill` sites converted; reset on slot recycle; seeded from parent on clone. Builds + boot signal tests + new host unit tests pass — **but the in-VM self-host build STILL crashed** (crate 54/147, `FAR=0x0`/`x0=0`/`ELR=0x332461c8`). Per-process mask was a real POSIX bug but **not** the root cause; kept as a correctness fix. Corruption STILL OPEN — hand-off in `docs/AKUMA_SELF_HOSTING.md` §7k.4.

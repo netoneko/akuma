@@ -307,6 +307,30 @@ papercut that "everyone expects" to work:
   Candidates for removal from `userspace/Cargo.toml` `members` to slim the
   self-host build surface (`sshd` is the lone `net-async` consumer; revisit whether
   either is still needed in-tree).
+- **Build a full pthreads / threading-API conformance test set.** The §7k.3
+  per-thread-signal-mask bug went undetected for a long time because nothing
+  exercised the threading/signal API the way a real multi-threaded program
+  (rustc/rayon) does — it only surfaced as an intermittent self-host crash. A
+  dedicated test set would catch this whole class up front. Cover, as standalone
+  userspace binaries (cross-built musl/aarch64 and staged on the disk) **and** as
+  boot self-tests where feasible:
+  - **Per-thread signal mask** — `pthread_sigmask`/`rt_sigprocmask` is per-thread:
+    one thread's BLOCK/UNBLOCK/SETMASK must not affect a sibling; mask survives a
+    signal-handler round-trip; a recycled thread slot starts with an empty mask; a
+    cloned thread inherits the creator's mask. (This is the exact §7k.3 regression.)
+  - **`pthread_create`/`join`/`detach`** — many threads, fan-out/fan-in, return
+    values, joinable vs detached, TLS (`tpidr_el0`) isolation per thread.
+  - **`pthread_mutex`/`cond`/`rwlock`/`barrier`/`once`/`spinlock`** — contention,
+    timed waits, broadcast, recursive/errorcheck mutexes (all futex-backed: stresses
+    `FUTEX_WAIT`/`WAKE`/`REQUEUE`/`WAIT_BITSET`/`CLOCK_REALTIME`).
+  - **Signals × threads** — `pthread_kill`/`tgkill` targeting a specific tid; async
+    delivery at arbitrary PCs (not just syscall stubs) with register-integrity
+    assertions across delivery+`sigreturn`; `sigaltstack` per thread; nested/
+    re-entrant delivery; fatal-signal → whole-group `exit_group`.
+  - **Cancellation, `pthread_atfork`, `pthread_key_*` (TSD with destructors).**
+  A `userspace/pthread_suite/` that prints `ALL PASSED`/`exit 0`, plus the targeted
+  register-integrity-under-signal-storm check, would have caught §7k.3 directly and
+  guards the cluster vision's multi-VM concurrency bar.
 - **In-VM `git` is broken for pulling — fix it.** Two separate problems block
   `git pull` of a branch into the on-disk `/root/akuma` (June 2026):
   1. **`git-remote-https` (apk git 2.54) SIGSEGVs** — `git fetch` over https dies
@@ -1146,6 +1170,125 @@ thread** took a kernel `EC=0x25` and the **whole VM wedged** (SSH dead):
   most plausibly kernel-stack pressure in the SSH data path under the abnormal
   concurrent streaming load. The §7k.2 wedge fix means even a recurrence no longer
   hangs the box; pinning the corruption source needs the live repro.
+
+#### 7k.3 — ROOT CAUSE of the intermittent rustc SIGSEGV: a per-process signal mask (FIXED June 22 2026)
+
+The §7k.1 worker-thread corruption was run to ground. **First a full self-host build
+was achieved**: with the icache (§7j) + wedge (§7k.2) fixes, `cargo build -p akuma`
+completed **147/147** in-VM via the retry loop (62 → 121 → `Finished`), riding out the
+intermittent crashes. Then the intermittent crash itself was root-caused.
+
+**Experiments that narrowed it (single-vCPU HVF):**
+- **Stack overflow — RULED OUT.** Bumping kernel stacks to **512 KB** (system + user)
+  did *not* stop the crash (recurred at crate 63 of a clean build). It *did* surface a
+  real **stack-size inversion oversight**: the full-capability `release` profile had a
+  *smaller* system-thread stack (64 KB) than `size` (128 KB) and `extreme` (96 KB).
+  **Fixed** — release is now the most generously provisioned (512 KB system + user),
+  with a regression self-test `test_kernel_stack_sizes_sane` (`src/process_tests.rs`).
+- **A missing / zero-returning syscall — RULED OUT.** Disassembly of the crash sites
+  showed the bad value is a *corrupted register*, not a syscall return: e.g. a real
+  `futex(uaddr, op=0xffffffff, …)` (kernel: `[futex] unsupported op=-1` → `ENOSYS`),
+  where *only the `op` register `x1`* is garbage; uaddr/val/timeout/uaddr2 are valid.
+  The syscall log shows `mmap`/`munmap`/`futex` all succeeding around the crash.
+- **The x8/icache race — did not recur** (the §7j fix held across ~600 crate-compiles).
+
+**Root cause: the signal mask was per-process, not per-thread.** `Process::signal_mask`
+is a single field, and `read_current_pid()` collapses every CLONE_THREAD sibling onto
+the **owner PID** — so **all sibling threads shared one signal mask**. The in-VM rustc
+build fires a **SIGUSR1 storm (~10,400 `tkill(sig=10)` per build)** at its worker/
+codegen threads and uses *per-thread* masking to gate those signals to safe points.
+With a shared mask, one sibling's `rt_sigprocmask` / `sigreturn` (which restored
+`uc_sigmask` into the shared field) **cleared the SIGUSR1 block another sibling had
+installed** → SIGUSR1 delivered mid-critical-section / between `mov x1,#op` and `svc` →
+the sigframe save/restore around that unsafe point **corrupted a single register**
+(`x0`→0, futex `op`/`x1`→`0xffffffff`, `x0`→`-38` used as a pointer). This is the
+long-documented-but-never-confirmed **signal/register-corruption** bug
+(`docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md` §D) — the flaky Go forktest never pinned
+it; the rustc self-host build, with its steady high signal volume, reproduces it
+~1/build.
+
+**Attempted fix (per-thread signal mask) — DID NOT resolve the corruption.** Made the
+signal mask **per-thread** (`THREAD_SIGNAL_MASK[MAX_THREADS]` keyed by
+`current_thread_id()`); delivery, `rt_sigprocmask`, `sigreturn`, and `tkill` all use it;
+reset on thread-slot recycle; seeded from the parent on `clone(CLONE_THREAD)`. Builds +
+clippy clean; all boot signal self-tests pass; new host unit tests
+`per_thread_masks_are_independent` / `signal_mask_out_of_range_is_zero` pass. **This is a
+genuine POSIX-correctness fix and is kept — but the in-VM validation build STILL crashed**
+(at crate 54/147, `[WILD-DA] FAR=0x0 x0=0x0 x1=0xfffffffffffff000 ELR=0x332461c8`, the
+original §7j site, arg pattern `[0,-4096,size,region,region_end,0]`). So the shared
+signal mask was **not** the (sole) root cause. The corruption persists at the same
+~1/build rate. **STILL OPEN** — see the hand-off in §7k.4.
+
+#### 7k.4 — HAND-OFF: the intermittent rustc register corruption (STILL OPEN, June 22 2026)
+
+State for the next session. **The full self-host build works** (147/147 via the retry
+loop); this is about eliminating the intermittent ~1/build crash so the build completes
+in a single pass.
+
+**The bug, precisely.** In a rustc worker/LTO `clone_thread`, intermittently (~1 per
+147-unit build, single-vCPU HVF), **a single register that should hold a valid pointer
+holds garbage**, and the next instruction uses it → `[WILD-DA]`. Confirmed
+manifestations (all in `librustc_driver`, all `last_sc` idle = not in a syscall):
+| crate/site | FAR | bad reg | source of the bad value (from disasm) |
+|---|---|---|---|
+| `0x332461c8` (the §7j site) | `0x0` | `x0=0` | `x0` = return of `bl 0x33c804c8`; then `str x1,[x0]` |
+| LTO cgu (`0x32ab64a8`) | `-38` | `x0=-38` | `x0` = return of `bl 0x33c804c8`; then `str w1,[x0]` |
+| ppv-lite86 (`0x30d746a8`) | `0x938` | `x0=0` | `x0` = a method `&self` arg passed valid by caller |
+| LTO cgu (`0x33a6a884`) | `-0xfe8` | `x0=-4096` | `x0` = `ldr [x7,#0x10]` (heap entry held -4096) |
+| futex (`sync.rs`) | `-38` | `x1=0xffffffff` | futex `op` arg garbage → `ENOSYS` → used as ptr |
+
+**`0x33c804c8` is a recurring suspect** — an alloc-like `librustc_driver` function
+(called `(x19, 8)`) that returns the bad `x0` in two of the crashes. Worth resolving
+its symbol (needs rustc debug info, which the shipped `.so` lacks) or single-stepping it
+under lldb.
+
+**Ruled out (with evidence):**
+- **Stack overflow** — recurs at 512 KB stacks (§7k.3). [Side fix kept: the release
+  system-stack was *smaller* than extreme's — inversion corrected, release now 512 KB.]
+- **Missing/zero-returning syscall** — the futex *fails because its arg is corrupt*;
+  `mmap`/`munmap`/`futex` all succeed in the syscall log around each crash.
+- **Per-process signal mask** — made it per-thread (§7k.3); crash still recurs. (Kept as
+  a correctness fix; **not** the root cause.)
+- **The §7j icache/x8 story for `0x332461c8` looks like a misdiagnosis** — that site is
+  `str x1,[x0]` where `x0` is a *function return*, not a stale `mov x8` immediate; the
+  icache `dc cvau` fix (§7j, real & kept) did not stop this site recurring.
+
+**Leading remaining hypotheses (for the new session):**
+1. **Register save/restore corruption across preemption** — a single GPR is wrong after
+   a context switch / signal-frame round-trip. Audit: the EL0 IRQ frame (`irq_el0_handler`),
+   `switch_context`, and the sigframe save/restore (`try_deliver_signal`/`do_rt_sigreturn`)
+   under the SIGUSR1 storm. The shapes (errno-/page-mask-/null-valued single regs) and the
+   documented `SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md` all point here, but the obvious paths
+   look symmetric on inspection — needs a **live catch**.
+2. **A kernel write corrupting a shared rustc heap structure** (the `0x33c804c8` allocator's
+   state), so it returns null/garbage. Single-vCPU rules out SMP visibility; suspect a
+   demand-paging / page-management edge under the heavy mmap/munmap churn.
+
+**How to reproduce + catch it (recipe):**
+- Boot the fixed kernel: `INSTANCE=1 GDB=1 MEMORY=6144M SNAPSHOT=0 DISK=disk_selfhost.img
+  cargo run --release` (gdbstub :1235, ssh :2322). `caffeinate -dimsu` to stop host sleep.
+- Drive clean builds in a loop (`/tmp/sh_batch.py N`, or `scripts/loop_selfhost_kernelbuild.py`);
+  ~1 crash per build. Kernel serial → `logs/selfhost_*_boot.log`.
+- **Diagnostics already in the tree** (rare-path only, keep): `[futex-diag]` (sync.rs, dumps
+  the user `svc`+`mov` stream on a corrupt futex op) and `[WILD-DA-diag]` (exceptions.rs,
+  dumps `insn@elr`/`insn@elr-4` + **`PREV-IS-SVC`** flag on an errno-shaped WILD-DA). NOTE
+  they DON'T fire on `FAR=0x0` (plain null deref, the `0x332461c8` variant) — **broaden the
+  WILD-DA-diag trigger to any small-|FAR| (e.g. `|far| < 0x10000`), not just `-200..0`.**
+- Best next experiment: boot `GDB=1`, set an lldb breakpoint on the fatal-EL0-DA path
+  (`maybe_print_sigsegv_syscall_diag` / the `[WILD-DA]` site) so the guest freezes *before*
+  the process is reaped, then read the faulting thread's full register file + walk back to
+  where the bad reg was produced; and inspect `0x33c804c8`'s state.
+
+**Side observation to investigate later:** `logs/selfhost_maskfix_boot.log` shows **~6,132
+`[EINVAL] nr=78` (readlinkat) at libc PC `0x30069828`, `args[0]=AT_FDCWD`** — the §7g.1
+"path isn't a symlink → EINVAL" red herring, but the *volume* (a tight loop) is suspicious;
+confirm it's benign vs a path-resolution retry storm (wasted work each build).
+
+**Committed/kept this session:** icache `dc cvau` fix (§7j/§7k) + test; EL1 fault-recovery
+IRQ-enable wedge fix (§7k.2) + test; release kernel-stack-inversion fix (§7k.3) + test;
+per-thread signal mask (POSIX-correct, not the root cause) + tests; the two diagnostics.
+**Tooling:** `/tmp/sh_batch.py` (clean-build loop + tally), `logs/batch_tally.txt`,
+`/tmp/akuma_extract/lrd.so` (extracted `librustc_driver` for disasm; offsets = VA − 0x30100000).
 
 ---
 

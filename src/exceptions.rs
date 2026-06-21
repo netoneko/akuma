@@ -1149,8 +1149,11 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         core::ptr::write(uc.add(24).cast::<i32>(),
             i32::from(on_altstack));                          // ss_flags (SS_ONSTACK=1)
         core::ptr::write(uc.add(32).cast::<u64>(), alt_size);                  // ss_size
-        // uc_sigmask — save the signal mask *before* we block the delivered signal
-        core::ptr::write(uc.add(40).cast::<u64>(), proc.signal_mask);          // uc_sigmask
+        // uc_sigmask — save the signal mask *before* we block the delivered signal.
+        // Per-thread (NOT proc.signal_mask, which is shared across CLONE_THREAD
+        // siblings via the owner PID) — see docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D.
+        core::ptr::write(uc.add(40).cast::<u64>(),
+            akuma_exec::threading::thread_signal_mask());                      // uc_sigmask
 
         // mcontext_t (sigcontext) - Zeroed by write_bytes(base, 0, ...)
         let mc = base.add(SIGFRAME_MCONTEXT);
@@ -1235,13 +1238,15 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     }
 
     // Block the delivered signal and the sa_mask signals during handler execution.
+    // Per-thread mask (see uc_sigmask note above): blocking on the shared
+    // proc.signal_mask would (un)block the signal for sibling threads too.
     if action.flags & SA_NODEFER == 0 && (1..=64).contains(&signal)
         && signal != 9 && signal != 19 { // SIGKILL/SIGSTOP cannot be masked
-            proc.signal_mask |= 1u64 << (signal - 1);
+            akuma_exec::threading::or_thread_signal_mask(1u64 << (signal - 1));
         }
     // Also apply the additional mask from sigaction(2): sa_mask is the set of signals
     // blocked while this handler runs.  SIGKILL (bit 8) and SIGSTOP (bit 18) are immune.
-    proc.signal_mask |= action.mask & !((1u64 << 8) | (1u64 << 18));
+    akuma_exec::threading::or_thread_signal_mask(action.mask & !((1u64 << 8) | (1u64 << 18)));
 
     crate::tprint!(128, "[signal] Delivering sig {} to handler {:#x} (restorer={:#x})\n",
         signal, handler_addr, restorer);
@@ -1343,13 +1348,13 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
             );
         }
 
-        // Restore signal mask from uc_sigmask (ucontext+40)
+        // Restore signal mask from uc_sigmask (ucontext+40) into the PER-THREAD mask
+        // (set_thread_signal_mask drops SIGKILL/SIGSTOP). Restoring into the shared
+        // proc.signal_mask is the bug that let one sibling's sigreturn clobber another
+        // thread's block — docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D.
         let uc_sigmask_ptr = (sigframe_sp + SIGFRAME_UCONTEXT + 40) as *const u64;
         let saved_mask = core::ptr::read(uc_sigmask_ptr);
-        if let Some(proc) = akuma_exec::process::current_process() {
-            // Never block SIGKILL (bit 8) or SIGSTOP (bit 18)
-            proc.signal_mask = saved_mask & !((1u64 << 8) | (1u64 << 18));
-        }
+        akuma_exec::threading::set_thread_signal_mask(saved_mask);
 
         // Restore FPSIMD state from signal frame into kernel stack NEON save area.
         // sync_el0_handler will restore NEON from frame+304 after rust_sync_el0_handler returns.
@@ -2025,12 +2030,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         // Go's sigpanic handler to try patching code at the wrong address,
                         // which itself faults → re-entrant SIGSEGV → process killed.
                         const FAULT_SIGNALS: u64 = (1 << 4) | (1 << 7) | (1 << 8) | (1 << 11);
-                        let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-                        let sig_mask = if let Some(p) = akuma_exec::process::lookup_process(pid) {
-                            p.signal_mask
-                        } else {
-                            0
-                        };
+                        let sig_mask = akuma_exec::threading::thread_signal_mask();
                         // Block fault signals in this path by adding them to the effective mask.
                         let effective_mask = sig_mask | FAULT_SIGNALS;
                         if let Some(sig) = akuma_exec::threading::take_pending_signal(effective_mask) {
@@ -2179,12 +2179,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                     // full register set in *frame, so delivery here sees the correct
                     // SP/PC. We must set frame.x0 = saved_x0 before delivering so
                     // that sigreturn from the nested handler restores the right value.
-                    let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-                    let sig_mask = if let Some(p) = akuma_exec::process::lookup_process(pid) {
-                        p.signal_mask
-                    } else {
-                        0
-                    };
+                    let sig_mask = akuma_exec::threading::thread_signal_mask();
                     if let Some(sig) = akuma_exec::threading::take_pending_signal(sig_mask) {
                         // For async signals like SIGURG, check if sigaltstack is ready
                         let thread_slot = akuma_exec::threading::current_thread_id();
@@ -2269,12 +2264,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             // Deliver any pending signal (e.g. SIGURG for Go goroutine preemption).
             // sys_tkill pends the signal; we deliver it here so the target thread
             // sees it at the next syscall boundary (async delivery via pending queue).
-            let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-            let sig_mask = if let Some(p) = akuma_exec::process::lookup_process(pid) {
-                p.signal_mask
-            } else {
-                0
-            };
+            let sig_mask = akuma_exec::threading::thread_signal_mask();
 
             if let Some(sig) = akuma_exec::threading::take_pending_signal(sig_mask) {
                 // For async signals like SIGURG (23), check if sigaltstack is configured.
@@ -2811,6 +2801,29 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                         crate::tprint!(256, "[WILD-DA] *** FAR={:#x} is -{} ({}) - syscall error used as pointer! ***\n",
                             far, errno, errno_name);
                         crate::tprint!(128, "[WILD-DA] This means a syscall returned error -{} and userspace used it as a pointer\n", errno);
+                        // §7k investigation (signal/register corruption, docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md):
+                        // dump the user instruction at the FAULT and the source syscall site so a
+                        // recurrence tells us whether the errno came from a REAL svc (genuine arg/
+                        // register corruption, e.g. via signal sigframe restore) or an instruction
+                        // mis-decode. We disassemble the faulting instr (to find which reg holds the
+                        // errno) and check whether the byte stream looks like a corrupted load/store.
+                        {
+                            let elr = frame_ref.elr_el1;
+                            let mut ib = [0u8; 8];
+                            let ok = unsafe {
+                                akuma_exec::mmu::user_access::copy_from_user_safe(
+                                    ib.as_mut_ptr(), elr.wrapping_sub(4) as *const u8, 8).is_ok()
+                            };
+                            if ok {
+                                let prev = u32::from_le_bytes([ib[0], ib[1], ib[2], ib[3]]);
+                                let at = u32::from_le_bytes([ib[4], ib[5], ib[6], ib[7]]);
+                                crate::safe_print!(200,
+                                    "[WILD-DA-diag] elr={:#x} insn@elr={:#010x} insn@elr-4={:#010x}{} x8={:#x}\n",
+                                    elr, at, prev,
+                                    if (prev & 0xFFE0_001F) == 0xD400_0001 { " (PREV-IS-SVC!)" } else { "" },
+                                    frame_ref.x8);
+                            }
+                        }
                     }
                     
                     crate::tprint!(384, "[WILD-DA] pid={} FAR={:#x} ELR={:#x} last_sc={}\n  x0={:#x} x1={:#x} x2={:#x} x3={:#x}\n  x4={:#x} x5={:#x} x6={:#x} x7={:#x}\n",

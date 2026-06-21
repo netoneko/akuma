@@ -376,8 +376,11 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
     }
 
     if flags & CLONE_THREAD != 0 && flags & CLONE_VM != 0 {
+        // POSIX: a new thread inherits the creating thread's (per-thread) signal mask.
+        let parent_mask = akuma_exec::threading::thread_signal_mask();
         match akuma_exec::process::clone_thread(stack, tls, parent_tid, child_tid) {
             Ok(tid) => {
+                akuma_exec::threading::seed_thread_signal_mask(tid as usize, parent_mask);
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED {
                     crate::tprint!(64, "[clone] new thread TID={}\n", tid);
                 }

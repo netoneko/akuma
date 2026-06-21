@@ -401,6 +401,40 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
         FUTEX_WAIT_REQUEUE_PI | FUTEX_CMP_REQUEUE_PI => ENOSYS,
         _ => {
             crate::tprint!(96, "[futex] unsupported op={} (cmd={})\n", op, cmd);
+            // §7k investigation: a corrupt futex op (e.g. -1) reaching here means the
+            // op register (x1) held garbage at the `svc`. Dump the user instruction
+            // stream at the syscall so a recurrence tells us WHICH mechanism:
+            //   - `svc #0` at [elr-4] AND a sane `mov w1,#<op>` just before, yet op is
+            //     garbage  → the register was corrupted after it was set (preemption /
+            //     context-switch save-restore bug);
+            //   - garbage/wrong instruction at [elr-4]/[elr-8] → stale I-cache mis-decode.
+            // ELR (trap frame) points just past the `svc`. Cheap; only the rare
+            // corruption path hits it.
+            if let Some(elr) = akuma_exec::threading::current_trap_frame_elr() {
+                let mut buf = [0u8; 12];
+                let read_ok = unsafe {
+                    akuma_exec::mmu::user_access::copy_from_user_safe(
+                        buf.as_mut_ptr(),
+                        elr.wrapping_sub(8) as *const u8,
+                        12,
+                    )
+                    .is_ok()
+                };
+                if read_ok {
+                    let pre = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]); // elr-8
+                    let svc = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]); // elr-4
+                    let nxt = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]); // elr
+                    let tid = akuma_exec::threading::current_thread_id();
+                    crate::safe_print!(
+                        224,
+                        "[futex-diag] tid={} elr={:#x} op={:#x} uaddr={:#x} val={} val3={} insn[-8]={:#010x} insn[-4]={:#010x}({}) insn[0]={:#010x}\n",
+                        tid, elr, op as u32, uaddr, val, val3, pre, svc,
+                        if svc == 0xd400_0001 { "svc#0" } else { "NOT-SVC" }, nxt,
+                    );
+                } else {
+                    crate::safe_print!(96, "[futex-diag] elr={:#x} user read failed\n", elr);
+                }
+            }
             ENOSYS
         }
     }

@@ -84,17 +84,17 @@ pub(super) fn sys_rt_sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigset
         return EINVAL;
     }
 
-    let proc = match akuma_exec::process::current_process() {
-        Some(p) => p,
-        None => return ENOSYS,
-    };
+    // POSIX signal masks are PER-THREAD. Operate on the calling thread's mask,
+    // not a process-shared field (which CLONE_THREAD siblings would all share via
+    // the owner PID) — docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D.
+    let cur = akuma_exec::threading::thread_signal_mask();
 
     // Return old mask if requested
     if oldset_ptr != 0 {
         if !validate_user_ptr(oldset_ptr, 8) {
             return EFAULT;
         }
-        if unsafe { copy_to_user_safe(oldset_ptr as *mut u8, (&raw const proc.signal_mask).cast::<u8>(), 8).is_err() } {
+        if unsafe { copy_to_user_safe(oldset_ptr as *mut u8, (&raw const cur).cast::<u8>(), 8).is_err() } {
             return EFAULT;
         }
     }
@@ -110,20 +110,14 @@ pub(super) fn sys_rt_sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigset
         }
 
         // SIGKILL (9) and SIGSTOP (19) cannot be blocked
-        let allowed_mask = new_mask & !((1u64 << 8) | (1u64 << 18));
-
-        match how {
-            SIG_BLOCK => {
-                proc.signal_mask |= allowed_mask;
-            }
-            SIG_UNBLOCK => {
-                proc.signal_mask &= !new_mask;
-            }
-            SIG_SETMASK => {
-                proc.signal_mask = allowed_mask;
-            }
+        let unblockable = (1u64 << 8) | (1u64 << 18);
+        let updated = match how {
+            SIG_BLOCK => cur | (new_mask & !unblockable),
+            SIG_UNBLOCK => cur & !new_mask,
+            SIG_SETMASK => new_mask & !unblockable,
             _ => return EINVAL,
-        }
+        };
+        akuma_exec::threading::set_thread_signal_mask(updated);
     }
 
     0
@@ -269,17 +263,19 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
 
     crate::safe_print!(96, "[signal] tkill(tid={}, sig={})\n", tid, sig);
 
-    // Get the target process (the one that owns the thread tid)
-    let (target_handler, target_mask) = if let Some(pid) = akuma_exec::process::find_pid_by_thread(tid as usize) {
+    // Handler is process-wide (sigaction); the mask is PER-THREAD — read the
+    // *target* thread's mask (docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D).
+    let target_mask = akuma_exec::threading::thread_signal_mask_of(tid as usize);
+    let target_handler = if let Some(pid) = akuma_exec::process::find_pid_by_thread(tid as usize) {
         if let Some(proc) = akuma_exec::process::lookup_process(pid) {
             let idx = (sig - 1) as usize;
             let actions = proc.signal_actions.actions.lock();
-            (actions[idx].handler, proc.signal_mask)
+            actions[idx].handler
         } else {
-            (akuma_exec::process::SignalHandler::Default, 0)
+            akuma_exec::process::SignalHandler::Default
         }
     } else {
-        (akuma_exec::process::SignalHandler::Default, 0)
+        akuma_exec::process::SignalHandler::Default
     };
 
     // SIGKILL (9) is always fatal and cannot be blocked/handled

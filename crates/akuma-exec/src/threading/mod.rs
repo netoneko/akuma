@@ -364,6 +364,61 @@ static PENDING_SIGNALS: [AtomicU64; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
+/// Per-thread **signal mask** (blocked-signal set). Bit N set = signal (N+1)
+/// blocked. This MUST be per-thread, not per-process: Linux/POSIX signal masks
+/// are per-thread (`pthread_sigmask`), and `read_current_pid()` collapses every
+/// CLONE_THREAD sibling onto the owner PID — so a `Process::signal_mask` is shared
+/// across all siblings, letting one thread's `rt_sigprocmask`/`sigreturn` clear a
+/// block another thread installed. That defeats per-thread masking used to gate
+/// async signals (e.g. rustc's SIGUSR1 storm) to safe points, delivering a signal
+/// mid-critical-section and corrupting a register — the long-standing
+/// signal/register-corruption bug (docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D).
+static THREAD_SIGNAL_MASK: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// Current thread's blocked-signal mask.
+pub fn thread_signal_mask() -> u64 {
+    let tid = current_thread_id();
+    if tid < MAX_THREADS { THREAD_SIGNAL_MASK[tid].load(Ordering::Acquire) } else { 0 }
+}
+
+/// Set the current thread's blocked-signal mask (SIGKILL/SIGSTOP can't be blocked).
+pub fn set_thread_signal_mask(mask: u64) {
+    let tid = current_thread_id();
+    if tid < MAX_THREADS {
+        let unblockable = (1u64 << 8) | (1u64 << 18); // SIGKILL(9), SIGSTOP(19)
+        THREAD_SIGNAL_MASK[tid].store(mask & !unblockable, Ordering::Release);
+    }
+}
+
+/// OR bits into the current thread's blocked-signal mask; returns the new mask.
+pub fn or_thread_signal_mask(bits: u64) -> u64 {
+    let tid = current_thread_id();
+    if tid < MAX_THREADS {
+        let unblockable = (1u64 << 8) | (1u64 << 18);
+        let prev = THREAD_SIGNAL_MASK[tid].fetch_or(bits & !unblockable, Ordering::AcqRel);
+        prev | (bits & !unblockable)
+    } else {
+        0
+    }
+}
+
+/// Seed a specific thread slot's signal mask (used at clone/spawn so a child
+/// inherits the parent thread's mask, matching Linux `CLONE` semantics).
+pub fn seed_thread_signal_mask(tid: usize, mask: u64) {
+    if tid < MAX_THREADS {
+        THREAD_SIGNAL_MASK[tid].store(mask, Ordering::Release);
+    }
+}
+
+/// Blocked-signal mask of a specific thread slot (0 for out-of-range).
+/// Used by `tkill`/`tgkill`, which target a thread by id.
+pub fn thread_signal_mask_of(tid: usize) -> u64 {
+    if tid < MAX_THREADS { THREAD_SIGNAL_MASK[tid].load(Ordering::Acquire) } else { 0 }
+}
+
 /// Per-thread alternate signal stack base address (0 = not set).
 /// Indexed by kernel thread slot so each CLONE_VM thread has its own sigaltstack.
 static THREAD_SIGALTSTACK_SP: [AtomicU64; MAX_THREADS] = {
@@ -443,6 +498,10 @@ fn claim_free_slot(start: usize, end: usize) -> Option<usize> {
             )
             .is_ok()
         {
+            // Reset the per-thread signal mask: slots are recycled, so a fresh
+            // thread must not inherit a terminated thread's blocked set. Clone/fork
+            // re-seed it from the parent afterwards (POSIX inheritance).
+            THREAD_SIGNAL_MASK[i].store(0, Ordering::Release);
             return Some(i);
         }
     }
@@ -3583,4 +3642,35 @@ pub fn print_stack_requirements() {
     safe_print!(96, "Grand total:            {} KB ({} MB)\n",
         summary.total_bytes / 1024,
         summary.total_bytes / (1024 * 1024));
+}
+
+#[cfg(test)]
+mod signal_mask_tests {
+    use super::*;
+
+    // Regression for the per-process→per-thread signal-mask fix
+    // (docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D): each thread slot must hold an
+    // INDEPENDENT blocked-signal mask. The bug was a single Process::signal_mask
+    // shared by all CLONE_THREAD siblings (via the owner PID), letting one thread's
+    // mask change clobber another's → mis-timed async-signal delivery → register
+    // corruption. These use the explicit-tid accessors (host-safe; no asm).
+    #[test]
+    fn per_thread_masks_are_independent() {
+        let (a, b) = (40usize, 41usize);
+        seed_thread_signal_mask(a, 0xAAAA_AAAA_AAAA_AAAA);
+        seed_thread_signal_mask(b, 0x5555_5555_5555_5555);
+        assert_eq!(thread_signal_mask_of(a), 0xAAAA_AAAA_AAAA_AAAA);
+        // The decisive check: changing slot A did not affect slot B.
+        assert_eq!(thread_signal_mask_of(b), 0x5555_5555_5555_5555);
+        // A fresh value on A leaves B untouched.
+        seed_thread_signal_mask(a, 0);
+        assert_eq!(thread_signal_mask_of(b), 0x5555_5555_5555_5555);
+        seed_thread_signal_mask(b, 0); // cleanup
+    }
+
+    #[test]
+    fn signal_mask_out_of_range_is_zero() {
+        assert_eq!(thread_signal_mask_of(MAX_THREADS), 0);
+        assert_eq!(thread_signal_mask_of(usize::MAX), 0);
+    }
 }
