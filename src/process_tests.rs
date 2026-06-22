@@ -103,6 +103,9 @@ pub fn run_all_tests() {
     // "x8 race" regression: rewriting code + cache maintenance must run the new
     // bytes, not stale ones (missing dc cvau before ic ivau). See §7j.
     test_icache_sync_rewrites_code();
+    // Stale-I-cache spurious-SVC guard (§7k.4): the SVC-instruction recogniser the
+    // guard uses to decide "the executed svc came from a stale I-cache line".
+    test_is_aarch64_svc_recogniser();
     // Wedge regression (§7k.2): fault/exit path must re-enable IRQs before the
     // terminal yield loop, else a fault-with-IRQs-masked wedges the whole VM.
     test_fault_exit_enables_irqs_before_yield();
@@ -2838,6 +2841,45 @@ fn test_icache_sync_rewrites_code() {
         crate::safe_print!(96,
             "[Test] icache_sync_rewrites_code FAILED: r1=0x{:x} (want 0x1111) r2=0x{:x} (want 0x2222)\n",
             r1, r2);
+    }
+}
+
+/// Regression for the §7k.4 stale-I-cache spurious-SVC guard
+/// (`docs/AKUMA_SELF_HOSTING.md`). The guard decides whether an `EC_SVC64` trap
+/// is real or a stale-I-cache phantom by checking the (cache-coherent) bytes at
+/// `ELR-4`: a real syscall always has an `svc` there. This guards the
+/// instruction recogniser at the heart of that decision against the exact
+/// encodings seen live: a real `svc #0` (the crash run had the spurious svc
+/// land on a `NOP`, `0xD503201F`, and a `movz x0,#0x1013`, `0xD2820260`) must be
+/// classified correctly, or the guard would either miss the phantom (crash
+/// recurs) or eat a real syscall (hang).
+fn test_is_aarch64_svc_recogniser() {
+    use crate::exceptions::is_aarch64_svc;
+    // Real SVCs (any immediate) — must be recognised.
+    let svcs = [
+        0xD400_0001u32, // svc #0   (the canonical Linux syscall encoding)
+        0xD400_0021,    // svc #1
+        0xD41F_FFE1,    // svc #0xffff (max immediate)
+    ];
+    // Non-SVC instructions seen at ELR-4 in the live spurious-SVC catches, plus
+    // common neighbours — must NOT be misread as an svc.
+    let non_svcs = [
+        0xD503_201Fu32, // nop                (crash-site insn@elr-4, run 1)
+        0xD282_0260,    // movz x0, #0x1013   (libc-site insn@elr-4, run 2)
+        0xD65F_03C0,    // ret
+        0xD400_0002,    // hvc #0  (not svc: op2 differs)
+        0xD400_0003,    // smc #0  (not svc)
+        0x0000_0000,    // udf / zero
+    ];
+    let ok = svcs.iter().all(|&i| is_aarch64_svc(i))
+        && non_svcs.iter().all(|&i| !is_aarch64_svc(i));
+    if ok {
+        console::print("[Test] is_aarch64_svc_recogniser PASSED\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] is_aarch64_svc_recogniser FAILED: svc#0={} nop={} movz={} hvc={}\n",
+            is_aarch64_svc(0xD400_0001), is_aarch64_svc(0xD503_201F),
+            is_aarch64_svc(0xD282_0260), is_aarch64_svc(0xD400_0002));
     }
 }
 

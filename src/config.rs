@@ -461,6 +461,29 @@ pub const SYSCALL_ERRNO_DIAG_EXTRA: bool = true;
 #[cfg(kernel_profile_extreme)]
 pub const SYSCALL_ERRNO_DIAG_EXTRA: bool = false;
 
+/// Stale-instruction-cache **spurious-SVC** guard (§7k.4 root cause).
+///
+/// At an `EC_SVC64` trap the CPU sets `ELR_EL1` to the instruction *after* the
+/// `svc`, so the instruction at `ELR-4` **must** be an `svc`
+/// (`0xD4000001` under mask `0xFFE0001F`). Reads of user memory are
+/// cache-coherent (they see the real bytes, not the I-cache), so if `ELR-4`
+/// reads back as anything *other* than `svc`, the CPU executed a **stale
+/// I-cache `svc`** at a PC whose backing memory is no longer an `svc` — a
+/// spurious syscall that, when dispatched, returns an errno into `x0` and
+/// clobbers the live register the real (non-`svc`) instruction expected. This
+/// is the long-open intermittent rustc self-host `[WILD-DA]`
+/// (`wait4(95)`/`futex` with pointer args → `EFAULT`/`ENOSYS` → `str [x0]`).
+///
+/// When `true`, such a spurious SVC is detected at entry, the I-cache is
+/// flushed (`ic iallu`), `ELR` is backed up by 4, and the syscall is **not**
+/// dispatched — so the real instruction re-executes with registers intact.
+/// Reads 4 bytes of user code per syscall; forced `false` on the low-RAM
+/// `extreme` profile.
+#[cfg(not(kernel_profile_extreme))]
+pub const VERIFY_SVC_AT_ENTRY: bool = true;
+#[cfg(kernel_profile_extreme)]
+pub const VERIFY_SVC_AT_ENTRY: bool = false;
+
 /// Log **`read()`** on **pipe reader FDs** (`PipeRead`): pid, tid, fd, pipe id, user
 /// buffer pointer and count on each syscall, plus **`validate_user_ptr`** /
 /// **`copy_to_user`** failures. Uses **`tprint`** timestamps so serial correlates with

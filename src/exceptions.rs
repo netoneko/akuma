@@ -1955,6 +1955,19 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
     safe_print!(64, "=============================\n");
 }
 
+/// Is `instr` an AArch64 `SVC` instruction (any immediate)?
+///
+/// Encoding: `SVC #imm16` = `0b11010100_000_iiiiiiiiiiiiiiii_00001`. The opcode
+/// bits (everything but the 16-bit immediate) are fixed at `0xD4000001`, so
+/// masking off the immediate field (`0xFFE0001F`) and comparing to `0xD4000001`
+/// recognises `svc` for any `imm16`. Used by the stale-I-cache spurious-SVC
+/// guard and the >500 JIT-replay workaround in `rust_sync_el0_handler`: at an
+/// `EC_SVC64` trap the (cache-coherent) instruction at `ELR-4` must satisfy
+/// this, or the executed `svc` came from a stale I-cache line.
+pub const fn is_aarch64_svc(instr: u32) -> bool {
+    (instr & 0xFFE0_001F) == 0xD400_0001
+}
+
 /// Synchronous exception handler from EL0 (user mode)
 /// Returns the syscall return value, or doesn't return if process exits
 #[unsafe(no_mangle)]
@@ -1973,6 +1986,67 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
             // System call - number in x8, args in x0-x5
             let frame_ref = unsafe { &*frame };
             let syscall_num = frame_ref.x8;
+
+            // Stale-I-cache spurious-SVC guard (§7k.4 root cause). At an EC_SVC64
+            // trap the hardware set ELR_EL1 to the instruction AFTER the svc, so
+            // the instruction at ELR-4 MUST be an svc. User-memory reads are
+            // cache-coherent, so if ELR-4 reads back as NOT an svc, the CPU
+            // executed a stale-I-cache svc at a PC whose backing memory is no
+            // longer an svc — a spurious syscall that would return an errno into
+            // x0 and clobber the live pointer the real instruction expected
+            // (the intermittent rustc WILD-DA: wait4(95)/futex with pointer args
+            // → EFAULT/ENOSYS → `str [x0]` faults). Recover by flushing the
+            // I-cache and re-executing from ELR-4 WITHOUT dispatching, so x0 is
+            // never corrupted. This generalizes the >500 JIT workaround below
+            // (which a VALID syscall number like 95 slips past). A legitimate
+            // syscall always reads back an svc here, so there are no false
+            // positives; the same-ELR replay counter bounds any non-I-cache
+            // cause so it falls through to normal dispatch instead of spinning.
+            if crate::config::VERIFY_SVC_AT_ENTRY {
+                use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+                static LAST_SPURIOUS_ELR: AtomicU64 = AtomicU64::new(0);
+                static SPURIOUS_REPLAYS: AtomicU32 = AtomicU32::new(0);
+                let elr = frame_ref.elr_el1;
+                let prev_instr = elr.checked_sub(4).and_then(|prev_va| {
+                    let mut buf = [0u8; 4];
+                    unsafe {
+                        akuma_exec::mmu::user_access::copy_from_user_safe(
+                            buf.as_mut_ptr(), prev_va as *const u8, 4,
+                        ).ok()
+                    }
+                    .map(|()| u32::from_le_bytes(buf))
+                });
+                // Only act when the prev instruction is readable AND definitively not an svc.
+                if let Some(instr) = prev_instr
+                    && !is_aarch64_svc(instr)
+                {
+                    let replays = if LAST_SPURIOUS_ELR.swap(elr, Ordering::Relaxed) == elr {
+                        SPURIOUS_REPLAYS.fetch_add(1, Ordering::Relaxed) + 1
+                    } else {
+                        SPURIOUS_REPLAYS.store(1, Ordering::Relaxed);
+                        1
+                    };
+                    if replays <= 8 {
+                        crate::safe_print!(192,
+                            "[SPURIOUS-SVC] stale-icache: nr={} elr={:#x} insn@elr-4={:#010x} (not svc) x0={:#x} — IC flush + replay #{}\n",
+                            syscall_num, elr, instr, frame_ref.x0, replays);
+                        unsafe {
+                            core::arch::asm!("ic iallu");
+                            core::arch::asm!("dsb ish");
+                            core::arch::asm!("isb");
+                            (*frame).elr_el1 = elr.wrapping_sub(4);
+                        }
+                        // Do NOT dispatch: return the live x0 so the epilogue restores
+                        // the original (un-clobbered) register and re-runs the real insn.
+                        return frame_ref.x0;
+                    }
+                    // Too many replays at the same ELR — unlikely to be I-cache;
+                    // fall through to normal dispatch rather than spin forever.
+                    crate::safe_print!(160,
+                        "[SPURIOUS-SVC] giving up at elr={:#x} after {} replays — dispatching nr={}\n",
+                        elr, replays, syscall_num);
+                }
+            }
 
             // JIT cache coherency workaround: bogus syscall numbers (> 500)
             // indicate stale instruction cache — JIT wrote new code but the
@@ -2004,8 +2078,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
                             }
                             .map(|()| u32::from_le_bytes(buf))
                         });
-                        let prev_is_svc = prev_instr
-                            .is_some_and(|instr| (instr & 0xFFE0001F) == 0xD4000001);
+                        let prev_is_svc = prev_instr.is_some_and(is_aarch64_svc);
                         // FIX_MEMORY_MAPPING.md / EPOLL_PERFORMANCE.md: stale icache can make the
                         // CPU decode the wrong SVC immediate; replay preserves ELR unless prev was SVC.
                         crate::safe_print!(128,

@@ -1219,7 +1219,13 @@ original §7j site, arg pattern `[0,-4096,size,region,region_end,0]`). So the sh
 signal mask was **not** the (sole) root cause. The corruption persists at the same
 ~1/build rate. **STILL OPEN** — see the hand-off in §7k.4.
 
-#### 7k.4 — HAND-OFF: the intermittent rustc register corruption (STILL OPEN, June 22 2026)
+#### 7k.4 — HAND-OFF: the intermittent rustc register corruption (~~STILL OPEN~~ → **ROOT-CAUSED + FIXED in §7k.6**, June 22 2026)
+
+> **RESOLVED — see §7k.6.** The root cause was a **stale-I-cache spurious `svc`**, not
+> register save/restore or heap corruption. The "function `0x33c804c8` returns garbage"
+> and "single corrupted register" framing below were the *symptom*; the garbage is a
+> spurious-syscall errno return clobbering `x0`. The hypotheses (1)/(2) below were both
+> wrong. Kept for the investigation trail.
 
 State for the next session. **The full self-host build works** (147/147 via the retry
 loop); this is about eliminating the intermittent ~1/build crash so the build completes
@@ -1395,6 +1401,73 @@ and handler/`sigreturn` round-trips need a real process — build them as `users
 additions or a `userspace/pthread_suite` (the doc's "ALL PASSED / exit 0" binary). That's
 where the §7k.4 intermittent register-corruption bug should be cornered, since it only
 manifests under real userspace async delivery at arbitrary PCs.
+
+#### 7k.6 — ROOT CAUSE of the §7k.4 intermittent SIGSEGV: a **stale-I-cache spurious `svc`** (FOUND + FIXED, June 22 2026)
+
+The §7k.4 "intermittent register corruption" was run to ground by catching it in the
+act. **It is not register save/restore corruption and not a heap-corruption write — it
+is a stale instruction cache delivering a *spurious `svc`*.**
+
+**The proof (clean from-scratch in-VM build, `disk_selfhost.img`, 6 GB, HVF).** A clean
+`cargo build -p akuma` (target wiped) crashed at unit **105/147 (`num-bigint-dig`)** with
+the canonical signature. The kernel diagnostics captured *both* the offending syscall and
+the fault, and comparing them is decisive:
+
+```
+[EFAULT] nr=95 (wait4) pid=877 tid=19 ELR=0x32ab64a8 args=[0x3e1fc9c0,0xffffffff,0x3fc,0x3e1e3010,0x3e20bffc,0x0]
+[WILD-DA] FAR=0xfffffffffffffff2 (-14 EFAULT) ELR=0x32ab64a8 insn@elr=0xb9000001 (str w1,[x0]) insn@elr-4=0xd503201f (NOP) x8=0x5f
+            syscall-entry x0..x5 → fault-time x0..x5:  x1..x5 IDENTICAL, only x0 changed 0x3e1fc9c0 → -14
+```
+
+One coherent register set: a **real** hardware `svc` trap fired (only `EC_SVC64` reaches
+this path), `wait4(95)` ran with those args, returned `-14` into `x0`, and `ERET` resumed
+at `str w1,[x0]` → data abort. **But `insn@elr-4` is a `NOP`, not an `svc`.** A real
+syscall *must* have an `svc` at `ELR-4` (hardware sets `ELR` to the instruction after the
+`svc`); user-memory reads are cache-coherent, so the only way the CPU executes an `svc`
+whose backing memory reads `nop` is a **stale I-cache line**. The spurious syscall
+returns an errno into `x0`, clobbering the live pointer the real (non-`svc`) instruction
+there expected → the next deref faults. This unifies every §7k.4 row (the errno-/page-/
+null-shaped `x0` values are just *whatever syscall the stale `svc` happened to run*; the
+"function `0x33c804c8` returns garbage" was a red herring — the garbage is a syscall
+return, not a corrupted heap entry).
+
+**This also explains why §7j's `dc cvau` fix and the per-thread signal mask didn't kill
+it** — both are real, kept fixes, but neither addresses *this* I-cache staleness. Note
+the staleness is **not** RO-page eviction (zero evictions occurred in the 6 GB build); it
+is a residual coherency effect on stable, mapped `librustc_driver`/`ld-musl` text under
+heavy concurrent mmap/TLB churn — the same class the §7j and the `>500` JIT-replay
+workaround already exist for.
+
+**The fix (`src/exceptions.rs`, `config::VERIFY_SVC_AT_ENTRY`).** Generalize the existing
+`>500` JIT-replay workaround to *every* syscall: at `EC_SVC64` entry, read the
+(cache-coherent) instruction at `ELR-4`; if it is **not** an `svc` (`is_aarch64_svc()`,
+mask `0xFFE0001F == 0xD4000001`), we caught a stale-I-cache spurious syscall — `ic iallu`
++ `dsb`/`isb`, back `ELR` up by 4, and **return without dispatching** so the real
+instruction re-executes with `x0` intact. A real syscall always reads back an `svc`, so
+there are no false positives; a same-`ELR` replay counter (≤8) bounds any non-I-cache
+cause so it falls through to normal dispatch instead of spinning. Costs one 4-byte user
+read per syscall (forced off on `extreme`).
+
+**Validation — caught red-handed, then a clean single pass.** Re-running the *same* clean
+build on the guarded kernel, the guard fired and recovered at the **exact crash site**:
+
+```
+[SPURIOUS-SVC] stale-icache: nr=144 elr=0x32ab64a8 insn@elr-4=0xd503201f (not svc) x0=0x1eea163b0 — IC flush + replay #1
+[SPURIOUS-SVC] stale-icache: nr=222 elr=0x30029f7c insn@elr-4=0xd2820260 (movz x0,#0x1013) x0=0x1013 — IC flush + replay #1
+```
+
+Same `ELR=0x32ab64a8`, same `insn@elr-4=NOP` as the crash — but `x0=0x1eea163b0` was a
+**valid pointer** (preserved by the guard) instead of being clobbered to an errno. The
+build then ran **147/147 to `Finished` in a single clean pass, zero `[WILD-DA]`** — the
+first crash-free from-scratch self-host build. Regression self-test
+`test_is_aarch64_svc_recogniser` (`src/process_tests.rs`) guards the recogniser against
+the live encodings (`svc #imm` vs the `NOP`/`movz` seen at `ELR-4`).
+
+> Follow-ups: (a) the guard is a robust *safety net* (like the JIT workaround) — the
+> deeper question of *which* path leaves a stable text page's I-cache stale under
+> mmap/TLB churn (HVF micro-arch vs. a missing maintenance point) is still worth pinning;
+> (b) the per-syscall 4-byte read has a measurable hot-path cost — consider narrowing it
+> (e.g. only when not recently verified) once the root staleness is understood.
 
 ---
 
