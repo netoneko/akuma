@@ -448,3 +448,29 @@ a significant step (it touches the hot socket path and the smoltcp ownership mod
 and is explicitly **out of scope for M1** — noted so the §10.1 config carries a
 "stack = smoltcp | rump" knob from the start, leaving room to flip it per box later
 without re-plumbing.
+
+### 10.3 Per-instance resource constraints (at least memory)
+Each rump instance is a full NetBSD kernel image (uvm, mbuf pools, socket buffers,
+the TCP/IP stack) running inside an Akuma process. Left unbounded, a single rump
+box can balloon its host process and starve the rest of the system — which on a
+small-RAM Akuma (the 4–8 MB floors we tune for) is fatal, and on the cluster
+(LLM box + agent box, see the cluster-vision memory) is the difference between
+graceful backpressure and a kernel-wide OOM abort.
+
+So the §10.1 per-box config should carry **resource constraints, memory first**:
+- **Memory cap** per rump instance. Two layers: (a) tell the rump kernel itself
+  how much it may use — NetBSD rump honours `RUMP_MEMLIMIT` (consulted in
+  `uvm`/`pool` sizing), which our Rust `rumpuser` reads via `rumpuser_getparam`
+  and can clamp/default from the box config; (b) bound the *host* process from
+  Akuma's side (the box's PMM/heap budget) so a runaway rump can be SIGKILL'd and
+  reclaimed rather than taking the kernel down — this dovetails with the existing
+  `akuma_oom_kill_not_panic` / PMM-reserve work.
+- **Later knobs** (same config surface, lower priority): CPU/scheduling share
+  (rump is single-CPU per instance today, but instance count needs bounding),
+  socket-buffer / mbuf-cluster limits, and an open-fd / packet-rate ceiling for
+  the `/dev/net/tap0` backend so one box can't monopolise the NIC.
+
+Design intent: the constraint lives in config from day one (like the
+`stack = smoltcp | rump` knob), so multi-box rump is bounded-by-default instead of
+retrofitting limits after the first OOM. The memory cap is the M-after-M1 must-have;
+the rest can follow.
