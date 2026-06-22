@@ -76,8 +76,13 @@ libraries (cross-built `librump*`, the Rust `rumpuser`, the `virtif` backend, th
 - ✅ **Phase 3 — kernel `rump` feature** (raw L2 `/dev/net/tap0` packet device on a
   dedicated second NIC, release-only, omitted from constrained profiles) — see
   [docs/PHASE3_KERNEL_TAP.md](docs/PHASE3_KERNEL_TAP.md).
-- ⏳ Phases 0/1/2/4/5/6 (buildrump cross-build → Rust `rumpuser` → virtif → box
-  `--net` → DHCP + curl). See [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md).
+- ✅ **Phases 0/1 — `librump*.a` built for aarch64-musl** (full NetBSD TCP/IP
+  stack), via a Linux container — see [docs/PHASE01_BUILDRUMP.md](docs/PHASE01_BUILDRUMP.md).
+- 🟡 **Phase 2 — Rust `rumpuser`**: the NetBSD rump kernel **boots on our
+  hypercalls** (banner + into `uvm_init`), one early-VM allocator bug from a green
+  `rump_init()` — see [docs/PHASE2_RUMPUSER.md](docs/PHASE2_RUMPUSER.md).
+- ⏳ Phases 4/5/6 (our `rumpcomp_user` virtif backend → box `--net` → DHCP + curl).
+  See [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md).
 
 Run the kernel tap path with `RUMP_NIC=1 cargo run --release` (adds the second
 QEMU NIC). Without it, `/dev/net/tap0` is absent and the default boot is
