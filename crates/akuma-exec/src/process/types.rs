@@ -151,6 +151,10 @@ pub enum FileDescriptor {
     EventFd(u32),
     DevNull,
     DevUrandom,
+    /// `/dev/zero`: reads fill the buffer with zero bytes (returning the full
+    /// count), writes are discarded. Mirrors `/dev/null` except read semantics.
+    /// Needed by libc/rump anonymous-memory and buffer-zeroing paths.
+    DevZero,
     /// virtio-sound output device (`/dev/dsp`). Writes stream PCM frames to the
     /// kernel audio driver; ioctl sets OSS format/channels/rate.
     DevDsp,
