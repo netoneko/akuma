@@ -102,6 +102,7 @@ dependencies = [
 name = "akuma-net"
 version = "0.1.0"
 dependencies = [
+ "akuma-rump",
  "const-oid",
  "der",
  "ed25519-dalek",
@@ -117,6 +118,10 @@ dependencies = [
  "virtio-drivers",
  "x509-cert",
 ]
+
+[[package]]
+name = "akuma-rump"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-shell"

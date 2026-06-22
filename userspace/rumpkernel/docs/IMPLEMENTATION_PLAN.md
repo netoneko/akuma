@@ -409,3 +409,42 @@ userspace/box/src/main.rs  `--net` switch on `box open` → spawn rump-net paylo
   only the raw packet path — native networking untouched.
 - Confirm M1 success bar: **DHCP lease + HTTP GET of the QEMU host IP through the
   rump stack**, DNS deferred.
+
+---
+
+## 10. Forward-looking architecture (post-M1, not required for M1)
+
+These directions emerged in review. None are needed for M1, but they shape how
+the pieces are factored now so we don't paint ourselves into a corner. The
+**kernel side already factors with this in mind**: the host-testable orchestration
+(NIC selection + RX state machine) lives in `crates/akuma-rump` behind a `RawNic`
+trait, and `TapNic<N>` is an **instance** type, not a hard singleton — the current
+single global in `akuma-net::rump_tap` is just the first wiring, not a ceiling.
+
+### 10.1 Config-driven rump init, recursive over the box model
+Today `rump_tap::init()` is called once at kernel boot for NIC1. The natural
+generalization is a **config-driven init**: the kernel (feature-gated) brings up a
+rump network instance from a declarative `RumpNetConfig` — which NIC/backend, MAC,
+DHCP vs. static IP, routes. This maps cleanly onto Akuma's existing **nested box
+model**: a box's spec carries its network-stack config, and the **host is just
+box 0 with the root config**, running the *same* setup path as any child box. So
+instead of one global tap, a registry keyed by `box_id` holds one rump instance
+per box that asks for one; `box open <name> --net [config]` (Phase 5) becomes
+"register box + attach a rump instance built from its config", and the host's own
+stack is the box-0 case of the identical mechanism. `TapNic<N>` being per-instance
+is what makes this a wiring change (a `BTreeMap<box_id, TapNic<…>>` + a config
+struct), not a redesign. **Worth prototyping right after M1.**
+
+### 10.2 NetBSD stack as a (per-box) primary stack, not just additive
+M1 keeps rump strictly additive and isolated (NIC1), with smoltcp owning NIC0 and
+the POSIX socket syscalls. A later option is to let a box (possibly box 0) use the
+**NetBSD stack as its primary networking**, i.e. route that box's `socket`/`connect`/
+`send`/`recv` syscalls to its rump instance instead of smoltcp. That needs new
+**kernel wiring**: a per-box "which stack backs AF_INET" selector in
+`src/syscall/net.rs`, translating the POSIX socket calls into `rump_sys_*` against
+the box's rump instance (the userspace rump program already exposes `rump_sys_socket`
+etc.; the kernel-side equivalent would proxy to it or host rump in-kernel). This is
+a significant step (it touches the hot socket path and the smoltcp ownership model)
+and is explicitly **out of scope for M1** — noted so the §10.1 config carries a
+"stack = smoltcp | rump" knob from the start, leaving room to flip it per box later
+without re-plumbing.

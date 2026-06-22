@@ -9,6 +9,7 @@ default-members = [
     "crates/akuma-ext2",
     "crates/akuma-isolation",
     "crates/akuma-net",
+    "crates/akuma-rump",
     "crates/akuma-shell",
     "crates/akuma-ssh",
     "crates/akuma-ssh-crypto",

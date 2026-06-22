@@ -54,10 +54,11 @@ notice, and `/dev/net/tap0` returns `ENODEV`. **The default boot is unaffected.*
 
 | File | Change |
 |------|--------|
-| `Cargo.toml` | `rump` feature, added to `default` |
-| `crates/akuma-net/Cargo.toml` | `rump = []` feature |
+| `Cargo.toml` | `rump` feature, added to `default`; `akuma-rump` workspace member |
+| `crates/akuma-rump/` | **new crate** — host-tested device-independent orchestration (`RawNic` trait, `TapNic<N>`, `select_second_net_addr`) + 14 unit tests |
+| `crates/akuma-net/Cargo.toml` | `rump = ["dep:akuma-rump"]` feature |
 | `crates/akuma-net/src/lib.rs` | `#[cfg(feature="rump")] pub mod rump_tap;` |
-| `crates/akuma-net/src/rump_tap.rs` | **new** — NIC1 bind + raw frame send/recv |
+| `crates/akuma-net/src/rump_tap.rs` | **new** — hardware half: `impl RawNic for VirtioRawNic`, NIC1 bind, global instance |
 | `crates/akuma-exec/src/process/types.rs` | `FileDescriptor::Tap` variant (unconditional) |
 | `src/vfs/proc.rs` | `Tap → "/dev/net/tap0"` name arm |
 | `src/syscall/fs.rs` | openat `/dev/net/tap0`, read (frame→buf), write (buf→frame), fstat (char dev) |
@@ -71,6 +72,27 @@ matches compile in non-rump builds; only the code that *constructs* and *acts on
 it (in `fs.rs`/`term.rs`/`main.rs`) is `#[cfg(feature = "rump")]`.
 
 ---
+
+## Crate split (host-testability)
+
+The logic is split so the bug-prone parts are unit-tested on the host without
+real virtio hardware:
+
+- **`crates/akuma-rump`** (no virtio dep, `cargo test`-able): the
+  device-independent orchestration behind a `RawNic` trait —
+  `select_second_net_addr` (NIC-selection ordering) and `TapNic<N>` (the RX
+  two-phase state machine + the malformed-length bounds guard + TX). 14 host
+  unit tests drive it with a mock NIC, including malformed-length and
+  begin/complete-failure cases.
+- **`crates/akuma-net/src/rump_tap.rs`** (the hardware half): `impl RawNic for
+  VirtioRawNic` wrapping `VirtIONetRaw`/`NetHal` (real DMA), plus MMIO probing
+  and the global instance. Can't be host-tested (needs a live transport) — which
+  is exactly why the testable logic was lifted out.
+
+`NetHal`/`VirtIONetRaw` are **not** exported — the `RawNic` trait is the seam, so
+nothing hardware-specific leaks. `TapNic<N>` is an instance type (not a hard
+singleton); the single global here is just the first wiring (see
+IMPLEMENTATION_PLAN.md §10 for the per-box, config-driven generalization).
 
 ## How the raw path works
 
@@ -102,6 +124,12 @@ The device + DMA buffers live behind a `Spinlock<Option<RumpTapNic>>`; a separat
 ---
 
 ## Verification
+
+Host unit tests for the orchestration (no VM needed):
+```
+cargo test --target "$(rustc -vV | grep '^host:' | cut -d' ' -f2)" -p akuma-rump
+# 14 passed (NIC selection ordering, RX state machine, malformed-length guard, TX)
+```
 
 Built clean in both configurations:
 - `cargo build --release` (rump **on**) — clean.

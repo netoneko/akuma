@@ -1,0 +1,10 @@
+[package]
+name = "akuma-rump"
+version = "0.1.0"
+edition = "2024"
+description = "Host-testable orchestration for the kernel rump raw L2 tap path (device-independent logic behind the RawNic trait)"
+
+[lints]
+workspace = true
+
+[dependencies]

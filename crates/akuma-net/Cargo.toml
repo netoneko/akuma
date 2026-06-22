@@ -6,8 +6,9 @@ edition = "2024"
 [features]
 small-sockets = []
 # Raw L2 packet path (a second virtio-net NIC exposed as /dev/net/tap0) for the
-# kernel's `rump` feature. Adds crate::rump_tap. Off unless the kernel enables it.
-rump = []
+# kernel's `rump` feature. Adds crate::rump_tap (the hardware half); the
+# device-independent orchestration lives in the host-tested `akuma-rump` crate.
+rump = ["dep:akuma-rump"]
 # In-kernel TLS client (embedded-tls) for outbound HTTPS — the only consumer is
 # the shell `curl` command's https:// branch (http::http_get). Pulls in
 # embedded-tls plus the X.509 cert verifier (x509-cert/der/p256/ed25519/sha2)
@@ -28,6 +29,8 @@ tls-rsa = ["kernel-tls", "dep:rsa"]
 workspace = true
 
 [dependencies]
+# Host-testable rump tap orchestration; pulled in only by the `rump` feature.
+akuma-rump = { path = "../akuma-rump", optional = true }
 smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"] }
 virtio-drivers = { version = "0.7", default-features = false }
 embedded-io-async = { version = "0.6", default-features = false }
