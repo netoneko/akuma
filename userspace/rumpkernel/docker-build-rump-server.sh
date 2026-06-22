@@ -49,12 +49,17 @@ exec docker run --rm \
           "#define STDC_HEADERS 1" > /usr/local/include/rumpuser_config.h
 
         echo "=== compile sysproxy server objects ==="
-        for f in rumpuser_sp rumpuser_errtrans; do
-          gcc -O2 -fcommon -c -o "/tmp/$f.o" "$SP/$f.c" \
+        # sp_serve_fd.c #includes the NetBSD rumpuser_sp.c (so it provides BOTH
+        # rumpuser_sp_init and our rumpuser_sp_init_fd); compile it instead of
+        # rumpuser_sp.c. errtrans stays standalone.
+        gcc -O2 -fcommon -c -o /tmp/rumpuser_sp.o rumpuser/sp_serve_fd.c \
             -I /usr/local/include -I "$I" -I "$SP" \
             -DLIBRUMPUSER -D_KERNTYPES -DRUMPUSER_CONFIG -Wno-error \
-            2>&1 | sed "s/^/[sp] /" || { echo "SP_COMPILE_FAIL $f"; exit 1; }
-        done
+            2>&1 | sed "s/^/[sp] /" || { echo "SP_COMPILE_FAIL sp_serve_fd"; exit 1; }
+        gcc -O2 -fcommon -c -o /tmp/rumpuser_errtrans.o "$SP/rumpuser_errtrans.c" \
+            -I /usr/local/include -I "$I" -I "$SP" \
+            -DLIBRUMPUSER -D_KERNTYPES -DRUMPUSER_CONFIG -Wno-error \
+            2>&1 | sed "s/^/[et] /" || { echo "SP_COMPILE_FAIL errtrans"; exit 1; }
 
         echo "=== link rump_server (static aarch64-musl) ==="
         gcc -O2 -static -o out/rump_server_akuma \

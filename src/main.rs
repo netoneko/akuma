@@ -51,6 +51,8 @@ mod pthread_tests;
 #[cfg(feature = "sc-framebuffer")]
 mod ramfb;
 mod rng;
+#[cfg(feature = "rump")]
+mod rump_proxy;
 mod shell;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod shell_tests;
@@ -1150,6 +1152,12 @@ fn run_async_main() -> ! {
             ssh_tests::run_all_tests();
         }
     }
+
+    // Kernel-as-client sysproxy demo (RUMP_SYSPROXY.md Step 4): only with
+    // RUMP_NIC=1; spawns /bin/rump_server and drives rump_sys_socket over a
+    // kernel pipe. Skips cleanly when NIC1 / rump_server is absent.
+    #[cfg(feature = "rump")]
+    rump_proxy::run_demo();
 
     // Initialize SSH host key
     ssh::init_host_key();

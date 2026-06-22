@@ -114,7 +114,7 @@ no-tests = ["akuma-net/small-sockets"]
 # build with --no-default-features and omit it (it targets roomy VMs, not the
 # 4 MB floor). NIC1 itself only exists when the QEMU runner is started with
 # RUMP_NIC=1; without it, tap init no-ops and /dev/net/tap0 returns ENODEV.
-rump = ["akuma-net/rump"]
+rump = ["akuma-net/rump", "dep:akuma-rump"]
 # In-kernel TLS client for the shell `curl` command's https:// branch (the
 # embedded-tls stack in akuma-net + its X.509 verifier — ~58 KB of kernel
 # .text). Enabled by default and kept by the `size` profile (ECDSA/Ed25519
@@ -189,6 +189,9 @@ akuma-ext2 = { path = "crates/akuma-ext2" }
 akuma-shell = { path = "crates/akuma-shell" }
 akuma-net = { path = "crates/akuma-net" }
 akuma-exec = { path = "crates/akuma-exec" }
+# Kernel-side sysproxy client (rumpsp wire + Linux↔NetBSD translation); only the
+# `rump` feature needs it directly (akuma-net already pulls it for rump_tap).
+akuma-rump = { path = "crates/akuma-rump", optional = true }
 akuma-isolation = { path = "crates/akuma-isolation" }
 talc = "4"
 spinning_top = "0.3"

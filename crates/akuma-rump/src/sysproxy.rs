@@ -327,6 +327,74 @@ fn rumpsp_err_to_errno(e: u32) -> i32 {
     }
 }
 
+// ── kernel pipe transport (injected IO, host-testable) ────────────────────
+
+/// Injected kernel I/O for [`PipeTransport`], so the blocking read loop
+/// (poll + yield + timeout) is host-testable with a mock instead of only at boot.
+///
+/// The kernel impl wraps `pipe_write`/`pipe_read` + the scheduler yield + the
+/// monotonic clock; non-kernel callers (tests) supply a scripted mock.
+///
+/// NOTE (why not reuse `akuma-net`'s injected `runtime()`, which already exposes
+/// `yield_now`/`uptime_us`): `akuma-rump` is a **leaf** crate that `akuma-net`
+/// depends on, so importing `akuma-net` here would be a **circular dependency**.
+/// `PipeIo` is therefore defined locally and implemented by the *kernel* (which
+/// depends on both crates), delegating to the same `threading::yield_now` /
+/// `timer::uptime_us` that feed akuma-net's runtime — one source of truth at the
+/// kernel, the trait duplicated only at the crate boundary to stay acyclic. The
+/// `read`/`write` here have no runtime equivalent anyway (the kernel pipe API).
+pub trait PipeIo {
+    /// Non-blocking read of one chunk into `buf`; returns `(bytes_read, eof)`.
+    fn read(&mut self, id: u32, buf: &mut [u8]) -> (usize, bool);
+    /// Write all of `buf` (the kernel pipe buffer is unbounded). `Err` = broken pipe.
+    fn write(&mut self, id: u32, buf: &[u8]) -> Result<(), ()>;
+    /// Cooperatively yield the CPU so the server thread can run.
+    fn yield_now(&mut self);
+    /// Monotonic microseconds (for the read timeout).
+    fn now_us(&mut self) -> u64;
+}
+
+/// A [`Transport`] over a kernel pipe pair: write to `wr` (→ the server's `rx`),
+/// read from `rd` (← the server's `tx`). Reads poll [`PipeIo::read`] +
+/// `yield_now` until the buffer is full, EOF, or `timeout_us` elapses (so a
+/// wedged server fails the request instead of hanging the caller forever).
+pub struct PipeTransport<P: PipeIo> {
+    /// Injected pipe I/O.
+    pub io: P,
+    /// Pipe the kernel writes (server reads via its `rx`).
+    pub wr: u32,
+    /// Pipe the kernel reads (server writes via its `tx`).
+    pub rd: u32,
+    /// Per-`read_exact` timeout in microseconds.
+    pub timeout_us: u64,
+}
+
+impl<P: PipeIo> Transport for PipeTransport<P> {
+    fn write_all(&mut self, buf: &[u8]) -> Result<(), TransportErr> {
+        self.io.write(self.wr, buf).map_err(|()| TransportErr)
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), TransportErr> {
+        let start = self.io.now_us();
+        let mut got = 0;
+        while got < buf.len() {
+            let (n, eof) = self.io.read(self.rd, &mut buf[got..]);
+            if n > 0 {
+                got += n;
+                continue;
+            }
+            if eof {
+                return Err(TransportErr);
+            }
+            if self.io.now_us().wrapping_sub(start) > self.timeout_us {
+                return Err(TransportErr);
+            }
+            self.io.yield_now();
+        }
+        Ok(())
+    }
+}
+
 /// A [`ClientMem`] that faults everything — used for the handshake (which has
 /// no copyin/out) and as a safe default.
 struct NoMem;
@@ -577,5 +645,116 @@ mod tests {
         assert_eq!(mm.typ, RUMPSP_ANONMMAP);
         let addr = u64::from_le_bytes(sent[HDRSZ..HDRSZ + 8].try_into().unwrap());
         assert_eq!(addr, 0x1000);
+    }
+
+    // ── PipeTransport (the kernel-pipe blocking read loop) ──────────────────
+
+    /// Scripted PipeIo: `reads` is a queue of (bytes, eof) chunks delivered on
+    /// successive read() calls (empty Vec with eof=false = "nothing yet, yield");
+    /// `clock` advances by `tick` each now_us() call; writes are captured.
+    struct MockIo {
+        reads: alloc::collections::VecDeque<(Vec<u8>, bool)>,
+        writes: Vec<u8>,
+        clock: u64,
+        tick: u64,
+        yields: u32,
+    }
+    impl MockIo {
+        fn new(reads: &[(&[u8], bool)], tick: u64) -> Self {
+            let mut q = alloc::collections::VecDeque::new();
+            for (b, eof) in reads {
+                q.push_back((b.to_vec(), *eof));
+            }
+            MockIo { reads: q, writes: Vec::new(), clock: 0, tick, yields: 0 }
+        }
+    }
+    impl PipeIo for MockIo {
+        fn read(&mut self, _id: u32, buf: &mut [u8]) -> (usize, bool) {
+            match self.reads.pop_front() {
+                Some((bytes, eof)) => {
+                    let n = bytes.len().min(buf.len());
+                    buf[..n].copy_from_slice(&bytes[..n]);
+                    // requeue any remainder of this chunk
+                    if n < bytes.len() {
+                        self.reads.push_front((bytes[n..].to_vec(), eof));
+                        (n, false)
+                    } else {
+                        (n, eof)
+                    }
+                }
+                None => (0, false), // nothing yet → caller yields/times out
+            }
+        }
+        fn write(&mut self, _id: u32, buf: &[u8]) -> Result<(), ()> {
+            self.writes.extend_from_slice(buf);
+            Ok(())
+        }
+        fn yield_now(&mut self) {
+            self.yields += 1;
+        }
+        fn now_us(&mut self) -> u64 {
+            let t = self.clock;
+            self.clock += self.tick;
+            t
+        }
+    }
+
+    fn pt(io: MockIo) -> PipeTransport<MockIo> {
+        PipeTransport { io, wr: 1, rd: 2, timeout_us: 1000 }
+    }
+
+    // read_exact assembles a value from multiple partial chunks (with empty
+    // "nothing yet" gaps that force yields).
+    #[test]
+    fn pipe_read_exact_assembles_partial_chunks() {
+        let io = MockIo::new(
+            &[(&[0xAA, 0xBB], false), (&[], false), (&[0xCC], false), (&[0xDD], false)],
+            1,
+        );
+        let mut t = pt(io);
+        let mut buf = [0u8; 4];
+        t.read_exact(&mut buf).expect("assembled");
+        assert_eq!(buf, [0xAA, 0xBB, 0xCC, 0xDD]);
+        assert!(t.io.yields >= 1); // the empty gap forced a yield
+    }
+
+    // a single read() returning more than the request is split across calls.
+    #[test]
+    fn pipe_read_exact_splits_oversized_chunk() {
+        let io = MockIo::new(&[(&[1, 2, 3, 4, 5, 6], false)], 1);
+        let mut t = pt(io);
+        let mut a = [0u8; 2];
+        let mut b = [0u8; 4];
+        t.read_exact(&mut a).expect("a");
+        t.read_exact(&mut b).expect("b");
+        assert_eq!(a, [1, 2]);
+        assert_eq!(b, [3, 4, 5, 6]);
+    }
+
+    // EOF mid-read is a transport error (server closed the channel).
+    #[test]
+    fn pipe_read_exact_eof_errors() {
+        let io = MockIo::new(&[(&[9], false), (&[], true)], 1);
+        let mut t = pt(io);
+        let mut buf = [0u8; 4];
+        assert_eq!(t.read_exact(&mut buf), Err(TransportErr));
+    }
+
+    // a server that never sends times out instead of looping forever.
+    #[test]
+    fn pipe_read_exact_times_out() {
+        // every now_us() advances 600us; timeout 1000us → fails within ~2 polls.
+        let io = MockIo::new(&[], 600);
+        let mut t = pt(io);
+        let mut buf = [0u8; 1];
+        assert_eq!(t.read_exact(&mut buf), Err(TransportErr));
+    }
+
+    // write_all goes to the wr pipe verbatim.
+    #[test]
+    fn pipe_write_all_passthrough() {
+        let mut t = pt(MockIo::new(&[], 1));
+        t.write_all(&[1, 2, 3]).expect("w");
+        assert_eq!(t.io.writes, alloc::vec![1, 2, 3]);
     }
 }

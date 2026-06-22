@@ -26,6 +26,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <rump/rump.h>
@@ -33,12 +34,36 @@
 
 void virtif_dump_stats(void);   /* from rumpcomp_tap.c (best-effort) */
 
+/* serve on a pre-connected fd (kernel-pipe transport); from sp_serve_fd.c */
+extern int rumpuser_sp_init_fd(int, const char *, const char *, const char *);
+
 int
 main(int argc, char **argv)
 {
-	const char *url    = (argc > 1) ? argv[1] : "unix:///tmp/rump_server.sock";
-	const char *ifname = (argc > 2) ? argv[2] : "virt0";
+	const char *url    = "unix:///tmp/rump_server.sock";
+	const char *ifname = "virt0";
+	int serve_fd = -1;   /* >=0: serve sysproxy on this inherited fd */
+	int do_net = 0;      /* --net: bring up virt0 + DHCP over /dev/net/tap0 */
 	int rv;
+
+	/*
+	 * Modes:
+	 *   rump_server --fd N [--net]     serve on inherited fd N (Akuma kernel-pipe)
+	 *   rump_server [url] [--net]      listen on a URL (container/path tests)
+	 * --net brings the rump stack online (needs RUMP_NIC=1 / a tap); without it
+	 * the stack still serves control-plane syscalls (e.g. socket()).
+	 */
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--fd") && i + 1 < argc) {
+			serve_fd = atoi(argv[++i]);
+		} else if (!strcmp(argv[i], "--net")) {
+			do_net = 1;
+		} else if (!strcmp(argv[i], "--if") && i + 1 < argc) {
+			ifname = argv[++i];
+		} else if (argv[i][0] != '-') {
+			url = argv[i];
+		}
+	}
 
 	setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -48,28 +73,35 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	rv = rump_pub_netconfig_ifcreate(ifname);
-	printf("RUMP_SERVER: ifcreate %s -> %d\n", ifname, rv);
-
-	rv = rump_pub_netconfig_dhcp_ipv4_oneshot(ifname);
-	printf("RUMP_SERVER: dhcp_ipv4_oneshot %s -> %d\n", ifname, rv);
-	if (rv != 0) {
-		/* Not fatal for proving the sysproxy listener: a client can still
-		 * share the stack (e.g. loopback) even if DHCP didn't complete. */
-		printf("RUMP_SERVER: WARN — DHCP rv=%d (continuing; stack still served)\n", rv);
+	if (do_net) {
+		rv = rump_pub_netconfig_ifcreate(ifname);
+		printf("RUMP_SERVER: ifcreate %s -> %d\n", ifname, rv);
+		rv = rump_pub_netconfig_dhcp_ipv4_oneshot(ifname);
+		printf("RUMP_SERVER: dhcp_ipv4_oneshot %s -> %d\n", ifname, rv);
+		if (rv != 0)
+			printf("RUMP_SERVER: WARN — DHCP rv=%d (continuing)\n", rv);
 	}
 
-	rv = rump_init_server(url);
-	printf("RUMP_SERVER: rump_init_server(%s) -> %d\n", url, rv);
-	if (rv != 0) {
-		printf("RUMP_SERVER: FAIL — rump_init_server rv=%d\n", rv);
-		return 1;
+	if (serve_fd >= 0) {
+		rv = rumpuser_sp_init_fd(serve_fd, "NetBSD", "7.99.34", "evbarm64");
+		printf("RUMP_SERVER: rumpuser_sp_init_fd(%d) -> %d\n", serve_fd, rv);
+		if (rv != 0) {
+			printf("RUMP_SERVER: FAIL — sp_init_fd rv=%d\n", rv);
+			return 1;
+		}
+		printf("RUMP_SERVER: SERVING sysproxy on fd %d (net=%s)\n",
+		    serve_fd, do_net ? "up" : "off");
+	} else {
+		rv = rump_init_server(url);
+		printf("RUMP_SERVER: rump_init_server(%s) -> %d\n", url, rv);
+		if (rv != 0) {
+			printf("RUMP_SERVER: FAIL — rump_init_server rv=%d\n", rv);
+			return 1;
+		}
+		printf("RUMP_SERVER: LISTENING — sysproxy on %s (iface %s)\n", url, ifname);
 	}
 
-	printf("RUMP_SERVER: LISTENING — sysproxy on %s (stack iface %s). "
-	    "Clients: RUMP_SERVER=%s rumpclient ...\n", url, ifname, url);
-
-	/* The sp server runs its own accept/worker threads; just stay alive. */
+	/* The sp server runs its own worker threads; just stay alive. */
 	for (;;)
 		pause();
 

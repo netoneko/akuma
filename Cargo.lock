@@ -46,6 +46,7 @@ dependencies = [
  "akuma-ext2",
  "akuma-isolation",
  "akuma-net",
+ "akuma-rump",
  "akuma-shell",
  "akuma-ssh",
  "akuma-ssh-crypto",
