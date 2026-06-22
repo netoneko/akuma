@@ -1,5 +1,7 @@
 # rumpkernel — NetBSD rump kernel compatibility for Akuma
 
+*With deep respect to NetBSD throughout the years.*
+
 This subtree brings **[rump kernels](https://github.com/rumpkernel/wiki/wiki)** to
 Akuma. A rump kernel is a real, unmodified NetBSD kernel — its drivers, file
 systems, and TCP/IP stack — compiled to run as an ordinary program on top of a
@@ -90,3 +92,9 @@ libraries (cross-built `librump*`, the Rust `rumpuser`, the `virtif` backend, th
 Run the kernel tap path with `RUMP_NIC=1 cargo run --release` (adds the second
 QEMU NIC). Without it, `/dev/net/tap0` is absent and the default boot is
 unchanged.
+
+## License
+
+BSD. Userspace components under different licenses (GPL2, LGPL2) follow their respective licenses.
+
+This code links with NetBSD project code, which was also used as reference. The NetBSD copyright belongs to NetBSD contributors.
