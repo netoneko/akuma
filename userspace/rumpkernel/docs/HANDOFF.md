@@ -25,7 +25,9 @@ Goal (M1): run the NetBSD TCP/IP stack as a userspace rump kernel inside an Akum
 | Phase 4 — `librumpnet_virtif.a` (kernel driver `if_virt.o`) built | ✅ via `docker-build-virtif.sh` |
 | Phase 4 — **container networking GREEN**: `virt0` up, IP assigned, `rump_sys_socket` OK | ✅ **2026-06-22** (`docker-net-test.sh`) |
 | Phase 4 — `rumpuser` scheduler-wrap under concurrency | ✅ fixed (cv/mutex/rwlock + **clock_sleep**) |
-| Phase 4 — DHCP + actual packet round-trip (needs tap peer / DHCP server) | ⏳ next |
+| **Unmodified `curl` does HTTP over the rump stack** (real packet round-trip) | ✅ **2026-06-22** (`docker-hijack-demo.sh`) |
+| Phase 4 — DHCP one-shot (vs net1 SLIRP) | ⏳ next |
+| Akuma backend: `rumpcomp_user` over `/dev/net/tap0` (vs container TUN/TAP) | ⏳ |
 | Rump SDK tarball (`bootstrap/archives/rump-sdk-aarch64-musl.tar.gz` → VM `/archives`) for in-VM builds | ✅ `package-sdk.sh` (48 MB, 154 archives) |
 | Capstone demo: clone+compile sic, IRC `#rumpkernel` over the NetBSD stack | 📋 `acceptance/11_netbsd_rumpkernel_irc.md` (target) |
 | Phase 4b — our `rumpcomp_user` backend → `/dev/net/tap0` | ⏳ |
