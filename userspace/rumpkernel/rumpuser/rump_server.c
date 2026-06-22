@@ -28,6 +28,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #include <rump/rump.h>
 #include <rump/netconfig.h>
@@ -37,11 +39,43 @@ void virtif_dump_stats(void);   /* from rumpcomp_tap.c (best-effort) */
 /* serve on a pre-connected fd (kernel-pipe transport); from sp_serve_fd.c */
 extern int rumpuser_sp_init_fd(int, const char *, const char *, const char *);
 
+/*
+ * Redirect stdout+stderr to `path` (creating parent dirs best-effort) so all of
+ * rump_server's output — including rump_init's verbose dprintf on fd 2 — lands
+ * in the box log instead of the (undrained) kernel ProcessChannel. Used by the
+ * kernel demo: --log /var/log/box/<id>/rump_server.log.
+ */
+static void
+redirect_log(const char *path)
+{
+	char tmp[256];
+	size_t n = strlen(path);
+	if (n >= sizeof(tmp))
+		return;
+	memcpy(tmp, path, n + 1);
+	/* mkdir each parent component (ignore EEXIST/errors). */
+	for (char *p = tmp + 1; *p; p++) {
+		if (*p == '/') {
+			*p = '\0';
+			mkdir(tmp, 0755);
+			*p = '/';
+		}
+	}
+	int lf = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (lf >= 0) {
+		dup2(lf, 1); /* stdout (printf) */
+		dup2(lf, 2); /* stderr (rumpuser dprintf) */
+		if (lf > 2)
+			close(lf);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
 	const char *url    = "unix:///tmp/rump_server.sock";
 	const char *ifname = "virt0";
+	const char *logpath = NULL; /* --log: redirect stdout/stderr to this file */
 	int serve_fd = -1;   /* >=0: serve sysproxy on this inherited fd */
 	int do_net = 0;      /* --net: bring up virt0 + DHCP over /dev/net/tap0 */
 	int rv;
@@ -60,10 +94,15 @@ main(int argc, char **argv)
 			do_net = 1;
 		} else if (!strcmp(argv[i], "--if") && i + 1 < argc) {
 			ifname = argv[++i];
+		} else if (!strcmp(argv[i], "--log") && i + 1 < argc) {
+			logpath = argv[++i];
 		} else if (argv[i][0] != '-') {
 			url = argv[i];
 		}
 	}
+
+	if (logpath)
+		redirect_log(logpath);
 
 	setvbuf(stdout, NULL, _IONBF, 0);
 

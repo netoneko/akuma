@@ -164,8 +164,11 @@ impl<T: Transport> Client<T> {
         c.t.write_all(&hdr).map_err(|_| EIO)?;
         c.t.write_all(&payload).map_err(|_| EIO)?;
 
-        // 3. Await the handshake response (no copyin/out for handshake).
-        c.await_response(reqno, &mut NoMem)?;
+        // 3. Await the handshake response. NOTE: a HANDSHAKE response is NOT a
+        // `rsp_sysresp` — the server sends a short payload (a 4-byte handshake
+        // word), so we must not run `parse_sysresp` (which needs 24 bytes). We
+        // only need: a RESP for our reqno = success, ERROR = failure.
+        c.await_response(reqno, &mut NoMem, false)?;
         Ok(c)
     }
 
@@ -189,12 +192,19 @@ impl<T: Transport> Client<T> {
         );
         self.t.write_all(&hdr).map_err(|_| EIO)?;
         self.t.write_all(args).map_err(|_| EIO)?;
-        self.await_response(reqno, mem)
+        self.await_response(reqno, mem, true)
     }
 
     /// Read frames, servicing server callbacks, until the RESP/ERROR for
-    /// `want_reqno` arrives.
-    fn await_response(&mut self, want_reqno: u64, mem: &mut dyn ClientMem) -> SyscallResult {
+    /// `want_reqno` arrives. `expect_sysresp` controls how a RESP payload is
+    /// interpreted: a syscall reply is a `rsp_sysresp` (parse it); a handshake
+    /// reply is a short non-sysresp word (RESP alone = success).
+    fn await_response(
+        &mut self,
+        want_reqno: u64,
+        mem: &mut dyn ClientMem,
+        expect_sysresp: bool,
+    ) -> SyscallResult {
         loop {
             let mut hbuf = [0u8; HDRSZ];
             self.t.read_exact(&mut hbuf).map_err(|_| EIO)?;
@@ -217,7 +227,7 @@ impl<T: Transport> Client<T> {
                     if h.class == RUMPSP_ERROR {
                         return Err(rumpsp_err_to_errno(h.u));
                     }
-                    return parse_sysresp(&data);
+                    return if expect_sysresp { parse_sysresp(&data) } else { Ok([0, 0]) };
                 }
                 RUMPSP_REQ => self.handle_req(&h, &data, mem)?,
                 // A RESP for some other reqno (shouldn't happen on our
@@ -526,10 +536,15 @@ mod tests {
 
     // Banner + guest handshake: client consumes the banner line and emits a
     // well-formed HANDSHAKE_GUEST request carrying progname+NUL.
+    //
+    // The handshake RESP carries a SHORT 4-byte payload (a handshake word), NOT a
+    // 24-byte rsp_sysresp — so connect() must accept it without parse_sysresp.
+    // (Regression: on-Akuma the real server sends rsp_len=28; treating it as a
+    // sysresp failed `data.len() < 24` → spurious EIO.)
     #[test]
     fn handshake_sends_guest_request() {
         let mut inbox = b"NetBSD rump\n".to_vec();
-        inbox.extend_from_slice(&frame(1, RUMPSP_RESP, RUMPSP_HANDSHAKE, 0, &sysresp(0, 0, 0)));
+        inbox.extend_from_slice(&frame(1, RUMPSP_RESP, RUMPSP_HANDSHAKE, 0, &[0u8; 4]));
         let t = MockT::new(inbox);
         let c = Client::connect(t, b"kernel").expect("handshake ok");
         let out = &c.t.outbox;
@@ -538,6 +553,14 @@ mod tests {
         assert_eq!(h.typ, RUMPSP_HANDSHAKE);
         assert_eq!(h.u, HANDSHAKE_GUEST);
         assert_eq!(&out[HDRSZ..], b"kernel\0");
+    }
+
+    // A handshake reply with NO payload (rsp_len == HDRSZ) is also accepted.
+    #[test]
+    fn handshake_accepts_empty_response() {
+        let mut inbox = b"b\n".to_vec();
+        inbox.extend_from_slice(&frame(1, RUMPSP_RESP, RUMPSP_HANDSHAKE, 0, &[]));
+        assert!(Client::connect(MockT::new(inbox), b"k").is_ok());
     }
 
     // The headline case: a syscall whose response is preceded by a COPYIN

@@ -81,12 +81,18 @@ The in-process backend gives only one networked payload per box.
      process: socketpair → `rumpuser_sp_init_fd` on one end → raw sp client on the other
      → `rump_sys_socket -> fd 3` through the rump kernel. PASS. The raw client mirrors
      `sysproxy.rs`, cross-checking its framing.
-   - ⏳ **Remaining integration** (needs a booted box, iterative; no architectural
-     unknowns left):
-     1. **In-kernel `Transport`** = read/write the kernel-held end of the pipe pair
-        (reuse `src/syscall/pipe.rs`); hand the other end to `rump_server` at spawn as a
-        private inherited fd (see channel-fd-isolation TODO). `rump_server` calls
-        `rumpuser_sp_init_fd(fd)` instead of `rump_init_server(url)`.
+   - ✅ **Kernel-as-client PROVEN ON AKUMA (2026-06-23).** `src/rump_proxy.rs`
+     (`#[cfg(feature="rump")]`, boot demo gated on `rump_tap::is_ready()`): the kernel
+     creates a pipe pair, spawns `/bin/rump_server --fd 3` and installs the server end at
+     fd 3 (`set_fd(UnixSocket{rx,tx})`), then runs `akuma_rump::sysproxy::Client` over a
+     `PipeTransport`/`KernelPipeIo` and drives `rump_sys_socket → fd 3` through the rump
+     kernel. Live boot log: banner → handshake → `rump_sys_socket -> fd 3`, then
+     `kill_process` reaps the server + its ~19 kthreads (no leak; `ps` shows only
+     herd/httpd after). rump_server stdout → `/var/log/box/<id>/rump_server.log` (`--log`)
+     since the kernel can't drain its ProcessChannel that early in boot. Bug fixed en
+     route: the HANDSHAKE reply is a short non-`rsp_sysresp` word, so `connect()` must
+     accept a RESP without `parse_sysresp` (regression-tested).
+   - ⏳ **Remaining integration** (next; no architectural unknowns left):
      2. **In-kernel `ClientMem`** over the calling box process's user VA (with the
         mandatory server-input bounds checks — see Security TODOs).
      3. **Syscall interception** for `stack=rump` boxes: route socket-family syscalls
@@ -138,6 +144,17 @@ The in-process backend gives only one networked payload per box.
   The namespace boundary should provide this, but add explicit self-tests: a process in
   box A cannot open box B's sysproxy socket, cannot see box B's `virt0`, and the kernel
   refuses to route box A's calls to box B's server. (Containment must be proven, not assumed.)
+
+## Future optimizations
+- **Fiber rumpuser → one OS thread per NetBSD kernel (TODO).** Our `rumpuser` uses the
+  **pthread** threading backend, so each rump kthread (`rump_init` spawns ~15–20:
+  per-CPU workqueues, softints, pagedaemon, cprng/aiodone, …) is a real Akuma thread —
+  visible as ~19 child PIDs per `rump_server`. Functionally fine (and pleasingly
+  cyberpunk), but at cluster scale (N boxes × ~19 threads) it adds up. Rump's **fiber**
+  backend (`rumpfiber.c`, `RUMPUSER_THREADS=fiber`, ucontext green threads) collapses
+  these to ~one OS thread per kernel. Deferred: it's a different concurrency model, and
+  our `cv_wait`/`mutex`/`clock_sleep` scheduler-wrap fixes were built around pthread
+  (see `FRANKENLIBC_EVAL.md` / the parked fiber notes).
 
 ## Open items / risks
 - musl portability of `rumpuser_sp.c`/`sp_common.c` (atomics, `INFTIM`, BSD cdefs).

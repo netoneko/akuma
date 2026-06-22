@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 const EFAULT: i32 = 14;
 /// Cap a single blocking read so a wedged server fails the request instead of
 /// hanging the boot before herd/SSH come up.
-const READ_TIMEOUT_US: u64 = 30_000_000;
+const READ_TIMEOUT_US: u64 = 8_000_000;
 
 /// Kernel [`PipeIo`]: wraps the kernel pipe API + scheduler yield + clock. The
 /// blocking read loop (poll + yield + timeout) lives in `akuma_rump` (host-tested
@@ -74,7 +74,14 @@ pub fn run_demo() {
     let px = pipe::pipe_create();
     let py = pipe::pipe_create();
 
-    let pid = match process::spawn_process_with_channel("/bin/rump_server", Some(&["--fd", "3"]), None) {
+    // The demo runs the server in box 0; its output goes to the box log
+    // (/var/log/box/0/rump_server.log) since the kernel does not drain its
+    // ProcessChannel this early in boot. `cat` it over SSH to see rump_init.
+    let pid = match process::spawn_process_with_channel(
+        "/bin/rump_server",
+        Some(&["--fd", "3", "--log", "/var/log/box/0/rump_server.log"]),
+        None,
+    ) {
         Ok((_tid, _chan, pid)) => pid,
         Err(e) => {
             crate::safe_print!(96, "[Test] rump_sysproxy FAILED: spawn: {}\n", e);
@@ -87,30 +94,41 @@ pub fn run_demo() {
     // read yields — and the server only touches fd 3 after rump_init() anyway.
     let Some(p) = process::lookup_process(pid) else {
         crate::console::print("[Test] rump_sysproxy FAILED: lookup_process\n");
+        let _ = process::kill_process(pid);
         return;
     };
     p.set_fd(3, process::FileDescriptor::UnixSocket { rx: px, tx: py });
 
+    // Drive the handshake + one socket syscall, then ALWAYS tear the server down
+    // (kill from outside — cascades to its ~19 rump kthreads) so it does not leak.
+    let outcome = drive_socket(px, py);
+    let _ = process::kill_process(pid);
+
+    match outcome {
+        Ok(fd) => crate::safe_print!(
+            96,
+            "[Test] rump_sysproxy PASSED — rump_sys_socket -> fd {} over kernel pipe\n",
+            fd
+        ),
+        Err(msg) => crate::safe_print!(96, "[Test] rump_sysproxy FAILED — {}\n", msg),
+    }
+}
+
+/// Connect over the kernel pipe pair and issue one `rump_sys_socket`. Returns the
+/// rump fd, or a short failure reason (errno baked in).
+fn drive_socket(px: u32, py: u32) -> Result<i64, alloc::string::String> {
+    use alloc::format;
     let chan = PipeTransport { io: KernelPipeIo, wr: px, rd: py, timeout_us: READ_TIMEOUT_US };
-    let mut client = match Client::connect(chan, b"akuma-kernel") {
-        Ok(c) => c,
-        Err(e) => {
-            crate::safe_print!(96, "[Test] rump_sysproxy FAILED: handshake errno {}\n", e);
-            return;
-        }
-    };
+    let mut client = Client::connect(chan, b"akuma-kernel")
+        .map_err(|e| format!("handshake errno {e}"))?;
     crate::console::print("[Test] rump_sysproxy: handshake OK; rump_sys_socket...\n");
 
     // rump_sys_socket(AF_INET=2, SOCK_STREAM=1, 0) — no pointer args, no copyin.
     let args = xlate::pack_args(&[2, 1, 0]);
     let mut mem = NoMem;
     match client.syscall(xlate::netbsd_sysno(xlate::Op::Socket), &args, &mut mem) {
-        Ok([fd, _]) if fd >= 0 => crate::safe_print!(
-            96,
-            "[Test] rump_sysproxy PASSED — rump_sys_socket -> fd {} over kernel pipe\n",
-            fd
-        ),
-        Ok([fd, _]) => crate::safe_print!(96, "[Test] rump_sysproxy FAILED — socket returned {}\n", fd),
-        Err(e) => crate::safe_print!(96, "[Test] rump_sysproxy FAILED — socket errno {}\n", e),
+        Ok([fd, _]) if fd >= 0 => Ok(fd),
+        Ok([fd, _]) => Err(format!("socket returned {fd}")),
+        Err(e) => Err(format!("socket errno {e}")),
     }
 }
