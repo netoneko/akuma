@@ -474,3 +474,36 @@ Design intent: the constraint lives in config from day one (like the
 `stack = smoltcp | rump` knob), so multi-box rump is bounded-by-default instead of
 retrofitting limits after the first OOM. The memory cap is the M-after-M1 must-have;
 the rest can follow.
+
+### 10.4 Running *unmodified* binaries against the rump stack
+(Full discussion + the user Q&A that drove it: `docs/ARCHITECTURE_QUESTIONS.md`.)
+
+`rumpuser` is the rump kernel's *downcall* layer to the host, **not** a syscall
+interceptor — so a normal `busybox curl` calls libc `socket()` → a native trap to
+**Akuma** (smoltcp), never the rump stack. The rump stack is reached only via
+`rump_sys_*`. Three ways to bridge that, in increasing ambition:
+
+1. **Link against rump** (`rump_sys_*`) — the M1 proof path (`sic`, acceptance 11).
+   Purpose-built binary; no infra. Works today once the stack networks.
+2. **Preload + hijack** — `LD_PRELOAD=librumphijack` intercepts libc socket calls →
+   `rump_sys_*`, either in-process or proxied to a `rump_server` via the `sp_*`
+   hypercalls. **Viable on Akuma** (Akuma *has* dynamic linking — apk ships dynamic
+   musl ELFs; only our own tcc-built binaries are forced `-static`). Cost: build
+   `librumphijack`/`librumpclient` and **un-stub the `sp_*` hypercalls** in our Rust
+   rumpuser (today they return `ENOTSUP`).
+3. **Kernel-side routing** (Akuma-native, generalizes §10.2) — Akuma owns the box's
+   syscall entry, so it can forward the box's network (or, with **`libsys_linux`**,
+   *all* Linux) syscalls to that box's rump instance with no preload. `libsys_linux`
+   (the Linux→NetBSD syscall ABI table inside rump) is **not built for `evbarm64`
+   yet** (buildrump's emul dir resolves empty for our MACHINE) — building it needs
+   aarch64 portability work, and is the enabler for fully unmodified Linux binaries.
+
+**herd must carry this config — and via OCI it largely already can.** herd parses
+OCI `config.json` (`process.args`, `process.env`, `mounts`, `root_path`). The bits
+this needs are all expressible there: `env` for `LD_PRELOAD=librumphijack` +
+`RUMP_SERVER=unix://…` (model 2); `mounts` to bind `/dev/net/tap0`, the rump SDK,
+and the server socket into the box namespace (herd already wires the process VFS).
+What may need adding to herd: an explicit per-service **stack/networking selector**
+(`smoltcp | rump`, model 3) and the resource caps from §10.3 — i.e. a small
+Akuma-specific extension to the OCI bundle, not a new mechanism. Track this as a
+herd requirement so the bundle schema reserves the knobs early.

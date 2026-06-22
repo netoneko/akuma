@@ -47,11 +47,13 @@ main(void)
 	}
 
 	/*
-	 * virt0: VIRTIF_BASE=virt ⇒ ifname "virt". The stock backend's devstr
-	 * is atoi()'d to select /dev/net/tun unit N — "0" ⇒ tun0.
+	 * virt0: VIRTIF_BASE=virt ⇒ ifname "virt". This if_virt.c is built WITHOUT
+	 * RUMP_VIF_LINKSTR, so virtif_clone creates the interface immediately at
+	 * ifcreate, binding it to /dev/net/tun unit N from the unit number (virt0 ⇒
+	 * tun0). SIOCSLINKSTR isn't compiled in (ifsetlinkstr would return ENOTTY),
+	 * so we go straight to addressing.
 	 */
 	STEP(rump_pub_netconfig_ifcreate("virt0"));
-	STEP(rump_pub_netconfig_ifsetlinkstr("virt0", "0"));
 	STEP(rump_pub_netconfig_ipv4_ifaddr("virt0", "10.0.0.2", "255.255.255.0"));
 	STEP(rump_pub_netconfig_ifup("virt0"));
 

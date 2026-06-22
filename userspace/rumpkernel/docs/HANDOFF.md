@@ -23,9 +23,9 @@ Goal (M1): run the NetBSD TCP/IP stack as a userspace rump kernel inside an Akum
 | **`rump_init()` runs ON AKUMA** — NetBSD rump kernel boots in the VM | ✅ **GREEN 2026-06-22** |
 | `rumpuser_component_*` family (scheduler bridge for virtif backend) | ✅ done, in `rumpuser/src/lib.rs` |
 | Phase 4 — `librumpnet_virtif.a` (kernel driver `if_virt.o`) built | ✅ via `docker-build-virtif.sh` |
-| Phase 4 — `test_net` links (stock TUN/TAP backend + net factions) + `rump_init()` | ✅ links & boots; ⚠️ hangs at `ifcreate` |
-| Phase 4 — **`rumpuser` scheduler-wrap under concurrency** (RX kthread deadlock) | 🔴 **THE blocker — see workaround #3** |
-| Phase 4 — virtif up + DHCP + `rump_sys_socket` (blocked on the above) | ⏳ |
+| Phase 4 — **container networking GREEN**: `virt0` up, IP assigned, `rump_sys_socket` OK | ✅ **2026-06-22** (`docker-net-test.sh`) |
+| Phase 4 — `rumpuser` scheduler-wrap under concurrency | ✅ fixed (cv/mutex/rwlock + **clock_sleep**) |
+| Phase 4 — DHCP + actual packet round-trip (needs tap peer / DHCP server) | ⏳ next |
 | Rump SDK tarball (`bootstrap/archives/rump-sdk-aarch64-musl.tar.gz` → VM `/archives`) for in-VM builds | ✅ `package-sdk.sh` (48 MB, 154 archives) |
 | Capstone demo: clone+compile sic, IRC `#rumpkernel` over the NetBSD stack | 📋 `acceptance/11_netbsd_rumpkernel_irc.md` (target) |
 | Phase 4b — our `rumpcomp_user` backend → `/dev/net/tap0` | ⏳ |
@@ -170,22 +170,19 @@ aarch64-linux-musl-gcc -O2 -static -o /tmp/test_init_akuma \
 2. **`rust_eh_personality` no-op stub** (`csupport.c`): prebuilt Rust `core`
    references it under `panic=abort`. **Proper fix on Akuma:** rebuild core with
    nightly `-Z build-std` `-Cpanic=immediate-abort` (like Akuma's other userspace).
-3. **`rumpuser` clock/lock "wrap"** — ⚠️ **NOW HIT (2026-06-22), blocking Phase 4.**
-   `cv_wait`/`clock_sleep`/the lock paths don't call the hypervisor
-   `hyp_schedule`/`unschedule` around blocking. This was harmless at single-CPU
-   init, but the **virtif RX kthread is the first real concurrency** and it
-   deadlocks: `docker-net-test.sh` gets `rump_init() returned 0`, then **hangs in
-   `rump_pub_netconfig_ifcreate("virt0")`** (its result line never prints; `timeout`
-   can't kill it — rump masks signals). Path: `ifcreate` → `virtif_clone` →
-   `VIFHYPER_CREATE` (`rumpcomp_virt_create`) → `pthread_create(rcvthread)` →
-   `rumpuser_component_kthread()` + `rumpuser_component_schedule()`. The new kthread
-   and the main lwp deadlock because a blocking wait holds the rump CPU instead of
-   releasing it via `hyp_backend_unschedule`. **THE next fix:** make the blocking
-   `rumpuser` primitives (cv_wait/cv_timedwait, mutex/rwlock enter when contended)
-   unschedule the rump CPU before sleeping and re-schedule after — i.e. wrap them
-   the way NetBSD's C librumpuser does (`rumpkern_unsched`/`rumpkern_sched` around
-   the host blocking call). Diagnose with `--features rumpuser_debug` to see the
-   last hypercall before the hang.
+3. **`rumpuser` scheduler-wrap under concurrency** — ✅ **FIXED (2026-06-22).**
+   The blocking `rumpuser` primitives now release the single rump CPU around the
+   host blocking call (NetBSD's `rumpkern_unsched`/`rumpkern_sched` discipline):
+   `mutex_enter`/`rw_enter` wrap **on contention** (trylock first; spin mutexes use
+   the no-wrap path); `cv_wait`/`cv_timedwait` use `cv_unschedule`/`cv_reschedule`
+   (with the spin-kmutex interlock special-case); and — the actual culprit —
+   **`clock_sleep`** now unschedules around its `nanosleep`. The hardclock thread
+   was holding the one rump CPU through every 10 ms tick, starving the main lwp
+   parked in the scheduler slowpath (`cv_wait_nowrap`) — a classic lost-CPU-handoff
+   ("missed delivery"). Found via a thread-ID-stamped, single-`write` trace
+   (`--features rumpuser_debug`; lines no longer tear). Also note: `mutex_init` now
+   stores the `RUMPUSER_MTX_SPIN|KMUTEX` flags (needed for the wrap decisions) and
+   `cv_timedwait` now treats the timeout as RELATIVE+CLOCK_REALTIME (was absolute).
 
 ---
 

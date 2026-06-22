@@ -71,6 +71,7 @@ extern "C" {
     fn pthread_join(t: PthreadT, retval: *mut *mut c_void) -> c_int;
     fn pthread_exit(retval: *mut c_void) -> !;
 
+    fn pthread_self() -> *mut c_void;
     fn pthread_key_create(key: *mut PthreadKey, destructor: *const c_void) -> c_int;
     fn pthread_setspecific(key: PthreadKey, value: *const c_void) -> c_int;
     fn pthread_getspecific(key: PthreadKey) -> *mut c_void;
@@ -245,6 +246,12 @@ pub unsafe extern "C" fn rumpuser_clock_gettime(enum_: c_int, sec: *mut i64, nse
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_clock_sleep(enum_: c_int, sec: i64, nsec: c_long) -> c_int {
     tr!(b"clock_sleep");
+    // CRITICAL: release the rump CPU for the duration of the sleep. Otherwise the
+    // calling lwp (e.g. the hardclock thread, which sleeps to the next tick every
+    // ~10ms) holds the single rump CPU across the sleep and STARVES every other
+    // lwp — a thread blocked in the scheduler slowpath waiting for the CPU then
+    // never runs (this is what wedged ifcreate). Matches NetBSD rumpuser_clock_sleep.
+    let nlocks = rumpkern_unsched(ptr::null_mut());
     // RELWALL: relative sleep. ABSMONO: sleep until the absolute monotonic time.
     let req = if enum_ == RUMPUSER_CLOCK_ABSMONO {
         let mut now = Timespec { tv_sec: 0, tv_nsec: 0 };
@@ -256,15 +263,16 @@ pub unsafe extern "C" fn rumpuser_clock_sleep(enum_: c_int, sec: i64, nsec: c_lo
             s -= 1;
         }
         if s < 0 {
+            // Deadline already passed — re-acquire the CPU before returning.
+            rumpkern_sched(nlocks, ptr::null_mut());
             return 0;
         }
         Timespec { tv_sec: s, tv_nsec: n }
     } else {
         Timespec { tv_sec: sec, tv_nsec: nsec }
     };
-    // hyp_unschedule/schedule around the block is the proper behaviour; for the
-    // stub phase we just sleep (single rump CPU during init).
     nanosleep(&req, ptr::null_mut());
+    rumpkern_sched(nlocks, ptr::null_mut());
     0
 }
 
@@ -428,40 +436,74 @@ pub unsafe extern "C" fn rumpuser_curlwp() -> *mut c_void {
 // musl pthread_mutex_t = 40 bytes / cond = 48 / rwlock = 56 on aarch64; the
 // generously-sized, 8-aligned buffers below hold them with room to spare.
 
+const RUMPUSER_MTX_SPIN: c_int = 0x01;
+const RUMPUSER_MTX_KMUTEX: c_int = 0x02;
+
 #[repr(C, align(8))]
 struct Mtx {
     pm: [u8; 64],
     owner: *mut c_void,
+    flags: c_int,
+}
+
+/// Record/clear ownership — only meaningful for KMUTEX (kernel adaptive) mutexes;
+/// spin mutexes don't track an owner (mirrors NetBSD's mtxenter/mtxexit).
+#[inline]
+unsafe fn mtxenter(m: *mut Mtx) {
+    if (*m).flags & RUMPUSER_MTX_KMUTEX != 0 {
+        (*m).owner = rumpuser_curlwp();
+    }
+}
+#[inline]
+unsafe fn mtxexit(m: *mut Mtx) {
+    if (*m).flags & RUMPUSER_MTX_KMUTEX != 0 {
+        (*m).owner = ptr::null_mut();
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn rumpuser_mutex_init(mtxp: *mut *mut Mtx, _flags: c_int) {
+pub unsafe extern "C" fn rumpuser_mutex_init(mtxp: *mut *mut Mtx, flags: c_int) {
     tr!(b"mutex_init");
     let m = malloc(core::mem::size_of::<Mtx>()) as *mut Mtx;
     pthread_mutex_init((*m).pm.as_mut_ptr() as *mut c_void, ptr::null());
     (*m).owner = ptr::null_mut();
+    (*m).flags = flags;
     *mtxp = m;
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_mutex_enter(m: *mut Mtx) {
     tr!(b"mutex_enter");
-    pthread_mutex_lock((*m).pm.as_mut_ptr() as *mut c_void);
-    (*m).owner = rumpuser_curlwp();
+    // Spin mutexes must NOT release the rump CPU (held briefly, taken in contexts
+    // where unscheduling is illegal) — go straight to the no-wrap path.
+    if (*m).flags & RUMPUSER_MTX_SPIN != 0 {
+        rumpuser_mutex_enter_nowrap(m);
+        return;
+    }
+    let p = (*m).pm.as_mut_ptr() as *mut c_void;
+    // Only release the rump CPU if the lock is actually contended; an uncontended
+    // acquire is a fast path and must not unschedule. On contention, unschedule so
+    // the lwp that holds the lock can be scheduled to release it (single rump CPU).
+    if pthread_mutex_trylock(p) != 0 {
+        let nlocks = rumpkern_unsched(ptr::null_mut());
+        pthread_mutex_lock(p);
+        rumpkern_sched(nlocks, ptr::null_mut());
+    }
+    mtxenter(m);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_mutex_enter_nowrap(m: *mut Mtx) {
     tr!(b"mutex_enter_nowrap");
     pthread_mutex_lock((*m).pm.as_mut_ptr() as *mut c_void);
-    (*m).owner = rumpuser_curlwp();
+    mtxenter(m);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_mutex_tryenter(m: *mut Mtx) -> c_int {
     tr!(b"mutex_tryenter");
     if pthread_mutex_trylock((*m).pm.as_mut_ptr() as *mut c_void) == 0 {
-        (*m).owner = rumpuser_curlwp();
+        mtxenter(m);
         0
     } else {
         EBUSY
@@ -471,7 +513,7 @@ pub unsafe extern "C" fn rumpuser_mutex_tryenter(m: *mut Mtx) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_mutex_exit(m: *mut Mtx) {
     tr!(b"mutex_exit");
-    (*m).owner = ptr::null_mut();
+    mtxexit(m);
     pthread_mutex_unlock((*m).pm.as_mut_ptr() as *mut c_void);
 }
 
@@ -517,11 +559,21 @@ pub unsafe extern "C" fn rumpuser_rw_init(rwp: *mut *mut Rw) {
 pub unsafe extern "C" fn rumpuser_rw_enter(enum_: c_int, rw: *mut Rw) {
     tr!(b"rw_enter");
     let p = (*rw).prw.as_mut_ptr() as *mut c_void;
+    // Release the rump CPU only when the lock is contended (see mutex_enter): the
+    // holder may be another lwp that needs the single rump CPU to release it.
     if enum_ == RUMPUSER_RW_WRITER {
-        pthread_rwlock_wrlock(p);
+        if pthread_rwlock_trywrlock(p) != 0 {
+            let nlocks = rumpkern_unsched(ptr::null_mut());
+            pthread_rwlock_wrlock(p);
+            rumpkern_sched(nlocks, ptr::null_mut());
+        }
         (*rw).writer = rumpuser_curlwp();
     } else {
-        pthread_rwlock_rdlock(p);
+        if pthread_rwlock_tryrdlock(p) != 0 {
+            let nlocks = rumpkern_unsched(ptr::null_mut());
+            pthread_rwlock_rdlock(p);
+            rumpkern_sched(nlocks, ptr::null_mut());
+        }
         (*rw).readers += 1;
     }
 }
@@ -614,37 +666,83 @@ pub unsafe extern "C" fn rumpuser_cv_destroy(cv: *mut Cv) {
     free(cv as *mut c_void);
 }
 
+// A cv wait must release the rump CPU before sleeping (the lwp that will signal
+// needs it — there is only one rump CPU), and reacquire on wake. The interlock
+// mutex is handed to the scheduler so the CPU handoff and the mutex release are
+// coordinated (avoids a lost-wakeup race). Mirrors NetBSD cv_unschedule/reschedule.
+#[inline]
+unsafe fn cv_unschedule(m: *mut Mtx) -> c_int {
+    let nlocks = rumpkern_unsched(m as *mut c_void);
+    mtxexit(m);
+    nlocks
+}
+
+#[inline]
+unsafe fn cv_reschedule(m: *mut Mtx, nlocks: c_int) {
+    // If the interlock is a spin kmutex, pthread_cond_wait reacquired pthmtx on
+    // return; to preserve lock-ordering vs. the rump CPU we must drop it, take the
+    // CPU, then relock — otherwise we'd hold-and-wait and could deadlock. Plain
+    // (non-spin) mutexes don't have this problem.
+    if (*m).flags & (RUMPUSER_MTX_SPIN | RUMPUSER_MTX_KMUTEX)
+        == (RUMPUSER_MTX_SPIN | RUMPUSER_MTX_KMUTEX)
+    {
+        pthread_mutex_unlock((*m).pm.as_mut_ptr() as *mut c_void);
+        rumpkern_sched(nlocks, m as *mut c_void);
+        rumpuser_mutex_enter_nowrap(m);
+    } else {
+        mtxenter(m);
+        rumpkern_sched(nlocks, m as *mut c_void);
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_cv_wait(cv: *mut Cv, m: *mut Mtx) {
     tr!(b"cv_wait");
     (*cv).waiters += 1;
-    (*m).owner = ptr::null_mut();
+    let nlocks = cv_unschedule(m);
     pthread_cond_wait((*cv).pcv.as_mut_ptr() as *mut c_void, (*m).pm.as_mut_ptr() as *mut c_void);
-    (*m).owner = rumpuser_curlwp();
+    cv_reschedule(m, nlocks);
     (*cv).waiters -= 1;
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_cv_wait_nowrap(cv: *mut Cv, m: *mut Mtx) {
     tr!(b"cv_wait_nowrap");
-    rumpuser_cv_wait(cv, m);
+    // No CPU release: the caller is in a context where unscheduling is illegal.
+    (*cv).waiters += 1;
+    mtxexit(m);
+    pthread_cond_wait((*cv).pcv.as_mut_ptr() as *mut c_void, (*m).pm.as_mut_ptr() as *mut c_void);
+    mtxenter(m);
+    (*cv).waiters -= 1;
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_cv_timedwait(cv: *mut Cv, m: *mut Mtx, sec: i64, nsec: i64) -> c_int {
     tr!(b"cv_timedwait");
-    // rump passes an ABSOLUTE CLOCK_MONOTONIC deadline (sec/nsec).
-    let abstime = Timespec { tv_sec: sec, tv_nsec: nsec as c_long };
+    // rump passes a RELATIVE timeout (sec/nsec); pthread_cond_timedwait wants an
+    // absolute CLOCK_REALTIME deadline. Sample the clock before unscheduling (we
+    // may be parked a while after releasing the rump CPU). Matches NetBSD.
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    clock_gettime(CLOCK_REALTIME, &mut ts);
+
     (*cv).waiters += 1;
-    (*m).owner = ptr::null_mut();
+    let nlocks = cv_unschedule(m);
+
+    ts.tv_sec += sec;
+    ts.tv_nsec += nsec as c_long;
+    if ts.tv_nsec >= 1_000_000_000 {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1_000_000_000;
+    }
     let rv = pthread_cond_timedwait(
         (*cv).pcv.as_mut_ptr() as *mut c_void,
         (*m).pm.as_mut_ptr() as *mut c_void,
-        &abstime,
+        &ts,
     );
-    (*m).owner = rumpuser_curlwp();
+
+    cv_reschedule(m, nlocks);
     (*cv).waiters -= 1;
-    // ETIMEDOUT (110 on Linux/musl) → rump expects a nonzero return on timeout.
+    // ETIMEDOUT (110 on Linux/musl) → rump expects nonzero on timeout; else 0.
     if rv == 110 { rv } else { 0 }
 }
 
@@ -778,28 +876,32 @@ pub unsafe extern "C" fn rumpuser_sp_fini(_arg: *mut c_void) { tr!(b"sp_fini(STU
 // `rumpkern_{un,}sched` (rumpuser_int.h) are thin inlines over the backend
 // schedule upcalls in the hyp table, so we inline them here directly.
 
+// Release / re-acquire the single rump-kernel CPU. `interlock` is the rump mutex
+// the scheduler coordinates the handoff with (NULL for the plain backend wrap);
+// it is compared by pointer against the scheduler's own CPU mutex inside the rump
+// kernel — pass the cv's interlock mutex in the cv paths, NULL otherwise.
 #[inline]
-unsafe fn rumpkern_unsched() -> c_int {
+unsafe fn rumpkern_unsched(interlock: *mut c_void) -> c_int {
     let mut nlocks: c_int = 0;
-    ((*HYPERUP).hyp_backend_unschedule.unwrap())(0, &mut nlocks, ptr::null_mut());
+    ((*HYPERUP).hyp_backend_unschedule.unwrap())(0, &mut nlocks, interlock);
     nlocks
 }
 
 #[inline]
-unsafe fn rumpkern_sched(nlocks: c_int) {
-    ((*HYPERUP).hyp_backend_schedule.unwrap())(nlocks, ptr::null_mut());
+unsafe fn rumpkern_sched(nlocks: c_int, interlock: *mut c_void) {
+    ((*HYPERUP).hyp_backend_schedule.unwrap())(nlocks, interlock);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_component_unschedule() -> *mut c_void {
     tr!(b"component_unschedule");
-    rumpkern_unsched() as isize as *mut c_void
+    rumpkern_unsched(ptr::null_mut()) as isize as *mut c_void
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_component_schedule(cookie: *mut c_void) {
     tr!(b"component_schedule");
-    rumpkern_sched(cookie as isize as c_int);
+    rumpkern_sched(cookie as isize as c_int, ptr::null_mut());
 }
 
 #[no_mangle]
@@ -860,12 +962,61 @@ unsafe fn dprint(msg: &[u8]) {
     write(2, msg.as_ptr() as *const c_void, msg.len());
 }
 
-/// TEMP debug: trace a hypercall name ("ru:<name>\n") to stderr.
+/// TEMP debug: trace one hypercall as "[<tid> #<seq>] ru:<name>\n" in a SINGLE
+/// write() so concurrent threads can't tear the line (one write to a pipe is
+/// atomic up to PIPE_BUF). The tid (low 32 bits of pthread_self) lets us follow a
+/// single lwp's flow, and the global seq orders events across threads — exactly
+/// what's needed to see which thread parks on a cv and which one should signal it.
 #[cfg(feature = "rumpuser_debug")]
 unsafe fn trace(name: &[u8]) {
-    dprint(b"ru:");
-    dprint(name);
-    dprint(b"\n");
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tid = pthread_self() as usize as u32;
+
+    let mut buf = [0u8; 128];
+    let mut n = 0usize;
+    let mut put = |b: u8| {
+        if n < buf.len() {
+            buf[n] = b;
+            n += 1;
+        }
+    };
+    // "[" <tid:08x> " #" <seq> "] ru:" <name> "\n"
+    put(b'[');
+    for i in 0..8 {
+        let nib = ((tid >> ((7 - i) * 4)) & 0xf) as u8;
+        put(if nib < 10 { b'0' + nib } else { b'a' + (nib - 10) });
+    }
+    put(b' ');
+    put(b'#');
+    // seq in decimal (small, human-orderable)
+    if seq == 0 {
+        put(b'0');
+    } else {
+        let mut tmp = [0u8; 20];
+        let mut t = 0;
+        let mut v = seq;
+        while v > 0 {
+            tmp[t] = b'0' + (v % 10) as u8;
+            t += 1;
+            v /= 10;
+        }
+        while t > 0 {
+            t -= 1;
+            put(tmp[t]);
+        }
+    }
+    put(b']');
+    put(b' ');
+    put(b'r');
+    put(b'u');
+    put(b':');
+    for &c in name {
+        put(c);
+    }
+    put(b'\n');
+    write(2, buf.as_ptr() as *const c_void, n);
 }
 
 /// TEMP debug: print "tag 0xA 0xB 0xC\n" without variadics/alloc.
