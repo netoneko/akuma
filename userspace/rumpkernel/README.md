@@ -68,6 +68,9 @@ toolchain. Akuma's target is `aarch64-linux-musl` static (see the plan).
 
 ## Status
 
+**Resuming work? Start at [docs/HANDOFF.md](docs/HANDOFF.md)** — current state,
+copy-paste reproduce steps, the next task, and gotchas.
+
 In progress. The **kernel side** is built and verified; the userspace rump
 libraries (cross-built `librump*`, the Rust `rumpuser`, the `virtif` backend, the
 `rump-net` box payload) are not started yet.
@@ -78,11 +81,11 @@ libraries (cross-built `librump*`, the Rust `rumpuser`, the `virtif` backend, th
   [docs/PHASE3_KERNEL_TAP.md](docs/PHASE3_KERNEL_TAP.md).
 - ✅ **Phases 0/1 — `librump*.a` built for aarch64-musl** (full NetBSD TCP/IP
   stack), via a Linux container — see [docs/PHASE01_BUILDRUMP.md](docs/PHASE01_BUILDRUMP.md).
-- 🟡 **Phase 2 — Rust `rumpuser`**: the NetBSD rump kernel **boots on our
-  hypercalls** (banner + into `uvm_init`), one early-VM allocator bug from a green
-  `rump_init()` — see [docs/PHASE2_RUMPUSER.md](docs/PHASE2_RUMPUSER.md).
-- ⏳ Phases 4/5/6 (our `rumpcomp_user` virtif backend → box `--net` → DHCP + curl).
-  See [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md).
+- ✅ **Phase 2 — Rust `rumpuser`**: a full NetBSD rump kernel **boots on our
+  hypercalls** — `rump_init()` returns 0 — see [docs/PHASE2_RUMPUSER.md](docs/PHASE2_RUMPUSER.md).
+- ⏳ Phases 4/5/6 (virtif up + DHCP + `rump_sys_socket` in the container test → our
+  `rumpcomp_user` backend to `/dev/net/tap0` → Akuma integration → box `--net` →
+  DHCP + curl = M1). See [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md).
 
 Run the kernel tap path with `RUMP_NIC=1 cargo run --release` (adds the second
 QEMU NIC). Without it, `/dev/net/tap0` is absent and the default boot is

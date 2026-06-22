@@ -1,22 +1,40 @@
-# Phase 2 — Rust `rumpuser`: the NetBSD rump kernel boots on our hypercalls 🎉
+# Phase 2 — Rust `rumpuser`: `rump_init()` is GREEN ✅
 
-Status: **major milestone reached, one bug from green.** A NetBSD rump kernel
-links against our **Rust** `rumpuser` (no NetBSD C `librumpuser`), starts
-`rump_init()`, prints its banner, and runs into `uvm_init()` — i.e. real NetBSD
-kernel code executing on hypercalls we wrote. It currently SIGSEGVs on one bad
-allocation length during early VM init (details below). This is the
-linking/boot proof the plan's Phase 2 was after.
-
-## What runs
+Status: **DONE.** A full NetBSD rump kernel boots to completion on our **Rust**
+`rumpuser` (no NetBSD C `librumpuser`): `rump_init()` returns 0.
 
 ```
 $ ./docker-rumpuser-test.sh      (links librump.a + librumpuser_akuma.a, runs rump_init)
-Copyright (c) 1996, … 2016  The NetBSD Foundation, Inc.  All rights reserved.
-Copyright (c) 1982, … 1993  The Regents of the University of California. …
 NetBSD 7.99.34 (RUMP-ROAST)
 total memory = unlimited (host limit)
-<SIGSEGV in early uvm_init>
+RUMPUSER-AKUMA: rump_init() returned 0
+RUMPUSER-AKUMA: PASS — NetBSD rump kernel booted on our rumpuser
 ```
+
+## The bug chain to green (each fix peeled the next layer)
+
+Found by tracing every hypercall (`--features rumpuser_debug`) + gdb in-container:
+
+1. **SIGSEGV in early `uvm_init`** — rump's *optimized aarch64* `memset`
+   (`rumpns_memset`, the DC-ZVA-style zero fast-path) miscomputed its loop bound
+   for a small zero-fill and walked off the allocation. Confirmed via gdb: the
+   call site passed the correct `(dest, 0, 368)`, but the routine itself ran
+   away. **Fix:** override `rumpns_memset` with a trivial byte loop (csupport.c),
+   linked with `-Wl,--allow-multiple-definition` so it wins over librump's.
+2. **`panic: evcnt_attach_static: group length`** — same class: the optimized
+   `strlen`/`memcpy`/… misbehave. **Fix:** byte-loop overrides for `rumpns_`
+   `memcpy`/`memmove`/`strlen`/`strcmp`/`strncmp` too.
+3. **`panic: assertion "rw_lock_held(&kauth_lock)" failed`** — our
+   `rumpuser_rw_held` stub always returned "not held", failing the kernel's
+   `KASSERT`. **Fix:** real reader/writer ownership tracking in `rumpuser_rw_*`
+   (writer = current lwp, readers = shared count), mirroring NetBSD's librumpuser.
+
+The optimized-libkern issue (1 & 2) is the notable one: the stock aarch64
+`memset`/`strlen`/… in `librump.a` don't behave in our link/run environment. The
+byte-loop overrides are a correct (if slow) stopgap. **Proper fix (later):** build
+`librump` with the generic C libkern string/mem routines instead of the aarch64
+assembly (investigate why the optimized ones run away — DC-ZVA / DCZID assumptions
+or how buildrump assembled them), then drop the overrides.
 
 That banner is printed **by the NetBSD kernel**, through our
 `rumpuser_putchar`/`rumpuser_dprintf`, after `rump_init()` drove our
@@ -56,49 +74,28 @@ under `panic=abort`, so `csupport.c` provides a no-op stub (never called). On
 Akuma proper we'll instead rebuild core with `-Cpanic=immediate-abort` via
 nightly `build-std`, like the rest of Akuma's userspace.
 
-## The remaining bug (early uvm_init)
+## Debugging method (for next time)
 
-`gdb` backtrace at the crash:
-```
-#0 rumpns_memset
-#1 kmem_intr_zalloc (kmflags=1, size=368)  subr_kmem.c:318  memset(p, 0, size)
-#2 kmem_zalloc (size=368)
-#3 uvm_init ()                              vm.c:399  rump_vmspace_local = kmem_zalloc(...)
-#4 rump_init ()                             rump.c:286
-#5 main ()                                  test_init.c:16
-```
-Registers at the fault: `x0` (dest) = `0xffff85e33000` (a **valid** mmap'd
-pointer from our allocator), `x1` (val) = 0, **`x2` (len) = `0x3fffe16bdf0`
-(~4.4 TB)**. So the pointer is fine; `memset` is called with a **garbage
-length**. The frame says `size=368`, so the `-O2` librump backtrace is
-mis-attributing the line — the real 4.4 TB-length `memset` is elsewhere in the
-first kmem/pool/vmem bootstrap. `physmem` is a fixed constant (`emul.c:57`), so
-it isn't that.
+`--features rumpuser_debug` traces every hypercall (and memory sizes/pointers) to
+stderr — that's what localised each crash to "the last hypercall before it." For
+the in-routine memset runaway, gdb in the container pinned it: break at the
+`memset` call site to read the *correct* args, then disassemble `rumpns_memset` to
+see it take the zero fast-path and run away. Set `RUMP_VERBOSE=1` (the test does)
+for rump's own boot prints.
 
-**Narrowed (instrumented `rumpuser_malloc`/`anonmmap` + filtered gdb):**
-- Our `rumpuser_malloc` returns **valid** page-aligned blocks (`len=0x1000
-  align=0x1000 ptr=0xffff86xxx000`), exactly like NetBSD's own librumpuser
-  (which also uses `posix_memalign`). The pool pages are non-contiguous — normal.
-- The faulting `memset` is the `kmem_zalloc(sizeof(struct vmspace)=368)` for
-  `rump_vmspace_local` (vm.c:399); the chunk handed back is invalid for 368
-  bytes, so `memset` walks off. (An earlier `initmsgbuf` 16 KB memset on static
-  BSS is benign.)
-- Suspect: how rump's bootstrap `kmem_arena = vmem_create("kmem", 0, 1024*1024,
-  PAGE_SIZE, …)` (base 0, 1 MB, no import fn) and `kmem_va_arena` are backed —
-  the VA→real-memory mapping for the first kmem allocations. Since our
-  `rumpuser_malloc` matches the stock one, the divergence is likely a subtler
-  hypercall our rumpuser gets wrong during vmem/pool bootstrap (a lock/cv/clock
-  return convention, or a missing init the stock librumpuser does), not malloc
-  itself.
+## Carried workarounds (revisit)
 
-**Bring-up tracing:** the `rumpuser_debug` cargo feature traces the memory
-hypercalls (`cargo build … --features rumpuser_debug`).
+- **`csupport.c` overrides** `rumpns_{memset,memcpy,memmove,strlen,strcmp,strncmp}`
+  with byte loops, linked via `-Wl,--allow-multiple-definition`. Correct but slow;
+  proper fix is to build `librump` with the generic C libkern routines.
+- **`rust_eh_personality`** no-op stub (prebuilt core references it under
+  `panic=abort`). On Akuma proper, rebuild core with `-Cpanic=immediate-abort`.
 
-**Next step (dedicated):** trace the kmem/vmem bootstrap path (`pool_subsystem_init`
-→ `vmem_create`/`vmem_subsystem_init` → first `kmem_intr_alloc`) and compare the
-hypercall sequence/return values against NetBSD's C librumpuser, to find the
-mis-implemented `rumpuser_*` convention. Then move to the container virtif+DHCP
-test, then Akuma integration.
+## Open question worth understanding
+
+Why do the stock optimized aarch64 `memset`/`strlen`/… in `librump.a` run away in
+our environment? (DC-ZVA / `DCZID_EL0` assumptions, or how buildrump assembled
+them.) Not blocking — the overrides work — but worth a root-cause before shipping.
 
 ## After green
 

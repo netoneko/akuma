@@ -21,6 +21,9 @@
 //! `no_std`: this is pure syscall/libc glue — no allocator, no std runtime. It
 //! links into a musl C program, which supplies libc/pthread and the
 //! compiler-builtin `memcpy`/`memset`. Matches the rest of Akuma's Rust userspace.
+//!
+//! Build with `--features rumpuser_debug` to trace every hypercall (and the
+//! memory sizes/pointers) to stderr — used to localise the bring-up crash.
 
 #![no_std]
 #![allow(non_camel_case_types)]
@@ -34,6 +37,15 @@ use core::ptr;
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     unsafe { abort() }
+}
+
+/// Trace a hypercall name to stderr when the `rumpuser_debug` feature is on.
+/// Expands to nothing otherwise (zero cost in release).
+macro_rules! tr {
+    ($name:literal) => {{
+        #[cfg(feature = "rumpuser_debug")]
+        trace($name);
+    }};
 }
 
 // ── libc / pthread externs (resolved by the musl libc the final program links) ──
@@ -144,6 +156,7 @@ static mut CURLWP_KEY: PthreadKey = 0;
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_init(version: c_int, hyp: *const RumpHyperUp) -> c_int {
+    tr!(b"init");
     const RUMPUSER_VERSION: c_int = 17;
     if version != RUMPUSER_VERSION {
         dprint(b"rumpuser_init: version mismatch\n");
@@ -161,6 +174,7 @@ pub unsafe extern "C" fn rumpuser_init(version: c_int, hyp: *const RumpHyperUp) 
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_malloc(len: usize, alignment: c_int, memp: *mut *mut c_void) -> c_int {
+    tr!(b"malloc");
     let align = if alignment <= 0 { core::mem::size_of::<usize>() } else { alignment as usize };
     // posix_memalign requires alignment to be a power of two and >= sizeof(void*).
     let align = align.max(core::mem::size_of::<usize>()).next_power_of_two();
@@ -171,12 +185,13 @@ pub unsafe extern "C" fn rumpuser_malloc(len: usize, alignment: c_int, memp: *mu
     }
     *memp = ptr;
     #[cfg(feature = "rumpuser_debug")]
-    dbg3(b"MALLOC len/align/ptr ", len, align, ptr as usize);
+    dbg3(b"  malloc len/align/ptr ", len, align, ptr as usize);
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_free(ptr: *mut c_void, _size: usize) {
+    tr!(b"free");
     free(ptr);
 }
 
@@ -188,6 +203,7 @@ pub unsafe extern "C" fn rumpuser_anonmmap(
     exec: c_int,
     memp: *mut *mut c_void,
 ) -> c_int {
+    tr!(b"anonmmap");
     let mut prot = PROT_READ | PROT_WRITE;
     if exec != 0 {
         prot |= PROT_EXEC;
@@ -198,22 +214,23 @@ pub unsafe extern "C" fn rumpuser_anonmmap(
     }
     *memp = p;
     #[cfg(feature = "rumpuser_debug")]
-    dbg3(b"ANONMMAP size/exec/ptr ", size, exec as usize, p as usize);
+    dbg3(b"  anonmmap size/exec/ptr ", size, exec as usize, p as usize);
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_unmap(addr: *mut c_void, size: usize) {
+    tr!(b"unmap");
     munmap(addr, size);
 }
 
 // ── clock ───────────────────────────────────────────────────────────────────
 
-const RUMPUSER_CLOCK_RELWALL: c_int = 0;
 const RUMPUSER_CLOCK_ABSMONO: c_int = 1;
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_clock_gettime(enum_: c_int, sec: *mut i64, nsec: *mut c_long) -> c_int {
+    tr!(b"clock_gettime");
     let clk = if enum_ == RUMPUSER_CLOCK_ABSMONO { CLOCK_MONOTONIC } else { CLOCK_REALTIME };
     let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
     if clock_gettime(clk, &mut ts) != 0 {
@@ -226,6 +243,7 @@ pub unsafe extern "C" fn rumpuser_clock_gettime(enum_: c_int, sec: *mut i64, nse
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_clock_sleep(enum_: c_int, sec: i64, nsec: c_long) -> c_int {
+    tr!(b"clock_sleep");
     // RELWALL: relative sleep. ABSMONO: sleep until the absolute monotonic time.
     let req = if enum_ == RUMPUSER_CLOCK_ABSMONO {
         let mut now = Timespec { tv_sec: 0, tv_nsec: 0 };
@@ -253,13 +271,14 @@ pub unsafe extern "C" fn rumpuser_clock_sleep(enum_: c_int, sec: i64, nsec: c_lo
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_getparam(name: *const c_char, buf: *mut c_void, blen: usize) -> c_int {
+    tr!(b"getparam");
     let n = cstr(name);
     let val: &[u8] = if n == b"_RUMPUSER_NCPU" {
         b"1\0"
     } else if n == b"_RUMPUSER_HOSTNAME" {
         b"rump-akuma\0"
     } else if n == b"RUMP_VERBOSE" {
-        b"1\0" // verbose during bring-up so rump prints its init steps
+        b"0\0" // quiet by default (set the RUMP_VERBOSE env in the test for boot logs)
     } else {
         return ENXIO;
     };
@@ -274,16 +293,19 @@ pub unsafe extern "C" fn rumpuser_getparam(name: *const c_char, buf: *mut c_void
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_seterrno(e: c_int) {
+    tr!(b"seterrno");
     set_errno(e);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_kill(_pid: i64, _sig: c_int) -> c_int {
+    tr!(b"kill");
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_exit(value: c_int) -> ! {
+    tr!(b"exit");
     const RUMPUSER_PANIC: c_int = -1;
     if value == RUMPUSER_PANIC {
         dprint(b"rumpuser_exit: PANIC\n");
@@ -296,6 +318,7 @@ pub unsafe extern "C" fn rumpuser_exit(value: c_int) -> ! {
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_putchar(ch: c_int) {
+    // (no tr! — fires per character; would drown the trace)
     let b = ch as u8;
     write(1, &b as *const u8 as *const c_void, 1);
 }
@@ -306,6 +329,7 @@ pub unsafe extern "C" fn rumpuser_putchar(ch: c_int) {
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_getrandom(buf: *mut c_void, buflen: usize, _flags: c_int, retp: *mut usize) -> c_int {
+    tr!(b"getrandom");
     let mut got = 0usize;
     while got < buflen {
         let r = getrandom((buf as *mut u8).add(got) as *mut c_void, buflen - got, 0);
@@ -331,6 +355,7 @@ pub unsafe extern "C" fn rumpuser_thread_create(
     _cpuidx: c_int,
     cookie: *mut *mut c_void,
 ) -> c_int {
+    tr!(b"thread_create");
     let mut tid: PthreadT = ptr::null_mut();
     let rv = pthread_create(&mut tid, ptr::null(), f, arg);
     if rv != 0 {
@@ -344,11 +369,13 @@ pub unsafe extern "C" fn rumpuser_thread_create(
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_thread_exit() -> ! {
+    tr!(b"thread_exit");
     pthread_exit(ptr::null_mut());
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_thread_join(cookie: *mut c_void) -> c_int {
+    tr!(b"thread_join");
     pthread_join(cookie as PthreadT, ptr::null_mut())
 }
 
@@ -361,6 +388,7 @@ const RUMPUSER_LWP_CLEAR: c_int = 3;
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_curlwpop(op: c_int, lwp: *mut c_void) -> c_int {
+    tr!(b"curlwpop");
     match op {
         RUMPUSER_LWP_SET => { pthread_setspecific(CURLWP_KEY, lwp); }
         RUMPUSER_LWP_CLEAR => { pthread_setspecific(CURLWP_KEY, ptr::null()); }
@@ -372,6 +400,7 @@ pub unsafe extern "C" fn rumpuser_curlwpop(op: c_int, lwp: *mut c_void) -> c_int
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_curlwp() -> *mut c_void {
+    // (no tr! — extremely hot; would drown the trace)
     pthread_getspecific(CURLWP_KEY)
 }
 
@@ -388,6 +417,7 @@ struct Mtx {
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_mutex_init(mtxp: *mut *mut Mtx, _flags: c_int) {
+    tr!(b"mutex_init");
     let m = malloc(core::mem::size_of::<Mtx>()) as *mut Mtx;
     pthread_mutex_init((*m).pm.as_mut_ptr() as *mut c_void, ptr::null());
     (*m).owner = ptr::null_mut();
@@ -396,18 +426,21 @@ pub unsafe extern "C" fn rumpuser_mutex_init(mtxp: *mut *mut Mtx, _flags: c_int)
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_mutex_enter(m: *mut Mtx) {
+    tr!(b"mutex_enter");
     pthread_mutex_lock((*m).pm.as_mut_ptr() as *mut c_void);
     (*m).owner = rumpuser_curlwp();
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_mutex_enter_nowrap(m: *mut Mtx) {
+    tr!(b"mutex_enter_nowrap");
     pthread_mutex_lock((*m).pm.as_mut_ptr() as *mut c_void);
     (*m).owner = rumpuser_curlwp();
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_mutex_tryenter(m: *mut Mtx) -> c_int {
+    tr!(b"mutex_tryenter");
     if pthread_mutex_trylock((*m).pm.as_mut_ptr() as *mut c_void) == 0 {
         (*m).owner = rumpuser_curlwp();
         0
@@ -418,86 +451,124 @@ pub unsafe extern "C" fn rumpuser_mutex_tryenter(m: *mut Mtx) -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_mutex_exit(m: *mut Mtx) {
+    tr!(b"mutex_exit");
     (*m).owner = ptr::null_mut();
     pthread_mutex_unlock((*m).pm.as_mut_ptr() as *mut c_void);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_mutex_destroy(m: *mut Mtx) {
+    tr!(b"mutex_destroy");
     pthread_mutex_destroy((*m).pm.as_mut_ptr() as *mut c_void);
     free(m as *mut c_void);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_mutex_owner(m: *mut Mtx, lp: *mut *mut c_void) {
+    tr!(b"mutex_owner");
     *lp = (*m).owner;
 }
 
 // ── rwlock ──────────────────────────────────────────────────────────────────
 
+// We track ownership ourselves (pthread offers no portable "held" query, and the
+// rump kernel KASSERTs `rw_lock_held()`): `writer` is the lwp holding it
+// exclusively (or null), `readers` the shared-hold count. Mirrors NetBSD's own
+// librumpuser bookkeeping.
 #[repr(C, align(8))]
 struct Rw {
     prw: [u8; 64],
+    writer: *mut c_void,
+    readers: c_int,
 }
 
-const RUMPUSER_RW_READER: c_int = 0;
 const RUMPUSER_RW_WRITER: c_int = 1;
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_rw_init(rwp: *mut *mut Rw) {
+    tr!(b"rw_init");
     let rw = malloc(core::mem::size_of::<Rw>()) as *mut Rw;
     pthread_rwlock_init((*rw).prw.as_mut_ptr() as *mut c_void, ptr::null());
+    (*rw).writer = ptr::null_mut();
+    (*rw).readers = 0;
     *rwp = rw;
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_rw_enter(enum_: c_int, rw: *mut Rw) {
+    tr!(b"rw_enter");
     let p = (*rw).prw.as_mut_ptr() as *mut c_void;
     if enum_ == RUMPUSER_RW_WRITER {
         pthread_rwlock_wrlock(p);
+        (*rw).writer = rumpuser_curlwp();
     } else {
         pthread_rwlock_rdlock(p);
+        (*rw).readers += 1;
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_rw_tryenter(enum_: c_int, rw: *mut Rw) -> c_int {
+    tr!(b"rw_tryenter");
     let p = (*rw).prw.as_mut_ptr() as *mut c_void;
-    let rv = if enum_ == RUMPUSER_RW_WRITER {
-        pthread_rwlock_trywrlock(p)
+    if enum_ == RUMPUSER_RW_WRITER {
+        if pthread_rwlock_trywrlock(p) == 0 {
+            (*rw).writer = rumpuser_curlwp();
+            0
+        } else {
+            EBUSY
+        }
+    } else if pthread_rwlock_tryrdlock(p) == 0 {
+        (*rw).readers += 1;
+        0
     } else {
-        pthread_rwlock_tryrdlock(p)
-    };
-    if rv == 0 { 0 } else { EBUSY }
+        EBUSY
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_rw_tryupgrade(_rw: *mut Rw) -> c_int {
+    tr!(b"rw_tryupgrade");
     // pthread rwlock has no atomic upgrade; report failure so the caller retries
     // via drop+reacquire (rump handles EBUSY here).
     EBUSY
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn rumpuser_rw_downgrade(_rw: *mut Rw) {
-    // No-op: pthread rwlocks can't downgrade in place. Safe (still write-locked).
+pub unsafe extern "C" fn rumpuser_rw_downgrade(rw: *mut Rw) {
+    tr!(b"rw_downgrade");
+    // pthread rwlocks can't downgrade in place — the lock stays exclusive (safe,
+    // just no reader concurrency), but update bookkeeping so held()/asserts agree.
+    (*rw).writer = ptr::null_mut();
+    (*rw).readers += 1;
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_rw_exit(rw: *mut Rw) {
+    tr!(b"rw_exit");
+    if (*rw).writer == rumpuser_curlwp() && !(*rw).writer.is_null() {
+        (*rw).writer = ptr::null_mut();
+    } else if (*rw).readers > 0 {
+        (*rw).readers -= 1;
+    }
     pthread_rwlock_unlock((*rw).prw.as_mut_ptr() as *mut c_void);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_rw_destroy(rw: *mut Rw) {
+    tr!(b"rw_destroy");
     pthread_rwlock_destroy((*rw).prw.as_mut_ptr() as *mut c_void);
     free(rw as *mut c_void);
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn rumpuser_rw_held(_enum_: c_int, _rw: *mut Rw, held: *mut c_int) {
-    // Best-effort: pthread offers no portable "held" query. Report not-held.
-    *held = 0;
+pub unsafe extern "C" fn rumpuser_rw_held(enum_: c_int, rw: *mut Rw, held: *mut c_int) {
+    tr!(b"rw_held");
+    *held = if enum_ == RUMPUSER_RW_WRITER {
+        c_int::from((*rw).writer == rumpuser_curlwp() && !(*rw).writer.is_null())
+    } else {
+        c_int::from((*rw).readers > 0)
+    };
 }
 
 // ── condvar ─────────────────────────────────────────────────────────────────
@@ -510,6 +581,7 @@ struct Cv {
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_cv_init(cvp: *mut *mut Cv) {
+    tr!(b"cv_init");
     let cv = malloc(core::mem::size_of::<Cv>()) as *mut Cv;
     pthread_cond_init((*cv).pcv.as_mut_ptr() as *mut c_void, ptr::null());
     (*cv).waiters = 0;
@@ -518,12 +590,14 @@ pub unsafe extern "C" fn rumpuser_cv_init(cvp: *mut *mut Cv) {
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_cv_destroy(cv: *mut Cv) {
+    tr!(b"cv_destroy");
     pthread_cond_destroy((*cv).pcv.as_mut_ptr() as *mut c_void);
     free(cv as *mut c_void);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_cv_wait(cv: *mut Cv, m: *mut Mtx) {
+    tr!(b"cv_wait");
     (*cv).waiters += 1;
     (*m).owner = ptr::null_mut();
     pthread_cond_wait((*cv).pcv.as_mut_ptr() as *mut c_void, (*m).pm.as_mut_ptr() as *mut c_void);
@@ -533,11 +607,13 @@ pub unsafe extern "C" fn rumpuser_cv_wait(cv: *mut Cv, m: *mut Mtx) {
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_cv_wait_nowrap(cv: *mut Cv, m: *mut Mtx) {
+    tr!(b"cv_wait_nowrap");
     rumpuser_cv_wait(cv, m);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_cv_timedwait(cv: *mut Cv, m: *mut Mtx, sec: i64, nsec: i64) -> c_int {
+    tr!(b"cv_timedwait");
     // rump passes an ABSOLUTE CLOCK_MONOTONIC deadline (sec/nsec).
     let abstime = Timespec { tv_sec: sec, tv_nsec: nsec as c_long };
     (*cv).waiters += 1;
@@ -555,16 +631,19 @@ pub unsafe extern "C" fn rumpuser_cv_timedwait(cv: *mut Cv, m: *mut Mtx, sec: i6
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_cv_signal(cv: *mut Cv) {
+    tr!(b"cv_signal");
     pthread_cond_signal((*cv).pcv.as_mut_ptr() as *mut c_void);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_cv_broadcast(cv: *mut Cv) {
+    tr!(b"cv_broadcast");
     pthread_cond_broadcast((*cv).pcv.as_mut_ptr() as *mut c_void);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_cv_has_waiters(cv: *mut Cv, nwaiters: *mut c_int) {
+    tr!(b"cv_has_waiters");
     *nwaiters = (*cv).waiters;
 }
 
@@ -572,17 +651,20 @@ pub unsafe extern "C" fn rumpuser_cv_has_waiters(cv: *mut Cv, nwaiters: *mut c_i
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_open(_name: *const c_char, _mode: c_int, fdp: *mut c_int) -> c_int {
+    tr!(b"open(STUB)");
     let _ = fdp;
     ENXIO
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_close(_fd: c_int) -> c_int {
+    tr!(b"close(STUB)");
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_getfileinfo(_name: *const c_char, _size: *mut u64, _ft: *mut c_int) -> c_int {
+    tr!(b"getfileinfo(STUB)");
     ENXIO
 }
 
@@ -596,21 +678,25 @@ pub unsafe extern "C" fn rumpuser_bio(
     _done: Option<extern "C" fn(*mut c_void, usize, c_int)>,
     _donearg: *mut c_void,
 ) {
+    tr!(b"bio(STUB)");
     // No block device backing in the networking-only phase.
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_iovread(_fd: c_int, _iov: *mut c_void, _iovcnt: usize, _off: i64, _retv: *mut usize) -> c_int {
+    tr!(b"iovread(STUB)");
     ENXIO
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_iovwrite(_fd: c_int, _iov: *const c_void, _iovcnt: usize, _off: i64, _retv: *mut usize) -> c_int {
+    tr!(b"iovwrite(STUB)");
     ENXIO
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_syncfd(_fd: c_int, _flags: c_int, _start: u64, _len: u64) -> c_int {
+    tr!(b"syncfd(STUB)");
     0
 }
 
@@ -622,17 +708,20 @@ pub unsafe extern "C" fn rumpuser_dl_bootstrap(
     _symload: *mut c_void,
     _compload: *mut c_void,
 ) {
+    tr!(b"dl_bootstrap(STUB)");
     // Components are linked statically (RUMP_COMPONENT ctors run via the linker),
     // so there is nothing to discover dynamically.
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_daemonize_begin() -> c_int {
+    tr!(b"daemonize_begin(STUB)");
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_daemonize_done(_error: c_int) -> c_int {
+    tr!(b"daemonize_done(STUB)");
     0
 }
 
@@ -640,22 +729,23 @@ pub unsafe extern "C" fn rumpuser_daemonize_done(_error: c_int) -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_sp_init(_url: *const c_char, _a: *const c_char, _b: *const c_char, _c: *const c_char) -> c_int {
+    tr!(b"sp_init(STUB)");
     ENOTSUP
 }
 #[no_mangle]
-pub unsafe extern "C" fn rumpuser_sp_copyin(_arg: *mut c_void, _raddr: *const c_void, _laddr: *mut c_void, _len: usize) -> c_int { ENOTSUP }
+pub unsafe extern "C" fn rumpuser_sp_copyin(_arg: *mut c_void, _raddr: *const c_void, _laddr: *mut c_void, _len: usize) -> c_int { tr!(b"sp_copyin(STUB)"); ENOTSUP }
 #[no_mangle]
-pub unsafe extern "C" fn rumpuser_sp_copyinstr(_arg: *mut c_void, _raddr: *const c_void, _laddr: *mut c_void, _len: *mut usize) -> c_int { ENOTSUP }
+pub unsafe extern "C" fn rumpuser_sp_copyinstr(_arg: *mut c_void, _raddr: *const c_void, _laddr: *mut c_void, _len: *mut usize) -> c_int { tr!(b"sp_copyinstr(STUB)"); ENOTSUP }
 #[no_mangle]
-pub unsafe extern "C" fn rumpuser_sp_copyout(_arg: *mut c_void, _laddr: *const c_void, _raddr: *mut c_void, _len: usize) -> c_int { ENOTSUP }
+pub unsafe extern "C" fn rumpuser_sp_copyout(_arg: *mut c_void, _laddr: *const c_void, _raddr: *mut c_void, _len: usize) -> c_int { tr!(b"sp_copyout(STUB)"); ENOTSUP }
 #[no_mangle]
-pub unsafe extern "C" fn rumpuser_sp_copyoutstr(_arg: *mut c_void, _laddr: *const c_void, _raddr: *mut c_void, _len: *mut usize) -> c_int { ENOTSUP }
+pub unsafe extern "C" fn rumpuser_sp_copyoutstr(_arg: *mut c_void, _laddr: *const c_void, _raddr: *mut c_void, _len: *mut usize) -> c_int { tr!(b"sp_copyoutstr(STUB)"); ENOTSUP }
 #[no_mangle]
-pub unsafe extern "C" fn rumpuser_sp_anonmmap(_arg: *mut c_void, _howmuch: usize, _addr: *mut *mut c_void) -> c_int { ENOTSUP }
+pub unsafe extern "C" fn rumpuser_sp_anonmmap(_arg: *mut c_void, _howmuch: usize, _addr: *mut *mut c_void) -> c_int { tr!(b"sp_anonmmap(STUB)"); ENOTSUP }
 #[no_mangle]
-pub unsafe extern "C" fn rumpuser_sp_raise(_arg: *mut c_void, _signo: c_int) -> c_int { ENOTSUP }
+pub unsafe extern "C" fn rumpuser_sp_raise(_arg: *mut c_void, _signo: c_int) -> c_int { tr!(b"sp_raise(STUB)"); ENOTSUP }
 #[no_mangle]
-pub unsafe extern "C" fn rumpuser_sp_fini(_arg: *mut c_void) {}
+pub unsafe extern "C" fn rumpuser_sp_fini(_arg: *mut c_void) { tr!(b"sp_fini(STUB)"); }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -670,6 +760,14 @@ unsafe fn cstr<'a>(s: *const c_char) -> &'a [u8] {
 /// Write a diagnostic to stderr (fd 2) without going through C variadics.
 unsafe fn dprint(msg: &[u8]) {
     write(2, msg.as_ptr() as *const c_void, msg.len());
+}
+
+/// TEMP debug: trace a hypercall name ("ru:<name>\n") to stderr.
+#[cfg(feature = "rumpuser_debug")]
+unsafe fn trace(name: &[u8]) {
+    dprint(b"ru:");
+    dprint(name);
+    dprint(b"\n");
 }
 
 /// TEMP debug: print "tag 0xA 0xB 0xC\n" without variadics/alloc.

@@ -36,6 +36,7 @@ exec docker run --rm \
         gcc -O2 -static -o /tmp/test_init \
             rumpuser/test_init.c rumpuser/csupport.c \
             -I "$I" \
+            -Wl,--allow-multiple-definition \
             -Wl,--whole-archive \
               -L "$L" -lrump \
               '"${RUMPUSER_A}"' \
