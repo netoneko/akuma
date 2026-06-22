@@ -60,6 +60,13 @@ The in-process backend gives only one networked payload per box.
      (the box process's user memory). 8 host tests cover header layout, guest handshake,
      syscall-with-copyin, copyout (no-response), anonmmap, ERROR→errno, errno
      propagation, and an oversize-frame guard. ABI-agnostic by design.
+   - ✅ **Translation layer DONE + host-tested** — `crates/akuma-rump/src/xlate.rs`
+     (hijack.c ported to Rust): Linux aarch64 sysno→`Op`→NetBSD sysno map
+     (socket=`__socket30` 394, etc.); `pack_args` (register_t widening, matches
+     `rump_syscalls.c`); `sockaddr_in` Linux↔NetBSD (`sin_len` insert); `SOCK_NONBLOCK`/
+     `SOCK_CLOEXEC` strip; NetBSD→Linux errno map (EAGAIN 35→11, EINPROGRESS 36→115,
+     ECONNREFUSED 61→111, …); per-box `FdMap` (box fd ⇄ rump fd). 10 host tests. This
+     is the only place ABI knowledge lives.
    - ⏳ **Remaining integration** (needs a booted box, iterative):
      1. **In-kernel `Transport`** over a real AF_UNIX client connection to the box's
         rump_server socket.
