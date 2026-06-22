@@ -419,6 +419,52 @@ pub fn thread_signal_mask_of(tid: usize) -> u64 {
     if tid < MAX_THREADS { THREAD_SIGNAL_MASK[tid].load(Ordering::Acquire) } else { 0 }
 }
 
+/// Raw pending-signal bitset of a thread slot (0 for out-of-range). Read-only —
+/// does not consume. Used by `rt_sigsuspend` to test for a deliverable signal
+/// without draining it (delivery happens at syscall return).
+pub fn pending_signals_raw(slot: usize) -> u64 {
+    if slot < MAX_THREADS { PENDING_SIGNALS[slot].load(Ordering::Acquire) } else { 0 }
+}
+
+// ---------------------------------------------------------------------------
+// Restore-sigmask (Linux TIF_RESTORE_SIGMASK analogue)
+//
+// `rt_sigsuspend` installs a temporary mask and must, after the woken signal's
+// handler returns, restore the mask that existed *before* the call — not the
+// temporary one. We stash the to-restore mask per thread and set a pending flag;
+// the next signal-frame setup (`try_deliver_signal`) consumes it and writes it
+// as `uc_sigmask`, so `rt_sigreturn` restores the original mask.
+// ---------------------------------------------------------------------------
+static THREAD_RESTORE_SIGMASK: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+static THREAD_RESTORE_SIGMASK_PENDING: [AtomicBool; MAX_THREADS] = {
+    const INIT: AtomicBool = AtomicBool::new(false);
+    [INIT; MAX_THREADS]
+};
+
+/// Arm the restore-sigmask for the current thread: the next delivered signal's
+/// frame saves `saved` as `uc_sigmask` (so `sigreturn` restores it).
+pub fn set_restore_sigmask(saved: u64) {
+    let tid = current_thread_id();
+    if tid < MAX_THREADS {
+        THREAD_RESTORE_SIGMASK[tid].store(saved, Ordering::Release);
+        THREAD_RESTORE_SIGMASK_PENDING[tid].store(true, Ordering::Release);
+    }
+}
+
+/// Consume the current thread's armed restore-sigmask, if any. Returns the saved
+/// mask and clears the pending flag; `None` if not armed.
+pub fn take_restore_sigmask() -> Option<u64> {
+    let tid = current_thread_id();
+    if tid < MAX_THREADS && THREAD_RESTORE_SIGMASK_PENDING[tid].swap(false, Ordering::AcqRel) {
+        Some(THREAD_RESTORE_SIGMASK[tid].load(Ordering::Acquire))
+    } else {
+        None
+    }
+}
+
 /// Per-thread alternate signal stack base address (0 = not set).
 /// Indexed by kernel thread slot so each CLONE_VM thread has its own sigaltstack.
 static THREAD_SIGALTSTACK_SP: [AtomicU64; MAX_THREADS] = {
@@ -502,6 +548,8 @@ fn claim_free_slot(start: usize, end: usize) -> Option<usize> {
             // thread must not inherit a terminated thread's blocked set. Clone/fork
             // re-seed it from the parent afterwards (POSIX inheritance).
             THREAD_SIGNAL_MASK[i].store(0, Ordering::Release);
+            // A recycled slot must not carry a stale rt_sigsuspend restore-mask.
+            THREAD_RESTORE_SIGMASK_PENDING[i].store(false, Ordering::Release);
             return Some(i);
         }
     }

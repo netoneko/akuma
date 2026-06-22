@@ -1149,11 +1149,14 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         core::ptr::write(uc.add(24).cast::<i32>(),
             i32::from(on_altstack));                          // ss_flags (SS_ONSTACK=1)
         core::ptr::write(uc.add(32).cast::<u64>(), alt_size);                  // ss_size
-        // uc_sigmask — save the signal mask *before* we block the delivered signal.
-        // Per-thread (NOT proc.signal_mask, which is shared across CLONE_THREAD
+        // uc_sigmask — the mask `rt_sigreturn` will restore. Normally the current
+        // per-thread mask (NOT proc.signal_mask, which is shared across CLONE_THREAD
         // siblings via the owner PID) — see docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D.
-        core::ptr::write(uc.add(40).cast::<u64>(),
-            akuma_exec::threading::thread_signal_mask());                      // uc_sigmask
+        // If rt_sigsuspend armed a restore-mask, save THAT instead so sigreturn
+        // restores the pre-suspend mask (POSIX sigsuspend semantics, §7k.5).
+        let uc_sigmask_val = akuma_exec::threading::take_restore_sigmask()
+            .unwrap_or_else(akuma_exec::threading::thread_signal_mask);
+        core::ptr::write(uc.add(40).cast::<u64>(), uc_sigmask_val);            // uc_sigmask
 
         // mcontext_t (sigcontext) - Zeroed by write_bytes(base, 0, ...)
         let mc = base.add(SIGFRAME_MCONTEXT);

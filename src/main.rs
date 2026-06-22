@@ -46,6 +46,8 @@ mod network_tests;
 mod pmm;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod process_tests;
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+mod pthread_tests;
 #[cfg(feature = "sc-framebuffer")]
 mod ramfb;
 mod rng;
@@ -912,6 +914,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
                             } else {
                                 // Run futex sync tests
                                 sync_tests::run_all_tests();
+
+                                // Run pthread / threading-API conformance tests
+                                // (per-thread signal mask, sigaltstack, tkill,
+                                // gettid — the §7k.3 regression class).
+                                pthread_tests::run_all_tests();
 
                                 // Run process execution tests
                                 process_tests::run_all_tests();

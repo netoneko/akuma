@@ -691,7 +691,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SET_TID_ADDRESS => proc::sys_set_tid_address(args[0]),
         nr::EXIT_GROUP => proc::sys_exit_group(args[0] as i32),
         nr::RT_SIGPROCMASK => signal::sys_rt_sigprocmask(args[0] as u32, args[1], args[2], args[3] as usize),
-        nr::RT_SIGSUSPEND => 0,
+        nr::RT_SIGSUSPEND => signal::sys_rt_sigsuspend(args[0], args[1] as usize),
         nr::RT_SIGTIMEDWAIT => signal::sys_rt_sigtimedwait(args[0], args[1], args[2], args[3] as usize),
         nr::RT_SIGRETURN => 0,
         nr::RT_SIGACTION => signal::sys_rt_sigaction(args[0] as u32, args[1] as usize, args[2] as usize, args[3] as usize),

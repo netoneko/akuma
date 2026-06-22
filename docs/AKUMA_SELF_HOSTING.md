@@ -1290,6 +1290,112 @@ per-thread signal mask (POSIX-correct, not the root cause) + tests; the two diag
 **Tooling:** `/tmp/sh_batch.py` (clean-build loop + tally), `logs/batch_tally.txt`,
 `/tmp/akuma_extract/lrd.so` (extracted `librustc_driver` for disasm; offsets = VA − 0x30100000).
 
+#### 7k.5 — pthread / threading-API conformance suite + API non-compliances (June 22 2026)
+
+Built the dedicated threading/signal-API conformance test set the §7 TODO called for
+(it's why §7k.3 went undetected so long: nothing exercised the API the way rustc/rayon
+do). New boot self-test module **`src/pthread_tests.rs`** (18 tests + a known-gaps
+report), wired into the boot suite right after `sync_tests` (`src/main.rs`). All 18
+PASS and the kernel boots clean through to SSH at **both 512 MB and 6 GB**
+(`logs/selfhost_revert_boot.log`, release). These call `handle_syscall(..)` directly
+with `BYPASS_VALIDATION` (like `sync_tests`) and `assert!` so a regression halts the boot.
+
+> **The 6 GB run caught a real test bug.** The EFAULT sub-tests originally used a fixed
+> low "bad pointer" (`0xdead_0000` ≈ 3.7 GB) — fine at 512 MB (above RAM) but **inside
+> the identity-mapped RAM at ≥4 GB**, so `validate_user_ptr` saw it as mapped and the
+> test halted the boot at 6 GB. Fixed to use the top of the user VA range
+> (`user_va_limit_value() - 0x1000`), which is unmapped at any RAM size. Lesson: boot
+> self-tests run on the self-host VM, so they must be RAM-size-independent.
+
+**Coverage (kernel-testable subset):**
+- **rt_sigprocmask** — BLOCK/UNBLOCK/SETMASK semantics; SIGKILL/SIGSTOP unblockable;
+  validation (sigsetsize≠8, bad `how`, EFAULT).
+- **Per-thread signal mask (the §7k.3 class)** — sibling independence;
+  `test_sibling_unblock_does_not_clear_my_block` reproduces the exact §7k.3 scenario at
+  the syscall layer (would fail on the old shared-mask code); fresh-slot starts empty;
+  clone-seed inheritance (`seed_thread_signal_mask`, the path `src/syscall/proc.rs` uses).
+- **Pending delivery** — `tkill`/`tgkill` target the right slot; mask honoured;
+  SIGKILL/SIGSTOP bypass it; lowest-numbered first; blocked-fatal pends not drops;
+  MAX_SIGNALS=64 boundary (sig 64 accepted, 65 → EINVAL).
+- **sigaltstack** — default-disabled, set/get round-trip, min-size ENOMEM, per-thread isolation.
+- **Identity/validation** — `gettid` uniqueness (and == `current_thread_id`);
+  `rt_sigaction` rejects 0/SIGKILL/SIGSTOP/>64; `rt_sigtimedwait` sigsetsize check.
+
+**On `MAX_SIGNALS` (it's 64 — the *count* is correct and consistent):** Linux has 64
+signals; the action table is `[SignalAction; 64]`, masks/pending are `u64`, `sigsetsize`
+is `==8`, bounds checks use `sig > MAX_SIGNALS` with `1<<(sig-1)` everywhere (no `<<sig`
+overflow, no under-sized array). The boundary is guarded by the two tests above. Where
+signal handling **does** drop the ball is *not* the cardinality:
+
+**API non-compliances found — 2 FIXED, 1 REVERTED (it broke the self-host build!), 1 open:**
+1. **No RT-signal queue (STILL OPEN — it's a feature, not a small fix).**
+   `PENDING_SIGNALS[tid]` is a single per-thread `AtomicU64` *bitset*. POSIX real-time
+   signals (SIGRTMIN..MAX = 34–64) must **queue** — multiple instances of the same number,
+   each with a siginfo payload. Akuma **coalesces** them to one bit and carries no siginfo
+   (verified: two `pend(40)` → one `take`). Implementing it means a per-thread (signo,
+   siginfo) queue + `rt_sigqueueinfo`/`sigwaitinfo` plumbing + a delivery-path change; no
+   current consumer needs it (rustc doesn't), so it's deferred to a dedicated pass with a
+   userspace `sigqueue` test. Still reported as `[GAP ]` at boot.
+2. **`signal_is_fatal_default` disposition — TRIED, then REVERTED (it broke the self-host
+   build).** Linux's disposition table says SIGUSR1(10), SIGUSR2(12), SIGSTKFLT(16),
+   SIGIO(29), SIGPWR(30) and the RT signals (32–64) terminate by default, so I added them.
+   **Running the in-VM kernel build then killed rustc with `signal: 10` at unit 146/147,
+   reproducibly.** Root cause: the rustc self-host build *storms* SIGUSR1 (~10,400
+   `tkill(sig=10)`), and Akuma's `tkill` falls back to a `Default` disposition whenever it
+   can't attribute the target tid to a process — so a *fatal* default on a stormed signal
+   kills the build. The §7k.3 doc's aside ("doesn't bite rustc — it installs handlers") is
+   **wrong**, and the original conservative table was load-bearing, not an oversight.
+   **Reverted** `signal_is_fatal_default` to the original set with a comment recording why.
+   The POSIX-correct fix belongs in `tkill`'s handler *attribution* (don't apply fatal-Default
+   to a signal whose target you can't resolve), not in the disposition table — left for a
+   future pass. (musl/pthreads similarly storm SIGRTMIN for cancellation/timers, so the RT
+   additions were unsafe for the same reason.) This is the session's headline finding.
+3. **`rt_sigsuspend` — FIXED** (was `=> 0` stub in `src/syscall/mod.rs`; now
+   `signal::sys_rt_sigsuspend`). Installs the suspend mask, blocks until a signal not
+   blocked by it is pending, and returns −EINTR (never 0). Restores the *pre-suspend* mask
+   via a new per-thread **restore-sigmask** mechanism (Linux `TIF_RESTORE_SIGMASK`
+   analogue: `threading::set_restore_sigmask`/`take_restore_sigmask`, consumed at the single
+   `uc_sigmask` write in `exceptions.rs::try_deliver_signal` so `rt_sigreturn` restores the
+   original; reset on slot recycle). Guards: `test_rt_sigsuspend_validation`,
+   `test_rt_sigsuspend_blocks_then_eintr` (asserts it actually blocks, then wakes on a pend
+   and returns −EINTR).
+4. **`tgkill` ignores `tgid` — FIXED** (`src/syscall/signal.rs`). Now returns `ESRCH` when
+   `tid` names a live thread whose `proc.tgid` ≠ the requested `tgid` (prevents mis-delivery
+   to a recycled tid living in a different process); falls through to `tkill` for kernel
+   threads with no owning process (unchanged best-effort). The cross-group ESRCH path needs
+   two real processes to exercise, so it's covered by review + the userspace half, not a
+   boot test.
+
+Minor/adjacent (noted, not yet addressed): `tkill` prints `[signal] tkill(...)`
+unconditionally (~10.4k/build of noise on the hot path); `setitimer` is a stub returning 0;
+`pend_signal_for_thread`'s doc comment says "overwrites / only one pending" but the code
+ORs a 64-bit set (stale comment).
+
+**In-VM self-host compile re-verified on the gap-fixed kernel (clean single pass).** After
+the gap-2 revert, booted the rebuilt kernel on `disk_selfhost.img` (release, `INSTANCE=1
+SNAPSHOT=0 MEMORY=6144M`) and rebuilt the **`akuma` kernel crate itself** in-VM (apk cargo
+1.96 + nightly `rustc`, the §7e env-var invocation, `scripts/loop_selfhost_kernelbuild.py`):
+
+```
+[attempt 1] *** FINISHED at 146/147 ***
+    Finished `release` profile [optimized] target(s) in 2m 13s
+```
+
+`/root/akuma/target/aarch64-unknown-none/release/akuma` = a valid AArch64 ELF
+(`7f 45 4c 46 02 01`…), 3,790,560 bytes — linked **on attempt 1, no crash, no retry**.
+Two notes from the run: (a) the `akuma`-crate fat-LTO that an earlier *stuck* prior-session
+process appeared to "wedge" in `munmap` for ~1 h was that one process's state, **not** a
+kernel bug — the fresh kernel ran the same LTO cleanly in ~2 min; (b) the §7k.4 intermittent
+register-corruption SIGSEGV did **not** recur this pass (it only re-paged the final crate;
+the dep compiles where it usually fires were cached — so this is not evidence it's gone).
+Boot/build logs: `logs/selfhost_revert_boot.log`, `logs/loopbuild_1.log`.
+
+**Next (userspace half of the suite):** the register-integrity-under-signal-storm check
+and handler/`sigreturn` round-trips need a real process — build them as `userspace/forktest`
+additions or a `userspace/pthread_suite` (the doc's "ALL PASSED / exit 0" binary). That's
+where the §7k.4 intermittent register-corruption bug should be cornered, since it only
+manifests under real userspace async delivery at arbitrary PCs.
+
 ---
 
 ### 7i. §7h fix breaks the proc-macro2 wall; kernel build reaches **102/147** (June 19 2026)

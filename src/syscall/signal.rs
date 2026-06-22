@@ -66,6 +66,22 @@ pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigs
     0
 }
 
+/// Does signal `sig` terminate the process by default (no installed handler)?
+///
+/// **Deliberately conservative — do NOT add SIGUSR1(10), SIGUSR2(12), or the
+/// real-time signals (32..=64) here.** Although Linux's *disposition table* says
+/// those terminate by default, Akuma's `tkill` resolves the handler per target
+/// thread and falls back to `Default` whenever it can't attribute the signal to
+/// a thread's process (transient/teardown threads, unresolved tids). Making a
+/// *stormed* signal fatal-by-default therefore kills the process on any such
+/// stray delivery.
+///
+/// This bit us concretely (docs/AKUMA_SELF_HOSTING.md §7k.5): the in-VM rustc
+/// self-host build fires a SIGUSR1 storm (~10,400 `tkill(sig=10)`), and adding
+/// SIGUSR1 to this set killed rustc mid-build with `signal: 10`. musl/pthreads
+/// likewise storm SIGRTMIN (cancellation/timer). So the POSIX-correct fix belongs
+/// in `tkill`'s handler attribution, not in this table — until then this stays
+/// limited to signals that are not used as async wakeups.
 fn signal_is_fatal_default(sig: u32) -> bool {
     matches!(sig, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 11 | 13 | 14 | 15 | 24 | 25 | 26 | 27 | 31)
 }
@@ -121,6 +137,61 @@ pub(super) fn sys_rt_sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigset
     }
 
     0
+}
+
+/// rt_sigsuspend - atomically install `mask`, wait until a signal is delivered
+/// (handler runs or the process is terminated), then restore the previous mask.
+/// Always returns -EINTR; it never returns 0 (POSIX).
+///
+/// Mechanism: install the suspend mask, arm the restore-sigmask so the woken
+/// signal's frame saves the *original* mask as `uc_sigmask` (rt_sigreturn then
+/// restores it — see exceptions.rs / threading::set_restore_sigmask). Block until
+/// a signal not blocked by the suspend mask is pending, then return EINTR so the
+/// syscall-return path delivers it. SIGKILL/SIGSTOP are never blocked.
+pub(super) fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: usize) -> u64 {
+    if sigsetsize != 8 {
+        return EINVAL;
+    }
+    if !validate_user_ptr(mask_ptr, 8) {
+        return EFAULT;
+    }
+    let mut new_mask: u64 = 0;
+    if unsafe { copy_from_user_safe((&raw mut new_mask).cast::<u8>(), mask_ptr as *const u8, 8).is_err() } {
+        return EFAULT;
+    }
+
+    let force_bits = (1u64 << 8) | (1u64 << 18); // SIGKILL(9), SIGSTOP(19) — unblockable
+    let suspend_mask = new_mask & !force_bits;
+    let saved_mask = akuma_exec::threading::thread_signal_mask();
+
+    // Arm restore-sigmask BEFORE installing the suspend mask so a signal racing in
+    // restores `saved_mask`, then install the temporary mask.
+    akuma_exec::threading::set_restore_sigmask(saved_mask);
+    akuma_exec::threading::set_thread_signal_mask(suspend_mask);
+
+    let slot = akuma_exec::threading::current_thread_id();
+    loop {
+        // A signal that the suspend mask does not block (or an unblockable one) is
+        // pending → wake. Delivery itself happens at syscall return.
+        let pending = akuma_exec::threading::pending_signals_raw(slot);
+        if pending & (!suspend_mask | force_bits) != 0 {
+            // Leave the restore-sigmask armed for try_deliver_signal to consume.
+            return EINTR;
+        }
+        if akuma_exec::process::is_current_interrupted() {
+            // Woken without a deliverable signal (spurious / external interrupt):
+            // no frame will be built to consume the restore-mask, so undo it
+            // ourselves and restore the original mask before returning.
+            if let Some(m) = akuma_exec::threading::take_restore_sigmask() {
+                akuma_exec::threading::set_thread_signal_mask(m);
+            }
+            return EINTR;
+        }
+        // Sleep in short slices so a wake (pend_signal_for_thread wakes the waker)
+        // or interrupt is observed promptly.
+        let now = crate::timer::uptime_us();
+        akuma_exec::threading::schedule_blocking(now + 10_000);
+    }
 }
 
 /// sigaltstack - set/get alternate signal stack
@@ -307,9 +378,19 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
     }
 }
 
-/// tgkill(tgid, tid, sig) — like tkill but checks the thread group id.
-/// We don't track thread groups separately so we just forward to tkill.
-pub(super) fn sys_tgkill(_tgid: u32, tid: u32, sig: u32) -> u64 {
+/// tgkill(tgid, tid, sig) — like tkill but the thread must belong to thread
+/// group `tgid`. POSIX/Linux: if `tid` names a live thread whose thread-group id
+/// is not `tgid`, fail with ESRCH (prevents mis-delivery to a recycled tid that
+/// now lives in a different process). If the thread isn't known we fall through
+/// to `tkill`'s own handling (best-effort, matches the old behavior for kernel
+/// threads with no owning process). See docs/AKUMA_SELF_HOSTING.md §7k.5.
+pub(super) fn sys_tgkill(tgid: u32, tid: u32, sig: u32) -> u64 {
+    if let Some(pid) = akuma_exec::process::find_pid_by_thread(tid as usize)
+        && let Some(proc) = akuma_exec::process::lookup_process(pid)
+        && proc.tgid != tgid
+    {
+        return ESRCH;
+    }
     sys_tkill(tid, sig)
 }
 
