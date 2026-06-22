@@ -83,6 +83,20 @@ Pro: no preload, no per-call proxy if in-process. Con: touches the hot syscall p
 Until either exists, the proof path is **link the client against rump**
 (`rump_sys_*`) — hence the `sic` capstone (`acceptance/11_netbsd_rumpkernel_irc.md`).
 
+**(C) Per-process ABI personality — the chosen long-term direction (future).**
+Rather than translate a foreign (Linux/musl) binary's calls, run an **actual
+NetBSD binary** and give Akuma a **swappable, per-process syscall table** chosen by
+the **ELF loader** from the binary's ABI note — exactly how production kernels do
+binary compat (NetBSD `struct emul`, FreeBSD `sysentvec`, Linux `personality()`).
+A NetBSD aarch64 ELF traps `SVC` as normal; Akuma dispatches through *that
+process's* NetBSD syscall table, whose handlers carry NetBSD semantics and route to
+rump (network → the box's rump TCP/IP, VFS → rump VFS or Akuma, etc.). **Zero
+translation** (the binary and the table are both NetBSD), no LD_PRELOAD, no rumprun
+linking. Why it wins: it unlocks **pkgsrc** — the entire prebuilt NetBSD/aarch64
+package set runs on Akuma unmodified. This is deferred (post-M1); see
+IMPLEMENTATION_PLAN §10.5 for the concrete code-level plan. The shim (A)/sic path
+gets us to M1; (C) is the real end state for "run NetBSD software on Akuma."
+
 **Our own programs are a 4th, cleaner case.** Akuma's first-party binaries (e.g.
 `userspace/sshd`) don't use libc sockets directly — they go through **`libakuma`'s
 net abstraction** (`net.rs`: `socket/bind/listen/accept` → Akuma syscalls). For

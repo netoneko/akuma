@@ -507,3 +507,18 @@ What may need adding to herd: an explicit per-service **stack/networking selecto
 (`smoltcp | rump`, model 3) and the resource caps from §10.3 — i.e. a small
 Akuma-specific extension to the OCI bundle, not a new mechanism. Track this as a
 herd requirement so the bundle schema reserves the knobs early.
+
+### 10.5 NetBSD binary compat via a per-process syscall table (→ pkgsrc)
+The end state for "run NetBSD software on Akuma": don't translate foreign binaries
+in userspace — give the kernel a **swappable, per-process syscall table** (an ABI
+"personality", à la NetBSD `struct emul` / FreeBSD `sysentvec` / Linux
+`personality`) that the **ELF loader selects from the binary's ABI tag**
+(`EI_OSABI = ELFOSABI_NETBSD` / the `.note.netbsd.ident` note). A real NetBSD/aarch64
+ELF then traps `SVC` normally; Akuma dispatches through *that process's* NetBSD
+table; the handlers carry NetBSD semantics and route network/VFS to the box's rump
+instance. Zero translation, no LD_PRELOAD, no rumprun. Code touch-points:
+`crates/akuma-exec/src/elf/` (ABI detect), `crates/akuma-exec/src/process/mod.rs`
+(`Process.syscall_table`), `src/syscall/mod.rs` `handle_syscall` (dispatch via the
+process table). Payoff: **pkgsrc** — the prebuilt NetBSD/aarch64 package set runs
+unmodified. **Deferred, post-M1**; full demo + open questions in
+`acceptance/12_netbsd_binary_compatibility.md`. (M1 ships on the userspace shim.)
