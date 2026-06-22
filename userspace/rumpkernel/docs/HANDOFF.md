@@ -19,14 +19,42 @@ Goal (M1): run the NetBSD TCP/IP stack as a userspace rump kernel inside an Akum
 | Phase 3 — kernel `rump` feature: `/dev/net/tap0` raw L2 dev on 2nd NIC (`RUMP_NIC=1`, release-only) | ✅ done, verified on boot |
 | `crates/akuma-rump` — host-testable tap orchestration + 14 unit tests | ✅ done |
 | Phases 0/1 — `librump*.a` for aarch64-musl (full TCP/IP stack) | ✅ built (Linux container) |
-| Phase 2 — Rust `rumpuser`: `rump_init()` returns 0 | ✅ **green** |
-| Phase 4 — virtif up + DHCP + `rump_sys_socket` (still in container) | ⏳ **next** |
+| Phase 2 — Rust `rumpuser`: `rump_init()` returns 0 | ✅ **green** (container) |
+| **`rump_init()` runs ON AKUMA** — NetBSD rump kernel boots in the VM | ✅ **GREEN 2026-06-22** |
+| `rumpuser_component_*` family (scheduler bridge for virtif backend) | ✅ done, in `rumpuser/src/lib.rs` |
+| Phase 4 — `librumpnet_virtif.a` (kernel driver `if_virt.o`) built | ✅ via `docker-build-virtif.sh` |
+| Phase 4 — `test_net` links (stock TUN/TAP backend + net factions) + `rump_init()` | ✅ links & boots; ⚠️ hangs at `ifcreate` |
+| Phase 4 — **`rumpuser` scheduler-wrap under concurrency** (RX kthread deadlock) | 🔴 **THE blocker — see workaround #3** |
+| Phase 4 — virtif up + DHCP + `rump_sys_socket` (blocked on the above) | ⏳ |
+| Rump SDK tarball (`bootstrap/archives/rump-sdk-aarch64-musl.tar.gz` → VM `/archives`) for in-VM builds | ✅ `package-sdk.sh` (48 MB, 154 archives) |
+| Capstone demo: clone+compile sic, IRC `#rumpkernel` over the NetBSD stack | 📋 `acceptance/11_netbsd_rumpkernel_irc.md` (target) |
 | Phase 4b — our `rumpcomp_user` backend → `/dev/net/tap0` | ⏳ |
-| Akuma integration (libakuma, build-std core) | ⏳ |
-| Phase 5 — `box open --net` spawns rump-net payload | ⏳ |
+| Akuma integration (libakuma, build-std core) | ✅ proven sufficient — stock host link runs on Akuma as-is |
+| Phase 5 — `box open --net` / herd service spawns rump-net payload | ⏳ |
 | Phase 6 — DHCP + curl host IP = **M1** | ⏳ |
 
 Nothing is committed. Branch `netbsd-rump-kernel-attempt-0`.
+
+### 🏁 Milestone (2026-06-22): rump kernel boots on Akuma
+
+`test_init` (the Phase-2 program) was linked with the **host** `aarch64-linux-musl-gcc`
+(same toolchain as `userspace/build.sh` — the container was only ever needed to
+*build* librump, not to link the final ELF), copied to `disk.img:/bin/test_init`,
+and run in the VM (`MEMORY=1024M RUMP_NIC=0`, networking off). Output:
+
+```
+NetBSD 7.99.34 (RUMP-ROAST)
+cpu0 at thinair0: rump virtual cpu
+RUMPUSER-AKUMA: rump_init() returned 0
+RUMPUSER-AKUMA: PASS — NetBSD rump kernel booted on our rumpuser
+```
+
+No crash. Proves the whole Phase-2 stack (Rust rumpuser, libkern overrides,
+`rust_eh_personality` stub, static ELF) survives transplant onto Akuma's own
+musl/pthread/mmap syscalls. **Akuma integration was a non-event** — the binary
+that passes in the container is already an Akuma binary (same triple). The
+`herd` route (run it as an OCI-bundle service; herd also wires the process VFS /
+mounts for us) is now a trivial follow-up.
 
 ---
 
@@ -90,12 +118,29 @@ which needs a `/models` file larger than RAM — skips instead of panicking.)
 
 **Userspace rump (`userspace/rumpkernel/`):**
 - `build.sh` (checkout|build|host|clean), `docker-build.sh` (librump in Alpine),
-  `docker-rumpuser-test.sh` (link + run rump_init).
-- `rumpuser/` — Rust **no_std** staticlib: `src/lib.rs` (59 `rumpuser_*` symbols),
+  `docker-build-virtif.sh` (builds the one `-k`-skipped faction, `librumpnet_virtif.a`),
+  `docker-rumpuser-test.sh` (link + run rump_init in container).
+- `rumpuser/` — Rust **no_std** staticlib: `src/lib.rs` (`rumpuser_*` symbols +
+  the `rumpuser_component_*` scheduler-bridge family added 2026-06-22),
   `csupport.c` (variadic `dprintf` + the libkern overrides + `rust_eh_personality`
   stub), `test_init.c` (calls `rump_init`), `Cargo.toml` (`rumpuser_debug` feature).
 - `src-netbsd/` (git-ignored) — pinned NetBSD source; `rumpuser.h` is at
   `src-netbsd/sys/rump/include/rump/rumpuser.h` (`RUMPUSER_VERSION 17`).
+
+**To rebuild + re-run the Akuma boot of `test_init`:**
+```sh
+( cd rumpuser && cargo build --release --target aarch64-unknown-linux-musl )
+aarch64-linux-musl-gcc -O2 -static -o /tmp/test_init_akuma \
+  rumpuser/test_init.c rumpuser/csupport.c -I obj/dest.stage/usr/include \
+  -Wl,--allow-multiple-definition -Wl,--whole-archive \
+    -L obj/dest.stage/usr/lib -lrump \
+    rumpuser/target/aarch64-unknown-linux-musl/release/librumpuser_akuma.a \
+  -Wl,--no-whole-archive -lpthread
+# copy into disk.img:/bin/test_init  (docker run --privileged, mount -o loop)
+# from repo root:  MEMORY=1024M RUMP_NIC=0 cargo run --release
+# then over SSH (port 2222): run `/bin/test_init`  (bare path; the shell rejects
+#   `VAR=val cmd` prefixes — RUMP_VERBOSE defaults ON anyway)
+```
 
 ---
 
@@ -125,33 +170,58 @@ which needs a `/models` file larger than RAM — skips instead of panicking.)
 2. **`rust_eh_personality` no-op stub** (`csupport.c`): prebuilt Rust `core`
    references it under `panic=abort`. **Proper fix on Akuma:** rebuild core with
    nightly `-Z build-std` `-Cpanic=immediate-abort` (like Akuma's other userspace).
-3. **`rumpuser` clock/lock "wrap"**: `cv_wait`/`clock_sleep` don't call the
-   hypervisor `hyp_schedule`/`unschedule` around blocking yet (fine single-CPU at
-   init; revisit under real concurrency).
+3. **`rumpuser` clock/lock "wrap"** — ⚠️ **NOW HIT (2026-06-22), blocking Phase 4.**
+   `cv_wait`/`clock_sleep`/the lock paths don't call the hypervisor
+   `hyp_schedule`/`unschedule` around blocking. This was harmless at single-CPU
+   init, but the **virtif RX kthread is the first real concurrency** and it
+   deadlocks: `docker-net-test.sh` gets `rump_init() returned 0`, then **hangs in
+   `rump_pub_netconfig_ifcreate("virt0")`** (its result line never prints; `timeout`
+   can't kill it — rump masks signals). Path: `ifcreate` → `virtif_clone` →
+   `VIFHYPER_CREATE` (`rumpcomp_virt_create`) → `pthread_create(rcvthread)` →
+   `rumpuser_component_kthread()` + `rumpuser_component_schedule()`. The new kthread
+   and the main lwp deadlock because a blocking wait holds the rump CPU instead of
+   releasing it via `hyp_backend_unschedule`. **THE next fix:** make the blocking
+   `rumpuser` primitives (cv_wait/cv_timedwait, mutex/rwlock enter when contended)
+   unschedule the rump CPU before sleeping and re-schedule after — i.e. wrap them
+   the way NetBSD's C librumpuser does (`rumpkern_unsched`/`rumpkern_sched` around
+   the host blocking call). Diagnose with `--features rumpuser_debug` to see the
+   last hypercall before the hang.
 
 ---
 
-## NEXT TASK — virtif + DHCP + socket, in the container
+## NEXT TASK — virtif backend + DHCP + socket, in the container
 
-Stay in the container test harness (no Akuma yet) to prove the TCP/IP path:
+Path #2: prove the TCP/IP path in the container (cheap to debug), then bring the
+known-good binary back to Akuma+herd. Progress so far:
 
-1. Build the networking factions so the program can link them:
-   `librumpnet.a`, `librumpnet_netinet.a`, `librumpnet_config.a` are already in
-   `obj/dest.stage/usr/lib/`. The **virtif** faction is NOT built yet — `-k` skips
-   `evalplatform` so `RUMP_VIRTIF` stays `no` (see PHASE01_BUILDRUMP.md). Either
-   force `RUMP_VIRTIF=yes` for the libvirtif build, or build `libvirtif`'s
-   `if_virt.c` directly and link our own `rumpcomp_user`.
-2. Extend `test_init.c` (or a new `test_net.c`) to do, after `rump_init()`:
-   `rump_pub_netconfig_ifcreate("virt0")` → `ifsetlinkstr(...)` →
+- ✅ `librumpnet_virtif.a` built (`./docker-build-virtif.sh`). It contains the
+  kernel driver `if_virt.o` only and exports `rump_virtif_virt_deliverpkt` (RX).
+  It has **4 undefined backend symbols** the link must satisfy:
+  `rumpcomp_virt_{create,send,dying,destroy}` (these come from the backend, which
+  `-k`/`RUMPKERN_ONLY` deliberately skips — `Makefile.rump:143`). `VIRTIF_BASE=virt`
+  ⇒ ifname `"virt"`, so the interface to create is **`virt0`**.
+- ✅ `rumpuser_component_*` provided by our Rust rumpuser (the backend calls these
+  to step in/out of the rump scheduler).
+
+Remaining:
+1. **Provide the backend** `rumpcomp_virt_{create,send,dying,destroy}`. For the
+   container proof, compile the **stock** `virtif_user.c` (Linux TUN/TAP) as a
+   standalone user object (needs `linux-headers` for `<linux/if_tun.h>`, and
+   `-DVIRTIF_BASE=virt -I.../libvirtif -I obj/dest.stage/usr/include`). For Akuma,
+   swap in our own `rumpcomp_user.c` over `/dev/net/tap0` (kernel side already done).
+2. **Write `test_net.c`** — after `rump_init()`: `rump_pub_netconfig_ifcreate("virt0")`
+   → `rump_pub_netconfig_ifsetlinkstr("virt0", "<devnum/tap>")` →
+   either `rump_pub_netconfig_ipv4_ifaddr_cidr` (static, simplest first) or
    `rump_pub_netconfig_dhcp_ipv4_oneshot("virt0")` → `rump_sys_socket/connect/...`.
-   Reference: `buildrump.sh/tests/nettest_simple/`.
-3. Backend: for the container test, the simplest packet path is a host TAP/socket;
-   for Akuma it becomes our `rumpcomp_user` over `/dev/net/tap0` (the kernel side
-   is already done). Decide whether to prove networking against a host tap in the
-   container first, or jump to wiring `/dev/net/tap0`.
+   API is in `obj/dest.stage/usr/include/rump/netconfig.h` + `rump/rump_syscalls.h`.
+   Reference: `buildrump.sh/tests/`.
+3. **Run in container** with `--device /dev/net/tun --cap-add NET_ADMIN` (stock
+   backend opens `/dev/net/tun` + `TUNSETIFF`). Link like `docker-rumpuser-test.sh`
+   but add `-lrumpnet -lrumpnet_net -lrumpnet_netinet -lrumpnet_config` and the
+   virtif lib + the backend object.
 
-After that: Akuma integration (libakuma + build-std core), then Phase 5
-(`box open --net` spawns the rump-net payload), then Phase 6 (DHCP + curl = M1).
+After networking is green in the container: Phase 5 (herd OCI-bundle service for
+the rump-net payload — herd wires the VFS/mounts), then Phase 6 (DHCP + curl = M1).
 
 ---
 
