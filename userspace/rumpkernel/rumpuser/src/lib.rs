@@ -62,6 +62,7 @@ extern "C" {
     fn abort() -> !;
     fn _exit(code: c_int) -> !;
     fn strlen(s: *const c_char) -> usize;
+    fn getenv(name: *const c_char) -> *const c_char;
     fn memcpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void;
     fn __errno_location() -> *mut c_int;
     fn getrandom(buf: *mut c_void, buflen: usize, flags: u32) -> isize;
@@ -273,19 +274,37 @@ pub unsafe extern "C" fn rumpuser_clock_sleep(enum_: c_int, sec: i64, nsec: c_lo
 pub unsafe extern "C" fn rumpuser_getparam(name: *const c_char, buf: *mut c_void, blen: usize) -> c_int {
     tr!(b"getparam");
     let n = cstr(name);
-    let val: &[u8] = if n == b"_RUMPUSER_NCPU" {
+
+    // Honor the host environment first for every param (as NetBSD's own
+    // librumpuser does): a set RUMP_VERBOSE / RUMP_NCPU / RUMP_MEMLIMIT / … wins.
+    let env = getenv(name);
+    if !env.is_null() {
+        let len = strlen(env) + 1; // include NUL
+        if len > blen {
+            return ENOMEM;
+        }
+        memcpy(buf, env as *const c_void, len);
+        return 0;
+    }
+
+    // Defaults when the env doesn't set it.
+    let default: &[u8] = if n == b"_RUMPUSER_NCPU" {
         b"1\0"
     } else if n == b"_RUMPUSER_HOSTNAME" {
         b"rump-akuma\0"
     } else if n == b"RUMP_VERBOSE" {
-        b"0\0" // quiet by default (set the RUMP_VERBOSE env in the test for boot logs)
+        // ON by default so the NetBSD copyright banner + boot steps print — we
+        // keep the NetBSD attribution visible out of respect. The `rump_quiet`
+        // cargo feature flips the default off; an explicit RUMP_VERBOSE env
+        // (handled above) still overrides either way.
+        if cfg!(feature = "rump_quiet") { b"0\0" } else { b"1\0" }
     } else {
         return ENXIO;
     };
-    if val.len() > blen {
+    if default.len() > blen {
         return ENOMEM;
     }
-    memcpy(buf, val.as_ptr() as *const c_void, val.len());
+    memcpy(buf, default.as_ptr() as *const c_void, default.len());
     0
 }
 

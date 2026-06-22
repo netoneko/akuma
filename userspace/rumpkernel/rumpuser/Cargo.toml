@@ -11,9 +11,13 @@ description = "Akuma's rumpuser hypercall layer for NetBSD rump kernels — a Ru
 name = "rumpuser_akuma"
 crate-type = ["staticlib"]
 
-# TEMP bring-up tracing of the memory hypercalls (size/align/ptr to stderr).
 [features]
+# TEMP bring-up tracing of every hypercall (+ memory size/align/ptr) to stderr.
 rumpuser_debug = []
+# Silence rump's boot output (RUMP_VERBOSE defaults to "0"). Off by default: we
+# keep the NetBSD copyright banner + boot steps visible out of respect. An
+# explicit RUMP_VERBOSE env var overrides this either way.
+rump_quiet = []
 
 # Dependency-free on purpose: builds offline in the build container (no registry
 # index needed). All host primitives come from libc/pthread via raw extern "C".

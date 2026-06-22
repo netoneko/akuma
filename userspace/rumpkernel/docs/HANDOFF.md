@@ -166,8 +166,10 @@ After that: Akuma integration (libakuma + build-std core), then Phase 5
 - **2016 NetBSD vs modern toolchain**: host-tool build needs `-fcommon`, trailing
   `-Wno-error` (after `"$@"` so it beats NetBSD's `-Werror`), and a `__BEGIN_DECLS`
   cdefs shim on musl — all in `docker-build.sh`'s gcc wrapper.
-- **Debug a rump crash**: `--features rumpuser_debug` traces hypercalls;
-  `RUMP_VERBOSE=1` (the test sets it) for rump's boot prints; `apk add gdb` in the
-  container, break at the call site to read real args.
+- **Debug a rump crash**: `--features rumpuser_debug` traces hypercalls; `apk add
+  gdb` in the container, break at the call site to read real args.
+- **NetBSD banner**: `rumpuser_getparam` defaults `RUMP_VERBOSE` ON (kept out of
+  respect for the NetBSD attribution); an env `RUMP_VERBOSE` overrides; the
+  `rump_quiet` cargo feature silences the default.
 - **`libakuma` is awkwardly structured** and should be broken up (deferred) — keep
   in mind when adding the rump-net userspace binary.
