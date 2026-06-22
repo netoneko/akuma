@@ -92,6 +92,18 @@ The in-process backend gives only one networked payload per box.
      since the kernel can't drain its ProcessChannel that early in boot. Bug fixed en
      route: the HANDSHAKE reply is a short non-`rsp_sysresp` word, so `connect()` must
      accept a RESP without `parse_sysresp` (regression-tested).
+   - **ARCHITECTURE: the proxy is PER-BOX, in a per-box kthread.** Each `stack=rump`
+     box gets its **own** kernel-side proxy — one proxy **kthread per box**, owning that
+     box's pipe channel + fd map + rump_server connection, **blocking** on its channel
+     (not busy-yielding). A single proxy serving all boxes is wrong. The boot
+     `rump_proxy::run_demo()` (single-shot, box 0, on the boot thread, cooperative-yield)
+     was only a transport stepping-stone — NOT the architecture; it gets replaced by the
+     per-box kthread.
+   - **Idle-loop fix (2026-06-23):** `rump_server`'s idle `for(;;) pause()` busy-looped —
+     Akuma has no `pause` syscall, so musl `pause()` → `ppoll(NULL,0)` and `sys_ppoll`
+     returns immediately for `nfds==0` → CPU peg (the `ppoll=16.8M` storm, in *both*
+     `--net` and not). Fixed: idle via `sleep()` (→ `nanosleep`, which blocks). (Kernel
+     latent quirk to revisit: `ppoll(nfds=0)` should block until a signal, not return 0.)
    - ⏳ **Remaining integration** (next; no architectural unknowns left — the
      transport above is proven on Akuma):
      1. **In-kernel `ClientMem`** over the calling box process's user VA — size

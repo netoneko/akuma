@@ -148,9 +148,12 @@ main(int argc, char **argv)
 		    do_net ? "up" : "off");
 	}
 
-	/* The sp server runs its own worker threads; just stay alive. */
+	/* The sp server / rump kthreads do the work; the main thread just parks.
+	 * NOTE: do NOT use pause() — on Akuma musl pause() compiles to ppoll(NULL,0)
+	 * which returns immediately (sys_ppoll: nfds==0 -> 0), so `for(;;) pause()`
+	 * is a CPU-pegging busy-loop. sleep() -> nanosleep actually blocks. */
 	for (;;)
-		pause();
+		sleep(3600);
 
 	return 0;
 }

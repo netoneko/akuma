@@ -1207,12 +1207,13 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
     
     let cwd_ref = cwd.as_deref();
 
+    // `args_ptr` is an argv array INCLUDING argv[0] = program name (both
+    // box/main.rs and herd build it that way), so always drop argv[0]. The old
+    // `len > 1` special-case leaked argv[0] (the path) through as a real argument
+    // for no-arg commands — e.g. a boxed `/bin/rump_server` with no args saw
+    // "/bin/rump_server" as a positional URL and tried rump_init_server() on it.
     let args_vec = parse_argv_array(o.args_ptr);
-    let args_refs: Vec<&str> = if args_vec.len() > 1 {
-        args_vec.iter().skip(1).map(alloc::string::String::as_str).collect()
-    } else {
-        args_vec.iter().map(alloc::string::String::as_str).collect()
-    };
+    let args_refs: Vec<&str> = args_vec.iter().skip(1).map(alloc::string::String::as_str).collect();
     let args_opt = if args_refs.is_empty() { None } else { Some(args_refs.as_slice()) };
 
     let stdin_data = if o.stdin_ptr != 0 {
