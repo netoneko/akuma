@@ -122,6 +122,32 @@ The in-process backend gives only one networked payload per box.
    Validate end-to-end: `/bin/curl https://ifconfig.me` in a `stack=rump` box returns
    a real answer over the NetBSD stack.
 
+## Box demo status (2026-06-23)
+- ✅ **herd autostarts a boxed NetBSD rump kernel.** `RUMP_NIC=1` boot → herd starts the
+  `rumpnet` service **boxed**; `ps` shows `/bin/rump_server` + its ~18 rump kthreads under
+  a non-zero box (hex `185c61f8b7` / decimal `104629139639`, named `rumpnet`). Idle and
+  stable; VM stays responsive. (Required three fixes: herd `spawn_in_box` ABI [argv
+  pointer-array + options at arg2]; kernel `sys_spawn_ext` always stripping `argv[0]`
+  [was leaking the path as a positional arg → `rump_init_server("/bin/rump_server")`];
+  and `rump_server` idling via `sleep` not `pause` [Akuma `ppoll(nfds=0)` returns
+  immediately, so `for(;;) pause()` busy-pegged the CPU].)
+- ✅ **A process runs inside the box.** `box use rumpnet -i /bin/busybox sh` →
+  `/bin/busybox sh` runs under box `185c61f8b7` (confirmed in `ps`). Box plumbing works.
+- ⚠️ **box-id resolution gotcha.** `ps` prints the box id in **hex** (`185c61f8b7`) but
+  `box use` / `/proc/boxes` use **decimal** (`104629139639`); `resolve_target_id` only
+  accepts bare hex with a `0x` prefix, so `box use 185c61f8b7` falls through to a name
+  lookup and misses. Working forms: `box use rumpnet`, `box use 104629139639`,
+  `box use 0x185c61f8b7`. TODO: make the resolver accept the hex form `ps` prints.
+- ⚠️ **KNOWN ISSUE — in-box fork+exec SIGSEGVs.** A process *already inside* a box that
+  `fork+exec`s another binary crashes: `busybox sh` → `/bin/curl-static` faults with an
+  **instruction abort at `ELR=0x0`/`FAR=0x0`** (jumped to null; `x30=0`) — i.e. the exec
+  of the child failed and control went to address 0. The box-use-spawned process (busybox
+  sh, via the kernel SPAWN_EXT path) runs fine; only the *in-box* fork+exec path breaks.
+  Works in box 0. TBD — likely a fork/exec-in-box bug, not curl-specific.
+- ℹ️ **Networking note:** binaries run in the box still use **smoltcp** (the box shares
+  the kernel AF_INET) until the per-box proxy kthread lands — so curl-over-rump is not
+  yet wired; that is the next target.
+
 ## Security / hardening TODOs
 - **Seal `rumpuser__hyp` after init.** Our Rust rumpuser exports `rumpuser__hyp` (the
   rump-kernel upcall function-pointer table) as a `static mut` in writable `.data` — a
