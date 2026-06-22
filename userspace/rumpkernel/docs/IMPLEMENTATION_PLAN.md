@@ -38,13 +38,16 @@ host's IP.
 Akuma, as groundwork for a multi-box / multi-VM Akuma cluster where networking
 can be composed from independent stacks.
 
-**Milestone M1 (this plan's bar for "it works"):**
-1. `box open mynet --net` creates a new box whose payload is a rump-kernel
-   program hosting the NetBSD TCP/IP stack.
+**Milestone M1 (this plan's bar for "it works") — ✅ ACHIEVED 2026-06-22** (see
+HANDOFF.md "M1 ACHIEVED"; the `box open --net` auto-spawn of Phase 5 is still
+pending — M1 ran the rump-net payload `rumphttp` by hand over SSH in a `RUMP_NIC=1`
+box, which satisfies 2+3):
+1. a rump-kernel program (`rumphttp`) hosts the NetBSD TCP/IP stack inside an Akuma
+   box. ✅ (Phase 5 `box open mynet --net` auto-spawn still ⏳.)
 2. Inside that box, the rump stack brings up a `virtif` interface, runs **DHCP**
-   to obtain an address/route/MAC from the QEMU network, and
-3. successfully performs an **HTTP `curl` of the QEMU host IP** (e.g.
-   `http://10.0.2.2/`) *through the rump stack* (not Akuma's native smoltcp).
+   to obtain an address/route from the QEMU net1 SLIRP (got 10.0.2.15/24), and ✅
+3. successfully performs an **HTTP GET of the QEMU host IP** (`http://10.0.2.2:8888/`)
+   *through the rump stack* over `/dev/net/tap0` (not smoltcp) — body returned. ✅
 
 **Explicitly deferred (later milestones):**
 - DNS resolution via the rump stack (M1 uses a literal host IP).
@@ -302,14 +305,15 @@ self-tests in `src/process_tests.rs` (per repo convention), not only e2e checks.
   frame, and reads the reply frame back. Add a `src/process_tests.rs` self-test
   for the tap device (loopback a frame).
 
-### Phase 4 — Akuma `virtif` packet backend
-- Build the rump networking factions (`librumpnet`, `librumpnet_netinet`,
-  `librumpnet_virtif`) for `aarch64-linux-musl`.
-- Ensure the virtif `rumpcomp_user` packet hypercall binds to `/dev/net/tap0`
-  (ideally unmodified Linux backend; otherwise a thin Akuma `rumpcomp_user.c`
-  under `userspace/rumpkernel/` doing `open/read/write` on the tap).
-- **Exit:** a rump app creates a virtif, sends a frame, and the same frame is
-  observed on the QEMU NIC (e.g. via host-side capture) — and vice-versa.
+### Phase 4 — Akuma `virtif` packet backend — ✅ DONE 2026-06-22
+- Built the rump networking factions for `aarch64-linux-musl` (incl.
+  `librumpnet_virtif` via `docker-build-virtif.sh`; static + `_pic`).
+- Our own `rumpuser/rumpcomp_tap.c` binds the virtif hypercalls to `/dev/net/tap0`
+  (`open/read/write`; instrumented). The kernel tap `read()` is now **blocking**
+  (`Tap{nonblock}` + `read_frame_blocking`, cooperative yield — no busy-wait), so
+  the RX thread does a plain blocking `read()`.
+- **Exit met:** frames the NetBSD stack sends appear on NIC1, replies are delivered
+  back (proven end-to-end by the M1 HTTP fetch + the virtif TX/RX counters).
 
 ### Phase 5 — `rump-net` box payload + `box --net` switch
 - New member `userspace/rump-net/` (or `userspace/rumpkernel/rump-net/`): the
@@ -326,14 +330,15 @@ self-tests in `src/process_tests.rs` (per repo convention), not only e2e checks.
 - **Exit:** `box open mynet --net` boots the rump stack inside the box; `box ps`
   / `box show` see it; `box close` tears it down cleanly.
 
-### Phase 6 — DHCP bootstrap + curl host IP (**M1**)
-- In `rump-net`: after virtif up, run NetBSD DHCP (rump exposes a oneshot DHCP
-  configurator; `buildrump.sh/brlib/libnetconfig` carries the dhcpcd-derived
-  client as a reference). Then issue an HTTP GET to the QEMU host IP
-  (`10.0.2.2`) over the rump stack's sockets (`rump_sys_socket/connect/send/recv`).
-- **Exit (M1 done):** from a cold `box open mynet --net`, the box logs a DHCP
-  lease and prints the HTTP response body fetched from the host IP — proving the
-  NetBSD stack carried real traffic on Akuma.
+### Phase 6 — DHCP bootstrap + curl host IP (**M1**) — ✅ DONE 2026-06-22
+- `rumpuser/rumphttp.c`: after virtif up, runs `rump_pub_netconfig_dhcp_ipv4_oneshot`
+  (got 10.0.2.15/24 + default route from QEMU net1 SLIRP — DHCP needs the `bpf`/`dev`/
+  `vfs` factions linked), then HTTP-GETs `10.0.2.2:8888` via
+  `rump_sys_socket/connect/write/read`.
+- **Exit met:** in a `RUMP_NIC=1` box, `rumphttp` logged the DHCP lease and printed
+  the HTTP body fetched from the host — NetBSD stack carrying real traffic on Akuma.
+- Residual: ran the payload by hand over SSH; the cold `box open --net` auto-spawn
+  is Phase 5 (still ⏳). DNS (Phase 7) deferred — M1 uses a literal host IP.
 
 ### Phase 7 — DNS (later)
 - Configure the rump resolver from DHCP option 6 and switch the curl target from

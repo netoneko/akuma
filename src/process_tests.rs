@@ -2391,6 +2391,7 @@ fn test_rump_tap() {
 
     const AT_FDCWD: u64 = (-100i64) as u64;
     const O_RDWR: u64 = 2;
+    const O_NONBLOCK: u64 = 0x800;
     const EAGAIN: u64 = (-11i64) as u64;
 
     let tid = current_thread_id();
@@ -2401,11 +2402,12 @@ fn test_rump_tap() {
 
     crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
 
-    // open("/dev/net/tap0", O_RDWR)
+    // open("/dev/net/tap0", O_RDWR|O_NONBLOCK) — non-blocking so the read below
+    // returns EAGAIN immediately (blocking opens now wait for a frame).
     let path = b"/dev/net/tap0\0";
     let fd = crate::syscall::handle_syscall(
         nr::OPENAT,
-        &[AT_FDCWD, path.as_ptr() as u64, O_RDWR, 0, 0, 0],
+        &[AT_FDCWD, path.as_ptr() as u64, O_RDWR | O_NONBLOCK, 0, 0, 0],
     );
     let open_ok = (fd as i64) >= 0;
 

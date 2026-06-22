@@ -501,11 +501,20 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
         }
         #[cfg(feature = "rump")]
-        akuma_exec::process::FileDescriptor::Tap => {
-            // Pull one L2 frame. No frame ready → EAGAIN (the tap fd behaves
-            // non-blocking at this phase; the rump virtif retries / polls).
+        akuma_exec::process::FileDescriptor::Tap { nonblock } => {
+            // Pull one L2 frame. O_NONBLOCK → EAGAIN when none ready; otherwise
+            // BLOCK cooperatively (yield to the scheduler, re-poll the tap) until a
+            // frame arrives — so the rump virtif RX thread does a plain blocking
+            // read() with no busy-wait. Akuma's net is poll-based (no RX IRQ), so
+            // this mirrors how socket recv blocks (akuma-net wait_until).
             let mut temp = alloc::vec![0u8; count];
-            match akuma_net::rump_tap::read_frame(&mut temp) {
+            let got = if nonblock {
+                akuma_net::rump_tap::read_frame(&mut temp)
+            } else {
+                // Block until a frame (None timeout); None only on interrupt → EAGAIN.
+                akuma_net::rump_tap::read_frame_blocking(&mut temp, None)
+            };
+            match got {
                 Some(n) => {
                     if n > 0
                         && unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
@@ -770,7 +779,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
             akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom | akuma_exec::process::FileDescriptor::DevZero => this_chunk as u64,
             #[cfg(feature = "rump")]
-            akuma_exec::process::FileDescriptor::Tap => {
+            akuma_exec::process::FileDescriptor::Tap { .. } => {
                 // One write() == one L2 frame. Ethernet frames are <2 KB, so a
                 // frame never exceeds the 64 KB chunk (single iteration).
                 if let Ok(n) = akuma_net::rump_tap::write_frame(buf_slice) {
@@ -1093,7 +1102,9 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             return ENODEV;
         }
         if let Some(proc) = akuma_exec::process::current_process() {
-            let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Tap);
+            let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Tap {
+                nonblock: flags & 0x800 != 0, // O_NONBLOCK
+            });
             if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
                 proc.set_cloexec(fd);
             }
@@ -1314,7 +1325,7 @@ pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
             stat = Stat { st_dev: 0, st_ino: 5, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 5), st_blksize: 4096, ..Default::default() };
             0
         }
-        Some(akuma_exec::process::FileDescriptor::Tap) => {
+        Some(akuma_exec::process::FileDescriptor::Tap { .. }) => {
             // /dev/net/tap0: char device. Linux's TUN/TAP is misc major 10, minor 200.
             stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(10, 200), st_blksize: 4096, ..Default::default() };
             0

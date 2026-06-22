@@ -163,7 +163,11 @@ pub enum FileDescriptor {
     /// virtio-net NIC (bypassing smoltcp). Only ever constructed when the
     /// kernel is built with the `rump` feature and NIC1 is present; the variant
     /// is unconditional so non-rump builds still match exhaustively.
-    Tap,
+    /// `nonblock`: when false (the default for `open` without `O_NONBLOCK`), a
+    /// `read` with no frame ready blocks (cooperatively yields) until one arrives;
+    /// when true it returns `EAGAIN` — POSIX device-read semantics, so the rump
+    /// virtif RX thread can do a plain blocking `read()` instead of busy-polling.
+    Tap { nonblock: bool },
     TimerFd(u32),
     EpollFd(u32),
     PidFd(u32),

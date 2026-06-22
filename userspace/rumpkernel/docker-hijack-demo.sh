@@ -55,7 +55,7 @@ exec docker run --rm --platform linux/arm64 \
               -L "$L" \
               -lrumpnet_config_pic -lrumpnet_virtif_pic \
               -lrumpnet_netinet_pic -lrumpnet_net_pic -lrumpnet_pic \
-              -lrumpdev_bpf_pic -lrumpdev_pic \
+              -lrumpdev_bpf_pic -lrumpdev_pic -lrumpvfs_pic \
               -lrump_pic \
               '"${RUMPUSER_A}"' \
             -Wl,--no-whole-archive \

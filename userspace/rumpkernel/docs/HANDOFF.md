@@ -25,17 +25,54 @@ Goal (M1): run the NetBSD TCP/IP stack as a userspace rump kernel inside an Akum
 | Phase 4 — `librumpnet_virtif.a` (kernel driver `if_virt.o`) built | ✅ via `docker-build-virtif.sh` |
 | Phase 4 — **container networking GREEN**: `virt0` up, IP assigned, `rump_sys_socket` OK | ✅ **2026-06-22** (`docker-net-test.sh`) |
 | Phase 4 — `rumpuser` scheduler-wrap under concurrency | ✅ fixed (cv/mutex/rwlock + **clock_sleep**) |
-| **Unmodified `curl` does HTTP over the rump stack** (real packet round-trip) | ✅ **2026-06-22** (`docker-hijack-demo.sh`) |
-| Phase 4 — DHCP one-shot (vs net1 SLIRP) | ⏳ next |
-| Akuma backend: `rumpcomp_user` over `/dev/net/tap0` (vs container TUN/TAP) | ⏳ |
-| Rump SDK tarball (`bootstrap/archives/rump-sdk-aarch64-musl.tar.gz` → VM `/archives`) for in-VM builds | ✅ `package-sdk.sh` (48 MB, 154 archives) |
+| **Unmodified `curl` does HTTP over the rump stack** (container, real round-trip) | ✅ **2026-06-22** (`docker-hijack-demo.sh`) |
+| DHCP over the rump stack (container, vs dnsmasq) | ✅ **2026-06-22** (`docker-hijack-demo.sh` RUMP_DHCP=1) |
+| Akuma backend: `rumpcomp_user` over `/dev/net/tap0` (vs container TUN/TAP) | ✅ `rumpuser/rumpcomp_tap.c` |
+| Kernel: **blocking `read()`** on `/dev/net/tap0` (`Tap{nonblock}`, no busy-wait) | ✅ `read_frame_blocking`; self-test updated |
+| 🏆 **M1 — DHCP + HTTP to the host, rump in an Akuma box** | ✅ **DONE 2026-06-22** (`rumphttp` in a `RUMP_NIC=1` box) |
+| Rump SDK tarball (`bootstrap/archives/rump-sdk-aarch64-musl.tar.gz` → VM `/archives`) | ✅ `package-sdk.sh` (48 MB, 154 archives) |
 | Capstone demo: clone+compile sic, IRC `#rumpkernel` over the NetBSD stack | 📋 `acceptance/11_netbsd_rumpkernel_irc.md` (target) |
-| Phase 4b — our `rumpcomp_user` backend → `/dev/net/tap0` | ⏳ |
 | Akuma integration (libakuma, build-std core) | ✅ proven sufficient — stock host link runs on Akuma as-is |
-| Phase 5 — `box open --net` / herd service spawns rump-net payload | ⏳ |
-| Phase 6 — DHCP + curl host IP = **M1** | ⏳ |
+| Phase 5 — `box open --net` / herd service spawns rump-net payload | ⏳ (M1 ran the payload by hand over SSH) |
+| NetBSD binary compat (pkgsrc) via per-process syscall table | 📋 future — `acceptance/12_netbsd_binary_compatibility.md` |
 
 Nothing is committed. Branch `netbsd-rump-kernel-attempt-0`.
+
+### 🏆 M1 ACHIEVED (2026-06-22): NetBSD stack in an Akuma box — DHCP + HTTP to the host
+
+`rumphttp` (a static Akuma binary = rump TCP/IP + our rumpuser + the
+`/dev/net/tap0` backend) ran in a `MEMORY=1024M RUMP_NIC=1` box and fetched a page
+off the **Mac host** through the NetBSD stack:
+
+```
+NetBSD 7.99.34 (RUMP-ROAST)
+virt0: Ethernet address b2:0a:38:0b:0e:00
+dhcp: virt0: adding IP address 10.0.2.15/24        ← DHCP from QEMU net1 SLIRP
+dhcp: virt0: adding default route via 10.0.2.2
+RUMPHTTP: connect 10.0.2.2:8888 -> 0               ← TCP to the host
+HTTP/1.0 200 OK ... <html><body>HELLO-FROM-MAC-HOST-VIA-RUMP</body></html>
+[VIRTIF STATS] tx=78 pkts/5828 bytes  rx=9 pkts/1832 bytes (over /dev/net/tap0)
+RUMPHTTP: PASS — fetched 240 bytes over the NetBSD rump stack (DHCP + TCP via /dev/net/tap0)
+```
+
+That is the M1 goal verbatim: NetBSD TCP/IP as a userspace rump kernel inside an
+Akuma box, DHCP an address, HTTP the QEMU host through it.
+
+**Reproduce:** `( cd userspace/rumpkernel && ./build-rumphttp.sh )` → copy
+`/tmp/rumphttp_akuma` to `disk.img:/bin/rumphttp` (docker `--privileged` loop-mount)
+→ run a host HTTP server (`python3 -m http.server 8888 --bind 127.0.0.1`) →
+`MEMORY=1024M RUMP_NIC=1 cargo run --release` → over SSH (`:2222`):
+`/bin/rumphttp 10.0.2.2 8888`. (The host is reachable at the SLIRP gateway 10.0.2.2;
+QEMU's net1 SLIRP also serves the DHCP lease.)
+
+**The `/dev/net/tap0` backend is blocking, not busy-wait:** the kernel tap `read()`
+now blocks (`FileDescriptor::Tap { nonblock }`; `rump_tap::read_frame_blocking`
+cooperatively yields like socket `recv`/`wait_until`, since Akuma's net is poll-based
+with no RX IRQ). The RX thread in `rumpcomp_tap.c` does a plain blocking `read()`.
+Boot self-test `test_rump_tap` updated to open `O_NONBLOCK` (still checks EAGAIN).
+
+New files: `rumpuser/rumpcomp_tap.c`, `rumpuser/rumphttp.c`, `build-rumphttp.sh`;
+kernel: `Tap{nonblock}` + `read_frame_blocking`.
 
 ### 🏁 Milestone (2026-06-22): rump kernel boots on Akuma
 

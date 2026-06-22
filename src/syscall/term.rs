@@ -115,7 +115,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             // this on the tap fd to attach to an interface; /dev/net/tap0 is
             // already the (only) tap, so accept it as a no-op success. Reject
             // on any non-tap fd with ENOTTY.
-            if !matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::Tap)) {
+            if !matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::Tap { .. })) {
                 return (-(25i64)) as u64; // ENOTTY — not a tap fd
             }
             return 0;
