@@ -700,21 +700,27 @@ fn spawn_in_box(
     command: &str,
     args: &[&str],
 ) -> Option<SpawnResult> {
-    let mut args_buf = Vec::new();
-    for arg in args {
-        args_buf.extend_from_slice(arg.as_bytes());
-        args_buf.push(0);
+    // Match the kernel SPAWN_EXT ABI (and box/main.rs): path is NUL-terminated,
+    // args is an argv POINTER ARRAY ([path\0, arg\0…, null]) — NOT a flat
+    // null-separated buffer — and `options` is arg2 (not arg3). The previous
+    // flat-buffer + arg3 layout made the kernel read `command.len()` as the
+    // options pointer → EFAULT (boxed services never started).
+    let path_term = format!("{}\0", command);
+    let args_term: Vec<String> = args.iter().map(|a| format!("{}\0", a)).collect();
+    let mut argv: Vec<*const u8> = Vec::with_capacity(args_term.len() + 2);
+    argv.push(path_term.as_ptr());
+    for s in &args_term {
+        argv.push(s.as_ptr());
     }
-    let args_ptr = if args_buf.is_empty() { 0 } else { args_buf.as_ptr() as u64 };
-    let args_len = args_buf.len();
+    argv.push(core::ptr::null());
 
     let options = SpawnOptions {
         cwd_ptr: "/".as_ptr() as u64,
         cwd_len: 1,
         root_dir_ptr: 0,
         root_dir_len: 0,
-        args_ptr,
-        args_len,
+        args_ptr: argv.as_ptr() as u64,
+        args_len: argv.len(),
         stdin_ptr: 0,
         stdin_len: 0,
         box_id,
@@ -722,9 +728,9 @@ fn spawn_in_box(
 
     let result = libakuma::syscall(
         SYSCALL_SPAWN_EXT,
-        command.as_ptr() as u64,
-        command.len() as u64,
+        path_term.as_ptr() as u64,
         &options as *const _ as u64,
+        0,
         0,
         0,
         0,

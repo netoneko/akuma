@@ -18,11 +18,11 @@
 //! COPYOUT / ANONMMAP callbacks before the final RESP — exactly the loop in
 //! `rumpclient.c:cliwaitresp` + `handlereq`.
 //!
-//! SECURITY (RUMP_SYSPROXY.md "Security / hardening TODOs"): every length/addr in
-//! a server callback is server-supplied. The kernel's [`ClientMem`] impl MUST
-//! bounds-check `addr`/`len` against the box process's mappings — never trust
-//! these values. This module caps allocation sizes defensively but cannot know
-//! the address space; that check lives in the impl.
+//! SECURITY (RUMP_SYSPROXY.md "sysproxy wire bounds-checks"): server callbacks
+//! carry server-supplied lengths/addrs. Split: this module coarse-caps sizes
+//! ([`MAX_TRANSFER`]); the kernel [`ClientMem`] impl sanity-checks the size and
+//! lets the user-VA copy fault on a bad address; full request validation is the
+//! server's job and lands when the sp glue is ported to Rust (not done today).
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -48,11 +48,12 @@ const RUMPSP_RAISE: u16 = 8;
 // handshake subtype (enum { HANDSHAKE_GUEST, HANDSHAKE_AUTH, ... })
 const HANDSHAKE_GUEST: u32 = 0;
 
-/// Defensive ceiling on any single server-requested copy/alloc (16 MiB).
+/// Defensive ceiling on any single server-requested copy/alloc (1 MiB).
 ///
-/// A well-behaved server never asks for more for a socket syscall; this bounds a
-/// malformed/hostile server before the [`ClientMem`] bounds check runs.
-pub const MAX_XFER: usize = 16 * 1024 * 1024;
+/// Socket syscalls move little (sockaddrs are bytes; the largest realistic chunk
+/// is a send/recv buffer), so 1 MiB is already generous; this is the coarse size
+/// sanity-cap before the [`ClientMem`] copy runs.
+pub const MAX_TRANSFER: usize = 1024 * 1024;
 
 /// Transport-level failure (connection dead / short read). Distinct from a
 /// NetBSD errno, which rides in the protocol payload.
@@ -71,8 +72,11 @@ pub trait Transport {
 /// Access to the calling box process's user memory, for the copyin/copyout
 /// callbacks the server issues against the syscall's pointer args.
 ///
-/// Implementations MUST validate `addr`/`len` against the process's address
-/// space (the server is not trusted — see the module security note).
+/// Bounds-check split (see docs/RUMP_SYSPROXY.md "sysproxy wire bounds-checks"):
+/// the kernel impl only **sanity-checks the size** and lets the user-VA copy
+/// fault on a bad address (`copy_from/to_user_safe`); `len` is coarse-capped by
+/// [`MAX_TRANSFER`]. Full request validation is the **server's** job and lands when
+/// the sp glue is ported to Rust — not done by these impls today.
 pub trait ClientMem {
     /// Read `len` bytes from user `addr` into `out` (cleared first). Err = a
     /// NetBSD errno (e.g. `EFAULT`) to fail the copyin with.
@@ -213,7 +217,7 @@ impl<T: Transport> Client<T> {
                 return Err(EIO);
             }
             let dlen = h.len as usize - HDRSZ;
-            if dlen > MAX_XFER {
+            if dlen > MAX_TRANSFER {
                 return Err(EIO);
             }
             let mut data = Vec::new();
@@ -275,7 +279,7 @@ impl<T: Transport> Client<T> {
             RUMPSP_ANONMMAP => {
                 let len = data.get(0..8).ok_or(EINVAL)?;
                 let len = u64::from_le_bytes(len.try_into().unwrap()) as usize;
-                let addr = if len <= MAX_XFER { mem.anonmmap(len) } else { 0 };
+                let addr = if len <= MAX_TRANSFER { mem.anonmmap(len) } else { 0 };
                 let hdr = enc_hdr(
                     (HDRSZ + 8) as u64,
                     h.reqno,
@@ -300,7 +304,7 @@ fn parse_copydata_head(data: &[u8]) -> Result<(usize, u64), i32> {
     }
     let len = u64::from_le_bytes(data[0..8].try_into().unwrap());
     let addr = u64::from_le_bytes(data[8..16].try_into().unwrap());
-    if len as usize > MAX_XFER {
+    if len as usize > MAX_TRANSFER {
         return Err(EINVAL);
     }
     Ok((len as usize, addr))
@@ -650,7 +654,7 @@ mod tests {
         let mut inbox = b"b\n".to_vec();
         inbox.extend_from_slice(&frame(1, RUMPSP_RESP, RUMPSP_HANDSHAKE, 0, &sysresp(0, 0, 0)));
         // claim a huge len with no body
-        let bad = enc_hdr((HDRSZ + MAX_XFER + 1) as u64, 2, RUMPSP_RESP, RUMPSP_SYSCALL, 0);
+        let bad = enc_hdr((HDRSZ + MAX_TRANSFER + 1) as u64, 2, RUMPSP_RESP, RUMPSP_SYSCALL, 0);
         inbox.extend_from_slice(&bad);
         let mut mem = MockMem::new();
         let mut c = Client::connect(MockT::new(inbox), b"k").expect("hs");

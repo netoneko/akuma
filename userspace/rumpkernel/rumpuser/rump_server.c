@@ -78,6 +78,7 @@ main(int argc, char **argv)
 	const char *logpath = NULL; /* --log: redirect stdout/stderr to this file */
 	int serve_fd = -1;   /* >=0: serve sysproxy on this inherited fd */
 	int do_net = 0;      /* --net: bring up virt0 + DHCP over /dev/net/tap0 */
+	int url_given = 0;   /* a positional URL was passed (legacy listen mode) */
 	int rv;
 
 	/*
@@ -98,6 +99,7 @@ main(int argc, char **argv)
 			logpath = argv[++i];
 		} else if (argv[i][0] != '-') {
 			url = argv[i];
+			url_given = 1;
 		}
 	}
 
@@ -130,7 +132,7 @@ main(int argc, char **argv)
 		}
 		printf("RUMP_SERVER: SERVING sysproxy on fd %d (net=%s)\n",
 		    serve_fd, do_net ? "up" : "off");
-	} else {
+	} else if (url_given) {
 		rv = rump_init_server(url);
 		printf("RUMP_SERVER: rump_init_server(%s) -> %d\n", url, rv);
 		if (rv != 0) {
@@ -138,6 +140,12 @@ main(int argc, char **argv)
 			return 1;
 		}
 		printf("RUMP_SERVER: LISTENING — sysproxy on %s (iface %s)\n", url, ifname);
+	} else {
+		/* No fd handed in and no URL: just keep the NetBSD stack alive in this
+		 * box (e.g. herd-managed `--net` service). The kernel-as-client wires the
+		 * sysproxy channel separately; this proves the stack boots boxed. */
+		printf("RUMP_SERVER: stack up, no sysproxy channel (net=%s) — staying alive\n",
+		    do_net ? "up" : "off");
 	}
 
 	/* The sp server runs its own worker threads; just stay alive. */

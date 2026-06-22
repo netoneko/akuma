@@ -92,17 +92,19 @@ The in-process backend gives only one networked payload per box.
      since the kernel can't drain its ProcessChannel that early in boot. Bug fixed en
      route: the HANDSHAKE reply is a short non-`rsp_sysresp` word, so `connect()` must
      accept a RESP without `parse_sysresp` (regression-tested).
-   - ⏳ **Remaining integration** (next; no architectural unknowns left):
-     2. **In-kernel `ClientMem`** over the calling box process's user VA (with the
-        mandatory server-input bounds checks — see Security TODOs).
-     3. **Syscall interception** for `stack=rump` boxes: route socket-family syscalls
+   - ⏳ **Remaining integration** (next; no architectural unknowns left — the
+     transport above is proven on Akuma):
+     1. **In-kernel `ClientMem`** over the calling box process's user VA — size
+        sanity-check only (cap + let the user-VA copy fault); full validation is the
+        server's job post-Rust-port (see Security TODOs).
+     2. **Syscall interception** for `stack=rump` boxes: route socket-family syscalls
         to the rumpsp client instead of smoltcp.
-     4. **Marshaling / translation** (the only place ABI knowledge lives): Linux/Akuma
+     3. **Marshaling / translation** (the only place ABI knowledge lives): Linux/Akuma
         sysnum → NetBSD rump sysnum; arg packing into the `register_t` block; a per-box
         **fd map** (box fd ↔ rump-server fd); `struct sockaddr_in` `sin_len` fixup served
         via `ClientMem`; NetBSD errno → Akuma errno on return. (This is hijack.c's
         Linux↔NetBSD work relocated into the kernel.)
-     5. **Kernel boot self-tests** per project policy.
+     4. **Kernel boot self-tests** per project policy.
 5. **herd**: the box bundle starts the rump_server payload + sets the box's
    `stack=rump` (see `RUMP_PLUS_HERD.md`); smoltcp off = the box's only stack.
    Validate end-to-end: `/bin/curl https://ifconfig.me` in a `stack=rump` box returns
@@ -116,12 +118,18 @@ The in-process backend gives only one networked payload per box.
   It is write-once (populated in `rumpuser_init`, read-only thereafter), so a hardening
   fix is to `mprotect()` its page read-only right after init (write-once-then-seal).
   Acceptable as-is for the non-prod showcase; TODO before any non-showcase use.
-- **Validate the sysproxy wire in the kernel-as-client (Step 4).** This is the *real* new
-  trust boundary: the kernel will forward a box's syscall args (lengths, embedded
-  pointers, copyin/copyout sizes) over the unix socket to `rump_server` via the sp_*
-  protocol. All of that wire input must be bounds/sanity-checked in the kernel before use
-  — never trust client-supplied lengths/offsets — or it becomes a memory-safety hole.
-  Track this as a first-class requirement of the Step 4 implementation + its self-tests.
+- **sysproxy wire bounds-checks — TBD (refined plan, 2026-06-23).** The trust boundary is
+  the sp wire (server-supplied copyin/copyout lengths + addresses). Refined strategy:
+  - **Kernel-as-client `ClientMem`**: only **sanity-check the size** (a sane cap +
+    that the copy stays within the box process's mapped VA via `copy_from/to_user_safe`,
+    which already faults on bad addresses). `MAX_TRANSFER` in `sysproxy.rs` is the coarse cap.
+    The kernel does *not* attempt full validation of every field.
+  - **The server checks the rest**: comprehensive request validation (well-formedness,
+    field consistency, the actual `rsp_*` invariants) belongs in the sp **server**, and
+    lands when we **port the sp glue (`rumpuser_sp.c`/`sp_serve_fd.c`) → Rust** (HANDOFF
+    workaround #4) — that Rust port is where the extra checks live, not the C as-is.
+  So: kernel = "is the size sane + does it fit the process VA"; server (post-Rust-port) =
+  "is the request valid". Track both; neither blocks the showcase.
 - **The sysproxy channel fd is private to rump_server (TODO).** With the kernel-pipe
   transport, the server-end fd handed to `rump_server` must be reachable by **only**
   that process: not inheritable by other box processes (no leak across spawn), not
@@ -157,6 +165,14 @@ The in-process backend gives only one networked payload per box.
   (see `FRANKENLIBC_EVAL.md` / the parked fiber notes).
 
 ## Open items / risks
+- **`--net` DHCP busy-loops on `ppoll` (TBD).** When `rump_server --net` runs boxed at
+  boot, PID shows ~16.8M `ppoll` (706K/s) — DHCP is spinning, not blocking, pegging the
+  CPU (it reset SSH). Not a box-access issue (the tap open at `fs.rs:1100` is a literal
+  path match, no `box_id` gate; `rump_tap` is a fresh global the net=off demo never
+  touched). Fix direction: **DHCP must not busy-spin** — it should **back off and retry,
+  bounded to ~10s total**, then give up cleanly (so a missing lease doesn't peg the CPU).
+  Deferred until rumpnet boots properly without `--net`; revisit with the tap-RX /
+  one-rump-per-boot angle (workaround #5).
 - musl portability of `rumpuser_sp.c`/`sp_common.c` (atomics, `INFTIM`, BSD cdefs).
 - the per-fd handle map + blocking semantics in the kernel-as-client step.
 - `/dev/net/tap0` reset-on-close (HANDOFF workaround #5) so a box restarts cleanly.
