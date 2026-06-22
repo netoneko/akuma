@@ -14,4 +14,9 @@ bootstrap/
 tmp
 __pycache__
 models
-seflhost_vendor
+selfhost_vendor
+proposals
+logs_*.txt
+
+akuma_*.bin
+akuma_*.elf
