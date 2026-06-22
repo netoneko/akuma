@@ -241,13 +241,18 @@ Open toolchain risks are tracked in §7.
 Each phase has an explicit exit test. Kernel changes must add boot-suite
 self-tests in `src/process_tests.rs` (per repo convention), not only e2e checks.
 
-### Phase 0 — Host rump sanity (no Akuma)
+### Phase 0 — Host rump sanity (no Akuma) — ⏭️ SKIPPED (folded into Phase 1)
 - Run `buildrump.sh/buildrump.sh` natively on the dev host; run its bundled
   tests (`tests/testrump.sh`, `nettest_simple`).
-- **Exit:** stock rump network test passes on the host. We now understand the
-  build/test loop and the `librump*` artifact set.
+- **Outcome:** skipped as a separate step — we went straight to the container
+  cross-build (Phase 1) and learned the build/test loop + `librump*` artifact set
+  there. The bundled host nettest was never the bottleneck.
 
-### Phase 1 — Cross-build `librump*` for `aarch64-linux-musl`
+### Phase 1 — Cross-build `librump*` for `aarch64-linux-musl` — ✅ DONE 2026-06-22
+- **Done via a Linux container** (`docker-build.sh` → Alpine arm64, musl-native =
+  our target; macOS clang couldn't build the 2016 host tools). 304 `librump*.a` in
+  `obj/dest.stage/usr/lib/`. We **skipped** the stock-C-`librumpuser` link step and
+  went straight to the Rust rumpuser (Phase 2). See `docs/PHASE01_BUILDRUMP.md`.
 - Write `userspace/rumpkernel/build.sh` invoking `buildrump.sh` with the
   `aarch64-linux-musl` cross toolchain, static-only, into
   `userspace/rumpkernel/obj/` + `dest/` (git-ignored).
@@ -259,7 +264,13 @@ self-tests in `src/process_tests.rs` (per repo convention), not only e2e checks.
 - **Exit:** a static `aarch64-linux-musl` ELF is produced and links cleanly. (It
   need not run on Akuma yet.)
 
-### Phase 2 — `rumpuser` in Rust, running on Akuma
+### Phase 2 — `rumpuser` in Rust, running on Akuma — ✅ DONE 2026-06-22
+- **Done.** `userspace/rumpkernel/rumpuser/` (no_std Rust staticlib) boots a full
+  NetBSD rump kernel: `rump_init()` returns 0 both in the container and **on Akuma**
+  (`test_init` binary). `/dev/zero` prerequisite landed with a boot self-test. Proof
+  was `rump_init()==0` (the `rumpcomp_user_testride` demo wasn't needed). The
+  scheduler-wrap concurrency fix (clock_sleep + locks) came later, when the virtif RX
+  thread first exercised real concurrency. See `docs/PHASE2_RUMPUSER.md`.
 - Create a Rust crate `userspace/rumpkernel/rumpuser/` that builds as a
   `staticlib` and exports the `rumpuser_*` C ABI (§2a) via `#[no_mangle] pub
   extern "C"`, implemented on top of `libakuma`. Link it against the Phase-1
@@ -287,7 +298,11 @@ self-tests in `src/process_tests.rs` (per repo convention), not only e2e checks.
   `rumpcomp_user_testride()` prints from inside the rump kernel, on Akuma. Add a
   kernel self-test asserting the threads/futex/mmap paths rump exercised.
 
-### Phase 3 — Kernel `rump` feature: raw L2 packet device
+### Phase 3 — Kernel `rump` feature: raw L2 packet device — ✅ DONE
+- **Done** (release-only `rump` feature; `RUMP_NIC=1` adds NIC1 → `/dev/net/tap0`).
+  Frame-granular `read()`/`write()`; `read()` later upgraded to a proper **blocking**
+  mode (`Tap{nonblock}` + `read_frame_blocking`) for the virtif RX thread. Boot
+  self-test `test_rump_tap` PASSED. See `docs/PHASE3_KERNEL_TAP.md`.
 - Add `rump = []` to root `Cargo.toml [features]`; emit `cfg(feature = "rump")`
   (or a `cfg(kernel_rump)` via `build.rs`, matching the `extreme` pattern). Off
   by default so normal builds are byte-for-byte unchanged.
@@ -315,7 +330,11 @@ self-tests in `src/process_tests.rs` (per repo convention), not only e2e checks.
 - **Exit met:** frames the NetBSD stack sends appear on NIC1, replies are delivered
   back (proven end-to-end by the M1 HTTP fetch + the virtif TX/RX counters).
 
-### Phase 5 — `rump-net` box payload + `box --net` switch
+### Phase 5 — `rump-net` box payload + `box --net` switch — ⏳ PARTIAL
+- The **payload exists and runs** (`rumphttp` = the static rump-net ELF), but it was
+  launched **by hand over SSH** in a `RUMP_NIC=1` box for M1, not via `box open --net`.
+  Remaining: the `--net` switch + herd auto-spawn (see `docs/RUMP_PLUS_HERD.md` —
+  herd holds the `stack: rump` selector and generates a standard OCI bundle).
 - New member `userspace/rump-net/` (or `userspace/rumpkernel/rump-net/`): the
   static ELF that `rump_init()`s, brings up the virtif, and exposes the M1
   behavior. Linked against the Phase-4 `librump*`.
@@ -340,7 +359,7 @@ self-tests in `src/process_tests.rs` (per repo convention), not only e2e checks.
 - Residual: ran the payload by hand over SSH; the cold `box open --net` auto-spawn
   is Phase 5 (still ⏳). DNS (Phase 7) deferred — M1 uses a literal host IP.
 
-### Phase 7 — DNS (later)
+### Phase 7 — DNS (later) — ⏳ DEFERRED (post-M1, as planned)
 - Configure the rump resolver from DHCP option 6 and switch the curl target from
   a literal IP to a hostname. Out of scope for M1.
 

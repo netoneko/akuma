@@ -256,6 +256,17 @@ aarch64-linux-musl-gcc -O2 -static -o /tmp/test_init_akuma \
    (`--features rumpuser_debug`; lines no longer tear). Also note: `mutex_init` now
    stores the `RUMPUSER_MTX_SPIN|KMUTEX` flags (needed for the wrap decisions) and
    `cv_timedwait` now treats the timeout as RELATIVE+CLOCK_REALTIME (was absolute).
+4. **Port the C glue → no_std Rust** (cleanup, do after it all works). `hijack.c`,
+   `rumpcomp_tap.c`, and `rumphttp.c` are C for fast iteration, but none *need* to
+   be — mirror `rumpuser/src/lib.rs` (no_std Rust exporting the C ABI). Interposers →
+   `#[no_mangle] extern "C"`; the LD_PRELOAD constructor → `#[used]
+   #[link_section=".init_array"]`; `rump_sys_*`/`dlsym(RTLD_NEXT)` → `extern "C"`
+   decls. Only wrinkles: C-variadic `fcntl`/`open` (interpose with a fixed 3-arg
+   signature — the optional arg sits in `x2` on aarch64; avoids nightly `c_variadic`),
+   and the `.init_array` constructor. `csupport.c`'s variadic `rumpuser_dprintf` is
+   the one piece that stays C-ish (variadic *definition* needs nightly — same reason
+   it was split from the Rust rumpuser). The C files are the reference to debug
+   against; keep them until the Rust port is proven equivalent.
 
 ---
 
