@@ -17,6 +17,9 @@
 
 extern crate alloc;
 
+/// rumpsp client protocol for the kernel-as-client sysproxy path (Step 4).
+pub mod sysproxy;
+
 /// Opaque error from a raw NIC backend. The orchestration only branches on
 /// success vs. failure, so the cause is intentionally not modelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

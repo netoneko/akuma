@@ -51,11 +51,32 @@ The in-process backend gives only one networked payload per box.
    `rumpclient_init OK` → `rump_sys_socket(AF_INET,SOCK_STREAM) -> 3` against the
    **server's** kernel → PASS. Two processes share one NetBSD stack; the sp wire
    round-trips. This is the known-good reference client for the Step-4 kernel client.
-4. **Kernel as client (the payoff):** Akuma `net.rs`, for a `stack=rump` box, speaks
-   the rumpclient/sysproxy wire to the box's server — forwarding the box processes'
-   `AF_INET` syscalls + a per-fd handle map. Now in-box binaries are unmodified.
+4. **Kernel as client (the payoff): 🚧 IN PROGRESS.** Akuma, for a `stack=rump` box,
+   speaks the rumpsp wire to the box's server, forwarding the box processes' socket
+   syscalls.
+   - ✅ **Protocol core DONE + host-tested** — `crates/akuma-rump/src/sysproxy.rs`:
+     the rumpsp client (`connect`/handshake + `syscall` with the COPYIN/COPYOUT/ANONMMAP
+     callback loop), parameterized over a `Transport` (byte I/O) and `ClientMem`
+     (the box process's user memory). 8 host tests cover header layout, guest handshake,
+     syscall-with-copyin, copyout (no-response), anonmmap, ERROR→errno, errno
+     propagation, and an oversize-frame guard. ABI-agnostic by design.
+   - ⏳ **Remaining integration** (needs a booted box, iterative):
+     1. **In-kernel `Transport`** over a real AF_UNIX client connection to the box's
+        rump_server socket.
+     2. **In-kernel `ClientMem`** over the calling box process's user VA (with the
+        mandatory server-input bounds checks — see Security TODOs).
+     3. **Syscall interception** for `stack=rump` boxes: route socket-family syscalls
+        to the rumpsp client instead of smoltcp.
+     4. **Marshaling / translation** (the only place ABI knowledge lives): Linux/Akuma
+        sysnum → NetBSD rump sysnum; arg packing into the `register_t` block; a per-box
+        **fd map** (box fd ↔ rump-server fd); `struct sockaddr_in` `sin_len` fixup served
+        via `ClientMem`; NetBSD errno → Akuma errno on return. (This is hijack.c's
+        Linux↔NetBSD work relocated into the kernel.)
+     5. **Kernel boot self-tests** per project policy.
 5. **herd**: the box bundle starts the rump_server payload + sets the box's
    `stack=rump` (see `RUMP_PLUS_HERD.md`); smoltcp off = the box's only stack.
+   Validate end-to-end: `/bin/curl https://ifconfig.me` in a `stack=rump` box returns
+   a real answer over the NetBSD stack.
 
 ## Security / hardening TODOs
 - **Seal `rumpuser__hyp` after init.** Our Rust rumpuser exports `rumpuser__hyp` (the
