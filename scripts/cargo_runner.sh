@@ -129,6 +129,28 @@ case "$SOUND" in
     ;;
 esac
 
+# RUMP_NIC - second virtio-net device (NIC1) on virtio-mmio-bus.4, for the kernel
+#            `rump` feature's raw L2 tap path (/dev/net/tap0). Its own isolated
+#            -netdev user SLIRP gives the rump stack DHCP + a 10.0.2.2 gateway,
+#            independent of NIC0 (which stays on the native smoltcp stack).
+#              0 (default) no second NIC; /dev/net/tap0 stays ENODEV
+#              1           add NIC1 → rump tap usable
+RUMP_NIC="${RUMP_NIC:-0}"
+RUMP_NIC_ARGS=()
+case "$RUMP_NIC" in
+  0|off|no|false|FALSE)
+    ;;
+  1|on|yes|true|TRUE)
+    RUMP_NIC_ARGS+=(-netdev "user,id=net1")
+    RUMP_NIC_ARGS+=(-device "virtio-net-device,netdev=net1,bus=virtio-mmio-bus.4")
+    echo "[cargo_runner] rump: NIC1 (net1) on virtio-mmio-bus.4 → /dev/net/tap0" >&2
+    ;;
+  *)
+    echo "[cargo_runner] ERROR: RUMP_NIC must be 0|1 (got '$RUMP_NIC')" >&2
+    exit 1
+    ;;
+esac
+
 # Accelerator. Defaults to HVF (Apple Hypervisor.framework, near-native AArch64
 # execution) on Apple Silicon where it is available, falling back to TCG (portable
 # software emulation, ~3000x slower for NEON) elsewhere. Override with HVF=1 to
@@ -178,6 +200,7 @@ exec qemu-system-aarch64 \
   -drive "$DRIVE_OPTS" \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
+  "${RUMP_NIC_ARGS[@]}" \
   "${FB_ARGS[@]}" \
   "${SOUND_ARGS[@]}" \
   -kernel "$BIN" \

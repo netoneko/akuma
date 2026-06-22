@@ -128,6 +128,7 @@ impl ProcFilesystem {
             FileDescriptor::DevUrandom => String::from("/dev/urandom"),
             FileDescriptor::DevZero => String::from("/dev/zero"),
             FileDescriptor::DevDsp => String::from("/dev/dsp"),
+            FileDescriptor::Tap => String::from("/dev/net/tap0"),
             FileDescriptor::Stdin => String::from("/dev/stdin"),
             FileDescriptor::Stdout => String::from("/dev/stdout"),
             FileDescriptor::Stderr => String::from("/dev/stderr"),

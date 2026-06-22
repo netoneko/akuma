@@ -6,6 +6,9 @@ extern crate alloc;
 pub mod runtime;
 pub mod hal;
 pub mod smoltcp_net;
+// Raw L2 packet path (second NIC → /dev/net/tap0) for the kernel `rump` feature.
+#[cfg(feature = "rump")]
+pub mod rump_tap;
 pub mod socket;
 pub mod dns;
 pub mod stats;

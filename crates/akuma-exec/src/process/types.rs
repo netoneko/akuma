@@ -158,6 +158,12 @@ pub enum FileDescriptor {
     /// virtio-sound output device (`/dev/dsp`). Writes stream PCM frames to the
     /// kernel audio driver; ioctl sets OSS format/channels/rate.
     DevDsp,
+    /// Raw L2 packet device (`/dev/net/tap0`) for the kernel `rump` feature.
+    /// `read`/`write` move whole Ethernet frames to/from a dedicated second
+    /// virtio-net NIC (bypassing smoltcp). Only ever constructed when the
+    /// kernel is built with the `rump` feature and NIC1 is present; the variant
+    /// is unconditional so non-rump builds still match exhaustively.
+    Tap,
     TimerFd(u32),
     EpollFd(u32),
     PidFd(u32),

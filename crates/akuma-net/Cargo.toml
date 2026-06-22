@@ -5,6 +5,9 @@ edition = "2024"
 
 [features]
 small-sockets = []
+# Raw L2 packet path (a second virtio-net NIC exposed as /dev/net/tap0) for the
+# kernel's `rump` feature. Adds crate::rump_tap. Off unless the kernel enables it.
+rump = []
 # In-kernel TLS client (embedded-tls) for outbound HTTPS — the only consumer is
 # the shell `curl` command's https:// branch (http::http_get). Pulls in
 # embedded-tls plus the X.509 cert verifier (x509-cert/der/p256/ed25519/sha2)

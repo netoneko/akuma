@@ -68,4 +68,17 @@ toolchain. Akuma's target is `aarch64-linux-musl` static (see the plan).
 
 ## Status
 
-Planning. Nothing is built yet — see [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md).
+In progress. The **kernel side** is built and verified; the userspace rump
+libraries (cross-built `librump*`, the Rust `rumpuser`, the `virtif` backend, the
+`rump-net` box payload) are not started yet.
+
+- ✅ **Kernel prerequisite — `/dev/zero`** — see [docs/DEV_ZERO.md](docs/DEV_ZERO.md).
+- ✅ **Phase 3 — kernel `rump` feature** (raw L2 `/dev/net/tap0` packet device on a
+  dedicated second NIC, release-only, omitted from constrained profiles) — see
+  [docs/PHASE3_KERNEL_TAP.md](docs/PHASE3_KERNEL_TAP.md).
+- ⏳ Phases 0/1/2/4/5/6 (buildrump cross-build → Rust `rumpuser` → virtif → box
+  `--net` → DHCP + curl). See [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md).
+
+Run the kernel tap path with `RUMP_NIC=1 cargo run --release` (adds the second
+QEMU NIC). Without it, `/dev/net/tap0` is absent and the default boot is
+unchanged.

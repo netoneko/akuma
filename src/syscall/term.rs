@@ -15,6 +15,9 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const FIONREAD: u32 = 0x541B;
     const FIOCLEX: u32 = 0x5451;
     const FIONCLEX: u32 = 0x5450;
+    // TUN/TAP: _IOW('T', 202, int) — rump's Linux virtif uses this to bind the tap.
+    #[cfg(feature = "rump")]
+    const TUNSETIFF: u32 = 0x4004_54ca;
     // OSS audio ioctls for /dev/dsp (mirror crate::audio constants).
     const SNDCTL_DSP_SPEED: u32 = crate::audio::SNDCTL_DSP_SPEED;
     const SNDCTL_DSP_SETFMT: u32 = crate::audio::SNDCTL_DSP_SETFMT;
@@ -103,6 +106,17 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             // Echo the accepted value back (OSS contract).
             if unsafe { copy_to_user_safe(arg as *mut u8, (&raw const val).cast::<u8>(), 4).is_err() } {
                 return EFAULT;
+            }
+            return 0;
+        }
+        #[cfg(feature = "rump")]
+        TUNSETIFF => {
+            // TUN/TAP interface bind. rump's stock Linux virtif backend issues
+            // this on the tap fd to attach to an interface; /dev/net/tap0 is
+            // already the (only) tap, so accept it as a no-op success. Reject
+            // on any non-tap fd with ENOTTY.
+            if !matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::Tap)) {
+                return (-(25i64)) as u64; // ENOTTY — not a tap fd
             }
             return 0;
         }

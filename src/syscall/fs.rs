@@ -500,6 +500,22 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 EIO
             }
         }
+        #[cfg(feature = "rump")]
+        akuma_exec::process::FileDescriptor::Tap => {
+            // Pull one L2 frame. No frame ready → EAGAIN (the tap fd behaves
+            // non-blocking at this phase; the rump virtif retries / polls).
+            let mut temp = alloc::vec![0u8; count];
+            match akuma_net::rump_tap::read_frame(&mut temp) {
+                Some(n) => {
+                    if n > 0
+                        && unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                            return EFAULT;
+                        }
+                    n as u64
+                }
+                None => EAGAIN,
+            }
+        }
         #[cfg(feature = "sc-timerfd")]
         akuma_exec::process::FileDescriptor::TimerFd(timer_id) => {
             let result = super::timerfd::timerfd_read(timer_id);
@@ -753,6 +769,17 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
             }
             akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom | akuma_exec::process::FileDescriptor::DevZero => this_chunk as u64,
+            #[cfg(feature = "rump")]
+            akuma_exec::process::FileDescriptor::Tap => {
+                // One write() == one L2 frame. Ethernet frames are <2 KB, so a
+                // frame never exceeds the 64 KB chunk (single iteration).
+                if let Ok(n) = akuma_net::rump_tap::write_frame(buf_slice) {
+                    n as u64
+                } else {
+                    if total_written > 0 { return total_written as u64; }
+                    return EIO;
+                }
+            }
             akuma_exec::process::FileDescriptor::DevDsp => {
                 // Blocking PCM playback. The audio driver re-chunks into bounded
                 // periods internally; consumes the whole slice or errors.
@@ -1056,6 +1083,28 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         return ESRCH;
     }
 
+    // /dev/net/tap0 — raw L2 packet device for the rump kernel feature. Only
+    // opens when a second virtio-net NIC was bound at boot (rump_tap::is_ready);
+    // otherwise returns ENODEV. Frame-granular read()/write() and a no-op
+    // TUN/TAP ioctl let a userspace rump virtif drive the NetBSD stack over it.
+    #[cfg(feature = "rump")]
+    if path == "/dev/net/tap0" {
+        if !akuma_net::rump_tap::is_ready() {
+            return ENODEV;
+        }
+        if let Some(proc) = akuma_exec::process::current_process() {
+            let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Tap);
+            if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
+                proc.set_cloexec(fd);
+            }
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(256, "[syscall] openat(/dev/net/tap0) = fd {} flags=0x{:x}\n", fd, flags);
+            }
+            return u64::from(fd);
+        }
+        return ESRCH;
+    }
+
     let path = if path == "/proc/self/exe" {
         if let Some(proc) = akuma_exec::process::current_process() {
             proc.name.clone()
@@ -1263,6 +1312,11 @@ pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
         }
         Some(akuma_exec::process::FileDescriptor::DevZero) => {
             stat = Stat { st_dev: 0, st_ino: 5, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 5), st_blksize: 4096, ..Default::default() };
+            0
+        }
+        Some(akuma_exec::process::FileDescriptor::Tap) => {
+            // /dev/net/tap0: char device. Linux's TUN/TAP is misc major 10, minor 200.
+            stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(10, 200), st_blksize: 4096, ..Default::default() };
             0
         }
         Some(akuma_exec::process::FileDescriptor::TimerFd(_) |
