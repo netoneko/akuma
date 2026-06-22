@@ -71,7 +71,9 @@ git clone https://git.suckless.org/sic /tmp/sic      # or a pinned mirror
 #    - rump_sys_* replace the libc socket calls (a tiny shim maps
 #      socket/connect/send/recv → rump_sys_*), OR sic is built with
 #      -Dmain=sic_main and driven by a small rump bootstrap (rump_init +
-#      ifcreate virt0 + ifsetlinkstr /dev/net/tap0 + dhcp_ipv4_oneshot).
+#      ifcreate virt0 + ipv4 via dhcp_ipv4_oneshot). NOTE: with the stock-style
+#      virtif (no RUMP_VIF_LINKSTR) the iface binds its tap at clone time, so
+#      there is NO ifsetlinkstr call — see docker-net-test.sh / test_net.c.
 #    - link: -lrumpnet_config -lrumpnet_virtif -lrumpnet_netinet -lrumpnet_net
 #            -lrumpnet -lrump  + librumpuser_akuma.a + virtif_user backend,
 #            --whole-archive for the component constructors, -static.
@@ -97,6 +99,59 @@ Seeing live `#rumpkernel` channel state = real bytes over the real internet,
 carried by the NetBSD TCP/IP stack running on our Rust `rumpuser`, inside Akuma,
 supervised by herd. That is the end-to-end win the whole port is for.
 
+## Same demo, other direction — SSH straight into the box over the rump stack
+
+The IRC client proves the **outbound** (connect) path. The same box also runs an
+SSH server **listening on the rump stack**, proving the **inbound** (listen/accept)
+path and a full interactive bidirectional session — a stronger end-to-end check.
+
+**Topology (two stacks, side by side):**
+
+| Reach | Host port | Guest NIC | Stack | Server |
+|-------|-----------|-----------|-------|--------|
+| Akuma itself | `2222` | NIC0 (net0) | smoltcp (`src/syscall/net.rs`) | Akuma's in-kernel sshd |
+| **the box**  | **`2223`** (`RUMP_SSH_PORT`) | NIC1 (net1) → `/dev/net/tap0` | **NetBSD rump** | dropbear in the box |
+
+So `ssh -p 2222 root@localhost` lands on Akuma (smoltcp); `ssh -p 2223 root@localhost`
+lands on the **box's** sshd whose socket lives on the **NetBSD stack**. Genuinely
+different interface, different stack, and a different guest IP — `virt0` gets its
+address from net1's own SLIRP DHCP (`10.0.2.15`, gateway `10.0.2.2`), independent of
+whatever NIC0/smoltcp holds. `scripts/cargo_runner.sh` adds the
+`hostfwd=tcp::2223-:22` on net1 when `RUMP_NIC=1` (override with `RUMP_SSH_PORT`).
+
+**Why dropbear, not our `userspace/sshd`:** our sshd is built on `libakuma`'s net
+abstraction (`net-async`, whose `socket/bind/listen/accept` are Akuma syscalls), so
+pointing *it* at rump would mean adding a **libakuma rump backend** — a separate
+integration. dropbear is an unmodified C binary that uses libc sockets directly, so
+it drops onto the **standard `librumphijack` `LD_PRELOAD`** path with no code
+changes — the simpler route for this demo. (The libakuma-backend route is the
+better long-term answer for *our* programs; tracked in docs/ARCHITECTURE_QUESTIONS.md.)
+
+**In-box (added to the herd service's run script):**
+```sh
+# after virt0 is up with an address (dhcp_ipv4_oneshot):
+#   run an unmodified dropbear whose libc socket/bind/listen/accept are redirected
+#   to the rump stack. Two ways (see docs/ARCHITECTURE_QUESTIONS.md):
+#     (a) in-process: dropbear linked/preloaded with librumphijack against the
+#         in-process rump kernel — the box is one process hosting rump + dropbear;
+#     (b) sysproxy: rump_server owns the stack, dropbear runs with
+#         LD_PRELOAD=librumphijack + RUMP_SERVER=unix://… (needs sp_* hypercalls).
+LD_PRELOAD=/usr/lib/librumphijack.so dropbear -F -E -p 22 -r /etc/box_hostkey
+```
+
+**Login shell = busybox `sh`.** dropbear runs a real login shell (`/bin/busybox
+sh`, already shipped static in `bootstrap/bin`), so an SSH session into the box
+gets full POSIX shell grammar — `&&`, pipes, `$?`, `VAR=val cmd` — *not* Akuma's
+in-kernel SSH shell (which rejects those; you hit it on `:2222`). So the entire
+in-box flow above (clone sic → `tcc` compile → run) is driven from a normal shell
+over the NetBSD stack. (Configure via dropbear's shell target / the box's
+`/etc/passwd`.)
+
+**Expected:** from the host, `ssh -p 2223 root@localhost` opens a busybox shell
+**in the box**, with the TCP handshake + the entire session carried by the NetBSD
+stack on our rumpuser. `RUMP_NIC=0` (no `/dev/net/tap0`) → `:2223` refuses — the
+negative control that it isn't secretly smoltcp.
+
 ---
 
 ## Why this proves the *correct* stack (not smoltcp)
@@ -110,10 +165,20 @@ supervised by herd. That is the end-to-end win the whole port is for.
 
 ## Open items before this is runnable
 
-- [ ] virtif packet backend (`rumpcomp_virt_*`) over `/dev/net/tap0` (Akuma) —
-      container proof of the stock TUN/TAP backend first (`docker-net-test.sh`).
-- [ ] `rumpuser` scheduler-wrap under real concurrency (RX kthread) — workaround
-      #3 in HANDOFF; the virtif RX thread is the first real test of it.
-- [ ] DHCP one-shot against the QEMU user-net / tap.
-- [ ] `package-sdk.sh` + the `/archives` herd install path.
-- [ ] sic ↔ rump link recipe (libc-socket shim vs rump bootstrap wrapper).
+Done:
+- [x] `rumpuser` scheduler-wrap under real concurrency — fixed (clock_sleep +
+      contended mutex/rwlock + cv waits release the rump CPU). Container net test
+      (`docker-net-test.sh`) is GREEN: `virt0` up, IP assigned, `rump_sys_socket` OK.
+- [x] `package-sdk.sh` → `bootstrap/archives/rump-sdk-aarch64-musl.tar.gz`.
+- [x] `cargo_runner.sh` forwards host `:2223` → rump:22 on net1 (`RUMP_SSH_PORT`).
+
+Remaining:
+- [ ] virtif packet backend over `/dev/net/tap0` on **Akuma** — container proof uses
+      the stock Linux TUN/TAP backend; Akuma needs our `rumpcomp_user` over the kernel
+      tap device.
+- [ ] DHCP one-shot (`rump_pub_netconfig_dhcp_ipv4_oneshot`) against net1's SLIRP.
+- [ ] the `/archives` herd install + bundle (`config.json`: SDK unpack, mounts,
+      `process.args` for the run script).
+- [ ] **sic** ↔ rump link recipe (libc-socket shim vs rump bootstrap wrapper).
+- [ ] **dropbear** for Akuma + `librumphijack`/`librumpclient` build + un-stub the
+      `sp_*` hypercalls (sysproxy model) — OR the in-process hijack link.

@@ -141,9 +141,20 @@ case "$RUMP_NIC" in
   0|off|no|false|FALSE)
     ;;
   1|on|yes|true|TRUE)
-    RUMP_NIC_ARGS+=(-netdev "user,id=net1")
+    # RUMP_SSH_PORT - host port forwarded to :22 on the RUMP stack's SLIRP (net1),
+    #                 so you can `ssh -p <port> root@localhost` straight into a
+    #                 box whose sshd listens on the NetBSD stack (acceptance/11).
+    #                 Distinct from NIC0/smoltcp's 2222 (Akuma's own sshd). Default
+    #                 2223; set empty to disable the forward.
+    RUMP_SSH_PORT="${RUMP_SSH_PORT:-2223}"
+    if [ -n "$RUMP_SSH_PORT" ]; then
+      RUMP_NIC_ARGS+=(-netdev "user,id=net1,hostfwd=tcp::${RUMP_SSH_PORT}-:22")
+      echo "[cargo_runner] rump: NIC1 (net1) → /dev/net/tap0; ssh box via host :${RUMP_SSH_PORT} → rump:22" >&2
+    else
+      RUMP_NIC_ARGS+=(-netdev "user,id=net1")
+      echo "[cargo_runner] rump: NIC1 (net1) on virtio-mmio-bus.4 → /dev/net/tap0" >&2
+    fi
     RUMP_NIC_ARGS+=(-device "virtio-net-device,netdev=net1,bus=virtio-mmio-bus.4")
-    echo "[cargo_runner] rump: NIC1 (net1) on virtio-mmio-bus.4 → /dev/net/tap0" >&2
     ;;
   *)
     echo "[cargo_runner] ERROR: RUMP_NIC must be 0|1 (got '$RUMP_NIC')" >&2
