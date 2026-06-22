@@ -91,6 +91,8 @@ hijack_init(void)
 	const char *gw     = getenv("RUMP_GW");        /* default 10.0.0.1 */
 	int rv;
 
+	const char *dhcp = getenv("RUMP_DHCP");        /* set => DHCP instead of static */
+
 	resolve();
 
 	if (!ifaddr) ifaddr = "10.0.0.2";
@@ -104,12 +106,20 @@ hijack_init(void)
 	}
 	rv = rump_pub_netconfig_ifcreate("virt0");
 	fprintf(stderr, "[hijack] ifcreate virt0 -> %d\n", rv);
-	rv = rump_pub_netconfig_ipv4_ifaddr("virt0", ifaddr, ifmask);
-	fprintf(stderr, "[hijack] ipv4_ifaddr %s/%s -> %d\n", ifaddr, ifmask, rv);
-	rv = rump_pub_netconfig_ifup("virt0");
-	fprintf(stderr, "[hijack] ifup -> %d\n", rv);
-	rv = rump_pub_netconfig_ipv4_gw(gw);
-	fprintf(stderr, "[hijack] gw %s -> %d\n", gw, rv);
+
+	if (dhcp && *dhcp && *dhcp != '0') {
+		/* M1 path: lease an address (and default route) from a DHCP server on
+		 * the wire, exactly like a real box would. ifup happens inside. */
+		rv = rump_pub_netconfig_dhcp_ipv4_oneshot("virt0");
+		fprintf(stderr, "[hijack] dhcp_ipv4_oneshot -> %d\n", rv);
+	} else {
+		rv = rump_pub_netconfig_ipv4_ifaddr("virt0", ifaddr, ifmask);
+		fprintf(stderr, "[hijack] ipv4_ifaddr %s/%s -> %d\n", ifaddr, ifmask, rv);
+		rv = rump_pub_netconfig_ifup("virt0");
+		fprintf(stderr, "[hijack] ifup -> %d\n", rv);
+		rv = rump_pub_netconfig_ipv4_gw(gw);
+		fprintf(stderr, "[hijack] gw %s -> %d\n", gw, rv);
+	}
 
 	atexit(virtif_dump_stats);
 	fprintf(stderr, "[hijack] stack up; interposing socket calls.\n");

@@ -26,7 +26,7 @@ exec docker run --rm --platform linux/arm64 \
     --device /dev/net/tun --cap-add NET_ADMIN \
     -v "${HERE}:/work" -w /work \
     alpine:3.20 sh -euc '
-        apk add --no-cache build-base linux-headers iproute2 python3 curl >/dev/null
+        apk add --no-cache build-base linux-headers iproute2 python3 curl dnsmasq >/dev/null
         L=obj/dest.stage/usr/lib
         I=obj/dest.stage/usr/include
         VDIR=src-netbsd/sys/rump/net/lib/libvirtif
@@ -39,8 +39,12 @@ exec docker run --rm --platform linux/arm64 \
         mkdir -p /www
         printf "<html><body>HELLO-FROM-NETBSD-RUMP-STACK</body></html>\n" > /www/index.html
         ( cd /www && python3 -m http.server 80 --bind 10.0.0.1 >/tmp/httpd.log 2>&1 & )
+        echo "[demo] DHCP server (dnsmasq) on tun0: leases 10.0.0.20-50, router 10.0.0.1"
+        dnsmasq --interface=tun0 --bind-interfaces --no-daemon --log-dhcp \
+            --dhcp-range=10.0.0.20,10.0.0.50,255.255.255.0,1h \
+            --dhcp-option=3,10.0.0.1 --dhcp-authoritative >/tmp/dnsmasq.log 2>&1 &
         sleep 1
-        echo "[demo] httpd up on 10.0.0.1:80; tun0:"; ip -br addr show tun0
+        echo "[demo] httpd + dnsmasq up; tun0:"; ip -br addr show tun0
 
         echo "[demo] === build hijack.so (shim + instrumented virtif + rump PIC) ==="
         gcc -shared -fPIC -O2 -o /tmp/hijack.so \
@@ -51,6 +55,7 @@ exec docker run --rm --platform linux/arm64 \
               -L "$L" \
               -lrumpnet_config_pic -lrumpnet_virtif_pic \
               -lrumpnet_netinet_pic -lrumpnet_net_pic -lrumpnet_pic \
+              -lrumpdev_bpf_pic -lrumpdev_pic \
               -lrump_pic \
               '"${RUMPUSER_A}"' \
             -Wl,--no-whole-archive \
@@ -60,22 +65,25 @@ exec docker run --rm --platform linux/arm64 \
         echo "[demo] sanity: host can see httpd (NOT via rump — control):"
         wget -q -O - http://10.0.0.1/ || echo "[demo] (host wget failed)"
 
-        echo "[demo] === run UNMODIFIED curl over the rump stack ==="
+        echo "[demo] === run UNMODIFIED curl over the rump stack (address via DHCP) ==="
         echo "[demo] curl: $(curl --version | head -1)"
         set +e
-        RUMP_VIRTIF_TRACE=1 LD_PRELOAD=/tmp/hijack.so \
+        RUMP_DHCP=1 RUMP_VIRTIF_TRACE=1 LD_PRELOAD=/tmp/hijack.so \
             curl -s -S -o /tmp/body http://10.0.0.1/ 2>/tmp/curl.err
         CRC=$?
         set -e
         echo "[demo] curl rc=${CRC}"
-        echo "[demo] === hijack stderr (init + per-frame trace + stats) ==="
+        echo "[demo] === hijack stderr (init + DHCP + per-frame trace + stats) ==="
         cat /tmp/curl.err
+        echo "[demo] === dnsmasq DHCP log (server side) ==="
+        grep -aiE "DHCP|lease|offer|ack|request" /tmp/dnsmasq.log | tail -12 || true
         echo "[demo] === body fetched by curl THROUGH THE RUMP STACK ==="
         cat /tmp/body 2>/dev/null || echo "(no body)"
         echo "[demo] === VERDICT ==="
         if grep -q "HELLO-FROM-NETBSD-RUMP-STACK" /tmp/body 2>/dev/null \
+           && grep -q "dhcp_ipv4_oneshot -> 0" /tmp/curl.err \
            && grep -q "VIRTIF STATS] tx=[1-9]" /tmp/curl.err; then
-            echo "[demo] PASS: unmodified curl fetched the page over the NetBSD rump stack."
+            echo "[demo] PASS: unmodified curl fetched the page over a DHCP-configured NetBSD rump stack."
         else
             echo "[demo] FAIL: see trace above."
         fi
