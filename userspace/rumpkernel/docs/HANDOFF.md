@@ -58,6 +58,40 @@ that passes in the container is already an Akuma binary (same triple). The
 `herd` route (run it as an OCI-bundle service; herd also wires the process VFS /
 mounts for us) is now a trivial follow-up.
 
+### 🏁 Milestone (2026-06-22): UNMODIFIED `curl` does HTTP over the rump stack
+
+`docker-hijack-demo.sh` runs an off-the-shelf `curl 8.14.1` (no recompile) so its
+network syscalls hit the NetBSD rump stack instead of the host kernel, and proves
+it with instrumentation:
+
+```
+[VIRTIF TX#1] ARP →  RX#1/2 ARP reply →  TX#3 SYN → RX#3 SYN-ACK → TX#4 ACK
+[VIRTIF TX#5] 138 (HTTP GET) →  RX#5/6 (HTTP 200 + body) →  TX/RX teardown
+[VIRTIF STATS] tx=7 pkts/498 bytes  rx=7 pkts/711 bytes
+<html><body>HELLO-FROM-NETBSD-RUMP-STACK</body></html>   ← body returned to curl
+```
+
+How: `rumpuser/hijack.c` is a single `LD_PRELOAD` `.so` that statically embeds the
+whole rump stack (PIC archives) + our rumpuser; a constructor `rump_init`s and
+brings up `virt0`; libc `socket/connect/send/recv/readv/writev/poll/fcntl/
+getsockopt` are interposed onto `rump_sys_*` (fd offset `0x40000000`; Linux→NetBSD
+sockaddr + `SOCK_NONBLOCK`/`O_NONBLOCK` handling). `rumpuser/virtif_user_instr.c` is
+the stock TUN/TAP backend + per-frame counters/log at the rump↔wire seam (the
+proof). Container `tun0`=10.0.0.1/24 + a python http server stand in for the wire.
+
+Hard-won lessons (all in `docs/ARCHITECTURE_QUESTIONS.md`):
+- **`busybox wget` can't be hijacked via LD_PRELOAD on musl** — it uses `FILE*`
+  (`fdopen`) and musl stdio flushes via *inline* `writev`/`readv` syscalls that
+  bypass the PLT. Use curl/nc-class tools (direct `send`/`recv`) — or kernel-routing.
+- curl uses Linux-only `SOCK_NONBLOCK|SOCK_CLOEXEC` type bits NetBSD rejects → strip
+  them; keep the rump socket blocking so connect/send/recv stay synchronous.
+
+Scope: proven **in the container**. An Akuma box swaps the TUN/TAP backend for our
+`rumpcomp_user` over `/dev/net/tap0` and runs it as a herd service — same shim, same
+proof. New files: `rumpuser/hijack.c`, `rumpuser/virtif_user_instr.c`,
+`docker-hijack-demo.sh`; the virtif PIC archive (build via `docker-build-virtif.sh`
+without `MKPIC=no`), and rumpuser built `-C relocation-model=pic`.
+
 ---
 
 ## Environment facts

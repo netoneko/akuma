@@ -172,6 +172,12 @@ Done:
 - [x] `package-sdk.sh` → `bootstrap/archives/rump-sdk-aarch64-musl.tar.gz`.
 - [x] `cargo_runner.sh` forwards host `:2223` → rump:22 on net1 (`RUMP_SSH_PORT`).
 
+Done:
+- [x] **In-process LD_PRELOAD hijack PROVEN** — unmodified `curl` did HTTP over the
+      rump stack (`docker-hijack-demo.sh`): `rumpuser/hijack.c` (the `.so`) +
+      `rumpuser/virtif_user_instr.c` (per-frame proof counters). The IRC/SSH demo
+      reuses this exact shim.
+
 Remaining:
 - [ ] virtif packet backend over `/dev/net/tap0` on **Akuma** — container proof uses
       the stock Linux TUN/TAP backend; Akuma needs our `rumpcomp_user` over the kernel
@@ -180,5 +186,10 @@ Remaining:
 - [ ] the `/archives` herd install + bundle (`config.json`: SDK unpack, mounts,
       `process.args` for the run script).
 - [ ] **sic** ↔ rump link recipe (libc-socket shim vs rump bootstrap wrapper).
-- [ ] **dropbear** for Akuma + `librumphijack`/`librumpclient` build + un-stub the
-      `sp_*` hypercalls (sysproxy model) — OR the in-process hijack link.
+- [ ] **dropbear** check: it must do its socket I/O via *directly-called* libc
+      `socket/accept/read/write` (interposable by `hijack.c`), NOT via `FILE*`
+      stdio — musl stdio flushes through inline `writev`/`readv` syscalls that
+      bypass the PLT and **cannot** be LD_PRELOAD-hijacked (this is why `busybox
+      wget` fails but `curl` works). If dropbear uses stdio on the socket, fall back
+      to the sysproxy model (`librumphijack`/`librumpclient` + un-stub `sp_*`) or
+      kernel-routing.
