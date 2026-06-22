@@ -346,18 +346,20 @@ fn rumpsp_err_to_errno(e: u32) -> i32 {
 pub trait PipeIo {
     /// Non-blocking read of one chunk into `buf`; returns `(bytes_read, eof)`.
     fn read(&mut self, id: u32, buf: &mut [u8]) -> (usize, bool);
-    /// Write all of `buf` (the kernel pipe buffer is unbounded). `Err` = broken pipe.
-    fn write(&mut self, id: u32, buf: &[u8]) -> Result<(), ()>;
+    /// Write all of `buf` (the kernel pipe buffer is unbounded). Returns `false`
+    /// on a broken pipe.
+    fn write(&mut self, id: u32, buf: &[u8]) -> bool;
     /// Cooperatively yield the CPU so the server thread can run.
     fn yield_now(&mut self);
     /// Monotonic microseconds (for the read timeout).
     fn now_us(&mut self) -> u64;
 }
 
-/// A [`Transport`] over a kernel pipe pair: write to `wr` (→ the server's `rx`),
-/// read from `rd` (← the server's `tx`). Reads poll [`PipeIo::read`] +
-/// `yield_now` until the buffer is full, EOF, or `timeout_us` elapses (so a
-/// wedged server fails the request instead of hanging the caller forever).
+/// A [`Transport`] over a kernel pipe pair: write to `wr`, read from `rd`.
+///
+/// `wr` reaches the server's `rx`; `rd` carries the server's `tx`. Reads poll
+/// [`PipeIo::read`] + `yield_now` until the buffer is full, EOF, or `timeout_us`
+/// elapses (so a wedged server fails the request instead of hanging forever).
 pub struct PipeTransport<P: PipeIo> {
     /// Injected pipe I/O.
     pub io: P,
@@ -371,7 +373,11 @@ pub struct PipeTransport<P: PipeIo> {
 
 impl<P: PipeIo> Transport for PipeTransport<P> {
     fn write_all(&mut self, buf: &[u8]) -> Result<(), TransportErr> {
-        self.io.write(self.wr, buf).map_err(|()| TransportErr)
+        if self.io.write(self.wr, buf) {
+            Ok(())
+        } else {
+            Err(TransportErr)
+        }
     }
 
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), TransportErr> {
@@ -685,9 +691,9 @@ mod tests {
                 None => (0, false), // nothing yet → caller yields/times out
             }
         }
-        fn write(&mut self, _id: u32, buf: &[u8]) -> Result<(), ()> {
+        fn write(&mut self, _id: u32, buf: &[u8]) -> bool {
             self.writes.extend_from_slice(buf);
-            Ok(())
+            true
         }
         fn yield_now(&mut self) {
             self.yields += 1;

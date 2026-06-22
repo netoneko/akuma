@@ -29,8 +29,8 @@ impl PipeIo for KernelPipeIo {
     fn read(&mut self, id: u32, buf: &mut [u8]) -> (usize, bool) {
         pipe::pipe_read(id, buf)
     }
-    fn write(&mut self, id: u32, buf: &[u8]) -> Result<(), ()> {
-        pipe::pipe_write(id, buf).map(|_| ()).map_err(|_| ())
+    fn write(&mut self, id: u32, buf: &[u8]) -> bool {
+        pipe::pipe_write(id, buf).is_ok()
     }
     fn yield_now(&mut self) {
         threading::yield_now();
@@ -85,13 +85,11 @@ pub fn run_demo() {
     // Install the server end at fd 3 BEFORE it runs. Single-core: we have not
     // yielded since spawn, so the child is not scheduled until our first blocking
     // read yields — and the server only touches fd 3 after rump_init() anyway.
-    match process::lookup_process(pid) {
-        Some(p) => p.set_fd(3, process::FileDescriptor::UnixSocket { rx: px, tx: py }),
-        None => {
-            crate::console::print("[Test] rump_sysproxy FAILED: lookup_process\n");
-            return;
-        }
-    }
+    let Some(p) = process::lookup_process(pid) else {
+        crate::console::print("[Test] rump_sysproxy FAILED: lookup_process\n");
+        return;
+    };
+    p.set_fd(3, process::FileDescriptor::UnixSocket { rx: px, tx: py });
 
     let chan = PipeTransport { io: KernelPipeIo, wr: px, rd: py, timeout_us: READ_TIMEOUT_US };
     let mut client = match Client::connect(chan, b"akuma-kernel") {
