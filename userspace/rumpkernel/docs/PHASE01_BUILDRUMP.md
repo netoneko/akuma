@@ -1,73 +1,105 @@
-# Phases 0/1 — buildrump cross-build: findings & state
+# Phases 0/1 — buildrump cross-build: **DONE** (aarch64-musl librump\* built)
 
-Status: **in progress / de-risked**. The driver (`build.sh`) and the pinned
-NetBSD source checkout work; the cross-build currently stalls in NetBSD's
-**host-tool** bootstrap due to 2016-source vs. modern-Apple-clang
-incompatibilities — exactly the plan's §7 risks #1 (toolchain divergence) and #2
-(2016 source pin), now concrete.
+Status: **complete.** `librump*.a` static archives for `aarch64` (musl) are built
+and verified — 304 archives including the full NetBSD TCP/IP stack. Built in a
+**Linux container** (not macOS), which sidesteps the 2016-source-vs-modern-clang
+host-tool failures (plan §7 #1/#2).
 
-This is the userspace half of the port (the `librump*.a` archives an Akuma
-program links to host a NetBSD TCP/IP stack). The **kernel** half is already done
-and verified — see [PHASE3_KERNEL_TAP.md](PHASE3_KERNEL_TAP.md).
+This is the userspace half of the port (the `librump*.a` an Akuma program links
+to host a NetBSD TCP/IP stack). The **kernel** half (the raw L2 `/dev/net/tap0`)
+is also done — see [PHASE3_KERNEL_TAP.md](PHASE3_KERNEL_TAP.md).
 
-## What works
-
-- **`build.sh`** drives `buildrump.sh` with the `aarch64-linux-musl` cross
-  toolchain. Commands: `checkout` | `build` | `host` | `clean`. Outputs to
-  git-ignored `obj/` + `dest/`.
-- **Source checkout** (`./build.sh checkout`): clones the pinned rump src-netbsd
-  (rev `82f3a69`, NetBSD 7.99.34) into `src-netbsd/` (~375 MB, git-ignored).
-- **Toolchain detection**: buildrump correctly resolves the cross tools and the
-  target — `MACHINE: evbarm64`, `MACHINE_ARCH: aarch64`, `RUMPKERN_ONLY: yes`
-  (our `-k`, so NetBSD's C librumpuser is skipped for the Rust one in Phase 2).
-
-## Blockers found (host-tool build, on macOS Apple clang)
-
-NetBSD bootstraps its own build tools (`nbmake`, `compat`, `mandoc`, …) with the
-**host** compiler before cross-compiling anything. Modern Apple clang (≥16)
-rejects 2016-era C that older compilers accepted:
-
-1. **`tools/compat`** — `error: call to undeclared function 'mi_vector_hash'`
-   (implicit function declarations are now hard errors).
-   **Fixed** by passing `-V HOST_CFLAGS=-Wno-error=implicit-function-declaration`
-   (and `HOST_CPPFLAGS`) — `-F CFLAGS=…` alone does **not** work: it only reaches
-   the *target* cross-compile, not the host-tool build.
-2. **`tools/mandoc`** — `config.h: conflicting types for '__builtin___strlcat_chk'
-   / '__builtin___strlcpy_chk'`, `implicit int`. mandoc's autoconf `config.h`
-   redeclares `strlcat`/`strlcpy` in a way that clashes with clang builtins.
-   **Not yet resolved.** (mandoc is a man-page formatter — not needed for the
-   rump libraries themselves; the lever is to skip it or relax its flags.)
-
-Expect more of the same down the host-tool list. The realistic options, in
-rough order of robustness:
-
-- **Build on Linux**, not macOS — a Linux host with an older/looser default
-  `cc` sidesteps most of these (the rump CI targets Linux). Cross-compile to
-  aarch64-musl from there. **Recommended** for the actual library build.
-- **Pin an older host clang/gcc** (e.g. via Homebrew `llvm@15` or `gcc`) so
-  implicit-int/implicit-function-declaration stay warnings.
-- **Per-tool flag relaxation** continuing the `HOST_CFLAGS` approach
-  (`-Wno-error=implicit-int`, `-Wno-error=…`) — works but is whack-a-mole.
-- **Skip unneeded host tools** (mandoc/man) via NetBSD `MK*=no` knobs if
-  buildrump exposes them through `-V`.
-
-## Reproduce
+## How to build
 
 ```sh
 cd userspace/rumpkernel
-./build.sh checkout      # ~375 MB clone (once)
-./build.sh build         # cross-build; currently stops in tools/mandoc
+./build.sh checkout      # ~375 MB clone of pinned src-netbsd (once)
+./docker-build.sh        # build librump*.a in an Alpine arm64 container
 ```
 
-`build.sh` already applies fix #1. Logs are verbose; the real error is usually a
-`*.c:NNN: error:` line well above the `*** BUILD ABORTED ***` banner.
+Artifacts (git-ignored): `obj/dest.stage/usr/lib/librump*.a`. Key ones for M1:
+- `librump.a` (9.5 MB) — core rump kernel
+- `librumpnet.a` (1.7 MB) — net core
+- `librumpnet_netinet.a` (84 KB) — **the NetBSD TCP/IP stack**
+- `librumpnet_config.a` (640 KB) — netconfig (DHCP oneshot)
+- `librumpvfs.a` — VFS faction
 
-## Once the libraries build (Phase 1 exit → Phase 2/4)
+Verified arch: `file` on a member → `ELF 64-bit LSB relocatable, ARM aarch64`.
 
-`dest/lib/librump*.a` is the artifact set. Then:
-- **Phase 2**: Rust `rumpuser/` staticlib exporting the `rumpuser_*` C ABI over
-  `libakuma`, linked in place of NetBSD's C librumpuser.
-- **Phase 4**: bind rump's virtif `rumpcomp_user` packet hypercall to the kernel
-  **`/dev/net/tap0`** that Phase 3 already provides. Note `RUMP_VIRTIF` probed to
-  **no** here because the musl sysroot lacks `<linux/if_tun.h>` — a small shim
-  header will be needed to enable the stock Linux virtif backend (plan §7 #1).
+## Why a Linux container
+
+The pinned NetBSD source is from 2016 (NetBSD 7.99.34). Its *host tools*
+(nbmake, compat, mandoc, lex, …) bootstrap with the **host** compiler before any
+target compilation. Modern Apple clang 17 on macOS rejects 2016-era C outright
+(implicit-function-declaration / implicit-int are hard errors), and there is no
+old clang/gcc on the macOS host. A Linux container fixes the *environment*:
+
+- **arm64 host → Alpine arm64 is musl-native on aarch64** → a *native* build in
+  the container *is* a build for `aarch64-linux-musl` (Akuma's target). No cross
+  toolchain, ABI matches `userspace/build.sh`'s `aarch64-linux-musl-gcc` output.
+- `gcc` (not clang) as the host compiler — laxer defaults.
+- `apk add linux-headers` provides `<linux/if_tun.h>` (the macOS musl sysroot
+  lacked it).
+
+`docker-build.sh` runs `build.sh` inside `alpine:3.20` with a small `gcc`/`g++`
+wrapper that makes the 2016 source compile on a 2026 toolchain.
+
+## The three compiler-era fixes (in the gcc/g++ wrapper)
+
+All in `docker-build.sh`'s wrapper, discovered by iterating the build:
+
+1. **`-fcommon`** — gcc 10+ defaults to `-fno-common`, so the 2016 source's
+   tentative-definition globals (e.g. `debug_file` in nbmake) collide at link
+   ("multiple definition"). `-fcommon` restores the old merging.
+2. **trailing `-Wno-error`** — the NetBSD build compiles with `-Werror`, and
+   modern gcc flags much 2016 code (`cast-function-type`, `uninitialized`, macro
+   `redefined`, …). The flag must come **after** `"$@"` to win over NetBSD's own
+   `-Werror` (a prefix flag loses to the later one). Downgrades them to warnings.
+3. **BSD cdefs shim** (`-include`) — musl's headers lack `__BEGIN_DECLS` /
+   `__END_DECLS` (glibc and BSD provide them), which NetBSD's own headers (e.g.
+   `include/regex.h`) assume → `expected ';' before 'int'` in host tools. A tiny
+   force-included shim defines them if absent.
+
+(`build.sh` also passes `-fcommon` + the implicit-decl relaxations to the target
+build for the macOS path; the container wrapper is the robust catch-all.)
+
+## virtif (Phase 4): reuse their kernel driver, write our own backend glue
+
+virtif has **two separable pieces**, and we treat them differently — the same
+"use their kernel code, write our own host glue" line as `rumpuser`:
+
+- **virtif kernel driver** (`if_virt.c`, compiled into `librumpnet_virtif.a`) —
+  the network interface *inside* the NetBSD stack that DHCP/IP/TCP bind to. **We
+  reuse this** (it is the NIC the rump stack sees; nothing substitutes for it).
+- **packet backend** (`rumpcomp_user.c` — the `rumpcomp_virtif_{create,send,recv,
+  destroy}` hypercalls the driver calls to move bytes on/off the wire). **We write
+  our own** thin glue over Akuma syscalls (`open("/dev/net/tap0")` + `read`/`write`),
+  rather than rump's stock Linux TUN/TAP backend.
+
+**Why our own backend, not the stock Linux one:** the backend is a tiny published
+hypercall contract (~4 functions) — writing it is the same kind of work as the Rust
+`rumpuser`, and consistent with that decision. The stock backend's only draw is
+being "tested", but it would only ever run against **our** `/dev/net/tap0`, which is
+itself a *mimicry* of Linux TUN/TAP — so it tests our mimicry's fidelity, not
+real-world behaviour, while costing us the full TUN/TAP ABI (`TUNSETIFF` /
+`SIOCSIFFLAGS` / `SIOCGIFHWADDR` / `/dev/net/tun` open semantics) plus the fight to
+force `RUMP_VIRTIF=yes` under `-k` (`evalplatform` is skipped at `buildrump.sh:1639`,
+and the top-level `RUMP_VIRTIF=no` clobbers the env var). Our glue avoids all of it.
+
+**Side effect on Phase 3:** the kernel tap stays exactly as built (open + raw-frame
+read/write), but its `TUNSETIFF` no-op becomes *optional* rather than load-bearing —
+`/dev/net/tap0` can just be a clean packet device, not a TUN/TAP impersonation.
+
+`librumpnet_virtif.a` was not built in this Phase-1 run (the `-k`/`RUMP_VIRTIF`
+interaction above). Phase 4 builds just `if_virt.c` into it and links our own
+`rumpcomp_user.o` — mirroring how the Rust `rumpuser` replaces NetBSD's C
+librumpuser. Phase 1's deliverable (core + TCP/IP libraries) is complete regardless.
+
+## Next (Phase 2 / Phase 4)
+
+- **Phase 2**: Rust `rumpuser/` staticlib exporting the `rumpuser_*` C ABI
+  (`RUMPUSER_VERSION 17`, from `src-netbsd/sys/rump/include/rump/rumpuser.h`) over
+  `libakuma`, linked in place of NetBSD's C librumpuser. Link a trivial app
+  against `librump.a` + the Rust rumpuser that calls `rump_init()`.
+- **Phase 4**: build `librumpnet_virtif` with an Akuma `rumpcomp_user` backend
+  bound to `/dev/net/tap0`.

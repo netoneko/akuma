@@ -35,7 +35,10 @@ OBJ="${HERE}/obj"
 DEST="${HERE}/dest"
 SRC="${HERE}/src-netbsd"   # checkout.sh target
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
-CROSS="${CROSS:-aarch64-linux-musl-}"
+# `-` not `:-`: an explicitly-empty CROSS="" means "native toolchain" (gcc/g++/…
+# with no prefix), used by the Linux-container build where aarch64-musl is native.
+# Only an UNSET CROSS falls back to the macOS cross prefix.
+CROSS="${CROSS-aarch64-linux-musl-}"
 
 cmd="${1:-build}"
 
@@ -88,13 +91,19 @@ do_cross() {
         -o "${OBJ}" \
         -d "${DEST}" \
         -F CFLAGS=-fno-stack-protector \
+        -F CFLAGS=-fcommon \
         -F CFLAGS=-Wno-error=implicit-function-declaration \
         -F CWARNFLAGS=-Wno-error=implicit-function-declaration \
         -V HOST_CFLAGS=-Wno-error=implicit-function-declaration \
         -V HOST_CPPFLAGS=-Wno-error=implicit-function-declaration \
         fullbuild )
-    info "done. librump*.a in ${DEST}/lib (if the build succeeded)"
-    ls -1 "${DEST}"/lib/librump*.a 2>/dev/null || info "no librump*.a yet — see build log above"
+    # buildrump stages the installed libs under ${OBJ}/dest.stage/usr/lib.
+    local libdir="${OBJ}/dest.stage/usr/lib"
+    local n
+    n=$(ls -1 "${libdir}"/librump*.a 2>/dev/null | wc -l | tr -d ' ')
+    info "done. ${n} librump*.a archives in ${libdir}"
+    info "  TCP/IP stack: librumpnet_netinet.a | core: librump.a | netconfig/DHCP: librumpnet_config.a"
+    [ "${n}" = "0" ] && info "no librump*.a — see build log above"
 }
 
 # Phase 0: native host sanity build to learn the build/test loop on a platform
