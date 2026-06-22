@@ -21,7 +21,7 @@ extern crate alloc;
 pub mod sysproxy;
 
 /// Linux⇄NetBSD translation (sysnums, sockaddr, errno, fd map) for the proxy.
-pub mod xlate;
+pub mod syscall_translation;
 
 /// Opaque error from a raw NIC backend. The orchestration only branches on
 /// success vs. failure, so the cause is intentionally not modelled.

@@ -20,9 +20,13 @@ The in-process backend gives only one networked payload per box.
   skipped," not "invent."
 - **`rump_init_server` exists** in our built libs (`nm` ✓) — the kernel entry that
   starts the listener and calls `rumpuser_sp_init`.
-- **Channel works with smoltcp off:** `rumpuser_sp.c` listens on a *host* socket
-  (`socket/bind/listen/accept/poll` on a `tcp://`|`unix://` URL). Akuma **has AF_UNIX**
-  (`src/syscall/net.rs`), so use **`unix://`** — local IPC, no smoltcp needed.
+- **Channel works with smoltcp off:** `rumpuser_sp.c` normally listens on a *host* socket
+  (`socket/bind/listen/accept` on a `tcp://`|`unix://` URL). ~~Akuma has AF_UNIX~~ —
+  **CORRECTION (2026-06-23):** Akuma's AF_UNIX is `socketpair`-only; there is **no
+  path-based AF_UNIX** (`bind`/`listen`/`connect` by pathname). So the transport is a
+  kernel **pipe pair** instead: the kernel hands `rump_server` one end as an inherited fd
+  and serves via `rumpuser_sp_init_fd()` (no listener). Local IPC, no smoltcp. See Step 4
+  "Transport shape PROVEN" below.
 
 ## Build sequence
 1. **Spike — un-stub `sp_*`: ✅ DONE (2026-06-22).** `docker-sysproxy-spike.sh` compiles
@@ -60,16 +64,29 @@ The in-process backend gives only one networked payload per box.
      (the box process's user memory). 8 host tests cover header layout, guest handshake,
      syscall-with-copyin, copyout (no-response), anonmmap, ERROR→errno, errno
      propagation, and an oversize-frame guard. ABI-agnostic by design.
-   - ✅ **Translation layer DONE + host-tested** — `crates/akuma-rump/src/xlate.rs`
+   - ✅ **Translation layer DONE + host-tested** — `crates/akuma-rump/src/syscall_translation.rs`
      (hijack.c ported to Rust): Linux aarch64 sysno→`Op`→NetBSD sysno map
      (socket=`__socket30` 394, etc.); `pack_args` (register_t widening, matches
      `rump_syscalls.c`); `sockaddr_in` Linux↔NetBSD (`sin_len` insert); `SOCK_NONBLOCK`/
      `SOCK_CLOEXEC` strip; NetBSD→Linux errno map (EAGAIN 35→11, EINPROGRESS 36→115,
      ECONNREFUSED 61→111, …); per-box `FdMap` (box fd ⇄ rump fd). 10 host tests. This
      is the only place ABI knowledge lives.
-   - ⏳ **Remaining integration** (needs a booted box, iterative):
-     1. **In-kernel `Transport`** over a real AF_UNIX client connection to the box's
-        rump_server socket.
+   - ✅ **Transport shape PROVEN — kernel pipes** (`docker-sp-fd-test.sh`, 2026-06-23).
+     Akuma has no path-based AF_UNIX (only socketpair), so the transport is a kernel
+     **pipe pair**: the kernel hands `rump_server` one end as an inherited fd and keeps
+     the other. New: `rumpuser/sp_serve_fd.c` adds `rumpuser_sp_init_fd(connfd,...)` —
+     serves the sysproxy protocol on a PRE-CONNECTED fd (no socket/bind/listen/accept),
+     reduced from NetBSD's `spserver`/`serv_handleconn` (it `#include`s the unmodified
+     `rumpuser_sp.c` to reach its statics). `rumpuser/sp_fd_test.c` proved it in one
+     process: socketpair → `rumpuser_sp_init_fd` on one end → raw sp client on the other
+     → `rump_sys_socket -> fd 3` through the rump kernel. PASS. The raw client mirrors
+     `sysproxy.rs`, cross-checking its framing.
+   - ⏳ **Remaining integration** (needs a booted box, iterative; no architectural
+     unknowns left):
+     1. **In-kernel `Transport`** = read/write the kernel-held end of the pipe pair
+        (reuse `src/syscall/pipe.rs`); hand the other end to `rump_server` at spawn as a
+        private inherited fd (see channel-fd-isolation TODO). `rump_server` calls
+        `rumpuser_sp_init_fd(fd)` instead of `rump_init_server(url)`.
      2. **In-kernel `ClientMem`** over the calling box process's user VA (with the
         mandatory server-input bounds checks — see Security TODOs).
      3. **Syscall interception** for `stack=rump` boxes: route socket-family syscalls
@@ -99,6 +116,21 @@ The in-process backend gives only one networked payload per box.
   protocol. All of that wire input must be bounds/sanity-checked in the kernel before use
   — never trust client-supplied lengths/offsets — or it becomes a memory-safety hole.
   Track this as a first-class requirement of the Step 4 implementation + its self-tests.
+- **The sysproxy channel fd is private to rump_server (TODO).** With the kernel-pipe
+  transport, the server-end fd handed to `rump_server` must be reachable by **only**
+  that process: not inheritable by other box processes (no leak across spawn), not
+  dup-able/openable from another box fd, and the kernel-held end never exposed to
+  userspace at all. Otherwise a box process could speak the sysproxy wire directly and
+  inject syscalls into the rump kernel, impersonating the kernel/proxy. Enforce +
+  self-test: another box process cannot read/write or even reference the channel fd.
+- **rump_server is not killable from inside the box (TODO).** The `rump_server` is the
+  box's stack daemon; if an in-box process could signal/kill it, that process could DoS
+  the whole box's networking (and orphan the kernel's per-box fd map / client connection).
+  Its lifecycle must be owned from **outside** — herd/kernel start and stop it; in-box
+  processes must not be able to `kill()` it, `close` its socket out from under the proxy,
+  or otherwise reach it as a normal box PID. Enforce + self-test: an in-box `kill` of the
+  server PID is denied, and only herd/`box close`/kernel teardown stops it. (Relates to
+  per-box isolation below.)
 - **Verify per-box isolation of the proxy (TODO for later).** Each box's `rump_server`
   listens on a unix socket in *that box's* mount namespace, and the kernel-as-client must
   forward a box's AF_INET syscalls *only* to that same box's server. Box A must not be
