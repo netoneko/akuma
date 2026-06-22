@@ -64,8 +64,9 @@ shortcut.
 # 1. install the rump SDK (temporary: untar the staged archive)
 tar -xzf /archives/rump-sdk-aarch64-musl.tar.gz -C /
 
-# 2. clone sic with the in-VM git (scratch)
-git clone https://git.suckless.org/sic /tmp/sic      # or a pinned mirror
+# 2. fetch sic sources (pinned) — builds cleanly with tcc
+#    https://dl.suckless.org/tools/sic-1.3.tar.gz   (~suckless simple IRC client)
+git clone https://git.suckless.org/sic /tmp/sic     # or: curl the pinned 1.3 tarball
 
 # 3. compile sic against the rump stack with tcc, fully static.
 #    - rump_sys_* replace the libc socket calls (a tiny shim maps
@@ -177,6 +178,13 @@ Done:
       rump stack (`docker-hijack-demo.sh`): `rumpuser/hijack.c` (the `.so`) +
       `rumpuser/virtif_user_instr.c` (per-frame proof counters). The IRC/SSH demo
       reuses this exact shim.
+- [x] **Inbound TCP server over rump, host-reachable** (`rumpuser/rumpserver.c`):
+      in a `RUMP_NIC=1` box it DHCPs, `bind`/`listen`/`accept`s on the rump stack,
+      and the **Mac host** reached it via `localhost:2223` → SLIRP → rump `:22`
+      (banner + echo returned). This is the transport an sshd sits on — the SSH
+      `listen/accept` path is proven; what's left is the SSH *protocol*.
+      Caveat: one rump process per boot (unclean kill leaves NIC1 RX mid-flight →
+      next process can't DHCP). Fix later: reset `/dev/net/tap0` on close.
 
 Remaining:
 - [ ] virtif packet backend over `/dev/net/tap0` on **Akuma** — container proof uses

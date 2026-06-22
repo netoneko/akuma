@@ -30,6 +30,8 @@ Goal (M1): run the NetBSD TCP/IP stack as a userspace rump kernel inside an Akum
 | Akuma backend: `rumpcomp_user` over `/dev/net/tap0` (vs container TUN/TAP) | ✅ `rumpuser/rumpcomp_tap.c` |
 | Kernel: **blocking `read()`** on `/dev/net/tap0` (`Tap{nonblock}`, no busy-wait) | ✅ `read_frame_blocking`; self-test updated |
 | 🏆 **M1 — DHCP + HTTP to the host, rump in an Akuma box** | ✅ **DONE 2026-06-22** (`rumphttp` in a `RUMP_NIC=1` box) |
+| **Inbound TCP server over rump, reachable from the host** | ✅ **2026-06-22** (`rumpserver.c`; host `:2223`→rump `:22`, banner+echo) |
+| acceptance/11 — actual sshd on the rump stack | ⏳ next (transport proven; need the SSH *protocol* layer) |
 | Rump SDK tarball (`bootstrap/archives/rump-sdk-aarch64-musl.tar.gz` → VM `/archives`) | ✅ `package-sdk.sh` (48 MB, 154 archives) |
 | Capstone demo: clone+compile sic, IRC `#rumpkernel` over the NetBSD stack | 📋 `acceptance/11_netbsd_rumpkernel_irc.md` (target) |
 | Akuma integration (libakuma, build-std core) | ✅ proven sufficient — stock host link runs on Akuma as-is |
@@ -267,6 +269,11 @@ aarch64-linux-musl-gcc -O2 -static -o /tmp/test_init_akuma \
    the one piece that stays C-ish (variadic *definition* needs nightly — same reason
    it was split from the Rust rumpuser). The C files are the reference to debug
    against; keep them until the Rust port is proven equivalent.
+5. **`/dev/net/tap0` should reset on close** (revealed by `rumpserver` testing). Only
+   one rump process works per boot: an unclean exit leaves NIC1's RX two-phase state
+   machine mid-flight, so the next `open("/dev/net/tap0")` can't receive (DHCP times
+   out). Fine for a single long-lived box payload (sshd), but `close()`/process
+   teardown should reset the `TapNic` RX state so a box can be restarted in place.
 
 ---
 

@@ -97,7 +97,24 @@ package set runs on Akuma unmodified. This is deferred (post-M1); see
 IMPLEMENTATION_PLAN §10.5 for the concrete code-level plan. The shim (A)/sic path
 gets us to M1; (C) is the real end state for "run NetBSD software on Akuma."
 
-**Our own programs are a 4th, cleaner case.** Akuma's first-party binaries (e.g.
+**(D) frankenlibc — a rump-backed libc (reference; future).**
+`https://github.com/justincormack/frankenlibc` (Justin Cormack). musl + a rump
+kernel, where libc's **syscall stubs** are wired to rump (with a policy for which
+calls go to rump vs. the host); ships a loader to run programs in that environment.
+It's the mature form of our `hijack.c`, but one layer lower — at the libc
+syscall-stub layer, not LD_PRELOAD. That placement sidesteps the two walls we hit:
+- the **musl-stdio** problem (Q1): stdio's inline `writev`/`readv` are themselves
+  rump syscalls, so even `busybox wget` works (no PLT to bypass).
+- the **mixed-fd `select()`** problem (the interactive-sshd blocker): one coherent
+  libc decides per-call rump-vs-host, so a `select()` over {rump socket, host pty}
+  is handled internally instead of split across an LD_PRELOAD seam.
+So it's a 4th option between (A) crude LD_PRELOAD and (C) the kernel syscall table:
+a **userspace rump-backed libc** — full ABI, runtime, no kernel change. Also a
+codebase to lift the hard parts from (fd split, syscall router, rump bootstrap).
+Caveats to check before relying on it: aarch64 support, and whether it can ride our
+existing `librump*` build vs. building its own.
+
+**Our own programs are a 5th, cleaner case.** Akuma's first-party binaries (e.g.
 `userspace/sshd`) don't use libc sockets directly — they go through **`libakuma`'s
 net abstraction** (`net.rs`: `socket/bind/listen/accept` → Akuma syscalls). For
 those, the right integration is a **libakuma rump backend**: a selectable net
