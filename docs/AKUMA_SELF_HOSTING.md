@@ -1402,7 +1402,7 @@ additions or a `userspace/pthread_suite` (the doc's "ALL PASSED / exit 0" binary
 where the §7k.4 intermittent register-corruption bug should be cornered, since it only
 manifests under real userspace async delivery at arbitrary PCs.
 
-#### 7k.6 — ROOT CAUSE of the §7k.4 intermittent SIGSEGV: a **stale-I-cache spurious `svc`** (FOUND + FIXED, June 22 2026)
+#### 7k.6 — ROOT CAUSE of the §7k.4 intermittent SIGSEGV: a **stale-I-cache spurious `svc`** (FOUND + FIXED + CONFIRMED, June 22 2026)
 
 The §7k.4 "intermittent register corruption" was run to ground by catching it in the
 act. **It is not register save/restore corruption and not a heap-corruption write — it
@@ -1457,11 +1457,25 @@ build on the guarded kernel, the guard fired and recovered at the **exact crash 
 ```
 
 Same `ELR=0x32ab64a8`, same `insn@elr-4=NOP` as the crash — but `x0=0x1eea163b0` was a
-**valid pointer** (preserved by the guard) instead of being clobbered to an errno. The
-build then ran **147/147 to `Finished` in a single clean pass, zero `[WILD-DA]`** — the
-first crash-free from-scratch self-host build. Regression self-test
-`test_is_aarch64_svc_recogniser` (`src/process_tests.rs`) guards the recogniser against
-the live encodings (`svc #imm` vs the `NOP`/`movz` seen at `ELR-4`).
+**valid pointer** (preserved by the guard) instead of being clobbered to an errno.
+
+**CONFIRMED — two independent clean from-scratch builds, both crash-free single passes:**
+
+| build (clean, `target/` wiped) | result | `[SPURIOUS-SVC]` recovered | `[WILD-DA]` |
+|---|---|---|---|
+| unguarded baseline | **crashed at 105/147** (`num-bigint-dig`) | — | 1 (the bug) |
+| guarded #1 | **147/147 `Finished`, single pass** | 2× | **0** |
+| guarded #2 (independent) | **147/147 `Finished` (26m40s), single pass** | 1× | **0** |
+
+Both guarded builds produced a valid 3,790,560-byte AArch64 ELF kernel. The guard fired
+and recovered in *each* run (run #2's catch: `nr=0 elr=0x30dce62c insn@elr-4=0xeb2963ff`
+(a `cmp`, not svc) `x0=0x3deae8e0` — valid pointer preserved), so the spurious-SVC
+condition is real and recurs ~1–2×/build, and the guard recovers it every time. **This is
+the first crash-free from-scratch self-host build of the kernel — the retry loop
+(`scripts/loop_selfhost_kernelbuild.py`) is no longer required for a clean pass.**
+Regression self-test `test_is_aarch64_svc_recogniser` (`src/process_tests.rs`, PASSES at
+boot) guards the recogniser against the live encodings (`svc #imm` vs the `NOP`/`movz`/
+`cmp` seen at `ELR-4`).
 
 > Follow-ups: (a) the guard is a robust *safety net* (like the JIT workaround) — the
 > deeper question of *which* path leaves a stable text page's I-cache stale under
