@@ -5,9 +5,17 @@ up. Detail docs: [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) (the full
 plan + §10 forward architecture), [PHASE01_BUILDRUMP.md](PHASE01_BUILDRUMP.md),
 [PHASE2_RUMPUSER.md](PHASE2_RUMPUSER.md), [PHASE3_KERNEL_TAP.md](PHASE3_KERNEL_TAP.md),
 [DEV_ZERO.md](DEV_ZERO.md).
+Post-M1 direction docs: [RUMP_SYSPROXY.md](RUMP_SYSPROXY.md) (**the committed next
+architecture** — per-box rump server), [RUMP_PLUS_HERD.md](../../../docs/RUMP_PLUS_HERD.md),
+[ARCHITECTURE_QUESTIONS.md](ARCHITECTURE_QUESTIONS.md) (unmodified-binary paths),
+[FRANKENLIBC_EVAL.md](FRANKENLIBC_EVAL.md) (parked). Demos:
+`acceptance/11_netbsd_rumpkernel_irc.md` (ssh-in + IRC), `acceptance/12_netbsd_binary_compatibility.md`.
 
-Goal (M1): run the NetBSD TCP/IP stack as a userspace rump kernel inside an Akuma
-`box`, DHCP an address, and `curl` the QEMU host IP through it.
+Goal: **M1 is DONE** (2026-06-22 — NetBSD stack in an Akuma box, DHCP + HTTP to the
+host; see "M1 ACHIEVED" below). Current target: a **shared-stack box** — ssh into a
+`--net` box over the NetBSD stack *and* run other networked programs (sic) on the
+same stack (acceptance/11), via a **per-box rump server (sysproxy)** — see
+RUMP_SYSPROXY.md.
 
 ---
 
@@ -38,7 +46,7 @@ Goal (M1): run the NetBSD TCP/IP stack as a userspace rump kernel inside an Akum
 | Phase 5 — `box open --net` / herd service spawns rump-net payload | ⏳ (M1 ran the payload by hand over SSH) |
 | NetBSD binary compat (pkgsrc) via per-process syscall table | 📋 future — `acceptance/12_netbsd_binary_compatibility.md` |
 
-Nothing is committed. Branch `netbsd-rump-kernel-attempt-0`.
+Committed on branch `netbsd-rump-kernel-attempt-0` (M1 + all session work as of 2026-06-22).
 
 ### 🏆 M1 ACHIEVED (2026-06-22): NetBSD stack in an Akuma box — DHCP + HTTP to the host
 
@@ -277,39 +285,36 @@ aarch64-linux-musl-gcc -O2 -static -o /tmp/test_init_akuma \
 
 ---
 
-## NEXT TASK — virtif backend + DHCP + socket, in the container
+## NEXT TASK — sysproxy Step 4: kernel-as-client. Full plan: RUMP_SYSPROXY.md
 
-Path #2: prove the TCP/IP path in the container (cheap to debug), then bring the
-known-good binary back to Akuma+herd. Progress so far:
+The committed architecture is a **per-box rump server process** that owns the
+stack + tap, with other in-box processes sharing it via rump **sysproxy**. End goal:
+Akuma's kernel is the sysproxy *client* (kernel-routes the box's AF_INET syscalls →
+unmodified in-box binaries: curl, sic, sshd). Validation target: a `stack=rump` box
+where `/bin/curl https://ifconfig.me` (the static curl+mbedTLS in `bootstrap/bin/curl`)
+returns a real answer over the NetBSD stack.
 
-- ✅ `librumpnet_virtif.a` built (`./docker-build-virtif.sh`). It contains the
-  kernel driver `if_virt.o` only and exports `rump_virtif_virt_deliverpkt` (RX).
-  It has **4 undefined backend symbols** the link must satisfy:
-  `rumpcomp_virt_{create,send,dying,destroy}` (these come from the backend, which
-  `-k`/`RUMPKERN_ONLY` deliberately skips — `Makefile.rump:143`). `VIRTIF_BASE=virt`
-  ⇒ ifname `"virt"`, so the interface to create is **`virt0`**.
-- ✅ `rumpuser_component_*` provided by our Rust rumpuser (the backend calls these
-  to step in/out of the rump scheduler).
+**Sysproxy progress (2026-06-23):**
+- ✅ **Step 1 — spike** (`docker-sysproxy-spike.sh`): NetBSD `rumpuser_sp.c`/`sp_common.c`
+  /`rumpuser_errtrans.c` compile + link against our Rust rumpuser; `rump_init()` still
+  boots. Our rumpuser now exports `rumpuser__hyp` (populated in `rumpuser_init`); the 8
+  `sp_*` stubs were removed. musl notes: `bsd-compat-headers`, `-DLIBRUMPUSER -D_KERNTYPES`,
+  a musl-tuned `rumpuser_config.h` (`-DRUMPUSER_CONFIG`). `sys/atomic.h` not needed.
+- ✅ **Step 2 — rump_server payload** (`rumpuser/rump_server.c`, `docker-build-rump-server.sh`):
+  14 MB static binary, `+ -lrumpkern_sysproxy`. Verified: `rump_init_server(unix:///…) -> 0`,
+  socket listens. (On Akuma it DHCPs over `/dev/net/tap0`; in-container DHCP warn-fails.)
+- ✅ **Step 3 — sharing via rumpclient** (`rumpuser/sp_client_test.c`,
+  `docker-sysproxy-client-test.sh`): a second process does `rump_sys_socket -> 3` against
+  the server's kernel over the unix socket. PASS. (srcsys symlinked to src/sys/sys.)
 
-Remaining:
-1. **Provide the backend** `rumpcomp_virt_{create,send,dying,destroy}`. For the
-   container proof, compile the **stock** `virtif_user.c` (Linux TUN/TAP) as a
-   standalone user object (needs `linux-headers` for `<linux/if_tun.h>`, and
-   `-DVIRTIF_BASE=virt -I.../libvirtif -I obj/dest.stage/usr/include`). For Akuma,
-   swap in our own `rumpcomp_user.c` over `/dev/net/tap0` (kernel side already done).
-2. **Write `test_net.c`** — after `rump_init()`: `rump_pub_netconfig_ifcreate("virt0")`
-   → `rump_pub_netconfig_ifsetlinkstr("virt0", "<devnum/tap>")` →
-   either `rump_pub_netconfig_ipv4_ifaddr_cidr` (static, simplest first) or
-   `rump_pub_netconfig_dhcp_ipv4_oneshot("virt0")` → `rump_sys_socket/connect/...`.
-   API is in `obj/dest.stage/usr/include/rump/netconfig.h` + `rump/rump_syscalls.h`.
-   Reference: `buildrump.sh/tests/`.
-3. **Run in container** with `--device /dev/net/tun --cap-add NET_ADMIN` (stock
-   backend opens `/dev/net/tun` + `TUNSETIFF`). Link like `docker-rumpuser-test.sh`
-   but add `-lrumpnet -lrumpnet_net -lrumpnet_netinet -lrumpnet_config` and the
-   virtif lib + the backend object.
-
-After networking is green in the container: Phase 5 (herd OCI-bundle service for
-the rump-net payload — herd wires the VFS/mounts), then Phase 6 (DHCP + curl = M1).
+**NEXT — Step 4 (kernel-as-client):** Akuma `net.rs`, for a `stack=rump` box, speaks the
+rumpclient/sysproxy wire (sp_common.c protocol; `rumpclient.c` is the reference) to the
+box's `rump_server` — forwarding the box processes' AF_INET syscalls + a per-fd handle
+map + blocking semantics. **Security (see RUMP_SYSPROXY.md "Security / hardening TODOs"):**
+validate all sp-wire input in the kernel (lengths/pointers/copyin sizes) — it is the new
+trust boundary; also verify per-box isolation (a box can't reach another box's server),
+and seal `rumpuser__hyp` (mprotect) before non-showcase use. Add kernel boot self-tests.
+Then Step 5: herd bundle starts rump_server + sets `stack=rump`; validate with curl.
 
 ---
 

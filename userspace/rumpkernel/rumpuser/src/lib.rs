@@ -71,6 +71,8 @@ extern "C" {
     fn pthread_join(t: PthreadT, retval: *mut *mut c_void) -> c_int;
     fn pthread_exit(retval: *mut c_void) -> !;
 
+    // Only referenced by the rumpuser_debug tid trace; keep the decl unconditionally.
+    #[allow(dead_code)]
     fn pthread_self() -> *mut c_void;
     fn pthread_key_create(key: *mut PthreadKey, destructor: *const c_void) -> c_int;
     fn pthread_setspecific(key: PthreadKey, value: *const c_void) -> c_int;
@@ -111,7 +113,6 @@ struct Timespec {
 const ENOMEM: c_int = 12;
 const EBUSY: c_int = 16;
 const ENXIO: c_int = 6;
-const ENOTSUP: c_int = 95; // Linux/musl EOPNOTSUPP/ENOTSUP
 
 // CLOCK_* (Linux/musl)
 const CLOCK_REALTIME: c_int = 0;
@@ -135,7 +136,8 @@ unsafe fn set_errno(e: c_int) {
 /// The hypervisor upcall table the rump kernel hands us at init. Stored for the
 /// scheduler-wrap lock paths (filled in later); kept verbatim.
 #[repr(C)]
-struct RumpHyperUp {
+#[derive(Clone, Copy)]
+pub struct RumpHyperUp {
     hyp_schedule: Option<extern "C" fn()>,
     hyp_unschedule: Option<extern "C" fn()>,
     hyp_backend_unschedule: Option<extern "C" fn(c_int, *mut c_int, *mut c_void)>,
@@ -153,6 +155,35 @@ struct RumpHyperUp {
 }
 
 static mut HYPERUP: *const RumpHyperUp = ptr::null();
+
+/// The C global the rump kernel's own C glue (and, post-Step-1, the in-tree
+/// sysproxy server `rumpuser_sp.c`/`sp_common.c`) read by value as
+/// `rumpuser__hyp.hyp_*`. In stock NetBSD this lives in `rumpuser.c`/`rumpfiber.c`;
+/// since our rumpuser is Rust, we export it here and populate it in `rumpuser_init`.
+///
+/// SECURITY TODO (see docs/RUMP_SYSPROXY.md "Security / hardening TODOs"): this is a
+/// function-pointer table in writable `.data`. It is write-once (set in
+/// `rumpuser_init`, read-only after), so before any non-showcase use it should be
+/// `mprotect()`-sealed read-only right after init to remove the post-init overwrite
+/// gadget. Acceptable as-is for the non-prod showcase; matches stock NetBSD posture.
+#[no_mangle]
+pub static mut rumpuser__hyp: RumpHyperUp = RumpHyperUp {
+    hyp_schedule: None,
+    hyp_unschedule: None,
+    hyp_backend_unschedule: None,
+    hyp_backend_schedule: None,
+    hyp_lwproc_switch: None,
+    hyp_lwproc_release: None,
+    hyp_lwproc_rfork: None,
+    hyp_lwproc_newlwp: None,
+    hyp_lwproc_curlwp: None,
+    hyp_syscall: None,
+    hyp_lwpexit: None,
+    hyp_execnotify: None,
+    hyp_getpid: None,
+    hyp_extra: [ptr::null_mut(); 8],
+};
+
 /// pthread TLS key holding the current lwp pointer (per host thread).
 static mut CURLWP_KEY: PthreadKey = 0;
 
@@ -164,7 +195,11 @@ pub unsafe extern "C" fn rumpuser_init(version: c_int, hyp: *const RumpHyperUp) 
         dprint(b"rumpuser_init: version mismatch\n");
         return 1;
     }
-    HYPERUP = hyp;
+    // Copy the upcall table by value into the exported C global (stock NetBSD
+    // does `rumpuser__hyp = *hyp;`), then point HYPERUP at our stable copy so the
+    // caller's hyp need not outlive init.
+    rumpuser__hyp = *hyp;
+    HYPERUP = core::ptr::addr_of!(rumpuser__hyp);
     // Allocate the curlwp TLS key once (init is single-threaded).
     if pthread_key_create(&mut CURLWP_KEY, ptr::null()) != 0 {
         return ENOMEM;
@@ -440,7 +475,7 @@ const RUMPUSER_MTX_SPIN: c_int = 0x01;
 const RUMPUSER_MTX_KMUTEX: c_int = 0x02;
 
 #[repr(C, align(8))]
-struct Mtx {
+pub struct Mtx {
     pm: [u8; 64],
     owner: *mut c_void,
     flags: c_int,
@@ -537,7 +572,7 @@ pub unsafe extern "C" fn rumpuser_mutex_owner(m: *mut Mtx, lp: *mut *mut c_void)
 // exclusively (or null), `readers` the shared-hold count. Mirrors NetBSD's own
 // librumpuser bookkeeping.
 #[repr(C, align(8))]
-struct Rw {
+pub struct Rw {
     prw: [u8; 64],
     writer: *mut c_void,
     readers: c_int,
@@ -645,7 +680,7 @@ pub unsafe extern "C" fn rumpuser_rw_held(enum_: c_int, rw: *mut Rw, held: *mut 
 // ── condvar ─────────────────────────────────────────────────────────────────
 
 #[repr(C, align(8))]
-struct Cv {
+pub struct Cv {
     pcv: [u8; 64],
     waiters: c_int,
 }
@@ -842,27 +877,13 @@ pub unsafe extern "C" fn rumpuser_daemonize_done(_error: c_int) -> c_int {
     0
 }
 
-// ── syscall proxy (sp_*) — STUBS (only used with the sysproxy faction) ────────
-
-#[no_mangle]
-pub unsafe extern "C" fn rumpuser_sp_init(_url: *const c_char, _a: *const c_char, _b: *const c_char, _c: *const c_char) -> c_int {
-    tr!(b"sp_init(STUB)");
-    ENOTSUP
-}
-#[no_mangle]
-pub unsafe extern "C" fn rumpuser_sp_copyin(_arg: *mut c_void, _raddr: *const c_void, _laddr: *mut c_void, _len: usize) -> c_int { tr!(b"sp_copyin(STUB)"); ENOTSUP }
-#[no_mangle]
-pub unsafe extern "C" fn rumpuser_sp_copyinstr(_arg: *mut c_void, _raddr: *const c_void, _laddr: *mut c_void, _len: *mut usize) -> c_int { tr!(b"sp_copyinstr(STUB)"); ENOTSUP }
-#[no_mangle]
-pub unsafe extern "C" fn rumpuser_sp_copyout(_arg: *mut c_void, _laddr: *const c_void, _raddr: *mut c_void, _len: usize) -> c_int { tr!(b"sp_copyout(STUB)"); ENOTSUP }
-#[no_mangle]
-pub unsafe extern "C" fn rumpuser_sp_copyoutstr(_arg: *mut c_void, _laddr: *const c_void, _raddr: *mut c_void, _len: *mut usize) -> c_int { tr!(b"sp_copyoutstr(STUB)"); ENOTSUP }
-#[no_mangle]
-pub unsafe extern "C" fn rumpuser_sp_anonmmap(_arg: *mut c_void, _howmuch: usize, _addr: *mut *mut c_void) -> c_int { tr!(b"sp_anonmmap(STUB)"); ENOTSUP }
-#[no_mangle]
-pub unsafe extern "C" fn rumpuser_sp_raise(_arg: *mut c_void, _signo: c_int) -> c_int { tr!(b"sp_raise(STUB)"); ENOTSUP }
-#[no_mangle]
-pub unsafe extern "C" fn rumpuser_sp_fini(_arg: *mut c_void) { tr!(b"sp_fini(STUB)"); }
+// ── syscall proxy (sp_*) ──────────────────────────────────────────────────────
+// The rumpuser_sp_* family is provided by the in-tree NetBSD sysproxy SERVER
+// (`src-netbsd/lib/librumpuser/rumpuser_sp.c`, which #includes `sp_common.c`),
+// compiled and linked alongside this staticlib (RUMP_SYSPROXY.md Step 1). The
+// former ENOTSUP stubs were removed once that source links against our base
+// hypercalls + the exported `rumpuser__hyp` global above. `rumpuser__errtrans`
+// (also needed by the server) is supplied by NetBSD's `rumpuser_errtrans.c`.
 
 // ── component (hypercall-backend ↔ rump scheduler bridge) ─────────────────────
 //
@@ -954,7 +975,7 @@ unsafe fn cstr<'a>(s: *const c_char) -> &'a [u8] {
     if s.is_null() {
         return &[];
     }
-    core::slice::from_raw_parts(s as *const u8, strlen(s))
+    core::slice::from_raw_parts(s, strlen(s))
 }
 
 /// Write a diagnostic to stderr (fd 2) without going through C variadics.

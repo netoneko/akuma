@@ -104,11 +104,12 @@ pub fn read_frame(buf: &mut [u8]) -> Option<usize> {
     guard.as_mut()?.read_frame(buf)
 }
 
-/// Blocking variant of [`read_frame`]: wait until a frame is available, then
-/// return it. Cooperative — re-polls the tap and yields the CPU to the scheduler
-/// between attempts (Akuma's net is poll-based, no RX IRQ), so the calling thread
-/// (the rump virtif RX kthread) sleeps efficiently instead of busy-waiting.
-/// Returns `None` only if interrupted, or if `timeout_us` elapses with no frame.
+/// Blocking variant of [`read_frame`]: wait until a frame is available, then return it.
+///
+/// Cooperative — re-polls the tap and yields the CPU to the scheduler between attempts
+/// (Akuma's net is poll-based, no RX IRQ), so the calling thread (the rump virtif RX
+/// kthread) sleeps efficiently instead of busy-waiting. Returns `None` only if
+/// interrupted, or if `timeout_us` elapses with no frame.
 pub fn read_frame_blocking(buf: &mut [u8], timeout_us: Option<u64>) -> Option<usize> {
     let rt = crate::runtime::runtime();
     let start = (rt.uptime_us)();
