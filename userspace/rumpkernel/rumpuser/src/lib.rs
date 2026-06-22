@@ -766,6 +766,85 @@ pub unsafe extern "C" fn rumpuser_sp_raise(_arg: *mut c_void, _signo: c_int) -> 
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_sp_fini(_arg: *mut c_void) { tr!(b"sp_fini(STUB)"); }
 
+// ── component (hypercall-backend ↔ rump scheduler bridge) ─────────────────────
+//
+// These are NOT part of the RUMPUSER_VERSION hypercall contract — they are the
+// helper ABI a `rumpcomp_user` packet backend (e.g. libvirtif's `virtif_user.c`,
+// or our own `/dev/net/tap0` glue) calls to step in and out of the rump CPU
+// scheduler around blocking host I/O and its receive kthread. NetBSD provides
+// them in `lib/librumpuser/rumpuser_component.c`; since our Rust rumpuser
+// replaces that C layer, we must provide them too — verbatim ports.
+//
+// `rumpkern_{un,}sched` (rumpuser_int.h) are thin inlines over the backend
+// schedule upcalls in the hyp table, so we inline them here directly.
+
+#[inline]
+unsafe fn rumpkern_unsched() -> c_int {
+    let mut nlocks: c_int = 0;
+    ((*HYPERUP).hyp_backend_unschedule.unwrap())(0, &mut nlocks, ptr::null_mut());
+    nlocks
+}
+
+#[inline]
+unsafe fn rumpkern_sched(nlocks: c_int) {
+    ((*HYPERUP).hyp_backend_schedule.unwrap())(nlocks, ptr::null_mut());
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rumpuser_component_unschedule() -> *mut c_void {
+    tr!(b"component_unschedule");
+    rumpkern_unsched() as isize as *mut c_void
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rumpuser_component_schedule(cookie: *mut c_void) {
+    tr!(b"component_schedule");
+    rumpkern_sched(cookie as isize as c_int);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rumpuser_component_kthread() {
+    tr!(b"component_kthread");
+    ((*HYPERUP).hyp_schedule.unwrap())();
+    ((*HYPERUP).hyp_lwproc_newlwp.unwrap())(0);
+    ((*HYPERUP).hyp_unschedule.unwrap())();
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rumpuser_component_curlwp() -> *mut c_void {
+    tr!(b"component_curlwp");
+    ((*HYPERUP).hyp_schedule.unwrap())();
+    let l = ((*HYPERUP).hyp_lwproc_curlwp.unwrap())();
+    ((*HYPERUP).hyp_unschedule.unwrap())();
+    l
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rumpuser_component_switchlwp(l: *mut c_void) {
+    tr!(b"component_switchlwp");
+    ((*HYPERUP).hyp_schedule.unwrap())();
+    ((*HYPERUP).hyp_lwproc_switch.unwrap())(l);
+    ((*HYPERUP).hyp_unschedule.unwrap())();
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rumpuser_component_kthread_release() {
+    tr!(b"component_kthread_release");
+    ((*HYPERUP).hyp_schedule.unwrap())();
+    ((*HYPERUP).hyp_lwproc_release.unwrap())();
+    ((*HYPERUP).hyp_unschedule.unwrap())();
+}
+
+/// Translate a host errno to a rump-kernel errno. NetBSD's librumpuser maps
+/// Linux→NetBSD here; on aarch64-linux-musl the low errno values we care about
+/// on backend error paths line up, so identity is correct enough for bring-up.
+/// (Revisit with a real table if a backend starts surfacing high errnos.)
+#[no_mangle]
+pub unsafe extern "C" fn rumpuser_component_errtrans(hosterr: c_int) -> c_int {
+    tr!(b"component_errtrans");
+    hosterr
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 /// Borrow a NUL-terminated C string as bytes (without the NUL).
