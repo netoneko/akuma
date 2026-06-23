@@ -62,6 +62,84 @@ akuma_sp_pthread_detach(pthread_t t)
 #define pthread_create akuma_sp_pthread_create
 #define pthread_detach akuma_sp_pthread_detach
 
+/*
+ * Cooperative mutex/cond redirect (fiber backend). NetBSD's rumpuser_sp.c uses
+ * raw pthread_mutex_t/pthread_cond_t — notably the COPYIN `waitresp` does a
+ * pthread_cond_wait. On the SINGLE OS thread of the fiber backend that real cond
+ * wait blocks the OS thread (a futex) and DEADLOCKS the cooperative scheduler: the
+ * worker fiber parks mid-syscall and the receiver fiber that would wake it can
+ * never run (a proxied `bind` then stalls to the kernel's read timeout → the DNS
+ * resolver fails). So route the locks/cvs to fiber wait-queues (akfiber_sp_* in
+ * fiber.rs), deciding at RUNTIME like pthread_create above. NetBSD source stays
+ * textually unmodified — the redirect lives here, applied before the #include.
+ */
+extern int akfiber_sp_mutex_init(void *);
+extern int akfiber_sp_mutex_lock(void *);
+extern int akfiber_sp_mutex_unlock(void *);
+extern int akfiber_sp_cond_init(void *);
+extern int akfiber_sp_cond_wait(void *, void *);
+extern int akfiber_sp_cond_signal(void *);
+extern int akfiber_sp_cond_broadcast(void *);
+extern int akfiber_sp_cond_destroy(void *);
+
+extern int __akuma_real_pthread_mutex_lock(pthread_mutex_t *)
+    __asm__("pthread_mutex_lock");
+extern int __akuma_real_pthread_mutex_unlock(pthread_mutex_t *)
+    __asm__("pthread_mutex_unlock");
+extern int __akuma_real_pthread_mutex_init(pthread_mutex_t *, const pthread_mutexattr_t *)
+    __asm__("pthread_mutex_init");
+extern int __akuma_real_pthread_cond_init(pthread_cond_t *, const pthread_condattr_t *)
+    __asm__("pthread_cond_init");
+extern int __akuma_real_pthread_cond_wait(pthread_cond_t *, pthread_mutex_t *)
+    __asm__("pthread_cond_wait");
+extern int __akuma_real_pthread_cond_signal(pthread_cond_t *)
+    __asm__("pthread_cond_signal");
+extern int __akuma_real_pthread_cond_broadcast(pthread_cond_t *)
+    __asm__("pthread_cond_broadcast");
+extern int __akuma_real_pthread_cond_destroy(pthread_cond_t *)
+    __asm__("pthread_cond_destroy");
+
+static int akuma_sp_mutex_lock(pthread_mutex_t *m) {
+	return rumpuser_akuma_cooperative() ? akfiber_sp_mutex_lock(m)
+	                                    : __akuma_real_pthread_mutex_lock(m);
+}
+static int akuma_sp_mutex_unlock(pthread_mutex_t *m) {
+	return rumpuser_akuma_cooperative() ? akfiber_sp_mutex_unlock(m)
+	                                    : __akuma_real_pthread_mutex_unlock(m);
+}
+static int akuma_sp_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *a) {
+	return rumpuser_akuma_cooperative() ? akfiber_sp_mutex_init(m)
+	                                    : __akuma_real_pthread_mutex_init(m, a);
+}
+static int akuma_sp_cond_init(pthread_cond_t *c, const pthread_condattr_t *a) {
+	return rumpuser_akuma_cooperative() ? akfiber_sp_cond_init(c)
+	                                    : __akuma_real_pthread_cond_init(c, a);
+}
+static int akuma_sp_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) {
+	return rumpuser_akuma_cooperative() ? akfiber_sp_cond_wait(c, m)
+	                                    : __akuma_real_pthread_cond_wait(c, m);
+}
+static int akuma_sp_cond_signal(pthread_cond_t *c) {
+	return rumpuser_akuma_cooperative() ? akfiber_sp_cond_signal(c)
+	                                    : __akuma_real_pthread_cond_signal(c);
+}
+static int akuma_sp_cond_broadcast(pthread_cond_t *c) {
+	return rumpuser_akuma_cooperative() ? akfiber_sp_cond_broadcast(c)
+	                                    : __akuma_real_pthread_cond_broadcast(c);
+}
+static int akuma_sp_cond_destroy(pthread_cond_t *c) {
+	return rumpuser_akuma_cooperative() ? akfiber_sp_cond_destroy(c)
+	                                    : __akuma_real_pthread_cond_destroy(c);
+}
+#define pthread_mutex_lock akuma_sp_mutex_lock
+#define pthread_mutex_unlock akuma_sp_mutex_unlock
+#define pthread_mutex_init akuma_sp_mutex_init
+#define pthread_cond_init akuma_sp_cond_init
+#define pthread_cond_wait akuma_sp_cond_wait
+#define pthread_cond_signal akuma_sp_cond_signal
+#define pthread_cond_broadcast akuma_sp_cond_broadcast
+#define pthread_cond_destroy akuma_sp_cond_destroy
+
 #include "rumpuser_sp.c"
 
 /*

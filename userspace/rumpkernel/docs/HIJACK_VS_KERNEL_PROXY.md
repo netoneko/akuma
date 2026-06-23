@@ -575,6 +575,20 @@ So: the thread-collapse + futex-storm-elimination are real and verified, but a
 *networked* fiber `rump_server` is blocked on the coupling below — confirmed, not
 theoretical.
 
+> **UPDATE (2026-06-24): RESOLVED — networked fiber `rump_server` works.** The
+> coupling below was fixed *without* the blocking-I/O offload thread. Two bugs:
+> (1) `rump_server.c`'s `for(;;) sleep(3600)` park blocked the one OS thread so the
+> serve fiber never sent its banner (handshake `errno 5`); (2) the real deadlock —
+> NetBSD's COPYIN `waitresp` does `pthread_cond_wait`, blocking the OS thread on a
+> futex so the receiver fiber can't wake the parked worker. Fix: `sp_serve_fd.c`
+> now redirects `pthread_mutex_*`/`pthread_cond_*` (not just `pthread_create`) to
+> cooperative fiber primitives (`akfiber_sp_*` in `fiber.rs`), runtime-gated on
+> `rumpuser_akuma_cooperative()`. **Result:** `curl http://example.com/` over the
+> proxied rump stack = **16.3 s on fiber vs 62.8 s pthread (~3.85×)**, `rump_server`
+> = **1 OS thread, PSTATS `clone=0 futex=0`**. The offload-thread design below is
+> no longer needed for correctness (it remains a possible latency optimization).
+> See `FIBER_HANDOFF.md` for the operational write-up + the Rust regression test.
+
 ### In-process (model C) networking under fiber — WORKING end-to-end (2026-06-24)
 
 The model-C path (`rumphttp`: rump linked in-process, the box's own backend over

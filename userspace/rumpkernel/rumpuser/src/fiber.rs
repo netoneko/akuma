@@ -721,6 +721,224 @@ pub unsafe extern "C" fn rumpuser_mutex_owner(m: *mut Mtx, lp: *mut *mut c_void)
     *lp = (*m).o;
 }
 
+// ── cooperative pthread-compat shims for the sysproxy C server ────────────────
+// NetBSD's `rumpuser_sp.c` uses raw `pthread_mutex_t`/`pthread_cond_t`. On the
+// single OS thread of the fiber backend a real `pthread_cond_wait` blocks the OS
+// thread (a futex) and DEADLOCKS the cooperative scheduler: a worker fiber parks
+// mid-`bind` in the COPYIN `waitresp`, and the receiver fiber that would wake it
+// can never run. These shims back each pthread object with a fiber wait-queue,
+// lazily allocated and stashed in the object's first word (`PTHREAD_*_INITIALIZER`
+// is all-zero → null → uninitialised). `sp_serve_fd.c` `#define`s the pthread
+// lock/cv calls to these at RUNTIME (cooperative? → here; else → real libc), so the
+// SAME object works against either backend. Host-side locks only — NO rump CPU
+// scheduling (unlike `rumpuser_mutex_*`). Akuma addition (derived from the
+// rumpfiber wait-queue primitives; NetBSD source stays unmodified).
+#[repr(C)]
+struct SpMtx {
+    waiters: List<Waiter>,
+    owner: *mut Thread,
+    depth: c_int,
+}
+
+#[repr(C)]
+struct SpCv {
+    waiters: List<Waiter>,
+}
+
+unsafe fn sp_mtx(p: *mut c_void) -> *mut SpMtx {
+    let slot = p as *mut *mut SpMtx;
+    if (*slot).is_null() {
+        let m = malloc(core::mem::size_of::<SpMtx>()) as *mut SpMtx;
+        ptr::write(
+            m,
+            SpMtx { waiters: List::new(), owner: ptr::null_mut(), depth: 0 },
+        );
+        *slot = m;
+    }
+    *slot
+}
+
+unsafe fn sp_cv(p: *mut c_void) -> *mut SpCv {
+    let slot = p as *mut *mut SpCv;
+    if (*slot).is_null() {
+        let c = malloc(core::mem::size_of::<SpCv>()) as *mut SpCv;
+        ptr::write(c, SpCv { waiters: List::new() });
+        *slot = c;
+    }
+    *slot
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn akfiber_sp_mutex_init(p: *mut c_void) -> c_int {
+    // Allocate the backing object now (in the caller's context). Statically
+    // initialised mutexes (PTHREAD_MUTEX_INITIALIZER) skip this and get a lazy
+    // alloc on first lock via sp_mtx() instead.
+    *(p as *mut *mut SpMtx) = ptr::null_mut();
+    let _ = sp_mtx(p);
+    0
+}
+
+#[no_mangle]
+// `owner` is cleared by another fiber (in unlock) while this one is parked in
+// wait() — clippy can't see the mutation across the cooperative yield.
+#[allow(clippy::while_immutable_condition)]
+pub unsafe extern "C" fn akfiber_sp_mutex_lock(p: *mut c_void) -> c_int {
+    let m = sp_mtx(p);
+    let cur = get_current();
+    while !(*m).owner.is_null() && (*m).owner != cur {
+        wait(&mut (*m).waiters, 0);
+    }
+    (*m).owner = cur;
+    (*m).depth += 1;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn akfiber_sp_mutex_unlock(p: *mut c_void) -> c_int {
+    let m = sp_mtx(p);
+    (*m).depth -= 1;
+    if (*m).depth <= 0 {
+        (*m).depth = 0;
+        (*m).owner = ptr::null_mut();
+        wakeup_one(&mut (*m).waiters);
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn akfiber_sp_cond_init(p: *mut c_void) -> c_int {
+    *(p as *mut *mut SpCv) = ptr::null_mut();
+    let _ = sp_cv(p);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn akfiber_sp_cond_wait(cvp: *mut c_void, mtxp: *mut c_void) -> c_int {
+    let c = sp_cv(cvp);
+    // Drop the mutex, park on the cv, then re-acquire. Atomic w.r.t. other fibers:
+    // nothing else runs between the unlock and the park until wait() schedule()s.
+    akfiber_sp_mutex_unlock(mtxp);
+    wait(&mut (*c).waiters, 0);
+    akfiber_sp_mutex_lock(mtxp);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn akfiber_sp_cond_signal(p: *mut c_void) -> c_int {
+    wakeup_one(&mut (*sp_cv(p)).waiters);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn akfiber_sp_cond_broadcast(p: *mut c_void) -> c_int {
+    wakeup_all(&mut (*sp_cv(p)).waiters);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn akfiber_sp_cond_destroy(p: *mut c_void) -> c_int {
+    let slot = p as *mut *mut SpCv;
+    if !(*slot).is_null() {
+        free(*slot as *mut c_void);
+        *slot = ptr::null_mut();
+    }
+    0
+}
+
+// ── tests (run on linux/arm64: the asm switch is ELF-style) ───────────────────
+// Built with `cargo test --features threads_fiber --target aarch64-unknown-linux-musl`
+// (`--no-run`), executed in a Docker arm64 container — see `test-fiber.sh`. Single
+// OS thread + global scheduler state ⇒ run with `--test-threads=1`. Fiber bodies
+// avoid std/TLS calls (fibers run with `tpidr_el0 == 0`); the lock backing objects
+// are pre-allocated from the main context via the eager `*_init`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::ffi::{c_char, c_int, c_void};
+
+    const ROUNDS: c_int = 5;
+
+    static mut SP_M: [usize; 8] = [0; 8]; // backs a pthread_mutex_t (1st word used)
+    static mut SP_C: [usize; 8] = [0; 8]; // backs a pthread_cond_t
+    static mut SP_TURN: c_int = 0;
+    static mut SP_ROUNDS: c_int = 0;
+
+    // The `unsafe` is required by older rustc (addr_of_mut! of a static mut) and
+    // a no-op on newer — allow the resulting unused-unsafe warning either way.
+    #[allow(unused_unsafe)]
+    fn m_ptr() -> *mut c_void {
+        unsafe { ptr::addr_of_mut!(SP_M) as *mut c_void }
+    }
+    #[allow(unused_unsafe)]
+    fn c_ptr() -> *mut c_void {
+        unsafe { ptr::addr_of_mut!(SP_C) as *mut c_void }
+    }
+
+    extern "C" fn sp_pinger(arg: *mut c_void) -> *mut c_void {
+        let me = arg as usize as c_int; // 0 or 1
+        unsafe {
+            for _ in 0..ROUNDS {
+                akfiber_sp_mutex_lock(m_ptr());
+                while SP_TURN != me {
+                    akfiber_sp_cond_wait(c_ptr(), m_ptr());
+                }
+                SP_ROUNDS += 1;
+                SP_TURN = if me == 0 { 1 } else { 0 };
+                akfiber_sp_cond_broadcast(c_ptr());
+                akfiber_sp_mutex_unlock(m_ptr());
+            }
+            rumpuser_thread_exit();
+        }
+    }
+
+    /// Cooperative pthread-shim mutex+condvar ping-pong on the fiber scheduler —
+    /// the regression test for the sysproxy COPYIN deadlock. If
+    /// `akfiber_sp_cond_wait` blocked the single OS thread (the bug), the partner
+    /// fiber could never run, so `SP_ROUNDS` would never reach the target and the
+    /// scheduler would idle-spin forever. Reaching `2*ROUNDS` proves `cond_wait`
+    /// yields cooperatively and each wake is delivered to the right fiber.
+    #[test]
+    fn sp_mutex_condvar_ping_pong() {
+        unsafe {
+            init_sched();
+            SP_TURN = 0;
+            SP_ROUNDS = 0;
+            akfiber_sp_mutex_init(m_ptr());
+            akfiber_sp_cond_init(c_ptr());
+
+            let mut p: *mut c_void = ptr::null_mut();
+            let mut q: *mut c_void = ptr::null_mut();
+            assert_eq!(
+                rumpuser_thread_create(
+                    sp_pinger,
+                    0 as *mut c_void,
+                    b"spP\0".as_ptr() as *const c_char,
+                    1,
+                    0,
+                    0,
+                    &mut p,
+                ),
+                0
+            );
+            assert_eq!(
+                rumpuser_thread_create(
+                    sp_pinger,
+                    1 as *mut c_void,
+                    b"spQ\0".as_ptr() as *const c_char,
+                    1,
+                    0,
+                    0,
+                    &mut q,
+                ),
+                0
+            );
+            rumpuser_thread_join(p);
+            rumpuser_thread_join(q);
+            assert_eq!(SP_ROUNDS, 2 * ROUNDS);
+        }
+    }
+}
+
 // ── rwlock ──────────────────────────────────────────────────────────────────
 #[repr(C)]
 pub struct Rw {

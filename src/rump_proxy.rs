@@ -19,8 +19,12 @@ use alloc::vec::Vec;
 /// EFAULT (NetBSD/Linux share it).
 const EFAULT: i32 = 14;
 /// Cap a single blocking read so a wedged server fails the request instead of
-/// hanging the boot before herd/SSH come up.
-const READ_TIMEOUT_US: u64 = 8_000_000;
+/// hanging the boot before herd/SSH come up. 30s: under the cooperative *fiber*
+/// rump_server, a proxied syscall needing a COPYIN callback (e.g. the DNS UDP
+/// `bind`) round-trips multiple legs at ~10ms cooperative-scheduling granularity,
+/// so a single syscall can take >10s — an 8s cap turned slow-but-working into a
+/// hard EIO. (The pthread server is event-driven and well under this.)
+const READ_TIMEOUT_US: u64 = 30_000_000;
 
 // ── per-box stack selection + dispatch instrumentation (Phase A) ───────────
 

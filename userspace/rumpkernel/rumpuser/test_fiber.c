@@ -35,6 +35,17 @@ extern void rumpuser_cv_init(void **cvp);
 extern void rumpuser_cv_wait(void *cv, void *m);
 extern void rumpuser_cv_signal(void *cv);
 
+/* Cooperative pthread-compat shims used by the sysproxy C server (fiber.rs). They
+ * take the address of the caller's pthread_mutex_t/pthread_cond_t storage and back
+ * it with a fiber wait-queue stashed in its first word (zeroed storage = uninit). */
+extern int akfiber_sp_mutex_init(void *m);
+extern int akfiber_sp_mutex_lock(void *m);
+extern int akfiber_sp_mutex_unlock(void *m);
+extern int akfiber_sp_cond_init(void *cv);
+extern int akfiber_sp_cond_wait(void *cv, void *m);
+extern int akfiber_sp_cond_signal(void *cv);
+extern int akfiber_sp_cond_broadcast(void *cv);
+
 #define RUMPUSER_LWP_SET     2
 #define RUMPUSER_CLOCK_RELWALL 0
 
@@ -87,6 +98,37 @@ pinger(void *arg)
 	rumpuser_thread_exit();
 }
 
+/* ── Test C: the sysproxy server's pthread mutex+condvar shims ──
+ * Mirrors Test B but drives the akfiber_sp_* primitives — the exact ones
+ * rumpuser_sp.c uses for the COPYIN waitresp that deadlocked the OS thread under
+ * fiber. If akfiber_sp_cond_wait blocked the single OS thread (the bug), the
+ * partner fiber could never run and sp_rounds would hang at 0. Reaching
+ * 2*ROUNDS deterministically proves cond_wait yields and the wake is delivered.
+ * Storage is plain zeroed bytes (≥8); the shim lazily inits via the first word. */
+static char sp_m[64];   /* stands in for pthread_mutex_t (shim uses 1st word) */
+static char sp_c[64];   /* stands in for pthread_cond_t */
+static int sp_turn;
+static int sp_rounds;
+
+static void *
+sp_pinger(void *arg)
+{
+	int me = (int)(intptr_t)arg; /* 0 or 1 */
+	rumpuser_curlwpop(RUMPUSER_LWP_SET, (void *)(intptr_t)(200 + me));
+	for (int r = 0; r < ROUNDS; r++) {
+		akfiber_sp_mutex_lock(sp_m);
+		while (sp_turn != me)
+			akfiber_sp_cond_wait(sp_c, sp_m);
+		printf("[C%c] round %d\n", me ? 'Q' : 'P', r);
+		fflush(stdout);
+		sp_rounds++;
+		sp_turn = !me;
+		akfiber_sp_cond_broadcast(sp_c);
+		akfiber_sp_mutex_unlock(sp_m);
+	}
+	rumpuser_thread_exit();
+}
+
 int
 main(void)
 {
@@ -125,7 +167,22 @@ main(void)
 	printf("[B] ping-pong done, rounds=%d (expect %d)\n", cv_rounds, 2 * ROUNDS);
 	fflush(stdout);
 
-	if (cv_rounds == 2 * ROUNDS) {
+	/* ── Test C: sysproxy pthread-shim mutex + condvar ping-pong ── */
+	printf("== Test C: sysproxy akfiber_sp_* mutex + condvar ping-pong ==\n");
+	fflush(stdout);
+	akfiber_sp_mutex_init(sp_m);
+	akfiber_sp_cond_init(sp_c);
+	sp_turn = 0;
+	sp_rounds = 0;
+	void *sp, *sq;
+	rumpuser_thread_create(sp_pinger, (void *)(intptr_t)0, "spP", 1, 0, 0, &sp);
+	rumpuser_thread_create(sp_pinger, (void *)(intptr_t)1, "spQ", 1, 0, 0, &sq);
+	rumpuser_thread_join(sp);
+	rumpuser_thread_join(sq);
+	printf("[C] sp ping-pong done, rounds=%d (expect %d)\n", sp_rounds, 2 * ROUNDS);
+	fflush(stdout);
+
+	if (cv_rounds == 2 * ROUNDS && sp_rounds == 2 * ROUNDS) {
 		printf("ALL TESTS PASSED\n");
 		return 0;
 	}

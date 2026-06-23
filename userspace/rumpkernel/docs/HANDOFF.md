@@ -19,8 +19,10 @@ AND `sic` holding a live IRC session on `#rumpkernel` (OFTC) over the NetBSD sta
 See "M2 ACHIEVED" below + RUMP_SYSPROXY.md ("Phase B" / IRC). **DNS now works over
 the rump stack (2026-06-23)** — `curl http://example.com` resolves + fetches HTTP 200
 through NetBSD (`bind` + `sendto`-with-dest + `recvmsg` marshaling added to
-`src/rump_proxy.rs`). Current target: drive down per-syscall latency (the one real
-weakness) + robustness (task #9) + boot self-tests.
+`src/rump_proxy.rs`). **Latency — ✅ MAJOR WIN (2026-06-24): the cooperative FIBER
+backend makes curl-over-rump ~3.85× faster (16.3s vs 62.8s) on 1 OS thread instead
+of 19, futex storm gone. See `FIBER_HANDOFF.md`.** Remaining: residual ~1s/syscall
+(event-driven channel wakeup is the next lever) + robustness (task #9) + boot self-tests.
 
 ---
 
@@ -52,6 +54,7 @@ weakness) + robustness (task #9) + boot self-tests.
 | Rump SDK tarball (`bootstrap/archives/rump-sdk-aarch64-musl.tar.gz` → VM `/archives`) | ✅ `package-sdk.sh` (48 MB, 154 archives) |
 | Akuma integration (libakuma, build-std core) | ✅ proven sufficient — stock host link runs on Akuma as-is |
 | ⚠️ Per-syscall latency (~1s round-trip; rump pthread kthreads on 1 core) | ⏳ open — see "M2" + RUMP_SYSPROXY.md |
+| **🏆 FIBER backend: curl over rump, ~3.85× faster, 1 OS thread** (`16.3s` vs `62.8s`; `clone=0 futex=0`) | ✅ **2026-06-24** — see `FIBER_HANDOFF.md` |
 | ⚠️ Robustness: uninterruptible proxy syscalls, `kill` invalid-pid, client-slot wedge | ⏳ open — project task #9 |
 | acceptance/11 — actual sshd on the rump stack | ⏳ (sic capstone met; sshd is the bigger protocol layer) |
 | NetBSD binary compat (pkgsrc) via per-process syscall table | 📋 future — `acceptance/12_netbsd_binary_compatibility.md` |
@@ -330,19 +333,21 @@ Driving is **synchronous on the calling thread** (approach 1 — copyin/copyout 
 
 The path WORKS; the weaknesses are performance + robustness, not correctness:
 
-1. **Latency (~1s per proxied syscall round-trip)** — the rump kernel's ~19 pthread
-   kthreads contend on a single core. **The heartbeat/herd theory is a DEAD END
-   (disproven 2026-06-23 — see `docs/RUMP_LATENCY_SLEEP_FIX.md`):** lowering `hz`
-   100→20 (heartbeat 5×↓, idle syscalls halved, verified in PSTATS) did NOT cut curl
-   latency — it got *worse* (29.1s→32.7s); `cv_broadcast`→`cv_signal` was worse still
-   (35.1s). Both reverted. Earlier dead-end too: scheduler wakeup-locality hint (no
-   help, GATED OFF in `threading/mod.rs` `WAKEUP_LOCALITY_HINT=false`). So the cost is
-   NOT in `rump_server`/the rump scheduler. **Untried real lever:** instrument the
-   *Akuma-side* round-trip (`src/rump_proxy.rs`: channel read/write, `ProcMem`
-   copyin/copyout, Akuma scheduler hops) + the real TCP RTTs — that's where the 3–4s
-   lives. **Fiber backend is BLOCKED** — `rumpfiber_sp.c` stubs the sysproxy server
-   (`abort()`), needs a from-scratch sp-server port. (The sic recv-drain patch
-   sidestepped per-op latency for sic by reading bursts in ~1 round-trip.)
+1. **Latency — ✅ MAJOR WIN via the FIBER backend (2026-06-24): ~3.85× faster.**
+   The cost was the ~19 pthread kthreads contending on one core (single-vCPU futex
+   thundering-herd). The **cooperative fiber backend** (one OS thread + userspace
+   scheduler, cargo feature `threads_fiber`) collapses them to 1 thread and kills the
+   futex storm. **Now WORKING end-to-end**: `box use rumpnet -i /bin/curl -sS
+   http://example.com/` → HTTP 200 in **16.3s on fiber vs 62.8s pthread (3/3 stable)**;
+   `rump_server` = **1 OS thread (vs 19)**, PSTATS **clone=0 futex=0 (vs 20/2606)**.
+   The "fiber backend is BLOCKED" note is OBSOLETE — the sp server now runs under
+   fiber (NOT the old `rumpfiber_sp.c` stub; our `sp_serve_fd.c` + cooperative
+   `pthread_mutex`/`pthread_cond` redirect to `akfiber_sp_*` fixed the COPYIN
+   `pthread_cond_wait` deadlock). **Full write-up + how-to: `docs/FIBER_HANDOFF.md`.**
+   Earlier dead-ends (for the record): heartbeat/`hz` 100→20 made it *worse*
+   (`RUMP_LATENCY_SLEEP_FIX.md`); scheduler wakeup-locality hint (gated off). Residual
+   under fiber: ~1s/proxied-syscall from poll/yield + ~10ms rump-clock granularity →
+   event-driven channel wakeup is the next lever (curl 16s, not sub-second).
 2. **Robustness (project task #9):** box procs stuck in a proxied syscall are
    UNINTERRUPTIBLE (the proxy channel read never checks `is_current_interrupted`/pending
    signals), `kill <pid>` of a box proc returns "invalid pid" (box/pid-namespace), and

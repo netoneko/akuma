@@ -25,7 +25,12 @@
 //! Build with `--features rumpuser_debug` to trace every hypercall (and the
 //! memory sizes/pointers) to stderr — used to localise the bring-up crash.
 
-#![no_std]
+// `no_std` for the shipped staticlib; under `cargo test` we pull in `std` so the
+// default test harness (and its own panic handler) are available — the fiber
+// cooperative-primitive tests run as a normal Rust test binary (see fiber.rs
+// `mod tests`). The hand-rolled aarch64 asm is ELF-style, so tests run on
+// linux/arm64 (cross-build `--no-run`, execute in a Docker arm64 container).
+#![cfg_attr(not(test), no_std)]
 #![allow(non_camel_case_types)]
 #![allow(clippy::missing_safety_doc)]
 #![allow(static_mut_refs)]
@@ -33,7 +38,9 @@
 use core::ffi::{c_char, c_int, c_long, c_void};
 use core::ptr;
 
-/// Panic = abort (no unwinding in a freestanding syscall-glue staticlib).
+/// Panic = abort (no unwinding in a freestanding syscall-glue staticlib). Under
+/// `cfg(test)` std supplies the panic handler, so this one must stand down.
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     unsafe { abort() }
