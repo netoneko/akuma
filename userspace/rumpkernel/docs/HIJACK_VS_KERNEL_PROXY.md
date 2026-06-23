@@ -554,16 +554,72 @@ only the rumpuser backend differs), `ps` in a fresh VM:**
 So the fiber backend collapses every rump kthread onto one OS thread in the real
 NetBSD rump kernel. Core fiber work (tasks 1–5) is **done and verified**.
 
-### Next (the real long pole): blocking-I/O offload thread
+### Full fiber `rump_server` — built, run, and the coupling CONFIRMED empirically
 
-Confirmed blocker for a *working networked* fiber `rump_server`: the sysproxy
+The fiber `rump_server` was swapped in as `/bin/rump_server` and run two ways:
+
+- **Without a tap (`RUMP_NIC=0`)**: `rump_init` runs, kthread herd collapses
+  (`ps`: PID + **1** thread = the sp pthread, vs ~19 pthread), sysproxy reaches
+  `[RUMP-SP] proxy ready`, PSTATS `clone=1`, **no `futex` line**,
+  `in_kernel=131ms` (vs the pthread server's `283050ms`). The herd/futer storm is
+  gone.
+- **With the tap (`RUMP_NIC=1`, the real networked path)**: `rump_init` runs and
+  the herd still collapses, but during the sysproxy handshake the boot log shows
+  **`[signal] tkill(tid=86, sig=6)`** (SIGABRT on tid 86 — the sp-server's lone
+  pthread) → `[RUMP-SP] handshake failed errno=5` → `rumpnet exited`. **No
+  networking.** Root cause = the predicted coupling: the sp pthread is a *second*
+  OS thread calling into the **lock-free** fiber rump kernel (wrong `curlwp` /
+  raced lock state → a rump `KASSERT` → `abort()`).
+
+So: the thread-collapse + futex-storm-elimination are real and verified, but a
+*networked* fiber `rump_server` is blocked on the coupling below — confirmed, not
+theoretical.
+
+### In-process (model C) networking under fiber — WORKING end-to-end (2026-06-24)
+
+The model-C path (`rumphttp`: rump linked in-process, the box's own backend over
+`/dev/net/tap0`, **no sysproxy**) now runs fully under the fiber backend. Two fixes
+in `rumpcomp_tap.c` (our file, not NetBSD source):
+
+1. **RX thread via `rumpuser_thread_create`, not `pthread_create`** — so it's a
+   *fiber* under the fiber backend (a pthread under the default). Fixes the
+   cross-thread race (a raw 2nd OS thread calling `VIF_DELIVERPKT` into the
+   lock-free fiber kernel → KASSERT/abort). With just this, `rump_init` + `virt0`
+   create cleanly, but the stack then *froze*: the RX fiber's **blocking**
+   `read(tap0)` parked the one OS thread before the DHCP DISCOVER could go out.
+2. **Cooperative non-blocking RX under fiber** — new backend hooks
+   `rumpuser_akuma_cooperative()` / `rumpuser_akuma_yield()` (in `src/lib.rs` +
+   `src/fiber.rs`): the fiber build opens the tap `O_NONBLOCK` and yields to the
+   scheduler on `EAGAIN` (the pthread build keeps its blocking read — no M2
+   regression). This lets the rest of the rump kernel run on the one OS thread.
+
+Result, `RUMP_NIC=1`, `/bin/rumphttp 10.0.2.2 8000` over SSH:
+```
+dhcp: virt0: adding IP address 10.0.2.16/24
+dhcp: virt0: adding default route via 10.0.2.2
+RUMPHTTP: connect 10.0.2.2:8000 -> 0
+RUMPHTTP: sent 56-byte GET -> 56
+HTTP/1.0 200 OK ... (full response)
+RUMPHTTP: PASS — fetched 767 bytes over the NetBSD rump stack (DHCP + TCP via /dev/net/tap0)
+[VIRTIF STATS] tx=77 pkts rx=8 pkts
+```
+**DHCP + TCP connect + HTTP GET all work on the single-OS-thread cooperative fiber
+stack.** So fiber networking is proven for the model-C / no-sysproxy path — the one
+the "do we even need sysproxy" pondering favors.
+
+Still open: the **sysproxy** `rump_server` path (the SIGABRT above) — its sp-server
+uses `pthread_create` in NetBSD source we don't own, so it needs the offload-thread
+treatment (below) rather than the in-file fix that worked for the tap backend.
+
+### Next (the real long pole, for the sysproxy path): blocking-I/O offload thread
+
+The blocker for a *working networked* fiber `rump_server`: the sysproxy
 server calls **`pthread_create` directly in 3 sites** (`sp_serve_fd.c:131`,
 `rumpuser_sp.c:943,1374`) and does **blocking channel reads**; the tap RX
 (`rumpcomp_tap.c`) does a **blocking `read` on `/dev/net/tap0`**. On the single
 cooperative OS thread, (a) a blocking read freezes *all* fibers, and (b) an
 sp-spawned pthread is a *second* OS thread that calls into the rump kernel and
-races the **lock-free** fiber scheduler globals. So the full fiber `rump_server`
-links but cannot run correctly yet.
+races the **lock-free** fiber scheduler globals → the SIGABRT above.
 
 **Design (decided 2026-06-24): a dedicated blocking-I/O OS thread.** Quarantine
 all blocking host I/O (tap0 read/write, the sp channel) onto one extra OS thread.
@@ -582,6 +638,37 @@ ONE I/O thread whose only shared state is a queue + a wakeup fd. A separate
 *thread* shares the address space for zero-copy buffer handoff. This is the
 standard "cooperative core + blocking-I/O offload" pattern and is what unblocks
 M2's shared stack (and the tap RX) under fiber.
+
+### Open ponderings (deferred — decide after model-C networking works)
+
+- **Do we still need sysproxy at all?** Sysproxy's job is *sharing* (many box
+  processes, one stack + one identity) and unmodified static binaries serviced at
+  the syscall boundary — NOT performance. Fiber doesn't replace that need; it
+  removes what made sysproxy *slow* (the herd), so it *rescues* sysproxy. What
+  fiber newly makes cheap is **in-process model C** (rump linked into the box,
+  ~1 thread instead of ~19) — which lets a *dedicated single-payload box* skip
+  sysproxy entirely. So: keep sysproxy where you need >1 process on one stack;
+  use model C where a box is one payload. Fiber widens the menu, doesn't collapse
+  it. (Model C's other limits — one-rump-per-tap, LD_PRELOAD on musl-stdio — are
+  unchanged by fiber; see next.)
+- **`rump_server` as the box's PID 1 + dynamic loading (idea, 2026-06-24) — could
+  remove the need for sysproxy entirely (for dynamic payloads).** Make the (fiber,
+  cheap) `rump_server` the box's PID 1 / rump host, and have it **dynamically load
+  the box payload into its own address space** (it acts as the loader; the dynamic
+  linker / an `LD_PRELOAD` hijack wires the payload's `socket`/`connect`/… straight
+  to the *in-process* rump stack). Because payload and rump now share one address
+  space, socket ops are **direct function calls** — this is model C, so there is
+  **no sysproxy channel at all** (no separate process, no remote-syscall proxy).
+  Fiber is what makes the pid-1 rump host cheap (~1 thread). Clean lifecycle too:
+  pid 1 dies → the box's networking dies.
+  - **Caveat (the catch):** this needs **dynamic loading**. It does **not** work
+    for unmodified **static** musl binaries — there's no loader to inject into, and
+    musl-static stdio bypasses the PLT (the original M1 hijack gotcha). So the split
+    is: *dynamic* payloads → pid-1 host + in-process rump, **no sysproxy**;
+    *unmodified static* binaries → still need sysproxy (kernel syscall
+    interception at the trap boundary, the one path that needs no preload).
+  - Worth exploring: a box that standardizes on dynamic payloads could drop
+    sysproxy completely and run everything in-process against a pid-1 fiber rump.
 
 ## Source pointers (fiber)
 

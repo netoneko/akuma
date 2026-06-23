@@ -562,6 +562,19 @@ unsafe fn dprint(msg: &[u8]) {
     write(2, msg.as_ptr() as *const c_void, msg.len());
 }
 
+/// Cooperative short yield for a backend poll loop (e.g. rumpcomp_tap.c's RX on
+/// EAGAIN): park this fiber ~1ms and let every other fiber run. This is what lets
+/// a non-blocking tap read coexist with the rest of the rump kernel on one OS
+/// thread (a *blocking* read here would freeze all fibers). Pure fiber yield — no
+/// rump-CPU interaction (the caller is in host/unscheduled context).
+#[no_mangle]
+pub unsafe extern "C" fn rumpuser_akuma_yield() {
+    let cur = get_current();
+    (*cur).wakeup_time = now() + 1; // 1ms
+    clear_runnable(cur);
+    schedule();
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // rumpuser_* hypercall exports (fiber backend)
 // ══════════════════════════════════════════════════════════════════════════════

@@ -434,6 +434,31 @@ pub unsafe extern "C" fn rumpuser_getrandom(buf: *mut c_void, buflen: usize, _fl
     0
 }
 
+// ── Akuma backend-capability hooks (not part of the rumpuser contract) ────────
+// Let a packet backend (rumpcomp_tap.c) adapt its blocking I/O to the backend:
+// the fiber backend runs all rump kthreads on ONE OS thread, so a blocking tap
+// read would freeze every fiber — there it must poll non-blocking + cooperatively
+// yield. The pthread backend keeps a real blocking read (its RX is its own thread).
+
+/// 1 if rump kthreads are cooperative fibers on one OS thread; 0 for pthread.
+#[no_mangle]
+pub extern "C" fn rumpuser_akuma_cooperative() -> c_int {
+    if cfg!(feature = "threads_fiber") {
+        1
+    } else {
+        0
+    }
+}
+
+/// Short yield for a backend's cooperative poll loop. pthread build: a real 1ms
+/// sleep (the fiber build overrides this with a cooperative scheduler yield).
+#[cfg(not(feature = "threads_fiber"))]
+#[no_mangle]
+pub unsafe extern "C" fn rumpuser_akuma_yield() {
+    let req = Timespec { tv_sec: 0, tv_nsec: 1_000_000 };
+    nanosleep(&req, ptr::null_mut());
+}
+
 // ── pthread threading/sync/curlwp backend ────────────────────────────────────
 // The default backend: rump kthreads are 1:1 host pthreads; locks/cv/rw map to
 // pthread primitives. Wrapped in a module so the entire block is swapped out for

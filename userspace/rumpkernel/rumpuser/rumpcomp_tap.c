@@ -39,6 +39,30 @@
 
 #define TAPDEV "/dev/net/tap0"
 
+/*
+ * Create the RX thread via the rumpuser hypercall, NOT pthread_create directly.
+ * Under the default (pthread) rumpuser this still maps to a host pthread; under
+ * the cooperative (fiber) rumpuser it becomes a fiber on the single OS thread —
+ * which is REQUIRED there, because rcvthread calls rumpuser_component_* /
+ * VIF_DELIVERPKT into the rump kernel: a raw 2nd OS thread (pthread_create) would
+ * race the fiber backend's lock-free scheduler state (wrong curlwp → KASSERT).
+ * (declared here; provided by our Rust rumpuser staticlib.)
+ */
+extern int rumpuser_thread_create(void *(*f)(void *), void *arg, const char *thrname,
+    int joinable, int pri, int cpuidx, void **cookie);
+extern int rumpuser_thread_join(void *cookie);
+
+/*
+ * Backend-capability hooks (provided by our Rust rumpuser). Under the fiber
+ * backend all rump kthreads share ONE OS thread, so a BLOCKING tap read would
+ * freeze every fiber (the RX fiber parks the OS thread before the stack can even
+ * send a DHCP DISCOVER → deadlock). There we open the tap non-blocking and yield
+ * cooperatively on EAGAIN. Under pthread (cooperative==0) we keep the blocking
+ * read (the RX is its own host thread; no change to the shipped M2 path).
+ */
+extern int rumpuser_akuma_cooperative(void);
+extern void rumpuser_akuma_yield(void);
+
 static volatile unsigned long g_tx_pkts, g_tx_bytes, g_rx_pkts, g_rx_bytes;
 static int g_trace = -1;
 
@@ -80,7 +104,7 @@ struct virtif_user {
 	struct virtif_sc *viu_virtifsc;
 	int viu_fd;
 	int viu_dying;
-	pthread_t viu_rcvthr;
+	void *viu_rcvcookie;   /* rumpuser_thread_create cookie (pthread or fiber) */
 	char viu_rcvbuf[9018];
 };
 
@@ -93,13 +117,16 @@ rcvthread(void *aaargh)
 
 	rumpuser_component_kthread();
 
-	/* The tap fd is opened BLOCKING: read() parks this thread in the Akuma kernel
-	 * (cooperative yield, no busy-wait) until a frame arrives. A short read (<1)
-	 * means interrupted — just re-block. We run in host context here (no rump CPU
-	 * held), so blocking does not stall the rump kernel's other threads. */
+	/* pthread backend: the tap fd is BLOCKING; read() parks THIS host thread until
+	 * a frame arrives (no rump CPU held, so other rump threads keep running).
+	 * fiber backend: the fd is non-blocking; on EAGAIN we cooperatively yield so
+	 * the rest of the rump kernel (and the DHCP path) runs on the one OS thread. */
+	int coop = rumpuser_akuma_cooperative();
 	while (!viu->viu_dying) {
 		nn = read(viu->viu_fd, viu->viu_rcvbuf, sizeof(viu->viu_rcvbuf));
 		if (nn < 1) {
+			if (coop)
+				rumpuser_akuma_yield();
 			continue;
 		}
 		iov.iov_base = viu->viu_rcvbuf;
@@ -134,7 +161,7 @@ VIFHYPER_CREATE(const char *devstr, struct virtif_sc *vif_sc, uint8_t *enaddr,
 	if (viu == NULL) { rv = errno; goto err1; }
 	viu->viu_virtifsc = vif_sc;
 
-	viu->viu_fd = open(TAPDEV, O_RDWR);
+	viu->viu_fd = open(TAPDEV, O_RDWR | (rumpuser_akuma_cooperative() ? O_NONBLOCK : 0));
 	if (viu->viu_fd == -1) {
 		fprintf(stderr, "rumpcomp_tap: can't open %s: %s\n",
 		    TAPDEV, strerror(errno));
@@ -142,7 +169,8 @@ VIFHYPER_CREATE(const char *devstr, struct virtif_sc *vif_sc, uint8_t *enaddr,
 		goto err2;
 	}
 
-	if ((rv = pthread_create(&viu->viu_rcvthr, NULL, rcvthread, viu)) != 0)
+	if ((rv = rumpuser_thread_create(rcvthread, viu, "tap-rx", 1, 0, -1,
+	    &viu->viu_rcvcookie)) != 0)
 		goto err3;
 
 	rumpuser_component_schedule(cookie);
@@ -202,7 +230,7 @@ VIFHYPER_DESTROY(struct virtif_user *viu)
 {
 	void *cookie = rumpuser_component_unschedule();
 	viu->viu_dying = 1;
-	pthread_join(viu->viu_rcvthr, NULL);
+	rumpuser_thread_join(viu->viu_rcvcookie);
 	close(viu->viu_fd);
 	free(viu);
 	rumpuser_component_schedule(cookie);
