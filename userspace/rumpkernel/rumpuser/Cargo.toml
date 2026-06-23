@@ -12,6 +12,11 @@ name = "rumpuser_akuma"
 crate-type = ["staticlib"]
 
 [features]
+# Fiber (cooperative) threading is the DEFAULT backend (2026-06-24): curl over the
+# proxied rump stack is ~3.85x faster on 1 OS thread vs the pthread herd, with no
+# futex storm (see docs/FIBER_HANDOFF.md). Build the legacy pthread backend with
+# `--no-default-features`.
+default = ["threads_fiber"]
 # TEMP bring-up tracing of every hypercall (+ memory size/align/ptr) to stderr.
 rumpuser_debug = []
 # Silence rump's boot output (RUMP_VERBOSE defaults to "0"). Off by default: we
@@ -21,9 +26,9 @@ rump_quiet = []
 # Cooperative (fiber) threading backend instead of pthread. Collapses the ~19
 # rump kthreads onto one OS thread + a userspace cooperative scheduler (a Rust
 # port of NetBSD's rumpfiber.c on top of an aarch64 context switch), killing the
-# single-vCPU thundering-herd latency. OFF by default — the pthread backend is
-# the shipped M2 path. aarch64-only (uses an inline context-switch). See
-# docs/HIJACK_VS_KERNEL_PROXY.md "fiber" sections.
+# single-vCPU thundering-herd latency. ON by default (see `default` above); use
+# `--no-default-features` for the legacy pthread backend. aarch64-only (uses an
+# inline context-switch). See docs/HIJACK_VS_KERNEL_PROXY.md "fiber" sections.
 threads_fiber = []
 
 # Dependency-free on purpose: builds offline in the build container (no registry

@@ -7,9 +7,10 @@ the operational "where we are / what's next / how to run it".
 ## TL;DR
 
 - We ported NetBSD rump's threading to a **cooperative fiber backend** (one OS
-  thread + a userspace scheduler) in our Rust `rumpuser`, behind the off-by-default
-  cargo feature **`threads_fiber`**. Collapses the ~19 rump kthreads → 1 OS thread,
-  killing the single-vCPU futex thundering-herd.
+  thread + a userspace scheduler) in our Rust `rumpuser`. It is now the **DEFAULT**
+  cargo feature **`threads_fiber`** (2026-06-24; `--no-default-features` for the
+  legacy pthread backend). Collapses the ~19 rump kthreads → 1 OS thread, killing
+  the single-vCPU futex thundering-herd.
 - **WORKS & verified:** the cooperative scheduler; `rump_init`; thread-collapse;
   **full in-process (model-C) networking** (`rumphttp`); AND — as of **2026-06-24**
   — the **sysproxy `rump_server` networked path end-to-end**: a `stack=rump` box
@@ -21,8 +22,7 @@ the operational "where we are / what's next / how to run it".
   **`clone=0 futex=0` (vs `clone=20 futex=2606`)**. Same workload, same box.
 - **NEXT:** event-driven channel wakeup to shave the residual per-syscall latency
   (still ~1s/proxied-syscall from the poll/yield + ~10ms rump-clock granularity);
-  Phase 5 herd/box `--net` auto-spawn ergonomics; revisit the 30s kernel read
-  timeout now that the deadlock is gone (8s would do).
+  Phase 5 herd/box `--net` auto-spawn ergonomics.
 
 ## What's DONE and verified
 
@@ -111,9 +111,6 @@ RUMP_NIC=1 MEMORY=512M scripts/cargo_runner.sh target/aarch64-unknown-none/relea
   clock granularity), so curl is 16 s not sub-second. Event-driven channel wakeup
   (wake the server's poll on a kernel pipe-write instead of ~tick polling) is the
   next lever.
-- **Kernel read timeout** (`src/rump_proxy.rs` `READ_TIMEOUT_US`) was bumped 8s→30s
-  while diagnosing the deadlock; now that the deadlock is fixed (per-syscall ~1 s)
-  8 s would be plenty — revisit / make configurable.
 - Phase 5 herd/box `--net` auto-spawn ergonomics.
 
 ## Files
@@ -126,10 +123,9 @@ Key files (the 2026-06-24 networked-sysproxy fix touches the ★ ones — UNCOMM
 - `rumpuser/rump_server.c` ★ — fiber-cooperative park loop (was `sleep(3600)`).
 - `rumpuser/src/lib.rs` ★ — `#![cfg_attr(not(test), no_std)]` + gated panic handler
   so the crate's Rust tests build; `rumpuser_akuma_cooperative()`/`_yield()` hooks.
-- `src/rump_proxy.rs` ★ (kernel) — `READ_TIMEOUT_US` 8s→30s (diagnostic; revisit).
 - `rumpuser/test-fiber.sh` ★ — Rust-test runner (rust-lld cross-build + Docker arm64).
 - `rumpuser/test_fiber.c` ★ — Test C added (sp mutex/cond ping-pong via `akfiber_sp_*`).
-- `rumpuser/Cargo.toml` — `threads_fiber` feature.
+- `rumpuser/Cargo.toml` ★ — `threads_fiber` is now the DEFAULT feature.
 - `rumpuser/rumpcomp_tap.c` — fiber RX (thread + cooperative read).
 - `docs/HIJACK_VS_KERNEL_PROXY.md` — analysis + results.
 
