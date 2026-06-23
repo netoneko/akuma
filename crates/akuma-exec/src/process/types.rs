@@ -168,6 +168,13 @@ pub enum FileDescriptor {
     /// when true it returns `EAGAIN` — POSIX device-read semantics, so the rump
     /// virtif RX thread can do a plain blocking `read()` instead of busy-polling.
     Tap { nonblock: bool },
+    /// A socket living in a `stack=rump` box's NetBSD `rump_server`. The box
+    /// process sees a normal low-numbered fd; the kernel proxy forwards this
+    /// fd's socket syscalls over the box's sysproxy channel, translating the box
+    /// fd ⇄ the server's `rump_fd`. `nonblock` mirrors the requested socket type
+    /// bit (the proxy keeps the rump socket blocking and emulates nonblock).
+    /// Unconditional (like `Tap`) so non-rump builds still match exhaustively.
+    RumpSocket { rump_fd: i32, nonblock: bool },
     TimerFd(u32),
     EpollFd(u32),
     PidFd(u32),

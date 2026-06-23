@@ -129,6 +129,7 @@ impl ProcFilesystem {
             FileDescriptor::DevZero => String::from("/dev/zero"),
             FileDescriptor::DevDsp => String::from("/dev/dsp"),
             FileDescriptor::Tap { .. } => String::from("/dev/net/tap0"),
+            FileDescriptor::RumpSocket { rump_fd, .. } => format!("socket:[rump:{rump_fd}]"),
             FileDescriptor::Stdin => String::from("/dev/stdin"),
             FileDescriptor::Stdout => String::from("/dev/stdout"),
             FileDescriptor::Stderr => String::from("/dev/stderr"),

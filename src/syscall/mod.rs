@@ -618,13 +618,20 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     let need_timing = track_time || crate::config::PROC_SYSCALL_LOG_ENABLED;
     let t0 = if need_timing { crate::timer::uptime_us() } else { 0 };
 
-    // Instrumentation (Phase A): trace a `stack=rump` box's socket-family
-    // syscalls so we can confirm the dispatch decision before routing them to
-    // the rump_server proxy. Non-breaking — falls through to normal dispatch.
+    // For a `stack=rump` box, the proxy intercepts socket-family syscalls (and
+    // read/write/close on rump-owned fds) and forwards them to the box's
+    // rump_server. `Some(r)` short-circuits the normal smoltcp dispatch with the
+    // proxied result; `None` falls through unchanged (the common case, incl. all
+    // non-rump boxes — a single relaxed atomic load). It also emits the
+    // `[RUMP-SP]` trace.
     #[cfg(feature = "rump")]
-    crate::rump_proxy::trace_box_syscall(syscall_num, args);
+    let rump_result = crate::rump_proxy::intercept_box_syscall(syscall_num, args);
+    #[cfg(not(feature = "rump"))]
+    let rump_result: Option<u64> = None;
 
-    let result = match syscall_num {
+    let result = match rump_result {
+        Some(r) => r,
+        None => match syscall_num {
         nr::EXIT => proc::sys_exit(args[0] as i32),
         nr::READ => fs::sys_read(args[0], args[1], args[2] as usize),
         nr::WRITE => fs::sys_write(args[0], args[1], args[2] as usize),
@@ -894,6 +901,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
                 args[0], args[1], args[2]);
             ENOSYS
         }
+        },
     };
 
     akuma_exec::threading::set_thread_current_syscall(!0u64);
