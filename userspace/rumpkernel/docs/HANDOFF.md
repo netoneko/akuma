@@ -11,11 +11,14 @@ architecture** — per-box rump server), [RUMP_PLUS_HERD.md](../../../docs/RUMP_
 [FRANKENLIBC_EVAL.md](FRANKENLIBC_EVAL.md) (parked). Demos:
 `acceptance/11_netbsd_rumpkernel_irc.md` (ssh-in + IRC), `acceptance/12_netbsd_binary_compatibility.md`.
 
-Goal: **M1 is DONE** (2026-06-22 — NetBSD stack in an Akuma box, DHCP + HTTP to the
-host; see "M1 ACHIEVED" below). Current target: a **shared-stack box** — ssh into a
-`--net` box over the NetBSD stack *and* run other networked programs (sic) on the
-same stack (acceptance/11), via a **per-box rump server (sysproxy)** — see
-RUMP_SYSPROXY.md.
+Goal: **M1 DONE** (2026-06-22 — NetBSD stack in an Akuma box, DHCP + HTTP to the host).
+**🏆 M2 DONE (2026-06-23) — the SHARED-STACK box via kernel-as-sysproxy-client:**
+unmodified static binaries in a `stack=rump` box have their AF_INET routed by the
+KERNEL to a shared boxed `rump_server`, validated end-to-end with **`curl` (HTTPS-by-IP)
+AND `sic` holding a live IRC session on `#rumpkernel` (OFTC) over the NetBSD stack**.
+See "M2 ACHIEVED" below + RUMP_SYSPROXY.md ("Phase B" / IRC). Current target:
+drive down per-syscall latency (the one real weakness) + robustness (task #9) + the
+DNS path (UDP/recvmsg) + boot self-tests.
 
 ---
 
@@ -39,14 +42,23 @@ RUMP_SYSPROXY.md.
 | Kernel: **blocking `read()`** on `/dev/net/tap0` (`Tap{nonblock}`, no busy-wait) | ✅ `read_frame_blocking`; self-test updated |
 | 🏆 **M1 — DHCP + HTTP to the host, rump in an Akuma box** | ✅ **DONE 2026-06-22** (`rumphttp` in a `RUMP_NIC=1` box) |
 | **Inbound TCP server over rump, reachable from the host** | ✅ **2026-06-22** (`rumpserver.c`; host `:2223`→rump `:22`, banner+echo) |
-| acceptance/11 — actual sshd on the rump stack | ⏳ next (transport proven; need the SSH *protocol* layer) |
+| **🏆 M2 — kernel-as-sysproxy-client: unmodified binary's AF_INET → shared boxed rump_server** | ✅ **DONE 2026-06-23** |
+| **`curl` HTTPS-by-IP over rump** (`-H Host:ifconfig.me http://34.160.111.145` → `87.71.13.205`) | ✅ **2026-06-23** |
+| **`sic` IRC: live `#rumpkernel` session on OFTC over rump** (acceptance/11 capstone) | ✅ **2026-06-23** (`163.61.26.35:6667`) |
+| Phase 5 — herd autostarts `rumpnet` box (`--net --fd 3`, kernel attaches sysproxy channel) | ✅ **2026-06-23** (herd OWNS the rump_server; `restart=false`) |
 | Rump SDK tarball (`bootstrap/archives/rump-sdk-aarch64-musl.tar.gz` → VM `/archives`) | ✅ `package-sdk.sh` (48 MB, 154 archives) |
-| Capstone demo: clone+compile sic, IRC `#rumpkernel` over the NetBSD stack | 📋 `acceptance/11_netbsd_rumpkernel_irc.md` (target) |
 | Akuma integration (libakuma, build-std core) | ✅ proven sufficient — stock host link runs on Akuma as-is |
-| Phase 5 — `box open --net` / herd service spawns rump-net payload | ⏳ (M1 ran the payload by hand over SSH) |
+| ⚠️ Per-syscall latency (~1s round-trip; rump pthread kthreads on 1 core) | ⏳ open — see "M2" + RUMP_SYSPROXY.md |
+| ⚠️ Robustness: uninterruptible proxy syscalls, `kill` invalid-pid, client-slot wedge | ⏳ open — project task #9 |
+| acceptance/11 — actual sshd on the rump stack | ⏳ (sic capstone met; sshd is the bigger protocol layer) |
 | NetBSD binary compat (pkgsrc) via per-process syscall table | 📋 future — `acceptance/12_netbsd_binary_compatibility.md` |
 
-Committed on branch `netbsd-rump-kernel-attempt-0` (M1 + all session work as of 2026-06-22).
+Branch `netbsd-rump-kernel-attempt-0`. **The M2 kernel/herd/sic changes are UNCOMMITTED** (the
+user commits): kernel (`src/rump_proxy.rs`, `src/syscall/{proc,mod,poll}.rs`,
+`crates/akuma-rump/src/{sysproxy,syscall_translation}.rs`, `src/syscall/net.rs`,
+`crates/akuma-exec/.../types.rs` `RumpSocket`, the gated scheduler tweak in
+`threading/mod.rs`), herd (`rumpnet.conf` + `restart` flag), and the `sic` submodule
+(`userspace/rumpkernel/sic` recv-drain patch, uncommitted in the submodule).
 
 ### 🏆 M1 ACHIEVED (2026-06-22): NetBSD stack in an Akuma box — DHCP + HTTP to the host
 
@@ -285,36 +297,59 @@ aarch64-linux-musl-gcc -O2 -static -o /tmp/test_init_akuma \
 
 ---
 
-## NEXT TASK — sysproxy Step 4: kernel-as-client. Full plan: RUMP_SYSPROXY.md
+## 🏆 M2 ACHIEVED (2026-06-23): kernel-as-sysproxy-client — curl + IRC over rump
 
-The committed architecture is a **per-box rump server process** that owns the
-stack + tap, with other in-box processes sharing it via rump **sysproxy**. End goal:
-Akuma's kernel is the sysproxy *client* (kernel-routes the box's AF_INET syscalls →
-unmodified in-box binaries: curl, sic, sshd). Validation target: a `stack=rump` box
-where `/bin/curl https://ifconfig.me` (the static curl+mbedTLS in `bootstrap/bin/curl`)
-returns a real answer over the NetBSD stack.
+Sysproxy Steps 1–3 (spike / rump_server payload / rumpclient sharing) and the
+transport-shape proof were already done; **M2 finished the kernel-as-client and
+validated it end-to-end with two real unmodified binaries.** Architecture (decided
+this session): **herd OWNS the one `rump_server` process** (`rumpnet.conf`:
+`command=/bin/rump_server`, `args=--net --fd 3`, `stack=rump`, `restart=false`); herd
+calls `SET_BOX_STACK` (syscall 324) before spawning, and when `sys_spawn_ext` sees that
+spawn it calls `rump_proxy::attach_server`, which installs the kernel pipe pair on the
+server's fd 3 (before it runs) and handshakes IN A KTHREAD. Then `handle_syscall` →
+`rump_proxy::intercept_box_syscall` forwards a `stack=rump` box process's socket-family
+syscalls (+ read/write/readv/writev/close on a `RumpSocket` fd) over the channel via
+`akuma_rump::sysproxy::Client`, marshaled by `syscall_translation` + `ProcMem` (user-VA
+copyin/copyout + sockaddr Linux↔NetBSD). New fd type `FileDescriptor::RumpSocket`.
+Driving is **synchronous on the calling thread** (approach 1 — copyin/copyout hit
+`current` VA); the kthread is only setup/handshake.
 
-**Sysproxy progress (2026-06-23):**
-- ✅ **Step 1 — spike** (`docker-sysproxy-spike.sh`): NetBSD `rumpuser_sp.c`/`sp_common.c`
-  /`rumpuser_errtrans.c` compile + link against our Rust rumpuser; `rump_init()` still
-  boots. Our rumpuser now exports `rumpuser__hyp` (populated in `rumpuser_init`); the 8
-  `sp_*` stubs were removed. musl notes: `bsd-compat-headers`, `-DLIBRUMPUSER -D_KERNTYPES`,
-  a musl-tuned `rumpuser_config.h` (`-DRUMPUSER_CONFIG`). `sys/atomic.h` not needed.
-- ✅ **Step 2 — rump_server payload** (`rumpuser/rump_server.c`, `docker-build-rump-server.sh`):
-  14 MB static binary, `+ -lrumpkern_sysproxy`. Verified: `rump_init_server(unix:///…) -> 0`,
-  socket listens. (On Akuma it DHCPs over `/dev/net/tap0`; in-container DHCP warn-fails.)
-- ✅ **Step 3 — sharing via rumpclient** (`rumpuser/sp_client_test.c`,
-  `docker-sysproxy-client-test.sh`): a second process does `rump_sys_socket -> 3` against
-  the server's kernel over the unix socket. PASS. (srcsys symlinked to src/sys/sys.)
+**Validated:**
+- `box use rumpnet -i /bin/curl -sS -H Host:ifconfig.me http://34.160.111.145` →
+  `87.71.13.205` over the rump stack (TCP path: socket/connect/getsockname/getsockopt
+  /setsockopt/sendto/recvfrom).
+- `box use rumpnet -i /bin/sic -h 163.61.26.35 -p 6667 -n netoneko` → full IRC
+  registration + **live `#rumpkernel` session on OFTC** (acceptance/11 capstone).
+  Required `readv`/`writev` marshaling (sic uses stdio) + `poll`/`select`-on-RumpSocket
+  (MSG_PEEK probe) + a `sic` recv-drain patch (vendored: `userspace/rumpkernel/sic`).
 
-**NEXT — Step 4 (kernel-as-client):** Akuma `net.rs`, for a `stack=rump` box, speaks the
-rumpclient/sysproxy wire (sp_common.c protocol; `rumpclient.c` is the reference) to the
-box's `rump_server` — forwarding the box processes' AF_INET syscalls + a per-fd handle
-map + blocking semantics. **Security (see RUMP_SYSPROXY.md "Security / hardening TODOs"):**
-validate all sp-wire input in the kernel (lengths/pointers/copyin sizes) — it is the new
-trust boundary; also verify per-box isolation (a box can't reach another box's server),
-and seal `rumpuser__hyp` (mprotect) before non-showcase use. Add kernel boot self-tests.
-Then Step 5: herd bundle starts rump_server + sets `stack=rump`; validate with curl.
+## NEXT TASK — drive down latency + robustness (M2 weaknesses). Plan: RUMP_SYSPROXY.md
+
+The path WORKS; the weaknesses are performance + robustness, not correctness:
+
+1. **Latency (~1s per proxied syscall round-trip)** — root cause: the rump kernel's
+   ~19 **pthread** kthreads contend on a single core (each round-trip waits on the
+   scheduler; PSTATS shows them blocked in futex, woken by the 100Hz heartbeat). Tried:
+   a scheduler wakeup-locality hint (no help, GATED OFF in `threading/mod.rs`
+   `WAKEUP_LOCALITY_HINT=false`). **Fiber backend is BLOCKED** — `rumpfiber_sp.c` stubs
+   out the sysproxy server (`abort()`), so fiber needs a from-scratch sp-server port.
+   Untried lever: lower the rump kernel `hz` (set the `hz` global from `rump_server.c`
+   BEFORE `rump_init` — `thetick` in `intr.c:doclock` is computed once at thread start;
+   nothing reassigns `hz`) to cut heartbeat churn. (The sic recv-drain patch sidestepped
+   it for sic by reading bursts in ~1 round-trip instead of per-byte.)
+2. **Robustness (project task #9):** box procs stuck in a proxied syscall are
+   UNINTERRUPTIBLE (the proxy channel read never checks `is_current_interrupted`/pending
+   signals), `kill <pid>` of a box proc returns "invalid pid" (box/pid-namespace), and
+   the single serialized `BoxProxy.client` slot means one wedged proc blocks ALL others
+   (they spin in `with_client`). Only reboot clears it. Fix: interrupt/timeout the proxy
+   read (return EINTR), reclaim the client slot from a dead holder, fix box-pid kill.
+3. **DNS path (UDP):** curl's own DNS uses `socket(DGRAM)`/`bind`/`sendto`/`recvmsg` —
+   not yet marshaled (so use raw IPs for now). Add UDP + `bind` + `recvmsg`/`sendmsg`.
+4. **Kernel boot self-tests** for the proxy path (project policy — task #6).
+5. **Security/hardening** (RUMP_SYSPROXY.md): sp-wire bounds-checks, seal `rumpuser__hyp`
+   (mprotect), per-box isolation self-tests, channel-fd private to rump_server.
+6. **Cleanup:** the `[RUMP-SP]` connect/transfer/iov debug prints are still in (gate them);
+   `/dev/net/tap0` reset-on-close (workaround #5) so a box restarts without reboot.
 
 ---
 

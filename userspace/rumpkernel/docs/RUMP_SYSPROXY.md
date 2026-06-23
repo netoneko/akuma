@@ -222,9 +222,16 @@ The in-process backend gives only one networked payload per box.
      (server replies)→`writev` PONGs, all proxied to rumpnet. ~135s, ~4.3 KB.
    - Connect details first seen: `erbium.libera.chat NOTICE *** Checking Ident /
      Looking up your hostname / Couldn't look up your hostname / No Ident response`
-     (the rDNS/ident failures are expected for the SLIRP-NAT'd rump IP; Libera
+     (the rDNS/ident failures are expected for the SLIRP-NAT'd rump IP; the server
      proceeds). To connect interactively: `box use rumpnet -i /bin/sic -h <ip> -p
      6667 -n <nick>`, then `:j #chan`.
+   - ✅ **IRC WORKS END-TO-END on OFTC** (`irc.oftc.net` = `163.61.26.35` /
+     `172.104.164.108`, plaintext 6667) — register → `:j #rumpkernel` → live channel
+     session, all interactive over the NetBSD rump stack. (`#rumpkernel` is on OFTC,
+     not Libera; the channel itself is essentially defunct/empty now, but that's
+     irrelevant — the *stack path* is proven.) This is the acceptance/11 capstone: a
+     separately-compiled IRC client, in a `stack=rump` box, holding a live session on
+     a real internet IRC network entirely over the boxed NetBSD TCP/IP stack.
    - **Two enablers added for sic:**
      - **`readv`/`writev` marshaling** (Linux 65/66 → NetBSD 120/121). sic uses
        `fdopen`/`FILE*`, so musl stdio flushes/reads via `writev`/`readv`, NOT
