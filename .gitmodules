@@ -20,3 +20,7 @@
 [submodule "userspace/rumpkernel/sic"]
 	path = userspace/rumpkernel/sic
 	url = https://github.com/netoneko/sic.git
+[submodule "userspace/rumpkernel/src-netbsd"]
+	path = userspace/rumpkernel/src-netbsd
+	url = https://github.com/netoneko/src-netbsd.git
+	branch = akuma-integration

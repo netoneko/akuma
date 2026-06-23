@@ -1,5 +1,45 @@
 # Rump sysproxy latency — why the kthreads "spin" and the plan to fix it
 
+> ## ⛔ DEAD END — hypothesis DISPROVEN (2026-06-23)
+>
+> **The heartbeat/thundering-herd hypothesis below was implemented, measured, and
+> falsified. Do not pursue it again.** Steps 1 (lower `hz`) and 2 (`cv_broadcast`→
+> `cv_signal`) were built and A/B-tested in-VM against the live `curl`-over-rump path
+> (`box use rumpnet -i /bin/curl -sS -H Host:ifconfig.me http://34.160.111.145`, same
+> host, `MEMORY=1024M RUMP_NIC=1`, returns the IP every time):
+>
+> | Config | `hz` | CPU-release wake | curl avg |
+> |---|---|---|---|
+> | **Baseline (unpatched)** | 100 | `cv_broadcast` | **29.1 s** (29.0–29.3) |
+> | Both patches (Step 1+2) | 20 | `cv_signal` | 32.7 s (31.5–33.3) |
+> | Step 2 only | 100 | `cv_signal` | 35.1 s (33.6–38.4, n=6) |
+>
+> **Both levers REGRESS latency; neither helps.** Step 1 *mechanically* worked — at
+> `hz=20` the heartbeat dropped 5× (`clock_gettime` 103/s→24/s in PSTATS) and the
+> rump_server idle syscall rate halved (210/s→110/s) — yet curl latency did not
+> improve, it got *worse*. So the 100 Hz heartbeat and the kthread thundering-herd
+> are **not** the dominant cost. Step 2 (`cv_signal`) is actively harmful (+6 s at
+> equal `hz`): forcing one-at-a-time baton hand-off (and, in the lost-wakeup-safe
+> variant, taking the scheduler mutex on *every* CPU release) serializes the curl
+> hot path worse than broadcast's wake-all.
+>
+> **Where the time actually is:** ~29–35 s for a handful of proxied syscalls ≈ 3–4 s
+> each — but that cost lives in the **synchronous round-trip through the Akuma-kernel
+> sysproxy channel + Akuma-side scheduling + real TCP RTTs to the internet**, none of
+> which the rump heartbeat or herd touches. This matches the earlier dead-end
+> ("scheduler wakeup-locality hint — no help", `threading/mod.rs`).
+>
+> **Lesson:** the plan's own **Step 0 gate** ("numbers match the model → proceed;
+> they don't → re-investigate before touching the stack") was the right call and
+> would have caught this. The next real lever is to instrument the *Akuma-side*
+> proxy round-trip (`src/rump_proxy.rs`: channel read/write, `ProcMem` copyin/copyout,
+> scheduler hops), **not** anything inside `rump_server`. The patches were reverted;
+> only the `src-netbsd` submodule wiring was kept.
+>
+> The original plan is preserved below for the record.
+
+---
+
 **Context:** M2 works but each proxied syscall costs ~0.8–4 s; full curl ~26 s
 (`RUMP_SYSPROXY.md` "B-OUTCOME", `HANDOFF.md` "NEXT TASK"). `ps` shows the
 `rump_server`'s ~19 rump kthreads as `STATE running, SYSCALL -` (runnable in

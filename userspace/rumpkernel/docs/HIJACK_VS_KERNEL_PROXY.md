@@ -195,3 +195,333 @@ Per `HANDOFF.md` "NEXT TASK" — fix the *real* bottleneck instead:
 - `src/rump_proxy.rs` — model A kernel-side interception + per-box proxy.
 - `docs/RUMP_SYSPROXY.md` "B-OUTCOME" + `docs/HANDOFF.md` "NEXT TASK" — the
   latency root-cause analysis this assessment rests on.
+
+---
+
+# Scope: compiling the rump kernel in "fiber mode"
+
+**Question (2026-06-23):** Could we build the NetBSD rump kernel in *fiber* mode
+(`rumpfiber.c` — ucontext green threads, ~1 OS thread instead of ~19 pthreads) to
+kill the single-vCPU thundering-herd that dominates M2 latency? "I know we'd have
+to add some patches — what's the scope?"
+
+## TL;DR
+
+The latency win is real and structural — fiber collapses the ~19 contending rump
+kthreads to one cooperative thread, removing the 100 Hz heartbeat herd at its
+source (see `RUMP_LATENCY_SLEEP_FIX.md` Step 3). **But the framing "compile the
+NetBSD kernel in fiber mode" doesn't match our tree, and that changes the whole
+estimate.** Two facts decide it:
+
+1. **There is no NetBSD kernel to recompile for fiber.** Pthread-vs-fiber is a
+   property of **librumpuser**, *not* the rump kernel libraries. We build the
+   kernel libs with `-k` (kernel only) and the default **hypercall** curlwp scheme
+   — which is exactly what fiber's `Makefile` enforces (`RUMP_CURLWP=hypercall`,
+   lines 33–36 of `src-netbsd/lib/librumpuser/Makefile`). So `librumpkern`,
+   `librumpnet`, etc. **do not change**. The work is entirely in the hypercall
+   layer.
+
+2. **In our tree the hypercall layer is our Rust `rumpuser`, not NetBSD's C.**
+   `RUMPUSER_THREADS=fiber` selects NetBSD's `rumpfiber.c` + `rumpfiber_sp.c` —
+   which would *replace our entire Rust `rumpuser/src/lib.rs`* (all 59 hypercalls,
+   plus the `clock_sleep` / scheduler-wrap fixes we landed 2026-06-22). So "turn on
+   fiber" is not a build flag for us; it's an *implementation swap or rewrite* of
+   the layer we own.
+
+**And the dominant cost in either path is the same single item:** the **sysproxy
+server must be re-architected to *yield* instead of *block*** under one OS thread.
+NetBSD never finished this — `rumpfiber_sp.c` is **all stubs** (`rumpuser_sp_init`
+returns 0, `rumpuser_sp_copyin/out/anonmmap/raise` all `abort()`). Our entire
+shipped M2 (model A: kernel = sysproxy client, `rump_server` = sysproxy server,
+shared NetBSD stack) **depends on that server**. Fiber as-shipped-by-NetBSD =
+no sp server = no shared stack = M2 broken.
+
+So: a genuine structural latency win, gated behind the one piece of work NetBSD
+itself left undone, plus a decision about whether to keep our Rust investment.
+
+## The two real options (not "flip a flag")
+
+### Option 1 — adopt NetBSD's C `rumpfiber.c` wholesale (`RUMPUSER_THREADS=fiber`)
+
+Drop our Rust `rumpuser`, build librumpuser from `rumpfiber.c` + `rumpfiber_bio.c`
++ `rumpfiber_sp.c`.
+
+- **Pro:** `rumpfiber.c` is a complete, upstream-tested cooperative scheduler —
+  thread_create/exit/join, mutex/rw/cv on wait-queues, curlwp, clock_sleep, all
+  done (≈22 hypercalls, ucontext `swapcontext`, 64 KB mmap'd fiber stacks,
+  round-robin with wakeup timers). We'd inherit it for free.
+- **Con — we throw away the Rust layer** and every fix encoded in it (the
+  `clock_sleep` CPU-release, the contended-mutex/cv unschedule discipline, the
+  FUTEX/abs-timeout correctness work). Re-validation from scratch.
+- **Con — ucontext dependency.** `rumpfiber.c` switches via
+  `getcontext`/`makecontext`/`swapcontext` and allocates stacks with `mmap`. musl
+  ships these (`ucontext.h` is in our sysroot) and our kernel has the signal
+  syscalls musl's `swapcontext` leans on (`src/syscall/signal.rs`:
+  sigaltstack/rt_sigprocmask), **but swapcontext has never been exercised on Akuma
+  aarch64** — must be de-risked with a standalone test before trusting it.
+- **Con — the sp blocker (below) still applies**, and now in C we don't control.
+
+### Option 2 — make *our* Rust `rumpuser` cooperative (keep the Rust)
+
+Keep `rumpuser/src/lib.rs`; reimplement only the threading/sync primitives from
+pthread-backed to single-OS-thread cooperative green threads.
+
+- **Pro:** keeps our investment and our fixes; the `component_*` bridge and
+  `rumpkern_unsched`/`rumpkern_sched` upcalls are already backend-abstracted and
+  would survive unchanged. Lets us keep linking NetBSD's *working* `rumpuser_sp.c`
+  (which we already link against our hypercalls) rather than the stubbed
+  `rumpfiber_sp.c`.
+- **Con — real rewrite.** `thread_create` → green-thread spawn (ucontext or a Rust
+  context-switch); `cv_wait`/`cv_signal`/`cv_broadcast`, `mutex_enter`,
+  `rw_enter` → wait-queues + a cooperative scheduler instead of
+  `pthread_cond_wait`/`pthread_mutex_*`. This is exactly the logic `rumpfiber.c`
+  already contains — so Option 2 is largely "port `rumpfiber.c`'s scheduler to
+  Rust," which raises the question of why not just take Option 1's C.
+
+**The honest read:** Option 2's only durable advantage over Option 1 is keeping
+NetBSD's *non-stubbed* `rumpuser_sp.c` server — but that server is **threaded and
+blocking**, so it can't run as-is on one cooperative OS thread either. Which lands
+both options on the same gate:
+
+## The gate (THE scope): a cooperative sysproxy server
+
+Under one OS thread, **any blocking read in the sp server blocks every fiber**,
+including the fibers that would produce the reply. The sp server must be turned
+inside-out into a yield-on-I/O event loop:
+
+- channel reads/writes (`copyin`/`copyout`/the request dispatch) must **yield to
+  the fiber scheduler** when they'd block, and resume when the fd is ready;
+- the per-client request handling that NetBSD parallelizes with threads must become
+  cooperative tasks driven by that loop.
+
+This is the "from-scratch sp-server port" called out in `HANDOFF.md` NEXT TASK #1,
+`RUMP_LATENCY_SLEEP_FIX.md` Step 3, and `RUMP_SYSPROXY.md` "Future optimizations"
+— and it's precisely what the `abort()` stubs in `rumpfiber_sp.c` represent:
+upstream rump shipped fiber *without* sysproxy on purpose, because the two models
+fight. There is no existing code to copy for this; it's the genuine net-new work.
+
+> Escape hatch worth noting: fiber + **model C (in-process rump)** sidesteps the sp
+> server entirely — no cross-process hop, so no sp wire to make cooperative (this
+> doc's earlier point that fiber "is also the cleanest enabler for a fast model-C").
+> But model C gives up the shared stack (per-process DHCP lease, the one-rump-per-tap
+> limit, the musl-stdio hijack gap) — i.e. it abandons M2's whole reason to exist.
+> If a fiber sp-server is too costly, "fiber + single-payload model-C box" is the
+> fallback that still banks the thread-collapse win for a *dedicated* relay/proxy
+> process.
+
+## Effort buckets (rough)
+
+| Piece | Option 1 (C rumpfiber) | Option 2 (Rust cooperative) |
+|---|---|---|
+| Threading/sync primitives | free (upstream) | **rewrite** (≈ port `rumpfiber.c` to Rust) |
+| ucontext on Akuma aarch64 | de-risk + likely small fixes | de-risk (or avoid via a Rust ctx-switch) |
+| Keep our shipped fixes | **lost** — revalidate | kept |
+| sp server | **must port** `rumpfiber_sp.c` (all stubs) | **must port** (`rumpuser_sp.c` blocks) |
+| Build glue | `-V RUMPUSER_THREADS=fiber -V RUMP_CURLWP=hypercall`, drop Rust link | unchanged build, swap primitives |
+| Rump kernel libs | **no change** | **no change** |
+
+The **sp-server port is the long pole in both columns** and is the only piece with
+no prior art. Everything else is either free (Option 1 threading) or a known
+quantity (Option 2 threading = port of code we can read).
+
+## Recommendation
+
+1. **Do Steps 1 + 2 first — they target the same latency for a fraction of the
+   cost and touch neither the threading model nor the sp server.** Lower the rump
+   `hz` from 100 → 10–25 before `rump_init` (kills the heartbeat herd cadence
+   directly; expected multiple-× cut) and change the scheduler's CPU-release
+   `cv_broadcast` → `cv_signal` (`scheduler.c:492`, fewer wakers per hop). Both are
+   small, both stay inside the architecture we shipped. `RUMP_LATENCY_SLEEP_FIX.md`
+   explicitly says fiber (Step 3) should only be revisited if 1+2 don't get latency
+   into a usable range.
+2. **If we do pursue fiber, scope it as: (a) the context-switch primitive —
+   ALREADY de-risked: a hand-rolled aarch64 cooperative switch, validated on Linux
+   + Akuma EL0 (see "VALIDATED prototype" below; musl ships no ucontext so FFI
+   `swapcontext` is out); (b) a cooperative rewrite of the sp server — the one true
+   cost; (c) the threading layer, which is "adopt `rumpfiber.c`" (Option 1) or
+   "port it to Rust to keep our fixes" (Option 2).** Decide 1-vs-2 on how
+   much we value the Rust `rumpuser` and its landed fixes versus a clean upstream
+   baseline. The kernel libs and the curlwp scheme do **not** move either way.
+3. **Don't frame it as a compile flag.** `RUMPUSER_THREADS=fiber` is a one-line
+   build change *only* if you also accept deleting our Rust layer **and** living
+   with a dead (stubbed) sysproxy server. The "some patches" in the question are,
+   concretely, the sp-server port — which is most of the work.
+
+## Cost of porting `rumpfiber.c` to Rust (Option 2, threading layer only)
+
+Read the whole of `rumpfiber.c` (1035 lines, but most is license header + blank
+lines — the logic is compact). Porting the **threading layer** into our Rust
+`rumpuser` is **~600 lines of straightforward Rust**, and most of it is *simpler*
+than the pthread code we already shipped, because single-vCPU cooperative
+scheduling deletes the concurrency machinery.
+
+| Piece | LOC (C) | Porting difficulty |
+|---|---|---|
+| `struct thread` + 3 intrusive lists (run / exited / join) | ~40 | trivial — no locks needed |
+| `schedule()` round-robin + wakeup-timer scan | ~40 | mechanical |
+| `create_thread`/`create_ctx`, `exit_thread`, `join_thread` | ~90 | mechanical |
+| `wait`/`wakeup_one`/`wakeup_all` + `waiter` queue | ~50 | mechanical |
+| mutex (7) / rw (8) / cv (10) on wait-queues | ~290 | mechanical, **shorter than our pthread versions** |
+| curlwp set/clear/get | ~30 | trivial — just `current_thread.lwp` |
+| `switch_threads` → the context switch | ~10 + primitive | **the only hard part** |
+
+**What deletes vs. our current code:** no `pthread_mutex`/`cond`/`rwlock` FFI, no
+futexes, no atomics / memory-ordering reasoning, no pthread TLS key for curlwp, and
+the contended/uncontended fast-path dance in `mutex_enter`/`cv_wait` collapses
+(spin mutexes just `assert` success — there is no preemption). Cooperative
+single-thread is a *strictly simpler* model than what we already debugged.
+
+**What carries over unchanged:** `rumpuser_init`, `clock_gettime`, `clock_sleep`
+(the body is nearly identical: `unsched → msleep/abssleep → sched`), `getparam`,
+console/`putchar`, `getrandom`, `seterrno`, `kill`, `dprintf`, the `component_*`
+backend bridge, and the `rumpuser__hyp` export. `rumpkern_unsched`/`rumpkern_sched`
+are called identically. So this is **swapping the bodies of ~25 functions in
+`lib.rs`, not rewriting the crate**.
+
+**Estimate (threading layer to "`rump_init` boots + DHCPs under fiber"):**
+
+- Mechanical port (scheduler + lifecycle + sync primitives + integration): ~3–5 days.
+- Context-switch primitive (asm, or de-risk + wire ucontext): ~1–3 days.
+- **Debugging the cooperative scheduler running a *real* kernel** — ~19 kthreads
+  (heartbeat, softints, pagedaemon) yielding correctly, no missed-wakeup hangs,
+  `cv_unsched`/`cv_resched` ordering exact: ~2–4 days. *This is where the time goes;
+  the line count lies.*
+- **Net: ~1.5–2.5 weeks** focused. Code is small; risk is concentrated in the
+  context switch and first-real-boot debugging.
+
+Coupling caveat (unchanged): the threading port alone does **not** keep M2 working
+— once the kernel runs on one cooperative OS thread, the sysproxy server can no
+longer do a blocking channel read on that thread (it would block every fiber). So
+fiber forces the sp-server rework too: either make its channel I/O yield to the
+fiber scheduler, or run it on a *separate* host pthread that hands work into the
+fiber world (one synchronization boundary). That is the real long pole, not the
+threading port.
+
+## Why a context switch is needed at all — and why "just use Rust threads" doesn't help
+
+**"Can't we just use our Rust/OS threads — we already have them running?"** The
+threading *primitive* is not the problem; the thread *count* is. Our Rust
+`rumpuser` already spawns the ~19 rump kthreads via `pthread_create`. Spawning them
+via Rust `std::thread`, or any other OS-thread API, yields the **same ~19 real OS
+threads, 1:1 with kthreads**, all contending on the rump kernel's single virtual
+CPU, all re-woken 100×/sec by the heartbeat `cv_broadcast`. That herd *is* the
+latency. Re-spelling the spawn is a rename, not a fix.
+
+**Why a context switch is fundamentally required for the fix.** Each rump kthread
+is straight-line **blocking** C: it runs on its own stack, calls `rumpuser_cv_wait`
+from arbitrary call depth, blocks, and later resumes *in place*. The only way to
+collapse N such independent blocking control-flows onto **one** OS thread is to
+save the suspending thread's stack pointer + callee-saved registers and restore the
+next one's — i.e. a context switch. There is no way around it *for code written as
+blocking straight-line C*, which the entire NetBSD kernel is (you cannot rewrite
+TCP/IP into callbacks).
+
+So the real question is only **who** performs the switch:
+
+- **OS threads (today):** the Akuma kernel scheduler does the switch — preemptively,
+  kernel-mediated, once per thread swap, with all ~19 schedulable at once → the
+  expensive herd. We are **not** avoiding context switches today; we have *more* of
+  them, done by the kernel, and they are the slow ones.
+- **Fibers:** *we* do the switch in userspace — cooperative, cheap, and only between
+  the handful of fibers that are actually runnable. Fiber doesn't *add*
+  context-switching to a switch-free system; it **replaces many expensive kernel
+  switches with few cheap userspace ones**. The price of taking the OS scheduler out
+  of the loop is that we must now write the save/restore ourselves.
+
+**Why Rust can't make this disappear:** `std::thread` *is* OS threads (no win, and
+we're `no_std` anyway). `async`/await can't help either — a future can only suspend
+at an `.await` point that the *callee* cooperates with; it cannot suspend a plain
+blocking C call mid-stack. To yield out of `rumpuser_cv_wait` you need a real stack
+switch. So "in Rust" is fine, but it must be **stackful-coroutine Rust**: either
+~40–80 lines of aarch64 inline asm (save x19–x30, sp, fp; build the initial frame),
+or a `no_std` stackful-coroutine crate (e.g. `corosensei` / `generator` — verify
+`no_std` + our custom target first). Both *are* "using Rust" — they're just not our
+existing OS-thread machinery, which is precisely the thing that's slow.
+
+## The context-switch primitive: option ladder, the musl dead-end, and a VALIDATED prototype (2026-06-23)
+
+The threading port needs exactly one non-mechanical primitive: a stackful
+context switch. We evaluated the ladder empirically rather than on memory.
+
+### musl ships NO ucontext implementation — "FFI `swapcontext`" is dead
+
+`<ucontext.h>` in musl **declares** `getcontext`/`makecontext`/`swapcontext`, but
+`libc.a` **defines none of them**. Confirmed against *both* the Homebrew
+`aarch64-linux-musl` toolchain and **Akuma's own musl** sysroot
+(`userspace/target/.../musl-*/.../libc.a`): `nm` shows zero `*context` text
+symbols (only unrelated `__malloc_context`). A `-static` link of a ucontext
+ping-pong fails with `undefined reference to swapcontext`. This is a deliberate,
+long-standing musl stance. Upstream `rumpfiber.c` only links because it's paired
+with NetBSD libc / frankenlibc, which *do* implement ucontext.
+
+→ The cheapest option (FFI libc `swapcontext`) is **off the table on musl**.
+   No symbol to call; nothing to smoke-test on Akuma. Answered at link time.
+
+### The implementable primitive: a hand-rolled aarch64 cooperative switch
+
+Modeled directly on **Akuma's own** `switch_context`
+(`crates/akuma-exec/src/threading/mod.rs:1102`, `global_asm!`) — the authoritative
+reference for this target. That is an **EL1, preemptive** kernel-thread switch, so
+it saves x19–x30, sp, **and** DAIF / ELR_EL1 / SPSR_EL1 / TTBR0_EL1 / `tpidr_el0`,
+plus an `x30==0` guard and a `dsb ish`. A **cooperative EL0** fiber switch is a
+strict subset — it runs as a plain function call inside one userspace process, so
+it needs only the AAPCS callee-saved set:
+
+- **x19–x28, x29(fp), x30(lr), sp** — same as `switch_context`.
+- **`d8–d15`** — the callee-saved low halves of v8–v15. `switch_context` *omits*
+  FP (kernel code is effectively FP-free); a fiber runs arbitrary C (printf, the
+  rump kernel) so it **must** save these.
+- **`tpidr_el0`** — so each fiber keeps its own TLS/`errno`. A cheap `mrs`/`msr`;
+  `exceptions.rs` already uses `tpidr_el0` as the EL0 user-TLS base.
+- **NOT needed at EL0:** DAIF, ELR/SPSR, TTBR0, the x30 guard — those exist only
+  because `switch_context` can fire from IRQ context across address spaces.
+
+Crucially this is a pure register/stack swap — **no syscall, no signal-mask
+touch** — so unlike glibc/musl `swapcontext` it has zero dependency on Akuma's
+`rt_sigprocmask` (the risk #3 we'd flagged simply doesn't exist for this path).
+
+### Validated on BOTH targets
+
+A ~110-line prototype (`akctx_switch` + a tiny entry trampoline + `akctx_make`,
+mirroring `rumpfiber.c`'s usage: 64 KB mmap stack, `makecontext`-style pointer
+arg) doing an A/B fiber ping-pong:
+
+- **Linux baseline** (static `aarch64-linux-musl`, run in a native arm64 Alpine
+  container): full 10-hop ping-pong, clean unwind, exit 0. ✅
+- **Akuma EL0** (same static binary on `disk.img`, run over SSH as
+  `/bin/asmctx_smoke`): identical 10-hop ping-pong, "main resumed … OK". ✅ —
+  including the production-shape build that exercises `msr tpidr_el0` from EL0 and
+  the `d8–d15` save/restore. So Akuma userspace honors the full switch.
+
+Prototype source: `rumpuser/akctx_smoke.c` (landed next to the existing
+`test_*.c`). It is the ready EL0-adapted template for `switch_threads` when the
+Rust rumpfiber port lands. Build/run: `aarch64-linux-musl-gcc -static -O2 -o
+akctx_smoke akctx_smoke.c`; run on disk via SSH as `/bin/akctx_smoke`.
+
+→ **Updated recommendation for the primitive:** skip the FFI-`swapcontext` rung
+   (musl can't provide it) and skip the crate hunt unless desired — the
+   hand-rolled aarch64 switch is **already proven on Linux + Akuma**, is ~80 lines
+   we fully control, derives directly from `switch_context`, and avoids the
+   signal-mask syscall path entirely. A `no_std` coroutine crate (`corosensei` /
+   `context`) remains a fine alternative for the primitive, but is no longer the
+   *only* de-risked route — and would still have to clear `no_std` + our
+   offline/no-deps build + symmetric-switch + C-stack-interop.
+
+## Source pointers (fiber)
+
+- `crates/akuma-exec/src/threading/mod.rs:1102` — **Akuma's own `switch_context`
+  `global_asm!`**; the reference our EL0 cooperative switch is adapted from.
+- `src/exceptions.rs:108–237` — the EL1 trap-frame save/restore (full q0–q31 +
+  `sp_el0` + `tpidr_el0`); shows the target's FP/TLS handling.
+- `src-netbsd/lib/librumpuser/rumpfiber.c` / `.h` — the cooperative scheduler
+  (ucontext `swapcontext`, 64 KB mmap stacks, round-robin + wakeup timers);
+  ~22 hypercalls fully implemented.
+- `src-netbsd/lib/librumpuser/rumpfiber_sp.c` — **the blocker**: all sp hypercalls
+  stubbed (`abort()` / no-op). This is the net-new work.
+- `src-netbsd/lib/librumpuser/Makefile` lines 11–42 — `RUMPUSER_THREADS` select;
+  fiber requires `RUMP_CURLWP=hypercall` (which our `-k` kernel build already uses).
+- `rumpuser/src/lib.rs` — our 59-hypercall Rust layer that Option 1 would replace /
+  Option 2 would partially rewrite (pthread threading, `clock_sleep` CPU-release,
+  contended-mutex/cv unschedule discipline).
+- `docs/RUMP_LATENCY_SLEEP_FIX.md` Steps 1–3 — the cheaper levers to try before
+  fiber, and the fiber blocker statement.

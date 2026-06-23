@@ -330,16 +330,19 @@ Driving is **synchronous on the calling thread** (approach 1 — copyin/copyout 
 
 The path WORKS; the weaknesses are performance + robustness, not correctness:
 
-1. **Latency (~1s per proxied syscall round-trip)** — root cause: the rump kernel's
-   ~19 **pthread** kthreads contend on a single core (each round-trip waits on the
-   scheduler; PSTATS shows them blocked in futex, woken by the 100Hz heartbeat). Tried:
-   a scheduler wakeup-locality hint (no help, GATED OFF in `threading/mod.rs`
-   `WAKEUP_LOCALITY_HINT=false`). **Fiber backend is BLOCKED** — `rumpfiber_sp.c` stubs
-   out the sysproxy server (`abort()`), so fiber needs a from-scratch sp-server port.
-   Untried lever: lower the rump kernel `hz` (set the `hz` global from `rump_server.c`
-   BEFORE `rump_init` — `thetick` in `intr.c:doclock` is computed once at thread start;
-   nothing reassigns `hz`) to cut heartbeat churn. (The sic recv-drain patch sidestepped
-   it for sic by reading bursts in ~1 round-trip instead of per-byte.)
+1. **Latency (~1s per proxied syscall round-trip)** — the rump kernel's ~19 pthread
+   kthreads contend on a single core. **The heartbeat/herd theory is a DEAD END
+   (disproven 2026-06-23 — see `docs/RUMP_LATENCY_SLEEP_FIX.md`):** lowering `hz`
+   100→20 (heartbeat 5×↓, idle syscalls halved, verified in PSTATS) did NOT cut curl
+   latency — it got *worse* (29.1s→32.7s); `cv_broadcast`→`cv_signal` was worse still
+   (35.1s). Both reverted. Earlier dead-end too: scheduler wakeup-locality hint (no
+   help, GATED OFF in `threading/mod.rs` `WAKEUP_LOCALITY_HINT=false`). So the cost is
+   NOT in `rump_server`/the rump scheduler. **Untried real lever:** instrument the
+   *Akuma-side* round-trip (`src/rump_proxy.rs`: channel read/write, `ProcMem`
+   copyin/copyout, Akuma scheduler hops) + the real TCP RTTs — that's where the 3–4s
+   lives. **Fiber backend is BLOCKED** — `rumpfiber_sp.c` stubs the sysproxy server
+   (`abort()`), needs a from-scratch sp-server port. (The sic recv-drain patch
+   sidestepped per-op latency for sic by reading bursts in ~1 round-trip.)
 2. **Robustness (project task #9):** box procs stuck in a proxied syscall are
    UNINTERRUPTIBLE (the proxy channel read never checks `is_current_interrupted`/pending
    signals), `kill <pid>` of a box proc returns "invalid pid" (box/pid-namespace), and

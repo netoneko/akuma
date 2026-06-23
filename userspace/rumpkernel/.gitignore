@@ -4,7 +4,6 @@
 /obj-host/
 /dest/
 /dest-host/
-/src-netbsd/
 /rumpkernel/usr/
 /frankenlibc/
 /out/
