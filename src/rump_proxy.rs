@@ -40,12 +40,32 @@ static RUMP_BOXES: Spinlock<BTreeSet<u64>> = Spinlock::new(BTreeSet::new());
 /// load when no `stack=rump` box exists (the common case / pre-rumpnet boot).
 static RUMP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Mark `box_id` as using the rump network stack. Idempotent; never un-marks
-/// (a later smoltcp-default spawn into the same box must not clear it).
+/// Mark `box_id` as using the rump network stack and EAGERLY bring up its
+/// `rump_server --net` (so `rump_init` + DHCP happen at box-setup time, NOT
+/// inside the box's first `socket()` — which otherwise pays the whole ~5s
+/// bring-up). Idempotent; never un-marks. The first mark spawns a one-shot
+/// setup kthread that waits for the tap (NIC1) then brings the proxy up in the
+/// background; `ensure_box_proxy` remains a lazy fallback if a socket races in.
 pub fn mark_box_rump(box_id: u64) {
-    RUMP_BOXES.lock().insert(box_id);
+    let newly = RUMP_BOXES.lock().insert(box_id);
     RUMP_ACTIVE.store(true, Ordering::Relaxed);
-    crate::safe_print!(64, "[RUMP-SP] box {} marked stack=rump\n", box_id);
+    if !newly {
+        return;
+    }
+    crate::safe_print!(64, "[RUMP-SP] box {} marked stack=rump; pre-bringing-up rump_server\n", box_id);
+    let _ = threading::spawn_fn(move || {
+        // The tap (NIC1) must be initialized before `rump_server --net` can DHCP.
+        let mut waited = 0u64;
+        while !akuma_net::rump_tap::is_ready() && waited < 30_000_000 {
+            threading::schedule_blocking(crate::timer::uptime_us() + 50_000);
+            waited += 50_000;
+        }
+        let _ = ensure_box_proxy(box_id);
+        threading::mark_current_terminated();
+        loop {
+            threading::yield_now();
+        }
+    });
 }
 
 /// Is this box's network stack the rump kernel?
@@ -587,10 +607,18 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
         _ => translation::pack_args(&[rump_fd as u64, buf_ptr, len]),
     };
     let mut mem = ProcMem::new();
+    let t0 = crate::timer::uptime_us();
     let res = proxy.with_client(|c| c.syscall(translation::netbsd_sysno(op), &nb_args, &mut mem));
+    let dt = crate::timer::uptime_us().saturating_sub(t0);
     match res {
-        Ok([n, _]) => n as u64,
-        Err(e) => neg_linux_errno(translation::errno_netbsd_to_linux(e)),
+        Ok([n, _]) => {
+            crate::safe_print!(96, "[RUMP-SP] {} len={} -> {} ({}us)\n", op_name(op), len, n, dt);
+            n as u64
+        }
+        Err(e) => {
+            crate::safe_print!(96, "[RUMP-SP] {} -> errno {} ({}us)\n", op_name(op), e, dt);
+            neg_linux_errno(translation::errno_netbsd_to_linux(e))
+        }
     }
 }
 
@@ -606,7 +634,14 @@ impl PipeIo for KernelPipeIo {
         pipe::pipe_write(id, buf).is_ok()
     }
     fn yield_now(&mut self) {
-        threading::yield_now();
+        // Don't busy-spin: the rump_server's poll-loop thread (and its tap-RX
+        // thread) share this single core, and a tight `yield_now` loop here
+        // starves them — every channel round-trip stretched to ~0.5-6s because
+        // the server couldn't get scheduled to read our request / write its
+        // reply. Sleep a short interval instead so the core goes to the server;
+        // we re-check the channel each timer tick. (Proper fix later: wake on
+        // pipe-write so this is event-driven, not a ~tick poll.)
+        threading::schedule_blocking(crate::timer::uptime_us() + 1_000);
     }
     fn now_us(&mut self) -> u64 {
         crate::timer::uptime_us()
