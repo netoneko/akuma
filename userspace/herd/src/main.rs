@@ -103,6 +103,10 @@ struct ServiceConfig {
     /// Network stack for the box: "" / "smoltcp" (default) or "rump" (route the
     /// box's AF_INET through its rump_server via the kernel sysproxy client).
     stack: String,
+    /// Whether to restart the service when it exits. Default true. Set false for
+    /// services whose restart needs special handling (e.g. a rump_server, whose
+    /// kernel sysproxy channel must be re-established on restart — TBD).
+    restart: bool,
 }
 
 impl Default for ServiceConfig {
@@ -116,6 +120,7 @@ impl Default for ServiceConfig {
             box_root: String::from("/"),
             bundle: String::new(),
             stack: String::new(),
+            restart: true,
         }
     }
 }
@@ -553,6 +558,7 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                     config.boxed = true; // bundles are always boxed
                 }
                 "stack" => config.stack = String::from(value),
+                "restart" => config.restart = value != "false" && value != "0" && value != "no",
                 _ => {}
             }
         }
@@ -859,6 +865,11 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
         let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
         register_box(name, box_id, &config.box_root, 0);
         if config.stack == "rump" {
+            // Mark the box BEFORE spawning so the kernel knows this box's
+            // rump_server should get a sysproxy channel wired onto fd 3 when we
+            // spawn it below. herd owns the rump_server lifecycle (one server,
+            // no second kernel-spawned one); the kernel only attaches the
+            // channel + drives the proxy.
             set_box_stack_rump(box_id);
         }
         let res = spawn_in_box(box_id, &config.command, &args);
@@ -968,9 +979,9 @@ fn check_process_exits(state: &mut HerdState, now_ms: u64) {
             svc.stdout_fd = None;
             svc.last_exit_code = Some(exit_code);
 
-            // Schedule restart on non-zero exit
-            if exit_code != 0 {
-                let should_restart = svc.config.max_retries == 0 
+            // Schedule restart on non-zero exit (unless restart is disabled).
+            if exit_code != 0 && svc.config.restart {
+                let should_restart = svc.config.max_retries == 0
                     || svc.restart_count < svc.config.max_retries;
 
                 if should_restart {

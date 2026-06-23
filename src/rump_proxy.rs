@@ -26,7 +26,6 @@ const READ_TIMEOUT_US: u64 = 8_000_000;
 
 use akuma_exec::process::Process;
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::format;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spinning_top::Spinlock;
@@ -40,32 +39,15 @@ static RUMP_BOXES: Spinlock<BTreeSet<u64>> = Spinlock::new(BTreeSet::new());
 /// load when no `stack=rump` box exists (the common case / pre-rumpnet boot).
 static RUMP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Mark `box_id` as using the rump network stack and EAGERLY bring up its
-/// `rump_server --net` (so `rump_init` + DHCP happen at box-setup time, NOT
-/// inside the box's first `socket()` — which otherwise pays the whole ~5s
-/// bring-up). Idempotent; never un-marks. The first mark spawns a one-shot
-/// setup kthread that waits for the tap (NIC1) then brings the proxy up in the
-/// background; `ensure_box_proxy` remains a lazy fallback if a socket races in.
+/// Mark `box_id` as using the rump network stack. Idempotent; never un-marks (a
+/// later smoltcp-default spawn into the same box must not clear it). herd calls
+/// `SET_BOX_STACK` for the box BEFORE it spawns the box's `rump_server`, so that
+/// when that spawn lands the kernel knows to wire it a sysproxy channel (see
+/// [`attach_server`]). herd owns the server process; the kernel owns the channel.
 pub fn mark_box_rump(box_id: u64) {
-    let newly = RUMP_BOXES.lock().insert(box_id);
+    RUMP_BOXES.lock().insert(box_id);
     RUMP_ACTIVE.store(true, Ordering::Relaxed);
-    if !newly {
-        return;
-    }
-    crate::safe_print!(64, "[RUMP-SP] box {} marked stack=rump; pre-bringing-up rump_server\n", box_id);
-    let _ = threading::spawn_fn(move || {
-        // The tap (NIC1) must be initialized before `rump_server --net` can DHCP.
-        let mut waited = 0u64;
-        while !akuma_net::rump_tap::is_ready() && waited < 30_000_000 {
-            threading::schedule_blocking(crate::timer::uptime_us() + 50_000);
-            waited += 50_000;
-        }
-        let _ = ensure_box_proxy(box_id);
-        threading::mark_current_terminated();
-        loop {
-            threading::yield_now();
-        }
-    });
+    crate::safe_print!(64, "[RUMP-SP] box {} marked stack=rump\n", box_id);
 }
 
 /// Is this box's network stack the rump kernel?
@@ -108,6 +90,10 @@ fn op_name(op: translation::Op) -> &'static str {
 /// rump_server readiness: `rump_init` + its ~19 kthread spawns take a while, so
 /// the handshake read tolerates a long stall before declaring the server dead.
 const HANDSHAKE_TIMEOUT_US: u64 = 15_000_000;
+
+/// How long a box socket syscall waits for its proxy to come up (herd spawns the
+/// rump_server at boot; the handshake takes ~5s through rump_init + DHCP).
+const PROXY_WAIT_TIMEOUT_US: u64 = 20_000_000;
 
 type ProxyClient = Client<PipeTransport<KernelPipeIo>>;
 
@@ -161,98 +147,87 @@ fn is_server_pid(pid: process::Pid) -> bool {
     SERVER_PIDS.lock().contains(&pid)
 }
 
-/// Get (or lazily bring up) the proxy for a `stack=rump` box. The first caller
-/// wins the `Initializing` slot and runs [`setup_proxy`]; concurrent callers
-/// yield until it publishes `Ready`/`Failed`.
+/// Wait (bounded) for the box's proxy to become `Ready`. Does NOT spawn anything
+/// — herd owns the `rump_server`, and the kernel brings the proxy up in a
+/// kthread via [`attach_server`] when herd spawns it. Returns the proxy, or
+/// `None` if it failed or never appeared within the timeout.
 fn ensure_box_proxy(box_id: u64) -> Option<Arc<BoxProxy>> {
+    let start = crate::timer::uptime_us();
     loop {
-        let we_init = {
-            let mut m = PROXIES.lock();
-            match m.get(&box_id) {
-                Some(ProxyEntry::Ready(p)) => return Some(p.clone()),
-                Some(ProxyEntry::Failed) => return None,
-                Some(ProxyEntry::Initializing) => false,
-                None => {
-                    m.insert(box_id, ProxyEntry::Initializing);
-                    true
-                }
-            }
-        };
-        if we_init {
-            let result = setup_proxy(box_id);
-            let mut m = PROXIES.lock();
-            m.insert(
-                box_id,
-                match &result {
-                    Some(p) => ProxyEntry::Ready(p.clone()),
-                    None => ProxyEntry::Failed,
-                },
-            );
-            return result;
+        match PROXIES.lock().get(&box_id) {
+            Some(ProxyEntry::Ready(p)) => return Some(p.clone()),
+            Some(ProxyEntry::Failed) => return None,
+            // Handshaking, or the server hasn't been spawned yet.
+            Some(ProxyEntry::Initializing) | None => {}
         }
-        threading::yield_now(); // another thread is bringing it up
+        if crate::timer::uptime_us().saturating_sub(start) > PROXY_WAIT_TIMEOUT_US {
+            crate::safe_print!(64, "[RUMP-SP] box={} proxy not ready (timeout)\n", box_id);
+            return None;
+        }
+        threading::schedule_blocking(crate::timer::uptime_us() + 5_000);
     }
 }
 
-/// Bring up a box's `rump_server` + sysproxy channel (kernel-owned). Creates a
-/// pipe pair, spawns `/bin/rump_server --fd 3 --log …` into the box, installs
-/// the server end at fd 3, and runs the guest handshake.
+/// Wire a freshly-spawned `rump_server` into the per-box proxy. Called from the
+/// spawn path when herd spawns the box's `rump_server` (`--fd 3 --net`): creates
+/// the kernel pipe pair, installs it on the server's fd 3 BEFORE the server runs,
+/// then handshakes IN A KTHREAD (the handshake blocks ~5s through rump_init +
+/// DHCP) and publishes the proxy to [`PROXIES`]. herd owns the server PROCESS
+/// lifecycle; the kernel owns the CHANNEL + proxy.
 ///
-/// B3: `--net` brings the NetBSD stack online (`virt0` + DHCP over
-/// `/dev/net/tap0`, needs `RUMP_NIC=1`) so `connect`/`sendto`/`recvfrom` reach
-/// the real wire. The sysproxy banner (which the handshake awaits) is printed
-/// AFTER DHCP, so the handshake read tolerates the DHCP delay (see
-/// `HANDSHAKE_TIMEOUT_US`). The server's stdout goes to the box log since the
-/// kernel can't drain its `ProcessChannel`.
-fn setup_proxy(box_id: u64) -> Option<Arc<BoxProxy>> {
-    crate::safe_print!(96, "[RUMP-SP] box={} bringing up rump_server (--fd 3 --net)...\n", box_id);
+/// TODO (channel-wiring trigger): currently detected by path-match in
+/// `sys_spawn_ext` (`box_is_rump` + "rump_server"). A cleaner signal — herd
+/// notifying the kernel explicitly which spawn is the stack daemon — is TBD.
+pub fn attach_server(box_id: u64, server_pid: process::Pid) {
+    {
+        let mut m = PROXIES.lock();
+        if m.contains_key(&box_id) {
+            return; // one server/proxy per box
+        }
+        m.insert(box_id, ProxyEntry::Initializing);
+    }
+    // Exclude the server from interception NOW (its channel I/O uses socket
+    // sendto/recvfrom — see SERVER_PIDS), before it can run.
+    SERVER_PIDS.lock().insert(server_pid);
+
     // px: kernel→server (server reads via its rx); py: server→kernel.
     let px = pipe::pipe_create();
     let py = pipe::pipe_create();
-
-    let logpath = format!("/var/log/box/{box_id}/rump_server.log");
-    let pid = match process::spawn_process_with_channel_ext(
-        "/bin/rump_server",
-        Some(&["--fd", "3", "--net", "--log", &logpath]),
-        None,
-        None,
-        Some("/"),
-        box_id,
-    ) {
-        Ok((_tid, _chan, pid)) => pid,
-        Err(e) => {
-            crate::safe_print!(128, "[RUMP-SP] box={} rump_server spawn failed: {}\n", box_id, e);
-            return None;
-        }
+    let Some(server) = process::lookup_process(server_pid) else {
+        SERVER_PIDS.lock().remove(&server_pid);
+        PROXIES.lock().insert(box_id, ProxyEntry::Failed);
+        return;
     };
-
-    // Exclude the server from interception NOW, before it can run (its handshake
-    // I/O uses socket sendto/recvfrom on the channel fd — see SERVER_PIDS).
-    SERVER_PIDS.lock().insert(pid);
-
-    // Install the server end at fd 3 BEFORE it runs (single-core: the child is
-    // not scheduled until our first blocking handshake read yields).
-    let Some(server) = process::lookup_process(pid) else {
-        crate::safe_print!(96, "[RUMP-SP] box={} lookup_process failed\n", box_id);
-        SERVER_PIDS.lock().remove(&pid);
-        let _ = process::kill_process(pid);
-        return None;
-    };
+    // Install the channel at fd 3 before the server is scheduled (single-core:
+    // it does not run until the spawning thread yields).
     server.set_fd(3, process::FileDescriptor::UnixSocket { rx: px, tx: py });
+    crate::safe_print!(
+        96,
+        "[RUMP-SP] box={} attached sysproxy channel to rump_server pid={}; handshaking\n",
+        box_id,
+        server_pid
+    );
 
-    let chan = PipeTransport { io: KernelPipeIo, wr: px, rd: py, timeout_us: HANDSHAKE_TIMEOUT_US };
-    match Client::connect(chan, b"akuma-kernel") {
-        Ok(client) => {
-            crate::safe_print!(96, "[RUMP-SP] box={} rump_server ready (pid={})\n", box_id, pid);
-            Some(Arc::new(BoxProxy { client: Spinlock::new(Some(client)) }))
+    let _ = threading::spawn_fn(move || {
+        let chan =
+            PipeTransport { io: KernelPipeIo, wr: px, rd: py, timeout_us: HANDSHAKE_TIMEOUT_US };
+        let entry = match Client::connect(chan, b"akuma-kernel") {
+            Ok(client) => {
+                crate::safe_print!(64, "[RUMP-SP] box={} proxy ready\n", box_id);
+                ProxyEntry::Ready(Arc::new(BoxProxy { client: Spinlock::new(Some(client)) }))
+            }
+            Err(e) => {
+                crate::safe_print!(64, "[RUMP-SP] box={} handshake failed errno={}\n", box_id, e);
+                SERVER_PIDS.lock().remove(&server_pid);
+                ProxyEntry::Failed
+            }
+        };
+        PROXIES.lock().insert(box_id, entry);
+        threading::mark_current_terminated();
+        loop {
+            threading::yield_now();
         }
-        Err(e) => {
-            crate::safe_print!(96, "[RUMP-SP] box={} handshake failed errno={}\n", box_id, e);
-            SERVER_PIDS.lock().remove(&pid);
-            let _ = process::kill_process(pid);
-            None
-        }
-    }
+    });
 }
 
 // ── dispatch interception ──────────────────────────────────────────────────

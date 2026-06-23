@@ -1228,11 +1228,19 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
     
     let stdin_slice = stdin_data.as_deref();
 
-    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(&path, args_opt, None, stdin_slice, cwd_ref, o.box_id)
-        && let Some(proc) = akuma_exec::process::current_process() {
+    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(&path, args_opt, None, stdin_slice, cwd_ref, o.box_id) {
+        // For a `stack=rump` box, when herd spawns its `rump_server` the kernel
+        // wires a sysproxy channel onto fd 3 (BEFORE the server runs) and brings
+        // the proxy up. herd owns the process; the kernel owns the channel.
+        #[cfg(feature = "rump")]
+        if path.contains("rump_server") && crate::rump_proxy::box_is_rump(o.box_id) {
+            crate::rump_proxy::attach_server(o.box_id, pid);
+        }
+        if let Some(proc) = akuma_exec::process::current_process() {
             akuma_exec::process::register_child_channel(pid, ch, proc.pid);
             return u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32);
         }
+    }
     ENOMEM
 }
 
