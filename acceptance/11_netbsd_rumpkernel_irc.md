@@ -1,22 +1,29 @@
 # Acceptance: NetBSD rump-kernel TCP/IP — clone, compile & IRC `#rumpkernel`
 
-**Status: TARGET (not yet runnable).** This is the capstone proof for the
-rump-kernel port (`userspace/rumpkernel/`): build a real network client *inside
-Akuma* against the NetBSD rump TCP/IP stack, connect it to a public IRC network
-over the real internet, and read back live channel state. If the channel topic /
-names list comes back, the bytes provably traversed **the NetBSD stack** (not
-Akuma's smoltcp) — because the client is linked against `librump*` + our
-`rumpuser`, and its socket calls are `rump_sys_*`, carried by the virtif NIC over
-`/dev/net/tap0`.
+**Status: ✅ PASSES (2026-06-23).** The capstone IRC proof is met: **`sic` holds a
+live `#rumpkernel` session on OFTC, with the entire IRC session carried by the
+NetBSD rump TCP/IP stack** running on our Rust `rumpuser` inside Akuma — not
+smoltcp. Source of record: `userspace/rumpkernel/docs/HANDOFF.md` ("🏆 M2
+ACHIEVED (2026-06-23)") and commit `28df3f1` *"IRC works end to end on netbsd
+networking stack"* (build-up: `e523669` "connected to libera via sic", `075029f`
+"patch sic").
 
-The client is **sic** (suckless simple IRC client, ~250 lines of C) — small
-enough to compile in-VM with `tcc`, and pure BSD-sockets so it links cleanly
-against the rump syscall surface.
+How it actually ran (differs from the original `tcc`-in-VM plan below — see
+"What shipped" note): the unmodified static `sic` binary runs in a `stack=rump`
+box, and the **kernel forwards its AF_INET socket syscalls to a shared boxed
+`rump_server`** (kernel-as-sysproxy-client). The proof is unchanged: the client's
+sockets resolve to the NetBSD stack via the rump_server, packets leave over
+virtif → `/dev/net/tap0` (NIC1), and NIC0/smoltcp is never in the path.
 
-See `userspace/rumpkernel/docs/HANDOFF.md` for port status. Milestones already
-green: `rump_init()` boots on Akuma; `librumpnet_virtif.a` built; `rumpuser_component_*`
-in place. Remaining before this demo runs: virtif packet backend over
-`/dev/net/tap0`, DHCP, the rump-SDK install path, and the `tcc`-against-rump link.
+```
+box use rumpnet -i /bin/sic -h 163.61.26.35 -p 6667 -n akuma_test
+# → full IRC registration + live #rumpkernel session on OFTC, over the rump stack
+```
+
+This proof originally targeted **sic** built in-VM with `tcc` against `librump*` +
+our `rumpuser` (the recipe below). It is preserved as the design narrative; the
+shipped path used the sysproxy routing above instead, which proves the same thing
+(real bytes over the NetBSD stack) without the in-VM compile step.
 
 ---
 
@@ -164,9 +171,17 @@ negative control that it isn't secretly smoltcp.
 - A negative control: with `RUMP_NIC=0` (no `/dev/net/tap0` backend), the same
   binary must fail to connect — confirming it is *not* secretly using smoltcp.
 
-## Open items before this is runnable
+## Status of the pieces
+
+**The IRC capstone PASSES** (2026-06-23) via the kernel-as-sysproxy-client path
+(see header + `docs/HANDOFF.md` "M2 ACHIEVED"). The list below tracks the
+original in-VM-`tcc` recipe; several items were satisfied by the sysproxy route
+instead of literally as written.
 
 Done:
+- [x] **IRC capstone — live `#rumpkernel` session over the NetBSD rump stack** —
+      `sic` in a `stack=rump` box, AF_INET forwarded to the boxed `rump_server`
+      (commit `28df3f1`). Also: unmodified `curl` does HTTPS-by-IP over rump.
 - [x] `rumpuser` scheduler-wrap under real concurrency — fixed (clock_sleep +
       contended mutex/rwlock + cv waits release the rump CPU). Container net test
       (`docker-net-test.sh`) is GREEN: `virt0` up, IP assigned, `rump_sys_socket` OK.
@@ -186,18 +201,26 @@ Done:
       Caveat: one rump process per boot (unclean kill leaves NIC1 RX mid-flight →
       next process can't DHCP). Fix later: reset `/dev/net/tap0` on close.
 
-Remaining:
-- [ ] virtif packet backend over `/dev/net/tap0` on **Akuma** — container proof uses
-      the stock Linux TUN/TAP backend; Akuma needs our `rumpcomp_user` over the kernel
-      tap device.
-- [ ] DHCP one-shot (`rump_pub_netconfig_dhcp_ipv4_oneshot`) against net1's SLIRP.
-- [ ] the `/archives` herd install + bundle (`config.json`: SDK unpack, mounts,
-      `process.args` for the run script).
-- [ ] **sic** ↔ rump link recipe (libc-socket shim vs rump bootstrap wrapper).
-- [ ] **dropbear** check: it must do its socket I/O via *directly-called* libc
-      `socket/accept/read/write` (interposable by `hijack.c`), NOT via `FILE*`
-      stdio — musl stdio flushes through inline `writev`/`readv` syscalls that
-      bypass the PLT and **cannot** be LD_PRELOAD-hijacked (this is why `busybox
-      wget` fails but `curl` works). If dropbear uses stdio on the socket, fall back
-      to the sysproxy model (`librumphijack`/`librumpclient` + un-stub `sp_*`) or
-      kernel-routing.
+Done (resolved by M1/M2 — see `docs/HANDOFF.md`):
+- [x] virtif packet backend over `/dev/net/tap0` on **Akuma** — our `rumpcomp_tap.c`
+      over the kernel tap device (M1, 2026-06-22).
+- [x] DHCP one-shot (`rump_pub_netconfig_dhcp_ipv4_oneshot`) against net1's SLIRP
+      (M1: `virt0` → `10.0.2.15`).
+- [x] herd autostarts the rump networking box (`rumpnet.conf`: `command=/bin/rump_server`,
+      `--net --fd 3`, `stack=rump`, `restart=false`) — supersedes the `/archives` SDK
+      unpack bundle; herd OWNS the `rump_server` (M2, 2026-06-23).
+- [x] **sic** over rump — via the kernel-as-sysproxy-client route (no in-VM `tcc`
+      link needed); needed `readv`/`writev` marshaling + `poll`/`select` on
+      `RumpSocket` + a `sic` recv-drain patch (vendored `userspace/rumpkernel/sic`).
+
+Remaining (the inbound SSH variant + polish — not blocking the IRC capstone):
+- [ ] **sshd on the rump stack** (the SSH-into-the-box direction above). The
+      `listen`/`accept` transport is proven (`rumpserver.c`, host `:2223`→rump `:22`);
+      what's left is the SSH *protocol* layer. **dropbear** caveat: it must do socket
+      I/O via *directly-called* libc `socket/accept/read/write` (interposable by
+      `hijack.c`), NOT via `FILE*` stdio — musl stdio flushes through inline
+      `writev`/`readv` syscalls that bypass the PLT and **cannot** be LD_PRELOAD-hijacked
+      (this is why `busybox wget` fails but `curl` works). If dropbear uses stdio on the
+      socket, use the sysproxy/kernel-routing model (now proven) instead of LD_PRELOAD.
+- [ ] DNS over rump (UDP `sendto`/`recvmsg`) — use raw IPs until then.
+- [ ] per-syscall latency (~1s round-trip) + robustness — see `docs/HANDOFF.md` / `RUMP_SYSPROXY.md`.

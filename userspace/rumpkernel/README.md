@@ -73,9 +73,25 @@ toolchain. Akuma's target is `aarch64-linux-musl` static (see the plan).
 **Resuming work? Start at [docs/HANDOFF.md](docs/HANDOFF.md)** — current state,
 copy-paste reproduce steps, the next task, and gotchas.
 
-In progress. The **kernel side** is built and verified; the userspace rump
-libraries (cross-built `librump*`, the Rust `rumpuser`, the `virtif` backend, the
-`rump-net` box payload) are not started yet.
+**🏆 IT WORKS, END TO END.** The NetBSD rump TCP/IP stack runs inside Akuma and
+carries real internet traffic:
+
+- ✅ **M1 (2026-06-22)** — a rump box **DHCPs an address and HTTP-GETs the QEMU
+  host** through the NetBSD stack (goal #5 above, verbatim). See
+  [docs/HANDOFF.md](docs/HANDOFF.md) "🏆 M1 ACHIEVED".
+- ✅ **M2 (2026-06-23)** — unmodified static binaries in a `stack=rump` box have
+  their AF_INET routed by the kernel to a shared boxed `rump_server`, validated
+  with **`curl` (HTTPS-by-IP) and `sic` holding a live `#rumpkernel` IRC session
+  on OFTC** over the NetBSD stack. This is the `acceptance/11` capstone — see
+  [docs/HANDOFF.md](docs/HANDOFF.md) "🏆 M2 ACHIEVED" and commit `28df3f1`
+  *"IRC works end to end on netbsd networking stack"*.
+
+Open work is now performance + robustness (per-syscall latency, interruptible
+proxy syscalls, the DNS/UDP path) and the inbound sshd-on-rump variant — not
+correctness. See [docs/HANDOFF.md](docs/HANDOFF.md) and
+[docs/RUMP_SYSPROXY.md](docs/RUMP_SYSPROXY.md).
+
+Phase history:
 
 - ✅ **Kernel prerequisite — `/dev/zero`** — see [docs/DEV_ZERO.md](docs/DEV_ZERO.md).
 - ✅ **Phase 3 — kernel `rump` feature** (raw L2 `/dev/net/tap0` packet device on a
@@ -85,9 +101,10 @@ libraries (cross-built `librump*`, the Rust `rumpuser`, the `virtif` backend, th
   stack), via a Linux container — see [docs/PHASE01_BUILDRUMP.md](docs/PHASE01_BUILDRUMP.md).
 - ✅ **Phase 2 — Rust `rumpuser`**: a full NetBSD rump kernel **boots on our
   hypercalls** — `rump_init()` returns 0 — see [docs/PHASE2_RUMPUSER.md](docs/PHASE2_RUMPUSER.md).
-- ⏳ Phases 4/5/6 (virtif up + DHCP + `rump_sys_socket` in the container test → our
-  `rumpcomp_user` backend to `/dev/net/tap0` → Akuma integration → box `--net` →
-  DHCP + curl = M1). See [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md).
+- ✅ **Phases 4/5/6** (virtif up + DHCP + `rump_sys_socket` → our `rumpcomp_user`
+  backend to `/dev/net/tap0` → Akuma integration → herd-owned `rump_server` box →
+  DHCP + curl + IRC) — **complete (M1 + M2)**. See
+  [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md).
 
 Run the kernel tap path with `RUMP_NIC=1 cargo run --release` (adds the second
 QEMU NIC). Without it, `/dev/net/tap0` is absent and the default boot is
