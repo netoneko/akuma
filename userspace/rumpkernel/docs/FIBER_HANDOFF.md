@@ -20,9 +20,11 @@ the operational "where we are / what's next / how to run it".
   http://example.com/` → HTTP 200 in **16.3s on fiber vs 62.8s on the pthread
   baseline (~3.85× faster)**, `rump_server` = **1 OS thread (vs 19)**, PSTATS
   **`clone=0 futex=0` (vs `clone=20 futex=2606`)**. Same workload, same box.
-- **NEXT:** event-driven channel wakeup to shave the residual per-syscall latency
-  (still ~1s/proxied-syscall from the poll/yield + ~10ms rump-clock granularity);
-  Phase 5 herd/box `--net` auto-spawn ergonomics.
+- **NEXT (planned, see "PLANNED" section below):** port our C wrapper
+  (`rump_server.c`) to Rust + archive the C test harnesses to `c_tests/` (cleanup,
+  perf-neutral). Then: event-driven channel wakeup to shave the residual
+  per-syscall latency (~1s/proxied-syscall from poll/yield + ~10ms rump-clock
+  granularity); Phase 5 herd/box `--net` auto-spawn ergonomics.
 
 ## What's DONE and verified
 
@@ -112,6 +114,71 @@ RUMP_NIC=1 MEMORY=512M scripts/cargo_runner.sh target/aarch64-unknown-none/relea
   (wake the server's poll on a kernel pipe-write instead of ~tick polling) is the
   next lever.
 - Phase 5 herd/box `--net` auto-spawn ergonomics.
+
+## PLANNED (next session): port OUR C wrapper to Rust; archive C tests
+
+Goal (user, 2026-06-24): get rid of our hand-written C in `rumpuser/` by porting it
+to Rust, **keeping NetBSD's `rumpuser_sp.c` unmodified**, and moving our C test
+harnesses to `rumpuser/c_tests/`. This is a **cleanliness refactor, NOT a perf
+change** — verify curl stays ~16.3s afterward, then latency tweaks come separately.
+
+### What ports vs. what MUST stay C (know this before starting)
+
+| file | action | why |
+| --- | --- | --- |
+| `rump_server.c` (our wrapper/main) | **PORT → Rust** | calls only public/extern APIs (`rump_init`, `rump_pub_netconfig_*`, `rumpuser_sp_init_fd`, `rumpuser_akuma_*`, libc) — clean to port. |
+| `sp_serve_fd.c` | **KEEP C** | it `#include`s NetBSD `rumpuser_sp.c` to (a) host the `#define pthread_*`→fiber redirects *into* it and (b) call its `static` fns (`readframe`/`handlereq`/`banner`/`spclist`…). Rust can't call C statics or do that preprocessor redirect. This file **is** the bridge that "keeps NetBSD's rump_server" — leave it. |
+| `csupport.c` | KEEP C (for now) | libkern byte-loop overrides via `-Wl,--allow-multiple-definition` + a C-variadic `rumpuser_dprintf` + `rust_eh_personality` stub. Awkward in Rust; revisit later. |
+| `rumpcomp_tap.c` | KEEP C (for now) | the `/dev/net/tap0` virtif backend; portable in principle but it's the rump virtif contract + fiber RX, not "the wrapper". Separate task. |
+
+### Step 1 — archive C test harnesses → `rumpuser/c_tests/`
+
+Pure dev harnesses (not linked into any shipped binary):
+`test_fiber.c` (superseded by the Rust `mod tests`), `test_init.c`, `test_init_live.c`,
+`test_net.c`, `akctx_smoke.c`, `sp_fd_test.c`, `sp_client_test.c`.
+Update the 4 scripts that reference them to the new path:
+`docker-rumpuser-test.sh` + `docker-sysproxy-spike.sh` (`test_init.c`),
+`docker-net-test.sh` (`test_net.c`), `docker-sp-fd-test.sh` (`sp_fd_test.c`),
+`docker-sysproxy-client-test.sh` (`sp_client_test.c`).
+LEAVE in place (demos/payloads, not tests, used by other scripts): `hijack.c`,
+`rumphttp.c`, `rumpserver.c`, `virtif_user_instr.c`.
+
+### Step 2 — port `rump_server.c` → Rust
+
+Replicate its `main` in Rust: arg parse (`--fd N`, `--net`, `--if`, `--log`),
+`redirect_log` (open/dup2/mkdir), `rump_init()`, `--net` → `rump_pub_netconfig_ifcreate`
++ `rump_pub_netconfig_dhcp_ipv4_oneshot`, then `rumpuser_sp_init_fd(fd,"NetBSD",
+"7.99.34","evbarm64")`, then the **cooperative park loop already proven in
+`rump_server.c`**: `if rumpuser_akuma_cooperative()!=0 { loop { rumpuser_akuma_yield() } }
+else { loop { sleep(3600) } }`. Declare the rump/libc entry points `extern "C"`
+(several libc externs already live in `lib.rs`).
+
+**Recommended build mechanic (least disruptive — keeps the working gcc final link):**
+add a **feature-gated** entry to the rumpuser crate:
+`#[cfg(feature="rump_server_main")] #[no_mangle] pub extern "C" fn main(argc: c_int,
+argv: *const *const c_char) -> c_int { … }`. Then in `docker-build-rump-server.sh`:
+build the staticlib with `--features rump_server_main` (threads_fiber is now default)
+and **drop `rump_server.c` from the gcc link line** — crt0 calls the Rust `main`; keep
+linking `sp_serve_fd.o`, `rumpuser_errtrans.o`, `rumpcomp_tap.c`, `csupport.c` + the
+rump `.a`s.
+- **GOTCHA — don't put `main` in the default `.a`:** rumphttp/sic/tests define their
+  own `main`; an unconditional `main` in the shared `librumpuser_akuma.a` → duplicate
+  symbol. Hence the `rump_server_main` feature. Note the `.a` path is shared
+  (`target/aarch64-unknown-linux-musl/release/`), so the rump_server build must
+  rebuild the `.a` WITH the feature right before its link; other consumers rebuild
+  the default `.a`. (Alternative, cleaner but more plumbing: a dedicated `[[bin]]`
+  target that pulls the C objects + rump whole-archive libs via `build.rs`
+  `cargo:rustc-link-arg`; must link in Docker — native musl gcc, the macOS linker
+  rejects GNU `-Wl` flags, as `test-fiber.sh` documents.)
+
+Then archive `rump_server.c` itself to `c_tests/` as reference.
+
+### Step 3 — verify (refactor, so perf must be UNCHANGED)
+
+Rebuild lib + `rump_server`, full `populate_disk.sh`, `RUMP_NIC=1` boot, then
+`box use rumpnet -i /bin/curl -sS http://example.com/` → HTTP 200 in **~16.3s**
+(same as the C wrapper) and `ps` still shows `rump_server` as **1 OS thread**.
+Re-run `./test-fiber.sh` (Rust tests) — still PASS.
 
 ## Files
 
