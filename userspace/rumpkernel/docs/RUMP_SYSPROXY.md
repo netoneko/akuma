@@ -104,19 +104,74 @@ The in-process backend gives only one networked payload per box.
      returns immediately for `nfds==0` → CPU peg (the `ppoll=16.8M` storm, in *both*
      `--net` and not). Fixed: idle via `sleep()` (→ `nanosleep`, which blocks). (Kernel
      latent quirk to revisit: `ppoll(nfds=0)` should block until a signal, not return 0.)
-   - ⏳ **Remaining integration** (next; no architectural unknowns left — the
-     transport above is proven on Akuma):
-     1. **In-kernel `ClientMem`** over the calling box process's user VA — size
-        sanity-check only (cap + let the user-VA copy fault); full validation is the
-        server's job post-Rust-port (see Security TODOs).
-     2. **Syscall interception** for `stack=rump` boxes: route socket-family syscalls
-        to the rumpsp client instead of smoltcp.
-     3. **Marshaling / translation** (the only place ABI knowledge lives): Linux/Akuma
-        sysnum → NetBSD rump sysnum; arg packing into the `register_t` block; a per-box
-        **fd map** (box fd ↔ rump-server fd); `struct sockaddr_in` `sin_len` fixup served
-        via `ClientMem`; NetBSD errno → Akuma errno on return. (This is hijack.c's
-        Linux↔NetBSD work relocated into the kernel.)
-     4. **Kernel boot self-tests** per project policy.
+   - ✅ **Phase A — dispatch instrumentation + `stack=rump` wiring (2026-06-23).**
+     `SET_BOX_STACK` syscall (324); herd reads `stack = rump` from a `.conf`
+     (`rumpnet.conf`) and calls it after `register_box`; the kernel keeps a
+     `RUMP_BOXES` set (`rump_proxy::{mark_box_rump,box_is_rump}`). A non-breaking
+     trace (`[RUMP-SP]`) in `handle_syscall` logs a rump box's socket-family
+     syscalls, then falls through to smoltcp. **It revealed curl's exact
+     sequence** (committed): curl does **its own DNS over a UDP socket**
+     (`socket(AF_INET,DGRAM)`/`bind`/`sendto`/`recvmsg`/`close`) *then* the TCP
+     connection (`socket(AF_INET,STREAM,proto=6)`/`setsockopt`×5/`connect`/
+     `getsockname`/`getsockopt(SO_ERROR)`/`sendto`/`recvfrom`×N/`close`). Findings
+     that reshaped the plan:
+       - curl's **first** call is `socket(AF_INET6=10,…)` — the proxy must return
+         `EAFNOSUPPORT` (not proxy it) so curl falls back to IPv4.
+       - **UDP + `bind` + `recvmsg`** are on the DNS hot path (a TCP-only proxy
+         never resolves a name); `recvmsg` needs `msghdr`/iovec marshaling.
+       - curl uses **`sendto`/`recvfrom`, never `read`/`write`** on the socket.
+       - box fds are low (4,5) → register a real `FileDescriptor::RumpSocket`
+         (normal low fd, `poll`/`select`-compatible) and keep the box-fd→rump-fd
+         map *inside* that fd, NOT the `0x40000000+` `FdMap` (that breaks `fd_set`).
+   - 🚧 **Phase B (approach 1 — synchronous on the calling thread).** Decided
+     (vs the doc's per-box kthread): the box's *own* syscall thread drives the
+     rumpsp round-trip under a per-box cooperative lock, so `copyin`/`copyout`
+     trivially hit the **calling process's** VA (`current` TTBR0) — matching the
+     proven `run_demo`. The kthread/request-queue model is deferred until this is
+     proven (its `copyin` would need a cross-address-space page-table walk).
+     - ✅ **B1 — per-box lazy bring-up + `socket`/`close` round-trip (2026-06-23).**
+       `rump_proxy.rs`: `PROXIES` map (`Initializing`/`Ready`/`Failed`), `BoxProxy`
+       (the handshaken `Client` behind a take/replace slot — the guarding spinlock
+       is never held across the yielding channel read), `ensure_box_proxy` +
+       `setup_proxy` (spawns `/bin/rump_server --fd 3 --log …` into the box on
+       first `socket()`, installs the channel fd, handshakes). `intercept_box_syscall`
+       in `handle_syscall` returns `Some(result)` to short-circuit smoltcp.
+       **Validated on Akuma:** curl in the `rumpnet` box → `socket(AF_INET6)`
+       `EAFNOSUPPORT`, `socket(AF_INET)` spawns the server (`SERVING sysproxy on
+       fd 3`) and **round-trips to a real `rump_sys_socket`** → box fd 5, `close`
+       round-trips. No crash, VM healthy.
+       - **Bug fixed (self-interception):** the sysproxy server drives its channel
+         fd with socket `sendto`/`recvfrom` (NetBSD `rumpuser_sp.c` is written for
+         sockets), and it runs *inside* the `stack=rump` box, so its own channel
+         I/O was being intercepted → handshake deadlock. Fix: record the server
+         pid in `SERVER_PIDS` the instant it spawns (before the handshake) and
+         exclude those pids from interception — they fall through to the normal
+         dispatch that handles the pipe-backed `UnixSocket` fd (as box-0 `run_demo`
+         does).
+       - **`net=off` here is deliberate:** B1 ran the server WITHOUT `--net`, so
+         the NetBSD **data plane is down** (no `virt0`/DHCP/route). `socket`/`close`
+         are pure rump-kernel object ops and work; an actual `connect` to an IP
+         needs `--net` (B3). The fd-3 channel (control plane) is independent of
+         `net` and always present.
+     - ⏳ **B2 — TCP-path marshaling + real `ClientMem`** (in progress): `ProcMem`
+       (copyin/copyout over the calling proc's VA + `sockaddr_in` Linux↔NetBSD
+       translation on the pointer args, size-capped by `MAX_TRANSFER`); marshal
+       `connect`/`getsockname`/`sendto`/`recvfrom`/`read`/`write`; `getsockopt(SO_ERROR)`
+       short-circuits to 0 (the rump socket is kept blocking, so `connect` completes
+       synchronously — no pending error); `setsockopt` best-effort no-op (curl
+       tolerates). Then `connect` round-trips (→ `ENETUNREACH` until `--net`).
+     - ⏳ **B3 — `--net`**: bring up the rump stack (`virt0` + DHCP over
+       `/dev/net/tap0`) so `connect`/`sendto`/`recvfrom` reach the real wire.
+       **Risk:** the known `--net` DHCP `ppoll` busy-loop (see "Open items"); may
+       need DHCP to block rather than spin. Validation target:
+       `curl -H Host:ifconfig.me -L http://34.160.111.145` over the NetBSD stack.
+     - ⏳ **Open sub-problem:** `poll`/`ppoll` on a `RumpSocket` fd (curl's nonblock
+       loop) isn't intercepted yet — may need `RumpSocket` to report ready so curl
+       proceeds to the (blocking) recv.
+     - ⏳ **Kernel boot self-tests** per project policy.
+     - ⏳ **Cleanup:** herd still spawns its own no-`--fd` `rump_server` in the box
+       (idle, redundant with the kernel-spawned one) — have herd skip the spawn for
+       `stack=rump` so the kernel owns the daemon (avoids the double server).
 5. **herd**: the box bundle starts the rump_server payload + sets the box's
    `stack=rump` (see `RUMP_PLUS_HERD.md`); smoltcp off = the box's only stack.
    Validate end-to-end: `/bin/curl https://ifconfig.me` in a `stack=rump` box returns
@@ -156,11 +211,13 @@ The in-process backend gives only one networked payload per box.
   is specific to the *in-box fork+exec* path (not SPAWN_EXT, not box 0). Lower priority
   than the proxy. (Earlier framing as a "musl exec bug via curl-static" was wrong —
   curl-static doesn't exist; that path was a missing-binary failure.)
-- ❌ **NOT DONE — curl over the NetBSD/rump stack.** This is THE Step-5 target and it is
-  NOT working: nothing has yet routed a box binary's AF_INET through rumpnet's NetBSD
-  stack. Needs the **per-box proxy kthread** (kernel-as-client): `socket()` in a
-  `stack=rump` box → rump fd; `connect`/`send`/`recv`/`read`/`write`/`close`/DNS on it →
-  marshaled over the box's channel to the rump_server. That is the next build.
+- 🚧 **IN PROGRESS — curl over the NetBSD/rump stack** (Step-5 target). **B1 done
+  (2026-06-23):** a box binary's `socket()`/`close()` now route through the per-box
+  proxy to a real `rump_sys_socket` (validated with curl in the `rumpnet` box; see
+  Step 4 "Phase B"). The connection path (`connect`/`sendto`/`recvfrom`/`getsockname`)
+  is the in-progress B2 marshaling, and `--net` (B3) is needed before any of it
+  reaches the wire. So: dispatch + socket round-trip proven; actual end-to-end HTTP
+  (`curl -H Host:ifconfig.me -L http://34.160.111.145`) still pending B2+B3.
 
 ## Security / hardening TODOs
 - **Seal `rumpuser__hyp` after init.** Our Rust rumpuser exports `rumpuser__hyp` (the
