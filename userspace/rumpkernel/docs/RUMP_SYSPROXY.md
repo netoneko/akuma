@@ -210,13 +210,21 @@ The in-process backend gives only one networked payload per box.
    - ✅ **`bootstrap/bin/sic`** — static sic 1.3 (aarch64-musl, 130 KB) for the IRC
      capstone. Connect by IP (`sic -h <ip> -p 6667 -n <nick>`; no DNS).
 
-   ### 🛰️ IRC over rump — sic ↔ Libera (2026-06-23)
-   - ✅ **sic connects to Libera.chat (`82.96.96.60:6667`) over the NetBSD rump
-     stack and exchanges real IRC traffic.** Captured server dialogue:
-     `erbium.libera.chat: NOTICE *** Checking Ident / Looking up your hostname /
-     Couldn't look up your hostname` (the last is expected — no rDNS for the
-     SLIRP-NAT'd rump IP; the server proceeds). Path: `socket`→`connect`→`writev`
-     (NICK/USER registration)→`readv` (server replies), all proxied to rumpnet.
+   ### 🛰️ IRC over rump — sic FULLY REGISTERS with Libera.Chat (2026-06-23) ✅
+   - ✅ **CAPSTONE: a separately-compiled IRC client (sic), in a `stack=rump` box,
+     fully registered with Libera.Chat over the NetBSD rump stack and ran `LIST`.**
+     Captured: `001 Welcome to the Libera.Chat … netoneko`, `002 … erbium.libera.chat
+     [82.96.96.60/6667] running solanum-1.0-dev`, full 005 ISUPPORT, `251 66 users …
+     22425 channels formed`, the whole MOTD (375…376), `MODE +iw`, then
+     `:LIST #rumpkernel` → `321 … Users Name` / `401 #rumpkernel No such nick/channel`
+     / `323 End of /LIST`. (So `#rumpkernel` does NOT exist on Libera — historically
+     freenode; try OFTC.) Path: `socket`→`connect`→`writev` (NICK/USER)→`recvfrom`
+     (server replies)→`writev` PONGs, all proxied to rumpnet. ~135s, ~4.3 KB.
+   - Connect details first seen: `erbium.libera.chat NOTICE *** Checking Ident /
+     Looking up your hostname / Couldn't look up your hostname / No Ident response`
+     (the rDNS/ident failures are expected for the SLIRP-NAT'd rump IP; Libera
+     proceeds). To connect interactively: `box use rumpnet -i /bin/sic -h <ip> -p
+     6667 -n <nick>`, then `:j #chan`.
    - **Two enablers added for sic:**
      - **`readv`/`writev` marshaling** (Linux 65/66 → NetBSD 120/121). sic uses
        `fdopen`/`FILE*`, so musl stdio flushes/reads via `writev`/`readv`, NOT
@@ -230,12 +238,19 @@ The in-process backend gives only one networked payload per box.
        MSG_DONTWAIT)` probe forwarded to rump (NetBSD flags), POLLOUT always. Lets
        sic multiplex stdin + the IRC socket instead of blocking in recv. (Added to
        `epoll_check_fd_readiness`, so ppoll/pselect/epoll all use it.)
-   - ⚠️ **Throughput is the wall: ~1 byte/sec.** `readv` returns ~1 byte per call,
-     ~1s each — the rump tap-RX/TCP is so starved by the single-core pthread
-     scheduling that only ~1 byte is buffered per poll. In 185s sic read ~333 B
-     (the 3 NOTICEs) and **never reached the `001` welcome**, so registration
-     didn't finish and `:LIST #rumpkernel` never fired. Same latency root cause as
-     everything else; the IRC path is proven but unusable until it's fixed.
+   - **The throughput fix (sic patch).** Stock sic does `setbuf(srv, NULL)` (sic.c:187)
+     so the socket `FILE*` is unbuffered (so `select()` reflects true socket state) —
+     meaning every `fgets` is a **1-byte `readv`** (instrumented: `total_len=1`), and
+     each readv is a proxy round-trip → the first attempt was ~1 B/s (185s read only
+     the 3 connect NOTICEs, never reached `001`). The proxy itself drains fine (curl's
+     `recvfrom(102400)→163` in one call). **Fix: patched sic** to drain with ONE
+     `recv(fileno(srv), buf, 8191, 0)` per readable event into a line accumulator and
+     process all complete lines (writes still go via the unbuffered srv FILE* so
+     commands flush; every byte still passes through `select`). Now `recvfrom` pulls
+     big chunks (179/53/**2860**/171 B per call) → ~1 round-trip per burst, ~1000×.
+     The patched `sic.c` lives in the sic build; vendor it with the patch when sic is
+     moved in-tree. (A proxy-side per-`RumpSocket` read-ahead buffer is the alternative
+     that needs no client patch — deferred since the sic patch sufficed.)
    - ⚠️ **Robustness bugs found (see project task / TODO):** box procs stuck in a
      proxied syscall are **uninterruptible** (the proxy channel read never checks
      pending signals/interrupt), `kill <pid>` of a box proc returns "invalid pid"

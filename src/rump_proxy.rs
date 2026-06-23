@@ -598,6 +598,34 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
         // read/write(fd, buf, len) and readv/writev(fd, iov, iovcnt)
         _ => translation::pack_args(&[rump_fd as u64, a1, a2]),
     };
+    // DEBUG (drain investigation): for readv/writev, dump the iovec lengths the
+    // box passed — to tell "sic asked for 1 byte" (stdio) from "asked big, got 1"
+    // (rump/drain bug). iovec = {u64 base; u64 len} per entry.
+    if matches!(op, translation::Op::Readv | translation::Op::Writev) {
+        let cnt = (a2 as usize).min(8);
+        let mut iobuf = [0u8; 128];
+        if cnt > 0
+            && unsafe { copy_from_user_safe(iobuf.as_mut_ptr(), a1 as *const u8, cnt * 16).is_ok() }
+        {
+            let mut total = 0u64;
+            let mut l0 = 0u64;
+            for i in 0..cnt {
+                let len = u64::from_le_bytes(iobuf[i * 16 + 8..i * 16 + 16].try_into().unwrap());
+                if i == 0 {
+                    l0 = len;
+                }
+                total += len;
+            }
+            crate::safe_print!(
+                96,
+                "[RUMP-SP] {} iovcnt={} iov0_len={} total_len={}\n",
+                op_name(op),
+                a2,
+                l0,
+                total
+            );
+        }
+    }
     let mut mem = ProcMem::new();
     let t0 = crate::timer::uptime_us();
     let res = proxy.with_client(|c| c.syscall(translation::netbsd_sysno(op), &nb_args, &mut mem));
