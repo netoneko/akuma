@@ -30,6 +30,13 @@ rump_quiet = []
 # `--no-default-features` for the legacy pthread backend. aarch64-only (uses an
 # inline context-switch). See docs/HIJACK_VS_KERNEL_PROXY.md "fiber" sections.
 threads_fiber = []
+# Compile the Rust port of the `rump_server` wrapper `main` into the staticlib
+# (FIBER_HANDOFF.md port of rump_server.c). OFF by default: an unconditional
+# `main` would duplicate-symbol against the OTHER consumers of this `.a`
+# (rumphttp/sic/tests). docker-build-rump-server.sh rebuilds the `.a` WITH this
+# feature right before linking the rump_server binary, and drops rump_server.c
+# from the gcc link line (crt0 calls the Rust `main`).
+rump_server_main = []
 
 # Dependency-free on purpose: builds offline in the build container (no registry
 # index needed). All host primitives come from libc/pthread via raw extern "C".

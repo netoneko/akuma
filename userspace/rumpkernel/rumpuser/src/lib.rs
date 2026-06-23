@@ -210,6 +210,13 @@ pub static mut rumpuser__hyp: RumpHyperUp = RumpHyperUp {
 #[cfg(feature = "threads_fiber")]
 mod fiber;
 
+/// Rust port of the `rump_server` wrapper `main` (FIBER_HANDOFF.md port).
+/// Feature-gated so this `#[no_mangle] main` is absent from the default
+/// `librumpuser_akuma.a` (other consumers — rumphttp/sic/tests — define their own
+/// `main`); the shipped rump_server binary builds with `--features rump_server_main`.
+#[cfg(feature = "rump_server_main")]
+mod rump_server;
+
 /// pthread TLS key holding the current lwp pointer (per host thread).
 #[cfg(not(feature = "threads_fiber"))]
 static mut CURLWP_KEY: PthreadKey = 0;

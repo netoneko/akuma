@@ -20,11 +20,14 @@ the operational "where we are / what's next / how to run it".
   http://example.com/` → HTTP 200 in **16.3s on fiber vs 62.8s on the pthread
   baseline (~3.85× faster)**, `rump_server` = **1 OS thread (vs 19)**, PSTATS
   **`clone=0 futex=0` (vs `clone=20 futex=2606`)**. Same workload, same box.
-- **NEXT (planned, see "PLANNED" section below):** port our C wrapper
-  (`rump_server.c`) to Rust + archive the C test harnesses to `c_tests/` (cleanup,
-  perf-neutral). Then: event-driven channel wakeup to shave the residual
-  per-syscall latency (~1s/proxied-syscall from poll/yield + ~10ms rump-clock
-  granularity); Phase 5 herd/box `--net` auto-spawn ergonomics.
+- **DONE (2026-06-24, see "PORT — DONE" section below):** ported our C wrapper
+  `rump_server.c` → Rust (`rumpuser/src/rump_server.rs`, feature `rump_server_main`)
+  and archived the C harnesses **+ their docker test scripts** to `rumpuser/c_tests/`.
+  Verified **perf-neutral**: curl over the Rust-`main` rump_server = **HTTP 200 in
+  16.3s** (identical to the C wrapper), `ps` = **1 OS thread**, Rust fiber test PASS.
+- **NEXT:** event-driven channel wakeup to shave the residual per-syscall latency
+  (~1s/proxied-syscall from poll/yield + ~10ms rump-clock granularity); Phase 5
+  herd/box `--net` auto-spawn ergonomics.
 
 ## What's DONE and verified
 
@@ -115,12 +118,33 @@ RUMP_NIC=1 MEMORY=512M scripts/cargo_runner.sh target/aarch64-unknown-none/relea
   next lever.
 - Phase 5 herd/box `--net` auto-spawn ergonomics.
 
-## PLANNED (next session): port OUR C wrapper to Rust; archive C tests
+## PORT — DONE (2026-06-24): C wrapper → Rust; C tests + scripts archived
 
 Goal (user, 2026-06-24): get rid of our hand-written C in `rumpuser/` by porting it
 to Rust, **keeping NetBSD's `rumpuser_sp.c` unmodified**, and moving our C test
-harnesses to `rumpuser/c_tests/`. This is a **cleanliness refactor, NOT a perf
-change** — verify curl stays ~16.3s afterward, then latency tweaks come separately.
+harnesses to `rumpuser/c_tests/`. A **cleanliness refactor, NOT a perf change**.
+
+**Result — all three steps done and verified:**
+- **Step 1 ✓** archived the 7 C harnesses **and the 5 docker `*-test.sh` scripts**
+  that drive them into `rumpuser/c_tests/` (user asked to move the scripts too).
+  The moved scripts' `HERE` now resolves via `$(dirname "$0")/../..` so the Docker
+  mount + relative paths still point at the rumpkernel root. The 5 in-script test
+  paths were repointed to `rumpuser/c_tests/...`.
+- **Step 2 ✓** ported `rump_server.c` → `rumpuser/src/rump_server.rs`, a
+  `#[no_mangle] pub extern "C" fn main` gated behind the new `rump_server_main`
+  cargo feature (off by default — avoids a duplicate-`main` collision with the
+  other consumers of the shared `.a`). `docker-build-rump-server.sh` rebuilds the
+  `.a` `--features rump_server_main` right before its link and **drops
+  `rump_server.c` from the gcc line** (crt0 → the Rust `main`, force-included via
+  `--whole-archive`). `rump_server.c` archived to `c_tests/`. clippy clean both
+  with and without the feature.
+- **Step 3 ✓** rebuilt + full-populate + `RUMP_NIC=1` boot:
+  `box use rumpnet -i /bin/curl -sS http://example.com/` → **HTTP 200 in 16.3s**
+  (same as C), box log shows the Rust `main`'s byte-identical `RUMP_SERVER:` output
+  (DHCP `10.0.2.15`, `rumpuser_sp_init_fd(3) -> 0`, `SERVING ... (net=up)`), `ps`
+  shows `rump_server` as **1 OS thread**. `./test-fiber.sh` (Rust unit test) PASS.
+
+Historical bring-up notes for the port (kept for reference):
 
 ### What ports vs. what MUST stay C (know this before starting)
 
@@ -187,12 +211,19 @@ Key files (the 2026-06-24 networked-sysproxy fix touches the ★ ones — UNCOMM
   cooperative pthread-compat shims + a Rust `mod tests` (the deadlock regression).
 - `rumpuser/sp_serve_fd.c` ★ — sp-server fiber glue: `pthread_create`/`detach` AND
   `pthread_mutex_*`/`pthread_cond_*` runtime redirect; the timeout-0 poll+yield loop.
-- `rumpuser/rump_server.c` ★ — fiber-cooperative park loop (was `sleep(3600)`).
+- `rumpuser/src/rump_server.rs` ☆ — **NEW (2026-06-24 port)**: the Rust `rump_server`
+  wrapper `main` (was `rump_server.c`); feature `rump_server_main`. Same arg parse /
+  redirect_log / rump_init / `--net` / sp_init_fd / cooperative park loop.
 - `rumpuser/src/lib.rs` ★ — `#![cfg_attr(not(test), no_std)]` + gated panic handler
-  so the crate's Rust tests build; `rumpuser_akuma_cooperative()`/`_yield()` hooks.
+  so the crate's Rust tests build; `rumpuser_akuma_cooperative()`/`_yield()` hooks;
+  now also `#[cfg(feature="rump_server_main")] mod rump_server;`.
+- `rumpuser/Cargo.toml` ★ — `threads_fiber` DEFAULT; new `rump_server_main` feature.
+- `docker-build-rump-server.sh` ☆ — rebuilds the `.a` `--features rump_server_main`
+  and drops `rump_server.c` from the gcc link (crt0 → Rust `main`).
+- `rumpuser/c_tests/` ☆ — **NEW**: archived dev C harnesses (`rump_server.c`,
+  `test_*.c`, `sp_*_test.c`, `akctx_smoke.c`) + their 5 docker `*-test.sh` drivers.
 - `rumpuser/test-fiber.sh` ★ — Rust-test runner (rust-lld cross-build + Docker arm64).
-- `rumpuser/test_fiber.c` ★ — Test C added (sp mutex/cond ping-pong via `akfiber_sp_*`).
-- `rumpuser/Cargo.toml` ★ — `threads_fiber` is now the DEFAULT feature.
+- `rumpuser/sp_serve_fd.c` — KEPT C (it `#include`s NetBSD's unmodified `rumpuser_sp.c`).
 - `rumpuser/rumpcomp_tap.c` — fiber RX (thread + cooperative read).
 - `docs/HIJACK_VS_KERNEL_PROXY.md` — analysis + results.
 

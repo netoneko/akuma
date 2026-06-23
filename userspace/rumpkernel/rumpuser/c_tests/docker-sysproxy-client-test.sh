@@ -5,7 +5,9 @@
 # tiny client, start the rump_server payload, and have the client run rump_sys_*
 # against the SERVER stack over the sysproxy unix socket.
 set -eu
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# NOTE: this script lives in rumpuser/c_tests/ (archived dev harness); HERE
+# resolves to the rumpkernel root so the Docker mount + relative paths still work.
+HERE="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "${HERE}"
 [ -x out/rump_server_akuma ] || { echo "build out/rump_server_akuma first (./docker-build-rump-server.sh)" >&2; exit 1; }
 
@@ -48,7 +50,7 @@ exec docker run --rm \
             || { echo "RSYS_FAIL"; exit 1; }
         echo "=== link sp_client_test ==="
         gcc -O2 -static -o /tmp/sp_client_test \
-            rumpuser/sp_client_test.c /tmp/rumpclient.o /tmp/rump_syscalls.o \
+            rumpuser/c_tests/sp_client_test.c /tmp/rumpclient.o /tmp/rump_syscalls.o \
             -I /usr/local/include -I "$I" \
             -Wl,--allow-multiple-definition -lpthread 2>&1 | sed "s/^/[ld] /" \
             || { echo "LINK_FAIL"; exit 1; }

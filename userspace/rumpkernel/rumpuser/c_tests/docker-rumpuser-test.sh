@@ -12,7 +12,9 @@
 # linked here; same aarch64-musl ABI as the container.
 set -eu
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# NOTE: this script lives in rumpuser/c_tests/ (archived dev harness); HERE
+# resolves to the rumpkernel root so the Docker mount + relative paths still work.
+HERE="$(cd "$(dirname "$0")/../.." && pwd)"
 RUMPUSER_A="rumpuser/target/aarch64-unknown-linux-musl/release/librumpuser_akuma.a"
 
 [ -f "${HERE}/${RUMPUSER_A}" ] || { echo "missing ${RUMPUSER_A} — build it first" >&2; exit 1; }
@@ -34,7 +36,7 @@ exec docker run --rm \
         # otherwise prefer → runtime "librump.so.0 not found"). Also matches
         # Akumas static-only ELF model.
         gcc -O2 -static -o /tmp/test_init \
-            rumpuser/test_init.c rumpuser/csupport.c \
+            rumpuser/c_tests/test_init.c rumpuser/csupport.c \
             -I "$I" \
             -Wl,--allow-multiple-definition \
             -Wl,--whole-archive \

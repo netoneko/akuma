@@ -12,7 +12,9 @@
 # Stage B: link test_init + librump.a + rumpuser_akuma.a + rumpuser_sp.o, with
 #          --allow-multiple-definition so the real sp_* override our Rust stubs.
 set -eu
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# NOTE: this script lives in rumpuser/c_tests/ (archived dev harness); HERE
+# resolves to the rumpkernel root so the Docker mount + relative paths still work.
+HERE="$(cd "$(dirname "$0")/../.." && pwd)"
 RUMPUSER_A="rumpuser/target/aarch64-unknown-linux-musl/release/librumpuser_akuma.a"
 [ -f "${HERE}/${RUMPUSER_A}" ] || { echo "missing ${RUMPUSER_A} — build it first" >&2; exit 1; }
 [ -f "${HERE}/obj/dest.stage/usr/lib/librump.a" ] || { echo "missing librump.a — run ./docker-build.sh" >&2; exit 1; }
@@ -88,7 +90,7 @@ CFG
         echo
         echo "=== Stage B: link test_init + librump + rumpuser + sp + errtrans ==="
         gcc -O2 -static -o /tmp/test_init_sp \
-            rumpuser/test_init.c rumpuser/csupport.c \
+            rumpuser/c_tests/test_init.c rumpuser/csupport.c \
             /tmp/rumpuser_sp.o /tmp/rumpuser_errtrans.o \
             -I "$I" \
             -Wl,--allow-multiple-definition \

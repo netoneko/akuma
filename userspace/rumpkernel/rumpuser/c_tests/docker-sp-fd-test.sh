@@ -4,7 +4,9 @@
 # sysproxy server can serve on a PRE-CONNECTED fd (kernel-pipe transport), by
 # compiling sp_serve_fd.c (adds rumpuser_sp_init_fd) and running sp_fd_test.c.
 set -eu
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# NOTE: this script lives in rumpuser/c_tests/ (archived dev harness); HERE
+# resolves to the rumpkernel root so the Docker mount + relative paths still work.
+HERE="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "${HERE}"
 RUMPUSER_A="rumpuser/target/aarch64-unknown-linux-musl/release/librumpuser_akuma.a"
 [ -f "${RUMPUSER_A}" ] || { echo "missing ${RUMPUSER_A} — build it first" >&2; exit 1; }
@@ -43,7 +45,7 @@ exec docker run --rm \
 
         echo "=== link sp_fd_test ==="
         gcc -O2 -static -o /tmp/sp_fd_test \
-            rumpuser/sp_fd_test.c rumpuser/rumpcomp_tap.c rumpuser/csupport.c \
+            rumpuser/c_tests/sp_fd_test.c rumpuser/rumpcomp_tap.c rumpuser/csupport.c \
             /tmp/sp_serve_fd.o /tmp/rumpuser_errtrans.o \
             -I "$I" -I "$VDIR" -I /tmp/inc -DVIRTIF_BASE=virt \
             -Wl,--allow-multiple-definition \

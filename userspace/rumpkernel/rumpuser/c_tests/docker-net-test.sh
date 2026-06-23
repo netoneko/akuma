@@ -17,7 +17,9 @@
 # rumpuser_component_* helpers our Rust rumpuser now provides.
 set -eu
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# NOTE: this script lives in rumpuser/c_tests/ (archived dev harness); HERE
+# resolves to the rumpkernel root so the Docker mount + relative paths still work.
+HERE="$(cd "$(dirname "$0")/../.." && pwd)"
 RUMPUSER_A="rumpuser/target/aarch64-unknown-linux-musl/release/librumpuser_akuma.a"
 
 [ -f "${HERE}/${RUMPUSER_A}" ] || { echo "missing ${RUMPUSER_A}" >&2; exit 1; }
@@ -53,7 +55,7 @@ exec docker run --rm \
         # (the dir also has .so). Net faction order under whole-archive does not
         # matter.
         gcc -O2 -static -o /tmp/test_net \
-            rumpuser/test_net.c rumpuser/csupport.c /tmp/virtif_user.o \
+            rumpuser/c_tests/test_net.c rumpuser/csupport.c /tmp/virtif_user.o \
             -I "$I" \
             -Wl,--allow-multiple-definition \
             -Wl,--whole-archive \

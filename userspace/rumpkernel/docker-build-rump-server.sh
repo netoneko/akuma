@@ -14,7 +14,15 @@ set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "${HERE}"
 RUMPUSER_A="rumpuser/target/aarch64-unknown-linux-musl/release/librumpuser_akuma.a"
-[ -f "${RUMPUSER_A}" ] || { echo "missing ${RUMPUSER_A} — build it first" >&2; exit 1; }
+
+# The rump_server wrapper `main` is now Rust (rumpuser/src/rump_server.rs), gated
+# behind the `rump_server_main` feature. Rebuild the (shared) staticlib WITH that
+# feature right before this link so the Rust `main` is force-included below — other
+# consumers (rumphttp/sic) rebuild the default `.a` without it. threads_fiber is
+# the crate's default feature, so the fiber backend is still in. See FIBER_HANDOFF.md.
+echo "=== build rumpuser staticlib (--features rump_server_main) ==="
+( cd rumpuser && cargo build --release --target aarch64-unknown-linux-musl --features rump_server_main )
+[ -f "${RUMPUSER_A}" ] || { echo "missing ${RUMPUSER_A} — cargo build failed" >&2; exit 1; }
 [ -f "obj/dest.stage/usr/lib/librumpkern_sysproxy.a" ] || { echo "missing librumpkern_sysproxy.a" >&2; exit 1; }
 mkdir -p out
 
@@ -62,8 +70,12 @@ exec docker run --rm \
             2>&1 | sed "s/^/[et] /" || { echo "SP_COMPILE_FAIL errtrans"; exit 1; }
 
         echo "=== link rump_server (static aarch64-musl) ==="
+        # NOTE: rump_server.c is GONE from this link — its main() is now the Rust
+        # main in librumpuser_akuma.a (built --features rump_server_main above) and
+        # is force-included via --whole-archive below; crt0 calls it. The wrapper C
+        # is archived at rumpuser/c_tests/rump_server.c for reference.
         gcc -O2 -static -o out/rump_server_akuma \
-            rumpuser/rump_server.c rumpuser/rumpcomp_tap.c rumpuser/csupport.c \
+            rumpuser/rumpcomp_tap.c rumpuser/csupport.c \
             /tmp/rumpuser_sp.o /tmp/rumpuser_errtrans.o \
             -I "$I" -I "$VDIR" -I /tmp/inc -DVIRTIF_BASE=virt \
             -Wl,--allow-multiple-definition \
