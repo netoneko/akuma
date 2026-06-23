@@ -18,6 +18,13 @@ rumpuser_debug = []
 # keep the NetBSD copyright banner + boot steps visible out of respect. An
 # explicit RUMP_VERBOSE env var overrides this either way.
 rump_quiet = []
+# Cooperative (fiber) threading backend instead of pthread. Collapses the ~19
+# rump kthreads onto one OS thread + a userspace cooperative scheduler (a Rust
+# port of NetBSD's rumpfiber.c on top of an aarch64 context switch), killing the
+# single-vCPU thundering-herd latency. OFF by default — the pthread backend is
+# the shipped M2 path. aarch64-only (uses an inline context-switch). See
+# docs/HIJACK_VS_KERNEL_PROXY.md "fiber" sections.
+threads_fiber = []
 
 # Dependency-free on purpose: builds offline in the build container (no registry
 # index needed). All host primitives come from libc/pthread via raw extern "C".

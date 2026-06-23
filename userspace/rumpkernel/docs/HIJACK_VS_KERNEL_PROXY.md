@@ -507,8 +507,51 @@ akctx_smoke akctx_smoke.c`; run on disk via SSH as `/bin/akctx_smoke`.
    *only* de-risked route — and would still have to clear `no_std` + our
    offline/no-deps build + symmetric-switch + C-stack-interop.
 
+## Implementation status — threading layer ported + validated (2026-06-23)
+
+Path chosen: **Option 2 (Rust port, feature-gated)** — keep our Rust `rumpuser`,
+add the cooperative backend behind a cargo feature so the shipped pthread/M2 path
+is untouched.
+
+Done:
+
+- **`rumpuser/Cargo.toml`**: new `threads_fiber` feature (off by default).
+- **`rumpuser/src/lib.rs`**: the pthread threading/sync/curlwp block is wrapped in
+  `#[cfg(not(feature="threads_fiber"))] mod pthread_backend` (default build is
+  byte-identical — M2 intact); `clock_sleep`, `CURLWP_KEY`, and the `rumpuser_init`
+  curlwp path are individually gated; `rumpkern_{un,}sched` are reused by the fiber
+  module via descendant-module privacy.
+- **`rumpuser/src/fiber.rs`** (~580 lines): a faithful Rust port of NetBSD's
+  `rumpfiber.c` on top of the validated `akctx`-style switch — intrusive
+  run/exited/join lists, round-robin `schedule()` with wakeup timers, thread
+  lifecycle, wait-queues, and the full hypercall set (thread_create/exit/join,
+  curlwp, clock_sleep, mutex×7, rw×8, cv×9). Single OS thread, cooperative.
+- **Builds clean both ways**: `cargo build/clippy` for `aarch64-unknown-linux-musl`
+  with and without `--features threads_fiber` — zero warnings, zero clippy findings.
+- **Validated end-to-end** with `rumpuser/test_fiber.c` (stubs the two hyp
+  scheduler upcalls, drives the hypercalls directly): Test A = 3 fibers
+  cooperatively `clock_sleep` + exit + join; Test B = two fibers mutex+condvar
+  ping-pong (perfect P/Q alternation, 10 rounds). **PASS on both** the Linux
+  baseline (static aarch64-musl in arm64 Alpine) and **Akuma EL0** (`/bin/fiber_test`
+  over SSH). So create/schedule/sleep/exit/join/mutex/cv all work on the
+  hand-rolled switch, in Akuma.
+
+Next (not yet done):
+
+- **Boot `rump_init` under fiber** — build `rump_server` linking the fiber
+  `rumpuser` (thread the `threads_fiber` feature through the container build /
+  `build-rumphttp.sh`); confirm the rump kernel comes up with ~1 OS thread instead
+  of ~19. The rump *kernel* libs are threading-agnostic and unchanged.
+- **The sp-server coupling (the real long pole)** — `rumpuser_sp.c` does blocking
+  channel reads; on one cooperative OS thread that blocks every fiber. rump_init +
+  DHCP may well come up, but the sysproxy *serve loop* needs the cooperative rework
+  (yield-on-I/O, or a dedicated host pthread that hands work into the fiber world)
+  before M2's shared stack works under fiber.
+
 ## Source pointers (fiber)
 
+- `rumpuser/src/fiber.rs` — the cooperative backend (Rust port of `rumpfiber.c`).
+- `rumpuser/test_fiber.c` — standalone validation harness (Linux + Akuma).
 - `crates/akuma-exec/src/threading/mod.rs:1102` — **Akuma's own `switch_context`
   `global_asm!`**; the reference our EL0 cooperative switch is adapted from.
 - `src/exceptions.rs:108–237` — the EL1 trap-frame save/restore (full q0–q31 +

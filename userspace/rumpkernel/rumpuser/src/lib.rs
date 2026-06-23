@@ -51,12 +51,17 @@ macro_rules! tr {
 // ── libc / pthread externs (resolved by the musl libc the final program links) ──
 
 extern "C" {
+    // malloc: only the pthread backend's lock/cv allocs use it (the fiber backend
+    // declares its own); rumpuser_malloc itself uses posix_memalign.
+    #[cfg(not(feature = "threads_fiber"))]
     fn malloc(size: usize) -> *mut c_void;
     fn free(ptr: *mut c_void);
     fn posix_memalign(memptr: *mut *mut c_void, align: usize, size: usize) -> c_int;
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> c_int;
     fn clock_gettime(clk: c_int, ts: *mut Timespec) -> c_int;
+    // nanosleep: only the pthread clock_sleep uses it (fiber yields cooperatively).
+    #[cfg(not(feature = "threads_fiber"))]
     fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> c_int;
     fn write(fd: c_int, buf: *const c_void, n: usize) -> isize;
     fn abort() -> !;
@@ -67,13 +72,18 @@ extern "C" {
     fn __errno_location() -> *mut c_int;
     fn getrandom(buf: *mut c_void, buflen: usize, flags: u32) -> isize;
 
-    fn pthread_create(t: *mut PthreadT, attr: *const c_void, f: extern "C" fn(*mut c_void) -> *mut c_void, arg: *mut c_void) -> c_int;
-    fn pthread_join(t: PthreadT, retval: *mut *mut c_void) -> c_int;
-    fn pthread_exit(retval: *mut c_void) -> !;
-
     // Only referenced by the rumpuser_debug tid trace; keep the decl unconditionally.
     #[allow(dead_code)]
     fn pthread_self() -> *mut c_void;
+}
+
+// pthread primitives used only by the default (pthread) threading backend; gated
+// out under `threads_fiber` (the fiber backend supplies its own scheduler).
+#[cfg(not(feature = "threads_fiber"))]
+extern "C" {
+    fn pthread_create(t: *mut PthreadT, attr: *const c_void, f: extern "C" fn(*mut c_void) -> *mut c_void, arg: *mut c_void) -> c_int;
+    fn pthread_join(t: PthreadT, retval: *mut *mut c_void) -> c_int;
+    fn pthread_exit(retval: *mut c_void) -> !;
     fn pthread_key_create(key: *mut PthreadKey, destructor: *const c_void) -> c_int;
     fn pthread_setspecific(key: PthreadKey, value: *const c_void) -> c_int;
     fn pthread_getspecific(key: PthreadKey) -> *mut c_void;
@@ -100,7 +110,9 @@ extern "C" {
     fn pthread_cond_destroy(c: *mut c_void) -> c_int;
 }
 
+#[cfg_attr(feature = "threads_fiber", allow(dead_code))]
 type PthreadT = *mut c_void; // musl pthread_t is pointer-sized
+#[cfg_attr(feature = "threads_fiber", allow(dead_code))]
 type PthreadKey = u32; // musl pthread_key_t is unsigned int
 
 #[repr(C)]
@@ -111,6 +123,7 @@ struct Timespec {
 
 // errno values used here
 const ENOMEM: c_int = 12;
+#[cfg(not(feature = "threads_fiber"))] // only the pthread lock/cv paths use EBUSY
 const EBUSY: c_int = 16;
 const ENXIO: c_int = 6;
 
@@ -184,7 +197,14 @@ pub static mut rumpuser__hyp: RumpHyperUp = RumpHyperUp {
     hyp_extra: [ptr::null_mut(); 8],
 };
 
+/// Cooperative (fiber) threading backend — a Rust port of NetBSD's rumpfiber.c
+/// on top of an aarch64 context switch. Replaces the pthread threading/sync/
+/// curlwp/clock_sleep hypercalls below when `--features threads_fiber` is set.
+#[cfg(feature = "threads_fiber")]
+mod fiber;
+
 /// pthread TLS key holding the current lwp pointer (per host thread).
+#[cfg(not(feature = "threads_fiber"))]
 static mut CURLWP_KEY: PthreadKey = 0;
 
 #[no_mangle]
@@ -201,9 +221,14 @@ pub unsafe extern "C" fn rumpuser_init(version: c_int, hyp: *const RumpHyperUp) 
     rumpuser__hyp = *hyp;
     HYPERUP = core::ptr::addr_of!(rumpuser__hyp);
     // Allocate the curlwp TLS key once (init is single-threaded).
+    #[cfg(not(feature = "threads_fiber"))]
     if pthread_key_create(&mut CURLWP_KEY, ptr::null()) != 0 {
         return ENOMEM;
     }
+    // Fiber backend: bring up the cooperative scheduler instead (the main thread
+    // becomes the first fiber; no pthread TLS key needed for curlwp).
+    #[cfg(feature = "threads_fiber")]
+    fiber::init_sched();
     0
 }
 
@@ -278,6 +303,10 @@ pub unsafe extern "C" fn rumpuser_clock_gettime(enum_: c_int, sec: *mut i64, nse
     0
 }
 
+// pthread clock_sleep: unschedule the rump CPU around a real host nanosleep.
+// (Fiber backend replaces this with a cooperative msleep that yields to the
+// scheduler — a real nanosleep there would block ALL fibers.)
+#[cfg(not(feature = "threads_fiber"))]
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_clock_sleep(enum_: c_int, sec: i64, nsec: c_long) -> c_int {
     tr!(b"clock_sleep");
@@ -404,6 +433,16 @@ pub unsafe extern "C" fn rumpuser_getrandom(buf: *mut c_void, buflen: usize, _fl
     *retp = if got == 0 { buflen } else { got };
     0
 }
+
+// ── pthread threading/sync/curlwp backend ────────────────────────────────────
+// The default backend: rump kthreads are 1:1 host pthreads; locks/cv/rw map to
+// pthread primitives. Wrapped in a module so the entire block is swapped out for
+// the cooperative `fiber` backend under `--features threads_fiber` (the
+// #[no_mangle] exports below are unaffected by the module path). See
+// docs/HIJACK_VS_KERNEL_PROXY.md.
+#[cfg(not(feature = "threads_fiber"))]
+mod pthread_backend {
+    use super::*;
 
 // ── threads ─────────────────────────────────────────────────────────────────
 
@@ -798,6 +837,8 @@ pub unsafe extern "C" fn rumpuser_cv_has_waiters(cv: *mut Cv, nwaiters: *mut c_i
     tr!(b"cv_has_waiters");
     *nwaiters = (*cv).waiters;
 }
+
+} // mod pthread_backend
 
 // ── files / block I/O — STUBS (not needed to init the network stack) ─────────
 
