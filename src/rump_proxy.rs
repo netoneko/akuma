@@ -245,6 +245,11 @@ const LINUX_ENOMEM: i32 = 12;
 const LINUX_EOPNOTSUPP: i32 = 95;
 const LINUX_EAFNOSUPPORT: i32 = 97;
 
+// NetBSD `recv`/`send` flag values (differ from Linux): used on the UDP/DNS path
+// so a nonblocking `recvfrom` drain returns EAGAIN instead of blocking the proxy.
+const NB_MSG_PEEK: u64 = 0x2;
+const NB_MSG_DONTWAIT: u64 = 0x80;
+
 /// Intercept a `stack=rump` box's socket-family syscall and forward it to the
 /// box's `rump_server`. Returns `Some(result)` to short-circuit normal smoltcp
 /// dispatch, or `None` to fall through (non-rump box, non-socket syscall, or a
@@ -297,19 +302,22 @@ pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
         translation::Op::Socket => proxy_socket(args, proc, box_id),
         translation::Op::Close => proxy_close(args, proc, box_id),
         translation::Op::Connect => proxy_connect(args, proc, box_id),
+        translation::Op::Bind => proxy_bind(args, proc, box_id),
         translation::Op::Getsockname => proxy_getname(args, proc, box_id, translation::Op::Getsockname),
         translation::Op::Getpeername => proxy_getname(args, proc, box_id, translation::Op::Getpeername),
         translation::Op::Getsockopt => proxy_getsockopt(args, proc),
         translation::Op::Setsockopt => proxy_setsockopt(args, proc),
         translation::Op::Sendto => proxy_transfer(args, proc, box_id, translation::Op::Sendto),
         translation::Op::Recvfrom => proxy_transfer(args, proc, box_id, translation::Op::Recvfrom),
+        translation::Op::Recvmsg => proxy_recvmsg(args, proc, box_id),
         translation::Op::Read => proxy_transfer(args, proc, box_id, translation::Op::Read),
         translation::Op::Write => proxy_transfer(args, proc, box_id, translation::Op::Write),
         translation::Op::Readv => proxy_transfer(args, proc, box_id, translation::Op::Readv),
         translation::Op::Writev => proxy_transfer(args, proc, box_id, translation::Op::Writev),
-        // Not on the curl HTTP-to-IP path yet (bind/listen/accept/shutdown/
-        // sendmsg/recvmsg — the last two incl. DNS's UDP recvmsg). Clean error so
-        // the box never reaches smoltcp with a rump fd.
+        // Not marshaled yet (listen/accept/shutdown/sendmsg). musl's resolver
+        // receives DNS answers via recvmsg (handled above) and sends via sendto,
+        // so it never needs sendmsg. Clean error so the box never reaches smoltcp
+        // with a rump fd.
         _ => neg_linux_errno(LINUX_EOPNOTSUPP),
     })
 }
@@ -451,19 +459,20 @@ impl ClientMem for ProcMem {
     }
 }
 
-/// Resolve a box socket fd → (its proxy, the server's rump fd), or a negated
-/// Linux errno to return to the box.
+/// Resolve a box socket fd → (its proxy, the server's rump fd, the box's
+/// requested nonblock flag), or a negated Linux errno to return to the box. The
+/// nonblock flag drives the UDP `recvfrom` drain (musl loops until EAGAIN).
 fn proxy_and_fd(
     args: &[u64; 6],
     proc: &Process,
     box_id: u64,
-) -> Result<(Arc<BoxProxy>, i32), u64> {
-    let rump_fd = match proc.get_fd(args[0] as u32) {
-        Some(process::FileDescriptor::RumpSocket { rump_fd, .. }) => rump_fd,
+) -> Result<(Arc<BoxProxy>, i32, bool), u64> {
+    let (rump_fd, nonblock) = match proc.get_fd(args[0] as u32) {
+        Some(process::FileDescriptor::RumpSocket { rump_fd, nonblock }) => (rump_fd, nonblock),
         _ => return Err(neg_linux_errno(LINUX_EBADF)),
     };
     match ensure_box_proxy(box_id) {
-        Some(p) => Ok((p, rump_fd)),
+        Some(p) => Ok((p, rump_fd, nonblock)),
         None => Err(neg_linux_errno(LINUX_ENOMEM)),
     }
 }
@@ -473,7 +482,7 @@ fn proxy_and_fd(
 /// this completes synchronously (no EINPROGRESS dance). Reaches the wire only
 /// once the server runs with `--net` (else `ENETUNREACH`).
 fn proxy_connect(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
-    let (proxy, rump_fd) = match proxy_and_fd(args, proc, box_id) {
+    let (proxy, rump_fd, _nonblock) = match proxy_and_fd(args, proc, box_id) {
         Ok(x) => x,
         Err(e) => return e,
     };
@@ -516,10 +525,42 @@ fn proxy_connect(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
     }
 }
 
+/// `bind(fd, addr, len)` → translate the box's Linux `sockaddr_in` to NetBSD
+/// (served via `cin_override`) and forward. musl's UDP resolver binds the source
+/// (`INADDR_ANY:0`, AF_INET) before `sendto`-ing the nameserver, so the DNS path
+/// needs this even though the TCP/curl path never binds.
+fn proxy_bind(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
+    let (proxy, rump_fd, _nonblock) = match proxy_and_fd(args, proc, box_id) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let addr_ptr = args[1];
+    if addr_ptr == 0 || (args[2] as usize) < 16 {
+        return neg_linux_errno(LINUX_EINVAL);
+    }
+    let mut lin = [0u8; 16];
+    if unsafe { copy_from_user_safe(lin.as_mut_ptr(), addr_ptr as *const u8, 16).is_err() } {
+        return neg_linux_errno(LINUX_EFAULT);
+    }
+    let Some(nb) = translation::sockaddr_in_linux_to_netbsd(&lin) else {
+        return neg_linux_errno(LINUX_EAFNOSUPPORT);
+    };
+    let mut mem = ProcMem::new();
+    mem.cin_override.insert(addr_ptr, nb.to_vec());
+    let res = proxy.with_client(|c| {
+        let a = translation::pack_args(&[rump_fd as u64, addr_ptr, 16]);
+        c.syscall(translation::netbsd_sysno(translation::Op::Bind), &a, &mut mem)
+    });
+    match res {
+        Ok(_) => 0,
+        Err(e) => neg_linux_errno(translation::errno_netbsd_to_linux(e)),
+    }
+}
+
 /// `getsockname`/`getpeername(fd, addr, len)` → forward; the result NetBSD
 /// `sockaddr_in` is translated back to Linux via `cout_sockaddr`.
 fn proxy_getname(args: &[u64; 6], proc: &Process, box_id: u64, op: translation::Op) -> u64 {
-    let (proxy, rump_fd) = match proxy_and_fd(args, proc, box_id) {
+    let (proxy, rump_fd, _nonblock) = match proxy_and_fd(args, proc, box_id) {
         Ok(x) => x,
         Err(e) => return e,
     };
@@ -575,12 +616,22 @@ fn proxy_setsockopt(args: &[u64; 6], proc: &Process) -> u64 {
     0
 }
 
-/// Data transfer on a connected rump socket: `sendto`/`recvfrom` (curl's TCP I/O)
-/// and `read`/`write` (other programs). `buf`=args[1], `len`=args[2] for all
-/// four; flags + dest addr are ignored (connected TCP, rump socket blocking — no
-/// MSG_NOSIGNAL needed). Returns the byte count.
+/// Data transfer on a rump socket: `sendto`/`recvfrom` (curl's TCP I/O + the
+/// UDP/DNS path) and `read`/`write` (other programs). `buf`=args[1],
+/// `len`=args[2] for all four. Returns the byte count.
+///
+/// Connected-socket I/O (curl's TCP recv/send, `read`/`write`) passes a NULL
+/// addr; the rump socket is kept blocking so it completes synchronously. The
+/// UDP/DNS path differs: musl's resolver `sendto`s to an explicit nameserver
+/// address and `recvfrom`s capturing the source, then loops the recv until
+/// EAGAIN. So when `sendto` carries a dest addr (args[4]≠0) we translate it
+/// Linux→NetBSD (via `cin_override`, like `connect`); when `recvfrom` passes a
+/// source-addr buffer (args[4]≠0) we mark it for the NetBSD→Linux back-translation
+/// (`cout_sockaddr`) and — for a nonblocking box socket — set NetBSD
+/// `MSG_DONTWAIT` so the drain loop terminates with EAGAIN instead of wedging the
+/// proxy waiting for a packet that will never come.
 fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation::Op) -> u64 {
-    let (proxy, rump_fd) = match proxy_and_fd(args, proc, box_id) {
+    let (proxy, rump_fd, nonblock) = match proxy_and_fd(args, proc, box_id) {
         Ok(x) => x,
         Err(e) => return e,
     };
@@ -590,10 +641,38 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
     // scatters/gathers via ProcMem copyin/copyout against the box VA. sic uses
     // FILE*/fdopen → stdio flushes via writev/readv, so these are load-bearing.
     let (a1, a2) = (args[1], args[2]);
+    let mut mem = ProcMem::new();
     let nb_args = match op {
-        // sendto/recvfrom(s, buf, len, flags=0, addr=NULL, addrlen=0)
-        translation::Op::Sendto | translation::Op::Recvfrom => {
-            translation::pack_args(&[rump_fd as u64, a1, a2, 0, 0, 0])
+        // sendto(s, buf, len, flags, addr, addrlen): a NULL addr is connected TCP
+        // (current behavior); an explicit AF_INET addr is the UDP datagram path.
+        translation::Op::Sendto => {
+            let (addr_ptr, addrlen) = (args[4], args[5]);
+            if addr_ptr != 0 && addrlen as usize >= 16 {
+                let mut lin = [0u8; 16];
+                if unsafe { copy_from_user_safe(lin.as_mut_ptr(), addr_ptr as *const u8, 16).is_err() } {
+                    return neg_linux_errno(LINUX_EFAULT);
+                }
+                let Some(nb) = translation::sockaddr_in_linux_to_netbsd(&lin) else {
+                    return neg_linux_errno(LINUX_EAFNOSUPPORT);
+                };
+                mem.cin_override.insert(addr_ptr, nb.to_vec());
+                // flags=0: strip Linux MSG_NOSIGNAL (no signals over the proxy).
+                translation::pack_args(&[rump_fd as u64, a1, a2, 0, addr_ptr, 16])
+            } else {
+                translation::pack_args(&[rump_fd as u64, a1, a2, 0, 0, 0])
+            }
+        }
+        // recvfrom(s, buf, len, flags, addr, addrlen): a NULL addr is connected
+        // TCP recv (current behavior); a source-addr buffer is the UDP path.
+        translation::Op::Recvfrom => {
+            let (addr_ptr, addrlen_ptr) = (args[4], args[5]);
+            if addr_ptr != 0 {
+                mem.cout_sockaddr.insert(addr_ptr);
+                let flags = if nonblock { NB_MSG_DONTWAIT } else { 0 };
+                translation::pack_args(&[rump_fd as u64, a1, a2, flags, addr_ptr, addrlen_ptr])
+            } else {
+                translation::pack_args(&[rump_fd as u64, a1, a2, 0, 0, 0])
+            }
         }
         // read/write(fd, buf, len) and readv/writev(fd, iov, iovcnt)
         _ => translation::pack_args(&[rump_fd as u64, a1, a2]),
@@ -626,7 +705,6 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
             );
         }
     }
-    let mut mem = ProcMem::new();
     let t0 = crate::timer::uptime_us();
     let res = proxy.with_client(|c| c.syscall(translation::netbsd_sysno(op), &nb_args, &mut mem));
     let dt = crate::timer::uptime_us().saturating_sub(t0);
@@ -637,6 +715,107 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
         }
         Err(e) => {
             crate::safe_print!(96, "[RUMP-SP] {} -> errno {} ({}us)\n", op_name(op), e, dt);
+            neg_linux_errno(translation::errno_netbsd_to_linux(e))
+        }
+    }
+}
+
+// Linux aarch64 `struct msghdr` field offsets (LP64): name@0, namelen@8 (u32),
+// iov@16, iovlen@24 (size_t), control@32, controllen@40 (size_t), flags@48 (u32).
+const MSGHDR_NAME: usize = 0;
+const MSGHDR_NAMELEN: usize = 8;
+const MSGHDR_IOV: usize = 16;
+const MSGHDR_IOVLEN: usize = 24;
+const MSGHDR_CONTROLLEN: usize = 40;
+const MSGHDR_FLAGS: usize = 48;
+const MSGHDR_SIZE: usize = 56;
+
+/// `recvmsg(fd, msghdr, flags)` on a rump socket. musl's DNS resolver receives
+/// answers via `recvmsg` (one iovec + a `msg_name` to capture the responding
+/// nameserver), so this is the DNS receive path's load-bearing call.
+///
+/// Rather than translate the whole Linux⇄NetBSD `msghdr` ABI (the two layouts
+/// disagree on `msg_iovlen`/`msg_control` widths), we decompose the box's Linux
+/// `msghdr` here in the kernel — where we know the layout — and drive the
+/// already-proven rump `recvfrom`: scatter into the first iovec, capture the
+/// source into `msg_name` (translated NetBSD→Linux via `cout_sockaddr`), and
+/// point `recvfrom`'s `fromlenaddr` at the `msg_namelen` field so the server
+/// updates it in place. A nonblocking box socket gets NetBSD `MSG_DONTWAIT` so
+/// the resolver's drain loop terminates with EAGAIN instead of wedging the proxy.
+/// (Only the first iovec is used — DNS answers are a single datagram in one
+/// buffer; a multi-iovec scatter would need a bounce buffer, logged if seen.)
+fn proxy_recvmsg(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
+    let (proxy, rump_fd, nonblock) = match proxy_and_fd(args, proc, box_id) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let msghdr_ptr = args[1];
+    if msghdr_ptr == 0 {
+        return neg_linux_errno(LINUX_EFAULT);
+    }
+    let mut mh = [0u8; MSGHDR_SIZE];
+    if unsafe { copy_from_user_safe(mh.as_mut_ptr(), msghdr_ptr as *const u8, MSGHDR_SIZE).is_err() } {
+        return neg_linux_errno(LINUX_EFAULT);
+    }
+    let rd_u64 = |off: usize| u64::from_le_bytes(mh[off..off + 8].try_into().unwrap());
+    let msg_name = rd_u64(MSGHDR_NAME);
+    let msg_iov = rd_u64(MSGHDR_IOV);
+    let msg_iovlen = rd_u64(MSGHDR_IOVLEN);
+    if msg_iov == 0 || msg_iovlen == 0 {
+        return neg_linux_errno(LINUX_EINVAL);
+    }
+    if msg_iovlen != 1 {
+        // DNS uses a single iovec; a multi-iovec scatter isn't implemented.
+        crate::safe_print!(64, "[RUMP-SP] recvmsg iovlen={} (>1 unsupported)\n", msg_iovlen);
+    }
+    // First iovec = { void *iov_base; size_t iov_len }.
+    let mut iov = [0u8; 16];
+    if unsafe { copy_from_user_safe(iov.as_mut_ptr(), msg_iov as *const u8, 16).is_err() } {
+        return neg_linux_errno(LINUX_EFAULT);
+    }
+    let iov_base = u64::from_le_bytes(iov[0..8].try_into().unwrap());
+    let iov_len = u64::from_le_bytes(iov[8..16].try_into().unwrap());
+
+    let mut mem = ProcMem::new();
+    let flags = if nonblock { NB_MSG_DONTWAIT } else { 0 };
+    // Capture the source into msg_name; recvfrom's fromlenaddr is the msghdr's
+    // own msg_namelen field (a u32 the box set to its buffer size), updated in
+    // place to the actual address length by the server.
+    let (addr_ptr, addrlen_ptr) = if msg_name != 0 {
+        mem.cout_sockaddr.insert(msg_name);
+        (msg_name, msghdr_ptr + MSGHDR_NAMELEN as u64)
+    } else {
+        (0, 0)
+    };
+    let t0 = crate::timer::uptime_us();
+    let res = proxy.with_client(|c| {
+        let a = translation::pack_args(&[rump_fd as u64, iov_base, iov_len, flags, addr_ptr, addrlen_ptr]);
+        c.syscall(translation::netbsd_sysno(translation::Op::Recvfrom), &a, &mut mem)
+    });
+    let dt = crate::timer::uptime_us().saturating_sub(t0);
+    match res {
+        Ok([n, _]) => {
+            // Clear msg_controllen + msg_flags in the box's msghdr (no ancillary
+            // data, not truncated); the resolver may inspect msg_flags.
+            let zero64 = 0u64.to_le_bytes();
+            let zero32 = 0u32.to_le_bytes();
+            unsafe {
+                let _ = copy_to_user_safe(
+                    (msghdr_ptr + MSGHDR_CONTROLLEN as u64) as *mut u8,
+                    zero64.as_ptr(),
+                    8,
+                );
+                let _ = copy_to_user_safe(
+                    (msghdr_ptr + MSGHDR_FLAGS as u64) as *mut u8,
+                    zero32.as_ptr(),
+                    4,
+                );
+            }
+            crate::safe_print!(96, "[RUMP-SP] recvmsg -> {} ({}us)\n", n, dt);
+            n as u64
+        }
+        Err(e) => {
+            crate::safe_print!(96, "[RUMP-SP] recvmsg -> errno {} ({}us)\n", e, dt);
             neg_linux_errno(translation::errno_netbsd_to_linux(e))
         }
     }
@@ -668,9 +847,6 @@ impl ClientMem for DiscardMem {
 /// NOTE: each call is one sysproxy round-trip, so polling a rump fd is not cheap
 /// (the proxy latency applies).
 pub fn rump_socket_readable(rump_fd: i32) -> bool {
-    // NetBSD flags: MSG_PEEK=0x2, MSG_DONTWAIT=0x80 (differs from Linux 0x40).
-    const NB_MSG_PEEK: u64 = 0x2;
-    const NB_MSG_DONTWAIT: u64 = 0x80;
     let pid = process::read_current_pid().unwrap_or(0);
     let Some(proc) = process::lookup_process(pid) else {
         return false;

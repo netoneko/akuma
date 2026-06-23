@@ -119,6 +119,7 @@ The in-process backend gives only one networked payload per box.
          `EAFNOSUPPORT` (not proxy it) so curl falls back to IPv4.
        - **UDP + `bind` + `recvmsg`** are on the DNS hot path (a TCP-only proxy
          never resolves a name); `recvmsg` needs `msghdr`/iovec marshaling.
+         ✅ **DONE 2026-06-23** — see "DNS over rump" below.
        - curl uses **`sendto`/`recvfrom`, never `read`/`write`** on the socket.
        - box fds are low (4,5) → register a real `FileDescriptor::RumpSocket`
          (normal low fd, `poll`/`select`-compatible) and keep the box-fd→rump-fd
@@ -266,6 +267,46 @@ The in-process backend gives only one networked payload per box.
      Only clean reset today is a VM reboot. Fix: make the proxy read honor
      interrupt/timeout (return EINTR), reclaim the client slot from a dead holder,
      fix box-pid kill.
+
+   ### 🌐 DNS over rump — `curl http://example.com` resolves + fetches (2026-06-23) ✅
+   - ✅ **A box binary now resolves a hostname over the NetBSD stack and fetches it.**
+     `box use rumpnet -i /bin/curl -sS http://example.com/` → DNS resolve
+     `example.com → 104.20.23.154` over UDP through rump, then the TCP fetch → **HTTP
+     200**. Live `[RUMP-SP]` trace: `socket(AF_INET6)`→`EAFNOSUPPORT`,
+     `socket(AF_INET,DGRAM|NONBLOCK)`→`bind`→`sendto 29B (query)`→`recvmsg 61B
+     (answer w/ A record)`→`close`, then `socket(STREAM)`→`connect 104.20.23.154:80`
+     →`sendto (GET)`→`recvfrom 873B`→HTTP 200. This completes the UDP/DNS hot path
+     flagged in Phase A.
+   - **Three additions, all in `src/rump_proxy.rs`** (no new wire protocol — reuses
+     `ProcMem`'s `cin_override`/`cout_sockaddr`):
+     - **`proxy_bind`** — translate the box's Linux `sockaddr_in` → NetBSD (served via
+       `cin_override`, like `connect`) and forward. musl's resolver binds
+       `INADDR_ANY:0` before sending.
+     - **`proxy_transfer` UDP branches** — `sendto` now marshals the destination
+       address when present (`args[4]≠0` ⇒ UDP datagram; NULL addr stays the TCP-
+       connected path), and `recvfrom` captures the source (`cout_sockaddr`) and sets
+       NetBSD `MSG_DONTWAIT` for a nonblocking box socket so the resolver's drain loop
+       ends on EAGAIN instead of wedging the proxy.
+     - **`proxy_recvmsg`** (the actual blocker — the trace proved this resolver
+       *receives* via `recvmsg`, not `recvfrom`). Rather than translate the whole
+       Linux⇄NetBSD `msghdr` ABI (the layouts disagree on `msg_iovlen`/`msg_control`
+       widths), it decomposes the Linux `msghdr` in-kernel — where the layout is known
+       — and drives the already-proven rump `recvfrom`: scatter into the first iovec,
+       capture the source into `msg_name`, point `recvfrom`'s `fromlenaddr` at the
+       msghdr's own `msg_namelen` field, then zero `msg_controllen`/`msg_flags`.
+   - **Nameserver caveat.** Requires a *working* resolver. QEMU SLIRP's built-in
+     forwarder `10.0.2.3` returns **empty answers** on some hosts (observed here on
+     macOS; it also hung the native smoltcp stack), so `bootstrap/etc/resolv.conf` now
+     defaults to `8.8.8.8`/`1.1.1.1` (reached via the rump default route → SLIRP →
+     internet, the same egress the M2 TCP path proved). Swap back to `10.0.2.3` where
+     SLIRP DNS works.
+   - **Scope / not-yet:** `sendmsg` (the send-side mirror) is still `EOPNOTSUPP` — this
+     resolver sends via `sendto`, so DNS doesn't need it; add it for a glibc/c-ares
+     client. Multi-iovec `recvmsg` scatter is unimplemented (DNS is single-iovec;
+     logged if `iovlen>1` ever appears). Kernel boot self-test for the proxy path is
+     still TODO (project policy) — the DNS path is validated e2e, not by a self-test
+     (it needs a live `rump_server`).
+
 5. **herd**: the box bundle starts the rump_server payload + sets the box's
    `stack=rump` (see `RUMP_PLUS_HERD.md`); smoltcp off = the box's only stack.
    Validate end-to-end: `/bin/curl https://ifconfig.me` in a `stack=rump` box returns

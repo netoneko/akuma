@@ -16,9 +16,11 @@ Goal: **M1 DONE** (2026-06-22 — NetBSD stack in an Akuma box, DHCP + HTTP to t
 unmodified static binaries in a `stack=rump` box have their AF_INET routed by the
 KERNEL to a shared boxed `rump_server`, validated end-to-end with **`curl` (HTTPS-by-IP)
 AND `sic` holding a live IRC session on `#rumpkernel` (OFTC) over the NetBSD stack**.
-See "M2 ACHIEVED" below + RUMP_SYSPROXY.md ("Phase B" / IRC). Current target:
-drive down per-syscall latency (the one real weakness) + robustness (task #9) + the
-DNS path (UDP/recvmsg) + boot self-tests.
+See "M2 ACHIEVED" below + RUMP_SYSPROXY.md ("Phase B" / IRC). **DNS now works over
+the rump stack (2026-06-23)** — `curl http://example.com` resolves + fetches HTTP 200
+through NetBSD (`bind` + `sendto`-with-dest + `recvmsg` marshaling added to
+`src/rump_proxy.rs`). Current target: drive down per-syscall latency (the one real
+weakness) + robustness (task #9) + boot self-tests.
 
 ---
 
@@ -45,6 +47,7 @@ DNS path (UDP/recvmsg) + boot self-tests.
 | **🏆 M2 — kernel-as-sysproxy-client: unmodified binary's AF_INET → shared boxed rump_server** | ✅ **DONE 2026-06-23** |
 | **`curl` HTTPS-by-IP over rump** (`-H Host:ifconfig.me http://34.160.111.145` → `87.71.13.205`) | ✅ **2026-06-23** |
 | **`sic` IRC: live `#rumpkernel` session on OFTC over rump** (acceptance/11 capstone) | ✅ **2026-06-23** (`163.61.26.35:6667`) |
+| **DNS over rump** — `curl http://example.com` resolves + fetches via NetBSD (`bind`+`sendto`-dest+`recvmsg`) | ✅ **2026-06-23** (`example.com`→`104.20.23.154`→HTTP 200) |
 | Phase 5 — herd autostarts `rumpnet` box (`--net --fd 3`, kernel attaches sysproxy channel) | ✅ **2026-06-23** (herd OWNS the rump_server; `restart=false`) |
 | Rump SDK tarball (`bootstrap/archives/rump-sdk-aarch64-musl.tar.gz` → VM `/archives`) | ✅ `package-sdk.sh` (48 MB, 154 archives) |
 | Akuma integration (libakuma, build-std core) | ✅ proven sufficient — stock host link runs on Akuma as-is |
@@ -343,8 +346,22 @@ The path WORKS; the weaknesses are performance + robustness, not correctness:
    the single serialized `BoxProxy.client` slot means one wedged proc blocks ALL others
    (they spin in `with_client`). Only reboot clears it. Fix: interrupt/timeout the proxy
    read (return EINTR), reclaim the client slot from a dead holder, fix box-pid kill.
-3. **DNS path (UDP):** curl's own DNS uses `socket(DGRAM)`/`bind`/`sendto`/`recvmsg` —
-   not yet marshaled (so use raw IPs for now). Add UDP + `bind` + `recvmsg`/`sendmsg`.
+3. **DNS path (UDP): ✅ DONE (2026-06-23).** musl's resolver does
+   `socket(AF_INET,DGRAM|NONBLOCK)` → `bind(INADDR_ANY:0)` → `sendto(query, ns:53)` →
+   `recvmsg(answer)`. All three new calls are in `src/rump_proxy.rs`: `proxy_bind`
+   (translate sockaddr like connect); `proxy_transfer` now marshals `sendto`'s dest
+   addr (args[4]≠0 ⇒ UDP) and `recvfrom`'s source capture + `MSG_DONTWAIT`-when-
+   nonblock so the drain loop ends on EAGAIN; and `proxy_recvmsg` decomposes the
+   Linux `msghdr` in-kernel and drives the proven rump `recvfrom` (first iovec +
+   `msg_name` source capture, `fromlenaddr`=the msghdr's `msg_namelen` field) — no
+   full msghdr ABI translation needed. Validated live: `box use rumpnet -i /bin/curl
+   http://example.com` → resolve `104.20.23.154` → HTTP 200. NOTE: requires a working
+   nameserver — QEMU SLIRP's `10.0.2.3` returns empty answers on some hosts, so
+   `bootstrap/etc/resolv.conf` now defaults to `8.8.8.8`/`1.1.1.1` (reached via the
+   rump default route → SLIRP → internet). `sendmsg` (the send-side mirror) is still
+   `EOPNOTSUPP` — this resolver sends via `sendto`, so DNS doesn't need it; add it if
+   a glibc/c-ares client shows up. Multi-iovec `recvmsg` scatter is unimplemented
+   (DNS is single-iovec; logged if `iovlen>1` ever appears).
 4. **Kernel boot self-tests** for the proxy path (project policy — task #6).
 5. **Security/hardening** (RUMP_SYSPROXY.md): sp-wire bounds-checks, seal `rumpuser__hyp`
    (mprotect), per-box isolation self-tests, channel-fd private to rump_server.

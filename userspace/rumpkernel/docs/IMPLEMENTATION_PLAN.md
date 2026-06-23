@@ -50,7 +50,8 @@ box, which satisfies 2+3):
    *through the rump stack* over `/dev/net/tap0` (not smoltcp) — body returned. ✅
 
 **Explicitly deferred (later milestones):**
-- DNS resolution via the rump stack (M1 uses a literal host IP).
+- DNS resolution via the rump stack (M1 uses a literal host IP). ✅ since DONE in M2
+  (2026-06-23) — see Phase 7 below.
 - Replacing or interoperating with Akuma's native smoltcp stack.
 - File-system / device rump factions; only networking is in scope.
 
@@ -359,9 +360,16 @@ self-tests in `src/process_tests.rs` (per repo convention), not only e2e checks.
 - Residual: ran the payload by hand over SSH; the cold `box open --net` auto-spawn
   is Phase 5 (still ⏳). DNS (Phase 7) deferred — M1 uses a literal host IP.
 
-### Phase 7 — DNS (later) — ⏳ DEFERRED (post-M1, as planned)
-- Configure the rump resolver from DHCP option 6 and switch the curl target from
-  a literal IP to a hostname. Out of scope for M1.
+### Phase 7 — DNS — ✅ DONE (2026-06-23, via the M2 sysproxy path)
+- `box use rumpnet -i /bin/curl http://example.com` resolves the hostname over UDP
+  through the NetBSD stack (`example.com → 104.20.23.154`) and fetches HTTP 200 —
+  a real hostname, not a literal IP. Implemented by marshaling the resolver's
+  `bind` + `sendto`-with-dest + `recvmsg` over the kernel sysproxy channel
+  (`src/rump_proxy.rs`); see `RUMP_SYSPROXY.md` "DNS over rump" and `HANDOFF.md`.
+- The resolver reads `/etc/resolv.conf` (Akuma VFS, not the rump kernel). It now
+  defaults to `8.8.8.8`/`1.1.1.1` because QEMU SLIRP's `10.0.2.3` forwarder returns
+  empty answers on some hosts; configuring the resolver from DHCP option 6 instead
+  of a static file remains a nicety, not a blocker.
 
 ---
 
