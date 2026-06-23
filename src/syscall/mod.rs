@@ -264,6 +264,10 @@ pub mod nr {
     pub const FB_DRAW: u64 = 322;
     #[cfg(feature = "sc-framebuffer")]
     pub const FB_INFO: u64 = 323;
+    /// Select a box's network stack: arg0 = box_id, arg1 = stack (0 = smoltcp,
+    /// 1 = rump). herd calls this for a `stack = rump` service so the kernel
+    /// routes that box's AF_INET syscalls to its rump_server (RUMP_SYSPROXY.md).
+    pub const SET_BOX_STACK: u64 = 324;
     pub const GETPID: u64 = 172;
     pub const GETPPID: u64 = 173;
     pub const GETUID: u64 = 174;
@@ -614,6 +618,12 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     let need_timing = track_time || crate::config::PROC_SYSCALL_LOG_ENABLED;
     let t0 = if need_timing { crate::timer::uptime_us() } else { 0 };
 
+    // Instrumentation (Phase A): trace a `stack=rump` box's socket-family
+    // syscalls so we can confirm the dispatch decision before routing them to
+    // the rump_server proxy. Non-breaking — falls through to normal dispatch.
+    #[cfg(feature = "rump")]
+    crate::rump_proxy::trace_box_syscall(syscall_num, args);
+
     let result = match syscall_num {
         nr::EXIT => proc::sys_exit(args[0] as i32),
         nr::READ => fs::sys_read(args[0], args[1], args[2] as usize),
@@ -682,6 +692,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::POLL_INPUT_EVENT => term::sys_poll_input_event(args[0], args[1] as usize, args[2]),
         nr::GET_CPU_STATS => term::sys_get_cpu_stats(args[0], args[1] as usize),
         nr::SPAWN_EXT => proc::sys_spawn_ext(args[0], args[1], args[2], args[3], args[4], args[5]),
+        nr::SET_BOX_STACK => proc::sys_set_box_stack(args[0], args[1]),
         #[cfg(feature = "sc-containers")]
         nr::REGISTER_BOX => container::sys_register_box(args[0], args[1], args[2] as usize, args[3], args[4] as usize, args[5] as u32),
         #[cfg(feature = "sc-containers")]

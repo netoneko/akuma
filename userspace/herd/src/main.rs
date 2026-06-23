@@ -100,6 +100,9 @@ struct ServiceConfig {
     /// Path to an OCI bundle directory. If set, overrides command/box_root
     /// with values from the bundle's config.json.
     bundle: String,
+    /// Network stack for the box: "" / "smoltcp" (default) or "rump" (route the
+    /// box's AF_INET through its rump_server via the kernel sysproxy client).
+    stack: String,
 }
 
 impl Default for ServiceConfig {
@@ -112,6 +115,7 @@ impl Default for ServiceConfig {
             boxed: false,
             box_root: String::from("/"),
             bundle: String::new(),
+            stack: String::new(),
         }
     }
 }
@@ -548,6 +552,7 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                     config.bundle = String::from(value);
                     config.boxed = true; // bundles are always boxed
                 }
+                "stack" => config.stack = String::from(value),
                 _ => {}
             }
         }
@@ -673,6 +678,13 @@ pub struct SpawnOptions {
 
 const SYSCALL_SPAWN_EXT: u64 = 315;
 const SYSCALL_REGISTER_BOX: u64 = 316;
+const SYSCALL_SET_BOX_STACK: u64 = 324;
+
+/// Tell the kernel a box uses the NetBSD rump network stack (stack = 1). The
+/// kernel then routes that box's AF_INET syscalls to its rump_server.
+fn set_box_stack_rump(box_id: u64) {
+    libakuma::syscall(SYSCALL_SET_BOX_STACK, box_id, 1, 0, 0, 0, 0);
+}
 
 fn generate_box_id(name: &str) -> u64 {
     let mut box_id = 0u64;
@@ -829,6 +841,9 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
 
         // 1. Register box (creates mount namespace in kernel)
         register_box(name, box_id, &root_dir, 0);
+        if config.stack == "rump" {
+            set_box_stack_rump(box_id);
+        }
 
         // 2. Set up OCI mounts in the box's namespace
         setup_oci_mounts(box_id, &oci.mounts);
@@ -843,6 +858,9 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
         let box_id = generate_box_id(name);
         let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
         register_box(name, box_id, &config.box_root, 0);
+        if config.stack == "rump" {
+            set_box_stack_rump(box_id);
+        }
         let res = spawn_in_box(box_id, &config.command, &args);
         if let Some(ref r) = res {
             register_box(name, box_id, &config.box_root, r.pid);

@@ -21,6 +21,105 @@ const EFAULT: i32 = 14;
 /// hanging the boot before herd/SSH come up.
 const READ_TIMEOUT_US: u64 = 8_000_000;
 
+// ── per-box stack selection + dispatch instrumentation (Phase A) ───────────
+
+use alloc::collections::BTreeSet;
+use core::sync::atomic::{AtomicBool, Ordering};
+use spinning_top::Spinlock;
+
+/// Box IDs whose network stack is the NetBSD rump kernel — set via the
+/// `SET_BOX_STACK` syscall when herd starts a `stack = rump` service. A box not
+/// in this set uses smoltcp (the default), so its socket dispatch is unchanged.
+static RUMP_BOXES: Spinlock<BTreeSet<u64>> = Spinlock::new(BTreeSet::new());
+
+/// Fast-path guard: the per-syscall trace/dispatch hook costs a single relaxed
+/// load when no `stack=rump` box exists (the common case / pre-rumpnet boot).
+static RUMP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Mark `box_id` as using the rump network stack. Idempotent; never un-marks
+/// (a later smoltcp-default spawn into the same box must not clear it).
+pub fn mark_box_rump(box_id: u64) {
+    RUMP_BOXES.lock().insert(box_id);
+    RUMP_ACTIVE.store(true, Ordering::Relaxed);
+    crate::safe_print!(64, "[RUMP-SP] box {} marked stack=rump\n", box_id);
+}
+
+/// Is this box's network stack the rump kernel?
+#[must_use]
+pub fn box_is_rump(box_id: u64) -> bool {
+    if !RUMP_ACTIVE.load(Ordering::Relaxed) {
+        return false;
+    }
+    RUMP_BOXES.lock().contains(&box_id)
+}
+
+/// Short name for an [`xlate::Op`] (the `safe_print!` formatter is byte-bounded
+/// and `{:?}` Debug output is awkward to size, so use a fixed `&str`).
+fn op_name(op: xlate::Op) -> &'static str {
+    use xlate::Op::*;
+    match op {
+        Socket => "socket",
+        Connect => "connect",
+        Bind => "bind",
+        Listen => "listen",
+        Accept => "accept",
+        Sendto => "sendto",
+        Recvfrom => "recvfrom",
+        Setsockopt => "setsockopt",
+        Getsockopt => "getsockopt",
+        Getsockname => "getsockname",
+        Getpeername => "getpeername",
+        Sendmsg => "sendmsg",
+        Recvmsg => "recvmsg",
+        Shutdown => "shutdown",
+        Socketpair => "socketpair",
+        Read => "read",
+        Write => "write",
+        Close => "close",
+    }
+}
+
+/// Diagnostic (Phase A): for a `stack=rump` box, log every socket-family
+/// syscall — plus read/write/close on a socket fd — then RETURN so normal
+/// dispatch (smoltcp) still runs. Non-breaking by design: it changes no control
+/// flow, it only reveals the exact syscall/fd sequence the box's networked
+/// programs (e.g. curl) issue, so the Phase-B proxy can be built to cover it.
+/// Directly serves "we are probably not dispatching the syscalls right."
+pub fn trace_box_syscall(syscall_num: u64, args: &[u64; 6]) {
+    if !RUMP_ACTIVE.load(Ordering::Relaxed) {
+        return; // no rump box exists → single relaxed load, no lock
+    }
+    let Some(op) = xlate::op_from_linux_sysno(syscall_num) else {
+        return; // not a proxied syscall family
+    };
+    let pid = process::read_current_pid().unwrap_or(0);
+    let Some(proc) = process::lookup_process(pid) else {
+        return;
+    };
+    if !box_is_rump(proc.box_id) {
+        return;
+    }
+    // read/write/close also hit files/pipes — only trace them on a socket fd
+    // (the Phase-B proxy must likewise leave non-socket fds to normal dispatch).
+    if matches!(op, xlate::Op::Read | xlate::Op::Write | xlate::Op::Close)
+        && !matches!(proc.get_fd(args[0] as u32), Some(process::FileDescriptor::Socket(_)))
+    {
+        return;
+    }
+    crate::safe_print!(
+        192,
+        "[RUMP-SP] box={} pid={} {} nr={} a0={} a1=0x{:x} a2=0x{:x} a3=0x{:x}\n",
+        proc.box_id,
+        pid,
+        op_name(op),
+        syscall_num,
+        args[0],
+        args[1],
+        args[2],
+        args[3]
+    );
+}
+
 /// Kernel [`PipeIo`]: wraps the kernel pipe API + scheduler yield + clock. The
 /// blocking read loop (poll + yield + timeout) lives in `akuma_rump` (host-tested
 /// via a mock `PipeIo`); this just supplies the real primitives.

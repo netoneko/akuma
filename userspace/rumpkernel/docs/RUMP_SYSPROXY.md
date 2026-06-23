@@ -138,15 +138,29 @@ The in-process backend gives only one networked payload per box.
   accepts bare hex with a `0x` prefix, so `box use 185c61f8b7` falls through to a name
   lookup and misses. Working forms: `box use rumpnet`, `box use 104629139639`,
   `box use 0x185c61f8b7`. TODO: make the resolver accept the hex form `ps` prints.
-- ⚠️ **KNOWN ISSUE — in-box fork+exec SIGSEGVs.** A process *already inside* a box that
-  `fork+exec`s another binary crashes: `busybox sh` → `/bin/curl-static` faults with an
-  **instruction abort at `ELR=0x0`/`FAR=0x0`** (jumped to null; `x30=0`) — i.e. the exec
-  of the child failed and control went to address 0. The box-use-spawned process (busybox
-  sh, via the kernel SPAWN_EXT path) runs fine; only the *in-box* fork+exec path breaks.
-  Works in box 0. TBD — likely a fork/exec-in-box bug, not curl-specific.
-- ℹ️ **Networking note:** binaries run in the box still use **smoltcp** (the box shares
-  the kernel AF_INET) until the per-box proxy kthread lands — so curl-over-rump is not
-  yet wired; that is the next target.
+- ✅ **curl (musl) runs + does real HTTPS from inside the box** — via `box use`:
+  `box use rumpnet -i /bin/curl -sS https://ifconfig.me/ip` → `87.71.13.205` (mbedTLS).
+  **This is over SMOLTCP ONLY — NOT the NetBSD/rump stack.** The box shares the kernel's
+  native AF_INET, so curl-in-a-box is just curl-over-smoltcp-in-a-box; it does **not**
+  validate the rump path. Launched via `box use` (kernel SPAWN_EXT), which loads musl
+  binaries fine. (`/bin/curl` is the real static curl+mbedTLS; `/bin/curl-static` does
+  NOT exist — running that path is what "segfaulted"/"box use: failed", a missing binary,
+  not a real bug.)
+- ✅ **In-box fork+exec works for native binaries — including networking.** `busybox sh`
+  inside the box → `/bin/hello` runs; → `/bin/meow` (~250 KB, native libakuma) runs AND
+  talks to ollama over smoltcp. So fork+exec + in-box userspace networking work — over
+  **smoltcp**, not rump.
+- ⚠️ **OPEN — in-box fork+exec of a large *dynamic* binary faults.** `busybox sh` →
+  `busybox wget` (busybox re-exec) SIGSEGVs (`[DP] no lazy region for inst FAR=0x0` →
+  `WILD-IA ELR=0x0`, entry=0). `/bin/curl` runs fine via `box use` (SPAWN_EXT), so this
+  is specific to the *in-box fork+exec* path (not SPAWN_EXT, not box 0). Lower priority
+  than the proxy. (Earlier framing as a "musl exec bug via curl-static" was wrong —
+  curl-static doesn't exist; that path was a missing-binary failure.)
+- ❌ **NOT DONE — curl over the NetBSD/rump stack.** This is THE Step-5 target and it is
+  NOT working: nothing has yet routed a box binary's AF_INET through rumpnet's NetBSD
+  stack. Needs the **per-box proxy kthread** (kernel-as-client): `socket()` in a
+  `stack=rump` box → rump fd; `connect`/`send`/`recv`/`read`/`write`/`close`/DNS on it →
+  marshaled over the box's channel to the rump_server. That is the next build.
 
 ## Security / hardening TODOs
 - **Seal `rumpuser__hyp` after init.** Our Rust rumpuser exports `rumpuser__hyp` (the

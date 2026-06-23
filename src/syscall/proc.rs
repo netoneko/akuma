@@ -1236,6 +1236,21 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
     ENOMEM
 }
 
+/// `SET_BOX_STACK(box_id, stack)` — select a box's network stack. `stack == 1`
+/// marks the box as using the NetBSD rump kernel (its AF_INET syscalls are
+/// routed to that box's rump_server); any other value is a no-op (smoltcp
+/// default). herd calls this for a `stack = rump` service. Without the `rump`
+/// kernel feature the call is harmlessly ignored.
+pub fn sys_set_box_stack(box_id: u64, stack: u64) -> u64 {
+    #[cfg(feature = "rump")]
+    if stack == 1 {
+        crate::rump_proxy::mark_box_rump(box_id);
+    }
+    #[cfg(not(feature = "rump"))]
+    let _ = (box_id, stack);
+    0
+}
+
 pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
     if pid == 0 { return 0; }
     // Linux: kill(pid <= 0, ...) targets a process group; we don't support
