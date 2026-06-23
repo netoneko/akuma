@@ -39,6 +39,11 @@ void virtif_dump_stats(void);   /* from rumpcomp_tap.c (best-effort) */
 /* serve on a pre-connected fd (kernel-pipe transport); from sp_serve_fd.c */
 extern int rumpuser_sp_init_fd(int, const char *, const char *, const char *);
 
+/* rumpuser backend introspection: 1 if rump kthreads are cooperative fibers on
+ * one OS thread (else 0 = pthread). _yield runs the fiber scheduler. */
+extern int rumpuser_akuma_cooperative(void);
+extern void rumpuser_akuma_yield(void);
+
 /*
  * Redirect stdout+stderr to `path` (creating parent dirs best-effort) so all of
  * rump_server's output — including rump_init's verbose dprintf on fd 2 — lands
@@ -149,11 +154,26 @@ main(int argc, char **argv)
 	}
 
 	/* The sp server / rump kthreads do the work; the main thread just parks.
+	 *
+	 * Under the FIBER (cooperative) backend the sp server's receiver (spserver_fd)
+	 * and its per-request workers are FIBERS on this one OS thread. The main thread
+	 * is itself the initial fiber, so it MUST cooperatively yield to let them run.
+	 * A real sleep()/nanosleep() here is an Akuma kernel syscall that blocks the
+	 * single OS thread (it is NOT the cooperative rumpuser_clock_sleep hypercall),
+	 * which starves every fiber — the receiver never sends its banner and the
+	 * client handshake times out (the EIO we hit). So spin on the fiber yield.
+	 *
+	 * Under the PTHREAD backend the receiver runs on its own OS thread, so the main
+	 * thread can just block-sleep (cheaper than a busy-yield).
 	 * NOTE: do NOT use pause() — on Akuma musl pause() compiles to ppoll(NULL,0)
-	 * which returns immediately (sys_ppoll: nfds==0 -> 0), so `for(;;) pause()`
-	 * is a CPU-pegging busy-loop. sleep() -> nanosleep actually blocks. */
-	for (;;)
-		sleep(3600);
+	 * which returns immediately (sys_ppoll: nfds==0 -> 0), a CPU-pegging busy-loop. */
+	if (rumpuser_akuma_cooperative()) {
+		for (;;)
+			rumpuser_akuma_yield();
+	} else {
+		for (;;)
+			sleep(3600);
+	}
 
 	return 0;
 }
