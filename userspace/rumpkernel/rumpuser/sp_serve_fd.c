@@ -15,6 +15,53 @@
  *
  * Compile this INSTEAD of rumpuser_sp.c (the #include pulls it in).
  */
+#include <pthread.h>
+
+/*
+ * Akuma fiber-backend adaptation. Under the cooperative (fiber) rumpuser, the
+ * sysproxy server's threads — the receiver (spserver_fd, below) AND the per-request
+ * workers (serv_workbouncer, spawned in rumpuser_sp.c:schedulework) — MUST be
+ * fibers on the one OS thread. A raw pthread is a 2nd OS thread calling into the
+ * lock-free fiber rump kernel → KASSERT/abort (the SIGABRT we observed). So we
+ * redirect pthread_create/detach to the rumpuser thread hypercalls, deciding at
+ * RUNTIME (cooperative? → fiber, else → real pthread) so the SAME compiled object
+ * works against either rumpuser backend. NetBSD's rumpuser_sp.c stays textually
+ * unmodified — the redirect lives entirely here, applied via the macros below
+ * before the #include.
+ */
+extern int rumpuser_thread_create(void *(*f)(void *), void *arg, const char *thrname,
+    int joinable, int pri, int cpuidx, void **cookie);
+extern int rumpuser_akuma_cooperative(void);
+extern void rumpuser_akuma_yield(void);
+
+/* real libc entry points, aliased so the shim can fall back without the macro */
+extern int __akuma_real_pthread_create(pthread_t *, const pthread_attr_t *,
+    void *(*)(void *), void *) __asm__("pthread_create");
+extern int __akuma_real_pthread_detach(pthread_t) __asm__("pthread_detach");
+
+static int
+akuma_sp_pthread_create(pthread_t *t, const pthread_attr_t *attr,
+    void *(*fn)(void *), void *arg)
+{
+	if (rumpuser_akuma_cooperative()) {
+		void *cookie = NULL;
+		int rv = rumpuser_thread_create(fn, arg, "rumpsp", 0, 0, -1, &cookie);
+		if (rv == 0 && t != NULL)
+			*t = (pthread_t)cookie;
+		return rv;
+	}
+	return __akuma_real_pthread_create(t, attr, fn, arg);
+}
+static int
+akuma_sp_pthread_detach(pthread_t t)
+{
+	if (rumpuser_akuma_cooperative())
+		return 0; /* fibers here are detached/non-joinable */
+	return __akuma_real_pthread_detach(t);
+}
+#define pthread_create akuma_sp_pthread_create
+#define pthread_detach akuma_sp_pthread_detach
+
 #include "rumpuser_sp.c"
 
 /*
@@ -29,6 +76,7 @@ spserver_fd(void *arg)
 	struct spclient *spc;
 	unsigned idx, maxidx;
 	int rv, seen, flags;
+	int coop = rumpuser_akuma_cooperative();
 
 	/* mirror spserver's slot init */
 	for (idx = 0; idx < MAXCLI; idx++) {
@@ -65,12 +113,20 @@ spserver_fd(void *arg)
 
 	for (;;) {
 		seen = 0;
-		rv = poll(pfdlist, maxidx + 1, INFTIM);
+		/* fiber backend: poll must NOT block the one OS thread — poll with a
+		 * zero timeout and cooperatively yield when idle so the rest of the rump
+		 * kernel runs. pthread backend: block in poll on this thread as before. */
+		rv = poll(pfdlist, maxidx + 1, coop ? 0 : INFTIM);
 		if (rv == -1) {
 			if (errno == EINTR)
 				continue;
 			fprintf(stderr, "rump_sp(fd): poll errno %d\n", errno);
 			break;
+		}
+		if (rv == 0) {
+			if (coop)
+				rumpuser_akuma_yield();
+			continue;
 		}
 		for (idx = 0; seen < rv && idx < MAXCLI; idx++) {
 			if ((pfdlist[idx].revents & POLLIN) == 0)
