@@ -536,17 +536,52 @@ Done:
   over SSH). So create/schedule/sleep/exit/join/mutex/cv all work on the
   hand-rolled switch, in Akuma.
 
-Next (not yet done):
+**`rump_init` boots under fiber — VERIFIED in Akuma (2026-06-24).** A minimal
+`test_init.c` (rump_init only) linked against the fiber `rumpuser` + `librump`
+prints the NetBSD boot banner and `rump_init() returned 0 … PASS` over SSH in
+Akuma EL0. The full `rump_server` also **rebuilds and links** with the fiber
+backend (`docker-build-rump-server.sh`, 13.9 MB binary).
 
-- **Boot `rump_init` under fiber** — build `rump_server` linking the fiber
-  `rumpuser` (thread the `threads_fiber` feature through the container build /
-  `build-rumphttp.sh`); confirm the rump kernel comes up with ~1 OS thread instead
-  of ~19. The rump *kernel* libs are threading-agnostic and unchanged.
-- **The sp-server coupling (the real long pole)** — `rumpuser_sp.c` does blocking
-  channel reads; on one cooperative OS thread that blocks every fiber. rump_init +
-  DHCP may well come up, but the sysproxy *serve loop* needs the cooperative rework
-  (yield-on-I/O, or a dedicated host pthread that hands work into the fiber world)
-  before M2's shared stack works under fiber.
+**Thread collapse — VERIFIED, apples-to-apples (`test_init_live.c`, same payload,
+only the rumpuser backend differs), `ps` in a fresh VM:**
+
+| binary | rump_init | OS threads (kthreads) |
+|---|---|---|
+| `rump_live_fiber` | ✅ booted | **0 child threads** (all kthreads are fibers on 1 OS thread) |
+| `rump_live_pthread` | ✅ booted | **12 child threads** |
+| `/bin/rump_server` (pthread, M2 autostart) | ✅ | **~19 child threads** (the herd) |
+
+So the fiber backend collapses every rump kthread onto one OS thread in the real
+NetBSD rump kernel. Core fiber work (tasks 1–5) is **done and verified**.
+
+### Next (the real long pole): blocking-I/O offload thread
+
+Confirmed blocker for a *working networked* fiber `rump_server`: the sysproxy
+server calls **`pthread_create` directly in 3 sites** (`sp_serve_fd.c:131`,
+`rumpuser_sp.c:943,1374`) and does **blocking channel reads**; the tap RX
+(`rumpcomp_tap.c`) does a **blocking `read` on `/dev/net/tap0`**. On the single
+cooperative OS thread, (a) a blocking read freezes *all* fibers, and (b) an
+sp-spawned pthread is a *second* OS thread that calls into the rump kernel and
+races the **lock-free** fiber scheduler globals. So the full fiber `rump_server`
+links but cannot run correctly yet.
+
+**Design (decided 2026-06-24): a dedicated blocking-I/O OS thread.** Quarantine
+all blocking host I/O (tap0 read/write, the sp channel) onto one extra OS thread.
+The hard rule that preserves the win: **that thread never touches fiber internals**
+(run/wait queues, cv/mutex state stay single-thread-owned and lock-free). It only
+- runs the blocking syscalls,
+- exchanges raw buffers with the fiber world over a thread-safe SPSC queue, and
+- wakes the fiber scheduler via a dedicated primitive (self-pipe / eventfd / futex);
+  the scheduler's idle `nanosleep` becomes a wait on that primitive (+ timeout).
+A fiber on the core thread then drains the queue and does the rump packet-input /
+proxied-syscall execution cooperatively (holding the one rump CPU as usual).
+
+Net effect: removes BOTH the blocking-freeze and the ~19-thread herd; adds exactly
+ONE I/O thread whose only shared state is a queue + a wakeup fd. A separate
+*process* is the wrong unit (forces IPC copies + re-raises tap-fd ownership); a
+*thread* shares the address space for zero-copy buffer handoff. This is the
+standard "cooperative core + blocking-I/O offload" pattern and is what unblocks
+M2's shared stack (and the tap RX) under fiber.
 
 ## Source pointers (fiber)
 
