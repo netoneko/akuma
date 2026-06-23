@@ -81,6 +81,8 @@ fn op_name(op: translation::Op) -> &'static str {
         Op::Socketpair => "socketpair",
         Op::Read => "read",
         Op::Write => "write",
+        Op::Readv => "readv",
+        Op::Writev => "writev",
         Op::Close => "close",
     }
 }
@@ -264,7 +266,15 @@ pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
         proc.get_fd(args[0] as u32),
         Some(process::FileDescriptor::RumpSocket { .. })
     );
-    if matches!(op, translation::Op::Read | translation::Op::Write | translation::Op::Close) && !fd_is_rump {
+    if matches!(
+        op,
+        translation::Op::Read
+            | translation::Op::Write
+            | translation::Op::Readv
+            | translation::Op::Writev
+            | translation::Op::Close
+    ) && !fd_is_rump
+    {
         return None;
     }
     // Never proxy the box's own rump_server back into itself.
@@ -295,6 +305,8 @@ pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
         translation::Op::Recvfrom => proxy_transfer(args, proc, box_id, translation::Op::Recvfrom),
         translation::Op::Read => proxy_transfer(args, proc, box_id, translation::Op::Read),
         translation::Op::Write => proxy_transfer(args, proc, box_id, translation::Op::Write),
+        translation::Op::Readv => proxy_transfer(args, proc, box_id, translation::Op::Readv),
+        translation::Op::Writev => proxy_transfer(args, proc, box_id, translation::Op::Writev),
         // Not on the curl HTTP-to-IP path yet (bind/listen/accept/shutdown/
         // sendmsg/recvmsg — the last two incl. DNS's UDP recvmsg). Clean error so
         // the box never reaches smoltcp with a rump fd.
@@ -572,14 +584,19 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
         Ok(x) => x,
         Err(e) => return e,
     };
-    let (buf_ptr, len) = (args[1], args[2]);
+    // args[1],args[2] = (buf,len) for read/write/sendto/recvfrom, or (iovptr,
+    // iovcnt) for readv/writev — same positional layout, passed verbatim. The
+    // iovec struct is identical Linux↔NetBSD, so the server's sys_readv/writev
+    // scatters/gathers via ProcMem copyin/copyout against the box VA. sic uses
+    // FILE*/fdopen → stdio flushes via writev/readv, so these are load-bearing.
+    let (a1, a2) = (args[1], args[2]);
     let nb_args = match op {
         // sendto/recvfrom(s, buf, len, flags=0, addr=NULL, addrlen=0)
         translation::Op::Sendto | translation::Op::Recvfrom => {
-            translation::pack_args(&[rump_fd as u64, buf_ptr, len, 0, 0, 0])
+            translation::pack_args(&[rump_fd as u64, a1, a2, 0, 0, 0])
         }
-        // read/write(fd, buf, len)
-        _ => translation::pack_args(&[rump_fd as u64, buf_ptr, len]),
+        // read/write(fd, buf, len) and readv/writev(fd, iov, iovcnt)
+        _ => translation::pack_args(&[rump_fd as u64, a1, a2]),
     };
     let mut mem = ProcMem::new();
     let t0 = crate::timer::uptime_us();
@@ -587,7 +604,7 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
     let dt = crate::timer::uptime_us().saturating_sub(t0);
     match res {
         Ok([n, _]) => {
-            crate::safe_print!(96, "[RUMP-SP] {} len={} -> {} ({}us)\n", op_name(op), len, n, dt);
+            crate::safe_print!(96, "[RUMP-SP] {} a2={} -> {} ({}us)\n", op_name(op), a2, n, dt);
             n as u64
         }
         Err(e) => {
@@ -595,6 +612,61 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
             neg_linux_errno(translation::errno_netbsd_to_linux(e))
         }
     }
+}
+
+/// A [`ClientMem`] that discards copyout and faults copyin — for syscalls whose
+/// result we don't keep (the [`rump_socket_readable`] MSG_PEEK probe).
+struct DiscardMem;
+impl ClientMem for DiscardMem {
+    fn copyin(&mut self, _a: u64, _l: usize, _o: &mut Vec<u8>) -> Result<(), i32> {
+        Err(14)
+    }
+    fn copyinstr(&mut self, _a: u64, _m: usize, _o: &mut Vec<u8>) -> Result<(), i32> {
+        Err(14)
+    }
+    fn copyout(&mut self, _a: u64, _d: &[u8]) -> Result<(), i32> {
+        Ok(()) // discard the peeked byte
+    }
+    fn anonmmap(&mut self, _l: usize) -> u64 {
+        0
+    }
+}
+
+/// Is the calling box's rump socket `rump_fd` readable right now? Forwards a
+/// non-blocking `recvfrom(rump_fd, _, 1, MSG_PEEK|MSG_DONTWAIT)` to the rump
+/// server (NetBSD flag values). `n > 0` ⇒ data waiting (POLLIN). This is how
+/// `poll`/`select`/`epoll` get real readiness for a `RumpSocket` fd, so a client
+/// like sic can multiplex stdin + the IRC socket instead of blocking in recv.
+/// NOTE: each call is one sysproxy round-trip, so polling a rump fd is not cheap
+/// (the proxy latency applies).
+pub fn rump_socket_readable(rump_fd: i32) -> bool {
+    // NetBSD flags: MSG_PEEK=0x2, MSG_DONTWAIT=0x80 (differs from Linux 0x40).
+    const NB_MSG_PEEK: u64 = 0x2;
+    const NB_MSG_DONTWAIT: u64 = 0x80;
+    let pid = process::read_current_pid().unwrap_or(0);
+    let Some(proc) = process::lookup_process(pid) else {
+        return false;
+    };
+    let box_id = proc.box_id;
+    let Some(proxy) = ensure_box_proxy(box_id) else {
+        return false;
+    };
+    // The server copyout's the peeked byte to this addr; DiscardMem drops it, so
+    // any addr works (1-byte peek).
+    let scratch_addr: u64 = 0x1000;
+    let mut mem = DiscardMem;
+    let res = proxy.with_client(|c| {
+        let a = translation::pack_args(&[
+            rump_fd as u64,
+            scratch_addr,
+            1,
+            NB_MSG_PEEK | NB_MSG_DONTWAIT,
+            0,
+            0,
+        ]);
+        c.syscall(translation::netbsd_sysno(translation::Op::Recvfrom), &a, &mut mem)
+    });
+    matches!(res, Ok([n, _]) if n > 0)
 }
 
 /// Kernel [`PipeIo`]: wraps the kernel pipe API + scheduler yield + clock. The

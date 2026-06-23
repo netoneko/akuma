@@ -425,6 +425,20 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
                 ready |= EPOLLOUT;
             }
         }
+        // A rump socket (stack=rump box): POLLIN comes from a non-blocking
+        // MSG_PEEK probe forwarded to the rump server; POLLOUT is assumed ready
+        // (sends are blocking-synchronous through the proxy). This lets a client
+        // like sic multiplex stdin + the IRC socket instead of blocking in recv.
+        // Each readiness check is a sysproxy round-trip (proxy latency applies).
+        #[cfg(feature = "rump")]
+        akuma_exec::process::FileDescriptor::RumpSocket { rump_fd, .. } => {
+            if requested & EPOLLIN != 0 && crate::rump_proxy::rump_socket_readable(rump_fd) {
+                ready |= EPOLLIN;
+            }
+            if requested & EPOLLOUT != 0 {
+                ready |= EPOLLOUT;
+            }
+        }
         _ => {
             if requested & EPOLLIN != 0 { ready |= EPOLLIN; }
             if requested & EPOLLOUT != 0 { ready |= EPOLLOUT; }

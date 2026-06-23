@@ -39,6 +39,8 @@ pub enum Op {
     Socketpair,
     Read,
     Write,
+    Readv,
+    Writev,
     Close,
 }
 
@@ -63,6 +65,8 @@ pub fn op_from_linux_sysno(n: u64) -> Option<Op> {
         212 => Op::Recvmsg,
         63 => Op::Read,
         64 => Op::Write,
+        65 => Op::Readv,
+        66 => Op::Writev,
         57 => Op::Close,
         _ => return None,
     })
@@ -89,6 +93,8 @@ pub fn netbsd_sysno(op: Op) -> u32 {
         Op::Socketpair => 135,
         Op::Read => 3,
         Op::Write => 4,
+        Op::Readv => 120,
+        Op::Writev => 121,
         Op::Close => 6,
     }
 }

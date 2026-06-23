@@ -208,9 +208,42 @@ The in-process backend gives only one networked payload per box.
      `rump_server`. (Fiber rumpuser — one OS thread per kernel — is the deeper
      alternative; see "Future optimizations".)
    - ✅ **`bootstrap/bin/sic`** — static sic 1.3 (aarch64-musl, 130 KB) for the IRC
-     capstone. Connect by IP (`sic -h <ip> -p 6667 -n <nick>`; no DNS). Blocked on:
-     `poll`/`select` readiness for `RumpSocket` fds (sic `select()`s the socket) +
-     usable latency.
+     capstone. Connect by IP (`sic -h <ip> -p 6667 -n <nick>`; no DNS).
+
+   ### 🛰️ IRC over rump — sic ↔ Libera (2026-06-23)
+   - ✅ **sic connects to Libera.chat (`82.96.96.60:6667`) over the NetBSD rump
+     stack and exchanges real IRC traffic.** Captured server dialogue:
+     `erbium.libera.chat: NOTICE *** Checking Ident / Looking up your hostname /
+     Couldn't look up your hostname` (the last is expected — no rDNS for the
+     SLIRP-NAT'd rump IP; the server proceeds). Path: `socket`→`connect`→`writev`
+     (NICK/USER registration)→`readv` (server replies), all proxied to rumpnet.
+   - **Two enablers added for sic:**
+     - **`readv`/`writev` marshaling** (Linux 65/66 → NetBSD 120/121). sic uses
+       `fdopen`/`FILE*`, so musl stdio flushes/reads via `writev`/`readv`, NOT
+       `write`/`read` — without these, sic's registration never reached rump and
+       Libera closed the idle link (the same stdio lesson as the M1 LD_PRELOAD
+       hijack). The iovec struct is identical Linux↔NetBSD, so we pass
+       `(rump_fd, iovptr, iovcnt)` verbatim and the server's `sys_readv`/`writev`
+       scatters/gathers via `ProcMem`.
+     - **`poll`/`select`/`epoll` readiness for `RumpSocket`** (`rump_proxy::
+       rump_socket_readable`): POLLIN via a non-blocking `recvfrom(_,1,MSG_PEEK|
+       MSG_DONTWAIT)` probe forwarded to rump (NetBSD flags), POLLOUT always. Lets
+       sic multiplex stdin + the IRC socket instead of blocking in recv. (Added to
+       `epoll_check_fd_readiness`, so ppoll/pselect/epoll all use it.)
+   - ⚠️ **Throughput is the wall: ~1 byte/sec.** `readv` returns ~1 byte per call,
+     ~1s each — the rump tap-RX/TCP is so starved by the single-core pthread
+     scheduling that only ~1 byte is buffered per poll. In 185s sic read ~333 B
+     (the 3 NOTICEs) and **never reached the `001` welcome**, so registration
+     didn't finish and `:LIST #rumpkernel` never fired. Same latency root cause as
+     everything else; the IRC path is proven but unusable until it's fixed.
+   - ⚠️ **Robustness bugs found (see project task / TODO):** box procs stuck in a
+     proxied syscall are **uninterruptible** (the proxy channel read never checks
+     pending signals/interrupt), `kill <pid>` of a box proc returns "invalid pid"
+     (box/pid-namespace resolution), and the single serialized `BoxProxy.client`
+     slot means one wedged box proc blocks ALL others (they spin in `with_client`).
+     Only clean reset today is a VM reboot. Fix: make the proxy read honor
+     interrupt/timeout (return EINTR), reclaim the client slot from a dead holder,
+     fix box-pid kill.
 5. **herd**: the box bundle starts the rump_server payload + sets the box's
    `stack=rump` (see `RUMP_PLUS_HERD.md`); smoltcp off = the box's only stack.
    Validate end-to-end: `/bin/curl https://ifconfig.me` in a `stack=rump` box returns
