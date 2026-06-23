@@ -169,9 +169,48 @@ The in-process backend gives only one networked payload per box.
        loop) isn't intercepted yet — may need `RumpSocket` to report ready so curl
        proceeds to the (blocking) recv.
      - ⏳ **Kernel boot self-tests** per project policy.
-     - ⏳ **Cleanup:** herd still spawns its own no-`--fd` `rump_server` in the box
-       (idle, redundant with the kernel-spawned one) — have herd skip the spawn for
-       `stack=rump` so the kernel owns the daemon (avoids the double server).
+
+   ### ✅ B-OUTCOME (2026-06-23): curl over rump WORKS; final ownership = herd
+   - **`curl -H Host:ifconfig.me http://34.160.111.145` over the NetBSD rump stack
+     returns `87.71.13.205`, repeatably.** The full TCP/HTTP path is marshaled:
+     `socket`/`close`/`connect`/`getsockname`/`getpeername`/`getsockopt(SO_ERROR→0)`/
+     `setsockopt(no-op)`/`sendto`/`recvfrom`/`read`/`write` via `ProcMem` (user-VA
+     copyin/copyout + sockaddr Linux↔NetBSD translation) + `FileDescriptor::RumpSocket`.
+   - **Ownership decided (user): herd owns the `rump_server` PROCESS; the kernel
+     owns the CHANNEL + proxy.** `rumpnet.conf`: `command=/bin/rump_server`,
+     `args=--net --fd 3`, `stack=rump`, `restart=false`. herd calls `SET_BOX_STACK`
+     BEFORE spawning; when the spawn lands, `sys_spawn_ext` detects it
+     (`box_is_rump` + path "rump_server") and calls `rump_proxy::attach_server`,
+     which installs the kernel pipe pair on the server's fd 3 (before it runs) and
+     **handshakes in a kthread** (blocks ~5s through rump_init + DHCP), publishing
+     the `BoxProxy` to `PROXIES`. The earlier lazy/kernel-eager-spawn approaches were
+     dropped. `restart=false` is deliberate: a correct restart must re-establish the
+     channel/proxy + back off — that health/lifecycle work is **TBD**. Detection by
+     path-match is interim; a herd→kernel notify is the cleaner TBD trigger.
+   - **`herd` gained a `restart` config flag** (default true); `check_process_exits`
+     honors it. `ServiceConfig.restart`.
+   - ⚠️ **LATENCY — root-caused, not yet fixed (the remaining work).** Each forwarded
+     syscall costs ~0.8–4s (a 74-byte `sendto` = ~0.8s with NO network wait → pure
+     channel/scheduling cost); full curl ~26s. **Cause:** the rump_server's ~19 rump
+     kthreads **busy-spin in userspace** — `ps` shows them `STATE running, SYSCALL -`
+     (NOT blocked in a syscall; only the main thread sits in futex `*98`). They
+     contend for the rump kernel's single virtual CPU as a **spin**, so a thread that
+     needs the CPU (e.g. to read the channel / run the proxied syscall) waits behind
+     ~19 spinners → ~270ms per scheduling hop, ~4 hops/syscall. Evidence it's
+     thread-count-bound: removing a (then-duplicate) second rump_server **halved**
+     per-op latency (linear). Two fixes that did **NOT** help (ruling out poll
+     cadence / client busy-spin): making `sys_ppoll` event-driven like epoll (waker
+     registers on the channel pipe), and making the kernel proxy's channel read sleep
+     instead of busy-yield (`KernelPipeIo::yield_now`). **THE fix (B, next):** make
+     idle rump kthreads / the rump-CPU wait TRULY BLOCK (futex sleep) instead of
+     spin — in our Rust `rumpuser` (`rumpuser/src/lib.rs`: the `cv_wait`/scheduler
+     CPU-wait / spin-mutex paths). Needs the container rebuild + relink of
+     `rump_server`. (Fiber rumpuser — one OS thread per kernel — is the deeper
+     alternative; see "Future optimizations".)
+   - ✅ **`bootstrap/bin/sic`** — static sic 1.3 (aarch64-musl, 130 KB) for the IRC
+     capstone. Connect by IP (`sic -h <ip> -p 6667 -n <nick>`; no DNS). Blocked on:
+     `poll`/`select` readiness for `RumpSocket` fds (sic `select()`s the socket) +
+     usable latency.
 5. **herd**: the box bundle starts the rump_server payload + sets the box's
    `stack=rump` (see `RUMP_PLUS_HERD.md`); smoltcp off = the box's only stack.
    Validate end-to-end: `/bin/curl https://ifconfig.me` in a `stack=rump` box returns
