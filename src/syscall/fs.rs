@@ -481,6 +481,14 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
         }
         akuma_exec::process::FileDescriptor::DevNull => 0,
+        akuma_exec::process::FileDescriptor::DevZero => {
+            // /dev/zero: fill the user buffer with zero bytes and return count.
+            let temp = alloc::vec![0u8; count];
+            if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
+                return EFAULT;
+            }
+            count as u64
+        }
         akuma_exec::process::FileDescriptor::DevUrandom => {
             let mut temp = alloc::vec![0u8; count];
             if crate::rng::fill_bytes(&mut temp).is_ok() {
@@ -490,6 +498,31 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 count as u64
             } else {
                 EIO
+            }
+        }
+        #[cfg(feature = "rump")]
+        akuma_exec::process::FileDescriptor::Tap { nonblock } => {
+            // Pull one L2 frame. O_NONBLOCK → EAGAIN when none ready; otherwise
+            // BLOCK cooperatively (yield to the scheduler, re-poll the tap) until a
+            // frame arrives — so the rump virtif RX thread does a plain blocking
+            // read() with no busy-wait. Akuma's net is poll-based (no RX IRQ), so
+            // this mirrors how socket recv blocks (akuma-net wait_until).
+            let mut temp = alloc::vec![0u8; count];
+            let got = if nonblock {
+                akuma_net::rump_tap::read_frame(&mut temp)
+            } else {
+                // Block until a frame (None timeout); None only on interrupt → EAGAIN.
+                akuma_net::rump_tap::read_frame_blocking(&mut temp, None)
+            };
+            match got {
+                Some(n) => {
+                    if n > 0
+                        && unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                            return EFAULT;
+                        }
+                    n as u64
+                }
+                None => EAGAIN,
             }
         }
         #[cfg(feature = "sc-timerfd")]
@@ -546,6 +579,13 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
             }
         }
         akuma_exec::process::FileDescriptor::DevNull => 0,
+        akuma_exec::process::FileDescriptor::DevZero => {
+            let temp = alloc::vec![0u8; count];
+            if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
+                return EFAULT;
+            }
+            count as u64
+        }
         akuma_exec::process::FileDescriptor::DevUrandom => {
             let mut temp = alloc::vec![0u8; count];
             if crate::rng::fill_bytes(&mut temp).is_ok() {
@@ -580,7 +620,7 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
                 Err(e) => fs_error_to_errno(e)
             }
         }
-        akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom => count as u64,
+        akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom | akuma_exec::process::FileDescriptor::DevZero => count as u64,
         _ => EBADF
     }
 }
@@ -737,7 +777,18 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     Err(e) => (-i64::from(e)) as u64,
                 }
             }
-            akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom => this_chunk as u64,
+            akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom | akuma_exec::process::FileDescriptor::DevZero => this_chunk as u64,
+            #[cfg(feature = "rump")]
+            akuma_exec::process::FileDescriptor::Tap { .. } => {
+                // One write() == one L2 frame. Ethernet frames are <2 KB, so a
+                // frame never exceeds the 64 KB chunk (single iteration).
+                if let Ok(n) = akuma_net::rump_tap::write_frame(buf_slice) {
+                    n as u64
+                } else {
+                    if total_written > 0 { return total_written as u64; }
+                    return EIO;
+                }
+            }
             akuma_exec::process::FileDescriptor::DevDsp => {
                 // Blocking PCM playback. The audio driver re-chunks into bounded
                 // periods internally; consumes the whole slice or errors.
@@ -1010,6 +1061,20 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         return ESRCH;
     }
 
+    if path == "/dev/zero" {
+        if let Some(proc) = akuma_exec::process::current_process() {
+            let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevZero);
+            if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
+                proc.set_cloexec(fd);
+            }
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(256, "[syscall] openat(/dev/zero) = fd {} flags=0x{:x}\n", fd, flags);
+            }
+            return u64::from(fd);
+        }
+        return ESRCH;
+    }
+
     // /dev/dsp — virtio-sound output. Only opens when a sound device was found at
     // boot (audio::is_available()); otherwise falls through to the normal path
     // (→ ENOENT), so the node simply doesn't exist when the feature is off.
@@ -1021,6 +1086,30 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             }
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
+            }
+            return u64::from(fd);
+        }
+        return ESRCH;
+    }
+
+    // /dev/net/tap0 — raw L2 packet device for the rump kernel feature. Only
+    // opens when a second virtio-net NIC was bound at boot (rump_tap::is_ready);
+    // otherwise returns ENODEV. Frame-granular read()/write() and a no-op
+    // TUN/TAP ioctl let a userspace rump virtif drive the NetBSD stack over it.
+    #[cfg(feature = "rump")]
+    if path == "/dev/net/tap0" {
+        if !akuma_net::rump_tap::is_ready() {
+            return ENODEV;
+        }
+        if let Some(proc) = akuma_exec::process::current_process() {
+            let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Tap {
+                nonblock: flags & 0x800 != 0, // O_NONBLOCK
+            });
+            if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
+                proc.set_cloexec(fd);
+            }
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(256, "[syscall] openat(/dev/net/tap0) = fd {} flags=0x{:x}\n", fd, flags);
             }
             return u64::from(fd);
         }
@@ -1170,7 +1259,7 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
 
 pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
-        if matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::DevNull)) {
+        if matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevZero)) {
             return 0;
         }
         let mut new_pos = 0i64;
@@ -1230,6 +1319,15 @@ pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
         }
         Some(akuma_exec::process::FileDescriptor::DevUrandom) => {
             stat = Stat { st_dev: 0, st_ino: 9, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 9), st_blksize: 4096, ..Default::default() };
+            0
+        }
+        Some(akuma_exec::process::FileDescriptor::DevZero) => {
+            stat = Stat { st_dev: 0, st_ino: 5, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 5), st_blksize: 4096, ..Default::default() };
+            0
+        }
+        Some(akuma_exec::process::FileDescriptor::Tap { .. }) => {
+            // /dev/net/tap0: char device. Linux's TUN/TAP is misc major 10, minor 200.
+            stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(10, 200), st_blksize: 4096, ..Default::default() };
             0
         }
         Some(akuma_exec::process::FileDescriptor::TimerFd(_) |
@@ -1294,6 +1392,10 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
     let res = (|| {
         if resolved_path == "/dev/null" {
             stat = Stat { st_dev: 0, st_ino: 1, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 3), st_blksize: 4096, ..Default::default() };
+            return 0;
+        }
+        if resolved_path == "/dev/zero" {
+            stat = Stat { st_dev: 0, st_ino: 5, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 5), st_blksize: 4096, ..Default::default() };
             return 0;
         }
 
@@ -1412,7 +1514,7 @@ pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> u64 {
 
     let path = crate::vfs::resolve_symlinks(&path);
 
-    if path == "/dev/null" {
+    if path == "/dev/null" || path == "/dev/zero" {
         return 0;
     }
 
@@ -1434,7 +1536,7 @@ pub(super) fn sys_fallocate(fd: u32, mode: i32, offset: i64, len: i64) -> u64 {
                 Err(e) => fs_error_to_errno(e),
             }
         }
-        Some(akuma_exec::process::FileDescriptor::DevNull) => 0,
+        Some(akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevZero) => 0,
         _ => EBADF,
     }
 }
@@ -1448,7 +1550,7 @@ pub(super) fn sys_ftruncate(fd: u32, length: i64) -> u64 {
                 Err(e) => fs_error_to_errno(e),
             }
         }
-        Some(akuma_exec::process::FileDescriptor::DevNull) => 0,
+        Some(akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevZero) => 0,
         _ => EBADF,
     }
 }
@@ -1526,6 +1628,8 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
     let (mode, ino, size, nlink, atime, mtime, ctime, rdev_major, rdev_minor) =
         if resolved_path == "/dev/null" {
             (0o20666u16, 1u64, 0u64, 1u32, 0i64, 0i64, 0i64, 1u32, 3u32)
+        } else if resolved_path == "/dev/zero" {
+            (0o20666u16, 5u64, 0u64, 1u32, 0i64, 0i64, 0i64, 1u32, 5u32)
         } else if !follow && crate::vfs::is_symlink(&resolved_path) {
             let target = crate::vfs::read_symlink(&resolved_path).unwrap_or_default();
             (0o120777u16, 1, target.len() as u64, 1, 0, 0, 0, 0, 0)

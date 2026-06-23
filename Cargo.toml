@@ -9,6 +9,7 @@ default-members = [
     "crates/akuma-ext2",
     "crates/akuma-isolation",
     "crates/akuma-net",
+    "crates/akuma-rump",
     "crates/akuma-shell",
     "crates/akuma-ssh",
     "crates/akuma-ssh-crypto",
@@ -99,10 +100,21 @@ default = [
     "kernel-tls",
     "tls-rsa",
     "sound",
+    "rump",
     "sc-aio", "sc-sysv-ipc", "sc-framebuffer", "sc-containers",
     "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
 ]
 no-tests = ["akuma-net/small-sockets"]
+
+# Rump-kernel support: a raw L2 packet path so a userspace NetBSD rump TCP/IP
+# stack can send/receive Ethernet frames. Binds a SECOND virtio-net device
+# (NIC1) and exposes it as /dev/net/tap0 (open/read/write whole frames + a
+# no-op TUN/TAP ioctl), leaving NIC0 on the native smoltcp stack. Included in
+# `default` so only the RELEASE profile carries it; the size/extreme profiles
+# build with --no-default-features and omit it (it targets roomy VMs, not the
+# 4 MB floor). NIC1 itself only exists when the QEMU runner is started with
+# RUMP_NIC=1; without it, tap init no-ops and /dev/net/tap0 returns ENODEV.
+rump = ["akuma-net/rump", "dep:akuma-rump"]
 # In-kernel TLS client for the shell `curl` command's https:// branch (the
 # embedded-tls stack in akuma-net + its X.509 verifier — ~58 KB of kernel
 # .text). Enabled by default and kept by the `size` profile (ECDSA/Ed25519
@@ -177,6 +189,9 @@ akuma-ext2 = { path = "crates/akuma-ext2" }
 akuma-shell = { path = "crates/akuma-shell" }
 akuma-net = { path = "crates/akuma-net" }
 akuma-exec = { path = "crates/akuma-exec" }
+# Kernel-side sysproxy client (rumpsp wire + Linux↔NetBSD translation); only the
+# `rump` feature needs it directly (akuma-net already pulls it for rump_tap).
+akuma-rump = { path = "crates/akuma-rump", optional = true }
 akuma-isolation = { path = "crates/akuma-isolation" }
 talc = "4"
 spinning_top = "0.3"

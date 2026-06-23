@@ -425,6 +425,20 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
                 ready |= EPOLLOUT;
             }
         }
+        // A rump socket (stack=rump box): POLLIN comes from a non-blocking
+        // MSG_PEEK probe forwarded to the rump server; POLLOUT is assumed ready
+        // (sends are blocking-synchronous through the proxy). This lets a client
+        // like sic multiplex stdin + the IRC socket instead of blocking in recv.
+        // Each readiness check is a sysproxy round-trip (proxy latency applies).
+        #[cfg(feature = "rump")]
+        akuma_exec::process::FileDescriptor::RumpSocket { rump_fd, .. } => {
+            if requested & EPOLLIN != 0 && crate::rump_proxy::rump_socket_readable(rump_fd) {
+                ready |= EPOLLIN;
+            }
+            if requested & EPOLLOUT != 0 {
+                ready |= EPOLLOUT;
+            }
+        }
         _ => {
             if requested & EPOLLIN != 0 { ready |= EPOLLIN; }
             if requested & EPOLLOUT != 0 { ready |= EPOLLOUT; }
@@ -760,10 +774,20 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
         return EFAULT;
     }
 
+    // Register the calling thread as a waker on each polled fd's underlying
+    // primitive (pipe/socket/etc.) so a peer write wakes us IMMEDIATELY (sticky
+    // WOKEN_STATES → schedule_blocking returns at once), instead of only at the
+    // next BLOCKING_POLL_INTERVAL_US re-poll. Without this, a request/response
+    // protocol over a pipe (e.g. the rump sysproxy channel: server blocks in
+    // poll(INFTIM) on the channel fd) pays ~interval+scheduling latency PER
+    // transfer — turning each forwarded syscall into hundreds of ms. epoll
+    // already does this (passes Some(&waker)); ppoll did not.
+    let waker = akuma_exec::threading::current_thread_waker();
+
     loop {
         akuma_net::smoltcp_net::poll();
         let mut ready_count = 0;
-        
+
         for fd in &mut kernel_fds {
             fd.revents = 0;
             if fd.fd < 0 { continue; }
@@ -772,7 +796,7 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
             if fd.events & 1 != 0 { requested |= EPOLLIN; }
             if fd.events & 4 != 0 { requested |= EPOLLOUT; }
 
-            let revents = epoll_check_fd_readiness(fd.fd as u32, requested, None);
+            let revents = epoll_check_fd_readiness(fd.fd as u32, requested, Some(&waker));
             
             if (revents & EPOLLIN != 0) && (fd.events & 1 != 0) { fd.revents |= 1; }
             if (revents & EPOLLOUT != 0) && (fd.events & 4 != 0) { fd.revents |= 4; }

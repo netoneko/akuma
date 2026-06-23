@@ -355,6 +355,22 @@ static WOKEN_STATES: [AtomicBool; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
+/// Wakeup-locality hint: the tid of a thread just promoted READY by an explicit
+/// `wake()` (futex/cond signal), which the scheduler prefers to run NEXT (once)
+/// instead of waiting a full round-robin cycle. Set in [`ThreadWaker::wake`],
+/// consumed (swapped to `MAX_THREADS`) in `schedule_indices`.
+///
+/// GATED OFF ([`WAKEUP_LOCALITY_HINT`] = false): tried as a rump-sysproxy latency
+/// fix; measured NO improvement (the per-syscall cost is not the woken-thread
+/// scheduling delay — woken threads already run promptly via the SGI), so it
+/// stays disabled to keep baseline round-robin behavior. Kept for a future,
+/// more-targeted use. The real latency lever is the fiber rumpuser backend.
+static PREEMPT_WAKE_TID: AtomicUsize = AtomicUsize::new(MAX_THREADS);
+
+/// Master switch for the [`PREEMPT_WAKE_TID`] wakeup-locality experiment. Off:
+/// the hint is never set, so the scheduler is exactly baseline round-robin.
+const WAKEUP_LOCALITY_HINT: bool = false;
+
 /// Per-thread pending signal bitmask.  Bit N set = signal (N+1) pending.
 /// Multiple signals can be pending simultaneously (unlike the old single-slot).
 /// Set by pend_signal_for_thread via fetch_or.
@@ -2016,35 +2032,50 @@ impl ThreadPool {
             unsafe { core::arch::asm!("sev"); }
         }
 
-        // Find next ready thread using GLOBAL round-robin index
-        // This ensures fair rotation through ALL threads, not just starting from current.
-        // Without this, threads 10, 11 would never run if 8, 9 are always ready and
-        // the scheduler always runs from a low-numbered system thread.
-        let mut next_idx = (self.round_robin_idx + 1) % MAX_THREADS;
-        let start_idx = next_idx;
+        // Wakeup locality: if a thread was just woken by an explicit signal
+        // (futex/cond), prefer running it NEXT (once) so a producer→consumer
+        // handoff doesn't wait a full round-robin cycle behind ~20 ready threads.
+        // This is the dominant per-syscall cost for the rump sysproxy. Consumed
+        // (swap to MAX_THREADS) so it fires once; the preempted current thread
+        // stays READY below, so round-robin fairness is preserved across ticks.
+        let hinted = PREEMPT_WAKE_TID.swap(MAX_THREADS, Ordering::SeqCst);
+        let next_idx = if hinted < MAX_THREADS
+            && hinted != current_idx
+            && THREAD_STATES[hinted].load(Ordering::SeqCst) == thread_state::READY
+        {
+            hinted
+        } else {
+            // Find next ready thread using GLOBAL round-robin index
+            // This ensures fair rotation through ALL threads, not just starting from current.
+            // Without this, threads 10, 11 would never run if 8, 9 are always ready and
+            // the scheduler always runs from a low-numbered system thread.
+            let mut next_idx = (self.round_robin_idx + 1) % MAX_THREADS;
+            let start_idx = next_idx;
 
-        loop {
-            let state = THREAD_STATES[next_idx].load(Ordering::SeqCst);
-            
-            if state == thread_state::READY {
-                // Found a ready thread - but skip if it's the current one
-                // (we want to switch TO a different thread, not stay on current)
-                if next_idx != current_idx {
-                    break;
+            loop {
+                let state = THREAD_STATES[next_idx].load(Ordering::SeqCst);
+
+                if state == thread_state::READY {
+                    // Found a ready thread - but skip if it's the current one
+                    // (we want to switch TO a different thread, not stay on current)
+                    if next_idx != current_idx {
+                        break;
+                    }
+                }
+
+                next_idx = (next_idx + 1) % MAX_THREADS;
+
+                if next_idx == start_idx {
+                    // Wrapped around without finding a different ready thread
+                    return None;
                 }
             }
 
-            next_idx = (next_idx + 1) % MAX_THREADS;
-
-            if next_idx == start_idx {
-                // Wrapped around without finding a different ready thread
-                return None;
-            }
-        }
-        
-        // Update global round-robin index to where we found the next thread
-        // This ensures the NEXT scheduling decision continues from here
-        self.round_robin_idx = next_idx;
+            // Update global round-robin index to where we found the next thread
+            // This ensures the NEXT scheduling decision continues from here
+            self.round_robin_idx = next_idx;
+            next_idx
+        };
 
         // Update states atomically (lock-free)
         // Don't change state if thread is TERMINATED or WAITING
@@ -2652,6 +2683,10 @@ impl ThreadWaker {
             if THREAD_STATES[tid].load(Ordering::SeqCst) == thread_state::WAITING {
                 WAKE_TIMES[tid].store(0, Ordering::SeqCst);
                 THREAD_STATES[tid].store(thread_state::READY, Ordering::SeqCst);
+                // Wakeup locality (gated off — see PREEMPT_WAKE_TID / WAKEUP_LOCALITY_HINT).
+                if WAKEUP_LOCALITY_HINT {
+                    PREEMPT_WAKE_TID.store(tid, Ordering::SeqCst);
+                }
                 // Trigger SGI to ensure scheduler runs and picks up the thread
                 (runtime().trigger_sgi)(0);
             }

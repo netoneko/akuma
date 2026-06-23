@@ -14,3 +14,9 @@
 	path = userspace/nca/native-cli-ai
 	url = https://github.com/netoneko/native-cli-ai.git
 	branch = dev
+[submodule "userspace/rumpkernel/buildrump.sh"]
+	path = userspace/rumpkernel/buildrump.sh
+	url = https://github.com/netoneko/buildrump.sh.git
+[submodule "userspace/rumpkernel/sic"]
+	path = userspace/rumpkernel/sic
+	url = https://github.com/netoneko/sic.git

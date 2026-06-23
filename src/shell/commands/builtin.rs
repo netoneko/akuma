@@ -494,19 +494,9 @@ impl Command for PsCommand {
                     } else {
                         cmdline
                     };
-                    // Debug: saved kernel resume point (x30/elr) of the process's
-                    // main thread — resolve against the kernel map to see where a
-                    // stuck thread is parked. (Temporary deadlock-hunt aid.)
-                    let kpc = process::lookup_process(p.pid)
-                        .and_then(|pr| pr.thread_id)
-                        .and_then(akuma_exec::threading::get_saved_kernel_resume);
-                    let kpc_str = match kpc {
-                        Some((x30, elr, _sp)) => format!("x30={x30:#x} elr={elr:#x}"),
-                        None => alloc::string::String::from("-"),
-                    };
                     let line = format!(
-                        "{:>5}  {:>4}  {:<8}  {:<8}  {:>7}  {:<26}  {}\r\n",
-                        p.pid, p.ppid, box_str, p.state, sc, kpc_str, cmdline
+                        "{:>5}  {:>4}  {:<8}  {:<8}  {:>7}  {}\r\n",
+                        p.pid, p.ppid, box_str, p.state, sc, cmdline
                     );
                     let _ = stdout.write(line.as_bytes()).await;
                 }

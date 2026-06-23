@@ -1207,12 +1207,13 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
     
     let cwd_ref = cwd.as_deref();
 
+    // `args_ptr` is an argv array INCLUDING argv[0] = program name (both
+    // box/main.rs and herd build it that way), so always drop argv[0]. The old
+    // `len > 1` special-case leaked argv[0] (the path) through as a real argument
+    // for no-arg commands — e.g. a boxed `/bin/rump_server` with no args saw
+    // "/bin/rump_server" as a positional URL and tried rump_init_server() on it.
     let args_vec = parse_argv_array(o.args_ptr);
-    let args_refs: Vec<&str> = if args_vec.len() > 1 {
-        args_vec.iter().skip(1).map(alloc::string::String::as_str).collect()
-    } else {
-        args_vec.iter().map(alloc::string::String::as_str).collect()
-    };
+    let args_refs: Vec<&str> = args_vec.iter().skip(1).map(alloc::string::String::as_str).collect();
     let args_opt = if args_refs.is_empty() { None } else { Some(args_refs.as_slice()) };
 
     let stdin_data = if o.stdin_ptr != 0 {
@@ -1227,12 +1228,35 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
     
     let stdin_slice = stdin_data.as_deref();
 
-    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(&path, args_opt, None, stdin_slice, cwd_ref, o.box_id)
-        && let Some(proc) = akuma_exec::process::current_process() {
+    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(&path, args_opt, None, stdin_slice, cwd_ref, o.box_id) {
+        // For a `stack=rump` box, when herd spawns its `rump_server` the kernel
+        // wires a sysproxy channel onto fd 3 (BEFORE the server runs) and brings
+        // the proxy up. herd owns the process; the kernel owns the channel.
+        #[cfg(feature = "rump")]
+        if path.contains("rump_server") && crate::rump_proxy::box_is_rump(o.box_id) {
+            crate::rump_proxy::attach_server(o.box_id, pid);
+        }
+        if let Some(proc) = akuma_exec::process::current_process() {
             akuma_exec::process::register_child_channel(pid, ch, proc.pid);
             return u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32);
         }
+    }
     ENOMEM
+}
+
+/// `SET_BOX_STACK(box_id, stack)` — select a box's network stack. `stack == 1`
+/// marks the box as using the NetBSD rump kernel (its AF_INET syscalls are
+/// routed to that box's rump_server); any other value is a no-op (smoltcp
+/// default). herd calls this for a `stack = rump` service. Without the `rump`
+/// kernel feature the call is harmlessly ignored.
+pub fn sys_set_box_stack(box_id: u64, stack: u64) -> u64 {
+    #[cfg(feature = "rump")]
+    if stack == 1 {
+        crate::rump_proxy::mark_box_rump(box_id);
+    }
+    #[cfg(not(feature = "rump"))]
+    let _ = (box_id, stack);
+    0
 }
 
 pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {

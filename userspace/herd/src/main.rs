@@ -100,6 +100,13 @@ struct ServiceConfig {
     /// Path to an OCI bundle directory. If set, overrides command/box_root
     /// with values from the bundle's config.json.
     bundle: String,
+    /// Network stack for the box: "" / "smoltcp" (default) or "rump" (route the
+    /// box's AF_INET through its rump_server via the kernel sysproxy client).
+    stack: String,
+    /// Whether to restart the service when it exits. Default true. Set false for
+    /// services whose restart needs special handling (e.g. a rump_server, whose
+    /// kernel sysproxy channel must be re-established on restart — TBD).
+    restart: bool,
 }
 
 impl Default for ServiceConfig {
@@ -112,6 +119,8 @@ impl Default for ServiceConfig {
             boxed: false,
             box_root: String::from("/"),
             bundle: String::new(),
+            stack: String::new(),
+            restart: true,
         }
     }
 }
@@ -548,6 +557,8 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                     config.bundle = String::from(value);
                     config.boxed = true; // bundles are always boxed
                 }
+                "stack" => config.stack = String::from(value),
+                "restart" => config.restart = value != "false" && value != "0" && value != "no",
                 _ => {}
             }
         }
@@ -673,6 +684,13 @@ pub struct SpawnOptions {
 
 const SYSCALL_SPAWN_EXT: u64 = 315;
 const SYSCALL_REGISTER_BOX: u64 = 316;
+const SYSCALL_SET_BOX_STACK: u64 = 324;
+
+/// Tell the kernel a box uses the NetBSD rump network stack (stack = 1). The
+/// kernel then routes that box's AF_INET syscalls to its rump_server.
+fn set_box_stack_rump(box_id: u64) {
+    libakuma::syscall(SYSCALL_SET_BOX_STACK, box_id, 1, 0, 0, 0, 0);
+}
 
 fn generate_box_id(name: &str) -> u64 {
     let mut box_id = 0u64;
@@ -700,21 +718,27 @@ fn spawn_in_box(
     command: &str,
     args: &[&str],
 ) -> Option<SpawnResult> {
-    let mut args_buf = Vec::new();
-    for arg in args {
-        args_buf.extend_from_slice(arg.as_bytes());
-        args_buf.push(0);
+    // Match the kernel SPAWN_EXT ABI (and box/main.rs): path is NUL-terminated,
+    // args is an argv POINTER ARRAY ([path\0, arg\0…, null]) — NOT a flat
+    // null-separated buffer — and `options` is arg2 (not arg3). The previous
+    // flat-buffer + arg3 layout made the kernel read `command.len()` as the
+    // options pointer → EFAULT (boxed services never started).
+    let path_term = format!("{}\0", command);
+    let args_term: Vec<String> = args.iter().map(|a| format!("{}\0", a)).collect();
+    let mut argv: Vec<*const u8> = Vec::with_capacity(args_term.len() + 2);
+    argv.push(path_term.as_ptr());
+    for s in &args_term {
+        argv.push(s.as_ptr());
     }
-    let args_ptr = if args_buf.is_empty() { 0 } else { args_buf.as_ptr() as u64 };
-    let args_len = args_buf.len();
+    argv.push(core::ptr::null());
 
     let options = SpawnOptions {
         cwd_ptr: "/".as_ptr() as u64,
         cwd_len: 1,
         root_dir_ptr: 0,
         root_dir_len: 0,
-        args_ptr,
-        args_len,
+        args_ptr: argv.as_ptr() as u64,
+        args_len: argv.len(),
         stdin_ptr: 0,
         stdin_len: 0,
         box_id,
@@ -722,9 +746,9 @@ fn spawn_in_box(
 
     let result = libakuma::syscall(
         SYSCALL_SPAWN_EXT,
-        command.as_ptr() as u64,
-        command.len() as u64,
+        path_term.as_ptr() as u64,
         &options as *const _ as u64,
+        0,
         0,
         0,
         0,
@@ -823,6 +847,9 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
 
         // 1. Register box (creates mount namespace in kernel)
         register_box(name, box_id, &root_dir, 0);
+        if config.stack == "rump" {
+            set_box_stack_rump(box_id);
+        }
 
         // 2. Set up OCI mounts in the box's namespace
         setup_oci_mounts(box_id, &oci.mounts);
@@ -837,6 +864,14 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
         let box_id = generate_box_id(name);
         let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
         register_box(name, box_id, &config.box_root, 0);
+        if config.stack == "rump" {
+            // Mark the box BEFORE spawning so the kernel knows this box's
+            // rump_server should get a sysproxy channel wired onto fd 3 when we
+            // spawn it below. herd owns the rump_server lifecycle (one server,
+            // no second kernel-spawned one); the kernel only attaches the
+            // channel + drives the proxy.
+            set_box_stack_rump(box_id);
+        }
         let res = spawn_in_box(box_id, &config.command, &args);
         if let Some(ref r) = res {
             register_box(name, box_id, &config.box_root, r.pid);
@@ -944,9 +979,9 @@ fn check_process_exits(state: &mut HerdState, now_ms: u64) {
             svc.stdout_fd = None;
             svc.last_exit_code = Some(exit_code);
 
-            // Schedule restart on non-zero exit
-            if exit_code != 0 {
-                let should_restart = svc.config.max_retries == 0 
+            // Schedule restart on non-zero exit (unless restart is disabled).
+            if exit_code != 0 && svc.config.restart {
+                let should_restart = svc.config.max_retries == 0
                     || svc.restart_count < svc.config.max_retries;
 
                 if should_restart {

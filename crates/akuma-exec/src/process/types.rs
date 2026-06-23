@@ -151,9 +151,30 @@ pub enum FileDescriptor {
     EventFd(u32),
     DevNull,
     DevUrandom,
+    /// `/dev/zero`: reads fill the buffer with zero bytes (returning the full
+    /// count), writes are discarded. Mirrors `/dev/null` except read semantics.
+    /// Needed by libc/rump anonymous-memory and buffer-zeroing paths.
+    DevZero,
     /// virtio-sound output device (`/dev/dsp`). Writes stream PCM frames to the
     /// kernel audio driver; ioctl sets OSS format/channels/rate.
     DevDsp,
+    /// Raw L2 packet device (`/dev/net/tap0`) for the kernel `rump` feature.
+    /// `read`/`write` move whole Ethernet frames to/from a dedicated second
+    /// virtio-net NIC (bypassing smoltcp). Only ever constructed when the
+    /// kernel is built with the `rump` feature and NIC1 is present; the variant
+    /// is unconditional so non-rump builds still match exhaustively.
+    /// `nonblock`: when false (the default for `open` without `O_NONBLOCK`), a
+    /// `read` with no frame ready blocks (cooperatively yields) until one arrives;
+    /// when true it returns `EAGAIN` — POSIX device-read semantics, so the rump
+    /// virtif RX thread can do a plain blocking `read()` instead of busy-polling.
+    Tap { nonblock: bool },
+    /// A socket living in a `stack=rump` box's NetBSD `rump_server`. The box
+    /// process sees a normal low-numbered fd; the kernel proxy forwards this
+    /// fd's socket syscalls over the box's sysproxy channel, translating the box
+    /// fd ⇄ the server's `rump_fd`. `nonblock` mirrors the requested socket type
+    /// bit (the proxy keeps the rump socket blocking and emulates nonblock).
+    /// Unconditional (like `Tap`) so non-rump builds still match exhaustively.
+    RumpSocket { rump_fd: i32, nonblock: bool },
     TimerFd(u32),
     EpollFd(u32),
     PidFd(u32),

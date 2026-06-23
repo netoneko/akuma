@@ -13,6 +13,12 @@ use alloc::format;
 pub fn run_network_tests() {
     console::print("\n--- Process Network Tests ---\n");
 
+    // /dev/net/tap0 raw L2 packet device (rump feature). Runs here — after
+    // network init has bound NIC1 — not in run_all_tests (which precedes it).
+    // Skips cleanly when NIC1 is absent (no RUMP_NIC=1).
+    #[cfg(feature = "rump")]
+    test_rump_tap();
+
     test_epoll_socket_waker();
     test_epoll_poll_socket_readiness_no_deadlock();
     test_epoll_check_fd_readiness_unknown_fd();
@@ -60,6 +66,10 @@ pub fn run_all_tests() {
     // Regression: hardware RNG live + producing entropy on the negotiated
     // (now modern, version 2) VirtIO transport — guards the force-legacy drop.
     test_rng_entropy_live();
+
+    // /dev/zero char device (open + zero-fill read + discard write). Kernel
+    // prerequisite for the rump hypercall layer (Phase 2).
+    test_dev_zero();
 
     // virtio-sound output path (skips cleanly when no device is on the bus).
     test_virtio_sound_output();
@@ -2290,6 +2300,152 @@ fn test_rng_entropy_live() {
             both_ok,
             not_all_zero,
             differ
+        );
+    }
+}
+
+/// `/dev/zero` char device: open it, read N bytes (must come back all-zero and
+/// return the full count), write N bytes (must be discarded and return the full
+/// count). Mirrors `/dev/null` except read fills with zeros. Drives the real
+/// syscall path (openat/read/write/close) with `BYPASS_VALIDATION` so the
+/// kernel-stack buffer passes the user-pointer check. Needed by Phase 2 rump
+/// hypercalls (anonymous-memory / buffer-zeroing paths expect `/dev/zero`).
+fn test_dev_zero() {
+    use core::sync::atomic::Ordering;
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid};
+    use akuma_exec::threading::current_thread_id;
+    use crate::syscall::nr;
+
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    const O_RDWR: u64 = 2;
+    const N: usize = 64;
+
+    let tid = current_thread_id();
+    let pid = 7050;
+    let proc = make_test_process(pid);
+    register_process(pid, proc);
+    register_thread_pid(tid, pid);
+
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+    // open("/dev/zero", O_RDWR)
+    let path = b"/dev/zero\0";
+    let fd = crate::syscall::handle_syscall(
+        nr::OPENAT,
+        &[AT_FDCWD, path.as_ptr() as u64, O_RDWR, 0, 0, 0],
+    );
+    let open_ok = (fd as i64) >= 0;
+
+    // read(fd, buf, N) — buf pre-filled with 0xAA must come back all-zero.
+    let mut buf = [0xAAu8; N];
+    let rret = crate::syscall::handle_syscall(
+        nr::READ,
+        &[fd, buf.as_mut_ptr() as u64, N as u64, 0, 0, 0],
+    );
+    let read_ok = rret == N as u64 && buf.iter().all(|&b| b == 0);
+
+    // write(fd, buf, N) — discarded, returns full count.
+    let wret = crate::syscall::handle_syscall(
+        nr::WRITE,
+        &[fd, buf.as_ptr() as u64, N as u64, 0, 0, 0],
+    );
+    let write_ok = wret == N as u64;
+
+    if open_ok {
+        crate::syscall::handle_syscall(nr::CLOSE, &[fd, 0, 0, 0, 0, 0]);
+    }
+
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    if open_ok && read_ok && write_ok {
+        console::print("[Test] dev_zero PASSED\n");
+    } else {
+        crate::safe_print!(
+            96,
+            "[Test] dev_zero FAILED: open_ok={} read_ok={} (rret={}) write_ok={} (wret={})\n",
+            open_ok, read_ok, rret as i64, write_ok, wret as i64,
+        );
+    }
+}
+
+/// `/dev/net/tap0` raw L2 packet device (kernel `rump` feature). Skips cleanly
+/// when NIC1 is absent (default QEMU command line — no `RUMP_NIC=1`), so the
+/// normal boot suite is unaffected. When NIC1 is bound: open the tap, write one
+/// crafted broadcast Ethernet frame (must accept the full length), and read once
+/// (EAGAIN with no frame queued, or a frame — both fine). Drives the real
+/// syscall path with `BYPASS_VALIDATION`. Full loopback verification against the
+/// QEMU SLIRP network is the C exit test, not this deterministic boot check.
+#[cfg(feature = "rump")]
+fn test_rump_tap() {
+    use core::sync::atomic::Ordering;
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid};
+    use akuma_exec::threading::current_thread_id;
+    use crate::syscall::nr;
+
+    if !akuma_net::rump_tap::is_ready() {
+        console::print("[Test] rump_tap SKIPPED (no NIC1; run QEMU with RUMP_NIC=1)\n");
+        return;
+    }
+
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    const O_RDWR: u64 = 2;
+    const O_NONBLOCK: u64 = 0x800;
+    const EAGAIN: u64 = (-11i64) as u64;
+
+    let tid = current_thread_id();
+    let pid = 7060;
+    let proc = make_test_process(pid);
+    register_process(pid, proc);
+    register_thread_pid(tid, pid);
+
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+    // open("/dev/net/tap0", O_RDWR|O_NONBLOCK) — non-blocking so the read below
+    // returns EAGAIN immediately (blocking opens now wait for a frame).
+    let path = b"/dev/net/tap0\0";
+    let fd = crate::syscall::handle_syscall(
+        nr::OPENAT,
+        &[AT_FDCWD, path.as_ptr() as u64, O_RDWR | O_NONBLOCK, 0, 0, 0],
+    );
+    let open_ok = (fd as i64) >= 0;
+
+    // Minimal 60-byte broadcast Ethernet frame: dst=ff:ff:ff:ff:ff:ff, an
+    // arbitrary src MAC, ethertype ARP (0x0806). Just needs to be a valid frame
+    // the NIC will accept for transmission.
+    let mut frame = [0u8; 60];
+    for b in &mut frame[0..6] { *b = 0xff; }
+    frame[6..12].copy_from_slice(&[0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+    frame[12] = 0x08;
+    frame[13] = 0x06;
+
+    let wret = if open_ok {
+        crate::syscall::handle_syscall(nr::WRITE, &[fd, frame.as_ptr() as u64, frame.len() as u64, 0, 0, 0])
+    } else { u64::MAX };
+    let write_ok = wret == frame.len() as u64;
+
+    let mut rbuf = [0u8; 2048];
+    let rret = if open_ok {
+        crate::syscall::handle_syscall(nr::READ, &[fd, rbuf.as_mut_ptr() as u64, rbuf.len() as u64, 0, 0, 0])
+    } else { EAGAIN };
+    let read_ok = rret == EAGAIN || (rret as i64) >= 0;
+
+    if open_ok {
+        crate::syscall::handle_syscall(nr::CLOSE, &[fd, 0, 0, 0, 0, 0]);
+    }
+
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    if open_ok && write_ok && read_ok {
+        console::print("[Test] rump_tap PASSED\n");
+    } else {
+        crate::safe_print!(
+            128,
+            "[Test] rump_tap FAILED: open_ok={} write_ok={} (wret={}) read_ok={} (rret={})\n",
+            open_ok, write_ok, wret as i64, read_ok, rret as i64,
         );
     }
 }

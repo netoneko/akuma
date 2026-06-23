@@ -1,0 +1,10 @@
+# buildrump.sh cross-build outputs and fetched NetBSD source (do NOT commit —
+# the source is hundreds of MB; pin it via buildrump.sh/.srcgitrev instead).
+/obj/
+/obj-host/
+/dest/
+/dest-host/
+/src-netbsd/
+/rumpkernel/usr/
+/frankenlibc/
+/out/

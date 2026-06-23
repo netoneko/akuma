@@ -51,6 +51,8 @@ mod pthread_tests;
 #[cfg(feature = "sc-framebuffer")]
 mod ramfb;
 mod rng;
+#[cfg(feature = "rump")]
+mod rump_proxy;
 mod shell;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod shell_tests;
@@ -1114,6 +1116,24 @@ fn run_async_main() -> ! {
 
     console::print("--- Network Initialization Done ---\n\n");
 
+    // rump feature: bind a SECOND virtio-net device (NIC1) to the raw L2 tap
+    // path (/dev/net/tap0), leaving NIC0 on smoltcp above. Only present when the
+    // QEMU runner adds NIC1 (RUMP_NIC=1); otherwise this no-ops with a notice and
+    // /dev/net/tap0 stays ENODEV. Never fatal — the native stack is unaffected.
+    #[cfg(feature = "rump")]
+    match akuma_net::rump_tap::init(&mmio_addrs) {
+        Ok(mac) => {
+            crate::safe_print!(
+                128,
+                "[rump] /dev/net/tap0 bound to NIC1, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            );
+        }
+        Err(e) => {
+            crate::safe_print!(128, "[rump] tap not available: {} (run QEMU with RUMP_NIC=1)\n", e);
+        }
+    }
+
     // Run network self-tests if enabled
     #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
     if config::RUN_NETWORK_TESTS {
@@ -1132,6 +1152,12 @@ fn run_async_main() -> ! {
             ssh_tests::run_all_tests();
         }
     }
+
+    // Kernel-as-client sysproxy demo (RUMP_SYSPROXY.md Step 4): only with
+    // RUMP_NIC=1; spawns /bin/rump_server and drives rump_sys_socket over a
+    // kernel pipe. Skips cleanly when NIC1 / rump_server is absent.
+    #[cfg(feature = "rump")]
+    rump_proxy::run_demo();
 
     // Initialize SSH host key
     ssh::init_host_key();
