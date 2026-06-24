@@ -1144,7 +1144,15 @@ pub(super) fn parse_argv_array(ptr: u64) -> Vec<String> {
     args
 }
 
-pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, stdin_len: usize, _a5: u64) -> u64 {
+/// Spawn flag bits (Akuma's own SPAWN ABI, arg6). Keep in sync with
+/// `libakuma::SPAWN_FLAG_PTY`.
+const SPAWN_FLAG_PTY: u64 = 1;
+
+pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, stdin_len: usize, flags: u64) -> u64 {
+    // arg6 carries spawn flags. Bit 0 (SPAWN_FLAG_PTY) marks the child's stdin
+    // as a terminal so the kernel line discipline runs (sshd sets it for an
+    // interactive login shell — the client's `pty-req`).
+    let pty = (flags & SPAWN_FLAG_PTY) != 0;
     let path = match copy_from_user_str(path_ptr, 512) {
         Ok(p) => p,
         Err(e) => return e,
@@ -1173,7 +1181,7 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     
     let stdin_slice = stdin_data.as_deref();
 
-    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_cwd(&path, Some(&args_refs), Some(&env_vec), stdin_slice, None)
+    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(&path, Some(&args_refs), Some(&env_vec), stdin_slice, None, 0, pty)
         && let Some(proc) = akuma_exec::process::current_process() {
             akuma_exec::process::register_child_channel(pid, ch, proc.pid);
             return u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32);
@@ -1228,7 +1236,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
     
     let stdin_slice = stdin_data.as_deref();
 
-    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(&path, args_opt, None, stdin_slice, cwd_ref, o.box_id) {
+    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(&path, args_opt, None, stdin_slice, cwd_ref, o.box_id, false) {
         // For a `stack=rump` box, when herd spawns its `rump_server` the kernel
         // wires a sysproxy channel onto fd 3 (BEFORE the server runs) and brings
         // the proxy up. herd owns the process; the kernel owns the channel.

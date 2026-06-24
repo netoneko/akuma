@@ -120,7 +120,13 @@ async fn run_shell_session(
         let arg_refs: Vec<&str> = session.config.shell_args.iter().map(|s| s.as_str()).collect();
         let args = if arg_refs.is_empty() { None } else { Some(arg_refs.as_slice()) };
         println(&format!("[SSH] Spawning shell: {} {:?}", shell_path, session.config.shell_args));
-        if let Some(res) = spawn(shell_path, args) {
+        // Interactive login shell: request a pty so the kernel runs its canonical
+        // line discipline (ICRNL CR->NL, echo, line editing) on the shell's
+        // stdin. `ssh -tt` sends a `pty-req` ahead of this `shell` request; the
+        // shell is cooked like a real terminal instead of a raw pipe. (A future
+        // refinement could gate this on a tracked `pty-req` flag so a
+        // no-pty client gets a pipe.)
+        if let Some(res) = spawn_pty(shell_path, args) {
             return bridge_process(stream, session, res.pid, res.stdout_fd).await;
         }
         println(&format!("[SSH] Failed to spawn {}, falling back to built-in", shell_path));

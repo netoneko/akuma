@@ -47,6 +47,7 @@ pub fn run_all_tests() {
 
     // Test that a spawned child's channel is non-terminal (isatty == false)
     test_spawned_child_not_a_tty();
+    test_spawned_child_pty_is_a_tty();
 
     // Test Linux compatibility bridging (vfork/execve)
     test_linux_process_abi();
@@ -2164,6 +2165,36 @@ fn test_spawned_child_not_a_tty() {
         crate::safe_print!(96, "[Test] FAIL: spawned child's channel reports a terminal (isatty would be true)\n");
     } else {
         crate::safe_print!(64, "[Test] spawned-child-not-a-tty: PASSED\n");
+    }
+    akuma_exec::threading::cleanup_terminated();
+}
+
+/// The inverse of [`test_spawned_child_not_a_tty`]: a spawn that requests a pty
+/// (`pty = true`, the path sshd takes for an interactive login shell via
+/// `spawn_pty` / SPAWN_FLAG_PTY) must produce a channel that reports a terminal,
+/// so the kernel runs its canonical line discipline (ICRNL CR->NL, echo) on the
+/// child's stdin instead of treating it as a raw pipe.
+fn test_spawned_child_pty_is_a_tty() {
+    use akuma_exec::process::spawn_process_with_channel_ext;
+
+    const HELLO_PATH: &str = "/bin/hello";
+    if !check_binary_exists(HELLO_PATH) {
+        crate::safe_print!(64, "[Test] spawned-child-pty-is-a-tty: SKIPPED (binary absent)\n");
+        return;
+    }
+    let args = &["1", "1"];
+    let (_tid, ch, _pid) =
+        match spawn_process_with_channel_ext(HELLO_PATH, Some(args), None, None, None, 0, true) {
+            Ok(result) => result,
+            Err(e) => {
+                crate::safe_print!(96, "[Test] Failed to spawn hello (pty): {}\n", e);
+                return;
+            }
+        };
+    if ch.is_terminal() {
+        crate::safe_print!(64, "[Test] spawned-child-pty-is-a-tty: PASSED\n");
+    } else {
+        crate::safe_print!(96, "[Test] FAIL: pty spawn's channel is not a terminal (isatty would be false)\n");
     }
     akuma_exec::threading::cleanup_terminated();
 }
@@ -4312,7 +4343,8 @@ fn test_child_stdout_blocking_read() {
         None,
         None,
         None,
-        0
+        0,
+        false
     ).expect("spawn failed");
 
     let mut buf = [0u8; 128];
@@ -4376,7 +4408,7 @@ fn test_waitpid_reap_preserves_buffered_stdout() {
 
     // One line of output, minimal delay, then exit.
     let args = ["/bin/hello", "1", "1"];
-    let (_tid, ch, pid) = spawn_process_with_channel_ext(path, Some(&args), None, None, None, 0)
+    let (_tid, ch, pid) = spawn_process_with_channel_ext(path, Some(&args), None, None, None, 0, false)
         .expect("spawn failed");
 
     // Mirror what sys_spawn does so the parent can resolve the channel by pid.

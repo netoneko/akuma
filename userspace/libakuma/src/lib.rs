@@ -1348,6 +1348,52 @@ pub fn spawn(path: &str, args: Option<&[&str]>) -> Option<SpawnResult> {
     spawn_with_stdin(path, args, None)
 }
 
+/// Spawn flag bits passed in the SPAWN syscall's 6th argument (Akuma's own
+/// SPAWN ABI). Keep in sync with the kernel's `SPAWN_FLAG_PTY` in
+/// `src/syscall/proc.rs`.
+pub const SPAWN_FLAG_PTY: u64 = 1;
+
+/// Spawn a child whose stdin/stdout is a terminal (pty), not a raw pipe.
+///
+/// Marks the child's channel as a tty so `isatty()` reports true and the kernel
+/// runs its canonical line discipline (ICRNL CR->NL, echo, line editing) on the
+/// child's stdin. Used by sshd when a client requests an interactive login shell
+/// (`pty-req` / `ssh -tt`) so typed input is cooked like a real terminal.
+pub fn spawn_pty(path: &str, args: Option<&[&str]>) -> Option<SpawnResult> {
+    let path_terminated = alloc::format!("{}\0", path);
+    let mut argv = alloc::vec::Vec::new();
+    argv.push(path_terminated.as_ptr());
+
+    let mut args_terminated = alloc::vec::Vec::new();
+    if let Some(slice) = args {
+        for a in slice {
+            args_terminated.push(alloc::format!("{}\0", a));
+        }
+    }
+    for s in &args_terminated {
+        argv.push(s.as_ptr());
+    }
+    argv.push(core::ptr::null());
+
+    let result = syscall(
+        syscall::SPAWN,
+        path_terminated.as_ptr() as u64,
+        argv.as_ptr() as u64,
+        0, // NULL envp
+        0, // no stdin seed
+        0,
+        SPAWN_FLAG_PTY,
+    );
+
+    if (result as i64) < 0 {
+        return None;
+    }
+
+    let pid = (result & 0xFFFF_FFFF) as u32;
+    let stdout_fd = ((result >> 32) & 0xFFFF_FFFF) as u32;
+    Some(SpawnResult { pid, stdout_fd })
+}
+
 /// Spawn a child process with stdin data
 ///
 /// Returns SpawnResult on success with child PID and stdout FD.

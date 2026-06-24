@@ -69,10 +69,16 @@ pub fn spawn_process_with_channel_cwd(
     stdin: Option<&[u8]>,
     cwd: Option<&str>,
 ) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
-    spawn_process_with_channel_ext(path, args, env, stdin, cwd, 0)
+    spawn_process_with_channel_ext(path, args, env, stdin, cwd, 0, false)
 }
 
-/// Extended version of spawn_process_with_channel
+/// Extended version of spawn_process_with_channel.
+///
+/// `pty`: when `true`, the child's channel is marked as a real terminal
+/// (`isatty()` reports true) so the kernel's canonical line discipline (ICRNL,
+/// echo, line editing) runs on its stdin — for interactive sessions that
+/// allocate a pty (e.g. sshd handling a client's `pty-req` for a login shell).
+/// When `false` (the default for piped spawns) the child's stdin is a raw pipe.
 pub fn spawn_process_with_channel_ext(
     path: &str,
     args: Option<&[&str]>,
@@ -80,6 +86,7 @@ pub fn spawn_process_with_channel_ext(
     stdin: Option<&[u8]>,
     cwd: Option<&str>,
     box_id: u64,
+    pty: bool,
 ) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
     if crate::threading::user_threads_available() == 0 {
         return Err("No available user threads for process execution".into());
@@ -203,11 +210,14 @@ pub fn spawn_process_with_channel_ext(
     let channel = Arc::new(ProcessChannel::new());
 
     // A spawned child's stdin/stdout is a pipe (this channel), not a real
-    // terminal, so isatty() must report false. Otherwise shells like busybox
-    // start an interactive line editor that hangs querying the (absent)
-    // terminal for its cursor position (ESC[6n) instead of batch-reading the
-    // commands the parent pipes in (e.g. the SSH-into-box bridge).
-    channel.set_terminal(false);
+    // terminal — unless the spawner explicitly requested a pty. When `pty` is
+    // false, isatty() reports false: shells like busybox then batch-read piped
+    // input instead of starting an interactive line editor that queries the
+    // (absent) terminal for its cursor position (ESC[6n) — the right default for
+    // piped spawns. When `pty` is true (sshd handling a client `pty-req` for a
+    // login shell), the channel is a terminal so the kernel line discipline
+    // (ICRNL CR->NL, canonical editing, echo) runs on the child's stdin.
+    channel.set_terminal(pty);
 
     // Seed the channel with initial stdin data if provided.
     // Empty stdin (Some(b"")) keeps stdin open so sys_write enables ONLCR
