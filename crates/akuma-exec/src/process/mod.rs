@@ -1616,8 +1616,16 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             }
         }
 
-        // Flush parent TLB so demoted PTEs take effect
-        mmu::flush_tlb_asid(0); // flush all — parent ASID may vary
+        // Flush parent TLB so the demoted (RO) PTEs take effect immediately.
+        // MUST be flush_tlb_all() (tlbi vmalle1): user processes run under their
+        // own non-zero ASID (ttbr0 = (asid<<48)|l0), so flush_tlb_asid(0) only
+        // invalidates ASID 0 and MISSES the parent's stale RW entries — the parent
+        // would then write through to a still-shared CoW page (no fault), clobbering
+        // the child's snapshot (e.g. saved return addresses on a shared stack page)
+        // and the child later ret's to a garbage/zero LR → SIGSEGV. (Intermittent
+        // because the next context switch's activate()/deactivate() flush_tlb_all
+        // closes the window; only writes before the parent is preempted corrupt.)
+        mmu::flush_tlb_all();
 
         new_proc.lazy_regions = Vec::new();
         new_proc.memory.next_mmap.store(parent.memory.next_mmap.load(Ordering::Relaxed), Ordering::Relaxed);

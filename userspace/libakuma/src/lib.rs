@@ -199,8 +199,13 @@ pub struct ProcessInfo {
 /// Get the current process ID
 ///
 /// Reads from the kernel-provided process info page.
+/// With the `linux-abi` feature, uses the Linux getpid syscall (172) instead,
+/// because the Akuma process-info page at 0x1000 is unmapped on standard Linux.
 #[inline]
 pub fn getpid() -> u32 {
+    #[cfg(feature = "linux-abi")]
+    { syscall(172, 0, 0, 0, 0, 0, 0) as u32 }
+    #[cfg(not(feature = "linux-abi"))]
     unsafe { (*(PROCESS_INFO_ADDR as *const ProcessInfo)).pid }
 }
 

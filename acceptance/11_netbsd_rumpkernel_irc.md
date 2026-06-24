@@ -321,12 +321,22 @@ Done (DNS + HTTPS in the box with static curl):
       `curl: (77)` mbedTLS ca-cert error). No code change — pure data staging, then
       full `populate_disk.sh`. See `docs/HANDOFF.md` "Session 2026-06-24 (latest)".
 
+Done (fork reliability):
+- [x] **Fork SIGSEGV FIXED (2026-06-24)** — the box shell forking curl (and any
+      fork+exec) crashed ~90% with `[WILD-IA] ELR=0 x30=0`. Root cause: fork's CoW
+      path demoted the parent to RO then flushed with `flush_tlb_asid(0)`, which
+      misses the parent's non-zero ASID → parent writes through the shared CoW page,
+      clobbering the child's stack. Fixed: `flush_tlb_all()` in
+      `crates/akuma-exec/src/process/mod.rs`. Reproduced+verified on plain smoltcp
+      with BOTH busybox (`:2323`) and toybox (`:4444`): 37/40 & 32/40 SIGSEGV → 0/40.
+      Not busybox- or rump-specific. See `docs/HANDOFF.md`.
+
 Remaining (polish — not blocking the IRC capstone):
-- [ ] **SSH-into-box curl reliability** — HTTPS works over `:2223` too (full body
-      fetched when it runs), but the box shell forks curl and hits the pre-existing
-      intermittent **fork SIGSEGV** (`[WILD-IA] ELR=0 x30=0 SPSR=0x20000000`,
-      boot-variable). `box use` (single fork) is reliable. See HANDOFF fork-SIGSEGV
-      analysis.
+- [ ] **SSH-into-box interactive reliability** — curl now forks cleanly over `:2223`
+      (fork bug fixed), and `box use` HTTPS is reliable, but a clean *interactive*
+      SSH-in curl is still gated by the sshd-bridge-over-rump session-robustness +
+      latency gap (single rump client-slot wedge / slow proxied session I/O — project
+      task #9), not by any crash.
 - [ ] **DNS cold-start** — the first query right after boot occasionally returns no
       answer (SLIRP warm-up); warm with one `box use ... curl` first. Steady-state 6/6.
 - [ ] per-syscall latency (~1s round-trip) + robustness — see `docs/HANDOFF.md` / `RUMP_SYSPROXY.md`.

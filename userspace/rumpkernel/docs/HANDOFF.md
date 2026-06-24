@@ -49,31 +49,37 @@ no kernel/code change. UNCOMMITTED (user commits):**
    Copied the main root's bundle. After staging both, run a FULL `populate_disk.sh`
    (not `--bin-only`) so the box rootfs lands on the disk.
 
-**Two reliability caveats (pre-existing, NOT DNS/HTTPS-specific):**
-- **Fork SIGSEGV dominates the SSH-into-box path.** Over `:2223` interactive,
-  `curl` is forked by the box shell and hits the intermittent fork SIGSEGV
-  (`[WILD-IA] ELR=0x0 x30=0x0 SPSR=0x20000000`, RC139) — boot-variable, sometimes
-  most attempts, sometimes ~half. When it does NOT crash, **HTTPS works over
-  SSH-in too** (observed `curl ... passed 559 returned 0` = full example.com body
-  fetched). The single-fork `box use` path avoids the shell fork and is reliable
-  (6/6). **New analysis this session (narrows the prior lead):** the child enters
-  EL0 ONLY via `Process::run()` → `enter_user_mode(&proc.context)` (process/mod.rs:487),
-  which sets `spsr_el1 = ctx.spsr`, `elr = ctx.pc`, `x30 = ctx[+240]`. fork forces
-  `child_ctx.spsr = 0`, yet the crash SPSR is `0x20000000` (the PARENT's captured
-  EL0 PSTATE). So `proc.context` is being OVERWRITTEN/raced between fork-setup and
-  the child's first `run()` — it is NOT a stale capture (consistent with the prior
-  session's finding that the capture guard never fired). NEXT: instrument
-  `proc.context.{pc,spsr,x30}` immediately before `enter_user_mode` vs. at the fork
-  set-site to catch the writer; or gdbstub a watchpoint on `proc.context.spsr`.
-- **DNS cold-start flakiness.** The FIRST DNS query right after boot sometimes
-  returns no answer (SLIRP/host-network warm-up); a second attempt resolves. Warm
-  with one `box use ... curl` before relying on it. (Steady-state DNS = 6/6.)
+**🏆 Fork SIGSEGV — ROOT-CAUSED & FIXED this session (one-line kernel fix).** This
+was THE blocker for the SSH-into-box path (`curl` forked by the box shell crashed
+~90% with `[WILD-IA] ELR=0x0 x30=0x0`, RC139). It was a `[[fork_cow_tlb_asid_flush]]`
+**kernel CoW/TLB bug — NOT busybox-specific, NOT rump-specific.** Isolated on plain
+smoltcp box-0 via the diag sshds (`sshd_host.conf` busybox `:2323`, `sshd_diag_toybox.conf`
+toybox `:4444`): a `/bin/{busybox,toybox} true` fork-stress crashed **37/40 (busybox)
+and 32/40 (toybox)** — so both shells, no rump in the path. Instrumentation proved the
+child enters EL0 with a **correct** context (`pc`/`sp`/`x30` valid, `spsr=0`) and only
+crashes *after running*, branching to a zeroed return address — **post-fork stack
+corruption, not a context-setup bug** (overturns the prior "context capture/zeroing"
+theory). Root cause: `fork_process` demotes the parent's pages to RO for CoW
+(`demote_range_to_ro`) but then flushed with `flush_tlb_asid(0)` — `tlbi aside1` for
+**ASID 0 only**, while every user process runs under its **own non-zero ASID**
+(`ttbr0 = (asid<<48)|l0`). So the parent's stale **RW** TLB entries survived → the
+parent wrote *through* to the still-shared CoW page without faulting → clobbered the
+child's snapshot (saved return addresses on the shared stack page) → child `ret`'d to
+~0. ~90% (not 100%) because the next context switch's `activate()` does a full flush,
+closing the window. **Fix:** `flush_tlb_asid(0)` → `mmu::flush_tlb_all()` (`tlbi
+vmalle1`, all ASIDs) in the fork CoW path (`crates/akuma-exec/src/process/mod.rs`,
+~line 1631). After the fix: busybox **0/40** and toybox **0/40** SIGSEGV, **0**
+`WILD-IA` faults. (UNCOMMITTED — user commits. NOTE: vfork/clone variants don't call
+`demote_range_to_ro` at all — separate follow-up if they show CoW issues.)
+- **DNS cold-start flakiness (still open, minor).** The FIRST DNS query right after
+  boot sometimes returns no answer (SLIRP/host-network warm-up); a second attempt
+  resolves. Warm with one `box use ... curl` before relying on it. (Steady-state DNS = 6/6.)
 
 The acceptance/11 capstone bar — DNS + HTTPS in the box on the NetBSD stack with an
-unmodified static curl — is met via `box use`; the SSH-in path is gated only by the
-separate fork-SIGSEGV robustness bug.
+unmodified static curl — is met via `box use` (6/6) and, with the fork fix, the
+SSH-into-box path now forks cleanly too.
 
-### Session 2026-06-24 (later): interactive PTY for the box shell + fork SIGSEGV lead
+### Session 2026-06-24 (later): interactive PTY for the box shell + fork SIGSEGV lead (bug since FIXED — see above)
 
 **SHIPPED (verified, UNCOMMITTED): the SSH-into-box shell is now a real
 interactive terminal.** Was: no prompt/echo/line-editing, Enter (`\r`) never
@@ -90,22 +96,22 @@ Enter work; **curl PASSED** (`curl -H Host:ifconfig.me -L http://34.160.111.145`
 from the box shell); **sic ran** interactively (caveat: `^C`/SIGINT through the
 pty+bridge unconfirmed). Full writeup: **`docs/BOX_PTY_INTERACTIVE_SHELL.md`**.
 
-**OPEN — intermittent fork SIGSEGV (pre-existing, NOT caused by the pty work).**
-`busybox <applet>` / `wget` / `curl` SIGSEGV ~1–3× then succeed: the forked child
-resumes with **ELR(pc)=0 and x30=0** while all other GPRs/SP are valid parent
-values (`[WILD-IA] ... ELR=0x0 ... x30=0x0 SPSR=0x20000000`). Exposed (not caused)
-by the now-working interactive shell. **Disproven this session (don't retry):**
-the capture in `threading::get_saved_user_context` is NOT the culprit — an
-IRQ-guarded, null-elr-rejecting capture was tried and **never fired** yet the
-child still crashed, so `proc.context.pc` is zeroed AFTER capture (the guard was
-reverted). The child reaches EL0 via `entry_point_trampoline`→`run()`→
-`enter_user_mode(&proc.context)`, but `SPSR=0x20000000` (not the `spsr=0`
-`enter_user_mode` sets) hints the failing child instead comes through the
-scheduler's fake-IRQ-frame path (`setup_fake_irq_frame` builds it;
-`update_thread_context` patches only x0/x1). NEXT: instrument `proc.context.pc`
-at the fork set-site vs. trampoline-pre-`run()` to localize the zeroing, or
-gdbstub a conditional breakpoint (reproduces within a few `busybox ls`). Same
-class as `docs/GO_FORK_EXEC_FIXES.md` / `SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md`.
+**✅ RESOLVED 2026-06-24 (later) — intermittent fork SIGSEGV was a CoW TLB
+flush-by-ASID bug. See the "DNS + HTTPS inside the box" session above for the full
+write-up + fix (`flush_tlb_asid(0)` → `flush_tlb_all()` in fork's CoW path).** The
+symptom: `busybox <applet>`/`wget`/`curl` SIGSEGV with the forked child resuming
+later at **ELR(pc)=0 and x30=0** (`[WILD-IA] ... ELR=0x0 ... x30=0x0`), all other
+GPRs/SP valid. *Historical note — the dead-end leads below were ALL ultimately wrong;
+kept only as a cautionary record:* this session's instrumentation proved the child
+enters EL0 with a fully CORRECT context (`pc`/`sp`/`x30` valid, `spsr=0`) via
+`enter_user_mode(&proc.context)` and only crashes AFTER running — i.e. it was never a
+context-setup/zeroing problem at all (the prior `get_saved_user_context` /
+fake-IRQ-frame / `SPSR=0x20000000` theories were red herrings; the `0x20000000` came
+from one early over-rump capture, but the clean smoltcp repro shows `SPSR=0x0`). The
+real bug was post-fork stack corruption: the parent's stale RW TLB entries (its
+non-zero ASID was never flushed) let it write through a shared CoW page and clobber
+the child's saved return addresses. Same class as `docs/GO_FORK_EXEC_FIXES.md` /
+`SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md` — those may share this root cause.
 
 **Also (minor):** box rootfs `/srv/rumpbox/bin` lacks busybox applet symlinks,
 so bare `ls` fails — use `busybox ls` or stage symlinks (main root gets them in

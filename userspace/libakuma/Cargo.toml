@@ -12,6 +12,11 @@ chunked-allocator = []
 # (e.g. `hello`, `httpd`) skips the build-script crate; consumers that use the
 # async IO traits (e.g. `sshd`) opt in with `features = ["net-async"]`.
 net-async = ["dep:embedded-io-async"]
+# Use standard Linux ABI for OS-specific helpers that otherwise read from the
+# Akuma kernel's process-info page (address 0x1000). Enable when building for
+# a standard Linux target (e.g. aarch64-unknown-linux-musl) to avoid a segfault
+# on the unmapped low page. Currently gates: getpid() → syscall 172.
+linux-abi = []
 
 [dependencies]
 talc = "4"
