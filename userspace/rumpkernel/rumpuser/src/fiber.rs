@@ -31,7 +31,24 @@ extern "C" {
     fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> c_int;
     fn write(fd: c_int, buf: *const c_void, n: usize) -> isize;
     fn abort() -> !;
+    // Idle-path fd readiness wait. On Akuma poll() registers a waker on the fd's
+    // underlying primitive (pipe/socket), so a peer write returns it immediately
+    // (see src/syscall/poll.rs sys_ppoll). nfds is unsigned long (nfds_t).
+    fn poll(fds: *mut PollFd, nfds: usize, timeout_ms: c_int) -> c_int;
 }
+
+/// musl `struct pollfd` — `{ int fd; short events; short revents; }`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PollFd {
+    fd: c_int,
+    events: i16,
+    revents: i16,
+}
+
+/// Max fds the idle poll watches at once (sysproxy channel + headroom). Cooperative
+/// single-thread, so this is the count of fibers simultaneously blocked on an fd.
+const MAXFDWAIT: usize = 8;
 
 #[repr(C)]
 struct Timespec {
@@ -241,6 +258,13 @@ struct Thread {
     ctx: AkCtx,
     flags: c_int,
     stack: *mut c_void, // mmap base to munmap on reap (null for the init thread)
+    // Event-driven fd wait (rumpuser_akuma_wait_fd): when a fiber blocks on an fd
+    // (e.g. the sysproxy receiver on the channel pipe), schedule()'s idle path
+    // poll()s these so a peer write wakes the OS thread IMMEDIATELY via the kernel
+    // pipe waker — instead of a blind nanosleep + busy re-poll. -1 = not fd-waiting.
+    wait_fd: c_int,
+    wait_events: i16,  // POLL* bits we're waiting for
+    wait_revents: i16, // POLL* bits the idle poll observed ready (consumed on wake)
 }
 impl Linked for Thread {
     unsafe fn link(this: *mut Self) -> *mut Link<Self> {
@@ -358,13 +382,55 @@ unsafe fn schedule() {
             break;
         }
 
-        // Nothing runnable: sleep the OS thread until the soonest wakeup.
-        let delta = wakeup - tm;
-        let sl = Timespec {
-            tv_sec: delta / 1000,
-            tv_nsec: (delta % 1000) * 1_000_000,
-        };
-        nanosleep(&sl, ptr::null_mut());
+        // Nothing runnable: park the OS thread until the soonest wakeup. If any
+        // fiber is blocked on an fd (rumpuser_akuma_wait_fd), poll() those fds with
+        // that same timeout — on Akuma a peer write registers a waker and returns
+        // poll() immediately, so the sysproxy channel becomes event-driven (no
+        // busy re-poll, no fixed latency floor). Otherwise plain nanosleep.
+        let delta = wakeup - tm; // ms, always >= 1 (wakeup > tm here)
+
+        // Collect fds from fibers blocked on one (single OS thread → no locking).
+        let mut pfds = [PollFd { fd: -1, events: 0, revents: 0 }; MAXFDWAIT];
+        let mut nfds = 0usize;
+        let mut t = THREAD_LIST.first();
+        while !t.is_null() && nfds < MAXFDWAIT {
+            if !is_runnable(t) && (*t).wait_fd >= 0 {
+                pfds[nfds] = PollFd { fd: (*t).wait_fd, events: (*t).wait_events, revents: 0 };
+                nfds += 1;
+            }
+            t = (*Thread::link(t)).next;
+        }
+
+        if nfds > 0 {
+            let rv = poll(pfds.as_mut_ptr(), nfds, delta as c_int);
+            if rv > 0 {
+                // Wake every fd-waiter whose fd reported readiness; stamp revents so
+                // the woken hypercall can return them. Timed-out waiters are handled
+                // by the wakeup_time scan on the next loop iteration.
+                for pfd in pfds.iter().take(nfds) {
+                    if pfd.revents == 0 {
+                        continue;
+                    }
+                    let mut w = THREAD_LIST.first();
+                    while !w.is_null() {
+                        let wnext = (*Thread::link(w)).next;
+                        if !is_runnable(w) && (*w).wait_fd == pfd.fd {
+                            (*w).wait_revents = pfd.revents;
+                            wake(w);
+                        }
+                        w = wnext;
+                    }
+                }
+            }
+            // rv == 0 (timeout) or rv < 0 (EINTR/err): fall through; the next loop
+            // iteration re-scans (timer wakeups) and re-polls as needed.
+        } else {
+            let sl = Timespec {
+                tv_sec: delta / 1000,
+                tv_nsec: (delta % 1000) * 1_000_000,
+            };
+            nanosleep(&sl, ptr::null_mut());
+        }
     }
 
     if prev != next {
@@ -406,6 +472,9 @@ unsafe fn create_thread(entry: usize, arg: *mut c_void) -> *mut Thread {
             ctx: AkCtx::zero(),
             flags: 0,
             stack,
+            wait_fd: -1,
+            wait_events: 0,
+            wait_revents: 0,
         },
     );
     akctx_make(&mut (*thr).ctx, stack, entry, arg);
@@ -493,6 +562,9 @@ pub unsafe fn init_sched() {
             ctx: AkCtx::zero(),
             flags: 0,
             stack: ptr::null_mut(), // main thread's stack: not ours to munmap
+            wait_fd: -1,
+            wait_events: 0,
+            wait_revents: 0,
         },
     );
     set_runnable(thr);
@@ -573,6 +645,34 @@ pub unsafe extern "C" fn rumpuser_akuma_yield() {
     (*cur).wakeup_time = now() + 1; // 1ms
     clear_runnable(cur);
     schedule();
+}
+
+/// Event-driven idle wait for a backend poll loop (the sysproxy receiver in
+/// sp_serve_fd.c): block this fiber until `fd` is ready for `events` (POLL* bits)
+/// OR `timeout_ms` elapses, letting every other fiber run meanwhile. Unlike
+/// `rumpuser_akuma_yield` (a blind 1ms park + busy re-poll), the scheduler's idle
+/// path poll()s `fd`, and on Akuma a peer write registers a waker so poll() returns
+/// the instant the channel has a request — collapsing the per-proxied-syscall
+/// latency floor. Returns the observed POLL* revents (0 on timeout). Must be called
+/// from host/unscheduled context (no rump CPU held), like yield.
+#[no_mangle]
+pub unsafe extern "C" fn rumpuser_akuma_wait_fd(fd: c_int, events: c_int, timeout_ms: c_int) -> c_int {
+    let cur = get_current();
+    (*cur).wait_fd = fd;
+    (*cur).wait_events = events as i16;
+    (*cur).wait_revents = 0;
+    // Always bound the wait so a missed/asymmetric readiness edge can't wedge the
+    // one OS thread; the receiver re-polls (timeout 0) on wake regardless.
+    let to = if timeout_ms > 0 { timeout_ms as i64 } else { 1000 };
+    (*cur).wakeup_time = now() + to;
+    clear_runnable(cur);
+    schedule();
+    // Cleared on return; report what the idle poll saw (0 ⇒ woke by timeout).
+    (*cur).wait_fd = -1;
+    (*cur).wait_events = 0;
+    let rev = (*cur).wait_revents;
+    (*cur).wait_revents = 0;
+    rev as c_int
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

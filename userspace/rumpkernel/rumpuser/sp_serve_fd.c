@@ -33,6 +33,11 @@ extern int rumpuser_thread_create(void *(*f)(void *), void *arg, const char *thr
     int joinable, int pri, int cpuidx, void **cookie);
 extern int rumpuser_akuma_cooperative(void);
 extern void rumpuser_akuma_yield(void);
+/* Event-driven idle wait under the fiber backend: block this fiber until `fd` is
+ * ready (POLL* `events`) or `timeout_ms` elapses, while other fibers run. The
+ * scheduler poll()s the fd, and Akuma's poll registers a waker so a channel write
+ * returns it immediately — replacing the busy yield's per-request latency floor. */
+extern int rumpuser_akuma_wait_fd(int fd, int events, int timeout_ms);
 
 /* real libc entry points, aliased so the shim can fall back without the macro */
 extern int __akuma_real_pthread_create(pthread_t *, const pthread_attr_t *,
@@ -203,7 +208,11 @@ spserver_fd(void *arg)
 		}
 		if (rv == 0) {
 			if (coop)
-				rumpuser_akuma_yield();
+				/* Block on the channel fd until a request arrives (woken
+				 * immediately by the kernel pipe waker) instead of a blind
+				 * 1ms yield + re-poll; bounded so a missed edge can't wedge
+				 * the one OS thread (next iteration's poll(...,0) re-checks). */
+				rumpuser_akuma_wait_fd(connfd, POLLIN, 1000);
 			continue;
 		}
 		for (idx = 0; seen < rv && idx < MAXCLI; idx++) {

@@ -473,6 +473,31 @@ pub unsafe extern "C" fn rumpuser_akuma_yield() {
     nanosleep(&req, ptr::null_mut());
 }
 
+/// Event-driven fd wait — the fiber backend integrates this into its cooperative
+/// scheduler (see fiber.rs); the pthread backend's RX/receiver runs on its own OS
+/// thread, so it just blocks in a real `poll`. Defined here only so the symbol
+/// resolves when a caller (sp_serve_fd.c) links against the pthread `.a`; that
+/// path takes the `INFTIM` branch and never actually calls this.
+#[cfg(not(feature = "threads_fiber"))]
+#[no_mangle]
+pub unsafe extern "C" fn rumpuser_akuma_wait_fd(fd: c_int, events: c_int, timeout_ms: c_int) -> c_int {
+    #[repr(C)]
+    struct PollFd {
+        fd: c_int,
+        events: i16,
+        revents: i16,
+    }
+    extern "C" {
+        fn poll(fds: *mut PollFd, nfds: usize, timeout: c_int) -> c_int;
+    }
+    let mut pfd = PollFd { fd, events: events as i16, revents: 0 };
+    if poll(&mut pfd, 1, timeout_ms) > 0 {
+        pfd.revents as c_int
+    } else {
+        0
+    }
+}
+
 // ── pthread threading/sync/curlwp backend ────────────────────────────────────
 // The default backend: rump kthreads are 1:1 host pthreads; locks/cv/rw map to
 // pthread primitives. Wrapped in a module so the entire block is swapped out for
