@@ -27,6 +27,11 @@ static CACHED_CONFIG: Spinlock<Option<SshdConfig>> = Spinlock::new(None);
 pub struct SshdConfig {
     pub disable_key_verification: bool,
     pub shell: Option<String>,
+    /// Extra argv passed to the spawned shell, after the shell path. Used to
+    /// drive multicall binaries (busybox/toybox/armybox) whose applet is
+    /// selected by an argument, e.g. `--shell /bin/toybox --shell-arg sh`
+    /// spawns argv = ["/bin/toybox", "sh"]. Empty for a plain shell binary.
+    pub shell_args: Vec<String>,
     pub port: Option<u16>,
 }
 
@@ -35,6 +40,7 @@ impl Default for SshdConfig {
         Self {
             disable_key_verification: false,
             shell: None, // Default to built-in shell
+            shell_args: Vec::new(),
             port: None,  // Default port is handled in main.rs
         }
     }

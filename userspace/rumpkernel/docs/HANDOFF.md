@@ -56,7 +56,7 @@ of 19, futex storm gone. See `FIBER_HANDOFF.md`.** Remaining: residual ~1s/sysca
 | ⚠️ Per-syscall latency (~1s round-trip; rump pthread kthreads on 1 core) | ⏳ open — see "M2" + RUMP_SYSPROXY.md |
 | **🏆 FIBER backend: curl over rump, ~3.85× faster, 1 OS thread** (`16.3s` vs `62.8s`; `clone=0 futex=0`) | ✅ **2026-06-24** — see `FIBER_HANDOFF.md` |
 | ⚠️ Robustness: uninterruptible proxy syscalls, `kill` invalid-pid, client-slot wedge | ⏳ open — project task #9 |
-| acceptance/11 — actual sshd on the rump stack | ✅ login/auth/shell-prompt over rump; ⏳ command round-trip (see "SSH interactive bridge" below) |
+| acceptance/11 — actual sshd on the rump stack | ✅ login/auth/shell-prompt over rump; ✅ **command round-trip FIXED (2026-06-24)** — was a kernel waitpid bug, not rump (see "SSH interactive bridge" below + `userspace/sshd/docs/INTERACTIVE_SHELL_BRIDGE_DRAIN_FIX.md`) |
 | NetBSD binary compat (pkgsrc) via per-process syscall table | 📋 future — `acceptance/12_netbsd_binary_compatibility.md` |
 
 Branch `netbsd-rump-kernel-attempt-0`. **The M2 kernel/herd/sic changes are UNCOMMITTED** (the
@@ -66,7 +66,20 @@ user commits): kernel (`src/rump_proxy.rs`, `src/syscall/{proc,mod,poll}.rs`,
 `threading/mod.rs`), herd (`rumpnet.conf` + `restart` flag), and the `sic` submodule
 (`userspace/rumpkernel/sic` recv-drain patch, uncommitted in the submodule).
 
-### SSH interactive command bridge (2026-06-24) — output path PROVEN; busybox stdin-exec is the remaining bug
+### SSH interactive command bridge — ✅ RESOLVED (2026-06-24)
+
+**UPDATE (2026-06-24, later): root-caused and FIXED.** The "shell spawns but emits no
+output" symptom was **not** busybox stdin-exec and **not** rump/box-specific. It was a
+kernel bug: `sys_waitpid`/`wait4`/`waitid` removed the child's stdout `ProcessChannel`
+the instant they reaped the zombie, so the bridge — which checks `waitpid` before
+draining stdout — found the channel gone and lost all buffered output (busybox flushes
+stdio at `_exit` → lost everything; toybox writes incrementally → lost only its last
+line). Fix: `reap_child_channel` keeps the channel until drained. busybox AND toybox now
+round-trip commands over the bridge. Full writeup + tests:
+**`userspace/sshd/docs/INTERACTIVE_SHELL_BRIDGE_DRAIN_FIX.md`**. The original
+investigation notes below are kept for history.
+
+<details><summary>Original 2026-06-24 notes (output path PROVEN; busybox stdin-exec suspected — superseded)</summary>
 
 Work on acceptance/11's **command round-trip** (`ssh -tt -p 2223` → type a command →
 see output, over the NetBSD rump stack). Login, auth, shell-spawn, and the **output
@@ -133,6 +146,8 @@ parse/execute? where does it exit?) — the `:2323` path is the fast repro (no r
 busybox left blocked in a proxied/stdin read holds the box's single client slot, so
 later connections to `:2223` get nothing (the robustness gap, project task #9). Reboot
 between box-side attempts; the `:2323` host repro avoids the rump client-slot issue.
+
+</details>
 
 ### 🏆 M1 ACHIEVED (2026-06-22): NetBSD stack in an Akuma box — DHCP + HTTP to the host
 

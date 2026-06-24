@@ -86,6 +86,15 @@ pub extern "C" fn main() {
                     println(&format!("[SSHD] Shell override from CLI: {}", shell_path));
                 }
             }
+            "--shell-arg" => {
+                // Extra argv for the spawned shell (e.g. the applet name for a
+                // multicall binary: `--shell /bin/toybox --shell-arg sh`). May be
+                // repeated; each occurrence appends one argument.
+                if let Some(shell_arg) = args.next() {
+                    ssh_config.shell_args.push(alloc::string::String::from(shell_arg));
+                    println(&format!("[SSHD] Shell arg from CLI: {}", shell_arg));
+                }
+            }
             "--port" => {
                 if let Some(port_str) = args.next() {
                     if let Ok(p) = port_str.parse::<u16>() {

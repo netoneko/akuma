@@ -194,6 +194,7 @@ pub fn run_all_tests() {
     test_rt_sigtimedwait_timeout();
     test_current_syscall_visibility();
     test_child_stdout_blocking_read();
+    test_waitpid_reap_preserves_buffered_stdout();
 
     // Pidfd + child channel exit notification (Go post-compile hang fix)
     test_pidfd_can_read_after_set_exited();
@@ -4346,6 +4347,75 @@ fn test_child_stdout_blocking_read() {
     }
 
     console::print("  [PASS] test_child_stdout_blocking_read\n");
+}
+
+/// Regression test for the sshd "lost command output" bug: a child that writes
+/// stdout and exits must have that output survive the `wait*` reap so the parent
+/// (sshd's interactive bridge) can drain it AFTER observing the exit. Before the
+/// fix, `sys_waitpid` called `remove_child_channel` the instant it reaped, so a
+/// shell that flushed its output at exit (busybox) lost everything. The fix
+/// (`reap_child_channel`) keeps the channel while stdout is still buffered.
+///
+/// This exercises the real spawn + channel registry path the syscall uses; the
+/// host unit tests in `akuma-exec` cover the reap decision in isolation.
+fn test_waitpid_reap_preserves_buffered_stdout() {
+    use akuma_exec::process::{
+        spawn_process_with_channel_ext, register_child_channel, get_child_channel,
+        reap_child_channel,
+    };
+
+    let path = "/bin/hello";
+    if fs::read_file(path).is_err() {
+        if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
+            crate::safe_print!(64, "[Test] {} not found - FAIL\n", path);
+            panic!("Required test binary not found");
+        }
+        crate::safe_print!(96, "[Test] {} not found, skipping waitpid_reap test\n", path);
+        return;
+    }
+
+    // One line of output, minimal delay, then exit.
+    let args = ["/bin/hello", "1", "1"];
+    let (_tid, ch, pid) = spawn_process_with_channel_ext(path, Some(&args), None, None, None, 0)
+        .expect("spawn failed");
+
+    // Mirror what sys_spawn does so the parent can resolve the channel by pid.
+    register_child_channel(pid, ch.clone(), 0);
+
+    // Wait for the child to exit WITHOUT draining its stdout first — exactly the
+    // window the bridge hits (it checks waitpid before reading stdout).
+    let mut spins = 0;
+    while !ch.has_exited() {
+        akuma_exec::threading::yield_now();
+        spins += 1;
+        assert!(spins <= 5_000_000, "child {pid} did not exit");
+    }
+
+    // Reap (what sys_waitpid now does). Output is buffered, so the channel MUST
+    // be kept, not removed.
+    let removed = reap_child_channel(pid);
+    assert!(!removed, "reap discarded the channel while stdout was still buffered");
+
+    // The parent can still resolve the channel by pid and drain the output.
+    let surviving = get_child_channel(pid)
+        .expect("child channel must survive reap while output is pending");
+    // Drain FULLY (the child has exited, so the buffer is complete and static):
+    // read until empty, regardless of how much `hello` printed.
+    let mut out = alloc::vec::Vec::new();
+    let mut scratch = [0u8; 64];
+    loop {
+        let n = surviving.read(&mut scratch);
+        if n == 0 { break; }
+        out.extend_from_slice(&scratch[..n]);
+    }
+    let out = core::str::from_utf8(&out).unwrap_or("");
+    assert!(out.contains("hello"), "lost buffered child output after reap; read '{out}'");
+
+    // Drained now → a subsequent reap removes the channel (no leak).
+    assert!(reap_child_channel(pid), "drained channel should be removed on reap");
+    assert!(get_child_channel(pid).is_none(), "channel must be gone after drained reap");
+
+    console::print("  [PASS] test_waitpid_reap_preserves_buffered_stdout\n");
 }
 
 /// Verify dup3 EINVAL/EBADF invariants.

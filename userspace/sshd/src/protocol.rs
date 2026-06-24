@@ -115,8 +115,12 @@ async fn run_shell_session(
     session: &mut SshSession,
 ) -> Result<(), NetError> {
     if let Some(ref shell_path) = session.config.shell {
-        println(&format!("[SSH] Spawning shell: {}", shell_path));
-        if let Some(res) = spawn(shell_path, None) {
+        // Extra argv for multicall shells (busybox/toybox): the kernel sets
+        // argv[0] = shell_path, then these follow (e.g. ["sh"]).
+        let arg_refs: Vec<&str> = session.config.shell_args.iter().map(|s| s.as_str()).collect();
+        let args = if arg_refs.is_empty() { None } else { Some(arg_refs.as_slice()) };
+        println(&format!("[SSH] Spawning shell: {} {:?}", shell_path, session.config.shell_args));
+        if let Some(res) = spawn(shell_path, args) {
             return bridge_process(stream, session, res.pid, res.stdout_fd).await;
         }
         println(&format!("[SSH] Failed to spawn {}, falling back to built-in", shell_path));
@@ -236,6 +240,12 @@ async fn bridge_process(
             sleep_ms(10);
         }
     }
+    // Close our read end of the child's stdout. The kernel keeps the child's
+    // ProcessChannel alive past waitpid while output is still buffered (so the
+    // drain above doesn't lose it); closing the ChildStdout fd here is what frees
+    // that channel now. Without it, sshd (which handles connections serially in
+    // one long-lived process) would leak one channel per login.
+    close(stdout_fd as i32);
     Ok(())
 }
 

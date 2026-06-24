@@ -30,10 +30,43 @@ pub fn get_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
     })
 }
 
-/// Remove a child process channel (called when child exits or parent closes FD)
+/// Remove a child process channel (called when the parent CLOSES its
+/// `ChildStdout` read fd, or on `execve`/teardown of the reading process).
 pub fn remove_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
     with_irqs_disabled(|| {
         CHILD_CHANNELS.lock().remove(&child_pid).map(|(ch, _)| ch)
+    })
+}
+
+/// Reap a child's channel on the `wait*` (waitpid/wait4/waitid) path.
+///
+/// This is distinct from [`remove_child_channel`], which fires when the parent
+/// closes its `ChildStdout` read fd. Reaping a zombie must NOT discard stdout the
+/// child wrote right before exiting: the parent's `ChildStdout` fd resolves the
+/// channel by pid via [`get_child_channel`] on every read, so if `wait*` removed
+/// the channel the instant it reaped, a parent that reads stdout *after*
+/// observing the exit would find it gone (EBADF) and lose all buffered output.
+///
+/// That is exactly the sshd interactive bridge: it checks `waitpid` first, then
+/// drains the child's stdout. A fully-buffered shell (busybox flushes stdio at
+/// `_exit`) loses everything; an unbuffered one (toybox) loses only its final
+/// pre-exit write. So here we only drop the channel if its stdout buffer is
+/// already empty; otherwise we keep it and let the parent's `close()` (or process
+/// teardown) remove it via [`remove_child_channel`] once drained.
+///
+/// Race-free: the child is confirmed exited before reaping, so no further writes
+/// can arrive — an empty buffer stays empty, and a non-empty one only shrinks as
+/// the reader drains it. Returns `true` if the channel was removed, `false` if it
+/// was kept (data still buffered) or was absent.
+pub fn reap_child_channel(child_pid: Pid) -> bool {
+    with_irqs_disabled(|| {
+        let mut map = CHILD_CHANNELS.lock();
+        let has_data = matches!(map.get(&child_pid), Some((ch, _)) if ch.has_stdout_data());
+        if has_data {
+            false
+        } else {
+            map.remove(&child_pid).is_some()
+        }
     })
 }
 
@@ -849,4 +882,147 @@ pub fn find_pid_by_thread(thread_id: usize) -> Option<Pid> {
     crate::process::table::find_process(|p| {
         if p.thread_id == Some(thread_id) { Some(p.pid) } else { None }
     })
+}
+
+#[cfg(test)]
+mod child_channel_drain_tests {
+    //! Regression tests for the sshd interactive-shell "lost output" bug: a child
+    //! that wrote stdout and exited (busybox/toybox login shell over sshd) had its
+    //! buffered output discarded because `wait*` called `remove_child_channel` the
+    //! instant it reaped the zombie, before the parent's bridge could drain it.
+    //! `reap_child_channel` keeps the channel until its stdout is drained.
+    use super::*;
+    use crate::process::channel::ProcessChannel;
+
+    /// `ProcessChannel::write` reads the global `config()` (for a debug-print
+    /// gate), which panics if unregistered. The crate has no shared test harness,
+    /// so register a no-op stub runtime + zeroed config once (OnceCopy::set is
+    /// idempotent — first call wins, the rest are ignored, so this is safe under
+    /// parallel test execution).
+    fn ensure_test_runtime() {
+        use crate::runtime::{ExecRuntime, ExecConfig, register};
+        let rt = ExecRuntime {
+            uptime_us: || 0,
+            disable_irqs: || {},
+            enable_irqs: || {},
+            end_of_interrupt: |_| {},
+            trigger_sgi: |_| {},
+            alloc_page_zeroed: || None,
+            alloc_page: || None,
+            free_page: |_| {},
+            pmm_stats: || (0, 0, 0),
+            track_frame: |_, _| {},
+            free_count: || 0,
+            total_count: || 0,
+            alloc_pages_contiguous_zeroed: |_| None,
+            free_pages_contiguous: |_, _| {},
+            heap_stats: || (0, 0),
+            is_memory_low: || false,
+            read_file: |_| Err(0),
+            read_at: |_, _, _| Err(0),
+            resolve_inode: |_| Err(0),
+            read_at_by_inode: |_, _, _| Err(0),
+            on_process_exit: |_| {},
+            remove_socket: |_| {},
+            futex_wake: |_, _, _| {},
+            pipe_close_write: |_| {},
+            pipe_close_read: |_| {},
+            pipe_clone_ref: |_, _| {},
+            eventfd_close: |_| {},
+            eventfd_clone_ref: |_| {},
+            epoll_destroy: |_| {},
+            pidfd_close: |_| {},
+            resolve_symlinks: |_| alloc::string::String::new(),
+            file_size: |_| Ok(0),
+            get_box_namespace: |_| None,
+            set_spawn_namespace: |_| {},
+            clear_spawn_namespace: || {},
+            print_str: |_| {},
+            cow_ref_inc: |_| {},
+            cow_ref_dec: |_| false,
+            cow_ref_get: |_| 0,
+        };
+        let cfg = ExecConfig {
+            max_threads: 64,
+            reserved_threads: 1,
+            kernel_stack_size: 0,
+            boot_stack_base: 0,
+            boot_stack_top: 0,
+            default_thread_stack_size: 0,
+            system_thread_stack_size: 0,
+            user_thread_stack_size: 0,
+            user_stack_size: 0,
+            enable_stack_canaries: false,
+            stack_canary: 0,
+            canary_words: 0,
+            network_thread_ratio: 0,
+            deferred_thread_cleanup: false,
+            thread_cleanup_cooldown_us: 0,
+            syscall_debug_info_enabled: false,
+            fork_brk_serial_progress: false,
+            enable_sgi_debug_prints: false,
+            proc_stdin_max_size: 1 << 20,
+            proc_stdout_max_size: 1 << 20,
+            cow_fork_enabled: false,
+            vfork_fastpath_enabled: false,
+        };
+        register(rt, cfg);
+    }
+
+    #[test]
+    fn reap_keeps_channel_until_buffered_stdout_is_drained() {
+        ensure_test_runtime();
+        // High, test-local pids so the shared CHILD_CHANNELS registry can't collide
+        // with other parallel host tests.
+        let pid: Pid = 0x7000_0001;
+        let parent: Pid = 0x7000_0002;
+
+        let ch = Arc::new(ProcessChannel::new());
+        // Child writes output, then exits (mirrors busybox flushing stdio at _exit).
+        ch.write(b"HELLO_FROM_CHILD");
+        ch.set_exited(0);
+        register_child_channel(pid, ch.clone(), parent);
+
+        // The wait* path reaps the zombie. Output is still buffered, so the channel
+        // MUST be kept (returns false = not removed) — otherwise the parent's
+        // ChildStdout fd would resolve to nothing and lose the output.
+        assert!(
+            !reap_child_channel(pid),
+            "reap must KEEP the channel while stdout is still buffered"
+        );
+        let surviving = get_child_channel(pid)
+            .expect("channel must survive the reap while data is pending");
+
+        // Parent drains the buffered output (exactly what sshd's bridge does after
+        // observing the child's exit).
+        let mut buf = [0u8; 64];
+        let n = surviving.read(&mut buf);
+        assert_eq!(&buf[..n], b"HELLO_FROM_CHILD", "buffered child output preserved");
+
+        // Now that it is drained, a subsequent reap removes the channel.
+        assert!(reap_child_channel(pid), "reap removes the channel once drained");
+        assert!(get_child_channel(pid).is_none(), "channel gone after drained reap");
+    }
+
+    #[test]
+    fn reap_removes_immediately_when_no_buffered_stdout() {
+        let pid: Pid = 0x7000_0011;
+        let parent: Pid = 0x7000_0012;
+
+        let ch = Arc::new(ProcessChannel::new());
+        ch.set_exited(0); // exited with no pending output (or already drained)
+        register_child_channel(pid, ch, parent);
+
+        // Nothing buffered → reap removes it right away, so callers that waitpid
+        // without ever reading the ChildStdout fd don't leak channels.
+        assert!(reap_child_channel(pid), "empty channel is removed on reap");
+        assert!(get_child_channel(pid).is_none());
+    }
+
+    #[test]
+    fn reap_absent_channel_is_a_noop() {
+        // Reaping a pid with no registered channel (a process spawned without a
+        // stdout pipe) must not panic and reports "not removed".
+        assert!(!reap_child_channel(0x7000_0021));
+    }
 }

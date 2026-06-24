@@ -789,7 +789,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                     // On Linux, waitpid is the only way to reap a zombie.
                     akuma_exec::process::clear_lazy_regions(p);
                     let _ = akuma_exec::process::unregister_process(p);
-                    akuma_exec::process::remove_child_channel(p);
+                    akuma_exec::process::reap_child_channel(p);
                     return u64::from(p);
                 }
 
@@ -807,7 +807,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                     }
                     akuma_exec::process::clear_lazy_regions(p);
                     let _ = akuma_exec::process::unregister_process(p);
-                    akuma_exec::process::remove_child_channel(p);
+                    akuma_exec::process::reap_child_channel(p);
                     return u64::from(p);
                 }
                 akuma_exec::threading::schedule_blocking(u64::MAX);
@@ -839,7 +839,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 // Reap the zombie
                 akuma_exec::process::clear_lazy_regions(child_pid);
                 let _ = akuma_exec::process::unregister_process(child_pid);
-                akuma_exec::process::remove_child_channel(child_pid);
+                akuma_exec::process::reap_child_channel(child_pid);
                 return u64::from(child_pid);
             }
 
@@ -862,7 +862,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 // Reap the zombie
                 akuma_exec::process::clear_lazy_regions(child_pid);
                 let _ = akuma_exec::process::unregister_process(child_pid);
-                akuma_exec::process::remove_child_channel(child_pid);
+                akuma_exec::process::reap_child_channel(child_pid);
                 return u64::from(child_pid);
             }
             akuma_exec::threading::schedule_blocking(u64::MAX);
@@ -1009,7 +1009,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
             // Reap the zombie (unless WNOWAIT says "don't consume")
             akuma_exec::process::clear_lazy_regions(child_pid);
             let _ = akuma_exec::process::unregister_process(child_pid);
-            akuma_exec::process::remove_child_channel(child_pid);
+            akuma_exec::process::reap_child_channel(child_pid);
         }
         0
     } else {
@@ -1371,7 +1371,7 @@ pub fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
             // Reap the zombie
             akuma_exec::process::clear_lazy_regions(pid);
             let _ = akuma_exec::process::unregister_process(pid);
-            akuma_exec::process::remove_child_channel(pid);
+            akuma_exec::process::reap_child_channel(pid);
             return u64::from(pid);
         }
     0
