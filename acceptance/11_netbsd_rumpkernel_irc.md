@@ -321,6 +321,29 @@ Done (DNS + HTTPS in the box with static curl):
       `curl: (77)` mbedTLS ca-cert error). No code change — pure data staging, then
       full `populate_disk.sh`. See `docs/HANDOFF.md` "Session 2026-06-24 (latest)".
 
+Done (the `meow` LLM client over the rump stack):
+- [x] **`meow` (LLM chat client) runs in the box, non-interactive, via SSH, over the
+      NetBSD stack (2026-06-24).** Built with the new `linux-net` feature
+      (`cargo +nightly build --release -Zbuild-std=core,alloc --target
+      aarch64-unknown-linux-musl --features linux-net`), which makes meow use standard
+      Linux socket/DNS syscalls (+ `libakuma/linux-abi` for `getpid`) instead of
+      Akuma-custom ones, so the kernel sysproxy intercepts them and routes through the
+      rump stack. Run via SSH in non-interactive mode against busybox `/bin/sh` in the
+      box:
+      ```
+      box use rumpnet -i /bin/meow -N -m qwen3.5:0.8b -c 'say hi in three words'
+      session: 6a3c3b53-5b
+      hi there
+      --- First: 1923ms | TPS: 42.5 | Duration: 1s 970ms
+      ```
+      Kernel trace confirms the path is rump: meow's `connect dest fam=2 port=11434
+      ip=10.0.2.2` (host ollama) + streamed `recvfrom` on a `RumpSocket` →
+      virtif → `/dev/net/tap0` → SLIRP → host. The model (`qwen3.5:0.8b` on host
+      ollama) generated "hi there"; 0 fork crashes. Endpoint is an IP so no DNS was
+      needed (TCP path only). Binary staged at `bootstrap/srv/rumpbox/bin/meow`. This
+      is the **non-interactive `box use`** path (reliable); a fully *interactive*
+      `ssh -p 2223` meow session is still subject to the session-robustness gap below.
+
 Done (fork reliability):
 - [x] **Fork SIGSEGV FIXED (2026-06-24)** — the box shell forking curl (and any
       fork+exec) crashed ~90% with `[WILD-IA] ELR=0 x30=0`. Root cause: fork's CoW
