@@ -24,6 +24,39 @@ backend makes curl-over-rump ~3.85× faster (16.3s vs 62.8s) on 1 OS thread inst
 of 19, futex storm gone. See `FIBER_HANDOFF.md`.** Remaining: residual ~1s/syscall
 (event-driven channel wakeup is the next lever) + robustness (task #9) + boot self-tests.
 
+### Session 2026-06-25: `meow` over the rump stack + built-in-shell pty regression fixed
+
+**1. `meow` (LLM client) runs in the box over the NetBSD stack.** Another agent
+added meow's `linux-net` feature (standard Linux socket/DNS syscalls +
+`libakuma/linux-abi` for `getpid`/clock, replacing Akuma-custom `RESOLVE_HOST 300`
+/ `UPTIME 319`) so the kernel sysproxy routes its traffic through rump. Built with
+`cargo +nightly build --release -Zbuild-std=core,alloc --target
+aarch64-unknown-linux-musl --features linux-net`, staged at
+`bootstrap/srv/rumpbox/bin/meow`, run non-interactively via SSH:
+`box use rumpnet -i /bin/meow -N -m qwen3.5:0.8b -c 'say hi'` → **"hi there"**,
+with `connect fam=2 port=11434 ip=10.0.2.2` (host ollama) + streamed `recvfrom` on
+a `RumpSocket` over the NetBSD stack (~42 TPS). Also verified the SAME binary on
+the **native smoltcp stack** (box 0, run by path so it's not sysproxy-routed): "Hello!"
+at ~81 TPS — so the Linux-syscall build is a viable universal build (Akuma implements
+the Linux socket ABI natively, like the static curl). meow is NOT built linux-net by
+default: `build.sh` targets `aarch64-unknown-none` with Akuma-custom syscalls. See
+`userspace/meow/README.md` (now documents the `linux-net` feature + a known limitation:
+interactive meow over `ssh -p 2223` into the box flickers / drops — the slow
+rump-proxied session + task #9 wedge).
+
+**2. Built-in `:2222` shell interactive sub-shells FIXED (regression from the pty work).**
+`busybox sh` / `toybox sh` launched from the in-kernel built-in shell on `:2222`
+hung (no prompt/echo, parked in `ppoll`), while single commands and interactive
+`meow` worked. Cause: the `set_terminal(pty)` spawn change (commits `fd3fac3` /
+`0126118`, made for the custom userspace sshd's piped-command bridge) defaulted the
+spawn wrappers to `pty=false`, but the built-in shell uses the same path and its
+`:2222` session is always a real pty. Fix: `execute_external_interactive`
+(`src/shell/mod.rs`) now spawns with `pty=true`
+(`spawn_process_with_channel_ext(..., 0, true)`). busybox/toybox `sh` now run as
+real ttys (termios `ioctl`s, prompt, `ppoll`); meow still works (kernel honors
+`TCSETS` → meow goes raw itself); custom-sshd path untouched. Full write-up:
+`docs/BOX_PTY_INTERACTIVE_SHELL.md` ("Follow-up (2026-06-25)"). UNCOMMITTED.
+
 ### Session 2026-06-24 (latest): DNS + HTTPS inside the box with static curl — ✅ WORKING
 
 **Goal (acceptance/11):** make DNS resolution + HTTPS work inside the rumpnet box

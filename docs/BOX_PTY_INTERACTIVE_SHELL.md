@@ -63,6 +63,29 @@ box's `rump_server` as a tty.
   Ctrl-C / SIGINT delivery through the pty + sshd bridge to the foreground
   process is not yet confirmed clean; needs follow-up).
 
+## Follow-up (2026-06-25): the built-in `:2222` shell needed the same pty=true
+
+Making `set_terminal(pty)` default `false` in the spawn wrappers (the table row
+above) fixed the **box / custom-sshd** path but **regressed the in-kernel
+built-in shell on `:2222`**: launching an interactive sub-shell there
+(`/bin/busybox sh`, `/bin/toybox sh`) hung — `isatty(0)` was false, so no prompt,
+no line editing, the shell parked in `ppoll` and never round-tripped. (Single
+commands like `/bin/busybox echo hi` still worked; only interactive sub-shells
+broke. meow was unaffected because it does raw I/O regardless of `isatty`.)
+
+Cause: the built-in shell spawns children via `execute_external_interactive`
+(`src/shell/mod.rs`), which used `spawn_process_with_channel_cwd` → `pty = false`.
+But the `:2222` session is **always** a real pty (you reach it via `ssh -tt`), so
+its children should be terminals. Fix: that call now uses
+`spawn_process_with_channel_ext(..., 0, true)` (pty=true). Verified: busybox/toybox
+`sh` now run as real interactive shells (termios `ioctl`s succeed, prompt written,
+park in `ppoll` for input — vs. the broken non-tty batch mode); meow still works
+(the kernel honors `TCSETS`, `src/syscall/term.rs:162`, so meow flips itself to raw
+mode). The custom-sshd path is untouched (it does not use `execute_external_interactive`).
+The `ESC[6n` cursor query busybox emits is answered by the client's real terminal
+(the bridge forwards it); an automated `ssh` harness without a terminal emulator
+can't drive that round-trip, so test interactively.
+
 ## Known issues (separate from the pty wiring)
 
 ### 1. Box rootfs lacks busybox applet symlinks

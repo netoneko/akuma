@@ -210,10 +210,16 @@ pub async fn execute_external_interactive(
     cwd: Option<&str>,
     channel_stream: &mut SshChannelStream<'_>,
 ) -> Result<(), ShellError> {
-    use akuma_exec::process::spawn_process_with_channel_cwd;
+    use akuma_exec::process::spawn_process_with_channel_ext;
     use embedded_io_async::Write;
 
-    let (thread_id, channel, pid) = match spawn_process_with_channel_cwd(path, args, env, stdin, cwd) {
+    // This is the built-in :2222 interactive shell spawning a child (e.g. an
+    // interactive `busybox sh` / `toybox sh` sub-shell). The session always has a
+    // real pty, so spawn the child as a terminal (pty=true) — otherwise isatty(0)
+    // is false and an interactive shell hangs reading stdin / never echoes. (The
+    // custom userspace sshd's piped-command path stays non-terminal; it doesn't
+    // use this code.)
+    let (thread_id, channel, pid) = match spawn_process_with_channel_ext(path, args, env, stdin, cwd, 0, true) {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("Error: {e}\r\n");
