@@ -127,6 +127,17 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         return (-(25i64)) as u64; // ENOTTY for terminal ioctls on non-TTY fds
     }
 
+    // A spawned child's stdin/stdout is a pipe (ProcessChannel), not a real
+    // terminal. Report ENOTTY for the terminal ioctls below (TCGETS is what
+    // isatty() probes) so shells like busybox run non-interactively over the
+    // SSH-into-box bridge instead of launching a line editor that hangs on an
+    // ESC[6n cursor query. Console/boot processes keep is_terminal == true.
+    if let Some(ch) = akuma_exec::process::current_channel()
+        && !ch.is_terminal()
+    {
+        return (-(25i64)) as u64; // ENOTTY — fd 0/1/2 are a pipe, not a tty
+    }
+
     let result = match cmd {
         TCGETS => {
             if !validate_user_ptr(arg, 36) { return EFAULT; }

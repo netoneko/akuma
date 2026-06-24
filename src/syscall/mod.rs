@@ -268,6 +268,12 @@ pub mod nr {
     /// 1 = rump). herd calls this for a `stack = rump` service so the kernel
     /// routes that box's AF_INET syscalls to its rump_server (RUMP_SYSPROXY.md).
     pub const SET_BOX_STACK: u64 = 324;
+    /// Deliver EOF to a spawned child's stdin: arg0 = child pid. Lets a parent
+    /// (e.g. the userspace SSH-into-box bridge) signal "no more input" so a
+    /// shell reading a piped script (busybox `sh`) finishes reading and runs to
+    /// completion. Mirrors the in-kernel sshd's `close_process_stdin` on
+    /// CHANNEL_EOF; only the spawner may close its child's stdin.
+    pub const CLOSE_CHILD_STDIN: u64 = 326;
     pub const GETPID: u64 = 172;
     pub const GETPPID: u64 = 173;
     pub const GETUID: u64 = 174;
@@ -700,6 +706,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GET_CPU_STATS => term::sys_get_cpu_stats(args[0], args[1] as usize),
         nr::SPAWN_EXT => proc::sys_spawn_ext(args[0], args[1], args[2], args[3], args[4], args[5]),
         nr::SET_BOX_STACK => proc::sys_set_box_stack(args[0], args[1]),
+        nr::CLOSE_CHILD_STDIN => proc::sys_close_child_stdin(args[0] as u32),
         #[cfg(feature = "sc-containers")]
         nr::REGISTER_BOX => container::sys_register_box(args[0], args[1], args[2] as usize, args[3], args[4] as usize, args[5] as u32),
         #[cfg(feature = "sc-containers")]

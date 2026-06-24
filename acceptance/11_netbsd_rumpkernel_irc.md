@@ -109,17 +109,30 @@ supervised by herd. That is the end-to-end win the whole port is for.
 
 ## Same demo, other direction — SSH straight into the box over the rump stack
 
-**Status: ✅ inbound proven; login reaches a busybox prompt (2026-06-24).** The IRC
-client proves the **outbound** (connect) path. The same box also runs an SSH server
-**listening on the rump stack**, proving the **inbound** (listen/accept) path: from
-the host, `ssh -p 2223 root@localhost` connects, completes the SSH key exchange,
-authenticates, and lands at a **busybox `/bin/sh` prompt running in the box's fresh
-`/srv/rumpbox` root** — the entire TCP handshake + session carried by the NetBSD rump
-stack (the kernel sysproxy routes sshd's `listen`/`accept`/`recvfrom`/`sendto`). We do
-this with **our own `userspace/sshd`**, spawned by **herd inside the rumpnet box** —
-not dropbear, not LD_PRELOAD. (Known rough edge: the interactive *command* round-trip —
-forwarding client keystrokes into the shell's stdin via the sshd bridge — is still
-being finished; the login, auth, shell spawn, and prompt all work over rump.)
+**Status: ✅ inbound + output proven over rump; ⏳ busybox command-exec pending
+(2026-06-24).** The IRC client proves the **outbound** (connect) path. The same box
+also runs an SSH server **listening on the rump stack**, proving the **inbound**
+(listen/accept) path: from the host, `ssh -p 2223 root@localhost` connects, completes
+the SSH key exchange, authenticates, and the **entire session + a spawned shell's
+stdout stream are carried by the NetBSD rump stack** (kernel sysproxy routes sshd's
+`listen`/`accept`/`recvfrom`/`sendto`; proven by `--shell /bin/hello` streaming its
+output to the client). We do this with **our own `userspace/sshd`**, spawned by
+**herd inside the rumpnet box** — not dropbear, not LD_PRELOAD. The remaining gap is
+the busybox interactive command round-trip (see "Command round-trip status" below).
+
+**Command round-trip status (2026-06-24):** the **output direction is proven
+end-to-end over rump** — with `--shell /bin/hello` (print-and-exit), `ssh -p 2223`
+streams the program's full stdout to the host client over the NetBSD stack. The
+**interactive command round-trip with busybox** is NOT yet working: busybox spawns,
+receives the piped command + stdin-EOF (both confirmed by kernel trace), but exits
+without executing or producing output — even for a pure builtin. This reproduces
+**outside the box** (the `sshd_host` diagnostic service on smoltcp `:2323`, no rump),
+so it is a `userspace/sshd` ↔ busybox stdin/execution bug, **not** rump-specific. The
+bridge mechanism itself (non-blocking poll, non-tty stdin, stdin-EOF delivery,
+drain-until-shell-exits) is fixed; see `userspace/rumpkernel/docs/HANDOFF.md`
+("SSH interactive command bridge (2026-06-24)") for the full breakdown and the
+next-session debug plan. (A secondary robustness gap — a blocked busybox wedges the
+box's single client slot for later connections — is project task #9.)
 
 **Topology (two stacks, side by side):**
 

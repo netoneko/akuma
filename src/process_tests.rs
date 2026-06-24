@@ -45,6 +45,9 @@ pub fn run_all_tests() {
     // Test procfs stdin/stdout access
     test_procfs_stdio();
 
+    // Test that a spawned child's channel is non-terminal (isatty == false)
+    test_spawned_child_not_a_tty();
+
     // Test Linux compatibility bridging (vfork/execve)
     test_linux_process_abi();
 
@@ -2119,6 +2122,49 @@ fn test_procfs_stdio() {
     akuma_exec::threading::cleanup_terminated();
 
     crate::safe_print!(64, "[Test] procfs stdio test complete\n");
+}
+
+/// A spawned child's stdin/stdout is a pipe (its ProcessChannel), not a real
+/// terminal, so `isatty()` must report false. The kernel's `ioctl` TCGETS path
+/// keys off `ProcessChannel::is_terminal()`; if a spawned child reported a tty,
+/// shells like busybox would launch an interactive line editor that hangs
+/// querying the absent terminal (ESC[6n) instead of batch-reading piped input —
+/// the exact failure of the SSH-into-rump-box command bridge.
+fn test_spawned_child_not_a_tty() {
+    use akuma_exec::process::ProcessChannel;
+
+    // A fresh channel defaults to terminal-backed (console/boot processes).
+    let console_ch = ProcessChannel::new();
+    if !console_ch.is_terminal() {
+        crate::safe_print!(96, "[Test] FAIL: fresh ProcessChannel should be a terminal by default\n");
+        return;
+    }
+    console_ch.set_terminal(false);
+    if console_ch.is_terminal() {
+        crate::safe_print!(96, "[Test] FAIL: set_terminal(false) did not take\n");
+        return;
+    }
+
+    // A process spawned via the channel path must have a non-terminal channel.
+    const HELLO_PATH: &str = "/bin/hello";
+    if !check_binary_exists(HELLO_PATH) {
+        crate::safe_print!(64, "[Test] spawned-child-not-a-tty: channel-flag checks PASSED (binary absent, spawn check skipped)\n");
+        return;
+    }
+    let args = &["1", "1"];
+    let (_tid, ch, _pid) = match process::spawn_process_with_channel(HELLO_PATH, Some(args), None) {
+        Ok(result) => result,
+        Err(e) => {
+            crate::safe_print!(96, "[Test] Failed to spawn hello: {}\n", e);
+            return;
+        }
+    };
+    if ch.is_terminal() {
+        crate::safe_print!(96, "[Test] FAIL: spawned child's channel reports a terminal (isatty would be true)\n");
+    } else {
+        crate::safe_print!(64, "[Test] spawned-child-not-a-tty: PASSED\n");
+    }
+    akuma_exec::threading::cleanup_terminated();
 }
 
 /// POSIX requires that on exec, custom signal handlers are reset to SIG_DFL and

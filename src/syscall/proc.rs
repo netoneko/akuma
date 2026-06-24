@@ -1259,6 +1259,32 @@ pub fn sys_set_box_stack(box_id: u64, stack: u64) -> u64 {
     0
 }
 
+/// `CLOSE_CHILD_STDIN(pid)` — deliver EOF to a spawned child's stdin so a shell
+/// reading a piped script (busybox `sh`) finishes reading and runs the commands.
+/// The userspace SSH-into-box bridge calls this on the client's `CHANNEL_EOF`.
+/// Authorization mirrors the procfs `/proc/<pid>/fd/0` write path: only the
+/// spawner may close its child's stdin, and box isolation is enforced.
+pub(super) fn sys_close_child_stdin(pid: u32) -> u64 {
+    let caller = match akuma_exec::process::current_process() { Some(p) => p, None => return ESRCH };
+    let target = match akuma_exec::process::lookup_process(pid) { Some(p) => p, None => return ESRCH };
+
+    // Box isolation: a boxed caller may only touch its own box's processes.
+    if caller.box_id != 0 && target.box_id != caller.box_id {
+        return ESRCH;
+    }
+    // Only the spawner may close its child's stdin (kernel-spawned => no spawner).
+    if let Some(spawner) = target.spawner_pid
+        && spawner != caller.pid
+    {
+        return EPERM;
+    }
+
+    match akuma_exec::process::close_process_stdin(pid) {
+        Ok(()) => 0,
+        Err(_) => ESRCH,
+    }
+}
+
 pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
     if pid == 0 { return 0; }
     // Linux: kill(pid <= 0, ...) targets a process group; we don't support

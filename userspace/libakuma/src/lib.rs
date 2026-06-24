@@ -83,6 +83,7 @@ pub mod syscall {
     pub const KILL: u64 = 302;
     pub const WAITPID: u64 = 303;
     pub const TIME: u64 = 305;
+    pub const CLOSE_CHILD_STDIN: u64 = 326;
     pub const CHDIR: u64 = 49;
     pub const GETCWD: u64 = 17;
     pub const FCNTL: u64 = 25;
@@ -1004,6 +1005,27 @@ pub fn pipe(fds: &mut [i32; 2]) -> i32 {
         0,
         0, 0, 0, 0,
     ) as i32
+}
+
+/// Set or clear the `O_NONBLOCK` flag on a file descriptor via `fcntl(F_SETFL)`.
+///
+/// The kernel's `F_SETFL` only inspects the `O_NONBLOCK` bit (see
+/// `src/syscall/fs.rs::sys_fcntl`), so we pass it directly. Returns 0 on
+/// success, negative errno on failure.
+pub fn set_nonblocking(fd: i32, nonblocking: bool) -> i32 {
+    const F_SETFL: u64 = 4;
+    const O_NONBLOCK: u64 = 0x800;
+    let arg = if nonblocking { O_NONBLOCK } else { 0 };
+    syscall(syscall::FCNTL, fd as u64, F_SETFL, arg, 0, 0, 0) as i32
+}
+
+/// Deliver EOF to a spawned child's stdin (`CLOSE_CHILD_STDIN`). A shell reading
+/// a piped script (busybox `sh`) blocks for more input until it sees EOF; the
+/// SSH-into-box bridge calls this on the client's CHANNEL_EOF so the shell
+/// finishes reading and runs to completion. Returns 0 on success, negative
+/// errno otherwise. Only the spawner of `pid` may close its stdin.
+pub fn close_child_stdin(pid: u32) -> i32 {
+    syscall(syscall::CLOSE_CHILD_STDIN, pid as u64, 0, 0, 0, 0, 0) as i32
 }
 
 /// Check file access permissions

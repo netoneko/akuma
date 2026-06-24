@@ -30,6 +30,13 @@ impl SshStream {
     pub fn new(inner: TcpStream) -> Self {
         Self { inner }
     }
+
+    /// Raw fd of the underlying socket — used by the interactive bridge to set
+    /// the connection non-blocking so it can poll the SSH channel and the
+    /// shell's stdout in the same loop.
+    pub fn as_raw_fd(&self) -> i32 {
+        self.inner.as_raw_fd()
+    }
 }
 
 impl ErrorType for SshStream {

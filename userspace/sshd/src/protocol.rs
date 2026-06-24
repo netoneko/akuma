@@ -133,41 +133,108 @@ async fn bridge_process(
 ) -> Result<(), NetError> {
     let mut buf = [0u8; 1024];
     let stdin_path = format!("/proc/{}/fd/0", pid);
-    
-    loop {
-        // 1. Check for process exit
-        if let Some((_, _exit_code)) = waitpid(pid) { break; }
-        
-        // 2. Output from process to SSH
-        let n = read_fd(stdout_fd as i32, &mut buf);
-        if n > 0 { send_channel_data(stream, session, &buf[..n as usize]).await?; }
 
-        // 3. Input from SSH to process
-        let mut ssh_buf = [0u8; 512];
-        match stream.read(&mut ssh_buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                session.input_buffer.extend_from_slice(&ssh_buf[..n]);
-                while let Some((msg_type, payload)) = process_encrypted_packet(session) {
-                    if msg_type == SSH_MSG_CHANNEL_DATA {
-                        let mut offset = 0;
-                        let _recipient = read_u32(&payload, &mut offset);
-                        if let Some(data) = read_string(&payload, &mut offset) {
-                            // Forward to process stdin via procfs
-                            let fd = open(&stdin_path, open_flags::O_WRONLY);
-                            if fd >= 0 {
-                                write_fd(fd, data);
-                                close(fd);
-                            }
-                        }
-                    } else if msg_type == SSH_MSG_CHANNEL_EOF || msg_type == SSH_MSG_CHANNEL_CLOSE {
-                        return Ok(());
-                    }
+    // CRITICAL: make BOTH ends non-blocking before the bridge loop. The child's
+    // stdout fd (ChildStdout) and the SSH socket both block by default. Without
+    // this, the loop parks in `read_fd(stdout_fd)` — busybox is waiting in ppoll
+    // on its stdin and emits no output — and never reaches the keystroke
+    // forwarding below, so the shell never receives input: a deadlock (bridge
+    // waits on stdout, shell waits on stdin). Non-blocking lets the loop poll
+    // both directions; `read_fd` returns EAGAIN (<0) and `stream.read` surfaces
+    // it as Err, both of which the loop already tolerates.
+    set_nonblocking(stdout_fd as i32, true);
+    set_nonblocking(stream.as_raw_fd(), true);
+
+    // The session ends when the SHELL exits, not when the client stops sending.
+    // A non-interactive client (`echo cmd | ssh`, or anything that closes its
+    // stdin) sends CHANNEL_EOF right after the command bytes; tearing down then
+    // would drop the shell's output. So after EOF we stop reading input but keep
+    // pumping stdout until waitpid(pid) reports the shell has exited.
+    let mut client_done = false;
+
+    loop {
+        // 1. Shell exited → drain remaining stdout, then stop.
+        if let Some((_, _exit_code)) = waitpid(pid) {
+            loop {
+                let n = read_fd(stdout_fd as i32, &mut buf);
+                if n > 0 {
+                    send_channel_data(stream, session, &buf[..n as usize]).await?;
+                } else {
+                    break;
                 }
             }
-            Err(_) => {}
+            break;
         }
-        sleep_ms(10);
+
+        let mut did_io = false;
+
+        // 2. Output from process to SSH (non-blocking). Translate bare \n → \r\n
+        //    so a client PTY (`ssh -tt`) renders lines without stair-stepping —
+        //    the shell's stdout is a pipe, not a terminal, so no line discipline
+        //    cooks it for us (mirrors the in-kernel sshd's cooked-mode output).
+        let n = read_fd(stdout_fd as i32, &mut buf);
+        if n > 0 {
+            let mut out = Vec::with_capacity(n as usize + 8);
+            for &byte in &buf[..n as usize] {
+                if byte == b'\n' {
+                    out.push(b'\r');
+                }
+                out.push(byte);
+            }
+            send_channel_data(stream, session, &out).await?;
+            did_io = true;
+        }
+
+        // 3. Input from SSH to process (non-blocking; EAGAIN surfaces as Err).
+        //    Skip once the client has signalled it is done sending.
+        if !client_done {
+            let mut ssh_buf = [0u8; 512];
+            match stream.read(&mut ssh_buf).await {
+                Ok(0) => client_done = true, // peer closed its write side (TCP)
+                Ok(n) => {
+                    did_io = true;
+                    session.input_buffer.extend_from_slice(&ssh_buf[..n]);
+                }
+                Err(_) => {} // EAGAIN / WouldBlock — nothing new to read right now
+            }
+
+            // ALWAYS drain buffered SSH packets — not just when the read above
+            // returned new bytes. The client's CHANNEL_DATA can already sit in
+            // `input_buffer` (buffered while the handshake completed, before this
+            // bridge took over); if we only processed on a fresh read, that data
+            // would never be forwarded and the shell would hang waiting for input.
+            while let Some((msg_type, payload)) = process_encrypted_packet(session) {
+                did_io = true;
+                if msg_type == SSH_MSG_CHANNEL_DATA {
+                    let mut offset = 0;
+                    let _recipient = read_u32(&payload, &mut offset);
+                    if let Some(data) = read_string(&payload, &mut offset) {
+                        // Forward to process stdin via procfs
+                        let fd = open(&stdin_path, open_flags::O_WRONLY);
+                        if fd >= 0 {
+                            write_fd(fd, data);
+                            close(fd);
+                        }
+                    }
+                } else if msg_type == SSH_MSG_CHANNEL_EOF || msg_type == SSH_MSG_CHANNEL_CLOSE {
+                    // Client is done sending input (`ssh -tt` with piped stdin
+                    // EOFs — and may CLOSE — right after the command bytes).
+                    // Deliver EOF to the shell's stdin so a shell reading a piped
+                    // script (busybox `sh`) stops waiting for more input and runs
+                    // to completion, then keep draining its output until the shell
+                    // ITSELF exits. Tearing down here would drop the command
+                    // output; if the client has truly gone, send_channel_data
+                    // above fails and the `?` unwinds the loop.
+                    close_child_stdin(pid);
+                    client_done = true;
+                }
+            }
+        }
+
+        // Only yield when both directions were idle, to keep latency low while busy.
+        if !did_io {
+            sleep_ms(10);
+        }
     }
     Ok(())
 }

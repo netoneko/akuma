@@ -201,7 +201,14 @@ pub fn spawn_process_with_channel_ext(
     // Reusing the parent's channel would cause the child's set_exited() call
     // to contaminate the parent's channel, leaking exit codes.
     let channel = Arc::new(ProcessChannel::new());
-    
+
+    // A spawned child's stdin/stdout is a pipe (this channel), not a real
+    // terminal, so isatty() must report false. Otherwise shells like busybox
+    // start an interactive line editor that hangs querying the (absent)
+    // terminal for its cursor position (ESC[6n) instead of batch-reading the
+    // commands the parent pipes in (e.g. the SSH-into-box bridge).
+    channel.set_terminal(false);
+
     // Seed the channel with initial stdin data if provided.
     // Empty stdin (Some(b"")) keeps stdin open so sys_write enables ONLCR
     // translation — use this for subprocesses that need terminal-style output.

@@ -26,6 +26,12 @@ pub struct ProcessChannel {
     raw_mode: AtomicBool,
     /// Stdin closed flag (true if no more data will be written to stdin)
     stdin_closed: AtomicBool,
+    /// Whether this channel's stdin/stdout is a real terminal. `true` for
+    /// console/boot processes; set `false` for channel-fed spawned children
+    /// (their fd 0 is a pipe, not a tty) so `isatty()` reports false and shells
+    /// like busybox run non-interactively instead of starting a line editor
+    /// that hangs querying an absent terminal (ESC[6n).
+    is_terminal: AtomicBool,
     /// Threads waiting for output (epoll, blocking read)
     pollers: Spinlock<BTreeSet<usize>>,
 }
@@ -44,8 +50,20 @@ impl ProcessChannel {
             interrupted: AtomicBool::new(false),
             raw_mode: AtomicBool::new(false),
             stdin_closed: AtomicBool::new(false),
+            is_terminal: AtomicBool::new(true),
             pollers: Spinlock::new(BTreeSet::new()),
         }
+    }
+
+    /// Mark whether this channel is backed by a real terminal. Spawned children
+    /// (pipe-fed stdin) call this with `false` so `isatty()` reports false.
+    pub fn set_terminal(&self, is_terminal: bool) {
+        self.is_terminal.store(is_terminal, Ordering::Release);
+    }
+
+    /// Whether this channel is backed by a real terminal (vs a pipe).
+    pub fn is_terminal(&self) -> bool {
+        self.is_terminal.load(Ordering::Acquire)
     }
 
     /// Mark stdin as closed (no more data will be arriving)

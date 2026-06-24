@@ -56,7 +56,7 @@ of 19, futex storm gone. See `FIBER_HANDOFF.md`.** Remaining: residual ~1s/sysca
 | ⚠️ Per-syscall latency (~1s round-trip; rump pthread kthreads on 1 core) | ⏳ open — see "M2" + RUMP_SYSPROXY.md |
 | **🏆 FIBER backend: curl over rump, ~3.85× faster, 1 OS thread** (`16.3s` vs `62.8s`; `clone=0 futex=0`) | ✅ **2026-06-24** — see `FIBER_HANDOFF.md` |
 | ⚠️ Robustness: uninterruptible proxy syscalls, `kill` invalid-pid, client-slot wedge | ⏳ open — project task #9 |
-| acceptance/11 — actual sshd on the rump stack | ⏳ (sic capstone met; sshd is the bigger protocol layer) |
+| acceptance/11 — actual sshd on the rump stack | ✅ login/auth/shell-prompt over rump; ⏳ command round-trip (see "SSH interactive bridge" below) |
 | NetBSD binary compat (pkgsrc) via per-process syscall table | 📋 future — `acceptance/12_netbsd_binary_compatibility.md` |
 
 Branch `netbsd-rump-kernel-attempt-0`. **The M2 kernel/herd/sic changes are UNCOMMITTED** (the
@@ -65,6 +65,74 @@ user commits): kernel (`src/rump_proxy.rs`, `src/syscall/{proc,mod,poll}.rs`,
 `crates/akuma-exec/.../types.rs` `RumpSocket`, the gated scheduler tweak in
 `threading/mod.rs`), herd (`rumpnet.conf` + `restart` flag), and the `sic` submodule
 (`userspace/rumpkernel/sic` recv-drain patch, uncommitted in the submodule).
+
+### SSH interactive command bridge (2026-06-24) — output path PROVEN; busybox stdin-exec is the remaining bug
+
+Work on acceptance/11's **command round-trip** (`ssh -tt -p 2223` → type a command →
+see output, over the NetBSD rump stack). Login, auth, shell-spawn, and the **output
+direction are now proven end-to-end over rump**; what remains is busybox not executing
+the piped commands — and that reproduces **outside the box too**, so it is NOT
+box/rump-specific.
+
+**Proven this session (the output path fully works):** with the box sshd's
+`--shell /bin/hello` (a plain print-and-exit program, no stdin), `ssh -p 2223`
+streamed its full output to the host client over the rump stack:
+```
+hello: started (PID 86, outputs=10, delay_ms=1000)
+hello (1/10) ... hello (9/10)
+```
+So spawn → bridge → rump_server → SLIRP → host client (with `\n`→`\r\n`) is solid.
+
+**Fixes made (kernel + userspace sshd + libakuma — UNCOMMITTED; each fixes a real
+bug, verified in isolation; clippy clean, host tests 105/0, boot self-test added):**
+- **Bridge deadlock (userspace `userspace/sshd/src/protocol.rs` `bridge_process`)** —
+  the loop did a *blocking* `read_fd(stdout_fd)` before reading SSH input, so once
+  busybox parked in `ppoll` on stdin (emitting nothing) the bridge blocked on stdout
+  forever and never forwarded keystrokes (bridge waits on stdout, shell waits on
+  stdin). Fix: set BOTH `stdout_fd` and the SSH socket non-blocking
+  (`libakuma::set_nonblocking`) and poll both; only `sleep_ms(10)` when idle.
+- **busybox interactive hang on `ESC[6n`** — every fd ≤ 2 returned success for
+  `TCGETS`, so `isatty(0)` was always true and busybox started its line editor
+  (cursor query). New `ProcessChannel::is_terminal` flag (default `true`; set `false`
+  for channel-spawned children in `spawn.rs`); `term.rs` returns `ENOTTY` for the
+  terminal ioctls when the channel is non-terminal. busybox now runs non-interactive
+  (no `ESC[6n`; verified `is_term=false`). Boot self-test `test_spawned_child_not_a_tty`.
+- **stdin was being cooked + echoed** — `fs.rs` Stdin read keyed canonical line
+  discipline (echo, line-buffering) on `is_stdin_closed()` instead of terminal-ness,
+  so a spawned child's *open* pipe stdin was treated as a tty and its input echoed
+  back, corrupting the command stream. Fix: `is_pipe = is_stdin_closed() || !is_terminal()`.
+- **Premature teardown** — the bridge `return`ed on `CHANNEL_EOF`/`CHANNEL_CLOSE`,
+  dropping command output. Fix: keep draining the shell's stdout until the SHELL
+  exits; only the client's EOF stops *input*. Also drain buffered SSH packets every
+  iteration (a `CHANNEL_DATA` buffered during the handshake was never processed when
+  the next `read` returned EAGAIN — a real input-delivery bug).
+- **`CLOSE_CHILD_STDIN` syscall (326)** + `libakuma::close_child_stdin` — deliver
+  stdin-EOF to the child on the client's `CHANNEL_EOF` so a shell reading a piped
+  script stops waiting for input (mirrors the in-kernel sshd's `close_process_stdin`;
+  `src/syscall/proc.rs::sys_close_child_stdin`, spawner-only + box-isolation checks).
+  **GOTCHA fixed:** first picked 325, which collided with `MOUNT_IN_NS` (325) — and
+  its dispatch arm came first, so every `MOUNT_IN_NS` (which mounts the box's `/proc`,
+  needed for the bridge's `/proc/<pid>/fd/0` stdin writes) was hijacked → broke the
+  box `/proc` mount. Now 326.
+
+**The remaining bug (NEXT SESSION — first task):** busybox spawns, reads the piped
+command + EOF, then **exits without executing or producing any output** — even for a
+pure builtin (`echo X; exit`). Confirmed via kernel trace: `stdin-write pid=NN len=…`
+and `close_child_stdin pid=NN` both fire (input + EOF delivered), but the child emits
+zero `write`s. **This reproduces OUTSIDE the box** (smoltcp, no rump): the
+`bootstrap/etc/herd/enabled/sshd_host.conf` diagnostic service runs `userspace/sshd`
+on box 0 at smoltcp `:23` (host `:2323`) with `--shell /bin/sh`, and a connection
+there shows the SAME empty-output behavior. So the bug is in the **userspace sshd ↔
+busybox stdin/execution bridge** (or how busybox reads the channel), not the rump
+path. Debug busybox's own syscalls next (does its `read(0)` return the bytes? does it
+parse/execute? where does it exit?) — the `:2323` path is the fast repro (no rump).
+(`/bin/sh` on every root is a busybox copy — argv[0] basename `sh` → ash; box 0's
+`/bin/sh` was created from `bootstrap/bin/busybox` this session.)
+
+**Also open (compounds testing):** the box **wedges after the first connection** — a
+busybox left blocked in a proxied/stdin read holds the box's single client slot, so
+later connections to `:2223` get nothing (the robustness gap, project task #9). Reboot
+between box-side attempts; the `:2323` host repro avoids the rump client-slot issue.
 
 ### 🏆 M1 ACHIEVED (2026-06-22): NetBSD stack in an Akuma box — DHCP + HTTP to the host
 

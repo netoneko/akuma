@@ -139,7 +139,14 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             let mut kernel_buf = alloc::vec![0u8; count];
             
             loop {
-                let is_pipe = ch.is_stdin_closed();
+                // `is_pipe` selects raw pass-through (no canonical line
+                // discipline, no echo) over cooked terminal input. A spawned
+                // child whose stdin is a pipe (non-terminal channel — e.g. the
+                // SSH-into-box bridge feeding commands to busybox) must NOT have
+                // its input echoed/line-buffered as if it were a tty; that
+                // corrupts the command stream. Treat non-terminal channels (and
+                // closed stdin) as a raw pipe; only a real terminal is cooked.
+                let is_pipe = ch.is_stdin_closed() || !ch.is_terminal();
 
                 if !is_pipe {
                     let term_state_lock = akuma_exec::process::current_terminal_state();
