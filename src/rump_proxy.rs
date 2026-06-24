@@ -467,10 +467,16 @@ fn proxy_and_fd(
     proc: &Process,
     box_id: u64,
 ) -> Result<(Arc<BoxProxy>, i32, bool), u64> {
-    let (rump_fd, nonblock) = match proc.get_fd(args[0] as u32) {
+    let fd = args[0] as u32;
+    let (rump_fd, nonblock) = match proc.get_fd(fd) {
         Some(process::FileDescriptor::RumpSocket { rump_fd, nonblock }) => (rump_fd, nonblock),
         _ => return Err(neg_linux_errno(LINUX_EBADF)),
     };
+    // The box socket is non-blocking if it was created SOCK_NONBLOCK (the struct
+    // field) OR later marked so via fcntl(F_SETFL)/ioctl(FIONBIO) (the separate
+    // per-fd `nonblock` set). libcurl uses SOCK_NONBLOCK; honor both so the recv
+    // path matches the box's actual semantics regardless of how it was requested.
+    let nonblock = nonblock || proc.is_nonblock(fd);
     match ensure_box_proxy(box_id) {
         Some(p) => Ok((p, rump_fd, nonblock)),
         None => Err(neg_linux_errno(LINUX_ENOMEM)),
@@ -620,9 +626,12 @@ fn proxy_setsockopt(args: &[u64; 6], proc: &Process) -> u64 {
 /// UDP/DNS path) and `read`/`write` (other programs). `buf`=args[1],
 /// `len`=args[2] for all four. Returns the byte count.
 ///
-/// Connected-socket I/O (curl's TCP recv/send, `read`/`write`) passes a NULL
-/// addr; the rump socket is kept blocking so it completes synchronously. The
-/// UDP/DNS path differs: musl's resolver `sendto`s to an explicit nameserver
+/// Connected-socket recv (curl's TCP, NULL addr) now honors the box's non-blocking
+/// flag: a non-blocking box socket gets NetBSD `MSG_DONTWAIT` so the server returns
+/// EAGAIN instead of blocking the rump recvfrom until the 15s proxy transport
+/// timeout (the keep-alive read-to-close hang). A blocking box socket still
+/// completes synchronously (flags 0). The UDP/DNS path differs: musl's resolver
+/// `sendto`s to an explicit nameserver
 /// address and `recvfrom`s capturing the source, then loops the recv until
 /// EAGAIN. So when `sendto` carries a dest addr (args[4]≠0) we translate it
 /// Linux→NetBSD (via `cin_override`, like `connect`); when `recvfrom` passes a
@@ -666,12 +675,20 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
         // TCP recv (current behavior); a source-addr buffer is the UDP path.
         translation::Op::Recvfrom => {
             let (addr_ptr, addrlen_ptr) = (args[4], args[5]);
+            // A non-blocking box socket gets NetBSD MSG_DONTWAIT so the server's
+            // recvfrom returns EAGAIN instead of blocking. CRITICAL for connected
+            // TCP (NULL addr): libcurl reads non-blocking + poll()s, and its
+            // read-to-detect-close on a keep-alive connection (no FIN coming) would
+            // otherwise block the rump recvfrom until the 15s proxy transport
+            // timeout (errno 5) — the dominant `curl` latency. With MSG_DONTWAIT it
+            // returns EAGAIN at once and curl's poll loop finishes (poll on a rump
+            // socket is served via a MSG_PEEK probe — see epoll_check_fd_readiness).
+            let flags = if nonblock { NB_MSG_DONTWAIT } else { 0 };
             if addr_ptr != 0 {
                 mem.cout_sockaddr.insert(addr_ptr);
-                let flags = if nonblock { NB_MSG_DONTWAIT } else { 0 };
                 translation::pack_args(&[rump_fd as u64, a1, a2, flags, addr_ptr, addrlen_ptr])
             } else {
-                translation::pack_args(&[rump_fd as u64, a1, a2, 0, 0, 0])
+                translation::pack_args(&[rump_fd as u64, a1, a2, flags, 0, 0])
             }
         }
         // read/write(fd, buf, len) and readv/writev(fd, iov, iovcnt)

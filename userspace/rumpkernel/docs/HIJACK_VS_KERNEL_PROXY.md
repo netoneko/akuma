@@ -74,6 +74,14 @@ box process (rump stack linked IN)
 
 ## Where the M2 latency actually comes from
 
+> **Status note (2026-06-24):** the analysis below is the *pre-fiber* M2 picture
+> (the ~19-thread single-vCPU spin), and it drove the fiber port that fixed it.
+> The fiber backend collapsed the 19 threads → 1; the headline `curl example.com`
+> time is now dominated by something else entirely. Post-fiber, the 16 s was traced
+> to a single keep-alive read-to-close `recvfrom` blocking on the proxy's 15 s
+> transport timeout (the proxy ignored the box socket's `O_NONBLOCK`); honoring it
+> took curl to ~1.4 s. See `docs/FIBER_HANDOFF.md` "LATENCY — ROOT-CAUSED & FIXED".
+
 From `RUMP_SYSPROXY.md` "B-OUTCOME" / `HANDOFF.md` "NEXT TASK", root-caused, not guessed:
 
 - Each forwarded syscall costs ~0.8–4 s; a 74-byte `sendto` is ~0.8 s **with no

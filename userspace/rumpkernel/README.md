@@ -85,11 +85,30 @@ carries real internet traffic:
   on OFTC** over the NetBSD stack. This is the `acceptance/11` capstone — see
   [docs/HANDOFF.md](docs/HANDOFF.md) "🏆 M2 ACHIEVED" and commit `28df3f1`
   *"IRC works end to end on netbsd networking stack"*.
+- ✅ **M3 (2026-06-24) — fast, full DNS+HTTP, container-class latency.** An
+  **unmodified `curl` running in its own box, over the NetBSD rump TCP/IP stack**
+  (DNS + TCP + HTTP, syscall-proxied to a shared `rump_server` on one OS thread):
 
-Open work is now performance + robustness (per-syscall latency, interruptible
-proxy syscalls, the DNS/UDP path) and the inbound sshd-on-rump variant — not
-correctness. See [docs/HANDOFF.md](docs/HANDOFF.md) and
-[docs/RUMP_SYSPROXY.md](docs/RUMP_SYSPROXY.md).
+  ```
+  box use rumpnet -i /bin/curl -sS http://example.com/   →  HTTP 200, ~1.4s warm
+  ```
+
+  That is **~1.4s vs 16.3s** before (~11×). The 16s was a single keep-alive
+  read-to-close `recvfrom` blocking on the proxy's 15s transport timeout because
+  the proxy ignored the box socket's `O_NONBLOCK`; honoring it (NetBSD
+  `MSG_DONTWAIT` on connected recv) fixed it. For scale: a throwaway **Docker**
+  container doing the same HTTP GET on this host measured **~0.4–3.8s** (DNS-bound
+  by the host's VPN; pure container spawn ~0.18s) — so Akuma's box, routing through
+  a *foreign kernel's* TCP/IP stack over a syscall proxy, is **in the same ballpark
+  as a native Linux container**. Also fiber-ized the sysproxy receiver to an
+  event-driven channel wait (no busy-poll). See
+  [docs/FIBER_HANDOFF.md](docs/FIBER_HANDOFF.md) "LATENCY — ROOT-CAUSED & FIXED".
+
+Open work is now further performance (rump-socket readiness waker to drop MSG_PEEK
+poll round-trips on bulk downloads, tap-fd poll support, an adaptive data-path
+transport timeout) and the inbound sshd-on-rump variant — not correctness. See
+[docs/FIBER_HANDOFF.md](docs/FIBER_HANDOFF.md), [docs/HANDOFF.md](docs/HANDOFF.md)
+and [docs/RUMP_SYSPROXY.md](docs/RUMP_SYSPROXY.md).
 
 Phase history:
 

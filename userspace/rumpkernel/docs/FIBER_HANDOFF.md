@@ -17,17 +17,19 @@ the operational "where we are / what's next / how to run it".
   runs **unmodified `curl` over the NetBSD rump stack** (DHCP + DNS + TCP + HTTP GET
   proxied over the kernel pipe), all on **one OS thread**.
 - **🏆 RESULT (the whole point):** `box use rumpnet -i /bin/curl -sS
-  http://example.com/` → HTTP 200 in **16.3s on fiber vs 62.8s on the pthread
-  baseline (~3.85× faster)**, `rump_server` = **1 OS thread (vs 19)**, PSTATS
-  **`clone=0 futex=0` (vs `clone=20 futex=2606`)**. Same workload, same box.
+  http://example.com/` → HTTP 200, `rump_server` = **1 OS thread (vs 19)**, PSTATS
+  **`clone=0 futex=0` (vs `clone=20 futex=2606`)**. Same workload, same box. End-to-end
+  time **16.3s on fiber vs 62.8s pthread** — then **16.3s → ~1.4s** after the
+  2026-06-24 non-blocking-recv fix (see "LATENCY — ROOT-CAUSED & FIXED" below; the
+  16s was a keep-alive close-read hang, NOT per-syscall cost).
 - **DONE (2026-06-24, see "PORT — DONE" section below):** ported our C wrapper
   `rump_server.c` → Rust (`rumpuser/src/rump_server.rs`, feature `rump_server_main`)
   and archived the C harnesses **+ their docker test scripts** to `rumpuser/c_tests/`.
   Verified **perf-neutral**: curl over the Rust-`main` rump_server = **HTTP 200 in
   16.3s** (identical to the C wrapper), `ps` = **1 OS thread**, Rust fiber test PASS.
-- **NEXT:** event-driven channel wakeup to shave the residual per-syscall latency
-  (~1s/proxied-syscall from poll/yield + ~10ms rump-clock granularity); Phase 5
-  herd/box `--net` auto-spawn ergonomics.
+- **NEXT:** see "Open / next (latency — further levers)" below — rump-socket
+  readiness waker (kill MSG_PEEK poll round-trips on bulk downloads), tap-fd poll
+  support, adaptive data-path transport timeout; Phase 5 herd/box `--net` auto-spawn.
 
 ## What's DONE and verified
 
@@ -110,12 +112,69 @@ RUMP_NIC=1 MEMORY=512M scripts/cargo_runner.sh target/aarch64-unknown-none/relea
 #   box use rumpnet -i /bin/curl -sS http://example.com/
 ```
 
-### Open / next
+### LATENCY — ROOT-CAUSED & FIXED (2026-06-24): the 16 s was NOT per-syscall cost
 
-- **Residual latency:** ~1 s per proxied syscall (the poll/yield + ~10 ms rump
-  clock granularity), so curl is 16 s not sub-second. Event-driven channel wakeup
-  (wake the server's poll on a kernel pipe-write instead of ~tick polling) is the
-  next lever.
+The earlier theory ("~1 s per proxied syscall from poll/yield + 10 ms rump clock")
+was **wrong**. Measured on Akuma (`box use rumpnet -i /bin/curl`):
+
+- An HTTP GET to a **raw IP (no DNS)** is **~1.3 s**; the same GET to **example.com**
+  was **~16.3 s**. curl's own `-w time_total` is **~1.1 s** in both cases — i.e. curl
+  finishes the transfer in ~1 s; the extra ~15 s is **outside** curl.
+- The kernel log pinned it to a **single syscall**: after the body, curl issues a
+  read-to-detect-close `recvfrom(fd, 1024)`. example.com is served over Cloudflare
+  with **HTTP keep-alive → no FIN**, so rump's `recvfrom` had nothing to return.
+  The proxy was forcing connected-socket recv to be **blocking**, so it blocked in
+  `rump_sys_recvfrom` until the `PipeTransport` timed out at exactly
+  `HANDSHAKE_TIMEOUT_US` = **15 s** → `errno 5` (EIO). (Contrast: the raw-IP CDN
+  sends `Connection: close` → FIN → the same `recvfrom` returns `0` in ~37 ms.)
+- **Why Linux never sees this:** libcurl uses **non-blocking sockets** + poll, so
+  that read returns EAGAIN instantly and curl's loop finishes. Akuma's proxy was
+  dropping the box socket's `O_NONBLOCK` on connected `recvfrom`.
+
+**Fix (kernel, `src/rump_proxy.rs`):** honor the box socket's non-blocking flag on
+connected `recvfrom` — pass NetBSD `MSG_DONTWAIT` (the UDP/DNS path already did).
+`proxy_and_fd` now derives nonblock from BOTH the `SOCK_NONBLOCK` creation flag AND
+the per-fd `fcntl(F_SETFL)`/`FIONBIO` set (libcurl creates with `SOCK_NONBLOCK`).
+curl's poll on a rump socket is served by a `MSG_PEEK` probe
+(`epoll_check_fd_readiness`), so its non-blocking loop completes correctly.
+
+**Result (verified on Akuma, 512M):** `curl http://example.com/` **16.3 s → ~1.4 s**
+(~11×), raw IP unchanged (~1.2 s), content correct (560 B). Kernel log: the final
+`recvfrom` now returns `errno 35` (EAGAIN) in ~20 ms; **zero** 15 s stalls / EIO.
+First run is ~4.4 s (one-time box/proxy warm-up + ARP/route), then ~1.4 s steady.
+
+**Container-class context:** a throwaway **Docker** container doing the same HTTP
+GET on this host measured **~0.4–3.8 s** (`docker run --rm --dns 8.8.8.8 alpine
+wget …`; high variance, DNS-bound by the host's VPN), pure container spawn ~0.18 s.
+So Akuma's box — running an *unmodified* curl through a *foreign kernel's* (NetBSD)
+TCP/IP stack over a kernel-pipe syscall proxy — lands in the same ballpark as a
+native Linux container. (Note: Docker's container DNS was broken without an
+explicit `--dns` in this env — "bad address"; the numbers above force a resolver.)
+
+### Also (2026-06-24): event-driven sysproxy channel wait (fiber scheduler)
+
+Independent cleanup, NOT the latency win above. The fiber sysproxy receiver used to
+busy-poll the channel (`poll(...,0)` + 1 ms `rumpuser_akuma_yield`). Added
+`rumpuser_akuma_wait_fd(fd, events, timeout)` (fiber.rs): the receiver blocks on the
+channel fd and `schedule()`'s idle path `poll()`s the waited fds — on Akuma a peer
+write registers a waker (`sys_ppoll`), so it wakes immediately instead of busy
+re-polling (removes idle CPU spin; channel hop is now event-driven). Receiver swap
+is one line in `sp_serve_fd.c` (`yield` → `wait_fd`). Fiber unit test still PASS.
+
+### Open / next (latency — further levers, NOT yet done)
+
+- **Bulk-download round-trips:** non-blocking recv means a recv that races ahead of
+  in-flight data returns EAGAIN and curl re-polls; each poll on a rump socket is a
+  `MSG_PEEK` sysproxy round-trip (~20 ms) with a 10 ms re-poll floor. Fine for small
+  pages; a large download would benefit from a real readiness waker on rump sockets
+  (push readiness from the tap RX / rump socket upcall) instead of MSG_PEEK polling.
+- **Per-syscall vs handshake timeout:** `HANDSHAKE_TIMEOUT_US` (15 s) is reused as
+  the data-path transport timeout. A shorter/adaptive data timeout would bound any
+  *legitimately*-blocking proxied call (belt-and-suspenders now that recv is
+  non-blocking).
+- **Tap RX is still busy-poll** (`/dev/net/tap0` has no kernel poll/waker): inbound
+  packets wait up to the 1 ms RX yield. Making the tap fd pollable (kernel) would
+  let the tap RX fiber use `wait_fd` too and cut inbound-packet latency.
 - Phase 5 herd/box `--net` auto-spawn ergonomics.
 
 ## PORT — DONE (2026-06-24): C wrapper → Rust; C tests + scripts archived
@@ -207,10 +266,16 @@ Re-run `./test-fiber.sh` (Rust tests) — still PASS.
 ## Files
 
 Key files (the 2026-06-24 networked-sysproxy fix touches the ★ ones — UNCOMMITTED):
-- `rumpuser/src/fiber.rs` ★ — the cooperative backend; now also the `akfiber_sp_*`
-  cooperative pthread-compat shims + a Rust `mod tests` (the deadlock regression).
+- `src/rump_proxy.rs` ☆ — **NEW (2026-06-24 latency fix, KERNEL):** connected-socket
+  `recvfrom` honors the box's non-blocking flag (`MSG_DONTWAIT`); `proxy_and_fd`
+  derives nonblock from the `SOCK_NONBLOCK` creation flag OR the per-fd
+  `fcntl`/`FIONBIO` set. This is the curl 16.3 s → 1.4 s fix.
+- `rumpuser/src/fiber.rs` ★ — the cooperative backend; `akfiber_sp_*` shims + Rust
+  `mod tests`; now also `rumpuser_akuma_wait_fd` + the scheduler idle-path `poll()`
+  over fd-waiting fibers (event-driven channel wait).
 - `rumpuser/sp_serve_fd.c` ★ — sp-server fiber glue: `pthread_create`/`detach` AND
-  `pthread_mutex_*`/`pthread_cond_*` runtime redirect; the timeout-0 poll+yield loop.
+  `pthread_mutex_*`/`pthread_cond_*` runtime redirect; idle now blocks via
+  `rumpuser_akuma_wait_fd(connfd, POLLIN, 1000)` instead of the timeout-0 poll+yield.
 - `rumpuser/src/rump_server.rs` ☆ — **NEW (2026-06-24 port)**: the Rust `rump_server`
   wrapper `main` (was `rump_server.c`); feature `rump_server_main`. Same arg parse /
   redirect_log / rump_init / `--net` / sp_init_fd / cooperative park loop.
