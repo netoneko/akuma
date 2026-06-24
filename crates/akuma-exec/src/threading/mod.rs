@@ -3421,7 +3421,7 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserCo
             });
         }
     }
-    
+
     // Fallback to saved context fields (less accurate, no GP registers)
     with_irqs_disabled(|| {
         let ctx = unsafe { &*get_context(thread_id) };

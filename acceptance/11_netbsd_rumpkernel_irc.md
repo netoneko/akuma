@@ -307,6 +307,26 @@ Done (the inbound SSH variant):
       kernel-wait in `src/rump_proxy.rs`. No dropbear, no LD_PRELOAD — see the
       "SSH straight into the box" section above for the full config + recipe.
 
+Done (DNS + HTTPS in the box with static curl):
+- [x] **DNS over rump** (UDP `sendto`/`recvmsg`) — `bind`+`sendto`-dest+`recvmsg`
+      marshaling in `src/rump_proxy.rs` (2026-06-23). `example.com` resolves over the
+      NetBSD stack.
+- [x] **HTTPS in the box with unmodified static curl** (2026-06-24) —
+      `box use rumpnet -i /bin/curl -sS -i https://example.com` → `HTTP/1.1 200 OK`
+      from Cloudflare, **6/6**, full TLS over the rump stack (DNS UDP → TCP `:443` →
+      TLS → body). Required staging two files into the box's fresh `/srv/rumpbox`
+      root (it reads the BOX's `/etc`, not the main root): `etc/resolv.conf`
+      (`8.8.8.8`/`1.1.1.1`; absent → musl defaults to `127.0.0.1` → "Could not
+      resolve") and `etc/ssl/certs/ca-certificates.crt` (+ `cert.pem`; absent →
+      `curl: (77)` mbedTLS ca-cert error). No code change — pure data staging, then
+      full `populate_disk.sh`. See `docs/HANDOFF.md` "Session 2026-06-24 (latest)".
+
 Remaining (polish — not blocking the IRC capstone):
-- [ ] DNS over rump (UDP `sendto`/`recvmsg`) — use raw IPs until then.
+- [ ] **SSH-into-box curl reliability** — HTTPS works over `:2223` too (full body
+      fetched when it runs), but the box shell forks curl and hits the pre-existing
+      intermittent **fork SIGSEGV** (`[WILD-IA] ELR=0 x30=0 SPSR=0x20000000`,
+      boot-variable). `box use` (single fork) is reliable. See HANDOFF fork-SIGSEGV
+      analysis.
+- [ ] **DNS cold-start** — the first query right after boot occasionally returns no
+      answer (SLIRP warm-up); warm with one `box use ... curl` first. Steady-state 6/6.
 - [ ] per-syscall latency (~1s round-trip) + robustness — see `docs/HANDOFF.md` / `RUMP_SYSPROXY.md`.

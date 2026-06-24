@@ -24,6 +24,94 @@ backend makes curl-over-rump ~3.85× faster (16.3s vs 62.8s) on 1 OS thread inst
 of 19, futex storm gone. See `FIBER_HANDOFF.md`.** Remaining: residual ~1s/syscall
 (event-driven channel wakeup is the next lever) + robustness (task #9) + boot self-tests.
 
+### Session 2026-06-24 (latest): DNS + HTTPS inside the box with static curl — ✅ WORKING
+
+**Goal (acceptance/11):** make DNS resolution + HTTPS work inside the rumpnet box
+with the unmodified static `curl` (`bootstrap/bin/curl`, mbedTLS). **DONE — proven
+6/6 via `box use`:** `box use rumpnet -i /bin/curl -sS -i https://example.com` →
+`HTTP/1.1 200 OK` from Cloudflare, every run (full TLS handshake + body over the
+NetBSD rump stack). Kernel trace confirms the whole path is rump: DNS UDP
+(`socket DGRAM|NONBLOCK` → `bind` → `sendto :53` → `recvmsg -> 61`,
+`example.com` → `172.66.147.243`), then TCP `connect ... port=443 -> OK`, TLS, body.
+
+**Two fixes — both pure data staging into the BOX rootfs (`bootstrap/srv/rumpbox/`),
+no kernel/code change. UNCOMMITTED (user commits):**
+1. **`bootstrap/srv/rumpbox/etc/resolv.conf`** (was MISSING). The box runs in a
+   fresh isolated SubdirFs root (`box_root = /srv/rumpbox`), so curl reads the
+   BOX's `/etc/resolv.conf`, not the main root's. With it absent, musl's resolver
+   defaulted to nameserver `127.0.0.1` → DNS queries went to the rump loopback →
+   "Could not resolve host". Copied the main root's resolv.conf (`8.8.8.8` /
+   `1.1.1.1`, reachable via the rump default route → SLIRP → internet).
+2. **`bootstrap/srv/rumpbox/etc/ssl/certs/ca-certificates.crt`** (+ `etc/ssl/cert.pem`)
+   (was MISSING). curl looks for `/etc/ssl/certs/ca-certificates.crt` (baked into
+   the binary); without it mbedTLS failed before the handshake
+   (`curl: (77) Error reading ca cert file ... PK - Read/write of file failed`).
+   Copied the main root's bundle. After staging both, run a FULL `populate_disk.sh`
+   (not `--bin-only`) so the box rootfs lands on the disk.
+
+**Two reliability caveats (pre-existing, NOT DNS/HTTPS-specific):**
+- **Fork SIGSEGV dominates the SSH-into-box path.** Over `:2223` interactive,
+  `curl` is forked by the box shell and hits the intermittent fork SIGSEGV
+  (`[WILD-IA] ELR=0x0 x30=0x0 SPSR=0x20000000`, RC139) — boot-variable, sometimes
+  most attempts, sometimes ~half. When it does NOT crash, **HTTPS works over
+  SSH-in too** (observed `curl ... passed 559 returned 0` = full example.com body
+  fetched). The single-fork `box use` path avoids the shell fork and is reliable
+  (6/6). **New analysis this session (narrows the prior lead):** the child enters
+  EL0 ONLY via `Process::run()` → `enter_user_mode(&proc.context)` (process/mod.rs:487),
+  which sets `spsr_el1 = ctx.spsr`, `elr = ctx.pc`, `x30 = ctx[+240]`. fork forces
+  `child_ctx.spsr = 0`, yet the crash SPSR is `0x20000000` (the PARENT's captured
+  EL0 PSTATE). So `proc.context` is being OVERWRITTEN/raced between fork-setup and
+  the child's first `run()` — it is NOT a stale capture (consistent with the prior
+  session's finding that the capture guard never fired). NEXT: instrument
+  `proc.context.{pc,spsr,x30}` immediately before `enter_user_mode` vs. at the fork
+  set-site to catch the writer; or gdbstub a watchpoint on `proc.context.spsr`.
+- **DNS cold-start flakiness.** The FIRST DNS query right after boot sometimes
+  returns no answer (SLIRP/host-network warm-up); a second attempt resolves. Warm
+  with one `box use ... curl` before relying on it. (Steady-state DNS = 6/6.)
+
+The acceptance/11 capstone bar — DNS + HTTPS in the box on the NetBSD stack with an
+unmodified static curl — is met via `box use`; the SSH-in path is gated only by the
+separate fork-SIGSEGV robustness bug.
+
+### Session 2026-06-24 (later): interactive PTY for the box shell + fork SIGSEGV lead
+
+**SHIPPED (verified, UNCOMMITTED): the SSH-into-box shell is now a real
+interactive terminal.** Was: no prompt/echo/line-editing, Enter (`\r`) never
+terminated a command (`ls^M^M^M^M`). Root cause: the kernel's full line
+discipline (`crates/akuma-terminal`: ICRNL, canonical, echo) was gated behind
+`is_terminal`, and the box shell was spawned `is_terminal=false`. Fix = wiring
+only, via Akuma's own SPAWN ABI: `SPAWN_FLAG_PTY` (arg6) + `libakuma::spawn_pty`
+→ sshd's interactive `run_shell_session` uses it → `sys_spawn` decodes it →
+`spawn_process_with_channel_ext(pty)` → `channel.set_terminal(pty)`. Scoped to
+sshd's `pty-req` (NOT herd/box config — tty-ness is a session property, and a
+per-box flag would wrongly mark `rump_server` a tty). Boot self-test
+`test_spawned_child_pty_is_a_tty` PASSED. Live over rump: prompt/echo/editing/
+Enter work; **curl PASSED** (`curl -H Host:ifconfig.me -L http://34.160.111.145`
+from the box shell); **sic ran** interactively (caveat: `^C`/SIGINT through the
+pty+bridge unconfirmed). Full writeup: **`docs/BOX_PTY_INTERACTIVE_SHELL.md`**.
+
+**OPEN — intermittent fork SIGSEGV (pre-existing, NOT caused by the pty work).**
+`busybox <applet>` / `wget` / `curl` SIGSEGV ~1–3× then succeed: the forked child
+resumes with **ELR(pc)=0 and x30=0** while all other GPRs/SP are valid parent
+values (`[WILD-IA] ... ELR=0x0 ... x30=0x0 SPSR=0x20000000`). Exposed (not caused)
+by the now-working interactive shell. **Disproven this session (don't retry):**
+the capture in `threading::get_saved_user_context` is NOT the culprit — an
+IRQ-guarded, null-elr-rejecting capture was tried and **never fired** yet the
+child still crashed, so `proc.context.pc` is zeroed AFTER capture (the guard was
+reverted). The child reaches EL0 via `entry_point_trampoline`→`run()`→
+`enter_user_mode(&proc.context)`, but `SPSR=0x20000000` (not the `spsr=0`
+`enter_user_mode` sets) hints the failing child instead comes through the
+scheduler's fake-IRQ-frame path (`setup_fake_irq_frame` builds it;
+`update_thread_context` patches only x0/x1). NEXT: instrument `proc.context.pc`
+at the fork set-site vs. trampoline-pre-`run()` to localize the zeroing, or
+gdbstub a conditional breakpoint (reproduces within a few `busybox ls`). Same
+class as `docs/GO_FORK_EXEC_FIXES.md` / `SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md`.
+
+**Also (minor):** box rootfs `/srv/rumpbox/bin` lacks busybox applet symlinks,
+so bare `ls` fails — use `busybox ls` or stage symlinks (main root gets them in
+`populate_disk.sh`; the box doesn't). busybox `wget` DNS over rump returns "bad
+address" (musl resolver path differs from curl's — separate).
+
 ---
 
 ## TL;DR status
@@ -50,6 +138,7 @@ of 19, futex storm gone. See `FIBER_HANDOFF.md`.** Remaining: residual ~1s/sysca
 | **`curl` HTTPS-by-IP over rump** (`-H Host:ifconfig.me http://34.160.111.145` → `87.71.13.205`) | ✅ **2026-06-23** |
 | **`sic` IRC: live `#rumpkernel` session on OFTC over rump** (acceptance/11 capstone) | ✅ **2026-06-23** (`163.61.26.35:6667`) |
 | **DNS over rump** — `curl http://example.com` resolves + fetches via NetBSD (`bind`+`sendto`-dest+`recvmsg`) | ✅ **2026-06-23** (`example.com`→`104.20.23.154`→HTTP 200) |
+| **DNS + HTTPS in the box with unmodified static curl** — `box use rumpnet -i /bin/curl -sS -i https://example.com` | ✅ **2026-06-24** (`HTTP/1.1 200` from Cloudflare, **6/6**; needed `resolv.conf` + CA bundle staged in `/srv/rumpbox/etc`) |
 | Phase 5 — herd autostarts `rumpnet` box (`--net --fd 3`, kernel attaches sysproxy channel) | ✅ **2026-06-23** (herd OWNS the rump_server; `restart=false`) |
 | Rump SDK tarball (`bootstrap/archives/rump-sdk-aarch64-musl.tar.gz` → VM `/archives`) | ✅ `package-sdk.sh` (48 MB, 154 archives) |
 | Akuma integration (libakuma, build-std core) | ✅ proven sufficient — stock host link runs on Akuma as-is |
