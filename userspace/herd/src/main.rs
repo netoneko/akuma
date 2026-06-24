@@ -107,6 +107,20 @@ struct ServiceConfig {
     /// services whose restart needs special handling (e.g. a rump_server, whose
     /// kernel sysproxy channel must be re-established on restart — TBD).
     restart: bool,
+    /// If set, spawn this service INTO an existing box (by name) instead of
+    /// registering a new one. The target box must already exist and be marked
+    /// stack=rump by its owner service (e.g. sshd `join_box = rumpnet` so its
+    /// AF_INET routes to the rumpnet box's rump_server). When set, herd does NOT
+    /// register the box or set its stack — the owner owns that.
+    join_box: String,
+    /// Mount points to create in the box's namespace before spawning (only
+    /// "proc"/"tmpfs"). A fresh-root (box_root != "/") box has no /proc unless
+    /// mounted here — sshd's interactive bridge needs /proc/<pid>/fd/0.
+    mount_fs: Vec<String>,
+    /// Defer the service's INITIAL start by this many ms (e.g. so a join_box
+    /// service starts after its target box's rump_server has finished its
+    /// handshake). Restart backstops any remaining race.
+    start_delay_ms: u64,
 }
 
 impl Default for ServiceConfig {
@@ -121,6 +135,9 @@ impl Default for ServiceConfig {
             bundle: String::new(),
             stack: String::new(),
             restart: true,
+            join_box: String::new(),
+            mount_fs: Vec::new(),
+            start_delay_ms: 0,
         }
     }
 }
@@ -360,6 +377,9 @@ struct SupervisedProcess {
     restart_count: u32,
     last_exit_code: Option<i32>,
     restart_at_ms: Option<u64>,
+    /// Earliest time (ms) this service's INITIAL start is allowed, computed lazily
+    /// from `config.start_delay_ms` the first time we consider starting it.
+    start_at_ms: Option<u64>,
     log_size: usize,
 }
 
@@ -373,6 +393,7 @@ impl SupervisedProcess {
             restart_count: 0,
             last_exit_code: None,
             restart_at_ms: None,
+            start_at_ms: None,
             log_size: 0,
         }
     }
@@ -484,7 +505,7 @@ pub extern "C" fn main() {
     reload_config(&mut state);
 
     // Start enabled services
-    start_stopped_services(&mut state);
+    start_stopped_services(&mut state, uptime() / 1000);
 
     // Main supervisor loop
     supervisor_loop(state);
@@ -503,11 +524,14 @@ fn supervisor_loop(mut state: HerdState) {
         // 3. Handle pending restarts
         process_pending_restarts(&mut state, now_ms);
 
+        // 3b. Start any stopped services whose (optional) start delay has elapsed.
+        start_stopped_services(&mut state, now_ms);
+
         // 4. Reload config every 20 seconds
         if now_ms.saturating_sub(state.last_config_reload_ms) >= CONFIG_RELOAD_INTERVAL_MS {
             print("[herd] Reloading config...\n");
             reload_config(&mut state);
-            start_stopped_services(&mut state);
+            start_stopped_services(&mut state, now_ms);
             state.last_config_reload_ms = now_ms;
         }
 
@@ -559,6 +583,19 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                 }
                 "stack" => config.stack = String::from(value),
                 "restart" => config.restart = value != "false" && value != "0" && value != "no",
+                "join_box" => {
+                    config.join_box = String::from(value);
+                    config.boxed = true; // a joined service always runs in a box
+                }
+                "mount" => {
+                    config.mount_fs = value
+                        .split_whitespace()
+                        .map(String::from)
+                        .collect();
+                }
+                "start_delay" => {
+                    config.start_delay_ms = parse_u64(value).unwrap_or(0);
+                }
                 _ => {}
             }
         }
@@ -658,11 +695,23 @@ fn reload_config(state: &mut HerdState) {
 // Service Management
 // ============================================================================
 
-fn start_stopped_services(state: &mut HerdState) {
-    let to_start: Vec<(String, ServiceConfig)> = state.services.iter()
-        .filter(|(_, svc)| svc.state == ServiceState::Stopped)
-        .map(|(name, svc)| (name.clone(), svc.config.clone()))
-        .collect();
+fn start_stopped_services(state: &mut HerdState, now_ms: u64) {
+    // Honor a per-service initial start delay (e.g. a join_box service waiting for
+    // its target box's rump_server handshake). start_at_ms is set lazily the first
+    // time we see the service so a 0-delay service still starts immediately.
+    let mut to_start: Vec<(String, ServiceConfig)> = Vec::new();
+    for (name, svc) in state.services.iter_mut() {
+        if svc.state != ServiceState::Stopped {
+            continue;
+        }
+        if svc.config.start_delay_ms > 0 {
+            let eligible = *svc.start_at_ms.get_or_insert(now_ms + svc.config.start_delay_ms);
+            if now_ms < eligible {
+                continue; // not yet — wait out the delay
+            }
+        }
+        to_start.push((name.clone(), svc.config.clone()));
+    }
 
     for (name, config) in to_start {
         start_service(state, &name, &config);
@@ -793,6 +842,35 @@ fn setup_oci_mounts(box_id: u64, mounts: &[OciMount]) {
     }
 }
 
+/// Mount the configured `mount` filesystems into a box's namespace. Each entry is
+/// a type ("proc"/"tmpfs") mounted at its conventional path. A fresh-root box
+/// (box_root != "/") otherwise has no /proc — sshd's interactive bridge needs it.
+fn setup_fs_mounts(box_id: u64, mounts: &[String]) {
+    for m in mounts {
+        let (fstype, dest): (&str, &str) = match m.as_str() {
+            "proc" => ("proc", "/proc"),
+            "tmpfs" => ("tmpfs", "/tmp"),
+            _ => continue,
+        };
+        let result = libakuma::syscall(
+            SYSCALL_MOUNT_IN_NS,
+            box_id,
+            dest.as_ptr() as u64,
+            dest.len() as u64,
+            fstype.as_ptr() as u64,
+            fstype.len() as u64,
+            0,
+        );
+        if (result as i64) < 0 {
+            print("[herd] Warning: Failed to mount ");
+            print(fstype);
+            print(" at ");
+            print(dest);
+            print(" in box\n");
+        }
+    }
+}
+
 fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
     print("[herd] Starting service: ");
     print(name);
@@ -805,7 +883,19 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
     }
     print("\n");
 
-    let spawn_res = if !config.bundle.is_empty() {
+    let spawn_res = if !config.join_box.is_empty() {
+        // Join an EXISTING box (e.g. sshd into the rumpnet box so its AF_INET is
+        // sysproxy-routed to that box's rump_server). The target box was registered
+        // and stack-marked by its owner service — do NOT register_box or
+        // set_box_stack_rump here. We mount the box's namespace fs (e.g. /proc for
+        // sshd's stdin bridge) then spawn into the existing box id. If the owner
+        // hasn't registered the box yet, spawn_in_box falls back to the caller ns
+        // and the mount fails — `start_delay` + `restart` cover that race.
+        let target_box_id = generate_box_id(&config.join_box);
+        setup_fs_mounts(target_box_id, &config.mount_fs);
+        let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
+        spawn_in_box(target_box_id, &config.command, &args)
+    } else if !config.bundle.is_empty() {
         // OCI Bundle mode
         let config_path = format!("{}/config.json", config.bundle);
         let json = match read_file_string(&config_path) {
@@ -872,6 +962,7 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
             // channel + drives the proxy.
             set_box_stack_rump(box_id);
         }
+        setup_fs_mounts(box_id, &config.mount_fs);
         let res = spawn_in_box(box_id, &config.command, &args);
         if let Some(ref r) = res {
             register_box(name, box_id, &config.box_root, r.pid);

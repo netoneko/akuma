@@ -109,56 +109,129 @@ supervised by herd. That is the end-to-end win the whole port is for.
 
 ## Same demo, other direction — SSH straight into the box over the rump stack
 
-The IRC client proves the **outbound** (connect) path. The same box also runs an
-SSH server **listening on the rump stack**, proving the **inbound** (listen/accept)
-path and a full interactive bidirectional session — a stronger end-to-end check.
+**Status: ✅ inbound proven; login reaches a busybox prompt (2026-06-24).** The IRC
+client proves the **outbound** (connect) path. The same box also runs an SSH server
+**listening on the rump stack**, proving the **inbound** (listen/accept) path: from
+the host, `ssh -p 2223 root@localhost` connects, completes the SSH key exchange,
+authenticates, and lands at a **busybox `/bin/sh` prompt running in the box's fresh
+`/srv/rumpbox` root** — the entire TCP handshake + session carried by the NetBSD rump
+stack (the kernel sysproxy routes sshd's `listen`/`accept`/`recvfrom`/`sendto`). We do
+this with **our own `userspace/sshd`**, spawned by **herd inside the rumpnet box** —
+not dropbear, not LD_PRELOAD. (Known rough edge: the interactive *command* round-trip —
+forwarding client keystrokes into the shell's stdin via the sshd bridge — is still
+being finished; the login, auth, shell spawn, and prompt all work over rump.)
 
 **Topology (two stacks, side by side):**
 
 | Reach | Host port | Guest NIC | Stack | Server |
 |-------|-----------|-----------|-------|--------|
 | Akuma itself | `2222` | NIC0 (net0) | smoltcp (`src/syscall/net.rs`) | Akuma's in-kernel sshd |
-| **the box**  | **`2223`** (`RUMP_SSH_PORT`) | NIC1 (net1) → `/dev/net/tap0` | **NetBSD rump** | dropbear in the box |
+| **the box**  | **`2223`** (`RUMP_SSH_PORT`) | NIC1 (net1) → `/dev/net/tap0` | **NetBSD rump** | `userspace/sshd` in the rumpnet box |
 
 So `ssh -p 2222 root@localhost` lands on Akuma (smoltcp); `ssh -p 2223 root@localhost`
-lands on the **box's** sshd whose socket lives on the **NetBSD stack**. Genuinely
+lands on the **box's** sshd whose sockets live on the **NetBSD rump stack**. Genuinely
 different interface, different stack, and a different guest IP — `virt0` gets its
 address from net1's own SLIRP DHCP (`10.0.2.15`, gateway `10.0.2.2`), independent of
-whatever NIC0/smoltcp holds. `scripts/cargo_runner.sh` adds the
-`hostfwd=tcp::2223-:22` on net1 when `RUMP_NIC=1` (override with `RUMP_SSH_PORT`).
+NIC0/smoltcp. `scripts/cargo_runner.sh` adds `hostfwd=tcp::2223-:22` on net1 when
+`RUMP_NIC=1` (override with `RUMP_SSH_PORT`).
 
-**Why dropbear, not our `userspace/sshd`:** our sshd is built on `libakuma`'s net
-abstraction (`net-async`, whose `socket/bind/listen/accept` are Akuma syscalls), so
-pointing *it* at rump would mean adding a **libakuma rump backend** — a separate
-integration. dropbear is an unmodified C binary that uses libc sockets directly, so
-it drops onto the **standard `librumphijack` `LD_PRELOAD`** path with no code
-changes — the simpler route for this demo. (The libakuma-backend route is the
-better long-term answer for *our* programs; tracked in docs/ARCHITECTURE_QUESTIONS.md.)
+**How it works (no dropbear, no LD_PRELOAD).** `userspace/sshd` is built on
+`libakuma` net, whose `socket/bind/listen/accept` are Akuma syscalls. Because sshd
+runs **inside the `stack=rump` rumpnet box**, the kernel **sysproxy intercepts those
+syscalls and forwards them to the box's `rump_server`** (`src/rump_proxy.rs`
+`intercept_box_syscall`) — the exact same kernel-as-client path that carries curl/sic
+outbound, now extended to the inbound server calls. No libakuma rump backend, no
+hijack `.so`. sshd's **login shell is busybox `/bin/sh`** (argv[0] dispatch → ash), so
+the session gets full POSIX grammar (`&&`, pipes, `$?`, `VAR=val cmd`) — *not* Akuma's
+in-kernel restricted shell (which you hit on `:2222`). sshd's filesystem is the box's
+**fresh `/srv/rumpbox`** root (it reads `/srv/rumpbox/etc/sshd/sshd.conf`; an SSH
+`ls /` shows the fresh tree, not the host root).
 
-**In-box (added to the herd service's run script):**
-```sh
-# after virt0 is up with an address (dhcp_ipv4_oneshot):
-#   run an unmodified dropbear whose libc socket/bind/listen/accept are redirected
-#   to the rump stack. Two ways (see docs/ARCHITECTURE_QUESTIONS.md):
-#     (a) in-process: dropbear linked/preloaded with librumphijack against the
-#         in-process rump kernel — the box is one process hosting rump + dropbear;
-#     (b) sysproxy: rump_server owns the stack, dropbear runs with
-#         LD_PRELOAD=librumphijack + RUMP_SERVER=unix://… (needs sp_* hypercalls).
-LD_PRELOAD=/usr/lib/librumphijack.so dropbear -F -E -p 22 -r /etc/box_hostkey
+### Config (this is the reproducible acceptance setup)
+
+Two herd services in `bootstrap/etc/herd/enabled/`, both boxed into the **same** box
+(`box_id` from the name "rumpnet"):
+
+`rumpnet.conf` — owns the rump_server, `box_root` is the fresh dir:
+```
+command  = /bin/rump_server
+args     = --net --fd 3
+boxed    = true
+box_root = /srv/rumpbox
+stack    = rump
+restart  = false
 ```
 
-**Login shell = busybox `sh`.** dropbear runs a real login shell (`/bin/busybox
-sh`, already shipped static in `bootstrap/bin`), so an SSH session into the box
-gets full POSIX shell grammar — `&&`, pipes, `$?`, `VAR=val cmd` — *not* Akuma's
-in-kernel SSH shell (which rejects those; you hit it on `:2222`). So the entire
-in-box flow above (clone sic → `tcc` compile → run) is driven from a normal shell
-over the NetBSD stack. (Configure via dropbear's shell target / the box's
-`/etc/passwd`.)
+`sshd.conf` — joins the rumpnet box, busybox shell, /proc mounted, delayed start:
+```
+command    = /bin/sshd
+args       = --port 22 --shell /bin/sh
+join_box   = rumpnet      # spawn INTO the rumpnet box → AF_INET sysproxy-routed to its rump_server
+mount      = proc         # fresh-root box has no /proc; sshd's stdin bridge needs /proc/<pid>/fd/0
+start_delay = 4000        # start after rumpnet's rump_server handshake; restart backstops the race
+restart    = true
+```
 
-**Expected:** from the host, `ssh -p 2223 root@localhost` opens a busybox shell
-**in the box**, with the TCP handshake + the entire session carried by the NetBSD
-stack on our rumpuser. `RUMP_NIC=0` (no `/dev/net/tap0`) → `:2223` refuses — the
-negative control that it isn't secretly smoltcp.
+The fresh box rootfs lives at `bootstrap/srv/rumpbox/` (copied to the disk's
+`/srv/rumpbox` by `populate_disk.sh`): `bin/{rump_server,sshd,busybox,sh}` (`sh` is a
+copy of busybox) and `etc/sshd/sshd.conf` (`shell=/bin/sh`, `port=22`,
+`disable_key_verification=true`). `/dev/net/tap0` needs no entry — it is matched
+pre-namespace by the kernel (see docs/BOX_SUBDIR_FS_LIMITATIONS.md).
+
+### Run it fresh
+
+```sh
+cargo build --release
+userspace/build.sh                 # builds userspace/sshd, herd, busybox staging, etc.
+scripts/create_disk.sh             # (re)create the ext2 disk
+scripts/populate_disk.sh           # copies bootstrap/ (incl. srv/rumpbox + the 2 herd confs) onto it
+RUMP_NIC=1 MEMORY=1024M cargo run --release
+```
+
+Boot prints the proxy self-test `[Test] rump_listen_accept PASSED`; herd starts
+`rumpnet` (DHCP `10.0.2.15`) then `sshd` in the same box (logs `[SSHD] Listening on
+0.0.0.0:22`). Then from the host (the `ssh` CLI is policy-blocked here — drive it via
+Python), an INTERACTIVE session (sshd handles the SSH "shell" request, not "exec"):
+
+```python
+import subprocess
+subprocess.run(["ssh","-tt","-o","StrictHostKeyChecking=no","-o","UserKnownHostsFile=/dev/null",
+                "-p","2223","root@localhost"], input="ls /\nexit\n", text=True, timeout=120)
+# → authenticates and lands at a busybox prompt:
+#     /bin/sh: can't access tty; job control turned off
+#     ~ #
+#   running IN the box (fresh /srv/rumpbox root). The TCP handshake + session are
+#   carried by the NetBSD rump stack — kernel log shows [RUMP-SP] route ... listen /
+#   accept / recvfrom / sendto on the sshd pid, routed through the box's rump_server.
+```
+
+(The login, key exchange, auth, busybox-shell spawn, and prompt are all carried over
+the rump stack. Forwarding typed commands into the shell's stdin via the sshd bridge is
+the one piece still being finished — see "What this required" / known issues.)
+
+**Negative control:** boot with `RUMP_NIC=0` (no `/dev/net/tap0`, no net1) → `:2223`
+refuses — confirming the session isn't secretly smoltcp.
+
+### What this required (2026-06-24, kernel + herd — UNCOMMITTED, user commits)
+
+- **Kernel sysproxy inbound** (`src/rump_proxy.rs`): `proxy_listen` + `proxy_accept`
+  (previously "Not marshaled yet"). `accept` is forwarded **non-blocking** (the
+  listener is set `O_NONBLOCK` server-side) and waits in the kernel, yielding the core
+  to the rump_server — a blocking accept would stall to the 15s transport timeout
+  (EIO). The accepted rump fd is registered as a box `RumpSocket`; the peer sockaddr
+  is translated NetBSD→Linux. Connected `recv` on a **blocking** box socket now also
+  blocks in the kernel (`MSG_DONTWAIT` + yield) instead of server-side — libakuma's
+  `TcpStream::read` is a blocking recv, so this avoids both the 15s hang and a
+  busy-spin. (`Op::Listen`/`Op::Accept` sysnos already existed in
+  `crates/akuma-rump/src/syscall_translation.rs`.)
+- **herd** (`userspace/herd/src/main.rs`): `join_box` (spawn into an existing box, no
+  re-register / no re-mark), `mount = proc|tmpfs` (mount into the box namespace), and
+  `start_delay` (defer initial start).
+- **Kernel ns idempotency** (`src/vfs/mod.rs`): `create_box_namespace` returns the
+  existing namespace on re-register, so herd's pid-update register doesn't drop the
+  box's `/proc` mount.
+- **Boot self-test**: `[Test] rump_listen_accept` (in `rump_proxy::run_demo`, gated on
+  `RUMP_NIC=1`) drives socket→bind→listen→nonblock→accept and asserts a fast EAGAIN.
 
 ---
 
@@ -213,14 +286,14 @@ Done (resolved by M1/M2 — see `docs/HANDOFF.md`):
       link needed); needed `readv`/`writev` marshaling + `poll`/`select` on
       `RumpSocket` + a `sic` recv-drain patch (vendored `userspace/rumpkernel/sic`).
 
-Remaining (the inbound SSH variant + polish — not blocking the IRC capstone):
-- [ ] **sshd on the rump stack** (the SSH-into-the-box direction above). The
-      `listen`/`accept` transport is proven (`rumpserver.c`, host `:2223`→rump `:22`);
-      what's left is the SSH *protocol* layer. **dropbear** caveat: it must do socket
-      I/O via *directly-called* libc `socket/accept/read/write` (interposable by
-      `hijack.c`), NOT via `FILE*` stdio — musl stdio flushes through inline
-      `writev`/`readv` syscalls that bypass the PLT and **cannot** be LD_PRELOAD-hijacked
-      (this is why `busybox wget` fails but `curl` works). If dropbear uses stdio on the
-      socket, use the sysproxy/kernel-routing model (now proven) instead of LD_PRELOAD.
+Done (the inbound SSH variant):
+- [x] **sshd on the rump stack** (2026-06-24) — `userspace/sshd` runs in the rumpnet
+      box (busybox `/bin/sh`, fresh `/srv/rumpbox` root), spawned by herd
+      (`join_box`); its `listen`/`accept`/`recv` are sysproxy-routed to the box's
+      `rump_server` via the new `proxy_listen`/`proxy_accept` + connected-blocking-recv
+      kernel-wait in `src/rump_proxy.rs`. No dropbear, no LD_PRELOAD — see the
+      "SSH straight into the box" section above for the full config + recipe.
+
+Remaining (polish — not blocking the IRC capstone):
 - [ ] DNS over rump (UDP `sendto`/`recvmsg`) — use raw IPs until then.
 - [ ] per-syscall latency (~1s round-trip) + robustness — see `docs/HANDOFF.md` / `RUMP_SYSPROXY.md`.

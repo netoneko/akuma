@@ -239,11 +239,20 @@ fn neg_linux_errno(e: i32) -> u64 {
     (-i64::from(e)) as u64
 }
 const LINUX_EBADF: i32 = 9;
+const LINUX_EINTR: i32 = 4;
+const LINUX_EAGAIN: i32 = 11;
 const LINUX_EFAULT: i32 = 14;
 const LINUX_EINVAL: i32 = 22;
 const LINUX_ENOMEM: i32 = 12;
 const LINUX_EOPNOTSUPP: i32 = 95;
 const LINUX_EAFNOSUPPORT: i32 = 97;
+
+/// NetBSD `fcntl` syscall number (used internally to flip O_NONBLOCK on a rump
+/// listening/accepted socket — never dispatched from a box, so it has no
+/// `translation::Op`). `F_SETFL`=4 and NetBSD `O_NONBLOCK`=0x4.
+const NETBSD_FCNTL: u32 = 92;
+const NETBSD_F_SETFL: u64 = 4;
+const NETBSD_O_NONBLOCK: u64 = 0x4;
 
 // NetBSD `recv`/`send` flag values (differ from Linux): used on the UDP/DNS path
 // so a nonblocking `recvfrom` drain returns EAGAIN instead of blocking the proxy.
@@ -303,6 +312,8 @@ pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
         translation::Op::Close => proxy_close(args, proc, box_id),
         translation::Op::Connect => proxy_connect(args, proc, box_id),
         translation::Op::Bind => proxy_bind(args, proc, box_id),
+        translation::Op::Listen => proxy_listen(args, proc, box_id),
+        translation::Op::Accept => proxy_accept(args, proc, box_id),
         translation::Op::Getsockname => proxy_getname(args, proc, box_id, translation::Op::Getsockname),
         translation::Op::Getpeername => proxy_getname(args, proc, box_id, translation::Op::Getpeername),
         translation::Op::Getsockopt => proxy_getsockopt(args, proc),
@@ -563,6 +574,146 @@ fn proxy_bind(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
     }
 }
 
+/// Set/clear `O_NONBLOCK` on a rump fd server-side via NetBSD `fcntl(F_SETFL)`.
+/// Best-effort (result ignored): used to make a listening socket non-blocking so
+/// the kernel can poll `accept` (instead of the server blocking until a 15s
+/// transport timeout), and to clear it on the accepted socket so the box gets
+/// normal blocking-stream semantics.
+fn set_rump_sock_nonblock(proxy: &Arc<BoxProxy>, rump_fd: i32, nonblock: bool) {
+    let flag = if nonblock { NETBSD_O_NONBLOCK } else { 0 };
+    let mut mem = NoMem;
+    let _ = proxy.with_client(|c| {
+        let a = translation::pack_args(&[rump_fd as u64, NETBSD_F_SETFL, flag]);
+        c.syscall(NETBSD_FCNTL, &a, &mut mem)
+    });
+}
+
+/// `listen(fd, backlog)` → forward to the rump server (no pointer args). Returns
+/// immediately server-side, so there is no transport-timeout concern.
+fn proxy_listen(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
+    let (proxy, rump_fd, _nonblock) = match proxy_and_fd(args, proc, box_id) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let mut mem = NoMem;
+    let res = proxy.with_client(|c| {
+        let a = translation::pack_args(&[rump_fd as u64, args[1]]);
+        c.syscall(translation::netbsd_sysno(translation::Op::Listen), &a, &mut mem)
+    });
+    match res {
+        Ok(_) => 0,
+        Err(e) => neg_linux_errno(translation::errno_netbsd_to_linux(e)),
+    }
+}
+
+/// `accept(fd, addr, len)` — the inbound server path. We must NEVER forward a
+/// blocking accept: the rump server would block until a connection arrives, but
+/// the kernel pipe transport gives up at the 15s handshake timeout (→ EIO). So we
+/// force the listening socket non-blocking server-side and wait HERE (yielding the
+/// core to the rump server each iteration) until a connection lands — mirroring
+/// the connected-recv `MSG_DONTWAIT` model that already works. libakuma's
+/// `TcpListener::accept` busy-loops on EAGAIN with no sleep, so a blocking box
+/// accept must block in the kernel rather than return EAGAIN (which would hot-spin
+/// the proxy). The accepted rump fd is registered as a new box `RumpSocket` and the
+/// peer's NetBSD `sockaddr_in` is translated back to Linux via `cout_sockaddr`.
+fn proxy_accept(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
+    let (proxy, rump_fd, nonblock) = match proxy_and_fd(args, proc, box_id) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    // Make the listener non-blocking server-side so accept returns EAGAIN instead
+    // of blocking the rump server (idempotent; cheap).
+    set_rump_sock_nonblock(&proxy, rump_fd, true);
+
+    let (addr_ptr, len_ptr) = (args[1], args[2]);
+    loop {
+        if akuma_exec::process::is_current_interrupted() {
+            return neg_linux_errno(LINUX_EINTR);
+        }
+        let mut mem = ProcMem::new();
+        if addr_ptr != 0 && len_ptr != 0 {
+            mem.cout_sockaddr.insert(addr_ptr);
+        }
+        let res = proxy.with_client(|c| {
+            let a = translation::pack_args(&[rump_fd as u64, addr_ptr, len_ptr]);
+            c.syscall(translation::netbsd_sysno(translation::Op::Accept), &a, &mut mem)
+        });
+        match res {
+            Ok([newfd, _]) if newfd >= 0 => {
+                // The accepted socket inherits the listener's O_NONBLOCK on NetBSD;
+                // clear it so the box sees a normal blocking stream (its recv path
+                // still gets kernel-side blocking via proxy_transfer).
+                set_rump_sock_nonblock(&proxy, newfd as i32, false);
+                let box_fd = proc.alloc_fd(process::FileDescriptor::RumpSocket {
+                    rump_fd: newfd as i32,
+                    nonblock: false,
+                });
+                crate::safe_print!(96, "[RUMP-SP] accept -> box_fd={} rump_fd={}\n", box_fd, newfd);
+                return u64::from(box_fd);
+            }
+            Ok(_) => return neg_linux_errno(LINUX_EOPNOTSUPP),
+            Err(e) => {
+                let lin = translation::errno_netbsd_to_linux(e);
+                if lin == LINUX_EAGAIN {
+                    // No pending connection: a non-blocking box accept surfaces it;
+                    // a blocking one waits (yield the core to the server) and retries.
+                    if nonblock {
+                        return neg_linux_errno(LINUX_EAGAIN);
+                    }
+                    threading::schedule_blocking(crate::timer::uptime_us() + 1_000);
+                    continue;
+                }
+                return neg_linux_errno(lin);
+            }
+        }
+    }
+}
+
+/// How long a "blocking" connected recv waits in the kernel before returning
+/// EAGAIN. This is a TIME-BOUNDED block, not an infinite one: a cooperative
+/// SSH bridge interleaves one socket read with one child-stdout poll per loop, so
+/// an infinite recv would starve stdout (the shell's output never flushes until
+/// the next keystroke). ~100ms keeps interactive output responsive while still
+/// avoiding both the 15s server-side stall and a busy-spin. libakuma's
+/// `TcpStream::read` consumers (`read_exact`, the bridge) treat the periodic
+/// EAGAIN as "retry", so this preserves blocking semantics in practice.
+const RECV_BLOCK_SLICE_US: u64 = 100_000;
+
+/// Connected recv on a BLOCKING box socket: wait in the KERNEL (yield to the rump
+/// server) using `MSG_DONTWAIT` + retry until data/EOF/real-error/interrupt, or
+/// until `RECV_BLOCK_SLICE_US` elapses (then EAGAIN). A server-side blocking
+/// recvfrom would stall until the 15s transport timeout (→ EIO); and libakuma's
+/// `TcpStream::read` busy-retries on EAGAIN with no sleep, so returning EAGAIN
+/// immediately would hot-spin the proxy. (Non-blocking box sockets keep the
+/// single-shot path in `proxy_transfer`.)
+fn proxy_recv_blocking(proxy: &Arc<BoxProxy>, rump_fd: i32, buf: u64, len: u64) -> u64 {
+    let deadline = crate::timer::uptime_us() + RECV_BLOCK_SLICE_US;
+    loop {
+        if akuma_exec::process::is_current_interrupted() {
+            return neg_linux_errno(LINUX_EINTR);
+        }
+        let mut mem = ProcMem::new();
+        let res = proxy.with_client(|c| {
+            let a = translation::pack_args(&[rump_fd as u64, buf, len, NB_MSG_DONTWAIT, 0, 0]);
+            c.syscall(translation::netbsd_sysno(translation::Op::Recvfrom), &a, &mut mem)
+        });
+        match res {
+            Ok([n, _]) => return n as u64, // n>0 = data, n==0 = peer closed (EOF)
+            Err(e) => {
+                let lin = translation::errno_netbsd_to_linux(e);
+                if lin == LINUX_EAGAIN {
+                    if crate::timer::uptime_us() >= deadline {
+                        return neg_linux_errno(LINUX_EAGAIN); // let the caller poll/loop
+                    }
+                    threading::schedule_blocking(crate::timer::uptime_us() + 1_000);
+                    continue;
+                }
+                return neg_linux_errno(lin);
+            }
+        }
+    }
+}
+
 /// `getsockname`/`getpeername(fd, addr, len)` → forward; the result NetBSD
 /// `sockaddr_in` is translated back to Linux via `cout_sockaddr`.
 fn proxy_getname(args: &[u64; 6], proc: &Process, box_id: u64, op: translation::Op) -> u64 {
@@ -644,6 +795,13 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
         Ok(x) => x,
         Err(e) => return e,
     };
+    // Connected recv (NULL src addr) on a BLOCKING box socket must block in the
+    // kernel, not server-side (15s EIO) — see proxy_recv_blocking. sshd's
+    // TcpStream::read is exactly this. Non-blocking sockets fall through to the
+    // single-shot MSG_DONTWAIT path below.
+    if matches!(op, translation::Op::Recvfrom) && args[4] == 0 && !nonblock {
+        return proxy_recv_blocking(&proxy, rump_fd, args[1], args[2]);
+    }
     // args[1],args[2] = (buf,len) for read/write/sendto/recvfrom, or (iovptr,
     // iovcnt) for readv/writev — same positional layout, passed verbatim. The
     // iovec struct is identical Linux↔NetBSD, so the server's sys_readv/writev
@@ -1002,9 +1160,67 @@ fn drive_socket(px: u32, py: u32) -> Result<i64, alloc::string::String> {
     // rump_sys_socket(AF_INET=2, SOCK_STREAM=1, 0) — no pointer args, no copyin.
     let args = translation::pack_args(&[2, 1, 0]);
     let mut mem = NoMem;
-    match client.syscall(translation::netbsd_sysno(translation::Op::Socket), &args, &mut mem) {
-        Ok([fd, _]) if fd >= 0 => Ok(fd),
-        Ok([fd, _]) => Err(format!("socket returned {fd}")),
-        Err(e) => Err(format!("socket errno {e}")),
+    let fd = match client.syscall(translation::netbsd_sysno(translation::Op::Socket), &args, &mut mem) {
+        Ok([fd, _]) if fd >= 0 => fd,
+        Ok([fd, _]) => return Err(format!("socket returned {fd}")),
+        Err(e) => return Err(format!("socket errno {e}")),
+    };
+
+    // Inbound path self-test (proxy_listen/proxy_accept marshaling + the critical
+    // non-blocking-accept timing): bind(INADDR_ANY:0) → listen → F_SETFL O_NONBLOCK
+    // → accept(NULL) must return EAGAIN (NetBSD 35) IMMEDIATELY, not stall to the
+    // 15s transport timeout (errno 5/EIO). Proves accept never blocks server-side.
+    match drive_listen_accept(&mut client, fd) {
+        Ok(()) => crate::console::print("[Test] rump_listen_accept PASSED — listen + non-blocking accept EAGAIN\n"),
+        Err(msg) => crate::safe_print!(96, "[Test] rump_listen_accept FAILED — {}\n", msg),
+    }
+    Ok(fd)
+}
+
+/// Drive `bind`/`listen`/`fcntl(O_NONBLOCK)`/`accept` on a fresh rump socket over
+/// the kernel pipe and assert the non-blocking `accept` returns EAGAIN fast (no
+/// pending connection, no 15s stall). Runs in kernel context with no user VA, so
+/// the bind sockaddr is served via a `cin_override` (like `proxy_connect`) rather
+/// than a real user pointer.
+fn drive_listen_accept(
+    client: &mut ProxyClient,
+    fd: i64,
+) -> Result<(), alloc::string::String> {
+    use alloc::format;
+    // Linux sockaddr_in for INADDR_ANY:0 (family AF_INET=2, port 0, addr 0).
+    let lin = [2u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let nb = translation::sockaddr_in_linux_to_netbsd(&lin)
+        .ok_or_else(|| alloc::string::String::from("sockaddr translate"))?;
+    const FAKE_ADDR: u64 = 0x2000; // cin_override key (no real user VA at boot)
+    let mut mem = ProcMem::new();
+    mem.cin_override.insert(FAKE_ADDR, nb.to_vec());
+    let a = translation::pack_args(&[fd as u64, FAKE_ADDR, 16]);
+    client
+        .syscall(translation::netbsd_sysno(translation::Op::Bind), &a, &mut mem)
+        .map_err(|e| format!("bind errno {e}"))?;
+
+    let mut nomem = NoMem;
+    let a = translation::pack_args(&[fd as u64, 1]);
+    client
+        .syscall(translation::netbsd_sysno(translation::Op::Listen), &a, &mut nomem)
+        .map_err(|e| format!("listen errno {e}"))?;
+
+    // fcntl(fd, F_SETFL, O_NONBLOCK) so accept won't block server-side.
+    let a = translation::pack_args(&[fd as u64, NETBSD_F_SETFL, NETBSD_O_NONBLOCK]);
+    client
+        .syscall(NETBSD_FCNTL, &a, &mut nomem)
+        .map_err(|e| format!("fcntl errno {e}"))?;
+
+    // accept(fd, NULL, NULL): no pending connection ⇒ must be EAGAIN (NetBSD 35),
+    // returned promptly. A non-EAGAIN error or an OK fd both fail the expectation.
+    let t0 = crate::timer::uptime_us();
+    let a = translation::pack_args(&[fd as u64, 0, 0]);
+    let res = client.syscall(translation::netbsd_sysno(translation::Op::Accept), &a, &mut nomem);
+    let dt = crate::timer::uptime_us().saturating_sub(t0);
+    match res {
+        Err(35) if dt < READ_TIMEOUT_US => Ok(()),
+        Err(35) => Err(format!("accept EAGAIN but slow ({dt}us)")),
+        Err(e) => Err(format!("accept errno {e} (want 35/EAGAIN)")),
+        Ok([n, _]) => Err(format!("accept unexpectedly returned fd {n}")),
     }
 }

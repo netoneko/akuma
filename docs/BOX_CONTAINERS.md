@@ -1,5 +1,9 @@
 # Box Containerization System Proposal
 
+> **Fresh-root caveats:** a box with a non-`/` root uses a VFS-layer `SubdirFs`
+> remap, which has sharp edges (device paths, `/proc`, no overlay/symlinks). See
+> [BOX_SUBDIR_FS_LIMITATIONS.md](BOX_SUBDIR_FS_LIMITATIONS.md).
+
 ## Overview
 
 "Box" is a lightweight containerization mechanism for AkumaOS, designed to provide process and filesystem isolation ("cats love boxes"). It allows running processes in restricted environments with their own filesystem root and process view, while sharing the networking stack (for now).

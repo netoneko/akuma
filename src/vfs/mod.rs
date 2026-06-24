@@ -53,8 +53,17 @@ pub fn clear_spawn_namespace() {
 /// Create a new namespace for a box and return a shared reference.
 /// If `root_dir` is non-"/" and the global root filesystem is available,
 /// a `SubdirFs` scoped to `root_dir` is mounted at `/` in the new namespace.
+///
+/// Idempotent: if the box already has a namespace, the existing one is returned
+/// unchanged. herd calls `register_box` (→ this) twice — once with a placeholder
+/// pid, then with the real pid — and recreating the namespace the second time
+/// would drop any mounts added in between (e.g. a `/proc` mounted for the box's
+/// sshd). Keeping the first namespace preserves those mounts.
 #[cfg(feature = "sc-containers")]
 pub fn create_box_namespace(box_id: u64, root_dir: &str) -> Arc<Namespace> {
+    if let Some(existing) = BOX_NAMESPACES.lock().get(&box_id).cloned() {
+        return existing;
+    }
     let ns = Arc::new(Namespace::new(box_id));
     if root_dir != "/"
         && let Some(root_fs) = get_root_fs() {

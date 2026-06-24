@@ -190,7 +190,16 @@ impl ProcessChannel {
             } else {
                 buf.extend(data);
             }
-        })
+        });
+
+        // Wake any thread blocked in poll/ppoll on its stdin (e.g. busybox sh over
+        // sshd: write_to_process_stdin fills this buffer, but a process sleeping in
+        // ppoll(fd 0) only wakes when a registered poller is notified). Without this
+        // the shell never sees typed input. Mirrors the stdout `write` wake path.
+        let mut pollers = self.pollers.lock();
+        while let Some(tid) = pollers.pop_first() {
+            crate::threading::get_waker_for_thread(tid).wake();
+        }
     }
 
     /// Read from stdin buffer (process reads from SSH input)
