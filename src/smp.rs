@@ -30,9 +30,9 @@ use akuma_exec::mmu::{attr_index, flags, phys_to_virt, MAIR_DEVICE_NGNRNE, MAIR_
 // Pure data plane + protocol lives in the host-testable `akuma-smp` crate; this
 // module is the kernel glue (asm, PSCI, page tables, the pump).
 use akuma_smp::{
-    partition, Command, CoreStateMachine, Event, MachineConfig, Range, ENF_FAULTED, ENF_LEAKED,
-    ENF_TESTING, MAGIC, MAX_CORES, MSG_PRESSURE, MSG_REPAID, STATE_BOOTING, STATE_OFFLINE,
-    STATE_ONLINE,
+    partition, Command, ConsoleRing, CoreStateMachine, Event, MachineConfig, Range, ENF_FAULTED,
+    ENF_LEAKED, ENF_TESTING, MAGIC, MAX_CORES, MSG_PRESSURE, MSG_REPAID, STATE_BOOTING,
+    STATE_OFFLINE, STATE_ONLINE,
 };
 use crate::console;
 use crate::pmm;
@@ -55,6 +55,102 @@ struct SyncConfig(UnsafeCell<MachineConfig>);
 unsafe impl Sync for SyncConfig {}
 
 static MACHINE_CONFIG: SyncConfig = SyncConfig(UnsafeCell::new(MachineConfig::new()));
+
+// ============================================================================
+// Per-core console output (docs/MULTIKERNEL.md §8.2)
+//
+// A secondary's restricted table does NOT map the UART (it is the BSP-owned
+// console device), so the secondary can't `console::print` directly. Instead each
+// secondary routes its console output to its per-core `ConsoleRing` in the shared
+// descriptor; a BSP drainer thread reads those rings and writes the UART. This is
+// the async, fire-and-forget counterpart to the synchronous control inbox — and
+// the natural seam to later move the console to a userspace server.
+// ============================================================================
+
+/// PA of THIS core's console output ring (a `ConsoleRing` in the shared descriptor),
+/// or 0 to write the UART directly. A `.bss` static → replicated per core by R1, so
+/// each secondary sets only ITS OWN copy at bringup; the BSP's stays 0 (UART owner).
+static CONSOLE_RING_PA: AtomicUsize = AtomicUsize::new(0);
+
+/// Route this core's `console::print` output to its per-core console ring. Called
+/// once by a secondary during bringup, after its restricted table maps the shared
+/// descriptor and before it prints anything.
+fn set_console_ring(pa: usize) {
+    CONSOLE_RING_PA.store(pa, Ordering::Release);
+}
+
+/// Console output hook, called from `console::emit`. If this core has a console ring
+/// (a secondary), append `bytes` to it and return `true`; otherwise return `false`
+/// so the caller writes the UART directly (the BSP / pre-bringup path). Never blocks:
+/// a full ring drops the overflow.
+pub fn console_emit(bytes: &[u8]) -> bool {
+    let pa = CONSOLE_RING_PA.load(Ordering::Acquire);
+    if pa == 0 {
+        return false;
+    }
+    // SAFETY: `pa` is a `ConsoleRing` inside the shared descriptor, mapped RW in this
+    // core's restricted table. IRQs off so this core is the sole producer (SPSC).
+    let ring = unsafe { &*(pa as *const ConsoleRing) };
+    crate::irq::with_irqs_disabled(|| {
+        ring.write(bytes);
+    });
+    true
+}
+
+/// Drain every secondary core's console ring to the UART (console-owner = BSP).
+/// Reads up to a page at a time and writes the raw bytes (the producer frames its
+/// own lines), looping per core until its ring is empty.
+fn drain_console_rings() {
+    // SAFETY: descriptor is initialized and identity-mapped on the BSP.
+    let cfg = unsafe { &*MACHINE_CONFIG.0.get() };
+    let num_cores = cfg.num_cores as usize;
+    let bsp_idx = (read_mpidr() & 0xff) as usize;
+    let mut buf = [0u8; 4096];
+    for idx in 0..num_cores.min(MAX_CORES) {
+        if idx == bsp_idx {
+            continue;
+        }
+        loop {
+            let n = cfg.console_rings[idx].read(&mut buf);
+            if n == 0 {
+                break;
+            }
+            console::print_bytes(&buf[..n]);
+        }
+    }
+}
+
+/// Spawn the BSP console drainer (no-op single-core). It forwards secondaries' console
+/// output to the UART: drains each ring to empty, then yields — so output appears
+/// within a scheduler quantum and the 4 KiB rings never overflow under normal logging.
+/// (Throttling to a coarser cadence + a coalesced doorbell wake is a future
+/// optimization, §8.2.)
+///
+/// A SYSTEM thread (kernel stack, like the SSH server), spawned from `run_async_main`
+/// AFTER preemption is live — spawning a kernel loop into a *user* slot before the
+/// scheduler runs dispatches it with a poison PC. The producer side is each
+/// secondary's `console::print`, routed to its ring by `console_emit`.
+pub fn start_console_drainer() {
+    if !PROBED.load(Ordering::Acquire) || NUM_CORES.load(Ordering::Relaxed) <= 1 {
+        return;
+    }
+    let spawned = akuma_exec::threading::spawn_system_thread_fn(|| loop {
+        drain_console_rings();
+        akuma_exec::threading::yield_now();
+    });
+    match spawned {
+        Ok(tid) => {
+            console::print("[SMP] console drainer thread spawned (tid ");
+            console::print_dec(tid);
+            console::print(")\n");
+        }
+        Err(e) => {
+            console::print("[SMP] console drainer spawn FAILED: ");
+            console::print(e);
+            console::print("\n");
+        }
+    }
+}
 
 // DTB snapshot, taken in `probe_dtb` BEFORE the heap allocator can overwrite the
 // DTB (on large-RAM configs QEMU places it exactly at heap_start). `bringup_
@@ -1078,6 +1174,11 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
         unsafe { core::ptr::write_volatile(percpu as *mut u64, MAGIC ^ core_idx as u64); }
     }
 
+    // §8.2 — route our console output to our per-core ring in the shared descriptor
+    // (the UART is unmapped here; the BSP drains the ring to it). Set BEFORE any
+    // `console::print` below, so a secondary can finally report for itself.
+    set_console_ring(core::ptr::from_ref(&cfg.console_rings[core_idx]) as usize);
+
     // R1 — per-core replication proof: mutate a shared-code `.data` static. With the
     // writable window replicated, this hits OUR private copy (which starts from the
     // pristine snapshot value REPL_TEST_INIT), so we read back INIT+1 while the BSP's
@@ -1095,6 +1196,13 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
     // isolated alloc works (records the result to PerCpu for the BSP). Done BEFORE
     // announcing Online so the BSP can verify it synchronously once it sees Online.
     run_r2_test(cc.ram_base as usize, cc.ram_len as usize, cc.kernel_end as usize, percpu);
+
+    // First words a secondary ever speaks for itself — proving the §8.2 console path
+    // end to end: this `print` lands in our console ring; the BSP drainer thread (not
+    // yet spawned — these bytes wait in the ring) later forwards them to the UART.
+    console::print("[core ");
+    console::print_dec(core_idx);
+    console::print("] per-core runtime online: pmm + heap + console (via ring)\n");
 
     // Announce Online from the isolated context (Release orders the enforcement
     // result + PerCpu marker before the BSP's Acquire load of `state`).

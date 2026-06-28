@@ -6,6 +6,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64};
 
+use crate::console_ring::ConsoleRing;
 use crate::ring::Ring;
 
 /// Maximum physical PEs the descriptor describes.
@@ -93,8 +94,13 @@ pub struct MachineConfig {
     /// In the SHARED descriptor (not private) precisely so peers may read it
     /// without violating isolation — a stalled counter ⇒ that core is offline.
     pub heartbeat: [AtomicU64; MAX_CORES],
-    /// Per-core message inbox (the ONLY cross-core data path).
+    /// Per-core message inbox (the synchronous control/protocol data path).
     pub inboxes: [Ring; MAX_CORES],
+    /// Per-core async console output ring (§8.2): a non-owner core writes its
+    /// console bytes here (fire-and-forget, batched) and the console-owner core
+    /// (core 0, UART owner) drains them. Separate from `inboxes` so high-volume
+    /// console traffic never floods or delays low-rate control messages.
+    pub console_rings: [ConsoleRing; MAX_CORES],
 }
 
 impl Default for MachineConfig {
@@ -104,7 +110,11 @@ impl Default for MachineConfig {
 }
 
 impl MachineConfig {
+    // The descriptor is only ever a `static` (the per-core console rings make it
+    // ~tens of KiB); it is never actually placed on a stack, so the large-array lint
+    // on the const initializer below is a false positive here.
     #[must_use]
+    #[allow(clippy::large_stack_arrays)]
     pub const fn new() -> Self {
         Self {
             enforcement_results: [const { AtomicU32::new(ENF_TESTING) }; MAX_CORES],
@@ -115,6 +125,7 @@ impl MachineConfig {
             cores: [const { CoreConfig::new() }; MAX_CORES],
             heartbeat: [const { AtomicU64::new(0) }; MAX_CORES],
             inboxes: [const { Ring::new() }; MAX_CORES],
+            console_rings: [const { ConsoleRing::new() }; MAX_CORES],
         }
     }
 }
@@ -131,11 +142,18 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_fits_one_page() {
-        // align(4096) rounds size up to a whole page; the kernel maps that many
-        // pages as the shared window. Keep it to a single page.
-        assert_eq!(core::mem::size_of::<MachineConfig>(), 4096);
+    fn descriptor_is_page_aligned_and_whole_pages() {
+        // align(4096) rounds the size up to whole pages; the kernel maps exactly
+        // that many pages as the shared window (`map_range_4k(cfg_pa, cfg_len)`), so
+        // the size MUST stay a page multiple. With the per-core console rings
+        // (CONSOLE_RING_CAP each) it is now several pages, not one.
+        let size = core::mem::size_of::<MachineConfig>();
         assert_eq!(core::mem::align_of::<MachineConfig>(), 4096);
+        assert_eq!(size % 4096, 0, "descriptor must be a whole number of pages");
+        // The console rings dominate the size; sanity-bound it so an accidental
+        // blow-up (e.g. a giant CONSOLE_RING_CAP) is caught here, not at boot.
+        let upper = (MAX_CORES * crate::CONSOLE_RING_CAP) + 8192;
+        assert!(size <= upper, "descriptor {size} bytes exceeds {upper}");
     }
 
     #[test]

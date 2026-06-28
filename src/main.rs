@@ -1188,6 +1188,13 @@ fn run_async_main() -> ! {
     #[cfg(feature = "rump")]
     rump_proxy::run_demo();
 
+    // Multikernel: start the console drainer now that preemption is live and the BSP
+    // can spawn system threads. It forwards secondary cores' per-core console rings
+    // (§8.2) to the UART; secondaries have been buffering output since bringup.
+    // (No-op single-core.)
+    #[cfg(kernel_smp)]
+    smp::start_console_drainer();
+
     // Initialize SSH host key
     ssh::init_host_key();
 

@@ -429,6 +429,21 @@ The same append-ring pattern generalizes to any output-only, no-reply sink (kern
 metrics). Inbound console (keyboard/stdin) — if needed — stays synchronous (§8.1), since the
 reader blocks for input.
 
+**DONE (2026-06-29).** Implemented as `akuma_smp::ConsoleRing` (a host-tested SPSC byte ring,
+`CONSOLE_RING_CAP` = one 4 KiB page per core) in `MachineConfig::console_rings[MAX_CORES]`. The
+kernel `console::print`/`print_dec`/… all funnel through one `emit()` chokepoint; on a secondary
+whose per-core ring is set (`smp::set_console_ring`, a replicated `.bss` static so each core sets
+only its own), `emit` appends to that ring and returns — the UART is unmapped in the secondary's
+restricted table. A BSP **drainer system thread** (`smp::start_console_drainer`, spawned from
+`run_async_main` once preemption is live — like the SSH server) reads each ring a page at a time
+and writes the UART. Why this shape and not "just messages on the inbox": console is high-volume,
+so a 16-byte `Msg` per write would be tiny and would flood the low-rate control inbox; a dedicated
+byte ring **is** the batched form of "send console to the owner kernel," and is the seam to later
+move the console to a userspace server. Verified SMP=2/4: each secondary prints `[core N] …` for
+itself (buffered in its ring from bringup, flushed when the drainer starts); full boot to SSH
+intact. NB: the producer drops on a full ring (no backpressure-yield yet) and the drainer drains
+every scheduler quantum (no coalesced-doorbell throttle yet) — both noted future tweaks.
+
 ---
 
 ## 9. Dynamic memory renegotiation (later)

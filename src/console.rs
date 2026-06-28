@@ -63,20 +63,44 @@ static UART: Uart = Uart::new(akuma_exec::mmu::DEV_UART_VA);
 // Public API - Safe wrappers around UART operations
 // ============================================================================
 
-/// Print a string to the console.
-/// Disables IRQs to prevent timer preemption from interleaving output
-/// of two threads mid-message.
-pub fn print(s: &str) {
+/// Single console output chokepoint. On a secondary core whose per-core console ring
+/// is set (multikernel §8.2) the bytes are appended to that ring (the UART is not
+/// mapped in the secondary's restricted table; the BSP drains the ring to the UART);
+/// otherwise — the BSP, or any pre-bringup path — they go straight to the UART. IRQs
+/// are disabled across the UART path so a timer preemption can't interleave two
+/// threads' output mid-message.
+#[inline]
+fn emit(bytes: &[u8]) {
+    #[cfg(kernel_smp)]
+    if crate::smp::console_emit(bytes) {
+        return;
+    }
     crate::irq::with_irqs_disabled(|| {
-        for c in s.bytes() {
-            UART.write(c);
+        for &b in bytes {
+            UART.write(b);
         }
     });
 }
 
+/// Write raw bytes to the console. Used by the multikernel console drainer to forward
+/// a secondary's ring contents, which may not be valid UTF-8 across a chunk boundary.
+/// (Only the `smp` build has a caller; gated so the default build doesn't see it as
+/// dead code.)
+#[cfg(kernel_smp)]
+pub fn print_bytes(bytes: &[u8]) {
+    emit(bytes);
+}
+
+/// Print a string to the console.
+/// Disables IRQs to prevent timer preemption from interleaving output
+/// of two threads mid-message.
+pub fn print(s: &str) {
+    emit(s.as_bytes());
+}
+
 /// Print a single character
 pub fn print_char(c: char) {
-    UART.write(c as u8);
+    emit(&[c as u8]);
 }
 
 /// Print a number in hexadecimal (no heap allocation)
@@ -87,7 +111,7 @@ pub fn print_hex(n: u64) {
     let mut val = n;
 
     if val == 0 {
-        UART.write(b'0');
+        emit(b"0");
         return;
     }
 
@@ -97,9 +121,7 @@ pub fn print_hex(n: u64) {
         val >>= 4;
     }
 
-    for c in &buf[i..] {
-        UART.write(*c);
-    }
+    emit(&buf[i..]);
 }
 
 /// Print a number in decimal (no heap allocation)
@@ -109,7 +131,7 @@ pub fn print_dec(n: usize) {
     let mut val = n;
 
     if val == 0 {
-        UART.write(b'0');
+        emit(b"0");
         return;
     }
 
@@ -119,9 +141,7 @@ pub fn print_dec(n: usize) {
         val /= 10;
     }
 
-    for c in &buf[i..] {
-        UART.write(*c);
-    }
+    emit(&buf[i..]);
 }
 
 /// Print a u64 in decimal (no heap allocation)
@@ -131,7 +151,7 @@ pub fn print_u64(n: u64) {
     let mut val = n;
 
     if val == 0 {
-        UART.write(b'0');
+        emit(b"0");
         return;
     }
 
@@ -141,9 +161,7 @@ pub fn print_u64(n: u64) {
         val /= 10;
     }
 
-    for c in &buf[i..] {
-        UART.write(*c);
-    }
+    emit(&buf[i..]);
 }
 
 // ============================================================================
