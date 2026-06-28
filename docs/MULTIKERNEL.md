@@ -1,9 +1,24 @@
 # Akuma Multikernel — One Kernel Per Core
 
-**Status:** In progress — §11 build gating + **M0 (second core spins) DONE** (2026-06-28),
-verified under `SMP=2`: core 1 wakes via PSCI `CPU_ON` (hvc), reports `Online`, BSP confirms.
-Build with `scripts/build_smp.sh`; boot with `scripts/run_smp.sh` (or `SMP=2 cargo run
---profile release-smp --features smp`). M1–M4 pending (see §12).
+**Status:** In progress (2026-06-29), all behind `cfg(kernel_smp)`; the default build is
+untouched. Verified under QEMU `SMP=4 @ 2 GB`:
+- **§11 build gating** — `smp` feature + `release-smp` profile.
+- **M0** — secondaries wake via PSCI `CPU_ON` (hvc), report `Online`.
+- **M1 isolation** — each secondary runs on its OWN restricted page table (shared RO code +
+  descriptor + private stack/PerCpu; peers UNMAPPED). Hardware isolation is **proven**: a
+  deliberate cross-core read **faults**. (Per-core `pmm`/heap/scheduler over a real partition
+  is still TODO — see §4.2 note; this is a TTBR0 identity kernel, so isolation uses per-core
+  *TTBR0* tables + a private PerCpu chunk, not the original "replicated `.data/.bss` via TTBR1".)
+- **Messaging + protocol** — per-core heartbeat liveness + a lock-free MPSC inbox ring; the
+  debt-based memory-reclaim protocol (§9) runs the host-tested `akuma_smp::CoreStateMachine`
+  over real rings (pressure → debtors repay their creditor → receiver zeroes + reclaims).
+  Values are faked (no per-core PMM yet) — logged only — but the protocol *logic* is the
+  simulator-validated code.
+
+Build with `scripts/build_smp.sh`; boot with `scripts/run_smp.sh` (or `SMP=N cargo run
+--profile release-smp --features smp`). Host-test/simulate the protocol with no QEMU:
+`cargo test -p akuma-smp --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)`. Remaining:
+per-core PMM (M1c), the SGI doorbell (M2), roles + forwarding (M3, §10), dynamic memory (M4).
 **Author:** design notes, 2026-06-28
 **Scope:** AArch64 (QEMU virt). A shared-nothing, message-passing multikernel where each
 physical core boots its own kernel instance ("a container per core"), instead of one
@@ -288,15 +303,18 @@ descriptor.
 
 ---
 
-> **Implementation note (2026-06-28):** the pure, host-testable half of the SMP
-> subsystem now lives in `crates/akuma-smp` (`no_std`): the lock-free MPSC `Ring`,
-> the `MachineConfig` descriptor, `partition()`, and a **sans-IO `CoreBrain` state
-> machine** for the debt-based memory-reclaim protocol (§9) — driven by `step(Event,
-> emit)` so the identical, alloc-free logic runs in an isolated secondary *and* in a
-> host simulator. `cargo test -p akuma-smp` exercises the ring under real concurrent
-> threads and simulates the protocol across N cores (conservation, repay-your-creditor,
-> receiver-zeroing) with zero QEMU. `src/smp.rs` is the kernel glue (asm, PSCI, page
-> tables, the pump).
+> **Implementation note (2026-06-29):** the pure, host-testable half of the SMP
+> subsystem lives in `crates/akuma-smp` (`no_std`): the lock-free MPSC `Ring`, the
+> `MachineConfig` descriptor, `partition()`, and a **sans-IO `CoreStateMachine`** —
+> one core's decision logic for multi-core cooperation (today the debt-based reclaim
+> protocol of §9; the place that will grow leadership/failover, §12). It is driven by
+> `step(Event, &mut emit)`, where `emit` receives `Command`s, so the identical,
+> **alloc-free** logic runs in an isolated secondary (no heap mapped) *and* in a host
+> simulator. `cargo test -p akuma-smp` exercises the ring under real concurrent
+> threads and simulates the protocol across N cores (memory conservation,
+> repay-your-creditor-not-the-requester, receiver-zeroing) with zero QEMU. `src/smp.rs`
+> is the kernel glue (asm, PSCI, page tables, and the pump that feeds the state machine
+> real events and carries out its commands over the rings).
 
 ## 7. Message passing (reuse the rump sysproxy)
 
@@ -516,7 +534,7 @@ target configuration realized at **M3**; M0–M2 are the bringup/isolation/trans
 |---|---|---|
 | **M0 — second core spins** ✅ | Core 1 wakes, reads descriptor, parks in a `wfe` loop; BSP sees `state = Online` | PSCI `CPU_ON` (conduit from DTB `/psci`), secondary trampoline (`src/smp.rs`), MPIDR-aff0 core index, descriptor as an identity-mapped `static` (VA==PA → no pre-kernel-gap page needed at M0), x0=`context_id` handoff. Isolation-by-convention (secondaries reuse the BSP boot page tables). |
 | **M1 — isolated second kernel** 🟡 | Each secondary runs on its OWN restricted page table (shared RO code + descriptor page + private stack/PerCpu; peers UNMAPPED) and **hardware-enforced isolation is PROVEN** (a deliberate cross-core read faults). NOTE: this codebase is a TTBR0 identity-mapped kernel, so M1 is realized by per-core *TTBR0* tables + a per-core `[PerCpu]` private chunk (not the doc's original "replicated .data/.bss via TTBR1" — see §4.2 note). Still TODO for full M1: per-core `pmm::init`/heap/scheduler over a real partition. | per-core restricted TTBR0 tables (`build_isolated_table`), `secondary_enter_isolated` (TTBR0+SP switch, **`isb` after `msr ttbr0` is mandatory** or the global 1 GB boot block survives in the TLB and isolation leaks), per-core VBAR enforcement self-test |
-| **M2 — ping-pong** | Core 0 ↔ Core 1 exchange a message over a shared ring + SGI doorbell | fix `trigger_sgi()` affinity targeting, `CoreTransport` over ring, SGI handler drain |
+| **M2 — ping-pong** 🟡 | Cores exchange messages over a shared ring — DONE (lock-free MPSC `Ring`, non-blocking, **poll-drained** each loop pass; the debt-protocol pressure/repay traffic rides it). REMAINING: the **SGI doorbell** (so an idle core is woken rather than polling) + `trigger_sgi()` affinity targeting (today hardcoded to PE0). | lock-free MPSC `Ring` ✅, poll drain ✅; TODO: fix `trigger_sgi()` affinity, SGI handler drain |
 | **M3 — roles + forwarding** | The §10 acceptance test: `hello` + `curl` pinned to core 1 | role table, VFS-read forwarding (first), syscall-forwarding stubs (§8.1), console append ring (§8.2), spawn/exit messages, reuse sysproxy marshaling |
 | **M4 — dynamic memory** | Core A releases pages to Core B at runtime | `ReleasePages`/`AcceptPages` messages, unmap-flush-remap handshake |
 
@@ -571,6 +589,8 @@ built early; this note exists only to avoid foreclosing it.
 
 | Concern | Location |
 |---|---|
+| SMP kernel glue (bringup, trampoline, page tables, pump) | `src/smp.rs` |
+| SMP pure logic (ring, descriptor, partition, `CoreStateMachine`) | `crates/akuma-smp/` |
 | Boot assembly entry, x0 handoff | `src/boot.rs:61`, `src/main.rs:146` |
 | Memory detection (DTB) | `src/main.rs:193` |
 | Memory layout computation | `src/main.rs:270` |

@@ -1,6 +1,9 @@
-//! The debt-based memory-reclaim protocol as a **sans-IO** state machine.
+//! [`CoreStateMachine`] — one core's decision logic for multi-core cooperation,
+//! as a **sans-IO** state machine. Today it implements the debt-based memory-reclaim
+//! protocol (§9); it is the place that will grow to make the rest of the inter-core
+//! coordination decisions (liveness/failover, leadership — §12).
 //!
-//! [`CoreBrain::step`] is pure: it consumes an [`Event`] and emits [`Command`]s
+//! [`CoreStateMachine::step`] is pure: it consumes an [`Event`] and emits [`Command`]s
 //! through a caller-supplied closure, doing NO I/O itself (no ring, no PMM, no
 //! console). The same logic therefore runs in two places:
 //! - **kernel**: the pump feeds real events (drained ring messages, pressure
@@ -9,8 +12,8 @@
 //!   in-memory model, so the protocol is developed/tested deterministically.
 //!
 //! It is deliberately **alloc-free / fixed-capacity** (no `Vec`): an isolated
-//! secondary's restricted page table doesn't map the kernel heap, so its brain
-//! must live entirely in its own stack/PerCpu.
+//! secondary's restricted page table doesn't map the kernel heap, so the state
+//! machine must live entirely in its own stack/PerCpu.
 //!
 //! Protocol (docs/MULTIKERNEL.md §9; see the `multikernel_memory_protocol` note):
 //! a core under pressure is low *because it lent pages out*. Pressure is NOT a
@@ -77,7 +80,7 @@ impl CreditorDebt {
 }
 
 /// One core's view of the protocol: its own free pool plus what it owes each peer.
-pub struct CoreBrain {
+pub struct CoreStateMachine {
     core_id: u32,
     num_cores: usize,
     free_pages: u64,
@@ -90,7 +93,7 @@ pub struct CoreBrain {
     signaled: bool,
 }
 
-impl CoreBrain {
+impl CoreStateMachine {
     #[must_use]
     pub fn new(core_id: u32, num_cores: usize, free_pages: u64, low_watermark: u64) -> Self {
         Self {
@@ -188,14 +191,14 @@ mod tests {
     /// of every range a receiver zeroed. Rounds are barriers — commands emitted this
     /// round are delivered for the next — so behavior is reproducible.
     struct Sim {
-        brains: Vec<CoreBrain>,
+        brains: Vec<CoreStateMachine>,
         inbox: Vec<Vec<Event>>,
         /// (receiver_core, range) for every Accept — used to assert receiver-zeroing.
         zeroed: Vec<(u32, Range)>,
     }
 
     impl Sim {
-        fn new(brains: Vec<CoreBrain>) -> Self {
+        fn new(brains: Vec<CoreStateMachine>) -> Self {
             let n = brains.len();
             Self { brains, inbox: (0..n).map(|_| Vec::new()).collect(), zeroed: Vec::new() }
         }
@@ -209,7 +212,7 @@ mod tests {
         }
 
         fn total_free(&self) -> u64 {
-            self.brains.iter().map(CoreBrain::free_pages).sum()
+            self.brains.iter().map(CoreStateMachine::free_pages).sum()
         }
 
         fn run_round(&mut self) {
@@ -250,7 +253,7 @@ mod tests {
     fn pressure_triggers_repayment_and_conserves_memory() {
         // 3 cores. Core 0 lends 400 to core 1 and 400 to core 2, leaving it low.
         let total = 1000;
-        let brains = (0..3).map(|i| CoreBrain::new(i, 3, total, 300)).collect();
+        let brains = (0..3).map(|i| CoreStateMachine::new(i, 3, total, 300)).collect();
         let mut sim = Sim::new(brains);
         let before = sim.total_free();
 
@@ -283,7 +286,7 @@ mod tests {
     fn debtor_repays_its_creditor_not_the_requester() {
         // Core 1 owes core 0. Core 2 (NOT a creditor of core 1) signals pressure.
         // Core 1 must repay core 0, and core 2 must receive nothing.
-        let brains = (0..3).map(|i| CoreBrain::new(i, 3, 1000, 300)).collect();
+        let brains = (0..3).map(|i| CoreStateMachine::new(i, 3, 1000, 300)).collect();
         let mut sim = Sim::new(brains);
         sim.lend(0, 1, Range { base: 0x5000, len: 200 });
 
@@ -302,7 +305,7 @@ mod tests {
     #[test]
     fn pressure_signal_is_armed_once_per_episode() {
         // A core that stays low should broadcast pressure once, not every tick.
-        let mut brain = CoreBrain::new(0, 3, 100, 300); // already below watermark
+        let mut brain = CoreStateMachine::new(0, 3, 100, 300); // already below watermark
         let mut sends = 0usize;
         for _ in 0..10 {
             brain.step(Event::Tick, &mut |c| {
@@ -317,7 +320,7 @@ mod tests {
 
     #[test]
     fn debt_tracking_is_capacity_bounded() {
-        let mut brain = CoreBrain::new(1, 3, 1000, 300);
+        let mut brain = CoreStateMachine::new(1, 3, 1000, 300);
         // More loans from creditor 0 than MAX_DEBT_RANGES → extras untracked.
         for i in 0..(MAX_DEBT_RANGES as u64 + 3) {
             brain.step(

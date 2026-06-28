@@ -18,16 +18,16 @@
 #[cfg(test)]
 extern crate std;
 
-mod brain;
 mod descriptor;
 mod ring;
+mod state_machine;
 
-pub use brain::{Command, CoreBrain, Event, Range, MAX_DEBT_RANGES};
+pub use state_machine::{Command, CoreStateMachine, Event, Range, MAX_DEBT_RANGES};
 pub use descriptor::{
     CoreConfig, MachineConfig, ENF_FAULTED, ENF_LEAKED, ENF_TESTING, MAGIC, MAX_CORES,
     STATE_BOOTING, STATE_OFFLINE, STATE_ONLINE,
 };
-pub use ring::{Ring, MSG_MEMORY_OFFER, MSG_PRESSURE_REPORT, RING_CAP};
+pub use ring::{Msg, Ring, MSG_PRESSURE, MSG_REPAID, RING_CAP};
 
 /// Carve detected RAM into `num_cores` disjoint, 2 MiB-aligned partitions
 /// (docs/MULTIKERNEL.md §4.1).

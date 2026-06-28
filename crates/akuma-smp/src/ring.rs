@@ -6,26 +6,27 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-// Message kinds for the (stubbed → debt-based) memory-reclaim protocol (§9).
-/// "I'm at `value`% used — debtors, repay your creditors." (The pressure signal.)
-pub const MSG_PRESSURE_REPORT: u32 = 1;
-/// "I can offer `value` MiB." Stub stage only (logged, not enforced); the real
-/// protocol sheds physical ranges directly to creditors instead.
-pub const MSG_MEMORY_OFFER: u32 = 2;
+// Message kinds for the debt-based memory-reclaim protocol (§9). The pressure
+// signal is the trigger; a repayment carries the physical range being returned.
+/// "I'm under pressure — debtors, repay your creditors." Payload unused.
+pub const MSG_PRESSURE: u32 = 1;
+/// A repayment addressed to a creditor: `v0` = range base, `v1` = range length.
+pub const MSG_REPAID: u32 = 2;
 
-/// Inbox capacity. Small — the coordination message rate is low; demo/protocol
-/// traffic is a handful of messages per event, drained every loop pass.
+/// Inbox capacity. Small — the coordination message rate is low; protocol traffic
+/// is a handful of messages per event, drained every loop pass.
 pub const RING_CAP: usize = 8;
 
-/// One message slot. `ready` gates the producer's two-word write from the consumer
+/// One message slot. `ready` gates the producer's payload writes from the consumer
 /// (publish with `Release`, observe with `Acquire`). `word0` packs `(kind << 32) |
-/// from`; `word1` is the payload value.
+/// from`; `v0`/`v1` are two payload words (enough for a `(base, len)` range).
 #[repr(C)]
 pub struct MsgSlot {
     ready: AtomicU32,
     _pad: u32,
     word0: AtomicU64,
-    word1: AtomicU64,
+    v0: AtomicU64,
+    v1: AtomicU64,
 }
 
 impl MsgSlot {
@@ -34,9 +35,19 @@ impl MsgSlot {
             ready: AtomicU32::new(0),
             _pad: 0,
             word0: AtomicU64::new(0),
-            word1: AtomicU64::new(0),
+            v0: AtomicU64::new(0),
+            v1: AtomicU64::new(0),
         }
     }
+}
+
+/// A decoded inbox message: `kind`, sender `from`, and two payload words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Msg {
+    pub kind: u32,
+    pub from: u32,
+    pub v0: u64,
+    pub v1: u64,
 }
 
 /// Bounded MPSC inbox ring. Lives in the SHARED descriptor region; private per-core
@@ -66,7 +77,7 @@ impl Ring {
 
     /// Push a message. Returns `false` (dropped) if the ring is full — never blocks.
     /// The boolean lets a caller observe drops; ignore it for fire-and-forget sends.
-    pub fn push(&self, kind: u32, from: u32, value: u64) -> bool {
+    pub fn push(&self, kind: u32, from: u32, v0: u64, v1: u64) -> bool {
         loop {
             let t = self.tail.load(Ordering::Acquire);
             let h = self.head.load(Ordering::Acquire);
@@ -81,15 +92,16 @@ impl Ring {
                 let slot = &self.slots[(t as usize) % RING_CAP];
                 slot.word0
                     .store((u64::from(kind) << 32) | u64::from(from), Ordering::Relaxed);
-                slot.word1.store(value, Ordering::Relaxed);
+                slot.v0.store(v0, Ordering::Relaxed);
+                slot.v1.store(v1, Ordering::Relaxed);
                 slot.ready.store(1, Ordering::Release);
                 return true;
             }
         }
     }
 
-    /// Pop the next message (owner core only): `(kind, from, value)` or `None`.
-    pub fn pop(&self) -> Option<(u32, u32, u64)> {
+    /// Pop the next message (owner core only), or `None` if empty.
+    pub fn pop(&self) -> Option<Msg> {
         let h = self.head.load(Ordering::Relaxed);
         let t = self.tail.load(Ordering::Acquire);
         if h == t {
@@ -100,10 +112,11 @@ impl Ring {
             return None; // producer claimed the slot but hasn't finished writing
         }
         let w0 = slot.word0.load(Ordering::Relaxed);
-        let value = slot.word1.load(Ordering::Relaxed);
+        let v0 = slot.v0.load(Ordering::Relaxed);
+        let v1 = slot.v1.load(Ordering::Relaxed);
         slot.ready.store(0, Ordering::Release);
         self.head.store(h.wrapping_add(1), Ordering::Release);
-        Some(((w0 >> 32) as u32, w0 as u32, value))
+        Some(Msg { kind: (w0 >> 32) as u32, from: w0 as u32, v0, v1 })
     }
 }
 
@@ -114,12 +127,10 @@ mod tests {
     #[test]
     fn fifo_order() {
         let r = Ring::new();
-        assert!(r.push(MSG_PRESSURE_REPORT, 1, 10));
-        assert!(r.push(MSG_PRESSURE_REPORT, 2, 20));
-        assert!(r.push(MSG_MEMORY_OFFER, 3, 30));
-        assert_eq!(r.pop(), Some((MSG_PRESSURE_REPORT, 1, 10)));
-        assert_eq!(r.pop(), Some((MSG_PRESSURE_REPORT, 2, 20)));
-        assert_eq!(r.pop(), Some((MSG_MEMORY_OFFER, 3, 30)));
+        assert!(r.push(MSG_PRESSURE, 1, 0, 0));
+        assert!(r.push(MSG_REPAID, 2, 0x1000, 400));
+        assert_eq!(r.pop(), Some(Msg { kind: MSG_PRESSURE, from: 1, v0: 0, v1: 0 }));
+        assert_eq!(r.pop(), Some(Msg { kind: MSG_REPAID, from: 2, v0: 0x1000, v1: 400 }));
         assert_eq!(r.pop(), None);
     }
 
@@ -127,23 +138,20 @@ mod tests {
     fn full_ring_drops_never_blocks() {
         let r = Ring::new();
         for i in 0..RING_CAP {
-            assert!(r.push(MSG_MEMORY_OFFER, 0, i as u64), "slot {i} should fit");
+            assert!(r.push(MSG_REPAID, 0, i as u64, 1), "slot {i} should fit");
         }
-        // One past capacity is dropped, not blocked.
-        assert!(!r.push(MSG_MEMORY_OFFER, 0, 999));
-        // Draining one frees exactly one slot.
-        assert_eq!(r.pop(), Some((MSG_MEMORY_OFFER, 0, 0)));
-        assert!(r.push(MSG_MEMORY_OFFER, 0, 1000));
-        assert!(!r.push(MSG_MEMORY_OFFER, 0, 1001));
+        assert!(!r.push(MSG_REPAID, 0, 999, 1)); // past capacity → dropped, not blocked
+        assert_eq!(r.pop(), Some(Msg { kind: MSG_REPAID, from: 0, v0: 0, v1: 1 }));
+        assert!(r.push(MSG_REPAID, 0, 1000, 1)); // one drained → one fits
+        assert!(!r.push(MSG_REPAID, 0, 1001, 1));
     }
 
     #[test]
     fn wraparound_preserves_order() {
         let r = Ring::new();
-        // Push/pop far more than RING_CAP to force the indices to wrap.
         for i in 0..(RING_CAP * 13) as u64 {
-            assert!(r.push(MSG_MEMORY_OFFER, 7, i));
-            assert_eq!(r.pop(), Some((MSG_MEMORY_OFFER, 7, i)));
+            assert!(r.push(MSG_REPAID, 7, i, i * 2));
+            assert_eq!(r.pop(), Some(Msg { kind: MSG_REPAID, from: 7, v0: i, v1: i * 2 }));
         }
         assert_eq!(r.pop(), None);
     }
@@ -163,21 +171,19 @@ mod tests {
             let r = Arc::clone(&ring);
             producers.push(thread::spawn(move || {
                 for seq in 0..PER {
-                    // Retry on full (backpressure) so nothing is lost in the test.
-                    while !r.push(MSG_MEMORY_OFFER, p, seq) {
+                    while !r.push(MSG_REPAID, p, seq, 0) {
                         std::hint::spin_loop();
                     }
                 }
             }));
         }
 
-        // Single consumer drains until it has every (producer, seq) pair.
         let total = u64::from(PRODUCERS) * PER;
         let mut seen: HashSet<(u32, u64)> = HashSet::new();
         while (seen.len() as u64) < total {
-            if let Some((_kind, from, seq)) = ring.pop() {
-                assert!(from < PRODUCERS);
-                assert!(seen.insert((from, seq)), "duplicate ({from}, {seq})");
+            if let Some(m) = ring.pop() {
+                assert!(m.from < PRODUCERS);
+                assert!(seen.insert((m.from, m.v0)), "duplicate ({}, {})", m.from, m.v0);
             } else {
                 std::hint::spin_loop();
             }
@@ -185,7 +191,6 @@ mod tests {
         for h in producers {
             h.join().unwrap();
         }
-        // No stragglers left, and we saw exactly the full cross-product.
         assert_eq!(ring.pop(), None);
         assert_eq!(seen.len() as u64, total);
     }

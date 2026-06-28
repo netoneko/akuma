@@ -30,8 +30,9 @@ use akuma_exec::mmu::{attr_index, flags, phys_to_virt, MAIR_NORMAL_WB};
 // Pure data plane + protocol lives in the host-testable `akuma-smp` crate; this
 // module is the kernel glue (asm, PSCI, page tables, the pump).
 use akuma_smp::{
-    partition, MachineConfig, ENF_FAULTED, ENF_LEAKED, ENF_TESTING, MAGIC, MAX_CORES,
-    MSG_MEMORY_OFFER, MSG_PRESSURE_REPORT, STATE_BOOTING, STATE_OFFLINE, STATE_ONLINE,
+    partition, Command, CoreStateMachine, Event, MachineConfig, Range, ENF_FAULTED, ENF_LEAKED,
+    ENF_TESTING, MAGIC, MAX_CORES, MSG_PRESSURE, MSG_REPAID, STATE_BOOTING, STATE_OFFLINE,
+    STATE_ONLINE,
 };
 use crate::console;
 use crate::pmm;
@@ -479,12 +480,14 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
     run_memory_demo(cfg, num_cores, bsp_idx);
 }
 
-/// Stage 3b — stubbed memory-pressure renegotiation demo (§9), non-blocking.
-/// The BSP plays a core under memory pressure: it broadcasts a `PressureReport`
-/// to every secondary and moves on. Each secondary, draining its inbox, replies
-/// with a (made-up) `MemoryOffer` to the BSP's inbox. The BSP then drains its
-/// inbox and logs the offers. Nothing is enforced or acted upon — offers are
-/// logged only. Symmetric in principle: any core can be the one under pressure.
+/// Step 3 — drive the debt-based reclaim protocol (§9) over real rings on real
+/// cores using the **host-tested** `akuma_smp::CoreStateMachine`. The BSP plays the
+/// creditor under pressure: at bringup each secondary's machine was pre-loaded with
+/// a (faked) debt to the BSP; here the BSP broadcasts the pressure signal, each
+/// debtor's machine sheds its debt back (a `Repay` → `MSG_REPAID` on the BSP's
+/// ring), and the BSP's own machine `Accept`s each repayment (zero + reclaim). All
+/// values are faked (no per-core PMM yet) — logged only — but the PROTOCOL LOGIC is
+/// exactly the code the host simulator validates.
 fn run_memory_demo(cfg: &MachineConfig, num_cores: usize, bsp_idx: usize) {
     const FAKED_PRESSURE_PCT: u64 = 30;
 
@@ -492,47 +495,61 @@ fn run_memory_demo(cfg: &MachineConfig, num_cores: usize, bsp_idx: usize) {
         return;
     };
 
-    // Broadcast the pressure report to every secondary (fire-and-forget).
+    // The BSP's own state machine: it lent to each secondary and is now low.
+    let mut bsp_sm = CoreStateMachine::new(bsp_idx as u32, num_cores, FAKED_PRESSURE_PCT, 50);
+
+    // Broadcast the pressure signal to every secondary (fire-and-forget).
     let mut sent = 0;
     for idx in 0..num_cores {
         if idx == bsp_idx {
             continue;
         }
         if let Some(peer) = cfg.inboxes.get(idx)
-            && peer.push(MSG_PRESSURE_REPORT, bsp_idx as u32, FAKED_PRESSURE_PCT)
+            && peer.push(MSG_PRESSURE, bsp_idx as u32, 0, 0)
         {
             sent += 1;
         }
     }
     console::print("[SMP] core ");
     console::print_dec(bsp_idx);
-    console::print(" broadcast PressureReport (");
+    console::print(" broadcast pressure signal (");
     console::print_dec(FAKED_PRESSURE_PCT as usize);
     console::print("% used) to ");
     console::print_dec(sent);
     console::print(" peer(s)\n");
 
-    // Give the spinning secondaries time to drain + reply (non-blocking on our end).
+    // Give the spinning secondaries time to drain + repay (non-blocking on our end).
     let until = crate::timer::uptime_us() + 300_000;
     while crate::timer::uptime_us() < until {
         core::hint::spin_loop();
     }
 
-    // Drain offers and log them (not enforced — just observed).
-    let mut offers = 0;
-    while let Some((kind, from, value)) = bsp_inbox.pop() {
-        if kind == MSG_MEMORY_OFFER {
-            offers += 1;
-            console::print("[SMP]   core ");
-            console::print_dec(from as usize);
-            console::print(" offers ");
-            console::print_dec(value as usize);
-            console::print(" MB (logged only, not enforced)\n");
+    // Drain repayments; feed each to the BSP's state machine. Its `Accept` command
+    // is where the receiver-zeroing happens (faked here = logged).
+    let mut repaid = 0;
+    while let Some(m) = bsp_inbox.pop() {
+        if m.kind != MSG_REPAID {
+            continue;
         }
+        let ev = Event::Repaid { from: m.from, range: Range { base: m.v0, len: m.v1 } };
+        bsp_sm.step(ev, &mut |cmd| {
+            if let Command::Accept { from, range } = cmd {
+                repaid += 1;
+                console::print("[SMP]   core ");
+                console::print_dec(from as usize);
+                console::print(" repaid ");
+                console::print_dec(range.len as usize);
+                console::print(" MB at 0x");
+                console::print_hex(range.base);
+                console::print(" (accepted + zeroed)\n");
+            }
+        });
     }
-    console::print("[SMP] received ");
-    console::print_dec(offers);
-    console::print(" memory offer(s)\n");
+    console::print("[SMP] reclaimed ");
+    console::print_dec(repaid);
+    console::print(" repayment(s); BSP pool now ");
+    console::print_dec(bsp_sm.free_pages() as usize);
+    console::print(" (faked units)\n");
 }
 
 /// Stage 3a — sample every secondary's heartbeat twice (~0.5 s apart) and report
@@ -598,7 +615,8 @@ pub extern "C" fn secondary_rust_start(cfg_pa: usize, core_idx: usize) -> ! {
 /// code (it executes), the descriptor page (`cfg`), and its own PerCpu page. Any
 /// other access (console, heap, PMM, peer state) is UNMAPPED and would fault. So
 /// this deliberately avoids `console`/`alloc`/`pmm`; it talks to the BSP solely
-/// through the descriptor's atomics (and, later, the shared message rings).
+/// through the descriptor's atomics and the shared message rings. It runs the
+/// alloc-free `akuma_smp::CoreStateMachine` for the debt-reclaim protocol.
 #[unsafe(no_mangle)]
 extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
     // SAFETY: cfg page is mapped RW in this core's table.
@@ -626,32 +644,49 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
     // result + PerCpu marker before the BSP's Acquire load of `state`).
     cc.state.store(STATE_ONLINE, Ordering::Release);
 
-    // Stage 3a — busy heartbeat loop (option 1). NO wfe: with no per-core timer or
-    // doorbell, wfe would sleep forever and the heartbeat would stall. We spin: bump
-    // our shared heartbeat slot, then a short delay so it advances at a human rate.
-    // Peers/BSP read this slot to tell "alive" from "wedged". (Pressure/offer
-    // messaging is layered on in 3b.)
     let Some(hb) = cfg.heartbeat.get(core_idx) else {
         loop {
             wfe();
         }
     };
-    // Faked "memory I can spare" = 10% of my partition (MiB). The pressure/offer
-    // exchange is a stub (§9): values are made up and offers are never enforced.
-    let offer_mb = cc.ram_len / (1024 * 1024) / 10;
+
+    // Step 3 — run the host-tested debt-reclaim state machine in the isolated loop.
+    // It is alloc-free, so it lives entirely on this private stack (the kernel heap
+    // is unmapped here). Pre-load a FAKED debt to the BSP (core 0): pretend we
+    // borrowed `borrowed_mb` from it. All units/values are faked (no per-core PMM
+    // yet); the LOGIC is exactly what the host sim validates.
+    const BSP: u32 = 0;
+    let num_cores = cfg.num_cores as usize;
+    let partition_mb = cc.ram_len / (1024 * 1024);
+    let borrowed_mb = partition_mb / 10; // 10% of our partition, "borrowed from BSP"
+    let mut sm = CoreStateMachine::new(core_idx as u32, num_cores, partition_mb, partition_mb / 4);
+    sm.step(
+        Event::Borrowed { creditor: BSP, range: Range { base: cc.ram_base, len: borrowed_mb } },
+        &mut |_| {},
+    );
+
     loop {
         hb.fetch_add(1, Ordering::Relaxed);
 
-        // Stage 3b — drain inbox (non-blocking). A peer under pressure asked for
-        // memory; reply with an offer to ITS inbox. We only ever touch the shared
-        // rings, never the peer's private state.
+        // Drain inbox → drive the state machine (non-blocking). Its `Repay` commands
+        // are shed back to the creditor's ring; we only ever touch the SHARED rings,
+        // never a peer's private state.
         if let Some(inbox) = cfg.inboxes.get(core_idx) {
-            while let Some((kind, from, _value)) = inbox.pop() {
-                if kind == MSG_PRESSURE_REPORT
-                    && let Some(reply_to) = cfg.inboxes.get(from as usize)
-                {
-                    reply_to.push(MSG_MEMORY_OFFER, core_idx as u32, offer_mb);
-                }
+            while let Some(m) = inbox.pop() {
+                let ev = match m.kind {
+                    MSG_PRESSURE => Event::Pressure { from: m.from },
+                    MSG_REPAID => Event::Repaid { from: m.from, range: Range { base: m.v0, len: m.v1 } },
+                    _ => continue,
+                };
+                sm.step(ev, &mut |cmd| {
+                    if let Command::Repay { creditor, range } = cmd
+                        && let Some(to) = cfg.inboxes.get(creditor as usize)
+                    {
+                        to.push(MSG_REPAID, core_idx as u32, range.base, range.len);
+                    }
+                    // Command::Accept (we'd be a creditor) would zero+reclaim here;
+                    // in this demo secondaries are debtors only.
+                });
             }
         }
 
