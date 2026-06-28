@@ -1,6 +1,18 @@
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_profile_size)");
     println!("cargo::rustc-check-cfg=cfg(kernel_profile_extreme)");
+    println!("cargo::rustc-check-cfg=cfg(kernel_smp)");
+
+    // Multikernel (one-kernel-per-core) gate. ALL secondary-core code lives behind
+    // `cfg(kernel_smp)`; with the feature off, none of it compiles and the default
+    // build stays byte-for-byte single-core (docs/MULTIKERNEL.md §11). The `smp`
+    // Cargo feature is the discriminator (the `release-smp` profile only sets
+    // codegen; Cargo profiles cannot auto-enable features), exposed to build
+    // scripts as CARGO_FEATURE_SMP. Selected together by scripts/build_smp.sh.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMP");
+    if std::env::var("CARGO_FEATURE_SMP").is_ok() {
+        println!("cargo:rustc-cfg=kernel_smp");
+    }
 
     // OPT_LEVEL is "z" only for profile.size / profile.extreme-size (opt-level = "z").
     // PROFILE is always "release" for inherited profiles, so we can't use that.

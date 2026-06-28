@@ -1,6 +1,9 @@
 # Akuma Multikernel — One Kernel Per Core
 
-**Status:** Design / not yet implemented
+**Status:** In progress — §11 build gating + **M0 (second core spins) DONE** (2026-06-28),
+verified under `SMP=2`: core 1 wakes via PSCI `CPU_ON` (hvc), reports `Online`, BSP confirms.
+Build with `scripts/build_smp.sh`; boot with `scripts/run_smp.sh` (or `SMP=2 cargo run
+--profile release-smp --features smp`). M1–M4 pending (see §12).
 **Author:** design notes, 2026-06-28
 **Scope:** AArch64 (QEMU virt). A shared-nothing, message-passing multikernel where each
 physical core boots its own kernel instance ("a container per core"), instead of one
@@ -501,7 +504,7 @@ target configuration realized at **M3**; M0–M2 are the bringup/isolation/trans
 
 | Milestone | Goal | Key work |
 |---|---|---|
-| **M0 — second core spins** | Core 1 wakes, reads descriptor, parks in a spin loop; BSP sees `state = Online` | PSCI `CPU_ON`, secondary trampoline, MPIDR read, descriptor in pre-kernel gap, x0 handoff |
+| **M0 — second core spins** ✅ | Core 1 wakes, reads descriptor, parks in a `wfe` loop; BSP sees `state = Online` | PSCI `CPU_ON` (conduit from DTB `/psci`), secondary trampoline (`src/smp.rs`), MPIDR-aff0 core index, descriptor as an identity-mapped `static` (VA==PA → no pre-kernel-gap page needed at M0), x0=`context_id` handoff. Isolation-by-convention (secondaries reuse the BSP boot page tables). |
 | **M1 — isolated second kernel** | Core 1 runs its own PMM + heap + scheduler over its partition; per-core `.data/.bss` via per-core TTBR1; both cores idle independently | per-core page tables, replicated writable sections, per-core PMM/TALC/POOL, per-core GIC redist + timer |
 | **M2 — ping-pong** | Core 0 ↔ Core 1 exchange a message over a shared ring + SGI doorbell | fix `trigger_sgi()` affinity targeting, `CoreTransport` over ring, SGI handler drain |
 | **M3 — roles + forwarding** | The §10 acceptance test: `hello` + `curl` pinned to core 1 | role table, VFS-read forwarding (first), syscall-forwarding stubs (§8.1), console append ring (§8.2), spawn/exit messages, reuse sysproxy marshaling |

@@ -61,7 +61,7 @@ pointers_in_nomem_asm_block = "allow"
 dead_code = "deny"
 unused_imports = "deny"
 unused_variables = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_profile_size)', 'cfg(kernel_profile_extreme)', 'cfg(ext2_fs_cache)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_profile_size)', 'cfg(kernel_profile_extreme)', 'cfg(kernel_smp)', 'cfg(ext2_fs_cache)'] }
 
 [package]
 name = "akuma"
@@ -94,6 +94,15 @@ panic = "immediate-abort"
 [profile.extreme-size]
 inherits = "size"
 
+# Multikernel build (docs/MULTIKERNEL.md §11). Inherits `release` codegen; carries
+# any SMP-specific knobs later. The profile sets codegen, the `smp` FEATURE gates
+# the code — they are selected together by scripts/build_smp.sh:
+#   cargo build --profile release-smp --features smp
+# Off by default until the §10 acceptance test passes; `cargo build --release`
+# is unaffected and the single-core path stays the only path.
+[profile.release-smp]
+inherits = "release"
+
 [features]
 default = [
     "neko",
@@ -105,6 +114,14 @@ default = [
     "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
 ]
 no-tests = ["akuma-net/small-sockets"]
+
+# Multikernel / one-kernel-per-core (docs/MULTIKERNEL.md). NOT in `default`: all
+# secondary-core bringup, the per-core descriptor, PSCI CPU_ON, the message bus
+# and forwarding stubs live behind `cfg(kernel_smp)`, which build.rs emits only
+# when this feature is set (via CARGO_FEATURE_SMP). Paired with the `release-smp`
+# profile by scripts/build_smp.sh. With it off, the default build is byte-for-byte
+# single-core.
+smp = []
 
 # Rump-kernel support: a raw L2 packet path so a userspace NetBSD rump TCP/IP
 # stack can send/receive Ethernet frames. Binds a SECOND virtio-net device

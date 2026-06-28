@@ -56,6 +56,8 @@ mod rump_proxy;
 mod shell;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod shell_tests;
+#[cfg(kernel_smp)]
+mod smp;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod sync_tests;
 mod ssh;
@@ -708,6 +710,13 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Initialize GIC (Generic Interrupt Controller)
     gic::init();
     console::print("GIC initialized\n");
+
+    // Multikernel (docs/MULTIKERNEL.md) — M0: wake secondary cores. They reuse the
+    // BSP's boot page tables (isolation-by-convention) and park after reporting
+    // Online. No-op when QEMU exposes a single CPU (default `-smp 1`). Gated to the
+    // `smp` feature so the default single-core build never compiles it.
+    #[cfg(kernel_smp)]
+    smp::bringup_secondaries(dtb_ptr);
 
     // Set up exception vectors and enable IRQs
     exceptions::init();

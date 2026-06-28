@@ -43,8 +43,18 @@ set -e
 
 MEMORY="${MEMORY:-256M}"
 INSTANCE="${INSTANCE:-0}"
+# Number of CPUs QEMU exposes (-smp N). Default 1 so ordinary `cargo run`/`run
+# --release` stays single-CPU; the multikernel build sets SMP=2+ (scripts/run_smp.sh)
+# to wake secondaries via PSCI CPU_ON. With a single-core kernel, extra CPUs simply
+# stay PSCI-powered-off and idle — harmless — so the gate is convention, not safety.
+SMP="${SMP:-1}"
 ELF="$1"
 BIN="${ELF}.bin"
+
+if ! [[ "$SMP" =~ ^[0-9]+$ ]] || [ "$SMP" -lt 1 ]; then
+  echo "[cargo_runner] SMP must be a positive integer (got '$SMP')" >&2
+  exit 1
+fi
 
 if ! [[ "$INSTANCE" =~ ^[0-9]+$ ]] || [ "$INSTANCE" -gt 98 ]; then
   echo "[cargo_runner] INSTANCE must be an integer 0..98 (got '$INSTANCE')" >&2
@@ -198,10 +208,13 @@ else
   echo "[cargo_runner] accelerator: TCG (software emulation)." >&2
 fi
 
+echo "[cargo_runner] -smp $SMP" >&2
+
 exec qemu-system-aarch64 \
   -semihosting \
   -machine virt,gic-version=3 \
   "${ACCEL_ARGS[@]}" \
+  -smp "$SMP" \
   -m "$MEMORY" \
   -serial mon:stdio \
   -display none \
