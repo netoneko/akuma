@@ -100,6 +100,18 @@ impl Ring {
         }
     }
 
+    /// Whether the ring currently has no messages. Used by a consumer for a
+    /// race-free "check then sleep": a producer that pushes after this returns
+    /// `true` also rings a doorbell SGI, which leaves the consumer's `wfi` wake
+    /// pending — so masking IRQs across `is_empty()` + `wfi` loses no wakeups.
+    /// (A producer mid-`push` that has claimed `tail` but not set `ready` shows as
+    /// non-empty here; the consumer simply loops and `pop` returns `None` until the
+    /// slot is published — a brief spin, never a hang.)
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.head.load(Ordering::Relaxed) == self.tail.load(Ordering::Acquire)
+    }
+
     /// Pop the next message (owner core only), or `None` if empty.
     pub fn pop(&self) -> Option<Msg> {
         let h = self.head.load(Ordering::Relaxed);
@@ -132,6 +144,16 @@ mod tests {
         assert_eq!(r.pop(), Some(Msg { kind: MSG_PRESSURE, from: 1, v0: 0, v1: 0 }));
         assert_eq!(r.pop(), Some(Msg { kind: MSG_REPAID, from: 2, v0: 0x1000, v1: 400 }));
         assert_eq!(r.pop(), None);
+    }
+
+    #[test]
+    fn is_empty_tracks_pending() {
+        let r = Ring::new();
+        assert!(r.is_empty());
+        assert!(r.push(MSG_PRESSURE, 1, 0, 0));
+        assert!(!r.is_empty());
+        assert!(r.pop().is_some());
+        assert!(r.is_empty());
     }
 
     #[test]

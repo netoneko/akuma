@@ -813,8 +813,9 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
         core::arch::asm!("msr cntv_cval_el0, {0}", in(reg) now + TIMER_INTERVAL_TICKS, options(nomem, nostack));
         core::arch::asm!("msr cntv_ctl_el0, {0}", in(reg) 1u64, options(nomem, nostack));
     }
-    // SAFETY: unmask IRQs (clear PSTATE.I) now that the vector + GIC + timer are ready.
-    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)) };
+    // Unmask IRQs now that the vector + GIC + timer are ready. `crate::irq` is
+    // pure asm (no statics), so it is safe to call in this isolated context.
+    crate::irq::enable_irqs();
 
     loop {
         hb.fetch_add(1, Ordering::Relaxed);
@@ -841,12 +842,25 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
             }
         }
 
-        // Sleep until the next INTERRUPT — a timer tick (heartbeat) or a doorbell
-        // SGI (a peer rang us). WFI, not WFE: WFE waits for an *event* (it returns
-        // spuriously / near-immediately here, leaving the core busy-spinning),
-        // whereas WFI truly halts the core until an interrupt is pending.
-        // SAFETY: idles this PE until an IRQ; the timer guarantees periodic wakeups.
+        // Race-free sleep until the next INTERRUPT — a timer tick (heartbeat) or a
+        // doorbell SGI (a peer rang us). WFI, not WFE: WFE waits for an *event* and
+        // returns spuriously (leaving the core busy-spinning); WFI halts until an
+        // interrupt is pending.
+        //
+        // To avoid a lost wakeup if a message lands after the drain above, MASK IRQs
+        // first (`crate::irq` — pure asm, safe here), then re-check the inbox. WFI
+        // still wakes on a pending interrupt even while masked, and any producer that
+        // pushes also rings a doorbell SGI — so a message racing in after the re-check
+        // leaves that SGI pending and WFI returns immediately. Unmasking last takes
+        // the interrupt that woke us.
+        crate::irq::disable_irqs();
+        if cfg.inboxes.get(core_idx).is_some_and(|r| !r.is_empty()) {
+            crate::irq::enable_irqs(); // work arrived — don't sleep, go process it
+            continue;
+        }
+        // SAFETY: WFI wakes on a pending IRQ despite the mask; then unmask to take it.
         unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        crate::irq::enable_irqs();
     }
 }
 
