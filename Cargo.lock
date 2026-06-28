@@ -48,6 +48,7 @@ dependencies = [
  "akuma-net",
  "akuma-rump",
  "akuma-shell",
+ "akuma-smp",
  "akuma-ssh",
  "akuma-ssh-crypto",
  "akuma-terminal",
@@ -131,6 +132,10 @@ dependencies = [
  "embedded-io-async",
  "log",
 ]
+
+[[package]]
+name = "akuma-smp"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-ssh"

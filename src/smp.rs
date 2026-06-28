@@ -24,212 +24,25 @@
 
 use core::arch::global_asm;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use akuma_exec::mmu::{attr_index, flags, phys_to_virt, MAIR_NORMAL_WB};
+// Pure data plane + protocol lives in the host-testable `akuma-smp` crate; this
+// module is the kernel glue (asm, PSCI, page tables, the pump).
+use akuma_smp::{
+    partition, MachineConfig, ENF_FAULTED, ENF_LEAKED, ENF_TESTING, MAGIC, MAX_CORES,
+    MSG_MEMORY_OFFER, MSG_PRESSURE_REPORT, STATE_BOOTING, STATE_OFFLINE, STATE_ONLINE,
+};
 use crate::console;
 use crate::pmm;
 
-/// Maximum physical PEs the descriptor describes. QEMU `virt` packs CPU affinity
-/// as `aff0 = cpu_index` for the first 16 cores (single cluster), so a core's
-/// index into [`MachineConfig::cores`] is `MPIDR_EL1 & 0xff`.
-pub const MAX_CORES: usize = 8;
-
 /// Per-core boot stack size as a power-of-two shift (1 << 14 = 16 KiB). Only the
-/// trampoline + `secondary_rust_start` run on it before M1 hands the core a real
-/// per-core stack, so 16 KiB is ample.
+/// trampoline + `secondary_rust_start` run on it before the core switches to its
+/// private isolated stack, so 16 KiB is ample. (Kernel/asm-only — not in the crate.)
 const SECONDARY_STACK_SHIFT: usize = 14;
-
-/// Sanity magic so a secondary can confirm it read a real descriptor.
-const MAGIC: u64 = 0x414b_554d_414d_4b31; // "AKUMAMK1"
-
-// Core lifecycle states (CoreConfig::state). The BSP watches Offline -> Online.
-const STATE_OFFLINE: u32 = 0;
-const STATE_BOOTING: u32 = 1;
-const STATE_ONLINE: u32 = 2;
 
 /// PSCI `CPU_ON` (SMC64) function id.
 const PSCI_CPU_ON: u64 = 0xC400_0003;
-
-/// Per-core slot in the shared descriptor. `#[repr(C)]` + a fixed layout so the
-/// (future) asm trampoline and Rust agree byte-for-byte.
-#[repr(C)]
-struct CoreConfig {
-    /// MPIDR_EL1 affinity of this PE (PSCI `CPU_ON` target).
-    mpidr: u64,
-    /// PRIVATE physical partition for this core. Reserved at M0 (0); the per-core
-    /// PMM in M1 reads these at runtime (never a compile-time const) so memory
-    /// renegotiation (§9) stays a message-protocol addition, not a format change.
-    ram_base: u64,
-    ram_len: u64,
-    kernel_end: u64,
-    /// Per-core isolated boot-stack top, in the core's PRIVATE chunk (mapped only
-    /// by `ttbr0_phys`). The trampoline switches SP here on the way into isolation.
-    entry_sp: u64,
-    /// Root (L0 PA) of this core's RESTRICTED page table, built by the BSP: shared
-    /// RO kernel code + the descriptor page RW + this core's own stack/PerCpu RW;
-    /// peer memory is UNMAPPED so a stray cross-core access faults (§13 hardware
-    /// isolation). 0 ⇒ no isolated table (secondary falls back to a parked spin on
-    /// the shared boot tables).
-    ttbr0_phys: u64,
-    /// PA of this core's PerCpu page (private; in its chunk). Holds the faked
-    /// memory-pressure figure and per-core counters for the message demo.
-    percpu_phys: u64,
-    /// Offline -> Booting -> Online. Cross-core via inner-shareable coherency.
-    state: AtomicU32,
-    _pad: u32,
-}
-
-impl CoreConfig {
-    const fn new() -> Self {
-        Self {
-            mpidr: 0,
-            ram_base: 0,
-            ram_len: 0,
-            kernel_end: 0,
-            entry_sp: 0,
-            ttbr0_phys: 0,
-            percpu_phys: 0,
-            state: AtomicU32::new(STATE_OFFLINE),
-            _pad: 0,
-        }
-    }
-}
-
-// Message kinds for the (stubbed) memory-renegotiation demo (§9).
-const MSG_PRESSURE_REPORT: u32 = 1; // "I'm at value% used — anyone able to spare memory?"
-const MSG_MEMORY_OFFER: u32 = 2; // "I can offer value MB" (logged only; NOT enforced/used)
-
-/// Inbox ring capacity (power-of-two not required; small — demo rate is low).
-const RING_CAP: usize = 8;
-
-/// One message slot. `ready` gates the producer's two-word write from the
-/// consumer (publish with Release, observe with Acquire). `word0` packs
-/// `(kind << 32) | from`; `word1` is the payload value.
-#[repr(C)]
-struct MsgSlot {
-    ready: AtomicU32,
-    _pad: u32,
-    word0: AtomicU64,
-    word1: AtomicU64,
-}
-impl MsgSlot {
-    const fn new() -> Self {
-        Self { ready: AtomicU32::new(0), _pad: 0, word0: AtomicU64::new(0), word1: AtomicU64::new(0) }
-    }
-}
-
-/// Bounded **MPSC** inbox ring in the SHARED descriptor: many peer cores push,
-/// the owning core pops. Lock-free (producers claim a slot via `tail` CAS), and
-/// NON-BLOCKING — a full ring drops the message rather than ever spinning on a
-/// peer, so a wedged/slow consumer can never stall a producer (the property the
-/// whole message plane depends on).
-#[repr(C)]
-struct Ring {
-    head: AtomicU32, // consumer index (owner only)
-    tail: AtomicU32, // producer index (claimed via CAS by any core)
-    slots: [MsgSlot; RING_CAP],
-}
-impl Ring {
-    const fn new() -> Self {
-        Self {
-            head: AtomicU32::new(0),
-            tail: AtomicU32::new(0),
-            slots: [const { MsgSlot::new() }; RING_CAP],
-        }
-    }
-
-    /// Push a message. Returns `false` (dropped) if the ring is full — never blocks.
-    fn push(&self, kind: u32, from: u32, value: u64) -> bool {
-        loop {
-            let t = self.tail.load(Ordering::Acquire);
-            let h = self.head.load(Ordering::Acquire);
-            if t.wrapping_sub(h) >= RING_CAP as u32 {
-                return false; // full → drop, do not block
-            }
-            if self
-                .tail
-                .compare_exchange(t, t.wrapping_add(1), Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                let slot = &self.slots[(t as usize) % RING_CAP];
-                slot.word0.store((u64::from(kind) << 32) | u64::from(from), Ordering::Relaxed);
-                slot.word1.store(value, Ordering::Relaxed);
-                slot.ready.store(1, Ordering::Release);
-                return true;
-            }
-        }
-    }
-
-    /// Pop the next message (owner core only). `(kind, from, value)` or `None`.
-    fn pop(&self) -> Option<(u32, u32, u64)> {
-        let h = self.head.load(Ordering::Relaxed);
-        let t = self.tail.load(Ordering::Acquire);
-        if h == t {
-            return None;
-        }
-        let slot = &self.slots[(h as usize) % RING_CAP];
-        if slot.ready.load(Ordering::Acquire) == 0 {
-            return None; // producer claimed the slot but hasn't finished writing
-        }
-        let w0 = slot.word0.load(Ordering::Relaxed);
-        let value = slot.word1.load(Ordering::Relaxed);
-        slot.ready.store(0, Ordering::Release);
-        self.head.store(h.wrapping_add(1), Ordering::Release);
-        Some(((w0 >> 32) as u32, w0 as u32, value))
-    }
-}
-
-// Enforcement self-test outcomes (MachineConfig::enforcement_results, offset 0).
-const ENF_TESTING: u32 = 0;
-/// Cross-core access faulted → isolation is hardware-enforced (the good outcome).
-const ENF_FAULTED: u32 = 1;
-/// Cross-core read SUCCEEDED → isolation leaked (the table is too permissive).
-const ENF_LEAKED: u32 = 2;
-
-/// Read-only-after-init machine descriptor + the one SHARED page every core maps.
-///
-/// `align(4096)` rounds the type's size up to a whole page, so the static occupies
-/// its own page(s) with no other `.bss` sharing them — that lets a fully-isolated
-/// secondary map *exactly* this region as its shared window without exposing any
-/// other BSP kernel state. The BSP fills it before any `CPU_ON`; secondaries only
-/// write their own `state`/`enforcement` atomics.
-#[repr(C, align(4096))]
-struct MachineConfig {
-    /// MUST be the first field (byte offset 0): the asm fault handler
-    /// (`smp_sync_handler`) writes `enforcement_results[idx]` via `TPIDR_EL1`
-    /// (= descriptor base) + `idx*4`, so it relies on this being at offset 0.
-    enforcement_results: [AtomicU32; MAX_CORES],
-    magic: u64,
-    version: u32,
-    num_cores: u32,
-    /// Self physical address (lets a secondary re-find the page; sanity only here).
-    config_phys_addr: u64,
-    cores: [CoreConfig; MAX_CORES],
-    /// Per-core liveness heartbeat: each core monotonically bumps its own slot in
-    /// its main loop. Lives in the SHARED descriptor (not private PerCpu) precisely
-    /// so peers may read it without violating isolation — a stalled counter means
-    /// that core is wedged/offline (§12 fault-tolerance hook).
-    heartbeat: [AtomicU64; MAX_CORES],
-    /// Per-core message inbox (the ONLY cross-core data path). All in the shared
-    /// region; private per-core state is never touched by a peer.
-    inboxes: [Ring; MAX_CORES],
-}
-
-impl MachineConfig {
-    const fn new() -> Self {
-        Self {
-            enforcement_results: [const { AtomicU32::new(ENF_TESTING) }; MAX_CORES],
-            magic: 0,
-            version: 0,
-            num_cores: 0,
-            config_phys_addr: 0,
-            cores: [const { CoreConfig::new() }; MAX_CORES],
-            heartbeat: [const { AtomicU64::new(0) }; MAX_CORES],
-            inboxes: [const { Ring::new() }; MAX_CORES],
-        }
-    }
-}
 
 /// `Sync` wrapper: the BSP writes the inner config exactly once (single-threaded,
 /// before any secondary runs); afterwards every access is either a read or a
@@ -474,33 +287,6 @@ fn build_isolated_table(cfg: &mut MachineConfig, idx: usize) -> bool {
     cfg.cores[idx].entry_sp = (stack.addr + STACK_PAGES * PAGE) as u64;
     cfg.cores[idx].percpu_phys = percpu.addr as u64;
     true
-}
-
-/// Carve detected RAM into `num_cores` disjoint, 2 MiB-aligned partitions (§4.1).
-/// Core `i` owns `[ram_base + i*slice, ...)`; the last core absorbs the remainder.
-/// The BSP's partition (core 0) contains the kernel image (loaded at ram_base+1MiB).
-///
-/// M1-step-1 records these bounds in the descriptor (read at RUNTIME, never a
-/// compile-time const — §9 renegotiation prerequisite). It does NOT yet change the
-/// BSP's PMM, which still owns all RAM; handing each core its own `pmm::init` over
-/// its slice is the (page-table-isolation) step that follows.
-fn partition(ram_base: usize, ram_size: usize, num_cores: usize) -> [(u64, u64); MAX_CORES] {
-    const ALIGN: usize = 2 * 1024 * 1024;
-    let mut parts = [(0u64, 0u64); MAX_CORES];
-    if num_cores == 0 {
-        return parts;
-    }
-    let slice = ((ram_size / num_cores) / ALIGN) * ALIGN;
-    for (i, p) in parts.iter_mut().enumerate().take(num_cores) {
-        let base = ram_base + i * slice;
-        let len = if i == num_cores - 1 {
-            (ram_base + ram_size) - base // last core absorbs the remainder
-        } else {
-            slice
-        };
-        *p = (base as u64, len as u64);
-    }
-    parts
 }
 
 /// Snapshot CPU MPIDRs + PSCI conduit from the DTB into module statics. MUST be

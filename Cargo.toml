@@ -11,6 +11,7 @@ default-members = [
     "crates/akuma-net",
     "crates/akuma-rump",
     "crates/akuma-shell",
+    "crates/akuma-smp",
     "crates/akuma-ssh",
     "crates/akuma-ssh-crypto",
     "crates/akuma-terminal",
@@ -120,8 +121,10 @@ no-tests = ["akuma-net/small-sockets"]
 # and forwarding stubs live behind `cfg(kernel_smp)`, which build.rs emits only
 # when this feature is set (via CARGO_FEATURE_SMP). Paired with the `release-smp`
 # profile by scripts/build_smp.sh. With it off, the default build is byte-for-byte
-# single-core.
-smp = []
+# single-core. Pulls in the pure, host-testable coordination crate `akuma-smp`
+# (descriptor, lock-free MPSC inbox, memory-reclaim protocol) only under this
+# feature, so the default build never even compiles it.
+smp = ["dep:akuma-smp"]
 
 # Rump-kernel support: a raw L2 packet path so a userspace NetBSD rump TCP/IP
 # stack can send/receive Ethernet frames. Binds a SECOND virtio-net device
@@ -210,6 +213,9 @@ akuma-exec = { path = "crates/akuma-exec" }
 # `rump` feature needs it directly (akuma-net already pulls it for rump_tap).
 akuma-rump = { path = "crates/akuma-rump", optional = true }
 akuma-isolation = { path = "crates/akuma-isolation" }
+# Pure, host-testable multikernel coordination (descriptor, MPSC ring, reclaim
+# protocol). Optional — only the `smp` feature pulls it in (cfg(kernel_smp) code).
+akuma-smp = { path = "crates/akuma-smp", optional = true }
 talc = "4"
 spinning_top = "0.3"
 fdt = "0.1"

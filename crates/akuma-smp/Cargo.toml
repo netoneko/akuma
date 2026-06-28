@@ -1,0 +1,8 @@
+[package]
+name = "akuma-smp"
+version = "0.1.0"
+edition = "2024"
+description = "Multikernel (one-kernel-per-core) coordination: shared descriptor, lock-free MPSC inbox, and the debt-based memory-reclaim protocol state machine — pure, no_std, and host-simulatable (no QEMU needed)."
+
+[lints]
+workspace = true
