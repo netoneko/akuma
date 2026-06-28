@@ -187,18 +187,23 @@ impl CoreStateMachine {
             }
             Event::Pressure { from: _ } => {
                 // Repay OUR creditors (single-hop), not necessarily the requester.
-                // Voluntary full repayment of what we can return.
+                // Shed what we can afford; RETAIN debts we can't (compact the array
+                // in place) so they're repaid on a later pressure signal — never
+                // silently forgotten.
                 for c in 0..self.num_cores {
                     let count = self.debts[c].count;
+                    let mut kept = 0;
                     for i in 0..count {
                         let range = self.debts[c].ranges[i];
-                        // Only shed pages we actually hold free.
                         if self.free_pages >= range.len {
                             emit(Command::Repay { creditor: c as u32, range });
                             self.free_pages -= range.len;
+                        } else {
+                            self.debts[c].ranges[kept] = range; // can't afford — keep
+                            kept += 1;
                         }
                     }
-                    self.debts[c].count = 0;
+                    self.debts[c].count = kept;
                 }
             }
             Event::Repaid { from, range } => {
@@ -421,6 +426,61 @@ mod tests {
         assert!(!sm.peer_dead(2));
         assert!(events.contains(&Command::PeerDown { core: 2 }));
         assert!(events.contains(&Command::PeerUp { core: 2 }));
+    }
+
+    #[test]
+    fn repays_multiple_creditors_on_pressure() {
+        // A debtor that owes two different cores repays BOTH (single-hop, each direct).
+        let mut sm = CoreStateMachine::new(1, 3, 1000, 300);
+        sm.step(Event::Borrowed { creditor: 0, range: Range { base: 0x1000, len: 50 } }, &mut |_| {});
+        sm.step(Event::Borrowed { creditor: 2, range: Range { base: 0x2000, len: 30 } }, &mut |_| {});
+        assert_eq!(sm.free_pages(), 1080);
+
+        let mut repays: Vec<Command> = Vec::new();
+        sm.step(Event::Pressure { from: 0 }, &mut |c| repays.push(c));
+
+        assert!(repays.contains(&Command::Repay { creditor: 0, range: Range { base: 0x1000, len: 50 } }));
+        assert!(repays.contains(&Command::Repay { creditor: 2, range: Range { base: 0x2000, len: 30 } }));
+        assert_eq!(sm.free_pages(), 1000, "shed both back");
+        assert_eq!(sm.debt_range_count(), 0);
+    }
+
+    #[test]
+    fn retains_debt_it_cannot_afford_to_repay() {
+        // If we don't currently hold enough free pages, we must NOT shed (and must
+        // NOT forget the debt) — it's repaid on a later pressure signal.
+        let mut sm = CoreStateMachine::new(1, 3, 1000, 300);
+        // Owe 150, but only 100 free → can't repay yet.
+        sm.step(Event::Borrowed { creditor: 0, range: Range { base: 0x3000, len: 150 } }, &mut |_| {});
+        sm.step(Event::Consumed { pages: 1050 }, &mut |_| {}); // free: 1000+150-1050 = 100
+
+        let mut repays = 0;
+        sm.step(Event::Pressure { from: 0 }, &mut |c| {
+            if matches!(c, Command::Repay { .. }) {
+                repays += 1;
+            }
+        });
+        assert_eq!(repays, 0, "can't afford → don't shed");
+        assert_eq!(sm.debt_range_count(), 1, "debt retained, not forgotten");
+
+        // Later we hold enough again → the retained debt is repaid.
+        sm.step(Event::Borrowed { creditor: 2, range: Range { base: 0x9000, len: 500 } }, &mut |_| {});
+        let mut repaid = Vec::new();
+        sm.step(Event::Pressure { from: 0 }, &mut |c| repaid.push(c));
+        assert!(repaid.contains(&Command::Repay { creditor: 0, range: Range { base: 0x3000, len: 150 } }));
+    }
+
+    #[test]
+    fn consumption_below_watermark_triggers_pressure() {
+        // Using our own pool down past the low watermark makes the next Tick signal.
+        let mut sm = CoreStateMachine::new(0, 3, 400, 300); // free 400 > wm 300
+        let mut sends = 0;
+        sm.step(Event::Tick, &mut |c| if matches!(c, Command::SendPressure { .. }) { sends += 1 });
+        assert_eq!(sends, 0, "above watermark → quiet");
+
+        sm.step(Event::Consumed { pages: 200 }, &mut |_| {}); // free → 200 < 300
+        sm.step(Event::Tick, &mut |c| if matches!(c, Command::SendPressure { .. }) { sends += 1 });
+        assert_eq!(sends, 2, "below watermark → signal both peers once");
     }
 
     #[test]

@@ -146,6 +146,12 @@ unsafe extern "C" {
 /// Minimal unsafe entry point - immediately delegates to safe kernel_main
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
+    // Multikernel: snapshot pristine `.data` BEFORE anything mutates a static, so
+    // each secondary's replicated `.data` starts from correct initial values
+    // (docs/MULTIKERNEL.md §4.2). Must be the very first action. smp-only.
+    #[cfg(kernel_smp)]
+    smp::snapshot_pristine_data();
+
     // Early debug: print raw DTB pointer before anything else
     console::print("DTB ptr from boot (x0 arg): 0x");
     console::print_hex(dtb_ptr as u64);

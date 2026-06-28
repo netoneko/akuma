@@ -183,8 +183,60 @@ const STACK_PAGES: usize = 4;
 unsafe extern "C" {
     /// Linker symbol: first byte of `.data` (page-aligned). Everything below it
     /// (`.text`/`.rodata`, from KERNEL_PHYS_BASE) is read-only shareable code; at
-    /// and above it is BSP-private writable state that secondaries must NOT map.
+    /// and above it is the kernel's WRITABLE window (`.data` then `.bss`).
     static _data_start: u8;
+    /// First byte of `.bss` (= end of `.data`). `[_data_start, __bss_start)` is the
+    /// initialized `.data` we snapshot pristine for per-core replication.
+    static __bss_start: u8;
+    /// End of `.bss` (page-rounded `_kernel_phys_end`). `[_data_start,
+    /// _kernel_phys_end)` is the full writable window replicated per core.
+    static _kernel_phys_end: u8;
+}
+
+/// Pristine snapshot of `.data`, taken by [`snapshot_pristine_data`] at the very
+/// start of boot before anything mutates it. The BSP copies this into each
+/// secondary's private `.data` so its replicated statics start from correct
+/// initial values (not the BSP's mutated runtime state). `.bss` needs no snapshot
+/// (it's zero). Sized to an upper bound of `.data`; a boot guard checks the fit.
+/// In `.bss` itself (so it's NOLOAD — no `.bin` bloat); `smp`-only.
+const DATA_SNAPSHOT_CAP: usize = 512 * 1024;
+struct DataSnapshot(UnsafeCell<[u8; DATA_SNAPSHOT_CAP]>);
+// SAFETY: written once at boot (single-threaded) before any secondary; read-only after.
+unsafe impl Sync for DataSnapshot {}
+static DATA_SNAPSHOT: DataSnapshot = DataSnapshot(UnsafeCell::new([0; DATA_SNAPSHOT_CAP]));
+
+/// Replication self-test static (R1). A `.data` static (non-zero init) so it also
+/// exercises the snapshot path. Each secondary does `fetch_add(1)`; if replication
+/// works, every secondary sees `INIT` then `INIT+1` in ITS OWN copy while the BSP's
+/// copy stays `INIT`. If the static were shared, the BSP's copy would change.
+const REPL_TEST_INIT: u64 = 0xAA00;
+static SMP_REPLICATION_TEST: AtomicU64 = AtomicU64::new(REPL_TEST_INIT);
+/// PerCpu byte offset where a secondary records its replication-test read-back.
+const PERCPU_REPL_TEST: usize = 32;
+
+/// Snapshot pristine `.data` — MUST be the first thing `rust_start` does, before any
+/// code mutates a `.data`/`.bss` static. Copies `[_data_start, __bss_start)` into
+/// `DATA_SNAPSHOT`. Boots-halts if `.data` exceeds the snapshot capacity (so the
+/// cap can't silently truncate). `smp`-only; the default build never calls it.
+pub fn snapshot_pristine_data() {
+    let data_start = &raw const _data_start as usize;
+    let data_end = &raw const __bss_start as usize;
+    let len = data_end - data_start;
+    if len > DATA_SNAPSHOT_CAP {
+        // Can't print safely this early on all paths; just refuse to proceed.
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    // SAFETY: single-threaded at the very start of boot; copying the live `.data`
+    // image into the snapshot buffer before anything mutates it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            data_start as *const u8,
+            DATA_SNAPSHOT.0.get().cast::<u8>(),
+            len,
+        );
+    }
 }
 
 /// Physical/virtual base of the kernel image (identity-mapped; see boot.rs).
@@ -334,6 +386,49 @@ fn map_range_4k(l0_pa: usize, base: usize, len: usize, leaf_flags: u64) -> Optio
     Some(())
 }
 
+/// Map the kernel's writable window `[_data_start, _kernel_phys_end)` (`.data` +
+/// `.bss`) to freshly-allocated PRIVATE pages at the SAME VA in the table rooted at
+/// `l0_pa`. `.data` pages are initialized from the pristine [`DATA_SNAPSHOT`]; `.bss`
+/// pages stay zero. After this, the shared kernel code running on this table sees
+/// its OWN copy of every `static` — the core of per-core isolation (§4.2).
+///
+/// `[skip_va, skip_va+skip_len)` (the SHARED descriptor) is left UNMAPPED here — the
+/// caller maps it shared afterwards. Replicating it would give the secondary a
+/// private, zeroed descriptor and break the cross-core comms contract.
+fn replicate_writable_window(l0_pa: usize, skip_va: usize, skip_len: usize) -> Option<()> {
+    let data_start = &raw const _data_start as usize;
+    let bss_start = &raw const __bss_start as usize;
+    let end = (&raw const _kernel_phys_end as usize).next_multiple_of(PAGE);
+    let snap = DATA_SNAPSHOT.0.get().cast::<u8>();
+    let skip_end = skip_va + skip_len;
+
+    let mut va = data_start; // page-aligned by the linker
+    while va < end {
+        // Skip the shared descriptor's page(s) (mapped shared by the caller).
+        if va < skip_end && va + PAGE > skip_va {
+            va += PAGE;
+            continue;
+        }
+        let page = pmm::alloc_page_zeroed()?; // zeroed → correct for the `.bss` part
+        if va < bss_start {
+            // Copy this page's `.data` bytes from the pristine snapshot.
+            let copy_len = core::cmp::min(PAGE, bss_start - va);
+            // SAFETY: snapshot covers `[0, data_len)`; `page` is identity-mapped on
+            // the BSP, so we can write its initial contents here.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    snap.add(va - data_start),
+                    phys_to_virt(page.addr),
+                    copy_len,
+                );
+            }
+        }
+        map_4k(l0_pa, va, page.addr, pte_rw())?;
+        va += PAGE;
+    }
+    Some(())
+}
+
 /// Build core `idx`'s RESTRICTED page table and private working set. Maps ONLY:
 /// shared kernel code RO+X, the descriptor page RW, and this core's own stack +
 /// PerCpu RW (all identity). Peer partitions and BSP `.data`/`.bss`/heap are left
@@ -353,9 +448,25 @@ fn build_isolated_table(cfg: &mut MachineConfig, idx: usize) -> bool {
         return false;
     }
 
-    // 2. The shared descriptor page (this very struct; identity VA==PA), RW.
+    // 2. R1 — per-core REPLICATED writable window: map [_data_start,
+    // _kernel_phys_end) (the kernel's `.data` + `.bss`) to PRIVATE physical pages
+    // at the SAME kernel VA, so `static PMM`/allocator/etc. resolve to this core's
+    // own instance (docs/MULTIKERNEL.md §4.2) — the same shared code, isolated by
+    // the page tables. `.data` is initialized from the pristine snapshot; `.bss` is
+    // zeroed. This is what lets a secondary later run its own pmm/heap/exec.
+    //
+    // EXCEPTION: the descriptor (`MACHINE_CONFIG`) is itself a `.bss` static, but it
+    // is the SHARED cross-core comms region — it must NOT be replicated. We skip its
+    // page(s) here and map them shared next.
     let cfg_pa = core::ptr::from_ref::<MachineConfig>(cfg) as usize;
-    if map_range_4k(l0_pa, cfg_pa, core::mem::size_of::<MachineConfig>(), pte_rw()).is_none() {
+    let cfg_len = core::mem::size_of::<MachineConfig>();
+    if replicate_writable_window(l0_pa, cfg_pa, cfg_len).is_none() {
+        return false;
+    }
+
+    // 2b. The SHARED descriptor page(s) — map to the BSP's single copy (identity),
+    // overriding any replicated mapping, so every core sees the same rings/state.
+    if map_range_4k(l0_pa, cfg_pa, cfg_len, pte_rw()).is_none() {
         return false;
     }
 
@@ -565,6 +676,19 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
             } else {
                 console::print(" (WARNING: PerCpu marker missing — ran on shared tables?)");
             }
+            // R1: per-core .data/.bss replication. The secondary mutated the shared
+            // static into its OWN copy (→ INIT+1); the BSP's copy must be untouched.
+            let repl = unsafe { core::ptr::read_volatile((percpu + PERCPU_REPL_TEST) as *const u64) };
+            let bsp_copy = SMP_REPLICATION_TEST.load(Ordering::SeqCst);
+            if repl == REPL_TEST_INIT + 1 && bsp_copy == REPL_TEST_INIT {
+                console::print(" [replication: private .data/.bss ✓]");
+            } else {
+                console::print(" [replication: FAILED secondary=0x");
+                console::print_hex(repl);
+                console::print(" bsp=0x");
+                console::print_hex(bsp_copy);
+                console::print(" ✗]");
+            }
         }
         // Stage 2: report the cross-core enforcement self-test outcome.
         match cfg.enforcement_results[idx].load(Ordering::Acquire) {
@@ -762,6 +886,16 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
     if percpu != 0 {
         // SAFETY: percpu page is mapped RW in this core's table.
         unsafe { core::ptr::write_volatile(percpu as *mut u64, MAGIC ^ core_idx as u64); }
+    }
+
+    // R1 — per-core replication proof: mutate a shared-code `.data` static. With the
+    // writable window replicated, this hits OUR private copy (which starts from the
+    // pristine snapshot value REPL_TEST_INIT), so we read back INIT+1 while the BSP's
+    // copy stays INIT. Record the read-back for the BSP to verify.
+    let repl = SMP_REPLICATION_TEST.fetch_add(1, Ordering::SeqCst) + 1;
+    if percpu != 0 {
+        // SAFETY: percpu page is mapped RW in this core's table.
+        unsafe { core::ptr::write_volatile((percpu + PERCPU_REPL_TEST) as *mut u64, repl) };
     }
 
     // Stage 2 — enforcement self-test: prove the MMU FAULTS a cross-core access.

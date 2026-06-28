@@ -14,6 +14,10 @@ untouched. Verified under QEMU `SMP=4 @ 2 GB`:
   over real rings (pressure → debtors repay their creditor → receiver zeroes + reclaims).
   Values are faked (no per-core PMM yet) — logged only — but the protocol *logic* is the
   simulator-validated code.
+- **Per-core runtime (Approach 2, §15) — R1 DONE:** each secondary now gets a PRIVATE copy of
+  the kernel's `.data`/`.bss` at the same VA, so `static PMM`/allocator/`POOL` resolve to its
+  own instance (verified: a secondary mutates a shared static into its private copy; the BSP's
+  stays pristine). This unblocks running a real per-core PMM/heap/exec (R2–R4).
 
 Build with `scripts/build_smp.sh`; boot with `scripts/run_smp.sh` (or `SMP=N cargo run
 --profile release-smp --features smp`). Host-test/simulate the protocol with no QEMU:
@@ -605,3 +609,27 @@ built early; this note exists only to avoid foreclosing it.
 | Transport trait | `crates/akuma-rump/src/sysproxy.rs` |
 | Box / namespace isolation | `src/syscall/container.rs`, `crates/akuma-isolation/src/lib.rs` |
 | Config struct precedent | `src/main.rs:653` (`ExecConfig`) |
+
+---
+
+## 15. Per-core kernel runtime (Approach 2): R1–R4
+
+M1 gave each secondary an *isolated* address space, but its restricted table maps no
+kernel heap/PMM and the kernel's globals (`static PMM`, allocator, `akuma_exec`'s
+`POOL`) live at fixed VAs in `.data`/`.bss` that the secondary doesn't map. To run a
+real **process** on core 1 (M3), the secondary needs its own runtime. The chosen
+mechanism is §4.2's: **replicate the writable sections per core** — map `.data`/`.bss`
+(and heap/stack) to PRIVATE physical pages at the SAME VA, so the *same* shared code
+resolves every `static` to that core's own instance, with zero code changes.
+
+Staged, each independently verifiable:
+
+| Stage | Goal | Notes |
+|---|---|---|
+| **R1 — writable replication** ✅ | Secondary gets a private `.data`/`.bss` at the kernel VA | `snapshot_pristine_data()` (first thing in `rust_start`) copies `.data`→`DATA_SNAPSHOT` before any mutation; `replicate_writable_window()` maps `[_data_start,_kernel_phys_end)` to private pages (`.data` from snapshot, `.bss` zeroed). **The descriptor (`MACHINE_CONFIG`, a `.bss` static) is the one thing that must stay SHARED** — replication skips it and maps it shared. Proof: a secondary mutates a shared static into its private copy; the BSP's copy stays pristine. |
+| **R2 — per-core PMM + heap** | Secondary runs `pmm::init`/`allocator::init` over its partition; `alloc` works, BSP PMM untouched | Identity-map the partition (2 MB blocks); bump-allocate `.data/.bss`/heap/stack/page-tables from the PARTITION; `kernel_end` = end of consumed. Do **not** call `akuma_exec::mmu::init` on a secondary — `extend_boot_ram_identity_map` writes the SHARED boot tables. |
+| **R3 — per-core exec/scheduler** | Secondary runs `akuma_exec` (process table, scheduler) per-core; switches to the main `exceptions.rs` vectors | Its `POOL`/process table are now per-core via replication; preemption via the per-core timer; syscalls trap to the (per-core) handlers. |
+| **R4 — process + forwarding (the demo)** | Spawn `/bin/hello` (then `curl`) pinned to core 1, forwarding `open`/`read`/`write`/sockets to core 0 (§10) | "exec is recursive forwarding": core 1 has no VFS, so loading the ELF forwards `open`/`read` to core 0. Console + sockets likewise. This is the §10 acceptance test. |
+
+**Why R1 is the keystone:** once `static`s are per-core, R2–R4 reuse the *existing*
+kernel init/exec code unchanged — the per-core-ness lives entirely in the page tables.
