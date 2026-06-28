@@ -40,6 +40,11 @@ pub struct Range {
     pub len: u64,
 }
 
+/// After this many consecutive observations of a peer's heartbeat *not* advancing,
+/// we declare it offline (§12 liveness). A live peer bumps its counter every loop,
+/// so any non-advance is suspicious; a few in a row is conclusive.
+pub const DEAD_AFTER_STALE: u32 = 3;
+
 /// Inputs to the state machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -54,6 +59,9 @@ pub enum Event {
     Borrowed { creditor: u32, range: Range },
     /// We consumed `pages` of our own pool (raises our pressure).
     Consumed { pages: u64 },
+    /// An observation of peer `core`'s liveness heartbeat counter (read from the
+    /// shared descriptor). Drives offline detection.
+    PeerHeartbeat { core: u32, value: u64 },
 }
 
 /// Outputs — intents the executor (kernel or sim) carries out.
@@ -65,6 +73,11 @@ pub enum Command {
     Repay { creditor: u32, range: Range },
     /// Accept a repayment from `from`: **zero** `range`, then it's ours again.
     Accept { from: u32, range: Range },
+    /// We now believe peer `core` is offline (its heartbeat stalled). A higher
+    /// layer reacts (re-point caps away from it, drive a reload — §12).
+    PeerDown { core: u32 },
+    /// Peer `core` that we'd declared down is beating again (it was only slow).
+    PeerUp { core: u32 },
 }
 
 #[derive(Clone, Copy)]
@@ -76,6 +89,21 @@ struct CreditorDebt {
 impl CreditorDebt {
     const fn new() -> Self {
         Self { ranges: [Range { base: 0, len: 0 }; MAX_DEBT_RANGES], count: 0 }
+    }
+}
+
+/// Our view of one peer's liveness, updated from `PeerHeartbeat` observations.
+#[derive(Clone, Copy)]
+struct PeerLiveness {
+    last_hb: u64,
+    /// Consecutive observations with no advance.
+    stale: u32,
+    declared_dead: bool,
+}
+
+impl PeerLiveness {
+    const fn new() -> Self {
+        Self { last_hb: 0, stale: 0, declared_dead: false }
     }
 }
 
@@ -91,6 +119,8 @@ pub struct CoreStateMachine {
     debts: [CreditorDebt; MAX_CORES],
     /// Whether we've already broadcast pressure for the current low episode.
     signaled: bool,
+    /// Per-peer liveness tracking, indexed by core id.
+    peers: [PeerLiveness; MAX_CORES],
 }
 
 impl CoreStateMachine {
@@ -103,7 +133,14 @@ impl CoreStateMachine {
             low_watermark,
             debts: [CreditorDebt::new(); MAX_CORES],
             signaled: false,
+            peers: [PeerLiveness::new(); MAX_CORES],
         }
+    }
+
+    /// Whether we currently believe peer `core` is offline.
+    #[must_use]
+    pub fn peer_dead(&self, core: u32) -> bool {
+        self.peers.get(core as usize).is_some_and(|p| p.declared_dead)
     }
 
     #[must_use]
@@ -178,6 +215,25 @@ impl CoreStateMachine {
             Event::Consumed { pages } => {
                 self.free_pages = self.free_pages.saturating_sub(pages);
             }
+            Event::PeerHeartbeat { core, value } => {
+                let Some(p) = self.peers.get_mut(core as usize) else {
+                    return;
+                };
+                if value > p.last_hb {
+                    p.last_hb = value;
+                    p.stale = 0;
+                    if p.declared_dead {
+                        p.declared_dead = false;
+                        emit(Command::PeerUp { core }); // was only slow, not dead
+                    }
+                } else {
+                    p.stale = p.stale.saturating_add(1);
+                    if p.stale >= DEAD_AFTER_STALE && !p.declared_dead {
+                        p.declared_dead = true;
+                        emit(Command::PeerDown { core });
+                    }
+                }
+            }
         }
     }
 }
@@ -245,6 +301,8 @@ mod tests {
                 Command::Accept { from: _, range } => {
                     self.zeroed.push((src, range)); // receiver zeroed it
                 }
+                // Liveness commands aren't part of the debt-flow sim scenarios.
+                Command::PeerDown { .. } | Command::PeerUp { .. } => {}
             }
         }
     }
@@ -316,6 +374,53 @@ mod tests {
         }
         // One episode → 2 peers signaled exactly once (not 10× each).
         assert_eq!(sends, 2);
+    }
+
+    #[test]
+    fn detects_stalled_peer_without_false_positives() {
+        // Core 0 watches cores 1 and 2. Core 1 keeps beating; core 2 freezes after
+        // a few rounds (fault injection) → only core 2 is declared down.
+        let mut sm = CoreStateMachine::new(0, 3, 1000, 300);
+        let mut down: Vec<u32> = Vec::new();
+        let (mut hb1, mut hb2) = (0u64, 0u64);
+        for round in 0..10 {
+            hb1 += 1;
+            if round < 3 {
+                hb2 += 1; // core 2 dies after round 3 — heartbeat frozen thereafter
+            }
+            let mut emit = |c: Command| {
+                if let Command::PeerDown { core } = c {
+                    down.push(core);
+                }
+            };
+            sm.step(Event::PeerHeartbeat { core: 1, value: hb1 }, &mut emit);
+            sm.step(Event::PeerHeartbeat { core: 2, value: hb2 }, &mut emit);
+        }
+        assert_eq!(down.as_slice(), &[2], "only the stalled peer is declared down");
+        assert!(sm.peer_dead(2));
+        assert!(!sm.peer_dead(1));
+    }
+
+    #[test]
+    fn a_slow_peer_that_resumes_is_brought_back_up() {
+        // Core 2 stalls long enough to be declared down, then resumes → PeerUp,
+        // and it is no longer considered dead (split-brain / false-accusation guard).
+        let mut sm = CoreStateMachine::new(0, 3, 1000, 300);
+        let mut events: Vec<Command> = Vec::new();
+        {
+            let mut emit = |c: Command| events.push(c);
+            // Frozen value for enough observations to declare it down.
+            for _ in 0..=DEAD_AFTER_STALE {
+                sm.step(Event::PeerHeartbeat { core: 2, value: 5 }, &mut emit);
+            }
+            assert!(sm.peer_dead(2));
+            // It beats again (value advances) → recovered.
+            sm.step(Event::PeerHeartbeat { core: 2, value: 6 }, &mut emit);
+        }
+
+        assert!(!sm.peer_dead(2));
+        assert!(events.contains(&Command::PeerDown { core: 2 }));
+        assert!(events.contains(&Command::PeerUp { core: 2 }));
     }
 
     #[test]
