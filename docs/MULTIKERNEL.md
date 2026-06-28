@@ -14,10 +14,16 @@ untouched. Verified under QEMU `SMP=4 @ 2 GB`:
   over real rings (pressure → debtors repay their creditor → receiver zeroes + reclaims).
   Values are faked (no per-core PMM yet) — logged only — but the protocol *logic* is the
   simulator-validated code.
-- **Per-core runtime (Approach 2, §15) — R1 DONE:** each secondary now gets a PRIVATE copy of
+- **Per-core runtime (Approach 2, §15) — R1+R2 DONE:** R1 — each secondary gets a PRIVATE copy of
   the kernel's `.data`/`.bss` at the same VA, so `static PMM`/allocator/`POOL` resolve to its
   own instance (verified: a secondary mutates a shared static into its private copy; the BSP's
-  stays pristine). This unblocks running a real per-core PMM/heap/exec (R2–R4).
+  stays pristine). R2 — each secondary now stands up its OWN `pmm`/`allocator` over its RAM
+  partition and allocates from it: the BSP carves the secondary's whole bringup image (page
+  tables, replicated `.data`/`.bss`, stack, PerCpu) from that partition via a bump allocator
+  and identity-maps the partition as 2 MiB blocks; the secondary seeds a private heap + PMM
+  there and `alloc`s. The partitions are reserved from the BSP PMM at boot, so the pools are
+  strictly disjoint (verified SMP=2 and SMP=4: each core allocs in-partition, BSP pool
+  untouched). This unblocks per-core exec/scheduler (R3) and a real pinned process (R4).
 
 Build with `scripts/build_smp.sh`; boot with `scripts/run_smp.sh` (or `SMP=N cargo run
 --profile release-smp --features smp`). Host-test/simulate the protocol with no QEMU:
@@ -627,7 +633,7 @@ Staged, each independently verifiable:
 | Stage | Goal | Notes |
 |---|---|---|
 | **R1 — writable replication** ✅ | Secondary gets a private `.data`/`.bss` at the kernel VA | `snapshot_pristine_data()` (first thing in `rust_start`) copies `.data`→`DATA_SNAPSHOT` before any mutation; `replicate_writable_window()` maps `[_data_start,_kernel_phys_end)` to private pages (`.data` from snapshot, `.bss` zeroed). **The descriptor (`MACHINE_CONFIG`, a `.bss` static) is the one thing that must stay SHARED** — replication skips it and maps it shared. Proof: a secondary mutates a shared static into its private copy; the BSP's copy stays pristine. |
-| **R2 — per-core PMM + heap** | Secondary runs `pmm::init`/`allocator::init` over its partition; `alloc` works, BSP PMM untouched | Identity-map the partition (2 MB blocks); bump-allocate `.data/.bss`/heap/stack/page-tables from the PARTITION; `kernel_end` = end of consumed. Do **not** call `akuma_exec::mmu::init` on a secondary — `extend_boot_ram_identity_map` writes the SHARED boot tables. |
+| **R2 — per-core PMM + heap** ✅ | Secondary runs `pmm::init`/`allocator::init` over its partition; `alloc` works, BSP PMM untouched | DONE. `PartitionBump` carves the secondary's whole bringup image (page tables + replicated `.data`/`.bss` + stack + PerCpu) from its OWN partition (never the BSP `pmm`); `build_isolated_table` identity-maps the partition as 2 MiB RW blocks and records the consumed prefix as `kernel_end`. The secondary then seeds a private heap just above `kernel_end` and runs the unchanged `allocator::init` + `pmm::init` over `[pbase, pbase+len_2mb)` — they resolve to its replicated `static`s, so nothing the BSP owns is touched. `smp::reserve_secondary_partitions` (called right after the BSP's `pmm::init`, before `mmu::init`) removes those ranges from the BSP pool so the two are disjoint. Proof: `run_r2_test` allocs a heap `Vec` + 16 PMM pages and posts the result to PerCpu; the BSP confirms in-partition + BSP-pool-unchanged (verified SMP=2/4). Did **not** call `akuma_exec::mmu::init` on a secondary (it writes the SHARED boot tables). |
 | **R3 — per-core exec/scheduler** | Secondary runs `akuma_exec` (process table, scheduler) per-core; switches to the main `exceptions.rs` vectors | Its `POOL`/process table are now per-core via replication; preemption via the per-core timer; syscalls trap to the (per-core) handlers. |
 | **R4 — process + forwarding (the demo)** | Spawn `/bin/hello` (then `curl`) pinned to core 1, forwarding `open`/`read`/`write`/sockets to core 0 (§10) | "exec is recursive forwarding": core 1 has no VFS, so loading the ELF forwards `open`/`read` to core 0. Console + sockets likewise. This is the §10 acceptance test. |
 

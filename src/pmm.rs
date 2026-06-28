@@ -504,6 +504,34 @@ pub fn init(ram_base: usize, ram_size: usize, kernel_end: usize) {
     ALLOCATED_PAGES.store(pmm.total_pages - pmm.free_pages, Ordering::Release);
 }
 
+/// Multikernel (smp): remove `[base, base+len)` from the BSP's free pool so a
+/// secondary core's per-core PMM (R2) can own that partition exclusively. Marks the
+/// covered, currently-free pages used and decrements the free count. Idempotent on
+/// already-used pages. MUST be called before any allocation could land in the range.
+#[cfg(kernel_smp)]
+pub fn reserve_range(base: usize, len: usize) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut pmm = PMM.lock();
+        if base < pmm.base_addr {
+            return;
+        }
+        let start = (base - pmm.base_addr) / PAGE_SIZE;
+        let pages = len / PAGE_SIZE;
+        let mut reserved = 0usize;
+        for i in start..start + pages {
+            if i >= pmm.total_pages {
+                break;
+            }
+            if pmm.is_free(i) {
+                pmm.mark_used(i);
+                reserved += 1;
+            }
+        }
+        pmm.free_pages -= reserved;
+        ALLOCATED_PAGES.fetch_add(reserved, Ordering::Relaxed);
+    });
+}
+
 /// Allocate a single physical page
 pub fn alloc_page() -> Option<PhysFrame> {
     if let Some(frame) = alloc_page_once() {

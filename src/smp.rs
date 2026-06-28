@@ -176,9 +176,66 @@ fn collect_mpidrs(fdt: &fdt::Fdt) -> ([u64; MAX_CORES], usize) {
 }
 
 const PAGE: usize = 4096;
+/// 2 MiB block size — the granule the secondary's partition is identity-mapped at
+/// (one L2 block descriptor per 2 MiB; 512 of them fill one L2 table = 1 GiB).
+const TWO_MB: usize = 2 * 1024 * 1024;
 
 /// Number of contiguous pages for a secondary's isolated boot stack (16 KiB).
 const STACK_PAGES: usize = 4;
+
+/// R2 — initial per-core kernel heap, carved from the secondary's partition just
+/// above the BSP-built kernel image (page tables + replicated `.data`/`.bss` +
+/// stack + PerCpu). 2 MiB is ample to seed the secondary's `talc` and hold its PMM
+/// bitmap (a 1 GiB partition's bitmap is only 32 KiB); the heap then grows on
+/// demand from the secondary's own PMM via the OOM handler, exactly like the BSP.
+const SECONDARY_HEAP_BYTES: usize = 2 * 1024 * 1024;
+
+/// Bump allocator over a single core's RAM partition. The BSP uses it to carve a
+/// secondary's ENTIRE bringup working set — page-table pages, the replicated
+/// `.data`/`.bss`, the boot stack, the PerCpu page — from that core's OWN
+/// partition, never from the BSP `pmm`. Two payoffs (docs/MULTIKERNEL.md §15, R2):
+/// the BSP physical pool stays untouched by secondary setup, and the consumed
+/// prefix becomes the secondary's `kernel_end` — the exact cut its per-core PMM
+/// marks used before managing the rest of the partition as free pages.
+///
+/// Pages are zeroed through the BSP's identity map (`phys_to_virt`), which spans
+/// all detected RAM during bringup, so the partition (even a high one the restricted
+/// table will later own) is writable here.
+struct PartitionBump {
+    cursor: usize,
+    end: usize,
+}
+
+impl PartitionBump {
+    fn new(base: usize, len: usize) -> Self {
+        Self { cursor: base, end: base + len }
+    }
+
+    /// Carve `n` contiguous, zeroed 4 KiB pages; returns the base PA, or `None` if
+    /// the partition is exhausted.
+    fn alloc_pages(&mut self, n: usize) -> Option<usize> {
+        let bytes = n * PAGE;
+        if bytes > self.end - self.cursor {
+            return None;
+        }
+        let pa = self.cursor;
+        self.cursor += bytes;
+        // SAFETY: `pa` is a partition PA, identity-mapped in the BSP boot tables
+        // (which cover all RAM); zero the freshly-carved pages before use.
+        unsafe { core::ptr::write_bytes(phys_to_virt(pa), 0, bytes) };
+        Some(pa)
+    }
+
+    #[inline]
+    fn alloc_page(&mut self) -> Option<usize> {
+        self.alloc_pages(1)
+    }
+
+    #[inline]
+    fn cursor(&self) -> usize {
+        self.cursor
+    }
+}
 
 unsafe extern "C" {
     /// Linker symbol: first byte of `.data` (page-aligned). Everything below it
@@ -213,6 +270,12 @@ const REPL_TEST_INIT: u64 = 0xAA00;
 static SMP_REPLICATION_TEST: AtomicU64 = AtomicU64::new(REPL_TEST_INIT);
 /// PerCpu byte offset where a secondary records its replication-test read-back.
 const PERCPU_REPL_TEST: usize = 32;
+/// PerCpu byte offsets where a secondary records its R2 (per-core PMM + heap)
+/// self-test result for the BSP to verify (all distinct from the offsets above).
+const PERCPU_R2_PAGES: usize = 40; // # pages its private PMM handed out
+const PERCPU_R2_FIRST_PA: usize = 48; // PA of the first such page (BSP checks in-partition)
+const PERCPU_R2_HEAP_OK: usize = 56; // 1 if a private-heap alloc round-tripped
+const PERCPU_R2_FREE: usize = 64; // its private PMM free-page count after the test
 
 /// Snapshot pristine `.data` — MUST be the first thing `rust_start` does, before any
 /// code mutates a `.data`/`.bss` static. Copies `[_data_start, __bss_start)` into
@@ -259,6 +322,13 @@ fn pte_rw() -> u64 {
 fn pte_device() -> u64 {
     flags::VALID | flags::TABLE | flags::AF | flags::SH_OUTER
         | attr_index(MAIR_DEVICE_NGNRNE) | flags::PXN | flags::UXN
+}
+/// L2 *block* descriptor (2 MiB), Normal Write-Back, RW at all ELs, non-executable.
+/// Note `flags::BLOCK` (bit[1] = 0): at L2 a cleared TABLE bit selects a block, not
+/// a table pointer. Used to identity-map a secondary's whole partition cheaply.
+fn pte_block_rw() -> u64 {
+    flags::VALID | flags::BLOCK | flags::AF | flags::SH_INNER
+        | attr_index(MAIR_NORMAL_WB) | flags::AP_RW_ALL | flags::PXN | flags::UXN
 }
 
 // --- GICv3 redistributor (per-PE MMIO) for the cross-core SGI doorbell (§7) ---
@@ -347,28 +417,28 @@ fn secondary_gic_init(idx: usize) {
 /// Read (or allocate+link) the next-level table under `table[idx]`, returning its
 /// physical address. Intermediate tables come from the PMM (the BSP builds these
 /// on its boot tables, where `phys_to_virt` is identity, so writes land in RAM).
-fn get_or_create(table: *mut u64, idx: usize) -> Option<usize> {
+fn get_or_create(table: *mut u64, idx: usize, bump: &mut PartitionBump) -> Option<usize> {
     // SAFETY: `table` is an identity-mapped page-table page; `idx < 512`.
     unsafe {
         let e = table.add(idx).read_volatile();
         if e & flags::VALID != 0 {
             return Some((e & 0x0000_FFFF_FFFF_F000) as usize);
         }
-        let f = pmm::alloc_page_zeroed()?;
+        let pa = bump.alloc_page()?;
         table
             .add(idx)
-            .write_volatile((f.addr as u64) | flags::VALID | flags::TABLE);
-        Some(f.addr)
+            .write_volatile((pa as u64) | flags::VALID | flags::TABLE);
+        Some(pa)
     }
 }
 
 /// Map one 4 KiB page `pa -> va` with `leaf_flags` into the table rooted at
-/// `l0_pa`, creating intermediate levels as needed.
-fn map_4k(l0_pa: usize, va: usize, pa: usize, leaf_flags: u64) -> Option<()> {
+/// `l0_pa`, creating intermediate levels as needed (carved from `bump`).
+fn map_4k(l0_pa: usize, va: usize, pa: usize, leaf_flags: u64, bump: &mut PartitionBump) -> Option<()> {
     let l0 = phys_to_virt(l0_pa).cast::<u64>();
-    let l1 = phys_to_virt(get_or_create(l0, (va >> 39) & 0x1FF)?).cast::<u64>();
-    let l2 = phys_to_virt(get_or_create(l1, (va >> 30) & 0x1FF)?).cast::<u64>();
-    let l3 = phys_to_virt(get_or_create(l2, (va >> 21) & 0x1FF)?).cast::<u64>();
+    let l1 = phys_to_virt(get_or_create(l0, (va >> 39) & 0x1FF, bump)?).cast::<u64>();
+    let l2 = phys_to_virt(get_or_create(l1, (va >> 30) & 0x1FF, bump)?).cast::<u64>();
+    let l3 = phys_to_virt(get_or_create(l2, (va >> 21) & 0x1FF, bump)?).cast::<u64>();
     // SAFETY: `l3` is an identity-mapped L3 table; index < 512.
     unsafe {
         l3.add((va >> 12) & 0x1FF)
@@ -377,11 +447,42 @@ fn map_4k(l0_pa: usize, va: usize, pa: usize, leaf_flags: u64) -> Option<()> {
     Some(())
 }
 
-fn map_range_4k(l0_pa: usize, base: usize, len: usize, leaf_flags: u64) -> Option<()> {
+fn map_range_4k(l0_pa: usize, base: usize, len: usize, leaf_flags: u64, bump: &mut PartitionBump) -> Option<()> {
     let pages = len.div_ceil(PAGE);
     for i in 0..pages {
         let a = base + i * PAGE;
-        map_4k(l0_pa, a, a, leaf_flags)?; // identity (va == pa)
+        map_4k(l0_pa, a, a, leaf_flags, bump)?; // identity (va == pa)
+    }
+    Some(())
+}
+
+/// Map one 2 MiB block `pa -> va` with `leaf_flags` (an L2 *block* descriptor)
+/// into the table rooted at `l0_pa`. L0/L1 intermediates are carved from `bump`;
+/// if an L2 table already exists under this L1 entry (e.g. the kernel image shares
+/// the 1 GiB region), the block is written into a free slot of that same L2 —
+/// kernel 4 KiB maps sit at low L2 indices, partition blocks at high ones.
+fn map_2mb(l0_pa: usize, va: usize, pa: usize, leaf_flags: u64, bump: &mut PartitionBump) -> Option<()> {
+    let l0 = phys_to_virt(l0_pa).cast::<u64>();
+    let l1 = phys_to_virt(get_or_create(l0, (va >> 39) & 0x1FF, bump)?).cast::<u64>();
+    let l2 = phys_to_virt(get_or_create(l1, (va >> 30) & 0x1FF, bump)?).cast::<u64>();
+    // SAFETY: `l2` is an identity-mapped L2 table; index < 512.
+    unsafe {
+        l2.add((va >> 21) & 0x1FF)
+            .write_volatile((pa as u64) | leaf_flags);
+    }
+    Some(())
+}
+
+/// Identity-map `[base, base+len)` as 2 MiB RW blocks (`len` must be 2 MiB-aligned).
+/// This is the keystone of R2: it gives the secondary direct access to ALL of its
+/// partition — the BSP-carved kernel image, the heap slab, and every page its
+/// per-core PMM will later hand out — so its `alloc`/page-table walks resolve to
+/// real, mapped RAM in its own partition.
+fn map_partition_blocks(l0_pa: usize, base: usize, len: usize, bump: &mut PartitionBump) -> Option<()> {
+    let blocks = len / TWO_MB;
+    for i in 0..blocks {
+        let a = base + i * TWO_MB;
+        map_2mb(l0_pa, a, a, pte_block_rw(), bump)?;
     }
     Some(())
 }
@@ -395,7 +496,7 @@ fn map_range_4k(l0_pa: usize, base: usize, len: usize, leaf_flags: u64) -> Optio
 /// `[skip_va, skip_va+skip_len)` (the SHARED descriptor) is left UNMAPPED here — the
 /// caller maps it shared afterwards. Replicating it would give the secondary a
 /// private, zeroed descriptor and break the cross-core comms contract.
-fn replicate_writable_window(l0_pa: usize, skip_va: usize, skip_len: usize) -> Option<()> {
+fn replicate_writable_window(l0_pa: usize, skip_va: usize, skip_len: usize, bump: &mut PartitionBump) -> Option<()> {
     let data_start = &raw const _data_start as usize;
     let bss_start = &raw const __bss_start as usize;
     let end = (&raw const _kernel_phys_end as usize).next_multiple_of(PAGE);
@@ -409,7 +510,7 @@ fn replicate_writable_window(l0_pa: usize, skip_va: usize, skip_len: usize) -> O
             va += PAGE;
             continue;
         }
-        let page = pmm::alloc_page_zeroed()?; // zeroed → correct for the `.bss` part
+        let page = bump.alloc_page()?; // from the partition, zeroed → correct for `.bss`
         if va < bss_start {
             // Copy this page's `.data` bytes from the pristine snapshot.
             let copy_len = core::cmp::min(PAGE, bss_start - va);
@@ -418,12 +519,12 @@ fn replicate_writable_window(l0_pa: usize, skip_va: usize, skip_len: usize) -> O
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     snap.add(va - data_start),
-                    phys_to_virt(page.addr),
+                    phys_to_virt(page),
                     copy_len,
                 );
             }
         }
-        map_4k(l0_pa, va, page.addr, pte_rw())?;
+        map_4k(l0_pa, va, page, pte_rw(), bump)?;
         va += PAGE;
     }
     Some(())
@@ -436,15 +537,21 @@ fn replicate_writable_window(l0_pa: usize, skip_va: usize, skip_len: usize) -> O
 /// `ttbr0_phys`/`entry_sp`/`percpu_phys` in the descriptor. Returns `false` (and
 /// leaves `ttbr0_phys == 0`) on OOM, so the secondary falls back to a parked spin.
 fn build_isolated_table(cfg: &mut MachineConfig, idx: usize) -> bool {
-    let Some(l0) = pmm::alloc_page_zeroed() else {
+    // R2: carve EVERYTHING for this secondary from its OWN partition (page tables,
+    // replicated window, stack, PerCpu) via a bump allocator — never the BSP `pmm`.
+    // The consumed prefix becomes the secondary's `kernel_end`.
+    let pbase = cfg.cores[idx].ram_base as usize;
+    let plen = cfg.cores[idx].ram_len as usize;
+    let mut bump = PartitionBump::new(pbase, plen);
+
+    let Some(l0_pa) = bump.alloc_page() else {
         return false;
     };
-    let l0_pa = l0.addr;
 
     // 1. Shared kernel code (.text/.rodata): [KERNEL_PHYS_BASE, _data_start) RO+X.
     let code_end = &raw const _data_start as usize;
     let code_len = code_end.saturating_sub(KERNEL_PHYS_BASE);
-    if map_range_4k(l0_pa, KERNEL_PHYS_BASE, code_len, pte_code()).is_none() {
+    if map_range_4k(l0_pa, KERNEL_PHYS_BASE, code_len, pte_code(), &mut bump).is_none() {
         return false;
     }
 
@@ -460,44 +567,55 @@ fn build_isolated_table(cfg: &mut MachineConfig, idx: usize) -> bool {
     // page(s) here and map them shared next.
     let cfg_pa = core::ptr::from_ref::<MachineConfig>(cfg) as usize;
     let cfg_len = core::mem::size_of::<MachineConfig>();
-    if replicate_writable_window(l0_pa, cfg_pa, cfg_len).is_none() {
+    if replicate_writable_window(l0_pa, cfg_pa, cfg_len, &mut bump).is_none() {
         return false;
     }
 
     // 2b. The SHARED descriptor page(s) — map to the BSP's single copy (identity),
     // overriding any replicated mapping, so every core sees the same rings/state.
-    if map_range_4k(l0_pa, cfg_pa, cfg_len, pte_rw()).is_none() {
+    if map_range_4k(l0_pa, cfg_pa, cfg_len, pte_rw(), &mut bump).is_none() {
         return false;
     }
 
-    // 3. This core's private stack (contiguous) + PerCpu page, RW.
-    let Some(stack) = pmm::alloc_pages_contiguous_zeroed(STACK_PAGES) else {
+    // 3. This core's private stack (contiguous) + PerCpu page — carved from the
+    // partition. No explicit 4 KiB identity map needed: the 2 MiB partition block
+    // map in step 5 covers them (they live low in the partition).
+    let Some(stack_pa) = bump.alloc_pages(STACK_PAGES) else {
         return false;
     };
-    if map_range_4k(l0_pa, stack.addr, STACK_PAGES * PAGE, pte_rw()).is_none() {
-        return false;
-    }
-    let Some(percpu) = pmm::alloc_page_zeroed() else {
+    let Some(percpu_pa) = bump.alloc_page() else {
         return false;
     };
-    if map_4k(l0_pa, percpu.addr, percpu.addr, pte_rw()).is_none() {
-        return false;
-    }
 
-    // 4. This core's own GIC redistributor frames (device), so it can wake its
-    // redistributor and receive the doorbell SGI (§7). Only THIS core's frames —
-    // peers' redistributors and all RAM-isolation properties are untouched.
+    // 4. This core's own GIC redistributor frames (device, OUTSIDE the partition),
+    // so it can wake its redistributor and receive the doorbell SGI (§7). Only THIS
+    // core's frames — peers' redistributors and all RAM-isolation properties are
+    // untouched.
     let rd = GICR_BASE + idx * GICR_STRIDE;
     let sgi = rd + GICR_SGI_OFFSET;
-    if map_4k(l0_pa, rd, rd, pte_device()).is_none()
-        || map_4k(l0_pa, sgi, sgi, pte_device()).is_none()
+    if map_4k(l0_pa, rd, rd, pte_device(), &mut bump).is_none()
+        || map_4k(l0_pa, sgi, sgi, pte_device(), &mut bump).is_none()
     {
         return false;
     }
 
+    // 5. R2 — identity-map this core's ENTIRE partition as 2 MiB RW blocks, so the
+    // secondary can address all of it: the bump-carved kernel image (above), the
+    // heap slab it seeds, and every page its per-core PMM will hand out. `ram_len`
+    // is rounded DOWN to a 2 MiB multiple (the last core may absorb an unaligned
+    // remainder); the secondary's PMM is given the same rounded length so it never
+    // hands out an unmapped tail page.
+    let len_2mb = plen & !(TWO_MB - 1);
+    if map_partition_blocks(l0_pa, pbase, len_2mb, &mut bump).is_none() {
+        return false;
+    }
+
     cfg.cores[idx].ttbr0_phys = l0_pa as u64;
-    cfg.cores[idx].entry_sp = (stack.addr + STACK_PAGES * PAGE) as u64;
-    cfg.cores[idx].percpu_phys = percpu.addr as u64;
+    cfg.cores[idx].entry_sp = (stack_pa + STACK_PAGES * PAGE) as u64;
+    cfg.cores[idx].percpu_phys = percpu_pa as u64;
+    // R2: the consumed prefix of the partition is the secondary's `kernel_end` — its
+    // per-core PMM marks [pbase, kernel_end) used and manages the rest as free.
+    cfg.cores[idx].kernel_end = bump.cursor() as u64;
     true
 }
 
@@ -528,6 +646,35 @@ pub fn probe_dtb(dtb_ptr: usize) {
     console::print_dec(num_cores);
     console::print(" core(s), conduit=");
     console::print(if use_hvc { "hvc\n" } else { "smc\n" });
+}
+
+/// Hand each secondary core sole ownership of its RAM partition by removing those
+/// ranges from the BSP's PMM. MUST run right after `pmm::init`/`mark_pmm_ready` and
+/// BEFORE any other BSP allocation (e.g. `mmu::init`), so the BSP can never hand out
+/// a page that a secondary's per-core PMM (R2) also owns — the two pools stay
+/// strictly disjoint. The BSP keeps only its own partition. No-op single-core.
+/// Uses the [`probe_dtb`] stash (the DTB itself may be heap-clobbered by now).
+pub fn reserve_secondary_partitions(ram_base: usize, ram_size: usize) {
+    if !PROBED.load(Ordering::Acquire) {
+        return;
+    }
+    let num_cores = NUM_CORES.load(Ordering::Relaxed);
+    if num_cores <= 1 {
+        return;
+    }
+    let bsp_idx = (read_mpidr() & 0xff) as usize;
+    let parts = partition(ram_base, ram_size, num_cores);
+    let mut reserved_mb = 0usize;
+    for (idx, &(base, len)) in parts.iter().enumerate().take(num_cores) {
+        if idx == bsp_idx {
+            continue;
+        }
+        pmm::reserve_range(base as usize, len as usize);
+        reserved_mb += (len / (1024 * 1024)) as usize;
+    }
+    console::print("[SMP] reserved ");
+    console::print_dec(reserved_mb);
+    console::print(" MB of secondary partitions from the BSP PMM\n");
 }
 
 /// BSP entry point: wake every secondary PE and wait for it to report `Online`.
@@ -620,6 +767,12 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
     console::print_hex(cfg_pa);
     console::print("\n");
 
+    // R2 proof baseline: the BSP's own free-page count BEFORE the secondaries run.
+    // Each secondary allocs from its OWN (replicated) PMM over its OWN partition —
+    // which the BSP PMM no longer owns (reserved at boot) — so this must be unchanged
+    // after they run. The BSP does not allocate in the wake/wait loops below.
+    let bsp_free_before = pmm::free_count();
+
     // Wake each secondary.
     for idx in 0..num_cores {
         if idx == bsp_idx {
@@ -695,6 +848,43 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
             ENF_FAULTED => console::print(" [enforcement: cross-core access FAULTED ✓]\n"),
             ENF_LEAKED => console::print(" [enforcement: LEAKED — isolation breach! ✗]\n"),
             _ => console::print(" [enforcement: inconclusive]\n"),
+        }
+        // R2: per-core PMM + heap. The secondary stood up its own allocator/pmm over
+        // its partition and recorded the result. Verify: it handed out pages, the
+        // first one is INSIDE this core's partition (not the BSP's), the private-heap
+        // round-trip succeeded, and the BSP's own free-page count is UNCHANGED.
+        if percpu != 0 {
+            let pages = unsafe { core::ptr::read_volatile((percpu + PERCPU_R2_PAGES) as *const u64) };
+            let first_pa = unsafe { core::ptr::read_volatile((percpu + PERCPU_R2_FIRST_PA) as *const u64) };
+            let heap_ok = unsafe { core::ptr::read_volatile((percpu + PERCPU_R2_HEAP_OK) as *const u64) };
+            let sec_free = unsafe { core::ptr::read_volatile((percpu + PERCPU_R2_FREE) as *const u64) };
+            let pbase = cfg.cores[idx].ram_base;
+            let pend = pbase + cfg.cores[idx].ram_len;
+            let in_partition = first_pa >= pbase && first_pa < pend;
+            let bsp_untouched = pmm::free_count() == bsp_free_before;
+            console::print("[SMP] core ");
+            console::print_dec(idx);
+            if pages > 0 && in_partition && heap_ok == 1 && bsp_untouched {
+                console::print(" R2: per-core pmm+heap ✓ (alloc'd ");
+                console::print_dec(pages as usize);
+                console::print(" pages from 0x");
+                console::print_hex(first_pa);
+                console::print(", heap ok, free=");
+                console::print_dec(sec_free as usize);
+                console::print(" pages; BSP pool untouched ✓)\n");
+            } else {
+                console::print(" R2: FAILED (pages=");
+                console::print_dec(pages as usize);
+                console::print(" first=0x");
+                console::print_hex(first_pa);
+                console::print(" in_part=");
+                console::print(if in_partition { "1" } else { "0" });
+                console::print(" heap=");
+                console::print_dec(heap_ok as usize);
+                console::print(" bsp_untouched=");
+                console::print(if bsp_untouched { "1" } else { "0" });
+                console::print(" ✗)\n");
+            }
         }
     }
 
@@ -901,6 +1091,11 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
     // Stage 2 — enforcement self-test: prove the MMU FAULTS a cross-core access.
     run_enforcement_test(cfg, cfg_pa, core_idx);
 
+    // R2 — stand up this core's OWN pmm + heap over its partition and prove an
+    // isolated alloc works (records the result to PerCpu for the BSP). Done BEFORE
+    // announcing Online so the BSP can verify it synchronously once it sees Online.
+    run_r2_test(cc.ram_base as usize, cc.ram_len as usize, cc.kernel_end as usize, percpu);
+
     // Announce Online from the isolated context (Release orders the enforcement
     // result + PerCpu marker before the BSP's Acquire load of `state`).
     cc.state.store(STATE_ONLINE, Ordering::Release);
@@ -1038,6 +1233,79 @@ fn run_enforcement_test(cfg: &MachineConfig, cfg_pa: usize, core_idx: usize) {
     // If the handler never fired, the read crossed cores undetected = leak.
     if slot.load(Ordering::Acquire) != ENF_FAULTED {
         slot.store(ENF_LEAKED, Ordering::Release);
+    }
+}
+
+/// R2 — bring up this secondary's OWN per-core PMM + heap over its partition, then
+/// prove an isolated `alloc` (docs/MULTIKERNEL.md §15). Because R1 already gives the
+/// core a PRIVATE `.data`/`.bss`, the kernel's `static TALC`/`static PMM`/`PMM_READY`
+/// all resolve to THIS core's replicated copies — so we can drive the *unchanged*
+/// `allocator::init` / `pmm::init` and they touch nothing the BSP owns:
+///
+///   1. seed a small private heap, carved by the BSP from this partition just above
+///      `kernel_end` (the consumed bringup prefix);
+///   2. init the private PMM over `[pbase, pbase+len_2mb)`, marking the heap +
+///      kernel prefix used and managing the rest as free pages;
+///   3. allocate from both pools and record the result to PerCpu.
+///
+/// All values land in PerCpu atomics (the secondary still has no console/UART map);
+/// the BSP reads them once the core reports Online and confirms the allocations came
+/// from this partition with the BSP pool untouched. No `console::print` here.
+fn run_r2_test(pbase: usize, plen: usize, kernel_end: usize, percpu: usize) {
+    if percpu == 0 {
+        return;
+    }
+    let len_2mb = plen & !(TWO_MB - 1);
+    // Heap slab: just above the BSP-carved kernel image, page-aligned, inside the
+    // 2 MiB-block-mapped region. Bail if the partition is too small to hold it.
+    let heap_base = kernel_end.next_multiple_of(PAGE);
+    let heap_len = SECONDARY_HEAP_BYTES;
+    let pmm_kernel_end = heap_base + heap_len;
+    if heap_base < pbase || pmm_kernel_end + PAGE > pbase + len_2mb {
+        return;
+    }
+
+    // 1. Seed this core's private `talc` heap.
+    if crate::allocator::init(heap_base, heap_len).is_err() {
+        return;
+    }
+    // 2. Init this core's private PMM over its partition; `[pbase, pmm_kernel_end)`
+    // (kernel image + heap) is marked used, the rest becomes its free pool.
+    crate::pmm::init(pbase, len_2mb, pmm_kernel_end);
+    crate::allocator::mark_pmm_ready();
+
+    // 3a. Private-heap proof: allocate, fill, read back (exercises `talc` + the
+    // mapped heap). A `Vec` round-trip is enough; it frees on drop.
+    let heap_ok = {
+        let v = alloc::vec![0xA5u8; PAGE];
+        v.iter().all(|&b| b == 0xA5)
+    };
+
+    // 3b. Private-PMM proof: hand out several zeroed pages from this partition.
+    let mut pages = 0u64;
+    let mut first_pa = 0u64;
+    for _ in 0..16 {
+        match crate::pmm::alloc_page_zeroed() {
+            Some(f) => {
+                if first_pa == 0 {
+                    first_pa = f.addr as u64;
+                }
+                pages += 1;
+            }
+            None => break,
+        }
+    }
+
+    // Record for the BSP (Release so the values are visible with the Online store).
+    // SAFETY: PerCpu page is mapped RW in this core's restricted table.
+    unsafe {
+        core::ptr::write_volatile((percpu + PERCPU_R2_PAGES) as *mut u64, pages);
+        core::ptr::write_volatile((percpu + PERCPU_R2_FIRST_PA) as *mut u64, first_pa);
+        core::ptr::write_volatile((percpu + PERCPU_R2_HEAP_OK) as *mut u64, u64::from(heap_ok));
+        core::ptr::write_volatile(
+            (percpu + PERCPU_R2_FREE) as *mut u64,
+            crate::pmm::free_count() as u64,
+        );
     }
 }
 

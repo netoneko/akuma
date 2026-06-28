@@ -582,6 +582,13 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     allocator::mark_pmm_ready();
     console::print("PMM initialized, allocator switched to page mode\n");
 
+    // Multikernel: remove the secondary cores' RAM partitions from the BSP PMM NOW,
+    // before any BSP allocation (e.g. mmu::init below) can claim a page inside one.
+    // Each secondary owns + manages its partition via its own per-core PMM (R2), so
+    // the two pools must be strictly disjoint. (No-op single-core.)
+    #[cfg(kernel_smp)]
+    smp::reserve_secondary_partitions(ram_base, ram_size);
+
     // Reclaim the pre-kernel region.  KERNEL_PHYS_OFFSET (1 MB) bytes before the
     // kernel are unused space — fully consumed by detect_memory() before PMM init
     // and safe to give back.  Hands ~256 pages (1 MB) to the user-page pool.
