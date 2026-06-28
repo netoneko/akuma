@@ -534,7 +534,7 @@ target configuration realized at **M3**; M0–M2 are the bringup/isolation/trans
 |---|---|---|
 | **M0 — second core spins** ✅ | Core 1 wakes, reads descriptor, parks in a `wfe` loop; BSP sees `state = Online` | PSCI `CPU_ON` (conduit from DTB `/psci`), secondary trampoline (`src/smp.rs`), MPIDR-aff0 core index, descriptor as an identity-mapped `static` (VA==PA → no pre-kernel-gap page needed at M0), x0=`context_id` handoff. Isolation-by-convention (secondaries reuse the BSP boot page tables). |
 | **M1 — isolated second kernel** 🟡 | Each secondary runs on its OWN restricted page table (shared RO code + descriptor page + private stack/PerCpu; peers UNMAPPED) and **hardware-enforced isolation is PROVEN** (a deliberate cross-core read faults). NOTE: this codebase is a TTBR0 identity-mapped kernel, so M1 is realized by per-core *TTBR0* tables + a per-core `[PerCpu]` private chunk (not the doc's original "replicated .data/.bss via TTBR1" — see §4.2 note). Still TODO for full M1: per-core `pmm::init`/heap/scheduler over a real partition. | per-core restricted TTBR0 tables (`build_isolated_table`), `secondary_enter_isolated` (TTBR0+SP switch, **`isb` after `msr ttbr0` is mandatory** or the global 1 GB boot block survives in the TLB and isolation leaks), per-core VBAR enforcement self-test |
-| **M2 — ping-pong** 🟡 | Cores exchange messages over a shared ring — DONE (lock-free MPSC `Ring`, non-blocking, **poll-drained** each loop pass; the debt-protocol pressure/repay traffic rides it). REMAINING: the **SGI doorbell** (so an idle core is woken rather than polling) + `trigger_sgi()` affinity targeting (today hardcoded to PE0). | lock-free MPSC `Ring` ✅, poll drain ✅; TODO: fix `trigger_sgi()` affinity, SGI handler drain |
+| **M2 — ping-pong** 🟡 | Cores exchange messages over a shared ring (lock-free MPSC `Ring`, non-blocking) AND the **cross-core SGI doorbell works** — `trigger_sgi_core(aff0, sgi)` targets a specific peer; each secondary brings up its own GIC receive path (CPU iface + its GICR frames mapped device + SGI enabled) and an IRQ vector, and a BSP doorbell is delivered + serviced (verified: counter bumped). REMAINING: convert the secondary loop from poll to `wfe`+doorbell wakeup, which needs a per-core timer so the heartbeat still advances while parked. | MPSC `Ring` ✅, `trigger_sgi_core` affinity ✅, secondary GIC receive + IRQ handler ✅; TODO: `wfe` conversion + per-core timer |
 | **M3 — roles + forwarding** | The §10 acceptance test: `hello` + `curl` pinned to core 1 | role table, VFS-read forwarding (first), syscall-forwarding stubs (§8.1), console append ring (§8.2), spawn/exit messages, reuse sysproxy marshaling |
 | **M4 — dynamic memory** | Core A releases pages to Core B at runtime | `ReleasePages`/`AcceptPages` messages, unmap-flush-remap handshake |
 
@@ -597,7 +597,7 @@ built early; this note exists only to avoid foreclosing it.
 | PMM init (already takes bounds) | `src/pmm.rs:499`, call site `src/main.rs:564` |
 | Boot page tables / identity map | `src/boot.rs:148`, `crates/akuma-exec/src/mmu/mod.rs:54` |
 | `get_boot_ttbr0` | `crates/akuma-exec/src/mmu/mod.rs:236` |
-| GIC redist + SGI (fix targeting) | `src/gic_v3.rs:152`, `src/gic_v3.rs:222` |
+| GIC redist + SGI; cross-core doorbell | `src/gic_v3.rs:152`, `trigger_sgi_core` in `src/gic_v3.rs` |
 | Per-CPU timer | `src/timer.rs:30` |
 | Scheduler / global `POOL` | `crates/akuma-exec/src/threading/mod.rs:2179` |
 | Process table / global statics | `crates/akuma-exec/src/process/table.rs` |

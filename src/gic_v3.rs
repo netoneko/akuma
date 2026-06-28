@@ -233,6 +233,25 @@ pub fn trigger_sgi(sgi_id: u32) {
     isb();
 }
 
+/// Trigger an SGI on a SPECIFIC core, identified by its affinity-0 (`MPIDR & 0xff`).
+/// The multikernel doorbell (docs/MULTIKERNEL.md §7): unlike [`trigger_sgi`] (which
+/// hardcodes the target list to PE0), this targets one peer in cluster Aff1=0 by
+/// setting that PE's bit in the 16-bit TargetList. Valid for `aff0 < 16` (QEMU
+/// `virt` single cluster); larger affinities would need Aff1 routing. Only the
+/// `smp` build references it.
+#[cfg(kernel_smp)]
+pub fn trigger_sgi_core(target_aff0: u32, sgi_id: u32) {
+    if sgi_id > 15 || target_aff0 >= 16 {
+        return;
+    }
+    // IRM=0, Aff3/2/1 = 0, INTID at [27:24], TargetList bit `target_aff0`.
+    let val = (u64::from(sgi_id) << 24) | (1u64 << target_aff0);
+    write_sysreg!("S3_0_C12_C11_5", val);
+    let _ = ICC_SGI1R_EL1;
+    dsb_ish();
+    isb();
+}
+
 /// Set interrupt priority (0 = highest, 255 = lowest). Only SGI/PPI (< 32) is
 /// supported here, which covers Akuma's usage.
 #[allow(dead_code)]

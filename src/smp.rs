@@ -26,7 +26,7 @@ use core::arch::global_asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use akuma_exec::mmu::{attr_index, flags, phys_to_virt, MAIR_NORMAL_WB};
+use akuma_exec::mmu::{attr_index, flags, phys_to_virt, MAIR_DEVICE_NGNRNE, MAIR_NORMAL_WB};
 // Pure data plane + protocol lives in the host-testable `akuma-smp` crate; this
 // module is the kernel glue (asm, PSCI, page tables, the pump).
 use akuma_smp::{
@@ -202,6 +202,86 @@ fn pte_rw() -> u64 {
     flags::VALID | flags::TABLE | flags::AF | flags::SH_INNER
         | attr_index(MAIR_NORMAL_WB) | flags::AP_RW_ALL | flags::PXN | flags::UXN
 }
+/// Device-nGnRnE (MAIR index 0, set by the trampoline), RW, non-executable. For
+/// mapping a secondary's own GIC redistributor frames into its restricted table.
+fn pte_device() -> u64 {
+    flags::VALID | flags::TABLE | flags::AF | flags::SH_OUTER
+        | attr_index(MAIR_DEVICE_NGNRNE) | flags::PXN | flags::UXN
+}
+
+// --- GICv3 redistributor (per-PE MMIO) for the cross-core SGI doorbell (§7) ---
+/// GICR base PA on QEMU `virt`; CPU `i`'s frames are at `base + i*GICR_STRIDE`.
+const GICR_BASE: usize = 0x080A_0000;
+/// Per-PE stride: an RD frame (64 KiB) + an SGI frame (64 KiB).
+const GICR_STRIDE: usize = 0x2_0000;
+/// SGI frame offset within a PE's redistributor.
+const GICR_SGI_OFFSET: usize = 0x1_0000;
+const GICR_WAKER: usize = 0x0014; // in the RD frame
+const GICR_WAKER_PROCESSOR_SLEEP: u32 = 1 << 1;
+const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
+const GICR_SGI_IGROUPR0: usize = 0x0080; // in the SGI frame
+const GICR_SGI_ISENABLER0: usize = 0x0100;
+const GICR_SGI_IPRIORITYR: usize = 0x0400;
+/// SGI INTID used as the multikernel doorbell (distinct from the BSP scheduler's
+/// SGI 0; redistributor config is per-PE, so the choice is independent anyway).
+const DOORBELL_SGI: u32 = 1;
+/// PerCpu byte offset where the IRQ handler counts doorbell SGIs it serviced.
+const PERCPU_DOORBELL_COUNT: usize = 24;
+
+/// ISV-safe 32-bit MMIO (single `str`/`ldr`, no writeback) — same reasoning as
+/// `gic_v3::mmio_w32` (writeback/pair forms assert under QEMU HVF).
+fn mmio_w32(addr: usize, val: u32) {
+    // SAFETY: `addr` is a device-mapped GIC redistributor register.
+    unsafe {
+        core::arch::asm!("str {v:w}, [{a}]", v = in(reg) val, a = in(reg) addr,
+            options(nostack, preserves_flags));
+    }
+}
+fn mmio_r32(addr: usize) -> u32 {
+    let val: u32;
+    // SAFETY: `addr` is a device-mapped GIC redistributor register.
+    unsafe {
+        core::arch::asm!("ldr {v:w}, [{a}]", v = out(reg) val, a = in(reg) addr,
+            options(nostack, preserves_flags, readonly));
+    }
+    val
+}
+
+/// Bring up THIS secondary's GICv3 receive path so a cross-core doorbell SGI can be
+/// delivered: enable the system-register CPU interface (sysregs — no mapping), wake
+/// this PE's redistributor and enable the doorbell SGI (MMIO — the RD/SGI frames are
+/// mapped device in the restricted table). The distributor's global config (ARE +
+/// Group 1) was already done by the BSP and is system-wide.
+fn secondary_gic_init(idx: usize) {
+    // SAFETY: GICv3 CPU-interface system registers; values per the architecture.
+    unsafe {
+        let sre: u64;
+        core::arch::asm!("mrs {0}, S3_0_C12_C12_5", out(reg) sre, options(nomem, nostack));
+        core::arch::asm!("msr S3_0_C12_C12_5, {0}", in(reg) sre | 1, options(nomem, nostack)); // ICC_SRE_EL1.SRE
+        core::arch::asm!("isb", options(nomem, nostack));
+        core::arch::asm!("msr S3_0_C4_C6_0, {0}", in(reg) 0xFFu64, options(nomem, nostack)); // ICC_PMR_EL1
+        core::arch::asm!("msr S3_0_C12_C12_3, {0}", in(reg) 0u64, options(nomem, nostack)); // ICC_BPR1_EL1
+        core::arch::asm!("msr S3_0_C12_C12_7, {0}", in(reg) 1u64, options(nomem, nostack)); // ICC_IGRPEN1_EL1
+        core::arch::asm!("isb", options(nomem, nostack));
+    }
+
+    let rd = GICR_BASE + idx * GICR_STRIDE;
+    let sgi = rd + GICR_SGI_OFFSET;
+    // Wake this redistributor: clear ProcessorSleep, wait ChildrenAsleep.
+    let waker = rd + GICR_WAKER;
+    mmio_w32(waker, mmio_r32(waker) & !GICR_WAKER_PROCESSOR_SLEEP);
+    while mmio_r32(waker) & GICR_WAKER_CHILDREN_ASLEEP != 0 {
+        core::hint::spin_loop();
+    }
+    // SGIs/PPIs to Group 1, mid priority, then enable the doorbell SGI.
+    mmio_w32(sgi + GICR_SGI_IGROUPR0, 0xFFFF_FFFF);
+    for i in 0..8 {
+        mmio_w32(sgi + GICR_SGI_IPRIORITYR + i * 4, 0xA0A0_A0A0);
+    }
+    mmio_w32(sgi + GICR_SGI_ISENABLER0, 1u32 << DOORBELL_SGI);
+    // SAFETY: ensure the redistributor writes complete before IRQs are unmasked.
+    unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
+}
 
 /// Read (or allocate+link) the next-level table under `table[idx]`, returning its
 /// physical address. Intermediate tables come from the PMM (the BSP builds these
@@ -281,6 +361,17 @@ fn build_isolated_table(cfg: &mut MachineConfig, idx: usize) -> bool {
         return false;
     };
     if map_4k(l0_pa, percpu.addr, percpu.addr, pte_rw()).is_none() {
+        return false;
+    }
+
+    // 4. This core's own GIC redistributor frames (device), so it can wake its
+    // redistributor and receive the doorbell SGI (§7). Only THIS core's frames —
+    // peers' redistributors and all RAM-isolation properties are untouched.
+    let rd = GICR_BASE + idx * GICR_STRIDE;
+    let sgi = rd + GICR_SGI_OFFSET;
+    if map_4k(l0_pa, rd, rd, pte_device()).is_none()
+        || map_4k(l0_pa, sgi, sgi, pte_device()).is_none()
+    {
         return false;
     }
 
@@ -518,6 +609,15 @@ fn run_memory_demo(cfg: &MachineConfig, num_cores: usize, bsp_idx: usize) {
     console::print_dec(sent);
     console::print(" peer(s)\n");
 
+    // M2 — ring the cross-core doorbell SGI at each secondary. They also poll, so
+    // this isn't required for progress; it proves SGI *delivery*: each secondary's
+    // IRQ handler bumps its PerCpu doorbell counter, which we read back below.
+    for idx in 0..num_cores {
+        if idx != bsp_idx {
+            crate::gic::trigger_sgi_core(idx as u32, DOORBELL_SGI);
+        }
+    }
+
     // Give the spinning secondaries time to drain + repay (non-blocking on our end).
     let until = crate::timer::uptime_us() + 300_000;
     while crate::timer::uptime_us() < until {
@@ -550,6 +650,24 @@ fn run_memory_demo(cfg: &MachineConfig, num_cores: usize, bsp_idx: usize) {
     console::print(" repayment(s); BSP pool now ");
     console::print_dec(bsp_sm.free_pages() as usize);
     console::print(" (faked units)\n");
+
+    // M2 — confirm each secondary actually took + serviced the doorbell SGI.
+    for idx in 0..num_cores {
+        if idx == bsp_idx {
+            continue;
+        }
+        let pp = cfg.cores[idx].percpu_phys as usize;
+        if pp == 0 {
+            continue;
+        }
+        // SAFETY: PerCpu PA is identity-mapped in the BSP boot tables.
+        let count = unsafe { core::ptr::read_volatile((pp + PERCPU_DOORBELL_COUNT) as *const u64) };
+        console::print("[SMP] core ");
+        console::print_dec(idx);
+        console::print(" doorbell SGIs serviced: ");
+        console::print_dec(count as usize);
+        console::print(if count > 0 { " (delivered ✓)\n" } else { " (NOT delivered ✗)\n" });
+    }
 }
 
 /// Stage 3a — sample every secondary's heartbeat twice (~0.5 s apart) and report
@@ -664,6 +782,20 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
         Event::Borrowed { creditor: BSP, range: Range { base: cc.ram_base, len: borrowed_mb } },
         &mut |_| {},
     );
+
+    // M2 — enable the cross-core doorbell: bring up this PE's GIC receive path and
+    // unmask IRQs so a peer's SGI is delivered to `smp_irq_handler` (which finds the
+    // PerCpu doorbell counter via TPIDRRO_EL0). VBAR_EL1 was already pointed at
+    // `smp_vectors` by the enforcement self-test.
+    if percpu != 0 {
+        // SAFETY: stash PerCpu PA in TPIDRRO_EL0 (free on secondaries) for the handler.
+        unsafe {
+            core::arch::asm!("msr tpidrro_el0, {0}", in(reg) percpu, options(nomem, nostack));
+        }
+    }
+    secondary_gic_init(core_idx);
+    // SAFETY: unmask IRQs (clear PSTATE.I) now that the vector + GIC are ready.
+    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)) };
 
     loop {
         hb.fetch_add(1, Ordering::Relaxed);
@@ -859,7 +991,7 @@ smp_vectors:
 .balign 0x80
     b       smp_sync_handler        // 0x200 Cur EL SPx Sync  <-- probe faults here
 .balign 0x80
-    b       smp_park_vec            // 0x280 Cur EL SPx IRQ
+    b       smp_irq_handler         // 0x280 Cur EL SPx IRQ   <-- doorbell SGI lands here
 .balign 0x80
     b       smp_park_vec            // 0x300 Cur EL SPx FIQ
 .balign 0x80
@@ -900,6 +1032,26 @@ smp_sync_handler:
     add     sp, sp, #32
     eret
 
+// Doorbell SGI handler: acknowledge + EOI the interrupt and bump this core's
+// PerCpu doorbell counter (so the BSP can confirm delivery). TPIDRRO_EL0 holds the
+// PerCpu PA (set by secondary_main; free on secondaries — no threading here). The
+// real wakeup value is the side effect of taking the IRQ: it pops the core out of
+// `wfe`, after which the main loop drains the ring.
+smp_irq_handler:
+    sub     sp, sp, #32
+    stp     x0, x1, [sp]
+    str     x2, [sp, #16]
+    mrs     x0, S3_0_C12_C12_0          // ICC_IAR1_EL1: acknowledge → INTID in x0
+    msr     S3_0_C12_C12_1, x0          // ICC_EOIR1_EL1: end of interrupt
+    mrs     x1, tpidrro_el0             // PerCpu PA
+    ldr     x2, [x1, #{db_off}]
+    add     x2, x2, #1
+    str     x2, [x1, #{db_off}]         // PerCpu.doorbell_count += 1
+    ldr     x2, [sp, #16]
+    ldp     x0, x1, [sp]
+    add     sp, sp, #32
+    eret
+
 smp_park_vec:
     wfe
     b       smp_park_vec
@@ -913,4 +1065,5 @@ secondary_boot_stacks:
     stack_shift = const SECONDARY_STACK_SHIFT,
     stacks_bytes = const (MAX_CORES << SECONDARY_STACK_SHIFT),
     enf_faulted = const ENF_FAULTED,
+    db_off = const PERCPU_DOORBELL_COUNT,
 );

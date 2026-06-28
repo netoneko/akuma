@@ -233,6 +233,13 @@ pub fn trigger_sgi(sgi_id: u32) {
     crate::gic_v3::trigger_sgi(sgi_id);
 }
 
+/// Trigger an SGI on a specific core (by affinity-0 = `MPIDR & 0xff`). The
+/// multikernel cross-core doorbell. GICv3 only; only the `smp` build uses it.
+#[cfg(all(not(feature = "gic-v2"), kernel_smp))]
+pub fn trigger_sgi_core(target_aff0: u32, sgi_id: u32) {
+    crate::gic_v3::trigger_sgi_core(target_aff0, sgi_id);
+}
+
 /// Set interrupt priority (0 = highest, 255 = lowest)
 #[allow(dead_code)]
 pub fn set_priority(irq: u32, priority: u8) {
