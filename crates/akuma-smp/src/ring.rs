@@ -172,7 +172,7 @@ mod tests {
         }
 
         // Single consumer drains until it has every (producer, seq) pair.
-        let total = (PRODUCERS as u64) * PER;
+        let total = u64::from(PRODUCERS) * PER;
         let mut seen: HashSet<(u32, u64)> = HashSet::new();
         while (seen.len() as u64) < total {
             if let Some((_kind, from, seq)) = ring.pop() {

@@ -18,9 +18,11 @@
 #[cfg(test)]
 extern crate std;
 
+mod brain;
 mod descriptor;
 mod ring;
 
+pub use brain::{Command, CoreBrain, Event, Range, MAX_DEBT_RANGES};
 pub use descriptor::{
     CoreConfig, MachineConfig, ENF_FAULTED, ENF_LEAKED, ENF_TESTING, MAGIC, MAX_CORES,
     STATE_BOOTING, STATE_OFFLINE, STATE_ONLINE,

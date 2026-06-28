@@ -288,6 +288,16 @@ descriptor.
 
 ---
 
+> **Implementation note (2026-06-28):** the pure, host-testable half of the SMP
+> subsystem now lives in `crates/akuma-smp` (`no_std`): the lock-free MPSC `Ring`,
+> the `MachineConfig` descriptor, `partition()`, and a **sans-IO `CoreBrain` state
+> machine** for the debt-based memory-reclaim protocol (§9) — driven by `step(Event,
+> emit)` so the identical, alloc-free logic runs in an isolated secondary *and* in a
+> host simulator. `cargo test -p akuma-smp` exercises the ring under real concurrent
+> threads and simulates the protocol across N cores (conservation, repay-your-creditor,
+> receiver-zeroing) with zero QEMU. `src/smp.rs` is the kernel glue (asm, PSCI, page
+> tables, the pump).
+
 ## 7. Message passing (reuse the rump sysproxy)
 
 The inter-core coordination plane reuses the **already-host-tested** sysproxy stack rather than
