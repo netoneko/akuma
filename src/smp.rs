@@ -228,6 +228,14 @@ const DOORBELL_SGI: u32 = 1;
 /// PerCpu byte offset where the IRQ handler counts doorbell SGIs it serviced.
 const PERCPU_DOORBELL_COUNT: usize = 24;
 
+/// EL1 virtual timer PPI (INTID 27) — the per-core heartbeat tick. Per-PE, so it
+/// doesn't conflict with the BSP's own scheduler timer on the same INTID.
+const TIMER_PPI: u32 = 27;
+/// Heartbeat tick interval in virtual-counter ticks. `0x10_0000` ≈ 17–44 ms across
+/// QEMU's typical 24–62.5 MHz `CNTFRQ`. Loadable as a single `movz #0x10, lsl #16`,
+/// so the asm IRQ handler re-arms with the SAME value — keep them in sync.
+const TIMER_INTERVAL_TICKS: u64 = 0x10_0000;
+
 /// ISV-safe 32-bit MMIO (single `str`/`ldr`, no writeback) — same reasoning as
 /// `gic_v3::mmio_w32` (writeback/pair forms assert under QEMU HVF).
 fn mmio_w32(addr: usize, val: u32) {
@@ -273,12 +281,13 @@ fn secondary_gic_init(idx: usize) {
     while mmio_r32(waker) & GICR_WAKER_CHILDREN_ASLEEP != 0 {
         core::hint::spin_loop();
     }
-    // SGIs/PPIs to Group 1, mid priority, then enable the doorbell SGI.
+    // SGIs/PPIs to Group 1, mid priority, then enable the doorbell SGI AND the
+    // virtual-timer PPI (INTID 27) — the periodic heartbeat-tick / wfe wakeup.
     mmio_w32(sgi + GICR_SGI_IGROUPR0, 0xFFFF_FFFF);
     for i in 0..8 {
         mmio_w32(sgi + GICR_SGI_IPRIORITYR + i * 4, 0xA0A0_A0A0);
     }
-    mmio_w32(sgi + GICR_SGI_ISENABLER0, 1u32 << DOORBELL_SGI);
+    mmio_w32(sgi + GICR_SGI_ISENABLER0, (1u32 << DOORBELL_SGI) | (1u32 << TIMER_PPI));
     // SAFETY: ensure the redistributor writes complete before IRQs are unmasked.
     unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
 }
@@ -794,7 +803,17 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
         }
     }
     secondary_gic_init(core_idx);
-    // SAFETY: unmask IRQs (clear PSTATE.I) now that the vector + GIC are ready.
+    // Arm this core's virtual timer for periodic heartbeat-tick wakeups (so the
+    // loop can `wfe`-sleep yet keep liveness advancing). CNTV_CVAL = now + interval;
+    // CNTV_CTL = 1 (enable, unmasked). The IRQ handler re-arms on each tick.
+    // SAFETY: CNTV* are EL1-accessible system registers.
+    unsafe {
+        let now: u64;
+        core::arch::asm!("mrs {0}, cntvct_el0", out(reg) now, options(nomem, nostack));
+        core::arch::asm!("msr cntv_cval_el0, {0}", in(reg) now + TIMER_INTERVAL_TICKS, options(nomem, nostack));
+        core::arch::asm!("msr cntv_ctl_el0, {0}", in(reg) 1u64, options(nomem, nostack));
+    }
+    // SAFETY: unmask IRQs (clear PSTATE.I) now that the vector + GIC + timer are ready.
     unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)) };
 
     loop {
@@ -822,9 +841,12 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
             }
         }
 
-        for _ in 0..2_000_000 {
-            core::hint::spin_loop();
-        }
+        // Sleep until the next INTERRUPT — a timer tick (heartbeat) or a doorbell
+        // SGI (a peer rang us). WFI, not WFE: WFE waits for an *event* (it returns
+        // spuriously / near-immediately here, leaving the core busy-spinning),
+        // whereas WFI truly halts the core until an interrupt is pending.
+        // SAFETY: idles this PE until an IRQ; the timer guarantees periodic wakeups.
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
     }
 }
 
@@ -1032,21 +1054,31 @@ smp_sync_handler:
     add     sp, sp, #32
     eret
 
-// Doorbell SGI handler: acknowledge + EOI the interrupt and bump this core's
-// PerCpu doorbell counter (so the BSP can confirm delivery). TPIDRRO_EL0 holds the
-// PerCpu PA (set by secondary_main; free on secondaries — no threading here). The
-// real wakeup value is the side effect of taking the IRQ: it pops the core out of
-// `wfe`, after which the main loop drains the ring.
+// Secondary IRQ handler. Two sources: the virtual-timer PPI (INTID 27, the
+// heartbeat tick — re-arm CVAL so the level IRQ deasserts) and the doorbell SGI
+// (bump the PerCpu counter). Either way, taking the IRQ is the point: it pops the
+// core out of `wfe`, after which the main loop drains the ring. TPIDRRO_EL0 holds
+// the PerCpu PA (set by secondary_main; free on secondaries — no threading here).
 smp_irq_handler:
     sub     sp, sp, #32
     stp     x0, x1, [sp]
     str     x2, [sp, #16]
     mrs     x0, S3_0_C12_C12_0          // ICC_IAR1_EL1: acknowledge → INTID in x0
-    msr     S3_0_C12_C12_1, x0          // ICC_EOIR1_EL1: end of interrupt
+    cmp     x0, #{timer_ppi}            // virtual-timer PPI?
+    b.ne    .Lsmp_doorbell
+    // Timer: re-arm CVAL = CNTVCT + interval (deasserts the level IRQ).
+    mrs     x1, cntvct_el0
+    movz    x2, #0x10, lsl #16          // TIMER_INTERVAL_TICKS = 0x10_0000
+    add     x1, x1, x2
+    msr     cntv_cval_el0, x1
+    b       .Lsmp_eoi
+.Lsmp_doorbell:
     mrs     x1, tpidrro_el0             // PerCpu PA
     ldr     x2, [x1, #{db_off}]
     add     x2, x2, #1
     str     x2, [x1, #{db_off}]         // PerCpu.doorbell_count += 1
+.Lsmp_eoi:
+    msr     S3_0_C12_C12_1, x0          // ICC_EOIR1_EL1: end of interrupt
     ldr     x2, [sp, #16]
     ldp     x0, x1, [sp]
     add     sp, sp, #32
@@ -1066,4 +1098,5 @@ secondary_boot_stacks:
     stacks_bytes = const (MAX_CORES << SECONDARY_STACK_SHIFT),
     enf_faulted = const ENF_FAULTED,
     db_off = const PERCPU_DOORBELL_COUNT,
+    timer_ppi = const TIMER_PPI,
 );
