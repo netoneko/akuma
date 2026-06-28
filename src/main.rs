@@ -440,6 +440,13 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     let (ram_base, ram_size) = detect_memory(dtb_ptr);
 
+    // Multikernel (docs/MULTIKERNEL.md): snapshot CPU/PSCI info from the DTB NOW,
+    // before the heap allocator (which can be placed exactly at the DTB's address
+    // on large-RAM configs) overwrites it. `bringup_secondaries` later reads the
+    // stash, never the DTB. No-op without the `smp` feature.
+    #[cfg(kernel_smp)]
+    smp::probe_dtb(dtb_ptr);
+
     // Memory layout. All the policy (boot-stack cover, code+stack floor, the
     // extreme reserve-RAM clamp) lives in `compute_memory_layout` + `config`, so
     // the boot path here is just "compute, then verify". The sanity guard below
@@ -716,7 +723,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Online. No-op when QEMU exposes a single CPU (default `-smp 1`). Gated to the
     // `smp` feature so the default single-core build never compiles it.
     #[cfg(kernel_smp)]
-    smp::bringup_secondaries(dtb_ptr);
+    smp::bringup_secondaries(ram_base, ram_size);
 
     // Set up exception vectors and enable IRQs
     exceptions::init();
