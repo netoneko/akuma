@@ -277,6 +277,15 @@ BSP, when building core N's image:
 So: **a secondary can reach no peer's memory except the shared descriptor page** (rings + bounce +
 the small per-core status slots). The BSP is the exception until it too gets a restricted table.
 
+**Invariant — kernels cannot manipulate each other's boxes/namespaces.** Box/container state
+(`src/syscall/container.rs`) is per-kernel-private replicated `.bss`, exactly like `PMM`/`POOL`/the
+process table — a box created by one kernel is invisible and unreachable to another, and there is no
+cross-kernel API to touch a peer's boxes (by design, not convention). Consequences: a process is in
+*at most one* kernel's box namespace — the namespace of the kernel that hosts it; a box and a non-BSP
+core pin are mutually exclusive (the BSP's box can't follow a process onto a secondary's kernel); and
+the way to get boxes on a subkernel is to run a box-creating supervisor (herd) *inside* that subkernel.
+See `userspace/herd/docs/CORE_AWARE_SCHEDULING.md`.
+
 ---
 
 ## 5. The shared config descriptor
@@ -543,6 +552,13 @@ The first split deliberately proxies **both networking and VFS** — the heavies
 subsystems — so the forwarding path is validated under real load before any capability is
 split to `Own` on a secondary. A box `B` is created pinned to core 1.
 
+> **Placement policy lives in herd.** *How* a service gets pinned to a core — the config key,
+> the `SpawnOptions.pin_core` ABI, and the "core unavailable ⇒ log + fail, never reschedule
+> elsewhere" rule — is specced in **`userspace/herd/docs/CORE_AWARE_SCHEDULING.md`**. That
+> doc's hard dependency is **R4b.3b** (a secondary actually hosting an EL0 process); the herd
+> side can land ahead of it (inert-but-correct: pinning to a not-yet-hostable core fails the
+> availability check cleanly).
+
 Key insight: **exec is recursive forwarding.** Core 1 has no VFS, so loading `/bin/hello`
 forces it to forward `open`/`read` back to core 0 to fetch the ELF bytes. So `hello` alone
 already tests spawn-forward (0→1), VFS-read-forward (1→0), and console output (1→0 async).
@@ -751,7 +767,10 @@ In code (`src/smp.rs`):
   number that runs the real op against core 0's resources. open/read/close are implemented today
   (the exec-fetch path); `write` and the socket set (`socket`/`connect`/`sendto`/`recvfrom`) slot in
   as additional arms with **no new message type** — which is why `curl` is "add arms," not new
-  machinery.
+  machinery. The classify-and-route above is the *requester's* advisory choice; the owner must also
+  **enforce** the boundary — reject a forwarded syscall whose capability the requester wasn't granted
+  to `Proxy` here (and reject `Local`-group syscalls outright). That guard is what makes capability
+  subtraction real; it's a tracked follow-up (§16) gated on the caps map being data.
 
 ---
 
@@ -960,6 +979,17 @@ Tracked here so it isn't lost; tackle after the R3b/R4 milestones, not inline.
   bringup verification (reading PerCpu markers). To make isolation symmetric, give the BSP a
   restricted TTBR0 like the secondaries and route its verification through the shared descriptor
   instead of direct peer reads. Until then, "shared-nothing" holds for secondaries only (§4.2).
+
+- **Owner-side capability guard on forwarded syscalls (enforcement, not just routing).** Today
+  `service_forwarded_syscall` dispatches whatever forwarded syscall arrives — the secondary's
+  classify-and-route (`capability_of`/`capability_owner`) is *advisory*. The owner must ENFORCE the
+  boundary: on a `MSG_FWD_SYSCALL_REQ` from core C, reject (e.g. `-ENOSYS`/`-EPERM`) unless the
+  syscall's capability group is one C was actually granted to `Proxy` to *this* owner — i.e.
+  `caps[C][capability_of(nr)] == Proxy(me)`. Also reject `Local`-group syscalls outright: a `Local`
+  syscall must never be forwarded (it belongs on the requester's own kernel), so receiving one is a
+  misconfiguration/attack. This is what makes capability *subtraction* real — a core with
+  `Net = Absent` that forwards a socket call anyway gets refused at the owner, not silently served.
+  Depends on the caps map being data (below); pairs with it.
 
 - **Caps map belongs in the descriptor (§5), not hardcoded.** `capability_owner` currently
   hardcodes the Phase-0 split (core 0 owns Vfs + Net). Make `caps` a real per-core field in
