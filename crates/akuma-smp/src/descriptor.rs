@@ -107,6 +107,11 @@ pub struct MachineConfig {
     /// dereferences a pointer into the other's partition. Access is serialized by the
     /// request/reply handshake on `inboxes`.
     pub fwd_bounce: [FwdBounce; MAX_CORES],
+    /// Set to 1 by the BSP's persistent forward-server thread once it is live and
+    /// draining `inboxes[bsp]` (R4b.2). Secondaries poll this before sending a
+    /// post-bringup forward request, so the request is provably serviced by the
+    /// long-running thread rather than the transient bringup wait loop.
+    pub fwd_server_ready: AtomicU32,
 }
 
 impl Default for MachineConfig {
@@ -133,6 +138,7 @@ impl MachineConfig {
             inboxes: [const { Ring::new() }; MAX_CORES],
             console_rings: [const { ConsoleRing::new() }; MAX_CORES],
             fwd_bounce: [const { FwdBounce::new() }; MAX_CORES],
+            fwd_server_ready: AtomicU32::new(0),
         }
     }
 }

@@ -1941,33 +1941,98 @@ fn secondary_steady_state(cfg: &MachineConfig, idx: usize, percpu: usize, mut sm
     arm_cntv_timer();
     crate::irq::enable_irqs();
 
-    // Idle/driver loop on the boot thread: advance the heartbeat, drain the inbox into
-    // the debt state machine (shedding `Repay` to creditors over the shared rings — we
-    // only ever touch shared rings, never a peer's private state), then `yield_now` so
-    // any OTHER thread on this core runs. There is none yet; R4b.3 spawns the first
-    // pinned EL0 process here. (Power: this busy-yields when idle rather than `WFI`-ing —
-    // a future tweak, like the BSP's own preemptive idle loop.)
+    // R4b.2 post-bringup forward probe: once the BSP's persistent forward-server thread
+    // is live (`fwd_server_ready`), send ONE echo round-trip from this idle loop and
+    // verify the reply — proving the long-running THREAD (not the transient bringup wait
+    // loop, long exited) services cross-core forwards. State: 0=not sent, 1=awaiting
+    // reply, 2=done. A distinct nonce keeps it unambiguous vs the R4a bringup probe.
+    let probe_nonce = 0xB2B2_0000_0000_0000u64 | idx as u64;
+    let mut probe = 0u8;
+    let mut probe_payload = [0u8; R4A_LEN];
+    for (i, b) in probe_payload.iter_mut().enumerate() {
+        *b = i as u8;
+    }
+
+    // Idle/driver loop on the boot thread: advance the heartbeat, drain the inbox (debt
+    // state machine — shedding `Repay` to creditors over the shared rings, plus the R4b.2
+    // probe reply — we only ever touch shared rings, never a peer's private state), fire
+    // the probe when ready, then SLEEP (`WFI`) until the next interrupt. The per-core timer
+    // still preempts to any OTHER thread that becomes runnable (R4b.3 spawns the first
+    // pinned EL0 process here); until then this core stays near-idle instead of pegging a
+    // host CPU with scheduler-SGI churn.
     loop {
         if let Some(hb) = cfg.heartbeat.get(idx) {
             hb.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(inbox) = cfg.inboxes.get(idx) {
             while let Some(m) = inbox.pop() {
-                let ev = match m.kind {
-                    MSG_PRESSURE => Event::Pressure { from: m.from },
-                    MSG_REPAID => Event::Repaid { from: m.from, range: Range { base: m.v0, len: m.v1 } },
-                    _ => continue,
-                };
-                sm.step(ev, &mut |cmd| {
-                    if let Command::Repay { creditor, range } = cmd
-                        && let Some(to) = cfg.inboxes.get(creditor as usize)
-                    {
-                        to.push(MSG_REPAID, idx as u32, range.base, range.len);
+                match m.kind {
+                    MSG_FWD_ECHO_REPLY if probe == 1 && m.v1 == probe_nonce => {
+                        // copyout + verify the BSP transform (byte + 1), then report via
+                        // our console ring (drained to the UART by the BSP drainer).
+                        let ok = cfg.fwd_bounce.get(idx).is_some_and(|b| {
+                            let mut got = [0u8; R4A_LEN];
+                            b.read(&mut got);
+                            m.v0 as usize == R4A_LEN
+                                && got.iter().enumerate().all(|(i, &x)| x == (i as u8).wrapping_add(1))
+                        });
+                        crate::safe_print!(
+                            80,
+                            "[core {}] post-bringup forward round-trip {}\n",
+                            idx,
+                            if ok { "PASS" } else { "FAIL" }
+                        );
+                        probe = 2;
                     }
-                });
+                    MSG_PRESSURE | MSG_REPAID => {
+                        let ev = if m.kind == MSG_PRESSURE {
+                            Event::Pressure { from: m.from }
+                        } else {
+                            Event::Repaid { from: m.from, range: Range { base: m.v0, len: m.v1 } }
+                        };
+                        sm.step(ev, &mut |cmd| {
+                            if let Command::Repay { creditor, range } = cmd
+                                && let Some(to) = cfg.inboxes.get(creditor as usize)
+                            {
+                                to.push(MSG_REPAID, idx as u32, range.base, range.len);
+                            }
+                        });
+                    }
+                    _ => {}
+                }
             }
         }
-        akuma_exec::threading::yield_now();
+
+        // Fire the probe once, after the forward-server thread reports ready (so the
+        // request can only be serviced by the thread, never the exited bringup loop).
+        let want_probe = probe == 0 && cfg.fwd_server_ready.load(Ordering::Acquire) == 1;
+        if want_probe
+            && let (Some(bounce), Some(bsp_inbox)) = (cfg.fwd_bounce.get(idx), cfg.inboxes.first())
+        {
+            bounce.write(&probe_payload);
+            if bsp_inbox.push(MSG_FWD_ECHO_REQ, idx as u32, R4A_LEN as u64, probe_nonce) {
+                probe = 1;
+            }
+        }
+
+        // Idle: SLEEP until the next interrupt rather than busy-yielding. A tight
+        // `yield_now` loop (scheduler-SGI per pass) pegs this core at 100% and, on a
+        // virtualized GIC, floods the hypervisor with VM exits — starving the BSP. With
+        // no other thread runnable, `WFI` instead: the per-core timer still fires (waking
+        // us to re-drain + keeping liveness advancing) and preempts us to any thread that
+        // DOES become runnable (R4b.3+), and a peer's doorbell wakes us immediately. Mask
+        // IRQs first, then re-check for pending work, so a message racing in after the
+        // drain can't be lost (its doorbell SGI stays pending and WFI returns at once).
+        crate::irq::disable_irqs();
+        let pending = cfg.inboxes.get(idx).is_some_and(|r| !r.is_empty())
+            || (probe == 0 && cfg.fwd_server_ready.load(Ordering::Acquire) == 1);
+        if pending {
+            crate::irq::enable_irqs();
+            continue;
+        }
+        // SAFETY: WFI wakes on a pending IRQ despite the mask; then unmask to take it.
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        crate::irq::enable_irqs();
     }
 }
 
@@ -2047,10 +2112,11 @@ fn run_r4a_fwd_test(cfg: &MachineConfig, idx: usize, percpu: usize) {
 /// can't deadlock against the BSP spinning on that secondary's `Online`. The transform
 /// (byte + 1) stands in for the real owner-side syscall (VFS `read`, socket op) of
 /// R4b/R4c; the data path it exercises — bounce region + reply ring — is the real one.
-fn service_fwd_requests(cfg: &MachineConfig, bsp_idx: usize) {
+fn service_fwd_requests(cfg: &MachineConfig, bsp_idx: usize) -> usize {
     let Some(bsp_inbox) = cfg.inboxes.get(bsp_idx) else {
-        return;
+        return 0;
     };
+    let mut served = 0usize;
     while let Some(m) = bsp_inbox.pop() {
         if m.kind != MSG_FWD_ECHO_REQ {
             continue; // debt-protocol traffic is post-bringup; ignore anything else here
@@ -2062,6 +2128,47 @@ fn service_fwd_requests(cfg: &MachineConfig, bsp_idx: usize) {
         }
         if let Some(reply) = cfg.inboxes.get(from) {
             reply.push(MSG_FWD_ECHO_REPLY, bsp_idx as u32, m.v0, m.v1);
+        }
+        served += 1;
+    }
+    served
+}
+
+/// Spawn the BSP's persistent forward-server (R4b.2). A SYSTEM thread (kernel stack,
+/// like the console drainer), spawned from `run_async_main` AFTER preemption is live.
+/// It drains `inboxes[bsp]` and services `MSG_FWD_ECHO_REQ`s for the lifetime of the
+/// system — the steady-state replacement for the transient bringup wait loop, which
+/// only serviced forwards while waiting for cores to report Online. R4b.4+ point this
+/// at the real owner-side syscalls (VFS `read`, sockets); for now it runs the same
+/// `service_fwd_requests` echo transform. Sets `fwd_server_ready` so secondaries know
+/// the long-running servicer is live before they send a post-bringup forward.
+pub fn start_fwd_server() {
+    if !PROBED.load(Ordering::Acquire) || NUM_CORES.load(Ordering::Relaxed) <= 1 {
+        return;
+    }
+    let spawned = akuma_exec::threading::spawn_system_thread_fn(|| {
+        // SAFETY: descriptor is initialized and identity-mapped on the BSP.
+        let cfg = unsafe { &*MACHINE_CONFIG.0.get() };
+        let bsp_idx = (read_mpidr() & 0xff) as usize;
+        cfg.fwd_server_ready.store(1, Ordering::Release);
+        let mut total = 0usize;
+        loop {
+            let n = service_fwd_requests(cfg, bsp_idx);
+            if n > 0 && total == 0 {
+                // First forward serviced post-bringup ⇒ this is the THREAD, not the
+                // bringup loop (long exited) — the R4b.2 proof.
+                crate::safe_print!(80, "[SMP] fwd-server thread: serviced post-bringup forward(s) PASS\n");
+            }
+            total += n;
+            akuma_exec::threading::yield_now();
+        }
+    });
+    match spawned {
+        Ok(tid) => {
+            crate::safe_print!(64, "[SMP] fwd-server thread spawned (tid {})\n", tid);
+        }
+        Err(e) => {
+            crate::safe_print!(80, "[SMP] fwd-server thread spawn FAILED: {}\n", e);
         }
     }
 }

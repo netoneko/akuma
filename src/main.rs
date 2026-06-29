@@ -1218,6 +1218,12 @@ fn run_async_main() -> ! {
     #[cfg(kernel_smp)]
     smp::start_console_drainer();
 
+    // Multikernel: start the persistent forward-server (R4b.2) — drains the BSP inbox
+    // and services cross-core forward requests for the system's lifetime, the steady-
+    // state replacement for the transient bringup wait loop. (No-op single-core.)
+    #[cfg(kernel_smp)]
+    smp::start_fwd_server();
+
     // Initialize SSH host key
     ssh::init_host_key();
 
