@@ -30,7 +30,8 @@ use akuma_exec::mmu::{attr_index, flags, phys_to_virt, MAIR_DEVICE_NGNRNE, MAIR_
 // Pure data plane + protocol lives in the host-testable `akuma-smp` crate; this
 // module is the kernel glue (asm, PSCI, page tables, the pump).
 use akuma_smp::{
-    partition, Command, ConsoleRing, CoreStateMachine, Event, MachineConfig, Range, ENF_FAULTED,
+    partition, Command, ConsoleRing, CoreConfig, CoreStateMachine, Event, MachineConfig, Range,
+    ENF_FAULTED,
     ENF_LEAKED, ENF_TESTING, MAGIC, MAX_CORES, MSG_PRESSURE, MSG_REPAID, STATE_BOOTING,
     STATE_OFFLINE, STATE_ONLINE,
 };
@@ -372,6 +373,14 @@ const PERCPU_R2_PAGES: usize = 40; // # pages its private PMM handed out
 const PERCPU_R2_FIRST_PA: usize = 48; // PA of the first such page (BSP checks in-partition)
 const PERCPU_R2_HEAP_OK: usize = 56; // 1 if a private-heap alloc round-tripped
 const PERCPU_R2_FREE: usize = 64; // its private PMM free-page count after the test
+/// PerCpu byte offsets where a secondary records its R3a (per-core cooperative
+/// scheduler) self-test result for the BSP to verify.
+const PERCPU_R3_YIELDS: usize = 72; // total yields the two coop threads performed
+const PERCPU_R3_DONE: usize = 80; // # coop threads that ran to completion (== spawned)
+/// Progress marker bumped through `run_r3a_coop_test` (1=entry … 7=recorded). The BSP
+/// reads it EVEN on timeout, so a hang inside R3a is pinpointed (the secondary's own
+/// console ring isn't reliably drained while it is still mid-bringup).
+const PERCPU_R3_STAGE: usize = 88;
 
 /// Snapshot pristine `.data` — MUST be the first thing `rust_start` does, before any
 /// code mutates a `.data`/`.bss` static. Copies `[_data_start, __bss_start)` into
@@ -908,8 +917,22 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
         }
         console::print("[SMP] core ");
         console::print_dec(idx);
-        console::print(if online { " ONLINE" } else { " TIMEOUT (never reported online)\n" });
+        console::print(if online { " ONLINE" } else { " TIMEOUT (never reported online)" });
         if !online {
+            // Pinpoint a hang: report the last R3a stage the secondary reached.
+            let percpu = cfg.cores[idx].percpu_phys as usize;
+            if percpu != 0 {
+                let st =
+                    unsafe { core::ptr::read_volatile((percpu + PERCPU_R3_STAGE) as *const u64) };
+                let yl =
+                    unsafe { core::ptr::read_volatile((percpu + PERCPU_R3_YIELDS) as *const u64) };
+                console::print(" [last R3a stage=");
+                console::print_dec(st as usize);
+                console::print(" yields=");
+                console::print_dec(yl as usize);
+                console::print("]");
+            }
+            console::print("\n");
             continue;
         }
         // Bringup-time verification (BSP runs on the all-seeing boot table): confirm
@@ -979,6 +1002,39 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
                 console::print_dec(heap_ok as usize);
                 console::print(" bsp_untouched=");
                 console::print(if bsp_untouched { "1" } else { "0" });
+                console::print(" ✗)\n");
+            }
+        }
+        // R3a: per-core cooperative scheduler. The secondary registered akuma-exec's
+        // runtime locally, stood up its scheduler, and ran two cooperative kernel
+        // threads that yielded to each other. Verify both ran to completion and the
+        // total yield count is exactly NUM_THREADS * YIELDS_PER_THREAD. `done==0 &&
+        // yields==0` means it was skipped (partition too small) — reported distinctly.
+        if percpu != 0 {
+            let r3_yields =
+                unsafe { core::ptr::read_volatile((percpu + PERCPU_R3_YIELDS) as *const u64) };
+            let r3_done =
+                unsafe { core::ptr::read_volatile((percpu + PERCPU_R3_DONE) as *const u64) };
+            let expect_yields = R3_NUM_THREADS * R3_YIELDS_PER_THREAD;
+            console::print("[SMP] core ");
+            console::print_dec(idx);
+            if r3_done == R3_SKIPPED {
+                console::print(" R3a: skipped (partition too small for thread pool)\n");
+            } else if r3_done == R3_NUM_THREADS && r3_yields == expect_yields {
+                console::print(" R3a: per-core cooperative scheduler ✓ (");
+                console::print_dec(r3_done as usize);
+                console::print(" threads, ");
+                console::print_dec(r3_yields as usize);
+                console::print(" yields)\n");
+            } else {
+                console::print(" R3a: FAILED (done=");
+                console::print_dec(r3_done as usize);
+                console::print("/");
+                console::print_dec(R3_NUM_THREADS as usize);
+                console::print(" yields=");
+                console::print_dec(r3_yields as usize);
+                console::print("/");
+                console::print_dec(expect_yields as usize);
                 console::print(" ✗)\n");
             }
         }
@@ -1196,6 +1252,13 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
     // isolated alloc works (records the result to PerCpu for the BSP). Done BEFORE
     // announcing Online so the BSP can verify it synchronously once it sees Online.
     run_r2_test(cc.ram_base as usize, cc.ram_len as usize, cc.kernel_end as usize, percpu);
+
+    // R3a — per-core COOPERATIVE scheduler self-test (records to PerCpu for the BSP).
+    // Runs after R2 (needs the per-core heap+PMM) and BEFORE we re-stamp TPIDRRO_EL0
+    // with the PerCpu PA for the heartbeat loop (the scheduler uses TPIDRRO_EL0 as the
+    // current-thread id). Returns to this isolated context with IRQs masked + the
+    // `smp_vectors` restored, so the M2 doorbell/heartbeat path below is unaffected.
+    run_r3a_coop_test(cc, core_idx, percpu);
 
     // First words a secondary ever speaks for itself — proving the §8.2 console path
     // end to end: this `print` lands in our console ring; the BSP drainer thread (not
@@ -1415,6 +1478,209 @@ fn run_r2_test(pbase: usize, plen: usize, kernel_end: usize, percpu: usize) {
             crate::pmm::free_count() as u64,
         );
     }
+}
+
+// ============================================================================
+// R3a — per-core COOPERATIVE scheduler (docs/MULTIKERNEL.md §15). Proves a secondary
+// can run akuma_exec's process table + scheduler over its OWN replicated statics +
+// partition: it registers the runtime locally, stands up the scheduler, installs the
+// real exception vectors, and runs two cooperative kernel threads that yield to each
+// other. No preemption/timer/syscalls yet (those are R3b/R4).
+// ============================================================================
+
+/// Scheduler SGI INTID. Must match `gic::SGI_SCHEDULER` and `yield_now`'s
+/// `trigger_sgi(0)`. Distinct from the M2 `DOORBELL_SGI` (= 1).
+const SCHED_SGI: u32 = 0;
+/// Yields each cooperative worker performs before terminating.
+const R3_YIELDS_PER_THREAD: u64 = 8;
+/// Number of cooperative workers the boot thread spawns.
+const R3_NUM_THREADS: u64 = 2;
+/// Upper bound on boot-thread driver iterations (defensive; the test finishes in
+/// `R3_NUM_THREADS * R3_YIELDS_PER_THREAD` round-robin hops in practice).
+const R3_MAX_SPINS: u64 = 200_000;
+/// Skip R3a unless free PMM comfortably covers the release-profile thread-stack pool
+/// (~15 MB) — keeps `threading::init` from panicking on a tiny partition (a panic on a
+/// secondary would fault, since its console is a ring, not the UART).
+const R3_MIN_FREE_PAGES: usize = 8192; // 32 MiB
+
+/// Shared counters for the R3a workers. Replicated `.bss` statics → each core mutates
+/// its OWN copy (no cross-core contention); the boot thread re-zeroes them per run.
+static R3_YIELD_COUNTER: AtomicU64 = AtomicU64::new(0);
+static R3_THREADS_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// Worker body for the R3a test: bump the shared yield counter and `yield_now`,
+/// `R3_YIELDS_PER_THREAD` times, then mark done and terminate. Spawned as a CLOSURE via
+/// `spawn_system_thread_fn` — that path builds a real `setup_fake_irq_frame`, which the
+/// live stack-based scheduler restores. (The bare `spawn(extern fn)` path is
+/// register-based — `ctx.sp` = empty stack top — and incompatible with this scheduler:
+/// the switch would pop a garbage IRQ frame.) Preemptive, but with no timer armed
+/// during the test it only switches on the voluntary yield SGI — i.e. cooperatively.
+fn r3_worker_body() -> ! {
+    for _ in 0..R3_YIELDS_PER_THREAD {
+        R3_YIELD_COUNTER.fetch_add(1, Ordering::SeqCst);
+        akuma_exec::threading::yield_now();
+    }
+    R3_THREADS_DONE.fetch_add(1, Ordering::SeqCst);
+    akuma_exec::threading::mark_current_terminated();
+    // Terminated: yield so the scheduler reschedules someone else and never us.
+    loop {
+        akuma_exec::threading::yield_now();
+    }
+}
+
+/// Set `VBAR_EL1` to a named `.global` vector-table symbol (2 KiB-aligned, in mapped
+/// `.text`). Used to swap between the kernel's real `exception_vector_table` (for the
+/// scheduler SGI path) and the secondary's minimal `smp_vectors`.
+macro_rules! set_vbar {
+    ($sym:literal) => {{
+        // SAFETY: `$sym` is a 2 KiB-aligned vector table mapped RO in our table.
+        unsafe {
+            core::arch::asm!(
+                concat!("adrp {t}, ", $sym),
+                concat!("add  {t}, {t}, :lo12:", $sym),
+                "msr vbar_el1, {t}",
+                "isb",
+                t = out(reg) _,
+                options(nomem, nostack),
+            );
+        }
+    }};
+}
+
+/// Bring up this PE's GICv3 receive path for the SCHEDULER SGI (INTID 0): enable the
+/// system-register CPU interface, wake the redistributor, and enable SGI 0. A subset of
+/// [`secondary_gic_init`] (which later also enables the doorbell + timer); the CPU
+/// interface state persists, so running both in sequence is fine.
+fn scheduler_sgi_enable(idx: usize) {
+    // SAFETY: GICv3 CPU-interface system registers; values per the architecture.
+    unsafe {
+        let sre: u64;
+        core::arch::asm!("mrs {0}, S3_0_C12_C12_5", out(reg) sre, options(nomem, nostack));
+        core::arch::asm!("msr S3_0_C12_C12_5, {0}", in(reg) sre | 1, options(nomem, nostack)); // ICC_SRE_EL1.SRE
+        core::arch::asm!("isb", options(nomem, nostack));
+        core::arch::asm!("msr S3_0_C4_C6_0, {0}", in(reg) 0xFFu64, options(nomem, nostack)); // ICC_PMR_EL1
+        core::arch::asm!("msr S3_0_C12_C12_3, {0}", in(reg) 0u64, options(nomem, nostack)); // ICC_BPR1_EL1
+        core::arch::asm!("msr S3_0_C12_C12_7, {0}", in(reg) 1u64, options(nomem, nostack)); // ICC_IGRPEN1_EL1
+        core::arch::asm!("isb", options(nomem, nostack));
+    }
+    let rd = GICR_BASE + idx * GICR_STRIDE;
+    let sgi = rd + GICR_SGI_OFFSET;
+    let waker = rd + GICR_WAKER;
+    mmio_w32(waker, mmio_r32(waker) & !GICR_WAKER_PROCESSOR_SLEEP);
+    while mmio_r32(waker) & GICR_WAKER_CHILDREN_ASLEEP != 0 {
+        core::hint::spin_loop();
+    }
+    // SGIs to Group 1, mid priority; enable the scheduler SGI (INTID 0).
+    mmio_w32(sgi + GICR_SGI_IGROUPR0, 0xFFFF_FFFF);
+    for i in 0..8 {
+        mmio_w32(sgi + GICR_SGI_IPRIORITYR + i * 4, 0xA0A0_A0A0);
+    }
+    mmio_w32(sgi + GICR_SGI_ISENABLER0, 1u32 << SCHED_SGI);
+    // SAFETY: ensure the redistributor writes complete before IRQs are unmasked.
+    unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
+}
+
+/// Self-targeting scheduler SGI for a secondary. The kernel's `gic::trigger_sgi`
+/// (which `yield_now` calls via the runtime) hardcodes TargetList bit 0 — i.e. it
+/// rings PE 0 (the BSP). On a secondary that would deliver the scheduler SGI to the
+/// WRONG core and the yield would never switch. Re-target it at THIS PE (aff0 = our
+/// core index) so `yield_now` rings ourselves. Installed in the secondary's runtime.
+fn trigger_sched_sgi_self(sgi_id: u32) {
+    let aff0 = (read_mpidr() & 0xff) as u32;
+    crate::gic::trigger_sgi_core(aff0, sgi_id);
+}
+
+/// Sentinel written to `PERCPU_R3_DONE` when R3a is skipped (vs. a genuine 0-progress
+/// failure, which leaves it 0). Lets the BSP report "skipped" distinctly.
+const R3_SKIPPED: u64 = u64::MAX;
+
+/// Run the R3a cooperative-scheduler self-test on this secondary, recording the
+/// outcome to PerCpu for the BSP. Preconditions: per-core heap+PMM are up (R2 ran) and
+/// TPIDRRO_EL0 has NOT yet been set to the PerCpu PA (the scheduler uses it as the
+/// current-thread id). On return: IRQs masked, `smp_vectors` reinstalled.
+fn run_r3a_coop_test(cc: &CoreConfig, idx: usize, percpu: usize) {
+    if percpu == 0 {
+        return;
+    }
+    // Guard: a partition too small for the thread-stack pool would panic in
+    // threading::init. Mark skipped (sentinel) so the BSP can distinguish it.
+    if crate::pmm::free_count() < R3_MIN_FREE_PAGES {
+        // SAFETY: PerCpu page is mapped RW in this core's restricted table.
+        unsafe { core::ptr::write_volatile((percpu + PERCPU_R3_DONE) as *mut u64, R3_SKIPPED) };
+        return;
+    }
+
+    // 1. Make every kernel thread on this core use OUR restricted table, not the BSP's.
+    //    `get_boot_ttbr0`'s asm cell (`boot_ttbr0_addr`) is in `.data.boot`, OUTSIDE the
+    //    replicated writable window (shared RO here — a write would fault), so we use the
+    //    replicated `BOOT_TTBR0_OVERRIDE` static instead. Without this the scheduler would
+    //    `msr ttbr0_el1, <BSP table>` on the first switch and destroy isolation.
+    akuma_exec::mmu::set_boot_ttbr0_override(cc.ttbr0_phys);
+
+    // 2. Register akuma-exec in our OWN replicated runtime/config cells (the BSP's are
+    //    private to it). Canaries OFF; our isolated per-core boot stack as the bounds.
+    //    Re-target the scheduler SGI at THIS PE (yield_now must ring ourselves, not the
+    //    BSP — see trigger_sched_sgi_self).
+    let sec_top = cc.entry_sp as usize;
+    let sec_base = sec_top - (1usize << SECONDARY_STACK_SHIFT);
+    let user_stack = crate::config::compute_user_stack_size(cc.ram_len as usize);
+    let (mut rt, cfg) = crate::build_exec_runtime(sec_base, sec_top, user_stack, false);
+    rt.trigger_sgi = trigger_sched_sgi_self;
+    akuma_exec::init(rt, cfg);
+
+    // Stage marker helper: record progress to PerCpu so the BSP can pinpoint a hang.
+    let stage = |s: u64| {
+        // SAFETY: PerCpu page is mapped RW in this core's restricted table.
+        unsafe { core::ptr::write_volatile((percpu + PERCPU_R3_STAGE) as *mut u64, s) };
+    };
+    stage(1); // entered, runtime built + registered
+
+    // 3. Stand up this core's scheduler (allocates thread stacks from OUR PMM).
+    akuma_exec::threading::init();
+    stage(3); // threading::init done
+
+    // 4. Switch to the real exception vectors (scheduler-SGI path) and enable ONLY
+    //    SGI 0, so the sole IRQ that can fire during the test is yield_now's SGI.
+    set_vbar!("exception_vector_table");
+    scheduler_sgi_enable(idx);
+    crate::irq::enable_irqs();
+    stage(4); // vectors + gic up, IRQs on
+
+    // 5. Spawn the cooperative workers.
+    R3_YIELD_COUNTER.store(0, Ordering::SeqCst);
+    R3_THREADS_DONE.store(0, Ordering::SeqCst);
+    let mut spawned = 0u64;
+    for _ in 0..R3_NUM_THREADS {
+        if akuma_exec::threading::spawn_system_thread_fn(r3_worker_body).is_ok() {
+            spawned += 1;
+        }
+    }
+    stage(5); // spawned; about to drive the scheduler
+
+    // 6. Drive the scheduler from the boot thread (thread 0) until both workers finish.
+    //    Each yield_now switches to a ready worker; control returns here once they all
+    //    terminate (or the defensive spin cap is hit).
+    let mut spins = 0u64;
+    while R3_THREADS_DONE.load(Ordering::Acquire) < spawned && spins < R3_MAX_SPINS {
+        akuma_exec::threading::yield_now();
+        spins += 1;
+    }
+    stage(6); // driver loop done
+
+    // 7. Quiesce before returning to the M2 heartbeat path: IRQs off, restore the
+    //    minimal smp vectors (whose IRQ handler reads TPIDRRO_EL0 as the PerCpu PA).
+    crate::irq::disable_irqs();
+    set_vbar!("smp_vectors");
+
+    // 8. Record the proof for the BSP.
+    let yields = R3_YIELD_COUNTER.load(Ordering::Acquire);
+    let done = R3_THREADS_DONE.load(Ordering::Acquire);
+    // SAFETY: PerCpu page is mapped RW in this core's restricted table.
+    unsafe {
+        core::ptr::write_volatile((percpu + PERCPU_R3_YIELDS) as *mut u64, yields);
+        core::ptr::write_volatile((percpu + PERCPU_R3_DONE) as *mut u64, done);
+    }
+    stage(7); // recorded
 }
 
 // ============================================================================

@@ -6,14 +6,16 @@ untouched. Verified under QEMU `SMP=4 @ 2 GB`:
 - **M0** — secondaries wake via PSCI `CPU_ON` (hvc), report `Online`.
 - **M1 isolation** — each secondary runs on its OWN restricted page table (shared RO code +
   descriptor + private stack/PerCpu; peers UNMAPPED). Hardware isolation is **proven**: a
-  deliberate cross-core read **faults**. (Per-core `pmm`/heap/scheduler over a real partition
-  is still TODO — see §4.2 note; this is a TTBR0 identity kernel, so isolation uses per-core
-  *TTBR0* tables + a private PerCpu chunk, not the original "replicated `.data/.bss` via TTBR1".)
-- **Messaging + protocol** — per-core heartbeat liveness + a lock-free MPSC inbox ring; the
-  debt-based memory-reclaim protocol (§9) runs the host-tested `akuma_smp::CoreStateMachine`
-  over real rings (pressure → debtors repay their creditor → receiver zeroes + reclaims).
-  Values are faked (no per-core PMM yet) — logged only — but the protocol *logic* is the
-  simulator-validated code.
+  deliberate cross-core read **faults**. (This is a TTBR0 identity kernel, so isolation uses
+  per-core *TTBR0* tables + replicated `.data`/`.bss` + a private PerCpu chunk, not the original
+  "via TTBR1". Per-core `pmm`/heap over a real partition = **R2 ✅**; a per-core COOPERATIVE
+  scheduler = **R3a ✅**; preemptive + syscalls = R3b, TODO.)
+- **Messaging (M2) + protocol** — per-core heartbeat liveness, a lock-free MPSC inbox ring, and a
+  cross-core **SGI doorbell**; secondaries are event-driven (WFI-sleep, wake on per-core timer
+  tick or doorbell). The debt-based memory-reclaim protocol (§9) runs the host-tested
+  `akuma_smp::CoreStateMachine` over real rings (pressure → debtors repay their creditor →
+  receiver zeroes + reclaims). Values are still faked (the demo doesn't yet move real pages) —
+  logged only — but the protocol *logic* is the simulator-validated code.
 - **Per-core runtime (Approach 2, §15) — R1+R2 DONE:** R1 — each secondary gets a PRIVATE copy of
   the kernel's `.data`/`.bss` at the same VA, so `static PMM`/allocator/`POOL` resolve to its
   own instance (verified: a secondary mutates a shared static into its private copy; the BSP's
@@ -24,11 +26,26 @@ untouched. Verified under QEMU `SMP=4 @ 2 GB`:
   there and `alloc`s. The partitions are reserved from the BSP PMM at boot, so the pools are
   strictly disjoint (verified SMP=2 and SMP=4: each core allocs in-partition, BSP pool
   untouched). This unblocks per-core exec/scheduler (R3) and a real pinned process (R4).
+- **Per-core console (§8.2) DONE** — a secondary's restricted table doesn't map the UART, so
+  `console::print` routes (via one `emit()` chokepoint) to the core's `ConsoleRing` (a 4 KiB-page
+  SPSC byte ring in the shared descriptor); a BSP drainer system thread forwards all rings to the
+  UART. Verified SMP=2/4: each secondary prints `[core N] …` for itself. Unblocks all secondary
+  output for R3.
+- **Per-core cooperative scheduler (§15) — R3a DONE:** each secondary registers `akuma_exec`'s
+  runtime in its OWN replicated `RUNTIME`/`CONFIG` cells (the BSP sets those *after* the `.data`
+  snapshot, so a secondary's copy is pristine — it calls `akuma_exec::init` locally, with the
+  scheduler SGI re-targeted at itself and `BOOT_TTBR0_OVERRIDE` = its restricted table so spawned
+  threads inherit its address space, not the BSP's), stands up `threading::init`, installs the
+  real `exception_vector_table`, and runs two kernel threads that `yield_now` to each other over
+  its private scheduler + stacks. Verified SMP=2/4: every secondary reports `R3a: cooperative
+  scheduler ✓ (2 threads, 16 yields)` then resumes the M2 heartbeat/doorbell loop intact. No
+  preemption/timer/syscalls yet (R3b).
 
 Build with `scripts/build_smp.sh`; boot with `scripts/run_smp.sh` (or `SMP=N cargo run
 --profile release-smp --features smp`). Host-test/simulate the protocol with no QEMU:
 `cargo test -p akuma-smp --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)`. Remaining:
-per-core PMM (M1c), the SGI doorbell (M2), roles + forwarding (M3, §10), dynamic memory (M4).
+per-core preemptive scheduler + syscalls (R3b) → pinned process + I/O forwarding (R4/M3, §10),
+dynamic memory (M4). Deferred cleanup/tech-debt is tracked in §16.
 **Author:** design notes, 2026-06-28
 **Scope:** AArch64 (QEMU virt). A shared-nothing, message-passing multikernel where each
 physical core boots its own kernel instance ("a container per core"), instead of one
@@ -649,7 +666,8 @@ Staged, each independently verifiable:
 |---|---|---|
 | **R1 — writable replication** ✅ | Secondary gets a private `.data`/`.bss` at the kernel VA | `snapshot_pristine_data()` (first thing in `rust_start`) copies `.data`→`DATA_SNAPSHOT` before any mutation; `replicate_writable_window()` maps `[_data_start,_kernel_phys_end)` to private pages (`.data` from snapshot, `.bss` zeroed). **The descriptor (`MACHINE_CONFIG`, a `.bss` static) is the one thing that must stay SHARED** — replication skips it and maps it shared. Proof: a secondary mutates a shared static into its private copy; the BSP's copy stays pristine. |
 | **R2 — per-core PMM + heap** ✅ | Secondary runs `pmm::init`/`allocator::init` over its partition; `alloc` works, BSP PMM untouched | DONE. `PartitionBump` carves the secondary's whole bringup image (page tables + replicated `.data`/`.bss` + stack + PerCpu) from its OWN partition (never the BSP `pmm`); `build_isolated_table` identity-maps the partition as 2 MiB RW blocks and records the consumed prefix as `kernel_end`. The secondary then seeds a private heap just above `kernel_end` and runs the unchanged `allocator::init` + `pmm::init` over `[pbase, pbase+len_2mb)` — they resolve to its replicated `static`s, so nothing the BSP owns is touched. `smp::reserve_secondary_partitions` (called right after the BSP's `pmm::init`, before `mmu::init`) removes those ranges from the BSP pool so the two are disjoint. Proof: `run_r2_test` allocs a heap `Vec` + 16 PMM pages and posts the result to PerCpu; the BSP confirms in-partition + BSP-pool-unchanged (verified SMP=2/4). Did **not** call `akuma_exec::mmu::init` on a secondary (it writes the SHARED boot tables). |
-| **R3 — per-core exec/scheduler** | Secondary runs `akuma_exec` (process table, scheduler) per-core; switches to the main `exceptions.rs` vectors | Its `POOL`/process table are now per-core via replication; preemption via the per-core timer; syscalls trap to the (per-core) handlers. |
+| **R3a — per-core COOPERATIVE scheduler** ✅ | Secondary runs `akuma_exec`'s scheduler per-core and switches between kernel threads via `yield_now` | DONE (SMP=2/4). `run_r3a_coop_test`: register the runtime locally (`build_exec_runtime` extracted from `main.rs`, canaries off, secondary stack bounds) since the BSP's `RUNTIME`/`CONFIG` cells are set post-snapshot and a secondary's replicated copy is pristine; `akuma_exec::mmu::set_boot_ttbr0_override(our table)` so spawned threads get OUR TTBR0, not the BSP's (`boot_ttbr0_addr` lives in `.data.boot`, *outside* the replicated writable window, so the asm cell can't be rewritten on a secondary); re-target the scheduler SGI at this PE (`gic::trigger_sgi` hardcodes TargetList bit 0 = BSP); install the real `exception_vector_table`; enable only the scheduler SGI; spawn 2 workers via `spawn_system_thread_fn` (the closure path builds a real `setup_fake_irq_frame` — the bare `spawn(extern fn)` path is register-based and incompatible with the stack-based scheduler) and `yield_now` between them. Proof: 2 threads × 8 yields = 16, then the M2 heartbeat/doorbell loop resumes. |
+| **R3b — per-core preemptive scheduler + syscalls** | Per-core timer preemption; syscalls trap to the (per-core) handlers | The timer PPI must route to the scheduler (today the secondary's timer only wakes the heartbeat WFI loop); SVC path on the per-core vectors. |
 | **R4 — process + forwarding (the demo)** | Spawn `/bin/hello` (then `curl`) pinned to core 1, forwarding `open`/`read`/`write`/sockets to core 0 (§10) | "exec is recursive forwarding": core 1 has no VFS, so loading the ELF forwards `open`/`read` to core 0. Console + sockets likewise. This is the §10 acceptance test. |
 
 **Why R1 is the keystone:** once `static`s are per-core, R2–R4 reuse the *existing*
@@ -657,7 +675,13 @@ kernel init/exec code unchanged — the per-core-ness lives entirely in the page
 
 ## 16. Deferred cleanup / tech debt (later)
 
-Tracked here so it isn't lost; tackle after the R3/R4 milestones, not inline.
+Tracked here so it isn't lost; tackle after the R3b/R4 milestones, not inline.
+
+- **R3a leftovers.** After the cooperative self-test a secondary leaves a fully-initialized
+  scheduler + 2 terminated worker slots dormant (the heartbeat loop never yields again) — fine
+  for now. The `PERCPU_R3_STAGE` progress marker + BSP timeout print are kept as cheap living
+  diagnostics. R3b will swap the secondary's minimal `smp_vectors` for the real
+  `exception_vector_table` permanently and route the timer PPI to the scheduler.
 
 - **Sweep deprecated code (general).** Do a pass over the kernel + crates for dead/deprecated
   code and remove it. (Done so far, 2026-06-29: removed the dead `switch_context` asm + its

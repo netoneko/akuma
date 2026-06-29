@@ -232,8 +232,30 @@ pub fn flush_tlb_all() {
 #[cfg(not(target_os = "none"))]
 pub fn flush_tlb_all() {}
 
+/// Per-core override for [`get_boot_ttbr0`]. The boot-table root is published by the
+/// boot asm into the `boot_ttbr0_addr` cell, which lives in `.data.boot` — placed
+/// BEFORE `_data_start`, so it is OUTSIDE the multikernel's replicated writable window
+/// and is shared read-only on a secondary (a write there faults). A multikernel
+/// SECONDARY therefore can't rewrite that cell; instead it sets this override (a normal
+/// `.bss` static, which IS replicated per core) to its OWN restricted-table root, so
+/// every kernel thread it spawns gets `ctx.ttbr0 = its own table`, not the BSP's.
+/// Zero means "no override" — the BSP (and the default build) read the asm cell.
+#[cfg(target_os = "none")]
+static BOOT_TTBR0_OVERRIDE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Override the boot TTBR0 used for newly-spawned kernel threads on THIS core. See
+/// [`BOOT_TTBR0_OVERRIDE`]. Multikernel secondaries call this before `threading::init`.
+#[cfg(target_os = "none")]
+pub fn set_boot_ttbr0_override(ttbr0: u64) {
+    BOOT_TTBR0_OVERRIDE.store(ttbr0, Ordering::Relaxed);
+}
+
 #[cfg(target_os = "none")]
 pub fn get_boot_ttbr0() -> u64 {
+    let over = BOOT_TTBR0_OVERRIDE.load(Ordering::Relaxed);
+    if over != 0 {
+        return over;
+    }
     unsafe {
         let addr: u64;
         core::arch::asm!(
