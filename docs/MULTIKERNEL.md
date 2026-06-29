@@ -654,3 +654,19 @@ Staged, each independently verifiable:
 
 **Why R1 is the keystone:** once `static`s are per-core, R2–R4 reuse the *existing*
 kernel init/exec code unchanged — the per-core-ness lives entirely in the page tables.
+
+## 16. Deferred cleanup / tech debt (later)
+
+Tracked here so it isn't lost; tackle after the R3/R4 milestones, not inline.
+
+- **Sweep deprecated code (general).** Do a pass over the kernel + crates for dead/deprecated
+  code and remove it. (Done so far, 2026-06-29: removed the dead `switch_context` asm + its
+  `extern` decls and the deprecated `sgi_scheduler_handler` in `crates/akuma-exec/src/threading`
+  — the live scheduler is the stack-based `sgi_scheduler_handler_with_sp` driven by the
+  `exceptions.rs` IRQ path. `thread_start`/`thread_start_closure` trampolines are KEPT — the
+  modern path still uses them.)
+- **Console (§8.2) tweaks.** Producer drops on a full ring (add yield-backpressure?); the drainer
+  runs every scheduler quantum (add a coarser cadence + coalesced-doorbell wake); optionally route
+  the BSP's own console through a ring too and move the whole console to a userspace server.
+- **CoW benchmark gating** — `run_cow_benchmarks()` prints `[BENCH]` every boot on purpose; gate
+  behind a flag.

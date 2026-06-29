@@ -1102,138 +1102,8 @@ pub fn check_preemption_watchdog() -> Option<u64> {
 global_asm!(
     r#"
 .section .text
-.global switch_context
 .global thread_start
 .global thread_start_closure
-
-// void switch_context(Context* old, const Context* new)
-// x0 = pointer to old context (save here)
-// x1 = pointer to new context (load from here)
-switch_context:
-    // Save old context
-    // NOTE: magic field is at offset 0, registers start at offset 8
-    stp x19, x20, [x0, #8]
-    stp x21, x22, [x0, #24]
-    stp x23, x24, [x0, #40]
-    stp x25, x26, [x0, #56]
-    stp x27, x28, [x0, #72]
-    stp x29, x30, [x0, #88]
-    
-    // Save stack pointer
-    mov x9, sp
-    str x9, [x0, #104]
-    
-    // Save DAIF (interrupt mask)
-    mrs x9, daif
-    str x9, [x0, #112]
-    
-    // Save ELR_EL1 and SPSR_EL1 to context
-    // CRITICAL: We MUST save/restore these here because:
-    // - irq_handler pushes ELR/SPSR to the OLD thread's stack
-    // - switch_context switches to the NEW thread's stack  
-    // - irq_handler would pop from the WRONG stack without this!
-    // Each thread needs its own saved ELR/SPSR in its context.
-    mrs x9, elr_el1
-    str x9, [x0, #120]
-    mrs x9, spsr_el1
-    str x9, [x0, #128]
-    
-    // Save TTBR0_EL1 (user address space)
-    // This is critical for thread safety: each thread may have different TTBR0
-    // (kernel threads use boot TTBR0, user processes use their own)
-    mrs x9, ttbr0_el1
-    str x9, [x0, #136]
-
-    // Save TPIDR_EL0 (user TLS pointer)
-    mrs x9, tpidr_el0
-    str x9, [x0, #160]
-    
-    // Ensure all writes to new context memory are visible before loading
-    dsb ish
-    
-    // Load new context
-    ldp x19, x20, [x1, #8]
-    ldp x21, x22, [x1, #24]
-    ldp x23, x24, [x1, #40]
-    ldp x25, x26, [x1, #56]
-    ldp x27, x28, [x1, #72]
-    ldp x29, x30, [x1, #88]
-    
-    // CRITICAL: Catch corrupt x30 before ret
-    // If x30 == 0, we'd jump to address 0 and crash with EC=0x0
-    cbnz x30, 10f
-    // x30 is 0! Halt the system with marker
-    mov x0, #0xBAD
-    movk x0, #0x0030, lsl #16   // 0x00300BAD = "bad x30"
-11: wfi
-    b 11b
-10:
-    
-    // Load stack pointer
-    ldr x9, [x1, #104]
-    mov sp, x9
-    
-    // CRITICAL: Do NOT restore DAIF here!
-    // 
-    // Restoring DAIF could unmask IRQs mid-switch, allowing a nested timer
-    // interrupt. Since TPIDRRO_EL0 was already updated, the nested handler
-    // would save the wrong thread's context, causing corruption.
-    //
-    // IRQs must stay MASKED throughout switch_context.
-    //
-    // For RETURNING threads: sgi_scheduler_handler's epilog will unmask IRQs,
-    // then ERET restores SPSR (which includes original IRQ state).
-    //
-    // For NEW threads: they ret to thread_start_closure which handles IRQ
-    // enabling based on thread type (process threads stay masked until
-    // activate(), others enable immediately).
-    
-    // Load ELR_EL1 and SPSR_EL1 from new context
-    // This ensures irq_handler's ERET uses this thread's saved values,
-    // not garbage from the stack (which belongs to a different thread after switch).
-    ldr x9, [x1, #120]
-    
-    // CRITICAL: Catch corrupt ELR before writing to system register
-    // ELR=0 is ALWAYS a bug for any thread - there's no valid code at address 0
-    cbnz x9, 12f                // ELR != 0, OK
-    // ELR is 0! Halt with thread ID in x1
-    mrs x1, tpidrro_el0         // Get thread ID for debugging
-    mov x0, #0xBAD
-    movk x0, #0x00E1, lsl #16   // 0x00E10BAD = "bad ELR"
-13: wfi
-    b 13b
-12:
-    msr elr_el1, x9
-    ldr x9, [x1, #128]
-    msr spsr_el1, x9
-    isb                       // Ensure ELR/SPSR changes visible before continuing
-    
-    // Load TTBR0_EL1 (user address space)
-    // Must restore before returning so the thread sees the correct address space
-    //
-    // CRITICAL: Must flush TLB after TTBR0 switch!
-    // When switching between threads with different TTBR0 (kernel vs user),
-    // stale TLB entries from the old address space could cause:
-    // - Wrong physical addresses being accessed
-    // - External aborts during translation table walk (DFSC=0x21)
-    // 
-    // Sequence: DSB -> switch TTBR0 -> ISB -> flush TLB -> DSB -> ISB
-    ldr x9, [x1, #136]
-    dsb ish                   // Complete pending memory accesses
-    msr ttbr0_el1, x9         // Switch TTBR0
-
-    // Restore TPIDR_EL0 (user TLS pointer)
-    ldr x9, [x1, #160]
-    msr tpidr_el0, x9
-    isb
-    
-    isb                       // Ensure TTBR0 change visible
-    tlbi vmalle1              // Flush all EL1 TLB entries
-    dsb ish                   // Wait for TLB flush to complete
-    isb                       // Ensure clean state before execution continues
-    
-    // Return
-    ret
 
 // Thread entry trampoline for extern "C" functions
 // x19 holds the actual thread entry function
@@ -1285,13 +1155,10 @@ thread_exit_asm:
 
 #[cfg(target_os = "none")]
 unsafe extern "C" {
-    fn switch_context(old: *mut Context, new: *const Context);
     fn thread_start() -> !;
     fn thread_start_closure() -> !;
 }
 
-#[cfg(not(target_os = "none"))]
-unsafe extern "C" fn switch_context(_old: *mut Context, _new: *const Context) {}
 #[cfg(not(target_os = "none"))]
 unsafe extern "C" fn thread_start() -> ! { panic!("not on bare metal") }
 #[cfg(not(target_os = "none"))]
@@ -1383,7 +1250,7 @@ extern "C" fn thread_exit_stub() -> ! {
 //
 // Thread contexts are stored in a separate static array, NOT behind the POOL
 // spinlock. This allows the scheduler to access contexts without holding the
-// lock across switch_context, which would cause deadlock.
+// lock across the context switch, which would cause deadlock.
 //
 // Safety invariants:
 // 1. Only the scheduler (with IRQs masked) modifies contexts during switch
@@ -2280,212 +2147,6 @@ where
 }
 
 
-/// DEPRECATED: Old SGI handler using switch_context
-/// 
-/// This handler used the old context switching mechanism with `switch_context`.
-/// It has been replaced by `sgi_scheduler_handler_with_sp` which uses a unified
-/// stack-based approach for both EL0 and EL1 IRQs.
-/// 
-/// Kept for reference and potential fallback.
-#[allow(dead_code)]
-#[cfg(target_os = "none")]
-pub fn sgi_scheduler_handler(irq: u32) {
-    (runtime().end_of_interrupt)(irq);
-
-    let voluntary = VOLUNTARY_SCHEDULE.swap(false, Ordering::Acquire);
-
-    // CRITICAL: Copy all needed metadata while holding lock, then release lock BEFORE switch_context.
-    // We cannot hold the lock across switch_context because:
-    // 1. The new thread might get a timer IRQ and try to acquire the same lock → deadlock
-    // 2. The lock guard is on the old thread's stack which we're switching away from
-    //
-    // Solution: Contexts are stored in THREAD_CONTEXTS static array (not behind lock).
-    // We copy stack bases and exception stack pointer while locked, then release.
-    let switch_info = {
-        let mut pool = POOL.lock();
-        pool.schedule_indices(voluntary).map(|(old_idx, new_idx)| {
-            // Copy all metadata we need - lock will be released after this block
-            let old_stack_base = pool.stacks[old_idx].base;
-            let new_stack_base = pool.stacks[new_idx].base;
-            let new_tpidr = pool.slots[new_idx].exception_stack_top;
-            (old_idx, new_idx, old_stack_base, new_stack_base, new_tpidr)
-        })
-    };  // Lock released here - safe because contexts are in separate static array
-
-    if let Some((old_idx, new_idx, old_stack_base, new_stack_base, new_tpidr)) = switch_info {
-        if config().enable_sgi_debug_prints {
-            // Safe print without heap allocation (critical in IRQ context!)
-            safe_print!(128, "[SGI] switching {} -> {}\n", old_idx, new_idx);
-        }
-        
-        unsafe {
-            // Verify stack canaries before switching (only if enabled)
-            if config().enable_stack_canaries {
-                if !check_stack_canary(old_stack_base) {
-                    // Don't allocate in IRQ context!
-                    safe_print!(128, "[CANARY] old thread stack corrupt\n");
-                }
-                if !check_stack_canary(new_stack_base) {
-                    safe_print!(128, "[CANARY] new thread stack corrupt\n");
-                }
-            }
-            
-            // Access contexts from THREAD_CONTEXTS - no lock needed!
-            let old_ptr = get_context_mut(old_idx);
-            let new_ptr = get_context(new_idx);
-            
-            // Read context values for corruption checks
-            let new_ctx = &*new_ptr;
-            
-            // PHASE 3: Check context magic values before switching
-            // If magic is corrupted, the context has been overwritten
-            
-            // Check old context - if corrupted, we're already in trouble
-            let old_ctx = &*old_ptr;
-            if !old_ctx.is_valid() {
-                safe_print!(256, "[SGI CORRUPT] OLD context magic invalid for thread {} - magic=0x{:x}\n", 
-                    old_idx, old_ctx.magic);
-            }
-            
-            // Check new context - if corrupted, try to recover
-            // CRITICAL: We CANNOT return early here! schedule_indices already updated
-            // TPIDR_EL0 to new_idx. If we return, the next timer interrupt will save
-            // old_idx's CPU state into new_idx's context slot, causing corruption.
-            // We MUST always call switch_context after schedule_indices returns Some.
-            if !new_ctx.is_valid() {
-                safe_print!(256, "[SGI CORRUPT] NEW context magic invalid for thread {} - recovering\n", new_idx);
-                // Try to recover: reinitialize the context with safe values
-                // Try to recover: reinitialize the context with safe values
-                let ctx = &mut *get_context_mut(new_idx);
-                ctx.magic = CONTEXT_MAGIC;
-                ctx.spsr = 0x00000005; // EL1h, IRQs will be enabled by trampoline
-                // Mark for termination AFTER we switch to it - it will terminate itself
-                // on the next yield/preemption. Setting x30=0 will cause it to crash
-                // safely if it tries to return.
-                ctx.x30 = 0; 
-                ctx.elr = 0;
-                // Thread will run with corrupted state but at least won't corrupt others
-                THREAD_STATES[new_idx].store(thread_state::TERMINATED, Ordering::SeqCst);
-            }
-            
-            let new_saved_ttbr0 = new_ctx.ttbr0;
-            let new_saved_spsr = new_ctx.spsr;
-            let new_saved_elr = new_ctx.elr;
-            let new_saved_x30 = new_ctx.x30;
-            
-            // CRITICAL: Detect context bugs that would cause jumps to address 0
-            // This check runs ALWAYS (not behind debug flag) since it's critical
-            let new_x19 = new_ctx.x19;
-            if new_saved_elr == 0 && new_idx != 0 {
-                safe_print!(64, "[CTX BUG] tid={} ELR=0 x30={:#x}\n", new_idx, new_saved_x30);
-            }
-            if new_x19 == 0 && new_idx != 0 {
-                safe_print!(64, "[CTX BUG] tid={} x19=0 (trampoline)\n", new_idx);
-            }
-            if new_saved_x30 == 0 && new_idx != 0 {
-                safe_print!(64, "[CTX BUG] tid={} x30=0 (link reg)\n", new_idx);
-            }
-            
-            // Check for context corruption
-            let is_user_spsr = (new_saved_spsr & 0xF) == 0;
-            let is_new_thread = new_saved_elr == 0 && new_saved_spsr == 0;
-            
-            // CRITICAL: System threads (0-7) should NEVER have user-mode SPSR!
-            if new_idx < 8 && !is_new_thread && is_user_spsr {
-                // Don't allocate in IRQ context!
-                (runtime().print_str)("[SGI CORRUPT] system thread has user SPSR - recovering\n");
-                // Try to recover by forcing kernel mode in SPSR
-                (*get_context_mut(new_idx)).spsr = 0x00000345; // EL1h, IRQs enabled
-            }
-            
-            // For user process threads (8+), check for boot TTBR0 with user ELR
-            if new_idx >= 8 && !is_new_thread {
-                let is_boot_ttbr0 = new_saved_ttbr0 >= KERNEL_PHYS_BASE as u64 && new_saved_ttbr0 < 0x4040_0000;
-                let is_user_elr = new_saved_elr > 0 && new_saved_elr < 0x4000_0000;
-                
-                if is_user_elr && is_user_spsr && is_boot_ttbr0 {
-                    // Don't allocate in IRQ context!
-                    (runtime().print_str)("[SGI CORRUPT] user thread has boot TTBR0\n");
-                }
-            }
-            
-            // DEBUG: Log context info for user threads (always, to diagnose hang)
-            if new_idx >= 8 {
-                safe_print!(128, "[CTX] tid={} elr={:#x} spsr={:#x} ttbr0={:#x} sp={:#x} x19={:#x}\n",
-                    new_idx, new_saved_elr, new_saved_spsr, new_saved_ttbr0, new_ctx.sp, new_x19);
-            }
-            
-            // Update exception stack BEFORE switching
-            set_current_exception_stack(new_tpidr);
-            
-            // Note: TPIDRRO_EL0 (thread ID) is already updated by schedule_indices
-            
-            // Debug: Print context SPs before switch AND actual SP register
-            if config().enable_sgi_debug_prints {
-                let actual_sp: u64;
-                core::arch::asm!("mov {}, sp", out(reg) actual_sp);
-                let new_sp = (*new_ptr).sp;
-                let new_elr = (*new_ptr).elr;
-                safe_print!(256, "  SP_now=0x{:x} new_ctx.sp=0x{:x} new_ctx.elr=0x{:x}{}\n",
-                    actual_sp, new_sp, new_elr,
-                    if new_elr == 0 && new_idx != 0 { " *** ELR=0 BUG! ***" } else { "" });
-            }
-            
-            switch_context(old_ptr, new_ptr);
-            
-            // We return here after being switched BACK to this thread
-            // CRITICAL: Mask IRQs immediately to prevent nested timer interrupts
-            core::arch::asm!("msr daifset, #2", options(nomem, nostack));
-            
-            // Debug: Print SP after return
-            if config().enable_sgi_debug_prints {
-                let current_sp: u64;
-                core::arch::asm!("mov {}, sp", out(reg) current_sp);
-                safe_print!(64, "[SGI] back, SP={:#x}\n", current_sp);
-            }
-            
-            // Check for TTBR0/SPSR mismatch - detect context corruption early
-            let current_ttbr0: u64;
-            let current_spsr: u64;
-            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) current_ttbr0);
-            core::arch::asm!("mrs {}, spsr_el1", out(reg) current_spsr);
-            
-            // SPSR bits [3:0] = 0 means EL0 (user mode)
-            let returning_to_user = (current_spsr & 0xF) == 0;
-            let has_boot_ttbr0 = current_ttbr0 >= KERNEL_PHYS_BASE as u64 && current_ttbr0 < 0x4040_0000;
-            
-            if returning_to_user && has_boot_ttbr0 {
-                // Don't allocate in IRQ context!
-                (runtime().print_str)("[SGI DANGER] returning to EL0 with boot TTBR0\n");
-            }
-            
-            if config().enable_sgi_debug_prints {
-                // Add sequence number, SP, and x30 to help debug double-return issue
-                // Safe print without heap allocation (critical in IRQ context!)
-                static RETURN_SEQ: core::sync::atomic::AtomicU64 = 
-                    core::sync::atomic::AtomicU64::new(0);
-                let seq = RETURN_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                let current_sp: u64;
-                let current_x30: u64;
-                let current_elr: u64;
-                unsafe {
-                    core::arch::asm!("mov {}, sp", out(reg) current_sp);
-                    core::arch::asm!("mov {}, x30", out(reg) current_x30);
-                    core::arch::asm!("mrs {}, elr_el1", out(reg) current_elr);
-                }
-                safe_print!(512, "[SGI] returned to tid={} seq={} SP=0x{:x} x30=0x{:x} ELR=0x{:x}\n",
-                    old_idx, seq, current_sp, current_x30, current_elr);
-            }
-            
-            // Re-enable IRQs before returning from handler
-            // This is safe now - we've finished all critical handler work
-            unsafe {
-                core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
-            }
-        }
-    }
-}
-
 /// Counter of yield_now() calls observed with IRQs masked (DAIF.I=1).
 /// SGIs are gated by DAIF.I, so a yield issued under an IrqGuard (or any
 /// IRQ-disabling spinlock) is a silent no-op — the caller will busy-spin
@@ -2754,7 +2415,7 @@ pub fn get_waker_for_thread(thread_id: usize) -> Waker {
 /// 
 /// When called from a syscall context, TTBR0 contains user page tables.
 /// We must switch to kernel (boot) TTBR0 before yielding so that:
-/// 1. switch_context saves kernel TTBR0, not user TTBR0
+/// 1. the context switch saves kernel TTBR0, not user TTBR0
 /// 2. When resumed, kernel code can access all kernel memory
 /// 
 /// After resuming, we restore the user TTBR0 before returning to syscall handler.
