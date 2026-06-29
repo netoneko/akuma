@@ -98,9 +98,11 @@ physical memory*, two cores never touch the same allocator, so the lock never co
 cores. The isolation lives in the **page tables**, not in rewritten code.
 
 ### Payoffs the user is after
-- **Effortless process pinning** — a process lives on the kernel instance that spawned it.
-  Pinning is "spawn on core N"; migration is an explicit "ship this process to core M" message,
-  not a scheduler-affinity subsystem.
+- **Effortless process pinning** — a process lives on the kernel instance that spawned it, and a
+  kernel only ever spawns from its own userspace. So "pinning to core N" is simply *running the
+  workload's init system (herd) on core N* — there's no affinity subsystem and no remote-spawn:
+  the cross-core control is just `core_init` (activate the core + name its init program). Migration
+  ("ship this process to core M") would be an explicit message, but it's far-future, not pinning.
 - **Function offload / stripped kernels** — a core's `role` (read from boot config) selects
   which subsystems its image initializes. A compute core can omit the network stack and VFS
   entirely and **forward** those syscalls to the owning core (exactly the rump model,
@@ -417,8 +419,18 @@ SGI doorbell**:
   — **requires fixing `trigger_sgi()` to target arbitrary affinities** (today hardcoded to PE0).
 - Receiver's SGI handler drains the ring and dispatches.
 
-Message types (grow as needed): `SpawnProcess`, `ForwardSyscall` (compute core → owning core for
-net/VFS), `SignalDeliver`, `ReleasePages`/`AcceptPages` (§4.4), `Shutdown`.
+Message types (grow as needed): `CoreInit` (activate a parked core — §6/R4b), `ForwardSyscall`
+(compute core → owning core for net/VFS), `SignalDeliver`, `ReleasePages`/`AcceptPages` (§4.4),
+`Shutdown`.
+
+> **There is deliberately no `SpawnProcess` message.** Process creation is never cross-core: a
+> process exists on a kernel only because *that kernel's own userspace* issued the spawn syscall.
+> The only cross-core "put work on core N" control is `CoreInit`, which activates a parked core and
+> tells it which **init program** to bootstrap; that core's kernel then spawns it **locally** (its
+> ELF fetched via forwarded VFS), and from there the init process (herd) spawns everything else on
+> that core with ordinary local syscalls. So no kernel ever injects a process into another — which
+> is what shared-nothing requires. (Likewise a process's `exit` is reaped by its parent on the same
+> kernel — no cross-core `ChildExit`.) See §10.
 
 **Reply routing / waiter table.** Every request that parks a thread needs its reply routed back
 to *that* thread, so each core keeps a small table keyed by **correlation id** → `(thread id,
@@ -550,25 +562,30 @@ data-movement path in one playbook. This is the **Phase 0 capability split**: **
 `Proxy`s all three to core 0 (its `caps`: `Vfs=Proxy(0)`, `Net=Proxy(0)`, `Console=Proxy(0)`).
 The first split deliberately proxies **both networking and VFS** — the heaviest, most-exercised
 subsystems — so the forwarding path is validated under real load before any capability is
-split to `Own` on a secondary. A box `B` is created pinned to core 1.
+split to `Own` on a secondary.
 
-> **Placement policy lives in herd.** *How* a service gets pinned to a core — the config key,
-> the `SpawnOptions.pin_core` ABI, and the "core unavailable ⇒ log + fail, never reschedule
-> elsewhere" rule — is specced in **`userspace/herd/docs/CORE_AWARE_SCHEDULING.md`**. That
-> doc's hard dependency is **R4b.3b** (a secondary actually hosting an EL0 process); the herd
-> side can land ahead of it (inert-but-correct: pinning to a not-yet-hostable core fails the
-> availability check cleanly).
+> **Process creation is never cross-core.** A process exists on a kernel only because *that
+> kernel's own userspace* issued the spawn syscall (a `clone`/`execve` is, by definition, an EL0
+> trap into the kernel the caller runs on). So there is **no `SpawnProcess` message** and the BSP
+> never injects a process into core 1. To run work on core 1 you run an **init system (herd) on
+> core 1**: `core_init(1)` (§6/R4b) activates the core and bootstraps its init program — herd —
+> whose ELF is fetched via forwarded VFS; that herd then spawns `hello`/`curl` with ordinary
+> **local** syscalls on core 1's kernel. Placement therefore lives in the *per-core* herd's
+> config, not in a BSP→core spawn route — the same "run a supervisor inside the subkernel" pattern
+> §4.2 already mandates for boxes. See **`userspace/herd/docs/CORE_AWARE_SCHEDULING.md`**.
 
-Key insight: **exec is recursive forwarding.** Core 1 has no VFS, so loading `/bin/hello`
-forces it to forward `open`/`read` back to core 0 to fetch the ELF bytes. So `hello` alone
-already tests spawn-forward (0→1), VFS-read-forward (1→0), and console output (1→0 async).
-`curl` then adds socket-forward (1→0). This is the full matrix.
+Key insight: **exec is recursive forwarding.** Core 1 has no VFS, so loading any binary
+(`/bin/herd`, then `/bin/hello`) forces it to forward `open`/`read` back to core 0 to fetch the
+ELF bytes — the spawn itself is a *local* core-1 syscall; only the file reads cross. So `hello`
+alone already tests local-spawn-on-a-secondary, VFS-read-forward (1→0), and console output (1→0
+async). `curl` then adds socket-forward (1→0). This is the full matrix.
 
 ```
-Part A — spawn + exec hello on core 1
-─────────────────────────────────────
-shell (core 0) : spawn_ext(box=B, pin=core1, "/bin/hello")
-core 0 kernel  : B pinned to core1  ──SpawnProcess{argv,env,cwd,box}── ring[1] ─▶ core 1
+Part A — exec hello on core 1 (spawned LOCALLY by core 1's own init)
+────────────────────────────────────────────────────────────────────
+(prereq)       : core_init(1) activated core 1 and bootstrapped its init program (herd) on
+                 core 1 — a LOCAL spawn; herd's OWN ELF fetched via forwarded open/read (1→0).
+herd (core 1)  : execve("/bin/hello")  ─ ordinary LOCAL spawn syscall on core 1's kernel
 core 1 kernel  : create process in core1 partition; begin exec("/bin/hello")
                  loader open("/bin/hello")   ─ VFS not owned ─
                        ──ForwardSyscall{open}── ring[0] ─▶ core 0 (ext2)  ──fd──▶
@@ -578,7 +595,7 @@ core 1 kernel  : create process in core1 partition; begin exec("/bin/hello")
 hello (core 1) : write(1, "hello\n")  ─ console not owned ─
                        append to core1 console ring (§8.2); return immediately
 core 0         : drains core1 console ring on tick ─▶ "hello\n" on serial
-hello (core 1) : exit ──ChildExit── ring[0] ─▶ core 0 reaps / shell sees status
+hello (core 1) : exit → reaped LOCALLY by core 1's herd (its parent) — no cross-core ChildExit
 
 Part B — curl networking on core 1
 ──────────────────────────────────
@@ -812,7 +829,7 @@ target configuration realized at **M3**; M0–M2 are the bringup/isolation/trans
 | **M0 — second core spins** ✅ | Core 1 wakes, reads descriptor, parks in a `wfe` loop; BSP sees `state = Online` | PSCI `CPU_ON` (conduit from DTB `/psci`), secondary trampoline (`src/smp.rs`), MPIDR-aff0 core index, descriptor as an identity-mapped `static` (VA==PA → no pre-kernel-gap page needed at M0), x0=`context_id` handoff. Isolation-by-convention (secondaries reuse the BSP boot page tables). |
 | **M1 — isolated second kernel** ✅ | Each secondary runs on its OWN restricted page table (shared RO code + descriptor page + private stack/PerCpu; peers UNMAPPED) and **hardware-enforced isolation is PROVEN** (a deliberate cross-core read faults). NOTE: this codebase is a TTBR0 identity-mapped kernel, so M1 is realized by per-core *TTBR0* tables + a per-core `[PerCpu]` private chunk (not the doc's original "replicated .data/.bss via TTBR1" — see §4.2 note). The per-core `pmm::init`/heap/scheduler over a real partition that "full M1" wanted is **done in R1–R3** (§15). Caveat: isolation is enforced secondary→peer; the **BSP** is still all-seeing (its boot tables map all RAM) — see §4.2. | per-core restricted TTBR0 tables (`build_isolated_table`), `secondary_enter_isolated` (TTBR0+SP switch, **`isb` after `msr ttbr0` is mandatory** or the global 1 GB boot block survives in the TLB and isolation leaks), per-core VBAR enforcement self-test |
 | **M2 — ping-pong** ✅ | Cores exchange messages over a lock-free MPSC `Ring` (non-blocking); the **cross-core SGI doorbell works** (`trigger_sgi_core(aff0, sgi)` targets a specific peer; each secondary brings up its own GIC receive path — CPU iface + its GICR frames mapped device + SGI/timer enabled — and an IRQ vector); and the secondary loop is now **event-driven**: it sleeps in **`WFI`** and is woken by its **per-core virtual timer** (the heartbeat tick, so liveness advances while parked) or a **doorbell SGI** (a peer rang it). No polling. (Gotcha: `WFE` returns spuriously — `WFI` is the sleep-until-interrupt primitive.) | MPSC `Ring` ✅, `trigger_sgi_core` ✅, secondary GIC receive + IRQ handler ✅, per-core CNTV timer + `WFI` ✅ |
-| **M3 — roles + forwarding** | The §10 acceptance test: `hello` + `curl` pinned to core 1 | role table, VFS-read forwarding (first), syscall-forwarding stubs (§8.1), console append ring (§8.2), spawn/exit messages, reuse sysproxy marshaling |
+| **M3 — roles + forwarding** | The §10 acceptance test: `hello` + `curl` running on core 1 (spawned locally by core 1's own init) | role table, VFS-read forwarding (first), syscall-forwarding stubs (§8.1), console append ring (§8.2), `core_init` activation (§6 — NOT a spawn message; spawn/exit stay local to each kernel), reuse sysproxy marshaling |
 | **M4 — dynamic memory** | Core A releases pages to Core B at runtime | `ReleasePages`/`AcceptPages` messages, unmap-flush-remap handshake |
 
 ### Beyond M4 — fault tolerance & leadership (far off, not scheduled)
@@ -1020,3 +1037,22 @@ Tracked here so it isn't lost; tackle after the R3b/R4 milestones, not inline.
   fd-sharing across cores (no cross-core `dup`/SCM_RIGHTS) — a simplifying invariant, not a
   limitation, since processes don't migrate. Keeps each socket's traffic on one deterministic
   ring edge.
+
+- **Flip core activation to herd-managed by default (currently interim BSP auto-init).** The
+  park→`MSG_CORE_INIT`→init lifecycle is in (cores park after their soundness self-tests and
+  await activation; a watchdog `CPU_OFF`s an un-activated core; `core_init` re-`CPU_ON`s it). The
+  userspace seam is wired both ends: the `core_init` syscall (`nr::CORE_INIT` = 327 → `smp::core_init`)
+  and `/proc/cores` (the BSP-served, machine-global state table), and herd reads `/proc/cores` and
+  calls `core_init` for non-online secondaries (`init_secondary_cores`). BUT for now the **BSP
+  auto-activates** every secondary during bringup (so the role self-tests R3a/R3b/R4a/R4b.3a still
+  run at boot and the existing BSP-side PerCpu reporting works) — so herd's calls are a no-op
+  (cores already `online`). To make `MULTIKERNEL_INIT_HERD` real (herd drives activation by
+  default): (1) gate the BSP auto-init loop in `bringup_secondaries` on `!(config::AUTO_START_HERD
+  && config::MULTIKERNEL_INIT_HERD)`; (2) in herd-managed mode have bringup wait for `STATE_PARKED`
+  (not `ONLINE`) and report only the soundness checks; (3) move the role-probe PASS/FAIL reporting
+  from BSP-PerCpu-reads (which only work while bringup is still waiting) to the **secondary's own
+  console ring**, since the role probes now run later (when herd activates the core), after bringup
+  has returned. Dependency for (3): **the secondary console ring isn't draining** in the SMP boot —
+  no `[core N] …` ring lines (nor the BSP's own `fwd-server thread spawned` line) appeared in the
+  `SMP=2` boot log despite a full boot; investigate the `start_console_drainer` / `run_async_main`
+  path under `kernel_smp` first, or herd-managed boots will show no role results.

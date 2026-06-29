@@ -510,6 +510,10 @@ pub extern "C" fn main() {
 
     let mut state = HerdState::new();
 
+    // Multikernel: activate any parked secondary cores from userspace before starting
+    // services, so a core-pinned service finds its core available (no-op single-kernel).
+    init_secondary_cores();
+
     // Initial config load
     reload_config(&mut state);
 
@@ -746,6 +750,48 @@ pub struct SpawnOptions {
 const SYSCALL_SPAWN_EXT: u64 = 315;
 const SYSCALL_REGISTER_BOX: u64 = 316;
 const SYSCALL_SET_BOX_STACK: u64 = 324;
+const SYSCALL_CORE_INIT: u64 = 327;
+
+/// Multikernel: activate secondary cores from userspace (docs/MULTIKERNEL.md R4b).
+///
+/// Reads `/proc/cores` (the BSP-served, machine-global core table) and calls the
+/// `core_init` syscall for every non-BSP core that is not already `online` (i.e. `parked`
+/// awaiting activation, or `offline` after its watchdog elapsed — `core_init` re-CPU_ONs
+/// the latter). This is herd acting as the init system that owns core activation. It is a
+/// no-op on a single-kernel boot (only the BSP row) or when the kernel already activated
+/// the cores itself (all `online`). Run once at startup before services start, so a
+/// core-pinned service finds its core available.
+fn init_secondary_cores() {
+    let content = match read_file_string("/proc/cores") {
+        Some(c) => c,
+        None => return, // no procfs entry → not a multikernel boot
+    };
+    for line in content.lines().skip(1) {
+        // Format: "core state role" (whitespace-separated; see src/vfs/proc.rs).
+        let mut fields = line.split_whitespace();
+        let idx = match fields.next().and_then(parse_u64) {
+            Some(i) => i,
+            None => continue,
+        };
+        let state = fields.next().unwrap_or("");
+        let role = fields.next().unwrap_or("");
+        if role == "bsp" || state == "online" {
+            continue; // BSP, or already active — nothing to do
+        }
+        let r = libakuma::syscall(SYSCALL_CORE_INIT, idx, 0, 0, 0, 0, 0);
+        if (r as i64) == 0 {
+            print("[herd] core ");
+            print_dec(idx as usize);
+            print(": activation requested (was ");
+            print(state);
+            print(")\n");
+        } else {
+            print("[herd] core ");
+            print_dec(idx as usize);
+            print(": core_init failed\n");
+        }
+    }
+}
 
 /// Tell the kernel a box uses the NetBSD rump network stack (stack = 1). The
 /// kernel then routes that box's AF_INET syscalls to its rump_server.

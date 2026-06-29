@@ -2726,6 +2726,47 @@ pub fn core_init(idx: usize) -> u64 {
     0
 }
 
+// --- /proc/cores accessors (heap-free; the formatting + the unavoidable Vec<u8>
+// allocation live in src/vfs/proc.rs, where the FS trait already requires them). These
+// let an init system (herd) enumerate cores + their lifecycle state and activate PARKED
+// ones via the core_init syscall. Only ever read on the BSP (it owns the VFS), so the
+// view is machine-global regardless of who forwarded the read. ---
+
+/// Number of CPUs to enumerate for `/proc/cores` (1 if SMP wasn't brought up).
+pub fn core_count() -> usize {
+    if PROBED.load(Ordering::Acquire) {
+        NUM_CORES.load(Ordering::Relaxed)
+    } else {
+        1
+    }
+}
+
+/// Whether core `idx` is the boot processor (the `/proc/cores` `role` column).
+pub fn is_bsp(idx: usize) -> bool {
+    if !PROBED.load(Ordering::Acquire) {
+        return idx == 0;
+    }
+    idx == (read_mpidr() & 0xff) as usize
+}
+
+/// Lifecycle state of core `idx` as a static string for `/proc/cores`. The BSP is always
+/// `online` (it is executing this); peers reflect the shared descriptor's `state` atomic.
+pub fn core_state_str(idx: usize) -> &'static str {
+    if is_bsp(idx) {
+        return "online"; // the boot core is, by definition, online
+    }
+    // SAFETY: the descriptor is initialized once at boot and identity-mapped on the BSP;
+    // we read only the per-core `state` atomic.
+    let cfg = unsafe { &*MACHINE_CONFIG.0.get() };
+    match cfg.cores.get(idx).map(|c| c.state.load(Ordering::Acquire)) {
+        Some(STATE_OFFLINE) => "offline",
+        Some(STATE_BOOTING) => "booting",
+        Some(STATE_PARKED) => "parked",
+        Some(STATE_ONLINE) => "online",
+        _ => "unknown",
+    }
+}
+
 // ============================================================================
 // Secondary trampoline (asm). Entered with the MMU OFF at EL1, interrupts masked
 // (PSCI brings a core up in the architectural masked state). x0 = context_id =

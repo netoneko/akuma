@@ -213,6 +213,13 @@ impl Filesystem for ProcFilesystem {
                     is_symlink: false,
                     size: 0,
                 });
+                // Multikernel: per-core state table (one row per CPU; see read_file).
+                entries.push(DirEntry {
+                    name: String::from("cores"),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 0,
+                });
             }
 
             // Everyone sees "net" directory
@@ -470,6 +477,34 @@ impl Filesystem for ProcFilesystem {
             return Ok(out.into_bytes());
         }
 
+        // /proc/cores — one row per CPU with its multikernel lifecycle state, so an init
+        // system (herd, on the BSP) can discover PARKED cores and activate them via the
+        // core_init syscall. Machine-global (the BSP owns VFS + the shared descriptor); a
+        // process pinned to a secondary reads it via forwarded openat/read, seeing the same
+        // table. Host context only.
+        if path == "cores" {
+            if current_box_id != 0 {
+                return Err(FsError::NotFound);
+            }
+            // Build the small fixed table straight into the byte buffer — every field is
+            // a static string or a single digit (core_count <= MAX_CORES = 8), so no
+            // String/format! churn, just the one Vec the FS trait returns.
+            let mut out: Vec<u8> = Vec::with_capacity(160);
+            out.extend_from_slice(b"core state role\n");
+            #[cfg(kernel_smp)]
+            for idx in 0..crate::smp::core_count() {
+                out.push(b'0' + (idx as u8)); // single digit: idx < MAX_CORES (8)
+                out.push(b' ');
+                out.extend_from_slice(crate::smp::core_state_str(idx).as_bytes());
+                out.push(b' ');
+                out.extend_from_slice(if crate::smp::is_bsp(idx) { b"bsp" } else { b"-" });
+                out.push(b'\n');
+            }
+            #[cfg(not(kernel_smp))]
+            out.extend_from_slice(b"0 online bsp\n");
+            return Ok(out);
+        }
+
         if path == "net/tcp" {
             let sockets = akuma_net::socket::list_sockets();
             let mut out = String::from("LOCAL_PORT,REMOTE_ADDR,STATE,BOX\n");
@@ -638,7 +673,7 @@ impl Filesystem for ProcFilesystem {
             return true; // Root always exists
         }
 
-        if path == "boxes" {
+        if path == "boxes" || path == "cores" {
             let current_box_id = akuma_exec::process::current_process().map_or(0, |p| p.box_id);
             return current_box_id == 0;
         }
@@ -715,7 +750,7 @@ impl Filesystem for ProcFilesystem {
             });
         }
 
-        if path == "boxes" {
+        if path == "boxes" || path == "cores" {
             let current_box_id = akuma_exec::process::current_process().map_or(0, |p| p.box_id);
             if current_box_id != 0 {
                 return Err(FsError::NotFound);

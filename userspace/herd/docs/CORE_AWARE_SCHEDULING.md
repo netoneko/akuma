@@ -1,7 +1,15 @@
 # herd core-aware scheduling
 
-**Status:** plan / not yet implemented.
-**Related:** `docs/MULTIKERNEL.md` (the multikernel; esp. §10 the spawn-on-core-1 scenario,
+**Status:** plan / **premise superseded — needs rewrite.** This doc was written around a BSP-wide
+herd routing a service to core N via a cross-core `SpawnProcess` message (`SpawnOptions.pin_core`).
+That model is **dropped**: process creation is never cross-core — a process runs on a kernel only
+because *that kernel's own userspace* spawned it (`docs/MULTIKERNEL.md` §7/§10). So core-awareness
+is **"run a herd instance on the target core"** (bootstrapped by `core_init`), which then spawns
+that core's services locally. The `core = N` key + `pin_core` ABI below are kept as history; the
+"run herd-per-subkernel" escape hatch is in fact the model. See the *Model correction* note under
+*Kernel-side work* before building on this.
+
+**Related:** `docs/MULTIKERNEL.md` (the multikernel; esp. §10 running `hello` on core 1,
 §10.1/§10.3 capability dispatch). This doc is the **userspace/herd** half: how the service
 supervisor places services onto specific cores once the kernel can host a process there.
 
@@ -146,10 +154,16 @@ something real once the kernel can actually run a process on a secondary:
 - Until R4b.3b lands, **no secondary can host a process**, so `pin_core != 0` correctly fails
   the availability check and logs the error — which is exactly the intended degenerate
   behavior. So herd's core-awareness can ship and be inert-but-correct ahead of the kernel.
-- When R4b.3b is in: `sys_spawn_ext` with `pin_core = N` sends a `SpawnProcess{argv, env, cwd,
-  box}` message to core N's kernel over the ring (§10 Part A), which creates the process in
-  core N's partition and exec's it — the loader's `open`/`read` forward back to the owner via
-  the generic forwarder (§10.3). Console/sockets follow the same dispatch.
+- **Model correction — no `SpawnProcess` message (this changes the doc's premise).** A process
+  runs on core N only because core N's *own* userspace spawned it; there is **no cross-core spawn
+  message** (`docs/MULTIKERNEL.md` §7). So a BSP-wide herd cannot place a service onto core N by
+  routing `pin_core` over the ring. The way to dedicate work to core N is to **run a herd instance
+  on core N** — the "escape hatch" above is in fact *the* model: `core_init(N)` activates the core
+  and bootstraps its init program (that herd), whose ELF is fetched via forwarded VFS; the per-core
+  herd then spawns its services with ordinary **local** syscalls (the loader's `open`/`read`
+  forwarding back to the owner, §10.3; console/sockets the same). The `core = N` config key + the
+  BSP-side `SpawnOptions.pin_core` route described earlier in this doc are therefore **superseded**
+  and kept only as history — this doc wants a rewrite around herd-per-core.
 
 ## Suggested implementation order
 
@@ -158,8 +172,9 @@ something real once the kernel can actually run a process on a secondary:
 2. **Kernel validation (now):** `sys_spawn_ext` rejects `pin_core` it can't honor with a
    distinct errno; herd logs + fails (no fallback). Verifiable immediately: pinning to a
    secondary fails cleanly, pinning to 0 / unpinned works as today.
-3. **Real cross-core spawn (after R4b.3b):** `sys_spawn_ext` routes `pin_core = N` to core N
-   via a `SpawnProcess` ring message; the §10 Part A path runs the process there.
+3. **Per-core herd (after R4b.3b):** instead of routing a spawn to core N, run a herd *on* core N
+   (bootstrapped by `core_init`); it spawns that core's services with local syscalls. There is no
+   `SpawnProcess` ring message — see the model correction above.
 
 ## Future (out of this cut, noted so the seam is intentional)
 
