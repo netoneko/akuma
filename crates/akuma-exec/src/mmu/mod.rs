@@ -532,6 +532,32 @@ impl UserAddressSpace {
         Ok(())
     }
 
+    /// Map a 2 MiB block `va -> pa` as **EL1-only RW, no-execute** (a kernel/partition RAM
+    /// block in a user table). A secondary's EL0 process needs its kernel code/data and its
+    /// partition reachable when a syscall traps to EL1 *under this table* (Akuma is TTBR0-
+    /// only, no switch on trap). `va`/`pa` must be 2 MiB-aligned. EL0 has no access (AP
+    /// defaults to EL1); `PXN|UXN` block execution. Intermediate L1/L2 frames are tracked
+    /// for Drop; the block target is kernel RAM (not a user frame) so it is not tracked.
+    pub fn map_kernel_block_2mb(&mut self, va: usize, pa: usize) -> Result<(), &'static str> {
+        const TWO_MB: usize = 1 << 21;
+        if va & (TWO_MB - 1) != 0 || pa & (TWO_MB - 1) != 0 {
+            return Err("2MB block must be 2MB-aligned");
+        }
+        let l0_idx = (va >> 39) & 0x1FF;
+        let l1_idx = (va >> 30) & 0x1FF;
+        let l2_idx = (va >> 21) & 0x1FF;
+        let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
+        let l1_frame = self.get_or_create_table(l0_ptr, l0_idx)?;
+        let l1_ptr = phys_to_virt(l1_frame.addr) as *mut u64;
+        let l2_frame = self.get_or_create_table(l1_ptr, l1_idx)?;
+        let l2_ptr = phys_to_virt(l2_frame.addr) as *mut u64;
+        // L2 BLOCK descriptor (TABLE bit clear): EL1 RW, inner-shareable, normal WB, no exec.
+        let entry = (pa as u64) | flags::VALID | flags::AF | flags::SH_INNER
+            | attr_index(MAIR_NORMAL_WB) | flags::PXN | flags::UXN;
+        unsafe { l2_ptr.add(l2_idx).write_volatile(entry); }
+        Ok(())
+    }
+
     pub fn alloc_and_map(&mut self, va: usize, user_flags: u64) -> Result<PhysFrame, &'static str> {
         let rt = runtime();
         let frame = (rt.alloc_page_zeroed)().ok_or("Out of memory for user page")?;
