@@ -56,7 +56,14 @@ const PSCI_CPU_OFF: u64 = 0x8400_0002;
 /// error and `CPU_OFF`s itself (docs/MULTIKERNEL.md R4b lifecycle). Not a hard race: a
 /// later `core_init` syscall re-`CPU_ON`s a core that shut down, so this only bounds how
 /// long an un-activated core stays powered, it does not bound when userspace must act.
-const CORE_INIT_WATCHDOG_US: u64 = 5_000_000;
+///
+/// Sized to comfortably exceed boot-to-herd time: the core parks right after bringup, but
+/// the BSP then runs its full self-test suite + rump + SSH before `AUTO_START_HERD` spawns
+/// herd, which is what calls `core_init`. A parked core just `WFI`s (near-idle, not
+/// spinning), so a generous window costs nothing and lets herd activate the core cleanly
+/// in the common case instead of forcing a `CPU_OFF`→re-`CPU_ON` re-bringup every boot.
+/// The re-wake path still covers a genuinely-forgotten core (no init system ever acts).
+const CORE_INIT_WATCHDOG_US: u64 = 120_000_000;
 
 /// `Sync` wrapper: the BSP writes the inner config exactly once (single-threaded,
 /// before any secondary runs); afterwards every access is either a read or a
@@ -91,6 +98,35 @@ static CONSOLE_RING_PA: AtomicUsize = AtomicUsize::new(0);
 /// register for the current-thread id — so a steady-state handler finds PerCpu here
 /// instead. A `.bss` static → replicated per core; each secondary sets only its own.
 static SECONDARY_PERCPU: AtomicUsize = AtomicUsize::new(0);
+
+/// THIS core's private partition base/len (replicated `.bss` statics — each secondary
+/// sets only its own). Read by the `prepare_user_address_space` runtime hook, which is a
+/// bare `fn` pointer and so cannot capture them. Lets the SAME spawn path build a correct
+/// user table on a secondary (overlay its replicated kernel window) without a bespoke entry.
+static SECONDARY_PART_BASE: AtomicUsize = AtomicUsize::new(0);
+static SECONDARY_PART_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Runtime hook installed in a secondary's `ExecRuntime` (docs/MULTIKERNEL.md §4.2/R4b.3a):
+/// `UserAddressSpace::new()` calls it after the default identity kernel mappings, so every
+/// user address space the normal spawn path builds on this core also carries the core's
+/// REPLICATED kernel writable window (`.data`/`.bss` → its OWN private pages). Without it a
+/// pinned process's syscall would resolve kernel statics (PMM/POOL/process table) to the
+/// BSP's copies. `None`/no-op on the BSP (set only on secondaries).
+fn secondary_prepare_user_as(uas: &mut akuma_exec::mmu::UserAddressSpace) -> Result<(), &'static str> {
+    let pbase = SECONDARY_PART_BASE.load(Ordering::Acquire);
+    let plen = SECONDARY_PART_LEN.load(Ordering::Acquire);
+    if pbase == 0 || plen == 0 {
+        return Err("secondary partition base/len not set");
+    }
+    build_secondary_user_kernel_view(uas, pbase, plen)
+}
+
+/// Whether THIS core routes console output to a per-core ring — i.e. it is an isolated
+/// secondary, not the BSP (the UART owner). The BSP never sets `CONSOLE_RING_PA`. Used by
+/// the `write` syscall to send a pinned process's tty output to the §8.2 console ring.
+pub fn is_on_secondary() -> bool {
+    CONSOLE_RING_PA.load(Ordering::Acquire) != 0
+}
 
 /// Route this core's `console::print` output to its per-core console ring. Called
 /// once by a secondary during bringup, after its restricted table maps the shared
@@ -292,8 +328,15 @@ const PAGE: usize = 4096;
 /// (one L2 block descriptor per 2 MiB; 512 of them fill one L2 table = 1 GiB).
 const TWO_MB: usize = 2 * 1024 * 1024;
 
-/// Number of contiguous pages for a secondary's isolated boot stack (16 KiB).
-const STACK_PAGES: usize = 4;
+/// Number of contiguous pages for a secondary's isolated boot stack (256 KiB).
+///
+/// This is the stack the secondary's boot/idle thread runs on, INCLUDING when it spawns
+/// its pinned init program (`spawn_init_program` → `Process::from_elf` →
+/// `load_elf_with_stack`). The ELF loader has deep, large frames (the BSP runs it on a
+/// 1 MiB stack), so the original 16 KiB overflowed into the replicated `.data` below the
+/// stack and corrupted kernel statics (CONFIG/RUNTIME read back unregistered). 256 KiB is
+/// carved from the core's own 1 GiB partition, so the cost is negligible.
+const STACK_PAGES: usize = 64;
 
 /// R2 — initial per-core kernel heap, carved from the secondary's partition just
 /// above the BSP-built kernel image (page tables + replicated `.data`/`.bss` +
@@ -411,12 +454,6 @@ const PERCPU_USERTAB_PRIV_OK: usize = 120;
 /// Diagnostics: the PA the user table / restricted table resolve the probe VA to.
 const PERCPU_USERTAB_USER_PA: usize = 128;
 const PERCPU_USERTAB_REST_PA: usize = 136;
-
-/// Forwarded-exec fetch (R4b.4): 1 = the secondary fetched `/bin/hello`'s ELF header from
-/// the owner core's filesystem via forwarded openat/read/close and the magic matched.
-const PERCPU_EXEC_FETCH_OK: usize = 144;
-/// Diagnostics: bytes returned by the forwarded `read`.
-const PERCPU_EXEC_FETCH_N: usize = 152;
 
 /// Snapshot pristine `.data` — MUST be the first thing `rust_start` does, before any
 /// code mutates a `.data`/`.bss` static. Copies `[_data_start, __bss_start)` into
@@ -927,57 +964,77 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
     }
 
     // R4b lifecycle: each secondary boots → soundness self-tests → PARKS awaiting
-    // MSG_CORE_INIT. Activate them.
+    // MSG_CORE_INIT (docs/MULTIKERNEL.md §6/R4b, acceptance/12).
     //
-    // INTERIM: the BSP auto-activates here so the role self-tests (R3a/R3b/R4a/R4b.3a) run
-    // at boot and the existing PerCpu reporting below works. The production model is herd
-    // driving activation from userspace (the `core_init` syscall + `/proc/cores`); once
-    // that is wired this should be gated on `!(config::AUTO_START_HERD &&
-    // config::MULTIKERNEL_INIT_HERD)` so herd-managed boots leave the cores parked for
-    // herd. The message is delivered to the inbox (persisted); a parked core drains it on
-    // entry, so the doorbell below is only a best-effort wake (harmless if the core's GIC
-    // receive path isn't up yet).
-    for idx in 0..num_cores {
-        if idx == bsp_idx {
-            continue;
+    // Who activates a parked core depends on the boot mode:
+    //   - **herd-managed** (`AUTO_START_HERD && MULTIKERNEL_INIT_HERD`, the default): the
+    //     cores stay PARKED here. herd, the userspace init system, reads `/proc/cores` and
+    //     calls the `core_init` syscall to activate the cores it wants — handing each its
+    //     init-program path in the activation message (the program it should run). So the
+    //     scheduler/role + workload come up LATER, when herd acts.
+    //   - **bare SMP / non-herd**: no userspace init drives activation, so the BSP
+    //     auto-activates each core here (with no init program — it just stands up its
+    //     scheduler/role for the boot self-tests). The message is delivered to the inbox
+    //     (persisted); a parked core drains it on entry, so the doorbell is a best-effort
+    //     wake (harmless if the core's GIC receive path isn't up yet).
+    let herd_managed = crate::config::AUTO_START_HERD && crate::config::MULTIKERNEL_INIT_HERD;
+    if !herd_managed {
+        for idx in 0..num_cores {
+            if idx == bsp_idx {
+                continue;
+            }
+            cfg.inboxes[idx].push(MSG_CORE_INIT, bsp_idx as u32, 0, 0);
+            crate::gic::trigger_sgi_core(idx as u32, DOORBELL_SGI);
         }
-        cfg.inboxes[idx].push(MSG_CORE_INIT, bsp_idx as u32, 0, 0);
-        crate::gic::trigger_sgi_core(idx as u32, DOORBELL_SGI);
     }
 
-    // Wait for secondaries to report Online (bounded by uptime, ~2s).
+    // Wait (bounded ~2s) for each secondary to reach its expected lifecycle state, then
+    // report. In herd-managed mode that is PARKED (the cores haven't been activated yet),
+    // so only the PRE-park soundness checks (isolated-run marker, `.data`/`.bss`
+    // replication, enforcement, per-core PMM/heap — all recorded before parking) are
+    // reported; the role probes (R3a/R3b/R4a/user-table) run later, post-activation, and
+    // report via the secondary's own console ring. In bare-SMP mode the cores were just
+    // auto-activated, so we wait for ONLINE and report the full self-test matrix.
+    let want_state = if herd_managed { STATE_PARKED } else { STATE_ONLINE };
     let deadline = crate::timer::uptime_us() + 2_000_000;
     for idx in 0..num_cores {
         if idx == bsp_idx {
             continue;
         }
-        let mut online = false;
+        let mut reached = false;
         while crate::timer::uptime_us() < deadline {
-            if cfg.cores[idx].state.load(Ordering::Acquire) == STATE_ONLINE {
-                online = true;
+            if cfg.cores[idx].state.load(Ordering::Acquire) == want_state {
+                reached = true;
                 break;
             }
-            // Service any secondary's forward request (R4a) while we wait — a secondary
-            // blocks on its reply before announcing Online, so without this the BSP
-            // (spinning on Online) and the secondary (spinning on the reply) deadlock.
+            // Service any secondary's forward request (R4a) while we wait — in bare-SMP
+            // mode a secondary blocks on its reply before announcing Online, so without
+            // this the BSP (spinning on Online) and the secondary (spinning on the reply)
+            // deadlock. Harmless in herd-managed mode (nothing to service pre-park).
             service_fwd_requests(cfg, bsp_idx);
             core::hint::spin_loop();
         }
+        let reached_label = if herd_managed { " PARKED" } else { " ONLINE" };
         crate::safe_print!(
             80,
             "[SMP] core {}{}",
             idx,
-            if online { " ONLINE" } else { " TIMEOUT (never reported online)" }
+            if reached { reached_label } else { " TIMEOUT (never reached expected state)" }
         );
-        if !online {
-            // Pinpoint a hang: report the last R3a stage the secondary reached.
-            let percpu = cfg.cores[idx].percpu_phys as usize;
-            if percpu != 0 {
-                let st =
-                    unsafe { core::ptr::read_volatile((percpu + PERCPU_R3_STAGE) as *const u64) };
-                let yl =
-                    unsafe { core::ptr::read_volatile((percpu + PERCPU_R3_YIELDS) as *const u64) };
-                crate::safe_print!(64, " [last R3a stage={} yields={}]", st as usize, yl as usize);
+        if !reached {
+            // Pinpoint a hang: in bare-SMP mode report the last R3a stage the secondary
+            // reached (R3a hasn't run yet in herd-managed mode — the core just never parked).
+            if !herd_managed {
+                let percpu = cfg.cores[idx].percpu_phys as usize;
+                if percpu != 0 {
+                    let st = unsafe {
+                        core::ptr::read_volatile((percpu + PERCPU_R3_STAGE) as *const u64)
+                    };
+                    let yl = unsafe {
+                        core::ptr::read_volatile((percpu + PERCPU_R3_YIELDS) as *const u64)
+                    };
+                    crate::safe_print!(64, " [last R3a stage={} yields={}]", st as usize, yl as usize);
+                }
             }
             crate::safe_print!(8, "\n");
             continue;
@@ -1051,7 +1108,10 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
         // threads that yielded to each other. Verify both ran to completion and the
         // total yield count is exactly NUM_THREADS * YIELDS_PER_THREAD. `done==0 &&
         // yields==0` means it was skipped (partition too small) — reported distinctly.
-        if percpu != 0 {
+        // (Post-activation probes: only valid in bare-SMP mode, where we waited for
+        // ONLINE; in herd-managed mode the core is still PARKED, so they run later and
+        // report via its console ring.)
+        if percpu != 0 && !herd_managed {
             let r3_yields =
                 unsafe { core::ptr::read_volatile((percpu + PERCPU_R3_YIELDS) as *const u64) };
             let r3_done =
@@ -1082,7 +1142,7 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
         // R3b: per-core PREEMPTIVE scheduler. A spinner thread that never yields ran only
         // because the per-core timer preempted the (also non-yielding) boot thread — so a
         // nonzero spin count + the spinner completing proves timer-driven preemption.
-        if percpu != 0 {
+        if percpu != 0 && !herd_managed {
             let r3b_count =
                 unsafe { core::ptr::read_volatile((percpu + PERCPU_R3B_COUNT) as *const u64) };
             let r3b_done =
@@ -1109,7 +1169,7 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
         // R4a: cross-core syscall-forwarding transport. The secondary shipped a payload
         // through its bounce region to the BSP, which transformed it + replied; a
         // verified round-trip proves the §8.1 data path (the keystone for R4 exec).
-        if percpu != 0 {
+        if percpu != 0 && !herd_managed {
             let r4a_ok =
                 unsafe { core::ptr::read_volatile((percpu + PERCPU_R4A_OK) as *const u64) };
             if r4a_ok == 1 {
@@ -1122,7 +1182,7 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
         // kernel view — code identity (handler runs), `.data`/`.bss` window to its OWN
         // private pages (not the BSP's), partition identity (phys_to_virt at EL1) — the
         // prerequisite for running an EL0 process here.
-        if percpu != 0 {
+        if percpu != 0 && !herd_managed {
             let ok = unsafe { core::ptr::read_volatile((percpu + PERCPU_USERTAB_PRIV_OK) as *const u64) };
             let upa = unsafe { core::ptr::read_volatile((percpu + PERCPU_USERTAB_USER_PA) as *const u64) };
             let rpa = unsafe { core::ptr::read_volatile((percpu + PERCPU_USERTAB_REST_PA) as *const u64) };
@@ -1140,8 +1200,15 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
     // reports through its own console ring, so there is no BSP-side reader here.
     crate::safe_print!(48, "[SMP] bringup complete\n");
 
-    monitor_liveness(cfg, num_cores, bsp_idx);
-    run_memory_demo(cfg, num_cores, bsp_idx);
+    // The liveness + debt-reclaim demos assume ONLINE cores running their heartbeat/debt
+    // loop. In herd-managed mode the cores are still PARKED (heartbeat not advancing, debt
+    // protocol not running), so the demos would misreport "stalled" / block awaiting
+    // repayments that never come. Run them only in bare-SMP mode, where bringup brought
+    // the cores fully online.
+    if !herd_managed {
+        monitor_liveness(cfg, num_cores, bsp_idx);
+        run_memory_demo(cfg, num_cores, bsp_idx);
+    }
 }
 
 /// Step 3 — drive the debt-based reclaim protocol (§9) over real rings on real
@@ -1397,6 +1464,14 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
     // end to end: this `print` lands in our console ring; the BSP drainer thread (not
     // yet spawned — these bytes wait in the ring) later forwards them to the UART.
     crate::safe_print!(80, "[core {}] per-core runtime online: pmm + heap + console (via ring)\n", core_idx);
+
+    // acceptance/12 Milestone-1 line: the activation handshake completed — this core
+    // stood up its scheduler/role (R3a) and is about to announce Online. Printed only
+    // when the scheduler actually came up (so a too-small partition that skipped R3a
+    // doesn't claim "scheduler up").
+    if sched_up {
+        crate::safe_print!(64, "[core {}] init: scheduler + role up — ONLINE\n", core_idx);
+    }
 
     // Announce Online from the isolated context (Release orders the enforcement
     // result + PerCpu marker before the BSP's Acquire load of `state`).
@@ -1765,10 +1840,20 @@ fn run_r3a_coop_test(cc: &CoreConfig, idx: usize, percpu: usize) -> bool {
     //    Re-target the scheduler SGI at THIS PE (yield_now must ring ourselves, not the
     //    BSP — see trigger_sched_sgi_self).
     let sec_top = cc.entry_sp as usize;
-    let sec_base = sec_top - (1usize << SECONDARY_STACK_SHIFT);
+    // Use the ACTUAL carved isolated-stack size (`STACK_PAGES`), not the trampoline's
+    // `secondary_boot_stacks` shift — `entry_sp` is the top of the partition-carved stack
+    // that `build_isolated_table` allocated, which is `STACK_PAGES` pages.
+    let sec_base = sec_top - STACK_PAGES * PAGE;
     let user_stack = crate::config::compute_user_stack_size(cc.ram_len as usize);
     let (mut rt, cfg) = crate::build_exec_runtime(sec_base, sec_top, user_stack, false);
     rt.trigger_sgi = trigger_sched_sgi_self;
+    // Publish our partition for the user-AS overlay hook (a bare fn ptr can't capture it),
+    // then install the hook so the normal spawn path builds a correct user table on this
+    // core (overlays our replicated kernel window) — the seam that lets a pinned EL0
+    // process run here (docs/MULTIKERNEL.md §4.2/R4b.3a).
+    SECONDARY_PART_BASE.store(cc.ram_base as usize, Ordering::Release);
+    SECONDARY_PART_LEN.store(cc.ram_len as usize, Ordering::Release);
+    rt.prepare_user_address_space = Some(secondary_prepare_user_as);
     akuma_exec::init(rt, cfg);
 
     // Stage marker helper: record progress to PerCpu so the BSP can pinpoint a hang.
@@ -2115,10 +2200,11 @@ fn secondary_steady_state(cfg: &MachineConfig, idx: usize, percpu: usize, mut sm
     arm_cntv_timer();
     crate::irq::enable_irqs();
 
-    // R4b.4 post-bringup proof: once the BSP's persistent forward-server thread is live
-    // (`fwd_server_ready`), run ONE forwarded-exec fetch (openat/read/close of /bin/hello
-    // over the generic syscall forwarder) — "exec is recursive forwarding." Done once.
-    let mut fetch_done = false;
+    // Once the BSP's persistent forward-server thread is live (`fwd_server_ready`), spawn
+    // this core's INIT PROGRAM (named by the initiator in MSG_CORE_INIT) as a real EL0
+    // process: fetch its ELF via forwarded open/read/close ("exec is recursive forwarding")
+    // and spawn it locally on this core's scheduler. Done once.
+    let mut init_spawned = false;
 
     // Idle/driver loop on the boot thread: advance the heartbeat, drain the inbox (debt
     // state machine — shedding `Repay` to creditors over the shared rings; we only ever
@@ -2153,12 +2239,13 @@ fn secondary_steady_state(cfg: &MachineConfig, idx: usize, percpu: usize, mut sm
             }
         }
 
-        // Run the exec-fetch probe ONCE, after the forward-server thread reports ready (so
-        // the forwarded syscalls can only be serviced by the thread, never the exited
-        // bringup loop). Blocking (a few round-trips); fine here — no other thread runs yet.
-        if !fetch_done && cfg.fwd_server_ready.load(Ordering::Acquire) == 1 {
-            run_exec_fetch_probe(cfg, idx, percpu);
-            fetch_done = true;
+        // Spawn the init program ONCE, after the forward-server thread reports ready (so the
+        // forwarded ELF-fetch syscalls can only be serviced by the thread, never the exited
+        // bringup loop). Blocking on the fetch (many round-trips); fine here — the boot
+        // thread is the idle thread, and once the process is spawned the timer preempts to it.
+        if !init_spawned && cfg.fwd_server_ready.load(Ordering::Acquire) == 1 {
+            spawn_init_program(cfg, idx);
+            init_spawned = true;
         }
 
         // Idle: SLEEP until the next interrupt rather than busy-yielding. A tight
@@ -2171,7 +2258,7 @@ fn secondary_steady_state(cfg: &MachineConfig, idx: usize, percpu: usize, mut sm
         // drain can't be lost (its doorbell SGI stays pending and WFI returns at once).
         crate::irq::disable_irqs();
         let pending = cfg.inboxes.get(idx).is_some_and(|r| !r.is_empty())
-            || (!fetch_done && cfg.fwd_server_ready.load(Ordering::Acquire) == 1);
+            || (!init_spawned && cfg.fwd_server_ready.load(Ordering::Acquire) == 1);
         if pending {
             crate::irq::enable_irqs();
             continue;
@@ -2259,46 +2346,100 @@ fn forward_syscall(cfg: &MachineConfig, idx: usize, owner: usize, nr: u64, args:
     enc_err(110) // ETIMEDOUT
 }
 
-/// One-shot R4b.4 proof ("exec is recursive forwarding"): the secondary FETCHES
-/// `/bin/hello`'s ELF header from the owner core's filesystem entirely via forwarded
-/// syscalls — `openat` -> `read` -> `close`, each classified VFS -> Proxy(core 0) ->
-/// forwarded — and verifies the returned bytes carry the ELF magic. Records 1/0 to PerCpu.
-/// No EL0 yet (R4b.3b runs the actual process); this proves the loader's data path.
-fn run_exec_fetch_probe(cfg: &MachineConfig, idx: usize, percpu: usize) {
+/// Fetch a whole file from the VFS owner into a heap `Vec` via forwarded
+/// `openat` -> `read`* -> `close` (the §8.1 outbound data path; "exec is recursive
+/// forwarding"). Each `read` returns up to one bounce slot (`FWD_BOUNCE_CAP`) of bytes,
+/// copied out of `fwd_bounce[idx]`; the owner advances its fd offset, so successive reads
+/// stream the file. Returns `None` on open failure or a read error. Blocking (one forward
+/// round-trip per chunk) — the caller is the secondary's idle/boot thread.
+fn fetch_file_forwarded(cfg: &MachineConfig, idx: usize, owner: usize, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     use crate::syscall::nr;
-    let path = b"/bin/hello\0";
-    // Route via the caps map — these are VFS syscalls, so on a secondary they forward to
-    // the owner; on the owner they'd be local (we only reach here on a secondary).
-    let mut magic_ok = false;
-    let mut n = 0u64;
-    if let Some(owner) = capability_owner(idx, nr::OPENAT) {
-        let h = forward_syscall(cfg, idx, owner, nr::OPENAT, &[0, 0, 0, 0, 0, 0], Some(path));
-        if (h as i64) >= 0 {
-            n = forward_syscall(cfg, idx, owner, nr::READ, &[h, 0, 64, 0, 0, 0], None);
-            if (n as i64) >= 4 {
-                let mut hdr = [0u8; 4];
-                if let Some(bounce) = cfg.fwd_bounce.get(idx) {
-                    bounce.read(&mut hdr);
-                }
-                magic_ok = hdr == [0x7f, b'E', b'L', b'F'];
-            }
+    // openat: NUL-terminated path in the bounce. `path` is the bytes WITHOUT a NUL.
+    let mut p = [0u8; FWD_BOUNCE_CAP];
+    let n = path.len().min(FWD_BOUNCE_CAP - 1);
+    p[..n].copy_from_slice(&path[..n]);
+    // p[n] stays 0 → NUL terminator.
+    let h = forward_syscall(cfg, idx, owner, nr::OPENAT, &[0, 0, 0, 0, 0, 0], Some(&p[..=n]));
+    if (h as i64) < 0 {
+        return None;
+    }
+    let mut data = alloc::vec::Vec::new();
+    let chunk = FWD_BOUNCE_CAP;
+    loop {
+        let ret = forward_syscall(cfg, idx, owner, nr::READ, &[h, 0, chunk as u64, 0, 0, 0], None);
+        let got = ret as i64;
+        if got < 0 {
             forward_syscall(cfg, idx, owner, nr::CLOSE, &[h, 0, 0, 0, 0, 0], None);
+            return None;
+        }
+        if got == 0 {
+            break; // EOF
+        }
+        let got = (got as usize).min(chunk);
+        let mut buf = [0u8; FWD_BOUNCE_CAP];
+        if let Some(bounce) = cfg.fwd_bounce.get(idx) {
+            bounce.read(&mut buf);
+        }
+        data.extend_from_slice(&buf[..got]);
+        if got < chunk {
+            break; // short read ⇒ EOF
         }
     }
-    // SAFETY: PerCpu page is mapped RW in this core's restricted table.
-    unsafe {
-        core::ptr::write_volatile((percpu + PERCPU_EXEC_FETCH_N) as *mut u64, n);
-        core::ptr::write_volatile((percpu + PERCPU_EXEC_FETCH_OK) as *mut u64, u64::from(magic_ok));
+    forward_syscall(cfg, idx, owner, nr::CLOSE, &[h, 0, 0, 0, 0, 0], None);
+    Some(data)
+}
+
+/// Spawn this core's INIT PROGRAM as a real EL0 process (docs/MULTIKERNEL.md §10,
+/// acceptance/12 Milestone 2). The initiator named it in the `MSG_CORE_INIT` activation
+/// message (`cfg.init_program[idx]`); the program is fetched from the VFS owner via
+/// forwarded `open`/`read` (this core has no local VFS) and spawned LOCALLY on this core's
+/// scheduler — there is no cross-core spawn (§7). Its tty output drains via the console
+/// ring (§8.2) and its exit is reaped by this kernel. Runs once, after the BSP
+/// forward-server is up; a no-op if no init program was named.
+fn spawn_init_program(cfg: &MachineConfig, idx: usize) {
+    use crate::syscall::nr;
+    let Some(slot) = cfg.init_program.get(idx) else {
+        return;
+    };
+    let mut path_buf = [0u8; akuma_smp::INIT_PROGRAM_CAP];
+    let len = slot.get(&mut path_buf);
+    if len == 0 || len > path_buf.len() {
+        return; // no init program named (or it didn't fit) — nothing to spawn
     }
-    // Report via our own console ring (drained to the UART by the BSP drainer) — the probe
-    // runs post-bringup, so a BSP-side reader at the Online barrier would be too early.
+    let path = &path_buf[..len];
+    let path_str = core::str::from_utf8(path).unwrap_or("<non-utf8>");
+
+    // VFS is Proxy'd to the owner on a secondary; fetch the ELF over the forward transport.
+    let Some(owner) = capability_owner(idx, nr::OPENAT) else {
+        crate::safe_print!(96, "[core {}] init: VFS not forwardable — cannot fetch {}\n", idx, path_str);
+        return;
+    };
+    let Some(elf) = fetch_file_forwarded(cfg, idx, owner, path) else {
+        crate::safe_print!(112, "[core {}] init: failed to fetch {} over forwarded VFS\n", idx, path_str);
+        return;
+    };
     crate::safe_print!(
-        112,
-        "[core {}] exec-fetch: /bin/hello ELF header via forwarded openat/read/close -> {} bytes, magic {}\n",
+        128,
+        "[core {}] init: fetched {} ({} bytes) via forwarded openat/read/close; spawning EL0 process\n",
         idx,
-        n,
-        if magic_ok { "PASS" } else { "FAIL" }
+        path_str,
+        elf.len()
     );
+
+    // Spawn from the in-memory image via the NORMAL spawn path. The per-core kernel-window
+    // overlay rides the `prepare_user_address_space` runtime hook (set in run_r3a_coop_test),
+    // so the process's syscalls resolve kernel statics to THIS core's private copies.
+    match akuma_exec::process::spawn_process_from_image(path_str, &elf) {
+        Ok((tid, pid)) => crate::safe_print!(
+            128,
+            "[core {}] init: spawned {} (pid {}, tid {}) — running on this core\n",
+            idx,
+            path_str,
+            pid,
+            tid
+        ),
+        Err(e) => crate::safe_print!(176, "[core {}] init: spawn failed for {}: {}\n", idx, path_str, e),
+    }
 }
 
 // ============================================================================
@@ -2686,7 +2827,7 @@ pub fn start_fwd_server() {
 /// receiver — a core that is already Online logs + drops a late/duplicate. Returns 0 on
 /// success, or a negative errno (Linux-encoded): `-ENOSYS` if SMP isn't up, `-ENODEV` for
 /// a bad/non-secondary index, `-EPERM` if this core isn't the descriptor's `initiator`.
-pub fn core_init(idx: usize) -> u64 {
+pub fn core_init(idx: usize, init_program: &[u8]) -> u64 {
     if !PROBED.load(Ordering::Acquire) {
         return enc_err(38); // ENOSYS — single-core / no SMP
     }
@@ -2702,6 +2843,21 @@ pub fn core_init(idx: usize) -> u64 {
     // sends MSG_CORE_INIT (§12). Re-pointable via `cfg.initiator`.
     if bsp as u32 != cfg.initiator.load(Ordering::Relaxed) {
         return enc_err(1); // EPERM — not the initiator
+    }
+
+    // Already online ⇒ a late/duplicate activation; log + drop (idempotent at the
+    // initiator, mirroring the receiver-side guard).
+    if cfg.cores[idx].state.load(Ordering::Acquire) == STATE_ONLINE {
+        crate::safe_print!(72, "[SMP] core_init({}): already online — ignored (duplicate)\n", idx);
+        return 0;
+    }
+
+    // Publish the init-program path (the program this core should run as its first
+    // process) BEFORE pushing MSG_CORE_INIT, so the ring push/pop orders it for the
+    // secondary. Empty ⇒ the core comes online with no init process. Never a cross-core
+    // spawn — the secondary spawns it LOCALLY (docs/MULTIKERNEL.md §7/§10, acceptance/12).
+    if let Some(slot) = cfg.init_program.get(idx) {
+        slot.set(init_program);
     }
 
     // Re-CPU_ON a core that shut itself down (the watchdog expired earlier). It re-runs
@@ -2723,6 +2879,16 @@ pub fn core_init(idx: usize) -> u64 {
         return enc_err(11); // EAGAIN — inbox full
     }
     crate::gic::trigger_sgi_core(idx as u32, DOORBELL_SGI);
+    if init_program.is_empty() {
+        crate::safe_print!(64, "[SMP] core_init({}): activating (MSG_CORE_INIT sent)\n", idx);
+    } else {
+        crate::safe_print!(
+            128,
+            "[SMP] core_init({}): activating (MSG_CORE_INIT sent), init program: {}\n",
+            idx,
+            core::str::from_utf8(init_program).unwrap_or("<non-utf8>")
+        );
+    }
     0
 }
 

@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64};
 
 use crate::console_ring::ConsoleRing;
 use crate::fwd_bounce::{ForwardCall, FwdBounce};
+use crate::init_program::InitProgram;
 use crate::ring::Ring;
 
 /// Maximum physical PEs the descriptor describes.
@@ -116,6 +117,14 @@ pub struct MachineConfig {
     /// Per-core forwarded-syscall request frame (§8.1/§10.1): the syscall number + scalar
     /// args a compute core ships to the owner; pointer-argument bytes ride `fwd_bounce`.
     pub fwd_call: [ForwardCall; MAX_CORES],
+    /// Per-core init-program path (§6/§10, acceptance/12): the program the initiator (herd
+    /// via `core_init`) tells a parked core to run as its first process. Written by the
+    /// initiator BEFORE it pushes `MSG_CORE_INIT`; read by the activated secondary, which
+    /// spawns it LOCALLY (ELF fetched via forwarded `open`/`read`). Empty ⇒ the core comes
+    /// online but runs no init process (its idle/role loop only). Ordered by the
+    /// `MSG_CORE_INIT` ring push/pop — never spawned across cores (there is no
+    /// `SpawnProcess` message, §7).
+    pub init_program: [InitProgram; MAX_CORES],
     /// Set to 1 by the BSP's persistent forward-server thread once it is live and
     /// draining `inboxes[bsp]` (R4b.2). Secondaries poll this before sending a
     /// post-bringup forward request, so the request is provably serviced by the
@@ -154,6 +163,7 @@ impl MachineConfig {
             console_rings: [const { ConsoleRing::new() }; MAX_CORES],
             fwd_bounce: [const { FwdBounce::new() }; MAX_CORES],
             fwd_call: [const { ForwardCall::new() }; MAX_CORES],
+            init_program: [const { InitProgram::new() }; MAX_CORES],
             fwd_server_ready: AtomicU32::new(0),
             initiator: AtomicU32::new(0), // BSP (core 0) by default
         }
@@ -182,7 +192,9 @@ mod tests {
         assert_eq!(size % 4096, 0, "descriptor must be a whole number of pages");
         // The console rings dominate the size; sanity-bound it so an accidental
         // blow-up (e.g. a giant CONSOLE_RING_CAP) is caught here, not at boot.
-        let upper = (MAX_CORES * (crate::CONSOLE_RING_CAP + crate::FWD_BOUNCE_CAP)) + 8192;
+        let upper = (MAX_CORES
+            * (crate::CONSOLE_RING_CAP + crate::FWD_BOUNCE_CAP + crate::INIT_PROGRAM_CAP))
+            + 8192;
         assert!(size <= upper, "descriptor {size} bytes exceeds {upper}");
     }
 

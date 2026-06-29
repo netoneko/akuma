@@ -1025,6 +1025,20 @@ Tracked here so it isn't lost; tackle after the R3b/R4 milestones, not inline.
   the forwarded `openat` carries the box id and the owner resolves within that box's namespace.
   Open question; design before a real boxed process runs on a secondary.
 
+- **Per-core chroot with shared read-only system dirs (idea, 2026-06-29).** Rather than giving
+  each core a full box/namespace, give the capability-VFS owner a simple split-resolution rule for
+  forwarded `openat`: a small set of **read-only system dirs** (`/bin`, `/usr`, …) resolve to ONE
+  **common** tree shared by all cores (they're immutable, so sharing is safe and saves duplicating
+  the toolchain/libs), while **everything else** resolves under a **per-core chroot** at
+  `/srv/cores/<N>` (core 1 → `/srv/cores/1`, etc.). So each core gets an isolated writable root for
+  free, with the heavy read-only system content shared. The owner picks common-vs-chroot by the
+  leading path component when it services the forwarded `openat` (it already resolves all paths —
+  this is just a prefix table + a per-requesting-core root). Later, even **core 0 (BSP) chroots to
+  `/srv/cores/0`**, so no core is special-cased and the host root isn't directly visible to any
+  workload. Composes with the caps map (the chroot root + shared-RO set could be per-core descriptor
+  fields) and supersedes needing full boxes for the common "isolated rootfs per core" case. Pairs
+  with the boxes-×-VFS item above (a box id would select a namespace *within* the core's chroot).
+
 - **Per-core fd/socket affinity (forwarding-model invariant).** Because a process belongs to
   exactly one core (it's pinned, with its address space in that core's partition), every fd /
   socket it opens — including ones whose backing capability is `Proxy`'d to the owner core — is

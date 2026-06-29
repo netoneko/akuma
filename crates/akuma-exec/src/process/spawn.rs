@@ -350,55 +350,49 @@ pub fn spawn_process_with_channel_ext(
     Ok((thread_id, channel, pid))
 }
 
-/// Spawn a process from an **in-memory** ELF image as a minimal LOCAL process
-/// (no VFS read, no box, no namespace, no stdin), running `prepare` on its address
-/// space before it is registered and entered. Returns `(thread_id, pid)`.
+/// Spawn a process from an **in-memory** ELF image as a minimal local process (no VFS
+/// read, no box/namespace, no stdin) on its own user thread. Returns `(thread_id, pid)`.
 ///
-/// The multikernel uses this to launch a pinned EL0 probe on a secondary core
-/// (docs/MULTIKERNEL.md §15 R4b.3b — "create + eret to a local-only pinned EL0
-/// process"): `prepare` overlays that core's *replicated* kernel writable window
-/// onto the user table, so when the process traps for a syscall the kernel resolves
-/// its `.data`/`.bss` statics (process table, PMM, …) against that core's OWN private
-/// copies, not the BSP's — the isolation guarantee R4b.3a verified on a bare table.
+/// This is the normal spawn path expressed for a caller that already has the ELF bytes in
+/// memory — used by the multikernel to launch a **pinned process on a secondary core**
+/// (docs/MULTIKERNEL.md §10, acceptance/12): the secondary fetches the binary via forwarded
+/// `open`/`read` to the VFS owner, then spawns it HERE with these bytes. The process runs on
+/// THIS kernel's scheduler and is reaped normally (registered in `THREAD_PID_MAP`).
 ///
-/// Unlike [`spawn_process_with_channel_ext`], this deliberately does **not** insert
-/// the thread into `THREAD_PID_MAP`. Two consequences, both wanted for a one-shot
-/// probe: `getpid` resolves via the PROCESS_INFO page instead (still a real syscall
-/// through the EL0 trap path), and the process is **not** auto-reaped on thread
-/// cleanup — it stays a zombie, so the spawner can read its `exit_code` race-free
-/// after it exits. Not for general process spawning (it leaks the slot by design).
-///
-/// DEPRECATED: this proved a secondary can build a user table, `eret` to EL0, and
-/// run a syscall — its job. The production path is a `SpawnProcess` message to the
-/// target core, which runs the NORMAL spawn in its own context; the secondary-specific
-/// kernel-window overlay belongs in user-AS construction (via the runtime hook), not in
-/// a bespoke spawn entry. Kept temporarily as the R4b.3b reference.
-#[deprecated(note = "R4b.3b proof only; use the SpawnProcess-message path + normal spawn + the \
-                     user-AS overlay runtime hook for cross-core process launch")]
-pub fn spawn_local_image(
-    name: &str,
-    elf_data: &[u8],
-    prepare: impl FnOnce(&mut crate::mmu::UserAddressSpace) -> Result<(), &'static str>,
-) -> Result<(usize, Pid), String> {
+/// The per-core kernel-window overlay (so the process's syscalls resolve kernel statics to
+/// this core's private `.data`/`.bss`) is NOT special-cased here: it rides the standard
+/// `runtime().prepare_user_address_space` hook that `UserAddressSpace::new()` invokes inside
+/// `Process::from_elf`, which a secondary sets when it initializes its runtime. So this is
+/// the SAME loader the BSP uses — the per-core-ness lives entirely in that hook + page tables.
+pub fn spawn_process_from_image(name: &str, elf_data: &[u8]) -> Result<(usize, Pid), String> {
     if crate::threading::user_threads_available() == 0 {
-        return Err("No available user threads for local image".into());
+        return Err("No available user threads for image execution".into());
+    }
+    if (runtime().is_memory_low)() {
+        return Err("Kernel memory low, cannot spawn image".into());
     }
 
-    let mut process = Process::from_elf(name, &[], &[], elf_data, None)
-        .map_err(|e| format!("Failed to load in-memory ELF: {}", e))?;
+    let full_args = alloc::vec![name.to_string()];
+    let full_env: Vec<String> = DEFAULT_ENV.iter().map(|s| String::from(*s)).collect();
 
-    // Caller hook: e.g. overlay the secondary's replicated kernel window so syscalls
-    // this process makes resolve against the pinned core's own kernel statics.
-    prepare(&mut process.address_space).map_err(|e| format!("address-space prepare failed: {}", e))?;
+    let mut process = Process::from_elf(name, &full_args, &full_env, elf_data, None)
+        .map_err(|e| format!("Failed to load in-memory ELF for {name}: {e}"))?;
 
-    // A channel keeps the exit/IO paths on their normal codepath (they expect Some).
+    // Fresh channel so the exit/IO codepaths stay on their normal path (they expect Some);
+    // a piped (non-terminal) stdout. On a secondary the process's tty output is also routed
+    // to the per-core console ring by the write syscall (§8.2), so it reaches the UART even
+    // though no parent drains this channel.
     let channel = Arc::new(ProcessChannel::new());
     channel.set_terminal(false);
     process.channel = Some(channel.clone());
+    // No extra argv beyond the program name (this entry takes none), so the ProcessInfo
+    // args list is empty — matching a bare spawn with no arguments.
+    process.args = Vec::new();
+    process.spawner_pid = read_current_pid();
 
     let pid = process.pid;
-    let boxed_process = Box::try_new(process)
-        .map_err(|_| format!("Failed to allocate Process struct for {name}"))?;
+    let boxed_process =
+        Box::try_new(process).map_err(|_| format!("Failed to allocate Process struct for {name}"))?;
     register_process(pid, boxed_process);
     register_channel(0, channel);
 
@@ -406,7 +400,11 @@ pub fn spawn_local_image(
         let tid = crate::threading::current_thread_id();
         if let Some(p) = lookup_process(pid) {
             p.thread_id = Some(tid);
-            // NOTE: intentionally no THREAD_PID_MAP insert (see doc comment).
+            // Register in THREAD_PID_MAP so the thread-cleanup path reaps the process
+            // normally (not a leaked zombie).
+            crate::runtime::with_irqs_disabled(|| {
+                crate::process::table::THREAD_PID_MAP.lock().insert(tid, pid);
+            });
             remove_channel(0);
             register_channel(tid, p.channel.as_ref().unwrap().clone());
             run_registered_process(pid);
@@ -414,7 +412,7 @@ pub fn spawn_local_image(
             loop { crate::threading::yield_now(); }
         }
     })
-    .map_err(|e| format!("Failed to spawn thread for {name}: {}", e))?;
+    .map_err(|e| format!("Failed to spawn thread for {name}: {e}"))?;
 
     if let Some(p) = lookup_process(pid) {
         p.thread_id = Some(thread_id);

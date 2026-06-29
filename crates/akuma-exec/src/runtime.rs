@@ -221,6 +221,13 @@ pub fn runtime() -> ExecRuntime {
         .expect("akuma-exec: ExecRuntime not registered — call akuma_exec::init() first")
 }
 
+/// Whether the runtime + config have been registered (non-panicking probe). Used by the
+/// multikernel to verify a secondary's per-core runtime is up before spawning on it.
+#[must_use]
+pub fn is_registered() -> bool {
+    RUNTIME.get().is_some() && CONFIG.get().is_some()
+}
+
 /// Access the registered config. Panics if not yet registered.
 /// Safe to call from IRQ context — never blocks.
 #[must_use]

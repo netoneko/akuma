@@ -1078,16 +1078,28 @@ pub(super) fn sys_getpid() -> u64 {
 
 /// Multikernel `core_init` (syscall nr::CORE_INIT): activate a parked secondary core
 /// from userspace (an init system like herd drives this — docs/MULTIKERNEL.md R4b
-/// lifecycle). Delegates to the BSP-served `smp::core_init`. On a non-multikernel build
-/// there are no secondaries, so it returns `-ENOSYS`.
-pub(super) fn sys_core_init(core_idx: usize) -> u64 {
+/// lifecycle, acceptance/12). `init_program_ptr` is an optional NUL-terminated path
+/// (0 ⇒ none): the program the activated core runs as its first (init) process — handed
+/// to the core in the `MSG_CORE_INIT` config (NOT a cross-core spawn). Delegates to the
+/// BSP-served `smp::core_init`. On a non-multikernel build there are no secondaries, so it
+/// returns `-ENOSYS`.
+pub(super) fn sys_core_init(core_idx: usize, init_program_ptr: u64) -> u64 {
     #[cfg(kernel_smp)]
     {
-        crate::smp::core_init(core_idx)
+        // Copy the optional init-program path from user space (NUL-terminated, like spawn).
+        let path = if init_program_ptr != 0 {
+            match copy_from_user_str(init_program_ptr, 512) {
+                Ok(s) => s,
+                Err(_) => return EFAULT,
+            }
+        } else {
+            alloc::string::String::new()
+        };
+        crate::smp::core_init(core_idx, path.as_bytes())
     }
     #[cfg(not(kernel_smp))]
     {
-        let _ = core_idx;
+        let _ = (core_idx, init_program_ptr);
         (-38i64) as u64 // ENOSYS
     }
 }

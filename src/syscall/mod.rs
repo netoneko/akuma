@@ -712,7 +712,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SPAWN_EXT => proc::sys_spawn_ext(args[0], args[1], args[2], args[3], args[4], args[5]),
         nr::SET_BOX_STACK => proc::sys_set_box_stack(args[0], args[1]),
         nr::CLOSE_CHILD_STDIN => proc::sys_close_child_stdin(args[0] as u32),
-        nr::CORE_INIT => proc::sys_core_init(args[0] as usize),
+        nr::CORE_INIT => proc::sys_core_init(args[0] as usize, args[1]),
         #[cfg(feature = "sc-containers")]
         nr::REGISTER_BOX => container::sys_register_box(args[0], args[1], args[2] as usize, args[3], args[4] as usize, args[5] as u32),
         #[cfg(feature = "sc-containers")]

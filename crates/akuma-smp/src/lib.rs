@@ -21,11 +21,13 @@ extern crate std;
 mod console_ring;
 mod descriptor;
 mod fwd_bounce;
+mod init_program;
 mod ring;
 mod state_machine;
 
 pub use console_ring::{ConsoleRing, CONSOLE_RING_CAP};
 pub use fwd_bounce::{ForwardCall, FwdBounce, FWD_BOUNCE_CAP, FWD_CALL_ARGS};
+pub use init_program::{InitProgram, INIT_PROGRAM_CAP};
 pub use state_machine::{Command, CoreStateMachine, Event, Range, MAX_DEBT_RANGES};
 pub use descriptor::{
     CoreConfig, MachineConfig, ENF_FAULTED, ENF_LEAKED, ENF_TESTING, MAGIC, MAX_CORES,

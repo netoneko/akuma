@@ -702,7 +702,17 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 if crate::config::STDOUT_TO_KERNEL_LOG_COPY_ENABLED {
                     proc.write_stdout(buf_slice);
                 }
-                
+
+                // Multikernel §8.2: a process PINNED to a secondary core has no BSP-side
+                // parent draining its channel, so route its tty output to this core's
+                // per-core console ring (console::print_bytes → console_emit → the ring →
+                // the BSP UART drainer). On the BSP (UART owner) this is a no-op:
+                // is_on_secondary() is false, so the normal channel path above stands.
+                #[cfg(kernel_smp)]
+                if crate::smp::is_on_secondary() {
+                    crate::console::print_bytes(buf_slice);
+                }
+
                 this_chunk as u64
             }
             akuma_exec::process::FileDescriptor::File(ref f) => {

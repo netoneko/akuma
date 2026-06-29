@@ -129,6 +129,14 @@ struct ServiceConfig {
     /// terminal `Completed` state instead of `Stopped` (so it is never restarted),
     /// regardless of exit code. Overrides `restart`. A reboot runs it again.
     oneshot: bool,
+    /// Multikernel core pin (docs/MULTIKERNEL.md §10, CORE_AWARE_SCHEDULING.md). 0 =
+    /// unpinned / BSP (current behavior: spawn locally on core 0). Non-zero = run this
+    /// service on that secondary core's kernel: herd hands the kernel the command path in
+    /// the `core_init` activation message and that core spawns it LOCALLY (no cross-core
+    /// spawn). A pinned service has no local pid — it lives on its core, its output drains
+    /// via that core's console ring, and its exit is reaped by that core's kernel.
+    /// Mutually exclusive with boxes (see `is_boxed`).
+    core: u32,
 }
 
 impl Default for ServiceConfig {
@@ -147,6 +155,7 @@ impl Default for ServiceConfig {
             mount_fs: Vec::new(),
             start_delay_ms: 0,
             oneshot: false,
+            core: 0,
         }
     }
 }
@@ -510,10 +519,6 @@ pub extern "C" fn main() {
 
     let mut state = HerdState::new();
 
-    // Multikernel: activate any parked secondary cores from userspace before starting
-    // services, so a core-pinned service finds its core available (no-op single-kernel).
-    init_secondary_cores();
-
     // Initial config load
     reload_config(&mut state);
 
@@ -611,6 +616,9 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                 }
                 "oneshot" => {
                     config.oneshot = value == "true" || value == "1";
+                }
+                "core" => {
+                    config.core = parse_u64(value).unwrap_or(0) as u32;
                 }
                 _ => {}
             }
@@ -752,45 +760,40 @@ const SYSCALL_REGISTER_BOX: u64 = 316;
 const SYSCALL_SET_BOX_STACK: u64 = 324;
 const SYSCALL_CORE_INIT: u64 = 327;
 
-/// Multikernel: activate secondary cores from userspace (docs/MULTIKERNEL.md R4b).
+/// Multikernel: activate secondary core `idx` to run `program` as its init process
+/// (docs/MULTIKERNEL.md §6/§10, acceptance/12). This is herd, the init system, owning
+/// core activation: it hands the kernel the program path in the activation message
+/// (`MSG_CORE_INIT`), and that core spawns it LOCALLY (its ELF fetched via forwarded
+/// `open`/`read`). There is deliberately NO cross-core spawn (§7) — the process is never
+/// injected into the core; the core's own kernel creates it. Returns true on success.
 ///
-/// Reads `/proc/cores` (the BSP-served, machine-global core table) and calls the
-/// `core_init` syscall for every non-BSP core that is not already `online` (i.e. `parked`
-/// awaiting activation, or `offline` after its watchdog elapsed — `core_init` re-CPU_ONs
-/// the latter). This is herd acting as the init system that owns core activation. It is a
-/// no-op on a single-kernel boot (only the BSP row) or when the kernel already activated
-/// the cores itself (all `online`). Run once at startup before services start, so a
-/// core-pinned service finds its core available.
-fn init_secondary_cores() {
-    let content = match read_file_string("/proc/cores") {
-        Some(c) => c,
-        None => return, // no procfs entry → not a multikernel boot
-    };
-    for line in content.lines().skip(1) {
-        // Format: "core state role" (whitespace-separated; see src/vfs/proc.rs).
-        let mut fields = line.split_whitespace();
-        let idx = match fields.next().and_then(parse_u64) {
-            Some(i) => i,
-            None => continue,
-        };
-        let state = fields.next().unwrap_or("");
-        let role = fields.next().unwrap_or("");
-        if role == "bsp" || state == "online" {
-            continue; // BSP, or already active — nothing to do
-        }
-        let r = libakuma::syscall(SYSCALL_CORE_INIT, idx, 0, 0, 0, 0, 0);
-        if (r as i64) == 0 {
-            print("[herd] core ");
-            print_dec(idx as usize);
-            print(": activation requested (was ");
-            print(state);
-            print(")\n");
-        } else {
-            print("[herd] core ");
-            print_dec(idx as usize);
-            print(": core_init failed\n");
-        }
-    }
+/// `program` must be a `/`-rooted path; it is passed NUL-terminated (the `core_init`
+/// syscall reads it like any path). On a single-kernel boot the syscall returns `-ENOSYS`
+/// and this returns false.
+fn core_init(idx: u32, program: &str) -> bool {
+    let mut path = Vec::with_capacity(program.len() + 1);
+    path.extend_from_slice(program.as_bytes());
+    path.push(0); // NUL-terminate for the kernel's path copy
+    let r = libakuma::syscall(
+        SYSCALL_CORE_INIT,
+        idx as u64,
+        path.as_ptr() as u64,
+        0,
+        0,
+        0,
+        0,
+    );
+    (r as i64) == 0
+}
+
+/// Whether a service config asks for any kind of box/namespace. A boxed service cannot
+/// also be pinned to a non-BSP core (boxes are per-kernel-private state; see
+/// userspace/herd/docs/CORE_AWARE_SCHEDULING.md) — herd rejects that combination.
+fn is_boxed(config: &ServiceConfig) -> bool {
+    config.boxed
+        || !config.bundle.is_empty()
+        || !config.join_box.is_empty()
+        || config.box_root != "/"
 }
 
 /// Tell the kernel a box uses the NetBSD rump network stack (stack = 1). The
@@ -930,6 +933,59 @@ fn setup_fs_mounts(box_id: u64, mounts: &[String]) {
 }
 
 fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
+    // Core-pinned service (multikernel): don't spawn locally. Hand the command to the
+    // target core's kernel via core_init — the activation message carries the program
+    // path and that core spawns it LOCALLY (ELF fetched via forwarded open/read). There
+    // is no cross-core spawn and no local pid to supervise: the process lives on core N,
+    // its stdout drains to the console through core N's ring, and its exit is reaped by
+    // core N's kernel (docs/MULTIKERNEL.md §7/§10, acceptance/12 Milestone 2).
+    if config.core != 0 {
+        print("[herd] Starting service: ");
+        print(name);
+        print(" on core ");
+        print_dec(config.core as usize);
+        print("\n");
+        // Box + non-BSP core is a misconfiguration: boxes are per-kernel-private state, so
+        // a BSP box can't follow a process onto a secondary (CORE_AWARE_SCHEDULING.md).
+        if is_boxed(config) {
+            print("[herd] Error: ");
+            print(name);
+            print(": box + non-BSP core is unsupported — not started\n");
+            if let Some(svc) = state.services.get_mut(name) {
+                svc.state = ServiceState::Failed;
+            }
+            return;
+        }
+        let ok = core_init(config.core, &config.command);
+        if let Some(svc) = state.services.get_mut(name) {
+            if ok {
+                print("[herd] core_init(");
+                print_dec(config.core as usize);
+                print(") requested: ");
+                print(&config.command);
+                print("\n");
+                // No local pid — the process runs on the core. A oneshot pinned service
+                // goes terminal (Completed) immediately (it runs once on its core, and
+                // herd can't waitpid a cross-core process); otherwise mark Running
+                // best-effort (not locally supervised). Restart is not attempted for
+                // pinned services in this cut.
+                svc.pid = None;
+                svc.stdout_fd = None;
+                svc.state = if config.oneshot {
+                    ServiceState::Completed
+                } else {
+                    ServiceState::Running
+                };
+            } else {
+                print("[herd] core_init failed for ");
+                print(name);
+                print(" — not started\n");
+                svc.state = ServiceState::Failed;
+            }
+        }
+        return;
+    }
+
     print("[herd] Starting service: ");
     print(name);
     if !config.bundle.is_empty() {
@@ -1241,18 +1297,26 @@ fn read_file_bytes(path: &str) -> Option<Vec<u8>> {
         }
     };
 
-    let size = stat.st_size as usize;
-    let mut content = alloc::vec![0u8; size];
-
+    // st_size is only a HINT: procfs files (e.g. /proc/cores) report size 0 yet stream
+    // real bytes on read, so we must read until EOF rather than trusting the stat size.
+    // Use the stat size to pre-size the buffer when it is nonzero; otherwise grow in
+    // CHUNK-sized steps.
+    const CHUNK: usize = 4096;
+    let hint = stat.st_size as usize;
+    let mut content: Vec<u8> = Vec::new();
     lseek(fd, 0, seek_mode::SEEK_SET);
-    let mut read = 0;
-    while read < size {
+    let mut read = 0usize;
+    loop {
+        // Ensure at least CHUNK bytes of spare capacity to read into.
+        let want = (hint.max(read + CHUNK)).max(content.len());
+        content.resize(want, 0);
         let n = read_fd(fd, &mut content[read..]);
         if n <= 0 {
             break;
         }
         read += n as usize;
     }
+    content.truncate(read);
 
     close(fd);
     Some(content)
