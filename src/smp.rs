@@ -391,6 +391,14 @@ const PERCPU_R3B_DONE: usize = 104; // 1 if the spinner ran to completion (R3_SK
 /// verified (BSP transformed our bounce payload + echoed our nonce), 0 = failed/no reply.
 const PERCPU_R4A_OK: usize = 112;
 
+/// Secondary user-table kernel-window check (R4b.3a): 1 = a freshly-built user address
+/// space resolves a kernel `.data` static to THIS core's PRIVATE page (matching its
+/// restricted table), not the BSP's identity copy. 0 = failed.
+const PERCPU_USERTAB_PRIV_OK: usize = 120;
+/// Diagnostics: the PA the user table / restricted table resolve the probe VA to.
+const PERCPU_USERTAB_USER_PA: usize = 128;
+const PERCPU_USERTAB_REST_PA: usize = 136;
+
 /// Snapshot pristine `.data` — MUST be the first thing `rust_start` does, before any
 /// code mutates a `.data`/`.bss` static. Copies `[_data_start, __bss_start)` into
 /// `DATA_SNAPSHOT`. Boots-halts if `.data` exceeds the snapshot capacity (so the
@@ -1072,6 +1080,19 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
                 crate::safe_print!(96, "[SMP] core {} R4a: FAILED (no/garbled reply - ok={} FAIL)\n", idx, r4a_ok as usize);
             }
         }
+        // R4b.3a: a user (EL0) address space built on this core resolves the kernel's
+        // `.data`/`.bss` statics to its OWN private pages (matching its restricted table),
+        // not the BSP's identity copy — the prerequisite for running an EL0 process here.
+        if percpu != 0 {
+            let ok = unsafe { core::ptr::read_volatile((percpu + PERCPU_USERTAB_PRIV_OK) as *const u64) };
+            let upa = unsafe { core::ptr::read_volatile((percpu + PERCPU_USERTAB_USER_PA) as *const u64) };
+            let rpa = unsafe { core::ptr::read_volatile((percpu + PERCPU_USERTAB_REST_PA) as *const u64) };
+            if ok == 1 {
+                crate::safe_print!(128, "[SMP] core {} user-table: kernel window -> private page 0x{:x} (not identity) PASS\n", idx, upa);
+            } else {
+                crate::safe_print!(128, "[SMP] core {} user-table: FAILED (user_pa=0x{:x} rest_pa=0x{:x} FAIL)\n", idx, upa, rpa);
+            }
+        }
     }
 
     crate::safe_print!(48, "[SMP] bringup complete\n");
@@ -1310,6 +1331,14 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
     // scheduler (ring + bounce + spin), so it runs regardless of R3a. The BSP services
     // the request from its bringup wait loop; we spin on the reply, then announce Online.
     run_r4a_fwd_test(cfg, core_idx, percpu);
+
+    // R4b.3a — build a user address space on this core, overlay the replicated kernel
+    // window, and verify its kernel statics resolve to OUR private pages (the mapping
+    // fix that lets an EL0 process run here without leaking into the BSP's `.data`/`.bss`).
+    // Needs the akuma-exec runtime R3a stood up; no-op (records 0) if R3a was skipped.
+    if sched_up {
+        verify_user_table_kernel_window(percpu);
+    }
 
     // First words a secondary ever speaks for itself — proving the §8.2 console path
     // end to end: this `print` lands in our console ring; the BSP drainer thread (not
@@ -2105,6 +2134,92 @@ fn run_r4a_fwd_test(cfg: &MachineConfig, idx: usize, percpu: usize) {
     }
     // SAFETY: PerCpu page is mapped RW in this core's restricted table.
     unsafe { core::ptr::write_volatile((percpu + PERCPU_R4A_OK) as *mut u64, ok) };
+}
+
+// ============================================================================
+// R4b.3 — EL0 on the secondary (docs/MULTIKERNEL.md §10, §15). A user (EL0) process's
+// page table must carry the SECONDARY's replicated kernel writable window, NOT the plain
+// identity map `add_kernel_mappings` builds. Akuma is TTBR0-only: an EL0->EL1 syscall
+// trap runs the kernel under the PROCESS's TTBR0 (no switch), so if that table identity-
+// maps RAM, the kernel's `.data`/`.bss` statics (PMM/POOL/process table) resolve to the
+// BSP's physical copies — an isolation breach + corruption. R4b.3a (here) builds the
+// overlay that fixes this and verifies it on a freshly-created user address space; R4b.3b
+// then runs a real pinned EL0 process on such a table.
+// ============================================================================
+
+/// Overlay the secondary's replicated kernel writable window onto `uas`. Walks the
+/// current (restricted) TTBR0 per page across `[_data_start, _kernel_phys_end)` and
+/// remaps each VA in `uas` to the SAME private PA, **EL1-only RW** (`PXN|UXN`, AP defaults
+/// to EL1 — so EL0 cannot touch kernel statics; note the restricted table itself uses
+/// `AP_RW_ALL`, harmless there because no EL0 runs on it, but unsafe in a user table).
+/// RO code is shared-identity (same PA both ways → no overlay needed); the shared
+/// descriptor page maps to `cfg_pa` in the restricted table, so the walk carries it
+/// across unchanged. `map_page` shatters the covering 2 MiB identity block as needed.
+fn overlay_secondary_kernel_window(
+    uas: &mut akuma_exec::mmu::UserAddressSpace,
+) -> Result<(), &'static str> {
+    let restricted_l0 = current_ttbr0_l0();
+    let data_start = &raw const _data_start as usize;
+    let end = (&raw const _kernel_phys_end as usize).next_multiple_of(PAGE);
+
+    let mut va = data_start;
+    while va < end {
+        // The PA this core's kernel uses for this VA (private `.data`/`.bss` page, or the
+        // shared descriptor). If unmapped in the restricted table, skip.
+        if let Some(pa) = akuma_exec::mmu::translate_user_va(restricted_l0, va) {
+            uas.map_page(va & !(PAGE - 1), pa & !(PAGE - 1), flags::PXN | flags::UXN)?;
+        }
+        va += PAGE;
+    }
+    Ok(())
+}
+
+/// Read this core's active TTBR0 L0 table as a `*const u64` (identity on a secondary —
+/// the partition 2 MiB blocks map its own page-table pages).
+fn current_ttbr0_l0() -> *const u64 {
+    let ttbr0: u64;
+    // SAFETY: reading TTBR0_EL1, the current address-space root.
+    unsafe { core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack)) };
+    phys_to_virt((ttbr0 & 0x0000_FFFF_FFFF_F000) as usize) as *const u64
+}
+
+/// Build a user address space on the secondary, overlay the kernel window, and prove its
+/// kernel statics resolve to THIS core's PRIVATE page — the R4b.3a mapping fix. Records
+/// 1/0 to PerCpu (+ the two PAs for diagnostics). Needs the akuma-exec runtime, which R3a
+/// stood up; if R3a was skipped this is a no-op (records 0).
+fn verify_user_table_kernel_window(percpu: usize) {
+    if percpu == 0 {
+        return;
+    }
+    let record = |ok: u64, user_pa: u64, rest_pa: u64| {
+        // SAFETY: PerCpu page is mapped RW in this core's restricted table.
+        unsafe {
+            core::ptr::write_volatile((percpu + PERCPU_USERTAB_USER_PA) as *mut u64, user_pa);
+            core::ptr::write_volatile((percpu + PERCPU_USERTAB_REST_PA) as *mut u64, rest_pa);
+            core::ptr::write_volatile((percpu + PERCPU_USERTAB_PRIV_OK) as *mut u64, ok);
+        }
+    };
+
+    let Some(mut uas) = akuma_exec::mmu::UserAddressSpace::new() else {
+        record(0, 0, 0);
+        return;
+    };
+    if overlay_secondary_kernel_window(&mut uas).is_err() {
+        record(0, 0, 0);
+        return;
+    }
+
+    // Probe a known kernel `.data` static (inside the writable window). The PA the USER
+    // table resolves it to must MATCH the restricted table (a private partition page) and
+    // must NOT equal the VA itself (identity would mean it points at the BSP's copy).
+    let probe_va = (&raw const SMP_REPLICATION_TEST as usize) & !(PAGE - 1);
+    let user_l0 = phys_to_virt(uas.l0_phys()) as *const u64;
+    let user_pa = akuma_exec::mmu::translate_user_va(user_l0, probe_va);
+    let rest_pa = akuma_exec::mmu::translate_user_va(current_ttbr0_l0(), probe_va);
+    let ok = matches!((user_pa, rest_pa), (Some(u), Some(r)) if u == r && r != probe_va);
+    record(u64::from(ok), user_pa.unwrap_or(0) as u64, rest_pa.unwrap_or(0) as u64);
+    // `uas` drops here: its Drop frees the user table's OWN page-table pages + ASID. The
+    // overlaid kernel PAs were never tracked as user frames, so they are untouched.
 }
 
 /// BSP side of forward serving: drain its inbox and service `MSG_FWD_ECHO_REQ`s. Called
