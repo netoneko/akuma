@@ -7,6 +7,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64};
 
 use crate::console_ring::ConsoleRing;
+use crate::fwd_bounce::FwdBounce;
 use crate::ring::Ring;
 
 /// Maximum physical PEs the descriptor describes.
@@ -101,6 +102,11 @@ pub struct MachineConfig {
     /// (core 0, UART owner) drains them. Separate from `inboxes` so high-volume
     /// console traffic never floods or delays low-rate control messages.
     pub console_rings: [ConsoleRing; MAX_CORES],
+    /// Per-core syscall-forwarding bounce region (§8.1): the shared byte buffer where a
+    /// forwarding core's inbound/outbound data meets the owner core, so neither ever
+    /// dereferences a pointer into the other's partition. Access is serialized by the
+    /// request/reply handshake on `inboxes`.
+    pub fwd_bounce: [FwdBounce; MAX_CORES],
 }
 
 impl Default for MachineConfig {
@@ -126,6 +132,7 @@ impl MachineConfig {
             heartbeat: [const { AtomicU64::new(0) }; MAX_CORES],
             inboxes: [const { Ring::new() }; MAX_CORES],
             console_rings: [const { ConsoleRing::new() }; MAX_CORES],
+            fwd_bounce: [const { FwdBounce::new() }; MAX_CORES],
         }
     }
 }
@@ -152,7 +159,7 @@ mod tests {
         assert_eq!(size % 4096, 0, "descriptor must be a whole number of pages");
         // The console rings dominate the size; sanity-bound it so an accidental
         // blow-up (e.g. a giant CONSOLE_RING_CAP) is caught here, not at boot.
-        let upper = (MAX_CORES * crate::CONSOLE_RING_CAP) + 8192;
+        let upper = (MAX_CORES * (crate::CONSOLE_RING_CAP + crate::FWD_BOUNCE_CAP)) + 8192;
         assert!(size <= upper, "descriptor {size} bytes exceeds {upper}");
     }
 

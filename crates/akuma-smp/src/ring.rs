@@ -13,6 +13,16 @@ pub const MSG_PRESSURE: u32 = 1;
 /// A repayment addressed to a creditor: `v0` = range base, `v1` = range length.
 pub const MSG_REPAID: u32 = 2;
 
+// Cross-core syscall-forwarding transport (docs/MULTIKERNEL.md §8.1/§10). R4a proves
+// the round-trip: a forwarding core writes a payload into its `fwd_bounce` slot
+// (§descriptor) and sends a request; the owner core reads it, produces a result back
+// into the same slot, and replies. The ring's `ready` Release/Acquire is the publish
+// edge that also orders the bounce-region bytes written before the push.
+/// Forward request: `v0` = payload byte length in `fwd_bounce[from]`, `v1` = nonce.
+pub const MSG_FWD_ECHO_REQ: u32 = 3;
+/// Forward reply: `v0` = byte length written back to `fwd_bounce[from]`, `v1` = nonce.
+pub const MSG_FWD_ECHO_REPLY: u32 = 4;
+
 /// Inbox capacity. Small — the coordination message rate is low; protocol traffic
 /// is a handful of messages per event, drained every loop pass.
 pub const RING_CAP: usize = 8;

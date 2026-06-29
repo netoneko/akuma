@@ -9,8 +9,8 @@ untouched. Verified under QEMU `SMP=4 @ 2 GB`:
   deliberate cross-core read **faults**. (This is a TTBR0 identity kernel, so isolation uses
   per-core *TTBR0* tables + replicated `.data`/`.bss` + a private PerCpu chunk, not the original
   "via TTBR1". Per-core `pmm`/heap over a real partition = **R2 ✅**; a per-core COOPERATIVE
-  scheduler = **R3a ✅**; per-core PREEMPTIVE scheduler (timer-driven) = **R3b ✅**; syscalls +
-  a pinned process = R4, TODO.)
+  scheduler = **R3a ✅**; per-core PREEMPTIVE scheduler (timer-driven) = **R3b ✅**; the cross-core
+  syscall-forwarding TRANSPORT = **R4a ✅**; syscalls + a pinned process = R4b, TODO.)
 - **Messaging (M2) + protocol** — per-core heartbeat liveness, a lock-free MPSC inbox ring, and a
   cross-core **SGI doorbell**; secondaries are event-driven (WFI-sleep, wake on per-core timer
   tick or doorbell). The debt-based memory-reclaim protocol (§9) runs the host-tested
@@ -47,14 +47,24 @@ untouched. Verified under QEMU `SMP=4 @ 2 GB`:
   the real `exception_vector_table`, enables PPI 27 in its OWN redistributor, and arms CNTV. Proof:
   one PREEMPTIVE spinner thread that never yields runs (millions of iters) purely because the timer
   preempts the also-never-yielding boot thread. Verified SMP=2/4: `R3b: preemptive scheduler ✓
-  (timer preempted)`, then the M2 heartbeat/doorbell loop resumes intact. Syscalls + a real pinned
-  process are R4 (§10).
+  (timer preempted)`, then the M2 heartbeat/doorbell loop resumes intact.
+- **Cross-core forwarding transport (§8.1/§10) — R4a DONE:** the data-movement round-trip that
+  every forwarded syscall rides — and the half §8.1 calls *hard*. A secondary `copyin`s a payload
+  into its per-core `FwdBounce` slot (a `[AtomicU8;256]` in the shared descriptor — the sole shared
+  byte buffer), pushes a `MSG_FWD_ECHO_REQ` to the BSP inbox, and spins for the reply; the BSP
+  services it **from its bringup online-wait loop** (so a secondary blocking on the reply can't
+  deadlock the BSP blocking on that secondary's `Online`), transforms the payload (stand-in for the
+  real owner-side syscall), and replies. The secondary `copyout`s + verifies (nonce-matched, byte
+  transform). Verified SMP=2/4: `R4a: cross-core forward round-trip ✓`. Neither core touched the
+  other's partition — only the bounce region. The ring's `ready` Release/Acquire orders the bounce
+  bytes. This is the keystone for R4b (loading a process's ELF = forwarding `open`/`read`).
 
 Build with `scripts/build_smp.sh`; boot with `scripts/run_smp.sh` (or `SMP=N cargo run
 --profile release-smp --features smp`). Host-test/simulate the protocol with no QEMU:
 `cargo test -p akuma-smp --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)`. Remaining:
-a pinned process + per-syscall I/O forwarding (R4/M3, §10 — see the worked end-to-end example
-there), dynamic memory (M4). Deferred cleanup/tech-debt is tracked in §16.
+per-core syscalls + a pinned process over the R4a transport (R4b/M3, §10 — see the worked
+end-to-end example + decision tree there), dynamic memory (M4). Deferred cleanup/tech-debt is
+tracked in §16.
 **Author:** design notes, 2026-06-28
 **Scope:** AArch64 (QEMU virt). A shared-nothing, message-passing multikernel where each
 physical core boots its own kernel instance ("a container per core"), instead of one
@@ -788,8 +798,8 @@ Staged, each independently verifiable:
 | **R2 — per-core PMM + heap** ✅ | Secondary runs `pmm::init`/`allocator::init` over its partition; `alloc` works, BSP PMM untouched | DONE. `PartitionBump` carves the secondary's whole bringup image (page tables + replicated `.data`/`.bss` + stack + PerCpu) from its OWN partition (never the BSP `pmm`); `build_isolated_table` identity-maps the partition as 2 MiB RW blocks and records the consumed prefix as `kernel_end`. The secondary then seeds a private heap just above `kernel_end` and runs the unchanged `allocator::init` + `pmm::init` over `[pbase, pbase+len_2mb)` — they resolve to its replicated `static`s, so nothing the BSP owns is touched. `smp::reserve_secondary_partitions` (called right after the BSP's `pmm::init`, before `mmu::init`) removes those ranges from the BSP pool so the two are disjoint. Proof: `run_r2_test` allocs a heap `Vec` + 16 PMM pages and posts the result to PerCpu; the BSP confirms in-partition + BSP-pool-unchanged (verified SMP=2/4). Did **not** call `akuma_exec::mmu::init` on a secondary (it writes the SHARED boot tables). |
 | **R3a — per-core COOPERATIVE scheduler** ✅ | Secondary runs `akuma_exec`'s scheduler per-core and switches between kernel threads via `yield_now` | DONE (SMP=2/4). `run_r3a_coop_test`: register the runtime locally (`build_exec_runtime` extracted from `main.rs`, canaries off, secondary stack bounds) since the BSP's `RUNTIME`/`CONFIG` cells are set post-snapshot and a secondary's replicated copy is pristine; `akuma_exec::mmu::set_boot_ttbr0_override(our table)` so spawned threads get OUR TTBR0, not the BSP's (`boot_ttbr0_addr` lives in `.data.boot`, *outside* the replicated writable window, so the asm cell can't be rewritten on a secondary); re-target the scheduler SGI at this PE (`gic::trigger_sgi` hardcodes TargetList bit 0 = BSP); install the real `exception_vector_table`; enable only the scheduler SGI; spawn 2 workers via `spawn_system_thread_fn` (the closure path builds a real `setup_fake_irq_frame` — the bare `spawn(extern fn)` path is register-based and incompatible with the stack-based scheduler) and `yield_now` between them. Proof: 2 threads × 8 yields = 16, then the M2 heartbeat/doorbell loop resumes. |
 | **R3b — per-core preemptive scheduler** ✅ | Per-core timer preempts kernel threads on a secondary | DONE (SMP=2/4). `run_r3b_preempt_test` reuses R3a's scheduler: registers a per-core timer handler via `irq::register_handler_no_gic` (the normal `register_handler` calls `gic::enable_irq`, which for INTID<32 pokes **core 0's** redistributor — faults on a secondary); runs on the real `exception_vector_table`; enables PPI 27 in its OWN redistributor + arms CNTV. The handler re-arms CNTV then rings the scheduler SGI **at itself** (`trigger_sched_sgi_self`) — same two-step as the BSP's `timer_irq_handler`. Proof: a preemptive spinner that never yields advances (~12 M iters) only because the timer preempts the never-yielding boot thread (which, being the cooperative idle thread, is preempted past `COOPERATIVE_TIMEOUT_US`=100 ms; run window 300 ms). |
-| **R3b-next — per-core syscalls** | SVC from EL0 traps to the (per-core) handlers | Folded into R4 — only meaningful once a user process runs on the secondary; `sync_el0_handler` on the per-core vectors + the syscall table resolve to replicated state. |
-| **R4 — process + forwarding (the demo)** | Spawn `/bin/hello` (then `curl`) pinned to core 1, forwarding `open`/`read`/`write`/sockets to core 0 (§10) | "exec is recursive forwarding": core 1 has no VFS, so loading the ELF forwards `open`/`read` to core 0. Console + sockets likewise. This is the §10 acceptance test. |
+| **R4a — cross-core forwarding TRANSPORT** ✅ | The data-movement round-trip (§8.1): request/reply over the ring + a shared bounce region | DONE (SMP=2/4). The keystone for everything else in R4 ("exec is recursive forwarding"), and the half §8.1 calls *hard*. Added `akuma_smp::FwdBounce` (per-core `[AtomicU8; 256]` slot in the descriptor, the sole shared byte buffer — published by the ring's `ready` Release/Acquire) + `MSG_FWD_ECHO_{REQ,REPLY}`. `run_r4a_fwd_test` (secondary): `copyin` a payload to its bounce slot → push request to the BSP inbox → spin (time-bounded) on the reply → `copyout` + verify. `service_fwd_requests` (BSP): drains its inbox **from the bringup online-wait loop** (else BSP-waits-Online ⇄ secondary-waits-reply deadlock), transforms the bounce payload (byte+1, standing in for the real owner-side syscall), replies. Proof: nonce-matched reply + verified transform = the §8.1 data path works end to end; neither core touched the other's partition. Independent of the scheduler, so it runs even when R3a is skipped. |
+| **R4b — per-core syscalls + pinned process** | SVC from EL0 on the per-core vectors; spawn `/bin/hello` (then `curl`) pinned to core 1, forwarding `open`/`read`/`write`/sockets to core 0 (§10) | The secondary stops tearing down (real vectors permanently + timer→scheduler steady state, §16); `sync_el0_handler` + the syscall table resolve to replicated state; exec forwards `open`/`read` over the R4a transport to fetch the ELF (recursive forwarding), then console/sockets likewise. This is the §10 acceptance test. Needs a persistent BSP forward-server (a thread, not the bringup loop) since real forwarding (VFS) is only up post-bringup. |
 
 **Why R1 is the keystone:** once `static`s are per-core, R2–R4 reuse the *existing*
 kernel init/exec code unchanged — the per-core-ness lives entirely in the page tables.
@@ -798,14 +808,17 @@ kernel init/exec code unchanged — the per-core-ness lives entirely in the page
 
 Tracked here so it isn't lost; tackle after the R3b/R4 milestones, not inline.
 
-- **R3a/R3b leftovers.** Both scheduler self-tests are bounded probes: each stands the scheduler
-  up, proves a property (cooperative yield / timer preemption), then tears down (restores
-  `smp_vectors`, masks IRQs, R3b disables CNTV) and the secondary returns to the M2 heartbeat WFI
-  loop, leaving a dormant scheduler + terminated worker slots. The `PERCPU_R3_STAGE` marker + BSP
-  timeout print are kept as cheap living diagnostics. **R4** is where the secondary stops tearing
-  down: it will run on the real `exception_vector_table` permanently with the timer wired to the
-  scheduler as its steady-state loop, and host a real pinned process (the heartbeat/debt work
-  becomes one of its threads).
+- **R3a/R3b/R4a leftovers.** All three are bounded bringup probes: each stands its mechanism up,
+  proves a property (cooperative yield / timer preemption / forward round-trip), then tears down
+  (restores `smp_vectors`, masks IRQs, R3b disables CNTV) and the secondary returns to the M2
+  heartbeat WFI loop, leaving a dormant scheduler + terminated worker slots. The `PERCPU_R3_STAGE`
+  marker + BSP timeout print are kept as cheap living diagnostics. R4a's `service_fwd_requests` is
+  driven inline by the BSP bringup loop (fine for a bringup probe); **R4b** needs a *persistent* BSP
+  forward-server (a system thread, like the console drainer), because real forwarding targets (VFS,
+  sockets) only come up post-bringup. **R4b** is also where the secondary stops tearing down: it
+  runs on the real `exception_vector_table` permanently with the timer wired to the scheduler as its
+  steady-state loop, and hosts a real pinned process (the heartbeat/debt work becomes one of its
+  threads).
 
 - **Sweep deprecated code (general).** Do a pass over the kernel + crates for dead/deprecated
   code and remove it. (Done so far, 2026-06-29: removed the dead `switch_context` asm + its

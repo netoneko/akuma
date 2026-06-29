@@ -31,9 +31,8 @@ use akuma_exec::mmu::{attr_index, flags, phys_to_virt, MAIR_DEVICE_NGNRNE, MAIR_
 // module is the kernel glue (asm, PSCI, page tables, the pump).
 use akuma_smp::{
     partition, Command, ConsoleRing, CoreConfig, CoreStateMachine, Event, MachineConfig, Range,
-    ENF_FAULTED,
-    ENF_LEAKED, ENF_TESTING, MAGIC, MAX_CORES, MSG_PRESSURE, MSG_REPAID, STATE_BOOTING,
-    STATE_OFFLINE, STATE_ONLINE,
+    ENF_FAULTED, ENF_LEAKED, ENF_TESTING, MAGIC, MAX_CORES, MSG_FWD_ECHO_REPLY, MSG_FWD_ECHO_REQ,
+    MSG_PRESSURE, MSG_REPAID, STATE_BOOTING, STATE_OFFLINE, STATE_ONLINE,
 };
 use crate::console;
 use crate::pmm;
@@ -385,6 +384,9 @@ const PERCPU_R3_STAGE: usize = 88;
 /// R3b (per-core PREEMPTIVE scheduler) self-test result offsets.
 const PERCPU_R3B_COUNT: usize = 96; // spinner iterations observed (>0 ⇒ timer preempted)
 const PERCPU_R3B_DONE: usize = 104; // 1 if the spinner ran to completion (R3_SKIPPED if skipped)
+/// R4a (cross-core syscall-forwarding transport) self-test result: 1 = round-trip
+/// verified (BSP transformed our bounce payload + echoed our nonce), 0 = failed/no reply.
+const PERCPU_R4A_OK: usize = 112;
 
 /// Snapshot pristine `.data` — MUST be the first thing `rust_start` does, before any
 /// code mutates a `.data`/`.bss` static. Copies `[_data_start, __bss_start)` into
@@ -917,6 +919,10 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
                 online = true;
                 break;
             }
+            // Service any secondary's forward request (R4a) while we wait — a secondary
+            // blocks on its reply before announcing Online, so without this the BSP
+            // (spinning on Online) and the secondary (spinning on the reply) deadlock.
+            service_fwd_requests(cfg, bsp_idx);
             core::hint::spin_loop();
         }
         console::print("[SMP] core ");
@@ -1064,6 +1070,22 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
                 console::print(" spin_count=");
                 console::print_dec(r3b_count as usize);
                 console::print(" — timer did not preempt? ✗)\n");
+            }
+        }
+        // R4a: cross-core syscall-forwarding transport. The secondary shipped a payload
+        // through its bounce region to the BSP, which transformed it + replied; a
+        // verified round-trip proves the §8.1 data path (the keystone for R4 exec).
+        if percpu != 0 {
+            let r4a_ok =
+                unsafe { core::ptr::read_volatile((percpu + PERCPU_R4A_OK) as *const u64) };
+            console::print("[SMP] core ");
+            console::print_dec(idx);
+            if r4a_ok == 1 {
+                console::print(" R4a: cross-core forward round-trip ✓ (bounce + reply verified)\n");
+            } else {
+                console::print(" R4a: FAILED (no/garbled reply — ok=");
+                console::print_dec(r4a_ok as usize);
+                console::print(" ✗)\n");
             }
         }
     }
@@ -1294,6 +1316,11 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
         // SAFETY: PerCpu page is mapped RW in this core's restricted table.
         unsafe { core::ptr::write_volatile((percpu + PERCPU_R3B_DONE) as *mut u64, R3_SKIPPED) };
     }
+
+    // R4a — cross-core syscall-forwarding transport round-trip. Independent of the
+    // scheduler (ring + bounce + spin), so it runs regardless of R3a. The BSP services
+    // the request from its bringup wait loop; we spin on the reply, then announce Online.
+    run_r4a_fwd_test(cfg, core_idx, percpu);
 
     // First words a secondary ever speaks for itself — proving the §8.2 console path
     // end to end: this `print` lands in our console ring; the BSP drainer thread (not
@@ -1858,6 +1885,101 @@ fn run_r3b_preempt_test(idx: usize, percpu: usize) {
         );
     }
     stage(16);
+}
+
+// ============================================================================
+// R4a — cross-core syscall-forwarding TRANSPORT (docs/MULTIKERNEL.md §8.1/§10). The
+// keystone for the R4 demo ("exec is recursive forwarding"): before a process can run
+// on a secondary, the data-movement path — request/reply over the ring + a shared
+// bounce region — must work. This proves exactly that round-trip, independent of the
+// scheduler (ring + bounce + bounded spin), so it runs even when R3a was skipped.
+//
+// A secondary `copyin`s a known payload into its `fwd_bounce` slot, sends a request to
+// the BSP, and spins for the reply; the BSP (servicing in its bringup wait loop) reads
+// the slot, applies a transform (stand-in for the real owner-side syscall), writes the
+// result back, and replies. The secondary `copyout`s + verifies. Neither core ever
+// touches the other's partition — only the shared bounce region.
+// ============================================================================
+
+/// Bytes the R4a probe ships through the bounce region.
+const R4A_LEN: usize = 32;
+
+/// Per-core nonce so a reply is unambiguously matched to THIS core's request (and a
+/// stale/foreign message can't spoof success).
+fn r4a_nonce(idx: usize) -> u64 {
+    0xD00D_0000_0000_0000 | idx as u64
+}
+
+/// Secondary side of the R4a forward round-trip. Records 1/0 (verified/failed) to
+/// PerCpu. BSP = core 0 (the debt protocol's `const BSP` convention).
+fn run_r4a_fwd_test(cfg: &MachineConfig, idx: usize, percpu: usize) {
+    if percpu == 0 {
+        return;
+    }
+    let (Some(bounce), Some(bsp_inbox), Some(my_inbox)) =
+        (cfg.fwd_bounce.get(idx), cfg.inboxes.first(), cfg.inboxes.get(idx))
+    else {
+        return;
+    };
+
+    // copyin: write a known pattern (byte i = i) into OUR bounce slot.
+    let mut payload = [0u8; R4A_LEN];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    bounce.write(&payload);
+
+    // Send the forward request to the BSP, then spin (time-bounded) for the reply.
+    let nonce = r4a_nonce(idx);
+    let mut ok = 0u64;
+    if bsp_inbox.push(MSG_FWD_ECHO_REQ, idx as u32, R4A_LEN as u64, nonce) {
+        let deadline = crate::timer::uptime_us() + 1_000_000; // 1 s safety bound
+        while crate::timer::uptime_us() < deadline {
+            // Accept only OUR reply (matched by nonce); ignore any other message.
+            if let Some(m) = my_inbox.pop()
+                && m.kind == MSG_FWD_ECHO_REPLY
+                && m.v1 == nonce
+            {
+                // copyout: read back + verify the BSP's transform (byte + 1).
+                let mut got = [0u8; R4A_LEN];
+                bounce.read(&mut got);
+                let len_ok = m.v0 as usize == R4A_LEN;
+                let bytes_ok = got
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &b)| b == (i as u8).wrapping_add(1));
+                ok = u64::from(len_ok && bytes_ok);
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    }
+    // SAFETY: PerCpu page is mapped RW in this core's restricted table.
+    unsafe { core::ptr::write_volatile((percpu + PERCPU_R4A_OK) as *mut u64, ok) };
+}
+
+/// BSP side of forward serving: drain its inbox and service `MSG_FWD_ECHO_REQ`s. Called
+/// repeatedly from the bringup online-wait loop so a secondary spinning on its reply
+/// can't deadlock against the BSP spinning on that secondary's `Online`. The transform
+/// (byte + 1) stands in for the real owner-side syscall (VFS `read`, socket op) of
+/// R4b/R4c; the data path it exercises — bounce region + reply ring — is the real one.
+fn service_fwd_requests(cfg: &MachineConfig, bsp_idx: usize) {
+    let Some(bsp_inbox) = cfg.inboxes.get(bsp_idx) else {
+        return;
+    };
+    while let Some(m) = bsp_inbox.pop() {
+        if m.kind != MSG_FWD_ECHO_REQ {
+            continue; // debt-protocol traffic is post-bringup; ignore anything else here
+        }
+        let from = m.from as usize;
+        let len = m.v0 as usize;
+        if let Some(bounce) = cfg.fwd_bounce.get(from) {
+            bounce.map_in_place(len, |b| b.wrapping_add(1));
+        }
+        if let Some(reply) = cfg.inboxes.get(from) {
+            reply.push(MSG_FWD_ECHO_REPLY, bsp_idx as u32, m.v0, m.v1);
+        }
+    }
 }
 
 // ============================================================================
