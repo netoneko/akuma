@@ -72,6 +72,13 @@ static MACHINE_CONFIG: SyncConfig = SyncConfig(UnsafeCell::new(MachineConfig::ne
 /// each secondary sets only ITS OWN copy at bringup; the BSP's stays 0 (UART owner).
 static CONSOLE_RING_PA: AtomicUsize = AtomicUsize::new(0);
 
+/// PA of THIS core's PerCpu page, for IRQ handlers that run on the real
+/// `exception_vector_table` in steady state (R4b.1). The minimal `smp_vectors` path
+/// stashes the PerCpu PA in TPIDRRO_EL0, but the per-core scheduler claims that
+/// register for the current-thread id — so a steady-state handler finds PerCpu here
+/// instead. A `.bss` static → replicated per core; each secondary sets only its own.
+static SECONDARY_PERCPU: AtomicUsize = AtomicUsize::new(0);
+
 /// Route this core's `console::print` output to its per-core console ring. Called
 /// once by a secondary during bringup, after its restricted table maps the shared
 /// descriptor and before it prints anything.
@@ -140,14 +147,10 @@ pub fn start_console_drainer() {
     });
     match spawned {
         Ok(tid) => {
-            console::print("[SMP] console drainer thread spawned (tid ");
-            console::print_dec(tid);
-            console::print(")\n");
+            crate::safe_print!(64, "[SMP] console drainer thread spawned (tid {})\n", tid);
         }
         Err(e) => {
-            console::print("[SMP] console drainer spawn FAILED: ");
-            console::print(e);
-            console::print("\n");
+            crate::safe_print!(96, "[SMP] console drainer spawn FAILED: {}\n", e);
         }
     }
 }
@@ -737,12 +740,12 @@ fn build_isolated_table(cfg: &mut MachineConfig, idx: usize) -> bool {
 pub fn probe_dtb(dtb_ptr: usize) {
     let actual_dtb = resolve_dtb(dtb_ptr);
     if actual_dtb == 0 {
-        console::print("[SMP] probe: no DTB\n");
+        crate::safe_print!(32, "[SMP] probe: no DTB\n");
         return;
     }
     // SAFETY: `actual_dtb` carries a verified FDT magic.
     let Ok(fdt) = (unsafe { fdt::Fdt::from_ptr(actual_dtb as *const u8) }) else {
-        console::print("[SMP] probe: invalid DTB\n");
+        crate::safe_print!(32, "[SMP] probe: invalid DTB\n");
         return;
     };
     let (mpidrs, num_cores) = collect_mpidrs(&fdt);
@@ -753,10 +756,12 @@ pub fn probe_dtb(dtb_ptr: usize) {
     NUM_CORES.store(num_cores, Ordering::Relaxed);
     USE_HVC.store(use_hvc, Ordering::Relaxed);
     PROBED.store(true, Ordering::Release);
-    console::print("[SMP] probe: ");
-    console::print_dec(num_cores);
-    console::print(" core(s), conduit=");
-    console::print(if use_hvc { "hvc\n" } else { "smc\n" });
+    crate::safe_print!(
+        64,
+        "[SMP] probe: {} core(s), conduit={}\n",
+        num_cores,
+        if use_hvc { "hvc" } else { "smc" }
+    );
 }
 
 /// Hand each secondary core sole ownership of its RAM partition by removing those
@@ -783,9 +788,7 @@ pub fn reserve_secondary_partitions(ram_base: usize, ram_size: usize) {
         pmm::reserve_range(base as usize, len as usize);
         reserved_mb += (len / (1024 * 1024)) as usize;
     }
-    console::print("[SMP] reserved ");
-    console::print_dec(reserved_mb);
-    console::print(" MB of secondary partitions from the BSP PMM\n");
+    crate::safe_print!(64, "[SMP] reserved {} MB of secondary partitions from the BSP PMM\n", reserved_mb);
 }
 
 /// BSP entry point: wake every secondary PE and wait for it to report `Online`.
@@ -793,7 +796,7 @@ pub fn reserve_secondary_partitions(ram_base: usize, ram_size: usize) {
 /// [`probe_dtb`] — the DTB itself may already be heap-clobbered by now.
 pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
     if !PROBED.load(Ordering::Acquire) {
-        console::print("[SMP] not probed; staying single-core\n");
+        crate::safe_print!(48, "[SMP] not probed; staying single-core\n");
         return;
     }
     let num_cores = NUM_CORES.load(Ordering::Relaxed);
@@ -804,14 +807,10 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
     }
     let bsp_idx = (read_mpidr() & 0xff) as usize;
 
-    console::print("[SMP] ");
-    console::print_dec(num_cores);
-    console::print(" core(s); BSP is core ");
-    console::print_dec(bsp_idx);
-    console::print("\n");
+    crate::safe_print!(64, "[SMP] {} core(s); BSP is core {}\n", num_cores, bsp_idx);
 
     if num_cores <= 1 {
-        console::print("[SMP] single core; no secondaries to bring up\n");
+        crate::safe_print!(64, "[SMP] single core; no secondaries to bring up\n");
         return;
     }
 
@@ -833,13 +832,13 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
         // the core's private image in the page-table-isolation step).
         cfg.cores[idx].kernel_end = pbase;
         cfg.cores[idx].state.store(STATE_OFFLINE, Ordering::Relaxed);
-        console::print("[SMP] core ");
-        console::print_dec(idx);
-        console::print(" partition: base=0x");
-        console::print_hex(pbase);
-        console::print(" len=");
-        console::print_dec((plen / (1024 * 1024)) as usize);
-        console::print(" MB\n");
+        crate::safe_print!(
+            96,
+            "[SMP] core {} partition: base=0x{:x} len={} MB\n",
+            idx,
+            pbase,
+            (plen / (1024 * 1024)) as usize
+        );
     }
 
     // Build each secondary's RESTRICTED, isolated page table (shared code RO +
@@ -850,16 +849,16 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
             continue;
         }
         let ok = build_isolated_table(cfg, idx);
-        console::print("[SMP] core ");
-        console::print_dec(idx);
         if ok {
-            console::print(" isolated table: ttbr0=0x");
-            console::print_hex(cfg.cores[idx].ttbr0_phys);
-            console::print(" sp=0x");
-            console::print_hex(cfg.cores[idx].entry_sp);
-            console::print("\n");
+            crate::safe_print!(
+                112,
+                "[SMP] core {} isolated table: ttbr0=0x{:x} sp=0x{:x}\n",
+                idx,
+                cfg.cores[idx].ttbr0_phys,
+                cfg.cores[idx].entry_sp
+            );
         } else {
-            console::print(" isolated table: OOM (falling back to shared park)\n");
+            crate::safe_print!(80, "[SMP] core {} isolated table: OOM (falling back to shared park)\n", idx);
         }
     }
 
@@ -870,13 +869,13 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
     // secondary's MMU-on read / table walk.
     dsb_sy();
 
-    console::print("[SMP] conduit=");
-    console::print(if use_hvc { "hvc" } else { "smc" });
-    console::print(", entry=0x");
-    console::print_hex(entry_pa);
-    console::print(", descriptor=0x");
-    console::print_hex(cfg_pa);
-    console::print("\n");
+    crate::safe_print!(
+        96,
+        "[SMP] conduit={}, entry=0x{:x}, descriptor=0x{:x}\n",
+        if use_hvc { "hvc" } else { "smc" },
+        entry_pa,
+        cfg_pa
+    );
 
     // R2 proof baseline: the BSP's own free-page count BEFORE the secondaries run.
     // Each secondary allocs from its OWN (replicated) PMM over its OWN partition —
@@ -893,17 +892,10 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
         cfg.cores[idx].state.store(STATE_BOOTING, Ordering::Relaxed);
         dsb_sy();
         let r = psci_call(use_hvc, PSCI_CPU_ON, target, entry_pa, cfg_pa);
-        console::print("[SMP] CPU_ON core ");
-        console::print_dec(idx);
-        console::print(" (mpidr=0x");
-        console::print_hex(target);
-        console::print(") -> ");
         if r == 0 {
-            console::print("PSCI_SUCCESS\n");
+            crate::safe_print!(80, "[SMP] CPU_ON core {} (mpidr=0x{:x}) -> PSCI_SUCCESS\n", idx, target);
         } else {
-            console::print("ERROR ");
-            console::print_dec((-r) as usize);
-            console::print("\n");
+            crate::safe_print!(80, "[SMP] CPU_ON core {} (mpidr=0x{:x}) -> ERROR {}\n", idx, target, (-r) as usize);
         }
     }
 
@@ -925,9 +917,12 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
             service_fwd_requests(cfg, bsp_idx);
             core::hint::spin_loop();
         }
-        console::print("[SMP] core ");
-        console::print_dec(idx);
-        console::print(if online { " ONLINE" } else { " TIMEOUT (never reported online)" });
+        crate::safe_print!(
+            80,
+            "[SMP] core {}{}",
+            idx,
+            if online { " ONLINE" } else { " TIMEOUT (never reported online)" }
+        );
         if !online {
             // Pinpoint a hang: report the last R3a stage the secondary reached.
             let percpu = cfg.cores[idx].percpu_phys as usize;
@@ -936,13 +931,9 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
                     unsafe { core::ptr::read_volatile((percpu + PERCPU_R3_STAGE) as *const u64) };
                 let yl =
                     unsafe { core::ptr::read_volatile((percpu + PERCPU_R3_YIELDS) as *const u64) };
-                console::print(" [last R3a stage=");
-                console::print_dec(st as usize);
-                console::print(" yields=");
-                console::print_dec(yl as usize);
-                console::print("]");
+                crate::safe_print!(64, " [last R3a stage={} yields={}]", st as usize, yl as usize);
             }
-            console::print("\n");
+            crate::safe_print!(8, "\n");
             continue;
         }
         // Bringup-time verification (BSP runs on the all-seeing boot table): confirm
@@ -954,29 +945,25 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
             // SAFETY: percpu PA is identity-mapped in the BSP boot tables.
             let marker = unsafe { core::ptr::read_volatile(percpu as *const u64) };
             if marker == MAGIC ^ idx as u64 {
-                console::print(" (isolated-run confirmed)");
+                crate::safe_print!(48, " (isolated-run confirmed)");
             } else {
-                console::print(" (WARNING: PerCpu marker missing — ran on shared tables?)");
+                crate::safe_print!(80, " (WARNING: PerCpu marker missing - ran on shared tables?)");
             }
             // R1: per-core .data/.bss replication. The secondary mutated the shared
             // static into its OWN copy (→ INIT+1); the BSP's copy must be untouched.
             let repl = unsafe { core::ptr::read_volatile((percpu + PERCPU_REPL_TEST) as *const u64) };
             let bsp_copy = SMP_REPLICATION_TEST.load(Ordering::SeqCst);
             if repl == REPL_TEST_INIT + 1 && bsp_copy == REPL_TEST_INIT {
-                console::print(" [replication: private .data/.bss ✓]");
+                crate::safe_print!(64, " [replication: private .data/.bss PASS]");
             } else {
-                console::print(" [replication: FAILED secondary=0x");
-                console::print_hex(repl);
-                console::print(" bsp=0x");
-                console::print_hex(bsp_copy);
-                console::print(" ✗]");
+                crate::safe_print!(96, " [replication: FAILED secondary=0x{:x} bsp=0x{:x} FAIL]", repl, bsp_copy);
             }
         }
         // Stage 2: report the cross-core enforcement self-test outcome.
         match cfg.enforcement_results[idx].load(Ordering::Acquire) {
-            ENF_FAULTED => console::print(" [enforcement: cross-core access FAULTED ✓]\n"),
-            ENF_LEAKED => console::print(" [enforcement: LEAKED — isolation breach! ✗]\n"),
-            _ => console::print(" [enforcement: inconclusive]\n"),
+            ENF_FAULTED => crate::safe_print!(64, " [enforcement: cross-core access FAULTED PASS]\n"),
+            ENF_LEAKED => crate::safe_print!(64, " [enforcement: LEAKED - isolation breach! FAIL]\n"),
+            _ => crate::safe_print!(48, " [enforcement: inconclusive]\n"),
         }
         // R2: per-core PMM + heap. The secondary stood up its own allocator/pmm over
         // its partition and recorded the result. Verify: it handed out pages, the
@@ -991,28 +978,26 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
             let pend = pbase + cfg.cores[idx].ram_len;
             let in_partition = first_pa >= pbase && first_pa < pend;
             let bsp_untouched = pmm::free_count() == bsp_free_before;
-            console::print("[SMP] core ");
-            console::print_dec(idx);
             if pages > 0 && in_partition && heap_ok == 1 && bsp_untouched {
-                console::print(" R2: per-core pmm+heap ✓ (alloc'd ");
-                console::print_dec(pages as usize);
-                console::print(" pages from 0x");
-                console::print_hex(first_pa);
-                console::print(", heap ok, free=");
-                console::print_dec(sec_free as usize);
-                console::print(" pages; BSP pool untouched ✓)\n");
+                crate::safe_print!(
+                    176,
+                    "[SMP] core {} R2: per-core pmm+heap PASS (alloc'd {} pages from 0x{:x}, heap ok, free={} pages; BSP pool untouched PASS)\n",
+                    idx,
+                    pages as usize,
+                    first_pa,
+                    sec_free as usize
+                );
             } else {
-                console::print(" R2: FAILED (pages=");
-                console::print_dec(pages as usize);
-                console::print(" first=0x");
-                console::print_hex(first_pa);
-                console::print(" in_part=");
-                console::print(if in_partition { "1" } else { "0" });
-                console::print(" heap=");
-                console::print_dec(heap_ok as usize);
-                console::print(" bsp_untouched=");
-                console::print(if bsp_untouched { "1" } else { "0" });
-                console::print(" ✗)\n");
+                crate::safe_print!(
+                    176,
+                    "[SMP] core {} R2: FAILED (pages={} first=0x{:x} in_part={} heap={} bsp_untouched={} FAIL)\n",
+                    idx,
+                    pages as usize,
+                    first_pa,
+                    if in_partition { "1" } else { "0" },
+                    heap_ok as usize,
+                    if bsp_untouched { "1" } else { "0" }
+                );
             }
         }
         // R3a: per-core cooperative scheduler. The secondary registered akuma-exec's
@@ -1026,26 +1011,26 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
             let r3_done =
                 unsafe { core::ptr::read_volatile((percpu + PERCPU_R3_DONE) as *const u64) };
             let expect_yields = R3_NUM_THREADS * R3_YIELDS_PER_THREAD;
-            console::print("[SMP] core ");
-            console::print_dec(idx);
             if r3_done == R3_SKIPPED {
-                console::print(" R3a: skipped (partition too small for thread pool)\n");
+                crate::safe_print!(96, "[SMP] core {} R3a: skipped (partition too small for thread pool)\n", idx);
             } else if r3_done == R3_NUM_THREADS && r3_yields == expect_yields {
-                console::print(" R3a: per-core cooperative scheduler ✓ (");
-                console::print_dec(r3_done as usize);
-                console::print(" threads, ");
-                console::print_dec(r3_yields as usize);
-                console::print(" yields)\n");
+                crate::safe_print!(
+                    112,
+                    "[SMP] core {} R3a: per-core cooperative scheduler PASS ({} threads, {} yields)\n",
+                    idx,
+                    r3_done as usize,
+                    r3_yields as usize
+                );
             } else {
-                console::print(" R3a: FAILED (done=");
-                console::print_dec(r3_done as usize);
-                console::print("/");
-                console::print_dec(R3_NUM_THREADS as usize);
-                console::print(" yields=");
-                console::print_dec(r3_yields as usize);
-                console::print("/");
-                console::print_dec(expect_yields as usize);
-                console::print(" ✗)\n");
+                crate::safe_print!(
+                    128,
+                    "[SMP] core {} R3a: FAILED (done={}/{} yields={}/{} FAIL)\n",
+                    idx,
+                    r3_done as usize,
+                    R3_NUM_THREADS as usize,
+                    r3_yields as usize,
+                    expect_yields as usize
+                );
             }
         }
         // R3b: per-core PREEMPTIVE scheduler. A spinner thread that never yields ran only
@@ -1056,20 +1041,23 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
                 unsafe { core::ptr::read_volatile((percpu + PERCPU_R3B_COUNT) as *const u64) };
             let r3b_done =
                 unsafe { core::ptr::read_volatile((percpu + PERCPU_R3B_DONE) as *const u64) };
-            console::print("[SMP] core ");
-            console::print_dec(idx);
             if r3b_done == R3_SKIPPED {
-                console::print(" R3b: skipped\n");
+                crate::safe_print!(64, "[SMP] core {} R3b: skipped\n", idx);
             } else if r3b_done == 1 && r3b_count > 0 {
-                console::print(" R3b: per-core preemptive scheduler ✓ (timer preempted; spinner ran ");
-                console::print_dec(r3b_count as usize);
-                console::print(" iters)\n");
+                crate::safe_print!(
+                    144,
+                    "[SMP] core {} R3b: per-core preemptive scheduler PASS (timer preempted; spinner ran {} iters)\n",
+                    idx,
+                    r3b_count as usize
+                );
             } else {
-                console::print(" R3b: FAILED (done=");
-                console::print_dec(r3b_done as usize);
-                console::print(" spin_count=");
-                console::print_dec(r3b_count as usize);
-                console::print(" — timer did not preempt? ✗)\n");
+                crate::safe_print!(
+                    144,
+                    "[SMP] core {} R3b: FAILED (done={} spin_count={} - timer did not preempt? FAIL)\n",
+                    idx,
+                    r3b_done as usize,
+                    r3b_count as usize
+                );
             }
         }
         // R4a: cross-core syscall-forwarding transport. The secondary shipped a payload
@@ -1078,19 +1066,15 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
         if percpu != 0 {
             let r4a_ok =
                 unsafe { core::ptr::read_volatile((percpu + PERCPU_R4A_OK) as *const u64) };
-            console::print("[SMP] core ");
-            console::print_dec(idx);
             if r4a_ok == 1 {
-                console::print(" R4a: cross-core forward round-trip ✓ (bounce + reply verified)\n");
+                crate::safe_print!(112, "[SMP] core {} R4a: cross-core forward round-trip PASS (bounce + reply verified)\n", idx);
             } else {
-                console::print(" R4a: FAILED (no/garbled reply — ok=");
-                console::print_dec(r4a_ok as usize);
-                console::print(" ✗)\n");
+                crate::safe_print!(96, "[SMP] core {} R4a: FAILED (no/garbled reply - ok={} FAIL)\n", idx, r4a_ok as usize);
             }
         }
     }
 
-    console::print("[SMP] bringup complete\n");
+    crate::safe_print!(48, "[SMP] bringup complete\n");
 
     monitor_liveness(cfg, num_cores, bsp_idx);
     run_memory_demo(cfg, num_cores, bsp_idx);
@@ -1126,13 +1110,13 @@ fn run_memory_demo(cfg: &MachineConfig, num_cores: usize, bsp_idx: usize) {
             sent += 1;
         }
     }
-    console::print("[SMP] core ");
-    console::print_dec(bsp_idx);
-    console::print(" broadcast pressure signal (");
-    console::print_dec(FAKED_PRESSURE_PCT as usize);
-    console::print("% used) to ");
-    console::print_dec(sent);
-    console::print(" peer(s)\n");
+    crate::safe_print!(
+        96,
+        "[SMP] core {} broadcast pressure signal ({}% used) to {} peer(s)\n",
+        bsp_idx,
+        FAKED_PRESSURE_PCT as usize,
+        sent
+    );
 
     // M2 — ring the cross-core doorbell SGI at each secondary. They also poll, so
     // this isn't required for progress; it proves SGI *delivery*: each secondary's
@@ -1160,21 +1144,22 @@ fn run_memory_demo(cfg: &MachineConfig, num_cores: usize, bsp_idx: usize) {
         bsp_sm.step(ev, &mut |cmd| {
             if let Command::Accept { from, range } = cmd {
                 repaid += 1;
-                console::print("[SMP]   core ");
-                console::print_dec(from as usize);
-                console::print(" repaid ");
-                console::print_dec(range.len as usize);
-                console::print(" MB at 0x");
-                console::print_hex(range.base);
-                console::print(" (accepted + zeroed)\n");
+                crate::safe_print!(
+                    112,
+                    "[SMP]   core {} repaid {} MB at 0x{:x} (accepted + zeroed)\n",
+                    from as usize,
+                    range.len as usize,
+                    range.base
+                );
             }
         });
     }
-    console::print("[SMP] reclaimed ");
-    console::print_dec(repaid);
-    console::print(" repayment(s); BSP pool now ");
-    console::print_dec(bsp_sm.free_pages() as usize);
-    console::print(" (faked units)\n");
+    crate::safe_print!(
+        96,
+        "[SMP] reclaimed {} repayment(s); BSP pool now {} (faked units)\n",
+        repaid,
+        bsp_sm.free_pages() as usize
+    );
 
     // M2 — confirm each secondary actually took + serviced the doorbell SGI.
     for idx in 0..num_cores {
@@ -1187,11 +1172,13 @@ fn run_memory_demo(cfg: &MachineConfig, num_cores: usize, bsp_idx: usize) {
         }
         // SAFETY: PerCpu PA is identity-mapped in the BSP boot tables.
         let count = unsafe { core::ptr::read_volatile((pp + PERCPU_DOORBELL_COUNT) as *const u64) };
-        console::print("[SMP] core ");
-        console::print_dec(idx);
-        console::print(" doorbell SGIs serviced: ");
-        console::print_dec(count as usize);
-        console::print(if count > 0 { " (delivered ✓)\n" } else { " (NOT delivered ✗)\n" });
+        crate::safe_print!(
+            96,
+            "[SMP] core {} doorbell SGIs serviced: {}{}",
+            idx,
+            count as usize,
+            if count > 0 { " (delivered PASS)\n" } else { " (NOT delivered FAIL)\n" }
+        );
     }
 }
 
@@ -1214,13 +1201,14 @@ fn monitor_liveness(cfg: &MachineConfig, num_cores: usize, bsp_idx: usize) {
         }
         let now = cfg.heartbeat[idx].load(Ordering::Relaxed);
         let before = first.get(idx).copied().unwrap_or(0);
-        console::print("[SMP] heartbeat core ");
-        console::print_dec(idx);
-        console::print(": ");
-        console::print_dec(before as usize);
-        console::print(" -> ");
-        console::print_dec(now as usize);
-        console::print(if now > before { " (alive)\n" } else { " (STALLED — offline?)\n" });
+        crate::safe_print!(
+            96,
+            "[SMP] heartbeat core {}: {} -> {}{}",
+            idx,
+            before as usize,
+            now as usize,
+            if now > before { " (alive)\n" } else { " (STALLED - offline?)\n" }
+        );
     }
 }
 
@@ -1309,7 +1297,8 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
     // Each returns to this isolated context with IRQs masked + `smp_vectors` restored, so
     // the M2 doorbell/heartbeat path below is unaffected. R3b reuses the scheduler R3a
     // stood up, so it only runs if R3a did.
-    if run_r3a_coop_test(cc, core_idx, percpu) {
+    let sched_up = run_r3a_coop_test(cc, core_idx, percpu);
+    if sched_up {
         run_r3b_preempt_test(core_idx, percpu);
     } else if percpu != 0 {
         // R3a skipped (e.g. partition too small) → R3b can't run either.
@@ -1325,9 +1314,7 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
     // First words a secondary ever speaks for itself — proving the §8.2 console path
     // end to end: this `print` lands in our console ring; the BSP drainer thread (not
     // yet spawned — these bytes wait in the ring) later forwards them to the UART.
-    console::print("[core ");
-    console::print_dec(core_idx);
-    console::print("] per-core runtime online: pmm + heap + console (via ring)\n");
+    crate::safe_print!(80, "[core {}] per-core runtime online: pmm + heap + console (via ring)\n", core_idx);
 
     // Announce Online from the isolated context (Release orders the enforcement
     // result + PerCpu marker before the BSP's Acquire load of `state`).
@@ -1353,6 +1340,15 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
         Event::Borrowed { creditor: BSP, range: Range { base: cc.ram_base, len: borrowed_mb } },
         &mut |_| {},
     );
+
+    // R4b.1 — if the per-core scheduler is up (R3a ran), this core's STEADY STATE is
+    // the real scheduler with timer preemption + doorbell IRQ running PERMANENTLY (no
+    // teardown), with the heartbeat/debt work as the boot thread's idle body. Never
+    // returns. The M2 `WFI` loop below is the fallback only when R3a was skipped (a
+    // partition too small to stand a scheduler up).
+    if sched_up {
+        secondary_steady_state(cfg, core_idx, percpu, sm);
+    }
 
     // M2 — enable the cross-core doorbell: bring up this PE's GIC receive path and
     // unmask IRQs so a peer's SGI is delivered to `smp_irq_handler` (which finds the
@@ -1885,6 +1881,94 @@ fn run_r3b_preempt_test(idx: usize, percpu: usize) {
         );
     }
     stage(16);
+}
+
+// ============================================================================
+// R4b.1 — per-core scheduler as STEADY STATE (docs/MULTIKERNEL.md §15/§16). R3a/R3b
+// proved cooperative + preemptive scheduling on a secondary, then tore down to the M2
+// `WFI` heartbeat loop. R4b.1 makes the scheduler PERMANENT: the secondary runs on the
+// real `exception_vector_table` with its per-core timer wired to the scheduler and the
+// cross-core doorbell as an ordinary IRQ, and the heartbeat/debt-protocol work becomes
+// the boot thread's idle body. This is the foundation R4b.2+ build on — a pinned EL0
+// process needs a live per-core scheduler to be switched in.
+// ============================================================================
+
+/// Steady-state doorbell-SGI handler (a peer rang us). Bump THIS core's PerCpu doorbell
+/// counter — the same counter the bringup-path `smp_irq_handler` maintains — so the M2
+/// verification still observes a serviced doorbell; the boot thread's idle loop drains
+/// the inbox. Runs on the real `exception_vector_table` IRQ path (`dispatch_irq`), so it
+/// finds PerCpu via [`SECONDARY_PERCPU`], NOT TPIDRRO_EL0 (now the scheduler thread id).
+fn secondary_doorbell_handler(_irq: u32) {
+    let percpu = SECONDARY_PERCPU.load(Ordering::Acquire);
+    if percpu != 0 {
+        // SAFETY: PerCpu page is mapped RW in this core's restricted table; this core
+        // is the sole writer of its own counter (IRQs masked during the handler).
+        unsafe {
+            let p = (percpu + PERCPU_DOORBELL_COUNT) as *mut u64;
+            p.write_volatile(p.read_volatile() + 1);
+        }
+    }
+}
+
+/// The secondary's permanent steady state (R4b.1). Preconditions: R3a stood the
+/// scheduler up (runtime registered, TTBR0 override set, `threading::init` done) and
+/// TPIDRRO_EL0 holds the boot thread's id. Never returns.
+fn secondary_steady_state(cfg: &MachineConfig, idx: usize, percpu: usize, mut sm: CoreStateMachine) -> ! {
+    // Handlers run on the real vectors, where TPIDRRO_EL0 is the thread id — publish
+    // PerCpu via a replicated static for `secondary_doorbell_handler` to read.
+    SECONDARY_PERCPU.store(percpu, Ordering::Release);
+
+    // Wire the per-core IRQ sources into this core's (replicated) dispatch table without
+    // poking the GIC (`register_handler` would write core 0's redistributor — §irq.rs).
+    // The timer handler re-arms CNTV + self-rings the scheduler SGI (R3b's mechanism,
+    // now permanent); the doorbell handler counts a peer's ring. Re-registering the
+    // timer handler is idempotent (R3b may have set it).
+    crate::irq::register_handler_no_gic(TIMER_PPI, secondary_timer_preempt_handler);
+    crate::irq::register_handler_no_gic(DOORBELL_SGI, secondary_doorbell_handler);
+
+    // Bring up this PE's GIC receive path for ALL three per-core sources: doorbell SGI +
+    // timer PPI (`secondary_gic_init`) and the scheduler SGI 0 (`scheduler_sgi_enable`).
+    // Both wake the CPU interface + redistributor; the CPU-interface state persists, so
+    // running them in sequence is fine (the doc note on `scheduler_sgi_enable`).
+    secondary_gic_init(idx);
+    scheduler_sgi_enable(idx);
+
+    // Real vectors permanently; arm the preemption timer; unmask IRQs. The scheduler now
+    // preempts us on each tick, `yield_now` switches threads via the self-rung SGI, and a
+    // peer's doorbell is delivered to `secondary_doorbell_handler`.
+    set_vbar!("exception_vector_table");
+    enable_timer_ppi(idx);
+    arm_cntv_timer();
+    crate::irq::enable_irqs();
+
+    // Idle/driver loop on the boot thread: advance the heartbeat, drain the inbox into
+    // the debt state machine (shedding `Repay` to creditors over the shared rings — we
+    // only ever touch shared rings, never a peer's private state), then `yield_now` so
+    // any OTHER thread on this core runs. There is none yet; R4b.3 spawns the first
+    // pinned EL0 process here. (Power: this busy-yields when idle rather than `WFI`-ing —
+    // a future tweak, like the BSP's own preemptive idle loop.)
+    loop {
+        if let Some(hb) = cfg.heartbeat.get(idx) {
+            hb.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(inbox) = cfg.inboxes.get(idx) {
+            while let Some(m) = inbox.pop() {
+                let ev = match m.kind {
+                    MSG_PRESSURE => Event::Pressure { from: m.from },
+                    MSG_REPAID => Event::Repaid { from: m.from, range: Range { base: m.v0, len: m.v1 } },
+                    _ => continue,
+                };
+                sm.step(ev, &mut |cmd| {
+                    if let Command::Repay { creditor, range } = cmd
+                        && let Some(to) = cfg.inboxes.get(creditor as usize)
+                    {
+                        to.push(MSG_REPAID, idx as u32, range.base, range.len);
+                    }
+                });
+            }
+        }
+        akuma_exec::threading::yield_now();
+    }
 }
 
 // ============================================================================

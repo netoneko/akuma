@@ -112,12 +112,20 @@ cores. The isolation lives in the **page tables**, not in rewritten code.
 
 ## 2. Current state of the codebase
 
-**Fundamentally single-core today**, but the right things already use per-CPU hardware state:
+> **Status (2026-06-29):** this section was the *pre-SMP baseline*. The multikernel is now built
+> through **R4b.1** (§15) and verified SMP=2/4: secondary bringup, **hardware-enforced per-core
+> isolation** (each secondary on its own TTBR0; peers unmapped; a cross-core read faults), per-core
+> PMM/heap/scheduler running as steady state, cross-core SGI + lock-free ring messaging, and the
+> §8.1 forwarding *transport*. Kept as the baseline that
+> motivated the design. The default (non-`smp`) build remains byte-for-byte single-core (§11).
 
-- ❌ **No secondary-core bringup at all** — zero PSCI / `CPU_ON`, no `MPIDR_EL1` reads, no
-  per-CPU data area, no core ID. `src/boot.rs:104` sets one `STACK_TOP`.
-- ❌ `trigger_sgi()` (`src/gic_v3.rs:222`) hardcodes the target list to `| 1` = PE0 only — no
-  cross-core IPI targeting yet.
+The right things already used per-CPU hardware state, which made the port tractable:
+
+- ✅ **Secondary-core bringup** (now done) — PSCI `CPU_ON` (conduit from the DTB), `MPIDR_EL1`
+  aff0 as the core index, a per-core PerCpu data area, secondary trampoline (`src/smp.rs`).
+  Originally there was none (`src/boot.rs` set a single `STACK_TOP`).
+- ✅ **Cross-core IPI targeting** (now done) — `trigger_sgi_core(aff0, sgi)` rings a specific peer;
+  the original `trigger_sgi()` hardcoded the target list to PE0 only.
 - ✅ Timer uses per-CPU regs (`CNTV_CVAL_EL0`/`CNTV_CTL_EL0`, `src/timer.rs:30`).
 - ✅ GIC redistributor wake is written for "this PE" (`src/gic_v3.rs:152`).
 - ✅ Current-thread tracking is per-CPU via `TPIDRRO_EL0`.
@@ -238,15 +246,36 @@ BSP, when building core N's image:
 2. Allocate a fresh `.data`/`.bss` copy from core N's partition; copy the initial `.data`
    image in, zero `.bss`; map at the canonical kernel VA in core N's tables.
 3. Allocate per-core heap + boot stack from core N's partition.
-4. Build core N's TTBR1 set covering **only** its partition + shared regions.
+4. Build core N's restricted **TTBR0** table covering **only** its partition + shared regions.
 
-> ⚠️ The static boot page tables (`src/boot.rs:148`) and `extend_boot_ram_identity_map`
-> (`crates/akuma-exec/src/mmu/mod.rs:54`) are currently **global/shared**. For real isolation
-> each core needs its own TTBR1 set. Two stages:
-> - **Isolation by convention** (quick): all cores share the identity map; behaves because each
->   PMM only hands out its slice. Good enough to stand up M1–M2.
-> - **Isolation by hardware** (hardening): per-core tables map only the partition →
->   cross-partition access *faults* instead of silently corrupting a peer.
+> **NOTE (impl reality):** the doc originally said "TTBR1," but Akuma is a **TTBR0
+> identity-mapped** kernel — kernel VA == PA, no TTBR1 split — so isolation is realized with
+> per-core **TTBR0** tables (`build_isolated_table`), per-core replicated `.data`/`.bss`, and a
+> private PerCpu chunk. Substitute TTBR0 for TTBR1 throughout this doc's design sketches.
+>
+> **Isolation status (achieved for secondaries):** each secondary now runs on its own restricted
+> TTBR0 table that maps only shared RO code + the shared descriptor page + its own partition;
+> every peer partition is **unmapped**, so a cross-partition access *faults* (proven — §enforcement
+> self-test, R1/M1). This is "isolation by hardware," done. The earlier "isolation by convention"
+> (all cores share the identity map; behaves only because each PMM hands out its own slice) was the
+> M0 staging step and is **superseded**.
+>
+> ⚠️ **The one remaining asymmetry:** the **BSP** still runs on the original global boot tables
+> (`src/boot.rs`, `extend_boot_ram_identity_map`), which identity-map *all* RAM — so the BSP is
+> **all-seeing**: it can read/write any secondary's partition (and deliberately does, to read
+> PerCpu markers during bringup verification). Isolation is therefore enforced **secondary→peer**,
+> not yet **BSP→secondary**. Putting the BSP on its own restricted partition table is future work.
+
+**What is shared vs. private (the precise model):**
+
+| Memory | Who maps it | Access |
+|---|---|---|
+| RO kernel `.text`/`.rodata`, device MMIO | all cores | shared, read-only (MMIO RW) |
+| The one **descriptor page** (`MACHINE_CONFIG`): ring inboxes, `FwdBounce` region, heartbeat counters, console rings, `CoreConfig[]`, `enforcement_results` | all cores | **shared RW** — the *only* mutable memory two cores both touch |
+| A secondary's partition (its PMM pages / heap / stack) + its private **PerCpu** page | that secondary (RW); **also the BSP** via its all-seeing identity map | private to the secondary vs. its peers; reachable by the BSP |
+
+So: **a secondary can reach no peer's memory except the shared descriptor page** (rings + bounce +
+the small per-core status slots). The BSP is the exception until it too gets a restricted table.
 
 ---
 
@@ -705,7 +734,7 @@ target configuration realized at **M3**; M0–M2 are the bringup/isolation/trans
 | Milestone | Goal | Key work |
 |---|---|---|
 | **M0 — second core spins** ✅ | Core 1 wakes, reads descriptor, parks in a `wfe` loop; BSP sees `state = Online` | PSCI `CPU_ON` (conduit from DTB `/psci`), secondary trampoline (`src/smp.rs`), MPIDR-aff0 core index, descriptor as an identity-mapped `static` (VA==PA → no pre-kernel-gap page needed at M0), x0=`context_id` handoff. Isolation-by-convention (secondaries reuse the BSP boot page tables). |
-| **M1 — isolated second kernel** 🟡 | Each secondary runs on its OWN restricted page table (shared RO code + descriptor page + private stack/PerCpu; peers UNMAPPED) and **hardware-enforced isolation is PROVEN** (a deliberate cross-core read faults). NOTE: this codebase is a TTBR0 identity-mapped kernel, so M1 is realized by per-core *TTBR0* tables + a per-core `[PerCpu]` private chunk (not the doc's original "replicated .data/.bss via TTBR1" — see §4.2 note). Still TODO for full M1: per-core `pmm::init`/heap/scheduler over a real partition. | per-core restricted TTBR0 tables (`build_isolated_table`), `secondary_enter_isolated` (TTBR0+SP switch, **`isb` after `msr ttbr0` is mandatory** or the global 1 GB boot block survives in the TLB and isolation leaks), per-core VBAR enforcement self-test |
+| **M1 — isolated second kernel** ✅ | Each secondary runs on its OWN restricted page table (shared RO code + descriptor page + private stack/PerCpu; peers UNMAPPED) and **hardware-enforced isolation is PROVEN** (a deliberate cross-core read faults). NOTE: this codebase is a TTBR0 identity-mapped kernel, so M1 is realized by per-core *TTBR0* tables + a per-core `[PerCpu]` private chunk (not the doc's original "replicated .data/.bss via TTBR1" — see §4.2 note). The per-core `pmm::init`/heap/scheduler over a real partition that "full M1" wanted is **done in R1–R3** (§15). Caveat: isolation is enforced secondary→peer; the **BSP** is still all-seeing (its boot tables map all RAM) — see §4.2. | per-core restricted TTBR0 tables (`build_isolated_table`), `secondary_enter_isolated` (TTBR0+SP switch, **`isb` after `msr ttbr0` is mandatory** or the global 1 GB boot block survives in the TLB and isolation leaks), per-core VBAR enforcement self-test |
 | **M2 — ping-pong** ✅ | Cores exchange messages over a lock-free MPSC `Ring` (non-blocking); the **cross-core SGI doorbell works** (`trigger_sgi_core(aff0, sgi)` targets a specific peer; each secondary brings up its own GIC receive path — CPU iface + its GICR frames mapped device + SGI/timer enabled — and an IRQ vector); and the secondary loop is now **event-driven**: it sleeps in **`WFI`** and is woken by its **per-core virtual timer** (the heartbeat tick, so liveness advances while parked) or a **doorbell SGI** (a peer rang it). No polling. (Gotcha: `WFE` returns spuriously — `WFI` is the sleep-until-interrupt primitive.) | MPSC `Ring` ✅, `trigger_sgi_core` ✅, secondary GIC receive + IRQ handler ✅, per-core CNTV timer + `WFI` ✅ |
 | **M3 — roles + forwarding** | The §10 acceptance test: `hello` + `curl` pinned to core 1 | role table, VFS-read forwarding (first), syscall-forwarding stubs (§8.1), console append ring (§8.2), spawn/exit messages, reuse sysproxy marshaling |
 | **M4 — dynamic memory** | Core A releases pages to Core B at runtime | `ReleasePages`/`AcceptPages` messages, unmap-flush-remap handshake |
@@ -799,7 +828,8 @@ Staged, each independently verifiable:
 | **R3a — per-core COOPERATIVE scheduler** ✅ | Secondary runs `akuma_exec`'s scheduler per-core and switches between kernel threads via `yield_now` | DONE (SMP=2/4). `run_r3a_coop_test`: register the runtime locally (`build_exec_runtime` extracted from `main.rs`, canaries off, secondary stack bounds) since the BSP's `RUNTIME`/`CONFIG` cells are set post-snapshot and a secondary's replicated copy is pristine; `akuma_exec::mmu::set_boot_ttbr0_override(our table)` so spawned threads get OUR TTBR0, not the BSP's (`boot_ttbr0_addr` lives in `.data.boot`, *outside* the replicated writable window, so the asm cell can't be rewritten on a secondary); re-target the scheduler SGI at this PE (`gic::trigger_sgi` hardcodes TargetList bit 0 = BSP); install the real `exception_vector_table`; enable only the scheduler SGI; spawn 2 workers via `spawn_system_thread_fn` (the closure path builds a real `setup_fake_irq_frame` — the bare `spawn(extern fn)` path is register-based and incompatible with the stack-based scheduler) and `yield_now` between them. Proof: 2 threads × 8 yields = 16, then the M2 heartbeat/doorbell loop resumes. |
 | **R3b — per-core preemptive scheduler** ✅ | Per-core timer preempts kernel threads on a secondary | DONE (SMP=2/4). `run_r3b_preempt_test` reuses R3a's scheduler: registers a per-core timer handler via `irq::register_handler_no_gic` (the normal `register_handler` calls `gic::enable_irq`, which for INTID<32 pokes **core 0's** redistributor — faults on a secondary); runs on the real `exception_vector_table`; enables PPI 27 in its OWN redistributor + arms CNTV. The handler re-arms CNTV then rings the scheduler SGI **at itself** (`trigger_sched_sgi_self`) — same two-step as the BSP's `timer_irq_handler`. Proof: a preemptive spinner that never yields advances (~12 M iters) only because the timer preempts the never-yielding boot thread (which, being the cooperative idle thread, is preempted past `COOPERATIVE_TIMEOUT_US`=100 ms; run window 300 ms). |
 | **R4a — cross-core forwarding TRANSPORT** ✅ | The data-movement round-trip (§8.1): request/reply over the ring + a shared bounce region | DONE (SMP=2/4). The keystone for everything else in R4 ("exec is recursive forwarding"), and the half §8.1 calls *hard*. Added `akuma_smp::FwdBounce` (per-core `[AtomicU8; 256]` slot in the descriptor, the sole shared byte buffer — published by the ring's `ready` Release/Acquire) + `MSG_FWD_ECHO_{REQ,REPLY}`. `run_r4a_fwd_test` (secondary): `copyin` a payload to its bounce slot → push request to the BSP inbox → spin (time-bounded) on the reply → `copyout` + verify. `service_fwd_requests` (BSP): drains its inbox **from the bringup online-wait loop** (else BSP-waits-Online ⇄ secondary-waits-reply deadlock), transforms the bounce payload (byte+1, standing in for the real owner-side syscall), replies. Proof: nonce-matched reply + verified transform = the §8.1 data path works end to end; neither core touched the other's partition. Independent of the scheduler, so it runs even when R3a is skipped. |
-| **R4b — per-core syscalls + pinned process** | SVC from EL0 on the per-core vectors; spawn `/bin/hello` (then `curl`) pinned to core 1, forwarding `open`/`read`/`write`/sockets to core 0 (§10) | The secondary stops tearing down (real vectors permanently + timer→scheduler steady state, §16); `sync_el0_handler` + the syscall table resolve to replicated state; exec forwards `open`/`read` over the R4a transport to fetch the ELF (recursive forwarding), then console/sockets likewise. This is the §10 acceptance test. Needs a persistent BSP forward-server (a thread, not the bringup loop) since real forwarding (VFS) is only up post-bringup. |
+| **R4b — per-core syscalls + pinned process** (staged R4b.1–.5) | SVC from EL0 on the per-core vectors; spawn `/bin/hello` (then `curl`) pinned to core 1, forwarding `open`/`read`/`write`/sockets to core 0 (§10) | The §10 acceptance test, staged like R1–R4a. **R4b.1 ✅** the secondary stops tearing down — it runs the per-core scheduler as STEADY STATE (real `exception_vector_table` + timer→scheduler permanently), with the heartbeat/debt work as the boot thread's idle body. **R4b.2** persistent BSP forward-server thread. **R4b.3** EL0 on the secondary (`sync_el0_handler` + syscall table → replicated state; a local-only pinned process). **R4b.4** forwarded exec — `/bin/hello`, `open`/`read` forwarded to fetch the ELF (§10 Part A). **R4b.5** sockets — `curl` (§10 Part B). |
+| &nbsp;&nbsp;**R4b.1 — scheduler as steady state** ✅ | Secondary never tears down; real vectors + timer→scheduler run permanently | DONE (SMP=2/4). `run_r3a_coop_test` now returns whether it stood the scheduler up; if so, after announcing Online `secondary_main` enters `secondary_steady_state` (never returns) instead of the M2 `WFI` loop. It registers the timer PPI (R3b's `secondary_timer_preempt_handler`) + the doorbell SGI handler via `register_handler_no_gic`, brings up the GIC receive path for all three per-core sources (`secondary_gic_init` + `scheduler_sgi_enable`), installs `exception_vector_table`, arms CNTV, and runs the heartbeat/debt-protocol drain as the boot thread's idle loop (`yield_now` each pass). The doorbell handler finds PerCpu via a new replicated `SECONDARY_PERCPU` static, **not** TPIDRRO_EL0 (the scheduler claims that register for the current-thread id — the load-bearing difference from the `smp_vectors` path). Proof: heartbeat advances ~14000× faster (scheduler idle loop vs `WFI`), debt repay still works through the idle-loop inbox drain, and the M2 doorbell is serviced via the real IRQ path. Power: busy-yields when idle (no `WFI`) — a future tweak (§16), matching the BSP's own preemptive idle loop. |
 
 **Why R1 is the keystone:** once `static`s are per-core, R2–R4 reuse the *existing*
 kernel init/exec code unchanged — the per-core-ness lives entirely in the page tables.
@@ -831,3 +861,39 @@ Tracked here so it isn't lost; tackle after the R3b/R4 milestones, not inline.
   the BSP's own console through a ring too and move the whole console to a userspace server.
 - **CoW benchmark gating** — `run_cow_benchmarks()` prints `[BENCH]` every boot on purpose; gate
   behind a flag.
+
+- **Investigate real cross-core network/FS data transfer between live processes.** Beyond the R4a
+  echo transport: drive the §10.2 path with *real* userspace producers/consumers split across
+  cores — e.g. `httpd` pinned to core 0 (owns Net) and `curl` pinned to core 1 (Proxy(Net)→0), or
+  a file read/write where the reader and the FS owner are on different cores. Measure where the
+  bytes actually move (bounce region offsets, chunking, copy amplification), confirm shared-nothing
+  holds at the data layer under load, and find the throughput/latency cost of the round-trip+
+  doorbell vs a single-core syscall. This is the load-test of R4b.4/R4b.5 once they exist.
+
+- **Sweep the whole codebase for `console::print` and convert to `safe_print!`.** `src/smp.rs` is
+  done (2026-06-29): every hand-rolled `console::print` + `print_dec`/`print_hex` run is now one
+  `safe_print!(N, "…{}…", …)` (heap-free stack buffer, routes through the same `emit()` chokepoint,
+  so equally safe on a secondary; only the drainer's raw `print_bytes` forwarder is kept). **We
+  mostly do NOT need bare `console::print` anywhere** — `safe_print!` is the house convention.
+  Remaining `console::print`/`print_dec`/`print_hex` callers elsewhere in `src/` should get the
+  same treatment. Keep `print_bytes` only where raw, already-formatted bytes are forwarded.
+
+- **Put the BSP on its own restricted partition table (close the isolation asymmetry).** Today
+  isolation is enforced secondary→peer, but the BSP still runs the global identity map (all RAM
+  mapped), so it can read/write any secondary's partition. It deliberately relies on this for
+  bringup verification (reading PerCpu markers). To make isolation symmetric, give the BSP a
+  restricted TTBR0 like the secondaries and route its verification through the shared descriptor
+  instead of direct peer reads. Until then, "shared-nothing" holds for secondaries only (§4.2).
+
+- **Per-core fd/socket affinity (forwarding-model invariant).** Because a process belongs to
+  exactly one core (it's pinned, with its address space in that core's partition), every fd /
+  socket it opens — including ones whose backing capability is `Proxy`'d to the owner core — is
+  logically *owned by the process's core*: only that core ever issues syscalls against the fd, so
+  the forward request/reply for a given fd always travels the **same core→owner edge**. The owner
+  (core 0) keeps the real `struct file`/socket; the process's core holds only an opaque handle it
+  forwards. Consequence to honor when building R4b.4/R4b.5: the fd table the EL0 process sees is
+  the *secondary's* (its own replicated state), mapping local fd → `(owner core, remote fd)`; the
+  owner need not track which core a remote fd came from beyond the reply route, and there is no
+  fd-sharing across cores (no cross-core `dup`/SCM_RIGHTS) — a simplifying invariant, not a
+  limitation, since processes don't migrate. Keeps each socket's traffic on one deterministic
+  ring edge.
