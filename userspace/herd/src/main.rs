@@ -83,6 +83,10 @@ enum ServiceState {
     Running,
     Failed,
     PendingRestart,
+    /// Terminal state for a `oneshot` service that has run and exited. It is never
+    /// (re)started — unlike `Stopped`, which `start_stopped_services` brings back up.
+    /// A reboot re-runs it (fresh herd, fresh state); a config reload preserves it.
+    Completed,
 }
 
 // ============================================================================
@@ -121,6 +125,10 @@ struct ServiceConfig {
     /// service starts after its target box's rump_server has finished its
     /// handshake). Restart backstops any remaining race.
     start_delay_ms: u64,
+    /// Run exactly once: start the service, and when it exits move it to the
+    /// terminal `Completed` state instead of `Stopped` (so it is never restarted),
+    /// regardless of exit code. Overrides `restart`. A reboot runs it again.
+    oneshot: bool,
 }
 
 impl Default for ServiceConfig {
@@ -138,6 +146,7 @@ impl Default for ServiceConfig {
             join_box: String::new(),
             mount_fs: Vec::new(),
             start_delay_ms: 0,
+            oneshot: false,
         }
     }
 }
@@ -595,6 +604,9 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                 }
                 "start_delay" => {
                     config.start_delay_ms = parse_u64(value).unwrap_or(0);
+                }
+                "oneshot" => {
+                    config.oneshot = value == "true" || value == "1";
                 }
                 _ => {}
             }
@@ -1070,8 +1082,17 @@ fn check_process_exits(state: &mut HerdState, now_ms: u64) {
             svc.stdout_fd = None;
             svc.last_exit_code = Some(exit_code);
 
-            // Schedule restart on non-zero exit (unless restart is disabled).
-            if exit_code != 0 && svc.config.restart {
+            // A oneshot service ran its single time: move it to the terminal
+            // Completed state (never restarted — start_stopped_services only revives
+            // Stopped), regardless of exit code. A reboot runs it again.
+            if svc.config.oneshot {
+                svc.state = ServiceState::Completed;
+                svc.restart_count = 0;
+                print("[herd] Oneshot service ");
+                print(&name);
+                print(" completed\n");
+            } else if exit_code != 0 && svc.config.restart {
+                // Schedule restart on non-zero exit (unless restart is disabled).
                 let should_restart = svc.config.max_retries == 0
                     || svc.restart_count < svc.config.max_retries;
 

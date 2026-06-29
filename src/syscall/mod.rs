@@ -274,6 +274,11 @@ pub mod nr {
     /// completion. Mirrors the in-kernel sshd's `close_process_stdin` on
     /// CHANNEL_EOF; only the spawner may close its child's stdin.
     pub const CLOSE_CHILD_STDIN: u64 = 326;
+    /// Multikernel: activate a parked secondary core (docs/MULTIKERNEL.md R4b lifecycle).
+    /// arg0 = target core index. BSP-served: validates the core, `CPU_ON`s it if it had
+    /// self-shut-down, and sends `MSG_CORE_INIT`. Lets an init system (herd) bring cores
+    /// up from userspace. Returns 0 / -ENODEV / -errno. Only meaningful under `smp`.
+    pub const CORE_INIT: u64 = 327;
     pub const GETPID: u64 = 172;
     pub const GETPPID: u64 = 173;
     pub const GETUID: u64 = 174;
@@ -707,6 +712,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SPAWN_EXT => proc::sys_spawn_ext(args[0], args[1], args[2], args[3], args[4], args[5]),
         nr::SET_BOX_STACK => proc::sys_set_box_stack(args[0], args[1]),
         nr::CLOSE_CHILD_STDIN => proc::sys_close_child_stdin(args[0] as u32),
+        nr::CORE_INIT => proc::sys_core_init(args[0] as usize),
         #[cfg(feature = "sc-containers")]
         nr::REGISTER_BOX => container::sys_register_box(args[0], args[1], args[2] as usize, args[3], args[4] as usize, args[5] as u32),
         #[cfg(feature = "sc-containers")]

@@ -150,6 +150,17 @@ pub struct ExecRuntime {
     pub cow_ref_inc: fn(usize),
     pub cow_ref_dec: fn(usize) -> bool,
     pub cow_ref_get: fn(usize) -> u16,
+
+    /// Optional hook run at the tail of `UserAddressSpace::new()`, after the default
+    /// identity kernel mappings are installed. `None` on a normal (single-kernel /
+    /// BSP) build. On a multikernel SECONDARY core it is set to overlay that core's
+    /// REPLICATED kernel writable window (`.data`/`.bss` → its OWN private pages) onto
+    /// the user table, so a syscall the process makes under its TTBR0 resolves kernel
+    /// statics to this core's copies, not the BSP's (docs/MULTIKERNEL.md §4.2/R4b.3a).
+    /// This is the seam that lets the SAME spawn path build a correct user address
+    /// space on the BSP and on a secondary — no secondary-specific spawn entry needed.
+    /// An `Err` aborts address-space creation (propagated as a `None` from `new()`).
+    pub prepare_user_address_space: Option<fn(&mut crate::mmu::UserAddressSpace) -> Result<(), &'static str>>,
 }
 
 /// Compile-time kernel configuration, passed once at init.

@@ -941,6 +941,7 @@ mod child_channel_drain_tests {
             cow_ref_inc: |_| {},
             cow_ref_dec: |_| false,
             cow_ref_get: |_| 0,
+            prepare_user_address_space: None,
         };
         let cfg = ExecConfig {
             max_threads: 64,

@@ -31,9 +31,9 @@ use akuma_exec::mmu::{attr_index, flags, phys_to_virt, MAIR_DEVICE_NGNRNE, MAIR_
 // module is the kernel glue (asm, PSCI, page tables, the pump).
 use akuma_smp::{
     partition, Command, ConsoleRing, CoreConfig, CoreStateMachine, Event, MachineConfig, Range,
-    ENF_FAULTED, ENF_LEAKED, ENF_TESTING, FWD_BOUNCE_CAP, MAGIC, MAX_CORES, MSG_FWD_ECHO_REPLY,
-    MSG_FWD_ECHO_REQ, MSG_FWD_SYSCALL_REPLY, MSG_FWD_SYSCALL_REQ, MSG_PRESSURE, MSG_REPAID,
-    STATE_BOOTING, STATE_OFFLINE, STATE_ONLINE,
+    ENF_FAULTED, ENF_LEAKED, ENF_TESTING, FWD_BOUNCE_CAP, MAGIC, MAX_CORES, MSG_CORE_INIT,
+    MSG_FWD_ECHO_REPLY, MSG_FWD_ECHO_REQ, MSG_FWD_SYSCALL_REPLY, MSG_FWD_SYSCALL_REQ, MSG_PRESSURE,
+    MSG_REPAID, STATE_BOOTING, STATE_OFFLINE, STATE_ONLINE, STATE_PARKED,
 };
 use spinning_top::Spinlock;
 use crate::console;
@@ -46,6 +46,17 @@ const SECONDARY_STACK_SHIFT: usize = 14;
 
 /// PSCI `CPU_ON` (SMC64) function id.
 const PSCI_CPU_ON: u64 = 0xC400_0003;
+
+/// PSCI `CPU_OFF` (SMC32) function id — powers off the CALLING core; does not return
+/// on success. A parked secondary that is never initialized within the watchdog window
+/// calls this to stop spinning (a later `core_init` re-`CPU_ON`s it).
+const PSCI_CPU_OFF: u64 = 0x8400_0002;
+
+/// How long a freshly-online secondary parks awaiting `MSG_CORE_INIT` before it logs an
+/// error and `CPU_OFF`s itself (docs/MULTIKERNEL.md R4b lifecycle). Not a hard race: a
+/// later `core_init` syscall re-`CPU_ON`s a core that shut down, so this only bounds how
+/// long an un-activated core stays powered, it does not bound when userspace must act.
+const CORE_INIT_WATCHDOG_US: u64 = 5_000_000;
 
 /// `Sync` wrapper: the BSP writes the inner config exactly once (single-threaded,
 /// before any secondary runs); afterwards every access is either a read or a
@@ -915,6 +926,25 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
         }
     }
 
+    // R4b lifecycle: each secondary boots → soundness self-tests → PARKS awaiting
+    // MSG_CORE_INIT. Activate them.
+    //
+    // INTERIM: the BSP auto-activates here so the role self-tests (R3a/R3b/R4a/R4b.3a) run
+    // at boot and the existing PerCpu reporting below works. The production model is herd
+    // driving activation from userspace (the `core_init` syscall + `/proc/cores`); once
+    // that is wired this should be gated on `!(config::AUTO_START_HERD &&
+    // config::MULTIKERNEL_INIT_HERD)` so herd-managed boots leave the cores parked for
+    // herd. The message is delivered to the inbox (persisted); a parked core drains it on
+    // entry, so the doorbell below is only a best-effort wake (harmless if the core's GIC
+    // receive path isn't up yet).
+    for idx in 0..num_cores {
+        if idx == bsp_idx {
+            continue;
+        }
+        cfg.inboxes[idx].push(MSG_CORE_INIT, bsp_idx as u32, 0, 0);
+        crate::gic::trigger_sgi_core(idx as u32, DOORBELL_SGI);
+    }
+
     // Wait for secondaries to report Online (bounded by uptime, ~2s).
     let deadline = crate::timer::uptime_us() + 2_000_000;
     for idx in 0..num_cores {
@@ -1324,6 +1354,16 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
     // isolated alloc works (records the result to PerCpu for the BSP). Done BEFORE
     // announcing Online so the BSP can verify it synchronously once it sees Online.
     run_r2_test(cc.ram_base as usize, cc.ram_len as usize, cc.kernel_end as usize, percpu);
+
+    // R4b lifecycle: the cheap soundness self-tests (isolation, replication, per-core
+    // PMM/heap) are done — now PARK and await activation. We stand up the scheduler/role
+    // below ONLY after a `MSG_CORE_INIT` arrives (sent by the initiator: the BSP during
+    // bringup today; herd via the `core_init` syscall once wired). No init within the
+    // watchdog window ⇒ log + `CPU_OFF` (a later `core_init` re-`CPU_ON`s us). This is the
+    // userspace-driven core-activation seam (docs/MULTIKERNEL.md §6/R4b).
+    if !secondary_park_and_await_init(cfg, core_idx, percpu) {
+        secondary_shutdown(cfg, core_idx); // never returns
+    }
 
     // R3a/R3b — per-core scheduler self-tests (record to PerCpu for the BSP). Run after
     // R2 (need the per-core heap+PMM) and BEFORE we re-stamp TPIDRRO_EL0 with the PerCpu
@@ -1955,6 +1995,98 @@ fn secondary_doorbell_handler(_irq: u32) {
 /// The secondary's permanent steady state (R4b.1). Preconditions: R3a stood the
 /// scheduler up (runtime registered, TTBR0 override set, `threading::init` done) and
 /// TPIDRRO_EL0 holds the boot thread's id. Never returns.
+/// PARK after the soundness self-tests and await activation (docs/MULTIKERNEL.md R4b
+/// lifecycle). Announces `STATE_PARKED`, brings up this PE's receive path (doorbell SGI +
+/// a periodic virtual-timer tick), then sleeps (`WFI`) draining its inbox until either a
+/// `MSG_CORE_INIT` arrives (→ returns `true`; the caller stands up the scheduler/role) or
+/// the watchdog window elapses (→ returns `false`; the caller `CPU_OFF`s). The receive
+/// path is torn down before returning so the role sequence starts from the clean post-R2
+/// state. The activation message is delivered to the inbox (persisted) and the loop drains
+/// it before each sleep, so a doorbell that races the park-entry can't be lost.
+fn secondary_park_and_await_init(cfg: &MachineConfig, core_idx: usize, percpu: usize) -> bool {
+    if let Some(cc) = cfg.cores.get(core_idx) {
+        cc.state.store(STATE_PARKED, Ordering::Release);
+    }
+    crate::safe_print!(
+        96,
+        "[core {}] parked: awaiting MSG_CORE_INIT (watchdog {} ms)\n",
+        core_idx,
+        CORE_INIT_WATCHDOG_US / 1000
+    );
+
+    // Receive path: doorbell SGI (initiator ringing us) + virtual-timer tick (periodic
+    // wakeups so the watchdog deadline is checked even with no doorbell). Both land in
+    // `smp_irq_handler` (VBAR is `smp_vectors` from the enforcement self-test), which finds
+    // PerCpu via TPIDRRO_EL0 — free on a secondary, so stash it.
+    if percpu != 0 {
+        // SAFETY: TPIDRRO_EL0 is unused on a secondary until the scheduler claims it.
+        unsafe { core::arch::asm!("msr tpidrro_el0, {0}", in(reg) percpu, options(nomem, nostack)) };
+    }
+    secondary_gic_init(core_idx);
+    // SAFETY: CNTV* are EL1-accessible; arm a periodic tick (re-armed by smp_irq_handler).
+    unsafe {
+        let now: u64;
+        core::arch::asm!("mrs {0}, cntvct_el0", out(reg) now, options(nomem, nostack));
+        core::arch::asm!("msr cntv_cval_el0, {0}", in(reg) now + TIMER_INTERVAL_TICKS, options(nomem, nostack));
+        core::arch::asm!("msr cntv_ctl_el0, {0}", in(reg) 1u64, options(nomem, nostack));
+    }
+    crate::irq::enable_irqs();
+
+    let deadline = crate::timer::uptime_us() + CORE_INIT_WATCHDOG_US;
+    let mut activated = false;
+    loop {
+        if let Some(inbox) = cfg.inboxes.get(core_idx) {
+            while let Some(m) = inbox.pop() {
+                if m.kind == MSG_CORE_INIT {
+                    activated = true; // drain the rest, but we're going online
+                }
+                // Other kinds (debt protocol) shouldn't arrive before we're online; ignore.
+            }
+        }
+        if activated || crate::timer::uptime_us() >= deadline {
+            break;
+        }
+        // Race-free sleep: mask, re-check the inbox, WFI (wakes on the timer tick or a
+        // doorbell even while masked), unmask to take the wake interrupt.
+        crate::irq::disable_irqs();
+        if cfg.inboxes.get(core_idx).is_some_and(|r| !r.is_empty()) {
+            crate::irq::enable_irqs();
+            continue;
+        }
+        // SAFETY: WFI wakes on a pending IRQ despite the mask.
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        crate::irq::enable_irqs();
+    }
+
+    // Tear down the park receive path: leave IRQs masked + the timer off so the role
+    // sequence (R3a stands up its own scheduler vectors/timer) starts from a clean slate.
+    crate::irq::disable_irqs();
+    disable_cntv_timer();
+    activated
+}
+
+/// A parked secondary that was never activated within the watchdog window: log it, mark
+/// the core `STATE_OFFLINE` (so a later `core_init` knows to re-`CPU_ON` it), and PSCI
+/// `CPU_OFF` this PE. Does not return on success (the core powers down).
+fn secondary_shutdown(cfg: &MachineConfig, core_idx: usize) -> ! {
+    crate::safe_print!(
+        112,
+        "[core {}] no MSG_CORE_INIT within {} ms — shutting down (CPU_OFF); core_init re-wakes it\n",
+        core_idx,
+        CORE_INIT_WATCHDOG_US / 1000
+    );
+    if let Some(cc) = cfg.cores.get(core_idx) {
+        cc.state.store(STATE_OFFLINE, Ordering::Release);
+    }
+    dsb_sy();
+    let use_hvc = USE_HVC.load(Ordering::Relaxed);
+    psci_call(use_hvc, PSCI_CPU_OFF, 0, 0, 0);
+    // CPU_OFF only returns on error — park forever as a fallback.
+    loop {
+        wfe();
+    }
+}
+
 fn secondary_steady_state(cfg: &MachineConfig, idx: usize, percpu: usize, mut sm: CoreStateMachine) -> ! {
     // Handlers run on the real vectors, where TPIDRRO_EL0 is the thread id — publish
     // PerCpu via a replicated static for `secondary_doorbell_handler` to read.
@@ -2543,6 +2675,55 @@ pub fn start_fwd_server() {
             crate::safe_print!(80, "[SMP] fwd-server thread spawn FAILED: {}\n", e);
         }
     }
+}
+
+/// BSP-served core activation — the kernel side of the `core_init` syscall
+/// (docs/MULTIKERNEL.md R4b lifecycle). An init system (herd) calls this from userspace
+/// to bring a parked secondary online. Steps: validate `idx` is a real secondary; if it
+/// had self-`CPU_OFF`'d (Offline) re-`CPU_ON` it to re-arm its park window; then push
+/// `MSG_CORE_INIT` to its inbox and ring its doorbell so the parked core wakes, sees the
+/// message, and stands up its scheduler/role. Targeted (one core) and idempotent at the
+/// receiver — a core that is already Online logs + drops a late/duplicate. Returns 0 on
+/// success, or a negative errno (Linux-encoded): `-ENOSYS` if SMP isn't up, `-ENODEV` for
+/// a bad/non-secondary index, `-EPERM` if this core isn't the descriptor's `initiator`.
+pub fn core_init(idx: usize) -> u64 {
+    if !PROBED.load(Ordering::Acquire) {
+        return enc_err(38); // ENOSYS — single-core / no SMP
+    }
+    let num = NUM_CORES.load(Ordering::Relaxed);
+    let bsp = (read_mpidr() & 0xff) as usize;
+    if idx == 0 || idx >= num || idx == bsp {
+        return enc_err(19); // ENODEV — not a real secondary
+    }
+    // SAFETY: the descriptor is initialized once at boot and identity-mapped on the BSP;
+    // here we only touch atomics (`state`) and the lock-free inbox, both shared-safe.
+    let cfg = unsafe { &*MACHINE_CONFIG.0.get() };
+    // Only the current initiator (BSP today, an elected leader later) drives PSCI and
+    // sends MSG_CORE_INIT (§12). Re-pointable via `cfg.initiator`.
+    if bsp as u32 != cfg.initiator.load(Ordering::Relaxed) {
+        return enc_err(1); // EPERM — not the initiator
+    }
+
+    // Re-CPU_ON a core that shut itself down (the watchdog expired earlier). It re-runs
+    // secondary bringup → soundness checks → parks again, and the MSG_CORE_INIT we push
+    // below is waiting in its inbox by the time it gets there.
+    if cfg.cores[idx].state.load(Ordering::Acquire) == STATE_OFFLINE {
+        let target = cfg.cores[idx].mpidr;
+        let entry_pa = secondary_entry as *const () as usize as u64;
+        let cfg_pa = core::ptr::from_ref::<MachineConfig>(cfg) as u64;
+        cfg.cores[idx].state.store(STATE_BOOTING, Ordering::Release);
+        dsb_sy();
+        let _ = psci_call(USE_HVC.load(Ordering::Relaxed), PSCI_CPU_ON, target, entry_pa, cfg_pa);
+    }
+
+    // Push the activation message + ring the doorbell to wake the parked core.
+    if let Some(inbox) = cfg.inboxes.get(idx)
+        && !inbox.push(MSG_CORE_INIT, bsp as u32, 0, 0)
+    {
+        return enc_err(11); // EAGAIN — inbox full
+    }
+    crate::gic::trigger_sgi_core(idx as u32, DOORBELL_SGI);
+    0
 }
 
 // ============================================================================

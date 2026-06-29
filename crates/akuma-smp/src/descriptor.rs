@@ -20,10 +20,16 @@ pub const MAX_CORES: usize = 8;
 /// Sanity magic so a secondary can confirm it read a real descriptor ("AKUMAMK1").
 pub const MAGIC: u64 = 0x414b_554d_414d_4b31;
 
-// Core lifecycle states (`CoreConfig::state`). The BSP watches Offline -> Online.
+// Core lifecycle states (`CoreConfig::state`). Offline -> Booting -> Parked -> Online.
 pub const STATE_OFFLINE: u32 = 0;
 pub const STATE_BOOTING: u32 = 1;
 pub const STATE_ONLINE: u32 = 2;
+/// Online + passed its soundness self-tests, but NOT yet activated.
+///
+/// Parked in a minimal WFI loop awaiting `MSG_CORE_INIT` (bounded by a watchdog — no init
+/// within the window ⇒ the core logs + `CPU_OFF`s itself). The initiator / init-system
+/// observes this to know a core is ready to be activated.
+pub const STATE_PARKED: u32 = 3;
 
 // Enforcement self-test outcomes (`MachineConfig::enforcement_results`).
 pub const ENF_TESTING: u32 = 0;
@@ -115,6 +121,12 @@ pub struct MachineConfig {
     /// post-bringup forward request, so the request is provably serviced by the
     /// long-running thread rather than the transient bringup wait loop.
     pub fwd_server_ready: AtomicU32,
+    /// Core index of the current **initiator** — the core authorized to send
+    /// `MSG_CORE_INIT` (activate a parked core) and drive PSCI. Hardcoded to the BSP
+    /// (core 0) today; a field (not a constant) precisely so it can be re-pointed to a
+    /// elected leader later (§12 consensus/failover) without a format change. Read at
+    /// runtime by whoever services the `core_init` syscall.
+    pub initiator: AtomicU32,
 }
 
 impl Default for MachineConfig {
@@ -143,6 +155,7 @@ impl MachineConfig {
             fwd_bounce: [const { FwdBounce::new() }; MAX_CORES],
             fwd_call: [const { ForwardCall::new() }; MAX_CORES],
             fwd_server_ready: AtomicU32::new(0),
+            initiator: AtomicU32::new(0), // BSP (core 0) by default
         }
     }
 }

@@ -454,6 +454,10 @@ pub(crate) fn build_exec_runtime(
         cow_ref_inc: pmm::cow_ref_inc,
         cow_ref_dec: pmm::cow_ref_dec,
         cow_ref_get: pmm::cow_ref_get,
+        // No user-AS overlay on the BSP / single-kernel build. A multikernel secondary
+        // sets this when it initializes (src/smp.rs) so the normal spawn path builds a
+        // correct user table on it too (docs/MULTIKERNEL.md §4.2/R4b.3a).
+        prepare_user_address_space: None,
     };
     let cfg = akuma_exec::ExecConfig {
         max_threads: config::MAX_THREADS,

@@ -603,6 +603,18 @@ pub const THREADING_HEARTBEAT_INTERVAL: u64 = 100000; // 1000 iterations
 /// defined in /etc/herd/enabled/.
 pub const AUTO_START_HERD: bool = true;
 
+/// Multikernel: let **herd** (userspace) manage secondary-core activation.
+///
+/// When this AND [`AUTO_START_HERD`] are both true (the default we want to try),
+/// the kernel brings secondaries only to the PARKED state and leaves activation to
+/// herd, which calls the `core_init` syscall for the cores it intends to use (it
+/// discovers them via `/proc/cores`). When false, the BSP auto-initializes
+/// secondaries itself at boot (the fallback for non-herd / bare SMP boots, which
+/// preserves the self-test PASS output without a userspace init system).
+///
+/// Only meaningful under `--features smp`; ignored on the single-kernel build.
+pub const MULTIKERNEL_INIT_HERD: bool = true;
+
 // ============================================================================
 // Procfs Buffer Size Limits
 // ============================================================================

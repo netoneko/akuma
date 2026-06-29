@@ -350,6 +350,78 @@ pub fn spawn_process_with_channel_ext(
     Ok((thread_id, channel, pid))
 }
 
+/// Spawn a process from an **in-memory** ELF image as a minimal LOCAL process
+/// (no VFS read, no box, no namespace, no stdin), running `prepare` on its address
+/// space before it is registered and entered. Returns `(thread_id, pid)`.
+///
+/// The multikernel uses this to launch a pinned EL0 probe on a secondary core
+/// (docs/MULTIKERNEL.md §15 R4b.3b — "create + eret to a local-only pinned EL0
+/// process"): `prepare` overlays that core's *replicated* kernel writable window
+/// onto the user table, so when the process traps for a syscall the kernel resolves
+/// its `.data`/`.bss` statics (process table, PMM, …) against that core's OWN private
+/// copies, not the BSP's — the isolation guarantee R4b.3a verified on a bare table.
+///
+/// Unlike [`spawn_process_with_channel_ext`], this deliberately does **not** insert
+/// the thread into `THREAD_PID_MAP`. Two consequences, both wanted for a one-shot
+/// probe: `getpid` resolves via the PROCESS_INFO page instead (still a real syscall
+/// through the EL0 trap path), and the process is **not** auto-reaped on thread
+/// cleanup — it stays a zombie, so the spawner can read its `exit_code` race-free
+/// after it exits. Not for general process spawning (it leaks the slot by design).
+///
+/// DEPRECATED: this proved a secondary can build a user table, `eret` to EL0, and
+/// run a syscall — its job. The production path is a `SpawnProcess` message to the
+/// target core, which runs the NORMAL spawn in its own context; the secondary-specific
+/// kernel-window overlay belongs in user-AS construction (via the runtime hook), not in
+/// a bespoke spawn entry. Kept temporarily as the R4b.3b reference.
+#[deprecated(note = "R4b.3b proof only; use the SpawnProcess-message path + normal spawn + the \
+                     user-AS overlay runtime hook for cross-core process launch")]
+pub fn spawn_local_image(
+    name: &str,
+    elf_data: &[u8],
+    prepare: impl FnOnce(&mut crate::mmu::UserAddressSpace) -> Result<(), &'static str>,
+) -> Result<(usize, Pid), String> {
+    if crate::threading::user_threads_available() == 0 {
+        return Err("No available user threads for local image".into());
+    }
+
+    let mut process = Process::from_elf(name, &[], &[], elf_data, None)
+        .map_err(|e| format!("Failed to load in-memory ELF: {}", e))?;
+
+    // Caller hook: e.g. overlay the secondary's replicated kernel window so syscalls
+    // this process makes resolve against the pinned core's own kernel statics.
+    prepare(&mut process.address_space).map_err(|e| format!("address-space prepare failed: {}", e))?;
+
+    // A channel keeps the exit/IO paths on their normal codepath (they expect Some).
+    let channel = Arc::new(ProcessChannel::new());
+    channel.set_terminal(false);
+    process.channel = Some(channel.clone());
+
+    let pid = process.pid;
+    let boxed_process = Box::try_new(process)
+        .map_err(|_| format!("Failed to allocate Process struct for {name}"))?;
+    register_process(pid, boxed_process);
+    register_channel(0, channel);
+
+    let thread_id = crate::threading::spawn_user_thread_fn_for_process(move || {
+        let tid = crate::threading::current_thread_id();
+        if let Some(p) = lookup_process(pid) {
+            p.thread_id = Some(tid);
+            // NOTE: intentionally no THREAD_PID_MAP insert (see doc comment).
+            remove_channel(0);
+            register_channel(tid, p.channel.as_ref().unwrap().clone());
+            run_registered_process(pid);
+        } else {
+            loop { crate::threading::yield_now(); }
+        }
+    })
+    .map_err(|e| format!("Failed to spawn thread for {name}: {}", e))?;
+
+    if let Some(p) = lookup_process(pid) {
+        p.thread_id = Some(thread_id);
+    }
+    Ok((thread_id, pid))
+}
+
 /// Execute a process that is already registered in the PROCESS_TABLE
 pub(crate) fn run_registered_process(pid: Pid) -> ! {
     let proc = lookup_process(pid).expect("Process not found in run_registered_process");

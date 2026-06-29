@@ -45,6 +45,29 @@ core = 1          # pin to core 1; omit or `core = 0` => BSP (current behavior)
 - Parse `"core"` → `config.core = parse_u32(value)`.
 - Unset / `core = 0` preserves today's behavior exactly (everything on the BSP).
 
+### Intended placements (not wired yet)
+
+Services we want to move off the BSP onto a dedicated kernel once R4b.3b lands.
+These live in herd's `available/` (defined, not enabled) until then, so they add no
+boot noise on the BSP:
+
+- **sshd** (`bootstrap/etc/herd/available/sshd.conf`) → a **network core**. It is the
+  natural first non-BSP workload: a long-running listener that should own (or proxy to)
+  the network capability, not compete with compute on core 0. Pinning is one line once
+  supported:
+
+  ```conf
+  # /etc/herd/enabled/sshd.conf  (future)
+  command = /bin/sshd
+  args = --port 22 --shell /bin/sh
+  core = 1          # run sshd on the network core
+  ```
+
+  Caveat (see *Boxes and core-pinning are mutually exclusive* below): the current
+  rumpnet `join_box` form can't also be pinned to a non-BSP core — to get boxes on a
+  subkernel you run a herd instance *inside* that subkernel. So the pinned-sshd form
+  above is the plain (box-less) listener, not the rump-box variant.
+
 ## ABI change: `SpawnOptions.pin_core`
 
 Core pinning rides the existing `SYSCALL_SPAWN_EXT` (315) path. Add a field to the shared

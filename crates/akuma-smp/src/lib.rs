@@ -29,11 +29,11 @@ pub use fwd_bounce::{ForwardCall, FwdBounce, FWD_BOUNCE_CAP, FWD_CALL_ARGS};
 pub use state_machine::{Command, CoreStateMachine, Event, Range, MAX_DEBT_RANGES};
 pub use descriptor::{
     CoreConfig, MachineConfig, ENF_FAULTED, ENF_LEAKED, ENF_TESTING, MAGIC, MAX_CORES,
-    STATE_BOOTING, STATE_OFFLINE, STATE_ONLINE,
+    STATE_BOOTING, STATE_OFFLINE, STATE_ONLINE, STATE_PARKED,
 };
 pub use ring::{
-    Msg, Ring, MSG_FWD_ECHO_REPLY, MSG_FWD_ECHO_REQ, MSG_FWD_SYSCALL_REPLY, MSG_FWD_SYSCALL_REQ,
-    MSG_PRESSURE, MSG_REPAID, RING_CAP,
+    Msg, Ring, MSG_CORE_INIT, MSG_FWD_ECHO_REPLY, MSG_FWD_ECHO_REQ, MSG_FWD_SYSCALL_REPLY,
+    MSG_FWD_SYSCALL_REQ, MSG_PRESSURE, MSG_REPAID, RING_CAP,
 };
 
 /// Carve detected RAM into `num_cores` disjoint, 2 MiB-aligned partitions

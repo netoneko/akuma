@@ -1076,6 +1076,22 @@ pub(super) fn sys_getpid() -> u64 {
     akuma_exec::process::read_current_pid().map_or(ESRCH, u64::from)
 }
 
+/// Multikernel `core_init` (syscall nr::CORE_INIT): activate a parked secondary core
+/// from userspace (an init system like herd drives this — docs/MULTIKERNEL.md R4b
+/// lifecycle). Delegates to the BSP-served `smp::core_init`. On a non-multikernel build
+/// there are no secondaries, so it returns `-ENOSYS`.
+pub(super) fn sys_core_init(core_idx: usize) -> u64 {
+    #[cfg(kernel_smp)]
+    {
+        crate::smp::core_init(core_idx)
+    }
+    #[cfg(not(kernel_smp))]
+    {
+        let _ = core_idx;
+        (-38i64) as u64 // ENOSYS
+    }
+}
+
 pub(super) fn sys_getppid() -> u64 {
     if let Some(proc) = akuma_exec::process::current_process() {
         u64::from(proc.parent_pid)

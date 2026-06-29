@@ -35,6 +35,16 @@ pub const MSG_FWD_SYSCALL_REQ: u32 = 5;
 /// echoed so the caller matches the reply to its outstanding request.
 pub const MSG_FWD_SYSCALL_REPLY: u32 = 6;
 
+// Core init/activation (docs/MULTIKERNEL.md §6 + R4b lifecycle). A secondary boots into
+// a minimal PARKED state and waits (bounded by a watchdog) for this message before it
+// stands up its scheduler/role and becomes hostable. Sent by the current initiator (the
+// BSP today, a leader later) — typically triggered from userspace via a `core_init`
+// syscall — so an init system (herd) decides which cores to activate. Payload unused
+// (bare "activate, read your pre-built CoreConfig"); role/caps ride the descriptor later.
+/// "Activate: leave the park-and-wait state and run your role." Idempotent at the
+/// receiver — a late/duplicate one (after the core is already Online) is logged + dropped.
+pub const MSG_CORE_INIT: u32 = 7;
+
 /// Inbox capacity. Small — the coordination message rate is low; protocol traffic
 /// is a handful of messages per event, drained every loop pass.
 pub const RING_CAP: usize = 8;

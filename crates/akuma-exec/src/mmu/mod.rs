@@ -362,6 +362,13 @@ impl UserAddressSpace {
             shared: false,
         };
         addr_space.add_kernel_mappings().ok()?;
+        // Multikernel seam: on a secondary core this overlays the core's replicated
+        // kernel writable window onto the fresh table (no-op / None on the BSP), so
+        // the SAME spawn path yields a correct address space on either (see the field
+        // doc on `ExecRuntime::prepare_user_address_space`).
+        if let Some(prepare) = runtime().prepare_user_address_space {
+            prepare(&mut addr_space).ok()?;
+        }
         Some(addr_space)
     }
 
