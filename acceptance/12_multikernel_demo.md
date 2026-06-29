@@ -7,21 +7,26 @@ userspace** — by **herd**, not hardcoded in the kernel — and then host real 
 This is a **staged, expanding** playbook. Each milestone below adds a section; the
 earlier ones keep passing as the later ones land.
 
-- **Now (R4b.3b + core lifecycle):** secondaries park awaiting `MSG_CORE_INIT`; herd
-  (the init system) activates them via a syscall; as the first workload herd runs
-  `/bin/hello` once (oneshot) on the BSP.
-- **Next (R4b.4/.5):** herd spawns `/bin/hello` — then `curl` — **pinned to a secondary
-  core**, with the loader's `open`/`read` (and later sockets) forwarded to the owner
-  core. That is `docs/MULTIKERNEL.md` §10 Part A/B and the core-aware scheduling
-  in `userspace/herd/docs/CORE_AWARE_SCHEDULING.md`.
+- **Milestone 1 — core lifecycle (DONE):** secondaries boot, run their soundness
+  self-tests, and **park** awaiting `MSG_CORE_INIT`; **herd** (the init system, not the
+  kernel) activates the cores it intends to use via the `core_init` syscall.
+- **Milestone 2 — pinned workload (DONE):** herd runs `/bin/hello` **pinned to secondary
+  core 1** (its `core = 1` config). herd hands the program path to core 1's kernel in the
+  activation message; core 1 fetches the ELF via forwarded `open`/`read` to core 0 and
+  spawns it locally. That is `docs/MULTIKERNEL.md` §6.1 + §10 Part A and the core-aware
+  scheduling in `userspace/herd/docs/CORE_AWARE_SCHEDULING.md`.
+- **Next (Part B):** `curl` pinned to core 1 — add socket-forward arms to the owner-side
+  dispatcher (`docs/MULTIKERNEL.md` §10 Part B / §10.3).
 
 ## The model being verified
 
 - **Kernel brings cores only to "parked."** At boot the BSP `CPU_ON`s each secondary,
   which runs its soundness self-tests (isolation, replicated `.data`/`.bss`, per-core
   PMM/heap) and then **parks** in a minimal WFI loop (`STATE_PARKED`), awaiting
-  `MSG_CORE_INIT`. A core that is not initialized within a ~5s watchdog window logs an
-  error and `CPU_OFF`s itself (idle cores don't spin); a later `core_init` re-`CPU_ON`s it.
+  `MSG_CORE_INIT`. A core that is not initialized within a watchdog window (~120s, sized to
+  comfortably exceed boot-to-herd time) logs an error and `CPU_OFF`s itself (idle cores don't
+  spin); a later `core_init` re-`CPU_ON`s it. A parked core just `WFI`s, so the long window
+  costs nothing and lets herd activate cleanly instead of forcing a re-bringup.
 - **Userspace decides activation.** When `AUTO_START_HERD && MULTIKERNEL_INIT_HERD`
   (both default on), **herd** manages the cores: it calls the `core_init` syscall to
   activate the cores it intends to use. With `MULTIKERNEL_INIT_HERD` off, the kernel
@@ -47,8 +52,9 @@ cd userspace && ./build.sh && cd ..
 ./scripts/populate_disk.sh
 ```
 
-The oneshot service config is staged at `bootstrap/etc/herd/enabled/hello.conf`
-(`command = /bin/hello`, `oneshot = true`) → `/etc/herd/enabled/hello.conf`.
+The service config is staged at `bootstrap/etc/herd/enabled/hello.conf`
+(`command = /bin/hello`, `oneshot = true`, **`core = 1`**) → `/etc/herd/enabled/hello.conf`.
+The `core = 1` key is what pins it to the secondary (Milestone 2).
 
 ### 3. Build + start the SMP VM
 
@@ -63,40 +69,33 @@ QEMU runs forever — do NOT block on it. Poll the log:
 until grep -q "SSH Server\] Listening" 12_multikernel_demo_acceptance.log 2>/dev/null; do sleep 2; done
 ```
 
-## Steps & expected result — Milestone 1 (core lifecycle + oneshot hello)
+## Steps & expected result — Milestone 1 (core lifecycle: park → herd activates)
 
-### A. Secondaries park, then herd activates them
-
-In the boot log:
+Secondaries boot, run their soundness self-tests, and **park**; herd then activates core 1
+via the `core_init` syscall (carrying the program name — see Milestone 2). In the boot log
+(secondary `[core N]` lines arrive via the console ring, so they interleave late):
 
 ```
 [SMP] core 1 partition: base=0x… len=… MB
-[core 1] parked: awaiting MSG_CORE_INIT (watchdog … s)
+[SMP] core 1 PARKED (isolated-run confirmed) [replication: … PASS] [enforcement: … FAULTED PASS]
+[SMP] core 1 R2: per-core pmm+heap PASS …
+[core 1] parked: awaiting MSG_CORE_INIT (watchdog 120000 ms)
 [herd] Userspace supervisor starting...
-[SMP] core_init(1): activating (MSG_CORE_INIT sent)
+[SMP] core_init(1): activating (MSG_CORE_INIT sent), init program: /bin/hello
 [core 1] init: scheduler + role up — ONLINE
 ```
 
-(With `MULTIKERNEL_INIT_HERD` off you'd instead see the kernel auto-init the core at
-boot, with no herd line.)
-
-### B. herd runs /bin/hello once
-
-```
-[herd] Starting service: hello
-[herd] Started hello (pid=…)
-[herd] Service hello exited with code 0
-[herd] Oneshot service hello completed
-```
-
-`herd log hello` prints hello's greeting; repeating it returns the **same** content
-(run-once — not restarted). See `userspace/herd/README.md` for the oneshot semantics.
+`/proc/cores` reflects the lifecycle (`parked` → `online`):
 
 ```python
 import subprocess
 def ssh(cmd): return subprocess.run(["ssh","-o","StrictHostKeyChecking=no","-p","2222","root@localhost",cmd], capture_output=True, text=True)
-print(ssh("herd log hello").stdout)
+print(ssh("cat /proc/cores").stdout)   # core 1 -> online after herd activates it
 ```
+
+(With `MULTIKERNEL_INIT_HERD` off you'd instead see the kernel auto-init each core at boot
+for its self-tests, with no herd/core_init line.) The workload that core 1 then runs is
+Milestone 2.
 
 ## Steps & expected result — Milestone 2 (pinned to a secondary core) — DONE
 

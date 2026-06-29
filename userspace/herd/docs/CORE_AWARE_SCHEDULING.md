@@ -1,187 +1,97 @@
 # herd core-aware scheduling
 
-**Status:** plan / **premise superseded — needs rewrite.** This doc was written around a BSP-wide
-herd routing a service to core N via a cross-core `SpawnProcess` message (`SpawnOptions.pin_core`).
-That model is **dropped**: process creation is never cross-core — a process runs on a kernel only
-because *that kernel's own userspace* spawned it (`docs/MULTIKERNEL.md` §7/§10). So core-awareness
-is **"run a herd instance on the target core"** (bootstrapped by `core_init`), which then spawns
-that core's services locally. The `core = N` key + `pin_core` ABI below are kept as history; the
-"run herd-per-subkernel" escape hatch is in fact the model. See the *Model correction* note under
-*Kernel-side work* before building on this.
+**Status:** implemented (2026-06-30) for the single-pinned-program case — `/bin/hello` runs on a
+secondary core via `core = 1` in its service config (acceptance/12 Milestone 2). This doc describes
+the **userspace/herd** half of the multikernel: how herd places a service onto a specific per-core
+kernel.
 
-**Related:** `docs/MULTIKERNEL.md` (the multikernel; esp. §10 running `hello` on core 1,
-§10.1/§10.3 capability dispatch). This doc is the **userspace/herd** half: how the service
-supervisor places services onto specific cores once the kernel can host a process there.
+**Related:** `docs/MULTIKERNEL.md` — the multikernel (esp. **§6.1** the `core_init` activation
+handshake + init-program slot, **§10** running `hello` on core 1, **§10.3** capability dispatch).
 
-## Goal
+## The model (what was actually built)
 
-Let a herd service declare *which core* it runs on, so we can schedule processes onto the
-multikernel's per-core kernels (the whole point of one-kernel-per-core: dedicate a core to a
-workload). A service config gains a `core = N` field; herd asks the kernel to spawn that
-service pinned to core N.
+Process creation is **never cross-core** — there is no `SpawnProcess` message and no
+`SpawnOptions.pin_core` field (an earlier draft of this doc proposed both; neither was built). A
+process runs on a kernel only because *that kernel's own kernel* created it. So herd places a
+service on core N by **naming the program in the kernel's `core_init` activation message**, and core
+N's own kernel spawns it locally:
 
-## Scope (deliberately small for the first cut)
+```
+herd (BSP, EL0)                          kernel                         core N
+───────────────                          ──────                         ──────
+reads <svc>.conf: core = N
+core_init(N, "/bin/<svc>")  ── syscall ─▶ write init_program[N] slot
+  (libakuma::syscall 327)                 send MSG_CORE_INIT ──────────▶ wake, scheduler up,
+                                          (§6.1; kernel fills the         read slot, fetch ELF via
+                                          slot, NOT herd directly)        forwarded open/read, spawn
+                                                                          /bin/<svc> LOCALLY
+```
 
-In:
-- A single explicit target core per service: `core = N`. "Core N is enough for now."
-- A pre-spawn **availability check**: is core N up and able to host a process?
-- If core N is **not** available: **log an error and do not start the service.** Do **NOT**
-  fall back to / reschedule on another core. The service simply fails to come up (normal
-  herd restart backoff still applies, but it always retries the *same* core N — never a
-  different one).
-- **Box + non-BSP core is a misconfiguration** → log an error, don't start the service (see
-  *Boxes and core-pinning are mutually exclusive* below).
-
-Out (explicitly not in this cut — see *Future*):
-- Affinity *sets* / ranges / lists (`core = 1,2` or `core = 2-3`).
-- Load balancing, auto-placement, migration, or rebalancing across cores.
-- Per-service capability assignment (run on core N with caps `{Net}`) — that rides on the
-  caps-as-data work in `docs/MULTIKERNEL.md` §16; cross-referenced under *Future*.
-- NUMA / locality heuristics.
+The program named can be the **workload directly** (`/bin/hello`) or a **per-core supervisor**
+(`/bin/herd`) that then spawns several services on that core with ordinary local syscalls — same
+mechanism; the choice is just which path you put in `core = N`'s config.
 
 ## Config surface
 
-`parse_service_config` (`userspace/herd/src/main.rs`) gains one key:
+`parse_service_config` (`userspace/herd/src/main.rs`) has one key for this:
 
-```
-# /etc/herd/<svc>.conf
+```conf
+# /etc/herd/enabled/hello.conf
 command = /bin/hello
-core = 1          # pin to core 1; omit or `core = 0` => BSP (current behavior)
+oneshot = true
+core    = 1          # run on secondary core 1; omit or `core = 0` => BSP (current behavior)
 ```
 
-- Add `core: Option<u32>` (or `i32` with `-1` = unpinned) to `ServiceConfig` (default: unpinned).
-- Parse `"core"` → `config.core = parse_u32(value)`.
-- Unset / `core = 0` preserves today's behavior exactly (everything on the BSP).
+- `ServiceConfig` has `core: u32` (default `0` = unpinned / BSP).
+- `core = 0` (or unset) preserves today's behavior exactly: herd spawns the service locally on the
+  BSP via its normal spawn path.
+- `core = N` (N > 0): herd does **not** spawn locally. In `start_service` it calls
+  `core_init(N, config.command)` (the `core_init` helper → `libakuma::syscall(327, N, path_ptr, …)`).
 
-### Intended placements (not wired yet)
+## Lifecycle of a pinned service (deliberately minimal for the first cut)
 
-Services we want to move off the BSP onto a dedicated kernel once R4b.3b lands.
-These live in herd's `available/` (defined, not enabled) until then, so they add no
-boot noise on the BSP:
+A pinned service has **no local pid** — the process lives on core N, its output drains to the
+console via core N's ring (§8.2), and its exit is reaped by core N's kernel. herd cannot `waitpid`
+a cross-core process, so it treats `core_init` returning 0 as "launched" and:
 
-- **sshd** (`bootstrap/etc/herd/available/sshd.conf`) → a **network core**. It is the
-  natural first non-BSP workload: a long-running listener that should own (or proxy to)
-  the network capability, not compete with compute on core 0. Pinning is one line once
-  supported:
+- **oneshot** (`oneshot = true`): moves the service to the terminal **`Completed`** state (it ran
+  once on its core).
+- **non-oneshot**: marks it **`Running`** best-effort (not locally supervised). herd does **not**
+  restart pinned services in this cut — a restart would need cross-core liveness/reaping it doesn't
+  have yet.
 
-  ```conf
-  # /etc/herd/enabled/sshd.conf  (future)
-  command = /bin/sshd
-  args = --port 22 --shell /bin/sh
-  core = 1          # run sshd on the network core
-  ```
-
-  Caveat (see *Boxes and core-pinning are mutually exclusive* below): the current
-  rumpnet `join_box` form can't also be pinned to a non-BSP core — to get boxes on a
-  subkernel you run a herd instance *inside* that subkernel. So the pinned-sshd form
-  above is the plain (box-less) listener, not the rump-box variant.
-
-## ABI change: `SpawnOptions.pin_core`
-
-Core pinning rides the existing `SYSCALL_SPAWN_EXT` (315) path. Add a field to the shared
-`SpawnOptions` struct — **and it MUST be changed in lockstep in all three consumers**, or the
-struct layout mismatches and the kernel reads garbage (there is already a hard-won comment in
-`herd/src/main.rs::spawn_in_box` about exactly this class of ABI-mismatch bug → EFAULT):
-
-1. `src/syscall/proc.rs:1113` — the kernel's `SpawnOptions` (source of truth) + `sys_spawn_ext`.
-2. `userspace/box/src/main.rs:33` — `box`'s copy.
-3. `userspace/herd/src/main.rs` — herd's copy (in `spawn_in_box`).
-
-Proposed field (append at the end to keep offsets of existing fields stable):
-
-```rust
-pub struct SpawnOptions {
-    // … existing fields …
-    pub box_id: u64,
-    /// Target core for execution. 0 = BSP / unpinned (default). Non-zero = pin to that
-    /// secondary core's kernel. The kernel validates availability (see below).
-    pub pin_core: u64,
-}
-```
-
-herd sets `pin_core = config.core.unwrap_or(0)` in `spawn_in_box`.
-
-## Availability check + failure semantics
-
-"Available for execution" = core N exists, is `Online`, and can host an EL0 process (i.e. its
-per-core runtime is up — see kernel dependency). Two layers, both cheap:
-
-1. **Kernel validates `pin_core` in `sys_spawn_ext`.** If `pin_core` names a core that is not
-   online / cannot host a process, return a distinct errno (suggest `-ENXIO` / `-ENODEV`)
-   rather than silently spawning on the BSP. This is the authoritative check (herd can't race
-   it).
-2. **herd logs and fails — no fallback.** On that error herd logs e.g.
-   `[herd] service <name>: core <N> unavailable (err <e>) — not started` and leaves the
-   service in its failed/stopped state. herd's existing restart backoff may retry, but the
-   retry MUST keep `pin_core = N` — it must never try a different core. (Equivalent to: the
-   service is pinned-or-nothing.)
-
-Optionally, herd can pre-query online cores to log a clearer message before even attempting
-the spawn — but the kernel-side validation is what makes it correct, so the query is just UX.
-If a query is wanted, expose online cores via a tiny read-only source (a `/proc`-style file or
-a small syscall returning an online-core bitmap); not required for the first cut.
+On `core_init` failure (core can't be activated / host) the service goes **`Failed`** — no fallback
+to another core, no local-BSP fallback. Pinned-or-nothing.
 
 ## Boxes and core-pinning are mutually exclusive
 
-A process **cannot** be both in a box *and* pinned to a non-BSP core. Boxes/namespaces are
-governed by the kernel instance that *hosts* the process — the container tables are per-kernel
-replicated state (`src/syscall/container.rs`, replicated `.bss`). A box created by the BSP
-(its `box_id`, its mount/namespace tables) is meaningless to a *secondary* kernel, which has
-its own, separate container machinery. So "run this in BSP box B **and** on core 1" is a
-contradiction: core 1's kernel can't see BSP box B.
+A service **cannot** be both boxed and pinned to a non-BSP core. Box/namespace state is
+per-kernel-private (`src/syscall/container.rs`, replicated `.bss`) — a BSP box is meaningless to a
+secondary's kernel. herd enforces this: if `is_boxed(config) && config.core != 0` it logs an error
+and does **not** start the service (same no-fallback rule). "Boxed" = any of `boxed = true`,
+`bundle = …`, `join_box = …`, or `box_root != "/"`.
 
-Rule: if a service config sets **both** a box and a non-BSP core, that's a **misconfiguration**
-— **log an error and do not bring the service up** (same as an unavailable core: no fallback,
-no "just drop the box" or "just drop the pin" guessing). "Boxed" means any of `boxed = true`,
-`bundle = …`, `join_box = …`, or `box_root != "/"`; "non-BSP core" means `core` is set to a
-value other than 0. Concretely, reject when `is_boxed(config) && config.core.is_some_and(|c| c != 0)`.
+The supported way to get boxes on a subkernel: **name a per-core herd as the init program**
+(`core = N`, `command = /bin/herd`). That herd creates boxes via *its own* kernel and supervises its
+own services — boxes are always scoped to the kernel that owns them.
 
-Escape hatch (the supported way to get boxes on a subkernel): **run a herd instance inside the
-target subkernel.** That herd creates boxes via *its own* kernel (core N's container machinery)
-and pins to its own core — so boxes are always scoped to the kernel that owns them. A user who
-wants boxes on their multikernel setup runs herd-per-subkernel rather than asking the BSP's herd
-to place a boxed service onto another core.
+## Kernel dependency
 
-## Kernel-side work + dependency
+The herd side rides the kernel's `core_init(idx, path)` syscall (`nr::CORE_INIT = 327`) and the
+`MachineConfig::init_program[idx]` descriptor slot (`docs/MULTIKERNEL.md` §6.1). Both are
+implemented; the secondary's local spawn of the named program over forwarded VFS is **R4b
+(done)** in `docs/MULTIKERNEL.md` §15. The default boot is herd-managed
+(`AUTO_START_HERD && MULTIKERNEL_INIT_HERD`); with those off the kernel auto-activates secondaries
+itself for its boot self-tests and herd's `core_init` calls are unnecessary.
 
-The herd-side (config key + ABI field + log-and-fail) is buildable **now**, but it only does
-something real once the kernel can actually run a process on a secondary:
+## Limitations (current cut) & future
 
-- **Hard dependency: R4b.3b** in `docs/MULTIKERNEL.md` — *run an EL0 process on a secondary
-  core*. The page-table foundation (R4b.3a, `build_secondary_user_kernel_view`) and the
-  generic forwarder (R4b.4, `service_forwarded_syscall`) are done; R4b.3b is the EL0
-  entry/exit-teardown piece that's still open.
-- Until R4b.3b lands, **no secondary can host a process**, so `pin_core != 0` correctly fails
-  the availability check and logs the error — which is exactly the intended degenerate
-  behavior. So herd's core-awareness can ship and be inert-but-correct ahead of the kernel.
-- **Model correction — no `SpawnProcess` message (this changes the doc's premise).** A process
-  runs on core N only because core N's *own* userspace spawned it; there is **no cross-core spawn
-  message** (`docs/MULTIKERNEL.md` §7). So a BSP-wide herd cannot place a service onto core N by
-  routing `pin_core` over the ring. The way to dedicate work to core N is to **run a herd instance
-  on core N** — the "escape hatch" above is in fact *the* model: `core_init(N)` activates the core
-  and bootstraps its init program (that herd), whose ELF is fetched via forwarded VFS; the per-core
-  herd then spawns its services with ordinary **local** syscalls (the loader's `open`/`read`
-  forwarding back to the owner, §10.3; console/sockets the same). The `core = N` config key + the
-  BSP-side `SpawnOptions.pin_core` route described earlier in this doc are therefore **superseded**
-  and kept only as history — this doc wants a rewrite around herd-per-core.
-
-## Suggested implementation order
-
-1. **herd + ABI (now):** add `core` config key, `SpawnOptions.pin_core` (3 consumers in
-   lockstep), set it in `spawn_in_box`. No behavior change for unpinned services.
-2. **Kernel validation (now):** `sys_spawn_ext` rejects `pin_core` it can't honor with a
-   distinct errno; herd logs + fails (no fallback). Verifiable immediately: pinning to a
-   secondary fails cleanly, pinning to 0 / unpinned works as today.
-3. **Per-core herd (after R4b.3b):** instead of routing a spawn to core N, run a herd *on* core N
-   (bootstrapped by `core_init`); it spawns that core's services with local syscalls. There is no
-   `SpawnProcess` ring message — see the model correction above.
-
-## Future (out of this cut, noted so the seam is intentional)
-
-- **Capabilities per service.** Once the caps map is data in the descriptor (`docs/MULTIKERNEL.md`
-  §16), a service could declare both a core *and* a capability set (`core = 1`, `caps = net`),
-  and the placement + caps go together. Pairs with the consensus/cluster-config direction.
-- **Pinning across boxes/VMs.** The forwarder is transport-agnostic; "core N" generalizes to
-  "node N" (a peer VM) under the cluster vision. `pin_core` may become `pin_node`.
-- **Affinity sets / placement policy.** Only worth it once there are enough cores + workloads
-  to balance; intentionally excluded now.
+- **One init program per core.** The first pinned service to call `core_init(N, …)` becomes core
+  N's init program; a second service pinned to the same N finds it already online and is ignored.
+  To run multiple services on one core, point `core = N` at a per-core `/bin/herd`.
+- **No supervision/restart** of pinned services (no cross-core reaping yet).
+- **Future:** capabilities per service (once the caps map is descriptor data, `docs/MULTIKERNEL.md`
+  §16: `core = 1, caps = net`); pinning across nodes/VMs (`core` → `node` under the cluster vision);
+  affinity sets / placement policy. Also the per-core-chroot direction (`docs/MULTIKERNEL.md` §16:
+  `/srv/cores/<N>` + shared RO `/bin`,`/usr`) would give each pinned program an isolated rootfs
+  without a full box.

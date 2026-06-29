@@ -86,7 +86,7 @@ restart       = true     # restart on non-zero exit (default true)
 | `stack` | `""`/`smoltcp`/`rump` | `""` | Network stack for the box. `rump` routes the box's `AF_INET` through its `rump_server` via the kernel sysproxy client. |
 | `join_box` | name | *(none)* | Spawn into an **existing** box (by name) instead of registering a new one. Implies `boxed = true`. The target box must already exist and be stack-marked by its owner service. |
 | `mount` | space-separated | *(none)* | Filesystems to mount in the box's namespace before spawning. Only `proc` (→ `/proc`) and `tmpfs` (→ `/tmp`). A fresh-root box has no `/proc` otherwise — sshd's interactive bridge needs `/proc/<pid>/fd/0`. |
-| `core` | u32 | *(unpinned)* | **(planned)** Pin the service to a specific multikernel core. See [`docs/CORE_AWARE_SCHEDULING.md`](docs/CORE_AWARE_SCHEDULING.md). |
+| `core` | u32 | `0` (BSP) | Run the service on a specific multikernel secondary core. `0`/unset = spawn locally on the BSP (default). Non-zero = herd calls `core_init(N, command)` so core N's kernel spawns it locally (no cross-core spawn, no local pid). Mutually exclusive with boxes. See [`docs/CORE_AWARE_SCHEDULING.md`](docs/CORE_AWARE_SCHEDULING.md). |
 
 ---
 
@@ -194,6 +194,12 @@ the `SpawnOptions` struct are defined in `main.rs`:
 | `SYSCALL_REGISTER_BOX`| 316 | Create/update a box's name + root + primary pid. |
 | `SYSCALL_SET_BOX_STACK`| 324 | Mark a box's network stack (`rump`). |
 | `SYSCALL_MOUNT_IN_NS` | 325 | Mount `proc`/`tmpfs` into a box's namespace. |
+| `SYSCALL_CORE_INIT`   | 327 | Activate a multikernel secondary core to run a named program (the `core = N` path). `core_init(idx, path_ptr)`. |
+
+> **Core pinning does NOT use `SpawnOptions`.** A `core = N` service is *not* a cross-core
+> spawn — herd calls `core_init(N, command)` (syscall 327), which hands the kernel the program
+> path; core N's own kernel then spawns it locally (`docs/MULTIKERNEL.md` §6.1). There is no
+> `pin_core` field. See [`docs/CORE_AWARE_SCHEDULING.md`](docs/CORE_AWARE_SCHEDULING.md).
 
 > **ABI warning (hard-won).** `SpawnOptions` is a `#[repr(C)]` struct shared
 > verbatim with the kernel (`src/syscall/proc.rs`) and `box` (`userspace/box/src/main.rs`).
@@ -202,8 +208,7 @@ the `SpawnOptions` struct are defined in `main.rs`:
 > not a flat null-separated buffer. A past mismatch made the kernel read
 > `command.len()` as the options pointer → `EFAULT`, and boxed services silently
 > never started. When you add a field, append it at the end and change all three
-> copies in lockstep (this is exactly what the planned `pin_core` field does — see
-> [`docs/CORE_AWARE_SCHEDULING.md`](docs/CORE_AWARE_SCHEDULING.md)).
+> copies in lockstep.
 
 ---
 
@@ -221,11 +226,11 @@ herd depends only on `libakuma` (see `Cargo.toml`).
 
 ## Roadmap
 
-- **Core-aware scheduling** — pin a service to a multikernel core via a `core = N`
-  config key (kernel `SpawnOptions.pin_core`). Fully specced in
-  [`docs/CORE_AWARE_SCHEDULING.md`](docs/CORE_AWARE_SCHEDULING.md); the herd side
-  is buildable ahead of the kernel's R4b.3b milestone (inert-but-correct: pinning
-  to a not-yet-hostable core fails the availability check cleanly).
-- Future: capability-per-service, pinning across boxes/VMs (cluster vision),
-  affinity sets / placement policy. All out of the current cut — see the
-  *Future* section of the core-aware doc.
+- **Core-aware scheduling (done, first cut)** — a `core = N` config key runs a service on
+  multikernel secondary core N: herd calls `core_init(N, command)` and that core's kernel spawns
+  the program locally (ELF fetched via forwarded VFS). One init program per core, no local
+  supervision/restart of pinned services. Fully described in
+  [`docs/CORE_AWARE_SCHEDULING.md`](docs/CORE_AWARE_SCHEDULING.md).
+- Future: multiple services per core (point `core = N` at a per-core `/bin/herd`),
+  cross-core supervision/restart, capability-per-service, pinning across nodes/VMs (cluster
+  vision), affinity sets. See the *Limitations & future* section of the core-aware doc.
