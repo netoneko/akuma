@@ -387,6 +387,65 @@ BSP (core 0)                                  Secondary (core N)
 x0 just like QEMU hands the BSP its DTB. **Secondaries never parse the DTB** — they only read the
 descriptor.
 
+### 6.1 Userspace-driven activation + the init program (the `core_init` handshake)
+
+A secondary doesn't run any workload just by being *online* — it **parks** after its soundness
+self-tests and waits to be **activated** by userspace (acceptance/12). The init system (**herd**)
+decides which cores to use and **what program each should run**, and tells the kernel via the
+`core_init` syscall. The program name rides the activation message through one shared slot —
+`MachineConfig::init_program[core]` (`InitProgram`, a fixed path buffer in the shared descriptor).
+
+**Who fills the slot?** The **kernel** does, on the BSP side of the `core_init` syscall — *not*
+herd directly. herd is an EL0 process; it cannot touch the descriptor (kernel memory). It only
+passes the path *through the syscall*, and the kernel copies it into the slot **before** it sends
+`MSG_CORE_INIT`. The ring push/pop (Release/Acquire) is what orders that write before the
+secondary's read, so the parked core always sees the path once it pops the message. There is **no
+cross-core spawn** — the kernel never injects a process into the secondary; it only names the
+program, and the secondary's *own* kernel creates it (§7).
+
+```
+ BSP, EL0           BSP kernel (EL1)                         SHARED descriptor            Core 1 kernel (EL1, parked)
+ ────────           ───────────────                          (MachineConfig)              ───────────────────────────
+ herd
+  │ reads hello.conf: core = 1
+  │
+  │ core_init(1, "/bin/hello")   ── SVC ──▶ sys_core_init(idx=1, path_ptr)
+  │  (syscall nr 327)                         │ copy_from_user("/bin/hello")
+  │                                           │ smp::core_init(1, b"/bin/hello"):
+  │                                           │   ① write the slot ───────────▶ init_program[1].set("/bin/hello")
+  │                                           │      (BEFORE the message)         ▲   (the kernel fills it,
+  │                                           │                                   │    not herd)
+  │                                           │   ② push activation ───────────▶ inboxes[1].push(MSG_CORE_INIT)
+  │                                           │   ③ doorbell ─ trigger_sgi_core(1) ─ ─ ─ ─ ─ ─ ─ ─ ─▶ (wakes from WFI)
+  │                                           │   log "[SMP] core_init(1): activating … init program: /bin/hello"
+  │ ◀── returns 0 ──────────────────────────┘                                             │
+  │ herd: "Starting service: hello on core 1"                                              │ pop MSG_CORE_INIT
+  │ (no local pid — the process lives on core 1)                                           │ stand up scheduler/role
+  │                                                                                        │ ── ONLINE ──
+  │                                                                                        │ read the slot ◀──┘
+  │                                                                          init_program[1].get() = "/bin/hello"
+  │                                                                                        │
+  │                                                                                        │ fetch ELF via FORWARDED
+  │                            owner side: service_forwarded_syscall  ◀── openat/read/close ─┤ open/read/close to BSP
+  │                            (real ext2 read on core 0)             ── ELF bytes ─────────▶│ (core 1 has no VFS)
+  │                                                                                        │
+  │                                                                                        │ spawn_process_from_image:
+  │                                                                                        │   Process::from_elf(bytes)
+  │                                                                                        │   → runs LOCALLY on core 1's
+  │                                                                                        │     scheduler (pid 1, its own
+  │                                                                                        │     per-kernel pid space)
+  │                                                                                        │ write(1,"hello\n") → §8.2
+  │                                                                                        │   console ring → BSP UART
+  │                                                                                        │ exit → reaped by core 1
+```
+
+So the slot is the **one-way config channel** for activation: herd → (syscall) → kernel writes
+slot → (message) → secondary reads slot → secondary spawns locally. It lives in the descriptor
+precisely because that is the only memory both the BSP and the secondary map (§4.2); everything
+else about the process — its address space, scheduler, fd table, pid — is private to core 1's
+kernel. (`MULTIKERNEL_INIT_HERD`/`AUTO_START_HERD` off ⇒ the BSP fills no slot and auto-activates
+cores itself for the boot self-tests; the herd-managed path above is the default.)
+
 ---
 
 > **Implementation note (2026-06-29):** the pure, host-testable half of the SMP
@@ -921,7 +980,7 @@ Staged, each independently verifiable:
 | **R3a — per-core COOPERATIVE scheduler** ✅ | Secondary runs `akuma_exec`'s scheduler per-core and switches between kernel threads via `yield_now` | DONE (SMP=2/4). `run_r3a_coop_test`: register the runtime locally (`build_exec_runtime` extracted from `main.rs`, canaries off, secondary stack bounds) since the BSP's `RUNTIME`/`CONFIG` cells are set post-snapshot and a secondary's replicated copy is pristine; `akuma_exec::mmu::set_boot_ttbr0_override(our table)` so spawned threads get OUR TTBR0, not the BSP's (`boot_ttbr0_addr` lives in `.data.boot`, *outside* the replicated writable window, so the asm cell can't be rewritten on a secondary); re-target the scheduler SGI at this PE (`gic::trigger_sgi` hardcodes TargetList bit 0 = BSP); install the real `exception_vector_table`; enable only the scheduler SGI; spawn 2 workers via `spawn_system_thread_fn` (the closure path builds a real `setup_fake_irq_frame` — the bare `spawn(extern fn)` path is register-based and incompatible with the stack-based scheduler) and `yield_now` between them. Proof: 2 threads × 8 yields = 16, then the M2 heartbeat/doorbell loop resumes. |
 | **R3b — per-core preemptive scheduler** ✅ | Per-core timer preempts kernel threads on a secondary | DONE (SMP=2/4). `run_r3b_preempt_test` reuses R3a's scheduler: registers a per-core timer handler via `irq::register_handler_no_gic` (the normal `register_handler` calls `gic::enable_irq`, which for INTID<32 pokes **core 0's** redistributor — faults on a secondary); runs on the real `exception_vector_table`; enables PPI 27 in its OWN redistributor + arms CNTV. The handler re-arms CNTV then rings the scheduler SGI **at itself** (`trigger_sched_sgi_self`) — same two-step as the BSP's `timer_irq_handler`. Proof: a preemptive spinner that never yields advances (~12 M iters) only because the timer preempts the never-yielding boot thread (which, being the cooperative idle thread, is preempted past `COOPERATIVE_TIMEOUT_US`=100 ms; run window 300 ms). |
 | **R4a — cross-core forwarding TRANSPORT** ✅ | The data-movement round-trip (§8.1): request/reply over the ring + a shared bounce region | DONE (SMP=2/4). The keystone for everything else in R4 ("exec is recursive forwarding"), and the half §8.1 calls *hard*. Added `akuma_smp::FwdBounce` (per-core `[AtomicU8; 256]` slot in the descriptor, the sole shared byte buffer — published by the ring's `ready` Release/Acquire) + `MSG_FWD_ECHO_{REQ,REPLY}`. `run_r4a_fwd_test` (secondary): `copyin` a payload to its bounce slot → push request to the BSP inbox → spin (time-bounded) on the reply → `copyout` + verify. `service_fwd_requests` (BSP): drains its inbox **from the bringup online-wait loop** (else BSP-waits-Online ⇄ secondary-waits-reply deadlock), transforms the bounce payload (byte+1, standing in for the real owner-side syscall), replies. Proof: nonce-matched reply + verified transform = the §8.1 data path works end to end; neither core touched the other's partition. Independent of the scheduler, so it runs even when R3a is skipped. |
-| **R4b — per-core syscalls + pinned process** (staged R4b.1–.5) | SVC from EL0 on the per-core vectors; spawn `/bin/hello` (then `curl`) pinned to core 1, forwarding `open`/`read`/`write`/sockets to core 0 (§10) | The §10 acceptance test, staged like R1–R4a. **R4b.1 ✅** scheduler as steady state. **R4b.2 ✅** persistent BSP forward-server thread. **R4b.3** EL0 on the secondary — **R4b.3a ✅** the full secondary user-table kernel view (`build_secondary_user_kernel_view` + `UserAddressSpace::map_kernel_block_2mb`): a user address space on a secondary maps code RO+X identity (handler runs), the `.data`/`.bss` window to ITS private pages (not the BSP's), and its partition identity (`phys_to_virt` at EL1) — peers unmapped; verified by walking all three regions. **R4b.3b** create + `eret` to a local-only pinned EL0 process (getpid/exit), syscall dispatch via `sync_el0_handler` → replicated state. **R4b.4** forwarded exec — **data path ✅**: the GENERIC syscall forwarder (`capability_of`→caps→`service_forwarded_syscall`, §10.3) is proven — core 1 fetched `/bin/hello`'s ELF header from core 0's ext2 via forwarded `openat`/`read`/`close` ("exec is recursive forwarding"); remaining: wire it into a real EL0 process's `exec` (needs R4b.3b) = §10 Part A. **R4b.5** sockets — `curl` = add socket arms to the same dispatcher (§10 Part B). |
+| **R4b — per-core syscalls + pinned process** (staged R4b.1–.5) | SVC from EL0 on the per-core vectors; spawn `/bin/hello` (then `curl`) pinned to core 1, forwarding `open`/`read`/`write`/sockets to core 0 (§10) | The §10 acceptance test, staged like R1–R4a. **R4b.1 ✅** scheduler as steady state. **R4b.2 ✅** persistent BSP forward-server thread. **R4b.3** EL0 on the secondary — **R4b.3a ✅** the full secondary user-table kernel view (`build_secondary_user_kernel_view` + `UserAddressSpace::map_kernel_block_2mb`): a user address space on a secondary maps code RO+X identity (handler runs), the `.data`/`.bss` window to ITS private pages (not the BSP's), and its partition identity (`phys_to_virt` at EL1) — peers unmapped; verified by walking all three regions. **R4b.3b** create + `eret` to a local-only pinned EL0 process (getpid/exit), syscall dispatch via `sync_el0_handler` → replicated state. **R4b.4 ✅ — forwarded exec, full process (§10 Part A, acceptance/12 Milestone 2):** a real EL0 process (`/bin/hello`) runs **pinned to core 1**. herd hands core 1's kernel the program path in the `MSG_CORE_INIT` activation message (`core_init(idx, path)` — NO cross-core spawn, §7); core 1's steady-state loop (`spawn_init_program`) fetches the WHOLE ELF from core 0's ext2 via forwarded `openat`/`read`/`close` (`fetch_file_forwarded`, "exec is recursive forwarding") and spawns it LOCALLY via the normal path (`spawn_process_from_image` → `Process::from_elf`). The per-core kernel-window overlay rides the `ExecRuntime::prepare_user_address_space` runtime hook (set per core in `run_r3a_coop_test`), so the SAME loader builds a correct user table on a secondary. The process's `write(1)` drains to core 0's UART via the §8.2 console ring (`sys_write` routes secondary tty output through `console::print_bytes`); its exit is reaped locally. Verified SMP=2 @2048: `[core 1] init: spawned /bin/hello (pid 1, tid 8)` then `hello (1/10)…(10/10) hello: done`. GOTCHA (cost a few boots): the secondary boot/idle stack was 16 KiB — the deep `load_elf_with_stack` frames overflowed it into the replicated `.data`, corrupting CONFIG/RUNTIME (read back "not registered"); fixed by carving a 256 KiB isolated boot stack (`STACK_PAGES=64`). **R4b.5** sockets — `curl` = add socket arms to `service_forwarded_syscall` (§10 Part B). |
 | &nbsp;&nbsp;**R4b.1 — scheduler as steady state** ✅ | Secondary never tears down; real vectors + timer→scheduler run permanently | DONE (SMP=2/4). `run_r3a_coop_test` now returns whether it stood the scheduler up; if so, after announcing Online `secondary_main` enters `secondary_steady_state` (never returns) instead of the M2 `WFI` loop. It registers the timer PPI (R3b's `secondary_timer_preempt_handler`) + the doorbell SGI handler via `register_handler_no_gic`, brings up the GIC receive path for all three per-core sources (`secondary_gic_init` + `scheduler_sgi_enable`), installs `exception_vector_table`, arms CNTV, and runs the heartbeat/debt-protocol drain as the boot thread's idle loop (`yield_now` each pass). The doorbell handler finds PerCpu via a new replicated `SECONDARY_PERCPU` static, **not** TPIDRRO_EL0 (the scheduler claims that register for the current-thread id — the load-bearing difference from the `smp_vectors` path). The idle loop **`WFI`s** when nothing is runnable (it does NOT busy-`yield_now`): a tight yield loop rings the scheduler SGI every pass, pegging the core at 100% and — on a virtualized GIC — flooding the hypervisor with VM exits that starved the BSP's boot; `WFI` keeps the core near-idle (the timer still preempts to any runnable thread and keeps liveness advancing). Proof: heartbeat advances at timer rate (`0→62` over 500 ms vs `~190k` busy-yielding), debt repay works through the idle-loop inbox drain, and the M2 doorbell is serviced via the real IRQ path. |
 | &nbsp;&nbsp;**R4b.2 — persistent BSP forward-server thread** ✅ | The BSP services cross-core forwards from a long-running thread, not the transient bringup loop | DONE (SMP=2, MEMORY=2048). `start_fwd_server()` spawns a BSP system thread (like the console drainer, from `run_async_main` once preemption is live) that loops `service_fwd_requests` + `yield_now` for the system's lifetime; the bringup wait loop's inline servicing is KEPT (R4a still needs it). Real forwarding targets (VFS/sockets) only come up post-bringup, so R4b.4+ point this thread at them. Verified two-sided: the thread sets `MachineConfig::fwd_server_ready`; the steady-state secondary, gated on that flag (so the request can only be serviced by the thread, not the exited bringup loop), fires one echo round-trip from its idle loop and verifies the reply → `[core 1] post-bringup forward round-trip PASS` + the thread's `serviced post-bringup forward(s) PASS`. |
 
