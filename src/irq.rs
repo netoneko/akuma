@@ -95,6 +95,22 @@ pub fn register_handler(irq: u32, handler: IrqHandler) {
     crate::gic::enable_irq(irq);
 }
 
+/// Register an IRQ handler WITHOUT touching the GIC (multikernel secondaries only).
+///
+/// `register_handler` calls `gic::enable_irq`, which for an SGI/PPI (`irq < 32`) writes
+/// **core 0's** redistributor SGI frame (the address is hardcoded to CPU0) — on a
+/// secondary that frame isn't even mapped, so it would fault. A secondary enables its
+/// OWN per-PE interrupts directly in its redistributor (`secondary_gic_init` / R3b's
+/// timer-PPI enable), so it only needs the dispatch-table entry, not the GIC poke.
+#[cfg(kernel_smp)]
+pub fn register_handler_no_gic(irq: u32, handler: IrqHandler) {
+    let mut handlers = IRQ_HANDLERS.lock();
+    while handlers.handlers.len() <= irq as usize {
+        handlers.handlers.push(None);
+    }
+    handlers.handlers[irq as usize] = Some(handler);
+}
+
 /// Dispatch an IRQ to its registered handler
 pub fn dispatch_irq(irq: u32) {
     // Copy the handler out while holding the lock, then call it without the lock

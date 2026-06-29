@@ -377,10 +377,14 @@ const PERCPU_R2_FREE: usize = 64; // its private PMM free-page count after the t
 /// scheduler) self-test result for the BSP to verify.
 const PERCPU_R3_YIELDS: usize = 72; // total yields the two coop threads performed
 const PERCPU_R3_DONE: usize = 80; // # coop threads that ran to completion (== spawned)
-/// Progress marker bumped through `run_r3a_coop_test` (1=entry … 7=recorded). The BSP
-/// reads it EVEN on timeout, so a hang inside R3a is pinpointed (the secondary's own
-/// console ring isn't reliably drained while it is still mid-bringup).
+/// Progress marker bumped through `run_r3a_coop_test` (1=entry … 7=recorded) and
+/// `run_r3b_preempt_test` (10…16). The BSP reads it EVEN on timeout, so a hang inside
+/// R3a/R3b is pinpointed (the secondary's own console ring isn't reliably drained while
+/// it is still mid-bringup).
 const PERCPU_R3_STAGE: usize = 88;
+/// R3b (per-core PREEMPTIVE scheduler) self-test result offsets.
+const PERCPU_R3B_COUNT: usize = 96; // spinner iterations observed (>0 ⇒ timer preempted)
+const PERCPU_R3B_DONE: usize = 104; // 1 if the spinner ran to completion (R3_SKIPPED if skipped)
 
 /// Snapshot pristine `.data` — MUST be the first thing `rust_start` does, before any
 /// code mutates a `.data`/`.bss` static. Copies `[_data_start, __bss_start)` into
@@ -1038,6 +1042,30 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
                 console::print(" ✗)\n");
             }
         }
+        // R3b: per-core PREEMPTIVE scheduler. A spinner thread that never yields ran only
+        // because the per-core timer preempted the (also non-yielding) boot thread — so a
+        // nonzero spin count + the spinner completing proves timer-driven preemption.
+        if percpu != 0 {
+            let r3b_count =
+                unsafe { core::ptr::read_volatile((percpu + PERCPU_R3B_COUNT) as *const u64) };
+            let r3b_done =
+                unsafe { core::ptr::read_volatile((percpu + PERCPU_R3B_DONE) as *const u64) };
+            console::print("[SMP] core ");
+            console::print_dec(idx);
+            if r3b_done == R3_SKIPPED {
+                console::print(" R3b: skipped\n");
+            } else if r3b_done == 1 && r3b_count > 0 {
+                console::print(" R3b: per-core preemptive scheduler ✓ (timer preempted; spinner ran ");
+                console::print_dec(r3b_count as usize);
+                console::print(" iters)\n");
+            } else {
+                console::print(" R3b: FAILED (done=");
+                console::print_dec(r3b_done as usize);
+                console::print(" spin_count=");
+                console::print_dec(r3b_count as usize);
+                console::print(" — timer did not preempt? ✗)\n");
+            }
+        }
     }
 
     console::print("[SMP] bringup complete\n");
@@ -1253,12 +1281,19 @@ extern "C" fn secondary_main(cfg_pa: usize, core_idx: usize) -> ! {
     // announcing Online so the BSP can verify it synchronously once it sees Online.
     run_r2_test(cc.ram_base as usize, cc.ram_len as usize, cc.kernel_end as usize, percpu);
 
-    // R3a — per-core COOPERATIVE scheduler self-test (records to PerCpu for the BSP).
-    // Runs after R2 (needs the per-core heap+PMM) and BEFORE we re-stamp TPIDRRO_EL0
-    // with the PerCpu PA for the heartbeat loop (the scheduler uses TPIDRRO_EL0 as the
-    // current-thread id). Returns to this isolated context with IRQs masked + the
-    // `smp_vectors` restored, so the M2 doorbell/heartbeat path below is unaffected.
-    run_r3a_coop_test(cc, core_idx, percpu);
+    // R3a/R3b — per-core scheduler self-tests (record to PerCpu for the BSP). Run after
+    // R2 (need the per-core heap+PMM) and BEFORE we re-stamp TPIDRRO_EL0 with the PerCpu
+    // PA for the heartbeat loop (the scheduler uses TPIDRRO_EL0 as the current-thread id).
+    // Each returns to this isolated context with IRQs masked + `smp_vectors` restored, so
+    // the M2 doorbell/heartbeat path below is unaffected. R3b reuses the scheduler R3a
+    // stood up, so it only runs if R3a did.
+    if run_r3a_coop_test(cc, core_idx, percpu) {
+        run_r3b_preempt_test(core_idx, percpu);
+    } else if percpu != 0 {
+        // R3a skipped (e.g. partition too small) → R3b can't run either.
+        // SAFETY: PerCpu page is mapped RW in this core's restricted table.
+        unsafe { core::ptr::write_volatile((percpu + PERCPU_R3B_DONE) as *mut u64, R3_SKIPPED) };
+    }
 
     // First words a secondary ever speaks for itself — proving the §8.2 console path
     // end to end: this `print` lands in our console ring; the BSP drainer thread (not
@@ -1598,16 +1633,19 @@ const R3_SKIPPED: u64 = u64::MAX;
 /// outcome to PerCpu for the BSP. Preconditions: per-core heap+PMM are up (R2 ran) and
 /// TPIDRRO_EL0 has NOT yet been set to the PerCpu PA (the scheduler uses it as the
 /// current-thread id). On return: IRQs masked, `smp_vectors` reinstalled.
-fn run_r3a_coop_test(cc: &CoreConfig, idx: usize, percpu: usize) {
+///
+/// Returns `true` if the scheduler was stood up and the test ran (so R3b can reuse the
+/// initialized scheduler), `false` if skipped (no PerCpu / partition too small).
+fn run_r3a_coop_test(cc: &CoreConfig, idx: usize, percpu: usize) -> bool {
     if percpu == 0 {
-        return;
+        return false;
     }
     // Guard: a partition too small for the thread-stack pool would panic in
     // threading::init. Mark skipped (sentinel) so the BSP can distinguish it.
     if crate::pmm::free_count() < R3_MIN_FREE_PAGES {
         // SAFETY: PerCpu page is mapped RW in this core's restricted table.
         unsafe { core::ptr::write_volatile((percpu + PERCPU_R3_DONE) as *mut u64, R3_SKIPPED) };
-        return;
+        return false;
     }
 
     // 1. Make every kernel thread on this core use OUR restricted table, not the BSP's.
@@ -1681,6 +1719,145 @@ fn run_r3a_coop_test(cc: &CoreConfig, idx: usize, percpu: usize) {
         core::ptr::write_volatile((percpu + PERCPU_R3_DONE) as *mut u64, done);
     }
     stage(7); // recorded
+    true
+}
+
+// ============================================================================
+// R3b — per-core PREEMPTIVE scheduler (docs/MULTIKERNEL.md §15). Proves the per-core
+// CNTV timer drives the scheduler on a secondary: a spinner thread that NEVER yields
+// runs only because the timer preempts the (also non-yielding) boot thread. Reuses the
+// scheduler/runtime stood up by R3a. The BSP's preemption path is the model — its
+// `timer_irq_handler` re-arms CNTV then `trigger_sgi(SGI_SCHEDULER)`; we do the same but
+// re-target the SGI at THIS PE.
+// ============================================================================
+
+/// How long the boot thread spin-waits while the timer must preempt it. Must exceed
+/// `COOPERATIVE_TIMEOUT_US` (100 ms — thread 0 is cooperative, only preempted past its
+/// timeout) by several timer ticks so at least one preemption is guaranteed.
+const R3B_RUN_US: u64 = 300_000; // 300 ms
+
+/// R3b worker/handshake state (replicated `.bss` — each core mutates its own copy).
+static R3B_STOP: AtomicBool = AtomicBool::new(false);
+static R3B_SPIN_COUNT: AtomicU64 = AtomicU64::new(0);
+static R3B_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// R3b spinner: a PREEMPTIVE thread that never yields — it just bumps a counter until
+/// told to stop. Because neither it nor the boot thread yields, any progress here proves
+/// the timer preempted the boot thread to run it.
+fn r3b_spinner_body() -> ! {
+    while !R3B_STOP.load(Ordering::Relaxed) {
+        R3B_SPIN_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    R3B_DONE.store(1, Ordering::SeqCst);
+    akuma_exec::threading::mark_current_terminated();
+    loop {
+        akuma_exec::threading::yield_now();
+    }
+}
+
+/// Arm this PE's CNTV virtual timer: `CVAL = now + interval`, enabled+unmasked. Re-arming
+/// also deasserts the level-triggered PPI. (Mirrors the inline arm in `secondary_main`.)
+fn arm_cntv_timer() {
+    // SAFETY: CNTV* are EL1-accessible system registers.
+    unsafe {
+        let now: u64;
+        core::arch::asm!("mrs {0}, cntvct_el0", out(reg) now, options(nomem, nostack));
+        core::arch::asm!("msr cntv_cval_el0, {0}", in(reg) now + TIMER_INTERVAL_TICKS, options(nomem, nostack));
+        core::arch::asm!("msr cntv_ctl_el0, {0}", in(reg) 1u64, options(nomem, nostack));
+    }
+}
+
+/// Disable this PE's CNTV virtual timer (CTL.ENABLE = 0).
+fn disable_cntv_timer() {
+    // SAFETY: CNTV_CTL_EL0 is EL1-accessible.
+    unsafe { core::arch::asm!("msr cntv_ctl_el0, {0}", in(reg) 0u64, options(nomem, nostack)) };
+}
+
+/// Enable the virtual-timer PPI (INTID 27) in THIS core's redistributor. The CPU
+/// interface + redistributor were already woken by `scheduler_sgi_enable` (R3a).
+fn enable_timer_ppi(idx: usize) {
+    let sgi = GICR_BASE + idx * GICR_STRIDE + GICR_SGI_OFFSET;
+    mmio_w32(sgi + GICR_SGI_ISENABLER0, 1u32 << TIMER_PPI);
+    // SAFETY: ensure the redistributor write completes before IRQs are unmasked.
+    unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
+}
+
+/// Per-core timer IRQ handler for R3b preemption: re-arm CNTV (deassert the level IRQ)
+/// then ring the scheduler SGI to OURSELVES. Registered for `TIMER_PPI` in this core's
+/// (replicated) dispatch table; invoked by the real `exception_vector_table` IRQ path.
+fn secondary_timer_preempt_handler(_irq: u32) {
+    arm_cntv_timer();
+    trigger_sched_sgi_self(SCHED_SGI);
+}
+
+/// Run the R3b preemptive-scheduler self-test. Reuses the scheduler stood up by
+/// `run_r3a_coop_test` (runtime registered, TTBR0 override set, `threading::init` done).
+/// On return: IRQs masked, CNTV disabled, `smp_vectors` reinstalled.
+fn run_r3b_preempt_test(idx: usize, percpu: usize) {
+    if percpu == 0 {
+        return;
+    }
+    let stage = |s: u64| {
+        // SAFETY: PerCpu page is mapped RW in this core's restricted table.
+        unsafe { core::ptr::write_volatile((percpu + PERCPU_R3_STAGE) as *mut u64, s) };
+    };
+    stage(10);
+
+    // 1. Route the timer PPI to the scheduler: register a handler that re-arms CNTV and
+    //    rings the scheduler SGI at ourselves. No GIC poke (that would hit core 0).
+    crate::irq::register_handler_no_gic(TIMER_PPI, secondary_timer_preempt_handler);
+
+    // 2. Real vectors (scheduler SGI + timer dispatch); enable PPI 27 + arm CNTV. SGI 0
+    //    is still enabled from R3a's scheduler_sgi_enable.
+    set_vbar!("exception_vector_table");
+    enable_timer_ppi(idx);
+    R3B_STOP.store(false, Ordering::SeqCst);
+    R3B_SPIN_COUNT.store(0, Ordering::SeqCst);
+    R3B_DONE.store(0, Ordering::SeqCst);
+    arm_cntv_timer();
+    crate::irq::enable_irqs();
+    stage(11);
+
+    // 3. Spawn ONE preemptive spinner (never yields).
+    let spawned = akuma_exec::threading::spawn_system_thread_fn(r3b_spinner_body).is_ok();
+    stage(12);
+
+    // 4. Boot thread spin-waits WITHOUT yielding for R3B_RUN_US. The only way the spinner
+    //    can run (and bump its counter) is the timer preempting us — that IS the proof.
+    //    `uptime_us` reads CNTVCT each iteration, so the loop can't be optimized away.
+    let deadline = crate::timer::uptime_us() + R3B_RUN_US;
+    while crate::timer::uptime_us() < deadline {
+        core::hint::spin_loop();
+    }
+    let count = R3B_SPIN_COUNT.load(Ordering::Acquire);
+    stage(13);
+
+    // 5. Stop the spinner and let it terminate (now we may yield).
+    R3B_STOP.store(true, Ordering::SeqCst);
+    let mut spins = 0u64;
+    while spawned && R3B_DONE.load(Ordering::Acquire) == 0 && spins < R3_MAX_SPINS {
+        akuma_exec::threading::yield_now();
+        spins += 1;
+    }
+    stage(14);
+
+    // 6. Quiesce: disable the timer, mask IRQs, restore the minimal smp vectors (the M2
+    //    heartbeat/doorbell path below re-arms CNTV + uses smp_irq_handler).
+    disable_cntv_timer();
+    crate::irq::disable_irqs();
+    set_vbar!("smp_vectors");
+
+    // 7. Record the proof: spin_count>0 ⇒ the timer preempted the never-yielding boot
+    //    thread to run the never-yielding spinner.
+    // SAFETY: PerCpu page is mapped RW in this core's restricted table.
+    unsafe {
+        core::ptr::write_volatile((percpu + PERCPU_R3B_COUNT) as *mut u64, count);
+        core::ptr::write_volatile(
+            (percpu + PERCPU_R3B_DONE) as *mut u64,
+            R3B_DONE.load(Ordering::Acquire),
+        );
+    }
+    stage(16);
 }
 
 // ============================================================================

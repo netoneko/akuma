@@ -9,7 +9,8 @@ untouched. Verified under QEMU `SMP=4 @ 2 GB`:
   deliberate cross-core read **faults**. (This is a TTBR0 identity kernel, so isolation uses
   per-core *TTBR0* tables + replicated `.data`/`.bss` + a private PerCpu chunk, not the original
   "via TTBR1". Per-core `pmm`/heap over a real partition = **R2 ✅**; a per-core COOPERATIVE
-  scheduler = **R3a ✅**; preemptive + syscalls = R3b, TODO.)
+  scheduler = **R3a ✅**; per-core PREEMPTIVE scheduler (timer-driven) = **R3b ✅**; syscalls +
+  a pinned process = R4, TODO.)
 - **Messaging (M2) + protocol** — per-core heartbeat liveness, a lock-free MPSC inbox ring, and a
   cross-core **SGI doorbell**; secondaries are event-driven (WFI-sleep, wake on per-core timer
   tick or doorbell). The debt-based memory-reclaim protocol (§9) runs the host-tested
@@ -38,14 +39,22 @@ untouched. Verified under QEMU `SMP=4 @ 2 GB`:
   threads inherit its address space, not the BSP's), stands up `threading::init`, installs the
   real `exception_vector_table`, and runs two kernel threads that `yield_now` to each other over
   its private scheduler + stacks. Verified SMP=2/4: every secondary reports `R3a: cooperative
-  scheduler ✓ (2 threads, 16 yields)` then resumes the M2 heartbeat/doorbell loop intact. No
-  preemption/timer/syscalls yet (R3b).
+  scheduler ✓ (2 threads, 16 yields)` then resumes the M2 heartbeat/doorbell loop intact.
+- **Per-core preemptive scheduler (§15) — R3b DONE:** the BSP drives preemption by having its
+  `timer_irq_handler` re-arm CNTV then `trigger_sgi(SGI_SCHEDULER)`; a secondary does the same but
+  re-targets the SGI at itself. It registers a per-core timer handler (`register_handler_no_gic` —
+  `register_handler` would poke core 0's redistributor) in its replicated dispatch table, runs on
+  the real `exception_vector_table`, enables PPI 27 in its OWN redistributor, and arms CNTV. Proof:
+  one PREEMPTIVE spinner thread that never yields runs (millions of iters) purely because the timer
+  preempts the also-never-yielding boot thread. Verified SMP=2/4: `R3b: preemptive scheduler ✓
+  (timer preempted)`, then the M2 heartbeat/doorbell loop resumes intact. Syscalls + a real pinned
+  process are R4 (§10).
 
 Build with `scripts/build_smp.sh`; boot with `scripts/run_smp.sh` (or `SMP=N cargo run
 --profile release-smp --features smp`). Host-test/simulate the protocol with no QEMU:
 `cargo test -p akuma-smp --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)`. Remaining:
-per-core preemptive scheduler + syscalls (R3b) → pinned process + I/O forwarding (R4/M3, §10),
-dynamic memory (M4). Deferred cleanup/tech-debt is tracked in §16.
+a pinned process + per-syscall I/O forwarding (R4/M3, §10 — see the worked end-to-end example
+there), dynamic memory (M4). Deferred cleanup/tech-debt is tracked in §16.
 **Author:** design notes, 2026-06-28
 **Scope:** AArch64 (QEMU virt). A shared-nothing, message-passing multikernel where each
 physical core boots its own kernel instance ("a container per core"), instead of one
@@ -537,6 +546,117 @@ curl (core 1)  : socket(AF_INET,…)   ──Forward── ring[0] ─▶ core 0
 it before anything else can run). Console ring (§8.2) before output is visible. This is the M3
 acceptance test.
 
+### 10.1 Per-syscall decision tree
+
+When the process pinned to core 1 issues a syscall, core 1's syscall entry classifies it
+**before** doing any work. Most syscalls never leave the core; only the ones that touch a
+`Proxy`'d capability cross to the owner. The classification is per-syscall, driven by the `caps`
+map (§5) — *not* a blanket "secondary forwards everything."
+
+```
+                    syscall N on core 1  (EL0 ─SVC─▶ core1 kernel, per-core vectors)
+                              │
+            ┌─────────────────┴─────────────────┐
+            │ Does N touch an OS capability?     │
+            │ (VFS / Net / Console / …)          │
+            └─────────────────┬──────────────────┘
+                 no │                       │ yes
+        ┌───────────▼──────────┐            │
+        │ LOCAL — handle on     │     ┌──────▼─────────────────────────┐
+        │ core 1 with its OWN   │     │ cap = caps[subsystem of N]     │
+        │ replicated state.     │     └──────┬─────────────────────────┘
+        │ mmap(anon)/brk/mremap │   Own │  Absent │           │ Proxy(owner)
+        │ getpid/gettid/clone   │       │         │           │
+        │ futex/nanosleep/sched │  ┌────▼───┐ ┌───▼──────┐    │
+        │ thread create/exit    │  │ handle │ │ return   │    │
+        │ signals, time, tls    │  │ locally│ │ -ENOSYS  │    │
+        │ → no cross-core msg   │  │(Own=0) │ │(stripped)│    │
+        └───────────────────────┘  └────────┘ └──────────┘    │
+                                                                │
+                          ┌─────────────────────────────────────┘
+                          │ Does N return meaningful data / status the caller waits on?
+                          └───────────────┬───────────────────────┬───────────────────┐
+                       no, output-only    │                       │ yes (read/open/    │
+                       (write(1/2,…),      │                       │  connect/recvfrom/ │
+                       console, logging)   │                       │  sendto status, …) │
+                          ┌────────────────▼─────────┐   ┌─────────▼──────────────────────────────┐
+                          │ ASYNC append (§8.2)       │   │ SYNC forward (§8.1)                     │
+                          │ • copyin bytes → core1's  │   │ 1. copyin inbound user buffers          │
+                          │   per-core CONSOLE RING   │   │    (path, sockaddr, write data) into    │
+                          │ • return byte count NOW   │   │    msg payload / bounce region          │
+                          │ • NO doorbell, NO block   │   │    — core1 touches ONLY its own memory  │
+                          │ • owner drains ring on its│   │ 2. push ForwardSyscall{nr,args,off,len} │
+                          │   tick (coalesced SGI)    │   │    onto ring[owner]; ring DOORBELL SGI   │
+                          └───────────────────────────┘   │ 3. PARK caller; core1 scheduler runs    │
+                                                           │    other threads (R3b preemptive)       │
+                                                           │ 4. owner executes real syscall, writes  │
+                                                           │    result + outbound bytes to reply     │
+                                                           │ 5. owner pushes Reply; doorbells core1  │
+                                                           │ 6. core1 reply handler WAKES caller;    │
+                                                           │    copyout outbound bytes → user buf;   │
+                                                           │    return result/errno to EL0           │
+                                                           └─────────────────────────────────────────┘
+```
+
+Notes that make the tree exact:
+- **Local-first is the common case.** A pinned compute process spends most syscalls on memory,
+  threads, futexes, and time — all `Own`ed locally because R1–R3 gave core 1 its own
+  `PMM`/`TALC`/`POOL`/scheduler. Forwarding is the exception, taken only on a `Proxy` capability.
+- **`exec` is recursive forwarding** (§10): loading the ELF is just `open`+`read` on a `Proxy`'d
+  VFS, so it walks the right-hand SYNC branch before the process's first instruction runs.
+- **Direction decides which side copies** (§8.1): inbound args are `copyin`'d by core 1 *before*
+  the message; outbound bytes are `copyout`'d by core 1 *after* the reply. The owner only ever
+  touches the message payload — never a peer's user page.
+- **Async vs sync is about whether a result is awaited**, not about which subsystem: `write` to a
+  pipe/file is SYNC (returns a count the caller may depend on); `write` to the console/stdout is
+  the ASYNC special-case because a tty write was never a synchronous-delivery guarantee.
+
+### 10.2 End-to-end data flow of one forwarded syscall (`read`, the bulk/outbound case)
+
+The worked lifecycle of a single blocking forward — every arrow is either a CPU-local action or
+the **one** shared medium (the ring + bounce region in `rings_phys`). Time flows downward; the two
+columns are physically isolated cores that share nothing but the ring.
+
+```
+  core 1  (curl/hello — Proxy(VFS)=core0)                 core 0  (owns ext2 / smoltcp / UART)
+  ───────────────────────────────────────                ─────────────────────────────────────
+  EL0:  read(fd, ubuf, n)
+     │  SVC ─▶ core1 kernel syscall entry
+     │  classify: VFS = Proxy(0), result awaited ⇒ SYNC
+     │  reserve bounce slot off..off+n in rings_phys
+     │  build msg = ForwardSyscall{nr=read, fd, off, len=n}
+     │  push msg ─▶ ring[0].inbox ───────────────────────▶  (lock-free MPSC enqueue)
+     │  trigger_sgi_core(aff0=0, DOORBELL) ──────────────▶  doorbell IRQ on core 0
+     │  park caller thread (state=WAITING on fd-reply);
+     │  scheduler runs core1's OTHER threads  ░░░busy░░░       core0 IRQ: drain ring[0]
+     │                                          ░░░          pop ForwardSyscall{read}
+     │                                          ░░░          do REAL read on ext2 into a
+     │                                          ░░░          core0 kbuf  (core0's own memory)
+     │                                          ░░░          copy kbuf ─▶ bounce[off..off+ret]
+     │                                          ░░░          push Reply{ret, off, len=ret} ─▶ ring[1]
+     │   doorbell IRQ on core 1  ◀──────────────────────────  trigger_sgi_core(aff0=1, DOORBELL)
+     │  core1 reply handler: pop Reply{ret,off,len}
+     │  copyout bounce[off..off+ret] ─▶ ubuf      (core1's own user page)
+     │  mark caller READY; scheduler resumes it
+     │  release bounce slot
+  EL0:  read returns ret  ◀── caller wakes with bytes in ubuf
+```
+
+Key invariants this picture encodes:
+- **Shared-nothing holds at the data layer, not just control.** The bytes live in `ubuf` (core1
+  memory) and `kbuf` (core0 memory); they meet only in the **bounce region**, the single piece of
+  shared RAM either side may touch. Neither core dereferences a pointer into the other's partition.
+- **Blocking is ordinary.** The caller parks exactly like any I/O-blocked thread; the only
+  difference from a single-core kernel is the wake source — a peer's doorbell SGI instead of a
+  device IRQ. While it waits, core 1's (R3b) preemptive scheduler keeps its other threads running.
+- **Small args ride the message; bulk rides the bounce region.** A `ForwardSyscall` slot carries
+  the syscall number + scalar args + a `(offset,len)` into the bounce region; `read`/`write`/`send`
+  payloads that exceed a slot are chunked or pointed at the bounce region to avoid copy
+  amplification (§8.1 "Bulk").
+- **Inbound mirror.** `write`/`sendto` are the same diagram reversed: core 1 `copyin`s the user
+  buffer into the bounce region *before* the message, and core 0 consumes it directly — so each
+  core still touches only its own user memory.
+
 ---
 
 ## 11. Build profile & gating — `release-smp` (default-off)
@@ -667,7 +787,8 @@ Staged, each independently verifiable:
 | **R1 — writable replication** ✅ | Secondary gets a private `.data`/`.bss` at the kernel VA | `snapshot_pristine_data()` (first thing in `rust_start`) copies `.data`→`DATA_SNAPSHOT` before any mutation; `replicate_writable_window()` maps `[_data_start,_kernel_phys_end)` to private pages (`.data` from snapshot, `.bss` zeroed). **The descriptor (`MACHINE_CONFIG`, a `.bss` static) is the one thing that must stay SHARED** — replication skips it and maps it shared. Proof: a secondary mutates a shared static into its private copy; the BSP's copy stays pristine. |
 | **R2 — per-core PMM + heap** ✅ | Secondary runs `pmm::init`/`allocator::init` over its partition; `alloc` works, BSP PMM untouched | DONE. `PartitionBump` carves the secondary's whole bringup image (page tables + replicated `.data`/`.bss` + stack + PerCpu) from its OWN partition (never the BSP `pmm`); `build_isolated_table` identity-maps the partition as 2 MiB RW blocks and records the consumed prefix as `kernel_end`. The secondary then seeds a private heap just above `kernel_end` and runs the unchanged `allocator::init` + `pmm::init` over `[pbase, pbase+len_2mb)` — they resolve to its replicated `static`s, so nothing the BSP owns is touched. `smp::reserve_secondary_partitions` (called right after the BSP's `pmm::init`, before `mmu::init`) removes those ranges from the BSP pool so the two are disjoint. Proof: `run_r2_test` allocs a heap `Vec` + 16 PMM pages and posts the result to PerCpu; the BSP confirms in-partition + BSP-pool-unchanged (verified SMP=2/4). Did **not** call `akuma_exec::mmu::init` on a secondary (it writes the SHARED boot tables). |
 | **R3a — per-core COOPERATIVE scheduler** ✅ | Secondary runs `akuma_exec`'s scheduler per-core and switches between kernel threads via `yield_now` | DONE (SMP=2/4). `run_r3a_coop_test`: register the runtime locally (`build_exec_runtime` extracted from `main.rs`, canaries off, secondary stack bounds) since the BSP's `RUNTIME`/`CONFIG` cells are set post-snapshot and a secondary's replicated copy is pristine; `akuma_exec::mmu::set_boot_ttbr0_override(our table)` so spawned threads get OUR TTBR0, not the BSP's (`boot_ttbr0_addr` lives in `.data.boot`, *outside* the replicated writable window, so the asm cell can't be rewritten on a secondary); re-target the scheduler SGI at this PE (`gic::trigger_sgi` hardcodes TargetList bit 0 = BSP); install the real `exception_vector_table`; enable only the scheduler SGI; spawn 2 workers via `spawn_system_thread_fn` (the closure path builds a real `setup_fake_irq_frame` — the bare `spawn(extern fn)` path is register-based and incompatible with the stack-based scheduler) and `yield_now` between them. Proof: 2 threads × 8 yields = 16, then the M2 heartbeat/doorbell loop resumes. |
-| **R3b — per-core preemptive scheduler + syscalls** | Per-core timer preemption; syscalls trap to the (per-core) handlers | The timer PPI must route to the scheduler (today the secondary's timer only wakes the heartbeat WFI loop); SVC path on the per-core vectors. |
+| **R3b — per-core preemptive scheduler** ✅ | Per-core timer preempts kernel threads on a secondary | DONE (SMP=2/4). `run_r3b_preempt_test` reuses R3a's scheduler: registers a per-core timer handler via `irq::register_handler_no_gic` (the normal `register_handler` calls `gic::enable_irq`, which for INTID<32 pokes **core 0's** redistributor — faults on a secondary); runs on the real `exception_vector_table`; enables PPI 27 in its OWN redistributor + arms CNTV. The handler re-arms CNTV then rings the scheduler SGI **at itself** (`trigger_sched_sgi_self`) — same two-step as the BSP's `timer_irq_handler`. Proof: a preemptive spinner that never yields advances (~12 M iters) only because the timer preempts the never-yielding boot thread (which, being the cooperative idle thread, is preempted past `COOPERATIVE_TIMEOUT_US`=100 ms; run window 300 ms). |
+| **R3b-next — per-core syscalls** | SVC from EL0 traps to the (per-core) handlers | Folded into R4 — only meaningful once a user process runs on the secondary; `sync_el0_handler` on the per-core vectors + the syscall table resolve to replicated state. |
 | **R4 — process + forwarding (the demo)** | Spawn `/bin/hello` (then `curl`) pinned to core 1, forwarding `open`/`read`/`write`/sockets to core 0 (§10) | "exec is recursive forwarding": core 1 has no VFS, so loading the ELF forwards `open`/`read` to core 0. Console + sockets likewise. This is the §10 acceptance test. |
 
 **Why R1 is the keystone:** once `static`s are per-core, R2–R4 reuse the *existing*
@@ -677,11 +798,14 @@ kernel init/exec code unchanged — the per-core-ness lives entirely in the page
 
 Tracked here so it isn't lost; tackle after the R3b/R4 milestones, not inline.
 
-- **R3a leftovers.** After the cooperative self-test a secondary leaves a fully-initialized
-  scheduler + 2 terminated worker slots dormant (the heartbeat loop never yields again) — fine
-  for now. The `PERCPU_R3_STAGE` progress marker + BSP timeout print are kept as cheap living
-  diagnostics. R3b will swap the secondary's minimal `smp_vectors` for the real
-  `exception_vector_table` permanently and route the timer PPI to the scheduler.
+- **R3a/R3b leftovers.** Both scheduler self-tests are bounded probes: each stands the scheduler
+  up, proves a property (cooperative yield / timer preemption), then tears down (restores
+  `smp_vectors`, masks IRQs, R3b disables CNTV) and the secondary returns to the M2 heartbeat WFI
+  loop, leaving a dormant scheduler + terminated worker slots. The `PERCPU_R3_STAGE` marker + BSP
+  timeout print are kept as cheap living diagnostics. **R4** is where the secondary stops tearing
+  down: it will run on the real `exception_vector_table` permanently with the timer wired to the
+  scheduler as its steady-state loop, and host a real pinned process (the heartbeat/debt work
+  becomes one of its threads).
 
 - **Sweep deprecated code (general).** Do a pass over the kernel + crates for dead/deprecated
   code and remove it. (Done so far, 2026-06-29: removed the dead `switch_context` asm + its
