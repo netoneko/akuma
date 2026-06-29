@@ -696,6 +696,63 @@ Key invariants this picture encodes:
   buffer into the bounce region *before* the message, and core 0 consumes it directly — so each
   core still touches only its own user memory.
 
+### 10.3 Capabilities dispatch flow (as implemented)
+
+Every syscall a pinned process issues is classified **by the capability it touches** *before* any
+work, and that single classification decides who runs it. This is the generic forwarder: there is
+one forwarded-syscall message type, not one per syscall.
+
+```
+                 EL0 syscall N on a compute core (e.g. core 1)
+                 EL0 ──SVC──▶ that core's kernel (per-core vectors)
+                                    │
+                       ┌────────────▼─────────────┐
+                       │ capability_of(N)          │  classify by syscall number
+                       └────────────┬─────────────┘
+          ┌─────────────────────────┼───────────────────────────┐
+          │ Vfs / Net               │ (everything else)          │ Console
+          │ (forwardable)           │ Threading/Memory/Time/…     │ write(1/2,…)
+          ▼                         ▼                             ▼
+  ┌───────────────────┐   ┌──────────────────────┐   ┌──────────────────────────┐
+  │ caps map (§5):    │   │ LOCAL — handle on     │   │ ASYNC append (§8.2):     │
+  │ owner of this cap │   │ THIS core's kernel    │   │ copy bytes → per-core    │
+  └───────┬───────────┘   │ over its replicated   │   │ CONSOLE RING, return the │
+   Own=me │  Proxy(owner) │ PMM/POOL/proc table.  │   │ count NOW. No ack, no    │
+          │      │        │ getpid/clone/futex/   │   │ doorbell, no round-trip  │
+   ┌──────▼───┐  │        │ mmap/nanosleep/…      │   │ (fire-and-forget — an    │
+   │ handle   │  │        │ → NO cross-core msg   │   │ ack would defeat the     │
+   │ locally  │  │        └──────────────────────┘   │ point; §10.3 note).      │
+   └──────────┘  │                                    └──────────────────────────┘
+        ┌────────▼──────────────────────────────────┐
+        │ FORWARD (generic, §8.1): publish {nr,args} │
+        │ to fwd_call[me] + pointer bytes to         │
+        │ fwd_bounce[me]; ring owner; PARK caller.   │
+        │ Owner runs the REAL syscall on its own     │
+        │ resources, copies outbound bytes back,     │
+        │ replies ret; caller wakes, copyout, return.│
+        └────────────────────────────────────────────┘
+```
+
+In code (`src/smp.rs`):
+- **`capability_of(nr) -> {Vfs, Net, Local}`** — classifies the syscall number (using the kernel's
+  canonical `syscall::nr::*` constants, never magic numbers). Only **Vfs** and **Net** are
+  *forwardable*; everything else is **Local**.
+- **`capability_owner(self_idx, nr) -> Option<owner>`** — consults the caps map (Phase-0: core 0
+  owns Vfs + Net; other cores `Proxy` them). `Some(owner)` ⇒ forward; `None` ⇒ run locally (the cap
+  is `Local`, **or** this core `Own`s it). An `Absent` capability returns `-ENOSYS`.
+- **Threading/memory/time/signals fall straight through to the local kernel** — they resolve against
+  this core's replicated `PMM`/`POOL`/process table, so a pinned process spends *most* syscalls
+  local; forwarding is the exception taken only on a `Proxy`'d cap.
+- **Console is NOT in this map.** tty output is the §8.2 async append-ring: fire-and-forget, **no
+  drain acknowledgement** — the producer returns the byte count immediately and never learns when
+  the owner drained it. An ack would reintroduce the per-write round-trip the ring exists to avoid,
+  so by design there is none. `write(1/2,…)` therefore never takes the synchronous forward path.
+- **The owner side is one generic dispatcher** (`service_forwarded_syscall`): a match on the syscall
+  number that runs the real op against core 0's resources. open/read/close are implemented today
+  (the exec-fetch path); `write` and the socket set (`socket`/`connect`/`sendto`/`recvfrom`) slot in
+  as additional arms with **no new message type** — which is why `curl` is "add arms," not new
+  machinery.
+
 ---
 
 ## 11. Build profile & gating — `release-smp` (default-off)
@@ -903,6 +960,23 @@ Tracked here so it isn't lost; tackle after the R3b/R4 milestones, not inline.
   bringup verification (reading PerCpu markers). To make isolation symmetric, give the BSP a
   restricted TTBR0 like the secondaries and route its verification through the shared descriptor
   instead of direct peer reads. Until then, "shared-nothing" holds for secondaries only (§4.2).
+
+- **Caps map belongs in the descriptor (§5), not hardcoded.** `capability_owner` currently
+  hardcodes the Phase-0 split (core 0 owns Vfs + Net). Make `caps` a real per-core field in
+  `MachineConfig` — `[Capability×owner]` per core — read at runtime so the split is configurable
+  and stays re-pointable for fail-over (§12 leadership note).
+
+- **Use `syscall::nr::*` constants everywhere — no magic syscall numbers.** The generic forwarder's
+  dispatch table + classifier (`capability_of`, `service_forwarded_syscall`) now use the kernel's
+  canonical `syscall::nr` constants. Sweep the codebase for any remaining bare syscall-number
+  literals and replace them; honor this convention in new code.
+
+- **Boxes × VFS in a multikernel.** A `box` (container/namespace, `src/syscall/container.rs`) scopes
+  mounts/rootfs/fd-namespace for a process. When the process is pinned to a compute core but its VFS
+  is `Proxy`'d to the owner, decide where the namespace lives: the owner resolves paths, so the
+  box's mount table / chroot must be visible to (or forwarded with) the owner-side `openat` — likely
+  the forwarded `openat` carries the box id and the owner resolves within that box's namespace.
+  Open question; design before a real boxed process runs on a secondary.
 
 - **Per-core fd/socket affinity (forwarding-model invariant).** Because a process belongs to
   exactly one core (it's pinned, with its address space in that core's partition), every fd /
