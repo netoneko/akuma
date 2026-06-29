@@ -31,9 +31,11 @@ use akuma_exec::mmu::{attr_index, flags, phys_to_virt, MAIR_DEVICE_NGNRNE, MAIR_
 // module is the kernel glue (asm, PSCI, page tables, the pump).
 use akuma_smp::{
     partition, Command, ConsoleRing, CoreConfig, CoreStateMachine, Event, MachineConfig, Range,
-    ENF_FAULTED, ENF_LEAKED, ENF_TESTING, MAGIC, MAX_CORES, MSG_FWD_ECHO_REPLY, MSG_FWD_ECHO_REQ,
-    MSG_PRESSURE, MSG_REPAID, STATE_BOOTING, STATE_OFFLINE, STATE_ONLINE,
+    ENF_FAULTED, ENF_LEAKED, ENF_TESTING, FWD_BOUNCE_CAP, MAGIC, MAX_CORES, MSG_FWD_ECHO_REPLY,
+    MSG_FWD_ECHO_REQ, MSG_FWD_SYSCALL_REPLY, MSG_FWD_SYSCALL_REQ, MSG_PRESSURE, MSG_REPAID,
+    STATE_BOOTING, STATE_OFFLINE, STATE_ONLINE,
 };
+use spinning_top::Spinlock;
 use crate::console;
 use crate::pmm;
 
@@ -398,6 +400,12 @@ const PERCPU_USERTAB_PRIV_OK: usize = 120;
 /// Diagnostics: the PA the user table / restricted table resolve the probe VA to.
 const PERCPU_USERTAB_USER_PA: usize = 128;
 const PERCPU_USERTAB_REST_PA: usize = 136;
+
+/// Forwarded-exec fetch (R4b.4): 1 = the secondary fetched `/bin/hello`'s ELF header from
+/// the owner core's filesystem via forwarded openat/read/close and the magic matched.
+const PERCPU_EXEC_FETCH_OK: usize = 144;
+/// Diagnostics: bytes returned by the forwarded `read`.
+const PERCPU_EXEC_FETCH_N: usize = 152;
 
 /// Snapshot pristine `.data` — MUST be the first thing `rust_start` does, before any
 /// code mutates a `.data`/`.bss` static. Copies `[_data_start, __bss_start)` into
@@ -1096,6 +1104,10 @@ pub fn bringup_secondaries(ram_base: usize, ram_size: usize) {
         }
     }
 
+    // R4b.4: each secondary fetches /bin/hello's ELF header from core 0's filesystem via
+    // forwarded openat/read/close (the generic syscall forwarder) — "exec is recursive
+    // forwarding." It runs post-bringup (once the secondary's forward-server is up) and
+    // reports through its own console ring, so there is no BSP-side reader here.
     crate::safe_print!(48, "[SMP] bringup complete\n");
 
     monitor_liveness(cfg, num_cores, bsp_idx);
@@ -1971,25 +1983,18 @@ fn secondary_steady_state(cfg: &MachineConfig, idx: usize, percpu: usize, mut sm
     arm_cntv_timer();
     crate::irq::enable_irqs();
 
-    // R4b.2 post-bringup forward probe: once the BSP's persistent forward-server thread
-    // is live (`fwd_server_ready`), send ONE echo round-trip from this idle loop and
-    // verify the reply — proving the long-running THREAD (not the transient bringup wait
-    // loop, long exited) services cross-core forwards. State: 0=not sent, 1=awaiting
-    // reply, 2=done. A distinct nonce keeps it unambiguous vs the R4a bringup probe.
-    let probe_nonce = 0xB2B2_0000_0000_0000u64 | idx as u64;
-    let mut probe = 0u8;
-    let mut probe_payload = [0u8; R4A_LEN];
-    for (i, b) in probe_payload.iter_mut().enumerate() {
-        *b = i as u8;
-    }
+    // R4b.4 post-bringup proof: once the BSP's persistent forward-server thread is live
+    // (`fwd_server_ready`), run ONE forwarded-exec fetch (openat/read/close of /bin/hello
+    // over the generic syscall forwarder) — "exec is recursive forwarding." Done once.
+    let mut fetch_done = false;
 
     // Idle/driver loop on the boot thread: advance the heartbeat, drain the inbox (debt
-    // state machine — shedding `Repay` to creditors over the shared rings, plus the R4b.2
-    // probe reply — we only ever touch shared rings, never a peer's private state), fire
-    // the probe when ready, then SLEEP (`WFI`) until the next interrupt. The per-core timer
-    // still preempts to any OTHER thread that becomes runnable (R4b.3 spawns the first
-    // pinned EL0 process here); until then this core stays near-idle instead of pegging a
-    // host CPU with scheduler-SGI churn.
+    // state machine — shedding `Repay` to creditors over the shared rings; we only ever
+    // touch shared rings, never a peer's private state), run the one-shot exec-fetch probe
+    // when the forward-server is up, then SLEEP (`WFI`) until the next interrupt. The
+    // per-core timer still preempts to any OTHER thread that becomes runnable (R4b.3b
+    // spawns the first pinned EL0 process here); until then this core stays near-idle
+    // instead of pegging a host CPU with scheduler-SGI churn.
     loop {
         if let Some(hb) = cfg.heartbeat.get(idx) {
             hb.fetch_add(1, Ordering::Relaxed);
@@ -1997,23 +2002,6 @@ fn secondary_steady_state(cfg: &MachineConfig, idx: usize, percpu: usize, mut sm
         if let Some(inbox) = cfg.inboxes.get(idx) {
             while let Some(m) = inbox.pop() {
                 match m.kind {
-                    MSG_FWD_ECHO_REPLY if probe == 1 && m.v1 == probe_nonce => {
-                        // copyout + verify the BSP transform (byte + 1), then report via
-                        // our console ring (drained to the UART by the BSP drainer).
-                        let ok = cfg.fwd_bounce.get(idx).is_some_and(|b| {
-                            let mut got = [0u8; R4A_LEN];
-                            b.read(&mut got);
-                            m.v0 as usize == R4A_LEN
-                                && got.iter().enumerate().all(|(i, &x)| x == (i as u8).wrapping_add(1))
-                        });
-                        crate::safe_print!(
-                            80,
-                            "[core {}] post-bringup forward round-trip {}\n",
-                            idx,
-                            if ok { "PASS" } else { "FAIL" }
-                        );
-                        probe = 2;
-                    }
                     MSG_PRESSURE | MSG_REPAID => {
                         let ev = if m.kind == MSG_PRESSURE {
                             Event::Pressure { from: m.from }
@@ -2033,16 +2021,12 @@ fn secondary_steady_state(cfg: &MachineConfig, idx: usize, percpu: usize, mut sm
             }
         }
 
-        // Fire the probe once, after the forward-server thread reports ready (so the
-        // request can only be serviced by the thread, never the exited bringup loop).
-        let want_probe = probe == 0 && cfg.fwd_server_ready.load(Ordering::Acquire) == 1;
-        if want_probe
-            && let (Some(bounce), Some(bsp_inbox)) = (cfg.fwd_bounce.get(idx), cfg.inboxes.first())
-        {
-            bounce.write(&probe_payload);
-            if bsp_inbox.push(MSG_FWD_ECHO_REQ, idx as u32, R4A_LEN as u64, probe_nonce) {
-                probe = 1;
-            }
+        // Run the exec-fetch probe ONCE, after the forward-server thread reports ready (so
+        // the forwarded syscalls can only be serviced by the thread, never the exited
+        // bringup loop). Blocking (a few round-trips); fine here — no other thread runs yet.
+        if !fetch_done && cfg.fwd_server_ready.load(Ordering::Acquire) == 1 {
+            run_exec_fetch_probe(cfg, idx, percpu);
+            fetch_done = true;
         }
 
         // Idle: SLEEP until the next interrupt rather than busy-yielding. A tight
@@ -2055,7 +2039,7 @@ fn secondary_steady_state(cfg: &MachineConfig, idx: usize, percpu: usize, mut sm
         // drain can't be lost (its doorbell SGI stays pending and WFI returns at once).
         crate::irq::disable_irqs();
         let pending = cfg.inboxes.get(idx).is_some_and(|r| !r.is_empty())
-            || (probe == 0 && cfg.fwd_server_ready.load(Ordering::Acquire) == 1);
+            || (!fetch_done && cfg.fwd_server_ready.load(Ordering::Acquire) == 1);
         if pending {
             crate::irq::enable_irqs();
             continue;
@@ -2064,6 +2048,125 @@ fn secondary_steady_state(cfg: &MachineConfig, idx: usize, percpu: usize, mut sm
         unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
         crate::irq::enable_irqs();
     }
+}
+
+/// OS capability a syscall touches, for the dispatch decision (docs/MULTIKERNEL.md
+/// §10.1). Only `Vfs`/`Net` are *forwardable* — they're routed by the caps map (Own =>
+/// local, Proxy(owner) => forward to owner). Everything else (threads, memory, futexes,
+/// time, signals, getpid…) is `Local`: it falls through to THIS core's own kernel,
+/// resolving against its replicated state. **Console is deliberately NOT here** — tty
+/// output is fire-and-forget over the §8.2 per-core append ring, not a synchronous
+/// forwarded syscall, so `write(1/2,…)` never takes this path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Capability {
+    Vfs,
+    Net,
+    Local,
+}
+
+/// Classify a syscall number into the capability that decides its dispatch, using the
+/// kernel's canonical `syscall::nr` constants (no magic numbers). A first cut covering the
+/// exec-fetch + socket sets; extend as more syscalls forward.
+fn capability_of(nr: u64) -> Capability {
+    use crate::syscall::nr;
+    match nr {
+        // VFS: path/inode/fd I/O against a filesystem.
+        nr::OPENAT | nr::CLOSE | nr::READ | nr::WRITE | nr::LSEEK | nr::FSTAT
+        | nr::GETDENTS64 | nr::READLINKAT | nr::FCNTL => Capability::Vfs,
+        // Net: sockets.
+        nr::SOCKET | nr::BIND | nr::CONNECT | nr::SENDTO | nr::RECVFROM | nr::LISTEN
+        | nr::ACCEPT | nr::SETSOCKOPT | nr::GETSOCKOPT | nr::SHUTDOWN => Capability::Net,
+        _ => Capability::Local,
+    }
+}
+
+/// Where a syscall on core `self_idx` must run, per the caps map. `None` = handle locally
+/// (the syscall's capability is `Local`, or this core OWNS it); `Some(owner)` = forward to
+/// `owner`. Phase-0 split (docs §10): core 0 owns VFS + Net; every other core proxies them
+/// to core 0. (The caps map is hardcoded to Phase-0 here; §5 makes it a descriptor field.)
+fn capability_owner(self_idx: usize, nr: u64) -> Option<usize> {
+    const OWNER: usize = 0; // Phase-0: core 0 owns VFS + Net
+    match capability_of(nr) {
+        Capability::Vfs | Capability::Net if self_idx != OWNER => Some(OWNER),
+        _ => None,
+    }
+}
+
+/// Secondary side of a forwarded syscall (R4b.4): publish `nr` + `args` (and an optional
+/// inbound buffer) to this core's `fwd_call`/`fwd_bounce`, ring the owner, and spin (time-
+/// bounded) for the matching reply. Returns the syscall's return value (Linux errno-
+/// encoded). Blocking — used by the one-shot exec-fetch probe; the real EL0 path (R4b.3b)
+/// will PARK the calling thread on the reply instead of spinning.
+fn forward_syscall(cfg: &MachineConfig, idx: usize, owner: usize, nr: u64, args: &[u64; 6], in_buf: Option<&[u8]>) -> u64 {
+    let (Some(call), Some(bounce), Some(owner_inbox), Some(my_inbox)) = (
+        cfg.fwd_call.get(idx),
+        cfg.fwd_bounce.get(idx),
+        cfg.inboxes.get(owner),
+        cfg.inboxes.get(idx),
+    ) else {
+        return enc_err(38); // ENOSYS — no transport
+    };
+    if let Some(b) = in_buf {
+        bounce.write(b);
+    }
+    call.set(nr, args);
+    if !owner_inbox.push(MSG_FWD_SYSCALL_REQ, idx as u32, 0, 0) {
+        return enc_err(11); // EAGAIN — owner inbox full
+    }
+    let deadline = crate::timer::uptime_us() + 1_000_000; // 1s safety bound
+    while crate::timer::uptime_us() < deadline {
+        // No other reply is expected here (calls are sequential); drop anything else.
+        if let Some(m) = my_inbox.pop()
+            && m.kind == MSG_FWD_SYSCALL_REPLY
+            && m.v1 == nr
+        {
+            return m.v0;
+        }
+        core::hint::spin_loop();
+    }
+    enc_err(110) // ETIMEDOUT
+}
+
+/// One-shot R4b.4 proof ("exec is recursive forwarding"): the secondary FETCHES
+/// `/bin/hello`'s ELF header from the owner core's filesystem entirely via forwarded
+/// syscalls — `openat` -> `read` -> `close`, each classified VFS -> Proxy(core 0) ->
+/// forwarded — and verifies the returned bytes carry the ELF magic. Records 1/0 to PerCpu.
+/// No EL0 yet (R4b.3b runs the actual process); this proves the loader's data path.
+fn run_exec_fetch_probe(cfg: &MachineConfig, idx: usize, percpu: usize) {
+    use crate::syscall::nr;
+    let path = b"/bin/hello\0";
+    // Route via the caps map — these are VFS syscalls, so on a secondary they forward to
+    // the owner; on the owner they'd be local (we only reach here on a secondary).
+    let mut magic_ok = false;
+    let mut n = 0u64;
+    if let Some(owner) = capability_owner(idx, nr::OPENAT) {
+        let h = forward_syscall(cfg, idx, owner, nr::OPENAT, &[0, 0, 0, 0, 0, 0], Some(path));
+        if (h as i64) >= 0 {
+            n = forward_syscall(cfg, idx, owner, nr::READ, &[h, 0, 64, 0, 0, 0], None);
+            if (n as i64) >= 4 {
+                let mut hdr = [0u8; 4];
+                if let Some(bounce) = cfg.fwd_bounce.get(idx) {
+                    bounce.read(&mut hdr);
+                }
+                magic_ok = hdr == [0x7f, b'E', b'L', b'F'];
+            }
+            forward_syscall(cfg, idx, owner, nr::CLOSE, &[h, 0, 0, 0, 0, 0], None);
+        }
+    }
+    // SAFETY: PerCpu page is mapped RW in this core's restricted table.
+    unsafe {
+        core::ptr::write_volatile((percpu + PERCPU_EXEC_FETCH_N) as *mut u64, n);
+        core::ptr::write_volatile((percpu + PERCPU_EXEC_FETCH_OK) as *mut u64, u64::from(magic_ok));
+    }
+    // Report via our own console ring (drained to the UART by the BSP drainer) — the probe
+    // runs post-bringup, so a BSP-side reader at the Online barrier would be too early.
+    crate::safe_print!(
+        112,
+        "[core {}] exec-fetch: /bin/hello ELF header via forwarded openat/read/close -> {} bytes, magic {}\n",
+        idx,
+        n,
+        if magic_ok { "PASS" } else { "FAIL" }
+    );
 }
 
 // ============================================================================
@@ -2261,31 +2364,146 @@ fn verify_user_table_kernel_window(pbase: usize, plen: usize, percpu: usize) {
     // kernel PAs it pointed at were never tracked as user frames, so they are untouched.
 }
 
-/// BSP side of forward serving: drain its inbox and service `MSG_FWD_ECHO_REQ`s. Called
-/// repeatedly from the bringup online-wait loop so a secondary spinning on its reply
-/// can't deadlock against the BSP spinning on that secondary's `Online`. The transform
-/// (byte + 1) stands in for the real owner-side syscall (VFS `read`, socket op) of
-/// R4b/R4c; the data path it exercises — bounce region + reply ring — is the real one.
+/// BSP side of forward serving: drain its inbox and service forward requests on behalf of
+/// compute cores that don't own a capability (§8.1/§10.1). Two kinds — `MSG_FWD_ECHO_REQ`
+/// (the R4a transport probe, byte + 1 transform) and `MSG_FWD_SYSCALL_REQ` (a GENERIC
+/// forwarded syscall: read `fwd_call[from]` nr + args and `fwd_bounce[from]` pointer-arg
+/// bytes, run the REAL syscall on the owner's own resources, copy any outbound bytes back,
+/// reply with the return value — one path for open/read/write/sockets, so `curl` rides the
+/// same dispatch with more nr arms). Called both from the bringup online-wait loop (ECHO
+/// only — real targets aren't up yet) and, post-bringup, from the persistent forward-server
+/// thread (where the VFS/net live).
 fn service_fwd_requests(cfg: &MachineConfig, bsp_idx: usize) -> usize {
     let Some(bsp_inbox) = cfg.inboxes.get(bsp_idx) else {
         return 0;
     };
     let mut served = 0usize;
     while let Some(m) = bsp_inbox.pop() {
-        if m.kind != MSG_FWD_ECHO_REQ {
-            continue; // debt-protocol traffic is post-bringup; ignore anything else here
-        }
         let from = m.from as usize;
-        let len = m.v0 as usize;
-        if let Some(bounce) = cfg.fwd_bounce.get(from) {
-            bounce.map_in_place(len, |b| b.wrapping_add(1));
+        match m.kind {
+            MSG_FWD_ECHO_REQ => {
+                let len = m.v0 as usize;
+                if let Some(bounce) = cfg.fwd_bounce.get(from) {
+                    bounce.map_in_place(len, |b| b.wrapping_add(1));
+                }
+                if let Some(reply) = cfg.inboxes.get(from) {
+                    reply.push(MSG_FWD_ECHO_REPLY, bsp_idx as u32, m.v0, m.v1);
+                }
+                served += 1;
+            }
+            MSG_FWD_SYSCALL_REQ => {
+                let (nr, ret) = service_forwarded_syscall(cfg, from);
+                if let Some(reply) = cfg.inboxes.get(from) {
+                    reply.push(MSG_FWD_SYSCALL_REPLY, bsp_idx as u32, ret, nr);
+                }
+                served += 1;
+            }
+            _ => {} // debt-protocol traffic is handled elsewhere
         }
-        if let Some(reply) = cfg.inboxes.get(from) {
-            reply.push(MSG_FWD_ECHO_REPLY, bsp_idx as u32, m.v0, m.v1);
-        }
-        served += 1;
     }
     served
+}
+
+/// Encode a negative result as the Linux ABI does, so the forwarding core sees `-errno`.
+fn enc_err(errno: i64) -> u64 {
+    (-errno) as u64
+}
+
+/// Owner-side (BSP) forwarded fd. A forwarded `openat` records the path here; subsequent
+/// forwarded `read`s advance `offset`. The real file state lives on the OWNER core (the
+/// fd-affinity invariant, docs §16) — the forwarding core holds only the opaque handle
+/// (this slot's index). Path-based under the hood (`crate::fs` is path+offset), so no
+/// kernel fd object is held; sockets (R4b.5) will hold a real socket handle here instead.
+struct ForwardedFd {
+    path: [u8; FWD_BOUNCE_CAP],
+    path_len: usize,
+    offset: usize,
+}
+const FWD_FD_MAX: usize = 32;
+static FORWARDED_FDS: Spinlock<[Option<ForwardedFd>; FWD_FD_MAX]> =
+    Spinlock::new([const { None }; FWD_FD_MAX]);
+
+/// Generic owner-side syscall dispatch (§8.1/§10.1): read `fwd_call[from]` (nr + args) and
+/// `fwd_bounce[from]` (any pointer buffer), run the REAL operation on the owner's own
+/// resources, copy outbound bytes back to the bounce, and return `(nr, ret)`. Today it
+/// services openat/read/close against the BSP's VFS (the exec-fetch path); write + socket
+/// arms slot in here with no new message type. Unknown syscalls return `-ENOSYS`.
+fn service_forwarded_syscall(cfg: &MachineConfig, from: usize) -> (u64, u64) {
+    use crate::syscall::nr;
+    let (Some(call), Some(bounce)) = (cfg.fwd_call.get(from), cfg.fwd_bounce.get(from)) else {
+        return (0, enc_err(38)); // ENOSYS — no slot for this core
+    };
+    let (sysno, args) = call.get();
+    let ret = match sysno {
+        // openat(dirfd, path, flags, mode): path (NUL-terminated) is in the bounce.
+        nr::OPENAT => {
+            let mut raw = [0u8; FWD_BOUNCE_CAP];
+            bounce.read(&mut raw);
+            let plen = raw.iter().position(|&b| b == 0).unwrap_or(FWD_BOUNCE_CAP);
+            match core::str::from_utf8(&raw[..plen]) {
+                Ok(path) if crate::fs::file_size(path).is_ok() => {
+                    let mut fds = FORWARDED_FDS.lock();
+                    match fds.iter().position(Option::is_none) {
+                        Some(h) => {
+                            let mut fd = ForwardedFd { path: [0; FWD_BOUNCE_CAP], path_len: plen, offset: 0 };
+                            fd.path[..plen].copy_from_slice(&raw[..plen]);
+                            fds[h] = Some(fd);
+                            h as u64
+                        }
+                        None => enc_err(24), // EMFILE
+                    }
+                }
+                Ok(_) => enc_err(2),   // ENOENT
+                Err(_) => enc_err(22), // EINVAL (bad path bytes)
+            }
+        }
+        // read(handle, buf, len): args[0] = handle, args[2] = len. Bytes ← bounce.
+        nr::READ => {
+            let h = args[0] as usize;
+            let want = (args[2] as usize).min(FWD_BOUNCE_CAP);
+            // Snapshot path + offset under the lock, then read WITHOUT holding it (the VFS
+            // may yield); re-lock only to advance the offset.
+            let snap = {
+                let fds = FORWARDED_FDS.lock();
+                fds.get(h).and_then(Option::as_ref).map(|fd| {
+                    let mut p = [0u8; FWD_BOUNCE_CAP];
+                    p[..fd.path_len].copy_from_slice(&fd.path[..fd.path_len]);
+                    (p, fd.path_len, fd.offset)
+                })
+            };
+            match snap {
+                Some((p, plen, off)) => {
+                    let path = core::str::from_utf8(&p[..plen]).unwrap_or("");
+                    let mut buf = [0u8; FWD_BOUNCE_CAP];
+                    match crate::fs::read_at(path, off, &mut buf[..want]) {
+                        Ok(n) => {
+                            bounce.write(&buf[..n]);
+                            if let Some(fd) = FORWARDED_FDS.lock().get_mut(h).and_then(Option::as_mut) {
+                                fd.offset += n;
+                            }
+                            n as u64
+                        }
+                        Err(_) => enc_err(5), // EIO
+                    }
+                }
+                None => enc_err(9), // EBADF
+            }
+        }
+        // close(handle): release the owner-side fd slot.
+        nr::CLOSE => {
+            let h = args[0] as usize;
+            let mut fds = FORWARDED_FDS.lock();
+            match fds.get_mut(h) {
+                Some(slot) => {
+                    *slot = None;
+                    0
+                }
+                None => enc_err(9), // EBADF
+            }
+        }
+        _ => enc_err(38), // ENOSYS — arm not implemented yet
+    };
+    (sysno, ret)
 }
 
 /// Spawn the BSP's persistent forward-server (R4b.2). A SYSTEM thread (kernel stack,

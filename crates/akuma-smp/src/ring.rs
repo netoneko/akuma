@@ -23,6 +23,18 @@ pub const MSG_FWD_ECHO_REQ: u32 = 3;
 /// Forward reply: `v0` = byte length written back to `fwd_bounce[from]`, `v1` = nonce.
 pub const MSG_FWD_ECHO_REPLY: u32 = 4;
 
+// Generic forwarded syscall (docs/MULTIKERNEL.md §8.1/§10.1 — "exec is recursive
+// forwarding"): a compute core that doesn't own a capability ships ONE message carrying a
+// whole syscall — the number + scalar args live in `fwd_call[from]`; any pointer
+// argument's bytes ride `fwd_bounce[from]` (copyin before for inbound buffers; copyout
+// after for outbound). The owner runs the REAL syscall and replies with the return value.
+// open/read/write/close/sockets all use this single path — no per-syscall message types.
+/// Forwarded-syscall request: read `fwd_call[from]` (`nr` + `args`) + `fwd_bounce[from]`.
+pub const MSG_FWD_SYSCALL_REQ: u32 = 5;
+/// Forwarded-syscall reply: `v0` = the syscall return value (errno-encoded), `v1` = `nr`
+/// echoed so the caller matches the reply to its outstanding request.
+pub const MSG_FWD_SYSCALL_REPLY: u32 = 6;
+
 /// Inbox capacity. Small — the coordination message rate is low; protocol traffic
 /// is a handful of messages per event, drained every loop pass.
 pub const RING_CAP: usize = 8;

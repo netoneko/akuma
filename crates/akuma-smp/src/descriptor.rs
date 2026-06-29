@@ -7,7 +7,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64};
 
 use crate::console_ring::ConsoleRing;
-use crate::fwd_bounce::FwdBounce;
+use crate::fwd_bounce::{ForwardCall, FwdBounce};
 use crate::ring::Ring;
 
 /// Maximum physical PEs the descriptor describes.
@@ -107,6 +107,9 @@ pub struct MachineConfig {
     /// dereferences a pointer into the other's partition. Access is serialized by the
     /// request/reply handshake on `inboxes`.
     pub fwd_bounce: [FwdBounce; MAX_CORES],
+    /// Per-core forwarded-syscall request frame (§8.1/§10.1): the syscall number + scalar
+    /// args a compute core ships to the owner; pointer-argument bytes ride `fwd_bounce`.
+    pub fwd_call: [ForwardCall; MAX_CORES],
     /// Set to 1 by the BSP's persistent forward-server thread once it is live and
     /// draining `inboxes[bsp]` (R4b.2). Secondaries poll this before sending a
     /// post-bringup forward request, so the request is provably serviced by the
@@ -138,6 +141,7 @@ impl MachineConfig {
             inboxes: [const { Ring::new() }; MAX_CORES],
             console_rings: [const { ConsoleRing::new() }; MAX_CORES],
             fwd_bounce: [const { FwdBounce::new() }; MAX_CORES],
+            fwd_call: [const { ForwardCall::new() }; MAX_CORES],
             fwd_server_ready: AtomicU32::new(0),
         }
     }

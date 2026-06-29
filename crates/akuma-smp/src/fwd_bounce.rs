@@ -15,11 +15,61 @@
 //! as [`crate::ConsoleRing`]); the loads/stores are `Relaxed` because the ring is the
 //! ordering edge.
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 /// Bytes per core in the forwarding bounce region. Sized to hold a path or a single
 /// forwarded `read`/`write` chunk; larger transfers loop (§8.1 "Bulk").
 pub const FWD_BOUNCE_CAP: usize = 256;
+
+/// Number of scalar syscall arguments a forwarded call carries (matches the AArch64
+/// syscall ABI: x0–x5).
+pub const FWD_CALL_ARGS: usize = 6;
+
+/// One core's forwarded-syscall request frame in the shared descriptor — the control half
+/// of generic syscall forwarding (§8.1/§10.1).
+///
+/// Holds the syscall number + its scalar args; any pointer argument's bytes travel
+/// separately in the core's [`FwdBounce`] slot. Like the bounce, it carries no internal
+/// synchronization — the [`crate::Ring`] handshake (`ready` Release/Acquire) is the
+/// publish edge, so the loads/stores are `Relaxed`.
+#[repr(C)]
+pub struct ForwardCall {
+    nr: AtomicU64,
+    args: [AtomicU64; FWD_CALL_ARGS],
+}
+
+impl Default for ForwardCall {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ForwardCall {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            nr: AtomicU64::new(0),
+            args: [const { AtomicU64::new(0) }; FWD_CALL_ARGS],
+        }
+    }
+
+    /// Publish a syscall number + args (the forwarding core, before pushing the request).
+    pub fn set(&self, nr: u64, args: &[u64; FWD_CALL_ARGS]) {
+        self.nr.store(nr, Ordering::Relaxed);
+        for (slot, &a) in self.args.iter().zip(args.iter()) {
+            slot.store(a, Ordering::Relaxed);
+        }
+    }
+
+    /// Read back the syscall number + args (the owner core, on servicing the request).
+    pub fn get(&self) -> (u64, [u64; FWD_CALL_ARGS]) {
+        let mut args = [0u64; FWD_CALL_ARGS];
+        for (out, slot) in args.iter_mut().zip(self.args.iter()) {
+            *out = slot.load(Ordering::Relaxed);
+        }
+        (self.nr.load(Ordering::Relaxed), args)
+    }
+}
 
 /// One core's bounce slot in the shared descriptor.
 #[repr(C)]
