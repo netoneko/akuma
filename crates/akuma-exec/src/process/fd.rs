@@ -113,6 +113,14 @@ impl SharedFdTable {
                 FileDescriptor::PidFd(pidfd_id) => {
                     (runtime().pidfd_close)(pidfd_id);
                 }
+                FileDescriptor::RemoteFd { owner, handle, kind } => {
+                    // Forward a close to the owner core so it frees the backing file/socket
+                    // (multikernel §8.1). No-op on a build without the hook (BSP/single-kernel,
+                    // where RemoteFd is never constructed anyway).
+                    if let Some(close) = runtime().remote_fd_close {
+                        close(owner, handle, kind);
+                    }
+                }
                 _ => {}
             }
         }

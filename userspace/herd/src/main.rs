@@ -956,13 +956,21 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
             }
             return;
         }
-        let ok = core_init(config.core, &config.command);
+        // The activation message carries the WHOLE command line (program + args), space-
+        // separated; the target core's kernel splits it back into argv before spawning (the
+        // pinned process gets its arguments, e.g. `curl -sS https://ifconfig.me`).
+        let mut cmdline = config.command.clone();
+        for a in &config.args {
+            cmdline.push(' ');
+            cmdline.push_str(a);
+        }
+        let ok = core_init(config.core, &cmdline);
         if let Some(svc) = state.services.get_mut(name) {
             if ok {
                 print("[herd] core_init(");
                 print_dec(config.core as usize);
                 print(") requested: ");
-                print(&config.command);
+                print(&cmdline);
                 print("\n");
                 // No local pid — the process runs on the core. A oneshot pinned service
                 // goes terminal (Completed) immediately (it runs once on its core, and

@@ -4,6 +4,7 @@
 #
 # Usage: ./scripts/populate_disk.sh [--bin-only] [--with-apk] [--with-musl-dev] [--with-rust-toolchain]
 #   --bin-only             Only update /bin directory (faster for development)
+#   --etc-only             Only update /etc directory (faster for development)
 #   --with-apk             Pre-install Alpine busybox package (sets up symlinks via apk)
 #   --with-musl-dev        Pre-install musl-dev (C headers + static libs) and extract
 #                          libtcc1.tar — disk boots ready for tcc -static without apk add
@@ -32,6 +33,10 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --bin-only)
             BIN_ONLY=true
+            shift
+            ;;
+        --etc-only)
+            ETC_ONLY=true
             shift
             ;;
         --with-apk)
@@ -77,7 +82,20 @@ if [ "$BIN_ONLY" = true ]; then
         echo "/bin contents:"
         ls -la /mnt/disk/bin/
     '
-else
+ elif [ "$ETC_ONLY" = true ]; then
+    echo "Updating /etc in $DISK_IMG..."
+    COPY_CMD='
+        # Only copy etc directory
+        echo "Copying etc/..."
+        rm -rf /mnt/disk/etc/*
+        cp -rv /bootstrap/etc/* /mnt/disk/etc/
+
+        # List bin contents
+        echo ""
+        echo "/bin contents:"
+        ls -la /mnt/disk/etc/
+    '
+ else
     echo "Populating $DISK_IMG with contents of $BOOTSTRAP_DIR..."
     COPY_CMD='
         # Wipe /tmp so VM-generated artifacts from prior runs do not persist.

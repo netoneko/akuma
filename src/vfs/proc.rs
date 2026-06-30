@@ -135,6 +135,11 @@ impl ProcFilesystem {
             FileDescriptor::Stderr => String::from("/dev/stderr"),
             FileDescriptor::ChildStdout(child_pid) => format!("pipe:[child:{child_pid}]"),
             FileDescriptor::PidFd(id) => format!("anon_inode:[pidfd:{id}]"),
+            // Multikernel: a Proxy'd file/socket living on the owner core (§8.1).
+            FileDescriptor::RemoteFd { owner, handle, kind } => match kind {
+                akuma_exec::process::RemoteKind::Vfs => format!("remote-file:[core{owner}:{handle}]"),
+                akuma_exec::process::RemoteKind::Socket => format!("socket:[remote:core{owner}:{handle}]"),
+            },
         }
     }
 }

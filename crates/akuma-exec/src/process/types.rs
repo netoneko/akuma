@@ -178,6 +178,25 @@ pub enum FileDescriptor {
     TimerFd(u32),
     EpollFd(u32),
     PidFd(u32),
+    /// A handle that lives on ANOTHER kernel — the capability owner core (multikernel
+    /// §8.1/§10, docs/MULTIKERNEL.md). The real file or socket is on `owner`; this core
+    /// holds only the opaque `handle` (an index into the owner's forwarded-fd table).
+    /// `read`/`write`/`close`/`lseek`/`fstat` and the socket-family syscalls on this fd
+    /// are forwarded to `owner` over the cross-core ring + bounce; local fds are untouched.
+    /// Constructed only on a secondary core whose VFS/Net are `Proxy`'d to the owner.
+    /// Unconditional (like `Tap`/`RumpSocket`) so non-`smp` builds still match exhaustively.
+    RemoteFd { owner: u16, handle: u32, kind: RemoteKind },
+}
+
+/// Which proxied capability a [`FileDescriptor::RemoteFd`] handle belongs to, so the
+/// per-fd forwarder picks the right owner-side dispatch (a forwarded `read` on a VFS
+/// handle is a file read; on a `Socket` handle it is a socket `recv`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteKind {
+    /// Backed by the owner core's filesystem (a forwarded `openat`).
+    Vfs,
+    /// Backed by the owner core's network stack (a forwarded `socket`).
+    Socket,
 }
 
 /// Cached directory entry for stable getdents64 enumeration.

@@ -1123,6 +1123,21 @@ pub(super) fn sys_getrandom(ptr: u64, len: usize) -> u64 {
     while remaining > 0 {
         let chunk = remaining.min(256);
         let mut kernel_buf = alloc::vec![0u8; chunk];
+        // On a secondary core the RNG device lives on the owner; forward for entropy (§8.1).
+        #[cfg(kernel_smp)]
+        if crate::smp::is_on_secondary() {
+            let r = crate::smp::fwd_getrandom(&mut kernel_buf);
+            if (r as i64) <= 0 {
+                return EIO;
+            }
+            let got = (r as usize).min(chunk);
+            if unsafe { copy_to_user_safe(current_ptr as *mut u8, kernel_buf.as_ptr(), got).is_err() } {
+                return EFAULT;
+            }
+            remaining -= got;
+            current_ptr += got as u64;
+            continue;
+        }
         if crate::rng::fill_bytes(&mut kernel_buf).is_ok() {
             if unsafe { copy_to_user_safe(current_ptr as *mut u8, kernel_buf.as_ptr(), chunk).is_err() } {
                 return EFAULT;

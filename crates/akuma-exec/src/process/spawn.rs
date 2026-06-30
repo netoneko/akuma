@@ -365,6 +365,15 @@ pub fn spawn_process_with_channel_ext(
 /// `Process::from_elf`, which a secondary sets when it initializes its runtime. So this is
 /// the SAME loader the BSP uses — the per-core-ness lives entirely in that hook + page tables.
 pub fn spawn_process_from_image(name: &str, elf_data: &[u8]) -> Result<(usize, Pid), String> {
+    spawn_process_from_image_with_args(name, &[name.to_string()], elf_data)
+}
+
+/// Like [`spawn_process_from_image`] but with an explicit `argv` (the pinned-process path
+/// on a multikernel secondary, where the command line — program + args — arrives in the
+/// `core_init` activation message and the ELF is fetched over forwarded VFS; §10 Part B).
+/// `argv[0]` is conventionally the program name. The process's `ProcessInfo.args` is set so
+/// userspace sees its arguments (e.g. `curl -sS https://ifconfig.me`).
+pub fn spawn_process_from_image_with_args(name: &str, argv: &[String], elf_data: &[u8]) -> Result<(usize, Pid), String> {
     if crate::threading::user_threads_available() == 0 {
         return Err("No available user threads for image execution".into());
     }
@@ -372,7 +381,11 @@ pub fn spawn_process_from_image(name: &str, elf_data: &[u8]) -> Result<(usize, P
         return Err("Kernel memory low, cannot spawn image".into());
     }
 
-    let full_args = alloc::vec![name.to_string()];
+    let full_args: Vec<String> = if argv.is_empty() {
+        alloc::vec![name.to_string()]
+    } else {
+        argv.to_vec()
+    };
     let full_env: Vec<String> = DEFAULT_ENV.iter().map(|s| String::from(*s)).collect();
 
     let mut process = Process::from_elf(name, &full_args, &full_env, elf_data, None)
@@ -385,9 +398,8 @@ pub fn spawn_process_from_image(name: &str, elf_data: &[u8]) -> Result<(usize, P
     let channel = Arc::new(ProcessChannel::new());
     channel.set_terminal(false);
     process.channel = Some(channel.clone());
-    // No extra argv beyond the program name (this entry takes none), so the ProcessInfo
-    // args list is empty — matching a bare spawn with no arguments.
-    process.args = Vec::new();
+    // ProcessInfo args = the arguments after argv[0] (empty for a bare spawn).
+    process.args = full_args.get(1..).map(<[String]>::to_vec).unwrap_or_default();
     process.spawner_pid = read_current_pid();
 
     let pid = process.pid;

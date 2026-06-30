@@ -7,7 +7,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64};
 
 use crate::console_ring::ConsoleRing;
-use crate::fwd_bounce::{ForwardCall, FwdBounce};
+use crate::fwd_bounce::{ForwardCall, FwdBounce, FwdReply};
 use crate::init_program::InitProgram;
 use crate::ring::Ring;
 
@@ -117,6 +117,11 @@ pub struct MachineConfig {
     /// Per-core forwarded-syscall request frame (§8.1/§10.1): the syscall number + scalar
     /// args a compute core ships to the owner; pointer-argument bytes ride `fwd_bounce`.
     pub fwd_call: [ForwardCall; MAX_CORES],
+    /// Per-core forwarded-syscall REPLY mailbox (§8.1): the owner publishes a forward's
+    /// return value here rather than onto `inboxes`, so a reply is never lost to the
+    /// requesting core's idle-loop inbox drain. Read only by the thread holding that
+    /// core's forward lock; single-slot because forwards from one core are serialized.
+    pub fwd_reply: [FwdReply; MAX_CORES],
     /// Per-core init-program path (§6/§10, acceptance/12): the program the initiator (herd
     /// via `core_init`) tells a parked core to run as its first process. Written by the
     /// initiator BEFORE it pushes `MSG_CORE_INIT`; read by the activated secondary, which
@@ -163,6 +168,7 @@ impl MachineConfig {
             console_rings: [const { ConsoleRing::new() }; MAX_CORES],
             fwd_bounce: [const { FwdBounce::new() }; MAX_CORES],
             fwd_call: [const { ForwardCall::new() }; MAX_CORES],
+            fwd_reply: [const { FwdReply::new() }; MAX_CORES],
             init_program: [const { InitProgram::new() }; MAX_CORES],
             fwd_server_ready: AtomicU32::new(0),
             initiator: AtomicU32::new(0), // BSP (core 0) by default
@@ -193,7 +199,10 @@ mod tests {
         // The console rings dominate the size; sanity-bound it so an accidental
         // blow-up (e.g. a giant CONSOLE_RING_CAP) is caught here, not at boot.
         let upper = (MAX_CORES
-            * (crate::CONSOLE_RING_CAP + crate::FWD_BOUNCE_CAP + crate::INIT_PROGRAM_CAP))
+            * (crate::CONSOLE_RING_CAP
+                + crate::FWD_BOUNCE_CAP
+                + crate::INIT_PROGRAM_CAP
+                + core::mem::size_of::<FwdReply>()))
             + 8192;
         assert!(size <= upper, "descriptor {size} bytes exceeds {upper}");
     }

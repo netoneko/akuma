@@ -32,7 +32,7 @@ use akuma_exec::mmu::{attr_index, flags, phys_to_virt, MAIR_DEVICE_NGNRNE, MAIR_
 use akuma_smp::{
     partition, Command, ConsoleRing, CoreConfig, CoreStateMachine, Event, MachineConfig, Range,
     ENF_FAULTED, ENF_LEAKED, ENF_TESTING, FWD_BOUNCE_CAP, MAGIC, MAX_CORES, MSG_CORE_INIT,
-    MSG_FWD_ECHO_REPLY, MSG_FWD_ECHO_REQ, MSG_FWD_SYSCALL_REPLY, MSG_FWD_SYSCALL_REQ, MSG_PRESSURE,
+    MSG_FWD_ECHO_REPLY, MSG_FWD_ECHO_REQ, MSG_FWD_SYSCALL_REQ, MSG_PRESSURE,
     MSG_REPAID, STATE_BOOTING, STATE_OFFLINE, STATE_ONLINE, STATE_PARKED,
 };
 use spinning_top::Spinlock;
@@ -1854,6 +1854,9 @@ fn run_r3a_coop_test(cc: &CoreConfig, idx: usize, percpu: usize) -> bool {
     SECONDARY_PART_BASE.store(cc.ram_base as usize, Ordering::Release);
     SECONDARY_PART_LEN.store(cc.ram_len as usize, Ordering::Release);
     rt.prepare_user_address_space = Some(secondary_prepare_user_as);
+    // Forward a `close` for any RemoteFd (a Proxy'd file/socket) still open when a process
+    // exits, so the owner frees its handle (R4b.5, §8.1).
+    rt.remote_fd_close = Some(fwd_close_remote);
     akuma_exec::init(rt, cfg);
 
     // Stage marker helper: record progress to PerCpu so the BSP can pinpoint a hang.
@@ -2311,39 +2314,73 @@ fn capability_owner(self_idx: usize, nr: u64) -> Option<usize> {
     }
 }
 
-/// Secondary side of a forwarded syscall (R4b.4): publish `nr` + `args` (and an optional
-/// inbound buffer) to this core's `fwd_call`/`fwd_bounce`, ring the owner, and spin (time-
-/// bounded) for the matching reply. Returns the syscall's return value (Linux errno-
-/// encoded). Blocking — used by the one-shot exec-fetch probe; the real EL0 path (R4b.3b)
-/// will PARK the calling thread on the reply instead of spinning.
+/// Per-core (replicated `.bss`, so private to each secondary) cooperative lock that
+/// serializes this core's use of its SINGLE shared forward slot
+/// (`fwd_call`/`fwd_bounce`/`fwd_reply`). Multiple EL0 threads on one secondary (e.g. a
+/// pinned `sshd` plus the `curl` it spawned) may issue forwarded syscalls concurrently;
+/// the slot holds exactly one outstanding request, so they must take turns. The lock is
+/// **cooperative** — a contender `yield_now`s rather than spins, and the holder also
+/// `yield_now`s while awaiting its reply — because a raw spinlock held across the reply
+/// wait would deadlock the moment the preemptive scheduler switches to another forwarder.
+static FWD_SLOT_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Acquire this core's forward slot, yielding the CPU while it is held by another thread.
+fn fwd_slot_acquire() {
+    while FWD_SLOT_BUSY.swap(true, Ordering::Acquire) {
+        akuma_exec::threading::yield_now();
+    }
+}
+
+/// Release this core's forward slot.
+fn fwd_slot_release() {
+    FWD_SLOT_BUSY.store(false, Ordering::Release);
+}
+
+/// Secondary side of ONE forwarded-syscall round-trip (§8.1): take this core's forward
+/// slot, publish `nr` + `args` (and an optional inbound buffer) to `fwd_call`/`fwd_bounce`,
+/// ring the owner, and wait (yielding) for the dedicated `fwd_reply` mailbox to change.
+/// Returns the syscall's return value (Linux errno-encoded). The reply rides a per-core
+/// mailbox, NOT the control inbox, so the idle loop's inbox drain can never swallow it.
+///
+/// This is the TRANSPORT primitive — one request/one reply. The owner services it
+/// non-blockingly (it replies at once, even with `-EAGAIN`), so the round-trip is short;
+/// BLOCKING semantics (a `recv` that waits for data) live one level up, in the `fwd_*`
+/// helpers that re-issue this on `-EAGAIN`. Outbound bytes (a `read`/`recv` result) are
+/// left in `fwd_bounce[idx]` for the caller to copy out after this returns.
 fn forward_syscall(cfg: &MachineConfig, idx: usize, owner: usize, nr: u64, args: &[u64; 6], in_buf: Option<&[u8]>) -> u64 {
-    let (Some(call), Some(bounce), Some(owner_inbox), Some(my_inbox)) = (
+    let (Some(call), Some(bounce), Some(owner_inbox), Some(reply)) = (
         cfg.fwd_call.get(idx),
         cfg.fwd_bounce.get(idx),
         cfg.inboxes.get(owner),
-        cfg.inboxes.get(idx),
+        cfg.fwd_reply.get(idx),
     ) else {
         return enc_err(38); // ENOSYS — no transport
     };
+    fwd_slot_acquire();
     if let Some(b) = in_buf {
         bounce.write(b);
     }
     call.set(nr, args);
+    let snapshot = reply.seq();
     if !owner_inbox.push(MSG_FWD_SYSCALL_REQ, idx as u32, 0, 0) {
+        fwd_slot_release();
         return enc_err(11); // EAGAIN — owner inbox full
     }
-    let deadline = crate::timer::uptime_us() + 1_000_000; // 1s safety bound
-    while crate::timer::uptime_us() < deadline {
-        // No other reply is expected here (calls are sequential); drop anything else.
-        if let Some(m) = my_inbox.pop()
-            && m.kind == MSG_FWD_SYSCALL_REPLY
-            && m.v1 == nr
-        {
-            return m.v0;
+    // The owner replies promptly (non-blocking on its side), so this is a short bound on
+    // the transport itself — not on any logical blocking, which the caller handles.
+    let deadline = crate::timer::uptime_us() + 5_000_000;
+    let ret = loop {
+        if reply.changed(snapshot) {
+            let (r, _nr) = reply.read();
+            break r;
         }
-        core::hint::spin_loop();
-    }
-    enc_err(110) // ETIMEDOUT
+        if crate::timer::uptime_us() >= deadline {
+            break enc_err(110); // ETIMEDOUT — owner never answered
+        }
+        akuma_exec::threading::yield_now();
+    };
+    fwd_slot_release();
+    ret
 }
 
 /// Fetch a whole file from the VFS owner into a heap `Vec` via forwarded
@@ -2406,41 +2443,310 @@ fn spawn_init_program(cfg: &MachineConfig, idx: usize) {
     if len == 0 || len > path_buf.len() {
         return; // no init program named (or it didn't fit) — nothing to spawn
     }
-    let path = &path_buf[..len];
-    let path_str = core::str::from_utf8(path).unwrap_or("<non-utf8>");
+    // The slot holds the whole command line (program + space-separated args, written by herd
+    // through `core_init`). Split it back into argv; the first token is the program path to
+    // fetch, the full list is the process's argv (so `curl -sS https://ifconfig.me` works).
+    let cmdline = core::str::from_utf8(&path_buf[..len]).unwrap_or("<non-utf8>");
+    let argv: alloc::vec::Vec<alloc::string::String> =
+        cmdline.split_ascii_whitespace().map(alloc::string::String::from).collect();
+    let Some(prog) = argv.first().cloned() else {
+        return; // empty command line
+    };
+
+    // Seed this core's wall clock from the owner before the process runs, so its TLS cert
+    // date checks (and any time-dependent logic) see real time, not 1970 (the RTC is BSP-only).
+    seed_realtime_from_owner();
 
     // VFS is Proxy'd to the owner on a secondary; fetch the ELF over the forward transport.
     let Some(owner) = capability_owner(idx, nr::OPENAT) else {
-        crate::safe_print!(96, "[core {}] init: VFS not forwardable — cannot fetch {}\n", idx, path_str);
+        crate::safe_print!(96, "[core {}] init: VFS not forwardable — cannot fetch {}\n", idx, prog);
         return;
     };
-    let Some(elf) = fetch_file_forwarded(cfg, idx, owner, path) else {
-        crate::safe_print!(112, "[core {}] init: failed to fetch {} over forwarded VFS\n", idx, path_str);
+    let Some(elf) = fetch_file_forwarded(cfg, idx, owner, prog.as_bytes()) else {
+        crate::safe_print!(112, "[core {}] init: failed to fetch {} over forwarded VFS\n", idx, prog);
         return;
     };
     crate::safe_print!(
         128,
         "[core {}] init: fetched {} ({} bytes) via forwarded openat/read/close; spawning EL0 process\n",
         idx,
-        path_str,
+        prog,
         elf.len()
     );
 
-    // Spawn from the in-memory image via the NORMAL spawn path. The per-core kernel-window
-    // overlay rides the `prepare_user_address_space` runtime hook (set in run_r3a_coop_test),
-    // so the process's syscalls resolve kernel statics to THIS core's private copies.
-    match akuma_exec::process::spawn_process_from_image(path_str, &elf) {
+    // Spawn from the in-memory image via the NORMAL spawn path, with the parsed argv. The
+    // per-core kernel-window overlay rides the `prepare_user_address_space` runtime hook (set
+    // in run_r3a_coop_test), so the process's syscalls resolve kernel statics to THIS core's
+    // private copies.
+    match akuma_exec::process::spawn_process_from_image_with_args(&prog, &argv, &elf) {
         Ok((tid, pid)) => crate::safe_print!(
             128,
             "[core {}] init: spawned {} (pid {}, tid {}) — running on this core\n",
             idx,
-            path_str,
+            prog,
             pid,
             tid
         ),
-        Err(e) => crate::safe_print!(176, "[core {}] init: spawn failed for {}: {}\n", idx, path_str, e),
+        Err(e) => crate::safe_print!(176, "[core {}] init: spawn failed for {}: {}\n", idx, prog, e),
     }
 }
+
+// ============================================================================
+// EL0 syscall forwarding (R4b.5 / §10 Part B): the per-fd + socket forwarders the
+// secondary's syscall layer (src/syscall/{fs,net}.rs) calls when a pinned EL0 process
+// touches a `Proxy`'d capability. Each wraps `forward_syscall` (ONE transport round-trip)
+// with the right marshaling plus, for the would-block socket ops, a blocking retry on
+// `-EAGAIN`. All return a Linux-encoded `u64` (handle / count / 0, or `-errno`). The
+// caller (the syscall layer) does the user-memory copyin/copyout; these touch only kernel
+// buffers and the shared bounce. Owner = core 0 (Phase-0 caps map). No-op (`-ENOSYS`) if
+// somehow called off a secondary.
+// ============================================================================
+
+/// `-EAGAIN` as the forwarder encodes it (the owner's "would block").
+fn is_eagain(r: u64) -> bool {
+    r as i64 == -11
+}
+
+/// (descriptor, this core index, capability owner) for a forward from a secondary.
+fn fwd_ctx() -> Option<(&'static MachineConfig, usize, usize)> {
+    if !is_on_secondary() {
+        return None;
+    }
+    // SAFETY: the descriptor is initialized + mapped (shared) on every online core.
+    let cfg = unsafe { &*MACHINE_CONFIG.0.get() };
+    let idx = (read_mpidr() & 0xff) as usize;
+    Some((cfg, idx, 0)) // Phase-0: core 0 owns VFS + Net
+}
+
+/// One round-trip with a blocking retry: re-issue on `-EAGAIN` (the owner is non-blocking)
+/// until success/other-error, or — if the fd is non-blocking — return `-EAGAIN` at once.
+/// Bounded by `timeout_us` so a wedged peer can't hang the caller forever.
+fn forward_retry(
+    cfg: &MachineConfig, idx: usize, owner: usize, nr: u64, args: &[u64; 6],
+    in_buf: Option<&[u8]>, nonblock: bool, timeout_us: u64,
+) -> u64 {
+    let deadline = crate::timer::uptime_us() + timeout_us;
+    loop {
+        let r = forward_syscall(cfg, idx, owner, nr, args, in_buf);
+        if !is_eagain(r) {
+            return r;
+        }
+        if nonblock {
+            return r; // propagate EAGAIN to EL0
+        }
+        if crate::timer::uptime_us() >= deadline {
+            return enc_err(110); // ETIMEDOUT
+        }
+        akuma_exec::threading::yield_now();
+    }
+}
+
+/// Forward `openat` for a non-local path; returns the owner handle (≥0) or `-errno`.
+pub fn fwd_openat(path: &str, flags: u32, _mode: u32) -> u64 {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
+    let bytes = path.as_bytes();
+    let mut p = [0u8; FWD_PATH_MAX];
+    let n = bytes.len().min(FWD_PATH_MAX - 1);
+    p[..n].copy_from_slice(&bytes[..n]); // p[n] stays 0 → NUL terminator
+    forward_syscall(cfg, idx, owner, nr::OPENAT, &[0, 0, u64::from(flags), 0, 0, 0], Some(&p[..=n]))
+}
+
+/// Forward a VFS `read` into `out` (one bounce-sized chunk; short reads are legal). VFS is
+/// synchronous on the owner, so no EAGAIN retry. Returns the byte count or `-errno`.
+pub fn fwd_read(handle: u32, out: &mut [u8]) -> u64 {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
+    let want = out.len().min(FWD_BOUNCE_CAP) as u64;
+    let r = forward_syscall(cfg, idx, owner, nr::READ, &[u64::from(handle), 0, want, 0, 0, 0], None);
+    if (r as i64) > 0 && let Some(b) = cfg.fwd_bounce.get(idx) {
+        let n = (r as usize).min(out.len());
+        b.read(&mut out[..n]);
+    }
+    r
+}
+
+/// Forward a VFS `write` of one bounce-sized chunk; returns the count written or `-errno`.
+pub fn fwd_write(handle: u32, data: &[u8]) -> u64 {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
+    let len = data.len().min(FWD_BOUNCE_CAP);
+    forward_syscall(cfg, idx, owner, nr::WRITE, &[u64::from(handle), 0, len as u64, 0, 0, 0], Some(&data[..len]))
+}
+
+/// Forward `lseek`; returns the new offset or `-errno`.
+pub fn fwd_lseek(handle: u32, offset: i64, whence: i32) -> u64 {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
+    forward_syscall(cfg, idx, owner, nr::LSEEK, &[u64::from(handle), offset as u64, whence as u64, 0, 0, 0], None)
+}
+
+/// Forward `fstat`; returns the file SIZE (≥0) or `-errno`. The caller synthesizes the
+/// `Stat` (the owner sends only the size — no struct crosses the bounce).
+pub fn fwd_fstat_size(handle: u32) -> u64 {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
+    forward_syscall(cfg, idx, owner, nr::FSTAT, &[u64::from(handle), 0, 0, 0, 0, 0], None)
+}
+
+/// Forward `close` of an owner handle; returns 0 or `-errno`.
+pub fn fwd_close(handle: u32) -> u64 {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
+    forward_syscall(cfg, idx, owner, nr::CLOSE, &[u64::from(handle), 0, 0, 0, 0, 0], None)
+}
+
+/// Close hook for the runtime: forward a `close` for a RemoteFd still open at process exit.
+/// Signature matches `ExecRuntime::remote_fd_close`.
+fn fwd_close_remote(_owner: u16, handle: u32, _kind: akuma_exec::process::RemoteKind) {
+    let _ = fwd_close(handle);
+}
+
+/// Forward `socket(domain, type, proto)`; returns the owner handle or `-errno`.
+pub fn fwd_socket(domain: i32, sock_type: i32, proto: i32) -> u64 {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
+    forward_syscall(cfg, idx, owner, nr::SOCKET, &[domain as u64, sock_type as u64, proto as u64, 0, 0, 0], None)
+}
+
+/// Forward `bind(handle, sockaddr)` (16-byte `sockaddr_in`); returns 0 or `-errno`.
+pub fn fwd_bind(handle: u32, sockaddr: &[u8]) -> u64 {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
+    let mut a = [0u8; 16];
+    let n = sockaddr.len().min(16);
+    a[..n].copy_from_slice(&sockaddr[..n]);
+    forward_syscall(cfg, idx, owner, nr::BIND, &[u64::from(handle), 0, 0, 0, 0, 0], Some(&a))
+}
+
+/// Forward `listen(handle, backlog)`; returns 0 or `-errno`.
+pub fn fwd_listen(handle: u32, backlog: i32) -> u64 {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
+    forward_syscall(cfg, idx, owner, nr::LISTEN, &[u64::from(handle), backlog as u64, 0, 0, 0, 0], None)
+}
+
+/// Forward `accept(handle)`; returns a new owner handle or `-errno`, writing the peer's
+/// `sockaddr_in` (16 bytes) into `peer_out` if provided. Blocking unless `nonblock`.
+pub fn fwd_accept(handle: u32, nonblock: bool, peer_out: Option<&mut [u8]>) -> u64 {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
+    // No accept timeout (a listener may idle indefinitely) — pass u64::MAX.
+    let r = forward_retry(cfg, idx, owner, nr::ACCEPT, &[u64::from(handle), 0, 0, 0, 0, 0], None, nonblock, u64::MAX);
+    if (r as i64) >= 0 && let Some(po) = peer_out && let Some(b) = cfg.fwd_bounce.get(idx) {
+        let mut tmp = [0u8; FWD_BOUNCE_CAP];
+        b.read(&mut tmp);
+        let m = po.len().min(16);
+        po[..m].copy_from_slice(&tmp[FWD_SOCK_ADDR_OFF..FWD_SOCK_ADDR_OFF + m]);
+    }
+    r
+}
+
+/// Forward `connect(handle, sockaddr)`; returns 0 or `-errno` (owner blocks, bounded).
+pub fn fwd_connect(handle: u32, sockaddr: &[u8]) -> u64 {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
+    let mut a = [0u8; 16];
+    let n = sockaddr.len().min(16);
+    a[..n].copy_from_slice(&sockaddr[..n]);
+    forward_syscall(cfg, idx, owner, nr::CONNECT, &[u64::from(handle), 0, 0, 0, 0, 0], Some(&a))
+}
+
+/// Forward `sendto(handle, data[, dest])` (one bounce-sized chunk). Returns the count or
+/// `-errno`. Blocking unless `nonblock`.
+pub fn fwd_sendto(handle: u32, data: &[u8], nonblock: bool, dest: Option<&[u8]>) -> u64 {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
+    let len = data.len().min(FWD_SOCK_DATA);
+    let mut buf = [0u8; FWD_BOUNCE_CAP];
+    buf[..len].copy_from_slice(&data[..len]);
+    let has_dest = match dest {
+        Some(d) => {
+            let m = d.len().min(16);
+            buf[FWD_SOCK_ADDR_OFF..FWD_SOCK_ADDR_OFF + m].copy_from_slice(&d[..m]);
+            1
+        }
+        None => 0,
+    };
+    forward_retry(cfg, idx, owner, nr::SENDTO, &[u64::from(handle), len as u64, has_dest, 0, 0, 0], Some(&buf), nonblock, 10_000_000)
+}
+
+/// Forward `recvfrom(handle, out[, peer])` (one bounce-sized chunk). Returns the count or
+/// `-errno`, writing the source `sockaddr_in` into `peer_out` if provided. Blocking unless
+/// `nonblock`.
+pub fn fwd_recvfrom(handle: u32, out: &mut [u8], nonblock: bool, peer_out: Option<&mut [u8]>) -> u64 {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
+    let want = out.len().min(FWD_SOCK_DATA) as u64;
+    let r = forward_retry(cfg, idx, owner, nr::RECVFROM, &[u64::from(handle), want, 0, 0, 0, 0], None, nonblock, 30_000_000);
+    if (r as i64) >= 0 && let Some(b) = cfg.fwd_bounce.get(idx) {
+        let mut tmp = [0u8; FWD_BOUNCE_CAP];
+        b.read(&mut tmp);
+        let cnt = (r as usize).min(out.len()).min(FWD_SOCK_DATA);
+        out[..cnt].copy_from_slice(&tmp[..cnt]);
+        if let Some(po) = peer_out {
+            let m = po.len().min(16);
+            po[..m].copy_from_slice(&tmp[FWD_SOCK_ADDR_OFF..FWD_SOCK_ADDR_OFF + m]);
+        }
+    }
+    r
+}
+
+/// Forward `setsockopt(handle, level, optname, optval)`; returns 0 or `-errno`.
+pub fn fwd_setsockopt(handle: u32, level: i32, optname: i32, optval: &[u8]) -> u64 {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
+    let mut a = [0u8; 16];
+    let n = optval.len().min(16);
+    a[..n].copy_from_slice(&optval[..n]);
+    forward_syscall(cfg, idx, owner, nr::SETSOCKOPT, &[u64::from(handle), level as u64, optname as u64, n as u64, 0, 0], Some(&a))
+}
+
+/// Forward `getsockopt(handle, level, optname)`; writes the option value into `optval_out`
+/// and returns 0 or `-errno`.
+pub fn fwd_getsockopt(handle: u32, level: i32, optname: i32, optval_out: &mut [u8]) -> u64 {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
+    let r = forward_syscall(cfg, idx, owner, nr::GETSOCKOPT, &[u64::from(handle), level as u64, optname as u64, 0, 0, 0], None);
+    if (r as i64) >= 0 && let Some(b) = cfg.fwd_bounce.get(idx) {
+        let mut tmp = [0u8; FWD_BOUNCE_CAP];
+        b.read(&mut tmp);
+        let n = (r as usize).min(optval_out.len());
+        optval_out[..n].copy_from_slice(&tmp[..n]);
+    }
+    r
+}
+
+/// Seed THIS core's wall clock from the owner ONCE (the RTC is a BSP-only device). Forwards a
+/// single `clock_gettime` for the owner's Unix epoch and sets the local UTC offset, so the
+/// pinned process's (high-frequency) `clock_gettime` is served locally and TLS cert date
+/// checks see real time instead of 1970. No-op off a secondary or if the owner has no clock.
+pub fn seed_realtime_from_owner() {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return };
+    let epoch_us = forward_syscall(cfg, idx, owner, nr::CLOCK_GETTIME, &[0, 0, 0, 0, 0, 0], None);
+    if epoch_us > 0 && (epoch_us as i64) > 0 {
+        crate::timer::set_utc_time_us(epoch_us);
+    }
+}
+
+/// Forward `getrandom` into `out` (one bounce-sized chunk) — entropy comes from the owner's
+/// virtio-rng (a BSP-owned device). Returns the byte count or `-errno`.
+pub fn fwd_getrandom(out: &mut [u8]) -> u64 {
+    use crate::syscall::nr;
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
+    let want = out.len().min(FWD_BOUNCE_CAP);
+    let r = forward_syscall(cfg, idx, owner, nr::GETRANDOM, &[want as u64, 0, 0, 0, 0, 0], None);
+    if (r as i64) > 0 && let Some(b) = cfg.fwd_bounce.get(idx) {
+        let n = (r as usize).min(out.len());
+        b.read(&mut out[..n]);
+    }
+    r
+}
+
+// `shutdown` is a global no-op (see `sys_shutdown`), so a remote socket needs no forward —
+// it behaves identically to a local one without a wasted round-trip. The owner-side socket
+// is torn down by the subsequent `close`.
 
 // ============================================================================
 // R4a — cross-core syscall-forwarding TRANSPORT (docs/MULTIKERNEL.md §8.1/§10). The
@@ -2666,8 +2972,11 @@ fn service_fwd_requests(cfg: &MachineConfig, bsp_idx: usize) -> usize {
             }
             MSG_FWD_SYSCALL_REQ => {
                 let (nr, ret) = service_forwarded_syscall(cfg, from);
-                if let Some(reply) = cfg.inboxes.get(from) {
-                    reply.push(MSG_FWD_SYSCALL_REPLY, bsp_idx as u32, ret, nr);
+                // Reply on the requester's DEDICATED mailbox (not its inbox), so its idle
+                // loop's inbox drain can't swallow the reply (§8.1). publish() bumps the
+                // sequence last, ordering the bounce bytes we wrote before the waiter reads.
+                if let Some(reply) = cfg.fwd_reply.get(from) {
+                    reply.publish(ret, nr);
                 }
                 served += 1;
             }
@@ -2682,67 +2991,132 @@ fn enc_err(errno: i64) -> u64 {
     (-errno) as u64
 }
 
-/// Owner-side (BSP) forwarded fd. A forwarded `openat` records the path here; subsequent
-/// forwarded `read`s advance `offset`. The real file state lives on the OWNER core (the
-/// fd-affinity invariant, docs §16) — the forwarding core holds only the opaque handle
-/// (this slot's index). Path-based under the hood (`crate::fs` is path+offset), so no
-/// kernel fd object is held; sockets (R4b.5) will hold a real socket handle here instead.
-struct ForwardedFd {
-    path: [u8; FWD_BOUNCE_CAP],
-    path_len: usize,
-    offset: usize,
+/// Owner-side (BSP) forwarded fd — the real file/socket a `Proxy`'d capability stands up on
+/// the owner core (the fd-affinity invariant, docs §16); the forwarding core holds only this
+/// slot's index as an opaque handle. A forwarded `openat` records a `File` (path + offset —
+/// `crate::fs` is path+offset, so no kernel fd object is held); a forwarded `socket` records
+/// a `Socket` holding the real smoltcp socket index.
+// The `File` variant embeds a fixed path buffer (paths are short and this lives in a small
+// fixed `static` array, so a boxed indirection would add a heap alloc per forwarded open for
+// no real benefit).
+#[allow(clippy::large_enum_variant)]
+enum ForwardedFd {
+    File { path: [u8; FWD_PATH_MAX], path_len: usize, offset: usize },
+    Socket { idx: usize },
 }
-const FWD_FD_MAX: usize = 32;
+/// Stored owner-side path cap (independent of the bounce: paths are short, the bounce is now
+/// 4 KiB and would bloat this static).
+const FWD_PATH_MAX: usize = 256;
+const FWD_FD_MAX: usize = 64;
 static FORWARDED_FDS: Spinlock<[Option<ForwardedFd>; FWD_FD_MAX]> =
     Spinlock::new([const { None }; FWD_FD_MAX]);
 
+/// Socket recv/send data region in the bounce: the trailing 16 bytes are reserved for a
+/// `sockaddr_in` (recvfrom's source / sendto's dest) so a single round-trip carries both
+/// the payload and the address (§8.1 — the bounce is the sole shared byte buffer).
+const FWD_SOCK_DATA: usize = FWD_BOUNCE_CAP - 16;
+/// Byte offset of the reserved `sockaddr_in` tail.
+const FWD_SOCK_ADDR_OFF: usize = FWD_SOCK_DATA;
+
+/// Reserve an owner-side fd slot for `fd`, returning its handle (slot index) or `-EMFILE`.
+fn fwd_fd_alloc(fd: ForwardedFd) -> u64 {
+    let mut fds = FORWARDED_FDS.lock();
+    match fds.iter().position(Option::is_none) {
+        Some(h) => {
+            fds[h] = Some(fd);
+            h as u64
+        }
+        None => enc_err(24), // EMFILE
+    }
+}
+
+/// Look up the real socket index behind an owner-side handle, if it is a `Socket`.
+fn fwd_fd_socket(h: usize) -> Option<usize> {
+    let fds = FORWARDED_FDS.lock();
+    match fds.get(h).and_then(Option::as_ref) {
+        Some(ForwardedFd::Socket { idx }) => Some(*idx),
+        _ => None,
+    }
+}
+
+/// Read a `sockaddr_in` (16 bytes) from a bounce region into a `SockAddrIn`.
+fn read_sockaddr(buf16: &[u8]) -> akuma_net::socket::SockAddrIn {
+    let mut sa = akuma_net::socket::SockAddrIn::default();
+    // SAFETY: SockAddrIn is repr(C), 16 bytes, all-bytes-valid (no padding invariants).
+    let dst = unsafe {
+        core::slice::from_raw_parts_mut((&raw mut sa).cast::<u8>(), core::mem::size_of::<akuma_net::socket::SockAddrIn>())
+    };
+    let n = dst.len().min(buf16.len());
+    dst[..n].copy_from_slice(&buf16[..n]);
+    sa
+}
+
+/// Serialize a `SocketAddrV4` peer into 16 `sockaddr_in` bytes.
+fn write_sockaddr(addr: &akuma_net::socket::SocketAddrV4) -> [u8; 16] {
+    let sa = akuma_net::socket::SockAddrIn::from_addr(addr);
+    let mut out = [0u8; 16];
+    // SAFETY: as above — repr(C) 16-byte POD.
+    let src = unsafe {
+        core::slice::from_raw_parts((&raw const sa).cast::<u8>(), 16)
+    };
+    out.copy_from_slice(src);
+    out
+}
+
 /// Generic owner-side syscall dispatch (§8.1/§10.1): read `fwd_call[from]` (nr + args) and
-/// `fwd_bounce[from]` (any pointer buffer), run the REAL operation on the owner's own
-/// resources, copy outbound bytes back to the bounce, and return `(nr, ret)`. Today it
-/// services openat/read/close against the BSP's VFS (the exec-fetch path); write + socket
-/// arms slot in here with no new message type. Unknown syscalls return `-ENOSYS`.
+/// `fwd_bounce[from]` (any pointer buffer), run the REAL operation on the owner's own VFS /
+/// network stack, copy outbound bytes back to the bounce, and return `(nr, ret)`. One path
+/// for files (openat/read/write/lseek/fstat/close) and sockets (socket/bind/listen/accept/
+/// connect/sendto/recvfrom/setsockopt/getsockopt/shutdown) — no per-syscall message type, so
+/// `curl` rides the same dispatch as the exec-fetch. Socket ops are NON-BLOCKING here (the
+/// secondary re-issues on `-EAGAIN`) so the single forward-server thread never stalls; only
+/// `connect` blocks (bounded, one-shot). Unknown syscalls return `-ENOSYS`.
 fn service_forwarded_syscall(cfg: &MachineConfig, from: usize) -> (u64, u64) {
     use crate::syscall::nr;
+    use akuma_net::socket;
     let (Some(call), Some(bounce)) = (cfg.fwd_call.get(from), cfg.fwd_bounce.get(from)) else {
         return (0, enc_err(38)); // ENOSYS — no slot for this core
     };
     let (sysno, args) = call.get();
+    let to_enc = |r: Result<usize, i32>| match r {
+        Ok(n) => n as u64,
+        Err(e) => enc_err(i64::from(e)),
+    };
     let ret = match sysno {
-        // openat(dirfd, path, flags, mode): path (NUL-terminated) is in the bounce.
+        // ── VFS ────────────────────────────────────────────────────────────────────────
+        // openat(dirfd, path, flags, mode): NUL-terminated path in the bounce. Read-only
+        // (Phase-0 curl/sshd only READ owner files; host-key generation is pre-staged).
         nr::OPENAT => {
-            let mut raw = [0u8; FWD_BOUNCE_CAP];
+            let mut raw = [0u8; FWD_PATH_MAX];
             bounce.read(&mut raw);
-            let plen = raw.iter().position(|&b| b == 0).unwrap_or(FWD_BOUNCE_CAP);
+            let plen = raw.iter().position(|&b| b == 0).unwrap_or(FWD_PATH_MAX);
             match core::str::from_utf8(&raw[..plen]) {
                 Ok(path) if crate::fs::file_size(path).is_ok() => {
-                    let mut fds = FORWARDED_FDS.lock();
-                    match fds.iter().position(Option::is_none) {
-                        Some(h) => {
-                            let mut fd = ForwardedFd { path: [0; FWD_BOUNCE_CAP], path_len: plen, offset: 0 };
-                            fd.path[..plen].copy_from_slice(&raw[..plen]);
-                            fds[h] = Some(fd);
-                            h as u64
-                        }
-                        None => enc_err(24), // EMFILE
+                    let mut fd = ForwardedFd::File { path: [0; FWD_PATH_MAX], path_len: plen, offset: 0 };
+                    if let ForwardedFd::File { path: p, .. } = &mut fd {
+                        p[..plen].copy_from_slice(&raw[..plen]);
                     }
+                    fwd_fd_alloc(fd)
                 }
                 Ok(_) => enc_err(2),   // ENOENT
                 Err(_) => enc_err(22), // EINVAL (bad path bytes)
             }
         }
-        // read(handle, buf, len): args[0] = handle, args[2] = len. Bytes ← bounce.
+        // read(handle, _, len): File → VFS read at offset; Socket → recv (read() on a socket).
         nr::READ => {
             let h = args[0] as usize;
             let want = (args[2] as usize).min(FWD_BOUNCE_CAP);
-            // Snapshot path + offset under the lock, then read WITHOUT holding it (the VFS
-            // may yield); re-lock only to advance the offset.
+            // Snapshot path+offset under the lock, read WITHOUT holding it (the VFS may yield).
             let snap = {
                 let fds = FORWARDED_FDS.lock();
-                fds.get(h).and_then(Option::as_ref).map(|fd| {
-                    let mut p = [0u8; FWD_BOUNCE_CAP];
-                    p[..fd.path_len].copy_from_slice(&fd.path[..fd.path_len]);
-                    (p, fd.path_len, fd.offset)
-                })
+                match fds.get(h).and_then(Option::as_ref) {
+                    Some(ForwardedFd::File { path, path_len, offset }) => {
+                        let mut p = [0u8; FWD_PATH_MAX];
+                        p[..*path_len].copy_from_slice(&path[..*path_len]);
+                        Some((p, *path_len, *offset))
+                    }
+                    _ => None,
+                }
             };
             match snap {
                 Some((p, plen, off)) => {
@@ -2751,30 +3125,276 @@ fn service_forwarded_syscall(cfg: &MachineConfig, from: usize) -> (u64, u64) {
                     match crate::fs::read_at(path, off, &mut buf[..want]) {
                         Ok(n) => {
                             bounce.write(&buf[..n]);
-                            if let Some(fd) = FORWARDED_FDS.lock().get_mut(h).and_then(Option::as_mut) {
-                                fd.offset += n;
+                            if let Some(ForwardedFd::File { offset, .. }) =
+                                FORWARDED_FDS.lock().get_mut(h).and_then(Option::as_mut)
+                            {
+                                *offset += n;
                             }
                             n as u64
                         }
                         Err(_) => enc_err(5), // EIO
                     }
                 }
-                None => enc_err(9), // EBADF
+                // Not a file handle → maybe a socket opened with read(); recv it.
+                None => match fwd_fd_socket(h) {
+                    Some(idx) => {
+                        let mut buf = [0u8; FWD_BOUNCE_CAP];
+                        let r = socket::socket_recv(idx, &mut buf[..want.min(FWD_SOCK_DATA)], true);
+                        if let Ok(n) = r { bounce.write(&buf[..n]); }
+                        to_enc(r)
+                    }
+                    None => enc_err(9), // EBADF
+                },
             }
         }
-        // close(handle): release the owner-side fd slot.
+        // write(handle, _, len): File → VFS write at offset; Socket → send.
+        nr::WRITE => {
+            let h = args[0] as usize;
+            let len = (args[2] as usize).min(FWD_BOUNCE_CAP);
+            let mut buf = [0u8; FWD_BOUNCE_CAP];
+            bounce.read(&mut buf);
+            let snap = {
+                let fds = FORWARDED_FDS.lock();
+                match fds.get(h).and_then(Option::as_ref) {
+                    Some(ForwardedFd::File { path, path_len, offset }) => {
+                        let mut p = [0u8; FWD_PATH_MAX];
+                        p[..*path_len].copy_from_slice(&path[..*path_len]);
+                        Some((p, *path_len, *offset))
+                    }
+                    _ => None,
+                }
+            };
+            match snap {
+                Some((p, plen, off)) => {
+                    let path = core::str::from_utf8(&p[..plen]).unwrap_or("");
+                    match crate::fs::write_at(path, off, &buf[..len]) {
+                        Ok(n) => {
+                            if let Some(ForwardedFd::File { offset, .. }) =
+                                FORWARDED_FDS.lock().get_mut(h).and_then(Option::as_mut)
+                            {
+                                *offset += n;
+                            }
+                            n as u64
+                        }
+                        Err(_) => enc_err(5), // EIO
+                    }
+                }
+                None => match fwd_fd_socket(h) {
+                    Some(idx) => to_enc(socket::socket_send(idx, &buf[..len.min(FWD_SOCK_DATA)], true)),
+                    None => enc_err(9), // EBADF
+                },
+            }
+        }
+        // lseek(handle, off, whence): File only. whence: 0=SET, 1=CUR, 2=END.
+        nr::LSEEK => {
+            let h = args[0] as usize;
+            let off = args[1] as i64;
+            let whence = args[2] as i32;
+            let mut fds = FORWARDED_FDS.lock();
+            match fds.get_mut(h).and_then(Option::as_mut) {
+                Some(ForwardedFd::File { path, path_len, offset }) => {
+                    let path_str = core::str::from_utf8(&path[..*path_len]).unwrap_or("");
+                    let base = match whence {
+                        0 => 0i64,
+                        1 => *offset as i64,
+                        2 => crate::fs::file_size(path_str).map(|s| s as i64).unwrap_or(0),
+                        _ => return (sysno, enc_err(22)), // EINVAL
+                    };
+                    let np = base + off;
+                    if np < 0 { enc_err(22) } else { *offset = np as usize; np as u64 }
+                }
+                _ => enc_err(9), // EBADF
+            }
+        }
+        // fstat(handle): File only — return the file SIZE as the result; the secondary
+        // synthesizes the `Stat` (regular file) locally, so no struct crosses the bounce.
+        nr::FSTAT => {
+            let h = args[0] as usize;
+            let fds = FORWARDED_FDS.lock();
+            match fds.get(h).and_then(Option::as_ref) {
+                Some(ForwardedFd::File { path, path_len, .. }) => {
+                    let p = core::str::from_utf8(&path[..*path_len]).unwrap_or("");
+                    match crate::fs::file_size(p) {
+                        Ok(sz) => sz,
+                        Err(_) => enc_err(2), // ENOENT
+                    }
+                }
+                _ => enc_err(9), // EBADF (socket fstat handled locally on the secondary)
+            }
+        }
+        // close(handle): release the owner-side slot (and the real socket, if any).
         nr::CLOSE => {
             let h = args[0] as usize;
-            let mut fds = FORWARDED_FDS.lock();
-            match fds.get_mut(h) {
-                Some(slot) => {
-                    *slot = None;
-                    0
-                }
+            let removed = { FORWARDED_FDS.lock().get_mut(h).and_then(Option::take) };
+            match removed {
+                Some(ForwardedFd::Socket { idx }) => { socket::remove_socket(idx); 0 }
+                Some(ForwardedFd::File { .. }) => 0,
                 None => enc_err(9), // EBADF
             }
         }
-        _ => enc_err(38), // ENOSYS — arm not implemented yet
+        // ── Net ────────────────────────────────────────────────────────────────────────
+        // socket(domain, type, proto): create a real socket on the owner; return its handle.
+        nr::SOCKET => {
+            let base_type = (args[1] as i32) & 0xFF;
+            match socket::alloc_socket(base_type) {
+                Some(idx) => fwd_fd_alloc(ForwardedFd::Socket { idx }),
+                None => enc_err(24), // EMFILE
+            }
+        }
+        // bind(handle, sockaddr): 16-byte sockaddr_in in the bounce.
+        nr::BIND => {
+            let h = args[0] as usize;
+            let mut raw = [0u8; 16];
+            bounce.read(&mut raw);
+            match fwd_fd_socket(h) {
+                Some(idx) => match socket::socket_bind(idx, read_sockaddr(&raw).to_addr()) {
+                    Ok(()) => 0,
+                    Err(e) => enc_err(i64::from(e)),
+                },
+                None => enc_err(9),
+            }
+        }
+        // listen(handle, backlog).
+        nr::LISTEN => {
+            let h = args[0] as usize;
+            match fwd_fd_socket(h) {
+                Some(idx) => match socket::socket_listen(idx, args[1] as usize) {
+                    Ok(()) => 0,
+                    Err(e) => enc_err(i64::from(e)),
+                },
+                None => enc_err(9),
+            }
+        }
+        // accept(handle): non-blocking; peer sockaddr → bounce tail; new socket → new handle.
+        nr::ACCEPT => {
+            let h = args[0] as usize;
+            match fwd_fd_socket(h) {
+                Some(idx) => match socket::socket_accept(idx, true) {
+                    Ok((new_idx, peer)) => {
+                        let mut tail = [0u8; FWD_BOUNCE_CAP];
+                        bounce.read(&mut tail);
+                        tail[FWD_SOCK_ADDR_OFF..].copy_from_slice(&write_sockaddr(&peer));
+                        bounce.write(&tail);
+                        fwd_fd_alloc(ForwardedFd::Socket { idx: new_idx })
+                    }
+                    Err(e) => enc_err(i64::from(e)),
+                },
+                None => enc_err(9),
+            }
+        }
+        // connect(handle, sockaddr): BLOCKING (bounded) — one-shot, so a brief fwd-server
+        // stall is acceptable; keeps the secondary side simple (no EINPROGRESS dance).
+        nr::CONNECT => {
+            let h = args[0] as usize;
+            let mut raw = [0u8; 16];
+            bounce.read(&mut raw);
+            match fwd_fd_socket(h) {
+                Some(idx) => match socket::socket_connect(idx, read_sockaddr(&raw).to_addr(), false) {
+                    Ok(()) => 0,
+                    Err(e) => enc_err(i64::from(e)),
+                },
+                None => enc_err(9),
+            }
+        }
+        // sendto(handle, len, has_dest): data in bounce[0..len]; dest sockaddr in tail.
+        nr::SENDTO => {
+            let h = args[0] as usize;
+            let len = (args[1] as usize).min(FWD_SOCK_DATA);
+            let has_dest = args[2] != 0;
+            let mut buf = [0u8; FWD_BOUNCE_CAP];
+            bounce.read(&mut buf);
+            match fwd_fd_socket(h) {
+                Some(idx) => {
+                    if socket::is_udp_socket(idx) {
+                        let dest = if has_dest {
+                            read_sockaddr(&buf[FWD_SOCK_ADDR_OFF..]).to_addr()
+                        } else if let Some(p) = socket::udp_default_peer(idx) {
+                            p
+                        } else {
+                            return (sysno, enc_err(89)); // EDESTADDRREQ
+                        };
+                        to_enc(socket::socket_send_udp(idx, &buf[..len], dest))
+                    } else {
+                        to_enc(socket::socket_send(idx, &buf[..len], true))
+                    }
+                }
+                None => enc_err(9),
+            }
+        }
+        // recvfrom(handle, want): non-blocking; data → bounce[0..n]; source sockaddr → tail.
+        nr::RECVFROM => {
+            let h = args[0] as usize;
+            let want = (args[1] as usize).min(FWD_SOCK_DATA);
+            match fwd_fd_socket(h) {
+                Some(idx) => {
+                    let mut buf = [0u8; FWD_BOUNCE_CAP];
+                    if socket::is_udp_socket(idx) {
+                        match socket::socket_recv_udp(idx, &mut buf[..want], true) {
+                            Ok((n, src)) => {
+                                buf[FWD_SOCK_ADDR_OFF..].copy_from_slice(&write_sockaddr(&src));
+                                bounce.write(&buf);
+                                n as u64
+                            }
+                            Err(e) => enc_err(i64::from(e)),
+                        }
+                    } else {
+                        let r = socket::socket_recv(idx, &mut buf[..want], true);
+                        if let Ok(n) = r { bounce.write(&buf[..n]); }
+                        to_enc(r)
+                    }
+                }
+                None => enc_err(9),
+            }
+        }
+        // setsockopt(handle, level, optname, optlen): apply the few opts we model; succeed
+        // (return 0) for the rest so curl/sshd aren't tripped up by a harmless tunable.
+        nr::SETSOCKOPT => {
+            let h = args[0] as usize;
+            let level = args[1] as i32;
+            let optname = args[2] as i32;
+            let mut raw = [0u8; 16];
+            bounce.read(&mut raw);
+            let enabled = raw.first().is_some_and(|&b| b != 0);
+            match fwd_fd_socket(h) {
+                Some(idx) => {
+                    // SOL_TCP(6)/TCP_NODELAY(1); SOL_SOCKET(1)/SO_KEEPALIVE(9).
+                    if level == 6 && optname == 1 { socket::set_tcp_nodelay(idx, enabled); }
+                    else if level == 1 && optname == 9 { socket::set_socket_keepalive(idx, enabled); }
+                    0
+                }
+                None => enc_err(9),
+            }
+        }
+        // getsockopt(handle, level, optname): we model only SO_ERROR (→ 0, no pending error,
+        // since connect is synchronous here); return a 4-byte zero in the bounce.
+        nr::GETSOCKOPT => {
+            let h = args[0] as usize;
+            match fwd_fd_socket(h) {
+                Some(_) => { bounce.write(&[0u8; 4]); 4 }
+                None => enc_err(9),
+            }
+        }
+        // ── Entropy ────────────────────────────────────────────────────────────────────
+        // getrandom(want): the hardware RNG (virtio-rng) is a BSP-owned device, unmapped on a
+        // secondary, so a pinned process's entropy reads (`/dev/urandom`, `getrandom`) forward
+        // here. Fill the bounce with `want` random bytes from the owner's RNG.
+        nr::GETRANDOM => {
+            let want = (args[0] as usize).min(FWD_BOUNCE_CAP);
+            let mut buf = [0u8; FWD_BOUNCE_CAP];
+            match crate::rng::fill_bytes(&mut buf[..want]) {
+                Ok(()) => {
+                    bounce.write(&buf[..want]);
+                    want as u64
+                }
+                Err(_) => enc_err(5), // EIO
+            }
+        }
+        // ── Wall clock ─────────────────────────────────────────────────────────────────
+        // clock_gettime(CLOCK_REALTIME): the RTC (PL031) is BSP-only, so a secondary seeds
+        // its wall clock ONCE from here (then serves clock_gettime locally). Returns the
+        // owner's current Unix epoch in MICROSECONDS (0 if the owner hasn't set its clock).
+        nr::CLOCK_GETTIME => crate::timer::utc_time_us().unwrap_or(0),
+        _ => enc_err(38), // ENOSYS — arm not implemented
     };
     (sysno, ret)
 }

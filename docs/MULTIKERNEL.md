@@ -1038,6 +1038,26 @@ Tracked here so it isn't lost; tackle after the R3b/R4 milestones, not inline.
   holds at the data layer under load, and find the throughput/latency cost of the round-trip+
   doorbell vs a single-core syscall. This is the load-test of R4b.4/R4b.5 once they exist.
 
+- **Throughput: a larger shared bounce ARENA addressed by `(offset, len)`, then page-lending for
+  bulk (2026-07-01).** Today each forwarded `read`/`write`/`recv`/`send` rides one per-core
+  `FwdBounce` slot (`FWD_BOUNCE_CAP`, bumped 256 B → 4 KiB for R4b.5), so a transfer larger than the
+  slot returns a short count and userspace loops — correct, but a TLS handshake or a big file becomes
+  many round-trips (the curl-on-core-1 HTTPS demo is functional but slow for this reason). Two staged
+  improvements, cheapest first:
+  1. **Shared bounce arena.** Reserve one larger fixed scratch region in the descriptor (the §8.1
+     `rings_phys` idea) that every core maps *once* (no per-op map/unmap/TLB), and pass `(offset, len)`
+     in the forwarded call. The forwarder does a single `memcpy` in; the owner reads it in place. Kills
+     the chunking for bulk I/O with no new isolation surface (it's still one fixed shared window) and
+     no page-table churn. This is the high-value, low-risk win.
+  2. **Page-lending for bulk, page-aligned payloads only.** For genuinely large, aligned transfers
+     (sendfile/splice, an mmap'd model), *lend* the caller's physical pages to the owner instead of
+     copying — a borrow+return variant of the §9 page-transfer protocol (unmap on lender → map on
+     owner → op → unmap → map back), marking the pages "payload, do not wipe". NOT a general
+     replacement for the bounce: it's page-granular (sub-page head/tail still bounce-copy), it's a
+     *loan* not the one-way §9 reclaim (needs return + a per-loan ledger + kill/error cleanup), and
+     each op pays two TLB shootdowns + cache maintenance — so it only pays off above several pages.
+     Use it for bulk; keep the bounce/arena for everything else.
+
 - **Rename milestone-tag identifiers to descriptive names (whole `smp-attempt-0` branch).** The
   staging tags (R1/R2/R3a/R3b/R4a/R4b…) leaked into IDENTIFIERS, not just comments: e.g.
   `run_r3a_coop_test`, `run_r3b_preempt_test`, `run_r4a_fwd_test`, `PERCPU_R2_PAGES`,

@@ -161,6 +161,13 @@ pub struct ExecRuntime {
     /// space on the BSP and on a secondary — no secondary-specific spawn entry needed.
     /// An `Err` aborts address-space creation (propagated as a `None` from `new()`).
     pub prepare_user_address_space: Option<fn(&mut crate::mmu::UserAddressSpace) -> Result<(), &'static str>>,
+
+    /// Multikernel (docs/MULTIKERNEL.md §8.1): close a [`crate::process::FileDescriptor::RemoteFd`]
+    /// whose backing file/socket lives on the owner core, when the owning process exits with the
+    /// fd still open. Forwards a `close` over the cross-core ring so the owner frees its handle.
+    /// `None` on a normal (single-kernel / BSP) build; set on a secondary core. Args:
+    /// `(owner, handle, kind)`.
+    pub remote_fd_close: Option<fn(u16, u32, crate::process::RemoteKind)>,
 }
 
 /// Compile-time kernel configuration, passed once at init.
