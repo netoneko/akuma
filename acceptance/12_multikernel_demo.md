@@ -15,8 +15,11 @@ earlier ones keep passing as the later ones land.
   activation message; core 1 fetches the ELF via forwarded `open`/`read` to core 0 and
   spawns it locally. That is `docs/MULTIKERNEL.md` §6.1 + §10 Part A and the core-aware
   scheduling in `userspace/herd/docs/CORE_AWARE_SCHEDULING.md`.
-- **Next (Part B):** `curl` pinned to core 1 — add socket-forward arms to the owner-side
-  dispatcher (`docs/MULTIKERNEL.md` §10 Part B / §10.3).
+- **Milestone 3 — networking, the full demo (DONE, 2026-07-01):** `curl https://ifconfig.me`
+  pinned to **core 1** prints the box's real public IP. core 1 has no net and no VFS, so DNS
+  (UDP), the HTTPS TCP connection, the CA-bundle read, the curl ELF, entropy, and the wall
+  clock are all forwarded to core 0 (`docs/MULTIKERNEL.md` §10 Part B / R4b.5). See the
+  Milestone 3 section below.
 
 ## The model being verified
 
@@ -126,8 +129,56 @@ hello: done
 
 `pid 1` is core 1's **own** process namespace (per-kernel-private) — not the BSP's pid
 space. The process runs entirely on core 1's CPU/partition/scheduler; only its ELF reads
-crossed to core 0. `curl` (socket-forward) is the next step — add socket arms to the
-owner-side `service_forwarded_syscall` dispatcher (§10.3); no new machinery.
+crossed to core 0.
+
+## Steps & expected result — Milestone 3 (networking: curl pinned to a secondary) — DONE
+
+`curl https://ifconfig.me` runs pinned to **core 1** and prints the box's real public IP.
+core 1 owns no network stack and no filesystem, so EVERY external dependency is forwarded to
+core 0 (the Net + VFS owner) over the cross-core ring + bounce (`docs/MULTIKERNEL.md` §10
+Part B / §15 R4b.5):
+
+- **DNS** — a UDP socket + `sendto`/`recvmsg` to the nameserver in `/etc/resolv.conf` (8.8.8.8),
+  serviced by core 0's smoltcp.
+- **HTTPS** — `socket`/`connect`/`send`/`recv` on a TCP socket; the full TLS handshake crosses
+  the bounce (4 KiB chunks).
+- **Files** — the CA bundle (`/etc/ssl/certs/ca-certificates.crt`, ~189 KB) and the `curl` ELF,
+  read via forwarded `openat`/`read`/`close`.
+- **Entropy** — `/dev/urandom`/`getrandom` forwarded to core 0's virtio-rng (a BSP-only device).
+- **Wall clock** — seeded once from core 0's RTC, so TLS cert date checks see real time (not 1970).
+
+The whole command line rides the `core_init` activation, so `curl` receives its
+`-sS https://ifconfig.me` arguments. Its stdout drains to core 0's UART via the §8.2 console ring.
+
+### Preparation delta (host)
+
+The service config is staged at `bootstrap/etc/herd/enabled/netcheck.conf` (`command = /bin/curl`,
+`args = -sS https://ifconfig.me`, **`core = 1`**, `oneshot = true`). `bootstrap/etc/resolv.conf`
+(nameserver 8.8.8.8) and `bootstrap/etc/ssl/certs/ca-certificates.crt` must be on the disk (use the
+static mbedTLS `bootstrap/bin/curl`). Re-stage with `./scripts/populate_disk.sh` (or `--etc-only`
+for a config-only change). Then build + boot as above (`scripts/build_smp.sh`;
+`SMP=2 MEMORY=2048 scripts/run_smp.sh`).
+
+In the boot log (core-1 lines arrive via the console ring):
+
+```
+[SMP] core_init(1): activating (MSG_CORE_INIT sent), init program: /bin/curl -sS https://ifconfig.me
+[core 1] init: fetched /bin/curl (1511904 bytes) via forwarded openat/read/close; spawning EL0 process
+[core 1] init: spawned /bin/curl (pid 1, tid 8) — running on this core
+[syscall] connect(fd=4, ip=<ifconfig.me>:443)          # serviced on core 0
+<your.public.ip.address>                                # curl stdout, drained from core 1's ring
+```
+
+**Pass criteria:** curl exits with NO error on stderr and prints a valid public IPv4 — proving
+the socket + VFS forwarding path end to end, with core 1's `PMM`/`POOL`/`TALC` physically isolated
+from core 0's throughout (criterion 3). Throughput is modest (4 KiB bounce chunks → many round-trips
+for TLS); a shared `(offset,len)` bounce arena is the tracked §16 throughput follow-up.
+
+> **Phase 2 (not yet done): interactive `sshd` on core 1.** `ssh -p 2323 root@localhost` into a
+> sshd pinned to core 1, then run `curl` there. Beyond the socket forwarding above, this needs a PTY
+> and a per-core procfs working *locally on the secondary* (sshd's shell bridge writes the login
+> shell's stdin via `/proc/<pid>/fd/0`, and `<pid>` is a core-1-local process). `sshd.conf` is staged
+> in `bootstrap/etc/herd/available/` (move to `enabled/` once Phase 2 lands).
 
 ## Notes
 
