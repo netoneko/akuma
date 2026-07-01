@@ -1093,15 +1093,21 @@ impl PipeIo for KernelPipeIo {
     fn write(&mut self, id: u32, buf: &[u8]) -> bool {
         pipe::pipe_write(id, buf).is_ok()
     }
-    fn yield_now(&mut self) {
-        // Don't busy-spin: the rump_server's poll-loop thread (and its tap-RX
-        // thread) share this single core, and a tight `yield_now` loop here
-        // starves them — every channel round-trip stretched to ~0.5-6s because
-        // the server couldn't get scheduled to read our request / write its
-        // reply. Sleep a short interval instead so the core goes to the server;
-        // we re-check the channel each timer tick. (Proper fix later: wake on
-        // pipe-write so this is event-driven, not a ~tick poll.)
-        threading::schedule_blocking(crate::timer::uptime_us() + 1_000);
+    fn wait_readable(&mut self, id: u32, deadline_us: u64) {
+        // Event-driven block (replaces the old ~1 ms poll). Register this thread as
+        // a waiter on the reply pipe and sleep until `rump_server`'s reply write
+        // wakes us (`pipe_write` → `get_waker_for_thread(tid).wake()`), or until the
+        // deadline. `pipe_check_set_reader` does the empty-check + registration under
+        // the pipe lock, so a write racing this block is never a lost wakeup; it also
+        // returns `true` if data/EOF is already there (then don't block — re-read).
+        // Going WAITING (not a busy `yield_now`) means we leave the round-robin so
+        // the server + its tap-RX/rump kthreads run freely — the reason the old code
+        // avoided a tight yield loop — but now we're woken the instant the reply
+        // lands instead of at the next timer tick.
+        let tid = threading::current_thread_id();
+        if !pipe::pipe_check_set_reader(id, tid) {
+            threading::schedule_blocking(deadline_us);
+        }
     }
     fn now_us(&mut self) -> u64 {
         crate::timer::uptime_us()

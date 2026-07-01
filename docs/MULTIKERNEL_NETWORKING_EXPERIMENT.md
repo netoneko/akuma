@@ -236,6 +236,25 @@ and every `ppoll`/`epoll` readiness check on a rump fd is itself a MSG_PEEK sysp
 The next lever is event-driven pipe wakeup (§8 #3), which replaces the ~10 ms poll granularity
 per hop with a µs waker.
 
+**IMPROVED again — event-driven sysproxy pipe (2026-07-01, §8 #3 DONE):** the kernel side of the
+sysproxy channel no longer polls. `PipeTransport::read_exact` (`akuma-rump/src/sysproxy.rs`) now
+calls a new `PipeIo::wait_readable(id, deadline)` on an empty read; the kernel impl
+(`KernelPipeIo`, `src/rump_proxy.rs`) registers the thread as a pipe waiter via
+`pipe_check_set_reader` (TOCTOU-safe) and `schedule_blocking`s until `rump_server`'s reply write
+wakes it (`pipe_write` → waker). The server side (`fs.rs` `sys_read` on a pipe) was already
+event-driven. Crucially, **`threading::schedule_blocking` now immediately voluntary-yields** after
+marking the thread WAITING instead of `WFI`-ing until the next timer tick — on a secondary the two
+pipe peers have no device IRQ between them, so a plain block→switch was tick-bound (~10 ms/hop).
+Together: `sendto` ~100–145 ms → **~72 ms**, `recvmsg` ~96 ms → **~49 ms**, curl DNS attempt
+**1.06 s → 1.33 s** (noisy; the wins compound over full requests). BSP native curl is unaffected
+(`http 200`, `dns=0.013 s`, `total=0.088 s`) — the `schedule_blocking` change is a global latency
+improvement, not a regression.
+
+The remaining ~72 ms/round-trip is now *inside `rump_server`*, NOT the sysproxy pipe: its ~19 rump
+kthreads block/wake through the fiber rumpuser backend + a NetBSD hardclock at HZ=100 (~10 ms
+callout granularity). That is a separate lever (the "fiber rumpuser backend" note) requiring a
+rump_server rebuild, out of scope for the pipe-transport fix.
+
 **Dispatch wiring — verified + hardened (2026-07-01).** `handle_syscall` (`src/syscall/mod.rs`) is
 a single linear funnel: after bookkeeping it calls `rump_proxy::intercept_box_syscall` *before*
 any native handler; `Some(r)` short-circuits native smoltcp dispatch, `None` falls through.
@@ -285,14 +304,17 @@ bug that keeps curl at `rumpapple[000]`.
    `arm_cntv_timer` reads (`cntfrq/100`, clamped ≤ the coarse bringup value). R3b/bringup keep
    the coarse tick (atomic default), so R3b is unchanged.
 
-**NEXT (A) — event-driven sysproxy pipe (the big remaining latency lever):** each pipe hop is now
-bounded by the ~10 ms tick, not 100 ms, but it is still a *poll*. Make `pipe_write` fire the
-blocked reader's waker + voluntary-reschedule to it (µs latency). The kernel side polls at
-`schedule_blocking(now+1ms)` (`KernelPipeIo::yield_now`, `src/rump_proxy.rs:1062`); the
-`rump_server` side (blocked `recvfrom` on the pipe) needs the same. `ppoll` already has a waker
-path (`current_thread_waker`); the raw pipe/UnixSocket read likely doesn't reschedule on write.
-Also: every `ppoll`/`epoll` readiness check on a rump fd is a MSG_PEEK sysproxy round-trip
-(`poll.rs:434`) — cheaper once the hops are µs, but still one round-trip per probe.
+**DONE (A) — event-driven sysproxy pipe.** `KernelPipeIo` now blocks in `wait_readable`
+(`pipe_check_set_reader` + `schedule_blocking`) and is woken by `rump_server`'s reply write; the
+server side was already event-driven; `threading::schedule_blocking` immediately voluntary-yields
+instead of `WFI`-waiting a tick. Result: `sendto` ~120 ms → ~72 ms, `recvmsg` ~96 ms → ~49 ms;
+BSP native curl unaffected. The remaining ~72 ms is `rump_server`-internal (fiber backend +
+HZ=100 hardclock), a separate rebuild-scoped lever, not the pipe.
+
+**NEXT — rump-internal latency (optional):** to push past ~72 ms/round-trip, the rump_server fiber
+scheduler + NetBSD hardclock (HZ=100) inside the rump kernel are the bottleneck; needs a
+rump_server rebuild. Also: every `ppoll`/`epoll` readiness check on a rump fd is a MSG_PEEK
+sysproxy round-trip (`poll.rs:434`) — one round-trip per probe.
 
 **NEXT (B) — functional DNS bug (why curl stays `rumpapple[000]`):** the DNS query goes out
 (`sendto 31 -> 31`) and a **161-byte answer comes back** (`recvmsg -> 161`), yet curl doesn't

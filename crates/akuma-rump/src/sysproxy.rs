@@ -363,8 +363,15 @@ pub trait PipeIo {
     /// Write all of `buf` (the kernel pipe buffer is unbounded). Returns `false`
     /// on a broken pipe.
     fn write(&mut self, id: u32, buf: &[u8]) -> bool;
-    /// Cooperatively yield the CPU so the server thread can run.
-    fn yield_now(&mut self);
+    /// EVENT-DRIVEN block: the last [`read`](PipeIo::read) of pipe `id` came back
+    /// empty, so register the caller as a waiter on `id` and sleep until a peer
+    /// write wakes it (or `deadline_us` passes), then return so the caller
+    /// re-reads. The registration MUST happen atomically with the empty-check
+    /// inside the implementation (TOCTOU-safe) so a write racing the block is
+    /// never a lost wakeup. This replaces the old ~tick-bound poll: on a secondary
+    /// there are no device IRQs between the sysproxy client and server, so a plain
+    /// timed yield stretched every pipe hop to the timer tick.
+    fn wait_readable(&mut self, id: u32, deadline_us: u64);
     /// Monotonic microseconds (for the read timeout).
     fn now_us(&mut self) -> u64;
 }
@@ -396,6 +403,7 @@ impl<P: PipeIo> Transport for PipeTransport<P> {
 
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), TransportErr> {
         let start = self.io.now_us();
+        let deadline = start.wrapping_add(self.timeout_us);
         let mut got = 0;
         while got < buf.len() {
             let (n, eof) = self.io.read(self.rd, &mut buf[got..]);
@@ -409,7 +417,10 @@ impl<P: PipeIo> Transport for PipeTransport<P> {
             if self.io.now_us().wrapping_sub(start) > self.timeout_us {
                 return Err(TransportErr);
             }
-            self.io.yield_now();
+            // Empty read → block until the peer writes (or the deadline), instead
+            // of a timed poll. `wait_readable` registers us as a waiter first, so
+            // the write that fills the pipe wakes us at once.
+            self.io.wait_readable(self.rd, deadline);
         }
         Ok(())
     }
@@ -690,7 +701,7 @@ mod tests {
         writes: Vec<u8>,
         clock: u64,
         tick: u64,
-        yields: u32,
+        waits: u32,
     }
     impl MockIo {
         fn new(reads: &[(&[u8], bool)], tick: u64) -> Self {
@@ -698,7 +709,7 @@ mod tests {
             for (b, eof) in reads {
                 q.push_back((b.to_vec(), *eof));
             }
-            MockIo { reads: q, writes: Vec::new(), clock: 0, tick, yields: 0 }
+            MockIo { reads: q, writes: Vec::new(), clock: 0, tick, waits: 0 }
         }
     }
     impl PipeIo for MockIo {
@@ -722,8 +733,8 @@ mod tests {
             self.writes.extend_from_slice(buf);
             true
         }
-        fn yield_now(&mut self) {
-            self.yields += 1;
+        fn wait_readable(&mut self, _id: u32, _deadline_us: u64) {
+            self.waits += 1;
         }
         fn now_us(&mut self) -> u64 {
             let t = self.clock;
@@ -748,7 +759,7 @@ mod tests {
         let mut buf = [0u8; 4];
         t.read_exact(&mut buf).expect("assembled");
         assert_eq!(buf, [0xAA, 0xBB, 0xCC, 0xDD]);
-        assert!(t.io.yields >= 1); // the empty gap forced a yield
+        assert!(t.io.waits >= 1); // the empty gap forced a block-until-readable
     }
 
     // a single read() returning more than the request is split across calls.

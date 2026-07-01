@@ -2476,7 +2476,17 @@ pub fn schedule_blocking(wake_time_us: u64) {
     
     // Mark thread as WAITING with wake time
     mark_thread_waiting(tid, wake_time_us);
-    
+
+    // Immediately hand the CPU to a ready thread instead of `WFI`-ing until the next
+    // timer tick preempts us. We're already WAITING, so the scheduler switches us out
+    // and we leave the round-robin until a waker (or our wake_time) readies us — no
+    // busy-spin. Without this, a block→switch waits up to one tick: fine on the BSP
+    // (device IRQs drive reschedules) but on a secondary two cooperating threads (the
+    // rump sysproxy client↔server pipe hop) have NO IRQ between them, so every hop was
+    // tick-bound (~10 ms). A voluntary SGI bypasses the cooperative-idle guard too.
+    VOLUNTARY_SCHEDULE.store(true, Ordering::Release);
+    (runtime().trigger_sgi)(0);
+
     // Wait for timer to preempt us and for scheduler to wake us
     loop {
         // Double check sticky wake flag in loop
