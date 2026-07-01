@@ -316,13 +316,30 @@ scheduler + NetBSD hardclock (HZ=100) inside the rump kernel are the bottleneck;
 rump_server rebuild. Also: every `ppoll`/`epoll` readiness check on a rump fd is a MSG_PEEK
 sysproxy round-trip (`poll.rs:434`) — one round-trip per probe.
 
-**NEXT (B) — functional DNS bug (why curl stays `rumpapple[000]`):** the DNS query goes out
-(`sendto 31 -> 31`) and a **161-byte answer comes back** (`recvmsg -> 161`), yet curl doesn't
-proceed to `connect()` the resolved IP — it closes and re-issues the DNS query. Suspect
-`proxy_recvmsg` not populating `msg_name` (source addr) so musl's resolver rejects the reply, or
-the answer being SERVFAIL from the core2 SLIRP resolver. This is independent of preemption/
-dispatch and reproduced before the preemption fix. Debug `proxy_recvmsg` (`src/rump_proxy.rs:944`)
-vs what musl's `__res_msend`/`getaddrinfo` expects.
+**ROOT-CAUSED (B) — DNS `rumpapple[000]` is a rump-INTERNAL RX truncation, not dispatch/resolver
+logic (2026-07-01).** Traced the full path with temporary dumps (`[TAP-DBG]`/`[CO-DBG]`/`[DNS-DBG]`,
+since removed):
+- The query is correct: `sendto` to `8.8.8.8:53` and `1.1.1.1:53`, A record for `www.apple.com`,
+  and `proxy_recvmsg` copies the answer out with the right source sockaddr (`msg_name=8.8.8.8:53`,
+  `namelen=16`). So dispatch/marshalling/`msg_name` are all fine.
+- The kernel delivers the **FULL 203-byte answer frame** to `rump_server` over `/dev/net/tap0`
+  (`TAP-DBG rx n=203 tail=… 00 01 00 01 … 00 04 17 dd 1d 2f` — a valid A record, IP `23.221.29.47`).
+  So the kernel/DMA RX is correct for this frame.
+- But the payload `rump_server` copies back to curl (`CO-DBG copyout len=161`, single chunk) is
+  **truncated at ~127 of 161 bytes, tail zero-filled** — the terminal A records are gone, leaving a
+  CNAME-only answer (`an=4`, all type `0x0005`). curl's `getaddrinfo` therefore has no address →
+  no `connect()` → `[000]`. The truncation happens **inside rump_server** (NetBSD ip/udp/soreceive
+  or mbuf handling): the kernel hands rump the whole frame, `VIF_DELIVERPKT` uses `m_copyback`
+  (`if_virt.c`), yet the delivered UDP payload loses its tail. Fixing this needs rump_server-side
+  instrumentation + rebuild (out of scope for a kernel-only change).
+- **Separate kernel RX-DMA bug found:** frames larger than ~586 B arrive with a zeroed tail
+  (`TAP-DBG rx n=590 tail=[00…00]`) — `TapNic.rx_buffer` (`[u8; 2048]` in the replicated `.bss`)
+  crosses a non-contiguous physical page, so the device DMAs the tail to the wrong PA (the
+  `secondary_dma_virt_to_phys` walk gives the right *start* PA but can't make a page-crossing
+  buffer contiguous). This breaks large frames (TCP/HTTP over rump). Fix: give the RX path a
+  physically-contiguous / identity-mapped DMA buffer (like the TX path). Does NOT explain the
+  203-byte DNS truncation (which is < 586 B and arrives intact), but is a real blocker for the
+  full HTTP-over-rump goal.
 
 **How to test:** boot `CORE2_NIC=1 RUMP_NIC=1 SMP=3 MEMORY=2048 cargo run --profile release-smp
 --features smp,rump,no-tests > logs/x.log 2>&1`. Watch `logs/x.log` for `[RUMP-SP] sendto -> 31
