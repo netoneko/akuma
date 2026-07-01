@@ -536,6 +536,13 @@ const TIMER_PPI: u32 = 27;
 /// so the asm IRQ handler re-arms with the SAME value — keep them in sync.
 const TIMER_INTERVAL_TICKS: u64 = 0x10_0000;
 
+/// Live CNTV re-arm interval in virtual-counter ticks, read by [`arm_cntv_timer`].
+/// Defaults to the coarse bringup/R3b tick ([`TIMER_INTERVAL_TICKS`]); the steady-state
+/// path ([`secondary_steady_state`]) lowers it to ~10 ms (like the BSP's scheduler tick)
+/// so the preemptive reschedule granularity — and thus the intra-core rump-sysproxy pipe-hop
+/// latency — is bounded by ~10 ms instead of ~44 ms. Per-core (replicated `.data`).
+static SECONDARY_TICK_INTERVAL: AtomicU64 = AtomicU64::new(TIMER_INTERVAL_TICKS);
+
 /// ISV-safe 32-bit MMIO (single `str`/`ldr`, no writeback) — same reasoning as
 /// `gic_v3::mmio_w32` (writeback/pair forms assert under QEMU HVF).
 fn mmio_w32(addr: usize, val: u32) {
@@ -1978,14 +1985,31 @@ fn r3b_spinner_body() -> ! {
     }
 }
 
+/// Compute a ~10 ms CNTV interval in virtual-counter ticks from this PE's `CNTFRQ_EL0`,
+/// matching the BSP scheduler's 10 ms tick. Robust to QEMU's varying `CNTFRQ` (24–62.5 MHz)
+/// where a fixed tick count would be a different wall-clock interval. Clamped to the coarse
+/// bringup interval as an upper bound so a bogus `CNTFRQ=0` can never disable preemption.
+fn steady_tick_interval_ticks() -> u64 {
+    let cntfrq: u64;
+    // SAFETY: CNTFRQ_EL0 is EL1-readable and reports the virtual counter frequency.
+    unsafe { core::arch::asm!("mrs {0}, cntfrq_el0", out(reg) cntfrq, options(nomem, nostack)) };
+    let ticks = cntfrq / 100; // 10 ms = cntfrq / 100
+    if ticks == 0 || ticks > TIMER_INTERVAL_TICKS {
+        TIMER_INTERVAL_TICKS
+    } else {
+        ticks
+    }
+}
+
 /// Arm this PE's CNTV virtual timer: `CVAL = now + interval`, enabled+unmasked. Re-arming
 /// also deasserts the level-triggered PPI. (Mirrors the inline arm in `secondary_main`.)
 fn arm_cntv_timer() {
+    let interval = SECONDARY_TICK_INTERVAL.load(Ordering::Relaxed);
     // SAFETY: CNTV* are EL1-accessible system registers.
     unsafe {
         let now: u64;
         core::arch::asm!("mrs {0}, cntvct_el0", out(reg) now, options(nomem, nostack));
-        core::arch::asm!("msr cntv_cval_el0, {0}", in(reg) now + TIMER_INTERVAL_TICKS, options(nomem, nostack));
+        core::arch::asm!("msr cntv_cval_el0, {0}", in(reg) now + interval, options(nomem, nostack));
         core::arch::asm!("msr cntv_ctl_el0, {0}", in(reg) 1u64, options(nomem, nostack));
     }
 }
@@ -2234,6 +2258,16 @@ fn secondary_steady_state(cfg: &MachineConfig, idx: usize, percpu: usize, mut sm
     // running them in sequence is fine (the doc note on `scheduler_sgi_enable`).
     secondary_gic_init(idx);
     scheduler_sgi_enable(idx);
+
+    // Enable REAL preemptive scheduling on this secondary. Two changes vs. the bringup
+    // default: (1) make the idle boot thread preemptible — it's a pure idle/heartbeat loop
+    // here (not the BSP's async/network runner), and while it stays cooperative the timer
+    // tick can't switch off it until its 100 ms timeout, pinning every intra-core
+    // reschedule (e.g. the rump-sysproxy pipe hops) to ~100 ms; (2) drop the tick from the
+    // coarse ~44 ms bringup interval to ~10 ms (matching the BSP scheduler) so the
+    // preemption granularity — and thus pipe-hop latency — is bounded by ~10 ms.
+    akuma_exec::threading::make_idle_preemptible();
+    SECONDARY_TICK_INTERVAL.store(steady_tick_interval_ticks(), Ordering::Relaxed);
 
     // Real vectors permanently; arm the preemption timer; unmask IRQs. The scheduler now
     // preempts us on each tick, `yield_now` switches threads via the self-rung SGI, and a

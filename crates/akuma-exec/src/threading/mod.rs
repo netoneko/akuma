@@ -1038,6 +1038,25 @@ pub fn enable_preemption() {
     }
 }
 
+/// Make the idle/boot thread (thread 0) preemptible — i.e. subject to normal
+/// involuntary timer preemption instead of the cooperative 100 ms slice.
+///
+/// The boot thread is marked *cooperative* by [`ThreadPool::init`] because on the BSP
+/// it runs the async executor + network runner, which must not be preempted mid-poll.
+/// A **secondary** core's boot thread, by contrast, is a pure idle/heartbeat loop: while
+/// it is the cooperative RUNNING thread, `schedule_indices` returns early on every
+/// involuntary tick (honoring the timeout) and never runs its WAITING→READY wake pass, so
+/// a just-woken thread (e.g. a rump-sysproxy pipe peer) cannot be scheduled until the
+/// idle thread's 100 ms timeout. Clearing the flag on a secondary gives it *real*
+/// preemptive scheduling: the timer tick preempts idle and round-robins to any runnable
+/// thread. Per-core (replicated statics), so this only affects the calling core.
+pub fn make_idle_preemptible() {
+    let _guard = IrqGuard::new();
+    let mut pool = POOL.lock();
+    pool.slots[IDLE_THREAD_IDX].cooperative = false;
+    pool.slots[IDLE_THREAD_IDX].timeout_us = 0;
+}
+
 /// Check if preemption is currently disabled for the current thread.
 #[inline]
 pub fn is_preemption_disabled() -> bool {

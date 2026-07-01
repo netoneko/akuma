@@ -72,6 +72,28 @@ pub fn op_from_linux_sysno(n: u64) -> Option<Op> {
     })
 }
 
+/// Is `n` a socket-*family* Linux aarch64 syscall?
+///
+/// I.e. one that operates on a socket — and therefore, for a `stack=rump` box, must
+/// be owned by the rump proxy and NEVER fall through to native smoltcp. This is a
+/// SUPERSET of the ops [`op_from_linux_sysno`] can actually marshal: it also lists
+/// the socket syscalls the proxy does not implement yet (`accept4`, `recvmmsg`,
+/// `sendmmsg`) so the dispatch can return a clean error for them on a rump box
+/// instead of leaking them to the native stack. Numbers: generic ABI
+/// `asm-generic/unistd.h`.
+#[must_use]
+pub fn is_socket_family_sysno(n: u64) -> bool {
+    matches!(
+        n,
+        198..=212 // socket, socketpair, bind, listen, accept, connect, getsockname,
+                  // getpeername, sendto, recvfrom, setsockopt, getsockopt, shutdown,
+                  // sendmsg, recvmsg
+            | 242 // accept4
+            | 243 // recvmmsg
+            | 269 // sendmmsg
+    )
+}
+
 /// NetBSD rump syscall number for an [`Op`] (what rides in rumpsp `rsp_sysnum`).
 #[must_use]
 pub fn netbsd_sysno(op: Op) -> u32 {
@@ -287,6 +309,27 @@ mod tests {
         assert_eq!(op_from_linux_sysno(63), Some(Op::Read));
         assert_eq!(op_from_linux_sysno(57), Some(Op::Close));
         assert_eq!(op_from_linux_sysno(999), None); // not proxied
+    }
+
+    #[test]
+    fn socket_family_covers_unmarshaled_ops_for_isolation() {
+        // Every op we can marshal must classify as socket-family (else a rump box
+        // could leak it to native smoltcp).
+        for n in 198..=212u64 {
+            assert!(is_socket_family_sysno(n), "nr {n} should be socket-family");
+        }
+        // Socket syscalls we do NOT marshal yet must still be owned (return an error,
+        // not fall through). This is the leak the isolation guarantee closes.
+        assert!(is_socket_family_sysno(242)); // accept4
+        assert!(is_socket_family_sysno(243)); // recvmmsg
+        assert!(is_socket_family_sysno(269)); // sendmmsg
+        assert_eq!(op_from_linux_sysno(242), None); // ...and indeed unmarshaled
+        // Non-socket syscalls (and read/write/close, which are fd-generic) are NOT
+        // socket-family — they only get owned when they target a rump fd.
+        assert!(!is_socket_family_sysno(63)); // read
+        assert!(!is_socket_family_sysno(57)); // close
+        assert!(!is_socket_family_sysno(73)); // ppoll
+        assert!(!is_socket_family_sysno(214)); // brk
     }
 
     #[test]

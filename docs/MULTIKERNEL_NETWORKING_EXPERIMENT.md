@@ -214,15 +214,109 @@ syscalls to that rump_server.
 out and a 161-byte response came back — **all over core 2's local rump stack, zero forwarding**.
 `sshd-rump` (interactive SSH-over-rump) also comes up listening (:22 → host :2224).
 
-**Open — sysproxy latency on the secondary:** each sysproxy syscall round-trip on core 2 takes
-**~840 ms** (`[RUMP-SP] sendto -> 31 (847312us)`), so curl times out on the handshake
-(`rumpapple[000] total=11.5s`). Root cause: curl + `rump_server` + its ~19 rump kthreads + the
-idle thread all share core 2's **cooperative scheduler**, and the pipe-hop wakeup/reschedule
-latency (same class as the cross-core doorbell fix, but intra-core) compounds across the
-round-trips. Fixing it needs an efficient pipe-reader wakeup + voluntary reschedule on the
-secondary. Until then the routing is proven but too slow to complete a real request — so the
-3-way curl comparison (native / forwarded / rump-local) is pending that fix.
+**IMPROVED — real preemption on the secondary (2026-07-01):** the ~840 ms/round-trip stall was
+the secondary running a *cooperative* idle thread with a coarse ~44 ms timer, so a just-woken
+sysproxy peer couldn't be scheduled until the idle thread's 100 ms cooperative timeout. Fix (in
+`src/smp.rs` + `crates/akuma-exec/src/threading/mod.rs`, "enable real preemption on secondaries"):
+- **Make the secondary idle boot thread preemptible** (`threading::make_idle_preemptible()`,
+  called from `secondary_steady_state`). On a secondary the boot thread is a pure idle/heartbeat
+  loop (not the BSP's async/network runner), so it can take normal *involuntary* timer preemption;
+  while it stayed cooperative, `schedule_indices` returned early on every tick and never ran its
+  WAITING→READY wake pass, pinning every reschedule to the 100 ms timeout.
+- **Drop the steady-state tick to ~10 ms** (matching the BSP): `arm_cntv_timer` now reads a live
+  `SECONDARY_TICK_INTERVAL` atomic that `secondary_steady_state` lowers from the coarse ~44 ms
+  bringup value (`TIMER_INTERVAL_TICKS`) to `cntfrq/100`. Bounds the reschedule granularity —
+  and thus each pipe hop — to ~10 ms. R3b/bringup keep the coarse tick (atomic default).
+
+Measured (`CORE2_NIC=1 RUMP_NIC=1 SMP=3 MEMORY=2048`): `sendto` ~840 ms → **~100–145 ms**;
+`recvmsg` ~560 ms → **~96 ms**; a curl-over-rump DNS attempt's wall-time **11.5 s → 1.06 s**.
+The residual per-syscall cost is now the *poll-hop count* — each sysproxy round-trip is bounded
+by the ~10 ms tick (the spread 96–145 ms ⇒ ~10–14 hops, i.e. it is NOT the old 100 ms floor),
+and every `ppoll`/`epoll` readiness check on a rump fd is itself a MSG_PEEK sysproxy round-trip.
+The next lever is event-driven pipe wakeup (§8 #3), which replaces the ~10 ms poll granularity
+per hop with a µs waker.
+
+**Dispatch wiring — verified + hardened (2026-07-01).** `handle_syscall` (`src/syscall/mod.rs`) is
+a single linear funnel: after bookkeeping it calls `rump_proxy::intercept_box_syscall` *before*
+any native handler; `Some(r)` short-circuits native smoltcp dispatch, `None` falls through.
+Coverage: `op_from_linux_sysno` maps every marshaled socket op (Linux 198–212) plus read/write/
+readv/writev/close, and `intercept_box_syscall` routes each to the box's `rump_server` (only
+rump-owned fds for read/write/close; never the server's own pid). `poll`/`ppoll`/`epoll` fall
+through to the native handlers, which are rump-aware (a rump fd's readiness is a forwarded
+MSG_PEEK — `poll.rs:434`).
+
+**Hard isolation guarantee (closed a real leak):** `intercept_box_syscall` was reordered to check
+`box_is_rump` FIRST and now enforces that, for a `stack=rump` box, *any socket-family syscall (by
+number) or any syscall on a rump-owned fd* is owned by the proxy — routed if marshalable, else a
+clean `EOPNOTSUPP`, but NEVER a native-smoltcp fall-through. Previously the op-map's `None` bail
+ran before the rump-box check, so the socket syscalls the proxy doesn't marshal yet — `accept4`
+(242), `recvmmsg` (243), `sendmmsg` (269) — fell through to native smoltcp *with a rump fd*. The
+socket-family superset lives in `akuma_rump::syscall_translation::is_socket_family_sysno` (host
+test `socket_family_covers_unmarshaled_ops_for_isolation`). Only truly-unrelated syscalls
+(brk/mmap/openat/poll/read-on-a-real-file) still fall through — correct, they aren't networking.
+Net: **no socket-family syscall from a rump box can reach native smoltcp with a rump fd.**
+
+The remaining `rumpapple[000]` is a separate *functional* DNS issue (a 161-byte answer comes back
+over recvmsg but getaddrinfo still retries), NOT a preemption or dispatch-wiring problem — it
+reproduced identically before this fix.
 
 Repro: `RUMP_NIC=1 CORE2_NIC=1 SMP=3 MEMORY=2048 cargo run --profile release-smp --features
 smp,rump,no-tests`, with `/etc/herd/enabled/rumphttp.conf` (args `10.0.2.2 <port>`) and a host
 HTTP server on that port.
+
+## 8. Handoff — NEXT SESSION (resume here)
+
+**Where we are:** curl-over-rump on core 2 is *functionally proven* (§ Stage 2): a real curl,
+its sockets sysproxy-routed to a `rump_server` running on core 2's own kernel over the local NIC
+(bus.5), DHCP + DNS observed over rump, `sshd-rump` listening. **Real preemption on secondaries
+is now DONE** (see the Stage 2 "IMPROVED" note) — the ~840 ms/round-trip stall dropped to
+~100–145 ms and a curl DNS attempt's wall-time fell 11.5 s → 1.06 s. Dispatch wiring was audited
+and is correct. Two things remain: (A) the residual poll-hop latency, and (B) a *functional* DNS
+bug that keeps curl at `rumpapple[000]`.
+
+**DONE — "enable real preemption on secondaries":**
+1. `threading::make_idle_preemptible()` clears the secondary idle boot thread's cooperative flag
+   at `secondary_steady_state` entry, so the timer takes normal involuntary preemption (and the
+   `schedule_indices` WAITING→READY wake pass runs every tick). *Real* preemption, not the
+   voluntary-override hack — chosen because on a secondary the idle thread is a pure heartbeat
+   loop, and involuntary preemption still respects any genuinely-cooperative thread if one is
+   ever spawned there.
+2. Steady-state tick lowered to ~10 ms via a live `SECONDARY_TICK_INTERVAL` atomic that
+   `arm_cntv_timer` reads (`cntfrq/100`, clamped ≤ the coarse bringup value). R3b/bringup keep
+   the coarse tick (atomic default), so R3b is unchanged.
+
+**NEXT (A) — event-driven sysproxy pipe (the big remaining latency lever):** each pipe hop is now
+bounded by the ~10 ms tick, not 100 ms, but it is still a *poll*. Make `pipe_write` fire the
+blocked reader's waker + voluntary-reschedule to it (µs latency). The kernel side polls at
+`schedule_blocking(now+1ms)` (`KernelPipeIo::yield_now`, `src/rump_proxy.rs:1062`); the
+`rump_server` side (blocked `recvfrom` on the pipe) needs the same. `ppoll` already has a waker
+path (`current_thread_waker`); the raw pipe/UnixSocket read likely doesn't reschedule on write.
+Also: every `ppoll`/`epoll` readiness check on a rump fd is a MSG_PEEK sysproxy round-trip
+(`poll.rs:434`) — cheaper once the hops are µs, but still one round-trip per probe.
+
+**NEXT (B) — functional DNS bug (why curl stays `rumpapple[000]`):** the DNS query goes out
+(`sendto 31 -> 31`) and a **161-byte answer comes back** (`recvmsg -> 161`), yet curl doesn't
+proceed to `connect()` the resolved IP — it closes and re-issues the DNS query. Suspect
+`proxy_recvmsg` not populating `msg_name` (source addr) so musl's resolver rejects the reply, or
+the answer being SERVFAIL from the core2 SLIRP resolver. This is independent of preemption/
+dispatch and reproduced before the preemption fix. Debug `proxy_recvmsg` (`src/rump_proxy.rs:944`)
+vs what musl's `__res_msend`/`getaddrinfo` expects.
+
+**How to test:** boot `CORE2_NIC=1 RUMP_NIC=1 SMP=3 MEMORY=2048 cargo run --profile release-smp
+--features smp,rump,no-tests > logs/x.log 2>&1`. Watch `logs/x.log` for `[RUMP-SP] sendto -> 31
+(Nus)` — N now ~100–145 ms (was ~840 ms). Success target = curl prints `rumpapple[200]:...` (not
+`[000]`), which needs BOTH (A) and (B). Then SSH into the rump box: `ssh -p 2224 root@localhost`
+(via `CORE2_SSH_PORT`, net2 → core-2 rump sshd:22) and run curl there → interactive
+SSH-over-rump; that gives the 3rd number for the §4 table (native 0.1 s / forwarded 1.4 s /
+rump-local ?).
+
+**Config wiring in place (committed):** `bootstrap/etc/herd/enabled/core2herd.conf` launches a
+second herd pinned to core 2 with `--service /srv/core2/etc/herd/{rumpnet,netcheck-rump,sshd-rump}.conf`
+(explicit files — no dir scan, working around the getdents64 gap). herd gained `--service <path>`
+(`explicit_service_files()`), `--enabled-dir`. Runner adds a `CORE2_SSH_PORT` (2224) hostfwd on net2.
+Deploy after edits: rebuild herd (`userspace/ cargo build --release -p herd`), copy to
+`bootstrap/bin/herd`, and docker-mount `disk.img` to place `/bin/herd` + `/srv/core2/etc/herd/*.conf`.
+
+**Also open (separate TODO):** forwarded directory listing (`getdents64`) is classified-but-
+unimplemented for secondaries (see the memory note); it's why herd needs `--service`. Proper fix:
+marshal dirents through the bounce in `service_forwarded_syscall`.

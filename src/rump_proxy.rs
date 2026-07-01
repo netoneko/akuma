@@ -267,32 +267,66 @@ pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
     if !RUMP_ACTIVE.load(Ordering::Relaxed) {
         return None; // no rump box exists → single relaxed load, no lock
     }
-    let op = translation::op_from_linux_sysno(syscall_num)?;
     let pid = process::read_current_pid().unwrap_or(0);
     let proc: &Process = process::lookup_process(pid)?;
     let box_id = proc.box_id;
     if !box_is_rump(box_id) {
+        return None; // not a rump box → native stack is correct
+    }
+    // Never proxy the box's own rump_server back into itself (it IS the stack and
+    // does not issue native socket syscalls).
+    if is_server_pid(pid) {
         return None;
     }
 
-    // read/write/close also hit files/pipes — only a rump socket fd is ours.
+    let op = translation::op_from_linux_sysno(syscall_num);
+
+    // read/write/readv/writev/close also hit files/pipes/stdio — only a rump socket
+    // fd is ours; a real fd on a rump-box process still goes native.
     let fd_is_rump = matches!(
         proc.get_fd(args[0] as u32),
         Some(process::FileDescriptor::RumpSocket { .. })
     );
     if matches!(
         op,
-        translation::Op::Read
-            | translation::Op::Write
-            | translation::Op::Readv
-            | translation::Op::Writev
-            | translation::Op::Close
+        Some(
+            translation::Op::Read
+                | translation::Op::Write
+                | translation::Op::Readv
+                | translation::Op::Writev
+                | translation::Op::Close
+        )
     ) && !fd_is_rump
     {
         return None;
     }
-    // Never proxy the box's own rump_server back into itself.
-    if is_server_pid(pid) {
+
+    // HARD ISOLATION GUARANTEE: for a `stack=rump` box, a socket-family syscall (by
+    // number) or ANY syscall on a rump-owned fd MUST be owned by this proxy — it can
+    // never fall through to the native smoltcp stack. We route it if we can marshal
+    // it, otherwise return a clean error (`EOPNOTSUPP`). Only truly unrelated syscalls
+    // (brk/mmap/openat/poll/read-on-a-real-file/…) fall through to native, which is
+    // correct — those have nothing to do with the network stack. This is the single
+    // choke point that enforces per-core rump networking isolation.
+    let must_own = translation::is_socket_family_sysno(syscall_num) || fd_is_rump;
+    let Some(op) = op else {
+        return if must_own {
+            crate::safe_print!(
+                128,
+                "[RUMP-SP] box={} pid={} nr={} on rump box UNIMPLEMENTED -> EOPNOTSUPP (no native fallthrough)\n",
+                box_id,
+                pid,
+                syscall_num
+            );
+            Some(neg_linux_errno(LINUX_EOPNOTSUPP))
+        } else {
+            None // unrelated syscall (not socket-family, not a rump fd) → native is correct
+        };
+    };
+    if !must_own {
+        // `op` is a socket op we understand but it targets a non-rump fd (the read/
+        // write/close case already returned None above); nothing else reaches here
+        // without `must_own`, but be explicit rather than accidentally routing.
         return None;
     }
 
