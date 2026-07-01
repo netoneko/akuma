@@ -2624,7 +2624,7 @@ fn secondary_init_local_nic(idx: usize) {
         return;
     }
     akuma_net::runtime::register(akuma_net::NetRuntime {
-        virt_to_phys: akuma_exec::mmu::virt_to_phys,
+        virt_to_phys: secondary_dma_virt_to_phys,
         phys_to_virt: |pa| akuma_exec::mmu::phys_to_virt(pa),
         uptime_us: crate::timer::uptime_us,
         utc_seconds: crate::timer::utc_seconds,
@@ -2643,6 +2643,25 @@ fn secondary_init_local_nic(idx: usize) {
             idx, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         ),
         Err(e) => crate::safe_print!(96, "[core {}] local NIC bind FAILED: {} (run QEMU with CORE2_NIC=1)\n", idx, e),
+    }
+}
+
+/// `virt_to_phys` for the secondary's net DMA. The default identity mapping (`mmu::virt_to_phys`)
+/// is WRONG on a secondary for a DMA buffer that lives in a kernel `static`: the replicated
+/// `.data`/`.bss` window is mapped at the kernel VA but backed by PRIVATE physical pages (R1),
+/// so VA != PA there. `TapNic`'s `rx_buffer` is exactly such a static — with identity `v2p` the
+/// device DMA-writes the frame to the wrong physical address and the CPU reads a stale (zero)
+/// buffer (TX works only because its buffers come from the identity-mapped partition heap). Walk
+/// THIS core's active table for the true PA; partition/identity ranges translate to themselves.
+/// The replicated window is physically contiguous (sequential `PartitionBump` pages), so a
+/// buffer spanning pages is safe.
+#[cfg(feature = "rump")]
+fn secondary_dma_virt_to_phys(vaddr: usize) -> usize {
+    let off = vaddr & (PAGE - 1);
+    let page = vaddr & !(PAGE - 1);
+    match akuma_exec::mmu::translate_user_va(current_ttbr0_l0(), page) {
+        Some(pa) => (pa & !(PAGE - 1)) | off,
+        None => vaddr, // partition RAM is identity-mapped; fall back to identity
     }
 }
 

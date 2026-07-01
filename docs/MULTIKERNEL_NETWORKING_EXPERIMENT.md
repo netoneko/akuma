@@ -143,9 +143,33 @@ binary) pinned there and compare its HTTP-GET latency to the forwarded `curl` ab
   (NetBSD 7.99.34) and creates `virt0` — all with no fault. Boot: `RUMP_NIC=1 CORE2_NIC=1 SMP=3`
   (RUMP_NIC=1 gives the BSP its own bus.4 so its auto-select doesn't grab core 2's bus.5).
 
-**Open — packet flow:** DHCP times out on core 2's NIC (`dhcp get: timed out waiting for
-response`). `virt_to_phys` is identity (correct over the identity-mapped partition), so DMA
-addresses are right; the issue is a deeper virtio queue/DMA/RX-poll matter on the secondary's
-device (TX not emitting or RX not delivered). Next debugging step. Also TODO: make the BSP skip
-the core-2-owned NIC so `RUMP_NIC=1` isn't required, and wire NIC→core assignment through herd
-core-init (see the memory note) rather than the hardcoded `RUMP_NIC_CORE`.
+**WORKING end to end (2026-07-01):** local rump networking on core 2 does **DHCP + ARP + TCP +
+HTTP GET with zero forwarding** to core 0:
+```
+RUMPHTTP: dhcp_ipv4_oneshot -> 0     (got an IP over bus.5)
+RUMPHTTP: connect 10.0.2.2:8000 -> 0
+HTTP/1.0 200 OK ... hello-from-host-core2-rump
+RUMPHTTP: PASS — fetched 212 bytes over the NetBSD rump stack (DHCP + TCP via /dev/net/tap0)
+```
+(GET target = a host `python3 -m http.server`; the earlier `connect 10.0.2.2:80 -> -1` was just
+no server on the host's port 80, not a bug.)
+
+**The DMA bug that blocked it (and its fix):** `virt_to_phys` was pure identity, but `TapNic`'s
+2 KB `rx_buffer` is a field of the `static TAP` → it lives in the kernel's **replicated
+`.data`/`.bss`**, which on a secondary is mapped at the kernel VA but backed by a PRIVATE
+physical page (R1). So identity `v2p` handed the device the wrong physical address: the device
+DMA-wrote the DHCP OFFER to the wrong page and the CPU read an all-zero (stale) buffer. TX worked
+only because its buffers come from the identity-mapped partition heap. Fix: register a
+secondary-specific `virt_to_phys` (`secondary_dma_virt_to_phys`) that WALKS this core's active
+page table for the true PA (identity ranges translate to themselves; the replicated window is
+physically contiguous via sequential `PartitionBump` pages, so a page-spanning buffer is safe).
+Not a cache-coherency issue — the address was simply wrong.
+
+**Remaining polish (not blockers):** make the BSP skip the core-2-owned NIC so `RUMP_NIC=1`
+isn't needed alongside `CORE2_NIC=1`; wire NIC→core assignment through herd core-init (see the
+memory note) instead of the hardcoded `RUMP_NIC_CORE`; then do the perf comparison vs the
+forwarded core-1 curl.
+
+Repro: `RUMP_NIC=1 CORE2_NIC=1 SMP=3 MEMORY=2048 cargo run --profile release-smp --features
+smp,rump,no-tests`, with `/etc/herd/enabled/rumphttp.conf` (args `10.0.2.2 <port>`) and a host
+HTTP server on that port.
