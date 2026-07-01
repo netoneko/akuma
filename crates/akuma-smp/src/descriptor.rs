@@ -144,17 +144,18 @@ pub struct MachineConfig {
 }
 
 impl Default for MachineConfig {
+    #[allow(clippy::large_stack_frames)]
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl MachineConfig {
-    // The descriptor is only ever a `static` (the per-core console rings make it
-    // ~tens of KiB); it is never actually placed on a stack, so the large-array lint
-    // on the const initializer below is a false positive here.
+    // The descriptor is only ever a `static` (the per-core forward bounces at
+    // FWD_BOUNCE_CAP make it ~hundreds of KiB); it is never actually placed on a stack, so
+    // the large-array / large-frame lints on the const initializer below are false positives.
     #[must_use]
-    #[allow(clippy::large_stack_arrays)]
+    #[allow(clippy::large_stack_arrays, clippy::large_stack_frames)]
     pub const fn new() -> Self {
         Self {
             enforcement_results: [const { AtomicU32::new(ENF_TESTING) }; MAX_CORES],

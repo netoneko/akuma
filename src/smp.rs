@@ -2084,6 +2084,16 @@ fn secondary_doorbell_handler(_irq: u32) {
             p.write_volatile(p.read_volatile() + 1);
         }
     }
+    // A forwarder thread is parked awaiting its reply and the owner just published it (that's
+    // why this doorbell rang). Preempt the idle WFI thread back to the waiter NOW instead of
+    // on the next timer tick. The idle thread is COOPERATIVE, so an involuntary scheduler SGI
+    // won't switch away from it (schedule_indices honors its timeout) — mark the reschedule
+    // VOLUNTARY so it switches unconditionally, then ring our own scheduler SGI. This is what
+    // takes a forwarded syscall's reply-observe latency from ~1 timer tick to ~tens of µs.
+    if FWD_AWAITING_REPLY.load(Ordering::Acquire) {
+        akuma_exec::threading::request_voluntary_reschedule();
+        trigger_sched_sgi_self(SCHED_SGI);
+    }
 }
 
 /// The secondary's permanent steady state (R4b.1). Preconditions: R3a stood the
@@ -2214,6 +2224,7 @@ fn secondary_steady_state(cfg: &MachineConfig, idx: usize, percpu: usize, mut sm
     // process: fetch its ELF via forwarded open/read/close ("exec is recursive forwarding")
     // and spawn it locally on this core's scheduler. Done once.
     let mut init_spawned = false;
+    let mut bench_spawned = false;
 
     // Idle/driver loop on the boot thread: advance the heartbeat, drain the inbox (debt
     // state machine — shedding `Repay` to creditors over the shared rings; we only ever
@@ -2255,6 +2266,14 @@ fn secondary_steady_state(cfg: &MachineConfig, idx: usize, percpu: usize, mut sm
         if !init_spawned && cfg.fwd_server_ready.load(Ordering::Acquire) == 1 {
             spawn_init_program(cfg, idx);
             init_spawned = true;
+        }
+
+        // Forward-transport self-test (deterministic; no disk/network needed). Runs after the
+        // forward-server is ready, on its own thread so it yields to this idle thread between
+        // round-trips — the steady-state doorbell-wake path. Gated OFF by default (RUN_FWD_BENCH).
+        if RUN_FWD_BENCH && !bench_spawned && cfg.fwd_server_ready.load(Ordering::Acquire) == 1 {
+            spawn_forward_bench();
+            bench_spawned = true;
         }
 
         // Idle: SLEEP until the next interrupt rather than busy-yielding. A tight
@@ -2342,6 +2361,14 @@ fn fwd_slot_release() {
     FWD_SLOT_BUSY.store(false, Ordering::Release);
 }
 
+/// Set by `forward_syscall` while a forwarder thread is parked (yielding) awaiting its
+/// reply. The doorbell handler reads it: the BSP rings our doorbell the instant it publishes
+/// a reply, and if a forward is outstanding we ring our OWN scheduler SGI so the scheduler
+/// preempts the idle (WFI) thread back to the waiter at once — instead of the waiter only
+/// resuming on the next per-core timer tick (`TIMER_INTERVAL_TICKS` later). Per-core
+/// replicated `.bss`; only one forward is outstanding per core at a time (`FWD_SLOT_BUSY`).
+static FWD_AWAITING_REPLY: AtomicBool = AtomicBool::new(false);
+
 /// Secondary side of ONE forwarded-syscall round-trip (§8.1): take this core's forward
 /// slot, publish `nr` + `args` (and an optional inbound buffer) to `fwd_call`/`fwd_bounce`,
 /// ring the owner, and wait (yielding) for the dedicated `fwd_reply` mailbox to change.
@@ -2375,6 +2402,10 @@ fn forward_syscall(cfg: &MachineConfig, idx: usize, owner: usize, nr: u64, args:
     // The owner replies promptly (non-blocking on its side), so this is a short bound on
     // the transport itself — not on any logical blocking, which the caller handles.
     let deadline = crate::timer::uptime_us() + 5_000_000;
+    // Announce we're parked awaiting a reply, so a doorbell from the owner (rung right after
+    // it publishes) makes our doorbell handler ring a self-scheduler SGI and preempt the idle
+    // WFI thread back to us at once (see FWD_AWAITING_REPLY / secondary_doorbell_handler).
+    FWD_AWAITING_REPLY.store(true, Ordering::Release);
     let ret = loop {
         if reply.changed(snapshot) {
             let (r, _nr) = reply.read();
@@ -2385,6 +2416,7 @@ fn forward_syscall(cfg: &MachineConfig, idx: usize, owner: usize, nr: u64, args:
         }
         akuma_exec::threading::yield_now();
     };
+    FWD_AWAITING_REPLY.store(false, Ordering::Release);
     fwd_slot_release();
     ret
 }
@@ -2395,6 +2427,9 @@ fn forward_syscall(cfg: &MachineConfig, idx: usize, owner: usize, nr: u64, args:
 /// copied out of `fwd_bounce[idx]`; the owner advances its fd offset, so successive reads
 /// stream the file. Returns `None` on open failure or a read error. Blocking (one forward
 /// round-trip per chunk) — the caller is the secondary's idle/boot thread.
+// Staging buffers are `[u8; FWD_BOUNCE_CAP]` (64 KiB): the forwarders run on ≥480 KiB kernel
+// stacks, so this is safe; see FWD_BOUNCE_CAP for why 64 KiB is the chosen size.
+#[allow(clippy::large_stack_arrays)]
 fn fetch_file_forwarded(cfg: &MachineConfig, idx: usize, owner: usize, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     use crate::syscall::nr;
     // openat: NUL-terminated path in the bounce. `path` is the bytes WITHOUT a NUL.
@@ -2430,6 +2465,128 @@ fn fetch_file_forwarded(cfg: &MachineConfig, idx: usize, owner: usize, path: &[u
     }
     forward_syscall(cfg, idx, owner, nr::CLOSE, &[h, 0, 0, 0, 0, 0], None);
     Some(data)
+}
+
+/// Whether to run the forward-transport self-test on a dedicated secondary after the
+/// forward-server comes up. OFF by default: it activates a spare core (see
+/// `autostart_bench_core`), so it needs `SMP>=3` to avoid colliding with a herd-pinned
+/// service on core 1, and it prints on every boot. Flip to `true` (with `SMP>=3`) to verify
+/// the doorbell-wake path in-kernel; the docs/MULTIKERNEL_NETWORKING_EXPERIMENT.md numbers
+/// were captured this way. To A/B the doorbell wake, short-circuit the reschedule in
+/// `secondary_doorbell_handler` and compare.
+const RUN_FWD_BENCH: bool = false;
+
+/// Round-trips the latency self-test times (after a warm-up).
+const FWD_BENCH_ITERS: u64 = 40;
+
+/// Upper bound (µs) for the mean forwarded round-trip in the self-test. The doorbell-wake
+/// path lands at ~40–50 µs; the old timer-tick-bound path was ~136 000 µs. 5 ms cleanly
+/// separates the two, so the test FAILs if the doorbell reschedule ever regresses.
+const FWD_LATENCY_MAX_US: u64 = 5_000;
+
+/// Forward-transport self-test: time `FWD_BENCH_ITERS` forwarded round-trips of a trivial
+/// owner-serviced syscall (`clock_gettime` — no payload, no EAGAIN retry) in isolation (no
+/// network, no disk), and PASS iff the mean is under `FWD_LATENCY_MAX_US`. Runs on its OWN
+/// kernel thread so it yields to the (WFI) idle boot thread between round-trips — exactly like
+/// a pinned EL0 process's forwarded syscalls — which is the steady-state path the doorbell
+/// wake accelerates (and which bringup-time tests can't exercise, as there's no idle thread
+/// then). Reports PASS/FAIL like the other SMP self-tests (§R4).
+fn run_forward_latency_bench(cfg: &MachineConfig, idx: usize, owner: usize) {
+    use crate::syscall::nr;
+    let args = [0u64; 6];
+    // Warm-up: fault in the owner-side fd table / first-touch caches so timing is steady.
+    let _ = forward_syscall(cfg, idx, owner, nr::CLOCK_GETTIME, &args, None);
+    let t0 = crate::timer::uptime_us();
+    for _ in 0..FWD_BENCH_ITERS {
+        let _ = forward_syscall(cfg, idx, owner, nr::CLOCK_GETTIME, &args, None);
+    }
+    let dt = crate::timer::uptime_us().saturating_sub(t0);
+    let per_rt = dt / FWD_BENCH_ITERS.max(1);
+    let verdict = if per_rt < FWD_LATENCY_MAX_US { "PASS" } else { "FAIL" };
+    crate::safe_print!(
+        144,
+        "[core {}] fwd self-test: {} round-trips in {} us = {} us/round-trip (< {} us) {}\n",
+        idx,
+        FWD_BENCH_ITERS,
+        dt,
+        per_rt,
+        FWD_LATENCY_MAX_US,
+        verdict
+    );
+}
+
+/// Bulk-transfer bench: fetch a known owner file over forwarded open/read/close (one
+/// `FWD_BOUNCE_CAP` chunk per round-trip) and report size, round-trips, and throughput. This
+/// is the signal for the `FWD_BOUNCE_CAP` buffer-size sweep — a larger bounce = fewer
+/// round-trips per byte. Runs with the doorbell reschedule at its production default (ON).
+fn run_forward_bulk_bench(cfg: &MachineConfig, idx: usize, owner: usize) {
+    let path: &[u8] = b"/bin/curl"; // ~1.5 MB static binary staged on the owner's ext2
+    let t0 = crate::timer::uptime_us();
+    let fetched = fetch_file_forwarded(cfg, idx, owner, path);
+    let dt = crate::timer::uptime_us().saturating_sub(t0).max(1);
+    let Some(d) = fetched else {
+        crate::safe_print!(
+            112,
+            "[core {}] bulk-bench: forwarded fetch of {} failed\n",
+            idx,
+            core::str::from_utf8(path).unwrap_or("?")
+        );
+        return;
+    };
+    let chunks = d.len().div_ceil(FWD_BOUNCE_CAP);
+    let mbps = d.len() as u64 / dt; // bytes/us == MB/s
+    crate::safe_print!(
+        176,
+        "[core {}] bulk-bench: fetched {} bytes of {} in {} us via {} round-trips (CAP={} B) = {} MB/s\n",
+        idx,
+        d.len(),
+        core::str::from_utf8(path).unwrap_or("?"),
+        dt,
+        chunks,
+        FWD_BOUNCE_CAP,
+        mbps
+    );
+}
+
+/// Spawn the forward-latency bench on a dedicated secondary kernel thread (so it yields to
+/// the idle boot thread between round-trips). Reads the descriptor + core index from globals
+/// inside the thread, mirroring the BSP forward-server's spawn.
+fn spawn_forward_bench() {
+    let spawned = akuma_exec::threading::spawn_system_thread_fn(|| {
+        // SAFETY: descriptor is initialized and mapped (shared) on every online core.
+        let cfg = unsafe { &*MACHINE_CONFIG.0.get() };
+        let idx = (read_mpidr() & 0xff) as usize;
+        run_forward_latency_bench(cfg, idx, 0);
+        run_forward_bulk_bench(cfg, idx, 0);
+        akuma_exec::threading::mark_current_terminated();
+        loop {
+            akuma_exec::threading::yield_now();
+        }
+    });
+    if let Err(e) = spawned {
+        crate::safe_print!(80, "[SMP] fwd-bench thread spawn FAILED: {}\n", e);
+    }
+}
+
+/// If the forward-latency bench is enabled, activate the LAST secondary with NO init program
+/// so it enters steady state and runs the bench on a core to itself — herd pins its services
+/// (sshd/curl) to core 1, so the top core stays idle and gives an uncontended measurement (no
+/// sharing of the per-core forward slot / scheduler). Use `SMP>=2`; `SMP=4` keeps it well
+/// clear of herd. Called by the BSP after the forward server is up. Idempotent, so it
+/// composes with herd. No-op if the bench is off or single-core.
+pub fn autostart_bench_core() {
+    if !RUN_FWD_BENCH || !PROBED.load(Ordering::Acquire) {
+        return;
+    }
+    let num = NUM_CORES.load(Ordering::Relaxed);
+    if num <= 1 {
+        return;
+    }
+    let bench_core = num - 1; // top core; herd only ever pins to core 1
+    let r = core_init(bench_core, b"");
+    if (r as i64) != 0 {
+        crate::safe_print!(80, "[SMP] fwd-bench: core_init({}) returned {}\n", bench_core, r as i64);
+    }
 }
 
 /// Spawn this core's INIT PROGRAM as a real EL0 process (docs/MULTIKERNEL.md §10,
@@ -2640,6 +2797,7 @@ pub fn fwd_listen(handle: u32, backlog: i32) -> u64 {
 
 /// Forward `accept(handle)`; returns a new owner handle or `-errno`, writing the peer's
 /// `sockaddr_in` (16 bytes) into `peer_out` if provided. Blocking unless `nonblock`.
+#[allow(clippy::large_stack_arrays)] // FWD_BOUNCE_CAP staging buffer; runs on a ≥480 KiB kernel stack
 pub fn fwd_accept(handle: u32, nonblock: bool, peer_out: Option<&mut [u8]>) -> u64 {
     use crate::syscall::nr;
     let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
@@ -2666,6 +2824,7 @@ pub fn fwd_connect(handle: u32, sockaddr: &[u8]) -> u64 {
 
 /// Forward `sendto(handle, data[, dest])` (one bounce-sized chunk). Returns the count or
 /// `-errno`. Blocking unless `nonblock`.
+#[allow(clippy::large_stack_arrays)] // FWD_BOUNCE_CAP staging buffer; runs on a ≥480 KiB kernel stack
 pub fn fwd_sendto(handle: u32, data: &[u8], nonblock: bool, dest: Option<&[u8]>) -> u64 {
     use crate::syscall::nr;
     let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
@@ -2686,6 +2845,7 @@ pub fn fwd_sendto(handle: u32, data: &[u8], nonblock: bool, dest: Option<&[u8]>)
 /// Forward `recvfrom(handle, out[, peer])` (one bounce-sized chunk). Returns the count or
 /// `-errno`, writing the source `sockaddr_in` into `peer_out` if provided. Blocking unless
 /// `nonblock`.
+#[allow(clippy::large_stack_arrays)] // FWD_BOUNCE_CAP staging buffer; runs on a ≥480 KiB kernel stack
 pub fn fwd_recvfrom(handle: u32, out: &mut [u8], nonblock: bool, peer_out: Option<&mut [u8]>) -> u64 {
     use crate::syscall::nr;
     let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
@@ -2716,6 +2876,7 @@ pub fn fwd_setsockopt(handle: u32, level: i32, optname: i32, optval: &[u8]) -> u
 
 /// Forward `getsockopt(handle, level, optname)`; writes the option value into `optval_out`
 /// and returns 0 or `-errno`.
+#[allow(clippy::large_stack_arrays)] // FWD_BOUNCE_CAP staging buffer; runs on a ≥480 KiB kernel stack
 pub fn fwd_getsockopt(handle: u32, level: i32, optname: i32, optval_out: &mut [u8]) -> u64 {
     use crate::syscall::nr;
     let Some((cfg, idx, owner)) = fwd_ctx() else { return enc_err(38) };
@@ -3060,6 +3221,12 @@ fn service_fwd_requests(cfg: &MachineConfig, bsp_idx: usize) -> usize {
                 if let Some(reply) = cfg.fwd_reply.get(from) {
                     reply.publish(ret, nr);
                 }
+                // Wake the requester NOW: ring its doorbell so its scheduler preempts the idle
+                // (WFI) thread back to the parked forwarder immediately, instead of on that
+                // core's next timer tick. publish() above ordered the bounce+seq before this,
+                // so by the time the waiter is scheduled it observes the completed reply. The
+                // requester's doorbell handler does the actual (voluntary) reschedule.
+                crate::gic::trigger_sgi_core(from as u32, DOORBELL_SGI);
                 served += 1;
             }
             _ => {} // debt-protocol traffic is handled elsewhere
@@ -3153,6 +3320,7 @@ fn write_sockaddr(addr: &akuma_net::socket::SocketAddrV4) -> [u8; 16] {
 /// `curl` rides the same dispatch as the exec-fetch. Socket ops are NON-BLOCKING here (the
 /// secondary re-issues on `-EAGAIN`) so the single forward-server thread never stalls; only
 /// `connect` blocks (bounded, one-shot). Unknown syscalls return `-ENOSYS`.
+#[allow(clippy::large_stack_arrays)] // FWD_BOUNCE_CAP staging buffers; runs on the fwd-server's ≥480 KiB kernel stack
 fn service_forwarded_syscall(cfg: &MachineConfig, from: usize) -> (u64, u64) {
     use crate::syscall::nr;
     use akuma_net::socket;

@@ -590,7 +590,7 @@ pub const DEFERRED_THREAD_CLEANUP: bool = true;
 /// 10ms is enough for context switches to complete while not blocking tests.
 pub const THREAD_CLEANUP_COOLDOWN_US: u64 = 10_000; // 10ms
 
-pub const THREADING_HEARTBEAT_INTERVAL: u64 = 100000; // 1000 iterations
+pub const THREADING_HEARTBEAT_INTERVAL: u64 = 50_000_000; // BSP idle heartbeat print cadence (raised to keep serial from throttling the guest)
 
 // ============================================================================
 // Herd Process Supervisor Configuration

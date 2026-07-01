@@ -1235,6 +1235,11 @@ fn run_async_main() -> ! {
     #[cfg(kernel_smp)]
     smp::start_fwd_server();
 
+    // Multikernel: activate a secondary for the forward-latency micro-benchmark (no-op unless
+    // the bench is enabled), so a plain `SMP=2` boot measures the transport without disk/herd.
+    #[cfg(kernel_smp)]
+    smp::autostart_bench_core();
+
     // Initialize SSH host key
     ssh::init_host_key();
 

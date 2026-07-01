@@ -24,10 +24,18 @@ use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 /// real workloads (R4b.5): socket/TLS data and — the big one — exec ELF loads (a 1 MiB busybox
 /// for sshd's shell) cross in far fewer round-trips (64 vs ~250 at 4 KiB), which dominates
 /// interactive latency. 16 KiB is the sweet spot: it's the largest chunk that keeps the helpers'
-/// stack staging buffers (`[u8; FWD_BOUNCE_CAP]`) within clippy's 16 KiB stack-array limit and the
-/// descriptor small (16 KiB × `MAX_CORES` = 128 KiB). The real bulk fix is a shared `(offset,len)`
-/// arena (§16), not an ever-larger control-path buffer.
-pub const FWD_BOUNCE_CAP: usize = 16384;
+/// stack staging buffers (`[u8; FWD_BOUNCE_CAP]`).
+///
+/// Buffer-size sweep (docs/MULTIKERNEL_NETWORKING_EXPERIMENT.md, after the doorbell-wake fix):
+/// bulk fetch of a 1.5 MiB file measured 74 MB/s @ 16 KiB, **119 MB/s @ 64 KiB**, but 113 MB/s
+/// @ 128 KiB — i.e. we go **copy-bound** (the byte-wise `AtomicU8` bounce copy dominates) past
+/// ~64 KiB, and 128 KiB also overflowed a 256 KiB thread stack via the staging arrays. So
+/// **64 KiB is the knee** and the value we keep. The helpers' `[u8; FWD_BOUNCE_CAP]` staging
+/// buffers now exceed clippy's stack-array limit, so those specific sites carry
+/// `#[allow(clippy::large_stack_arrays)]` (they run on ≥480 KiB kernel stacks; 64 KiB is safe).
+/// A bigger control-path buffer is NOT the real bulk lever past here: a shared `(offset,len)`
+/// arena that skips the per-chunk copy is (§16).
+pub const FWD_BOUNCE_CAP: usize = 65536;
 
 /// Number of scalar syscall arguments a forwarded call carries (matches the AArch64
 /// syscall ABI: x0–x5).
@@ -92,7 +100,10 @@ impl Default for FwdBounce {
 }
 
 impl FwdBounce {
+    // Only ever a `static` field of the descriptor, never on a real stack, so the
+    // large-array lint on this FWD_BOUNCE_CAP const initializer is a false positive.
     #[must_use]
+    #[allow(clippy::large_stack_arrays)]
     pub const fn new() -> Self {
         Self {
             bytes: [const { AtomicU8::new(0) }; FWD_BOUNCE_CAP],

@@ -108,12 +108,26 @@ bridge writes `/proc/<pid>/fd/0`). Verified under QEMU `SMP=4 @ 2 GB` (the pinne
   (a live socket momentarily reads inactive → sshd saw "client closed" → tightened EOF to `!may_recv()`
   only). `FWD_BOUNCE_CAP` was raised 4 KiB → 16 KiB so the 1 MiB shell/curl ELF loads cross in ~64
   round-trips, not ~250.
+- **Forwarded-syscall latency fix (§8.1) — DONE (2026-07-01):** the "extremely slowly" above was
+  a scheduling bug, not a transport one. A parked forwarder yields to the per-core idle boot
+  thread, which is COOPERATIVE — so an involuntary scheduler SGI won't preempt it and the waiter
+  only resumed on the next timer tick (~44 ms; empirically ~3 ticks ⇒ **~136 ms per forwarded
+  syscall**). Fix: the BSP rings the requester's doorbell right after publishing a reply
+  (`service_fwd_requests`), and the secondary's doorbell handler does a VOLUNTARY reschedule
+  (`FWD_AWAITING_REPLY` + `threading::request_voluntary_reschedule` -> self scheduler-SGI) so it
+  preempts idle->waiter at once. Result: **~136 ms -> ~45 us per round-trip (~3000x)**;
+  `curl -sS https://ifconfig.me` on core 1 went **~8.5 s -> ~1.6 s** end-to-end. A buffer sweep
+  then showed 64 KiB is the knee (74->119 MB/s bulk; 128 KiB regresses, copy-bound) so
+  `FWD_BOUNCE_CAP` is 64 KiB. Full write-up + numbers + repro: **`MULTIKERNEL_NETWORKING_EXPERIMENT.md`**.
+  Also: herd now rejects (with an error) two services pinned to the same core, since a kernel
+  runs only one init program per core.
 
 Build with `scripts/build_smp.sh`; boot with `scripts/run_smp.sh` (or `SMP=N cargo run
 --profile release-smp --features smp`). Host-test/simulate the protocol with no QEMU:
 `cargo test -p akuma-smp --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)`. Remaining: dynamic
-memory (M4); forwarding **throughput** (the bounce is 16 KiB so bulk/TLS still chunks in many
-round-trips — a shared `(offset,len)` bounce arena is the §16 fix); sshd's single-threaded accept
+memory (M4); forwarding **throughput** (the bounce is 64 KiB and we're now copy-bound on the
+byte-wise bounce copy — a shared `(offset,len)` bounce arena that skips the per-chunk copy is
+the §16 fix; see `MULTIKERNEL_NETWORKING_EXPERIMENT.md`); sshd's single-threaded accept
 loop serves one connection at a time (a stuck connection blocks new logins — connection-teardown
 robustness is future work); and the §16 hardening (caps map as descriptor data, owner-side capability
 enforcement, BSP on its own restricted table). Deferred cleanup/tech-debt is tracked in §16.

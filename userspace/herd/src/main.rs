@@ -424,6 +424,10 @@ impl SupervisedProcess {
 struct HerdState {
     services: BTreeMap<String, SupervisedProcess>,
     last_config_reload_ms: u64,
+    /// Secondary core -> name of the service pinned there. A kernel can run only ONE init
+    /// program per core (core_init overwrites the pending program), so herd must reject a
+    /// second service pinned to an already-claimed core rather than silently clobber it.
+    pinned_cores: BTreeMap<u32, String>,
 }
 
 impl HerdState {
@@ -431,6 +435,7 @@ impl HerdState {
         Self {
             services: BTreeMap::new(),
             last_config_reload_ms: 0,
+            pinned_cores: BTreeMap::new(),
         }
     }
 }
@@ -956,6 +961,26 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
             }
             return;
         }
+        // One init program per core: the kernel's core_init overwrites the pending program,
+        // so if another service already claimed this core, reject this one with an error
+        // rather than silently clobbering it (which is what happened when sshd and netcheck
+        // were both pinned to core 1). A service re-pinning the SAME core it already owns
+        // (e.g. across a config reload) is fine.
+        if let Some(existing) = state.pinned_cores.get(&config.core) {
+            if existing.as_str() != name {
+                print("[herd] Error: ");
+                print(name);
+                print(": core ");
+                print_dec(config.core as usize);
+                print(" already pinned to '");
+                print(existing);
+                print("' — only one init program per core; not started\n");
+                if let Some(svc) = state.services.get_mut(name) {
+                    svc.state = ServiceState::Failed;
+                }
+                return;
+            }
+        }
         // The activation message carries the WHOLE command line (program + args), space-
         // separated; the target core's kernel splits it back into argv before spawning (the
         // pinned process gets its arguments, e.g. `curl -sS https://ifconfig.me`).
@@ -965,6 +990,9 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
             cmdline.push_str(a);
         }
         let ok = core_init(config.core, &cmdline);
+        if ok {
+            state.pinned_cores.insert(config.core, String::from(name));
+        }
         if let Some(svc) = state.services.get_mut(name) {
             if ok {
                 print("[herd] core_init(");
