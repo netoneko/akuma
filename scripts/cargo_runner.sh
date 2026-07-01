@@ -190,17 +190,18 @@ case "$CORE2_NIC" in
   0|off|no|false|FALSE)
     ;;
   1|on|yes|true|TRUE)
-    # CORE2_HTTP_PORT - host port forwarded to :80 on NIC2's SLIRP, so a plain-HTTP GET from
-    #                   the secondary's rump stack (rumphttp) can reach a server you run on the
-    #                   host. Default 8081; set empty to disable the forward.
+    # CORE2_HTTP_PORT - host port -> :80 on NIC2's SLIRP (a plain-HTTP GET from the secondary's
+    #                   rump stack can reach a server you run on the host). Default 8081.
+    # CORE2_SSH_PORT  - host port -> :22 on NIC2's SLIRP, to `ssh` into an sshd running INSIDE
+    #                   core 2's rump box (the whole session + curl then ride the rump stack).
+    #                   Default 2224. Set either empty to drop that forward.
     CORE2_HTTP_PORT="${CORE2_HTTP_PORT:-8081}"
-    if [ -n "$CORE2_HTTP_PORT" ]; then
-      CORE2_NIC_ARGS+=(-netdev "user,id=net2,hostfwd=tcp::${CORE2_HTTP_PORT}-:80")
-      echo "[cargo_runner] core2 NIC (net2) on virtio-mmio-bus.5; host :${CORE2_HTTP_PORT} -> secondary rump :80" >&2
-    else
-      CORE2_NIC_ARGS+=(-netdev "user,id=net2")
-      echo "[cargo_runner] core2 NIC (net2) on virtio-mmio-bus.5 -> secondary rump stack" >&2
-    fi
+    CORE2_SSH_PORT="${CORE2_SSH_PORT:-2224}"
+    C2FWD=""
+    [ -n "$CORE2_HTTP_PORT" ] && C2FWD="${C2FWD},hostfwd=tcp::${CORE2_HTTP_PORT}-:80"
+    [ -n "$CORE2_SSH_PORT" ] && C2FWD="${C2FWD},hostfwd=tcp::${CORE2_SSH_PORT}-:22"
+    CORE2_NIC_ARGS+=(-netdev "user,id=net2${C2FWD}")
+    echo "[cargo_runner] core2 NIC (net2) on virtio-mmio-bus.5; host :${CORE2_HTTP_PORT}->rump:80, :${CORE2_SSH_PORT}->rump:22" >&2
     CORE2_NIC_ARGS+=(-device "virtio-net-device,netdev=net2,bus=virtio-mmio-bus.5")
     ;;
   *)

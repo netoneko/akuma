@@ -41,6 +41,23 @@ const DEFAULT_MAX_RETRIES: u32 = 0;
 /// Herd directories
 const HERD_ENABLED_DIR: &str = "/etc/herd/enabled";
 const HERD_AVAILABLE_DIR: &str = "/etc/herd/available";
+
+/// The enabled-config directory the daemon loads from. Defaults to
+/// [`HERD_ENABLED_DIR`], but a `--enabled-dir <path>` argument overrides it — so a SECOND herd
+/// instance (e.g. pinned to a secondary core to bring up that core's own rump box) can run a
+/// distinct service set without touching the BSP herd's `/etc/herd/enabled`.
+fn enabled_dir() -> String {
+    let mut i = 1;
+    loop {
+        match libakuma::arg(i) {
+            Some("--enabled-dir") => {
+                return libakuma::arg(i + 1).map_or_else(|| String::from(HERD_ENABLED_DIR), String::from);
+            }
+            Some(_) => i += 1,
+            None => return String::from(HERD_ENABLED_DIR),
+        }
+    }
+}
 const HERD_LOG_DIR: &str = "/var/log/herd";
 
 // ============================================================================
@@ -656,39 +673,78 @@ fn parse_u32(s: &str) -> Option<u32> {
 // Config Loading
 // ============================================================================
 
+/// If `--service <path>` args were given, read each config file DIRECTLY (`openat`+`read`, which
+/// forwards fine to the VFS owner on a secondary core — unlike a directory *listing*, which
+/// isn't forwarded). Returns `(service_name, content)` pairs (name = basename minus `.conf`), or
+/// `None` to fall back to an enabled-dir scan. Lets a per-core herd (e.g. pinned to core 2 to
+/// bring up that core's own rump box) load its services without ever scanning a directory.
+fn explicit_service_files() -> Option<Vec<(String, String)>> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut i = 1;
+    loop {
+        match libakuma::arg(i) {
+            Some("--service") => {
+                if let Some(path) = libakuma::arg(i + 1) {
+                    let base = path.rsplit('/').next().unwrap_or(path);
+                    let name = base.trim_end_matches(".conf");
+                    match read_file_string(path) {
+                        Some(c) => out.push((String::from(name), c)),
+                        None => {
+                            print("[herd] Warning: cannot read --service ");
+                            print(path);
+                            print("\n");
+                        }
+                    }
+                }
+                i += 2;
+            }
+            Some(_) => i += 1,
+            None => break,
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 fn reload_config(state: &mut HerdState) {
-    // List enabled directory
-    let dir = match read_dir(HERD_ENABLED_DIR) {
-        Some(d) => d,
+    // Source the service configs: explicit `--service <path>` files (read directly), else scan
+    // the enabled dir (honors --enabled-dir). Direct files work on a secondary core, where the
+    // VFS is forwarded to core 0 and file reads work but directory listing does not.
+    let entries: Vec<(String, String)> = match explicit_service_files() {
+        Some(list) => list,
         None => {
-            print("[herd] Warning: Cannot read enabled directory\n");
-            return;
+            let ed = enabled_dir();
+            let dir = match read_dir(&ed) {
+                Some(d) => d,
+                None => {
+                    print("[herd] Warning: Cannot read enabled directory\n");
+                    return;
+                }
+            };
+            let mut v: Vec<(String, String)> = Vec::new();
+            for entry in dir {
+                if !entry.name.ends_with(".conf") {
+                    continue;
+                }
+                let name = String::from(entry.name.trim_end_matches(".conf"));
+                let path = format!("{}/{}", ed, entry.name);
+                if let Some(c) = read_file_string(&path) {
+                    v.push((name, c));
+                }
+            }
+            v
         }
     };
 
     let mut found_services: Vec<String> = Vec::new();
-
-    for entry in dir {
-        if !entry.name.ends_with(".conf") {
-            continue;
-        }
-
-        let service_name = entry.name.trim_end_matches(".conf");
-        found_services.push(String::from(service_name));
-
-        // Read config file
-        let config_path = format!("{}/{}", HERD_ENABLED_DIR, entry.name);
-        let content = match read_file_string(&config_path) {
-            Some(c) => c,
-            None => continue,
-        };
+    for (service_name, content) in &entries {
+        found_services.push(service_name.clone());
 
         // Parse config
-        let config = match parse_service_config(&content) {
+        let config = match parse_service_config(content) {
             Some(c) => c,
             None => {
                 print("[herd] Error parsing ");
-                print(&entry.name);
+                print(service_name);
                 print("\n");
                 continue;
             }
@@ -698,8 +754,8 @@ fn reload_config(state: &mut HerdState) {
         if let Some(svc) = state.services.get_mut(service_name) {
             svc.config = config;
         } else {
-            let svc = SupervisedProcess::new(String::from(service_name), config);
-            state.services.insert(String::from(service_name), svc);
+            let svc = SupervisedProcess::new(service_name.clone(), config);
+            state.services.insert(service_name.clone(), svc);
         }
     }
 

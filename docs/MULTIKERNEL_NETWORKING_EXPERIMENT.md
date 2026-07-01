@@ -92,6 +92,35 @@ internet DNS + TLS RTT, which is fixed regardless of forwarding speed; the 3000�
 syscall-bound phases. (The ELF fetch stays fast even before the fix, because it runs on the boot
 thread, which busy-spins — there's no idle thread to hand off to until the process is spawned.)
 
+### curl comparison: native (core 0) vs forwarded (core 1)
+
+Measured the way it's actually used — **interactively over SSH**, with curl's own `-w` phase
+timing, fetching Apple's captive-portal page over HTTP and HTTPS (SMP=2, MEMORY=2048, HVF).
+`ssh -p 2222` lands a core-0 shell (native smoltcp); `ssh -p 2323` lands a core-1 shell (all
+networking forwarded to core 0). Both return HTTP 200 `<TITLE>Success</TITLE>`.
+
+`curl -sS -o /dev/null -w ... http://www.apple.com/library/test/success.html https://…`
+
+| phase | core 0 — native | core 1 — forwarded | overhead |
+|---|---|---|---|
+| **HTTP total** | **0.100 s** | **1.379 s** | ~14× |
+| **HTTPS total** | **0.271 s** | **2.642 s** | ~10× |
+| DNS lookup | 0.03–0.09 s | 0.72–0.76 s | ~10–28× |
+| TCP connect | 0.04–0.10 s | 1.18–1.29 s | ~13–34× |
+| TLS handshake | 0.21 s | 2.31 s | ~11× |
+
+The native stack is fast (100 ms HTTP / 271 ms HTTPS). Forwarding is correct and usable but
+carries a real per-syscall tax that accumulates over the handshake-heavy phases (every DNS/TLS/
+HTTP round-trip is several forwarded socket syscalls). This is the motivation for a local rump
+stack on the secondary (core 2), which avoids forwarding entirely — the Stage 2 comparison
+(curl-over-rump) is pending.
+
+**Methodology caveat (important):** native core-0 curl is **not** broken. An earlier apparent
+"hang" was purely a test-harness artifact — running curl as a stripped-down herd *boot-time
+oneshot* (sshd + other services disabled) tipped the timing-marginal native connect into a
+stall. Run interactively (full boot, live session) it's the fast 0.1 s path above. Always
+measure the native stack from an interactive shell, not a bare boot oneshot.
+
 ## 5. Related changes
 
 - **herd: reject two services pinned to the same core.** A kernel runs one init program per
@@ -165,10 +194,34 @@ page table for the true PA (identity ranges translate to themselves; the replica
 physically contiguous via sequential `PartitionBump` pages, so a page-spanning buffer is safe).
 Not a cache-coherency issue — the address was simply wrong.
 
-**Remaining polish (not blockers):** make the BSP skip the core-2-owned NIC so `RUMP_NIC=1`
-isn't needed alongside `CORE2_NIC=1`; wire NIC→core assignment through herd core-init (see the
-memory note) instead of the hardcoded `RUMP_NIC_CORE`; then do the perf comparison vs the
-forwarded core-1 curl.
+**Remaining polish (not blockers):** the BSP now binds its rump tap to bus.4 explicitly so
+`CORE2_NIC=1` works without `RUMP_NIC=1`; wire NIC→core assignment through herd core-init (see
+the memory note) instead of the hardcoded `RUMP_NIC_CORE`.
+
+### Stage 2 — real curl over a LOCAL rump stack on core 2 (mechanism achieved)
+
+Goal: an unmodified `curl` on core 2 whose networking goes through core 2's OWN rump stack (not
+forwarded to core 0). Approach: run a **second herd instance pinned to core 2** (herd
+`--service <path>` to load its config files directly — a secondary's forwarded VFS does file
+reads but not directory listing; see the getdents64 TODO). That herd creates a `stack=rump` box,
+spawns `rump_server` in it (over core 2's local NIC / bus.5), and joins a curl + an sshd to the
+box; the kernel's `rump_proxy` (all per-core-replicated state) sysproxy-routes the box's socket
+syscalls to that rump_server.
+
+**Working end-to-end on core 2:** box marked `stack=rump`; sysproxy channel attached;
+`rump_server` created `virt0` and **DHCP'd 10.0.2.15/24** over bus.5; curl's
+`socket`/`bind`/`sendto`/`recvmsg` all routed via `[RUMP-SP]` to rump_server; a DNS query went
+out and a 161-byte response came back — **all over core 2's local rump stack, zero forwarding**.
+`sshd-rump` (interactive SSH-over-rump) also comes up listening (:22 → host :2224).
+
+**Open — sysproxy latency on the secondary:** each sysproxy syscall round-trip on core 2 takes
+**~840 ms** (`[RUMP-SP] sendto -> 31 (847312us)`), so curl times out on the handshake
+(`rumpapple[000] total=11.5s`). Root cause: curl + `rump_server` + its ~19 rump kthreads + the
+idle thread all share core 2's **cooperative scheduler**, and the pipe-hop wakeup/reschedule
+latency (same class as the cross-core doorbell fix, but intra-core) compounds across the
+round-trips. Fixing it needs an efficient pipe-reader wakeup + voluntary reschedule on the
+secondary. Until then the routing is proven but too slow to complete a real request — so the
+3-way curl comparison (native / forwarded / rump-local) is pending that fix.
 
 Repro: `RUMP_NIC=1 CORE2_NIC=1 SMP=3 MEMORY=2048 cargo run --profile release-smp --features
 smp,rump,no-tests`, with `/etc/herd/enabled/rumphttp.conf` (args `10.0.2.2 <port>`) and a host
