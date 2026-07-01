@@ -1,0 +1,56 @@
+========================================================================
+ Akuma Devbox — cheat sheet
+========================================================================
+
+You are inside the rump box. All networking goes through the NetBSD rump
+TCP/IP stack (not smoltcp). Full README: /src/github.com/netoneko/akuma/overlays/devbox/README.md
+
+------------------------------------------------------------------------
+ 1. Secrets (fill these in first)
+------------------------------------------------------------------------
+
+z.ai / GLM-5.2 API key  -> edit /etc/meow/config, uncomment + set api_key:
+    vi /etc/meow/config
+        [provider:zai]
+        base_url=https://api.z.ai/api/paas/v4
+        type=openai
+        api_key=YOUR_ZAI_KEY          <- set this
+    meow -c "hello"                    # smoke test
+
+GitHub PAT (for git/scratch clone + push):
+    scratch config credential.token ghp_your_token_here
+    # or per push:  git push main --token ghp_your_token_here
+
+------------------------------------------------------------------------
+ 2. Edit / build
+------------------------------------------------------------------------
+
+Editor:   vi <file>                    # neatvi
+C:        tcc -static -o hello hello.c && ./hello
+Rust:     export PATH=/usr/local/bin:$PATH
+
+Rebuild meow from source (linux ABI -> routed through rump):
+    cd /src/github.com/netoneko/akuma/userspace/meow
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-Clinker=rust-lld -Clinker-flavor=ld.lld -Clink-self-contained=no" \
+    cargo build --release --target aarch64-unknown-linux-musl --features linux-net \
+        -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
+    ./target/aarch64-unknown-linux-musl/release/meow --help
+
+------------------------------------------------------------------------
+ 3. git via scratch
+------------------------------------------------------------------------
+
+    git clone https://github.com/<you>/<repo>.git
+    git add . && git commit -m "wip" && git push
+
+------------------------------------------------------------------------
+ 4. meow -> GLM-5.2
+------------------------------------------------------------------------
+
+    meow                 # interactive TUI
+    meow -c "message"    # one-shot
+
+------------------------------------------------------------------------
+Hit a papercut? That's the point. Write it down — the devbox exists to
+find and fix the rough edges of daily use inside Akuma.
+========================================================================

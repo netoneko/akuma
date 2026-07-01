@@ -3,6 +3,7 @@
 # This avoids needing fuse-ext2 or debugfs on macOS
 #
 # Usage: ./scripts/populate_disk.sh [--bin-only] [--with-apk] [--with-musl-dev] [--with-rust-toolchain]
+#                                   [--overlay DIR] [--full-busybox]
 #   --bin-only             Only update /bin directory (faster for development)
 #   --etc-only             Only update /etc directory (faster for development)
 #   --with-apk             Pre-install Alpine busybox package (sets up symlinks via apk)
@@ -14,6 +15,13 @@
 #                          from static.rust-lang.org and installs them under /usr/local;
 #                          also apk-installs the C toolchain (clang, lld, gcc, make,
 #                          musl-dev). No network needed inside the VM to start a build.
+#   --overlay DIR          Overlay-only mode: copy DIR/. over the mounted image WITHOUT the
+#                          base bootstrap copy/wipe. Use to layer profile-specific files
+#                          (e.g. overlays/devbox) or a staged source tree on top of an
+#                          already-populated image. Repeatable across separate invocations.
+#   --full-busybox         Generate the complete busybox applet symlink set in /bin (awk,
+#                          sed, find, tar, ps, …), never clobbering a real shipped binary
+#                          (e.g. /bin/git -> scratch). Composable with any mode.
 #
 # DISK env var overrides the image path (default: disk.img), so you can prepare a
 # separate image without touching the primary one, e.g.:
@@ -27,6 +35,8 @@ BIN_ONLY=false
 WITH_APK=false
 WITH_MUSL_DEV=false
 WITH_RUST_TOOLCHAIN=false
+OVERLAY_DIR=""
+FULL_BUSYBOX=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -51,13 +61,35 @@ while [[ $# -gt 0 ]]; do
             WITH_RUST_TOOLCHAIN=true
             shift
             ;;
+        --overlay)
+            OVERLAY_DIR="$2"
+            shift 2
+            ;;
+        --full-busybox)
+            FULL_BUSYBOX=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--bin-only] [--with-apk] [--with-musl-dev] [--with-rust-toolchain]"
+            echo "Usage: $0 [--bin-only] [--with-apk] [--with-musl-dev] [--with-rust-toolchain] [--overlay DIR] [--full-busybox]"
             exit 1
             ;;
     esac
 done
+
+# Resolve --overlay DIR to an absolute path for the Docker bind mount.
+OVERLAY_MOUNT=""
+if [ -n "$OVERLAY_DIR" ]; then
+    case "$OVERLAY_DIR" in
+        /*) OVERLAY_ABS="$OVERLAY_DIR" ;;
+        *)  OVERLAY_ABS="$(pwd)/$OVERLAY_DIR" ;;
+    esac
+    if [ ! -d "$OVERLAY_ABS" ]; then
+        echo "Error: overlay dir $OVERLAY_ABS not found."
+        exit 1
+    fi
+    OVERLAY_MOUNT="-v $OVERLAY_ABS:/overlay:ro"
+fi
 
 if [ ! -f "$DISK_IMG" ]; then
     echo "Error: $DISK_IMG not found. Run ./scripts/create_disk.sh first."
@@ -69,7 +101,16 @@ if [ ! -d "$BOOTSTRAP_DIR" ]; then
     exit 1
 fi
 
-if [ "$BIN_ONLY" = true ]; then
+if [ -n "$OVERLAY_DIR" ]; then
+    echo "Overlaying $OVERLAY_ABS onto $DISK_IMG (no base copy)..."
+    COPY_CMD='
+        # Overlay-only: layer files on top of an already-populated image. No wipe.
+        echo "Copying overlay files..."
+        cp -a /overlay/. /mnt/disk/
+        echo ""
+        echo "Overlay applied."
+    '
+elif [ "$BIN_ONLY" = true ]; then
     echo "Updating /bin in $DISK_IMG..."
     COPY_CMD='
         # Only copy bin directory
@@ -184,12 +225,71 @@ if [ "$WITH_RUST_TOOLCHAIN" = true ]; then
     '
 fi
 
+# Essential symlinks (git -> scratch + a handful of busybox commands). Run for the base
+# populate/bin/etc modes but NOT for an overlay-only pass (which must not touch /bin).
+SYMLINK_CMD=''
+if [ -z "$OVERLAY_DIR" ]; then
+    SYMLINK_CMD='
+        # Create git -> scratch symlink so "git clone" works without specifying scratch
+        ln -sf scratch /mnt/disk/bin/git
+        echo "Created /bin/git -> scratch"
+
+        # Create essential busybox symlinks (apk --no-scripts skips post-install triggers)
+        for cmd in sh chmod ls mkdir rm cat echo grep; do
+            ln -sf busybox.static /mnt/disk/bin/$cmd 2>/dev/null || true
+        done
+        echo "Created busybox symlinks"
+    '
+fi
+
+# Full busybox applet symlink set (--full-busybox). Composable with any mode.
+FULL_BUSYBOX_CMD=''
+if [ "$FULL_BUSYBOX" = true ]; then
+    FULL_BUSYBOX_CMD='
+        echo "Generating full busybox applet symlinks..."
+        BB=busybox.static
+        [ -e /mnt/disk/bin/$BB ] || BB=busybox
+        if [ -e /mnt/disk/bin/$BB ]; then
+            # Prefer the binary'"'"'s own applet list; fall back to a curated set if it cannot
+            # be exec'"'"'d in this container (e.g. arch mismatch).
+            APPLETS="$(/mnt/disk/bin/$BB --list 2>/dev/null || true)"
+            if [ -z "$APPLETS" ]; then
+                APPLETS="awk sed grep egrep fgrep find xargs tar gzip gunzip zcat bzip2 xz unxz cpio \
+                    less more head tail sort uniq wc cut tr nl fold comm paste \
+                    cat tac printf dir cp mv rm mkdir rmdir ln touch stat readlink realpath \
+                    basename dirname pwd env printenv date sleep usleep sync truncate \
+                    chmod chown chgrp du df mount umount losetup mknod mkfifo \
+                    ps top kill killall pgrep pkill nice renice free uptime watch \
+                    id whoami who groups hostname uname clear reset tty stty \
+                    test true false yes seq expr dd shuf \
+                    sha1sum sha256sum sha512sum md5sum cksum base64 \
+                    tee od hexdump xxd cmp diff patch strings split \
+                    which whereis mktemp getopt \
+                    wget nc telnet ping traceroute nslookup ifconfig route netstat \
+                    ash hush"
+            fi
+            for app in $APPLETS; do
+                # Never clobber a real (non-symlink) binary we ship (git->scratch,
+                # vi->neatvi, tcc, meow, curl, scratch, ...).
+                if [ -e /mnt/disk/bin/$app ] && [ ! -L /mnt/disk/bin/$app ]; then
+                    continue
+                fi
+                ln -sf $BB /mnt/disk/bin/$app 2>/dev/null || true
+            done
+            echo "Linked busybox applets ($BB)"
+        else
+            echo "WARN: no busybox binary on disk; skipping applet symlinks"
+        fi
+    '
+fi
+
 # Use Docker to mount and copy files
 # - Mount disk.img as a loop device inside the container
-# - Copy bootstrap files to the mounted filesystem
+# - Copy bootstrap files (or an --overlay dir) to the mounted filesystem
 docker run --rm --privileged \
     -v "$(pwd)/$DISK_IMG:/disk.img" \
     -v "$(pwd)/$BOOTSTRAP_DIR:/bootstrap:ro" \
+    $OVERLAY_MOUNT \
     alpine:latest \
     sh -c "
         set -e
@@ -209,15 +309,9 @@ docker run --rm --privileged \
 
         $RUST_CMD
 
-        # Create git -> scratch symlink so 'git clone' works without specifying scratch
-        ln -sf scratch /mnt/disk/bin/git
-        echo 'Created /bin/git -> scratch'
+        $SYMLINK_CMD
 
-        # Create essential busybox symlinks (apk --no-scripts skips post-install triggers)
-        for cmd in sh chmod ls mkdir rm cat echo grep; do
-            ln -sf busybox.static /mnt/disk/bin/$cmd 2>/dev/null || true
-        done
-        echo 'Created busybox symlinks'
+        $FULL_BUSYBOX_CMD
 
         # Sync and unmount
         sync
@@ -228,7 +322,9 @@ docker run --rm --privileged \
     "
 
 echo ""
-if [ "$BIN_ONLY" = true ]; then
+if [ -n "$OVERLAY_DIR" ]; then
+    echo "Successfully overlaid $OVERLAY_ABS onto $DISK_IMG"
+elif [ "$BIN_ONLY" = true ]; then
     echo "Successfully updated /bin in $DISK_IMG"
 elif [ "$WITH_RUST_TOOLCHAIN" = true ]; then
     echo "Successfully populated $DISK_IMG with the nightly Rust toolchain + packages"

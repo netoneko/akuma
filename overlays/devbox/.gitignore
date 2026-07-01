@@ -1,0 +1,2 @@
+# Build working area for bootstrap.sh (neatvi clone, repo clone staging, etc.)
+.stage/
