@@ -204,6 +204,13 @@ pub struct ExecConfig {
     /// Enable the vfork fast-path (shared-AS child for CLONE_VFORK). See
     /// `config::VFORK_FASTPATH_ENABLED`.
     pub vfork_fastpath_enabled: bool,
+
+    /// Always load an exec'd ELF whole (via `runtime().read_file`) instead of the
+    /// demand-paged path, regardless of size. Set on a multikernel SECONDARY core, where
+    /// the filesystem is `Proxy`'d to the owner: a single forwarded whole-file fetch is far
+    /// simpler and more robust than per-page forwarded `read_at` + an inode-keyed file-page
+    /// cache the secondary never set up (docs/MULTIKERNEL.md §10 Part B). `false` on the BSP.
+    pub prefer_whole_file_load: bool,
 }
 
 // Lock-free single-shot cells: must be safe to read from IRQ context.

@@ -496,6 +496,9 @@ pub(crate) fn build_exec_runtime(
         proc_stdout_max_size: config::PROC_STDOUT_MAX_SIZE,
         cow_fork_enabled: config::COW_FORK_ENABLED,
         vfork_fastpath_enabled: config::VFORK_FASTPATH_ENABLED,
+        // BSP/single-kernel: use the normal size-based loader. A multikernel secondary flips
+        // this to true (it forwards file reads to the owner; whole-file is simplest there).
+        prefer_whole_file_load: false,
     };
     (rt, cfg)
 }

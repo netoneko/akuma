@@ -1845,7 +1845,7 @@ fn run_r3a_coop_test(cc: &CoreConfig, idx: usize, percpu: usize) -> bool {
     // that `build_isolated_table` allocated, which is `STACK_PAGES` pages.
     let sec_base = sec_top - STACK_PAGES * PAGE;
     let user_stack = crate::config::compute_user_stack_size(cc.ram_len as usize);
-    let (mut rt, cfg) = crate::build_exec_runtime(sec_base, sec_top, user_stack, false);
+    let (mut rt, mut cfg) = crate::build_exec_runtime(sec_base, sec_top, user_stack, false);
     rt.trigger_sgi = trigger_sched_sgi_self;
     // Publish our partition for the user-AS overlay hook (a bare fn ptr can't capture it),
     // then install the hook so the normal spawn path builds a correct user table on this
@@ -1857,6 +1857,12 @@ fn run_r3a_coop_test(cc: &CoreConfig, idx: usize, percpu: usize) -> bool {
     // Forward a `close` for any RemoteFd (a Proxy'd file/socket) still open when a process
     // exits, so the owner frees its handle (R4b.5, §8.1).
     rt.remote_fd_close = Some(fwd_close_remote);
+    // This core has no local VFS: forward exec's file reads to the owner, and force the
+    // whole-file load path (one forwarded fetch) instead of demand-paging (R4b.5 Phase 2).
+    rt.read_file = secondary_forward_read_file;
+    rt.read_at = secondary_forward_read_at;
+    rt.file_size = secondary_forward_file_size;
+    cfg.prefer_whole_file_load = true;
     akuma_exec::init(rt, cfg);
 
     // Stage marker helper: record progress to PerCpu so the BSP can pinpoint a hang.
@@ -2457,6 +2463,10 @@ fn spawn_init_program(cfg: &MachineConfig, idx: usize) {
     // date checks (and any time-dependent logic) see real time, not 1970 (the RTC is BSP-only).
     seed_realtime_from_owner();
 
+    // Mount this core's local procfs so a spawned process (and any children — e.g. sshd's
+    // login shell) can resolve /proc/<pid>/... against THIS core's process table.
+    mount_local_procfs();
+
     // VFS is Proxy'd to the owner on a secondary; fetch the ELF over the forward transport.
     let Some(owner) = capability_owner(idx, nr::OPENAT) else {
         crate::safe_print!(96, "[core {}] init: VFS not forwardable — cannot fetch {}\n", idx, prog);
@@ -2525,7 +2535,9 @@ fn forward_retry(
     cfg: &MachineConfig, idx: usize, owner: usize, nr: u64, args: &[u64; 6],
     in_buf: Option<&[u8]>, nonblock: bool, timeout_us: u64,
 ) -> u64 {
-    let deadline = crate::timer::uptime_us() + timeout_us;
+    // saturating_add: callers pass u64::MAX for "no timeout" (e.g. a blocking accept), and a
+    // plain `+` would overflow → a tiny deadline → spurious ETIMEDOUT on the first EAGAIN.
+    let deadline = crate::timer::uptime_us().saturating_add(timeout_us);
     loop {
         let r = forward_syscall(cfg, idx, owner, nr, args, in_buf);
         if !is_eagain(r) {
@@ -2715,6 +2727,76 @@ pub fn fwd_getsockopt(handle: u32, level: i32, optname: i32, optval_out: &mut [u
         optval_out[..n].copy_from_slice(&tmp[..n]);
     }
     r
+}
+
+/// Secondary `ExecRuntime::read_file` hook: fetch a whole file by forwarding open/read/close
+/// to the VFS owner (R4b.5 Phase 2 — exec on a secondary, e.g. sshd spawning `/bin/sh`, or a
+/// shell spawning `curl`). Installed only on a secondary, so it always forwards.
+pub fn secondary_forward_read_file(path: &str) -> Result<alloc::vec::Vec<u8>, i32> {
+    let Some((cfg, idx, owner)) = fwd_ctx() else { return Err(-38) };
+    fetch_file_forwarded(cfg, idx, owner, path.as_bytes()).ok_or(-5)
+}
+
+/// Secondary `ExecRuntime::read_at` hook: forwarded positional read (fresh handle = pread
+/// semantics). A fallback — `prefer_whole_file_load` routes exec through `read_file` — kept
+/// correct for the interp/large-file paths.
+fn secondary_forward_read_at(path: &str, off: usize, buf: &mut [u8]) -> Result<usize, i32> {
+    let h = fwd_openat(path, 0, 0);
+    if (h as i64) < 0 {
+        return Err(h as i32);
+    }
+    let handle = h as u32;
+    if off != 0 {
+        let _ = fwd_lseek(handle, off as i64, 0);
+    }
+    let mut total = 0usize;
+    while total < buf.len() {
+        let n = fwd_read(handle, &mut buf[total..]);
+        if (n as i64) < 0 {
+            let _ = fwd_close(handle);
+            return Err(n as i32);
+        }
+        if n == 0 {
+            break;
+        }
+        total += n as usize;
+    }
+    let _ = fwd_close(handle);
+    Ok(total)
+}
+
+/// Secondary `ExecRuntime::file_size` hook: forwarded `fstat` size.
+fn secondary_forward_file_size(path: &str) -> Result<u64, &'static str> {
+    let h = fwd_openat(path, 0, 0);
+    if (h as i64) < 0 {
+        return Err("openat failed");
+    }
+    let handle = h as u32;
+    let sz = fwd_fstat_size(handle);
+    let _ = fwd_close(handle);
+    if (sz as i64) < 0 {
+        Err("fstat failed")
+    } else {
+        Ok(sz)
+    }
+}
+
+/// Mount this core's OWN local procfs (R4b.5 Phase 2). The VFS mount table is a replicated
+/// static (empty on a secondary); procfs is stateless and resolves `/proc/<pid>/...` against
+/// THIS core's process table — exactly what an interactive shell needs (sshd's bridge writes
+/// the login shell's stdin via `/proc/<pid>/fd/0`, a core-local pid). ext2 is deliberately NOT
+/// mounted — real-file paths forward to the owner (the openat hook skips `/proc` and `/dev`).
+fn mount_local_procfs() {
+    crate::vfs::init();
+    let proc_fs = alloc::sync::Arc::new(crate::vfs::proc::ProcFilesystem::new());
+    if let Err(e) = crate::vfs::mount("/proc", proc_fs) {
+        crate::safe_print!(64, "[core ?] local procfs mount failed: {:?}\n", e);
+        return;
+    }
+    // Enable the `crate::fs::*` wrappers (they gate on this flag) so the local `/proc`
+    // resolves — the sshd shell bridge opens `/proc/<pid>/fd/0`. ext2 is not mounted here;
+    // real-file paths forward to the owner before ever hitting these wrappers.
+    crate::fs::mark_initialized();
 }
 
 /// Seed THIS core's wall clock from the owner ONCE (the RTC is a BSP-only device). Forwards a
@@ -3084,21 +3166,35 @@ fn service_forwarded_syscall(cfg: &MachineConfig, from: usize) -> (u64, u64) {
     };
     let ret = match sysno {
         // ── VFS ────────────────────────────────────────────────────────────────────────
-        // openat(dirfd, path, flags, mode): NUL-terminated path in the bounce. Read-only
-        // (Phase-0 curl/sshd only READ owner files; host-key generation is pre-staged).
+        // openat(dirfd, path, flags, mode): NUL-terminated path in the bounce; flags in
+        // args[2]. Reads (curl/sshd config, CA bundle, exec ELFs) are the common case;
+        // O_CREAT/O_TRUNC are honored too so sshd can generate its host key on the owner's
+        // ext2 (the subsequent forwarded `write`s go to the same File handle).
         nr::OPENAT => {
+            let flags = args[2] as u32;
+            const O_CREAT: u32 = 0o100;
+            const O_TRUNC: u32 = 0o1000;
             let mut raw = [0u8; FWD_PATH_MAX];
             bounce.read(&mut raw);
             let plen = raw.iter().position(|&b| b == 0).unwrap_or(FWD_PATH_MAX);
             match core::str::from_utf8(&raw[..plen]) {
-                Ok(path) if crate::fs::file_size(path).is_ok() => {
+                Ok(path) => {
+                    let exists = crate::fs::file_size(path).is_ok();
+                    if !exists && (flags & O_CREAT) != 0 {
+                        if crate::fs::write_file(path, &[]).is_err() {
+                            return (sysno, enc_err(5)); // EIO — couldn't create
+                        }
+                    } else if !exists {
+                        return (sysno, enc_err(2)); // ENOENT
+                    } else if (flags & O_TRUNC) != 0 {
+                        let _ = crate::fs::write_file(path, &[]);
+                    }
                     let mut fd = ForwardedFd::File { path: [0; FWD_PATH_MAX], path_len: plen, offset: 0 };
                     if let ForwardedFd::File { path: p, .. } = &mut fd {
                         p[..plen].copy_from_slice(&raw[..plen]);
                     }
                     fwd_fd_alloc(fd)
                 }
-                Ok(_) => enc_err(2),   // ENOENT
                 Err(_) => enc_err(22), // EINVAL (bad path bytes)
             }
         }

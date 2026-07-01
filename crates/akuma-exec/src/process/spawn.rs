@@ -166,8 +166,11 @@ pub fn spawn_process_with_channel_ext(
     // had nothing to kill and panicked the whole kernel (EC=0x3c BRK). On the
     // size profile we now always use the path loader and re-stat if needed,
     // never slurp.
-    let want_demand_paged =
-        HEAP_SLURP_MAX == 0 || matches!(stat_size, Some(sz) if sz > HEAP_SLURP_MAX);
+    // A multikernel secondary forwards file reads to the owner; force the whole-file path
+    // (one forwarded fetch) instead of demand-paging, which would need per-page forwarded
+    // read_at + an inode-keyed file-page cache the secondary never set up.
+    let want_demand_paged = !config().prefer_whole_file_load
+        && (HEAP_SLURP_MAX == 0 || matches!(stat_size, Some(sz) if sz > HEAP_SLURP_MAX));
 
     let mut process = if want_demand_paged {
         // The path loader needs a size; re-stat if the first stat failed rather

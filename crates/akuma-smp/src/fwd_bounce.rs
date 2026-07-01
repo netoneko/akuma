@@ -20,11 +20,14 @@ use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 /// Bytes per core in the forwarding bounce region.
 ///
 /// Sized to hold a path or a single forwarded `read`/`write`/`recv`/`send` chunk; larger
-/// transfers loop (§8.1 "Bulk"). Bumped from 256 B to 4 KiB for socket forwarding (R4b.5):
-/// a TLS record / HTTP buffer crosses in far fewer round-trips. The descriptor is
-/// page-aligned in the 1 MiB pre-kernel gap, so the extra bytes (≈30 KiB across `MAX_CORES`)
-/// cost only page count.
-pub const FWD_BOUNCE_CAP: usize = 4096;
+/// transfers loop (§8.1 "Bulk"). Grown 256 B → 4 KiB → 16 KiB as cross-core forwarding took on
+/// real workloads (R4b.5): socket/TLS data and — the big one — exec ELF loads (a 1 MiB busybox
+/// for sshd's shell) cross in far fewer round-trips (64 vs ~250 at 4 KiB), which dominates
+/// interactive latency. 16 KiB is the sweet spot: it's the largest chunk that keeps the helpers'
+/// stack staging buffers (`[u8; FWD_BOUNCE_CAP]`) within clippy's 16 KiB stack-array limit and the
+/// descriptor small (16 KiB × `MAX_CORES` = 128 KiB). The real bulk fix is a shared `(offset,len)`
+/// arena (§16), not an ever-larger control-path buffer.
+pub const FWD_BOUNCE_CAP: usize = 16384;
 
 /// Number of scalar syscall arguments a forwarded call carries (matches the AArch64
 /// syscall ABI: x0–x5).

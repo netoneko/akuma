@@ -1542,7 +1542,28 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
         };
         crate::vfs::resolve_path(&base_path, &path)
     };
-    
+
+    // Multikernel (R4b.5 Phase 2): a pinned process (e.g. a shell resolving `curl` on PATH)
+    // stat's real-file paths that live on the owner's ext2. Forward: open+fstat the file on
+    // core 0; synthesize a regular-file Stat from its size. `/proc`/`/dev` resolve locally.
+    #[cfg(kernel_smp)]
+    if crate::smp::is_on_secondary() && !resolved_path.starts_with("/proc") && !resolved_path.starts_with("/dev") {
+        let h = crate::smp::fwd_openat(&resolved_path, 0, 0);
+        if (h as i64) < 0 {
+            return h; // ENOENT etc.
+        }
+        let sz = crate::smp::fwd_fstat_size(h as u32);
+        let _ = crate::smp::fwd_close(h as u32);
+        if (sz as i64) < 0 {
+            return ENOENT;
+        }
+        let stat = Stat { st_dev: 1, st_ino: 0, st_size: sz as i64, st_mode: 0o100755, st_nlink: 1, st_blksize: 4096, st_blocks: ((sz as i64) + 511) / 512, ..Default::default() };
+        if unsafe { copy_to_user_safe(stat_ptr as *mut u8, (&raw const stat).cast::<u8>(), core::mem::size_of::<Stat>()).is_err() } {
+            return EFAULT;
+        }
+        return 0;
+    }
+
     let mut stat = Stat::default();
     let res = (|| {
         if resolved_path == "/dev/null" {

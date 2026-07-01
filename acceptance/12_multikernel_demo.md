@@ -174,11 +174,31 @@ the socket + VFS forwarding path end to end, with core 1's `PMM`/`POOL`/`TALC` p
 from core 0's throughout (criterion 3). Throughput is modest (4 KiB bounce chunks → many round-trips
 for TLS); a shared `(offset,len)` bounce arena is the tracked §16 throughput follow-up.
 
-> **Phase 2 (not yet done): interactive `sshd` on core 1.** `ssh -p 2323 root@localhost` into a
-> sshd pinned to core 1, then run `curl` there. Beyond the socket forwarding above, this needs a PTY
-> and a per-core procfs working *locally on the secondary* (sshd's shell bridge writes the login
-> shell's stdin via `/proc/<pid>/fd/0`, and `<pid>` is a core-1-local process). `sshd.conf` is staged
-> in `bootstrap/etc/herd/available/` (move to `enabled/` once Phase 2 lands).
+## Steps & expected result — Milestone 3 Phase 2 (interactive sshd on a secondary) — DONE
+
+An interactive **`sshd` pinned to core 1** — `ssh` in and run `curl` in the shell. `sshd.conf`
+(`command = /bin/sshd`, `args = --port 23 --shell /bin/sh`, **`core = 1`**) is in
+`bootstrap/etc/herd/enabled/`. Stage `bootstrap/etc/sshd/authorized_keys` with your public key
+(`cp ~/.ssh/id_ed25519.pub bootstrap/etc/sshd/authorized_keys`), then `populate_disk.sh` +
+`build_smp.sh` + `SMP=2 MEMORY=2048 run_smp.sh`.
+
+herd activates core 1 with the whole command line; core 1 fetches `/bin/sshd`'s ELF over forwarded
+VFS and runs it. sshd's `socket`/`bind`/`listen`/`accept` and its file reads (config, authorized_keys,
+host key — generated on first run into core 0's ext2 via forwarded `openat(O_CREAT)`+`write`) forward
+to core 0. Its login shell (`/bin/sh`) and any command you run (`curl`) are spawned LOCALLY on core 1
+(fork+exec, ELF fetched whole over forwarded VFS); the shell bridge writes the shell's stdin via
+`/proc/<pid>/fd/0` against core 1's OWN locally-mounted procfs.
+
+```bash
+ssh -o StrictHostKeyChecking=no -p 2323 root@localhost      # (QEMU hostfwd :2323 -> guest :23)
+~ # curl -sS https://ifconfig.me
+87.71.63.90                                                 # your public IP, fetched from core 1
+```
+
+**Pass:** the shell prompt returns over the SSH connection, and `curl` in the session prints a public
+IPv4 — every socket/VFS/exec operation of sshd, the shell, and curl serviced by core 0, while core 1's
+kernel statics stay physically isolated. (Caveat: sshd serves one connection at a time; a stuck/half-
+open connection blocks new logins until reboot — connection-teardown robustness is future work.)
 
 ## Notes
 

@@ -130,6 +130,17 @@ pub fn is_initialized() -> bool {
     *FS_INITIALIZED.lock()
 }
 
+/// Mark the VFS layer initialized without running the full `init()` (which mounts ext2 over
+/// virtio-blk). A multikernel SECONDARY core has no local block device — it mounts only its
+/// own procfs (`smp::mount_local_procfs`) and forwards real-file paths to the owner — but the
+/// `crate::fs::*` wrappers gate on this flag, so `exists()`/etc. must be enabled for the
+/// local `/proc` (the sshd shell bridge's `/proc/<pid>/fd/0`) to resolve. Non-/proc paths
+/// simply find no mount and return `NotFound`, which is correct (they forward earlier).
+#[cfg(kernel_smp)]
+pub fn mark_initialized() {
+    *FS_INITIALIZED.lock() = true;
+}
+
 /// List directory contents
 pub fn list_dir(path: &str) -> Result<Vec<DirEntry>, FsError> {
     if !is_initialized() {

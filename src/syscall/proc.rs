@@ -611,7 +611,29 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
             }
         }
     };
-    #[cfg(not(kernel_profile_size))]
+    // Multikernel (R4b.5 Phase 2): a pinned process exec'ing a real binary (a shell running
+    // `curl`) has no local VFS — forward the whole-file read to the owner. `/proc`/`/dev` (and
+    // the non-smp / BSP case) take the normal local read.
+    #[cfg(all(not(kernel_profile_size), kernel_smp))]
+    let file_data = if crate::smp::is_on_secondary()
+        && !resolved_path.starts_with("/proc") && !resolved_path.starts_with("/dev")
+    {
+        let Ok(data) = crate::smp::secondary_forward_read_file(&resolved_path) else {
+            crate::safe_print!(96, "[syscall] execve: forwarded read failed for {}\n", resolved_path);
+            return ENOENT;
+        };
+        Some(data)
+    } else {
+        match crate::fs::read_file(&resolved_path) {
+            Ok(data) => Some(data),
+            Err(crate::vfs::FsError::Internal) => None,
+            Err(e) => {
+                crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
+                return super::fs::fs_error_to_errno(e);
+            }
+        }
+    };
+    #[cfg(all(not(kernel_profile_size), not(kernel_smp)))]
     let file_data = match crate::fs::read_file(&resolved_path) {
         Ok(data) => Some(data),
         Err(crate::vfs::FsError::Internal) => None,

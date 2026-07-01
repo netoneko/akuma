@@ -577,17 +577,23 @@ pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, 
         if let Some(Some(KernelSocket { inner: SocketType::Stream(h), .. })) = table.get(idx) { Some(*h) } else { None }
     }).ok_or(libc_errno::EBADF)?;
 
+    // EOF is signalled ONLY by `!may_recv()` — the peer closed its send half (FIN) or the
+    // connection was reset. `!is_active()` is deliberately NOT treated as EOF here: a live
+    // ESTABLISHED socket can momentarily read `!is_active()` across smoltcp poll boundaries,
+    // and reporting that as `Ok(0)` gives a SPURIOUS end-of-stream — fatal for an interactive
+    // reader (e.g. sshd's bridge treats one `recv()==0` as "client closed" and stops reading
+    // input). `may_recv()` stays false once a real FIN/RST arrives, so genuine EOF still works.
     if nonblock {
         smoltcp_net::poll();
         let ready = with_network(|net| {
             let socket = net.sockets.get::<tcp::Socket>(handle);
-            socket.can_recv() || !socket.is_active() || !socket.may_recv()
+            socket.can_recv() || !socket.may_recv()
         }).unwrap_or(true);
         if !ready { return Err(libc_errno::EAGAIN); }
     } else {
         wait_until(|| with_network(|net| {
             let socket = net.sockets.get::<tcp::Socket>(handle);
-            socket.can_recv() || !socket.is_active() || !socket.may_recv()
+            socket.can_recv() || !socket.may_recv()
         }).unwrap_or(true), Some(30_000_000))?;
     }
 
@@ -599,7 +605,7 @@ pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, 
                 buf[..len].copy_from_slice(&data[..len]);
                 (len, len)
             }).map_err(|_| libc_errno::EIO)
-        } else if !socket.is_active() || !socket.may_recv() { Ok(0) } else { Err(libc_errno::EAGAIN) }
+        } else if !socket.may_recv() { Ok(0) } else { Err(libc_errno::EAGAIN) }
     });
 
     if matches!(res, Some(Ok(_))) {

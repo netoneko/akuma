@@ -1,12 +1,16 @@
 # Akuma Multikernel — One Kernel Per Core
 
 **Status:** In progress (2026-07-01), all behind `cfg(kernel_smp)`; the default build is
-untouched. **Headline: the FULL §10 acceptance demo (acceptance/12) runs — `/bin/hello` AND now
-`curl https://ifconfig.me` PINNED to a secondary core, activated from userspace by herd, with all
-networking + VFS forwarded to core 0.** `curl` on core 1 printed its real public IP (Part B / R4b.5,
-2026-07-01): DNS over UDP, the TLS/HTTPS TCP connection, the CA-bundle read, the ELF load, entropy,
-and the wall clock are ALL serviced by core 0 over the cross-core ring + bounce. Verified
-under QEMU `SMP=4 @ 2 GB` (the pinned-process demos at `SMP=2 @ 2 GB`):
+untouched. **Headline: the FULL §10 acceptance demo (acceptance/12) runs, both non-interactive AND
+interactive.** Phase 1: `curl https://ifconfig.me` PINNED to secondary core 1 printed its real
+public IP with all networking + VFS forwarded to core 0. Phase 2: an **interactive `sshd` runs on
+core 1** — `ssh -p 2323 root@localhost` logs in, and typing `curl -sS https://ifconfig.me` in that
+session returns the public IP (`87.71.63.90`). Everything a pinned process and its children touch —
+DNS over UDP, the TLS/HTTPS TCP connection, VFS reads (config, CA bundle), **exec** (the shell and
+curl ELFs, fetched whole over forwarded VFS), entropy, and the wall clock — is serviced by core 0
+over the cross-core ring + bounce; only PTY + a per-core procfs run locally on core 1 (the shell
+bridge writes `/proc/<pid>/fd/0`). Verified under QEMU `SMP=4 @ 2 GB` (the pinned-process demos at
+`SMP=2 @ 2 GB`):
 - **§11 build gating** — `smp` feature + `release-smp` profile.
 - **M0** — secondaries wake via PSCI `CPU_ON` (hvc), report `Online`.
 - **M1 isolation** — each secondary runs on its OWN restricted page table (shared RO code +
@@ -90,15 +94,29 @@ under QEMU `SMP=4 @ 2 GB` (the pinned-process demos at `SMP=2 @ 2 GB`):
   never stalls; the reply rides a dedicated per-core `fwd_reply` mailbox (not the control inbox) so the
   idle loop's drain can't swallow it. Verified SMP=2 @ 2 GB end to end.
 
+- **Interactive sshd on core 1 (§10 Phase 2, R4b.5 Phase 2) — DONE (SMP=2 @ 2 GB, 2026-07-01):**
+  `ssh -p 2323 root@localhost` logs into a `sshd` PINNED to core 1; typing `curl -sS https://ifconfig.me`
+  returns the public IP. Adds, over Phase 1: **forwarded exec** (`sys_execve` + the whole-file spawn
+  loader both route their ELF read through the owner, gated by `ExecConfig::prefer_whole_file_load` so a
+  secondary never demand-pages), a **per-core procfs mounted locally** on core 1 (`smp::mount_local_procfs`
+  + `fs::mark_initialized`) so the shell bridge's `/proc/<pid>/fd/0` stdin write resolves against core 1's
+  OWN process table, **forwarded `newfstatat`** (PATH lookup of `curl`), and **forwarded `openat(O_CREAT)`
+  + write** so sshd generates its host key on the owner's ext2. The login shell (`/bin/sh`, busybox) and
+  `curl` are spawned LOCALLY on core 1 (fork+exec), their ELFs fetched whole over forwarded VFS. Two
+  load-bearing fixes found here: a `forward_retry` deadline `u64::MAX` overflow (a blocking `accept`
+  timed out instantly — `saturating_add`), and `socket_recv` reporting a SPURIOUS EOF on `!is_active()`
+  (a live socket momentarily reads inactive → sshd saw "client closed" → tightened EOF to `!may_recv()`
+  only). `FWD_BOUNCE_CAP` was raised 4 KiB → 16 KiB so the 1 MiB shell/curl ELF loads cross in ~64
+  round-trips, not ~250.
+
 Build with `scripts/build_smp.sh`; boot with `scripts/run_smp.sh` (or `SMP=N cargo run
 --profile release-smp --features smp`). Host-test/simulate the protocol with no QEMU:
 `cargo test -p akuma-smp --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)`. Remaining: dynamic
-memory (M4); forwarding **throughput** (the bounce is 4 KiB so bulk/TLS chunks in many round-trips — a
-shared `(offset,len)` bounce arena is the §16 fix); and the §16 hardening (caps map as descriptor data,
-owner-side capability enforcement, BSP on its own restricted table). Phase 2 of the networking demo —
-interactive **`sshd` on core 1** (`ssh -p 2323` in, run curl there) — additionally needs PTY + a
-per-core procfs on the secondary (the shell bridge writes `/proc/<pid>/fd/0`); `sshd.conf` is staged in
-`bootstrap/etc/herd/available/`. Deferred cleanup/tech-debt is tracked in §16.
+memory (M4); forwarding **throughput** (the bounce is 16 KiB so bulk/TLS still chunks in many
+round-trips — a shared `(offset,len)` bounce arena is the §16 fix); sshd's single-threaded accept
+loop serves one connection at a time (a stuck connection blocks new logins — connection-teardown
+robustness is future work); and the §16 hardening (caps map as descriptor data, owner-side capability
+enforcement, BSP on its own restricted table). Deferred cleanup/tech-debt is tracked in §16.
 **Author:** design notes, 2026-06-28
 **Scope:** AArch64 (QEMU virt). A shared-nothing, message-passing multikernel where each
 physical core boots its own kernel instance ("a container per core"), instead of one

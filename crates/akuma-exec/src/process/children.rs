@@ -967,6 +967,7 @@ mod child_channel_drain_tests {
             proc_stdout_max_size: 1 << 20,
             cow_fork_enabled: false,
             vfork_fastpath_enabled: false,
+            prefer_whole_file_load: false,
         };
         register(rt, cfg);
     }
