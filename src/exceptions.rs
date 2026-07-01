@@ -1561,6 +1561,60 @@ fn try_resolve_el1_cow_fault() -> bool {
     }
 }
 
+/// Fast-path resolver for an EL1 kernel data abort caused by touching a LAZY
+/// (not-yet-mapped) user page during a kernel→user copy (`copy_to_user_safe` /
+/// `copy_from_user_safe`) — e.g. the rump sysproxy `copyout` writing a DNS answer
+/// into an *unmodified* client's demand-paged receive buffer. The kernel copy is
+/// the first touch of the buffer's later page(s), so the byte-copy loop takes a
+/// translation fault at the page boundary. Without this the registered user-copy
+/// fault handler turns it into EFAULT and the copy is silently truncated at the
+/// boundary (this is what dropped the tail — the terminal A records — of DNS
+/// answers over the rump stack, so `getaddrinfo` failed). Here we demand-page the
+/// lazy anon page and return `true` so ERET retries the faulting byte and the copy
+/// continues across the boundary — exactly how an EL0 touch of the same page would
+/// be handled. (On a single kernel the BSP demo used the `hijack.so` userspace
+/// path, which writes the buffer in-process and never hits kernel `copy_to_user`,
+/// so this only surfaced with the kernel sysproxy path.)
+///
+/// Self-gating for safety: only a *translation* fault (page absent — a permission/
+/// CoW fault is `try_resolve_el1_cow_fault`) from kernel code, on a page that lies
+/// in a registered lazy zero-fill anon region ([`ensure_user_page_mapped`]), is
+/// resolved. If the page is already mapped (yet still faulting) we return `false`
+/// so we can't spin retrying. Anything else falls through to the kill path.
+fn try_resolve_el1_user_copy_lazy_fault() -> bool {
+    let fault_esr: u64;
+    let fault_far: u64;
+    let fault_pc: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, esr_el1", out(reg) fault_esr);
+        core::arch::asm!("mrs {}, far_el1", out(reg) fault_far);
+        core::arch::asm!("mrs {}, elr_el1", out(reg) fault_pc);
+    }
+    let ec = (fault_esr >> 26) & 0x3F;
+    let dfsc = fault_esr & 0x3F;
+    // EL1 data abort (0x25) + translation fault (DFSC 0x04..=0x07 = page absent, L0..L3).
+    if ec != 0x25 || !(0x04..=0x07).contains(&dfsc) {
+        return false;
+    }
+    // A real copy_to_user/from_user is executing in kernel text.
+    if !((crate::config::KERNEL_PHYS_BASE as u64..0x6000_0000).contains(&fault_pc)) {
+        return false;
+    }
+    let page_va = fault_far as usize & !0xFFF;
+    // Already mapped but still faulting → not a lazy miss; don't claim it (avoids a
+    // retry loop). `ensure_user_page_mapped` self-gates on a lazy zero-fill region.
+    if akuma_exec::mmu::is_current_user_page_mapped(page_va) {
+        return false;
+    }
+    let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    if ensure_user_page_mapped(pid, page_va) {
+        akuma_exec::mmu::flush_tlb_page(page_va);
+        true // ERET retries the faulting byte; the copy continues across the boundary
+    } else {
+        false
+    }
+}
+
 /// Synchronous exception handler from EL1 (kernel mode)
 /// Uses static buffers to avoid heap allocation during crash
 #[unsafe(no_mangle)]
@@ -1570,6 +1624,11 @@ extern "C" fn rust_sync_el1_handler() {
     // Quick CoW pre-check: resolve CoW write faults before full debug dump.
     // EC=0x25 + DFSC=0x0F (permission fault L3) + WnR + user VA → CoW from kernel code.
     if try_resolve_el1_cow_fault() {
+        return;
+    }
+    // Demand-page a lazy user page touched by a kernel→user copy (sysproxy copyout,
+    // etc.) and retry, instead of EFAULT-truncating the copy at the page boundary.
+    if try_resolve_el1_user_copy_lazy_fault() {
         return;
     }
 
