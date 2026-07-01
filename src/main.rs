@@ -1179,21 +1179,22 @@ fn run_async_main() -> ! {
 
     console::print("--- Network Initialization Done ---\n\n");
 
-    // rump feature: bind a SECOND virtio-net device (NIC1) to the raw L2 tap
-    // path (/dev/net/tap0), leaving NIC0 on smoltcp above. Only present when the
-    // QEMU runner adds NIC1 (RUMP_NIC=1); otherwise this no-ops with a notice and
-    // /dev/net/tap0 stays ENODEV. Never fatal — the native stack is unaffected.
+    // rump feature: bind the BSP's rump tap (/dev/net/tap0) to NIC1 on virtio-mmio-bus.4
+    // (RUMP_NIC=1), leaving NIC0 on smoltcp above. Bound to that SPECIFIC slot — not "the 2nd
+    // virtio-net" — so it never claims bus.5, which is reserved for a secondary core's LOCAL
+    // rump stack (CORE2_NIC=1; see smp::RUMP_NIC_CORE). This lets CORE2_NIC=1 be used ALONE. If
+    // bus.4 has no device (RUMP_NIC=0), init_at fails gracefully and /dev/net/tap0 stays ENODEV.
     #[cfg(feature = "rump")]
-    match akuma_net::rump_tap::init(&mmio_addrs) {
+    match akuma_net::rump_tap::init_at(mmu::DEV_VIRTIO_VA + 4 * 0x200) {
         Ok(mac) => {
             crate::safe_print!(
                 128,
-                "[rump] /dev/net/tap0 bound to NIC1, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                "[rump] /dev/net/tap0 bound to NIC1 (bus.4), MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
             );
         }
         Err(e) => {
-            crate::safe_print!(128, "[rump] tap not available: {} (run QEMU with RUMP_NIC=1)\n", e);
+            crate::safe_print!(128, "[rump] BSP tap not available: {} (run QEMU with RUMP_NIC=1)\n", e);
         }
     }
 

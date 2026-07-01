@@ -96,7 +96,7 @@ pub fn timer_irq_handler(_irq: u32) {
         static TIMER_TICK: AtomicU64 = AtomicU64::new(0);
         let tick = TIMER_TICK.fetch_add(1, Ordering::Relaxed);
         let forking = akuma_exec::process::FORK_IN_PROGRESS.load(Ordering::Relaxed);
-        let interval = if forking { 50 } else { 500 };
+        let interval = if forking { 5000 } else { 200_000 };
         if tick.is_multiple_of(interval) {
             let tid = akuma_exec::threading::current_thread_id();
             crate::safe_print!(64, "[TMR] t={} T={} f={}\n", tick, tid, u8::from(forking));
