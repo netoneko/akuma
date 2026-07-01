@@ -77,7 +77,16 @@ pub fn init(mmio_addrs: &[usize]) -> Result<[u8; 6], &'static str> {
 
     let addr = akuma_rump::select_second_net_addr(&slots)
         .ok_or("tap: no second virtio-net (NIC1) device found")?;
+    init_at(addr)
+}
 
+/// Bind the tap path to a SPECIFIC virtio-mmio slot address, instead of auto-selecting the
+/// second virtio-net.
+///
+/// Used when a core owns a dedicated NIC at a known slot — the rump-on-secondary experiment
+/// binds the NIC on `virtio-mmio-bus.5` (docs/MULTIKERNEL_NETWORKING_EXPERIMENT.md Stage 0/1).
+/// Returns the NIC MAC on success.
+pub fn init_at(addr: usize) -> Result<[u8; 6], &'static str> {
     let header_ptr =
         core::ptr::NonNull::new(addr as *mut VirtIOHeader).ok_or("tap: bad mmio addr")?;
     let transport =

@@ -177,6 +177,38 @@ case "$RUMP_NIC" in
     ;;
 esac
 
+# CORE2_NIC - a THIRD virtio-net (NIC2) on virtio-mmio-bus.5, dedicated to a SECONDARY core
+#             so it can run a LOCAL network stack (rump) instead of forwarding sockets to
+#             core 0 (docs/MULTIKERNEL_NETWORKING_EXPERIMENT.md §7, Stage 0/1). Its own
+#             isolated -netdev user SLIRP gives that core's stack DHCP + a 10.0.2.2 gateway,
+#             independent of NIC0 (smoltcp on core 0) and NIC1 (core 0's rump tap).
+#               0 (default) no third NIC
+#               1           add NIC2 on bus.5 -> the secondary's /dev/net/tap0
+CORE2_NIC="${CORE2_NIC:-0}"
+CORE2_NIC_ARGS=()
+case "$CORE2_NIC" in
+  0|off|no|false|FALSE)
+    ;;
+  1|on|yes|true|TRUE)
+    # CORE2_HTTP_PORT - host port forwarded to :80 on NIC2's SLIRP, so a plain-HTTP GET from
+    #                   the secondary's rump stack (rumphttp) can reach a server you run on the
+    #                   host. Default 8081; set empty to disable the forward.
+    CORE2_HTTP_PORT="${CORE2_HTTP_PORT:-8081}"
+    if [ -n "$CORE2_HTTP_PORT" ]; then
+      CORE2_NIC_ARGS+=(-netdev "user,id=net2,hostfwd=tcp::${CORE2_HTTP_PORT}-:80")
+      echo "[cargo_runner] core2 NIC (net2) on virtio-mmio-bus.5; host :${CORE2_HTTP_PORT} -> secondary rump :80" >&2
+    else
+      CORE2_NIC_ARGS+=(-netdev "user,id=net2")
+      echo "[cargo_runner] core2 NIC (net2) on virtio-mmio-bus.5 -> secondary rump stack" >&2
+    fi
+    CORE2_NIC_ARGS+=(-device "virtio-net-device,netdev=net2,bus=virtio-mmio-bus.5")
+    ;;
+  *)
+    echo "[cargo_runner] ERROR: CORE2_NIC must be 0|1 (got '$CORE2_NIC')" >&2
+    exit 1
+    ;;
+esac
+
 # Accelerator. Defaults to HVF (Apple Hypervisor.framework, near-native AArch64
 # execution) on Apple Silicon where it is available, falling back to TCG (portable
 # software emulation, ~3000x slower for NEON) elsewhere. Override with HVF=1 to
@@ -230,6 +262,7 @@ exec qemu-system-aarch64 \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
   "${RUMP_NIC_ARGS[@]}" \
+  "${CORE2_NIC_ARGS[@]}" \
   "${FB_ARGS[@]}" \
   "${SOUND_ARGS[@]}" \
   -kernel "$BIN" \

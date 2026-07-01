@@ -123,3 +123,29 @@ a NIC as-is. Stage 0/1: give a dedicated NIC (a 3rd `virtio-net` on `virtio-mmio
 secondary — map that one virtio-mmio page into its isolated table, register `akuma_net`'s
 runtime on that core, bind `rump_tap` to that slot — then run `rumphttp` (self-contained static
 binary) pinned there and compare its HTTP-GET latency to the forwarded `curl` above.
+
+### Stage 0/1 implementation status (in progress)
+
+**Done — plumbing works end to end (no crash):**
+- **Stage 0:** `CORE2_NIC=1` in `scripts/cargo_runner.sh` adds NIC2 on `virtio-mmio-bus.5` (own
+  SLIRP + a host:8081→rump:80 forward). Build `--features smp,rump,no-tests`.
+- **Stage 1 (kernel):** `RUMP_NIC_CORE` (=2) gets the virtio-mmio page mapped **twice** — into
+  its bringup isolated table (`build_isolated_table`, for the NIC init on the boot thread) AND
+  into every user address space's kernel overlay (`build_secondary_user_kernel_view` via the new
+  `UserAddressSpace::map_device_page`, for the tap read/write during the pinned process's
+  syscalls — Akuma is TTBR0-only, so a syscall runs at EL1 under the *user* table). A missing
+  overlay mapping was the first bug: a level-0 translation fault at `DEV_VIRTIO_VA` from
+  rumphttp's syscall context. `secondary_init_local_nic` registers `akuma_net`'s runtime on the
+  core (no smoltcp) and binds `rump_tap::init_at(bus.5)`. herd pins `/bin/rumphttp` to core 2
+  (`rumphttp.conf`).
+- **Verified:** core 2 maps the MMIO, binds bus.5 (its own MAC, distinct from the BSP's bus.4),
+  fetches the 13.5 MB ELF over forwarded VFS, spawns rumphttp, and its rump kernel boots
+  (NetBSD 7.99.34) and creates `virt0` — all with no fault. Boot: `RUMP_NIC=1 CORE2_NIC=1 SMP=3`
+  (RUMP_NIC=1 gives the BSP its own bus.4 so its auto-select doesn't grab core 2's bus.5).
+
+**Open — packet flow:** DHCP times out on core 2's NIC (`dhcp get: timed out waiting for
+response`). `virt_to_phys` is identity (correct over the identity-mapped partition), so DMA
+addresses are right; the issue is a deeper virtio queue/DMA/RX-poll matter on the secondary's
+device (TX not emitting or RX not delivered). Next debugging step. Also TODO: make the BSP skip
+the core-2-owned NIC so `RUMP_NIC=1` isn't required, and wire NIC→core assignment through herd
+core-init (see the memory note) rather than the hardcoded `RUMP_NIC_CORE`.

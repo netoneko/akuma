@@ -714,6 +714,15 @@ fn replicate_writable_window(l0_pa: usize, skip_va: usize, skip_len: usize, bump
 /// unmapped, so any cross-core access from the secondary faults. Records
 /// `ttbr0_phys`/`entry_sp`/`percpu_phys` in the descriptor. Returns `false` (and
 /// leaves `ttbr0_phys == 0`) on OOM, so the secondary falls back to a parked spin.
+/// The secondary core that owns a dedicated NIC for a LOCAL network stack (rump), instead of
+/// forwarding sockets to core 0 (docs/MULTIKERNEL_NETWORKING_EXPERIMENT.md Stage 0/1). Its
+/// virtio-mmio window is mapped into its isolated table (`build_isolated_table`), and it binds
+/// `rump_tap` to the dedicated NIC (`secondary_init_local_nic`). Boot with `SMP>=3` (so it's a
+/// real secondary and clear of herd's core-1 services) and QEMU `CORE2_NIC=1` (adds the NIC on
+/// `virtio-mmio-bus.5`). Assigning this via herd core-init is the follow-up (see the memory note).
+#[cfg(feature = "rump")]
+const RUMP_NIC_CORE: usize = 2;
+
 fn build_isolated_table(cfg: &mut MachineConfig, idx: usize) -> bool {
     // R2: carve EVERYTHING for this secondary from its OWN partition (page tables,
     // replicated window, stack, PerCpu) via a bump allocator — never the BSP `pmm`.
@@ -775,6 +784,21 @@ fn build_isolated_table(cfg: &mut MachineConfig, idx: usize) -> bool {
         || map_4k(l0_pa, sgi, sgi, pte_device(), &mut bump).is_none()
     {
         return false;
+    }
+
+    // Rump-on-secondary (docs/MULTIKERNEL_NETWORKING_EXPERIMENT.md §7, Stage 0/1): the core
+    // that owns a dedicated NIC gets DIRECT access to the virtio-mmio window so it can drive
+    // that NIC locally (a local rump stack) instead of forwarding sockets to core 0. All 8
+    // mapped virtio slots live in ONE 4 KiB device page at VIRTIO_MMIO_PHYS, mapped at the
+    // same DEV_VIRTIO_VA the BSP uses — so `rump_tap`'s VirtIONetRaw resolves its registers.
+    // This is a deliberate, single-device relaxation of the RAM-isolation invariant, scoped to
+    // one page and one core (its DMA buffers come from its own identity-mapped partition).
+    #[cfg(feature = "rump")]
+    if idx == RUMP_NIC_CORE {
+        const VIRTIO_MMIO_PHYS: usize = 0x0A00_0000;
+        if map_4k(l0_pa, akuma_exec::mmu::DEV_VIRTIO_VA, VIRTIO_MMIO_PHYS, pte_device(), &mut bump).is_none() {
+            return false;
+        }
     }
 
     // 5. R2 — identity-map this core's ENTIRE partition as 2 MiB RW blocks, so the
@@ -2589,6 +2613,49 @@ pub fn autostart_bench_core() {
     }
 }
 
+/// Rump-on-secondary (docs/MULTIKERNEL_NETWORKING_EXPERIMENT.md Stage 1): on the NIC-owning
+/// core, register `akuma_net`'s runtime (closures resolve to THIS core's kernel — smoltcp is
+/// NOT started here) and bind `rump_tap` to the dedicated NIC on virtio-mmio-bus.5, so a pinned
+/// process (rumphttp) drives a LOCAL rump stack over `/dev/net/tap0` instead of forwarding
+/// sockets to core 0. Runs once, before the init program is fetched/spawned.
+#[cfg(feature = "rump")]
+fn secondary_init_local_nic(idx: usize) {
+    if idx != RUMP_NIC_CORE {
+        return;
+    }
+    akuma_net::runtime::register(akuma_net::NetRuntime {
+        virt_to_phys: akuma_exec::mmu::virt_to_phys,
+        phys_to_virt: |pa| akuma_exec::mmu::phys_to_virt(pa),
+        uptime_us: crate::timer::uptime_us,
+        utc_seconds: crate::timer::utc_seconds,
+        yield_now: akuma_exec::threading::yield_now,
+        current_box_id: || akuma_exec::process::current_process().map_or(0, |p| p.box_id),
+        is_current_interrupted: akuma_exec::process::is_current_interrupted,
+        rng_fill: secondary_net_rng_stub,
+        current_thread_id: || akuma_exec::threading::current_thread_id() as u32,
+    });
+    // NIC2 is on virtio-mmio-bus.5: DEV_VIRTIO_VA + 5 * 0x200 (the virtio-mmio slot stride).
+    let addr = akuma_exec::mmu::DEV_VIRTIO_VA + 5 * 0x200;
+    match akuma_net::rump_tap::init_at(addr) {
+        Ok(mac) => crate::safe_print!(
+            144,
+            "[core {}] local NIC bound at bus.5, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} — /dev/net/tap0 is local\n",
+            idx, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        ),
+        Err(e) => crate::safe_print!(96, "[core {}] local NIC bind FAILED: {} (run QEMU with CORE2_NIC=1)\n", idx, e),
+    }
+}
+
+/// RNG closure for the secondary's net runtime. The local rump-tap path never needs it (rump
+/// carries its own entropy; smoltcp isn't run on this core), and RNG MMIO isn't mapped into the
+/// secondary's isolated table — so this is a safe no-op stub rather than a faulting call.
+#[cfg(feature = "rump")]
+fn secondary_net_rng_stub(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+}
+
 /// Spawn this core's INIT PROGRAM as a real EL0 process (docs/MULTIKERNEL.md §10,
 /// acceptance/12 Milestone 2). The initiator named it in the `MSG_CORE_INIT` activation
 /// message (`cfg.init_program[idx]`); the program is fetched from the VFS owner via
@@ -2623,6 +2690,12 @@ fn spawn_init_program(cfg: &MachineConfig, idx: usize) {
     // Mount this core's local procfs so a spawned process (and any children — e.g. sshd's
     // login shell) can resolve /proc/<pid>/... against THIS core's process table.
     mount_local_procfs();
+
+    // Rump-on-secondary (Stage 1): if this is the NIC-owning core, register the net runtime and
+    // bind its dedicated NIC so the pinned process (rumphttp) drives a LOCAL rump stack over
+    // /dev/net/tap0 instead of forwarding sockets to core 0. No-op on other cores / non-rump.
+    #[cfg(feature = "rump")]
+    secondary_init_local_nic(idx);
 
     // VFS is Proxy'd to the owner on a secondary; fetch the ELF over the forward transport.
     let Some(owner) = capability_owner(idx, nr::OPENAT) else {
@@ -3119,6 +3192,17 @@ fn build_secondary_user_kernel_view(
     while off < len_2mb {
         uas.map_kernel_block_2mb(pbase + off, pbase + off)?;
         off += TWO_MB;
+    }
+
+    // 3. Rump-on-secondary: the NIC-owning core drives its NIC's virtio-mmio registers from a
+    //    syscall that runs at EL1 UNDER this user table (Akuma is TTBR0-only, no table switch on
+    //    trap), so map that one device page here too. The shared device window that gives the
+    //    BSP its 0x80_0000_0000+ device mappings is BSP-only (DEVICE_L1_PA is unset on a
+    //    secondary), hence the explicit per-core mapping. Scoped to one page and one core.
+    #[cfg(feature = "rump")]
+    if (read_mpidr() & 0xff) as usize == RUMP_NIC_CORE {
+        const VIRTIO_MMIO_PHYS: usize = 0x0A00_0000;
+        uas.map_device_page(akuma_exec::mmu::DEV_VIRTIO_VA, VIRTIO_MMIO_PHYS)?;
     }
     Ok(())
 }

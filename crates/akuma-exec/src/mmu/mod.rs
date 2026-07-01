@@ -531,6 +531,34 @@ impl UserAddressSpace {
         }
     }
 
+    /// Map a single 4 KiB **device** page `va -> pa` (Device-nGnRnE, EL1-RW, no EL0, no
+    /// execute) into this user table. Unlike [`map_page`] (which hardcodes Normal-WB
+    /// attributes), this uses the device memory type — for a secondary core that owns a NIC and
+    /// must reach its virtio-mmio registers from a syscall running under this table
+    /// (rump-on-secondary; the shared device window that serves the BSP is BSP-only).
+    /// Intermediate L1/L2/L3 frames are tracked for Drop; the target is device MMIO, not a frame.
+    pub fn map_device_page(&mut self, va: usize, pa: usize) -> Result<(), &'static str> {
+        if va & (PAGE_SIZE - 1) != 0 || pa & (PAGE_SIZE - 1) != 0 { return Err("Addresses must be page-aligned"); }
+        let l0_idx = (va >> 39) & 0x1FF;
+        let l1_idx = (va >> 30) & 0x1FF;
+        let l2_idx = (va >> 21) & 0x1FF;
+        let l3_idx = (va >> 12) & 0x1FF;
+
+        let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
+        let l1_frame = self.get_or_create_table(l0_ptr, l0_idx)?;
+        let l1_ptr = phys_to_virt(l1_frame.addr) as *mut u64;
+        let l2_frame = self.get_or_create_table(l1_ptr, l1_idx)?;
+        let l2_ptr = phys_to_virt(l2_frame.addr) as *mut u64;
+        let l3_frame = self.get_or_create_table(l2_ptr, l2_idx)?;
+        let l3_ptr = phys_to_virt(l3_frame.addr) as *mut u64;
+
+        // No AP bits => AP[2:1]=0b00 = EL1 RW, EL0 none. Device-nGnRnE + Outer-shareable, PXN|UXN.
+        let entry = (pa as u64) | flags::VALID | flags::TABLE | flags::AF | flags::NG
+            | attr_index(MAIR_DEVICE_NGNRNE) | flags::SH_OUTER | flags::PXN | flags::UXN;
+        unsafe { l3_ptr.add(l3_idx).write_volatile(entry); }
+        Ok(())
+    }
+
     pub fn map_range(&mut self, va_start: usize, pa_start: usize, size: usize, user_flags: u64) -> Result<(), &'static str> {
         let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
         for i in 0..pages {
