@@ -131,6 +131,11 @@ const EINVAL: i32 = 22;
 pub struct Client<T: Transport> {
     t: T,
     reqno: u64,
+    /// Server→client callbacks (copyin/copyout/anonmmap) serviced during the LAST
+    /// [`syscall`](Client::syscall). A latency-localization signal: one proxied
+    /// syscall costs `1 + callbacks` pipe round-trips, so this separates "many
+    /// copyin hops" from "one slow hop" when reading the `[RUMP-SP]` timings.
+    callbacks: u32,
 }
 
 impl<T: Transport> Client<T> {
@@ -152,7 +157,7 @@ impl<T: Transport> Client<T> {
             return Err(EIO);
         }
 
-        let mut c = Self { t, reqno: 1 };
+        let mut c = Self { t, reqno: 1, callbacks: 0 };
         // 2. Handshake request: hdr + progname + NUL.
         let reqno = c.next_reqno();
         let mut payload = Vec::with_capacity(progname.len() + 1);
@@ -186,6 +191,7 @@ impl<T: Transport> Client<T> {
     /// `register_t` argument block, already in NetBSD layout) and run the
     /// copyin/copyout callback loop against `mem` until the final RESP.
     pub fn syscall(&mut self, sysnum: u32, args: &[u8], mem: &mut dyn ClientMem) -> SyscallResult {
+        self.callbacks = 0;
         let reqno = self.next_reqno();
         let hdr = enc_hdr(
             (HDRSZ + args.len()) as u64,
@@ -241,8 +247,16 @@ impl<T: Transport> Client<T> {
         }
     }
 
+    /// Number of server→client callbacks serviced during the last
+    /// [`syscall`](Client::syscall) — a latency-localization signal (hop count).
+    #[must_use]
+    pub fn last_callbacks(&self) -> u32 {
+        self.callbacks
+    }
+
     /// Service one server→client callback (copyin/copyout/anonmmap/raise).
     fn handle_req(&mut self, h: &DecHdr, data: &[u8], mem: &mut dyn ClientMem) -> Result<(), i32> {
+        self.callbacks = self.callbacks.saturating_add(1);
         match h.typ {
             RUMPSP_COPYIN | RUMPSP_COPYINSTR => {
                 let (len, addr) = parse_copydata_head(data)?;

@@ -55,16 +55,36 @@ pub const VIRTIO_DEVICE_ID_NET: u32 = 1;
 
 /// Device-independent tap state over an arbitrary [`RawNic`]: one staging buffer
 /// and an optional posted-RX token.
+///
+/// The RX staging buffer is **heap-allocated** (`Box<[u8]>`), not an inline array,
+/// and this is load-bearing for the DMA on a secondary core. A secondary maps the
+/// kernel's `.data`/`.bss` window to PRIVATE, per-core physical pages (R1
+/// replication, `src/smp.rs`), and those pages are NOT guaranteed physically
+/// contiguous across a page boundary (the shared-descriptor skip in
+/// `replicate_writable_window` breaks the run). An inline `[u8; FRAME_BUF]` field
+/// of a `static TapNic` therefore lands in that replicated window, and virtio's
+/// `Hal::share` hands the device a single start-PA + length — so a frame that
+/// spans the buffer's page boundary gets DMA-written past the first physical page
+/// into the wrong PA, and the CPU reads the tail back as zero (the historical
+/// ">586 B RX truncation"). The kernel heap is identity-mapped over physically
+/// contiguous partition RAM (VA==PA), so a single heap allocation is always
+/// physically contiguous — the same reason the TX path works. Keeping the buffer
+/// on the heap keeps the DMA target contiguous regardless of where the struct
+/// itself lives.
 pub struct TapNic<N: RawNic> {
     nic: N,
-    rx_buffer: [u8; FRAME_BUF],
+    rx_buffer: alloc::boxed::Box<[u8]>,
     rx_token: Option<u16>,
 }
 
 impl<N: RawNic> TapNic<N> {
     /// Wrap a raw NIC backend.
     pub fn new(nic: N) -> Self {
-        Self { nic, rx_buffer: [0u8; FRAME_BUF], rx_token: None }
+        Self {
+            nic,
+            rx_buffer: alloc::vec![0u8; FRAME_BUF].into_boxed_slice(),
+            rx_token: None,
+        }
     }
 
     /// Pull one received L2 frame into `out`.
@@ -76,7 +96,7 @@ impl<N: RawNic> TapNic<N> {
     pub fn read_frame(&mut self, out: &mut [u8]) -> Option<usize> {
         // Phase 1: ensure a receive buffer is posted.
         if self.rx_token.is_none() {
-            match self.nic.receive_begin(&mut self.rx_buffer) {
+            match self.nic.receive_begin(&mut self.rx_buffer[..]) {
                 Ok(token) => self.rx_token = Some(token),
                 Err(_) => return None,
             }
@@ -87,7 +107,7 @@ impl<N: RawNic> TapNic<N> {
             return None;
         }
         let token = self.rx_token.take()?;
-        match self.nic.receive_complete(token, &mut self.rx_buffer) {
+        match self.nic.receive_complete(token, &mut self.rx_buffer[..]) {
             Ok((hdr_len, pkt_len)) => {
                 if hdr_len.saturating_add(pkt_len) > self.rx_buffer.len() {
                     return None;

@@ -27,8 +27,20 @@ const READ_TIMEOUT_US: u64 = 8_000_000;
 use akuma_exec::process::Process;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spinning_top::Spinlock;
+
+// ── Per-proxied-syscall latency breakdown (docs/MULTIKERNEL_NETWORKING_EXPERIMENT.md §4) ──
+// Per-core (core 2) accumulators for the time the kernel client THREAD spends BLOCKED
+// waiting for a rump_server reply during one proxied syscall — vs. the syscall's total
+// wall-time. This localized the residual latency: block-time ≈ total AND uniform per hop
+// (~1 tick), which pinned the cost to the secondary scheduler tick (a sub-tick fiber
+// sleep in rump_server woke only at the periodic timer pass), NOT the rump HZ=100
+// hardclock — the lever that motivated the 1 ms `steady_tick_interval_ticks`. Snapshotted
+// around each proxied op and logged with the hop (`callbacks`) count; kept as a cheap
+// regression signal for this experimental path.
+static RUMP_WAIT_US: AtomicU64 = AtomicU64::new(0);
+static RUMP_WAIT_N: AtomicU32 = AtomicU32::new(0);
 
 /// Box IDs whose network stack is the NetBSD rump kernel — set via the
 /// `SET_BOX_STACK` syscall when herd starts a `stack = rump` service. A box not
@@ -915,15 +927,28 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
         }
     }
     let t0 = crate::timer::uptime_us();
-    let res = proxy.with_client(|c| c.syscall(translation::netbsd_sysno(op), &nb_args, &mut mem));
+    let w_us0 = RUMP_WAIT_US.load(Ordering::Relaxed);
+    let w_n0 = RUMP_WAIT_N.load(Ordering::Relaxed);
+    let (res, hops) =
+        proxy.with_client(|c| (c.syscall(translation::netbsd_sysno(op), &nb_args, &mut mem), c.last_callbacks()));
     let dt = crate::timer::uptime_us().saturating_sub(t0);
+    let w_us = RUMP_WAIT_US.load(Ordering::Relaxed).saturating_sub(w_us0);
+    let w_n = RUMP_WAIT_N.load(Ordering::Relaxed).saturating_sub(w_n0);
     match res {
         Ok([n, _]) => {
-            crate::safe_print!(96, "[RUMP-SP] {} a2={} -> {} ({}us)\n", op_name(op), a2, n, dt);
+            crate::safe_print!(
+                128,
+                "[RUMP-SP] {} a2={} -> {} ({}us; hops={} blk={}us/{})\n",
+                op_name(op), a2, n, dt, hops, w_us, w_n
+            );
             n as u64
         }
         Err(e) => {
-            crate::safe_print!(96, "[RUMP-SP] {} -> errno {} ({}us)\n", op_name(op), e, dt);
+            crate::safe_print!(
+                128,
+                "[RUMP-SP] {} -> errno {} ({}us; hops={} blk={}us/{})\n",
+                op_name(op), e, dt, hops, w_us, w_n
+            );
             neg_linux_errno(translation::errno_netbsd_to_linux(e))
         }
     }
@@ -1106,7 +1131,11 @@ impl PipeIo for KernelPipeIo {
         // lands instead of at the next timer tick.
         let tid = threading::current_thread_id();
         if !pipe::pipe_check_set_reader(id, tid) {
+            let t0 = crate::timer::uptime_us();
             threading::schedule_blocking(deadline_us);
+            let dt = crate::timer::uptime_us().saturating_sub(t0);
+            RUMP_WAIT_US.fetch_add(dt, Ordering::Relaxed);
+            RUMP_WAIT_N.fetch_add(1, Ordering::Relaxed);
         }
     }
     fn now_us(&mut self) -> u64 {

@@ -1985,15 +1985,25 @@ fn r3b_spinner_body() -> ! {
     }
 }
 
-/// Compute a ~10 ms CNTV interval in virtual-counter ticks from this PE's `CNTFRQ_EL0`,
-/// matching the BSP scheduler's 10 ms tick. Robust to QEMU's varying `CNTFRQ` (24–62.5 MHz)
-/// where a fixed tick count would be a different wall-clock interval. Clamped to the coarse
-/// bringup interval as an upper bound so a bogus `CNTFRQ=0` can never disable preemption.
+/// Compute the secondary's steady-state CNTV interval in virtual-counter ticks from
+/// this PE's `CNTFRQ_EL0`. A **1 ms** tick — 10× finer than the BSP's 10 ms — because
+/// it directly bounds the rump sysproxy round-trip latency (see
+/// docs/MULTIKERNEL_NETWORKING_EXPERIMENT.md §4). rump_server's cooperative-fiber
+/// backend advances by parking a fiber for a sub-millisecond `clock_sleep`/`nanosleep`,
+/// which on Akuma becomes a `schedule_blocking` whose WAITING→READY wake only runs on a
+/// scheduler pass. On a secondary the only *periodic* scheduler pass is this timer tick
+/// (event wakes — pipe/socket wakers — are already prompt), so every sub-tick fiber sleep
+/// during a proxied syscall waited a full tick. Measured: a bare EAGAIN `recvfrom` cost
+/// ~24 ms (2 hops) at a 10 ms tick vs ~2 ms at 1 ms; a full curl-over-rump HTTPS dropped
+/// 5.65 s → 2.93 s. 1 ms is a standard OS tick rate and this core is dedicated to the rump
+/// stack, so the extra idle timer IRQs are negligible. Robust to QEMU's varying `CNTFRQ`
+/// (24–62.5 MHz); clamped to the coarse bringup interval so a bogus `CNTFRQ=0` can never
+/// disable preemption.
 fn steady_tick_interval_ticks() -> u64 {
     let cntfrq: u64;
     // SAFETY: CNTFRQ_EL0 is EL1-readable and reports the virtual counter frequency.
     unsafe { core::arch::asm!("mrs {0}, cntfrq_el0", out(reg) cntfrq, options(nomem, nostack)) };
-    let ticks = cntfrq / 100; // 10 ms = cntfrq / 100
+    let ticks = cntfrq / 1000; // 1 ms = cntfrq / 1000
     if ticks == 0 || ticks > TIMER_INTERVAL_TICKS {
         TIMER_INTERVAL_TICKS
     } else {

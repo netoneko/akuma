@@ -103,27 +103,66 @@ HTTP 200.
 
 `curl -sS -o /dev/null -w ... https://www.apple.com/library/test/success.html`
 
-| phase (cumulative) | core 0 — native | core 1 — forwarded | core 2 — rump-local |
+| phase (cumulative) | core 0 — native | core 1 — forwarded | core 2 — rump-local (before) | core 2 — rump-local (**after**) |
+|---|---|---|---|---|
+| DNS lookup | 0.03–0.09 s | 0.72–0.76 s | 0.39–0.50 s | 2.6–3.5 s ⚠ (warmup/RTT, see below) |
+| TLS handshake (incremental) | 0.17 s | 1.13 s | 1.25 s | **0.14–0.16 s** |
+| HTTP transfer (incremental) | — | ~1.1 s | 1.10 s | **0.12–0.14 s** |
+| **HTTPS connect+TLS+transfer (total − DNS)** | **~0.24 s** | ~1.9 s | **~2.58 s** | **~0.31–0.37 s** |
+
+The **"after" column is the two levers below** (1 ms secondary tick + the RX-DMA fix), measured on
+`netcheck-rump` over core 2's local rump stack. The syscall-bound phases — TLS handshake and HTTP
+transfer, which are many small sysproxy round-trips — collapse from **~2.58 s to ~0.34 s (~7×)**,
+landing within ~1.5× of the *native* stack for those phases. (The `DNS lookup` cell regressed in
+the raw number only because it now absorbs the first-URL ARP/warmup round + real-internet DNS RTT;
+it is not syscall-bound and swings 2.6–3.5 s run-to-run independent of these fixes, so the full
+HTTPS *total* — 2.9–3.9 s — understates the win. The clean signal is per-syscall latency:)
+
+| proxied syscall | before (10 ms tick) | after (1 ms tick) | speedup |
 |---|---|---|---|
-| DNS lookup | 0.03–0.09 s | 0.72–0.76 s | **0.39–0.50 s** |
-| TCP connect | 0.04–0.10 s | 1.18–1.29 s | **0.65–0.74 s** |
-| TLS handshake | 0.21 s | 2.31 s | **1.89–2.14 s** |
-| **HTTPS total** | **0.271 s** | **2.642 s** | **3.00–3.35 s** |
-| vs native | 1× | ~10× | **~11×** |
+| `sendto` (DNS, 2 copyin hops) | ~72 ms | **~5 ms** | ~14× |
+| `recvfrom` nonblocking EAGAIN (0 hops) | ~24 ms | **~2 ms** | ~12× |
+| `recvfrom` with data (1 hop) | ~59 ms | **~2–5 ms** | ~12× |
 
-So **rump-local networking is now roughly on par with forwarding** (~1.1–1.3× the forwarded HTTPS
-total) and ~11× the native stack. Interestingly its *early* phases beat forwarding — DNS ~0.4 s
-(vs 0.74 s forwarded) and TCP connect ~0.26 s incremental (vs ~0.5 s) — because a local UDP/ARP
-round-trip avoids the per-syscall forward tax; but the handshake-heavy phases (TLS ≈ 1.24 s
-incremental, HTTP transfer ≈ 1.1 s) dominate, gated by the ~72 ms/syscall sysproxy latency + the
-rump_server-internal fiber/hardclock latency compounded across the many TLS round-trips. The
-native stack (271 ms) is still far ahead of both.
+**Root cause (measured, not assumed — this corrects the earlier "rump_server-internal
+fiber/hardclock" guess):** with the kernel↔server pipe already event-driven (§7), instrumenting the
+kernel client's *block time per syscall* showed it was ~100 % of the wall-time AND uniform at ~one
+timer tick per pipe hop — even for a 0-hop EAGAIN `recvfrom` that does no rump work. The cost was
+**the Akuma secondary scheduler tick**, not the rump HZ=100 hardclock: rump_server's cooperative
+fiber backend advances by parking a fiber for a sub-millisecond `clock_sleep`/`nanosleep`, which on
+Akuma becomes a `schedule_blocking` whose WAITING→READY wake only runs on a periodic scheduler pass;
+on a secondary the sole periodic pass is the timer tick (event wakes are already prompt), so every
+sub-tick fiber sleep waited a full ~10 ms tick. Dropping the secondary steady tick 10 ms → **1 ms**
+(`steady_tick_interval_ticks`, `src/smp.rs`) bounds each hop to ~1 ms; core 2 is dedicated to the
+rump stack, so the extra idle timer IRQs are negligible. (Lowering the tick further keeps helping
+linearly but with rising IRQ cost; the event-precise fix — arm a one-shot CNTV at the fiber's
+`wake_time` so a sub-tick sleep wakes in µs, no periodic-tick dependence — is the deeper lever, left
+as a follow-up since the periodic tick makes 1 ms a safe, simple, fully-measured win.)
 
-Caveats: single warm HTTPS sample (repeated steady-state via SSH-into-the-rump-box is blocked by
-the >586 B RX-DMA truncation, which breaks SSH KEX — see §8); no warm rump HTTP number (the
-http:// URL is the one that hits the first-round ARP warmup). The forwarding path stays valid;
-rump-local's win is *architectural* (a self-contained per-core stack, no BSP dependency), not yet
-raw latency.
+The forwarding path stays valid; rump-local is now both *architectural* (a self-contained per-core
+stack, no BSP dependency) **and** competitive on the syscall-bound phases.
+
+### Verdict — is rump-local better than native smoltcp?
+
+**No — native smoltcp is still faster, and it's a structural, not a tuning, gap.** smoltcp on core 0
+runs *in-process, in-kernel*: a socket syscall is a direct call (~µs) with no round-trip. rump-local
+routes every socket syscall through the sysproxy pipe to `rump_server` (~2–5 ms/syscall now), so it
+is fundamentally ~1000× the per-syscall cost of native even with both levers in — the pipe hop can
+be made prompt (done) but not free.
+
+What the two fixes changed is the **gap on real workloads**: the handshake/transfer phases went from
+~10× native to **~1.5× native**, and >586 B bodies work at all. So the standing is:
+
+| axis | winner | why |
+|---|---|---|
+| per-socket-syscall latency | **native smoltcp** (~µs vs ~2–5 ms) | in-process direct call; no proxy hop |
+| warm HTTPS handshake+transfer | native (~0.24 s vs ~0.34 s) | ~1.5× — was ~10× |
+| full-featured TCP/IP (NetBSD) | **rump** | real BSD stack vs smoltcp's minimal one |
+| per-core isolation / no BSP dep | **rump** | self-contained stack on the secondary |
+
+So: reach for **native smoltcp when latency is what matters**; rump-local's win is *architectural* (a
+complete, self-contained per-core NetBSD stack), now delivered without a ~10× latency penalty rather
+than *because* it is faster. It is competitive, not superior.
 
 **Methodology caveat (important):** native core-0 curl is **not** broken. An earlier apparent
 "hang" was purely a test-harness artifact — running curl as a stripped-down herd *boot-time
@@ -313,9 +352,10 @@ below). Two secondary issues remain (neither blocks the DNS/HTTPS proof): a firs
    voluntary-override hack — chosen because on a secondary the idle thread is a pure heartbeat
    loop, and involuntary preemption still respects any genuinely-cooperative thread if one is
    ever spawned there.
-2. Steady-state tick lowered to ~10 ms via a live `SECONDARY_TICK_INTERVAL` atomic that
-   `arm_cntv_timer` reads (`cntfrq/100`, clamped ≤ the coarse bringup value). R3b/bringup keep
-   the coarse tick (atomic default), so R3b is unchanged.
+2. Steady-state tick lowered via a live `SECONDARY_TICK_INTERVAL` atomic that `arm_cntv_timer`
+   reads (`steady_tick_interval_ticks`, clamped ≤ the coarse bringup value). R3b/bringup keep
+   the coarse tick (atomic default), so R3b is unchanged. **Now `cntfrq/1000` = 1 ms** (was
+   `cntfrq/100` = 10 ms) — see "DONE (C)" below; this is the dominant per-syscall lever.
 
 **DONE (A) — event-driven sysproxy pipe.** `KernelPipeIo` now blocks in `wait_readable`
 (`pipe_check_set_reader` + `schedule_blocking`) and is woken by `rump_server`'s reply write; the
@@ -324,10 +364,25 @@ instead of `WFI`-waiting a tick. Result: `sendto` ~120 ms → ~72 ms, `recvmsg` 
 BSP native curl unaffected. The remaining ~72 ms is `rump_server`-internal (fiber backend +
 HZ=100 hardclock), a separate rebuild-scoped lever, not the pipe.
 
-**NEXT — rump-internal latency (optional):** to push past ~72 ms/round-trip, the rump_server fiber
-scheduler + NetBSD hardclock (HZ=100) inside the rump kernel are the bottleneck; needs a
-rump_server rebuild. Also: every `ppoll`/`epoll` readiness check on a rump fd is a MSG_PEEK
-sysproxy round-trip (`poll.rs:434`) — one round-trip per probe.
+**DONE (C) — the ~72 ms residual was the AKUMA SECONDARY TICK, not the rump hardclock
+(2026-07-01).** The earlier "rump_server-internal fiber + HZ=100 hardclock, needs a rump_server
+rebuild" attribution was a guess; a Step-0 measurement (add `hops`/`blk` per-syscall accounting to
+the kernel client — `Client::last_callbacks` + `RUMP_WAIT_US`/`RUMP_WAIT_N` in `rump_proxy.rs`)
+falsified it. The kernel client's block-time was ~100 % of each syscall's wall-time AND uniform at
+~one timer tick *per pipe hop* — even a 0-hop nonblocking `recvfrom` returning EAGAIN (no rump work
+at all) cost ~24 ms = 2 hops × ~12 ms. So the cost was Akuma-side, NOT inside rump_server. Two
+control experiments confirmed it and ruled out the alternatives: lowering the `ppoll`
+`BLOCKING_POLL_INTERVAL` re-poll floor (10 ms → 1 ms) changed **nothing** (server wakes are already
+waker-driven/prompt), and lowering the **secondary scheduler tick** (10 ms → 1 ms) cut every hop
+~12×. Mechanism: rump_server's cooperative fiber backend advances by parking a fiber for a
+sub-millisecond `clock_sleep`/`nanosleep`; on Akuma that is a `schedule_blocking` whose
+WAITING→READY wake only runs on a periodic scheduler pass, and on a secondary the sole periodic pass
+is the timer tick — so every sub-tick fiber sleep waited a full tick. **Fix: 1 ms secondary steady
+tick (`steady_tick_interval_ticks`, `src/smp.rs`).** No rump_server rebuild needed. Measured:
+`sendto` ~72 ms → ~5 ms, EAGAIN `recvfrom` ~24 ms → ~2 ms; the HTTPS connect+TLS+transfer phases
+~2.58 s → ~0.34 s (§4). Further (optional): an event-precise one-shot CNTV armed at the fiber's
+`wake_time` would drop sub-tick sleeps to µs without any periodic-tick dependence; also, each
+`ppoll`/`epoll` readiness probe on a rump fd is still one MSG_PEEK sysproxy round-trip.
 
 **FIXED (B) — DNS `rumpapple[000]` was a KERNEL `copy_to_user` fault on a lazy user page, NOT a
 rump-internal bug (2026-07-01).** 🎉 curl over the local rump stack on core 2 now completes a full
@@ -359,26 +414,37 @@ Root cause (found via the "it worked on a single kernel" hint — which ruled ou
   user-copy hitting a lazy page, not just the sysproxy. BSP native curl unaffected (`https 200`,
   `total=0.255 s`); no crashes.
 
-**Still open — two secondary issues (not the DNS truncation):**
+**FIXED (D) — kernel RX-DMA truncation for frames >~586 B (2026-07-01).** Was: `TAP-DBG rx n=590
+tail=[00…00]` — `TapNic.rx_buffer` was an inline `[u8; FRAME_BUF]` field of the `static TAP`, so on a
+secondary it lived in the **replicated `.bss`**, whose per-core private pages are NOT physically
+contiguous across a page boundary (the shared-descriptor skip in `replicate_writable_window` breaks
+the run). virtio's `Hal::share` hands the device a single start-PA + length, so a frame spanning the
+buffer's page boundary was DMA-written past the first physical page into the wrong PA and the tail
+read back zero. **Fix (`crates/akuma-rump/src/lib.rs`): heap-allocate the RX staging buffer
+(`Box<[u8]>`).** The kernel heap is identity-mapped over physically contiguous partition RAM
+(VA==PA), so a single heap allocation is always physically contiguous — the same reason the TX path
+already worked. Verified end-to-end: SSH-into-the-rump-box KEX + auth complete (they exchange >586 B
+packets), and an interactive `curl -L https://.../success.html` over that SSH session returns the
+full page, with `recvfrom a2=3265 -> 3265 (2042us)` — a 3265-byte TLS record received intact in one
+shot (and in ~2 ms, the tick fix). Zero truncation warnings, zero faults.
+
+**Still open — one secondary issue:**
 - **First-URL `[000]` (first-packet/ARP warmup):** the FIRST curl URL (http://) sends 4 DNS queries
-  and gets **zero** answers (~5.7 s timeout) while the SECOND (https://) resolves immediately — the
-  first query round hits an un-warmed rump link (ARP for the gateway, or a dropped first packet).
-  Pre-existing, independent of the truncation fix. Warm the stack (a throwaway query at box bringup)
-  or debug the first-packet loss.
-- **Kernel RX-DMA truncation for frames >~586 B:** `TAP-DBG rx n=590 tail=[00…00]` —
-  `TapNic.rx_buffer` (`[u8; 2048]` in the replicated `.bss`) crosses a non-contiguous physical page,
-  so the device DMAs the tail to the wrong PA (`secondary_dma_virt_to_phys` gives the right *start*
-  PA but can't make a page-crossing buffer contiguous). The DNS answer (203 B) is < 586 B so it's
-  intact, and the HTTPS handshake succeeded (its records fit), but large TLS/HTTP bodies will
-  truncate. Fix: give the RX path a physically-contiguous / identity-mapped DMA buffer like the TX
-  path.
+  and gets **zero** answers (~5 s timeout) while the SECOND (https://) resolves — the first query
+  round hits an un-warmed rump link (ARP for the gateway, or a dropped first packet). Pre-existing,
+  independent of these fixes; it now dominates the raw HTTPS-*total* number (the syscall-bound phases
+  are fast). Warm the stack (a throwaway query at box bringup) or debug the first-packet loss.
+- **(minor) SSH-over-rump non-interactive `ssh host <cmd>` closes after auth**, while an interactive
+  session works (busybox + curl HTTPS confirmed over it). The session-exec/channel-request path over
+  the sysproxy, not RX/tick. Separate follow-up.
 
 **How to test:** boot `CORE2_NIC=1 RUMP_NIC=1 SMP=3 MEMORY=2048 cargo run --profile release-smp
 --features smp,rump,no-tests > logs/x.log 2>&1`. Success = curl prints `rumpapple[200]:...` (the
-https leg does today). `[RUMP-SP] sendto a2=31 -> 31 (Nus)` shows N ~72 ms (was ~840 ms). Then SSH
-into the rump box: `ssh -p 2224 root@localhost` (via `CORE2_SSH_PORT`, net2 → core-2 rump sshd:22)
-and run curl there → interactive SSH-over-rump; that gives the 3rd number for the §4 table
-(native 0.1 s / forwarded 1.4 s / rump-local ~3.4 s incl. first-run warmup).
+https leg does today). `[RUMP-SP] sendto a2=31 -> 31 (Nus; hops=H blk=Bus/K)` shows N ~5 ms with the
+1 ms tick (was ~72 ms at the 10 ms tick, ~840 ms before the event-driven pipe); the `blk`/`hops`
+fields are the per-syscall latency breakdown from DONE (C). Then SSH into the rump box:
+`ssh -p 2224 root@localhost` (via `CORE2_SSH_PORT`, net2 → core-2 rump sshd:22) and run curl there →
+interactive SSH-over-rump returns the page (busybox + `curl -L https://…/success.html` confirmed).
 
 **Config wiring in place (committed):** `bootstrap/etc/herd/enabled/core2herd.conf` launches a
 second herd pinned to core 2 with `--service /srv/core2/etc/herd/{rumpnet,netcheck-rump,sshd-rump}.conf`
