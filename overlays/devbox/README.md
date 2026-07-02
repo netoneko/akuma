@@ -200,8 +200,8 @@ overlays/devbox/
 | `DEVBOX_DISK` | `devbox.img` | Output image path (`DISK=` passthrough). |
 | `DEVBOX_DISK_MB` | `12288` | Image size in MB (toolchain + repo + submodules + cargo cache). |
 | `DEVBOX_MEMORY` | `4096` | Default RAM for `run.sh` (rustc needs ≥2 GB). |
-| `AKUMA_GIT_URL` | `git@github.com:netoneko/akuma.git` | Repo to clone into `/src/...`. Set to a local path/`file://` for offline. |
-| `GITHUB_PAT` | *(unset)* | If set, injected into HTTPS clone URLs for private repos. |
+| `AKUMA_GIT_URL` | `https://github.com/netoneko/akuma.git` | Repo to clone into `/src/...` (all clones are public, no auth needed). Set to a local path/`file://` for offline. |
+| `GITHUB_PAT` | *(unset)* | Only needed if you point `AKUMA_GIT_URL` at a private fork; injected into HTTPS clone URLs. |
 | `DEVBOX_ALL_SUBMODULES` | `true` | Clone all submodules (incl. large `src-netbsd`); set `false` for a lighter image with just the source needed to build meow. |
 
 ---
@@ -223,3 +223,14 @@ overlays/devbox/
 5. Compile meow from source (see [Daily workflow](#daily-workflow)) and run the fresh
    binary's `--help`.
 6. Log every papercut hit during 4–5 — those become the follow-up fix tasks.
+
+---
+
+## Backlog (papercuts)
+
+Papercuts surfaced by dogfooding, to fix later:
+
+- **`ps` shows nothing** despite `/proc` being full of per-process data. `ps` returns
+  empty output even though `/proc/<pid>/…` is populated — so the applet isn't reading
+  the procfs data the kernel already exposes. Needs investigation on the `ps` side
+  (which `/proc` layout it expects) vs. what our procfs presents.

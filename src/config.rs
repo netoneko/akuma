@@ -652,7 +652,12 @@ pub const SSH_PORT: u16 = 22;
 ///
 /// When enabled, the kernel will not spawn its internal SSH server thread.
 /// The userspace /bin/sshd should be started by /bin/herd instead.
-pub const ENABLE_USERSPACE_SSHD: bool = false;
+///
+/// Driven by the `userspace-sshd` cargo feature (off by default → the normal
+/// image keeps its built-in SSH). The devbox turns it on: with rump the default
+/// stack, the built-in server (smoltcp-only) would be the sole thing left on the
+/// native stack, so it must not start.
+pub const ENABLE_USERSPACE_SSHD: bool = cfg!(feature = "userspace-sshd");
 
 /// Prioritize built-in shell commands over external binaries in SSH shell.
 ///

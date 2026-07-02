@@ -3,7 +3,7 @@
 //! For a `stack=rump` box the kernel forwards the box's socket syscalls to the
 //! box's `rump_server` over a kernel **pipe pair** (Akuma has no path AF_UNIX).
 //! This module hosts the kernel end: a [`Transport`] over the kernel-held pipe
-//! ends, and — for now — a boot demo ([`run_demo`]) that spawns `rump_server`,
+//! ends, and — for now — a boot demo ([`run_rump`]) that spawns `rump_server`,
 //! hands it one end as fd 3, and drives one `rump_sys_socket` over the channel.
 //! That is the on-Akuma proof of the kernel-pipe transport; full syscall
 //! interception + per-box wiring (a real [`ClientMem`] over user VA, the fd map,
@@ -152,7 +152,7 @@ static PROXIES: Spinlock<BTreeMap<u64, ProxyEntry>> = Spinlock::new(BTreeMap::ne
 /// since the server runs inside the `stack=rump` box those calls would be
 /// intercepted and routed back into itself (deadlock during bring-up). Excluded
 /// here, they fall through to normal dispatch, which handles the pipe-backed
-/// `UnixSocket` channel fd — exactly as the proven box-0 `run_demo` does.
+/// `UnixSocket` channel fd — exactly as the proven box-0 `run_rump` does.
 static SERVER_PIDS: Spinlock<BTreeSet<process::Pid>> = Spinlock::new(BTreeSet::new());
 
 /// Is `pid` a kernel-spawned `rump_server`? Its own syscalls must never be
@@ -1162,10 +1162,58 @@ impl ClientMem for NoMem {
     }
 }
 
+/// Make the NetBSD rump stack the DEFAULT network stack for box 0 — the root box
+/// every process starts in (the `rump-default` / `devbox` feature). Unlike the
+/// boxed `stack=rump` service (a herd-owned `rump_server` in a fresh box that
+/// processes must `join_box` into), this marks **box 0** rump and brings up its
+/// `rump_server` from the kernel at boot, so every ordinary unboxed process
+/// (the login shell, `sshd`, `curl`, …) has its AF_INET syscalls routed to rump
+/// with no box and no `join_box`. The one persistent `rump_server` it spawns is
+/// box 0's stack; [`attach_server`] wires the sysproxy channel onto its fd 3 and
+/// handshakes in a kthread (~5s: `rump_init` + DHCP over `/dev/net/tap0`).
+///
+/// Requires NIC1 (`RUMP_NIC=1`); without it there is no `/dev/net/tap0` for the
+/// stack to DHCP on, so this logs and returns (box 0 stays on the native stack).
+/// Call once at boot, after the filesystem is mounted (so `/bin/rump_server`
+/// exists) and before herd starts `sshd`.
+#[cfg(feature = "rump-default")]
+pub fn start_default_stack() {
+    if !akuma_net::rump_tap::is_ready() {
+        crate::safe_print!(
+            96,
+            "[RUMP-SP] rump-default: no NIC1 (/dev/net/tap0) — box 0 stays on native stack (run with RUMP_NIC=1)\n"
+        );
+        return;
+    }
+    // Mark box 0 rump BEFORE spawning the server so any subsequent box-0 socket
+    // syscall routes to the proxy (which waits for the handshake); the server's
+    // own pid is excluded from interception inside attach_server.
+    mark_box_rump(0);
+    crate::console::print("[RUMP-SP] rump-default: box 0 stack=rump; spawning /bin/rump_server (--net --fd 3)...\n");
+
+    let pid = match process::spawn_process_with_channel(
+        "/bin/rump_server",
+        Some(&["--net", "--fd", "3", "--log", "/var/log/box/0/rump_server.log"]),
+        None,
+    ) {
+        Ok((_tid, _chan, pid)) => pid,
+        Err(e) => {
+            crate::safe_print!(96, "[RUMP-SP] rump-default: FAILED to spawn rump_server: {}\n", e);
+            return;
+        }
+    };
+    // Wire fd 3 + handshake (in a kthread) + publish the proxy. Persistent: unlike
+    // run_rump we do NOT kill the server — it is box 0's live network stack.
+    attach_server(0, pid);
+}
+
 /// Boot demo — only when NIC1 is present (`RUMP_NIC=1`). Spawns `/bin/rump_server`,
 /// hands it one end of a kernel pipe pair as fd 3, and drives a `rump_sys_socket`
-/// over the other end. Prints `[Test] rump_sysproxy PASSED/FAILED`.
-pub fn run_demo() {
+/// over the other end. Prints `[Test] rump_sysproxy PASSED/FAILED`. Suppressed
+/// when `rump-default` owns box 0's stack (that path spawns the real, persistent
+/// box-0 rump_server instead — see [`start_default_stack`]).
+#[cfg(not(feature = "rump-default"))]
+pub fn run_rump() {
     if !akuma_net::rump_tap::is_ready() {
         return; // no NIC1 → skip cleanly
     }
@@ -1219,6 +1267,7 @@ pub fn run_demo() {
 
 /// Connect over the kernel pipe pair and issue one `rump_sys_socket`. Returns the
 /// rump fd, or a short failure reason (errno baked in).
+#[cfg(not(feature = "rump-default"))]
 fn drive_socket(px: u32, py: u32) -> Result<i64, alloc::string::String> {
     use alloc::format;
     let chan = PipeTransport { io: KernelPipeIo, wr: px, rd: py, timeout_us: READ_TIMEOUT_US };
@@ -1251,6 +1300,7 @@ fn drive_socket(px: u32, py: u32) -> Result<i64, alloc::string::String> {
 /// pending connection, no 15s stall). Runs in kernel context with no user VA, so
 /// the bind sockaddr is served via a `cin_override` (like `proxy_connect`) rather
 /// than a real user pointer.
+#[cfg(not(feature = "rump-default"))]
 fn drive_listen_accept(
     client: &mut ProxyClient,
     fd: i64,

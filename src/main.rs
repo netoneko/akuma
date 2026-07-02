@@ -1217,11 +1217,19 @@ fn run_async_main() -> ! {
         }
     }
 
+    // devbox: make the rump stack the DEFAULT for box 0 (the root box) and bring
+    // up its rump_server here, so every unboxed process is rump-networked with no
+    // herd box / join_box. Mutually exclusive with the demo below (both spawn a
+    // box-0 rump_server; the default-stack one is persistent and real).
+    #[cfg(feature = "rump-default")]
+    rump_proxy::start_default_stack();
+
     // Kernel-as-client sysproxy demo (RUMP_SYSPROXY.md Step 4): only with
     // RUMP_NIC=1; spawns /bin/rump_server and drives rump_sys_socket over a
-    // kernel pipe. Skips cleanly when NIC1 / rump_server is absent.
-    #[cfg(feature = "rump")]
-    rump_proxy::run_demo();
+    // kernel pipe. Skips cleanly when NIC1 / rump_server is absent. Suppressed
+    // when rump-default owns box 0's stack (avoid a second box-0 rump_server).
+    #[cfg(all(feature = "rump", not(feature = "rump-default")))]
+    rump_proxy::run_rump();
 
     // Multikernel: start the console drainer now that preemption is live and the BSP
     // can spawn system threads. It forwards secondary cores' per-core console rings
