@@ -421,6 +421,16 @@ pub fn neg_errno(e: i32) -> u64 {
     (-i64::from(e)) as u64
 }
 
+/// ENETDOWN as the syscall ABI expects it. Used by the AF_INET dispatch arms on a
+/// rump-only build (smoltcp compiled out): a socket syscall that somehow reaches
+/// native dispatch (it normally can't — the rump proxy short-circuits it) gets a
+/// clean "network is down" instead of a missing-symbol link error.
+#[cfg(not(feature = "smoltcp"))]
+#[inline]
+fn net_enetdown() -> u64 {
+    neg_errno(akuma_net::socket::libc_errno::ENETDOWN)
+}
+
 #[repr(C)]
 struct Timespec {
     tv_sec: i64,
@@ -659,22 +669,67 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::LSEEK => fs::sys_lseek(args[0] as u32, args[1] as i64, args[2] as i32),
         nr::FSTAT => fs::sys_fstat(args[0] as u32, args[1]),
         nr::NANOSLEEP => time::sys_nanosleep(args[0], args[1]),
+        // AF_INET socket ops. In a rump box these never reach here (the rump proxy
+        // short-circuits above); with the smoltcp native stack compiled out they
+        // have no implementation, so a stray box-0 call gets a clean ENETDOWN
+        // instead of a link error. SOCKETPAIR (pipe-backed) and SHUTDOWN (no-op)
+        // stay available on both builds.
+        #[cfg(feature = "smoltcp")]
         nr::SOCKET => net::sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),
+        #[cfg(not(feature = "smoltcp"))]
+        nr::SOCKET => net_enetdown(),
         nr::SOCKETPAIR => net::sys_socketpair(args[0] as i32, args[1] as i32, args[2] as i32, args[3]),
+        #[cfg(feature = "smoltcp")]
         nr::BIND => net::sys_bind(args[0] as u32, args[1], args[2] as usize),
+        #[cfg(not(feature = "smoltcp"))]
+        nr::BIND => net_enetdown(),
+        #[cfg(feature = "smoltcp")]
         nr::LISTEN => net::sys_listen(args[0] as u32, args[1] as i32),
+        #[cfg(not(feature = "smoltcp"))]
+        nr::LISTEN => net_enetdown(),
+        #[cfg(feature = "smoltcp")]
         nr::ACCEPT => net::sys_accept(args[0] as u32, args[1], args[2]),
+        #[cfg(not(feature = "smoltcp"))]
+        nr::ACCEPT => net_enetdown(),
+        #[cfg(feature = "smoltcp")]
         nr::ACCEPT4 => net::sys_accept4(args[0] as u32, args[1], args[2], args[3] as u32),
+        #[cfg(not(feature = "smoltcp"))]
+        nr::ACCEPT4 => net_enetdown(),
+        #[cfg(feature = "smoltcp")]
         nr::CONNECT => net::sys_connect(args[0] as u32, args[1], args[2] as usize),
+        #[cfg(not(feature = "smoltcp"))]
+        nr::CONNECT => net_enetdown(),
+        // Always dispatched (both smoltcp and rump-only builds define these): the
+        // rump-only variants handle a UnixSocket (pipe-backed) fd — the box-0
+        // rump_server's fd-3 sysproxy channel uses send()/recv() on it — and EBADF
+        // anything else. Gating these to net_enetdown() breaks the rump handshake.
         nr::SENDTO => net::sys_sendto(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5] as usize),
         nr::RECVFROM => net::sys_recvfrom(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5]),
+        #[cfg(feature = "smoltcp")]
         nr::GETSOCKNAME => net::sys_getsockname(args[0] as u32, args[1], args[2]),
+        #[cfg(not(feature = "smoltcp"))]
+        nr::GETSOCKNAME => net_enetdown(),
+        #[cfg(feature = "smoltcp")]
         nr::GETPEERNAME => net::sys_getpeername(args[0] as u32, args[1], args[2]),
+        #[cfg(not(feature = "smoltcp"))]
+        nr::GETPEERNAME => net_enetdown(),
+        #[cfg(feature = "smoltcp")]
         nr::SETSOCKOPT => net::sys_setsockopt(args[0] as u32, args[1] as i32, args[2] as i32, args[3], args[4] as u32),
+        #[cfg(not(feature = "smoltcp"))]
+        nr::SETSOCKOPT => net_enetdown(),
+        #[cfg(feature = "smoltcp")]
         nr::GETSOCKOPT => net::sys_getsockopt(args[0] as u32, args[1] as i32, args[2] as i32, args[3], args[4]),
+        #[cfg(not(feature = "smoltcp"))]
+        nr::GETSOCKOPT => net_enetdown(),
         nr::SHUTDOWN => net::sys_shutdown(args[0] as u32, args[1] as i32),
+        #[cfg(feature = "smoltcp")]
         nr::SENDMSG => net::sys_sendmsg(args[0] as u32, args[1], args[2] as i32),
+        #[cfg(not(feature = "smoltcp"))]
+        nr::SENDMSG => net_enetdown(),
+        #[cfg(feature = "smoltcp")]
         nr::RECVMSG => net::sys_recvmsg(args[0] as u32, args[1], args[2] as i32),
+        #[cfg(not(feature = "smoltcp"))]
+        nr::RECVMSG => net_enetdown(),
         nr::MREMAP => mem::sys_mremap(args[0] as usize, args[1] as usize, args[2] as usize, args[3] as u32),
         nr::MMAP => mem::sys_mmap(args[0] as usize, args[1] as usize, args[2] as u32, args[3] as u32, args[4] as i32, args[5] as usize),
         nr::MUNMAP => mem::sys_munmap(args[0] as usize, args[1] as usize),
@@ -682,7 +737,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CLONE3 => proc::sys_clone3(args[0], args[1] as usize),
         nr::EXECVE => proc::sys_execve(args[0], args[1], args[2]),
         nr::UPTIME => time::sys_uptime(),
+        #[cfg(feature = "smoltcp")]
         nr::RESOLVE_HOST => net::sys_resolve_host(args[0], args[1] as usize, args[2]),
+        #[cfg(not(feature = "smoltcp"))]
+        nr::RESOLVE_HOST => net_enetdown(),
         nr::GETDENTS64 => fs::sys_getdents64(args[0] as u32, args[1], args[2] as usize),
         nr::PSELECT6 => poll::sys_pselect6(args[0] as usize, args[1], args[2], args[3], args[4], args[5]),
         nr::PPOLL => poll::sys_ppoll(args[0], args[1] as usize, args[2], args[3]),

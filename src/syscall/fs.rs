@@ -1,5 +1,8 @@
 use super::*;
-use akuma_net::socket::{self, libc_errno};
+use akuma_net::socket::libc_errno;
+// The `socket` module alias is only used by the smoltcp socket read/write arms.
+#[cfg(feature = "smoltcp")]
+use akuma_net::socket;
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 const EROFS: u64 = (-30i64) as u64;
@@ -313,6 +316,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 Err(e) => fs_error_to_errno(e)
             }
         }
+        #[cfg(feature = "smoltcp")]
         akuma_exec::process::FileDescriptor::Socket(idx) => {
             let limit = 64 * 1024;
             let to_read = count.min(limit);
@@ -794,6 +798,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     }
                 }
             }
+            #[cfg(feature = "smoltcp")]
             akuma_exec::process::FileDescriptor::Socket(idx) => {
                 let nonblock = super::net::fd_is_nonblock(fd_num as u32);
                 let result = if socket::is_udp_socket(idx) {

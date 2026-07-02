@@ -8,6 +8,14 @@
 #![allow(clippy::wrong_self_convention)] // kernel types don't follow std naming
 #![allow(clippy::inline_always)] // used for hot syscall paths
 #![allow(clippy::needless_pass_by_value)] // trait bounds often require owned types
+// Rump-only build (devbox: smoltcp compiled out). The whole in-kernel interactive
+// surface — the built-in shell (builtin/fs/exec commands), the `neko` editor, and
+// the `async_fs` helpers behind it — is reached ONLY through the built-in SSH
+// server, which is smoltcp-based and gone here. In this reduced build those
+// subsystems are compiled but unused (SSH is the userspace /bin/sshd, and the
+// shell is userspace busybox), so silence dead-code for this config only. The
+// default/size/extreme builds keep dead-code denied.
+#![cfg_attr(not(feature = "smoltcp"), allow(dead_code))]
 
 extern crate alloc;
 
@@ -41,7 +49,7 @@ mod gic;
 #[cfg(not(feature = "gic-v2"))]
 mod gic_v3;
 mod irq;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), feature = "smoltcp"))]
 mod network_tests;
 mod pmm;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
@@ -60,9 +68,17 @@ mod shell_tests;
 mod smp;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod sync_tests;
+// The built-in (in-kernel) SSH server is built on smoltcp sockets, so it is
+// compiled out with the native stack (devbox / rump-only). SSH there is the
+// userspace /bin/sshd (herd), which routes over rump like any other process.
+#[cfg(feature = "smoltcp")]
 mod ssh;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), feature = "smoltcp"))]
 mod ssh_tests;
+// The only in-kernel SSH server is smoltcp-based; with it gone there must be a
+// userspace sshd, or the image has no way in.
+#[cfg(all(not(feature = "smoltcp"), not(feature = "userspace-sshd")))]
+compile_error!("no in-kernel SSH without `smoltcp`; enable the `userspace-sshd` feature (userspace /bin/sshd)");
 mod syscall;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod tests;
@@ -1198,15 +1214,16 @@ fn run_async_main() -> ! {
         }
     }
 
-    // Run network self-tests if enabled
-    #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+    // Run network self-tests if enabled (smoltcp-only suites)
+    #[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), feature = "smoltcp"))]
     if config::RUN_NETWORK_TESTS {
         network_tests::run_tests();
     }
 
     // Recompute here (different function from kernel_main's boot_tests_enabled):
     // these spawn-heavy suites are skipped on tiny machines, see kernel_main.
-    #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+    // Both suites are smoltcp/SSH-coupled, so they compile out with the native stack.
+    #[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), feature = "smoltcp"))]
     {
         let ram = akuma_exec::mmu::ram_end().saturating_sub(akuma_exec::mmu::ram_base());
         let low_mem_skip_tests = config::LOW_MEM_TEST_SKIP_MB != 0
@@ -1249,9 +1266,13 @@ fn run_async_main() -> ! {
     #[cfg(kernel_smp)]
     smp::autostart_bench_core();
 
-    // Initialize SSH host key
+    // Initialize SSH host key (built-in SSH server is smoltcp-only).
+    #[cfg(feature = "smoltcp")]
     ssh::init_host_key();
 
+    // Built-in (smoltcp) SSH server. Compiled out entirely when the native stack
+    // is absent (devbox / rump-only) — there SSH is the userspace /bin/sshd.
+    #[cfg(feature = "smoltcp")]
     if !config::ENABLE_USERSPACE_SSHD {
         console::print("[Main] Spawning built-in SSH server thread...\n");
         if let Err(e) = threading::spawn_system_thread_fn(|| ssh::server::run()) {
@@ -1262,10 +1283,13 @@ fn run_async_main() -> ! {
     } else {
         console::print("[Main] Built-in SSH server disabled (ENABLE_USERSPACE_SSHD=true)\n");
     }
+    #[cfg(not(feature = "smoltcp"))]
+    console::print("[Main] Built-in SSH server not compiled (rump-only build); userspace /bin/sshd only\n");
 
     safe_print!(1024, "[Main] Network ready! Running background polling loop.\n");
+    #[cfg(feature = "smoltcp")]
     if !config::ENABLE_USERSPACE_SSHD {
-        safe_print!(1024, "[Main] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p {}\n", 
+        safe_print!(1024, "[Main] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p {}\n",
             if crate::config::SSH_PORT == 22 { 2222 } else { crate::config::SSH_PORT });
     }
 
@@ -1346,6 +1370,9 @@ fn run_async_main() -> ! {
         // without draining, TCP ACKs/window updates are delayed until the
         // next scheduler slot, causing the remote sender's TCP window to
         // shrink and throughput to collapse.
+        // Rump-only builds have no smoltcp interface to poll; the rump stack is
+        // driven by rump_server + the per-box sysproxy path instead.
+        #[cfg(feature = "smoltcp")]
         {
             let mut polls = 0u32;
             while akuma_net::smoltcp_net::poll() {
@@ -1355,7 +1382,7 @@ fn run_async_main() -> ! {
                 }
             }
         }
-        
+
         GLOBAL_POLL_STEP.store(2, Ordering::Relaxed);
         if config::MEM_MONITOR_ENABLED {
             let _ = mem_monitor_pinned.as_mut().poll(&mut cx);
@@ -1510,6 +1537,10 @@ async fn memory_monitor() -> ! {
         // for the extreme kernel stacks. Printed on its own line to keep [Mem] short.
         akuma_exec::threading::report_stack_high_water();
 
+        // SSH server stats + stall watchdog. The built-in server is smoltcp-only,
+        // so this whole report compiles out on a rump-only build.
+        #[cfg(feature = "smoltcp")]
+        {
         let ssh = ssh::server::stats();
         buf.clear();
         if ssh.alive {
@@ -1570,6 +1601,7 @@ async fn memory_monitor() -> ! {
             );
         }
         console::print(buf.as_str());
+        }
 
         // Report every 10 seconds (or period from config)
         Timer::after(Duration::from_secs(config::MEM_MONITOR_PERIOD_SECONDS)).await;

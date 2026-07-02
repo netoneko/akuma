@@ -12,10 +12,14 @@ set -e
 # reservation itself is now derived from the linked image size in linker.ld, not
 # a per-profile constant. Re-add any sc-* feature (or kernel-tls) below to keep
 # that family in the build (used to bisect which family tcc needs).
+#
+# `smoltcp` is listed explicitly: it is now an optional feature (so the devbox
+# can drop the native stack), and extreme keeps its native stack + built-in SSH
+# as before. Drop `smoltcp` here to reclaim its space if extreme goes netless.
 cargo +nightly build \
     --profile extreme-size \
     --no-default-features \
-    --features no-tests,extreme \
+    --features no-tests,smoltcp,extreme \
     -Z build-std=core,alloc \
     "$@"
 ls -lh target/aarch64-unknown-none/extreme-size/akuma

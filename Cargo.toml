@@ -117,6 +117,7 @@ inherits = "release"
 [features]
 default = [
     "neko",
+    "smoltcp",
     "kernel-tls",
     "tls-rsa",
     "sound",
@@ -145,13 +146,21 @@ smp = ["dep:akuma-smp"]
 # 4 MB floor). NIC1 itself only exists when the QEMU runner is started with
 # RUMP_NIC=1; without it, tap init no-ops and /dev/net/tap0 returns ENODEV.
 rump = ["akuma-net/rump", "dep:akuma-rump"]
+# The native smoltcp TCP/IP stack (NIC0): the in-kernel socket syscalls, DNS/HTTP,
+# and the built-in SSH server are all built on it. In `default`; the devbox build
+# drops it (rump is the only stack) via --no-default-features, which compiles the
+# whole smoltcp path — and the smoltcp-coupled built-in SSH — out. Enables the
+# matching akuma-net feature.
+smoltcp = ["dep:smoltcp", "akuma-net/smoltcp"]
 # In-kernel TLS client for the shell `curl` command's https:// branch (the
 # embedded-tls stack in akuma-net + its X.509 verifier — ~58 KB of kernel
 # .text). Enabled by default and kept by the `size` profile (ECDSA/Ed25519
 # HTTPS); the `extreme` profile omits it (build_extreme_size.sh does not re-add
 # it under --no-default-features), so 4 MB builds carry no built-in HTTPS — use
 # a userspace tool. Fully independent of SSH, which is Ed25519-only via
-# akuma-ssh-crypto and never gated by this.
+# akuma-ssh-crypto and never gated by this. NOTE: its only runtime consumer
+# (http_get) is smoltcp-coupled, so kernel-tls is dead weight without `smoltcp`
+# — every profile that enables it also enables `smoltcp`.
 kernel-tls = [
     "akuma-net/kernel-tls",
 ]
@@ -241,7 +250,7 @@ akuma-ssh = { path = "crates/akuma-ssh" }
 akuma-vfs = { path = "crates/akuma-vfs" }
 akuma-ext2 = { path = "crates/akuma-ext2" }
 akuma-shell = { path = "crates/akuma-shell" }
-akuma-net = { path = "crates/akuma-net" }
+akuma-net = { path = "crates/akuma-net", default-features = false }
 akuma-exec = { path = "crates/akuma-exec" }
 # Kernel-side sysproxy client (rumpsp wire + Linux↔NetBSD translation); only the
 # `rump` feature needs it directly (akuma-net already pulls it for rump_tap).
@@ -253,7 +262,7 @@ akuma-smp = { path = "crates/akuma-smp", optional = true }
 talc = "4"
 spinning_top = "0.3"
 fdt = "0.1"
-smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"] }
+smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
 virtio-drivers = { version = "0.7", default-features = false }
 arm_pl031 = { version = "0.2", default-features = false }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize", "fast"] }

@@ -28,6 +28,7 @@ where
         match future.as_mut().poll(&mut cx) {
             core::task::Poll::Ready(val) => return val,
             core::task::Poll::Pending => {
+                #[cfg(feature = "smoltcp")]
                 akuma_net::smoltcp_net::poll();
                 akuma_exec::threading::yield_now();
             }

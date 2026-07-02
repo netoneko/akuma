@@ -5,6 +5,9 @@
 pub mod builtin;
 pub mod exec;
 pub mod fs;
+// curl/nslookup/pkg are built on the smoltcp stack (http_get / DNS); gated out on
+// a rump-only build — use a userspace HTTP tool there.
+#[cfg(feature = "smoltcp")]
 pub mod net;
 
 use super::CommandRegistry;
@@ -20,6 +23,7 @@ pub use fs::{
     APPEND_CMD, CAT_CMD, CP_CMD, DF_CMD, FIND_CMD, LS_CMD, MKDIR_CMD, MOUNT_CMD, MV_CMD, RM_CMD,
     WRITE_CMD,
 };
+#[cfg(feature = "smoltcp")]
 pub use net::{CURL_CMD, NSLOOKUP_CMD, PKG_CMD};
 
 /// Create and populate the default command registry.
@@ -60,10 +64,13 @@ pub fn create_default_registry() -> CommandRegistry {
     registry.register(&DF_CMD);
     registry.register(&MOUNT_CMD);
 
-    // Network commands
-    registry.register(&CURL_CMD);
-    registry.register(&NSLOOKUP_CMD);
-    registry.register(&PKG_CMD);
+    // Network commands (smoltcp-only)
+    #[cfg(feature = "smoltcp")]
+    {
+        registry.register(&CURL_CMD);
+        registry.register(&NSLOOKUP_CMD);
+        registry.register(&PKG_CMD);
+    }
 
     // Process execution commands
     registry.register(&EXEC_CMD);

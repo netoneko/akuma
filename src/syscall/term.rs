@@ -46,6 +46,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 Some(akuma_exec::process::FileDescriptor::PipeRead(pipe_id)) => {
                     super::pipe::pipe_bytes_available(pipe_id) as i32
                 }
+                #[cfg(feature = "smoltcp")]
                 Some(akuma_exec::process::FileDescriptor::Socket(idx)) => {
                     super::net::socket_recv_queue_size(idx) as i32
                 }

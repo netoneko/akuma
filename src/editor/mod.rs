@@ -5,7 +5,10 @@
 
 use alloc::string::String;
 
-pub use akuma_editor::{TermSize, TermSizeProvider};
+pub use akuma_editor::TermSizeProvider;
+// TermSize is consumed only by the built-in (smoltcp) SSH editor integration.
+#[cfg(feature = "smoltcp")]
+pub use akuma_editor::TermSize;
 
 use crate::async_fs;
 

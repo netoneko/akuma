@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(feature = "smoltcp")]
 use akuma_net::socket;
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 #[cfg(feature = "sc-epoll")]
@@ -283,6 +284,7 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
     let tid = akuma_exec::threading::current_thread_id();
 
     match fd_entry {
+        #[cfg(feature = "smoltcp")]
         akuma_exec::process::FileDescriptor::Socket(idx) => {
             if let Some(w) = waker {
                 socket::socket_add_waker(idx, w.clone());
@@ -475,6 +477,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
         iterations += 1;
         
         // Drive network stack (only once per loop)
+        #[cfg(feature = "smoltcp")]
         akuma_net::smoltcp_net::poll();
 
         let mut kernel_events = alloc::vec![];
@@ -684,6 +687,7 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
     let start_time = crate::timer::uptime_us();
 
     loop {
+        #[cfg(feature = "smoltcp")]
         akuma_net::smoltcp_net::poll();
         let mut ready_count: u64 = 0;
         let mut out_read = [0u64; MAX_FDS / 64];
@@ -785,6 +789,7 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
     let waker = akuma_exec::threading::current_thread_waker();
 
     loop {
+        #[cfg(feature = "smoltcp")]
         akuma_net::smoltcp_net::poll();
         let mut ready_count = 0;
 

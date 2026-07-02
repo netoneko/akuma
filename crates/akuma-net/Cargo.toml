@@ -4,17 +4,28 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+# Default on so plain `cargo build`/`cargo test -p akuma-net` keep the smoltcp
+# native stack. The kernel disables it for the devbox (rump-only) by depending on
+# this crate with `default-features = false` and NOT re-enabling `smoltcp`.
+default = ["smoltcp"]
 small-sockets = []
+# The native smoltcp TCP/IP stack: the smoltcp_net/socket/dns/http modules and
+# everything with smoltcp types in its signatures. Optional so a rump-only build
+# (devbox) can compile it out entirely. The rump path (rump_tap + the kernel
+# sysproxy client) is smoltcp-free and stays available without this.
+smoltcp = ["dep:smoltcp"]
 # Raw L2 packet path (a second virtio-net NIC exposed as /dev/net/tap0) for the
 # kernel's `rump` feature. Adds crate::rump_tap (the hardware half); the
 # device-independent orchestration lives in the host-tested `akuma-rump` crate.
+# Smoltcp-free — usable with `smoltcp` off.
 rump = ["dep:akuma-rump"]
 # In-kernel TLS client (embedded-tls) for outbound HTTPS — the only consumer is
-# the shell `curl` command's https:// branch (http::http_get). Pulls in
-# embedded-tls plus the X.509 cert verifier (x509-cert/der/p256/ed25519/sha2)
-# and the TLS RNG adapter (rand_core) — ~58 KB of kernel .text. Default-on for
-# normal/size builds; the extreme profile omits it to reclaim that space. This
-# stack is fully independent of SSH, which lives in `akuma-ssh-crypto`.
+# the shell `curl` command's https:// branch (http::http_get). The TLS/verifier
+# crates are themselves smoltcp-free, but http.rs is gated by `smoltcp`, so this
+# is dead weight without it. Pulls in embedded-tls plus the X.509 cert verifier
+# (x509-cert/der/p256/ed25519/sha2) and the TLS RNG adapter (rand_core) — ~58 KB
+# of kernel .text. Default-on for normal/size builds; the extreme profile omits
+# it. Independent of SSH (which lives in akuma-ssh-crypto).
 kernel-tls = [
     "dep:embedded-tls", "dep:sha2", "dep:x509-cert", "dep:der",
     "dep:const-oid", "dep:p256", "dep:ed25519-dalek", "dep:rand_core",
@@ -31,7 +42,7 @@ workspace = true
 [dependencies]
 # Host-testable rump tap orchestration; pulled in only by the `rump` feature.
 akuma-rump = { path = "../akuma-rump", optional = true }
-smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"] }
+smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
 virtio-drivers = { version = "0.7", default-features = false }
 embedded-io-async = { version = "0.6", default-features = false }
 spinning_top = "0.3"

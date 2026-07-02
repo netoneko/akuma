@@ -28,4 +28,7 @@ echo "Once you see the rump DHCP lease + userspace sshd listening, connect with:
 echo "  ssh -o StrictHostKeyChecking=no -p $SSH_PORT root@localhost"
 echo
 
-exec cargo run --profile devbox --features devbox
+# Same feature set as scripts/build_devbox.sh: --no-default-features drops smoltcp
+# (and the smoltcp-coupled built-in SSH) entirely; rump is the only stack.
+DEVBOX_FEATURES="devbox,neko,sound,no-tests,sc-aio,sc-sysv-ipc,sc-framebuffer,sc-containers,sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll"
+exec cargo run --profile devbox --no-default-features --features "$DEVBOX_FEATURES"

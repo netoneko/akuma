@@ -8,7 +8,7 @@ set -e
 cargo +nightly build \
     --profile size \
     --no-default-features \
-    --features no-tests,kernel-tls,sc-aio,sc-sysv-ipc,sc-framebuffer,sc-containers,sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll \
+    --features no-tests,smoltcp,kernel-tls,sc-aio,sc-sysv-ipc,sc-framebuffer,sc-containers,sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll \
     -Z build-std=core,alloc \
     "$@"
 ls -lh target/aarch64-unknown-none/size/akuma

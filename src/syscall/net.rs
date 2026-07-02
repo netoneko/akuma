@@ -1,6 +1,11 @@
 use super::*;
+// Socket types/errnos + copyin are only used by the smoltcp socket ops below;
+// copy_to_user_safe is also used by the Tier-A bounce/socketpair paths.
+#[cfg(feature = "smoltcp")]
 use akuma_net::socket::{self, SockAddrIn, libc_errno};
-use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
+#[cfg(feature = "smoltcp")]
+use akuma_exec::mmu::user_access::copy_from_user_safe;
+use akuma_exec::mmu::user_access::copy_to_user_safe;
 
 /// Largest bounce buffer a single net syscall will allocate (16 pages).
 const NET_BOUNCE_MAX: usize = 64 * 1024;
@@ -66,6 +71,7 @@ pub(super) fn remote_socket_handle(fd: u32) -> Option<u32> {
     }
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
     let base_type = sock_type & 0xFF;
     let cloexec = sock_type & 0x80000 != 0;
@@ -180,6 +186,7 @@ pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: u
     0
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     if len < 16 { return EINVAL; }
     if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
@@ -208,6 +215,7 @@ pub(super) fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     }
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn sys_listen(fd: u32, backlog: i32) -> u64 {
     #[cfg(kernel_smp)]
     if let Some(h) = remote_socket_handle(fd) {
@@ -223,6 +231,7 @@ pub(super) fn sys_listen(fd: u32, backlog: i32) -> u64 {
     }
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     if addr_ptr != 0 && !validate_user_ptr(addr_ptr, 16) { return EFAULT; }
     if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
@@ -267,6 +276,7 @@ pub(super) fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     }
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u64 {
     if addr_ptr != 0 && !validate_user_ptr(addr_ptr, 16) { return EFAULT; }
     if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
@@ -321,6 +331,7 @@ pub(super) fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u
     }
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     if len < 16 { return EINVAL; }
     if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
@@ -357,6 +368,7 @@ pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     }
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn sys_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     if addr_ptr == 0 || len_ptr == 0 { return EINVAL; }
     if !validate_user_ptr(len_ptr, 4) { return EFAULT; }
@@ -384,6 +396,7 @@ pub(super) fn sys_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     0
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn sys_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     if addr_ptr == 0 || len_ptr == 0 { return EINVAL; }
     if !validate_user_ptr(len_ptr, 4) { return EFAULT; }
@@ -435,6 +448,7 @@ pub(super) fn sys_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     }
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_addr: u64, addr_len: usize) -> u64 {
     // AF_UNIX socketpair endpoint: send == write to the tx pipe.
     if fd_is_unix_socket(fd) {
@@ -516,6 +530,7 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
     }
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_addr: u64, addr_len_ptr: u64) -> u64 {
     // AF_UNIX socketpair endpoint: recv == read from the rx pipe.
     if fd_is_unix_socket(fd) {
@@ -617,8 +632,32 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
     }
 }
 
+// Rump-only build (no smoltcp): the native socket table is gone, but a UnixSocket
+// (pipe-backed) fd still needs send/recv, which map to pipe write/read. This is
+// how the box-0 `rump_server`'s fd-3 sysproxy channel works: rump_server is
+// excluded from box interception, so its `send()`/`recv()` on fd 3 fall through to
+// here — the sysproxy banner + reply frames flow through this path. Without it the
+// handshake banner send fails and box 0's rump stack never comes up. A real AF_INET
+// socket cannot exist without smoltcp, so anything else is EBADF.
+#[cfg(not(feature = "smoltcp"))]
+pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, _dest_addr: u64, _addr_len: usize) -> u64 {
+    if fd_is_unix_socket(fd) {
+        return super::fs::sys_write(u64::from(fd), buf_ptr, len);
+    }
+    EBADF
+}
+
+#[cfg(not(feature = "smoltcp"))]
+pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, _src_addr: u64, _addr_len_ptr: u64) -> u64 {
+    if fd_is_unix_socket(fd) {
+        return super::fs::sys_read(u64::from(fd), buf_ptr, len);
+    }
+    EBADF
+}
+
 pub(super) fn sys_shutdown(_fd: u32, _how: i32) -> u64 { 0 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, optlen: u32) -> u64 {
     const SOL_SOCKET: i32 = 1;
     const IPPROTO_TCP: i32 = 6;
@@ -701,6 +740,7 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
     }
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, optlen: u64) -> u64 {
     const SOL_SOCKET: i32 = 1;
     const SO_ERROR: i32 = 4;
@@ -793,6 +833,7 @@ struct MsgHdr {
     msg_flags: i32,
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     if !validate_user_ptr(msg_ptr, core::mem::size_of::<MsgHdr>()) { return EFAULT; }
     let mut msg = MsgHdr::default();
@@ -878,6 +919,7 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     }
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     if !validate_user_ptr(msg_ptr, core::mem::size_of::<MsgHdr>()) { return EFAULT; }
     let mut msg = MsgHdr::default();
@@ -1031,6 +1073,7 @@ pub(super) fn fd_is_unix_socket(fd: u32) -> bool {
     })
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn socket_get_udp_handle(idx: usize) -> Option<akuma_net::smoltcp_net::SocketHandle> {
     socket::with_socket(idx, |sock| {
         if let socket::SocketType::Datagram { handle, .. } = &sock.inner {
@@ -1041,6 +1084,7 @@ pub(super) fn socket_get_udp_handle(idx: usize) -> Option<akuma_net::smoltcp_net
     }).flatten()
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn socket_recv_queue_size(idx: usize) -> usize {
     socket::with_socket(idx, |sock| {
         match &sock.inner {
@@ -1059,6 +1103,7 @@ pub(super) fn socket_recv_queue_size(idx: usize) -> usize {
     }).unwrap_or(0)
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn socket_can_recv_tcp(idx: usize) -> bool {
     socket::with_socket(idx, |sock| {
         match &sock.inner {
@@ -1092,6 +1137,7 @@ pub(super) fn socket_can_recv_tcp(idx: usize) -> bool {
     }).unwrap_or(false)
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn socket_can_send_tcp(idx: usize) -> bool {
     socket::with_socket(idx, |sock| {
         if let socket::SocketType::Stream(h) = &sock.inner {
@@ -1107,6 +1153,7 @@ pub(super) fn socket_can_send_tcp(idx: usize) -> bool {
 
 /// Returns true when the smoltcp socket is completely dead (Closed state).
 /// Used to report EPOLLHUP so callers detect connection loss without spinning.
+#[cfg(feature = "smoltcp")]
 pub(super) fn socket_is_dead_tcp(idx: usize) -> bool {
     socket::with_socket(idx, |sock| {
         if let socket::SocketType::Stream(h) = &sock.inner {
@@ -1121,6 +1168,7 @@ pub(super) fn socket_is_dead_tcp(idx: usize) -> bool {
 
 /// Returns true when the remote peer has closed its write side (sent FIN).
 /// Used to report EPOLLRDHUP — signals to libuv that recv() will return EOF.
+#[cfg(feature = "smoltcp")]
 pub(super) fn socket_peer_closed_tcp(idx: usize) -> bool {
     socket::with_socket(idx, |sock| {
         if let socket::SocketType::Stream(h) = &sock.inner {
@@ -1134,6 +1182,7 @@ pub(super) fn socket_peer_closed_tcp(idx: usize) -> bool {
     }).unwrap_or(false)
 }
 
+#[cfg(feature = "smoltcp")]
 pub(super) fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> u64 {
     if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
     if !validate_user_ptr(res_ptr, 4) { return EFAULT; }

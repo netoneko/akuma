@@ -13,24 +13,34 @@ pub mod commands;
 
 use alloc::format;
 use alloc::string::String;
+// Only the smoltcp-gated interactive (SSH) execution paths use these.
+#[cfg(feature = "smoltcp")]
 use alloc::vec::Vec;
 
+#[cfg(feature = "smoltcp")]
 use akuma_exec::process;
+// The SSH channel stream type belongs to the smoltcp-based built-in SSH server.
+#[cfg(feature = "smoltcp")]
 use crate::ssh::protocol::SshChannelStream;
 
 pub use akuma_shell::{
-    expand_variables,
-    split_first_word, trim_bytes, translate_input_keys,
-    ChainExecutionResult, Command, CommandRegistry,
-    InteractiveRead, ShellContext, ShellError,
-    StreamableCommand, VecWriter,
+    split_first_word, trim_bytes,
+    Command, CommandRegistry,
+    ShellContext, ShellError,
+    VecWriter,
+};
+// Re-exports consumed only by the interactive (SSH) execution paths.
+#[cfg(feature = "smoltcp")]
+pub use akuma_shell::{
+    expand_variables, translate_input_keys,
+    ChainExecutionResult, InteractiveRead, StreamableCommand,
 };
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub use akuma_shell::parse_pipeline;
 
-pub use akuma_shell::exec::{
-    check_streamable_command, execute_command_chain, ShellBackend,
-};
+pub use akuma_shell::exec::ShellBackend;
+#[cfg(feature = "smoltcp")]
+pub use akuma_shell::exec::{check_streamable_command, execute_command_chain};
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub use akuma_shell::exec::execute_pipeline;
 
@@ -202,6 +212,7 @@ where
     }
 }
 
+#[cfg(feature = "smoltcp")]
 pub async fn execute_external_interactive(
     path: &str,
     args: Option<&[&str]>,
@@ -343,7 +354,8 @@ pub async fn execute_external_interactive(
 
 /// Execute a command with streaming output for interactive sessions.
 ///
-/// This is the main entry point called from the SSH protocol handler.
+/// This is the main entry point called from the SSH protocol handler (smoltcp-only).
+#[cfg(feature = "smoltcp")]
 pub async fn execute_command_streaming_interactive(
     line: &[u8],
     registry: &CommandRegistry,

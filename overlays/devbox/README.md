@@ -1,179 +1,132 @@
 # Akuma Devbox
 
 A reproducible "sit down and develop **inside** Akuma" image. You SSH into it and use it
-like a tiny Unix workstation: rump networking, a real editor (`neatvi`), C + Rust
-toolchains, `scratch` as git-to-GitHub, and `meow` wired to **z.ai's GLM-5.2**.
+like a tiny Unix workstation. The point is **dogfooding** — surfacing and fixing the
+concrete papercuts that only show up under daily use.
 
-The point is **dogfooding** — surfacing and fixing the concrete papercuts that only show
-up under daily use. First workloads: compiling `meow` from source in-VM, and (later) a
-music player evolved from `wavplay`.
+Everything here lives under `overlays/devbox/` and does not disturb the default
+`bootstrap/` tree or the normal run scripts.
 
-Everything here is self-contained under `overlays/devbox/` and does not disturb the
-default `bootstrap/` tree or the existing run scripts.
+> **Current state:** the image is being built up incrementally. Right now it is the
+> **minimal** target — *SSH in over the rump network stack, nothing else* — so that the
+> networking + login foundation is solid before the toolchains, editor, `meow`, and the
+> in-VM source tree get layered back on (see [Roadmap — the rest](#roadmap--the-rest)).
 
 ---
 
 ## Quick start
 
 ```bash
-# 1. Build the image (host). ~8–12 GB; pulls the Rust toolchain + clones the repo in.
+# 1. Build the minimal image (host). Needs Docker; builds herd + sshd, ~1 GB image.
 overlays/devbox/bootstrap.sh
 
-# 2. Boot it (single kernel, rump networking, 4 GB RAM).
+# 2. Boot it (devbox profile: rump is the default stack, no built-in SSH, RUMP_NIC=1).
 overlays/devbox/run.sh
 
-# 3. SSH in once you see the rump DHCP lease + "[SSH Server] Listening" in the log.
+# 3. SSH in once box 0's rump stack is up and herd has started sshd.
 ssh -o StrictHostKeyChecking=no -p 2223 root@localhost
 ```
 
-Then fill in your secrets **inside the VM** (see [Secrets](#secrets-fill-in-after-ssh)).
-
 ---
 
-## Design
+## How it works
 
-### Single kernel, no SMP
-The devbox boots one kernel (`cargo run --release`, no `--features smp`, `SMP` unset). The
-`release` profile is deliberate: it compiles in both `rump` (networking) and `sound`
-(virtio-sound for `wavplay`).
+The devbox differs from a normal Akuma boot in exactly two ways, and both are selected
+together by the **`devbox` profile + `devbox` feature** (mirroring how `size`/`extreme`
+are a `[profile.*]` plus a feature set):
 
-### rump is the only stack you touch
-Networking uses the **NetBSD rump TCP/IP stack**, not the native smoltcp stack. This is
-achieved by running everything you interact with **inside one `stack=rump` box rooted at
-`/`**:
-
-- `herd` supervises a single `rump_server` (the box's networking), and
-- the userspace `sshd` **joins that box** (`join_box = rumpnet`), so your SSH session — and
-  every process you spawn from it (shells, `curl`, `cargo`, `meow`) — lives in the box.
-
-For any process in a `stack=rump` box, the kernel intercepts the AF_INET socket syscalls
-(`socket`/`connect`/`bind`/`listen`/`accept`/`send`/`recv`, syscalls 198/203/206/…) and
-routes them to the box's `rump_server` over a sysproxy channel on the server's fd 3. smoltcp
-still exists in the kernel but nothing you run touches it. The kernel's dispatch is hardened
-so a `stack=rump` box can never fall through to smoltcp.
-
-Requires the second NIC (`/dev/net/tap0`) — `run.sh` sets `RUMP_NIC=1`, which adds a
-virtio-net on `virtio-mmio-bus.4` and forwards host port **2223** → box port 22. rump DHCPs
-`10.0.2.15` from QEMU SLIRP on boot.
-
-### meow → rump, and the "does TLS go through smoltcp?" question
-**No — meow's TLS goes through rump, not smoltcp, once meow runs in the box.** This trips
-people up, so here is the exact mechanism (verified in `userspace/libakuma`):
-
-- meow does HTTPS via `libakuma-tls` (a pure-Rust `embedded-tls` client). Its TLS record
-  I/O is plain socket `connect`/`send`/`recv`.
-- Those socket calls in `libakuma` **already use the standard Linux aarch64 socket syscall
-  numbers** (`SOCKET=198`, `CONNECT=203`, `SENDTO=206` — `lib.rs:64-69`, ungated by any
-  feature). They are exactly the syscalls the kernel intercepts for a `stack=rump` box.
-  → **TLS traffic is routed to rump automatically. No smoltcp. `libakuma-tls` stays.**
-- The one thing that would leak is **DNS**: by default meow resolves hostnames via the
-  Akuma-custom `RESOLVE_HOST` syscall (300), which is *not* intercepted (and isn't the rump
-  resolver). meow's **`linux-net` feature** (`userspace/meow/src/linux_net.rs`) replaces
-  that with ordinary UDP-socket DNS, which **is** intercepted → resolves `api.z.ai` through
-  rump. It also swaps `UPTIME` (319) for `clock_gettime`.
-
-So the correct build is: **`--features linux-net`, target `aarch64-unknown-linux-musl`,
-keep `libakuma-tls`.** That is what makes meow fully rump-routed (DNS + TLS). No meow code
-change is needed. `linux-net` also enables `libakuma/linux-abi`, which fixes `getpid` on the
-linux-musl target.
-
-```bash
-# How the devbox meow (shipped + rebuilt in-VM) is built. meow is a freestanding no_std
-# binary that provides its own _start, so it links with rust-lld directly (no crt, no libc,
-# no external gcc) and build-std supplies the mem intrinsics — same model as the bare-metal
-# build, just with linux-abi syscall numbers:
-cd userspace/meow
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-Clinker=rust-lld -Clinker-flavor=ld.lld -Clink-self-contained=no" \
-cargo build --release --target aarch64-unknown-linux-musl --features linux-net \
-  -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
+```
+cargo run --profile devbox --features devbox      # what overlays/devbox/run.sh does
+scripts/build_devbox.sh                            # build-only equivalent
 ```
 
-### Filesystem
-The rump box is rooted at `/` — the whole disk **is** the devbox. No isolated subtree, so
-the full toolchain and source tree are directly visible in your SSH session with no
-duplication.
+```
+[features]
+devbox         = ["rump-default", "userspace-sshd"]   # the meta-feature
+rump-default   = ["rump"]                             # rump is the DEFAULT stack for box 0
+userspace-sshd = []                                   # no built-in (smoltcp) SSH server
+```
+
+`[profile.devbox]` inherits `release`, so it carries `rump` + `sound` codegen; the
+behavioural difference is entirely in those two features.
+
+### 1. rump is the DEFAULT network stack (not a box)
+
+Akuma routes AF_INET syscalls **per box**, keyed on a process's `box_id`. Box 0 is the
+root box every process starts in; normally box 0 is on the native smoltcp stack, and rump
+is opt-in per box (a herd `stack=rump` service in its own box that other processes must
+`join_box` into).
+
+The `rump-default` feature flips box 0 itself to rump. At boot the kernel
+(`rump_proxy::start_default_stack`, `src/rump_proxy.rs`):
+
+1. marks **box 0** as `stack=rump` (`mark_box_rump(0)`),
+2. spawns `/bin/rump_server --net --fd 3` in box 0, and
+3. wires the kernel sysproxy channel onto its fd 3 and handshakes (`attach_server(0, …)`)
+   — `rump_init` + ~19 kthreads + DHCP over `/dev/net/tap0`, ~5 s.
+
+After that, **every ordinary unboxed process** — the login shell, `sshd`, and anything you
+spawn from your session — has its socket syscalls transparently routed to box 0's
+`rump_server` over that channel. No herd box, no `box_root`, no `join_box`. The kernel's
+dispatch hook (`intercept_box_syscall`) enforces this as a hard guarantee: a socket-family
+syscall (or any syscall on a rump-owned fd) from a rump box can never fall through to
+smoltcp.
+
+This needs the second NIC (`/dev/net/tap0`) — `run.sh` sets `RUMP_NIC=1`, which adds a
+virtio-net on `virtio-mmio-bus.4` and forwards host port **2223** → guest port 22 on that
+NIC. Without `RUMP_NIC=1` there is no tap for the stack to DHCP on, so `start_default_stack`
+logs and leaves box 0 on the native stack.
+
+### 2. No built-in SSH
+
+Akuma normally runs an **in-kernel** SSH server (the one that prints
+`[SSH Server] Listening`). It is built on smoltcp sockets and runs unboxed on the native
+stack — exactly the one thing that would *not* go through rump. The `userspace-sshd`
+feature sets `config::ENABLE_USERSPACE_SSHD = true` so the kernel never starts it
+(`[Main] Built-in SSH server disabled`).
+
+The only sshd is then the **userspace `/bin/sshd`**, started by herd
+(`/etc/herd/enabled/sshd.conf`) **unboxed** — so it lives in box 0 and its
+listen/accept/session I/O is automatically rump-routed. There is no `join_box` anymore.
+
+**Login auth:** this is a local dev VM reachable only via the host port-forward, so
+`/etc/sshd/sshd.conf` sets `disable_key_verification = true` — `ssh -o
+StrictHostKeyChecking=no -p 2223 root@localhost` gets in with no key setup. The host key is
+auto-generated on first boot at `/etc/sshd/id_ed25519`. To require a key instead, set that
+false and drop your pubkey in `/etc/sshd/authorized_keys`.
+
+### `/etc` comes from the overlay only
+
+`bootstrap.sh` populates the base binaries from `bootstrap/`, then **wipes `/etc`
+entirely** and lays down `overlays/devbox/rootfs/` as the *sole* source of `/etc`. Nothing
+from `bootstrap/etc/` (stale herd/sshd/httpd demo configs) is inherited unreviewed — the
+devbox owns its `/etc` outright.
+
+### smoltcp is still compiled in (for now)
+
+`smoltcp` and the in-kernel SSH server are **compile-coupled** — the SSH server, plus
+`syscall/net.rs`, `poll.rs`, and the DNS/HTTP paths, are all built on smoltcp types across
+~15 files. So the current `devbox` feature simply layers on top of the default feature set:
+smoltcp is *compiled* but box 0 never routes to it, and the built-in SSH server never
+starts. **Phase 2** will build the devbox with `--no-default-features` to compile smoltcp
+(and the smoltcp-coupled built-in SSH) out entirely — see `scripts/build_devbox.sh`.
 
 ---
 
-## What's on the image
+## What's on the minimal image
 
 | Area | Contents |
 |------|----------|
-| **Shell / tools** | `busybox` with a **full applet symlink set** (`awk`, `sed`, `find`, `tar`, `ps`, …) so common commands work without full paths. `apk` package manager present. |
-| **Editor** | `neatvi` at `/bin/vi` (a small ISC-licensed C vi clone — see [`NOTICE`](./NOTICE)). |
-| **C toolchain** | `tcc` (`/bin/tcc`) + musl-dev headers/static libs + `libtcc1`. Compile with `tcc -static`. |
-| **Rust toolchain** | Nightly `rustc`/`cargo` (musl host) under `/usr/local`, with `rust-src` and std for `aarch64-unknown-linux-musl` and `aarch64-unknown-none`. |
-| **git** | `scratch` (symlinked `/bin/git`): `clone`/`push` over HTTPS with a GitHub PAT. |
-| **Agent** | `meow` (built `--features linux-net`) → z.ai GLM-5.2. |
-| **Audio** | `wavplay` → `/dev/dsp` (virtio-sound). *(Not exercised by verification — test it yourself.)* |
-| **Source** | The full Akuma repo cloned from GitHub **with submodules** into `/src/github.com/netoneko/akuma/` — the tree you develop against in-VM (includes the `meow` submodule). Optionally a pre-seeded `/root/.cargo` cache for offline builds. |
+| **Networking** | `/bin/rump_server` — box 0's NetBSD rump TCP/IP stack, brought up by the kernel at boot. |
+| **Supervisor** | `/bin/herd` — starts the userspace `sshd`. |
+| **SSH** | `/bin/sshd` (userspace), unboxed → rump. The only sshd on the image. |
+| **Shell** | `busybox` with a full applet symlink set (`--full-busybox`), `/bin/sh`. |
 
-Services are configured via `herd` (`/etc/herd/enabled/`):
-- `rumpnet.conf` — the boxed `rump_server` (`box_root = /`, `stack = rump`).
-- `sshd.conf` — userspace `sshd`, `join_box = rumpnet`, port 22, `start_delay_ms` to let the
-  rump handshake settle. This is the **only** sshd; the base image's native httpd/sshd are
-  not carried into the devbox enabled set.
-
----
-
-## Secrets (fill in after SSH)
-
-The image ships with **placeholders** — no secrets are baked in at build time. After you
-SSH in:
-
-**z.ai / GLM-5.2 API key** — edit `/etc/meow/config` and set the key under the `zai`
-provider, or run `meow init`:
-```
-[provider:zai]
-base_url=https://api.z.ai/api/paas/v4
-type=openai
-api_key=YOUR_ZAI_KEY_HERE
-```
-```bash
-vi /etc/meow/config          # set api_key=…
-meow -c "hello"              # smoke test one turn
-```
-
-**GitHub PAT** (for `scratch`/`git` push/clone of private repos):
-```bash
-scratch config credential.token ghp_your_token_here
-# or per-command:  scratch push main --token ghp_...
-git clone https://github.com/<you>/<repo>.git
-```
-`/root/DEVBOX.txt` on the image has these commands paste-ready.
-
----
-
-## Daily workflow
-
-```bash
-ssh -o StrictHostKeyChecking=no -p 2223 root@localhost
-
-# edit
-vi somefile.c
-
-# C
-tcc -static -o hello hello.c && ./hello
-
-# Rust / rebuild meow from source (linux ABI → rump-routed)
-export PATH=/usr/local/bin:$PATH
-cd /src/github.com/netoneko/akuma/userspace/meow
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-Clinker=rust-lld -Clinker-flavor=ld.lld -Clink-self-contained=no" \
-cargo build --release --target aarch64-unknown-linux-musl --features linux-net \
-  -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
-./target/aarch64-unknown-linux-musl/release/meow --help
-
-# git via scratch (after PAT)
-git clone https://github.com/<you>/<repo>.git
-git add . && git commit -m "wip" && git push
-
-# talk to GLM-5.2 (after api_key)
-meow                          # interactive TUI
-meow -c "explain this diff"   # one-shot
-```
-
-When something is awkward, slow, or broken — that's the point. Note it; those papercuts are
-the backlog this devbox exists to generate and fix.
+`/etc` (all from the overlay):
+- `etc/herd/enabled/sshd.conf` — the unboxed userspace sshd.
+- `etc/sshd/sshd.conf` — `disable_key_verification = true` (local dev VM).
+- `etc/resolv.conf`, `etc/meow/config` — staged for the roadmap items below (not exercised
+  by the minimal image).
 
 ---
 
@@ -181,15 +134,15 @@ the backlog this devbox exists to generate and fix.
 
 ```
 overlays/devbox/
-  bootstrap.sh   # end-to-end host build: userspace → neatvi → create → populate → clone → overlay
-  run.sh         # launch QEMU: single kernel, RUMP_NIC=1, MEMORY=4096, DISK=devbox.img
+  bootstrap.sh   # host build: build herd+sshd → create image → base binaries → wipe /etc → overlay
+  run.sh         # boot QEMU: cargo run --profile devbox --features devbox, RUMP_NIC=1, MEMORY=4096
   README.md      # this file
-  NOTICE         # third-party attribution (neatvi)
-  rootfs/        # files overlaid on top of the base bootstrap into the image
-    etc/herd/enabled/rumpnet.conf
+  NOTICE         # third-party attribution (neatvi — used by a roadmap item)
+  rootfs/        # the SOLE source of the image's /etc
     etc/herd/enabled/sshd.conf
-    etc/meow/config
+    etc/sshd/sshd.conf
     etc/resolv.conf
+    etc/meow/config
     root/DEVBOX.txt
 ```
 
@@ -198,31 +151,57 @@ overlays/devbox/
 | Var | Default | Meaning |
 |-----|---------|---------|
 | `DEVBOX_DISK` | `devbox.img` | Output image path (`DISK=` passthrough). |
-| `DEVBOX_DISK_MB` | `12288` | Image size in MB (toolchain + repo + submodules + cargo cache). |
-| `DEVBOX_MEMORY` | `4096` | Default RAM for `run.sh` (rustc needs ≥2 GB). |
-| `AKUMA_GIT_URL` | `https://github.com/netoneko/akuma.git` | Repo to clone into `/src/...` (all clones are public, no auth needed). Set to a local path/`file://` for offline. |
-| `GITHUB_PAT` | *(unset)* | Only needed if you point `AKUMA_GIT_URL` at a private fork; injected into HTTPS clone URLs. |
-| `DEVBOX_ALL_SUBMODULES` | `true` | Clone all submodules (incl. large `src-netbsd`); set `false` for a lighter image with just the source needed to build meow. |
+| `DEVBOX_DISK_MB` | `1024` | Image size in MB. Bumped when the toolchain + `/src` tree are added. |
+| `DEVBOX_BUILD_USERSPACE` | `true` | Rebuild `herd` + `sshd` from source; `false` reuses `bootstrap/bin`. |
+
+`run.sh` env knobs: `DEVBOX_DISK`, `DEVBOX_MEMORY` (default 4096), `RUMP_SSH_PORT` (default 2223).
 
 ---
 
 ## Verification
 
-1. `overlays/devbox/bootstrap.sh` completes; the image exists.
-2. `overlays/devbox/run.sh`; wait for the rump DHCP lease (`10.0.2.15`) and
-   `[SSH Server] Listening` in the log.
-3. `ssh -p 2223 root@localhost` lands in the rump-box shell.
-4. In-VM smoke tests:
-   - busybox applets resolve without full paths (`awk`, `sed`, `find`, `tar`, `ps`).
-   - `apk --version` works.
-   - `vi` (neatvi) opens and edits a file.
-   - `tcc -static hello.c && ./a.out`; rebuild neatvi from source with `tcc`.
-   - `curl -sS https://ifconfig.me` succeeds (proves HTTPS through rump).
-   - after PAT: `git clone` / `git push` a repo.
-   - `meow --help`; after key set, one live GLM-5.2 turn.
-5. Compile meow from source (see [Daily workflow](#daily-workflow)) and run the fresh
-   binary's `--help`.
-6. Log every papercut hit during 4–5 — those become the follow-up fix tasks.
+1. `overlays/devbox/bootstrap.sh` completes; `devbox.img` exists with `/etc` = overlay only.
+2. `overlays/devbox/run.sh`; in the log, watch for:
+   - `[RUMP-SP] box 0 marked stack=rump` and `rump-default: … spawning /bin/rump_server`
+   - `[Main] Built-in SSH server disabled (ENABLE_USERSPACE_SSHD=true)`
+   - `[RUMP-SP] box=0 proxy ready` (box 0's rump stack up, DHCP done)
+   - `[herd] Started sshd` and `[SSHD] Listening on …`
+3. `ssh -o StrictHostKeyChecking=no -p 2223 root@localhost` lands in a shell — and the log
+   shows `[RUMP-SP] accept -> box_fd=…` + `sendto`/`recvfrom` for the session, i.e. the SSH
+   session is running over rump with no box.
+4. Log every papercut hit — those become follow-up fix tasks (see Backlog).
+
+---
+
+## Roadmap — the rest
+
+Layered back on now that SSH-over-rump is solid:
+
+- **Phase 2 networking:** build with `--no-default-features` so smoltcp (and the
+  smoltcp-coupled built-in SSH) are compiled out entirely, not just unused.
+- **Toolchains:** `apk` + `musl-dev` + `libtcc1`, `tcc` (`tcc -static`), and a nightly Rust
+  toolchain (musl host) under `/usr/local` with `rust-src` and the `aarch64-unknown-linux-musl`
+  / `aarch64-unknown-none` std — via `populate_disk.sh --with-apk --with-musl-dev
+  --with-rust-toolchain`. (Needs `etc/apk` + `etc/ssl` staged into the overlay so `/etc`
+  stays overlay-only.)
+- **Editor:** `neatvi` at `/bin/vi` (ISC-licensed C vi clone — see [`NOTICE`](./NOTICE)),
+  cross-compiled with the repo's `aarch64-linux-musl-gcc`.
+- **`git`:** `scratch` symlinked to `/bin/git` (clone/push over HTTPS with a GitHub PAT).
+- **Agent `meow` → z.ai GLM-5.2.** meow's HTTPS already rides rump automatically: its socket
+  syscalls (`libakuma`, numbers 198/203/206) are the Linux ABI numbers the kernel intercepts,
+  so `libakuma-tls` (embedded-tls) goes through rump with no change. The one leak is DNS
+  (custom `RESOLVE_HOST` syscall 300, not intercepted); meow's **`linux-net` feature** swaps
+  it for ordinary UDP-socket DNS that *is* intercepted. Build (freestanding no_std, its own
+  `_start`, links with rust-lld directly):
+  ```bash
+  cd userspace/meow
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-Clinker=rust-lld -Clinker-flavor=ld.lld -Clink-self-contained=no" \
+  cargo build --release --target aarch64-unknown-linux-musl --features linux-net \
+    -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
+  ```
+  z.ai key + GitHub PAT are filled in **after** SSH (placeholders only; `/root/DEVBOX.txt`).
+- **Source tree:** clone the full Akuma repo (+submodules) into `/src/github.com/netoneko/akuma`
+  so you develop against it in-VM (this is what bumps `DEVBOX_DISK_MB`).
 
 ---
 
@@ -230,7 +209,7 @@ overlays/devbox/
 
 Papercuts surfaced by dogfooding, to fix later:
 
-- **`ps` shows nothing** despite `/proc` being full of per-process data. `ps` returns
-  empty output even though `/proc/<pid>/…` is populated — so the applet isn't reading
-  the procfs data the kernel already exposes. Needs investigation on the `ps` side
-  (which `/proc` layout it expects) vs. what our procfs presents.
+- **`ps` shows nothing** despite `/proc` being full of per-process data. `ps` returns empty
+  output even though `/proc/<pid>/…` is populated — so the applet isn't reading the procfs
+  data the kernel already exposes. Needs investigation on the `ps` side (which `/proc`
+  layout it expects) vs. what our procfs presents.

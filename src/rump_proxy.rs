@@ -103,11 +103,15 @@ fn op_name(op: translation::Op) -> &'static str {
 
 /// rump_server readiness: `rump_init` + its ~19 kthread spawns take a while, so
 /// the handshake read tolerates a long stall before declaring the server dead.
-const HANDSHAKE_TIMEOUT_US: u64 = 15_000_000;
+/// On a minimal/idle boot (e.g. the devbox rump-only build, where box 0's
+/// rump_server is the very first process and no other stack activity keeps the
+/// scheduler churning) rump_init advances only at the ~10 ms hardclock and takes
+/// noticeably longer than the ~5 s of a busy boot — hence the generous ceiling.
+const HANDSHAKE_TIMEOUT_US: u64 = 60_000_000;
 
 /// How long a box socket syscall waits for its proxy to come up (herd spawns the
-/// rump_server at boot; the handshake takes ~5s through rump_init + DHCP).
-const PROXY_WAIT_TIMEOUT_US: u64 = 20_000_000;
+/// rump_server at boot; the handshake takes ~5s busy, longer on an idle boot).
+const PROXY_WAIT_TIMEOUT_US: u64 = 90_000_000;
 
 type ProxyClient = Client<PipeTransport<KernelPipeIo>>;
 
@@ -1205,6 +1209,15 @@ pub fn start_default_stack() {
     // Wire fd 3 + handshake (in a kthread) + publish the proxy. Persistent: unlike
     // run_rump we do NOT kill the server — it is box 0's live network stack.
     attach_server(0, pid);
+    //
+    // Do NOT block here waiting for the handshake: rump_server's rumpsp fiber (which
+    // sends the banner the kernel handshake reads) is COOPERATIVELY scheduled and
+    // only advances while the host scheduler keeps churning. main must return so it
+    // starts herd + enters its background loop — that ongoing churn is what pumps
+    // rump_server's fibers to completion. herd's sshd `start_delay_ms` + restart, and
+    // the per-box `ensure_box_proxy` wait on the first socket syscall, cover the ~5s+
+    // bring-up. (Blocking main here starves those fibers and the handshake never
+    // completes.)
 }
 
 /// Boot demo — only when NIC1 is present (`RUMP_NIC=1`). Spawns `/bin/rump_server`,

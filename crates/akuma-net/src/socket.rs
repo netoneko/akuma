@@ -4,13 +4,20 @@
 //! Wraps smoltcp sockets via the thread-safe `smoltcp_net` module.
 
 use alloc::vec::Vec;
+#[cfg(feature = "smoltcp")]
 use alloc::collections::VecDeque;
+#[cfg(feature = "smoltcp")]
 use core::sync::atomic::{AtomicU16, Ordering};
+#[cfg(feature = "smoltcp")]
 use core::task::Waker;
+#[cfg(feature = "smoltcp")]
 use spinning_top::Spinlock;
 
+#[cfg(feature = "smoltcp")]
 use crate::smoltcp_net::{self, SocketHandle, with_network};
+#[cfg(feature = "smoltcp")]
 use crate::runtime::runtime;
+#[cfg(feature = "smoltcp")]
 use smoltcp::socket::tcp;
 
 // ============================================================================
@@ -21,6 +28,7 @@ use smoltcp::socket::tcp;
 pub const MAX_SOCKETS: usize = 128;
 
 /// Maximum number of sockets to pre-allocate for a listener's backlog
+#[cfg(feature = "smoltcp")]
 const MAX_BACKLOG: usize = 8;
 
 /// Ephemeral port range start
@@ -29,6 +37,7 @@ pub const EPHEMERAL_PORT_START: u16 = 49152;
 pub const EPHEMERAL_PORT_END: u16 = 65535;
 
 /// Global atomic for ephemeral port allocation
+#[cfg(feature = "smoltcp")]
 static NEXT_EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(EPHEMERAL_PORT_START);
 
 // ============================================================================
@@ -96,6 +105,7 @@ pub mod socket_const {
 // Socket Type
 // ============================================================================
 
+#[cfg(feature = "smoltcp")]
 pub enum SocketType {
     /// A connected or connecting socket (one smoltcp handle)
     Stream(SocketHandle),
@@ -115,6 +125,7 @@ pub enum SocketType {
 // Kernel Socket
 // ============================================================================
 
+#[cfg(feature = "smoltcp")]
 pub struct KernelSocket {
     pub inner: SocketType,
     pub bind_port: Option<u16>,
@@ -127,6 +138,7 @@ pub struct KernelSocket {
     pub wakers: Spinlock<Vec<Waker>>,
 }
 
+#[cfg(feature = "smoltcp")]
 impl KernelSocket {
     #[must_use] 
     pub fn new_stream() -> Option<Self> {
@@ -210,6 +222,7 @@ impl KernelSocket {
 // ============================================================================
 
 /// Allocate an ephemeral port
+#[cfg(feature = "smoltcp")]
 fn alloc_ephemeral_port() -> u16 {
     let port = NEXT_EPHEMERAL_PORT.fetch_add(1, Ordering::Relaxed);
     if port == EPHEMERAL_PORT_END {
@@ -225,9 +238,11 @@ fn alloc_ephemeral_port() -> u16 {
 // ============================================================================
 
 /// Global table of sockets (indexed by integer "socket descriptor")
+#[cfg(feature = "smoltcp")]
 static SOCKET_TABLE: Spinlock<Option<Vec<Option<KernelSocket>>>> = Spinlock::new(None);
 
-pub(crate) fn with_table<F, R>(f: F) -> R 
+#[cfg(feature = "smoltcp")]
+pub(crate) fn with_table<F, R>(f: F) -> R
 where F: FnOnce(&mut Vec<Option<KernelSocket>>) -> R 
 {
     let mut guard = SOCKET_TABLE.lock();
@@ -238,7 +253,8 @@ where F: FnOnce(&mut Vec<Option<KernelSocket>>) -> R
 }
 
 /// Allocate a socket index
-#[must_use] 
+#[cfg(feature = "smoltcp")]
+#[must_use]
 pub fn alloc_socket(socket_type: i32) -> Option<usize> {
     let socket = match socket_type {
         socket_const::SOCK_STREAM => KernelSocket::new_stream()?,
@@ -262,6 +278,7 @@ pub fn alloc_socket(socket_type: i32) -> Option<usize> {
     })
 }
 
+#[cfg(feature = "smoltcp")]
 pub fn with_socket<F, R>(idx: usize, f: F) -> Option<R>
 where F: FnOnce(&KernelSocket) -> R
 {
@@ -270,6 +287,7 @@ where F: FnOnce(&KernelSocket) -> R
     })
 }
 
+#[cfg(feature = "smoltcp")]
 pub fn socket_add_waker(idx: usize, waker: Waker) {
     with_table(|table| {
         if let Some(Some(sock)) = table.get(idx) {
@@ -278,6 +296,7 @@ pub fn socket_add_waker(idx: usize, waker: Waker) {
     });
 }
 
+#[cfg(feature = "smoltcp")]
 pub fn remove_socket(idx: usize) {
     with_table(|table| {
         if idx < table.len()
@@ -295,11 +314,19 @@ pub fn remove_socket(idx: usize) {
     });
 }
 
+/// No-op when the smoltcp stack is compiled out (devbox / rump-only).
+///
+/// There is no smoltcp socket table, and `FileDescriptor::Socket` fds are never
+/// created. Kept so the unconditional FD-teardown / `ExecRuntime` callers link.
+#[cfg(not(feature = "smoltcp"))]
+pub fn remove_socket(_idx: usize) {}
+
 // ============================================================================
 // Socket Option Setters
 // ============================================================================
 
 /// Set `TCP_NODELAY` option on a socket
+#[cfg(feature = "smoltcp")]
 pub fn set_tcp_nodelay(idx: usize, enabled: bool) {
     with_table(|table| {
         if let Some(Some(sock)) = table.get_mut(idx) {
@@ -309,6 +336,7 @@ pub fn set_tcp_nodelay(idx: usize, enabled: bool) {
 }
 
 /// Set `SO_KEEPALIVE` option on a socket
+#[cfg(feature = "smoltcp")]
 pub fn set_socket_keepalive(idx: usize, enabled: bool) {
     with_table(|table| {
         if let Some(Some(sock)) = table.get_mut(idx) {
@@ -326,6 +354,7 @@ pub fn set_socket_keepalive(idx: usize, enabled: bool) {
 /// Drains all pending network work before checking the condition, since the
 /// calling thread is about to block anyway. This ensures TCP ACKs, window
 /// updates, and retransmissions are processed promptly.
+#[cfg(feature = "smoltcp")]
 fn wait_until<F>(mut condition: F, timeout_us: Option<u64>) -> Result<(), i32>
 where F: FnMut() -> bool
 {
@@ -360,6 +389,7 @@ where F: FnMut() -> bool
     }
 }
 
+#[cfg(feature = "smoltcp")]
 pub fn socket_bind(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
     with_table(|table| {
         if let Some(Some(sock)) = table.get_mut(idx) {
@@ -377,6 +407,7 @@ pub fn socket_bind(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
     })
 }
 
+#[cfg(feature = "smoltcp")]
 pub fn socket_listen(idx: usize, backlog: usize) -> Result<(), i32> {
     with_table(|table| {
         if idx >= table.len() || table[idx].is_none() {
@@ -400,6 +431,7 @@ pub fn socket_listen(idx: usize, backlog: usize) -> Result<(), i32> {
     })
 }
 
+#[cfg(feature = "smoltcp")]
 fn has_pending_connection(idx: usize) -> bool {
     let mut result = false;
     with_table(|table| {
@@ -416,6 +448,7 @@ fn has_pending_connection(idx: usize) -> bool {
     result
 }
 
+#[cfg(feature = "smoltcp")]
 pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4), i32> {
     if nonblock {
         if !has_pending_connection(idx) {
@@ -469,6 +502,7 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
     Ok((new_idx, addr))
 }
 
+#[cfg(feature = "smoltcp")]
 pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<(), i32> {
     let is_dgram = with_table(|table| {
         if let Some(Some(sock)) = table.get(idx) {
@@ -541,6 +575,7 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
     if connected { Ok(()) } else { Err(libc_errno::ECONNREFUSED) }
 }
 
+#[cfg(feature = "smoltcp")]
 pub fn socket_send(idx: usize, buf: &[u8], nonblock: bool) -> Result<usize, i32> {
     let handle = with_table(|table| {
         if let Some(Some(KernelSocket { inner: SocketType::Stream(h), .. })) = table.get(idx) { Some(*h) } else { None }
@@ -572,6 +607,7 @@ pub fn socket_send(idx: usize, buf: &[u8], nonblock: bool) -> Result<usize, i32>
     res.unwrap_or(Err(libc_errno::ENETDOWN))
 }
 
+#[cfg(feature = "smoltcp")]
 pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, i32> {
     let handle = with_table(|table| {
         if let Some(Some(KernelSocket { inner: SocketType::Stream(h), .. })) = table.get(idx) { Some(*h) } else { None }
@@ -625,6 +661,7 @@ pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, 
 // UDP Socket Operations
 // ============================================================================
 
+#[cfg(feature = "smoltcp")]
 pub fn socket_send_udp(idx: usize, buf: &[u8], dest: SocketAddrV4) -> Result<usize, i32> {
     let handle = with_table(|table| {
         if let Some(Some(KernelSocket { inner: SocketType::Datagram { handle, .. }, bind_port, .. })) = table.get_mut(idx) {
@@ -656,6 +693,7 @@ pub fn socket_send_udp(idx: usize, buf: &[u8], dest: SocketAddrV4) -> Result<usi
     Ok(buf.len())
 }
 
+#[cfg(feature = "smoltcp")]
 pub fn socket_recv_udp(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<(usize, SocketAddrV4), i32> {
     let handle = with_table(|table| {
         if let Some(Some(KernelSocket { inner: SocketType::Datagram { handle, .. }, .. })) = table.get(idx) {
@@ -692,6 +730,7 @@ pub fn socket_recv_udp(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<(us
 
 /// Check if a socket index refers to a UDP socket
 #[must_use] 
+#[cfg(feature = "smoltcp")]
 pub fn is_udp_socket(idx: usize) -> bool {
     with_table(|table| {
         if let Some(Some(sock)) = table.get(idx) {
@@ -704,6 +743,7 @@ pub fn is_udp_socket(idx: usize) -> bool {
 
 /// Get the default peer for a connected UDP socket
 #[must_use] 
+#[cfg(feature = "smoltcp")]
 pub fn udp_default_peer(idx: usize) -> Option<SocketAddrV4> {
     with_table(|table| {
         if let Some(Some(KernelSocket { inner: SocketType::Datagram { peer, .. }, .. })) = table.get(idx) {
@@ -722,7 +762,8 @@ pub struct SocketStat {
     pub box_id: u64,
 }
 
-#[must_use] 
+#[must_use]
+#[cfg(feature = "smoltcp")]
 pub fn list_sockets() -> Vec<SocketStat> {
     let mut stats = Vec::new();
     let current_box_id = (runtime().current_box_id)();
@@ -789,6 +830,15 @@ pub fn list_sockets() -> Vec<SocketStat> {
         }
     });
     stats
+}
+
+/// Empty when the smoltcp stack is compiled out (devbox / rump-only): no smoltcp
+/// socket table exists, so `/proc/net/tcp` shows just its header. Kept so the
+/// unconditional procfs caller still links.
+#[cfg(not(feature = "smoltcp"))]
+#[must_use]
+pub fn list_sockets() -> Vec<SocketStat> {
+    Vec::new()
 }
 
 // ============================================================================
