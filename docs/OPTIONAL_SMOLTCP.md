@@ -127,15 +127,21 @@ working smoltcp build); both fixes live in our kernel dispatch:
    as the `sendto`/`recvfrom` UnixSocket variants). `readframe` uses `read`, already
    handled. (`src/syscall/net.rs`, `src/syscall/mod.rs`.)
 
-2. **WAITPID pid ↔ rump-fd collision (session hang).** `rump_proxy::intercept_box_syscall`
-   treated *any* syscall whose `args[0]` numerically matched a rump socket fd as
-   proxy-owned. `sshd`'s `waitpid(child_pid)` (nr 303) on its shell child, whose pid `4`
-   equalled the accepted rump-socket fd `4`, was thus misrouted and returned `EOPNOTSUPP`
-   in a tight retry loop → the session hung. (Phase 1's larger pid/fd numbers never
-   collided; the minimal `no-tests` build makes them small and collide.) Fix: a syscall
-   with no translation op is owned **only if it is socket-family by number** — `args[0]` is
-   not reliably an fd for arbitrary syscalls (WAITPID/KILL/SPAWN take a pid). Read/write/
-   close on a rump fd, and socket-family ops, are still owned as before.
+2. **WAITPID pid ↔ rump-fd collision (session hang), and the fcntl-ownership invariant.**
+   `rump_proxy::intercept_box_syscall` treated *any* syscall whose `args[0]` numerically
+   matched a rump socket fd as proxy-owned. `sshd`'s `waitpid(child_pid)` (nr 303) on its
+   shell child, whose pid `4` equalled the accepted rump-socket fd `4`, was thus misrouted
+   and returned `EOPNOTSUPP` in a tight retry loop → the session hung. (Phase 1's larger
+   pid/fd numbers never collided; the minimal `no-tests` build makes them small and
+   collide.) Fix: a syscall with no translation op is owned only if it is **socket-family
+   by number, OR `fcntl`/`ioctl` on a rump fd** — `args[0]` is not reliably an fd for
+   arbitrary syscalls (WAITPID/KILL/SPAWN take a pid). The `fcntl`/`ioctl` carve-out is
+   essential: the accept path deliberately clears O_NONBLOCK so the box sees a
+   kernel-side-blocking stream, and that invariant relies on the box's own
+   `fcntl(F_SETFL,O_NONBLOCK)` being proxy-owned (EOPNOTSUPP), not run natively. Letting it
+   run natively flipped `box_fd.nonblock`, so the proxy started doing non-blocking rump
+   recvs → EAGAIN → the SSH session dropped on the *second* connection (fd reuse, same
+   flow). Read/write/close on a rump fd and socket-family ops are still owned as before.
    (`src/rump_proxy.rs`.)
 
 ### Backlog

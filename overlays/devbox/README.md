@@ -217,3 +217,6 @@ Papercuts surfaced by dogfooding, to fix later:
   closes the connection without spawning the command child). The **interactive** session
   works fine (`ssh -p 2223 root@localhost`, then run commands). Looks like a sshd
   one-shot-exec path issue, unrelated to rump/networking — to investigate.
+- **`/bin/rump_server` is ~13 MB** — the box-0 network stack binary is huge (it dominates
+  the image and its cold-load demand-paging). Trim it down later (strip / drop unused rump
+  components / link-time GC).

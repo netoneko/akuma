@@ -30,6 +30,19 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spinning_top::Spinlock;
 
+/// Verbose per-syscall `[RUMP-SP]` proxy trace, gated by
+/// [`crate::config::RUMP_SP_TRACE`] (off by default — one line per proxied socket
+/// syscall floods the console under load). Same args as `crate::safe_print!`. The
+/// one-time lifecycle lines and the `UNIMPLEMENTED` warning bypass this and always
+/// print.
+macro_rules! rsp_trace {
+    ($cap:expr, $($arg:tt)*) => {
+        if crate::config::RUMP_SP_TRACE {
+            crate::safe_print!($cap, $($arg)*);
+        }
+    };
+}
+
 // ── Per-proxied-syscall latency breakdown (docs/MULTIKERNEL_NETWORKING_EXPERIMENT.md §4) ──
 // Per-core (core 2) accumulators for the time the kernel client THREAD spends BLOCKED
 // waiting for a rump_server reply during one proxied syscall — vs. the syscall's total
@@ -324,17 +337,26 @@ pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
     // (brk/mmap/openat/poll/read-on-a-real-file/…) fall through to native, which is
     // correct — those have nothing to do with the network stack. This is the single
     // choke point that enforces per-core rump networking isolation.
+    // fd-control syscalls with no translation op that DO take an fd in args[0]:
+    // fcntl/ioctl. On a rump socket these must be owned (not run natively) — a box
+    // process must not, e.g., flip the socket to O_NONBLOCK behind the proxy's back,
+    // which desyncs the proxy's blocking recv path (sshd did exactly this: native
+    // fcntl(F_SETFL,O_NONBLOCK) made the next recvfrom return EAGAIN and it dropped
+    // the session). Linux aarch64 numbers.
+    const NR_FCNTL: u64 = 25;
+    const NR_IOCTL: u64 = 29;
+
     let must_own = translation::is_socket_family_sysno(syscall_num) || fd_is_rump;
     let Some(op) = op else {
-        // No translation op. Only OWN it if it is a socket-family syscall BY NUMBER.
-        // Do NOT own it merely because args[0] matches a rump fd: for a syscall with
-        // no translation op, args[0] is not necessarily an fd (e.g. WAITPID/KILL/SPAWN
-        // take a pid). A numeric pid↔fd collision — e.g. sshd's waitpid() on its shell
-        // child, whose pid equals the accepted rump-socket fd — would otherwise wrongly
-        // return EOPNOTSUPP and wedge the caller in a retry loop. Such syscalls (and
-        // e.g. fcntl(O_NONBLOCK), which the proxy honors via fd_is_nonblock) are
-        // correctly serviced by native dispatch; they never touch the socket stack.
-        return if translation::is_socket_family_sysno(syscall_num) {
+        // No translation op. Own it if it is socket-family BY NUMBER, or an fd-control
+        // syscall (fcntl/ioctl) on a rump fd. Do NOT own it merely because args[0]
+        // matches a rump fd: for most no-op syscalls args[0] is not an fd (WAITPID/
+        // KILL/SPAWN take a pid), and a numeric pid↔fd collision would wrongly return
+        // EOPNOTSUPP and wedge the caller — e.g. sshd's waitpid() on its shell child
+        // whose pid equalled the accepted rump-socket fd. Those go to native dispatch.
+        let own = translation::is_socket_family_sysno(syscall_num)
+            || (fd_is_rump && matches!(syscall_num, NR_FCNTL | NR_IOCTL));
+        return if own {
             crate::safe_print!(
                 128,
                 "[RUMP-SP] box={} pid={} nr={} on rump box UNIMPLEMENTED -> EOPNOTSUPP (no native fallthrough)\n",
@@ -344,7 +366,7 @@ pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
             );
             Some(neg_linux_errno(LINUX_EOPNOTSUPP))
         } else {
-            None // not socket-family (and args[0] isn't reliably an fd) → native is correct
+            None // not socket-family, not fcntl/ioctl → args[0] isn't reliably an fd → native
         };
     };
     if !must_own {
@@ -354,7 +376,7 @@ pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
         return None;
     }
 
-    crate::safe_print!(
+    rsp_trace!(
         160,
         "[RUMP-SP] route box={} pid={} {} fd={} a1=0x{:x} a2=0x{:x}\n",
         box_id,
@@ -575,7 +597,7 @@ fn proxy_connect(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
     let mut mem = ProcMem::new();
     mem.cin_override.insert(addr_ptr, nb.to_vec());
     // DEBUG: dest from the translated NetBSD sockaddr (len,fam,port-hi,port-lo,ip…).
-    crate::safe_print!(
+    rsp_trace!(
         128,
         "[RUMP-SP] connect dest len={} fam={} port={} ip={}.{}.{}.{}\n",
         nb[0], nb[1],
@@ -590,11 +612,11 @@ fn proxy_connect(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
     let dt = crate::timer::uptime_us().saturating_sub(t0);
     match res {
         Ok(r) => {
-            crate::safe_print!(96, "[RUMP-SP] connect -> OK r0={} ({}us)\n", r[0], dt);
+            rsp_trace!(96, "[RUMP-SP] connect -> OK r0={} ({}us)\n", r[0], dt);
             0
         }
         Err(e) => {
-            crate::safe_print!(96, "[RUMP-SP] connect -> errno {} after {}us (timeout={})\n", e, dt, READ_TIMEOUT_US);
+            rsp_trace!(96, "[RUMP-SP] connect -> errno {} after {}us (timeout={})\n", e, dt, READ_TIMEOUT_US);
             neg_linux_errno(translation::errno_netbsd_to_linux(e))
         }
     }
@@ -706,7 +728,7 @@ fn proxy_accept(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
                     rump_fd: newfd as i32,
                     nonblock: false,
                 });
-                crate::safe_print!(96, "[RUMP-SP] accept -> box_fd={} rump_fd={}\n", box_fd, newfd);
+                rsp_trace!(96, "[RUMP-SP] accept -> box_fd={} rump_fd={}\n", box_fd, newfd);
                 return u64::from(box_fd);
             }
             Ok(_) => return neg_linux_errno(LINUX_EOPNOTSUPP),
@@ -928,7 +950,7 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
                 }
                 total += len;
             }
-            crate::safe_print!(
+            rsp_trace!(
                 96,
                 "[RUMP-SP] {} iovcnt={} iov0_len={} total_len={}\n",
                 op_name(op),
@@ -948,7 +970,7 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
     let w_n = RUMP_WAIT_N.load(Ordering::Relaxed).saturating_sub(w_n0);
     match res {
         Ok([n, _]) => {
-            crate::safe_print!(
+            rsp_trace!(
                 128,
                 "[RUMP-SP] {} a2={} -> {} ({}us; hops={} blk={}us/{})\n",
                 op_name(op), a2, n, dt, hops, w_us, w_n
@@ -956,7 +978,7 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
             n as u64
         }
         Err(e) => {
-            crate::safe_print!(
+            rsp_trace!(
                 128,
                 "[RUMP-SP] {} -> errno {} ({}us; hops={} blk={}us/{})\n",
                 op_name(op), e, dt, hops, w_us, w_n
@@ -1012,7 +1034,7 @@ fn proxy_recvmsg(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
     }
     if msg_iovlen != 1 {
         // DNS uses a single iovec; a multi-iovec scatter isn't implemented.
-        crate::safe_print!(64, "[RUMP-SP] recvmsg iovlen={} (>1 unsupported)\n", msg_iovlen);
+        rsp_trace!(64, "[RUMP-SP] recvmsg iovlen={} (>1 unsupported)\n", msg_iovlen);
     }
     // First iovec = { void *iov_base; size_t iov_len }.
     let mut iov = [0u8; 16];
@@ -1057,11 +1079,11 @@ fn proxy_recvmsg(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
                     4,
                 );
             }
-            crate::safe_print!(96, "[RUMP-SP] recvmsg -> {} ({}us)\n", n, dt);
+            rsp_trace!(96, "[RUMP-SP] recvmsg -> {} ({}us)\n", n, dt);
             n as u64
         }
         Err(e) => {
-            crate::safe_print!(96, "[RUMP-SP] recvmsg -> errno {} ({}us)\n", e, dt);
+            rsp_trace!(96, "[RUMP-SP] recvmsg -> errno {} ({}us)\n", e, dt);
             neg_linux_errno(translation::errno_netbsd_to_linux(e))
         }
     }

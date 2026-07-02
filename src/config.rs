@@ -666,6 +666,20 @@ pub const ENABLE_USERSPACE_SSHD: bool = cfg!(feature = "userspace-sshd");
 pub const SSH_BUILT_INS_FIRST: bool = false;
 
 // ============================================================================
+// Rump sysproxy (networking) Configuration
+// ============================================================================
+
+/// Emit the verbose per-syscall `[RUMP-SP]` proxy trace (the `route …`, per-op
+/// latency, `connect`/`accept`/`recvmsg` lines in `rump_proxy.rs`).
+///
+/// Off by default: it prints a line for every proxied socket syscall, which floods
+/// the console under any real network load (e.g. an SSH session or `curl`). The
+/// one-time lifecycle lines (`box … marked stack=rump`, `proxy ready`/`handshake
+/// failed`, the rump-default bring-up) print regardless. Flip to `true` to debug
+/// the sysproxy path.
+pub const RUMP_SP_TRACE: bool = false;
+
+// ============================================================================
 // Dynamic Configuration Functions
 // ============================================================================
 
