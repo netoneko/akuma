@@ -213,3 +213,7 @@ Papercuts surfaced by dogfooding, to fix later:
   output even though `/proc/<pid>/…` is populated — so the applet isn't reading the procfs
   data the kernel already exposes. Needs investigation on the `ps` side (which `/proc`
   layout it expects) vs. what our procfs presents.
+- **One-shot `ssh host <cmd>` returns no output** (e.g. `ssh -p 2223 root@localhost echo hi`
+  closes the connection without spawning the command child). The **interactive** session
+  works fine (`ssh -p 2223 root@localhost`, then run commands). Looks like a sshd
+  one-shot-exec path issue, unrelated to rump/networking — to investigate.

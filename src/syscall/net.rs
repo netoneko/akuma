@@ -1,9 +1,9 @@
 use super::*;
-// Socket types/errnos + copyin are only used by the smoltcp socket ops below;
-// copy_to_user_safe is also used by the Tier-A bounce/socketpair paths.
+// Socket types/errnos are only used by the smoltcp socket ops below; the copyin/
+// copyout helpers are also used by the Tier-A bounce/socketpair paths and the
+// rump-only UnixSocket `sendmsg` variant, so they stay ungated.
 #[cfg(feature = "smoltcp")]
 use akuma_net::socket::{self, SockAddrIn, libc_errno};
-#[cfg(feature = "smoltcp")]
 use akuma_exec::mmu::user_access::copy_from_user_safe;
 use akuma_exec::mmu::user_access::copy_to_user_safe;
 
@@ -917,6 +917,46 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
             Err(e) => neg_errno(e),
         }
     }
+}
+
+// Rump-only build (no smoltcp): the box-0 `rump_server` replies to every sysproxy
+// request via `dosend` → `sendmsg(MSG_NOSIGNAL)` on its fd-3 UnixSocket channel
+// (only the initial banner uses plain `send`). rump_server is excluded from box
+// interception, so those `sendmsg`s fall through to here. Write every iovec to the
+// tx pipe so the full frame (header + payload) reaches the kernel; without this the
+// handshake RESP — and all proxied-syscall replies — never arrive and box 0's rump
+// stack never comes up. A real AF_INET socket cannot exist without smoltcp → EBADF.
+#[cfg(not(feature = "smoltcp"))]
+pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
+    if !fd_is_unix_socket(fd) {
+        return EBADF;
+    }
+    if !validate_user_ptr(msg_ptr, core::mem::size_of::<MsgHdr>()) { return EFAULT; }
+    let mut msg = MsgHdr::default();
+    if unsafe { copy_from_user_safe((&raw mut msg).cast::<u8>(), msg_ptr as *const u8, core::mem::size_of::<MsgHdr>()).is_err() } {
+        return EFAULT;
+    }
+    if msg.msg_iovlen == 0 { return 0; }
+    let iov_size = msg.msg_iovlen as usize * core::mem::size_of::<super::fs::IoVec>();
+    if !validate_user_ptr(msg.msg_iov, iov_size) { return EFAULT; }
+    let mut iovs = alloc::vec![super::fs::IoVec { iov_base: 0, iov_len: 0 }; msg.msg_iovlen as usize];
+    if unsafe { copy_from_user_safe(iovs.as_mut_ptr().cast::<u8>(), msg.msg_iov as *const u8, iov_size).is_err() } {
+        return EFAULT;
+    }
+    // Byte-stream pipe: write each iovec in order; the kernel side reads exactly
+    // `rsp_len` bytes, so concatenation is correct.
+    let mut total: u64 = 0;
+    for iov in &iovs {
+        if iov.iov_len == 0 { continue; }
+        if !validate_user_ptr(iov.iov_base, iov.iov_len) { return EFAULT; }
+        let r = super::fs::sys_write(u64::from(fd), iov.iov_base, iov.iov_len);
+        if (r as i64) < 0 {
+            return if total > 0 { total } else { r };
+        }
+        total += r;
+        if r < iov.iov_len as u64 { break; } // short write: stop
+    }
+    total
 }
 
 #[cfg(feature = "smoltcp")]

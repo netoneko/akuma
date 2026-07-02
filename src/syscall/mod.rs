@@ -722,10 +722,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(not(feature = "smoltcp"))]
         nr::GETSOCKOPT => net_enetdown(),
         nr::SHUTDOWN => net::sys_shutdown(args[0] as u32, args[1] as i32),
-        #[cfg(feature = "smoltcp")]
+        // Always dispatched: the rump-only variant handles the box-0 rump_server's
+        // fd-3 UnixSocket channel (dosend → sendmsg for the handshake RESP + all
+        // proxied-syscall replies). Gating it to net_enetdown() breaks rump entirely.
         nr::SENDMSG => net::sys_sendmsg(args[0] as u32, args[1], args[2] as i32),
-        #[cfg(not(feature = "smoltcp"))]
-        nr::SENDMSG => net_enetdown(),
         #[cfg(feature = "smoltcp")]
         nr::RECVMSG => net::sys_recvmsg(args[0] as u32, args[1], args[2] as i32),
         #[cfg(not(feature = "smoltcp"))]

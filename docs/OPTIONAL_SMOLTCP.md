@@ -97,47 +97,52 @@ dispatch arms are **not** gated to `ENETDOWN`. Without this the rump handshake b
 fails and box 0's rump stack never comes up. (See `syscall/net.rs` +
 `syscall/mod.rs` SENDTO/RECVFROM.)
 
-## Status
+## Status — WORKING
 
 | Build | Compiles | Runtime |
 |-------|----------|---------|
 | default (`smoltcp` on) | ✅ clean, clippy-clean | unchanged |
 | `size` / `extreme` (smoltcp re-added) | ✅ | unchanged |
-| **devbox (`smoltcp` off)** | ✅ clean, clippy-clean, 1.4 MB | ⚠️ **rump bring-up blocked** — see below |
+| **devbox (`smoltcp` off)** | ✅ clean, clippy-clean, **1.4 MB** | ✅ **rump default stack + interactive SSH-over-rump verified** |
 
-### Open blocker: rump handshake stalls on the idle, smoltcp-free build
+Verified end-to-end on the fully smoltcp-free build: box 0's `rump_server` boots (DHCP
+`10.0.2.15`, `SERVING sysproxy on fd 3`), the kernel handshake completes (`box=0 proxy
+ready`), herd's userspace `sshd` binds/accepts over rump, and an **interactive SSH session
+runs commands** (`echo`, `uname -a`, `ls /`) with output returned — all over the NetBSD
+rump stack, no smoltcp compiled in.
 
-On the rump-only devbox build, box 0's `rump_server` boots fully (DHCP `10.0.2.15`,
-`SERVING sysproxy on fd 3`), and the kernel-side handshake gets **most** of the way:
+### Two gating bugs found + fixed (no NetBSD-source patch)
 
-1. kernel reads the complete banner off the reply pipe ✅
-   (`RUMPSP-…-NetBSD-7.99.34/evbarm64\n`)
-2. kernel writes the `HANDSHAKE_GUEST` request to the request pipe ✅ (24 + 13 bytes)
-3. `poll` reports the request pipe readable and `rump_server` reads the request ✅
-4. `rump_server` **never writes the RESP back** ➜ kernel times out ➜ userspace `sshd`
-   can't get a socket ➜ herd crash-loops it.
+Getting there surfaced two real bugs, both from over-gating socket syscalls that the rump
+path still needs. Neither is in the NetBSD source (`rumpuser_sp.c` is byte-identical to the
+working smoltcp build); both fixes live in our kernel dispatch:
 
-So the stall is inside `rump_server`'s `handlereq` for `HANDSHAKE_GUEST` (which rforks a
-rump lwp/client context). It only manifests when the system is otherwise idle: in a build
-with `smoltcp`, the kernel's background `smoltcp_net::poll()` loop keeps the scheduler
-churning, which pumps rump's cooperative fibers to completion; with the native stack gone
-there is no such churn, and a rump fiber-wake / `steady_tick` path does not advance. This
-is the same cooperative-scheduling sensitivity noted in the rump port work
-(`userspace/rumpkernel/…`, the sub-tick fiber-sleep / `steady_tick_interval` lever).
+1. **`sendmsg` UnixSocket passthrough (rump bring-up).** box 0's `rump_server` is excluded
+   from box interception, so its own channel I/O falls through to native dispatch. Its
+   sysproxy replies — the handshake RESP and *every* proxied-syscall reply — go through
+   `dosend` → `host_sendmsg` (only the initial banner uses `send`→`sendto`). Gating
+   `sys_sendmsg` to `ENETDOWN` made the RESP fail, so the handshake timed out and the stack
+   never came up. Fix: a `#[cfg(not(feature = "smoltcp"))]` `sys_sendmsg` variant that
+   writes every iovec to the UnixSocket tx pipe, dispatched unconditionally (same pattern
+   as the `sendto`/`recvfrom` UnixSocket variants). `readframe` uses `read`, already
+   handled. (`src/syscall/net.rs`, `src/syscall/mod.rs`.)
 
-**This is the one thing standing between the current tree and a fully smoltcp-free devbox.**
+2. **WAITPID pid ↔ rump-fd collision (session hang).** `rump_proxy::intercept_box_syscall`
+   treated *any* syscall whose `args[0]` numerically matched a rump socket fd as
+   proxy-owned. `sshd`'s `waitpid(child_pid)` (nr 303) on its shell child, whose pid `4`
+   equalled the accepted rump-socket fd `4`, was thus misrouted and returned `EOPNOTSUPP`
+   in a tight retry loop → the session hung. (Phase 1's larger pid/fd numbers never
+   collided; the minimal `no-tests` build makes them small and collide.) Fix: a syscall
+   with no translation op is owned **only if it is socket-family by number** — `args[0]` is
+   not reliably an fd for arbitrary syscalls (WAITPID/KILL/SPAWN take a pid). Read/write/
+   close on a rump fd, and socket-family ops, are still owned as before.
+   (`src/rump_proxy.rs`.)
 
-### Ways forward
+### Backlog
 
-- **A — ship the working config, keep this infra behind the flag.** Point
-  `overlays/devbox/run.sh` + `scripts/build_devbox.sh` back at the Phase-1 feature set
-  (`--features devbox` *with* default features → `smoltcp` compiled but unused; rump is
-  still the default stack, still no built-in SSH — verified SSH-over-rump working). The
-  smoltcp-out build stays available for finishing later.
-- **B — fix the rump bring-up.** Make the handshake complete without smoltcp's churn:
-  drive the rump clock / steady-tick faster during bring-up, or have the kernel pump the
-  rump kthreads while the box-0 proxy is initializing, so `handlereq`'s client-context
-  fork finishes.
+- **One-shot `ssh host <cmd>` doesn't spawn the child** (`ssh -p 2223 root@localhost echo
+  hi` closes without output); the **interactive** session works. Appears to be a
+  sshd one-shot-exec path issue, not rump/smoltcp — to investigate separately.
 
 ## Touchpoints
 
@@ -146,8 +151,11 @@ is the same cooperative-scheduling sensitivity noted in the rump port work
 - `src/main.rs` — `mod ssh`/tests gating, built-in-SSH-spawn gating, background-poll gating,
   the `compile_error!` guard (no smoltcp ⇒ must have `userspace-sshd`), crate-level
   `allow(dead_code)` for the rump-only build.
-- `src/syscall/{mod,net,poll,fs,term}.rs` — dispatch cfg-else, per-fn gating, UnixSocket
-  `send`/`recv` variants.
-- `src/rump_proxy.rs` — `start_default_stack` (unchanged by this doc's split; smoltcp-free).
+- `src/syscall/{mod,net,poll,fs,term}.rs` — dispatch cfg-else, per-fn gating, and the
+  rump-only UnixSocket `sendto`/`recvfrom`/**`sendmsg`** variants (always dispatched) that
+  service box 0's rump_server fd-3 channel.
+- `src/rump_proxy.rs` — `start_default_stack` (smoltcp-free) + the
+  `intercept_box_syscall` fix so a non-socket-family syscall is not proxy-owned merely
+  because `args[0]` collides with a rump fd number (the WAITPID hang).
 - `scripts/build_size.sh`, `scripts/build_extreme_size.sh`, `scripts/build_devbox.sh`,
   `overlays/devbox/run.sh` — explicit `smoltcp` in the profiles that need it.

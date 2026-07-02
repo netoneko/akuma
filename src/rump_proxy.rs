@@ -326,7 +326,15 @@ pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
     // choke point that enforces per-core rump networking isolation.
     let must_own = translation::is_socket_family_sysno(syscall_num) || fd_is_rump;
     let Some(op) = op else {
-        return if must_own {
+        // No translation op. Only OWN it if it is a socket-family syscall BY NUMBER.
+        // Do NOT own it merely because args[0] matches a rump fd: for a syscall with
+        // no translation op, args[0] is not necessarily an fd (e.g. WAITPID/KILL/SPAWN
+        // take a pid). A numeric pid↔fd collision — e.g. sshd's waitpid() on its shell
+        // child, whose pid equals the accepted rump-socket fd — would otherwise wrongly
+        // return EOPNOTSUPP and wedge the caller in a retry loop. Such syscalls (and
+        // e.g. fcntl(O_NONBLOCK), which the proxy honors via fd_is_nonblock) are
+        // correctly serviced by native dispatch; they never touch the socket stack.
+        return if translation::is_socket_family_sysno(syscall_num) {
             crate::safe_print!(
                 128,
                 "[RUMP-SP] box={} pid={} nr={} on rump box UNIMPLEMENTED -> EOPNOTSUPP (no native fallthrough)\n",
@@ -336,7 +344,7 @@ pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
             );
             Some(neg_linux_errno(LINUX_EOPNOTSUPP))
         } else {
-            None // unrelated syscall (not socket-family, not a rump fd) → native is correct
+            None // not socket-family (and args[0] isn't reliably an fd) → native is correct
         };
     };
     if !must_own {
