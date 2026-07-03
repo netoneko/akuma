@@ -220,3 +220,16 @@ Papercuts surfaced by dogfooding, to fix later:
 - **`/bin/rump_server` is ~13 MB** — the box-0 network stack binary is huge (it dominates
   the image and its cold-load demand-paging). Trim it down later (strip / drop unused rump
   components / link-time GC).
+- **`curl <hostname>` crashes the DNS resolver thread and wedges the VM.** TLS over rump
+  works (`curl -k https://1.1.1.1` → HTTP 301) and `curl --version` is fine; only name
+  resolution fails. curl's `AsynchDNS` runs resolution in a spawned thread, and that thread
+  faults with `ec=0x20` (EL0 instruction abort — bad PC). **Two bugs:** (1) that resolver
+  thread faults on the rump-only build (needs lldb+gdbstub to catch); (2) — more important —
+  the kernel **loops on the unhandled EL0 instruction abort instead of killing the process**,
+  so the CPU spins and the whole VM hangs (all SSH sessions freeze; the boot log floods with
+  `unhandled exception ec=0x20`). Fix (2) first: an unhandled EL0 fault must SIGSEGV/SIGILL
+  the process (like the OOM-kill path), never wedge the kernel.
+- **Only one SSH session at a time / parallel shells hang** — currently a consequence of the
+  above (a wedged VM freezes everything). Re-check true concurrency after the fault-kill fix;
+  the single box-0 rump proxy also serializes socket syscalls, which may head-of-line block
+  concurrent sessions.
