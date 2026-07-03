@@ -149,6 +149,61 @@ working smoltcp build); both fixes live in our kernel dispatch:
 - **One-shot `ssh host <cmd>` doesn't spawn the child** (`ssh -p 2223 root@localhost echo
   hi` closes without output); the **interactive** session works. Appears to be a
   sshd one-shot-exec path issue, not rump/smoltcp — to investigate separately.
+- **Concurrent SSH sessions don't work** — `userspace/sshd` is single-session by design:
+  its accept loop runs `block_on(handle_connection(...))` to completion before the next
+  `accept()` (`userspace/sshd/src/main.rs:131-146`). So a second simultaneous connection
+  waits for the first to finish. Not a kernel/rump bug — fix is to spawn a handler thread
+  per connection in sshd.
+- **`curl https://host` wedges the kernel — a multithreaded fault/lock deadlock (WIP).**
+  See the section below.
+
+## Concurrency: `curl https://host` wedges the kernel (WIP)
+
+Dogfooding surfaced this and it is **not fully fixed**. Symptoms and findings, recorded so
+the next session can pick it up:
+
+**What works:** `curl --version`, `curl https://<IP>` (→ HTTP 301, so TLS-over-rump is
+fine), single-threaded `curl http://host` (DNS-over-rump resolves). **What breaks:**
+`curl https://host` (and, intermittently, any curl that spins up its `AsynchDNS` resolver
+**thread** alongside the TLS/main thread) — i.e. the trigger is a **multithreaded** process
+doing concurrent work on the rump box, not the networking itself. Concurrent SSH sessions
+would hit the same class once sshd is made concurrent.
+
+**Mechanism (two nested-fault deadlocks on the single CPU):**
+1. **FIXED — `get_user_copy_fault_handler` reentrancy.** It took `POOL.lock()` from the
+   data-abort handler; if a user copy faulted while `POOL` was held (nested fault), it
+   self-deadlocked spinning on the pool spinlock (observed as an endless
+   `qemu: … unhandled exception ec=0x20` at the `ldaxrb`/`stxrb` loop inside that fn, which
+   flooded the log to 15M+ lines and spun the CPU). Fixed by moving the handler to a
+   lock-free per-thread atomic array `USER_COPY_FAULT_HANDLER` (mirrors `CURRENT_TRAP_FRAME`,
+   which is lock-free for the same "read from the exception handler" reason).
+   `crates/akuma-exec/src/threading/{mod.rs,types.rs}`.
+2. **OPEN — a second deadlock in the same path.** With #1 fixed, `curl https://host` no
+   longer produces the `ec=0x20` loop, but the kernel now **silently freezes** (heartbeat
+   stops → IRQs masked) at the `mprotect` where curl commits its DNS-thread stack. This is
+   the same class: on the single CPU a spinlock the fault/demand-paging/signal path needs
+   (`POOL` reached via another path, and/or `fault_slot`/PMM) is taken **with IRQs masked**
+   while another context holds it **preemptibly** → deadlock. Root cause is that the
+   kernel's spinlocks aren't uniformly IRQ-safe across the preemption + exception boundary:
+   there are ~10 bare `POOL.lock()` sites (no `with_irqs_disabled`) in
+   `crates/akuma-exec/src/threading/mod.rs` that open a preempt-while-held window the
+   exception path can deadlock on.
+
+**It's a `dispatch`/locking bug, not a rump-protocol bug** — the rump proxy dispatch itself
+(fd table, `with_client`, the sendto/recvfrom/sendmsg variants) is correctly locked; the
+deadlock is in the kernel's fault-handling + scheduler locking under a multithreaded EL0
+process.
+
+**Two ways to finish (not yet done):**
+- **(a) Targeted:** lldb+gdbstub (INSTANCE=1 GDB=1, attach to :1235 — see
+  `akuma_lldb_gdbstub_debugging`) to catch the freeze and read which lock/threads are stuck,
+  then fix that one site.
+- **(b) Systemic:** make `POOL` (and the fault-path locks) uniformly IRQ-safe
+  (`with_irqs_disabled`) so no holder is ever preemptible — fixes the whole deadlock class,
+  but a broad, delicate change to core scheduling locks (watch for lock-ordering).
+
+Until then: the devbox is fully usable for SSH + non-multithreaded networking; avoid
+`curl https://<hostname>` (use an IP, or `http://`).
 
 ## Touchpoints
 

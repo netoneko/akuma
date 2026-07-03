@@ -309,6 +309,20 @@ static CURRENT_TRAP_FRAME: [AtomicU64; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
+/// Per-thread user-copy fault handler address (set around copy_from/to_user).
+///
+/// Lock-free, for the same reason as `CURRENT_TRAP_FRAME`: it is read by the DATA
+/// ABORT exception handler (`get_user_copy_fault_handler`) to recover a faulting
+/// user copy. Taking `POOL.lock()` there self-deadlocks the single CPU if the
+/// fault occurred while `POOL` was already held (a nested fault) — observed as a
+/// hang spinning on the pool spinlock in the copy-fault path under a multithreaded
+/// process (curl's resolver + main thread). A per-thread atomic is safe: a thread
+/// only reads/writes its OWN slot, and its own fault can't race its own set.
+static USER_COPY_FAULT_HANDLER: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
 /// Atomic wake times for WAITING threads - scheduler checks these
 /// Value is 0 for threads that are not waiting, otherwise it's the wake deadline in microseconds
 static WAKE_TIMES: [AtomicU64; MAX_THREADS] = {
@@ -2604,30 +2618,24 @@ pub fn mark_current_terminated() {
     }
 }
 
-/// Get the current thread's user copy fault handler address
+/// Get the current thread's user copy fault handler address.
+///
+/// Lock-free (see `USER_COPY_FAULT_HANDLER`): called from the data-abort handler,
+/// where taking `POOL.lock()` could self-deadlock a nested fault.
 pub fn get_user_copy_fault_handler() -> u64 {
     let tid = get_current_thread_register();
     if tid < MAX_THREADS {
-        // Safe to read lock-free? No, it's not atomic.
-        // But in exception handler (which calls this), we are effectively atomic wrt this thread.
-        // However, correct way is lock.
-        with_irqs_disabled(|| {
-            let pool = POOL.lock();
-            pool.slots[tid].user_copy_fault_handler
-        })
+        USER_COPY_FAULT_HANDLER[tid].load(Ordering::Acquire)
     } else {
         0
     }
 }
 
-/// Set the current thread's user copy fault handler address
+/// Set the current thread's user copy fault handler address. Lock-free.
 pub fn set_user_copy_fault_handler(handler: u64) {
     let tid = get_current_thread_register();
     if tid < MAX_THREADS {
-        with_irqs_disabled(|| {
-            let mut pool = POOL.lock();
-            pool.slots[tid].user_copy_fault_handler = handler;
-        })
+        USER_COPY_FAULT_HANDLER[tid].store(handler, Ordering::Release);
     }
 }
 
