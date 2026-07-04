@@ -1,12 +1,22 @@
-# Rust Toolchain on the Devbox — `cargo` Crash (Open Issue)
+# Rust Toolchain on the Devbox — Open Issues
 
-Tracks a `cargo` crash found while bringing up the self-hosted nightly Rust
-toolchain (`aarch64-unknown-linux-musl` host, installed under `/usr/local` by
-`overlays/devbox/bootstrap.sh` step 7) on the `devbox` profile. `rustc` works;
-`cargo` does not. This is an **investigation report, not a fix** — written so
-the next session can pick it up without re-deriving the repro.
+Tracks open issues found while exercising Rust toolchains on the `devbox`
+profile. Two **separate toolchain installs** are in play here, don't conflate
+them:
 
-## Status
+- **Self-hosted nightly** (`aarch64-unknown-linux-musl`, installed under
+  `/usr/local` by `overlays/devbox/bootstrap.sh` step 7) — `rustc
+  1.98.0-nightly`. §1 below.
+- **Alpine apk package** (`aarch64-alpine-linux-musl`, installed under `/usr`
+  by `overlays/devbox/bootstrap.sh` step 6 alongside `git`) — `rustc 1.96.0
+  (Alpine Linux Rust 1.96.0-r0)`. §2 below.
+
+These are an **investigation report, not a fix** — written so the next
+session can pick up either one without re-deriving the repro.
+
+## 1. Self-hosted nightly `cargo` crash (`/usr/local/bin/cargo`)
+
+### Status
 
 | Component | State |
 |---|---|
@@ -15,7 +25,7 @@ the next session can pick it up without re-deriving the repro.
 | VM survives the crash | ✅ yes — thread is recycled, subsequent SSH connections still work. Not the same class as the documented curl/DNS EC=0x20 "spins forever" wedge (`overlays/devbox/README.md` Backlog) |
 | Root cause | ⚠️ **not confirmed** — best-evidence hypothesis below, needs a targeted repro to confirm |
 
-## Symptom
+### Symptom
 
 Over SSH into the devbox (`ssh -p 2223 root@localhost`, `export PATH=/usr/local/bin:$PATH`):
 
@@ -54,7 +64,7 @@ else — including `0x0` — falls into the catch-all `_ =>` arm at line ~3467, 
 logs `[Exception] Unknown from EL0: ...` and kills the process (`return_to_kernel(-1)`).
 That catch-all is why the process dies cleanly instead of the kernel wedging.
 
-## Leading hypothesis: QEMU HVF traps physical-timer (`CNTP_*`) register access as a bare `EC=0x0`
+### Leading hypothesis: QEMU HVF traps physical-timer (`CNTP_*`) register access as a bare `EC=0x0`
 
 `EC=0x0` already has a confirmed, documented precedent **in this exact codebase**,
 for a different code path:
@@ -107,7 +117,7 @@ dependencies could easily have picked up a new timing/instant call on the
 `aarch64-unknown-linux-musl` path between June and July that the older nightly's
 `cargo` didn't execute.
 
-## What would confirm/fix this
+### What would confirm/fix this
 
 1. **Confirm the register.** Patch the `_ =>` catch-all in `src/exceptions.rs`
    (~line 3467) to also disassemble/print the 4 bytes at `ELR-4`..`ELR` (the
@@ -136,7 +146,7 @@ dependencies could easily have picked up a new timing/instant call on the
    `CNTP_*` register" by decoding the raw instruction bytes (since `ISS` gives
    nothing to go on here), and handle it the same way `EC_MSR_MRS_TRAP` does.
 
-## Repro
+### Repro
 
 ```
 cd /Users/netoneko/github.com/netoneko/akuma
@@ -155,3 +165,90 @@ wedged even though it isn't crashed — observed firsthand during this
 investigation. Wait for one SSH command to fully return before starting
 another, and use a generous client-side timeout (rustc/cargo invocations can
 legitimately take minutes on this hardware).
+
+## 2. Alpine apk `rustc` — Scudo heap corruption during release/LTO build
+
+Found 2026-07-05 while verifying the fork/socketpair fixes below against a
+real crate ([netoneko/teddy](https://github.com/netoneko/teddy)) with the
+**Alpine apk toolchain** (`/usr/bin/rustc`, `1.96.0 (Alpine Linux Rust
+1.96.0-r0)`, `/usr/bin/cargo` — installed by `overlays/devbox/bootstrap.sh`
+step 6, *not* the self-hosted nightly in §1 above). This is a **separate
+toolchain and a separate symptom** from the §1 `cargo --version` crash — do
+not conflate them.
+
+### Status
+
+| Component | State |
+|---|---|
+| `git clone` (real repo, over rump DNS) | ✅ works — see `docs/OPTIONAL_SMOLTCP.md` |
+| `cargo build` (debug, no LTO) | ✅ got well into compiling the crate's own binaries (only warnings) before the session ended; not confirmed complete |
+| `cargo build --release` (LTO + `codegen-units=1`) | ❌ `rustc` aborts (`SIGABRT`) compiling a dependency (`rustix`) with a Scudo allocator integrity error |
+| Root cause | ⚠️ **not investigated** — found at the very end of a long debugging session, deferred to next time |
+
+### Symptom
+
+```
+Scudo ERROR: corrupted chunk header at address 0x000170804610: chunk header is
+zero and might indicate memory corruption or a double free
+error: could not compile `rustix` (lib)
+
+Caused by:
+  process didn't exit successfully: `rustc --crate-name rustix --edition=2021
+  ... -C opt-level=z -C linker-plugin-lto -C codegen-units=1 ...`
+  (signal: 6, SIGABRT: process abort signal)
+```
+
+Scudo is Alpine/musl's hardened heap allocator; "corrupted chunk header" is its
+own internal consistency check firing, not a kernel-reported fault — this is
+`rustc` itself corrupting its own heap (or Scudo mis-detecting corruption)
+partway through LTO codegen for `rustix`.
+
+### What's known so far
+
+- **Not the fork/socketpair bugs** fixed the same session (see
+  `docs/OPTIONAL_SMOLTCP.md`'s socketpair/CLOEXEC sections) — those are
+  confirmed fixed independently: a minimal `Command::new("/bin/true").output()`
+  repro, and `rustc` invoking its own linker directly, both complete cleanly
+  with no panic.
+- **Likely LTO/codegen-units=1-specific.** A plain `cargo build` (debug
+  profile, no LTO, default `codegen-units`) on the same crate got much further
+  — past the build-script stage and well into compiling `teddy`'s own binaries
+  (`teddy-lsp`, `teddy-session`, `teddy-demo`) with only warnings — before the
+  session ended, suggesting this is tied to the release profile's heavier,
+  longer-lived allocation pattern rather than a fundamental fork/exec issue.
+- **Not yet root-caused.** Candidates not yet ruled out: a genuine allocator
+  bug under memory pressure (this VM is 4 GB, `-m 4096`), a page-fault/CoW
+  corner case specific to large long-running processes (LLVM's LTO codegen
+  holds much more live memory than a normal `-O` compile), or something
+  specific to how mmap/mprotect/madvise behave for a process that grows this
+  large. No kernel-side panic or exception was logged before the abort — from
+  the kernel's point of view nothing looked wrong, which points more toward
+  userspace (Scudo/LLVM) than a kernel-side memory-safety bug, but that is not
+  confirmed.
+
+### CPU-starvation caveat also applies here
+
+While waiting on the debug (non-LTO) build, the devbox VM's console output
+went silent for 13+ minutes while the QEMU host process stayed pegged at
+~100% CPU (single core, `-smp 1`) — no new trace lines at all, SSH connections
+timing out at the banner exchange. This matches the §1 caution above almost
+exactly ("running two compiler invocations concurrently... can starve `sshd`
+of CPU entirely and make the VM look wedged even though it isn't crashed") —
+in this case compounded by an orphaned SSH-invoked polling loop (`while pgrep
+...; do sleep 2; done`) left running detached on the guest from an earlier
+debugging step whose local SSH client had already timed out. Likely just
+severe scheduling starvation from concurrent CPU-bound guest work, not a new
+kernel wedge — but not confirmed either way since the VM was killed rather
+than left to finish.
+
+### Next steps
+
+1. Retry the debug (`cargo build`, no `--release`) build first, with **nothing
+   else running concurrently** on the guest (no leftover polling loops), and
+   watch the log's growth rate the whole time to distinguish "genuinely slow
+   single-core LLVM codegen" from "actually wedged."
+2. If the debug build completes cleanly, confirm the resulting binaries
+   actually **run** (the original ask) before touching `--release` again.
+3. Only then revisit `--release`/LTO: try `codegen-units=16` (default) instead
+   of `1` first, as the cheapest way to test whether extreme LTO settings are
+   the trigger, before assuming a kernel bug.

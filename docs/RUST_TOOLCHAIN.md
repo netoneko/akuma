@@ -521,6 +521,33 @@ not a conformant SEQPACKET. Unchanged.
 
 ---
 
+## 6. Same bug class resurfaces in the rump-proxy layer (2026-07-05)
+
+§4d fixed `UnixSocket` routing in the **native** (smoltcp) socket recv/send
+syscalls. That fix does not automatically cover the **rump** network stack
+(`stack=rump` boxes, the default for box 0 under the `devbox` profile,
+`overlays/devbox/`) — the rump proxy (`src/rump_proxy.rs`) sits *in front of*
+the native dispatch and can intercept a syscall before it ever reaches the
+already-fixed native handler.
+
+Exactly that happened: `socketpair()` itself, and then `sendto`/`recvfrom` on
+the socketpair's `UnixSocket` fd, were both being claimed by the rump proxy
+purely by syscall number (198-212 was treated as "always ours on a rump box"),
+regardless of whether the target fd was an actual `RumpSocket`. Both were
+fixed the same way §4d fixed the native path: check the fd's actual type, not
+just the syscall number, and fall through to native when it isn't a rump
+socket. Full writeup, root-cause trace, and the fix: see
+[`docs/OPTIONAL_SMOLTCP.md`](OPTIONAL_SMOLTCP.md)'s "`socketpair()` hijacked by
+the rump proxy" and "CLOEXEC pipe `EBADF` after fork" sections. Verified via a
+minimal `Command::new("/bin/true").output()` repro and `rustc` invoking its
+own linker directly, both under the **Alpine apk toolchain** (`/usr/bin/rustc`,
+distinct from the nightly self-hosting toolchain this doc otherwise covers).
+
+A real crate build (`cargo build --release` on
+[netoneko/teddy](https://github.com/netoneko/teddy)) then surfaced a further,
+unrelated Scudo heap-corruption abort during LTO codegen — not yet
+root-caused, tracked in [`docs/RUST_TOOLCHAIN_ISSUES.md`](RUST_TOOLCHAIN_ISSUES.md) §2.
+
 ## References
 
 - Syscall dispatch + errno consts (`ESPIPE`): `src/syscall/mod.rs`
