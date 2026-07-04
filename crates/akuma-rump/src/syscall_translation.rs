@@ -81,13 +81,24 @@ pub fn op_from_linux_sysno(n: u64) -> Option<Op> {
 /// `sendmmsg`) so the dispatch can return a clean error for them on a rump box
 /// instead of leaking them to the native stack. Numbers: generic ABI
 /// `asm-generic/unistd.h`.
+///
+/// `socketpair` (199) is deliberately excluded even though `op_from_linux_sysno`
+/// maps it to `Op::Socketpair`: it's AF_UNIX-only, pipe-backed, pure local IPC
+/// between processes in the same box — it never touches the network stack, so
+/// it must always run natively (`net::sys_socketpair`) even on a rump box. There
+/// is no dispatch arm for `Op::Socketpair` in `intercept_box_syscall`'s match, so
+/// including 199 here previously made every `socketpair()` call on a rump box
+/// (box 0 by default under the `devbox` profile) silently fall into that match's
+/// `_ => EOPNOTSUPP` catch-all — which broke any program using the modern Rust
+/// std's socketpair-based child-exec-status channel (e.g. `rustc` spawning its
+/// linker), well before the process ever forked.
 #[must_use]
 pub fn is_socket_family_sysno(n: u64) -> bool {
     matches!(
         n,
-        198..=212 // socket, socketpair, bind, listen, accept, connect, getsockname,
-                  // getpeername, sendto, recvfrom, setsockopt, getsockopt, shutdown,
-                  // sendmsg, recvmsg
+        198 | 200..=212 // socket, bind, listen, accept, connect, getsockname,
+                        // getpeername, sendto, recvfrom, setsockopt, getsockopt,
+                        // shutdown, sendmsg, recvmsg (199/socketpair excluded, see above)
             | 242 // accept4
             | 243 // recvmmsg
             | 269 // sendmmsg
