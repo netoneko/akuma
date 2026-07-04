@@ -218,20 +218,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Self-hosted nightly Rust toolchain (aarch64-unknown-linux-musl host, runs ON the
-#    devbox) under /usr/local, plus the C toolchain (clang/lld/gcc/binutils/make/musl-dev)
-#    cargo's build scripts need. A throwaway docker container installs both directly
-#    into the mounted image — no overlay/base-populate re-copy of any kind, since that
-#    (via scripts/populate_disk.sh --overlay) is exactly what clobbered apk's /etc/apk/world
-#    here once already (the overlay shipped an empty world file; re-copying it right
-#    before this step's apk transaction reset apk's "wanted" set to just this step's
-#    packages, so apk purged git/libcurl/ca-certificates-bundle as no-longer-wanted).
-#    Root fix was removing that world file from the overlay for good; this step also no
-#    longer touches the overlay at all, so the class of bug can't recur here.
+# 7. Rust toolchain (aarch64-unknown-linux-musl host, runs ON the devbox), installed
+#    via apk — Alpine's own stable `rust`/`cargo` build — plus the C toolchain
+#    (clang/lld/gcc/binutils/make/musl-dev) cargo's build scripts need. Previously this
+#    step downloaded the nightly toolchain straight from static.rust-lang.org/dist; that
+#    nightly `cargo` binary crashes the kernel's EL0 exception handler on every
+#    invocation (see docs/RUST_TOOLCHAIN_ISSUES.md) — `rustc --version` works,
+#    `cargo --version` faults with EC=0x0 at a fixed instruction, reproducing
+#    identically across every kernel build tried (main, this branch, both profiles,
+#    a kernel from 6 weeks earlier), which points at the nightly cargo binary itself
+#    rather than the kernel. apk's stable `rust`/`cargo` is a completely different
+#    build (Alpine's own, not upstream's static.rust-lang.org tarball) and installs
+#    all its own shared-lib deps (LLVM, libcurl, libssl, libsqlite3, ...), so this
+#    also exercises the dynamic linker much harder than the mostly-static nightly did.
+#    All packages install in a single `apk add` transaction (matching step 6's fix):
+#    doing it as separate `apk add` calls once reset apk's "wanted" set and purged
+#    earlier steps' packages (see step 6's comment for the war story).
 #    Skip with DEVBOX_RUST_TOOLCHAIN=false (large download; offline builds).
 # ---------------------------------------------------------------------------
 if [ "${DEVBOX_RUST_TOOLCHAIN:-true}" = "true" ]; then
-    hr "Installing self-hosted Rust toolchain (aarch64-unknown-linux-musl)"
+    hr "Installing Rust toolchain (apk: rust + cargo, Alpine's stable aarch64-musl build)"
     docker run --rm --privileged \
         -v "$REPO_ROOT/$DEVBOX_DISK:/disk.img" \
         alpine:latest \
@@ -240,37 +246,14 @@ if [ "${DEVBOX_RUST_TOOLCHAIN:-true}" = "true" ]; then
             mkdir -p /mnt/disk
             mount -o loop /disk.img /mnt/disk
 
-            echo "Installing C toolchain (clang lld gcc binutils make musl-dev) into disk..."
-            apk --root /mnt/disk --no-scripts add clang lld gcc binutils make musl-dev
-
-            # Host-side tools needed to fetch/unpack/install (live in the container,
-            # not the disk). bash is required by the rust components install.sh.
-            apk add --no-cache curl xz bash >/dev/null
-
-            RUST_HOST=aarch64-unknown-linux-musl
-            DIST=https://static.rust-lang.org/dist
-            PREFIX=/mnt/disk/usr/local
-            mkdir -p /tmp/rust
-            for comp in \
-                rustc-nightly-$RUST_HOST \
-                cargo-nightly-$RUST_HOST \
-                rust-std-nightly-$RUST_HOST \
-                rust-std-nightly-aarch64-unknown-none \
-                rust-src-nightly ; do
-                echo "Downloading $comp ..."
-                curl -fsSL "$DIST/$comp.tar.xz" -o /tmp/rust/$comp.tar.xz
-                echo "Extracting $comp ..."
-                xz -dc /tmp/rust/$comp.tar.xz | tar x -C /tmp/rust
-                echo "Installing $comp -> $PREFIX ..."
-                (cd /tmp/rust/$comp && ./install.sh --prefix="$PREFIX" --disable-ldconfig)
-                rm -rf /tmp/rust/$comp /tmp/rust/$comp.tar.xz
-            done
+            echo "Installing C toolchain + rust + cargo into disk..."
+            apk --root /mnt/disk --no-scripts add clang lld gcc binutils make musl-dev rust cargo
 
             mkdir -p /mnt/disk/etc/profile.d
-            printf "export PATH=/usr/local/bin:\$PATH\n" > /mnt/disk/etc/profile.d/rust.sh
+            printf "export PATH=/usr/bin:\$PATH\n" > /mnt/disk/etc/profile.d/rust.sh
 
             echo "Rust toolchain installed:"
-            ls /mnt/disk/usr/local/bin
+            ls -la /mnt/disk/usr/bin/rustc /mnt/disk/usr/bin/cargo
             sync
             umount /mnt/disk
         '
