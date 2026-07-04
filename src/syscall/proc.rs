@@ -1246,11 +1246,17 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     
     let stdin_slice = stdin_data.as_deref();
 
-    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(&path, Some(&args_refs), Some(&env_vec), stdin_slice, None, 0, pty)
-        && let Some(proc) = akuma_exec::process::current_process() {
-            akuma_exec::process::register_child_channel(pid, ch, proc.pid);
-            return u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32);
+    match akuma_exec::process::spawn_process_with_channel_ext(&path, Some(&args_refs), Some(&env_vec), stdin_slice, None, 0, pty) {
+        Ok((_tid, ch, pid)) => {
+            if let Some(proc) = akuma_exec::process::current_process() {
+                akuma_exec::process::register_child_channel(pid, ch, proc.pid);
+                return u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32);
+            }
         }
+        Err(e) => {
+            crate::safe_print!(128, "[sys_spawn] path={} failed: {}\n", path, e);
+        }
+    }
     ENOMEM
 }
 

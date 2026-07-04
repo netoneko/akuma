@@ -234,11 +234,24 @@ if [ -z "$OVERLAY_DIR" ]; then
         ln -sf scratch /mnt/disk/bin/git
         echo "Created /bin/git -> scratch"
 
-        # Create essential busybox symlinks (apk --no-scripts skips post-install triggers)
-        for cmd in sh chmod ls mkdir rm cat echo grep; do
-            ln -sf busybox.static /mnt/disk/bin/$cmd 2>/dev/null || true
-        done
-        echo "Created busybox symlinks"
+        # Create essential busybox symlinks (apk --no-scripts skips post-install triggers).
+        # Prefer busybox.static (installed via --with-apk/--with-musl-dev); fall back to
+        # plain busybox when it is absent (e.g. a bare/--bin-only populate on an image that
+        # never apk-installed busybox-static) so these do not become dangling symlinks that
+        # shadow perfectly good regular-file copies the base copy just staged (this bit a
+        # devbox --bin-only re-populate: resolve_symlinks("/bin/sh") -> "busybox.static",
+        # which did not exist, so spawning the shell failed with "Failed to stat
+        # /bin/busybox.static").
+        BB=busybox.static
+        [ -e /mnt/disk/bin/$BB ] || BB=busybox
+        if [ -e /mnt/disk/bin/$BB ]; then
+            for cmd in sh chmod ls mkdir rm cat echo grep; do
+                ln -sf $BB /mnt/disk/bin/$cmd 2>/dev/null || true
+            done
+            echo "Created busybox symlinks -> $BB"
+        else
+            echo "WARN: no busybox binary on disk; skipping essential busybox symlinks"
+        fi
     '
 fi
 

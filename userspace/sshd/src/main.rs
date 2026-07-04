@@ -3,12 +3,15 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::format;
-use core::task::{Context, Poll};
+use alloc::vec::Vec;
+use core::future::{poll_fn, Future};
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use core::pin::Pin;
 
 use libakuma::*;
-use libakuma::net::{TcpListener, TcpStream, Error as NetError};
+use libakuma::net::{TcpListener, TcpStream, Error as NetError, ErrorKind as NetErrorKind};
 use embedded_io_async::{Read, Write, ErrorType};
 
 mod crypto;
@@ -37,21 +40,59 @@ impl SshStream {
     pub fn as_raw_fd(&self) -> i32 {
         self.inner.as_raw_fd()
     }
+
+    /// One-shot, non-suspending read: returns immediately (`Err(WouldBlock)`
+    /// if nothing is available) instead of yielding to the executor. Used by
+    /// `bridge_process`'s own manual multiplexer, which must check the SSH
+    /// socket and the child's stdout fd within the *same* poll tick — if this
+    /// suspended on `WouldBlock` like `Read::read` below, the bridge would
+    /// stop draining the child's stdout the moment the client had nothing to
+    /// send, freezing the session's output.
+    pub fn try_read(&mut self, buf: &mut [u8]) -> Result<usize, NetError> {
+        self.inner.read(buf)
+    }
+
+    fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, NetError>> {
+        match self.inner.read(buf) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(e) if e.kind() == NetErrorKind::WouldBlock => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, NetError>> {
+        match self.inner.write(buf) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(e) if e.kind() == NetErrorKind::WouldBlock => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
 }
 
 impl ErrorType for SshStream {
     type Error = NetError;
 }
 
+// These suspend (`Poll::Pending`) rather than error out on `WouldBlock`, so a
+// connection whose fd has no data/space right now yields control back to the
+// multi-session executor in `main()` instead of tearing down the session —
+// that's what lets a second SSH connection make progress while the first is
+// idle waiting on its socket.
 impl Read for SshStream {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        self.inner.read(buf)
+        poll_fn(|cx| self.poll_read(cx, buf)).await
     }
 }
 
 impl Write for SshStream {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        self.inner.write(buf)
+        poll_fn(|cx| self.poll_write(cx, buf)).await
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
@@ -128,39 +169,75 @@ pub extern "C" fn main() {
         println("[SSHD] Default shell: built-in");
     }
 
+    if let Err(e) = listener.set_nonblocking(true) {
+        eprintln(&format!("[SSHD] Failed to set listener non-blocking: {:?}", e));
+        exit(1);
+    }
+
+    // A single-threaded cooperative multiplexer: every live connection is one
+    // `handle_connection` future here, polled to completion in turn each
+    // tick. Previously `accept()` blocked and each connection ran via
+    // `block_on(...)` to completion before the next `accept()`, so a second
+    // simultaneous connection just waited for the first to finish. Now the
+    // listener and every accepted socket are non-blocking, and `SshStream`'s
+    // `Read`/`Write` impls yield `Poll::Pending` (instead of erroring out) on
+    // `WouldBlock`, so a session that's idle waiting on its socket suspends
+    // and lets the others make progress.
+    let mut sessions: Vec<Pin<Box<dyn Future<Output = ()>>>> = Vec::new();
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
     loop {
-        match listener.accept() {
+        let mut did_work = false;
+
+        match listener.try_accept() {
             Ok((stream, _addr)) => {
                 println("[SSHD] Accepted connection");
-                handle_connection(stream, ssh_config.clone());
+                set_nonblocking(stream.as_raw_fd(), true);
+                let ssh_stream = SshStream::new(stream);
+                let config = ssh_config.clone();
+                sessions.push(Box::pin(protocol::handle_connection(ssh_stream, config)));
+                did_work = true;
             }
+            Err(e) if e.kind() == NetErrorKind::WouldBlock => {}
             Err(e) => {
                 eprintln(&format!("[SSHD] Accept error: {:?}", e));
             }
         }
+
+        let mut i = 0;
+        while i < sessions.len() {
+            match sessions[i].as_mut().poll(&mut cx) {
+                Poll::Ready(()) => {
+                    drop(sessions.swap_remove(i));
+                    did_work = true;
+                }
+                Poll::Pending => i += 1,
+            }
+        }
+
+        if !did_work {
+            sleep_ms(1);
+        }
     }
 }
 
-fn handle_connection(stream: TcpStream, config: config::SshdConfig) {
-    let ssh_stream = SshStream::new(stream);
-    block_on(protocol::handle_connection(ssh_stream, config));
-}
-
-fn block_on<F: core::future::Future>(mut future: F) -> F::Output {
-    let mut future = unsafe { Pin::new_unchecked(&mut future) };
-    
-    static VTABLE: core::task::RawWakerVTable = core::task::RawWakerVTable::new(
-        |_| core::task::RawWaker::new(core::ptr::null(), &VTABLE),
+fn noop_waker() -> Waker {
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(core::ptr::null(), &VTABLE),
         |_| {},
         |_| {},
         |_| {},
     );
-    
+    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+}
+
+fn block_on<F: core::future::Future>(mut future: F) -> F::Output {
+    let mut future = unsafe { Pin::new_unchecked(&mut future) };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
     loop {
-        let raw_waker = core::task::RawWaker::new(core::ptr::null(), &VTABLE);
-        let waker = unsafe { core::task::Waker::from_raw(raw_waker) };
-        let mut cx = Context::from_waker(&waker);
-        
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(val) => return val,
             Poll::Pending => {

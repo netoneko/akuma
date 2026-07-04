@@ -9,7 +9,7 @@ use ed25519_dalek::{SECRET_KEY_LENGTH, SigningKey, VerifyingKey};
 use spinning_top::Spinlock;
 use core::convert::TryInto;
 
-use super::crypto::SimpleRng;
+use super::crypto::new_seeded_rng;
 use libakuma::*;
 
 // ============================================================================
@@ -194,7 +194,7 @@ pub fn parse_public_key_ssh(line: &str) -> Option<VerifyingKey> {
 
 /// Generate a new Ed25519 keypair
 fn generate_keypair() -> SigningKey {
-    let mut rng = SimpleRng::new();
+    let mut rng = new_seeded_rng();
     let mut key_bytes = [0u8; SECRET_KEY_LENGTH];
     rng.fill_bytes(&mut key_bytes);
     SigningKey::from_bytes(&key_bytes)

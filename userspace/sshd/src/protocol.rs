@@ -90,7 +90,7 @@ impl SshSession {
     fn new(config: SshdConfig) -> Self {
         Self {
             state: SshState::AwaitingVersion,
-            rng: SimpleRng::new(),
+            rng: super::crypto::new_seeded_rng(),
             client_version: Vec::new(),
             server_version: SSH_VERSION[..SSH_VERSION.len() - 2].to_vec(),
             client_kexinit: Vec::new(),
@@ -109,6 +109,39 @@ impl SshSession {
 // ============================================================================
 // Shell Handling
 // ============================================================================
+
+/// One-shot `ssh host <cmd>` (SSH `exec` channel request, as opposed to an
+/// interactive `shell` request). Spawns the command through the configured
+/// shell's `-c` and pumps it through the same `bridge_process` used for
+/// interactive sessions, so exit-on-child-exit / stdin-forwarding /
+/// stdout-draining behave identically. Falls back to the built-in shell's
+/// single-command execution if no external shell is configured.
+async fn run_exec_session(
+    stream: &mut SshStream,
+    session: &mut SshSession,
+    command: &[u8],
+) -> Result<(), NetError> {
+    let cmd_str = core::str::from_utf8(command).unwrap_or("");
+
+    if let Some(ref shell_path) = session.config.shell {
+        let mut arg_refs: Vec<&str> = session.config.shell_args.iter().map(|s| s.as_str()).collect();
+        arg_refs.push("-c");
+        arg_refs.push(cmd_str);
+        println(&format!("[SSH] Exec: {} {:?}", shell_path, arg_refs));
+        if let Some(res) = spawn(shell_path, Some(&arg_refs)) {
+            return bridge_process(stream, session, res.pid, res.stdout_fd).await;
+        }
+        println(&format!("[SSH] Failed to spawn {} for exec, falling back to built-in", shell_path));
+    }
+
+    let registry = create_default_registry();
+    let mut shell_ctx = ShellContext::new();
+    let res = shell::execute_command_chain(command, &registry, &mut shell_ctx).await;
+    if !res.output.is_empty() {
+        send_channel_data(stream, session, &res.output).await?;
+    }
+    Ok(())
+}
 
 async fn run_shell_session(
     stream: &mut SshStream,
@@ -199,7 +232,10 @@ async fn bridge_process(
         //    Skip once the client has signalled it is done sending.
         if !client_done {
             let mut ssh_buf = [0u8; 512];
-            match stream.read(&mut ssh_buf).await {
+            // Non-suspending: this loop must also keep draining the child's
+            // stdout in the same tick, so it can't await a would-block read
+            // (see `SshStream::try_read`).
+            match stream.try_read(&mut ssh_buf) {
                 Ok(0) => client_done = true, // peer closed its write side (TCP)
                 Ok(n) => {
                     did_io = true;
@@ -320,7 +356,7 @@ async fn run_built_in_shell(
 // Message Handlers
 // ============================================================================
 
-enum MessageResult { Continue, StartShell, Disconnect }
+enum MessageResult { Continue, StartShell, StartExec(Vec<u8>), Disconnect }
 
 async fn handle_message(
     stream: &mut SshStream,
@@ -388,6 +424,14 @@ async fn handle_message(
                 send_packet(stream, &full_reply, session).await?;
             }
             if req_type == b"shell" { return Ok(MessageResult::StartShell); }
+            if req_type == b"exec" {
+                // The want_reply byte (already peeked above, not yet consumed)
+                // precedes the exec command string.
+                let mut cmd_offset = offset + 1;
+                if let Some(command) = read_string(payload, &mut cmd_offset) {
+                    return Ok(MessageResult::StartExec(command.to_vec()));
+                }
+            }
         }
         SSH_MSG_DISCONNECT => return Ok(MessageResult::Disconnect),
         _ => {}
@@ -479,7 +523,13 @@ async fn send_packet(stream: &mut SshStream, payload: &[u8], session: &mut SshSe
     if session.crypto.encrypt_cipher.is_some() && session.state != SshState::AwaitingNewKeys {
         let seq = session.crypto.encrypt_seq;
         session.crypto.encrypt_seq = seq.wrapping_add(1);
-        let packet = build_encrypted_packet(payload, session.crypto.encrypt_cipher.as_mut().unwrap(), &session.crypto.encrypt_mac_key, seq);
+        let packet = build_encrypted_packet(
+            payload,
+            session.crypto.encrypt_cipher.as_mut().unwrap(),
+            &session.crypto.encrypt_mac_key,
+            seq,
+            &mut session.rng,
+        );
         stream.write_all(&packet).await
     } else {
         let packet = build_packet(payload);
@@ -574,6 +624,10 @@ pub async fn handle_connection(mut stream: SshStream, config: SshdConfig) {
                         Ok(MessageResult::Continue) => {}
                         Ok(MessageResult::StartShell) => {
                             let _ = run_shell_session(&mut stream, &mut session).await;
+                            return;
+                        }
+                        Ok(MessageResult::StartExec(cmd)) => {
+                            let _ = run_exec_session(&mut stream, &mut session, &cmd).await;
                             return;
                         }
                         Ok(MessageResult::Disconnect) => return,

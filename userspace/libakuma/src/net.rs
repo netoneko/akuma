@@ -178,6 +178,43 @@ impl TcpListener {
     pub fn local_addr(&self) -> SocketAddrV4 {
         self.local_addr
     }
+
+    /// Attempt to accept a single pending connection without looping on
+    /// `EAGAIN`/`WouldBlock`. Used by a cooperative multiplexer (sshd) that
+    /// polls the listener alongside other in-flight sessions instead of
+    /// parking in `accept()` until one arrives.
+    pub fn try_accept(&self) -> Result<(TcpStream, SocketAddrV4), Error> {
+        let new_fd = crate::accept(self.fd);
+        if new_fd >= 0 {
+            let remote_addr = SocketAddrV4::new([0, 0, 0, 0], 0);
+            return Ok((
+                TcpStream {
+                    fd: new_fd,
+                    local_addr: self.local_addr,
+                    remote_addr,
+                },
+                remote_addr,
+            ));
+        }
+        Err(Error::from_errno(-new_fd))
+    }
+
+    /// Get the underlying file descriptor.
+    pub fn as_raw_fd(&self) -> i32 {
+        self.fd
+    }
+
+    /// Set or clear `O_NONBLOCK` on the listening socket, so `try_accept`
+    /// returns `WouldBlock` instead of blocking in-kernel when no connection
+    /// is pending.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<(), Error> {
+        let ret = crate::set_nonblocking(self.fd, nonblocking);
+        if ret < 0 {
+            Err(Error::from_errno(-ret))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Drop for TcpListener {

@@ -7,6 +7,9 @@ edition = "2024"
 # net-async: sshd uses embedded_io_async::{Read,Write} with libakuma's net Error,
 # so it opts into libakuma's `net-async` feature (off by default).
 libakuma = { path = "../libakuma", features = ["net-async"] }
+# Shared, host-testable SSH-2 wire-format/crypto primitives (also used by the
+# in-kernel SSH server via crates/akuma-ssh) instead of a hand-rolled duplicate.
+akuma-ssh-crypto = { path = "../../crates/akuma-ssh-crypto" }
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
 aes = { version = "0.8", default-features = false }

@@ -338,22 +338,35 @@ pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
     // correct — those have nothing to do with the network stack. This is the single
     // choke point that enforces per-core rump networking isolation.
     // fd-control syscalls with no translation op that DO take an fd in args[0]:
-    // fcntl/ioctl. On a rump socket these must be owned (not run natively) — a box
-    // process must not, e.g., flip the socket to O_NONBLOCK behind the proxy's back,
-    // which desyncs the proxy's blocking recv path (sshd did exactly this: native
-    // fcntl(F_SETFL,O_NONBLOCK) made the next recvfrom return EAGAIN and it dropped
-    // the session). Linux aarch64 numbers.
+    // fcntl/ioctl. On a rump socket these must be owned (not run natively) — letting
+    // an unrecognized cmd run natively would flip the box's *native* per-fd bits
+    // behind the proxy's back without the proxy's recv/send/accept paths (which key
+    // off `Process::is_nonblock`) ever seeing the change desync. Linux aarch64
+    // numbers.
     const NR_FCNTL: u64 = 25;
     const NR_IOCTL: u64 = 29;
 
     let must_own = translation::is_socket_family_sysno(syscall_num) || fd_is_rump;
     let Some(op) = op else {
-        // No translation op. Own it if it is socket-family BY NUMBER, or an fd-control
-        // syscall (fcntl/ioctl) on a rump fd. Do NOT own it merely because args[0]
-        // matches a rump fd: for most no-op syscalls args[0] is not an fd (WAITPID/
-        // KILL/SPAWN take a pid), and a numeric pid↔fd collision would wrongly return
-        // EOPNOTSUPP and wedge the caller — e.g. sshd's waitpid() on its shell child
-        // whose pid equalled the accepted rump-socket fd. Those go to native dispatch.
+        // fcntl(F_SETFL/F_GETFL) on a rump fd: implement it for real instead of
+        // EOPNOTSUPP. It only touches `Process`'s own per-fd bookkeeping (the same
+        // flag `sys_fcntl` would set) — no NetBSD syscall involved — and
+        // `proxy_and_fd`'s `nonblock` (read fresh via `Process::is_nonblock` on
+        // every recv/send/accept) picks up the change immediately. This is what
+        // lets a box cooperatively multiplex several rump sockets (e.g. sshd
+        // accepting concurrent connections) instead of every accept/recv blocking
+        // the box's only thread. ioctl has no such fd-flag equivalent here, so it
+        // stays EOPNOTSUPP below.
+        if fd_is_rump && syscall_num == NR_FCNTL {
+            return Some(rump_fcntl(proc, args[0] as u32, args[1] as u32, args[2]));
+        }
+        // No other translation op. Own it if it is socket-family BY NUMBER, or an
+        // fd-control syscall (fcntl/ioctl) on a rump fd. Do NOT own it merely
+        // because args[0] matches a rump fd: for most no-op syscalls args[0] is not
+        // an fd (WAITPID/KILL/SPAWN take a pid), and a numeric pid↔fd collision
+        // would wrongly return EOPNOTSUPP and wedge the caller — e.g. sshd's
+        // waitpid() on its shell child whose pid equalled the accepted rump-socket
+        // fd. Those go to native dispatch.
         let own = translation::is_socket_family_sysno(syscall_num)
             || (fd_is_rump && matches!(syscall_num, NR_FCNTL | NR_IOCTL));
         return if own {
@@ -666,6 +679,30 @@ fn set_rump_sock_nonblock(proxy: &Arc<BoxProxy>, rump_fd: i32, nonblock: bool) {
         let a = translation::pack_args(&[rump_fd as u64, NETBSD_F_SETFL, flag]);
         c.syscall(NETBSD_FCNTL, &a, &mut mem)
     });
+}
+
+/// `fcntl(fd, cmd, arg)` on a rump-owned fd: `F_SETFL`/`F_GETFL` (`O_NONBLOCK`
+/// only) are handled directly against `Process`'s own per-fd bit — the same one
+/// `syscall::fs::sys_fcntl` would set for a native fd — since `proxy_and_fd`
+/// already re-reads `Process::is_nonblock` on every recv/send/accept call. No
+/// NetBSD round-trip needed. Anything else (`F_GETFD`/`F_SETFD`/locks/…)
+/// EOPNOTSUPPs; the box's rump sockets have no cloexec/lock state to manage.
+fn rump_fcntl(proc: &Process, fd: u32, cmd: u32, arg: u64) -> u64 {
+    const F_GETFL: u32 = 3;
+    const F_SETFL: u32 = 4;
+    const O_NONBLOCK: u64 = 0x800;
+    match cmd {
+        F_GETFL => if proc.is_nonblock(fd) { O_NONBLOCK } else { 0 },
+        F_SETFL => {
+            if arg & O_NONBLOCK != 0 {
+                proc.set_nonblock(fd);
+            } else {
+                proc.clear_nonblock(fd);
+            }
+            0
+        }
+        _ => neg_linux_errno(LINUX_EOPNOTSUPP),
+    }
 }
 
 /// `listen(fd, backlog)` → forward to the rump server (no pointer args). Returns

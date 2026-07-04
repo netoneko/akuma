@@ -65,6 +65,38 @@ fn proc_status_text(p: &process::Process) -> String {
     }
 }
 
+/// `/proc/<pid>/stat` (Linux-compatible, space-separated, single line).
+///
+/// This is the file `ps`/`top` actually parse (not `status`) — busybox's
+/// `ps` applet showed an empty process list despite `status`/`cmdline` being
+/// populated because this file didn't exist at all. Accounting fields we
+/// don't track per-process yet (times, memory, scheduling) read as 0/a
+/// neutral placeholder — enough for `ps`/`top` to list PID/PPID/STATE/
+/// COMMAND, which is what they read this file for; real per-process CPU/mem
+/// stats are a separate, larger feature.
+fn proc_stat_text(p: &process::Process) -> String {
+    let name = p.name.as_str();
+    // Linux's `comm` is the executable's basename, truncated to 15 bytes.
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let comm = if base.len() > 15 { &base[..15] } else { base };
+    let state = match p.state {
+        ProcessState::Zombie(_) => 'Z',
+        ProcessState::Blocked => 'S',
+        ProcessState::Ready | ProcessState::Running => 'R',
+    };
+    let pid = p.pid;
+    let ppid = p.parent_pid;
+    // pid comm state ppid pgrp session tty_nr tpgid flags minflt cminflt
+    // majflt cmajflt utime stime cutime cstime priority nice num_threads
+    // itrealvalue starttime vsize rss rsslim startcode endcode startstack
+    // kstkesp kstkeip signal blocked sigignore sigcatch wchan nswap cnswap
+    // exit_signal processor rt_priority policy delayacct_blkio_ticks
+    // guest_time cguest_time
+    format!(
+        "{pid} ({comm}) {state} {ppid} {pid} {pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+    )
+}
+
 // ============================================================================
 // ProcFilesystem
 // ============================================================================
@@ -310,6 +342,12 @@ impl Filesystem for ProcFilesystem {
                     is_symlink: false,
                     size: 0,
                 });
+                pid_entries.push(DirEntry {
+                    name: String::from("stat"),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 0,
+                });
             }
             if crate::config::PROC_SYSCALL_LOG_ENABLED
                 && crate::syscall::log::get_formatted(pid).is_some()
@@ -392,7 +430,7 @@ impl Filesystem for ProcFilesystem {
         // Handle <pid>/cmdline and <pid>/status
         {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
-            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status")
+            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status" || parts[1] == "stat")
                 && let Ok(pid) = parts[0].parse::<Pid>() {
                     let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
                     let current_box_id =
@@ -400,10 +438,10 @@ impl Filesystem for ProcFilesystem {
                     if current_box_id != 0 && proc.box_id != current_box_id {
                         return Err(FsError::NotFound);
                     }
-                    let data = if parts[1] == "cmdline" {
-                        proc_cmdline_bytes(proc)
-                    } else {
-                        proc_status_text(proc).into_bytes()
+                    let data = match parts[1] {
+                        "cmdline" => proc_cmdline_bytes(proc),
+                        "stat" => proc_stat_text(proc).into_bytes(),
+                        _ => proc_status_text(proc).into_bytes(),
                     };
                     if offset >= data.len() {
                         return Ok(0);
@@ -566,16 +604,17 @@ impl Filesystem for ProcFilesystem {
         // Handle <pid>/cmdline and <pid>/status
         {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
-            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status")
+            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status" || parts[1] == "stat")
                 && let Ok(pid) = parts[0].parse::<Pid>() {
                     let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
                     if current_box_id != 0 && proc.box_id != current_box_id {
                         return Err(FsError::NotFound);
                     }
-                    if parts[1] == "cmdline" {
-                        return Ok(proc_cmdline_bytes(proc));
-                    }
-                    return Ok(proc_status_text(proc).into_bytes());
+                    return Ok(match parts[1] {
+                        "cmdline" => proc_cmdline_bytes(proc),
+                        "stat" => proc_stat_text(proc).into_bytes(),
+                        _ => proc_status_text(proc).into_bytes(),
+                    });
                 }
         }
 
@@ -712,7 +751,7 @@ impl Filesystem for ProcFilesystem {
             if parts.len() == 2 && parts[1] == "fd" {
                 return Self::process_exists(pid);
             }
-            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status") {
+            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status" || parts[1] == "stat") {
                 if !Self::process_exists(pid) {
                     return false;
                 }
@@ -860,17 +899,17 @@ impl Filesystem for ProcFilesystem {
                 return Err(FsError::NotFound);
             }
             // <pid>/cmdline and <pid>/status
-            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status") {
+            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status" || parts[1] == "stat") {
                 let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
                 let current_box_id =
                     akuma_exec::process::current_process().map_or(0, |p| p.box_id);
                 if current_box_id != 0 && proc.box_id != current_box_id {
                     return Err(FsError::NotFound);
                 }
-                let size = if parts[1] == "cmdline" {
-                    proc_cmdline_bytes(proc).len() as u64
-                } else {
-                    proc_status_text(proc).len() as u64
+                let size = match parts[1] {
+                    "cmdline" => proc_cmdline_bytes(proc).len() as u64,
+                    "stat" => proc_stat_text(proc).len() as u64,
+                    _ => proc_status_text(proc).len() as u64,
                 };
                 return Ok(Metadata {
                     is_dir: false,
