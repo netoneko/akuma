@@ -103,13 +103,17 @@ fails and box 0's rump stack never comes up. (See `syscall/net.rs` +
 |-------|----------|---------|
 | default (`smoltcp` on) | ✅ clean, clippy-clean | unchanged |
 | `size` / `extreme` (smoltcp re-added) | ✅ | unchanged |
-| **devbox (`smoltcp` off)** | ✅ clean, clippy-clean, **1.4 MB** | ✅ **rump default stack + interactive SSH-over-rump verified** |
+| **devbox (`smoltcp` off)** | ✅ clean, clippy-clean, **1.4 MB** | ✅ **rump default stack + interactive SSH-over-rump + `curl http://host` (200 OK) verified** |
 
 Verified end-to-end on the fully smoltcp-free build: box 0's `rump_server` boots (DHCP
 `10.0.2.15`, `SERVING sysproxy on fd 3`), the kernel handshake completes (`box=0 proxy
-ready`), herd's userspace `sshd` binds/accepts over rump, and an **interactive SSH session
-runs commands** (`echo`, `uname -a`, `ls /`) with output returned — all over the NetBSD
-rump stack, no smoltcp compiled in.
+ready`), herd's userspace `sshd` binds/accepts over rump, an **interactive SSH session
+runs commands** (`echo`, `uname -a`, `ls /`), and **`curl http://example.com` returns
+`HTTP=200`** over the rump stack (DNS + TCP + HTTP, incl. curl's multithreaded resolver
+path) — no smoltcp compiled in. `curl https://host` runs its full TLS path too; it only
+fails on a missing `/etc/ssl/certs/ca-certificates.crt` on the minimal devbox image (a
+content issue, not a kernel/rump bug — populate the file and it succeeds).
+
 
 ### Two gating bugs found + fixed (no NetBSD-source patch)
 
@@ -156,117 +160,76 @@ working smoltcp build); both fixes live in our kernel dispatch:
   Concurrent-SSH section below).** Do it as a *single-threaded cooperative multiplexer*, NOT
   by spawning kernel threads per connection — a thread-per-connection sshd would turn sshd
   into a multithreaded process and hit the exact `curl https` deadlock class below.
-- **`curl https://host` wedges the kernel — a multithreaded fault/lock deadlock (WIP).**
-  See the section below.
+- **`/etc/ssl/certs/ca-certificates.crt` is absent on the minimal devbox image**, so
+  `curl https://host` fails at TLS verification (mbedTLS `-0x3E00`). The TLS/HTTPS path
+  itself works (it reaches the CA-read step). Populate the file (or pass `--insecure`/a
+  `--cacert`) and HTTPS succeeds.
 
-## Concurrency: `curl https://host` wedges the kernel (WIP)
+## Concurrency: `curl https://host` — FIXED (clone child got a bogus TTBR0)
 
-Dogfooding surfaced this and it is **not fully fixed**. Symptoms and findings, recorded so
-the next session can pick it up:
+This was the freeze that dogfooding surfaced. **Fixed 2026-07-04.** Recorded here so the
+next session doesn't re-walk the wrong tree: the *first* hypothesis (a `fault_mutex`
+IRQ-safety deadlock under CLONE_VM) was a red herring; the real bug is in `clone_thread`.
 
-**What works:** `curl --version`, `curl https://<IP>` (→ HTTP 301, so TLS-over-rump is
-fine), single-threaded `curl http://host` (DNS-over-rump resolves). **What breaks:**
-`curl https://host` (and, intermittently, any curl that spins up its `AsynchDNS` resolver
-**thread** alongside the TLS/main thread) — i.e. the trigger is a **multithreaded** process
-doing concurrent work on the rump box, not the networking itself. Concurrent SSH sessions
-would hit the same class once sshd is made concurrent.
+**Symptom.** `curl http://<IP>` worked, single-threaded `curl http://<host>` (DNS-over-rump)
+worked, `curl https://<IP>` (TLS, no DNS) worked. `curl https://<host>` — and any
+multithreaded process whose first `clone(CLONE_THREAD)` ran right after an `execve` —
+silently hung the whole box: heartbeat (the main thread's idle loop) stopped advancing, the
+shell never returned, no panic/fault log. Pure logic bug, 100% reproducible.
 
-**Mechanism (two nested-fault deadlocks on the single CPU):**
-1. **FIXED — `get_user_copy_fault_handler` reentrancy.** It took `POOL.lock()` from the
-   data-abort handler; if a user copy faulted while `POOL` was held (nested fault), it
-   self-deadlocked spinning on the pool spinlock (observed as an endless
-   `qemu: … unhandled exception ec=0x20` at the `ldaxrb`/`stxrb` loop inside that fn, which
-   flooded the log to 15M+ lines and spun the CPU). Fixed by moving the handler to a
-   lock-free per-thread atomic array `USER_COPY_FAULT_HANDLER` (mirrors `CURRENT_TRAP_FRAME`,
-   which is lock-free for the same "read from the exception handler" reason).
-   `crates/akuma-exec/src/threading/{mod.rs,types.rs}`.
-2. **OPEN — a second deadlock in the same class, now PINPOINTED.** With #1 fixed,
-   `curl https://host` no longer produces the `ec=0x20` loop, but the kernel now **silently
-   freezes** (heartbeat stops → IRQs masked forever) around the `mprotect`/demand-paging the
-   DNS thread does. A full audit of the locking discipline on the mprotect + fault +
-   PMM/heap + `vm_lock` + CLONE_VM paths (2026-07-03) found that **the earlier "~10 bare
-   `POOL.lock()`" hypothesis was WRONG** — every `POOL.lock()` in `threading/mod.rs` is in
-   fact already wrapped in `with_irqs_disabled` (or taken from IRQ context, e.g. the
-   scheduler). Likewise PMM (`src/pmm.rs`), the heap (`src/allocator.rs`), `LAZY_REGION_TABLE`,
-   `PROCESS_TABLE`, `Process::vm_lock`, and the page-table walkers are all uniformly
-   IRQ-safe. `mprotect` itself (`src/syscall/mem.rs:602`) is clean.
-
-   **The single discipline outlier is `Process::fault_mutex`.** It is a bare
-   `spinning_top::Spinlock<BTreeMap<usize,usize>>` (`crates/akuma-exec/src/process/mod.rs:208`)
-   — the per-page demand-paging "who's faulting this page" slot map — and it is the **only**
-   shared spinlock on these paths acquired **without** `with_irqs_disabled`:
-   - `fault_slot_acquire` → `proc.fault_mutex.lock()` at
-     **`crates/akuma-exec/src/process/children.rs:251`**
-   - `fault_slot_release` → `proc.fault_mutex.lock()` at
-     **`crates/akuma-exec/src/process/children.rs:281`**
-
-   Both are reached from the EL0 demand-paging fault path
-   (`src/exceptions.rs:2458 / 2579 / 3098`), which runs **IRQs-ENABLED**. `spinning_top::lock()`
-   does not touch DAIF, so a thread can be **preempted by the timer/SGI while holding
-   `fault_mutex`**. All CLONE_VM siblings (curl's DNS thread + main thread) **share the
-   leader's one `fault_mutex`** (`children.rs:511`), so they genuinely contend on it. A
-   bare-vs-bare contention self-heals (the spinner gets preempted, the holder resumes), but
-   the freeze becomes **permanent** the moment the *contending* acquisition happens with IRQs
-   masked — i.e. a nested/EL1-side fault, or any acquisition reached from inside an
-   `IrqGuard`/`with_irqs_disabled` region, spins on a preempted holder that can never be
-   rescheduled (timer is masked) → heartbeat dead. This matches the reported symptom exactly.
-
-**It's a `dispatch`/locking bug, not a rump-protocol bug** — the rump proxy dispatch itself
-(fd table, `with_client`, the sendto/recvfrom/sendmsg variants) is correctly locked; the
-deadlock is in the kernel's fault-handling locking under a multithreaded EL0 process.
-
-### The fix (primary suspect — verify this first)
-
-Make `fault_mutex` IRQ-safe like every other shared spinlock in these paths: wrap **only the
-critical section** (the `.lock()` + `BTreeMap` ops) in `with_irqs_disabled`, **not** the
-`yield_now()` — the loop already drops `faults` before yielding (`children.rs:269` closes the
-block before `children.rs:271`), and the yield must run IRQs-enabled so the scheduler + IRQs
-can make progress. `with_irqs_disabled` is reentrant, and `lookup_process`/`BTreeMap::insert`
-(which may hit the IRQ-safe heap lock) nest fine. Sketch for `fault_slot_acquire`:
+**Root cause (`crates/akuma-exec/src/process/mod.rs::clone_thread`).** A new CLONE_THREAD
+sibling must share the leader's address space. clone_thread built the child's saved
+register context (`child_ctx`) from `get_saved_user_context(parent)`, whose `ttbr0` field
+is read out of `THREAD_CONTEXTS[parent].ttbr0` — a value that is only refreshed when the
+SGI context-switch code switches *away* from that thread. A freshly-`execve`'d process
+(curl) activates a brand-new address space (new TTBR0 written to `TTBR0_EL1` directly via
+`activate()`) **without** the SGI switch path ever running for it, so
+`THREAD_CONTEXTS[parent].ttbr0` still holds a stale/bogus value. clone_thread copied that
+bogus value into the child, then `update_thread_context` wrote it to the child's kernel
+context. The fix:
 
 ```rust
-loop {
-    let outcome = crate::runtime::with_irqs_disabled(|| {
-        let proc = match lookup_process(as_owner) { Some(p) => p, None => return Some(FaultSlot::NoProc) };
-        let mut faults = proc.fault_mutex.lock();
-        match faults.get(&page_va).copied() {
-            None => { faults.insert(page_va, my_tid); Some(FaultSlot::Acquired) }
-            Some(h) if h == my_tid => Some(FaultSlot::Acquired),
-            Some(h) => {
-                if crate::threading::is_thread_terminated(h) { faults.insert(page_va, my_tid); return Some(FaultSlot::ReclaimedDead(h)); }
-                if spins >= FAULT_SLOT_SPIN_BOUND      { faults.insert(page_va, my_tid); return Some(FaultSlot::ReclaimedWedged(h)); }
-                None // contended — retry after yielding (IRQs on)
-            }
-        }
-    });
-    if let Some(slot) = outcome { return slot; }
-    spins = spins.wrapping_add(1);
-    crate::threading::yield_now();
-}
+// captured straight off the still-live address space, before `shared_as` is moved:
+let shared_ttbr0 = parent.address_space.ttbr0();
+...
+let mut child_ctx = parent_ctx;
+child_ctx.x0 = 0;
+child_ctx.sp = stack;
+child_ctx.tpidr = tls;
+child_ctx.spsr = 0;
+child_ctx.ttbr0 = shared_ttbr0;   // OVERRIDE the stale inherited value
 ```
-and wrap the whole `if let Some(proc) …` body of `fault_slot_release` (children.rs:280-285)
-in one `with_irqs_disabled`. Once IRQ-safe, a holder can never be preempted mid-critical-
-section on a single CPU, so no masked contender can ever spin forever.
 
-**Also harden (same class, off the freeze path, do while you're here):** `IRQ_HANDLERS`
-(`src/irq.rs:85`) is taken bare in `register_handler` but from IRQ context in `dispatch_irq`
-— same hazard, but registration is boot-time only so it's not the curl freeze.
+**Mechanism of the hang (confirmed via the SGI handler, not guessed).** Tracing the
+scheduler: `clone_thread` correctly created the child (TID 13), marked it READY, and
+returned; the parent (TID 12) then yielded voluntarily; `schedule_indices` correctly chose
+`12 → 13`; the SGI switch code loaded the child's **`new_ttbr0 = 0x5000062_eda000`** (a
+~90 PB "physical address" — obvious garbage; RAM is at `0x4000_0000`) into `TTBR0_EL1`,
+flushed the TLB, and ERET'd to the child's user PC. With no valid user page table, the
+first instruction fetch faulted in a way that left the CPU wedged with IRQs masked, so the
+timer SGI could no longer fire and no other thread (incl. the heartbeat) ever ran again.
+Once the child got the parent's *real* TTBR0, `curl http://example.com` returned `200`
+immediately and `curl https://host` reached the TLS step (it now only fails on the missing
+CA bundle, above).
 
-### How to verify (for whoever picks this up)
+**Why the `fault_mutex` hypothesis was wrong (and what was nonetheless done).** The earlier
+analysis fingered `Process::fault_mutex` — the one shared spinlock on the demand-paging
+fault path acquired *without* `with_irqs_disabled` — and proposed wrapping its
+`fault_slot_acquire`/`fault_slot_release` critical sections in `with_irqs_disabled`. That
+IRQ-safety change was applied (`crates/akuma-exec/src/process/children.rs`): it is correct
+hygiene (a holder could be preempted mid-section on a single CPU and self-deadlock a nested
+contender), it's kept, and the host regression test (`test_fault_mutex_insert_remove`,
+ `src/process_tests.rs`) still passes — but it does **not** fix `curl https`, because the
+freeze was never a fault-path spin. The decisive evidence that ruled it out: an SGI-handler
+sampler logged the preempted thread's PC (`ELR_EL1`) across the freeze and found the box
+*mostly idle* (threads parked in `yield_now`/`trigger_sgi`), with **zero** EL1 sync
+exceptions — i.e. a wait/freeze, not a spin and not a fault loop. The actual spin site was
+the SGI switch code itself, mid-`ERET`, after loading the bogus TTBR0. **Lesson: trust
+`ELR_EL1` sampled from the SGI handler over a gdbstub PC snapshot** — under HVF the gdbstub
+consistently misreports the PC as the exception-vector entry (and `ESR`/`ELR`/`FAR` read
+back equal to the PC), so only the general registers (notably `SP`, `LR`) are trustworthy.
+For a reliable PC snapshot, force `HVF=0` (TCG) for the repro.
 
-1. Apply the `fault_mutex` fix; `cargo test -p akuma-exec --target <host>` (fault-slot
-   regression tests live in `src/process_tests.rs:5330`) + `cargo build`.
-2. `overlays/devbox/bootstrap.sh` then `overlays/devbox/run.sh`; SSH in and run
-   `curl https://<hostname>` (the multithreaded AsynchDNS path). Success = it returns without
-   freezing the VM; the heartbeat keeps ticking in the boot log.
-3. If it still freezes, confirm with lldb+gdbstub (INSTANCE=1 GDB=1, attach to :1235 — see
-   memory `akuma_lldb_gdbstub_debugging`): catch the freeze, `bt` all threads, and look for a
-   thread spinning in `fault_slot_acquire`/`lock()` while another holds the same
-   `fault_mutex`. If the stuck lock is something *other* than `fault_mutex`, this analysis
-   missed a path — re-audit that specific lock's IRQ discipline.
-
-Until fixed: the devbox is fully usable for SSH + non-multithreaded networking; avoid
-`curl https://<hostname>` (use an IP, or `http://`).
 
 ## Concurrent SSH: do it single-threaded (cooperative multiplexer)
 

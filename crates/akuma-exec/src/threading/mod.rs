@@ -2235,7 +2235,7 @@ pub fn yield_now() {
 #[cfg(target_os = "none")]
 pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     (runtime().end_of_interrupt)(irq);
-    
+
     let voluntary = VOLUNTARY_SCHEDULE.swap(false, Ordering::Acquire);
     let debug = SGI_DEBUG_ONCE.swap(false, Ordering::SeqCst);
     

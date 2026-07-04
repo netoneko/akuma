@@ -243,29 +243,49 @@ pub fn fault_slot_acquire(as_owner: Pid, page_va: usize) -> FaultSlot {
     let my_tid = crate::threading::current_thread_id();
     let mut spins: u32 = 0;
     loop {
-        {
+        // IRQ-safe critical section. `fault_mutex` is a shared spinlock on the
+        // EL0 demand-paging path; like every other such lock here it must be
+        // taken with IRQs disabled, otherwise a holder could be preempted by the
+        // timer/SGI mid-section while a CLONE_VM sibling (which shares the
+        // leader's one `fault_mutex`) contended on it — and a contender that
+        // reached the lock with IRQs already masked (a nested/EL1-side fault,
+        // or any call site inside an `IrqGuard`) would spin on a preempted
+        // holder that can never be rescheduled (timer masked). Masking here
+        // guarantees the holder can never be preempted while holding the slot
+        // on a single CPU. `with_irqs_disabled` is reentrant and nests fine
+        // with the IRQ-safe heap lock that `BTreeMap::insert` may touch. The
+        // `yield_now()` below stays OUTSIDE the IRQ-disabled region so the
+        // scheduler + IRQs keep making progress while we wait. (Correct hygiene
+        // — but note this was investigated and is *not* the `curl https` freeze;
+        // see docs/OPTIONAL_SMOLTCP.md: that was `clone_thread` handing the
+        // child a stale TTBR0.)
+        let outcome = with_irqs_disabled(|| {
             let proc = match lookup_process(as_owner) {
                 Some(p) => p,
-                None => return FaultSlot::NoProc,
+                None => return Some(FaultSlot::NoProc),
             };
             let mut faults = proc.fault_mutex.lock();
             match faults.get(&page_va).copied() {
                 None => {
                     faults.insert(page_va, my_tid);
-                    return FaultSlot::Acquired;
+                    Some(FaultSlot::Acquired)
                 }
-                Some(holder) if holder == my_tid => return FaultSlot::Acquired,
+                Some(holder) if holder == my_tid => Some(FaultSlot::Acquired),
                 Some(holder) => {
                     if crate::threading::is_thread_terminated(holder) {
                         faults.insert(page_va, my_tid);
-                        return FaultSlot::ReclaimedDead(holder);
+                        return Some(FaultSlot::ReclaimedDead(holder));
                     }
                     if spins >= FAULT_SLOT_SPIN_BOUND {
                         faults.insert(page_va, my_tid);
-                        return FaultSlot::ReclaimedWedged(holder);
+                        return Some(FaultSlot::ReclaimedWedged(holder));
                     }
+                    None // contended — retry after yielding (IRQs on)
                 }
             }
+        });
+        if let Some(slot) = outcome {
+            return slot;
         }
         spins = spins.wrapping_add(1);
         crate::threading::yield_now();
@@ -277,12 +297,17 @@ pub fn fault_slot_acquire(as_owner: Pid, page_va: usize) -> FaultSlot {
 /// dead/wedged), we must NOT remove its entry — the reclaimer releases it.
 pub fn fault_slot_release(as_owner: Pid, page_va: usize) {
     let my_tid = crate::threading::current_thread_id();
-    if let Some(proc) = lookup_process(as_owner) {
-        let mut faults = proc.fault_mutex.lock();
-        if faults.get(&page_va).copied() == Some(my_tid) {
-            faults.remove(&page_va);
+    // IRQ-safe critical section — same discipline as `fault_slot_acquire`. Reached
+    // from the EL0 demand-paging fault path (IRQs-enabled), and contended across
+    // CLONE_VM siblings sharing the leader's one `fault_mutex`.
+    with_irqs_disabled(|| {
+        if let Some(proc) = lookup_process(as_owner) {
+            let mut faults = proc.fault_mutex.lock();
+            if faults.get(&page_va).copied() == Some(my_tid) {
+                faults.remove(&page_va);
+            }
         }
-    }
+    });
 }
 
 /// Get the current process (for syscall handlers).

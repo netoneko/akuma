@@ -2074,6 +2074,16 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     let parent_l0_phys = parent.address_space.ttbr0() & 0x0000_FFFF_FFFF_F000;
     let shared_as = mmu::UserAddressSpace::new_shared(parent_l0_phys as usize)
         .ok_or("Failed to create shared address space")?;
+    // CLONE_VM: the child shares the parent's address space, so its kernel
+    // context ttbr0 MUST be the parent's *actual* top-of-page-table physical
+    // base. `get_saved_user_context(parent)` below reads the stale
+    // `THREAD_CONTEXTS[parent].ttbr0`, which for a thread that activated a new
+    // address space (execve/mmap) since its last context-switch-out can hold a
+    // bogus value — loading that on the child's first switch froze the kernel
+    // (user space unmapped → fault on ERET → silent hang). Capture the real,
+    // canonical ttbr0 here, straight off the still-live address space, before
+    // `shared_as` is moved into the child Process.
+    let shared_ttbr0 = parent.address_space.ttbr0();
 
     let parent_tgid = parent.tgid; // inherit thread group leader
     let mut new_proc = Box::try_new(Process {
@@ -2131,6 +2141,9 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     child_ctx.sp = stack;
     child_ctx.tpidr = tls;
     child_ctx.spsr = 0;
+    // Override the (possibly stale) inherited ttbr0 with the live, canonical
+    // shared address-space ttbr0 — see the comment where `shared_ttbr0` is captured.
+    child_ctx.ttbr0 = shared_ttbr0;
 
     new_proc.context = child_ctx;
 
