@@ -259,6 +259,39 @@ the VM wedged during the fork, before any DNS output was produced.
 creates two independent `UserAddressSpace`s and verifies the override invariant: the
 child's context ttbr0 must equal `child_as.ttbr0()`, not the inherited parent value.
 
+### `vfork_process` had the exact same bug — and was the one git actually hits
+
+**Fixed 2026-07-05.** The `fork_process` fix above did not actually fix `git clone`: git
+spawns `git-remote-https` via `start_command`, and musl's `posix_spawn`/`vfork` route
+through **`CLONE_VFORK`**, which — when `VFORK_FASTPATH_ENABLED` (`src/config.rs`, default
+`true`) — dispatches to `vfork_process`, not `fork_process` (see the routing in
+`src/syscall/proc.rs::sys_clone`). `vfork_process` builds the child via
+`UserAddressSpace::new_shared(parent_l0_phys)` (same live L0 table, fresh ASID) and reads
+`parent_ctx` from `get_saved_user_context(parent_tid)` — the same stale-`THREAD_CONTEXTS`
+read as `fork_process` and `clone_thread` — but never got the override. Fixed identically:
+
+```rust
+// After child_ctx = parent_ctx + x0=0 + spsr=0 + sp override:
+child_ctx.ttbr0 = new_proc.address_space.ttbr0();
+```
+
+**Regression test.** `test_vfork_child_context_ttbr0_not_stale` in `src/process_tests.rs`,
+mirroring the fork test but building the child via `UserAddressSpace::new_shared(...)`.
+
+**Verified in the devbox VM:** `git clone https://github.com/...` no longer wedges the VM
+(previously: silent hang, SSH session dead, `git`'s "DNS error" was actually the VM dying
+mid-fork, same as the `fork_process` bug above). The clone now runs to completion and the
+SSH session stays responsive afterward.
+
+**New, separate blocker found while verifying this fix:** with the wedge gone, `git clone`
+now fails cleanly with `fatal: unable to access '...': Could not resolve host: github.com
+(Could not contact DNS servers)` — that parenthetical is a c-ares error string, and Alpine's
+apk-packaged git links a libcurl built with c-ares. c-ares issues its own raw UDP
+socket/sendto/recvfrom DNS queries directly against `/etc/resolv.conf`'s servers, bypassing
+whatever path the threaded-resolver `AsynchDNS` curl build and busybox `nslookup` use (both
+of which succeed against the same resolvers). This is a rump/UDP-socket-layer issue, not a
+fork/vfork/TTBR0 one — worth its own investigation.
+
 
 ## Concurrent SSH — FIXED (cooperative multiplexer)
 

@@ -2032,6 +2032,13 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
     if stack_ptr != 0 {
         child_ctx.sp = stack_ptr;
     }
+    // Same stale-ttbr0 bug as clone_thread/fork_process: parent_ctx.ttbr0 comes
+    // from THREAD_CONTEXTS[parent_tid], only refreshed on context-switch-out, so
+    // it can be stale if the parent execve'd/mmap'd since its last switch-out.
+    // vfork's child shares the parent's L0 table under a *new* ASID (new_shared
+    // above), so new_proc.address_space.ttbr0() is the live, canonical value —
+    // use that instead of the possibly-stale inherited one.
+    child_ctx.ttbr0 = new_proc.address_space.ttbr0();
     new_proc.context = child_ctx;
 
     let tid = crate::threading::spawn_user_thread_initializing(

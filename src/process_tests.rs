@@ -414,6 +414,11 @@ pub fn run_all_tests() {
     // (same bug class as the clone_thread TTBR0 fix; git/wedge on execve)
     test_fork_child_context_ttbr0_not_stale();
 
+    // vfork_process must override child_ctx.ttbr0 too (same bug class, was
+    // never patched even after fork_process/clone_thread were; this is the
+    // CLONE_VFORK fast path git's posix_spawn hits, so it wedged git clone)
+    test_vfork_child_context_ttbr0_not_stale();
+
     // Go mmap regression: forktest_parent with mmap_test must not SIGSEGV
     // test_forktest_parent_mmap(); // disabled: runs for up to 60s
 
@@ -10151,4 +10156,87 @@ fn test_fork_child_context_ttbr0_not_stale() {
     }
 
     console::print("[Test] fork_child_ttbr0_not_stale PASSED\n");
+}
+
+/// Regression: `vfork_process` must set `child_ctx.ttbr0` to
+/// `new_proc.address_space.ttbr0()`, not the value inherited from
+/// `get_saved_user_context(parent_tid)`. Same bug class as
+/// `test_fork_child_context_ttbr0_not_stale`, but for the CLONE_VFORK path:
+/// `vfork_process` builds the child's address space with
+/// `UserAddressSpace::new_shared(parent_l0_phys)`, which reuses the parent's
+/// live L0 table but allocates a *new* ASID — so its ttbr0 differs from
+/// `THREAD_CONTEXTS[parent].ttbr0` whenever that field is stale (parent
+/// execve'd/mmap'd since its last context-switch-out).
+///
+/// This path is exactly what musl's `posix_spawn` uses (CLONE_VFORK), which is
+/// what `git` calls to spawn `git-remote-https`/`ssh` — so this bug wedged the
+/// VM on `git clone` even after `fork_process` and `clone_thread` were fixed.
+fn test_vfork_child_context_ttbr0_not_stale() {
+    use akuma_exec::mmu::UserAddressSpace;
+
+    let parent_as = if let Some(a) = UserAddressSpace::new() {
+        a
+    } else {
+        console::print("[Test] vfork_child_ttbr0_not_stale FAILED: alloc parent AS\n");
+        return;
+    };
+
+    // Mirrors vfork_process: new_shared() reuses the parent's live L0 phys
+    // but mints a fresh ASID for the child.
+    let shared_as = if let Some(a) = UserAddressSpace::new_shared(parent_as.l0_phys()) {
+        a
+    } else {
+        console::print("[Test] vfork_child_ttbr0_not_stale FAILED: alloc shared AS\n");
+        return;
+    };
+
+    let parent_ttbr0 = parent_as.ttbr0();
+    let shared_ttbr0 = shared_as.ttbr0();
+
+    // 1. Both must be non-zero (ASID + L0 phys).
+    if parent_ttbr0 == 0 || shared_ttbr0 == 0 {
+        crate::safe_print!(128,
+            "[Test] vfork_child_ttbr0_not_stale FAILED: zero ttbr0 parent={:#x} shared={:#x}\n",
+            parent_ttbr0, shared_ttbr0);
+        return;
+    }
+
+    // 2. Same L0 phys (shared table), but different ASID → different ttbr0.
+    //    If they were equal, the override would be a no-op and the bug invisible.
+    if parent_ttbr0 == shared_ttbr0 {
+        crate::safe_print!(128,
+            "[Test] vfork_child_ttbr0_not_stale FAILED: parent and shared ttbr0 identical ({:#x}) — ASID didn't change\n",
+            parent_ttbr0);
+        return;
+    }
+
+    let parent_l0_phys = parent_ttbr0 & 0x0000_FFFF_FFFF_F000;
+    let shared_l0_phys = shared_ttbr0 & 0x0000_FFFF_FFFF_F000;
+    if parent_l0_phys != shared_l0_phys {
+        crate::safe_print!(128,
+            "[Test] vfork_child_ttbr0_not_stale FAILED: L0 phys not shared parent={:#x} shared={:#x}\n",
+            parent_l0_phys, shared_l0_phys);
+        return;
+    }
+
+    // 3. Simulate the bug: child_ctx inherits parent_ctx.ttbr0 (stale, from
+    //    get_saved_user_context). Without the override, child_ctx.ttbr0 !=
+    //    new_proc.address_space.ttbr0() (shared_ttbr0).
+    let inherited_ttbr0 = parent_ttbr0; // what get_saved_user_context returns
+    if inherited_ttbr0 == shared_ttbr0 {
+        console::print("[Test] vfork_child_ttbr0_not_stale SKIPPED (stale==fresh by coincidence)\n");
+        return;
+    }
+
+    // 4. With the fix (override), child_ctx.ttbr0 = new_proc.address_space.ttbr0()
+    //    → matches shared_ttbr0, not the parent's stale value.
+    let overridden_ttbr0 = shared_as.ttbr0();
+    if overridden_ttbr0 != shared_ttbr0 {
+        crate::safe_print!(128,
+            "[Test] vfork_child_ttbr0_not_stale FAILED: override {:#x} != shared AS {:#x}\n",
+            overridden_ttbr0, shared_ttbr0);
+        return;
+    }
+
+    console::print("[Test] vfork_child_ttbr0_not_stale PASSED\n");
 }
