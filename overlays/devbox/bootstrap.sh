@@ -49,14 +49,45 @@ for b in rump_server herd sshd busybox sh; do
 done
 
 # ---------------------------------------------------------------------------
-# 2. Create + base-populate the image (binaries, libs). This copies bootstrap/*,
-#    including bootstrap/etc — which step 3 then wipes so /etc is overlay-only.
+# 2. Create + base-populate the image with just bootstrap/bin + bootstrap/usr
+#    (binaries, libs) — not bootstrap/etc (step 3 wipes /etc right after; no
+#    point copying it) or the demo-content dirs (archives/models/music/public/
+#    srv) the minimal SSH-over-rump image doesn't need.
+#    A throwaway docker container does the mount+copy directly (not
+#    scripts/populate_disk.sh) so this script owns its full behavior instead of
+#    depending on that shared script's flag-mode side effects — see step 7's
+#    history: reusing populate_disk.sh --overlay there once clobbered apk's
+#    world file via a code path meant for something else entirely.
 # ---------------------------------------------------------------------------
 hr "Creating ${DEVBOX_DISK_MB}MB image $DEVBOX_DISK"
 DISK="$DEVBOX_DISK" scripts/create_disk.sh "$DEVBOX_DISK_MB"
 
-hr "Populating base binaries (bootstrap/*)"
-DISK="$DEVBOX_DISK" scripts/populate_disk.sh
+hr "Populating base binaries (bootstrap/bin + bootstrap/usr)"
+docker run --rm --privileged \
+    -v "$REPO_ROOT/$DEVBOX_DISK:/disk.img" \
+    -v "$REPO_ROOT/bootstrap:/bootstrap:ro" \
+    alpine:latest \
+    sh -c '
+        set -e
+        mkdir -p /mnt/disk
+        mount -o loop /disk.img /mnt/disk
+        cp -rv /bootstrap/bin /mnt/disk/
+        cp -rv /bootstrap/usr /mnt/disk/
+
+        # git -> scratch for now; step 6 repoints /bin/git at the real
+        # apk-installed binary. A handful of busybox symlinks so the image can
+        # exec at all before step 4s full applet set is laid down.
+        ln -sf scratch /mnt/disk/bin/git
+        BB=busybox.static
+        [ -e /mnt/disk/bin/$BB ] || BB=busybox
+        if [ -e /mnt/disk/bin/$BB ]; then
+            for cmd in sh chmod ls mkdir rm cat echo grep; do
+                ln -sf $BB /mnt/disk/bin/$cmd 2>/dev/null || true
+            done
+        fi
+        sync
+        umount /mnt/disk
+    '
 
 # ---------------------------------------------------------------------------
 # 3. Wipe the base /etc so the devbox overlay is the SOLE source of /etc — no
@@ -79,7 +110,47 @@ docker run --rm --privileged \
 # 4. Overlay the devbox rootfs (the ONLY source of /etc) + full busybox applets.
 # ---------------------------------------------------------------------------
 hr "Overlaying devbox rootfs + full busybox applet symlinks"
-DISK="$DEVBOX_DISK" scripts/populate_disk.sh --overlay "$SCRIPT_DIR/rootfs" --full-busybox
+docker run --rm --privileged \
+    -v "$REPO_ROOT/$DEVBOX_DISK:/disk.img" \
+    -v "$SCRIPT_DIR/rootfs:/overlay:ro" \
+    alpine:latest \
+    sh -c '
+        set -e
+        mkdir -p /mnt/disk
+        mount -o loop /disk.img /mnt/disk
+        cp -a /overlay/. /mnt/disk/
+
+        BB=busybox.static
+        [ -e /mnt/disk/bin/$BB ] || BB=busybox
+        if [ -e /mnt/disk/bin/$BB ]; then
+            APPLETS="$(/mnt/disk/bin/$BB --list 2>/dev/null || true)"
+            if [ -z "$APPLETS" ]; then
+                APPLETS="awk sed grep egrep fgrep find xargs tar gzip gunzip zcat bzip2 xz unxz cpio \
+                    less more head tail sort uniq wc cut tr nl fold comm paste \
+                    cat tac printf dir cp mv rm mkdir rmdir ln touch stat readlink realpath \
+                    basename dirname pwd env printenv date sleep usleep sync truncate \
+                    chmod chown chgrp du df mount umount losetup mknod mkfifo \
+                    ps top kill killall pgrep pkill nice renice free uptime watch \
+                    id whoami who groups hostname uname clear reset tty stty \
+                    test true false yes seq expr dd shuf \
+                    sha1sum sha256sum sha512sum md5sum cksum base64 \
+                    tee od hexdump xxd cmp diff patch strings split \
+                    which whereis mktemp getopt \
+                    wget nc telnet ping traceroute nslookup ifconfig route netstat \
+                    ash hush"
+            fi
+            for app in $APPLETS; do
+                # Never clobber a real (non-symlink) binary we ship (git, vi->neatvi,
+                # tcc, meow, curl, scratch, ...).
+                if [ -e /mnt/disk/bin/$app ] && [ ! -L /mnt/disk/bin/$app ]; then
+                    continue
+                fi
+                ln -sf $BB /mnt/disk/bin/$app 2>/dev/null || true
+            done
+        fi
+        sync
+        umount /mnt/disk
+    '
 
 # ---------------------------------------------------------------------------
 # 5. Stage the TLS CA trust bundle so `curl https://host` (mbedTLS) can verify
@@ -111,6 +182,124 @@ if [ "${DEVBOX_CA_CERTS:-true}" = "true" ]; then
         '
 else
     echo "Skipping CA bundle (DEVBOX_CA_CERTS=false)"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Install real `git` via apk (+ its `musl` dependency, which provides
+#    /lib/ld-musl-aarch64.so.1 — the kernel's ELF loader already handles
+#    PT_INTERP, see docs/APK_MISSING_SYSCALLS.md's "Dynamic Linking Support"
+#    section). `--no-scripts` skips post-install triggers (there's no real
+#    ldconfig to run against this image). git lands at /usr/bin/git; we then
+#    repoint /bin/git at it, replacing the base populate's `git -> scratch`
+#    symlink. scratch itself is untouched at /bin/scratch — still usable
+#    directly, just no longer the default `git`.
+#    Skip with DEVBOX_GIT=false to keep scratch as the default /bin/git.
+# ---------------------------------------------------------------------------
+if [ "${DEVBOX_GIT:-true}" = "true" ]; then
+    hr "Installing git (apk) — scratch remains available at /bin/scratch"
+    docker run --rm --privileged \
+        -v "$REPO_ROOT/$DEVBOX_DISK:/disk.img" \
+        alpine:latest \
+        sh -c '
+            set -e
+            mkdir -p /mnt/disk
+            mount -o loop /disk.img /mnt/disk
+            apk add --root /mnt/disk --initdb --no-cache --no-scripts \
+                --repository https://dl-cdn.alpinelinux.org/alpine/latest-stable/main \
+                musl git
+            ls -la /mnt/disk/usr/bin/git /mnt/disk/lib/ld-musl-aarch64.so.1
+            ln -sf /usr/bin/git /mnt/disk/bin/git
+            echo "/bin/git -> $(readlink /mnt/disk/bin/git)"
+            sync
+            umount /mnt/disk
+        '
+else
+    echo "Skipping apk git install (DEVBOX_GIT=false); /bin/git stays symlinked to scratch"
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Self-hosted nightly Rust toolchain (aarch64-unknown-linux-musl host, runs ON the
+#    devbox) under /usr/local, plus the C toolchain (clang/lld/gcc/binutils/make/musl-dev)
+#    cargo's build scripts need. A throwaway docker container installs both directly
+#    into the mounted image — no overlay/base-populate re-copy of any kind, since that
+#    (via scripts/populate_disk.sh --overlay) is exactly what clobbered apk's /etc/apk/world
+#    here once already (the overlay shipped an empty world file; re-copying it right
+#    before this step's apk transaction reset apk's "wanted" set to just this step's
+#    packages, so apk purged git/libcurl/ca-certificates-bundle as no-longer-wanted).
+#    Root fix was removing that world file from the overlay for good; this step also no
+#    longer touches the overlay at all, so the class of bug can't recur here.
+#    Skip with DEVBOX_RUST_TOOLCHAIN=false (large download; offline builds).
+# ---------------------------------------------------------------------------
+if [ "${DEVBOX_RUST_TOOLCHAIN:-true}" = "true" ]; then
+    hr "Installing self-hosted Rust toolchain (aarch64-unknown-linux-musl)"
+    docker run --rm --privileged \
+        -v "$REPO_ROOT/$DEVBOX_DISK:/disk.img" \
+        alpine:latest \
+        sh -c '
+            set -e
+            mkdir -p /mnt/disk
+            mount -o loop /disk.img /mnt/disk
+
+            echo "Installing C toolchain (clang lld gcc binutils make musl-dev) into disk..."
+            apk --root /mnt/disk --no-scripts add clang lld gcc binutils make musl-dev
+
+            # Host-side tools needed to fetch/unpack/install (live in the container,
+            # not the disk). bash is required by the rust components install.sh.
+            apk add --no-cache curl xz bash >/dev/null
+
+            RUST_HOST=aarch64-unknown-linux-musl
+            DIST=https://static.rust-lang.org/dist
+            PREFIX=/mnt/disk/usr/local
+            mkdir -p /tmp/rust
+            for comp in \
+                rustc-nightly-$RUST_HOST \
+                cargo-nightly-$RUST_HOST \
+                rust-std-nightly-$RUST_HOST \
+                rust-std-nightly-aarch64-unknown-none \
+                rust-src-nightly ; do
+                echo "Downloading $comp ..."
+                curl -fsSL "$DIST/$comp.tar.xz" -o /tmp/rust/$comp.tar.xz
+                echo "Extracting $comp ..."
+                xz -dc /tmp/rust/$comp.tar.xz | tar x -C /tmp/rust
+                echo "Installing $comp -> $PREFIX ..."
+                (cd /tmp/rust/$comp && ./install.sh --prefix="$PREFIX" --disable-ldconfig)
+                rm -rf /tmp/rust/$comp /tmp/rust/$comp.tar.xz
+            done
+
+            mkdir -p /mnt/disk/etc/profile.d
+            printf "export PATH=/usr/local/bin:\$PATH\n" > /mnt/disk/etc/profile.d/rust.sh
+
+            echo "Rust toolchain installed:"
+            ls /mnt/disk/usr/local/bin
+            sync
+            umount /mnt/disk
+        '
+else
+    echo "Skipping Rust toolchain (DEVBOX_RUST_TOOLCHAIN=false)"
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Optional soundtrack (bootstrap/music) — pure bonus content, off by default.
+#    Skip (default) leaves the image without it; set DEVBOX_SOUNDTRACK=true to
+#    include it, e.g. DEVBOX_SOUNDTRACK=true overlays/devbox/bootstrap.sh
+# ---------------------------------------------------------------------------
+if [ "${DEVBOX_SOUNDTRACK:-false}" = "true" ]; then
+    hr "Copying soundtrack (bootstrap/music)"
+    docker run --rm --privileged \
+        -v "$REPO_ROOT/$DEVBOX_DISK:/disk.img" \
+        -v "$REPO_ROOT/bootstrap/music:/music:ro" \
+        alpine:latest \
+        sh -c '
+            set -e
+            mkdir -p /mnt/disk
+            mount -o loop /disk.img /mnt/disk
+            mkdir -p /mnt/disk/music
+            cp -rv /music/. /mnt/disk/music/
+            sync
+            umount /mnt/disk
+        '
+else
+    echo "Skipping soundtrack (DEVBOX_SOUNDTRACK=false; set true to include bootstrap/music)"
 fi
 
 # ---------------------------------------------------------------------------
