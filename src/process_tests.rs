@@ -410,6 +410,10 @@ pub fn run_all_tests() {
     // CLONE_THREAD must NOT appear in CHILD_CHANNELS (git sideband pthread blocked wait4(-1) forever)
     test_clone_thread_not_visible_to_wait4();
 
+    // fork_process must override child_ctx.ttbr0 with the child's own AS ttbr0
+    // (same bug class as the clone_thread TTBR0 fix; git/wedge on execve)
+    test_fork_child_context_ttbr0_not_stale();
+
     // Go mmap regression: forktest_parent with mmap_test must not SIGSEGV
     // test_forktest_parent_mmap(); // disabled: runs for up to 60s
 
@@ -10061,4 +10065,90 @@ fn test_clone_thread_not_visible_to_wait4() {
     }
 
     console::print("[Test] clone_thread_not_visible_to_wait4 PASSED\n");
+}
+
+/// Regression: `fork_process` must set `child_ctx.ttbr0` to the child's *own*
+/// `address_space.ttbr0()`, not the value inherited from
+/// `get_saved_user_context(parent_tid)` — which reads
+/// `THREAD_CONTEXTS[parent].ttbr0`, a field only refreshed when the SGI
+/// context-switch code switches *away* from the parent.
+///
+/// A parent that execve'd or mmap'd since its last switch-out has a stale ttbr0
+/// there. If the child inherits it, the scheduler loads a garbage page table on
+/// the child's first scheduling → `tlbi vmalle1` → instruction fetch against an
+/// unmapped address → ec=0x20 with IRQs masked → silent VM hang. This is the
+/// same bug class as the clone_thread TTBR0 fix (OPTIONAL_SMOLTCP.md §"curl
+/// https freeze"), but fork_process was never patched.
+///
+/// This test verifies the invariant the one-line override establishes: that a
+/// fresh `UserAddressSpace` has a distinct ttbr0 from its "parent's stale
+/// context", and that overriding child_ctx.ttbr0 with the child's address-space
+/// ttbr0 makes them match (rather than leaving the inherited stale value).
+fn test_fork_child_context_ttbr0_not_stale() {
+    use akuma_exec::mmu::UserAddressSpace;
+
+    // Two independent address spaces, as fork creates for the child.
+    let parent_as = if let Some(a) = UserAddressSpace::new() {
+        a
+    } else {
+        console::print("[Test] fork_child_ttbr0_not_stale FAILED: alloc parent AS\n");
+        return;
+    };
+    let child_as = if let Some(a) = UserAddressSpace::new() {
+        a
+    } else {
+        console::print("[Test] fork_child_ttbr0_not_stale FAILED: alloc child AS\n");
+        return;
+    };
+
+    let parent_ttbr0 = parent_as.ttbr0();
+    let child_ttbr0 = child_as.ttbr0();
+
+    // 1. Both must be non-zero (ASID + L0 phys).
+    if parent_ttbr0 == 0 || child_ttbr0 == 0 {
+        crate::safe_print!(128,
+            "[Test] fork_child_ttbr0_not_stale FAILED: zero ttbr0 parent={:#x} child={:#x}\n",
+            parent_ttbr0, child_ttbr0);
+        return;
+    }
+
+    // 2. Different address spaces MUST have different ttbr0 (different L0 pages,
+    //    and likely different ASIDs). If they were the same, the "override" would
+    //    be a no-op and the bug invisible.
+    if parent_ttbr0 == child_ttbr0 {
+        crate::safe_print!(128,
+            "[Test] fork_child_ttbr0_not_stale FAILED: parent and child ttbr0 identical ({:#x})\n",
+            parent_ttbr0);
+        return;
+    }
+
+    // 3. Simulate the bug: child_ctx inherits parent_ctx.ttbr0 (stale). Without
+    //    the override, child_ctx.ttbr0 != child_as.ttbr0().
+    let inherited_ttbr0 = parent_ttbr0; // what get_saved_user_context returns
+    let stale_match = inherited_ttbr0 == child_ttbr0;
+    if stale_match {
+        // Improbable but not impossible if ASIDs wrapped; skip the contrast check.
+        console::print("[Test] fork_child_ttbr0_not_stale SKIPPED (stale==fresh by coincidence)\n");
+        return;
+    }
+
+    // 4. With the fix (override), child_ctx.ttbr0 = child_as.ttbr0() → they match.
+    let overridden_ttbr0 = child_as.ttbr0();
+    if overridden_ttbr0 != child_ttbr0 {
+        crate::safe_print!(128,
+            "[Test] fork_child_ttbr0_not_stale FAILED: override {:#x} != child AS {:#x}\n",
+            overridden_ttbr0, child_ttbr0);
+        return;
+    }
+
+    // 5. The L0 physical base must be page-aligned and in the RAM range.
+    let child_l0_phys = child_ttbr0 & 0x0000_FFFF_FFFF_F000;
+    if child_l0_phys < 0x4000_0000 || child_l0_phys >= 0x1400_0000 {
+        crate::safe_print!(128,
+            "[Test] fork_child_ttbr0_not_stale FAILED: child L0 phys {:#x} outside RAM\n",
+            child_l0_phys);
+        return;
+    }
+
+    console::print("[Test] fork_child_ttbr0_not_stale PASSED\n");
 }

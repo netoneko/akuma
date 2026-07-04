@@ -218,18 +218,23 @@ Papercuts surfaced by dogfooding, to fix later:
 - **`/bin/rump_server` is ~13 MB** — the box-0 network stack binary is huge (it dominates
   the image and its cold-load demand-paging). Trim it down later (strip / drop unused rump
   components / link-time GC).
-- **`curl <hostname>` crashes the DNS resolver thread and wedges the VM.** TLS over rump
-  works (`curl -k https://1.1.1.1` → HTTP 301) and `curl --version` is fine; only name
-  resolution fails. curl's `AsynchDNS` runs resolution in a spawned thread, and that thread
-  faults with `ec=0x20` (EL0 instruction abort — bad PC). **Two bugs:** (1) that resolver
-  thread faults on the rump-only build (needs lldb+gdbstub to catch); (2) — more important —
-  the kernel **loops on the unhandled EL0 instruction abort instead of killing the process**,
-  so the CPU spins and the whole VM hangs (all SSH sessions freeze; the boot log floods with
-  `unhandled exception ec=0x20`). Fix (2) first: an unhandled EL0 fault must SIGSEGV/SIGILL
-  the process (like the OOM-kill path), never wedge the kernel.
+- ~~**`curl <hostname>` crashes the DNS resolver thread and wedges the VM.**~~ — **FIXED.**
+  Two bugs, both addressed:
+  (1) The resolver thread's `ec=0x20` instruction abort was a stale-TTBR0 bug in the
+  scheduler context. `clone_thread` (curl's `AsynchDNS` path) was fixed first — see
+  `docs/OPTIONAL_SMOLTCP.md`'s "curl https freeze" section. The identical code path in
+  `fork_process` (which `git clone`, `wget`, and any fork+execve hits) was never patched
+  until 2026-07-04 — same one-line override: `child_ctx.ttbr0 = new_proc.address_space.ttbr0()`.
+  DNS itself was never broken (`nslookup`/`curl http://` worked); the "DNS error" was the
+  SSH session dying when the VM wedged during the fork, before DNS output was produced.
+  (2) The kernel still loops on unhandled EL0 instruction aborts instead of killing the
+  process — when the fault happens *inside the scheduler* (loading the garbage TTBR0 +
+  `tlbi vmalle1`), the handler itself can't run because the CPU is wedged with IRQs masked.
+  Fixing (1) prevents the bad TTBR0 from ever being loaded; a general EL0-fault → SIGSEGV
+  robustness fix for the handler is still desirable but no longer load-bearing.
 - ~~**Only one SSH session at a time / parallel shells hang**~~ — **FIXED**, and it turned
-  out to be unrelated to the `curl` DNS-crash wedge above (that theory was wrong — the VM
-  itself was never frozen; `sshd` was). Three separate bugs, all fixed: `sshd`'s own accept
+  out to be unrelated to the `curl` DNS-crash wedge above. Three separate bugs, all fixed:
+  `sshd`'s own accept
   loop was fully serial by design; the kernel hard-rejected the `fcntl(O_NONBLOCK)` a
   cooperative multiplexer needs on rump sockets; and a blocking `sleep_ms` inside an
   `async fn` loop (no `.await` on it) never actually yielded, so the first idle session

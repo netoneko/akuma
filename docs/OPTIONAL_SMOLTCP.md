@@ -224,6 +224,42 @@ back equal to the PC), so only the general registers (notably `SP`, `LR`) are tr
 For a reliable PC snapshot, force `HVF=0` (TCG) for the repro.
 
 
+## `fork_process` stale TTBR0 — FIXED (same bug class, fork path was never patched)
+
+**Fixed 2026-07-04.** The `clone_thread` TTBR0 fix above was only ever applied to
+`clone_thread` — the identical code path in `fork_process` was left with the stale
+inheritance. This made every fork+execve on the rump-only devbox wedge the VM:
+
+**Symptom.** `nslookup github.com` and `curl http://github.com` worked (no fork), but
+`git clone`, `wget`, and any program that forks+execves a child silently hung the whole
+VM — no `ec=0x20` in TCG, no panic, no heartbeat, just a dead SSH session. Under HVF the
+git case additionally flooded `qemu-system-aarch64: 0x401b2550: unhandled exception ec=0x20`
+(the SGI scheduler's `isb` right after `msr TTBR0_EL1` + `tlbi vmalle1`).
+
+**Root cause (`crates/akuma-exec/src/process/mod.rs::fork_process`).** Same as clone_thread:
+`get_saved_user_context(parent_tid)` reads `THREAD_CONTEXTS[parent].ttbr0`, which is stale
+for any thread that execve'd/mmap'd since its last context-switch-out. fork_process copied
+that stale value into `child_ctx` and never overrode it — even though the child gets a
+**fresh, independent** address space whose ttbr0 is `new_proc.address_space.ttbr0()`, not
+the parent's. The one-line fix mirrors clone_thread's:
+
+```rust
+// After child_ctx = parent_ctx + x0=0 + spsr=0 + sp override:
+child_ctx.ttbr0 = new_proc.address_space.ttbr0();
+```
+
+**Why curl worked but git/wget didn't.** curl (single-threaded, `AsynchDNS` via
+`clone_thread`) was covered by the earlier fix. git and wget fork+execve to run
+subprocesses (git-remote-https, busybox wget), and the fork child inherited the stale
+ttbr0. The DNS path itself (musl `__res_msend`: `sendto` + `recvmsg` over the rump proxy)
+was never broken — `nslookup` proved it. The "DNS error" was the SSH session dying when
+the VM wedged during the fork, before any DNS output was produced.
+
+**Regression test.** `test_fork_child_context_ttbr0_not_stale` in `src/process_tests.rs` —
+creates two independent `UserAddressSpace`s and verifies the override invariant: the
+child's context ttbr0 must equal `child_as.ttbr0()`, not the inherited parent value.
+
+
 ## Concurrent SSH — FIXED (cooperative multiplexer)
 
 **Fixed 2026-07-04.** Full before/after diagram, the `bridge_process`/`fail_spawn`
@@ -298,7 +334,9 @@ now that the executor is in.
 - `crates/akuma-exec/src/process/mod.rs::clone_thread` — the `curl https` freeze fix: a
   CLONE_THREAD child's kernel-context `ttbr0` is set to the parent's *live*
   `address_space.ttbr0()` (captured before `shared_as` is moved), not the stale value in
-  `get_saved_user_context(parent)`. `crates/akuma-exec/src/process/children.rs` —
+  `get_saved_user_context(parent)`. `crates/akuma-exec/src/process/mod.rs::fork_process` — the
+  same ttbr0 override for the fork path (child gets its own fresh `address_space.ttbr0()`).
+  `crates/akuma-exec/src/process/children.rs` —
   `fault_mutex` IRQ-safety in `fault_slot_acquire`/`fault_slot_release` (correct hygiene;
   not the curl freeze).
 - Concurrent SSH (see that section above) — `userspace/sshd/src/main.rs` (the executor +

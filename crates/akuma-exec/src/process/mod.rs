@@ -1874,6 +1874,16 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     if stack_ptr != 0 {
         child_ctx.sp = stack_ptr;
     }
+    // Override the (possibly stale) inherited ttbr0 with the child's *own* address
+    // space ttbr0 — the same fix as clone_thread (line ~2146). parent_ctx was read
+    // from `THREAD_CONTEXTS[parent_tid].ttbr0`, which is only refreshed when the SGI
+    // context-switch code switches *away* from the parent. A parent that execve'd or
+    // mmap'd since its last switch-out has a stale value there; loading it on the
+    // child's first scheduling wedge the CPU (TLB flush → instruction fetch against a
+    // garbage page table → ec=0x20 with IRQs masked → silent VM hang). The child
+    // gets a fresh, independent address space from this fork, so its ttbr0 is
+    // `new_proc.address_space.ttbr0()`, captured here before `new_proc` is consumed.
+    child_ctx.ttbr0 = new_proc.address_space.ttbr0();
 
     // Store context in the Process struct (entry_point_trampoline uses proc.context)
     new_proc.context = child_ctx;
