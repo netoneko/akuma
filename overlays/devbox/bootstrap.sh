@@ -82,6 +82,38 @@ hr "Overlaying devbox rootfs + full busybox applet symlinks"
 DISK="$DEVBOX_DISK" scripts/populate_disk.sh --overlay "$SCRIPT_DIR/rootfs" --full-busybox
 
 # ---------------------------------------------------------------------------
+# 5. Stage the TLS CA trust bundle so `curl https://host` (mbedTLS) can verify
+#    peer certs. Install it via apk straight into the mounted image. Use the
+#    `ca-certificates-bundle` subpackage on purpose: it is arch-independent and
+#    has ZERO runtime dependencies, so it drops ONLY /etc/ssl/certs/
+#    ca-certificates.crt (Mozilla's bundle, ~120 roots) — it does NOT drag in
+#    musl/busybox/libcrypto3 and overwrite the image's own userspace the way the
+#    `ca-certificates` meta-package would. `--initdb` bootstraps the minimal apk
+#    database in the target (the image is not an Alpine system); `--allow-
+#    untrusted` is needed because the fresh target has no alpine-keys yet.
+#    Skip the whole step with DEVBOX_CA_CERTS=false (e.g. offline builds).
+# ---------------------------------------------------------------------------
+if [ "${DEVBOX_CA_CERTS:-true}" = "true" ]; then
+    hr "Staging CA bundle (apk ca-certificates-bundle) for curl https"
+    docker run --rm --privileged \
+        -v "$REPO_ROOT/$DEVBOX_DISK:/disk.img" \
+        alpine:latest \
+        sh -c '
+            set -e
+            mkdir -p /mnt/disk
+            mount -o loop /disk.img /mnt/disk
+            apk add --root /mnt/disk --initdb --no-cache --allow-untrusted \
+                --repository http://dl-cdn.alpinelinux.org/alpine/latest-stable/main \
+                ca-certificates-bundle
+            ls -la /mnt/disk/etc/ssl/certs/ca-certificates.crt
+            sync
+            umount /mnt/disk
+        '
+else
+    echo "Skipping CA bundle (DEVBOX_CA_CERTS=false)"
+fi
+
+# ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 hr "Minimal devbox image ready: $DEVBOX_DISK"

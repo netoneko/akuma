@@ -103,16 +103,17 @@ fails and box 0's rump stack never comes up. (See `syscall/net.rs` +
 |-------|----------|---------|
 | default (`smoltcp` on) | ✅ clean, clippy-clean | unchanged |
 | `size` / `extreme` (smoltcp re-added) | ✅ | unchanged |
-| **devbox (`smoltcp` off)** | ✅ clean, clippy-clean, **1.4 MB** | ✅ **rump default stack + interactive SSH-over-rump + `curl http://host` (200 OK) verified** |
+| **devbox (`smoltcp` off)** | ✅ clean, clippy-clean, **1.4 MB** | ✅ **rump default stack + interactive SSH-over-rump + `curl http(s)://host` (200 OK) verified** |
 
 Verified end-to-end on the fully smoltcp-free build: box 0's `rump_server` boots (DHCP
 `10.0.2.15`, `SERVING sysproxy on fd 3`), the kernel handshake completes (`box=0 proxy
 ready`), herd's userspace `sshd` binds/accepts over rump, an **interactive SSH session
-runs commands** (`echo`, `uname -a`, `ls /`), and **`curl http://example.com` returns
-`HTTP=200`** over the rump stack (DNS + TCP + HTTP, incl. curl's multithreaded resolver
-path) — no smoltcp compiled in. `curl https://host` runs its full TLS path too; it only
-fails on a missing `/etc/ssl/certs/ca-certificates.crt` on the minimal devbox image (a
-content issue, not a kernel/rump bug — populate the file and it succeeds).
+runs commands** (`echo`, `uname -a`, `ls /`), and over the rump stack (DNS + TCP + HTTP(S),
+incl. curl's multithreaded resolver path) both **`curl http://example.com` and
+`curl https://example.com` return `200`** — no smoltcp compiled in. HTTPS verifies peer
+certs against the Mozilla CA bundle staged by `overlays/devbox/bootstrap.sh` step 5 (apk
+`ca-certificates-bundle`).
+
 
 
 ### Two gating bugs found + fixed (no NetBSD-source patch)
@@ -160,10 +161,6 @@ working smoltcp build); both fixes live in our kernel dispatch:
   Concurrent-SSH section below).** Do it as a *single-threaded cooperative multiplexer*, NOT
   by spawning kernel threads per connection — a thread-per-connection sshd would turn sshd
   into a multithreaded process and hit the exact `curl https` deadlock class below.
-- **`/etc/ssl/certs/ca-certificates.crt` is absent on the minimal devbox image**, so
-  `curl https://host` fails at TLS verification (mbedTLS `-0x3E00`). The TLS/HTTPS path
-  itself works (it reaches the CA-read step). Populate the file (or pass `--insecure`/a
-  `--cacert`) and HTTPS succeeds.
 
 ## Concurrency: `curl https://host` — FIXED (clone child got a bogus TTBR0)
 
@@ -209,8 +206,7 @@ flushed the TLB, and ERET'd to the child's user PC. With no valid user page tabl
 first instruction fetch faulted in a way that left the CPU wedged with IRQs masked, so the
 timer SGI could no longer fire and no other thread (incl. the heartbeat) ever ran again.
 Once the child got the parent's *real* TTBR0, `curl http://example.com` returned `200`
-immediately and `curl https://host` reached the TLS step (it now only fails on the missing
-CA bundle, above).
+immediately and `curl https://host` reached the TLS step.
 
 **Why the `fault_mutex` hypothesis was wrong (and what was nonetheless done).** The earlier
 analysis fingered `Process::fault_mutex` — the one shared spinlock on the demand-paging
@@ -286,3 +282,12 @@ executor is in.
   because `args[0]` collides with a rump fd number (the WAITPID hang).
 - `scripts/build_size.sh`, `scripts/build_extreme_size.sh`, `scripts/build_devbox.sh`,
   `overlays/devbox/run.sh` — explicit `smoltcp` in the profiles that need it.
+- `overlays/devbox/bootstrap.sh` — step 5 stages the TLS CA trust bundle (apk
+  `ca-certificates-bundle`, dep-free) into the image so `curl https` (mbedTLS) verifies
+  peers. Skip with `DEVBOX_CA_CERTS=false` (e.g. offline builds).
+- `crates/akuma-exec/src/process/mod.rs::clone_thread` — the `curl https` freeze fix: a
+  CLONE_THREAD child's kernel-context `ttbr0` is set to the parent's *live*
+  `address_space.ttbr0()` (captured before `shared_as` is moved), not the stale value in
+  `get_saved_user_context(parent)`. `crates/akuma-exec/src/process/children.rs` —
+  `fault_mutex` IRQ-safety in `fault_slot_acquire`/`fault_slot_release` (correct hygiene;
+  not the curl freeze).
