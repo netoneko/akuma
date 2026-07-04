@@ -319,6 +319,107 @@ holding one open).
 completes fully — working tree checked out, `git log`/`cat` on the cloned files work, and
 the VM stays responsive afterward.
 
+### `socketpair()` hijacked by the rump proxy — FIXED (broke every Rust subprocess spawn)
+
+**Fixed 2026-07-05.** Follow-up test: `git clone` + `cargo build --release` of a real Rust
+crate ([netoneko/teddy](https://github.com/netoneko/teddy)) inside the devbox VM. The clone
+succeeded; the build failed on the very first crate needing a build script (`rustix`) with
+`could not execute process \`rustc ...\` (never executed) — Caused by: Not supported (os
+error 95)`. Minimal repro: `rustc` invoking its own linker (`cc`) hits the identical error —
+no cargo/jobserver involved.
+
+**Root cause (`crates/akuma-rump/src/syscall_translation.rs::is_socket_family_sysno`).**
+Full syscall tracing (`SYSCALL_DEBUG_INFO_ENABLED` plus a temporary catch-all entry/return
+print in `handle_syscall`) showed `clone()`/`clone3()` was **never called** before the
+failure — the abort happens entirely before any fork attempt. The actual failing call:
+
+```
+socketpair(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC, 0, sv) -> -95 (EOPNOTSUPP)
+```
+
+Modern Rust's `std::process::Command` uses a `socketpair()` (not just a pipe) as its
+child-exec-status channel for *every* subprocess spawn. `is_socket_family_sysno()` included
+syscall 199 (`socketpair`) in the range of syscalls a `stack=rump` box (box 0 by default
+under `devbox`) must route through the rump proxy — but `op_from_linux_sysno` maps 199 to
+`Op::Socketpair`, and `intercept_box_syscall`'s dispatch `match` has **no arm for
+`Op::Socketpair`**, so every call silently fell into the generic `_ => EOPNOTSUPP`
+catch-all (no print, hence invisible even with tracing on — needed a targeted print right at
+that return to catch it). musl's own resolver, libcurl, and anything not using this newer
+Rust-specific idiom never call `socketpair()` this way, so nothing else surfaced it.
+
+This was always semantically wrong regardless of the missing dispatch arm: `socketpair()`
+is AF_UNIX-only, pipe-backed, pure local IPC between processes in the same box — it never
+touches the network stack, and the existing `src/syscall/mod.rs` dispatcher comment already
+documented the intent ("SOCKETPAIR (pipe-backed) ... stay available on both builds").
+
+**Fix:** excluded syscall 199 from `is_socket_family_sysno()`'s range, so it always falls
+through to the native, pipe-backed `net::sys_socketpair` — regardless of whether the calling
+box is on rump or smoltcp.
+
+**Verified:** the minimal `rustc`-spawns-`cc` repro gets past `socketpair()` cleanly (no more
+`os error 95`). `cargo build --release` on `teddy` now gets further — see the next section
+for the bug this uncovered.
+
+### CLOEXEC pipe `EBADF` after fork — FIXED (rump proxy hijacking `recvfrom`/`sendto` too)
+
+**Fixed 2026-07-05.** With `socketpair()` no longer hijacked, `rustc` spawning its linker
+panicked instead of cleanly erroring:
+
+```
+thread 'rustc' panicked at library/std/src/sys/process/unix/unix.rs:155:21:
+the CLOEXEC pipe failed: Os { code: 9, kind: Uncategorized, message: "Bad file descriptor" }
+```
+
+**Root cause (`src/rump_proxy.rs::intercept_box_syscall`).** Targeted `[CLOSE9-10]`/
+`[READ9-10]` tracing (temporary prints keyed on the socketpair's two fd numbers) showed the
+parent (rustc's own worker thread, running the link step) never even attempted a `read()`
+via `sys_read` before the panic — the `trace_read_ebadf` instrumentation that fires on a
+missing fd never fired either. The actual culprit: `is_socket_family_sysno()` claims
+`sendto`/`recvfrom` (206/207) **purely by syscall number**, same as the `socketpair` bug
+above — but unlike `read`/`write`/`readv`/`writev`/`close`, which already had a
+`!fd_is_rump` escape hatch to fall through to native when the target fd isn't a
+`RumpSocket`, `sendto`/`recvfrom` had no such check. musl/Rust's `read()` on a
+socketpair-backed fd can surface as a `recvfrom` syscall, and `intercept_box_syscall`
+routed it to `proxy_transfer` → `proxy_and_fd`, which rejects any non-`RumpSocket` fd with
+a bare `EBADF` — instead of falling through to the native `sys_recvfrom`, which already
+special-cased `UnixSocket` fds correctly (delegating to `sys_read`).
+
+**Fix:** extended the existing `!fd_is_rump` fallthrough check (already covering
+Read/Write/Readv/Writev/Close) to also cover `Op::Sendto`/`Op::Recvfrom`.
+
+**Verified:** the minimal `rustc`-spawns-`cc` repro (`Command::new("/bin/true").output()`
+and a full rustc-invokes-`cc` link step) both complete cleanly — no more panic, no more
+`os error 95`.
+
+### Scudo heap corruption in release/LTO builds — OPEN, not yet investigated
+
+**Found 2026-07-05.** With both fork/socketpair bugs fixed, `cargo build --release` on
+`teddy` (which enables `lto = true, codegen-units = 1`) gets past the build-script stage
+and into compiling `rustix` itself, then aborts:
+
+```
+Scudo ERROR: corrupted chunk header at address 0x...: chunk header is zero and might
+indicate memory corruption or a double free
+error: could not compile `rustix` (lib)
+  process didn't exit successfully (signal: 6, SIGABRT)
+```
+
+A plain `cargo build` (debug, no LTO) on the same crate got much further — compiling
+teddy's own binaries (`teddy-lsp`, `teddy-session`, `teddy-demo`) with only warnings — so
+this looks specific to the release/LTO codegen path (heavier, longer-lived allocations),
+not a fundamental fork/exec issue. Not yet root-caused.
+
+**Also observed, unconfirmed:** during that debug build, the devbox VM's console output
+went completely silent for 13+ minutes while the QEMU host process stayed pegged at ~100%
+CPU (single core, `-smp 1`) — no new trace lines at all. Possibly the same failure
+signature as the already-documented, unfixed "shell pipeline can wedge the VM" backlog
+item, possibly something new triggered by heavier build load, or possibly compounded by an
+orphaned SSH polling loop (`while pgrep ...; do sleep 2; done`) left running detached on
+the guest from an earlier debugging step whose local SSH client had already timed out.
+Killed and not yet re-investigated with a clean environment. Next session: retry the debug
+build with nothing else running concurrently and watch the log growth rate to distinguish
+"genuinely slow single-core LLVM codegen" from "actually wedged."
+
 
 ## Concurrent SSH — FIXED (cooperative multiplexer)
 

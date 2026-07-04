@@ -325,10 +325,24 @@ mod tests {
     #[test]
     fn socket_family_covers_unmarshaled_ops_for_isolation() {
         // Every op we can marshal must classify as socket-family (else a rump box
-        // could leak it to native smoltcp).
+        // could leak it to native smoltcp) — except socketpair (199, see below).
         for n in 198..=212u64 {
+            if n == 199 {
+                continue;
+            }
             assert!(is_socket_family_sysno(n), "nr {n} should be socket-family");
         }
+        // socketpair (199) is the deliberate exception: AF_UNIX, pipe-backed, pure
+        // local IPC that never touches the network stack, so it must always run
+        // natively (`net::sys_socketpair`) even on a rump box. It used to be
+        // included here, which made `intercept_box_syscall` claim it — but its
+        // dispatch match has no arm for `Op::Socketpair`, so every socketpair()
+        // call on a rump box silently hit the `_ => EOPNOTSUPP` catch-all. That
+        // broke any program using modern Rust std's socketpair-based child-exec
+        // status channel (e.g. `rustc` spawning its linker) — see
+        // docs/OPTIONAL_SMOLTCP.md.
+        assert!(!is_socket_family_sysno(199), "socketpair must run natively, not via the rump proxy");
+        assert_eq!(op_from_linux_sysno(199), Some(Op::Socketpair)); // mapping stays for completeness
         // Socket syscalls we do NOT marshal yet must still be owned (return an error,
         // not fall through). This is the leak the isolation guarantee closes.
         assert!(is_socket_family_sysno(242)); // accept4

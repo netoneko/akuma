@@ -1294,8 +1294,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         let mut buf = [0u8; 128];
         let mut pos = 0usize;
         let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-            format_args!("[FORK-DBG] pid={} brk=0x{:x} code_end=0x{:x} mmap_regions={} lazy_regs={}\n",
-                parent_pid, parent.brk, parent.memory.code_end,
+            format_args!("[FORK-DBG] parent_pid={} child_pid={} brk=0x{:x} code_end=0x{:x} mmap_regions={} lazy_regs={}\n",
+                parent_pid, child_pid, parent.brk, parent.memory.code_end,
                 parent.mmap_regions.len(),
                 parent.lazy_regions.len()));
         if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }

@@ -257,6 +257,24 @@ Papercuts surfaced by dogfooding, to fix later:
   processes never clean up and the CPU stays pegged. Not yet root-caused — suspect the
   writer's SIGPIPE handling/delivery path spins instead of terminating the write syscall.
   Workaround: redirect verbose output to a file instead of piping through `head`/`tail`.
+- ~~**`cargo build`/`rustc` can't spawn a subprocess at all — `os error 95` before any
+  `clone()`.**~~ — **FIXED.** Found while checking that a real crate (`cargo build
+  --release` on a Rust project) works, not just `git clone`. Root cause:
+  `is_socket_family_sysno()` (`crates/akuma-rump/src/syscall_translation.rs`) claimed
+  `socketpair()` (199) for the rump proxy, but the proxy's dispatch has no arm for
+  `Op::Socketpair` — it silently fell into the generic `_ => EOPNOTSUPP` catch-all.
+  Modern Rust's `std::process::Command` uses `socketpair(AF_UNIX, SOCK_SEQPACKET|
+  SOCK_CLOEXEC)` as its exec-status channel for every subprocess spawn, so this broke
+  spawning *any* subprocess from a Rust program on a rump box (box 0 under devbox) — e.g.
+  `rustc` couldn't even invoke its own linker (`cc`). Fixed by excluding 199 from the
+  proxied range: AF_UNIX socketpairs are pure local IPC, never networking, so they always
+  run natively regardless of the box's stack. See `docs/OPTIONAL_SMOLTCP.md`.
+- **`cargo build`/`rustc` subprocess spawn panics with CLOEXEC-pipe `EBADF` — in progress.**
+  With the socketpair fix above, `rustc` gets past `socketpair()` but then panics:
+  `the CLOEXEC pipe failed: Os { code: 9, ... "Bad file descriptor" }` — the parent fails
+  to read its own end of the exec-status socketpair after forking the child. Points to a
+  `fork_process`/`vfork_process`/`execve` bug specific to `FileDescriptor::UnixSocket` fds
+  across fork, separate from the TTBR0 bug class. See `docs/OPTIONAL_SMOLTCP.md`.
 - ~~**Only one SSH session at a time / parallel shells hang**~~ — **FIXED**, and it turned
   out to be unrelated to the `curl` DNS-crash wedge above. Three separate bugs, all fixed:
   `sshd`'s own accept

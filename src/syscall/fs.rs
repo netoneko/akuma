@@ -119,7 +119,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         trace_read_ebadf("fd-not-in-table", fd_num, buf_ptr);
         return EBADF;
     };
-    
+
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED && fd_num == 0 {
         crate::safe_print!(128, "[syscall] read(stdin, count={})\n", count);
     }

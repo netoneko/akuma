@@ -312,6 +312,21 @@ pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
 
     // read/write/readv/writev/close also hit files/pipes/stdio — only a rump socket
     // fd is ours; a real fd on a rump-box process still goes native.
+    //
+    // sendto/recvfrom belong in this same "check the fd, not just the syscall
+    // number" bucket: a `socketpair(AF_UNIX)` fd (`FileDescriptor::UnixSocket`,
+    // pipe-backed — see the socketpair fix elsewhere in this file) is not a
+    // `RumpSocket`, but musl's `read()`/`write()` on such a fd can still surface
+    // as a `recvfrom`/`sendto` syscall (Rust's std, for a socketpair-backed fd,
+    // issues `recvfrom`/`sendto` directly rather than `read`/`write`). Without
+    // this check, `is_socket_family_sysno` claims 206/207 purely by number and
+    // `proxy_transfer` → `proxy_and_fd` rejects the non-`RumpSocket` fd with a
+    // bare `EBADF` instead of falling through to the native `sys_recvfrom`/
+    // `sys_sendto` (which special-case `UnixSocket` fds correctly). That EBADF
+    // is exactly what broke reading the exec-status end of the socketpair
+    // Rust's `std::process::Command` uses for every subprocess spawn, panicking
+    // with "the CLOEXEC pipe failed: Bad file descriptor" right after the fork
+    // that should have started the child (e.g. `rustc` spawning its linker).
     let fd_is_rump = matches!(
         proc.get_fd(args[0] as u32),
         Some(process::FileDescriptor::RumpSocket { .. })
@@ -324,6 +339,8 @@ pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
                 | translation::Op::Readv
                 | translation::Op::Writev
                 | translation::Op::Close
+                | translation::Op::Sendto
+                | translation::Op::Recvfrom
         )
     ) && !fd_is_rump
     {
