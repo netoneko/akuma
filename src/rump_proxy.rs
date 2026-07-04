@@ -685,13 +685,29 @@ fn set_rump_sock_nonblock(proxy: &Arc<BoxProxy>, rump_fd: i32, nonblock: bool) {
 /// only) are handled directly against `Process`'s own per-fd bit — the same one
 /// `syscall::fs::sys_fcntl` would set for a native fd — since `proxy_and_fd`
 /// already re-reads `Process::is_nonblock` on every recv/send/accept call. No
-/// NetBSD round-trip needed. Anything else (`F_GETFD`/`F_SETFD`/locks/…)
-/// EOPNOTSUPPs; the box's rump sockets have no cloexec/lock state to manage.
+/// NetBSD round-trip needed.
+///
+/// `F_GETFD`/`F_SETFD` (`FD_CLOEXEC`) are a best-effort no-op success, same
+/// precedent as `proxy_setsockopt`: c-ares's `ares_socket_set_flags` calls
+/// `fcntl(fd, F_SETFD, FD_CLOEXEC)` right after every UDP socket it opens for a
+/// DNS query and treats any error as fatal — closing the socket and retrying
+/// with a fresh one (once per configured nameserver × `tries`, then giving up
+/// with "Could not contact DNS servers"). Returning `EOPNOTSUPP` here silently
+/// broke `git clone`/`curl` for any binary linked against c-ares, even though
+/// DNS itself worked fine (musl's own resolver and libcurl's threaded resolver
+/// never set `FD_CLOEXEC` on their DNS sockets, so they never hit this path).
+/// There's no real close-on-exec state to track for a rump socket fd (nothing
+/// downstream execve's while holding one open), so accepting the flag and
+/// discarding it is safe.
 fn rump_fcntl(proc: &Process, fd: u32, cmd: u32, arg: u64) -> u64 {
+    const F_GETFD: u32 = 1;
+    const F_SETFD: u32 = 2;
     const F_GETFL: u32 = 3;
     const F_SETFL: u32 = 4;
     const O_NONBLOCK: u64 = 0x800;
     match cmd {
+        F_GETFD => 0,
+        F_SETFD => 0,
         F_GETFL => if proc.is_nonblock(fd) { O_NONBLOCK } else { 0 },
         F_SETFL => {
             if arg & O_NONBLOCK != 0 {

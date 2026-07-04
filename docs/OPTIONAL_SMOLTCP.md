@@ -283,14 +283,41 @@ mirroring the fork test but building the child via `UserAddressSpace::new_shared
 mid-fork, same as the `fork_process` bug above). The clone now runs to completion and the
 SSH session stays responsive afterward.
 
-**New, separate blocker found while verifying this fix:** with the wedge gone, `git clone`
-now fails cleanly with `fatal: unable to access '...': Could not resolve host: github.com
-(Could not contact DNS servers)` — that parenthetical is a c-ares error string, and Alpine's
-apk-packaged git links a libcurl built with c-ares. c-ares issues its own raw UDP
-socket/sendto/recvfrom DNS queries directly against `/etc/resolv.conf`'s servers, bypassing
-whatever path the threaded-resolver `AsynchDNS` curl build and busybox `nslookup` use (both
-of which succeed against the same resolvers). This is a rump/UDP-socket-layer issue, not a
-fork/vfork/TTBR0 one — worth its own investigation.
+### c-ares DNS failure after the wedge fix — FIXED (`fcntl(F_SETFD)` on a rump socket)
+
+**Fixed 2026-07-05.** With the vfork wedge gone, `git clone` still failed cleanly with
+`fatal: unable to access '...': Could not resolve host: github.com (Could not contact DNS
+servers)`. That parenthetical is a c-ares error string — Alpine's apk-packaged `git` links
+a libcurl built against `libcares.so`, confirmed by `git-remote-https`'s own
+dynamic-library mmap trace (`/usr/lib/libcares.so.2.19.5`).
+
+**Root cause (`src/rump_proxy.rs::rump_fcntl`).** Traced with `RUMP_SP_TRACE = true` plus a
+temporary per-call fcntl print. c-ares's `ares_socket_set_flags` calls, per UDP socket it
+opens for a DNS query:
+
+```
+fcntl(fd, F_GETFL)              -> 0x800   (ok)
+fcntl(fd, F_SETFL, O_NONBLOCK)  -> 0       (ok)
+fcntl(fd, F_SETFD, FD_CLOEXEC)  -> -EOPNOTSUPP
+```
+
+`rump_fcntl` only implemented `F_GETFL`/`F_SETFL`; every other `cmd` (including `F_SETFD`)
+hit the `_ => EOPNOTSUPP` fallback. c-ares treats that failure as fatal, closes the socket,
+and retries with a fresh one — the trace showed exactly 6 `socket()`+immediate-`close()`
+cycles (2 configured nameservers × 3 `tries`) with **no** intervening `connect`/`bind`/
+`sendto` at all, then c-ares gave up and reported the query as unreachable. musl's own
+resolver and libcurl's threaded (`AsynchDNS`) resolver never call `fcntl(F_SETFD)` on their
+DNS sockets, so `nslookup` and our own `curl` binary never hit this path — only c-ares-linked
+binaries did.
+
+**Fix:** `F_GETFD`/`F_SETFD` are now a best-effort no-op success, the same precedent
+already used by `proxy_setsockopt` for unsupported `setsockopt` options — there's no real
+close-on-exec state to track for a rump socket fd (nothing downstream execve's while
+holding one open).
+
+**Verified in the devbox VM:** `git clone https://github.com/octocat/Hello-World.git`
+completes fully — working tree checked out, `git log`/`cat` on the cloned files work, and
+the VM stays responsive afterward.
 
 
 ## Concurrent SSH — FIXED (cooperative multiplexer)

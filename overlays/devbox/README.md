@@ -218,20 +218,45 @@ Papercuts surfaced by dogfooding, to fix later:
 - **`/bin/rump_server` is ~13 MB** — the box-0 network stack binary is huge (it dominates
   the image and its cold-load demand-paging). Trim it down later (strip / drop unused rump
   components / link-time GC).
-- ~~**`curl <hostname>` crashes the DNS resolver thread and wedges the VM.**~~ — **FIXED.**
-  Two bugs, both addressed:
+- ~~**`curl <hostname>` crashes the DNS resolver thread and wedges the VM.**~~ — **FIXED**
+  (for real this time as of 2026-07-05; see below). Same stale-TTBR0 bug class, three call
+  sites, all now patched:
   (1) The resolver thread's `ec=0x20` instruction abort was a stale-TTBR0 bug in the
   scheduler context. `clone_thread` (curl's `AsynchDNS` path) was fixed first — see
-  `docs/OPTIONAL_SMOLTCP.md`'s "curl https freeze" section. The identical code path in
-  `fork_process` (which `git clone`, `wget`, and any fork+execve hits) was never patched
-  until 2026-07-04 — same one-line override: `child_ctx.ttbr0 = new_proc.address_space.ttbr0()`.
-  DNS itself was never broken (`nslookup`/`curl http://` worked); the "DNS error" was the
-  SSH session dying when the VM wedged during the fork, before DNS output was produced.
-  (2) The kernel still loops on unhandled EL0 instruction aborts instead of killing the
-  process — when the fault happens *inside the scheduler* (loading the garbage TTBR0 +
-  `tlbi vmalle1`), the handler itself can't run because the CPU is wedged with IRQs masked.
-  Fixing (1) prevents the bad TTBR0 from ever being loaded; a general EL0-fault → SIGSEGV
-  robustness fix for the handler is still desirable but no longer load-bearing.
+  `docs/OPTIONAL_SMOLTCP.md`'s "curl https freeze" section.
+  (2) The identical code path in `fork_process` (plain `fork()`+execve) was patched
+  2026-07-04 — same one-line override: `child_ctx.ttbr0 = new_proc.address_space.ttbr0()`.
+  This was *believed* at the time to fix `git clone`/`wget`, but did not: those spawn
+  subprocesses via `CLONE_VFORK` (musl `posix_spawn`), which routes to a third, separate
+  function — `vfork_process` — not `fork_process`.
+  (3) `vfork_process` had the exact same bug and was still unpatched until 2026-07-05 —
+  it's the one `git clone` actually hits, and was verified (in devbox) to no longer wedge
+  the VM. See `docs/OPTIONAL_SMOLTCP.md`'s "`vfork_process` had the exact same bug" section.
+  DNS itself was never broken via the threaded resolver (`nslookup`/`curl` both work); the
+  "DNS error" people saw was the SSH session dying when the VM wedged mid-fork/vfork, before
+  any real output was produced. The kernel still loops on unhandled EL0 instruction aborts
+  instead of killing the process — a general EL0-fault → SIGSEGV robustness fix for the
+  handler is still desirable but no longer load-bearing now that all three TTBR0 call sites
+  are patched.
+- ~~**`git clone` still fails after the wedge fix — c-ares can't reach DNS servers.**~~ —
+  **FIXED.** With the vfork wedge gone, `git clone https://...` failed cleanly instead of
+  hanging, with `Could not resolve host: ... (Could not contact DNS servers)` — that
+  parenthetical is a c-ares error string (Alpine's apk-packaged `git` links a c-ares-enabled
+  libcurl). Root cause: c-ares calls `fcntl(fd, F_SETFD, FD_CLOEXEC)` on every UDP socket it
+  opens for a DNS query; `rump_fcntl` (`src/rump_proxy.rs`) only implemented `F_GETFL`/
+  `F_SETFL` and returned `EOPNOTSUPP` for `F_SETFD`, which c-ares treats as fatal — it closed
+  the socket and retried (2 nameservers × 3 tries = 6 socket-open/close cycles, confirmed via
+  `RUMP_SP_TRACE`) before giving up entirely. musl's resolver and libcurl's threaded resolver
+  never call `fcntl(F_SETFD)` on their DNS sockets, so `curl`/`nslookup` never hit this.
+  Fixed by making `F_GETFD`/`F_SETFD` a no-op success, same precedent as
+  `proxy_setsockopt`'s handling of unsupported options. See `docs/OPTIONAL_SMOLTCP.md`.
+- **Shell pipeline with an early-closing reader can wedge the whole VM.** `cmd | head -N`
+  (or `| tail`), where `cmd` writes more than `N` lines, has twice wedged the VM at ~99%
+  CPU with the last log line being `[signal] tkill(tid=X, sig=13)` (SIGPIPE delivery to the
+  writer). New SSH sessions still connect (the VM isn't fully dead), but the stuck
+  processes never clean up and the CPU stays pegged. Not yet root-caused — suspect the
+  writer's SIGPIPE handling/delivery path spins instead of terminating the write syscall.
+  Workaround: redirect verbose output to a file instead of piping through `head`/`tail`.
 - ~~**Only one SSH session at a time / parallel shells hang**~~ — **FIXED**, and it turned
   out to be unrelated to the `curl` DNS-crash wedge above. Three separate bugs, all fixed:
   `sshd`'s own accept
