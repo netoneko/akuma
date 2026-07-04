@@ -393,7 +393,7 @@ async fn execute_pipeline_internal(
                         }
                         break;
                     }
-                    sleep_ms(1);
+                    crate::yield_now().await;
                 }
                 if is_last { return PipelineResult::Output(captured); }
                 else { stdin_data = Some(captured); continue; }

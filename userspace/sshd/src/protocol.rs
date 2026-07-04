@@ -278,8 +278,10 @@ async fn bridge_process(
         }
 
         // Only yield when both directions were idle, to keep latency low while busy.
+        // `yield_now` (not `sleep_ms`) so this suspends *this session's* future
+        // instead of blocking sshd's whole executor thread — see its doc comment.
         if !did_io {
-            sleep_ms(10);
+            crate::yield_now().await;
         }
     }
     // Close our read end of the child's stdout. The kernel keeps the child's

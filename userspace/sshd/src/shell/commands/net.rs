@@ -55,7 +55,7 @@ impl Command for PkgCommand {
                         let _ = stdout.write(format!("\r\nsshd: /bin/pkg exited with status {}\r\n", exit_code).as_bytes()).await;
                         break;
                     }
-                    sleep_ms(10);
+                    crate::yield_now().await;
                 }
             } else {
                 let _ = stdout.write(b"sshd: failed to spawn /bin/pkg. Is it on the disk image?\r\n").await;

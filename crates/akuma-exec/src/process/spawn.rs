@@ -235,22 +235,41 @@ pub fn spawn_process_with_channel_ext(
     // Set the channel in the process struct (UNIFIED I/O)
     process.channel = Some(channel.clone());
 
-    // Inherit terminal state from caller if available
-    if let Some(shared_state) = current_terminal_state() {
+    // Inherit terminal state from caller if available — but NOT for a `pty`
+    // spawn. `pty` means "give the child a brand-new controlling terminal"
+    // (real Unix semantics: allocating a new pty starts a new session, it
+    // does not share the allocator's terminal). A multiplexing daemon — one
+    // OS process/thread serving many independent interactive sessions, e.g.
+    // userspace sshd handling several concurrent SSH connections — has
+    // exactly one `terminal_state` on itself; inheriting it for every
+    // spawned pty session would make them all share one `input_waker` slot
+    // (`crates/akuma-terminal`): session B's blocked stdin read stores its
+    // waker there, but a stdin write for session A wakes whatever waker is
+    // *currently* in that shared slot instead of targeting the right pid —
+    // so B can permanently miss its wakeup while A keeps using its terminal,
+    // and only resumes once A exits and stops re-registering. `Process::new`
+    // already gives every process its own fresh `TerminalState`
+    // (`process/mod.rs`), so a `pty` spawn just keeps that instead of
+    // overwriting it. Non-pty spawns (plain fork/exec within an existing
+    // session) keep inheriting, matching a real shell subprocess sharing its
+    // parent's controlling terminal.
+    if !pty && let Some(shared_state) = current_terminal_state() {
         if config().syscall_debug_info_enabled {
             log::debug!("[Process] Inheriting shared terminal state at {:p} for PID {}", Arc::as_ptr(&shared_state), process.pid);
         }
         process.terminal_state = shared_state;
-        
-        // Auto-delegate foreground to the new process.
-        // For interactive spawns, the child should start in the foreground.
-        let pid_to_delegate = process.pid;
-        process.terminal_state.lock().foreground_pgid = pid_to_delegate;
-    } else {
-        if config().syscall_debug_info_enabled {
+    } else if config().syscall_debug_info_enabled {
+        if pty {
+            log::debug!("[Process] Fresh (non-inherited) terminal state for pty spawn PID {}", process.pid);
+        } else {
             log::debug!("[Process] NO shared terminal state found for caller thread {}, using default for PID {}", crate::threading::current_thread_id(), process.pid);
         }
     }
+
+    // Auto-delegate foreground to the new process (on whichever
+    // terminal_state it ended up with, shared or fresh). For interactive
+    // spawns, the child should start in the foreground.
+    process.terminal_state.lock().foreground_pgid = process.pid;
 
     // Save arguments in process struct for ProcessInfo page
     process.args = if let Some(arg_slice) = args {

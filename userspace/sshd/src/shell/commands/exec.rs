@@ -53,7 +53,7 @@ impl Command for ExecCommand {
                         if exit_code != 0 { let _ = stdout.write(format!("[exit code: {}]\r\n", exit_code).as_bytes()).await; }
                         break;
                     }
-                    sleep_ms(1);
+                    crate::yield_now().await;
                 }
             } else { let _ = stdout.write(b"Error: Failed to spawn process\r\n").await; }
             Ok(())

@@ -222,6 +222,34 @@ pub extern "C" fn main() {
     }
 }
 
+/// Yield exactly one poll cycle back to the multi-session executor in
+/// `main()`, then resume on the next poll.
+///
+/// `sleep_ms` is a blocking syscall (raw `NANOSLEEP`) — it parks the *entire*
+/// OS thread `sshd` runs on, not just the calling future. Rust only suspends
+/// an `async fn` at an explicit `.await` point; a loop that calls `sleep_ms`
+/// directly (no `.await` on it) never actually returns `Poll::Pending` to
+/// its caller, so the executor's `poll()` call on that session never
+/// returns either. In practice that meant the *first* session to reach an
+/// idle "nothing to do this tick, sleep a bit" loop (interactive shell
+/// bridge, or a spawned command in the built-in shell) monopolized the
+/// executor for its entire lifetime — every other connection's
+/// `try_accept`/poll starved until that session's process exited. Use this
+/// in place of `sleep_ms` in any such loop.
+pub async fn yield_now() {
+    let mut yielded = false;
+    poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await
+}
+
 fn noop_waker() -> Waker {
     static VTABLE: RawWakerVTable = RawWakerVTable::new(
         |_| RawWaker::new(core::ptr::null(), &VTABLE),
