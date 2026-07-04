@@ -19,7 +19,6 @@ mod auth;
 mod keys;
 mod config;
 mod protocol;
-mod shell;
 
 // ============================================================================
 // TcpStream Wrapper for embedded-io-async
@@ -123,7 +122,7 @@ pub extern "C" fn main() {
         match arg {
             "--shell" => {
                 if let Some(shell_path) = args.next() {
-                    ssh_config.shell = Some(alloc::string::String::from(shell_path));
+                    ssh_config.shell = alloc::string::String::from(shell_path);
                     println(&format!("[SSHD] Shell override from CLI: {}", shell_path));
                 }
             }
@@ -163,11 +162,7 @@ pub extern "C" fn main() {
     };
 
     println(&format!("[SSHD] Listening on {}...", addr));
-    if let Some(ref shell) = ssh_config.shell {
-        println(&format!("[SSHD] Default shell: {}", shell));
-    } else {
-        println("[SSHD] Default shell: built-in");
-    }
+    println(&format!("[SSHD] Shell: {}", ssh_config.shell));
 
     if let Err(e) = listener.set_nonblocking(true) {
         eprintln(&format!("[SSHD] Failed to set listener non-blocking: {:?}", e));
@@ -230,12 +225,11 @@ pub extern "C" fn main() {
 /// an `async fn` at an explicit `.await` point; a loop that calls `sleep_ms`
 /// directly (no `.await` on it) never actually returns `Poll::Pending` to
 /// its caller, so the executor's `poll()` call on that session never
-/// returns either. In practice that meant the *first* session to reach an
-/// idle "nothing to do this tick, sleep a bit" loop (interactive shell
-/// bridge, or a spawned command in the built-in shell) monopolized the
+/// returns either. In practice that meant the *first* session to reach
+/// `bridge_process`'s idle "nothing to do this tick" branch monopolized the
 /// executor for its entire lifetime — every other connection's
-/// `try_accept`/poll starved until that session's process exited. Use this
-/// in place of `sleep_ms` in any such loop.
+/// `try_accept`/poll starved until that session's shell exited. Use this in
+/// place of `sleep_ms` in any loop nested inside a session's future.
 pub async fn yield_now() {
     let mut yielded = false;
     poll_fn(|cx| {

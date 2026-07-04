@@ -80,8 +80,8 @@ thread `sshd` runs on. Two layers had to agree on that:
                      │            SshStream (main.rs)           │
                      │                                           │
   handshake loop,    │  Read::read()/Write::write()              │
-  run_built_in_shell,│    -> poll_fn: WouldBlock => Pending  ────┼──> suspends THIS
-  send_packet, ...   │       (yields to the multiplexer)         │    session's future;
+  send_packet, ...   │    -> poll_fn: WouldBlock => Pending  ────┼──> suspends THIS
+                     │       (yields to the multiplexer)         │    session's future;
                      │                                           │    other sessions
                      │  try_read()                                │    keep polling.
   bridge_process's   │    -> WouldBlock => Err, returns now  ────┼──> does NOT suspend;
@@ -98,7 +98,55 @@ else), the loop would never get back to draining stdout while waiting for
 the next keystroke — a session-local stall, independent of the multiplexer.
 So `bridge_process` calls the non-suspending `try_read()` instead.
 
-## `shell` vs `exec` — same pipe, different entry
+## Two more blockers only a *live* second connection turned up
+
+The multiplexer above looked correct and passed automated concurrency tests
+(two `ssh` processes started back-to-back and driven programmatically), but
+a *manual* test — open one connection, sit at its prompt, then open a
+second — still hung: the second connection got zero bytes back, not even
+the SSH version banner, until the first was closed. Two bugs, both about
+things that "being inside an `async fn`" does **not** automatically fix:
+
+**1. A blocking `sleep_ms` inside a loop with no `.await` on it never
+suspends the future.** `bridge_process`'s idle branch was
+`if !did_io { sleep_ms(10); }` — `sleep_ms` is a raw blocking `NANOSLEEP`
+syscall. Rust only yields an `async fn` at an explicit `.await` point; a
+loop that never hits one just runs synchronously forever once polled. So
+the *first* session to reach that idle branch (e.g. sitting at an
+interactive shell prompt, waiting for a keystroke) never returned control to
+`main()`'s executor — its `poll()` call simply never came back, and
+`try_accept()` for every other connection starved for as long as that
+session's shell stayed open. Fixed with a proper one-shot async yield:
+
+```rust
+pub async fn yield_now() {
+    let mut yielded = false;
+    poll_fn(|cx| {
+        if yielded { Poll::Ready(()) }
+        else { yielded = true; cx.waker().wake_by_ref(); Poll::Pending }
+    }).await
+}
+```
+`bridge_process` (and every other spawned-command loop that used to call
+`sleep_ms` in the same pattern) now does `crate::yield_now().await` instead
+— a real suspend, not a blocking sleep dressed up as async.
+
+**2. `sshd`'s own `TerminalState` was shared by every `spawn_pty` child.**
+`spawn_process_with_channel_ext` (`crates/akuma-exec/src/process/spawn.rs`)
+inherits `current_terminal_state()` from the *caller* by default — correct
+for a real shell forking a subcommand (they should share one controlling
+terminal), wrong for a multiplexing daemon: `sshd` is one OS process with
+one `TerminalState` of its own, so every session's spawned shell used to
+inherit **the same one**, including its single `input_waker` slot. A stdin
+wakeup meant for session B's parked reader could get delivered to session
+A's instead (and vice versa), so a session's shell could permanently miss
+its wakeup while a sibling session kept using "the" terminal. Fixed by *not*
+inheriting for a `pty` spawn — it now keeps the fresh, independent
+`TerminalState` every process already gets by default (`Process::new`),
+matching real Unix semantics: allocating a new pty starts a new session, it
+doesn't borrow the allocator's.
+
+## `shell` vs `exec` — busybox is the only shell now
 
 ```
 CHANNEL_REQUEST -----------------+
@@ -113,6 +161,9 @@ CHANNEL_REQUEST -----------------+
                                       - poll child stdout  (read_fd, non-blocking)
                                       - poll SSH input     (try_read, non-blocking)
                                       - waitpid(pid) -> drain remaining stdout -> return
+
+  spawn failure (either path) -> fail_spawn(): error message to client, session ends.
+  No built-in shell to fall back to.
 ```
 
 `ssh host <cmd>` (`ssh -p 2223 root@localhost echo hi`) used to do nothing:
@@ -122,6 +173,15 @@ parses the command string out of the same `CHANNEL_REQUEST` payload (right
 after the `want_reply` byte) and spawns `<shell> -c <cmd>` through the exact
 same `bridge_process` pump interactive sessions use — so exit-on-child-exit,
 stdin forwarding, and stdout draining behave identically for both.
+
+`sshd` originally had a hand-rolled fallback shell (`userspace/sshd/src/shell/`)
+for when no external shell was configured or a configured one failed to
+spawn — a small untested command interpreter duplicating what a real shell
+already does. It's been removed entirely: `session.config.shell` is now a
+plain `String` (not `Option<String>`), defaulting to `config::DEFAULT_SHELL`
+(busybox's `/bin/sh` — present on every bootstrap/devbox image). A spawn
+failure now ends the session with an error message via `fail_spawn` instead
+of degrading to a fallback.
 
 ## Where the wire-format parsing lives
 

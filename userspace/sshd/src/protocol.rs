@@ -24,9 +24,6 @@ use crate::SshStream;
 use libakuma::*;
 use libakuma::net::Error as NetError;
 
-// Use our ported shell
-use crate::shell::{self, CommandRegistry, ShellContext, create_default_registry};
-
 // ============================================================================
 // SSH Constants
 // ============================================================================
@@ -111,61 +108,63 @@ impl SshSession {
 // ============================================================================
 
 /// One-shot `ssh host <cmd>` (SSH `exec` channel request, as opposed to an
-/// interactive `shell` request). Spawns the command through the configured
-/// shell's `-c` and pumps it through the same `bridge_process` used for
-/// interactive sessions, so exit-on-child-exit / stdin-forwarding /
-/// stdout-draining behave identically. Falls back to the built-in shell's
-/// single-command execution if no external shell is configured.
+/// interactive `shell` request). Spawns the configured shell with `-c <cmd>`
+/// and pumps it through the same `bridge_process` used for interactive
+/// sessions, so exit-on-child-exit / stdin-forwarding / stdout-draining
+/// behave identically. There is no built-in fallback — a spawn failure ends
+/// the session with an error message.
 async fn run_exec_session(
     stream: &mut SshStream,
     session: &mut SshSession,
     command: &[u8],
 ) -> Result<(), NetError> {
     let cmd_str = core::str::from_utf8(command).unwrap_or("");
-
-    if let Some(ref shell_path) = session.config.shell {
-        let mut arg_refs: Vec<&str> = session.config.shell_args.iter().map(|s| s.as_str()).collect();
-        arg_refs.push("-c");
-        arg_refs.push(cmd_str);
-        println(&format!("[SSH] Exec: {} {:?}", shell_path, arg_refs));
-        if let Some(res) = spawn(shell_path, Some(&arg_refs)) {
-            return bridge_process(stream, session, res.pid, res.stdout_fd).await;
-        }
-        println(&format!("[SSH] Failed to spawn {} for exec, falling back to built-in", shell_path));
+    let shell_path = session.config.shell.clone();
+    let mut arg_refs: Vec<&str> = session.config.shell_args.iter().map(|s| s.as_str()).collect();
+    arg_refs.push("-c");
+    arg_refs.push(cmd_str);
+    println(&format!("[SSH] Exec: {} {:?}", shell_path, arg_refs));
+    if let Some(res) = spawn(&shell_path, Some(&arg_refs)) {
+        return bridge_process(stream, session, res.pid, res.stdout_fd).await;
     }
-
-    let registry = create_default_registry();
-    let mut shell_ctx = ShellContext::new();
-    let res = shell::execute_command_chain(command, &registry, &mut shell_ctx).await;
-    if !res.output.is_empty() {
-        send_channel_data(stream, session, &res.output).await?;
-    }
-    Ok(())
+    fail_spawn(stream, session, &shell_path, "exec").await
 }
 
+/// Interactive `shell` channel request. There is no built-in fallback shell
+/// — a spawn failure ends the session with an error message.
 async fn run_shell_session(
     stream: &mut SshStream,
     session: &mut SshSession,
 ) -> Result<(), NetError> {
-    if let Some(ref shell_path) = session.config.shell {
-        // Extra argv for multicall shells (busybox/toybox): the kernel sets
-        // argv[0] = shell_path, then these follow (e.g. ["sh"]).
-        let arg_refs: Vec<&str> = session.config.shell_args.iter().map(|s| s.as_str()).collect();
-        let args = if arg_refs.is_empty() { None } else { Some(arg_refs.as_slice()) };
-        println(&format!("[SSH] Spawning shell: {} {:?}", shell_path, session.config.shell_args));
-        // Interactive login shell: request a pty so the kernel runs its canonical
-        // line discipline (ICRNL CR->NL, echo, line editing) on the shell's
-        // stdin. `ssh -tt` sends a `pty-req` ahead of this `shell` request; the
-        // shell is cooked like a real terminal instead of a raw pipe. (A future
-        // refinement could gate this on a tracked `pty-req` flag so a
-        // no-pty client gets a pipe.)
-        if let Some(res) = spawn_pty(shell_path, args) {
-            return bridge_process(stream, session, res.pid, res.stdout_fd).await;
-        }
-        println(&format!("[SSH] Failed to spawn {}, falling back to built-in", shell_path));
+    let shell_path = session.config.shell.clone();
+    // Extra argv for multicall shells (busybox/toybox): the kernel sets
+    // argv[0] = shell_path, then these follow (e.g. ["sh"]).
+    let arg_refs: Vec<&str> = session.config.shell_args.iter().map(|s| s.as_str()).collect();
+    let args = if arg_refs.is_empty() { None } else { Some(arg_refs.as_slice()) };
+    println(&format!("[SSH] Spawning shell: {} {:?}", shell_path, session.config.shell_args));
+    // Interactive login shell: request a pty so the kernel runs its canonical
+    // line discipline (ICRNL CR->NL, echo, line editing) on the shell's
+    // stdin. `ssh -tt` sends a `pty-req` ahead of this `shell` request; the
+    // shell is cooked like a real terminal instead of a raw pipe. (A future
+    // refinement could gate this on a tracked `pty-req` flag so a
+    // no-pty client gets a pipe.)
+    if let Some(res) = spawn_pty(&shell_path, args) {
+        return bridge_process(stream, session, res.pid, res.stdout_fd).await;
     }
+    fail_spawn(stream, session, &shell_path, "shell").await
+}
 
-    run_built_in_shell(stream, session).await
+/// Report a shell-spawn failure to both the log and the client, then end the
+/// session cleanly (no built-in shell to fall back to).
+async fn fail_spawn(
+    stream: &mut SshStream,
+    session: &mut SshSession,
+    shell_path: &str,
+    kind: &str,
+) -> Result<(), NetError> {
+    let msg = format!("sshd: failed to spawn '{shell_path}' for {kind}\r\n");
+    println(&format!("[SSH] {}", msg.trim_end()));
+    send_channel_data(stream, session, msg.as_bytes()).await
 }
 
 async fn bridge_process(
@@ -290,67 +289,6 @@ async fn bridge_process(
     // that channel now. Without it, sshd (which handles connections serially in
     // one long-lived process) would leak one channel per login.
     close(stdout_fd as i32);
-    Ok(())
-}
-
-async fn run_built_in_shell(
-    stream: &mut SshStream,
-    session: &mut SshSession,
-) -> Result<(), NetError> {
-    let welcome = b"\r\nWelcome to Akuma SSH Built-in Shell\r\nType 'help' for commands.\r\n";
-    send_channel_data(stream, session, welcome).await?;
-    
-    let mut line = Vec::new();
-    let mut shell_ctx = ShellContext::new();
-    let registry = create_default_registry();
-
-    loop {
-        let prompt = format!("akuma:{}> ", shell_ctx.cwd());
-        send_channel_data(stream, session, prompt.as_bytes()).await?;
-        
-        line.clear();
-        'read_loop: loop {
-            let mut b = [0u8; 1];
-            if stream.read(&mut b).await? == 0 { return Ok(()); }
-            
-            session.input_buffer.extend_from_slice(&b);
-            while let Some((msg_type, payload)) = process_encrypted_packet(session) {
-                if msg_type == SSH_MSG_CHANNEL_DATA {
-                    let mut offset = 0;
-                    let _recipient = read_u32(&payload, &mut offset);
-                    if let Some(data) = read_string(&payload, &mut offset) {
-                        for &byte in data {
-                            if byte == b'\r' || byte == b'\n' {
-                                send_channel_data(stream, session, b"\r\n").await?;
-                                break 'read_loop;
-                            } else if byte == 8 || byte == 127 {
-                                if !line.is_empty() {
-                                    line.pop();
-                                    send_channel_data(stream, session, b"\x08 \x08").await?;
-                                }
-                            } else if byte >= 32 {
-                                line.push(byte);
-                                send_channel_data(stream, session, &[byte]).await?;
-                            }
-                        }
-                    }
-                } else if msg_type == SSH_MSG_DISCONNECT {
-                    return Ok(());
-                }
-            }
-        }
-
-        if line.is_empty() { continue; }
-
-        let res = shell::execute_command_chain(&line, &registry, &mut shell_ctx).await;
-        if !res.output.is_empty() {
-            send_channel_data(stream, session, &res.output).await?;
-        }
-        if res.should_exit {
-            send_channel_data(stream, session, b"Goodbye!\r\n").await?;
-            break;
-        }
-    }
     Ok(())
 }
 

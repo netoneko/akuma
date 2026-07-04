@@ -26,22 +26,32 @@ static CACHED_CONFIG: Spinlock<Option<SshdConfig>> = Spinlock::new(None);
 #[derive(Debug, Clone)]
 pub struct SshdConfig {
     pub disable_key_verification: bool,
-    pub shell: Option<String>,
+    /// Path to the shell spawned for both interactive (`shell` channel
+    /// request) and one-shot (`exec` channel request, `-c <cmd>`) sessions.
+    /// There is no built-in fallback shell — this must be a real executable
+    /// on disk. Defaults to busybox's `/bin/sh` (a devbox/bootstrap image
+    /// always symlinks `/bin/sh` to busybox; see `scripts/populate_disk.sh`).
+    pub shell: String,
     /// Extra argv passed to the spawned shell, after the shell path. Used to
     /// drive multicall binaries (busybox/toybox/armybox) whose applet is
     /// selected by an argument, e.g. `--shell /bin/toybox --shell-arg sh`
-    /// spawns argv = ["/bin/toybox", "sh"]. Empty for a plain shell binary.
+    /// spawns argv = ["/bin/toybox", "sh"]. Empty for a plain shell binary
+    /// (the default `/bin/sh` dispatches via its own argv[0] basename).
     pub shell_args: Vec<String>,
     pub port: Option<u16>,
 }
+
+/// Default shell: busybox's multicall entry point, present on every
+/// bootstrap/devbox image (`scripts/populate_disk.sh` always symlinks it).
+pub const DEFAULT_SHELL: &str = "/bin/sh";
 
 impl Default for SshdConfig {
     fn default() -> Self {
         Self {
             disable_key_verification: false,
-            shell: None, // Default to built-in shell
+            shell: String::from(DEFAULT_SHELL),
             shell_args: Vec::new(),
-            port: None,  // Default port is handled in main.rs
+            port: None, // Default port is handled in main.rs
         }
     }
 }
@@ -66,7 +76,7 @@ impl SshdConfig {
                     self.disable_key_verification = parse_bool(value);
                 }
                 "shell" => {
-                    self.shell = Some(String::from(value));
+                    self.shell = String::from(value);
                 }
                 "port" => {
                     if let Ok(p) = value.parse::<u16>() {

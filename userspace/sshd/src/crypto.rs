@@ -10,7 +10,7 @@
 pub use akuma_ssh_crypto::crypto::{
     AES_IV_SIZE, AES_KEY_SIZE, Aes128Ctr, CryptoState, HmacSha256, MAC_KEY_SIZE, MAC_SIZE,
     SimpleRng, build_encrypted_packet, build_packet, derive_key, read_string, read_u32,
-    split_first_word, trim_bytes, write_namelist, write_string, write_u32,
+    write_namelist, write_string, write_u32,
 };
 
 /// A `SimpleRng` seeded from the kernel's hardware entropy (`getrandom`).

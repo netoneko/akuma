@@ -151,16 +151,13 @@ working smoltcp build); both fixes live in our kernel dispatch:
 
 ### Backlog
 
-- **One-shot `ssh host <cmd>` doesn't spawn the child** (`ssh -p 2223 root@localhost echo
-  hi` closes without output); the **interactive** session works. Appears to be a
-  sshd one-shot-exec path issue, not rump/smoltcp — to investigate separately.
-- **Concurrent SSH sessions don't work** — `userspace/sshd` is single-session by design:
-  its accept loop runs `block_on(handle_connection(...))` to completion before the next
-  `accept()` (`userspace/sshd/src/main.rs:144-171`). So a second simultaneous connection
-  waits for the first to finish. Not a kernel/rump bug. **Recommended fix + why (see the
-  Concurrent-SSH section below).** Do it as a *single-threaded cooperative multiplexer*, NOT
-  by spawning kernel threads per connection — a thread-per-connection sshd would turn sshd
-  into a multithreaded process and hit the exact `curl https` deadlock class below.
+- ~~**One-shot `ssh host <cmd>` doesn't spawn the child**~~ — **FIXED.** `handle_message`
+  only recognized the `shell` channel-request type; `exec` fell through with no reply and
+  no spawn. `run_exec_session` (`userspace/sshd/src/protocol.rs`) now parses the command
+  string out of the same request and spawns `<shell> -c <cmd>` through `bridge_process`.
+- ~~**Concurrent SSH sessions don't work**~~ — **FIXED**, see the Concurrent SSH section
+  below (now retitled) and [`userspace/sshd/docs/FLOW.md`](../userspace/sshd/docs/FLOW.md)
+  for the full before/after diagram.
 
 ## Concurrency: `curl https://host` — FIXED (clone child got a bogus TTBR0)
 
@@ -227,30 +224,43 @@ back equal to the PC), so only the general registers (notably `SP`, `LR`) are tr
 For a reliable PC snapshot, force `HVF=0` (TCG) for the repro.
 
 
-## Concurrent SSH: do it single-threaded (cooperative multiplexer)
+## Concurrent SSH — FIXED (cooperative multiplexer)
 
-`userspace/sshd` accepts one connection and runs `block_on(protocol::handle_connection(...))`
-to completion before the next `accept()` (`main.rs:126-171`). The **whole** session is
-already one cooperative `async` future, and its interactive bridge already sets both fds
-non-blocking and polls (`protocol.rs:155-208`). So the right fix is a **single-threaded
-multi-future executor**, which also keeps sshd a single-threaded process (so it never trips
-the `fault_mutex` deadlock class above):
+**Fixed 2026-07-04.** Full before/after diagram, the `bridge_process`/`fail_spawn`
+mechanics, and the wire-format test coverage: see
+[`userspace/sshd/docs/FLOW.md`](../userspace/sshd/docs/FLOW.md). Summary of what actually
+shipped, and where it deviated from the plan originally sketched in this section:
 
-1. Set the listener non-blocking and each accepted fd non-blocking immediately
-   (`libakuma::set_nonblocking`, already used by the bridge — fcntl `F_SETFL O_NONBLOCK`,
-   `libakuma/src/lib.rs:1020`).
-2. Make the `async` socket read actually **yield `Poll::Pending` on `WouldBlock`** instead of
-   the current blocking `recv` (`SshStream::read` → `TcpStream::read` → `crate::recv`,
-   `libakuma/src/net.rs:251`, which today blocks in-kernel). Today only the bridge tolerates
-   `WouldBlock`; the handshake + built-in-shell read loops call `stream.read().await`
-   expecting it to block. This is the one real code change.
-3. Replace the accept loop's `block_on(one)` with an executor that holds a
-   `Vec<Pin<Box<dyn Future<Output=()>>>>` of live sessions: each tick, non-blocking-`accept`
-   (push a new `handle_connection` future on success), poll every session future, retain the
-   `Pending` ones, and `sleep_ms(1)` only when nothing was ready.
+1. **Listener + accepted fds non-blocking, `TcpListener::try_accept()`, and the accept loop
+   replaced with a `Vec<Pin<Box<dyn Future<Output=()>>>>` executor** — as planned.
+2. **`SshStream::read`/`write` yield `Poll::Pending` on `WouldBlock`** — as planned, plus a
+   non-suspending `SshStream::try_read()` for `bridge_process`'s own manual stdout/stdin
+   interleaving (it can't afford to suspend the *whole* future mid-tick just to wait on one
+   direction).
+3. **A blocker the plan didn't anticipate: `fcntl(F_SETFL, O_NONBLOCK)` on a rump socket
+   was hard `EOPNOTSUPP`'d** (`src/rump_proxy.rs`, from the WAITPID-collision fix below) —
+   so step 1 alone crash-looped `sshd` the instant it tried to go non-blocking. Fixed by
+   implementing real `F_SETFL`/`F_GETFL` handling for rump fds instead of the blanket
+   rejection (`rump_fcntl` in `rump_proxy.rs`).
+4. **A second blocker: every `bridge_process` idle loop called `sleep_ms` (a blocking
+   `NANOSLEEP` syscall) with no `.await` on it.** Rust only suspends an `async fn` at an
+   explicit `.await` point, so this loop never actually returned `Poll::Pending` — the first
+   session to go idle monopolized the executor's one OS thread for its entire lifetime,
+   starving every other connection's `accept`/poll until that session's shell exited.
+   Fixed with a proper one-shot `yield_now()` (`userspace/sshd/src/main.rs`) in place of the
+   blocking sleep.
+5. **A third blocker: `sshd`'s own `TerminalState` was inherited by every `spawn_pty`
+   child**, so two sessions' shells shared one `input_waker` slot — a stdin wakeup for
+   session A's shell could get delivered to session B's parked reader instead. Fixed in
+   `crates/akuma-exec/src/process/spawn.rs`: a `pty` spawn no longer inherits the caller's
+   terminal state (real Unix semantics too — a new pty is a new session, not a share of the
+   spawner's).
 
-This gives real concurrency (while session A parks on a socket read, B progresses) on one
-thread — no `clone`/thread-per-connection, no shared `fault_mutex` contention.
+This gives real concurrency (while session A parks on a socket read or sits idle at its
+shell prompt, B progresses) on one thread — no `clone`/thread-per-connection, no shared
+`fault_mutex` contention, and (per the built-in-shell removal) no fallback shell either:
+`sshd` always spawns a real shell now (`config::DEFAULT_SHELL` = busybox's `/bin/sh`); a
+spawn failure ends the session with an error message instead of falling back.
 
 **Thread-per-connection IS possible — but is the *worse* option here.** `libakuma` doesn't
 wrap it, but the kernel implements the Linux `clone`/`CLONE_VM` (and `fork`) ABI directly —
@@ -263,9 +273,9 @@ design has none of); (2) the cooperative multiplexer is strictly less machinery 
 no per-thread teardown, no locking around shared session state. Reach for real threads only
 if a session ever needs to do genuinely CPU-bound work that would starve the others.
 
-Related backlog once concurrency lands: the single box-0 rump proxy serializes socket
-syscalls, which *may* head-of-line-block truly-simultaneous sessions — re-measure after the
-executor is in.
+Related backlog, still open: the single box-0 rump proxy serializes socket syscalls, which
+*may* head-of-line-block truly-simultaneous sessions under heavy load — not yet re-measured
+now that the executor is in.
 
 ## Touchpoints
 
@@ -291,3 +301,15 @@ executor is in.
   `get_saved_user_context(parent)`. `crates/akuma-exec/src/process/children.rs` —
   `fault_mutex` IRQ-safety in `fault_slot_acquire`/`fault_slot_release` (correct hygiene;
   not the curl freeze).
+- Concurrent SSH (see that section above) — `userspace/sshd/src/main.rs` (the executor +
+  `yield_now`), `protocol.rs` (`SshStream::try_read`, `run_exec_session`, `fail_spawn`,
+  `bridge_process`), `userspace/libakuma/src/net.rs` (`TcpListener::try_accept`/
+  `set_nonblocking`), `src/rump_proxy.rs::rump_fcntl`, and
+  `crates/akuma-exec/src/process/spawn.rs` (pty spawns get a fresh `TerminalState`). The
+  built-in fallback shell (`userspace/sshd/src/shell/`) was removed entirely; `sshd` now
+  always spawns a real shell (`config::DEFAULT_SHELL` = busybox's `/bin/sh`). Its wire-format
+  helpers (`read_string`/`read_u32`/packet framing/`SimpleRng`) now come from the shared,
+  tested `crates/akuma-ssh-crypto` instead of a duplicated copy. `/proc/<pid>/stat`
+  (`src/vfs/proc.rs`) was added so `ps`/`top` can list processes at all — they parse that
+  file, not `/proc/<pid>/status`. `scripts/populate_disk.sh`'s base symlink step no longer
+  points `sh`/`cat`/`echo`/etc. at a `busybox.static` that may not exist.

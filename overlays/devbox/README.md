@@ -209,14 +209,12 @@ Layered back on now that SSH-over-rump is solid:
 
 Papercuts surfaced by dogfooding, to fix later:
 
-- **`ps` shows nothing** despite `/proc` being full of per-process data. `ps` returns empty
-  output even though `/proc/<pid>/…` is populated — so the applet isn't reading the procfs
-  data the kernel already exposes. Needs investigation on the `ps` side (which `/proc`
-  layout it expects) vs. what our procfs presents.
-- **One-shot `ssh host <cmd>` returns no output** (e.g. `ssh -p 2223 root@localhost echo hi`
-  closes the connection without spawning the command child). The **interactive** session
-  works fine (`ssh -p 2223 root@localhost`, then run commands). Looks like a sshd
-  one-shot-exec path issue, unrelated to rump/networking — to investigate.
+- ~~**`ps` shows nothing**~~ — **FIXED.** `ps`/`top` parse `/proc/<pid>/stat` (Linux's
+  compact single-line format), not `/proc/<pid>/status` (the human-readable one, the only
+  one procfs implemented). Added `/proc/<pid>/stat` in `src/vfs/proc.rs`.
+- ~~**One-shot `ssh host <cmd>` returns no output**~~ — **FIXED**, see
+  `docs/OPTIONAL_SMOLTCP.md`'s Concurrent SSH section and
+  [`userspace/sshd/docs/FLOW.md`](../../userspace/sshd/docs/FLOW.md).
 - **`/bin/rump_server` is ~13 MB** — the box-0 network stack binary is huge (it dominates
   the image and its cold-load demand-paging). Trim it down later (strip / drop unused rump
   components / link-time GC).
@@ -229,7 +227,13 @@ Papercuts surfaced by dogfooding, to fix later:
   so the CPU spins and the whole VM hangs (all SSH sessions freeze; the boot log floods with
   `unhandled exception ec=0x20`). Fix (2) first: an unhandled EL0 fault must SIGSEGV/SIGILL
   the process (like the OOM-kill path), never wedge the kernel.
-- **Only one SSH session at a time / parallel shells hang** — currently a consequence of the
-  above (a wedged VM freezes everything). Re-check true concurrency after the fault-kill fix;
-  the single box-0 rump proxy also serializes socket syscalls, which may head-of-line block
-  concurrent sessions.
+- ~~**Only one SSH session at a time / parallel shells hang**~~ — **FIXED**, and it turned
+  out to be unrelated to the `curl` DNS-crash wedge above (that theory was wrong — the VM
+  itself was never frozen; `sshd` was). Three separate bugs, all fixed: `sshd`'s own accept
+  loop was fully serial by design; the kernel hard-rejected the `fcntl(O_NONBLOCK)` a
+  cooperative multiplexer needs on rump sockets; and a blocking `sleep_ms` inside an
+  `async fn` loop (no `.await` on it) never actually yielded, so the first idle session
+  monopolized `sshd`'s one thread until it exited. See `docs/OPTIONAL_SMOLTCP.md`'s
+  Concurrent SSH section for all three. Still open: the single box-0 rump proxy serializes
+  socket syscalls, which may head-of-line block truly-simultaneous sessions under load — not
+  yet re-measured.
