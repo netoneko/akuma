@@ -81,6 +81,12 @@ struct SshSession {
     channel_open: bool,
     client_channel: u32,
     config: SshdConfig,
+    /// PTY dimensions from the client's `pty-req` (columns / rows). Applied to
+    /// the spawned login shell via `TIOCSWINSZ` after `spawn_pty` — without
+    /// this, full-screen apps (vi, less) read 80x24 from `TIOCGWINSZ` and
+    /// ignore the real terminal size. Defaults to 80x24.
+    term_width: u32,
+    term_height: u32,
 }
 
 impl SshSession {
@@ -99,6 +105,8 @@ impl SshSession {
             channel_open: false,
             client_channel: 0,
             config,
+            term_width: 80,
+            term_height: 24,
         }
     }
 }
@@ -149,6 +157,12 @@ async fn run_shell_session(
     // refinement could gate this on a tracked `pty-req` flag so a
     // no-pty client gets a pipe.)
     if let Some(res) = spawn_pty(&shell_path, args) {
+        // Push the client's pty-req dimensions into the child's TerminalState
+        // so TIOCGWINSZ (vi, less, `stty size`) sees the real size, not 80x24.
+        // Must happen before the first full-screen redraw. The child got a
+        // fresh TerminalState from the pty spawn, so its fd (ChildStdout) is
+        // the handle the kernel resolves to that state.
+        set_terminal_size(res.stdout_fd as i32, session.term_width as u16, session.term_height as u16);
         return bridge_process(stream, session, res.pid, res.stdout_fd).await;
     }
     fail_spawn(stream, session, &shell_path, "shell").await
@@ -272,6 +286,22 @@ async fn bridge_process(
                     // above fails and the `?` unwinds the loop.
                     close_child_stdin(pid);
                     client_done = true;
+                } else if msg_type == SSH_MSG_CHANNEL_REQUEST {
+                    // A live resize: forward new columns/rows to the child so
+                    // full-screen apps (vi, less) reflow. Format after the
+                    // recipient channel: string req_type, boolean want_reply,
+                    // u32 width, u32 height, u32 pixel_w, u32 pixel_h.
+                    let mut offset = 0;
+                    let _recipient = read_u32(&payload, &mut offset);
+                    if read_string(&payload, &mut offset) == Some(b"window-change") {
+                        let _want_reply = payload.get(offset).copied().unwrap_or(0);
+                        offset += 1;
+                        if let (Some(w), Some(h)) = (read_u32(&payload, &mut offset), read_u32(&payload, &mut offset)) {
+                            session.term_width = w;
+                            session.term_height = h;
+                            set_terminal_size(stdout_fd as i32, w as u16, h as u16);
+                        }
+                    }
                 }
             }
         }
@@ -370,6 +400,18 @@ async fn handle_message(
                 let mut cmd_offset = offset + 1;
                 if let Some(command) = read_string(payload, &mut cmd_offset) {
                     return Ok(MessageResult::StartExec(command.to_vec()));
+                }
+            }
+            if req_type == b"pty-req" {
+                // Format after want_reply: string TERM, u32 width, u32 height,
+                // u32 pixel_width, u32 pixel_height, string modes. Stash the
+                // dimensions; run_shell_session applies them to the spawned
+                // shell via TIOCSWINSZ once it has the child fd.
+                let mut off = offset + 1; // skip want_reply
+                let _term = read_string(payload, &mut off);
+                if let (Some(w), Some(h)) = (read_u32(payload, &mut off), read_u32(payload, &mut off)) {
+                    session.term_width = w;
+                    session.term_height = h;
                 }
             }
         }

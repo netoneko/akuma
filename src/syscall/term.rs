@@ -9,6 +9,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const TCSETSW: u32 = 0x5403;
     const TCSETSF: u32 = 0x5404;
     const TIOCGWINSZ: u32 = 0x5413;
+    const TIOCSWINSZ: u32 = 0x5414;
     const TIOCGPGRP: u32 = 0x540f;
     const TIOCSPGRP: u32 = 0x5410;
     const FIONBIO: u32 = 0x5421;
@@ -83,6 +84,42 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         FIONCLEX => {
             proc.clear_cloexec(fd);
             return 0;
+        }
+        TIOCSWINSZ => {
+            // Set terminal window size (ws_row, ws_col). Unlike the TIOCGWINSZ
+            // path below (which is gated to fd 0-2 and reads the CALLER's own
+            // state), TIOCSWINSZ must also work on a `ChildStdout(child_pid)`
+            // fd: userspace sshd holds the login shell it spawned under such an
+            // fd, and a `pty` spawn gives that child a FRESH TerminalState
+            // (spawn.rs — it deliberately does NOT inherit sshd's, so concurrent
+            // sessions don't share one input_waker slot). So sshd cannot update
+            // its own state; it must target the CHILD's. That child's state is
+            // an Arc shared with all its descendants (shell → vi), so the update
+            // reaches any full-screen app under the session via TIOCGWINSZ.
+            if !validate_user_ptr(arg, 8) { return EFAULT; }
+            let mut winsz = [0u16; 4];
+            if unsafe { copy_from_user_safe(winsz.as_mut_ptr().cast::<u8>(), arg as *const u8, 8).is_err() } {
+                return EFAULT;
+            }
+            let height = winsz[0];
+            let width = winsz[1];
+            let child_pid = match proc.get_fd(fd) {
+                Some(akuma_exec::process::FileDescriptor::ChildStdout(pid)) => Some(pid),
+                _ => None,
+            };
+            let ts = match child_pid {
+                Some(pid) => akuma_exec::process::lookup_process(pid).map(|p| p.terminal_state.clone()),
+                None => akuma_exec::process::current_terminal_state(),
+            };
+            match ts {
+                Some(state) => {
+                    let mut s = state.lock();
+                    s.term_width = width;
+                    s.term_height = height;
+                    return 0;
+                }
+                None => return (-(12i64)) as u64, // ENXIO — no terminal attached
+            }
         }
         SNDCTL_DSP_SPEED | SNDCTL_DSP_SETFMT | SNDCTL_DSP_CHANNELS => {
             // OSS audio params on /dev/dsp. arg is *mut i32 (in/out): the desired

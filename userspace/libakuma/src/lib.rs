@@ -1024,6 +1024,25 @@ pub fn set_nonblocking(fd: i32, nonblocking: bool) -> i32 {
     syscall(syscall::FCNTL, fd as u64, F_SETFL, arg, 0, 0, 0) as i32
 }
 
+/// Set a PTY's terminal window size via `ioctl(TIOCSWINSZ)`.
+///
+/// The kernel routes this to the child's shared `TerminalState` when `fd` is a
+/// `ChildStdout(pid)` (the handle a spawner like sshd holds for a spawned login
+/// shell); for fd 0-2 it updates the caller's own state. `width`/`height` are in
+/// columns/rows. Returns 0 on success, negative errno otherwise.
+pub fn set_terminal_size(fd: i32, width: u16, height: u16) -> i32 {
+    const TIOCSWINSZ: u64 = 0x5414;
+    // struct winsize { u16 ws_row, ws_col, ws_xpixel, ws_ypixel }
+    let winsz: [u16; 4] = [height, width, 0, 0];
+    syscall(
+        syscall::IOCTL,
+        fd as u64,
+        TIOCSWINSZ,
+        winsz.as_ptr() as u64,
+        0, 0, 0,
+    ) as i32
+}
+
 /// Deliver EOF to a spawned child's stdin (`CLOSE_CHILD_STDIN`). A shell reading
 /// a piped script (busybox `sh`) blocks for more input until it sees EOF; the
 /// SSH-into-box bridge calls this on the client's CHANNEL_EOF so the shell
