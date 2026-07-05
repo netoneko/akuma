@@ -120,6 +120,22 @@ impl<N: RawNic> TapNic<N> {
         }
     }
 
+    /// Non-consuming readiness check: is there a frame waiting to be read?
+    ///
+    /// Posts a receive buffer if none is outstanding (same as `read_frame`'s
+    /// phase 1 — idempotent, no data movement) then queries the device without
+    /// completing the receive, so a subsequent `read_frame` still sees — and
+    /// consumes — the same pending frame. For `poll`/`ppoll` readiness, which
+    /// must not consume the data it reports on.
+    pub fn has_frame(&mut self) -> bool {
+        if self.rx_token.is_none()
+            && let Ok(token) = self.nic.receive_begin(&mut self.rx_buffer[..])
+        {
+            self.rx_token = Some(token);
+        }
+        self.rx_token.is_some() && self.nic.poll_receive()
+    }
+
     /// Transmit one bare L2 frame. Returns the bytes accepted (`frame.len()`).
     pub fn write_frame(&mut self, frame: &[u8]) -> Result<usize, NicError> {
         self.nic.send(frame)?;

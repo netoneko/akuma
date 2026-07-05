@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,7 +62,7 @@ extern int rumpuser_thread_join(void *cookie);
  * read (the RX is its own host thread; no change to the shipped M2 path).
  */
 extern int rumpuser_akuma_cooperative(void);
-extern void rumpuser_akuma_yield(void);
+extern int rumpuser_akuma_wait_fd(int fd, int events, int timeout_ms);
 
 static volatile unsigned long g_tx_pkts, g_tx_bytes, g_rx_pkts, g_rx_bytes;
 static int g_trace = -1;
@@ -119,14 +120,16 @@ rcvthread(void *aaargh)
 
 	/* pthread backend: the tap fd is BLOCKING; read() parks THIS host thread until
 	 * a frame arrives (no rump CPU held, so other rump threads keep running).
-	 * fiber backend: the fd is non-blocking; on EAGAIN we cooperatively yield so
-	 * the rest of the rump kernel (and the DHCP path) runs on the one OS thread. */
+	 * fiber backend: the fd is non-blocking; on EAGAIN we block the fiber on the
+	 * tap fd via rumpuser_akuma_wait_fd() until it's actually readable (or a
+	 * bounded timeout, as a backstop), instead of a blind 1ms yield + busy
+	 * re-poll — the latter drove read() ~1000x/sec even with zero traffic. */
 	int coop = rumpuser_akuma_cooperative();
 	while (!viu->viu_dying) {
 		nn = read(viu->viu_fd, viu->viu_rcvbuf, sizeof(viu->viu_rcvbuf));
 		if (nn < 1) {
 			if (coop)
-				rumpuser_akuma_yield();
+				rumpuser_akuma_wait_fd(viu->viu_fd, POLLIN, 1000);
 			continue;
 		}
 		iov.iov_base = viu->viu_rcvbuf;

@@ -46,11 +46,12 @@ extern "C" {
     // serve sysproxy on a pre-connected fd (kernel-pipe transport); from sp_serve_fd.c.
     fn rumpuser_sp_init_fd(fd: c_int, host: *const c_char, vers: *const c_char, arch: *const c_char) -> c_int;
     // rumpuser backend introspection (defined in this crate): 1 if rump kthreads
-    // are cooperative fibers on one OS thread (else 0 = pthread). _yield runs the
-    // fiber scheduler. Declared extern so we resolve the symbol regardless of which
-    // backend module (fiber.rs / lib.rs) defines it under the active cfg.
+    // are cooperative fibers on one OS thread (else 0 = pthread). _wait_fd parks
+    // this fiber (fd=-1 => timeout only) and runs the fiber scheduler meanwhile.
+    // Declared extern so we resolve the symbol regardless of which backend module
+    // (fiber.rs / lib.rs) defines it under the active cfg.
     fn rumpuser_akuma_cooperative() -> c_int;
-    fn rumpuser_akuma_yield();
+    fn rumpuser_akuma_wait_fd(fd: c_int, events: c_int, timeout_ms: c_int) -> c_int;
 }
 
 // open(2) flags / setvbuf mode (Linux/musl aarch64; asm-generic).
@@ -186,11 +187,19 @@ pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int 
     //
     // Under the FIBER (cooperative) backend the sp server's receiver and its
     // per-request workers are FIBERS on this one OS thread. The main thread is
-    // itself the initial fiber, so it MUST cooperatively yield to let them run. A
-    // real sleep()/nanosleep() here is an Akuma kernel syscall that blocks the
-    // single OS thread (it is NOT the cooperative rumpuser_clock_sleep hypercall),
-    // starving every fiber — the receiver never sends its banner and the client
-    // handshake times out (the EIO we hit). So spin on the fiber yield.
+    // itself the initial fiber, so it MUST periodically call into the fiber
+    // scheduler (via a park) to let them run. A real sleep()/nanosleep() here is
+    // an Akuma kernel syscall that blocks the single OS thread (it is NOT the
+    // cooperative rumpuser_clock_sleep hypercall), starving every fiber — the
+    // receiver never sends its banner and the client handshake times out (the
+    // EIO we hit). So we park via the fiber scheduler instead — but with a long
+    // timeout: schedule()'s idle wait is capped by the SOONEST wakeup_time among
+    // *all* fibers (see fiber.rs:schedule()), so re-arming this one every 1ms
+    // (the old `rumpuser_akuma_yield()`) forced the whole scheduler to re-scan
+    // and re-poll every millisecond forever, even completely idle — pegging the
+    // host vCPU. Any fiber that actually becomes runnable (timer, fd-ready via
+    // rumpuser_akuma_wait_fd) still preempts this immediately regardless of how
+    // long the main fiber's own park is, so a long park costs nothing.
     //
     // Under the PTHREAD backend the receiver runs on its own OS thread, so the
     // main thread can just block-sleep (cheaper than a busy-yield).
@@ -198,7 +207,7 @@ pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int 
     // which returns immediately (sys_ppoll: nfds==0 -> 0), a CPU-pegging busy-loop.
     if rumpuser_akuma_cooperative() != 0 {
         loop {
-            rumpuser_akuma_yield();
+            rumpuser_akuma_wait_fd(-1, 0, 60_000);
         }
     } else {
         loop {

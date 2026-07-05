@@ -441,6 +441,22 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
                 ready |= EPOLLOUT;
             }
         }
+        #[cfg(feature = "rump")]
+        akuma_exec::process::FileDescriptor::Tap { .. } => {
+            // Was falling through to the `_` catch-all below, which reports
+            // EPOLLIN/EPOLLOUT unconditionally regardless of actual readiness —
+            // fine for fd types that don't reach poll(), but /dev/net/tap0 does
+            // (rumpcomp_tap.c's RX fiber calls rumpuser_akuma_wait_fd on it), so
+            // that default turned every "wait for a packet" into an instant,
+            // always-ready return: a busy-spin hidden behind a blocking-looking
+            // poll() call.
+            if requested & EPOLLIN != 0 && akuma_net::rump_tap::has_frame() {
+                ready |= EPOLLIN;
+            }
+            if requested & EPOLLOUT != 0 {
+                ready |= EPOLLOUT;
+            }
+        }
         _ => {
             if requested & EPOLLIN != 0 { ready |= EPOLLIN; }
             if requested & EPOLLOUT != 0 { ready |= EPOLLOUT; }
