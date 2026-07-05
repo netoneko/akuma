@@ -3,9 +3,12 @@ current_model=glm-5.2
 
 # z.ai (Zhipu) OpenAI-compatible endpoint serving GLM-5.2. meow appends
 # /v1/chat/completions to base_url and sends `Authorization: Bearer <api_key>`.
+# Use the GLM Coding Plan endpoint (subscription-based, what coding-agent keys are
+# provisioned for) — NOT /api/paas/v4, which is the pay-per-token API and will
+# 429 with "insufficient balance" for a coding-plan key.
 # The api_key is a PLACEHOLDER — fill it in after you SSH in (see /root/DEVBOX.txt):
 #   vi /etc/meow/config    # set api_key=YOUR_ZAI_KEY   (uncomment the line below)
 [provider:zai]
-base_url=https://api.z.ai/api/paas/v4
+base_url=https://api.z.ai/api/coding/paas/v4
 type=openai
 #api_key=YOUR_ZAI_KEY_HERE
