@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build a MINIMAL Akuma devbox image: enough to SSH in over the rump network stack,
-# nothing more (the toolchains / neatvi / rump-routed meow / repo clone are layered
+# nothing more (the toolchains / rump-routed meow / repo clone are layered
 # back on later — "start with ssh via rumpnet only, then add the rest").
 #
 # Design for this step:
@@ -74,6 +74,10 @@ docker run --rm --privileged \
         cp -rv /bootstrap/bin /mnt/disk/
         cp -rv /bootstrap/usr /mnt/disk/
 
+        # Drop the neatvi /bin/vi that came in with bootstrap/bin — busybox vi
+        # (laid down as an applet symlink in step 4) is the devbox editor.
+        rm -f /mnt/disk/bin/vi
+
         # git -> scratch for now; step 6 repoints /bin/git at the real
         # apk-installed binary. A handful of busybox symlinks so the image can
         # exec at all before step 4s full applet set is laid down.
@@ -137,10 +141,10 @@ docker run --rm --privileged \
                     tee od hexdump xxd cmp diff patch strings split \
                     which whereis mktemp getopt \
                     wget nc telnet ping traceroute nslookup ifconfig route netstat \
-                    ash hush"
+                    ash hush vi"
             fi
             for app in $APPLETS; do
-                # Never clobber a real (non-symlink) binary we ship (git, vi->neatvi,
+                # Never clobber a real (non-symlink) binary we ship (git,
                 # tcc, meow, curl, scratch, ...).
                 if [ -e /mnt/disk/bin/$app ] && [ ! -L /mnt/disk/bin/$app ]; then
                     continue
