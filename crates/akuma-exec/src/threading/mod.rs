@@ -1078,6 +1078,14 @@ pub fn is_preemption_disabled() -> bool {
     PREEMPTION_DISABLED[tid].load(Ordering::SeqCst) > 0
 }
 
+/// Read the per-thread preemption-disable nesting count for `tid`.
+/// Used by diagnostics (e.g. the timer-tick log) to detect a leaked
+/// `disable_preemption()` that starves the scheduler.
+#[inline]
+pub fn preemption_disabled_count(tid: usize) -> usize {
+    PREEMPTION_DISABLED[tid].load(Ordering::SeqCst)
+}
+
 /// Check if preemption has been disabled for too long (watchdog).
 /// Called from timer interrupt handler.
 /// Returns:
@@ -2246,7 +2254,25 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     // Get scheduling decision
     let switch_info = {
         if debug { (runtime().print_str)("[SGI-DBG] acquiring POOL\n"); }
-        let mut pool = POOL.lock();
+        // Use try_lock instead of a blocking lock(): this handler runs from the
+        // timer-driven SGI in IRQ context (PSTATE.I masked). If the timer
+        // interrupted the current thread while it already held POOL (e.g.
+        // mid-syscall or mid-fault), a blocking lock() would spin forever with
+        // IRQs masked — freezing the entire box (timer stops firing, no further
+        // IRQs land). Skipping one best-effort preemption tick is harmless: the
+        // next tick retries. See docs/RUST_TOOLCHAIN_ISSUES.md §3.
+        let mut pool = match POOL.try_lock() {
+            Some(guard) => guard,
+            None => {
+                static SGI_POOL_SKIP: AtomicU64 = AtomicU64::new(0);
+                let n = SGI_POOL_SKIP.fetch_add(1, Ordering::Relaxed);
+                if n.is_multiple_of(1000) {
+                    let tid = current_thread_id();
+                    safe_print!(96, "[SGI] POOL contended, skipped {} ticks (tid={})\n", n, tid);
+                }
+                return 0;
+            }
+        };
         if debug { (runtime().print_str)("[SGI-DBG] got POOL\n"); }
         let result = pool.schedule_indices(voluntary).map(|(old_idx, new_idx)| {
             let new_tpidr = pool.slots[new_idx].exception_stack_top;

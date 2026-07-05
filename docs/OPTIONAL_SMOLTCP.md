@@ -158,6 +158,27 @@ working smoltcp build); both fixes live in our kernel dispatch:
 - ~~**Concurrent SSH sessions don't work**~~ — **FIXED**, see the Concurrent SSH section
   below (now retitled) and [`userspace/sshd/docs/FLOW.md`](../userspace/sshd/docs/FLOW.md)
   for the full before/after diagram.
+- **Rump stack is slow — needs investigation.** Network I/O over a rump box is dramatically
+  slower than the native smoltcp path. Observed 2026-07-05 in the devbox (box 0 on rump):
+  `git clone https://github.com/netoneko/teddy.git` (a tiny repo) took well over 2 minutes
+  and exceeded a 120 s client-side SSH timeout; `cargo fetch`/dependency pulls are similarly
+  sluggish. Not yet characterized — candidates: the per-syscall proxy round-trip (every
+  socket syscall crosses the kernel→`rump_server` fd-3 channel and back, serialized by the
+  single proxy), the virtio-net + DHCP path, rump's own TCP implementation, or the
+  `intercept_box_syscall` dispatch overhead. Worth measuring against the native smoltcp
+  stack on the same workload before assuming it's fundamental. Tracked in
+  `overlays/devbox/README.md`'s backlog too.
+- **Rump net thread (and sshd) starve under CPU-bound load — bump scheduling priority.**
+  Under a single-core guest running a heavy CPU-bound process (e.g. `rustc`/LLVM codegen,
+  pure compute with no syscalls for minutes at a stretch), SSH connections time out at the
+  banner exchange and the box looks unreachable even though QEMU stays pegged at ~100% CPU
+  and the guest is not crashed. Observed 2026-07-05 in the devbox during a `cargo build` of
+  `teddy`: every SSH attempt failed with `Connection timed out during banner exchange` for
+  ~10+ minutes of solid rustc codegen. Root cause is the scheduler giving the CPU-bound
+  process equal standing with the rump network thread and sshd, so on a single core the
+  latency-sensitive net/SSH path can't get a timeslice in time. Likely fix: raise the
+  scheduling weight/priority of the rump proxy thread (and/or sshd) so the network stays
+  responsive under load. Tracked in `overlays/devbox/README.md`'s backlog too.
 
 ## Concurrency: `curl https://host` — FIXED (clone child got a bogus TTBR0)
 

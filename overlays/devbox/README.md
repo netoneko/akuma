@@ -282,6 +282,26 @@ Papercuts surfaced by dogfooding, to fix later:
   cooperative multiplexer needs on rump sockets; and a blocking `sleep_ms` inside an
   `async fn` loop (no `.await` on it) never actually yielded, so the first idle session
   monopolized `sshd`'s one thread until it exited. See `docs/OPTIONAL_SMOLTCP.md`'s
-  Concurrent SSH section for all three. Still open: the single box-0 rump proxy serializes
+  Concurrent SSH section for all three.   Still open: the single box-0 rump proxy serializes
   socket syscalls, which may head-of-line block truly-simultaneous sessions under load — not
   yet re-measured.
+- **Rump stack is slow — needs investigation.** Network I/O over box 0's rump stack is
+  dramatically slower than the native smoltcp path. Observed 2026-07-05: `git clone
+  https://github.com/netoneko/teddy.git` (a tiny repo) took well over 2 minutes and exceeded
+  a 120 s client-side SSH timeout; `cargo fetch`/build dependency pulls are similarly
+  sluggish. Not yet characterized whether this is the per-syscall proxy round-trip cost (every
+  socket syscall crosses the kernel→`rump_server` fd-3 channel and back, serialized), the
+  virtio-net + DHCP path, rump's own TCP, or something else. Worth measuring against the
+  native smoltcp stack on the same workload before assuming it's fundamental. See
+  `docs/OPTIONAL_SMOLTCP.md`'s backlog for the same item.
+- **Rump net thread (and sshd) starve under CPU-bound load — bump scheduling priority.**
+  Under a single-core guest running a heavy CPU-bound process (e.g. `rustc`/LLVM codegen,
+  which is pure compute with no syscalls for minutes at a stretch), SSH connections time out
+  at the banner exchange and the box looks unreachable even though QEMU stays pegged at ~100%
+  CPU and the guest is not crashed. Observed 2026-07-05: during a `cargo build` of `teddy`,
+  every SSH attempt failed with `Connection timed out during banner exchange` for ~10+
+  minutes of solid rustc codegen. Root cause is the scheduler giving the CPU-bound process
+  equal standing with the rump network thread and sshd, so on a single core the
+  latency-sensitive net/SSH path can't get a timeslice in time. Likely fix: raise the
+  scheduling weight/priority of the rump proxy thread (and/or sshd) so the network stays
+  responsive under load. See `docs/OPTIONAL_SMOLTCP.md`'s backlog for the same item.
