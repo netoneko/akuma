@@ -359,7 +359,108 @@ thread as a poller for the pipe.
 
 ---
 
-## 10. Re-entrant signal delivery — `SIGPIPE` crash in Go
+## 10. devbox: `/dev/net/tap0` poll() always reports ready — disguised busy-spin
+
+**Status:** Fixed (2026-07-06) in `src/syscall/poll.rs`, `crates/akuma-rump/src/lib.rs`,
+`crates/akuma-net/src/rump_tap.rs`, `userspace/rumpkernel/rumpuser/rumpcomp_tap.c`,
+`userspace/rumpkernel/rumpuser/src/rump_server.rs`
+**Component:** rump sysproxy fiber backend (devbox / `rump-default` build)
+
+### Symptom
+
+An interactive `meow` session in the devbox build took 78 seconds to first token
+on a trivial prompt to an HTTPS LLM API (z.ai), and the host
+`qemu-system-aarch64` process sat at ~100% CPU on its single vCPU even with
+`meow` completely idle at its prompt — before, during, and after any request.
+
+### Root cause (two bugs, the second masked until the first was fixed)
+
+1. `rumpcomp_tap.c`'s RX fiber (`rcvthread`) busy-polled `/dev/net/tap0`: on
+   EAGAIN it did a blind 1ms cooperative yield then re-read, forever, whether or
+   not there was traffic — ~1000 real `read()` syscalls/sec at idle, permanently.
+2. Switching that to the proper `rumpuser_akuma_wait_fd(fd, POLLIN, timeout)`
+   primitive (already used elsewhere in this backend) didn't help, because
+   `epoll_check_fd_readiness` in `src/syscall/poll.rs` has no match arm for
+   `FileDescriptor::Tap` — it fell through to the wildcard default, which
+   reports **whatever readiness was requested, unconditionally**, regardless of
+   whether a frame was actually pending. Every "block until a packet arrives"
+   call returned instantly, so the RX fiber was re-woken **~435,000 times/sec**
+   — a busy-spin wearing a blocking-`poll()` costume. (This default arm is
+   correct for fd types that never reach `poll()`; the tap driver just never
+   used to be one of them.)
+3. Separately, `rump_server.rs`'s idle main loop parked via a 1ms self-rearming
+   `rumpuser_akuma_yield()`. The fiber scheduler's idle-sleep ceiling
+   (`fiber.rs::schedule()`) is capped by the *soonest* `wakeup_time` across
+   *every* fiber, so that lone 1ms self-rearm alone forced a full thread-list
+   scan + `nanosleep`/`poll` syscall every millisecond forever, independent of
+   anything else in the system.
+
+### Fix
+
+- `rumpcomp_tap.c`: RX fiber blocks on `rumpuser_akuma_wait_fd(viu->viu_fd,
+  POLLIN, 1000)` instead of yield-and-reread.
+- `rump_server.rs`: idle main loop parks 60s at a time
+  (`rumpuser_akuma_wait_fd(-1, 0, 60_000)`) instead of re-arming every 1ms.
+- `src/syscall/poll.rs`: added a real `FileDescriptor::Tap` arm to
+  `epoll_check_fd_readiness`, backed by a new non-consuming
+  `TapNic::has_frame()` (`crates/akuma-rump/src/lib.rs`, wrapped by
+  `akuma_net::rump_tap::has_frame()`) — posts the RX buffer if one isn't
+  already outstanding and queries actual device readiness without completing
+  the receive, so a following real `read_frame()` still sees the pending frame.
+
+### Verified
+
+Clean-boot, zero-interaction measurements via Akuma's own `top`
+(`get_cpu_stats`): `tap-rx` fiber wake count **~870,000/2s → ~1–2/2s**; total
+fiber-scheduler `schedule()` calls **~870,000/2s → ~11,000/2s**; `rump_server`'s
+own accumulated CPU time over comparable uptime **111,096ms → 2,731ms** (~40×).
+
+Full narrative: `userspace/rumpkernel/docs/FIBER_HANDOFF.md`, "RESOLVED
+(2026-07-06)".
+
+### Not fixed by this — see issue 12
+
+Host CPU is still ~100% on a fresh, untouched boot even with both fixes above.
+It's no longer `rump_server` burning it.
+
+---
+
+## 11. devbox: base kernel idle threads show tens of seconds of CPU time at idle
+
+**Status:** Open — under investigation
+**Component:** base kernel idle/timer/WFI path (`src/smp.rs` and/or
+`crates/akuma-exec/src/threading`), NOT rump/tap networking
+
+### Symptom
+
+Surfaced while verifying the fix for issue 11: after eliminating the rump
+tap-poll busy-spin, host `qemu-system-aarch64` CPU usage is still pinned at
+~100% on a freshly booted, completely untouched devbox VM (single vCPU). Akuma's
+own `top` (`get_cpu_stats`) attributes it to TID 0 (`kernel`) and TID 1 (`-`),
+not to any userspace process:
+
+```
+TID  PID  BOX ID    STATE       CPU%   TIME(ms)  NAME
+  0    0  host      READY      0.0%     37158  kernel
+  1    0  host      READY      0.0%     51667  -
+  8    1  host      READY      0.0%      2731  /bin/rump_server
+```
+
+37–51 *seconds* of accumulated `TIME(ms)` on the idle-looking threads against a
+much shorter uptime, while the reported `CPU%` column for the same rows reads
+`0.0%` — internally inconsistent, and possibly related to issue 2 above ("`top`
+reports impossible CPU percentages"), which is a different symptom (>100%/thread,
+sums >2000%) of what may be the same underlying CPU-time/idle-thread accounting
+bug. Not yet established whether the WFI idle loop's time is being
+mis-attributed as busy CPU time (a `top`/accounting bug, and the real host CPU
+cost is virtualization overhead from legitimate but frequent WFI wake cycles) or
+whether threads 0/1 are doing real unnecessary work at idle (a genuine
+busy-spin). Needs its own investigation, independent of the rump/tap/networking
+code paths that issue 11 was about.
+
+---
+
+## 12. Re-entrant signal delivery — `SIGPIPE` crash in Go
 
 **Status:** Fixed (2026-03-19) in `src/exceptions.rs` and `crates/akuma-exec/src/threading/mod.rs`
 **Component:** `take_pending_signal`, `rust_sync_el0_handler`
