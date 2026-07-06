@@ -1,18 +1,7 @@
 Third-party software bundled into the Akuma devbox image
 ========================================================
 
-neatvi (editor, shipped as /bin/vi)
------------------------------------
-  Upstream:  https://github.com/aligrudi/neatvi
-  Author:    Ali Gholami Rudi
-  Pinned:    e0fff2c05329caccfd22a99bde0f7e666a2334a4 (default when this was written;
-             overlays/devbox/bootstrap.sh clones --depth 1 and prints the exact commit
-             used for each build).
-  License:   See the LICENSE / COPYING notice in the upstream repository. neatvi is
-             distributed under permissive terms by its author; it is bundled here
-             unmodified and cross-compiled with aarch64-linux-musl-gcc.
-
-The devbox also stages the standard Akuma userspace (busybox, apk, tcc, scratch, meow,
+The devbox stages the standard Akuma userspace (busybox, apk, tcc, scratch, meow,
 etc.) whose provenance is tracked in the main repository and its submodules
 (.gitmodules). NetBSD-derived rump kernel sources carry their own attribution in
 userspace/rumpkernel and src-netbsd.
