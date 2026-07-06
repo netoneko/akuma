@@ -1106,17 +1106,17 @@ fn run_async_main_preemptive() -> ! {
 
                 threading::yield_now();
 
-                // Halt until the next interrupt (timer tick ~10 ms, or a device IRQ).
-                // Without this, the boot/idle thread is a pure `loop { yield_now() }`
-                // busy-spin: yield_now() only fires a self-SGI and returns immediately,
-                // so when no other thread is runnable this thread and the network poller
-                // ping-pong SGIs at microsecond granularity and pin the host vCPU at
-                // 100% even at idle. WFI wakes on any IRQ (the periodic timer guarantees
-                // a wake within one tick, so cleanup/heartbeat above still run). The
-                // secondary cores already WFI in their idle loops (smp.rs); this is the
-                // BSP equivalent. See docs/KNOWN_ISSUES.md issue #11.
-                #[cfg(target_os = "none")]
-                unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
+                // Genuinely halt until the next interrupt (timer tick ~10 ms, or a
+                // device IRQ). Without this the boot/idle thread is a pure
+                // `loop { yield_now() }` busy-spin: yield_now() only fires a self-SGI
+                // and returns immediately, so when no other thread is runnable this
+                // thread and the network poller ping-pong SGIs at microsecond
+                // granularity and pin the host vCPU at 100% even at idle. idle_halt
+                // (not raw wfi) also keeps CPU-time accounting honest so the halt
+                // isn't billed as busy time. The secondary cores already WFI in their
+                // idle loops (smp.rs); this is the BSP equivalent.
+                // See docs/KNOWN_ISSUES.md issue #11.
+                threading::idle_halt();
             }
 
             console::print("[AsyncMain] Preemtive main thread terminated\n");
@@ -1427,12 +1427,12 @@ fn run_async_main() -> ! {
         // above (the `poll()` block is #[cfg(feature = "smoltcp")]), so this
         // loop's only real work is the low-frequency herd-output / heartbeat
         // polls. Yielding alone makes it a busy-spin that pins the vCPU at 100%
-        // alongside the boot thread. Halt until the next interrupt (timer tick
-        // ~10 ms, or a device/rump-NIC IRQ); the periodic work above still runs
+        // alongside the boot thread. Genuinely halt until the next interrupt
+        // (timer ~10 ms, or a rump-NIC IRQ); the periodic work above still runs
         // at tick granularity. smoltcp builds keep the busy-poll below so their
         // burst-draining throughput is untouched. See docs/KNOWN_ISSUES.md #11.
-        #[cfg(all(target_os = "none", not(feature = "smoltcp")))]
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
+        #[cfg(not(feature = "smoltcp"))]
+        threading::idle_halt();
     }
 }
 

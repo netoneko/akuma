@@ -418,29 +418,31 @@ own accumulated CPU time over comparable uptime **111,096ms → 2,731ms** (~40×
 Full narrative: `userspace/rumpkernel/docs/FIBER_HANDOFF.md`, "RESOLVED
 (2026-07-06)".
 
-### Not fixed by this — see issue 12
+### Not fixed by this — see issue 11
 
 Host CPU is still ~100% on a fresh, untouched boot even with both fixes above.
-It's no longer `rump_server` burning it.
+It's no longer `rump_server` burning it. **Issue 11 is now also fixed
+(2026-07-07):** the residual 100% was two BSP idle loops busy-yielding with no
+halt plus residency-based CPU-time accounting that hid the fix — see issue 11.
 
 ---
 
 ## 11. devbox: base kernel idle threads show tens of seconds of CPU time at idle
 
-**Status:** Open — under investigation
-**Component:** base kernel idle/timer/WFI path (`src/smp.rs` and/or
-`crates/akuma-exec/src/threading`), NOT rump/tap networking
+**Status:** Fixed (2026-07-07) in `src/main.rs`, `crates/akuma-exec/src/threading/mod.rs`
+**Component:** BSP idle loops (`run_async_main_preemptive`, `run_async_main`) + per-thread CPU-time accounting
 
 ### Symptom
 
 Surfaced while verifying the fix for issue 11: after eliminating the rump
-tap-poll busy-spin, host `qemu-system-aarch64` CPU usage is still pinned at
+tap-poll busy-spin, host `qemu-system-aarch64` CPU usage was still pinned at
 ~100% on a freshly booted, completely untouched devbox VM (single vCPU). Akuma's
-own `top` (`get_cpu_stats`) attributes it to TID 0 (`kernel`) and TID 1 (`-`),
+own `top` (`get_cpu_stats`) attributed it to TID 0 (`kernel`) and TID 1 (`-`),
 not to any userspace process:
 
 ```
 TID  PID  BOX ID    STATE       CPU%   TIME(ms)  NAME
+-------------------------------------------------------
   0    0  host      READY      0.0%     37158  kernel
   1    0  host      READY      0.0%     51667  -
   8    1  host      READY      0.0%      2731  /bin/rump_server
@@ -457,6 +459,94 @@ cost is virtualization overhead from legitimate but frequent WFI wake cycles) or
 whether threads 0/1 are doing real unnecessary work at idle (a genuine
 busy-spin). Needs its own investigation, independent of the rump/tap/networking
 code paths that issue 11 was about.
+
+### Root cause — two bugs (a real spin AND an accounting lie that masked the fix)
+
+1. **The spin (the actual 100% host CPU):** the two BSP idle loops were
+   `loop { threading::yield_now() }` with no halt. `yield_now()` only sets a
+   voluntary-reschedule flag and fires a self-SGI — it *returns immediately*
+   and never stops the core. So when no other thread is runnable, the boot/idle
+   thread (TID 0, `run_async_main_preemptive`) and the network poller (TID 1,
+   `run_async_main`) ping-pong SGIs at microsecond granularity and pin the host
+   vCPU at 100% forever. In the devbox (`rump-default`, no `smoltcp`) TID 1's
+   loop has *nothing* to poll — the `akuma_net::smoltcp_net::poll()` block is
+   `#[cfg(feature = "smoltcp")]`, so TID 1 was a pure busy-spin. The secondary
+   cores (smp.rs) already `wfi` in their idle loops; the BSP loops were the
+   inconsistency. This is the same bug class as issue 10 (a busy-spin wearing a
+   cooperative-yield costume), just in the base kernel instead of the rump
+   backend.
+
+2. **The accounting lie (why `TIME(ms)` read 0.0% but tens of seconds):** the
+   scheduler bills a thread for its whole quantum *residency*
+   (`now - start_time_us` at switch-out in `schedule_indices`). A thread that
+   `wfi`s during its quantum is halted (not burning CPU) but still "current", so
+   its halt time is billed as busy CPU — inflating `TIME(ms)`/`CPU%` for idle
+   threads even while the host vCPU is ~idle. This is the same root cause as
+   issue 2 (impossible CPU percentages): residency ≠ CPU-busy time. Before this
+   fix the two bugs correlated (the threads really were spinning, so the huge
+   `TIME(ms)` looked plausible); once the spin was stopped they diverged —
+   `TIME(ms)` stayed at ~19 s while host CPU dropped to ~1% — which is what
+   finally nailed the accounting as a separate bug.
+
+### Fix
+
+- `crates/akuma-exec/src/threading/mod.rs`: new `idle_halt()` primitive — the
+  "there is genuinely nothing to do, so stop" counterpart to `yield_now()`. It
+  `wfi`s (halting the core until the next IRQ: the ~10 ms timer tick or a
+  device/rump-NIC IRQ), and keeps accounting honest by (a) disabling preemption
+  around the `wfi` so a preemptible idle thread is neither billed nor switched
+  out mid-halt, and (b) shifting the thread's quantum `start_time_us` forward by
+  exactly the halt duration, so the next switch-out bills only the genuinely
+  busy time. The voluntary `yield_now()` that follows it in the idle loop
+  bypasses the preemption check (`!voluntary && is_preemption_disabled()`), so a
+  thread readied by the halt's IRQ still reschedules immediately; the 100 ms
+  preemption-watchdog threshold tolerates the ≤1-tick (~10 ms) disabled window.
+- `src/main.rs`: both BSP idle loops now call `threading::idle_halt()` instead of
+  bare `yield_now()`. TID 0 (the boot/idle thread) halts unconditionally. TID 1
+  (the network poller) halts only in the rump-only/devbox build
+  (`#[cfg(not(feature = "smoltcp"))]`): the smoltcp build keeps its busy
+  burst-draining poll loop untouched, since its `poll()` actually has work to do
+  and incoming packets raise a virtio IRQ that would wake a `wfi` anyway —
+  adopting `idle_halt()` there too is a measured-safe follow-up, not this fix.
+
+### Verified
+
+Clean-boot, zero-interaction devbox (`RUMP_NIC=1`, MEMORY=4096, 20 s idle):
+
+| metric | before | after |
+| --- | --- | --- |
+| host `qemu-system-aarch64` CPU% | **99.6%** | **0.8%** |
+| TID 0 `TIME(ms)` | 9154–37158 | **15** |
+| TID 1 `TIME(ms)` | 12803–51667 | **20** |
+
+`top`'s `TIME(ms)` for the idle threads now tracks reality (≈0, matching the
+host CPU), so this also resolves the issue-2 "impossible CPU %" symptom *for the
+idle threads specifically* (other >100%/thread cases of issue 2 may have
+additional causes and are out of scope here). SSH (`box ps`, `uname`) works; no
+preemption-watchdog warnings in the log.
+
+### SSH "responds slowly initially" — connected, and now characterized
+
+Part of the reported symptom was the userspace `/bin/sshd` (the only sshd in the
+devbox) being slow to respond on the first connection. Two things were going on:
+
+1. **CPU starvation from this spin (fixed):** with TID 0/1 burning the whole
+   vCPU, sshd was starved. Stopping the spin gave sshd real CPU.
+2. **Rump-network cold start (residual, documented, separate):** a first SSH
+   connect still takes ~8 s; warm connects take ~1.4–2.2 s. The host key is
+   ed25519 (ms to generate), so that is *not* the cost. The one-time ~6.6 s
+   delta is the rump-networking first-packet warm-up (ARP/route/sysproxy cold
+   start), and the ~1.4–2.2 s warm cost is the rump-sysproxy per-connection
+   latency — both already documented in `userspace/rumpkernel/docs/FIBER_HANDOFF.md`
+   ("LATENCY — ROOT-CAUSED & FIXED" and the "Open / next" levers). Not a base-
+   kernel bug; not addressed by this fix.
+
+### Files
+
+- `crates/akuma-exec/src/threading/mod.rs` — `idle_halt()` (new), added next to
+  `yield_now()`.
+- `src/main.rs` — `run_async_main_preemptive` idle loop (TID 0) and
+  `run_async_main` poll loop (TID 1, devbox-gated) call `threading::idle_halt()`.
 
 ---
 

@@ -203,13 +203,23 @@ vCPU even with `meow` fully idle at its prompt. Two bugs, found and fixed in ord
 
 **Not fully resolved:** host CPU is *still* ~100% on a fresh, untouched boot even
 after both fixes above. Akuma's in-guest `top` now attributes it to the base
-kernel's own idle threads (TID 0 `kernel`, TID 1 `-`), not `rump_server` — tens of
-seconds of accumulated `TIME(ms)` against a fraction that of uptime. This is a
+kernel's own idle threads (TID 0 `kernel`, TID 1 `-`), not `rump_server` — tens
+of seconds of accumulated `TIME(ms)` against a fraction that of uptime. This is a
 **separate bug in a different subsystem** (base kernel idle/timer/WFI path, not
 rump/tap networking) and needs its own investigation; see `docs/KNOWN_ISSUES.md`
 issue tracking this (cross-referenced against issue #2, "`top` reports impossible
 CPU percentages", which may share a root cause in the same CPU-stat/idle-thread
 accounting).
+
+> **Update (2026-07-07) — RESOLVED.** This turned out to be two bugs, both in the
+> base kernel (not this crate): (1) the BSP idle loops (`src/main.rs`) were
+> `loop { yield_now() }` with no `wfi`, so TID 0 and TID 1 ping-pong'd SGIs at
+> full speed at idle; (2) the scheduler bills whole-quantum residency as CPU
+> time, so a halted idle thread's `TIME(ms)` read as tens of seconds even after
+> the spin was stopped. Fix: new `threading::idle_halt()` (WFI + preemption-guard
+> + start_time_us correction) in both BSP idle loops. Host `qemu-system-aarch64`
+> CPU **99.6% → 0.8%**; idle-thread `TIME(ms)` **~9–19 s → 15–20 ms**. Full
+> write-up in `docs/KNOWN_ISSUES.md` issue #11.
 
 ### Open / next (latency — further levers, NOT yet done)
 

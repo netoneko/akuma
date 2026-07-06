@@ -2235,6 +2235,61 @@ pub fn yield_now() {
     (runtime().trigger_sgi)(0);
 }
 
+/// Halt the calling (idle) thread until the next interrupt, AND keep CPU-time
+/// accounting honest while doing so.
+///
+/// The scheduler bills a thread for its entire quantum residency
+/// (`now - start_time_us` at switch-out in [`ThreadPool::schedule_indices`]).
+/// A raw `wfi` in an idle loop would therefore be billed as busy CPU — inflating
+/// `TIME(ms)`/`CPU%` for the idle threads even though the core is halted (the
+/// issue-#11/#2 accounting symptom: `top` shows tens of seconds of `TIME(ms)`
+/// on threads 0/1 while the host vCPU sits at ~1%). Here we record the entry
+/// instant, WFI, then shift this thread's quantum `start_time_us` forward by
+/// exactly the halt duration — so the next switch-out bills only the genuinely
+/// busy time before/after the halt, never the halt itself.
+///
+/// IRQs MUST be enabled on entry: WFI halts until a pending IRQ (the periodic
+/// timer tick ~10 ms, or a device/rump-NIC IRQ) and that IRQ's handler must run
+/// before WFI returns; we mask only briefly around the post-halt bookkeeping to
+/// stop a racing timer tick from billing the halt. [`yield_now`] is still the
+/// cooperative give-up-the-CPU primitive; this is the complementary "there is
+/// nothing to do, so genuinely stop" primitive for idle loops.
+#[cfg(target_os = "none")]
+pub fn idle_halt() {
+    let tid = current_thread_id();
+    // Disable preemption for the duration of the halt. Without this, a
+    // preemptible idle thread (e.g. the network poller) would be billed and
+    // switched out by the timer tick *mid-WFI* — the residency including the
+    // halt lands in its CPU-time bucket before we can correct it, and the
+    // correction (start_time_us bump below) is discarded at the next switch-in.
+    // With preemption disabled the timer's involuntary schedule_indices returns
+    // None early (`!voluntary && is_preemption_disabled()`), so the halt is
+    // neither billed nor switched. WFI still wakes on the very same timer IRQ
+    // (and on device IRQs), and the voluntary yield_now() that follows this in
+    // the idle loop bypasses the preemption check, so readying a thread still
+    // reschedules immediately. The watchdog (100 ms WARN) tolerates a ≤1-tick
+    // (~10 ms) disabled window.
+    disable_preemption();
+    let entered = (runtime().uptime_us)();
+    // SAFETY: WFI halts the PE until a pending IRQ. IRQs are enabled on entry, so
+    // the interrupt (timer tick / device) is taken and serviced before WFI returns.
+    unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+    let halted = (runtime().uptime_us)().saturating_sub(entered);
+    if tid < MAX_THREADS && halted > 0 {
+        let _guard = IrqGuard::new();
+        if let Some(mut pool) = POOL.try_lock() {
+            // Shift the quantum start forward by the halt duration so the next
+            // switch-out's `now - start_time_us` excludes the time we spent halted.
+            pool.slots[tid].start_time_us =
+                pool.slots[tid].start_time_us.saturating_add(halted);
+        }
+    }
+    enable_preemption();
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn idle_halt() {}
+
 /// SIMPLIFIED SGI handler for stack-based context switching
 /// 
 /// Takes current SP from assembly, returns new SP if switch needed (or 0).
