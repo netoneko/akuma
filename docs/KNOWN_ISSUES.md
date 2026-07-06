@@ -501,6 +501,17 @@ code paths that issue 11 was about.
   bypasses the preemption check (`!voluntary && is_preemption_disabled()`), so a
   thread readied by the halt's IRQ still reschedules immediately; the 100 ms
   preemption-watchdog threshold tolerates the ≤1-tick (~10 ms) disabled window.
+- `crates/akuma-exec/src/threading/mod.rs`: **also** moved the WAITING-thread
+  wake-pass to the *top* of `schedule_indices`, before the preemption-disabled
+  early-return. That return previously skipped the wake-pass, which was a latent
+  bug (a preempt-disabled section crossing a tick would delay wakeups) that
+  `idle_halt`'s preempt-guarded WFI made permanent — every idle-thread tick
+  skipped the wake-pass, so `nanosleep`/`schedule_blocking`/condvar-timeout
+  wakeups were delayed by 1–5 ticks. With the wake-pass first, preemption-disabled
+  only suppresses the context *switch*, never the wake bookkeeping; the readied
+  thread runs on the idle thread's immediate post-`wfi` voluntary yield. This
+  dropped a 9×1 s `hello` run from +468 ms (~52 ms/sleep) to +104 ms (~11 ms/sleep
+  — the ~1-tick floor of a 10 ms deadline-checked-on-tick timer).
 - `src/main.rs`: both BSP idle loops now call `threading::idle_halt()` instead of
   bare `yield_now()`. TID 0 (the boot/idle thread) halts unconditionally. TID 1
   (the network poller) halts only in the rump-only/devbox build
@@ -532,14 +543,18 @@ devbox) being slow to respond on the first connection. Two things were going on:
 
 1. **CPU starvation from this spin (fixed):** with TID 0/1 burning the whole
    vCPU, sshd was starved. Stopping the spin gave sshd real CPU.
-2. **Rump-network cold start (residual, documented, separate):** a first SSH
-   connect still takes ~8 s; warm connects take ~1.4–2.2 s. The host key is
-   ed25519 (ms to generate), so that is *not* the cost. The one-time ~6.6 s
-   delta is the rump-networking first-packet warm-up (ARP/route/sysproxy cold
-   start), and the ~1.4–2.2 s warm cost is the rump-sysproxy per-connection
-   latency — both already documented in `userspace/rumpkernel/docs/FIBER_HANDOFF.md`
-   ("LATENCY — ROOT-CAUSED & FIXED" and the "Open / next" levers). Not a base-
-   kernel bug; not addressed by this fix.
+2. **Rump-network per-connection cost (residual, documented, separate):** after
+   the spin fix, a trivial command (`uname`) still takes **~3.4 s wall** over a
+   fresh SSH connection, and `hello` (zero sleeps, internal `uptime=0ms`) takes
+   ~4.0 s. The `now`/`uptime` syscall is NOT blocking (it reads the `CNTVCT`
+   counter — `time.rs:116`), and the write path costs ~0 internally, so the gap
+   is *outside* the program: it is the SSH handshake (TCP + key exchange + auth
+   + exec, ~5 round-trips) running over the rump sysproxy, where each round-trip
+   pays the MSG_PEEK-poll + 10 ms re-poll-floor cost. This is exactly the
+   rump-sysproxy latency documented in `FIBER_HANDOFF.md` ("LATENCY —
+   ROOT-CAUSED & FIXED" + "Open / next" levers); the lever that would fix it is
+   a real readiness waker on rump sockets. Not a base-kernel bug; not addressed
+   by this fix.
 
 ### Files
 

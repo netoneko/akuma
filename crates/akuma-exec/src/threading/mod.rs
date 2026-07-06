@@ -1876,7 +1876,39 @@ impl ThreadPool {
         let current_idx = get_current_thread_register();
         let current = &self.slots[current_idx];
 
+        // Wake-pass: mark READY any WAITING thread whose wake deadline has passed.
+        // This MUST run on every scheduler entry — including involuntary
+        // (timer-tick) entries where the current thread has preemption disabled
+        // (e.g. an idle thread halted in `idle_halt`'s WFI). The preemption check
+        // below only suppresses the context SWITCH; if it also suppressed the
+        // wake-pass, every sleeping thread's wakeup (nanosleep, schedule_blocking,
+        // condvar/futex timeouts) would be delayed by however long the idle thread
+        // stays preempt-disabled, inflating sleep latency by whole ticks. The
+        // wake-pass only flips state + SEVs; it never switches context, so running
+        // it with preemption disabled is safe. (Reordering it to the top is also
+        // what makes `idle_halt`'s preempt-guarded WFI cheap for accounting
+        // without costing wakeup latency.)
+        let now = (runtime().uptime_us)();
+        let mut woke_any = false;
+        for i in 0..MAX_THREADS {
+            if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::WAITING {
+                let wake_time = WAKE_TIMES[i].load(Ordering::SeqCst);
+                if wake_time > 0 && now >= wake_time {
+                    // Wake this thread - mark as READY and clear wake time
+                    WAKE_TIMES[i].store(0, Ordering::SeqCst);
+                    THREAD_STATES[i].store(thread_state::READY, Ordering::SeqCst);
+                    woke_any = true;
+                }
+            }
+        }
+        // Send event to wake any threads in WFI
+        if woke_any {
+            #[cfg(target_os = "none")]
+            unsafe { core::arch::asm!("sev"); }
+        }
+
         // For timer-triggered preemption, first check if preemption is explicitly disabled.
+        // (Only gates the context switch — the wake-pass above already ran.)
         if !voluntary && is_preemption_disabled() {
             return None;
         }
@@ -1887,7 +1919,6 @@ impl ThreadPool {
         if !voluntary && current.cooperative && current_state == thread_state::RUNNING {
             let timeout = current.timeout_us;
             if timeout > 0 && current.start_time_us > 0 {
-                let now = (runtime().uptime_us)();
                 let elapsed = now.saturating_sub(current.start_time_us);
                 if elapsed < timeout {
                     return None;
@@ -1910,7 +1941,6 @@ impl ThreadPool {
                         THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
                     }
                     THREAD_STATES[net_tid].store(thread_state::RUNNING, Ordering::SeqCst);
-                    let now = (runtime().uptime_us)();
                     self.slots[net_tid].start_time_us = now;
                     set_current_thread_register(net_tid);
                     self.current_idx = net_tid;
@@ -1920,25 +1950,6 @@ impl ThreadPool {
         }
         // If current thread is the network thread, or counter hasn't reached ratio, use round-robin below
 
-        // First pass: Wake any WAITING threads whose wake time has passed
-        let now = (runtime().uptime_us)();
-        let mut woke_any = false;
-        for i in 0..MAX_THREADS {
-            if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::WAITING {
-                let wake_time = WAKE_TIMES[i].load(Ordering::SeqCst);
-                if wake_time > 0 && now >= wake_time {
-                    // Wake this thread - mark as READY and clear wake time
-                    WAKE_TIMES[i].store(0, Ordering::SeqCst);
-                    THREAD_STATES[i].store(thread_state::READY, Ordering::SeqCst);
-                    woke_any = true;
-                }
-            }
-        }
-        // Send event to wake any threads in WFI
-        if woke_any {
-            #[cfg(target_os = "none")]
-            unsafe { core::arch::asm!("sev"); }
-        }
 
         // Wakeup locality: if a thread was just woken by an explicit signal
         // (futex/cond), prefer running it NEXT (once) so a producer→consumer
@@ -1989,7 +2000,6 @@ impl ThreadPool {
         // Don't change state if thread is TERMINATED or WAITING
         // WAITING threads keep their state - scheduler handles wake time
         let current_state = THREAD_STATES[current_idx].load(Ordering::SeqCst);
-        let now = (runtime().uptime_us)();
 
         // Accumulate CPU time for the thread being scheduled out
         if current.start_time_us > 0 {

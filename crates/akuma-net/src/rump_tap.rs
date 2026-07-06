@@ -113,12 +113,14 @@ pub fn read_frame(buf: &mut [u8]) -> Option<usize> {
     guard.as_mut()?.read_frame(buf)
 }
 
-/// Non-consuming check: is a frame waiting? For `poll`/`ppoll` readiness on
-/// `/dev/net/tap0` — does not take the frame, so a following `read_frame` still
-/// sees it. `false` (not just "no data") if the tap was never bound.
+/// Non-consuming readiness check for `poll`/`ppoll` on `/dev/net/tap0`.
+///
+/// Reports whether a frame is waiting without taking it, so a following
+/// `read_frame` still sees the same pending frame. Returns `false` (not just
+/// "no data") if the tap was never bound.
 pub fn has_frame() -> bool {
     let mut guard = TAP.lock();
-    guard.as_mut().is_some_and(|tap| tap.has_frame())
+    guard.as_mut().is_some_and(akuma_rump::TapNic::has_frame)
 }
 
 /// Blocking variant of [`read_frame`]: wait until a frame is available, then return it.
