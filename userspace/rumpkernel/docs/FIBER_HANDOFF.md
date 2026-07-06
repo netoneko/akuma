@@ -28,8 +28,9 @@ the operational "where we are / what's next / how to run it".
   Verified **perf-neutral**: curl over the Rust-`main` rump_server = **HTTP 200 in
   16.3s** (identical to the C wrapper), `ps` = **1 OS thread**, Rust fiber test PASS.
 - **NEXT:** see "Open / next (latency — further levers)" below — rump-socket
-  readiness waker (kill MSG_PEEK poll round-trips on bulk downloads), tap-fd poll
-  support, adaptive data-path transport timeout; Phase 5 herd/box `--net` auto-spawn.
+  readiness waker (kill MSG_PEEK poll round-trips on bulk downloads), adaptive
+  data-path transport timeout; Phase 5 herd/box `--net` auto-spawn. Tap-fd poll
+  support (previously listed here) is **DONE** — see "RESOLVED (2026-07-06)" below.
 
 ## What's DONE and verified
 
@@ -161,6 +162,55 @@ write registers a waker (`sys_ppoll`), so it wakes immediately instead of busy
 re-polling (removes idle CPU spin; channel hop is now event-driven). Receiver swap
 is one line in `sp_serve_fd.c` (`yield` → `wait_fd`). Fiber unit test still PASS.
 
+### RESOLVED (2026-07-06): tap-fd poll support, and a second busy-floor it uncovered
+
+User report: an interactive `meow` session in the devbox (rump-default) build was
+"crazy slow" talking to an HTTPS LLM API (z.ai) — 78s to first token on a trivial
+prompt — and the host `qemu-system-aarch64` process sat at ~100% CPU on the single
+vCPU even with `meow` fully idle at its prompt. Two bugs, found and fixed in order:
+
+1. **Tap RX was a blind 1ms-yield-and-reread**, exactly the "still busy-poll" item
+   this section used to list as open (`rumpcomp_tap.c`'s `rcvthread`, EAGAIN branch).
+   Swapped to `rumpuser_akuma_wait_fd(viu->viu_fd, POLLIN, 1000)` (the same primitive
+   already used by the sysproxy receiver, see the 2026-06-24 section above). Also
+   gave `rump_server.rs`'s idle main loop (previously `for(;;) rumpuser_akuma_yield()`,
+   see fix 1 in the 2026-06-24 "RESOLVED" section above) a long park
+   (`rumpuser_akuma_wait_fd(-1, 0, 60_000)`) instead of a 1ms self-rearm — `schedule()`'s
+   idle-sleep ceiling is capped by the *soonest* wakeup_time across *all* fibers
+   (`fiber.rs`), so that 1ms self-rearm alone was forcing a full thread-list scan +
+   `nanosleep`/`poll` every millisecond forever, independent of anything else.
+2. **Fix 1 alone didn't work** — CPU stayed pinned. Added temporary per-thread
+   "times picked as runnable" counters to `schedule()` (since removed) and found
+   `tap-rx` was being re-woken **~435,000 times/sec**. Root cause was one layer
+   down, in the **kernel**, not this crate: `epoll_check_fd_readiness`
+   (`src/syscall/poll.rs`) has no arm for `FileDescriptor::Tap` and fell through to
+   the wildcard default, which reports **whatever was requested as ready,
+   unconditionally** — correct for fd types that never reach `poll()`, but
+   `/dev/net/tap0` does now (via fix 1), so every "wait for a packet" call returned
+   instantly regardless of whether one existed: a busy-spin wearing a blocking-poll
+   costume. Fixed by adding a real `Tap` arm backed by a new non-consuming
+   `TapNic::has_frame()` (`crates/akuma-rump/src/lib.rs`) — posts the RX buffer if
+   needed and queries the device without completing the receive, so a following
+   `read_frame()` still sees the same pending frame.
+
+**Verified, clean-boot, zero-interaction measurements** (Akuma's own `top`,
+`get_cpu_stats`):
+- `tap-rx` fiber picks: **~870,000/2s → ~1–2/2s**.
+- Total `schedule()` calls: **~870,000/2s → ~11,000/2s** (mostly attributable to
+  heavy diagnostic SSH traffic during the fix session, not idle baseline).
+- `rump_server`'s own accumulated CPU time (`TIME(ms)` in `/bin/top`) over
+  comparable uptime: **111,096ms → 2,731ms** (~40×).
+
+**Not fully resolved:** host CPU is *still* ~100% on a fresh, untouched boot even
+after both fixes above. Akuma's in-guest `top` now attributes it to the base
+kernel's own idle threads (TID 0 `kernel`, TID 1 `-`), not `rump_server` — tens of
+seconds of accumulated `TIME(ms)` against a fraction that of uptime. This is a
+**separate bug in a different subsystem** (base kernel idle/timer/WFI path, not
+rump/tap networking) and needs its own investigation; see `docs/KNOWN_ISSUES.md`
+issue tracking this (cross-referenced against issue #2, "`top` reports impossible
+CPU percentages", which may share a root cause in the same CPU-stat/idle-thread
+accounting).
+
 ### Open / next (latency — further levers, NOT yet done)
 
 - **Bulk-download round-trips:** non-blocking recv means a recv that races ahead of
@@ -172,9 +222,6 @@ is one line in `sp_serve_fd.c` (`yield` → `wait_fd`). Fiber unit test still PA
   the data-path transport timeout. A shorter/adaptive data timeout would bound any
   *legitimately*-blocking proxied call (belt-and-suspenders now that recv is
   non-blocking).
-- **Tap RX is still busy-poll** (`/dev/net/tap0` has no kernel poll/waker): inbound
-  packets wait up to the 1 ms RX yield. Making the tap fd pollable (kernel) would
-  let the tap RX fiber use `wait_fd` too and cut inbound-packet latency.
 - Phase 5 herd/box `--net` auto-spawn ergonomics.
 
 ## PORT — DONE (2026-06-24): C wrapper → Rust; C tests + scripts archived
