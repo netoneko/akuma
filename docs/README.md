@@ -35,6 +35,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | SSH unreachable or slow to connect | [`runbooks/debug-devbox.md`](runbooks/debug-devbox.md) (devbox) / [`runbooks/debug-ssh-latency.md`](runbooks/debug-ssh-latency.md) |
 | VM wedged, 100% CPU, unresponsive | [`runbooks/recover-wedged-vm.md`](runbooks/recover-wedged-vm.md) |
 | Kernel panic / OOM / allocation failure | [`runbooks/debug-memory-oom.md`](runbooks/debug-memory-oom.md) |
+| Kernel panic with ESR_EL1/FAR_EL1 / "unhandled exception" / EL1 crash | [`runbooks/debug-exceptions.md`](runbooks/debug-exceptions.md) |
 | Network doesn't work / can't connect out | [`runbooks/debug-network.md`](runbooks/debug-network.md) (smoltcp) / [`runbooks/debug-devbox.md`](runbooks/debug-devbox.md) (rump) |
 | `cargo` or `rustc` crashes in the devbox | [`runbooks/debug-devbox.md`](runbooks/debug-devbox.md) -> Toolchain crashes |
 | `git clone` hangs or wedges | [`runbooks/debug-devbox.md`](runbooks/debug-devbox.md) / [`runbooks/debug-network.md`](runbooks/debug-network.md) |
@@ -64,7 +65,8 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 |---|---|---|
 | Boot / MMU / DTB | [`reference/subsystems/boot.md`](reference/subsystems/boot.md) | B |
 | Memory (PMM, heap, COW) | [`reference/subsystems/memory.md`](reference/subsystems/memory.md) | **C** |
-| Scheduler / threads / SMP | [`reference/subsystems/scheduler.md`](reference/subsystems/scheduler.md) | A |
+| Scheduler / threads | [`reference/subsystems/scheduler.md`](reference/subsystems/scheduler.md) | A |
+| SMP / multikernel | [`reference/subsystems/smp.md`](reference/subsystems/smp.md) | **C** |
 | Networking (box model, two stacks) | [`reference/subsystems/networking.md`](reference/subsystems/networking.md) | **C** |
 | Rump stack (sysproxy, fiber) | [`reference/subsystems/rump-stack.md`](reference/subsystems/rump-stack.md) | B |
 | SSH (built-in + userspace) | [`reference/subsystems/ssh.md`](reference/subsystems/ssh.md) | A |
@@ -75,6 +77,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | IRQ / console / RNG / async-fs | [`reference/subsystems/irq.md`](reference/subsystems/irq.md) etc. | B / B / B / A |
 | In-kernel shell / editor | [`reference/subsystems/shell.md`](reference/subsystems/shell.md) / [`editor.md`](reference/subsystems/editor.md) | **C** / A |
 | Drivers (GIC, timers, block, fw_cfg) | [`reference/subsystems/drivers/`](reference/subsystems/drivers/) | B / B / A / A |
+| Exceptions (vector table, trap frame, ESR_EL1) | [`reference/subsystems/exceptions.md`](reference/subsystems/exceptions.md) | **C** |
 
 Syscalls / Linux ABI now has 17 per-family docs under
 [`reference/subsystems/syscalls/`](reference/subsystems/syscalls/) — grades

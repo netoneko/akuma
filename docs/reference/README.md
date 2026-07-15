@@ -15,7 +15,8 @@ churn. See [`../README.md`](../README.md).
 |---|---|---|
 | Boot / MMU / DTB | [`subsystems/boot.md`](subsystems/boot.md) | B |
 | Memory (PMM, heap, COW) | [`subsystems/memory.md`](subsystems/memory.md) | **C** |
-| Scheduler / threads / SMP | [`subsystems/scheduler.md`](subsystems/scheduler.md) | A |
+| Scheduler / threads | [`subsystems/scheduler.md`](subsystems/scheduler.md) | A |
+| SMP / multikernel | [`subsystems/smp.md`](subsystems/smp.md) | **C** |
 | Networking (box model, two stacks) | [`subsystems/networking.md`](subsystems/networking.md) | **C** |
 | Rump stack (sysproxy, fiber) | [`subsystems/rump-stack.md`](subsystems/rump-stack.md) | B |
 | SSH (built-in + userspace) | [`subsystems/ssh.md`](subsystems/ssh.md) | A |
@@ -29,6 +30,7 @@ churn. See [`../README.md`](../README.md).
 | Async filesystem wrappers | [`subsystems/async-fs.md`](subsystems/async-fs.md) | A |
 | In-kernel shell | [`subsystems/shell.md`](subsystems/shell.md) | **C** |
 | In-kernel editor ("neko") | [`subsystems/editor.md`](subsystems/editor.md) | A |
+| Exceptions (vector table, trap frame, ESR_EL1) | [`subsystems/exceptions.md`](subsystems/exceptions.md) | **C** |
 
 ### Drivers
 

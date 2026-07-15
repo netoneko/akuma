@@ -9,7 +9,7 @@ switch, synchronization primitives, and blocking.
 > do slow I/O inside a preemption-disabled closure** — that is the single most
 > common cause of hangs (see `../../runbooks/debug-network.md`).
 
-For SMP/multikernel (one-kernel-per-core), see the last section.
+For SMP/multikernel (one-kernel-per-core), see [`smp.md`](smp.md).
 
 ## Threading model
 
@@ -87,23 +87,14 @@ For SMP/multikernel (one-kernel-per-core), see the last section.
 
 ## SMP / multikernel
 
-Behind `cfg(kernel_smp)` (the `smp` feature), paired with the `release-smp`
-profile. One kernel **per core** — not SMP sharing.
-
-- Secondary cores boot to **PARKED** (`wfe` loop). herd activates them via the
-  `core_init` syscall (`MSG_CORE_INIT`), which PSCI `CPU_ON`s the core.
-- Cross-core IPC via the `akuma-smp` message bus (`MSG_FWD_SYSCALL_REQ` /
-  `MSG_FWD_ECHO_REQ`); forwarded `openat`/`read`/`close` let a pinned core's
-  process reach core 0's filesystem.
-- Per-core PMM/heap/POOL/TALC isolation; smoltcp on BSP only (DNS/HTTPS/entropy
-  forwarded to core 0).
-- Config: `MULTIKERNEL_INIT_HERD` + `AUTO_START_HERD` (both default on =
-  userspace-driven). Parked watchdog 120 s. Box + non-BSP core mutually exclusive.
-- Demo: [`acceptance/12_multikernel_demo.md`](../../../acceptance/12_multikernel_demo.md).
+One kernel **per core** (not SMP sharing), behind `cfg(kernel_smp)`. Now has
+its own full doc: see [`smp.md`](smp.md) for boot/activation, the message
+bus, per-core isolation, syscall forwarding, config knobs, and constraints.
 
 ## Background
 
 - `archive/MULTITASKING.md`, `archive/CONCURRENCY.md`, `archive/LOCK_REFERENCE.md`.
 - `archive/WAIT_QUEUES.md`, `archive/SYSCALL_BLOCKING.md`.
 - `archive/CONTEXT_SWITCH_FIX_2026.md`, `archive/TTBR0_AND_THREADING_FIXES.md`.
-- `archive/MULTIKERNEL.md` (29 commits — the SMP design).
+- `archive/MULTIKERNEL.md` (29 commits — the SMP design; see [`smp.md`](smp.md)
+  for the current-state doc).

@@ -15,6 +15,7 @@ Start from the symptom or task on the left.
 | Recovering a wedged / hung / 100%-CPU VM | [`recover-wedged-vm.md`](recover-wedged-vm.md) |
 | Debugging networking (native smoltcp stack) | [`debug-network.md`](debug-network.md) |
 | Debugging OOM / panics / allocation failures | [`debug-memory-oom.md`](debug-memory-oom.md) |
+| Debugging an EL1 crash / data abort / unhandled exception | [`debug-exceptions.md`](debug-exceptions.md) |
 | Debugging a boot hang | [`debug-boot-hang.md`](debug-boot-hang.md) |
 | Debugging SSH latency / echo / terminal sizing | [`debug-ssh-latency.md`](debug-ssh-latency.md) |
 | Self-hosting (compiling the kernel inside Akuma) | [`selfhost-kernel-build.md`](selfhost-kernel-build.md) |
