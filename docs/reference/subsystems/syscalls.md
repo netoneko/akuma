@@ -3,10 +3,14 @@
 Current-state architecture for syscall dispatch, the `sc-*` feature gates, and
 Linux compatibility.
 
-> **Stability: A (stable).** The "missing syscalls" cohort flared in Mar–May
-> (Go/Bun/dash/git bring-up) and has been quiet since — those problems are
-> resolved. The dispatch model (`handle_syscall` + rump interception) is
-> settled. errno compliance is tracked in `archive/SYSCALL_ERRNO_COMPLIANCE_CHANGES.md`.
+> **Stability: A (stable) for dispatch.** The "missing syscalls" cohort flared
+> in Mar–May (Go/Bun/dash/git bring-up) and has been quiet since — those
+> problems are resolved. The dispatch model (`handle_syscall` + rump
+> interception) is settled. errno compliance is tracked in
+> `archive/SYSCALL_ERRNO_COMPLIANCE_CHANGES.md`. **Per-family grades vary** —
+> `mem`/`net`/`signal`/`sync` are graded C (active risk, touched in the Jun
+> 2026 memory+signal crisis); see the table below before trusting a specific
+> family.
 
 For memory syscalls see [`memory.md`](memory.md); for network syscalls see
 [`networking.md`](networking.md) + [`rump-stack.md`](rump-stack.md).
@@ -27,27 +31,30 @@ x0. Entry: EL0 sync exception → `src/exceptions.rs` → `handle_syscall`
 
 `src/syscall/mod.rs` is the dispatcher; per-family logic lives in submodules.
 Each gated by a `sc-*` feature (default-on; minimal builds re-add selectively).
+Each family now has its own current-state doc under
+[`syscalls/`](syscalls/) — grades vary per family (a quiet family living next
+to an actively-churning one doesn't inherit its risk).
 
-| Submodule | Family | Gate |
-|---|---|---|
-| `fs.rs` | open/read/write/stat/getdents/... | always |
-| `mem.rs` | mmap/munmap/brk/mremap/membarrier | always |
-| `net.rs` | socket/connect/bind/listen/sendto/recvfrom | always (smoltcp **or** rump-routed) |
-| `pipe.rs` | pipe/fifo | always |
-| `poll.rs` | poll/ppoll/epoll | `sc-epoll` (Tier 2) |
-| `proc.rs` | fork/clone/execve/wait/exit | always |
-| `signal.rs` | rt_sigaction/kill/tkill/sigreturn | always |
-| `sync.rs` | futex | always |
-| `term.rs` | ioctl (TIOCGWINSZ/TIOCSWINSZ) + rich terminal 307–313 | always |
-| `time.rs` | clock_gettime/nanosleep | always |
-| `log.rs` | kernel log (dmesg) | always |
-| `aio.rs` | io_setup/io_submit/... | `sc-aio` |
-| `container.rs` | box/join_box/core_init | `sc-containers` |
-| `eventfd.rs` | eventfd | `sc-eventfd` (Tier 2) |
-| `fb.rs` | framebuffer ioctl | `sc-framebuffer` |
-| `msgqueue.rs` | SysV msg queues | `sc-sysv-ipc` |
-| `pidfd.rs` | pidfd_open/waitid | `sc-pidfd` (Tier 2) |
-| `timerfd.rs` | timerfd_create/settime | `sc-timerfd` |
+| Submodule | Family | Gate | Doc | Grade |
+|---|---|---|---|---|
+| `fs.rs` | open/read/write/stat/getdents/... | always | [`syscalls/fs.md`](syscalls/fs.md) | A |
+| `mem.rs` | mmap/munmap/brk/mremap/membarrier | always | [`syscalls/mem.md`](syscalls/mem.md) | **C** |
+| `net.rs` | socket/connect/bind/listen/sendto/recvfrom | always (smoltcp **or** rump-routed) | [`syscalls/net.md`](syscalls/net.md) | **C** |
+| `pipe.rs` | pipe/fifo | always | [`syscalls/pipe.md`](syscalls/pipe.md) | A |
+| `poll.rs` | poll/ppoll/epoll | `sc-epoll` (Tier 2) | [`syscalls/poll.md`](syscalls/poll.md) | B |
+| `proc.rs` | fork/clone/execve/wait/exit | always | [`syscalls/proc.md`](syscalls/proc.md) | A |
+| `signal.rs` | rt_sigaction/kill/tkill/sigreturn | always | [`syscalls/signal.md`](syscalls/signal.md) | **C** |
+| `sync.rs` | futex | always | [`syscalls/sync.md`](syscalls/sync.md) | **C** |
+| `term.rs` | ioctl (TIOCGWINSZ/TIOCSWINSZ) + rich terminal 307–313 | always | [`syscalls/term.md`](syscalls/term.md) | B |
+| `time.rs` | clock_gettime/nanosleep | always | [`syscalls/time.md`](syscalls/time.md) | A |
+| `log.rs` | kernel log (dmesg) | always | [`syscalls/log.md`](syscalls/log.md) | A |
+| `aio.rs` | io_setup/io_submit/... | `sc-aio` | [`syscalls/aio.md`](syscalls/aio.md) | B |
+| `container.rs` | box/join_box/core_init | `sc-containers` | [`syscalls/container.md`](syscalls/container.md) | B |
+| `eventfd.rs` | eventfd | `sc-eventfd` (Tier 2) | [`syscalls/eventfd.md`](syscalls/eventfd.md) | B |
+| `fb.rs` | framebuffer ioctl | `sc-framebuffer` | [`syscalls/fb.md`](syscalls/fb.md) | A |
+| `msgqueue.rs` | SysV msg queues | `sc-sysv-ipc` | [`syscalls/msgqueue.md`](syscalls/msgqueue.md) | A |
+| `pidfd.rs` | pidfd_open/waitid | `sc-pidfd` (Tier 2) | [`syscalls/pidfd.md`](syscalls/pidfd.md) | A |
+| `timerfd.rs` | timerfd_create/settime | `sc-timerfd` | [`syscalls/timerfd.md`](syscalls/timerfd.md) | B |
 
 ## Feature gates & ExecRuntime stubs
 

@@ -41,7 +41,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | SSH echo lag / staggering / terminal sizing | [`runbooks/debug-ssh-latency.md`](runbooks/debug-ssh-latency.md) |
 | epoll crash / DNS hang under bun | [`runbooks/debug-network.md`](runbooks/debug-network.md) -> epoll |
 | HTTPS download measured in minutes | [`runbooks/debug-network.md`](runbooks/debug-network.md) -> TLS |
-| Fork / exec / signal misbehaviour | [`reference/subsystems/scheduler.md`](reference/subsystems/scheduler.md) + `archive/THREADING_RACE_CONDITIONS.md`, `archive/SIGNAL_DELIVERY.md` |
+| Fork / exec / signal misbehaviour | [`reference/subsystems/syscalls/proc.md`](reference/subsystems/syscalls/proc.md) + [`syscalls/signal.md`](reference/subsystems/syscalls/signal.md) + [`scheduler.md`](reference/subsystems/scheduler.md) |
 | Filesystem / ext2 / procfs errors | [`reference/subsystems/vfs.md`](reference/subsystems/vfs.md) + `archive/EXT2_FIRST_DATA_BLOCK_FIX.md` |
 | Porting a new binary (missing syscalls) | [`reference/subsystems/syscalls.md`](reference/subsystems/syscalls.md) -> Porting + `archive/*_MISSING_SYSCALLS.md` |
 
@@ -72,10 +72,18 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | Syscalls / Linux ABI | [`reference/subsystems/syscalls.md`](reference/subsystems/syscalls.md) | A |
 | Containers / boxes / herd | [`reference/subsystems/containers.md`](reference/subsystems/containers.md) | B |
 | Cargo features + env knobs | [`reference/subsystems/config-flags.md`](reference/subsystems/config-flags.md) | — |
+| IRQ / console / RNG / async-fs | [`reference/subsystems/irq.md`](reference/subsystems/irq.md) etc. | B / B / B / A |
+| In-kernel shell / editor | [`reference/subsystems/shell.md`](reference/subsystems/shell.md) / [`editor.md`](reference/subsystems/editor.md) | **C** / A |
+| Drivers (GIC, timers, block, fw_cfg) | [`reference/subsystems/drivers/`](reference/subsystems/drivers/) | B / B / A / A |
 
-**Still undocumented (deferred gap list):** drivers (virtio, gic, timers, block,
-console, framebuffer, audio, fw_cfg, rng), the in-kernel shell/editor, and
-several syscall sub-families. See
+Syscalls / Linux ABI now has 17 per-family docs under
+[`reference/subsystems/syscalls/`](reference/subsystems/syscalls/) — grades
+vary per family; `mem`, `net`, `signal`, `sync` are **C** (active risk,
+touched in the Jun 2026 crisis).
+
+**Still undocumented (deferred gap list):** audio (`src/audio.rs`) and the
+framebuffer device itself (`src/ramfb.rs` — distinct from the `fb.rs` syscall
+wrapper, which is documented), both Tier C / niche. See
 [`proposals/DOCS_MIGRATION_PLAN.md`](../proposals/DOCS_MIGRATION_PLAN.md).
 
 ## When in doubt

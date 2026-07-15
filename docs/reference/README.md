@@ -20,23 +20,49 @@ churn. See [`../README.md`](../README.md).
 | Rump stack (sysproxy, fiber) | [`subsystems/rump-stack.md`](subsystems/rump-stack.md) | B |
 | SSH (built-in + userspace) | [`subsystems/ssh.md`](subsystems/ssh.md) | A |
 | VFS (ext2, procfs, pipes) | [`subsystems/vfs.md`](subsystems/vfs.md) | A |
-| Syscalls / Linux ABI | [`subsystems/syscalls.md`](subsystems/syscalls.md) | A |
+| Syscalls / Linux ABI | [`subsystems/syscalls.md`](subsystems/syscalls.md) (per-family docs in [`subsystems/syscalls/`](subsystems/syscalls/), grades vary) | A |
 | Containers / boxes / herd | [`subsystems/containers.md`](subsystems/containers.md) | B |
 | Cargo features + env knobs | [`subsystems/config-flags.md`](subsystems/config-flags.md) | — |
+| IRQ dispatch | [`subsystems/irq.md`](subsystems/irq.md) | B |
+| Console / UART output | [`subsystems/console.md`](subsystems/console.md) | B |
+| Kernel RNG (VirtIO entropy) | [`subsystems/rng.md`](subsystems/rng.md) | B |
+| Async filesystem wrappers | [`subsystems/async-fs.md`](subsystems/async-fs.md) | A |
+| In-kernel shell | [`subsystems/shell.md`](subsystems/shell.md) | **C** |
+| In-kernel editor ("neko") | [`subsystems/editor.md`](subsystems/editor.md) | A |
+
+### Drivers
+
+| Driver | Doc | Grade |
+|---|---|---|
+| GIC (v2/v3 interrupt controller) | [`subsystems/drivers/gic.md`](subsystems/drivers/gic.md) | B |
+| Timers (CNTV tick + alarm queue) | [`subsystems/drivers/timers.md`](subsystems/drivers/timers.md) | B |
+| Block (VirtIO-blk + DMA HAL) | [`subsystems/drivers/block.md`](subsystems/drivers/block.md) | A |
+| fw_cfg (QEMU firmware config) | [`subsystems/drivers/fw_cfg.md`](subsystems/drivers/fw_cfg.md) | A |
+
+### ABI
+
+| Doc | Covers |
+|---|---|
+| [`abi/linux-compat.md`](abi/linux-compat.md) | Syscall calling convention, errno encoding, ELF/auxv contract |
+| [`abi/musl.md`](abi/musl.md) | What musl expects of the kernel, posix_spawn/CLONE_VFORK |
+
+### Build system
+
+[`build-system.md`](build-system.md) — the profile/feature pairing model
+(`release`/`size`/`extreme-size`/`devbox`/`release-smp`) and their
+`scripts/build_*.sh` wrappers.
 
 ## Not yet written (deferred gap list)
 
-These are tracked in [`../../proposals/DOCS_MIGRATION_PLAN.md`](../../proposals/DOCS_MIGRATION_PLAN.md):
+Tracked in [`../../proposals/DOCS_MIGRATION_PLAN.md`](../../proposals/DOCS_MIGRATION_PLAN.md).
+Tier A and B are now done (drivers above + the subsystems listed above); only
+Tier C (niche) remains:
 
-- **ABI:** `abi/linux-compat.md`, `abi/musl.md` — material is in
-  `archive/MUSL_COMPATIBILITY.md`, `archive/SYSCALL_HARDENING.md`.
-- **Build system:** `build-system.md` — profiles + `scripts/` + disk images
-  (partly covered by `subsystems/config-flags.md`).
-- **Drivers:** `subsystems/drivers/` (virtio, gic, timers, block, console,
-  framebuffer, audio, fw_cfg, rng) — Tier A/B/C in the gap list.
-- **Shell:** `subsystems/shell.md` — `src/shell/` + `shell/commands/`.
-- **Syscall sub-families:** per-family docs (most covered by
-  `subsystems/syscalls.md`'s index).
+- **Drivers:** `subsystems/drivers/audio.md` (`src/audio.rs`),
+  `subsystems/drivers/framebuffer.md` (`src/ramfb.rs` — distinct from
+  `subsystems/syscalls/fb.md`, which covers the `fb.rs` syscall wrapper, not
+  the ramfb device itself). No generic `drivers/virtio.md` overview exists;
+  VirtIO-blk specifics live in `drivers/block.md`.
 
 For these, consult `archive/` directly in the meantime.
 
