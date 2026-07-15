@@ -1,0 +1,200 @@
+# fs syscalls
+
+open/read/write/stat/getdents/unlink/rename/... — the largest syscall family
+(`src/syscall/fs.rs`, 2340 lines). For the VFS layer, `FileDescriptor`
+variants, ext2, procfs, mount namespaces, and pipes/PTY, see
+[`../vfs.md`](../vfs.md) — this doc covers only the syscall entry-point
+layer: which syscalls this file implements, argument/flag validation,
+path-resolution entry points, and quirks specific to the syscall boundary.
+Do not expect ext2/procfs/namespace mechanics here; they're linked, not
+repeated.
+
+> **Stability: A (stable).** Inherits `vfs.md`'s grade — this file's own
+> commit history is dominated by *other* subsystems being bootstrapped
+> against it (Go, rustc, multikernel, rump) rather than fs-syscall bugs
+> themselves; the actual VFS/ext2/procfs layer underneath has been dormant
+> since March 2026. The recurring lesson: **most "missing" POSIX semantics
+> here are silent gaps, not errors** — `O_EXCL`, real hardlinks, and
+> `faccessat2`'s access-mode bits are all accepted and silently ignored
+> rather than rejected or partially honored; don't assume an error-free
+> return means full POSIX behavior.
+
+## Syscall table
+
+| Syscall | nr | Entry point |
+|---|---|---|
+| `getcwd` | 17 | `sys_getcwd` |
+| `mkdirat` | 34 | `sys_mkdirat` |
+| `unlinkat` | 35 | `sys_unlinkat` |
+| `symlinkat` | 36 | `sys_symlinkat` |
+| `linkat` | 37 | `sys_linkat` |
+| `renameat` | 38 | `sys_renameat` |
+| `truncate` | 45 | `sys_truncate` |
+| `ftruncate` | 46 | `sys_ftruncate` |
+| `fallocate` | 47 | `sys_fallocate` |
+| `faccessat` | 48 | `sys_faccessat2` (mode arg dropped) |
+| `chdir` | 49 | `sys_chdir` |
+| `fchdir` | 50 | `sys_fchdir` |
+| `fchmod` | 52 | `sys_fchmod` |
+| `fchmodat` | 53 | `sys_fchmodat` |
+| `openat` | 56 | `sys_openat` |
+| `close` | 57 | `sys_close` |
+| `getdents64` | 61 | `sys_getdents64` |
+| `lseek` | 62 | `sys_lseek` |
+| `read` | 63 | `sys_read` |
+| `write` | 64 | `sys_write` |
+| `readv` | 65 | `sys_readv` |
+| `writev` | 66 | `sys_writev` |
+| `pread64` | 67 | `sys_pread64` |
+| `pwrite64` | 68 | `sys_pwrite64` |
+| `readlinkat` | 78 | `sys_readlinkat` |
+| `newfstatat` | 79 | `sys_newfstatat` |
+| `fstat` | 80 | `sys_fstat` |
+| `dup` | 23 | `sys_dup` |
+| `dup3` | 24 | `sys_dup3` |
+| `fcntl` | 25 | `sys_fcntl` |
+| `fstatfs` | 44 | `sys_fstatfs` |
+| `renameat2` | 276 | `sys_renameat2` |
+| `statx` | 291 | `sys_statx` |
+| `close_range` | 436 | `sys_close_range` |
+| `faccessat2` | 439 | `sys_faccessat2` |
+
+All always-on — `fs.rs` has no `sc-*` gate (see
+[`../syscalls.md`](../syscalls.md) "The `src/syscall/` split").
+
+## Path resolution entry point
+
+Every `*at` syscall (`openat`, `mkdirat`, `unlinkat`, `renameat[2]`,
+`symlinkat`, `linkat`, `readlinkat`, `fchmodat`, `newfstatat`, `faccessat2`)
+shares the same `dirfd` convention, implemented independently in each
+function (a shared `resolve_path_at` helper exists at `fs.rs:56` and is used
+by the newer call sites — `renameat`/`renameat2`/`symlinkat`/`linkat`; older
+ones like `openat`/`mkdirat`/`unlinkat`/`statx`/`faccessat2` inline the same
+logic):
+
+- Absolute path (`starts_with('/')`) → `canonicalize_path`, dirfd ignored.
+- `dirfd == AT_FDCWD (-100)` → resolve relative to `proc.cwd`.
+- `dirfd >= 0` → must resolve to an open `FileDescriptor::File`; anything
+  else (a pipe, a socket, an absent fd) → `EBADF`.
+- Any other negative `dirfd` → treated as `/` (not an error) in most of
+  these functions — a syscall-boundary looseness worth knowing if porting a
+  binary that passes a deliberately-invalid negative dirfd expecting `EBADF`.
+
+Symlink resolution (`crate::vfs::resolve_symlinks`) is applied to the
+resolved path in `openat`/`fchmodat`/`statx`/`faccessat2` before the
+filesystem is touched — see `../vfs.md` for how symlinks are stored; this
+file only calls into it.
+
+## `openat` flag semantics
+
+`sys_openat` (`fs.rs:1090`) handles device nodes (`/dev/null`, `/dev/zero`,
+`/dev/urandom`, `/dev/random`, `/dev/dsp`/`/dev/audio` when
+`audio::is_available()`, `/dev/net/tap0` when the `rump` feature's tap is
+ready) and `/proc/self/exe` before ever touching the real filesystem — see
+`../vfs.md` "procfs" for what those resolve to.
+
+For a real path:
+- File doesn't exist and `O_CREAT` not set → `ENOENT`.
+- File doesn't exist, `O_CREAT` set, but the **parent directory** doesn't
+  exist either → `ENOENT` (checked explicitly via `split_path` before
+  creation, so a dangling multi-level path doesn't attempt a
+  create-into-nowhere).
+- File doesn't exist, `O_CREAT` set → created via `write_file(path, &[])`;
+  if `mode & 0o7777 != 0`, `chmod`'d to that mode.
+- File exists and `O_TRUNC` set → truncated to zero via the same
+  `write_file(path, &[])`.
+- **`O_EXCL` is not implemented at all** — there is no `open_flags::O_EXCL`
+  constant and no check for it anywhere in `fs.rs`. `O_CREAT|O_EXCL` on an
+  already-existing file silently succeeds and (if `O_TRUNC` is also set,
+  which many `O_EXCL` callers don't set) may truncate it, instead of
+  returning `EEXIST`. Anything relying on `O_EXCL` for exclusive-create
+  locking semantics will not get them here.
+- `O_CLOEXEC` is honored (`proc.set_cloexec`); `O_APPEND` is honored at
+  `read`/`write` time (see below), not at open time.
+
+On `kernel_smp`, an `openat` for anything other than `/proc/*`/`/dev/*` from
+a process pinned to a secondary core is forwarded to the VFS owner (core 0)
+via `crate::smp::fwd_openat`, returning a `FileDescriptor::RemoteFd`; the
+per-fd (not per-syscall) routing then carries through read/write/close/
+lseek/fstat on that fd. `/dev/*` and `/proc/*` stay local because they're
+per-core (procfs) or synthetic (device nodes).
+
+## `write`/`pwrite64` and `O_APPEND`
+
+`sys_write` resolves the write position **once**, before the chunking loop:
+if `O_APPEND` is set, it re-reads `crate::fs::file_size` on every call (so a
+concurrent writer's growth is respected — true POSIX append semantics, not
+just "whatever position was cached at open"); otherwise it uses the fd's
+tracked `position`. Each 64 KiB chunk is written via `vfs::write_at` (the
+streaming optimization documented in `../vfs.md` "VFS layer" — linked, not
+re-derived here) and a **short write from any chunk stops the loop and
+returns the partial total**, not an error — this is legal POSIX short-write
+behavior but means every caller of a large `write()` must already handle
+partial completion. `pwrite64`/`pread64` reject a negative `offset` with
+`EINVAL` up front (the `File` arm is a single un-chunked `read_at`/
+`write_at` call, no APPEND handling — POSIX `pwrite` ignores `O_APPEND` by
+design).
+
+## `getdents64` directory cache
+
+`sys_getdents64` (`fs.rs:2235`) reads the whole directory listing once via
+`crate::fs::list_dir` and caches it on the fd (`f.dir_cache`) as a flat
+`Vec<DirCacheEntry>`; subsequent calls on the same fd paginate through that
+cached snapshot by `f.position` (an entry index, not a byte offset — same
+field `KernelFile::position` that a regular file uses for its byte offset).
+**Syscall-boundary consequence:** a directory modified between two
+`getdents64` calls on the same fd is invisible until the cache is
+invalidated — which only happens via `lseek(fd, 0, SEEK_SET)` (`fs.rs:1419`
+clears `dir_cache` on seek-to-zero) or closing and reopening the fd. See
+`../vfs.md` "ext2" `GETDENTS64_DIR_CACHE_FIX.md` for why this caching exists
+at all (a directory-cache bug, not a design from scratch).
+
+## Other syscall-boundary gaps worth knowing
+
+- **`linkat` is not a real hardlink.** `sys_linkat` (`fs.rs:2177`) implements
+  a "hardlink" by `read_file` + `write_file` — a full content copy into a
+  new inode. There is no shared-inode/`nlink` semantics; the two paths are
+  independent files after the call, not the same file under two names. Any
+  caller that hardlinks then mutates one path expecting the other to see it
+  will not get that behavior.
+- **`faccessat2`/`faccessat` ignore the `mode` argument entirely.** Both
+  dispatch to `sys_faccessat2`, which only checks existence
+  (`crate::fs::exists` or `is_symlink`) → `0` or `ENOENT`. `R_OK`/`W_OK`/
+  `X_OK` bits and `AT_EACCESS` are accepted but never inspected — a caller
+  probing for write permission on a read-only mount gets a false "yes".
+- **`fcntl`'s advisory locks are no-op stubs.** `F_GETLK`/`F_SETLK`/
+  `F_SETLKW` all return `0` (success) unconditionally — there is no lock
+  state, so two processes "locking" the same file never actually contend.
+  `F_DUPFD`/`F_DUPFD_CLOEXEC`/`F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL` are
+  fully implemented (cloexec/nonblock bits + fd duplication with pipe
+  refcount bumping); any other `cmd` → `EINVAL` (logged as `UNSUPPORTED`).
+- **`lseek` error selection is fd-type-aware.** A bad fd → `EBADF`; a real
+  seekable `File` with a resulting negative offset or unknown `whence` →
+  `EINVAL`; a valid-but-non-seekable fd (pipe, socket, tty, eventfd, ...) →
+  `ESPIPE` — this three-way split matters because musl/Rust std probe
+  seekability of stdio by calling `lseek(fd, 0, SEEK_CUR)` and branch on
+  `ESPIPE` specifically.
+- **`renameat2`'s `RENAME_NOREPLACE`/`RENAME_EXCHANGE` are only partially
+  real:** `RENAME_NOREPLACE` does check-then-`EEXIST` if the destination
+  exists; both flags together → `EINVAL`; but there is no actual atomic
+  exchange implementation for `RENAME_EXCHANGE` — it falls through to a
+  plain `crate::fs::rename`, which is a rename, not a swap.
+- **`unlinkat`'s `AT_REMOVEDIR`** routes to `crate::fs::remove_dir` instead
+  of `remove_file`; without the flag, a plain `unlinkat` also always calls
+  `crate::vfs::remove_symlink` first (harmless no-op if the target isn't a
+  symlink) before `remove_file`.
+- **`statx`** synthesizes `/dev/null`/`/dev/zero` stat data inline (does not
+  consult the VFS) and supports `AT_EMPTY_PATH` (empty path + valid `dirfd`
+  → stat the fd itself) and `AT_SYMLINK_NOFOLLOW`; only `STATX_BASIC_STATS`
+  fields are ever populated regardless of the requested `mask`.
+
+## Background
+
+- `archive/GETDENTS64_DIR_CACHE_FIX.md` — why `getdents64` caches (linked
+  from `../vfs.md` too; the fix is in `sys_getdents64` itself).
+- `archive/STAT_AND_UNLINKAT_FIX.md` — `stat`/`unlinkat`/`dup3` + kernel
+  pipes interaction fix.
+- `archive/RUST_TOOLCHAIN.md` §4 — the CLOEXEC-pipe-read `EBADF` symptom
+  that `READ_EBADF_TRACE` (`fs.rs:20`) exists to localize.
+- `archive/WRITE_AT_SYSCALL.md` — the streaming write path `sys_write`/
+  `sys_pwrite64` call into (full detail in `../vfs.md`, not here).

@@ -1,0 +1,147 @@
+# poll syscalls
+
+poll (via `ppoll`) / `pselect6` / `epoll_create1` / `epoll_ctl` / `epoll_pwait`.
+Source: `src/syscall/poll.rs`. `epoll_*` is gated behind the `sc-epoll`
+feature — Tier 2 in [`../syscalls.md`](../syscalls.md)'s "Feature gates &
+ExecRuntime stubs" table, meaning turning it off requires the no-op
+`ExecRuntime` stub (`epoll_destroy: noop_u32`, `src/main.rs:451`) rather than
+being pure dead weight. For the generic blocking/wait-queue pattern every
+syscall here uses, see `../syscalls.md` "Blocking vs non-blocking"; for what
+"readable"/"writable" means per resource type (sockets, pipes, eventfd,
+child channels), see `../networking.md` and [`../vfs.md`](../vfs.md) — this
+doc covers only the syscall entry points: argument validation, the
+epoll interest-list semantics, and known instability history.
+
+> **Stability: B (mostly stable, one open gotcha).** The March 2026 EL1-crash
+> /stack-overflow/DNS-hang cohort (6 root causes) is resolved and dormant —
+> no epoll crash fixes since. One item stays genuinely **OPEN**:
+> `epoll_destroy` is not reference-counted, so sharing an epoll fd via `dup`
+> across `fork` lets either side's `close()` destroy the other's interest
+> list. The recurring lesson: **never hold `EPOLL_TABLE` while doing a
+> readiness check** — every readiness check can recurse into
+> `current_process()` (`PROCESS_TABLE`) or a resource's own lock, and two
+> historical whole-kernel deadlocks (`EPOLL_TABLE` ↔ `PROCESS_TABLE`,
+> `NETWORK` ↔ `SOCKET_TABLE`) came from violating exactly that ordering.
+
+## Syscall table
+
+| Syscall | nr | Entry point | Gate |
+|---|---|---|---|
+| `pselect6` | 72 | `sys_pselect6` | always |
+| `ppoll` | 73 | `sys_ppoll` | always |
+| `epoll_create1` | 20 | `sys_epoll_create1` | `sc-epoll` |
+| `epoll_ctl` | 21 | `sys_epoll_ctl` | `sc-epoll` |
+| `epoll_pwait` | 22 | `sys_epoll_pwait` | `sc-epoll` |
+
+There is no plain `poll(2)` — userspace's `poll()` wrapper (musl) is expected
+to go through `ppoll` with a null timeout, which this dispatcher treats as
+infinite wait (see below). When `sc-epoll` is off, any binary calling
+`epoll_create1`/`epoll_ctl`/`epoll_pwait` gets `[ENOSYS] nr=20/21/22` — decode
+via [`../syscalls.md`](../syscalls.md) "Porting a new binary".
+
+## Argument validation & error codes
+
+**`sys_epoll_create1`**: no argument validation beyond having a current
+process (else `EBADF`, not `ESRCH` — a boundary-quirk worth knowing). Honors
+`EPOLL_CLOEXEC` in `flags`; any other bit is silently accepted.
+
+**`sys_epoll_ctl`**: `epfd` must resolve to a live `FileDescriptor::EpollFd`
+→ else `EBADF`. `EPOLL_CTL_ADD`/`MOD` validate `event_ptr` for the 16-byte
+ARM64 `epoll_event` layout (`events: u32, _pad: u32, data: u64` — **not**
+packed, unlike x86_64) before `copy_from_user_safe`; a bad pointer → `EFAULT`.
+`ADD` on an already-present `fd` silently upgrades to a `MOD` (logged, not an
+error) rather than `EEXIST`. `MOD`/`DEL` on an absent `fd` → `ENOENT`.
+Unknown `op` → `EINVAL`.
+
+**`sys_epoll_pwait`**: `maxevents <= 0` → `EINVAL`. The output buffer is
+validated for `maxevents * 16` bytes → `EFAULT` if it doesn't fit. `timeout`
+follows the standard three-way convention: `> 0` real timeout (ms→µs),
+`== 0` a single non-blocking poll, `< 0` infinite wait. `is_current_interrupted()`
+→ `EINTR`. **The `sigmask`/`sigsetsize` arguments (args 4/5) are accepted and
+logged when `SYSCALL_DEBUG_NET_ENABLED`, but never applied** — `epoll_pwait`
+does not actually mask signals for the duration of the wait, unlike real
+Linux `pwait` semantics. Same gap in `ppoll`'s `_sigmask` and `pselect6`'s
+`_sigmask_ptr` — both parameters are received and discarded (see the
+leading underscore in their signatures).
+
+**`sys_ppoll`**: `nfds == 0` → `0` immediately (no error). Buffer sized
+`nfds * size_of::<PollFd>()` is validated → `EFAULT`. A null `timeout_ptr`
+means infinite wait; otherwise it's read as a 16-byte `timespec` → `EFAULT`
+on a bad pointer. Negative `fd` entries in the array are skipped (matches
+POSIX `poll()`: negative fd means "ignore this slot").
+
+**`sys_pselect6`**: `nfds == 0` → `0`. `nfds > 1024` (`MAX_FDS`) → `EINVAL` —
+this is a **hard cap** not present in the epoll/ppoll paths; a caller
+`select()`-ing on a very high fd number will get `EINVAL` where `ppoll`/
+`epoll` would work fine. `readfds_ptr`/`writefds_ptr`, when non-null, are
+validated for `nfds.div_ceil(64) * 8` bytes. `exceptfds_ptr` is accepted but
+entirely ignored (`_exceptfds_ptr`) — no exceptional-condition reporting.
+
+## epoll interest-list semantics
+
+`EPOLL_TABLE: Spinlock<BTreeMap<u32, EpollInstance>>` is a **process-global**
+table keyed by an internal `epoll_id` (not by fd) — an `EpollFd(id)`
+`FileDescriptor` variant is just a handle into it. `sys_epoll_pwait`'s loop:
+
+1. Snapshots the interest-list fd keys into a stack array (≤128 fds; a
+   heap `Vec` only for larger interest lists) **then releases
+   `EPOLL_TABLE`** before calling `epoll_check_fd_readiness` per fd — the
+   lock-ordering fix from the `EPOLL_TABLE`/`PROCESS_TABLE` deadlock (see
+   Background).
+2. `epoll_check_fd_readiness` (`poll.rs:276`) is the single readiness
+   dispatch used by `epoll_pwait`, `ppoll`, and `pselect6` alike — it
+   switches on the fd's `FileDescriptor` variant and, when a `Waker` is
+   passed, registers it with the underlying resource (socket/pipe/eventfd/
+   child-channel/timerfd/pidfd) so a producer-side write wakes this thread
+   directly instead of waiting for the next poll tick. Fd types with no
+   real readiness model (e.g. a plain file) fall through to the catch-all
+   arm and are reported ready for whatever was requested — always-ready,
+   not polled.
+3. `EPOLLET` (edge-triggered) bookkeeping is entirely local to this file:
+   `last_ready` per interest-list entry tracks what was already reported, so
+   an edge-triggered fd only re-fires on **new** bits since the last report.
+   `net.rs`/`fs.rs` call `epoll_on_fd_drained` after every socket read (see
+   [`net.md`](net.md)) specifically to reset that edge — without it, a
+   caller that reads one TLS record at a time without draining to `EAGAIN`
+   (BoringSSL/bun) would never see `EPOLLIN` fire again for buffered data
+   that arrived within the same poll window.
+4. No event ready and `timeout != 0`: `schedule_blocking(deadline)` — never
+   a busy `yield_now()` spin. The 10 ms `BLOCKING_POLL_INTERVAL_US` cap
+   still exists as a safety net for resources that don't yet support wakers
+   (e.g. `TimerFd`), but a woken thread returns immediately rather than
+   waiting for the next tick.
+
+`epoll_destroy(epoll_id)` removes the instance outright — see the Stability
+callout above; it is invoked from `sys_close`'s `EpollFd` arm and from the
+CLOEXEC-fd-closing path on `execve`, and (per the fork fix below) `EpollFd`
+entries are stripped from a child's fd table across both `fork` and
+`vfork`/`clone_thread`, so an ordinary fork+exec never triggers this shared-
+destroy hazard — only an explicit `dup` across a fork can.
+
+## DNS-hang-under-bun (historical, resolved)
+
+`docs/README.md`'s symptom matrix lists "epoll crash / DNS hang under bun" →
+[`../../../runbooks/debug-network.md`](../../../runbooks/debug-network.md)
+"epoll issues". That table's entries are now all `FIXED` except the dup-across-fork
+non-refcounting gap noted above. The DNS-hang mechanism specifically was a
+socket-table-exhaustion chain, not an epoll bug per se: a crashing process
+used to leak its open sockets (no cleanup on the crash path), and after a
+few crashes `MAX_SOCKETS` was exhausted, so the next `bun install`'s DNS
+resolver hung waiting on a UDP socket that could never be allocated. Fixed
+by routing the EL1 fault-recovery pad through `return_to_kernel(-14)`
+(proper fd/socket cleanup) instead of looping forever. See Background.
+
+## Background
+
+- `archive/EPOLL_EL1_CRASH_FIX.md` — the six-cause March 2026 cohort: EL1
+  data-abort recovery, lazy stack region, the reverted kernel-VA exclusion,
+  `epoll_destroy` on a child-shared fd, `EPOLL_CLOEXEC` being ignored, and
+  the socket-exhaustion DNS-hang chain.
+- `archive/EPOLL_PERFORMANCE.md` — the waker-based reactive-polling
+  rewrite, the two lock-inversion deadlocks (`EPOLL_TABLE`↔`PROCESS_TABLE`,
+  `NETWORK`↔`SOCKET_TABLE`) and their fixes, and a Go-toolchain compatibility
+  survey run through this subsystem.
+- `archive/NETWORKING_POLLING_AND_ACK_FIXES.md`.
+- [`../../../runbooks/debug-network.md`](../../../runbooks/debug-network.md) —
+  "epoll issues" table (symptom/cause/status/fix), the live source of truth
+  for what's fixed vs. open in this file.

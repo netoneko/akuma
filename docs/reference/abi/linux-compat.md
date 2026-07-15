@@ -132,7 +132,7 @@ frame **after** `cow_share_range` — Go ARM64 binaries have `code_start =
   fds/closes immediately.
 - **fork:** `clone_deep_for_fork` — deep copy, bumps pipe refcounts, **strips
   EpollFd entries** (epoll instances are not refcounted; sharing via dup across
-  fork is an open wedge — see [`../runbooks/debug-network.md`](../runbooks/debug-network.md)
+  fork is an open wedge — see [`../../runbooks/debug-network.md`](../../runbooks/debug-network.md)
   epoll section).
 
 See `archive/SHARED_FD_TABLES.md` and [`../subsystems/vfs.md`](../subsystems/vfs.md)

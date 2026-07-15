@@ -46,7 +46,7 @@ the parent blocks until the child `execve`s or `_exit`s. On `execve`,
 | Quirk | What breaks | Kernel handling |
 |---|---|---|
 | `posix_spawn` = `CLONE_VFORK\|CLONE_VM` | stale-TTBR0 in `vfork_process` → `git clone` wedges | all three call sites (`clone_thread`/`fork_process`/`vfork_process`) set `child_ctx.ttbr0 = new_proc.address_space.ttbr0()` — FIXED |
-| c-ares (git's DNS) calls `fcntl(F_SETFD)` | rump `fcntl` returned `EOPNOTSUPP` → c-ares treats as fatal → DNS dead | `F_GETFD`/`F_SETFD` are no-op success — FIXED (see [`../runbooks/debug-devbox.md`](../runbooks/debug-devbox.md)) |
+| c-ares (git's DNS) calls `fcntl(F_SETFD)` | rump `fcntl` returned `EOPNOTSUPP` → c-ares treats as fatal → DNS dead | `F_GETFD`/`F_SETFD` are no-op success — FIXED (see [`../../runbooks/debug-devbox.md`](../../runbooks/debug-devbox.md)) |
 | Resolver expects `RESOLVE_HOST` (nr 300) or getaddrinfo-over-socket | musl resolver uses UDP sockets + `/etc/resolv.conf` | native stack does UDP; `RESOLVE_HOST` is an Akuma-private shortcut for libakuma |
 | TLS access (`mrs TPIDR_EL0; ldr [x0, #off]`) before `__init_tls` | FAR = TLS offset, looks like NULL deref | fault dump prints `TPIDR_EL0`; if 0, it's pre-`__init_tls` |
 | `tkill` must hit the target TID, not the caller | early `tkill` killed the caller | `src/syscall/signal.rs` delivers to the named TID |
