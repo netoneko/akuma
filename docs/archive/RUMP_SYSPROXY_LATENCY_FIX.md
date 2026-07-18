@@ -4,15 +4,22 @@
 > verified. Phase 3e/3f root-caused (not yet fixed) a residual ~300ms
 > single-round-trip floor to fiber-scheduling contention, dominated by
 > `rumpsp` (expected) and `rumpclk0`, the software-clock heartbeat (37% of
-> all scheduling activity — unexpected).
+> all scheduling activity — unexpected). Phase 3g tried lowering `rumpclk0`'s
+> rate and disproved it properly (worse, not better — see Phase 3g). Phase 3h
+> ruled out CPU contention and the TTY/procfs forwarding path as causes (both
+> measured, neither is it), fixing a real-but-not-load-bearing sshd
+> inefficiency along the way. **The floor is still open** — Phase 3i has the
+> honest next step.
 >
 > See `docs/archive/RUMP_LATENCY_SLEEP_FIX.md` for the earlier **disproven**
 > "lower `hz`" / `cv_broadcast`→`cv_signal` approach — disproven specifically
 > on the **pthread** backend (a `cv_broadcast` thundering herd across ~19 real
 > OS threads). That mechanism doesn't exist under the fiber backend (Phase 3e
 > proved fiber context switches are cheap even under 50-way contention), so
-> Phase 3f's `rumpclk0` finding is a **new data point, not a rerun of the old
-> one** — see Phase 3f below before assuming "already tried, don't bother."
+> Phase 3f's `rumpclk0` finding was a **new data point, not a rerun of the
+> old one** — though Phase 3g's fiber-specific hz test also came back
+> negative, so the practical conclusion (don't lower hz) ends up the same on
+> both backends, for different reasons.
 
 ## Symptom
 
@@ -380,6 +387,87 @@ measure-before-and-after discipline as every other phase here — not a blind
 patch. Left for Phase 3g rather than rushed through in the same pass as the
 identification.
 
+## Phase 3g — tested lowering `rumpclk0`'s tick rate: disproven, for real this time
+
+Set `rumpns_hz`/`rumpns_tick`/`rumpns_tickadj` (note the `rumpns_` prefix —
+rump namespaces every kernel-internal symbol to avoid host-libc collisions;
+plain `hz`/`tick`/`tickadj` link-fails with "undefined reference", confirmed
+via `nm` on `librump.a`'s `param.o`) to `hz=20` in `rump_server.rs`, right
+before `rump_init()` creates the `doclock` kthread. Booted clean — DHCP still
+completed, SSH still worked — so this wasn't a repeat of the old build
+failure, just a real behavior change measured properly:
+
+| Test | hz=100 (baseline) | hz=20 |
+|---|---|---|
+| Single keystroke round trip | ~300–400ms | ~300–400ms (no change) |
+| 50x printf burst | 458ms | **2675ms** (5.8x worse) |
+| 200x printf burst | 518ms | **9742ms** (19x worse) |
+
+Single-round-trip latency didn't improve at all, and burst workloads got
+dramatically worse. Reverted immediately (`RUMP_HZ = 100`, i.e. a no-op —
+left in the source as a documented, guarded experiment rather than deleted,
+so a future attempt doesn't have to rediscover the `rumpns_` prefix gotcha).
+
+Root cause of the regression: NetBSD's TCP/callout processing is
+timer-driven. A burst needs many internal handoffs to actually get each
+segment through the stack, and each of those is gated by the SAME clock
+tick — coarsening it from 10ms to 50ms multiplies the wait per handoff
+across all of them. This is a **different mechanism** than the old
+pthread-era disproof (thundering herd), but it lands on the same
+conclusion: don't lower `hz`. Two independent mechanisms, two backends, same
+answer — this is now a settled question, not just an old warning to route
+around.
+
+## Phase 3h — ruled out CPU contention; found and fixed a real sshd inefficiency
+
+Two things prompted by direct questions: "is `rump_server` clogging the
+CPU?" and "have we ever actually looked at the TTY path?" — both answered
+with real measurement rather than more rump-side speculation.
+
+### CPU: not the bottleneck
+
+Sampled host `ps -o %cpu` for the `qemu-system-aarch64` process (this VM is
+`-smp 1`, so all guest CPU activity funnels through one host thread) during
+the heaviest burst workload tested: **avg 1.14%, max 10.2%** across 227
+samples. Cross-checked against Akuma's own in-VM per-process stats
+(`[PSTATS]`): `rump_server`'s `in_kernel` time was ~99% of its wall-clock
+life, but the breakdown showed why that's not compute — `ppoll` alone
+accounted for 97%+ of that in-kernel time (115,410ms of 118,998ms over
+120s). `ppoll` is a blocking-wait syscall; "in kernel" here means "inside
+the syscall boundary," not "executing." `rump_server` is genuinely parked,
+not busy. Confirms the Phase 3e/3f finding from a completely different
+angle: this is a latency/scheduling-granularity problem, not a
+CPU-contention one.
+
+### TTY path: found a real inefficiency, measured it to not be the cause
+
+`sshd`'s `bridge_process` (`userspace/sshd/src/protocol.rs`) forwarded every
+single keystroke to the shell via `open("/proc/<pid>/fd/0", O_WRONLY)` →
+`write_fd` → `close` — a full procfs path resolution **on every character**,
+instead of opening the fd once per session and reusing it. Fixed: open once
+before the bridge loop, write through the same fd for the session's
+lifetime, close once at the end.
+
+Measured with a controlled A/B (same devbox boot, swapping only the `sshd`
+binary, 30-keystroke runs) rather than comparing against an earlier
+measurement from a different point in the session — burst-workload timings
+turned out to have high run-to-run variance (700ms–3000ms for the identical
+test on the identical binary, most likely host-level vCPU scheduling jitter
+from `-accel hvf` competing with other host load, not anything in this
+repo's code) that would have made an uncontrolled before/after comparison
+meaningless:
+
+| | median | range |
+|---|---|---|
+| Original (open+write+close per keystroke) | 319.7ms | 288–460ms |
+| Fixed (open once, reuse) | 319.7ms | 294–369ms |
+
+**No measurable effect on latency** — identical median. The fix is real (2
+fewer syscalls per keystroke, no functional change) and worth keeping, but
+it conclusively rules out sshd's procfs-open pattern as a contributor to the
+~300ms floor. The floor remains rooted in rump/fiber scheduling (Phase
+3e/3f), not in the TTY-forwarding path or CPU contention.
+
 ## Future work (Phase 3, not started)
 
 - **Phase 3a2**: A genuine push wake for tap RX would require NIC1 GIC
@@ -389,13 +477,16 @@ identification.
   `librumpnet_virtif`) to Rust for parity and maintainability.
 - **Phase 3d**: Per-socket wakers (conditional wake instead of broadcast) to
   reduce scheduler contention under many-fd workloads.
-- **Phase 3g**: Test lowering `rumpclk0`'s tick rate (`hz`) under the fiber
-  backend specifically — Phase 3f found it's 37% of all fiber scheduling
-  activity, and the earlier "lower hz" disproof (`RUMP_LATENCY_SLEEP_FIX.md`)
-  was measured on the pthread backend, a different mechanism (see Phase 3f's
-  writeup above). Where to set it: the Rust `main()` in `rump_server.rs` now
-  owns what `rump_server.c`'s wrapper used to (before `rump_init()`), not the
-  archived C file. Validate with the same before/after methodology as every
-  other phase — `round_robin_contention_scales_with_fiber_count`
-  (`test-fiber.sh`) for a fast sanity check, then a real devbox boot +
-  `interactive_latency.py`-style measurement before trusting the number.
+- **Phase 3i**: `rumpclk0` is confirmed load-bearing (37% of scheduling
+  activity, Phase 3f) and confirmed NOT fixable by just running it less often
+  (Phase 3g). The remaining lever is reducing the NUMBER of internal
+  wait/wake handoffs a single recv/send needs to traverse NetBSD's layered
+  stack — which needs the handoffs identified by name/purpose, not just
+  counted (extend Phase 3f's histogram to log the *chain* of names involved
+  in one traced round trip, not just aggregate counts). This is genuinely
+  unstarted and likely the real next step, not a quick experiment.
+- Host-level measurement noise (Phase 3h's 700–3000ms variance on identical
+  burst-test runs) should be controlled for in any future measurement here —
+  prefer the single-keystroke test (much lower variance, ~290–370ms
+  consistently) as the primary metric, or run burst tests in A/B pairs on
+  the same boot rather than trusting a single absolute number.
