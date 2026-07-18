@@ -72,36 +72,46 @@ pub fn effective_poll_interval_us(has_rump_fd: bool) -> u64 {
     }
 }
 
-/// True if `fd` in the current process resolves to a `RumpSocket`. Used to
-/// pick the shorter poll cadence for rump-box socket readiness checks.
+/// True if `fd` in the current process is a rump-box fd with no push readiness
+/// (a `RumpSocket`, or the raw `/dev/net/tap0` device rump_server's RX kthread
+/// blocks on) — used to pick the shorter poll cadence for these. Tap matters
+/// as much as sockets here: `rumpcomp_tap.c`'s `rcvthread` blocks on the tap fd
+/// via `rumpuser_akuma_wait_fd` (fiber idle-path `poll()`, or a direct host
+/// `poll()` under the pthread backend) for EVERY inbound frame, so leaving it
+/// out silently downgrades tap RX to the 10 ms default floor regardless of how
+/// tight `RUMP_BLOCKING_POLL_INTERVAL_US` is set.
 #[cfg(feature = "rump")]
-fn fd_is_rump_socket(fd: i32) -> bool {
+fn fd_wants_rump_poll_interval(fd: i32) -> bool {
     if fd < 0 {
         return false;
     }
     let Some(proc) = akuma_exec::process::current_process() else { return false };
     matches!(
         proc.get_fd(fd as u32),
-        Some(akuma_exec::process::FileDescriptor::RumpSocket { .. })
+        Some(
+            akuma_exec::process::FileDescriptor::RumpSocket { .. }
+                | akuma_exec::process::FileDescriptor::Tap { .. }
+        )
     )
 }
 
 /// True if any of the polled raw fd numbers (epoll interest list / ppoll fds)
-/// is a `RumpSocket` in the current process.
+/// wants the tightened rump poll cadence (see `fd_wants_rump_poll_interval`).
 #[cfg(feature = "rump")]
-fn any_fd_is_rump_socket(fds: &[u32]) -> bool {
-    fds.iter().any(|&fd| fd_is_rump_socket(fd as i32))
+fn any_fd_wants_rump_poll_interval(fds: &[u32]) -> bool {
+    fds.iter().any(|&fd| fd_wants_rump_poll_interval(fd as i32))
 }
 
 #[cfg(not(feature = "rump"))]
-fn any_fd_is_rump_socket(_fds: &[u32]) -> bool {
+fn any_fd_wants_rump_poll_interval(_fds: &[u32]) -> bool {
     false
 }
 
-/// True if any fd in the select(2) fd_set bitmaps is a `RumpSocket` in the
-/// current process. Walks only the set bits (typically a handful).
+/// True if any fd in the select(2) fd_set bitmaps wants the tightened rump
+/// poll cadence (see `fd_wants_rump_poll_interval`). Walks only the set bits
+/// (typically a handful).
 #[cfg(feature = "rump")]
-fn fd_set_contains_rump_socket(readfds: &[u64], writefds: &[u64], nfds: usize) -> bool {
+fn fd_set_wants_rump_poll_interval(readfds: &[u64], writefds: &[u64], nfds: usize) -> bool {
     let nwords = nfds.div_ceil(64);
     for word_idx in 0..nwords {
         let bits = readfds.get(word_idx).copied().unwrap_or(0)
@@ -117,7 +127,7 @@ fn fd_set_contains_rump_socket(readfds: &[u64], writefds: &[u64], nfds: usize) -
             if fd >= nfds {
                 break;
             }
-            if fd_is_rump_socket(fd as i32) {
+            if fd_wants_rump_poll_interval(fd as i32) {
                 return true;
             }
         }
@@ -126,7 +136,7 @@ fn fd_set_contains_rump_socket(readfds: &[u64], writefds: &[u64], nfds: usize) -
 }
 
 #[cfg(not(feature = "rump"))]
-fn fd_set_contains_rump_socket(_readfds: &[u64], _writefds: &[u64], _nfds: usize) -> bool {
+fn fd_set_wants_rump_poll_interval(_readfds: &[u64], _writefds: &[u64], _nfds: usize) -> bool {
     false
 }
 
@@ -740,7 +750,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
             );
             return 0;
         }
-        let deadline = abs_deadline.min(crate::timer::uptime_us() + effective_poll_interval_us(any_fd_is_rump_socket(fds)));
+        let deadline = abs_deadline.min(crate::timer::uptime_us() + effective_poll_interval_us(any_fd_wants_rump_poll_interval(fds)));
 
         akuma_exec::threading::schedule_blocking(deadline);
     }
@@ -785,7 +795,7 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
 
     // Rump sockets have no push readiness yet (MSG_PEEK probe only), so a
     // shorter per-iteration sleep ceiling keeps their poll cadence tight.
-    let has_rump_fd = fd_set_contains_rump_socket(&orig_read, &orig_write, nfds);
+    let has_rump_fd = fd_set_wants_rump_poll_interval(&orig_read, &orig_write, nfds);
 
     loop {
         #[cfg(feature = "smoltcp")]
@@ -891,7 +901,7 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
 
     // Rump sockets have no push readiness yet (MSG_PEEK probe only), so a
     // shorter per-iteration sleep ceiling keeps their poll cadence tight.
-    let has_rump_fd = kernel_fds.iter().any(|p| fd_is_rump_socket(p.fd));
+    let has_rump_fd = kernel_fds.iter().any(|p| fd_wants_rump_poll_interval(p.fd));
 
     loop {
         #[cfg(feature = "smoltcp")]

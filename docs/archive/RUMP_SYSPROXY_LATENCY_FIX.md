@@ -1,6 +1,6 @@
-# Rump sysproxy latency — Phase 2 fix (network thread + poll cadence)
+# Rump sysproxy latency — Phase 2 + 3a fix (network thread + poll cadence)
 
-> **Status: LIVE (2026-07-18).** Phase 2a + 2b applied, measured, verified.
+> **Status: LIVE (2026-07-18).** Phase 2a + 2b + 3a applied, measured, verified.
 > See `docs/archive/RUMP_LATENCY_SLEEP_FIX.md` for the earlier **disproven**
 > approach (lowering `hz`, `cv_broadcast`→`cv_signal`) — do NOT revisit.
 
@@ -81,10 +81,10 @@ stubs returning `false`.
 
 ## Measurement (2026-07-18, devbox, single kernel, QEMU virt, 4 GB)
 
-| Metric | Baseline | Phase 2b only | Phase 2a (fixed) + 2b |
-|--------|----------|---------------|----------------------|
-| `uname -a` over SSH (median) | ~3.4 s | ~2.7 s | **1.96 s** (−42%) |
-| `echo hello` over SSH (median) | ~4.0 s | ~2.7 s | **1.97 s** (−51%) |
+| Metric | Baseline | Phase 2b only | Phase 2a + 2b | Phase 2a+2b+3a |
+|--------|----------|---------------|----------------|----------------|
+| `uname -a` over SSH (median) | ~3.4 s | ~2.7 s | 1.96 s (−42%) | **1.85 s** (−46%) |
+| `echo hello` over SSH (median) | ~4.0 s | ~2.7 s | 1.97 s (−51%) | **1.81 s** (−55%) |
 
 Per-call sysproxy trace (`RUMP_SP_TRACE=true`) before vs after:
 
@@ -114,10 +114,44 @@ Enabled on devbox via the `rump-tests` Cargo feature (allows rump_tests to
 compile alongside `no-tests` without pulling in the full smoltcp-coupled test
 suite).
 
-## Future work (Phase 3, not yet started)
+## Phase 3a — tap fd was missing the tightened rump poll cadence
 
-- **Phase 3a**: Add a readiness waker in `rumpcomp_tap.c` so rump_server's
-  fiber scheduler gets woken immediately on tap RX, instead of polling.
+The original plan for Phase 3a was "add a readiness waker in `rumpcomp_tap.c`
+so rump_server's fiber scheduler gets woken immediately on tap RX." That
+premise doesn't hold: `/dev/net/tap0` (NIC1, `crates/akuma-net/src/rump_tap.rs`)
+is **pure register-polled virtio, no RX IRQ** — nothing in the kernel
+discovers a frame's arrival except a caller actively checking
+`akuma_net::rump_tap::has_frame()`. There is no independent event to push a
+wake from; a "waker" with nothing to fire it is a no-op. Building a real
+push-wake would mean adding NIC1 GIC interrupt handling from scratch — out of
+scope here (tracked as Phase 3a2 below, if ever needed).
+
+What *was* real: `rumpcomp_tap.c`'s `rcvthread` already blocks on the tap fd
+via `rumpuser_akuma_wait_fd` (fiber backend: `fiber.rs`'s `schedule()` idle
+path calls the kernel's `poll()`/`sys_ppoll` on it; pthread backend: a direct
+host `poll()`). That `sys_ppoll` blocking loop re-checks readiness on a fixed
+cadence — 1 ms for "rump fds", 10 ms otherwise (`RUMP_BLOCKING_POLL_INTERVAL_US`
+vs `BLOCKING_POLL_INTERVAL_US`, `src/syscall/poll.rs`). The classifier that
+picks between them, `fd_is_rump_socket` (now `fd_wants_rump_poll_interval`),
+only matched `FileDescriptor::RumpSocket` — **not** `FileDescriptor::Tap`.
+So the RX kthread's per-frame wait — the highest-frequency rump-fd wait in the
+whole system — was silently paying the 10 ms floor instead of the 1 ms one
+Phase 2b introduced, on every SSH round-trip.
+
+### Fix
+
+`src/syscall/poll.rs`: renamed `fd_is_rump_socket` →
+`fd_wants_rump_poll_interval` (and its `any_fd_*`/`fd_set_*` callers to
+match, all private to this file) and widened its match to also accept
+`FileDescriptor::Tap { .. }`. Three call sites already routed through it
+(`sys_epoll_pwait`, `sys_pselect6`, `sys_ppoll`), so no new call sites were
+needed — this was a pure classification fix.
+
+### Future work (Phase 3, not started)
+
+- **Phase 3a2**: A genuine push wake would require NIC1 GIC interrupt
+  handling (none exists today — see above); only worth it if 1 ms is still
+  measurably too coarse after 3a.
 - **Phase 3b**: Port `rumpcomp_tap.c` (241 lines, C-ABI to NetBSD
   `librumpnet_virtif`) to Rust for parity and maintainability.
 - **Phase 3c**: Per-socket wakers (conditional wake instead of broadcast) to
