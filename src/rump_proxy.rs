@@ -151,6 +151,26 @@ pub struct BoxProxy {
 
 impl BoxProxy {
     /// Run `f` with exclusive access to the client (see field doc).
+    ///
+    /// Preemption is disabled across `f`. This is the sysproxy latency fix: a
+    /// proxied syscall's request is written to the kernel→server pipe as two
+    /// `pipe_write`s (header, then args), and `pipe_write` wakes the server's
+    /// poller (SGI) on the *first* one. With preemption enabled, that SGI could
+    /// preempt this box thread mid-request — after the header, before the args —
+    /// leaving the server woken on a partial frame and this thread dumped into
+    /// the ~10 ms-tick-gated round-robin to finish writing. Measured: ~48 ms per
+    /// leg (a full scheduler round trip), even for an EAGAIN recvfrom where the
+    /// server does no work — pure scheduling latency, not rump_server cost.
+    ///
+    /// Disabling preemption makes the request write atomic: the wake-SGI is a
+    /// no-op while disabled (the scheduler's involuntary path honors
+    /// `is_preemption_disabled`), so the full frame lands before this thread
+    /// blocks. When it then blocks on the reply, `schedule_blocking` re-enables
+    /// preemption and does a *voluntary* directed hand-off (SGI) straight to the
+    /// now-runnable server — bypassing the round-robin — and restores the
+    /// disabled count on wake. So the round trip is two directed context
+    /// switches (µs), not ~5 timer ticks (~48 ms). Same fix class as the
+    /// multikernel forwarded-syscall doorbell wake (136 ms → 45 µs).
     fn with_client<R>(&self, f: impl FnOnce(&mut ProxyClient) -> R) -> R {
         let mut c = loop {
             if let Some(c) = self.client.lock().take() {
@@ -158,7 +178,9 @@ impl BoxProxy {
             }
             threading::yield_now();
         };
+        threading::disable_preemption();
         let r = f(&mut c);
+        threading::enable_preemption();
         *self.client.lock() = Some(c);
         r
     }

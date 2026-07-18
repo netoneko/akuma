@@ -799,6 +799,15 @@ Median: ~1733ms
 
 ### Combined Analysis
 
+> **⚠️ Correction (see Phase 3q): conclusion #2/#3 below are WRONG.** The ~95 ms
+> per syscall is NOT rump_server internal processing — it is Akuma-side scheduler
+> round-trip latency (~10 ms-tick-gated). Phase 3q proves this: an EAGAIN
+> `recvfrom`, where rump_server does *zero* work, still costs ~48 ms. The
+> `blk=0`/`hops=0` readings that suggested "not scheduling" only measure the
+> reply-side block; the cost is on the *request-send* leg, which this
+> instrumentation attributed to "write" without recognizing it as a preemption
+> gap. Read Phase 3q for the real root cause and fix.
+
 Both measurement tasks confirm the same root cause:
 1. **Kernel-side overhead**: Minimal and not the bottleneck
 2. **rump_server internal processing**: The primary cost center at ~95ms per syscall
@@ -815,6 +824,108 @@ Both measurement tasks confirm the same root cause:
 1. Reducing the number of syscalls per keystroke (protocol optimization)
 2. Optimizing rump_server internal processing (NetBSD kernel tuning)
 3. Investigating why rump_server needs ~95ms per syscall (likely the ~6 sp_cond_wait handoffs identified in Phase 3i)
+
+## Phase 3q — root cause FOUND: the ~48 ms/leg is Akuma scheduler round-trip, not rump_server (+ Tier 1 fix)
+
+Phase 3p mis-concluded (see the correction above). Re-measured with the same
+`RUMP_SP_TRACE` instrumentation plus a smoltcp control, and traced the write leg
+all the way through the pipe transport and the thread scheduler. The cost is
+**Akuma-side scheduler round-trip latency**, gated by the 10 ms preemption tick —
+not rump_server processing.
+
+### The control that settles it
+
+Same kernel/disk (release + `userspace-sshd`), one build with box 0 on **smoltcp**
+(no `rump-default`, no `RUMP_NIC`) and one on **rump** (devbox profile). Measured
+with `scripts/ssh_harness.py echo` (interactive PTY, 16 B/round) — the clean
+single-keystroke round trip, not a fresh-connect one-shot:
+
+| Path | keystroke echo p50 | p95 | connect (KEX) |
+|---|---|---|---|
+| smoltcp (userspace sshd, in-kernel SSH off) | **37.8 ms** | 53.7 ms | 91.7 ms |
+| rump | **318.8 ms** | 334.9 ms | 921.6 ms |
+| rump tax | **+281 ms** | +281 ms | +830 ms |
+
+So the ~300 ms figure from earlier phases is the *clean* per-keystroke rump floor
+(the ~1733 ms of Phase 3p Task 2 was a fresh connect+exec+teardown, not one
+keystroke). Rump is ~8.4× the smoltcp floor.
+
+### The smoking gun
+
+Per-leg trace of one keystroke's syscalls (`[kern: w=<write_us> r=<read_us>]`):
+
+```
+recvfrom -> errno 35 (48647us; hops=0 blk=0us/0) [kern: w=48646 r=1 ...]   # EAGAIN — server did NOTHING
+recvfrom a2=512 -> 80 (49226us;  hops=1 blk=0us/0) [kern: w=49223 r=2 ...]
+sendto  a2=128 -> 128 (96144us;  hops=1 blk=0us/0) [kern: w=47338 r=48805]
+```
+
+`errno 35` is **EAGAIN**: a non-blocking `recvfrom` with no data, for which
+rump_server does essentially no work — yet it costs ~48 ms, entirely in the write
+leg. Compute cannot explain a flat ~48 ms that is independent of payload size and
+present even when the server does nothing. It is a fixed scheduling latency.
+
+### Traced to the mechanism
+
+- `Client::syscall` (crates/akuma-rump/src/sysproxy.rs) writes the request as
+  **two** transport writes — `write_all(hdr)` then `write_all(args)` — and times
+  only those two calls as `last_write_us`.
+- `PipeTransport::write_all` → `KernelPipeIo::write` → `pipe::pipe_write`
+  (src/syscall/pipe.rs) is **instant and non-blocking**: it appends to the pipe
+  buffer and wakes the pipe's pollers. `ThreadWaker::wake` marks the server READY
+  and fires a scheduler **SGI**.
+- The trap: `pipe_write` wakes the server after the **header**, before `args` is
+  written. With preemption enabled, that SGI preempts the box's sshd thread
+  mid-request. The server wakes on a **partial frame**, can't complete
+  `readframe`, and re-blocks; the box thread, now merely READY, waits for the
+  10 ms-tick round-robin to cycle back — several ticks (~48 ms) — before it can
+  even write `args`. That whole off-CPU gap is charged to `last_write_us`, which
+  is why an instant `pipe_write` "takes" 48 ms.
+- The **reply** leg is already fast (`r`≈1 µs) because `schedule_blocking`
+  (crates/akuma-exec/src/threading/mod.rs) already does a *voluntary directed
+  hand-off* (sets `VOLUNTARY_SCHEDULE`, fires an SGI to switch immediately rather
+  than wait a tick) — added earlier for exactly "the rump sysproxy client↔server
+  pipe hop." Only the request-send leg lacked the equivalent.
+
+The single-core scheduler tick is `config::TIMER_INTERVAL_US = 10_000` (10 ms);
+~48 ms ≈ ~5 ticks per leg. This is the same bug class the multikernel
+forwarded-syscall path already fixed with a doorbell wake + voluntary reschedule
+(136 ms → 45 µs); it was simply never applied to the single-core rump sysproxy.
+
+### Tier 1 fix (implemented): make the request-send atomic
+
+`BoxProxy::with_client` (src/rump_proxy.rs) — the single choke point every
+proxied syscall funnels through — now brackets the call in
+`threading::disable_preemption()` / `enable_preemption()`. Effects:
+
+- The header's wake-SGI becomes a no-op while preemption is disabled (the
+  scheduler's *involuntary* path honors `is_preemption_disabled`), so both writes
+  land and the full request frame is buffered before the box thread yields.
+- When the thread then blocks on the reply, `schedule_blocking` re-enables
+  preemption and does its *voluntary* directed hand-off straight to the
+  now-runnable server (voluntary bypasses the preemption guard), and restores the
+  disabled count on wake (`if was_disabled { disable_preemption() }`), so the
+  guard's nesting counter stays balanced across the block.
+
+Net: the round trip becomes two directed context switches (µs) instead of ~5
+timer ticks per leg — for both the real recv/send and the wasted EAGAIN polls.
+Nagle/`TCP_NODELAY` is untouched (that was Phase 3p+1's abandoned side-quest,
+reverted).
+
+### Tier 2 (planned): coalesce the request into one `pipe_write`
+
+Even with Tier 1, `Client::syscall` still issues two `pipe_write`s. Combining
+`hdr` + `args` into a single transport write means one buffer append and one
+wake with the complete frame — a smaller, complementary win on top of Tier 1.
+Wire-compatible (the pipe is a byte stream; the server's `readframe` reads
+header-then-payload regardless).
+
+### Note: smoltcp floor is a separate, analogous issue
+
+The 37.8 ms smoltcp keystroke floor does NOT go through rump/sysproxy, so Tier 1
+does not touch it. But ~38 ms ≈ ~4 ticks strongly suggests the same
+tick-gated-wakeup disease between the userspace sshd thread and the kernel
+net-poll loop — a separate follow-up with the same harness.
 
 ## Future work (Phase 3, not started)
 
