@@ -8,8 +8,14 @@
 > rate and disproved it properly (worse, not better — see Phase 3g). Phase 3h
 > ruled out CPU contention and the TTY/procfs forwarding path as causes (both
 > measured, neither is it), fixing a real-but-not-load-bearing sshd
-> inefficiency along the way. **The floor is still open** — Phase 3i has the
-> honest next step.
+> inefficiency along the way. Phase 3i pinned the floor down precisely:
+> `rumpsp` spends essentially 100% of a round trip cycling through **~6
+> sequential wait/wake handoffs, each costing 30-95ms** — not a fixed floor,
+> not idle time, not compute. Also tried and closed: removing
+> `rumpvfs`/`rumpdev`/`rumpdev_bpf` to shed unused kthreads panics
+> `socket()` itself (BSD ties sockets into the same fd/vnode machinery as
+> files). **The floor is still open** — Phase 3j (name the 6 handoffs) has
+> the honest next step.
 >
 > See `docs/archive/RUMP_LATENCY_SLEEP_FIX.md` for the earlier **disproven**
 > "lower `hz`" / `cv_broadcast`→`cv_signal` approach — disproven specifically
@@ -468,6 +474,63 @@ it conclusively rules out sshd's procfs-open pattern as a contributor to the
 ~300ms floor. The floor remains rooted in rump/fiber scheduling (Phase
 3e/3f), not in the TTY-forwarding path or CPU contention.
 
+## Phase 3i — the 300ms is a chain of ~6-10 short waits, not one floor
+
+Extended the Phase 3f histogram into a full per-wait sequence trace: every
+`wait()` return (not just the ≥1ms-filtered ones from 3e/3f) logs its
+fiber's name + elapsed time + a monotonic timestamp, capped by total event
+count (60,000) rather than a time window or duration filter — a duration
+filter throws away exactly the fine-grained sequencing needed here, and a
+naive "trace everything, always" repeats Phase 3e's write-storm mistake. One
+`write()` per line (the `LineBuf` from 3e), so 60k lines is cheap.
+
+Booted, ran one isolated keystroke round trip immediately after boot
+settled, pulled `/var/log/box/0/rump_server.log`, and picked a clean 350ms
+window mid-capture:
+
+```
+window: 9 events in 350ms
+rumpsp: 6 wait-completions, sum=362ms, individual=[94, 33, 56, 64, 58, 57]
+fiber counts in window: {rumpsp: 6, rsi0/1: 2, vdrain: 1}
+```
+
+**`rumpsp` — the fiber doing our actual sysproxy work — was blocked inside
+`wait()` for 362ms of a 350ms wall-clock window.** Not one big stall, not
+idle time, not CPU contention (Phase 3h already ruled that out): a *chain*
+of 6 sequential block/wake cycles, each costing 30-95ms (3-9 ticks at
+hz=100), one immediately after another. This is the precise shape of the
+~300ms floor: `rumpsp` spends the entire round trip cycling through this
+chain, essentially never idle and never doing sustained work either.
+
+This explains why Phase 3g's `hz` experiment made things worse instead of
+better: if the round trip's cost is "N sequential handoffs × ticks per
+handoff," lowering the tick rate multiplies N's cost instead of reducing N.
+The only lever that helps is cutting N itself — collapsing some of those 6
+handoffs into fewer, or making individual handoffs resolve in closer to 1
+tick instead of 3-9. Neither is done; this phase identifies the shape of the
+problem precisely but doesn't fix it.
+
+### Tried removing unnecessary kthreads (rumpvfs/rumpdev/rumpdev_bpf): disproven
+
+The histogram (Phase 3f) shows VFS-housekeeping kthreads (`vdrain`, `vrele`,
+`cachegc`, `ioflush`) and device kthreads (`aiodoned`, `pmfevent`,
+`pmfsuspend`) that look irrelevant to a network-only rump instance with no
+real filesystem or device I/O — candidates for shrinking the round-robin
+`rumpsp` has to share. Tested removing `-lrumpdev_bpf -lrumpdev -lrumpvfs`
+from `docker-build-rump-server.sh`'s link line: links fine (binary drops
+13.9MB → 11.5MB, incidentally answering "why is it 13MB" — `--whole-archive`
+force-includes every object from every linked library, so unused libraries
+are pure bloat, not just unused kthreads), but **panics at boot**:
+`panic: failed to open socket: 18`, right after `ifcreate virt0`. BSD
+unifies files and sockets under the same fd/vnode abstraction, so `rumpvfs`
+turned out to be load-bearing for `socket()` itself, not just real
+filesystem access. Tried a narrower cut (keep `-lrumpvfs`, drop only
+`-lrumpdev`/`-lrumpdev_bpf`): identical panic — the virtif network
+attachment apparently goes through the device layer too. Both reverted;
+the full library set is required. This avenue is closed, not just
+deprioritized — don't re-attempt without a different specific hypothesis
+for which library boundary is actually safe to cut.
+
 ## Future work (Phase 3, not started)
 
 - **Phase 3a2**: A genuine push wake for tap RX would require NIC1 GIC
@@ -477,14 +540,15 @@ it conclusively rules out sshd's procfs-open pattern as a contributor to the
   `librumpnet_virtif`) to Rust for parity and maintainability.
 - **Phase 3d**: Per-socket wakers (conditional wake instead of broadcast) to
   reduce scheduler contention under many-fd workloads.
-- **Phase 3i**: `rumpclk0` is confirmed load-bearing (37% of scheduling
-  activity, Phase 3f) and confirmed NOT fixable by just running it less often
-  (Phase 3g). The remaining lever is reducing the NUMBER of internal
-  wait/wake handoffs a single recv/send needs to traverse NetBSD's layered
-  stack — which needs the handoffs identified by name/purpose, not just
-  counted (extend Phase 3f's histogram to log the *chain* of names involved
-  in one traced round trip, not just aggregate counts). This is genuinely
-  unstarted and likely the real next step, not a quick experiment.
+- **Phase 3j**: Identify what the 6 `rumpsp` handoffs in one round trip are
+  *for* — which lock/cv each one blocks on, and who's expected to wake it.
+  Phase 3i named the fiber and counted the handoffs but not their individual
+  purpose. Needs per-cv or per-call-site labeling (the `wait()` call sites
+  are spread across `mutex_enter`/`cv_wait`/`rw_enter` in fiber.rs, and the
+  actual cv identity comes from deep inside the vendored NetBSD stack, not
+  from fiber.rs itself) — collapsing any of the 6 into a faster path is the
+  only remaining lever now that hz-tuning (3g) and kthread-pruning (3i) are
+  both closed.
 - Host-level measurement noise (Phase 3h's 700–3000ms variance on identical
   burst-test runs) should be controlled for in any future measurement here —
   prefer the single-keystroke test (much lower variance, ~290–370ms
