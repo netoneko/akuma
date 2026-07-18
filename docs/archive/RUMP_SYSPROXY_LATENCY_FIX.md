@@ -14,8 +14,23 @@
 > not idle time, not compute. Also tried and closed: removing
 > `rumpvfs`/`rumpdev`/`rumpdev_bpf` to shed unused kthreads panics
 > `socket()` itself (BSD ties sockets into the same fd/vnode machinery as
-> files). **The floor is still open** — Phase 3j (name the 6 handoffs) has
-> the honest next step.
+> files). Phase 3j named the handoffs precisely: **100% `sp_cond_wait`** —
+> the sysproxy protocol's own producer/consumer worker-dispatch design
+> (built for real OS-thread parallelism, pure overhead under one cooperative
+> fiber), not kernel locks or the rump-CPU token. A wakeup-locality fix for
+> it hung under contention (bug, disabled, never deployed) — moot anyway,
+> since Phase 3k measured pure scheduling delay at only ~7ms/handoff average,
+> confirming the real cost is genuine event-wait time on both sides of the
+> handoff (worker AND the previously-invisible receiver wait), not
+> scheduling slack. Phase 3l explained *why* the receiver's wait is slow
+> despite being "event-driven": `schedule()` only reaches the poll branch
+> that registers Akuma's fd-waker ~24% of the time (the rest, `rumpclk0` or
+> another periodic kthread is already runnable and wins round-robin), and
+> even when it does, the poll window itself is tick-sized (~14ms avg,
+> whether resolved by a real event or a timeout) — both effects trace back
+> to `rumpclk0`'s ubiquity (Phase 3f), not a bug in the waker. **The floor
+> is still open** — Phase 3m (measure the Akuma-kernel-side round trip in
+> isolation) has the honest next step.
 >
 > See `docs/archive/RUMP_LATENCY_SLEEP_FIX.md` for the earlier **disproven**
 > "lower `hz`" / `cv_broadcast`→`cv_signal` approach — disproven specifically
@@ -531,6 +546,151 @@ the full library set is required. This avenue is closed, not just
 deprioritized — don't re-attempt without a different specific hypothesis
 for which library boundary is actually safe to cut.
 
+## Phase 3j — named the call site: 100% `sp_cond_wait`, not kernel/CPU-token waits
+
+Tagged each of the 6 `rumpuser_*` hypercalls that funnel into `wait()`
+(`mutex_enter`, `sp_mutex_lock`, `sp_cond_wait`, `rw_enter`, `cv_wait`,
+`cv_wait_nowrap`, `cv_timedwait`) with a `WAIT_KIND` set immediately before
+each call site's `wait(...)` and read inside `wait()` — safe as a single
+global with no locking because this is a cooperative single-OS-thread
+scheduler: between one call site setting it and `wait()` reading it, no
+other code can run. (First cut read `WAIT_KIND` *after* `schedule()`
+returned — a real bug, since another fiber could run in between and
+overwrite the global before we resumed; fixed by capturing it into a local
+before the switch.)
+
+Result, one isolated keystroke round trip: **464/464 of `rumpsp`'s waits
+were `sp_cond_wait`. Zero were `cv_wait_nowrap`** — the single
+rump-virtual-CPU scheduling token (`rump_schedule_cpu`'s `rcpu_cv`, the
+mechanism `RUMP_LATENCY_SLEEP_FIX.md` originally implicated). This rules out
+kernel-lock contention and CPU-token contention as the cause and points
+squarely at `sp_serve_fd.c`/the vendored `rumpuser_sp.c`'s **own** internal
+architecture: every thread it creates — the receiver (`spserver_fd`) *and* a
+separate per-request worker (`serv_workbouncer`, spawned by `schedulework`)
+— is created via `rumpuser_thread_create(..., "rumpsp", ...)`, so they all
+share one name in the histogram. The pattern: receiver reads a frame →
+`schedulework` queues it and either signals an idle worker or spawns one →
+worker dequeues, executes the syscall, sends the response, loops back to
+`sp_cond_wait` for the next job. This is a **producer/consumer design built
+for real OS-thread parallelism** (receiver and worker running concurrently
+on separate cores) — sound for the pthread backend, but under one
+cooperative fiber there's no actual parallelism to gain from splitting
+receiver and worker onto separate fibers, only the handoff's latency cost.
+
+### Tried: wakeup-locality hint at the fiber-scheduler level — found a real hang, disabled
+
+Akuma's OS-thread scheduler already has this idea (`PREEMPT_WAKE_TID` in
+`crates/akuma-exec/src/threading/mod.rs`), gated off because "woken threads
+already run promptly via the SGI" (a hardware interrupt reschedules
+immediately there). `fiber.rs` has no such mechanism — a woken fiber only
+actually runs once the currently-running fiber calls `schedule()` and the
+round-robin scan reaches it — so that disproof doesn't transfer. Implemented
+the same idea here: `wake()` sets a `WAKE_HINT`, `schedule()`'s scan prefers
+it over the fallback-to-first-runnable it would otherwise pick.
+
+**Hung** the host-testable contention benchmark (`round_robin_contention_scales_with_fiber_count`)
+the moment background pairs were introduced (passed at `fibers=2`, wedged
+indefinitely at `fibers=6`) — a real correctness bug, not just "no
+improvement," root cause not identified. Disabled immediately
+(`WAKE_LOCALITY_HINT = false`, code kept in place but fully inert — matches
+the `PREEMPT_WAKE_TID` precedent of preserving a tried-and-rejected
+experiment rather than deleting it) and verified the fast host test suite
+passes again before doing anything else. **Never deployed to devbox.**
+
+## Phase 3k — measured scheduling delay directly: only ~7ms, not the dominant cost
+
+Before chasing the hang further, measured whether it would even have
+mattered: added `Thread::wake_time` (timestamp `wake()` marks a fiber
+runnable) and read it in `switch_threads` — the gap between "became
+runnable" and "actually resumed" is pure scheduling delay, isolated from
+whatever the wait was semantically for.
+
+Result: **`sched_delay: count=4415 sum_ms=34238 avg_ms=7 max_ms=235`.**
+Average scheduling delay per wake is ~7ms — a small fraction of the 20-90ms
+average per `sp_cond_wait` handoff measured in Phase 3i/3j. So even a
+correctly-implemented wakeup-locality hint would only have shaved off a
+minority of the cost; the hang cost little upside. (The max=235ms outlier is
+real and worth keeping in mind, but it's the exception, not the pattern.)
+
+### Also instrumented: the receiver's OWN wait, previously invisible
+
+`rumpuser_akuma_wait_fd` (what `spserver_fd`'s receiver loop blocks in
+between requests) calls `schedule()` directly — it never goes through the
+shared `wait()` helper, so none of the Phase 3e-3j tracing saw it at all.
+Added the same per-call trace (`w3k`, sharing `w3i`'s event-count budget).
+Sample from one round trip: ~25 events, 2-55ms each, **all `revents=1`**
+(woken by real data arrival, not a timeout) — meaning this is genuine
+"waiting for the kernel to actually deliver the next frame" time, not idle
+scheduling overhead either.
+
+**Running both traces (`w3i` and `w3k`) at once made the box unresponsive**
+— doubled the per-event I/O this session's own Phase 3e writeup already
+warned about. Not a production issue (verified separately: the clean,
+non-debug binary handled 5 sequential and 4 concurrent SSH connections fine
+— concurrent ones serialize and slow down as documented in
+`debug-devbox.md`'s "single box-0 proxy" limitation, but none hung). A
+lesson for whoever runs Phase 3l: budget the *combined* event rate across
+all active trace points, not each one independently.
+
+**Net position going into Phase 3l**: both the worker's `sp_cond_wait`
+(20-90ms/handoff) and the receiver's `wait_fd` (2-55ms/handoff) cost real,
+event-driven wait time that ISN'T pure scheduling delay (confirmed ~7ms avg)
+and ISN'T CPU contention (Phase 3h).
+
+## Phase 3l — why `rumpuser_akuma_wait_fd` waits so long: found the actual split
+
+The receiver's fd-wait is only serviced by `schedule()`'s idle/poll branch —
+the ONE place Akuma's poll-waker (what makes new sysproxy data
+"event-driven") actually gets registered. Every other branch of `schedule()`
+just round-robins to whatever else is runnable. Phase 3k's `SCHED_IDLE_COUNT`
+only ever tracked the *pure-nanosleep* half of that branch (`nfds==0`); it
+said nothing about how often the *actual* `poll()`-with-fds call — the one
+`rumpuser_akuma_wait_fd` depends on — gets reached, or how it resolves once
+it does. Added two more counter groups to close that gap:
+
+- `SCHED_NORMAL_PICK_COUNT`: incremented whenever `schedule()`'s scan finds
+  something immediately runnable (hint or fallback) and never reaches the
+  idle/poll branch at all this cycle.
+- `SCHED_POLL_COUNT`/`_MS_TOTAL`/`_EVENT_COUNT`/`_TIMEOUT_COUNT`/
+  `_TIMEOUT_MS_TOTAL`: timing and outcome for every `poll()` call that DOES
+  happen — split by whether it resolved via a real event (the waker fired)
+  or just ran out its timeout budget.
+
+One isolated keystroke round trip:
+
+```
+sched_delay:  count=3943 sum_ms=30484 avg_ms=7   max_ms=249
+sched_reach:  normal_pick=6009  poll_calls=1892  poll_avg_ms=14
+              poll_event=1164  poll_timeout=726  poll_timeout_ms_total=12168
+```
+
+Two things, both real:
+
+1. **`schedule()` reaches the poll/idle branch only ~24% of the time**
+   (1892 of 6009+1892 ≈ 7901 total scan outcomes) — the other ~76% it finds
+   `rumpclk0` or another periodic kthread (Phase 3f) already runnable and
+   round-robins to that instead. The receiver's fd only gets a chance to
+   register its event-driven wait when NOTHING else is momentarily ready.
+2. Of the calls that DO reach `poll()`: 61% (1164/1892) resolve via a real
+   event, 39% (726/1892) genuinely time out with nothing to report. Backing
+   out the timeout-only average (`12168ms / 726 ≈ 16.8ms`) from the overall
+   average (`14ms`) puts the EVENT-resolved calls at roughly **12ms
+   average** too — not the "returns immediately" the waker mechanism's own
+   doc comment implies. That's not a bug in the waker itself; it's that
+   `poll()`'s timeout window (`delta`, bounded by whichever OTHER thread's
+   `wakeup_time` is soonest — often `rumpclk0`'s own ~10ms tick) is itself
+   routinely 10-20ms wide, so an event landing partway through it still
+   costs a meaningful fraction of that window before `poll()` returns.
+
+So `rumpuser_akuma_wait_fd`'s long waits are explained by two independent,
+additive effects, neither of which is a bug: **(a)** it's frequently not
+even polled for a while because other periodic kthreads keep the scheduler
+busy round-robining elsewhere, and **(b)** when it is polled, the window
+it's polled within is itself tick-sized, so even a genuine event doesn't
+resolve as fast as "event-driven" suggests. This is the same underlying
+fact as Phase 3f/3i from a different angle — `rumpclk0`'s ubiquity limits
+how promptly *anything* else, scheduling or fd-waiting, gets attention.
+
 ## Future work (Phase 3, not started)
 
 - **Phase 3a2**: A genuine push wake for tap RX would require NIC1 GIC
@@ -540,17 +700,35 @@ for which library boundary is actually safe to cut.
   `librumpnet_virtif`) to Rust for parity and maintainability.
 - **Phase 3d**: Per-socket wakers (conditional wake instead of broadcast) to
   reduce scheduler contention under many-fd workloads.
-- **Phase 3j**: Identify what the 6 `rumpsp` handoffs in one round trip are
-  *for* — which lock/cv each one blocks on, and who's expected to wake it.
-  Phase 3i named the fiber and counted the handoffs but not their individual
-  purpose. Needs per-cv or per-call-site labeling (the `wait()` call sites
-  are spread across `mutex_enter`/`cv_wait`/`rw_enter` in fiber.rs, and the
-  actual cv identity comes from deep inside the vendored NetBSD stack, not
-  from fiber.rs itself) — collapsing any of the 6 into a faster path is the
-  only remaining lever now that hz-tuning (3g) and kthread-pruning (3i) are
-  both closed.
+- **Phase 3m**: Measure the Akuma-kernel-side round trip for one proxied
+  syscall in isolation (kernel writes request → rump_server responds →
+  kernel reads response), now that Phase 3k/3l have shown rump_server's OWN
+  wait time is genuine event-waiting (plus schedule-branch starvation from
+  `rumpclk0`), not raw scheduling slack. If that hop is also tens of ms, the
+  remaining lever is there, not inside rump_server at all.
+- **Phase 3n** (optional, low priority): root-cause the Phase 3j wakeup-locality
+  hang before ever re-attempting it — given Phase 3k showed only ~7ms/handoff
+  of scheduling delay exists to reclaim, this is low value regardless; only
+  worth it out of general fiber.rs correctness interest.
+- **Phase 3o**: `rumpclk0` keeps coming up (37% of scheduling activity in
+  3f, ~76% of schedule() calls bypassing the idle/poll branch in 3l). Every
+  angle tried so far treats it as fixed background cost — lowering its rate
+  (3g) made things worse, removing it isn't an option (it's NetBSD's
+  softclock, load-bearing). Worth asking a different question: does it need
+  to run on EVERY schedule() opportunity, or could its own scheduling be
+  made less eager without touching `hz` itself (e.g. a minimum real-time
+  gap between its own consecutive runs, distinct from lowering its logical
+  tick rate)? Not attempted — 3g's negative result was about tick *rate*,
+  not scheduling *eagerness*, so it may not directly transfer either way.
 - Host-level measurement noise (Phase 3h's 700–3000ms variance on identical
   burst-test runs) should be controlled for in any future measurement here —
   prefer the single-keystroke test (much lower variance, ~290–370ms
   consistently) as the primary metric, or run burst tests in A/B pairs on
   the same boot rather than trusting a single absolute number.
+- Trace-instrumentation budget: don't run more than one unconditional
+  per-event trace point at a time (Phase 3k found running `w3i` + `w3k`
+  together wedged the box; Phase 3l added a `PER_EVENT_TRACE` master switch,
+  default `false`, precisely to make this mistake harder to repeat — the
+  cheap aggregate counters stay on regardless). A future per-event trace
+  must gate itself behind the same switch and share `CAPTURE_COUNT`'s
+  budget, not add an independent one.

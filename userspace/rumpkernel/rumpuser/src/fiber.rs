@@ -289,6 +289,16 @@ struct Thread {
     name: [u8; 16],
     #[cfg(feature = "rumpuser_debug")]
     name_len: u8,
+    /// Phase 3k: timestamp `wake()` marked this fiber runnable, -1 if not
+    /// pending. Read (and cleared) in `switch_threads` when it's actually
+    /// switched to, giving the PURE scheduling delay between "became
+    /// runnable" and "actually ran" — separate from whatever the wait was
+    /// semantically for. This is what the (buggy, disabled) Phase 3j
+    /// wakeup-locality hint would need to be worth fixing: if this gap is
+    /// small, scheduling isn't the lever; if it's most of the 20-90ms per
+    /// `sp_cond_wait`, it is.
+    #[cfg(feature = "rumpuser_debug")]
+    wake_time: i64,
 }
 impl Linked for Thread {
     unsafe fn link(this: *mut Self) -> *mut Link<Self> {
@@ -325,6 +335,38 @@ static mut JOINWQ: List<JoinWaiter> = List::new();
 static mut CURRENT: *mut Thread = ptr::null_mut();
 static mut SCHED_HOOK: Option<extern "C" fn(*mut c_void, *mut c_void)> = None;
 
+/// Phase 3j wakeup-locality hint: the most recently `wake()`d thread, which
+/// `schedule()` prefers to run next (once) instead of waiting a full
+/// round-robin sweep behind whatever else happens to be runnable. This is the
+/// SAME idea as Akuma's OS-thread-level `PREEMPT_WAKE_TID`
+/// (`crates/akuma-exec/src/threading/mod.rs`) — which is gated OFF there
+/// because "woken threads already run promptly via the SGI" (a hardware
+/// interrupt reschedules immediately). fiber.rs has no such mechanism: a
+/// woken fiber only actually runs once the currently-running fiber calls
+/// `schedule()` AND the round-robin scan reaches it, so that disproof doesn't
+/// transfer here. Phase 3i/3j found `rumpsp`'s sysproxy worker fiber
+/// (`serv_workbouncer` in the vendored `rumpuser_sp.c`) spends a round trip
+/// cycling through several `sp_cond_wait` handoffs — each is exactly a
+/// producer (the receiver, via `schedulework`'s `pthread_cond_signal`) →
+/// consumer (the idle worker) handoff with no other reason to delay. This is
+/// a real scheduling change, NOT a diagnostic — unlike the rest of this
+/// file's Phase 3e-3j additions it is NOT gated behind `rumpuser_debug`, so
+/// it's live in the shipped binary. Toggle for easy A/B.
+const WAKE_LOCALITY_HINT: bool = false;
+static mut WAKE_HINT: *mut Thread = ptr::null_mut();
+
+/// Phase 3l: master switch for the `w3i`/`w3k` PER-EVENT traces. Phase 3k
+/// found that running both at once (each independently bounded by
+/// `CAPTURE_CAP`, but concurrently active) wedged the box — doubled the
+/// per-event `write()` volume that Phase 3e's writeup already flagged as the
+/// scarce resource here. Default `false`: the cheap AGGREGATE counters
+/// (`sched_delay`, `sched_reach`, the histogram) cost only atomic increments
+/// and stay on regardless, dumped via the same rate-limited point — that's
+/// sufficient for most questions. Flip this on only when the exact event
+/// SEQUENCE is needed, and only one investigation at a time.
+#[cfg(feature = "rumpuser_debug")]
+const PER_EVENT_TRACE: bool = false;
+
 #[inline]
 unsafe fn get_current() -> *mut Thread {
     CURRENT
@@ -353,6 +395,19 @@ unsafe fn clear_runnable(t: *mut Thread) {
 unsafe fn wake(t: *mut Thread) {
     (*t).wakeup_time = -1;
     set_runnable(t);
+    if WAKE_LOCALITY_HINT {
+        WAKE_HINT = t;
+    }
+    #[cfg(feature = "rumpuser_debug")]
+    {
+        // Only fibers that were genuinely idle (not already runnable) log a
+        // fresh wake_time — a thread can be `wake()`d more than once before
+        // it's actually switched to (e.g. a stale wakeup_time race), and we
+        // want time-since-FIRST-became-runnable, not since the last call.
+        if (*t).wake_time < 0 {
+            (*t).wake_time = now();
+        }
+    }
 }
 unsafe fn block(t: *mut Thread) {
     (*t).wakeup_time = -1;
@@ -363,12 +418,55 @@ unsafe fn switch_threads(prev: *mut Thread, next: *mut Thread) {
     CURRENT = next;
     #[cfg(feature = "rumpuser_debug")]
     schedule_hist_bump(&(&(*next).name)[..(*next).name_len as usize]);
+    #[cfg(feature = "rumpuser_debug")]
+    if (*next).wake_time >= 0 {
+        let delay = now() - (*next).wake_time;
+        (*next).wake_time = -1;
+        SCHED_DELAY_COUNT.fetch_add(1, Ordering::Relaxed);
+        SCHED_DELAY_SUM_MS.fetch_add(delay.max(0) as u64, Ordering::Relaxed);
+        SCHED_DELAY_MAX_MS.fetch_max(delay.max(0) as u64, Ordering::Relaxed);
+    }
     if let Some(hook) = SCHED_HOOK {
         // cookie field isn't tracked separately; pass lwp pointers (parity stub).
         hook((*prev).lwp, (*next).lwp);
     }
     akfiber_switch(&mut (*prev).ctx, &mut (*next).ctx);
 }
+
+/// Phase 3k: pure scheduling-delay stats (wake() timestamp → actually
+/// switched-to), separate from the `w3i`/`wait:` traces which measure the
+/// FULL wait() duration (semantic wait + scheduling delay combined). Cheap
+/// atomics on the hot path; dumped alongside the histogram.
+#[cfg(feature = "rumpuser_debug")]
+static SCHED_DELAY_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rumpuser_debug")]
+static SCHED_DELAY_SUM_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rumpuser_debug")]
+static SCHED_DELAY_MAX_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Phase 3l: does `schedule()` reach its idle/poll path promptly, or does it
+/// keep finding OTHER runnable fibers (`rumpclk0` et al, Phase 3f) first? A
+/// receiver blocked in `rumpuser_akuma_wait_fd` only gets its fd's readiness
+/// checked (and only registers Akuma's poll-waker, which is what makes new
+/// data "event-driven") when the scan below finds NOTHING runnable and falls
+/// through to `poll()` — if `SCHED_NORMAL_PICK_COUNT` dwarfs
+/// `SCHED_POLL_COUNT`, the fd-wait mechanism is being starved of the chance
+/// to even start waiting event-drivenly, independent of how fast poll()
+/// itself resolves once actually called (`SCHED_POLL_MS_TOTAL`/`_EVENT_COUNT`
+/// vs `_TIMEOUT_COUNT`/`_TIMEOUT_MS_TOTAL` distinguishes real waker-driven
+/// wakeups from calls that just ran out their `delta` budget).
+#[cfg(feature = "rumpuser_debug")]
+static SCHED_NORMAL_PICK_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rumpuser_debug")]
+static SCHED_POLL_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rumpuser_debug")]
+static SCHED_POLL_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rumpuser_debug")]
+static SCHED_POLL_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rumpuser_debug")]
+static SCHED_POLL_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rumpuser_debug")]
+static SCHED_POLL_TIMEOUT_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Phase 3f: per-name switch-in histogram (which NAMED fiber is `schedule()`
 /// actually favoring). In-memory only on the hot path — a linear scan over
@@ -385,6 +483,27 @@ static mut HIST_COUNT: [u64; HIST_SLOTS] = [0u64; HIST_SLOTS];
 /// Sampling counter for the histogram dump (see the `wait:` trace site).
 #[cfg(feature = "rumpuser_debug")]
 static HIST_DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Phase 3i: total-count cap for the unconditional per-wait `w3i`/`w3k` trace,
+/// shared across both wait paths (`wait()` and `rumpuser_akuma_wait_fd`) so
+/// they interleave chronologically and stay bounded together.
+#[cfg(feature = "rumpuser_debug")]
+static CAPTURE_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rumpuser_debug")]
+const CAPTURE_CAP: u64 = 60_000;
+
+/// Phase 3j: which of the 6 rumpuser hypercalls that funnel into `wait()` is
+/// about to call it — set immediately before each call site's `wait(...)`,
+/// read inside `wait()`. Safe as a single global despite no locking: this is
+/// a single-OS-thread cooperative scheduler, so between one call site setting
+/// this and `wait()` reading it, no other Rust code can run (the only way
+/// control leaves this stack is `wait()`'s own `schedule()`, which is always
+/// AFTER the read). Distinguishes e.g. "blocked acquiring a kernel mutex"
+/// from "blocked waiting for the single rump virtual CPU" (`cv_wait_nowrap`,
+/// the `rump_schedule_cpu` token — see `rumpuser_cv_wait_nowrap`'s doc) —
+/// counts alone (Phase 3i) can't tell those apart, and they call for very
+/// different fixes.
+#[cfg(feature = "rumpuser_debug")]
+static mut WAIT_KIND: &[u8] = b"?";
 
 #[cfg(feature = "rumpuser_debug")]
 unsafe fn schedule_hist_bump(name: &[u8]) {
@@ -415,6 +534,12 @@ unsafe fn schedule() {
         let tm = now();
         let mut wakeup = tm + 1000; // wake up in 1s max
         next = ptr::null_mut();
+        // Snapshot before the scan: the scan's own timeout-driven wake() calls
+        // below also write WAKE_HINT, and we only want to prefer whichever
+        // fiber an EXPLICIT wakeup_one/wakeup_all/fd-wake targeted before this
+        // schedule() call, not a fiber this same scan happens to time out.
+        let hint = if WAKE_LOCALITY_HINT { WAKE_HINT } else { ptr::null_mut() };
+        let mut fallback: *mut Thread = ptr::null_mut();
 
         // Walk all threads (capturing next link first — wake() may relink).
         let mut t = THREAD_LIST.first();
@@ -429,16 +554,34 @@ unsafe fn schedule() {
                 }
             }
             if is_runnable(t) {
-                next = t;
-                // move to tail (round-robin)
-                THREAD_LIST.remove(t);
-                THREAD_LIST.insert_tail(t);
-                break;
+                if t == hint {
+                    next = t;
+                    THREAD_LIST.remove(t);
+                    THREAD_LIST.insert_tail(t);
+                    break;
+                }
+                if fallback.is_null() {
+                    fallback = t;
+                }
             }
             t = tnext;
         }
+        if next.is_null() && !fallback.is_null() {
+            next = fallback;
+            // move to tail (round-robin)
+            THREAD_LIST.remove(fallback);
+            THREAD_LIST.insert_tail(fallback);
+        }
+        if WAKE_LOCALITY_HINT {
+            WAKE_HINT = ptr::null_mut();
+        }
 
         if !next.is_null() {
+            // Phase 3l: a fiber was immediately runnable (hint or fallback) —
+            // the idle/poll path below (what rumpuser_akuma_wait_fd's event
+            // delivery actually depends on) was never reached THIS scan.
+            #[cfg(feature = "rumpuser_debug")]
+            SCHED_NORMAL_PICK_COUNT.fetch_add(1, Ordering::Relaxed);
             break;
         }
 
@@ -462,7 +605,21 @@ unsafe fn schedule() {
         }
 
         if nfds > 0 {
+            #[cfg(feature = "rumpuser_debug")]
+            let poll_t0 = now();
             let rv = poll(pfds.as_mut_ptr(), nfds, delta as c_int);
+            #[cfg(feature = "rumpuser_debug")]
+            {
+                let poll_dt = now() - poll_t0;
+                SCHED_POLL_COUNT.fetch_add(1, Ordering::Relaxed);
+                SCHED_POLL_MS_TOTAL.fetch_add(poll_dt.max(0) as u64, Ordering::Relaxed);
+                if rv > 0 {
+                    SCHED_POLL_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
+                } else if rv == 0 {
+                    SCHED_POLL_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    SCHED_POLL_TIMEOUT_MS_TOTAL.fetch_add(poll_dt.max(0) as u64, Ordering::Relaxed);
+                }
+            }
             if rv > 0 {
                 // Wake every fd-waiter whose fd reported readiness; stamp revents so
                 // the woken hypercall can return them. Timed-out waiters are handled
@@ -544,6 +701,8 @@ unsafe fn create_thread(entry: usize, arg: *mut c_void) -> *mut Thread {
             name: [0u8; 16],
             #[cfg(feature = "rumpuser_debug")]
             name_len: 0,
+            #[cfg(feature = "rumpuser_debug")]
+            wake_time: -1,
         },
     );
     akctx_make(&mut (*thr).ctx, stack, entry, arg);
@@ -638,6 +797,8 @@ pub unsafe fn init_sched() {
             name: *b"main\0\0\0\0\0\0\0\0\0\0\0\0",
             #[cfg(feature = "rumpuser_debug")]
             name_len: 4,
+            #[cfg(feature = "rumpuser_debug")]
+            wake_time: -1,
         },
     );
     set_runnable(thr);
@@ -652,6 +813,13 @@ unsafe fn wait(wh: *mut List<Waiter>, msec: i64) -> c_int {
     let cur = get_current();
     #[cfg(feature = "rumpuser_debug")]
     let t_enter = now();
+    // Capture into a LOCAL (this fiber's own stack, preserved correctly
+    // across the cooperative switch below) before schedule() — WAIT_KIND is
+    // a single shared global, and another fiber calling wait() while we're
+    // blocked would overwrite it before we resume, corrupting a read taken
+    // after schedule() returns.
+    #[cfg(feature = "rumpuser_debug")]
+    let kind = WAIT_KIND;
     let mut w = Waiter {
         link: Link::null(),
         who: cur,
@@ -666,10 +834,29 @@ unsafe fn wait(wh: *mut List<Waiter>, msec: i64) -> c_int {
     schedule();
     #[cfg(feature = "rumpuser_debug")]
     {
-        // Only log wait()s that actually took real time — fast wait/wake
-        // handoffs (the overwhelming majority) are not the signal we're after
-        // and logging them unconditionally is what drowned rump_server in its
-        // own write() calls the first time around.
+        // Phase 3i: unconditional per-wait trace (name + elapsed + timestamp),
+        // capped by total EVENT COUNT rather than filtered by duration — the
+        // Phase 3e/3f `elapsed>=1ms` filter was cheap but threw away exactly
+        // the fine-grained sequencing (which fiber, in what order, how far
+        // apart) needed to find the actual handoff chain behind one ~300ms
+        // round trip. Capped (not time-windowed) so it self-limits regardless
+        // of how long boot + the test take before the cap is hit; a fixed
+        // total is also just easier to reason about than a wall-clock window.
+        // Same single-`write()`-per-line LineBuf as before — the earlier
+        // volume disaster was per-DIGIT writes, not the event rate itself.
+        if PER_EVENT_TRACE {
+            let n = CAPTURE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < CAPTURE_CAP {
+                let elapsed = now() - t_enter;
+                let cur = get_current();
+                LineBuf::new()
+                    .s(b"w3i t=").n(now())
+                    .s(b" name=").s(&(&(*cur).name)[..(*cur).name_len as usize])
+                    .s(b" kind=").s(kind)
+                    .s(b" elapsed_ms=").n(elapsed)
+                    .flush();
+            }
+        }
         let elapsed = now() - t_enter;
         if elapsed >= 1 {
             LineBuf::new()
@@ -679,6 +866,38 @@ unsafe fn wait(wh: *mut List<Waiter>, msec: i64) -> c_int {
                 .s(b" wake_all_calls=").n(WAKE_ALL_CALLS.load(Ordering::Relaxed) as i64)
                 .s(b" wake_all_woken_total=").n(WAKE_ALL_WOKEN_TOTAL.load(Ordering::Relaxed) as i64)
                 .flush();
+            // Phase 3k: pure scheduling-delay stats (wake() -> actually run).
+            {
+                let sdc = SCHED_DELAY_COUNT.load(Ordering::Relaxed);
+                let sds = SCHED_DELAY_SUM_MS.load(Ordering::Relaxed);
+                let sdm = SCHED_DELAY_MAX_MS.load(Ordering::Relaxed);
+                let avg = if sdc > 0 { (sds / sdc) as i64 } else { 0 };
+                LineBuf::new()
+                    .s(b"  sched_delay: count=").n(sdc as i64)
+                    .s(b" sum_ms=").n(sds as i64)
+                    .s(b" avg_ms=").n(avg)
+                    .s(b" max_ms=").n(sdm as i64)
+                    .flush();
+            }
+            // Phase 3l: how often schedule() reaches the idle/poll path at all,
+            // and how the poll() calls that DO happen resolve.
+            {
+                let npc = SCHED_NORMAL_PICK_COUNT.load(Ordering::Relaxed);
+                let pc = SCHED_POLL_COUNT.load(Ordering::Relaxed);
+                let pms = SCHED_POLL_MS_TOTAL.load(Ordering::Relaxed);
+                let pec = SCHED_POLL_EVENT_COUNT.load(Ordering::Relaxed);
+                let ptc = SCHED_POLL_TIMEOUT_COUNT.load(Ordering::Relaxed);
+                let ptms = SCHED_POLL_TIMEOUT_MS_TOTAL.load(Ordering::Relaxed);
+                let pavg = if pc > 0 { (pms / pc) as i64 } else { 0 };
+                LineBuf::new()
+                    .s(b"  sched_reach: normal_pick=").n(npc as i64)
+                    .s(b" poll_calls=").n(pc as i64)
+                    .s(b" poll_avg_ms=").n(pavg)
+                    .s(b" poll_event=").n(pec as i64)
+                    .s(b" poll_timeout=").n(ptc as i64)
+                    .s(b" poll_timeout_ms_total=").n(ptms as i64)
+                    .flush();
+            }
             // Phase 3f: dump the per-name switch-in histogram too, but only
             // every HIST_DUMP_EVERY'th slow wait() — the histogram itself is
             // cheap to update (pure in-memory) but printing all HIST_SLOTS
@@ -846,6 +1065,8 @@ pub unsafe extern "C" fn rumpuser_akuma_yield() {
 #[no_mangle]
 pub unsafe extern "C" fn rumpuser_akuma_wait_fd(fd: c_int, events: c_int, timeout_ms: c_int) -> c_int {
     let cur = get_current();
+    #[cfg(feature = "rumpuser_debug")]
+    let t_enter = now();
     (*cur).wait_fd = fd;
     (*cur).wait_events = events as i16;
     (*cur).wait_revents = 0;
@@ -860,6 +1081,26 @@ pub unsafe extern "C" fn rumpuser_akuma_wait_fd(fd: c_int, events: c_int, timeou
     (*cur).wait_events = 0;
     let rev = (*cur).wait_revents;
     (*cur).wait_revents = 0;
+    // Phase 3k: this is the OTHER wait path invisible to wait()'s w3i/WAIT_KIND
+    // trace — schedule() called directly, not through the shared `wait()`
+    // helper. It's what the sysproxy RECEIVER fiber (spserver_fd's
+    // rumpuser_akuma_wait_fd(connfd, ...) in sp_serve_fd.c) blocks in between
+    // requests. Same CAPTURE_CAP budget as w3i (one shared counter) so the two
+    // traces interleave chronologically and stay bounded together.
+    #[cfg(feature = "rumpuser_debug")]
+    if PER_EVENT_TRACE {
+        let n = CAPTURE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < CAPTURE_CAP {
+            let elapsed = now() - t_enter;
+            LineBuf::new()
+                .s(b"w3k t=").n(now())
+                .s(b" name=").s(&(&(*cur).name)[..(*cur).name_len as usize])
+                .s(b" fd=").n(fd as i64)
+                .s(b" revents=").n(rev as i64)
+                .s(b" elapsed_ms=").n(elapsed)
+                .flush();
+        }
+    }
     rev as c_int
 }
 
@@ -980,6 +1221,8 @@ pub unsafe extern "C" fn rumpuser_mutex_enter(m: *mut Mtx) {
     if rumpuser_mutex_tryenter(m) != 0 {
         let nlocks = rumpkern_unsched(ptr::null_mut());
         while rumpuser_mutex_tryenter(m) != 0 {
+            #[cfg(feature = "rumpuser_debug")]
+            { WAIT_KIND = b"mutex_enter"; }
             wait(&mut (*m).waiters, 0);
         }
         rumpkern_sched(nlocks, ptr::null_mut());
@@ -1089,6 +1332,8 @@ pub unsafe extern "C" fn akfiber_sp_mutex_lock(p: *mut c_void) -> c_int {
     let m = sp_mtx(p);
     let cur = get_current();
     while !(*m).owner.is_null() && (*m).owner != cur {
+        #[cfg(feature = "rumpuser_debug")]
+        { WAIT_KIND = b"sp_mutex_lock"; }
         wait(&mut (*m).waiters, 0);
     }
     (*m).owner = cur;
@@ -1121,6 +1366,8 @@ pub unsafe extern "C" fn akfiber_sp_cond_wait(cvp: *mut c_void, mtxp: *mut c_voi
     // Drop the mutex, park on the cv, then re-acquire. Atomic w.r.t. other fibers:
     // nothing else runs between the unlock and the park until wait() schedule()s.
     akfiber_sp_mutex_unlock(mtxp);
+    #[cfg(feature = "rumpuser_debug")]
+    { WAIT_KIND = b"sp_cond_wait"; }
     wait(&mut (*c).waiters, 0);
     akfiber_sp_mutex_lock(mtxp);
     0
@@ -1459,6 +1706,8 @@ pub unsafe extern "C" fn rumpuser_rw_enter(enum_: c_int, rw: *mut Rw) {
     if rumpuser_rw_tryenter(enum_, rw) != 0 {
         let nlocks = rumpkern_unsched(ptr::null_mut());
         while rumpuser_rw_tryenter(enum_, rw) != 0 {
+            #[cfg(feature = "rumpuser_debug")]
+            { WAIT_KIND = b"rw_enter"; }
             wait(wq, 0);
         }
         rumpkern_sched(nlocks, ptr::null_mut());
@@ -1578,6 +1827,8 @@ unsafe fn cv_resched(m: *mut Mtx, nlocks: c_int) {
 pub unsafe extern "C" fn rumpuser_cv_wait(cv: *mut Cv, m: *mut Mtx) {
     (*cv).nwaiters += 1;
     let nlocks = cv_unsched(m);
+    #[cfg(feature = "rumpuser_debug")]
+    { WAIT_KIND = b"cv_wait"; }
     wait(&mut (*cv).waiters, 0);
     cv_resched(m, nlocks);
     (*cv).nwaiters -= 1;
@@ -1587,6 +1838,8 @@ pub unsafe extern "C" fn rumpuser_cv_wait(cv: *mut Cv, m: *mut Mtx) {
 pub unsafe extern "C" fn rumpuser_cv_wait_nowrap(cv: *mut Cv, m: *mut Mtx) {
     (*cv).nwaiters += 1;
     rumpuser_mutex_exit(m);
+    #[cfg(feature = "rumpuser_debug")]
+    { WAIT_KIND = b"cv_wait_nowrap"; }
     wait(&mut (*cv).waiters, 0);
     rumpuser_mutex_enter_nowrap(m);
     (*cv).nwaiters -= 1;
@@ -1596,6 +1849,8 @@ pub unsafe extern "C" fn rumpuser_cv_wait_nowrap(cv: *mut Cv, m: *mut Mtx) {
 pub unsafe extern "C" fn rumpuser_cv_timedwait(cv: *mut Cv, m: *mut Mtx, sec: i64, nsec: i64) -> c_int {
     (*cv).nwaiters += 1;
     let nlocks = cv_unsched(m);
+    #[cfg(feature = "rumpuser_debug")]
+    { WAIT_KIND = b"cv_timedwait"; }
     let rv = wait(&mut (*cv).waiters, sec * 1000 + nsec / 1_000_000);
     cv_resched(m, nlocks);
     (*cv).nwaiters -= 1;
