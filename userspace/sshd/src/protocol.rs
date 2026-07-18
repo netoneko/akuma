@@ -3,7 +3,6 @@
 use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
-use alloc::string::String;
 use core::convert::TryInto;
 
 use ed25519_dalek::{SigningKey, Signer};
@@ -188,7 +187,17 @@ async fn bridge_process(
     stdout_fd: u32,
 ) -> Result<(), NetError> {
     let mut buf = [0u8; 1024];
-    let stdin_path = format!("/proc/{}/fd/0", pid);
+
+    // Open the child's stdin ONCE and reuse it for the whole session, instead
+    // of open()+write()+close() per keystroke (a full procfs path resolution
+    // — parse "/proc/<pid>/fd/0", look up the process, build a fresh
+    // FileDescriptor — on every single character forwarded). Interactive
+    // typing was paying 2 extra syscalls per keystroke for no reason; the
+    // channel this resolves to doesn't change for the life of the session.
+    let stdin_fd = open(&format!("/proc/{}/fd/0", pid), open_flags::O_WRONLY);
+    if stdin_fd < 0 {
+        eprintln(&format!("[SSHD] bridge_process: couldn't open stdin for pid {}", pid));
+    }
 
     // CRITICAL: make BOTH ends non-blocking before the bridge loop. The child's
     // stdout fd (ChildStdout) and the SSH socket both block by default. Without
@@ -268,11 +277,9 @@ async fn bridge_process(
                     let mut offset = 0;
                     let _recipient = read_u32(&payload, &mut offset);
                     if let Some(data) = read_string(&payload, &mut offset) {
-                        // Forward to process stdin via procfs
-                        let fd = open(&stdin_path, open_flags::O_WRONLY);
-                        if fd >= 0 {
-                            write_fd(fd, data);
-                            close(fd);
+                        // Forward to the child's stdin (opened once above).
+                        if stdin_fd >= 0 {
+                            write_fd(stdin_fd, data);
                         }
                     }
                 } else if msg_type == SSH_MSG_CHANNEL_EOF || msg_type == SSH_MSG_CHANNEL_CLOSE {
@@ -319,6 +326,9 @@ async fn bridge_process(
     // that channel now. Without it, sshd (which handles connections serially in
     // one long-lived process) would leak one channel per login.
     close(stdout_fd as i32);
+    if stdin_fd >= 0 {
+        close(stdin_fd);
+    }
     Ok(())
 }
 

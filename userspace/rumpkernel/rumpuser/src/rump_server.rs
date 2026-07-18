@@ -54,6 +54,23 @@ extern "C" {
     fn rumpuser_akuma_wait_fd(fd: c_int, events: c_int, timeout_ms: c_int) -> c_int;
 }
 
+// NetBSD kernel globals (`sys/conf/param.c`): the software clock's tick rate.
+// `doclock` (`sys/rump/librump/rumpkern/intr.c`) creates a kthread that runs
+// hardclock() then rumpuser_clock_sleep()s for one tick, forever — under the
+// fiber backend that's `rumpclk0`, and it turned out to be 37% of ALL fiber
+// scheduling activity (Phase 3f, docs/archive/RUMP_SYSPROXY_LATENCY_FIX.md).
+// Reassigning before rump_init() (which creates doclock) takes effect
+// cleanly. These are NetBSD's own globals, not ours — note the `rumpns_`
+// prefix: rump's build namespaces every kernel-internal symbol to avoid
+// collisions with the host libc (confirmed via `nm` on `librump.a`'s
+// `param.o`; plain `hz`/`tick`/`tickadj` link-fail with "undefined
+// reference").
+extern "C" {
+    static mut rumpns_hz: c_int;
+    static mut rumpns_tick: c_int;
+    static mut rumpns_tickadj: c_int;
+}
+
 // open(2) flags / setvbuf mode (Linux/musl aarch64; asm-generic).
 const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = 0o100;
@@ -142,6 +159,32 @@ pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int 
     }
 
     setvbuf(stdout, ptr::null_mut(), _IONBF, 0);
+
+    // Phase 3g experiment (docs/archive/RUMP_SYSPROXY_LATENCY_FIX.md): cut
+    // doclock's tick rate before rump_init() creates it. RUMP_HZ is a plain
+    // constant (not a flag) on purpose — this is a measure-before-trusting
+    // experiment, not a shipped tunable; sweep it here and rebuild between
+    // runs. 100 = NetBSD default (baseline, no-op).
+    //
+    // hz=20 TESTED AND DISPROVEN (2026-07-18): single-round-trip latency was
+    // unchanged (~320-400ms either way), but burst-write workloads got
+    // dramatically WORSE — 50x printf 458ms→2675ms (5.8x), 200x printf
+    // 518ms→9742ms (19x). TCP/callout processing is timer-driven; a coarser
+    // tick means every one of a burst's many internal handoffs waits longer
+    // for its turn. Do not re-enable without a new hypothesis for why a
+    // *different* hz would avoid this — the mechanism, not just the number,
+    // was wrong. See the doc for the full writeup.
+    const RUMP_HZ: c_int = 100;
+    if RUMP_HZ != 100 {
+        rumpns_hz = RUMP_HZ;
+        rumpns_tick = 1_000_000 / RUMP_HZ;
+        let ta = 240_000 / (60 * RUMP_HZ);
+        rumpns_tickadj = if ta != 0 { ta } else { 1 };
+        printf(
+            c"RUMP_SERVER: hz=%d tick=%d tickadj=%d (Phase 3g)\n".as_ptr(),
+            rumpns_hz, rumpns_tick, rumpns_tickadj,
+        );
+    }
 
     printf(c"RUMP_SERVER: rump_init...\n".as_ptr());
     let mut rv = rump_init();
