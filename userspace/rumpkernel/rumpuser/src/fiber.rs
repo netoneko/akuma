@@ -367,6 +367,18 @@ static mut WAKE_HINT: *mut Thread = ptr::null_mut();
 #[cfg(feature = "rumpuser_debug")]
 const PER_EVENT_TRACE: bool = false;
 
+/// Phase 3m: master switch for the eager (`timeout_ms=0`) fd-poll check at
+/// the top of `schedule()`'s loop, as opposed to only polling fd-waiters
+/// from the idle fallback. NOT gated behind `rumpuser_debug` — like
+/// `WAKE_LOCALITY_HINT`, this is a real scheduling behavior change, not a
+/// diagnostic. Default `false`: tried and measured a severe regression
+/// (idle CPU ~1% → 13-26%) for a latency win that only showed up in the
+/// best case, not the median — see the call site's doc comment for the
+/// full writeup. Code kept (inert when off) per this file's established
+/// convention of preserving tried-and-rejected experiments rather than
+/// deleting them.
+const EAGER_FD_POLL: bool = false;
+
 #[inline]
 unsafe fn get_current() -> *mut Thread {
     CURRENT
@@ -412,6 +424,80 @@ unsafe fn wake(t: *mut Thread) {
 unsafe fn block(t: *mut Thread) {
     (*t).wakeup_time = -1;
     clear_runnable(t);
+}
+
+enum FdPollResult {
+    /// No fiber is currently fd-blocked — caller should fall back to a plain
+    /// timed sleep instead (nothing for poll() to usefully wait on).
+    NoWaiters,
+    /// poll() found at least one ready fd and woke its waiter(s).
+    Woke,
+    /// poll() was called (fiber(s) ARE fd-blocked) but nothing was ready
+    /// within `timeout_ms` — for a real (non-zero) timeout this already
+    /// consumed that much wall time blocking in the syscall, equivalent to
+    /// having slept; the caller shouldn't sleep again on top of it.
+    TimedOut,
+}
+
+/// Check every fd-blocked fiber with one `poll()` call of the given timeout;
+/// wake any whose fd reported readiness. Shared by two call sites in
+/// `schedule()`: an EAGER `timeout_ms=0` check on every scheduling decision
+/// (Phase 3m fix — see the doc comment at its call site for why), and the
+/// original idle-path fallback with a real timeout when nothing else is
+/// runnable. Splitting this out (instead of duplicating the collect+wake
+/// logic at both sites, as the eager check's first draft did) keeps the two
+/// call sites from silently diverging.
+unsafe fn poll_fd_waiters(timeout_ms: c_int) -> FdPollResult {
+    let mut pfds = [PollFd { fd: -1, events: 0, revents: 0 }; MAXFDWAIT];
+    let mut nfds = 0usize;
+    let mut t = THREAD_LIST.first();
+    while !t.is_null() && nfds < MAXFDWAIT {
+        if !is_runnable(t) && (*t).wait_fd >= 0 {
+            pfds[nfds] = PollFd { fd: (*t).wait_fd, events: (*t).wait_events, revents: 0 };
+            nfds += 1;
+        }
+        t = (*Thread::link(t)).next;
+    }
+    if nfds == 0 {
+        return FdPollResult::NoWaiters;
+    }
+
+    #[cfg(feature = "rumpuser_debug")]
+    let poll_t0 = now();
+    let rv = poll(pfds.as_mut_ptr(), nfds, timeout_ms);
+    #[cfg(feature = "rumpuser_debug")]
+    {
+        let poll_dt = now() - poll_t0;
+        SCHED_POLL_COUNT.fetch_add(1, Ordering::Relaxed);
+        SCHED_POLL_MS_TOTAL.fetch_add(poll_dt.max(0) as u64, Ordering::Relaxed);
+        if rv > 0 {
+            SCHED_POLL_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
+        } else if rv == 0 {
+            SCHED_POLL_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+            SCHED_POLL_TIMEOUT_MS_TOTAL.fetch_add(poll_dt.max(0) as u64, Ordering::Relaxed);
+        }
+    }
+
+    if rv <= 0 {
+        return FdPollResult::TimedOut;
+    }
+    // Wake every fd-waiter whose fd reported readiness; stamp revents so the
+    // woken hypercall can return them.
+    for pfd in pfds.iter().take(nfds) {
+        if pfd.revents == 0 {
+            continue;
+        }
+        let mut w = THREAD_LIST.first();
+        while !w.is_null() {
+            let wnext = (*Thread::link(w)).next;
+            if !is_runnable(w) && (*w).wait_fd == pfd.fd {
+                (*w).wait_revents = pfd.revents;
+                wake(w);
+            }
+            w = wnext;
+        }
+    }
+    FdPollResult::Woke
 }
 
 unsafe fn switch_threads(prev: *mut Thread, next: *mut Thread) {
@@ -531,6 +617,32 @@ unsafe fn schedule() {
     let mut next: *mut Thread;
 
     loop {
+        // Phase 3m: give fd-blocked fibers (rumpuser_akuma_wait_fd — the
+        // sysproxy receiver's idle wait, Phase 3l) a look-in on every
+        // scheduling decision, not just when nothing else is runnable —
+        // before this, an fd's readiness was only ever checked from the idle
+        // fallback further down, reached just ~24% of the time (Phase 3l;
+        // `rumpclk0` et al. win round-robin the other ~76%).
+        //
+        // TRIED AND MEASURED WORSE (2026-07-19): assumed a zero-timeout
+        // poll() would be free whenever no fiber is fd-blocked
+        // (`poll_fd_waiters` skips the syscall when `nfds == 0`) — true, but
+        // in practice the sysproxy receiver is *persistently* fd-blocked
+        // whenever it's idle, which is most of the time, so `nfds` is almost
+        // never 0. That turned this into a real poll() syscall on nearly
+        // EVERY schedule() call system-wide (poll_calls went 1892 → 20124 in
+        // one comparable run), which measured as idle CPU jumping from ~1%
+        // to a sustained 13-26% — a severe regression for a latency win that
+        // only showed up in the best case (min 288ms → 216ms) and not the
+        // median (~320-330ms either way; the median case's bottleneck is
+        // elsewhere, likely the worker's `sp_cond_wait` chain, Phase 3j/3k).
+        // Disabled. If revisited, rate-limit it (e.g. only once per K
+        // schedule() calls, or debounced by elapsed time since the last
+        // eager check) instead of running it unconditionally.
+        if EAGER_FD_POLL {
+            poll_fd_waiters(0);
+        }
+
         let tm = now();
         let mut wakeup = tm + 1000; // wake up in 1s max
         next = ptr::null_mut();
@@ -589,69 +701,31 @@ unsafe fn schedule() {
         // fiber is blocked on an fd (rumpuser_akuma_wait_fd), poll() those fds with
         // that same timeout — on Akuma a peer write registers a waker and returns
         // poll() immediately, so the sysproxy channel becomes event-driven (no
-        // busy re-poll, no fixed latency floor). Otherwise plain nanosleep.
+        // busy re-poll, no fixed latency floor). Otherwise plain nanosleep. (The
+        // eager `poll_fd_waiters(0)` at the top of this loop already handles the
+        // common case where SOME other fiber is runnable; this is genuinely the
+        // "nothing to do at all" fallback.)
         let delta = wakeup - tm; // ms, always >= 1 (wakeup > tm here)
 
-        // Collect fds from fibers blocked on one (single OS thread → no locking).
-        let mut pfds = [PollFd { fd: -1, events: 0, revents: 0 }; MAXFDWAIT];
-        let mut nfds = 0usize;
-        let mut t = THREAD_LIST.first();
-        while !t.is_null() && nfds < MAXFDWAIT {
-            if !is_runnable(t) && (*t).wait_fd >= 0 {
-                pfds[nfds] = PollFd { fd: (*t).wait_fd, events: (*t).wait_events, revents: 0 };
-                nfds += 1;
+        match poll_fd_waiters(delta as c_int) {
+            FdPollResult::Woke => {
+                // Re-scan at the top of the loop; the woken fiber is runnable now.
             }
-            t = (*Thread::link(t)).next;
-        }
-
-        if nfds > 0 {
-            #[cfg(feature = "rumpuser_debug")]
-            let poll_t0 = now();
-            let rv = poll(pfds.as_mut_ptr(), nfds, delta as c_int);
-            #[cfg(feature = "rumpuser_debug")]
-            {
-                let poll_dt = now() - poll_t0;
-                SCHED_POLL_COUNT.fetch_add(1, Ordering::Relaxed);
-                SCHED_POLL_MS_TOTAL.fetch_add(poll_dt.max(0) as u64, Ordering::Relaxed);
-                if rv > 0 {
-                    SCHED_POLL_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
-                } else if rv == 0 {
-                    SCHED_POLL_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
-                    SCHED_POLL_TIMEOUT_MS_TOTAL.fetch_add(poll_dt.max(0) as u64, Ordering::Relaxed);
+            FdPollResult::TimedOut => {
+                // poll() itself already blocked ~delta ms; nothing more to wait for.
+            }
+            FdPollResult::NoWaiters => {
+                #[cfg(feature = "rumpuser_debug")]
+                {
+                    SCHED_IDLE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    SCHED_IDLE_MS_TOTAL.fetch_add(delta as u64, Ordering::Relaxed);
                 }
+                let sl = Timespec {
+                    tv_sec: delta / 1000,
+                    tv_nsec: (delta % 1000) * 1_000_000,
+                };
+                nanosleep(&sl, ptr::null_mut());
             }
-            if rv > 0 {
-                // Wake every fd-waiter whose fd reported readiness; stamp revents so
-                // the woken hypercall can return them. Timed-out waiters are handled
-                // by the wakeup_time scan on the next loop iteration.
-                for pfd in pfds.iter().take(nfds) {
-                    if pfd.revents == 0 {
-                        continue;
-                    }
-                    let mut w = THREAD_LIST.first();
-                    while !w.is_null() {
-                        let wnext = (*Thread::link(w)).next;
-                        if !is_runnable(w) && (*w).wait_fd == pfd.fd {
-                            (*w).wait_revents = pfd.revents;
-                            wake(w);
-                        }
-                        w = wnext;
-                    }
-                }
-            }
-            // rv == 0 (timeout) or rv < 0 (EINTR/err): fall through; the next loop
-            // iteration re-scans (timer wakeups) and re-polls as needed.
-        } else {
-            #[cfg(feature = "rumpuser_debug")]
-            {
-                SCHED_IDLE_COUNT.fetch_add(1, Ordering::Relaxed);
-                SCHED_IDLE_MS_TOTAL.fetch_add(delta as u64, Ordering::Relaxed);
-            }
-            let sl = Timespec {
-                tv_sec: delta / 1000,
-                tv_nsec: (delta % 1000) * 1_000_000,
-            };
-            nanosleep(&sl, ptr::null_mut());
         }
     }
 

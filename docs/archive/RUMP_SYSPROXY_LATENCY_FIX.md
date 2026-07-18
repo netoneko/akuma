@@ -28,9 +28,15 @@
 > another periodic kthread is already runnable and wins round-robin), and
 > even when it does, the poll window itself is tick-sized (~14ms avg,
 > whether resolved by a real event or a timeout) — both effects trace back
-> to `rumpclk0`'s ubiquity (Phase 3f), not a bug in the waker. **The floor
-> is still open** — Phase 3m (measure the Akuma-kernel-side round trip in
-> isolation) has the honest next step.
+> to `rumpclk0`'s ubiquity (Phase 3f), not a bug in the waker. Phase 3m
+> tried the obvious direct fix (poll fd-waiters eagerly on every scheduling
+> decision, not just the idle fallback) — it worked exactly as designed
+> (reach ratio flipped from 24%/76% to 62%/38%, best-case latency improved)
+> but cost idle CPU going from ~1% to 13-26%, a bad trade for a fix that
+> only moved the best case and left the median untouched. Reverted (toggle,
+> code kept). **The floor is still open** — Phase 3p (measure the
+> Akuma-kernel-side round trip in isolation, and profile the median-case
+> path specifically) has the honest next step.
 >
 > See `docs/archive/RUMP_LATENCY_SLEEP_FIX.md` for the earlier **disproven**
 > "lower `hz`" / `cv_broadcast`→`cv_signal` approach — disproven specifically
@@ -691,6 +697,46 @@ resolve as fast as "event-driven" suggests. This is the same underlying
 fact as Phase 3f/3i from a different angle — `rumpclk0`'s ubiquity limits
 how promptly *anything* else, scheduling or fd-waiting, gets attention.
 
+## Phase 3m — tried fixing the poll/schedule race directly: real CPU regression, reverted
+
+Phase 3l's diagnosis suggests an obvious fix: give fd-blocked fibers a
+cheap, non-blocking look-in on *every* scheduling decision, not just when
+the idle fallback happens to be reached. Refactored the idle path's
+collect-fds-then-poll logic into a shared `poll_fd_waiters(timeout_ms)`
+helper (used both by the original blocking idle-path call and a new eager
+`timeout_ms=0` call at the top of `schedule()`'s loop) — one function
+instead of two copies that could silently diverge.
+
+The assumption going in: a zero-timeout `poll()` is free when nothing is
+fd-blocked (`poll_fd_waiters` checks `nfds == 0` and skips the syscall
+entirely), so calling it unconditionally shouldn't meaningfully add to
+`schedule()`'s own cost. **That assumption was wrong in practice**: the
+sysproxy receiver is fd-blocked essentially any time it's idle, which is
+most of the time, so `nfds` is almost never actually 0. The eager check
+therefore turned into a real `poll()` syscall on nearly every `schedule()`
+call system-wide.
+
+Measured, one comparable session: `poll_calls` went from 1,892 to 20,124,
+and `poll_avg_ms` dropped 14ms → 2ms (expected — most calls now resolve
+near-instantly at `timeout_ms=0`). The scheduling-reach ratio flipped
+exactly as intended (24%/76% poll/normal-pick → 62%/38%). Latency: best
+case improved (min round trip 288ms → 216ms across a 30-keystroke sample),
+but the median barely moved (~320-330ms either way) — the median case's
+bottleneck is elsewhere, most likely the worker's `sp_cond_wait` chain
+(Phase 3j/3k), which this fix doesn't touch at all.
+
+**But idle CPU jumped from ~1% to a sustained 13-26%.** For a fix that only
+improved the best case and left the typical case unchanged, that's a bad
+trade. Reverted via a runtime toggle (`EAGER_FD_POLL = false`, not gated
+behind `rumpuser_debug` since it's a real scheduling behavior, not a
+diagnostic — same pattern as `WAKE_LOCALITY_HINT`). The `poll_fd_waiters`
+refactor itself stays (the idle path uses it unchanged, functionally
+identical to before, just de-duplicated) — only the eager call site is
+disabled.
+
+Confirmed clean afterward: idle CPU back to ~1%, boot log back to 216
+lines, host test suite passes, devbox SSH round trip normal.
+
 ## Future work (Phase 3, not started)
 
 - **Phase 3a2**: A genuine push wake for tap RX would require NIC1 GIC
@@ -700,26 +746,39 @@ how promptly *anything* else, scheduling or fd-waiting, gets attention.
   `librumpnet_virtif`) to Rust for parity and maintainability.
 - **Phase 3d**: Per-socket wakers (conditional wake instead of broadcast) to
   reduce scheduler contention under many-fd workloads.
-- **Phase 3m**: Measure the Akuma-kernel-side round trip for one proxied
+- **Phase 3n**: If the eager fd-poll idea (3m) is ever revisited, RATE-LIMIT
+  it instead of running it unconditionally — e.g. only once per K
+  `schedule()` calls, or debounced by elapsed real time since the last eager
+  check for that specific fd. The architecture was validated (reach ratio
+  flipped, min latency improved); only the "every single call" cadence was
+  the problem.
+- **Phase 3p**: Measure the Akuma-kernel-side round trip for one proxied
   syscall in isolation (kernel writes request → rump_server responds →
-  kernel reads response), now that Phase 3k/3l have shown rump_server's OWN
-  wait time is genuine event-waiting (plus schedule-branch starvation from
-  `rumpclk0`), not raw scheduling slack. If that hop is also tens of ms, the
-  remaining lever is there, not inside rump_server at all.
-- **Phase 3n** (optional, low priority): root-cause the Phase 3j wakeup-locality
+  kernel reads response), now that Phase 3k/3l/3m have shown rump_server's
+  OWN wait time is genuine event-waiting (plus schedule-branch starvation
+  from `rumpclk0`, now confirmed expensive to fix naively), not raw
+  scheduling slack. If that hop is also tens of ms, the remaining lever is
+  there, not inside rump_server at all. Also: profile the median-case
+  keystroke path specifically against the worker's `sp_cond_wait` chain,
+  since Phase 3m's A/B showed that's where the *typical* cost lives, not
+  wherever the eager-poll fix targeted (which only moved the best case).
+- **Phase 3q** (optional, low priority): root-cause the Phase 3j wakeup-locality
   hang before ever re-attempting it — given Phase 3k showed only ~7ms/handoff
   of scheduling delay exists to reclaim, this is low value regardless; only
   worth it out of general fiber.rs correctness interest.
-- **Phase 3o**: `rumpclk0` keeps coming up (37% of scheduling activity in
-  3f, ~76% of schedule() calls bypassing the idle/poll branch in 3l). Every
-  angle tried so far treats it as fixed background cost — lowering its rate
-  (3g) made things worse, removing it isn't an option (it's NetBSD's
-  softclock, load-bearing). Worth asking a different question: does it need
-  to run on EVERY schedule() opportunity, or could its own scheduling be
-  made less eager without touching `hz` itself (e.g. a minimum real-time
-  gap between its own consecutive runs, distinct from lowering its logical
-  tick rate)? Not attempted — 3g's negative result was about tick *rate*,
-  not scheduling *eagerness*, so it may not directly transfer either way.
+- **Phase 3r**: `rumpclk0` keeps coming up (37% of scheduling activity in
+  3f, ~76% of schedule() calls bypassing the idle/poll branch in 3l, and now
+  the reason 3m's fix was so expensive — it's *why* `nfds>0` is essentially
+  always true, since the receiver keeps re-arming its fd-wait every time
+  `rumpclk0` or another periodic kthread preempts its turn). Every angle
+  tried so far treats it as fixed background cost — lowering its rate (3g)
+  made things worse, removing it isn't an option (it's NetBSD's softclock,
+  load-bearing). Worth asking a different question: does it need to run on
+  EVERY schedule() opportunity, or could its own scheduling be made less
+  eager without touching `hz` itself (e.g. a minimum real-time gap between
+  its own consecutive runs, distinct from lowering its logical tick rate)?
+  Not attempted — 3g's negative result was about tick *rate*, not
+  scheduling *eagerness*, so it may not directly transfer either way.
 - Host-level measurement noise (Phase 3h's 700–3000ms variance on identical
   burst-test runs) should be controlled for in any future measurement here —
   prefer the single-keystroke test (much lower variance, ~290–370ms
