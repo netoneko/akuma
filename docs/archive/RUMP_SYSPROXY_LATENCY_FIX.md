@@ -217,6 +217,103 @@ flooding the serial console (10k+ lines for a single boot + a few SSH round
 trips) and made the actual measurement logs hard to read. Both reverted to
 their documented default (`false`).
 
+## Phase 3e — the ~300 ms single-round-trip floor: root-caused, not fixed
+
+Phase 3b closed the multi-write-burst gap but left single-round-trip cost
+(one keystroke echo, ~300–370 ms) untouched. This investigated *where that
+time actually goes*, live, inside `rump_server`.
+
+### Instrumentation
+
+`fiber.rs` (the cooperative rumpuser backend) had no tracing at all — the
+existing `rumpuser_debug` feature only ever covered the old pthread backend
+(`lib.rs`'s `tr!`/`trace()`). Added (gated behind `rumpuser_debug`, so zero
+cost in the shipped binary):
+- Per-call counters for `schedule()`'s idle-nanosleep path (`SCHED_IDLE_COUNT`/
+  `SCHED_IDLE_MS_TOTAL`) and `wakeup_all`'s fan-out (`WAKE_ALL_CALLS`/
+  `WAKE_ALL_WOKEN_TOTAL`) — cheap atomics, no I/O on the hot path.
+- A snapshot trace on `wait()` returns that took ≥1 ms, using a single-`write()`
+  line builder (`LineBuf`). The first cut logged unconditionally and per-digit
+  — 36,240 `write()` calls in 60 s, ~98% of `rump_server`'s own CPU time spent
+  tracing itself, which is *why* it's gated this tightly: over-instrumentation
+  here directly perturbs the very thing being measured.
+
+Rebuilt `rump_server` via `docker-build-rump-server.sh` with `rumpuser_debug`
+added to the feature list, deployed via `scripts/populate_disk.sh --overlay`
+(reversible — no base-image rebuild), booted devbox, ran one real keystroke
+over SSH, read `/var/log/box/0/rump_server.log` (rump_server's `--log`
+redirects its own stdout+stderr there, not to the kernel console).
+
+### Finding
+
+Across 4,461 sampled `wait()` calls: `idle_count=0` on **every single one**.
+`schedule()`'s "nothing runnable, nanosleep" path was never entered once.
+`p50=78 ms, p90=895 ms, max=61.9 s` per wait — under instrumentation load, so
+inflated vs. the ~22–96 ms seen unadorned, but the binary signal (idle path
+never taken) doesn't depend on that inflation. `wake_all_calls` climbed
+steadily while `wake_all_woken_total` stayed at 2 the whole time — broadcasts
+fire often but almost always find an empty waiter list.
+
+**This rules out an idle-sleep/poll-cadence floor** (the mechanism Phase 2b/3a
+fixed) as the cause here. The cost is round-robin **contention**: many fibers
+are simultaneously runnable at all times, and a specific fiber's `wait()` →
+`wake()` handoff has to wait its turn through the others.
+
+### Isolating the scheduler mechanism itself (host-testable, no QEMU)
+
+`fiber.rs` already had one `#[cfg(test)]` unit test
+(`sp_mutex_condvar_ping_pong`, cross-built + run in a Docker arm64 container
+via `test-fiber.sh` — no rump kernel, no QEMU, no disk image, seconds not
+minutes). Added a second: `round_robin_contention_scales_with_fiber_count`
+runs N independent cv_wait/cv_broadcast ping-pong *pairs* concurrently (real
+fiber work, the same primitive NetBSD's own kthreads use) and times how long
+one *tracked* pair takes to complete 200 rounds as N grows:
+
+| fibers | time / round |
+|---|---|
+| 2  | 0.2 µs |
+| 6  | 0.6 µs |
+| 14 | 1.4 µs |
+| 26 | 2.6 µs |
+| 50 | 4.9 µs |
+
+Clean, linear scaling, and **microseconds** even at 50 competing fibers — two
+to three orders of magnitude below the millisecond-scale costs seen live.
+**The fiber scheduler mechanism itself (context switches, round-robin,
+wait/wake bookkeeping) is not the bottleneck.** Combined with the live
+`idle_count=0` finding, this narrows the real cost to whatever *work* each
+NetBSD kthread-as-fiber actually does once scheduled — real kernel-internal
+processing (or possibly I/O), not Akuma-side scheduling overhead. That work
+lives inside the vendored NetBSD `src-netbsd` tree and rump's own
+single-virtual-CPU (`rump_schedule_cpu`) serialization, not in anything this
+repo's Rust owns — profiling it further needs per-kthread identification
+(names/purpose), which the current trace doesn't capture.
+
+### Bug found and fixed along the way
+
+Adding the second `#[test]` fn crashed the *first* one (SIGSEGV, exit 139).
+Rust's std test harness runs every `#[test]` in a file in the same process
+(separate OS threads, not separate processes); `THREAD_LIST`/`EXITED`/
+`CURRENT` are process-wide statics, and `init_sched()` (called once per test)
+allocates a fresh "self" `Thread` and never removes the previous one — so
+whichever test ran second inherited a stale entry pointing at an OS
+thread/stack that had already returned, and `schedule()`'s round-robin
+eventually reached it. Fixed with a shared `reset_sched()` helper (clears
+`THREAD_LIST`/`EXITED`/`CURRENT` before `init_sched()`) that both tests now
+call, making them order-independent. This was a real latent bug in the
+existing test suite, only ever exercised once a second scheduler test
+existed.
+
+### Also noted, not yet a live issue
+
+`MAXFDWAIT = 8` (`fiber.rs`): `schedule()`'s idle path only polls the first 8
+fd-blocked fibers it finds walking `THREAD_LIST`; a 9th concurrent fd-waiter
+is silently excluded from the poll set with no warning, and would only ever
+be woken by a timeout (or never, for an untimed wait). Today there are only
+two real `wait_fd` users (`rumpcomp_tap.c`'s RX loop, `sp_serve_fd.c`'s
+sysproxy reader), well under the cap — but it's a silent limit worth knowing
+about before adding a third.
+
 ## Future work (Phase 3, not started)
 
 - **Phase 3a2**: A genuine push wake for tap RX would require NIC1 GIC
@@ -226,8 +323,9 @@ their documented default (`false`).
   `librumpnet_virtif`) to Rust for parity and maintainability.
 - **Phase 3d**: Per-socket wakers (conditional wake instead of broadcast) to
   reduce scheduler contention under many-fd workloads.
-- **Phase 3e**: The ~300 ms single-round-trip floor (Phase 2's residual
-  "fiber round-trip" cost) is still unaddressed — it's the reason per-keystroke
-  echo didn't improve in 3b. Worth profiling where inside a single sysproxy
-  round trip that time actually goes, now that 3a/3b have removed the two
-  cheaper-to-fix multipliers on top of it.
+- **Phase 3f**: Identify *which* NetBSD kthread-fibers are runnable so often
+  and what work they're doing per turn (Phase 3e narrowed this to "not
+  scheduling overhead" but didn't name the culprit) — likely needs per-fiber
+  naming/labeling in the trace, not just counts. The `round_robin_contention_*`
+  host test is the fast harness to validate any fix against before a full
+  QEMU/SSH round trip.

@@ -27,12 +27,25 @@ symptom on the left. For build/verify steps, see
 | Built-in SSH started instead of userspace | Log lacks `[Main] Built-in SSH server disabled` | Confirm `userspace-sshd` feature is on (`devbox` feature implies it) |
 | Port 2223 busy on host | `ssh` connects then drops | `pkill -9 qemu-system-aarch64` or set `RUMP_SSH_PORT` |
 
-### SSH slow / first-connection lag (~3.4s)
+### SSH slow / first-connection lag
 
-Known: per-syscall sysproxy round-trip + MSG_PEEK poll + 10ms re-poll floor.
-**Open** — no fix yet. See [`../reference/subsystems/rump-stack.md`](../reference/subsystems/rump-stack.md)
-"Known limitations". Under CPU-bound load SSH can time out at banner exchange
-(see "VM pegged at 100% CPU" below).
+**Mostly fixed (2026-07-18).** Was ~3.4–4.0s; now ~1.8–1.85s for a one-shot
+`ssh ... <cmd>`, and multi-write bursts (a TUI redraw, streaming output) that
+used to be pathologically slow (Nagle + no `TCP_NODELAY`) are now 3–4x
+faster. See `archive/RUMP_SYSPROXY_LATENCY_FIX.md` Phases 2a/2b/3a/3b for the
+fixes (network-thread scheduling boost, rump-aware poll cadence, tap-fd poll
+classification, forced `TCP_NODELAY` on every rump TCP socket).
+
+**Still open**: a ~300ms floor on a single synchronous round-trip (one
+keystroke echo doesn't benefit from the above — it was never Nagle- or
+poll-cadence-bound). Phase 3e root-caused this to round-robin contention
+among `rump_server`'s fibers (many are simultaneously runnable;
+`schedule()`'s idle-sleep path is never even entered), and proved — via a
+fast, host-testable benchmark (`userspace/rumpkernel/test-fiber.sh`,
+no QEMU/no rump kernel needed) — that the fiber *scheduler mechanism* itself
+is not the cost (microseconds even at 50 competing fibers). The actual cost
+is in whatever work each NetBSD kthread-as-fiber does once scheduled; that's
+unidentified. See `archive/RUMP_SYSPROXY_LATENCY_FIX.md` Phase 3e/3f.
 
 ### Toolchain crashes
 
@@ -56,7 +69,7 @@ Known: per-syscall sysproxy round-trip + MSG_PEEK poll + 10ms re-poll floor.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Idle VM at ~100% CPU, responsive | **FIXED (2026-07-06/07).** (1) tap-poll busy-spin in `rumpcomp_tap.c` RX fiber; (2) BSP idle threads busy-yielding instead of `WFI`. | If it recurs, check `rumpcomp_tap.c` and `idle_halt()` in `src/main.rs`. See `archive/KNOWN_ISSUES.md` §10-11. |
-| CPU-bound load (rustc codegen) starves SSH → banner timeout | Single core; scheduler gives the compute job equal standing with rump thread + sshd. | **Open.** Likely fix: raise scheduling weight of the rump proxy thread. Meanwhile: run lighter, or accept timeouts during codegen. |
+| CPU-bound load (rustc codegen) starves SSH → banner timeout | Single core; rump_server waited many scheduler quanta for a timeslice. | **FIXED (2026-07-18).** `start_default_stack` registers rump_server's actual TID (not a parked kthread) for the `NETWORK_THREAD_RATIO` boost. See `archive/RUMP_SYSPROXY_LATENCY_FIX.md` Phase 2a. If it recurs, check `threading::set_network_thread_id` is still called with the right TID. |
 | Shell pipeline `cmd \| head -N` wedges VM at ~99%, `[signal] tkill(tid=X, sig=13)` | SIGPIPE delivery to the writer spins instead of terminating the write syscall. | **Open.** Workaround: redirect to a file instead of piping through `head`/`tail`. |
 
 ### Network doesn't work
@@ -81,10 +94,39 @@ starved the multiplexer. Residual: single box-0 proxy serializes syscalls
 All in `src/config.rs` (compile-time; rebuild after). See
 [`../reference/subsystems/config-flags.md`](../reference/subsystems/config-flags.md):
 
-- `RUMP_SP_TRACE = true` — one line per proxied socket syscall.
+- `RUMP_SP_TRACE = true` — one line per proxied socket syscall (`[RUMP-SP] ...`,
+  includes per-call `us`/`hops`/`blk` timing). **Revert to `false` before
+  shipping** — both this and the next flag were left on after the 2026-07-18
+  session and flooded the console (10k+ lines/boot) until caught; neither is
+  meant to stay on.
+- `SYSCALL_DEBUG_NET_ENABLED = true` — verbose network/epoll/ppoll tracing
+  (`[ppoll] enter: ...` etc.). Same "revert after use" warning as above.
 - `SYSCALL_DEBUG_INFO_ENABLED = true` — full syscall tracing.
 - `FUTEX_DBG_ENABLED` / `DEADLOCK_THREAD_DUMP_ENABLED` — futex/deadlock dumps.
 - `[THR-DUMP]` heartbeat prints when ≥2 threads waiting.
+
+**`rump_server`'s own internals** are separate from the above (those are all
+kernel-side `src/config.rs` flags; `rump_server` is a userspace binary built
+from `userspace/rumpkernel/`, not part of the kernel build):
+- `rumpuser_debug` Cargo feature (`userspace/rumpkernel/rumpuser/Cargo.toml`)
+  — traces every rumpuser hypercall. Under the default fiber backend this only
+  covers what `fiber.rs` explicitly instruments (`schedule()`'s idle path,
+  `wait()`/`wakeup_all` — added 2026-07-18); the old pthread-backend `tr!`
+  traces in `lib.rs` don't fire under fiber. **Keep this rate-limited** — an
+  earlier unconditional per-event version made `rump_server` spend ~98% of its
+  CPU time in `write()` tracing itself (see `archive/RUMP_SYSPROXY_LATENCY_FIX.md`
+  Phase 3e). Rebuild via `docker-build-rump-server.sh` with the feature added
+  to the `cargo build` line, deploy with
+  `DISK=devbox.img scripts/populate_disk.sh --overlay <dir with bin/rump_server>`
+  (reversible, no base-image rebuild), read output from
+  `/var/log/box/0/rump_server.log` (its `--log` flag redirects its own
+  stdout+stderr there, not the kernel console).
+- `userspace/rumpkernel/test-fiber.sh` — cross-builds and runs `fiber.rs`'s
+  own `#[cfg(test)]` suite (cross-build + Docker linux/arm64, no rump kernel,
+  no QEMU, no disk image — seconds, not minutes). The right place to
+  reproduce/benchmark fiber-scheduler behavior in isolation before touching
+  the live stack; see `round_robin_contention_scales_with_fiber_count` for an
+  example (N concurrent cv_wait/broadcast pairs, timing one tracked pair).
 
 Runtime: `HVF=0` forces TCG (faithful PC; HVF gdbstub misreports PC as
 exception-vector entry). `GDB=1` for QEMU gdbstub on `:1234` →
@@ -99,3 +141,6 @@ In-VM: `ps` builtin prints each process's saved kernel resume point
 - `archive/KNOWN_ISSUES.md` §10-11 — the two 100%-CPU bugs (FIXED).
 - `archive/OPTIONAL_SMOLTCP.md` — the rump-path bug-fix history.
 - `archive/FIBER_HANDOFF.md` — rump latency root cause + open items.
+- `archive/RUMP_SYSPROXY_LATENCY_FIX.md` — the full Phase 2/3 latency fix
+  history (scheduling boost, poll cadence, `TCP_NODELAY`, the fiber-contention
+  root-cause investigation) — current as of 2026-07-18.

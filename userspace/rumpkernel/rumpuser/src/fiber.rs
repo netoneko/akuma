@@ -20,6 +20,18 @@
 
 use core::ffi::{c_char, c_int, c_long, c_void};
 use core::ptr;
+#[cfg(feature = "rumpuser_debug")]
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// TEMP diagnostic (2026-07-18 rump sysproxy latency investigation): cheap
+/// atomic counters for schedule()'s idle-nanosleep path, snapshotted (not
+/// per-event traced — that alone was ~600 events/s and dominated rump_server's
+/// own CPU time, see the `dnum` doc comment) into the rarer wait()/wakeup_*
+/// trace lines below.
+#[cfg(feature = "rumpuser_debug")]
+static SCHED_IDLE_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rumpuser_debug")]
+static SCHED_IDLE_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 // ── libc externs we need (resolved by the musl the final program links) ──
 extern "C" {
@@ -425,6 +437,11 @@ unsafe fn schedule() {
             // rv == 0 (timeout) or rv < 0 (EINTR/err): fall through; the next loop
             // iteration re-scans (timer wakeups) and re-polls as needed.
         } else {
+            #[cfg(feature = "rumpuser_debug")]
+            {
+                SCHED_IDLE_COUNT.fetch_add(1, Ordering::Relaxed);
+                SCHED_IDLE_MS_TOTAL.fetch_add(delta as u64, Ordering::Relaxed);
+            }
             let sl = Timespec {
                 tv_sec: delta / 1000,
                 tv_nsec: (delta % 1000) * 1_000_000,
@@ -577,6 +594,8 @@ pub unsafe fn init_sched() {
 /// Returns ETIMEDOUT if woken by timeout, else 0. Port of rumpfiber.c:wait().
 unsafe fn wait(wh: *mut List<Waiter>, msec: i64) -> c_int {
     let cur = get_current();
+    #[cfg(feature = "rumpuser_debug")]
+    let t_enter = now();
     let mut w = Waiter {
         link: Link::null(),
         who: cur,
@@ -589,6 +608,23 @@ unsafe fn wait(wh: *mut List<Waiter>, msec: i64) -> c_int {
         (*cur).wakeup_time = now() + msec;
     }
     schedule();
+    #[cfg(feature = "rumpuser_debug")]
+    {
+        // Only log wait()s that actually took real time — fast wait/wake
+        // handoffs (the overwhelming majority) are not the signal we're after
+        // and logging them unconditionally is what drowned rump_server in its
+        // own write() calls the first time around.
+        let elapsed = now() - t_enter;
+        if elapsed >= 1 {
+            LineBuf::new()
+                .s(b"wait: elapsed_ms=").n(elapsed)
+                .s(b" idle_count=").n(SCHED_IDLE_COUNT.load(Ordering::Relaxed) as i64)
+                .s(b" idle_ms_total=").n(SCHED_IDLE_MS_TOTAL.load(Ordering::Relaxed) as i64)
+                .s(b" wake_all_calls=").n(WAKE_ALL_CALLS.load(Ordering::Relaxed) as i64)
+                .s(b" wake_all_woken_total=").n(WAKE_ALL_WOKEN_TOTAL.load(Ordering::Relaxed) as i64)
+                .flush();
+        }
+    }
 
     // Woken by timeout (still on the list)?
     if w.onlist != 0 {
@@ -608,7 +644,16 @@ unsafe fn wakeup_one(wh: *mut List<Waiter>) {
     }
 }
 
+/// Count only (no per-call print — this is the herd-wake fan-out signal;
+/// snapshotted into the rarer `wait:` trace instead of printed here).
+#[cfg(feature = "rumpuser_debug")]
+static WAKE_ALL_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rumpuser_debug")]
+static WAKE_ALL_WOKEN_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 unsafe fn wakeup_all(wh: *mut List<Waiter>) {
+    #[cfg(feature = "rumpuser_debug")]
+    let mut n = 0u64;
     loop {
         let w = (*wh).first();
         if w.is_null() {
@@ -617,6 +662,13 @@ unsafe fn wakeup_all(wh: *mut List<Waiter>) {
         (*wh).remove(w);
         (*w).onlist = 0;
         wake((*w).who);
+        #[cfg(feature = "rumpuser_debug")]
+        { n += 1; }
+    }
+    #[cfg(feature = "rumpuser_debug")]
+    {
+        WAKE_ALL_CALLS.fetch_add(1, Ordering::Relaxed);
+        WAKE_ALL_WOKEN_TOTAL.fetch_add(n, Ordering::Relaxed);
     }
 }
 
@@ -632,6 +684,62 @@ unsafe fn rumpkern_sched(nlocks: c_int, interlock: *mut c_void) {
 
 unsafe fn dprint(msg: &[u8]) {
     write(2, msg.as_ptr() as *const c_void, msg.len());
+}
+
+/// TEMP diagnostic (2026-07-18, rump sysproxy latency investigation): a
+/// single-`write()` line builder — no variadics/alloc, and critically no
+/// per-digit `write()` calls either. The first cut of this (per-digit
+/// `dprint`) made rump_server spend ~98% of its CPU time inside `write()`
+/// (36k calls/60s) tracing itself, drowning out the signal it was meant to
+/// capture — see the wait()/wakeup_* call sites below for how this is used.
+/// Gated behind `rumpuser_debug` — the existing pthread-backend `tr!`/
+/// `trace()` machinery in lib.rs never covered fiber.rs's own scheduler
+/// internals (schedule()'s idle path, wakeup_one/all), which is where the
+/// per-syscall floor now lives once the pthread thundering herd
+/// (RUMP_LATENCY_SLEEP_FIX.md) was replaced by the fiber backend.
+#[cfg(feature = "rumpuser_debug")]
+struct LineBuf {
+    buf: [u8; 256],
+    len: usize,
+}
+
+#[cfg(feature = "rumpuser_debug")]
+impl LineBuf {
+    fn new() -> Self {
+        Self { buf: [0u8; 256], len: 0 }
+    }
+    fn s(&mut self, s: &[u8]) -> &mut Self {
+        let n = s.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s[..n]);
+        self.len += n;
+        self
+    }
+    fn n(&mut self, v: i64) -> &mut Self {
+        if v < 0 {
+            self.s(b"-");
+        }
+        let mut uv = v.unsigned_abs();
+        if uv == 0 {
+            self.s(b"0");
+        } else {
+            let mut tmp = [0u8; 20];
+            let mut t = 0;
+            while uv > 0 {
+                tmp[t] = b'0' + (uv % 10) as u8;
+                t += 1;
+                uv /= 10;
+            }
+            while t > 0 {
+                t -= 1;
+                self.s(&tmp[t..t + 1]);
+            }
+        }
+        self
+    }
+    unsafe fn flush(&mut self) {
+        self.s(b"\n");
+        write(2, self.buf.as_ptr() as *const c_void, self.len);
+    }
 }
 
 /// Cooperative short yield for a backend poll loop (e.g. rumpcomp_tap.c's RX on
@@ -958,6 +1066,23 @@ mod tests {
 
     const ROUNDS: c_int = 5;
 
+    /// Reset the scheduler globals and re-run `init_sched()`. Rust's std test
+    /// harness runs every `#[test]` fn in this file in the SAME process
+    /// (separate OS threads, not separate processes) — `THREAD_LIST`/`EXITED`/
+    /// `CURRENT` are process-wide statics, so a PRIOR test's `init_sched()`
+    /// Thread (a fiber never removes ITSELF from THREAD_LIST) is still linked
+    /// in, with a `ctx` pointing at an OS thread/stack that has already
+    /// returned. Without this reset, whichever test runs second segfaults the
+    /// moment `schedule()`'s round-robin reaches that stale entry (found via
+    /// `test-fiber.sh`, exit 139/SIGSEGV, while adding the contention test
+    /// below). Every `#[test]` in this module must call this first.
+    unsafe fn reset_sched() {
+        THREAD_LIST = List::new();
+        EXITED = List::new();
+        CURRENT = ptr::null_mut();
+        init_sched();
+    }
+
     static mut SP_M: [usize; 8] = [0; 8]; // backs a pthread_mutex_t (1st word used)
     static mut SP_C: [usize; 8] = [0; 8]; // backs a pthread_cond_t
     static mut SP_TURN: c_int = 0;
@@ -1000,7 +1125,7 @@ mod tests {
     #[test]
     fn sp_mutex_condvar_ping_pong() {
         unsafe {
-            init_sched();
+            reset_sched();
             SP_TURN = 0;
             SP_ROUNDS = 0;
             akfiber_sp_mutex_init(m_ptr());
@@ -1035,6 +1160,171 @@ mod tests {
             rumpuser_thread_join(p);
             rumpuser_thread_join(q);
             assert_eq!(SP_ROUNDS, 2 * ROUNDS);
+        }
+    }
+
+    // ── round-robin contention reproduction (2026-07-18 rump sysproxy latency
+    // investigation) ─────────────────────────────────────────────────────────
+    //
+    // Live tracing (docs/archive/RUMP_SYSPROXY_LATENCY_FIX.md "Phase 3e") found
+    // that a real rump_server's per-syscall latency floor is NOT idle-sleep
+    // granularity (schedule()'s "nothing runnable, nanosleep" path was never
+    // once entered across 4461 sampled blocking waits) — it's round-robin
+    // contention: many fibers are simultaneously runnable, and a specific
+    // fiber's wait()->wake() handoff has to wait its turn through all of them.
+    // This reproduces that mechanism entirely in-process (no rump kernel, no
+    // QEMU, no Docker-link cycle) by running N independent cv_wait/broadcast
+    // ping-pong PAIRS concurrently — each pair is "legitimate work", exactly
+    // like NetBSD's own kthreads bouncing on internal locks — and measuring how
+    // long ONE tracked pair takes to complete a fixed number of rounds as N
+    // grows. `cargo test -- --nocapture` prints the scaling table.
+    const BG_MAX_PAIRS: usize = 24;
+    static mut BG_MUTEXES: [[usize; 8]; BG_MAX_PAIRS] = [[0; 8]; BG_MAX_PAIRS];
+    static mut BG_CONDS: [[usize; 8]; BG_MAX_PAIRS] = [[0; 8]; BG_MAX_PAIRS];
+    static mut BG_TURN: [c_int; BG_MAX_PAIRS] = [0; BG_MAX_PAIRS];
+    static mut BG_ACTIVE: bool = false;
+
+    // BG_ACTIVE is flipped by the test's drain loop while this fiber sits
+    // parked in akfiber_sp_cond_wait — invisible to clippy across the
+    // cooperative yield, same as SP_TURN in sp_pinger above.
+    #[allow(clippy::while_immutable_condition)]
+    extern "C" fn bg_pair_fiber(arg: *mut c_void) -> *mut c_void {
+        let packed = arg as usize;
+        let idx = packed >> 1;
+        let me = (packed & 1) as c_int;
+        unsafe {
+            let m = ptr::addr_of_mut!(BG_MUTEXES[idx]) as *mut c_void;
+            let c = ptr::addr_of_mut!(BG_CONDS[idx]) as *mut c_void;
+            while BG_ACTIVE {
+                akfiber_sp_mutex_lock(m);
+                while BG_TURN[idx] != me {
+                    akfiber_sp_cond_wait(c, m);
+                }
+                BG_TURN[idx] = if me == 0 { 1 } else { 0 };
+                akfiber_sp_cond_broadcast(c);
+                akfiber_sp_mutex_unlock(m);
+            }
+            rumpuser_thread_exit();
+        }
+    }
+
+    /// Tracked pair: same shape as `sp_pinger`, but runs a fixed round count and
+    /// reports completion via `TRACKED_DONE`/`TRACKED_ROUNDS` instead of join
+    /// (background pairs must not be joined — they loop until `BG_ACTIVE` drops).
+    static mut TRACKED_M: [usize; 8] = [0; 8];
+    static mut TRACKED_C: [usize; 8] = [0; 8];
+    static mut TRACKED_TURN: c_int = 0;
+    static mut TRACKED_ROUNDS: c_int = 0;
+    const TRACKED_TARGET: c_int = 200;
+
+    extern "C" fn tracked_pinger(arg: *mut c_void) -> *mut c_void {
+        let me = arg as usize as c_int;
+        unsafe {
+            let m = ptr::addr_of_mut!(TRACKED_M) as *mut c_void;
+            let c = ptr::addr_of_mut!(TRACKED_C) as *mut c_void;
+            loop {
+                akfiber_sp_mutex_lock(m);
+                while TRACKED_TURN != me {
+                    akfiber_sp_cond_wait(c, m);
+                }
+                let done = TRACKED_ROUNDS >= TRACKED_TARGET;
+                if !done {
+                    TRACKED_ROUNDS += 1;
+                }
+                TRACKED_TURN = if me == 0 { 1 } else { 0 };
+                akfiber_sp_cond_broadcast(c);
+                akfiber_sp_mutex_unlock(m);
+                if done {
+                    rumpuser_thread_exit();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round_robin_contention_scales_with_fiber_count() {
+        std::println!(
+            "\n[contention] tracked pair target={} rounds, background pairs sweep 0..{}",
+            TRACKED_TARGET, BG_MAX_PAIRS
+        );
+        // See reset_sched()'s doc comment — required regardless of which
+        // #[test] in this module happens to run first.
+        unsafe {
+            reset_sched();
+        }
+        for &n_bg in &[0usize, 2, 6, 12, BG_MAX_PAIRS] {
+            unsafe {
+                TRACKED_TURN = 0;
+                TRACKED_ROUNDS = 0;
+                akfiber_sp_mutex_init(ptr::addr_of_mut!(TRACKED_M) as *mut c_void);
+                akfiber_sp_cond_init(ptr::addr_of_mut!(TRACKED_C) as *mut c_void);
+                BG_ACTIVE = true;
+                for i in 0..n_bg {
+                    akfiber_sp_mutex_init(ptr::addr_of_mut!(BG_MUTEXES[i]) as *mut c_void);
+                    akfiber_sp_cond_init(ptr::addr_of_mut!(BG_CONDS[i]) as *mut c_void);
+                    BG_TURN[i] = 0;
+                    let mut cookie: *mut c_void = ptr::null_mut();
+                    assert_eq!(
+                        rumpuser_thread_create(
+                            bg_pair_fiber, (i << 1) as *mut c_void,
+                            b"bgA\0".as_ptr() as *const c_char, 0, 0, 0, &mut cookie,
+                        ), 0
+                    );
+                    assert_eq!(
+                        rumpuser_thread_create(
+                            bg_pair_fiber, ((i << 1) | 1) as *mut c_void,
+                            b"bgB\0".as_ptr() as *const c_char, 0, 0, 0, &mut cookie,
+                        ), 0
+                    );
+                }
+
+                let mut p: *mut c_void = ptr::null_mut();
+                let mut q: *mut c_void = ptr::null_mut();
+                assert_eq!(
+                    rumpuser_thread_create(
+                        tracked_pinger, 0 as *mut c_void,
+                        b"trP\0".as_ptr() as *const c_char, 1, 0, 0, &mut p,
+                    ), 0
+                );
+                assert_eq!(
+                    rumpuser_thread_create(
+                        tracked_pinger, 1 as *mut c_void,
+                        b"trQ\0".as_ptr() as *const c_char, 1, 0, 0, &mut q,
+                    ), 0
+                );
+
+                let t0 = std::time::Instant::now();
+                rumpuser_thread_join(p);
+                rumpuser_thread_join(q);
+                let elapsed = t0.elapsed();
+                assert_eq!(TRACKED_ROUNDS, TRACKED_TARGET);
+
+                // Stop background pairs (non-joinable — they self-exit once
+                // BG_ACTIVE drops and they next reach their own turn) before the
+                // next sweep step re-initializes shared state. THREAD_LIST always
+                // has >= 1 entry (this test fiber itself never exits), so drain by
+                // a fixed number of nudge rounds rather than "list empty": each
+                // round wakes every background pair, and one flip is enough for
+                // both fibers in a pair to cascade out (the one that wins the
+                // race flips BG_TURN again before exiting, releasing its partner).
+                // A few extra rounds over n_bg is generous slack, not a tight
+                // bound — this loop is O(n_bg) fiber switches, not wall-clock time.
+                BG_ACTIVE = false;
+                for _ in 0..(n_bg + 4) {
+                    for i in 0..n_bg {
+                        BG_TURN[i] = 1 - BG_TURN[i];
+                        akfiber_sp_cond_broadcast(ptr::addr_of_mut!(BG_CONDS[i]) as *mut c_void);
+                    }
+                    rumpuser_akuma_yield();
+                }
+
+                let fibers = 2 + 2 * n_bg;
+                let per_round_us = elapsed.as_micros() as f64 / f64::from(TRACKED_TARGET);
+                std::println!(
+                    "  fibers={:3}  {:>4} rounds in {:8.2}ms  ({:6.1} us/round)",
+                    fibers, TRACKED_TARGET, elapsed.as_secs_f64() * 1000.0, per_round_us
+                );
+            }
         }
     }
 }
