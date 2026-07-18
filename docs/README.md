@@ -74,6 +74,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | Syscalls / Linux ABI | [`reference/subsystems/syscalls.md`](reference/subsystems/syscalls.md) | A |
 | Containers / boxes / herd | [`reference/subsystems/containers.md`](reference/subsystems/containers.md) | B |
 | Cargo features + env knobs | [`reference/subsystems/config-flags.md`](reference/subsystems/config-flags.md) | — |
+| Build profiles / distributions (release, size, extreme-size, devbox, release-smp) | [`reference/build-profiles.md`](reference/build-profiles.md) | — |
 | IRQ / console / RNG / async-fs | [`reference/subsystems/irq.md`](reference/subsystems/irq.md) etc. | B / B / B / A |
 | In-kernel shell / editor | [`reference/subsystems/shell.md`](reference/subsystems/shell.md) / [`editor.md`](reference/subsystems/editor.md) | **C** / A |
 | Drivers (GIC, timers, block, fw_cfg) | [`reference/subsystems/drivers/`](reference/subsystems/drivers/) | B / B / A / A |
