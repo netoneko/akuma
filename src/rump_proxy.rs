@@ -55,6 +55,17 @@ macro_rules! rsp_trace {
 static RUMP_WAIT_US: AtomicU64 = AtomicU64::new(0);
 static RUMP_WAIT_N: AtomicU32 = AtomicU32::new(0);
 
+// Phase 3p: Kernel-side round-trip timing breakdown for one isolated proxied syscall.
+// Measures the time spent in each phase:
+// - RUMP_KERNEL_WRITE_US: time writing request to rump_server
+// - RUMP_KERNEL_READ_US: time waiting for and reading response from rump_server  
+// - RUMP_KERNEL_TOTAL_US: total kernel-side time (write + read)
+// These are separate from the existing RUMP_WAIT_US which measures blocking time only.
+static RUMP_KERNEL_WRITE_US: AtomicU64 = AtomicU64::new(0);
+static RUMP_KERNEL_READ_US: AtomicU64 = AtomicU64::new(0);
+static RUMP_KERNEL_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+static RUMP_KERNEL_N: AtomicU32 = AtomicU32::new(0);
+
 /// Box IDs whose network stack is the NetBSD rump kernel — set via the
 /// `SET_BOX_STACK` syscall when herd starts a `stack = rump` service. A box not
 /// in this set uses smoltcp (the default), so its socket dispatch is unchanged.
@@ -243,7 +254,9 @@ pub fn attach_server(box_id: u64, server_pid: process::Pid) {
         let chan =
             PipeTransport { io: KernelPipeIo, wr: px, rd: py, timeout_us: HANDSHAKE_TIMEOUT_US };
         let entry = match Client::connect(chan, b"akuma-kernel") {
-            Ok(client) => {
+            Ok(mut client) => {
+                // Phase 3p: Set time function for kernel-side timing instrumentation
+                client.set_now_fn(crate::timer::uptime_us);
                 crate::safe_print!(64, "[RUMP-SP] box={} proxy ready\n", box_id);
                 // NOTE: the network-thread boost slot is claimed by
                 // `start_default_stack` (for the rump_server TID), NOT here.
@@ -1077,25 +1090,54 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
     let t0 = crate::timer::uptime_us();
     let w_us0 = RUMP_WAIT_US.load(Ordering::Relaxed);
     let w_n0 = RUMP_WAIT_N.load(Ordering::Relaxed);
+    
+    // Phase 3p: Capture kernel-side accumulators for this specific syscall
+    let kern_write0 = RUMP_KERNEL_WRITE_US.load(Ordering::Relaxed);
+    let kern_read0 = RUMP_KERNEL_READ_US.load(Ordering::Relaxed);
+    let kern_total0 = RUMP_KERNEL_TOTAL_US.load(Ordering::Relaxed);
+    let kern_n0 = RUMP_KERNEL_N.load(Ordering::Relaxed);
+    
     let (res, hops) =
-        proxy.with_client(|c| (c.syscall(translation::netbsd_sysno(op), &nb_args, &mut mem), c.last_callbacks()));
+        proxy.with_client(|c| {
+            let (result, callbacks) = (c.syscall(translation::netbsd_sysno(op), &nb_args, &mut mem), c.last_callbacks());
+            // Phase 3p: Accumulate kernel-side timings
+            RUMP_KERNEL_WRITE_US.fetch_add(c.last_write_us(), Ordering::Relaxed);
+            RUMP_KERNEL_READ_US.fetch_add(c.last_read_us(), Ordering::Relaxed);
+            RUMP_KERNEL_TOTAL_US.fetch_add(c.last_write_us() + c.last_read_us(), Ordering::Relaxed);
+            RUMP_KERNEL_N.fetch_add(1, Ordering::Relaxed);
+            (result, callbacks)
+        });
     let dt = crate::timer::uptime_us().saturating_sub(t0);
     let w_us = RUMP_WAIT_US.load(Ordering::Relaxed).saturating_sub(w_us0);
     let w_n = RUMP_WAIT_N.load(Ordering::Relaxed).saturating_sub(w_n0);
+    
+    // Phase 3p: Extract detailed kernel timings for this specific syscall
+    let kern_write_us = RUMP_KERNEL_WRITE_US.load(Ordering::Relaxed).saturating_sub(kern_write0);
+    let kern_read_us = RUMP_KERNEL_READ_US.load(Ordering::Relaxed).saturating_sub(kern_read0);
+    let kern_total_us = RUMP_KERNEL_TOTAL_US.load(Ordering::Relaxed).saturating_sub(kern_total0);
+    let kern_n = RUMP_KERNEL_N.load(Ordering::Relaxed).saturating_sub(kern_n0);
+    
+    // Also get per-syscall transport timings from the client
+    let (transport_write_us, transport_read_us) = proxy.with_client(|c| (c.last_write_us(), c.last_read_us()));
+    
     match res {
         Ok([n, _]) => {
             rsp_trace!(
                 128,
-                "[RUMP-SP] {} a2={} -> {} ({}us; hops={} blk={}us/{})\n",
-                op_name(op), a2, n, dt, hops, w_us, w_n
+                "[RUMP-SP] {} a2={} -> {} ({}us; hops={} blk={}us/{}) [kern: w={} r={} t={} n={}] [trans: w={} r={}]\n",
+                op_name(op), a2, n, dt, hops, w_us, w_n,
+                kern_write_us, kern_read_us, kern_total_us, kern_n,
+                transport_write_us, transport_read_us
             );
             n as u64
         }
         Err(e) => {
             rsp_trace!(
                 128,
-                "[RUMP-SP] {} -> errno {} ({}us; hops={} blk={}us/{})\n",
-                op_name(op), e, dt, hops, w_us, w_n
+                "[RUMP-SP] {} -> errno {} ({}us; hops={} blk={}us/{}) [kern: w={} r={} t={} n={}] [trans: w={} r={}]\n",
+                op_name(op), e, dt, hops, w_us, w_n,
+                kern_write_us, kern_read_us, kern_total_us, kern_n,
+                transport_write_us, transport_read_us
             );
             neg_linux_errno(translation::errno_netbsd_to_linux(e))
         }

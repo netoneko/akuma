@@ -136,6 +136,11 @@ pub struct Client<T: Transport> {
     /// syscall costs `1 + callbacks` pipe round-trips, so this separates "many
     /// copyin hops" from "one slow hop" when reading the `[RUMP-SP]` timings.
     callbacks: u32,
+    /// Phase 3p: Timing breakdown for the last syscall (microseconds)
+    last_write_us: u64,
+    last_read_us: u64,
+    /// Phase 3p: Callback to get current time for instrumentation
+    now_fn: fn() -> u64,
 }
 
 impl<T: Transport> Client<T> {
@@ -157,7 +162,7 @@ impl<T: Transport> Client<T> {
             return Err(EIO);
         }
 
-        let mut c = Self { t, reqno: 1, callbacks: 0 };
+        let mut c = Self { t, reqno: 1, callbacks: 0, last_write_us: 0, last_read_us: 0, now_fn: || { 0 } };
         // 2. Handshake request: hdr + progname + NUL.
         let reqno = c.next_reqno();
         let mut payload = Vec::with_capacity(progname.len() + 1);
@@ -200,9 +205,19 @@ impl<T: Transport> Client<T> {
             RUMPSP_SYSCALL,
             sysnum,
         );
+        
+        // Phase 3p: Time the request write
+        let write_start = (self.now_fn)();
         self.t.write_all(&hdr).map_err(|_| EIO)?;
         self.t.write_all(args).map_err(|_| EIO)?;
-        self.await_response(reqno, mem, true)
+        self.last_write_us = (self.now_fn)().saturating_sub(write_start);
+        
+        // Phase 3p: Time the response read (including any callbacks)
+        let read_start = (self.now_fn)();
+        let result = self.await_response(reqno, mem, true);
+        self.last_read_us = (self.now_fn)().saturating_sub(read_start);
+        
+        result
     }
 
     /// Read frames, servicing server callbacks, until the RESP/ERROR for
@@ -252,6 +267,23 @@ impl<T: Transport> Client<T> {
     #[must_use]
     pub fn last_callbacks(&self) -> u32 {
         self.callbacks
+    }
+
+    /// Phase 3p: Write time in microseconds for the last syscall
+    #[must_use]
+    pub fn last_write_us(&self) -> u64 {
+        self.last_write_us
+    }
+
+    /// Phase 3p: Read time in microseconds for the last syscall  
+    #[must_use]
+    pub fn last_read_us(&self) -> u64 {
+        self.last_read_us
+    }
+
+    /// Phase 3p: Set the time function for instrumentation (normally uptime_us)
+    pub fn set_now_fn(&mut self, f: fn() -> u64) {
+        self.now_fn = f;
     }
 
     /// Service one server→client callback (copyin/copyout/anonmmap/raise).

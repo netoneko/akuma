@@ -577,6 +577,16 @@ static CAPTURE_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "rumpuser_debug")]
 const CAPTURE_CAP: u64 = 60_000;
 
+/// Phase 3p: Detailed sp_cond_wait chain profiling. Tracks what each handoff in
+/// the ~6 sequential wait/wake cycles is actually waiting for (which lock/cv, which
+/// upstream event). Uses a shared CAPTURE_COUNT budget with the existing w3i/w3k traces.
+#[cfg(feature = "rumpuser_debug")]
+static mut SP_COND_WAIT_CHAIN: [u8; 256] = [0u8; 256];
+#[cfg(feature = "rumpuser_debug")]
+static mut SP_COND_WAIT_CHAIN_LEN: u8 = 0;
+#[cfg(feature = "rumpuser_debug")]
+static SP_COND_WAIT_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Phase 3j: which of the 6 rumpuser hypercalls that funnel into `wait()` is
 /// about to call it — set immediately before each call site's `wait(...)`,
 /// read inside `wait()`. Safe as a single global despite no locking: this is
@@ -994,6 +1004,21 @@ unsafe fn wait(wh: *mut List<Waiter>, msec: i64) -> c_int {
                         lb.s(nm);
                     }
                     lb.s(b" switches=").n(c as i64).flush();
+                }
+                // Phase 3p: Dump sp_cond_wait chain profiling
+                let sp_count = SP_COND_WAIT_COUNT.load(Ordering::Relaxed);
+                let sp_len = SP_COND_WAIT_CHAIN_LEN as usize;
+                if sp_count > 0 && sp_len > 0 {
+                    let mut lb = LineBuf::new();
+                    lb.s(b"  sp_chain: count=").n(sp_count as i64).s(b" len=").n(sp_len as i64).flush();
+                    // Dump up to 8 cv pointers from the chain
+                    let dump_len = sp_len.min(8);
+                    for i in 0..dump_len {
+                        let start = i * 8;
+                        let cv_id = u64::from_le_bytes(SP_COND_WAIT_CHAIN[start..start + 8].try_into().unwrap());
+                        let mut lb = LineBuf::new();
+                        lb.s(b"  sp_chain[").n(i as i64).s(b"] cv=0x").n(cv_id as i64).flush();
+                    }
                 }
             }
         }
@@ -1437,6 +1462,24 @@ pub unsafe extern "C" fn akfiber_sp_cond_init(p: *mut c_void) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn akfiber_sp_cond_wait(cvp: *mut c_void, mtxp: *mut c_void) -> c_int {
     let c = sp_cv(cvp);
+    // Phase 3p: Track sp_cond_wait chain profiling - capture cv/mtx pointers
+    #[cfg(feature = "rumpuser_debug")]
+    {
+        let count = SP_COND_WAIT_COUNT.fetch_add(1, Ordering::Relaxed);
+        if count < 256 {
+            let chain_len = SP_COND_WAIT_CHAIN_LEN as usize;
+            if chain_len < 256 {
+                // Store cv pointer (truncated to 8 bytes) as a unique identifier
+                let cv_id = (cvp as u64).to_le_bytes();
+                let start = chain_len * 8;
+                if start + 8 <= 256 {
+                    SP_COND_WAIT_CHAIN[start..start + 8].copy_from_slice(&cv_id);
+                    SP_COND_WAIT_CHAIN_LEN = (chain_len + 1) as u8;
+                }
+            }
+        }
+    }
+    
     // Drop the mutex, park on the cv, then re-acquire. Atomic w.r.t. other fibers:
     // nothing else runs between the unlock and the park until wait() schedule()s.
     akfiber_sp_mutex_unlock(mtxp);
