@@ -3,10 +3,9 @@
 **Status: ✅ PASSES (2026-06-23).** The capstone IRC proof is met: **`sic` holds a
 live `#rumpkernel` session on OFTC, with the entire IRC session carried by the
 NetBSD rump TCP/IP stack** running on our Rust `rumpuser` inside Akuma — not
-smoltcp. Source of record: `userspace/rumpkernel/docs/HANDOFF.md` ("🏆 M2
-ACHIEVED (2026-06-23)") and commit `28df3f1` *"IRC works end to end on netbsd
-networking stack"* (build-up: `e523669` "connected to libera via sic", `075029f`
-"patch sic").
+smoltcp. Source of record: `docs/archive/RUMP_SYSPROXY.md` "B-OUTCOME" and
+commit `28df3f1` *"IRC works end to end on netbsd networking stack"*
+(build-up: `e523669` "connected to libera via sic", `075029f` "patch sic").
 
 How it actually ran (differs from the original `tcc`-in-VM plan below — see
 "What shipped" note): the unmodified static `sic` binary runs in a `stack=rump`
@@ -129,9 +128,10 @@ without executing or producing output — even for a pure builtin. This reproduc
 **outside the box** (the `sshd_host` diagnostic service on smoltcp `:2323`, no rump),
 so it is a `userspace/sshd` ↔ busybox stdin/execution bug, **not** rump-specific. The
 bridge mechanism itself (non-blocking poll, non-tty stdin, stdin-EOF delivery,
-drain-until-shell-exits) is fixed; see `userspace/rumpkernel/docs/HANDOFF.md`
-("SSH interactive command bridge (2026-06-24)") for the full breakdown and the
-next-session debug plan. (A secondary robustness gap — a blocked busybox wedges the
+drain-until-shell-exits) is fixed — the write-up ("SSH interactive command
+bridge (2026-06-24)") lived in `docs/HANDOFF.md`, which was retired
+2026-06-29 and not migrated; no surviving doc covers this fix in detail.
+(A secondary robustness gap — a blocked busybox wedges the
 box's single client slot for later connections — is project task #9.)
 
 **Topology (two stacks, side by side):**
@@ -260,7 +260,7 @@ refuses — confirming the session isn't secretly smoltcp.
 ## Status of the pieces
 
 **The IRC capstone PASSES** (2026-06-23) via the kernel-as-sysproxy-client path
-(see header + `docs/HANDOFF.md` "M2 ACHIEVED"). The list below tracks the
+(see header + `docs/archive/RUMP_SYSPROXY.md` "B-OUTCOME"). The list below tracks the
 original in-VM-`tcc` recipe; several items were satisfied by the sysproxy route
 instead of literally as written.
 
@@ -287,7 +287,7 @@ Done:
       Caveat: one rump process per boot (unclean kill leaves NIC1 RX mid-flight →
       next process can't DHCP). Fix later: reset `/dev/net/tap0` on close.
 
-Done (resolved by M1/M2 — see `docs/HANDOFF.md`):
+Done (resolved by M1/M2 — see `docs/archive/RUMP_SYSPROXY.md`):
 - [x] virtif packet backend over `/dev/net/tap0` on **Akuma** — our `rumpcomp_tap.c`
       over the kernel tap device (M1, 2026-06-22).
 - [x] DHCP one-shot (`rump_pub_netconfig_dhcp_ipv4_oneshot`) against net1's SLIRP
@@ -319,7 +319,7 @@ Done (DNS + HTTPS in the box with static curl):
       (`8.8.8.8`/`1.1.1.1`; absent → musl defaults to `127.0.0.1` → "Could not
       resolve") and `etc/ssl/certs/ca-certificates.crt` (+ `cert.pem`; absent →
       `curl: (77)` mbedTLS ca-cert error). No code change — pure data staging, then
-      full `populate_disk.sh`. See `docs/HANDOFF.md` "Session 2026-06-24 (latest)".
+      full `populate_disk.sh`. See `docs/archive/RUMP_SYSPROXY.md` "Nameserver caveat".
 
 Done (the `meow` LLM client over the rump stack):
 - [x] **`meow` (LLM chat client) runs in the box, non-interactive, via SSH, over the
@@ -352,7 +352,8 @@ Done (fork reliability):
       clobbering the child's stack. Fixed: `flush_tlb_all()` in
       `crates/akuma-exec/src/process/mod.rs`. Reproduced+verified on plain smoltcp
       with BOTH busybox (`:2323`) and toybox (`:4444`): 37/40 & 32/40 SIGSEGV → 0/40.
-      Not busybox- or rump-specific. See `docs/HANDOFF.md`.
+      Not busybox- or rump-specific. See
+      `docs/archive/FAR_0x5_AND_HEAP_CORRUPTION_FIX.md`.
 
 Remaining (polish — not blocking the IRC capstone):
 - [ ] **SSH-into-box interactive reliability** — curl now forks cleanly over `:2223`
@@ -362,4 +363,6 @@ Remaining (polish — not blocking the IRC capstone):
       task #9), not by any crash.
 - [ ] **DNS cold-start** — the first query right after boot occasionally returns no
       answer (SLIRP warm-up); warm with one `box use ... curl` first. Steady-state 6/6.
-- [ ] per-syscall latency (~1s round-trip) + robustness — see `docs/HANDOFF.md` / `RUMP_SYSPROXY.md`.
+- [ ] per-syscall latency (~1s round-trip) + robustness — see
+      `docs/reference/subsystems/rump-stack.md` "Known limitations" and
+      `docs/archive/RUMP_SYSPROXY.md`.

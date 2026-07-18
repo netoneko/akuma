@@ -3,16 +3,20 @@
 `rump_server`: the NetBSD rump kernel running as a userspace process, providing
 the alternate (non-smoltcp) network stack via the kernel sysproxy.
 
-Docs live at [`userspace/rumpkernel/docs/`](../../userspace/rumpkernel/docs/):
-- `RUMP_SYSPROXY.md` — the committed sysproxy design.
-- `HIJACK_VS_KERNEL_PROXY.md` — why kernel-side routing was chosen.
-- `FIBER_HANDOFF.md` — cooperative scheduling handoff with the host kernel.
-- `NATIVE_STACK_INTERNET.md` — validating the native (smoltcp) stack.
-- `PHASE01_BUILDRUMP.md`, `PHASE2_RUMPUSER.md`, `PHASE3_KERNEL_TAP.md` — the
-  bring-up phases.
-- `ARCHITECTURE_QUESTIONS.md`, `FRANKENLIBC_EVAL.md`, `DEV_ZERO.md`,
-  `RUMP_LATENCY_SLEEP_FIX.md`.
-
-See also: [`../reference/subsystems/rump-stack.md`](../reference/subsystems/rump-stack.md),
-[`../reference/subsystems/networking.md`](../reference/subsystems/networking.md),
+For current-state architecture, see
+[`../reference/subsystems/rump-stack.md`](../reference/subsystems/rump-stack.md)
+(internals: sysproxy, the fiber backend, syscall marshaling, known
+limitations) and
+[`../reference/subsystems/networking.md`](../reference/subsystems/networking.md)
+(box routing, the two-stack model). To build/boot it, see
+[`../runbooks/build-devbox.md`](../runbooks/build-devbox.md) and
 [`../runbooks/debug-devbox.md`](../runbooks/debug-devbox.md).
+
+History (build-out narrative, bug post-mortems, rejected designs) lives in
+`archive/`, not co-located with the source anymore:
+`RUMP_SYSPROXY.md`, `HIJACK_VS_KERNEL_PROXY.md`, `FIBER_HANDOFF.md`,
+`RUMP_LATENCY_SLEEP_FIX.md`, `ARCHITECTURE_QUESTIONS.md`,
+`FRANKENLIBC_EVAL.md`, `NATIVE_STACK_INTERNET.md`, `DEV_ZERO.md`,
+`PHASE01_BUILDRUMP.md`, `PHASE2_RUMPUSER.md`, `PHASE3_KERNEL_TAP.md`,
+`IMPLEMENTATION_PLAN.md`, `RUMP_PLUS_HERD.md`, `OPTIONAL_SMOLTCP.md`,
+`MULTIKERNEL_NETWORKING_EXPERIMENT.md`.

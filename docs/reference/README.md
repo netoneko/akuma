@@ -18,7 +18,7 @@ churn. See [`../README.md`](../README.md).
 | Scheduler / threads | [`subsystems/scheduler.md`](subsystems/scheduler.md) | A |
 | SMP / multikernel | [`subsystems/smp.md`](subsystems/smp.md) | **C** |
 | Networking (box model, two stacks) | [`subsystems/networking.md`](subsystems/networking.md) | **C** |
-| Rump stack (sysproxy, fiber) | [`subsystems/rump-stack.md`](subsystems/rump-stack.md) | B |
+| Rump stack (sysproxy, fiber) | [`subsystems/rump-stack.md`](subsystems/rump-stack.md) | **C** |
 | SSH (built-in + userspace) | [`subsystems/ssh.md`](subsystems/ssh.md) | A |
 | VFS (ext2, procfs, pipes) | [`subsystems/vfs.md`](subsystems/vfs.md) | A |
 | Syscalls / Linux ABI | [`subsystems/syscalls.md`](subsystems/syscalls.md) (per-family docs in [`subsystems/syscalls/`](subsystems/syscalls/), grades vary) | A |

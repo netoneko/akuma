@@ -68,7 +68,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | Scheduler / threads | [`reference/subsystems/scheduler.md`](reference/subsystems/scheduler.md) | A |
 | SMP / multikernel | [`reference/subsystems/smp.md`](reference/subsystems/smp.md) | **C** |
 | Networking (box model, two stacks) | [`reference/subsystems/networking.md`](reference/subsystems/networking.md) | **C** |
-| Rump stack (sysproxy, fiber) | [`reference/subsystems/rump-stack.md`](reference/subsystems/rump-stack.md) | B |
+| Rump stack (sysproxy, fiber) | [`reference/subsystems/rump-stack.md`](reference/subsystems/rump-stack.md) | **C** |
 | SSH (built-in + userspace) | [`reference/subsystems/ssh.md`](reference/subsystems/ssh.md) | A |
 | VFS (ext2, procfs, pipes) | [`reference/subsystems/vfs.md`](reference/subsystems/vfs.md) | A |
 | Syscalls / Linux ABI | [`reference/subsystems/syscalls.md`](reference/subsystems/syscalls.md) | A |

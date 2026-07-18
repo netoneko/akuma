@@ -98,4 +98,4 @@ In-VM: `ps` builtin prints each process's saved kernel resume point
 - `archive/RUST_TOOLCHAIN_ISSUES.md` — nightly cargo crash, Scudo corruption.
 - `archive/KNOWN_ISSUES.md` §10-11 — the two 100%-CPU bugs (FIXED).
 - `archive/OPTIONAL_SMOLTCP.md` — the rump-path bug-fix history.
-- `userspace/rumpkernel/docs/FIBER_HANDOFF.md` — rump latency root cause + open items.
+- `archive/FIBER_HANDOFF.md` — rump latency root cause + open items.

@@ -96,6 +96,6 @@ spawn. Source: `crates/akuma-rump/src/syscall_translation.rs`,
 
 - `archive/SMOLTCP_MIGRATION_SUMMARY.md` — the smoltcp migration post-mortem.
 - `archive/OPTIONAL_SMOLTCP.md` — making smoltcp optional for the devbox.
-- `userspace/rumpkernel/docs/NATIVE_STACK_INTERNET.md` — validating the native stack.
-- `userspace/rumpkernel/docs/RUMP_SYSPROXY.md` — the committed sysproxy design.
-- `userspace/rumpkernel/docs/HIJACK_VS_KERNEL_PROXY.md` — why kernel-side routing.
+- `archive/NATIVE_STACK_INTERNET.md` — validating the native stack.
+- `archive/RUMP_SYSPROXY.md` — the committed sysproxy design.
+- `archive/HIJACK_VS_KERNEL_PROXY.md` — why kernel-side routing.
