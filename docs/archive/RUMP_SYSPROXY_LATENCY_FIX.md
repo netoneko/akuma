@@ -1,8 +1,18 @@
 # Rump sysproxy latency — Phase 2 + 3 fix (scheduling, poll cadence, Nagle)
 
-> **Status: LIVE (2026-07-18).** Phase 2a + 2b + 3a + 3b applied, measured, verified.
+> **Status: LIVE (2026-07-18).** Phase 2a + 2b + 3a + 3b applied, measured,
+> verified. Phase 3e/3f root-caused (not yet fixed) a residual ~300ms
+> single-round-trip floor to fiber-scheduling contention, dominated by
+> `rumpsp` (expected) and `rumpclk0`, the software-clock heartbeat (37% of
+> all scheduling activity — unexpected).
+>
 > See `docs/archive/RUMP_LATENCY_SLEEP_FIX.md` for the earlier **disproven**
-> approach (lowering `hz`, `cv_broadcast`→`cv_signal`) — do NOT revisit.
+> "lower `hz`" / `cv_broadcast`→`cv_signal` approach — disproven specifically
+> on the **pthread** backend (a `cv_broadcast` thundering herd across ~19 real
+> OS threads). That mechanism doesn't exist under the fiber backend (Phase 3e
+> proved fiber context switches are cheap even under 50-way contention), so
+> Phase 3f's `rumpclk0` finding is a **new data point, not a rerun of the old
+> one** — see Phase 3f below before assuming "already tried, don't bother."
 
 ## Symptom
 
@@ -314,6 +324,62 @@ two real `wait_fd` users (`rumpcomp_tap.c`'s RX loop, `sp_serve_fd.c`'s
 sysproxy reader), well under the cap — but it's a silent limit worth knowing
 about before adding a third.
 
+## Phase 3f — named the fibers: `rumpclk0` is 37% of all scheduling activity
+
+Phase 3e proved the fiber scheduler *mechanism* isn't the cost but couldn't
+say which fibers were dominating turns — the trace only had counts, no names.
+Fix: `rumpuser_thread_create`'s `thrname` argument was silently discarded
+(`_thrname`) even though every NetBSD kthread — and `rumpcomp_tap.c`'s
+`tap-rx` — already passes one. Captured it into `Thread` (`fiber.rs`, gated
+behind `rumpuser_debug`, dead weight otherwise) and added a per-name
+switch-in histogram (`schedule_hist_bump`, called from `switch_threads`) —
+pure in-memory counter updates on the hot path (a ≤32-slot linear scan,
+no I/O), dumped rate-limited (every 200th slow `wait()`) piggybacked on the
+existing trace point.
+
+Deployed the same way as Phase 3e (rebuild via `docker-build-rump-server.sh`
+with `rumpuser_debug` added, `scripts/populate_disk.sh --overlay`, boot,
+one keystroke, read `/var/log/box/0/rump_server.log`), then summed the last
+histogram snapshot (9,636 total switches captured over the run):
+
+| fiber | switches | share |
+|---|---|---|
+| `rumpsp` (sysproxy server — the actual worker) | 4,352 | 45.2% |
+| `rumpclk0` (rump's software clock / hardclock heartbeat) | 3,538 | **36.7%** |
+| `rsi0/1` (softint, NIC0) | 825 | 8.6% |
+| everything else (16 kthreads: `ipflow_slowtimo`, `tap-rx`, `vdrain`, `vrele`, `cachegc`, `ioflush`, `rt_timer`, `rsi0/2`, `rsi0/3`, `vmem_rehash`, `main`, …) | ~920 combined | ~9.5% |
+
+`rumpsp` dominating is expected — it's the fiber doing our actual work.
+**`rumpclk0` at 37% was not expected**, and together with `rumpsp` they're
+~82% of all scheduling activity, with a long tail of NetBSD's other kthreads
+each under 2%.
+
+### Why this doesn't just re-confirm the disproven doc
+
+`docs/archive/RUMP_LATENCY_SLEEP_FIX.md` already investigated "the 100 Hz
+clock heartbeat is the cost" back on 2026-06-23 — lowering `hz` was built,
+measured, and **disproven** (made curl latency *worse*, not better). But that
+measurement predates the fiber backend entirely: it was diagnosing the
+*pthread* backend's `cv_broadcast` thundering herd, where every clock tick's
+CPU release woke ~19 real OS threads that all lost the race and went back to
+sleep — a mechanism specific to pthreads. Phase 3e already proved fibers
+don't have that problem (context switches are microseconds even at 50-way
+contention). So `rumpclk0` showing up this large under fiber is a **different
+mechanism** than what was ruled out in June — it's not a "thundering herd
+disproof rerun," it's a fresh data point on a fresh backend. Worth testing on
+its own merits, not skipped because of the old doc.
+
+### Not yet done: actually testing a fix
+
+This phase identified the culprit; it didn't fix it. Lowering `hz` (or
+reducing `rumpclk0`'s tick rate some other way) is the obvious next
+experiment, but it's a real behavior change to rump's internal timekeeping
+(the old doc's own caveat still applies: coarser `hz` risks slower TCP
+retransmit/DHCP timing, not just less overhead) and needs the same
+measure-before-and-after discipline as every other phase here — not a blind
+patch. Left for Phase 3g rather than rushed through in the same pass as the
+identification.
+
 ## Future work (Phase 3, not started)
 
 - **Phase 3a2**: A genuine push wake for tap RX would require NIC1 GIC
@@ -323,9 +389,13 @@ about before adding a third.
   `librumpnet_virtif`) to Rust for parity and maintainability.
 - **Phase 3d**: Per-socket wakers (conditional wake instead of broadcast) to
   reduce scheduler contention under many-fd workloads.
-- **Phase 3f**: Identify *which* NetBSD kthread-fibers are runnable so often
-  and what work they're doing per turn (Phase 3e narrowed this to "not
-  scheduling overhead" but didn't name the culprit) — likely needs per-fiber
-  naming/labeling in the trace, not just counts. The `round_robin_contention_*`
-  host test is the fast harness to validate any fix against before a full
-  QEMU/SSH round trip.
+- **Phase 3g**: Test lowering `rumpclk0`'s tick rate (`hz`) under the fiber
+  backend specifically — Phase 3f found it's 37% of all fiber scheduling
+  activity, and the earlier "lower hz" disproof (`RUMP_LATENCY_SLEEP_FIX.md`)
+  was measured on the pthread backend, a different mechanism (see Phase 3f's
+  writeup above). Where to set it: the Rust `main()` in `rump_server.rs` now
+  owns what `rump_server.c`'s wrapper used to (before `rump_init()`), not the
+  archived C file. Validate with the same before/after methodology as every
+  other phase — `round_robin_contention_scales_with_fiber_count`
+  (`test-fiber.sh`) for a fast sanity check, then a real devbox boot +
+  `interactive_latency.py`-style measurement before trusting the number.

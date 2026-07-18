@@ -277,6 +277,18 @@ struct Thread {
     wait_fd: c_int,
     wait_events: i16,  // POLL* bits we're waiting for
     wait_revents: i16, // POLL* bits the idle poll observed ready (consumed on wake)
+    // TEMP diagnostic (2026-07-18 rump sysproxy latency investigation, Phase
+    // 3f): `rumpuser_thread_create`'s `thrname` arg was previously discarded
+    // (`_thrname`) — every NetBSD kthread IS created with a human-readable
+    // name (e.g. "softnet", "ifnet", "sysproxy"; see `rump_server.c`/the
+    // vendored `src-netbsd` kthread call sites), so capturing it costs nothing
+    // and turns "many fibers are runnable" into "THESE NAMED fibers are
+    // runnable" — see `schedule_hist_bump`. Gated behind `rumpuser_debug` so
+    // it's dead weight (unused field, never read) in the shipped binary.
+    #[cfg(feature = "rumpuser_debug")]
+    name: [u8; 16],
+    #[cfg(feature = "rumpuser_debug")]
+    name_len: u8,
 }
 impl Linked for Thread {
     unsafe fn link(this: *mut Self) -> *mut Link<Self> {
@@ -349,11 +361,47 @@ unsafe fn block(t: *mut Thread) {
 
 unsafe fn switch_threads(prev: *mut Thread, next: *mut Thread) {
     CURRENT = next;
+    #[cfg(feature = "rumpuser_debug")]
+    schedule_hist_bump(&(&(*next).name)[..(*next).name_len as usize]);
     if let Some(hook) = SCHED_HOOK {
         // cookie field isn't tracked separately; pass lwp pointers (parity stub).
         hook((*prev).lwp, (*next).lwp);
     }
     akfiber_switch(&mut (*prev).ctx, &mut (*next).ctx);
+}
+
+/// Phase 3f: per-name switch-in histogram (which NAMED fiber is `schedule()`
+/// actually favoring). In-memory only on the hot path — a linear scan over
+/// <=32 short byte-slices per real context switch, no I/O — dumped
+/// (rate-limited) from the existing wait()>=1ms trace point, not printed here.
+#[cfg(feature = "rumpuser_debug")]
+const HIST_SLOTS: usize = 32;
+#[cfg(feature = "rumpuser_debug")]
+static mut HIST_NAME: [[u8; 16]; HIST_SLOTS] = [[0u8; 16]; HIST_SLOTS];
+#[cfg(feature = "rumpuser_debug")]
+static mut HIST_NAME_LEN: [u8; HIST_SLOTS] = [0u8; HIST_SLOTS];
+#[cfg(feature = "rumpuser_debug")]
+static mut HIST_COUNT: [u64; HIST_SLOTS] = [0u64; HIST_SLOTS];
+/// Sampling counter for the histogram dump (see the `wait:` trace site).
+#[cfg(feature = "rumpuser_debug")]
+static HIST_DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "rumpuser_debug")]
+unsafe fn schedule_hist_bump(name: &[u8]) {
+    for i in 0..HIST_SLOTS {
+        if HIST_COUNT[i] == 0 {
+            let n = name.len().min(16);
+            HIST_NAME[i][..n].copy_from_slice(&name[..n]);
+            HIST_NAME_LEN[i] = n as u8;
+            HIST_COUNT[i] = 1;
+            return;
+        }
+        if HIST_NAME_LEN[i] as usize == name.len() && &HIST_NAME[i][..name.len()] == name {
+            HIST_COUNT[i] += 1;
+            return;
+        }
+    }
+    // All HIST_SLOTS distinct names taken: drop silently (diagnostic only).
 }
 
 /// Cooperative round-robin scheduler. Picks the next runnable thread, waking any
@@ -492,6 +540,10 @@ unsafe fn create_thread(entry: usize, arg: *mut c_void) -> *mut Thread {
             wait_fd: -1,
             wait_events: 0,
             wait_revents: 0,
+            #[cfg(feature = "rumpuser_debug")]
+            name: [0u8; 16],
+            #[cfg(feature = "rumpuser_debug")]
+            name_len: 0,
         },
     );
     akctx_make(&mut (*thr).ctx, stack, entry, arg);
@@ -582,6 +634,10 @@ pub unsafe fn init_sched() {
             wait_fd: -1,
             wait_events: 0,
             wait_revents: 0,
+            #[cfg(feature = "rumpuser_debug")]
+            name: *b"main\0\0\0\0\0\0\0\0\0\0\0\0",
+            #[cfg(feature = "rumpuser_debug")]
+            name_len: 4,
         },
     );
     set_runnable(thr);
@@ -623,6 +679,30 @@ unsafe fn wait(wh: *mut List<Waiter>, msec: i64) -> c_int {
                 .s(b" wake_all_calls=").n(WAKE_ALL_CALLS.load(Ordering::Relaxed) as i64)
                 .s(b" wake_all_woken_total=").n(WAKE_ALL_WOKEN_TOTAL.load(Ordering::Relaxed) as i64)
                 .flush();
+            // Phase 3f: dump the per-name switch-in histogram too, but only
+            // every HIST_DUMP_EVERY'th slow wait() — the histogram itself is
+            // cheap to update (pure in-memory) but printing all HIST_SLOTS
+            // entries on every single slow wait would reintroduce the same
+            // I/O flood this whole trace path is built to avoid.
+            const HIST_DUMP_EVERY: u64 = 200;
+            let n = HIST_DUMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            if n % HIST_DUMP_EVERY == 0 {
+                for i in 0..HIST_SLOTS {
+                    let c = HIST_COUNT[i];
+                    if c == 0 {
+                        break; // slots fill front-to-back; first empty = end
+                    }
+                    let nm = &HIST_NAME[i][..HIST_NAME_LEN[i] as usize];
+                    let mut lb = LineBuf::new();
+                    lb.s(b"  hist[").n(i as i64).s(b"] name=");
+                    if nm.is_empty() {
+                        lb.s(b"(unnamed)");
+                    } else {
+                        lb.s(nm);
+                    }
+                    lb.s(b" switches=").n(c as i64).flush();
+                }
+            }
         }
     }
 
@@ -791,18 +871,33 @@ pub unsafe extern "C" fn rumpuser_akuma_wait_fd(fd: c_int, events: c_int, timeou
 pub unsafe extern "C" fn rumpuser_thread_create(
     f: extern "C" fn(*mut c_void) -> *mut c_void,
     arg: *mut c_void,
-    _thrname: *const c_char,
+    thrname: *const c_char,
     mustjoin: c_int,
     _priority: c_int,
     _cpuidx: c_int,
     cookie: *mut *mut c_void,
 ) -> c_int {
+    #[cfg(not(feature = "rumpuser_debug"))]
+    let _ = thrname; // captured into Thread::name only when rumpuser_debug is on
     let thr = create_thread(f as usize, arg);
     if thr.is_null() {
         return EINVAL;
     }
     if mustjoin != 0 {
         (*thr).flags |= THREAD_MUSTJOIN;
+    }
+    #[cfg(feature = "rumpuser_debug")]
+    if !thrname.is_null() {
+        let mut n = 0usize;
+        while n < (*thr).name.len() {
+            let b = *thrname.add(n).cast::<u8>();
+            if b == 0 {
+                break;
+            }
+            (*thr).name[n] = b;
+            n += 1;
+        }
+        (*thr).name_len = n as u8;
     }
     if !cookie.is_null() {
         *cookie = thr as *mut c_void;
