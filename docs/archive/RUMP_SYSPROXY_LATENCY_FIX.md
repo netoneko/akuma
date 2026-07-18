@@ -1,6 +1,6 @@
-# Rump sysproxy latency — Phase 2 + 3a fix (network thread + poll cadence)
+# Rump sysproxy latency — Phase 2 + 3 fix (scheduling, poll cadence, Nagle)
 
-> **Status: LIVE (2026-07-18).** Phase 2a + 2b + 3a applied, measured, verified.
+> **Status: LIVE (2026-07-18).** Phase 2a + 2b + 3a + 3b applied, measured, verified.
 > See `docs/archive/RUMP_LATENCY_SLEEP_FIX.md` for the earlier **disproven**
 > approach (lowering `hz`, `cv_broadcast`→`cv_signal`) — do NOT revisit.
 
@@ -147,12 +147,87 @@ match, all private to this file) and widened its match to also accept
 (`sys_epoll_pwait`, `sys_pselect6`, `sys_ppoll`), so no new call sites were
 needed — this was a pure classification fix.
 
-### Future work (Phase 3, not started)
+## Phase 3b — Nagle + no `TCP_NODELAY` was strangling multi-write bursts
 
-- **Phase 3a2**: A genuine push wake would require NIC1 GIC interrupt
-  handling (none exists today — see above); only worth it if 1 ms is still
-  measurably too coarse after 3a.
-- **Phase 3b**: Port `rumpcomp_tap.c` (241 lines, C-ABI to NetBSD
+The remaining symptom after 3a: `busybox` per-keystroke echo and `meow`'s TUI
+(3-pane layout, redrawn via a per-character cursor-position + glyph write —
+confirmed by capturing its raw output: `\x1b[25;28He\x1b[25;29Hl…`) were still
+"incredibly slow", and had never been slow under the smoltcp built-in stack.
+That split (fine under smoltcp, bad under rump) plus "many small writes worse
+than one big write of the same content" is the signature of Nagle's algorithm
+interacting with delayed ACKs, not a scheduling problem.
+
+Checked whether any box program could turn Nagle off: `libakuma::net` (what
+`/bin/sshd` and `meow` are built against) has **no `set_nodelay` at all**, and
+`proxy_setsockopt` (`src/rump_proxy.rs`) was a hardcoded no-op returning
+success without forwarding anything to the real rump socket (originally added
+so curl's best-effort `TCP_NODELAY`/keepalive calls wouldn't abort it — see
+the function's existing doc comment). So every rump TCP socket ran with Nagle
+on, permanently, with no way for a box program to opt out even if it tried.
+
+### Measurement (interactive-latency harness, PTY over real SSH, devbox)
+
+| Test | Before 3b | After 3b |
+|---|---|---|
+| Single keystroke echo (busybox, serialized round-trips) | ~320–370 ms median | ~320 ms median (unchanged — see below) |
+| 50 separate `printf` writes in one command | 1427 ms | **458 ms** (−68%) |
+| 200 separate `printf` writes in one command | 2070 ms | **518 ms** (−75%, barely above the 50-write case) |
+| Same 50-line content as ONE write (`seq 1 50`) | 369.8 ms (already fine) | 284.5 ms |
+
+Per-keystroke echo latency is unaffected by 3b because that test is fully
+serialized (wait for the echo before sending the next key) — no unacked
+backlog ever exists for Nagle to hold back, so its cost is the underlying
+sysproxy/fiber round-trip floor (Phase 2's own "50–110 ms fiber round-trip",
+compounded across the ≥2 rump-proxied hops in a keystroke→echo cycle), not
+Nagle. The 50/200-write bursts *do* build up a backlog of small unacked
+segments — that's exactly what Nagle+delayed-ACK penalizes, and exactly what
+3b fixes. `meow`'s redraw is a burst-of-small-writes workload, so it benefits
+the same way: post-fix, live per-keystroke TUI redraw in `meow` itself
+measured ~140 ms median (captured via the same PTY harness, typing into a
+running `meow` session).
+
+### Fix
+
+`src/rump_proxy.rs`: added `set_rump_sock_nodelay(proxy, rump_fd)` — forwards
+a real NetBSD `setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1)` (syscall 105, via
+the same `Op::Setsockopt` mapping that already existed but was unused; the
+option value is served through `cin_override` the same way `connect`/`bind`
+serve their translated `sockaddr_in`, so no real box pointer is needed).
+Applied unconditionally — not opt-in — on every accepted rump TCP socket
+(`proxy_accept`) and every outbound one (`proxy_connect`), since no box
+program has a way to request it itself. `IPPROTO_TCP`/`TCP_NODELAY` are
+numerically identical on Linux and NetBSD, so no translation table was
+needed. `proxy_setsockopt` itself is untouched (still a no-op for whatever a
+box program explicitly requests) — this is a proxy-internal default, not a
+change to what setsockopt reports back to callers.
+
+Tradeoff: Nagle exists to coalesce small writes for bulk-transfer efficiency;
+disabling it unconditionally trades a small amount of packet-count efficiency
+on large transfers (git clone, curl downloads) for interactive latency. Given
+every fix in this doc already prioritizes interactive latency over bulk
+throughput, and this is exactly what every SSH client/server and browser
+defaults to, that tradeoff is the right one here.
+
+## Also cleaned up: debug trace flags left on
+
+`SYSCALL_DEBUG_NET_ENABLED` and `RUMP_SP_TRACE` (`src/config.rs`) had been
+flipped to `true` while debugging Phase 2a/2b and never reverted — every
+`ppoll`/`epoll_pwait`/rump-proxy call was logging a trace line, which was
+flooding the serial console (10k+ lines for a single boot + a few SSH round
+trips) and made the actual measurement logs hard to read. Both reverted to
+their documented default (`false`).
+
+## Future work (Phase 3, not started)
+
+- **Phase 3a2**: A genuine push wake for tap RX would require NIC1 GIC
+  interrupt handling (none exists today — see Phase 3a above); only worth it
+  if 1 ms is still measurably too coarse after 3a.
+- **Phase 3c**: Port `rumpcomp_tap.c` (241 lines, C-ABI to NetBSD
   `librumpnet_virtif`) to Rust for parity and maintainability.
-- **Phase 3c**: Per-socket wakers (conditional wake instead of broadcast) to
+- **Phase 3d**: Per-socket wakers (conditional wake instead of broadcast) to
   reduce scheduler contention under many-fd workloads.
+- **Phase 3e**: The ~300 ms single-round-trip floor (Phase 2's residual
+  "fiber round-trip" cost) is still unaddressed — it's the reason per-keystroke
+  echo didn't improve in 3b. Worth profiling where inside a single sysproxy
+  round trip that time actually goes, now that 3a/3b have removed the two
+  cheaper-to-fix multipliers on top of it.

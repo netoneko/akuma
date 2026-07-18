@@ -649,6 +649,7 @@ fn proxy_connect(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
     match res {
         Ok(r) => {
             rsp_trace!(96, "[RUMP-SP] connect -> OK r0={} ({}us)\n", r[0], dt);
+            set_rump_sock_nodelay(&proxy, rump_fd);
             0
         }
         Err(e) => {
@@ -688,6 +689,42 @@ fn proxy_bind(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
         Ok(_) => 0,
         Err(e) => neg_linux_errno(translation::errno_netbsd_to_linux(e)),
     }
+}
+
+/// NetBSD `IPPROTO_TCP`/`TCP_NODELAY` — numerically identical to Linux's (both
+/// inherit the same value from the original BSD sockets ABI), so no level/optname
+/// translation table is needed for this one option.
+const NETBSD_IPPROTO_TCP: u64 = 6;
+const NETBSD_TCP_NODELAY: u64 = 1;
+
+/// Force `TCP_NODELAY` on a rump TCP socket server-side via a real NetBSD
+/// `setsockopt`. Best-effort (result ignored), same fire-and-forget pattern as
+/// `set_rump_sock_nonblock`.
+///
+/// Unconditional rather than opt-in: `libakuma::net` has no client-facing
+/// `set_nodelay`, so no box program can ask for this even if it wanted to —
+/// every rump TCP socket ran with Nagle on. Combined with delayed ACKs, that
+/// turned each small write (a single keystroke echo, a TUI's per-line redraw
+/// write) into a ~40-200ms stall; a burst of many small writes stacks that
+/// stall per write. `docs/archive/RUMP_SYSPROXY_LATENCY_FIX.md` "Phase 3b" has
+/// the measurement. The synthetic optval isn't a real box pointer — it's
+/// served out of `cin_override`, same trick `proxy_connect`/`proxy_bind` use
+/// for their translated `sockaddr_in`, so the NetBSD-side copyin never
+/// touches actual box memory.
+fn set_rump_sock_nodelay(proxy: &Arc<BoxProxy>, rump_fd: i32) {
+    const SYNTH_OPTVAL_ADDR: u64 = 0xdead_0000;
+    let mut mem = ProcMem::new();
+    mem.cin_override.insert(SYNTH_OPTVAL_ADDR, 1i32.to_ne_bytes().to_vec());
+    let a = translation::pack_args(&[
+        rump_fd as u64,
+        NETBSD_IPPROTO_TCP,
+        NETBSD_TCP_NODELAY,
+        SYNTH_OPTVAL_ADDR,
+        4,
+    ]);
+    let _ = proxy.with_client(|c| {
+        c.syscall(translation::netbsd_sysno(translation::Op::Setsockopt), &a, &mut mem)
+    });
 }
 
 /// Set/clear `O_NONBLOCK` on a rump fd server-side via NetBSD `fcntl(F_SETFL)`.
@@ -800,6 +837,7 @@ fn proxy_accept(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
                 // clear it so the box sees a normal blocking stream (its recv path
                 // still gets kernel-side blocking via proxy_transfer).
                 set_rump_sock_nonblock(&proxy, newfd as i32, false);
+                set_rump_sock_nodelay(&proxy, newfd as i32);
                 let box_fd = proc.alloc_fd(process::FileDescriptor::RumpSocket {
                     rump_fd: newfd as i32,
                     nonblock: false,
