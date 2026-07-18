@@ -49,6 +49,87 @@ const EPOLL_CTL_DEL: i32 = 2;
 const EPOLL_CTL_MOD: i32 = 3;
 const BLOCKING_POLL_INTERVAL_US: u64 = 10_000;
 
+/// Shorter per-iteration sleep ceiling when a polled fd is a rump socket.
+/// Rump sockets have no push readiness from the tap RX path yet (readiness is
+/// discovered only by re-polling via MSG_PEEK), so the default 10 ms cap means
+/// each round-trip on the rump sysproxy path pays up to 10 ms of idle wait
+/// before the poller re-checks. Dropping to 1 ms tightens the per-call cost
+/// for rump boxes without disturbing non-rump paths (pipes/eventfds/timerfds
+/// keep their existing wakers + 10 ms safety ceiling). See
+/// `docs/runbooks/debug-devbox.md` "SSH slow / first-connection lag" and
+/// `docs/reference/subsystems/rump-stack.md` "Known limitations".
+const RUMP_BLOCKING_POLL_INTERVAL_US: u64 = 1_000;
+
+/// Per-iteration blocking-poll sleep ceiling. Rump fds get a shorter interval
+/// because they have no push readiness yet; everything else keeps the 10 ms
+/// default (the `KNOWN_ISSUES.md` #6/#7 fix that bounds per-iteration sleep
+/// when no waker fires).
+pub fn effective_poll_interval_us(has_rump_fd: bool) -> u64 {
+    if has_rump_fd {
+        RUMP_BLOCKING_POLL_INTERVAL_US
+    } else {
+        BLOCKING_POLL_INTERVAL_US
+    }
+}
+
+/// True if `fd` in the current process resolves to a `RumpSocket`. Used to
+/// pick the shorter poll cadence for rump-box socket readiness checks.
+#[cfg(feature = "rump")]
+fn fd_is_rump_socket(fd: i32) -> bool {
+    if fd < 0 {
+        return false;
+    }
+    let Some(proc) = akuma_exec::process::current_process() else { return false };
+    matches!(
+        proc.get_fd(fd as u32),
+        Some(akuma_exec::process::FileDescriptor::RumpSocket { .. })
+    )
+}
+
+/// True if any of the polled raw fd numbers (epoll interest list / ppoll fds)
+/// is a `RumpSocket` in the current process.
+#[cfg(feature = "rump")]
+fn any_fd_is_rump_socket(fds: &[u32]) -> bool {
+    fds.iter().any(|&fd| fd_is_rump_socket(fd as i32))
+}
+
+#[cfg(not(feature = "rump"))]
+fn any_fd_is_rump_socket(_fds: &[u32]) -> bool {
+    false
+}
+
+/// True if any fd in the select(2) fd_set bitmaps is a `RumpSocket` in the
+/// current process. Walks only the set bits (typically a handful).
+#[cfg(feature = "rump")]
+fn fd_set_contains_rump_socket(readfds: &[u64], writefds: &[u64], nfds: usize) -> bool {
+    let nwords = nfds.div_ceil(64);
+    for word_idx in 0..nwords {
+        let bits = readfds.get(word_idx).copied().unwrap_or(0)
+            | writefds.get(word_idx).copied().unwrap_or(0);
+        if bits == 0 {
+            continue;
+        }
+        for bit in 0..64u64 {
+            if bits & (1u64 << bit) == 0 {
+                continue;
+            }
+            let fd = word_idx * 64 + bit as usize;
+            if fd >= nfds {
+                break;
+            }
+            if fd_is_rump_socket(fd as i32) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(feature = "rump"))]
+fn fd_set_contains_rump_socket(_readfds: &[u64], _writefds: &[u64], _nfds: usize) -> bool {
+    false
+}
+
 #[cfg(feature = "sc-epoll")]
 pub fn epoll_wait_deadline(timeout: i32, start_time: u64, timeout_us: u64, now: u64) -> u64 {
     match timeout.cmp(&0) {
@@ -659,7 +740,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
             );
             return 0;
         }
-        let deadline = abs_deadline.min(crate::timer::uptime_us() + BLOCKING_POLL_INTERVAL_US);
+        let deadline = abs_deadline.min(crate::timer::uptime_us() + effective_poll_interval_us(any_fd_is_rump_socket(fds)));
 
         akuma_exec::threading::schedule_blocking(deadline);
     }
@@ -701,6 +782,10 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
     };
 
     let start_time = crate::timer::uptime_us();
+
+    // Rump sockets have no push readiness yet (MSG_PEEK probe only), so a
+    // shorter per-iteration sleep ceiling keeps their poll cadence tight.
+    let has_rump_fd = fd_set_contains_rump_socket(&orig_read, &orig_write, nfds);
 
     loop {
         #[cfg(feature = "smoltcp")]
@@ -760,7 +845,7 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
         }
 
         let abs_deadline = if infinite { u64::MAX } else { start_time + timeout_us };
-        let deadline = abs_deadline.min(crate::timer::uptime_us() + BLOCKING_POLL_INTERVAL_US);
+        let deadline = abs_deadline.min(crate::timer::uptime_us() + effective_poll_interval_us(has_rump_fd));
         akuma_exec::threading::schedule_blocking(deadline);
     }
 }
@@ -804,6 +889,10 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
     // already does this (passes Some(&waker)); ppoll did not.
     let waker = akuma_exec::threading::current_thread_waker();
 
+    // Rump sockets have no push readiness yet (MSG_PEEK probe only), so a
+    // shorter per-iteration sleep ceiling keeps their poll cadence tight.
+    let has_rump_fd = kernel_fds.iter().any(|p| fd_is_rump_socket(p.fd));
+
     loop {
         #[cfg(feature = "smoltcp")]
         akuma_net::smoltcp_net::poll();
@@ -841,7 +930,7 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
         }
 
         let abs_deadline = if infinite { u64::MAX } else { start_time + timeout_us };
-        let deadline = abs_deadline.min(crate::timer::uptime_us() + BLOCKING_POLL_INTERVAL_US);
+        let deadline = abs_deadline.min(crate::timer::uptime_us() + effective_poll_interval_us(has_rump_fd));
         akuma_exec::threading::schedule_blocking(deadline);
     }
 }

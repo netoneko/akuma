@@ -245,6 +245,12 @@ pub fn attach_server(box_id: u64, server_pid: process::Pid) {
         let entry = match Client::connect(chan, b"akuma-kernel") {
             Ok(client) => {
                 crate::safe_print!(64, "[RUMP-SP] box={} proxy ready\n", box_id);
+                // NOTE: the network-thread boost slot is claimed by
+                // `start_default_stack` (for the rump_server TID), NOT here.
+                // This kthread only runs the handshake then parks — boosting it
+                // does nothing for per-call sysproxy latency. See
+                // `start_default_stack` above and
+                // `docs/archive/RUMP_SYSPROXY_LATENCY_FIX.md`.
                 ProxyEntry::Ready(Arc::new(BoxProxy { client: Spinlock::new(Some(client)) }))
             }
             Err(e) => {
@@ -1295,17 +1301,27 @@ pub fn start_default_stack() {
     mark_box_rump(0);
     crate::console::print("[RUMP-SP] rump-default: box 0 stack=rump; spawning /bin/rump_server (--net --fd 3)...\n");
 
-    let pid = match process::spawn_process_with_channel(
+    let (server_tid, pid) = match process::spawn_process_with_channel(
         "/bin/rump_server",
         Some(&["--net", "--fd", "3", "--log", "/var/log/box/0/rump_server.log"]),
         None,
     ) {
-        Ok((_tid, _chan, pid)) => pid,
+        Ok((tid, _chan, pid)) => (tid, pid),
         Err(e) => {
             crate::safe_print!(96, "[RUMP-SP] rump-default: FAILED to spawn rump_server: {}\n", e);
             return;
         }
     };
+    // Register rump_server's main thread (the fiber-scheduler OS thread) as the
+    // scheduler's network thread so it gets the `NETWORK_THREAD_RATIO` boost.
+    // Unlike the proxy handshake kthread (which parks after `Client::connect`),
+    // this thread is the one that actually processes every proxied socket
+    // syscall — the 90-120 ms per-call sysproxy latency observed pre-fix traces
+    // to rump_server waiting many scheduler quanta for a timeslice. See
+    // `overlays/devbox/README.md` "starve under CPU-bound load" and the
+    // measurement notes in `docs/archive/RUMP_SYSPROXY_LATENCY_FIX.md`.
+    threading::set_network_thread_id(server_tid);
+    crate::safe_print!(64, "[RUMP-SP] rump-default: rump_server tid={} registered as network thread\n", server_tid);
     // Wire fd 3 + handshake (in a kthread) + publish the proxy. Persistent: unlike
     // run_rump we do NOT kill the server — it is box 0's live network stack.
     attach_server(0, pid);

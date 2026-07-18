@@ -523,7 +523,7 @@ pub const DEBUG_PATTERN2_TRAP_TRACE: bool = false;
 
 /// Verbose network/epoll debugging for bun resolution issues.
 /// Logs epoll_pwait returns (compact; see `EPOLL_ZERO_SAMPLE_INTERVAL`), UDP recv/send, and DNS traffic.
-pub const SYSCALL_DEBUG_NET_ENABLED: bool = false;
+pub const SYSCALL_DEBUG_NET_ENABLED: bool = true;
 
 /// Log every Nth `epoll_pwait` with **timeout=0** and **nready=0** (hot spin). Others are suppressed
 /// to avoid serial floods; increase for quieter traces, decrease (e.g. 512) while debugging.
@@ -677,7 +677,7 @@ pub const SSH_BUILT_INS_FIRST: bool = false;
 /// one-time lifecycle lines (`box … marked stack=rump`, `proxy ready`/`handshake
 /// failed`, the rump-default bring-up) print regardless. Flip to `true` to debug
 /// the sysproxy path.
-pub const RUMP_SP_TRACE: bool = false;
+pub const RUMP_SP_TRACE: bool = true;
 
 // ============================================================================
 // Dynamic Configuration Functions

@@ -126,6 +126,10 @@ default = [
     "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
 ]
 no-tests = ["akuma-net/small-sockets"]
+# Allow ONLY rump_tests to compile even when `no-tests` is set — used by the
+# devbox to verify rump regression guards at boot without pulling in the full
+# test suite (which requires default features smoltcp types etc.).
+rump-tests = []
 
 # Multikernel / one-kernel-per-core (docs/MULTIKERNEL.md). NOT in `default`: all
 # secondary-core bringup, the per-core descriptor, PSCI CPU_ON, the message bus

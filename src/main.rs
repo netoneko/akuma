@@ -61,6 +61,8 @@ mod ramfb;
 mod rng;
 #[cfg(feature = "rump")]
 mod rump_proxy;
+#[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), feature = "rump"))]
+mod rump_tests;
 mod shell;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod shell_tests;
@@ -1146,6 +1148,13 @@ fn run_async_main() -> ! {
     use core::task::{Context, RawWaker, RawWakerVTable, Waker};
 
     // Register this thread as the network poller so the scheduler boost targets it.
+    //
+    // Under `rump-default` (devbox), this thread drives the (compiled-but-unused)
+    // smoltcp stack and does no real work — the rump proxy kthread in
+    // `rump_proxy::attach_server` is the actual network path and must claim the
+    // boost slot instead. See `overlays/devbox/README.md` "Rump net thread
+    // starve under CPU-bound load" and `docs/runbooks/debug-devbox.md`.
+    #[cfg(not(feature = "rump-default"))]
     threading::set_network_thread_id(threading::current_thread_id());
 
     // =========================================================================
@@ -1244,6 +1253,14 @@ fn run_async_main() -> ! {
             process_tests::run_network_tests();
             ssh_tests::run_all_tests();
         }
+    }
+
+    // Rump sysproxy / scheduling regression guards. Compile under `rump` (so
+    // they also run on default-smoltcp builds that opt a herd box into rump),
+    // not gated on `rump-default`. See `src/rump_tests.rs`.
+    #[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), feature = "rump"))]
+    if !config::DISABLE_ALL_TESTS {
+        rump_tests::run_all_tests();
     }
 
     // devbox: make the rump stack the DEFAULT for box 0 (the root box) and bring
