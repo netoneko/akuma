@@ -13,7 +13,7 @@ set -e
 # — use a userspace tool). Boot with RUMP_NIC=1 (overlays/devbox/run.sh does that).
 #
 # Extra args are forwarded (e.g. `scripts/build_devbox.sh --quiet`).
-DEVBOX_FEATURES="devbox,neko,sound,no-tests,sc-aio,sc-sysv-ipc,sc-framebuffer,sc-containers,sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll"
+DEVBOX_FEATURES="devbox,neko,sound,no-tests,rump-tests,sc-aio,sc-sysv-ipc,sc-framebuffer,sc-containers,sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll"
 cargo build \
     --profile devbox \
     --no-default-features \

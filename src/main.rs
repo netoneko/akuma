@@ -61,7 +61,11 @@ mod ramfb;
 mod rng;
 #[cfg(feature = "rump")]
 mod rump_proxy;
-#[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), feature = "rump"))]
+#[cfg(all(
+    not(kernel_profile_size),
+    feature = "rump",
+    any(not(feature = "no-tests"), feature = "rump-tests"),
+))]
 mod rump_tests;
 mod shell;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
@@ -1258,7 +1262,11 @@ fn run_async_main() -> ! {
     // Rump sysproxy / scheduling regression guards. Compile under `rump` (so
     // they also run on default-smoltcp builds that opt a herd box into rump),
     // not gated on `rump-default`. See `src/rump_tests.rs`.
-    #[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), feature = "rump"))]
+    #[cfg(all(
+        not(kernel_profile_size),
+        feature = "rump",
+        any(not(feature = "no-tests"), feature = "rump-tests"),
+    ))]
     if !config::DISABLE_ALL_TESTS {
         rump_tests::run_all_tests();
     }

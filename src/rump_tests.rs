@@ -1,9 +1,10 @@
 //! Rump sysproxy / scheduling regression guards.
 //!
 //! Static + behavioural invariants for the rump-default devbox performance
-//! fixes (Phase 2a: rump proxy kthread claims the network-thread boost slot;
-//! Phase 2b: rump-aware shorter blocking-poll cadence). Mirrors the
-//! source-text-check pattern in `ssh_tests::test_block_on_uses_yield_now`.
+//! fixes (Phase 2a: `start_default_stack` registers rump_server's TID as the
+//! network thread; Phase 2b: rump-aware shorter blocking-poll cadence).
+//! Mirrors the source-text-check pattern in
+//! `ssh_tests::test_block_on_uses_yield_now`.
 //!
 //! All tests are kernel-space (called from `main` at boot under
 //! `#[cfg(feature = "rump")]`), not host-testable — they assert on files in
@@ -12,15 +13,15 @@
 use crate::console;
 
 /// T1: under `rump-default`, `run_async_main` must NOT register itself as the
-/// network thread — the rump proxy kthread owns that slot (T2). If anyone
-/// removes the `#[cfg(not(feature = "rump-default"))]` gate we'd silently
-/// regress the devbox "starve under CPU-bound load" fix
-/// (`overlays/devbox/README.md:297-307`).
+/// network thread — `start_default_stack` owns that slot (T2, registers
+/// rump_server's TID). If anyone removes the `#[cfg(not(feature =
+/// "rump-default"))]` gate we'd silently regress the devbox "starve under
+/// CPU-bound load" fix (`overlays/devbox/README.md:297-307`).
 fn test_run_async_main_skips_network_thread_id_under_rump_default() {
     const MAIN_SRC: &str = include_str!("main.rs");
 
     let fn_start = MAIN_SRC
-        .find("fn run_async_main")
+        .find("fn run_async_main(")
         .expect("main.rs must define run_async_main");
     let fn_body_end = MAIN_SRC[fn_start..]
         .find("\nfn ")
@@ -34,7 +35,9 @@ fn test_run_async_main_skips_network_thread_id_under_rump_default() {
 
     // Walk backwards from the call over non-comment, non-blank lines until we
     // find the nearest attribute (attrs must precede the item/call closely).
-    let before = &body[..call_idx];
+    // Trim the partial last line (the `    threading::` prefix on the call's
+    // own line) so we start scanning from the line ABOVE the call.
+    let before = body[..call_idx].rsplit_once('\n').map_or("", |(rest, _)| rest);
     let mut found_cfg = false;
     for raw_line in before.lines().rev() {
         let line = raw_line.trim_start();
@@ -49,7 +52,7 @@ fn test_run_async_main_skips_network_thread_id_under_rump_default() {
     assert!(
         found_cfg,
         "run_async_main's set_network_thread_id call must be gated by \
-         #[cfg(not(feature = \"rump-default\"))] so the rump proxy kthread owns \
+         #[cfg(not(feature = \"rump-default\"))] so start_default_stack owns \
          the boost slot under devbox"
     );
 
@@ -103,8 +106,7 @@ fn test_start_default_stack_registers_rump_server_tid() {
     // Find the next function after the kthread body to bound our search.
     let kthread_end = kthread_body
         .find("\n    });\n")
-        .map(|off| spawn_idx + off)
-        .unwrap_or(attach_body.len());
+        .map_or(attach_body.len(), |off| spawn_idx + off);
     let kthread_section = &attach_body[spawn_idx..kthread_end];
     assert!(
         !kthread_section.contains("set_network_thread_id(current_thread_id())"),
