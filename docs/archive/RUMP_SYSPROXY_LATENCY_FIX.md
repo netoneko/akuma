@@ -912,13 +912,53 @@ timer ticks per leg — for both the real recv/send and the wasted EAGAIN polls.
 Nagle/`TCP_NODELAY` is untouched (that was Phase 3p+1's abandoned side-quest,
 reverted).
 
-### Tier 2 (planned): coalesce the request into one `pipe_write`
+### Tier 2 (implemented): coalesce both request AND reply to one write each
 
-Even with Tier 1, `Client::syscall` still issues two `pipe_write`s. Combining
-`hdr` + `args` into a single transport write means one buffer append and one
-wake with the complete frame — a smaller, complementary win on top of Tier 1.
-Wire-compatible (the pipe is a byte stream; the server's `readframe` reads
-header-then-payload regardless).
+Per user direction, achieve request atomicity **by coalescing, not by disabling
+preemption** — the Tier 1 guard was removed and replaced with:
+
+- **Request:** `Client::syscall` (crates/akuma-rump/src/sysproxy.rs) now builds one
+  buffer (`hdr` + `args`) and issues a single `write_all` → one `pipe_write` → one
+  wake with the complete frame. The server can never be woken on a partial
+  request, without any preemption guard.
+- **Reply:** the rump-only `sys_sendmsg` (src/syscall/net.rs) was writing each
+  iovec of `dosend`'s response (header, then payload) with a separate `sys_write`
+  → two `pipe_write`s → the first wake's SGI could preempt the server mid-reply,
+  so the client woke on a partial frame and blocked twice (`blk=.../2`). It now
+  gathers all iovecs into one buffer and issues a single `pipe_write` → one wake,
+  one client block. Wire-identical (byte-stream pipe, client reads `rsp_len`).
+
+**Measured (same harness):** rump keystroke p50 **219 ms** (from 318 ms baseline;
+min improved 187→123 ms). Comparable to the Tier 1 guard's 199 ms and cleaner
+(no preemption manipulation). Note the guard was marginally lower because it also
+suppressed the *post-write* preemption; coalescing leaves the single request
+write's wake-SGI able to preempt the client once before it blocks (~one round
+trip, now charged to the write leg with `blk=0`). That residual is small next to
+the round-trip-count issue below.
+
+### The real remaining cost: round-trip COUNT (traced)
+
+With coalescing, the per-round-trip floor is ~20 ms and **unchanged** — it is
+rump_server's own internal fiber cadence (`sp_cond_wait`/`rumpclk0`, the Phase
+3f–3r residual), present even for an EAGAIN that does no work. So the lever is the
+NUMBER of round trips per keystroke, and the trace shows two fat targets:
+
+1. **Wasted EAGAIN polls.** The userspace sshd interactive bridge
+   (userspace/sshd/src/protocol.rs) pumps two non-blocking fds in a spin loop:
+   each idle iteration does a non-blocking `recvfrom` on the rump SSH socket that
+   returns EAGAIN — a full ~20 ms rump round trip — while it is really just
+   waiting for the shell's stdout echo. ~1–2 of these per keystroke. Fix
+   direction: a real `poll`/blocking wait across both fds instead of spin-polling
+   the expensive rump socket (needs poll-over-rump readability; cf. Phase 3a).
+2. **`sendto` copyin callback.** A `sendto` costs ~50–70 ms because it is 2–3 pipe
+   round trips: the server issues a `copyin` **callback** (`hops=1`) to fetch the
+   send buffer, then sends the reply. Inlining small send buffers into the request
+   frame would drop the callback hop. Protocol-level change to the sysproxy
+   marshaling.
+
+Both are larger, subsystem-specific changes (sshd bridge redesign; sysproxy
+protocol). The ~20 ms/round-trip floor itself remains the hard rump-internal
+residual.
 
 ### Note: smoltcp floor is a separate, analogous issue
 

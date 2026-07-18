@@ -943,20 +943,40 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     if unsafe { copy_from_user_safe(iovs.as_mut_ptr().cast::<u8>(), msg.msg_iov as *const u8, iov_size).is_err() } {
         return EFAULT;
     }
-    // Byte-stream pipe: write each iovec in order; the kernel side reads exactly
-    // `rsp_len` bytes, so concatenation is correct.
-    let mut total: u64 = 0;
-    for iov in &iovs {
-        if iov.iov_len == 0 { continue; }
-        if !validate_user_ptr(iov.iov_base, iov.iov_len) { return EFAULT; }
-        let r = super::fs::sys_write(u64::from(fd), iov.iov_base, iov.iov_len);
-        if (r as i64) < 0 {
-            return if total > 0 { total } else { r };
+    // Coalesce ALL iovecs into a SINGLE pipe write so the reader (the rump
+    // sysproxy client) is woken exactly once, with the complete reply frame.
+    // Writing each iovec separately (header, then payload) makes `pipe_write`
+    // fire a waker after the header; that SGI can preempt this server thread
+    // mid-reply, so the client wakes on a partial frame, can't finish
+    // `read_exact`, and blocks again — an extra ~10 ms-tick scheduler round trip
+    // per reply (the `blk=.../2` seen in traces). One write = one wake = one
+    // client block. The pipe is a byte stream and the client reads exactly
+    // `rsp_len` bytes, so concatenation is wire-identical.
+    // (See docs/archive/RUMP_SYSPROXY_LATENCY_FIX.md Phase 3q.)
+    let tx = {
+        let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+        match proc.get_fd(fd) {
+            Some(akuma_exec::process::FileDescriptor::UnixSocket { tx, .. }) => tx,
+            _ => return EBADF,
         }
-        total += r;
-        if r < iov.iov_len as u64 { break; } // short write: stop
+    };
+    let total_len: usize = iovs.iter().map(|v| v.iov_len).sum();
+    if total_len == 0 { return 0; }
+    let mut buf = alloc::vec![0u8; total_len];
+    let mut off = 0usize;
+    for iov in &iovs {
+        let len = iov.iov_len;
+        if len == 0 { continue; }
+        if !validate_user_ptr(iov.iov_base, len) { return EFAULT; }
+        if unsafe { copy_from_user_safe(buf[off..].as_mut_ptr(), iov.iov_base as *const u8, len).is_err() } {
+            return EFAULT;
+        }
+        off += len;
     }
-    total
+    match super::pipe::pipe_write(tx, &buf) {
+        Ok(n) => n as u64,
+        Err(e) => (-i64::from(e)) as u64,
+    }
 }
 
 #[cfg(feature = "smoltcp")]

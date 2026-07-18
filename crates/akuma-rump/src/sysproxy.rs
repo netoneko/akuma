@@ -206,10 +206,20 @@ impl<T: Transport> Client<T> {
             sysnum,
         );
         
-        // Phase 3p: Time the request write
+        // Send the request as a SINGLE transport write so it lands atomically.
+        // The transport maps one `write_all` to one `pipe_write`, and `pipe_write`
+        // wakes the server's poller. Writing `hdr` then `args` as two calls would
+        // wake the server after the header, on a *partial* frame — it can't finish
+        // `readframe`, re-blocks, and the client thread is left mid-request in the
+        // ~10 ms-tick scheduler round-robin (~48 ms/leg, even for EAGAIN). One frame
+        // = one wake with the complete request = no partial-frame stall, without
+        // needing to disable preemption around the write. (See
+        // docs/archive/RUMP_SYSPROXY_LATENCY_FIX.md Phase 3q.)
+        let mut req = Vec::with_capacity(hdr.len() + args.len());
+        req.extend_from_slice(&hdr);
+        req.extend_from_slice(args);
         let write_start = (self.now_fn)();
-        self.t.write_all(&hdr).map_err(|_| EIO)?;
-        self.t.write_all(args).map_err(|_| EIO)?;
+        self.t.write_all(&req).map_err(|_| EIO)?;
         self.last_write_us = (self.now_fn)().saturating_sub(write_start);
         
         // Phase 3p: Time the response read (including any callbacks)
