@@ -57,6 +57,16 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_smp_shared_exec_parallelism();
 
+    // Real (shared-kernel) SMP M5c step-2 regression: a kernel thread that exec's an EL0
+    // child and cooperatively waits for it must NOT hold the BKL across the wait, or the
+    // BKL-free EL0-preempt scheduler lets a peer strand the child -> cross-core deadlock.
+    // NOT dispatched by default: it enables step-2, and while the `exec_with_io` idle_halt
+    // fix removes the deterministic deadlock, a ~25% residual livelock remains until the BKL
+    // is made fair (see docs/runbooks/debug-smp.md §"M5c step-2"). Enable manually to
+    // reproduce/measure. Left compiled (allow(dead_code)) so it doesn't bit-rot.
+    #[cfg(kernel_smp_shared)]
+    let _ = test_smp_shared_cooperative_wait;
+
     // Net bounce-buffer OOM degradation (pure-fn boundaries + ample-mem alloc);
     // guards against the EC=0x3c kernel abort when an oversized socket buffer
     // can't grow the heap. No network stack required.
@@ -901,6 +911,96 @@ fn test_smp_shared_exec_parallelism() {
             "[Test] smp_shared_exec_parallelism PASSED (measured; drop ON did not lower spins here: +{} — expected on host-cached disk)\n",
             spins_on.saturating_sub(spins_off)
         );
+    }
+}
+
+/// M5c step-2 regression: proves a kernel thread that exec's an EL0 child and
+/// cooperatively waits for it does NOT deadlock with the BKL-free EL0-preempt scheduler
+/// enabled.
+///
+/// Topology (lldb-confirmed 2026-07-20): with `sched_bklfree_el0` ON, a peer core can
+/// claim the exec'd child (mark it RUNNING + become its `TPIDRRO_EL0`) WITHOUT acquiring
+/// the BKL, while this (BSP) thread holds the BKL inside `exec_with_io`'s cooperative
+/// wait. If that wait does not drop the BKL, the child is stranded RUNNING on a peer that
+/// then freezes the instant it needs EL1 (syscall/IRQ) — a cross-core circular deadlock,
+/// and the boot suite hangs *here*. The fix is `exec_with_io_cwd`'s `idle_halt` (drops the
+/// BKL around a WFI so the peer can drive the child to exit). Needs ≥1 secondary (so a peer
+/// exists to do the BKL-free claim); no-op on a single-CPU boot.
+#[cfg(kernel_smp_shared)]
+fn test_smp_shared_cooperative_wait() {
+    if crate::smp_shared::probed_core_count() <= 1 {
+        console::print("[Test] smp_shared_cooperative_wait SKIPPED (single CPU; boot with SMP>1)\n");
+        return;
+    }
+    if crate::fs::read_file("/bin/hello").is_err() {
+        console::print("[Test] smp_shared_cooperative_wait SKIPPED (/bin/hello not on disk)\n");
+        return;
+    }
+
+    // Enable the M5c step-2 BKL-free EL0-preempt scheduler ONLY for this test (restore
+    // after). This is the toggle that opens the deadlock window; the fix must hold with it
+    // on.
+    let saved = crate::smp_shared::sched_bklfree_el0_enabled();
+    crate::smp_shared::set_sched_bklfree_el0_enabled(true);
+
+    // The deadlock is a *race*: a peer core, timer-preempted while running EL0, must claim
+    // the exec'd child BKL-free during the narrow window the BSP holds the BKL in the wait.
+    // A single exec almost never hits it — it became near-certain in the original wedge only
+    // because step-2 ran across the whole suite (many exec operations + concurrent kernel
+    // threads). So this test accumulates the probability: it keeps a pool of long-running
+    // background userspace resident (peers busy in EL0, the precondition for the BKL-free
+    // claim) and repeatedly exec's a child through the vulnerable `exec_with_io` wait. If any
+    // iteration deadlocks, the boot suite hangs HERE (that IS the regression signal). With
+    // the fix (`exec_with_io_cwd`'s BKL-dropping `idle_halt`) every iteration completes.
+    const ITERS: usize = 40;
+    let bg_args: [&str; 2] = ["200", "20"]; // ~4 s of periodic EL0 syscalls per bg proc
+    let ncore = crate::smp_shared::probed_core_count();
+
+    let mut bg: alloc::vec::Vec<alloc::sync::Arc<akuma_exec::process::ProcessChannel>> =
+        alloc::vec::Vec::new();
+    let mut ok = true;
+    for i in 0..ITERS {
+        // Top the background pool back up to one resident proc per core (replace any that
+        // exited) so the secondaries keep running EL0 across every iteration.
+        bg.retain(|c| !c.has_exited());
+        while bg.len() < ncore {
+            match process::spawn_process_with_channel("/bin/hello", Some(&bg_args), None) {
+                Ok((_t, ch, _p)) => bg.push(ch),
+                Err(_) => break,
+            }
+        }
+        // The BSP exec's a short child and cooperatively waits for it via `exec_with_io`
+        // (blocking, holds the BKL across the wait unless the fix drops it). A regression
+        // hangs the suite on this call.
+        match process::exec_with_io("/bin/hello", Some(&["3", "20"]), None) {
+            Ok(_) => {}
+            Err(e) => {
+                crate::safe_print!(96, "[Test] smp_shared_cooperative_wait iter {} exec error: {}\n", i, e);
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    // Reap the background pool (BKL-dropping wait so cleanup doesn't re-introduce the bug).
+    let reap = crate::timer::uptime_us();
+    while !bg.iter().all(|c| c.has_exited()) {
+        if crate::timer::uptime_us().saturating_sub(reap) > 15_000_000 {
+            break;
+        }
+        akuma_exec::threading::yield_now();
+        akuma_exec::threading::idle_halt();
+    }
+    crate::smp_shared::set_sched_bklfree_el0_enabled(saved);
+
+    if ok {
+        crate::safe_print!(
+            128,
+            "[Test] smp_shared_cooperative_wait PASSED ({} exec+wait iters under step-2 + peer EL0 load; no BKL deadlock)\n",
+            ITERS
+        );
+    } else {
+        crate::safe_print!(96, "[Test] smp_shared_cooperative_wait FAILED (exec error)\n");
     }
 }
 

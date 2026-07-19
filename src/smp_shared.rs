@@ -96,27 +96,49 @@ pub fn set_exec_bkl_drop_enabled(on: bool) {
 
 /// Runtime toggle (default **off**) for the M5c optimization: run the scheduler SGI
 /// BKL-free when it preempted EL0 (userspace, no BKL held), so peer cores' timer ticks
-/// don't serialize on the BKL. Correct at SMP=2. Left **off** because it is premature on
-/// the current coarse BKL, not because the switch itself is wrong.
+/// don't serialize on the BKL. Correct at SMP=2. Left **off** because at SMP≥4 it opens a
+/// **correctness deadlock** (see below) — not merely because it is premature.
 ///
-/// ROOT CAUSE of the SMP≥4 "hang" (root-caused 2026-07-19, evidence in
-/// docs/runbooks/debug-smp.md): with this ON, a secondary that a timer preempts in EL0
-/// reschedules BKL-free, so its user thread stays `RUNNING` and never cycles through the
-/// global READY pool. When the BSP's long EL1 operations (e.g. `ps` fork/exec/ELF-load)
-/// are timer-preempted, its scheduler finds nothing READY to switch to → returns None →
-/// the BSP resumes still holding the BKL, releasing only on a reconcile-to-EL0 that now
-/// rarely happens. On the unfair test-and-set BKL the BSP then monopolizes the lock and
-/// the secondaries starve — observed as a flood of `[BKL] stuck: owner=1` (~30× the
-/// toggle-off baseline) and the workload frozen 9 s+, intermittently long enough to trip
-/// the 40 s `parallel_processes` timeout ("P1 done: false"). With the toggle OFF, every
-/// secondary tick takes the BKL path, forcing the lock to circulate each ~10 ms, which
-/// prevents the monopoly.
+/// ROOT CAUSE of the SMP≥4 hang (re-root-caused 2026-07-20 with lldb over the QEMU
+/// gdbstub; full evidence in docs/runbooks/debug-smp.md §"M5c step-2"). It is a hard
+/// **cross-core circular deadlock**, NOT the fairness/monopoly story the earlier note
+/// claimed. Live state at the wedge:
 ///
-/// The fix is NOT more scheduler surgery: it is shortening BKL hold times (M5b per-AS
-/// fault lock; splitting fork/exec/ELF-load off the BKL) and/or a fair/queued BKL, so
-/// that removing per-tick circulation no longer lets one core monopolize the lock. Keep
-/// this gated until then. The POOL-over-switch foundation (step 1) is always active and
-/// makes this safe to flip once the BKL is no longer held for milliseconds at a time.
+/// - The BSP (core 0) holds the BKL and is spinning in a kernel thread's cooperative
+///   wait-loop — `exec_with_io_cwd`'s `while !child.has_exited() { yield_now() }` — waiting
+///   for an EL0 child it spawned. Because the loop runs entirely in EL1, the BKL is never
+///   reconciled-to-EL0-released; the BSP holds it the whole time.
+/// - The child is state `RUNNING`, "owned" by a secondary (its `TPIDRRO_EL0`), but that
+///   secondary is frozen in `enter_kernel`'s BKL-acquire spin (`rust_irq_handler_with_sp`)
+///   — it took a syscall/device IRQ while running the child and now waits on the BKL the
+///   BSP holds.
+/// - The BSP's `schedule_indices` only ever selects a **READY, non-idle** thread. The child
+///   is `RUNNING` (skipped) and the only READY thread is a per-core idle (skipped), so the
+///   scheduler returns `None` and the BSP spins its yield loop forever holding the BKL.
+///
+/// Why this toggle is what triggers it: the BKL-free EL0-preempt path lets a secondary
+/// **claim a READY thread and mark it `RUNNING` without acquiring the BKL**, while the BSP
+/// is holding the BKL in a cooperative wait for that very thread. Once the child is
+/// `RUNNING` on a secondary, (a) the BSP won't touch it (it migrates only READY threads)
+/// and (b) the secondary freezes the instant the child needs EL1. With the toggle OFF a
+/// secondary can only claim a thread by first acquiring the BKL — which it can't while the
+/// BSP holds it — so the child stays READY and the **BSP itself** runs it, reconciling to
+/// EL0 and releasing the BKL. No deadlock.
+///
+/// The fix is TWO parts, both required (measured at SMP=4 with a 40-iteration exec-and-wait
+/// stress test, `test_smp_shared_cooperative_wait`):
+///
+/// 1. "A kernel thread must not hold the BKL across a cooperative wait-loop": drop +
+///    re-acquire the BKL around `yield_now` waits. Done for `exec_with_io_cwd` via
+///    `idle_halt` (`crate::process::exec::exec_with_io_cwd`). This alone cuts the hang from
+///    ~100% to a ~25% residual.
+/// 2. A FAIR / queued BKL. The residual ~25% is a livelock: after the waiter drops the BKL,
+///    the unfair test-and-set lets peers (and the waiter re-grabbing on its next tick)
+///    starve the one secondary that holds the BKL-free-stolen child, so it never un-strands.
+///    A ticket/queued BKL removes this. NOT yet done — the remaining blocker.
+///
+/// Keep step-2 gated until both land. The POOL-over-switch foundation (step 1) is always
+/// active.
 static SCHED_BKLFREE_EL0_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Whether the BKL-free EL0-preempt scheduler path (M5c step 2) is enabled.

@@ -41,8 +41,22 @@ pub fn exec_with_io_cwd(path: &str, args: Option<&[&str]>, env: Option<&[String]
         if channel.has_exited() || crate::threading::is_thread_terminated(thread_id) {
             break;
         }
-        // Yield to let process run
+        // Yield to let process run.
         crate::threading::yield_now();
+        // Real shared-kernel SMP: a kernel thread must NOT hold the Big Kernel Lock
+        // across this cooperative wait. `yield_now` alone reschedules under the BKL and,
+        // finding nothing READY (the child is RUNNING on a peer core that claimed it
+        // BKL-free via the M5c step-2 path), returns without switching — so this thread
+        // spins here holding the BKL forever while the peer running the child freezes the
+        // instant the child needs EL1. That is a cross-core circular deadlock (see
+        // `smp_shared.rs` SCHED_BKLFREE_EL0 and docs/runbooks/debug-smp.md §"M5c step-2").
+        // `idle_halt` drops the BKL around a WFI so the peer can enter the kernel and drive
+        // the child to exit; we wake on the next timer tick and re-check. No-op on the BKL
+        // for non-smp-shared builds, and it only halts when this core has nothing else to
+        // run, so it does not change default-build behavior. Mirrors the proven wait idiom
+        // in `test_smp_shared_userspace`.
+        #[cfg(kernel_smp_shared)]
+        crate::threading::idle_halt();
     }
     
     // Collect output
