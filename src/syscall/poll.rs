@@ -95,6 +95,14 @@ fn fd_wants_rump_poll_interval(fd: i32) -> bool {
     )
 }
 
+// No rump feature → no rump sockets or tap fds exist, so nothing ever wants the
+// tightened cadence. Stub keeps `sys_ppoll` compiling on a rump-free build (e.g.
+// the smoltcp-only devbox-smoltcp overlay).
+#[cfg(not(feature = "rump"))]
+fn fd_wants_rump_poll_interval(_fd: i32) -> bool {
+    false
+}
+
 /// True if any of the polled raw fd numbers (epoll interest list / ppoll fds)
 /// wants the tightened rump poll cadence (see `fd_wants_rump_poll_interval`).
 #[cfg(feature = "rump")]
