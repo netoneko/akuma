@@ -472,17 +472,45 @@ pure foundation**. Verified: clippy clean (smp-shared + default), 114 host tests
 `.../mmu/mod.rs` (`map_and_track`), `src/syscall/mem.rs` (all AS-edit sequences),
 `src/process_tests.rs` + `src/tests.rs` (Process literal field).
 
-### M5b Stage 3 — restructure file-backed fault (read-pass/install-pass) — NEXT
+### M5b Stage 3 — all fault-path PTE edits under `as_lock` + file read/install split ✅ (2026-07-19)
 
-The file-backed demand-paging loop (`exceptions.rs`, `EC_DATA_ABORT_LOWER`) interleaves
-block I/O (`vfs::read_at*`) with `map_user_page_no_flush` per page. Split it: **Pass B**
-(no `as_lock`, no BKL later) allocs the frame pool + does all block I/O + fill + icache
-maintenance into private frames; **Pass C** (`as_lock`) re-validates the lazy region still
-exists (matches BKL semantics vs a racing `munmap`) and installs PTEs + tracks frames +
-flushes. Also wire `as_lock` into the CoW, PROT_NONE-commit, anon, and single-page-fallback
-edits (so *all* fault-path PTE edits honor the invariant — even disjoint fault types race
-on shared intermediate page-table nodes). Keep faults on the BKL through Stage 3 (verify no
-regression under BKL), then:
+Wired `as_lock` into **every** page-table-editing site in BOTH fault arms
+(`EC_DATA_ABORT_LOWER` and `EC_INST_ABORT_LOWER`), faults still on the BKL (`as_lock`
+redundant here — foundation for the Stage 4 flip). Needed because even disjoint fault
+types race on shared *intermediate* page-table nodes, so no fault can go BKL-free until
+all fault PTE edits honor the lock. Changes:
+
+- **File-backed readahead split into Pass B / Pass C.** The old loop interleaved
+  `vfs::read_at*` (block I/O) with `map_user_page_no_flush` per page. Now Pass B
+  (no `as_lock`) allocs the pool + reads/fills + icache-maintains PRIVATE frames; Pass C
+  (`as_lock`) atomically installs + tracks each filled frame, freeing install-race losers
+  and unused pool frames after the hold. This is what makes the long part (block I/O)
+  BKL-free once faults flip.
+- CoW, PROT_NONE-commit, anon single-page, file single-page fallback, and eager-remap
+  fallback edits all take `as_lock` (alloc/copy/IO/free kept outside; via
+  `lookup_process_shared` + free fns so a shared `&Process` suffices).
+- New mmu free fns (resolve L0 from `TTBR0_EL1`, so the fault path needs no `&mut`):
+  `update_current_user_page_flags` (mprotect-style upgrade), `remap_current_user_page`
+  (CoW overwrite — `map_user_page` refuses to replace a valid PTE).
+
+**Verified:** clippy clean (smp-shared + default), 114 host tests. `SMP=2` fully clean —
+all `smp_shared_{cores,scheduler,userspace,migration}` PASS (the userspace + migration
+tests exercise cross-core demand paging through the restructured path). `SMP=4` end-to-end
+run: all four tests PASS; threading tests pass 3/3 across reruns; transient `[BKL] stuck`
+~44–54, comparable to Stage 2 (~51–60) — no contention regression. (Two initial SMP=4 runs
+hit the pre-existing nondeterministic SMP=4 race in the spawn-heavy *threading* tests,
+which don't touch the fault path; reruns of committed Stage 2 confirmed that race is
+independent of these changes.)
+
+**Files:** `crates/akuma-exec/src/mmu/mod.rs` (`update_current_user_page_flags`,
+`remap_current_user_page`), `src/exceptions.rs` (both fault arms restructured).
+
+**Known item for Stage 4:** Pass C currently holds `as_lock` (IRQs off) across the whole
+readahead install batch (≤256 pages). Redundant with the BKL today, but once faults are
+BKL-free this becomes a long non-preemptible window that would starve peers of the BKL —
+chunk/per-page the install hold (bounded IRQ-off) as part of the flip.
+
+### M5b Stage 4 — flip fault fast path BKL-free — NEXT
 
 ### M5b Stage 4 — flip fault fast path BKL-free — AFTER 3
 

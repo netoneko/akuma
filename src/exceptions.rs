@@ -2528,48 +2528,65 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                     }
                     let _cow_fault_guard = CowFaultGuard { pid: as_owner, page_va };
 
-                    let ttbr0: u64;
-                    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
-                    let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
-                    let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
-                    if let Some(old_pa_with_offset) = akuma_exec::mmu::translate_user_va(l0_ptr, page_va) {
-                        let old_pa = old_pa_with_offset & !(0xFFF);
-                        let cow_ref = crate::pmm::cow_ref_get(old_pa);
-                        if cow_ref > 0 {
-                            // CoW fault: allocate new page, copy data, remap RW
-                            if let Some(new_frame) = crate::pmm::alloc_page_zeroed() {
-                                crate::pmm::track_frame(new_frame, akuma_exec::runtime::FrameSource::UserData);
-                                unsafe {
-                                    let src = akuma_exec::mmu::phys_to_virt(old_pa).cast_const();
-                                    let dst = akuma_exec::mmu::phys_to_virt(new_frame.addr);
-                                    core::ptr::copy_nonoverlapping(src, dst, 0x1000);
-                                }
-                                if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
-                                    // Overwrite PTE: same VA, new PA, RW permissions
-                                    let _ = owner.address_space.map_page(page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
-                                    akuma_exec::mmu::flush_tlb_page(page_va);
-                                    // Track new frame, remove old shared frame
+                    // Allocate the CoW destination BEFORE taking `as_lock` — alloc must
+                    // stay outside the hold (the PMM OOM/reclaim path can re-enter
+                    // `as_lock`). Freed below if the page didn't actually need CoW.
+                    if let Some(new_frame) = crate::pmm::alloc_page_zeroed() {
+                        let mut did_cow = false;
+                        if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+                            // PTE overwrite + 4 KiB copy under `as_lock` (shared-kernel
+                            // SMP): a concurrent munmap/fault on this AS is excluded, so
+                            // `old_pa` stays valid across the copy. Short: no alloc/IO here.
+                            #[cfg(kernel_smp_shared)]
+                            let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
+                            let ttbr0: u64;
+                            unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+                            let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+                            let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
+                            if let Some(old_pa_with_offset) = akuma_exec::mmu::translate_user_va(l0_ptr, page_va) {
+                                let old_pa = old_pa_with_offset & !(0xFFF);
+                                if crate::pmm::cow_ref_get(old_pa) > 0 {
+                                    crate::pmm::track_frame(new_frame, akuma_exec::runtime::FrameSource::UserData);
+                                    unsafe {
+                                        let src = akuma_exec::mmu::phys_to_virt(old_pa).cast_const();
+                                        let dst = akuma_exec::mmu::phys_to_virt(new_frame.addr);
+                                        core::ptr::copy_nonoverlapping(src, dst, 0x1000);
+                                    }
+                                    // Overwrite PTE: same VA, new PA, RW (free fn → shared
+                                    // `&Process`; `map_user_page` would refuse the valid PTE).
+                                    akuma_exec::mmu::remap_current_user_page(page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
                                     owner.address_space.track_user_frame(new_frame);
                                     // CoW: old page freed via the global CoW refcount
                                     // (cow_ref_dec), not user_frames — drop the bookkeeping
                                     // ref but never free here.
                                     let _ = owner.address_space.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
+                                    // Decrement CoW refcount (may free old page if last ref)
+                                    crate::pmm::cow_ref_dec(old_pa);
+                                    did_cow = true;
                                 }
-                                // Decrement CoW refcount (may free old page if last ref)
-                                crate::pmm::cow_ref_dec(old_pa);
-                                return unsafe { (*frame).x0 };
                             }
-                            // OOM: fall through to SIGSEGV
                         }
+                        if did_cow {
+                            return unsafe { (*frame).x0 };
+                        }
+                        // Not a CoW page (or no owner): return the unused frame.
+                        crate::pmm::free_page(new_frame);
                     }
+                    // OOM or not-CoW: fall through to the lazy permission upgrade / SIGSEGV.
                 }
 
                 // Lazy region permission upgrade (e.g. demand-paged RO → RW after mprotect)
                 if let Some((region_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup_for_page_fault(pid, far_usize)
                     && !akuma_exec::mmu::user_flags::is_none(region_flags) {
                         let page_va = far_usize & !(0xFFF);
-                        if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
-                            let _ = owner.address_space.update_page_flags(page_va, akuma_exec::mmu::user_flags::RW_NO_EXEC);
+                        if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+                            // PTE permission edit under `as_lock` (shared-kernel SMP); free
+                            // fn resolves the current TTBR0, so a shared `&Process` suffices.
+                            #[cfg(kernel_smp_shared)]
+                            let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
+                            #[cfg(not(kernel_smp_shared))]
+                            let _ = &owner;
+                            akuma_exec::mmu::update_current_user_page_flags(page_va, akuma_exec::mmu::user_flags::RW_NO_EXEC);
                             return unsafe { (*frame).x0 };
                         }
                     }
@@ -2598,29 +2615,28 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                         // entries so this path is only reached for genuine reservations.
                         let page_va = far_usize & !(0xFFF);
                         if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
-                            let (table_frames, installed) = unsafe {
-                                akuma_exec::mmu::map_user_page(page_va, page_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
-                            };
-                            if installed {
-                                if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
-                                    owner.address_space.track_user_frame(page_frame);
-                                    for tf in table_frames {
-                                        owner.address_space.track_page_table_frame(tf);
-                                    }
-                                } else {
-                                    crate::pmm::free_page(page_frame);
-                                    for tf in table_frames { crate::pmm::free_page(tf); }
+                            // Frame allocated OUTSIDE `as_lock`; install + track under it.
+                            let mut installed_ok = false;
+                            if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+                                #[cfg(kernel_smp_shared)]
+                                let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
+                                let (table_frames, installed) = unsafe {
+                                    akuma_exec::mmu::map_user_page(page_va, page_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
+                                };
+                                for tf in table_frames {
+                                    owner.address_space.track_page_table_frame(tf);
                                 }
+                                if installed {
+                                    owner.address_space.track_user_frame(page_frame);
+                                    installed_ok = true;
+                                }
+                            }
+                            if installed_ok {
                                 crate::pmm::dp_count(&crate::pmm::DP_PROTNONE_PAGES, 1);
                                 crate::syscall::syscall_counters::inc_pagefault(1);
                             } else {
-                                // Race: another CPU already mapped this page.
+                                // Race (another CPU mapped it) or no owner: free our page.
                                 crate::pmm::free_page(page_frame);
-                                if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
-                                    for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
-                                } else {
-                                    for tf in table_frames { crate::pmm::free_page(tf); }
-                                }
                             }
                             return unsafe { (*frame).x0 };
                         }
@@ -2704,8 +2720,11 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                         };
                         let mut pool_idx = 0usize;
 
-                        let mut any_mapped = false;
-                        let mut pages_mapped = 0u64;
+                        // Pass B — FILL (no `as_lock`, no BKL-critical state): read file
+                        // data + do icache maintenance into PRIVATE pool frames. This is the
+                        // long part (block I/O) and runs OUTSIDE the per-AS lock so peers can
+                        // fault/run in parallel (M5b). Records (va, frame) to install next.
+                        let mut filled: alloc::vec::Vec<(usize, crate::pmm::PhysFrame)> = alloc::vec::Vec::new();
                         let mut cur_va = page_va;
                         while cur_va < ra_end {
                             if akuma_exec::mmu::is_current_user_page_mapped(cur_va) {
@@ -2737,67 +2756,66 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                                 }
                             }
 
-                                if is_exec {
-                                    let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
-                                    for off in (0..0x1000_usize).step_by(64) {
-                                        unsafe { core::arch::asm!("dc cvau, {}", in(reg) kva + off); }
-                                    }
-                                    unsafe { core::arch::asm!("dsb ish"); }
-                                    for off in (0..0x1000_usize).step_by(64) {
-                                        // IC IVAU by the kernel VA (kva), not the user VA: the
-                                        // user page is not mapped yet at this point (map happens
-                                        // below), so an IC IVAU on cur_va translation-faults on
-                                        // real hardware / HVF. I-cache invalidation to PoU is by
-                                        // physical address, so the kva alias of the same frame is
-                                        // equivalent and always mapped.
-                                        unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
-                                    }
+                            if is_exec {
+                                let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
+                                for off in (0..0x1000_usize).step_by(64) {
+                                    unsafe { core::arch::asm!("dc cvau, {}", in(reg) kva + off); }
                                 }
+                                unsafe { core::arch::asm!("dsb ish"); }
+                                for off in (0..0x1000_usize).step_by(64) {
+                                    // IC IVAU by the kernel VA (kva), not the user VA: the
+                                    // user page is not mapped yet, so an IC IVAU on cur_va
+                                    // translation-faults on real hardware / HVF. I-cache
+                                    // invalidation to PoU is by physical address, so the kva
+                                    // alias of the same frame is equivalent and always mapped.
+                                    unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
+                                }
+                            }
+                            filled.push((cur_va, pf));
+                            cur_va += 0x1000;
+                        }
 
-                                // Use no_flush variant — we batch the TLB invalidation
-                                // after the loop with a single flush_tlb_range call.
+                        // Pass C — INSTALL (under `as_lock`): atomically map each filled frame
+                        // + track it. Short, no alloc/IO. A frame that loses the install race
+                        // (a peer mapped the VA) is collected and freed after the hold.
+                        let mut any_mapped = false;
+                        let mut pages_mapped = 0u64;
+                        let mut race_free: alloc::vec::Vec<crate::pmm::PhysFrame> = alloc::vec::Vec::new();
+                        if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+                            #[cfg(kernel_smp_shared)]
+                            let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
+                            for (cur_va, pf) in filled.iter().copied() {
+                                // no_flush: batch the TLB invalidation after the loop.
                                 let (table_frames, installed) = unsafe {
                                     akuma_exec::mmu::map_user_page_no_flush(cur_va, pf.addr, map_flags)
                                 };
+                                for tf in table_frames {
+                                    owner.address_space.track_page_table_frame(tf);
+                                }
                                 if installed {
-                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
-                                        owner.address_space.track_user_frame(pf);
-                                        for tf in table_frames {
-                                            owner.address_space.track_page_table_frame(tf);
-                                        }
-                                    } else {
-                                        crate::pmm::free_page(pf);
-                                        for tf in table_frames { crate::pmm::free_page(tf); }
-                                    }
+                                    owner.address_space.track_user_frame(pf);
                                     any_mapped = true;
                                     pages_mapped += 1;
                                 } else {
-                                    // Race: another CPU mapped this page between our check and
-                                    // the atomic install. The page IS mapped now - don't SIGSEGV!
-                                    crate::pmm::free_page(pf);
-                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
-                                        for tf in table_frames {
-                                            owner.address_space.track_page_table_frame(tf);
-                                        }
-                                    } else {
-                                        for tf in table_frames { crate::pmm::free_page(tf); }
-                                    }
-                                    // Critical: if this is the faulting page, it's now mapped!
+                                    // Race: a peer mapped this page. Free our frame after the
+                                    // hold; the faulting page is now present regardless.
+                                    race_free.push(pf);
                                     if cur_va == page_va {
                                         any_mapped = true;
                                     }
                                 }
-                            cur_va += 0x1000;
+                            }
+                            // Flush the whole mapped run in one shot (fewer barriers).
+                            if any_mapped {
+                                akuma_exec::mmu::flush_tlb_range(page_va, pages_mapped as usize);
+                            }
+                        } else {
+                            // No owner (degenerate): nothing to install; free what we filled.
+                            for (_, pf) in filled.iter().copied() { race_free.push(pf); }
                         }
 
-                        // Flush TLB for the entire readahead range in one shot.
-                        // This replaces N individual (dsb+tlbi+dsb+isb) sequences with
-                        // a single flush_tlb_range call — ~100x fewer barriers for 256 pages.
-                        if any_mapped {
-                            akuma_exec::mmu::flush_tlb_range(page_va, pages_mapped as usize);
-                        }
-
-                        // Return unused frames from the batch back to PMM
+                        // Free race-lost frames + unused pool frames (outside the hold).
+                        for pf in race_free { crate::pmm::free_page(pf); }
                         while pool_idx < frame_pool.len() {
                             crate::pmm::free_page(frame_pool[pool_idx]);
                             pool_idx += 1;
@@ -2814,7 +2832,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                             crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, pages_mapped as usize);
                             crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
                             if crate::config::PROCESS_SYSCALL_STATS
-                                && let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
+                                && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                                     owner.syscall_stats.inc_pagefault(pages_mapped);
                                 }
                             return unsafe { (*frame).x0 };
@@ -2863,24 +2881,23 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                                 }
                                 unsafe { core::arch::asm!("dsb ish"); core::arch::asm!("isb"); }
                             }
-                            let (table_frames, installed) = unsafe {
-                                akuma_exec::mmu::map_user_page(page_va, pf.addr, map_flags)
-                            };
-                            if installed {
-                                if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
+                            // Install + track under `as_lock` (frame + file data already
+                            // prepared above, outside the hold).
+                            let mut installed_ok = false;
+                            if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+                                #[cfg(kernel_smp_shared)]
+                                let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
+                                let (table_frames, installed) = unsafe {
+                                    akuma_exec::mmu::map_user_page(page_va, pf.addr, map_flags)
+                                };
+                                for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
+                                if installed {
                                     owner.address_space.track_user_frame(pf);
-                                    for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
-                                } else {
-                                    crate::pmm::free_page(pf);
-                                    for tf in table_frames { crate::pmm::free_page(tf); }
+                                    installed_ok = true;
                                 }
-                            } else {
+                            }
+                            if !installed_ok {
                                 crate::pmm::free_page(pf);
-                                if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
-                                    for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
-                                } else {
-                                    for tf in table_frames { crate::pmm::free_page(tf); }
-                                }
                             }
                             crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, 1);
                             crate::syscall::syscall_counters::inc_pagefault(1);
@@ -2890,35 +2907,33 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                         crate::tprint!(128, "[DA-DP] pid={} va=0x{:x} single-page fallback OOM, {} free pages\n",
                             pid, far_usize, free2);
                     } else if let Some(page_frame) = crate::pmm::alloc_page_zeroed_user() {
-                        let (table_frames, installed) = unsafe {
-                            akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
-                        };
-                        if installed {
-                            if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
-                                owner.address_space.track_user_frame(page_frame);
-                                for tf in table_frames {
-                                    owner.address_space.track_page_table_frame(tf);
-                                }
-                            } else {
-                                crate::pmm::free_page(page_frame);
-                                for tf in table_frames { crate::pmm::free_page(tf); }
+                        // Anonymous demand page: frame (zeroed) allocated OUTSIDE `as_lock`;
+                        // install + track under it.
+                        let mut installed_ok = false;
+                        if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+                            #[cfg(kernel_smp_shared)]
+                            let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
+                            let (table_frames, installed) = unsafe {
+                                akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
+                            };
+                            for tf in table_frames {
+                                owner.address_space.track_page_table_frame(tf);
                             }
+                            if installed {
+                                owner.address_space.track_user_frame(page_frame);
+                                installed_ok = true;
+                            }
+                        }
+                        if installed_ok {
                             crate::pmm::dp_count(&crate::pmm::DP_ANON_PAGES, 1);
                             crate::syscall::syscall_counters::inc_pagefault(1);
                             if crate::config::PROCESS_SYSCALL_STATS
-                                && let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
+                                && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                                     owner.syscall_stats.inc_pagefault(1);
                                 }
                         } else {
-                            // Race: another CPU mapped this page. Free our frame and continue.
+                            // Race (peer mapped it) or no owner: free our frame.
                             crate::pmm::free_page(page_frame);
-                            if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
-                                for tf in table_frames {
-                                    owner.address_space.track_page_table_frame(tf);
-                                }
-                            } else {
-                                for tf in table_frames { crate::pmm::free_page(tf); }
-                            }
                         }
                         // Page is mapped (by us or another CPU) - success
                         return unsafe { (*frame).x0 };
@@ -2936,11 +2951,11 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                     // all mmaps were performed on the parent.
                     let page_va = far_usize & !0xFFF;
                     let mut recovered = false;
-                    if let Some(proc) = akuma_exec::process::lookup_process(as_owner) {
+                    if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                         // Find the frame for this page under vm_lock (pure Vec read),
-                        // then map it AFTER releasing the lock (map allocs page
-                        // tables and must not run while vm_lock is held).
-                        let phys_opt = proc.vm_with_regions(|r| {
+                        // then map it under `as_lock` (map allocs page tables and must not
+                        // run while vm_lock is held; the two locks never nest here).
+                        let phys_opt = owner.vm_with_regions(|r| {
                             r.iter().find_map(|(start, frames)| {
                                 let region_end = *start + frames.len() * 4096;
                                 if page_va >= *start && page_va < region_end {
@@ -2953,11 +2968,13 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                         if let Some(phys) = phys_opt {
                             crate::tprint!(192, "[DP-eager] pid={} re-map va=0x{:x} frame=0x{:x}\n",
                                 pid, page_va, phys.addr);
+                            #[cfg(kernel_smp_shared)]
+                            let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
                             let (table_frames, _) = unsafe {
                                 akuma_exec::mmu::map_user_page(page_va, phys.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
                             };
                             for tf in table_frames {
-                                proc.address_space.track_page_table_frame(tf);
+                                owner.address_space.track_page_table_frame(tf);
                             }
                             recovered = true;
                         }
@@ -3122,8 +3139,11 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                 && let Some((region_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup_for_page_fault(pid, far_usize)
                     && !akuma_exec::mmu::user_flags::is_none(region_flags) {
                         let page_va = far_usize & !(0xFFF);
-                        if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
-                            let _ = owner.address_space.update_page_flags(page_va, akuma_exec::mmu::user_flags::RX);
+                        if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+                            // PTE permission edit under `as_lock` (shared-kernel SMP).
+                            #[cfg(kernel_smp_shared)]
+                            let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
+                            akuma_exec::mmu::update_current_user_page_flags(page_va, akuma_exec::mmu::user_flags::RX);
                             owner.address_space.invalidate_icache_for_page_va(page_va);
                             return unsafe { (*frame).x0 };
                         }
@@ -3219,8 +3239,9 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                         };
                         let mut ia_pool_idx = 0usize;
 
-                        let mut any_mapped = false;
-                        let mut pages_mapped = 0u64;
+                        // Pass B — FILL (no `as_lock`): read file data + icache maintenance
+                        // into PRIVATE frames. Block I/O runs outside the per-AS lock (M5b).
+                        let mut filled: alloc::vec::Vec<(usize, crate::pmm::PhysFrame)> = alloc::vec::Vec::new();
                         let mut cur_va = page_va;
                         while cur_va < ra_end {
                             if akuma_exec::mmu::is_current_user_page_mapped(cur_va) {
@@ -3232,7 +3253,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                             }
                             let pf = ia_frame_pool[ia_pool_idx];
                             ia_pool_idx += 1;
-                            if true {
+                            {
                                 let pg_data_start = core::cmp::max(cur_va, segment_va);
                                 let pg_data_end = core::cmp::min(cur_va + 0x1000, segment_va + filesz);
                                 if pg_data_start < pg_data_end {
@@ -3256,58 +3277,47 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                                 }
                                 unsafe { core::arch::asm!("dsb ish"); }
                                 for off in (0..0x1000_usize).step_by(64) {
-                                    // IC IVAU by kva, not the user VA — the page isn't mapped yet
-                                    // (see note at the other demand-paging sites); on HVF an IC
-                                    // IVAU on cur_va would translation-fault.
+                                    // IC IVAU by kva, not the user VA — the page isn't mapped yet.
                                     unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
                                 }
-
-                                // Use no_flush — TLB batched after the loop.
-                                let (table_frames, installed) = unsafe {
-                                    akuma_exec::mmu::map_user_page_no_flush(cur_va, pf.addr, map_flags)
-                                };
-                                if installed {
-                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
-                                        owner.address_space.track_user_frame(pf);
-                                        for tf in table_frames {
-                                            owner.address_space.track_page_table_frame(tf);
-                                        }
-                                    } else {
-                                        crate::pmm::free_page(pf);
-                                        for tf in table_frames { crate::pmm::free_page(tf); }
-                                    }
-                                    any_mapped = true;
-                                    pages_mapped += 1;
-                                } else {
-                                    // Race: another CPU mapped this page between our check and
-                                    // the atomic install. The page IS mapped now - don't SIGSEGV!
-                                    // We just need to free our unused page and track table frames.
-                                    crate::pmm::free_page(pf);
-                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
-                                        for tf in table_frames {
-                                            owner.address_space.track_page_table_frame(tf);
-                                        }
-                                    } else {
-                                        for tf in table_frames { crate::pmm::free_page(tf); }
-                                    }
-                                    // Critical: if this is the faulting page, it's now mapped!
-                                    if cur_va == page_va {
-                                        any_mapped = true;
-                                    }
-                                }
-                            } // end if true (batch pool entry)
+                            }
+                            filled.push((cur_va, pf));
                             cur_va += 0x1000;
                         }
 
-                        // Return unused frames from the batch pool back to PMM.
+                        // Pass C — INSTALL (under `as_lock`): atomic map + track per frame.
+                        let mut any_mapped = false;
+                        let mut pages_mapped = 0u64;
+                        let mut race_free: alloc::vec::Vec<crate::pmm::PhysFrame> = alloc::vec::Vec::new();
+                        if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+                            #[cfg(kernel_smp_shared)]
+                            let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
+                            for (cur_va, pf) in filled.iter().copied() {
+                                let (table_frames, installed) = unsafe {
+                                    akuma_exec::mmu::map_user_page_no_flush(cur_va, pf.addr, map_flags)
+                                };
+                                for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
+                                if installed {
+                                    owner.address_space.track_user_frame(pf);
+                                    any_mapped = true;
+                                    pages_mapped += 1;
+                                } else {
+                                    race_free.push(pf);
+                                    if cur_va == page_va { any_mapped = true; }
+                                }
+                            }
+                            if any_mapped {
+                                akuma_exec::mmu::flush_tlb_range(page_va, pages_mapped as usize);
+                            }
+                        } else {
+                            for (_, pf) in filled.iter().copied() { race_free.push(pf); }
+                        }
+
+                        // Free race-lost frames + unused pool frames (outside the hold).
+                        for pf in race_free { crate::pmm::free_page(pf); }
                         while ia_pool_idx < ia_frame_pool.len() {
                             crate::pmm::free_page(ia_frame_pool[ia_pool_idx]);
                             ia_pool_idx += 1;
-                        }
-
-                        // Single TLB flush for the entire readahead window.
-                        if any_mapped {
-                            akuma_exec::mmu::flush_tlb_range(page_va, pages_mapped as usize);
                         }
 
                         unsafe {
@@ -3319,7 +3329,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                             crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, pages_mapped as usize);
                             crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
                             if crate::config::PROCESS_SYSCALL_STATS
-                                && let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
+                                && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                                     owner.syscall_stats.inc_pagefault(pages_mapped);
                                 }
                             return unsafe { (*frame).x0 };
@@ -3360,25 +3370,22 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                                 // IVAU on page_va would translation-fault.
                                 unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
                             }
-                            let (table_frames, installed) = unsafe {
-                                akuma_exec::mmu::map_user_page(page_va, pf.addr, map_flags)
-                            };
-                            if installed {
-                                if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
+                            // Install + track under `as_lock` (frame + file data prepared
+                            // above, outside the hold).
+                            let mut installed_ok = false;
+                            if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+                                #[cfg(kernel_smp_shared)]
+                                let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
+                                let (table_frames, installed) = unsafe {
+                                    akuma_exec::mmu::map_user_page(page_va, pf.addr, map_flags)
+                                };
+                                for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
+                                if installed {
                                     owner.address_space.track_user_frame(pf);
-                                    for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
-                                } else {
-                                    crate::pmm::free_page(pf);
-                                    for tf in table_frames { crate::pmm::free_page(tf); }
-                                }
-                            } else {
-                                crate::pmm::free_page(pf);
-                                if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
-                                    for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
-                                } else {
-                                    for tf in table_frames { crate::pmm::free_page(tf); }
+                                    installed_ok = true;
                                 }
                             }
+                            if !installed_ok { crate::pmm::free_page(pf); }
                             unsafe { core::arch::asm!("dsb ish"); core::arch::asm!("isb"); }
                             crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, 1);
                             crate::syscall::syscall_counters::inc_pagefault(1);
@@ -3388,35 +3395,32 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                         crate::tprint!(128, "[IA-DP] pid={} va=0x{:x} single-page fallback OOM, {} free pages\n",
                             pid, far_usize, free2);
                     } else if let Some(page_frame) = crate::pmm::alloc_page_zeroed_user() {
-                        let (table_frames, installed) = unsafe {
-                            akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
-                        };
-                        if installed {
-                            if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
-                                owner.address_space.track_user_frame(page_frame);
-                                for tf in table_frames {
-                                    owner.address_space.track_page_table_frame(tf);
-                                }
-                            } else {
-                                crate::pmm::free_page(page_frame);
-                                for tf in table_frames { crate::pmm::free_page(tf); }
+                        // Anonymous demand page: frame (zeroed) allocated OUTSIDE `as_lock`.
+                        let mut installed_ok = false;
+                        if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+                            #[cfg(kernel_smp_shared)]
+                            let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
+                            let (table_frames, installed) = unsafe {
+                                akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
+                            };
+                            for tf in table_frames {
+                                owner.address_space.track_page_table_frame(tf);
                             }
+                            if installed {
+                                owner.address_space.track_user_frame(page_frame);
+                                installed_ok = true;
+                            }
+                        }
+                        if installed_ok {
                             crate::pmm::dp_count(&crate::pmm::DP_ANON_PAGES, 1);
                             crate::syscall::syscall_counters::inc_pagefault(1);
                             if crate::config::PROCESS_SYSCALL_STATS
-                                && let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
+                                && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                                     owner.syscall_stats.inc_pagefault(1);
                                 }
                         } else {
-                            // Race: another CPU mapped this page. Free our frame and continue.
+                            // Race (peer mapped it) or no owner: free our frame.
                             crate::pmm::free_page(page_frame);
-                            if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
-                                for tf in table_frames {
-                                    owner.address_space.track_page_table_frame(tf);
-                                }
-                            } else {
-                                for tf in table_frames { crate::pmm::free_page(tf); }
-                            }
                         }
                         // Page is mapped (by us or another CPU) - success
                         return unsafe { (*frame).x0 };

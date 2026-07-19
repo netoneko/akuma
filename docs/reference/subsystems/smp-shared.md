@@ -80,7 +80,7 @@ they run on more than one core.
 | M3 — userspace on secondaries (+ inner-shareable TLB) | ✅ userspace on 2 & 4 cores |
 | M4 — migration + hardening (cross-core wakeup deferred) | ✅ 1 thread on 4 cores |
 | M5a — network SMP-safety, devbox boots to sshd under SMP | ✅ SMP=2 clean, SMP=4 works |
-| M5b — BKL-free user page-fault path (per-AS `as_lock`) | 🚧 Stages 1–2 done (primitives + syscall wiring, no regression); Stages 3–4 (fault restructure + flip) next |
+| M5b — BKL-free user page-fault path (per-AS `as_lock`) | 🚧 Stages 1–3 done (primitives + syscall wiring + all fault-path PTE edits under `as_lock` + file read/install split; SMP=2/4 verified, faults still on BKL); Stage 4 (flip faults BKL-free) next |
 | M5 — fine-grained locking (real ASIDs, split BKL, cross-core wakeup) | in progress (see M5b) |
 
 > **Known open item:** the *full devbox-smoltcp boot to sshd* stalls under active
