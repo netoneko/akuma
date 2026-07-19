@@ -116,6 +116,12 @@ pub struct ExecRuntime {
     pub heap_stats: fn() -> (usize, usize),
     pub is_memory_low: fn() -> bool,
 
+    /// Whether the shared-kernel SMP execve/ELF-load BKL-drop is enabled (mirrors
+    /// `smp_shared::exec_bkl_drop_enabled`). The ELF loader (in this crate) consults it to
+    /// decide whether to drop the BKL around the dynamic-interpreter whole-file read; always
+    /// `false` off `smp-shared`, where the `bkl` calls are no-ops anyway.
+    pub exec_bkl_drop_enabled: fn() -> bool,
+
     // VFS (for elf_loader)
     pub read_file: fn(&str) -> Result<alloc::vec::Vec<u8>, i32>,
     pub read_at: fn(&str, usize, &mut [u8]) -> Result<usize, i32>,

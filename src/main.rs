@@ -454,6 +454,12 @@ pub(crate) fn build_exec_runtime(
             (s.heap_size, s.allocated)
         },
         is_memory_low: allocator::is_memory_low,
+        // Whether the execve/ELF-load BKL-drop is enabled (M5c hold-shortening). Lets the
+        // ELF loader drop the BKL around the dynamic-interpreter read. No-op off shared-SMP.
+        #[cfg(kernel_smp_shared)]
+        exec_bkl_drop_enabled: smp_shared::exec_bkl_drop_enabled,
+        #[cfg(not(kernel_smp_shared))]
+        exec_bkl_drop_enabled: || false,
         read_file: |path| crate::fs::read_file(path).map_err(|_| -1),
         read_at: |path, off, buf| crate::vfs::read_at(path, off, buf).map_err(|_| -1),
         resolve_inode: |path| crate::vfs::resolve_inode(path).map_err(|_| -1),

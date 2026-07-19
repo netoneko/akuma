@@ -965,6 +965,7 @@ mod child_channel_drain_tests {
             free_pages_contiguous: |_, _| {},
             heap_stats: || (0, 0),
             is_memory_low: || false,
+            exec_bkl_drop_enabled: || false,
             read_file: |_| Err(0),
             read_at: |_, _, _| Err(0),
             resolve_inode: |_| Err(0),

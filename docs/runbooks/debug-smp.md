@@ -81,10 +81,13 @@ race adds noise), enabling the profiler only around the window.
 - `smp_shared::set_fault_bkl_drop_enabled(bool)` — the M5b Stage 4a optimization (drop the
   BKL around a file-fault's block I/O). Default **on**.
 - `smp_shared::set_exec_bkl_drop_enabled(bool)` — the M5c hold-shortening optimization (drop
-  the BKL around execve's whole-file ELF read in `do_execve`). Default **on**. Safe: the read
-  runs before the process image is touched and uses only VFS/ext2/`blk` + the self-locked heap
-  allocator, none BKL-protected — the same profile as the fault drop. This is the "shorten BKL
-  holds" lever (execve fork/exec/ELF-load was the dominant coarse-BKL hold).
+  the BKL around execve's ELF reads: the main-binary read in `do_execve` **and** the
+  dynamic-interpreter read in the ELF loader, the latter via the `ExecRuntime.exec_bkl_drop_enabled`
+  hook). Default **on**. Safe: each read runs on a not-yet-installed image/AS and uses only
+  VFS/ext2/`blk` + the self-locked heap allocator, none BKL-protected — the same profile as the
+  fault drop. This is the "shorten BKL holds" lever (execve ELF-load was the dominant coarse-BKL
+  hold). A/B-measured by the `smp_shared_exec_parallelism` self-test (SMP=2): busybox exec storm,
+  ~26–63% fewer BKL spins with the drop ON across boots.
 - `smp_shared::set_sched_bklfree_el0_enabled(bool)` — the M5c step-2 optimization (run the
   scheduler SGI BKL-free when it preempted EL0). Default **off**: correct at SMP=2, but on
   the current coarse BKL it is counter-productive at SMP≥4 (**root-caused**, see below). The

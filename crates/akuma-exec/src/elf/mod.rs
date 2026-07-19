@@ -246,8 +246,18 @@ pub fn load_elf(elf_data: &[u8], interp_prefix: Option<&str>) -> Result<LoadedEl
         let interp_info = load_interpreter_from_path(&resolved_interp, &mut address_space)?;
         #[cfg(not(kernel_profile_size))]
         let interp_info = {
-            let interp_data = (runtime().read_file)(&resolved_interp)
-                .map_err(|_| ElfError::InvalidFormat("Cannot read interpreter"))?;
+            // M5c hold-shortening: drop the BKL around the dynamic-interpreter whole-file read
+            // (a second ~1 MB read for dynamically-linked binaries), mirroring the main-binary
+            // read in `do_execve`. Safe: `address_space` is a private, not-yet-installed AS,
+            // and the read touches only VFS/block + the self-locked heap — no BKL state is
+            // mutated during the window. Re-take BEFORE the `?` so an error return doesn't leave
+            // the BKL dropped for the caller. No-op off shared-SMP (`bkl` calls compile away).
+            let drop_bkl = (runtime().exec_bkl_drop_enabled)();
+            if drop_bkl { crate::bkl::leave_kernel(); }
+            let read_res = (runtime().read_file)(&resolved_interp);
+            if drop_bkl { crate::bkl::enter_kernel(); }
+            let interp_data =
+                read_res.map_err(|_| ElfError::InvalidFormat("Cannot read interpreter"))?;
             load_interpreter(&interp_data, &mut address_space)?
         };
         if DEBUG_ELF_LOADING {
@@ -1081,8 +1091,18 @@ pub fn load_elf_from_path(path: &str, file_size: usize, interp_prefix: Option<&s
         let interp_info = load_interpreter_from_path(&resolved_interp, &mut address_space)?;
         #[cfg(not(kernel_profile_size))]
         let interp_info = {
-            let interp_data = (runtime().read_file)(&resolved_interp)
-                .map_err(|_| ElfError::InvalidFormat("Cannot read interpreter"))?;
+            // M5c hold-shortening: drop the BKL around the dynamic-interpreter whole-file read
+            // (a second ~1 MB read for dynamically-linked binaries), mirroring the main-binary
+            // read in `do_execve`. Safe: `address_space` is a private, not-yet-installed AS,
+            // and the read touches only VFS/block + the self-locked heap — no BKL state is
+            // mutated during the window. Re-take BEFORE the `?` so an error return doesn't leave
+            // the BKL dropped for the caller. No-op off shared-SMP (`bkl` calls compile away).
+            let drop_bkl = (runtime().exec_bkl_drop_enabled)();
+            if drop_bkl { crate::bkl::leave_kernel(); }
+            let read_res = (runtime().read_file)(&resolved_interp);
+            if drop_bkl { crate::bkl::enter_kernel(); }
+            let interp_data =
+                read_res.map_err(|_| ElfError::InvalidFormat("Cannot read interpreter"))?;
             load_interpreter(&interp_data, &mut address_space)?
         };
         if DEBUG_ELF_LOADING {
