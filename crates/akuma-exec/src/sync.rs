@@ -4,7 +4,24 @@
 //! with writer priority to prevent reader starvation — and `KernelLock`, the
 //! recursive Big Kernel Lock used by real (shared-kernel) SMP.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+/// Total Big-Kernel-Lock spin iterations across all contended [`KernelLock::acquire`]
+/// calls — a cross-core BKL-wait-time proxy for A/B measurement (e.g. does dropping the
+/// BKL around a fault's block I/O reduce peer wait). Accumulated once per acquire, so the
+/// uncontended fast path is unaffected. Read/reset via [`contention_spins`] /
+/// [`reset_contention_spins`].
+static CONTENTION_SPINS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot the total BKL contention-spin counter (see [`CONTENTION_SPINS`]).
+pub fn contention_spins() -> u64 {
+    CONTENTION_SPINS.load(Ordering::Relaxed)
+}
+
+/// Reset the total BKL contention-spin counter to zero (for A/B measurement windows).
+pub fn reset_contention_spins() {
+    CONTENTION_SPINS.store(0, Ordering::Relaxed);
+}
 
 /// The Big Kernel Lock (BKL) for real (shared-kernel) SMP — an **owner-tracked,
 /// idempotent** spinlock that serializes kernel execution across cores.
@@ -56,6 +73,7 @@ impl KernelLock {
     pub fn acquire(&self, core_id: u32) {
         let me = core_id + 1;
         let mut spins: u32 = 0;
+        let mut total_spins: u64 = 0;
         loop {
             // Re-check ownership EVERY iteration, not just once up front. The syscall
             // path calls this with IRQs enabled, so a timer IRQ can nest mid-spin and
@@ -73,9 +91,16 @@ impl KernelLock {
                     .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
             {
+                // Accumulate this acquire's spin count once (a cross-core BKL-wait-time
+                // proxy for measuring contention; see `contention_spins`). One atomic
+                // add per acquire — the uncontended fast path adds nothing.
+                if total_spins > 0 {
+                    CONTENTION_SPINS.fetch_add(total_spins, Ordering::Relaxed);
+                }
                 return;
             }
             spins = spins.wrapping_add(1);
+            total_spins = total_spins.wrapping_add(1);
             if spins == SPIN_WARN_THRESHOLD {
                 spins = 0;
                 log_kernel_lock_stuck(self.owner.load(Ordering::Relaxed), me);

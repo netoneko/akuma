@@ -510,7 +510,55 @@ readahead install batch (≤256 pages). Redundant with the BKL today, but once f
 BKL-free this becomes a long non-preemptible window that would starve peers of the BKL —
 chunk/per-page the install hold (bounded IRQ-off) as part of the flip.
 
-### M5b Stage 4 — flip fault fast path BKL-free — NEXT
+### M5b Stage 4a — drop the BKL around file-fault block I/O ✅ (2026-07-19)
+
+Faults keep the BKL, but the file-backed fault's **Pass B** (the Stage-3 fill pass:
+frame-pool block I/O + fill + icache into PRIVATE frames) now runs with the BKL
+**dropped** (`bkl::leave_kernel()` before the fill loop, `enter_kernel()` after), in both
+fault arms. Peer cores can enter the kernel while this core waits on the disk — the
+measured ~10 ms hold. Safe: Pass B touches only private frames + the block device (own
+lock) + the held fault-slot; a concurrent `munmap` clears PTEs but never frees the
+intermediate page-table pages the fill loop's `is_current_user_page_mapped` walk reads
+(tables free only at teardown, which can't run while this thread faults). A timer may
+re-acquire the BKL for us via the IRQ reconcile mid-fill; the `enter_kernel()` after the
+loop is then idempotent, and the wrapper's final `leave_kernel()` balances it.
+
+**Verified:** clippy clean (both configs), 114 host tests; `SMP=2` all `smp_shared_*` PASS
+(19 stuck, == baseline); `SMP=4` 3/3 full runs PASS, ~46–55 stuck.
+
+**Measurement finding (important for scoping 4b):** the SMP=4 self-test `[BKL] stuck`
+count did **not** drop (Stage 3 ~44–54 → 4a ~46–55). Clustering the stucks by test phase
+shows they occur in the **`smp_shared` scheduler/userspace tests + parallel-process
+execution** (many cores spawning/scheduling under the coarse BKL) and right after the
+threading suite — essentially **zero** are file-fault-bound. So the self-test benchmark is
+scheduler/spawn-serialization-bound, which no fault-path change (4a or 4b) can move; M5b's
+win (file-fault block I/O parallelism) only shows on file-mmap-heavy workloads. The
+self-test `[BKL] stuck` count is therefore NOT a valid metric for M5b.
+
+**Dedicated measurement — 4a validated (2026-07-19).** Added a runtime toggle
+(`smp_shared::set_fault_bkl_drop_enabled`) for the Pass-B BKL-drop, a total-BKL-spin
+counter (`sync::contention_spins`, accumulated once per contended acquire — a cross-core
+wait-time proxy), and `test_smp_shared_fault_parallelism`: it spawns copies of the largest
+on-disk binary (picks `/bin/busybox`, ~1.08 MB ⇒ ~256 ELF file-fault pages) concurrently
+with the drop **OFF** then **ON**, comparing the spin counter. **SMP=2, 3 runs:** OFF
+6.35M/6.12M/7.70M vs ON 4.26M/3.64M/5.26M → a stable **~32–40 % reduction** in cross-core
+BKL wait with the drop on. Confirms 4a delivers even on HVF's host-cached disk (the fill
+loop's 256-page read+copy+icache is enough CPU-under-BKL that moving it off matters). The
+A/B ran at SMP=2 because the busybox spawn-storm provokes the pre-existing nondeterministic
+SMP=4 contention race (observed in the drop-**OFF** phase, so unrelated to 4a).
+
+**Files:** `src/exceptions.rs` (toggle-gated leave/enter around Pass B in both fault arms),
+`src/smp_shared.rs` (drop toggle), `crates/akuma-exec/src/sync.rs` (contention-spin
+counter), `src/process_tests.rs` (`test_smp_shared_fault_parallelism`).
+
+### M5b Stage 4b — reconcile-aware full flip (faults never hold BKL) — NEXT (scope under review)
+
+Faults never take the BKL; use `as_lock` only, plus a fault-aware IRQ reconcile
+(per-thread "in-BKL-free-fault" flag so a timer tick releases rather than acquires the BKL
+for a faulting thread). Highest-risk change in M5b (touches the M2a reconcile path). Note
+from 4a's measurement: its incremental benefit over 4a is small — anon/CoW faults are
+µs-scale (not a contention source) and 4a already moved the dominant fault cost (block I/O)
+off the BKL — so the risk/reward is under review.
 
 ### M5b Stage 4 — flip fault fast path BKL-free — AFTER 3
 

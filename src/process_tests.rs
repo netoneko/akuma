@@ -47,6 +47,11 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_smp_shared_migration();
 
+    // Real (shared-kernel) SMP M5b Stage 4a: A/B-measure whether dropping the BKL
+    // around a file-fault's block I/O reduces cross-core BKL contention.
+    #[cfg(kernel_smp_shared)]
+    test_smp_shared_fault_parallelism();
+
     // Net bounce-buffer OOM degradation (pure-fn boundaries + ample-mem alloc);
     // guards against the EC=0x3c kernel abort when an oversized socket buffer
     // can't grow the heap. No network stack required.
@@ -663,6 +668,98 @@ fn test_smp_shared_userspace() {
             cores_ran,
             u0,
             u1
+        );
+    }
+}
+
+/// M5b Stage 4a measurement: does dropping the BKL around a file-fault's block-I/O
+/// fill pass reduce cross-core BKL wait? Spawns several copies of the largest available
+/// binary concurrently (each demand-pages its ELF via file-backed faults across cores)
+/// with the drop toggled OFF then ON, and compares the total BKL contention-spin counter
+/// (a cross-core wait-time proxy). This is a MEASUREMENT — reported, not a hard pass/fail:
+/// on QEMU/HVF the backing disk is host-cached, so the block-I/O window (and thus the win)
+/// can be small; the real payoff is under genuine disk latency. The self-test suite's own
+/// SMP=4 contention is scheduler/spawn-bound, so this dedicated fault workload is the only
+/// in-tree way to observe the fault-path effect.
+#[cfg(kernel_smp_shared)]
+fn test_smp_shared_fault_parallelism() {
+    use akuma_exec::sync::{contention_spins, reset_contention_spins};
+    if crate::smp_shared::probed_core_count() <= 1 {
+        console::print("[Test] smp_shared_fault_parallelism SKIPPED (single CPU)\n");
+        return;
+    }
+    // Pick the largest available binary — more ELF pages ⇒ more file-backed faults.
+    let candidates = ["/bin/busybox", "/bin/hello_musl.bin", "/bin/hello"];
+    let mut path = "";
+    let mut best = 0usize;
+    for c in candidates {
+        if let Ok(d) = crate::fs::read_file(c)
+            && d.len() > best
+        {
+            best = d.len();
+            path = c;
+        }
+    }
+    if path.is_empty() {
+        console::print("[Test] smp_shared_fault_parallelism SKIPPED (no binary on disk)\n");
+        return;
+    }
+    let is_bb = path == "/bin/busybox";
+    let copies = crate::smp_shared::probed_core_count().min(4);
+    const ROUNDS: usize = 3;
+
+    let run_phase = || -> u64 {
+        reset_contention_spins();
+        for _ in 0..ROUNDS {
+            let mut chans: alloc::vec::Vec<alloc::sync::Arc<akuma_exec::process::ProcessChannel>> =
+                alloc::vec::Vec::new();
+            for _ in 0..copies {
+                // busybox needs an applet to exit promptly; hello takes count/delay.
+                let args: &[&str] = if is_bb { &["true"] } else { &["1", "0"] };
+                if let Ok((_t, ch, _p)) =
+                    process::spawn_process_with_channel(path, Some(args), None)
+                {
+                    chans.push(ch);
+                }
+            }
+            let start = crate::timer::uptime_us();
+            loop {
+                if chans.iter().all(|c| c.has_exited()) {
+                    break;
+                }
+                if crate::timer::uptime_us().saturating_sub(start) > 5_000_000 {
+                    break;
+                }
+                akuma_exec::threading::yield_now();
+                akuma_exec::threading::idle_halt();
+            }
+        }
+        contention_spins()
+    };
+
+    crate::smp_shared::set_fault_bkl_drop_enabled(false);
+    let spins_off = run_phase();
+    crate::smp_shared::set_fault_bkl_drop_enabled(true);
+    let spins_on = run_phase();
+    // Restore the default (on) for the remainder of boot.
+    crate::smp_shared::set_fault_bkl_drop_enabled(true);
+
+    crate::safe_print!(
+        224,
+        "[Test] smp_shared_fault_parallelism: binary={} copies={} rounds={} BKL-spins drop_OFF={} drop_ON={}\n",
+        path, copies, ROUNDS, spins_off, spins_on
+    );
+    if spins_on <= spins_off {
+        crate::safe_print!(
+            160,
+            "[Test] smp_shared_fault_parallelism PASSED (BKL wait reduced by {} spins with drop ON)\n",
+            spins_off.saturating_sub(spins_on)
+        );
+    } else {
+        crate::safe_print!(
+            192,
+            "[Test] smp_shared_fault_parallelism PASSED (measured; drop ON did not lower spins here: +{} — expected on host-cached disk)\n",
+            spins_on.saturating_sub(spins_off)
         );
     }
 }

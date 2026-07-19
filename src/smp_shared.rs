@@ -57,6 +57,23 @@ static ONLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// promptly (M4 cross-core wakeup) instead of waiting for its ~10 ms timer tick.
 static CORE_IDLE_MASK: AtomicU32 = AtomicU32::new(0);
 
+/// Runtime toggle (default on) for the M5b Stage 4a optimization: drop the BKL around a
+/// file-backed fault's block-I/O fill pass so peer cores can enter the kernel while this
+/// core waits on disk. Exposed so a boot self-test can A/B-measure its effect on
+/// cross-core BKL contention (see `test_smp_shared_fault_parallelism`).
+static FAULT_BKL_DROP_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Whether the file-fault block-I/O BKL-drop (M5b Stage 4a) is currently enabled.
+#[inline]
+pub fn fault_bkl_drop_enabled() -> bool {
+    FAULT_BKL_DROP_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Enable/disable the file-fault block-I/O BKL-drop at runtime (A/B measurement only).
+pub fn set_fault_bkl_drop_enabled(on: bool) {
+    FAULT_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
+}
+
 /// Mark this core idle/busy in [`CORE_IDLE_MASK`] (called around the idle WFI).
 #[inline]
 fn set_core_idle(core: usize, idle: bool) {

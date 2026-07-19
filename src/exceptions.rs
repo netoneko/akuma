@@ -2725,6 +2725,19 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                         // long part (block I/O) and runs OUTSIDE the per-AS lock so peers can
                         // fault/run in parallel (M5b). Records (va, frame) to install next.
                         let mut filled: alloc::vec::Vec<(usize, crate::pmm::PhysFrame)> = alloc::vec::Vec::new();
+                        // M5b Stage 4a: DROP the BKL for the block-I/O fill so peer cores can
+                        // enter the kernel while this core waits on the disk (the measured
+                        // ~10 ms hold). Pass B touches only PRIVATE frames + the block device
+                        // (own lock) + the held fault-slot — no BKL-protected state. A timer
+                        // may re-acquire the BKL for us via the IRQ reconcile (then the
+                        // enter_kernel below is idempotent); the wrapper's leave_kernel still
+                        // balances it. Concurrent munmap clears PTEs but never frees the
+                        // intermediate tables this loop's page-table reads walk (freed only at
+                        // teardown, which can't run while this thread faults).
+                        #[cfg(kernel_smp_shared)]
+                        let fault_dropped_bkl = crate::smp_shared::fault_bkl_drop_enabled();
+                        #[cfg(kernel_smp_shared)]
+                        if fault_dropped_bkl { akuma_exec::bkl::leave_kernel(); }
                         let mut cur_va = page_va;
                         while cur_va < ra_end {
                             if akuma_exec::mmu::is_current_user_page_mapped(cur_va) {
@@ -2774,6 +2787,10 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                             filled.push((cur_va, pf));
                             cur_va += 0x1000;
                         }
+                        // Re-take the BKL for the install pass (idempotent if a timer already
+                        // reacquired it for us during the fill above).
+                        #[cfg(kernel_smp_shared)]
+                        if fault_dropped_bkl { akuma_exec::bkl::enter_kernel(); }
 
                         // Pass C — INSTALL (under `as_lock`): atomically map each filled frame
                         // + track it. Short, no alloc/IO. A frame that loses the install race
@@ -3242,6 +3259,12 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                         // Pass B — FILL (no `as_lock`): read file data + icache maintenance
                         // into PRIVATE frames. Block I/O runs outside the per-AS lock (M5b).
                         let mut filled: alloc::vec::Vec<(usize, crate::pmm::PhysFrame)> = alloc::vec::Vec::new();
+                        // M5b Stage 4a: DROP the BKL for the block-I/O fill (see the matching
+                        // note in the data-abort arm). Peers run while this core waits on disk.
+                        #[cfg(kernel_smp_shared)]
+                        let fault_dropped_bkl = crate::smp_shared::fault_bkl_drop_enabled();
+                        #[cfg(kernel_smp_shared)]
+                        if fault_dropped_bkl { akuma_exec::bkl::leave_kernel(); }
                         let mut cur_va = page_va;
                         while cur_va < ra_end {
                             if akuma_exec::mmu::is_current_user_page_mapped(cur_va) {
@@ -3284,6 +3307,10 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                             filled.push((cur_va, pf));
                             cur_va += 0x1000;
                         }
+                        // Re-take the BKL for the install pass (idempotent if a timer already
+                        // reacquired it during the fill).
+                        #[cfg(kernel_smp_shared)]
+                        if fault_dropped_bkl { akuma_exec::bkl::enter_kernel(); }
 
                         // Pass C — INSTALL (under `as_lock`): atomic map + track per frame.
                         let mut any_mapped = false;
