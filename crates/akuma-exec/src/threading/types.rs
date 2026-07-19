@@ -16,6 +16,11 @@ pub const COOPERATIVE_TIMEOUT_US: u64 = 100_000;
 /// Thread 0 is the boot/idle thread - always protected, never terminated
 pub const IDLE_THREAD_IDX: usize = 0;
 
+/// Maximum number of cores for real (shared-kernel) SMP. Matches
+/// `akuma_smp::MAX_CORES` / the SMP bringup cap. Used to size the per-core idle-thread
+/// table in the shared scheduler.
+pub const MAX_CORES: usize = 8;
+
 /// Magic value for Context integrity check
 pub const CONTEXT_MAGIC: u64 = 0xDEAD_BEEF_1234_5678;
 

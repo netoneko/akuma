@@ -132,7 +132,65 @@ tests pass; clippy clean on smp-shared + default + akuma-exec.
 `.../src/process/mod.rs` (enter_user_mode), `src/exceptions.rs` (syscall wrapper),
 `Cargo.toml` (forward smp-shared to akuma-exec).
 
-## M2..M5 (planned)
+## M2 — Shared scheduler: BKL on the IRQ path + per-core idle (in progress)
+
+### M2a — IRQ/scheduler-path BKL + eret reconcile ✅ (2026-07-19)
+
+Completes the BKL wiring M1 started (which covered only the syscall excursion). The
+IRQ/SGI entry (`rust_irq_handler_with_sp`, `src/exceptions.rs`) now:
+- `enter_kernel()` at the top, so the scheduler + device handlers run holding the BKL;
+- after the handler, **reconciles the BKL to the EL the pending `eret` will enter** by
+  reading the SPSR of the frame it's about to restore — `new_sp`'s frame after a
+  context switch, else the interrupted `current_sp` frame. SPSR is at a fixed offset
+  (`IRQ_FRAME_SPSR_OFFSET = 248`) derived from the `irq_el0_handler`/`irq_handler` save
+  order and matched by `setup_fake_irq_frame`'s synthetic frames. `(spsr & 0xf) == 0`
+  ⇒ returning to EL0 ⇒ release; else keep held.
+
+Since every context switch (yield/block/preempt) goes through this one path, and the
+BKL is held across the *entire* excursion (scheduler decision **and** the context
+save), the switch is cross-core-atomic: a thread is fully switched out before any peer
+core can touch it. `idle_halt` (`threading/mod.rs`) now drops the BKL before its `WFI`
+and re-takes it after, so an idle core never blocks peers from entering the kernel. All
+no-ops unless `cfg(kernel_smp_shared)`.
+
+Verified SMP=2 (secondaries still parked): BSP boots, syscalls + timer preemptions flow
+through the IRQ-path BKL, `smp_shared_cores_online PASSED`, zero `[BKL] stuck`, same
+pre-existing baseline. No regression.
+
+### M2b — SMP-safe scheduler: per-core idle ✅ (2026-07-19)
+
+`ThreadPool::schedule_indices` now takes a `core_id` and supports **one idle thread per
+core** (`IS_IDLE_THREAD` + `IDLE_SLOT_FOR_CORE[MAX_CORES]`, `register_core_idle`): the
+round-robin scan **skips idle threads**, and a core with nothing else READY falls back
+to *its own* idle — so one core can never grab another core's idle. The commit logic was
+extracted into `commit_switch` and shared by the normal and idle-fallback paths. Slot 0
+is registered as core 0's idle at init, so single-core behavior is unchanged (`core_id`
+is 0, the fallback picks slot 0 — exactly the old "drop to idle" behavior). The
+no-double-run guarantee comes for free from the BKL serialization + RUNNING state (M2a),
+so no per-thread owner-core field was needed yet.
+
+Verified SMP=2 (BSP): boots, futex + thread-cleanup tests pass, 114 akuma-exec host
+tests pass, zero `[BKL] stuck`, same baseline. No regression. `current_idx` left as-is
+(a near-dead mirror; only `validate_current_sp` reads it) — its removal is cosmetic and
+deferred.
+
+**Files:** `src/exceptions.rs` (IRQ wrapper + SPSR offset), `crates/akuma-exec/src/`
+`threading/mod.rs` (schedule_indices core_id + per-core idle + commit_switch + idle_halt
+BKL), `threading/types.rs` (MAX_CORES), `bkl.rs` (current_core_id all-configs).
+
+### M2c — secondaries run the shared scheduler (NEXT)
+
+Replace M0's secondary WFE park with a real per-core scheduler: adopt the secondary's
+boot context as *its* idle thread (a fresh slot, `register_core_idle`), init its GIC
+redistributor + CPU interface, set VBAR to the shared `exception_vector_table`, arm its
+CNTV timer (→ scheduler SGI **targeted at itself** — widen `trigger_sgi_core` /
+`register_handler_no_gic` to `any(kernel_smp, kernel_smp_shared)`, and make the timer
+handler ring the *current* core's SGI), make its idle preemptible, enable IRQs. Then a
+test kernel thread should run on a secondary, timer-preempted, concurrently with the
+BSP — the first real BKL contention. Also in M2: inner-shareable TLB flushes (`...is`)
+and real per-AS ASIDs (needed once user threads run cross-core in M3).
+
+## M3..M5 (planned)
 
 See the approved plan for the full roadmap: M2 shared scheduler (SMP-safe SGI handler,
 per-core idle, inner-shareable TLB flushes `...is`, real per-AS ASIDs, map all GICR

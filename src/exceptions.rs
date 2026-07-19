@@ -1451,11 +1451,43 @@ extern "C" fn rust_default_exception_handler() {
 /// 
 /// Takes current SP, returns new SP if context switch needed (or 0 if no switch).
 /// The assembly does the actual SP switch AFTER this returns.
+/// Byte offset of the saved `SPSR_EL1` within the 832-byte IRQ trap frame (the frame
+/// `sp` points at when the vector calls `rust_irq_handler_with_sp`). Derived from the
+/// save order in `irq_el0_handler`/`irq_handler`: x30(0), x28/29..x0/1 (240), then
+/// ELR(240)/SPSR(248). Synthetic frames written by `setup_fake_irq_frame` place SPSR
+/// at the same slot (`frame.add(31)` = byte 248). The BKL reads it to learn the EL the
+/// `eret` will target. If the frame layout ever changes, update this constant.
+#[cfg(kernel_smp_shared)]
+const IRQ_FRAME_SPSR_OFFSET: usize = 248;
+
+/// IRQ / SGI entry from the vector asm. Under real shared-kernel SMP this runs the
+/// scheduler and device handlers holding the Big Kernel Lock, then reconciles the BKL
+/// to the EL the pending `eret` will enter (release when returning to EL0, keep for
+/// EL1) using the SPSR of the frame we're about to restore — which, after a context
+/// switch, is the *incoming* thread's frame. No-op unless `cfg(kernel_smp_shared)`.
 #[unsafe(no_mangle)]
 extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
+    akuma_exec::bkl::enter_kernel();
+    let new_sp = rust_irq_handler_inner(current_sp);
+    #[cfg(kernel_smp_shared)]
+    {
+        // The asm erets into `new_sp`'s frame after a switch, else the interrupted
+        // `current_sp` frame. Reconcile the BKL to that frame's target EL.
+        let final_sp = if new_sp != 0 { new_sp } else { current_sp };
+        // SAFETY: `final_sp` is a live IRQ trap frame; SPSR sits at a fixed offset.
+        let spsr = unsafe {
+            core::ptr::read_volatile((final_sp as usize + IRQ_FRAME_SPSR_OFFSET) as *const u64)
+        };
+        akuma_exec::bkl::reconcile_for_spsr(spsr);
+    }
+    new_sp
+}
+
+#[inline]
+fn rust_irq_handler_inner(current_sp: u64) -> u64 {
     // Acknowledge the interrupt and get IRQ number
     let irq_opt = crate::gic::acknowledge_irq();
-    
+
     if let Some(irq) = irq_opt {
         // Special handling for scheduler SGI
         if irq == crate::gic::SGI_SCHEDULER {

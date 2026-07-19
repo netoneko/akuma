@@ -24,7 +24,8 @@ use crate::sync::KernelLock;
 static KERNEL_LOCK: KernelLock = KernelLock::new();
 
 /// This core's identity (MPIDR aff0). Matches the `mpidr & 0xff` indexing used by the
-/// SMP bringup path and `trigger_sgi_core`.
+/// SMP bringup path and `trigger_sgi_core`. Always `0` on non-SMP builds and on host
+/// tests, so callers (e.g. the scheduler's per-core idle) can use it unconditionally.
 #[cfg(all(kernel_smp_shared, target_os = "none"))]
 #[inline]
 pub fn current_core_id() -> u32 {
@@ -32,6 +33,13 @@ pub fn current_core_id() -> u32 {
     // SAFETY: reading the affinity register has no side effects.
     unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack)) };
     (mpidr & 0xff) as u32
+}
+
+/// Non-SMP / host shim: a single-core build is always core 0.
+#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[inline(always)]
+pub fn current_core_id() -> u32 {
+    0
 }
 
 /// Acquire the BKL for this core — call on entering kernel code from EL0. Spins if
@@ -88,10 +96,4 @@ pub fn reconcile_for_spsr(_spsr: u64) {}
 #[inline(always)]
 pub fn held_by_current() -> bool {
     false
-}
-
-#[cfg(all(kernel_smp_shared, not(target_os = "none")))]
-#[inline(always)]
-pub fn current_core_id() -> u32 {
-    0
 }

@@ -66,7 +66,9 @@ Self-test: `process_tests.rs::test_smp_shared_cores_online` asserts online count
 |---|---|
 | M0 — cores online on shared kernel | ✅ SMP=2/4 verified |
 | M1 — BKL primitive + syscall-path wiring | ✅ BSP verified, no deadlock/regression |
-| M2 — shared scheduler (BKL reconcile at switch, idle, SGI/TLB-IS/ASID) | planned |
+| M2a — IRQ/scheduler-path BKL + eret reconcile | ✅ BSP verified |
+| M2b — SMP-safe scheduler: per-core idle | ✅ BSP verified |
+| M2c — secondaries run the shared scheduler (+ TLB-IS, ASID) | next |
 | M3 — userspace on secondaries | planned |
 | M4 — migration + cross-core wakeups | planned |
 | M5 — fine-grained locking | planned |

@@ -15,7 +15,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 #[cfg(target_os = "none")]
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
 use crate::runtime::{runtime, config, with_irqs_disabled, IrqGuard};
@@ -384,6 +384,35 @@ static PREEMPT_WAKE_TID: AtomicUsize = AtomicUsize::new(MAX_THREADS);
 /// Master switch for the [`PREEMPT_WAKE_TID`] wakeup-locality experiment. Off:
 /// the hint is never set, so the scheduler is exactly baseline round-robin.
 const WAKEUP_LOCALITY_HINT: bool = false;
+
+/// Real shared-kernel SMP: which thread slots are per-core idle threads. Idle threads
+/// are skipped by the round-robin scan — a core only ever runs ITS OWN idle, chosen
+/// explicitly as the fallback in `schedule_indices` — so one core can never pick
+/// another core's idle. Slot 0 (the boot/idle thread) is marked idle for core 0 at init.
+static IS_IDLE_THREAD: [AtomicBool; MAX_THREADS] = {
+    const INIT: AtomicBool = AtomicBool::new(false);
+    [INIT; MAX_THREADS]
+};
+
+/// Per-core idle thread slot (index into the pool), or -1 if none assigned. Core 0 is
+/// slot 0 (the boot thread); each secondary registers its own via
+/// [`register_core_idle`]. `schedule_indices` falls back to this core's idle when no
+/// non-idle thread is READY.
+static IDLE_SLOT_FOR_CORE: [AtomicI32; MAX_CORES] = {
+    const INIT: AtomicI32 = AtomicI32::new(-1);
+    [INIT; MAX_CORES]
+};
+
+/// Register `slot` as the idle thread for `core_id` (real shared-kernel SMP). Called by
+/// the BSP for core 0 at init and by each secondary during bringup. Idempotent.
+pub fn register_core_idle(core_id: usize, slot: usize) {
+    if slot < MAX_THREADS {
+        IS_IDLE_THREAD[slot].store(true, Ordering::Release);
+    }
+    if core_id < MAX_CORES {
+        IDLE_SLOT_FOR_CORE[core_id].store(slot as i32, Ordering::Release);
+    }
+}
 
 /// Per-thread pending signal bitmask.  Bit N set = signal (N+1) pending.
 /// Multiple signals can be pending simultaneously (unlike the old single-slot).
@@ -1391,6 +1420,10 @@ impl ThreadPool {
         self.slots[IDLE_THREAD_IDX].cooperative = true;
         self.slots[IDLE_THREAD_IDX].timeout_us = COOPERATIVE_TIMEOUT_US;
         self.slots[IDLE_THREAD_IDX].start_time_us = (runtime().uptime_us)();
+        // Real shared-kernel SMP: slot 0 is core 0's per-core idle thread. Registering it
+        // makes the scheduler's idle-fallback logic uniform across cores (single-core
+        // builds also go through it, with core_id 0 → slot 0 = the original behavior).
+        register_core_idle(0, IDLE_THREAD_IDX);
         
         // Initialize boot thread context in THREAD_CONTEXTS (not in slot)
         unsafe {
@@ -1871,10 +1904,22 @@ impl ThreadPool {
     ///   - If preemption is explicitly disabled: Don't switch
     ///   - Cooperative threads (thread 0): Only switch after timeout elapses
     ///   - Non-cooperative threads (sessions, user processes): Always preemptible
-    pub fn schedule_indices(&mut self, voluntary: bool) -> Option<(usize, usize)> {
+    ///
+    /// Pick the next thread for `core_id` to run. Returns `Some((old, new))` if a
+    /// switch is needed. Under real shared-kernel SMP this runs serialized by the Big
+    /// Kernel Lock (the whole IRQ/scheduler excursion holds it), so two cores never
+    /// execute this concurrently and the RUNNING state alone prevents double-running a
+    /// thread. Per-core idle threads (see [`IS_IDLE_THREAD`]) are skipped by the
+    /// round-robin scan; a core falls back only to ITS OWN idle. `core_id` is 0 on
+    /// single-core builds, so behavior there is unchanged.
+    pub fn schedule_indices(&mut self, voluntary: bool, core_id: usize) -> Option<(usize, usize)> {
         // Use TPIDRRO_EL0 register for current thread ID - more reliable than atomic
         let current_idx = get_current_thread_register();
-        let current = &self.slots[current_idx];
+        // Read the current slot's scheduling fields by value (Copy) rather than holding
+        // a borrow, so `commit_switch(&mut self)` below doesn't conflict.
+        let current_cooperative = self.slots[current_idx].cooperative;
+        let current_timeout_us = self.slots[current_idx].timeout_us;
+        let current_start_time_us = self.slots[current_idx].start_time_us;
 
         // Wake-pass: mark READY any WAITING thread whose wake deadline has passed.
         // This MUST run on every scheduler entry — including involuntary
@@ -1916,10 +1961,10 @@ impl ThreadPool {
         // For timer-triggered preemption, check if the current thread is cooperative.
         // Use atomic state check
         let current_state = THREAD_STATES[current_idx].load(Ordering::SeqCst);
-        if !voluntary && current.cooperative && current_state == thread_state::RUNNING {
-            let timeout = current.timeout_us;
-            if timeout > 0 && current.start_time_us > 0 {
-                let elapsed = now.saturating_sub(current.start_time_us);
+        if !voluntary && current_cooperative && current_state == thread_state::RUNNING {
+            let timeout = current_timeout_us;
+            if timeout > 0 && current_start_time_us > 0 {
+                let elapsed = now.saturating_sub(current_start_time_us);
                 if elapsed < timeout {
                     return None;
                 }
@@ -1960,6 +2005,7 @@ impl ThreadPool {
         let hinted = PREEMPT_WAKE_TID.swap(MAX_THREADS, Ordering::SeqCst);
         let next_idx = if hinted < MAX_THREADS
             && hinted != current_idx
+            && !IS_IDLE_THREAD[hinted].load(Ordering::Relaxed)
             && THREAD_STATES[hinted].load(Ordering::SeqCst) == thread_state::READY
         {
             hinted
@@ -1968,25 +2014,38 @@ impl ThreadPool {
             // This ensures fair rotation through ALL threads, not just starting from current.
             // Without this, threads 10, 11 would never run if 8, 9 are always ready and
             // the scheduler always runs from a low-numbered system thread.
+            //
+            // Skip per-core idle threads: they are never taken by the scan (a core only
+            // runs ITS OWN idle, chosen as the fallback below), so one core can't grab
+            // another core's idle under SMP.
             let mut next_idx = (self.round_robin_idx + 1) % MAX_THREADS;
             let start_idx = next_idx;
 
             loop {
                 let state = THREAD_STATES[next_idx].load(Ordering::SeqCst);
 
-                if state == thread_state::READY {
-                    // Found a ready thread - but skip if it's the current one
-                    // (we want to switch TO a different thread, not stay on current)
-                    if next_idx != current_idx {
-                        break;
-                    }
+                if state == thread_state::READY
+                    && next_idx != current_idx
+                    && !IS_IDLE_THREAD[next_idx].load(Ordering::Relaxed)
+                {
+                    // Found a ready, non-idle thread to switch TO.
+                    break;
                 }
 
                 next_idx = (next_idx + 1) % MAX_THREADS;
 
                 if next_idx == start_idx {
-                    // Wrapped around without finding a different ready thread
-                    return None;
+                    // No non-idle READY thread. Fall back to THIS core's idle thread so
+                    // the core has something to run (single-core: idle is slot 0, the
+                    // original behavior of dropping to idle when nothing else is ready).
+                    let idle = IDLE_SLOT_FOR_CORE[core_id].load(Ordering::Relaxed);
+                    if idle < 0 || idle as usize == current_idx {
+                        // No idle registered yet, or we're already on our idle: stay put.
+                        return None;
+                    }
+                    let idle = idle as usize;
+                    self.commit_switch(current_idx, idle, now);
+                    return Some((current_idx, idle));
                 }
             }
 
@@ -1996,14 +2055,23 @@ impl ThreadPool {
             next_idx
         };
 
-        // Update states atomically (lock-free)
-        // Don't change state if thread is TERMINATED or WAITING
-        // WAITING threads keep their state - scheduler handles wake time
+        self.commit_switch(current_idx, next_idx, now);
+        Some((current_idx, next_idx))
+    }
+
+    /// Apply a scheduler switch decision: bill the outgoing thread's CPU time, flip it
+    /// back to READY (unless TERMINATED/WAITING), mark the incoming thread RUNNING, and
+    /// publish it as this core's current thread (TPIDRRO_EL0). Shared by the normal
+    /// round-robin path and the per-core idle fallback.
+    fn commit_switch(&mut self, current_idx: usize, next_idx: usize, now: u64) {
+        // Don't change state if the outgoing thread is TERMINATED or WAITING —
+        // WAITING threads keep their state so the wake-pass handles them.
         let current_state = THREAD_STATES[current_idx].load(Ordering::SeqCst);
 
-        // Accumulate CPU time for the thread being scheduled out
-        if current.start_time_us > 0 {
-            let elapsed = now.saturating_sub(current.start_time_us);
+        // Accumulate CPU time for the thread being scheduled out.
+        let start = self.slots[current_idx].start_time_us;
+        if start > 0 {
+            let elapsed = now.saturating_sub(start);
             TOTAL_CPU_TIMES[current_idx].fetch_add(elapsed, Ordering::Relaxed);
         }
 
@@ -2011,15 +2079,13 @@ impl ThreadPool {
             THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
         }
         THREAD_STATES[next_idx].store(thread_state::RUNNING, Ordering::SeqCst);
-        
+
         // Update timing (still in slot, but we own it)
         self.slots[next_idx].start_time_us = now;
 
-        // Update current thread in CPU register (authoritative source of truth)
+        // Update current thread in CPU register (authoritative, per-core source of truth)
         set_current_thread_register(next_idx);
-        self.current_idx = next_idx; // Keep in sync for context access
-        
-        Some((current_idx, next_idx))
+        self.current_idx = next_idx; // Legacy mirror (only validate_current_sp reads it)
     }
 
     pub fn thread_stats(&self) -> (usize, usize, usize) {
@@ -2281,9 +2347,17 @@ pub fn idle_halt() {
     // (~10 ms) disabled window.
     disable_preemption();
     let entered = (runtime().uptime_us)();
+    // Real shared-kernel SMP: an idle core must not hold the Big Kernel Lock while
+    // halted, or peer cores can't enter the kernel. Drop it before WFI; the IRQ that
+    // wakes us re-takes it via the IRQ-path reconcile as it returns into this thread.
+    // No-op unless `cfg(kernel_smp_shared)`.
+    crate::bkl::leave_kernel();
     // SAFETY: WFI halts the PE until a pending IRQ. IRQs are enabled on entry, so
     // the interrupt (timer tick / device) is taken and serviced before WFI returns.
     unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+    // Re-take the BKL for the post-halt bookkeeping below (idempotent if the waking
+    // IRQ's reconcile already re-acquired it for this thread). No-op unless smp-shared.
+    crate::bkl::enter_kernel();
     let halted = (runtime().uptime_us)().saturating_sub(entered);
     if tid < MAX_THREADS && halted > 0 {
         let _guard = IrqGuard::new();
@@ -2339,7 +2413,9 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             }
         };
         if debug { (runtime().print_str)("[SGI-DBG] got POOL\n"); }
-        let result = pool.schedule_indices(voluntary).map(|(old_idx, new_idx)| {
+        // Which core is scheduling — selects this core's idle fallback. 0 on single-core.
+        let core_id = crate::bkl::current_core_id() as usize;
+        let result = pool.schedule_indices(voluntary, core_id).map(|(old_idx, new_idx)| {
             let new_tpidr = pool.slots[new_idx].exception_stack_top;
             (old_idx, new_idx, new_tpidr)
         });
