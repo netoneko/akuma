@@ -44,6 +44,11 @@ on the in-kernel stack. No userspace process owns the stack.
 
 ### Rump-default (devbox)
 
+> **Deferred (2026-07-19):** the default devbox is now **devbox-smoltcp** (box 0
+> on the native smoltcp stack + real shared-kernel SMP; see
+> [`smp-shared.md`](smp-shared.md)). `rump-default` still works but is no longer
+> the recommended devbox.
+
 At boot, `rump_proxy::start_default_stack` (`src/rump_proxy.rs:1284`) runs when
 the `rump-default` feature is on:
 

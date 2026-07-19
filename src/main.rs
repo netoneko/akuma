@@ -72,6 +72,10 @@ mod shell;
 mod shell_tests;
 #[cfg(kernel_smp)]
 mod smp;
+// Real (shared-kernel) SMP — the inverse of the multikernel `smp` module. One
+// shared kernel across all cores; see docs/reference/subsystems/smp-shared.md.
+#[cfg(kernel_smp_shared)]
+mod smp_shared;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod sync_tests;
 // The built-in (in-kernel) SSH server is built on smoltcp sockets, so it is
@@ -602,6 +606,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     #[cfg(kernel_smp)]
     smp::probe_dtb(dtb_ptr);
 
+    // Real (shared-kernel) SMP: same rationale — snapshot CPU/PSCI info before the
+    // heap can overwrite the DTB. No-op without the `smp-shared` feature.
+    #[cfg(kernel_smp_shared)]
+    smp_shared::probe_dtb(dtb_ptr);
+
     // Memory layout. All the policy (boot-stack cover, code+stack floor, the
     // extreme reserve-RAM clamp) lives in `compute_memory_layout` + `config`, so
     // the boot path here is just "compute, then verify". The sanity guard below
@@ -793,6 +802,13 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // `smp` feature so the default single-core build never compiles it.
     #[cfg(kernel_smp)]
     smp::bringup_secondaries(ram_base, ram_size);
+
+    // Real (shared-kernel) SMP — M0: wake secondary cores onto the SHARED boot page
+    // tables, PMM, and heap (no per-core isolation or partitions). In M0 each
+    // secondary just reports online and parks in WFE; the shared scheduler arrives
+    // in a later milestone. No-op with a single QEMU CPU. (docs/archive/SMP_SHARED.md)
+    #[cfg(kernel_smp_shared)]
+    smp_shared::bringup_secondaries();
 
     // Set up exception vectors and enable IRQs
     exceptions::init();

@@ -7,23 +7,34 @@ concrete papercuts that only show up under daily use.
 Everything here lives under `overlays/devbox/` and does not disturb the default
 `bootstrap/` tree or the normal run scripts.
 
-> **Current state:** the image is being built up incrementally. Right now it is the
-> **minimal** target — *SSH in over the rump network stack, nothing else* — so that the
-> networking + login foundation is solid before the toolchains, editor, `meow`, and the
-> in-VM source tree get layered back on (see [Roadmap — the rest](#roadmap--the-rest)).
+> **Default devbox = `devbox-smoltcp` (as of 2026-07-19).** The recommended dev image
+> now runs on the **native smoltcp** network stack with **real shared-kernel SMP**
+> (multiple cores share one kernel), built-in SSH dropped in favour of the userspace
+> `/bin/sshd`. **`rump_server` work is deferred** — the rump path below still builds and
+> boots (`overlays/devbox/run.sh`), it is just no longer the recommended image. See
+> [`../../docs/reference/subsystems/smp-shared.md`](../../docs/reference/subsystems/smp-shared.md).
 
 ---
 
-## Quick start
+## Quick start (devbox-smoltcp — default)
 
 ```bash
-# 1. Build the minimal image (host). Needs Docker; builds herd + sshd, ~1 GB image.
+# 1. Build the image (host). Needs Docker; builds herd + sshd, ~1 GB image.
 overlays/devbox/bootstrap.sh
 
-# 2. Boot it (devbox profile: rump is the default stack, no built-in SSH, RUMP_NIC=1).
-overlays/devbox/run.sh
+# 2. Boot it: smoltcp stack, no built-in SSH, real SMP (SMP=2 by default).
+overlays/devbox/run-smoltcp.sh                     # or: SMP=4 overlays/devbox/run-smoltcp.sh
+scripts/build_devbox_smoltcp.sh                    # build-only equivalent
 
-# 3. SSH in once box 0's rump stack is up and herd has started sshd.
+# 3. SSH in once the smoltcp stack is up and herd has started sshd.
+ssh -o StrictHostKeyChecking=no -p 2222 root@localhost
+```
+
+## Quick start (rump — deferred / alternative)
+
+```bash
+overlays/devbox/bootstrap.sh                       # same image
+overlays/devbox/run.sh                             # rump default stack, RUMP_NIC=1, single kernel
 ssh -o StrictHostKeyChecking=no -p 2223 root@localhost
 ```
 
@@ -49,6 +60,26 @@ userspace-sshd = []                                   # no built-in (smoltcp) SS
 
 `[profile.devbox]` inherits `release`, so it carries `rump` + `sound` codegen; the
 behavioural difference is entirely in those two features.
+
+### devbox-smoltcp (the default) — the inverse
+
+The recommended image is the **`devbox-smoltcp`** meta-feature on the
+**`release-smp-shared`** profile:
+
+```
+cargo run --profile release-smp-shared --features devbox-smoltcp,no-tests   # run-smoltcp.sh
+scripts/build_devbox_smoltcp.sh                                             # build-only
+
+[features]
+devbox-smoltcp = ["userspace-sshd", "smp-shared"]   # keep smoltcp, drop built-in ssh, add real SMP
+smp-shared     = []                                  # one shared kernel across cores (cfg(kernel_smp_shared))
+```
+
+Unlike `devbox` (rump-only, `--no-default-features`), `devbox-smoltcp` keeps the default
+feature set — so the **native smoltcp** stack, `kernel-tls`, and `tls-rsa` stay in, and
+box 0's networking is the simple in-kernel path (no second NetBSD stack). Booted with
+`SMP=N` (real shared-kernel SMP; the rump devbox `unset SMP`). SSH is the userspace
+`/bin/sshd` (herd) over smoltcp; QEMU forwards host `:2222 → :22`.
 
 ### 1. rump is the DEFAULT network stack (not a box)
 

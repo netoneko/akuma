@@ -104,6 +104,14 @@ inherits = "size"
 [profile.release-smp]
 inherits = "release"
 
+# Real (shared-kernel) SMP build (docs/reference/subsystems/smp-shared.md). Inherits
+# `release` codegen; the `smp-shared` FEATURE gates the code. Selected together:
+#   cargo build --profile release-smp-shared --features smp-shared
+# (scripts/build_smp_shared.sh). Mutually exclusive with `smp` (build.rs panics if
+# both are set). `cargo build --release` is unaffected — single-core stays the default.
+[profile.release-smp-shared]
+inherits = "release"
+
 # Devbox build (overlays/devbox). Inherits `release` codegen (so it carries `rump`
 # + `sound`); the DISTINCTION from release is entirely in the `devbox` FEATURE set,
 # selected together by scripts/build_devbox.sh / overlays/devbox/run.sh:
@@ -140,6 +148,16 @@ rump-tests = []
 # (descriptor, lock-free MPSC inbox, memory-reclaim protocol) only under this
 # feature, so the default build never even compiles it.
 smp = ["dep:akuma-smp"]
+
+# Real (shared-kernel) SMP / classic symmetric multiprocessing. NOT in `default`:
+# all shared-kernel secondary bringup + the shared scheduler/locking live behind
+# `cfg(kernel_smp_shared)`, which build.rs emits only when this feature is set (via
+# CARGO_FEATURE_SMP_SHARED). Paired with the `release-smp-shared` profile. The
+# INVERSE of `smp`: instead of replicating per-core state, all cores share one
+# kernel image, one PMM/heap, and one run queue under real cross-core locks.
+# Mutually exclusive with `smp` (build.rs enforces). See
+# docs/reference/subsystems/smp-shared.md and docs/archive/SMP_SHARED.md.
+smp-shared = []
 
 # Rump-kernel support: a raw L2 packet path so a userspace NetBSD rump TCP/IP
 # stack can send/receive Ethernet frames. Binds a SECOND virtio-net device
@@ -242,6 +260,18 @@ userspace-sshd = []
 # the smoltcp-coupled built-in SSH) out entirely; for now it layers on top of the
 # default set, so the build still carries smoltcp but never routes box 0 to it.
 devbox = ["rump-default", "userspace-sshd"]
+
+# ── devbox-smoltcp: the DEFAULT devbox going forward ─────────────────────────
+# A dev image on the NATIVE smoltcp stack (NOT rump — rump_server work is
+# deferred), with the built-in in-kernel SSH dropped (`userspace-sshd` → the
+# userspace /bin/sshd from herd serves SSH over smoltcp instead) and real
+# shared-kernel SMP (`smp-shared`). The INVERSE of `devbox` (rump-default):
+# keep smoltcp, drop the built-in ssh, add real SMP. Built with the
+# `release-smp-shared` profile by scripts/build_devbox_smoltcp.sh and layered on
+# the default (smoltcp-carrying) feature set. Because smoltcp stays in, the
+# `userspace-sshd` compile guard in main.rs is satisfied. See
+# docs/reference/subsystems/smp-shared.md and overlays/devbox/README.md.
+devbox-smoltcp = ["userspace-sshd", "smp-shared"]
 
 [lints]
 workspace = true

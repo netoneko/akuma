@@ -28,6 +28,12 @@ pub fn run_network_tests() {
 pub fn run_all_tests() {
     console::print("\n--- Process Execution Tests ---\n");
 
+    // Real (shared-kernel) SMP M0: confirm every secondary the DTB reported came up
+    // on the shared kernel. Runs FIRST so it is observed even if a later, unrelated
+    // memory-pressure test aborts the suite. No-op on a single-CPU boot.
+    #[cfg(kernel_smp_shared)]
+    test_smp_shared_cores_online();
+
     // Net bounce-buffer OOM degradation (pure-fn boundaries + ample-mem alloc);
     // guards against the EC=0x3c kernel abort when an oversized socket buffer
     // can't grow the heap. No network stack required.
@@ -470,6 +476,35 @@ pub fn run_all_tests() {
     test_shared_file_mmap_writeback();
 
     console::print("--- Process Execution Tests Done ---\n\n");
+}
+
+/// M0 boot self-test for real SMP: `smp_shared::bringup_secondaries` (run earlier in
+/// `kernel_main`) should have brought every non-BSP core online. Verifies the online
+/// count equals `probed_core_count - 1` when the DTB reports more than one CPU.
+#[cfg(kernel_smp_shared)]
+fn test_smp_shared_cores_online() {
+    let probed = crate::smp_shared::probed_core_count();
+    let online = crate::smp_shared::online_secondary_count();
+    if probed <= 1 {
+        console::print("[Test] smp_shared_cores_online SKIPPED (single CPU; boot with SMP>1)\n");
+        return;
+    }
+    let expected = probed - 1;
+    if online == expected {
+        crate::safe_print!(
+            96,
+            "[Test] smp_shared_cores_online PASSED ({}/{} secondaries on shared kernel)\n",
+            online,
+            expected
+        );
+    } else {
+        crate::safe_print!(
+            96,
+            "[Test] smp_shared_cores_online FAILED ({}/{} secondaries online)\n",
+            online,
+            expected
+        );
+    }
 }
 
 /// Exercises the core of the writable MAP_SHARED writeback path: fill a resident

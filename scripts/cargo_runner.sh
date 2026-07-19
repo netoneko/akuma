@@ -84,6 +84,11 @@ BIN_BYTES=$(wc -c < "$BIN")
 if echo "$ELF" | grep -q "/size/"; then
   SIZE_LIMIT=$((1 * 1024 * 1024))   # 1 MB for size profile
   SIZE_LABEL="1 MB"
+elif echo "$ELF" | grep -q "/release-smp-shared/"; then
+  # Real (shared-kernel) SMP (cfg(kernel_smp_shared)) adds shared-secondary bringup +
+  # scheduler/locking on top of release; same headroom as the multikernel.
+  SIZE_LIMIT=$((4 * 1024 * 1024))   # 4 MB for release-smp-shared profile
+  SIZE_LABEL="4 MB"
 elif echo "$ELF" | grep -q "/release-smp/"; then
   # The multikernel (cfg(kernel_smp)) compiles in the per-core bringup/scheduler code on
   # top of release; allow a little more headroom than plain release.

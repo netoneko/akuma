@@ -1,5 +1,12 @@
 # Rump stack (sysproxy + fiber backend)
 
+> **Status: DEFERRED (2026-07-19).** `rump_server` work is on hold. The default
+> devbox is now **devbox-smoltcp** (native smoltcp stack + real shared-kernel
+> SMP) — see [`smp-shared.md`](smp-shared.md) and
+> [`../../../overlays/devbox/README.md`](../../../overlays/devbox/README.md). The
+> rump path below still builds and boots (`overlays/devbox/run.sh`); it is just
+> no longer the recommended image. This doc describes it as last left.
+
 > **Stability: C (active risk).** `src/rump_proxy.rs` and its supporting
 > crates had 8+ commits in the week before this doc was last verified
 > (2026-06-30 to 2026-07-06: fiber-by-default, tap-fd poll, sshd-over-rump,

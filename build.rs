@@ -2,6 +2,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_profile_size)");
     println!("cargo::rustc-check-cfg=cfg(kernel_profile_extreme)");
     println!("cargo::rustc-check-cfg=cfg(kernel_smp)");
+    println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
 
     // Multikernel (one-kernel-per-core) gate. ALL secondary-core code lives behind
     // `cfg(kernel_smp)`; with the feature off, none of it compiles and the default
@@ -10,9 +11,30 @@ fn main() {
     // codegen; Cargo profiles cannot auto-enable features), exposed to build
     // scripts as CARGO_FEATURE_SMP. Selected together by scripts/build_smp.sh.
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMP");
-    if std::env::var("CARGO_FEATURE_SMP").is_ok() {
+    let smp = std::env::var("CARGO_FEATURE_SMP").is_ok();
+    if smp {
         println!("cargo:rustc-cfg=kernel_smp");
     }
+
+    // Real (shared-kernel) SMP gate. Distinct from the multikernel: ONE shared
+    // kernel — one set of statics, one page-table set, one PMM/heap, one global run
+    // queue — across all cores under real cross-core locking. All of it lives behind
+    // `cfg(kernel_smp_shared)`, emitted only when the `smp-shared` feature is set
+    // (exposed as CARGO_FEATURE_SMP_SHARED). Paired with the `release-smp-shared`
+    // profile. See docs/reference/subsystems/smp-shared.md.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMP_SHARED");
+    let smp_shared = std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok();
+    if smp_shared {
+        println!("cargo:rustc-cfg=kernel_smp_shared");
+    }
+
+    // The two SMP models are opposites (share-nothing vs. share-everything) and must
+    // never compile together — the shared path assumes globals are NOT replicated,
+    // the multikernel assumes they ARE.
+    assert!(
+        !(smp && smp_shared),
+        "features `smp` (multikernel) and `smp-shared` (real SMP) are mutually exclusive"
+    );
 
     // OPT_LEVEL is "z" only for profile.size / profile.extreme-size (opt-level = "z").
     // PROFILE is always "release" for inherited profiles, so we can't use that.

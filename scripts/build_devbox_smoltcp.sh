@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -e
+# Build the devbox-smoltcp kernel: the DEFAULT devbox going forward.
+#
+# The INVERSE of scripts/build_devbox.sh (which is rump-only). This image keeps the
+# NATIVE smoltcp stack for box 0, DROPS the built-in in-kernel (smoltcp) SSH server
+# (`userspace-sshd` → the only sshd is the userspace /bin/sshd from herd, which routes
+# over smoltcp like any other process), and compiles in real shared-kernel SMP
+# (`smp-shared`). rump_server work is DEFERRED — the rump path stays in-tree/buildable
+# via scripts/build_devbox.sh, but this smoltcp image is the recommended devbox.
+#
+# Unlike build_devbox.sh we do NOT pass --no-default-features: smoltcp / kernel-tls /
+# tls-rsa must stay IN (the userspace sshd + curl route over smoltcp). We layer the
+# `devbox-smoltcp` meta-feature (userspace-sshd + smp-shared) plus `no-tests` (this is
+# a runtime target; skip the boot self-test suite) on top of the default set. Built
+# with the `release-smp-shared` profile so the shared-SMP secondary bringup compiles.
+#
+# Run with overlays/devbox/run-smoltcp.sh (SMP=N, no RUMP_NIC, host :2222 -> :22).
+# Extra args are forwarded (e.g. scripts/build_devbox_smoltcp.sh --quiet).
+DEVBOX_SMOLTCP_FEATURES="devbox-smoltcp,no-tests"
+cargo build \
+    --profile release-smp-shared \
+    --features "$DEVBOX_SMOLTCP_FEATURES" \
+    "$@"
+ls -lh target/aarch64-unknown-none/release-smp-shared/akuma
