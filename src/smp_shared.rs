@@ -74,6 +74,27 @@ pub fn set_fault_bkl_drop_enabled(on: bool) {
     FAULT_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
 }
 
+/// Runtime toggle (default **on**) for the M5c hold-shortening optimization: drop the BKL
+/// around execve's whole-file ELF read (`fs::read_file` in `do_execve`) so peer cores can
+/// enter the kernel while this core waits on disk. That read runs BEFORE the process image
+/// is touched and goes only through the VFS mount lookup (released before I/O), the ext2
+/// block cache, and the block device — all their own locks, none BKL-protected — the same
+/// lock profile the proven file-fault BKL-drop relies on. Exposed for A/B measurement.
+static EXEC_BKL_DROP_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Whether the execve ELF-read BKL-drop (M5c hold-shortening) is currently enabled.
+#[inline]
+pub fn exec_bkl_drop_enabled() -> bool {
+    EXEC_BKL_DROP_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Enable/disable the execve ELF-read BKL-drop at runtime. Retained for A/B measurement;
+/// correctness is covered by the execve-heavy boot path plus the host BKL model harness.
+#[allow(dead_code)]
+pub fn set_exec_bkl_drop_enabled(on: bool) {
+    EXEC_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
+}
+
 /// Runtime toggle (default **off**) for the M5c optimization: run the scheduler SGI
 /// BKL-free when it preempted EL0 (userspace, no BKL held), so peer cores' timer ticks
 /// don't serialize on the BKL. Correct at SMP=2. Left **off** because it is premature on

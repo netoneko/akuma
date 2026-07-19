@@ -634,12 +634,28 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
         }
     };
     #[cfg(all(not(kernel_profile_size), not(kernel_smp)))]
-    let file_data = match crate::fs::read_file(&resolved_path) {
-        Ok(data) => Some(data),
-        Err(crate::vfs::FsError::Internal) => None,
-        Err(e) => {
-            crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
-            return super::fs::fs_error_to_errno(e);
+    let file_data = {
+        // M5c hold-shortening: DROP the BKL around the whole-file ELF read so peer cores can
+        // enter the kernel while this core waits on disk (execve's dominant BKL-held window).
+        // Safe: this runs before `replace_image` touches the process, and the read goes only
+        // through the VFS/ext2/block locks (all BKL-independent) — the same profile as the
+        // proven file-fault drop. We re-take the BKL before inspecting the result / any
+        // further kernel work; a timer may re-acquire it for us meanwhile (enter_kernel is
+        // idempotent), and the syscall wrapper's leave_kernel still balances it.
+        #[cfg(kernel_smp_shared)]
+        let exec_dropped_bkl = crate::smp_shared::exec_bkl_drop_enabled();
+        #[cfg(kernel_smp_shared)]
+        if exec_dropped_bkl { akuma_exec::bkl::leave_kernel(); }
+        let read_result = crate::fs::read_file(&resolved_path);
+        #[cfg(kernel_smp_shared)]
+        if exec_dropped_bkl { akuma_exec::bkl::enter_kernel(); }
+        match read_result {
+            Ok(data) => Some(data),
+            Err(crate::vfs::FsError::Internal) => None,
+            Err(e) => {
+                crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
+                return super::fs::fs_error_to_errno(e);
+            }
         }
     };
 
