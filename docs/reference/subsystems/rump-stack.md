@@ -126,6 +126,36 @@ readiness — see "Known limitations"). Full analysis + corrected earlier
 mis-conclusion + reverted dead ends: `archive/RUMP_SYSPROXY_LATENCY_FIX.md`
 Phase 3q.
 
+**Rump tax vs native smoltcp — measured A/B (2026-07-19).** The same `curl`
+(8.11.1 / mbedTLS), same `devbox.img`, same QEMU SLIRP + DNS, run minutes apart
+against `http://example.com/`: box 0 on **native smoltcp** (default `--release`
+build, in-kernel stack) vs box 0 on **rump** (devbox build, sysproxy). Medians:
+
+| phase (cumulative) | smoltcp (in-kernel) | rump (sysproxy) | rump tax |
+|---|---|---|---|
+| DNS resolve | ~0.085 s | ~0.57 s | +0.48 s |
+| + TCP connect | ~0.10 s | ~0.85 s | +0.27 s |
+| + first byte | ~0.12 s | ~1.13 s | +0.24 s |
+| **total (HTTP GET)** | **~0.13 s** | **~1.13 s** | **+1.0 s (~8.7×)** |
+| **total (HTTPS GET)** | **~0.30 s** | **~1.9 s** | ~6× |
+
+The key correction this settles: the ~1.1 s rump `curl` is **NOT** dominated by
+external internet RTT. The identical GET over smoltcp — same DNS server, same
+SLIRP path — completes in **~0.13 s**, so external latency is only ~0.13 s and the
+remaining **~1.0 s is pure rump/sysproxy tax**. It is spread across *every* phase
+(~0.24–0.48 s each) because each phase is several socket syscalls and each syscall
+is a cross-process round-trip through the cooperatively-scheduled NetBSD kernel
+(the `N × per-syscall-cost` amplification). Consistent with the keystroke figure
+(rump ~225 ms vs smoltcp ~38 ms, ~6×): same per-syscall tax, different `N`.
+
+**Implication:** rump is a NetBSD-stack correctness/compat vehicle, not a
+low-latency one — it costs ~1 s on a trivial request, and no scheduler tuning
+inside rump (tick, network-thread boost, RX pump) closes an ~8× gap; those shave
+the rump portion only at the margin. For latency-sensitive networking, route the
+hot path through **native smoltcp**; reserve rump for where NetBSD semantics are
+genuinely required, and there prefer an in-process (no-sysproxy) model. See
+`archive/HIJACK_VS_KERNEL_PROXY.md` for the in-process vs kernel-proxy trade.
+
 ## Syscall marshaling — what's proxied
 
 `op_from_linux_sysno` (`crates/akuma-rump/src/syscall_translation.rs:49`)
@@ -160,6 +190,17 @@ isolated address space. Verdict from the experiment that built it: **native
 smoltcp is still faster per-syscall** (in-process call vs. a proxy
 round-trip), but rump-local closed the gap from ~10× to ~1.5× native on real
 HTTPS workloads once the secondary's scheduler tick was tightened to 1 ms.
+
+> **Caveat (2026-07-19): treat that ~1.5× figure with suspicion.** It came from
+> the `smp` build, which has smoltcp compiled *in* and had a documented
+> `stack=rump`→native-smoltcp **fall-through bug** (later hardened so a rump box
+> can never fall through to native — see `archive/MULTIKERNEL_NETWORKING_EXPERIMENT.md`).
+> A measurement taken before/around that fix could be smoltcp wearing a rump label.
+> The clean, uncontaminated number
+> is the **single-core devbox A/B above** (rump-only, smoltcp compiled out, no
+> fall-through possible): **~8.7× on HTTP, ~6× on HTTPS**. Don't cite the
+> multikernel ~1.5× as the rump tax; the devbox A/B is ground truth.
+
 See [`smp.md`](smp.md) and `archive/MULTIKERNEL_NETWORKING_EXPERIMENT.md`
 for the full latency investigation (event-driven pipe wakeup, the
 `copy_to_user` lazy-page truncation bug, RX-DMA truncation on replicated
