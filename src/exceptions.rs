@@ -2030,7 +2030,21 @@ pub const fn is_aarch64_svc(instr: u32) -> bool {
 /// Synchronous exception handler from EL0 (user mode)
 /// Returns the syscall return value, or doesn't return if process exits
 #[unsafe(no_mangle)]
+/// Syscall / EL0-fault entry from the vector asm. Wraps the real handler with the
+/// Big Kernel Lock (real shared-kernel SMP): a thread executing kernel code on behalf
+/// of an EL0 trap holds the BKL for the whole excursion, so its shared-state access
+/// (process table, VFS, net, page tables) is serialized against other cores. No-op
+/// unless `cfg(kernel_smp_shared)` (see `akuma_exec::bkl`). The IRQ/scheduler path's
+/// BKL reconciliation is added in M2; here the syscall thread may still be preempted
+/// mid-excursion, which is correct on the single active core of M0/M1.
 extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
+    akuma_exec::bkl::enter_kernel();
+    let ret = rust_sync_el0_handler_inner(frame);
+    akuma_exec::bkl::leave_kernel();
+    ret
+}
+
+fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
     // Read ESR_EL1 to determine exception type
     let esr: u64;
     unsafe {

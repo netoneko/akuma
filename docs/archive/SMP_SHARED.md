@@ -73,14 +73,64 @@ yet. Harmless; addressed when the console is serialized (M1/M2).
 
 ---
 
-## M1 — Big Kernel Lock scaffolding (next)
+## M1 — Big Kernel Lock: primitive + syscall-path wiring ✅ (2026-07-19)
 
-Add a nesting-aware `KERNEL_LOCK` in `akuma-exec`, acquired on kernel entry and
-released around blocking/context-switch points, upgrading the pervasive
-`with_irqs_disabled` single-core invariant (esp. the 218+
-`lookup_process() -> &'static mut Process` sites) from "IRQs off" to "BKL held".
-Retire `ThreadPool.current_idx` as the current-thread source of truth. Not yet
-running two cores through the scheduler.
+**Goal:** introduce the BKL and take it on the hot syscall path, uncontended, without
+regressing the BSP — the foundation M3's process-table safety relies on.
+
+**The lock** (`crates/akuma-exec/src/sync.rs::KernelLock`): an **owner-tracked,
+idempotent** spinlock, *not* a counted/recursive one. Invariant: **held by a core iff
+that core is executing kernel code (EL1)**, reconciled at EL transitions rather than
+balanced. Because there is exactly one EL1→EL0 return per kernel excursion, there is
+exactly one release per excursion — so no per-thread lock depth has to travel across
+context switches (the trap that killed Linux's BKL simplicity). Idempotent
+acquire/release (re-acquiring what you hold, releasing what you don't — both no-ops)
+makes it robust against the non-lexical acquire/release that context switches create.
+6 host tests in sync.rs.
+
+**Why idempotent/binary works here:** the boundary map found (a) no synchronous
+context switch anywhere — every switch (yield/block/preempt) goes through the IRQ-
+vector SGI path; (b) the `eret` target EL is set by the *incoming* thread's restored
+SPSR, decoupled from which handler runs; (c) `sync_el0_handler` enables IRQs during the
+syscall. A counted lock would need per-thread depth save/restore across every switch; a
+binary "held iff in EL1" lock needs only reconciliation at EL crossings. The owner-CAS
+is atomic regardless of local IRQ state, so the lock is **IRQ-state-agnostic** — it can
+be driven from Rust, avoiding fragile edits to the exception assembly.
+
+**Global module** (`crates/akuma-exec/src/bkl.rs`): the one `KERNEL_LOCK` +
+`current_core_id()` (MPIDR aff0) + `enter_kernel`/`leave_kernel`/`reconcile_for_spsr`/
+`held_by_current`. Every function is a **zero-cost no-op unless `cfg(kernel_smp_shared)`**
+(the `smp-shared` feature, now forwarded to akuma-exec via its own build.rs, mirroring
+`extreme`). Default / size / extreme / multikernel builds are byte-for-byte unaffected.
+
+**Wiring (M1 scope = the syscall excursion only):**
+- `src/exceptions.rs::rust_sync_el0_handler` split into a thin BKL wrapper
+  (`enter_kernel` → inner → `leave_kernel`) around the renamed
+  `rust_sync_el0_handler_inner`. A thread servicing an EL0 trap (syscall or fault) holds
+  the BKL for the whole excursion, so its process-table / VFS / net / page-table access
+  is serialized against other cores.
+- `crates/akuma-exec/src/process/mod.rs::enter_user_mode` calls `leave_kernel` before
+  its `eret` — initial launch / execve drop to EL0 without returning through the wrapper.
+
+**Deferred to M2 (deliberately — needs cross-core contention to test):** the
+IRQ/scheduler context-switch reconciliation (`reconcile_for_spsr` at the switch, using
+the incoming thread's frame SPSR), idle-loop release-around-WFI, and kernel-thread BKL
+handling. On the single active core of M0/M1 a syscall thread may still be preempted
+mid-excursion; that is harmless here (idempotent ops, no contention) and becomes correct
+once M2 adds reconciliation. `ThreadPool.current_idx` retirement also deferred to M2
+(it's already a redundant mirror of `TPIDRRO_EL0`; low-value churn until the scheduler
+changes).
+
+**Verification** (`release-smp-shared`, SMP=2): BSP boots, the full boot suite runs
+through the BKL wrapper (futex + process tests), `smp_shared_cores_online PASSED`, and
+**zero `[BKL] stuck`** (no deadlock). Reaches the exact same pre-existing baseline
+(`test_mmap_file_oom` panic, unrelated) as M0 — no new regression. 6 KernelLock host
+tests pass; clippy clean on smp-shared + default + akuma-exec.
+
+**Files:** `crates/akuma-exec/src/sync.rs` (KernelLock + tests), `.../src/bkl.rs` (new),
+`.../src/lib.rs`, `.../Cargo.toml` + `.../build.rs` (smp-shared feature),
+`.../src/process/mod.rs` (enter_user_mode), `src/exceptions.rs` (syscall wrapper),
+`Cargo.toml` (forward smp-shared to akuma-exec).
 
 ## M2..M5 (planned)
 

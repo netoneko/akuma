@@ -590,6 +590,11 @@ impl Drop for Process {
 #[inline(never)]
 #[allow(dead_code)]
 pub unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
+    // Real shared-kernel SMP: this `eret` drops to EL0 without returning through the
+    // syscall wrapper (initial process launch / execve), so release the BKL here —
+    // otherwise it would stay held while running userspace. No-op unless
+    // `cfg(kernel_smp_shared)`.
+    crate::bkl::leave_kernel();
     // SAFETY: This inline asm sets up CPU state and ERETs to user mode.
     // x30 is pinned as the context pointer and loaded last to avoid corruption.
     unsafe {

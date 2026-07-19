@@ -8,6 +8,15 @@ fn main() {
     // still slurped whole binaries (e.g. the 723 KB tcc) into the kernel heap.
     println!("cargo::rustc-check-cfg=cfg(kernel_profile_size)");
     println!("cargo::rustc-check-cfg=cfg(kernel_profile_extreme)");
+    println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
+
+    // Real (shared-kernel) SMP, forwarded from the bin's `smp-shared` feature
+    // (smp-shared = ["akuma-exec/smp-shared"]). Emits the same cfg name the bin
+    // crate uses so the Big Kernel Lock code is uniform across crates.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMP_SHARED");
+    if std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok() {
+        println!("cargo:rustc-cfg=kernel_smp_shared");
+    }
     let size_profile = std::env::var("OPT_LEVEL").as_deref() == Ok("z");
     if size_profile {
         println!("cargo:rustc-cfg=kernel_profile_size");

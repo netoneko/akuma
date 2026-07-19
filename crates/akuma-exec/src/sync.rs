@@ -1,9 +1,143 @@
 //! Synchronization primitives for akuma-exec.
 //!
 //! Provides `RwSpinlock<T>` — a reader-writer spinlock built on `lock_api`
-//! with writer priority to prevent reader starvation.
+//! with writer priority to prevent reader starvation — and `KernelLock`, the
+//! recursive Big Kernel Lock used by real (shared-kernel) SMP.
 
 use core::sync::atomic::{AtomicU32, Ordering};
+
+/// The Big Kernel Lock (BKL) for real (shared-kernel) SMP — an **owner-tracked,
+/// idempotent** spinlock that serializes kernel execution across cores.
+///
+/// **Invariant:** the lock is held by a core **iff that core is executing kernel code
+/// (EL1).** It is *reconciled* at every EL transition rather than balanced like an
+/// ordinary lock: entry from EL0 acquires it; an `eret` back to EL0 releases it; a
+/// nested exception taken while already in EL1, and the `eret` back to EL1 from it,
+/// leave it held (the target is still EL1). Because there is exactly one EL1→EL0
+/// return per kernel excursion, there is exactly one release per excursion — no
+/// per-thread depth needs to travel across context switches. This upgrades the
+/// kernel's pervasive single-core `with_irqs_disabled` invariant (mutual exclusion on
+/// one core only) into a genuine cross-core one, so the ~218 legacy
+/// `lookup_process() -> &'static mut Process` sites become correct without per-site
+/// changes (docs/archive/SMP_SHARED.md, M1). Uncontended on a single-core build and in
+/// M0/M1 (secondaries parked).
+///
+/// **Contract:** all operations must run with local IRQs masked (exception entry, the
+/// eret epilogue, and `with_irqs_disabled` all guarantee this), so re-entrancy from a
+/// *local* interrupt is stack-ordered, never concurrent, on the owning core. Cross-core
+/// exclusion is the compare-exchange on `owner`. `acquire`/`release` are **idempotent**
+/// for the owner (re-acquiring what you hold, or releasing what you don't, is a no-op),
+/// which makes the reconciliation robust against the non-lexical acquire/release that
+/// context switches create.
+pub struct KernelLock {
+    /// `0` = free; otherwise `owner_core_aff0 + 1`. A CAS from `0` transfers ownership
+    /// between cores; the owner writes `0` back to release.
+    owner: AtomicU32,
+}
+
+impl Default for KernelLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KernelLock {
+    /// A free lock.
+    pub const fn new() -> Self {
+        Self {
+            owner: AtomicU32::new(0),
+        }
+    }
+
+    /// Ensure `core_id` (an MPIDR aff0) owns the lock, spinning until free if another
+    /// core holds it. Idempotent: a no-op if this core already owns it. Must run with
+    /// local IRQs masked (see the type contract).
+    #[inline]
+    pub fn acquire(&self, core_id: u32) {
+        let me = core_id + 1;
+        if self.owner.load(Ordering::Acquire) == me {
+            return;
+        }
+        let mut spins: u32 = 0;
+        while self
+            .owner
+            .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spins = spins.wrapping_add(1);
+            if spins == SPIN_WARN_THRESHOLD {
+                log_kernel_lock_stuck(self.owner.load(Ordering::Relaxed), me);
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Ensure `core_id` does not own the lock, freeing it for a waiting core.
+    /// Idempotent: a no-op if this core does not own it. Must run with local IRQs
+    /// masked by the current owner.
+    #[inline]
+    pub fn release(&self, core_id: u32) {
+        let me = core_id + 1;
+        // Only the owner may free it; releasing what you don't hold is a no-op (the
+        // reconciliation path can legitimately call this after a sibling core's
+        // excursion already moved the lock).
+        let _ = self
+            .owner
+            .compare_exchange(me, 0, Ordering::Release, Ordering::Relaxed);
+    }
+
+    /// Reconcile the lock to the EL this core is about to run in: acquire when
+    /// returning to / staying in EL1, release when returning to EL0. This is the
+    /// single operation the `eret` epilogues call, keeping the invariant "held iff in
+    /// EL1" true across context switches that change the target EL.
+    #[inline]
+    pub fn reconcile(&self, core_id: u32, target_is_el0: bool) {
+        if target_is_el0 {
+            self.release(core_id);
+        } else {
+            self.acquire(core_id);
+        }
+    }
+
+    /// `true` if `core_id` currently owns the lock.
+    #[inline]
+    pub fn held_by(&self, core_id: u32) -> bool {
+        self.owner.load(Ordering::Relaxed) == core_id + 1
+    }
+
+    /// `true` if any core owns the lock.
+    #[inline]
+    pub fn is_held(&self) -> bool {
+        self.owner.load(Ordering::Relaxed) != 0
+    }
+}
+
+/// Diagnostic: log when the Big Kernel Lock is stuck spinning (a cross-core deadlock
+/// canary). Stack-buffered to avoid heap use in an IRQ-masked context.
+fn log_kernel_lock_stuck(owner: u32, me: u32) {
+    use core::fmt::Write;
+    struct Buf([u8; 96], usize);
+    impl Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let b = s.as_bytes();
+            let n = b.len().min(96 - self.1);
+            self.0[self.1..self.1 + n].copy_from_slice(&b[..n]);
+            self.1 += n;
+            Ok(())
+        }
+    }
+    let mut buf = Buf([0u8; 96], 0);
+    let _ = writeln!(
+        buf,
+        "[BKL] stuck: owner={} waiter={} (core ids are aff0+1)",
+        owner, me
+    );
+    if buf.1 > 0 {
+        if let Ok(s) = core::str::from_utf8(&buf.0[..buf.1]) {
+            (crate::runtime::runtime().print_str)(s);
+        }
+    }
+}
 
 /// Raw reader-writer spinlock with writer priority.
 ///
@@ -323,5 +457,85 @@ mod tests {
 
         // After write releases, read should succeed
         assert!(lock.try_read().is_some());
+    }
+
+    // --- KernelLock (Big Kernel Lock) ---
+
+    #[test]
+    fn kernel_lock_acquire_release_single_core() {
+        let bkl = KernelLock::new();
+        assert!(!bkl.is_held());
+        assert!(!bkl.held_by(0));
+        bkl.acquire(0);
+        assert!(bkl.is_held());
+        assert!(bkl.held_by(0));
+        bkl.release(0);
+        assert!(!bkl.is_held());
+        assert!(!bkl.held_by(0));
+    }
+
+    #[test]
+    fn kernel_lock_acquire_is_idempotent_for_owner() {
+        let bkl = KernelLock::new();
+        bkl.acquire(2);
+        bkl.acquire(2); // nested (e.g. IRQ/fault while already in a syscall)
+        bkl.acquire(2);
+        assert!(bkl.held_by(2));
+        // A single release frees it — there is one EL1→EL0 return per excursion.
+        bkl.release(2);
+        assert!(!bkl.is_held());
+    }
+
+    #[test]
+    fn kernel_lock_release_by_non_owner_is_noop() {
+        let bkl = KernelLock::new();
+        bkl.acquire(1);
+        bkl.release(0); // core 0 doesn't own it
+        assert!(bkl.held_by(1), "non-owner release must not free the lock");
+        bkl.release(1);
+        assert!(!bkl.is_held());
+    }
+
+    #[test]
+    fn kernel_lock_ownership_transfers_between_cores() {
+        let bkl = KernelLock::new();
+        bkl.acquire(0);
+        assert!(bkl.held_by(0));
+        assert!(!bkl.held_by(1));
+        bkl.release(0);
+        // Now a different core can take it.
+        bkl.acquire(1);
+        assert!(bkl.held_by(1));
+        assert!(!bkl.held_by(0));
+        bkl.release(1);
+        assert!(!bkl.held_by(1));
+    }
+
+    #[test]
+    fn kernel_lock_reconcile_matches_target_el() {
+        let bkl = KernelLock::new();
+        // Entering / staying in EL1 acquires.
+        bkl.reconcile(0, /* target_is_el0 */ false);
+        assert!(bkl.held_by(0));
+        // Re-entering EL1 (nested) is idempotent.
+        bkl.reconcile(0, false);
+        assert!(bkl.held_by(0));
+        // Returning to EL0 releases.
+        bkl.reconcile(0, true);
+        assert!(!bkl.is_held());
+        // Returning to EL0 when already free is a no-op.
+        bkl.reconcile(0, true);
+        assert!(!bkl.is_held());
+    }
+
+    #[test]
+    fn kernel_lock_held_by_only_owner() {
+        let bkl = KernelLock::new();
+        bkl.acquire(3);
+        for other in [0u32, 1, 2, 4, 5] {
+            assert!(!bkl.held_by(other));
+        }
+        assert!(bkl.held_by(3));
+        bkl.release(3);
     }
 }

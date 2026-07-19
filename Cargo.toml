@@ -157,7 +157,7 @@ smp = ["dep:akuma-smp"]
 # kernel image, one PMM/heap, and one run queue under real cross-core locks.
 # Mutually exclusive with `smp` (build.rs enforces). See
 # docs/reference/subsystems/smp-shared.md and docs/archive/SMP_SHARED.md.
-smp-shared = []
+smp-shared = ["akuma-exec/smp-shared"]
 
 # Rump-kernel support: a raw L2 packet path so a userspace NetBSD rump TCP/IP
 # stack can send/receive Ethernet frames. Binds a SECOND virtio-net device

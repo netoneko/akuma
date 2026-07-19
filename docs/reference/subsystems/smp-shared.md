@@ -5,8 +5,8 @@ page-table set, one PMM/heap, one global run queue, real cross-core locking. Sou
 `src/smp_shared.rs`. Behind `cfg(kernel_smp_shared)` (the `smp-shared` feature, paired
 with the `release-smp-shared` profile); the default build compiles none of it.
 
-> **Stability: C (active development).** M0 only as of 2026-07-19. Progress log:
-> [`../../archive/SMP_SHARED.md`](../../archive/SMP_SHARED.md).
+> **Stability: C (active development).** M0 + M1 (partial) as of 2026-07-19. Progress
+> log: [`../../archive/SMP_SHARED.md`](../../archive/SMP_SHARED.md).
 
 This is the **inverse** of the multikernel ([`smp.md`](smp.md), `cfg(kernel_smp)`),
 which is share-nothing (one kernel per core, replicated `.data`/`.bss`, disjoint RAM
@@ -33,7 +33,12 @@ real SMP) — see `scripts/build_devbox_smoltcp.sh` and
   pervasive single-core invariant — `with_irqs_disabled` (IRQ masking) gives mutual
   exclusion only on one core; the worst offenders are the 218+
   `lookup_process() -> &'static mut Process` sites (`process/table.rs`,
-  `process/children.rs`) — from "IRQs off" to "BKL held" in one stroke.
+  `process/children.rs`) — from "IRQs off" to "BKL held" in one stroke. The lock
+  (`akuma_exec::sync::KernelLock`, driven via `akuma_exec::bkl`) is an owner-tracked,
+  idempotent spinlock: **held iff a core is in EL1**, reconciled at EL transitions, so
+  no per-thread depth crosses context switches. Zero-cost no-op unless
+  `cfg(kernel_smp_shared)`. M1 wires it on the syscall path (`rust_sync_el0_handler`
+  wrapper + `enter_user_mode`); the IRQ/scheduler reconciliation is M2.
 - **Single global run queue + lock**; each core's current thread is `TPIDRRO_EL0`
   (already per-core hardware). The single `ThreadPool.current_idx`/`round_robin_idx`
   do not generalize and are being retired.
@@ -60,8 +65,8 @@ Self-test: `process_tests.rs::test_smp_shared_cores_online` asserts online count
 | Milestone | State |
 |---|---|
 | M0 — cores online on shared kernel | ✅ SMP=2/4 verified |
-| M1 — Big Kernel Lock scaffolding | next |
-| M2 — shared scheduler (SGI/idle/TLB-IS/ASID) | planned |
+| M1 — BKL primitive + syscall-path wiring | ✅ BSP verified, no deadlock/regression |
+| M2 — shared scheduler (BKL reconcile at switch, idle, SGI/TLB-IS/ASID) | planned |
 | M3 — userspace on secondaries | planned |
 | M4 — migration + cross-core wakeups | planned |
 | M5 — fine-grained locking | planned |

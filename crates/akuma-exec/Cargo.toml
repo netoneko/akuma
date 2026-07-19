@@ -13,6 +13,12 @@ workspace = true
 # right-size kernel stacks for the extreme low-memory target. NOT a syscall gate.
 extreme = []
 
+# Real (shared-kernel) SMP, forwarded from the bin crate's `smp-shared` feature.
+# Lets this crate's build.rs emit `cfg(kernel_smp_shared)` so the Big Kernel Lock
+# (`bkl`) is active; with it off, `bkl` compiles to zero-overhead no-ops and the
+# default/other builds are unaffected. See docs/reference/subsystems/smp-shared.md.
+smp-shared = []
+
 [dependencies]
 spinning_top = "0.3"
 lock_api = "0.4"
