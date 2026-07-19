@@ -23,6 +23,72 @@ pub fn reset_contention_spins() {
     CONTENTION_SPINS.store(0, Ordering::Relaxed);
 }
 
+// --- BKL-hold profiler ---------------------------------------------------------
+// Attributes cross-core BKL wait to WHAT the holding core was doing, so we can see
+// which excursions (which syscall, faults, or the IRQ/scheduler path) cause peers to
+// wait — the lever for fine-graining past the coarse BKL. A waiter samples the current
+// owner core's "tag" once when it first observes contention and, on finally acquiring,
+// adds its accumulated spin count to that tag's bucket. Cheap: only the contended path
+// touches this; the uncontended fast path is unchanged.
+
+/// Max cores tracked by the profiler (matches the kernel's `MAX_CORES`).
+const PROFILE_MAX_CORES: usize = 8;
+/// Tag buckets: 0..=499 are syscall numbers (capped), 500 fault, 501 IRQ/scheduler,
+/// 511 unknown/idle. Sized to 512.
+const PROFILE_BUCKETS: usize = 512;
+/// Reserved tag values.
+pub const HOLD_TAG_FAULT: u64 = 500;
+pub const HOLD_TAG_IRQ: u64 = 501;
+pub const HOLD_TAG_UNKNOWN: u64 = 511;
+
+/// Master switch for the BKL-hold profiler. **Default off** so normal boot pays nothing:
+/// when on, `set_holder_tag` writes the shared `HOLDER_TAG` line on every kernel entry
+/// (cross-core false sharing) and waiters do an extra `WAIT_BY_HOLDER` add — enough to
+/// perturb timing-sensitive tests. A measurement enables it only around its window.
+static PROFILE_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Enable/disable the BKL-hold profiler (measurement windows only; default off).
+pub fn set_profiling(on: bool) {
+    PROFILE_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// A per-core tag padded to its own cache line, so `set_holder_tag` on every kernel
+/// entry never false-shares across cores (that traffic alone perturbs timing tests).
+#[repr(align(64))]
+struct CoreTag(AtomicU64);
+
+/// Per-core tag: what the core is doing while it holds (or last held) the BKL.
+static HOLDER_TAG: [CoreTag; PROFILE_MAX_CORES] =
+    [const { CoreTag(AtomicU64::new(HOLD_TAG_UNKNOWN)) }; PROFILE_MAX_CORES];
+/// Per-tag accumulated peer wait (spin iterations attributed to a holder doing `tag`).
+static WAIT_BY_HOLDER: [AtomicU64; PROFILE_BUCKETS] =
+    [const { AtomicU64::new(0) }; PROFILE_BUCKETS];
+
+/// Record what `core_id` is doing while in the kernel (holding the BKL). Called by the
+/// exception entry paths (syscall number / fault / IRQ) so waiters can attribute blame.
+#[inline]
+pub fn set_holder_tag(core_id: u32, tag: u64) {
+    if !PROFILE_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let c = core_id as usize;
+    if c < PROFILE_MAX_CORES {
+        HOLDER_TAG[c].0.store(tag.min((PROFILE_BUCKETS - 1) as u64), Ordering::Relaxed);
+    }
+}
+
+/// Read a tag bucket's accumulated peer-wait spins (for the profiler dump).
+pub fn wait_by_holder(tag: usize) -> u64 {
+    WAIT_BY_HOLDER.get(tag).map_or(0, |a| a.load(Ordering::Relaxed))
+}
+
+/// Reset the per-tag wait histogram (for a measurement window).
+pub fn reset_wait_by_holder() {
+    for a in &WAIT_BY_HOLDER {
+        a.store(0, Ordering::Relaxed);
+    }
+}
+
 /// The Big Kernel Lock (BKL) for real (shared-kernel) SMP — an **owner-tracked,
 /// idempotent** spinlock that serializes kernel execution across cores.
 ///
@@ -74,6 +140,9 @@ impl KernelLock {
         let me = core_id + 1;
         let mut spins: u32 = 0;
         let mut total_spins: u64 = 0;
+        // Profiler: the tag of the core that was blocking us, sampled once when we first
+        // observe contention (u64::MAX = not yet sampled).
+        let mut wait_tag: u64 = u64::MAX;
         loop {
             // Re-check ownership EVERY iteration, not just once up front. The syscall
             // path calls this with IRQs enabled, so a timer IRQ can nest mid-spin and
@@ -85,19 +154,37 @@ impl KernelLock {
             if cur == me {
                 return; // this core already owns it (possibly via a nested acquire)
             }
-            if cur == 0
-                && self
+            if cur == 0 {
+                if self
                     .owner
                     .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
-            {
-                // Accumulate this acquire's spin count once (a cross-core BKL-wait-time
-                // proxy for measuring contention; see `contention_spins`). One atomic
-                // add per acquire — the uncontended fast path adds nothing.
-                if total_spins > 0 {
-                    CONTENTION_SPINS.fetch_add(total_spins, Ordering::Relaxed);
+                {
+                    // Accumulate this acquire's spin count once (a cross-core BKL-wait-time
+                    // proxy; see `contention_spins`). One atomic add per acquire — the
+                    // uncontended fast path adds nothing.
+                    if total_spins > 0 {
+                        CONTENTION_SPINS.fetch_add(total_spins, Ordering::Relaxed);
+                        // Attribute the wait to whatever the blocking core was doing
+                        // (profiler only — gated so normal boot pays nothing).
+                        if PROFILE_ENABLED.load(Ordering::Relaxed) {
+                            let bucket = if wait_tag == u64::MAX {
+                                HOLD_TAG_UNKNOWN as usize
+                            } else {
+                                (wait_tag as usize).min(PROFILE_BUCKETS - 1)
+                            };
+                            WAIT_BY_HOLDER[bucket].fetch_add(total_spins, Ordering::Relaxed);
+                        }
+                    }
+                    return;
                 }
-                return;
+            } else if wait_tag == u64::MAX && PROFILE_ENABLED.load(Ordering::Relaxed) {
+                // First observed contention: sample the blocking owner core's tag
+                // (owner encodes core `cur - 1`). Profiler-only.
+                let owner_core = (cur - 1) as usize;
+                if owner_core < PROFILE_MAX_CORES {
+                    wait_tag = HOLDER_TAG[owner_core].0.load(Ordering::Relaxed);
+                }
             }
             spins = spins.wrapping_add(1);
             total_spins = total_spins.wrapping_add(1);

@@ -551,7 +551,38 @@ SMP=4 contention race (observed in the drop-**OFF** phase, so unrelated to 4a).
 `src/smp_shared.rs` (drop toggle), `crates/akuma-exec/src/sync.rs` (contention-spin
 counter), `src/process_tests.rs` (`test_smp_shared_fault_parallelism`).
 
-### M5b Stage 4b — reconcile-aware full flip (faults never hold BKL) — NEXT (scope under review)
+### M5b — BKL-hold profiler + the scheduler finding (2026-07-19)
+
+Retargeting per the 4a finding (self-test contention is scheduler/spawn-bound, not
+fault-bound), added a **BKL-hold profiler** to attribute cross-core BKL *wait* to what the
+*holding* core was doing. `crates/akuma-exec/src/sync.rs`: a per-core cache-line-padded
+`HOLDER_TAG` (`set_holder_tag`, called from the syscall / fault / IRQ entry paths with the
+syscall number / `HOLD_TAG_FAULT` / `HOLD_TAG_IRQ`) and a `WAIT_BY_HOLDER` histogram — a
+waiter samples the blocking owner's tag once on first contention and adds its spin count to
+that bucket on acquire. **Gated off by default** (`set_profiling`): its per-entry
+`HOLDER_TAG` write false-shared across cores and tipped the flaky `parallel_processes` test
+into a wedge; padding + the default-off gate fixed that (normal boot pays nothing;
+`test_smp_shared_fault_parallelism` enables it only for its window).
+
+**Finding (busybox ELF-fault storm, SMP=2, drop ON):** BKL wait by holder —
+**IRQ/scheduler ≈ 70 %** (4.7–6.8 M spins), **FAULT ≈ 20 %** (~1.6 M), syscalls the rest
+(<0.7 M). So the dominant cross-core BKL-hold under multi-process load is the
+**IRQ/scheduler path** (the scheduler runs under the BKL on every timer tick / SGI — M2a),
+not faults. That is the real lever for SMP contention and explains why fault-path work
+(4a/4b) can't move the scheduler/spawn-bound self-test `[BKL] stuck` count. The natural
+next milestone is a **run-queue lock split from the BKL** so scheduler decisions don't
+serialize against unrelated kernel work. (4a's fault win stands — it addresses the ~20 %
+FAULT slice; the ~33 % A/B from the cleaner profiler-off run vs ~6–8 % with profiling on
+reflects HVF measurement noise + the profiler perturbing timing.)
+
+**Files:** `crates/akuma-exec/src/sync.rs` (profiler + `set_profiling`), `src/exceptions.rs`
+(`set_holder_tag` at syscall/fault/IRQ entry), `src/process_tests.rs` (profiler dump).
+
+### M5b Stage 4b — reconcile-aware full flip (faults never hold BKL) — OPTIONAL/DEFERRED
+
+Superseded in priority by the scheduler finding above: with the IRQ/scheduler path holding
+~70 % of contended BKL time and faults ~20 %, splitting the run queue out of the BKL is the
+higher-leverage next step than making the last ~20 % of fault work BKL-free.
 
 Faults never take the BKL; use `as_lock` only, plus a fault-aware IRQ reconcile
 (per-thread "in-BKL-free-fault" flag so a timer tick releases rather than acquires the BKL

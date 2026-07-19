@@ -1469,6 +1469,8 @@ const IRQ_FRAME_SPSR_OFFSET: usize = 248;
 extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     akuma_exec::bkl::enter_kernel();
     #[cfg(kernel_smp_shared)]
+    akuma_exec::sync::set_holder_tag(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_IRQ);
+    #[cfg(kernel_smp_shared)]
     {
         // If this IRQ interrupted EL0, userspace was running on this core — count it
         // (captures pure compute loops that get timer-preempted, not just syscalls).
@@ -2109,6 +2111,10 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
             // System call - number in x8, args in x0-x5
             let frame_ref = unsafe { &*frame };
             let syscall_num = frame_ref.x8;
+            // BKL-hold profiler: tag this core's excursion with the syscall number so a
+            // waiting peer can attribute its BKL wait to this syscall (shared-kernel SMP).
+            #[cfg(kernel_smp_shared)]
+            akuma_exec::sync::set_holder_tag(akuma_exec::bkl::current_core_id(), syscall_num);
 
             // Stale-I-cache spurious-SVC guard (§7k.4 root cause). At an EC_SVC64
             // trap the hardware set ELR_EL1 to the instruction AFTER the svc, so
@@ -2501,6 +2507,8 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
             // Thread-group leader: mmap_regions and fault_mutex live on the leader Process
             // (CLONE_VM worker threads have their own Process slot but empty mmap_regions).
             let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
+            #[cfg(kernel_smp_shared)]
+            akuma_exec::sync::set_holder_tag(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_FAULT);
 
             // Translation/permission fault (ISS bits [5:2]) — try demand paging
             let fault_type = iss & 0x3C; // DFSC[5:2]
@@ -3146,6 +3154,8 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
             }
             let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
             let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
+            #[cfg(kernel_smp_shared)]
+            akuma_exec::sync::set_holder_tag(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_FAULT);
 
             let fault_type = iss & 0x3C;
             let is_translation_fault = fault_type == 0x04 || fault_type == 0x08;

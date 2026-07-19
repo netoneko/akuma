@@ -683,7 +683,7 @@ fn test_smp_shared_userspace() {
 /// in-tree way to observe the fault-path effect.
 #[cfg(kernel_smp_shared)]
 fn test_smp_shared_fault_parallelism() {
-    use akuma_exec::sync::{contention_spins, reset_contention_spins};
+    use akuma_exec::sync::{contention_spins, reset_contention_spins, reset_wait_by_holder, set_profiling};
     if crate::smp_shared::probed_core_count() <= 1 {
         console::print("[Test] smp_shared_fault_parallelism SKIPPED (single CPU)\n");
         return;
@@ -737,18 +737,44 @@ fn test_smp_shared_fault_parallelism() {
         contention_spins()
     };
 
+    // Profile which excursions cause the BKL wait during the storm. Profiling is OFF by
+    // default (its per-entry HOLDER_TAG writes false-share and perturb timing-sensitive
+    // tests); enable it only for this measurement window.
+    set_profiling(true);
+    reset_wait_by_holder();
     crate::smp_shared::set_fault_bkl_drop_enabled(false);
     let spins_off = run_phase();
     crate::smp_shared::set_fault_bkl_drop_enabled(true);
     let spins_on = run_phase();
-    // Restore the default (on) for the remainder of boot.
+    // Restore defaults for the remainder of boot.
     crate::smp_shared::set_fault_bkl_drop_enabled(true);
+    set_profiling(false);
 
     crate::safe_print!(
         224,
         "[Test] smp_shared_fault_parallelism: binary={} copies={} rounds={} BKL-spins drop_OFF={} drop_ON={}\n",
         path, copies, ROUNDS, spins_off, spins_on
     );
+    // BKL-hold profiler: which excursions made peers wait most (the fine-graining lever)?
+    {
+        use akuma_exec::sync::{wait_by_holder, HOLD_TAG_FAULT, HOLD_TAG_IRQ};
+        let mut top: alloc::vec::Vec<(usize, u64)> = (0..512usize)
+            .map(|t| (t, wait_by_holder(t)))
+            .filter(|&(_, w)| w > 0)
+            .collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+        console::print("[Test] fault_parallelism BKL-wait by holder (top excursions):\n");
+        for (tag, w) in top.iter().take(8) {
+            let label = if *tag as u64 == HOLD_TAG_FAULT {
+                "FAULT"
+            } else if *tag as u64 == HOLD_TAG_IRQ {
+                "IRQ/sched"
+            } else {
+                "syscall#"
+            };
+            crate::safe_print!(96, "    holder={} ({}) wait_spins={}\n", tag, label, w);
+        }
+    }
     if spins_on <= spins_off {
         crate::safe_print!(
             160,
