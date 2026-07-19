@@ -316,6 +316,35 @@ fn set_shared_vbar() {
 /// proof that threads execute across cores. Genuinely shared (not replicated).
 static CORES_SEEN: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
 
+/// Per-core count of EL0 traps (syscalls / user faults) serviced — the M3 proof that
+/// USERSPACE runs across cores. Bumped from the EL0 trap entry (`rust_sync_el0_handler`).
+static CORES_SEEN_USER: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
+
+/// Record that this core just took an EL0 trap (a user syscall or fault). Called from
+/// the syscall entry; an EL0 trap only originates from userspace, so a nonzero count on
+/// core N means a user process executed on core N.
+#[inline]
+pub fn record_el0_trap() {
+    let aff0 = (read_mpidr() & 0xff) as usize;
+    if aff0 < MAX_CORES {
+        CORES_SEEN_USER[aff0].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Number of cores that have serviced a user (EL0) trap (M3 self-test).
+pub fn cores_that_ran_userspace() -> usize {
+    CORES_SEEN_USER.iter().filter(|c| c.load(Ordering::Relaxed) > 0).count()
+}
+
+/// Per-core user-trap count (diagnostics / self-test).
+pub fn user_traps(core: usize) -> u64 {
+    if core < MAX_CORES {
+        CORES_SEEN_USER[core].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
 /// Demo worker (real shared-kernel SMP M2c): bump this core's counter, then SLEEP.
 /// Sleeping (rather than busy-looping) is essential — a kernel thread holds the Big
 /// Kernel Lock while it runs, so a never-sleeping worker would let one core monopolize

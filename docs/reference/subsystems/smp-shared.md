@@ -5,8 +5,8 @@ page-table set, one PMM/heap, one global run queue, real cross-core locking. Sou
 `src/smp_shared.rs`. Behind `cfg(kernel_smp_shared)` (the `smp-shared` feature, paired
 with the `release-smp-shared` profile); the default build compiles none of it.
 
-> **Stability: C (active development).** M0 + M1 (partial) as of 2026-07-19. Progress
-> log: [`../../archive/SMP_SHARED.md`](../../archive/SMP_SHARED.md).
+> **Stability: C (active development).** M0–M3 done as of 2026-07-19 (userspace runs
+> across cores). Progress log: [`../../archive/SMP_SHARED.md`](../../archive/SMP_SHARED.md).
 
 This is the **inverse** of the multikernel ([`smp.md`](smp.md), `cfg(kernel_smp)`),
 which is share-nothing (one kernel per core, replicated `.data`/`.bss`, disjoint RAM
@@ -42,9 +42,11 @@ real SMP) — see `scripts/build_devbox_smoltcp.sh` and
 - **Single global run queue + lock**; each core's current thread is `TPIDRRO_EL0`
   (already per-core hardware). The single `ThreadPool.current_idx`/`round_robin_idx`
   do not generalize and are being retired.
-- **TLB (M2):** switch the local `vmalle1`/`aside1`/`vaae1` flushes to inner-shareable
-  `...is` (hardware broadcast) and give each `UserAddressSpace` a real ASID (today all
-  use ASID 0) so shared address spaces don't alias cross-core.
+- **TLB (M3, done):** the page-table *modification* flushes (`flush_tlb_all`/`_asid`/
+  `_page`/`_range_all_asid`) broadcast over the inner-shareable domain (`...is`) under
+  `kernel_smp_shared`, so a user address space edited on one core is coherent on peers
+  running it. Real per-AS ASIDs are deferred (a perf optimization; all use ASID 0 today,
+  which is correct given private per-core TLBs + full local switch-flush + IS edits).
 
 ## Boot / bringup
 
@@ -74,7 +76,9 @@ they run on more than one core.
 | M2a — IRQ/scheduler-path BKL + eret reconcile | ✅ BSP verified |
 | M2b — SMP-safe scheduler: per-core idle | ✅ BSP verified |
 | M2c — secondaries run the shared scheduler | ✅ threads on 2 & 4 cores |
-| M3 — userspace on secondaries (+ TLB-IS, ASID) | next |
+| M3 — userspace on secondaries (+ inner-shareable TLB) | ✅ userspace on 2 & 4 cores |
+| M4 — migration + cross-core wakeups + hardening | next |
+| M5 — fine-grained locking (real ASIDs, split BKL) | planned |
 | M3 — userspace on secondaries | planned |
 | M4 — migration + cross-core wakeups | planned |
 | M5 — fine-grained locking | planned |

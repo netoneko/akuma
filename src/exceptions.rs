@@ -1468,6 +1468,20 @@ const IRQ_FRAME_SPSR_OFFSET: usize = 248;
 #[unsafe(no_mangle)]
 extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     akuma_exec::bkl::enter_kernel();
+    #[cfg(kernel_smp_shared)]
+    {
+        // If this IRQ interrupted EL0, userspace was running on this core — count it
+        // (captures pure compute loops that get timer-preempted, not just syscalls).
+        // SAFETY: `current_sp` is the live interrupted IRQ trap frame; SPSR at fixed off.
+        let cur_spsr = unsafe {
+            core::ptr::read_volatile((current_sp as usize + IRQ_FRAME_SPSR_OFFSET) as *const u64)
+        };
+        // SPSR.M[3:0] == 0 means the interrupted context was EL0t (userspace).
+        #[allow(clippy::verbose_bit_mask)]
+        if cur_spsr & 0xf == 0 {
+            crate::smp_shared::record_el0_trap();
+        }
+    }
     let new_sp = rust_irq_handler_inner(current_sp);
     #[cfg(kernel_smp_shared)]
     {
@@ -2071,6 +2085,10 @@ pub const fn is_aarch64_svc(instr: u32) -> bool {
 /// mid-excursion, which is correct on the single active core of M0/M1.
 extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
     akuma_exec::bkl::enter_kernel();
+    // Record that this core serviced a user (EL0) trap — the M3 cross-core-userspace
+    // proof (an EL0 trap only comes from userspace running on this core).
+    #[cfg(kernel_smp_shared)]
+    crate::smp_shared::record_el0_trap();
     let ret = rust_sync_el0_handler_inner(frame);
     akuma_exec::bkl::leave_kernel();
     ret

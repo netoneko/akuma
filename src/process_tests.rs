@@ -39,6 +39,10 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_smp_shared_scheduler();
 
+    // Real (shared-kernel) SMP M3: confirm USERSPACE processes run across cores.
+    #[cfg(kernel_smp_shared)]
+    test_smp_shared_userspace();
+
     // Net bounce-buffer OOM degradation (pure-fn boundaries + ample-mem alloc);
     // guards against the EC=0x3c kernel abort when an oversized socket buffer
     // can't grow the heap. No network stack required.
@@ -551,6 +555,73 @@ fn test_smp_shared_scheduler() {
             cores_ran,
             c0,
             c1
+        );
+    }
+}
+
+/// M3 boot self-test for real SMP: spawn two userspace processes and confirm they run
+/// across more than one core. Each `/bin/hello` loops printing with a delay — periodic
+/// syscalls (write/getpid/uptime) plus `sleep_ms` — so it both makes EL0 traps (counted
+/// per core) and yields the CPU (so it migrates). The BSP waits with yield+`idle_halt`
+/// so it releases the Big Kernel Lock and secondaries can pick the processes up. This is
+/// the payoff: userspace runs *concurrently* across cores (userspace holds no BKL).
+#[cfg(kernel_smp_shared)]
+fn test_smp_shared_userspace() {
+    if crate::smp_shared::probed_core_count() <= 1 {
+        console::print("[Test] smp_shared_userspace SKIPPED (single CPU; boot with SMP>1)\n");
+        return;
+    }
+    if crate::fs::read_file("/bin/hello").is_err() {
+        console::print("[Test] smp_shared_userspace SKIPPED (/bin/hello not on disk)\n");
+        return;
+    }
+
+    // 20 outputs, 80 ms apart ≈ 1.6 s of periodic syscalls + sleeps per process.
+    let args: [&str; 2] = ["20", "80"];
+    let mut chans: alloc::vec::Vec<alloc::sync::Arc<akuma_exec::process::ProcessChannel>> =
+        alloc::vec::Vec::new();
+    for _ in 0..2 {
+        match process::spawn_process_with_channel("/bin/hello", Some(&args), None) {
+            Ok((_tid, ch, _pid)) => chans.push(ch),
+            Err(e) => crate::safe_print!(96, "[Test] smp_shared_userspace: spawn failed: {}\n", e),
+        }
+    }
+    if chans.is_empty() {
+        console::print("[Test] smp_shared_userspace FAILED (could not spawn any process)\n");
+        return;
+    }
+
+    // Wait (bounded) for both to finish, idling so secondaries aren't BKL-starved.
+    let start = crate::timer::uptime_us();
+    loop {
+        if chans.iter().all(|c| c.has_exited()) {
+            break;
+        }
+        if crate::timer::uptime_us().saturating_sub(start) > 10_000_000 {
+            break;
+        }
+        akuma_exec::threading::yield_now();
+        akuma_exec::threading::idle_halt();
+    }
+
+    let cores_ran = crate::smp_shared::cores_that_ran_userspace();
+    let u0 = crate::smp_shared::user_traps(0);
+    let u1 = crate::smp_shared::user_traps(1);
+    if cores_ran >= 2 {
+        crate::safe_print!(
+            120,
+            "[Test] smp_shared_userspace PASSED (userspace ran on {} cores; core0={} core1={} EL0 traps)\n",
+            cores_ran,
+            u0,
+            u1
+        );
+    } else {
+        crate::safe_print!(
+            120,
+            "[Test] smp_shared_userspace FAILED (userspace on only {} core; core0={} core1={})\n",
+            cores_ran,
+            u0,
+            u1
         );
     }
 }

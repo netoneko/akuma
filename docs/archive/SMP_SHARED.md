@@ -228,7 +228,48 @@ all share the boot TTBR0, so the context switch's TTBR0 doesn't change and the l
 (`trigger_sgi_core`/`trigger_sgi_self` gates), `src/timer.rs` (self-SGI), `src/main.rs`
 (runtime `trigger_sgi`), `src/process_tests.rs` (`test_smp_shared_scheduler`).
 
-## M3..M5 (planned)
+## M3 — Userspace processes run across cores ✅ (2026-07-19)
+
+**Goal:** user processes execute on secondaries — the real payoff, since userspace holds
+no BKL, so this is *genuine* parallelism (unlike kernel threads, which the BKL serializes).
+
+**Cross-core TLB coherence** (the one real prerequisite). In M2c all kernel threads shared
+the boot TTBR0, so the context-switch's local `tlbi` sufficed. Once a *user* address space
+runs on core 1 while core 0 edits its page tables (demand-paging, fork/CoW, munmap), core
+0's core-local `tlbi` never reaches core 1 → stale TLB. Fix: under `cfg(kernel_smp_shared)`
+the modification flushes broadcast over the inner-shareable domain —
+`flush_tlb_all` → `vmalle1is`, `flush_tlb_asid` → `aside1is`, `flush_tlb_page` → `vaae1is`,
+`flush_tlb_range_all_asid` → `vaae1is` per page (`crates/akuma-exec/src/mmu/mod.rs`). Other
+builds keep the cheaper local form; the context-switch flush stays local (it only clears
+the switching core's own TLB). **ASIDs deferred** (still ASID 0 for all): correctness holds
+because per-core TLBs are private, the switch flushes the whole local TLB, and edits
+broadcast — verified with no faults. Real per-AS ASIDs remain a *performance* follow-up.
+
+**Instrumentation + demo.** `record_el0_trap` bumps a per-core counter on every EL0 trap —
+from the syscall entry (`rust_sync_el0_handler`) *and* from the IRQ path when the
+interrupted frame's SPSR shows EL0 (so a pure compute loop that only gets timer-preempted
+still counts). `test_smp_shared_userspace` spawns two `/bin/hello` processes (each loops
+printing with an 80 ms delay → periodic syscalls + `sleep_ms`, so it both traps and
+migrates), waits with yield+`idle_halt`, and asserts userspace ran on >1 core. A spawned
+process is a normal READY slot in the shared thread pool, so the shared scheduler places it
+on any core.
+
+**Verified:** SMP=2 "userspace ran on 2 cores (core0=600 core1=490 EL0 traps)"; SMP=4
+"userspace ran on 4 cores". Reaches the same pre-existing baseline (the unrelated
+`test_mmap_file_oom` panic) — no new fault from the IS-TLB change or cross-core userspace.
+~17 (SMP=2) / ~45 (SMP=4) transient BKL-contention warnings before that panic. clippy clean;
+114 host tests pass.
+
+**Note on process-table safety:** under the BKL a syscall on any core has exclusive kernel
+access, and a process isn't freed while its own thread is mid-syscall — so the ~218
+`lookup_process` sites remain sound cross-core here without the refcount rework (that's the
+M5 fine-graining, needed only when the BKL is split).
+
+**Files:** `crates/akuma-exec/src/mmu/mod.rs` (inner-shareable flushes),
+`src/smp_shared.rs` (`record_el0_trap` + user counters), `src/exceptions.rs` (count EL0
+traps from syscall + IRQ paths), `src/process_tests.rs` (`test_smp_shared_userspace`).
+
+## M4..M5 (planned)
 
 See the approved plan for the full roadmap: M2 shared scheduler (SMP-safe SGI handler,
 per-core idle, inner-shareable TLB flushes `...is`, real per-AS ASIDs, map all GICR

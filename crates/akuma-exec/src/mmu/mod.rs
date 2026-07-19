@@ -222,7 +222,20 @@ pub fn sync_icache_range(kva: usize, len: usize) {
     let _ = (kva, len);
 }
 
-#[cfg(target_os = "none")]
+// Real shared-kernel SMP: TLB maintenance that affects a shared/user address space must
+// reach EVERY core (a page-table edit on one core while another runs that space in EL0
+// would otherwise leave the peer with stale entries). The inner-shareable `...is`
+// variants broadcast the invalidation across the inner-shareable domain (all cores on
+// QEMU `virt`). Other builds keep the cheaper core-local form. The context-switch flush
+// (threading) stays local — it only needs to clear the switching core's own TLB.
+#[cfg(all(target_os = "none", kernel_smp_shared))]
+pub fn flush_tlb_all() {
+    unsafe {
+        core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb");
+    }
+}
+
+#[cfg(all(target_os = "none", not(kernel_smp_shared)))]
 pub fn flush_tlb_all() {
     unsafe {
         core::arch::asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
@@ -272,34 +285,40 @@ pub fn get_boot_ttbr0() -> u64 {
 #[cfg(not(target_os = "none"))]
 pub fn get_boot_ttbr0() -> u64 { 0 }
 
-#[cfg(target_os = "none")]
+// Inner-shareable under shared SMP (see `flush_tlb_all`).
+#[cfg(all(target_os = "none", kernel_smp_shared))]
 pub fn flush_tlb_asid(asid: u16) {
     unsafe {
         let asid_val = (asid as u64) << 48;
-        core::arch::asm!(
-            "dsb ishst",
-            "tlbi aside1, {}",
-            "dsb ish",
-            "isb",
-            in(reg) asid_val
-        );
+        core::arch::asm!("dsb ishst", "tlbi aside1is, {}", "dsb ish", "isb", in(reg) asid_val);
+    }
+}
+
+#[cfg(all(target_os = "none", not(kernel_smp_shared)))]
+pub fn flush_tlb_asid(asid: u16) {
+    unsafe {
+        let asid_val = (asid as u64) << 48;
+        core::arch::asm!("dsb ishst", "tlbi aside1, {}", "dsb ish", "isb", in(reg) asid_val);
     }
 }
 
 #[cfg(not(target_os = "none"))]
 pub fn flush_tlb_asid(_asid: u16) {}
 
-#[cfg(target_os = "none")]
+// Inner-shareable under shared SMP (see `flush_tlb_all`).
+#[cfg(all(target_os = "none", kernel_smp_shared))]
 pub fn flush_tlb_page(va: usize) {
     unsafe {
         let va_shifted = (va >> 12) as u64;
-        core::arch::asm!(
-            "dsb ishst",
-            "tlbi vaae1, {}",
-            "dsb ish",
-            "isb",
-            in(reg) va_shifted
-        );
+        core::arch::asm!("dsb ishst", "tlbi vaae1is, {}", "dsb ish", "isb", in(reg) va_shifted);
+    }
+}
+
+#[cfg(all(target_os = "none", not(kernel_smp_shared)))]
+pub fn flush_tlb_page(va: usize) {
+    unsafe {
+        let va_shifted = (va >> 12) as u64;
+        core::arch::asm!("dsb ishst", "tlbi vaae1, {}", "dsb ish", "isb", in(reg) va_shifted);
     }
 }
 
@@ -1251,7 +1270,20 @@ pub fn flush_tlb_range_all_asid(start_va: usize, pages: usize) {
         flush_tlb_all();
         return;
     }
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_os = "none", kernel_smp_shared))]
+    unsafe {
+        // Inner-shareable: a range unmapped on one core must invalidate peers running
+        // the same address space in EL0 (see `flush_tlb_all`).
+        core::arch::asm!("dsb ishst");
+        let mut va = start_va;
+        for _ in 0..pages {
+            core::arch::asm!("tlbi vaae1is, {}", in(reg) (va >> 12) as u64);
+            va += 0x1000;
+        }
+        core::arch::asm!("dsb ish");
+        core::arch::asm!("isb");
+    }
+    #[cfg(all(target_os = "none", not(kernel_smp_shared)))]
     unsafe {
         core::arch::asm!("dsb ishst");
         let mut va = start_va;
