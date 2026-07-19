@@ -88,9 +88,8 @@ pub fn exec_bkl_drop_enabled() -> bool {
     EXEC_BKL_DROP_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Enable/disable the execve ELF-read BKL-drop at runtime. Retained for A/B measurement;
-/// correctness is covered by the execve-heavy boot path plus the host BKL model harness.
-#[allow(dead_code)]
+/// Enable/disable the execve ELF-read BKL-drop at runtime. Used by the A/B measurement
+/// self-test `test_smp_shared_exec_parallelism`; also handy for interactive A/B.
 pub fn set_exec_bkl_drop_enabled(on: bool) {
     EXEC_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
 }

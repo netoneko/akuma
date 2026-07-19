@@ -52,6 +52,11 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_smp_shared_fault_parallelism();
 
+    // Real (shared-kernel) SMP M5c: A/B-measure whether dropping the BKL around execve's
+    // whole-file ELF read reduces cross-core BKL contention.
+    #[cfg(kernel_smp_shared)]
+    test_smp_shared_exec_parallelism();
+
     // Net bounce-buffer OOM degradation (pure-fn boundaries + ample-mem alloc);
     // guards against the EC=0x3c kernel abort when an oversized socket buffer
     // can't grow the heap. No network stack required.
@@ -789,6 +794,111 @@ fn test_smp_shared_fault_parallelism() {
         crate::safe_print!(
             192,
             "[Test] smp_shared_fault_parallelism PASSED (measured; drop ON did not lower spins here: +{} — expected on host-cached disk)\n",
+            spins_on.saturating_sub(spins_off)
+        );
+    }
+}
+
+/// Real (shared-kernel) SMP M5c: A/B-measure whether dropping the BKL around execve's
+/// whole-file ELF read (`do_execve`'s `fs::read_file`) reduces cross-core BKL contention.
+///
+/// Unlike the fault test, `spawn_process_with_channel` loads its ELF through the kernel
+/// loader, NOT `do_execve` — so to exercise the drop we need real userspace `execve`
+/// syscalls. We spawn shells that each `exec` the ~1 MB busybox a few times (absolute path,
+/// so no PATH lookup); each child `execve` hits the BKL-dropped whole-file read. Same
+/// SMP=2-only caveat as the fault test (a heavy spawn storm provokes the pre-existing SMP≥4
+/// race). This is a MEASUREMENT tool: it always "passes" as long as it runs to completion.
+#[cfg(kernel_smp_shared)]
+fn test_smp_shared_exec_parallelism() {
+    use akuma_exec::sync::{contention_spins, reset_contention_spins, reset_wait_by_holder, set_profiling};
+    if crate::smp_shared::probed_core_count() != 2 {
+        console::print("[Test] smp_shared_exec_parallelism SKIPPED (runs only at SMP=2)\n");
+        return;
+    }
+    // Need busybox (the binary the child execs) and a shell to drive the exec.
+    if crate::fs::read_file("/bin/busybox").is_err() {
+        console::print("[Test] smp_shared_exec_parallelism SKIPPED (no /bin/busybox)\n");
+        return;
+    }
+    let copies = crate::smp_shared::probed_core_count().min(4);
+    const ROUNDS: usize = 3;
+    // Each shell execs the ~1 MB busybox 3× (absolute path → no PATH dependency). Every
+    // child `execve` reads the whole binary through `do_execve`'s BKL-dropped read window.
+    let args: &[&str] = &["sh", "-c", "/bin/busybox true; /bin/busybox true; /bin/busybox true"];
+
+    let run_phase = || -> u64 {
+        reset_contention_spins();
+        for _ in 0..ROUNDS {
+            let mut chans: alloc::vec::Vec<alloc::sync::Arc<akuma_exec::process::ProcessChannel>> =
+                alloc::vec::Vec::new();
+            for _ in 0..copies {
+                if let Ok((_t, ch, _p)) =
+                    process::spawn_process_with_channel("/bin/busybox", Some(args), None)
+                {
+                    chans.push(ch);
+                }
+            }
+            let start = crate::timer::uptime_us();
+            loop {
+                if chans.iter().all(|c| c.has_exited()) {
+                    break;
+                }
+                if crate::timer::uptime_us().saturating_sub(start) > 5_000_000 {
+                    break;
+                }
+                akuma_exec::threading::yield_now();
+                akuma_exec::threading::idle_halt();
+            }
+        }
+        contention_spins()
+    };
+
+    set_profiling(true);
+    reset_wait_by_holder();
+    crate::smp_shared::set_exec_bkl_drop_enabled(false);
+    let spins_off = run_phase();
+    crate::smp_shared::set_exec_bkl_drop_enabled(true);
+    let spins_on = run_phase();
+    // Restore default for the remainder of boot.
+    crate::smp_shared::set_exec_bkl_drop_enabled(true);
+    set_profiling(false);
+
+    crate::safe_print!(
+        224,
+        "[Test] smp_shared_exec_parallelism: copies={} rounds={} BKL-spins drop_OFF={} drop_ON={}\n",
+        copies, ROUNDS, spins_off, spins_on
+    );
+    // Which excursions made peers wait? A visible `syscall#` holder means execve's own hold
+    // shows up (the window this drop targets); FAULT/IRQ dominance means the win is elsewhere.
+    {
+        use akuma_exec::sync::{wait_by_holder, HOLD_TAG_FAULT, HOLD_TAG_IRQ};
+        let mut top: alloc::vec::Vec<(usize, u64)> = (0..512usize)
+            .map(|t| (t, wait_by_holder(t)))
+            .filter(|&(_, w)| w > 0)
+            .collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+        console::print("[Test] exec_parallelism BKL-wait by holder (top excursions):\n");
+        for (tag, w) in top.iter().take(8) {
+            let label = if *tag as u64 == HOLD_TAG_FAULT {
+                "FAULT"
+            } else if *tag as u64 == HOLD_TAG_IRQ {
+                "IRQ/sched"
+            } else {
+                "syscall#"
+            };
+            crate::safe_print!(96, "    holder={} ({}) wait_spins={}\n", tag, label, w);
+        }
+    }
+    if spins_on <= spins_off {
+        crate::safe_print!(
+            160,
+            "[Test] smp_shared_exec_parallelism PASSED (BKL wait reduced by {} spins with drop ON)\n",
+            spins_off.saturating_sub(spins_on)
+        );
+    } else {
+        crate::safe_print!(
+            192,
+            "[Test] smp_shared_exec_parallelism PASSED (measured; drop ON did not lower spins here: +{} — expected on host-cached disk)\n",
             spins_on.saturating_sub(spins_off)
         );
     }
