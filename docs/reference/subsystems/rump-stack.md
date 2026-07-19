@@ -176,17 +176,27 @@ shared `rump_proxy.rs`/`sysproxy.rs` code paths this doc describes.
   syscall is uninterruptible (the channel read doesn't check pending
   signals), and the single `BoxProxy.client` slot means one wedged box proc
   blocks every other process sharing that box's stack.
-- **No push readiness for rump sockets.** Readiness is a `MSG_PEEK` sysproxy
-  round-trip; `epoll_check_fd_readiness` (`src/syscall/poll.rs`) registers **no
-  waker** for a `RumpSocket` (unlike `Stdin`), so poll re-probes every ~10 ms
-  instead of blocking on an event. A real lever for large downloads AND for
-  interactive keystroke latency: the sshd bridge spin-`try_read`s the socket
-  each loop iteration (~20 ms/probe) while waiting for the shell echo, and a
-  userspace attempt to gate that regressed hard (per-iteration probing is
-  load-bearing for input responsiveness — see `archive/RUMP_SYSPROXY_LATENCY_FIX.md`
-  Phase 3q). The real fix is push readiness: wire tap0-frame-arrival to wake
-  rump-socket poll waiters, then switch the bridge to a blocking `ppoll` on
-  `[ssh_sock, stdout]`. Kernel work; also benefits `curl`/`sic`.
+- **No push readiness for rump sockets — and the idle probes are load-bearing.**
+  Readiness is a `MSG_PEEK` sysproxy round-trip; `epoll_check_fd_readiness`
+  (`src/syscall/poll.rs`) registers **no waker** for a `RumpSocket` (unlike
+  `Stdin`), so poll re-probes every ~10 ms instead of blocking on an event, and
+  the sshd bridge spin-`try_read`s the socket each loop iteration (~20 ms/probe)
+  while waiting for the shell echo. This *looks* like pure waste but is not:
+  **those idle probes pump rump_server's tap RX.** NIC1 has no RX IRQ, so
+  rump only reads `/dev/net/tap0` when its cooperative fiber scheduler runs the
+  RX fiber — and each proxied recvfrom wakes rump_server over the sysproxy pipe,
+  which runs that fiber. A Phase 3a attempt to gate the probes behind a
+  tap-frame push signal (skip the round-trip when no frame arrived recently)
+  **stalled every interactive session**: with the probes gone, rump stopped
+  reading the tap (`tap_rx` advanced +4 frames/30 s vs ~25 baseline), so
+  readiness never advanced and every recv skipped forever. Measured with an
+  `ssh -tt` PTY harness: baseline 8/8 @ ~225 ms, gated 0/10 (total stall).
+  Reverted in full. **The real prerequisite is an autonomous kernel-side RX
+  pump** (kernel polls NIC1's RX ring in its net-poll loop and wakes rump's
+  tap-blocked RX thread), so RX no longer depends on userspace probe traffic;
+  only then is gating the probes (or a blocking-`ppoll` bridge) safe. Full
+  write-up: `archive/RUMP_SYSPROXY_LATENCY_FIX.md` Phase 3a; the pump is Phase
+  3a2 there.
 - **One rump per `/dev/net/tap0` per boot.** The NIC1 RX two-phase state
   machine isn't reset on close, so only one rump owner can hold the tap per
   boot.

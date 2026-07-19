@@ -991,6 +991,94 @@ Wire tap0-frame-arrival → wake rump-socket poll waiters, then switch the sshd
 bridge from spin-`try_read` to a blocking `ppoll` on `[ssh_sock, stdout]`. Kernel
 work, not a userspace tweak; also benefits `curl`/`sic`.
 
+## Phase 3a — push-readiness probe-gating ATTEMPTED and REVERTED: the idle probes pump rump RX (2026-07-19)
+
+Built the kernel half of the fix above and it **broke every interactive session** —
+a decisive negative that reshapes what "push readiness" has to mean here. Recorded
+in full so nobody rebuilds it the same way.
+
+### What was built
+
+A tap-RX *push signal* + a probe gate, entirely kernel-side, no userspace change:
+
+- `note_tap_rx()` (`src/rump_proxy.rs`), called from the `Tap` fd read path
+  (`sys_read`, `src/syscall/fs.rs` — the exact moment a frame is handed to
+  rump_server), bumped a generation counter `TAP_RX_GEN` + timestamp
+  `TAP_RX_LAST_US`.
+- A per-thread `ReadinessMemo`: a rump readiness probe (`recvfrom` MSG_DONTWAIT, or
+  `MSG_PEEK` in `rump_socket_readable`) was paid only when the generation had
+  advanced since the caller last drained this fd, or a frame landed within a
+  `RUMP_RX_PROBE_WINDOW_US` window. Otherwise the cheap EAGAIN / not-readable was
+  returned with **no sysproxy round-trip**.
+- The intended win: an idle `recvfrom`/`poll` on a rump socket costs nothing, so the
+  sshd bridge's `try_read` spin (and curl/sic poll loops) stop burning a ~20 ms
+  round-trip per idle iteration while waiting for the shell echo.
+
+The pure gate decision was unit-tested (truth table) and a boot self-test added
+(`rump_tests.rs` T6). Kernel + devbox built clean; the gate logic itself was
+correct.
+
+### Measured (reliable `ssh -tt` PTY harness, 8–10 keystroke rounds)
+
+The paramiko `scripts/ssh_harness.py echo` path hangs against Akuma's sshd under
+paramiko 5.0.0 (hangs on **baseline** too — a harness/PTY-negotiation issue, not
+the kernel), so measurement used a direct `ssh -tt` pseudo-terminal that types
+`echo <marker>` and times the echo+run round trip. It matches the documented
+figures and is reliable both ways.
+
+| Build | interactive keystroke rounds |
+|---|---|
+| Baseline (no change) | **8/8 OK, ~225 ms median** |
+| Probe-gate, recv short-circuit ON | **0/10 — total stall** (4 s timeout every round, no shell banner) |
+| Probe-gate, recv short-circuit OFF (gate+signal compiled in, early-return disabled) | 8/8 OK, ~263 ms |
+
+The third row isolates the cause: with the *only* behavioural change (the
+early-return that skips the recvfrom) removed, interactive works again. The recv
+short-circuit is unambiguously the killer.
+
+### Root cause: the idle recvfroms are load-bearing — they pump rump_server's RX
+
+Diagnostic counters (`[push] tap_rx=… gen=… recv_skip=… recv_probe=…`, printed from
+the heartbeat) told the story directly. During a stalled interactive session:
+`tap_rx` advanced **+4 frames over 30 s** (baseline reads ~25/session), while
+`recv_skip` climbed into the hundreds and `recv_probe` stayed ~2. rump_server's RX
+had **stopped reading the tap**.
+
+Why: NIC1 has **no RX IRQ** (Akuma's net is poll-based). rump_server only reads
+`/dev/net/tap0` when its cooperative single-OS-thread fiber scheduler runs the
+`tap-rx` fiber — and what kept that scheduler running frequently enough was the
+**bridge's own stream of recvfroms**: each proxied `recvfrom` writes the sysproxy
+request to the kernel→server pipe, wakes rump_server (pipe waker + directed
+hand-off), and in servicing it rump_server runs its whole fiber round — including
+the RX fiber that polls the tap. Kill the idle recvfroms and rump_server is no
+longer poked; its RX fiber polls the tap only on its own timer cadence, which
+Phase 3f/3l already showed loses the round-robin to `rumpclk0` most of the time.
+Result: incoming frames pile up unread → `TAP_RX_GEN` never advances → the gate
+returns cheap EAGAIN forever → the socket never delivers the keystroke → the shell
+never echoes → deadlock (and, once wedged, the box's single serialized client slot
+poisons every other proc — the "one wedged box proc blocks the box" limitation).
+
+This is the same shape as the reverted userspace EAGAIN fix above: **per-iteration
+rump probing is load-bearing** — there for input responsiveness (that attempt) AND
+for pumping RX itself (this one). The poll-gate half (`rump_socket_readable`) has
+the identical flaw for `curl`/`sic`: a client blocked in `poll` waiting for a
+response it already requested would stop issuing the recvfroms that pump the RX of
+the very response it's waiting for.
+
+### Consequence for the fix direction (sharpened)
+
+"Wire tap0-arrival → wake poll waiters, then blocking `ppoll`" is **not
+sufficient**, and neither is any scheme that *reduces the frequency of
+rump-poking syscalls*, because those syscalls are the RX pump. The prerequisite is
+an **autonomous, kernel-side RX pump for rump**: the kernel must poll NIC1's RX
+ring itself (in its timer/net-poll loop) and wake rump_server's tap-blocked RX
+thread on arrival — so RX progress no longer depends on userspace probe traffic.
+Only *then* is it safe to gate the probes (or move the bridge to a blocking
+`ppoll`). That pump is the Phase 3a2 work below (kernel NIC1 RX handling), now
+promoted from "nice to have" to **the actual blocker** for push readiness. The
+probe-gate code was reverted in full (no toggle left behind — it is unsafe on a
+load-bearing path, not merely a tuning miss).
+
 ### Note: smoltcp floor is a separate, analogous issue
 
 The 37.8 ms smoltcp keystroke floor does NOT go through rump/sysproxy, so Tier 1
@@ -1000,9 +1088,15 @@ net-poll loop — a separate follow-up with the same harness.
 
 ## Future work (Phase 3, not started)
 
-- **Phase 3a2**: A genuine push wake for tap RX would require NIC1 GIC
-  interrupt handling (none exists today — see Phase 3a above); only worth it
-  if 1 ms is still measurably too coarse after 3a.
+- **Phase 3a2 (now the blocker for push readiness, not optional)**: an
+  autonomous kernel-side RX pump for rump. Phase 3a proved the userspace probe
+  traffic is what currently pumps rump's tap RX, so push readiness is impossible
+  until RX progresses without it. Two shapes: (a) kernel polls NIC1's RX ring in
+  its own timer/net-poll loop and wakes rump_server's tap-blocked RX thread on
+  arrival (no new IRQ needed — reuses the existing poll-based net model); or
+  (b) a genuine NIC1 GIC RX interrupt (more invasive, none exists today). Either
+  makes RX independent of userspace probes; only then does gating the probes
+  (Phase 3a) or a blocking-`ppoll` bridge become safe.
 - **Phase 3c**: Port `rumpcomp_tap.c` (241 lines, C-ABI to NetBSD
   `librumpnet_virtif`) to Rust for parity and maintainability.
 - **Phase 3d**: Per-socket wakers (conditional wake instead of broadcast) to
