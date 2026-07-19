@@ -82,7 +82,7 @@ they run on more than one core.
 | M5a — network SMP-safety, devbox boots to sshd under SMP | ✅ SMP=2 clean, SMP=4 works |
 | M5b — BKL-free user page-fault path (per-AS `as_lock`) | ✅ Stages 1–3 + 4a: fault PTE edits under `as_lock`, file read/install split, **file-fault block I/O runs BKL-dropped** (A/B measured a BKL-wait reduction on a busybox ELF-fault storm). 4b (full flip) deferred |
 | M5b BKL-hold profiler | ✅ Gated (`set_profiling`, default off). **Finding: IRQ/scheduler ≈70 % of contended BKL time, faults ≈20 %** under multi-process load |
-| M5c — split the run-queue lock out of the BKL | planned (the scheduler is now the dominant BKL-hold — highest-leverage next step) |
+| M5c — split the run-queue lock out of the BKL | 🚧 Step 1 (POOL covers the whole context switch — switch atomic on POOL alone) done + verified SMP=2/4. Step 2 (scheduler runs BKL-free on EL0 preemption) implemented but **gated off** — hangs a process at SMP≥4, under investigation |
 | M5 — fine-grained locking (real ASIDs, split BKL, cross-core wakeup) | in progress (see M5b) |
 
 > **Known open item:** the *full devbox-smoltcp boot to sshd* stalls under active

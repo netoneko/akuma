@@ -17,6 +17,7 @@ Start from the symptom or task on the left.
 | Debugging OOM / panics / allocation failures | [`debug-memory-oom.md`](debug-memory-oom.md) |
 | Debugging an EL1 crash / data abort / unhandled exception | [`debug-exceptions.md`](debug-exceptions.md) |
 | Debugging a boot hang | [`debug-boot-hang.md`](debug-boot-hang.md) |
+| Debugging shared-kernel SMP (BKL deadlock/contention, profiler) | [`debug-smp.md`](debug-smp.md) |
 | Debugging SSH latency / echo / terminal sizing | [`debug-ssh-latency.md`](debug-ssh-latency.md) |
 | Self-hosting (compiling the kernel inside Akuma) | [`selfhost-kernel-build.md`](selfhost-kernel-build.md) |
 | Adding an apk package to the devbox | [`add-apk-package.md`](add-apk-package.md) |

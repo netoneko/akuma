@@ -1467,24 +1467,70 @@ const IRQ_FRAME_SPSR_OFFSET: usize = 248;
 /// switch, is the *incoming* thread's frame. No-op unless `cfg(kernel_smp_shared)`.
 #[unsafe(no_mangle)]
 extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
-    akuma_exec::bkl::enter_kernel();
+    // Under shared SMP, read the interrupted frame's SPSR up front: SPSR.M[3:0]==0 means
+    // we preempted EL0 (userspace), where this core holds NO BKL (the invariant is "held
+    // iff in EL1"). That is exactly the case where the scheduler SGI can run BKL-FREE
+    // (M5c) — the switch is made atomic by POOL alone, so peer cores' timer ticks no
+    // longer serialize on the BKL. A scheduler SGI that preempted EL1 (a syscall/fault
+    // holding the BKL) must keep it — releasing would expose the interrupted excursion's
+    // shared state to peers.
     #[cfg(kernel_smp_shared)]
-    akuma_exec::sync::set_holder_tag(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_IRQ);
-    #[cfg(kernel_smp_shared)]
-    {
-        // If this IRQ interrupted EL0, userspace was running on this core — count it
-        // (captures pure compute loops that get timer-preempted, not just syscalls).
+    #[allow(clippy::verbose_bit_mask)]
+    let interrupted_el0 = {
         // SAFETY: `current_sp` is the live interrupted IRQ trap frame; SPSR at fixed off.
         let cur_spsr = unsafe {
             core::ptr::read_volatile((current_sp as usize + IRQ_FRAME_SPSR_OFFSET) as *const u64)
         };
-        // SPSR.M[3:0] == 0 means the interrupted context was EL0t (userspace).
-        #[allow(clippy::verbose_bit_mask)]
-        if cur_spsr & 0xf == 0 {
-            crate::smp_shared::record_el0_trap();
-        }
+        // SPSR.M[3:0] == 0 ⇒ interrupted context was EL0t (userspace).
+        (cur_spsr & 0xf) == 0
+    };
+    // If this IRQ interrupted EL0, userspace was running on this core — count it (captures
+    // pure compute loops that only get timer-preempted, not just syscalls).
+    #[cfg(kernel_smp_shared)]
+    if interrupted_el0 {
+        crate::smp_shared::record_el0_trap();
     }
-    let new_sp = rust_irq_handler_inner(current_sp);
+
+    // Acknowledge the IRQ once, up front (the GIC IAR read needs no BKL).
+    let irq_opt = crate::gic::acknowledge_irq();
+
+    // BKL-free fast path (M5c): a scheduler SGI that preempted EL0. This core held no BKL,
+    // and `sgi_scheduler_handler_with_sp` makes the switch atomic on POOL. Reconcile at
+    // the end (re)acquires the BKL only if the thread we resume into is EL1.
+    #[cfg(kernel_smp_shared)]
+    if interrupted_el0
+        && crate::smp_shared::sched_bklfree_el0_enabled()
+        && matches!(irq_opt, Some(i) if i == crate::gic::SGI_SCHEDULER)
+    {
+        let new_sp =
+            akuma_exec::threading::sgi_scheduler_handler_with_sp(crate::gic::SGI_SCHEDULER, current_sp);
+        let final_sp = if new_sp != 0 { new_sp } else { current_sp };
+        // SAFETY: `final_sp` is a live IRQ trap frame; SPSR sits at a fixed offset.
+        let spsr = unsafe {
+            core::ptr::read_volatile((final_sp as usize + IRQ_FRAME_SPSR_OFFSET) as *const u64)
+        };
+        akuma_exec::bkl::reconcile_for_spsr(spsr);
+        return new_sp;
+    }
+
+    // Device IRQ, or a scheduler SGI that preempted EL1 (BKL held): run holding the BKL.
+    akuma_exec::bkl::enter_kernel();
+    #[cfg(kernel_smp_shared)]
+    akuma_exec::sync::set_holder_tag(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_IRQ);
+
+    let new_sp = if let Some(irq) = irq_opt {
+        if irq == crate::gic::SGI_SCHEDULER {
+            akuma_exec::threading::sgi_scheduler_handler_with_sp(irq, current_sp)
+        } else {
+            // Normal device IRQ: dispatch then EOI.
+            crate::irq::dispatch_irq(irq);
+            crate::gic::end_of_interrupt(irq);
+            0
+        }
+    } else {
+        0
+    };
+
     #[cfg(kernel_smp_shared)]
     {
         // The asm erets into `new_sp`'s frame after a switch, else the interrupted
@@ -1497,24 +1543,6 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
         akuma_exec::bkl::reconcile_for_spsr(spsr);
     }
     new_sp
-}
-
-#[inline]
-fn rust_irq_handler_inner(current_sp: u64) -> u64 {
-    // Acknowledge the interrupt and get IRQ number
-    let irq_opt = crate::gic::acknowledge_irq();
-
-    if let Some(irq) = irq_opt {
-        // Special handling for scheduler SGI
-        if irq == crate::gic::SGI_SCHEDULER {
-            // Returns new SP if switch needed, or 0 if not
-            return akuma_exec::threading::sgi_scheduler_handler_with_sp(irq, current_sp);
-        }
-        // Normal IRQs: call handler then EOI
-        crate::irq::dispatch_irq(irq);
-        crate::gic::end_of_interrupt(irq);
-    }
-    0  // No context switch
 }
 
 /// Landing pad for EL1 fault recovery.

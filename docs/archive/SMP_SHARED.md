@@ -584,6 +584,38 @@ Superseded in priority by the scheduler finding above: with the IRQ/scheduler pa
 ~70 % of contended BKL time and faults ~20 %, splitting the run queue out of the BKL is the
 higher-leverage next step than making the last ~20 % of fault work BKL-free.
 
+## M5c — run-queue lock split from the BKL (2026-07-19)
+
+Acts on the profiler finding (scheduler = dominant BKL-hold). Two steps:
+
+**Step 1 — POOL covers the whole context switch ✅.** `sgi_scheduler_handler_with_sp` used
+`POOL.try_lock()` only for the scheduling *decision*, then released POOL and did the context
+save/load under the BKL. But `commit_switch` marks the outgoing thread READY (pickable by a
+peer) inside the decision — so the outgoing SP/TTBR0 must be saved before POOL is released,
+or a peer could pick a stale context. The BKL provided that atomicity (M2a); now **POOL is
+held across the entire switch** (decision + save + new-thread load), so the switch is atomic
+on POOL alone. This is the prerequisite for taking the BKL off the scheduler. Safe (POOL held
+a bit longer, BKL still held) — verified SMP=2 all tests + SMP=4 all `smp_shared_*` pass.
+
+**Step 2 — BKL-free scheduler on EL0 preemption 🚧 (implemented, gated OFF).** When a timer
+SGI preempts **EL0** (userspace), this core holds NO BKL (invariant: held iff in EL1), so the
+scheduler can run BKL-free — POOL makes the switch atomic and the IRQ reconcile (re)acquires
+the BKL only if the resumed thread is EL1. `rust_irq_handler_with_sp` was restructured to
+acknowledge up front, read the interrupted SPSR, and take a BKL-free path for an EL0-preempt
+scheduler SGI (device IRQs and EL1-preempt SGIs keep the BKL). **Correct at SMP=2** (full
+suite passes), but at **SMP≥4** the resulting concurrent schedulers hang a process
+(`parallel_processes` "P1 done: false" after ~38 s) — a scheduling bug in the concurrent
+BKL-free-scheduler / reconcile interaction, not yet root-caused. So step 2 is **gated off by
+default** (`smp_shared::set_sched_bklfree_el0_enabled`, default false); the code is retained
+for A/B debugging. Note: `test_smp_shared_fault_parallelism` is now gated to SMP=2 only (its
+busybox spawn-storm provokes the pre-existing SMP≥4 race and would halt the boot suite).
+
+**Status:** step 1 shipped + verified; step 2 needs the SMP≥4 hang debugged before enabling
+(gdb the concurrent-scheduler path; likely a lost wakeup or a reconcile-vs-switch race when
+two cores schedule BKL-free at once). **Files:** `crates/akuma-exec/src/threading/mod.rs`
+(POOL over switch), `src/exceptions.rs` (`rust_irq_handler_with_sp` restructure), `src/smp_shared.rs`
+(step-2 toggle). Profiler + `debug-smp.md` runbook added alongside.
+
 Faults never take the BKL; use `as_lock` only, plus a fault-aware IRQ reconcile
 (per-thread "in-BKL-free-fault" flag so a timer tick releases rather than acquires the BKL
 for a faulting thread). Highest-risk change in M5b (touches the M2a reconcile path). Note

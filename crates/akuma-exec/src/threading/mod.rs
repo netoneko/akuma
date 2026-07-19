@@ -2432,46 +2432,50 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
         safe_print!(64, "[SGI-DBG] entry voluntary={}\n", voluntary);
     }
     
-    // Get scheduling decision
-    let switch_info = {
-        if debug { (runtime().print_str)("[SGI-DBG] acquiring POOL\n"); }
-        // Use try_lock instead of a blocking lock(): this handler runs from the
-        // timer-driven SGI in IRQ context (PSTATE.I masked). If the timer
-        // interrupted the current thread while it already held POOL (e.g.
-        // mid-syscall or mid-fault), a blocking lock() would spin forever with
-        // IRQs masked — freezing the entire box (timer stops firing, no further
-        // IRQs land). Skipping one best-effort preemption tick is harmless: the
-        // next tick retries. See docs/RUST_TOOLCHAIN_ISSUES.md §3.
-        let mut pool = match POOL.try_lock() {
-            Some(guard) => guard,
-            None => {
-                static SGI_POOL_SKIP: AtomicU64 = AtomicU64::new(0);
-                let n = SGI_POOL_SKIP.fetch_add(1, Ordering::Relaxed);
-                if n.is_multiple_of(1000) {
-                    let tid = current_thread_id();
-                    safe_print!(96, "[SGI] POOL contended, skipped {} ticks (tid={})\n", n, tid);
-                }
-                return 0;
+    // Get scheduling decision. Use try_lock instead of a blocking lock(): this handler
+    // runs from the timer-driven SGI in IRQ context (PSTATE.I masked). If the timer
+    // interrupted the current thread while it already held POOL (e.g. mid-syscall or
+    // mid-fault), a blocking lock() would spin forever with IRQs masked — freezing the
+    // box. Skipping one best-effort preemption tick is harmless: the next tick retries.
+    // See docs/RUST_TOOLCHAIN_ISSUES.md §3.
+    //
+    // M5c: `pool` is held across the ENTIRE switch below (decision + context save +
+    // new-thread load), not just the decision. `schedule_indices`/`commit_switch` mark
+    // the outgoing thread READY (pickable by a peer core) — so the outgoing context MUST
+    // be saved before POOL is released, or a peer could pick it and restore a stale SP.
+    // The Big Kernel Lock provided that atomicity before; holding POOL across the whole
+    // switch makes it hold on POOL alone, so the scheduler SGI no longer needs the BKL.
+    if debug { (runtime().print_str)("[SGI-DBG] acquiring POOL\n"); }
+    let mut pool = match POOL.try_lock() {
+        Some(guard) => guard,
+        None => {
+            static SGI_POOL_SKIP: AtomicU64 = AtomicU64::new(0);
+            let n = SGI_POOL_SKIP.fetch_add(1, Ordering::Relaxed);
+            if n.is_multiple_of(1000) {
+                let tid = current_thread_id();
+                safe_print!(96, "[SGI] POOL contended, skipped {} ticks (tid={})\n", n, tid);
             }
-        };
-        if debug { (runtime().print_str)("[SGI-DBG] got POOL\n"); }
-        // Which core is scheduling — selects this core's idle fallback. 0 on single-core.
-        let core_id = crate::bkl::current_core_id() as usize;
-        let result = pool.schedule_indices(voluntary, core_id).map(|(old_idx, new_idx)| {
-            let new_tpidr = pool.slots[new_idx].exception_stack_top;
-            (old_idx, new_idx, new_tpidr)
-        });
-        if debug {
-            if result.is_some() {
-                (runtime().print_str)("[SGI-DBG] schedule_indices returned Some\n");
-            } else {
-                (runtime().print_str)("[SGI-DBG] schedule_indices returned None!\n");
-            }
+            return 0;
         }
-        result
     };
-    
+    if debug { (runtime().print_str)("[SGI-DBG] got POOL\n"); }
+    // Which core is scheduling — selects this core's idle fallback. 0 on single-core.
+    let core_id = crate::bkl::current_core_id() as usize;
+    let switch_info = pool.schedule_indices(voluntary, core_id).map(|(old_idx, new_idx)| {
+        let new_tpidr = pool.slots[new_idx].exception_stack_top;
+        (old_idx, new_idx, new_tpidr)
+    });
+    if debug {
+        if switch_info.is_some() {
+            (runtime().print_str)("[SGI-DBG] schedule_indices returned Some\n");
+        } else {
+            (runtime().print_str)("[SGI-DBG] schedule_indices returned None!\n");
+        }
+    }
+
     if let Some((old_idx, new_idx, new_tpidr)) = switch_info {
+        // `pool` is still locked here and stays locked until this function returns —
+        // covering the context save/load so the switch is atomic on POOL alone.
         if debug || config().enable_sgi_debug_prints {
             safe_print!(64, "[SGI-DBG] switching {} -> {}\n", old_idx, new_idx);
         }

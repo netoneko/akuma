@@ -74,6 +74,27 @@ pub fn set_fault_bkl_drop_enabled(on: bool) {
     FAULT_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
 }
 
+/// Runtime toggle (default **off**) for the M5c optimization: run the scheduler SGI
+/// BKL-free when it preempted EL0 (userspace, no BKL held), so peer cores' timer ticks
+/// don't serialize on the BKL. Correct at SMP=2, but at SMP≥4 the resulting concurrent
+/// schedulers currently hang a process (`parallel_processes` "P1 done: false") — under
+/// investigation — so it is disabled by default until debugged. The POOL-over-switch
+/// foundation (step 1) is always active and makes this safe to flip once fixed.
+static SCHED_BKLFREE_EL0_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the BKL-free EL0-preempt scheduler path (M5c step 2) is enabled.
+#[inline]
+pub fn sched_bklfree_el0_enabled() -> bool {
+    SCHED_BKLFREE_EL0_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Enable/disable the BKL-free EL0-preempt scheduler path (M5c step 2). Default off.
+/// Retained for A/B debugging of the SMP≥4 hang; not yet wired to any enabler.
+#[allow(dead_code)]
+pub fn set_sched_bklfree_el0_enabled(on: bool) {
+    SCHED_BKLFREE_EL0_ENABLED.store(on, Ordering::Relaxed);
+}
+
 /// Mark this core idle/busy in [`CORE_IDLE_MASK`] (called around the idle WFI).
 #[inline]
 fn set_core_idle(core: usize, idle: bool) {
