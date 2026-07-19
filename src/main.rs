@@ -426,6 +426,13 @@ pub(crate) fn build_exec_runtime(
         disable_irqs: irq::disable_irqs,
         enable_irqs: irq::enable_irqs,
         end_of_interrupt: gic::end_of_interrupt,
+        // Real shared-kernel SMP: voluntary reschedules (yield_now / schedule_blocking)
+        // must ring THIS core's scheduler SGI, not the hardcoded PE0 that `trigger_sgi`
+        // targets — otherwise a secondary's yield/block pokes the BSP and never
+        // reschedules itself. On the BSP (aff0 = 0) `trigger_sgi_self` is equivalent.
+        #[cfg(kernel_smp_shared)]
+        trigger_sgi: gic::trigger_sgi_self,
+        #[cfg(not(kernel_smp_shared))]
         trigger_sgi: gic::trigger_sgi,
         alloc_page_zeroed: || pmm::alloc_page_zeroed(),
         alloc_page: || pmm::alloc_page(),

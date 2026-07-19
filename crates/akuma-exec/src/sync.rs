@@ -55,17 +55,29 @@ impl KernelLock {
     #[inline]
     pub fn acquire(&self, core_id: u32) {
         let me = core_id + 1;
-        if self.owner.load(Ordering::Acquire) == me {
-            return;
-        }
         let mut spins: u32 = 0;
-        while self
-            .owner
-            .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+        loop {
+            // Re-check ownership EVERY iteration, not just once up front. The syscall
+            // path calls this with IRQs enabled, so a timer IRQ can nest mid-spin and
+            // *its* `enter_kernel` may win the lock for THIS core; the outer spin must
+            // then observe `owner == me` and return, rather than retrying `CAS(0, me)`
+            // forever (which fails once owner is a nonzero `me`). This is the
+            // re-entrancy that produced the `owner=N waiter=N` self-deadlock.
+            let cur = self.owner.load(Ordering::Acquire);
+            if cur == me {
+                return; // this core already owns it (possibly via a nested acquire)
+            }
+            if cur == 0
+                && self
+                    .owner
+                    .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return;
+            }
             spins = spins.wrapping_add(1);
             if spins == SPIN_WARN_THRESHOLD {
+                spins = 0;
                 log_kernel_lock_stuck(self.owner.load(Ordering::Relaxed), me);
             }
             core::hint::spin_loop();

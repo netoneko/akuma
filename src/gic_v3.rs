@@ -220,6 +220,9 @@ pub fn end_of_interrupt(irq: u32) {
 }
 
 /// Trigger a Software Generated Interrupt to this CPU (affinity 0.0.0.0).
+// Unused under `kernel_smp_shared` (self-targets via `trigger_sgi_core`); kept for the
+// default/single-core and multikernel paths.
+#[allow(dead_code)]
 pub fn trigger_sgi(sgi_id: u32) {
     if sgi_id > 15 {
         return;
@@ -234,12 +237,13 @@ pub fn trigger_sgi(sgi_id: u32) {
 }
 
 /// Trigger an SGI on a SPECIFIC core, identified by its affinity-0 (`MPIDR & 0xff`).
-/// The multikernel doorbell (docs/MULTIKERNEL.md §7): unlike [`trigger_sgi`] (which
-/// hardcodes the target list to PE0), this targets one peer in cluster Aff1=0 by
-/// setting that PE's bit in the 16-bit TargetList. Valid for `aff0 < 16` (QEMU
-/// `virt` single cluster); larger affinities would need Aff1 routing. Only the
-/// `smp` build references it.
-#[cfg(kernel_smp)]
+/// Unlike [`trigger_sgi`] (which hardcodes the target list to PE0), this targets one
+/// peer in cluster Aff1=0 by setting that PE's bit in the 16-bit TargetList. Valid for
+/// `aff0 < 16` (QEMU `virt` single cluster); larger affinities would need Aff1 routing.
+/// Used by the multikernel doorbell (docs/MULTIKERNEL.md §7) and by real shared-kernel
+/// SMP for each core to ring its OWN scheduler SGI (the timer handler is shared, so it
+/// must self-target rather than hit PE0).
+#[cfg(any(kernel_smp, kernel_smp_shared))]
 pub fn trigger_sgi_core(target_aff0: u32, sgi_id: u32) {
     if sgi_id > 15 || target_aff0 >= 16 {
         return;

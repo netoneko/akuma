@@ -26,9 +26,12 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 /// comfortably under the `aff0 < 16` single-cluster limit on QEMU `virt`.
 const MAX_CORES: usize = 8;
 
-/// Per-core boot/park stack size shift (16 KiB). Ample for the M0 park path; a
-/// secondary switches to a real thread stack when it joins the scheduler (M2).
-const STACK_SHIFT: usize = 14;
+/// Per-core boot/idle stack size shift (64 KiB). This stack backs the secondary's
+/// idle thread, so it must hold the full IRQ excursion — the 832-byte trap frame plus
+/// the shared `timer_irq_handler` (kernel-timer alarm processing, preemption watchdog,
+/// logging) and the scheduler — which is far deeper than M0's WFE park. 16 KiB
+/// overflowed here (fault-in-fault while holding the BKL); 64 KiB is ample.
+const STACK_SHIFT: usize = 16;
 
 // PSCI (matches crate::smp — QEMU `virt` exposes PSCI over the DTB-declared conduit).
 const PSCI_CPU_ON: u64 = 0xC400_0003;
@@ -210,23 +213,210 @@ fn dsb_sy() {
     unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) }
 }
 
-/// Secondary-core Rust entry (M0). Runs on the SHARED boot page tables and the single
-/// shared PMM/heap. For now: announce online, then park in `WFE`. Later milestones
-/// replace the park with GIC/timer setup and joining the shared scheduler.
+// --- Per-PE GICv3 receive path (M2c) --------------------------------------------
+// The boot L1[0] block identity-maps device space, so a secondary on the shared boot
+// tables reaches its own redistributor at its physical address directly. Constants
+// mirror `crate::smp` (kept private here so the multikernel path stays untouched).
+const GICR_BASE: usize = 0x080A_0000;
+const GICR_STRIDE: usize = 0x2_0000;
+const GICR_SGI_OFFSET: usize = 0x1_0000;
+const GICR_WAKER: usize = 0x0014;
+const GICR_WAKER_PROCESSOR_SLEEP: u32 = 1 << 1;
+const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
+const GICR_SGI_IGROUPR0: usize = 0x0080;
+const GICR_SGI_ISENABLER0: usize = 0x0100;
+const GICR_SGI_IPRIORITYR: usize = 0x0400;
+/// EL1 virtual-timer PPI (the shared 10 ms scheduler tick) and the scheduler SGI
+/// (INTID 0), which each core rings at itself from the shared timer handler.
+const TIMER_PPI: u32 = 27;
+const SCHED_SGI: u32 = 0;
+
+/// ISV-safe single-register MMIO (no writeback/pair form — those assert under QEMU HVF;
+/// same reasoning as `gic_v3::mmio_w32`).
+fn mmio_w32(addr: usize, val: u32) {
+    // SAFETY: `addr` is a device-mapped GIC redistributor register.
+    unsafe {
+        core::arch::asm!("str {v:w}, [{a}]", v = in(reg) val, a = in(reg) addr,
+            options(nostack, preserves_flags));
+    }
+}
+fn mmio_r32(addr: usize) -> u32 {
+    let val: u32;
+    // SAFETY: `addr` is a device-mapped GIC redistributor register.
+    unsafe {
+        core::arch::asm!("ldr {v:w}, [{a}]", v = out(reg) val, a = in(reg) addr,
+            options(nostack, preserves_flags, readonly));
+    }
+    val
+}
+
+/// Bring up THIS secondary's GICv3 receive path: enable the system-register CPU
+/// interface, wake its redistributor, and enable the scheduler SGI (INTID 0) + the
+/// virtual-timer PPI (27). The distributor's global config was done once by the BSP.
+fn secondary_gic_init(idx: usize) {
+    // SAFETY: GICv3 CPU-interface system registers; values per the architecture.
+    unsafe {
+        let sre: u64;
+        core::arch::asm!("mrs {0}, S3_0_C12_C12_5", out(reg) sre, options(nomem, nostack));
+        core::arch::asm!("msr S3_0_C12_C12_5, {0}", in(reg) sre | 1, options(nomem, nostack)); // ICC_SRE_EL1.SRE
+        core::arch::asm!("isb", options(nomem, nostack));
+        core::arch::asm!("msr S3_0_C4_C6_0, {0}", in(reg) 0xFFu64, options(nomem, nostack)); // ICC_PMR_EL1
+        core::arch::asm!("msr S3_0_C12_C12_3, {0}", in(reg) 0u64, options(nomem, nostack)); // ICC_BPR1_EL1
+        core::arch::asm!("msr S3_0_C12_C12_7, {0}", in(reg) 1u64, options(nomem, nostack)); // ICC_IGRPEN1_EL1
+        core::arch::asm!("isb", options(nomem, nostack));
+    }
+    let rd = GICR_BASE + idx * GICR_STRIDE;
+    let sgi = rd + GICR_SGI_OFFSET;
+    let waker = rd + GICR_WAKER;
+    mmio_w32(waker, mmio_r32(waker) & !GICR_WAKER_PROCESSOR_SLEEP);
+    while mmio_r32(waker) & GICR_WAKER_CHILDREN_ASLEEP != 0 {
+        core::hint::spin_loop();
+    }
+    mmio_w32(sgi + GICR_SGI_IGROUPR0, 0xFFFF_FFFF);
+    for i in 0..8 {
+        mmio_w32(sgi + GICR_SGI_IPRIORITYR + i * 4, 0xA0A0_A0A0);
+    }
+    mmio_w32(sgi + GICR_SGI_ISENABLER0, (1u32 << SCHED_SGI) | (1u32 << TIMER_PPI));
+    // SAFETY: ensure redistributor writes complete before IRQs are unmasked.
+    unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
+}
+
+/// Base VA of this core's 16 KiB boot/idle stack in `secondary_boot_stacks_shared`.
+fn secondary_stack_base(core: usize) -> usize {
+    let addr: usize;
+    // SAFETY: resolves the `.bss.smp_shared` symbol's address; no memory access.
+    unsafe {
+        core::arch::asm!(
+            "adrp {t}, secondary_boot_stacks_shared",
+            "add {t}, {t}, :lo12:secondary_boot_stacks_shared",
+            t = out(reg) addr,
+            options(nomem, nostack),
+        );
+    }
+    addr + (core << STACK_SHIFT)
+}
+
+/// Set `VBAR_EL1` to the shared exception vector table (the BSP's) so this core takes
+/// syscalls/IRQs/faults through the same handlers.
+fn set_shared_vbar() {
+    // SAFETY: installs the kernel's exception vector base for this PE.
+    unsafe {
+        core::arch::asm!(
+            "adrp {t}, exception_vector_table",
+            "add {t}, {t}, :lo12:exception_vector_table",
+            "msr vbar_el1, {t}",
+            "isb",
+            t = out(reg) _,
+            options(nomem, nostack),
+        );
+    }
+}
+
+/// Per-core counter of scheduler ticks each core has serviced a worker on — the M2c
+/// proof that threads execute across cores. Genuinely shared (not replicated).
+static CORES_SEEN: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
+
+/// Demo worker (real shared-kernel SMP M2c): bump this core's counter, then SLEEP.
+/// Sleeping (rather than busy-looping) is essential — a kernel thread holds the Big
+/// Kernel Lock while it runs, so a never-sleeping worker would let one core monopolize
+/// the lock and starve the others. Sleeping makes the worker WAITING, letting a core
+/// drop to idle (releasing the BKL) so peers can pick up work. Runs forever.
+fn smp_worker() -> ! {
+    loop {
+        let aff0 = (read_mpidr() & 0xff) as usize;
+        if aff0 < MAX_CORES {
+            CORES_SEEN[aff0].fetch_add(1, Ordering::Relaxed);
+        }
+        akuma_exec::threading::sleep_us(2000);
+    }
+}
+
+/// Spawn the M2c demo workers from the BSP (after secondaries are up). Each is an
+/// ordinary shared-pool kernel thread; the per-core schedulers distribute them, so over
+/// time both the BSP and the secondaries run them. Call once.
+pub fn spawn_worker_demo() {
+    let cores = NUM_CORES.load(Ordering::Relaxed);
+    if cores <= 1 {
+        return;
+    }
+    // A few workers (cores + 1) so there is usually one runnable when a core wakes.
+    for _ in 0..=cores {
+        let _ = akuma_exec::threading::spawn_system_thread_fn(smp_worker);
+    }
+    crate::safe_print!(64, "[SMP-shared] spawned {} demo workers\n", cores + 1);
+}
+
+/// Number of cores that have run a demo worker at least once (for the boot self-test).
+pub fn cores_that_ran_workers() -> usize {
+    CORES_SEEN.iter().filter(|c| c.load(Ordering::Relaxed) > 0).count()
+}
+
+/// Per-core worker tick count (diagnostics / self-test).
+pub fn worker_ticks(core: usize) -> u64 {
+    if core < MAX_CORES {
+        CORES_SEEN[core].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// Secondary-core Rust entry (M2c). Runs on the SHARED boot page tables + PMM/heap.
+/// Adopts its boot context as this core's idle thread, brings up its GIC receive path,
+/// installs the shared vectors, arms the shared 10 ms virtual-timer tick, enables IRQs,
+/// and enters the idle loop — from which the timer preempts it onto any runnable thread
+/// in the shared scheduler. The BKL (held across each IRQ/scheduler excursion)
+/// serializes kernel execution; `idle_halt` drops it around WFI so peers can enter.
 ///
 /// # Safety
-/// Called only from the `secondary_entry_shared` trampoline, once, per core, with the
-/// MMU on and this core's private boot stack installed.
+/// Called only from the `secondary_entry_shared` trampoline, once per core, MMU on,
+/// with this core's boot stack installed and IRQs masked.
 #[unsafe(no_mangle)]
 pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
-    // A plain kernel static write here is visible to the BSP — shared, not replicated.
-    ONLINE_COUNT.fetch_add(1, Ordering::AcqRel);
-    // safe_print! is heap-free and reaches the shared UART via the boot device map.
-    crate::safe_print!(48, "[SMP-shared] core {} online\n", core_idx);
+    let core = core_idx as usize;
+    let stack_base = secondary_stack_base(core);
+    let stack_size = 1usize << STACK_SHIFT;
+    let exc_top = (stack_base + stack_size) as u64;
 
+    // Adopt the current (boot) context as this core's idle thread so the shared
+    // scheduler can switch away from it and back. Sets TPIDRRO_EL0.
+    let idle =
+        akuma_exec::threading::adopt_current_as_core_idle(core, exc_top, stack_base, stack_size);
+
+    ONLINE_COUNT.fetch_add(1, Ordering::AcqRel);
+    let Some(slot) = idle else {
+        crate::safe_print!(64, "[SMP-shared] core {} online but NO idle slot; parking\n", core);
+        loop {
+            unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
+        }
+    };
+    crate::safe_print!(64, "[SMP-shared] core {} online (idle tid {})\n", core, slot);
+
+    // Bring up this PE's interrupt receive path, install shared vectors, arm the tick.
+    secondary_gic_init(core);
+    set_shared_vbar();
+    crate::timer::enable_timer_interrupts(crate::config::TIMER_INTERVAL_US);
+
+    // Unmask IRQs: from here the timer tick drives this core's scheduler.
+    // SAFETY: vectors + GIC + timer are configured; safe to take interrupts now.
+    unsafe { core::arch::asm!("msr daifclr, #2", "isb", options(nomem, nostack)) };
+
+    // Idle loop. Two requirements pull against each other: (1) don't hammer the BKL
+    // when there's nothing to run (a `yield_now()` every iteration livelocks SMP=4 as
+    // idle cores fight over the lock); (2) still switch onto a thread the moment one is
+    // runnable. The solution: release the BKL, WFI, re-acquire — WITHOUT disabling
+    // preemption (unlike `idle_halt`). With preemption enabled, the timer tick's
+    // self-SGI runs the scheduler and preempts this idle thread onto any READY thread;
+    // when nothing is runnable we just fall back to WFI. One timer IRQ + one SGI per
+    // ~10 ms tick — cheap and contention-free.
     loop {
-        // SAFETY: idle until an event/interrupt; M0 secondaries do no further work.
-        unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
+        // Drop the BKL so peers can enter the kernel while we're halted.
+        akuma_exec::bkl::leave_kernel();
+        // SAFETY: IRQs are enabled; the timer/device IRQ wakes us and (via the
+        // scheduler SGI) may switch us to a runnable thread instead of returning here.
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        // Re-take the BKL for our brief kernel work before the next halt (idempotent
+        // if the waking IRQ's reconcile already re-acquired it for us).
+        akuma_exec::bkl::enter_kernel();
     }
 }
 

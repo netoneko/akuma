@@ -226,6 +226,9 @@ pub fn end_of_interrupt(irq: u32) {
 /// Trigger a Software Generated Interrupt (SGI)
 ///
 /// SGI 0-15 are available. This sends the interrupt to the current CPU.
+// Unused under `kernel_smp_shared` (that build self-targets via `trigger_sgi_self`); kept
+// for the default/single-core and multikernel paths.
+#[allow(dead_code)]
 pub fn trigger_sgi(sgi_id: u32) {
     #[cfg(feature = "gic-v2")]
     GIC.trigger_sgi(sgi_id);
@@ -234,10 +237,22 @@ pub fn trigger_sgi(sgi_id: u32) {
 }
 
 /// Trigger an SGI on a specific core (by affinity-0 = `MPIDR & 0xff`). The
-/// multikernel cross-core doorbell. GICv3 only; only the `smp` build uses it.
-#[cfg(all(not(feature = "gic-v2"), kernel_smp))]
+/// multikernel cross-core doorbell; also used by real shared-kernel SMP. GICv3 only.
+#[cfg(all(not(feature = "gic-v2"), any(kernel_smp, kernel_smp_shared)))]
 pub fn trigger_sgi_core(target_aff0: u32, sgi_id: u32) {
     crate::gic_v3::trigger_sgi_core(target_aff0, sgi_id);
+}
+
+/// Trigger an SGI on the CURRENT core (self-targeted by reading `MPIDR & 0xff`). Real
+/// shared-kernel SMP uses this so the shared timer handler rings *this* core's
+/// scheduler SGI instead of `trigger_sgi`'s hardcoded PE0. On the BSP (aff0 = 0) it is
+/// equivalent to `trigger_sgi`.
+#[cfg(all(not(feature = "gic-v2"), kernel_smp_shared))]
+pub fn trigger_sgi_self(sgi_id: u32) {
+    let mpidr: u64;
+    // SAFETY: reading the affinity register has no side effects.
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack)) };
+    trigger_sgi_core((mpidr & 0xff) as u32, sgi_id);
 }
 
 /// Set interrupt priority (0 = highest, 255 = lowest)

@@ -46,19 +46,24 @@ real SMP) — see `scripts/build_devbox_smoltcp.sh` and
   `...is` (hardware broadcast) and give each `UserAddressSpace` a real ASID (today all
   use ASID 0) so shared address spaces don't alias cross-core.
 
-## Boot / bringup (M0)
+## Boot / bringup
 
 1. `probe_dtb(dtb_ptr)` (from `kernel_main`, before heap init) parses `/cpus` + `/psci`,
    stashes MPIDRs by `aff0 = mpidr & 0xff`.
 2. `bringup_secondaries()` (after `gic::init`) PSCI `CPU_ON`s each secondary at the
    `secondary_entry_shared` trampoline (asm, `.text.boot`), which loads the BSP's
    **shared** boot `TTBR0`/`TTBR1` and tail-calls `secondary_shared_start`.
-3. `secondary_shared_start(_ctx, core_idx)` bumps the shared `ONLINE_COUNT`, prints
-   over the shared UART (device space is identity-mapped via the boot L1[0] block), and
-   parks in `WFE`. GIC/timer/scheduler join in later milestones.
+3. `secondary_shared_start(_ctx, core_idx)` (M2c) adopts its boot context as this core's
+   idle thread (`adopt_current_as_core_idle` → `TPIDRRO_EL0`, `register_core_idle`),
+   inits its per-PE GIC receive path (CPU interface + redistributor + scheduler SGI 0 +
+   timer PPI 27; device space is identity-mapped via boot L1[0]), installs the shared
+   `exception_vector_table`, arms the shared 10 ms CNTV tick, enables IRQs, and enters an
+   idle loop (release-BKL / WFI / re-acquire, preemption enabled). From there the timer
+   tick's self-SGI preempts idle onto any READY thread in the shared scheduler.
 
-Self-test: `process_tests.rs::test_smp_shared_cores_online` asserts online count ==
-`probed_core_count - 1`.
+Self-tests (`process_tests.rs`): `test_smp_shared_cores_online` asserts online count ==
+`probed_core_count - 1`; `test_smp_shared_scheduler` spawns kernel workers and asserts
+they run on more than one core.
 
 ## Status
 
@@ -68,7 +73,8 @@ Self-test: `process_tests.rs::test_smp_shared_cores_online` asserts online count
 | M1 — BKL primitive + syscall-path wiring | ✅ BSP verified, no deadlock/regression |
 | M2a — IRQ/scheduler-path BKL + eret reconcile | ✅ BSP verified |
 | M2b — SMP-safe scheduler: per-core idle | ✅ BSP verified |
-| M2c — secondaries run the shared scheduler (+ TLB-IS, ASID) | next |
+| M2c — secondaries run the shared scheduler | ✅ threads on 2 & 4 cores |
+| M3 — userspace on secondaries (+ TLB-IS, ASID) | next |
 | M3 — userspace on secondaries | planned |
 | M4 — migration + cross-core wakeups | planned |
 | M5 — fine-grained locking | planned |

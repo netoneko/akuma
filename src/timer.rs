@@ -105,7 +105,14 @@ pub fn timer_irq_handler(_irq: u32) {
     }
     // #endregion
 
-    // Trigger SGI for scheduling - scheduler will decide if switch is needed
+    // Trigger SGI for scheduling - scheduler will decide if switch is needed.
+    // Real shared-kernel SMP: this timer handler is shared across cores (one dispatch
+    // table), so it must ring the CURRENT core's scheduler SGI, not the hardcoded PE0
+    // that `trigger_sgi` targets — otherwise a secondary's tick would preempt the BSP.
+    // On the BSP (aff0 = 0) `trigger_sgi_self` is equivalent to `trigger_sgi`.
+    #[cfg(kernel_smp_shared)]
+    crate::gic::trigger_sgi_self(crate::gic::SGI_SCHEDULER);
+    #[cfg(not(kernel_smp_shared))]
     crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
 }
 

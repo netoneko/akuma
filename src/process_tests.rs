@@ -34,6 +34,11 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_smp_shared_cores_online();
 
+    // Real (shared-kernel) SMP M2c: confirm the shared scheduler runs threads on more
+    // than one core (secondaries participate in scheduling). No-op on a single CPU.
+    #[cfg(kernel_smp_shared)]
+    test_smp_shared_scheduler();
+
     // Net bounce-buffer OOM degradation (pure-fn boundaries + ample-mem alloc);
     // guards against the EC=0x3c kernel abort when an oversized socket buffer
     // can't grow the heap. No network stack required.
@@ -503,6 +508,49 @@ fn test_smp_shared_cores_online() {
             "[Test] smp_shared_cores_online FAILED ({}/{} secondaries online)\n",
             online,
             expected
+        );
+    }
+}
+
+/// M2c boot self-test for real SMP: spawn demo worker threads into the shared pool and
+/// confirm they get scheduled on more than one core — i.e. the secondaries run the
+/// shared scheduler, not just the BSP. The wait loop `idle_halt`s (not just yields) so
+/// the BSP releases the Big Kernel Lock and secondaries can pick up the (sleeping)
+/// workers; a yield-only wait would let the BSP monopolize the BKL and starve them.
+#[cfg(kernel_smp_shared)]
+fn test_smp_shared_scheduler() {
+    if crate::smp_shared::probed_core_count() <= 1 {
+        console::print("[Test] smp_shared_scheduler SKIPPED (single CPU; boot with SMP>1)\n");
+        return;
+    }
+    crate::smp_shared::spawn_worker_demo();
+
+    // Let the workers run for ~2s, behaving like the idle loop (yield + halt) so both
+    // the BSP and the secondaries get scheduling opportunities.
+    let start = crate::timer::uptime_us();
+    while crate::timer::uptime_us().saturating_sub(start) < 2_000_000 {
+        akuma_exec::threading::yield_now();
+        akuma_exec::threading::idle_halt();
+    }
+
+    let cores_ran = crate::smp_shared::cores_that_ran_workers();
+    let c0 = crate::smp_shared::worker_ticks(0);
+    let c1 = crate::smp_shared::worker_ticks(1);
+    if cores_ran >= 2 {
+        crate::safe_print!(
+            112,
+            "[Test] smp_shared_scheduler PASSED (workers ran on {} cores; core0={} core1={} ticks)\n",
+            cores_ran,
+            c0,
+            c1
+        );
+    } else {
+        crate::safe_print!(
+            112,
+            "[Test] smp_shared_scheduler FAILED (only {} core ran workers; core0={} core1={})\n",
+            cores_ran,
+            c0,
+            c1
         );
     }
 }

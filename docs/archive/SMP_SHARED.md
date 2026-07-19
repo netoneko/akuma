@@ -178,17 +178,55 @@ deferred.
 `threading/mod.rs` (schedule_indices core_id + per-core idle + commit_switch + idle_halt
 BKL), `threading/types.rs` (MAX_CORES), `bkl.rs` (current_core_id all-configs).
 
-### M2c — secondaries run the shared scheduler (NEXT)
+### M2c — secondaries run the shared scheduler ✅ (2026-07-19)
 
-Replace M0's secondary WFE park with a real per-core scheduler: adopt the secondary's
-boot context as *its* idle thread (a fresh slot, `register_core_idle`), init its GIC
-redistributor + CPU interface, set VBAR to the shared `exception_vector_table`, arm its
-CNTV timer (→ scheduler SGI **targeted at itself** — widen `trigger_sgi_core` /
-`register_handler_no_gic` to `any(kernel_smp, kernel_smp_shared)`, and make the timer
-handler ring the *current* core's SGI), make its idle preemptible, enable IRQs. Then a
-test kernel thread should run on a secondary, timer-preempted, concurrently with the
-BSP — the first real BKL contention. Also in M2: inner-shareable TLB flushes (`...is`)
-and real per-AS ASIDs (needed once user threads run cross-core in M3).
+Secondaries leave M0's WFE park and join the one shared scheduler. Each secondary
+(`secondary_shared_start`): adopts its boot context as *its own* idle thread
+(`adopt_current_as_core_idle` → a fresh slot, `register_core_idle`, `TPIDRRO_EL0`), does
+its per-PE GIC receive-path init (CPU interface + redistributor wake + scheduler SGI 0 +
+timer PPI 27 — device space is identity-mapped via boot L1[0], so no page-table change),
+installs the shared `exception_vector_table` (`VBAR_EL1`), arms the shared 10 ms CNTV
+tick (`timer::enable_timer_interrupts`), enables IRQs, and enters an idle loop. The
+shared `timer_irq_handler` now rings the **current** core's scheduler SGI
+(`gic::trigger_sgi_self`, gated `kernel_smp_shared`); `trigger_sgi_core` /
+`trigger_sgi_self` are exposed for `any(kernel_smp, kernel_smp_shared)`. The runtime's
+`trigger_sgi` (used by `yield_now`/`schedule_blocking`) is also self-targeted under
+shared SMP. Demo: `spawn_worker_demo` spawns `cores+1` kernel workers that bump a
+per-core counter then `sleep_us`; the boot self-test confirms they run on >1 core.
+
+**Verified:** `smp_shared_scheduler PASSED` — SMP=2 "workers ran on 2 cores
+(core0=399 core1=375)", SMP=4 "workers ran on 4 cores". Reaches the same pre-existing
+baseline (the unrelated `test_mmap_file_oom` panic); ~16 transient BKL-contention
+warnings during the test (a core spinning ≤10 M for the lock, then progressing — coarse
+but correct), and post-panic orphan spinning once that pre-existing panic kills the BSP.
+
+**Four bugs found + fixed along the way (all the hard part of M2):**
+1. **16 KiB secondary stack overflow.** The idle stack backs the full IRQ excursion
+   (trap frame + shared `timer_irq_handler` + kernel-timer + scheduler), far deeper than
+   M0's park → fault-in-fault while holding the BKL. Bumped to 64 KiB (`STACK_SHIFT` 14→16).
+2. **BKL acquire re-entrancy self-deadlock** (`owner=N waiter=N`). The syscall-path
+   `enter_kernel` runs with IRQs enabled, so a timer IRQ nests mid-spin and *its*
+   `enter_kernel` wins the lock for this core; the outer spin then retried `CAS(0, me)`
+   forever. Fix: re-check `owner == me` every loop iteration in `KernelLock::acquire`.
+3. **Voluntary reschedules rang PE0, not self.** `runtime().trigger_sgi` was
+   `gic::trigger_sgi` (hardcoded PE0), so a secondary's `yield_now`/`schedule_blocking`
+   poked the BSP and never rescheduled itself. Fix: self-target under `kernel_smp_shared`.
+4. **Idle contention livelock (SMP=4) vs. no-switch.** A `yield_now()` in the idle loop
+   hammered the BKL (idle cores fighting); removing it broke worker pickup because
+   `idle_halt` disables preemption (blocking the timer from switching idle→worker). Fix:
+   the secondary idle releases the BKL, WFIs, re-acquires — **without** disabling
+   preemption — so the timer's self-SGI preempts idle onto a READY thread, cheaply.
+
+**Deferred within M2 → folded into M3** (only needed once *user* address spaces run
+cross-core): inner-shareable TLB flushes (`...is`) and real per-AS ASIDs. Kernel threads
+all share the boot TTBR0, so the context switch's TTBR0 doesn't change and the local
+`tlbi` is harmless here.
+
+**Files:** `src/smp_shared.rs` (secondary scheduler bringup + GIC + worker demo),
+`crates/akuma-exec/src/threading/mod.rs` (`adopt_current_as_core_idle`, `sleep_us`),
+`crates/akuma-exec/src/sync.rs` (acquire re-entrancy fix), `src/gic.rs` + `src/gic_v3.rs`
+(`trigger_sgi_core`/`trigger_sgi_self` gates), `src/timer.rs` (self-SGI), `src/main.rs`
+(runtime `trigger_sgi`), `src/process_tests.rs` (`test_smp_shared_scheduler`).
 
 ## M3..M5 (planned)
 

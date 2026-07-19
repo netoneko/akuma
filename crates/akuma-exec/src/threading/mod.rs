@@ -1100,6 +1100,48 @@ pub fn make_idle_preemptible() {
     pool.slots[IDLE_THREAD_IDX].timeout_us = 0;
 }
 
+/// Real shared-kernel SMP: adopt the CURRENT execution context — a secondary core's
+/// boot/trampoline context, running on its boot stack — as that core's idle thread, so
+/// the one shared scheduler can switch away from it and back like any thread. Claims a
+/// free slot, marks it the RUNNING, preemptible idle for `core_id`, points
+/// `TPIDRRO_EL0` at it, and registers it via [`register_core_idle`] (so no other core's
+/// round-robin scan ever picks it). The context's saved SP/TTBR0 are captured on the
+/// first switch-out. Returns the slot, or `None` if no slot is free.
+///
+/// `exc_stack_top` becomes the slot's exception-stack top (loaded into `TPIDR_EL1` when
+/// the scheduler switches back to this idle); `stack_base`/`stack_size` describe the
+/// boot stack so `validate_current_sp` recognizes it. Must be called with IRQs masked
+/// and before this core enables interrupts.
+#[cfg(target_os = "none")]
+pub fn adopt_current_as_core_idle(
+    core_id: usize,
+    exc_stack_top: u64,
+    stack_base: usize,
+    stack_size: usize,
+) -> Option<usize> {
+    let _guard = IrqGuard::new();
+    let mut pool = POOL.lock();
+    let slot = claim_free_slot(1, MAX_THREADS)?;
+    pool.slots[slot].cooperative = false; // preemptible: timer ticks round-robin off it
+    pool.slots[slot].timeout_us = 0;
+    pool.slots[slot].start_time_us = (runtime().uptime_us)();
+    pool.slots[slot].exception_stack_top = exc_stack_top;
+    pool.stacks[slot] = StackInfo::new(stack_base, stack_size);
+    // Seed a valid context; sp/ttbr0 are captured on the first switch-out from idle.
+    unsafe {
+        let ctx = &mut *get_context_mut(slot);
+        ctx.magic = CONTEXT_MAGIC;
+        ctx.ttbr0 = crate::mmu::get_boot_ttbr0();
+        ctx.is_user_process = 0;
+    }
+    // This core is now the idle thread.
+    set_current_thread_register(slot);
+    set_current_exception_stack(exc_stack_top);
+    THREAD_STATES[slot].store(thread_state::RUNNING, Ordering::SeqCst);
+    register_core_idle(core_id, slot);
+    Some(slot)
+}
+
 /// Check if preemption is currently disabled for the current thread.
 #[inline]
 pub fn is_preemption_disabled() -> bool {
@@ -2628,9 +2670,18 @@ pub fn get_waker_for_thread(thread_id: usize) -> Waker {
 /// 2. When resumed, kernel code can access all kernel memory
 /// 
 /// After resuming, we restore the user TTBR0 before returning to syscall handler.
+/// Sleep the current thread for approximately `us` microseconds by blocking until an
+/// absolute wake time. Thin wrapper over [`schedule_blocking`] that computes the
+/// deadline from the current uptime. Used by the real-SMP worker demo (and any kernel
+/// thread that wants a timed sleep without the syscall layer).
+pub fn sleep_us(us: u64) {
+    let now = (runtime().uptime_us)();
+    schedule_blocking(now.saturating_add(us));
+}
+
 pub fn schedule_blocking(wake_time_us: u64) {
     let tid = current_thread_id();
-    
+
     // Check if we were already woken (sticky wake)
     if WOKEN_STATES[tid].swap(false, Ordering::SeqCst) {
         return;
