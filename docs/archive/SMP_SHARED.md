@@ -336,6 +336,79 @@ runs + migrates cross-core (M3/M4 tests prove it).
 (idle mask + wake + migration/demo workers + reclaim), `src/main.rs` (wire hook),
 `src/process_tests.rs` (`test_smp_shared_migration` + reclaim), `children.rs` (test rt field).
 
+## M5a — Network SMP-safety + devbox boots to sshd under SMP ✅ (2026-07-19)
+
+Resolves the M4 "open item": the full devbox-smoltcp boot to userspace/sshd now works
+under `SMP=2` (reliable) and `SMP=4` (works; boot race noted below). SSH-in verified.
+Three independent fixes, matching the two root causes M4 identified plus a stale-disk
+issue found along the way:
+
+1. **Network path made SMP-safe (`PreemptGuard`).** Root cause of the httpd
+   `socket()`/`bind()` wedge: the base `NETWORK` (`smoltcp_net.rs`) and `SOCKET_TABLE`
+   (`socket.rs`) `spinning_top` spinlocks disable no preemption of their own. Under the
+   BKL, a holder timer-preempted mid-section is descheduled with the inner lock still
+   held; the BKL is released on the switch's EL0 return, and the next core to enter the
+   kernel spins on that inner lock **while holding the BKL** — so the BKL owner can never
+   be rescheduled to release it. Deadlock. Fix: a `PreemptGuard` RAII
+   (`akuma-net/src/runtime.rs`) disables scheduler preemption for the whole critical
+   section (`poll`, `with_network`, `with_table` — the only base-lock sites; every other
+   net path nests under one of these), so the inner lock is never held across a switch
+   and under the BKL is never cross-core contended (the BKL already provides the mutual
+   exclusion). Zero-cost no-op on every non-`smp-shared` build (compiles to nothing); the
+   two `disable_preemption`/`enable_preemption` fn pointers are added to `NetRuntime` and
+   wired at both registration sites (`main.rs`, `smp.rs`). Proof: under SMP httpd now
+   completes `socket`+`bind`+`listen`+`accept` where it previously wedged the BKL.
+
+2. **Secondary bringup ordering (the async-main slot collision).** For the RUNTIME image
+   (`no-tests`, devbox) `smp_shared::bringup_secondaries()` now runs **after**
+   `threading::init()` (right after preemptive scheduling is enabled in `kernel_main`),
+   so each secondary's `adopt_current_as_core_idle` claims a slot from the initialized
+   allocator and never collides with the async-main thread spawned later. The boot
+   SELF-TEST image keeps the pre-init order (gated `not(feature = "no-tests")`): its
+   `test_smp_shared_*` suite needs the secondaries online before it runs, and moving
+   bringup after `init` makes them join the scheduler during the spawn-heavy suites and
+   storm the coarse BKL. `adopt_current_as_core_idle` takes only `IrqGuard` + `POOL.lock`
+   (never the BKL) and `bringup_secondaries` blocks until every secondary has adopted, so
+   the post-init placement is race-free w.r.t. the async-main slot.
+
+3. **Async-main network loop no longer hogs the BKL.** Even booted, the `run_async_main`
+   poll loop (`main.rs`) held the BKL near-continuously on its core (nothing else READY
+   there → `yield_now` re-runs it immediately), starving a userspace thread (sshd, or the
+   login shell it forks) on a PEER core — the devbox booted but SSH sessions couldn't
+   progress. Fix: under `all(kernel_smp_shared, feature = "smoltcp")`, after the
+   `while poll()` drain loop (which already drained every ready packet), the loop drops
+   the BKL and `WFI`s until the next interrupt (mirroring the secondary idle loop). A
+   pending RX/timer/SGI IRQ makes `WFI` return at once, so burst draining is unaffected,
+   while the peer core gets a BKL window every iteration. This took BKL-contention
+   warnings during an SSH session from thousands to **zero**.
+
+Also required (not a kernel change): the `devbox.img` herd config was stale — its
+`/etc/herd/enabled/sshd.conf` pinned sshd to a core via `core_init` (a *multikernel*
+mechanism that fails under shared SMP: `core_init failed for sshd — not started`), and a
+`core2herd.conf` was present. Patched in place with `debugfs` to the unpinned overlay
+config (`overlays/devbox/rootfs/.../sshd.conf`, `command = /bin/sshd`, `--port 22`, no
+`core_init`) and `core2herd.conf` removed. The disk should be re-provisioned from the
+overlay (`overlays/devbox/bootstrap.sh`) for reproducibility.
+
+**Verified:** `SMP=2` devbox-smoltcp boots to userspace; `ssh -p 2222 root@localhost`
+returns `uname`/`ls`/`free` across repeated sessions with **0** `[BKL] stuck`. `SMP=4`
+also boots + SSHes in (`0` stuck on a clean boot). Boot self-tests (`--features smp-shared`)
+still green at `SMP=2` (`smp_shared_cores_online/scheduler/userspace/migration` all
+PASSED). 114 akuma-exec + 32 akuma-net host tests pass; clippy clean on
+devbox-smoltcp / smp-shared / default.
+
+**Residual (→ M5 fine-graining, coarse-BKL contention):** `SMP=4` has a *nondeterministic*
+bringup/contention race — some boots wedge with one core holding the BKL, and the
+`parallel_processes` boot self-test intermittently times out under heavy contention
+(`stuck` spikes; a re-run passes). This is the coarse BKL scaling past 2 cores, the exact
+"bringup/contention interaction" M4 flagged. Splitting the BKL into per-subsystem locks
+(the real M5) is the fix; `SMP=2` is contention-clean today.
+
+**Files:** `crates/akuma-net/src/runtime.rs` (`PreemptGuard` + fn ptrs), `.../smoltcp_net.rs`
++ `.../socket.rs` (guard the 3 base-lock sites), `.../Cargo.toml` + root `Cargo.toml`
+(`smp-shared` feature forward), `src/main.rs` (bringup reorder + async-main BKL-release +
+`NetRuntime` fields), `src/smp.rs` (`NetRuntime` fields).
+
 ## M5 (planned)
 
 See the approved plan for the full roadmap: M2 shared scheduler (SMP-safe SGI handler,

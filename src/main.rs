@@ -820,14 +820,25 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // PMM, and heap. Each secondary adopts an idle thread and joins the one shared
     // scheduler. No-op with a single QEMU CPU. (docs/archive/SMP_SHARED.md)
     //
-    // NOTE: this runs before `threading::init` below. That is fine for the boot self-test
-    // suite (M0–M4 all pass), but the FULL devbox boot to userspace stalls under SMP —
-    // see the "known open item" in docs/archive/SMP_SHARED.md. Moving this after
-    // `threading::init` lets the devbox get further (herd/httpd start) but regresses the
-    // test build's contention and still hits a network-stack SMP deadlock, so the proper
-    // fix is deferred (needs the bringup/contention interaction resolved + the network
-    // path made SMP-safe). Left here to keep the verified milestones green.
-    #[cfg(kernel_smp_shared)]
+    // Bringup TIMING depends on the image, because the secondary immediately calls
+    // `adopt_current_as_core_idle` to claim a thread-pool slot:
+    //
+    //  * Boot SELF-TEST image (tests compiled in): bring up HERE, before `threading::init`,
+    //    so the M0–M4 `test_smp_shared_*` self-tests find the secondaries already online.
+    //    `threading::init` later resets the slot allocator's free map, so the secondaries'
+    //    adopted slots are re-marked free — a latent collision — but it stays masked because
+    //    a secondary only WFI-idles its slot and the tests run+finish on the BSP. Placing
+    //    bringup after `init` instead makes the secondaries join the scheduler during the
+    //    spawn-heavy suites and storm the coarse BKL (~2900 `[BKL] stuck`) — an M5
+    //    fine-graining problem. So the self-test image keeps the pre-init order.
+    //
+    //  * RUNTIME image (`no-tests`, e.g. devbox-smoltcp): there are no self-tests to run
+    //    against the secondaries, but the full boot DOES schedule the async-main thread —
+    //    which, under the pre-init order, collides with a secondary's adopted idle slot and
+    //    stalls the boot. So the runtime image brings secondaries up AFTER `threading::init`
+    //    (below), where the slot allocator is live and hands out distinct slots. See
+    //    docs/archive/SMP_SHARED.md M4 "open item".
+    #[cfg(all(kernel_smp_shared, not(feature = "no-tests")))]
     smp_shared::bringup_secondaries();
 
     // Set up exception vectors and enable IRQs
@@ -929,6 +940,16 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Enable IRQ-safe allocations now that preemption is active
     allocator::enable_preemption_safe_alloc();
+
+    // RUNTIME image (`no-tests`): bring secondaries up HERE — after the thread pool and
+    // preemptive scheduler are live — so each secondary's `adopt_current_as_core_idle`
+    // claims a distinct slot from the initialized allocator and never collides with the
+    // async-main thread spawned below. (The self-test image brought them up earlier, before
+    // `threading::init`; see the note there.) Combined with the network path's cross-core
+    // lock discipline (`PreemptGuard` in akuma-net), this lets the devbox boot to userspace
+    // sshd under SMP>=2. See docs/archive/SMP_SHARED.md M4 "open item".
+    #[cfg(all(kernel_smp_shared, feature = "no-tests"))]
+    smp_shared::bringup_secondaries();
 
     // The boot self-test suite spawns many concurrent threads/processes. On a
     // tiny machine there aren't enough user thread slots (the pool is scaled to
@@ -1244,6 +1265,8 @@ fn run_async_main() -> ! {
             is_current_interrupted: process::is_current_interrupted,
             rng_fill: |buf| rng::fill_bytes(buf).expect("RNG required for networking"),
             current_thread_id: || threading::current_thread_id() as u32,
+            disable_preemption: threading::disable_preemption,
+            enable_preemption: threading::enable_preemption,
         },
         &mmio_addrs,
         config::ENABLE_DHCP,
@@ -1485,6 +1508,28 @@ fn run_async_main() -> ! {
         // polling loop above already drains bursts (up to 64 packets),
         // so yielding here doesn't hurt bulk throughput — it just lets
         // consumer threads process the data between bursts.
+        //
+        // Under shared SMP a plain `yield_now()` here is not enough: with nothing
+        // else READY on its core this loop re-runs immediately and keeps holding the
+        // Big Kernel Lock, so a userspace thread (e.g. sshd, or a login shell it
+        // forked) on a PEER core starves waiting for the BKL — the devbox then boots
+        // but SSH sessions can't make progress. The `while poll()` above has already
+        // drained every ready packet, so there is nothing more to do this iteration:
+        // drop the BKL and halt until the next interrupt (mirroring the secondary
+        // idle loop in smp_shared.rs). A pending RX/timer/SGI IRQ makes WFI return at
+        // once, so burst draining is unaffected, while the peer core gets a BKL window
+        // every iteration.
+        #[cfg(all(kernel_smp_shared, feature = "smoltcp"))]
+        {
+            akuma_exec::bkl::leave_kernel();
+            // SAFETY: IRQs are enabled; the timer/RX/SGI IRQ wakes us and its handler
+            // re-takes the BKL (our enter_kernel below is then idempotent).
+            unsafe {
+                core::arch::asm!("wfi", options(nomem, nostack));
+            }
+            akuma_exec::bkl::enter_kernel();
+        }
+        #[cfg(not(all(kernel_smp_shared, feature = "smoltcp")))]
         threading::yield_now();
 
         // In a rump-only / devbox build there is no smoltcp interface to poll

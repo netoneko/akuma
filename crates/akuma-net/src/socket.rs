@@ -17,6 +17,7 @@ use spinning_top::Spinlock;
 use crate::smoltcp_net::{self, SocketHandle, with_network};
 #[cfg(feature = "smoltcp")]
 use crate::runtime::runtime;
+use crate::runtime::PreemptGuard;
 #[cfg(feature = "smoltcp")]
 use smoltcp::socket::tcp;
 
@@ -245,6 +246,11 @@ static SOCKET_TABLE: Spinlock<Option<Vec<Option<KernelSocket>>>> = Spinlock::new
 pub(crate) fn with_table<F, R>(f: F) -> R
 where F: FnOnce(&mut Vec<Option<KernelSocket>>) -> R 
 {
+    // Preemption disabled for the whole hold: the SOCKET_TABLE spinlock (and the
+    // NETWORK lock nested under it via socket ops) must never be stranded across a
+    // context switch under the BKL (see `PreemptGuard`). The closure `f` must not
+    // yield — the same discipline the native stack already followed single-core.
+    let _pg = PreemptGuard::new();
     let mut guard = SOCKET_TABLE.lock();
     if guard.is_none() {
         *guard = Some(Vec::new());

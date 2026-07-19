@@ -9,6 +9,12 @@ edition = "2024"
 # this crate with `default-features = false` and NOT re-enabling `smoltcp`.
 default = ["smoltcp"]
 small-sockets = []
+# Real shared-kernel SMP. Gates the `PreemptGuard` critical-section preemption
+# guards (runtime.rs): under the Big Kernel Lock the base NETWORK/SOCKET_TABLE
+# spinlocks must never be held across a context switch. A no-op otherwise, so
+# non-SMP builds are byte-for-byte unchanged. Forwarded from the kernel's
+# `smp-shared` feature. See docs/reference/subsystems/smp-shared.md.
+smp-shared = []
 # The native smoltcp TCP/IP stack: the smoltcp_net/socket/dns/http modules and
 # everything with smoltcp types in its signatures. Optional so a rump-only build
 # (devbox) can compile it out entirely. The rump path (rump_tap + the kernel

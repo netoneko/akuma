@@ -21,6 +21,7 @@ use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
 use crate::hal::NetHal;
 use crate::runtime::runtime;
+use crate::runtime::PreemptGuard;
 
 // ============================================================================
 // Constants
@@ -586,6 +587,10 @@ pub fn init(mmio_addrs: &[usize], enable_dhcp: bool) -> Result<(), &'static str>
 pub fn poll() -> bool {
     POLL_ENTERED.fetch_add(1, Ordering::Relaxed);
     let socket_state_changed = {
+        // Hold preemption disabled for the whole NETWORK critical section so the
+        // spinlock is never stranded across a context switch (fatal under the
+        // BKL — see `PreemptGuard`). No-op on non-smp-shared builds.
+        let _pg = PreemptGuard::new();
         let mut guard = NETWORK.lock();
         mark_acquire(NetSite::Poll);
         let result = if let Some(net) = guard.as_mut() {
@@ -696,6 +701,9 @@ pub fn with_network<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut NetworkState) -> R,
 {
+    // Preemption disabled for the whole hold: the NETWORK spinlock must never be
+    // stranded across a context switch under the BKL (see `PreemptGuard`).
+    let _pg = PreemptGuard::new();
     let mut guard = NETWORK.lock();
     mark_acquire(NetSite::WithNetwork);
     let result = guard.as_mut().map(f);
