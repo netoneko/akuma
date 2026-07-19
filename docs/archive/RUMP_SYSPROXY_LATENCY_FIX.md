@@ -1086,17 +1086,87 @@ does not touch it. But ~38 ms ≈ ~4 ticks strongly suggests the same
 tick-gated-wakeup disease between the userspace sshd thread and the kernel
 net-poll loop — a separate follow-up with the same harness.
 
+## Phase 3a2 — autonomous kernel RX pump BUILT: fixes RX starvation, but the recv gate is still flaky + low payoff (2026-07-19)
+
+Built the kernel RX pump that Phase 3a identified as the prerequisite, re-applied
+the Phase 3a probe-gate on top, and tested end-to-end. Result: the pump works and
+proves the RX-starvation half of the diagnosis — but the recv short-circuit stays
+timing-fragile and the latency win is marginal, so the combination is **not
+shippable**. Reverted. Recorded so the next attempt starts from the real wall.
+
+### What was built
+
+- `rx_pump_tick()` (`src/rump_proxy.rs`), called from the timer IRQ (`timer.rs`,
+  ~10 ms): if a frame is waiting at NIC1, wake rump_server's OS thread (the
+  registered network thread, `threading::network_thread_id`) so its cooperative RX
+  fiber reads it — RX no longer depends on userspace socket-syscall pokes.
+- IRQ-safe via `rump_tap::try_has_frame()` (a `try_lock` variant — never blocks the
+  IRQ on a tap lock a preempted thread holds; a missed poll retries next tick) and
+  `ThreadWaker::wake` (the same atomic-store + SGI the timer already issues).
+- No-op when nothing waits (idle CPU preserved) or on non-rump boots.
+
+### Measured (reliable `ssh -tt` PTY harness; paramiko `ssh_harness.py echo` hangs on baseline too)
+
+The pump demonstrably fires and un-starves RX — diagnostic counters on a **working**
+boot: `pump=31 (frames waited → rump woken) lockfail=0 (try_lock never lost) tap_rx=32
+(RX flowing, vs +4 when starved) recv_skip=3`. Interactive: **10/10, 10/10, 10/10 @
+~192–229 ms median** (min 91 ms). So RX-scheduling starvation was real and the pump
+cures it.
+
+**But it is flaky across boots.** A *fresh* boot's first interactive connection came
+back **0/10** with `pump=40 tap_rx=51 lockfail=0` — the pump was firing and frames
+were flowing, yet the session still stalled, with `recv_skip=1063` (vs 3 on the good
+boot). The recv gate is **bistable**: if it stays in "keep probing" mode it drains
+normally (works, ~baseline); if it once falls into "skip" mode it can't climb out.
+The trigger is a race the pump does NOT fix — a frame bumps the generation, the
+bridge probes during the recency window and gets EAGAIN because rump's
+frame→socket-buffer processing hasn't finished, records the now-current generation,
+the window expires, processing completes at the *same* generation (no new frame to
+re-bump it), and the gate skips forever. rump's processing lag has no safe upper
+bound under scheduler contention (Phase 3l), so no fixed recency window closes this.
+
+### Why it was abandoned (two independent reasons)
+
+1. **Flaky on a load-bearing path** — 10/10 on one boot, 0/10 on the next, same
+   binary. The recv short-circuit's correctness depends on a timing relationship
+   (probe-vs-processing at the same generation) with no robust bound. A safety valve
+   (force a real probe every N skips, or a probe-count instead of time window) trades
+   the flakiness back for exactly the idle round-trips it was removing.
+2. **Marginal payoff even when it works** — steady keystroke latency is dominated by
+   the *necessary* recvfrom(keystroke) + sendto(echo) round-trips, not the idle
+   EAGAINs. Working-build median ~212 ms vs baseline ~225 ms is within noise (min did
+   drop to 91 ms). The idle-CPU win is real but was never the stated goal.
+
+### What stands (for a future attempt)
+
+The pump itself is a sound, reusable mechanism and its diagnosis is now solid: RX
+starvation is real and a timer-driven `has_frame → wake network thread` cures it
+cheaply (idle-gated, `lockfail=0`). The unsolved part is the **readiness gate**, not
+the pump. Any real push-readiness needs readiness to be *event-accurate* (know when a
+specific socket has data), not *generation-approximate* — e.g. rump_server signalling
+per-socket readiness back over a side channel, or a frankenlibc/in-process model that
+removes the sysproxy round-trip entirely. Gating a coarse global generation against
+an unbounded processing lag is the dead end this phase closes.
+
+### Note: smoltcp floor is a separate, analogous issue
+
+The 37.8 ms smoltcp keystroke floor does NOT go through rump/sysproxy, so Tier 1
+does not touch it. But ~38 ms ≈ ~4 ticks strongly suggests the same
+tick-gated-wakeup disease between the userspace sshd thread and the kernel
+net-poll loop — a separate follow-up with the same harness.
+
 ## Future work (Phase 3, not started)
 
-- **Phase 3a2 (now the blocker for push readiness, not optional)**: an
-  autonomous kernel-side RX pump for rump. Phase 3a proved the userspace probe
-  traffic is what currently pumps rump's tap RX, so push readiness is impossible
-  until RX progresses without it. Two shapes: (a) kernel polls NIC1's RX ring in
-  its own timer/net-poll loop and wakes rump_server's tap-blocked RX thread on
-  arrival (no new IRQ needed — reuses the existing poll-based net model); or
-  (b) a genuine NIC1 GIC RX interrupt (more invasive, none exists today). Either
-  makes RX independent of userspace probes; only then does gating the probes
-  (Phase 3a) or a blocking-`ppoll` bridge become safe.
+- **Phase 3a2 (BUILT + reverted — see the Phase 3a2 section above)**: the
+  autonomous kernel RX pump (timer IRQ → `has_frame` → wake network thread) was
+  built and works — it cures the RX-starvation Phase 3a found (pump fires,
+  `lockfail=0`, RX flows, some boots 10/10). But it does NOT make push readiness
+  shippable: the recv gate stays bistable/flaky across boots (10/10 vs 0/10, same
+  binary) because rump's frame→socket-buffer processing lag at a fixed generation
+  has no safe recency bound, and the latency payoff is marginal anyway. The pump is
+  sound and reusable; the dead end is the coarse generation-based gate. A real fix
+  needs event-accurate per-socket readiness (rump signalling readiness back, or an
+  in-process/frankenlibc model with no sysproxy round-trip), not probe-gating.
 - **Phase 3c**: Port `rumpcomp_tap.c` (241 lines, C-ABI to NetBSD
   `librumpnet_virtif`) to Rust for parity and maintainability.
 - **Phase 3d**: Per-socket wakers (conditional wake instead of broadcast) to

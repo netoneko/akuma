@@ -191,12 +191,17 @@ shared `rump_proxy.rs`/`sysproxy.rs` code paths this doc describes.
   reading the tap (`tap_rx` advanced +4 frames/30 s vs ~25 baseline), so
   readiness never advanced and every recv skipped forever. Measured with an
   `ssh -tt` PTY harness: baseline 8/8 @ ~225 ms, gated 0/10 (total stall).
-  Reverted in full. **The real prerequisite is an autonomous kernel-side RX
-  pump** (kernel polls NIC1's RX ring in its net-poll loop and wakes rump's
-  tap-blocked RX thread), so RX no longer depends on userspace probe traffic;
-  only then is gating the probes (or a blocking-`ppoll` bridge) safe. Full
-  write-up: `archive/RUMP_SYSPROXY_LATENCY_FIX.md` Phase 3a; the pump is Phase
-  3a2 there.
+  The **Phase 3a2 kernel RX pump** (timer IRQ → `has_frame` → wake the network
+  thread) was then built and *does* cure the RX starvation (pump fires,
+  `lockfail=0`, RX flows, some boots 10/10) — but it still isn't shippable: the
+  recv gate stays **bistable/flaky across boots** (10/10 vs 0/10, same binary)
+  because rump's frame→socket-buffer processing lag at a fixed generation has no
+  safe recency bound, and the latency win is marginal anyway (~212 ms vs 225 ms
+  baseline). Both attempts reverted. A real fix needs **event-accurate per-socket
+  readiness** (rump signalling readiness back over a side channel, or an
+  in-process/frankenlibc model that removes the sysproxy round-trip), not
+  probe-gating a coarse global generation. Full write-up:
+  `archive/RUMP_SYSPROXY_LATENCY_FIX.md` Phase 3a + 3a2.
 - **One rump per `/dev/net/tap0` per boot.** The NIC1 RX two-phase state
   machine isn't reset on close, so only one rump owner can hold the tap per
   boot.
