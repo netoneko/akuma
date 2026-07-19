@@ -616,9 +616,19 @@ impl UserAddressSpace {
         let rt = runtime();
         let frame = (rt.alloc_page_zeroed)().ok_or("Out of memory for user page")?;
         (rt.track_frame)(frame, FrameSource::ElfLoader);
-        { let _irq = IrqGuard::new(); *self.user_frames.lock().entry(frame.addr).or_insert(0) += 1; }
-        self.map_page(va, frame.addr, user_flags)?;
+        self.map_and_track(va, frame, user_flags)?;
         Ok(frame)
+    }
+
+    /// Install an *already-allocated* frame at `va` and record it in `user_frames` —
+    /// the "install" half of [`alloc_and_map`]. Split out so a caller can allocate the
+    /// frame OUTSIDE a per-AS page-table lock (`Process::as_lock`) and hold that lock
+    /// only across this PTE-editing step (shared-kernel SMP: alloc must not run under
+    /// `as_lock` — the PMM OOM/reclaim path can re-enter it). Contains only PTE writes
+    /// + the self-locked `user_frames` bookkeeping.
+    pub fn map_and_track(&mut self, va: usize, frame: PhysFrame, user_flags: u64) -> Result<(), &'static str> {
+        { let _irq = IrqGuard::new(); *self.user_frames.lock().entry(frame.addr).or_insert(0) += 1; }
+        self.map_page(va, frame.addr, user_flags)
     }
 
     pub fn is_range_mapped(&self, va_start: usize, len: usize) -> bool {

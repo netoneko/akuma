@@ -205,6 +205,27 @@ pub fn lookup_process(pid: Pid) -> Option<&'static mut Process> {
     Some(unsafe { &mut *ptr })
 }
 
+/// Look up a process by PID, returning a **shared** `&'static Process`.
+///
+/// The shared-kernel-SMP (M5b) BKL-free page-fault path uses this instead of
+/// [`lookup_process`] so two cores faulting in different address spaces don't both
+/// materialize `&'static mut` to the same object (aliasing UB). Every address-space
+/// mutation the fault path needs is a `&self` method (`track_user_frame`,
+/// `track_page_table_frame`, `vm_with_regions`, `with_as_locked`) or a free function
+/// (`mmu::map_user_page*`); the actual cross-core mutual exclusion on the raw
+/// page-table writes comes from [`Process::as_lock`], not from `&mut` exclusivity.
+///
+/// # Safety warning
+/// Same lifetime caveat as [`lookup_process`]: valid only while the process stays
+/// registered. The fault fast path only ever looks up its **own** live thread-group
+/// leader (`as_owner`), which cannot be freed while the faulting thread runs, so the
+/// reference is sound there. Foreign-PID lookups must stay on the BKL slow path.
+pub fn lookup_process_shared(pid: Pid) -> Option<&'static Process> {
+    let ptr = crate::process::table::get_process_ptr(pid)?;
+    crate::process::diag::borrow_inc(pid);
+    Some(unsafe { &*ptr })
+}
+
 /// Outcome of [`fault_slot_acquire`] — how the per-page demand-paging slot was won.
 pub enum FaultSlot {
     /// No address-space-owner process is registered; caller skips serialization.

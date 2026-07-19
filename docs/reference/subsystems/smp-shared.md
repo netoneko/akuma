@@ -79,7 +79,9 @@ they run on more than one core.
 | M2c — secondaries run the shared scheduler | ✅ threads on 2 & 4 cores |
 | M3 — userspace on secondaries (+ inner-shareable TLB) | ✅ userspace on 2 & 4 cores |
 | M4 — migration + hardening (cross-core wakeup deferred) | ✅ 1 thread on 4 cores |
-| M5 — fine-grained locking (real ASIDs, split BKL, cross-core wakeup) | planned |
+| M5a — network SMP-safety, devbox boots to sshd under SMP | ✅ SMP=2 clean, SMP=4 works |
+| M5b — BKL-free user page-fault path (per-AS `as_lock`) | 🚧 Stages 1–2 done (primitives + syscall wiring, no regression); Stages 3–4 (fault restructure + flip) next |
+| M5 — fine-grained locking (real ASIDs, split BKL, cross-core wakeup) | in progress (see M5b) |
 
 > **Known open item:** the *full devbox-smoltcp boot to sshd* stalls under active
 > secondaries (SMP=1 boots fine). gdb root-caused two issues (see

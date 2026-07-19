@@ -217,6 +217,20 @@ pub struct Process {
     /// frame-free is performed while it is held (those happen on the returned
     /// frames after the lock is released), so it can never be held across a yield.
     pub vm_lock: Spinlock<()>,
+    /// Serializes hardware page-table mutation for this address space across cores
+    /// under shared-kernel SMP (real M5b). The BKL-free user page-fault path takes
+    /// this (instead of the BKL) for its short PTE-install window; every AS-mutating
+    /// syscall (`mmap`/`munmap`/`mprotect`/`brk`/teardown/CoW-mark) takes it in
+    /// addition to the BKL it already holds, so a concurrent fault on the same
+    /// address space excludes correctly. Unlike [`Process::vm_lock`] (which guards
+    /// only the `mmap_regions` `Vec` for pure Vec ops), this covers the raw
+    /// page-table writes in `mmu::map_user_page*` / `AddressSpace::{un,}map_page`.
+    /// Held only for short windows with preemption disabled — NEVER across alloc,
+    /// block I/O, or a context switch (see [`Process::with_as_locked`] and
+    /// docs/archive/SMP_SHARED_M5_FAULT_LOCK_PLAN.md). CLONE_VM members share the
+    /// leader's, keyed by `tgid`, exactly like [`Process::fault_mutex`]. Lock order:
+    /// `BKL > as_lock > {PMM, page_table_frames, user_frames, fault_mutex, ...}`.
+    pub as_lock: Spinlock<()>,
     pub sigaltstack_sp: u64,
     pub sigaltstack_flags: i32,
     pub sigaltstack_size: u64,
@@ -251,6 +265,25 @@ pub fn kill_box(box_id: u64) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// RAII hold of an address space's `as_lock` with IRQs disabled — see
+/// [`Process::as_lock_hold`]. Field drop order (declaration order) releases the lock
+/// before restoring DAIF. smp-shared only.
+#[cfg(kernel_smp_shared)]
+pub struct AsLockHold<'a> {
+    _g: spinning_top::guard::SpinlockGuard<'a, ()>,
+    _irq: crate::runtime::IrqGuard,
+}
+
+#[cfg(kernel_smp_shared)]
+impl<'a> AsLockHold<'a> {
+    #[inline]
+    pub fn new(as_lock: &'a Spinlock<()>) -> Self {
+        let _irq = crate::runtime::IrqGuard::new();
+        let _g = as_lock.lock();
+        AsLockHold { _g, _irq }
+    }
+}
+
 impl Process {
     /// Run `f` with exclusive access to [`Process::mmap_regions`], serialized by
     /// [`Process::vm_lock`] with IRQs disabled. This is the ONLY sanctioned way to
@@ -278,6 +311,54 @@ impl Process {
             };
             f(regions)
         })
+    }
+
+    /// Run `f` holding this address space's page-table lock ([`Process::as_lock`])
+    /// with preemption disabled — the shared-kernel-SMP (M5b) primitive that lets a
+    /// user page fault mutate page tables **without** the Big Kernel Lock while still
+    /// excluding concurrent AS-mutating syscalls and sibling faults on the same
+    /// address space.
+    ///
+    /// `f` MUST be short and self-contained: PTE writes + frame tracking only. It MUST
+    /// NOT allocate frames, do block I/O, or yield while held — do that work before/
+    /// after (on private frames), exactly like [`Process::vm_with_regions`]. IRQs are
+    /// disabled for the whole hold, so (a) `as_lock` is never carried across a context
+    /// switch (the "spinlock across switch" deadlock class), and (b) a nested timer IRQ
+    /// can't acquire the BKL behind our back and leak it (an `as_lock`→BKL inversion) —
+    /// the fault fast path holds `as_lock` *instead of* the BKL. See
+    /// docs/archive/SMP_SHARED_M5_FAULT_LOCK_PLAN.md.
+    ///
+    /// On builds without `kernel_smp_shared` this compiles to just `f()` — no lock, no
+    /// IRQ change — so single-core/size/extreme/multikernel builds are unaffected.
+    #[inline]
+    pub fn with_as_locked<R>(&self, f: impl FnOnce() -> R) -> R {
+        #[cfg(kernel_smp_shared)]
+        {
+            // Locals drop in reverse declaration order: `_g` (release lock) before
+            // `_irq` (restore DAIF) — release the lock before re-enabling IRQs.
+            let _irq = crate::runtime::IrqGuard::new();
+            let _g = self.as_lock.lock();
+            f()
+        }
+        #[cfg(not(kernel_smp_shared))]
+        {
+            f()
+        }
+    }
+
+    /// RAII hold of this address space's [`Process::as_lock`] with IRQs disabled — the
+    /// counterpart to [`Process::with_as_locked`] for the `&mut Process` syscall paths
+    /// (`mmap`/`munmap`/`mprotect`/`brk`/teardown) where a closure would conflict with
+    /// the disjoint `&mut self.address_space` edits it guards.
+    ///
+    /// Construct as `AsLockHold::new(&proc.as_lock)` so only the `as_lock` *field* is
+    /// borrowed, leaving `proc.address_space` free to mutate (disjoint-field borrow).
+    /// Same discipline as [`Process::with_as_locked`]: short window, no alloc/IO/yield.
+    /// smp-shared only; call sites gate the `let _g = …` line on `cfg(kernel_smp_shared)`.
+    #[cfg(kernel_smp_shared)]
+    #[must_use]
+    pub fn as_lock_hold(as_lock: &Spinlock<()>) -> AsLockHold<'_> {
+        AsLockHold::new(as_lock)
     }
 
     /// Create a new process from ELF data
@@ -352,6 +433,7 @@ impl Process {
             signal_mask: 0,
             fault_mutex: Spinlock::new(BTreeMap::new()),
             vm_lock: Spinlock::new(()),
+            as_lock: Spinlock::new(()),
             sigaltstack_sp: 0,
             sigaltstack_flags: 2, // SS_DISABLE
             sigaltstack_size: 0,
@@ -450,6 +532,7 @@ impl Process {
             signal_mask: 0,
             fault_mutex: Spinlock::new(BTreeMap::new()),
             vm_lock: Spinlock::new(()),
+            as_lock: Spinlock::new(()),
             sigaltstack_sp: 0,
             sigaltstack_flags: 2, // SS_DISABLE
             sigaltstack_size: 0,
@@ -554,7 +637,16 @@ impl Process {
             let mut page = old_top;
             while page < aligned {
                 if !self.address_space.is_range_mapped(page, 0x1000) {
-                    let _ = self.address_space.alloc_and_map(page, crate::mmu::user_flags::RW_NO_EXEC);
+                    // Allocate the frame OUTSIDE `as_lock` (the PMM OOM/reclaim path can
+                    // re-enter it), then install it under the hold so a concurrent
+                    // BKL-free fault on this address space excludes correctly.
+                    let rt = runtime();
+                    if let Some(frame) = (rt.alloc_page_zeroed)() {
+                        (rt.track_frame)(frame, FrameSource::ElfLoader);
+                        #[cfg(kernel_smp_shared)]
+                        let _asg = AsLockHold::new(&self.as_lock);
+                        let _ = self.address_space.map_and_track(page, frame, crate::mmu::user_flags::RW_NO_EXEC);
+                    }
                 }
                 page += 0x1000;
             }
@@ -1362,6 +1454,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         signal_mask: parent.signal_mask,
         fault_mutex: Spinlock::new(BTreeMap::new()),
         vm_lock: Spinlock::new(()),
+        as_lock: Spinlock::new(()),
         sigaltstack_sp: parent.sigaltstack_sp,
         sigaltstack_flags: parent.sigaltstack_flags,
         sigaltstack_size: parent.sigaltstack_size,
@@ -2019,6 +2112,7 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
         signal_mask: parent.signal_mask,
         fault_mutex: Spinlock::new(BTreeMap::new()),
         vm_lock: Spinlock::new(()),
+        as_lock: Spinlock::new(()),
         sigaltstack_sp: parent.sigaltstack_sp,
         sigaltstack_flags: parent.sigaltstack_flags,
         sigaltstack_size: parent.sigaltstack_size,
@@ -2146,6 +2240,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         signal_mask: parent.signal_mask,
         fault_mutex: Spinlock::new(BTreeMap::new()),
         vm_lock: Spinlock::new(()),
+        as_lock: Spinlock::new(()),
         sigaltstack_sp: parent.sigaltstack_sp,
         sigaltstack_flags: parent.sigaltstack_flags,
         sigaltstack_size: parent.sigaltstack_size,

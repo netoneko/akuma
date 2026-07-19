@@ -416,3 +416,82 @@ per-core idle, inner-shareable TLB flushes `...is`, real per-AS ASIDs, map all G
 frames), M3 userspace on secondaries, M4 migration + cross-core wakeups, M5
 fine-grained locking (PMM/heap out first, then the `&'static mut Process` refcount
 rework, then VFS/net).
+
+## M5b — BKL-free user page-fault path (per-AS lock) — IN PROGRESS
+
+Attacks the SMP=4 residual: a live SMP=4 self-test run measured all four `smp_shared_*`
+tests PASSING but **~102 transient `[BKL] stuck` events (99 `owner=1`)** before the
+pre-existing `test_mmap_file_oom` baseline panic — one core holding the BKL ~10 ms at a
+time during FS/mmap-heavy work while the other three spin. Root of the win: run the
+expensive part of demand paging (file block I/O, page copy/zero) **without** the BKL.
+
+Design (approved; full doc: [`SMP_SHARED_M5_FAULT_LOCK_PLAN.md`](SMP_SHARED_M5_FAULT_LOCK_PLAN.md)).
+Two naive shortcuts were rejected as unsound: (1) dropping the BKL while keeping
+`&'static mut Process` is aliasing UB; (2) dropping the BKL around block I/O turns every
+other `BLOCK_DEVICE.lock()`-under-BKL site into a deadlock. Investigation also found the
+only AS structure NOT already self-locked is the **raw page-table memory** (edited by
+`map_user_page*` / `AddressSpace::{un,}map_page` / `update_page_flags`); `user_frames`,
+`page_table_frames`, `mmap_regions` (`vm_lock`), CoW refcounts, and lazy regions all have
+their own locks. So the fix is a **per-address-space page-table lock** (`Process::as_lock`)
+that the fault path takes *instead of* the BKL and every AS-mutating syscall takes *in
+addition to* the BKL. Key simplification: syscalls keep the BKL, so `as_lock` only ever
+arbitrates fault-vs-syscall and fault-vs-fault (never syscall-vs-syscall). `as_lock` is
+held **IRQs-off** for short windows only (never across alloc/block-I/O/switch): IRQs-off
+prevents a nested timer IRQ from acquiring the BKL behind a fault's back (an `as_lock`→BKL
+inversion) and prevents holding the lock across a context switch. Lock order:
+`BKL > as_lock > {PMM, page_table_frames, user_frames, fault_mutex, BLOCK_DEVICE, ...}`.
+
+### M5b Stage 1 — primitives ✅ (2026-07-19)
+
+`Process::as_lock: Spinlock<()>` (shared across CLONE_VM members via the leader, keyed by
+`tgid`, like `fault_mutex`); `Process::with_as_locked` (closure form, IRQs-off + lock, for
+the `&self` fault path) and `AsLockHold`/`Process::as_lock_hold` (RAII, for the
+`&mut Process` syscall paths where a closure conflicts with the disjoint
+`&mut self.address_space` edits); `lookup_process_shared -> &'static Process` (fault path,
+avoids the `&mut` aliasing UB — all AS mutations it needs are `&self` or free functions).
+All no-ops / uncompiled unless `cfg(kernel_smp_shared)`. Compiles both configs; 114
+akuma-exec host tests pass.
+
+### M5b Stage 2 — wire `as_lock` into AS-mutating syscalls ✅ (2026-07-19)
+
+Every raw page-table edit *sequence* in `sys_mmap`/`sys_mremap`/`sys_munmap`/`sys_mprotect`/
+`sys_brk`/`sys_madvise` now holds `as_lock` across the PTE writes + `user_frames`
+bookkeeping, with **alloc and free kept OUTSIDE the hold** (the PMM OOM/reclaim path can
+unmap pages and re-enter `as_lock` → self-deadlock if held across alloc; frees are
+collected and run after release). `sys_mremap` and `sys_munmap` were restructured to
+pre-allocate / collect-then-free; `set_brk` gained `AddressSpace::map_and_track` (the
+"install" half of `alloc_and_map`) so its per-page grow allocs outside the hold. Faults
+STILL take the BKL here, so `as_lock` is redundant with the BKL — **zero behavior change,
+pure foundation**. Verified: clippy clean (smp-shared + default), 114 host tests,
+`SMP=2` and `SMP=4` boot self-tests all PASS
+(`cores_online`/`scheduler`/`userspace`/`migration`) with contention NOT regressed
+(SMP=4 ~43 transient stuck this run vs the ~102 baseline, within boot-to-boot variance).
+
+**Files:** `crates/akuma-exec/src/process/mod.rs` (`as_lock` field + `with_as_locked` +
+`AsLockHold` + `set_brk`), `.../process/children.rs` (`lookup_process_shared`),
+`.../mmu/mod.rs` (`map_and_track`), `src/syscall/mem.rs` (all AS-edit sequences),
+`src/process_tests.rs` + `src/tests.rs` (Process literal field).
+
+### M5b Stage 3 — restructure file-backed fault (read-pass/install-pass) — NEXT
+
+The file-backed demand-paging loop (`exceptions.rs`, `EC_DATA_ABORT_LOWER`) interleaves
+block I/O (`vfs::read_at*`) with `map_user_page_no_flush` per page. Split it: **Pass B**
+(no `as_lock`, no BKL later) allocs the frame pool + does all block I/O + fill + icache
+maintenance into private frames; **Pass C** (`as_lock`) re-validates the lazy region still
+exists (matches BKL semantics vs a racing `munmap`) and installs PTEs + tracks frames +
+flushes. Also wire `as_lock` into the CoW, PROT_NONE-commit, anon, and single-page-fallback
+edits (so *all* fault-path PTE edits honor the invariant — even disjoint fault types race
+on shared intermediate page-table nodes). Keep faults on the BKL through Stage 3 (verify no
+regression under BKL), then:
+
+### M5b Stage 4 — flip fault fast path BKL-free — AFTER 3
+
+Route resolvable self-AS data-abort faults through `as_lock` instead of `enter_kernel`;
+keep the BKL for the SVC arm and the slow paths (SIGSEGV/signals, foreign-`parent_pid`
+lookups, OOM, kernel-VA faults). Wire `as_lock` into `exit`/`exec` AS teardown and `fork`
+CoW-marking (teardown is delicate — `as_lock` lives *in* the Process being freed; the
+group can't fully exit while a member thread is mid-fault). Add a `process_tests.rs`
+self-test (two processes fault concurrently on distinct address spaces on distinct cores;
+assert the BKL is not held during the fault window). Success metric: SMP=4 transient
+`[BKL] stuck` count drops sharply vs the ~102 baseline; devbox-smoltcp SMP=2/4 boot + ssh
+with 0 stuck.

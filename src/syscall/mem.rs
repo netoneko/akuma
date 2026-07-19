@@ -224,6 +224,10 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         }
         if is_fixed {
             let _ = akuma_exec::process::munmap_lazy_regions_in_range(proc.tgid, addr, pages * 4096);
+            // Page-table edits under `as_lock` (shared-kernel SMP): excludes a
+            // concurrent BKL-free fault on this address space. No alloc/IO here.
+            #[cfg(kernel_smp_shared)]
+            let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
             for i in 0..pages {
                 let va = addr + i * 4096;
                 let _ = proc.address_space.unmap_page(va);
@@ -333,19 +337,26 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     };
     let _ = map_populate; // populate is now subsumed by the lazy fallback above
     let mut frames = alloc::vec::Vec::with_capacity(pages);
-    for (i, frame) in frame_batch.into_iter().enumerate() {
-        let (table_frames, _) = unsafe {
-            akuma_exec::mmu::map_user_page_no_flush(mmap_addr + i * 4096, frame.addr, initial_flags)
-        };
-        proc.address_space.track_user_frame(frame);
-        for tf in table_frames {
-            proc.address_space.track_page_table_frame(tf);
+    {
+        // Page-table install under `as_lock` (shared-kernel SMP): frames were already
+        // allocated above (alloc must stay OUTSIDE the hold — the PMM OOM/reclaim path
+        // can unmap pages and re-enter `as_lock`). Excludes concurrent BKL-free faults.
+        #[cfg(kernel_smp_shared)]
+        let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+        for (i, frame) in frame_batch.into_iter().enumerate() {
+            let (table_frames, _) = unsafe {
+                akuma_exec::mmu::map_user_page_no_flush(mmap_addr + i * 4096, frame.addr, initial_flags)
+            };
+            proc.address_space.track_user_frame(frame);
+            for tf in table_frames {
+                proc.address_space.track_page_table_frame(tf);
+            }
+            frames.push(frame);
         }
-        frames.push(frame);
+        // Single TLB flush for the entire mmap range (still under the hold).
+        akuma_exec::mmu::flush_tlb_range(mmap_addr, pages);
     }
     crate::pmm::dp_count(&crate::pmm::EAGER_MMAP_PAGES, pages);
-    // Single TLB flush for the entire mmap range.
-    akuma_exec::mmu::flush_tlb_range(mmap_addr, pages);
     if is_file_backed {
         if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
             let path = f.path;
@@ -371,6 +382,9 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             }
         }
         if page_flags != initial_flags {
+            // Permission fix-up under `as_lock` (shared-kernel SMP). PTE edits only.
+            #[cfg(kernel_smp_shared)]
+            let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
             for i in 0..pages {
                 let _ = proc.address_space.update_page_flags(mmap_addr + i * 4096, page_flags);
             }
@@ -434,16 +448,28 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
     };
 
     if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
-        let mut new_frames = alloc::vec::Vec::new();
-        for i in 0..new_pages {
+        // Pre-allocate all frames BEFORE taking `as_lock` (alloc must stay outside the
+        // hold — the PMM OOM/reclaim path can re-enter `as_lock`). Roll back on OOM.
+        let mut new_frames = alloc::vec::Vec::with_capacity(new_pages);
+        for _ in 0..new_pages {
             if let Some(frame) = crate::pmm::alloc_page_zeroed() {
                 new_frames.push(frame);
+            } else {
+                for f in new_frames { crate::pmm::free_page(f); }
+                return ENOMEM;
+            }
+        }
+        {
+            // Page-table install under `as_lock` (shared-kernel SMP). PTE edits only.
+            #[cfg(kernel_smp_shared)]
+            let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+            for (i, frame) in new_frames.iter().enumerate() {
                 let (table_frames, _) = unsafe { akuma_exec::mmu::map_user_page(new_addr + i * 4096, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC) };
-                proc.address_space.track_user_frame(frame);
+                proc.address_space.track_user_frame(*frame);
                 for tf in table_frames {
                     proc.address_space.track_page_table_frame(tf);
                 }
-            } else { return ENOMEM; }
+            }
         }
 
         let copy_len = old_size.min(new_size);
@@ -472,33 +498,48 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
         });
         if let Some(old_frames) = old_frames_opt {
             let freed_size = old_frames.len() * 4096;
-            for (i, frame) in old_frames.into_iter().enumerate() {
-                let _ = proc.address_space.unmap_page(old_addr + i * 4096);
-                // Free only when this drops the frame's last reference; an
-                // aliased/shared PA is freed by its surviving owner instead.
-                if proc.address_space.remove_user_frame(frame) {
-                    crate::pmm::free_page(frame);
+            // Unmap + user-frame bookkeeping under `as_lock`; collect frames to free
+            // and free them AFTER releasing the hold (free stays outside).
+            let mut to_free = alloc::vec::Vec::new();
+            {
+                #[cfg(kernel_smp_shared)]
+                let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+                for (i, frame) in old_frames.into_iter().enumerate() {
+                    let _ = proc.address_space.unmap_page(old_addr + i * 4096);
+                    // Free only when this drops the frame's last reference; an
+                    // aliased/shared PA is freed by its surviving owner instead.
+                    if proc.address_space.remove_user_frame(frame) {
+                        to_free.push(frame);
+                    }
                 }
             }
+            for frame in to_free { crate::pmm::free_page(frame); }
             proc.memory.free_regions.push((old_addr, freed_size));
             found_eager = true;
         }
 
         if !found_eager {
             let lazy_results = akuma_exec::process::munmap_lazy_regions_in_range(proc.tgid, old_addr, old_pages * 4096);
-            for &(freed_start, freed_pages) in &lazy_results {
-                for i in 0..freed_pages {
-                    if let Some(frame) = proc.address_space.unmap_and_free_page(freed_start + i * 4096) {
-                        crate::pmm::free_page(frame);
+            // Unmap under `as_lock`; free the returned frames after the hold.
+            let mut to_free = alloc::vec::Vec::new();
+            {
+                #[cfg(kernel_smp_shared)]
+                let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+                for &(freed_start, freed_pages) in &lazy_results {
+                    for i in 0..freed_pages {
+                        if let Some(frame) = proc.address_space.unmap_and_free_page(freed_start + i * 4096) {
+                            to_free.push(frame);
+                        }
+                    }
+                }
+                for i in 0..old_pages {
+                    let va = old_addr + i * 4096;
+                    if let Some(frame) = proc.address_space.unmap_and_free_page(va) {
+                        to_free.push(frame);
                     }
                 }
             }
-            for i in 0..old_pages {
-                let va = old_addr + i * 4096;
-                if let Some(frame) = proc.address_space.unmap_and_free_page(va) {
-                    crate::pmm::free_page(frame);
-                }
-            }
+            for frame in to_free { crate::pmm::free_page(frame); }
             proc.memory.free_regions.push((old_addr, old_pages * 4096));
         }
 
@@ -545,18 +586,24 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
                 Some(v) => v,
                 None => return 0, // advisory — ignore OOM
             };
-            for (idx, (page_va, flags)) in prefault.into_iter().enumerate() {
-                let frame = frames[idx];
-                let (table_frames, _) = unsafe {
-                    akuma_exec::mmu::map_user_page_no_flush(page_va, frame.addr, flags)
-                };
-                proc.address_space.track_user_frame(frame);
-                for tf in table_frames {
-                    proc.address_space.track_page_table_frame(tf);
+            {
+                // Prefault install under `as_lock` (shared-kernel SMP); frames were
+                // allocated above (alloc stays outside the hold).
+                #[cfg(kernel_smp_shared)]
+                let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+                for (idx, (page_va, flags)) in prefault.into_iter().enumerate() {
+                    let frame = frames[idx];
+                    let (table_frames, _) = unsafe {
+                        akuma_exec::mmu::map_user_page_no_flush(page_va, frame.addr, flags)
+                    };
+                    proc.address_space.track_user_frame(frame);
+                    for tf in table_frames {
+                        proc.address_space.track_page_table_frame(tf);
+                    }
                 }
+                // Flush the entire requested range (covers all newly mapped pages).
+                akuma_exec::mmu::flush_tlb_range(aligned_addr, (end - aligned_addr) / 4096);
             }
-            // Flush the entire requested range (covers all newly mapped pages).
-            akuma_exec::mmu::flush_tlb_range(aligned_addr, (end - aligned_addr) / 4096);
             0
         }
         MADV_DONTNEED => {
@@ -569,8 +616,14 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
             let aligned_addr = addr & !0xFFF;
             let aligned_len = ((addr + len + 0xFFF) & !0xFFF) - aligned_addr;
             let pages = aligned_len / 4096;
-            for i in 0..pages {
-                proc.address_space.zero_mapped_page(aligned_addr + i * 4096);
+            {
+                // `zero_mapped_page` reads page-table state to find each frame; hold
+                // `as_lock` so a concurrent BKL-free fault can't edit the tables under it.
+                #[cfg(kernel_smp_shared)]
+                let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+                for i in 0..pages {
+                    proc.address_space.zero_mapped_page(aligned_addr + i * 4096);
+                }
             }
             0
         }
@@ -616,15 +669,20 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
         // TLB range flush. Previously each update_page_flags call issued its
         // own dsb+tlbi+dsb+isb, causing O(pages) expensive barrier sequences.
         let mut any_updated = false;
-        for i in 0..pages {
-            let va = addr + i * 4096;
-            if proc.address_space.is_mapped(va) {
-                let _ = proc.address_space.update_page_flags_no_flush(va, new_flags);
-                any_updated = true;
+        {
+            // Permission edits under `as_lock` (shared-kernel SMP). PTE edits only.
+            #[cfg(kernel_smp_shared)]
+            let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+            for i in 0..pages {
+                let va = addr + i * 4096;
+                if proc.address_space.is_mapped(va) {
+                    let _ = proc.address_space.update_page_flags_no_flush(va, new_flags);
+                    any_updated = true;
+                }
             }
-        }
-        if any_updated {
-            akuma_exec::mmu::flush_tlb_range(addr, pages);
+            if any_updated {
+                akuma_exec::mmu::flush_tlb_range(addr, pages);
+            }
         }
         if adding_exec {
             for i in 0..pages {
@@ -700,15 +758,23 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
         }
         // Defer the TLB flush: clear each PTE without a per-page barrier,
         // then flush the whole region once (cheap-win E, COW_OPTIMIZATIONS.md).
-        for (i, frame) in frames.into_iter().enumerate() {
-            let _ = proc.address_space.unmap_page_no_flush(base + i * 4096);
-            // Free only when this drops the frame's last reference; an
-            // aliased/shared PA is freed by its surviving owner instead.
-            if proc.address_space.remove_user_frame(frame) {
-                crate::pmm::free_page(frame);
+        // Unmap + user-frame bookkeeping under `as_lock` (shared-kernel SMP); free the
+        // dropped frames AFTER releasing the hold (free stays outside).
+        let mut to_free = alloc::vec::Vec::new();
+        {
+            #[cfg(kernel_smp_shared)]
+            let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+            for (i, frame) in frames.into_iter().enumerate() {
+                let _ = proc.address_space.unmap_page_no_flush(base + i * 4096);
+                // Free only when this drops the frame's last reference; an
+                // aliased/shared PA is freed by its surviving owner instead.
+                if proc.address_space.remove_user_frame(frame) {
+                    to_free.push(frame);
+                }
             }
+            akuma_exec::mmu::flush_tlb_range_all_asid(base, n);
         }
-        akuma_exec::mmu::flush_tlb_range_all_asid(base, n);
+        for frame in to_free { crate::pmm::free_page(frame); }
         proc.memory.free_regions.push((addr, n * 4096));
         return 0;
     }
@@ -716,14 +782,19 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     let results = akuma_exec::process::munmap_lazy_regions_in_range(proc.tgid, addr, unmap_len);
     if !results.is_empty() {
         for &(freed_start, freed_pages) in &results {
-            let mut had_physical = false;
-            for i in 0..freed_pages {
-                if let Some(frame) = proc.address_space.unmap_and_free_page_no_flush(freed_start + i * 4096) {
-                    crate::pmm::free_page(frame);
-                    had_physical = true;
+            let mut to_free = alloc::vec::Vec::new();
+            {
+                #[cfg(kernel_smp_shared)]
+                let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+                for i in 0..freed_pages {
+                    if let Some(frame) = proc.address_space.unmap_and_free_page_no_flush(freed_start + i * 4096) {
+                        to_free.push(frame);
+                    }
                 }
+                akuma_exec::mmu::flush_tlb_range_all_asid(freed_start, freed_pages);
             }
-            akuma_exec::mmu::flush_tlb_range_all_asid(freed_start, freed_pages);
+            let had_physical = !to_free.is_empty();
+            for frame in to_free { crate::pmm::free_page(frame); }
             // Only recycle the VA range when physical pages were actually freed.
             // Pure lazy (PROT_NONE, never demand-paged) regions must NOT be put
             // back in free_regions: alloc_mmap prefers free_regions over
@@ -738,21 +809,33 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     }
 
     let total_pages = unmap_len / 4096;
+    // Compute the eager-membership mask first (vm_lock), so the `as_lock` window below
+    // is pure page-table work with no nested lock ordering to reason about.
+    let mut skip = alloc::vec::Vec::with_capacity(total_pages);
     for i in 0..total_pages {
         let va = addr + i * 4096;
-        let in_eager = proc.vm_with_regions(|r| r.iter().any(|(start, frames)| {
+        skip.push(proc.vm_with_regions(|r| r.iter().any(|(start, frames)| {
             va >= *start && va < *start + frames.len() * 4096
-        }));
-        if !in_eager
-            && let Some(frame) = proc.address_space.unmap_and_free_page_no_flush(va) {
-                crate::pmm::free_page(frame);
+        })));
+    }
+    let mut to_free = alloc::vec::Vec::new();
+    {
+        #[cfg(kernel_smp_shared)]
+        let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+        for (i, &skipped) in skip.iter().enumerate() {
+            if skipped { continue; }
+            let va = addr + i * 4096;
+            if let Some(frame) = proc.address_space.unmap_and_free_page_no_flush(va) {
+                to_free.push(frame);
             }
+        }
+        // Some VAs in [addr, addr+unmap_len) may have been skipped (in_eager) or
+        // never mapped, but flushing the whole span once is correct and cheaper
+        // than tracking which pages we actually cleared.
+        if total_pages > 0 {
+            akuma_exec::mmu::flush_tlb_range_all_asid(addr, total_pages);
+        }
     }
-    // Some VAs in [addr, addr+unmap_len) may have been skipped (in_eager) or
-    // never mapped, but flushing the whole span once is correct and cheaper
-    // than tracking which pages we actually cleared.
-    if total_pages > 0 {
-        akuma_exec::mmu::flush_tlb_range_all_asid(addr, total_pages);
-    }
+    for frame in to_free { crate::pmm::free_page(frame); }
     0
 }
