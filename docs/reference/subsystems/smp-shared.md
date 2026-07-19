@@ -82,10 +82,12 @@ they run on more than one core.
 | M5 — fine-grained locking (real ASIDs, split BKL, cross-core wakeup) | planned |
 
 > **Known open item:** the *full devbox-smoltcp boot to sshd* stalls under active
-> secondaries (mounts FS, spawns the async-network thread, then no progress to `herd`;
-> scheduler keeps ticking — no crash/deadlock). Userspace itself runs cross-core (the M3
-> test runs `/bin/hello` on 4 cores); the stall is in the async-network/herd-autostart
-> init path under SMP — needs a gdbstub root-cause. Run devbox single-core until fixed.
+> secondaries (SMP=1 boots fine). gdb root-caused two issues (see
+> [`../../archive/SMP_SHARED.md`](../../archive/SMP_SHARED.md) M4 open item): (1) a
+> bringup-vs-`threading::init` ordering/slot-timing interaction, and (2) the network
+> stack isn't SMP-safe — `httpd`'s `socket`/`bind` deadlocks the BKL against the async
+> net-poll thread (NETWORK lock held across a switch, now cross-core; an M5 item).
+> Userspace itself runs + migrates cross-core (M3/M4 tests). Run devbox single-core until fixed.
 | M3 — userspace on secondaries | planned |
 | M4 — migration + cross-core wakeups | planned |
 | M5 — fine-grained locking | planned |

@@ -297,15 +297,39 @@ anti-optimization under a BKL.
 pre-existing baseline; heavy virtio-blk FS init completes under SMP=4; clippy clean across
 smp-shared / devbox-smoltcp / default; 114 host tests pass.
 
-**Open item (top priority for the next session):** the *full devbox-smoltcp boot to
-userspace/sshd* stalls under active secondaries — it mounts the FS and spawns the
-async-main/network thread (tid=1), then makes no further progress to `herd`/`sshd` (the
-scheduler keeps ticking across cores — no crash, no deadlock, zero `[BKL] stuck`). At M0
-(task 2) this booted fine because secondaries were parked. Userspace itself is proven to
-run cross-core (the M3 test runs `/bin/hello` on 4 cores), so the stall is specific to the
-async-network/herd-autostart init path under SMP — needs a gdbstub root-cause (likely a
-per-core / BSP-affinity assumption in the async network runner). Until then, run the devbox
-image single-core, or the shared-SMP kernel with the boot self-tests.
+**Open item — full devbox-smoltcp boot to userspace under SMP (investigated, not yet fixed).**
+SMP=1 boots fully to userspace (herd/httpd/SmolNet); SMP≥2 stalls. gdbstub (lldb on :1235)
+root-caused **two** distinct problems, both real:
+
+1. **Bringup / `threading::init` ordering + slot timing.** `smp_shared::bringup_secondaries`
+   runs *before* `threading::init` in `kernel_main`. With that order the async-main thread
+   spawns into a slot that collides with a secondary's adopted idle slot (observed: async
+   main = "tid=1" == a secondary's "idle tid 1"), and boot stalls with both cores idle and
+   the async thread never running. Moving bringup to *after* `threading::init` fixes the
+   collision (async main becomes tid=4, distinct) and lets the devbox get much further —
+   **herd + httpd actually start** — BUT it regresses the boot-self-test build's contention
+   badly (~50 → ~2900 `[BKL] stuck`, tests don't complete). So the reorder is not a clean
+   fix and was reverted; the interaction between bringup timing and BKL contention needs a
+   proper solution (`ThreadPool::init` only touches slot 0, so it does not itself clobber
+   secondary slots — the collision is a timing/claim-order effect worth pinning down).
+
+2. **Network stack is not SMP-safe (the deeper blocker).** Even with #1 worked around, the
+   full boot then deadlocks in the socket/network path: right after `httpd` does
+   `socket()`+`bind(port=8080)`, the BKL wedges (`owner` cycling between cores). This is the
+   classic "NETWORK spinlock held across a scheduler switch" hazard (see
+   `runbooks/debug-network.md` / `debug-ssh-latency.md`) now going cross-core: the async
+   net-poll thread and a userspace socket syscall on different cores contend the `NETWORK`
+   lock vs. the BKL. Fixing it means making the network path SMP-safe (drop-before-yield
+   discipline enforced cross-core, or fold `NETWORK` under the BKL ordering) — natural M5
+   (fine-grained locking) work.
+
+Also note: on `devbox.img` the herd config pins `sshd`/`core2herd` to cores via `core_init`
+(a *multikernel* mechanism), so they fail to start under shared SMP regardless — that disk's
+herd `sshd.conf` needs re-provisioning for shared SMP (the task-2 follow-up).
+
+**Status:** the boot self-tests (M0–M4) pass at SMP=2/4; the *full devbox boot to sshd* under
+SMP needs the two fixes above. Run the devbox image single-core until then. Userspace itself
+runs + migrates cross-core (M3/M4 tests prove it).
 
 **Files:** `crates/akuma-exec/src/runtime.rs` (`wake_remote_idle` hook),
 `crates/akuma-exec/src/threading/mod.rs` (`sleep_us`, wake note), `src/smp_shared.rs`

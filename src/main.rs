@@ -816,10 +816,17 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     #[cfg(kernel_smp)]
     smp::bringup_secondaries(ram_base, ram_size);
 
-    // Real (shared-kernel) SMP — M0: wake secondary cores onto the SHARED boot page
-    // tables, PMM, and heap (no per-core isolation or partitions). In M0 each
-    // secondary just reports online and parks in WFE; the shared scheduler arrives
-    // in a later milestone. No-op with a single QEMU CPU. (docs/archive/SMP_SHARED.md)
+    // Real (shared-kernel) SMP: wake secondary cores onto the SHARED boot page tables,
+    // PMM, and heap. Each secondary adopts an idle thread and joins the one shared
+    // scheduler. No-op with a single QEMU CPU. (docs/archive/SMP_SHARED.md)
+    //
+    // NOTE: this runs before `threading::init` below. That is fine for the boot self-test
+    // suite (M0–M4 all pass), but the FULL devbox boot to userspace stalls under SMP —
+    // see the "known open item" in docs/archive/SMP_SHARED.md. Moving this after
+    // `threading::init` lets the devbox get further (herd/httpd start) but regresses the
+    // test build's contention and still hits a network-stack SMP deadlock, so the proper
+    // fix is deferred (needs the bringup/contention interaction resolved + the network
+    // path made SMP-safe). Left here to keep the verified milestones green.
     #[cfg(kernel_smp_shared)]
     smp_shared::bringup_secondaries();
 
