@@ -603,18 +603,32 @@ scheduler can run BKL-free — POOL makes the switch atomic and the IRQ reconcil
 the BKL only if the resumed thread is EL1. `rust_irq_handler_with_sp` was restructured to
 acknowledge up front, read the interrupted SPSR, and take a BKL-free path for an EL0-preempt
 scheduler SGI (device IRQs and EL1-preempt SGIs keep the BKL). **Correct at SMP=2** (full
-suite passes), but at **SMP≥4** the resulting concurrent schedulers hang a process
-(`parallel_processes` "P1 done: false" after ~38 s) — a scheduling bug in the concurrent
-BKL-free-scheduler / reconcile interaction, not yet root-caused. So step 2 is **gated off by
-default** (`smp_shared::set_sched_bklfree_el0_enabled`, default false); the code is retained
-for A/B debugging. Note: `test_smp_shared_fault_parallelism` is now gated to SMP=2 only (its
-busybox spawn-storm provokes the pre-existing SMP≥4 race and would halt the boot suite).
+suite passes), but at **SMP≥4** it triggers a BKL-monopolization livelock.
 
-**Status:** step 1 shipped + verified; step 2 needs the SMP≥4 hang debugged before enabling
-(gdb the concurrent-scheduler path; likely a lost wakeup or a reconcile-vs-switch race when
-two cores schedule BKL-free at once). **Files:** `crates/akuma-exec/src/threading/mod.rs`
-(POOL over switch), `src/exceptions.rs` (`rust_irq_handler_with_sp` restructure), `src/smp_shared.rs`
-(step-2 toggle). Profiler + `debug-smp.md` runbook added alongside.
+**SMP≥4 root cause (root-caused 2026-07-19).** The toggle only changes what a *secondary*
+does when a timer preempts it in EL0: it reschedules BKL-free, so its user thread stays
+`RUNNING` and never cycles through the global READY pool (the toggle-off path marks it READY
+under the BKL every tick). When the BSP's long EL1 operations (`ps` fork/exec/ELF-load) are
+timer-preempted, its scheduler finds nothing READY to switch to → returns `None` → the BSP
+resumes still holding the BKL, releasing only on a reconcile-to-EL0 that now rarely fires.
+On the unfair test-and-set BKL the BSP monopolizes the lock and the secondaries starve —
+reproduced as ~3000–5000 `[BKL] stuck: owner=1` events in a single boot (**all** `owner=1`,
+the BSP; ~30× the ~102 toggle-off baseline) with the workload frozen 9 s+, intermittently
+long enough to trip the 40 s `parallel_processes` timeout ("P1 done: false"). With the toggle
+OFF, every secondary tick takes the BKL path, forcing the lock to circulate each ~10 ms —
+which prevents the monopoly. Not a lost-wakeup / reconcile-vs-switch race (the earlier
+guess); it is a fairness/hold-time problem inherent to a coarse BKL. So step 2 is **gated off
+by default** (`smp_shared::set_sched_bklfree_el0_enabled`, default false); the code is
+retained for A/B debugging. Note: `test_smp_shared_fault_parallelism` is now gated to SMP=2
+only (its busybox spawn-storm provokes the pre-existing SMP≥4 race and would halt the boot).
+
+**Status:** step 1 shipped + verified; step 2 root-caused and correctly gated. The
+prerequisite for enabling it is shortening BKL hold times (M5b per-AS fault lock; split
+fork/exec/ELF-load off the BKL) and/or a fair/queued BKL — **not** more scheduler surgery.
+Full analysis in `docs/runbooks/debug-smp.md` (§"M5c step-2"). **Files:**
+`crates/akuma-exec/src/threading/mod.rs` (POOL over switch), `src/exceptions.rs`
+(`rust_irq_handler_with_sp` restructure), `src/smp_shared.rs` (step-2 toggle + root cause).
+Profiler + `debug-smp.md` runbook added alongside.
 
 Faults never take the BKL; use `as_lock` only, plus a fault-aware IRQ reconcile
 (per-thread "in-BKL-free-fault" flag so a timer tick releases rather than acquires the BKL

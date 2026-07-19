@@ -76,10 +76,27 @@ pub fn set_fault_bkl_drop_enabled(on: bool) {
 
 /// Runtime toggle (default **off**) for the M5c optimization: run the scheduler SGI
 /// BKL-free when it preempted EL0 (userspace, no BKL held), so peer cores' timer ticks
-/// don't serialize on the BKL. Correct at SMP=2, but at SMP≥4 the resulting concurrent
-/// schedulers currently hang a process (`parallel_processes` "P1 done: false") — under
-/// investigation — so it is disabled by default until debugged. The POOL-over-switch
-/// foundation (step 1) is always active and makes this safe to flip once fixed.
+/// don't serialize on the BKL. Correct at SMP=2. Left **off** because it is premature on
+/// the current coarse BKL, not because the switch itself is wrong.
+///
+/// ROOT CAUSE of the SMP≥4 "hang" (root-caused 2026-07-19, evidence in
+/// docs/runbooks/debug-smp.md): with this ON, a secondary that a timer preempts in EL0
+/// reschedules BKL-free, so its user thread stays `RUNNING` and never cycles through the
+/// global READY pool. When the BSP's long EL1 operations (e.g. `ps` fork/exec/ELF-load)
+/// are timer-preempted, its scheduler finds nothing READY to switch to → returns None →
+/// the BSP resumes still holding the BKL, releasing only on a reconcile-to-EL0 that now
+/// rarely happens. On the unfair test-and-set BKL the BSP then monopolizes the lock and
+/// the secondaries starve — observed as a flood of `[BKL] stuck: owner=1` (~30× the
+/// toggle-off baseline) and the workload frozen 9 s+, intermittently long enough to trip
+/// the 40 s `parallel_processes` timeout ("P1 done: false"). With the toggle OFF, every
+/// secondary tick takes the BKL path, forcing the lock to circulate each ~10 ms, which
+/// prevents the monopoly.
+///
+/// The fix is NOT more scheduler surgery: it is shortening BKL hold times (M5b per-AS
+/// fault lock; splitting fork/exec/ELF-load off the BKL) and/or a fair/queued BKL, so
+/// that removing per-tick circulation no longer lets one core monopolize the lock. Keep
+/// this gated until then. The POOL-over-switch foundation (step 1) is always active and
+/// makes this safe to flip once the BKL is no longer held for milliseconds at a time.
 static SCHED_BKLFREE_EL0_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Whether the BKL-free EL0-preempt scheduler path (M5c step 2) is enabled.
