@@ -1154,10 +1154,13 @@ fn run_async_main() -> ! {
     // Register this thread as the network poller so the scheduler boost targets it.
     //
     // Under `rump-default` (devbox), this thread drives the (compiled-but-unused)
-    // smoltcp stack and does no real work — the rump proxy kthread in
-    // `rump_proxy::attach_server` is the actual network path and must claim the
-    // boost slot instead. See `overlays/devbox/README.md` "Rump net thread
-    // starve under CPU-bound load" and `docs/runbooks/debug-devbox.md`.
+    // smoltcp stack and does no real work — so it must NOT claim the boost slot.
+    // `rump_proxy::start_default_stack` claims it instead, registering
+    // `rump_server`'s own main OS thread (the fiber scheduler that services every
+    // proxied socket syscall) — NOT the `attach_server` handshake kthread, which
+    // parks after `Client::connect` and does no per-call work. See
+    // `overlays/devbox/README.md` "Rump net thread starve under CPU-bound load"
+    // and `docs/runbooks/debug-devbox.md`.
     #[cfg(not(feature = "rump-default"))]
     threading::set_network_thread_id(threading::current_thread_id());
 
