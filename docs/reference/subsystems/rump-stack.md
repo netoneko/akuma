@@ -111,6 +111,21 @@ the full history): `rump_server` OS thread count **19 → 1**, PSTATS
 `recvfrom` so curl's poll loop doesn't block on the proxy's transport
 timeout, not a fiber change).
 
+**Per-syscall / keystroke latency (2026-07-19).** The residual ~300 ms
+single-keystroke floor over rump (vs ~38 ms on smoltcp) was root-caused to
+**Akuma-side scheduler round-trip latency**, not rump_server compute: a proxied
+syscall's request was written to the kernel→server pipe as two `pipe_write`s, and
+the first wake-SGI preempted the box thread mid-request → the server woke on a
+partial frame → the box waited ~5 × the 10 ms preemption tick to finish. Proof: an
+EAGAIN `recvfrom` (server does no work) still cost ~48 ms. Fixed by **coalescing
+the request AND the reply each into one `pipe_write`** (single wake, complete
+frame): keystroke p50 **318 → 219 ms**. The remaining ~20 ms/round-trip floor is
+rump_server's own internal fiber cadence; the wasted-EAGAIN-poll and `sendto`
+copyin-callback round trips are the next levers (the EAGAIN one needs kernel push
+readiness — see "Known limitations"). Full analysis + corrected earlier
+mis-conclusion + reverted dead ends: `archive/RUMP_SYSPROXY_LATENCY_FIX.md`
+Phase 3q.
+
 ## Syscall marshaling — what's proxied
 
 `op_from_linux_sysno` (`crates/akuma-rump/src/syscall_translation.rs:49`)
@@ -161,10 +176,17 @@ shared `rump_proxy.rs`/`sysproxy.rs` code paths this doc describes.
   syscall is uninterruptible (the channel read doesn't check pending
   signals), and the single `BoxProxy.client` slot means one wedged box proc
   blocks every other process sharing that box's stack.
-- **Bulk-transfer round-trips.** Readiness for a rump socket is a
-  `MSG_PEEK` sysproxy round-trip with a ~10 ms re-poll floor (no push
-  readiness from the tap RX / rump socket upcall yet) — fine for small
-  responses, a real lever for large downloads.
+- **No push readiness for rump sockets.** Readiness is a `MSG_PEEK` sysproxy
+  round-trip; `epoll_check_fd_readiness` (`src/syscall/poll.rs`) registers **no
+  waker** for a `RumpSocket` (unlike `Stdin`), so poll re-probes every ~10 ms
+  instead of blocking on an event. A real lever for large downloads AND for
+  interactive keystroke latency: the sshd bridge spin-`try_read`s the socket
+  each loop iteration (~20 ms/probe) while waiting for the shell echo, and a
+  userspace attempt to gate that regressed hard (per-iteration probing is
+  load-bearing for input responsiveness — see `archive/RUMP_SYSPROXY_LATENCY_FIX.md`
+  Phase 3q). The real fix is push readiness: wire tap0-frame-arrival to wake
+  rump-socket poll waiters, then switch the bridge to a blocking `ppoll` on
+  `[ssh_sock, stdout]`. Kernel work; also benefits `curl`/`sic`.
 - **One rump per `/dev/net/tap0` per boot.** The NIC1 RX two-phase state
   machine isn't reset on close, so only one rump owner can hold the tap per
   boot.

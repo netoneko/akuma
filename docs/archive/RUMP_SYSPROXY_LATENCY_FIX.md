@@ -960,6 +960,37 @@ Both are larger, subsystem-specific changes (sshd bridge redesign; sysproxy
 protocol). The ~20 ms/round-trip floor itself remains the hard rump-internal
 residual.
 
+### Round-trip attempts — both dead ends for a *quick* win (2026-07-19)
+
+Both fat targets were investigated; neither yields a cheap, low-risk fix:
+
+- **`sendto` copyin inlining — NOT attempted (too risky for the payoff).** Killing
+  the `hops=1` callback requires (a) extending the sysproxy request wire format so
+  the client ships the send buffer inline, and (b) a prefetch check in the server
+  copyin path — which lives entirely in `rumpuser_sp.c` (`sp_copyin`/`copyin_req`,
+  both `static`), the NetBSD-derived source `sp_serve_fd.c` deliberately keeps
+  textually unmodified, and which the macro-redirect trick can't cleanly wrap. For
+  ~20 ms on a load-bearing path (box 0 DHCP, all SSH, curl), the blast radius isn't
+  worth it without a dedicated, carefully-gated effort.
+
+- **EAGAIN userspace fix — TRIED and REVERTED (hard regression).** Gated the sshd
+  bridge (`userspace/sshd/src/protocol.rs`) to skip the rump-socket `try_read`
+  while it was draining the shell's stdout, with an 8-iteration skip cap so heavy
+  output couldn't starve input. Result: **~219 ms → ~1000 ms p50, reproducibly.**
+  In the keystroke ping-pong, deferring the socket read stalls the *next* keystroke
+  by ~1 s — probing the SSH socket every iteration is **load-bearing for input
+  responsiveness**, not waste. Reverted (source + rebuilt binary + `devbox.img`
+  restored). **Conclusion: the EAGAIN round trip is inherent WITHOUT kernel push
+  readiness; it cannot be gated away in userspace.**
+
+**Corrected fix direction for EAGAIN (the real one):** push readiness for rump
+sockets (a Phase 3a-class kernel feature). `epoll_check_fd_readiness`
+(src/syscall/poll.rs) registers **no waker** for a `RumpSocket` (unlike `Stdin`,
+which calls `ch.add_poller(tid)`), so poll re-probes via MSG_PEEK every cycle.
+Wire tap0-frame-arrival → wake rump-socket poll waiters, then switch the sshd
+bridge from spin-`try_read` to a blocking `ppoll` on `[ssh_sock, stdout]`. Kernel
+work, not a userspace tweak; also benefits `curl`/`sic`.
+
 ### Note: smoltcp floor is a separate, analogous issue
 
 The 37.8 ms smoltcp keystroke floor does NOT go through rump/sysproxy, so Tier 1
