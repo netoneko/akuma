@@ -932,6 +932,7 @@ mod child_channel_drain_tests {
             enable_irqs: || {},
             end_of_interrupt: |_| {},
             trigger_sgi: |_| {},
+            wake_remote_idle: || {},
             alloc_page_zeroed: || None,
             alloc_page: || None,
             free_page: |_| {},

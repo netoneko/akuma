@@ -5,8 +5,9 @@ page-table set, one PMM/heap, one global run queue, real cross-core locking. Sou
 `src/smp_shared.rs`. Behind `cfg(kernel_smp_shared)` (the `smp-shared` feature, paired
 with the `release-smp-shared` profile); the default build compiles none of it.
 
-> **Stability: C (active development).** M0–M3 done as of 2026-07-19 (userspace runs
-> across cores). Progress log: [`../../archive/SMP_SHARED.md`](../../archive/SMP_SHARED.md).
+> **Stability: C (active development).** M0–M4 done as of 2026-07-19 (userspace runs +
+> migrates across cores; one open boot item, below). Progress log:
+> [`../../archive/SMP_SHARED.md`](../../archive/SMP_SHARED.md).
 
 This is the **inverse** of the multikernel ([`smp.md`](smp.md), `cfg(kernel_smp)`),
 which is share-nothing (one kernel per core, replicated `.data`/`.bss`, disjoint RAM
@@ -77,8 +78,14 @@ they run on more than one core.
 | M2b — SMP-safe scheduler: per-core idle | ✅ BSP verified |
 | M2c — secondaries run the shared scheduler | ✅ threads on 2 & 4 cores |
 | M3 — userspace on secondaries (+ inner-shareable TLB) | ✅ userspace on 2 & 4 cores |
-| M4 — migration + cross-core wakeups + hardening | next |
-| M5 — fine-grained locking (real ASIDs, split BKL) | planned |
+| M4 — migration + hardening (cross-core wakeup deferred) | ✅ 1 thread on 4 cores |
+| M5 — fine-grained locking (real ASIDs, split BKL, cross-core wakeup) | planned |
+
+> **Known open item:** the *full devbox-smoltcp boot to sshd* stalls under active
+> secondaries (mounts FS, spawns the async-network thread, then no progress to `herd`;
+> scheduler keeps ticking — no crash/deadlock). Userspace itself runs cross-core (the M3
+> test runs `/bin/hello` on 4 cores); the stall is in the async-network/herd-autostart
+> init path under SMP — needs a gdbstub root-cause. Run devbox single-core until fixed.
 | M3 — userspace on secondaries | planned |
 | M4 — migration + cross-core wakeups | planned |
 | M5 — fine-grained locking | planned |

@@ -269,7 +269,50 @@ M5 fine-graining, needed only when the BKL is split).
 `src/smp_shared.rs` (`record_el0_trap` + user counters), `src/exceptions.rs` (count EL0
 traps from syscall + IRQ paths), `src/process_tests.rs` (`test_smp_shared_userspace`).
 
-## M4..M5 (planned)
+## M4 — Migration + cross-core wakeups + hardening ✅ (2026-07-19)
+
+**Migration** already fell out of the shared scheduler (M2c/M3 showed *different* threads
+on different cores); M4 proves a *single* thread migrates. `test_smp_shared_migration`
+spawns one probe (`migration_worker`) that records each core it runs on (MPIDR) between
+short sleeps; asserts `count_ones() >= 2`. **Verified SMP=4: "one thread ran on 4 distinct
+cores."** Correct because the context switch saves/restores per-thread SP+TTBR0 (shared
+`THREAD_CONTEXTS`) and the M3 inner-shareable flushes keep a migrated address space
+coherent. Slot-leak fix along the way: the demo workers/probe now self-terminate on a stop
+flag (`DEMO_STOP` → `mark_current_terminated`) and are reclaimed (`stop_and_reclaim_demos`)
+after each self-test, so they don't exhaust the scarce system-thread slots (RESERVED_THREADS).
+
+**Cross-core wakeup — built, then deliberately NOT fired (deferred to M5).** Infrastructure:
+an idle-core bitmask (`CORE_IDLE_MASK`, set/cleared around the secondary idle WFI) +
+`wake_remote_idle` (rings the lowest idle peer's scheduler SGI) + a runtime hook. But
+firing it from `wake()` on every wakeup measured a **~40x jump in BKL-contention spins**
+(45 → 1843 stuck warnings at SMP=4): under a coarse BKL, a woken idle peer can't enter the
+kernel until the waker releases the lock anyway, so it just spins. Removing the call
+restored ~53 spins with all tests still passing (woken threads run via the waker's own
+reschedule + the ≤10 ms tick). The mechanism stays wired for M5, where fine-grained locks
+make waking an idle peer actually parallel. Lesson: eager cross-core wakeup is an
+anti-optimization under a BKL.
+
+**Hardening verified:** SMP=2 and SMP=4 run the full self-test suite (scheduler + userspace
++ migration) with no deadlock and low, non-growing contention, reaching the same
+pre-existing baseline; heavy virtio-blk FS init completes under SMP=4; clippy clean across
+smp-shared / devbox-smoltcp / default; 114 host tests pass.
+
+**Open item (top priority for the next session):** the *full devbox-smoltcp boot to
+userspace/sshd* stalls under active secondaries — it mounts the FS and spawns the
+async-main/network thread (tid=1), then makes no further progress to `herd`/`sshd` (the
+scheduler keeps ticking across cores — no crash, no deadlock, zero `[BKL] stuck`). At M0
+(task 2) this booted fine because secondaries were parked. Userspace itself is proven to
+run cross-core (the M3 test runs `/bin/hello` on 4 cores), so the stall is specific to the
+async-network/herd-autostart init path under SMP — needs a gdbstub root-cause (likely a
+per-core / BSP-affinity assumption in the async network runner). Until then, run the devbox
+image single-core, or the shared-SMP kernel with the boot self-tests.
+
+**Files:** `crates/akuma-exec/src/runtime.rs` (`wake_remote_idle` hook),
+`crates/akuma-exec/src/threading/mod.rs` (`sleep_us`, wake note), `src/smp_shared.rs`
+(idle mask + wake + migration/demo workers + reclaim), `src/main.rs` (wire hook),
+`src/process_tests.rs` (`test_smp_shared_migration` + reclaim), `children.rs` (test rt field).
+
+## M5 (planned)
 
 See the approved plan for the full roadmap: M2 shared scheduler (SMP-safe SGI handler,
 per-core idle, inner-shareable TLB flushes `...is`, real per-AS ASIDs, map all GICR

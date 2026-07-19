@@ -434,6 +434,12 @@ pub(crate) fn build_exec_runtime(
         trigger_sgi: gic::trigger_sgi_self,
         #[cfg(not(kernel_smp_shared))]
         trigger_sgi: gic::trigger_sgi,
+        // Cross-core wakeup (M4): nudge an idle peer to run a just-woken thread. No-op
+        // off shared-SMP.
+        #[cfg(kernel_smp_shared)]
+        wake_remote_idle: smp_shared::wake_remote_idle,
+        #[cfg(not(kernel_smp_shared))]
+        wake_remote_idle: || {},
         alloc_page_zeroed: || pmm::alloc_page_zeroed(),
         alloc_page: || pmm::alloc_page(),
         free_page: pmm::free_page,

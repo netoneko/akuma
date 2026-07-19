@@ -43,6 +43,10 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_smp_shared_userspace();
 
+    // Real (shared-kernel) SMP M4: confirm a single thread MIGRATES across cores.
+    #[cfg(kernel_smp_shared)]
+    test_smp_shared_migration();
+
     // Net bounce-buffer OOM degradation (pure-fn boundaries + ample-mem alloc);
     // guards against the EC=0x3c kernel abort when an oversized socket buffer
     // can't grow the heap. No network stack required.
@@ -540,6 +544,9 @@ fn test_smp_shared_scheduler() {
     let cores_ran = crate::smp_shared::cores_that_ran_workers();
     let c0 = crate::smp_shared::worker_ticks(0);
     let c1 = crate::smp_shared::worker_ticks(1);
+    // Stop the demo workers and reclaim their (scarce) system-thread slots so the later
+    // self-tests (userspace, migration) can spawn.
+    crate::smp_shared::stop_and_reclaim_demos();
     if cores_ran >= 2 {
         crate::safe_print!(
             112,
@@ -555,6 +562,40 @@ fn test_smp_shared_scheduler() {
             cores_ran,
             c0,
             c1
+        );
+    }
+}
+
+/// M4 boot self-test for real SMP: confirm a SINGLE thread migrates across cores. The
+/// probe thread records each core it runs on (via MPIDR) between short sleeps; if its
+/// mask shows >1 core it demonstrably moved between them (not just different threads on
+/// different cores, which M2c/M3 already show). Also exercises the cross-core wake path
+/// (each `sleep_us` wake nudges an idle peer). The BSP waits with yield+`idle_halt`.
+#[cfg(kernel_smp_shared)]
+fn test_smp_shared_migration() {
+    if crate::smp_shared::probed_core_count() <= 1 {
+        console::print("[Test] smp_shared_migration SKIPPED (single CPU; boot with SMP>1)\n");
+        return;
+    }
+    crate::smp_shared::spawn_migration_probe();
+    let start = crate::timer::uptime_us();
+    while crate::timer::uptime_us().saturating_sub(start) < 2_000_000 {
+        akuma_exec::threading::yield_now();
+        akuma_exec::threading::idle_halt();
+    }
+    let cores = crate::smp_shared::migration_core_count();
+    crate::smp_shared::stop_and_reclaim_demos();
+    if cores >= 2 {
+        crate::safe_print!(
+            96,
+            "[Test] smp_shared_migration PASSED (one thread ran on {} distinct cores)\n",
+            cores
+        );
+    } else {
+        crate::safe_print!(
+            96,
+            "[Test] smp_shared_migration FAILED (probe thread stayed on {} core)\n",
+            cores
         );
     }
 }

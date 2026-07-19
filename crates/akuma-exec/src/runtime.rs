@@ -96,6 +96,10 @@ pub struct ExecRuntime {
     // GIC
     pub end_of_interrupt: fn(u32),
     pub trigger_sgi: fn(u32),
+    // Real shared-kernel SMP: nudge one idle peer core to reschedule so a just-woken
+    // thread runs there promptly instead of waiting for that core's next timer tick.
+    // No-op on single-core / non-SMP builds.
+    pub wake_remote_idle: fn(),
 
     // PMM
     pub alloc_page_zeroed: fn() -> Option<PhysFrame>,

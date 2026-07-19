@@ -20,7 +20,13 @@
 //! arrive in later milestones. See docs/archive/SMP_SHARED.md for the running log and
 //! docs/reference/subsystems/smp-shared.md for the current-state design.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+// The M2c/M3/M4 demo workers + self-test accessors are exercised only by the boot
+// self-tests in `process_tests` (compiled out under `no-tests` / `size`). In those
+// runtime-only builds (e.g. devbox-smoltcp) they are intentionally unused — suppress the
+// dead-code lint there. Test builds still lint dead code normally.
+#![cfg_attr(any(feature = "no-tests", kernel_profile_size), allow(dead_code))]
+
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Maximum cores we bring up. Matches the multikernel's `akuma_smp::MAX_CORES` and is
 /// comfortably under the `aff0 < 16` single-cluster limit on QEMU `virt`.
@@ -45,6 +51,36 @@ static PROBED_MPIDRS: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX
 /// Count of secondaries that have reached their online barrier. Genuinely shared
 /// (not replicated) — a plain kernel static IS cross-core state in this build.
 static ONLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Bitmask of cores currently halted in their idle loop (bit `aff0` set = idle). Used
+/// by [`wake_remote_idle`] to nudge an idle core to pick up a just-woken thread
+/// promptly (M4 cross-core wakeup) instead of waiting for its ~10 ms timer tick.
+static CORE_IDLE_MASK: AtomicU32 = AtomicU32::new(0);
+
+/// Mark this core idle/busy in [`CORE_IDLE_MASK`] (called around the idle WFI).
+#[inline]
+fn set_core_idle(core: usize, idle: bool) {
+    let bit = 1u32 << (core as u32);
+    if idle {
+        CORE_IDLE_MASK.fetch_or(bit, Ordering::Release);
+    } else {
+        CORE_IDLE_MASK.fetch_and(!bit, Ordering::Release);
+    }
+}
+
+/// Ring one idle peer core's scheduler SGI so it wakes from WFI, reschedules, and can
+/// pick up a just-woken READY thread now rather than on its next timer tick. Best-effort
+/// (a race that finds no idle core just falls back to the timer). Called from `wake()`
+/// via the `wake_remote_idle` runtime hook. No-op unless a peer is idle.
+pub fn wake_remote_idle() {
+    let self_aff0 = read_mpidr() & 0xff;
+    let mask = CORE_IDLE_MASK.load(Ordering::Acquire) & !(1u32 << self_aff0);
+    if mask == 0 {
+        return; // no idle peer
+    }
+    let target = mask.trailing_zeros(); // lowest idle peer core
+    crate::gic::trigger_sgi_core(target, SCHED_SGI);
+}
 
 unsafe extern "C" {
     /// The secondary trampoline (asm, `.text.boot`, defined below). Taking its
@@ -345,19 +381,78 @@ pub fn user_traps(core: usize) -> u64 {
     }
 }
 
+/// Bitmask of cores a single migration-test thread has observed itself running on
+/// (bit `aff0`). `count_ones() >= 2` proves that ONE thread migrated across cores (M4).
+static MIGRATION_MASK: AtomicU32 = AtomicU32::new(0);
+
+/// Stop flag for the demo workers/probes so they self-terminate after their test and
+/// free their (scarce) system-thread slots for the next test. See [`stop_and_reclaim_demos`].
+static DEMO_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Terminate the current kernel thread and park (the standard kernel-thread exit path:
+/// mark terminated so `cleanup_terminated` recycles the slot, then yield forever).
+fn demo_exit() -> ! {
+    akuma_exec::threading::mark_current_terminated();
+    loop {
+        akuma_exec::threading::yield_now();
+    }
+}
+
+/// Signal all demo workers/probes to stop, wait for them to self-terminate, reclaim
+/// their slots, then reset the flag for the next test. Keeps the scarce system-thread
+/// slots (RESERVED_THREADS) from leaking across the M2c/M3/M4 self-tests.
+pub fn stop_and_reclaim_demos() {
+    DEMO_STOP.store(true, Ordering::Release);
+    // Let workers wake from their short sleep, observe the flag, and self-terminate.
+    let start = crate::timer::uptime_us();
+    while crate::timer::uptime_us().saturating_sub(start) < 300_000 {
+        akuma_exec::threading::yield_now();
+        akuma_exec::threading::idle_halt();
+    }
+    akuma_exec::threading::cleanup_terminated();
+    DEMO_STOP.store(false, Ordering::Release);
+}
+
+/// M4 migration-proof worker: record this core in `MIGRATION_MASK`, then SLEEP so the
+/// scheduler is free to resume us on a *different* core next time. Stops on `DEMO_STOP`.
+fn migration_worker() -> ! {
+    while !DEMO_STOP.load(Ordering::Acquire) {
+        let aff0 = read_mpidr() & 0xff;
+        MIGRATION_MASK.fetch_or(1u32 << aff0, Ordering::Relaxed);
+        akuma_exec::threading::sleep_us(1500);
+    }
+    demo_exit()
+}
+
+/// Spawn ONE migration-test thread (M4). One thread that lands on >1 core over its
+/// lifetime demonstrates cross-core migration (not just different threads on different
+/// cores). Call once, from the BSP.
+pub fn spawn_migration_probe() {
+    if NUM_CORES.load(Ordering::Relaxed) <= 1 {
+        return;
+    }
+    let _ = akuma_exec::threading::spawn_system_thread_fn(migration_worker);
+}
+
+/// Number of distinct cores the single migration-probe thread has run on (M4 self-test).
+pub fn migration_core_count() -> u32 {
+    MIGRATION_MASK.load(Ordering::Relaxed).count_ones()
+}
+
 /// Demo worker (real shared-kernel SMP M2c): bump this core's counter, then SLEEP.
 /// Sleeping (rather than busy-looping) is essential — a kernel thread holds the Big
 /// Kernel Lock while it runs, so a never-sleeping worker would let one core monopolize
 /// the lock and starve the others. Sleeping makes the worker WAITING, letting a core
 /// drop to idle (releasing the BKL) so peers can pick up work. Runs forever.
 fn smp_worker() -> ! {
-    loop {
+    while !DEMO_STOP.load(Ordering::Acquire) {
         let aff0 = (read_mpidr() & 0xff) as usize;
         if aff0 < MAX_CORES {
             CORES_SEEN[aff0].fetch_add(1, Ordering::Relaxed);
         }
         akuma_exec::threading::sleep_us(2000);
     }
+    demo_exit()
 }
 
 /// Spawn the M2c demo workers from the BSP (after secondaries are up). Each is an
@@ -438,14 +533,17 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
     // when nothing is runnable we just fall back to WFI. One timer IRQ + one SGI per
     // ~10 ms tick — cheap and contention-free.
     loop {
-        // Drop the BKL so peers can enter the kernel while we're halted.
+        // Publish that this core is idle so `wake_remote_idle` can nudge it, then drop
+        // the BKL so peers can enter the kernel while we're halted.
+        set_core_idle(core, true);
         akuma_exec::bkl::leave_kernel();
-        // SAFETY: IRQs are enabled; the timer/device IRQ wakes us and (via the
-        // scheduler SGI) may switch us to a runnable thread instead of returning here.
+        // SAFETY: IRQs are enabled; the timer/device IRQ (or a cross-core wake SGI)
+        // wakes us and (via the scheduler SGI) may switch us to a runnable thread.
         unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
         // Re-take the BKL for our brief kernel work before the next halt (idempotent
         // if the waking IRQ's reconcile already re-acquired it for us).
         akuma_exec::bkl::enter_kernel();
+        set_core_idle(core, false);
     }
 }
 
