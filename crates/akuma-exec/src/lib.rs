@@ -86,6 +86,10 @@ extern crate alloc;
 pub mod runtime;
 pub mod sync;
 pub mod bkl;
+/// Host-only model checker + concurrency stress harness for the Big Kernel Lock protocol
+/// (deadlock / mutual-exclusion / starvation checks). Compiled only for `cargo test`.
+#[cfg(test)]
+mod bkl_model;
 pub mod mmu;
 #[path = "elf/mod.rs"]
 pub mod elf_loader;
