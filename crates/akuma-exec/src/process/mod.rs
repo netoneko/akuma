@@ -15,9 +15,7 @@ pub mod exec;
 pub mod diag;
 pub mod lifecycle;
 
-pub use lifecycle::{LifecycleGuard, LifecycleLock};
-#[cfg(kernel_smp_shared)]
-pub use lifecycle::PROCESS_LIFECYCLE_LOCK;
+pub use lifecycle::LifecycleGuard;
 
 pub use types::*;
 pub use table::*;

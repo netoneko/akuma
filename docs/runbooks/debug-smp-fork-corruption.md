@@ -1,26 +1,73 @@
 # SMP=4 fork/exec process-state corruption — handoff / debugging dossier
 
-> **Status: FIX LANDED 2026-07-21 — awaiting empirical confirmation.** The
-> "correctness-first bisection" experiment (suggested next experiments §3) is
-> implemented: a reentrant `LifecycleLock` now serializes every process-lifecycle
-> op (`fork_process` / `vfork_process` / `clone_thread` / `replace_image{,_from_path}`
-> / `return_to_kernel{,_from_fault}` / `kill_process{,_with_signal}` /
-> `spawn_process_with_channel_ext` / `spawn_process_from_image_with_args`) across
-> preemption under `cfg(kernel_smp_shared)`. Source:
-> `crates/akuma-exec/src/process/lifecycle.rs`. The lock is **distinct from the
-> BKL**, held with IRQs **enabled** (so the holder can still be preempted and
-> resumed — preemption no longer exposes half-built state because no peer can
-> enter a lifecycle op until the holder finishes), and reentrant (depth-tracked)
-> so nested calls like `return_to_kernel → kill_box → kill_process` don't
-> self-deadlock. Compiles to a no-op on every non-`kernel_smp_shared` profile
-> (default / `size` / `extreme` / `multikernel`), so those builds are byte-for-byte
-> unaffected. **To confirm:** rerun `SMP=4 python3 sshd_crash_hunt.py` against a
-> fresh `cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests`.
-> If the crash vanishes → hypotheses 1/3 confirmed and the long-term fix is real
-> per-Process locking (RwSpinlock) for non-lifecycle readers. If it persists →
-> narrowed to hypotheses 2/4 (THREAD_CONTEXTS aliasing or TLB coherence), and
-> this lock can stay as defense-in-depth regardless. Below is the original handoff
-> doc, unchanged for context.
+> **UPDATE 2026-07-21 (later same day): mechanism CONFIRMED, fix scope identified,
+> tree returned to a clean baseline.** Two decisive experiments were run on real
+> SMP=4 QEMU after the LifecycleLock was disproven (see the status block below):
+>
+> - **SMP=1 control, same harness:** 39 forks + 39 busybox execs, **0 crashes,
+>   0 `[BKL] stuck`** across 12 hammer rounds. SMP=4 crashes on round 1. ⇒ this is a
+>   **true cross-core race**, not a fork/exec logic bug. (The doc had asserted SMP=1
+>   stability; now confirmed with *this* harness.)
+> - **Whole-op per-core preemption disable** (mask `DAIF.I` for the entire body of
+>   every lifecycle op, replacing the cross-core spinlock): **0 SIGSEGV across a full
+>   hammer run** — so the fault class *is* preemption-mid-operation exposure (to
+>   non-lifecycle readers too, which is why serializing only lifecycle-vs-lifecycle
+>   didn't help). BUT it **hard-deadlocked**: the ops (and the freshly-exec'd child's
+>   first `[IA-DP]` ELF code-page fault) cooperatively yield / wait on async block-I/O
+>   completion that a *different* thread must pump; with preemption masked that thread
+>   never runs, the I/O never completes, and the BKL holder never releases → all cores
+>   wedge. Wedged exactly at the child's first code-page fault.
+>
+> **Validated fix direction (TODO):** the *mechanism* (disable preemption during the
+> mutation) is right; the *scope* (whole op) is wrong. Disable preemption only around
+> the **synchronous, non-yielding, non-blocking memory-mutation windows** — never
+> across a lock-wait, a cooperative yield, block I/O, or an `eret` to userspace:
+> `replace_image`'s `mmap_regions/lazy_regions.clear()` + AS-swap + repopulate middle;
+> `fork_process`'s child-publish (context write + table register + mark schedulable);
+> the `THREAD_CONTEXTS[tid]` writes; the trap-frame capture. Pin the exact non-yielding
+> boundaries with an lldb watchpoint on `Process.parent_pid` / `THREAD_CONTEXTS[tid].pc`.
+>
+> **Tree state now:** `crates/akuma-exec/src/process/lifecycle.rs` `LifecycleGuard` is a
+> documented **no-op** on every build (both the spinlock's BKL-stall regression and the
+> whole-op deadlock removed; behavior == pre-66e09bf). The 11 `LifecycleGuard::acquire()`
+> call sites are retained as no-ops marking where the narrow guards belong. SMP=4 boots
+> clean to sshd (0 `[BKL] stuck`, 0 watchdog) and still crashes under the hammer (the
+> original open bug, now with a much sharper diagnosis).
+>
+> ---
+>
+> **Status: LifecycleLock fix (commit 66e09bf) EMPIRICALLY DISPROVEN 2026-07-21.**
+> A real SMP=4 QEMU run (fresh `--profile release-smp-shared --features
+> devbox-smoltcp,no-tests` on `devbox.img`/4096MB, lock confirmed active in the
+> binary) + the fork-hammer **still crashes on boot 1, hammer round 1**: 12
+> SIGSEGVs, 10× user-PC-in-kernel-text, `ppid=0`-clobbered processes — the same
+> signatures as before the fix. Idle boot is clean; the crash fires the instant
+> the hammer runs. Per the decision tree below, this puts us squarely in
+> **hypotheses 2/4** (THREAD_CONTEXTS aliasing / TLB coherence) and rules out the
+> lifecycle-op-vs-lifecycle-op race the lock serialized. **Two concrete new facts
+> from that run:**
+>
+> 1. **The clobbered user PC resolves to `rust_sync_el0_handler_inner + 0x0`**
+>    (`0x4011d22c` in this binary; the doc's earlier `0x4011d004` was a different
+>    build) **and the fault SPSR is `0x0` (EL0t).** A context that was saved while
+>    the thread executed the syscall/fault handler **at EL1** is being restored and
+>    `eret`'d **as an EL0 context** — i.e. an EL-confused / aliased
+>    `THREAD_CONTEXTS[tid]` slot, written by the **preemption context-save path,
+>    which is NOT a lifecycle op and takes no lock.** That is precisely why the
+>    LifecycleLock (which only serializes fork/exec/exit/spawn against each other)
+>    cannot touch this bug. **Hypothesis 2 is now the lead; start at the SGI/timer
+>    EL1-preemption context-save in `src/exceptions.rs` and every writer of
+>    `THREAD_CONTEXTS` in `crates/akuma-exec/src/threading/mod.rs`.**
+> 2. **The fix introduced a REGRESSION:** the pre-fix run had "0 `[BKL] stuck`";
+>    this run has 8× `[BKL] stuck` (`owner=3 waiter=1/2/4`) plus a `[WATCHDOG]
+>    Preemption disabled 140ms`. The lock is held across preemption and never
+>    dropped at EL transitions, so it contends with the BKL. If the lock is kept as
+>    defense-in-depth it needs a lock-ordering audit against the BKL first.
+>
+> The `LifecycleLock` itself (`crates/akuma-exec/src/process/lifecycle.rs`) is
+> correctly implemented and wired into all 11 named lifecycle ops; it is a no-op on
+> non-`kernel_smp_shared` builds. It just does not address the actual fault class.
+> Original handoff doc below, unchanged for context.
 >
 > Companion: [`debug-smp.md`](debug-smp.md) (general shared-kernel SMP debugging)
 > and [`../reference/subsystems/smp-shared.md`](../reference/subsystems/smp-shared.md).

@@ -1,168 +1,87 @@
-//! Process-lifecycle serialization lock.
+//! Process-lifecycle guard — currently a **no-op**, kept as the anchor for the eventual
+//! narrow preemption-disable fix.
 //!
-//! Under shared-kernel SMP, the Big Kernel Lock serializes EL1 *instants* across cores
-//! but does **not** make multi-step process-lifecycle operations
-//! (`fork_process` / `do_execve`+`replace_image` / `return_to_kernel` / `kill_process`)
-//! **atomic across preemption**: a syscall running with IRQs enabled can be timer-preempted
-//! mid-`fork`/`execve`/`exit`, the scheduler can switch to another EL1 thread on the same
-//! core (or a peer core can enter EL1 once this core reconciles to an EL0 target), and
-//! that other EL1 code then observes half-mutated globals — a `Process` mid-`replace_image`
-//! with `mmap_regions` already `.clear()`ed, a `THREAD_CONTEXTS[tid]` mid-spawn, a
-//! process-table slot mid-`register`/`unregister`. The signatures of the SMP=4 fork-hammer
-//! crash (heterogeneous userspace SIGSEGVs, `parent_pid` fields clobbered to 0 on running
-//! services, user PC slots holding kernel text addresses) all match this class of bug — see
-//! `docs/runbooks/debug-smp-fork-corruption.md`.
+//! ## The problem this exists for
 //!
-//! This module closes that hole by introducing a dedicated **reentrant spinlock** that is
-//! held for the entire critical section of every lifecycle op. Because it is distinct from
-//! the BKL, it is **not** reconciled (dropped) at EL transitions — the holder keeps it
-//! across preemption until the op completes and the RAII guard drops. Contended acquirers
-//! spin with IRQs **enabled**, so they in turn can be preempted and the holder always gets
-//! rescheduled to finish.
+//! Under shared-kernel SMP the Big Kernel Lock serializes EL1 *instants* across cores but
+//! does **not** make multi-step process-lifecycle operations (`fork_process` /
+//! `do_execve`+`replace_image` / `return_to_kernel` / `kill_process` / `spawn_*`) **atomic
+//! across preemption**: the syscall/fault handler runs with IRQs enabled
+//! (`src/exceptions.rs`, `msr daifclr, #2`), so a thread can be timer-preempted
+//! mid-`fork`/`execve`/`exit`. On that preemption the BKL is reconciled away and other EL1
+//! code (a peer core, or the next thread on this core — crucially including **non-lifecycle**
+//! readers: the page-fault handler, signal delivery, a `for_each_process` sweep) observes
+//! half-mutated state: a `Process` mid-`replace_image` with `mmap_regions` already
+//! `.clear()`ed, a `THREAD_CONTEXTS[tid]` mid-spawn, a process-table slot mid-register, a
+//! captured trap frame mid-repopulate. That is the SMP=4 fork-hammer corruption. Full
+//! dossier + the empirical results below: `docs/runbooks/debug-smp-fork-corruption.md`.
 //!
-//! ## Reentrancy
+//! ## Two approaches tried and rejected (both empirically, on a real SMP=4 QEMU run)
 //!
-//! Lifecycle ops nest: `return_to_kernel` may call `kill_box`, which calls `kill_process`,
-//! which acquires this lock. To support that, the lock tracks `(owner_tid, depth)` and
-//! reentrant acquires by the same thread simply bump `depth`.
+//! 1. **Reentrant cross-core spinlock held across preemption** (commit 66e09bf). The crash
+//!    *persisted* (it only serialized lifecycle-vs-lifecycle, not lifecycle-vs-the
+//!    non-lifecycle readers that also touch the half-built state), and it **inverted
+//!    against the BKL**: a preempted holder was switched out still owning the lock while a
+//!    peer that had entered EL1 (holding the BKL) spun on it — the holder needs the BKL to
+//!    be rescheduled and finish, so it stalled until the spinner was itself timer-preempted.
+//!    Symptom: `[BKL] stuck` + `[WATCHDOG] Preemption disabled`.
 //!
-//! ## Zero-cost when off
+//! 2. **Whole-op per-core preemption disable (mask `DAIF.I` for the entire op).** This
+//!    *eliminated the corruption* (0 SIGSEGV across a full hammer run — proving the fault
+//!    class really is preemption-mid-op exposure), but it **hard-deadlocked**: these ops
+//!    (and the child's first-run demand-paging that reads the ELF page from ext2) can
+//!    cooperatively yield / wait on async block-I/O completion that a *different* thread
+//!    must pump. With preemption masked that thread can't run, the I/O never completes, and
+//!    the BKL holder never releases → all cores wedge on the BKL. It wedged exactly at the
+//!    freshly-exec'd child's first `[IA-DP]` code-page fault.
 //!
-//! On builds without `cfg(kernel_smp_shared)` (single-core, `size`, `extreme`,
-//! `multikernel`) the lock compiles to a no-op: `acquire()` / `release()` / the
-//! `LifecycleGuard` are all empty inlines, so the existing single-CPU `with_irqs_disabled`
-//! invariant suffices and there is no new lock cost.
+//! ## The validated fix direction (TODO — not yet implemented)
+//!
+//! The mechanism is right, the *scope* was wrong. Preemption must be disabled only around
+//! the **synchronous, non-yielding, non-blocking memory-mutation windows** — never across a
+//! lock-wait, a cooperative yield, block I/O, or an `eret` to userspace. Concretely:
+//!
+//! - `replace_image`: guard just the `mmap_regions.clear()` + `lazy_regions.clear()` + AS
+//!   swap + repopulate window (the destructive middle), released before the process-info
+//!   page allocation and before returning.
+//! - `fork_process`: guard just the child-publish window (write `Process.context`, register
+//!   in the table, mark the thread schedulable) so a peer never sees the child half-built.
+//! - The `THREAD_CONTEXTS[tid]` writes and the trap-frame capture likewise need their own
+//!   narrow guards.
+//!
+//! Confirming the exact non-yielding boundaries wants an lldb watchpoint on the victim
+//! `Process.parent_pid` / `THREAD_CONTEXTS[tid].pc` (see the runbook) so we place each guard
+//! tightly. Until then this guard is inert so the tree is free of both the spinlock's
+//! BKL-stall regression and the whole-op version's deadlock. The 11 `LifecycleGuard::acquire()`
+//! call sites are retained as no-ops: they mark where the narrow guards belong.
+//!
+//! On non-`kernel_smp_shared` builds this was always a no-op; it now is on every build.
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-
-/// Sentinel value stored in [`LifecycleLock::owner`] when no thread holds the lock.
-const FREE: usize = usize::MAX;
-
-/// Reentrant spinlock serializing process-lifecycle operations across preemption under
-/// shared-kernel SMP. See the module docs for the rationale.
-pub struct LifecycleLock {
-    /// `FREE` (=`usize::MAX`) when uncontended; otherwise the owning thread's id
-    /// (`TPIDRRO_EL0`). Read with `Acquire`; written with `Release` only when publishing
-    /// "free" — the depth-balanced hand-off is single-writer (the owner).
-    owner: AtomicUsize,
-    /// Reentrant depth. Read/written only by the owner thread, so `Relaxed` is sufficient
-    /// (the `owner` Release store on last release is what publishes the state change).
-    depth: AtomicU32,
-}
-
-impl LifecycleLock {
-    pub const fn new() -> Self {
-        Self {
-            owner: AtomicUsize::new(FREE),
-            depth: AtomicU32::new(0),
-        }
-    }
-
-    /// Acquire the lock, blocking (with IRQs enabled) until free or already owned by this
-    /// thread (reentrant). Cheap on the uncontended path: one `Acquire` load + one
-    /// `compare_exchange`.
-    #[inline]
-    pub fn acquire(&self) {
-        let tid = crate::threading::current_thread_id();
-        // Uncontended fast path: claim it.
-        if self
-            .owner
-            .compare_exchange(FREE, tid, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            self.depth.store(1, Ordering::Relaxed);
-            return;
-        }
-        // Reentrant fast path: this thread already owns it.
-        if self.owner.load(Ordering::Acquire) == tid {
-            self.depth.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        // Contended: spin with IRQs enabled. `current_thread_id()` is per-CPU
-        // (`TPIDRRO_EL0`) so it stays correct across preemption of this spinner; the timer
-        // can preempt us so the holder gets rescheduled to finish and release.
-        let mut spins: u32 = 0;
-        loop {
-            let cur = self.owner.load(Ordering::Acquire);
-            if cur == tid {
-                // Owner was preempted, switched back in, and re-entered acquire on the
-                // same slot before its earlier depth-balanced release: reentrant.
-                self.depth.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            if cur == FREE {
-                if self
-                    .owner
-                    .compare_exchange_weak(FREE, tid, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    self.depth.store(1, Ordering::Relaxed);
-                    return;
-                }
-                // Lost the CAS to another acquirer; retry.
-            }
-            spins = spins.wrapping_add(1);
-            // Periodic `core::hint::spin_loop` keeps the spin power-friendly without
-            // letting LLVM hoist the atomic load out of the loop.
-            if spins & 0x3f == 0 {
-                core::hint::spin_loop();
-            }
-        }
-    }
-
-    /// Release one level of reentrant depth. The owner-only publication of "free" happens
-    /// on the last (depth-1→0) release. Calling this without a matching `acquire` is a
-    /// programming error (debug-asserted).
-    #[inline]
-    pub fn release(&self) {
-        let tid = crate::threading::current_thread_id();
-        debug_assert_eq!(
-            self.owner.load(Ordering::Relaxed),
-            tid,
-            "LifecycleLock released by non-owner"
-        );
-        let prev_depth = self.depth.fetch_sub(1, Ordering::Relaxed);
-        if prev_depth == 1 {
-            // Last release: publish "free" with Release so a subsequent acquirer's
-            // Acquire load sees the lock in a consistent state.
-            self.owner.store(FREE, Ordering::Release);
-        }
-    }
-
-    /// `true` iff the calling thread currently holds this lock (any depth). For
-    /// assertions / diagnostics.
-    #[inline]
-    pub fn held_by_current(&self) -> bool {
-        self.owner.load(Ordering::Relaxed) == crate::threading::current_thread_id()
-    }
-}
-
-/// The one process-lifecycle lock. Only meaningful under `cfg(kernel_smp_shared)`.
-#[cfg(kernel_smp_shared)]
-pub static PROCESS_LIFECYCLE_LOCK: LifecycleLock = LifecycleLock::new();
-
-/// RAII guard: acquires on construction, releases on drop. Compiles to nothing on
-/// non-`kernel_smp_shared` builds so callers can use it unconditionally.
+/// RAII guard reserved for the narrow process-lifecycle preemption-disable fix. Currently a
+/// **no-op on every build** — see the module docs for why the cross-core-spinlock and
+/// whole-op-IRQ-mask approaches were both rejected, and what the eventual narrow fix must do.
+///
+/// The `acquire()`/`release()` API and the 11 call sites are kept so the fix can be dropped
+/// in without re-touching every lifecycle op.
 pub struct LifecycleGuard {
-    /// `!Send` — the lock is per-thread-reentrant; the guard must drop on the same thread.
+    /// `!Send`: a future implementation will restore per-core IRQ state on the same core it
+    /// masked it on, so the guard must not cross a thread/core boundary. Enforced now so the
+    /// call sites are already correct when the guard gains behavior.
     _no_send: core::marker::PhantomData<*mut ()>,
 }
 
 impl LifecycleGuard {
-    /// Acquire the global lifecycle lock and return a guard that releases on drop.
+    /// Acquire the (currently inert) lifecycle guard.
     #[inline]
     pub fn acquire() -> Self {
-        #[cfg(kernel_smp_shared)]
-        PROCESS_LIFECYCLE_LOCK.acquire();
         Self {
             _no_send: core::marker::PhantomData,
         }
     }
 
-    /// Release the lock eagerly (equivalent to `drop(guard)`, named for symmetry).
+    /// Release eagerly (equivalent to `drop(guard)`, named for symmetry).
     #[inline]
     pub fn release(self) {
-        // Drop impl does the work; this just consumes the guard.
         drop(self);
     }
 }
@@ -170,8 +89,7 @@ impl LifecycleGuard {
 impl Drop for LifecycleGuard {
     #[inline]
     fn drop(&mut self) {
-        #[cfg(kernel_smp_shared)]
-        PROCESS_LIFECYCLE_LOCK.release();
+        // No-op. See module docs.
     }
 }
 
@@ -180,40 +98,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn single_thread_acquire_release() {
-        let lock = LifecycleLock::new();
-        lock.acquire();
-        lock.release();
+    fn acquire_release() {
+        let g = LifecycleGuard::acquire();
+        g.release();
     }
 
     #[test]
-    fn reentrant_acquire_balanced_release() {
-        // Simulate same-thread reentrancy by hand-crafting the depth/owner fields.
-        // We model "current_thread_id" by using 0 (host tests return 0).
-        let lock = LifecycleLock::new();
-        // First acquire: owner FREE → 0, depth 1.
-        lock.acquire();
-        // Reentrant: depth 2.
-        lock.acquire();
-        // First release: depth 1 (still owned).
-        lock.release();
-        // Second release: depth 0 → FREE.
-        lock.release();
-        // A fresh acquire must succeed (FREE was published).
-        lock.acquire();
-        lock.release();
-    }
-
-    #[test]
-    fn guard_drops_on_early_return() {
-        // Mimic the `let _g = guard; ... return;` pattern: the guard's Drop runs and
-        // releases the lock, so a second acquire succeeds without deadlock.
+    fn nested_guards() {
+        let _outer = LifecycleGuard::acquire();
         {
-            let _g = LifecycleGuard::acquire();
-            // early scope end
+            let _inner = LifecycleGuard::acquire();
         }
-        // Lock should be free now.
-        let _g2 = LifecycleGuard::acquire();
-        // depth-balanced: dropping _g2 releases.
     }
 }
