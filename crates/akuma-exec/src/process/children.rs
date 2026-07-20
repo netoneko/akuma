@@ -309,7 +309,12 @@ pub fn fault_slot_acquire(as_owner: Pid, page_va: usize) -> FaultSlot {
             return slot;
         }
         spins = spins.wrapping_add(1);
-        crate::threading::yield_now();
+        // Wait for the slot holder to release, DROPPING the Big Kernel Lock under
+        // shared-kernel SMP. The holder may be a CLONE_VM sibling doing its fault
+        // block I/O on a peer core (M5b BKL-dropped file-fault path); it must be able
+        // to re-take the BKL to release the slot, which it can't if we spin holding it
+        // (the bounded `FAULT_SLOT_SPIN_BOUND` reclaim above only papers over that).
+        crate::threading::blocking_relax();
     }
 }
 

@@ -2416,6 +2416,27 @@ pub fn idle_halt() {
 #[cfg(not(target_os = "none"))]
 pub fn idle_halt() {}
 
+/// Cooperative wait for a blocking kernel loop that is polling for external
+/// progress (network data, a child exit, …) while holding the Big Kernel Lock.
+///
+/// First [`yield_now`], so any thread already READY on this core runs. Then, under
+/// shared-kernel SMP only, [`idle_halt`] — which DROPS the BKL around a WFI — so a
+/// peer core can enter the kernel and produce the progress this loop is waiting on.
+/// Without the drop the loop busy-spins holding the BKL (nothing else READY on the
+/// core → `yield_now` returns without switching), freezing every peer core: exactly
+/// the socket-recv / `exec_with_io_cwd` cross-core wedge (see
+/// docs/runbooks/debug-smp.md). We wake on the next timer tick and the caller
+/// re-checks its condition.
+///
+/// Off `cfg(kernel_smp_shared)` this is a plain `yield_now` — single-core / default
+/// builds are byte-for-byte unchanged (the `idle_halt` call compiles out).
+#[inline]
+pub fn blocking_relax() {
+    yield_now();
+    #[cfg(kernel_smp_shared)]
+    idle_halt();
+}
+
 /// SIMPLIFIED SGI handler for stack-based context switching
 /// 
 /// Takes current SP from assembly, returns new SP if switch needed (or 0).

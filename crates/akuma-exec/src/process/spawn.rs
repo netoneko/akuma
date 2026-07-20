@@ -359,6 +359,11 @@ pub fn spawn_process_with_channel_ext(
             run_registered_process(pid);
         } else {
             log::debug!("[Process] FATAL: PID {} disappeared during spawn", pid);
+            // Mark terminated BEFORE parking: the scheduler then switches away permanently
+            // (reconciling the BKL to the next thread) instead of this thread busy-spinning
+            // in `yield_now` holding the Big Kernel Lock forever, which freezes every peer
+            // core under shared-kernel SMP.
+            crate::threading::mark_current_terminated();
             loop { crate::threading::yield_now(); }
         }
     })
@@ -443,6 +448,10 @@ pub fn spawn_process_from_image_with_args(name: &str, argv: &[String], elf_data:
             register_channel(tid, p.channel.as_ref().unwrap().clone());
             run_registered_process(pid);
         } else {
+            // Mark terminated BEFORE parking so the scheduler switches away permanently
+            // (reconciling the BKL) rather than busy-spinning in `yield_now` holding the
+            // Big Kernel Lock forever — a peer-freezing wedge under shared-kernel SMP.
+            crate::threading::mark_current_terminated();
             loop { crate::threading::yield_now(); }
         }
     })

@@ -138,10 +138,12 @@ pub fn set_exec_bkl_drop_enabled(on: bool) {
 ///    starve the one secondary holding the BKL-free-stolen child. Done: `KernelLock` is now
 ///    a FIFO ticket lock (`akuma_exec::sync`), which removes the residual.
 ///
-/// This toggle is therefore **now safe to enable** at SMP≥4; it is left defaulting **off**
-/// only because flipping the kernel-wide default is a separate decision. The POOL-over-switch
-/// foundation (step 1) is always active.
-static SCHED_BKLFREE_EL0_ENABLED: AtomicBool = AtomicBool::new(false);
+/// This toggle is therefore **now safe to enable** at SMP≥4. Enabled by default as of
+/// 2026-07-20 (both parts of the two-part fix landed + validated 3/3 at SMP=4); the POOL-over-
+/// switch foundation (step 1) is always active regardless. Kept as a runtime toggle for A/B
+/// debugging. Only affects `cfg(kernel_smp_shared)` builds — the default release build is
+/// untouched.
+static SCHED_BKLFREE_EL0_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Whether the BKL-free EL0-preempt scheduler path (M5c step 2) is enabled.
 #[inline]
@@ -149,8 +151,8 @@ pub fn sched_bklfree_el0_enabled() -> bool {
     SCHED_BKLFREE_EL0_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Enable/disable the BKL-free EL0-preempt scheduler path (M5c step 2). Default off.
-/// Retained for A/B debugging of the SMP≥4 hang; not yet wired to any enabler.
+/// Enable/disable the BKL-free EL0-preempt scheduler path (M5c step 2). Default ON.
+/// Retained for A/B debugging of the SMP≥4 hang.
 #[allow(dead_code)]
 pub fn set_sched_bklfree_el0_enabled(on: bool) {
     SCHED_BKLFREE_EL0_ENABLED.store(on, Ordering::Relaxed);
@@ -567,6 +569,32 @@ pub fn spawn_worker_demo() {
         let _ = akuma_exec::threading::spawn_system_thread_fn(smp_worker);
     }
     crate::safe_print!(64, "[SMP-shared] spawned {} demo workers\n", cores + 1);
+}
+
+/// Self-test waiter that parks in a pure `blocking_relax()` loop — exactly what a thread
+/// blocked in a socket recv (`wait_until`) or a DNS resolve does. Each time it is scheduled
+/// it holds the Big Kernel Lock and must DROP it across the relax so peer cores can enter
+/// the kernel; if `blocking_relax` regressed to not drop the BKL, a waiter that lands on a
+/// peer core would hold it forever and freeze every other core (the meow->LLM wedge). Stops
+/// on `DEMO_STOP`.
+fn blocking_relax_waiter() -> ! {
+    while !DEMO_STOP.load(Ordering::Acquire) {
+        akuma_exec::threading::blocking_relax();
+    }
+    demo_exit()
+}
+
+/// Spawn one [`blocking_relax_waiter`] per core (BSP self-test). They occupy every core so
+/// the test can prove the BSP still makes BKL-requiring forward progress while they are all
+/// parked in a blocking wait. Best-effort (slot-limited); stop via [`stop_and_reclaim_demos`].
+pub fn spawn_blocking_relax_waiters() {
+    let cores = NUM_CORES.load(Ordering::Relaxed);
+    if cores <= 1 {
+        return;
+    }
+    for _ in 0..cores {
+        let _ = akuma_exec::threading::spawn_system_thread_fn(blocking_relax_waiter);
+    }
 }
 
 /// Number of cores that have run a demo worker at least once (for the boot self-test).

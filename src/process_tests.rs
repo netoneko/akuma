@@ -66,6 +66,12 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_smp_shared_cooperative_wait();
 
+    // Real (shared-kernel) SMP: a thread parked in a blocking poll-wait (socket recv / DNS
+    // resolve) must DROP the BKL across the wait, or it freezes every peer core. Regression
+    // for the `blocking_relax` fix of the meow->LLM wedge (see docs/runbooks/debug-smp.md).
+    #[cfg(kernel_smp_shared)]
+    test_smp_shared_blocking_wait_peer_progress();
+
     // Net bounce-buffer OOM degradation (pure-fn boundaries + ample-mem alloc);
     // guards against the EC=0x3c kernel abort when an oversized socket buffer
     // can't grow the heap. No network stack required.
@@ -1000,6 +1006,79 @@ fn test_smp_shared_cooperative_wait() {
         );
     } else {
         crate::safe_print!(96, "[Test] smp_shared_cooperative_wait FAILED (exec error)\n");
+    }
+}
+
+/// Regression for the blocking-wait BKL-drop fix (`threading::blocking_relax`): a thread
+/// parked in a blocking poll-wait — a socket recv (`akuma_net::socket::wait_until`) or a
+/// DNS resolve — must NOT hold the Big Kernel Lock across the wait, or it freezes every
+/// peer core.
+///
+/// Models the meow->LLM wedge root-caused 2026-07-20: meow did `connect()` then sat in
+/// `wait_until` for the HTTP response holding the BKL, so sshd (and every other core)
+/// starved and the box hung. The fix makes the wait drop the BKL (yield_now + `idle_halt`).
+///
+/// The test spawns one waiter per core, each parked in a pure `blocking_relax()` loop (the
+/// primitive the socket/DNS waits now use), then requires the BSP to make BKL-requiring
+/// forward progress — exec + cooperatively reap a userspace child — while every core is
+/// parked in a blocking wait. If `blocking_relax` stops dropping the BKL, a waiter on a peer
+/// holds it forever and the exec below wedges: the boot suite hangs HERE (that IS the
+/// regression signal). Runs with the BKL-free EL0-preempt scheduler ON (the shipping
+/// default). Needs >=1 secondary; no-op on a single-CPU boot.
+#[cfg(kernel_smp_shared)]
+fn test_smp_shared_blocking_wait_peer_progress() {
+    if crate::smp_shared::probed_core_count() <= 1 {
+        console::print(
+            "[Test] smp_shared_blocking_wait_peer_progress SKIPPED (single CPU; boot with SMP>1)\n",
+        );
+        return;
+    }
+    if crate::fs::read_file("/bin/hello").is_err() {
+        console::print(
+            "[Test] smp_shared_blocking_wait_peer_progress SKIPPED (/bin/hello not on disk)\n",
+        );
+        return;
+    }
+
+    let saved = crate::smp_shared::sched_bklfree_el0_enabled();
+    crate::smp_shared::set_sched_bklfree_el0_enabled(true);
+
+    // One waiter per core, each parked in `blocking_relax()` (mirrors a process blocked in a
+    // socket recv / DNS resolve). They occupy every core; the BSP must still push through.
+    crate::smp_shared::spawn_blocking_relax_waiters();
+
+    // BSP forward progress that REQUIRES the BKL: exec a short child and cooperatively wait
+    // for it. With the fix, the parked waiters keep dropping the BKL so every iter completes;
+    // a regression wedges here.
+    const ITERS: usize = 5;
+    let mut ok = true;
+    for i in 0..ITERS {
+        match process::exec_with_io("/bin/hello", Some(&["3", "20"]), None) {
+            Ok(_) => {}
+            Err(e) => {
+                crate::safe_print!(
+                    112,
+                    "[Test] smp_shared_blocking_wait_peer_progress iter {} exec error: {}\n",
+                    i,
+                    e
+                );
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    crate::smp_shared::stop_and_reclaim_demos();
+    crate::smp_shared::set_sched_bklfree_el0_enabled(saved);
+
+    if ok {
+        crate::safe_print!(
+            160,
+            "[Test] smp_shared_blocking_wait_peer_progress PASSED ({} exec+reap iters while every core parked in blocking_relax; no BKL freeze)\n",
+            ITERS
+        );
+    } else {
+        console::print("[Test] smp_shared_blocking_wait_peer_progress FAILED (exec error)\n");
     }
 }
 

@@ -143,7 +143,10 @@ pub fn read_frame_blocking(buf: &mut [u8], timeout_us: Option<u64>) -> Option<us
             && (rt.uptime_us)() - start > t {
                 return None;
             }
-        (rt.yield_now)();
+        // Drop the Big Kernel Lock across the wait under shared-kernel SMP (same freeze
+        // class as the socket/DNS waits). Rump is not in the devbox-smoltcp default path,
+        // but keep the idiom consistent so it's correct if rump ever runs under smp-shared.
+        (rt.blocking_relax)();
     }
 }
 

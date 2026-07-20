@@ -766,7 +766,12 @@ pub fn dns_query(hostname: &str) -> Result<smoltcp::wire::Ipv4Address, DnsQueryE
                 if (runtime().uptime_us)() - start > timeout_us {
                     return Err(DnsQueryError::Timeout);
                 }
-                (runtime().yield_now)();
+                // Wait for the DNS response, DROPPING the Big Kernel Lock across the wait
+                // under shared-kernel SMP. This loop does not poll itself — it relies on
+                // the async-main poller (on a peer core) to drive the DNS RX, which cannot
+                // happen if we spin holding the BKL. Same freeze as the socket wait; fires
+                // first, on any connect-by-hostname. See docs/runbooks/debug-smp.md.
+                (runtime().blocking_relax)();
             }
         }
     }

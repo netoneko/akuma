@@ -390,7 +390,12 @@ where F: FnMut() -> bool
             }
 
         if !any_progress {
-            (runtime().yield_now)();
+            // Wait for more network progress. Under shared-kernel SMP this DROPS the
+            // Big Kernel Lock across the wait (a plain `yield_now` would spin holding
+            // it, freezing every peer core — the meow→LLM `connect`+recv wedge). The
+            // BKL is not held while we poll below either, so a peer's async-main poller
+            // can drive the RX that satisfies `condition`.
+            (runtime().blocking_relax)();
         }
     }
 }
