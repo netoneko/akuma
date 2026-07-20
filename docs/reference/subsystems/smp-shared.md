@@ -84,20 +84,21 @@ they run on more than one core.
 | M5a — network SMP-safety, devbox boots to sshd under SMP | ✅ SMP=2 clean, SMP=4 works |
 | M5b — BKL-free user page-fault path (per-AS `as_lock`) | ✅ Stages 1–3 + 4a: fault PTE edits under `as_lock`, file read/install split, **file-fault block I/O runs BKL-dropped** (A/B measured a BKL-wait reduction on a busybox ELF-fault storm). 4b (full flip) deferred |
 | M5b BKL-hold profiler | ✅ Gated (`set_profiling`, default off). **Finding: IRQ/scheduler ≈70 % of contended BKL time, faults ≈20 %** under multi-process load |
-| M5c — split the run-queue lock out of the BKL | ✅ Step 1 (POOL covers the whole context switch — switch atomic on POOL alone) done + verified SMP=2/4. Step 2 (scheduler runs BKL-free on EL0 preemption) implemented + its SMP≥4 deadlock **fixed** (lldb-confirmed 2026-07-20 cross-core circular deadlock, *not* the earlier "fairness/monopoly" guess): a BKL-free secondary claimed a thread `RUNNING` without the BKL while the BSP held the BKL in a cooperative `yield_now` wait. Two-part fix, both landed: (1) don't hold the BKL across a cooperative wait — `idle_halt` in `exec_with_io_cwd` + `test_parallel_processes`; (2) a **fair FIFO ticket `KernelLock`** to kill the residual livelock. Validated 3/3 at SMP=4 (`test_smp_shared_cooperative_wait`) + fixed the pre-existing SMP=4 `parallel_processes` race. **The step-2 toggle (`sched_bklfree_el0`) is now default-on (2026-07-20)** — validated on the self-test suite (3/3 SMP=4) and on the full devbox-smoltcp boot to sshd at **SMP=2** (SSH-in clean, 0 `[BKL] stuck`). See `debug-smp.md` §"M5c step-2". |
+| M5c — split the run-queue lock out of the BKL | ✅ Step 1 (POOL covers the whole context switch — switch atomic on POOL alone) done + verified SMP=2/4. Step 2 (scheduler runs BKL-free on EL0 preemption) implemented + its SMP≥4 deadlock **fixed** (lldb-confirmed 2026-07-20 cross-core circular deadlock, *not* the earlier "fairness/monopoly" guess): a BKL-free secondary claimed a thread `RUNNING` without the BKL while the BSP held the BKL in a cooperative `yield_now` wait. Two-part fix, both landed: (1) don't hold the BKL across a cooperative wait — `idle_halt` in `exec_with_io_cwd` + `test_parallel_processes`; (2) a **fair FIFO ticket `KernelLock`** to kill the residual livelock. Validated 3/3 at SMP=4 (`test_smp_shared_cooperative_wait`) + fixed the pre-existing SMP=4 `parallel_processes` race. **⚠️ The step-2 toggle (`sched_bklfree_el0`) defaults OFF** — it was briefly flipped on (2026-07-20) and reverted the same day: under heavy fork/exec churn at SMP≥4 the BKL-free path **leaks a fair-`KernelLock` ticket** (it is the only path that `reconcile`-acquires the BKL without a paired `enter_kernel`), drifting `next_ticket`/`now_serving` until the lock hard-deadlocks with `owner==0`. lldb-confirmed; A/B: flag-ON wedges within seconds under mixed fork/exec+meow load, flag-OFF runs 13/13 meow turns clean. Re-enabling needs the ticket-accounting leak fixed first (M5 follow-up). See `debug-smp.md` §"M5c step-2". |
 | M5d — blocking waits drop the BKL (`threading::blocking_relax`) | ✅ A thread parked in a blocking poll-wait must not hold the BKL, or it freezes every peer core. Fixed the **socket recv/accept/connect/send-space wait** (`akuma_net::socket::wait_until`), the **DNS-resolve wait** (`smoltcp_net.rs`, fires first on connect-by-hostname), the **demand-paging fault-slot spin** (`children.rs`), the **rump tap read** (rump-only), and hardened two fatal spawn parks (`spawn.rs`) to `mark_current_terminated` first. All route through one `blocking_relax()` (= `yield_now` then, under smp-shared, `idle_halt`); off smp-shared it is a plain `yield_now` (default build byte-identical). Regression test: `test_smp_shared_blocking_wait_peer_progress` (every core parked in `blocking_relax`, BSP still exec+reaps; 5/5 SMP=4). **Root cause**: the meow→LLM freeze — meow `connect`ed to the LLM then sat in the recv holding the BKL, freezing all 4 cores (thousands of `[BKL] stuck`). **After the fix**: meow streams full LLM responses at SMP=4 with **0** `[BKL] stuck`. |
 | M5 — fine-grained locking (real ASIDs, split BKL, cross-core wakeup) | in progress (see M5b/M5d) |
 
-> **Residual (→ M5 fine-grained locking):** the coarse BKL does not scale cleanly past
-> 2 cores. `SMP=2` is contention-clean; `SMP=4` has a *nondeterministic* contention wedge:
-> individual operations complete (meow streams several full LLM responses, the self-test suite
-> passes, forktest spawns children), but **under sustained multi-core network load `SMP=4` can
-> still wedge on the coarse BKL** after a while (observed: meow works for several exchanges then
-> hangs). This is distinct from — and remains after — the M5d blocking-wait fix, which removed
-> the *deterministic first-recv* freeze. Splitting the BKL into per-subsystem locks (a real
-> NETWORK lock out of the BKL) is the fix; the profiler points at the scheduler/IRQ path
-> (≈70 % of contended BKL time), which `sched_bklfree_el0` (M5c step 2, now default-on) attacks.
-> **Use `SMP=2` for sustained/interactive workloads until the BKL is split.**
+> **State of SMP=4 under load (2026-07-20):** with `sched_bklfree_el0` **OFF** (the default) +
+> the M5d blocking-wait fix, `SMP=4` now survives sustained mixed load — a fork/exec storm
+> (`forktest -combined_stress`) + a busybox fork loop + **13/13 meow→LLM turns**, **0 `[BKL]
+> stuck`**. The earlier "meow hangs after a few turns" wedge was the `sched_bklfree_el0` ticket
+> leak (above), not a generic coarse-BKL limit — reverting the flag resolved it.
+>
+> **Remaining M5 work:** (1) fix the `sched_bklfree_el0` ticket-accounting leak so the
+> scheduler-off-BKL optimization can ship (the profiler puts the scheduler/IRQ path at ≈70 % of
+> contended BKL time — the biggest lever); (2) split a real NETWORK lock out of the BKL. Coarse
+> BKL contention still shows as *transient* `[BKL] stuck` bursts during spawn-heavy work, but
+> these recover. `SMP=2` remains the most contention-clean config.
 >
 > The earlier "full devbox-smoltcp boot to sshd stalls under active secondaries" item was the
 > M4 open item and is **resolved** by M5a (see below) — boot-to-sshd works at SMP=2 (reliable)
