@@ -110,24 +110,43 @@ Stress-testing with `forktest` and `rustc` turned up two userspace-visible failu
 the **kernel alive** (0 `[BKL] stuck`, console/heartbeat live) — neither is a BKL wedge. Tracked
 separately:
 
-- **`forktest_parent` never completes on this branch — a REGRESSION vs `main`.** It hangs at
-  "Launching child 0": the children close their report pipes having written nothing (`[pipe]
-  close_write … write_count=0`), and the parent's Go runtime parks in a ~60 s `futex` waiting on
-  an `epoll` that never signals. **Confirmed a branch regression by bisecting on the kernel:**
-  same `devbox.img` (same forktest binaries), booted on **`main`'s default kernel it runs
-  cleanly** ("Child 0/1 finished successfully … All children processed via epoll. Parent
-  exiting.", ~5 s); booted on the `another-smp-attempt-0` kernel it hangs — at **every** core
-  count including SMP=1 (SMP=1 *on the branch* still compiles in all the branch's kernel changes,
-  so "reproduces at SMP=1" does **not** exonerate the SMP work). Something in this branch's
-  kernel deltas breaks the child's exit/pipe-close → parent `epoll`/`futex` notification. Not yet
-  bisected to a specific commit. `rustc` (`hello.rs`) compiles and runs fine on the branch image
-  (RC=0, ~68 s at SMP=1), so fork/exec/mmap themselves work.
+- **`forktest_parent` hangs only when launched via the userspace `/bin/sshd` (devbox-smoltcp),
+  NOT a kernel-commit regression and NOT the ticket leak.** It hangs at "Launching child 0": the
+  parent's Go runtime parks in a `futex` and never reaches its own duration deadline (children
+  close their report pipes with `write_count=0`). **Controlled comparison (all SMP=1, flag off):**
 
-- **`/bin/sshd` intermittently `SIGSEGV`s under SMP=4** (`[Fault] Process 3 (/bin/sshd) SIGSEGV
-  after ~10 s`), which resets all new connections while the kernel keeps running. Intermittent —
-  sshd was stable across a 13-turn meow session + fork storm on other SMP=4 boots the same day.
-  Suspected residual fork/CoW-under-SMP race on the per-connection fork (cf. the earlier
-  fork-CoW-TLB-ASID fix). Not yet reproduced under a debugger.
+  | Build / launcher | forktest |
+  |---|---|
+  | `main` kernel, in-kernel ssh server | ✅ passes (~5 s, all children reaped) |
+  | branch `--profile release-smp-shared --features smp-shared`, in-kernel ssh | ✅ passes |
+  | branch `devbox-smoltcp` (`userspace-sshd`, `/bin/sshd`) | ❌ hangs |
+
+  The **same smp-shared kernel** runs forktest fine under the in-kernel ssh server and hangs under
+  the userspace `/bin/sshd`. So the variable is the **launch environment** — the deep userspace
+  fork chain `sshd → shell → forktest_parent → forktest_child` under `userspace-sshd` — not the
+  BKL/SMP kernel code. (An earlier "regression vs main" note here was a *confounded* comparison:
+  `main` was tested via the in-kernel ssh server, the branch via userspace `/bin/sshd`.) It is
+  **not** the `sched_bklfree_el0` ticket leak: that needs SMP≥2 contention + the flag on; this
+  reproduces at SMP=1 with the flag off. Likely a Go-runtime futex/timer/signal or pipe-`EPOLLHUP`
+  issue exposed by that fork chain. `rustc` (`hello.rs`) compiles + runs on the branch (RC=0,
+  ~68 s SMP=1), so fork/exec/mmap themselves are fine.
+
+- **Forked children `SIGSEGV` under SMP=4 concurrency — a fork/clone context race.** First seen
+  as an intermittent `/bin/sshd` SIGSEGV; now **reliably reproduced** by fork-hammering at SMP=4
+  (many concurrent SSH connections, each forking a busybox shell → crash on the first boot). Not
+  sshd-specific — `/bin/busybox` children crash **right after `[FORK-COW] shared N pages`**. Two
+  signatures captured (`sshd_crash_HUNT_RESULT.txt`):
+  - `[WILD-DA]` on a **CLONE_VM thread**: `FAR=0x0`, **`x0..x19` all zero** (incl. the callee-saved
+    pointer `x19`) while `x20/x29/x30/SP_EL0/TPIDR_EL0` are intact → the thread resumed with a
+    **partially-zeroed register context** and null-deref'd.
+  - a level-3 **translation fault** (`ISS=0x7`) on a userspace page after the CoW fork.
+
+  **Not a missing TLB flush:** the fork demote-to-RO path calls `flush_tlb_all()`, which under
+  `kernel_smp_shared` is a correct cross-core broadcast (`tlbi vmalle1is; dsb ish; isb`). The
+  partially-zeroed callee-saved context points at the **fork/clone context setup or the
+  context-switch save/restore racing under 4-core concurrency**, not a CoW page-mapping bug. This
+  is the real cause of interactive-shell / sshd instability at SMP=4. Next: `lldb` on the
+  `[WILD-DA]` to trace where the zeroed context originates (clone init vs scheduler save/restore).
 
 ## Background
 
