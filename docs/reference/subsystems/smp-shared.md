@@ -131,22 +131,36 @@ separately:
   issue exposed by that fork chain. `rustc` (`hello.rs`) compiles + runs on the branch (RC=0,
   ~68 s SMP=1), so fork/exec/mmap themselves are fine.
 
-- **Forked children `SIGSEGV` under SMP=4 concurrency — a fork/clone context race.** First seen
-  as an intermittent `/bin/sshd` SIGSEGV; now **reliably reproduced** by fork-hammering at SMP=4
-  (many concurrent SSH connections, each forking a busybox shell → crash on the first boot). Not
-  sshd-specific — `/bin/busybox` children crash **right after `[FORK-COW] shared N pages`**. Two
-  signatures captured (`sshd_crash_HUNT_RESULT.txt`):
-  - `[WILD-DA]` on a **CLONE_VM thread**: `FAR=0x0`, **`x0..x19` all zero** (incl. the callee-saved
-    pointer `x19`) while `x20/x29/x30/SP_EL0/TPIDR_EL0` are intact → the thread resumed with a
-    **partially-zeroed register context** and null-deref'd.
-  - a level-3 **translation fault** (`ISS=0x7`) on a userspace page after the CoW fork.
+- **Forked children `SIGSEGV` under SMP=4 — memory corruption in the fork/exec/process-creation
+  path during the high-concurrency BRINGUP window.** First seen as an intermittent `/bin/sshd`
+  SIGSEGV; **reproduced** by fork-hammering **during boot** (`scratchpad/sshd_crash_hunt.py`:
+  reboot + immediate concurrent fork load). Key timing finding: it fires only in the **first few
+  seconds** (secondaries onlining + herd forking every service at once) — a settled instance
+  survives 30×20 concurrent fork rounds cleanly. So it is a **bringup-window concurrency race**,
+  not steady-state fork load. Children crash **right after `[FORK-COW] shared N pages`**.
 
-  **Not a missing TLB flush:** the fork demote-to-RO path calls `flush_tlb_all()`, which under
-  `kernel_smp_shared` is a correct cross-core broadcast (`tlbi vmalle1is; dsb ish; isb`). The
-  partially-zeroed callee-saved context points at the **fork/clone context setup or the
-  context-switch save/restore racing under 4-core concurrency**, not a CoW page-mapping bug. This
-  is the real cause of interactive-shell / sshd instability at SMP=4. Next: `lldb` on the
-  `[WILD-DA]` to trace where the zeroed context originates (clone init vs scheduler save/restore).
+  **It is not one bug — the crash signature is heterogeneous across boots**, which is the tell of
+  memory corruption rather than a single logic error:
+  - `x0..x19` all zero (inherited callee-saved `x19` lost) → null-deref;
+  - child's user PC = a **kernel** address (`rust_sync_el0_handler_inner`) with other regs correct;
+  - a fresh process writing to `0x0` during musl startup (`set_tid_address`/`sigprocmask`);
+  - `[DA-MISS] pid=N ppid=0 … checked 0 mmap_regions` — a process with an **empty mmap-region list
+    and no parent** (a half-initialized / clobbered `Process`).
+
+  **Hypotheses ruled out by instrumentation:** (1) missing TLB flush — `flush_tlb_all()` is a
+  correct cross-core broadcast (`tlbi vmalle1is; dsb ish; isb`); (2) the zeroed-GPR fallback in
+  `get_saved_user_context` — a `[CTXBUG]` probe on the fallback-for-current-thread case **never
+  fired**; (3) capture-time kernel PC — a `[CAPBUG]` probe on `fork`'s captured `parent_ctx.pc`
+  **never fired** (the kernel PC appears *after* capture). So the corruption is post-capture and
+  affects `Process`/context/page-table/mmap-region state broadly.
+
+  **Working conclusion:** the fork/exec/process-registration path is **not fully SMP-safe under
+  concurrency** — likely because the coarse BKL is *dropped* in places (execve ELF-read drop,
+  M5b file-fault block-I/O drop) and/or the process table / `mmap_regions` / context stores lack
+  their own locking, so overlapping fork/exec/exit across 4 cores corrupt shared state. This is
+  the real cause of interactive-shell / sshd instability at SMP=4, and it is the same family as
+  the coarse-BKL residual (not a one-line fix). Next: audit the BKL-drop sites + process-table /
+  `mmap_regions` locking for concurrent fork/exec/exit, and/or serialize process creation.
 
 ## Background
 
