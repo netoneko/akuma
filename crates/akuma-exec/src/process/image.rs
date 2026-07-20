@@ -5,6 +5,7 @@ use crate::mmu;
 use crate::runtime::{runtime, config, FrameSource};
 use crate::process::types::{ProcessMemory, LazySource, SignalHandler, SignalAction, PROCESS_INFO_ADDR, ProcessInfo};
 use crate::process::children::{clear_lazy_regions, push_lazy_region, push_lazy_region_with_source};
+use crate::process::lifecycle::LifecycleGuard;
 use super::Process;
 
 /// Maximum virtual address range registered for demand-paged stack growth.
@@ -26,6 +27,13 @@ pub(crate) fn compute_heap_lazy_size(brk: usize, memory: &ProcessMemory) -> usiz
 impl Process {
     /// Replace current process image with a new ELF binary (execve core)
     pub fn replace_image(&mut self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), String> {
+        // Serialize against concurrent lifecycle ops under shared-kernel SMP — see
+        // `process/lifecycle.rs`. `replace_image` does the destructive
+        // `mmap_regions.clear()` + address-space swap mid-body, and the runbook
+        // (`docs/runbooks/debug-smp-fork-corruption.md` hypothesis 1) identified
+        // preemption inside that window as the prime suspect for the heterogeneous
+        // userspace SIGSEGVs at SMP=4.
+        let _lifecycle = LifecycleGuard::acquire();
         // #region agent log
         (runtime().print_str)("[FORK-DBG] replace_image: loading ELF\n");
         // #endregion
@@ -109,6 +117,9 @@ impl Process {
 
     /// Replace current process image using on-demand loading from a file path.
     pub fn replace_image_from_path(&mut self, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<(), String> {
+        // Serialize against concurrent lifecycle ops under shared-kernel SMP — see
+        // `process/lifecycle.rs` and the comment in `replace_image`.
+        let _lifecycle = LifecycleGuard::acquire();
         let interp_prefix: Option<&str> = None;
         let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, deferred_segments) =
             crate::elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config().user_stack_size, interp_prefix)

@@ -1,10 +1,29 @@
 # SMP=4 fork/exec process-state corruption — handoff / debugging dossier
 
-> **Status: OPEN bug. This is a handoff doc** written 2026-07-21 for whoever picks up the
-> live debugging. It records the symptom, an exact repro, every hypothesis **ruled out**
-> (with file:line evidence so you don't re-chase them), the one **decisive experiment**
-> already run, and the narrowed hypothesis space. Companion: [`debug-smp.md`](debug-smp.md)
-> (general shared-kernel SMP debugging) and [`../reference/subsystems/smp-shared.md`](../reference/subsystems/smp-shared.md).
+> **Status: FIX LANDED 2026-07-21 — awaiting empirical confirmation.** The
+> "correctness-first bisection" experiment (suggested next experiments §3) is
+> implemented: a reentrant `LifecycleLock` now serializes every process-lifecycle
+> op (`fork_process` / `vfork_process` / `clone_thread` / `replace_image{,_from_path}`
+> / `return_to_kernel{,_from_fault}` / `kill_process{,_with_signal}` /
+> `spawn_process_with_channel_ext` / `spawn_process_from_image_with_args`) across
+> preemption under `cfg(kernel_smp_shared)`. Source:
+> `crates/akuma-exec/src/process/lifecycle.rs`. The lock is **distinct from the
+> BKL**, held with IRQs **enabled** (so the holder can still be preempted and
+> resumed — preemption no longer exposes half-built state because no peer can
+> enter a lifecycle op until the holder finishes), and reentrant (depth-tracked)
+> so nested calls like `return_to_kernel → kill_box → kill_process` don't
+> self-deadlock. Compiles to a no-op on every non-`kernel_smp_shared` profile
+> (default / `size` / `extreme` / `multikernel`), so those builds are byte-for-byte
+> unaffected. **To confirm:** rerun `SMP=4 python3 sshd_crash_hunt.py` against a
+> fresh `cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests`.
+> If the crash vanishes → hypotheses 1/3 confirmed and the long-term fix is real
+> per-Process locking (RwSpinlock) for non-lifecycle readers. If it persists →
+> narrowed to hypotheses 2/4 (THREAD_CONTEXTS aliasing or TLB coherence), and
+> this lock can stay as defense-in-depth regardless. Below is the original handoff
+> doc, unchanged for context.
+>
+> Companion: [`debug-smp.md`](debug-smp.md) (general shared-kernel SMP debugging)
+> and [`../reference/subsystems/smp-shared.md`](../reference/subsystems/smp-shared.md).
 
 ## One-paragraph summary
 

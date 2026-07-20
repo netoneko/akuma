@@ -6,6 +6,7 @@ use crate::process::table;
 use crate::process::channel::{remove_channel, get_channel};
 use crate::process::children::lookup_process;
 use crate::process::cleanup_process_fds;
+use crate::process::lifecycle::LifecycleGuard;
 use crate::threading;
 
 /// Shared signal action table for CLONE_SIGHAND semantics.
@@ -39,6 +40,10 @@ impl SharedSignalTable {
 /// * `Ok(())` if the process was successfully killed
 /// * `Err(message)` if the process was not found or could not be killed
 pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
+    // Serialize against concurrent lifecycle ops — reentrant when called from
+    // `return_to_kernel`'s teardown (which already holds the lock). See
+    // `process/lifecycle.rs`.
+    let _lifecycle = LifecycleGuard::acquire();
     // Kill direct children first so parent-kill semantics cascade and avoid
     // leaving orphaned workers running after the parent exits.
     let child_pids: Vec<Pid> = table::collect_pids(|p| p.parent_pid == pid);
@@ -103,6 +108,8 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
 /// Kill a process with a specific signal number.
 /// The exit code is set to -(signal) so encode_wait_status reports the correct signal.
 pub fn kill_process_with_signal(pid: Pid, sig: u32) -> Result<(), &'static str> {
+    // Serialize against concurrent lifecycle ops — reentrant. See `process/lifecycle.rs`.
+    let _lifecycle = LifecycleGuard::acquire();
     let proc = lookup_process(pid).ok_or("Process not found")?;
     let thread_id = proc.thread_id;
 

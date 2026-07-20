@@ -13,6 +13,11 @@ pub mod image;
 pub mod spawn;
 pub mod exec;
 pub mod diag;
+pub mod lifecycle;
+
+pub use lifecycle::{LifecycleGuard, LifecycleLock};
+#[cfg(kernel_smp_shared)]
+pub use lifecycle::PROCESS_LIFECYCLE_LOCK;
 
 pub use types::*;
 pub use table::*;
@@ -1011,6 +1016,12 @@ pub fn kill_child_processes_for_thread_group(l0_phys: usize) {
 /// Exit code is communicated via ProcessChannel for async callers.
 #[unsafe(no_mangle)]
 pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
+    // Serialize the entire teardown (channel notify, fd close, AS deactivate,
+    // child/box kill, unregister) against concurrent lifecycle ops on peer cores.
+    // Released explicitly before the terminal yield loop (this function never
+    // returns, so the RAII guard would otherwise hold the lock forever — wedging
+    // every future fork/exec/exit on the box). See `process/lifecycle.rs`.
+    let lifecycle = LifecycleGuard::acquire();
     let lr: u64;
     #[cfg(target_os = "none")]
     unsafe { core::arch::asm!("mov {}, x30", out(reg) lr); }
@@ -1221,7 +1232,14 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     // Mark thread as terminated so scheduler stops scheduling it
     // Idempotent - safe to call even if already marked by kill_process
     crate::threading::mark_current_terminated();
-    
+
+    // Release the lifecycle lock before entering the terminal yield loop. The thread
+    // is now zombie and will never run user code again; holding the lock past this
+    // point would deadlock every future fork/exec/exit on the box. Drop is explicit
+    // (rather than via the RAII guard's scope-end drop) because this function never
+    // returns — the `loop` below is the function's end.
+    drop(lifecycle);
+
     // Yield forever - thread is terminated, scheduler will reclaim it
     // Thread 0's cleanup routine will free the thread slot.
     // Defensive (mirrors return_to_kernel_from_fault): if this exit was reached
@@ -1249,6 +1267,9 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
 /// - `kill_thread_group` has already terminated all sibling threads, so there
 ///   are no live waiters to wake via FUTEX_OWNER_DIED.
 pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
+    // Serialize teardown against concurrent lifecycle ops (mirrors `return_to_kernel`).
+    // Released explicitly before the terminal yield loop below — see the comment there.
+    let lifecycle = LifecycleGuard::acquire();
     let tid = crate::threading::current_thread_id();
     log::debug!("[RTK-FAULT] code={} tid={}", exit_code, tid);
 
@@ -1320,6 +1341,11 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
 
     crate::threading::mark_current_terminated();
 
+    // Release the lifecycle lock before entering the terminal yield loop — same
+    // reasoning as `return_to_kernel`. The thread is zombie now; holding the lock
+    // would deadlock future fork/exec/exit on the box.
+    drop(lifecycle);
+
     // CRITICAL: this path is entered from the EL1 fault-recovery pad, which ERETs
     // with the *faulting* code's DAIF. If the fault hit a kernel critical section
     // (IRQs masked, SPSR.I=1), the terminal yield loop below can never switch away
@@ -1367,6 +1393,10 @@ pub fn waitpid(pid: Pid) -> Option<(Pid, i32)> {
 /// expected to deadlock the global lazy-region or fd tables. A pathological
 /// huge `brk` can still monopolize CPU for a long time (see `MAX_FORK_BRK_COPY_PAGES`).
 pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str> {
+    // Serialize lifecycle against preemption under shared-kernel SMP. See
+    // `process/lifecycle.rs`. The guard drops on every return path (including `?`
+    // early-returns), so the lock is released exactly when the function exits.
+    let _lifecycle = LifecycleGuard::acquire();
     // #region agent log
     (runtime().print_str)("[FORK-DBG] fork_process ENTRY\n");
     // #endregion
@@ -2061,6 +2091,10 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 /// mapped pages; faulting new memory before exec would violate the vfork
 /// contract and mutate the shared L0 — a stray fault instead fails safely).
 pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str> {
+    // Serialize lifecycle against preemption under shared-kernel SMP — see
+    // `process/lifecycle.rs`. vfork's state mutations (shared-AS clone, parent
+    // suspension, child registration) must not be exposed mid-flight.
+    let _lifecycle = LifecycleGuard::acquire();
     if (runtime().is_memory_low)() {
         return Err("Kernel memory low, cannot vfork");
     }
@@ -2173,6 +2207,11 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
 /// Clone a thread within the same process (CLONE_THREAD | CLONE_VM).
 /// The child shares the parent's address space and file descriptors.
 pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u64) -> Result<u32, &'static str> {
+    // Serialize lifecycle against preemption under shared-kernel SMP — see
+    // `process/lifecycle.rs`. CLONE_THREAD creates a new thread + Process and
+    // registers it; the half-built child must not be observable by a peer core's
+    // EL1 code (e.g. a signal-delivery scan) between allocate and mark-ready.
+    let _lifecycle = LifecycleGuard::acquire();
     // Reject stack=0: a thread with SP=0 will immediately crash at a near-zero
     // address (e.g. FAR=0x28) when it tries to access stack variables.  This
     // happens when Go's vfork child leaks -ENOSYS into clone flags, causing

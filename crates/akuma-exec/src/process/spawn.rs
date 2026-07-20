@@ -10,6 +10,7 @@ use crate::process::types::{Pid, DEFAULT_ENV};
 use crate::process::channel::{ProcessChannel, register_channel, remove_channel};
 use crate::process::table::{register_process};
 use crate::process::children::{lookup_process, current_terminal_state};
+use crate::process::lifecycle::LifecycleGuard;
 
 use super::{Process, enter_user_mode, read_current_pid, get_box_name};
 
@@ -88,6 +89,11 @@ pub fn spawn_process_with_channel_ext(
     box_id: u64,
     pty: bool,
 ) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
+    // Serialize lifecycle against preemption under shared-kernel SMP — see
+    // `process/lifecycle.rs`. spawn builds a Process, registers it, then spawns
+    // a thread whose first act is to mutate that Process; the half-built state
+    // must not be observable mid-flight by a peer core's EL1 code.
+    let _lifecycle = LifecycleGuard::acquire();
     if crate::threading::user_threads_available() == 0 {
         return Err("No available user threads for process execution".into());
     }
@@ -401,6 +407,9 @@ pub fn spawn_process_from_image(name: &str, elf_data: &[u8]) -> Result<(usize, P
 /// `argv[0]` is conventionally the program name. The process's `ProcessInfo.args` is set so
 /// userspace sees its arguments (e.g. `curl -sS https://ifconfig.me`).
 pub fn spawn_process_from_image_with_args(name: &str, argv: &[String], elf_data: &[u8]) -> Result<(usize, Pid), String> {
+    // Serialize lifecycle against preemption under shared-kernel SMP — see
+    // `process/lifecycle.rs` and `spawn_process_with_channel_ext`.
+    let _lifecycle = LifecycleGuard::acquire();
     if crate::threading::user_threads_available() == 0 {
         return Err("No available user threads for image execution".into());
     }
