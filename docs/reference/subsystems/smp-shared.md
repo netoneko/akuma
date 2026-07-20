@@ -154,13 +154,17 @@ separately:
   **never fired** (the kernel PC appears *after* capture). So the corruption is post-capture and
   affects `Process`/context/page-table/mmap-region state broadly.
 
-  **Working conclusion:** the fork/exec/process-registration path is **not fully SMP-safe under
-  concurrency** — likely because the coarse BKL is *dropped* in places (execve ELF-read drop,
-  M5b file-fault block-I/O drop) and/or the process table / `mmap_regions` / context stores lack
-  their own locking, so overlapping fork/exec/exit across 4 cores corrupt shared state. This is
-  the real cause of interactive-shell / sshd instability at SMP=4, and it is the same family as
-  the coarse-BKL residual (not a one-line fix). Next: audit the BKL-drop sites + process-table /
-  `mmap_regions` locking for concurrent fork/exec/exit, and/or serialize process creation.
+  **Updated conclusion (2026-07-21): NOT the BKL-drops.** A decisive experiment forced **both**
+  block-I/O BKL-drops OFF (so every EL1 excursion holds the BKL end-to-end → EL1 fully serialized
+  across cores) and the crash **still fired on boot 1/20**, all signatures present. So the cause
+  is **not** concurrent EL1. The exposure is that a multi-step lifecycle op (`fork_process`,
+  `do_execve`/`replace_image`, exit/teardown) is **not atomic across preemption** — IRQs are on
+  during the handler (`exceptions.rs:174`), so a thread preempted mid-op has the BKL reconciled
+  away, exposing half-built `Process` / `THREAD_CONTEXTS` / process-table state — and/or
+  genuinely-parallel **EL0** over fork-CoW-shared frames. The user-PC-=-kernel-addr signature
+  resolves exactly to `rust_sync_el0_handler_inner+0x0`, a value never stored as a pointer in the
+  source ⇒ context-memory corruption/aliasing. **Full dossier + rank-ordered hypotheses + repro:
+  [`../../runbooks/debug-smp-fork-corruption.md`](../../runbooks/debug-smp-fork-corruption.md).**
 
 ## Background
 
