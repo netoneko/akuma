@@ -6,6 +6,40 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+/// Mask local IRQs (set `DAIF.I`) and return the prior `DAIF` for [`irq_restore`]. Used by
+/// [`KernelLock::acquire`] to make its FIFO ticket wait atomic against local exception
+/// nesting. Bare-metal AArch64 only; a no-op returning `0` on host builds (single-threaded
+/// tests have no local IRQs).
+#[cfg(target_os = "none")]
+#[inline(always)]
+fn irq_save_mask() -> u64 {
+    let daif: u64;
+    // SAFETY: reading DAIF and setting the IRQ mask bit have no memory effects.
+    unsafe {
+        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
+        core::arch::asm!("msr daifset, #0x2", options(nomem, nostack));
+    }
+    daif
+}
+
+/// Restore `DAIF` saved by [`irq_save_mask`]. Bare-metal AArch64 only; no-op on host.
+#[cfg(target_os = "none")]
+#[inline(always)]
+fn irq_restore(daif: u64) {
+    // SAFETY: restoring the previously-saved DAIF; no memory effects.
+    unsafe { core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack)) };
+}
+
+#[cfg(not(target_os = "none"))]
+#[inline(always)]
+fn irq_save_mask() -> u64 {
+    0
+}
+
+#[cfg(not(target_os = "none"))]
+#[inline(always)]
+fn irq_restore(_daif: u64) {}
+
 /// Total Big-Kernel-Lock spin iterations across all contended [`KernelLock::acquire`]
 /// calls — a cross-core BKL-wait-time proxy for A/B measurement (e.g. does dropping the
 /// BKL around a fault's block I/O reduce peer wait). Accumulated once per acquire, so the
@@ -105,17 +139,34 @@ pub fn reset_wait_by_holder() {
 /// changes (docs/archive/SMP_SHARED.md, M1). Uncontended on a single-core build and in
 /// M0/M1 (secondaries parked).
 ///
-/// **Contract:** all operations must run with local IRQs masked (exception entry, the
-/// eret epilogue, and `with_irqs_disabled` all guarantee this), so re-entrancy from a
-/// *local* interrupt is stack-ordered, never concurrent, on the owning core. Cross-core
-/// exclusion is the compare-exchange on `owner`. `acquire`/`release` are **idempotent**
-/// for the owner (re-acquiring what you hold, or releasing what you don't, is a no-op),
-/// which makes the reconciliation robust against the non-lexical acquire/release that
-/// context switches create.
+/// **IRQ state:** the IRQ/eret paths call in with local IRQs masked (hardware masks on
+/// exception entry), but the **syscall path enters with IRQs *enabled*** — the EL0-sync
+/// trampoline does `msr daifclr, #2` before `rust_sync_el0_handler → enter_kernel` so a
+/// long syscall stays preemptible. `acquire` therefore masks IRQs itself for the duration
+/// of its (fair) wait and restores them once it owns the lock; see `acquire`.
+///
+/// **Fairness:** contended acquisition is a **FIFO ticket lock** (`next_ticket` /
+/// `now_serving`) layered over the binary `owner`, so no core can be starved by peers (or
+/// by the releaser immediately re-grabbing). This is what makes the M5c step-2 BKL-free
+/// EL0 scheduler safe: without it, a secondary that must re-enter EL1 to un-strand a
+/// BKL-free-stolen thread could lose the plain test-and-set race indefinitely (a livelock;
+/// see `smp_shared::SCHED_BKLFREE_EL0_ENABLED`).
+///
+/// `acquire`/`release` remain **idempotent** for the owner (re-acquiring what you hold, or
+/// releasing what you don't, is a no-op) — the reentrant/reconcile cases take NO ticket, so
+/// the ticket counters stay balanced across the non-lexical acquire/release that context
+/// switches create (one ticket per EL0→EL1 crossing, one `now_serving` advance per
+/// EL1→EL0 crossing, per core).
 pub struct KernelLock {
-    /// `0` = free; otherwise `owner_core_aff0 + 1`. A CAS from `0` transfers ownership
-    /// between cores; the owner writes `0` back to release.
+    /// `0` = free; otherwise `owner_core_aff0 + 1`. Written by the ticket winner on
+    /// acquire and cleared by the owner on release; the source of truth for
+    /// `held_by`/`is_held`/reconcile and the reentrant fast path.
     owner: AtomicU32,
+    /// Next FIFO ticket to hand out (monotonic, wraps). A contended acquirer takes one.
+    next_ticket: AtomicU32,
+    /// The ticket currently permitted to take ownership. The owner's release advances it
+    /// by one, handing the lock to the next waiter in arrival order.
+    now_serving: AtomicU32,
 }
 
 impl Default for KernelLock {
@@ -129,61 +180,55 @@ impl KernelLock {
     pub const fn new() -> Self {
         Self {
             owner: AtomicU32::new(0),
+            next_ticket: AtomicU32::new(0),
+            now_serving: AtomicU32::new(0),
         }
     }
 
-    /// Ensure `core_id` (an MPIDR aff0) owns the lock, spinning until free if another
-    /// core holds it. Idempotent: a no-op if this core already owns it. Must run with
-    /// local IRQs masked (see the type contract).
+    /// Ensure `core_id` (an MPIDR aff0) owns the lock, waiting (FIFO) until it is our turn
+    /// if another core holds it. Idempotent: a no-op if this core already owns it.
+    ///
+    /// Masks local IRQs for the duration of the ticket wait. The syscall path enters with
+    /// IRQs enabled (see the type doc), so without masking a timer/device IRQ could nest
+    /// mid-wait and *its* `enter_kernel` would take a SECOND ticket for this core — a ticket
+    /// that can never be served, because the outer (lower) ticket is stalled underneath the
+    /// nested exception frame → self-deadlock. Masking makes the per-core wait atomic; IRQs
+    /// are restored to their prior state once we own the lock. On the IRQ/eret paths IRQs
+    /// are already masked, so the mask/restore is a no-op there.
     #[inline]
     pub fn acquire(&self, core_id: u32) {
         let me = core_id + 1;
+        // Reentrant fast path: this core already owns it (a nested EL1 exception, or a
+        // reconcile-acquire that finds we never left EL1). No ticket, no wait.
+        if self.owner.load(Ordering::Acquire) == me {
+            return;
+        }
+        let daif = irq_save_mask();
+        // Re-check after masking: a nested IRQ in the tiny window before the mask may have
+        // already acquired the lock for this core (taking the ticket itself). If so we must
+        // NOT take a second ticket.
+        if self.owner.load(Ordering::Acquire) == me {
+            irq_restore(daif);
+            return;
+        }
+        // Take a FIFO ticket and wait for our turn. The holder's release advances
+        // `now_serving` by exactly one, so waiters are served in arrival order and none can
+        // be starved by a peer or by the releaser re-grabbing.
+        let my_ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         let mut spins: u32 = 0;
         let mut total_spins: u64 = 0;
-        // Profiler: the tag of the core that was blocking us, sampled once when we first
-        // observe contention (u64::MAX = not yet sampled).
+        // Profiler: the tag of the core that was blocking us, sampled once (u64::MAX = not
+        // yet sampled).
         let mut wait_tag: u64 = u64::MAX;
-        loop {
-            // Re-check ownership EVERY iteration, not just once up front. The syscall
-            // path calls this with IRQs enabled, so a timer IRQ can nest mid-spin and
-            // *its* `enter_kernel` may win the lock for THIS core; the outer spin must
-            // then observe `owner == me` and return, rather than retrying `CAS(0, me)`
-            // forever (which fails once owner is a nonzero `me`). This is the
-            // re-entrancy that produced the `owner=N waiter=N` self-deadlock.
-            let cur = self.owner.load(Ordering::Acquire);
-            if cur == me {
-                return; // this core already owns it (possibly via a nested acquire)
-            }
-            if cur == 0 {
-                if self
-                    .owner
-                    .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    // Accumulate this acquire's spin count once (a cross-core BKL-wait-time
-                    // proxy; see `contention_spins`). One atomic add per acquire — the
-                    // uncontended fast path adds nothing.
-                    if total_spins > 0 {
-                        CONTENTION_SPINS.fetch_add(total_spins, Ordering::Relaxed);
-                        // Attribute the wait to whatever the blocking core was doing
-                        // (profiler only — gated so normal boot pays nothing).
-                        if PROFILE_ENABLED.load(Ordering::Relaxed) {
-                            let bucket = if wait_tag == u64::MAX {
-                                HOLD_TAG_UNKNOWN as usize
-                            } else {
-                                (wait_tag as usize).min(PROFILE_BUCKETS - 1)
-                            };
-                            WAIT_BY_HOLDER[bucket].fetch_add(total_spins, Ordering::Relaxed);
-                        }
+        while self.now_serving.load(Ordering::Acquire) != my_ticket {
+            if wait_tag == u64::MAX && PROFILE_ENABLED.load(Ordering::Relaxed) {
+                // Sample the blocking owner core's tag (owner encodes core `cur - 1`).
+                let cur = self.owner.load(Ordering::Relaxed);
+                if cur != 0 {
+                    let owner_core = (cur - 1) as usize;
+                    if owner_core < PROFILE_MAX_CORES {
+                        wait_tag = HOLDER_TAG[owner_core].0.load(Ordering::Relaxed);
                     }
-                    return;
-                }
-            } else if wait_tag == u64::MAX && PROFILE_ENABLED.load(Ordering::Relaxed) {
-                // First observed contention: sample the blocking owner core's tag
-                // (owner encodes core `cur - 1`). Profiler-only.
-                let owner_core = (cur - 1) as usize;
-                if owner_core < PROFILE_MAX_CORES {
-                    wait_tag = HOLDER_TAG[owner_core].0.load(Ordering::Relaxed);
                 }
             }
             spins = spins.wrapping_add(1);
@@ -194,20 +239,46 @@ impl KernelLock {
             }
             core::hint::spin_loop();
         }
+        // Our turn: the previous holder cleared `owner` to 0 before advancing `now_serving`
+        // to us, and no later ticket can proceed ahead of us, so we are the sole writer.
+        self.owner.store(me, Ordering::Release);
+        // Accumulate this acquire's spin count once (a cross-core BKL-wait-time proxy; see
+        // `contention_spins`). The uncontended fast path (our turn immediately) adds nothing.
+        if total_spins > 0 {
+            CONTENTION_SPINS.fetch_add(total_spins, Ordering::Relaxed);
+            if PROFILE_ENABLED.load(Ordering::Relaxed) {
+                let bucket = if wait_tag == u64::MAX {
+                    HOLD_TAG_UNKNOWN as usize
+                } else {
+                    (wait_tag as usize).min(PROFILE_BUCKETS - 1)
+                };
+                WAIT_BY_HOLDER[bucket].fetch_add(total_spins, Ordering::Relaxed);
+            }
+        }
+        irq_restore(daif);
     }
 
-    /// Ensure `core_id` does not own the lock, freeing it for a waiting core.
-    /// Idempotent: a no-op if this core does not own it. Must run with local IRQs
+    /// Ensure `core_id` does not own the lock, freeing it for the next waiter in FIFO
+    /// order. Idempotent: a no-op if this core does not own it. Must run with local IRQs
     /// masked by the current owner.
     #[inline]
     pub fn release(&self, core_id: u32) {
         let me = core_id + 1;
         // Only the owner may free it; releasing what you don't hold is a no-op (the
         // reconciliation path can legitimately call this after a sibling core's
-        // excursion already moved the lock).
-        let _ = self
+        // excursion already moved the lock). Clear `owner` to 0 BEFORE advancing
+        // `now_serving` so the next ticket winner sees a free lock the instant it is
+        // handed the turn (the `owner.store(me)` in `acquire` relies on this ordering).
+        if self
             .owner
-            .compare_exchange(me, 0, Ordering::Release, Ordering::Relaxed);
+            .compare_exchange(me, 0, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
+        {
+            // Hand the lock to the next waiter in arrival order (exactly one advance per
+            // owning release — reentrant/idempotent releases don't reach here, keeping
+            // `now_serving` balanced against the tickets `acquire` handed out).
+            self.now_serving.fetch_add(1, Ordering::Release);
+        }
     }
 
     /// Reconcile the lock to the EL this core is about to run in: acquire when
@@ -661,5 +732,29 @@ mod tests {
         }
         assert!(bkl.held_by(3));
         bkl.release(3);
+    }
+
+    #[test]
+    fn kernel_lock_ticket_counters_stay_balanced() {
+        // Every EL0→EL1 crossing takes one FIFO ticket and every EL1→EL0 crossing advances
+        // `now_serving` once; reentrant acquires and idempotent (non-owner / double)
+        // releases must take NO ticket and NOT advance, or the counters drift and a later
+        // acquire would wait forever for a `now_serving` value that never arrives. Exercise
+        // exactly those cases across cores; a drift would hang this test.
+        let bkl = KernelLock::new();
+        for round in 0..2000u32 {
+            let core = round % 4;
+            bkl.acquire(core);
+            bkl.acquire(core); // nested — takes no ticket
+            assert!(bkl.held_by(core));
+            bkl.release(core);
+            bkl.release(core); // idempotent — must NOT advance now_serving
+            assert!(!bkl.is_held(), "round {round}: lock not free after release");
+        }
+        // Still acquirable after all that (counters didn't drift).
+        bkl.acquire(1);
+        assert!(bkl.held_by(1));
+        bkl.release(1);
+        assert!(!bkl.is_held());
     }
 }

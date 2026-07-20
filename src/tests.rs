@@ -2651,6 +2651,13 @@ fn test_parallel_processes() -> bool {
 
     loop {
         threading::yield_now();
+        // Real shared-kernel SMP: drop the BKL across this cooperative wait (same reason as
+        // exec_with_io_cwd — a child claimed onto a peer core strands if this thread holds
+        // the BKL while waiting for it). Without this, both children can end up RUNNING on
+        // secondaries and freeze needing EL1 while the BSP yield-holds the BKL → the known
+        // nondeterministic SMP=4 `parallel_processes` hang. See docs/runbooks/debug-smp.md.
+        #[cfg(kernel_smp_shared)]
+        akuma_exec::threading::idle_halt();
 
         let p1_done = channel1.has_exited() || akuma_exec::threading::is_thread_terminated(tid1);
         let p2_done = channel2.has_exited() || akuma_exec::threading::is_thread_terminated(tid2);

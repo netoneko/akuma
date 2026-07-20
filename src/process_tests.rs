@@ -60,12 +60,11 @@ pub fn run_all_tests() {
     // Real (shared-kernel) SMP M5c step-2 regression: a kernel thread that exec's an EL0
     // child and cooperatively waits for it must NOT hold the BKL across the wait, or the
     // BKL-free EL0-preempt scheduler lets a peer strand the child -> cross-core deadlock.
-    // NOT dispatched by default: it enables step-2, and while the `exec_with_io` idle_halt
-    // fix removes the deterministic deadlock, a ~25% residual livelock remains until the BKL
-    // is made fair (see docs/runbooks/debug-smp.md §"M5c step-2"). Enable manually to
-    // reproduce/measure. Left compiled (allow(dead_code)) so it doesn't bit-rot.
+    // Safe to run now that the BKL is fair (ticket lock) + `exec_with_io` drops the BKL
+    // across its wait — both required to keep step-2 from deadlocking (see
+    // docs/runbooks/debug-smp.md §"M5c step-2").
     #[cfg(kernel_smp_shared)]
-    let _ = test_smp_shared_cooperative_wait;
+    test_smp_shared_cooperative_wait();
 
     // Net bounce-buffer OOM degradation (pure-fn boundaries + ample-mem alloc);
     // guards against the EC=0x3c kernel abort when an oversized socket buffer

@@ -36,8 +36,10 @@ real SMP) — see `scripts/build_devbox_smoltcp.sh` and
   `lookup_process() -> &'static mut Process` sites (`process/table.rs`,
   `process/children.rs`) — from "IRQs off" to "BKL held" in one stroke. The lock
   (`akuma_exec::sync::KernelLock`, driven via `akuma_exec::bkl`) is an owner-tracked,
-  idempotent spinlock: **held iff a core is in EL1**, reconciled at EL transitions, so
-  no per-thread depth crosses context switches. Zero-cost no-op unless
+  idempotent lock: **held iff a core is in EL1**, reconciled at EL transitions, so
+  no per-thread depth crosses context switches. Contended acquisition is a **fair FIFO
+  ticket wait** (M5c) so no core is starved — the reentrant/reconcile acquires take no
+  ticket, keeping the counters balanced across context switches. Zero-cost no-op unless
   `cfg(kernel_smp_shared)`. M1 wires it on the syscall path (`rust_sync_el0_handler`
   wrapper + `enter_user_mode`); the IRQ/scheduler reconciliation is M2.
 - **Single global run queue + lock**; each core's current thread is `TPIDRRO_EL0`
@@ -82,7 +84,7 @@ they run on more than one core.
 | M5a — network SMP-safety, devbox boots to sshd under SMP | ✅ SMP=2 clean, SMP=4 works |
 | M5b — BKL-free user page-fault path (per-AS `as_lock`) | ✅ Stages 1–3 + 4a: fault PTE edits under `as_lock`, file read/install split, **file-fault block I/O runs BKL-dropped** (A/B measured a BKL-wait reduction on a busybox ELF-fault storm). 4b (full flip) deferred |
 | M5b BKL-hold profiler | ✅ Gated (`set_profiling`, default off). **Finding: IRQ/scheduler ≈70 % of contended BKL time, faults ≈20 %** under multi-process load |
-| M5c — split the run-queue lock out of the BKL | 🚧 Step 1 (POOL covers the whole context switch — switch atomic on POOL alone) done + verified SMP=2/4. Step 2 (scheduler runs BKL-free on EL0 preemption) implemented but **gated off** — at SMP≥4 it opens a **cross-core circular deadlock** (lldb-confirmed 2026-07-20, *not* the earlier "fairness/monopoly" guess): a BKL-free secondary claims a thread `RUNNING` without the BKL while the BSP holds the BKL in a cooperative `yield_now` wait for it. Fix is **two parts, both required**: (1) don't hold the BKL across a cooperative wait — done for `exec_with_io_cwd` via `idle_halt`, cuts the SMP=4 stress hang ~100%→~25%; (2) a **fair/queued BKL** to kill the ~25% residual livelock — not yet done, the remaining blocker. See `debug-smp.md` §"M5c step-2". |
+| M5c — split the run-queue lock out of the BKL | ✅ Step 1 (POOL covers the whole context switch — switch atomic on POOL alone) done + verified SMP=2/4. Step 2 (scheduler runs BKL-free on EL0 preemption) implemented + its SMP≥4 deadlock **fixed** (lldb-confirmed 2026-07-20 cross-core circular deadlock, *not* the earlier "fairness/monopoly" guess): a BKL-free secondary claimed a thread `RUNNING` without the BKL while the BSP held the BKL in a cooperative `yield_now` wait. Two-part fix, both landed: (1) don't hold the BKL across a cooperative wait — `idle_halt` in `exec_with_io_cwd` + `test_parallel_processes`; (2) a **fair FIFO ticket `KernelLock`** to kill the residual livelock. Validated 3/3 at SMP=4 (`test_smp_shared_cooperative_wait`) + fixed the pre-existing SMP=4 `parallel_processes` race. Step-2 toggle now safe to enable (still defaults off). See `debug-smp.md` §"M5c step-2". |
 | M5 — fine-grained locking (real ASIDs, split BKL, cross-core wakeup) | in progress (see M5b) |
 
 > **Known open item:** the *full devbox-smoltcp boot to sshd* stalls under active

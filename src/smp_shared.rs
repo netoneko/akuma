@@ -125,20 +125,22 @@ pub fn set_exec_bkl_drop_enabled(on: bool) {
 /// BSP holds it — so the child stays READY and the **BSP itself** runs it, reconciling to
 /// EL0 and releasing the BKL. No deadlock.
 ///
-/// The fix is TWO parts, both required (measured at SMP=4 with a 40-iteration exec-and-wait
-/// stress test, `test_smp_shared_cooperative_wait`):
+/// The fix is TWO parts, both required — and both now DONE (validated at SMP=4 with the
+/// 40-iteration exec-and-wait stress `test_smp_shared_cooperative_wait`, 3/3 clean where the
+/// unfixed build hung ~100%):
 ///
 /// 1. "A kernel thread must not hold the BKL across a cooperative wait-loop": drop +
 ///    re-acquire the BKL around `yield_now` waits. Done for `exec_with_io_cwd` via
-///    `idle_halt` (`crate::process::exec::exec_with_io_cwd`). This alone cuts the hang from
+///    `idle_halt` (`crate::process::exec::exec_with_io_cwd`). Alone this cut the hang from
 ///    ~100% to a ~25% residual.
-/// 2. A FAIR / queued BKL. The residual ~25% is a livelock: after the waiter drops the BKL,
-///    the unfair test-and-set lets peers (and the waiter re-grabbing on its next tick)
-///    starve the one secondary that holds the BKL-free-stolen child, so it never un-strands.
-///    A ticket/queued BKL removes this. NOT yet done — the remaining blocker.
+/// 2. A FAIR / queued BKL. The residual ~25% was a livelock: after the waiter dropped the
+///    BKL, the unfair test-and-set let peers (and the waiter re-grabbing on its next tick)
+///    starve the one secondary holding the BKL-free-stolen child. Done: `KernelLock` is now
+///    a FIFO ticket lock (`akuma_exec::sync`), which removes the residual.
 ///
-/// Keep step-2 gated until both land. The POOL-over-switch foundation (step 1) is always
-/// active.
+/// This toggle is therefore **now safe to enable** at SMP≥4; it is left defaulting **off**
+/// only because flipping the kernel-wide default is a separate decision. The POOL-over-switch
+/// foundation (step 1) is always active.
 static SCHED_BKLFREE_EL0_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Whether the BKL-free EL0-preempt scheduler path (M5c step 2) is enabled.

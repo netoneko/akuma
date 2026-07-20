@@ -7,8 +7,10 @@ running dev log see [`../archive/SMP_SHARED.md`](../archive/SMP_SHARED.md). This
 *inverse* of the share-nothing multikernel ([`../reference/subsystems/smp.md`](../reference/subsystems/smp.md),
 `cfg(kernel_smp)`); the two are mutually exclusive.
 
-> **Stability: C (active development).** M0–M4 + M5a/M5b done; the SMP=4 path has a
-> known nondeterministic contention race (below). Run devbox single-core unless you are
+> **Stability: C (active development).** M0–M4 + M5a/M5b/M5c done. The BKL is now a **fair
+> FIFO ticket lock**, which (with `idle_halt` on cooperative waits) fixed the former
+> nondeterministic SMP=4 contention hang — the self-test suite now reaches the
+> `test_mmap_file_oom` baseline reliably at SMP=4. Run devbox single-core unless you are
 > specifically working on SMP.
 
 ## Mental model in 60 seconds
@@ -48,9 +50,9 @@ SMP=4 cargo run --profile release-smp-shared --features smp-shared     # -smp 4
 |---|---|---|
 | `[BKL] stuck: owner=N waiter=M` **flood that never stops**, no forward progress | A core is wedged in EL1 holding the BKL (real deadlock) — OR the BSP panicked while holding it (see the panic dump just above the flood). | If preceded by a panic dump, it's that panic — fix the panic, the flood is an artifact. Else attach gdb (below) and find what `owner`'s core is spinning on. |
 | A few dozen **transient** `[BKL] stuck` during a spawn-heavy / FS test, then progress | Coarse-BKL contention — a core held the BKL >10 M spins (~10 ms) while peers waited. Expected today. | Profile it (below). The dominant holder is usually the scheduler. Not a bug. |
-| SMP=4 **nondeterministically wedges** in a spawn/timing-heavy test (`parallel_processes`, "Mixed cooperative") — a re-run passes | The known nondeterministic SMP=4 coarse-BKL contention race. Independent of the fault path (reproduces with fault opts disabled). | Re-run; use SMP=2 for clean measurement. Real fix is shortening BKL hold times (M5b per-AS fault lock; split fork/exec/ELF-load off the BKL) — **not** the BKL-free scheduler, which makes this worse (see "M5c step-2" below). |
-| `[BKL] stuck: owner=1` flood, workload frozen, **only** with `sched_bklfree_el0` ON | The M5c step-2 **cross-core circular deadlock** (re-root-caused 2026-07-20 with lldb — the earlier "monopoly on an unfair lock" note was wrong; it's a hard hang, not a re-grab race). A BKL-free secondary claims a thread `RUNNING` without the BKL while the BSP holds the BKL in a cooperative yield-wait for it. | Keep step-2 gated off. See the dedicated section below. |
-| `owner=N waiter=N` (same core) self-deadlock | A non-idempotent re-acquire, or holding a spinlock then taking the BKL and being re-entered. | The BKL re-checks `owner==me` every spin iteration (`KernelLock::acquire`) to survive nested `enter_kernel` from a timer IRQ. If you added a lock that nests with the BKL, check ordering: `BKL > as_lock > {PMM, page tables, block, ...}`. |
+| SMP=4 **nondeterministically wedges** in a spawn/timing-heavy test (`parallel_processes`, "Mixed cooperative") — a re-run passes | **FIXED (2026-07-20).** Was a cooperative wait-loop (`yield_now` only) holding the BKL while a child stranded RUNNING on a BKL-blocked peer, the unfair test-and-set then livelocking recovery. | Fixed by `idle_halt` on the wait loops (drop the BKL) + the fair FIFO ticket BKL. If a *new* wedge appears, check for a yield-only wait holding the BKL (see "M5c step-2" below). |
+| `[BKL] stuck: owner=1` flood, workload frozen, **only** with `sched_bklfree_el0` ON | The M5c step-2 **cross-core circular deadlock** (re-root-caused 2026-07-20 with lldb — the earlier "monopoly on an unfair lock" note was wrong; it's a hard hang, not a re-grab race). A BKL-free secondary claims a thread `RUNNING` without the BKL while the BSP holds the BKL in a cooperative yield-wait for it. | **FIXED** by the two-part fix (idle_halt on cooperative waits + fair ticket BKL). Step-2 is now safe to enable; see the dedicated section below. |
+| `owner=N waiter=N` (same core) self-deadlock | A non-idempotent re-acquire, or holding a spinlock then taking the BKL and being re-entered. | `KernelLock::acquire` handles nested `enter_kernel` from a timer IRQ two ways: a reentrant fast path (`owner==me` → return, no ticket) and **masking local IRQs across the ticket wait** so a nested exception can't take a second ticket. If you added a lock that nests with the BKL, check ordering: `BKL > as_lock > {PMM, page tables, block, ...}`. |
 | `[SGI] POOL contended, skipped N ticks` | The scheduler SGI used `POOL.try_lock()` and the current thread already held POOL (mid-op). One preemption tick skipped — harmless; the next tick retries. | Only worry if it never stops (a leaked POOL guard). |
 | Boots at SMP=1 but hangs/deadlocks at SMP≥2 in a subsystem | That subsystem isn't SMP-safe: an inner spinlock (`NETWORK`, `SOCKET_TABLE`, block, VFS) is held across a context switch, so under the BKL a peer spins on it while holding the BKL. | Wrap the critical section in a `PreemptGuard` (akuma-net pattern) so the inner lock is never held across a switch; or fold it under the BKL/`as_lock` ordering. |
 | Text interleaves per-char on the console (`[SM[PS-sMP...`) | Multiple cores writing the UART with no cross-core console lock. | Cosmetic. Use `safe_print!` (heap-free, secondary-safe). |
@@ -73,8 +75,8 @@ optimization, runs a workload, and dumps the top holders. **Finding (2026-07):**
 multi-process (spawn) workload the **IRQ/scheduler path holds ~70 %** of contended BKL
 time, faults ~20 %, syscalls the rest — so the scheduler is the dominant contention source.
 
-To A/B a change safely, measure at **SMP=2** (contention-clean; SMP=4's nondeterministic
-race adds noise), enabling the profiler only around the window.
+To A/B a change safely, measure at **SMP=2** (fewer cores → less timing noise), enabling the
+profiler only around the window.
 
 ### Runtime toggles (A/B / debugging)
 
@@ -89,12 +91,13 @@ race adds noise), enabling the profiler only around the window.
   hold). A/B-measured by the `smp_shared_exec_parallelism` self-test (SMP=2): busybox exec storm,
   ~26–63% fewer BKL spins with the drop ON across boots.
 - `smp_shared::set_sched_bklfree_el0_enabled(bool)` — the M5c step-2 optimization (run the
-  scheduler SGI BKL-free when it preempted EL0). Default **off**: correct at SMP=2, but on
-  the current coarse BKL it is counter-productive at SMP≥4 (**root-caused**, see below). The
-  M5c step-1 foundation (POOL covers the whole context switch) is always active regardless.
+  scheduler SGI BKL-free when it preempted EL0). Default **off**, but **now safe to enable**
+  at SMP≥4 (the cross-core deadlock it used to open is fixed by the two-part fix below — left
+  defaulting off only because flipping the kernel-wide default is a separate call). The M5c
+  step-1 foundation (POOL covers the whole context switch) is always active regardless.
 - `sync::set_profiling(bool)` — the BKL-hold profiler. Default **off**.
 
-## M5c step-2 (BKL-free EL0 scheduler): why it stays gated OFF
+## M5c step-2 (BKL-free EL0 scheduler): the deadlock and its fix
 
 **Re-root-caused 2026-07-20 with lldb over the QEMU gdbstub.** The earlier (2026-07-19)
 "monopoly on an unfair lock" explanation was **wrong** — reasoned, never confirmed at the
@@ -141,23 +144,30 @@ itself** runs it, reconciling to EL0 and releasing the BKL. No deadlock. (The ol
 "per-tick circulation" is really "secondaries can't steal a thread out from under a
 BKL-holding cooperative waiter.")
 
-**The fix is TWO parts, both required** (measured at SMP=4 with the 40-iteration
-exec-and-wait stress `test_smp_shared_cooperative_wait`, which deadlocks ~100% with step-2
-on and no fix):
+**The fix is TWO parts, both required — both now DONE** (validated at SMP=4 with the
+40-iteration exec-and-wait stress `test_smp_shared_cooperative_wait`, 3/3 clean where the
+unfixed build hung ~100%):
 
 1. **A kernel thread must not hold the BKL across a cooperative wait-loop.** Drop +
-   re-acquire the BKL around the `yield_now` wait — done for `exec_with_io_cwd` via
-   `idle_halt` (`crates/akuma-exec/src/process/exec.rs`). This alone cuts the hang from
-   ~100% to a **~25% residual**.
-2. **A fair / queued BKL.** The residual ~25% is a *livelock*: after the waiter drops the
-   BKL (idle_halt WFI), the unfair test-and-set lets the other spinning secondaries and the
+   re-acquire the BKL around the `yield_now` wait — done for `exec_with_io_cwd` and
+   `test_parallel_processes` via `idle_halt`. This alone cut the hang from ~100% to a
+   **~25% residual**.
+2. **A fair / queued BKL.** The residual ~25% was a *livelock*: after the waiter dropped the
+   BKL (idle_halt WFI), the unfair test-and-set let the other spinning secondaries and the
    waiter's own next-tick re-grab starve the one secondary holding the BKL-free-stolen
-   child, so it never gets the BKL to un-strand it. (Attaching gdb *hides* this — the stub's
+   child, so it never got the BKL to un-strand it. (Attaching gdb *hides* this — the stub's
    periodic all-core halts perturb the race enough to let it through; it reproduces without
-   gdb.) A ticket/queued `KernelLock` removes it. **Not yet done — the remaining blocker.**
+   gdb.) **Done:** `KernelLock` (`crates/akuma-exec/src/sync.rs`) is now a **FIFO ticket
+   lock** — a contended acquirer takes a ticket and waits its turn (masking local IRQs for
+   the wait so a nested exception can't take a second, un-serviceable ticket); the owner's
+   release advances `now_serving` by one. Reentrant/reconcile acquires take no ticket, so the
+   counters stay balanced across the non-lexical acquire/release of context switches.
 
-So do not treat step-2 as "just premature": it is a correctness deadlock, and only when
-BOTH parts land does it become safe to flip on.
+**Result:** step-2 is now safe to enable at SMP≥4 (left defaulting off only because flipping
+the kernel-wide default is a separate call). As a bonus, the same idle_halt + fair-BKL combo
+**also cured the pre-existing nondeterministic SMP=4 `parallel_processes` hang** (same
+yield-wait-under-BKL root cause) — the full self-test suite now reaches the `test_mmap_file_oom`
+baseline reliably at SMP=4.
 
 ## Live debugging with gdb/lldb
 
@@ -186,7 +196,8 @@ until grep -q "SSH Server\] Listening" run.log 2>/dev/null; do sleep 2; done
 
 The self-test suite halts on a failed threading test
 (`!!! THREADING TESTS FAILED - HALTING !!!`, an intentional semihosting `hlt`, *not* a
-crash). `parallel_processes` failing there is usually the SMP=4 race — re-run.
+crash). `parallel_processes` timing out here used to be the SMP=4 race; that is fixed (fair
+BKL + idle_halt) — if it recurs, treat it as a fresh regression, not "re-run and hope".
 
 ## Gotchas
 
