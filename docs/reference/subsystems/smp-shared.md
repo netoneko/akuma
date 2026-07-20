@@ -104,6 +104,31 @@ they run on more than one core.
 > M4 open item and is **resolved** by M5a (see below) — boot-to-sshd works at SMP=2 (reliable)
 > and SMP=4 (works, subject to the residual above).
 
+### Separate issues surfaced 2026-07-20 (NOT the BKL/SMP-lock work)
+
+Stress-testing with `forktest` and `rustc` turned up two userspace-visible failures. Both leave
+the **kernel alive** (0 `[BKL] stuck`, console/heartbeat live) — neither is a BKL wedge. Tracked
+separately:
+
+- **`forktest_parent` never completes on this branch — a REGRESSION vs `main`.** It hangs at
+  "Launching child 0": the children close their report pipes having written nothing (`[pipe]
+  close_write … write_count=0`), and the parent's Go runtime parks in a ~60 s `futex` waiting on
+  an `epoll` that never signals. **Confirmed a branch regression by bisecting on the kernel:**
+  same `devbox.img` (same forktest binaries), booted on **`main`'s default kernel it runs
+  cleanly** ("Child 0/1 finished successfully … All children processed via epoll. Parent
+  exiting.", ~5 s); booted on the `another-smp-attempt-0` kernel it hangs — at **every** core
+  count including SMP=1 (SMP=1 *on the branch* still compiles in all the branch's kernel changes,
+  so "reproduces at SMP=1" does **not** exonerate the SMP work). Something in this branch's
+  kernel deltas breaks the child's exit/pipe-close → parent `epoll`/`futex` notification. Not yet
+  bisected to a specific commit. `rustc` (`hello.rs`) compiles and runs fine on the branch image
+  (RC=0, ~68 s at SMP=1), so fork/exec/mmap themselves work.
+
+- **`/bin/sshd` intermittently `SIGSEGV`s under SMP=4** (`[Fault] Process 3 (/bin/sshd) SIGSEGV
+  after ~10 s`), which resets all new connections while the kernel keeps running. Intermittent —
+  sshd was stable across a 13-turn meow session + fork storm on other SMP=4 boots the same day.
+  Suspected residual fork/CoW-under-SMP race on the per-connection fork (cf. the earlier
+  fork-CoW-TLB-ASID fix). Not yet reproduced under a debugger.
+
 ## Background
 
 - [`../../archive/SMP_SHARED.md`](../../archive/SMP_SHARED.md) — full progress log.
