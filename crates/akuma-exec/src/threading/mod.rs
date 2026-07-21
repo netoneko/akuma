@@ -962,6 +962,12 @@ fn cleanup_terminated_internal(force: bool) -> usize {
             // triggering signal delivery code in an unexpected context (e.g. /bin/hello
             // which never registered a signal handler), causing an EL1 data abort.
             PENDING_SIGNALS[i].store(0, Ordering::Release);
+            // Reset the per-thread preemption-disable counter. A thread that died with
+            // a disable outstanding (e.g. a lifecycle op that never released — see
+            // process/lifecycle.rs "No-return callers") must not poison the slot's next
+            // occupant with permanently-deferred preemption.
+            PREEMPTION_DISABLED[i].store(0, Ordering::Release);
+            PREEMPTION_DISABLED_SINCE[i].store(0, Ordering::Release);
             // Reset per-thread sigaltstack so the next occupant starts clean.
             THREAD_SIGALTSTACK_SP[i].store(0, Ordering::Release);
             THREAD_SIGALTSTACK_SIZE[i].store(0, Ordering::Release);
@@ -1050,6 +1056,28 @@ static PREEMPTION_DISABLED_SINCE: [AtomicU64; MAX_THREADS] = {
 /// Track last time we ran the watchdog check (for detecting time jumps)
 static LAST_WATCHDOG_CHECK_US: AtomicU64 = AtomicU64::new(0);
 
+/// Diagnostic: source location (`core::panic::Location` pointer) of the
+/// `disable_preemption()` call that took each thread's count 0→1. Read by the
+/// preemption watchdog so a long-disabled thread's log line names the culprit
+/// call site instead of just the tid. Pointer to a `&'static Location`, so a
+/// relaxed usize store is safe.
+static PREEMPTION_DISABLED_AT: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// The file:line that first disabled preemption for `tid` (0→1 transition), if
+/// still disabled. For the watchdog diagnostics.
+pub fn preemption_disabled_at(tid: usize) -> Option<&'static core::panic::Location<'static>> {
+    let ptr = PREEMPTION_DISABLED_AT[tid].load(Ordering::Relaxed) as usize;
+    if ptr == 0 || PREEMPTION_DISABLED[tid].load(Ordering::Relaxed) == 0 {
+        None
+    } else {
+        // SAFETY: only ever stores `Location::caller()` pointers, which are &'static.
+        Some(unsafe { &*(ptr as *const core::panic::Location<'static>) })
+    }
+}
+
 /// Disable preemption for the current thread.
 ///
 /// Can be nested - must call `enable_preemption()` the same number of times.
@@ -1058,12 +1086,15 @@ static LAST_WATCHDOG_CHECK_US: AtomicU64 = AtomicU64::new(0);
 ///
 /// Use this to protect code that uses RefCell or other non-thread-safe structures.
 #[inline]
+#[track_caller]
 pub fn disable_preemption() {
     let tid = get_current_thread_register();
     let prev = PREEMPTION_DISABLED[tid].fetch_add(1, Ordering::SeqCst);
     // Record timestamp on first disable (nesting level 0 -> 1)
     if prev == 0 {
         PREEMPTION_DISABLED_SINCE[tid].store((runtime().uptime_us)(), Ordering::Release);
+        PREEMPTION_DISABLED_AT[tid]
+            .store(core::panic::Location::caller() as *const _ as u64, Ordering::Relaxed);
     }
 }
 
@@ -2203,21 +2234,44 @@ fn check_stack_canary(stack_base: usize) -> bool {
 // ============================================================================
 
 static POOL: Spinlock<ThreadPool> = Spinlock::new(ThreadPool::new());
-static VOLUNTARY_SCHEDULE: AtomicBool = AtomicBool::new(false);
+/// Per-core "the next scheduler SGI on THIS core is a voluntary switch" flags.
+///
+/// PER-CORE, not global (fixed 2026-07-21): the voluntary setters (`yield_now`,
+/// `schedule_blocking`, `request_voluntary_reschedule`) always pair the flag with a
+/// SELF-targeted scheduler SGI, so producer and consumer are the same core. With one
+/// global flag, a PEER core's concurrent timer SGI would `swap` the flag away — its
+/// involuntary tick ran as voluntary (bypassing that core's cooperative/preemption
+/// checks) while the yielding core's SGI ran as INVOLUNTARY, silently eating the
+/// yield. Mostly-invisible when involuntary switches could stand in for the lost
+/// voluntary one, but fatal for a thread whose involuntary path is gated (a
+/// `LifecycleGuard` holder in a cooperative wait loop spins forever in EL1 holding
+/// the BKL — the SMP=4 fork-hammer wedge, `[WATCHDOG] disabled at lifecycle.rs`).
+static VOLUNTARY_SCHEDULE: [AtomicBool; MAX_CORES] = {
+    const INIT: AtomicBool = AtomicBool::new(false);
+    [INIT; MAX_CORES]
+};
 static SGI_DEBUG_ONCE: AtomicBool = AtomicBool::new(false);
+
+/// This core's voluntary-reschedule flag (see [`VOLUNTARY_SCHEDULE`]). Core 0 on
+/// non-SMP and host builds.
+#[inline]
+fn voluntary_schedule_flag() -> &'static AtomicBool {
+    &VOLUNTARY_SCHEDULE[crate::bkl::current_core_id() as usize % MAX_CORES]
+}
 
 /// Enable SGI debug for next yield (one-shot)
 pub fn set_sgi_debug(enable: bool) {
     SGI_DEBUG_ONCE.store(enable, Ordering::SeqCst);
 }
 
-/// Mark the next scheduler SGI as a VOLUNTARY switch, so `schedule_indices` switches away
-/// even from a cooperative thread (the idle thread is cooperative and would otherwise be left
-/// running until its 100 ms timeout). Used by an IRQ-context cross-core wakeup — e.g. the
-/// multikernel forward-reply doorbell — that readies a thread while the cooperative idle
-/// thread is current and must preempt it now. Pair with a self-targeted scheduler-SGI trigger.
+/// Mark the next scheduler SGI on THIS core as a VOLUNTARY switch, so `schedule_indices`
+/// switches away even from a cooperative thread (the idle thread is cooperative and would
+/// otherwise be left running until its 100 ms timeout). Used by an IRQ-context cross-core
+/// wakeup — e.g. the multikernel forward-reply doorbell — that readies a thread while the
+/// cooperative idle thread is current and must preempt it now. Pair with a self-targeted
+/// scheduler-SGI trigger.
 pub fn request_voluntary_reschedule() {
-    VOLUNTARY_SCHEDULE.store(true, Ordering::Release);
+    voluntary_schedule_flag().store(true, Ordering::Release);
 }
 
 /// Initialize the thread pool
@@ -2349,7 +2403,7 @@ pub fn yield_now() {
             }
         }
     }
-    VOLUNTARY_SCHEDULE.store(true, Ordering::Release);
+    voluntary_schedule_flag().store(true, Ordering::Release);
     (runtime().trigger_sgi)(0);
 }
 
@@ -2446,7 +2500,7 @@ pub fn blocking_relax() {
 pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     (runtime().end_of_interrupt)(irq);
 
-    let voluntary = VOLUNTARY_SCHEDULE.swap(false, Ordering::Acquire);
+    let voluntary = voluntary_schedule_flag().swap(false, Ordering::Acquire);
     let debug = SGI_DEBUG_ONCE.swap(false, Ordering::SeqCst);
     
     if debug {
@@ -2543,7 +2597,22 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             if config().enable_sgi_debug_prints {
                 safe_print!(64, "[SGI-S] returning new_sp={:#x}\n", new_sp);
             }
-            
+
+            // Tripwire for the SMP=4 mixed-EL corruption (user PC = kernel text,
+            // SPSR = EL0t): inspect the IRQ frame we are about to restore (ELR at
+            // +240, SPSR at +248 — see setup_fake_irq_frame). An EL0-target frame
+            // whose ELR is a kernel address would eret userspace into kernel text —
+            // catch it HERE, at the restore, with both thread ids.
+            {
+                let elr = ((new_sp + 240) as *const u64).read_volatile();
+                let spsr = ((new_sp + 248) as *const u64).read_volatile();
+                if (spsr & 0xF) == 0 && elr >= 0x4000_0000 {
+                    safe_print!(128,
+                        "[SGI-S POISON] eret->EL0 elr={:#x} spsr={:#x} old_tid={} new_tid={} sp={:#x}\n",
+                        elr, spsr, old_idx, new_idx, new_sp);
+                }
+            }
+
             // Return new SP - assembly will do the switch
             return new_sp;
         }
@@ -2554,6 +2623,14 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
 
 /// Update a thread's context for a new execution (e.g., after execve or fork)
 pub fn update_thread_context(thread_id: usize, user_context: &crate::process::UserContext) {
+    // Tripwire for the SMP=4 mixed-EL corruption: a "user" context whose PC is a
+    // kernel address is poison at CREATION time (the capture read a clobbered
+    // frame/slot) — catch it here with the culprit tid before it is published.
+    if user_context.pc >= 0x4000_0000 {
+        safe_print!(128,
+            "[CTX POISON] update_thread_context tid={} pc={:#x} spsr={:#x} (from tid={})\n",
+            thread_id, user_context.pc, user_context.spsr, current_thread_id());
+    }
     // Disable IRQs to safely access context
     with_irqs_disabled(|| {
         unsafe {
@@ -2750,7 +2827,7 @@ pub fn schedule_blocking(wake_time_us: u64) {
     // (device IRQs drive reschedules) but on a secondary two cooperating threads (the
     // rump sysproxy client↔server pipe hop) have NO IRQ between them, so every hop was
     // tick-bound (~10 ms). A voluntary SGI bypasses the cooperative-idle guard too.
-    VOLUNTARY_SCHEDULE.store(true, Ordering::Release);
+    voluntary_schedule_flag().store(true, Ordering::Release);
     (runtime().trigger_sgi)(0);
 
     // Wait for timer to preempt us and for scheduler to wake us

@@ -1,7 +1,7 @@
-//! Process-lifecycle guard — currently a **no-op**, kept as the anchor for the eventual
-//! narrow preemption-disable fix.
+//! Process-lifecycle guard — defers **involuntary preemption** for the duration of a
+//! lifecycle operation under shared-kernel SMP.
 //!
-//! ## The problem this exists for
+//! ## The problem this solves
 //!
 //! Under shared-kernel SMP the Big Kernel Lock serializes EL1 *instants* across cores but
 //! does **not** make multi-step process-lifecycle operations (`fork_process` /
@@ -13,73 +13,84 @@
 //! readers: the page-fault handler, signal delivery, a `for_each_process` sweep) observes
 //! half-mutated state: a `Process` mid-`replace_image` with `mmap_regions` already
 //! `.clear()`ed, a `THREAD_CONTEXTS[tid]` mid-spawn, a process-table slot mid-register, a
-//! captured trap frame mid-repopulate. That is the SMP=4 fork-hammer corruption. Full
-//! dossier + the empirical results below: `docs/runbooks/debug-smp-fork-corruption.md`.
+//! captured trap frame mid-repopulate. That was the SMP=4 fork-hammer corruption. Full
+//! dossier + the empirical results: `docs/runbooks/debug-smp-fork-corruption.md`.
 //!
-//! ## Two approaches tried and rejected (both empirically, on a real SMP=4 QEMU run)
+//! ## Why `disable_preemption()` and not a lock or an IRQ mask
+//!
+//! Two earlier approaches failed empirically (real SMP=4 QEMU + fork-hammer):
 //!
 //! 1. **Reentrant cross-core spinlock held across preemption** (commit 66e09bf). The crash
-//!    *persisted* (it only serialized lifecycle-vs-lifecycle, not lifecycle-vs-the
-//!    non-lifecycle readers that also touch the half-built state), and it **inverted
-//!    against the BKL**: a preempted holder was switched out still owning the lock while a
-//!    peer that had entered EL1 (holding the BKL) spun on it — the holder needs the BKL to
-//!    be rescheduled and finish, so it stalled until the spinner was itself timer-preempted.
-//!    Symptom: `[BKL] stuck` + `[WATCHDOG] Preemption disabled`.
+//!    persisted (it only serialized lifecycle-vs-lifecycle, not lifecycle-vs-the
+//!    non-lifecycle readers) and it inverted against the BKL (`[BKL] stuck` stalls).
 //!
-//! 2. **Whole-op per-core preemption disable (mask `DAIF.I` for the entire op).** This
-//!    *eliminated the corruption* (0 SIGSEGV across a full hammer run — proving the fault
-//!    class really is preemption-mid-op exposure), but it **hard-deadlocked**: these ops
-//!    (and the child's first-run demand-paging that reads the ELF page from ext2) can
-//!    cooperatively yield / wait on async block-I/O completion that a *different* thread
-//!    must pump. With preemption masked that thread can't run, the I/O never completes, and
-//!    the BKL holder never releases → all cores wedge on the BKL. It wedged exactly at the
-//!    freshly-exec'd child's first `[IA-DP]` code-page fault.
+//! 2. **Whole-op IRQ mask (`DAIF.I`)**. This *eliminated the corruption* — 0 SIGSEGV
+//!    across a full hammer run, proving these op boundaries are the right scope — but it
+//!    **hard-deadlocked**: some ops cooperatively yield / wait on async block-I/O whose
+//!    completion another thread must pump (the exec ELF read, spawn's file load, the
+//!    child's first demand-paging fault). With IRQs masked that thread never runs.
 //!
-//! ## The validated fix direction (TODO — not yet implemented)
+//! [`crate::threading::disable_preemption`] keeps exactly the property that killed the
+//! corruption (no *involuntary* switch can expose the half-mutated state mid-op) while
+//! avoiding both failure modes:
 //!
-//! The mechanism is right, the *scope* was wrong. Preemption must be disabled only around
-//! the **synchronous, non-yielding, non-blocking memory-mutation windows** — never across a
-//! lock-wait, a cooperative yield, block I/O, or an `eret` to userspace. Concretely:
+//! - **IRQs stay enabled** — timer ticks, device IRQs and the scheduler wake-pass all
+//!   still run; block I/O completes. Only the context *switch* is deferred
+//!   (`ThreadPool::schedule_indices` returns `None` for involuntary entries).
+//! - **Voluntary switches still work** — an op that yields or blocks (`yield_now`,
+//!   `blocking_relax`, a file read) switches away normally. While it waits, the op is
+//!   not mid-mutation of shared state (the yield points in these ops all sit outside
+//!   the destructive windows), so this is safe — and it is what makes the guard
+//!   deadlock-free by construction.
+//! - **Per-thread counter** — the disable rides the acquiring tid only. It cannot leak
+//!   into the freshly-published child thread (new tid, count 0), unlike a masked `SPSR`.
+//! - **Watchdog-monitored** — `check_preemption_watchdog` flags a guard held > 100 ms,
+//!   so a mis-scoped window is loud, not silent.
 //!
-//! - `replace_image`: guard just the `mmap_regions.clear()` + `lazy_regions.clear()` + AS
-//!   swap + repopulate window (the destructive middle), released before the process-info
-//!   page allocation and before returning.
-//! - `fork_process`: guard just the child-publish window (write `Process.context`, register
-//!   in the table, mark the thread schedulable) so a peer never sees the child half-built.
-//! - The `THREAD_CONTEXTS[tid]` writes and the trap-frame capture likewise need their own
-//!   narrow guards.
+//! With the guard held, this core cannot be involuntarily switched away mid-op, and the
+//! BKL (held for the whole EL1 excursion, never dropped inside the guarded windows'
+//! non-yielding sections) keeps every other core out of EL1 — so no EL1 reader anywhere
+//! can observe the half-built state.
 //!
-//! Confirming the exact non-yielding boundaries wants an lldb watchpoint on the victim
-//! `Process.parent_pid` / `THREAD_CONTEXTS[tid].pc` (see the runbook) so we place each guard
-//! tightly. Until then this guard is inert so the tree is free of both the spinlock's
-//! BKL-stall regression and the whole-op version's deadlock. The 11 `LifecycleGuard::acquire()`
-//! call sites are retained as no-ops: they mark where the narrow guards belong.
+//! ## No-return callers
 //!
-//! On non-`kernel_smp_shared` builds this was always a no-op; it now is on every build.
+//! `return_to_kernel` / `return_to_kernel_from_fault` never return, so RAII would leak
+//! the disable count on their tid forever (and the slot-recycle reset would be the only
+//! recovery). They call [`LifecycleGuard::release`] explicitly before parking — keep it
+//! that way when touching teardown. As defense-in-depth, thread-slot recycling resets
+//! the per-tid preemption counter (see `threading::cleanup_terminated_threads`).
+//!
+//! On non-`kernel_smp_shared` builds this is a no-op and compiles to nothing.
 
-/// RAII guard reserved for the narrow process-lifecycle preemption-disable fix. Currently a
-/// **no-op on every build** — see the module docs for why the cross-core-spinlock and
-/// whole-op-IRQ-mask approaches were both rejected, and what the eventual narrow fix must do.
+/// RAII guard that defers involuntary preemption of the current thread for the span of a
+/// process-lifecycle operation under `cfg(kernel_smp_shared)`. No-op on all other builds.
 ///
-/// The `acquire()`/`release()` API and the 11 call sites are kept so the fix can be dropped
-/// in without re-touching every lifecycle op.
+/// See the module docs for why this is a per-thread preemption disable and not a lock or
+/// IRQ mask. Ops that never return must call [`release`](Self::release) explicitly.
 pub struct LifecycleGuard {
-    /// `!Send`: a future implementation will restore per-core IRQ state on the same core it
-    /// masked it on, so the guard must not cross a thread/core boundary. Enforced now so the
-    /// call sites are already correct when the guard gains behavior.
+    /// `!Send`: the disable/enable pair must run on the same thread — the counter is
+    /// indexed by the current tid at each call.
     _no_send: core::marker::PhantomData<*mut ()>,
 }
 
 impl LifecycleGuard {
-    /// Acquire the (currently inert) lifecycle guard.
+    /// Acquire the lifecycle guard: defer involuntary preemption of this thread until
+    /// the guard drops. Nests (per-thread counter).
+    ///
+    /// `#[track_caller]` so the preemption watchdog's culprit line names the lifecycle
+    /// *op* that acquired the guard, not this wrapper.
     #[inline]
+    #[track_caller]
     pub fn acquire() -> Self {
+        #[cfg(kernel_smp_shared)]
+        crate::threading::disable_preemption();
         Self {
             _no_send: core::marker::PhantomData,
         }
     }
 
-    /// Release eagerly (equivalent to `drop(guard)`, named for symmetry).
+    /// Release eagerly (equivalent to `drop(guard)`, named for symmetry). Required in
+    /// functions that never return (`return_to_kernel*`), where RAII drop never runs.
     #[inline]
     pub fn release(self) {
         drop(self);
@@ -89,7 +100,8 @@ impl LifecycleGuard {
 impl Drop for LifecycleGuard {
     #[inline]
     fn drop(&mut self) {
-        // No-op. See module docs.
+        #[cfg(kernel_smp_shared)]
+        crate::threading::enable_preemption();
     }
 }
 

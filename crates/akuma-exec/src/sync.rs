@@ -214,21 +214,94 @@ impl KernelLock {
         // Take a FIFO ticket and wait for our turn. The holder's release advances
         // `now_serving` by exactly one, so waiters are served in arrival order and none can
         // be starved by a peer or by the releaser re-grabbing.
-        let my_ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        //
+        // ## Self-healing (empirical, 2026-07-21)
+        //
+        // The ticket accounting has a rare leak under SMP=4 fork-hammer load: lldb on a
+        // hard-wedged instance showed `owner == 0`, `next_ticket == now_serving + 5`, and
+        // only FOUR cores spinning — one handed-out ticket had no living waiter, so
+        // `now_serving` could never advance and every core spun forever (all four
+        // backtraces in the BKL wait; the whole box dead). Root cause not yet pinned
+        // (same family as the M5c step-2 `sched_bklfree_el0` ticket leak, but observed
+        // with that flag OFF). Until it is, the wait loop self-heals both wedge shapes,
+        // loudly:
+        //
+        // - **Lost ticket ahead** (the observed wedge): the lock stays FREE (`owner == 0`)
+        //   while `now_serving` sits frozen short of our ticket for
+        //   `LOST_TICKET_RECOVERY_SPINS` consecutive spins. A live served waiter stores
+        //   `owner` within its masked spin (ns), and a releasing holder advances
+        //   `now_serving` right after clearing `owner` — so free+frozen for that long
+        //   means the served ticket's core is gone. CAS `now_serving` one step forward
+        //   (CAS: racing recoverers can't double-advance) and keep waiting.
+        // - **Skipped** (the recovery's dual): `now_serving` moved PAST our ticket — a
+        //   recovery advanced over us while our vCPU was stalled (host descheduling), or
+        //   the underlying leak double-advanced. Waiting for an exact match would spin
+        //   forever; take a fresh ticket and rejoin the queue.
+        //
+        // Ownership take is a CAS (not a blind store): if a recovery advanced onto our
+        // ticket in the same instant another core still owns the lock, the failed CAS
+        // sends us back to the wait loop instead of minting two owners.
+        let mut my_ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         let mut spins: u32 = 0;
         let mut total_spins: u64 = 0;
         // Profiler: the tag of the core that was blocking us, sampled once (u64::MAX = not
         // yet sampled).
         let mut wait_tag: u64 = u64::MAX;
-        while self.now_serving.load(Ordering::Acquire) != my_ticket {
-            if wait_tag == u64::MAX && PROFILE_ENABLED.load(Ordering::Relaxed) {
-                // Sample the blocking owner core's tag (owner encodes core `cur - 1`).
-                let cur = self.owner.load(Ordering::Relaxed);
-                if cur != 0 {
-                    let owner_core = (cur - 1) as usize;
-                    if owner_core < PROFILE_MAX_CORES {
-                        wait_tag = HOLDER_TAG[owner_core].0.load(Ordering::Relaxed);
+        // Lost-ticket detector: consecutive spins with the lock free and `now_serving`
+        // unchanged (reset whenever either moves).
+        let mut frozen_serving = self.now_serving.load(Ordering::Acquire);
+        let mut frozen_spins: u32 = 0;
+        loop {
+            let serving = self.now_serving.load(Ordering::Acquire);
+            if serving == my_ticket {
+                // Our turn: the previous holder cleared `owner` to 0 before advancing
+                // `now_serving` to us. CAS instead of store — see the recovery note above.
+                if self
+                    .owner
+                    .compare_exchange(0, me, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+                // Someone owns it at our turn (recovery race): rejoin the queue.
+                my_ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+                log_kernel_lock_recovered(me, "reticket-owned");
+                continue;
+            }
+            if (serving.wrapping_sub(my_ticket) as i32) > 0 {
+                // `now_serving` passed us (skipped shape above): rejoin the queue.
+                my_ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+                log_kernel_lock_recovered(me, "reticket-skipped");
+                continue;
+            }
+            let cur_owner = self.owner.load(Ordering::Relaxed);
+            if cur_owner == 0 && serving == frozen_serving {
+                frozen_spins = frozen_spins.wrapping_add(1);
+                if frozen_spins >= LOST_TICKET_RECOVERY_SPINS {
+                    frozen_spins = 0;
+                    if self
+                        .now_serving
+                        .compare_exchange(
+                            serving,
+                            serving.wrapping_add(1),
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        log_kernel_lock_recovered(me, "advanced-lost");
                     }
+                    continue;
+                }
+            } else {
+                frozen_serving = serving;
+                frozen_spins = 0;
+            }
+            if wait_tag == u64::MAX && PROFILE_ENABLED.load(Ordering::Relaxed) && cur_owner != 0 {
+                // Sample the blocking owner core's tag (owner encodes core `cur - 1`).
+                let owner_core = (cur_owner - 1) as usize;
+                if owner_core < PROFILE_MAX_CORES {
+                    wait_tag = HOLDER_TAG[owner_core].0.load(Ordering::Relaxed);
                 }
             }
             spins = spins.wrapping_add(1);
@@ -239,9 +312,6 @@ impl KernelLock {
             }
             core::hint::spin_loop();
         }
-        // Our turn: the previous holder cleared `owner` to 0 before advancing `now_serving`
-        // to us, and no later ticket can proceed ahead of us, so we are the sole writer.
-        self.owner.store(me, Ordering::Release);
         // Accumulate this acquire's spin count once (a cross-core BKL-wait-time proxy; see
         // `contention_spins`). The uncontended fast path (our turn immediately) adds nothing.
         if total_spins > 0 {
@@ -334,6 +404,30 @@ fn log_kernel_lock_stuck(owner: u32, me: u32) {
     }
 }
 
+/// Diagnostic: log when [`KernelLock::acquire`]'s self-healing fired (see the recovery
+/// note there). Every line here is a live sighting of the ticket-accounting leak —
+/// keep them until the leak is root-caused. Stack-buffered (IRQ-masked context).
+fn log_kernel_lock_recovered(me: u32, kind: &str) {
+    use core::fmt::Write;
+    struct Buf([u8; 96], usize);
+    impl Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let b = s.as_bytes();
+            let n = b.len().min(96 - self.1);
+            self.0[self.1..self.1 + n].copy_from_slice(&b[..n]);
+            self.1 += n;
+            Ok(())
+        }
+    }
+    let mut buf = Buf([0u8; 96], 0);
+    let _ = writeln!(buf, "[BKL] RECOVERED ({kind}) by core {me} (aff0+1)");
+    if buf.1 > 0 {
+        if let Ok(s) = core::str::from_utf8(&buf.0[..buf.1]) {
+            (crate::runtime::runtime().print_str)(s);
+        }
+    }
+}
+
 /// Raw reader-writer spinlock with writer priority.
 ///
 /// State encoding in a single `AtomicU32`:
@@ -356,6 +450,13 @@ const UNLOCKED: u32 = 0;
 
 /// Spin iteration limit before logging a diagnostic (helps debug deadlocks).
 const SPIN_WARN_THRESHOLD: u32 = 10_000_000;
+
+/// Consecutive free-lock/frozen-FIFO spins before [`KernelLock::acquire`] concludes the
+/// currently-served ticket has no living waiter and advances `now_serving` itself (see
+/// the self-healing note in `acquire`). ~2× the stuck-warn threshold: tens of
+/// milliseconds — far beyond the ns-scale hand-off windows this state legitimately
+/// occupies, but short enough that a wedged box recovers before watchdogs cascade.
+const LOST_TICKET_RECOVERY_SPINS: u32 = 20_000_000;
 
 unsafe impl lock_api::RawRwLock for RawRwSpinlock {
     #[allow(clippy::declare_interior_mutable_const)]

@@ -82,8 +82,14 @@ pub fn timer_irq_handler(_irq: u32) {
                 // Get poll step to help diagnose where we're stuck
                 let step = crate::GLOBAL_POLL_STEP.load(Ordering::Relaxed);
                 // Use stack-only print to avoid heap allocation in IRQ context
-                crate::safe_print!(96, "[WATCHDOG] Preemption disabled for {}ms at step {}\n", 
-                    duration_us / 1000, step);
+                let tid = akuma_exec::threading::current_thread_id();
+                crate::safe_print!(96, "[WATCHDOG] Preemption disabled for {}ms at step {} tid={}\n",
+                    duration_us / 1000, step, tid);
+                // Name the call site that took this thread's disable count 0->1 —
+                // the culprit holding preemption off (file:line, stack-only print).
+                if let Some(loc) = akuma_exec::threading::preemption_disabled_at(tid) {
+                    crate::safe_print!(160, "[WATCHDOG] disabled at {}:{}\n", loc.file(), loc.line());
+                }
             }
         }
 

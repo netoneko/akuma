@@ -100,6 +100,15 @@ they run on more than one core.
 > BKL contention still shows as *transient* `[BKL] stuck` bursts during spawn-heavy work, but
 > these recover. `SMP=2` remains the most contention-clean config.
 >
+> **Update 2026-07-21 (see the same-dated entry in the progress log):** the fork/exec
+> corruption work landed a real `LifecycleGuard` (per-thread preemption disable around the
+> lifecycle mutation windows), fixed a pre-existing stolen-yield race (`VOLUNTARY_SCHEDULE`
+> is now per-core), and made the BKL's ticket FIFO **self-healing** after lldb proved it can
+> leak a ticket and hard-deadlock all cores even with `sched_bklfree_el0` OFF —
+> `[BKL] RECOVERED` log lines are live sightings of that still-unfixed leak. The fork-hammer's
+> surviving crash family is now null-deref data corruption (CoW/TLB, hypothesis 4 in
+> [`../../runbooks/debug-smp-fork-corruption.md`](../../runbooks/debug-smp-fork-corruption.md)).
+>
 > The earlier "full devbox-smoltcp boot to sshd stalls under active secondaries" item was the
 > M4 open item and is **resolved** by M5a (see below) — boot-to-sshd works at SMP=2 (reliable)
 > and SMP=4 (works, subject to the residual above).

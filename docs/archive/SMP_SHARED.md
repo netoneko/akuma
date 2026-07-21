@@ -648,3 +648,105 @@ self-test (two processes fault concurrently on distinct address spaces on distin
 assert the BKL is not held during the fault window). Success metric: SMP=4 transient
 `[BKL] stuck` count drops sharply vs the ~102 baseline; devbox-smoltcp SMP=2/4 boot + ssh
 with 0 stuck.
+
+## Lifecycle preemption guard + two liveness fixes (2026-07-21)
+
+A full debugging session on the SMP=4 fork-hammer corruption
+(`docs/runbooks/debug-smp-fork-corruption.md` is the detailed dossier; this is the
+progress-log summary). Net result: the **mixed-EL context corruption stopped appearing**,
+two previously-unknown **whole-box deadlocks were root-caused and fixed** (one in the BKL
+itself), and the surviving crash population changed shape — pointing the next session at
+the cross-core CoW/TLB protocol.
+
+### 1. `LifecycleGuard` is now real: per-thread preemption disable ✅
+
+The 2026-07-21 morning analysis had proven the corruption mechanism (multi-step
+lifecycle ops — `fork_process`, `replace_image*`, spawn, teardown — are not atomic
+across preemption: a timer tick mid-op switches away, the eret-to-EL0 releases the BKL,
+and a peer core reads the half-built `Process`/context state) and left `LifecycleGuard`
+as a no-op. It now calls `threading::disable_preemption()` under
+`cfg(kernel_smp_shared)` (`crates/akuma-exec/src/process/lifecycle.rs`):
+
+- **Why this primitive:** it keeps exactly the property the whole-op DAIF experiment
+  proved sufficient (no involuntary switch can expose mid-op state) while avoiding both
+  DAIF failure modes — IRQs stay enabled (block-I/O completion, timers, wake-passes all
+  run) and voluntary yields still switch (`schedule_indices` gates only `!voluntary`
+  entries). Per-tid counter, so it cannot leak into a freshly-published child thread.
+- **Scope, narrowed empirically:** holding the guard across a disk read wedges the box
+  (the spawning thread cooperatively waits for I/O in EL1 while every peer starves on
+  the BKL — caught live as `[WATCHDOG] disabled at spawn.rs:96`). Spawn guards now start
+  at the publish window (`register_process` onward); exec guards start after the ELF
+  load (`image.rs`, both variants). `fork`/`vfork`/`clone_thread`/teardown remain
+  whole-op (their bodies are non-yielding). The no-return teardown fns keep their
+  explicit `release()` before parking.
+
+### 2. Per-core `VOLUNTARY_SCHEDULE` (pre-existing stolen-yield race) ✅
+
+`yield_now`/`schedule_blocking`/`request_voluntary_reschedule` set ONE global
+"next scheduler SGI is voluntary" flag and ring a self-targeted SGI — but all cores'
+timer SGIs `swap` the same flag. A peer's concurrent tick could steal the bit: the
+peer's involuntary tick ran as voluntary (bypassing its cooperative/preemption checks)
+while the yielding core's SGI ran as INVOLUNTARY, silently eating the yield. Invisible
+historically (the next involuntary tick rescued the thread) but fatal with the guard:
+a guarded thread in a cooperative wait loop whose yield was eaten spun forever in EL1
+holding the BKL — observed as a 249 s `[WATCHDOG] disabled at lifecycle.rs` wedge with
+all peers in `[BKL] stuck`. Fix: `VOLUNTARY_SCHEDULE` is now `[AtomicBool; MAX_CORES]`
+indexed by `bkl::current_core_id()` (`crates/akuma-exec/src/threading/mod.rs`) — setter
+and consumer are always the same core. Single-core/host builds see index 0 = identical
+behavior.
+
+### 3. BKL fair-FIFO ticket leak: self-healing acquire ✅ (root cause still open)
+
+lldb on a hard-wedged SMP=4 instance (gdbstub :1235, all cores halted) produced the
+decisive state: `KERNEL_LOCK = { owner: 0, next_ticket: 114074, now_serving: 114069 }`
+with all four cores' backtraces parked in the acquire spin (3× in
+`rust_irq_handler_with_sp`, 1× in `rust_sync_el0_handler`) — five tickets in flight,
+four living waiters, the currently-served ticket's taker **gone**. `now_serving` can
+never advance ⇒ permanent 4-core deadlock. Same family as the known M5c step-2
+`sched_bklfree_el0` ticket leak, but reproduced with that flag OFF.
+
+`KernelLock::acquire` (`crates/akuma-exec/src/sync.rs`) now self-heals, loudly:
+lost-ticket-ahead (lock FREE + FIFO frozen short of us for ~20M consecutive spins →
+CAS-advance `now_serving` one step), skipped (FIFO moved past our ticket → take a fresh
+ticket and re-queue), and the ownership take is a CAS instead of a blind store so a
+recovery race cannot mint two owners. Every recovery prints
+`[BKL] RECOVERED (<kind>) by core N` — **each line is a live sighting of the unfixed
+accounting leak**; root-causing it is an open follow-up (lead suspect: a thread
+migrating cores mid-EL1-hold, after which `release(current_core_id())`'s owner-CAS
+fails and never advances the queue).
+
+### 4. Diagnostics kept in-tree
+
+- `disable_preemption()` and `LifecycleGuard::acquire()` are `#[track_caller]`; the
+  preemption watchdog (`src/timer.rs`) prints the culprit `file:line` + tid of the
+  oldest outstanding disable. This is what turned each wedge into a one-line diagnosis.
+- Thread-slot recycling resets the per-tid preemption counter (a leaked disable would
+  otherwise permanently starve the slot's next occupant).
+- Three POISON tripwires for the mixed-EL corruption (user PC = kernel text, SPSR=EL0t):
+  `[SGI-S POISON]` inspects the IRQ frame at switch-in (ELR at +240 / SPSR at +248),
+  `[EUM POISON]` in `enter_user_mode`, `[CTX POISON]` in `update_thread_context` —
+  catching the poison at restore vs. mint time, with thread ids.
+
+### Where the hammer stands (evidence, 5 instrumented runs)
+
+- SMP=1 (same harness): clean — 0 kernel fault lines (connection failures under the
+  16-way flood are graceful `No available user threads` exhaustion, not a kernel bug).
+- SMP=4: **no more permanent wedges** (both deadlock classes above are fixed/healing),
+  and the mixed-EL signature stopped appearing (tripwires armed and silent). Earlier
+  same-day "0 SIGSEGV with the whole-op guard" evidence was weak — those runs wedged
+  before the hammer really exercised fork/exec; do not over-trust it.
+- **Still failing:** shells crash with `WILD-DA FAR=0x0` at *valid* busybox PCs ~1 s
+  into life (`last_sc=ppoll`) — i.e. DATA corruption (an owned pointer reads back 0),
+  not context corruption. That moves **hypothesis 4 — cross-core CoW/TLB coherence**
+  (fork's `cow_share_range` → `demote_range_to_ro` → `flush_tlb_all` window, the
+  CoW-break across two per-AS `as_lock`s, refcounts under genuinely-parallel EL0) to
+  the top of the list for the next session.
+
+Repro harness: `sshd_crash_hunt.py` (session scratchpad; reboots devbox-smoltcp at
+SMP=4, waits for `Started sshd`, 16 concurrent ssh × `busybox true` fork loops,
+separates hard faults from `[BKL] stuck`/`[WATCHDOG]`/`RECOVERED` diagnostics, plus a
+two-consecutive-dead-rounds wedge detector).
+
+**Files:** `crates/akuma-exec/src/process/{lifecycle,spawn,image,mod}.rs`,
+`crates/akuma-exec/src/threading/mod.rs`, `crates/akuma-exec/src/sync.rs`,
+`src/timer.rs`, `docs/runbooks/debug-smp-fork-corruption.md`.

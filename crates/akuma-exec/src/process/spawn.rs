@@ -89,11 +89,13 @@ pub fn spawn_process_with_channel_ext(
     box_id: u64,
     pty: bool,
 ) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
-    // Serialize lifecycle against preemption under shared-kernel SMP — see
-    // `process/lifecycle.rs`. spawn builds a Process, registers it, then spawns
-    // a thread whose first act is to mutate that Process; the half-built state
-    // must not be observable mid-flight by a peer core's EL1 code.
-    let _lifecycle = LifecycleGuard::acquire();
+    // NOTE: the LifecycleGuard is acquired at the PUBLISH point (just before
+    // `register_process`, below), NOT here. The whole load phase above it — path/
+    // namespace resolution, stat, the ELF read from ext2 — does block I/O and
+    // cooperative waits; holding the preemption-disable guard across those wedged
+    // SMP=4 at bringup (`[WATCHDOG] disabled at spawn.rs:96` for 100+ ms while every
+    // peer core spun on the BKL). Nothing built before registration is globally
+    // visible, so the load needs no guard. See `process/lifecycle.rs`.
     if crate::threading::user_threads_available() == 0 {
         return Err("No available user threads for process execution".into());
     }
@@ -333,6 +335,12 @@ pub fn spawn_process_with_channel_ext(
     let boxed_process = Box::try_new(process)
         .map_err(|_| format!("Failed to allocate Process struct for {path}"))?;
 
+    // Serialize the PUBLISH window (register → thread spawn → return) against
+    // preemption under shared-kernel SMP — from here on the half-built Process is
+    // globally visible and a peer core's EL1 code must not observe it mid-flight.
+    // See `process/lifecycle.rs` and the load-phase note at the top of this fn.
+    let _lifecycle = LifecycleGuard::acquire();
+
     // CRITICAL: Register the process in the table immediately.
     // This ensures that lookup_process(pid) works as soon as this function returns,
     // allowing reattach() to succeed without races.
@@ -407,9 +415,8 @@ pub fn spawn_process_from_image(name: &str, elf_data: &[u8]) -> Result<(usize, P
 /// `argv[0]` is conventionally the program name. The process's `ProcessInfo.args` is set so
 /// userspace sees its arguments (e.g. `curl -sS https://ifconfig.me`).
 pub fn spawn_process_from_image_with_args(name: &str, argv: &[String], elf_data: &[u8]) -> Result<(usize, Pid), String> {
-    // Serialize lifecycle against preemption under shared-kernel SMP — see
-    // `process/lifecycle.rs` and `spawn_process_with_channel_ext`.
-    let _lifecycle = LifecycleGuard::acquire();
+    // LifecycleGuard acquired at the publish point below (mirrors
+    // `spawn_process_with_channel_ext` — the load phase needs no guard).
     if crate::threading::user_threads_available() == 0 {
         return Err("No available user threads for image execution".into());
     }
@@ -441,6 +448,8 @@ pub fn spawn_process_from_image_with_args(name: &str, argv: &[String], elf_data:
     let pid = process.pid;
     let boxed_process =
         Box::try_new(process).map_err(|_| format!("Failed to allocate Process struct for {name}"))?;
+    // Publish window — see `spawn_process_with_channel_ext`.
+    let _lifecycle = LifecycleGuard::acquire();
     register_process(pid, boxed_process);
     register_channel(0, channel);
 

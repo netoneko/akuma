@@ -1,5 +1,65 @@
 # SMP=4 fork/exec process-state corruption — handoff / debugging dossier
 
+> **UPDATE 2026-07-21 (evening): major progress, NOT closed. `LifecycleGuard` is
+> now a real per-thread preemption-disable guard; two liveness bugs it exposed are
+> fixed (one pre-existing); the fault population CHANGED but SMP=4 fork-hammer is
+> still not clean.** Where it stands after this session's five instrumented hammer
+> runs:
+>
+> - The **mixed-EL context corruption** (user PC = kernel text, SPSR=EL0t —
+>   hypothesis 2) stopped appearing in the final runs, and three POISON tripwires
+>   (below) now stand guard for it. Not yet provable as fixed — it was
+>   intermittent — but it no longer dominates.
+> - The surviving crashes are the **null-deref family** (valid busybox PC reads
+>   `FAR=0x0` ~1 s into shell life, `last_sc=ppoll`): DATA corruption, i.e.
+>   **hypothesis 4 (cross-core CoW/TLB coherence) is now the lead** — the shells
+>   that fork children lose an owned pointer value. Next session should attack
+>   the CoW share/demote/break protocol under concurrent EL0 (see hypothesis 4
+>   and the demote-then-flush window in `fork_process`).
+>
+> What changed, and what was found on the way:
+>
+> - **The fix:** `LifecycleGuard::acquire()` now calls
+>   `threading::disable_preemption()` under `cfg(kernel_smp_shared)` (released on
+>   drop; explicit `release()` retained in the no-return teardown fns). This keeps
+>   exactly the property the whole-op DAIF experiment proved sufficient (no
+>   involuntary switch can expose half-mutated lifecycle state mid-op) while
+>   avoiding both DAIF failure modes: IRQs stay enabled (timer/device IRQs and
+>   block-I/O completion still run) and voluntary yields still switch
+>   (`schedule_indices` only gates `!voluntary` entries), so ops that read ELFs
+>   or wait cooperatively cannot deadlock the box. Full rationale:
+>   `crates/akuma-exec/src/process/lifecycle.rs` module docs.
+> - **Defense-in-depth:** thread-slot recycling resets the per-tid
+>   preemption-disable counter (a leaked count would permanently starve the
+>   slot's next occupant); `disable_preemption()` is `#[track_caller]` and the
+>   preemption watchdog prints the culprit `file:line` of the oldest disable.
+> - **NEW BUG FOUND while validating (the hammer wedged the box with 0
+>   SIGSEGVs): the BKL fair-FIFO ticket accounting can leak a ticket with
+>   `sched_bklfree_el0` OFF** — same family as the known M5c step-2 leak, but on
+>   the default configuration. lldb on the wedged instance (gdbstub :1235, all
+>   cores halted): `KERNEL_LOCK = {owner: 0, next_ticket: 114074, now_serving:
+>   114069}` with all four cores' backtraces parked in the BKL acquire spin (3×
+>   `rust_irq_handler_with_sp+864`, 1× `rust_sync_el0_handler+352`) — five
+>   tickets in flight, four living waiters, the served ticket's taker gone ⇒
+>   `now_serving` can never advance ⇒ permanent 4-core wedge. Preemption
+>   counters were clean (only an `idle_halt` WFI hold), so this is NOT a guard
+>   leak — the guard's scheduling shift just makes the pre-existing hole easy to
+>   hit under fork-hammer churn.
+> - **Mitigation landed:** `KernelLock::acquire` is now self-healing
+>   (`crates/akuma-exec/src/sync.rs`): (a) if the lock stays FREE while
+>   `now_serving` sits frozen short of our ticket for ~20M consecutive spins,
+>   the waiter CAS-advances `now_serving` one step; (b) a waiter whose ticket
+>   `now_serving` moved PAST re-takes a fresh ticket; (c) the ownership take is
+>   a CAS (not a blind store) so a recovery race cannot mint two owners. Every
+>   recovery prints `[BKL] RECOVERED (<kind>) by core N` — **each such line is a
+>   live sighting of the still-unfixed accounting leak; root-causing it is the
+>   open follow-up** (start from thread-migration-while-in-EL1 and the
+>   reconcile-acquire paths).
+>
+> Original dossier below (mechanism confirmation, disproven approaches, repro).
+>
+> ---
+>
 > **UPDATE 2026-07-21 (later same day): mechanism CONFIRMED, fix scope identified,
 > tree returned to a clean baseline.** Two decisive experiments were run on real
 > SMP=4 QEMU after the LifecycleLock was disproven (see the status block below):

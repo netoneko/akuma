@@ -27,13 +27,6 @@ pub(crate) fn compute_heap_lazy_size(brk: usize, memory: &ProcessMemory) -> usiz
 impl Process {
     /// Replace current process image with a new ELF binary (execve core)
     pub fn replace_image(&mut self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), String> {
-        // Serialize against concurrent lifecycle ops under shared-kernel SMP — see
-        // `process/lifecycle.rs`. `replace_image` does the destructive
-        // `mmap_regions.clear()` + address-space swap mid-body, and the runbook
-        // (`docs/runbooks/debug-smp-fork-corruption.md` hypothesis 1) identified
-        // preemption inside that window as the prime suspect for the heterogeneous
-        // userspace SIGSEGVs at SMP=4.
-        let _lifecycle = LifecycleGuard::acquire();
         // #region agent log
         (runtime().print_str)("[FORK-DBG] replace_image: loading ELF\n");
         // #endregion
@@ -44,6 +37,15 @@ impl Process {
         // #region agent log
         (runtime().print_str)("[FORK-DBG] replace_image: ELF loaded, deactivating old AS\n");
         // #endregion
+
+        // Serialize the DESTRUCTIVE window against preemption under shared-kernel SMP —
+        // from the AS deactivate/swap and `mmap_regions.clear()` onward the process is
+        // half-built and must not be observable mid-flight (runbook hypothesis 1, the
+        // SMP=4 heterogeneous SIGSEGVs). Acquired AFTER the ELF load above: the load
+        // allocates/copies for milliseconds and (in the `from_path` variant) does block
+        // I/O — holding the preemption-disable guard across such waits wedges the box
+        // (see `process/lifecycle.rs` and the spawn.rs load-phase note).
+        let _lifecycle = LifecycleGuard::acquire();
 
         (runtime().print_str)("[FORK-DBG] replace_image: deactivating\n");
         mmu::UserAddressSpace::deactivate();
@@ -117,13 +119,14 @@ impl Process {
 
     /// Replace current process image using on-demand loading from a file path.
     pub fn replace_image_from_path(&mut self, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<(), String> {
-        // Serialize against concurrent lifecycle ops under shared-kernel SMP — see
-        // `process/lifecycle.rs` and the comment in `replace_image`.
-        let _lifecycle = LifecycleGuard::acquire();
         let interp_prefix: Option<&str> = None;
         let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, deferred_segments) =
             crate::elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config().user_stack_size, interp_prefix)
             .map_err(|e| format!("Failed to load ELF: {}", e))?;
+
+        // Guard the destructive window only — acquired AFTER the header read above,
+        // which does block I/O. See the comment in `replace_image`.
+        let _lifecycle = LifecycleGuard::acquire();
 
         mmu::UserAddressSpace::deactivate();
 

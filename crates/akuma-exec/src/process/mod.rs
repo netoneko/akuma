@@ -685,6 +685,16 @@ impl Drop for Process {
 #[inline(never)]
 #[allow(dead_code)]
 pub unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
+    // Tripwire for the SMP=4 mixed-EL corruption: refuse silence if this EL0 entry
+    // would land in kernel text (poison minted upstream — see update_thread_context).
+    if ctx.pc >= 0x4000_0000 {
+        let mut buf = [0u8; 128];
+        let mut pos = 0usize;
+        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+            format_args!("[EUM POISON] enter_user_mode pc={:#x} spsr={:#x} tid={}\n",
+                ctx.pc, ctx.spsr, crate::threading::current_thread_id()));
+        if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+    }
     // Real shared-kernel SMP: this `eret` drops to EL0 without returning through the
     // syscall wrapper (initial process launch / execve), so release the BKL here —
     // otherwise it would stay held while running userspace. No-op unless
