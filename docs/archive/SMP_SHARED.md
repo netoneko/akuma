@@ -859,10 +859,26 @@ tests; 125 pass; clippy clean both configs.
 
 **Verified:** SMP=1/2/4 basic forktest EXIT=0; SMP=2 `-num_children=3
 -duration=15s -combined_stress` EXIT=0, 0 stuck/RECOVERED/WATCHDOG.
-**New residual exposed:** SMP=4 + combined_stress → one child WILD-DA
-(`FAR=0x20000001a`, wild pointer) then a hard BKL wedge (core 2 owner, ~5.5k
-stuck, 0 RECOVERED — not the ticket leak; owner genuinely stuck in EL1). The Go
-stress test is now a reliable repro for the SMP≥4 residual family — see
-`../runbooks/debug-forktest-go-hang.md` + `../runbooks/debug-smp-fork-corruption.md`.
+
+**New residuals exposed + evidence-mined (2026-07-22)** — full prompt in
+`../runbooks/debug-smp-go-stress-corruption.md`:
+- **Phantom-SVC misclassification** (SMP≥2, silent even in passing runs — 8 at
+  SMP=2, 25 + 2 WILD-DA + wedge at SMP=4): EL0 demand-paging data aborts at Go's
+  `memclrNoHeapPointers` (`dc zva`) / `spanSet.push` (`ldar`) classify as
+  EC_SVC64. Prime suspect: `rust_sync_el0_handler_inner` reads `mrs esr_el1`
+  AFTER the BKL wrapper's preemptible spin window (syndrome registers are
+  per-PE, valid only until the next trap) — misclassification rate scales with
+  BKL contention, zero at SMP=1. Amplifier: the VERIFY_SVC give-up path
+  dispatches the garbage nr, clobbering live `x0` (→ the WILD-DA family). Fix
+  direction: snapshot ESR/FAR at exception entry in the vector asm; never
+  dispatch on give-up.
+- **Hard BKL wedge at the SIGTERM/teardown deadline** (SMP=4 combined_stress):
+  core 2 owns the BKL forever (~7.5k stuck, 0 RECOVERED ⇒ not the ticket leak,
+  owner stuck in EL1), 0 WATCHDOG. Possibly downstream of the corruption; fix
+  bug 1 first, then lldb the owner core if it persists.
+- **Ticket leak reproduces at SMP=1** (one `RECOVERED (advanced-lost)` in
+  `forktest_smp1_fixed.log`) — the "migrating mid-EL1-hold" lead suspect for the
+  BKL accounting leak is wrong or incomplete; a single-core repro is a far
+  easier root-cause target.
 
 **Files:** `crates/akuma-exec/src/process/children.rs`, `src/syscall/proc.rs`.

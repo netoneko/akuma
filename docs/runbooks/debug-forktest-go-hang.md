@@ -62,16 +62,24 @@ host tests pass; clippy clean (smp-shared + default).
   EXIT=0; children handle SIGTERM gracefully; 0 RECOVERED / 0 WATCHDOG / 0 crashes.
 - SMP=4: basic completes, EXIT=0.
 
-## Remaining (separate bug, pre-existing SMP≥4 residual family)
+## Remaining (separate bugs — see `debug-smp-go-stress-corruption.md`)
 
-SMP=4 + `-combined_stress` (3 Go children, mmap+goroutine+file-IO storm):
-one child died with a userspace `WILD-DA FAR=0x20000001a ELR=0x45db8` (wild
-pointer, Go arena-adjacent address) and the box then wedged with core 2
-permanently owning the BKL (~5.5k `[BKL] stuck`, **zero** `[BKL] RECOVERED`, no
-WATCHDOG — so NOT the ticket leak; the owner is genuinely stuck in EL1).
-Log: `forktest_smp4_fixed.log`. This is the known SMP≥4 contention/corruption
-residual (see `debug-smp-fork-corruption.md`), now readily reproducible via the
-Go stress test — that repro is the next session's entry point:
+SMP=4 + `-combined_stress` exposed two further kernel bugs, since evidence-mined
+and given their own investigation prompt in
+[`debug-smp-go-stress-corruption.md`](debug-smp-go-stress-corruption.md):
+
+1. **Phantom-SVC misclassification** (present from SMP=2 up, silent): EL0
+   demand-paging data aborts in Go's hottest loops (`memclrNoHeapPointers`'
+   `dc zva`, `spanSet.push`'s `ldar`) sometimes classify as EC_SVC64. Prime
+   suspect: `rust_sync_el0_handler_inner` reads `mrs esr_el1` *after* the BKL
+   wrapper's preemptible spin window instead of an entry-time snapshot. The
+   guard's give-up path then dispatches a garbage syscall nr, clobbering live
+   `x0` → the observed `WILD-DA FAR=0x20000001a` and Go heap corruption.
+2. **Hard BKL wedge at the SIGTERM/teardown deadline** (SMP=4): core 2 owns the
+   BKL forever, 0 RECOVERED (not the ticket leak), 0 WATCHDOG. Possibly
+   downstream of bug 1.
+
+Repro:
 
 ```bash
 SMP=4 overlays/devbox/run-smoltcp.sh   # then:
