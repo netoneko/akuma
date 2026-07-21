@@ -817,3 +817,23 @@ fails and never advances the queue).
 
   **Status:** Both CoW/TLB protocol fixes confirmed working. The target bug
   (`WILD-DA FAR=0x0` crashes) has been eliminated across SMP=2 and SMP=4.
+
+  **Note: forktest_parent (Go) hanging under SMP (2026-07-21).** While
+  `busybox true` fork loops work correctly, the Go-based `forktest_parent`
+  stress test starts but hangs instead of completing within its specified
+  duration (tested: 1s, 3s, 5s). Observations:
+  - Process starts successfully: `forktest_parent: Starting with 1 children, duration=Xs`
+  - Multiple forktest_parent processes appear (PIDs 11-14) when only 1 child was requested
+  - No kernel crashes, `[BKL] RECOVERED`, or `[WATCHDOG]` events
+  - Process performs syscalls (futex, nanosleep, mmap, munmap, epoll) but never exits
+  - SSH connections receive "Connection closed by remote host"
+
+  **Analysis:** This is a **userspace hang**, not a kernel crash. Likely causes:
+  1. Go runtime SMP interactions (goroutines, channels, futex scheduling)
+  2. Epoll/futex deadlocks under the BKL
+  3. Parent-child pipe communication blocking
+  4. Go `time.Sleep` / timer interaction with kernel tick scheduling
+
+  **Investigation needed:** Check Go runtime futex/epoll patterns, verify
+  futex wake/unblock correctness under SMP, examine pipe/epoll edge cases.
+  Separate from CoW/TLB fixes — this is a Go runtime + kernel interaction issue.
