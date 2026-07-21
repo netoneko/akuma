@@ -160,6 +160,8 @@ pub struct ExecRuntime {
     pub cow_ref_inc: fn(usize),
     pub cow_ref_dec: fn(usize) -> bool,
     pub cow_ref_get: fn(usize) -> u16,
+    pub cow_fault_lock: fn(usize),
+    pub cow_fault_unlock: fn(usize),
 
     /// Optional hook run at the tail of `UserAddressSpace::new()`, after the default
     /// identity kernel mappings are installed. `None` on a normal (single-kernel /

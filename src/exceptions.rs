@@ -2582,23 +2582,40 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                             if let Some(old_pa_with_offset) = akuma_exec::mmu::translate_user_va(l0_ptr, page_va) {
                                 let old_pa = old_pa_with_offset & !(0xFFF);
                                 if crate::pmm::cow_ref_get(old_pa) > 0 {
-                                    crate::pmm::track_frame(new_frame, akuma_exec::runtime::FrameSource::UserData);
-                                    unsafe {
-                                        let src = akuma_exec::mmu::phys_to_virt(old_pa).cast_const();
-                                        let dst = akuma_exec::mmu::phys_to_virt(new_frame.addr);
-                                        core::ptr::copy_nonoverlapping(src, dst, 0x1000);
+                                    // Serialize CoW break across parent/child processes that share
+                                    // this physical page. The per-PID fault_slot doesn't serialize
+                                    // across PIDs, so we need a global per-PA lock to prevent
+                                    // double-free races in the CoW protocol.
+                                    crate::pmm::cow_fault_lock(old_pa);
+                                    struct CowFaultLockGuard { pa: usize }
+                                    impl Drop for CowFaultLockGuard {
+                                        fn drop(&mut self) {
+                                            crate::pmm::cow_fault_unlock(self.pa);
+                                        }
                                     }
-                                    // Overwrite PTE: same VA, new PA, RW (free fn → shared
-                                    // `&Process`; `map_user_page` would refuse the valid PTE).
-                                    akuma_exec::mmu::remap_current_user_page(page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
-                                    owner.address_space.track_user_frame(new_frame);
-                                    // CoW: old page freed via the global CoW refcount
-                                    // (cow_ref_dec), not user_frames — drop the bookkeeping
-                                    // ref but never free here.
-                                    let _ = owner.address_space.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
-                                    // Decrement CoW refcount (may free old page if last ref)
-                                    crate::pmm::cow_ref_dec(old_pa);
-                                    did_cow = true;
+                                    let _cow_lock_guard = CowFaultLockGuard { pa: old_pa };
+
+                                    // Re-check refcount after acquiring the lock — another
+                                    // process may have already broken the CoW while we waited.
+                                    if crate::pmm::cow_ref_get(old_pa) > 0 {
+                                        crate::pmm::track_frame(new_frame, akuma_exec::runtime::FrameSource::UserData);
+                                        unsafe {
+                                            let src = akuma_exec::mmu::phys_to_virt(old_pa).cast_const();
+                                            let dst = akuma_exec::mmu::phys_to_virt(new_frame.addr);
+                                            core::ptr::copy_nonoverlapping(src, dst, 0x1000);
+                                        }
+                                        // Overwrite PTE: same VA, new PA, RW (free fn → shared
+                                        // `&Process`; `map_user_page` would refuse the valid PTE).
+                                        akuma_exec::mmu::remap_current_user_page(page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
+                                        owner.address_space.track_user_frame(new_frame);
+                                        // CoW: old page freed via the global CoW refcount
+                                        // (cow_ref_dec), not user_frames — drop the bookkeeping
+                                        // ref but never free here.
+                                        let _ = owner.address_space.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
+                                        // Decrement CoW refcount (may free old page if last ref)
+                                        crate::pmm::cow_ref_dec(old_pa);
+                                        did_cow = true;
+                                    }
                                 }
                             }
                         }

@@ -808,6 +808,12 @@ pub fn alloc_pages_zeroed(count: usize) -> Option<alloc::vec::Vec<PhysFrame>> {
 // Copy-on-Write Reference Counting
 // ============================================================================
 
+/// Global CoW fault serialization lock (per-physical-page).
+/// Under SMP, parent and child can fault on the same shared page concurrently.
+/// The per-PID fault_slot mechanism doesn't serialize across PIDs, so we need
+/// a global per-PA lock to prevent double-free races in the CoW break protocol.
+static COW_FAULT_LOCK: Spinlock<BTreeMap<usize, u32>> = Spinlock::new(BTreeMap::new());
+
 /// Tracks CoW-shared physical frames.  Only pages that are actually shared
 /// between parent and child after fork get entries here.  Non-shared pages
 /// have no overhead.
@@ -844,6 +850,30 @@ pub fn cow_ref_dec(pa: usize) -> bool {
             None => true, // Not tracked → single owner → safe to free
         }
     })
+}
+
+/// Acquire the CoW fault lock for a physical page.
+/// Serializes CoW break across parent and child processes that share the page.
+/// Must be paired with `cow_fault_unlock`.
+pub fn cow_fault_lock(pa: usize) {
+    // Increment the per-PA lock count
+    crate::irq::with_irqs_disabled(|| {
+        let mut locks = COW_FAULT_LOCK.lock();
+        *locks.entry(pa).or_insert(0) += 1;
+    });
+}
+
+/// Release the CoW fault lock for a physical page.
+pub fn cow_fault_unlock(pa: usize) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut locks = COW_FAULT_LOCK.lock();
+        if let Some(count) = locks.get_mut(&pa) {
+            *count -= 1;
+            if *count == 0 {
+                locks.remove(&pa);
+            }
+        }
+    });
 }
 
 #[allow(dead_code)]

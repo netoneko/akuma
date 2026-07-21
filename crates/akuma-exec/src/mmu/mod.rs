@@ -1715,6 +1715,13 @@ pub fn collect_mapped_pages_with_flags(
 /// Walks the page table via raw L0 pointer (no `&mut UserAddressSpace` needed).
 /// Returns the number of PTEs actually demoted.  Caller must flush the TLB
 /// after calling this (e.g. `flush_tlb_asid`).
+///
+/// # SMP safety
+/// Under `kernel_smp_shared`, this function ensures all PTE writes are visible
+/// before returning, so a subsequent `flush_tlb_all()` guarantees that no core
+/// can use a stale RW TLB entry after the demotion. This is critical for CoW
+/// fork correctness: the demote+flush window must be atomic with respect to
+/// genuinely-parallel EL0 on peer cores.
 pub unsafe fn demote_range_to_ro(l0_ptr: *mut u64, va_start: usize, pages: usize) -> usize { unsafe {
     const AP_MASK: u64 = flags::AP_RO_ALL | flags::AP_RW_ALL; // bits [7:6]
     let mut demoted = 0usize;
@@ -1769,6 +1776,11 @@ pub unsafe fn demote_range_to_ro(l0_ptr: *mut u64, va_start: usize, pages: usize
         }
         va = l2_range_end;
     }
+    // Ensure all PTE writes are visible before returning. Under kernel_smp_shared,
+    // the caller will issue flush_tlb_all() which includes DSB, but this DSB here
+    // guarantees ordering even if the call pattern changes.
+    #[cfg(kernel_smp_shared)]
+    core::arch::asm!("dsb ish", options(nostack, nomem));
     demoted
 }}
 

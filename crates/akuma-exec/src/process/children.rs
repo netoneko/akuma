@@ -994,6 +994,8 @@ mod child_channel_drain_tests {
             cow_ref_inc: |_| {},
             cow_ref_dec: |_| false,
             cow_ref_get: |_| 0,
+            cow_fault_lock: |_| {},
+            cow_fault_unlock: |_| {},
             prepare_user_address_space: None,
             remote_fd_close: None,
         };
