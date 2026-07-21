@@ -837,3 +837,32 @@ fails and never advances the queue).
   **Investigation needed:** Check Go runtime futex/epoll patterns, verify
   futex wake/unblock correctness under SMP, examine pipe/epoll edge cases.
   Separate from CoW/TLB fixes — this is a Go runtime + kernel interaction issue.
+
+## forktest_parent (Go) hang — ROOT-CAUSED + FIXED (2026-07-22)
+
+Resolves the item above. **Not SMP-related** — reproduced at SMP=1 (the missing
+baseline). The "extra forktest_parent PIDs" were Go runtime threads; no fork ever
+happened. Root cause: `sys_waitid` (P_PIDFD/P_PID) blocked on processes that are
+NOT the caller's children. Go ≥1.23 os/exec probes pidfd support before its first
+fork: `pidfd_open(getpid())` + `waitid(P_PIDFD, <pidfd of self>)`, expecting
+**ECHILD** (you are not your own child). Akuma resolved the pidfd and blocked on
+the caller's *own* exit channel → `exec.Cmd.Start()` hung before `clone`.
+Regression window: pidfd support landed 2026-06-19; the Go forktest last passed
+pre-pidfd (April), when the probe failed at `pidfd_open` and os/exec used the
+classic fork+wait4 path.
+
+Fix: `children.rs::is_child_of_group(child, waiter_tgid)` (thread-group-aware —
+Go forks/waits from different M's) + ECHILD guards in `sys_waitid` P_PID/P_PIDFD
+and `sys_wait4` explicit-pid arms. With waitid correct, the probe now fails
+cleanly at unimplemented `pidfd_send_signal` → fork+wait4 fallback. 2 new host
+tests; 125 pass; clippy clean both configs.
+
+**Verified:** SMP=1/2/4 basic forktest EXIT=0; SMP=2 `-num_children=3
+-duration=15s -combined_stress` EXIT=0, 0 stuck/RECOVERED/WATCHDOG.
+**New residual exposed:** SMP=4 + combined_stress → one child WILD-DA
+(`FAR=0x20000001a`, wild pointer) then a hard BKL wedge (core 2 owner, ~5.5k
+stuck, 0 RECOVERED — not the ticket leak; owner genuinely stuck in EL1). The Go
+stress test is now a reliable repro for the SMP≥4 residual family — see
+`../runbooks/debug-forktest-go-hang.md` + `../runbooks/debug-smp-fork-corruption.md`.
+
+**Files:** `crates/akuma-exec/src/process/children.rs`, `src/syscall/proc.rs`.

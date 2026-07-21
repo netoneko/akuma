@@ -811,6 +811,12 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
 
     if pid > 0 {
         let p = pid as u32;
+        // Waiting on a process that is not our child (thread-group-wise) must
+        // fail with ECHILD, not block — see is_child_of_group.
+        let waiter_tgid = akuma_exec::process::current_process().map_or(current_pid, |pr| pr.tgid);
+        if !akuma_exec::process::is_child_of_group(p, waiter_tgid) {
+            return i64::from(-libc_errno::ECHILD) as u64;
+        }
         if let Some(ch) = akuma_exec::process::get_child_channel(p) {
             loop {
                 if ch.has_exited() {
@@ -949,8 +955,14 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
     };
 
     let waiter_tid = akuma_exec::threading::current_thread_id();
+    // Waits may come from any thread of a multithreaded parent (Go M's), so
+    // parentage is checked against the caller's thread group.
+    let waiter_tgid = akuma_exec::process::current_process().map_or(current_pid, |p| p.tgid);
     let result: Option<(u32, i32)> = match idtype {
         P_PID => {
+            if !akuma_exec::process::is_child_of_group(id, waiter_tgid) {
+                return i64::from(-libc_errno::ECHILD) as u64;
+            }
             if let Some(ch) = akuma_exec::process::get_child_channel(id) {
                 loop {
                     if ch.has_exited() {
@@ -999,6 +1011,13 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
             } else {
                 return i64::from(-libc_errno::ECHILD) as u64;
             };
+            // A pidfd can reference any live process (e.g. Go's os/exec probe opens
+            // a pidfd of ITSELF), but waitid on one that is not our child must
+            // fail with ECHILD, exactly like Linux — blocking would deadlock the
+            // prober against its own exit.
+            if !akuma_exec::process::is_child_of_group(target_pid, waiter_tgid) {
+                return i64::from(-libc_errno::ECHILD) as u64;
+            }
             if let Some(ch) = akuma_exec::process::get_child_channel(target_pid) {
                 loop {
                     if ch.has_exited() {

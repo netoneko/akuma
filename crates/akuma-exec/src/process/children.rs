@@ -30,6 +30,28 @@ pub fn get_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
     })
 }
 
+/// True when `child_pid` is registered as a child of the thread group `waiter_tgid`.
+///
+/// The registered parent is the pid of whichever thread called fork/clone; a
+/// multithreaded parent (e.g. the Go runtime) may wait from a *different* thread
+/// of the same group, so the comparison is by thread group, not raw pid. Linux
+/// `wait*` on a process that is not your child fails with ECHILD — the wait4 /
+/// waitid paths use this to enforce that. Notably Go's os/exec pidfd probe
+/// calls `waitid(P_PIDFD, <pidfd of itself>)` and *requires* ECHILD; blocking
+/// on a non-child instead deadlocks the caller against its own exit.
+pub fn is_child_of_group(child_pid: Pid, waiter_tgid: Pid) -> bool {
+    let ppid = with_irqs_disabled(|| {
+        CHILD_CHANNELS.lock().get(&child_pid).map(|(_, ppid)| *ppid)
+    });
+    let Some(ppid) = ppid else { return false };
+    if ppid == waiter_tgid {
+        return true;
+    }
+    // The recorded parent may be a non-leader thread; resolve its thread group.
+    find_process(|p| if p.pid == ppid { Some(p.tgid) } else { None })
+        .is_some_and(|tgid| tgid == waiter_tgid)
+}
+
 /// Remove a child process channel (called when the parent CLOSES its
 /// `ChildStdout` read fd, or on `execve`/teardown of the reading process).
 pub fn remove_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
@@ -1075,6 +1097,28 @@ mod child_channel_drain_tests {
         // without ever reading the ChildStdout fd don't leak channels.
         assert!(reap_child_channel(pid), "empty channel is removed on reap");
         assert!(get_child_channel(pid).is_none());
+    }
+
+    #[test]
+    fn is_child_of_group_matches_registered_parent_only() {
+        let pid: Pid = 0x7000_0031;
+        let parent: Pid = 0x7000_0032;
+        let stranger: Pid = 0x7000_0033;
+
+        register_child_channel(pid, Arc::new(ProcessChannel::new()), parent);
+
+        assert!(is_child_of_group(pid, parent), "registered parent may wait");
+        assert!(!is_child_of_group(pid, stranger), "non-parent gets ECHILD");
+        // The Go os/exec pidfd probe: a process waitid()s a pidfd of ITSELF and
+        // must get ECHILD (it is not its own child), never block.
+        assert!(!is_child_of_group(pid, pid), "self-wait is not a child wait");
+
+        remove_child_channel(pid);
+    }
+
+    #[test]
+    fn is_child_of_group_unregistered_pid_is_not_a_child() {
+        assert!(!is_child_of_group(0x7000_0041, 0x7000_0042));
     }
 
     #[test]

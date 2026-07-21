@@ -1,129 +1,91 @@
-# Forktest_parent Go Hanging Issue - Investigation Prompt
+# Forktest_parent Go Hang — ROOT-CAUSED & FIXED (2026-07-22)
 
-## Problem Statement
+## Problem Statement (as originally filed)
 
-The Go-based `forktest_parent` stress test (from `userspace/forktest/`) hangs under SMP=2 and SMP=4, failing to complete within its specified duration despite starting successfully.
+The Go-based `forktest_parent` stress test (from `userspace/forktest/`) hung under
+SMP=2 and SMP=4: it printed `Launching child 0...` and never completed, leaving
+multiple `forktest_parent` PIDs in `ps` and no kernel crash diagnostics.
 
-## Observed Behavior
+## Resolution summary
 
-**Test command:**
-```bash
-/bin/forktest_parent -num_children=1 -duration=1s
-```
+**Not an SMP bug at all.** The hang reproduced identically at SMP=1 (the original
+investigation never ran the single-core baseline). The extra PIDs in `ps` were the
+Go runtime's OS threads (M's), not leaked forks — no fork had ever happened.
 
-**Output:**
-```
-forktest_parent: Starting with 1 children, duration=1s (deadline 2026-07-21T20:36:00Z).
-forktest_parent: Launching child 0...
-# [hangs indefinitely, never exits]
-```
+**Root cause:** the kernel's `waitid` blocked on processes that are NOT children
+of the caller. Go's `os/exec` (Go ≥1.23) probes pidfd support once per process
+(`os.checkPidfd`) before its first fork:
 
-**Process listing after hang:**
-```
-  11 0 0:00 /bin/forktest_parent -num_children=1 -duration=1s
-  12 0 0:00 /bin/forktest_parent -num_children=1 -duration=1s
-  13 0 0:00 /bin/forktest_parent -num_children=1 -duration=1s
-  14 0 0:00 /bin/forktest_parent -num_children=1 -duration=1s
-```
+1. `pidfd_open(getpid())` — open a pidfd of ITSELF (Akuma implements this; it
+   succeeded because `forktest_parent` is itself in `CHILD_CHANNELS` as a child
+   of the login shell).
+2. `waitid(P_PIDFD, fd, WEXITED)` — on Linux this returns **ECHILD immediately**
+   (a process is not its own child). Akuma's `sys_waitid` P_PIDFD arm resolved
+   the pidfd to PID N and blocked on PID N's exit channel with **no parentage
+   check** — i.e. the process blocked forever waiting for *its own* exit.
 
-**Kernel diagnostics:**
-- 0 `[BKL] RECOVERED` events
-- 0 `[WATCHDOG]` events
-- 0 crashes (no `WILD-DA`, `SIGSEGV`, `panic`)
-- Process performs syscalls normally (futex, nanosleep, mmap, munmap, epoll_create1, epoll_ctl)
-- SSH receives "Connection closed by remote host"
+So the main goroutine hung inside `exec.Cmd.Start()` before `clone` was ever
+issued. `[futex-dbg]` + syscall tracing showed the last userspace action was
+`[pidfd] open pid=5 → fd=8`, then silence — no clone, no error pipe.
 
-## Known Working vs Failing
+**Why it regressed:** pidfd support (`src/syscall/pidfd.rs`) landed 2026-06-19
+(git-in-VM work). Before that, `pidfd_open` returned ENOSYS, Go's probe failed,
+and os/exec used the classic fork+wait4 path (which worked since April).
 
-**Working:**
-- `busybox true` fork loops (both SMP=2 and SMP=4)
-- 384 concurrent forks via `sshd_crash_hunt.py` (SMP=4, 3 boots, 0 crashes)
-- CoW/TLB fixes confirmed working
+## The fix
 
-**Failing:**
-- Go `forktest_parent` with any duration (tested: 1s, 3s, 5s)
-- Both SMP=2 and SMP=4
-- Basic mode (no stress flags) hangs immediately
+`wait*` on a process that is not your child now fails with ECHILD instead of
+blocking, matching Linux:
 
-## Investigation Leads
+- `crates/akuma-exec/src/process/children.rs::is_child_of_group(child_pid,
+  waiter_tgid)` — parentage check against the caller's **thread group** (the
+  registered parent is whichever thread called fork/clone; a multithreaded Go
+  parent may wait from a different M, so raw pid equality would break real
+  waits). Falls back to `find_process` to resolve a non-leader thread's tgid.
+- `src/syscall/proc.rs::sys_waitid` — P_PID and P_PIDFD arms return ECHILD when
+  `!is_child_of_group(target, waiter_tgid)`.
+- `src/syscall/proc.rs::sys_wait4` — explicit-pid arm gets the same guard (same
+  latent self/non-child block).
 
-### 1. Go Runtime Futex/Epoll Patterns
-- Go uses futex for goroutine parking/unparking
-- forktest_parent uses epoll for child process pipe monitoring
-- Check if futex wake-ups are missed under SMP scheduler
-- Verify epoll edge-triggered behavior with multiple cores
+With waitid returning ECHILD, Go's probe proceeds to `pidfd_send_signal`, which
+Akuma does NOT implement (ENOSYS) → the probe cleanly reports "pidfd unsupported"
+→ os/exec falls back to fork + wait4, the long-verified path.
 
-### 2. Parent-Child Pipe Communication
-- forktest_parent creates pipes for each child's stdout/stderr
-- Uses epoll to monitor pipe readiness
-- Check if pipe read/write deadlocks occur under BKL
-- Verify pipe close/destroy logic with concurrent access
+Host tests: `is_child_of_group_matches_registered_parent_only`,
+`is_child_of_group_unregistered_pid_is_not_a_child` (children.rs). 125 akuma-exec
+host tests pass; clippy clean (smp-shared + default).
 
-### 3. Go Timer/Sleep Interaction
-- Go's `time.Sleep` uses futex-based timers
-- Kernel tick is 10ms (CNTV timer)
-- Check if Go timer wake-ups are delayed or missed
-- Verify monotonic clock vs kernel timer alignment
+## Verified (2026-07-22, devbox-smoltcp, release-smp-shared)
 
-### 4. Goroutine Channel Deadlocks
-- Go channels may block on futex internally
-- Check channel send/receive under SMP scheduling
-- Verify channel close/broadcast correctness
+- SMP=1: `forktest_parent -num_children=1 -duration=1s` completes, EXIT=0.
+- SMP=2: basic AND `-num_children=3 -duration=15s -combined_stress` complete,
+  EXIT=0; children handle SIGTERM gracefully; 0 RECOVERED / 0 WATCHDOG / 0 crashes.
+- SMP=4: basic completes, EXIT=0.
 
-## Files to Investigate
+## Remaining (separate bug, pre-existing SMP≥4 residual family)
 
-**Kernel:**
-- `src/syscall/futex.rs` — futex FUTEX_WAIT/FUTEX_WAKE implementation
-- `src/syscall/epoll.rs` — epoll edge-triggered behavior
-- `src/syscall/pipe.rs` — pipe close/destroy race conditions
-- `src/timer.rs` — timer tick delivery to sleeping processes
-- `crates/akuma-exec/src/threading/mod.rs` — scheduler wake decisions
-
-**Userspace (forktest):**
-- `userspace/forktest/parent/main.go` — epoll monitoring, child spawning
-- `userspace/forktest/child/main.go` — stress test goroutines
-
-**Reference:**
-- `docs/archive/GO_FORK_EXEC_FIXES.md` — Go futex/epoll history
-- `docs/archive/GOLANG_IPC.md` — Go IPC patterns
-
-## Debugging Commands
+SMP=4 + `-combined_stress` (3 Go children, mmap+goroutine+file-IO storm):
+one child died with a userspace `WILD-DA FAR=0x20000001a ELR=0x45db8` (wild
+pointer, Go arena-adjacent address) and the box then wedged with core 2
+permanently owning the BKL (~5.5k `[BKL] stuck`, **zero** `[BKL] RECOVERED`, no
+WATCHDOG — so NOT the ticket leak; the owner is genuinely stuck in EL1).
+Log: `forktest_smp4_fixed.log`. This is the known SMP≥4 contention/corruption
+residual (see `debug-smp-fork-corruption.md`), now readily reproducible via the
+Go stress test — that repro is the next session's entry point:
 
 ```bash
-# Boot and test
-SMP=2 MEMORY=2048 overlays/devbox/run-smoltcp.sh
-
-# Check if forktest_parent started
-ssh -p 2222 root@localhost "/bin/forktest_parent -num_children=1 -duration=1s"
-
-# In another terminal, monitor processes
-ssh -p 2222 root@localhost "watch -n 1 'ps ax | grep forktest'"
-
-# Check futex syscalls (if instrumented)
-grep "futex" kernel_log
-
-# Check epoll syscalls
-grep "epoll" kernel_log
+SMP=4 overlays/devbox/run-smoltcp.sh   # then:
+ssh -p 2222 root@localhost '/bin/forktest_parent -num_children=3 -duration=15s -combined_stress'
 ```
 
-## Hypothesis Priority
+## Debugging tools that cracked it (keep in mind for next time)
 
-1. **High:** Go futex wake-up missed under SMP scheduler (similar to historic Go futex issues)
-2. **Medium:** Epoll edge-triggered race with multiple cores writing pipes
-3. **Medium:** Pipe close sequence deadlock when parent terminates
-4. **Low:** Go timer tick misalignment with kernel 10ms tick
-
-## Success Criteria
-
-- forktest_parent completes within specified duration
-- No process leaks (multiple forktest_parent PIDs should not appear)
-- Correct child process cleanup
-- No kernel crashes or deadlocks
-
-## Next Steps
-
-1. Add futex/epoll instrumentation to trace wake-up patterns
-2. Test with `-num_children=0` to isolate parent-only behavior
-3. Test Go simple program that just sleeps (no fork/epoll)
-4. Compare single-core (SMP=1) vs SMP=2/4 behavior
-5. Check if issue exists in the C version (if available)
+- `src/config.rs::FUTEX_DBG_ENABLED = true` — futex WAIT/WOKE/WAKE trace with
+  tids and timestamps.
+- `src/config.rs::DEADLOCK_THREAD_DUMP_ENABLED = true` — periodic parked-thread
+  resume-point dumps.
+- PSTATS per-PID syscall profiles: the tell was `forktest_parent` having **no
+  clone syscall at all** — the hang was before the fork, killing all
+  futex/epoll/pipe hypotheses at once.
+- Baseline first: running the SMP=1 case immediately reclassified the bug from
+  "SMP scheduler race" to "syscall semantics".
