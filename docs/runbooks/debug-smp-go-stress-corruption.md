@@ -1,5 +1,9 @@
 # SMP Go combined_stress: phantom-SVC corruption + BKL teardown wedge — Investigation Prompt
 
+> **STATUS 2026-07-22 (same day, follow-up session): bugs 1 and 2 FIXED — see
+> "Resolution" at the bottom. Bug 3 (ticket leak) still open; two new residuals
+> (sshd post-session freeze, missing SSH exit-status) documented there.**
+
 ## Problem Statement
 
 With the waitid/pidfd fix in (see `debug-forktest-go-hang.md`), the Go forktest
@@ -173,3 +177,139 @@ same mode → gate with `-combined_stress` at SMP=2 and SMP=4. `quick_forktest.p
 - `docs/runbooks/debug-smp-fork-corruption.md` — prior dossier (mixed-EL family,
   LifecycleGuard, POISON tripwires); the phantom-SVC mechanism may explain
   earlier "context corruption" sightings too.
+
+## Resolution (2026-07-22)
+
+### Bug 1 — phantom SVC: FIXED (ESR/FAR entry snapshot)
+
+The prime suspect was confirmed, but the window is even earlier than the BKL
+spin: `sync_el0_handler`'s **vector asm itself enables IRQs** (`msr daifclr, #2`)
+before `bl rust_sync_el0_handler`, so *any* syndrome read from Rust was already
+after a preemptible window.
+
+Fix (all in `src/exceptions.rs`):
+
+1. The vector asm snapshots `ESR_EL1`→`x1` and `FAR_EL1`→`x2` **before**
+   `daifclr`, while PSTATE.I is still masked from the trap, and passes them as
+   arguments: `rust_sync_el0_handler(frame, esr, far)`. The entire inner chain
+   consumes the snapshot; no live `mrs esr_el1/far_el1` remains on the EL0 sync
+   path. The fault arms take ELR from the **trap frame** too — the live
+   `ELR_EL1` is consumed by any intervening IRQ's `eret`, so a late read
+   returns a kernel resume address, not the faulting user PC.
+2. EL1-sync paths (`rust_sync_el1_handler`, CoW/user-copy fast paths) keep
+   live reads — sound because that asm never unmasks IRQs before the handler.
+3. The spurious-SVC guard's give-up path **never dispatches**. It sets a flag;
+   after the QEMU DC-ZVA / STP-XZR misroute emulations get their chance (they
+   legitimately reach give-up — their ELR-4 is not an svc either), an
+   unclaimed phantom SVC gets SIGILL at the trap PC (or kills the group).
+4. `SPURIOUS_SVC_COUNT` counter + `spurious_svc_count()`; boot self-test
+   `test_no_spurious_svc_traps` runs LAST in the suite and asserts 0.
+
+Verified: SPURIOUS-SVC 0 (was 8) at SMP=2, 0 (was 25) at SMP=4, across 4 boots /
+13 combined_stress runs. The `[BKL] stuck owner=N` deadline wedge (bug 2) never
+reappeared (was ~7.5k lines) — it was downstream of bug-1 corruption as
+hypothesized.
+
+### Bug 2b (new, found by the fix) — exit/exit_group returned to EL0: FIXED
+
+With the phantom storm gone, the remaining WILD-DA pair at every SIGTERM
+deadline decoded to `FAR=0x0 ELR=0x4aa0c` = `str xzr,[x0]` with `x0=0` inside
+**`runtime.fatalthrow`** — Go's *deliberate* crash-store when `exit` returns.
+Kernel chain: group teardown unregisters the process while a CLONE_VM sibling
+still runs on another core (10 ms preemption window) → its `write`s hit EBADF
+(fds already closed by exit_group) → it calls `exit_group`, `current_process()`
+is None, `sys_exit_group` falls through and **returns the exit code to EL0** →
+Go crashes on purpose. Same fall-through existed in `sys_exit`.
+
+Fix: `src/syscall/mod.rs` dispatch arms for `nr::EXIT`/`nr::EXIT_GROUP` call
+`return_to_kernel(code)` if the sys fn comes back (it handles the
+process-already-gone case and parks the thread). exit/exit_group can now never
+return to EL0. Verified: 0 WILD-DA in 8+ subsequent SMP=4 runs.
+
+### Scaling table after the fixes (same repro)
+
+| SMP | `[SPURIOUS-SVC]` | `WILD-DA` | BKL deadline wedge | outcome |
+|-----|-----------------|-----------|--------------------|---------|
+| 2   | 0 (was 8)       | 0         | none               | PASS |
+| 4   | 0 (was 25)      | 0 (was 2) | none (was ~7.5k spins) | forktest PASS (in-band exit 0); residuals below |
+
+### Bugs 2 + 3 — BKL wedge AND ticket leak: one root cause, FIXED (lldb-confirmed)
+
+The wedge was NOT purely downstream of bug 1 — it reappeared intermittently
+mid-run (not at the deadline) after the ESR fix, now reliably reproducible
+(~1 boot in 2). lldb on a live wedge (gdbstub, `GDB=1`):
+
+- **All four cores** parked at the same PC inside `KernelLock::acquire`'s
+  ticket wait — no owner doing work anywhere.
+- Lock state: `owner=4`, `next_ticket=958866`, `now_serving=958861`; the four
+  spinners held tickets 958862–65. The *served* ticket belonged to no living
+  waiter, and the lost-ticket self-heal can't fire because `owner != 0`.
+- Smoking gun: the spinner physically on CPU3 had **`me=2`** in its registers.
+
+Root cause — same class as bug 1: `bkl::enter_kernel()`/`leave_kernel()` read
+`current_core_id()` (MPIDR) in **preemptible context** (the vector asm enables
+IRQs before the handler; `acquire` masks only later, inside the wait). A
+preemption + migration between the MPIDR read and the lock operation runs the
+op with a stale core identity, which breaks both directions:
+
+- stale-`me` **acquire** skips the reentrant `owner == me` fast path → the
+  thread takes a ticket and spins IRQ-masked on a core whose own (logical)
+  hold it can never observe → that core can never release → `owner` frozen
+  nonzero, every core piles up = **the hard wedge** (0 RECOVERED).
+- stale-`me` **release** is a silent CAS no-op → the hold leaks and
+  `now_serving` stops advancing = **the whole bug-3 "ticket leak" family**
+  that the `advanced-lost`/`reticket` self-heals were papering over.
+
+Fix (`crates/akuma-exec/src/bkl.rs`): `enter_kernel`, `leave_kernel`, and
+`reconcile_for_spsr` now mask IRQs **around** the `current_core_id()` read +
+lock op (`sync.rs` `irq_save_mask`/`irq_restore` made `pub(crate)`), making
+the core identity migration-atomic with the operation.
+
+The SMP=1 `RECOVERED (advanced-lost)` sighting is consistent with a false
+positive of the frozen-`now_serving` heuristic during a host stall (QEMU vCPU
+descheduled) — not necessarily the same leak.
+
+### Still open
+
+- **Terminated-thread lock leak — the sshd "freeze" root cause (lldb + THR-DUMP
+  confirmed, NOT yet fixed)**. After the BKL fix, 7/7 stress runs passed and
+  then run 8's ssh hung: sshd (single-threaded cooperative multiplexer,
+  `userspace/sshd`) was parked in syscall 301 (`SPAWN`) forever while the
+  kernel stayed healthy. lldb: its core executing
+  `spawn_process_with_channel_ext → resolve_symlinks → ext2 read_inode →
+  block::read_bytes`, PC at the `isb; ldrb; cbnz` spin loop of
+  **`BLOCK_DEVICE.lock()`** (`src/block.rs` `Spinlock`). All forktest threads
+  were already recycled ⇒ a stress-run child thread died holding the
+  block-device spinlock. Mechanism: `kill_thread_group` PHASE 1
+  (`process/mod.rs`) marks sibling threads TERMINATED unconditionally — a
+  sibling parked mid-EL1 (cooperative disk wait during demand paging, holding
+  `BLOCK_DEVICE`) never runs again, so the lock leaks and every later
+  disk-dependent path (sshd's next spawn) spins forever. Network/timers stay
+  fine; only disk I/O is dead — hence "sshd freeze". **Fix direction:
+  terminate only at safe points** — a thread inside an EL1 kernel excursion
+  gets a *pending* kill that fires at its next kernel-exit boundary (or is
+  woken to unwind), never a hard TERMINATED while it may hold kernel locks.
+  Hunt aid added meanwhile: `DEADLOCK_THREAD_DUMP_ENABLED` also dumps on the
+  30 s PSTATS cadence in `src/main.rs` (the Thread-0 heartbeat trigger fires
+  ~never under `idle_halt`).
+- **SMP=4 boot self-test suite wedges (PRE-EXISTING, nondeterministic)**: with
+  AND without this session's changes, the test-enabled suite (`SMP=4 cargo run
+  --profile release-smp-shared --features smp-shared`) wedges mid-suite
+  (`[BKL] stuck: owner=1` storm; the wedge point varies between runs —
+  pthread-conformance tests one run, post-`sa_siginfo` the next; baseline A/B
+  confirmed both wedge). Green at SMP=1. Many suite tests spawn/terminate
+  kernel threads directly — consistent with the terminated-thread lock-leak
+  class above.
+- Pre-existing suite failure (SMP-independent, also in old full-suite logs):
+  `fs_error_to_errno_mapping: PermissionDenied → got -13 (EACCES), expected
+  -1 (EPERM)`.
+- (Fixed in passing: `test_mmap_file_oom_survives` panicked the suite at small
+  RAM — its lazy-path expectation of `-11` predated clean file-page eviction,
+  which now legitimately lets the oversized-mmap process finish with exit 0.
+  The test accepts both; the kernel-stays-up assertion is unchanged.)
+- **ssh always exits 255** ("Connection to localhost closed by remote host"):
+  `userspace/sshd` never sends `SSH_MSG_CHANNEL_EXIT_STATUS`/`CHANNEL_CLOSE` —
+  `handle_connection` just returns and drops the socket. Chronic, not a
+  regression; makes `ssh`'s exit code useless for gating. Harnesses must grade
+  in-band (`<cmd>; echo INBAND_EXIT=$?`). Proper fix: send exit-status (from
+  the `waitpid` the bridge already does) + CHANNEL_CLOSE before returning.

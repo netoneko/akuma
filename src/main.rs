@@ -1468,6 +1468,13 @@ fn run_async_main() -> ! {
         if now_us.saturating_sub(last_ps) >= PSTATS_INTERVAL_US {
             LAST_PSTATS_US.store(now_us, Ordering::Relaxed);
             akuma_exec::process::dump_running_process_stats();
+            // Deadlock-hunt aid: the Thread-0 heartbeat's dump trigger fires
+            // every 50M idle loops (~never with idle_halt); piggyback on the
+            // 30s PSTATS cadence instead so a wedged thread's parked resume
+            // point is actually observable.
+            if crate::config::DEADLOCK_THREAD_DUMP_ENABLED {
+                threading::dump_thread_resume_points();
+            }
         }
 
         GLOBAL_POLL_STEP.store(1, Ordering::Relaxed);

@@ -882,3 +882,45 @@ tests; 125 pass; clippy clean both configs.
   easier root-cause target.
 
 **Files:** `crates/akuma-exec/src/process/children.rs`, `src/syscall/proc.rs`.
+
+---
+
+### 2026-07-22 (later): phantom-SVC + teardown wedge FIXED (ESR/FAR entry snapshot + exit-never-returns)
+
+Executed the `debug-smp-go-stress-corruption.md` plan; resolution recorded there
+in full. Summary:
+
+- **Phantom-SVC FIXED**: the window was even earlier than the BKL spin —
+  `sync_el0_handler`'s vector asm enables IRQs (`msr daifclr, #2`) BEFORE
+  calling Rust. The asm now snapshots `ESR_EL1`→x1/`FAR_EL1`→x2 while PSTATE.I
+  is still masked and passes them as handler arguments; the whole EL0 sync
+  chain consumes the snapshot (fault arms take ELR from the trap frame — the
+  live `ELR_EL1` is consumed by any intervening IRQ eret). Give-up never
+  dispatches (SIGILL after the QEMU misroute emulations decline).
+  `SPURIOUS_SVC_COUNT` + `test_no_spurious_svc_traps` (runs last) guard
+  regression. Verified 0/0 at SMP=2/4 (was 8/25).
+- **BKL deadline wedge GONE** with bug 1 fixed (0 stuck-storms across multiple
+  boots; was ~7.5k) — it was downstream of the corruption, as suspected.
+- **New: exit/exit_group returned to EL0** when `current_process()` was None
+  (CLONE_VM sibling still running cross-core after group teardown) → Go's
+  deliberate `runtime.fatalthrow` null-store (WILD-DA FAR=0x0 ELR=0x4aa0c,
+  fatal-message writes → EBADF on the already-closed fd table). Fixed in the
+  dispatcher: `nr::EXIT`/`nr::EXIT_GROUP` call `return_to_kernel(code)` if the
+  sys fn returns. 0 WILD-DA since.
+- **Bugs 2+3 root cause found later the same session (lldb)**: `enter_kernel`/
+  `leave_kernel` read `current_core_id()` in preemptible context; a
+  preemption+migration between the MPIDR read and the lock op runs it with a
+  stale core id (live wedge: CPU3 spinner with `me=2`, `owner=4` frozen,
+  served ticket lost, all 4 cores parked in `acquire`). Stale-me acquire
+  misses the reentrant fast path → hard wedge; stale-me release CAS no-ops →
+  the ticket-leak family. FIXED: IRQ-mask around the id read + lock op in
+  `bkl.rs`. 7/7 SMP=4 stress runs clean after.
+- **Still open**: terminated-thread lock leak — `kill_thread_group` PHASE 1
+  hard-terminates siblings that may be parked mid-EL1 holding kernel locks;
+  lldb-confirmed instance: a forktest child died holding `BLOCK_DEVICE`
+  (src/block.rs) → all later disk I/O spins → the "sshd freeze" (sshd parked
+  in SPAWN at `BLOCK_DEVICE.lock()`). Fix direction: pending-kill at safe
+  points. Likely also the PRE-EXISTING nondeterministic SMP=4 boot-suite
+  wedge (baseline A/B confirmed it predates these fixes; suite green at
+  SMP=1). Also: `userspace/sshd` never sends SSH_MSG_CHANNEL_EXIT_STATUS so
+  `ssh` always exits 255 — gates must grade in-band.

@@ -513,7 +513,25 @@ pub fn run_all_tests() {
     // binary lands on disk as zero bytes).
     test_shared_file_mmap_writeback();
 
+    // Phantom-SVC tripwire: runs LAST so it covers every EL0 trap the suite above
+    // generated (fork/exec/signal/mmap stress). A nonzero count means an EC_SVC64
+    // trap arrived whose insn@ELR-4 was not an `svc` — either stale I-cache or the
+    // SMP syndrome-misclassification regressing (the ESR/FAR entry snapshot in
+    // sync_el0_handler). Re-check after acceptance stress runs too.
+    test_no_spurious_svc_traps();
+
     console::print("--- Process Execution Tests Done ---\n\n");
+}
+
+/// See the call site: asserts the [SPURIOUS-SVC] counter stayed 0 across the suite.
+fn test_no_spurious_svc_traps() {
+    let n = crate::exceptions::spurious_svc_count();
+    if n == 0 {
+        console::print("[Test] no_spurious_svc_traps PASSED (0 phantom SVCs)\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] no_spurious_svc_traps FAILED: {} phantom SVC trap(s) during boot suite\n", n);
+    }
 }
 
 /// M0 boot self-test for real SMP: `smp_shared::bringup_secondaries` (run earlier in
@@ -5239,20 +5257,20 @@ fn test_mmap_file_oom_survives() {
 
     // The failure mode depends on how file-backed mmap is serviced:
     //  - lazy (MMAP_FILE_BACKED_LAZY, the size/extreme profiles): the mmap
-    //    succeeds and pages fault in on touch; running out of RAM mid-touch
-    //    SIGSEGVs the process (exit -11). This is the path the readahead reserve
-    //    clamp protects.
-    //  - eager (release): the region is allocated up front. With file-page
-    //    eviction, the kernel can evict clean file pages during the eager walk,
-    //    so a file larger than RAM may succeed (exit 0) or fail with ENOMEM
-    //    (exit 2) depending on eviction pressure. Either outcome is valid.
+    //    succeeds and pages fault in on touch. With clean file-page eviction
+    //    (try_evict_ro_page hooked into alloc_page_zeroed_user), touching a
+    //    file larger than RAM usually SUCCEEDS (exit 0) — clean RO pages are
+    //    reclaimed under pressure; only when nothing is evictable does the
+    //    process get OOM-SIGSEGV'd (exit -11). Both outcomes are valid.
+    //  - eager (release): the region is allocated up front. Same eviction
+    //    logic: success (exit 0) or ENOMEM (exit 2) depending on pressure.
     // Either way the kernel must stay up — which is the whole point — so we
     // accept the profile-appropriate exit code(s) and always assert survival.
     let lazy = crate::config::MMAP_FILE_BACKED_LAZY;
     crate::safe_print!(192,
         "  [..] test_mmap_file_oom_survives: mmap {} ({} MB) vs {} MB RAM — expect {}\n",
         path, size / 1024 / 1024, total_ram / 1024 / 1024,
-        if lazy { "SIGSEGV (-11)" } else { "success or ENOMEM (exit 0 or 2)" });
+        if lazy { "success via eviction or SIGSEGV (exit 0 or -11)" } else { "success or ENOMEM (exit 0 or 2)" });
 
     let free_before = pmm::free_count();
 
@@ -5260,14 +5278,14 @@ fn test_mmap_file_oom_survives() {
         Ok((exit_code, _stdout)) => {
             // Reaching here at all proves the kernel did not abort.
             let ok = if lazy {
-                exit_code == -11
+                exit_code == 0 || exit_code == -11
             } else {
                 exit_code == 0 || exit_code == 2
             };
             assert!(ok,
                 "test_mmap_file_oom: oversized file mmap (lazy={}) unexpected exit {}, want {}",
                 lazy, exit_code,
-                if lazy { "-11" } else { "0 or 2" });
+                if lazy { "0 or -11" } else { "0 or 2" });
 
             // The dead process's frames must be reclaimed and the kernel must
             // still be able to hand out user pages.
@@ -10757,9 +10775,12 @@ fn test_fork_child_context_ttbr0_not_stale() {
         return;
     }
 
-    // 5. The L0 physical base must be page-aligned and in the RAM range.
+    // 5. The L0 physical base must be page-aligned and in the RAM range
+    // (RAM base 0x4000_0000, upper bound generous enough for MEMORY up to
+    // 4 GB — the old constant 0x1400_0000 was a typo BELOW the RAM base, so
+    // this arm failed unconditionally whenever the test ran).
     let child_l0_phys = child_ttbr0 & 0x0000_FFFF_FFFF_F000;
-    if child_l0_phys < 0x4000_0000 || child_l0_phys >= 0x1400_0000 {
+    if child_l0_phys < 0x4000_0000 || child_l0_phys >= 0x1_4000_0000 {
         crate::safe_print!(128,
             "[Test] fork_child_ttbr0_not_stale FAILED: child L0 phys {:#x} outside RAM\n",
             child_l0_phys);

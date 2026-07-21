@@ -169,11 +169,21 @@ sync_el0_handler:
     
     // Pass pointer to saved context as first arg
     mov     x0, sp
-    
+
+    // Snapshot the trap syndrome (x1=ESR_EL1, x2=FAR_EL1) as handler args
+    // while PSTATE.I is still masked from the trap. The syndrome registers
+    // are per-PE and only hold THIS trap's values until the next trap on
+    // this PE; IRQs are enabled just below, so any later `mrs esr_el1` /
+    // `mrs far_el1` in the handler can observe a different trap's syndrome
+    // (SMP phantom-SVC: an EL0 data abort classified as EC_SVC64 after the
+    // BKL spin was preempted by other threads' traps).
+    mrs     x1, esr_el1
+    mrs     x2, far_el1
+
     // Enable IRQs during syscall handling to allow preemption
     msr     daifclr, #2
     isb
-    
+
     // Call Rust handler - returns syscall result in x0
     bl      rust_sync_el0_handler
     
@@ -989,8 +999,9 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     // In Linux, this is often done via ERESTARTSYS. Here we do it manually
     // by backing up ELR to the SVC instruction.
     //
-    // entry_esr is the ESR captured at the very top of rust_sync_el0_handler,
-    // before any context switch could overwrite ESR_EL1 on the live register.
+    // entry_esr is the ESR snapshotted by the vector asm at exception entry
+    // (while PSTATE.I was still masked), before any preemption could overwrite
+    // ESR_EL1 on the live register.
     const SA_RESTART: u64 = 0x10000000;
     if action.flags & SA_RESTART != 0 {
         // Only if we were in a syscall (EC_SVC_LOWER)
@@ -2103,6 +2114,20 @@ pub const fn is_aarch64_svc(instr: u32) -> bool {
     (instr & 0xFFE0_001F) == 0xD400_0001
 }
 
+/// Total EC_SVC64 traps whose instruction at ELR-4 was readable and
+/// definitively NOT an `svc` (phantom SVC), counted once per trap (replays and
+/// give-ups alike). Healthy runs keep this at 0 — the boot self-tests assert
+/// it (see `process_tests`) and stress/acceptance runs should re-check it: a
+/// nonzero count means syndrome misclassification (or stale I-cache) is back.
+static SPURIOUS_SVC_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read the phantom-SVC counter (see [`SPURIOUS_SVC_COUNT`]).
+// Consumed by the boot self-tests, which `no-tests`/size-profile builds omit.
+#[cfg_attr(any(feature = "no-tests", kernel_profile_size), allow(dead_code))]
+pub fn spurious_svc_count() -> u64 {
+    SPURIOUS_SVC_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Synchronous exception handler from EL0 (user mode)
 /// Returns the syscall return value, or doesn't return if process exits
 #[unsafe(no_mangle)]
@@ -2113,24 +2138,24 @@ pub const fn is_aarch64_svc(instr: u32) -> bool {
 /// unless `cfg(kernel_smp_shared)` (see `akuma_exec::bkl`). The IRQ/scheduler path's
 /// BKL reconciliation is added in M2; here the syscall thread may still be preempted
 /// mid-excursion, which is correct on the single active core of M0/M1.
-extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame) -> u64 {
+/// `esr`/`far` are the trap syndrome snapshotted by the vector asm at exception
+/// entry, while PSTATE.I was still masked. They MUST be used instead of live
+/// `mrs esr_el1`/`mrs far_el1` reads anywhere in this call chain: the BKL spin
+/// below runs with IRQs enabled, so this thread can be preempted (or even resume
+/// on another core) and the live syndrome registers then belong to someone
+/// else's trap. Same for ELR_EL1 — use the frame's saved copy.
+extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u64) -> u64 {
     akuma_exec::bkl::enter_kernel();
     // Record that this core serviced a user (EL0) trap — the M3 cross-core-userspace
     // proof (an EL0 trap only comes from userspace running on this core).
     #[cfg(kernel_smp_shared)]
     crate::smp_shared::record_el0_trap();
-    let ret = rust_sync_el0_handler_inner(frame);
+    let ret = rust_sync_el0_handler_inner(frame, esr, far);
     akuma_exec::bkl::leave_kernel();
     ret
 }
 
-fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
-    // Read ESR_EL1 to determine exception type
-    let esr: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, esr_el1", out(reg) esr);
-    }
-
+fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) -> u64 {
     let ec = (esr >> 26) & 0x3F; // Exception Class
     let iss = esr & 0x1FFFFFF; // Instruction Specific Syndrome
 
@@ -2158,7 +2183,11 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
             // (which a VALID syscall number like 95 slips past). A legitimate
             // syscall always reads back an svc here, so there are no false
             // positives; the same-ELR replay counter bounds any non-I-cache
-            // cause so it falls through to normal dispatch instead of spinning.
+            // cause. A trap the replays don't heal is still NOT a syscall — it
+            // is never dispatched (see `spurious_svc_give_up` below); the QEMU
+            // DC-ZVA/STP-XZR misroute emulations further down get a chance to
+            // claim it first.
+            let mut spurious_svc_give_up = false;
             if crate::config::VERIFY_SVC_AT_ENTRY {
                 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
                 static LAST_SPURIOUS_ELR: AtomicU64 = AtomicU64::new(0);
@@ -2177,6 +2206,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                 if let Some(instr) = prev_instr
                     && !is_aarch64_svc(instr)
                 {
+                    SPURIOUS_SVC_COUNT.fetch_add(1, Ordering::Relaxed);
                     let replays = if LAST_SPURIOUS_ELR.swap(elr, Ordering::Relaxed) == elr {
                         SPURIOUS_REPLAYS.fetch_add(1, Ordering::Relaxed) + 1
                     } else {
@@ -2197,11 +2227,17 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                         // the original (un-clobbered) register and re-runs the real insn.
                         return frame_ref.x0;
                     }
-                    // Too many replays at the same ELR — unlikely to be I-cache;
-                    // fall through to normal dispatch rather than spin forever.
+                    // Too many replays at the same ELR — unlikely to be I-cache.
+                    // Still not a real syscall (insn@ELR-4 is not an svc), so it
+                    // must NEVER be dispatched: writing a syscall return into x0
+                    // clobbers a live user register (the SMP Go-heap corruption
+                    // amplifier — memclr/spanSet.push pointers turning into
+                    // errnos/timespecs → WILD-DA). Flag it; after the QEMU
+                    // misroute emulations below decline it, deliver a signal.
                     crate::safe_print!(160,
-                        "[SPURIOUS-SVC] giving up at elr={:#x} after {} replays — dispatching nr={}\n",
+                        "[SPURIOUS-SVC] giving up at elr={:#x} after {} replays — nr={} will NOT be dispatched\n",
                         elr, replays, syscall_num);
+                    spurious_svc_give_up = true;
                 }
             }
 
@@ -2401,6 +2437,34 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
                 }
             }
 
+            // Phantom SVC the replay guard gave up on and no QEMU misroute
+            // emulation above claimed: this trap did not come from an `svc`, so
+            // there is nothing to dispatch (a dispatch would corrupt x0 of a
+            // thread that never made a syscall — and nr could even be 139,
+            // making the sigreturn below restore garbage). Deliver SIGILL at
+            // the trap PC; with no handler, kill the thread group like any
+            // other fatal fault.
+            if spurious_svc_give_up {
+                let elr = frame_ref.elr_el1;
+                crate::safe_print!(128,
+                    "[SPURIOUS-SVC] undispatchable phantom SVC at elr={:#x} — delivering SIGILL\n", elr);
+                if try_deliver_signal(frame, 4, elr, true, esr) {
+                    return 4; // signal number in x0 for the handler
+                }
+                if let Some(proc) = akuma_exec::process::current_process() {
+                    crate::safe_print!(128,
+                        "[SPURIOUS-SVC] Process {} ({}) killed (SIGILL, phantom SVC)\n",
+                        proc.pid, proc.name);
+                    if proc.address_space.is_shared() {
+                        // Fatal signal in a CLONE_VM thread kills the whole group.
+                        crate::syscall::proc::sys_exit_group_pub(-4);
+                    }
+                    crate::syscall::proc::notify_child_channel_exited_pub(proc.pid, -4);
+                    crate::syscall::proc::vfork_complete(proc.pid);
+                }
+                akuma_exec::process::return_to_kernel(-4) // never returns
+            }
+
             // rt_sigreturn (NR 139): restore saved context from signal frame
             if syscall_num == 139 {
                 if let Some(saved_x0) = do_rt_sigreturn(frame) {
@@ -2524,12 +2588,11 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
             ret
         }
         esr::EC_DATA_ABORT_LOWER => {
-            let far: u64;
-            let elr: u64;
-            unsafe {
-                core::arch::asm!("mrs {}, far_el1", out(reg) far);
-                core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
-            }
+            // `far` is the entry snapshot (see rust_sync_el0_handler); ELR comes
+            // from the trap frame — the live ELR_EL1 is consumed by any eret in
+            // between (a preempting IRQ's return), so a late `mrs elr_el1` reads
+            // a kernel resume address, not the faulting user PC.
+            let elr = unsafe { (*frame).elr_el1 };
 
             let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
             // Thread-group leader: mmap_regions and fault_mutex live on the leader Process
@@ -3193,10 +3256,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
             akuma_exec::process::return_to_kernel(-11) // SIGSEGV - never returns
         }
         esr::EC_INST_ABORT_LOWER => {
-            let far: u64;
-            unsafe {
-                core::arch::asm!("mrs {}, far_el1", out(reg) far);
-            }
+            // `far` is the entry snapshot (see rust_sync_el0_handler).
             let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
             let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
             #[cfg(kernel_smp_shared)]
@@ -3618,16 +3678,13 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame) -> u64 {
             akuma_exec::process::return_to_kernel(-5) // SIGTRAP
         }
         _ => {
-            // Capture additional state for debugging
-            let elr: u64;
-            let far: u64;
-            let spsr: u64;
+            // Capture additional state for debugging. ELR/SPSR from the trap
+            // frame and FAR from the entry snapshot — the live registers may
+            // belong to a later trap (see rust_sync_el0_handler).
+            let (elr, spsr) = unsafe { ((*frame).elr_el1, (*frame).spsr_el1) };
             let ttbr0: u64;
             let sp: u64;
             unsafe {
-                core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
-                core::arch::asm!("mrs {}, far_el1", out(reg) far);
-                core::arch::asm!("mrs {}, spsr_el1", out(reg) spsr);
                 core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
                 core::arch::asm!("mov {}, sp", out(reg) sp);
             }

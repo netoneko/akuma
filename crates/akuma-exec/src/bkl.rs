@@ -45,29 +45,53 @@ pub fn current_core_id() -> u32 {
 /// Acquire the BKL for this core — call on entering kernel code from EL0. Spins if
 /// another core holds it; idempotent if this core already does. No-op unless
 /// `cfg(kernel_smp_shared)`.
+///
+/// IRQs are masked around the `current_core_id()` read AND the lock operation. The
+/// syscall path calls this with IRQs enabled, so without the mask a preemption between
+/// reading MPIDR and acting on the lock can MIGRATE this thread to another core — the
+/// lock op then runs with a stale core identity. That breaks both directions: a stale
+/// `me` skips the reentrant fast path (the thread takes a ticket and spins IRQ-masked
+/// on a core whose own hold it can never see — the SMP=4 hard wedge with `owner`
+/// frozen nonzero, all cores parked in `acquire`, 0 RECOVERED; lldb-confirmed
+/// 2026-07-22: a spinner on CPU3 with `me=2` in its registers), and a stale-`me`
+/// `release` CAS silently no-ops (the long-standing ticket-leak family — `owner`/
+/// `now_serving` drift the self-heal papers over).
 #[cfg(all(kernel_smp_shared, target_os = "none"))]
 #[inline]
 pub fn enter_kernel() {
+    let daif = crate::sync::irq_save_mask();
     KERNEL_LOCK.acquire(current_core_id());
+    crate::sync::irq_restore(daif);
 }
 
 /// Release the BKL for this core — call on returning to EL0. Idempotent if this core
 /// does not hold it. No-op unless `cfg(kernel_smp_shared)`.
+///
+/// Masked for the same migration-atomicity reason as [`enter_kernel`]: releasing with
+/// a stale core id is a silent CAS no-op that leaks the hold.
 #[cfg(all(kernel_smp_shared, target_os = "none"))]
 #[inline]
 pub fn leave_kernel() {
+    let daif = crate::sync::irq_save_mask();
     KERNEL_LOCK.release(current_core_id());
+    crate::sync::irq_restore(daif);
 }
 
 /// Reconcile the BKL to the EL this core is about to `eret` into, given the SPSR that
 /// will be restored: `SPSR.M[3:0] == 0` means EL0 (release), otherwise EL1 (acquire).
 /// This is the operation the context-switch path uses in M2. No-op unless
 /// `cfg(kernel_smp_shared)`.
+///
+/// Callers are IRQ epilogues (already masked), but mask anyway so the core-id read
+/// stays migration-atomic with the lock op no matter the calling context (see
+/// [`enter_kernel`]).
 #[cfg(all(kernel_smp_shared, target_os = "none"))]
 #[inline]
 pub fn reconcile_for_spsr(spsr: u64) {
     let target_is_el0 = (spsr & 0xf) == 0;
+    let daif = crate::sync::irq_save_mask();
     KERNEL_LOCK.reconcile(current_core_id(), target_is_el0);
+    crate::sync::irq_restore(daif);
 }
 
 /// `true` if this core currently holds the BKL. For assertions / diagnostics.

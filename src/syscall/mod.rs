@@ -654,7 +654,20 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     let result = match rump_result {
         Some(r) => r,
         None => match syscall_num {
-        nr::EXIT => proc::sys_exit(args[0] as i32),
+        // exit/exit_group must NEVER return to EL0. sys_exit/sys_exit_group
+        // normally park the calling thread, but fall through (returning the
+        // exit code!) when `current_process()` is already None — e.g. a
+        // CLONE_VM sibling still running on another core after its group's
+        // teardown unregistered the process (SMP forktest SIGTERM deadline).
+        // Go's runtime deliberately crashes (`str xzr,[x0]`, x0=0) when exit
+        // returns — the WILD-DA FAR=0x0 ELR=runtime.fatalthrow noise.
+        // return_to_kernel handles the process-already-gone case and parks
+        // the thread.
+        nr::EXIT => {
+            let code = args[0] as i32;
+            proc::sys_exit(code);
+            akuma_exec::process::return_to_kernel(code)
+        }
         nr::READ => fs::sys_read(args[0], args[1], args[2] as usize),
         nr::WRITE => fs::sys_write(args[0], args[1], args[2] as usize),
         nr::READV => fs::sys_readv(args[0], args[1], args[2] as usize),
@@ -779,7 +792,12 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(feature = "sc-containers")]
         nr::REATTACH => container::sys_reattach(args[0] as u32),
         nr::SET_TID_ADDRESS => proc::sys_set_tid_address(args[0]),
-        nr::EXIT_GROUP => proc::sys_exit_group(args[0] as i32),
+        // Same never-return contract as nr::EXIT above.
+        nr::EXIT_GROUP => {
+            let code = args[0] as i32;
+            proc::sys_exit_group(code);
+            akuma_exec::process::return_to_kernel(code)
+        }
         nr::RT_SIGPROCMASK => signal::sys_rt_sigprocmask(args[0] as u32, args[1], args[2], args[3] as usize),
         nr::RT_SIGSUSPEND => signal::sys_rt_sigsuspend(args[0], args[1] as usize),
         nr::RT_SIGTIMEDWAIT => signal::sys_rt_sigtimedwait(args[0], args[1], args[2], args[3] as usize),

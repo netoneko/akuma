@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 /// tests have no local IRQs).
 #[cfg(target_os = "none")]
 #[inline(always)]
-fn irq_save_mask() -> u64 {
+pub(crate) fn irq_save_mask() -> u64 {
     let daif: u64;
     // SAFETY: reading DAIF and setting the IRQ mask bit have no memory effects.
     unsafe {
@@ -25,20 +25,20 @@ fn irq_save_mask() -> u64 {
 /// Restore `DAIF` saved by [`irq_save_mask`]. Bare-metal AArch64 only; no-op on host.
 #[cfg(target_os = "none")]
 #[inline(always)]
-fn irq_restore(daif: u64) {
+pub(crate) fn irq_restore(daif: u64) {
     // SAFETY: restoring the previously-saved DAIF; no memory effects.
     unsafe { core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack)) };
 }
 
 #[cfg(not(target_os = "none"))]
 #[inline(always)]
-fn irq_save_mask() -> u64 {
+pub(crate) fn irq_save_mask() -> u64 {
     0
 }
 
 #[cfg(not(target_os = "none"))]
 #[inline(always)]
-fn irq_restore(_daif: u64) {}
+pub(crate) fn irq_restore(_daif: u64) {}
 
 /// Total Big-Kernel-Lock spin iterations across all contended [`KernelLock::acquire`]
 /// calls — a cross-core BKL-wait-time proxy for A/B measurement (e.g. does dropping the
