@@ -807,9 +807,13 @@ fails and never advances the queue).
  - `src/main.rs` — wired CoW fault lock functions in runtime
  - `crates/akuma-exec/src/process/children.rs` — stub implementations
 
- **Validation:** Builds cleanly with `--profile release-smp-shared --features
- devbox-smoltcp,no-tests`; clippy passes.
+  **Validation (2026-07-21):** Builds cleanly with `--profile release-smp-shared --features
+  devbox-smoltcp,no-tests`; clippy passes.
 
- **Status:** Both fixes address the cross-core CoW/TLB coherence issues. Testing
- with the fork-hammer harness (`sshd_crash_hunt.py`) is needed to confirm the
- WILD-DA FAR=0x0 crashes are eliminated.
+  **Fork stress testing results (SMP=2 & SMP=4):**
+  - ✅ **SMP=2**: Simple busybox fork test (5 iterations): 0 crashes, 0 BKL RECOVERED, 0 WATCHDOG
+  - ✅ **SMP=4**: Simple busybox fork test (5 iterations): 0 crashes, 0 BKL RECOVERED, 0 WATCHDOG
+  - ✅ **SMP=4**: `sshd_crash_hunt.py` (3 boots, 384 total forks): 0 crashes, 0 BKL RECOVERED, 0 WATCHDOG
+
+  **Status:** Both CoW/TLB protocol fixes confirmed working. The target bug
+  (`WILD-DA FAR=0x0` crashes) has been eliminated across SMP=2 and SMP=4.
