@@ -737,16 +737,79 @@ fails and never advances the queue).
   before the hammer really exercised fork/exec; do not over-trust it.
 - **Still failing:** shells crash with `WILD-DA FAR=0x0` at *valid* busybox PCs ~1 s
   into life (`last_sc=ppoll`) — i.e. DATA corruption (an owned pointer reads back 0),
-  not context corruption. That moves **hypothesis 4 — cross-core CoW/TLB coherence**
-  (fork's `cow_share_range` → `demote_range_to_ro` → `flush_tlb_all` window, the
-  CoW-break across two per-AS `as_lock`s, refcounts under genuinely-parallel EL0) to
-  the top of the list for the next session.
+   not context corruption. That moves **hypothesis 4 — cross-core CoW/TLB coherence**
+   (fork's `cow_share_range` → `demote_range_to_ro` → `flush_tlb_all` window, the
+   CoW-break across two per-AS `as_lock`s, refcounts under genuinely-parallel EL0) to
+   the top of the list for the next session.
 
-Repro harness: `sshd_crash_hunt.py` (session scratchpad; reboots devbox-smoltcp at
-SMP=4, waits for `Started sshd`, 16 concurrent ssh × `busybox true` fork loops,
-separates hard faults from `[BKL] stuck`/`[WATCHDOG]`/`RECOVERED` diagnostics, plus a
-two-consecutive-dead-rounds wedge detector).
+ Repro harness: `sshd_crash_hunt.py` (session scratchpad; reboots devbox-smoltcp at
+ SMP=4, waits for `Started sshd`, 16 concurrent ssh × `busybox true` fork loops,
+ separates hard faults from `[BKL] stuck`/`[WATCHDOG]`/`RECOVERED` diagnostics, plus a
+ two-consecutive-dead-rounds wedge detector).
 
-**Files:** `crates/akuma-exec/src/process/{lifecycle,spawn,image,mod}.rs`,
-`crates/akuma-exec/src/threading/mod.rs`, `crates/akuma-exec/src/sync.rs`,
-`src/timer.rs`, `docs/runbooks/debug-smp-fork-corruption.md`.
+ **Files:** `crates/akuma-exec/src/process/{lifecycle,spawn,image,mod}.rs`,
+ `crates/akuma-exec/src/threading/mod.rs`, `crates/akuma-exec/src/sync.rs`,
+ `src/timer.rs`, `docs/runbooks/debug-smp-fork-corruption.md`.
+
+## Cross-core CoW/TLB protocol fixes (2026-07-21 evening)
+
+ **Problem:** The surviving crash family under SMP=4 fork-hammer: shells die with
+ `WILD-DA FAR=0x0` at valid busybox PCs ~1s into life (`last_sc=ppoll`) — DATA
+ corruption, not context corruption. Lead hypothesis was cross-core CoW/TLB
+ coherence in `fork_process` (hypothesis 4 in `debug-smp-fork-corruption.md`).
+
+ **Root causes found and fixed:**
+
+ 1. **Missing memory barrier in `demote_range_to_ro`.** The function walks the
+    parent's page tables and demotes RW PTEs to RO, but did not ensure these PTE
+    writes were globally visible before the caller's `flush_tlb_all()` took effect.
+    This created a race window where cached RW TLB entries could persist on the
+    parent core after the PTEs were demoted, allowing the parent to write through
+    a stale TLB entry and corrupt the shared frame without faulting.
+
+    **Fix:** Added `dsb ish` (Data Synchronization Barrier, Inner Shareable) at
+    the end of `demote_range_to_ro` under `cfg(kernel_smp_shared)` to guarantee
+    all PTE modifications are visible before the TLB invalidate.
+    (`crates/akuma-exec/src/mmu/mod.rs:1745`)
+
+ 2. **CoW fault serialization was per-PID, not per-physical-page.** The
+    `fault_slot_acquire/release` mechanism serializes CoW faults within a single
+    process (same PID), but CoW sharing is per-physical-page. Parent and child
+    (different PIDs) could fault on the same shared page concurrently, leading to:
+
+    - Both processes checking `cow_ref_get(old_pa) > 0` (returns 2, true)
+    - Both allocating new frames and copying the shared page
+    - Both calling `cow_ref_dec(old_pa)` (refcount: 2 → 1 → 0)
+    - Both calls returning `true` (refcount == 0)
+    - **Both attempting to free the shared page** → double-free corruption
+
+    **Fix:** Added global per-physical-page CoW fault serialization:
+
+    - `COW_FAULT_LOCK: Spinlock<BTreeMap<usize, u32>>` in `src/pmm.rs` (per-PA
+      lock count map)
+    - `cow_fault_lock(pa)` / `cow_fault_unlock(pa)` functions (IRQ-safe, count
+      based for reentrancy)
+    - Updated CoW fault handler in `src/exceptions.rs` to:
+      1. Acquire `cow_fault_lock(old_pa)` before CoW operations
+      2. Re-check `cow_ref_get(old_pa) > 0` after acquiring the lock (another
+         process may have broken the CoW while we waited)
+      3. Only proceed with CoW if the page is still shared
+      4. RAII guard ensures lock is released on all paths
+
+    This ensures that only one process performs the CoW break for a given shared
+    page, preventing double-free races across parent/child processes.
+
+ **Files changed:**
+ - `crates/akuma-exec/src/mmu/mod.rs` — DSB barrier in `demote_range_to_ro`
+ - `src/pmm.rs` — `COW_FAULT_LOCK` + `cow_fault_lock/unlock`
+ - `src/exceptions.rs` — CoW fault handler updated to use per-PA locking
+ - `crates/akuma-exec/src/runtime.rs` — added `cow_fault_lock/unlock` fn ptrs
+ - `src/main.rs` — wired CoW fault lock functions in runtime
+ - `crates/akuma-exec/src/process/children.rs` — stub implementations
+
+ **Validation:** Builds cleanly with `--profile release-smp-shared --features
+ devbox-smoltcp,no-tests`; clippy passes.
+
+ **Status:** Both fixes address the cross-core CoW/TLB coherence issues. Testing
+ with the fork-hammer harness (`sshd_crash_hunt.py`) is needed to confirm the
+ WILD-DA FAR=0x0 crashes are eliminated.

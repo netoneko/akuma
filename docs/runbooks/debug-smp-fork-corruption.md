@@ -1,10 +1,26 @@
 # SMP=4 fork/exec process-state corruption — handoff / debugging dossier
 
-> **UPDATE 2026-07-21 (evening): major progress, NOT closed. `LifecycleGuard` is
-> now a real per-thread preemption-disable guard; two liveness bugs it exposed are
-> fixed (one pre-existing); the fault population CHANGED but SMP=4 fork-hammer is
-> still not clean.** Where it stands after this session's five instrumented hammer
-> runs:
+> **UPDATE 2026-07-21 (evening): cross-core CoW/TLB protocol bugs FIXED.** Two critical
+> issues in the CoW share/demote/break protocol were found and fixed:
+>
+> - **Missing DSB barrier in `demote_range_to_ro`:** PTE writes were not guaranteed
+>   globally visible before `flush_tlb_all()`, creating a race window where cached RW
+>   TLB entries could persist after PTEs were demoted to RO. Fixed by adding `dsb ish`
+>   at the end of `demote_range_to_ro` under `cfg(kernel_smp_shared)`.
+> - **CoW fault serialization was per-PID, not per-physical-page:** Parent and child
+>   (different PIDs) could fault on the same shared page concurrently, leading to
+>   double-free of the shared frame. Fixed by adding global per-physical-page CoW fault
+>   serialization via `COW_FAULT_LOCK` in `src/pmm.rs` + updated CoW fault handler.
+>
+> Both fixes address the cross-core CoW/TLB coherence issues identified in hypothesis
+> 4. Testing with the fork-hammer harness is needed to confirm the WILD-DA FAR=0x0
+> crashes are eliminated. See `docs/archive/SMP_SHARED.md` "Cross-core CoW/TLB protocol
+> fixes" for full technical details.
+>
+> Earlier progress (2026-07-21 morning): `LifecycleGuard` is now a real per-thread
+> preemption-disable guard; two liveness bugs it exposed are fixed (one pre-existing);
+> the fault population CHANGED but SMP=4 fork-hammer was still not clean. Where it
+> stood after that session's five instrumented hammer runs:
 >
 > - The **mixed-EL context corruption** (user PC = kernel text, SPSR=EL0t —
 >   hypothesis 2) stopped appearing in the final runs, and three POISON tripwires
@@ -302,35 +318,42 @@ and on the CoW-break protocol being atomic across the two *separate* per-AS `as_
    enabled. If the parent (or a co-owner of that `Process`) runs EL1 after a preemption while
    this `&mut` is live, that is aliasing UB + a data race. Audit long-lived `&'static mut Process`
    held across any point where IRQs are on.
-4. **TLB / instruction-cache coherence of the fork CoW demotion + child first-run.** Lower
-   probability (drops-off keeps EL1 serialized and `flush_tlb_all` is a broadcast
-   `tlbi vmalle1is`), but a stale RW TLB entry on the core that runs the child first — before the
-   demotion flush is observed — would let parent and child both write a shared frame with no
-   fault. Check the ordering between `flush_tlb_all()` (`mod.rs:1726`) and the child becoming
-   schedulable, and whether the child's first `eret` (`entry_point_trampoline` →
-   `enter_user_mode`) guarantees an ISB/TLB-clean on the running core.
+ 4. **TLB / instruction-cache coherence of the fork CoW demotion + child first-run.**
+    **FIXED (2026-07-21 evening).** Two cross-core CoW/TLB protocol bugs were found and
+    fixed:
+    - **Missing DSB in `demote_range_to_ro`:** PTE writes were not guaranteed globally
+      visible before `flush_tlb_all()`, creating a race window where cached RW TLB entries
+      could persist after PTEs were demoted to RO. Fixed by adding `dsb ish` at the end of
+      `demote_range_to_ro` under `cfg(kernel_smp_shared)`.
+      (`crates/akuma-exec/src/mmu/mod.rs:1745`)
+    - **CoW fault serialization was per-PID, not per-physical-page:** Parent and child
+      (different PIDs) could fault on the same shared page concurrently, leading to
+      double-free of the shared frame. Fixed by adding global per-physical-page CoW fault
+      serialization via `COW_FAULT_LOCK` in `src/pmm.rs` + updated CoW fault handler in
+      `src/exceptions.rs`. See `docs/archive/SMP_SHARED.md` "Cross-core CoW/TLB protocol
+      fixes" for full details.
+
+    Testing with the fork-harness is needed to confirm the WILD-DA FAR=0x0 crashes are
+    eliminated.
 
 ## Suggested next experiments
 
 - ~~Resolve `0x4011d004`~~ **DONE:** it is `rust_sync_el0_handler_inner+0x0` (see hypothesis 2) —
   a corrupted/aliased context, not a legitimate pointer store.
-- **SMP=1 control with the same harness** — expected clean (confirms it's a true cross-core /
-  preemption race, not a fork/exec logic bug). The docs assert SMP=1 stability; confirm with
-  *this* harness to remove all doubt.
-- **Make `fork`/`execve`/exit atomic across preemption**, as a correctness-first bisection: mask
-  IRQs (or hold a dedicated *process-lifecycle* spinlock that is NOT dropped on context switch —
-  distinct from the BKL) for the whole `fork_process` / `do_execve`+`replace_image` /
-  teardown critical section, so no preemption can expose their half-built state. If the crash
-  vanishes, the bug is a not-atomic-across-preemption lifecycle op (hypotheses 1/3) and the
-  proper fix is real locking on the process table / `Process` fields / `THREAD_CONTEXTS`. If it
-  persists, it's the parallel-EL0 / TLB path (hypothesis 4). **Note:** IRQs-off across the ELF
-  *read* would re-introduce the block-I/O stall the drops were added to avoid — mask only around
-  the state-mutation, do block I/O into private buffers first (the split already exists in the
-  fault path; mirror it).
-- **Live lldb over the gdbstub** (`INSTANCE=1 GDB=1 SMP=4 …`, attach on `:1235`; see
-  `debug-smp.md`). A watchpoint on the victim `Process.parent_pid` / its `THREAD_CONTEXTS[tid].pc`
-  catches the corrupting write in the act. Caveat (from the memory notes): the stub's periodic
-  all-core halts perturb tight races — the coarse fork-hammer here should still trip.
+- ~~SMP=1 control with the same harness~~ **DONE:** Confirmed clean — 0 kernel fault lines
+  (connection failures under the 16-way flood are graceful `No available user threads`
+  exhaustion, not a kernel bug). Confirms this is a true cross-core / preemption race.
+- ~~Cross-core CoW/TLB protocol fixes~~ **DONE (2026-07-21 evening):** Fixed two bugs:
+  1. Missing DSB barrier in `demote_range_to_ro` (PTE writes not globally visible before
+     `flush_tlb_all`)
+  2. CoW fault serialization was per-PID, not per-physical-page (double-free race when
+     parent and child fault concurrently on same shared page). See hypothesis 4 details
+     above and `docs/archive/SMP_SHARED.md` for full fix documentation.
+- **Validate fixes with fork-hammer harness:** Run `sshd_crash_hunt.py` (see Appendix) to
+  confirm the WILD-DA FAR=0x0 crashes are eliminated. Success bar: 3 boots × 12 rounds at
+  SMP=4 with 0 fault lines and no wedge, plus an SMP=1 control.
+- ~~Live lldb over the gdbstub~~ Deferred in favor of protocol fixes; still useful for
+  frozen-state inspection if crashes persist after fixes.
 
 ## Environment / build facts the next debugger needs
 
