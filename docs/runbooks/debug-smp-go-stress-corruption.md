@@ -312,14 +312,40 @@ descheduled) — not necessarily the same leak.
   a spawn burst — the expected coarse-BKL contention, not the freeze. Hunt aid
   retained: `DEADLOCK_THREAD_DUMP_ENABLED` also dumps on the 30 s PSTATS cadence
   in `src/main.rs`.
-- **SMP=4 boot self-test suite wedges (PRE-EXISTING, nondeterministic)**: with
-  AND without this session's changes, the test-enabled suite (`SMP=4 cargo run
-  --profile release-smp-shared --features smp-shared`) wedges mid-suite
-  (`[BKL] stuck: owner=1` storm; the wedge point varies between runs —
-  pthread-conformance tests one run, post-`sa_siginfo` the next; baseline A/B
-  confirmed both wedge). Green at SMP=1. Many suite tests spawn/terminate
-  kernel threads directly — consistent with the terminated-thread lock-leak
-  class above.
+- **SMP=4 boot self-test suite wedges — RESOLVED (2026-07-23, follow-up
+  session).** The "nondeterministic wedge" was two DETERMINISTIC test bugs in
+  sequence, each panicking/halting core 0 mid-suite so the peers' `[BKL]
+  stuck: owner=1` storm buried the real error (hence "the wedge point
+  varies" — it was whichever bug the run reached, and both storms look alike
+  from the log tail). Neither was an SMP race — both reproduced at SMP=1 once
+  the suite actually ran the failing tests (a disk with a >RAM `/models` file
+  un-skips `test_mmap_file_oom_survives`):
+  1. `test_mmap_file_oom_survives` asserted PMM free-count recovery the
+     instant `exec_with_io` returned. Post-exit reclaim is asynchronous by
+     design — `set_exited` fires before `unregister_process`, and a dying
+     thread cannot free its own kernel stack/slot resources (freed at slot
+     recycle by `cleanup_terminated`). Instrumentation showed a 144–321-page
+     deficit that recovers after ONE reap+yield, zero heap claimed-span
+     growth, converging to the same free-count every run: a lag, not a leak.
+     Fix: the test polls (bounded, 500 iterations) before judging.
+  2. `test_kill_thread_group_reaps_futex_blocked_sibling` fabricated a
+     futex-parked sibling from a bare `claim_test_thread_slots` slot forced
+     into WAITING — a state no real thread can be in (WAITING with no saved
+     context). The deferred-kill fix's `request_thread_kill` WAKES parked
+     siblings, so the scheduler dispatched the context-less slot:
+     `[SGI-S FATAL] new_sp=0x0` halt, 4/4 runs, SMP=1..4. Fix: the sibling is
+     now a real initialized thread (`spawn_user_thread_initializing`) whose
+     trampoline performs the boundary dance (`take_thread_kill_request` →
+     `mark_current_terminated`), making the test exercise the deferred-kill
+     wake→schedule→self-terminate flow end-to-end. (Kernel-side hygiene was
+     already sound: `PENDING_KILL` is cleared at slot recycle.)
+
+  After both fixes: suite runs END-TO-END green at SMP=1 and SMP=4 (3/3 runs),
+  0 FATAL / 0 PANIC, only ~55 transient recovered `[BKL] stuck` (the known
+  coarse-BKL contention). Remaining suite failures are the two pre-existing
+  SMP-independent ones: `fs_error_to_errno_mapping` (below) and
+  `stp_xzr_ec15_handler_fires` (QEMU/HVF generates EC=0x25 instead of 0x15 —
+  environment-dependent, also FAILED in old boottest_smp1 logs).
 - Pre-existing suite failure (SMP-independent, also in old full-suite logs):
   `fs_error_to_errno_mapping: PermissionDenied → got -13 (EACCES), expected
   -1 (EPERM)`.

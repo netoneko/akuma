@@ -5292,16 +5292,34 @@ fn test_mmap_file_oom_survives() {
 
             // The dead process's frames must be reclaimed and the kernel must
             // still be able to hand out user pages.
-            let free_after = pmm::free_count();
+            //
+            // Post-exit reclaim is asynchronous by design: the exit notification
+            // (`set_exited`) fires before teardown finishes, and the dying
+            // thread cannot free its own kernel stack / thread-slot resources —
+            // those are reclaimed at slot recycle (`cleanup_terminated`) by a
+            // LATER thread. So sampling `free_count()` the instant
+            // `exec_with_io` returns races that tail reclaim (instrumented
+            // 2026-07-23: a 144–321-page deficit that recovers after one
+            // reap+yield; no heap claimed-span growth; converges to the same
+            // free-count every run — a lag, not a leak). Poll briefly before
+            // judging; a genuine leak still fails after the bound.
+            let mut free_after = pmm::free_count();
+            let mut polls = 0u32;
+            while free_after + pmm::USER_PAGE_RESERVE < free_before && polls < 500 {
+                akuma_exec::threading::cleanup_terminated();
+                akuma_exec::threading::blocking_relax();
+                free_after = pmm::free_count();
+                polls += 1;
+            }
             assert!(free_after + pmm::USER_PAGE_RESERVE >= free_before,
-                "test_mmap_file_oom: PMM not reclaimed after kill: before={free_before} after={free_after}");
+                "test_mmap_file_oom: PMM not reclaimed after kill (waited {polls} polls): before={free_before} after={free_after}");
             let f = pmm::alloc_page_zeroed_user()
                 .expect("test_mmap_file_oom: user alloc must work after the OOM kill");
             pmm::free_page(f);
 
             crate::safe_print!(160,
-                "  [PASS] test_mmap_file_oom_survives: exit {} as expected, kernel alive, free {} -> {} pages\n",
-                exit_code, free_before, free_after);
+                "  [PASS] test_mmap_file_oom_survives: exit {} as expected, kernel alive, free {} -> {} pages ({} reclaim polls)\n",
+                exit_code, free_before, free_after, polls);
         }
         Err(e) => {
             // Missing binary or spawn failure — don't fail the suite, just report.
@@ -6088,18 +6106,33 @@ fn test_kill_thread_group_reaps_futex_blocked_sibling() {
         register_thread_pid, unregister_thread_pid};
     use akuma_exec::threading;
 
+    /// What a REAL woken futex-waiter does at its EL1→EL0 boundary under
+    /// deferred kill (`cfg(kernel_smp_shared)`): consume the pending kill
+    /// request and self-terminate. Under non-smp-shared builds
+    /// `kill_thread_group` PHASE 1 hard-marks the sibling TERMINATED, so this
+    /// never runs. The sibling must be a real initialized thread (valid stack
+    /// and context): `request_thread_kill` WAKES a parked sibling, so a bare
+    /// claimed slot fabricated into WAITING gets dispatched with context sp=0,
+    /// which is the scheduler's `[SGI-S FATAL] new_sp=0` halt (seen 4/4 suite
+    /// runs at SMP=1..4 on 2026-07-23).
+    extern "C" fn futex_sibling_boundary_trampoline() -> ! {
+        let _ = akuma_exec::threading::take_thread_kill_request();
+        akuma_exec::threading::mark_current_terminated();
+        loop { akuma_exec::threading::yield_now(); }
+    }
+
     let leader_pid = 60_120;
     let leader_proc = make_test_process(leader_pid);
     let l0 = leader_proc.address_space.l0_phys();
     register_process(leader_pid, leader_proc);
 
-    let claimed = threading::claim_test_thread_slots(1);
-    if claimed.len() != 1 {
+    let Ok(sib_tid) = threading::spawn_user_thread_initializing(
+        futex_sibling_boundary_trampoline, core::ptr::null_mut(), false)
+    else {
         unregister_process(leader_pid);
         console::print("[Test] kill_thread_group_reaps_futex_blocked_sibling SKIPPED (no free slot)\n");
         return;
-    }
-    let sib_tid = claimed[0];
+    };
 
     // A CLONE_THREAD sibling: same tgid as the leader, sharing its address space,
     // with a real thread id — exactly the shape of a rustc rayon worker.
@@ -6119,14 +6152,25 @@ fn test_kill_thread_group_reaps_futex_blocked_sibling() {
     // Leader exits → must reap the whole thread group.
     kill_thread_group(leader_pid, l0, 0);
 
-    let terminated = threading::is_thread_terminated(sib_tid);          // not stuck WAITING
+    // Under deferred kill the sibling self-terminates at its boundary; the
+    // grace-wait exits once the request is consumed, which can be an instant
+    // before the sibling's own TERMINATED store lands — poll briefly.
+    let mut terminated = threading::is_thread_terminated(sib_tid);      // not stuck WAITING
+    let mut polls = 0;
+    while !terminated && polls < 100 {
+        threading::blocking_relax();
+        terminated = threading::is_thread_terminated(sib_tid);
+        polls += 1;
+    }
     let unregistered = akuma_exec::process::lookup_process(sib_pid).is_none(); // auto-reaped
 
-    // Cleanup
+    // Cleanup. The sibling may have really RUN (smp-shared boundary path), so
+    // recycle it via cleanup_terminated (safe: skips a still-current thread)
+    // rather than force-storing its slot FREE.
     unregister_thread_pid(sib_tid);
     unregister_process(leader_pid);
     let _ = unregister_process(sib_pid);
-    threading::release_test_thread_slot(sib_tid);
+    threading::cleanup_terminated();
 
     if terminated && unregistered {
         console::print("[Test] kill_thread_group_reaps_futex_blocked_sibling PASSED\n");
