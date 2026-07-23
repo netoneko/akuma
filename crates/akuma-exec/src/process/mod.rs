@@ -840,14 +840,72 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
         if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
     }
 
-    // PHASE 1: Mark ALL sibling threads as TERMINATED first.
-    // This prevents them from running and acquiring locks while we clean up.
-    // Without this, a sibling could be scheduled between our lock operations,
-    // try to acquire PROCESS_CHANNELS or other locks, and cause a deadlock
-    // when we later try to acquire the same lock.
-    for (_sib_pid, sib_tid) in &siblings {
-        if let Some(tid) = sib_tid {
-            crate::threading::mark_thread_terminated(*tid);
+    // PHASE 1: prevent siblings from running further kernel work.
+    //
+    // Real shared-kernel SMP: a sibling preempted mid-EL1 may hold kernel
+    // spinlocks (e.g. BLOCK_DEVICE during a demand-paging disk read). Hard-
+    // marking it TERMINATED strands those locks forever — every later disk-
+    // dependent path spins (the sshd "freeze"; lldb-confirmed 2026-07-22).
+    // Instead post a deferred-kill request: the sibling stays schedulable,
+    // finishes its critical section, releases every lock, and self-terminates
+    // at its EL1→EL0 boundary (take_thread_kill_request, checked in
+    // rust_sync_el0_handler). We then grace-wait for all siblings to reach
+    // TERMINATED before PHASE 2 cleanup, so the sibling can't touch its
+    // Process/fds while we tear them down.
+    //
+    // Single-core / non-SMP: the caller is the only EL1 thread, so no sibling
+    // can be mid-critical-section; the direct mark is safe and the default
+    // build stays byte-for-byte unchanged.
+    #[cfg(kernel_smp_shared)]
+    {
+        for (_sib_pid, sib_tid) in &siblings {
+            if let Some(tid) = sib_tid {
+                crate::threading::request_thread_kill(*tid);
+            }
+        }
+        // Grace-wait: yield (dropping the BKL under smp-shared) so preempted
+        // siblings can run to their boundary and self-terminate. Bounded by a
+        // timeout; a sibling stuck in a non-yielding EL1 loop (a separate bug)
+        // is hard-terminated as a last resort — the lock may leak, but that is
+        // strictly better than hanging the caller's exit_group forever.
+        const KILL_GRACE_US: u64 = 2_000_000; // 2 s
+        let started = (crate::runtime::runtime().uptime_us)();
+        loop {
+            let all_done = siblings.iter().all(|(_, t)| {
+                t.is_none_or(|tid| {
+                    // Done once the sibling consumed the request (it is between
+                    // take and mark, or already TERMINATED) OR its slot is
+                    // gone (TERMINATED/FREE, incl. scheduler recycling).
+                    crate::threading::is_thread_terminated(tid)
+                        || !crate::threading::has_pending_kill(tid)
+                })
+            });
+            if all_done { break; }
+            if (crate::runtime::runtime().uptime_us)() - started > KILL_GRACE_US {
+                let stragglers = siblings.iter()
+                    .filter(|(_, t)| t.is_some_and(|tid| crate::threading::has_pending_kill(tid)))
+                    .count();
+                log::warn!(
+                    "[ktg] pid={}: grace expired, hard-terminating {} straggler(s)",
+                    my_pid, stragglers);
+                for (_, t) in &siblings {
+                    if let Some(tid) = t {
+                        crate::threading::mark_thread_terminated(*tid);
+                    }
+                }
+                break;
+            }
+            crate::threading::blocking_relax();
+        }
+    }
+    #[cfg(not(kernel_smp_shared))]
+    {
+        // PHASE 1 (single-core): mark ALL sibling threads TERMINATED. The
+        // caller is the sole EL1 thread, so none can be mid-critical-section.
+        for (_sib_pid, sib_tid) in &siblings {
+            if let Some(tid) = sib_tid {
+                crate::threading::mark_thread_terminated(*tid);
+            }
         }
     }
 
@@ -883,7 +941,8 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
             with_irqs_disabled(|| {
                 THREAD_PID_MAP.lock().remove(tid);
             });
-            // Already marked terminated in phase 1
+            // Already marked terminated in phase 1 (or self-terminated at the
+            // boundary under smp-shared); wake in case it is still parked.
             crate::threading::get_waker_for_thread(*tid).wake();
         }
     }

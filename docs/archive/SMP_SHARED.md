@@ -924,3 +924,54 @@ in full. Summary:
   wedge (baseline A/B confirmed it predates these fixes; suite green at
   SMP=1). Also: `userspace/sshd` never sends SSH_MSG_CHANNEL_EXIT_STATUS so
   `ssh` always exits 255 — gates must grade in-band.
+
+---
+
+## Deferred sibling kill at the EL1→EL0 boundary (2026-07-23)
+
+Resolved the "terminated-thread lock leak" open item above. Under
+`cfg(kernel_smp_shared)`, `kill_thread_group` PHASE 1 (`process/mod.rs`) no
+longer calls `mark_thread_terminated` on sibling tids — which stranded any
+spinlock a sibling held when preempted mid-EL1 (the lldb-confirmed sshd
+"freeze": a forktest child died holding `BLOCK_DEVICE`, so every later disk
+I/O spun). Instead:
+
+1. **Post a per-thread pending-kill** (`threading::request_thread_kill`): arms a
+   `PENDING_KILL[tid]` flag and wakes the sibling if parked. The sibling stays
+   schedulable (NOT TERMINATED), so it can finish its critical section.
+2. **Grace-wait**: the caller (`sys_exit_group`) yields via `blocking_relax`
+   (which drops the BKL under smp-shared) so a preempted sibling on a peer core
+   can run. It loops until every sibling has either consumed the request or is
+   `TERMINATED`/`FREE`. A 2 s grace bounds it; a sibling stuck in a non-yielding
+   EL1 loop (a separate bug) is hard-terminated as a last resort.
+3. **Self-terminate at the boundary**: the BKL wrapper `rust_sync_el0_handler`
+   (`src/exceptions.rs`) checks `threading::take_thread_kill_request` after the
+   syscall/fault inner handler returns — the point where the call stack has
+   unwound and released every kernel lock. If pending, the thread does
+   `mark_thread_terminated` + `yield_now` loop (the proven `sys_exit` pattern;
+   the BKL is reconciled on switch-out). It never reaches `eret`, so a sibling
+   can never return to EL0 with half-cleaned-up group state.
+4. **PHASE 2 cleanup** runs only after all siblings are confirmed dead, so none
+   can touch its `Process`/fds while they're torn down.
+
+Single-core / non-smp-shared builds keep the direct `mark_thread_terminated` in
+PHASE 1 (safe: the caller is the sole EL1 thread, so no sibling can be
+mid-critical-section) — the default build is byte-for-byte unchanged. The BKL is
+the key enabler: it guarantees no two cores run EL1 at the same instant, so the
+caller's PHASE-1/2 and a sibling's boundary self-terminate are mutually
+exclusive — no fine-grained lock is needed around the pending-kill flag itself.
+
+Host unit tests (`threading::pending_kill_tests`: request/take/independence/
+idle-guard) + kernel self-test (`test_deferred_kill_does_not_strand_locks`:
+armed ⇒ pending but still schedulable; take clears exactly once). 125→128 host
+tests; clippy clean both configs.
+
+**Validation (2026-07-23, SMP=4 devbox-smoltcp):** 15/15 forktest
+`-combined_stress` runs clean (old freeze onset was run 8), 8/8 concurrent
+busybox fork-hammer clean, sshd responsive throughout and after. Log: 0
+SPURIOUS-SVC / WILD-DA / SIGSEGV / `[BKL] RECOVERED` / `[WATCHDOG]` / "grace
+expired" (the grace-wait never hit the 2 s timeout — siblings self-terminate
+promptly). One transient `[BKL] stuck` (250 ms, recovered) during a spawn
+burst — expected coarse-BKL contention, not the freeze. The PRE-EXISTING
+nondeterministic SMP=4 boot-suite wedge was not re-tested (suite is a separate
+gate; this validation used `no-tests`).

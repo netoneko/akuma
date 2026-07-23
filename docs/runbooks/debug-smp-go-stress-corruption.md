@@ -271,27 +271,47 @@ descheduled) — not necessarily the same leak.
 
 ### Still open
 
-- **Terminated-thread lock leak — the sshd "freeze" root cause (lldb + THR-DUMP
-  confirmed, NOT yet fixed)**. After the BKL fix, 7/7 stress runs passed and
-  then run 8's ssh hung: sshd (single-threaded cooperative multiplexer,
-  `userspace/sshd`) was parked in syscall 301 (`SPAWN`) forever while the
-  kernel stayed healthy. lldb: its core executing
+- **Terminated-thread lock leak — the sshd "freeze" root cause: FIXED
+  (deferred kill at the EL1→EL0 boundary).** After the BKL fix, 7/7 stress runs
+  passed and then run 8's ssh hung: sshd (single-threaded cooperative
+  multiplexer, `userspace/sshd`) was parked in syscall 301 (`SPAWN`) forever
+  while the kernel stayed healthy. lldb: its core executing
   `spawn_process_with_channel_ext → resolve_symlinks → ext2 read_inode →
   block::read_bytes`, PC at the `isb; ldrb; cbnz` spin loop of
   **`BLOCK_DEVICE.lock()`** (`src/block.rs` `Spinlock`). All forktest threads
   were already recycled ⇒ a stress-run child thread died holding the
   block-device spinlock. Mechanism: `kill_thread_group` PHASE 1
-  (`process/mod.rs`) marks sibling threads TERMINATED unconditionally — a
+  (`process/mod.rs`) marked sibling threads TERMINATED unconditionally — a
   sibling parked mid-EL1 (cooperative disk wait during demand paging, holding
-  `BLOCK_DEVICE`) never runs again, so the lock leaks and every later
-  disk-dependent path (sshd's next spawn) spins forever. Network/timers stay
-  fine; only disk I/O is dead — hence "sshd freeze". **Fix direction:
-  terminate only at safe points** — a thread inside an EL1 kernel excursion
-  gets a *pending* kill that fires at its next kernel-exit boundary (or is
-  woken to unwind), never a hard TERMINATED while it may hold kernel locks.
-  Hunt aid added meanwhile: `DEADLOCK_THREAD_DUMP_ENABLED` also dumps on the
-  30 s PSTATS cadence in `src/main.rs` (the Thread-0 heartbeat trigger fires
-  ~never under `idle_halt`).
+  `BLOCK_DEVICE`) never ran again, so the lock leaked and every later
+  disk-dependent path (sshd's next spawn) spun forever.
+
+  **Fix (deferred kill):** under `cfg(kernel_smp_shared)`, `kill_thread_group`
+  PHASE 1 no longer hard-marks siblings `TERMINATED`. It posts a per-thread
+  pending-kill flag (`threading::request_thread_kill`) and leaves the sibling
+  schedulable, then grace-waits (yielding, which drops the BKL under smp-shared)
+  for every sibling to reach `TERMINATED`. Each sibling runs to its next
+  **EL1→EL0 boundary** — the point in `rust_sync_el0_handler` (the BKL wrapper)
+  where the syscall/fault call stack has unwound and released every kernel lock —
+  sees the flag (`threading::take_thread_kill_request`), and self-terminates
+  there (`mark_thread_terminated` + yield loop; the proven `sys_exit` pattern).
+  Only then does PHASE 2 clean up fds/channels/unregister. A 2 s grace bounds
+  the wait; a sibling stuck in a non-yielding EL1 loop (a separate bug) is
+  hard-terminated as a last resort. Single-core / non-smp-shared builds keep the
+  direct `mark_thread_terminated` (safe: the caller is the sole EL1 thread), so
+  the default build is byte-for-byte unchanged. Host unit tests
+  (`threading::pending_kill_tests`) + kernel self-test
+  (`test_deferred_kill_does_not_strand_locks`) guard the primitive.
+
+  **Validated (2026-07-23, SMP=4 devbox-smoltcp):** 15/15 forktest
+  `-combined_stress` runs clean (old freeze onset was run 8), 8/8 concurrent
+  busybox fork-hammer clean, sshd responsive throughout and after. Log: 0
+  SPURIOUS-SVC, 0 WILD-DA, 0 SIGSEGV, 0 `[BKL] RECOVERED`, 0 `[WATCHDOG]`,
+  0 "grace expired" (siblings self-terminate promptly — the grace-wait never
+  hit the 2 s timeout). One transient `[BKL] stuck` (250 ms, recovered) during
+  a spawn burst — the expected coarse-BKL contention, not the freeze. Hunt aid
+  retained: `DEADLOCK_THREAD_DUMP_ENABLED` also dumps on the 30 s PSTATS cadence
+  in `src/main.rs`.
 - **SMP=4 boot self-test suite wedges (PRE-EXISTING, nondeterministic)**: with
   AND without this session's changes, the test-enabled suite (`SMP=4 cargo run
   --profile release-smp-shared --features smp-shared`) wedges mid-suite

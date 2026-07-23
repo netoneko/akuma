@@ -503,6 +503,22 @@ static THREAD_RESTORE_SIGMASK_PENDING: [AtomicBool; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
+/// Per-thread deferred-kill request (real shared-kernel SMP).
+///
+/// Set by [`request_thread_kill`] when a peer core's `kill_thread_group` wants
+/// this thread dead. The thread self-terminates at its next EL1→EL0 boundary
+/// ([`take_thread_kill_request`], checked in the sync-EL0 exception wrapper),
+/// AFTER every kernel lock held by the unwound call stack has been released —
+/// never while it may hold a spinlock. Hard-marking a sibling `TERMINATED`
+/// while it was preempted mid-critical-section (e.g. holding `BLOCK_DEVICE`
+/// during a demand-paging disk read) stranded the lock forever, freezing every
+/// later disk-dependent path (the sshd "freeze"; see
+/// `docs/runbooks/debug-smp-go-stress-corruption.md`).
+static PENDING_KILL: [AtomicBool; MAX_THREADS] = {
+    const INIT: AtomicBool = AtomicBool::new(false);
+    [INIT; MAX_THREADS]
+};
+
 /// Arm the restore-sigmask for the current thread: the next delivered signal's
 /// frame saves `saved` as `uc_sigmask` (so `sigreturn` restores it).
 pub fn set_restore_sigmask(saved: u64) {
@@ -641,6 +657,48 @@ pub fn mark_thread_terminated(idx: usize) {
         TERMINATION_TIME[idx].store((runtime().uptime_us)(), Ordering::SeqCst);
         THREAD_STATES[idx].store(thread_state::TERMINATED, Ordering::SeqCst);
     }
+}
+
+/// Request that thread `tid` terminate itself at its next kernel-exit boundary
+/// (real shared-kernel SMP). The thread is NOT marked `TERMINATED` here — it
+/// stays schedulable so it can finish any in-flight kernel work, release every
+/// held lock, and then self-terminate at the EL1→EL0 boundary
+/// ([`take_thread_kill_request`], checked in the sync-EL0 handler wrapper).
+/// Hard-terminating a thread preempted mid-critical-section leaks its locks
+/// (the sshd "freeze" root cause).
+///
+/// Wakes the thread if parked so it reaches a boundary promptly. No-op for the
+/// idle thread and out-of-range slots.
+pub fn request_thread_kill(tid: usize) {
+    if tid != IDLE_THREAD_IDX && tid < MAX_THREADS {
+        PENDING_KILL[tid].store(true, Ordering::Release);
+        get_waker_for_thread(tid).wake();
+    }
+}
+
+/// Atomically take (clear) the current thread's deferred-kill request. Returns
+/// `true` if a kill was pending — the caller (the sync-EL0 handler wrapper)
+/// must then self-terminate instead of returning to EL0.
+pub fn take_thread_kill_request() -> bool {
+    take_kill_request_via_tid(get_current_thread_register())
+}
+
+/// Tid-explicit core of [`take_thread_kill_request`]. Also used by host tests
+/// and the kernel self-test (where `current_thread_id()` is always the idle
+/// thread 0 on host, or not the target tid in a runtime self-test).
+pub fn take_kill_request_via_tid(tid: usize) -> bool {
+    if tid < MAX_THREADS {
+        PENDING_KILL[tid].swap(false, Ordering::AcqRel)
+    } else {
+        false
+    }
+}
+
+/// `true` if a deferred-kill request is still pending for `tid` (not yet
+/// consumed by the target reaching its boundary). Used by `kill_thread_group`'s
+/// grace-wait loop to know when a sibling has acted on the request.
+pub fn has_pending_kill(tid: usize) -> bool {
+    tid < MAX_THREADS && PENDING_KILL[tid].load(Ordering::Acquire)
 }
 
 /// Mark a thread as ready (lock-free)
@@ -962,6 +1020,9 @@ fn cleanup_terminated_internal(force: bool) -> usize {
             // triggering signal delivery code in an unexpected context (e.g. /bin/hello
             // which never registered a signal handler), causing an EL1 data abort.
             PENDING_SIGNALS[i].store(0, Ordering::Release);
+            // Clear a stale deferred-kill request so a recycled slot's next occupant
+            // is not wrongly self-terminated at its first EL1→EL0 boundary.
+            PENDING_KILL[i].store(false, Ordering::Release);
             // Reset the per-thread preemption-disable counter. A thread that died with
             // a disable outstanding (e.g. a lifecycle op that never released — see
             // process/lifecycle.rs "No-return callers") must not poison the slot's next
@@ -3791,5 +3852,50 @@ mod signal_mask_tests {
     fn signal_mask_out_of_range_is_zero() {
         assert_eq!(thread_signal_mask_of(MAX_THREADS), 0);
         assert_eq!(thread_signal_mask_of(usize::MAX), 0);
+    }
+}
+
+#[cfg(test)]
+mod pending_kill_tests {
+    use super::*;
+
+    // The deferred-kill flag is per-thread, independent across slots, and
+    // take clears it exactly once (the contract kill_thread_group's grace-wait
+    // relies on). On host `current_thread_id()` is always 0 (the idle thread,
+    // which `request_thread_kill` refuses to arm), so these drive the tid-
+    // explicit `has_pending_kill` / `take_kill_request` core directly.
+
+    #[test]
+    fn request_sets_and_take_clears() {
+        let tid = 42;
+        assert!(!has_pending_kill(tid));
+        // request_thread_kill arms the flag (the wake it fires is a host no-op).
+        request_thread_kill(tid);
+        assert!(has_pending_kill(tid));
+        assert!(take_kill_request_via_tid(tid), "first take must see the pending request");
+        assert!(!has_pending_kill(tid), "flag must be cleared after take");
+        assert!(!take_kill_request_via_tid(tid), "second take must see nothing");
+    }
+
+    #[test]
+    fn flags_are_independent_per_thread() {
+        let (a, b) = (43usize, 44);
+        request_thread_kill(a);
+        request_thread_kill(b);
+        assert!(has_pending_kill(a));
+        assert!(has_pending_kill(b));
+        take_kill_request_via_tid(a);
+        assert!(!has_pending_kill(a), "clearing A must not affect B");
+        assert!(has_pending_kill(b));
+        take_kill_request_via_tid(b); // cleanup
+    }
+
+    #[test]
+    fn idle_thread_and_out_of_range_are_noops() {
+        request_thread_kill(IDLE_THREAD_IDX);
+        assert!(!has_pending_kill(IDLE_THREAD_IDX), "idle thread is never armed");
+        request_thread_kill(MAX_THREADS + 5);
+        assert!(!has_pending_kill(MAX_THREADS + 5));
+        assert!(!take_kill_request_via_tid(MAX_THREADS + 5));
     }
 }

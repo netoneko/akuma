@@ -2151,6 +2151,21 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
     #[cfg(kernel_smp_shared)]
     crate::smp_shared::record_el0_trap();
     let ret = rust_sync_el0_handler_inner(frame, esr, far);
+    // Deferred thread-kill (real shared-kernel SMP): if a peer core's
+    // kill_thread_group posted a kill request for this thread, terminate it
+    // HERE — at the EL1→EL0 boundary, after the unwound syscall/fault call
+    // stack has released every kernel lock — rather than where it was
+    // preempted mid-critical-section (which would leak the locks: the sshd
+    // "freeze"). The thread still holds the BKL at this point (same state as
+    // the sys_exit/sys_exit_group self-termination paths); mark + yield
+    // reconciles the BKL on switch-out. (Never reached for the exit paths,
+    // which don't return from `_inner`.)
+    #[cfg(kernel_smp_shared)]
+    if akuma_exec::threading::take_thread_kill_request() {
+        let tid = akuma_exec::threading::current_thread_id();
+        akuma_exec::threading::mark_thread_terminated(tid);
+        loop { akuma_exec::threading::yield_now(); }
+    }
     akuma_exec::bkl::leave_kernel();
     ret
 }

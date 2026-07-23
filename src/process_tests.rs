@@ -263,6 +263,9 @@ pub fn run_all_tests() {
     test_kill_thread_group_terminates_before_cleanup();
     test_kill_thread_group_no_channel_lock_contention();
 
+    // Deferred kill (smp-shared): pending kill doesn't strand locks
+    test_deferred_kill_does_not_strand_locks();
+
     // exit_group ordering fix (kill siblings before close_all, yield after)
     test_exit_group_kills_siblings_before_close_all();
     test_exit_group_yields_after_killing_siblings();
@@ -6265,6 +6268,61 @@ fn test_kill_thread_group_terminates_before_cleanup() {
     }
 }
 
+/// Verify the deferred-kill primitive that backs `kill_thread_group` PHASE 1
+/// under real shared-kernel SMP (`cfg(kernel_smp_shared)`): a pending kill
+/// arms the flag but leaves the thread schedulable (NOT TERMINATED), and the
+/// boundary check (`take_kill_request`) clears it exactly once.
+///
+/// This is the sshd-"freeze" fix: hard-marking a sibling TERMINATED while it
+/// was preempted mid-critical-section leaked its spinlocks (BLOCK_DEVICE).
+/// Under smp-shared, kill_thread_group posts `request_thread_kill` and the
+/// sibling self-terminates at its EL1→EL0 boundary instead.
+fn test_deferred_kill_does_not_strand_locks() {
+    use akuma_exec::threading::{
+        claim_test_thread_slots, release_test_thread_slot,
+        request_thread_kill, has_pending_kill, take_kill_request_via_tid,
+        mark_thread_terminated, get_thread_state, thread_state,
+    };
+
+    let claimed = claim_test_thread_slots(1);
+    if claimed.is_empty() {
+        console::print("[Test] deferred_kill_does_not_strand_locks SKIPPED: no free slots\n");
+        return;
+    }
+    let tid = claimed[0];
+
+    // Armed ⇒ pending, but still schedulable (the whole point: it must run to
+    // release its locks before dying).
+    request_thread_kill(tid);
+    let pending_after_request = has_pending_kill(tid);
+    let state_after_request = get_thread_state(tid);
+    let still_schedulable = state_after_request != thread_state::TERMINATED
+        && state_after_request != thread_state::FREE;
+
+    // Boundary check consumes the request exactly once.
+    let took_first = take_kill_request_via_tid(tid);
+    let took_second = take_kill_request_via_tid(tid);
+    let pending_after_take = has_pending_kill(tid);
+
+    // Cleanup.
+    mark_thread_terminated(tid);
+    release_test_thread_slot(tid);
+
+    let ok = pending_after_request
+        && still_schedulable
+        && took_first
+        && !took_second
+        && !pending_after_take;
+    if ok {
+        console::print("[Test] deferred_kill_does_not_strand_locks PASSED\n");
+    } else {
+        crate::safe_print!(160,
+            "[Test] deferred_kill_does_not_strand_locks FAILED: pending={} schedulable={} \
+             took1={} took2={} pending_after={}\n",
+            pending_after_request, still_schedulable, took_first, took_second, pending_after_take);
+    }
+}
+
 /// Verify that kill_thread_group doesn't deadlock when acquiring PROCESS_CHANNELS.
 ///
 /// This simulates the scenario where:
@@ -10780,7 +10838,7 @@ fn test_fork_child_context_ttbr0_not_stale() {
     // 4 GB — the old constant 0x1400_0000 was a typo BELOW the RAM base, so
     // this arm failed unconditionally whenever the test ran).
     let child_l0_phys = child_ttbr0 & 0x0000_FFFF_FFFF_F000;
-    if child_l0_phys < 0x4000_0000 || child_l0_phys >= 0x1_4000_0000 {
+    if !(0x4000_0000..0x1_4000_0000).contains(&child_l0_phys) {
         crate::safe_print!(128,
             "[Test] fork_child_ttbr0_not_stale FAILED: child L0 phys {:#x} outside RAM\n",
             child_l0_phys);
