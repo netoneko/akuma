@@ -471,11 +471,13 @@ pub(super) fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
                     for b in &mut stat.name[to_copy..] { *b = 0; }
                 }
             }
-        } else if i == 0 {
-            stat.name[..6].copy_from_slice(b"kernel");
-            for b in &mut stat.name[6..] { *b = 0; }
         } else {
-            for b in &mut stat.name { *b = 0; }
+            // No owning userspace process → it's a kernel thread. Surface its role
+            // (kernel/idle/network/system) instead of leaving the name blank.
+            let kname = akuma_exec::threading::kernel_thread_name(i).as_bytes();
+            let to_copy = kname.len().min(stat.name.len());
+            stat.name[..to_copy].copy_from_slice(&kname[..to_copy]);
+            for b in &mut stat.name[to_copy..] { *b = 0; }
         }
 
         if unsafe { copy_to_user_safe((ptr as usize + i * stat_size) as *mut u8, (&raw const stat).cast::<u8>(), stat_size).is_err() } {

@@ -42,6 +42,16 @@ pub extern "C" fn main() {
     get_cpu_stats(&mut last_stats);
     let mut last_time = uptime();
 
+    // CPU% = Δthread_cpu_time / Δwall_time over the interval between two samples. In the
+    // interactive loop that interval is the ~1s poll wait below. `--once` prints after a
+    // single iteration, so without a pause here the two samples are taken back-to-back
+    // (~microseconds apart) and every thread on-core at that instant reads ~100% (up to
+    // one per core) while everything else reads 0% — a meaningless snapshot. Sleep briefly
+    // so the single-shot percentages reflect real load.
+    if once {
+        sleep_ms(500);
+    }
+
     loop {
         let mut current_stats: [ThreadCpuStat; 64] = [ThreadCpuStat::default(); 64];
         let count = get_cpu_stats(&mut current_stats);

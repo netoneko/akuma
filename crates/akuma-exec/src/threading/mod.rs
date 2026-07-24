@@ -908,6 +908,30 @@ pub fn get_thread_last_core(idx: usize) -> u8 {
     }
 }
 
+/// Role name for a KERNEL thread — one with no owning userspace process — for display
+/// in `top` / cpu stats. Without this such threads (per-core idle, the network poller,
+/// other system threads) show up blank. Lock-free: reads only atomics + `config()`, so
+/// it is safe to call from `sys_get_cpu_stats`, which must not take `POOL.lock` (see the
+/// `USER_COPY_FAULT_HANDLER` note above).
+pub fn kernel_thread_name(idx: usize) -> &'static str {
+    if idx >= MAX_THREADS {
+        return "?";
+    }
+    if idx == 0 {
+        return "kernel";
+    }
+    if IS_IDLE_THREAD[idx].load(Ordering::Relaxed) {
+        return "idle";
+    }
+    if idx == NETWORK_THREAD_ID.load(Ordering::Relaxed) {
+        return "network";
+    }
+    if idx < config().reserved_threads {
+        return "system";
+    }
+    "kernel-thread"
+}
+
 /// Get total CPU time for a thread in microseconds
 pub fn get_thread_cpu_time(idx: usize) -> u64 {
     if idx < MAX_THREADS {

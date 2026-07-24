@@ -456,3 +456,15 @@ Deploy after edits: rebuild herd (`userspace/ cargo build --release -p herd`), c
 **Also open (separate TODO):** forwarded directory listing (`getdents64`) is classified-but-
 unimplemented for secondaries (see the memory note); it's why herd needs `--service`. Proper fix:
 marshal dirents through the bounce in `service_forwarded_syscall`.
+
+**Gotcha — `--service` fallback recursion (fixed 2026-07-24):** `core2herd.conf` has
+`command = /bin/herd`, so it launches a *second* herd. If that child's `--service` files are
+unreadable (e.g. `/srv/core2` was never staged on the disk), `explicit_service_files()` used to
+return `None` and herd fell back to scanning `/etc/herd/enabled/` — which lists `core2herd` again,
+re-launching another `/bin/herd`, and so on: a recursive herd fork-bomb that exhausts the fixed
+user-thread + socket pools (~13 `/bin/herd`, then `No available user threads` for everything,
+including any SSH command). Fix: `explicit_service_files()` now returns `Some(list)` (even empty)
+whenever ANY `--service` flag was passed, so a sub-herd never falls back to the BSP's enabled-dir
+scan. Also moved `core2herd.conf` out of the default `enabled/` into `available/` (it's an
+SMP≥3 + `CORE2_NIC` experiment, not something a plain boot should start). Symptom to recognize:
+repeating `[herd] Warning: cannot read --service …` followed by an ever-growing herd count.

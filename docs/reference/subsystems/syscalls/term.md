@@ -54,7 +54,48 @@ input these consume.
 
 `get_cpu_stats` (314) is dispatched from this file but is unrelated to
 terminals — it's a `/proc`-adjacent debugging syscall (per-thread CPU time,
-state, owning pid/box) that ended up here rather than in its own module.
+state, owning pid/box) that ended up here rather than in its own module. It
+fills a caller-provided array of `ThreadCpuStat` (one per thread slot) and
+returns the count. It powers `userspace/top`.
+
+### `ThreadCpuStat` wire format (48 bytes, `#[repr(C, align(8))]`)
+
+The struct is defined **identically** in two places that must stay
+byte-for-byte in sync: the kernel copy (`src/syscall/mod.rs`) and the
+userspace copy (`userspace/libakuma/src/lib.rs`). Fields:
+`tid: u32`, `pid: u32`, `box_id: u64`, `total_time_us: u64`, `state: u8`,
+`last_core: u8`, `_reserved: [u8; 6]`, `name: [u8; 16]`.
+
+- **`last_core`** (offset 25) — the MPIDR aff0 of the core the thread last
+  ran on; `0xFF` means never scheduled. Populated from
+  `threading::get_thread_last_core`, which reads a lock-free
+  `LAST_CORE: [AtomicU8; MAX_THREADS]` array written in the scheduler's
+  `commit_switch` (in `akuma-exec`). It is deliberately **not** a
+  `ThreadSlot` field: `sys_get_cpu_stats` must not take `POOL.lock` (a
+  nested user-copy fault while holding it self-deadlocks the core — see the
+  `USER_COPY_FAULT_HANDLER` note in `threading/mod.rs`), so every per-thread
+  value it reads comes from a lock-free atomic array. `top` renders this as
+  its `CORE` column (`-` for the `0xFF` sentinel). Added when `_reserved`
+  shrank `[u8; 7] → [u8; 6]`, keeping the 48-byte ABI.
+- **`name`** — for a thread with an owning userspace process this is the
+  process name. For a **kernel thread** (no process) the populator falls back
+  to `threading::kernel_thread_name(tid)` (also lock-free) rather than
+  leaving it blank: `kernel` (tid 0), `idle` (a per-core idle thread),
+  `network` (the poller), `system` (a reserved system slot), else
+  `kernel-thread`.
+
+### CPU% is delta-based — a single sample is meaningless
+
+`top` computes `CPU% = Δtotal_time_us / Δwall_time_us` between two
+`get_cpu_stats` samples (`total_time_us` and `uptime` are both microseconds —
+no unit mismatch). The percentage is therefore **only as meaningful as the
+gap between samples**. In the interactive loop that gap is the ~1s input
+poll. `top --once` prints after one iteration, so it now `sleep_ms(500)`s
+between its two samples on purpose — without that pause the samples are taken
+microseconds apart and every thread that happens to be on-core at that
+instant reads ~100% (up to one per core) while everything else reads 0%.
+Sustained ~100% readings for the `network` poller and `sshd`'s accept loop
+are **real** busy-poll behavior, not a sampling artifact.
 
 ## Background
 
