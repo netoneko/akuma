@@ -830,7 +830,8 @@ const SYSCALL_CORE_INIT: u64 = 327;
 ///
 /// `program` must be a `/`-rooted path; it is passed NUL-terminated (the `core_init`
 /// syscall reads it like any path). On a single-kernel boot the syscall returns `-ENOSYS`
-/// and this returns false.
+/// and this returns false. Also returns false on shared-kernel SMP where CORE_INIT is
+/// not available (all cores are already online and run the same kernel).
 fn core_init(idx: u32, program: &str) -> bool {
     let mut path = Vec::with_capacity(program.len() + 1);
     path.extend_from_slice(program.as_bytes());
@@ -844,6 +845,8 @@ fn core_init(idx: u32, program: &str) -> bool {
         0,
         0,
     );
+    // Success (0) or ENOSYS (-38) means core_init is not available in this kernel mode
+    // In shared-kernel SMP, we fall back to normal spawning
     (r as i64) == 0
 }
 
@@ -1069,10 +1072,39 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
                     ServiceState::Running
                 };
             } else {
-                print("[herd] core_init failed for ");
+                // core_init failed (likely ENOSYS in shared-kernel SMP mode)
+                // Fall back to starting as a normal local process on the BSP
+                print("[herd] core_init unavailable for ");
                 print(name);
-                print(" — not started\n");
-                svc.state = ServiceState::Failed;
+                print(" — falling back to local process on BSP\n");
+                // Clear the core pinning and continue to normal spawning below
+                let config_for_local = ServiceConfig {
+                    core: 0, // Force BSP (core 0)
+                    ..config.clone()
+                };
+                let args: Vec<&str> = config_for_local.args.iter().map(|s| s.as_str()).collect();
+                let args_opt = if args.is_empty() { None } else { Some(args.as_slice()) };
+                let spawn_res = spawn(&config_for_local.command, args_opt);
+                
+                match spawn_res {
+                    Some(SpawnResult { pid, stdout_fd }) => {
+                        svc.pid = Some(pid);
+                        svc.stdout_fd = Some(stdout_fd);
+                        svc.state = ServiceState::Running;
+                        svc.restart_at_ms = None;
+                        print("[herd] Started ");
+                        print(name);
+                        print(" (pid=");
+                        print_dec(pid as usize);
+                        print(") on BSP fallback\n");
+                    }
+                    None => {
+                        svc.state = ServiceState::Failed;
+                        print("[herd] Failed to start ");
+                        print(name);
+                        print("\n");
+                    }
+                }
             }
         }
         return;
