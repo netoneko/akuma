@@ -466,6 +466,7 @@ pub(crate) fn build_exec_runtime(
         read_at_by_inode: |_inode, _off, _buf| Err(-1),
         on_process_exit: |_pid| {},
         remove_socket: akuma_net::socket::remove_socket,
+        socket_clone_ref: akuma_net::socket::socket_clone_ref,
         futex_wake: crate::syscall::futex_wake,
         pipe_close_write: crate::syscall::pipe::pipe_close_write,
         pipe_close_read: crate::syscall::pipe::pipe_close_read,

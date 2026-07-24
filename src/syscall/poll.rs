@@ -263,20 +263,29 @@ pub(super) fn epoll_on_fd_drained(_fd: u32) {}
 /// the transition is missed and EPOLLIN never re-fires.
 #[cfg(feature = "sc-epoll")]
 pub(super) fn epoll_on_fd_drained(fd: u32) {
+    // IRQ-masked holds: this is called from the TCP recv syscalls, which under
+    // `no-bkl-network` run with the Big Kernel Lock DROPPED. A nested IRQ there
+    // does an unconditional `enter_kernel()` hard-spin; if it lands while this
+    // core holds EPOLL_TABLE and the BKL owner is blocked on EPOLL_TABLE (any
+    // epoll_wait/epoll_ctl syscall), the cores deadlock AB-BA. Masking IRQs for
+    // the (tiny) holds makes them nest-free. Harmless on all other builds.
+    //
     // Snapshot IDs to avoid holding EPOLL_TABLE lock during the entire iteration
     // (though not strictly necessary for this simple function yet, good practice)
-    let ids: alloc::vec::Vec<u32> = {
+    let ids: alloc::vec::Vec<u32> = crate::irq::with_irqs_disabled(|| {
         let table = EPOLL_TABLE.lock();
         table.keys().copied().collect()
-    };
+    });
 
     for epoll_id in ids {
-        let mut table = EPOLL_TABLE.lock();
-        if let Some(inst) = table.get_mut(&epoll_id)
-            && let Some(entry) = inst.interest_list.get_mut(&fd)
-                && entry.events & EPOLLET != 0 {
-                    entry.last_ready &= !EPOLLIN;
-                }
+        crate::irq::with_irqs_disabled(|| {
+            let mut table = EPOLL_TABLE.lock();
+            if let Some(inst) = table.get_mut(&epoll_id)
+                && let Some(entry) = inst.interest_list.get_mut(&fd)
+                    && entry.events & EPOLLET != 0 {
+                        entry.last_ready &= !EPOLLIN;
+                    }
+        });
     }
 }
 

@@ -57,13 +57,64 @@ pub struct NetRuntime {
 ///
 /// A zero-cost no-op on every non-`smp-shared` build: `new`/`drop` compile to
 /// nothing, so the hot path is byte-for-byte unchanged.
+///
+/// **`no-bkl-network` addition — local IRQs are masked for the hold too.** With
+/// the Big Kernel Lock dropped around net syscalls, this core can be inside a
+/// `NETWORK`/`SOCKET_TABLE` critical section *without* owning the BKL. A nested
+/// IRQ then runs `enter_kernel()` (exceptions.rs), which hard-spins (IRQs masked)
+/// until the BKL frees — while THIS core still holds the inner spinlock. If the
+/// current BKL owner is meanwhile spinning on that same inner lock (the async-main
+/// poller does exactly that on `NETWORK`, near-constantly), the two cores deadlock
+/// AB-BA and every other core piles into the BKL wait: the SMP=4 hard wedge
+/// (`[BKL] stuck`, owner frozen nonzero, guest timer starved). Masking IRQs for
+/// the (short) hold makes the window nest-free, so a core can never be caught
+/// "holding an inner lock, waiting for the BKL". Plain `smp-shared` builds don't
+/// need it — there EL1 always holds the BKL, so the nested `enter_kernel` is the
+/// idempotent owner fast path.
 #[must_use]
 pub struct PreemptGuard {
     /// Whether `new()` actually disabled preemption (runtime was registered).
     /// Present only under `smp-shared`; other builds carry no state.
     #[cfg(feature = "smp-shared")]
     active: bool,
+    /// Saved DAIF to restore on drop (no-bkl-network builds only).
+    #[cfg(all(feature = "smp-shared", feature = "no-bkl-network"))]
+    saved_daif: u64,
 }
+
+/// Mask local IRQs and return the prior DAIF.
+///
+/// Bare-metal AArch64 only; host tests get a no-op shim. Mirrors
+/// `akuma_exec::sync::irq_save_mask`.
+#[cfg(all(feature = "smp-shared", feature = "no-bkl-network", target_arch = "aarch64", target_os = "none"))]
+#[inline]
+fn irq_save_mask() -> u64 {
+    let daif: u64;
+    // SAFETY: reading DAIF and setting the IRQ mask bit have no memory effects.
+    unsafe {
+        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
+        core::arch::asm!("msr daifset, #0x2", options(nomem, nostack));
+    }
+    daif
+}
+
+/// Restore DAIF saved by [`irq_save_mask`].
+#[cfg(all(feature = "smp-shared", feature = "no-bkl-network", target_arch = "aarch64", target_os = "none"))]
+#[inline]
+fn irq_restore(daif: u64) {
+    // SAFETY: restoring the previously-saved DAIF; no memory effects.
+    unsafe { core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack)) };
+}
+
+#[cfg(all(feature = "smp-shared", feature = "no-bkl-network", not(all(target_arch = "aarch64", target_os = "none"))))]
+#[inline]
+fn irq_save_mask() -> u64 {
+    0
+}
+
+#[cfg(all(feature = "smp-shared", feature = "no-bkl-network", not(all(target_arch = "aarch64", target_os = "none"))))]
+#[inline]
+fn irq_restore(_daif: u64) {}
 
 impl PreemptGuard {
     /// Disable preemption (under `smp-shared`) until the returned guard drops.
@@ -73,11 +124,18 @@ impl PreemptGuard {
         {
             // Best-effort: the runtime is always registered before any net path
             // runs, but stay panic-free during early boot / host tests.
-            if let Some(rt) = try_runtime() {
+            let active = if let Some(rt) = try_runtime() {
                 (rt.disable_preemption)();
-                return Self { active: true };
-            }
-            Self { active: false }
+                true
+            } else {
+                false
+            };
+            // Mask IRQs AFTER disabling preemption so drop's reverse order
+            // re-enables preemption only once IRQs are live again.
+            #[cfg(feature = "no-bkl-network")]
+            return Self { active, saved_daif: irq_save_mask() };
+            #[cfg(not(feature = "no-bkl-network"))]
+            return Self { active };
         }
         #[cfg(not(feature = "smp-shared"))]
         Self {}
@@ -94,6 +152,8 @@ impl Default for PreemptGuard {
 impl Drop for PreemptGuard {
     #[inline]
     fn drop(&mut self) {
+        #[cfg(all(feature = "smp-shared", feature = "no-bkl-network"))]
+        irq_restore(self.saved_daif);
         #[cfg(feature = "smp-shared")]
         if self.active
             && let Some(rt) = try_runtime()

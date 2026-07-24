@@ -318,6 +318,11 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         #[cfg(feature = "smoltcp")]
         akuma_exec::process::FileDescriptor::Socket(idx) => {
+            // read(2) on a TCP socket is sshd's hot recv path — run it BKL-free
+            // like recvfrom (no-op guard unless no-bkl-network). `temp` is a
+            // kernel bounce buffer; the copy_to_user below runs after the socket
+            // ops, outside the socket locks.
+            let _net_bkl = super::net::NetBklGuard::new();
             let limit = 64 * 1024;
             let to_read = count.min(limit);
             let mut temp = alloc::vec![0u8; to_read];
@@ -800,6 +805,11 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
             #[cfg(feature = "smoltcp")]
             akuma_exec::process::FileDescriptor::Socket(idx) => {
+                // write(2) on a TCP socket is sshd's hot send path — run it
+                // BKL-free like sendto (no-op guard unless no-bkl-network).
+                // `buf_slice` is a kernel bounce buffer, so no user-memory
+                // fault can occur inside the socket locks.
+                let _net_bkl = super::net::NetBklGuard::new();
                 let nonblock = super::net::fd_is_nonblock(fd_num as u32);
                 let result = if socket::is_udp_socket(idx) {
                     match socket::udp_default_peer(idx) {
@@ -1020,6 +1030,8 @@ pub(super) fn sys_dup(oldfd: u32) -> u64 {
             super::pipe::pipe_clone_ref(*rx, false);
             super::pipe::pipe_clone_ref(*tx, true);
         }
+        #[cfg(feature = "smoltcp")]
+        akuma_exec::process::FileDescriptor::Socket(idx) => socket::socket_clone_ref(*idx),
         _ => {}
     }
     let newfd = proc.alloc_fd(entry);
@@ -1053,6 +1065,8 @@ pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
             super::pipe::pipe_clone_ref(*rx, false);
             super::pipe::pipe_clone_ref(*tx, true);
         }
+        #[cfg(feature = "smoltcp")]
+        akuma_exec::process::FileDescriptor::Socket(idx) => socket::socket_clone_ref(*idx),
         _ => {}
     }
 
@@ -1967,10 +1981,16 @@ pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let entry = match proc.get_fd(fd) { Some(e) => e, None => return EBADF };
-            // Bump pipe refcount before inserting the duplicate entry.
+            // Bump pipe/socket refcounts before inserting the duplicate entry.
             match &entry {
                 akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_clone_ref(*id, true),
                 akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_clone_ref(*id, false),
+                akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+                    super::pipe::pipe_clone_ref(*rx, false);
+                    super::pipe::pipe_clone_ref(*tx, true);
+                }
+                #[cfg(feature = "smoltcp")]
+                akuma_exec::process::FileDescriptor::Socket(idx) => socket::socket_clone_ref(*idx),
                 _ => {}
             }
             let new_fd = proc.alloc_fd_from(arg as u32, entry);

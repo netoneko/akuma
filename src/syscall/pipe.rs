@@ -58,16 +58,16 @@ pub fn pipe_add_poller(id: u32, tid: usize) {
 /// has been destroyed (no readers left or pipe removed). On Linux, writing to
 /// a broken pipe delivers SIGPIPE and returns EPIPE; callers must replicate this.
 pub fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
-    crate::irq::with_irqs_disabled(|| {
+    // Outcome of the locked section: Ok(n) = wrote n bytes; Err(true) = broken
+    // pipe, raise SIGPIPE (after unlocking!); Err(false) = pipe gone, plain EPIPE.
+    let outcome = crate::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
             if pipe.read_count == 0 {
-                // Send SIGPIPE to current process (Linux behaviour)
-                super::signal::send_sigpipe();
-                return Err(libc_errno::EPIPE);
+                return Err(true);
             }
             pipe.buffer.extend(data);
-            
+
             // Wake all async pollers (epoll/poll/read)
             while let Some(tid) = pipe.pollers.pop_first() {
                 akuma_exec::threading::get_waker_for_thread(tid).wake();
@@ -76,9 +76,26 @@ pub fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
             Ok(data.len())
         } else {
             crate::safe_print!(128, "[pipe] write WARN: pipe id={} not found (len={})\n", id, data.len());
+            Err(false)
+        }
+    });
+    match outcome {
+        Ok(n) => Ok(n),
+        Err(raise_sigpipe) => {
+            if raise_sigpipe {
+                // Send SIGPIPE to the current process (Linux behaviour) — with NO
+                // pipe lock held. For a default disposition the delivery runs the
+                // terminate action INLINE (tkill → sys_exit_group → close_all →
+                // pipe_close_write), which re-acquires PIPES: raising it inside
+                // the locked section above self-deadlocked the core (spinning on
+                // its own lock, IRQs masked, still holding the BKL) and wedged
+                // every other core in KernelLock::acquire. Root-caused live via
+                // lldb 2026-07-24 (aria2c `| head -1` → EPIPE storm at exit).
+                super::signal::send_sigpipe();
+            }
             Err(libc_errno::EPIPE)
         }
-    })
+    }
 }
 
 pub fn pipe_read(id: u32, buf: &mut [u8]) -> (usize, bool) {

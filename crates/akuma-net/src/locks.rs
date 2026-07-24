@@ -281,51 +281,80 @@ pub fn release_socket_table_lock() {
 // Testing Utilities
 // ============================================================================
 
+/// Test-only: reset the process-global lock state to a clean slate.
+///
+/// `HELD_LOCKS`, `LOCK_STATS`, and the holder atomics are all process-wide, but
+/// cargo runs unit tests on multiple threads — so any test that touches them
+/// races unless serialized AND reset. Both test modules (`locks::tests` and
+/// `lock_tests.rs`) funnel through [`with_test_serial`], which calls this first.
+#[cfg(test)]
+pub(crate) fn reset_test_state() {
+    HELD_LOCKS.store(0, Ordering::Relaxed);
+    NETWORK_LOCK_HOLDER.store(LOCK_HOLDER_NONE, Ordering::Relaxed);
+    SOCKET_TABLE_LOCK_HOLDER.store(LOCK_HOLDER_NONE, Ordering::Relaxed);
+    reset_lock_stats();
+}
+
+/// Test-only: run `f` serialized against every other lock test, from freshly-reset
+/// global state. Without this, a test that deliberately triggers an ordering
+/// violation (bumping `LOCK_STATS.ordering_violations`) bleeds into a concurrent
+/// test asserting the count is zero — the flake that made
+/// `test_lock_ordering_enforcement` fail intermittently. Recovers from a poisoned
+/// mutex (a `#[should_panic]` test poisons it on unwind); the guarded state is
+/// reset on the next entry, so the poison carries no stale data.
+#[cfg(test)]
+pub(crate) fn with_test_serial<F: FnOnce()>(f: F) {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    reset_test_state();
+    f();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_lock_ordering_enforcement() {
-        reset_lock_stats();
-        
-        // Acquire network lock should succeed
-        acquire_network_lock(1);
-        
-        // Acquire socket table lock should succeed (network held)
-        acquire_socket_table_lock(1);
-        
-        // Release in reverse order
-        release_socket_table_lock();
-        release_network_lock();
-        
-        // Verify no violations
-        let stats = get_lock_stats();
-        assert_eq!(stats.ordering_violations, 0);
+        with_test_serial(|| {
+            // Acquire network lock should succeed
+            acquire_network_lock(1);
+
+            // Acquire socket table lock should succeed (network held)
+            acquire_socket_table_lock(1);
+
+            // Release in reverse order
+            release_socket_table_lock();
+            release_network_lock();
+
+            // Verify no violations
+            let stats = get_lock_stats();
+            assert_eq!(stats.ordering_violations, 0);
+        });
     }
 
     #[test]
     #[should_panic(expected = "Lock ordering violation")]
     fn test_socket_table_without_network() {
-        reset_lock_stats();
-        
-        // Attempting to acquire socket table lock without network lock should panic
-        acquire_socket_table_lock(1);
+        with_test_serial(|| {
+            // Attempting to acquire socket table lock without network lock should panic
+            acquire_socket_table_lock(1);
+        });
     }
 
     #[test]
     fn test_stats_tracking() {
-        reset_lock_stats();
-        
-        let initial_stats = get_lock_stats();
-        assert_eq!(initial_stats.ordering_violations, 0);
-        
-        // Trigger a violation
-        let _ = std::panic::catch_unwind(|| {
-            acquire_socket_table_lock(1);
+        with_test_serial(|| {
+            let initial_stats = get_lock_stats();
+            assert_eq!(initial_stats.ordering_violations, 0);
+
+            // Trigger a violation
+            let _ = std::panic::catch_unwind(|| {
+                acquire_socket_table_lock(1);
+            });
+
+            let stats = get_lock_stats();
+            assert_eq!(stats.ordering_violations, 1);
         });
-        
-        let stats = get_lock_stats();
-        assert_eq!(stats.ordering_violations, 1);
     }
 }

@@ -3,6 +3,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_profile_extreme)");
     println!("cargo::rustc-check-cfg=cfg(kernel_smp)");
     println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
+    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_network)");
 
     // Multikernel (one-kernel-per-core) gate. ALL secondary-core code lives behind
     // `cfg(kernel_smp)`; with the feature off, none of it compiles and the default
@@ -35,6 +36,18 @@ fn main() {
         !(smp && smp_shared),
         "features `smp` (multikernel) and `smp-shared` (real SMP) are mutually exclusive"
     );
+
+    // BKL-free network path (Phase 2 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md).
+    // `cfg(kernel_no_bkl_network)` makes the smoltcp net syscalls drop the BKL for their
+    // duration; only meaningful under shared-kernel SMP (nothing to drop otherwise). The
+    // gate is emitted independently of `smp_shared` so the net.rs guard can compile-check
+    // in either combination — its body is additionally `cfg(kernel_smp_shared)`-gated so
+    // it stays a no-op without real SMP.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_NETWORK");
+    let no_bkl_network = std::env::var("CARGO_FEATURE_NO_BKL_NETWORK").is_ok();
+    if no_bkl_network {
+        println!("cargo:rustc-cfg=kernel_no_bkl_network");
+    }
 
     // OPT_LEVEL is "z" only for profile.size / profile.extreme-size (opt-level = "z").
     // PROFILE is always "release" for inherited profiles, so we can't use that.

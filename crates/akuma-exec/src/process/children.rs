@@ -999,6 +999,7 @@ mod child_channel_drain_tests {
             read_at_by_inode: |_, _, _| Err(0),
             on_process_exit: |_| {},
             remove_socket: |_| {},
+            socket_clone_ref: |_| {},
             futex_wake: |_, _, _| {},
             pipe_close_write: |_| {},
             pipe_close_read: |_| {},

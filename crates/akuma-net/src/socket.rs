@@ -137,6 +137,16 @@ pub struct KernelSocket {
     pub keepalive: bool,
     /// Threads waiting for I/O on this socket (epoll, blocking recv/send)
     pub wakers: Spinlock<Vec<Waker>>,
+    /// Number of fd-table references to this socket (fork-inherited fds, dup'd
+    /// fds). [`remove_socket`] only destroys the socket when this drops to zero.
+    /// Without it, the FIRST close (a fork child's exit, exec's cloexec sweep, a
+    /// plain `close(2)` of a dup) destroyed the socket under every other fd still
+    /// using it; the freed table slot AND smoltcp handle were then reused by the
+    /// next connection, splicing two unrelated TCP streams together (observed as
+    /// TLS record bytes inside an SSH session → "message authentication code
+    /// incorrect" on the client). Guarded by the SOCKET_TABLE lock, so a plain
+    /// integer suffices.
+    pub refs: u32,
 }
 
 #[cfg(feature = "smoltcp")]
@@ -152,6 +162,7 @@ impl KernelSocket {
             tcp_nodelay: true,  // We disable Nagle by default
             keepalive: false,
             wakers: Spinlock::new(Vec::new()),
+            refs: 1,
         })
     }
 
@@ -166,6 +177,7 @@ impl KernelSocket {
             tcp_nodelay: false,
             keepalive: false,
             wakers: Spinlock::new(Vec::new()),
+            refs: 1,
         })
     }
 
@@ -197,6 +209,7 @@ impl KernelSocket {
             tcp_nodelay: true,
             keepalive: false,
             wakers: Spinlock::new(Vec::new()),
+            refs: 1,
         })
     }
 
@@ -302,21 +315,55 @@ pub fn socket_add_waker(idx: usize, waker: Waker) {
     });
 }
 
+/// Add one fd-table reference to socket `idx` (see [`KernelSocket::refs`]).
+///
+/// Called whenever a `FileDescriptor::Socket` entry is duplicated: fork's fd-table
+/// deep copy, `dup`/`dup2`/`F_DUPFD`. Mirrors `pipe_clone_ref` for pipe fds.
+#[cfg(feature = "smoltcp")]
+pub fn socket_clone_ref(idx: usize) {
+    with_table(|table| {
+        if let Some(Some(sock)) = table.get_mut(idx) {
+            sock.refs += 1;
+        }
+    });
+}
+
+/// No-op when the smoltcp stack is compiled out — see [`remove_socket`]'s shim.
+#[cfg(not(feature = "smoltcp"))]
+pub fn socket_clone_ref(_idx: usize) {}
+
+/// Drop one fd-table reference to socket `idx`; destroy it on the last close.
+///
+/// Every fd close path (process-exit `close_all`, exec's
+/// cloexec sweep, `close(2)`, `dup2` replacing an entry) calls this, so a fork
+/// child's exit no longer tears the socket out from under the parent's live fd
+/// (the smoltcp handle would be GC'd and reused by the next connection, splicing
+/// two TCP streams together).
 #[cfg(feature = "smoltcp")]
 pub fn remove_socket(idx: usize) {
     with_table(|table| {
-        if idx < table.len()
-            && let Some(sock) = table[idx].take() {
-                match sock.inner {
-                    SocketType::Stream(h) => smoltcp_net::socket_close(h),
-                    SocketType::Listener { handles, .. } => {
-                        for h in handles {
-                            smoltcp_net::socket_close(h);
-                        }
-                    }
-                    SocketType::Datagram { handle, .. } => smoltcp_net::udp_socket_close(handle),
-                }
+        if idx >= table.len() {
+            return;
+        }
+        if let Some(sock) = table[idx].as_mut() {
+            if sock.refs > 1 {
+                sock.refs -= 1;
+                return;
             }
+        } else {
+            return;
+        }
+        if let Some(sock) = table[idx].take() {
+            match sock.inner {
+                SocketType::Stream(h) => smoltcp_net::socket_close(h),
+                SocketType::Listener { handles, .. } => {
+                    for h in handles {
+                        smoltcp_net::socket_close(h);
+                    }
+                }
+                SocketType::Datagram { handle, .. } => smoltcp_net::udp_socket_close(handle),
+            }
+        }
     });
 }
 
@@ -365,7 +412,11 @@ fn wait_until<F>(mut condition: F, timeout_us: Option<u64>) -> Result<(), i32>
 where F: FnMut() -> bool
 {
     let start = (runtime().uptime_us)();
-    
+
+    // Consecutive rounds where poll() reported progress but `condition` stayed
+    // false. See the relax logic below.
+    let mut fruitless_progress_rounds: u32 = 0;
+
     loop {
         // Drain all pending network work (not just one poll)
         let mut any_progress = false;
@@ -390,12 +441,30 @@ where F: FnMut() -> bool
             }
 
         if !any_progress {
+            fruitless_progress_rounds = 0;
             // Wait for more network progress. Under shared-kernel SMP this DROPS the
             // Big Kernel Lock across the wait (a plain `yield_now` would spin holding
             // it, freezing every peer core — the meow→LLM `connect`+recv wedge). The
             // BKL is not held while we poll below either, so a peer's async-main poller
             // can drive the RX that satisfies `condition`.
             (runtime().blocking_relax)();
+        } else {
+            // poll() made progress but not the progress WE need. Under sustained
+            // unrelated traffic (a torrent's dozens of peers, DHT chatter) poll()
+            // reports progress on nearly every call, so the `!any_progress` branch
+            // never runs — and under shared-kernel SMP this loop then busy-spins
+            // HOLDING the Big Kernel Lock for the entire wait (an accept with no
+            // timeout: forever), starving every peer core. Reproduced 2026-07-24:
+            // baseline SMP=4 hard-wedged ([BKL] stuck, owner frozen) the moment
+            // aria2c's swarm traffic started. Bound the hold: after a few fruitless
+            // progress rounds, relax anyway. `blocking_relax` wakes on the next IRQ
+            // (RX under active traffic, else the 10ms tick), so the added latency on
+            // a soon-to-be-ready socket is small, and the fast path — condition met
+            // within the first rounds — is unchanged.
+            fruitless_progress_rounds = fruitless_progress_rounds.wrapping_add(1);
+            if fruitless_progress_rounds >= 4 {
+                (runtime().blocking_relax)();
+            }
         }
     }
 }
@@ -502,6 +571,7 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
         tcp_nodelay: true,
         keepalive: false,
         wakers: Spinlock::new(Vec::new()),
+        refs: 1,
     };
     let new_idx = with_table(|table| {
         for (i, slot) in table.iter_mut().enumerate() {

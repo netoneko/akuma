@@ -64,6 +64,10 @@ impl SharedFdTable {
                     (crate::runtime::runtime().pipe_clone_ref)(*tx, true);
                 }
                 FileDescriptor::EventFd(id) => (crate::runtime::runtime().eventfd_clone_ref)(*id),
+                // Sockets are refcounted like pipes: the child's fd-table copy is a
+                // real reference, so the first close (child exit / exec cloexec
+                // sweep) must not destroy the socket under the parent's live fd.
+                FileDescriptor::Socket(idx) => (crate::runtime::runtime().socket_clone_ref)(*idx),
                 _ => {}
             }
         }

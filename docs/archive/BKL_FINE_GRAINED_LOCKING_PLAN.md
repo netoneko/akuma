@@ -628,12 +628,110 @@ This plan breaks up the Big Kernel Lock (BKL) into fine-grained subsystem locks,
 - Comprehensive unit tests for lock ordering
 - Integration with existing akuma-net module structure
 
-### Phase 2 - Network BKL-Free Path
-- [ ] BKL-free syscall entry points
-- [ ] Updated IRQ handler
-- [ ] Blocking operations compatible
-- [ ] Stress tests passing
-- [ ] Performance measured
+### Phase 2 - Network BKL-Free Path 🚧 IN PROGRESS (`no-bkl-network` feature)
+- [x] BKL-free syscall entry points — all 15 smoltcp net syscalls
+- [ ] Updated IRQ handler (`poll()` still runs under whatever BKL state the caller has)
+- [x] Blocking operations compatible (no inner spinlock held across `blocking_relax`)
+- [x] Boots + SSH login verified at SMP=2 (no wedge, no abort)
+- [ ] Stress tests / A/B contention measurement
+
+**Design note — why the implementation diverges from the pseudo-code above.**
+The Phase-2 sketch wrapped each syscall in a *new coarse* `NETWORK_LOCK`
+(`crates/akuma-net/src/locks.rs`). That does not work for the blocking syscalls:
+`accept`/`connect`/`recv`/`dns_query` yield via `blocking_relax()` (which drops the
+BKL so a peer can drive the stack), and holding a coarse lock across that yield would
+serialize *all* network syscalls behind one blocked socket — strictly worse than the
+BKL, which IS dropped during the wait.
+
+Instead, the `no-bkl-network` feature (bin feature → `cfg(kernel_no_bkl_network)`,
+only active with `smp-shared`) makes each net syscall **drop the BKL for its whole
+duration** and rely on the *already-existing* fine-grained locks for cross-core
+mutual exclusion:
+- the per-process fd table — `SharedFdTable`'s three spinlocks
+  (`crates/akuma-exec/src/process/fd.rs`),
+- the socket descriptor table — `akuma_net::socket::SOCKET_TABLE`,
+- the network stack — `akuma_net::smoltcp_net::NETWORK` (held under a `PreemptGuard`),
+- and the heap (`TALC` spinlock) for bounce-buffer alloc/free.
+
+All four are real spinlocks acquired under `with_irqs_disabled` / `PreemptGuard` and are
+correct across cores *without* the BKL — the BKL was redundant for them. Blocking waits
+hold none of the inner spinlocks, so two cores can block in network syscalls at once.
+The drop/re-acquire is an RAII guard (`NetBklGuard` in `src/syscall/net.rs`); re-acquire
+on drop keeps the syscall wrapper's single `leave_kernel` balanced, and a nested
+IRQ/fault re-taking the BKL meanwhile is harmless because `enter_kernel` is idempotent —
+the same contract the `exec_dropped_bkl` and file-fault BKL-drop paths already use.
+Host test `kernel_lock_midexcursion_drop_reacquire_stays_balanced` (sync.rs) proves the
+ticket accounting stays balanced under this pattern (incl. peer contention in the window).
+
+The coarse `NETWORK_LOCK` + ordering-enforcement scaffolding in `locks.rs` is **not**
+wired into the hot path (its global `HELD_LOCKS` bitmap is per-process, not per-core, so
+it is host-test/documentation scaffolding only); the fine-grained locks above are the
+real "network lock instead of BKL".
+
+**Trade-off to watch:** each net syscall now takes the BKL twice (drop + re-acquire),
+roughly doubling ticket churn on the network hot path. A verified SMP=2 SSH session saw
+6 `[BKL] RECOVERED` self-heals (0 `stuck`, 0 aborts) — the pre-existing ticket-leak
+self-heal doing its job under the extra churn. A/B contention measurement + confirming
+this doesn't raise the recovery rate materially is the remaining Phase-2 work.
+
+**2026-07-24 SMP=4 attribution + hardening (this session).** Sustained load
+(`apk add`, then an aria2c torrent swarm) at SMP=4 showed two bad symptoms with
+`no-bkl-network`; an identical run on a BASELINE build (`devbox-smoltcp,no-tests`,
+no feature) reproduced BOTH, so neither is a feature regression:
+
+1. *SSH stream corruption* (`Bad packet length 0x17030300` = a TLS record header
+   inside the SSH stream) — cross-socket data injection from a missing socket
+   refcount: `clone_deep_for_fork` copied `FileDescriptor::Socket(idx)` with no
+   ref bump while every close path (`close_all` at exit, exec's cloexec sweep,
+   `close(2)`, `dup2`-replace) destroyed the socket unconditionally, so the first
+   closer freed the smoltcp handle under every other fd; the reused handle then
+   spliced two live TCP streams. FIXED: `KernelSocket::refs` +
+   `socket_clone_ref()` (bumped by fork/dup/dup2/F_DUPFD, mirroring
+   `pipe_clone_ref`), refcount-aware `remove_socket`, boot self-test
+   `test_socket_refcount_survives_first_close`.
+2. *Hard BKL wedge* (`[BKL] stuck`, owner frozen, all cores IRQ-masked in
+   `acquire`, guest timer starved → watchdog mislabels it "host sleep/wake") —
+   TWO distinct shapes, both fixed:
+   - `wait_until` (socket.rs) only called `blocking_relax()` when a poll round
+     made NO progress; under constant swarm traffic every round reports
+     progress, so a blocking waiter (accept has NO timeout) busy-spun holding
+     the BKL forever. FIXED: after 4 fruitless progress-rounds the waiter
+     relaxes anyway, bounding the hold.
+   - **Pipe SIGPIPE self-deadlock** (lldb-root-caused live, 100% reproducible
+     via `aria2c … | head -1`): `pipe_write` raised `send_sigpipe()` while
+     HOLDING the global `PIPES` spinlock (IRQs masked). Default disposition
+     terminates the writer INLINE — tkill → `sys_exit_group` → `close_all` →
+     `pipe_close_write` → re-acquire `PIPES` → the core self-deadlocks on its
+     own lock while holding the BKL; every peer core piles into
+     `KernelLock::acquire`. FIXED: the signal is raised after the locked
+     section (src/syscall/pipe.rs); boot regression test
+     `test_sigpipe_terminate_no_deadlock` (`yes | head -n 1`). This is the
+     probable root of the long-standing "SMP=4 hard wedge family".
+
+**Feature-specific latent deadlock found by audit + closed.** In the dropped-BKL
+window a nested IRQ runs an unconditional `enter_kernel()` hard-spin
+(exceptions.rs `rust_irq_handler_with_sp`, the "preempted EL1" path). If the
+window holds an inner spinlock the current BKL owner wants — the async-main
+poller spins on `NETWORK` near-constantly — the two cores deadlock AB-BA.
+Hardening shipped under the feature:
+- `PreemptGuard` (guards `NETWORK`/`SOCKET_TABLE`) now also MASKS local IRQs for
+  the hold (`akuma-net/no-bkl-network` feature, forwarded from the bin crate), so
+  the window is nest-free;
+- `epoll_on_fd_drained` takes `EPOLL_TABLE` under `with_irqs_disabled`
+  (unconditionally — harmless, and exec's BKL-drop window reaches epoll too);
+- pipe-backed `UnixSocket` fds are routed BEFORE the guard in
+  sendto/recvfrom/sendmsg/recvmsg (the pipe/fs paths must not run BKL-free);
+- heap (`talc_alloc/dealloc/realloc`), fd table, PMM, and `vm_with_regions` were
+  audited and already run under `with_irqs_disabled` — no change needed.
+Residual (shared with the PRE-EXISTING `exec_dropped_bkl` / file-fault windows,
+not new): page-table frame vecs and the COW fault map are bare spinlocks touched
+from BKL-free windows; same AB-BA shape at much lower duty. Tracked as the
+likely root of the long-standing "SMP=4 hard wedge family".
+
+Also extended coverage: `read(2)`/`write(2)` on Socket fds (sshd's actual hot
+path — its PSTATS shows `read=`/`write=`, not recvfrom) now take `NetBklGuard`
+too; both use kernel bounce buffers so no user-memory fault can occur inside the
+socket locks.
 
 ### Phase 3 - Process Management Locks
 - [ ] Process table locking designed

@@ -71,8 +71,55 @@ pub(super) fn remote_socket_handle(fd: u32) -> Option<u32> {
     }
 }
 
+/// RAII guard that runs a native (smoltcp) network syscall **without** the Big
+/// Kernel Lock — Phase 2 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md.
+///
+/// Constructed at the top of each net syscall: `new()` DROPS the BKL so this core
+/// runs the syscall concurrently with peer cores, and `drop()` RE-ACQUIRES it on
+/// every return path. Correctness rests on the state these syscalls mutate already
+/// carrying its own fine-grained locks — the per-process fd table
+/// (`SharedFdTable`'s spinlocks), the socket descriptor table
+/// (`akuma_net::socket::SOCKET_TABLE`), and the network stack
+/// (`akuma_net::smoltcp_net::NETWORK`, held under a `PreemptGuard`) — so the BKL is
+/// redundant for them; dropping it lets non-network work on other cores proceed in
+/// parallel. Blocking waits (`accept`/`connect`/`recv`/DNS) hold none of the inner
+/// spinlocks across the wait, so two cores can block in network syscalls at once
+/// without wedging (unlike wrapping the whole syscall in one coarse lock).
+///
+/// Re-acquiring on drop keeps the syscall wrapper's single `leave_kernel`
+/// (`rust_sync_el0_handler` in exceptions.rs) balanced. A nested IRQ or page fault
+/// that re-takes the BKL during the dropped window is harmless: `enter_kernel` is
+/// idempotent for the owner, exactly the contract the `exec_dropped_bkl` and
+/// file-fault BKL-drop paths already rely on.
+///
+/// Zero-cost no-op unless BOTH `kernel_smp_shared` and `kernel_no_bkl_network` are
+/// set — the struct is empty and `new`/`drop` compile to nothing, so default,
+/// `size`, `extreme`, and plain `smp-shared` builds are byte-for-byte unchanged.
+#[cfg(feature = "smoltcp")]
+pub(super) struct NetBklGuard;
+
+#[cfg(feature = "smoltcp")]
+impl NetBklGuard {
+    #[inline]
+    pub(super) fn new() -> Self {
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        akuma_exec::bkl::leave_kernel();
+        Self
+    }
+}
+
+#[cfg(feature = "smoltcp")]
+impl Drop for NetBklGuard {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        akuma_exec::bkl::enter_kernel();
+    }
+}
+
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
+    let _net_bkl = NetBklGuard::new();
     let base_type = sock_type & 0xFF;
     let cloexec = sock_type & 0x80000 != 0;
     let nonblock = sock_type & 0x800 != 0;
@@ -188,6 +235,7 @@ pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: u
 
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
+    let _net_bkl = NetBklGuard::new();
     if len < 16 { return EINVAL; }
     if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
     let mut sa = SockAddrIn::default();
@@ -217,6 +265,7 @@ pub(super) fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
 
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_listen(fd: u32, backlog: i32) -> u64 {
+    let _net_bkl = NetBklGuard::new();
     #[cfg(kernel_smp)]
     if let Some(h) = remote_socket_handle(fd) {
         return crate::smp::fwd_listen(h, backlog);
@@ -233,6 +282,7 @@ pub(super) fn sys_listen(fd: u32, backlog: i32) -> u64 {
 
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
+    let _net_bkl = NetBklGuard::new();
     if addr_ptr != 0 && !validate_user_ptr(addr_ptr, 16) { return EFAULT; }
     if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     #[cfg(kernel_smp)]
@@ -278,6 +328,7 @@ pub(super) fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
 
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u64 {
+    let _net_bkl = NetBklGuard::new();
     if addr_ptr != 0 && !validate_user_ptr(addr_ptr, 16) { return EFAULT; }
     if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     #[cfg(kernel_smp)]
@@ -333,6 +384,7 @@ pub(super) fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u
 
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
+    let _net_bkl = NetBklGuard::new();
     if len < 16 { return EINVAL; }
     if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
     let mut sa = SockAddrIn::default();
@@ -370,6 +422,7 @@ pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
 
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
+    let _net_bkl = NetBklGuard::new();
     if addr_ptr == 0 || len_ptr == 0 { return EINVAL; }
     if !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     let idx = match get_socket_from_fd(fd) {
@@ -398,6 +451,7 @@ pub(super) fn sys_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
 
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
+    let _net_bkl = NetBklGuard::new();
     if addr_ptr == 0 || len_ptr == 0 { return EINVAL; }
     if !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     let idx = match get_socket_from_fd(fd) {
@@ -450,10 +504,14 @@ pub(super) fn sys_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
 
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_addr: u64, addr_len: usize) -> u64 {
-    // AF_UNIX socketpair endpoint: send == write to the tx pipe.
+    // AF_UNIX socketpair endpoint: send == write to the tx pipe. Checked BEFORE
+    // dropping the BKL: the pipe/fs paths take spinlocks that BKL-holding peers
+    // also take, which must not happen in the BKL-free window (AB-BA with a
+    // nested IRQ's enter_kernel — see NetBklGuard).
     if fd_is_unix_socket(fd) {
         return super::fs::sys_write(u64::from(fd), buf_ptr, len);
     }
+    let _net_bkl = NetBklGuard::new();
     // On a secondary, forward to the Net owner (one bounce-sized chunk; short sends loop).
     #[cfg(kernel_smp)]
     if let Some(h) = remote_socket_handle(fd) {
@@ -532,10 +590,12 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
 
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_addr: u64, addr_len_ptr: u64) -> u64 {
-    // AF_UNIX socketpair endpoint: recv == read from the rx pipe.
+    // AF_UNIX socketpair endpoint: recv == read from the rx pipe. Checked BEFORE
+    // dropping the BKL — see sys_sendto.
     if fd_is_unix_socket(fd) {
         return super::fs::sys_read(u64::from(fd), buf_ptr, len);
     }
+    let _net_bkl = NetBklGuard::new();
     // On a secondary, forward to the Net owner (one bounce-sized chunk; short recvs loop).
     #[cfg(kernel_smp)]
     if let Some(h) = remote_socket_handle(fd) {
@@ -659,6 +719,7 @@ pub(super) fn sys_shutdown(_fd: u32, _how: i32) -> u64 { 0 }
 
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, optlen: u32) -> u64 {
+    let _net_bkl = NetBklGuard::new();
     const SOL_SOCKET: i32 = 1;
     const IPPROTO_TCP: i32 = 6;
     const SO_REUSEADDR: i32 = 2;
@@ -742,6 +803,7 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
 
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, optlen: u64) -> u64 {
+    let _net_bkl = NetBklGuard::new();
     const SOL_SOCKET: i32 = 1;
     const SO_ERROR: i32 = 4;
     const SO_SNDBUF: i32 = 7;
@@ -854,10 +916,14 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     if !validate_user_ptr(iov.iov_base, iov.iov_len as usize) { return EFAULT; }
 
     // AF_UNIX socketpair endpoint: sendmsg == write the first iovec to the tx
-    // pipe. (libstd's handshake uses a single small message.)
+    // pipe. (libstd's handshake uses a single small message.) Handled BEFORE
+    // dropping the BKL — the pipe paths must not run in the BKL-free window
+    // (see sys_sendto).
     if fd_is_unix_socket(fd) {
         return super::fs::sys_write(u64::from(fd), iov.iov_base, iov.iov_len as usize);
     }
+
+    let _net_bkl = NetBklGuard::new();
 
     // On a secondary, forward to the Net owner (first iovec; DNS uses a single iovec).
     #[cfg(kernel_smp)]
@@ -1011,6 +1077,9 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         }
         return n;
     }
+
+    // Past the pipe-backed unix-socket branch: safe to drop the BKL (see sys_sendto).
+    let _net_bkl = NetBklGuard::new();
 
     // On a secondary, forward to the Net owner (first iovec; DNS uses a single iovec).
     #[cfg(kernel_smp)]
@@ -1244,6 +1313,7 @@ pub(super) fn socket_peer_closed_tcp(idx: usize) -> bool {
 
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> u64 {
+    let _net_bkl = NetBklGuard::new();
     if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
     if !validate_user_ptr(res_ptr, 4) { return EFAULT; }
     let mut kernel_path = alloc::vec![0u8; path_len];

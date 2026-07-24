@@ -919,4 +919,43 @@ mod tests {
         bkl.release(1);
         assert!(!bkl.is_held());
     }
+
+    #[test]
+    fn kernel_lock_midexcursion_drop_reacquire_stays_balanced() {
+        // Models the `no-bkl-network` net-syscall guard (Phase 2 of the BKL
+        // fine-graining plan, src/syscall/net.rs `NetBklGuard`): a syscall wrapper
+        // holds the BKL, then a subsystem DROPS it mid-excursion to run BKL-free and
+        // RE-ACQUIRES it before the wrapper's single release. So per syscall the lock
+        // sees enter → (drop) release → (re-acquire) acquire → release: two acquires,
+        // two releases, each acquire taking a fresh ticket. If the extra
+        // release/acquire pair drifted the ticket counters, a later core's acquire
+        // would wait forever for a `now_serving` that never arrives — this test would
+        // hang. Also exercise a peer stealing the lock in the BKL-free window (the
+        // whole point of dropping it), which must not break FIFO balance.
+        let bkl = KernelLock::new();
+        for round in 0..2000u32 {
+            let core = round % 4;
+            let peer = (core + 1) % 4;
+            // Wrapper entry (EL0→EL1).
+            bkl.acquire(core);
+            assert!(bkl.held_by(core));
+            // Guard drop: run the syscall body BKL-free.
+            bkl.release(core);
+            assert!(!bkl.is_held(), "round {round}: not free in BKL-free window");
+            // A peer core enters the kernel while we're BKL-free, then leaves.
+            bkl.acquire(peer);
+            assert!(bkl.held_by(peer));
+            bkl.release(peer);
+            // Guard re-acquire for the return path, then wrapper release (EL1→EL0).
+            bkl.acquire(core);
+            assert!(bkl.held_by(core));
+            bkl.release(core);
+            assert!(!bkl.is_held(), "round {round}: not free after wrapper release");
+        }
+        // Counters didn't drift: still cleanly acquirable.
+        bkl.acquire(2);
+        assert!(bkl.held_by(2));
+        bkl.release(2);
+        assert!(!bkl.is_held());
+    }
 }

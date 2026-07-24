@@ -22,6 +22,86 @@ pub fn run_network_tests() {
     test_epoll_socket_waker();
     test_epoll_poll_socket_readiness_no_deadlock();
     test_epoll_check_fd_readiness_unknown_fd();
+
+    #[cfg(feature = "smoltcp")]
+    test_socket_refcount_survives_first_close();
+}
+
+/// Regression: writing to a broken pipe delivers SIGPIPE whose DEFAULT action
+/// terminates the writer INLINE (`send_sigpipe` → tkill → `sys_exit_group` →
+/// `close_all` → `pipe_close_write`). Before the 2026-07-24 fix, `pipe_write`
+/// raised the signal while still HOLDING the global `PIPES` spinlock (IRQs
+/// masked), so the exit path re-acquiring PIPES self-deadlocked the core — at
+/// SMP≥2 the whole box wedged with every peer stuck in `KernelLock::acquire`
+/// (lldb-root-caused via aria2c's `| head -1` EPIPE storm). `yes | head -n 1`
+/// reproduces it: head exits after one line, yes's next write hits the EPIPE
+/// branch and must terminate cleanly instead of wedging.
+fn test_sigpipe_terminate_no_deadlock() {
+    if crate::fs::read_file("/bin/busybox").is_err() {
+        console::print("  [SKIP] test_sigpipe_terminate_no_deadlock (no /bin/busybox)\n");
+        return;
+    }
+    let args: &[&str] = &["sh", "-c", "/bin/busybox yes | /bin/busybox head -n 1"];
+    match process::spawn_process_with_channel("/bin/busybox", Some(args), None) {
+        Ok((_t, ch, _p)) => {
+            let start = crate::timer::uptime_us();
+            loop {
+                if ch.has_exited() {
+                    console::print("  [PASS] test_sigpipe_terminate_no_deadlock\n");
+                    return;
+                }
+                if crate::timer::uptime_us().saturating_sub(start) > 10_000_000 {
+                    console::print("  [FAIL] test_sigpipe_terminate_no_deadlock (pipeline did not exit in 10s)\n");
+                    return;
+                }
+                akuma_exec::threading::yield_now();
+                akuma_exec::threading::idle_halt();
+            }
+        }
+        Err(e) => {
+            crate::safe_print!(96, "  [SKIP] test_sigpipe_terminate_no_deadlock (spawn failed: {})\n", e);
+        }
+    }
+}
+
+/// Regression test for the cross-stream corruption bug: a fork-duplicated (or
+/// dup'd) socket fd must NOT destroy the socket on its first close. Before the
+/// `KernelSocket::refs` refcount, `remove_socket` destroyed the socket
+/// unconditionally, so a fork child's exit (or exec's cloexec sweep) freed the
+/// smoltcp handle under the parent's live fd; the handle slot was then reused by
+/// the next connection, splicing two unrelated TCP streams (observed as TLS
+/// record bytes inside an SSH session — "message authentication code incorrect").
+#[cfg(feature = "smoltcp")]
+fn test_socket_refcount_survives_first_close() {
+    use akuma_net::socket;
+
+    let Some(idx) = socket::alloc_socket(socket::socket_const::SOCK_STREAM) else {
+        console::print("  [SKIP] test_socket_refcount (no socket available)\n");
+        return;
+    };
+
+    // Simulate fork/dup: a second fd-table reference to the same socket.
+    socket::socket_clone_ref(idx);
+
+    // First close (the fork child exiting): socket must survive.
+    socket::remove_socket(idx);
+    assert!(
+        socket::with_socket(idx, |_| ()).is_some(),
+        "socket destroyed by first close despite a second fd reference"
+    );
+
+    // Last close: now it must actually be destroyed and the slot freed.
+    socket::remove_socket(idx);
+    assert!(
+        socket::with_socket(idx, |_| ()).is_none(),
+        "socket not destroyed after the last fd reference closed"
+    );
+
+    // Extra closes on a freed slot must stay no-ops (idempotent close paths).
+    socket::remove_socket(idx);
+    assert!(socket::with_socket(idx, |_| ()).is_none());
+
+    console::print("  [PASS] test_socket_refcount_survives_first_close\n");
 }
 
 /// Run all process tests
@@ -98,6 +178,9 @@ pub fn run_all_tests() {
 
     // Test epoll multi poller pipe
     test_epoll_multi_poller_pipe();
+
+    // Regression: EPIPE→SIGPIPE inline-terminate must not self-deadlock
+    test_sigpipe_terminate_no_deadlock();
 
     // Test waitid WNOHANG with no children returns ECHILD
     test_waitid_stub();

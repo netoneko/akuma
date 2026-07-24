@@ -159,6 +159,17 @@ smp = ["dep:akuma-smp"]
 # docs/reference/subsystems/smp-shared.md and docs/archive/SMP_SHARED.md.
 smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared"]
 
+# Run the native (smoltcp) network syscalls WITHOUT the Big Kernel Lock — the
+# first subsystem carved out of the BKL (docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
+# Phase 2). Only meaningful together with `smp-shared`: build.rs emits
+# `cfg(kernel_no_bkl_network)` from CARGO_FEATURE_NO_BKL_NETWORK, and the net
+# syscall entry points then DROP the BKL for their duration, relying on the
+# existing fine-grained NETWORK / SOCKET_TABLE / fd-table spinlocks for cross-core
+# mutual exclusion instead. A no-op (byte-for-byte unchanged) on every build that
+# doesn't set both features. Experimental: gates the BKL-free network path so it
+# can be A/B tested before the BKL is removed subsystem by subsystem.
+no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network"]
+
 # Rump-kernel support: a raw L2 packet path so a userspace NetBSD rump TCP/IP
 # stack can send/receive Ethernet frames. Binds a SECOND virtio-net device
 # (NIC1) and exposes it as /dev/net/tap0 (open/read/write whole frames + a

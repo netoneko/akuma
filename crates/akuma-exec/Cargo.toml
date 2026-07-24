@@ -19,6 +19,12 @@ extreme = []
 # default/other builds are unaffected. See docs/reference/subsystems/smp-shared.md.
 smp-shared = []
 
+# Disable BKL usage for network operations (Phase 2 testing).
+# When enabled, network syscalls skip BKL acquisition and use the new
+# fine-grained network locks instead. Other subsystems still use BKL.
+# Used for testing network BKL-free operations before full BKL removal.
+no-bkl-network = []
+
 [dependencies]
 spinning_top = "0.3"
 lock_api = "0.4"

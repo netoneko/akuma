@@ -18,108 +18,112 @@ fn test_lock_constants() {
 
 #[test]
 fn test_stats_initialization() {
-    reset_lock_stats();
-    
-    let stats = get_lock_stats();
-    assert_eq!(stats.network_contention_count, 0);
-    assert_eq!(stats.network_contention_spins, 0);
-    assert_eq!(stats.socket_table_contention_count, 0);
-    assert_eq!(stats.socket_table_contention_spins, 0);
-    assert_eq!(stats.ordering_violations, 0);
+    with_test_serial(|| {
+        let stats = get_lock_stats();
+        assert_eq!(stats.network_contention_count, 0);
+        assert_eq!(stats.network_contention_spins, 0);
+        assert_eq!(stats.socket_table_contention_count, 0);
+        assert_eq!(stats.socket_table_contention_spins, 0);
+        assert_eq!(stats.ordering_violations, 0);
+    });
 }
 
 #[test]
 fn test_holder_tracking_initial() {
-    // Initially, no locks should be held
-    assert_eq!(network_lock_holder(), LOCK_HOLDER_NONE);
-    assert_eq!(socket_table_lock_holder(), LOCK_HOLDER_NONE);
+    with_test_serial(|| {
+        // With a freshly-reset state, no locks should be held
+        assert_eq!(network_lock_holder(), LOCK_HOLDER_NONE);
+        assert_eq!(socket_table_lock_holder(), LOCK_HOLDER_NONE);
+    });
 }
 
 #[test]
 fn test_reset_clears_stats() {
-    // Trigger a violation by attempting to acquire socket table lock without network lock
-    let result = core::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
-        acquire_socket_table_lock(1);
-    }));
-    
-    // Should have panicked due to ordering violation
-    assert!(result.is_err());
-    
-    // Verify stats recorded the violation
-    let stats_before = get_lock_stats();
-    assert!(stats_before.ordering_violations > 0);
-    
-    // Reset
-    reset_lock_stats();
-    
-    // Verify stats cleared
-    let stats_after = get_lock_stats();
-    assert_eq!(stats_after.ordering_violations, 0);
-    assert_eq!(stats_after.network_contention_count, 0);
-    assert_eq!(stats_after.socket_table_contention_count, 0);
+    with_test_serial(|| {
+        // Trigger a violation by attempting to acquire socket table lock without network lock
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            acquire_socket_table_lock(1);
+        }));
+
+        // Should have panicked due to ordering violation
+        assert!(result.is_err());
+
+        // Verify stats recorded the violation
+        let stats_before = get_lock_stats();
+        assert!(stats_before.ordering_violations > 0);
+
+        // Reset
+        reset_lock_stats();
+
+        // Verify stats cleared
+        let stats_after = get_lock_stats();
+        assert_eq!(stats_after.ordering_violations, 0);
+        assert_eq!(stats_after.network_contention_count, 0);
+        assert_eq!(stats_after.socket_table_contention_count, 0);
+    });
 }
 
 #[test]
 fn test_network_lock_acquire_release() {
-    reset_lock_stats();
-    
-    // Acquire network lock should succeed
-    acquire_network_lock(42);
-    
-    // Verify holder tracking
-    assert_eq!(network_lock_holder(), 42);
-    
-    // Release network lock
-    release_network_lock();
-    
-    // Verify holder cleared
-    assert_eq!(network_lock_holder(), LOCK_HOLDER_NONE);
-    
-    // Check no violations
-    let stats = get_lock_stats();
-    assert_eq!(stats.ordering_violations, 0);
+    with_test_serial(|| {
+        // Acquire network lock should succeed
+        acquire_network_lock(42);
+
+        // Verify holder tracking
+        assert_eq!(network_lock_holder(), 42);
+
+        // Release network lock
+        release_network_lock();
+
+        // Verify holder cleared
+        assert_eq!(network_lock_holder(), LOCK_HOLDER_NONE);
+
+        // Check no violations
+        let stats = get_lock_stats();
+        assert_eq!(stats.ordering_violations, 0);
+    });
 }
 
 #[test]
 fn test_lock_hierarchy_network_then_socket_table() {
-    reset_lock_stats();
-    
-    // Acquire network lock first (correct order)
-    acquire_network_lock(1);
-    
-    // Then acquire socket table lock (correct order)
-    acquire_socket_table_lock(1);
-    
-    // Verify both locks held
-    assert_eq!(network_lock_holder(), 1);
-    assert_eq!(socket_table_lock_holder(), 1);
-    
-    // Release in reverse order
-    release_socket_table_lock();
-    release_network_lock();
-    
-    // Verify no violations
-    let stats = get_lock_stats();
-    assert_eq!(stats.ordering_violations, 0);
+    with_test_serial(|| {
+        // Acquire network lock first (correct order)
+        acquire_network_lock(1);
+
+        // Then acquire socket table lock (correct order)
+        acquire_socket_table_lock(1);
+
+        // Verify both locks held
+        assert_eq!(network_lock_holder(), 1);
+        assert_eq!(socket_table_lock_holder(), 1);
+
+        // Release in reverse order
+        release_socket_table_lock();
+        release_network_lock();
+
+        // Verify no violations
+        let stats = get_lock_stats();
+        assert_eq!(stats.ordering_violations, 0);
+    });
 }
 
 #[test]
 fn test_multiple_acquisitions_same_level() {
-    reset_lock_stats();
-    
-    // Acquire network lock multiple times (should be idempotent)
-    acquire_network_lock(1);
-    acquire_network_lock(1);
-    
-    // Should be able to acquire socket table lock
-    acquire_socket_table_lock(1);
-    
-    // Release everything
-    release_socket_table_lock();
-    release_network_lock();
-    
-    let stats = get_lock_stats();
-    assert_eq!(stats.ordering_violations, 0);
+    with_test_serial(|| {
+        // Acquire network lock multiple times (should be idempotent)
+        acquire_network_lock(1);
+        acquire_network_lock(1);
+
+        // Should be able to acquire socket table lock
+        acquire_socket_table_lock(1);
+
+        // Release everything
+        release_socket_table_lock();
+        release_network_lock();
+
+        let stats = get_lock_stats();
+        assert_eq!(stats.ordering_violations, 0);
+    });
 }
 
 #[test]

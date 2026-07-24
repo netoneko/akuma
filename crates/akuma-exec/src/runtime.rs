@@ -134,6 +134,11 @@ pub struct ExecRuntime {
     // Socket cleanup (per-FD)
     pub remove_socket: fn(usize),
 
+    // Socket fd-reference bump (fork's fd-table deep copy). Mirrors
+    // `pipe_clone_ref`: without it the first close of a fork-inherited socket fd
+    // destroys the socket under the other holders.
+    pub socket_clone_ref: fn(usize),
+
     // Syscall helpers
     pub futex_wake: fn(u32, usize, i32),
     pub pipe_close_write: fn(u32),

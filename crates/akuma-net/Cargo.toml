@@ -15,6 +15,13 @@ small-sockets = []
 # non-SMP builds are byte-for-byte unchanged. Forwarded from the kernel's
 # `smp-shared` feature. See docs/reference/subsystems/smp-shared.md.
 smp-shared = []
+# Run native net syscalls without the Big Kernel Lock (Phase 2 of
+# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), forwarded from the bin crate.
+# Upgrades PreemptGuard to also mask local IRQs for NETWORK/SOCKET_TABLE holds,
+# so a BKL-free core can never be caught holding an inner spinlock while a
+# nested IRQ hard-spins on the BKL (AB-BA wedge). Only meaningful with
+# `smp-shared`.
+no-bkl-network = []
 # The native smoltcp TCP/IP stack: the smoltcp_net/socket/dns/http modules and
 # everything with smoltcp types in its signatures. Optional so a rump-only build
 # (devbox) can compile it out entirely. The rump path (rump_tap + the kernel
