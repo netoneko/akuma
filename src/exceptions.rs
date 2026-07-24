@@ -1508,6 +1508,8 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     // BKL-free fast path (M5c): a scheduler SGI that preempted EL0. This core held no BKL,
     // and `sgi_scheduler_handler_with_sp` makes the switch atomic on POOL. Reconcile at
     // the end (re)acquires the BKL only if the thread we resume into is EL1.
+    // IMPORTANT: use reconcile_for_spsr_no_ticket here because we never called
+    // enter_kernel — a normal reconcile would leak a ticket.
     #[cfg(kernel_smp_shared)]
     if interrupted_el0
         && crate::smp_shared::sched_bklfree_el0_enabled()
@@ -1520,7 +1522,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
         let spsr = unsafe {
             core::ptr::read_volatile((final_sp as usize + IRQ_FRAME_SPSR_OFFSET) as *const u64)
         };
-        akuma_exec::bkl::reconcile_for_spsr(spsr);
+        akuma_exec::bkl::reconcile_for_spsr_no_ticket(spsr);
         return new_sp;
     }
 

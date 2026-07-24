@@ -94,6 +94,19 @@ pub fn reconcile_for_spsr(spsr: u64) {
     crate::sync::irq_restore(daif);
 }
 
+/// Ticket-free variant of reconcile_for_spsr for use after BKL-free scheduler paths.
+/// When we run the scheduler BKL-free (M5c step-2), we never called `enter_kernel`,
+/// so a reconcile that targets EL1 must acquire without taking a ticket — otherwise
+/// we leak a ticket. This variant uses `KernelLock::reconcile_no_ticket`.
+#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[inline]
+pub fn reconcile_for_spsr_no_ticket(spsr: u64) {
+    let target_is_el0 = (spsr & 0xf) == 0;
+    let daif = crate::sync::irq_save_mask();
+    KERNEL_LOCK.reconcile_no_ticket(current_core_id(), target_is_el0);
+    crate::sync::irq_restore(daif);
+}
+
 /// `true` if this core currently holds the BKL. For assertions / diagnostics.
 #[cfg(all(kernel_smp_shared, target_os = "none"))]
 #[inline]
@@ -115,6 +128,10 @@ pub fn leave_kernel() {}
 #[cfg(not(all(kernel_smp_shared, target_os = "none")))]
 #[inline(always)]
 pub fn reconcile_for_spsr(_spsr: u64) {}
+
+#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[inline(always)]
+pub fn reconcile_for_spsr_no_ticket(_spsr: u64) {}
 
 #[cfg(not(all(kernel_smp_shared, target_os = "none")))]
 #[inline(always)]

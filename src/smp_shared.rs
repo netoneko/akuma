@@ -152,7 +152,7 @@ pub fn set_exec_bkl_drop_enabled(on: bool) {
 /// The POOL-over-switch foundation (step 1 of M5c) is always active regardless. Turning this
 /// back on needs the ticket-accounting leak in the reconcile path fixed first.
 /// Only affects `cfg(kernel_smp_shared)` builds — the default release build is untouched.
-static SCHED_BKLFREE_EL0_ENABLED: AtomicBool = AtomicBool::new(false);
+static SCHED_BKLFREE_EL0_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Whether the BKL-free EL0-preempt scheduler path (M5c step 2) is enabled.
 #[inline]

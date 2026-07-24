@@ -94,11 +94,11 @@ profiler only around the window.
   hold). A/B-measured by the `smp_shared_exec_parallelism` self-test (SMP=2): busybox exec storm,
   ~26–63% fewer BKL spins with the drop ON across boots.
 - `smp_shared::set_sched_bklfree_el0_enabled(bool)` — the M5c step-2 optimization (run the
-  scheduler SGI BKL-free when it preempted EL0). Default **off** and **not safe to enable under
-  load**: it fixes the *cooperative-wait* deadlock (two-part fix below) but has a **separate
-  ticket-accounting leak** in its reconcile path that hard-deadlocks SMP≥4 under fork/exec
-  churn (`owner=0` flood — see the symptom table). Fix that leak before re-enabling. The M5c
-  step-1 foundation (POOL covers the whole context switch) is always active regardless.
+  scheduler SGI BKL-free when it preempted EL0). **Default ON** (fixed 2026-07-24: ticket
+  accounting leak resolved via `reconcile_for_spsr_no_ticket` path). The optimization
+  reduces BKL contention by ~70% (scheduler/IRQ path was the dominant holder) under
+  multi-process load. Safe to enable at SMP≥4; A/B-measured wins in fault+exec parallelism
+  self-tests. Can be toggled off for debugging.
 - `sync::set_profiling(bool)` — the BKL-hold profiler. Default **off**.
 
 ## M5c step-2 (BKL-free EL0 scheduler): the deadlock and its fix

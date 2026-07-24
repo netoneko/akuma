@@ -364,6 +364,67 @@ impl KernelLock {
         }
     }
 
+    /// Ticket-free variant of reconcile for use after BKL-free scheduler paths.
+    /// When we run the scheduler BKL-free (M5c step-2), we never called `enter_kernel`,
+    /// so a reconcile that targets EL1 must acquire without taking a ticket — otherwise
+    /// we leak a ticket (next_ticket advances with no matching now_serving advance).
+    /// This variant uses `acquire_no_ticket` for the acquire case.
+    #[inline]
+    pub fn reconcile_no_ticket(&self, core_id: u32, target_is_el0: bool) {
+        if target_is_el0 {
+            self.release(core_id);
+        } else {
+            self.acquire_no_ticket(core_id);
+        }
+    }
+
+    /// Acquire the lock without taking a FIFO ticket. Used only by the BKL-free
+    /// scheduler reconcile path (M5c step-2) where we never called `enter_kernel`,
+    /// so we must not disturb the ticket accounting. Still idempotent and IRQ-masked
+    /// for the same migration-atomicity reasons as `acquire`.
+    #[inline]
+    pub fn acquire_no_ticket(&self, core_id: u32) {
+        let me = core_id + 1;
+        // Reentrant fast path: this core already owns it. No ticket, no wait.
+        if self.owner.load(Ordering::Acquire) == me {
+            return;
+        }
+        let daif = irq_save_mask();
+        // Re-check after masking: a nested IRQ may have already acquired for this core.
+        if self.owner.load(Ordering::Acquire) == me {
+            irq_restore(daif);
+            return;
+        }
+        // Spin-wait for ownership WITHOUT taking a ticket. This is only safe when
+        // we know the lock will be released by a path that doesn't expect our ticket
+        // (i.e., the BKL-free scheduler path where we're reconciling to EL1 after
+        // having run BKL-free). The wait is unfair here, but the BKL-free path is
+        // already a special case — the normal reconcile path uses the fair ticket lock.
+        let mut spins: u32 = 0;
+        loop {
+            // Try to take ownership directly if the lock is free.
+            if self
+                .owner
+                .compare_exchange(0, me, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                irq_restore(daif);
+                return;
+            }
+            // Check if we already own it (reentrant case after a successful CAS above).
+            if self.owner.load(Ordering::Acquire) == me {
+                irq_restore(daif);
+                return;
+            }
+            spins = spins.wrapping_add(1);
+            if spins == SPIN_WARN_THRESHOLD {
+                spins = 0;
+                log_kernel_lock_stuck(self.owner.load(Ordering::Relaxed), me);
+            }
+            core::hint::spin_loop();
+        }
+    }
+
     /// `true` if `core_id` currently owns the lock.
     #[inline]
     pub fn held_by(&self, core_id: u32) -> bool {
