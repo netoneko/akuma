@@ -31,6 +31,9 @@ pub mod tls_verifier;
 #[cfg(feature = "smoltcp")]
 pub mod http;
 
+// Lock infrastructure for fine-grained locking (Phase 1 of BKL removal)
+pub mod locks;
+
 
 #[cfg(test)]
 mod tests;
