@@ -336,6 +336,14 @@ static TOTAL_CPU_TIMES: [AtomicU64; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
+/// Last core each thread ran on (MPIDR aff0). 0xFF = never scheduled.
+/// Lock-free like THREAD_STATES/TOTAL_CPU_TIMES so sys_get_cpu_stats reads it
+/// without POOL.lock (see USER_COPY_FAULT_HANDLER note above).
+static LAST_CORE: [AtomicU8; MAX_THREADS] = {
+    const INIT: AtomicU8 = AtomicU8::new(0xFF);
+    [INIT; MAX_THREADS]
+};
+
 /// Per-THREAD current syscall number (`!0` = not in a syscall). Set by the
 /// syscall dispatch at entry and cleared at exit, keyed by thread id. Unlike
 /// `Process.current_syscall` (keyed by the address-space owner / leader, so a
@@ -888,6 +896,15 @@ pub fn get_woken_state(idx: usize) -> bool {
 pub fn set_woken_state(idx: usize, val: bool) {
     if idx < MAX_THREADS {
         WOKEN_STATES[idx].store(val, Ordering::SeqCst);
+    }
+}
+
+/// Get the last core a thread ran on (MPIDR aff0). 0xFF = never scheduled.
+pub fn get_thread_last_core(idx: usize) -> u8 {
+    if idx < MAX_THREADS {
+        LAST_CORE[idx].load(Ordering::Relaxed)
+    } else {
+        0xFF
     }
 }
 
@@ -2213,6 +2230,10 @@ impl ThreadPool {
             THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
         }
         THREAD_STATES[next_idx].store(thread_state::RUNNING, Ordering::SeqCst);
+        // Record the core the incoming thread is now running on. commit_switch always
+        // runs on the core that will run next_idx (single runqueue, each core schedules
+        // itself), so current_core_id() is authoritative.
+        LAST_CORE[next_idx].store(crate::bkl::current_core_id() as u8, Ordering::Relaxed);
 
         // Update timing (still in slot, but we own it)
         self.slots[next_idx].start_time_us = now;

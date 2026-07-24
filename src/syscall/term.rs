@@ -456,6 +456,7 @@ pub(super) fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
             tid: i as u32,
             total_time_us: akuma_exec::threading::get_thread_cpu_time(i),
             state: akuma_exec::threading::get_thread_state(i),
+            last_core: akuma_exec::threading::get_thread_last_core(i),
             ..Default::default()
         };
 

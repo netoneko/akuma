@@ -53,8 +53,8 @@ pub extern "C" fn main() {
         }
 
         println("Akuma OS - CPU Stats (press 'q' to quit)");
-        println("TID  PID  BOX ID    STATE       CPU%   TIME(ms)  NAME");
-        println("-------------------------------------------------------");
+        println("TID  PID  BOX ID    STATE    CORE  CPU%   TIME(ms)  NAME");
+        println("-----------------------------------------------------------");
 
         for i in 0..count {
             let cur = &current_stats[i];
@@ -93,6 +93,15 @@ pub extern "C" fn main() {
 
             print(state_str);
             print("  ");
+
+            // CORE column: 0xFF = never scheduled → "-".
+            if cur.last_core == 0xFF {
+                print("  -  ");
+            } else {
+                print_u32_fixed(cur.last_core as u32, 3);
+                print("  ");
+            }
+
             print_f64_fixed(cpu_usage, 1);
             print("%  ");
             print_u64_fixed(cur.total_time_us / 1000, 8);

@@ -127,7 +127,9 @@ pub struct ThreadCpuStat {
     pub box_id: u64,
     pub total_time_us: u64,
     pub state: u8,
-    pub _reserved: [u8; 7],
+    /// Last core the thread ran on (MPIDR aff0). 0xFF = never scheduled.
+    pub last_core: u8,
+    pub _reserved: [u8; 6],
     pub name: [u8; 16],
 }
 

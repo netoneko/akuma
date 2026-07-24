@@ -194,6 +194,9 @@ pub fn run_all_tests() {
     // Test tgkill (syscall 131) is wired — does not return ENOSYS
     test_tgkill_not_enosys();
 
+    // Scheduler records the last core each thread ran on (drives top's CORE column).
+    test_thread_last_core_tracked();
+
     // Regression: hardware RNG live + producing entropy on the negotiated
     // (now modern, version 2) VirtIO transport — guards the force-legacy drop.
     test_rng_entropy_live();
@@ -607,6 +610,59 @@ pub fn run_all_tests() {
     test_no_spurious_svc_traps();
 
     console::print("--- Process Execution Tests Done ---\n\n");
+}
+
+/// The scheduler records, per thread, the last core it ran on (`LAST_CORE`), which
+/// `top`'s new CORE column reads via `sys_get_cpu_stats`. Spawn a cooperative kernel
+/// thread and yield so the scheduler runs it through `commit_switch`; afterwards its
+/// last-core must no longer be the `0xFF` "never scheduled" sentinel and must be a
+/// valid core id (`< MAX_CORES`). On the single-core boot path it must be exactly 0.
+fn test_thread_last_core_tracked() {
+    use akuma_exec::threading;
+
+    let tid = match threading::spawn_fn_cooperative(|| {
+        threading::mark_current_terminated();
+        loop {
+            threading::yield_now();
+            unsafe { core::arch::asm!("wfi") };
+        }
+    }) {
+        Ok(tid) => tid,
+        Err(e) => {
+            crate::safe_print!(96, "[Test] thread_last_core_tracked FAILED to spawn: {}\n", e);
+            return;
+        }
+    };
+
+    // Yield enough that the scheduler picks the new thread at least once (records its core).
+    for _ in 0..10 {
+        threading::yield_now();
+    }
+
+    let core = threading::get_thread_last_core(tid);
+    threading::cleanup_terminated_force();
+
+    // Non-SMP builds always run on core 0 (`current_core_id()` is a `0` shim); SMP builds
+    // are single-core unless the DTB reported >1 CPU.
+    #[cfg(kernel_smp_shared)]
+    let single_core = crate::smp_shared::probed_core_count() <= 1;
+    #[cfg(not(kernel_smp_shared))]
+    let single_core = true;
+
+    const MAX_CORES: u8 = akuma_exec::threading::MAX_CORES as u8;
+    if core == 0xFF {
+        crate::safe_print!(96,
+            "[Test] thread_last_core_tracked FAILED: tid={} never recorded a core (0xFF)\n", tid);
+    } else if core >= MAX_CORES {
+        crate::safe_print!(96,
+            "[Test] thread_last_core_tracked FAILED: tid={} core={} out of range\n", tid, core);
+    } else if single_core && core != 0 {
+        crate::safe_print!(96,
+            "[Test] thread_last_core_tracked FAILED: single-core boot but tid={} core={}\n", tid, core);
+    } else {
+        crate::safe_print!(96,
+            "[Test] thread_last_core_tracked PASSED (tid={} last_core={})\n", tid, core);
+    }
 }
 
 /// See the call site: asserts the [SPURIOUS-SVC] counter stayed 0 across the suite.

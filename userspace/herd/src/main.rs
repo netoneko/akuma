@@ -680,10 +680,12 @@ fn parse_u32(s: &str) -> Option<u32> {
 /// bring up that core's own rump box) load its services without ever scanning a directory.
 fn explicit_service_files() -> Option<Vec<(String, String)>> {
     let mut out: Vec<(String, String)> = Vec::new();
+    let mut saw_service_flag = false;
     let mut i = 1;
     loop {
         match libakuma::arg(i) {
             Some("--service") => {
+                saw_service_flag = true;
                 if let Some(path) = libakuma::arg(i + 1) {
                     let base = path.rsplit('/').next().unwrap_or(path);
                     let name = base.trim_end_matches(".conf");
@@ -702,7 +704,17 @@ fn explicit_service_files() -> Option<Vec<(String, String)>> {
             None => break,
         }
     }
-    if out.is_empty() { None } else { Some(out) }
+    // If ANY `--service` flag was given, this is an explicit-config sub-herd (e.g. a
+    // core-pinned instance): honor exactly that set, even if empty/unreadable. Only fall
+    // back to the enabled-dir scan when NO `--service` flag was seen at all. Falling back
+    // here when a sub-herd's `--service` files are missing would make it re-scan the BSP's
+    // enabled dir — which lists this very sub-herd (command=/bin/herd) and re-launches it,
+    // an unbounded recursive herd fork-bomb.
+    if saw_service_flag {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 fn reload_config(state: &mut HerdState) {
