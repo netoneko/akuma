@@ -628,12 +628,19 @@ This plan breaks up the Big Kernel Lock (BKL) into fine-grained subsystem locks,
 - Comprehensive unit tests for lock ordering
 - Integration with existing akuma-net module structure
 
-### Phase 2 - Network BKL-Free Path 🚧 IN PROGRESS (`no-bkl-network` feature)
-- [x] BKL-free syscall entry points — all 15 smoltcp net syscalls
+### Phase 2 - Network BKL-Free Path ✅ DEFAULT-ON for `smp-shared` (2026-07-24)
+- [x] BKL-free syscall entry points — all 15 smoltcp net syscalls, plus the
+      `read(2)`/`write(2)` Socket arms (sshd's hot path)
 - [ ] Updated IRQ handler (`poll()` still runs under whatever BKL state the caller has)
 - [x] Blocking operations compatible (no inner spinlock held across `blocking_relax`)
 - [x] Boots + SSH login verified at SMP=2 (no wedge, no abort)
-- [ ] Stress tests / A/B contention measurement
+- [x] Stress-tested at SMP=4: real BitTorrent swarm (aria2c, 8 peers, ~3.2 MiB/s,
+      83 MiB) + ssh hammer — 0 wedges, 0 stream corruption, 0 aborts
+- [x] Enabled by default: the bin `smp-shared` feature now includes
+      `no-bkl-network` (default single-core builds verified byte-identical;
+      SMP=4 boot suite green, same counters as HEAD). Remove it from the
+      `smp-shared` feature list in Cargo.toml to A/B against the BKL-held path.
+- [ ] A/B contention measurement (BKL wait-time with/without the drop)
 
 **Design note — why the implementation diverges from the pseudo-code above.**
 The Phase-2 sketch wrapped each syscall in a *new coarse* `NETWORK_LOCK`

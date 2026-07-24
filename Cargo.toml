@@ -157,17 +157,22 @@ smp = ["dep:akuma-smp"]
 # kernel image, one PMM/heap, and one run queue under real cross-core locks.
 # Mutually exclusive with `smp` (build.rs enforces). See
 # docs/reference/subsystems/smp-shared.md and docs/archive/SMP_SHARED.md.
-smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared"]
+# Includes `no-bkl-network` (BKL-free native net syscalls) by default since
+# 2026-07-24: validated at SMP=4 under a real BitTorrent swarm + ssh hammer
+# (0 wedges, 0 corruption) after the socket-refcount / wait_until / pipe-SIGPIPE
+# fixes. To A/B against the BKL-held net path, remove it from this list.
+smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared", "no-bkl-network"]
 
 # Run the native (smoltcp) network syscalls WITHOUT the Big Kernel Lock — the
 # first subsystem carved out of the BKL (docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
-# Phase 2). Only meaningful together with `smp-shared`: build.rs emits
-# `cfg(kernel_no_bkl_network)` from CARGO_FEATURE_NO_BKL_NETWORK, and the net
-# syscall entry points then DROP the BKL for their duration, relying on the
-# existing fine-grained NETWORK / SOCKET_TABLE / fd-table spinlocks for cross-core
-# mutual exclusion instead. A no-op (byte-for-byte unchanged) on every build that
-# doesn't set both features. Experimental: gates the BKL-free network path so it
-# can be A/B tested before the BKL is removed subsystem by subsystem.
+# Phase 2). Only meaningful together with `smp-shared` (and included in it by
+# default): build.rs emits `cfg(kernel_no_bkl_network)` from
+# CARGO_FEATURE_NO_BKL_NETWORK, and the net syscall entry points then DROP the
+# BKL for their duration, relying on the existing fine-grained NETWORK /
+# SOCKET_TABLE / fd-table spinlocks for cross-core mutual exclusion instead
+# (PreemptGuard additionally masks IRQs for those holds — see
+# crates/akuma-net/src/runtime.rs). A no-op (byte-for-byte unchanged) on every
+# build that doesn't set both features.
 no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network"]
 
 # Rump-kernel support: a raw L2 packet path so a userspace NetBSD rump TCP/IP
