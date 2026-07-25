@@ -2148,6 +2148,27 @@ pub fn spurious_svc_count() -> u64 {
 /// else's trap. Same for ELR_EL1 — use the frame's saved copy.
 extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u64) -> u64 {
     akuma_exec::bkl::enter_kernel();
+    // Tripwire: a thread entering from EL0 can have no open dropped-BKL window — the
+    // guards live entirely inside one excursion. A nonzero depth here is a leak (an
+    // abnormal unwind skipped a guard's destructor, or a recycled slot inherited state);
+    // left in place it would make this excursion's IRQ epilogues silently RELEASE the
+    // BKL mid-syscall. Heal it and say so.
+    #[cfg(kernel_smp_shared)]
+    if akuma_exec::bkl::in_dropped_window() {
+        let leaked = akuma_exec::bkl::reset_dropped_windows();
+        if leaked != 0 {
+            static STALE_WINDOW_TRACE: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            if STALE_WINDOW_TRACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+                crate::safe_print!(
+                    96,
+                    "[BKL] stale dropped-window depth {} healed at EL0 entry (tid={})\n",
+                    leaked,
+                    akuma_exec::threading::current_thread_id(),
+                );
+            }
+        }
+    }
     // Record that this core serviced a user (EL0) trap — the M3 cross-core-userspace
     // proof (an EL0 trap only comes from userspace running on this core).
     #[cfg(kernel_smp_shared)]
@@ -2861,16 +2882,17 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         // M5b Stage 4a: DROP the BKL for the block-I/O fill so peer cores can
                         // enter the kernel while this core waits on the disk (the measured
                         // ~10 ms hold). Pass B touches only PRIVATE frames + the block device
-                        // (own lock) + the held fault-slot — no BKL-protected state. A timer
-                        // may re-acquire the BKL for us via the IRQ reconcile (then the
-                        // enter_kernel below is idempotent); the wrapper's leave_kernel still
-                        // balances it. Concurrent munmap clears PTEs but never frees the
-                        // intermediate tables this loop's page-table reads walk (freed only at
-                        // teardown, which can't run while this thread faults).
+                        // (own lock) + the held fault-slot — no BKL-protected state. The
+                        // dropped-window ledger keeps the fill BKL-free across timer ticks
+                        // (the IRQ reconcile used to re-hold it for the fill's remainder);
+                        // the wrapper's leave_kernel still balances it. Concurrent munmap
+                        // clears PTEs but never frees the intermediate tables this loop's
+                        // page-table reads walk (freed only at teardown, which can't run
+                        // while this thread faults).
                         #[cfg(kernel_smp_shared)]
                         let fault_dropped_bkl = crate::smp_shared::fault_bkl_drop_enabled();
                         #[cfg(kernel_smp_shared)]
-                        if fault_dropped_bkl { akuma_exec::bkl::leave_kernel(); }
+                        if fault_dropped_bkl { akuma_exec::bkl::dropped_window_open(); }
                         let mut cur_va = page_va;
                         while cur_va < ra_end {
                             if akuma_exec::mmu::is_current_user_page_mapped(cur_va) {
@@ -2920,10 +2942,10 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             filled.push((cur_va, pf));
                             cur_va += 0x1000;
                         }
-                        // Re-take the BKL for the install pass (idempotent if a timer already
-                        // reacquired it for us during the fill above).
+                        // Close the window: re-takes the BKL for the install pass (unless a
+                        // still-open outer window means it must stay dropped).
                         #[cfg(kernel_smp_shared)]
-                        if fault_dropped_bkl { akuma_exec::bkl::enter_kernel(); }
+                        if fault_dropped_bkl { akuma_exec::bkl::dropped_window_close(); }
 
                         // Pass C — INSTALL (under `as_lock`): atomically map each filled frame
                         // + track it. Short, no alloc/IO. A frame that loses the install race
@@ -3396,7 +3418,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         #[cfg(kernel_smp_shared)]
                         let fault_dropped_bkl = crate::smp_shared::fault_bkl_drop_enabled();
                         #[cfg(kernel_smp_shared)]
-                        if fault_dropped_bkl { akuma_exec::bkl::leave_kernel(); }
+                        if fault_dropped_bkl { akuma_exec::bkl::dropped_window_open(); }
                         let mut cur_va = page_va;
                         while cur_va < ra_end {
                             if akuma_exec::mmu::is_current_user_page_mapped(cur_va) {
@@ -3439,10 +3461,10 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             filled.push((cur_va, pf));
                             cur_va += 0x1000;
                         }
-                        // Re-take the BKL for the install pass (idempotent if a timer already
-                        // reacquired it during the fill).
+                        // Close the window: re-takes the BKL for the install pass (unless a
+                        // still-open outer window means it must stay dropped).
                         #[cfg(kernel_smp_shared)]
-                        if fault_dropped_bkl { akuma_exec::bkl::enter_kernel(); }
+                        if fault_dropped_bkl { akuma_exec::bkl::dropped_window_close(); }
 
                         // Pass C — INSTALL (under `as_lock`): atomic map + track per frame.
                         let mut any_mapped = false;

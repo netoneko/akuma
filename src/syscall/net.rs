@@ -87,10 +87,12 @@ pub(super) fn remote_socket_handle(fd: u32) -> Option<u32> {
 /// without wedging (unlike wrapping the whole syscall in one coarse lock).
 ///
 /// Re-acquiring on drop keeps the syscall wrapper's single `leave_kernel`
-/// (`rust_sync_el0_handler` in exceptions.rs) balanced. A nested IRQ or page fault
-/// that re-takes the BKL during the dropped window is harmless: `enter_kernel` is
-/// idempotent for the owner, exactly the contract the `exec_dropped_bkl` and
-/// file-fault BKL-drop paths already rely on.
+/// (`rust_sync_el0_handler` in exceptions.rs) balanced. The pair goes through
+/// `bkl::dropped_window_open`/`close`, registering the window in the per-thread ledger
+/// so a nested IRQ, page fault, blocking wait, or context switch RESTORES the dropped
+/// state on resume instead of silently re-holding the BKL for the window's remainder
+/// (the `[BKL] stuck` conversion, docs/archive/BKL_VFS_CARVE_OUT.md §8 — net's blocking
+/// recv/accept windows were converted on every wake before the ledger existed).
 ///
 /// Zero-cost no-op unless BOTH `kernel_smp_shared` and `kernel_no_bkl_network` are
 /// set — the struct is empty and `new`/`drop` compile to nothing, so default,
@@ -103,7 +105,7 @@ impl NetBklGuard {
     #[inline]
     pub(super) fn new() -> Self {
         #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
-        akuma_exec::bkl::leave_kernel();
+        akuma_exec::bkl::dropped_window_open();
         Self
     }
 }
@@ -113,7 +115,7 @@ impl Drop for NetBklGuard {
     #[inline]
     fn drop(&mut self) {
         #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
-        akuma_exec::bkl::enter_kernel();
+        akuma_exec::bkl::dropped_window_close();
     }
 }
 

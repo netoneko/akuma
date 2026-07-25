@@ -2558,8 +2558,15 @@ pub fn idle_halt() {
     // the interrupt (timer tick / device) is taken and serviced before WFI returns.
     unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
     // Re-take the BKL for the post-halt bookkeeping below (idempotent if the waking
-    // IRQ's reconcile already re-acquired it for this thread). No-op unless smp-shared.
-    crate::bkl::enter_kernel();
+    // IRQ's reconcile already re-acquired it for this thread) — UNLESS this thread sits
+    // inside a deliberately-dropped-BKL window (a guarded net/vfs syscall relaxing via
+    // blocking_relax): re-taking here would re-hold the BKL for the window's remainder,
+    // exactly the conversion the dropped-window ledger exists to prevent. The
+    // bookkeeping below is safe BKL-free — it touches only POOL under its own IRQ-masked
+    // lock. No-op unless smp-shared.
+    if !crate::bkl::in_dropped_window() {
+        crate::bkl::enter_kernel();
+    }
     let halted = (runtime().uptime_us)().saturating_sub(entered);
     if tid < MAX_THREADS && halted > 0 {
         let _guard = IrqGuard::new();

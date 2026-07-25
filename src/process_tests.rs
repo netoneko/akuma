@@ -137,6 +137,12 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_smp_shared_exec_parallelism();
 
+    // A deliberately-dropped-BKL window (Vfs/Net guards, exec/fault drops) must SURVIVE
+    // timer IRQs and scheduler crossings — regression for the `[BKL] stuck` conversion
+    // where the first tick inside a window re-held the BKL for the window's remainder.
+    #[cfg(kernel_smp_shared)]
+    test_smp_shared_dropped_window_survives_irq();
+
     // `no-bkl-vfs`: concurrent fs syscalls (read/stat/getdents) from several processes must
     // stay correct with the BKL dropped, and should lower cross-core BKL contention.
     #[cfg(kernel_smp_shared)]
@@ -1080,6 +1086,78 @@ fn test_smp_shared_exec_parallelism() {
             192,
             "[Test] smp_shared_exec_parallelism PASSED (measured; drop ON did not lower spins here: +{} — expected on host-cached disk)\n",
             spins_on.saturating_sub(spins_off)
+        );
+    }
+}
+
+/// Regression test for the `[BKL] stuck` conversion (docs/archive/BKL_VFS_CARVE_OUT.md §8):
+/// a deliberately-dropped-BKL window must stay BKL-FREE across timer IRQs, voluntary
+/// yields, and the context switches they cause.
+///
+/// Before the dropped-window ledger, the first IRQ landing inside a window would
+/// `enter_kernel` for its handler and the eret epilogue — seeing an EL1 target — would
+/// KEEP the lock, silently converting the window's remainder (tens of ms of bulk ext2
+/// I/O) into a BKL-held run. The dwell below is longer than several 10 ms timer ticks,
+/// so on the pre-ledger kernel the mid-window assertion deterministically fails.
+///
+/// Also pins the nesting contract: an inner window's close must NOT re-acquire while the
+/// outer window is still open; the outermost close must.
+#[cfg(kernel_smp_shared)]
+fn test_smp_shared_dropped_window_survives_irq() {
+    use akuma_exec::bkl;
+
+    // Make the starting state definite (idempotent if this thread already holds it).
+    bkl::enter_kernel();
+    if !bkl::held_by_current() {
+        console::print(
+            "[Test] smp_shared_dropped_window_survives_irq FAILED: could not establish baseline hold\n",
+        );
+        return;
+    }
+    let preserved_before = bkl::dropped_windows_preserved();
+
+    bkl::dropped_window_open();
+    let open_released = !bkl::held_by_current();
+
+    // Cross the IRQ epilogue both ways: scheduler crossings via voluntary yields, and a
+    // real dwell (~3.5 timer ticks) so genuine timer IRQs land inside the open window.
+    for _ in 0..8 {
+        akuma_exec::threading::yield_now();
+    }
+    let start = crate::timer::uptime_us();
+    while crate::timer::uptime_us().saturating_sub(start) < 35_000 {
+        core::hint::spin_loop();
+    }
+    let survived_irqs = !bkl::held_by_current();
+
+    // Nested window: closing the INNER window must leave the outer window BKL-free.
+    bkl::dropped_window_open();
+    for _ in 0..4 {
+        akuma_exec::threading::yield_now();
+    }
+    bkl::dropped_window_close();
+    let nested_close_stayed_free = !bkl::held_by_current();
+
+    // Outermost close re-acquires.
+    bkl::dropped_window_close();
+    let outer_close_reacquired = bkl::held_by_current();
+    let preserved = bkl::dropped_windows_preserved().saturating_sub(preserved_before);
+
+    if open_released && survived_irqs && nested_close_stayed_free && outer_close_reacquired {
+        crate::safe_print!(
+            160,
+            "[Test] smp_shared_dropped_window_survives_irq PASSED ({} eret(s) preserved the window)\n",
+            preserved
+        );
+    } else {
+        crate::safe_print!(
+            224,
+            "[Test] smp_shared_dropped_window_survives_irq FAILED: open_released={} survived_irqs={} nested_close_stayed_free={} outer_close_reacquired={} (preserved={})\n",
+            open_released,
+            survived_irqs,
+            nested_close_stayed_free,
+            outer_close_reacquired,
+            preserved
         );
     }
 }

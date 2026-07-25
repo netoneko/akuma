@@ -23,11 +23,13 @@ const EROFS: u64 = (-30i64) as u64;
 /// non-fs work on other cores proceed in parallel.
 ///
 /// Re-acquiring on drop keeps the syscall wrapper's single `leave_kernel`
-/// (`rust_sync_el0_handler` in exceptions.rs) balanced. A nested IRQ or page fault
-/// that re-takes the BKL during the dropped window is harmless: `enter_kernel` is
-/// idempotent for the owner, exactly the contract the `exec_dropped_bkl` and
-/// file-fault BKL-drop paths already rely on (and that
-/// `kernel_lock_midexcursion_drop_reacquire_stays_balanced` proves).
+/// (`rust_sync_el0_handler` in exceptions.rs) balanced. The drop/re-acquire pair goes
+/// through `bkl::dropped_window_open`/`close`, which registers the window in the
+/// per-thread ledger so a nested IRQ, page fault, or context switch RESTORES the
+/// dropped state on its way back in. (The first version used bare
+/// `leave_kernel`/`enter_kernel`: balanced, but the first timer tick inside the window
+/// re-held the BKL for the syscall's remainder — tens of ms for bulk ext2 I/O — which
+/// was the `[BKL] stuck` regression, docs/archive/BKL_VFS_CARVE_OUT.md §8.)
 ///
 /// Zero-cost no-op unless BOTH `kernel_smp_shared` and `kernel_no_bkl_vfs` are set
 /// (or the runtime toggle `vfs_bkl_drop_enabled()` is off) — the struct is empty
@@ -58,7 +60,7 @@ impl VfsBklGuard {
         let dropped_bkl = crate::smp_shared::vfs_bkl_drop_enabled();
         #[cfg(all(kernel_smp_shared, kernel_no_bkl_vfs))]
         if dropped_bkl {
-            akuma_exec::bkl::leave_kernel();
+            akuma_exec::bkl::dropped_window_open();
         }
         Self {
             #[cfg(all(kernel_smp_shared, kernel_no_bkl_vfs))]
@@ -87,7 +89,7 @@ impl Drop for VfsBklGuard {
         // Latched in `new()` — deliberately NOT a fresh `vfs_bkl_drop_enabled()` read.
         #[cfg(all(kernel_smp_shared, kernel_no_bkl_vfs))]
         if self.dropped_bkl {
-            akuma_exec::bkl::enter_kernel();
+            akuma_exec::bkl::dropped_window_close();
         }
     }
 }

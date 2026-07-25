@@ -765,11 +765,18 @@ work is a BKL-drop guard plus inner-lock hardening. No new locks were introduced
 - [x] Block I/O path — covered transitively, no change needed (that doc §3.2)
 - [x] Phase 2a: read-path syscalls converted (9 syscalls)
 - [x] Boot self-test + host tests passing at SMP=2
+- [x] `[BKL] stuck` regression root-caused + FIXED (that doc §9): the IRQ-epilogue
+      reconcile was converting every dropped window into a BKL-held run at the first timer
+      tick; fixed with a per-thread dropped-window ledger consulted at every eret. Applies
+      to ALL droppers (vfs, net, exec, file-fault), 0 stuck in the re-run regimen.
 - [ ] Phase 2b/2c/2d: `openat`/`close`/`dup`/`fcntl`, the mutating syscalls, `chdir` family
-- [ ] Phase 2e: eager file-backed `mmap` arm
+      (2c urgency data point: one `rm` of a 735 MB file = ~40 s BKL hold, 274 stuck warns)
+- [ ] Phase 2e: eager file-backed `mmap` arm — verify with the `userspace/` mmap stress
+      test + llama.cpp mmap model-load end-to-end (per user, 2026-07-25)
 - [ ] A contention signal (current A/B is cache-resident, measures 0 spins either way)
-- [ ] SMP=4 stress — the AB-BA failure mode this targets only appeared at SMP=4 for net
-- [ ] Combined net+VFS large-download I/O regimen (that doc §8)
+- [ ] SMP=4 stress — the AB-BA failure mode this targets only appeared at SMP=4 for net;
+      note the §9 fix widens true window concurrency, so this matters MORE now
+- [x] Combined net+VFS large-download I/O regimen (that doc §8, re-run post-fix §9.4)
 
 ### Phase 5 - Memory Management Locks
 - [ ] `as_lock` extended

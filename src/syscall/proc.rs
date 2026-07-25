@@ -639,16 +639,16 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
         // enter the kernel while this core waits on disk (execve's dominant BKL-held window).
         // Safe: this runs before `replace_image` touches the process, and the read goes only
         // through the VFS/ext2/block locks (all BKL-independent) — the same profile as the
-        // proven file-fault drop. We re-take the BKL before inspecting the result / any
-        // further kernel work; a timer may re-acquire it for us meanwhile (enter_kernel is
-        // idempotent), and the syscall wrapper's leave_kernel still balances it.
+        // proven file-fault drop. The dropped-window ledger keeps the window BKL-free across
+        // timer ticks (a bare leave/enter pair let the first tick re-hold the BKL for the
+        // rest of the read); the syscall wrapper's leave_kernel still balances it.
         #[cfg(kernel_smp_shared)]
         let exec_dropped_bkl = crate::smp_shared::exec_bkl_drop_enabled();
         #[cfg(kernel_smp_shared)]
-        if exec_dropped_bkl { akuma_exec::bkl::leave_kernel(); }
+        if exec_dropped_bkl { akuma_exec::bkl::dropped_window_open(); }
         let read_result = crate::fs::read_file(&resolved_path);
         #[cfg(kernel_smp_shared)]
-        if exec_dropped_bkl { akuma_exec::bkl::enter_kernel(); }
+        if exec_dropped_bkl { akuma_exec::bkl::dropped_window_close(); }
         match read_result {
             Ok(data) => Some(data),
             Err(crate::vfs::FsError::Internal) => None,

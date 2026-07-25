@@ -5,8 +5,9 @@ Phase 4 of [BKL_FINE_GRAINED_LOCKING_PLAN.md](BKL_FINE_GRAINED_LOCKING_PLAN.md),
 (Phase 2, that doc's §631) and reuses its hardening discipline.
 
 **Status: Phase 1 (foundation) + Phase 2a (read-path syscalls) + Phase 3.1 (ext2 hardening)
-shipped and verified at SMP=2. Phases 2b–2e (mutating syscalls, `mmap` eager arm) NOT
-started. SMP=4 stress NOT run.**
+shipped and verified at SMP=2. The §8 `[BKL] stuck` regression is ROOT-CAUSED AND FIXED
+(§9: per-thread dropped-window ledger; 0 stuck in the re-run regimen). Phases 2b–2e
+(mutating syscalls, `mmap` eager arm) NOT started. SMP=4 stress NOT run.**
 
 ---
 
@@ -249,20 +250,29 @@ Not caused by this work; recorded so they aren't re-attributed:
 1. **Phase 2b** — `sys_openat`, `sys_close`, `sys_dup`, `sys_dup3`, `sys_fcntl`.
 2. **Phase 2c** — the mutating syscalls (`mkdirat`, `unlinkat`, `renameat2`, `symlinkat`,
    `linkat`, `readlinkat`, `fchmodat`, `fchmod`, `truncate`, `ftruncate`, `fallocate`).
-   These take the ext2 **write** guard, so they are the real test of §3.
+   These take the ext2 **write** guard, so they are the real test of §3. Fresh evidence
+   this matters: a single `rm` of a 735 MB file held the BKL for ~40 s and produced 274
+   consecutive `[BKL] stuck` warnings on the peer core (all self-healed, no data loss) —
+   measured 2026-07-25 during the §9 validation, on a kernel whose read paths were clean.
 3. **Phase 2d** — `chdir`, `fchdir`, `getcwd`, `fstatfs`.
 4. **Phase 2e** — the eager file-backed `sys_mmap` arm (`src/syscall/mem.rs`), closing the
    asymmetry where the lazy fault path drops the BKL but the eager path does not. Needs an
-   `as_lock` audit first.
+   `as_lock` audit first. **Verification plan (per user, 2026-07-25):** the existing mmap
+   stress test in `userspace/`, plus llama.cpp with mmap model loading as the end-to-end
+   consumer check (model loads + serves — the same harness that validated the
+   mmap-bigger-than-RAM and mmap_regions-race work).
 5. **A contention signal.** The current A/B is uninformative because everything is
    cache-resident. Needs a working set exceeding the block cache.
 6. **SMP=4 stress.** The failure mode this hardening targets (AB-BA under nested IRQ) is
    what net hit at SMP=4, not SMP=2. Until that runs, §3 is argued-correct, not
-   demonstrated-correct.
-7. **`[BKL] stuck` regression (§8) — highest priority.** 8 vs 0 in a controlled A/B. Benign
-   so far (self-heals, no data loss), but it is the same signature as net's SMP=4 wedge.
-   Understand it before SMP=4 stress and before Phase 2c.
-8. **I/O regimen** — done for the read path (§8); re-run after each of 2b–2e.
+   demonstrated-correct. Note the §9 fix also WIDENS true window concurrency (windows now
+   survive IRQs instead of silently re-serializing), so SMP=4 exercises §3 harder than any
+   pre-fix run did.
+7. ~~**`[BKL] stuck` regression (§8) — highest priority.**~~ **RESOLVED — root-caused and
+   fixed, see §9.** The doubling/re-queue hypothesis in §8 was wrong; the real mechanism
+   was IRQ-epilogue reconcile converting dropped windows into BKL-held runs.
+8. **I/O regimen** — done for the read path (§8), re-run post-fix (§9.4); re-run after
+   each of 2b–2e.
 
 ---
 
@@ -347,3 +357,105 @@ core doing bulk fs I/O therefore repeatedly re-queues, and the peer observes lon
 self-healed). But the SMP=4 hard wedge that `no-bkl-network` hit presented as exactly this —
 `[BKL] stuck` with a frozen owner — so **this must be understood before SMP=4 stress, and
 before Phase 2c puts the ext2 *write* guard on this path.** It is the top open item.
+
+> **2026-07-25, same day:** resolved — see §9. The "doubles BKL acquisitions / fresh ticket
+> at the back of the FIFO" mechanism above was **wrong**: the lock is a fair FIFO, so with
+> two cores a 10M-spin wait cannot come from queueing — only from a genuine tens-of-ms
+> *hold*. The real mechanism was found by reading the IRQ path, and it is worse and more
+> interesting.
+
+---
+
+## 9. The `[BKL] stuck` regression: root cause and fix — 2026-07-25
+
+### 9.1 Root cause: one IRQ converts a dropped window into a BKL-held run
+
+The reconcile invariant is "BKL held iff EL1", enforced at every `eret`
+(`reconcile_for_spsr`, called from the IRQ epilogues in `exceptions.rs`). A guard's dropped
+window deliberately violates that invariant — and the violation did not survive the first
+interrupt:
+
+1. Core takes a guarded fs syscall, `VfsBklGuard` drops the BKL. So far so good.
+2. A **timer IRQ** lands inside the window. The device-IRQ path does `enter_kernel()`
+   unconditionally (the handler needs the BKL), and its epilogue reconciles to the
+   *interrupted frame's* SPSR — which is **EL1** — so it **keeps the BKL held**.
+3. The `eret` resumes the middle of the "BKL-free" window **with the BKL held**. Nothing
+   ever notices: the guard's `drop()` re-acquire is the owner-reentrant no-op, and the
+   syscall wrapper's `leave_kernel` releases at the end. Balanced, correct — and silently
+   serialized.
+
+At the regimen's measured ~2.5 MB/s ext2 write speed, one 64 KiB `sys_write` is a ~20 ms
+syscall, so the 10 ms tick landed inside essentially **every** bulk-I/O syscall — each one
+then held the BKL for its remainder. Baseline (`no-bkl-vfs` OUT) shows 0 stuck because its
+holds get *chopped by preemption*: a tick that context-switches to an EL0 thread releases
+the BKL at the eret. The converted windows resisted exactly that chop — the ext2
+`PreemptGuard` holds (IRQs masked across virtio busy-polls, §3.1) keep deferring the tick —
+so the holds ran long enough to cross the 10M-spin warning. The same conversion applied to
+every dropper: `NetBklGuard` (converted on every blocking-recv wake), the execve ELF-read
+drop, and the file-fault fill drop.
+
+### 9.2 Fix: a per-thread dropped-window ledger, consulted at every eret
+
+`akuma_exec::bkl` now keeps a **per-thread depth of open dropped-BKL windows**
+(`DroppedWindowLedger`, host-tested; `MAX_THREADS` entries of plain atomics):
+
+- All five dropper sites go through `bkl::dropped_window_open()` / `dropped_window_close()`
+  instead of bare `leave_kernel`/`enter_kernel`: `VfsBklGuard`, `NetBklGuard`, the execve
+  ELF-read drop (`syscall/proc.rs`), and both file-fault fill drops (`exceptions.rs`).
+- `reconcile_for_spsr` (and `_no_ticket`) treat "target is EL1 **and** the resumed thread
+  has an open window" as *release*: the eret restores the state the interrupted code chose.
+  The check is thread-scoped (not core-scoped) because windows survive preemption, blocking
+  waits, and cross-core migration; it reads the *incoming* thread, which is authoritative at
+  the epilogue because `commit_switch` has already published it.
+- `close()` re-acquires only for the **outermost** window, so a fault-drop nested inside a
+  vfs window no longer converts the outer window on its way out (a pre-existing lesser form
+  of the same bug).
+- `idle_halt`'s post-WFI re-take is skipped inside a window (`blocking_relax` from a guarded
+  net wait used to convert the window right there).
+- Ordering is chosen so a race with an IRQ is benign in both directions: `open` publishes
+  the depth *before* releasing; `close` decrements *before* re-acquiring.
+
+Leak containment (a stale depth on a recycled thread slot would make unrelated EL1 code run
+BKL-free — catastrophic): `return_to_kernel_from_fault` force-clears the ledger (the EL1
+fault-kill path abandons the kernel stack, skipping guard destructors), and
+`rust_sync_el0_handler` carries a tripwire — entry from EL0 with nonzero depth is healed and
+logged (`[BKL] stale dropped-window depth …`), since no window can legally span an EL0
+crossing.
+
+Diagnostics: each preserved window logs with decaying frequency
+(`[BKL] dropped window preserved across IRQ xN`, power-of-two sampled), and
+`bkl::dropped_windows_preserved()` exposes the counter.
+
+### 9.3 Tests
+
+- **Host:** `bkl::tests::dropped_window_ledger_{nesting_and_isolation, unbalanced_close_saturates,
+  reset_and_bounds}` pin the ledger contract. Full workspace suite green.
+- **Boot self-test:** `test_smp_shared_dropped_window_survives_irq` (`src/process_tests.rs`)
+  opens a window, yields through the scheduler and dwells >3 timer ticks, and asserts the
+  BKL stays dropped (deterministically fails pre-fix), plus the nesting contract.
+  SMP=2 result: `PASSED (18 eret(s) preserved the window)`. Full suite: 225 PASSED, the only
+  failures the two known pre-existing ones (§6), 0 PANIC; the ~16 `[BKL] stuck` in the boot
+  log are the known NEON/FP-test-region spikes (§6), unchanged.
+
+### 9.4 Regimen re-run (same harness as §8) — fixed build, `no-bkl-vfs` ON, SMP=2
+
+| check | result |
+|---|---|
+| W (3× 8 MiB net→disk + disk→disk copy) | **6/6 digests exact** |
+| 32 MiB net→disk + 32 MiB `cp`, ×2 (fresh boot) | all **exact** |
+| `[BKL] stuck` during W + 32 MiB transfers | **0** (was 8 on W alone) |
+| `RECOVERED` | 8–13 (baseline band: 15–22) |
+| PANIC / WILD / SPURIOUS | 0 |
+| windows preserved across IRQs | >32,768 in one boot — each a conversion the pre-fix kernel suffered |
+| throughput | 32 MiB ingress **3.9 MB/s** (pre-fix §8: ~2.5–3.4); in-VM 32 MiB `cp` ~6.5 MB/s r+w |
+
+Two harness gotchas found while validating, so nobody re-burns the time:
+
+- **`devbox.img` accumulates artifacts across sessions.** The 32 MiB test initially "failed"
+  with truncation-at-22 MiB then instant 0-byte curls: the 1 GB image still carried a 735 MB
+  Debian ISO from an earlier aria2 session, and the disk was simply FULL. `curl -s` swallows
+  the ENOSPC (host server sees `BrokenPipeError`), and busybox `df /` can't resolve the
+  mount point on this box — check with `ls -l /` before bulk-I/O tests.
+- The 274-stuck storm during the cleanup `rm` of that ISO is the Phase 2c data point quoted
+  in §7.2 — a real, reproducible motivation for guarding the mutating syscalls, and equally
+  a warning that Phase 2c must land the §3 write-guard hardening first.

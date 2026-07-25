@@ -1334,6 +1334,13 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
 /// - `kill_thread_group` has already terminated all sibling threads, so there
 ///   are no live waiters to wake via FUTEX_OWNER_DIED.
 pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
+    // This thread's kernel call stack was ABANDONED (ELR redirected here after an EL1
+    // fault), so any live BKL-carve-out guard never ran its destructor. Clear the
+    // thread's dropped-window ledger and restore the "EL1 holds the BKL" invariant
+    // before touching shared teardown state — a stale window would otherwise make the
+    // IRQ epilogues release the BKL mid-teardown (and poison the recycled slot).
+    // No-op unless smp-shared.
+    crate::bkl::reset_dropped_windows();
     // Serialize teardown against concurrent lifecycle ops (mirrors `return_to_kernel`).
     // Released explicitly before the terminal yield loop below — see the comment there.
     let lifecycle = LifecycleGuard::acquire();
