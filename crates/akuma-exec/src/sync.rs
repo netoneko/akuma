@@ -554,10 +554,19 @@ fn log_kernel_lock_stuck(owner: u32, me: u32) {
         }
     }
     let mut buf = Buf([0u8; 96], 0);
+    // Attribute the hold: what the owner core was doing when it last entered the kernel
+    // (tag: syscall nr, 500=fault, 501=IRQ/scheduler, 511=unknown; see the profiler above).
+    // Only meaningful while `set_profiling(true)` — otherwise reads as 511 — but always
+    // printed so a stuck episode during a profiled window self-attributes.
+    let tag = if owner >= 1 && ((owner - 1) as usize) < PROFILE_MAX_CORES {
+        HOLDER_TAG[(owner - 1) as usize].0.load(Ordering::Relaxed)
+    } else {
+        HOLD_TAG_UNKNOWN
+    };
     let _ = writeln!(
         buf,
-        "[BKL] stuck: owner={} waiter={} (core ids are aff0+1)",
-        owner, me
+        "[BKL] stuck: owner={} waiter={} tag={} (aff0+1)",
+        owner, me, tag
     );
     if buf.1 > 0 {
         if let Ok(s) = core::str::from_utf8(&buf.0[..buf.1]) {

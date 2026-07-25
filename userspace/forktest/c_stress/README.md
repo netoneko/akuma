@@ -1,7 +1,20 @@
-# mmap_stress — C-only mmap control binary
+# c_stress — C-only mmap/fault control binaries
 
-Pure musl static ELF (no Go runtime). Mirrors the mmap loop shape of `forktest_child`
-`runMmapStress` so you can tell kernel mmap faults from Go allocator bugs.
+Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel's.
+
+- `mmap_stress` — anon mmap/memset/munmap churn; mirrors `forktest_child`
+  `runMmapStress` so you can tell kernel mmap faults from Go allocator bugs.
+- `mmap_file` — file-backed mmap + touch every page (demand-paging/readahead driver;
+  proves an over-RAM file SIGSEGVs the process, not the kernel).
+- `mmapsum` — content integrity of file-backed mmap vs `read()`: hashes the same file
+  via read, two mmap passes, an `madvise(MADV_WILLNEED)` pre-faulted mapping, and a
+  2-thread concurrent mapping. The `madv:` line is the regression check for the
+  2026-07-25 bug where WILLNEED installed ZEROED frames over file-backed lazy pages
+  (llama.cpp garbage-with-mmap).
+- `fpfault` — FP/NEON register integrity across demand faults (all 32 Q regs
+  canaried over every faulting touch).
+- `neonfault` — data integrity of NEON loads that cross a page boundary into an
+  unmapped demand-paged page (the quantized-GEMM access shape).
 
 ## Build (host)
 

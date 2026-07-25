@@ -255,12 +255,10 @@ Not caused by this work; recorded so they aren't re-attributed:
    consecutive `[BKL] stuck` warnings on the peer core (all self-healed, no data loss) —
    measured 2026-07-25 during the §9 validation, on a kernel whose read paths were clean.
 3. **Phase 2d** — `chdir`, `fchdir`, `getcwd`, `fstatfs`.
-4. **Phase 2e** — the eager file-backed `sys_mmap` arm (`src/syscall/mem.rs`), closing the
-   asymmetry where the lazy fault path drops the BKL but the eager path does not. Needs an
-   `as_lock` audit first. **Verification plan (per user, 2026-07-25):** the existing mmap
-   stress test in `userspace/`, plus llama.cpp with mmap model loading as the end-to-end
-   consumer check (model loads + serves — the same harness that validated the
-   mmap-bigger-than-RAM and mmap_regions-race work).
+4. ~~**Phase 2e** — the eager file-backed `sys_mmap` arm.~~ **DONE — see §10.** Shipped as
+   fill-before-install inside a `VfsBklGuard` window; verified with the
+   `userspace/forktest/c_stress` mmap tools + llama.cpp mmap model loading end-to-end
+   (which exposed and fixed the pre-existing `MADV_WILLNEED` zero-fill corruption, §10.3).
 5. **A contention signal.** The current A/B is uninformative because everything is
    cache-resident. Needs a working set exceeding the block cache.
 6. **SMP=4 stress.** The failure mode this hardening targets (AB-BA under nested IRQ) is
@@ -459,3 +457,88 @@ Two harness gotchas found while validating, so nobody re-burns the time:
 - The 274-stuck storm during the cleanup `rm` of that ISO is the Phase 2c data point quoted
   in §7.2 — a real, reproducible motivation for guarding the mutating syscalls, and equally
   a warning that Phase 2c must land the §3 write-guard hardening first.
+
+---
+
+## 10. Phase 2e (eager file-backed `mmap`) + the llama.cpp end-to-end — 2026-07-25
+
+### 10.1 What shipped
+
+- **Eager file-backed fill restructured to fill-before-install** (`sys_mmap`,
+  `src/syscall/mem.rs`): frames are filled from the file while still PRIVATE (unmapped,
+  untracked) inside a `VfsBklGuard` window, then installed under `as_lock` with the final
+  page flags. The old order (map as `RW_NO_EXEC` → fill → fix up flags) needed the BKL
+  across the whole fill precisely because the pages were already visible to the process
+  (a sibling could munmap the frames out from under the fill). Fill-before-install is the
+  proven demand-fault Pass B shape; the `RW_NO_EXEC` + permission-fix-up dance disappears.
+  In practice this arm serves writable `MAP_SHARED` mappings — `MMAP_FILE_BACKED_LAZY`
+  routes read-only file mmaps to the demand-paged path on every profile.
+- Both mmap-path `resolve_inode` calls (lazy-file arm + eager→lazy fallback) take the
+  window for their on-disk metadata read.
+- Boot suite SMP=2 green (225 PASSED, only the two §6 pre-existing failures, 0 PANIC),
+  including `shared_file_mmap_writeback`, which drives the restructured path directly.
+
+### 10.2 Verification per plan: userspace mmap stress + llama.cpp on devbox-smoltcp (SMP=2, 4 GB)
+
+| check | result |
+|---|---|
+| `mmap_stress` (18 iters × 5 × 70 MB anon mmap/memset/munmap) | clean |
+| `mmap_file` on the 508 MB qwen3.5-0.8B gguf (touch all ~130k pages) | clean, 16 s |
+| `mmapsum` read vs mmap ×2 vs madvise-prefaulted vs 2-thread-concurrent | **all byte-exact** vs host reference (post-§10.3 fix) |
+| `fpfault` (all 32 Q regs canaried across 130k demand faults; also 2 instances concurrently) | 0 corrupted |
+| `neonfault` (130k page-crossing NEON loads into faulting pages) | 0 wrong |
+| llama-server, model via `mmap = true`, chat completion | **coherent** (post-§10.3 fix) |
+
+New tools live in `userspace/forktest/c_stress/` (see its README).
+
+### 10.3 Bug found by the llama end-to-end: `madvise(MADV_WILLNEED)` destroyed file-backed lazy pages
+
+llama with mmap produced garbage tokens (`$6;,0#%+-DB,HA/'`) while `--no-mmap` was clean —
+**on the pre-Phase-2e baseline too** (controlled A/B), so pre-existing, not this work.
+Content probes (mmapsum/fpfault/neonfault) were all clean; the discriminator was that
+llama's loader calls `posix_madvise(WILLNEED)` over the whole mapping and no probe did.
+
+Root cause: `sys_madvise(MADV_WILLNEED)` pre-faulted lazy pages by installing **zeroed**
+frames, ignoring the region's `LazySource` — correct for anonymous regions (zero-fill IS
+their fill), catastrophic for `LazySource::File`: the page is now "present", the demand
+fault never runs, and the file content is permanently zeros. Fixed by pre-faulting ONLY
+`LazySource::Zero` pages; file-backed pages are left to the (correct, readahead-optimized)
+fault path. `mmapsum`'s `madv:` line is the standing regression check.
+
+> The 6-month-old "llama mmap=true loads+serves at 4048 MB" validation predates this
+> llama-server build; whether it verified token *quality* is unknown. On smp-shared it was
+> reproducibly garbage until this fix.
+
+Same-family latent bug, documented not fixed: `MADV_DONTNEED` zeroes mapped pages
+regardless of backing — correct-ish for anon, wrong for file-backed `MAP_PRIVATE`
+(POSIX: dropping the private copy must re-expose FILE content on next touch, not zeros).
+
+### 10.4 Pre-existing llama-on-smp-shared issues found on the way (not fixed)
+
+llama.cpp had never run on the shared-SMP kernel before this validation. With default
+arguments it dies before serving:
+
+1. **Default 262k context → ~3 GiB anon KV cache → SIGSEGV**: the demand fault at
+   VA ≈ 0x2_36c0e000 (inside the mmap'd KV region, ~9.5 GB) is rejected — smells like a
+   user-VA-limit check rather than genuine OOM (3.5 GB PMM free at the time).
+   `-c 4096` avoids it.
+2. **`clone_thread` first-touch SIGSEGV** (fresh thread faults just above `SP_EL0`,
+   `WILD-DA`, `last_sc=MAX`) — same family as the fixed extreme-profile spawn bug, now
+   seen on smp-shared under llama's thread spawn.
+3. **One (unreproduced) `[BKL] stuck` storm**: after ~20 min of 2-thread no-mmap
+   generation following several crashed llama instances, 7.8k consecutive
+   `owner=2 waiter=1` warnings — core 0 starved (sshd unresponsive) while heartbeats
+   continued; no panic, no data loss. Not seen again across several longer runs on the
+   same build (nor with the BKL profiler enabled), and never on baseline (which however
+   got fewer opportunities). The dropped-window ledger is the prime suspect *class*;
+   `[BKL] stuck` lines now print the holder's profiler tag to attribute the next
+   occurrence. **Watch item for SMP=4 stress.**
+4. The userspace sshd kills exec channels under load (ssh `ServerAlive` keepalives time
+   out when llama pegs both cores → channel teardown kills the session's children).
+   Workaround: `nohup … &` for long-running commands; known sshd instability family.
+
+### 10.5 Ledger tripwire proven in anger
+
+The first crashed llama leaked one open dropped-BKL window (destructor-skipping kill
+path); the §9 EL0-entry tripwire healed it at slot reuse exactly as designed
+(`[BKL] stale dropped-window depth 1 healed at EL0 entry (tid=14)`).

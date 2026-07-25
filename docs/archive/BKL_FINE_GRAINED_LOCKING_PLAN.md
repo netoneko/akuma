@@ -771,8 +771,11 @@ work is a BKL-drop guard plus inner-lock hardening. No new locks were introduced
       to ALL droppers (vfs, net, exec, file-fault), 0 stuck in the re-run regimen.
 - [ ] Phase 2b/2c/2d: `openat`/`close`/`dup`/`fcntl`, the mutating syscalls, `chdir` family
       (2c urgency data point: one `rm` of a 735 MB file = ~40 s BKL hold, 274 stuck warns)
-- [ ] Phase 2e: eager file-backed `mmap` arm — verify with the `userspace/` mmap stress
-      test + llama.cpp mmap model-load end-to-end (per user, 2026-07-25)
+- [x] Phase 2e: eager file-backed `mmap` arm — fill-before-install inside a
+      `VfsBklGuard` window + windowed `resolve_inode` (that doc §10). Verified with the
+      `userspace/forktest/c_stress` mmap stress tools + llama.cpp mmap model-load
+      end-to-end; the llama leg exposed and fixed a pre-existing
+      `madvise(MADV_WILLNEED)` bug that zero-filled file-backed lazy pages (§10.3).
 - [ ] A contention signal (current A/B is cache-resident, measures 0 spins either way)
 - [ ] SMP=4 stress — the AB-BA failure mode this targets only appeared at SMP=4 for net;
       note the §9 fix widens true window concurrency, so this matters MORE now

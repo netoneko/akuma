@@ -168,7 +168,12 @@ fn mmap_eager_to_lazy_fallback(
     if is_file_backed {
         if let Some(akuma_exec::process::FileDescriptor::File(ref f)) = proc.get_fd(fd as u32) {
             let path = f.path.clone();
-            let inode = crate::vfs::resolve_inode(&path).unwrap_or(0);
+            // On-disk metadata read — dropped-BKL window like the other read paths
+            // (Phase 2e of the no-bkl-vfs carve-out).
+            let inode = {
+                let _vfs_window = super::fs::VfsBklGuard::new();
+                crate::vfs::resolve_inode(&path).unwrap_or(0)
+            };
             let source = akuma_exec::process::LazySource::File {
                 path, inode, file_offset: offset, filesz: len, segment_va: mmap_addr,
             };
@@ -283,7 +288,13 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     if crate::config::MMAP_FILE_BACKED_LAZY && is_file_backed && !is_shared_writable
         && let Some(akuma_exec::process::FileDescriptor::File(ref f)) = proc.get_fd(fd as u32) {
             let path = f.path.clone();
-            let inode = crate::vfs::resolve_inode(&path).unwrap_or(0);
+            // Path→inode resolution reads ext2 metadata (real I/O on a cold cache) —
+            // take the dropped-BKL window for it like every other on-disk read path
+            // (Phase 2e of the no-bkl-vfs carve-out).
+            let inode = {
+                let _vfs_window = super::fs::VfsBklGuard::new();
+                crate::vfs::resolve_inode(&path).unwrap_or(0)
+            };
             let source = akuma_exec::process::LazySource::File {
                 path: path.clone(),
                 inode,
@@ -297,12 +308,6 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 proc.pid, fd, &path, offset, len, mmap_addr, count);
             return mmap_addr as u64;
         }
-
-    let initial_flags = if is_file_backed {
-        akuma_exec::mmu::user_flags::RW_NO_EXEC
-    } else {
-        page_flags
-    };
 
     // Batch-allocate all pages in a single PMM lock acquisition, then map
     // them with no_flush and issue a single TLB flush after the loop.
@@ -336,33 +341,25 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         }
     };
     let _ = map_populate; // populate is now subsumed by the lazy fallback above
-    let mut frames = alloc::vec::Vec::with_capacity(pages);
-    {
-        // Page-table install under `as_lock` (shared-kernel SMP): frames were already
-        // allocated above (alloc must stay OUTSIDE the hold — the PMM OOM/reclaim path
-        // can unmap pages and re-enter `as_lock`). Excludes concurrent BKL-free faults.
-        #[cfg(kernel_smp_shared)]
-        let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
-        for (i, frame) in frame_batch.into_iter().enumerate() {
-            let (table_frames, _) = unsafe {
-                akuma_exec::mmu::map_user_page_no_flush(mmap_addr + i * 4096, frame.addr, initial_flags)
-            };
-            proc.address_space.track_user_frame(frame);
-            for tf in table_frames {
-                proc.address_space.track_page_table_frame(tf);
-            }
-            frames.push(frame);
-        }
-        // Single TLB flush for the entire mmap range (still under the hold).
-        akuma_exec::mmu::flush_tlb_range(mmap_addr, pages);
-    }
-    crate::pmm::dp_count(&crate::pmm::EAGER_MMAP_PAGES, pages);
+
+    // Fill file-backed frames from disk BEFORE installing them. The frames are still
+    // private here (unmapped, untracked), so no sibling thread can observe — or munmap
+    // out from under us — a half-filled page. That privacy is what lets the read loop
+    // run in a dropped-BKL window (Phase 2e of the no-bkl-vfs carve-out,
+    // docs/archive/BKL_VFS_CARVE_OUT.md): it has exactly the proven profile of the
+    // demand-fault Pass B fill — VFS/ext2/block locks only, no BKL-protected state. The
+    // old order (map as RW_NO_EXEC → fill → fix up flags) required the BKL across the
+    // whole fill precisely because the pages were already visible to the process.
+    // In practice this arm serves writable MAP_SHARED mappings (e.g. llama's
+    // --kv-cache-file): MMAP_FILE_BACKED_LAZY routes read-only file mmaps to the
+    // demand-paged path on every profile.
     if is_file_backed {
         if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
             let path = f.path;
+            let _vfs_window = super::fs::VfsBklGuard::new();
             let mut file_off = offset;
             let mut bytes_read = 0usize;
-            for (i, frame) in frames.iter().enumerate().take(pages) {
+            for (i, frame) in frame_batch.iter().enumerate() {
                 let chunk = core::cmp::min(4096, len.saturating_sub(i * 4096));
                 if chunk == 0 { break; }
                 let page_kva = akuma_exec::mmu::phys_to_virt(frame.addr);
@@ -381,18 +378,33 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                     proc.pid, fd, &path, offset, len, mmap_addr, bytes_read);
             }
         }
-        if page_flags != initial_flags {
-            // Permission fix-up under `as_lock` (shared-kernel SMP). PTE edits only.
-            #[cfg(kernel_smp_shared)]
-            let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
-            for i in 0..pages {
-                let _ = proc.address_space.update_page_flags(mmap_addr + i * 4096, page_flags);
-            }
-        }
     } else {
         crate::tprint!(128, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (eager)\n",
             proc.pid, len, prot, flags, mmap_addr);
     }
+
+    let frames = frame_batch;
+    {
+        // Page-table install under `as_lock` (shared-kernel SMP): frames were already
+        // allocated above (alloc must stay OUTSIDE the hold — the PMM OOM/reclaim path
+        // can unmap pages and re-enter `as_lock`) and already carry their file content,
+        // so they install with the final `page_flags` directly (no RW_NO_EXEC window +
+        // permission fix-up pass). Excludes concurrent BKL-free faults. No I/O here.
+        #[cfg(kernel_smp_shared)]
+        let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+        for (i, frame) in frames.iter().enumerate() {
+            let (table_frames, _) = unsafe {
+                akuma_exec::mmu::map_user_page_no_flush(mmap_addr + i * 4096, frame.addr, page_flags)
+            };
+            proc.address_space.track_user_frame(*frame);
+            for tf in table_frames {
+                proc.address_space.track_page_table_frame(tf);
+            }
+        }
+        // Single TLB flush for the entire mmap range (still under the hold).
+        akuma_exec::mmu::flush_tlb_range(mmap_addr, pages);
+    }
+    crate::pmm::dp_count(&crate::pmm::EAGER_MMAP_PAGES, pages);
 
     // Record writable MAP_SHARED file mappings so their pages get written back to
     // the file on munmap/msync/exit (Akuma has no shared page cache).
@@ -566,11 +578,21 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
             let end = (addr.saturating_add(len) + 0xFFF) & !0xFFF;
 
             // Collect (va, flags) pairs for pages in lazy regions not yet mapped.
+            //
+            // ANONYMOUS (LazySource::Zero) pages only: installing a zeroed frame IS
+            // their fill. A FILE-backed lazy page must be left to the demand-fault
+            // path, which reads the file into the frame — pre-mapping a zeroed frame
+            // here *destroys* its content (the page is now "present", so the fill
+            // never runs). That was a real corruption: llama.cpp's mmap loader calls
+            // posix_madvise(WILLNEED) over the whole model mapping, and every weight
+            // page this loop touched first became zeroes — garbage inference with
+            // mmap, clean with --no-mmap (caught 2026-07-25 by the Phase 2e llama
+            // end-to-end validation; docs/archive/BKL_VFS_CARVE_OUT.md §10).
             let mut prefault: alloc::vec::Vec<(usize, u64)> = alloc::vec::Vec::new();
             let mut va = aligned_addr;
             while va < end {
                 if !akuma_exec::mmu::is_current_user_page_mapped(va)
-                    && let Some((flags, _, _, _)) =
+                    && let Some((flags, akuma_exec::process::LazySource::Zero, _, _)) =
                         akuma_exec::process::lazy_region_lookup_for_pid(proc.tgid, va)
                     {
                         prefault.push((va, flags));
