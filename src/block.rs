@@ -223,6 +223,24 @@ impl VirtioBlockDevice {
 // Global Block Device State
 // ============================================================================
 
+/// The virtio-blk device, behind a plain `Spinlock`.
+///
+/// **`no-bkl-vfs` invariant:** this lock is held across a full virtio round-trip
+/// ([`VirtioBlockDevice::read_sectors`] busy-polls the virtqueue; it never yields), so it
+/// must not be stranded by a context switch or nested exception on a core running an fs
+/// syscall *without* the Big Kernel Lock. It isn't, and not by accident: every path that
+/// reaches it does so through the [`crate::vfs::ext2`] `BlockDevice` impl, i.e. from
+/// inside `akuma-ext2`'s `read_block`/`write_block`/`write_superblock`, all of which
+/// require an `Ext2State` guard — and that guard carries the `PreemptGuard` (preemption
+/// off + IRQs masked) under `no-bkl-vfs`. So the hold is already covered transitively and
+/// needs no guard of its own; a nested one would only re-save an already-masked DAIF.
+///
+/// The one exception is [`is_initialized`], a momentary probe from `fs::init` during
+/// single-threaded boot.
+///
+/// If a *new* caller ever reaches [`with_device`] from outside an ext2 state guard, it
+/// must take an `akuma_exec::sync::PreemptGuard` itself — otherwise it reopens the AB-BA
+/// window (this core holding BLOCK_DEVICE while a nested IRQ hard-spins for the BKL).
 static BLOCK_DEVICE: Spinlock<Option<VirtioBlockDevice>> = Spinlock::new(None);
 
 // ============================================================================

@@ -1275,8 +1275,6 @@ fn run_async_main() -> ! {
             is_current_interrupted: process::is_current_interrupted,
             rng_fill: |buf| rng::fill_bytes(buf).expect("RNG required for networking"),
             current_thread_id: || threading::current_thread_id() as u32,
-            disable_preemption: threading::disable_preemption,
-            enable_preemption: threading::enable_preemption,
         },
         &mmio_addrs,
         config::ENABLE_DHCP,

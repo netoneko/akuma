@@ -161,7 +161,10 @@ smp = ["dep:akuma-smp"]
 # 2026-07-24: validated at SMP=4 under a real BitTorrent swarm + ssh hammer
 # (0 wedges, 0 corruption) after the socket-refcount / wait_until / pipe-SIGPIPE
 # fixes. To A/B against the BKL-held net path, remove it from this list.
-smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared", "no-bkl-network"]
+# Includes `no-bkl-vfs` (BKL-free VFS syscalls) since 2026-07-25 — same pattern
+# as net: every piece of VFS state already carries its own spinlock, so the BKL
+# is redundant for fs syscalls. Remove from this list to A/B.
+smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared", "no-bkl-network", "no-bkl-vfs"]
 
 # Run the native (smoltcp) network syscalls WITHOUT the Big Kernel Lock — the
 # first subsystem carved out of the BKL (docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
@@ -174,6 +177,20 @@ smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared", "no-bkl-network"]
 # crates/akuma-net/src/runtime.rs). A no-op (byte-for-byte unchanged) on every
 # build that doesn't set both features.
 no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network"]
+
+# Run the VFS syscalls WITHOUT the Big Kernel Lock — Phase 4 of
+# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md, the second subsystem carved out
+# of the BKL (mirrors `no-bkl-network`). Only meaningful together with
+# `smp-shared` (and included in it by default): build.rs emits
+# `cfg(kernel_no_bkl_vfs)` from CARGO_FEATURE_NO_BKL_VFS, and the fs syscall
+# entry points then DROP the BKL for their duration, relying on the existing
+# fine-grained MOUNT_TABLE / Ext2Filesystem::state (RwSpinlock) / block_cache /
+# BLOCK_DEVICE / fd-table spinlocks for cross-core mutual exclusion.
+# PreemptGuard (lifted to `akuma_exec::sync` from akuma-net) additionally masks
+# IRQs for the ext2/block-device holds — the same hardening that closed the
+# SMP=4 ABBA wedge in net's Phase 2. A no-op (byte-for-byte unchanged) on every
+# build that doesn't set both features.
+no-bkl-vfs = ["akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs", "akuma-net/no-bkl-vfs"]
 
 # Rump-kernel support: a raw L2 packet path so a userspace NetBSD rump TCP/IP
 # stack can send/receive Ethernet frames. Binds a SECOND virtio-net device

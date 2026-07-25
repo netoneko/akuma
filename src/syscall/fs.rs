@@ -7,6 +7,91 @@ use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 const EROFS: u64 = (-30i64) as u64;
 
+/// RAII guard that runs a VFS syscall **without** the Big Kernel Lock — Phase 4 of
+/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md. Mirrors
+/// [`super::net::NetBklGuard`] (the proven `no-bkl-network` template).
+///
+/// Constructed at the top of each fs syscall: `new()` DROPS the BKL so this core
+/// runs the syscall concurrently with peer cores, and `drop()` RE-ACQUIRES it on
+/// every return path. Correctness rests on the state these syscalls mutate already
+/// carrying its own fine-grained locks — the per-process fd table
+/// (`SharedFdTable`'s `Spinlock`, every access already wrapped in
+/// `with_irqs_disabled`), the mount table (`MOUNT_TABLE`, released before any I/O
+/// in `with_fs`), the ext2 superblock/BGD (`Ext2Filesystem::state` RwSpinlock),
+/// the block cache (`Ext2Filesystem::block_cache` Spinlock), and the block device
+/// (`BLOCK_DEVICE` Spinlock) — so the BKL is redundant for them; dropping it lets
+/// non-fs work on other cores proceed in parallel.
+///
+/// Re-acquiring on drop keeps the syscall wrapper's single `leave_kernel`
+/// (`rust_sync_el0_handler` in exceptions.rs) balanced. A nested IRQ or page fault
+/// that re-takes the BKL during the dropped window is harmless: `enter_kernel` is
+/// idempotent for the owner, exactly the contract the `exec_dropped_bkl` and
+/// file-fault BKL-drop paths already rely on (and that
+/// `kernel_lock_midexcursion_drop_reacquire_stays_balanced` proves).
+///
+/// Zero-cost no-op unless BOTH `kernel_smp_shared` and `kernel_no_bkl_vfs` are set
+/// (or the runtime toggle `vfs_bkl_drop_enabled()` is off) — the struct is empty
+/// and `new`/`drop` compile to nothing, so default, `size`, `extreme`, and plain
+/// `smp-shared` builds are byte-for-byte unchanged. The runtime toggle lets a boot
+/// image with the feature compiled in still A/B against the BKL-held path without
+/// a rebuild.
+pub(super) struct VfsBklGuard {
+    /// Whether `new()` actually dropped the BKL, **latched at construction**.
+    ///
+    /// `drop()` must not re-read `vfs_bkl_drop_enabled()`: unlike [`super::net::NetBklGuard`]
+    /// — which is purely compile-time gated and so cannot go out of balance — this guard
+    /// consults a runtime toggle, and that toggle really does get flipped while guards are
+    /// live (the A/B boot self-tests flip it between phases, and it doubles as a kill
+    /// switch). A guard that asked the toggle twice would, on a flip from ON to OFF between
+    /// its `new` and its `drop`, leave the BKL released for the rest of the syscall — and
+    /// the syscall wrapper's single `leave_kernel` would then release a lock this core no
+    /// longer holds, advancing `now_serving` for a ticket nobody owns. Latching makes the
+    /// guard balanced by construction, whatever the toggle does mid-syscall.
+    #[cfg(all(kernel_smp_shared, kernel_no_bkl_vfs))]
+    dropped_bkl: bool,
+}
+
+impl VfsBklGuard {
+    #[inline]
+    pub(super) fn new() -> Self {
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_vfs))]
+        let dropped_bkl = crate::smp_shared::vfs_bkl_drop_enabled();
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_vfs))]
+        if dropped_bkl {
+            akuma_exec::bkl::leave_kernel();
+        }
+        Self {
+            #[cfg(all(kernel_smp_shared, kernel_no_bkl_vfs))]
+            dropped_bkl,
+        }
+    }
+
+    /// Take the guard only if `on_disk` — i.e. this call really is going to touch the
+    /// on-disk VFS.
+    ///
+    /// Used where the on-disk work spans a whole function rather than sitting in one
+    /// `match` arm (`sys_write`'s per-chunk loop, `sys_lseek`'s `update_fd` closure), so
+    /// the arm-local placement used elsewhere isn't available. Mirrors how `sys_sendto`
+    /// routes pipe-backed fds *before* taking `NetBklGuard`: an fd that isn't a real file
+    /// (tty, pipe, socket, eventfd, `/dev/null`) must keep the BKL, since its path touches
+    /// terminal/pipe state this carve-out has not audited.
+    #[inline]
+    pub(super) fn new_if(on_disk: bool) -> Option<Self> {
+        on_disk.then(Self::new)
+    }
+}
+
+impl Drop for VfsBklGuard {
+    #[inline]
+    fn drop(&mut self) {
+        // Latched in `new()` — deliberately NOT a fresh `vfs_bkl_drop_enabled()` read.
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_vfs))]
+        if self.dropped_bkl {
+            akuma_exec::bkl::enter_kernel();
+        }
+    }
+}
+
 /// Bounded, always-on diagnostic counter for `read()` returning EBADF.
 ///
 /// A process calling `read()` on a descriptor that is *absent* from its fd
@@ -296,6 +381,11 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
         }
         akuma_exec::process::FileDescriptor::File(ref f) => {
+            // read(2) on a real file is the hot on-disk path — run it BKL-free, exactly
+            // like the Socket arm below runs BKL-free under `no-bkl-network`. Scoped to
+            // THIS arm on purpose: the Stdin arm parks in `schedule_blocking` while taking
+            // non-IRQ-masked terminal-state locks, which this carve-out has not audited.
+            let _vfs_bkl = VfsBklGuard::new();
             let limit = 64 * 1024;
             let to_read = count.min(limit);
             let mut temp = alloc::vec![0u8; to_read];
@@ -619,6 +709,7 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
 
     match fd {
         akuma_exec::process::FileDescriptor::File(ref f) => {
+            let _vfs_bkl = VfsBklGuard::new();
             let limit = 64 * 1024;
             let to_read = count.min(limit);
             let mut temp = alloc::vec![0u8; to_read];
@@ -686,6 +777,7 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
 
     match fd {
         akuma_exec::process::FileDescriptor::File(ref f) => {
+            let _vfs_bkl = VfsBklGuard::new();
             let mut buf = alloc::vec![0u8; count];
             if unsafe { copy_from_user_safe(buf.as_mut_ptr(), buf_ptr as *const u8, count).is_err() } {
                 return EFAULT;
@@ -704,6 +796,13 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
     let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return EBADF };
+
+    // write(2) to a real file runs BKL-free. Unlike `sys_read`, the on-disk work here
+    // isn't confined to one `match` arm — the match is *inside* the per-chunk loop, and
+    // the O_APPEND `file_size` probe below already hits the VFS — so the guard spans the
+    // function and is armed only for `File` fds (`new_if`). Every other fd kind (tty,
+    // pipe, socket, /dev/*) keeps the BKL.
+    let _vfs_bkl = VfsBklGuard::new_if(matches!(fd, akuma_exec::process::FileDescriptor::File(_)));
 
     // For File descriptors, capture the initial position now (before the loop).
     // The `fd` variable is a clone — proc.update_fd() updates the real fd table but
@@ -1418,6 +1517,15 @@ pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
                 akuma_exec::process::RemoteKind::Socket => ESPIPE,
             };
         }
+        // SEEK_END needs the on-disk size, so lseek on a real file is a VFS call. It
+        // happens *inside* the `update_fd` closure (i.e. under the fd table's
+        // `with_irqs_disabled`), so the ext2 work below is already IRQ-masked — no nested
+        // exception can wait on the BKL from inside it, which is what makes the drop safe.
+        let _vfs_bkl = VfsBklGuard::new_if(matches!(
+            proc.get_fd(fd),
+            Some(akuma_exec::process::FileDescriptor::File(_))
+        ));
+
         let mut new_pos = 0i64;
         let mut success = false;
         let mut bad_fd = true;
@@ -1461,6 +1569,9 @@ pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
     let mut stat = Stat::default();
     let res = match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
+            // Only this arm reaches the on-disk VFS; every other arm below synthesizes a
+            // Stat from constants (or forwards cross-core, which must keep the BKL).
+            let _vfs_bkl = VfsBklGuard::new();
             if let Ok(meta) = crate::vfs::metadata(&f.path) {
                 stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
                 if crate::config::SYSCALL_DEBUG_IO_ENABLED {
@@ -1582,6 +1693,11 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
         }
         return 0;
     }
+
+    // Path resolution + `metadata` below are pure VFS work — run them BKL-free. Placed
+    // AFTER the cross-core forwarding arm above, which marshals through the BKL-protected
+    // bounce and must keep the lock.
+    let _vfs_bkl = VfsBklGuard::new();
 
     let mut stat = Stat::default();
     let res = (|| {
@@ -1816,6 +1932,11 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
         };
         crate::vfs::resolve_path(&base_path, &path)
     };
+
+    // Everything from here on is symlink resolution + `metadata` — pure VFS, BKL-free.
+    // The user copies happen after, from `buf` (a kernel stack buffer), so no user access
+    // is interleaved with the fs work.
+    let _vfs_bkl = VfsBklGuard::new();
 
     const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
@@ -2259,6 +2380,10 @@ pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
         Some(akuma_exec::process::FileDescriptor::File(f)) => f,
         _ => return EBADF,
     };
+
+    // `fd` is already known to be a `File` (the match above returns EBADF otherwise), so
+    // arm unconditionally: the cache-miss path below does a full directory read off disk.
+    let _vfs_bkl = VfsBklGuard::new();
 
     let entries = if let Some(ref cached) = f.dir_cache {
         cached.clone()

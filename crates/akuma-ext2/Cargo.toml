@@ -15,7 +15,21 @@ extreme = []
 # Off by default; opt in via the kernel's `fs-cache` feature. See
 # docs/AKUMA_SELF_HOSTING.md §7a/§7b.
 fs-cache = []
+# Run the ext2 paths without the Big Kernel Lock (Phase 4 of
+# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), forwarded from the bin crate.
+# Wraps the `state` (RwSpinlock) holds — and therefore, transitively, every
+# `block_cache` access, which is only ever reached with a state guard held — in
+# `akuma_exec::sync::PreemptGuard`, so a core running an fs syscall WITHOUT the
+# BKL can never be caught holding an ext2 inner lock while a nested IRQ
+# hard-spins on the BKL (the AB-BA wedge `no-bkl-network` hit at SMP=4).
+# `akuma-exec`'s own `smp-shared` / `no-bkl-vfs` features are enabled by the bin
+# crate; cargo unifies them across the graph, so this flag only gates whether
+# akuma-ext2 *calls* the guard.
+no-bkl-vfs = []
 
 [dependencies]
 akuma-vfs = { path = "../akuma-vfs" }
+# For `sync::PreemptGuard` (the IRQ-masking inner-lock guard) under `no-bkl-vfs`.
+# No cycle: akuma-exec -> akuma-isolation -> akuma-vfs, and akuma-vfs is a leaf.
+akuma-exec = { path = "../akuma-exec" }
 spinning_top = "0.3"

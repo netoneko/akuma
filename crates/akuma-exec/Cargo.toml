@@ -25,6 +25,15 @@ smp-shared = []
 # Used for testing network BKL-free operations before full BKL removal.
 no-bkl-network = []
 
+# Disable BKL usage for VFS operations (Phase 4 of
+# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), forwarded from the bin crate.
+# Upgrades PreemptGuard to also mask local IRQs for fs-internal spinlock holds
+# (ext2 state/block_cache, BLOCK_DEVICE, MOUNT_TABLE), so a BKL-free core can
+# never be caught holding an inner spinlock while a nested IRQ hard-spins on
+# the BKL (AB-BA wedge — same shape as `no-bkl-network`). Only meaningful with
+# `smp-shared`.
+no-bkl-vfs = []
+
 [dependencies]
 spinning_top = "0.3"
 lock_api = "0.4"

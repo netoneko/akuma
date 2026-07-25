@@ -94,6 +94,31 @@ pub fn set_exec_bkl_drop_enabled(on: bool) {
     EXEC_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
 }
 
+/// Runtime toggle (default **on**) for `no-bkl-vfs` (Phase 4 of
+/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md) — drop the BKL for the whole duration
+/// of every fs syscall (`sys_read`/`sys_write`/`sys_openat`/`sys_close`/...), relying on
+/// the existing fine-grained `MOUNT_TABLE` / `Ext2Filesystem::state` (RwSpinlock) /
+/// `block_cache` / `BLOCK_DEVICE` / `proc.fds.table` spinlocks for cross-core mutual
+/// exclusion. The `VfsBklGuard` reads this at construct/drop time so an `smp-shared` boot
+/// with the feature compiled in can still A/B against the BKL-held path without a
+/// rebuild. Defaults **on** to match `no-bkl-network`'s post-validation default and the
+/// other fs BKL-drop toggles (`FAULT_BKL_DROP_ENABLED`, `EXEC_BKL_DROP_ENABLED`); flip
+/// off via `set_vfs_bkl_drop_enabled(false)` at boot for a measurement window.
+static VFS_BKL_DROP_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Whether the VFS-syscall BKL-drop (`no-bkl-vfs`) is currently enabled.
+#[inline]
+pub fn vfs_bkl_drop_enabled() -> bool {
+    VFS_BKL_DROP_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Enable/disable the VFS-syscall BKL-drop at runtime. Used by A/B measurement; also
+/// serves as a runtime kill-switch if a regression surfaces (the VFS BKL-drop, unlike
+/// `no-bkl-network`, has no equivalent of the SSH-stall watchdog to self-detect).
+pub fn set_vfs_bkl_drop_enabled(on: bool) {
+    VFS_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
+}
+
 /// Runtime toggle (default **off**) for the M5c optimization: run the scheduler SGI
 /// BKL-free when it preempted EL0 (userspace, no BKL held), so peer cores' timer ticks
 /// don't serialize on the BKL. Correct at SMP=2. Left **off** because at SMP≥4 it opens a

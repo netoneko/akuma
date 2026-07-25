@@ -2678,8 +2678,6 @@ fn secondary_init_local_nic(idx: usize) {
         is_current_interrupted: akuma_exec::process::is_current_interrupted,
         rng_fill: secondary_net_rng_stub,
         current_thread_id: || akuma_exec::threading::current_thread_id() as u32,
-        disable_preemption: akuma_exec::threading::disable_preemption,
-        enable_preemption: akuma_exec::threading::enable_preemption,
     });
     // NIC2 is on virtio-mmio-bus.5: DEV_VIRTIO_VA + 5 * 0x200 (the virtio-mmio slot stride).
     let addr = akuma_exec::mmu::DEV_VIRTIO_VA + 5 * 0x200;

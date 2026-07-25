@@ -747,12 +747,29 @@ socket locks.
 - [ ] Lifecycle guards implemented
 - [ ] Tests passing
 
-### Phase 4 - VFS and Filesystem Locks
-- [ ] VFS lock hierarchy created
-- [ ] Per-filesystem locks
-- [ ] Per-inode locks
-- [ ] Block I/O path updated
-- [ ] Tests passing
+### Phase 4 - VFS and Filesystem Locks — PARTIALLY SHIPPED (2026-07-25)
+
+See **[BKL_VFS_CARVE_OUT.md](BKL_VFS_CARVE_OUT.md)** for what actually shipped and why it
+diverges from the sketch above.
+
+Headline: the new VFS lock hierarchy below was **not built and is not needed** — every piece
+of VFS state already carries a fine-grained lock, so (exactly as with net in Phase 2) the
+work is a BKL-drop guard plus inner-lock hardening. No new locks were introduced.
+
+- [x] ~~VFS lock hierarchy created~~ — unnecessary; existing locks suffice (see that doc §1)
+- [x] ~~Per-filesystem locks~~ / ~~Per-inode locks~~ — unnecessary, same reason
+- [x] `no-bkl-vfs` feature + `cfg(kernel_no_bkl_vfs)` + runtime A/B toggle
+- [x] `PreemptGuard` lifted from `akuma-net` to `akuma-exec::sync`
+- [x] ext2 `state` guard hardening (IRQ-masked **per try**, not across the wait — the sketch
+      had this wrong; see that doc §3.1)
+- [x] Block I/O path — covered transitively, no change needed (that doc §3.2)
+- [x] Phase 2a: read-path syscalls converted (9 syscalls)
+- [x] Boot self-test + host tests passing at SMP=2
+- [ ] Phase 2b/2c/2d: `openat`/`close`/`dup`/`fcntl`, the mutating syscalls, `chdir` family
+- [ ] Phase 2e: eager file-backed `mmap` arm
+- [ ] A contention signal (current A/B is cache-resident, measures 0 spins either way)
+- [ ] SMP=4 stress — the AB-BA failure mode this targets only appeared at SMP=4 for net
+- [ ] Combined net+VFS large-download I/O regimen (that doc §8)
 
 ### Phase 5 - Memory Management Locks
 - [ ] `as_lock` extended

@@ -8,11 +8,12 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Mask local IRQs (set `DAIF.I`) and return the prior `DAIF` for [`irq_restore`]. Used by
 /// [`KernelLock::acquire`] to make its FIFO ticket wait atomic against local exception
-/// nesting. Bare-metal AArch64 only; a no-op returning `0` on host builds (single-threaded
-/// tests have no local IRQs).
+/// nesting, and by [`PreemptGuard`] to make inner-spinlock critical sections nest-free
+/// under a dropped BKL. Bare-metal AArch64 only; a no-op returning `0` on host builds
+/// (single-threaded tests have no local IRQs).
 #[cfg(target_os = "none")]
 #[inline(always)]
-pub(crate) fn irq_save_mask() -> u64 {
+pub fn irq_save_mask() -> u64 {
     let daif: u64;
     // SAFETY: reading DAIF and setting the IRQ mask bit have no memory effects.
     unsafe {
@@ -25,20 +26,20 @@ pub(crate) fn irq_save_mask() -> u64 {
 /// Restore `DAIF` saved by [`irq_save_mask`]. Bare-metal AArch64 only; no-op on host.
 #[cfg(target_os = "none")]
 #[inline(always)]
-pub(crate) fn irq_restore(daif: u64) {
+pub fn irq_restore(daif: u64) {
     // SAFETY: restoring the previously-saved DAIF; no memory effects.
     unsafe { core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack)) };
 }
 
 #[cfg(not(target_os = "none"))]
 #[inline(always)]
-pub(crate) fn irq_save_mask() -> u64 {
+pub fn irq_save_mask() -> u64 {
     0
 }
 
 #[cfg(not(target_os = "none"))]
 #[inline(always)]
-pub(crate) fn irq_restore(_daif: u64) {}
+pub fn irq_restore(_daif: u64) {}
 
 /// Total Big-Kernel-Lock spin iterations across all contended [`KernelLock::acquire`]
 /// calls — a cross-core BKL-wait-time proxy for A/B measurement (e.g. does dropping the
@@ -55,6 +56,106 @@ pub fn contention_spins() -> u64 {
 /// Reset the total BKL contention-spin counter to zero (for A/B measurement windows).
 pub fn reset_contention_spins() {
     CONTENTION_SPINS.store(0, Ordering::Relaxed);
+}
+
+// --- PreemptGuard ---------------------------------------------------------------
+
+/// RAII guard that disables scheduler preemption (and, under the BKL-drop features,
+/// masks local IRQs) for the lifetime of a kernel spinlock critical section.
+///
+/// Under real shared-kernel SMP (`smp-shared` feature), the inner spinlocks protecting
+/// kernel state (`NETWORK`, `SOCKET_TABLE`, `Ext2Filesystem::state`, `BLOCK_DEVICE`,
+/// `proc.fds.table`, ...) must never be held across a context switch. The Big Kernel
+/// Lock is released on an EL1→EL0 return, so a thread descheduled while holding one of
+/// these inner spinlocks strands the lock — and any *other* core that then spins on it
+/// does so **while holding the BKL**, wedging every core (the BKL owner can never be
+/// rescheduled to release the inner lock).
+///
+/// Disabling preemption for the hold keeps the holder on-core until it releases, so
+/// under the BKL the inner lock is never cross-core contended (the BKL already provides
+/// the mutual exclusion; this guard only prevents the strand). The critical sections it
+/// wraps must never voluntarily yield/block — same rule the kernel already followed on
+/// single-core.
+///
+/// A zero-cost no-op on every non-`smp-shared` build: `new`/`drop` compile to nothing,
+/// so the hot path is byte-for-byte unchanged.
+///
+/// **`no-bkl-*` addition — local IRQs are masked for the hold too.** With the Big
+/// Kernel Lock dropped around a subsystem's syscalls (network: `no-bkl-network`, VFS:
+/// `no-bkl-vfs`), this core can be inside one of those critical sections *without*
+/// owning the BKL. A nested IRQ then runs `enter_kernel()` (exceptions.rs), which
+/// hard-spins (IRQs masked) until the BKL frees — while THIS core still holds the inner
+/// spinlock. If the current BKL owner is meanwhile spinning on that same inner lock (the
+/// async-main poller does exactly that on `NETWORK`, near-constantly), the two cores
+/// deadlock AB-BA and every other core piles into the BKL wait: the SMP=4 hard wedge
+/// (`[BKL] stuck`, owner frozen nonzero, guest timer starved). Masking IRQs for the
+/// (short) hold makes the window nest-free, so a core can never be caught "holding an
+/// inner lock, waiting for the BKL". Plain `smp-shared` builds don't need it — there
+/// EL1 always holds the BKL, so the nested `enter_kernel` is the idempotent owner fast
+/// path.
+///
+/// # Lift history
+///
+/// Originally `akuma-net::runtime::PreemptGuard` (where it was wired through the
+/// `NetRuntime` registration callbacks so the net crate could stay decoupled from
+/// `akuma-exec`). Lifted here so the VFS BKL-drop path (`no-bkl-vfs`) can reuse the
+/// same primitive without duplicating it, and because `akuma-exec` owns both
+/// `threading::disable_preemption` and `irq_save_mask` directly — no runtime callback
+/// indirection needed. The net crate re-exports it from
+/// `akuma_net::runtime::PreemptGuard` for source compatibility.
+#[must_use]
+pub struct PreemptGuard {
+    /// Whether `new()` actually disabled preemption. Present only under `smp-shared`;
+    /// other builds carry no state.
+    #[cfg(feature = "smp-shared")]
+    active: bool,
+    /// Saved DAIF to restore on drop (`no-bkl-*` builds only — see type doc).
+    #[cfg(all(feature = "smp-shared", any(feature = "no-bkl-network", feature = "no-bkl-vfs")))]
+    saved_daif: u64,
+}
+
+impl PreemptGuard {
+    /// Disable preemption (under `smp-shared`) until the returned guard drops.
+    #[inline]
+    pub fn new() -> Self {
+        #[cfg(feature = "smp-shared")]
+        {
+            // Direct call: akuma-exec owns threading. No runtime registration needed
+            // (the historical reason net used a callback pointer), so this works during
+            // early boot and in host tests alike.
+            crate::threading::disable_preemption();
+            let active = true;
+            // Mask IRQs AFTER disabling preemption so drop's reverse order re-enables
+            // preemption only once IRQs are live again.
+            #[cfg(any(feature = "no-bkl-network", feature = "no-bkl-vfs"))]
+            return Self { active, saved_daif: irq_save_mask() };
+            #[cfg(not(any(feature = "no-bkl-network", feature = "no-bkl-vfs")))]
+            return Self { active };
+        }
+        #[cfg(not(feature = "smp-shared"))]
+        Self {}
+    }
+}
+
+impl Default for PreemptGuard {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PreemptGuard {
+    #[inline]
+    fn drop(&mut self) {
+        // Restore IRQs first (reverse of new's order), then re-enable preemption — so
+        // a timer IRQ can't preempt us between enable_preemption and the DAIF restore.
+        #[cfg(all(feature = "smp-shared", any(feature = "no-bkl-network", feature = "no-bkl-vfs")))]
+        irq_restore(self.saved_daif);
+        #[cfg(feature = "smp-shared")]
+        if self.active {
+            crate::threading::enable_preemption();
+        }
+    }
 }
 
 // --- BKL-hold profiler ---------------------------------------------------------
@@ -956,6 +1057,86 @@ mod tests {
         bkl.acquire(2);
         assert!(bkl.held_by(2));
         bkl.release(2);
+        assert!(!bkl.is_held());
+    }
+
+    #[test]
+    fn preempt_guard_constructs_and_nests() {
+        // The lifted `PreemptGuard` (moved here from akuma-net so the `no-bkl-vfs` VFS path
+        // could share it) is taken *nested* in the fs path: an ext2 `state` hold can sit
+        // inside another guarded region, and `threading::disable_preemption` is a per-thread
+        // COUNTER, so the inner drop must not re-enable preemption for the outer holder.
+        // On host builds (no `smp-shared`) both are no-ops; this pins the API + drop order
+        // so the kernel-only nesting can't be broken by a refactor here.
+        let outer = PreemptGuard::new();
+        {
+            let inner = PreemptGuard::default();
+            drop(inner);
+        }
+        drop(outer);
+    }
+
+    #[test]
+    fn vfs_bkl_guard_latched_arm_stays_balanced_across_toggle_flip() {
+        // Models `src/syscall/fs.rs`'s `VfsBklGuard`, which differs from `NetBklGuard` in
+        // one dangerous way: it consults a RUNTIME toggle (`vfs_bkl_drop_enabled`) rather
+        // than only a cfg. The toggle is flipped while guards can be live — the A/B boot
+        // self-tests flip it between phases, and it doubles as a kill switch.
+        //
+        // The guard therefore latches its decision at construction. Here we prove why: a
+        // guard that re-read the toggle on drop would, on an ON→OFF flip mid-syscall, skip
+        // its re-acquire, and the syscall wrapper's single release would then advance
+        // `now_serving` for a ticket this core does not own — corrupting the FIFO for every
+        // other core. Replay both a latched guard and (as the counter-example) an
+        // unlatched one, and assert only the latched one keeps the lock balanced.
+        let bkl = KernelLock::new();
+
+        // Latched: `armed` is decided at `new()` and honored on `drop()`, whatever the
+        // toggle says by then.
+        for round in 0..500u32 {
+            let core = round % 4;
+            let toggle_at_new = round % 2 == 0;
+            bkl.acquire(core); // wrapper entry (EL0->EL1)
+
+            let armed = toggle_at_new; // <- latched
+            if armed {
+                bkl.release(core);
+            }
+            // Toggle flips mid-syscall, in BOTH directions across rounds.
+            let _toggle_now = !toggle_at_new;
+            if armed {
+                bkl.acquire(core);
+            }
+
+            assert!(
+                bkl.held_by(core),
+                "round {round}: latched guard left the BKL unheld before wrapper release"
+            );
+            bkl.release(core); // wrapper exit (EL1->EL0)
+            assert!(!bkl.is_held(), "round {round}: BKL not free after wrapper release");
+        }
+
+        // Counter-example: re-reading the toggle on drop. Take the ON->OFF case, where the
+        // guard drops the lock and then declines to re-acquire it.
+        bkl.acquire(0);
+        let armed_at_new = true;
+        if armed_at_new {
+            bkl.release(0);
+        }
+        let armed_at_drop = false; // toggle flipped to OFF mid-syscall
+        if armed_at_drop {
+            bkl.acquire(0);
+        }
+        assert!(
+            !bkl.held_by(0),
+            "the unlatched counter-example is supposed to lose the lock — if it holds it, \
+             this test no longer demonstrates the hazard the latch exists to prevent"
+        );
+
+        // Balanced again for the next user.
+        bkl.acquire(0);
+        assert!(bkl.held_by(0));
+        bkl.release(0);
         assert!(!bkl.is_held());
     }
 }

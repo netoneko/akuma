@@ -88,6 +88,7 @@ dependencies = [
 name = "akuma-ext2"
 version = "0.1.0"
 dependencies = [
+ "akuma-exec",
  "akuma-vfs",
  "spinning_top",
 ]
@@ -104,6 +105,7 @@ dependencies = [
 name = "akuma-net"
 version = "0.1.0"
 dependencies = [
+ "akuma-exec",
  "akuma-rump",
  "const-oid",
  "der",

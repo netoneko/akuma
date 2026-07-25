@@ -22,6 +22,12 @@ smp-shared = []
 # nested IRQ hard-spins on the BKL (AB-BA wedge). Only meaningful with
 # `smp-shared`.
 no-bkl-network = []
+# Run the VFS paths without the Big Kernel Lock (Phase 4 of the BKL fine-grained
+# locking plan), forwarded from the bin crate so the `kernel_no_bkl_vfs` cfg
+# reaches akuma-net's `PreemptGuard` (the IRQ-masking arm fires under
+# `any(no-bkl-network, no-bkl-vfs)`). No akuma-net code is itself cfg-gated on
+# this — VFS lives in the kernel crate; only the guard's cfg union needs it.
+no-bkl-vfs = []
 # The native smoltcp TCP/IP stack: the smoltcp_net/socket/dns/http modules and
 # everything with smoltcp types in its signatures. Optional so a rump-only build
 # (devbox) can compile it out entirely. The rump path (rump_tap + the kernel
@@ -55,6 +61,10 @@ workspace = true
 [dependencies]
 # Host-testable rump tap orchestration; pulled in only by the `rump` feature.
 akuma-rump = { path = "../akuma-rump", optional = true }
+# Owns `threading::disable_preemption` and the IRQ-masking `PreemptGuard` (lifted
+# from this crate's runtime.rs so the VFS BKL-drop path can reuse it). Always
+# pulled in — the net crate's `PreemptGuard` re-export comes from here.
+akuma-exec = { path = "../akuma-exec" }
 smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
 virtio-drivers = { version = "0.7", default-features = false }
 embedded-io-async = { version = "0.6", default-features = false }

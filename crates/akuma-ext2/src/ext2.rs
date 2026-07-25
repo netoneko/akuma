@@ -493,12 +493,73 @@ struct Ext2State {
     first_data_block: u32,
 }
 
-/// Type alias for read guard (no ownership tracking needed - reads are concurrent)
-type Ext2ReadGuard<'a> = spinning_top::lock_api::RwLockReadGuard<'a, spinning_top::RawRwSpinlock, Ext2State>;
+/// Non-preemption/IRQ guard held for the lifetime of an [`Ext2State`] lock hold under
+/// `no-bkl-vfs`; a zero-sized no-op otherwise.
+///
+/// Every ext2 lock hold does real block I/O (see [`Ext2Filesystem::read_block`]), so it
+/// must never be descheduled mid-hold: the Big Kernel Lock is released on an EL1→EL0
+/// return, and a stranded `state` guard means any other core that then spins for it does
+/// so *while holding the BKL* — the holder can never be rescheduled to release it, and
+/// every core piles into the BKL wait. With `no-bkl-vfs` the same guard additionally
+/// masks local IRQs, so a core inside an ext2 critical section without the BKL can't take
+/// a nested IRQ whose `enter_kernel()` hard-spins for the BKL while this core holds the
+/// inner lock (AB-BA — the SMP=4 wedge `no-bkl-network` closed the same way).
+///
+/// **IRQs are masked around the non-blocking `try_*` and the resulting hold only, never
+/// across the acquisition backoff** — see [`Ext2Filesystem::read_state`].
+#[cfg(feature = "no-bkl-vfs")]
+type StateHoldGuard = akuma_exec::sync::PreemptGuard;
+#[cfg(not(feature = "no-bkl-vfs"))]
+type StateHoldGuard = NoStateHold;
+
+/// The `StateHoldGuard` stand-in when `no-bkl-vfs` is off: a ZST that compiles to nothing.
+///
+/// Deliberately **not** `Copy`, and carrying an empty `Drop`, so that the explicit
+/// `drop(hold)` before each backoff spin type-checks identically in both configurations —
+/// without it, the same source line is a real release in one build and a lint
+/// (`dropping_copy_types` / `drop_non_drop`) in the other.
+#[cfg(not(feature = "no-bkl-vfs"))]
+struct NoStateHold;
+
+#[cfg(not(feature = "no-bkl-vfs"))]
+impl Drop for NoStateHold {
+    fn drop(&mut self) {}
+}
+
+/// Take a [`StateHoldGuard`] for one `try_*` attempt (and, on success, the hold).
+#[inline]
+fn state_hold_guard() -> StateHoldGuard {
+    #[cfg(feature = "no-bkl-vfs")]
+    return akuma_exec::sync::PreemptGuard::new();
+    #[cfg(not(feature = "no-bkl-vfs"))]
+    NoStateHold
+}
+
+/// RAII guard for read access to `Ext2State` (no ownership tracking needed — reads are
+/// concurrent). Carries the [`StateHoldGuard`] so preemption/IRQ state is restored
+/// exactly when the lock is released.
+struct Ext2ReadGuard<'a> {
+    // Declaration order IS drop order: release the lock first, THEN restore
+    // preemption/IRQs — never the other way round, or the window this guard exists to
+    // close would reopen for the instant between them.
+    inner: spinning_top::lock_api::RwLockReadGuard<'a, spinning_top::RawRwSpinlock, Ext2State>,
+    #[allow(dead_code)]
+    hold: StateHoldGuard,
+}
+
+impl core::ops::Deref for Ext2ReadGuard<'_> {
+    type Target = Ext2State;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
 
 /// RAII guard for write access to `Ext2State` that clears lock ownership on drop.
 struct Ext2WriteGuard<'a> {
+    // See `Ext2ReadGuard` for why `inner` must precede `hold`.
     inner: spinning_top::lock_api::RwLockWriteGuard<'a, spinning_top::RawRwSpinlock, Ext2State>,
+    #[allow(dead_code)]
+    hold: StateHoldGuard,
 }
 
 impl core::ops::Deref for Ext2WriteGuard<'_> {
@@ -618,10 +679,12 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     #[cfg(test)]
     fn try_read_state(&self, max_retries: u32) -> Option<Ext2ReadGuard<'_>> {
         for attempt in 0..max_retries {
-            if let Some(guard) = self.state.try_read() {
-                return Some(guard);
+            let hold = state_hold_guard();
+            if let Some(inner) = self.state.try_read() {
+                return Some(Ext2ReadGuard { inner, hold });
             }
-            
+            drop(hold);
+
             // Check if there's an orphaned write lock blocking reads
             if attempt > 0 && attempt % 10_000 == 0 {
                 let owner = EXT2_WRITE_LOCK_OWNER.load(Ordering::Acquire);
@@ -629,31 +692,45 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                     // SAFETY: The owner thread is dead so it can't be using the lock.
                     unsafe { self.state.force_unlock_write(); }
                     EXT2_WRITE_LOCK_OWNER.store(0, Ordering::Release);
-                    if let Some(guard) = self.state.try_read() {
-                        return Some(guard);
+                    let hold = state_hold_guard();
+                    if let Some(inner) = self.state.try_read() {
+                        return Some(Ext2ReadGuard { inner, hold });
                     }
+                    drop(hold);
                 }
             }
-            
+
             for _ in 0..100 {
                 core::hint::spin_loop();
             }
         }
         None
     }
-    
+
     /// Acquire a read lock, blocking until available.
     /// Read locks can be held concurrently by multiple threads.
+    ///
+    /// The [`StateHoldGuard`] is taken *per attempt*, immediately before the
+    /// non-blocking `try_read()`, and either kept (success — it now covers the hold) or
+    /// dropped before the backoff spin. It deliberately does **not** wrap the whole loop:
+    /// under `no-bkl-vfs` that guard masks local IRQs, and this loop is unbounded (it has
+    /// a 10,000-attempt orphan-recovery path precisely because a wait can be long), so
+    /// masking across the wait would starve this core's timer for the whole contended
+    /// window — and if the current holder were a thread on this core, nothing could ever
+    /// run to release it. Masking only the try + hold gives the property we actually need
+    /// (no nested exception *while holding* the lock) with a bounded masked window.
     #[allow(dead_code)]
     fn read_state(&self) -> Ext2ReadGuard<'_> {
         let mut attempt = 0u32;
         loop {
-            if let Some(guard) = self.state.try_read() {
-                return guard;
+            let hold = state_hold_guard();
+            if let Some(inner) = self.state.try_read() {
+                return Ext2ReadGuard { inner, hold };
             }
-            
+            drop(hold);
+
             attempt = attempt.wrapping_add(1);
-            
+
             // Check for orphaned write lock periodically
             if attempt % 10_000 == 0 {
                 let owner = EXT2_WRITE_LOCK_OWNER.load(Ordering::Acquire);
@@ -663,26 +740,31 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                     continue;
                 }
             }
-            
+
             for _ in 0..100 {
                 core::hint::spin_loop();
             }
         }
     }
-    
+
     /// Acquire a write lock, blocking until available.
     /// Tracks ownership for orphaned lock recovery.
+    ///
+    /// Same per-attempt [`StateHoldGuard`] discipline as [`Self::read_state`] — see there
+    /// for why the guard must not span the backoff spin.
     fn write_state(&self) -> Ext2WriteGuard<'_> {
         let current_tid = current_thread_id();
         let mut attempt = 0u32;
         loop {
-            if let Some(guard) = self.state.try_write() {
+            let hold = state_hold_guard();
+            if let Some(inner) = self.state.try_write() {
                 EXT2_WRITE_LOCK_OWNER.store(current_tid, Ordering::Release);
-                return Ext2WriteGuard { inner: guard };
+                return Ext2WriteGuard { inner, hold };
             }
-            
+            drop(hold);
+
             attempt = attempt.wrapping_add(1);
-            
+
             // Check for orphaned write lock periodically
             if attempt % 10_000 == 0 {
                 let owner = EXT2_WRITE_LOCK_OWNER.load(Ordering::Acquire);
@@ -692,7 +774,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                     continue;
                 }
             }
-            
+
             for _ in 0..100 {
                 core::hint::spin_loop();
             }

@@ -137,6 +137,11 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_smp_shared_exec_parallelism();
 
+    // `no-bkl-vfs`: concurrent fs syscalls (read/stat/getdents) from several processes must
+    // stay correct with the BKL dropped, and should lower cross-core BKL contention.
+    #[cfg(kernel_smp_shared)]
+    test_smp_shared_vfs_parallelism();
+
     // Real (shared-kernel) SMP M5c step-2 regression: a kernel thread that exec's an EL0
     // child and cooperatively waits for it must NOT hold the BKL across the wait, or the
     // BKL-free EL0-preempt scheduler lets a peer strand the child -> cross-core deadlock.
@@ -1074,6 +1079,247 @@ fn test_smp_shared_exec_parallelism() {
         crate::safe_print!(
             192,
             "[Test] smp_shared_exec_parallelism PASSED (measured; drop ON did not lower spins here: +{} — expected on host-cached disk)\n",
+            spins_on.saturating_sub(spins_off)
+        );
+    }
+}
+
+/// `no-bkl-vfs`: concurrent ext2 reads must stay byte-correct with the BKL dropped, and the
+/// drop should lower cross-core BKL contention.
+///
+/// Two halves, because the carve-out has two independently-breakable pieces:
+///
+/// 1. **Correctness under concurrency (any core count).** Several threads hammer
+///    `fs::read_at` on one file while checksumming every read against a single-threaded
+///    baseline. This is the half that catches a bad `Ext2ReadGuard`/`Ext2WriteGuard`
+///    hardening: with the BKL dropped, those inner RwSpinlock holds are the *only* thing
+///    serializing ext2's superblock/BGD state and its block cache, so a torn read surfaces
+///    as a checksum mismatch. This half genuinely FAILS — it does not merely measure.
+/// 2. **Contention A/B (SMP=2 only).** Mirrors `test_smp_shared_{fault,exec}_parallelism`:
+///    same load with `set_vfs_bkl_drop_enabled(false)` then `(true)`, reporting the
+///    `contention_spins` delta. Measurement only. Same SMP=2 restriction as its siblings
+///    (at SMP>=4 the pre-existing spawn-storm race would mask the signal).
+///
+/// Note the A/B toggle is what keeps this honest: half 1 is run once with the drop OFF and
+/// once with it ON, so a checksum mismatch can be attributed to the carve-out rather than
+/// to a pre-existing ext2 concurrency bug.
+#[cfg(kernel_smp_shared)]
+fn test_smp_shared_vfs_parallelism() {
+    use akuma_exec::sync::{contention_spins, reset_contention_spins};
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    // Needs to span several ext2 blocks so reads actually reach the block cache and the
+    // block device rather than being served from one cached block.
+    const PATH: &str = "/bin/busybox";
+    const WINDOW: usize = 8 * 1024;
+    const ITERS: usize = 24;
+    const READERS: usize = 3;
+
+    let size = match crate::fs::file_size(PATH) {
+        Ok(s) if s as usize >= WINDOW => s as usize,
+        _ => {
+            console::print("[Test] smp_shared_vfs_parallelism SKIPPED (no suitable /bin/busybox)\n");
+            return;
+        }
+    };
+    // Read from the middle: past the direct blocks, so the indirect-block walk (which reads
+    // ext2 metadata under the state guard) is exercised on every pass.
+    let offset = (size / 2) & !(4096 - 1);
+
+    // Single-threaded baseline, taken with nothing else touching the fs.
+    let checksum_of = |buf: &[u8]| -> u64 {
+        let mut h = 0u64;
+        for (i, b) in buf.iter().enumerate() {
+            h = h.wrapping_mul(0x100_0000_01b3) ^ (u64::from(*b) << (i % 8));
+        }
+        h
+    };
+    let mut base_buf = alloc::vec![0u8; WINDOW];
+    let base_len = match crate::fs::read_at(PATH, offset, &mut base_buf) {
+        Ok(n) if n > 0 => n,
+        _ => {
+            console::print("[Test] smp_shared_vfs_parallelism SKIPPED (baseline read failed)\n");
+            return;
+        }
+    };
+    let baseline = checksum_of(&base_buf[..base_len]);
+
+    static MISMATCHES: AtomicU32 = AtomicU32::new(0);
+    static SHORT_READS: AtomicU32 = AtomicU32::new(0);
+    static ERRORS: AtomicU32 = AtomicU32::new(0);
+    static FINISHED: AtomicU32 = AtomicU32::new(0);
+    static READS_DONE: AtomicU64 = AtomicU64::new(0);
+
+    // The pool level to return to before handing control back — see the recycle wait at the
+    // end of `run_phase`. Sampled before any reader is spawned.
+    let pool_before = akuma_exec::threading::user_threads_available();
+    if pool_before < READERS + 1 {
+        crate::safe_print!(
+            160,
+            "[Test] smp_shared_vfs_parallelism SKIPPED (user-thread pool too low: {} free, need {})\n",
+            pool_before,
+            READERS + 1
+        );
+        return;
+    }
+
+    // One A/B phase: `READERS` threads plus this thread all re-read the same window and
+    // verify it. Returns the BKL contention spins accumulated during the phase.
+    let run_phase = |expect_len: usize, want: u64| -> u64 {
+        MISMATCHES.store(0, Ordering::SeqCst);
+        SHORT_READS.store(0, Ordering::SeqCst);
+        ERRORS.store(0, Ordering::SeqCst);
+        FINISHED.store(0, Ordering::SeqCst);
+        READS_DONE.store(0, Ordering::SeqCst);
+        reset_contention_spins();
+
+        for _ in 0..READERS {
+            let spawned = akuma_exec::threading::spawn_user_thread_fn(move || {
+                let my_tid = akuma_exec::threading::current_thread_id();
+                let mut buf = alloc::vec![0u8; WINDOW];
+                for _ in 0..ITERS {
+                    match crate::fs::read_at(PATH, offset, &mut buf) {
+                        Ok(n) if n == expect_len => {
+                            let mut h = 0u64;
+                            for (i, b) in buf[..n].iter().enumerate() {
+                                h = h.wrapping_mul(0x100_0000_01b3) ^ (u64::from(*b) << (i % 8));
+                            }
+                            if h != want {
+                                MISMATCHES.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                        Ok(_) => { SHORT_READS.fetch_add(1, Ordering::SeqCst); }
+                        Err(_) => { ERRORS.fetch_add(1, Ordering::SeqCst); }
+                    }
+                    READS_DONE.fetch_add(1, Ordering::SeqCst);
+                    akuma_exec::threading::yield_now();
+                }
+                FINISHED.fetch_add(1, Ordering::SeqCst);
+                akuma_exec::threading::mark_thread_terminated(my_tid);
+                loop { akuma_exec::threading::yield_now(); }
+            });
+            if spawned.is_err() {
+                // Fewer readers than asked for is fine — record it by not counting the
+                // thread; the wait below keys off FINISHED reaching the spawned count.
+                FINISHED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        // This thread reads concurrently too, so the load isn't purely peer-core.
+        let mut buf = alloc::vec![0u8; WINDOW];
+        for _ in 0..ITERS {
+            match crate::fs::read_at(PATH, offset, &mut buf) {
+                Ok(n) if n == expect_len => {
+                    if checksum_of(&buf[..n]) != want {
+                        MISMATCHES.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                Ok(_) => { SHORT_READS.fetch_add(1, Ordering::SeqCst); }
+                Err(_) => { ERRORS.fetch_add(1, Ordering::SeqCst); }
+            }
+            READS_DONE.fetch_add(1, Ordering::SeqCst);
+            akuma_exec::threading::yield_now();
+        }
+
+        let start = crate::timer::uptime_us();
+        while FINISHED.load(Ordering::SeqCst) < READERS as u32
+            && crate::timer::uptime_us().saturating_sub(start) < 10_000_000
+        {
+            akuma_exec::threading::yield_now();
+            akuma_exec::threading::idle_halt();
+        }
+        let spins = contention_spins();
+
+        // Reclaim the reader threads' slots before returning. `spawn_user_thread_fn` draws
+        // from the same fixed user-thread pool `spawn_process_with_channel` needs, and
+        // `mark_thread_terminated` only makes a slot *eligible* — it stays occupied until a
+        // cleanup pass runs.
+        //
+        // We must drive that pass OURSELVES. In deferred mode `cleanup_terminated_internal`
+        // returns early unless it is called from thread 0, and the boot self-tests run *on*
+        // thread 0 — so simply yielding here starves the only thread that could recycle
+        // anything, and the pool never recovers (measured: `before=8 after=5` after a full
+        // 5 s wait). That is what broke `smp_shared_cooperative_wait` two tests later with
+        // "No available user threads". Calling `cleanup_terminated()` explicitly is the
+        // convention the other thread-spawning tests in this file already follow.
+        let recycle_start = crate::timer::uptime_us();
+        while akuma_exec::threading::user_threads_available() < pool_before
+            && crate::timer::uptime_us().saturating_sub(recycle_start) < 5_000_000
+        {
+            akuma_exec::threading::cleanup_terminated();
+            akuma_exec::threading::yield_now();
+            akuma_exec::threading::idle_halt();
+        }
+        // Report whether the pool actually came back, so a later "No available user threads"
+        // can be attributed to this test or exonerated from it.
+        crate::safe_print!(
+            160,
+            "[Test]   vfs_parallelism pool: before={} after={} (waited {}us)\n",
+            pool_before,
+            akuma_exec::threading::user_threads_available(),
+            crate::timer::uptime_us().saturating_sub(recycle_start)
+        );
+        spins
+    };
+
+    // Phase A: drop OFF (BKL-held VFS) — establishes that the load itself is clean.
+    crate::smp_shared::set_vfs_bkl_drop_enabled(false);
+    let spins_off = run_phase(base_len, baseline);
+    let (bad_off, short_off, err_off, reads_off) = (
+        MISMATCHES.load(Ordering::SeqCst),
+        SHORT_READS.load(Ordering::SeqCst),
+        ERRORS.load(Ordering::SeqCst),
+        READS_DONE.load(Ordering::SeqCst),
+    );
+
+    // Phase B: drop ON — the configuration `no-bkl-vfs` actually ships.
+    crate::smp_shared::set_vfs_bkl_drop_enabled(true);
+    let spins_on = run_phase(base_len, baseline);
+    let (bad_on, short_on, err_on, reads_on) = (
+        MISMATCHES.load(Ordering::SeqCst),
+        SHORT_READS.load(Ordering::SeqCst),
+        ERRORS.load(Ordering::SeqCst),
+        READS_DONE.load(Ordering::SeqCst),
+    );
+
+    // Restore the shipping default for the remainder of boot.
+    crate::smp_shared::set_vfs_bkl_drop_enabled(true);
+
+    crate::safe_print!(
+        256,
+        "[Test] smp_shared_vfs_parallelism: reads OFF={} ON={} | bad OFF={}/{}/{} ON={}/{}/{} (mismatch/short/err) | BKL-spins OFF={} ON={}\n",
+        reads_off, reads_on, bad_off, short_off, err_off, bad_on, short_on, err_on,
+        spins_off, spins_on
+    );
+
+    if bad_on > 0 || short_on > 0 || err_on > 0 {
+        // Distinguish a carve-out regression from a pre-existing ext2 concurrency bug.
+        if bad_off > 0 || short_off > 0 || err_off > 0 {
+            crate::safe_print!(
+                224,
+                "[Test] smp_shared_vfs_parallelism FAILED: concurrent ext2 reads are unreliable with the BKL HELD too — pre-existing, not the no-bkl-vfs carve-out\n"
+            );
+        } else {
+            crate::safe_print!(
+                224,
+                "[Test] smp_shared_vfs_parallelism FAILED: reads are clean with the BKL held but corrupt with it dropped — the no-bkl-vfs inner-lock hardening is insufficient\n"
+            );
+        }
+        return;
+    }
+
+    if spins_on <= spins_off {
+        crate::safe_print!(
+            192,
+            "[Test] smp_shared_vfs_parallelism PASSED ({} concurrent reads verified; BKL wait reduced by {} spins with drop ON)\n",
+            reads_on,
+            spins_off.saturating_sub(spins_on)
+        );
+    } else {
+        crate::safe_print!(
+            224,
+            "[Test] smp_shared_vfs_parallelism PASSED ({} concurrent reads verified; drop ON did not lower spins here: +{} — expected when the block cache serves every read)\n",
+            reads_on,
             spins_on.saturating_sub(spins_off)
         );
     }
