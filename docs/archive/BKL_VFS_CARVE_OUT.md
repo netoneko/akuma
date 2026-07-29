@@ -4,13 +4,15 @@ Phase 4 of [BKL_FINE_GRAINED_LOCKING_PLAN.md](BKL_FINE_GRAINED_LOCKING_PLAN.md),
 2026-07-25 on branch `another-smp-attempt-0`. Mirrors the `no-bkl-network` carve-out
 (Phase 2, that doc's §631) and reuses its hardening discipline.
 
-**Status: Phase 1 (foundation) + Phase 2a (read-path syscalls) + Phase 2e (eager file `mmap`)
-+ Phase 3.1 (ext2 hardening) shipped and verified at SMP=2. The §8 `[BKL] stuck` regression is
-ROOT-CAUSED AND FIXED (§9: per-thread dropped-window ledger; 0 stuck in the re-run regimen).
-Phases 2b–2d (`openat`/`close`/`dup`/`fcntl`, mutating syscalls, `chdir` family) NOT started.
-SMP=4 stress FIRST RUN 2026-07-29 — see §11: it reproduces `[BKL] stuck` in bulk (~600–700 per
-run, 0 at SMP=2) with no corruption, and it surfaced two pre-existing kernel bugs that make
-parallel userspace workloads barely runnable.**
+**Status: Phase 1 (foundation) + Phase 2a (read-path syscalls) + Phase 2c-first-target (`unlinkat`)
++ Phase 2e (eager file `mmap`) + Phase 3.1 (ext2 hardening) shipped and verified at SMP=2. The §8
+`[BKL] stuck` regression is ROOT-CAUSED AND FIXED (§9: per-thread dropped-window ledger; 0 stuck in
+the re-run regimen). Phase 2c's `unlinkat` conversion is DONE (§12, 2026-07-30): the §11.6
+attribution's 72.6% culprit dropped to **absent**, and the SMP=4 `[BKL] stuck` storm collapsed
+598–704 → 0. Remaining 2b–2d (`openat`/`close`/`dup`/`fcntl`, the rest of the mutating syscalls,
+`chdir` family) NOT started — §12's attribution now names `openat` (36.6%, Phase 2b) as the
+surfaced next target. The two pre-existing kernel bugs from §11 stand as before (thread-slot
+reclaim FIXED §11.7; `wait`/SIGCHLD still open §11.3).**
 
 ---
 
@@ -254,9 +256,12 @@ Not caused by this work; recorded so they aren't re-attributed:
 2. **Phase 2c** — the mutating syscalls (`mkdirat`, `unlinkat`, `renameat2`, `symlinkat`,
    `linkat`, `readlinkat`, `fchmodat`, `fchmod`, `truncate`, `ftruncate`, `fallocate`).
    These take the ext2 **write** guard, so they are the real test of §3. Fresh evidence
-   this matters: a single `rm` of a 735 MB file held the BKL for ~40 s and produced 274
+   this mattered: a single `rm` of a 735 MB file held the BKL for ~40 s and produced 274
    consecutive `[BKL] stuck` warnings on the peer core (all self-healed, no data loss) —
    measured 2026-07-25 during the §9 validation, on a kernel whose read paths were clean.
+   **First target `unlinkat` DONE 2026-07-30 — see §12** (the §11.6 72.6% culprit dropped to
+   *absent*; SMP=4 stuck 598–704 → 0). The remaining 2c list is now evidence-led: §12's
+   attribution names `openat` (Phase 2b, 36.6%), not a 2c syscall, as the next-largest holder.
 3. **Phase 2d** — `chdir`, `fchdir`, `getcwd`, `fstatfs`.
 4. ~~**Phase 2e** — the eager file-backed `sys_mmap` arm.~~ **DONE — see §10.** Shipped as
    fill-before-install inside a `VfsBklGuard` window; verified with the
@@ -737,6 +742,11 @@ Three conclusions, in order of how much they change the plan:
    outweigh *everything else combined* by nearly 3:1. Converting `unlinkat` alone should
    recover the large majority of the available win; the rest of the 2c list can follow on
    evidence rather than on principle.
+
+   **Confirmed — §12 (2026-07-30):** converting `unlinkat` alone dropped it from 72.6% to
+   *absent* and took the SMP=4 `[BKL] stuck` count from 598–704 to 0. The prediction
+   under-recovers slightly: the win this workload could surface was recovered *entirely* by
+   this one conversion.
 3. **The Phase 0 "scheduler/IRQ holds ~70% of contended time" estimate is wrong for this
    workload — it is 27%.** Still the second-largest consumer, and still what Phase 3 targets,
    so Phase 3 keeps its place in the plan. But it is not the reason this workload contends,
@@ -797,7 +807,83 @@ writes don't maintain htree indexes.
 
 - **`wait` still hangs** (§11.3). Unfixed — it needs SIGCHLD delivery, which is a larger piece
   of work than the reclaim fix and touches the signal path rather than the scheduler.
-- **Phase 2c**, now with a specific first target: `unlinkat`. Land the §3 write-guard
-  hardening with it, and re-run this regimen to confirm the 72.6% moves.
-- **The stuck episodes themselves.** Attributed, but not eliminated: the fix for them *is*
-  Phase 2c, since that is where they live.
+- ~~**Phase 2c**, first target `unlinkat`. Land the §3 write-guard hardening with it, and
+  re-run this regimen to confirm the 72.6% moves.~~ **DONE — see §12 (2026-07-30).** The 72.6%
+  did not just move, it vanished; the SMP=4 `[BKL] stuck` storm went with it. The remaining 2c
+  list is now evidence-led — §12's attribution names `openat` (Phase 2b, 36.6%) as the
+  next-largest holder, not a 2c syscall.
+- ~~**The stuck episodes themselves.** Attributed, but not eliminated: the fix for them *is*
+  Phase 2c, since that is where they live.~~ **Resolved by the `unlinkat` conversion (§12):**
+  the ~600–700/run that were almost all `tag=35` are now 0.
+
+---
+
+## 12. Phase 2c first target (`unlinkat`) — DONE, 2026-07-30
+
+§11.6 named a single culprit — `unlinkat` (syscall 35, `tag=35`), 72.6% of all cross-core BKL
+wait — and §11.8 made it Phase 2c's first target. Converted; re-ran the identical §11.1 regimen
+to confirm the share moves. It did not move — it vanished.
+
+### 12.1 The change
+
+`sys_unlinkat` (`src/syscall/fs.rs`) now takes a `VfsBklGuard` window across its on-disk work,
+mirroring the Phase 2a read-path placement (§4): the user-string copy and the dirfd base-path
+lookup stay outside the window (early `EBADF` returns must not pay for a BKL drop), and the
+window covers the directory walk (`canonicalize_path`/`resolve_path`) plus the deletion itself
+(`remove_dir`/`remove_file`/`remove_symlink`). No new locks — the ext2 **write** guard the
+deletion takes is the §3-hardened one. Zero-cost no-op off `smp-shared` + `no-bkl-vfs`.
+
+### 12.2 Result — same §11.1 regimen, `bkl-profile` build, SMP=4, 4 GB
+
+| signal | §11 pre-fix | §12 post-fix |
+|---|---|---|
+| `[BKL] stuck` | 598–704 (§11.2) / 1156 `tag=35` episodes (§11.6) | **0** |
+| `unlinkat` `tag=35` share of attributed spins | **72.6%** | **absent** (not in top 12) |
+| PANIC / WILD / SPURIOUS | 0 / 0 / 0 | 0 / 0 / 0 |
+| pool exhaustion (`No available user threads`) | 0 (post §11.7) | 0 |
+| digests (4 net + 2 in-VM copy) | 6/6 exact | **6/6 exact** |
+| regimen wall-clock | 136 s (§11.7 lean) | 136 s |
+
+Post-fix cumulative attributed spins (185.9 M total, same profiler): `irq/sched` `tag=501`
+53.9%, `openat` `tag=56` **36.6%**, everything else <2%. `openat` is the surfaced next target —
+**Phase 2b**, not 2c; the rest of the 2c list is now evidence-led rather than principle-led.
+
+### 12.3 Correctness was verified, not assumed
+
+`rm -f` swallows errors, so a *broken* `unlinkat` (early error return, no I/O) would also show
+no BKL contention — indistinguishable from "works and is fast" via profiling alone. Ruled out
+directly: downloaded `p64.bin` (64 MiB, sha matched the reference) → `rm` → `ls` reports
+"No such file or directory"; `mkdir -p`/`rm -rf` exercised the `AT_REMOVEDIR` (`remove_dir`)
+path the same way → gone. Both deletion paths remove real files, and the 64 MiB delete produced
+0 stuck — the class of hold §7.2 measured at ~40 s pre-fix.
+
+### 12.4 `e2fsck` finding: pre-existing durability bug, NOT a carve-out regression
+
+Post-campaign `e2fsck -fp devbox.img` flagged two directory inodes as *"in use, but has dtime
+set"* + *"zero-length directory"* (beyond the standing cosmetic HTREE warning). These were the
+`/tmp/delme` + `/tmp/delme/sub` the verify script `rm -rf`'d. Looked serious, so it was
+attributed decisively before being filed:
+
+- `remove_dir` (`crates/akuma-ext2/src/ext2.rs:2162`) sets `inode.deletion_time` + `write_inode`
+  and then `free_inode` (clears the bitmap bit, `:1105`) **all under one `write_state` guard** —
+  the ext2 write lock §3 hardened serializes them, so a concurrency tear between the dtime write
+  and the bitmap clear is not possible from dropping the BKL.
+- **Decisive test: reproduced identically at SMP=1** (one core, zero concurrency, where the
+  `VfsBklGuard`'s BKL-drop is a correctness no-op). Same two directory inodes, same pattern.
+
+The real cause: **Akuma's ext2 block cache is write-back with no sync-on-shutdown.** When QEMU
+is raw-`kill`'d, the inode-record write (dtime set) has landed on disk but the inode-bitmap
+clear is still dirty in the 64-slot cache and is discarded. §11.7 reported "clean" because those
+runs did more I/O after deleting (evicting/flushing the dirty bitmap blocks through the cache);
+here the deletion was the literal last op before kill. Pre-existing, SMP-independent, and
+unaffected by whether the BKL is held around `remove_dir`. Filed as a separate item; the image
+`e2fsck -fp`'d clean afterward (read-only `-n` check passes, exit 0).
+
+### 12.5 Caveat: profiler perturbation, and what the number establishes
+
+The `bkl-profile` feature perturbs timing (§11.5), so absolute spin counts are not comparable
+across sessions. The two decisive, profiler-independent signals: the `[BKL] stuck` *count*
+(0 vs §11.2's 598–704 — a threshold counter present in every build), and `unlinkat`'s
+*presence* in the attribution (absent, under the same profiler on the same workload where it was
+72.6%). §11.6's prediction — *"converting `unlinkat` alone should recover the large majority of
+the available win"* — is confirmed; for this workload it recovered all of it.

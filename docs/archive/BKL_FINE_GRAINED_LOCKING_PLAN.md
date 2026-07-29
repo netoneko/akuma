@@ -769,8 +769,12 @@ work is a BKL-drop guard plus inner-lock hardening. No new locks were introduced
       reconcile was converting every dropped window into a BKL-held run at the first timer
       tick; fixed with a per-thread dropped-window ledger consulted at every eret. Applies
       to ALL droppers (vfs, net, exec, file-fault), 0 stuck in the re-run regimen.
-- [ ] Phase 2b/2c/2d: `openat`/`close`/`dup`/`fcntl`, the mutating syscalls, `chdir` family
-      (2c urgency data point: one `rm` of a 735 MB file = ~40 s BKL hold, 274 stuck warns)
+- [~] Phase 2b/2c/2d: `openat`/`close`/`dup`/`fcntl`, the mutating syscalls, `chdir` family.
+      **Phase 2c first target `unlinkat` DONE 2026-07-30** (carve-out doc §12): the §11.6 72.6%
+      attribution culprit dropped to *absent*, SMP=4 `[BKL] stuck` 598–704 → 0 on the identical
+      regimen (6/6 digests exact). Remaining 2c list is now evidence-led — §12 names `openat`
+      (Phase 2b, 36.6%) as the next holder, not a 2c syscall. (Original urgency data point: one
+      `rm` of a 735 MB file = ~40 s BKL hold, 274 stuck warns — that hold is now gone.)
 - [x] Phase 2e: eager file-backed `mmap` arm — fill-before-install inside a
       `VfsBklGuard` window + windowed `resolve_inode` (that doc §10). Verified with the
       `userspace/forktest/c_stress` mmap stress tools + llama.cpp mmap model-load
@@ -783,10 +787,12 @@ work is a BKL-drop guard plus inner-lock hardening. No new locks were introduced
       done, **Phase 2c is the whole remaining VFS win and its first target is specifically
       `unlinkat`**, and the Phase 0 "scheduler/IRQ ≈70%" estimate is wrong for this workload
       (it is 27%) — Phase 3 keeps its place but does not jump the queue.
-- [~] SMP=4 stress — FIRST RUN 2026-07-29 (that doc §11). Result: no wedge, no corruption,
+- [x] SMP=4 stress — FIRST RUN 2026-07-29 (that doc §11). Result: no wedge, no corruption,
       0 PANIC/WILD/SPURIOUS — but **~600–700 `[BKL] stuck` per run** where SMP=2 produced 0,
-      so the §9 ledger fix bounded holds at SMP=2 only. Attribution is the next step, and
-      **Phase 2c must not land before those holds are attributed.**
+      so the §9 ledger fix bounded holds at SMP=2 only. Attribution (§11.6) named `unlinkat`
+      (72.6%); the "Phase 2c must not land before those holds are attributed" gate was met, 2c's
+      `unlinkat` landed (§12, 2026-07-30) and **SMP=4 stuck is now 0**. Remaining §11 blockers
+      stand: thread-slot reclaim FIXED (§11.7), `wait`/SIGCHLD still open (§11.3).
       Two pre-existing blockers found by the campaign (neither a carve-out regression, both
       reproduce at SMP=1):
       **(a) thread-slot reclamation starved under load** (p50 24 s / max 192 s against a 10 ms

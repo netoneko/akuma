@@ -2201,29 +2201,42 @@ pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> u64 {
         Err(e) => return e,
     };
 
-    let resolved = if path.starts_with('/') {
-        crate::vfs::canonicalize_path(&path)
-    } else {
-        let base = if dirfd == -100 {
-            if let Some(proc) = akuma_exec::process::current_process() {
-                proc.cwd.clone()
-            } else {
-                return EBADF;
-            }
-        } else if dirfd >= 0 {
-            if let Some(proc) = akuma_exec::process::current_process() {
-                if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                    f.path
-                } else {
-                    return EBADF;
-                }
-            } else {
-                return EBADF;
-            }
-        } else {
-            return EBADF;
+    // Build the dirfd-relative base path (fd-table lookups only, no disk I/O) before
+    // entering the VFS BKL window — matches sys_statx/sys_newfstatat: the early-return
+    // EBADF paths must not pay for a BKL drop/reacquire when no on-disk work will happen.
+    //
+    // The path walk + inode deletion below is exactly the on-disk mutating work Phase 2c
+    // targets: `unlinkat` (syscall 35) measured 72.6% of all cross-core BKL wait —
+    // docs/archive/BKL_VFS_CARVE_OUT.md §11.6.
+    let base: Option<String> = if path.starts_with('/') {
+        None
+    } else if dirfd == -100 {
+        match akuma_exec::process::current_process() {
+            Some(proc) => Some(proc.cwd.clone()),
+            None => return EBADF,
+        }
+    } else if dirfd >= 0 {
+        let proc = match akuma_exec::process::current_process() {
+            Some(p) => p,
+            None => return EBADF,
         };
-        crate::vfs::resolve_path(&base, &path)
+        match proc.get_fd(dirfd as u32) {
+            Some(akuma_exec::process::FileDescriptor::File(f)) => Some(f.path),
+            _ => return EBADF,
+        }
+    } else {
+        return EBADF;
+    };
+
+    // From here on is pure VFS work (directory walk + ext2 inode/block deallocation, which
+    // takes the ext2 write guard) — run it BKL-free. `remove_file` of a large file can hold
+    // the write guard for tens of seconds (§7.2: one 735 MB `rm` = ~40 s), which is the
+    // hold this carve-out exists to remove from the peer core's view.
+    let _vfs_bkl = VfsBklGuard::new();
+
+    let resolved = match base {
+        Some(b) => crate::vfs::resolve_path(&b, &path),
+        None => crate::vfs::canonicalize_path(&path),
     };
 
     if crate::config::SYSCALL_DEBUG_IO_ENABLED {
