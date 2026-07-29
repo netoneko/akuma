@@ -192,6 +192,18 @@ no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network"]
 # build that doesn't set both features.
 no-bkl-vfs = ["akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs", "akuma-net/no-bkl-vfs"]
 
+# BKL-hold attribution (measurement builds only — never ship it). Enables the
+# per-tag BKL profiler in `akuma_exec::sync` for the whole boot and makes the
+# async-main loop print a periodic `[BKLPROF]` delta histogram: which syscall /
+# fault / IRQ-scheduler excursion the *holding* core was in while peers spun.
+# This is the input that decides whether more BKL carve-outs are worth it (the
+# Phase 0 estimate that scheduler/IRQ holds ~70% of contended time was never
+# measured under a real userspace workload). Costs a shared-line store on every
+# kernel entry, so it perturbs timing-sensitive tests — keep it out of
+# `smp-shared` and enable it explicitly:
+#   cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests,bkl-profile
+bkl-profile = []
+
 # Rump-kernel support: a raw L2 packet path so a userspace NetBSD rump TCP/IP
 # stack can send/receive Ethernet frames. Binds a SECOND virtio-net device
 # (NIC1) and exposes it as /dev/net/tap0 (open/read/write whole frames + a

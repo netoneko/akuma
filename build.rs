@@ -5,6 +5,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_network)");
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_vfs)");
+    println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
 
     // Multikernel (one-kernel-per-core) gate. ALL secondary-core code lives behind
     // `cfg(kernel_smp)`; with the feature off, none of it compiles and the default
@@ -61,6 +62,16 @@ fn main() {
     let no_bkl_vfs = std::env::var("CARGO_FEATURE_NO_BKL_VFS").is_ok();
     if no_bkl_vfs {
         println!("cargo:rustc-cfg=kernel_no_bkl_vfs");
+    }
+
+    // BKL-hold attribution build. Turns on the per-tag profiler in
+    // `akuma_exec::sync` for the whole boot and has the async-main loop dump a
+    // periodic delta histogram to the serial console. A MEASUREMENT build only:
+    // the profiler writes a shared per-core tag line on every kernel entry, which
+    // perturbs timing, so it must never be in a shipping feature set.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BKL_PROFILE");
+    if std::env::var("CARGO_FEATURE_BKL_PROFILE").is_ok() {
+        println!("cargo:rustc-cfg=kernel_bkl_profile");
     }
 
     // OPT_LEVEL is "z" only for profile.size / profile.extreme-size (opt-level = "z").

@@ -148,6 +148,10 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_smp_shared_vfs_parallelism();
 
+    // Thread-slot exhaustion must be recoverable: a spawn that finds no free slot has to
+    // collect cooled-down terminated slots itself instead of reporting ENOMEM.
+    test_thread_slot_reclaim_on_spawn();
+
     // Real (shared-kernel) SMP M5c step-2 regression: a kernel thread that exec's an EL0
     // child and cooperatively waits for it must NOT hold the BKL across the wait, or the
     // BKL-free EL0-preempt scheduler lets a peer strand the child -> cross-core deadlock.
@@ -1099,6 +1103,124 @@ fn test_smp_shared_exec_parallelism() {
 /// KEEP the lock, silently converting the window's remainder (tens of ms of bulk ext2
 /// I/O) into a BKL-held run. The dwell below is longer than several 10 ms timer ticks,
 /// so on the pre-ledger kernel the mid-window assertion deterministically fails.
+/// Thread-slot exhaustion must be **recoverable at the spawn site**.
+///
+/// The deferred-cleanup design has exactly one collector — thread 0 — and its only
+/// steady-state caller is thread 0's *idle* loop, which does not run while the system is
+/// busy. Under process churn that starved reclamation outright: slots sat TERMINATED for
+/// tens of seconds and `spawn` returned "No free user thread slots" (surfacing to userspace
+/// as `fork: Out of memory`) while gigabytes of RAM were free
+/// (docs/archive/BKL_VFS_CARVE_OUT.md §11.4).
+///
+/// This test drives the exact shape that used to fail: fill the pool, terminate everything,
+/// let the cooldown elapse, then spawn again **without** any explicit cleanup call. The
+/// spawn must succeed by collecting the cooled-down slots itself.
+///
+/// It also pins the two properties that keep on-demand reclaim safe:
+/// - a slot still inside its cooldown is NOT recycled (it may still be on its kernel stack);
+/// - the caller-identity gate is what was relaxed, nothing else — `cleanup_terminated()`
+///   still declines to collect from a non-thread-0 caller.
+fn test_thread_slot_reclaim_on_spawn() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static STARTED: AtomicUsize = AtomicUsize::new(0);
+
+    // Baseline: reclaim anything already pending so the counts below are ours.
+    akuma_exec::threading::cleanup_terminated_force();
+    let free_before = akuma_exec::threading::user_threads_available();
+    if free_before < 4 {
+        crate::safe_print!(128,
+            "[Test] thread_slot_reclaim_on_spawn SKIPPED: only {} free user slots\n", free_before);
+        return;
+    }
+
+    // Fill the pool. Each thread marks itself terminated immediately, so every slot ends
+    // up TERMINATED-but-occupied — the state the old code could not get out of.
+    let mut spawned = 0usize;
+    // Stop on the first refusal, or once we have clearly out-spawned the pool — past that
+    // point reclaim-on-demand is simply recycling as fast as we can ask, which is the
+    // behavior under test, not a reason to keep going.
+    while spawned <= free_before + 8
+        && akuma_exec::threading::spawn_user_thread_fn(move || {
+            STARTED.fetch_add(1, Ordering::SeqCst);
+            let my_tid = akuma_exec::threading::current_thread_id();
+            akuma_exec::threading::mark_thread_terminated(my_tid);
+            loop {
+                akuma_exec::threading::yield_now();
+            }
+        })
+        .is_ok()
+    {
+        spawned += 1;
+    }
+    // Let every spawned thread run far enough to mark itself terminated.
+    for _ in 0..64 {
+        akuma_exec::threading::yield_now();
+    }
+
+    // A terminated slot inside its cooldown must NOT be recycled. Sample immediately;
+    // `thread_cleanup_cooldown_us` is 10ms, far longer than this call takes.
+    let reclaimed_hot = akuma_exec::threading::reclaim_terminated_slots();
+
+    // The caller gate is the ONLY thing on-demand reclaim relaxes: the gated entry point
+    // still refuses to collect from a non-thread-0 caller. (Boot tests run ON thread 0, so
+    // assert this from a spawned thread instead of here.)
+    static GATED_FROM_OTHER_THREAD: AtomicUsize = AtomicUsize::new(usize::MAX);
+    if let Ok(_tid) = akuma_exec::threading::spawn_user_thread_fn(move || {
+        GATED_FROM_OTHER_THREAD.store(
+            akuma_exec::threading::cleanup_terminated(),
+            Ordering::SeqCst,
+        );
+        let my_tid = akuma_exec::threading::current_thread_id();
+        akuma_exec::threading::mark_thread_terminated(my_tid);
+        loop {
+            akuma_exec::threading::yield_now();
+        }
+    }) {
+        for _ in 0..64 {
+            akuma_exec::threading::yield_now();
+            if GATED_FROM_OTHER_THREAD.load(Ordering::SeqCst) != usize::MAX {
+                break;
+            }
+        }
+    }
+
+    // Burn past the cooldown, then spawn with NO explicit cleanup. Pre-fix this returned
+    // "No free user thread slots"; the spawn path must now reclaim and succeed.
+    let deadline = crate::timer::uptime_us() + 200_000; // 200ms >> 10ms cooldown
+    while crate::timer::uptime_us() < deadline {
+        akuma_exec::threading::yield_now();
+    }
+    let respawn = akuma_exec::threading::spawn_user_thread_fn(move || {
+        let my_tid = akuma_exec::threading::current_thread_id();
+        akuma_exec::threading::mark_thread_terminated(my_tid);
+        loop {
+            akuma_exec::threading::yield_now();
+        }
+    });
+
+    let gated = GATED_FROM_OTHER_THREAD.load(Ordering::SeqCst);
+    let gate_held = gated == 0 || gated == usize::MAX; // MAX = helper never got to run
+    let hot_ok = reclaimed_hot == 0;
+    let respawn_ok = respawn.is_ok();
+
+    // Leave the pool clean for the tests that follow.
+    for _ in 0..64 {
+        akuma_exec::threading::yield_now();
+    }
+    akuma_exec::threading::cleanup_terminated_force();
+
+    if hot_ok && respawn_ok && gate_held {
+        crate::safe_print!(160,
+            "[Test] thread_slot_reclaim_on_spawn PASSED (filled {} slots, hot-reclaim {}, respawn ok)\n",
+            spawned, reclaimed_hot);
+    } else {
+        crate::safe_print!(224,
+            "[Test] thread_slot_reclaim_on_spawn FAILED: hot_reclaim={} (want 0) respawn_ok={} gated_from_other_thread={} (want 0)\n",
+            reclaimed_hot, respawn_ok, gated);
+    }
+}
+
 ///
 /// Also pins the nesting contract: an inner window's close must NOT re-acquire while the
 /// outer window is still open; the outermost close must.

@@ -968,44 +968,75 @@ fn count_free_slots(start: usize, end: usize) -> usize {
 /// - Only cleans up if called from thread 0 (main thread)
 /// - Respects THREAD_CLEANUP_COOLDOWN_US before recycling slots
 pub fn cleanup_terminated_lockfree() -> usize {
-    cleanup_terminated_internal(false)
+    cleanup_terminated_internal(false, false)
 }
 
 /// Force cleanup of terminated threads - bypasses thread check and cooldown
 /// Use for tests or when you know it's safe to recycle immediately
 pub fn cleanup_terminated_force() -> usize {
-    cleanup_terminated_internal(true)
+    cleanup_terminated_internal(true, true)
 }
 
-/// Internal cleanup implementation
-fn cleanup_terminated_internal(force: bool) -> usize {
-    // In deferred mode (unless forced), only allow cleanup from thread 0
-    if !force && config().deferred_thread_cleanup {
+/// Reclaim cooled-down terminated slots **from any thread**, keeping the cooldown.
+///
+/// The deferred-cleanup design has one collector — thread 0 — and its only
+/// steady-state caller is thread 0's *idle* loop, which by definition does not run
+/// while the system is busy. Under sustained process churn that starves reclamation
+/// completely: slots sat TERMINATED for a measured p50 of 24 s (max 192 s) against a
+/// 10 ms cooldown, `fork` stalled for minutes, and spawns eventually failed with
+/// "No free user thread slots" while gigabytes of RAM were free. See
+/// docs/archive/BKL_VFS_CARVE_OUT.md §11.4.
+///
+/// Dropping only the caller gate is safe; the two things that make recycling correct
+/// are kept:
+/// - **The cooldown stays.** A thread marks itself TERMINATED while still executing on
+///   its own kernel stack and only leaves it at the next context switch. The cooldown —
+///   not the caller's identity — is what guarantees it is gone before the slot's stack
+///   and context are reused. `cleanup_terminated_force` (tests only) is the one caller
+///   that may bypass it.
+/// - **The `TERMINATED → INITIALIZING` CAS stays.** It is what actually excludes a
+///   concurrent `claim_free_slot`, and it equally serializes two concurrent reclaimers:
+///   only one can win a given slot, and the loser skips it.
+///
+/// The caller's own slot can never be a candidate — a running thread is not TERMINATED.
+pub fn reclaim_terminated_slots() -> usize {
+    cleanup_terminated_internal(true, false)
+}
+
+/// Internal cleanup implementation.
+///
+/// `any_caller` drops the "only thread 0 collects" gate; `ignore_cooldown` drops the
+/// post-termination settling time. They are independent: `reclaim_terminated_slots`
+/// takes the first without the second, which is the combination that is safe in
+/// production (see its docs).
+fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize {
+    // In deferred mode, only thread 0 collects unless the caller opts out.
+    if !any_caller && config().deferred_thread_cleanup {
         let current = get_current_thread_register();
         if current != IDLE_THREAD_IDX {
             // Not main thread - skip cleanup
             return 0;
         }
     }
-    
+
     let now = (runtime().uptime_us)();
     let mut count = 0;
-    
+
     for i in 1..MAX_THREADS {
         // Check if thread is terminated
         if THREAD_STATES[i].load(Ordering::SeqCst) != thread_state::TERMINATED {
             continue;
         }
-        
-        // In deferred mode (unless forced), check cooldown period
-        if !force && config().deferred_thread_cleanup {
+
+        // In deferred mode, respect the settling time unless the caller opts out.
+        if !ignore_cooldown && config().deferred_thread_cleanup {
             let term_time = TERMINATION_TIME[i].load(Ordering::SeqCst);
             if term_time > 0 && now.saturating_sub(term_time) < config().thread_cleanup_cooldown_us {
                 // Thread hasn't been terminated long enough - skip
                 continue;
             }
         }
-        
+
         // CRITICAL: Use INITIALIZING as intermediate state to prevent race with spawn!
         // 
         // Race condition without this:
@@ -3185,10 +3216,19 @@ pub fn spawn_system_thread_fn<F>(f: F) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
 {
-    // Step 1: Atomically claim a free slot (lock-free)
+    // Step 1: Atomically claim a free slot (lock-free). Same reclaim-then-retry as
+    // the user-thread path — see `spawn_user_thread_fn_internal`.
     let slot_idx = match claim_free_slot(1, config().reserved_threads) {
         Some(idx) => idx,
-        None => return Err("No free system thread slots"),
+        None => {
+            if reclaim_terminated_slots() == 0 {
+                return Err("No free system thread slots");
+            }
+            match claim_free_slot(1, config().reserved_threads) {
+                Some(idx) => idx,
+                None => return Err("No free system thread slots"),
+            }
+        }
     };
 
     // Lazy stacks: ensure this slot has a stack (no-op if pre-allocated). On a
@@ -3322,10 +3362,23 @@ fn spawn_user_thread_fn_internal<F>(f: F, cooperative: bool, start_irqs_disabled
 where
     F: FnOnce() -> ! + Send + 'static,
 {
-    // Step 1: Atomically claim a free slot (lock-free)
+    // Step 1: Atomically claim a free slot (lock-free). On a miss, collect
+    // cooled-down terminated slots ourselves and retry once before failing — the
+    // pool is usually not exhausted, just uncollected (see
+    // `reclaim_terminated_slots`). Without this, a spawn storm reports ENOMEM to
+    // userspace while the slots it needs sit TERMINATED waiting for an idle loop
+    // that a busy system never reaches.
     let slot_idx = match claim_free_slot(config().reserved_threads, thread_limit()) {
         Some(idx) => idx,
-        None => return Err("No free user thread slots"),
+        None => {
+            if reclaim_terminated_slots() == 0 {
+                return Err("No free user thread slots");
+            }
+            match claim_free_slot(config().reserved_threads, thread_limit()) {
+                Some(idx) => idx,
+                None => return Err("No free user thread slots"),
+            }
+        }
     };
 
     // Lazy stacks: ensure this slot has a stack (no-op if pre-allocated).

@@ -4,10 +4,13 @@ Phase 4 of [BKL_FINE_GRAINED_LOCKING_PLAN.md](BKL_FINE_GRAINED_LOCKING_PLAN.md),
 2026-07-25 on branch `another-smp-attempt-0`. Mirrors the `no-bkl-network` carve-out
 (Phase 2, that doc's §631) and reuses its hardening discipline.
 
-**Status: Phase 1 (foundation) + Phase 2a (read-path syscalls) + Phase 3.1 (ext2 hardening)
-shipped and verified at SMP=2. The §8 `[BKL] stuck` regression is ROOT-CAUSED AND FIXED
-(§9: per-thread dropped-window ledger; 0 stuck in the re-run regimen). Phases 2b–2e
-(mutating syscalls, `mmap` eager arm) NOT started. SMP=4 stress NOT run.**
+**Status: Phase 1 (foundation) + Phase 2a (read-path syscalls) + Phase 2e (eager file `mmap`)
++ Phase 3.1 (ext2 hardening) shipped and verified at SMP=2. The §8 `[BKL] stuck` regression is
+ROOT-CAUSED AND FIXED (§9: per-thread dropped-window ledger; 0 stuck in the re-run regimen).
+Phases 2b–2d (`openat`/`close`/`dup`/`fcntl`, mutating syscalls, `chdir` family) NOT started.
+SMP=4 stress FIRST RUN 2026-07-29 — see §11: it reproduces `[BKL] stuck` in bulk (~600–700 per
+run, 0 at SMP=2) with no corruption, and it surfaced two pre-existing kernel bugs that make
+parallel userspace workloads barely runnable.**
 
 ---
 
@@ -542,3 +545,259 @@ arguments it dies before serving:
 The first crashed llama leaked one open dropped-BKL window (destructor-skipping kill
 path); the §9 EL0-entry tripwire healed it at slot reuse exactly as designed
 (`[BKL] stale dropped-window depth 1 healed at EL0 entry (tid=14)`).
+
+---
+
+## 11. SMP=4 stress campaign + BKL-hold attribution — 2026-07-29 (IN PROGRESS)
+
+The two open items from §7 — "a contention signal" (§7.5) and "SMP=4 stress" (§7.6) — are the
+gate on everything downstream: until they run, §3's hardening is argued-correct, not
+demonstrated-correct, and there is no evidence that carving *more* subsystems out of the BKL
+is where the remaining contention actually is. This section is the campaign that runs both.
+
+**Section status: COMPLETE. Stress run at SMP=4 (§11.2) — no corruption, no wedge, but
+hundreds of `[BKL] stuck` where SMP=2 produced none. Attribution collected (§11.6) — and it
+names a single culprit: `unlinkat`, at 72.6% of all cross-core BKL wait. Two pre-existing
+kernel bugs were found on the way; the thread-slot one is FIXED (§11.7), the missing SIGCHLD
+is not (§11.3).**
+
+### 11.1 Harness
+
+Same shape as §8 (devbox-smoltcp, userspace sshd over a full busybox userspace, deterministic
+non-compressible payload from a host HTTP server on `10.0.2.2`), with three changes:
+
+- **SMP=4**, MEMORY=4096.
+- **`devbox.img` grown 1 GB → 4 GB.** The §9.4 gotcha (image silently full, ENOSPC
+  masquerading as a network bug) cost real debugging time; 4 GB removes it. Grown in place on
+  the host with Homebrew e2fsprogs — `e2fsck -fp && truncate -s 4G && resize2fs && e2fsck -fp`
+  — which preserves the existing rootfs. Akuma's ext2 driver reads and writes the 32-block-group
+  image without complaint. **Nothing else may have the image open while this runs**; a stale
+  QEMU from an earlier session holds a write lock on it (and would be writing through a stale
+  1 GB superblock).
+- The workload is driven from a **script fetched into the VM and run detached** (`nohup sh
+  /tmp/job.sh &`), polled over short-lived ssh connections. Detached because this sshd tears
+  down exec channels when the cores are pegged; `sh /tmp/job.sh` rather than the shebang
+  because busybox resolves a bare executable path with no recognised interpreter as an *applet
+  name* and fails with `applet not found`.
+
+Phases, each driving a different BKL consumer: `net4` (4 concurrent 32–64 MiB downloads → net
+syscalls + ext2 write), `read4` (4 concurrent `sha256sum` → ext2 read with a working set far
+larger than the 64-slot block cache, which is what §7.5 asked for), `cp2` (read+write in one
+process), `rm` (mutating syscalls — the Phase 2c motivation).
+
+### 11.2 Stress result: SMP=4 reproduces `[BKL] stuck` in bulk, with no corruption
+
+Two runs of the shipping config (`no-bkl-vfs` + `no-bkl-network`, `release-smp-shared`,
+`devbox-smoltcp,no-tests`), each moving 256 MiB through 4 concurrent `curl`s:
+
+| signal | run 1 | run 2 | SMP=2 (§9.4) |
+|---|---|---|---|
+| `[BKL] stuck` | **704** | **598** | 0 |
+| `RECOVERED` | 39 | 12 | 8–13 |
+| PANIC / WILD / SPURIOUS | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| stale dropped-window heals | 0 | 0 | — |
+| download integrity | 4/4 complete, `rc=0` | 4/4 complete, `rc=0` | — |
+| **digests** (4 net + 2 in-VM copies) | — (run cut short) | **6/6 exact** | 6/6 exact |
+
+Run 2's digest verification is the correctness half: 4 × 64 MiB downloaded concurrently over
+the BKL-free net path onto ext2, then re-read (`sha256sum`, 4 processes, 256 MiB — far past the
+64-slot block cache) and copied in-VM, all byte-exact against the host reference. So SMP=4
+concurrency does **not** corrupt the carve-out's read, write, or copy paths.
+
+Throughput datapoint for the read phase: the 4 concurrent `sha256sum`s over 256 MiB joined in
+15 s (~17 MB/s aggregate), i.e. the cache-missing read path is healthy even while producing
+hundreds of stuck warnings.
+
+So the §9 ledger fix did **not** eliminate long BKL holds — it eliminated them *at SMP=2*. At
+SMP=4 the same workload produces hundreds of >10M-spin waits. Every one self-healed: no panic,
+no wedge, no wild data abort, no truncated transfer. All lines report `tag=511` (unknown)
+because the per-tag profiler is off in a shipping build — attributing them is §11.5.
+
+Two independent points worth keeping: (a) the failure mode §3's hardening targets (AB-BA under
+a nested IRQ inside a dropped window) did **not** occur — 0 wedges across both runs; (b) long
+holds at SMP=4 are nevertheless routine, so Phase 2c (the ext2 *write* guard) must not land
+until they are attributed.
+
+### 11.3 Blocker found: the shell's `wait` builtin never returns
+
+`sh -c "sleep 1 & wait; echo OK"` **hangs forever** — at SMP=1 and SMP=4, on an otherwise idle
+VM. The child runs, exits, and disappears from `ps`; the parent sits in `wait` indefinitely.
+
+Not a regression from either carve-out (it reproduces at SMP=1, and the mechanism below has
+never existed): **the kernel delivers no SIGCHLD.** `grep -r SIGCHLD src/ crates/` finds only
+clone-flag *parsing* — no code path ever raises the signal on a child's exit. Foreground waits
+are unaffected, because they go through a blocking `wait4` while the child is still alive
+(that is how every `ssh <cmd>` returns); it is specifically the background-job path that
+depends on the signal.
+
+Impact well beyond this campaign: `&` + `wait` is the standard way to express parallelism in
+shell, so *no* parallel shell workload can synchronize — which is exactly what SMP testing
+needs. The harness works around it by having each worker touch a sentinel file and having the
+parent poll for it.
+
+### 11.4 Blocker found: thread-slot reclamation starves under load
+
+Under sustained load `fork` stalls for **minutes**, then fails outright: userspace sees
+`can't fork: Out of memory` and the kernel logs `[sys_spawn] … No available user threads`
+while **3.4 GB of RAM is free** (`pmm=905586free/1048576tot`). Measured reclaim latency in one
+run: **p50 24 s, p90 176 s, max 192 s** — against a configured
+`THREAD_CLEANUP_COOLDOWN_US` of **10 ms** (`src/config.rs:591`). The cooldown is not the
+problem; the pass simply is not running.
+
+Mechanism, all of it in `cleanup_terminated_internal`
+(`crates/akuma-exec/src/threading/mod.rs:981`) and its callers:
+
+1. With `DEFERRED_THREAD_CLEANUP = true` the pass returns early unless the caller **is thread
+   0** — so no other thread can ever reclaim a slot, including the thread that just failed to
+   find one.
+2. The only steady-state caller is thread 0's **idle** loop (`src/main.rs:1137`, every 10
+   iterations). That loop runs only when nothing else is runnable — precisely never under the
+   load that exhausts the pool. The async-main poll loop, which *does* run on the BSP under
+   load, never calls it.
+3. So slot exhaustion has no recovery path: `spawn` fails and returns an error instead of
+   running a pass and retrying.
+
+`MAX_THREADS` is 64 (`crates/akuma-exec/src/threading/types.rs:11`), so this bites after a few
+dozen short-lived processes — which a shell script reaches in seconds. This is very likely the
+root of the standing "SMP=4 testing is blocked by pool exhaustion" note and of the §5 gotcha
+("one cleanup call reclaimed ~45 slots… raising MAX_THREADS would not have helped").
+
+Remedy directions, cheapest first — none implemented yet:
+- **Reclaim on demand.** `spawn_user_thread_fn_internal`
+  (`crates/akuma-exec/src/threading/mod.rs:3326`) turns a `claim_free_slot` miss straight into
+  `Err("No free user thread slots")` without ever attempting a pass. Run a cleanup pass and
+  retry once there (and at the sibling site `:3189`). The pass is already race-safe against
+  concurrent spawns: it CASes `TERMINATED → INITIALIZING`, which blocks a spawn from claiming
+  the slot mid-pass.
+- **Reclaim from the async-main loop**, not just the idle loop, so a busy BSP still collects.
+- **Relax the thread-0 restriction.** The `INITIALIZING` interlock is what actually provides
+  safety against a concurrent *spawn*; "only thread 0" looks like a conservative leftover. Two
+  things must survive the relaxation: the cooldown (which guards against recycling a slot whose
+  thread has not yet left its kernel stack), and a "not currently running" check. The latter is
+  cheap and already per-core — `get_current_thread_register()` reads `TPIDRRO_EL0`
+  (`threading/mod.rs:593`), so under shared-kernel SMP a reclaimer must confirm the candidate
+  slot is not the running thread on *any* core, not just its own. Reclaiming from a
+  non-thread-0 core without that check is the one way this could get worse instead of better.
+
+### 11.5 Attribution build (`bkl-profile`) — NEW, result pending
+
+`akuma_exec::sync` has carried a per-tag BKL-hold profiler for a while (a waiter samples what
+the *owning* core is doing when it first observes contention, and credits its spins to that
+tag on acquiring), but its only consumer was a boot self-test — so it had never been read under
+a real userspace workload, and the Phase 0 claim that the scheduler/IRQ path holds ~70% of
+contended time remained an estimate.
+
+New `bkl-profile` cargo feature → `cfg(kernel_bkl_profile)` (`build.rs`), plus
+`src/bkl_profile.rs`: turns the profiler on for the whole boot and prints a **delta** histogram
+every 10 s from the async-main loop —
+
+```
+[BKLPROF] w12 t=340s spins=1843221 attributed=1840012 windows_preserved=4211
+[BKLPROF]   irq/sched tag=501 44.1% spins=811... 
+[BKLPROF]   write tag=64 31.7% spins=583...
+```
+
+Deltas, not totals, so a window is attributable to the workload that ran during it rather than
+to boot noise. Measurement-only: with profiling on, every kernel entry stores to a shared
+per-core tag line, which perturbs timing — hence the explicit feature rather than inclusion in
+`smp-shared`. Build:
+
+```
+cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests,bkl-profile
+```
+
+This is what turns §11.2's 700 anonymous `tag=511` stuck episodes into an answer about which
+subsystem to carve out next — and therefore whether Phase 2b/2c/2d are worth doing before
+Phase 3 (process management), which the Phase 0 estimate says is the bigger lever.
+
+### 11.6 RESULT: `unlinkat` is 72.6% of all cross-core BKL wait
+
+Full regimen, SMP=4, `bkl-profile` build, 16.85 billion attributed spin-iterations:
+
+| share | holder tag | what it is |
+|---|---|---|
+| **72.6%** | `unlinkat` (35) | **file deletion — a Phase 2c mutating syscall** |
+| **26.9%** | `irq/sched` (501) | the scheduler / IRQ path — Phase 3's target |
+| 0.3% | `openat` (56) | Phase 2b |
+| <0.2% total | everything else | `read`, `write`, `clone`, `mmap`, `ppoll`, … |
+
+The `[BKL] stuck` lines agree independently: of 1583 tagged episodes, **1156 were `tag=35`**
+and 427 `tag=501` — nothing else appears at all.
+
+Three conclusions, in order of how much they change the plan:
+
+1. **Phase 2a worked, and the read path is done.** `read` and `write` — the syscalls this
+   carve-out converted — together account for well under 0.1% of contended wait. There is no
+   remaining contention to win on the read path, at any core count.
+2. **Phase 2c is the whole game, and it is narrower than "the mutating syscalls".** It is
+   specifically `unlinkat`. §7.2 already flagged it anecdotally (one `rm` of a 735 MB file =
+   ~40 s hold, 274 stuck warns) and §9.4 filed that as a large-file curiosity. It is not: in
+   this regimen the `rm` phase deletes 192 MB in a workload that also moves 128 MB over the
+   network, re-reads 128 MB past the block cache, and copies 64 MB — and the deletes still
+   outweigh *everything else combined* by nearly 3:1. Converting `unlinkat` alone should
+   recover the large majority of the available win; the rest of the 2c list can follow on
+   evidence rather than on principle.
+3. **The Phase 0 "scheduler/IRQ holds ~70% of contended time" estimate is wrong for this
+   workload — it is 27%.** Still the second-largest consumer, and still what Phase 3 targets,
+   so Phase 3 keeps its place in the plan. But it is not the reason this workload contends,
+   and "do Phase 3 before finishing Phase 2" is not supported.
+
+**Caveats, stated so the number is not over-read.** The profiler perturbs timing (that is why
+it is a separate feature). This is one workload, and it deliberately ends with a bulk delete —
+a workload that never unlinks would obviously not attribute 72.6% there. What the ratio does
+establish is the *rate*: a handful of `unlinkat` calls out-contend hundreds of megabytes of
+read, write, and socket traffic, which is a statement about `unlinkat`'s hold length, not
+about how often the regimen calls it. The run also carried the §11.4 reclaim fix, so it had
+genuinely more cross-core concurrency than the §11.2 runs (whole regimen: 152 s vs. >1800 s
+and unfinished) — which raises absolute stuck counts (1594) without changing the shares.
+
+Correctness held throughout: **6/6 digests exact** on this build too.
+
+### 11.7 Thread-slot reclaim: FIXED
+
+The §11.4 starvation is fixed, and the effect on this campaign is not subtle — **the identical
+regimen went from "did not finish in 1800 s" to "finished in 152 s."**
+
+- `crates/akuma-exec/src/threading/mod.rs`: `cleanup_terminated_internal` now takes its two
+  gates independently (`any_caller`, `ignore_cooldown`) instead of one `force` flag that
+  dropped both. New `reclaim_terminated_slots()` = drop the caller gate, **keep the cooldown**.
+  The cooldown is the property that actually matters (a thread marks itself TERMINATED while
+  still on its kernel stack); the caller-identity gate never provided safety — the
+  `TERMINATED → INITIALIZING` CAS does, and it serializes two concurrent reclaimers exactly as
+  it serializes a reclaimer against a spawn.
+- Both spawn paths (`spawn_user_thread_fn_internal`, `spawn_system_thread_fn`) now collect and
+  retry once on a `claim_free_slot` miss instead of returning "No free … slots" outright. Slot
+  exhaustion is a recoverable condition, not an error to hand to userspace as ENOMEM.
+- `src/main.rs`: the async-main loop reclaims every 100 ms. This is the steady-state collector
+  that was missing — it runs on a system thread (not thread 0) and keeps running under load,
+  where thread 0's idle loop by definition does not.
+
+Boot self-test `test_thread_slot_reclaim_on_spawn` (`src/process_tests.rs`) drives the exact
+failing shape — fill the pool, terminate everything, let the cooldown elapse, spawn again with
+no explicit cleanup — and additionally pins that a slot **inside** its cooldown is not
+recycled, and that the gated `cleanup_terminated()` still declines from a non-thread-0 caller
+(asserted from a spawned thread, since boot tests themselves run on thread 0). SMP=2 suite:
+`PASSED (filled 56 slots, hot-reclaim 0, respawn ok)`, 230 passed, 0 panics, the only 2
+failures the two known pre-existing ones (§6).
+
+`No available user threads` occurrences during the post-fix regimen: **0**.
+
+Post-fix run on the **shipping** config (no profiler, `devbox-smoltcp,no-tests`, SMP=4, the
+lean 4 × 32 MiB regimen): completed in **136 s**, **6/6 digests exact**, 455 `[BKL] stuck`,
+30 `RECOVERED`, 0 PANIC / WILD / SPURIOUS, 0 pool exhaustion. So the fix changes throughput and
+removes the ENOMEM failure mode without disturbing the stability picture — the stuck episodes
+are `unlinkat`'s, and they wait for Phase 2c.
+
+`e2fsck -fp devbox.img` after the whole campaign (three SMP=4 runs, ~1 GB written and deleted):
+clean. The only complaint is the standing cosmetic one — `HTREE … invalid root node / HTREE
+INDEX CLEARED` on `/tmp` — which is present before the campaign too, because Akuma's ext2
+writes don't maintain htree indexes.
+
+### 11.8 Still open
+
+- **`wait` still hangs** (§11.3). Unfixed — it needs SIGCHLD delivery, which is a larger piece
+  of work than the reclaim fix and touches the signal path rather than the scheduler.
+- **Phase 2c**, now with a specific first target: `unlinkat`. Land the §3 write-guard
+  hardening with it, and re-run this regimen to confirm the 72.6% moves.
+- **The stuck episodes themselves.** Attributed, but not eliminated: the fix for them *is*
+  Phase 2c, since that is where they live.

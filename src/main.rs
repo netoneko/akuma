@@ -26,6 +26,8 @@ mod audio;
 // mod async_net;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod async_tests;
+#[cfg(kernel_bkl_profile)]
+mod bkl_profile;
 mod block;
 mod boot;
 mod config;
@@ -1447,6 +1449,10 @@ fn run_async_main() -> ! {
     let waker = unsafe { Waker::from_raw(raw_waker) };
     let mut cx = Context::from_waker(&waker);
 
+    // Measurement builds only: start attributing cross-core BKL wait to the holder.
+    #[cfg(kernel_bkl_profile)]
+    crate::bkl_profile::init();
+
     loop {
         // Periodic heartbeat
         let count = LOOP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1475,6 +1481,28 @@ fn run_async_main() -> ! {
                 threading::dump_thread_resume_points();
             }
         }
+
+        // Collect cooled-down terminated thread slots.
+        //
+        // Thread 0's idle loop also does this, but only when nothing else is
+        // runnable — i.e. never while the system is busy, which is exactly when
+        // slots churn fastest. This loop runs on a system thread (not thread 0)
+        // and keeps running under load, so it is the collector that matters for
+        // steady-state reclamation; without it, slots sat TERMINATED for tens of
+        // seconds and `fork` failed with a full pool while RAM was free
+        // (docs/archive/BKL_VFS_CARVE_OUT.md §11.4). The cooldown is still
+        // honored, so this cannot recycle a slot whose thread is still on its
+        // kernel stack.
+        static LAST_RECLAIM_US: AtomicU64 = AtomicU64::new(0);
+        const RECLAIM_INTERVAL_US: u64 = 100_000; // 100ms
+        let last_reclaim = LAST_RECLAIM_US.load(Ordering::Relaxed);
+        if now_us.saturating_sub(last_reclaim) >= RECLAIM_INTERVAL_US {
+            LAST_RECLAIM_US.store(now_us, Ordering::Relaxed);
+            threading::reclaim_terminated_slots();
+        }
+
+        #[cfg(kernel_bkl_profile)]
+        crate::bkl_profile::maybe_dump(now_us);
 
         GLOBAL_POLL_STEP.store(1, Ordering::Relaxed);
         // Poll network stack in a loop until no more progress.

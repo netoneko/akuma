@@ -776,9 +776,28 @@ work is a BKL-drop guard plus inner-lock hardening. No new locks were introduced
       `userspace/forktest/c_stress` mmap stress tools + llama.cpp mmap model-load
       end-to-end; the llama leg exposed and fixed a pre-existing
       `madvise(MADV_WILLNEED)` bug that zero-filled file-backed lazy pages (§10.3).
-- [ ] A contention signal (current A/B is cache-resident, measures 0 spins either way)
-- [ ] SMP=4 stress — the AB-BA failure mode this targets only appeared at SMP=4 for net;
-      note the §9 fix widens true window concurrency, so this matters MORE now
+- [x] A contention signal — `bkl-profile` feature + `src/bkl_profile.rs` land the per-tag
+      BKL-hold attribution dump (`[BKLPROF]` delta histogram every 10 s). **Collected at SMP=4
+      (that doc §11.6): `unlinkat` 72.6%, `irq/sched` 26.9%, `openat` 0.3%, everything else
+      <0.2% — `read`/`write` (the Phase 2a conversions) contribute ~nothing.** So Phase 2a is
+      done, **Phase 2c is the whole remaining VFS win and its first target is specifically
+      `unlinkat`**, and the Phase 0 "scheduler/IRQ ≈70%" estimate is wrong for this workload
+      (it is 27%) — Phase 3 keeps its place but does not jump the queue.
+- [~] SMP=4 stress — FIRST RUN 2026-07-29 (that doc §11). Result: no wedge, no corruption,
+      0 PANIC/WILD/SPURIOUS — but **~600–700 `[BKL] stuck` per run** where SMP=2 produced 0,
+      so the §9 ledger fix bounded holds at SMP=2 only. Attribution is the next step, and
+      **Phase 2c must not land before those holds are attributed.**
+      Two pre-existing blockers found by the campaign (neither a carve-out regression, both
+      reproduce at SMP=1):
+      **(a) thread-slot reclamation starved under load** (p50 24 s / max 192 s against a 10 ms
+      cooldown → `fork` stalled for minutes, then failed with `No available user threads` while
+      GBs were free) — **FIXED** (that doc §11.7): reclaim-on-demand at both spawn sites plus a
+      100 ms collector in the async-main loop, keeping the cooldown and dropping only the
+      "thread 0 collects" gate. Same regimen went from unfinished-in-1800 s to 152 s; boot
+      self-test `test_thread_slot_reclaim_on_spawn` added.
+      **(b) the shell's `wait` builtin never returns** — the kernel delivers no SIGCHLD at all
+      (`grep -r SIGCHLD` finds only clone-flag parsing). STILL OPEN (that doc §11.3); it makes
+      `&`+`wait` unusable, so parallel shell workloads must join on sentinel files.
 - [x] Combined net+VFS large-download I/O regimen (that doc §8, re-run post-fix §9.4)
 
 ### Phase 5 - Memory Management Locks
