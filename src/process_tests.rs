@@ -617,6 +617,10 @@ pub fn run_all_tests() {
     // binary lands on disk as zero bytes).
     test_shared_file_mmap_writeback();
 
+    // sys_unlinkat entry point: dirfd resolution, AT_REMOVEDIR, errno contract —
+    // pins what the Phase 2c VfsBklGuard conversion (carve-out doc §12) must preserve.
+    test_unlinkat();
+
     // Phantom-SVC tripwire: runs LAST so it covers every EL0 trap the suite above
     // generated (fork/exec/signal/mmap stress). A nonzero count means an EC_SVC64
     // trap arrived whose insn@ELR-4 was not an `svc` — either stale I-cache or the
@@ -1741,6 +1745,153 @@ fn test_shared_file_mmap_writeback() {
             "[Test] shared_file_mmap_writeback FAILED (written={} page0_ok={} page1_ok={})\n",
             written, page0_ok, page1_ok);
         panic!("shared_file_mmap_writeback: writeback did not persist correctly");
+    }
+}
+
+/// `sys_unlinkat` (syscall 35) — dirfd resolution, `AT_REMOVEDIR`, and the errno contract.
+///
+/// Drives the real syscall ENTRY point via `handle_syscall` (not the `crate::fs` layer
+/// beneath, which the ext2 crate's host tests already cover). Pins the behaviors the Phase 2c
+/// `VfsBklGuard` conversion (`src/syscall/fs.rs`, carve-out doc §12) must preserve, including
+/// the historically-regressing **dirfd-relative** case (`archive/STAT_AND_UNLINKAT_FIX.md`:
+/// `rm` recursing with `unlinkat(dirfd, "name", 0)` — dirfd used to be ignored) and that the
+/// dropped-BKL window stays balanced on error paths too.
+fn test_unlinkat() {
+    use crate::syscall::{handle_syscall, nr::UNLINKAT, BYPASS_VALIDATION};
+    use akuma_exec::process::{
+        register_process, unregister_process, register_thread_pid, unregister_thread_pid,
+        FileDescriptor, KernelFile,
+    };
+    use akuma_exec::threading::current_thread_id;
+    use core::sync::atomic::Ordering;
+
+    const EBADF: u64 = (-9i64) as u64;
+    const ENOENT: u64 = (-2i64) as u64;
+    const EISDIR: u64 = (-21i64) as u64;
+    const AT_FDCWD: i32 = -100;
+    const AT_REMOVEDIR: u32 = 0x200;
+    const ROOT: &str = "/tmp/unlinkat_selftest";
+
+    // Best-effort clean slate (a crashed prior run may have left the tree).
+    let _ = crate::fs::remove_file(&format!("{ROOT}/sub/f.txt"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/plaindir"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/emptydir"));
+    let _ = crate::fs::remove_dir(ROOT);
+    let _ = crate::fs::create_dir(ROOT);
+    let _ = crate::fs::create_dir(&format!("{ROOT}/sub"));
+
+    // Register a process whose cwd is /tmp (so the AT_FDCWD-relative case resolves) and
+    // whose fd 7 names the `sub` directory (the dirfd-relative / rm-recursion case).
+    let tid = current_thread_id();
+    let pid: u32 = 7701;
+    let mut proc = make_test_process(pid);
+    proc.cwd = "/tmp".to_string();
+    proc.fds.table.lock().insert(7, FileDescriptor::File(KernelFile::new(format!("{ROOT}/sub"), 0)));
+    register_process(pid, proc);
+    register_thread_pid(tid, pid);
+
+    // Null-terminate a path into a stack buffer the syscall's copy_from_user_str can read.
+    // BYPASS_VALIDATION lets the kernel address stand in for a user VA (same trick as
+    // test_rt_sigtimedwait_timeout).
+    let cstr = |s: &str| -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::from(s.as_bytes());
+        v.push(0);
+        v
+    };
+    let unlinkat = |dirfd: i32, path: &[u8], flags: u32| -> u64 {
+        handle_syscall(UNLINKAT, &[dirfd as u64, path.as_ptr() as u64, u64::from(flags), 0, 0, 0])
+    };
+
+    BYPASS_VALIDATION.store(true, Ordering::Release);
+    let mut fails = 0u32;
+
+    // 1. Absolute path -> remove_file.
+    let _ = crate::fs::write_file(&format!("{ROOT}/abs.txt"), b"abs");
+    let p = cstr(&format!("{ROOT}/abs.txt"));
+    let r = unlinkat(AT_FDCWD, &p, 0);
+    if r != 0 || crate::fs::exists(&format!("{ROOT}/abs.txt")) {
+        fails += 1;
+        crate::safe_print!(96, "[Test] unlinkat abs FAILED r={} exists={}\n", r, crate::fs::exists(&format!("{ROOT}/abs.txt")));
+    }
+
+    // 2. AT_FDCWD-relative (cwd=/tmp) -> remove_file.
+    let _ = crate::fs::write_file(&format!("{ROOT}/rel.txt"), b"rel");
+    let p = cstr("unlinkat_selftest/rel.txt");
+    let r = unlinkat(AT_FDCWD, &p, 0);
+    if r != 0 || crate::fs::exists(&format!("{ROOT}/rel.txt")) {
+        fails += 1;
+        crate::safe_print!(96, "[Test] unlinkat rel(cwd) FAILED r={} exists={}\n", r, crate::fs::exists(&format!("{ROOT}/rel.txt")));
+    }
+
+    // 3. dirfd-relative (fd 7 -> .../sub): the rm-recursion case. dirfd must NOT be ignored.
+    let _ = crate::fs::write_file(&format!("{ROOT}/sub/f.txt"), b"f");
+    let p = cstr("f.txt");
+    let r = unlinkat(7, &p, 0);
+    if r != 0 || crate::fs::exists(&format!("{ROOT}/sub/f.txt")) {
+        fails += 1;
+        crate::safe_print!(96, "[Test] unlinkat dirfd FAILED r={} exists={}\n", r, crate::fs::exists(&format!("{ROOT}/sub/f.txt")));
+    }
+
+    // 4. AT_REMOVEDIR -> remove_dir.
+    let _ = crate::fs::create_dir(&format!("{ROOT}/emptydir"));
+    let p = cstr(&format!("{ROOT}/emptydir"));
+    let r = unlinkat(AT_FDCWD, &p, AT_REMOVEDIR);
+    if r != 0 || crate::fs::exists(&format!("{ROOT}/emptydir")) {
+        fails += 1;
+        crate::safe_print!(96, "[Test] unlinkat AT_REMOVEDIR FAILED r={} exists={}\n", r, crate::fs::exists(&format!("{ROOT}/emptydir")));
+    }
+
+    // 5. Plain unlinkat on a directory (no AT_REMOVEDIR) must NOT remove it as a file —
+    //    remove_file rejects a dir with NotAFile -> EISDIR, and the dir survives.
+    let _ = crate::fs::create_dir(&format!("{ROOT}/plaindir"));
+    let p = cstr(&format!("{ROOT}/plaindir"));
+    let r = unlinkat(AT_FDCWD, &p, 0);
+    if r != EISDIR || !crate::fs::exists(&format!("{ROOT}/plaindir")) {
+        fails += 1;
+        crate::safe_print!(96, "[Test] unlinkat dir-as-file FAILED r={} (want EISDIR) exists={}\n", r, crate::fs::exists(&format!("{ROOT}/plaindir")));
+    }
+
+    // 6. EBADF: negative dirfd that isn't AT_FDCWD.
+    let p = cstr("anything");
+    let r = unlinkat(-5, &p, 0);
+    if r != EBADF {
+        fails += 1;
+        crate::safe_print!(64, "[Test] unlinkat bad-neg-dirfd FAILED r={} (want EBADF)\n", r);
+    }
+
+    // 7. EBADF: dirfd in valid range but not present in the fd table.
+    let p = cstr("anything");
+    let r = unlinkat(999, &p, 0);
+    if r != EBADF {
+        fails += 1;
+        crate::safe_print!(64, "[Test] unlinkat unopen-dirfd FAILED r={} (want EBADF)\n", r);
+    }
+
+    // 8. ENOENT: missing target. Exercises the error path through the dropped-BKL window.
+    let p = cstr(&format!("{ROOT}/nope.txt"));
+    let r = unlinkat(AT_FDCWD, &p, 0);
+    if r != ENOENT {
+        fails += 1;
+        crate::safe_print!(64, "[Test] unlinkat missing FAILED r={} (want ENOENT)\n", r);
+    }
+
+    BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    // Cleanup (best-effort; the test verdict is the case results above, not this).
+    let _ = crate::fs::remove_file(&format!("{ROOT}/sub/f.txt"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/plaindir"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/emptydir"));
+    let _ = crate::fs::remove_dir(ROOT);
+
+    if fails == 0 {
+        crate::safe_print!(128, "[Test] unlinkat PASSED (8 cases: abs/cwd-rel/dirfd/AT_REMOVEDIR/dir-as-file/EBADFx2/ENOENT)\n");
+    } else {
+        crate::safe_print!(64, "[Test] unlinkat FAILED ({} of 8 cases)\n", fails);
+        panic!("test_unlinkat: {fails} of 8 cases failed");
     }
 }
 

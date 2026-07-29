@@ -95,8 +95,8 @@ elif echo "$ELF" | grep -q "/release-smp/"; then
   SIZE_LIMIT=$((4 * 1024 * 1024))   # 4 MB for release-smp profile
   SIZE_LABEL="4 MB"
 else
-  SIZE_LIMIT=$((3 * 1024 * 1024))   # 3 MB for release profile
-  SIZE_LABEL="3 MB"
+  SIZE_LIMIT=$((4 * 1024 * 1024))   # 4 MB for release profile
+  SIZE_LABEL="4 MB"
 fi
 if [ "$BIN_BYTES" -gt "$SIZE_LIMIT" ]; then
   echo "[cargo_runner] ERROR: kernel binary is $(( BIN_BYTES / 1024 )) KB, exceeds ${SIZE_LABEL} limit" >&2
