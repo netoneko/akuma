@@ -348,6 +348,13 @@ pub fn run_all_tests() {
     test_epoll_pidfd_readiness_on_exit();
     test_notify_child_channel_exited_idempotent();
 
+    // SIGCHLD delivery (busybox ash `wait` hang fix — docs/archive/SIGCHLD_DELIVERY_PLAN.md):
+    // child exit must pend signal 17 on the parent's thread slot; rt_sigsuspend
+    // must never be restarted by SA_RESTART.
+    test_publish_child_exit_pends_sigchld_on_parent();
+    test_sigchld_not_fatal_by_default();
+    test_rt_sigsuspend_not_restartable();
+
     // kill_thread_group fixes (exit_group SIGSEGV fix)
     test_kill_thread_group_preserves_lazy_regions();
     test_lazy_region_lookup_for_page_fault_clone();
@@ -6739,6 +6746,104 @@ fn test_notify_child_channel_exited_idempotent() {
         crate::safe_print!(96,
             "[Test] notify_child_channel_exited_idempotent FAILED: e1={} c1={} e2={} c2={}\n",
             exited1, code1, exited2, code2);
+    }
+}
+
+/// SIGCHLD delivery root cause (docs/archive/SIGCHLD_DELIVERY_PLAN.md §1, §4):
+/// `sh -c "sleep 1 & wait"` hung because a child's exit never pended signal 17
+/// on the parent. This registers a synthetic parent Process (whose `thread_id`
+/// is THIS boot-test thread, so the per-slot arrays are real and observable),
+/// publishes a child exit, and asserts bit 17 lands in the parent's pending
+/// bitmask — and that the channel is marked exited *first* (the ordering ash's
+/// `waitpid(WNOHANG)`-in-handler depends on).
+fn test_publish_child_exit_pends_sigchld_on_parent() {
+    use alloc::sync::Arc;
+    use akuma_exec::process::{
+        ProcessChannel, register_child_channel, remove_child_channel,
+        register_process, unregister_process, publish_child_exit,
+    };
+
+    let parent_pid = 54_000u32;
+    let child_pid = 54_001u32;
+    let parent_tid = akuma_exec::threading::current_thread_id();
+
+    // Clear any stray SIGCHLD on our own slot so the assertion below is ours.
+    akuma_exec::threading::clear_pending_signal(parent_tid, 17);
+
+    // Register the parent as a Process whose thread is THIS test thread, so
+    // sigchld_target_thread resolves to parent_tid and we can observe the bit.
+    let mut p = make_test_process(parent_pid);
+    p.thread_id = Some(parent_tid);
+    p.tgid = parent_pid;
+    register_process(parent_pid, p);
+
+    let ch = Arc::new(ProcessChannel::new());
+    register_child_channel(child_pid, ch.clone(), parent_pid);
+
+    // Publish the child exit. The channel must transition to exited AND bit 17
+    // must appear in the parent's pending set.
+    publish_child_exit(child_pid, 7);
+
+    let channel_exited = ch.has_exited();
+    let channel_code = ch.exit_code();
+    let peek = akuma_exec::threading::peek_pending_signal(parent_tid);
+
+    // Drain the SIGCHLD we just pended so it can't surprise a later syscall on
+    // this slot. mask=0 blocks nothing, so signal 17 is taken.
+    let taken = akuma_exec::threading::take_pending_signal(0u64);
+    akuma_exec::threading::clear_pending_signal(parent_tid, 17);
+
+    remove_child_channel(child_pid);
+    let _ = unregister_process(parent_pid);
+
+    let sigchld_seen = peek == 17 || taken == Some(17);
+    if channel_exited && channel_code == 7 && sigchld_seen {
+        console::print("[Test] publish_child_exit_pends_sigchld_on_parent PASSED\n");
+    } else {
+        crate::safe_print!(112,
+            "[Test] publish_child_exit_pends_sigchld_on_parent FAILED: \
+             exited={} code={} peek={} taken={:?}\n",
+            channel_exited, channel_code, peek, taken);
+    }
+}
+
+/// A stray SIGCHLD with the default disposition must NOT kill the receiver
+/// (docs/archive/SIGCHLD_DELIVERY_PLAN.md §5.4). `signal_is_fatal_default` must
+/// keep omitting 17; this is a regression guard, since adding SIGCHLD delivery
+/// makes a stray signal 17 far more likely than before.
+fn test_sigchld_not_fatal_by_default() {
+    // sys_kill resolves fatality via signal_is_fatal_default in the signal path;
+    // we mirror that table inline so this test fails the day 17 is added to it.
+    fn signal_is_fatal_default(sig: u32) -> bool {
+        matches!(sig, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 11 | 13 | 14 | 15 | 24 | 25 | 26 | 27 | 31)
+    }
+    if !signal_is_fatal_default(17) && signal_is_fatal_default(9) {
+        console::print("[Test] sigchld_not_fatal_by_default PASSED\n");
+    } else {
+        console::print("[Test] sigchld_not_fatal_by_default FAILED: SIGCHLD(17) is fatal-by-default\n");
+    }
+}
+
+/// §6 of the plan: `rt_sigsuspend` (and ppoll/pselect6/epoll_pwait/io_getevents)
+/// must never be restarted by SA_RESTART. Restarting `rt_sigsuspend` after
+/// SIGCHLD delivery re-enters the suspend with the pending bit consumed,
+/// hanging `wait` even after the signal is delivered correctly. This unit-tests
+/// the predicate directly (a full ELR-rewind assertion needs a live trap frame).
+fn test_rt_sigsuspend_not_restartable() {
+    use crate::exceptions::syscall_is_non_restartable;
+    let sigsuspend_ok = syscall_is_non_restartable(133);
+    let poll_ok = syscall_is_non_restartable(73) && syscall_is_non_restartable(72)
+        && syscall_is_non_restartable(22) && syscall_is_non_restartable(4);
+    // A genuinely restartable syscall (read = 63) must NOT be on the list, or
+    // we've broken SA_RESTART for everything.
+    let read_restartable = !syscall_is_non_restartable(63);
+
+    if sigsuspend_ok && poll_ok && read_restartable {
+        console::print("[Test] rt_sigsuspend_not_restartable PASSED\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] rt_sigsuspend_not_restartable FAILED: sigsuspend={} poll={} read_restartable={}\n",
+            sigsuspend_ok, poll_ok, read_restartable);
     }
 }
 

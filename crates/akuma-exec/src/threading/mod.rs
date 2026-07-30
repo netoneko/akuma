@@ -511,6 +511,23 @@ static THREAD_RESTORE_SIGMASK_PENDING: [AtomicBool; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
+/// Last SIGCHLD payload for each thread slot, packed as
+/// `(child_pid: u32 << 32) | (exit_code as i32 as u32)`. Written by
+/// [`raise_sigchld_for_parent`] immediately before pending signal 17; read by
+/// `try_deliver_signal` when it builds the `siginfo_t` for a delivered SIGCHLD,
+/// so an `SA_SIGINFO` handler sees a real `si_pid`/`si_status` instead of zeros.
+///
+/// Last-writer-wins under a burst: `PENDING_SIGNALS` is a bitmask, so N child
+/// exits already collapse to one delivered SIGCHLD — matching Linux for
+/// non-realtime signals, and why correct reapers loop on `waitpid(WNOHANG)`
+/// rather than counting signals. Peek (load) rather than take (swap) so that a
+/// signal which re-pends (e.g. `SA_ONSTACK` before `sigaltstack`) still finds
+/// its payload on the next delivery attempt.
+static LAST_SIGCHLD: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
 /// Per-thread deferred-kill request (real shared-kernel SMP).
 ///
 /// Set by [`request_thread_kill`] when a peer core's `kill_thread_group` wants
@@ -546,6 +563,30 @@ pub fn take_restore_sigmask() -> Option<u64> {
     } else {
         None
     }
+}
+
+/// Record the payload for a SIGCHLD about to be pended on `slot`: the exiting
+/// child's pid and its raw exit code (negative ⇒ killed by signal `-code`).
+/// Called by [`crate::process::raise_sigchld_for_parent`] immediately before
+/// `pend_signal_for_thread`, so delivery reads a consistent `(pid, code)`.
+pub fn set_last_sigchld(slot: usize, child_pid: u32, exit_code: i32) {
+    if slot < MAX_THREADS {
+        let packed = ((child_pid as u64) << 32) | (exit_code as u32 as u64);
+        LAST_SIGCHLD[slot].store(packed, Ordering::Release);
+    }
+}
+
+/// Peek (do NOT consume) the last SIGCHLD payload pended on `slot`. Returns
+/// `(child_pid, exit_code)` if one was ever recorded, else `None`. Delivery
+/// peeks rather than takes so an `SA_ONSTACK` re-pend still finds its payload.
+pub fn peek_last_sigchld(slot: usize) -> Option<(u32, i32)> {
+    if slot < MAX_THREADS {
+        let packed = LAST_SIGCHLD[slot].load(Ordering::Acquire);
+        if packed != 0 {
+            return Some(((packed >> 32) as u32, packed as u32 as i32));
+        }
+    }
+    None
 }
 
 /// Per-thread alternate signal stack base address (0 = not set).

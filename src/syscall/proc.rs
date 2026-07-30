@@ -8,14 +8,15 @@ use akuma_net::socket::libc_errno;
 static VFORK_WAITERS: Spinlock<BTreeMap<u32, usize>> = Spinlock::new(BTreeMap::new());
 
 /// Mark the child channel as exited so `pidfd_can_read` and `find_exited_child`
-/// return immediately.  Called from `sys_exit` / `sys_exit_group` — before
-/// `return_to_kernel` runs — so the parent's epoll + pidfd / wait4 path sees
-/// the exit without a 10ms polling delay.  `set_exited` is idempotent; the
-/// second call from `return_to_kernel` is harmless.
+/// return immediately, AND raise SIGCHLD on the parent.  Called from
+/// `sys_exit` / `sys_exit_group` — before `return_to_kernel` runs — so the
+/// parent's epoll + pidfd / wait4 path sees the exit without a 10ms polling
+/// delay, and a parent parked in `sigsuspend` (busybox ash `wait`) is woken.
+/// `set_exited` is idempotent; the second call from `return_to_kernel` is a
+/// no-op for SIGCHLD purposes (the `has_exited` guard in `publish_child_exit`
+/// suppresses the duplicate signal).
 fn notify_child_channel_exited(pid: u32, code: i32) {
-    if let Some(ch) = akuma_exec::process::get_child_channel(pid) {
-        ch.set_exited(code);
-    }
+    akuma_exec::process::publish_child_exit(pid, code);
 }
 
 /// Public wrapper for crash paths in exceptions.rs that need to notify the
@@ -1041,20 +1042,26 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
             crate::safe_print!(128, "[syscall] waitid: PID {} exited with code {}\n", child_pid, code);
         }
         if infop != 0 {
-            // siginfo_t layout for SIGCHLD (AArch64 Linux):
-            //   0: si_signo (u32), 4: si_errno (u32), 8: si_code (i32)
-            //  12: si_pid   (u32), 16: si_uid  (u32), 20: si_status (i32)
+            // siginfo_t layout for SIGCHLD (AArch64 LP64 Linux):
+            //   0: si_signo (u32), 4: si_errno (u32), 8: si_code (i32),
+            //  12: __pad0 (u32) — aligns the _sifields union to 8 bytes,
+            //  16: si_pid (u32), 20: si_uid (u32), 24: si_status (i32).
+            // The union (containing `void *si_addr` / `clock_t si_utime`) is
+            // 8-byte aligned, so si_pid starts at offset 16, NOT 12. musl agrees
+            // (`__pad[128 - 2*sizeof(int) - sizeof(long)]`); the kernel's own
+            // signal frame writes `si_addr` at offset 16 too.
             #[repr(C)]
             struct SigChld {
                 si_signo:  u32,
                 si_errno:  u32,
                 si_code:   i32,
+                __pad0:    u32,
                 si_pid:    u32,
                 si_uid:    u32,
                 si_status: i32,
             }
             let (si_code, si_status) = if code < 0 { (CLD_KILLED, -code) } else { (CLD_EXITED, code) };
-            let info = SigChld { si_signo: SIGCHLD, si_errno: 0, si_code,
+            let info = SigChld { si_signo: SIGCHLD, si_errno: 0, si_code, __pad0: 0,
                                  si_pid: child_pid, si_uid: 0, si_status };
             let _ = unsafe {
                 copy_to_user_safe(infop as *mut u8,

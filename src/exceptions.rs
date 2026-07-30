@@ -968,6 +968,26 @@ fn ensure_sigreturn_trampoline(pid: u32) -> Option<usize> {
     Some(SIGRETURN_TRAMPOLINE_ADDR)
 }
 
+/// Syscalls Linux never restarts, regardless of `SA_RESTART`. Either the caller
+/// must re-evaluate a predicate the handler just changed (`rt_sigsuspend`/
+/// `pause`), or it was given an explicit timeout that a silent restart would
+/// extend past (`ppoll`/`pselect6`/`epoll_pwait`). AArch64 generic syscall
+/// numbers.
+///
+/// Restarting `rt_sigsuspend` after SIGCHLD delivery is precisely fatal for
+/// busybox ash's `wait`: the handler set `got_sigchld`, `rt_sigreturn` re-enters
+/// the `SVC`, the now-consumed pending bit is gone, and the kernel cannot see
+/// the userspace `got_sigchld` flag — so it suspends forever, reproducing the
+/// exact hang SIGCHLD delivery was meant to fix.
+pub fn syscall_is_non_restartable(nr: u64) -> bool {
+    matches!(nr,
+        4    /* io_getevents */
+        | 22 /* epoll_pwait */
+        | 72 /* pselect6 */
+        | 73 /* ppoll */
+        | 133 /* rt_sigsuspend */)
+}
+
 /// Try to deliver a signal to a userspace handler by setting up an
 /// rt_sigframe on the user stack and redirecting ELR to the handler.
 /// Returns true if delivery succeeded (caller should return signal number as x0).
@@ -1011,7 +1031,14 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
             // for a completed FUTEX_WAKE (ret=1) causes it to re-execute with
             // x0=1 (the return value), producing EINVAL (uaddr=1 is unaligned).
             let ret_val = unsafe { (*frame).x0 as i64 };
-            if ret_val == -4 /* EINTR */ || ret_val == -512 /* ERESTARTSYS */ {
+            // And never restart the non-restartable set (sigsuspend/ppoll/…):
+            // their contract is to return EINTR so the caller re-checks a
+            // predicate the handler changed. frame.x8 still holds the syscall
+            // number at this point.
+            let syscall_nr = unsafe { (*frame).x8 };
+            if (ret_val == -4 /* EINTR */ || ret_val == -512 /* ERESTARTSYS */)
+                && !syscall_is_non_restartable(syscall_nr)
+            {
                 unsafe { (*frame).elr_el1 -= 4; }
             }
         }
@@ -1147,9 +1174,31 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         let si = base.add(SIGFRAME_SIGINFO);
         core::ptr::write(si.add(0).cast::<i32>(), signal as i32);   // si_signo
         core::ptr::write(si.add(4).cast::<i32>(), 0i32);            // si_errno = 0
-        core::ptr::write(si.add(8).cast::<i32>(),                   // si_code
-            i32::from(is_fault));                  // SEGV_MAPERR=1, SI_USER=0
-        core::ptr::write(si.add(16).cast::<u64>(), fault_addr);     // si_addr
+        const CLD_EXITED: i32 = 1;
+        const CLD_KILLED: i32 = 2;
+        if signal == 17 /* SIGCHLD */ {
+            // Fill the `_sigchld` union. On LP64 the union is 8-byte aligned, so
+            // it starts at offset 16 (si_addr's slot) — si_pid=16, si_uid=20,
+            // si_status=24. The payload was stashed by `raise_sigchld_for_parent`
+            // in the per-thread `LAST_SIGCHLD` side-channel; peek (not take) so a
+            // signal that re-pends (SA_ONSTACK before sigaltstack) still finds it.
+            let (child_pid, raw_code) =
+                akuma_exec::threading::peek_last_sigchld(thread_slot).unwrap_or((0, 0));
+            // Negative raw_code ⇒ killed by signal (-raw_code); else clean exit.
+            let (si_code, si_status) = if raw_code < 0 {
+                (CLD_KILLED, -raw_code)
+            } else {
+                (CLD_EXITED, raw_code)
+            };
+            core::ptr::write(si.add(8).cast::<i32>(), si_code);
+            core::ptr::write(si.add(16).cast::<u32>(), child_pid);  // si_pid
+            core::ptr::write(si.add(20).cast::<u32>(), 0u32);       // si_uid (root)
+            core::ptr::write(si.add(24).cast::<i32>(), si_status);  // si_status
+        } else {
+            core::ptr::write(si.add(8).cast::<i32>(),               // si_code
+                i32::from(is_fault));                // SEGV_MAPERR=1, SI_USER=0
+            core::ptr::write(si.add(16).cast::<u64>(), fault_addr); // si_addr
+        }
 
         // ucontext.uc_stack (stack_t) — Go runtime reads this to determine
         // whether the signal arrived on the sigaltstack.  All-zero confuses

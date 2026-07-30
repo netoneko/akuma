@@ -87,10 +87,12 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     proc.state = ProcessState::Zombie(-9);
     proc.thread_id = None; // prevent entry_point_trampoline from matching this zombie
 
-    // Notify the CHILD channel so the parent's wait4 unblocks
-    if let Some(ch) = crate::process::get_child_channel(pid) {
-        ch.set_exited(-9);
-    }
+    // Notify the CHILD channel so the parent's wait4 unblocks, and raise
+    // SIGCHLD so a shell parked in `sigsuspend` (busybox ash `wait`) wakes.
+    // `publish_child_exit` is a no-op if the child already exited cleanly, so
+    // a defensive `kill -9` on an already-reaped zombie does not overwrite the
+    // real exit code or raise a duplicate SIGCHLD.
+    crate::process::publish_child_exit(pid, -9);
 
     // Remove and notify the thread channel, terminate the thread
     if let Some(tid) = thread_id {
@@ -132,10 +134,9 @@ pub fn kill_process_with_signal(pid: Pid, sig: u32) -> Result<(), &'static str> 
 
     // Do NOT unregister — leave zombie for wait4 to reap.
 
-    // Notify the CHILD channel so the parent's wait4 unblocks
-    if let Some(ch) = crate::process::get_child_channel(pid) {
-        ch.set_exited(exit_code);
-    }
+    // Notify the CHILD channel so the parent's wait4 unblocks, and raise
+    // SIGCHLD (e.g. `kill -9 <child>` from a shell must wake its `wait`).
+    crate::process::publish_child_exit(pid, exit_code);
 
     if let Some(tid) = thread_id {
         if let Some(channel) = remove_channel(tid) {

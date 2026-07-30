@@ -52,6 +52,117 @@ pub fn is_child_of_group(child_pid: Pid, waiter_tgid: Pid) -> bool {
         .is_some_and(|tgid| tgid == waiter_tgid)
 }
 
+/// The pid recorded as `child_pid`'s parent at fork time, if it is still a
+/// registered child. This is the *forking thread's* pid, which may be a
+/// non-leader thread of a multithreaded parent (e.g. the Go runtime's M
+/// threads) — resolve its thread group before using it as a signal target
+/// (see [`sigchld_target_thread`]).
+pub fn parent_pid_of(child_pid: Pid) -> Option<Pid> {
+    with_irqs_disabled(|| CHILD_CHANNELS.lock().get(&child_pid).map(|(_, ppid)| *ppid))
+}
+
+/// Pick which thread of group `tgid` receives a process-directed signal.
+///
+/// Linux delivers a process-directed signal to any thread that does not block
+/// it. We approximate that with an explicit preference order, because two of
+/// our delivery-path guards silently drop a signal aimed at the wrong thread:
+///
+///   1. a thread not blocking SIGCHLD **and** with a sigaltstack configured —
+///      preferred because `try_deliver_signal` (src/exceptions.rs) re-pends a
+///      signal whose handler is `SA_ONSTACK` when the target thread's
+///      `alt_sp == 0` (a Go M that has not reached `mstart`'s `sigaltstack`
+///      call); targeting such a thread would re-pend SIGCHLD at every syscall
+///      return forever and never deliver;
+///   2. any thread not blocking SIGCHLD;
+///   3. the thread-group leader (the blocked-signal fallback — Linux would pick
+///      *some* thread and leave the bit pending; we pin it to the leader so a
+///      blocked SIGCHLD stays pending on a real thread of the group until the
+///      mask is cleared).
+fn sigchld_target_thread(tgid: Pid) -> Option<usize> {
+    const SIGCHLD_BIT: u64 = 1u64 << (17 - 1);
+    let mut best_with_altstack: Option<usize> = None;
+    let mut best_unblocked: Option<usize> = None;
+    let mut leader_tid: Option<usize> = None;
+
+    crate::process::table::for_each_process(|p| {
+        if p.tgid != tgid { return; }
+        let Some(tid) = p.thread_id else { return; };
+        if p.pid == tgid { leader_tid = Some(tid); }
+        let blocks_sigchld = crate::threading::thread_signal_mask_of(tid) & SIGCHLD_BIT != 0;
+        if !blocks_sigchld {
+            if best_unblocked.is_none() { best_unblocked = Some(tid); }
+            let (sp, _size, flags) = crate::threading::get_sigaltstack(tid);
+            if sp != 0 && flags != 2 /* SS_DISABLE */ && best_with_altstack.is_none() {
+                best_with_altstack = Some(tid);
+            }
+        }
+    });
+
+    best_with_altstack.or(best_unblocked).or(leader_tid)
+}
+
+/// Raise SIGCHLD on the parent of `child_pid`, if it has a live parent process.
+///
+/// MUST be called *after* the child's channel is marked exited (see
+/// [`publish_child_exit`]): shells respond to the handler by calling
+/// `waitpid(WNOHANG)`, which has to already see the zombie or the shell
+/// concludes nothing happened and re-suspends. The ordering is structural in
+/// [`publish_child_exit`]; callers that invoke this directly must honour it.
+///
+/// Records `exit_code` in the per-thread SIGCHLD siginfo side-channel so an
+/// `SA_SIGINFO` handler reads a real `si_pid`/`si_status` instead of zeros.
+///
+/// Never sets the interrupted flag (`interrupt_thread`) — that is Ctrl+C's
+/// channel and would turn every child exit into a spurious `EINTR` storm across
+/// the parent's unrelated blocking syscalls. Pending + wake is enough: the
+/// pending bit is what `sys_rt_sigsuspend` polls, and delivery happens at the
+/// parent's next syscall-return boundary.
+pub fn raise_sigchld_for_parent(child_pid: Pid, exit_code: i32) {
+    const SIGCHLD: u32 = 17;
+    let Some(ppid) = parent_pid_of(child_pid) else { return };
+    // The forking thread may be a non-leader of a multithreaded parent; resolve
+    // its thread group so we can target any of its threads.
+    let Some(tgid) = find_process(|p| if p.pid == ppid { Some(p.tgid) } else { None }) else { return };
+    // Kernel-thread parents (e.g. the in-kernel sshd bridge) have no live child
+    // entry and no userspace to signal — silently skip.
+    if let Some(tid) = sigchld_target_thread(tgid) {
+        crate::threading::set_last_sigchld(tid, child_pid, exit_code);
+        crate::threading::pend_signal_for_thread(tid, SIGCHLD);
+    }
+}
+
+/// Publish a child's exit atomically: mark the child channel exited (waking any
+/// `wait4`/pidfd pollers) and then raise SIGCHLD on the parent, **iff this call
+/// is the one that published the exit**.
+///
+/// Ordering is load-bearing: the channel MUST be marked exited before SIGCHLD
+/// is pended, because the parent's SIGCHLD handler immediately re-polls with
+/// `waitpid(WNOHANG)` and must observe the zombie. Routing every exit site
+/// through this helper makes that ordering structural instead of a comment
+/// repeated at each call site.
+///
+/// SIGCHLD is raised only on the first publish — a child that exits cleanly and
+/// is then torn down (`return_to_kernel` / `kill_child_processes`) must not
+/// raise two SIGCHLDs for one death. A duplicate is harmless for shells (which
+/// re-poll with `WNOHANG` and get `ECHILD`/0) but would confuse a
+/// signal-counting handler, so the guard is worth keeping.
+pub fn publish_child_exit(child_pid: Pid, exit_code: i32) {
+    let published = match get_child_channel(child_pid) {
+        Some(ch) => {
+            if !ch.has_exited() {
+                ch.set_exited(exit_code);
+                true
+            } else {
+                false
+            }
+        }
+        None => false,
+    };
+    if published {
+        raise_sigchld_for_parent(child_pid, exit_code);
+    }
+}
+
 /// Remove a child process channel (called when the parent CLOSES its
 /// `ChildStdout` read fd, or on `execve`/teardown of the reading process).
 pub fn remove_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
@@ -1034,7 +1145,7 @@ mod child_channel_drain_tests {
     /// so register a no-op stub runtime + zeroed config once (OnceCopy::set is
     /// idempotent — first call wins, the rest are ignored, so this is safe under
     /// parallel test execution).
-    fn ensure_test_runtime() {
+    pub(super) fn ensure_test_runtime() {
         use crate::runtime::{ExecRuntime, ExecConfig, register};
         let rt = ExecRuntime {
             uptime_us: || 0,
@@ -1369,5 +1480,130 @@ mod mmap_region_inheritance_tests {
         assert!(r.contains(0x2012_0338));
         assert_eq!(r.frame_for(0x2012_0338), None);
         assert_eq!(r.frame_for(0x9999_0000), None);
+    }
+}
+
+#[cfg(test)]
+mod sigchld_delivery_tests {
+    //! Host unit tests for the SIGCHLD delivery edge added to fix the hanging
+    //! `wait` builtin (docs/archive/SIGCHLD_DELIVERY_PLAN.md). The kernel boot
+    //! self-test exercises the in-VM reproducer; these cover the pure-logic
+    //! helpers (`parent_pid_of`, `raise_sigchld_for_parent`, `publish_child_exit`,
+    //! and the `LAST_SIGCHLD` siginfo side-channel) that have no dependency on a
+    //! live thread slot.
+    //!
+    //! Every assertion here relies only on the shared `CHILD_CHANNELS` registry
+    //! and the static per-slot arrays; high test-local pids (0x7000_005x) avoid
+    //! collisions with the parallel sibling test modules.
+    use super::*;
+    use crate::process::channel::ProcessChannel;
+    use crate::threading;
+
+    /// `parent_pid_of` mirrors the lookup `is_child_of_group` already does, but
+    /// returns the raw forking-thread pid (which may be a non-leader of a
+    /// multithreaded parent — resolution happens later, in `raise_sigchld_for_parent`).
+    #[test]
+    fn parent_pid_of_returns_registered_parent_then_none_after_remove() {
+        let child: Pid = 0x7000_0050;
+        let parent: Pid = 0x7000_0051;
+        register_child_channel(child, Arc::new(ProcessChannel::new()), parent);
+        assert_eq!(parent_pid_of(child), Some(parent));
+        remove_child_channel(child);
+        assert_eq!(parent_pid_of(child), None);
+    }
+
+    /// Raising SIGCHLD for a child with no registered channel (reaped, or a
+    /// double-published exit) must be a silent no-op — never a panic.
+    #[test]
+    fn raise_sigchld_for_unregistered_child_is_noop() {
+        raise_sigchld_for_parent(0x7000_0052, 0);
+        raise_sigchld_for_parent(0x7000_0052, -9);
+    }
+
+    /// The in-kernel sshd bridge spawns children whose recorded parent is a
+    /// kernel system thread with no `Process` entry. Resolving the parent's
+    /// thread group must fail cleanly (no signal, no panic) rather than index a
+    /// missing process.
+    #[test]
+    fn raise_sigchld_for_parent_with_no_process_is_noop() {
+        let child: Pid = 0x7000_0053;
+        let kernel_thread_parent: Pid = 0x7000_0054; // not in the process table
+        register_child_channel(child, Arc::new(ProcessChannel::new()), kernel_thread_parent);
+        // No registered Process → find_process returns None → no signal pended.
+        raise_sigchld_for_parent(child, 0);
+        remove_child_channel(child);
+    }
+
+    /// With an empty process table, every thread-group preference falls through
+    /// and `sigchld_target_thread` returns `None` — the signal simply isn't
+    /// raised. (The preference-order test against registered Processes is a
+    /// kernel boot self-test: it needs live thread slots, which host tests lack.)
+    #[test]
+    fn sigchld_target_thread_is_none_with_no_processes() {
+        assert!(sigchld_target_thread(0x7000_0055).is_none());
+    }
+
+    /// The load-bearing invariant: `publish_child_exit` marks the channel exited
+    /// (so a racing `waitpid(WNOHANG)` in the parent's handler sees the zombie)
+    /// and is safe even though the SIGCHLD itself is a no-op here (no parent
+    /// Process registered). A second publish must NOT overwrite the real exit
+    /// code with a teardown code like 137 — that is the "one death, one signal"
+    /// guard, and it is what keeps `go build`'s buildID honest when a goroutine
+    /// crashes after the leader already published a clean exit.
+    #[test]
+    fn publish_child_exit_marks_channel_and_dedups() {
+        let child: Pid = 0x7000_0056;
+        let parent: Pid = 0x7000_0057;
+        let ch = Arc::new(ProcessChannel::new());
+        register_child_channel(child, ch.clone(), parent);
+
+        // First publish: real exit code 0, channel transitions to exited.
+        publish_child_exit(child, 0);
+        assert!(ch.has_exited(), "channel must be marked exited by publish");
+        assert_eq!(ch.exit_code(), 0);
+
+        // Second publish (e.g. return_to_kernel / subtree teardown with code 137):
+        // the `has_exited` guard suppresses the overwrite AND the duplicate
+        // SIGCHLD. The real exit code survives.
+        publish_child_exit(child, 137);
+        assert_eq!(ch.exit_code(), 0, "second publish must not clobber the real code");
+
+        remove_child_channel(child);
+    }
+
+    /// `publish_child_exit` on a pid with no registered child channel (a process
+    /// spawned without a stdout pipe, or one already reaped) is a silent no-op.
+    #[test]
+    fn publish_child_exit_for_absent_channel_is_noop() {
+        publish_child_exit(0x7000_0058, 0);
+        publish_child_exit(0x7000_0058, -9);
+    }
+
+    /// The SIGCHLD `siginfo` side-channel packs `(child_pid, exit_code)` into one
+    /// u64 and must round-trip both clean exits (code >= 0) and signal kills
+    /// (code < 0, where `-code` is the signal number). Slot 63 is unused by any
+    /// other host test.
+    #[test]
+    fn last_sigchld_roundtrips_clean_and_signaled_exits() {
+        let slot = 63usize;
+
+        threading::set_last_sigchld(slot, 1234, 0);
+        assert_eq!(threading::peek_last_sigchld(slot), Some((1234, 0)));
+
+        threading::set_last_sigchld(slot, 4321, -9);
+        assert_eq!(threading::peek_last_sigchld(slot), Some((4321, -9)),
+            "negative exit codes (signal kills) must round-trip");
+
+        threading::set_last_sigchld(slot, 7, 42);
+        assert_eq!(threading::peek_last_sigchld(slot), Some((7, 42)));
+    }
+
+    /// `peek_last_sigchld` on a slot that was never written returns `None`, so
+    /// the SIGCHLD siginfo path falls back to zeros gracefully.
+    #[test]
+    fn peek_last_sigchld_unset_is_none() {
+        // Slot 62 is untouched by the round-trip test (which uses 63), and no
+        // other host test writes LAST_SIGCHLD, so it is reliably the zero init.
+        assert_eq!(threading::peek_last_sigchld(62), None);
     }
 }

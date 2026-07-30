@@ -1012,11 +1012,9 @@ fn teardown_forked_process_thread_group(child_pid: Pid, l0_phys: usize) {
         // exit_group / return_to_kernel, `has_exited` is true with the real code
         // (e.g. 0).  Do **not** overwrite with 137 — wait4 would report 137
         // while `[exit_group] … code=0` and confuse `go build` (buildID).
-        if let Some(ch) = get_child_channel(*pid) {
-            if !ch.has_exited() {
-                ch.set_exited(137);
-            }
-        }
+        // `publish_child_exit` keeps that guard AND raises SIGCHLD on the first
+        // publish, so a parent tearing down a live subtree is notified.
+        publish_child_exit(*pid, 137);
         if let Some(tid) = tid {
             if let Some(ch) = remove_channel(*tid) {
                 if !ch.has_exited() {
@@ -1117,9 +1115,22 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         None
     };
     
+    // Publish the child exit + raise SIGCHLD BEFORE the thread-channel set_exited
+    // below. `publish_child_exit`'s `has_exited` guard means: if a crash path
+    // already called `notify_child_channel_exited_pub`, this is a no-op (no
+    // duplicate SIGCHLD); if the process fell off the end of `main` without
+    // calling `exit_group`, THIS is the first publish and the parent gets its
+    // SIGCHLD. Must run first so the guard sees the un-exited channel.
+    if let Some(pid) = pid {
+        publish_child_exit(pid, exit_code);
+    }
+
     // Set exit code on ProcessChannel if registered for this thread
     // This notifies async callers (SSH shell, etc.) that the process exited
-    // Safe to call even if already removed by kill_process - just returns None
+    // Safe to call even if already removed by kill_process - just returns None.
+    // Same Arc as the child channel above, so on the fall-off-the-end path this
+    // is now a redundant re-set (harmless); on the crash path it is the wake for
+    // async SSH pollers.
     if let Some(channel) = remove_channel(tid) {
         channel.set_exited(exit_code);
     }
@@ -1360,6 +1371,13 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
     } else {
         None
     };
+
+    // Publish child exit + SIGCHLD before the thread-channel set_exited below —
+    // same rationale as `return_to_kernel` (first-publish-wins via the
+    // `has_exited` guard; covers the fault-exit fall-off-the-end path).
+    if let Some(pid) = pid {
+        publish_child_exit(pid, exit_code);
+    }
 
     if let Some(channel) = remove_channel(tid) {
         channel.set_exited(exit_code);
