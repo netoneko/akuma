@@ -401,6 +401,45 @@ async fn send_exit_report(
 
     // Guard against a second send on a channel we've already closed.
     session.channel_open = false;
+
+    // Then wait for the client to close the channel back before returning —
+    // because returning drops `SshStream`, which closes the socket, and
+    // `write_all` above only *queued* those three packets in the TCP stack. A
+    // close that races the flush discards them, and the client falls back to its
+    // 255 placeholder: observed as a signal-killed command intermittently
+    // reporting no exit request at all (~1 in 10), with sshd's own log showing
+    // it had sent one. Reading until the peer hangs up keeps the socket open
+    // until the report has actually gone out.
+    //
+    // Bounded, because a client that holds the connection open would otherwise
+    // pin this session forever. `yield_now` (not `sleep_ms`) so the wait costs
+    // other sessions nothing — see its doc comment.
+    const CLOSE_WAIT_TICKS: u32 = 500;
+    let mut scratch = [0u8; 512];
+    for _ in 0..CLOSE_WAIT_TICKS {
+        match stream.try_read(&mut scratch) {
+            // Peer hung up: the report necessarily reached it first (TCP is
+            // ordered), so there is nothing left to flush.
+            Ok(0) => break,
+            Ok(n) => {
+                // Its CHANNEL_CLOSE may be in here; decrypt so we can stop as
+                // soon as it arrives instead of spinning to the bound.
+                session.input_buffer.extend_from_slice(&scratch[..n]);
+                let mut saw_close = false;
+                while let Some((msg_type, _)) = process_encrypted_packet(session) {
+                    if msg_type == SSH_MSG_CHANNEL_CLOSE {
+                        saw_close = true;
+                    }
+                }
+                if saw_close {
+                    break;
+                }
+            }
+            Err(_) => {} // EAGAIN — nothing yet
+        }
+        crate::yield_now().await;
+    }
+
     Ok(())
 }
 

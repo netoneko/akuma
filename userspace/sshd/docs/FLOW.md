@@ -160,18 +160,23 @@ CHANNEL_REQUEST -----------------+
                                     bridge_process(pid, stdout_fd)
                                       - poll child stdout  (read_fd, non-blocking)
                                       - poll SSH input     (try_read, non-blocking)
-                                      - waitpid(pid) -> drain remaining stdout
+                                      - waitpid_status(pid) -> drain stdout
                                                      -> close fds
-                                                     -> send_exit_status(code):
-                                                          exit-status + EOF + CLOSE
+                                                     -> send_exit_report(status):
+                                                          exit-status OR exit-signal
+                                                          + EOF + CLOSE
+                                                     -> wait for client's CLOSE
 
   spawn failure (either path) -> fail_spawn(): error message to client,
   exit status 127, session ends. No built-in shell to fall back to.
 ```
 
-The `exit-status` request (RFC 4254 §6.10) is not optional bookkeeping — it is
-the only way the client learns the remote exit code, and omitting it made every
-command report 255. See [`EXIT_STATUS_FIX.md`](EXIT_STATUS_FIX.md).
+The RFC 4254 §6.10 exit report is not optional bookkeeping — it is the only way
+the client learns how the command ended, and omitting it made every command
+report 255. `waitpid_status` (not `waitpid`) because a signal death has
+`WEXITSTATUS` 0 and would otherwise be reported as a success. The trailing wait
+for the client's `CHANNEL_CLOSE` is what stops the socket close from racing the
+flush of those final packets. See [`EXIT_STATUS_FIX.md`](EXIT_STATUS_FIX.md).
 
 `ssh host <cmd>` (`ssh -p 2223 root@localhost echo hi`) used to do nothing:
 `handle_message` only recognized the `"shell"` channel-request type, so an

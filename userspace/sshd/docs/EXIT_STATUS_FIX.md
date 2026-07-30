@@ -134,15 +134,78 @@ Interactive `ssh -tt` (stdin piped, shared `bridge_process` path) — 3/3:
 `echo MARKER_A; exit 5` → 5 with `MARKER_A` present, `exit` → 0,
 `false; exit $?` → 1.
 
-Host unit tests: 6/6. Target build clean (no new warnings).
+### Signal path
 
-## 6. Known gap
+`ssh -v host 'kill -9 $$'` — the client's own trace is the proof the request
+arrived and parsed, rather than the 255 default being left in place (both give
+exit 255, so the exit code alone proves nothing):
 
-A shell **killed by a signal** is reported as its exit code (0) instead of the
-`exit-signal` request of RFC 4254 §6.10. `libakuma::waitpid` decodes only
-`WEXITSTATUS` and discards the raw wait status, so sshd cannot currently
-distinguish the two — closing that gap means changing `libakuma`, outside this
-fix. Recorded in `LIMITATIONS.md` §6.
+```
+debug1: client_input_channel_req: channel 0 rtype exit-signal reply 0
+debug1: Exit status -1
+```
+
+`reply 0` confirms `want_reply` is false as §6.10 requires; `Exit status -1` is
+OpenSSH's internal marker for a signal death. sshd's own log for the same run:
+
+```
+[SSH] Exec: /bin/sh ["-c", "kill -9 $$"]
+[SSH] Killed by signal 9 (KILL)
+```
+
+Delivery-race fix: **25/25** SIGKILL runs delivered `exit-signal`, including
+across 45-second idle gaps (the condition the original miss appeared under),
+versus ~1 in 10 missing before. `exit-status` (8/8) and interactive (3/3)
+re-checked after the change.
+
+Host unit tests: 11/11. Target build clean (no new warnings).
+
+## 6. Signal deaths: `exit-signal`
+
+Initially a shell **killed by a signal** was still reported via `exit-status`,
+which is wrong in the worst direction: `WEXITSTATUS` for a signal death is 0, so
+a killed command looked like a clean success.
+
+The kernel was never the problem. It already distinguishes the two cases —
+`kill_process` records `exit_code = -9`, `terminate_process_with_signal` records
+`-(sig)`, and `encode_wait_status` (`src/syscall/proc.rs`) puts a clean exit in
+the high byte and a signal in the low 7 bits, with boot self-tests covering it.
+The information was being discarded one layer up, in `libakuma::waitpid`, which
+returned only `(status >> 8) & 0xFF`.
+
+**`libakuma`** (`userspace/libakuma/src/lib.rs`) gained a `WaitStatus` type
+carrying the raw status word plus `exited()` / `exit_code()` / `signaled()` /
+`term_signal()` / `shell_code()`, and `waitpid_status()` returning it.
+`waitpid()` is now a thin wrapper over it, keeping its exact previous signature
+and semantics so the other 11 call sites (`box`, `herd`, `httpd`, `elftest`,
+`meow`) are unaffected — its doc comment now warns that its exit code is
+`WEXITSTATUS` only.
+
+**sshd** uses `waitpid_status` and picks the matching §6.10 report:
+`exit_signal_payload` names the signal (RFC signal names, no `SIG` prefix;
+anything unlisted uses the `@domain` extension form rather than being forced onto
+a wrong standard name), sets `core_dumped` false, and is sent *instead of*
+`exit-status`, never both.
+
+Note what this correctly does **not** catch: a shell that *handles* a signal and
+then exits normally has no signal death to report. busybox `sh` does exactly this
+for SIGTERM/SIGINT/SIGQUIT/SIGSEGV — it exits 130 — so those arrive as
+`exit-status 130`, which is the truth about what the shell did. SIGKILL cannot be
+caught, so it is the case that exercises the `exit-signal` path.
+
+### The delivery race this exposed
+
+Once the exit report existed, a second bug became reachable: roughly 1 in 10
+signal-killed commands arrived with **no** request at all, sshd's log showing it
+had sent one. `write_all` only *queues* bytes in the TCP stack, and returning
+from the session drops `SshStream`, closing the socket — a close that races the
+flush discards the just-queued packets, and the client falls back to its 255
+placeholder.
+
+`send_exit_report` now waits (bounded, cooperatively, via `yield_now`) for the
+client's `CHANNEL_CLOSE` or hangup before returning, which keeps the socket alive
+until the report has actually gone out. This was always latent; before the fix
+there were simply no final packets to lose.
 
 ## Background
 

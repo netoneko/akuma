@@ -14,7 +14,7 @@ is compiled out via the `userspace-sshd` feature.
 | MAC | `hmac-sha2-256` (both directions) |
 | Compression | `none` |
 | Auth | `publickey` (`ssh-ed25519` only), or accept-anything via `disable_key_verification` |
-| Channel requests | `shell`, `exec`, `pty-req`, `window-change`, and `exit-status` on the way out |
+| Channel requests | `shell`, `exec`, `pty-req`, `window-change`; `exit-status` / `exit-signal` on the way out |
 
 `password` auth is **not** implemented and is always rejected. Primitives
 (packet framing, key derivation, byte helpers) come from
