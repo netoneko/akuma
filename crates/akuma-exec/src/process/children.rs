@@ -680,6 +680,43 @@ pub fn push_lazy_region_with_source(pid: Pid, start_va: usize, size: usize, page
     len
 }
 
+/// Copy every lazy-region descriptor registered for `parent_pid` into a fresh
+/// entry for `child_pid`.
+///
+/// `fork_process`'s CoW-sharing (`cow_share_range`) only shares pages that are
+/// *currently resident* in the parent — a lazy region the parent registered but
+/// hasn't fully touched yet (a `.data`/`.bss` page nobody wrote to since exec, a
+/// stack page deeper than the parent's current usage, ...) has nothing resident
+/// to share. Without also copying the region *descriptors* themselves, the child
+/// has no lazy-region entry for that VA either: not resident (nothing was shared)
+/// and not lazy (no entry to demand-page from) — an unconditional SIGSEGV on first
+/// touch. A single fork off a long-lived, fully-warmed-up process rarely hits this;
+/// forking off a process that was itself freshly forked (a shell subshell
+/// backgrounding a real command) hits it far more often, since the intermediate
+/// process hasn't had time to fault every lazy page in yet.
+/// See docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md.
+///
+/// Returns the number of regions copied (0 if the parent has none registered).
+pub fn propagate_lazy_regions_to_child(parent_pid: Pid, child_pid: Pid) -> usize {
+    let parent_regions: alloc::vec::Vec<LazyRegion> = with_irqs_disabled(|| {
+        let table = LAZY_REGION_TABLE.lock();
+        table.get(&parent_pid)
+            .map(|regions| regions.values().cloned().collect())
+            .unwrap_or_default()
+    });
+    let count = parent_regions.len();
+    if count > 0 {
+        with_irqs_disabled(|| {
+            let mut table = LAZY_REGION_TABLE.lock();
+            let child_regions = table.entry(child_pid).or_insert_with(alloc::collections::BTreeMap::new);
+            for region in parent_regions {
+                child_regions.insert(region.start_va, region);
+            }
+        });
+    }
+    count
+}
+
 /// Update flags on all lazy regions that overlap [range_start, range_start+range_size).
 pub fn update_lazy_region_flags(pid: Pid, range_start: usize, range_size: usize, new_flags: u64) {
     let range_end = range_start + range_size;
@@ -1127,5 +1164,101 @@ mod child_channel_drain_tests {
         // Reaping a pid with no registered channel (a process spawned without a
         // stdout pipe) must not panic and reports "not removed".
         assert!(!reap_child_channel(0x7000_0021));
+    }
+}
+
+#[cfg(test)]
+mod lazy_region_propagation_tests {
+    //! Regression tests for `propagate_lazy_regions_to_child`
+    //! (docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md): `fork_process`'s
+    //! `cow_share_range` only shares pages already resident in the parent, so the
+    //! child also needs the parent's lazy-region *descriptors* copied over —
+    //! otherwise a page the parent registered but hadn't touched yet is neither
+    //! resident (nothing to share) nor lazy (no entry to demand-page from) for the
+    //! child, and the first touch is an unconditional SIGSEGV.
+    use super::*;
+
+    fn clear(pid: Pid) {
+        LAZY_REGION_TABLE.lock().remove(&pid);
+    }
+
+    #[test]
+    fn copies_all_parent_regions_to_child() {
+        let parent: Pid = 900_001;
+        let child: Pid = 900_002;
+        clear(parent);
+        clear(child);
+
+        push_lazy_region(parent, 0x1000_0000, 0x1000, 0x1);
+        push_lazy_region_with_source(parent, 0x2000_0000, 0x2000, 0x2, LazySource::File {
+            path: alloc::string::String::from("/bin/busybox"),
+            inode: 42,
+            file_offset: 0,
+            filesz: 0x2000,
+            segment_va: 0x2000_0000,
+        });
+
+        let copied = propagate_lazy_regions_to_child(parent, child);
+        assert_eq!(copied, 2);
+
+        let table = LAZY_REGION_TABLE.lock();
+        let child_regions = table.get(&child).expect("child should have a lazy-region entry");
+        assert_eq!(child_regions.len(), 2);
+
+        let r1 = &child_regions[&0x1000_0000];
+        assert_eq!(r1.size, 0x1000);
+        assert_eq!(r1.flags, 0x1);
+        assert!(matches!(r1.source, LazySource::Zero));
+
+        let r2 = &child_regions[&0x2000_0000];
+        assert_eq!(r2.size, 0x2000);
+        assert_eq!(r2.flags, 0x2);
+        match &r2.source {
+            LazySource::File { path, inode, .. } => {
+                assert_eq!(path, "/bin/busybox");
+                assert_eq!(*inode, 42);
+            }
+            _ => panic!("expected a File-backed lazy source to survive propagation"),
+        }
+        drop(table);
+        clear(parent);
+        clear(child);
+    }
+
+    #[test]
+    fn parent_with_no_regions_copies_nothing() {
+        let parent: Pid = 900_003;
+        let child: Pid = 900_004;
+        clear(parent);
+        clear(child);
+
+        let copied = propagate_lazy_regions_to_child(parent, child);
+        assert_eq!(copied, 0);
+        assert!(LAZY_REGION_TABLE.lock().get(&child).is_none());
+    }
+
+    #[test]
+    fn does_not_clobber_childs_existing_regions_at_other_vas() {
+        let parent: Pid = 900_005;
+        let child: Pid = 900_006;
+        clear(parent);
+        clear(child);
+
+        // Child already has its own region (e.g. from an earlier setup step) at a
+        // VA the parent doesn't use; propagation must not wipe it out.
+        push_lazy_region(child, 0x3000_0000, 0x1000, 0x1);
+        push_lazy_region(parent, 0x1000_0000, 0x1000, 0x1);
+
+        let copied = propagate_lazy_regions_to_child(parent, child);
+        assert_eq!(copied, 1);
+
+        let table = LAZY_REGION_TABLE.lock();
+        let child_regions = table.get(&child).unwrap();
+        assert_eq!(child_regions.len(), 2);
+        assert!(child_regions.contains_key(&0x1000_0000));
+        assert!(child_regions.contains_key(&0x3000_0000));
+        drop(table);
+        clear(parent);
+        clear(child);
     }
 }

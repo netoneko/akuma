@@ -1763,18 +1763,28 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             .map(|(va, frames)| (*va, Vec::with_capacity(frames.len())))
             .collect();
 
-        // Share lazy region pages (demand-paged pages in parent)
+        // Share lazy region pages (demand-paged pages in parent), AND propagate the
+        // parent's lazy-region *descriptors* themselves to the child's own tgid —
+        // see `propagate_lazy_regions_to_child`'s doc comment for why: `cow_share_range`
+        // only shares pages *currently resident* in the parent, so a lazy region the
+        // parent registered but hasn't fully touched yet would otherwise vanish for the
+        // child (not resident, not registered). Note: this closes a real correctness
+        // gap, but is NOT a fix for the specific fork-then-exec SIGSEGV investigated in
+        // docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md — that crash's faulting VA
+        // was confirmed unregistered in the parent too, so nothing here would have
+        // covered it. That bug remains open.
         {
-            let lazy_ranges: alloc::vec::Vec<(usize, usize)> = with_irqs_disabled(|| {
+            let parent_regions: alloc::vec::Vec<crate::process::types::LazyRegion> = with_irqs_disabled(|| {
                 let table = LAZY_REGION_TABLE.lock();
                 table.get(&parent_tgid)
-                    .map(|regions| regions.values().map(|r| (r.start_va, r.size)).collect())
+                    .map(|regions| regions.values().cloned().collect())
                     .unwrap_or_default()
             });
-            for (va, size) in lazy_ranges {
-                total_shared += cow_share_range(parent_l0, va, size,
+            for region in &parent_regions {
+                total_shared += cow_share_range(parent_l0, region.start_va, region.size,
                     &mut new_proc.address_space, "lazy")?;
             }
+            propagate_lazy_regions_to_child(parent_tgid, child_pid);
         }
 
         // Demote ALL parent RW pages to RO so writes in the parent also
@@ -1974,13 +1984,19 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         {
             const MAX_FORK_LAZY_PAGES: usize = 4096;
             let lazy_start_us = (runtime().uptime_us)();
-            let lazy_ranges: alloc::vec::Vec<(usize, usize)> = with_irqs_disabled(|| {
+            // Clone the full LazyRegion descriptors, not just (va, size) — see
+            // `propagate_lazy_regions_to_child`'s doc comment (same propagation gap:
+            // eagerly copying whatever's *resident* in the parent's lazy ranges is
+            // not enough; the child needs its own lazy-region registration too, for
+            // whatever wasn't resident yet in the parent at fork time).
+            let parent_regions: alloc::vec::Vec<crate::process::types::LazyRegion> = with_irqs_disabled(|| {
                 let table = LAZY_REGION_TABLE.lock();
                 table.get(&parent_tgid)
-                    .map(|regions| regions.values().map(|r| (r.start_va, r.size)).collect())
+                    .map(|regions| regions.values().cloned().collect())
                     .unwrap_or_default()
             });
-            let num_regions = lazy_ranges.len();
+            propagate_lazy_regions_to_child(parent_tgid, child_pid);
+            let num_regions = parent_regions.len();
             let mut lazy_pages_copied = 0usize;
             let mut lazy_pages_scanned = 0usize;
             {
@@ -1990,7 +2006,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                     format_args!("[FORK-DBG] lazy: {} regions\n", num_regions));
                 if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
             }
-            'lazy_copy: for (region_idx, (va, size)) in lazy_ranges.into_iter().enumerate() {
+            'lazy_copy: for (region_idx, region) in parent_regions.into_iter().enumerate() {
+                let (va, size) = (region.start_va, region.size);
                 let pages = match fork_page_count_for_len(size) {
                     Some(p) => p,
                     None => continue,
