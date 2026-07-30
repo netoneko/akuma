@@ -152,8 +152,9 @@ contention probe (combine with the BKL-hold profiler,
 
 Suggested loop for each M5 split: profile with the matching single mode
 (baseline `WAIT_BY_HOLDER` + `contention_spins`) → implement split → re-profile
-same mode → gate with `-combined_stress` at SMP=2 and SMP=4. `quick_forktest.py`
-(repo root) already automates boot+run+log-scrape; extend it to sweep modes.
+same mode → gate with `-combined_stress` at SMP=2 and SMP=4. `scripts/quick_forktest.py`
+(invoked from the repo root, like the other `scripts/*.py` harnesses) already
+automates boot+run+log-scrape; extend it to sweep modes.
 
 ## Success Criteria
 

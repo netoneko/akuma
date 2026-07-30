@@ -51,12 +51,15 @@ churn. See [`../README.md`](../README.md).
 ### Build system
 
 [`build-system.md`](build-system.md) — the profile/feature pairing model
-(`release`/`size`/`extreme-size`/`devbox`/`release-smp`) and their
-`scripts/build_*.sh` wrappers.
+(`release`/`size`/`extreme-size`/`release-smp`/`release-smp-shared`/`devbox`/
+`devbox-smoltcp`), their `scripts/build_*.sh` wrappers, the disk-image
+lifecycle, and the userspace build.
+
+[`build-profiles.md`](build-profiles.md) — the same seven targets as a
+"which one do I build/run" comparison table (sizes, networking, purpose).
 
 ## Not yet written (deferred gap list)
 
-Tracked in [`../../proposals/DOCS_MIGRATION_PLAN.md`](../../proposals/DOCS_MIGRATION_PLAN.md).
 Tier A and B are now done (drivers above + the subsystems listed above); only
 Tier C (niche) remains:
 

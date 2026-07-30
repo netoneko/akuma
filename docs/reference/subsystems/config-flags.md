@@ -15,15 +15,20 @@ profiles — the profile just sets opt level / codegen units / LTO.
 |---|---|---|---|
 | `release` | — | default `cargo run` | full feature set |
 | `size` | `release` | `scripts/build_size.sh` | `--no-default-features`, re-adds minimal set |
-| `extreme-size` | `release` | `scripts/build_extreme_size.sh` | 4 MB floor; omits TLS, block cache |
-| `release-smp` | `release` | `scripts/build_smp.sh` | multikernel; paired with `smp` feature |
+| `extreme-size` | `size` | `scripts/build_extreme_size.sh` | 4 MB floor; omits TLS, block cache |
+| `release-smp` | `release` | `cargo build --profile release-smp --features smp` | multikernel; paired with `smp` feature |
+| `release-smp-shared` | `release` | `cargo build --profile release-smp-shared --features smp-shared`; also `scripts/build_devbox_smoltcp.sh` | real shared-kernel SMP; paired with `smp-shared`. Mutually exclusive with `smp` (build.rs panics if both) |
 | `devbox` | `release` | `scripts/build_devbox.sh`, `overlays/devbox/run.sh` | rump-only, no smoltcp |
 
-Source: `Cargo.toml:77-115`.
+There is no `devbox-smoltcp` *profile* — the default devbox target is the
+`release-smp-shared` profile plus the `devbox-smoltcp` feature. See
+[`../build-profiles.md`](../build-profiles.md) for the target-level view.
+
+Source: `Cargo.toml:77-123`.
 
 ## Features
 
-`default` (`Cargo.toml:118-127`):
+`default` (`Cargo.toml:126-135`):
 ```
 neko, smoltcp, kernel-tls, tls-rsa, sound, rump,
 sc-aio, sc-sysv-ipc, sc-framebuffer, sc-containers,
@@ -34,13 +39,14 @@ sc-timerfd, sc-eventfd, sc-pidfd, sc-epoll
 
 | Feature | Effect | Source |
 |---|---|---|
-| `smoltcp` | Native smoltcp TCP/IP stack on NIC0; built-in SSH + DNS/HTTP depend on it. | `Cargo.toml:154` |
-| `rump` | Raw L2 tap path on NIC1 (`/dev/net/tap0`) for a userspace NetBSD rump stack. NIC1 only exists with `RUMP_NIC=1`. | `Cargo.toml:148` |
-| `rump-default` | Makes the rump stack the **default** for box 0 (kernel brings up `/bin/rump_server` at boot). Implies `rump`. | `Cargo.toml:225` |
-| `userspace-sshd` | Disables the built-in (smoltcp) in-kernel SSH server; only herd's `/bin/sshd` runs. Drives `config::ENABLE_USERSPACE_SSHD`. | `Cargo.toml:233` |
-| `devbox` | Meta-feature = `["rump-default", "userspace-sshd"]`. | `Cargo.toml:240` |
+| `smoltcp` | Native smoltcp TCP/IP stack on NIC0; built-in SSH + DNS/HTTP depend on it. | `Cargo.toml:221` |
+| `rump` | Raw L2 tap path on NIC1 (`/dev/net/tap0`) for a userspace NetBSD rump stack. NIC1 only exists with `RUMP_NIC=1`. | `Cargo.toml:215` |
+| `rump-default` | Makes the rump stack the **default** for box 0 (kernel brings up `/bin/rump_server` at boot). Implies `rump`. | `Cargo.toml:292` |
+| `userspace-sshd` | Disables the built-in (smoltcp) in-kernel SSH server; only herd's `/bin/sshd` runs. Drives `config::ENABLE_USERSPACE_SSHD`. | `Cargo.toml:300` |
+| `devbox` | Meta-feature = `["rump-default", "userspace-sshd"]`. | `Cargo.toml:307` |
+| `devbox-smoltcp` | Meta-feature = `["userspace-sshd", "smp-shared"]` — the **default** devbox. Keeps smoltcp; drops only the built-in SSH. | `Cargo.toml:319` |
 
-> **Drift note:** `Cargo.toml:236-239` and `overlays/devbox/README.md:105-112`
+> **Drift note:** `overlays/devbox/README.md:142,211`
 > still say "Phase 2 will build with `--no-default-features`" and "smoltcp is
 > still compiled in (for now)". That is **stale** — `scripts/build_devbox.sh`
 > and `overlays/devbox/run.sh` already pass `--no-default-features`, so smoltcp

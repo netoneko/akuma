@@ -12,8 +12,9 @@ userspace/    Thin pointers to per-binary docs (kept co-located with source).
 archive/      Every historical doc, moved verbatim. Linked from new docs, never rewritten.
 ```
 
-For the reasoning behind this structure, see
-[`proposals/DOCS_MIGRATION_PLAN.md`](../proposals/DOCS_MIGRATION_PLAN.md).
+Authoring conventions for each kind live in that section's own README:
+[`runbooks/README.md`](runbooks/README.md) and
+[`reference/README.md`](reference/README.md).
 
 ## Stability grades
 
@@ -87,8 +88,8 @@ touched in the Jun 2026 crisis).
 
 **Still undocumented (deferred gap list):** audio (`src/audio.rs`) and the
 framebuffer device itself (`src/ramfb.rs` — distinct from the `fb.rs` syscall
-wrapper, which is documented), both Tier C / niche. See
-[`proposals/DOCS_MIGRATION_PLAN.md`](../proposals/DOCS_MIGRATION_PLAN.md).
+wrapper, which is documented), both Tier C / niche. The full gap list is in
+[`reference/README.md`](reference/README.md) -> Not yet written.
 
 ## When in doubt
 

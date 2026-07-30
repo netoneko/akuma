@@ -166,7 +166,7 @@ SMP-specific; see [`config-flags.md`](config-flags.md) for the general system.
 
 | Knob | Default | Effect |
 |---|---|---|
-| `smp` (feature) / `release-smp` (profile) | off | Compiles this subsystem in; paired profile used by `scripts/build_smp.sh`. |
+| `smp` (feature) / `release-smp` (profile) | off | Compiles this subsystem in. No wrapper script — invoke directly: `cargo build --profile release-smp --features smp`. |
 | `SMP` (env, `cargo_runner.sh`) | `1` | QEMU `-smp N` vCPU count. |
 | `CORE2_NIC` (env) | `0` | `1` adds a third virtio-net for `RUMP_NIC_CORE`'s local stack. |
 | `MULTIKERNEL_INIT_HERD` (`config.rs:616`) | `true` | Secondaries stay `PARKED`; herd calls `core_init` via `/proc/cores`. |

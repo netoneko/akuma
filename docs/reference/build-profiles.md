@@ -1,6 +1,6 @@
 # Build profiles & distributions
 
-At-a-glance comparison of Akuma's five build targets. For the exhaustive
+At-a-glance comparison of Akuma's seven build targets. For the exhaustive
 per-feature/per-knob breakdown, see
 [`reference/subsystems/config-flags.md`](subsystems/config-flags.md) — this
 doc answers "which one do I build/run", that one answers "what exactly does
@@ -15,7 +15,7 @@ targets can share a profile (`release`, `size`) and differ only in features —
 `opt-level = "z"` and are told apart at build time solely by the `extreme`
 feature (`build.rs` cannot see `OPT_LEVEL` to distinguish them).
 
-## The five targets
+## The seven targets
 
 | Target | Profile | Build command | Binary size | Networking | Purpose |
 |---|---|---|---|---|---|
