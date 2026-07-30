@@ -188,7 +188,7 @@ pub struct Process {
     pub exited: bool,
     pub exit_code: i32,
     pub dynamic_page_tables: Vec<PhysFrame>,
-    pub mmap_regions: Vec<(usize, Vec<PhysFrame>)>,
+    pub mmap_regions: Vec<MmapRegion>,
     pub lazy_regions: Vec<LazyRegion>,
     pub fds: Arc<SharedFdTable>,
     pub thread_id: Option<usize>,
@@ -299,7 +299,7 @@ impl Process {
     /// return any frames to unmap/free and do that work AFTER this returns, with
     /// the lock released. Holding `vm_lock` across a yield/alloc would risk a
     /// single-core deadlock.
-    pub fn vm_with_regions<R>(&self, f: impl FnOnce(&mut Vec<(usize, Vec<PhysFrame>)>) -> R) -> R {
+    pub fn vm_with_regions<R>(&self, f: impl FnOnce(&mut Vec<MmapRegion>) -> R) -> R {
         with_irqs_disabled(|| {
             let _g = self.vm_lock.lock();
             // SAFETY: `vm_lock` (held here) serializes every `vm_with_regions`
@@ -310,7 +310,7 @@ impl Process {
             // already aliased `&mut` across CLONE_VM threads by `lookup_process`).
             let regions = unsafe {
                 &mut *(core::ptr::addr_of!(self.mmap_regions)
-                    as *mut Vec<(usize, Vec<PhysFrame>)>)
+                    as *mut Vec<MmapRegion>)
             };
             f(regions)
         })
@@ -1711,11 +1711,20 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 &mut new_proc.address_space, "interp")?;
         }
 
-        // Share mmap regions
-        for (va_start, parent_frames) in &parent.mmap_regions {
-            let len = parent_frames.len() * mmu::PAGE_SIZE;
-            if len > 0 {
-                total_shared += cow_share_range(parent_l0, *va_start, len,
+        // Share mmap regions.
+        //
+        // Size the share from `region.pages`, NOT `region.frames.len()`: when the
+        // parent is itself a CoW-forked child its regions are `inherited` (extent
+        // known, no owned frames), and using the frame count would compute a
+        // zero-length range and silently skip the region — leaving this child with
+        // no mapping at all for a VA its parent has resident and will hand it a
+        // live pointer into. That is exactly the deterministic SIGSEGV in
+        // docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md: a grandchild of the
+        // process that ran `mmap` (`( cmd; cmd ) &` — shell forks a subshell,
+        // subshell forks to exec) faulted on musl's first malloc arena.
+        for region in &parent.mmap_regions {
+            if region.pages > 0 {
+                total_shared += cow_share_range(parent_l0, region.start_va, region.len_bytes(),
                     &mut new_proc.address_space, "mmap")?;
             }
         }
@@ -1736,10 +1745,10 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             let mut overflow = false;
             table::for_each_process(|p| {
                 if p.tgid == parent_tgid && p.pid != parent_pid {
-                    for (va, frames) in &p.mmap_regions {
-                        if !frames.is_empty() {
+                    for region in &p.mmap_regions {
+                        if region.pages > 0 {
                             if ranges.len() < ranges.capacity() {
-                                ranges.push((*va, frames.len() * mmu::PAGE_SIZE));
+                                ranges.push((region.start_va, region.len_bytes()));
                             } else {
                                 overflow = true;
                             }
@@ -1758,10 +1767,9 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         }
         // CoW fork doesn't track per-region frame lists — frames are shared,
         // not owned.  On write fault, new frames are allocated and tracked in
-        // user_frames.  We keep the mmap region VA ranges for munmap.
-        new_proc.mmap_regions = parent.mmap_regions.iter()
-            .map(|(va, frames)| (*va, Vec::with_capacity(frames.len())))
-            .collect();
+        // user_frames.  We keep each region's VA *and page count* so munmap can
+        // size it and so this child's own forks can share it (see `MmapRegion`).
+        new_proc.mmap_regions = inherit_mmap_regions_for_cow_child(&parent.mmap_regions);
 
         // Share lazy region pages (demand-paged pages in parent), AND propagate the
         // parent's lazy-region *descriptors* themselves to the child's own tgid —
@@ -1804,8 +1812,11 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 mmu::demote_range_to_ro(parent_l0_mut, interp_base, interp_pages);
             }
 
-            for (va_start, parent_frames) in &parent.mmap_regions {
-                mmu::demote_range_to_ro(parent_l0_mut, *va_start, parent_frames.len());
+            // Demote by `pages` for the same reason we shared by it: an inherited
+            // region has no owned frames, and demoting 0 pages would leave the
+            // parent writing straight through a page it now shares with the child.
+            for region in &parent.mmap_regions {
+                mmu::demote_range_to_ro(parent_l0_mut, region.start_va, region.pages);
             }
 
             // Demote sibling-thread eager mmap regions we just CoW-shared, so a
@@ -1908,12 +1919,14 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         (runtime().print_str)("[FORK-DBG] step4: interp done\n");
 
         const MAX_FORK_MMAP_PAGES: usize = 2048;
-        let mmap_snapshot: Vec<(usize, Vec<PhysFrame>)> = parent.mmap_regions.clone();
+        let mmap_snapshot: Vec<MmapRegion> = parent.mmap_regions.clone();
         FORK_IN_PROGRESS.store(true, Ordering::Release);
         let mut total_copied_pages: usize = 0;
-        let mut child_mmap_regions: Vec<(usize, Vec<PhysFrame>)> = Vec::new();
+        let mut child_mmap_regions: Vec<MmapRegion> = Vec::new();
 
-        for (region_idx, (va_start, parent_frames)) in mmap_snapshot.iter().enumerate() {
+        for (region_idx, region) in mmap_snapshot.iter().enumerate() {
+            let va_start = &region.start_va;
+            let parent_frames = &region.frames;
             {
                 let mut buf = [0u8; 128];
                 let mut pos = 0usize;
@@ -1967,7 +1980,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             }
             if ok {
                 total_copied_pages += child_frames.len();
-                child_mmap_regions.push((*va_start, child_frames));
+                child_mmap_regions.push(MmapRegion::owned(*va_start, child_frames));
             } else {
                 if config().syscall_debug_info_enabled {
                     log::debug!("[fork] OOM copying mmap region 0x{:x}, skipping rest", va_start);

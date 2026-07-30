@@ -1,4 +1,5 @@
 use super::*;
+use akuma_exec::process::MmapRegion;
 
 // ── Linux mmap flag constants ────────────────────────────────────────────────
 //
@@ -76,8 +77,8 @@ pub(super) fn flush_and_clear_shared_file_mappings(tgid: u32) {
     if let Some(proc) = akuma_exec::process::lookup_process(tgid) {
         for (base, path, foff, mlen) in &entries {
             let pas = proc.vm_with_regions(|r| {
-                r.iter().find(|(s, _)| *s == *base)
-                    .map(|(_, frames)| frames.iter().map(|f| f.addr).collect::<Vec<usize>>())
+                r.iter().find(|reg| reg.start_va == *base)
+                    .map(|reg| reg.frames.iter().map(|f| f.addr).collect::<Vec<usize>>())
             });
             if let Some(pas) = pas {
                 writeback_shared_pages(path, *foff, *mlen, &pas);
@@ -108,8 +109,8 @@ pub(super) fn sys_msync(addr: usize, len: usize, _flags: u32) -> u64 {
     };
     for (base, path, foff, mlen) in &entries {
         let pas = proc.vm_with_regions(|r| {
-            r.iter().find(|(s, _)| *s == *base)
-                .map(|(_, frames)| frames.iter().map(|f| f.addr).collect::<Vec<usize>>())
+            r.iter().find(|reg| reg.start_va == *base)
+                .map(|reg| reg.frames.iter().map(|f| f.addr).collect::<Vec<usize>>())
         });
         if let Some(pas) = pas {
             writeback_shared_pages(path, *foff, *mlen, &pas);
@@ -418,7 +419,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 proc.pid, fd, &f.path, offset, len, mmap_addr);
         }
 
-    proc.vm_with_regions(|r| r.push((mmap_addr, frames)));
+    proc.vm_with_regions(|r| r.push(MmapRegion::owned(mmap_addr, frames)));
 
     mmap_addr as u64
 }
@@ -445,9 +446,7 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
         let is_mapped = akuma_exec::mmu::is_current_user_page_mapped(old_addr)
             || akuma_exec::process::lazy_region_lookup_for_pid(lazy_key, old_addr).is_some()
             || akuma_exec::process::lookup_process(owner_pid)
-                .is_some_and(|p| p.vm_with_regions(|r| r.iter().any(|(start, frames)| {
-                    old_addr >= *start && old_addr < *start + frames.len() * 4096
-                })));
+                .is_some_and(|p| p.vm_with_regions(|r| r.iter().any(|reg| reg.contains(old_addr))));
         return if is_mapped { ENOMEM } else { EFAULT };
     }
 
@@ -500,28 +499,45 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
             }
         }
 
-        proc.vm_with_regions(|r| r.push((new_addr, new_frames)));
+        proc.vm_with_regions(|r| r.push(MmapRegion::owned(new_addr, new_frames)));
 
         let mut found_eager = false;
         // Remove the old region under the lock, then unmap/free its frames after
         // releasing it (unmap/free must not run while vm_lock is held).
-        let old_frames_opt = proc.vm_with_regions(|r| {
-            r.iter().position(|(va, _)| *va == old_addr).map(|idx| r.remove(idx).1)
+        let old_region_opt = proc.vm_with_regions(|r| {
+            r.iter().position(|reg| reg.start_va == old_addr).map(|idx| r.remove(idx))
         });
-        if let Some(old_frames) = old_frames_opt {
-            let freed_size = old_frames.len() * 4096;
+        if let Some(old_region) = old_region_opt {
+            // Size from `pages`, not the owned frame count: a CoW-inherited region
+            // owns no frames but has every page mapped, and using `frames.len()`
+            // would leave those pages mapped while still recycling the VA range.
+            let old_region_pages = old_region.pages;
+            let freed_size = old_region.len_bytes();
+            let old_frames = old_region.frames;
             // Unmap + user-frame bookkeeping under `as_lock`; collect frames to free
             // and free them AFTER releasing the hold (free stays outside).
             let mut to_free = alloc::vec::Vec::new();
             {
                 #[cfg(kernel_smp_shared)]
                 let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
-                for (i, frame) in old_frames.into_iter().enumerate() {
-                    let _ = proc.address_space.unmap_page(old_addr + i * 4096);
-                    // Free only when this drops the frame's last reference; an
-                    // aliased/shared PA is freed by its surviving owner instead.
-                    if proc.address_space.remove_user_frame(frame) {
-                        to_free.push(frame);
+                for i in 0..old_region_pages {
+                    let va = old_addr + i * 4096;
+                    match old_frames.get(i) {
+                        // Frame this process owns. Free only when this drops its
+                        // last reference; an aliased/shared PA is freed by its
+                        // surviving owner instead.
+                        Some(&frame) => {
+                            let _ = proc.address_space.unmap_page(va);
+                            if proc.address_space.remove_user_frame(frame) {
+                                to_free.push(frame);
+                            }
+                        }
+                        // CoW-inherited page: take the PA from the live PTE.
+                        None => {
+                            if let Some(frame) = proc.address_space.unmap_and_free_page(va) {
+                                to_free.push(frame);
+                            }
+                        }
                     }
                 }
             }
@@ -746,28 +762,34 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     // full unmap, remove it; for a partial prefix, remove it, split off the prefix
     // frames, and re-push the remaining suffix. The actual page unmap + frame free
     // happens AFTER the lock is released (it takes other locks and must not run
-    // while vm_lock is held). Returns (base_va, frames_to_unmap) or None.
+    // while vm_lock is held). Returns (base_va, pages_to_unmap, owned_frames) or None.
+    //
+    // `pages_to_unmap` comes from `MmapRegion::pages`, not the frame count: a
+    // CoW-inherited region has every page mapped but owns no frames, and sizing
+    // the unmap by `frames.len()` would silently unmap nothing and leak the VA
+    // range back to `alloc_mmap` while the pages stayed live.
     let detached = proc.vm_with_regions(|r| {
-        let idx = r.iter().position(|(start, _)| *start == addr)?;
-        let region_pages = r[idx].1.len();
+        let idx = r.iter().position(|reg| reg.start_va == addr)?;
+        let region_pages = r[idx].pages;
         if unmap_pages >= region_pages {
-            let (_, frames) = r.remove(idx);
-            Some((addr, frames))
+            let reg = r.remove(idx);
+            Some((addr, region_pages, reg.frames))
         } else {
-            let (old_start, old_frames) = r.remove(idx);
-            let mut iter = old_frames.into_iter();
+            let reg = r.remove(idx);
+            let mut iter = reg.frames.into_iter();
             let prefix: Vec<crate::pmm::PhysFrame> = (0..unmap_pages).filter_map(|_| iter.next()).collect();
             let remaining: Vec<crate::pmm::PhysFrame> = iter.collect();
-            if !remaining.is_empty() {
-                r.push((old_start + unmap_pages * 4096, remaining));
-            }
-            Some((old_start, prefix))
+            r.push(MmapRegion {
+                start_va: reg.start_va + unmap_pages * 4096,
+                pages: region_pages - unmap_pages,
+                frames: remaining,
+            });
+            Some((reg.start_va, unmap_pages, prefix))
         }
     });
-    if let Some((base, frames)) = detached {
-        let n = frames.len();
-        crate::tprint!(128, "[munmap] pid={} addr=0x{:x} ({} pages, base=0x{:x})\n",
-            proc.pid, addr, n, base);
+    if let Some((base, n, frames)) = detached {
+        crate::tprint!(128, "[munmap] pid={} addr=0x{:x} ({} pages, {} owned, base=0x{:x})\n",
+            proc.pid, addr, n, frames.len(), base);
         // Writable MAP_SHARED file mapping: flush its (still-resident) pages back
         // to the backing file BEFORE the frames are freed below.
         let wb = SHARED_FILE_MAPPINGS.lock().remove(&(proc.tgid, base));
@@ -786,12 +808,27 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
         {
             #[cfg(kernel_smp_shared)]
             let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
-            for (i, frame) in frames.into_iter().enumerate() {
-                let _ = proc.address_space.unmap_page_no_flush(base + i * 4096);
-                // Free only when this drops the frame's last reference; an
-                // aliased/shared PA is freed by its surviving owner instead.
-                if proc.address_space.remove_user_frame(frame) {
-                    to_free.push(frame);
+            for i in 0..n {
+                let va = base + i * 4096;
+                match frames.get(i) {
+                    // Frame this process owns: unmap the PTE, then drop our
+                    // reference. Free only when this drops the frame's last
+                    // reference; an aliased/shared PA is freed by its surviving
+                    // owner instead.
+                    Some(&frame) => {
+                        let _ = proc.address_space.unmap_page_no_flush(va);
+                        if proc.address_space.remove_user_frame(frame) {
+                            to_free.push(frame);
+                        }
+                    }
+                    // CoW-inherited page (no owned frame recorded): take the PA
+                    // from the live PTE instead, which also covers the case where
+                    // a CoW write fault already swapped in a private frame.
+                    None => {
+                        if let Some(frame) = proc.address_space.unmap_and_free_page_no_flush(va) {
+                            to_free.push(frame);
+                        }
+                    }
                 }
             }
             akuma_exec::mmu::flush_tlb_range_all_asid(base, n);
@@ -836,9 +873,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     let mut skip = alloc::vec::Vec::with_capacity(total_pages);
     for i in 0..total_pages {
         let va = addr + i * 4096;
-        skip.push(proc.vm_with_regions(|r| r.iter().any(|(start, frames)| {
-            va >= *start && va < *start + frames.len() * 4096
-        })));
+        skip.push(proc.vm_with_regions(|r| r.iter().any(|reg| reg.contains(va))));
     }
     let mut to_free = alloc::vec::Vec::new();
     {

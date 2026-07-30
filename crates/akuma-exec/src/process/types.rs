@@ -5,6 +5,7 @@
 
 #![allow(dead_code)]
 
+use crate::runtime::PhysFrame;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;
@@ -254,6 +255,59 @@ pub struct LazyRegion {
     pub size: usize,
     pub flags: u64,
     pub source: LazySource,
+}
+
+/// An eagerly-mapped `mmap` region (all pages resident at mmap time).
+///
+/// `pages` — not `frames.len()` — is the authoritative extent of the region.
+/// The two are equal for a region this process created itself via `mmap`, but a
+/// **CoW-forked child inherits `pages` with an empty `frames`**: the child maps
+/// every page (read-only, shared with the parent) but owns none of them, so it
+/// has no per-region frame list to record. Frame ownership for such a child is
+/// tracked solely in `UserAddressSpace::user_frames`, which is refcounted.
+///
+/// Deriving the extent from `frames.len()` therefore reports 0 pages for any
+/// inherited region, which is how a *grandchild* fork used to lose its parent's
+/// mmap regions entirely — `cow_share_range` skipped them as zero-length, and
+/// the grandchild took an unrecoverable translation fault on first touch (see
+/// `docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md`). Use `pages` for extent
+/// (sharing, demotion, munmap sizing) and `frames` only when a real PA is
+/// required, guarding the index against a short/empty list.
+#[derive(Clone)]
+pub struct MmapRegion {
+    pub start_va: usize,
+    pub pages: usize,
+    pub frames: Vec<PhysFrame>,
+}
+
+impl MmapRegion {
+    /// Region created by this process: it owns every frame.
+    pub fn owned(start_va: usize, frames: Vec<PhysFrame>) -> Self {
+        Self { start_va, pages: frames.len(), frames }
+    }
+
+    /// Region inherited by a CoW-forked child: extent known, no owned frames.
+    pub fn inherited(start_va: usize, pages: usize) -> Self {
+        Self { start_va, pages, frames: Vec::new() }
+    }
+
+    pub fn len_bytes(&self) -> usize {
+        self.pages * 4096
+    }
+
+    pub fn contains(&self, va: usize) -> bool {
+        va >= self.start_va && va < self.start_va + self.len_bytes()
+    }
+
+    /// Physical frame backing `va`, if this process owns a frame list covering it.
+    /// Returns `None` for CoW-inherited regions (no owned frames) and for any VA
+    /// outside the owned prefix.
+    pub fn frame_for(&self, va: usize) -> Option<PhysFrame> {
+        if !self.contains(va) {
+            return None;
+        }
+        self.frames.get((va - self.start_va) / 4096).copied()
+    }
 }
 
 /// Process state

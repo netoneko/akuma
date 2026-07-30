@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
 use crate::process::Process;
-use crate::process::types::{Pid, ProcessInfo, PROCESS_INFO_ADDR, LazyRegion, LazySource, ProcessInfo2, ProcessState};
+use crate::process::types::{Pid, ProcessInfo, PROCESS_INFO_ADDR, LazyRegion, LazySource, MmapRegion, ProcessInfo2, ProcessState};
 use crate::process::channel::{ProcessChannel, get_channel};
 use crate::process::table::{LAZY_REGION_TABLE, THREAD_PID_MAP, find_process};
 use crate::runtime::{with_irqs_disabled, runtime, PhysFrame};
@@ -432,7 +432,7 @@ pub fn alloc_mmap(size: usize) -> usize {
 pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
     let pid = address_space_owner_pid_for_fault().unwrap_or(0);
     if let Some(proc) = lookup_process(pid) {
-        proc.vm_with_regions(|r| r.push((start_va, frames)));
+        proc.vm_with_regions(|r| r.push(MmapRegion::owned(start_va, frames)));
     }
 }
 
@@ -717,6 +717,30 @@ pub fn propagate_lazy_regions_to_child(parent_pid: Pid, child_pid: Pid) -> usize
     count
 }
 
+/// Derive a CoW-forked child's `mmap_regions` from its parent's.
+///
+/// The child maps every page of every parent region (read-only, CoW-shared by
+/// `cow_share_range`) but *owns* none of them — frames are shared, and a write
+/// fault allocates the child a private frame tracked in `user_frames`. So each
+/// child region carries the parent's extent with an empty frame list.
+///
+/// Carrying the **extent** across is the part that matters, and the part that
+/// used to be dropped: the child's regions were built with
+/// `Vec::with_capacity(frames.len())`, which is a *length-zero* Vec, and every
+/// consumer derived the region's size from `frames.len()`. A child forked from
+/// such a child therefore saw four zero-length regions, `cow_share_range` skipped
+/// all of them, and the grandchild had no mapping at all for the VAs its parent
+/// was about to hand it live pointers into — a deterministic write to an unmapped
+/// page (`docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md`). The shell shape
+/// `( cmd; cmd ) &` produces exactly that lineage: the shell mmaps musl's first
+/// malloc arena, forks a subshell, and the subshell forks again to exec `cmd`.
+pub fn inherit_mmap_regions_for_cow_child(parent_regions: &[MmapRegion]) -> alloc::vec::Vec<MmapRegion> {
+    parent_regions
+        .iter()
+        .map(|r| MmapRegion::inherited(r.start_va, r.pages))
+        .collect()
+}
+
 /// Update flags on all lazy regions that overlap [range_start, range_start+range_size).
 pub fn update_lazy_region_flags(pid: Pid, range_start: usize, range_size: usize, new_flags: u64) {
     let range_end = range_start + range_size;
@@ -903,15 +927,16 @@ pub fn remove_mmap_region(start_va: usize) -> Option<Vec<PhysFrame>> {
     let proc = lookup_process(pid)?;
     
     // Find & remove the region under vm_lock (pure Vec op).
-    let (va, frames) = proc.vm_with_regions(|r| {
-        r.iter().position(|(va, _)| *va == start_va).map(|idx| r.remove(idx))
+    let region = proc.vm_with_regions(|r| {
+        r.iter().position(|reg| reg.start_va == start_va).map(|idx| r.remove(idx))
     })?;
 
-    // RECLAIM: Add the freed range to free_regions
-    let size: usize = frames.len() * 4096; // config::PAGE_SIZE
-    proc.memory.free_regions.push((va, size));
+    // RECLAIM: Add the freed range to free_regions. Size from `pages` (the
+    // authoritative extent) so a CoW-inherited region — which owns no frames —
+    // still recycles its full VA range rather than zero bytes.
+    proc.memory.free_regions.push((region.start_va, region.len_bytes()));
 
-    Some(frames)
+    Some(region.frames)
 }
 
 /// Get stack bounds for current process
@@ -1260,5 +1285,89 @@ mod lazy_region_propagation_tests {
         drop(table);
         clear(parent);
         clear(child);
+    }
+}
+
+#[cfg(test)]
+mod mmap_region_inheritance_tests {
+    //! Regression tests for the grandchild-loses-its-mmap-regions bug
+    //! (docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md).
+    //!
+    //! A CoW-forked child owns none of its inherited regions' frames, so its
+    //! frame lists are empty. When the region's extent was *derived* from those
+    //! lists, a child's own fork computed a zero-length range for every inherited
+    //! region and shared none of them, leaving the grandchild with no mapping for
+    //! VAs its parent had resident. `MmapRegion::pages` carries the extent
+    //! independently of frame ownership so that chain holds up.
+    use super::*;
+    use crate::runtime::PhysFrame;
+
+    fn frames(n: usize) -> alloc::vec::Vec<PhysFrame> {
+        (0..n).map(|i| PhysFrame::new(0x4000_0000 + i * 4096)).collect()
+    }
+
+    /// The generation that called `mmap` owns its frames; extent == frame count.
+    #[test]
+    fn owned_region_extent_matches_frames() {
+        let r = MmapRegion::owned(0x2012_0000, frames(3));
+        assert_eq!(r.pages, 3);
+        assert_eq!(r.len_bytes(), 3 * 4096);
+        assert!(r.contains(0x2012_0000));
+        assert!(r.contains(0x2012_2fff));
+        assert!(!r.contains(0x2012_3000));
+        assert_eq!(r.frame_for(0x2012_1000).map(|f| f.addr), Some(0x4000_1000));
+    }
+
+    /// A CoW child keeps the extent but owns no frames — the exact state whose
+    /// extent used to be lost.
+    #[test]
+    fn cow_child_inherits_extent_without_owning_frames() {
+        let parent = alloc::vec![
+            MmapRegion::owned(0x2012_0000, frames(1)),
+            MmapRegion::owned(0x2012_1000, frames(1)),
+            MmapRegion::owned(0x2012_2000, frames(2)),
+            MmapRegion::owned(0x2012_4000, frames(1)),
+        ];
+
+        let child = inherit_mmap_regions_for_cow_child(&parent);
+
+        assert_eq!(child.len(), 4);
+        for (c, p) in child.iter().zip(parent.iter()) {
+            assert_eq!(c.start_va, p.start_va);
+            assert_eq!(c.pages, p.pages, "extent must survive the CoW fork");
+            assert!(c.frames.is_empty(), "a CoW child owns no per-region frames");
+        }
+        // Total extent preserved: 1+1+2+1 = 5 pages — the five pages the
+        // grandchild used to be missing.
+        assert_eq!(child.iter().map(|r| r.pages).sum::<usize>(), 5);
+    }
+
+    /// The actual regression: fork the child again. Every region must still
+    /// present a non-zero range to share, or the grandchild faults on first touch.
+    #[test]
+    fn grandchild_still_inherits_full_extent() {
+        let parent = alloc::vec![MmapRegion::owned(0x2012_0000, frames(1))];
+        let child = inherit_mmap_regions_for_cow_child(&parent);
+        let grandchild = inherit_mmap_regions_for_cow_child(&child);
+
+        assert_eq!(grandchild.len(), 1);
+        assert_eq!(grandchild[0].start_va, 0x2012_0000);
+        assert_eq!(grandchild[0].pages, 1);
+        assert!(
+            grandchild[0].len_bytes() > 0,
+            "a zero-length range is skipped by cow_share_range — this is the bug"
+        );
+        // The faulting address from the original report lands in this region.
+        assert!(grandchild[0].contains(0x2012_0338));
+    }
+
+    /// An inherited region has no owned frame to re-map from, so the eager
+    /// demand-paging fallback must decline rather than index an empty list.
+    #[test]
+    fn inherited_region_has_no_frame_to_remap() {
+        let r = MmapRegion::inherited(0x2012_0000, 2);
+        assert!(r.contains(0x2012_0338));
+        assert_eq!(r.frame_for(0x2012_0338), None);
+        assert_eq!(r.frame_for(0x9999_0000), None);
     }
 }

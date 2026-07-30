@@ -4132,7 +4132,7 @@ fn test_clone_vm_mmap_regions_on_owner() -> bool {
 
     // Simulate an eager mmap on the parent
     let test_frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
-    parent_proc.mmap_regions.push((0x6809_d000, vec![test_frame]));
+    parent_proc.mmap_regions.push(akuma_exec::process::MmapRegion::owned(0x6809_d000, vec![test_frame]));
 
     let child_proc = make_test_process(child_pid, parent_pid, child_as, info.addr);
 
@@ -4148,8 +4148,8 @@ fn test_clone_vm_mmap_regions_on_owner() -> bool {
     let _ = akuma_exec::process::unregister_process(child_pid);
     let mut pp = akuma_exec::process::unregister_process(parent_pid);
     if let Some(ref mut p) = pp {
-        for (_, frames) in p.mmap_regions.drain(..) {
-            for f in frames { crate::pmm::free_page(f); }
+        for reg in p.mmap_regions.drain(..) {
+            for f in reg.frames { crate::pmm::free_page(f); }
         }
     }
     drop(pp);
@@ -4194,7 +4194,7 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
             return false;
         }
     }
-    owner_proc.mmap_regions.push((region_base, frames));
+    owner_proc.mmap_regions.push(akuma_exec::process::MmapRegion::owned(region_base, frames));
 
     akuma_exec::process::register_process(owner_pid, owner_proc);
     akuma_exec::process::register_process(worker_pid, worker_proc);
@@ -4205,10 +4205,9 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
 
     // Search via owner PID (correct path after fix)
     let found_via_owner = akuma_exec::process::lookup_process(owner_pid).and_then(|p| {
-        for (start, fr) in &p.mmap_regions {
-            let end = *start + fr.len() * 4096;
-            if page_va >= *start && page_va < end {
-                return Some((*start, fr.len()));
+        for reg in &p.mmap_regions {
+            if reg.contains(page_va) {
+                return Some((reg.start_va, reg.pages));
             }
         }
         None
@@ -4216,10 +4215,9 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
 
     // Search via worker PID (broken path before fix)
     let found_via_worker = akuma_exec::process::lookup_process(worker_pid).and_then(|p| {
-        for (start, fr) in &p.mmap_regions {
-            let end = *start + fr.len() * 4096;
-            if page_va >= *start && page_va < end {
-                return Some((*start, fr.len()));
+        for reg in &p.mmap_regions {
+            if reg.contains(page_va) {
+                return Some((reg.start_va, reg.pages));
             }
         }
         None
@@ -4229,8 +4227,8 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
     let _ = akuma_exec::process::unregister_process(worker_pid);
     let mut op = akuma_exec::process::unregister_process(owner_pid);
     if let Some(ref mut p) = op {
-        for (_, frs) in p.mmap_regions.drain(..) {
-            for f in frs { crate::pmm::free_page(f); }
+        for reg in p.mmap_regions.drain(..) {
+            for f in reg.frames { crate::pmm::free_page(f); }
         }
     }
     drop(op);

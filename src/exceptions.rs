@@ -3127,15 +3127,12 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         // Find the frame for this page under vm_lock (pure Vec read),
                         // then map it under `as_lock` (map allocs page tables and must not
                         // run while vm_lock is held; the two locks never nest here).
+                        // `frame_for` needs a real PA, so it consults the owned
+                        // frame list and returns None for a CoW-inherited region
+                        // (extent known, no owned frames) — there is nothing to
+                        // re-map from here in that case.
                         let phys_opt = owner.vm_with_regions(|r| {
-                            r.iter().find_map(|(start, frames)| {
-                                let region_end = *start + frames.len() * 4096;
-                                if page_va >= *start && page_va < region_end {
-                                    Some(frames[(page_va - *start) / 4096])
-                                } else {
-                                    None
-                                }
-                            })
+                            r.iter().find_map(|reg| reg.frame_for(page_va))
                         });
                         if let Some(phys) = phys_opt {
                             crate::tprint!(192, "[DP-eager] pid={} re-map va=0x{:x} frame=0x{:x}\n",

@@ -1,12 +1,14 @@
-# `( cmd; more-cmds ) &` SIGSEGV — deterministic wild write in a forked-but-not-yet-exec'd child
+# `( cmd; more-cmds ) &` SIGSEGV — a grandchild fork loses its inherited mmap regions
 
 Found 2026-07-30 on branch `another-smp-attempt-0` while chasing fresh BKL attribution data
-for [BKL_VFS_CARVE_OUT.md](BKL_VFS_CARVE_OUT.md) §7. **Partially investigated, not fixed.**
-One real, separate correctness bug was found and fixed along the way (a fork lazy-region
-propagation gap — §"Propagation fix landed" below), but it does **not** explain this crash;
-that fix was verified to leave the crash fully reproducible. The kernel bug itself is still
-open, worked around only at the test-harness level
-(`scripts/bkl_smp_regimen/payload/job.sh`).
+for [BKL_VFS_CARVE_OUT.md](BKL_VFS_CARVE_OUT.md) §7. **Root-caused and fixed 2026-07-30.**
+
+Two separate bugs were found along the way. The second one is the crash:
+
+1. A fork **lazy-region propagation** gap (§"Propagation fix" below) — real, fixed, but
+   verified *not* to be the cause of this crash.
+2. **CoW fork dropped the extent of every inherited `mmap` region**, so a *grandchild* fork
+   shared none of them and faulted on the first touch (§"Root cause"). This is the crash.
 
 ## Symptom
 
@@ -30,187 +32,209 @@ reproduces with exactly one backgrounded job, and reproduces identically at `SMP
 | 4 concurrent copies of the crashing pattern | SIGSEGV, same as 1 |
 | the crashing pattern at `SMP=1` | SIGSEGV, same as `SMP=4` |
 
-So the trigger is specifically: **a process forked but not yet exec'd** (ash's subshell,
-needed because there's more than one statement in the parens) **then execs a real
-program**. A process that reaches exec via a *direct* single-fork-then-exec (no
-intermediate non-exec'd fork) is fine, and forking a program that never execs (`true`) is
-also fine.
+This table is the root cause in disguise: the trigger is **two levels of fork**. The shell
+forks a subshell (needed because there is more than one statement in the parens), and the
+subshell forks *again* to exec the real command. `wget &` is a single fork-then-exec and is
+fine; `( true; ... ) &` never forks a second time because ash runs builtins in-process.
 
-## Root cause (as far as traced)
+## Root cause
 
-The crash is a **write to an unmapped page** (`Data abort`, `ISS=0x46` → DFSC level-2
-translation fault, `WnR=1`), not a permission/CoW fault — so it never touches the CoW
-refcount machinery in `crates/akuma-exec/src/process/mod.rs` at all.
+`Process::mmap_regions` was `Vec<(usize, Vec<PhysFrame>)>` — a start VA and the frames
+backing the region. **Every consumer derived the region's extent from `frames.len()`**, and
+that was the only record of how big the region was.
 
-**It happens in the forked child before it ever reaches `execve`.** This was the biggest
-correction versus the first pass at this investigation: the syscall trace right before the
-fault (`set_tid_address` + `rt_sigprocmask`, i.e. what a freshly-exec'd musl `_start` does)
-initially looked like post-exec libc init, but the kernel log around every crash instance
-has **no `[syscall] execve(...)` trace line and no `[mmap]` trace line** for the crashing
-pid at all — both are printed unconditionally by their respective syscall handlers, so their
-absence means neither syscall was ever made. The crashing pid's own `fork_process` trace
-(`[FORK-DBG] parent_pid=P child_pid=N ...`) is the last thing tied to it before
-`[FORK-DBG] trampoline ENTRY tid=T` and then straight to `[DA-MISS]`/`[WILD-DA]`. Whatever
-those two `set_tid_address`/`rt_sigprocmask` entries are, they are not evidence of a
-completed exec (either stale data from a reused per-thread syscall-log slot, or musl's own
-`fork()` wrapper doing its post-`clone()` signal-mask restore in the child — not
-distinguished). So `replace_image()` is not implicated the way originally suspected; the
-break is somewhere in `fork_process` (`crates/akuma-exec/src/process/mod.rs`) or in what the
-child touches immediately after the fork trampoline returns it to userspace, still running
-unmodified inherited code.
+A CoW-forked child owns none of its inherited frames: `cow_share_range` maps the parent's
+pages read-only into the child and refcounts them in `UserAddressSpace::user_frames`; a write
+fault later hands the child a private frame. So `fork_process` gave the child region entries
+with a deliberately empty frame list:
 
-Disassembling the exact faulting instruction (`ELR=0x1004e8f0`, i.e. file offset `0x4e8f0`
-in `bootstrap/bin/busybox`, a `static-pie` binary) with `objdump -d`:
-
-```
-adrp x0, 0x11f000       ; x0 = 0x1011f000 (this binary always loads at base 0x10000000)
-ldr  x0, [x0, #0xf88]   ; x0 = *(0x1011ff88)              — PTR_A, a fixed global in .data
-...
-ldr  x0, [x0]           ; x0 = *(PTR_A)                    — PTR_B, observed = 0x20120030
-str  wzr, [x0, #0x308]  ; *(PTR_B + 0x308) = 0   <-- faults; PTR_B+0x308 = FAR = 0x20120338
+```rust
+new_proc.mmap_regions = parent.mmap_regions.iter()
+    .map(|(va, frames)| (*va, Vec::with_capacity(frames.len())))   // len 0, not `frames.len()`
+    .collect();
 ```
 
-So the crash is a double-pointer-dereference write: a fixed global holds `PTR_A`, and
-`*PTR_A` should be a valid pointer (`PTR_B`) but is instead `0x20120030` — a value that
-lands suspiciously close to `next_mmap`'s initial computed value (`0x20120000`, see below),
-though no `mmap()` syscall was ever made by this process to justify treating that address as
-valid. **Hypotheses ruled out, each with direct evidence:**
+`Vec::with_capacity(n)` has **length zero**. The child's regions therefore reported an extent
+of 0 pages. That was invisible for the child itself — it had the pages mapped — but when the
+*child* forked, the sharing loop computed a zero-length range and skipped every region:
 
-- **Not the earlier-suspected heap-lazy-region/mmap-floor boundary in isolation.** True that
-  `compute_heap_lazy_size` caps the heap region at exactly `next_mmap`'s initial value
-  (`(code_end + 0x1000_0000) & !0xFFFF` = `0x20120000` for this binary), and the fault
-  address sits `0x338` bytes past that boundary — but `[DA-MISS]` diagnostics show
-  `parent_has_va=false`: **neither the parent nor the child has this VA registered as a lazy
-  region**, so it isn't a "forgot to inherit a valid registration" gap either (see next
-  section) — it's a value nobody ever validly reserved, in anyone's lineage.
-- **Not a fork lazy-region propagation gap.** See "Propagation fix landed" below — a real,
-  separate bug was found and fixed here, and confirmed *not* to touch this crash (the fix
-  correctly propagates 6/6 parent regions to the child; the crash persists unchanged).
-- **Not file-size-driven eager-vs-lazy `execve` loader selection.** `do_execve` picks
-  `replace_image` (eager, whole file read) vs `replace_image_from_path` (on-demand) based on
-  whether `ext2::read_inode_data` returns `FsError::Internal` for files over 16 MB
-  (`crates/akuma-ext2/src/ext2.rs`); `/bin/busybox` is ~1.1 MB, nowhere near that threshold,
-  and moot regardless since the crash precedes `execve` entirely.
-- **Not an actual `mmap()` call gone wrong.** Confirmed no `[mmap] pid=<N> ...` trace line
-  exists for any crashing pid before its crash, so `PTR_B`'s value cannot be a real-but-
-  mis-registered `mmap()` return address.
-- **Not the previously-fixed vfork/TTBR0 bug** (`project_vfork_stale_ttbr0`, fixed
-  2026-07-05) — that one was in the vfork fast path (`vfork_process`); this reproduces via
-  the full/CoW fork path (`fork_process`) and needs no vfork at all, and reproduces
-  identically at `SMP=1` (ruling out any cross-core TLB-staleness variant of that class of
-  bug too).
-- **ASID collision** (two live processes sharing an address-space ID, causing stale TLB
-  aliasing) was considered but not seriously pursued — `AsidAllocator` supports 256 IDs and
-  only ~10-15 processes are ever alive at once in the repro, making a collision implausible
-  without a separate leak bug, which wasn't found.
+```rust
+for (va_start, parent_frames) in &parent.mmap_regions {
+    let len = parent_frames.len() * mmu::PAGE_SIZE;   // 0 for an inherited region
+    if len > 0 { cow_share_range(...)?; }             // → never runs
+}
+```
 
-Net: the actual origin of the `0x20120030`/`0x20120338` value — why a fixed global in
-busybox's `.data` ends up holding something that looks like an mmap-floor address despite no
-mmap ever happening — is still unexplained. It's deterministic (identical `FAR`/`ELR` across
-dozens of repro instances, different pids, different sessions, `SMP=1` and `SMP=4` alike),
-which points at a kernel-side setup difference for CoW-forked (not-yet-exec'd) children
-rather than a genuine race, but the specific mechanism needs more tracing than done here —
-likely into exactly what code runs between the fork trampoline returning to userspace and
-the first real syscall, for a process that inherited its entire image via CoW rather than
-having just loaded it via the ELF loader.
+The grandchild ended up with **no mapping at all** for VAs its parent had resident and was
+about to hand it live pointers into. First touch → write to an unmapped page.
 
-## Propagation fix landed (real bug, but not this one)
+### Why it landed on `0x20120338` every time
 
-While chasing the above, a separate, genuine bug was found and fixed: `fork_process`'s
-lazy-region sharing (`crates/akuma-exec/src/process/mod.rs`, both the CoW-fork and legacy
-eager-copy branches) only used `cow_share_range` to copy pages **currently resident** in the
-parent — it never copied the parent's lazy-region *descriptors* themselves into a fresh
+busybox is a `static-pie` loaded at `0x1000_0000` with `code_end = 0x1012_3000`, so
+`ProcessMemory::new` computes `next_mmap = (code_end + 0x1000_0000) & !0xFFFF = 0x2012_0000`.
+The **first `mmap` any busybox process makes is musl's first malloc arena**, and it is
+*eager* (`MMAP_EAGER_MAX_PAGES = 16`, arena is 1 page), so it goes into `mmap_regions`:
+
+```
+[mmap] pid=121 len=0x1000 prot=0x3 flags=0x22 = 0x20120000 (eager)
+```
+
+The faulting instruction (`ELR=0x1004e8f0`, file offset `0x4e8f0` in `bootstrap/bin/busybox`)
+is a double-pointer-dereference write through a fixed global in `.data`:
+
+```
+adrp x0, 0x11f000       ; x0 = 0x1011f000
+ldr  x0, [x0, #0xf88]   ; x0 = *(0x1011ff88)   — PTR_A, fixed global in .data
+ldr  x0, [x0]           ; x0 = *(PTR_A)        — PTR_B = 0x20120030
+str  wzr, [x0, #0x308]  ; *(0x20120338) = 0    <-- faults
+```
+
+`PTR_B = 0x20120030` is not a wild value at all: it is a **perfectly valid heap pointer**,
+`0x30` into that first malloc arena, inherited through two forks. `0x20120338` is inside the
+same page. The grandchild simply had nothing mapped there.
+
+`ISS=0x46`/`0x47` (DFSC = level-2 translation fault, `WnR=1`) is exactly right for this: the
+whole 2 MB L2 block is absent in the grandchild, not merely permission-denied — which is why
+it never touched the CoW refcount machinery.
+
+### Direct confirmation
+
+With a temporary per-region trace in `fork_process`, one run of
+`( /bin/busybox cat /etc/hosts > /tmp/o0; echo $? > /tmp/rc0 ) &`:
+
+```
+[FORK-DBG] parent_pid=137 child_pid=140 ... mmap_regions=4     <- shell (ran the mmaps)
+[FORK-DBG]   mmap va=0x20120000 pages=1
+[FORK-DBG]   mmap va=0x20121000 pages=1
+[FORK-DBG]   mmap va=0x20122000 pages=2
+[FORK-DBG]   mmap va=0x20124000 pages=1
+[FORK-COW] shared 1090 pages
+
+[FORK-DBG] parent_pid=139 child_pid=141 ... mmap_regions=4     <- subshell (a CoW child)
+[FORK-DBG]   mmap va=0x20120000 pages=0                        <- extent gone
+[FORK-DBG]   mmap va=0x20121000 pages=0
+[FORK-DBG]   mmap va=0x20122000 pages=0
+[FORK-DBG]   mmap va=0x20124000 pages=0
+[FORK-COW] shared 1085 pages                                   <- exactly 5 fewer: 1+1+2+1
+
+[DA-MISS] pid=141 ppid=139 va=0x20120338 lr_count=7 parent_lr=7 parent_has_va=false
+[Fault] Data abort from EL0 at FAR=0x20120338, ELR=0x1004e8f0, ISS=0x47
+[Fault] Process 141 (/bin/busybox) SIGSEGV after 0.01s
+```
+
+`1090 - 1085 = 5` — precisely the four lost regions' five pages.
+
+Note the `parent_has_va=false` in `[DA-MISS]`: that diagnostic only consults
+`LAZY_REGION_TABLE` (`lazy_region_lookup_for_pid`). These are **eager** regions, so it was
+never going to report them, and reading it as "nobody ever reserved this VA" is what sent the
+first pass at this investigation looking for a phantom wild pointer. The VA was validly
+reserved — by the grandparent, as an eager mmap.
+
+## The fix
+
+`mmap_regions` is now `Vec<MmapRegion>` (`crates/akuma-exec/src/process/types.rs`) with the
+extent recorded **independently of frame ownership**:
+
+```rust
+pub struct MmapRegion {
+    pub start_va: usize,
+    pub pages: usize,            // authoritative extent — survives CoW fork
+    pub frames: Vec<PhysFrame>,  // frames this process owns; EMPTY when CoW-inherited
+}
+```
+
+- `MmapRegion::owned(va, frames)` — the process that called `mmap`; `pages == frames.len()`.
+- `MmapRegion::inherited(va, pages)` — a CoW-forked child; extent kept, owns no frames.
+- `contains(va)` / `len_bytes()` use `pages`; `frame_for(va)` consults `frames` and returns
+  `None` for an inherited region (it needs a real PA and there isn't one).
+
+Call sites split along that line:
+
+| site | uses |
+|---|---|
+| `fork_process` CoW share + RO demotion (`process/mod.rs`) | `pages` |
+| `fork_process` sibling-thread eager mmap replication | `pages` |
+| `sys_munmap` region sizing + split (`syscall/mem.rs`) | `pages` |
+| `sys_mremap` "is this mapped" probe | `pages` (`contains`) |
+| `remove_mmap_region` VA-range reclaim (`process/children.rs`) | `pages` |
+| `[DP-eager]` fault fallback re-map (`exceptions.rs`) | `frames` (`frame_for`) |
+| MAP_SHARED writeback / `msync` | `frames` |
+
+The child-derivation is now a named helper,
+`inherit_mmap_regions_for_cow_child(&[MmapRegion]) -> Vec<MmapRegion>`
+(`crates/akuma-exec/src/process/children.rs`), so the invariant that used to be lost inside a
+`.map()` closure is testable on the host.
+
+Two consequential bugs fell out of the same root and are fixed with it:
+
+- **The parent was never demoted to RO for an inherited region.** `demote_range_to_ro(...,
+  parent_frames.len())` demoted 0 pages, so a subshell's writes went straight through to a
+  page it still shared CoW with its own child, silently clobbering the child's snapshot.
+- **`munmap` on an inherited region unmapped nothing** while still recycling the VA range
+  into `free_regions` for `alloc_mmap` to hand back out. `sys_munmap` now iterates `pages`
+  VAs and, for pages with no owned frame recorded, takes the PA from the live PTE via
+  `unmap_and_free_page_no_flush` (which also handles the case where a CoW write fault already
+  swapped in a private frame — reading a stale PA out of a recorded frame list would have
+  been a double-free).
+
+### Verification
+
+Same repro, same build, after the fix:
+
+```
+[FORK-DBG] parent_pid=118 child_pid=120 ... mmap_regions=4     <- subshell (a CoW child)
+[FORK-DBG]   mmap va=0x20120000 pages=1 owned=0                <- extent kept, owns nothing
+[FORK-DBG]   mmap va=0x20121000 pages=1 owned=0
+[FORK-DBG]   mmap va=0x20122000 pages=2 owned=0
+[FORK-DBG]   mmap va=0x20124000 pages=1 owned=0
+[FORK-COW] shared 1090 pages                                   <- same as the owning parent
+[syscall] execve(path="/bin/busybox", args=["wc","-c","/bin/busybox"]) PID 120
+```
+
+No `[DA-MISS]`, no `[WILD-DA]`, no SIGSEGV; the grandchild reaches `execve` and runs:
+
+```sh
+~ # ( /bin/busybox wc -c /bin/busybox > /tmp/o0; echo $? > /tmp/rc0 ) &
+~ # cat /tmp/rc0
+0
+~ # cat /tmp/o0
+1116408 /bin/busybox
+```
+
+## Propagation fix (real bug, separate from the crash)
+
+While chasing the above, a genuine second bug was found and fixed: `fork_process`'s
+lazy-region sharing only used `cow_share_range` to copy pages **currently resident** in the
+parent — it never copied the parent's lazy-region *descriptors* into a fresh
 `LAZY_REGION_TABLE` entry for the child. A lazy region the parent registered but hadn't
-fully touched yet (a `.data`/`.bss` page nobody had written to since exec, a stack page
-deeper than the parent's current usage) would have nothing resident to share, and the child
-would end up with **no lazy-region coverage for that VA at all** — not resident (nothing
-shared) and not lazy (no entry to demand-page from) — a real, if narrower, path to the same
-class of unconditional SIGSEGV on first touch. A single fork off a long-lived, fully
-warmed-up process rarely hits this (everything relevant is usually already resident by
-then); forking off a process that was itself freshly forked (exactly this bug report's
-shell-subshell shape) is exactly where it would bite hardest.
+touched yet (a `.data`/`.bss` page nobody wrote to since exec, a stack page deeper than the
+parent's current usage) had nothing resident to share, so the child got **no coverage for
+that VA at all** — not resident, not lazy — an unconditional SIGSEGV on first touch.
 
-Fixed by extracting a `propagate_lazy_regions_to_child(parent_pid, child_pid)` helper
-(`crates/akuma-exec/src/process/children.rs`) that copies every `LazyRegion` descriptor
-(VA, size, flags, and `LazySource` — including file-backed sources with their
-path/inode/offset) from the parent's table entry into a fresh entry for the child, called
-from both `fork_process` branches. Unit-tested directly (no address-space/TTBR0 mocking
-needed, since the helper only touches the `LAZY_REGION_TABLE` global) in
-`crates/akuma-exec/src/process/children.rs`'s `lazy_region_propagation_tests` module: copies
-all parent regions including a `LazySource::File` variant, a no-regions-to-copy no-op case,
-and a case confirming it doesn't clobber a child's pre-existing entry at a different VA.
+Fixed by `propagate_lazy_regions_to_child(parent_pid, child_pid)`
+(`crates/akuma-exec/src/process/children.rs`), called from both `fork_process` branches,
+which copies every `LazyRegion` descriptor (VA, size, flags, `LazySource` — including
+file-backed sources with their path/inode/offset) into a fresh entry for the child.
 
-**This fix is real and worth keeping, but it does not explain the crash in this doc.**
-Verified directly: after landing it, `[DA-MISS]` for the still-crashing pid showed
-`lr_count=6 parent_lr=6` (the fix's propagation working exactly as intended — all 6 of the
-parent's regions correctly copied) alongside the unchanged `parent_has_va=false` — the
-crashing VA was never registered by anyone in the lineage, so nothing was there to fail to
-propagate.
+**This is worth keeping but it is not the crash in this doc.** Verified directly: after
+landing it, `[DA-MISS]` for the still-crashing pid showed `lr_count=6 parent_lr=6` (all 6
+parent regions propagated correctly) and the crash was completely unchanged — because the
+faulting VA belonged to an *eager* region, which this code path never touches.
 
-## Evidence preserved
+## Tests
 
-Full kernel log capturing the crash (dozens of repro instances across curl/wget, N=1/2/4,
-SMP=1/4): `/private/tmp/claude-502/.../scratchpad/bkl_concurrent_exec_segv.log` (session-local
-scratchpad, not committed — regenerate via the repro below if needed).
+Host-testable (`cargo test --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)`):
 
-## Reproduction
+- `crates/akuma-exec/src/process/children.rs::mmap_region_inheritance_tests` — extent survives
+  one CoW fork (`pages` kept, `frames` empty), survives a *second* fork with a non-zero range
+  (the actual regression, asserting the reported `0x20120338` still lands inside the
+  grandchild's region), and `frame_for` declines on an inherited region.
+- `crates/akuma-exec/src/process/children.rs::lazy_region_propagation_tests` — the
+  propagation fix above.
 
-```sh
-# boot devbox-smoltcp at any SMP, then over ssh:
-( wget -q -O /tmp/t0.bin http://10.0.2.2:8899/<any-file-served-locally>; echo $? > /tmp/t0.rc ) &
-sleep 5
-cat /tmp/t0.rc   # 139 (128 + SIGSEGV), t0.bin absent
-```
+## Follow-up
 
-Kernel log shows, for the crashing PID:
-
-```
-[DA-MISS] pid=<N> ppid=<P> va=0x20120338 lr_count=<k> parent_lr=<k> parent_has_va=false
-[DP] no lazy region for FAR=0x20120338 pid=<N> (pid has <k> lazy regions)
-[WILD-DA] pid=<N> FAR=0x20120338 ELR=0x1004e8f0 last_sc=18446744073709551615
-[Fault] Data abort from EL0 at FAR=0x20120338, ELR=0x1004e8f0, ISS=0x46
-[Fault] Process <N> (/bin/busybox) SIGSEGV after 0.00s
-```
-
-`FAR` and `ELR` are identical across every repro instance (different PIDs, different
-sessions, SMP=1 or SMP=4) — this is fully deterministic, not a timing-dependent race.
-
-## Workaround applied (test harness only)
-
-`scripts/bkl_smp_regimen/payload/job.sh` used `( cmd; echo $? > rc; echo done > sentinel ) &`
-to background each parallel worker — hitting this bug on every single invocation once real
-commands (`curl`, `sha256sum`, `cp`) replaced the trivial ones it started with. Fixed by
-writing each worker out as its own tiny script and backgrounding a *single* command instead:
-
-```sh
-{
-    echo "curl -s -o $D/d$i.bin $URL"
-    echo "echo \$? > $D/d$i.rc"
-    echo "echo done > $D/w$i.done"
-} > $D/worker$i.sh
-sh $D/worker$i.sh &
-```
-
-`sh $D/workerN.sh &` is one simple command with nothing after it in the backgrounding shell,
-so it reaches exec via a direct fork-then-exec (matching the "plain `wget &` works" case
-above). Verified clean (SMP=1, all digests exact, 0 SIGSEGV) before re-running the full
-SMP=4 campaign.
-
-## What remains
-
-- **The actual bug is still open.** Root-cause where `PTR_A` (the fixed global at
-  `0x1011ff88` in busybox's `.data`) gets its value, and why dereferencing it yields
-  `0x20120030` specifically for a CoW-forked-but-not-yet-exec'd child. Concretely: trace
-  what runs between the fork trampoline (`crates/akuma-exec/src/process/mod.rs`,
-  `trampoline ENTRY`) returning to userspace and the process's first real syscall, for a
-  process whose entire image arrived via CoW-fork rather than the ELF loader — that's the
-  code window this crash lives in, not `replace_image`/execve as first assumed.
-- Fix belongs in the kernel, not just the test harness — **any** shell pipeline or script
-  anywhere in Akuma that backgrounds a multi-statement subshell around a real command hits
-  this today (confirmed: not specific to `curl`/`wget`, not specific to networking).
-- Once fixed, the `scripts/bkl_smp_regimen/payload/job.sh` workaround (writing each worker
-  out as its own script, backgrounded as a single `sh workerN.sh &` rather than an inline
-  `( cmd; ... ) &`) can most likely be reverted to the simpler inline-subshell form, though
-  there's no urgency to do so.
-- The `propagate_lazy_regions_to_child` fix (previous section) should stay regardless of
-  what happens with the main bug — it's an independently real correctness gap.
+`scripts/bkl_smp_regimen/payload/job.sh` still works around this by writing each parallel
+worker out as its own script and backgrounding a single `sh workerN.sh &` instead of an inline
+`( cmd; ... ) &`. That workaround is now unnecessary and can be reverted to the simpler inline
+form whenever the SMP campaign is next touched; it is harmless as-is, so there is no urgency.
