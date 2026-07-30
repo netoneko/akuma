@@ -9,10 +9,12 @@ Phase 4 of [BKL_FINE_GRAINED_LOCKING_PLAN.md](BKL_FINE_GRAINED_LOCKING_PLAN.md),
 `[BKL] stuck` regression is ROOT-CAUSED AND FIXED (§9: per-thread dropped-window ledger; 0 stuck in
 the re-run regimen). Phase 2c's `unlinkat` conversion is DONE (§12, 2026-07-30): the §11.6
 attribution's 72.6% culprit dropped to **absent**, and the SMP=4 `[BKL] stuck` storm collapsed
-598–704 → 0. Remaining 2b–2d (`openat`/`close`/`dup`/`fcntl`, the rest of the mutating syscalls,
-`chdir` family) NOT started — §12's attribution now names `openat` (36.6%, Phase 2b) as the
-surfaced next target. The two pre-existing kernel bugs from §11 stand as before (thread-slot
-reclaim FIXED §11.7; `wait`/SIGCHLD still open §11.3).**
+598–704 → 0. Phase 2b first target `openat` is CONVERTED + boot-verified (§13, 2026-07-30): the
+§12.2 attribution's 36.6% surfaced next target now runs BKL-free through `O_CREAT`/`O_TRUNC`/dirfd;
+the SMP=4 `bkl-profile` regimen to confirm the share moves is the remaining confirmation. Remaining
+2b (`close`/`dup`/`fcntl`, rest of 2c/2d) NOT started — to be evidence-led off the next attribution.
+The two pre-existing kernel bugs from §11 stand as before (thread-slot reclaim FIXED §11.7;
+`wait`/SIGCHLD still open §11.3).**
 
 ---
 
@@ -253,6 +255,10 @@ Not caused by this work; recorded so they aren't re-attributed:
 ## 7. Remaining work
 
 1. **Phase 2b** — `sys_openat`, `sys_close`, `sys_dup`, `sys_dup3`, `sys_fcntl`.
+   **First target `openat` CONVERTED + boot-verified 2026-07-30 — see §13** (the §12.2 36.6%
+   surfaced next target now runs BKL-free through `O_CREAT`/`O_TRUNC`/dirfd; SMP=4 regimen
+   re-run to confirm the share moves is the remaining confirmation). The rest of 2b
+   (`close`/`dup`/`dup3`/`fcntl`) is not started — to be evidence-led off the next attribution.
 2. **Phase 2c** — the mutating syscalls (`mkdirat`, `unlinkat`, `renameat2`, `symlinkat`,
    `linkat`, `readlinkat`, `fchmodat`, `fchmod`, `truncate`, `ftruncate`, `fallocate`).
    These take the ext2 **write** guard, so they are the real test of §3. Fresh evidence
@@ -807,6 +813,12 @@ writes don't maintain htree indexes.
 
 - **`wait` still hangs** (§11.3). Unfixed — it needs SIGCHLD delivery, which is a larger piece
   of work than the reclaim fix and touches the signal path rather than the scheduler.
+- **Phase 2b first target `openat` — CONVERTED, regimen re-run pending.** §12.2's attribution
+  named `openat` (`tag=56`, 36.6%) the next-largest holder after `unlinkat` vanished; §13
+  (2026-07-30) wraps its on-disk work in a `VfsBklGuard` window and boot-verifies it. The
+  decisive confirmation — re-running the §11.1 regimen on the `bkl-profile` build to see the
+  36.6% share move/absent, the analog of §11.6/§12.2 — is the remaining step; it needs the
+  §11.1 devbox-smoltcp harness and was not re-run for this landing.
 - ~~**Phase 2c**, first target `unlinkat`. Land the §3 write-guard hardening with it, and
   re-run this regimen to confirm the 72.6% moves.~~ **DONE — see §12 (2026-07-30).** The 72.6%
   did not just move, it vanished; the SMP=4 `[BKL] stuck` storm went with it. The remaining 2c
@@ -845,8 +857,10 @@ deletion takes is the §3-hardened one. Zero-cost no-op off `smp-shared` + `no-b
 | regimen wall-clock | 136 s (§11.7 lean) | 136 s |
 
 Post-fix cumulative attributed spins (185.9 M total, same profiler): `irq/sched` `tag=501`
-53.9%, `openat` `tag=56` **36.6%**, everything else <2%. `openat` is the surfaced next target —
+ 53.9%, `openat` `tag=56` **36.6%**, everything else <2%. `openat` is the surfaced next target —
 **Phase 2b**, not 2c; the rest of the 2c list is now evidence-led rather than principle-led.
+**Converted + boot-verified — see §13 (2026-07-30);** the SMP=4 regimen re-run to confirm the
+36.6% share moves is the remaining confirmation.
 
 ### 12.3 Correctness was verified, not assumed
 
@@ -887,3 +901,71 @@ across sessions. The two decisive, profiler-independent signals: the `[BKL] stuc
 *presence* in the attribution (absent, under the same profiler on the same workload where it was
 72.6%). §11.6's prediction — *"converting `unlinkat` alone should recover the large majority of
 the available win"* — is confirmed; for this workload it recovered all of it.
+
+---
+
+## 13. Phase 2b first target (`openat`) — CONVERTED + boot-verified, 2026-07-30
+
+§12.2's attribution named `openat` (syscall 56, `tag=56`) the next-largest holder once `unlinkat`
+vanished — 36.6% of attributed cross-core BKL wait, second only to `irq/sched`. §11.8 made it
+Phase 2b's first target. Converted; boot-verified. The SMP=4 `bkl-profile` regimen re-run that
+would confirm the 36.6% share moves (the analog of §11.6 → §12.2) is the remaining confirmation and
+was not re-run for this landing — it needs the §11.1 devbox-smoltcp harness.
+
+### 13.1 The change
+
+`sys_openat` (`src/syscall/fs.rs`) now takes a `VfsBklGuard` window across its on-disk work,
+mirroring the placement §4 established for the path-based read syscalls and §12 used for
+`unlinkat`. The window opens **after** the cross-core forward arm — exactly like `sys_newfstatat`
+(§4) — because that arm marshals through the BKL-protected bounce and must keep the lock. It covers
+the existence probes, `O_CREAT` create / `O_TRUNC` truncate (both `crate::fs::write_file`; truncating
+a large file frees its blocks under the ext2 write guard, the same class of long hold §7.2 measured
+at ~40 s for an `unlink`), `chmod`, and the fd allocation.
+
+Deliberately **outside** the window (i.e. still BKL-held): the user-string copy, the dirfd base-path
+lookup (fd-table only, no disk I/O — early `EBADF` returns must not pay for a BKL drop), the
+`/dev/null`/`/dev/zero`/`/dev/urandom`/`/dev/dsp`/`/dev/net/tap0` device-node fast paths (allocate
+a synthetic fd, do no ext2 I/O), `/proc/self/exe`, and `resolve_symlinks` (runs before the device
+checks; for the regimen's simple absolute paths it touches no symlinks, and reordering it would
+change the `/proc/self/exe` resolution order). The forward arm and an active guard never coexist in
+one binary anyway — `build.rs` asserts `kernel_smp` (multikernel, where the forward arm compiles)
+and `kernel_smp_shared` (where the guard's body is non-empty) are mutually exclusive — but the
+"forward arm outside the window" placement keeps the §4 invariant consistent under any future cfg
+combination. Zero-cost no-op off `smp-shared` + `no-bkl-vfs`.
+
+### 13.2 Verification — boot self-test (the part actually run)
+
+New `test_openat` (`src/process_tests.rs`), structurally identical to §12's `test_unlinkat`: drives
+the real entry point via `handle_syscall(OPENAT, …)`, pinning what the conversion must preserve —
+
+| # | case | pins |
+|---|---|---|
+| 1 | `O_CREAT\|O_WRONLY` on absent file | file appears, empty — create happens inside the window |
+| 2 | `O_TRUNC\|O_WRONLY` on non-empty file | file emptied — the long truncate hold runs BKL-free |
+| 3 | dirfd-relative (`fd 7 → …/sub`) | openat must NOT ignore dirfd (the rm-recursion family) |
+| 4 | `AT_FDCWD`-relative (`cwd=/tmp`) | cwd-relative resolution |
+| 5 | `/dev/null` (`O_RDWR`) | device fast path still allocates a usable fd, pre-window |
+| 6 | dirfd `999` (unopen) | `EBADF` early-return path stays balanced |
+| 7 | missing target, no `O_CREAT` | `ENOENT` error path *through* the dropped window |
+
+**SMP=2 boot, `smp-shared` + `no-bkl-vfs`:** `[Test] openat PASSED (7 cases)`. Full suite 221 PASSED,
+the only 2 failures the standing §6 pre-existing ones, 0 PANIC / WILD / stale dropped-window heals,
+0 `[BKL] stuck` lines attributed to `tag=56`. Default / `release-smp-shared` / `bkl-profile` builds
+all build; clippy clean; host workspace suite green.
+
+A note on what the test deliberately does **not** assert: a negative non-`AT_FDCWD` dirfd. `sys_openat`
+(unlike `sys_unlinkat:2227`, which returns `EBADF`) falls through to base `"/"` (`fs.rs:1237`) — i.e.
+it resolves the path against root rather than rejecting the dirfd. That is a pre-existing divergence
+from POSIX/unlinkat, it runs before the guard opens, and it is out of scope for this carve-out (which
+preserves behavior, not changes it). Filed here so it is not re-discovered as a regression.
+
+### 13.3 What remains (the confirmation this landing does not claim)
+
+§12 marked `unlinkat` DONE only because the §11.6 regimen confirmed the 72.6% dropped to *absent* and
+the stuck storm went 598–704 → 0. `openat` has the *conversion* and the *correctness* half (boot
+self-test green, no corruption) but not yet the *contention* half: re-run the §11.1 regimen on the
+`bkl-profile` build and check (a) `openat` `tag=56`'s 36.6% share moves/absent, and (b) the
+`[BKL] stuck` count (the profiler-independent counter). Expectation, by analogy with §12.2: the share
+should largely vanish, since `O_CREAT`/`O_TRUNC` of the output files is the on-disk work the `net4`
+phase drives through `openat`. Until that runs, this conversion is argued-correct and
+boot-demonstrated, not contention-demonstrated.

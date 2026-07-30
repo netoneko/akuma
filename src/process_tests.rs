@@ -621,6 +621,11 @@ pub fn run_all_tests() {
     // pins what the Phase 2c VfsBklGuard conversion (carve-out doc §12) must preserve.
     test_unlinkat();
 
+    // sys_openat entry point: O_CREAT/O_TRUNC, dirfd resolution, /dev/null fast path,
+    // errno contract — pins what the Phase 2b VfsBklGuard conversion (carve-out doc §13)
+    // must preserve.
+    test_openat();
+
     // Phantom-SVC tripwire: runs LAST so it covers every EL0 trap the suite above
     // generated (fork/exec/signal/mmap stress). A nonzero count means an EC_SVC64
     // trap arrived whose insn@ELR-4 was not an `svc` — either stale I-cache or the
@@ -1892,6 +1897,169 @@ fn test_unlinkat() {
     } else {
         crate::safe_print!(64, "[Test] unlinkat FAILED ({} of 8 cases)\n", fails);
         panic!("test_unlinkat: {fails} of 8 cases failed");
+    }
+}
+
+/// `sys_openat` (syscall 56) — O_CREAT create, O_TRUNC truncate, dirfd-relative open,
+/// the `/dev/null` fast path, and the errno contract.
+///
+/// Drives the real syscall ENTRY point via `handle_syscall`. Pins the behaviors the Phase
+/// 2b `VfsBklGuard` conversion (`src/syscall/fs.rs`, carve-out doc §13) must preserve:
+/// the on-disk create/truncate happens inside the dropped-BKL window and must still take
+/// effect (file appears / is emptied), the dirfd-relative case (openat used to ignore
+/// dirfd — same family as the unlinkat regression) must resolve against fd 7, the
+/// `/dev/null` early return keeps the BKL and still allocates a usable fd, and every
+/// error path (EBADF before the window, ENOENT inside it) leaves the window balanced.
+fn test_openat() {
+    use crate::syscall::{handle_syscall, nr, BYPASS_VALIDATION};
+    use akuma_exec::process::{
+        register_process, unregister_process, register_thread_pid, unregister_thread_pid,
+        FileDescriptor, KernelFile,
+    };
+    use akuma_exec::process::open_flags;
+    use akuma_exec::threading::current_thread_id;
+    use core::sync::atomic::Ordering;
+
+    const EBADF: u64 = (-9i64) as u64;
+    const ENOENT: u64 = (-2i64) as u64;
+    const AT_FDCWD: i32 = -100;
+    const ROOT: &str = "/tmp/openat_selftest";
+
+    // Best-effort clean slate (a crashed prior run may have left the tree).
+    let _ = crate::fs::remove_file(&format!("{ROOT}/creat.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/trunc.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/sub/rel.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/cwd.txt"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
+    let _ = crate::fs::remove_dir(ROOT);
+    let _ = crate::fs::create_dir(ROOT);
+    let _ = crate::fs::create_dir(&format!("{ROOT}/sub"));
+
+    // Register a process whose cwd is /tmp (AT_FDCWD-relative) and whose fd 7 names the
+    // `sub` directory (the dirfd-relative case). cwd=/tmp so "openat_selftest/..." resolves.
+    let tid = current_thread_id();
+    let pid: u32 = 7702;
+    let mut proc = make_test_process(pid);
+    proc.cwd = "/tmp".to_string();
+    proc.fds.table.lock().insert(7, FileDescriptor::File(KernelFile::new(format!("{ROOT}/sub"), 0)));
+    register_process(pid, proc);
+    register_thread_pid(tid, pid);
+
+    // Null-terminate a path into a stack buffer the syscall's copy_from_user_str can read
+    // (BYPASS_VALIDATION lets the kernel address stand in for a user VA — same trick as
+    // test_unlinkat).
+    let cstr = |s: &str| -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::from(s.as_bytes());
+        v.push(0);
+        v
+    };
+    let openat = |dirfd: i32, path: &[u8], flags: u32, mode: u32| -> u64 {
+        handle_syscall(nr::OPENAT, &[dirfd as u64, path.as_ptr() as u64, u64::from(flags), u64::from(mode), 0, 0])
+    };
+    let close = |fd: u64| { handle_syscall(nr::CLOSE, &[fd, 0, 0, 0, 0, 0]); };
+
+    BYPASS_VALIDATION.store(true, Ordering::Release);
+    let mut fails = 0u32;
+
+    // 1. O_CREAT|O_WRONLY on an absent file -> creates it empty.
+    let p = cstr(&format!("{ROOT}/creat.txt"));
+    let r = openat(AT_FDCWD, &p, open_flags::O_WRONLY | open_flags::O_CREAT, 0o644);
+    if (r as i64) < 0 || !crate::fs::exists(&format!("{ROOT}/creat.txt"))
+        || crate::fs::file_size(&format!("{ROOT}/creat.txt")).unwrap_or(1) != 0
+    {
+        fails += 1;
+        crate::safe_print!(96, "[Test] openat O_CREAT FAILED r={} exists={} size={}\n",
+            r, crate::fs::exists(&format!("{ROOT}/creat.txt")),
+            crate::fs::file_size(&format!("{ROOT}/creat.txt")).unwrap_or(0));
+    } else {
+        close(r);
+    }
+
+    // 2. O_TRUNC|O_WRONLY on a non-empty existing file -> empties it.
+    let _ = crate::fs::write_file(&format!("{ROOT}/trunc.txt"), b"nonempty-payload");
+    let p = cstr(&format!("{ROOT}/trunc.txt"));
+    let r = openat(AT_FDCWD, &p, open_flags::O_WRONLY | open_flags::O_TRUNC, 0);
+    if (r as i64) < 0 || crate::fs::file_size(&format!("{ROOT}/trunc.txt")).unwrap_or(0) != 0 {
+        fails += 1;
+        crate::safe_print!(96, "[Test] openat O_TRUNC FAILED r={} size={}\n",
+            r, crate::fs::file_size(&format!("{ROOT}/trunc.txt")).unwrap_or(0));
+    } else {
+        close(r);
+    }
+
+    // 3. dirfd-relative (fd 7 -> .../sub): openat must NOT ignore dirfd. Creates sub/rel.txt.
+    let p = cstr("rel.txt");
+    let r = openat(7, &p, open_flags::O_WRONLY | open_flags::O_CREAT, 0o644);
+    if (r as i64) < 0 || !crate::fs::exists(&format!("{ROOT}/sub/rel.txt")) {
+        fails += 1;
+        crate::safe_print!(96, "[Test] openat dirfd FAILED r={} exists={}\n",
+            r, crate::fs::exists(&format!("{ROOT}/sub/rel.txt")));
+    } else {
+        close(r);
+    }
+
+    // 4. AT_FDCWD-relative (cwd=/tmp) -> creates openat_selftest/cwd.txt.
+    let p = cstr("openat_selftest/cwd.txt");
+    let r = openat(AT_FDCWD, &p, open_flags::O_WRONLY | open_flags::O_CREAT, 0o644);
+    if (r as i64) < 0 || !crate::fs::exists(&format!("{ROOT}/cwd.txt")) {
+        fails += 1;
+        crate::safe_print!(96, "[Test] openat cwd-rel FAILED r={} exists={}\n",
+            r, crate::fs::exists(&format!("{ROOT}/cwd.txt")));
+    } else {
+        close(r);
+    }
+
+    // 5. /dev/null fast path — early-returns before the window (no ext2 I/O) but must
+    //    still allocate a usable fd. Pins that the guard insertion didn't break the
+    //    device-node arms.
+    let p = cstr("/dev/null");
+    let r = openat(AT_FDCWD, &p, open_flags::O_RDWR, 0);
+    if (r as i64) < 0 {
+        fails += 1;
+        crate::safe_print!(96, "[Test] openat /dev/null FAILED r={}\n", r);
+    } else {
+        close(r);
+    }
+
+    // 6. EBADF: dirfd in valid range but not present in the fd table. (Negative
+    //    non-AT_FDCWD dirfds are NOT rejected by sys_openat — unlike sys_unlinkat it
+    //    falls through to base="/" — so that case is deliberately omitted here; it is
+    //    a pre-existing divergence, runs before the guard opens, and is out of scope
+    //    for the carve-out. This case validates the early-return EBADF path that DOES
+    //    fire, and that it stays balanced.)
+    let p = cstr("anything");
+    let r = openat(999, &p, open_flags::O_RDONLY, 0);
+    if r != EBADF {
+        fails += 1;
+        crate::safe_print!(64, "[Test] openat unopen-dirfd FAILED r={} (want EBADF)\n", r);
+    }
+
+    // 7. ENOENT: missing target, no O_CREAT. Exercises the error path THROUGH the
+    //    dropped-BKL window (the guard must stay balanced on this return).
+    let p = cstr(&format!("{ROOT}/nope.txt"));
+    let r = openat(AT_FDCWD, &p, open_flags::O_RDONLY, 0);
+    if r != ENOENT {
+        fails += 1;
+        crate::safe_print!(64, "[Test] openat missing FAILED r={} (want ENOENT)\n", r);
+    }
+
+    BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    // Cleanup (best-effort; the test verdict is the case results above, not this).
+    let _ = crate::fs::remove_file(&format!("{ROOT}/creat.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/trunc.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/sub/rel.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/cwd.txt"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
+    let _ = crate::fs::remove_dir(ROOT);
+
+    if fails == 0 {
+        crate::safe_print!(128, "[Test] openat PASSED (7 cases: O_CREAT/O_TRUNC/dirfd/cwd-rel/dev-null/EBADF/ENOENT)\n");
+    } else {
+        crate::safe_print!(64, "[Test] openat FAILED ({} of 7 cases)\n", fails);
+        panic!("test_openat: {fails} of 7 cases failed");
     }
 }
 
