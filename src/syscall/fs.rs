@@ -1814,31 +1814,40 @@ pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> u64 {
         Err(e) => return e,
     };
 
-    let path = if raw_path.starts_with('/') {
-        crate::vfs::canonicalize_path(&raw_path)
-    } else {
-        let base = if dirfd == -100 {
-            if let Some(proc) = akuma_exec::process::current_process() {
-                proc.cwd.clone()
-            } else {
-                return EBADF;
-            }
-        } else if dirfd >= 0 {
-            if let Some(proc) = akuma_exec::process::current_process() {
-                if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                    f.path
-                } else {
-                    return EBADF;
-                }
-            } else {
-                return EBADF;
-            }
-        } else {
-            return EBADF;
+    // Build the dirfd-relative base path (fd-table lookup only, no disk I/O) before
+    // entering the VFS BKL window — mirrors sys_unlinkat/sys_mkdirat/sys_renameat.
+    let base: Option<String> = if raw_path.starts_with('/') {
+        None
+    } else if dirfd == -100 {
+        match akuma_exec::process::current_process() {
+            Some(proc) => Some(proc.cwd.clone()),
+            None => return EBADF,
+        }
+    } else if dirfd >= 0 {
+        let proc = match akuma_exec::process::current_process() {
+            Some(p) => p,
+            None => return EBADF,
         };
-        crate::vfs::resolve_path(&base, &raw_path)
+        match proc.get_fd(dirfd as u32) {
+            Some(akuma_exec::process::FileDescriptor::File(f)) => Some(f.path),
+            _ => return EBADF,
+        }
+    } else {
+        return EBADF;
     };
 
+    // `resolve_symlinks` does a real on-disk symlink-target lookup (same class of
+    // real lookup as renameat2's RENAME_NOREPLACE `exists` probe, §14.2), and
+    // `crate::vfs::chmod` takes the ext2 write guard for the on-disk mode-bits
+    // update — attribution named `fchmodat` (syscall 53) alongside `mkdirat` as the
+    // next-largest untouched Phase 2c holders: docs/archive/BKL_VFS_CARVE_OUT.md
+    // §14.6.
+    let _vfs_bkl = VfsBklGuard::new();
+
+    let path = match base {
+        Some(b) => crate::vfs::resolve_path(&b, &raw_path),
+        None => crate::vfs::canonicalize_path(&raw_path),
+    };
     let path = crate::vfs::resolve_symlinks(&path);
 
     if path == "/dev/null" || path == "/dev/zero" {
@@ -2174,29 +2183,39 @@ pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, _mode: u32) -> u64 {
         Err(e) => return e,
     };
 
-    let path = if raw_path.starts_with('/') {
-        crate::vfs::canonicalize_path(&raw_path)
-    } else {
-        let base = if dirfd == -100 {
-            if let Some(proc) = akuma_exec::process::current_process() {
-                proc.cwd.clone()
-            } else {
-                return EBADF;
-            }
-        } else if dirfd >= 0 {
-            if let Some(proc) = akuma_exec::process::current_process() {
-                if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                    f.path
-                } else {
-                    return EBADF;
-                }
-            } else {
-                return EBADF;
-            }
-        } else {
-            return EBADF;
+    // Build the dirfd-relative base path (fd-table lookup only, no disk I/O) before
+    // entering the VFS BKL window — mirrors sys_unlinkat/sys_renameat: early-return
+    // EBADF paths must not pay for a BKL drop/reacquire when no on-disk work will
+    // happen.
+    let base: Option<String> = if raw_path.starts_with('/') {
+        None
+    } else if dirfd == -100 {
+        match akuma_exec::process::current_process() {
+            Some(proc) => Some(proc.cwd.clone()),
+            None => return EBADF,
+        }
+    } else if dirfd >= 0 {
+        let proc = match akuma_exec::process::current_process() {
+            Some(p) => p,
+            None => return EBADF,
         };
-        crate::vfs::resolve_path(&base, &raw_path)
+        match proc.get_fd(dirfd as u32) {
+            Some(akuma_exec::process::FileDescriptor::File(f)) => Some(f.path),
+            _ => return EBADF,
+        }
+    } else {
+        return EBADF;
+    };
+
+    // `crate::fs::create_dir` takes the ext2 write guard for the on-disk inode
+    // allocation + directory-entry write — attribution named `mkdirat` (syscall 34)
+    // the next-largest untouched Phase 2c holder after `renameat`:
+    // docs/archive/BKL_VFS_CARVE_OUT.md §14.6.
+    let _vfs_bkl = VfsBklGuard::new();
+
+    let path = match base {
+        Some(b) => crate::vfs::resolve_path(&b, &raw_path),
+        None => crate::vfs::canonicalize_path(&raw_path),
     };
 
     if crate::config::SYSCALL_DEBUG_IO_ENABLED {

@@ -639,6 +639,13 @@ pub fn run_all_tests() {
     // must preserve.
     test_renameat();
 
+    // sys_mkdirat/sys_fchmodat entry points: dirfd resolution, EBADF-before-window
+    // early return, errno contract — pins what the Phase 2c VfsBklGuard conversions
+    // (carve-out doc §14.6, the two next-largest untouched holders after renameat)
+    // must preserve.
+    test_mkdirat();
+    test_fchmodat();
+
     // Phantom-SVC tripwire: runs LAST so it covers every EL0 trap the suite above
     // generated (fork/exec/signal/mmap stress). A nonzero count means an EC_SVC64
     // trap arrived whose insn@ELR-4 was not an `svc` — either stale I-cache or the
@@ -2227,6 +2234,244 @@ fn test_renameat() {
     } else {
         crate::safe_print!(64, "[Test] renameat FAILED ({} of 6 cases)\n", fails);
         panic!("test_renameat: {fails} of 6 cases failed");
+    }
+}
+
+fn test_mkdirat() {
+    use crate::syscall::{handle_syscall, nr, BYPASS_VALIDATION};
+    use akuma_exec::process::{
+        register_process, unregister_process, register_thread_pid, unregister_thread_pid,
+        FileDescriptor, KernelFile,
+    };
+    use akuma_exec::threading::current_thread_id;
+    use core::sync::atomic::Ordering;
+
+    const ENOENT: u64 = (-2i64) as u64;
+    const EEXIST: u64 = (-17i64) as u64;
+    const EBADF: u64 = (-9i64) as u64;
+    const AT_FDCWD: i32 = -100;
+    const ROOT: &str = "/tmp/mkdirat_selftest";
+
+    // Best-effort clean slate (a crashed prior run may have left the tree).
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/abs_dir"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/rel_dir"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub/dirfd_dir"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
+    let _ = crate::fs::remove_dir(ROOT);
+    let _ = crate::fs::create_dir(ROOT);
+    let _ = crate::fs::create_dir(&format!("{ROOT}/sub"));
+
+    // Same shape as test_renameat/test_unlinkat: cwd=/tmp, fd 7 names `sub`.
+    let tid = current_thread_id();
+    let pid: u32 = 7704;
+    let mut proc = make_test_process(pid);
+    proc.cwd = "/tmp".to_string();
+    proc.fds.table.lock().insert(7, FileDescriptor::File(KernelFile::new(format!("{ROOT}/sub"), 0)));
+    register_process(pid, proc);
+    register_thread_pid(tid, pid);
+
+    let cstr = |s: &str| -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::from(s.as_bytes());
+        v.push(0);
+        v
+    };
+    let mkdirat = |dirfd: i32, path: &[u8]| -> u64 {
+        handle_syscall(nr::MKDIRAT, &[dirfd as u64, path.as_ptr() as u64, 0o755, 0, 0, 0])
+    };
+
+    BYPASS_VALIDATION.store(true, Ordering::Release);
+    let mut fails = 0u32;
+
+    // 1. Absolute path -> directory created.
+    let p = cstr(&format!("{ROOT}/abs_dir"));
+    let r = mkdirat(AT_FDCWD, &p);
+    if r != 0 || !crate::vfs::metadata(&format!("{ROOT}/abs_dir")).map(|m| m.is_dir).unwrap_or(false) {
+        fails += 1;
+        crate::safe_print!(64, "[Test] mkdirat abs FAILED r={}\n", r);
+    }
+
+    // 2. AT_FDCWD-relative (cwd=/tmp).
+    let p = cstr("mkdirat_selftest/rel_dir");
+    let r = mkdirat(AT_FDCWD, &p);
+    if r != 0 || !crate::vfs::metadata(&format!("{ROOT}/rel_dir")).map(|m| m.is_dir).unwrap_or(false) {
+        fails += 1;
+        crate::safe_print!(64, "[Test] mkdirat rel(cwd) FAILED r={}\n", r);
+    }
+
+    // 3. dirfd-relative (fd 7 -> .../sub): mkdirat must NOT ignore dirfd — same
+    //    regression family as unlinkat/openat/renameat.
+    let p = cstr("dirfd_dir");
+    let r = mkdirat(7, &p);
+    if r != 0 || !crate::vfs::metadata(&format!("{ROOT}/sub/dirfd_dir")).map(|m| m.is_dir).unwrap_or(false) {
+        fails += 1;
+        crate::safe_print!(64, "[Test] mkdirat dirfd FAILED r={}\n", r);
+    }
+
+    // 4. dirfd in valid range but not present in the fd table. Unlike sys_renameat
+    //    (§14.3 case 5), sys_mkdirat explicitly checks proc.get_fd and returns EBADF
+    //    before the window even opens — pin that this early-return path (now living
+    //    entirely outside the guard) still fires correctly.
+    let p = cstr("anything");
+    let r = mkdirat(999, &p);
+    if r != EBADF {
+        fails += 1;
+        crate::safe_print!(64, "[Test] mkdirat unopen-dirfd FAILED r={} (want EBADF)\n", r);
+    }
+
+    // 5. EEXIST: target already a directory. Exercises the error path THROUGH the
+    //    dropped-BKL window (lookup_path finds it before allocating an inode).
+    let p = cstr(&format!("{ROOT}/abs_dir"));
+    let r = mkdirat(AT_FDCWD, &p);
+    if r != EEXIST {
+        fails += 1;
+        crate::safe_print!(64, "[Test] mkdirat EEXIST FAILED r={} (want EEXIST)\n", r);
+    }
+
+    // 6. ENOENT: parent directory doesn't exist.
+    let p = cstr(&format!("{ROOT}/nope/deeper"));
+    let r = mkdirat(AT_FDCWD, &p);
+    if r != ENOENT {
+        fails += 1;
+        crate::safe_print!(64, "[Test] mkdirat missing-parent FAILED r={} (want ENOENT)\n", r);
+    }
+
+    BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    // Cleanup (best-effort; the test verdict is the case results above, not this).
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/abs_dir"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/rel_dir"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub/dirfd_dir"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
+    let _ = crate::fs::remove_dir(ROOT);
+
+    if fails == 0 {
+        crate::safe_print!(128, "[Test] mkdirat PASSED (6 cases: abs/cwd-rel/dirfd/unopen-dirfd/EEXIST/ENOENT)\n");
+    } else {
+        crate::safe_print!(64, "[Test] mkdirat FAILED ({} of 6 cases)\n", fails);
+        panic!("test_mkdirat: {fails} of 6 cases failed");
+    }
+}
+
+fn test_fchmodat() {
+    use crate::syscall::{handle_syscall, nr, BYPASS_VALIDATION};
+    use akuma_exec::process::{
+        register_process, unregister_process, register_thread_pid, unregister_thread_pid,
+        FileDescriptor, KernelFile,
+    };
+    use akuma_exec::threading::current_thread_id;
+    use core::sync::atomic::Ordering;
+
+    const ENOENT: u64 = (-2i64) as u64;
+    const EBADF: u64 = (-9i64) as u64;
+    const AT_FDCWD: i32 = -100;
+    const ROOT: &str = "/tmp/fchmodat_selftest";
+
+    // Best-effort clean slate (a crashed prior run may have left the tree).
+    let _ = crate::fs::remove_file(&format!("{ROOT}/abs.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/rel.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/sub/dirfd.txt"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
+    let _ = crate::fs::remove_dir(ROOT);
+    let _ = crate::fs::create_dir(ROOT);
+    let _ = crate::fs::create_dir(&format!("{ROOT}/sub"));
+    let _ = crate::fs::write_file(&format!("{ROOT}/abs.txt"), b"a");
+    let _ = crate::fs::write_file(&format!("{ROOT}/rel.txt"), b"a");
+    let _ = crate::fs::write_file(&format!("{ROOT}/sub/dirfd.txt"), b"a");
+
+    // Same shape as test_renameat/test_mkdirat: cwd=/tmp, fd 7 names `sub`.
+    let tid = current_thread_id();
+    let pid: u32 = 7705;
+    let mut proc = make_test_process(pid);
+    proc.cwd = "/tmp".to_string();
+    proc.fds.table.lock().insert(7, FileDescriptor::File(KernelFile::new(format!("{ROOT}/sub"), 0)));
+    register_process(pid, proc);
+    register_thread_pid(tid, pid);
+
+    let cstr = |s: &str| -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::from(s.as_bytes());
+        v.push(0);
+        v
+    };
+    let fchmodat = |dirfd: i32, path: &[u8], mode: u32| -> u64 {
+        handle_syscall(nr::FCHMODAT, &[dirfd as u64, path.as_ptr() as u64, u64::from(mode), 0, 0, 0])
+    };
+    let perm_bits = |path: &str| -> Option<u32> {
+        crate::vfs::metadata(path).ok().map(|m| m.mode & 0o777)
+    };
+
+    BYPASS_VALIDATION.store(true, Ordering::Release);
+    let mut fails = 0u32;
+
+    // 1. Absolute path -> mode bits actually change (not just exit-code success).
+    let p = cstr(&format!("{ROOT}/abs.txt"));
+    let r = fchmodat(AT_FDCWD, &p, 0o604);
+    if r != 0 || perm_bits(&format!("{ROOT}/abs.txt")) != Some(0o604) {
+        fails += 1;
+        crate::safe_print!(64, "[Test] fchmodat abs FAILED r={}\n", r);
+    }
+
+    // 2. AT_FDCWD-relative (cwd=/tmp).
+    let p = cstr("fchmodat_selftest/rel.txt");
+    let r = fchmodat(AT_FDCWD, &p, 0o640);
+    if r != 0 || perm_bits(&format!("{ROOT}/rel.txt")) != Some(0o640) {
+        fails += 1;
+        crate::safe_print!(64, "[Test] fchmodat rel(cwd) FAILED r={}\n", r);
+    }
+
+    // 3. dirfd-relative (fd 7 -> .../sub): fchmodat must NOT ignore dirfd — same
+    //    regression family as unlinkat/openat/renameat/mkdirat.
+    let p = cstr("dirfd.txt");
+    let r = fchmodat(7, &p, 0o600);
+    if r != 0 || perm_bits(&format!("{ROOT}/sub/dirfd.txt")) != Some(0o600) {
+        fails += 1;
+        crate::safe_print!(64, "[Test] fchmodat dirfd FAILED r={}\n", r);
+    }
+
+    // 4. dirfd in valid range but not present in the fd table -> EBADF, checked
+    //    before the window opens (same shape as test_mkdirat case 4).
+    let p = cstr("anything");
+    let r = fchmodat(999, &p, 0o600);
+    if r != EBADF {
+        fails += 1;
+        crate::safe_print!(64, "[Test] fchmodat unopen-dirfd FAILED r={} (want EBADF)\n", r);
+    }
+
+    // 5. ENOENT: missing target. Exercises the error path THROUGH the dropped-BKL
+    //    window (resolve_symlinks + chmod's lookup both run before failing).
+    let p = cstr(&format!("{ROOT}/nope.txt"));
+    let r = fchmodat(AT_FDCWD, &p, 0o600);
+    if r != ENOENT {
+        fails += 1;
+        crate::safe_print!(64, "[Test] fchmodat missing FAILED r={} (want ENOENT)\n", r);
+    }
+
+    // 6. /dev/null fast path: must short-circuit to success without touching the
+    //    ext2 chmod path — this branch now lives inside the dropped-BKL window.
+    let p = cstr("/dev/null");
+    let r = fchmodat(AT_FDCWD, &p, 0o666);
+    if r != 0 {
+        fails += 1;
+        crate::safe_print!(64, "[Test] fchmodat /dev/null FAILED r={} (want 0)\n", r);
+    }
+
+    BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    // Cleanup (best-effort; the test verdict is the case results above, not this).
+    let _ = crate::fs::remove_file(&format!("{ROOT}/abs.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/rel.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/sub/dirfd.txt"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
+    let _ = crate::fs::remove_dir(ROOT);
+
+    if fails == 0 {
+        crate::safe_print!(128, "[Test] fchmodat PASSED (6 cases: abs/cwd-rel/dirfd/unopen-dirfd/ENOENT/dev-null)\n");
+    } else {
+        crate::safe_print!(64, "[Test] fchmodat FAILED ({} of 6 cases)\n", fails);
+        panic!("test_fchmodat: {fails} of 6 cases failed");
     }
 }
 

@@ -19,9 +19,14 @@ was extended with `meta`/`trunc`/`openclose` phases first — the resulting attr
 `renameat` (2.8%) narrowly ahead of `mkdirat` (2.6%) and `fchmodat` (1.8%) as the largest
 untouched holders; converting `renameat` cut its own share **8.3% → absent** and total workload
 spinning **289.4M → 255.0M spins** (~12%), 0 stuck / 0 PANIC / 6-of-6 digests exact on both sides.
-Remaining 2b (`close`/`dup`/`fcntl`), the rest of 2c (now led by `mkdirat`/`fchmodat`), and 2d are
-NOT started — to be evidence-led off the next attribution. The two pre-existing kernel bugs from
-§11 stand as before (thread-slot reclaim FIXED §11.7; `wait`/SIGCHLD still open §11.3).**
+Phase 2c's remaining pair `mkdirat`/`fchmodat` is DONE, contention-confirmed by a controlled A/B
+(§15, 2026-07-30): both converted together (§14.6 named them the next-largest untouched holders,
+5.2%/3.2% of a 285.7M-spin extended-regimen run); post-conversion neither appears in the top 12 —
+both drop out entirely, matching `unlinkat`/`renameat` — and total workload spinning cut
+285.7M → 246.0M spins (~14%), 0 stuck / 0 PANIC / 6-of-6 digests exact on both sides.
+Remaining 2b (`close`/`dup`/`fcntl`) and 2d are NOT started — to be evidence-led off the next
+attribution. The two pre-existing kernel bugs from §11 stand as before (thread-slot reclaim FIXED
+§11.7; `wait`/SIGCHLD still open §11.3).**
 
 ---
 
@@ -1153,3 +1158,117 @@ list, both still an order of magnitude behind `irq/sched`/`clone`/`execve`. Whet
 worth converting on its own — versus the remaining win being in Phase 3 (scheduler/IRQ) or
 process-creation paths outside this carve-out's scope — is exactly the question the next
 attribution run should answer, per §7's evidence-led rule.
+
+## 15. Phase 2c remaining pair (`mkdirat`/`fchmodat`) — DONE, contention-confirmed, 2026-07-30
+
+§14.6 left `mkdirat` and `fchmodat` as the largest untouched Phase 2c holders, both an order of
+magnitude behind `irq/sched`/`clone`/`execve` — small enough that whether converting them was
+worth it at all was an open question. Converting both together (they share the exact same
+dirfd-resolution shape as `unlinkat`) and re-measuring answers that question directly rather than
+guessing.
+
+### 15.1 The change
+
+`sys_mkdirat` and `sys_fchmodat` (`src/syscall/fs.rs`) are restructured to the `sys_unlinkat`
+shape rather than the `sys_renameat` shape: both originally interleaved the dirfd/EBADF resolution
+with the path-string building in one `if/else` chain, so a straight "add a guard before the disk
+call" edit would have left early-return `EBADF` paths inside the window. Instead the dirfd
+resolution is pulled out into a `base: Option<String>` computed *before* the guard opens (fd-table
+lookup + early `EBADF` returns only, no disk I/O — identical shape to `unlinkat`'s `base`), and the
+`VfsBklGuard` opens immediately after, covering: `resolve_path`/`canonicalize_path` (string work),
+`crate::fs::create_dir` (ext2 write guard, inode alloc + dirent write) for `mkdirat`; and for
+`fchmodat`, `resolve_symlinks` (a real on-disk symlink-target lookup — same class of real lookup as
+`renameat2`'s `RENAME_NOREPLACE` `exists` probe, §14.2) plus `crate::vfs::chmod` (ext2 write guard,
+mode-bits rewrite). The `/dev/null`/`/dev/zero` fast path in `fchmodat` stays inside the window
+(a branch within the window, not a different fd *kind* that needs routing around it — see
+`locking.md`'s "route special fd kinds before the guard opens" rule, which is about pipe/socket fds
+specifically). No new locks; zero-cost no-op off `smp-shared` + `no-bkl-vfs`.
+
+### 15.2 Verification — boot self-test (correctness)
+
+New `test_mkdirat` and `test_fchmodat` (`src/process_tests.rs`), structurally identical to
+§12/§14's tests, drive `handle_syscall(MKDIRAT, …)` / `handle_syscall(FCHMODAT, …)`:
+
+| syscall | # | case | pins |
+|---|---|---|---|
+| mkdirat | 1 | absolute path | directory created |
+| mkdirat | 2 | `AT_FDCWD`-relative (`cwd=/tmp`) | cwd-relative resolution |
+| mkdirat | 3 | dirfd-relative (`fd 7 → …/sub`) | dirfd must NOT be ignored |
+| mkdirat | 4 | dirfd `999` (unopen) | `EBADF` — unlike `renameat` (§14.3 case 5), `mkdirat` explicitly checks `proc.get_fd` before the window opens |
+| mkdirat | 5 | target already exists | `EEXIST` through the dropped window |
+| mkdirat | 6 | missing parent | `ENOENT` through the dropped window |
+| fchmodat | 1 | absolute path | mode bits actually changed (`metadata().mode`, not just exit code) |
+| fchmodat | 2 | `AT_FDCWD`-relative | cwd-relative resolution |
+| fchmodat | 3 | dirfd-relative (`fd 7 → …/sub`) | dirfd must NOT be ignored |
+| fchmodat | 4 | dirfd `999` (unopen) | `EBADF`, same shape as `mkdirat` case 4 |
+| fchmodat | 5 | missing target | `ENOENT` through the dropped window (`resolve_symlinks` + `chmod`'s lookup both run first) |
+| fchmodat | 6 | `/dev/null` | fast-path short-circuit to `0`, now living inside the window |
+
+Unlike `renameat`'s divergence discovery (§14.3 case 5), `mkdirat`/`fchmodat` had no surprise here
+— both already had an explicit `EBADF` dirfd check pre-conversion, and restructuring preserved it
+exactly (case 4 on both pins this).
+
+**SMP=2 boot, `smp-shared` + `no-bkl-vfs`** (private disk clone + unique ports, isolated from a
+concurrent agent's own VM on the same host — see `locking.md`'s isolated-verification pattern):
+`[Test] mkdirat PASSED (6 cases)`, `[Test] fchmodat PASSED (6 cases)`, plus `unlinkat`/`openat`/
+`renameat` still pass and `no_spurious_svc_traps` reports 0 phantom SVCs. Full suite: 2 `FAILED`
+lines, both the §6 pre-existing flaky failures (`fs_error_to_errno_mapping` EPERM/EACCES,
+`stp_xzr_ec15_handler_fires`), 0 PANIC/WILD/stale-dropped-window heals, 18 `[BKL] stuck` lines
+(within the §6/§9.3 NEON/FP-test-region noise band).
+
+### 15.3 Verification — controlled A/B (contention), SMP=4, `bkl-profile`, 2026-07-30
+
+Same-binary A/B per the §13.3/§14.4 template, on a `devbox-smoltcp` VM: the regimen extended with
+§14.1's `meta` phase (two workers, each 60× `mkdir` + 60× `mv` + 60× `chmod`, concurrently — kept
+as a scratch edit to `scripts/bkl_smp_regimen/payload/job.sh`, restored via `git checkout`
+afterward, not landed in the standing regimen) run twice at SMP=4 on private `devbox.img` clones —
+ON (the §15.1 change in place) vs. OFF (`git show HEAD:src/syscall/fs.rs` swapped in for the
+pre-conversion source, restored afterward, `git diff --stat` confirmed identical to the intended
+landing state both before the swap and after restoring it).
+
+| signal | ON (converted) | OFF (reverted) |
+|---|---|---|
+| `mkdirat` `nr=34` cumulative share | **absent** (not in top 12) | **5.2%** (14.8M spins) |
+| `fchmodat` `nr=53` cumulative share | **absent** (not in top 12) | **3.2%** (9.2M spins) |
+| workload cumulative attributed spins | 246,018,905 | 285,698,468 (1.16x) |
+| `[BKL] stuck` during workload | 0 | 0 |
+| PANIC / WILD | 0 / 0 | 0 / 0 |
+| digests (4 net + 2 cp) | 6/6 exact | 6/6 exact |
+| regimen wall-clock | 136 s | 136 s |
+
+Top holders on the OFF side: `irq/sched` 66.3%, `clone` 12.9%, `execve` 5.5%, `mkdirat` 5.2%,
+`nr53`(`fchmodat`) 3.2%, `rt_sigprocmask` 2.0%, `read` 1.3%. On the ON side: `irq/sched` 73.2%,
+`clone` 12.5%, `execve` 6.5%, `nanosleep` 2.2%, `read` 1.5%, `openat` 1.3% — both `mkdirat` and
+`fchmodat` drop out of the list entirely rather than shrinking, matching the `unlinkat`/`renameat`
+pattern (§12/§14) more than `openat`'s (§13, which left a small residual). Note `fchmodat`
+(syscall 53) prints as `nr53` in the OFF-side table — `src/bkl_profile.rs`'s tag-label table
+doesn't yet have a friendly name for tag 53; cosmetic only, not fixed here (out of scope for a BKL
+conversion, and every other reading — the syscall-number cross-reference, the self-test names — is
+unambiguous).
+
+### 15.4 Data integrity
+
+Both disk clones were `e2fsck -fy`'d before boot and showed the identical "unattached zero-length
+inode" symptom on the same two inodes (the §12.4/§14.5 write-back-cache-with-no-sync-on-raw-kill
+artifact, present on both clones *before* either VM even booted — confirms it predates this
+change and isn't `mkdirat`/`fchmodat`-specific). Both VMs ran with `snapshot=on` (guest writes
+discarded at exit), so a post-run `e2fsck` comparison would just re-show the identical pre-run
+state and carries no signal this round — the decisive check is the digest table in §15.3:
+`sha256sum` on all 4 downloaded + 2 copied files, read live from inside each VM over SSH before
+teardown, 6/6 exact on both sides. A `mkdir`/`mv`/`chmod` that silently corrupted an unrelated
+inode during the concurrent `meta` phase would show up as a digest mismatch in the untouched
+net4/cp2 files, not just as a `meta`-phase exit code.
+
+### 15.5 Next
+
+With `mkdirat`/`fchmodat` converted, every Phase 2c syscall this campaign's attribution ever named
+(`unlinkat`, `renameat`/`renameat2`, `mkdirat`, `fchmodat`) is now BKL-free. Remaining untouched
+work in this carve-out: Phase 2b's `close`/`dup`/`fcntl` (never yet named by an attribution run —
+§14.1's `openclose` phase produced no signal on `close`, consistent with §11.6's "simple ops with
+no expensive block work behind them stay cheap regardless of BKL state" finding) and Phase 2d
+(unexercised entirely: `symlinkat`/`linkat`/`readlinkat`/`fchdir`/`getcwd`/`fstatfs`/`truncate`/
+`ftruncate`/`fallocate`). Both OFF-side runs in this campaign (§14.4, §15.3) now show `irq/sched`
+alone accounting for two-thirds-plus of all attributed spin (66.3–73.2%, climbing as more VFS
+syscalls convert) — per §7's evidence-led rule, the next attribution run should check whether
+Phase 3 (scheduler/IRQ) now dominates the remaining opportunity enough to redirect effort there
+instead of chasing the rest of 2b/2d's now much smaller shares.

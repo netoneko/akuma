@@ -32,7 +32,8 @@ is not.
 
 Two carve-outs exist today: `no-bkl-network` (all smoltcp net syscalls +
 socket `read`/`write`) and `no-bkl-vfs` (ext2 read paths, `mmap`, `unlinkat`,
-`openat`). Both follow the same shape below.
+`openat`, `renameat`/`renameat2`, `mkdirat`, `fchmodat`). Both follow the same
+shape below.
 
 ## The carve-out playbook
 
@@ -82,7 +83,13 @@ For a given syscall or subsystem:
    72.6%. Converting `unlinkat` didn't just remove its share — it promoted the
    next-largest holder (`openat`, 36.6%) into visibility. Don't convert the
    next syscall on a checklist; profile, then convert whatever the profile
-   names.
+   names. This kept paying off down to small holders: `renameat` (2.8%),
+   `mkdirat` (2.6%), and `fchmodat` (1.8%) only showed up at all once the
+   driving workload was extended with a `mkdir`+`rename`+`chmod` phase — the
+   standing regimen never exercised them. Once every syscall an attribution
+   run had ever named was converted, `irq/sched` alone was 66–73% of
+   remaining spin — the signal that the next round of effort belongs in
+   Phase 3, not further down the VFS syscall list.
 
 ## Correctness rules learned the hard way
 
