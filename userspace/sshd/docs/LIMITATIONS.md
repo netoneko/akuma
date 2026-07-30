@@ -30,3 +30,18 @@ SSH is a cryptographically heavy protocol, making it resource-intensive for a `n
 ## 5. Shell Integration Bottlenecks
 - **I/O Bridging**: In the current "Bridge" mode (when using an external shell like `paws`), I/O is forwarded via synchronous syscalls. This may lead to high latency or dropped characters if the scheduler doesn't context-switch between the bridge and the shell process frequently enough.
 - **Bidirectional I/O**: Full bidirectional interaction (writing to a child process's stdin from `sshd`) is still experimental and may not behave exactly like a real PTY.
+
+## 6. Signal-Killed Commands Report Exit Code 0
+
+A remote command that **exits normally** reports its real status (RFC 4254 §6.10
+`exit-status`; see `EXIT_STATUS_FIX.md`). One killed by a **signal** does not.
+
+- **Cause**: `libakuma::waitpid` decodes only `WEXITSTATUS`
+  (`(status >> 8) & 0xFF`) and discards the raw wait status, so `sshd` cannot
+  tell a signal death from a clean exit. A signal status has nothing in the
+  high byte, so it decodes as 0.
+- **Impact**: `ssh box 'kill -9 $$'` reports success. Real OpenSSH would send an
+  `exit-signal` request naming the signal, and its client would exit 255.
+- **Fix Requirement**: `waitpid` must surface the raw status (or a
+  `WIFSIGNALED`/`WTERMSIG` pair) before `sshd` can emit `exit-signal`. That is a
+  `libakuma` change, not an `sshd` one.

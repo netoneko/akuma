@@ -3,10 +3,20 @@ name = "sshd"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# On by default; everything except the host-testable `src/wire.rs` needs it.
+# `--no-default-features` drops libakuma so `cargo test --lib` can link against
+# a std host target — libakuma defines #[panic_handler] and #[global_allocator],
+# which collide with std's. See src/lib.rs.
+default = ["akuma"]
+akuma = ["dep:libakuma"]
+
 [dependencies]
 # net-async: sshd uses embedded_io_async::{Read,Write} with libakuma's net Error,
 # so it opts into libakuma's `net-async` feature (off by default).
-libakuma = { path = "../libakuma", features = ["net-async"] }
+# Optional only so the `wire` unit tests can build for the host — the binary
+# always needs it (see [features]).
+libakuma = { path = "../libakuma", features = ["net-async"], optional = true }
 # Shared, host-testable SSH-2 wire-format/crypto primitives (also used by the
 # in-kernel SSH server via crates/akuma-ssh) instead of a hand-rolled duplicate.
 akuma-ssh-crypto = { path = "../../crates/akuma-ssh-crypto" }

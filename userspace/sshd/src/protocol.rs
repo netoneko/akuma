@@ -19,6 +19,9 @@ use super::crypto::{
     write_namelist, write_string, write_u32,
 };
 use super::keys;
+// Channel-message byte layout lives in the crate's lib target so it can be
+// unit-tested on the host — see `wire.rs`.
+use sshd::wire;
 use crate::SshStream;
 use libakuma::*;
 use libakuma::net::Error as NetError;
@@ -177,7 +180,11 @@ async fn fail_spawn(
 ) -> Result<(), NetError> {
     let msg = format!("sshd: failed to spawn '{shell_path}' for {kind}\r\n");
     println(&format!("[SSH] {}", msg.trim_end()));
-    send_channel_data(stream, session, msg.as_bytes()).await
+    send_channel_data(stream, session, msg.as_bytes()).await?;
+    // 127 — the shell convention for "command not found". Without an explicit
+    // status the client would report 255 (see `send_exit_status`), which reads
+    // as a connection failure rather than "your command could not be run".
+    send_exit_status(stream, session, 127).await
 }
 
 async fn bridge_process(
@@ -217,9 +224,12 @@ async fn bridge_process(
     // pumping stdout until waitpid(pid) reports the shell has exited.
     let mut client_done = false;
 
-    loop {
+    // Evaluates to the child's exit code, which `send_exit_status` below reports
+    // to the client. The only way out of this loop other than the reap is a `?`,
+    // and those all mean the client is already gone.
+    let exit_code = loop {
         // 1. Shell exited → drain remaining stdout, then stop.
-        if let Some((_, _exit_code)) = waitpid(pid) {
+        if let Some((_, code)) = waitpid(pid) {
             loop {
                 let n = read_fd(stdout_fd as i32, &mut buf);
                 if n > 0 {
@@ -228,7 +238,7 @@ async fn bridge_process(
                     break;
                 }
             }
-            break;
+            break code;
         }
 
         let mut did_io = false;
@@ -319,7 +329,7 @@ async fn bridge_process(
         if !did_io {
             crate::yield_now().await;
         }
-    }
+    };
     // Close our read end of the child's stdout. The kernel keeps the child's
     // ProcessChannel alive past waitpid while output is still buffered (so the
     // drain above doesn't lose it); closing the ChildStdout fd here is what frees
@@ -329,6 +339,48 @@ async fn bridge_process(
     if stdin_fd >= 0 {
         close(stdin_fd);
     }
+
+    // Only now that the fds are released (so a write error can't leak them via
+    // `?`) tell the client what the command's exit code was.
+    send_exit_status(stream, session, exit_code).await
+}
+
+/// RFC 4254 §6.10: report the command's exit code to the client, then tear the
+/// channel down (`CHANNEL_EOF` + `CHANNEL_CLOSE`).
+///
+/// This is what makes `ssh host cmd; echo $?` print the command's real status.
+/// OpenSSH's client seeds its own exit status with **255** and only overwrites
+/// it when this `exit-status` request arrives; a server that just closes the
+/// connection leaves that 255 in place, so *every* remote command — including
+/// a perfectly successful one — looked like a connection failure. Sending the
+/// status is the server's job, not something the client can infer.
+///
+/// `want_reply` MUST be false here: §6.10 forbids a reply to `exit-status`.
+///
+/// Limitation: a shell killed by a signal is reported as its (zero) exit code
+/// rather than `exit-signal`, because `libakuma::waitpid` decodes only
+/// `WEXITSTATUS` and discards the raw wait status — see `docs/LIMITATIONS.md`.
+async fn send_exit_status(
+    stream: &mut SshStream,
+    session: &mut SshSession,
+    exit_code: i32,
+) -> Result<(), NetError> {
+    if !session.channel_open {
+        return Ok(());
+    }
+    println(&format!("[SSH] Exit status: {}", exit_code));
+
+    let channel = session.client_channel;
+    let payload = wire::exit_status_payload(channel, exit_code);
+    send_packet(stream, &payload, session).await?;
+
+    // The client returns once the channel closes, using the status recorded
+    // above. EOF first, then CLOSE, so it knows no more data is coming.
+    send_packet(stream, &wire::channel_eof_payload(channel), session).await?;
+    send_packet(stream, &wire::channel_close_payload(channel), session).await?;
+
+    // Guard against a second send on a channel we've already closed.
+    session.channel_open = false;
     Ok(())
 }
 
