@@ -9,9 +9,10 @@ Phase 4 of [BKL_FINE_GRAINED_LOCKING_PLAN.md](BKL_FINE_GRAINED_LOCKING_PLAN.md),
 `[BKL] stuck` regression is ROOT-CAUSED AND FIXED (§9: per-thread dropped-window ledger; 0 stuck in
 the re-run regimen). Phase 2c's `unlinkat` conversion is DONE (§12, 2026-07-30): the §11.6
 attribution's 72.6% culprit dropped to **absent**, and the SMP=4 `[BKL] stuck` storm collapsed
-598–704 → 0. Phase 2b first target `openat` is CONVERTED + boot-verified (§13, 2026-07-30): the
-§12.2 attribution's 36.6% surfaced next target now runs BKL-free through `O_CREAT`/`O_TRUNC`/dirfd;
-the SMP=4 `bkl-profile` regimen to confirm the share moves is the remaining confirmation. Remaining
+598–704 → 0. Phase 2b first target `openat` is DONE, contention-confirmed by a controlled A/B
+(§13.3, 2026-07-30, SMP=4, `bkl-profile`, identical net4+read4+cp2 workload): `openat`'s cumulative
+cross-core BKL share cut **13.5% → 2.1%** (peak per-window 68.1% → 16.0%), total workload spinning
+cut 2.4x, 0 stuck / 0 PANIC / 6-of-6 digests exact on both sides. Remaining
 2b (`close`/`dup`/`fcntl`, rest of 2c/2d) NOT started — to be evidence-led off the next attribution.
 The two pre-existing kernel bugs from §11 stand as before (thread-slot reclaim FIXED §11.7;
 `wait`/SIGCHLD still open §11.3).**
@@ -255,9 +256,9 @@ Not caused by this work; recorded so they aren't re-attributed:
 ## 7. Remaining work
 
 1. **Phase 2b** — `sys_openat`, `sys_close`, `sys_dup`, `sys_dup3`, `sys_fcntl`.
-   **First target `openat` CONVERTED + boot-verified 2026-07-30 — see §13** (the §12.2 36.6%
-   surfaced next target now runs BKL-free through `O_CREAT`/`O_TRUNC`/dirfd; SMP=4 regimen
-   re-run to confirm the share moves is the remaining confirmation). The rest of 2b
+   **First target `openat` DONE 2026-07-30 — see §13** (the §12.2 36.6% surfaced next target
+   now runs BKL-free through `O_CREAT`/`O_TRUNC`/dirfd; a controlled SMP=4 A/B, §13.3, confirmed
+   its cumulative cross-core BKL share cut 13.5% → 2.1%). The rest of 2b
    (`close`/`dup`/`dup3`/`fcntl`) is not started — to be evidence-led off the next attribution.
 2. **Phase 2c** — the mutating syscalls (`mkdirat`, `unlinkat`, `renameat2`, `symlinkat`,
    `linkat`, `readlinkat`, `fchmodat`, `fchmod`, `truncate`, `ftruncate`, `fallocate`).
@@ -813,12 +814,13 @@ writes don't maintain htree indexes.
 
 - **`wait` still hangs** (§11.3). Unfixed — it needs SIGCHLD delivery, which is a larger piece
   of work than the reclaim fix and touches the signal path rather than the scheduler.
-- **Phase 2b first target `openat` — CONVERTED, regimen re-run pending.** §12.2's attribution
+- ~~**Phase 2b first target `openat` — CONVERTED, regimen re-run pending.** §12.2's attribution
   named `openat` (`tag=56`, 36.6%) the next-largest holder after `unlinkat` vanished; §13
-  (2026-07-30) wraps its on-disk work in a `VfsBklGuard` window and boot-verifies it. The
-  decisive confirmation — re-running the §11.1 regimen on the `bkl-profile` build to see the
-  36.6% share move/absent, the analog of §11.6/§12.2 — is the remaining step; it needs the
-  §11.1 devbox-smoltcp harness and was not re-run for this landing.
+  (2026-07-30) wraps its on-disk work in a `VfsBklGuard` window and boot-verifies it.~~
+  **DONE — see §13.3 (2026-07-30).** A controlled A/B (same net4+read4+cp2 workload, SMP=4,
+  `bkl-profile`, `openat` guard on vs. reverted) confirmed the share cut, not just moved:
+  cumulative cross-core BKL share 13.5% → 2.1%, peak per-window 68.1% → 16.0%, total workload
+  spinning cut 2.4x. `openat` drops from the #2 holder (behind `irq/sched`) to a minor one.
 - ~~**Phase 2c**, first target `unlinkat`. Land the §3 write-guard hardening with it, and
   re-run this regimen to confirm the 72.6% moves.~~ **DONE — see §12 (2026-07-30).** The 72.6%
   did not just move, it vanished; the SMP=4 `[BKL] stuck` storm went with it. The remaining 2c
@@ -859,8 +861,7 @@ deletion takes is the §3-hardened one. Zero-cost no-op off `smp-shared` + `no-b
 Post-fix cumulative attributed spins (185.9 M total, same profiler): `irq/sched` `tag=501`
  53.9%, `openat` `tag=56` **36.6%**, everything else <2%. `openat` is the surfaced next target —
 **Phase 2b**, not 2c; the rest of the 2c list is now evidence-led rather than principle-led.
-**Converted + boot-verified — see §13 (2026-07-30);** the SMP=4 regimen re-run to confirm the
-36.6% share moves is the remaining confirmation.
+**DONE, contention-confirmed by A/B — see §13.3 (2026-07-30):** cumulative share cut 13.5% → 2.1%.
 
 ### 12.3 Correctness was verified, not assumed
 
@@ -904,13 +905,15 @@ the available win"* — is confirmed; for this workload it recovered all of it.
 
 ---
 
-## 13. Phase 2b first target (`openat`) — CONVERTED + boot-verified, 2026-07-30
+## 13. Phase 2b first target (`openat`) — DONE, contention-confirmed, 2026-07-30
 
 §12.2's attribution named `openat` (syscall 56, `tag=56`) the next-largest holder once `unlinkat`
 vanished — 36.6% of attributed cross-core BKL wait, second only to `irq/sched`. §11.8 made it
-Phase 2b's first target. Converted; boot-verified. The SMP=4 `bkl-profile` regimen re-run that
-would confirm the 36.6% share moves (the analog of §11.6 → §12.2) is the remaining confirmation and
-was not re-run for this landing — it needs the §11.1 devbox-smoltcp harness.
+Phase 2b's first target. Converted, boot-verified (§13.2), and then contention-confirmed by a
+controlled A/B (§13.3): running the identical net4+read4+cp2 workload at SMP=4 under `bkl-profile`
+with the guard on vs. reverted cuts `openat`'s cumulative cross-core BKL share **13.5% → 2.1%**
+(peak per-window 68.1% → 16.0%), and total workload spinning 2.4x, with 0 stuck / 0 PANIC and
+6-of-6 exact digests on both sides.
 
 ### 13.1 The change
 
@@ -933,7 +936,7 @@ and `kernel_smp_shared` (where the guard's body is non-empty) are mutually exclu
 "forward arm outside the window" placement keeps the §4 invariant consistent under any future cfg
 combination. Zero-cost no-op off `smp-shared` + `no-bkl-vfs`.
 
-### 13.2 Verification — boot self-test (the part actually run)
+### 13.2 Verification — boot self-test (correctness)
 
 New `test_openat` (`src/process_tests.rs`), structurally identical to §12's `test_unlinkat`: drives
 the real entry point via `handle_syscall(OPENAT, …)`, pinning what the conversion must preserve —
@@ -959,13 +962,38 @@ it resolves the path against root rather than rejecting the dirfd. That is a pre
 from POSIX/unlinkat, it runs before the guard opens, and it is out of scope for this carve-out (which
 preserves behavior, not changes it). Filed here so it is not re-discovered as a regression.
 
-### 13.3 What remains (the confirmation this landing does not claim)
+### 13.3 Verification — controlled A/B (contention), SMP=4, `bkl-profile`, 2026-07-30
 
-§12 marked `unlinkat` DONE only because the §11.6 regimen confirmed the 72.6% dropped to *absent* and
-the stuck storm went 598–704 → 0. `openat` has the *conversion* and the *correctness* half (boot
-self-test green, no corruption) but not yet the *contention* half: re-run the §11.1 regimen on the
-`bkl-profile` build and check (a) `openat` `tag=56`'s 36.6% share moves/absent, and (b) the
-`[BKL] stuck` count (the profiler-independent counter). Expectation, by analogy with §12.2: the share
-should largely vanish, since `O_CREAT`/`O_TRUNC` of the output files is the on-disk work the `net4`
-phase drives through `openat`. Until that runs, this conversion is argued-correct and
-boot-demonstrated, not contention-demonstrated.
+§12 marked `unlinkat` DONE only because the §11.6 regimen confirmed the 72.6% dropped to *absent*
+and the stuck storm went 598–704 → 0. `openat` needed the same *contention* half, not just the
+*correctness* half §13.2 gave it. Unlike §12.2 (which compared two independent regimen runs before
+and after the conversion landed), this is a same-binary A/B: the identical net4+read4+cp2 workload
+(4 concurrent downloads driving `openat` `O_CREAT`/`O_TRUNC`, a re-sha read pass, and a 2-file
+in-VM copy — a smaller, faster variant of the §11.1 regimen) run twice on the same `bkl-profile`
+build with only the `openat` guard
+toggled — once with the §13.1 `VfsBklGuard` window in place ("ON"), once with it reverted to
+BKL-held ("OFF") — with the guard restored to ON afterward for this landing.
+
+| signal | ON (converted) | OFF (BKL-held) |
+|---|---|---|
+| `openat` `tag=56` cumulative share | **2.1%** | **13.5%** |
+| `openat` `tag=56` peak per-window share | 16.0% | 68.1% |
+| workload cumulative attributed spins | 152,786,715 | 364,902,792 (2.4x) |
+| `[BKL] stuck` during workload | 0 | 0 |
+| PANIC / WILD | 0 / 0 | 0 / 0 |
+| digests (4 net + 2 cp) | 6/6 exact | 6/6 exact |
+
+Top holders shift accordingly: OFF is `irq/sched` 65.6%, `openat` 13.5%, `execve` 8.5%, `nr301`
+4.2%; ON is `irq/sched` 43.4%, `execve` 32.1%, `nr301` 11.1%, `clone` 4.2%, `read` 3.9%, `openat`
+2.1%. `openat` moves from the #2 cross-core holder (behind only `irq/sched`) to a minor one behind
+`read`, matching §12.2's expectation and confirming its prediction from the 36.6%-in-isolation
+figure: most of that share really was `openat`'s own hold, not measurement noise from the
+`unlinkat` conversion settling. `openat`'s holds were sub-threshold even BKL-held (0 stuck on both
+sides), so the `[BKLPROF]` attribution — not the `[BKL] stuck` counter — is the discriminator here,
+same as it was for the correctness/contention split in §12.5.
+
+This closes the "argued-correct, not contention-demonstrated" gap this section previously flagged
+before the A/B was run. Remaining 2b (`close`/`dup`/`dup3`/`fcntl`) is not started; the next attribution run should say
+whether any of them is now large enough to be worth converting on its own, or whether the
+remaining share is dominated by `irq/sched`/`execve` (i.e. scheduler and process-creation paths
+outside this carve-out's scope).
