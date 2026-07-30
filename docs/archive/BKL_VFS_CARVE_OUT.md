@@ -12,10 +12,16 @@ attribution's 72.6% culprit dropped to **absent**, and the SMP=4 `[BKL] stuck` s
 598–704 → 0. Phase 2b first target `openat` is DONE, contention-confirmed by a controlled A/B
 (§13.3, 2026-07-30, SMP=4, `bkl-profile`, identical net4+read4+cp2 workload): `openat`'s cumulative
 cross-core BKL share cut **13.5% → 2.1%** (peak per-window 68.1% → 16.0%), total workload spinning
-cut 2.4x, 0 stuck / 0 PANIC / 6-of-6 digests exact on both sides. Remaining
-2b (`close`/`dup`/`fcntl`, rest of 2c/2d) NOT started — to be evidence-led off the next attribution.
-The two pre-existing kernel bugs from §11 stand as before (thread-slot reclaim FIXED §11.7;
-`wait`/SIGCHLD still open §11.3).**
+cut 2.4x, 0 stuck / 0 PANIC / 6-of-6 digests exact on both sides. Phase 2c's next target
+`renameat`/`renameat2` is DONE, contention-confirmed by a controlled A/B (§14, 2026-07-30):
+the base regimen didn't stress `mkdirat`/`renameat`/`fchmodat`/`truncate`/`close` at all, so it
+was extended with `meta`/`trunc`/`openclose` phases first — the resulting attribution named
+`renameat` (2.8%) narrowly ahead of `mkdirat` (2.6%) and `fchmodat` (1.8%) as the largest
+untouched holders; converting `renameat` cut its own share **8.3% → absent** and total workload
+spinning **289.4M → 255.0M spins** (~12%), 0 stuck / 0 PANIC / 6-of-6 digests exact on both sides.
+Remaining 2b (`close`/`dup`/`fcntl`), the rest of 2c (now led by `mkdirat`/`fchmodat`), and 2d are
+NOT started — to be evidence-led off the next attribution. The two pre-existing kernel bugs from
+§11 stand as before (thread-slot reclaim FIXED §11.7; `wait`/SIGCHLD still open §11.3).**
 
 ---
 
@@ -267,8 +273,14 @@ Not caused by this work; recorded so they aren't re-attributed:
    consecutive `[BKL] stuck` warnings on the peer core (all self-healed, no data loss) —
    measured 2026-07-25 during the §9 validation, on a kernel whose read paths were clean.
    **First target `unlinkat` DONE 2026-07-30 — see §12** (the §11.6 72.6% culprit dropped to
-   *absent*; SMP=4 stuck 598–704 → 0). The remaining 2c list is now evidence-led: §12's
-   attribution names `openat` (Phase 2b, 36.6%), not a 2c syscall, as the next-largest holder.
+   *absent*; SMP=4 stuck 598–704 → 0). **Second target `renameat`/`renameat2` DONE 2026-07-30 —
+   see §14** (the base regimen never stressed `mkdirat`/`renameat`/`fchmodat`/`truncate`, so it
+   was extended first; the resulting attribution named `renameat` at 2.8%, narrowly ahead of
+   `mkdirat` 2.6% and `fchmodat` 1.8%; a controlled A/B confirmed its share cut 8.3% → absent).
+   The remaining 2c list (`mkdirat`, `symlinkat`, `linkat`, `readlinkat`, `fchmodat`, `fchmod`,
+   `truncate`, `ftruncate`, `fallocate`) is now evidence-led: §14's attribution names `mkdirat`
+   (6.4%) and `fchmodat` (7.5% ON-side / 4.3% OFF-side) as the next-largest untouched holders,
+   both still well behind `irq/sched`/`clone`/`execve` (Phase 3/process-management territory).
 3. **Phase 2d** — `chdir`, `fchdir`, `getcwd`, `fstatfs`.
 4. ~~**Phase 2e** — the eager file-backed `sys_mmap` arm.~~ **DONE — see §10.** Shipped as
    fill-before-install inside a `VfsBklGuard` window; verified with the
@@ -829,6 +841,14 @@ writes don't maintain htree indexes.
 - ~~**The stuck episodes themselves.** Attributed, but not eliminated: the fix for them *is*
   Phase 2c, since that is where they live.~~ **Resolved by the `unlinkat` conversion (§12):**
   the ~600–700/run that were almost all `tag=35` are now 0.
+- ~~**Phase 2c second target `renameat`/`renameat2`.** The base net4+read4+cp2+rm regimen never
+  called `mkdirat`/`renameat`/`fchmodat`/`truncate` more than once or twice, so it couldn't say
+  which of the rest of the 2c/2d list mattered.~~ **DONE — see §14 (2026-07-30).** Extended the
+  regimen with `meta` (mkdir/rename/chmod)/`trunc`/`openclose` phases first, then attributed:
+  `renameat` (2.8%) narrowly ahead of `mkdirat` (2.6%) and `fchmodat` (1.8%). Converted
+  `renameat`/`renameat2`; a controlled A/B confirmed the share cut 8.3% → absent and total
+  workload spinning dropped ~12%. `mkdirat` and `fchmodat` are now the next-largest untouched
+  holders, both still well behind `irq/sched`/`clone`/`execve`.
 
 ---
 
@@ -997,3 +1017,139 @@ before the A/B was run. Remaining 2b (`close`/`dup`/`dup3`/`fcntl`) is not start
 whether any of them is now large enough to be worth converting on its own, or whether the
 remaining share is dominated by `irq/sched`/`execve` (i.e. scheduler and process-creation paths
 outside this carve-out's scope).
+
+---
+
+## 14. Phase 2c second target (`renameat`/`renameat2`) — DONE, contention-confirmed, 2026-07-30
+
+§13.3 closed out `openat` and left the attribution ambiguous for the rest of 2b/2c/2d: §12.2's
+post-`unlinkat` numbers named `openat` (36.6%) as the next holder, but nothing else in the 2b/2c/2d
+list had ever been measured, because the standing net4+read4+cp2+rm regimen (§11.1) simply never
+calls `mkdirat`/`renameat`/`fchmodat`/`truncate` more than once or twice, and never calls
+`symlinkat`/`linkat`/`readlinkat`/`fchmod`/`ftruncate`/`fallocate`/`chdir`/`fchdir`/`getcwd`/
+`fstatfs` at all. A first `bkl-profile` run with `openat` converted confirmed this directly: with
+`irq/sched` (83.7%) and process-management syscalls (`nanosleep`/`ppoll`/`clone`/`execve`/`mmap`/
+`read`) accounting for the rest, not one 2b/2c/2d syscall appeared in the top 12 — not because
+they're cheap, but because the regimen doesn't exercise them.
+
+### 14.1 Extending the regimen to get real signal
+
+Added three phases to the payload script (kept as a scratch variant of
+`scripts/bkl_smp_regimen/payload/job.sh`, run before the final `rm`):
+
+- **`meta`** — two workers, each 60× `mkdir` + 60× `mv` (rename) + 60× `chmod`, run concurrently.
+- **`trunc`** — two workers, each 15 iterations of shrinking a 32 MiB file to ~1 MB then growing
+  it back (`truncate -s`), exercising the same class of block alloc/free `unlinkat` hit.
+- **`openclose`** — two workers, each 200× `cat` of a 4 KiB file (open+read+close cycles), to get
+  signal on `close` (Phase 2b) under repetition rather than the single close-per-download the base
+  regimen gives it.
+
+Re-run at SMP=4 with `bkl-profile` (same devbox-smoltcp harness, private disk clone + unique
+ports so it didn't collide with another session's VM on the same host — see
+`docs/reference/subsystems/locking.md` for the general pattern). Result, cumulative attributed
+spins (499.2M total, `openat` already converted from §13):
+
+| share | holder tag | what it is |
+|---|---|---|
+| 65.2% | `irq/sched` (501) | scheduler / IRQ path — Phase 3's target |
+| 12.3% | `clone` (220) | process creation — outside this carve-out |
+| 7.6% | `execve` (221) | process creation — outside this carve-out |
+| **2.8%** | `renameat` (nr 38) | **directory-entry rewrite — Phase 2c** |
+| **2.6%** | `mkdirat` (34) | **directory creation — Phase 2c** |
+| 2.3% | `nanosleep` (101) | sshd's accept-poll loop |
+| **1.8%** | `fchmodat` (nr 53) | **Phase 2c** |
+| 1.7% | `ppoll` (73) | |
+| 1.5% | `openat` (56) | residual, already converted (§13) |
+| 0.8% | `read` (63) | already converted (§4) |
+
+`trunc` and `openclose` produced no measurable signal (`truncate`/`close` do not appear in the top
+12) — consistent with §11.6's finding for `read`/`write`: simple ops with no expensive block
+work behind them stay cheap regardless of BKL state. `renameat` edges out `mkdirat` by a margin
+well inside the profiler's own perturbation noise (§11.5), but it's the top of the list, so per
+§7's evidence-led rule it's the next conversion.
+
+### 14.2 The change
+
+Both `sys_renameat` and `sys_renameat2` (`src/syscall/fs.rs`) now take a `VfsBklGuard` window
+immediately after copying the two path strings out of user memory, covering: `resolve_path_at`
+for both paths (fd-table + string-normalization work only, no disk I/O — same as the equivalent
+call in `sys_unlinkat`/`sys_openat`), the `RENAME_NOREPLACE` existence probe in `sys_renameat2`
+(a real lookup), and `crate::fs::rename` (the ext2-write-guarded directory-entry rewrite —
+`akuma-ext2`'s `rename` reads both parent directories, optionally frees a replaced destination
+inode, then rewrites both directory entries, all under one `write_state` guard). No new locks;
+mirrors the §12/§13 placement exactly. Zero-cost no-op off `smp-shared` + `no-bkl-vfs`.
+
+### 14.3 Verification — boot self-test (correctness)
+
+New `test_renameat` (`src/process_tests.rs`), structurally identical to §12/§13's tests: drives
+`handle_syscall(RENAMEAT, …)` and `RENAMEAT2`, pinning —
+
+| # | case | pins |
+|---|---|---|
+| 1 | absolute paths both sides | source gone, destination holds the content |
+| 2 | `AT_FDCWD`-relative (`cwd=/tmp`) both sides | cwd-relative resolution |
+| 3 | dirfd-relative (`fd 7 → …/sub`) both sides | dirfd must NOT be ignored (the rm-recursion family) |
+| 4 | `renameat2` `RENAME_NOREPLACE` onto an existing destination | `EEXIST`, source untouched — the `exists` probe now runs *inside* the window |
+| 5 | dirfd `999` (unopen) | exercises the error path, see below |
+| 6 | missing source, no `O_CREAT`-equivalent | `ENOENT` through the dropped window |
+
+Case 5 surfaced a real (pre-existing, not a regression) divergence while writing the test: unlike
+`sys_unlinkat`, which explicitly checks the dirfd and returns `EBADF`, `sys_renameat` has no such
+check at all — `resolve_path_at` falls through to base `"/"` for an unresolvable dirfd (same
+family as `sys_openat`'s documented `/proc/self/exe`-ordering divergence, §13.2), so
+`renameat(999, "anything", …)` resolves to `/anything` and returns `ENOENT`, not `EBADF`. The
+first version of the test asserted `EBADF` and failed (panicking, which is by design — the test
+`panic!()`s on any failed case); fixed by asserting the actual pre-existing behavior instead of
+changing it, matching how this carve-out treats every other such divergence (preserve behavior,
+don't fix unrelated bugs in the same commit).
+
+**SMP=2 boot, `smp-shared` + `no-bkl-vfs`:** `[Test] renameat PASSED (6 cases)`, plus `unlinkat`
+and `openat` still pass and `no_spurious_svc_traps` reports 0 phantom SVCs. Full suite: 0 `FAILED`
+lines this run (the two standing §6 pre-existing failures are flaky/non-deterministic and simply
+didn't fire this boot), 0 PANIC/WILD/stale-dropped-window heals. 19 `[BKL] stuck` lines, all in
+the known NEON/FP-test-region noise band (§6/§9.3's ~15–16 baseline).
+
+### 14.4 Verification — controlled A/B (contention), SMP=4, `bkl-profile`, 2026-07-30
+
+Same-binary A/B per the §13.3 template: the extended regimen (net4+read4+cp2+**meta+trunc+
+openclose**+rm) run twice at SMP=4 on private disk clones with the `renameat`/`renameat2` guard
+toggled — ON (the §14.2 change in place) vs. OFF (`git show HEAD:src/syscall/fs.rs` swapped in
+to get the pre-conversion source, **not** `git stash`, since another agent had uncommitted work
+in the same working tree — restored afterward, confirmed byte-identical to the intended landing
+state via `git diff`).
+
+| signal | ON (converted) | OFF (reverted) |
+|---|---|---|
+| `renameat` `nr=38` cumulative share | **absent** (not in top 12) | **8.3%** (23.9M spins) |
+| workload cumulative attributed spins | 255,013,999 | 289,377,294 (1.13x) |
+| `[BKL] stuck` during workload | 0 | 0 |
+| PANIC / WILD | 0 / 0 | 0 / 0 |
+| digests (4 net + 2 cp) | 6/6 exact | 6/6 exact |
+| regimen wall-clock | 136 s | 135 s |
+
+Top holders on the OFF side: `irq/sched` 42.0%, `clone` 19.3%, `execve` 13.6%, `renameat` 8.3%,
+`mkdirat` 5.0%, `fchmodat` 4.3%, `openat` 2.8%. On the ON side: `irq/sched` 43.9%, `clone` 19.8%,
+`execve` 13.8%, `fchmodat` 7.5%, `mkdirat` 6.4%, `openat` 2.0% — `renameat` drops out of the list
+entirely rather than just shrinking, matching the `unlinkat` pattern (§12) more than the `openat`
+pattern (§13, which left a small residual). `mkdirat`'s and `fchmodat`'s shares shift up slightly
+between the two runs (profiler perturbation + normal run-to-run variance, §11.5/§12.5's standing
+caveat), not a sign either was affected by the `renameat` guard.
+
+### 14.5 Data integrity
+
+Both `e2fsck -fn` (read-only) passes on the ON- and OFF-side disk images post-run reported the
+*same* "unattached zero-length inode" / inode-bitmap-difference symptom on the *same* two
+inodes — the §12.4 write-back-cache-with-no-sync-on-raw-kill artifact, reproduced identically
+regardless of the guard, i.e. not a `renameat`-specific regression. The decisive check is the
+digest table above: content correctness was verified via `sha256sum` on both the renamed-into
+destination path (self-test, §14.3 case 1) and the full regimen's read-back/copy phases (§14.4),
+not just via `ls`/exit-code as `unlinkat`'s original §12.3 did — a `rename` that silently failed
+or scrambled content would show up as a digest mismatch, not just a missing file.
+
+### 14.6 Next
+
+`mkdirat` (2.6%/6.4%) and `fchmodat` (1.8%/7.5%) are now the largest untouched holders in the 2c
+list, both still an order of magnitude behind `irq/sched`/`clone`/`execve`. Whether either is
+worth converting on its own — versus the remaining win being in Phase 3 (scheduler/IRQ) or
+process-creation paths outside this carve-out's scope — is exactly the question the next
+attribution run should answer, per §7's evidence-led rule.

@@ -160,11 +160,18 @@ CHANNEL_REQUEST -----------------+
                                     bridge_process(pid, stdout_fd)
                                       - poll child stdout  (read_fd, non-blocking)
                                       - poll SSH input     (try_read, non-blocking)
-                                      - waitpid(pid) -> drain remaining stdout -> return
+                                      - waitpid(pid) -> drain remaining stdout
+                                                     -> close fds
+                                                     -> send_exit_status(code):
+                                                          exit-status + EOF + CLOSE
 
-  spawn failure (either path) -> fail_spawn(): error message to client, session ends.
-  No built-in shell to fall back to.
+  spawn failure (either path) -> fail_spawn(): error message to client,
+  exit status 127, session ends. No built-in shell to fall back to.
 ```
+
+The `exit-status` request (RFC 4254 §6.10) is not optional bookkeeping — it is
+the only way the client learns the remote exit code, and omitting it made every
+command report 255. See [`EXIT_STATUS_FIX.md`](EXIT_STATUS_FIX.md).
 
 `ssh host <cmd>` (`ssh -p 2223 root@localhost echo hi`) used to do nothing:
 `handle_message` only recognized the `"shell"` channel-request type, so an
@@ -192,3 +199,10 @@ primitives the in-kernel SSH server uses). `sshd/src/crypto.rs` now
 re-exports from that crate instead, so its existing host-run test suite
 (`cargo test -p akuma-ssh-crypto`) covers the exact byte-parsing code the
 `exec` command-string extraction above depends on.
+
+Byte layout that is specific to *this* server — the channel teardown messages —
+lives in `sshd/src/wire.rs`, a lib target with its own host unit tests. Note that
+`crypto.rs` cannot host-test: it calls `libakuma::getrandom`. Pure code must
+import from `akuma-ssh-crypto` directly rather than through that re-export, or it
+drags `libakuma` (and its `#[panic_handler]`) into the build. See
+[`../src/lib.rs`](../src/lib.rs).

@@ -182,9 +182,11 @@ async fn fail_spawn(
     println(&format!("[SSH] {}", msg.trim_end()));
     send_channel_data(stream, session, msg.as_bytes()).await?;
     // 127 — the shell convention for "command not found". Without an explicit
-    // status the client would report 255 (see `send_exit_status`), which reads
+    // status the client would report 255 (see `send_exit_report`), which reads
     // as a connection failure rather than "your command could not be run".
-    send_exit_status(stream, session, 127).await
+    // Synthesised as a clean exit: nothing was ever spawned, so there is no
+    // signal to report.
+    send_exit_report(stream, session, WaitStatus { pid: 0, raw: (127 << 8) }).await
 }
 
 async fn bridge_process(
@@ -224,12 +226,14 @@ async fn bridge_process(
     // pumping stdout until waitpid(pid) reports the shell has exited.
     let mut client_done = false;
 
-    // Evaluates to the child's exit code, which `send_exit_status` below reports
-    // to the client. The only way out of this loop other than the reap is a `?`,
-    // and those all mean the client is already gone.
-    let exit_code = loop {
+    // Evaluates to how the child ended, which `send_exit_report` below relays to
+    // the client. `waitpid_status`, not `waitpid`: the latter returns only
+    // WEXITSTATUS, which is 0 for a signal death and so cannot be told apart
+    // from a clean success. The only way out of this loop other than the reap is
+    // a `?`, and those all mean the client is already gone.
+    let status = loop {
         // 1. Shell exited → drain remaining stdout, then stop.
-        if let Some((_, code)) = waitpid(pid) {
+        if let Some(status) = waitpid_status(pid) {
             loop {
                 let n = read_fd(stdout_fd as i32, &mut buf);
                 if n > 0 {
@@ -238,7 +242,7 @@ async fn bridge_process(
                     break;
                 }
             }
-            break code;
+            break status;
         }
 
         let mut did_io = false;
@@ -341,37 +345,53 @@ async fn bridge_process(
     }
 
     // Only now that the fds are released (so a write error can't leak them via
-    // `?`) tell the client what the command's exit code was.
-    send_exit_status(stream, session, exit_code).await
+    // `?`) tell the client how the command ended.
+    send_exit_report(stream, session, status).await
 }
 
-/// RFC 4254 §6.10: report the command's exit code to the client, then tear the
-/// channel down (`CHANNEL_EOF` + `CHANNEL_CLOSE`).
+/// RFC 4254 §6.10: report how the command ended, then tear the channel down
+/// (`CHANNEL_EOF` + `CHANNEL_CLOSE`).
 ///
 /// This is what makes `ssh host cmd; echo $?` print the command's real status.
 /// OpenSSH's client seeds its own exit status with **255** and only overwrites
-/// it when this `exit-status` request arrives; a server that just closes the
+/// it when one of these requests arrives; a server that just closes the
 /// connection leaves that 255 in place, so *every* remote command — including
-/// a perfectly successful one — looked like a connection failure. Sending the
-/// status is the server's job, not something the client can infer.
+/// a perfectly successful one — looked like a connection failure. Reporting is
+/// the server's job, not something the client can infer.
 ///
-/// `want_reply` MUST be false here: §6.10 forbids a reply to `exit-status`.
+/// §6.10 defines two mutually exclusive reports, and which one applies is
+/// exactly the distinction `WEXITSTATUS` alone cannot make:
 ///
-/// Limitation: a shell killed by a signal is reported as its (zero) exit code
-/// rather than `exit-signal`, because `libakuma::waitpid` decodes only
-/// `WEXITSTATUS` and discards the raw wait status — see `docs/LIMITATIONS.md`.
-async fn send_exit_status(
+/// - clean exit → `exit-status` with the code.
+/// - killed by a signal → `exit-signal` naming the signal. Its exit code is 0,
+///   so sending `exit-status` here would report a crash as a success.
+///
+/// Never both, per the spec.
+async fn send_exit_report(
     stream: &mut SshStream,
     session: &mut SshSession,
-    exit_code: i32,
+    status: WaitStatus,
 ) -> Result<(), NetError> {
     if !session.channel_open {
         return Ok(());
     }
-    println(&format!("[SSH] Exit status: {}", exit_code));
 
     let channel = session.client_channel;
-    let payload = wire::exit_status_payload(channel, exit_code);
+    let payload = match status.term_signal() {
+        Some(sig) => {
+            println(&format!(
+                "[SSH] Killed by signal {} ({})",
+                sig,
+                wire::signal_name(sig)
+            ));
+            let msg = format!("terminated by signal {sig}");
+            wire::exit_signal_payload(channel, sig, &msg)
+        }
+        None => {
+            println(&format!("[SSH] Exit status: {}", status.exit_code()));
+            wire::exit_status_payload(channel, status.exit_code())
+        }
+    };
     send_packet(stream, &payload, session).await?;
 
     // The client returns once the channel closes, using the status recorded

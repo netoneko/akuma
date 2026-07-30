@@ -2281,6 +2281,14 @@ pub(super) fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpa
         Ok(p) => p,
         Err(e) => return e,
     };
+
+    // From here on is pure VFS work (dirfd/cwd-relative path resolution — fd-table +
+    // string ops only, no disk I/O — plus the on-disk directory-entry rewrite in
+    // `crate::fs::rename`, which takes the ext2 write guard). Mirrors `sys_unlinkat`
+    // (§12) — attribution named `renameat` (syscall 38) the largest untouched-syscall
+    // BKL holder after `unlinkat`/`openat`: docs/archive/BKL_VFS_CARVE_OUT.md §14.
+    let _vfs_bkl = VfsBklGuard::new();
+
     let oldpath = resolve_path_at(olddirfd, &raw_old);
     let newpath = resolve_path_at(newdirfd, &raw_new);
     crate::safe_print!(256, "[syscall] renameat: {} -> {}\n", oldpath, newpath);
@@ -2309,6 +2317,12 @@ pub(super) fn sys_renameat2(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newp
         Ok(p) => p,
         Err(e) => return e,
     };
+
+    // See sys_renameat above: path resolution is fd-table/string work only, and the
+    // window also covers the `exists` probe (a real lookup) and `crate::fs::rename`
+    // (the ext2-write-guarded directory-entry rewrite).
+    let _vfs_bkl = VfsBklGuard::new();
+
     let oldpath = resolve_path_at(olddirfd, &raw_old);
     let newpath = resolve_path_at(newdirfd, &raw_new);
 

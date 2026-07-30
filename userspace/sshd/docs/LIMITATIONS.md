@@ -2,17 +2,31 @@
 
 This document outlines the known technical limitations of the current userspace `sshd` implementation in Akuma OS. These constraints are primarily due to the current state of the userspace runtime environment.
 
-## 1. Single-Session Restriction (Serial Processing)
-The most significant limitation is that the server can only handle **one active connection at a time**.
+## 1. Single-Threaded Concurrency (Cooperative, Not Parallel)
+Concurrent sessions **do** work — this section used to say they didn't, which has
+been wrong since the cooperative multiplexer landed (see
+[`FLOW.md`](FLOW.md#after-one-future-per-connection-polled-cooperatively)).
+What remains is that the concurrency is cooperative, not parallel.
 
-- **Cause**: The `main` loop calls `handle_connection`, which is a blocking call. The server will not return to the `accept()` state until the current SSH session is terminated (e.g., the user logs out or the connection drops).
-- **Impact**: New connection attempts will time out or hang if another user is already connected.
+- **Mechanism**: Each connection is one future in a `Vec`, polled round-robin by
+  the loop in `main()`. The listener and every accepted socket are non-blocking,
+  and `SshStream`'s `Read`/`Write` return `Poll::Pending` on `WouldBlock`, so an
+  idle session yields instead of stalling the others.
+- **Constraint**: It is all one OS thread. Any session that performs a genuinely
+  *blocking* syscall stalls **every** other session for its duration — this is
+  exactly the `sleep_ms`-in-a-loop bug documented in `FLOW.md`. Use
+  `crate::yield_now().await`, never `sleep_ms`, inside anything a session future
+  can reach.
+- **Impact**: Sessions doing heavy CPU or blocking I/O add latency to their
+  peers. Real parallelism would need userspace threading (§2).
 
-## 2. Lack of Userspace Threading
-Akuma OS currently does not provide a mechanism for userspace processes to manage multiple threads of execution.
+## 2. No Userspace Threading
+`sshd` cannot spread sessions across cores or threads within its own process.
 
-- **Missing Infrastructure**: There is no `sys_thread_create` or `fork()` syscall available to `libakuma`.
-- **Future Requirement**: To support concurrent connections, the kernel must support thread spawning within a process's address space, and the `sshd` server must be updated to an async-spawn or thread-per-connection model.
+- **Missing Infrastructure**: `libakuma` exposes no `sys_thread_create`; `spawn`
+  creates a whole separate process, not a thread sharing the address space.
+- **Consequence**: The cooperative model in §1 is the only option available. A
+  thread-per-connection or work-stealing design would need kernel support first.
 
 ## 3. Kernel Socket Limits
 All networking in userspace eventually relies on the kernel's network stack.

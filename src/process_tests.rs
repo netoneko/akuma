@@ -633,6 +633,12 @@ pub fn run_all_tests() {
     // must preserve.
     test_openat();
 
+    // sys_renameat/sys_renameat2 entry points: dirfd resolution, RENAME_NOREPLACE,
+    // errno contract — pins what the Phase 2c VfsBklGuard conversion (carve-out doc
+    // §14, the largest untouched-syscall BKL holder once unlinkat/openat were done)
+    // must preserve.
+    test_renameat();
+
     // Phantom-SVC tripwire: runs LAST so it covers every EL0 trap the suite above
     // generated (fork/exec/signal/mmap stress). A nonzero count means an EC_SVC64
     // trap arrived whose insn@ELR-4 was not an `svc` — either stale I-cache or the
@@ -2067,6 +2073,160 @@ fn test_openat() {
     } else {
         crate::safe_print!(64, "[Test] openat FAILED ({} of 7 cases)\n", fails);
         panic!("test_openat: {fails} of 7 cases failed");
+    }
+}
+
+/// `sys_renameat`/`sys_renameat2` (syscalls 38/276) — dirfd resolution, `RENAME_NOREPLACE`,
+/// and the errno contract.
+///
+/// Drives the real syscall ENTRY point via `handle_syscall`. Pins the behaviors the Phase
+/// 2c `VfsBklGuard` conversion (`src/syscall/fs.rs`, carve-out doc §14) must preserve: the
+/// on-disk directory-entry rewrite happens inside the dropped-BKL window and must still
+/// take effect (source gone, destination holds the content), the dirfd-relative case
+/// resolves against fd 7 (same family as the unlinkat/openat dirfd regressions),
+/// `RENAME_NOREPLACE` still rejects an existing destination from inside the window, and
+/// every error path (`EBADF` before the window, `ENOENT` inside it) leaves the window
+/// balanced.
+fn test_renameat() {
+    use crate::syscall::{handle_syscall, nr, BYPASS_VALIDATION};
+    use akuma_exec::process::{
+        register_process, unregister_process, register_thread_pid, unregister_thread_pid,
+        FileDescriptor, KernelFile,
+    };
+    use akuma_exec::threading::current_thread_id;
+    use core::sync::atomic::Ordering;
+
+    const ENOENT: u64 = (-2i64) as u64;
+    const EEXIST: u64 = (-17i64) as u64;
+    const AT_FDCWD: i32 = -100;
+    const RENAME_NOREPLACE: u32 = 1;
+    const ROOT: &str = "/tmp/renameat_selftest";
+
+    // Best-effort clean slate (a crashed prior run may have left the tree).
+    let _ = crate::fs::remove_file(&format!("{ROOT}/abs_dst.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/rel_dst.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/sub/dirfd_dst.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/noreplace_src.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/noreplace_dst.txt"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
+    let _ = crate::fs::remove_dir(ROOT);
+    let _ = crate::fs::create_dir(ROOT);
+    let _ = crate::fs::create_dir(&format!("{ROOT}/sub"));
+
+    // Register a process whose cwd is /tmp (AT_FDCWD-relative) and whose fd 7 names the
+    // `sub` directory (the dirfd-relative case) — same shape as test_unlinkat/test_openat.
+    let tid = current_thread_id();
+    let pid: u32 = 7703;
+    let mut proc = make_test_process(pid);
+    proc.cwd = "/tmp".to_string();
+    proc.fds.table.lock().insert(7, FileDescriptor::File(KernelFile::new(format!("{ROOT}/sub"), 0)));
+    register_process(pid, proc);
+    register_thread_pid(tid, pid);
+
+    let cstr = |s: &str| -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::from(s.as_bytes());
+        v.push(0);
+        v
+    };
+    let renameat = |olddirfd: i32, old: &[u8], newdirfd: i32, new: &[u8]| -> u64 {
+        handle_syscall(nr::RENAMEAT, &[olddirfd as u64, old.as_ptr() as u64, newdirfd as u64, new.as_ptr() as u64, 0, 0])
+    };
+    let renameat2 = |olddirfd: i32, old: &[u8], newdirfd: i32, new: &[u8], flags: u32| -> u64 {
+        handle_syscall(nr::RENAMEAT2, &[olddirfd as u64, old.as_ptr() as u64, newdirfd as u64, new.as_ptr() as u64, u64::from(flags), 0])
+    };
+
+    BYPASS_VALIDATION.store(true, Ordering::Release);
+    let mut fails = 0u32;
+
+    // 1. Absolute paths, both sides -> source gone, destination holds the content.
+    let _ = crate::fs::write_file(&format!("{ROOT}/abs_src.txt"), b"abs-payload");
+    let op = cstr(&format!("{ROOT}/abs_src.txt"));
+    let np = cstr(&format!("{ROOT}/abs_dst.txt"));
+    let r = renameat(AT_FDCWD, &op, AT_FDCWD, &np);
+    if r != 0 || crate::fs::exists(&format!("{ROOT}/abs_src.txt"))
+        || crate::fs::read_file(&format!("{ROOT}/abs_dst.txt")).ok().as_deref() != Some(b"abs-payload" as &[u8])
+    {
+        fails += 1;
+        crate::safe_print!(96, "[Test] renameat abs FAILED r={} src_exists={}\n", r, crate::fs::exists(&format!("{ROOT}/abs_src.txt")));
+    }
+
+    // 2. AT_FDCWD-relative (cwd=/tmp) on both sides.
+    let _ = crate::fs::write_file(&format!("{ROOT}/rel_src.txt"), b"rel-payload");
+    let op = cstr("renameat_selftest/rel_src.txt");
+    let np = cstr("renameat_selftest/rel_dst.txt");
+    let r = renameat(AT_FDCWD, &op, AT_FDCWD, &np);
+    if r != 0 || crate::fs::exists(&format!("{ROOT}/rel_src.txt")) || !crate::fs::exists(&format!("{ROOT}/rel_dst.txt")) {
+        fails += 1;
+        crate::safe_print!(96, "[Test] renameat rel(cwd) FAILED r={} dst_exists={}\n", r, crate::fs::exists(&format!("{ROOT}/rel_dst.txt")));
+    }
+
+    // 3. dirfd-relative source (fd 7 -> .../sub): renameat must NOT ignore dirfd — same
+    //    regression family as unlinkat/openat (archive/STAT_AND_UNLINKAT_FIX.md).
+    let _ = crate::fs::write_file(&format!("{ROOT}/sub/dirfd_src.txt"), b"dirfd-payload");
+    let op = cstr("dirfd_src.txt");
+    let np = cstr("dirfd_dst.txt");
+    let r = renameat(7, &op, 7, &np);
+    if r != 0 || crate::fs::exists(&format!("{ROOT}/sub/dirfd_src.txt")) || !crate::fs::exists(&format!("{ROOT}/sub/dirfd_dst.txt")) {
+        fails += 1;
+        crate::safe_print!(96, "[Test] renameat dirfd FAILED r={} dst_exists={}\n", r, crate::fs::exists(&format!("{ROOT}/sub/dirfd_dst.txt")));
+    }
+
+    // 4. renameat2 RENAME_NOREPLACE: existing destination -> EEXIST, source untouched.
+    //    Exercises the `exists` probe now living inside the dropped-BKL window.
+    let _ = crate::fs::write_file(&format!("{ROOT}/noreplace_src.txt"), b"src");
+    let _ = crate::fs::write_file(&format!("{ROOT}/noreplace_dst.txt"), b"dst");
+    let op = cstr(&format!("{ROOT}/noreplace_src.txt"));
+    let np = cstr(&format!("{ROOT}/noreplace_dst.txt"));
+    let r = renameat2(AT_FDCWD, &op, AT_FDCWD, &np, RENAME_NOREPLACE);
+    if r != EEXIST || !crate::fs::exists(&format!("{ROOT}/noreplace_src.txt"))
+        || crate::fs::read_file(&format!("{ROOT}/noreplace_dst.txt")).ok().as_deref() != Some(b"dst" as &[u8])
+    {
+        fails += 1;
+        crate::safe_print!(96, "[Test] renameat2 NOREPLACE FAILED r={} (want EEXIST)\n", r);
+    }
+
+    // 5. dirfd in valid range but not present in the fd table. Unlike sys_unlinkat
+    //    (which explicitly checks and returns EBADF), sys_renameat has no such check —
+    //    resolve_path_at falls through to base="/" for an unresolvable dirfd (same
+    //    pre-existing divergence test_openat's case 6 documents for sys_openat). So
+    //    "anything" resolves to "/anything", which doesn't exist -> ENOENT. This case
+    //    exists to pin that behavior (not to change it) and to exercise the error path
+    //    with an unusual dirfd through the dropped-BKL window.
+    let op = cstr("anything");
+    let np = cstr("anything-else");
+    let r = renameat(999, &op, AT_FDCWD, &np);
+    if r != ENOENT {
+        fails += 1;
+        crate::safe_print!(64, "[Test] renameat unopen-dirfd FAILED r={} (want ENOENT)\n", r);
+    }
+
+    // 6. ENOENT: missing source. Exercises the error path THROUGH the dropped-BKL window.
+    let op = cstr(&format!("{ROOT}/nope_src.txt"));
+    let np = cstr(&format!("{ROOT}/nope_dst.txt"));
+    let r = renameat(AT_FDCWD, &op, AT_FDCWD, &np);
+    if r != ENOENT {
+        fails += 1;
+        crate::safe_print!(64, "[Test] renameat missing FAILED r={} (want ENOENT)\n", r);
+    }
+
+    BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    // Cleanup (best-effort; the test verdict is the case results above, not this).
+    let _ = crate::fs::remove_file(&format!("{ROOT}/abs_dst.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/rel_dst.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/sub/dirfd_dst.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/noreplace_src.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/noreplace_dst.txt"));
+    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
+    let _ = crate::fs::remove_dir(ROOT);
+
+    if fails == 0 {
+        crate::safe_print!(128, "[Test] renameat PASSED (6 cases: abs/cwd-rel/dirfd/NOREPLACE/unopen-dirfd/ENOENT)\n");
+    } else {
+        crate::safe_print!(64, "[Test] renameat FAILED ({} of 6 cases)\n", fails);
+        panic!("test_renameat: {fails} of 6 cases failed");
     }
 }
 

@@ -50,6 +50,68 @@ pub fn exit_status_payload(channel: u32, exit_code: i32) -> Vec<u8> {
     payload
 }
 
+/// RFC 4254 §6.10 signal name for a Linux/Akuma signal number — the value that
+/// goes in an `exit-signal` request.
+///
+/// The spec lists bare names without the `SIG` prefix, and permits anything else
+/// only in the local-extension form `sig-name@domain`. Signals outside that list
+/// therefore get the extension form rather than being forced onto a wrong
+/// standard name, so a client never displays a plausible lie like `TERM` for a
+/// signal that wasn't `SIGTERM`.
+pub fn signal_name(sig: u8) -> &'static str {
+    match sig {
+        1 => "HUP",
+        2 => "INT",
+        3 => "QUIT",
+        4 => "ILL",
+        6 => "ABRT",
+        8 => "FPE",
+        9 => "KILL",
+        10 => "USR1",
+        11 => "SEGV",
+        12 => "USR2",
+        13 => "PIPE",
+        14 => "ALRM",
+        15 => "TERM",
+        _ => "UNKNOWN@akuma.os",
+    }
+}
+
+/// RFC 4254 §6.10 `exit-signal` channel request — the counterpart to
+/// `exit_status_payload` for a command **killed by a signal**.
+///
+/// A signal death has no exit code to report (`WEXITSTATUS` is 0, which would
+/// read as success), so the spec gives it a separate message naming the signal.
+/// Send this *instead of* `exit-status`, never both. OpenSSH's client responds
+/// by reporting 255 and printing "Killed by signal N" — deliberately not a
+/// small number, so a killed remote command can't be mistaken for a clean exit.
+///
+/// Layout:
+///
+/// ```text
+/// byte      SSH_MSG_CHANNEL_REQUEST (98)
+/// uint32    recipient channel
+/// string    "exit-signal"
+/// boolean   want_reply — MUST be false
+/// string    signal name, no "SIG" prefix (e.g. "KILL")
+/// boolean   core dumped
+/// string    error message (UTF-8)
+/// string    language tag
+/// ```
+///
+/// `core_dumped` is always false: Akuma does not write core files.
+pub fn exit_signal_payload(channel: u32, sig: u8, message: &str) -> Vec<u8> {
+    let mut payload = vec![SSH_MSG_CHANNEL_REQUEST];
+    write_u32(&mut payload, channel);
+    write_string(&mut payload, b"exit-signal");
+    payload.push(0); // want_reply = false, required by §6.10
+    write_string(&mut payload, signal_name(sig).as_bytes());
+    payload.push(0); // core_dumped = false
+    write_string(&mut payload, message.as_bytes());
+    write_string(&mut payload, b""); // language tag: none
+    payload
+}
+
 /// RFC 4254 §5.3 `SSH_MSG_CHANNEL_EOF`: no more data will be sent on this
 /// channel. Sent before the close so the client knows the output is complete.
 pub fn channel_eof_payload(channel: u32) -> Vec<u8> {
@@ -131,6 +193,88 @@ mod tests {
             off += 1;
             assert_eq!(read_u32(&payload, &mut off), Some(want), "code {code}");
         }
+    }
+
+    /// Full layout of an `exit-signal` request, including both trailing strings
+    /// — a client that parses the fields in order will desync if either the
+    /// core-dumped boolean or the language tag is dropped.
+    #[test]
+    fn exit_signal_payload_has_exact_rfc_layout() {
+        let payload = exit_signal_payload(0, 9, "hi");
+        let mut want = vec![98u8];
+        want.extend_from_slice(&[0, 0, 0, 0]); // channel
+        want.extend_from_slice(&[0, 0, 0, 11]); // "exit-signal"
+        want.extend_from_slice(b"exit-signal");
+        want.push(0); // want_reply = false
+        want.extend_from_slice(&[0, 0, 0, 4]); // "KILL"
+        want.extend_from_slice(b"KILL");
+        want.push(0); // core_dumped = false
+        want.extend_from_slice(&[0, 0, 0, 2]); // "hi"
+        want.extend_from_slice(b"hi");
+        want.extend_from_slice(&[0, 0, 0, 0]); // language tag = ""
+        assert_eq!(payload, want);
+    }
+
+    #[test]
+    fn exit_signal_round_trips_every_field() {
+        let payload = exit_signal_payload(3, 11, "boom");
+        let mut off = 1;
+        assert_eq!(read_u32(&payload, &mut off), Some(3));
+        assert_eq!(read_string(&payload, &mut off), Some(&b"exit-signal"[..]));
+        assert_eq!(payload[off], 0, "want_reply must be false");
+        off += 1;
+        assert_eq!(read_string(&payload, &mut off), Some(&b"SEGV"[..]));
+        assert_eq!(payload[off], 0, "core_dumped must be false");
+        off += 1;
+        assert_eq!(read_string(&payload, &mut off), Some(&b"boom"[..]));
+        assert_eq!(read_string(&payload, &mut off), Some(&b""[..]));
+        assert_eq!(off, payload.len(), "trailing bytes after exit_signal");
+    }
+
+    /// The names RFC 4254 §6.10 actually lists, spelled without the SIG prefix.
+    #[test]
+    fn signal_names_match_the_rfc_list() {
+        let expected = [
+            (1u8, "HUP"), (2, "INT"), (3, "QUIT"), (4, "ILL"), (6, "ABRT"),
+            (8, "FPE"), (9, "KILL"), (10, "USR1"), (11, "SEGV"), (12, "USR2"),
+            (13, "PIPE"), (14, "ALRM"), (15, "TERM"),
+        ];
+        for (sig, name) in expected {
+            assert_eq!(signal_name(sig), name, "signal {sig}");
+            assert!(!name.starts_with("SIG"), "{name} must not carry the SIG prefix");
+        }
+    }
+
+    /// A signal with no standard name must use the `@domain` extension form
+    /// rather than borrowing a standard name it isn't.
+    #[test]
+    fn unlisted_signals_use_the_extension_form() {
+        for sig in [5u8, 7, 16, 31, 64] {
+            let name = signal_name(sig);
+            assert!(name.contains('@'), "signal {sig} name {name:?} must be an extension");
+        }
+        // And must never collide with a listed name.
+        for sig in [5u8, 7, 16, 31, 64] {
+            for listed in ["HUP", "INT", "QUIT", "ILL", "ABRT", "FPE", "KILL",
+                           "USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM"] {
+                assert_ne!(signal_name(sig), listed);
+            }
+        }
+    }
+
+    /// `exit-status` and `exit-signal` share the CHANNEL_REQUEST tag, so the
+    /// request-name string is the only thing distinguishing them on the wire.
+    #[test]
+    fn exit_status_and_exit_signal_differ_by_request_name() {
+        let status = exit_status_payload(1, 0);
+        let signal = exit_signal_payload(1, 9, "");
+        assert_eq!(status[0], signal[0], "both are CHANNEL_REQUEST");
+        let mut so = 1;
+        let mut go = 1;
+        let _ = read_u32(&status, &mut so);
+        let _ = read_u32(&signal, &mut go);
+        assert_eq!(read_string(&status, &mut so), Some(&b"exit-status"[..]));
+        assert_eq!(read_string(&signal, &mut go), Some(&b"exit-signal"[..]));
     }
 
     #[test]

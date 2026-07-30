@@ -1539,12 +1539,77 @@ pub fn reattach(pid: u32) -> i32 {
     syscall(syscall::REATTACH, pid as u64, 0, 0, 0, 0, 0) as i32
 }
 
-/// Wait for a child process (non-blocking)
+/// How a reaped child ended: the raw Linux-style wait status plus the accessors
+/// needed to interpret it.
 ///
-/// Returns:
-/// - Some((pid, exit_code)) if child has exited
-/// - None if child is still running or not found
-pub fn waitpid(pid: u32) -> Option<(u32, i32)> {
+/// Exists because a bare exit code cannot express "killed by a signal". The
+/// kernel already distinguishes the two cases (`encode_wait_status` in
+/// `src/syscall/proc.rs`: a clean exit goes in the high byte, a signal death in
+/// the low 7 bits), but [`waitpid`] reads only the high byte and so reports a
+/// signal-killed child as exit code 0 — indistinguishable from success. Callers
+/// that need the difference should use [`waitpid_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitStatus {
+    /// PID of the reaped child.
+    pub pid: u32,
+    /// The status word exactly as the kernel wrote it, for callers that want to
+    /// apply their own macros.
+    pub raw: u32,
+}
+
+impl WaitStatus {
+    /// `WIFEXITED`: the child terminated normally (low 7 bits clear).
+    pub fn exited(&self) -> bool {
+        self.raw & 0x7F == 0
+    }
+
+    /// `WEXITSTATUS`: the exit code, meaningful only when [`Self::exited`].
+    /// Returns 0 for a signal death, which is exactly the ambiguity
+    /// [`Self::signaled`] exists to resolve.
+    pub fn exit_code(&self) -> i32 {
+        ((self.raw >> 8) & 0xFF) as i32
+    }
+
+    /// `WIFSIGNALED`: the child was killed by a signal.
+    ///
+    /// 0x7F in the low byte is Linux's `WIFSTOPPED` marker, not a termination.
+    /// Akuma never encodes a stopped status today, but it is excluded here so
+    /// that adding one later cannot make this silently claim a kill.
+    pub fn signaled(&self) -> bool {
+        let low = self.raw & 0x7F;
+        low != 0 && low != 0x7F
+    }
+
+    /// `WTERMSIG`: the signal that killed the child, or `None` if it exited
+    /// normally.
+    pub fn term_signal(&self) -> Option<u8> {
+        if self.signaled() {
+            Some((self.raw & 0x7F) as u8)
+        } else {
+            None
+        }
+    }
+
+    /// Exit code in the shell/`$?` convention: `128 + signal` for a signal
+    /// death, otherwise the plain exit code. What a shell would have reported.
+    pub fn shell_code(&self) -> i32 {
+        match self.term_signal() {
+            Some(sig) => 128 + sig as i32,
+            None => self.exit_code(),
+        }
+    }
+}
+
+/// Wait for a child process (non-blocking), returning the full wait status.
+///
+/// Prefer this over [`waitpid`] whenever a signal death must be distinguished
+/// from a clean exit — a crashed child, a `kill`ed one, and a child that exited
+/// 0 are all `exit_code() == 0` and only [`WaitStatus::signaled`] tells them
+/// apart.
+///
+/// Returns `None` if the child is still running or does not exist (the same
+/// two-cases-in-one-value limitation [`waitpid`] has always had).
+pub fn waitpid_status(pid: u32) -> Option<WaitStatus> {
     let mut status: u32 = 0;
     let result = syscall(
         syscall::WAITPID,
@@ -1560,10 +1625,21 @@ pub fn waitpid(pid: u32) -> Option<(u32, i32)> {
         // Error (e.g., no such child)
         None
     } else {
-        // Child exited, extract exit code from Linux-style status
-        let exit_code = ((status >> 8) & 0xFF) as i32;
-        Some((result as u32, exit_code))
+        Some(WaitStatus { pid: result as u32, raw: status })
     }
+}
+
+/// Wait for a child process (non-blocking)
+///
+/// Returns:
+/// - Some((pid, exit_code)) if child has exited
+/// - None if child is still running or not found
+///
+/// The exit code is `WEXITSTATUS` only: a child **killed by a signal** reports
+/// 0 here and is indistinguishable from a clean success. Use
+/// [`waitpid_status`] if that distinction matters.
+pub fn waitpid(pid: u32) -> Option<(u32, i32)> {
+    waitpid_status(pid).map(|st| (st.pid, st.exit_code()))
 }
 
 // ============================================================================
