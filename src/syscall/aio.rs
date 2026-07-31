@@ -71,7 +71,7 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
         None => return EFAULT,
     };
 
-    let ring_va = match proc.memory.alloc_mmap(PAGE_SIZE) {
+    let ring_va = match proc.vm_alloc_mmap(PAGE_SIZE) {
         Some(va) => va,
         None => return ENOMEM,
     };

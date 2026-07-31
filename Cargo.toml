@@ -219,6 +219,32 @@ no-bkl-vfs = ["akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs", "akuma-net/no-bk
 # A no-op (byte-for-byte unchanged) on every build that doesn't set both features.
 no-bkl-process = ["akuma-exec/no-bkl-process"]
 
+# Run the memory-management syscalls (`mprotect`/`madvise`/`munmap`/`mremap`/`mmap`)
+# WITHOUT the Big Kernel Lock — Phase 5 of
+# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md, the fourth subsystem carved out.
+# Unlike net/vfs/process, this phase's own audit found two real gaps rather than
+# rediscovering an existing lock: `ProcessMemory::free_regions` was a plain
+# unguarded `Vec` (fixed by folding it under the existing `Process::vm_lock`, see
+# `Process::vm_alloc_mmap`/`vm_free_mmap`), and `sys_mmap`'s OOM/reclaim sweep
+# mutated page tables with no `as_lock` hold at all (fixed by taking a per-page
+# `as_lock_hold` in `reclaim_clean_file_pages`). With those closed, every piece of
+# state these syscalls touch — `Process::as_lock` (page tables), `Process::vm_lock`
+# (`mmap_regions` + the mmap free-list), `LAZY_REGION_TABLE`, PMM/FRAME_TRACKER, and
+# `SHARED_FILE_MAPPINGS` — already carries its own fine-grained lock independent of
+# the BKL. build.rs emits `cfg(kernel_no_bkl_mm)` from CARGO_FEATURE_NO_BKL_MM.
+# Unlike net/vfs/process, attribution has never named an mm syscall as a real
+# contention target (`mmap` was 2.4% of the last measured pool, itself since cut
+# 67% by the `netpoll_drain` carve, §20 of BKL_VFS_CARVE_OUT.md) — this phase is
+# plan-driven, not evidence-driven. A no-op (byte-for-byte unchanged) on every
+# build that doesn't set both features. Unlike net/vfs/process, none of the
+# underlying locks (`as_lock`, `vm_lock`, `LAZY_REGION_TABLE`, PMM) need to know
+# this feature exists — their IRQ-masking is already unconditional (`as_lock` on
+# `kernel_smp_shared` alone, the rest always-on), not conditionally gated on being
+# reachable from a BKL-free window the way `PreemptGuard` is for net/vfs (see
+# BKL_VFS_CARVE_OUT.md §19.3) — so this is a bin-crate-only feature with nothing
+# to forward into `akuma-exec`.
+no-bkl-mm = []
+
 # BKL-hold attribution (measurement builds only — never ship it). Enables the
 # per-tag BKL profiler in `akuma_exec::sync` for the whole boot and makes the
 # async-main loop print a periodic `[BKLPROF]` delta histogram: which syscall /

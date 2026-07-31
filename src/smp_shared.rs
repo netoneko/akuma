@@ -142,6 +142,29 @@ pub fn set_process_bkl_drop_enabled(on: bool) {
     akuma_exec::process::set_process_bkl_drop_enabled(on);
 }
 
+/// Runtime toggle (default **on**) for `no-bkl-mm` (Phase 5 of
+/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md) — drop the BKL for the whole
+/// duration of `sys_mprotect`/`sys_madvise`/`sys_munmap`/`sys_mremap`/`sys_mmap`,
+/// relying on `Process::as_lock` (page tables), `Process::vm_lock` (`mmap_regions`
+/// and the mmap free-list), `LAZY_REGION_TABLE`, PMM/`FRAME_TRACKER`, and
+/// `SHARED_FILE_MAPPINGS` for cross-core mutual exclusion instead. `MmBklGuard`
+/// reads this at construct/drop time (latched, same discipline as
+/// `VFS_BKL_DROP_ENABLED`) so an `smp-shared` boot with the feature compiled in can
+/// still A/B against the BKL-held path without a rebuild.
+static MM_BKL_DROP_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Whether the mm-syscall BKL-drop (`no-bkl-mm`) is currently enabled.
+#[inline]
+pub fn mm_bkl_drop_enabled() -> bool {
+    MM_BKL_DROP_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Enable/disable the mm-syscall BKL-drop at runtime. Used by A/B measurement; also
+/// serves as a runtime kill-switch, same as `set_vfs_bkl_drop_enabled`.
+pub fn set_mm_bkl_drop_enabled(on: bool) {
+    MM_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
+}
+
 /// Runtime toggle (default **off**) for the M5c optimization: run the scheduler SGI
 /// BKL-free when it preempted EL0 (userspace, no BKL held), so peer cores' timer ticks
 /// don't serialize on the BKL. Correct at SMP=2. Left **off** because at SMP≥4 it opens a

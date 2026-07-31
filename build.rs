@@ -6,6 +6,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_network)");
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_vfs)");
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_process)");
+    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_mm)");
     println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
 
     // Multikernel (one-kernel-per-core) gate. ALL secondary-core code lives behind
@@ -77,6 +78,22 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_PROCESS");
     if std::env::var("CARGO_FEATURE_NO_BKL_PROCESS").is_ok() {
         println!("cargo:rustc-cfg=kernel_no_bkl_process");
+    }
+
+    // BKL-free memory-management syscalls (Phase 5 of
+    // docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), mirroring `kernel_no_bkl_vfs`.
+    // `cfg(kernel_no_bkl_mm)` makes `sys_mprotect`/`sys_madvise`/`sys_munmap`/
+    // `sys_mremap`/`sys_mmap` drop the BKL for their duration, relying on
+    // `Process::as_lock` (page tables), `Process::vm_lock` (mmap_regions AND the
+    // mmap free-list — extended to cover the latter as part of this carve, see
+    // `Process::vm_alloc_mmap`/`vm_free_mmap`), `LAZY_REGION_TABLE`, PMM/
+    // FRAME_TRACKER, and `SHARED_FILE_MAPPINGS` — all already independent of the
+    // BKL. Only meaningful under shared-kernel SMP. Emitted independently of
+    // `smp_shared` so the guard body (gated on `all(kernel_smp_shared,
+    // kernel_no_bkl_mm)`) can compile-check in either combination.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_MM");
+    if std::env::var("CARGO_FEATURE_NO_BKL_MM").is_ok() {
+        println!("cargo:rustc-cfg=kernel_no_bkl_mm");
     }
 
     // BKL-hold attribution build. Turns on the per-tag profiler in

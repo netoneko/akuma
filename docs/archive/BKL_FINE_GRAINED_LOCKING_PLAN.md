@@ -863,11 +863,56 @@ work is a BKL-drop guard plus inner-lock hardening. No new locks were introduced
       `&`+`wait` unusable, so parallel shell workloads must join on sentinel files.
 - [x] Combined net+VFS large-download I/O regimen (that doc §8, re-run post-fix §9.4)
 
-### Phase 5 - Memory Management Locks
-- [ ] `as_lock` extended
-- [ ] PMM locks added
-- [ ] TLB shootdown updated
-- [ ] Tests passing
+### Phase 5 - Memory Management Locks — SHIPPED (2026-08-01, `no-bkl-mm`, not yet default-on)
+
+See **[BKL_MM_CARVE_OUT.md](BKL_MM_CARVE_OUT.md)** for the full writeup. Headline,
+same shape as Phases 2/3/4: the sketched new locks below were **not built** —
+`as_lock`/`vm_lock`/`LAZY_REGION_TABLE`/PMM already covered every mm syscall's state
+except two real gaps (an unguarded `ProcessMemory::free_regions`, and `sys_mmap`'s
+OOM-reclaim path missing an `as_lock` hold on its page-table writes), both closed by
+reusing existing locks rather than adding new ones.
+
+Unlike Phases 2–4, this phase was picked by the plan, not by attribution — no mm
+syscall has ever measured as a significant BKL holder (`mmap` was 2.4% of the pool
+before the `netpoll_drain` carve cut it 67%). So there is no before/after contention
+number here the way `unlinkat` (72.6%→absent) or `netpoll_drain` (57.2%→absent) got
+one — see that doc's §5.
+
+- [x] ~~`as_lock` extended~~ — unnecessary; `Process::as_lock` already covers every
+      mm-syscall PTE edit (same lock `fork_process`'s CoW pass and the fault handler
+      already use BKL-free)
+- [x] ~~PMM locks added~~ — unnecessary; `PMM`/`FRAME_TRACKER`/`COW_REFCOUNTS` already
+      self-locked, never held across a yield
+- [x] ~~TLB shootdown updated~~ — unnecessary; TLB flushes already happen inside the
+      existing `as_lock` holds
+- [x] Real gap found and fixed: `ProcessMemory::free_regions`/`alloc_mmap()` had no
+      lock at all — folded under the existing `Process::vm_lock` via two new methods,
+      `vm_alloc_mmap`/`vm_free_mmap`
+- [x] Real gap found and fixed: `sys_mmap`'s OOM/reclaim sweep
+      (`reclaim_clean_file_pages` → `try_evict_ro_page`) mutated page tables with no
+      `as_lock` hold — fixed with a per-page (not per-sweep) hold
+- [x] `no-bkl-mm` feature + `cfg(kernel_no_bkl_mm)` + runtime A/B toggle
+      (`mm_bkl_drop_enabled`/`set_mm_bkl_drop_enabled`, latched at construction like
+      `VfsBklGuard`)
+- [x] `sys_mprotect`/`sys_madvise`/`sys_munmap`/`sys_mremap`/`sys_mmap` converted
+- [x] Boot self-test `test_mm_bkl_drop` (ledger balance across early-error + real
+      unmapped-VA paths + an mmap/munmap round trip + the kill switch), PASSED at
+      SMP=2 and SMP=4 (real QEMU boots): 0 PANIC/WILD, 0 stale-ledger heals
+- [x] Real-PTE-install correctness (what the boot self-test structurally can't cover
+      — `map_user_page_no_flush` reads the live TTBR0_EL1) validated end-to-end with
+      the same tools Phase 2e used: `mmap_stress`/`mmap_file`/`mmapsum`/`fpfault`/
+      `neonfault` + `llama-bench`, all clean, matching or exceeding the original
+      Phase 2e table
+- [x] Contention regimen (`net4→read4→cp2→rm`, SMP=4): 6/6 digests exact, 0 stuck,
+      total workload spins 47.3M → 42.6M (~10% cut) — but mm syscalls don't appear
+      as named holders in this regimen either before or after, so the cut isn't
+      attributable specifically to this carve (see the doc's §5)
+- [ ] **Not yet promoted to `smp-shared`'s default bundle** — unlike Phases 2–4,
+      which were promoted the same session they landed, this phase has no
+      contention number to justify default-on the way `no-bkl-process`'s
+      `clone` 19.5%→2.5% did. Promote once a real mmap-heavy contention A/B exists,
+      or on a deliberate decision that the audit + boot-suite + stress-tool
+      verification here is sufficient on its own.
 
 ### Phase 6 - Device Driver Locks
 - [ ] Device drivers audited

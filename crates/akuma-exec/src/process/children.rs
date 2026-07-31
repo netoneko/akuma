@@ -526,7 +526,7 @@ pub fn alloc_mmap(size: usize) -> usize {
     };
 
     // Use per-process memory tracking
-    match proc.memory.alloc_mmap(size) {
+    match proc.vm_alloc_mmap(size) {
         Some(addr) => addr,
         None => {
             log::debug!("[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}",
@@ -667,7 +667,22 @@ pub fn reclaim_clean_file_pages(want: usize) -> usize {
                 break 'sweep;
             }
             scanned += 1;
-            if let Some(frame) = proc.address_space.try_evict_ro_page(va) {
+            // `try_evict_ro_page` walks and clears a live PTE, same class of edit as
+            // every other page-table mutation in this address space — it needs
+            // `as_lock` to exclude a concurrent BKL-free fault (or a future BKL-free
+            // mmap-family syscall) on the same page, exactly like the fault handler's
+            // own per-page `as_lock` holds. One hold per page (not one hold spanning
+            // the whole up-to-262144-page scan): this loop is a bounded but
+            // potentially long sweep, and `as_lock_hold` masks IRQs for its duration —
+            // holding it across the entire sweep would starve this core's timer for
+            // however long the scan runs, exactly the "mask per attempt, never across
+            // an unbounded wait" rule (docs/reference/subsystems/locking.md).
+            let evicted = {
+                #[cfg(kernel_smp_shared)]
+                let _asg = Process::as_lock_hold(&proc.as_lock);
+                proc.address_space.try_evict_ro_page(va)
+            };
+            if let Some(frame) = evicted {
                 (runtime().free_page)(frame);
                 freed += 1;
             }
@@ -1045,7 +1060,7 @@ pub fn remove_mmap_region(start_va: usize) -> Option<Vec<PhysFrame>> {
     // RECLAIM: Add the freed range to free_regions. Size from `pages` (the
     // authoritative extent) so a CoW-inherited region — which owns no frames —
     // still recycles its full VA range rather than zero bytes.
-    proc.memory.free_regions.push((region.start_va, region.len_bytes()));
+    proc.vm_free_mmap(region.start_va, region.len_bytes());
 
     Some(region.frames)
 }

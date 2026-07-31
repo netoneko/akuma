@@ -1,6 +1,72 @@
 use super::*;
 use akuma_exec::process::MmapRegion;
 
+/// RAII guard that runs a memory-management syscall **without** the Big Kernel
+/// Lock — Phase 5 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md. Mirrors
+/// [`super::fs::VfsBklGuard`] exactly, including the latching discipline.
+///
+/// Constructed at the top of `sys_mprotect`/`sys_madvise`/`sys_munmap`/
+/// `sys_mremap`/`sys_mmap` (after early-error/arg-validation returns — an
+/// early `EINVAL` on a malformed length never touches the state this guard
+/// exists to protect, so it shouldn't pay for a drop+reacquire): `new()` DROPS
+/// the BKL so this core runs the syscall concurrently with peer cores, and
+/// `drop()` RE-ACQUIRES it on every return path. Correctness rests on the state
+/// these syscalls mutate already carrying its own fine-grained lock —
+/// `Process::as_lock` (page-table PTE edits, via `AsLockHold`/`as_lock_hold`),
+/// `Process::vm_lock` (`mmap_regions` AND the mmap free-list, via
+/// `vm_with_regions`/`vm_alloc_mmap`/`vm_free_mmap`), `LAZY_REGION_TABLE`, PMM/
+/// `FRAME_TRACKER` (never held across a yield), and `SHARED_FILE_MAPPINGS` — so
+/// the BKL is redundant for them. Two gaps this phase's audit found (a plain
+/// unguarded `ProcessMemory::free_regions`, and `sys_mmap`'s OOM/reclaim sweep
+/// mutating page tables with no `as_lock` hold) were closed as a prerequisite;
+/// see `Process::vm_alloc_mmap`/`vm_free_mmap` and
+/// `reclaim_clean_file_pages`'s per-page `as_lock_hold`.
+///
+/// Unlike the VFS/net carve-outs, none of `as_lock`/`vm_lock`/`LAZY_REGION_TABLE`/
+/// PMM need to know a BKL-free window is calling them — their IRQ-masking is
+/// already unconditional (not gated on being reachable from a dropped-BKL window
+/// the way `PreemptGuard` is, see BKL_VFS_CARVE_OUT.md §19.3), so there is no
+/// AB-BA nested-IRQ hazard analogous to the one that gate exists to close.
+///
+/// Zero-cost no-op unless BOTH `kernel_smp_shared` and `kernel_no_bkl_mm` are set
+/// (or the runtime toggle `mm_bkl_drop_enabled()` is off) — the struct is empty
+/// and `new`/`drop` compile to nothing.
+pub(super) struct MmBklGuard {
+    /// Whether `new()` actually dropped the BKL, **latched at construction** —
+    /// same reasoning as `VfsBklGuard::dropped_bkl`: `drop()` must not re-read
+    /// `mm_bkl_drop_enabled()`, since a toggle flip mid-syscall would otherwise
+    /// unbalance the syscall wrapper's single `leave_kernel`.
+    #[cfg(all(kernel_smp_shared, kernel_no_bkl_mm))]
+    dropped_bkl: bool,
+}
+
+impl MmBklGuard {
+    #[inline]
+    pub(super) fn new() -> Self {
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_mm))]
+        let dropped_bkl = crate::smp_shared::mm_bkl_drop_enabled();
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_mm))]
+        if dropped_bkl {
+            akuma_exec::bkl::dropped_window_open();
+        }
+        Self {
+            #[cfg(all(kernel_smp_shared, kernel_no_bkl_mm))]
+            dropped_bkl,
+        }
+    }
+}
+
+impl Drop for MmBklGuard {
+    #[inline]
+    fn drop(&mut self) {
+        // Latched in `new()` — deliberately NOT a fresh `mm_bkl_drop_enabled()` read.
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_mm))]
+        if self.dropped_bkl {
+            akuma_exec::bkl::dropped_window_close();
+        }
+    }
+}
+
 // ── Linux mmap flag constants ────────────────────────────────────────────────
 //
 // Lifted from `sys_mmap` to module scope so the same bits are used by both
@@ -217,6 +283,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         Some(p) => p,
         None => return ESRCH,
     };
+    let _mm_window = MmBklGuard::new();
 
     let mmap_addr = if (is_fixed || is_fixed_noreplace) && addr != 0 {
         // Reject MAP_FIXED mappings that overlap the kernel identity-map range.
@@ -240,7 +307,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             }
         }
         addr
-    } else if let Some(a) = proc.memory.alloc_mmap(pages * 4096) { a } else {
+    } else if let Some(a) = proc.vm_alloc_mmap(pages * 4096) { a } else {
         crate::safe_print!(192, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
             proc.pid, pages * 4096,
             proc.memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed),
@@ -439,26 +506,33 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
         return old_addr as u64;
     }
 
-    if flags & MREMAP_MAYMOVE == 0 {
-        let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    // Resolve the address-space owner ONCE, while the BKL is still held, and reuse
+    // this reference for the rest of the call — the process table itself has no
+    // inner lock (BKL_PROCESS_CARVE_OUT.md's audit), so every syscall carved out of
+    // the BKL so far resolves its process reference before opening the drop window
+    // rather than re-walking the table inside it.
+    let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
-        let lazy_key = akuma_exec::process::lookup_process(owner_pid).map_or(owner_pid, |p| p.tgid);
+    let proc = akuma_exec::process::lookup_process(owner_pid);
+    let _mm_window = MmBklGuard::new();
+
+    if flags & MREMAP_MAYMOVE == 0 {
         let is_mapped = akuma_exec::mmu::is_current_user_page_mapped(old_addr)
-            || akuma_exec::process::lazy_region_lookup_for_pid(lazy_key, old_addr).is_some()
-            || akuma_exec::process::lookup_process(owner_pid)
-                .is_some_and(|p| p.vm_with_regions(|r| r.iter().any(|reg| reg.contains(old_addr))));
+            || akuma_exec::process::lazy_region_lookup_for_pid(owner_pid, old_addr).is_some()
+            || proc.is_some_and(|p| p.vm_with_regions(|r| r.iter().any(|reg| reg.contains(old_addr))));
         return if is_mapped { ENOMEM } else { EFAULT };
     }
 
-    let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
-    let new_addr = match akuma_exec::process::lookup_process(owner_pid)
-        .and_then(|p| p.memory.alloc_mmap(new_pages * 4096)) {
+    let proc = match proc {
+        Some(p) => p,
+        None => return ENOMEM,
+    };
+    let new_addr = match proc.vm_alloc_mmap(new_pages * 4096) {
         Some(a) => a,
         None => return ENOMEM,
     };
 
-    if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
+    {
         // Pre-allocate all frames BEFORE taking `as_lock` (alloc must stay outside the
         // hold — the PMM OOM/reclaim path can re-enter `as_lock`). Roll back on OOM.
         let mut new_frames = alloc::vec::Vec::with_capacity(new_pages);
@@ -542,7 +616,7 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
                 }
             }
             for frame in to_free { crate::pmm::free_page(frame); }
-            proc.memory.free_regions.push((old_addr, freed_size));
+            proc.vm_free_mmap(old_addr, freed_size);
             found_eager = true;
         }
 
@@ -568,11 +642,11 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
                 }
             }
             for frame in to_free { crate::pmm::free_page(frame); }
-            proc.memory.free_regions.push((old_addr, old_pages * 4096));
+            proc.vm_free_mmap(old_addr, old_pages * 4096);
         }
 
         new_addr as u64
-    } else { ENOMEM }
+    }
 }
 
 pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
@@ -590,6 +664,7 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
                 Some(p) => p,
                 None => return 0,
             };
+            let _mm_window = MmBklGuard::new();
             let aligned_addr = addr & !0xFFF;
             let end = (addr.saturating_add(len) + 0xFFF) & !0xFFF;
 
@@ -651,6 +726,7 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
                 Some(p) => p,
                 None => return 0,
             };
+            let _mm_window = MmBklGuard::new();
             let aligned_addr = addr & !0xFFF;
             let aligned_len = ((addr + len + 0xFFF) & !0xFFF) - aligned_addr;
             let pages = aligned_len / 4096;
@@ -701,6 +777,7 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     crate::tprint!(128, "[mprotect] pid={} owner={} addr=0x{:x} len=0x{:x} prot={:#x}\n",
         current_pid, owner_pid, addr, pages * 4096, prot);
     if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
+        let _mm_window = MmBklGuard::new();
         akuma_exec::process::update_lazy_region_flags(proc.tgid, addr, pages * 4096, new_flags);
 
         // Update all page table entries with no_flush, then issue a single
@@ -754,6 +831,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
         Some(p) => p,
         None => return ESRCH,
     };
+    let _mm_window = MmBklGuard::new();
 
     let unmap_len = if len > 0 { (len + 4095) & !4095 } else { 4096 };
     let unmap_pages = unmap_len / 4096;
@@ -834,7 +912,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
             akuma_exec::mmu::flush_tlb_range_all_asid(base, n);
         }
         for frame in to_free { crate::pmm::free_page(frame); }
-        proc.memory.free_regions.push((addr, n * 4096));
+        proc.vm_free_mmap(addr, n * 4096);
         return 0;
     }
 
@@ -861,7 +939,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
             // loop (observed with Go's heap prober returning 0x100000000 60+
             // times in succession).
             if had_physical {
-                proc.memory.free_regions.push((freed_start, freed_pages * 4096));
+                proc.vm_free_mmap(freed_start, freed_pages * 4096);
             }
         }
         return 0;

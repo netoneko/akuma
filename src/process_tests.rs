@@ -657,6 +657,11 @@ pub fn run_all_tests() {
     // the carve-out must preserve (BKL_PROCESS_CARVE_OUT.md §9).
     test_fork_bkl_drop();
 
+    // `no-bkl-mm` (Phase 5): MmBklGuard's ledger balance across sys_mprotect/madvise/
+    // munmap/mremap/mmap's real entry points, on both early-error and real-but-unmapped
+    // paths, plus the runtime kill switch — pins what the carve-out must preserve.
+    test_mm_bkl_drop();
+
     // Phantom-SVC tripwire: runs LAST so it covers every EL0 trap the suite above
     // generated (fork/exec/signal/mmap stress). A nonzero count means an EC_SVC64
     // trap arrived whose insn@ELR-4 was not an `svc` — either stale I-cache or the
@@ -2923,6 +2928,126 @@ fn test_fork_bkl_drop() {
     } else {
         crate::safe_print!(96, "[Test] fork-bkl-drop FAILED ({} checks)\n", fails);
         panic!("test_fork_bkl_drop: {fails} checks failed");
+    }
+}
+
+/// `sys_mprotect`/`sys_madvise`/`sys_munmap`/`sys_mremap`/`sys_mmap` entry points —
+/// `MmBklGuard`'s ledger balance, Phase 5 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
+/// (`src/syscall/mem.rs`).
+///
+/// Drives the real syscall ENTRY points via `handle_syscall`, checking two things per
+/// case: the documented return value, and that `bkl::in_dropped_window()` is false once
+/// the call returns — the guard's ledger must end balanced both on early-error paths
+/// that never open it AND on real paths that do.
+///
+/// Deliberately does NOT attempt to install a real PTE: `mmu::map_user_page_no_flush`
+/// (what `sys_mmap`'s eager fill and `sys_mremap`'s growth path use) operates on the
+/// LIVE `TTBR0_EL1`, so a boot self-test would need a genuine context switch to a
+/// synthetic process's own page tables to exercise that safely — out of scope here (no
+/// existing self-test in this suite does this for mmap either; `run_cow_benchmarks`
+/// sidesteps it by taking an explicit L0 pointer instead of the ambient-TTBR0 mmu
+/// calls). Every case below targets a VA the currently-active address space has never
+/// mapped, or a fresh anonymous `PROT_NONE` region that takes the lazy fast path
+/// (`push_lazy_region`, no PTE installed) — real lock/guard code runs for real, nothing
+/// aliases live kernel state. Real PTE-install correctness is covered end-to-end by the
+/// userspace mmap stress tools + llama.cpp, the same validation Phase 2e used
+/// (docs/archive/BKL_VFS_CARVE_OUT.md §10).
+fn test_mm_bkl_drop() {
+    use akuma_exec::bkl;
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid};
+    use akuma_exec::threading::current_thread_id;
+    use crate::syscall::{handle_syscall, nr};
+
+    const EINVAL: u64 = (-22i64) as u64;
+    const EFAULT: u64 = (-14i64) as u64;
+    const MADV_WILLNEED: u64 = 3;
+    const MAP_PRIVATE: u64 = 0x02;
+    const MAP_ANONYMOUS: u64 = 0x20;
+    // Clear of `BENCH_VA_BASE` (0x10_0000_0000) and `test_fork_bkl_drop`'s `VA_BASE`
+    // (0x11_0000_0000) so a leaked mapping from either can't alias this.
+    const VA: u64 = 0x12_0000_0000;
+
+    let tid = current_thread_id();
+    let pid: u32 = 7703;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+
+    let mut fails = 0u32;
+    let balanced = |what: &str, fails: &mut u32| {
+        if bkl::in_dropped_window() {
+            *fails += 1;
+            crate::safe_print!(96, "[Test] mm-bkl-drop: {} left the window open\n", what);
+        }
+    };
+
+    // ── Early-error paths: must never open the window ──────────────────────
+    let r = handle_syscall(nr::MPROTECT, &[1, 4096, 0, 0, 0, 0]); // unaligned addr
+    if r != EINVAL { fails += 1; crate::safe_print!(96, "[Test] mm-bkl-drop: mprotect(unaligned) FAILED r={} (want EINVAL)\n", r); }
+    balanced("mprotect(unaligned)", &mut fails);
+
+    let r = handle_syscall(nr::MREMAP, &[VA, 4096, 0, 0, 0, 0]); // new_size == 0
+    if r != EINVAL { fails += 1; crate::safe_print!(96, "[Test] mm-bkl-drop: mremap(new_size=0) FAILED r={} (want EINVAL)\n", r); }
+    balanced("mremap(new_size=0)", &mut fails);
+
+    let r = handle_syscall(nr::MMAP, &[0, 0, 0, 0, !0u64, 0]); // len == 0
+    if r != EINVAL { fails += 1; crate::safe_print!(96, "[Test] mm-bkl-drop: mmap(len=0) FAILED r={} (want EINVAL)\n", r); }
+    balanced("mmap(len=0)", &mut fails);
+
+    // ── Real guarded paths, on state that can't alias anything live ────────
+    // mprotect on a never-mapped VA: real as_lock + LAZY_REGION_TABLE touch, no PTE
+    // actually flips (`is_mapped()` is false for every page), returns 0.
+    let r = handle_syscall(nr::MPROTECT, &[VA, 4096, 0, 0, 0, 0]);
+    if r != 0 { fails += 1; crate::safe_print!(96, "[Test] mm-bkl-drop: mprotect(unmapped) FAILED r={} (want 0)\n", r); }
+    balanced("mprotect(unmapped)", &mut fails);
+
+    // madvise(WILLNEED) on a VA that isn't in any lazy region: real LAZY_REGION_TABLE
+    // lookup, empty prefault set, returns 0 without touching PMM/as_lock.
+    let r = handle_syscall(nr::MADVISE, &[VA, 4096, MADV_WILLNEED, 0, 0, 0]);
+    if r != 0 { fails += 1; crate::safe_print!(96, "[Test] mm-bkl-drop: madvise(WILLNEED, unmapped) FAILED r={} (want 0)\n", r); }
+    balanced("madvise(unmapped)", &mut fails);
+
+    // mremap-grow (MAYMOVE unset) on an unmapped VA: real `is_current_user_page_mapped`
+    // + `lazy_region_lookup_for_pid` + `vm_with_regions` reads, all false -> EFAULT.
+    let r = handle_syscall(nr::MREMAP, &[VA, 4096, 8192, 0, 0, 0]);
+    if r != EFAULT { fails += 1; crate::safe_print!(96, "[Test] mm-bkl-drop: mremap(grow, unmapped) FAILED r={} (want EFAULT)\n", r); }
+    balanced("mremap(grow, unmapped)", &mut fails);
+
+    // mmap/munmap round trip: an anonymous PROT_NONE mapping takes the lazy fast path
+    // (`push_lazy_region`) — never installs a PTE — exercising `Process::vm_alloc_mmap`
+    // (new this phase) for real. munmap on the returned address exercises
+    // `munmap_lazy_regions_in_range` + `Process::vm_free_mmap` (also new this phase) for
+    // real, freeing zero physical frames since the region was never faulted in.
+    let mmap_ret = handle_syscall(nr::MMAP, &[0, 4096, 0, MAP_PRIVATE | MAP_ANONYMOUS, !0u64, 0]);
+    if (mmap_ret as i64) <= 0 {
+        fails += 1;
+        crate::safe_print!(96, "[Test] mm-bkl-drop: mmap(anon lazy) FAILED r={}\n", mmap_ret as i64);
+    } else {
+        balanced("mmap(anon lazy)", &mut fails);
+        let r = handle_syscall(nr::MUNMAP, &[mmap_ret, 4096, 0, 0, 0, 0]);
+        if r != 0 { fails += 1; crate::safe_print!(96, "[Test] mm-bkl-drop: munmap(anon lazy) FAILED r={} (want 0)\n", r); }
+        balanced("munmap(anon lazy)", &mut fails);
+    }
+
+    // Runtime kill switch: with the toggle off, the guard must never open the window at
+    // all — same kill-switch contract as `set_vfs_bkl_drop_enabled`.
+    #[cfg(kernel_smp_shared)]
+    {
+        use crate::smp_shared::{mm_bkl_drop_enabled, set_mm_bkl_drop_enabled};
+        let was = mm_bkl_drop_enabled();
+        set_mm_bkl_drop_enabled(false);
+        let _ = handle_syscall(nr::MPROTECT, &[VA, 4096, 0, 0, 0, 0]);
+        balanced("mprotect(toggle off)", &mut fails);
+        set_mm_bkl_drop_enabled(was);
+    }
+
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    if fails == 0 {
+        crate::safe_print!(160, "[Test] mm-bkl-drop PASSED (3 early-error + mprotect/madvise/mremap-unmapped + mmap/munmap round trip + kill switch)\n");
+    } else {
+        crate::safe_print!(64, "[Test] mm-bkl-drop FAILED ({} cases)\n", fails);
+        panic!("test_mm_bkl_drop: {fails} cases failed");
     }
 }
 

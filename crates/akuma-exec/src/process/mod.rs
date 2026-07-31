@@ -348,16 +348,18 @@ pub struct Process {
     /// RAII release guard never ran) and reclaim the slot instead of spinning
     /// forever. See [`fault_slot_acquire`]/[`fault_slot_release`].
     pub fault_mutex: Spinlock<BTreeMap<usize, usize>>,
-    /// Serializes all access to [`Process::mmap_regions`] across the thread group.
-    /// CLONE_VM threads share one address-space-owner Process, so concurrent
-    /// `sys_mmap`/`munmap`/`mremap` (push/remove) and the page-fault eager
-    /// fallback (iter) would otherwise race on the plain `Vec` — a half-completed
-    /// reallocation read by another thread corrupts it and hangs the kernel
-    /// (observed under llama's burst of graph-buffer mmaps). All access goes
-    /// through the `vm_*` helper methods, which hold this lock with IRQs disabled
-    /// for a *pure Vec operation only* — no allocation, file I/O, mapping, or
-    /// frame-free is performed while it is held (those happen on the returned
-    /// frames after the lock is released), so it can never be held across a yield.
+    /// Serializes all access to [`Process::mmap_regions`] AND `Process::memory`'s
+    /// mmap free-list (`ProcessMemory::free_regions`, via [`Process::vm_alloc_mmap`]/
+    /// [`Process::vm_free_mmap`]) across the thread group. CLONE_VM threads share one
+    /// address-space-owner Process, so concurrent `sys_mmap`/`munmap`/`mremap`
+    /// (push/remove) and the page-fault eager fallback (iter) would otherwise race on
+    /// the plain `Vec`s — a half-completed reallocation read by another thread
+    /// corrupts it and hangs the kernel (observed under llama's burst of
+    /// graph-buffer mmaps). All access goes through the `vm_*` helper methods, which
+    /// hold this lock with IRQs disabled for a *pure Vec/bookkeeping operation only*
+    /// — no allocation, file I/O, mapping, or frame-free is performed while it is
+    /// held (those happen on the returned frames after the lock is released), so it
+    /// can never be held across a yield.
     pub vm_lock: Spinlock<()>,
     /// Serializes hardware page-table mutation for this address space across cores
     /// under shared-kernel SMP (real M5b). The BKL-free user page-fault path takes
@@ -452,6 +454,43 @@ impl Process {
                     as *mut Vec<MmapRegion>)
             };
             f(regions)
+        })
+    }
+
+    /// Allocate `size` bytes of mmap VA space, serialized by the SAME
+    /// [`Process::vm_lock`] that guards [`Process::mmap_regions`]. `ProcessMemory::
+    /// alloc_mmap`'s free-list fast path (`free_regions`) was, before this, a plain
+    /// unguarded `Vec` — exclusivity relied entirely on the BKL, which is not just a
+    /// gap for any future BKL-free mm-syscall carve-out but a live bug today: an IRQ
+    /// preemption of a CLONE_VM sibling thread mid-`alloc_mmap` (the exact race class
+    /// `vm_lock` itself was introduced to close for `mmap_regions`, see that field's
+    /// doc comment) can interleave a second thread's `alloc_mmap`/`free_mmap` call on
+    /// the same `free_regions` `Vec`. Reusing `vm_lock` costs nothing new: `alloc_mmap`
+    /// is already a pure bump-pointer/free-list operation with no allocation, I/O, or
+    /// yield, matching `vm_lock`'s existing discipline exactly. `next_mmap`'s own CAS
+    /// (see [`ProcessMemory::alloc_mmap`]) still stands for callers that can't take
+    /// this lock, but every syscall-level caller should go through this method now.
+    pub fn vm_alloc_mmap(&self, size: usize) -> Option<usize> {
+        with_irqs_disabled(|| {
+            let _g = self.vm_lock.lock();
+            // SAFETY: `vm_lock` (held here) serializes every `vm_alloc_mmap`/
+            // `vm_free_mmap` caller across the thread group, so this is the unique
+            // live reference to `memory` for the closure's duration — same
+            // reasoning as `vm_with_regions`'s `mmap_regions` access.
+            let memory = unsafe { &mut *(core::ptr::addr_of!(self.memory) as *mut ProcessMemory) };
+            memory.alloc_mmap(size)
+        })
+    }
+
+    /// Return `[start, start+size)` to the mmap free-list. Counterpart to
+    /// [`Process::vm_alloc_mmap`] — see that method's doc for why this needs
+    /// `vm_lock` at all.
+    pub fn vm_free_mmap(&self, start: usize, size: usize) {
+        with_irqs_disabled(|| {
+            let _g = self.vm_lock.lock();
+            // SAFETY: see `vm_alloc_mmap`.
+            let memory = unsafe { &mut *(core::ptr::addr_of!(self.memory) as *mut ProcessMemory) };
+            memory.free_mmap(start, size);
         })
     }
 

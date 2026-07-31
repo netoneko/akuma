@@ -30,14 +30,19 @@ BKL is simply *redundant* for syscalls that only touch that state. See
 `docs/reference/subsystems/smp.md` for the other, share-nothing SMP model this
 is not.
 
-Three carve-outs exist today: `no-bkl-network` (all smoltcp net syscalls +
+Four carve-outs exist today: `no-bkl-network` (all smoltcp net syscalls +
 socket `read`/`write`), `no-bkl-vfs` (ext2 read paths, `mmap`, `unlinkat`,
-`openat`, `renameat`/`renameat2`, `mkdirat`, `fchmodat`), and `no-bkl-process`
-(`fork_process`'s CoW page-copy window — opt-in, not in `smp-shared`). All three
-follow the same shape below. `no-bkl-process` is the first that is not about
-I/O: it overlaps a CPU-bound page copy with peer-core EL1 rather than a disk or
-wire wait, and it is the first to lean on a *page-table* inner lock (`as_lock`)
-rather than a subsystem's own state locks.
+`openat`, `renameat`/`renameat2`, `mkdirat`, `fchmodat`), `no-bkl-process`
+(`fork_process`'s CoW page-copy window — opt-in, not in `smp-shared`), and
+`no-bkl-mm` (`mprotect`/`madvise`/`munmap`/`mremap`/`mmap` — opt-in, not in
+`smp-shared`). `no-bkl-process` is the first that is not about I/O: it overlaps a
+CPU-bound page copy with peer-core EL1 rather than a disk or wire wait, and it is
+the first to lean on a *page-table* inner lock (`as_lock`) rather than a
+subsystem's own state locks. `no-bkl-mm` is the first phase picked by the plan
+rather than by attribution (no mm syscall has ever been measured as a significant
+BKL holder) — see `BKL_MM_CARVE_OUT.md` §5 — and the first where the audit found
+real gaps (an unguarded free-list, a page-table mutation with no `as_lock`) rather
+than only rediscovering an existing lock.
 
 ## The carve-out playbook
 
@@ -209,7 +214,7 @@ Each of these was a real bug found during a carve-out, not a hypothetical.
 
 ## Syscall → lock map
 
-Ground truth as of 2026-07-31, verified against `src/syscall/{fs,net,mem,proc}.rs`
+Ground truth as of 2026-08-01, verified against `src/syscall/{fs,net,mem,proc}.rs`
 and the inner-lock call sites in `crates/akuma-ext2/src/ext2.rs`,
 `crates/akuma-exec/src/process/fd.rs`, `src/block.rs`, `src/vfs/mod.rs`, and
 `crates/akuma-net/src/{socket,smoltcp_net}.rs` — not transcribed from the
@@ -342,6 +347,38 @@ is what actually landed and why §2.4a's "the parent's page tables have no lock"
 was wrong: the CoW fault handler was already editing those same PTEs BKL-free
 under `as_lock`, so the inner lock existed and fork just wasn't taking it.
 
+### `no-bkl-mm` — `src/syscall/mem.rs`
+
+Phase 5, landed 2026-08-01. Not yet in `smp-shared`'s default bundle (see
+`BKL_MM_CARVE_OUT.md` §6) — picked by the plan, not by attribution (no mm syscall
+has ever measured as a significant BKL holder).
+
+| syscall | guard scope | inner lock(s) held while BKL dropped |
+|---|---|---|
+| `sys_mprotect` (`mem.rs`) | after `proc` resolves | `Process::as_lock` (PTE flag edits); `LAZY_REGION_TABLE` |
+| `sys_madvise` (`mem.rs`) | after `proc` resolves, per match arm | `Process::as_lock` (prefault install / zero-mapped); `LAZY_REGION_TABLE`; PMM (`MADV_WILLNEED`'s batch alloc) |
+| `sys_munmap` (`mem.rs`) | after `proc` resolves | `Process::vm_lock` (region lookup/removal + free-list); `Process::as_lock` (PTE unmap); `SHARED_FILE_MAPPINGS`; `LAZY_REGION_TABLE`; PMM (frame free) |
+| `sys_mremap` (`mem.rs`) | after `proc` resolves once (not re-looked-up inside the window) | `Process::vm_lock`; `Process::as_lock`; `LAZY_REGION_TABLE`; PMM |
+| `sys_mmap` (`mem.rs`) | after `proc` resolves | `Process::vm_lock` (free-list alloc via `vm_alloc_mmap`); `Process::as_lock` (PTE install); `LAZY_REGION_TABLE`; PMM; `SHARED_FILE_MAPPINGS`; nested `VfsBklGuard` windows for on-disk fill (ledger depth-counted, safe to nest) |
+
+Two gaps closed as a prerequisite (not present before this phase, not a "nothing to
+build" finding like net/vfs/process):
+
+- **`ProcessMemory::free_regions`/`alloc_mmap()`** was a plain unguarded `Vec` —
+  every mm syscall now goes through `Process::vm_alloc_mmap`/`vm_free_mmap`, which
+  fold it under the existing `vm_lock` (same IRQ-disabled, pure-bookkeeping
+  discipline `vm_lock` already enforces for `mmap_regions`).
+- **`sys_mmap`'s OOM/reclaim fallback** (`reclaim_clean_file_pages` →
+  `try_evict_ro_page`) mutated page tables with no `as_lock` hold at all — fixed
+  with a per-page (not per-sweep) `as_lock_hold`.
+
+Background: [`BKL_MM_CARVE_OUT.md`](../../archive/BKL_MM_CARVE_OUT.md) — §1 is the
+audit (the two gaps above), §3 is verification (boot self-test at SMP=2/4, the
+`mmap_stress`/`mmap_file`/`mmapsum`/`fpfault`/`neonfault` + `llama-bench` suite,
+the contention regimen), §4 is a same-binary Akuma-vs-native-Linux tok/s comparison
+(bonus, not part of the carve-out itself), §5 explains why this phase has no
+before/after contention number the way `unlinkat`/`netpoll_drain` do.
+
 ## Attribution tooling
 
 `bkl-profile` (cargo feature → `cfg(kernel_bkl_profile)`, `src/bkl_profile.rs`)
@@ -409,6 +446,10 @@ Driving workload: `net4` (concurrent downloads → net + ext2 write), `read4`
   Phase 3 audit of `clone`/`fork_process`/`execve`: why no carve-out was
   implemented (no inner lock on process/CoW state; the BKL is the lock), and
   what prerequisites would unblock one.
+- [`BKL_MM_CARVE_OUT.md`](../../archive/BKL_MM_CARVE_OUT.md) — the Phase 5
+  `mprotect`/`madvise`/`munmap`/`mremap`/`mmap` carve-out: the two real locking
+  gaps it found and closed, and why (unlike the other three) it has no
+  attribution-backed contention number.
 - [`BKL_FINE_GRAINED_LOCKING_PLAN.md`](../../archive/BKL_FINE_GRAINED_LOCKING_PLAN.md)
   — the overall phased plan; §"Phase 2" has the network carve-out's design
   notes (why a coarse `NETWORK_LOCK` doesn't work, the SIGPIPE self-deadlock,
