@@ -76,6 +76,25 @@ For a given syscall or subsystem:
    same-binary A/B is what tells "this conversion measurably helped" apart
    from "this syscall was never contended in the first place" — see
    `BKL_VFS_CARVE_OUT.md` §13.3 for a worked example.
+
+   Two rules the campaign learned the hard way about *how* to toggle and *what*
+   to sum (`BKL_VFS_CARVE_OUT.md` §17):
+
+   - **Toggle in source, not in cargo features.** Swap the guard out
+     (`git show HEAD:src/syscall/fs.rs > …`) and keep the feature set byte-
+     identical across both sides. A source edit forces a recompile, so the ELF
+     is always newer than the `.bin`; alternating feature sets was what made
+     `cargo_runner.sh`'s old `[ "$ELF" -nt "$BIN" ]` guard boot the *other*
+     side's kernel behind a "Finished in 0.1s" cargo line. That guard is gone
+     (objcopy now always regenerates), but the habit is still the safer one —
+     and if you must alternate features, verify the boot is the kernel you
+     think it is by grepping the `.bin` for a string only one side contains.
+   - **Sum only the workload's windows.** `analyze.py`'s default is whole-boot
+     and gets diluted by idle/teardown; filtering by spin magnitude instead of
+     by time is worse still, since it counts service bringup as workload on a
+     boot whose regimen starts early. Take `drive.py`'s REGIMEN START/DONE (or
+     the first/last regimen `execve` in the serial log) and sum `[BKLPROF]`
+     per-tag spins over the `t=` windows spanning that interval, on both sides.
 6. **Verify data integrity, not just "didn't crash."** A syscall that early-
    returns an error on every call (broken, not fast) can look identical to a
    correctly BKL-free one in a profiler — `rm -f`/`cp` swallow errors. Check

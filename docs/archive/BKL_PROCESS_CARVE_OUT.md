@@ -630,6 +630,16 @@ bringup do the actual hammering.
 >
 > If you are re-deriving any earlier result in this campaign, check whether it
 > alternated feature sets under the old guard before trusting it.
+>
+> **[2026-07-31] That audit is done for the VFS campaign — see
+> [`BKL_VFS_CARVE_OUT.md`](BKL_VFS_CARVE_OUT.md) §17.** Result: every A/B behind a
+> Phase 2b/2c conversion (§§12–16) toggled *source*, not cargo features, and is
+> structurally immune; nothing needs retracting. The only feature-toggled A/Bs are
+> §8's two, from 2026-07-25, and neither carries a number the campaign built on.
+> §13.3's `openat` A/B was additionally re-derived from its original serial logs
+> with the attribution restricted to the workload windows: the conclusion holds,
+> the shares move up (13.5% → 18.4% BKL-held, 2.1% → 2.9% converted) and the
+> total-spin ratio down (2.4x → 1.9x).
 
 **Contention A/B under `bkl-profile`, SMP=4** — the playbook's rule-5 step, which
 separates "this conversion measurably helped" from "this syscall was never

@@ -46,6 +46,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | Fork / exec / signal misbehaviour | [`reference/subsystems/syscalls/proc.md`](reference/subsystems/syscalls/proc.md) + [`syscalls/signal.md`](reference/subsystems/syscalls/signal.md) + [`scheduler.md`](reference/subsystems/scheduler.md) |
 | Filesystem / ext2 / procfs errors | [`reference/subsystems/vfs.md`](reference/subsystems/vfs.md) + `archive/EXT2_FIRST_DATA_BLOCK_FIX.md` |
 | Porting a new binary (missing syscalls) | [`reference/subsystems/syscalls.md`](reference/subsystems/syscalls.md) -> Porting + `archive/*_MISSING_SYSCALLS.md` |
+| A/B run shows no difference / boot doesn't match the features you built | [`reference/subsystems/locking.md`](reference/subsystems/locking.md) -> playbook rule 5 + `archive/BKL_VFS_CARVE_OUT.md` §17 |
 
 ## Task list - "I want to do X"
 

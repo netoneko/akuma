@@ -356,6 +356,12 @@ mid-stream.
 (`no-bkl-network` still on) — it truncates the same way: 6000640 / 6117376 / 3656704 bytes,
 also lossy. So the bug predates this work.
 
+> **[2026-07-31] "Decisive" overstates it.** This is a cargo-feature toggle, so it is exposed to the
+> stale-`.bin` trap (§17.1) — and "both sides fail identically" is precisely that trap's signature,
+> so the OFF-build run cannot clear itself. The *conclusion* survives on the independent evidence in
+> the next paragraph (T6 moves the same 32 MiB byte-exact through httpd over the same stack). Nothing
+> in the campaign depends on this run; do not cite it as an A/B.
+
 **Localized:** the same 32 MiB file served by the VM's **httpd** over the same smoltcp stack
 transfers byte-exact, twice (T6). So the socket send path and the VFS read path are both
 fine; the defect is specific to the **sshd exec-channel stdout bridge** dropping data under
@@ -373,6 +379,10 @@ Controlled A/B — identical workload W, same image, same SMP=2, near-identical 
 |---|---|---|---|---|
 | `no-bkl-vfs` **ON** | 6/6 ✅ | **8** | 15 | 456 |
 | `no-bkl-vfs` **OUT** | 6/6 ✅ | **0** | 22 | 444 |
+
+> **[2026-07-31]** This is one of only two A/Bs in this doc that toggled a *cargo feature* rather
+> than source, so it is exposed to the stale-`.bin` trap — see §17.1, which clears it (the sides
+> differ, which the trap cannot produce, and §9 root-caused the mechanism in code anyway).
 
 `[BKL] stuck` fires when a waiter spins `SPIN_WARN_THRESHOLD` = 10,000,000 times while the
 lock is *genuinely owned* — tens of milliseconds of real hold, not a ticket anomaly (that is
@@ -884,9 +894,11 @@ deletion takes is the §3-hardened one. Zero-cost no-op off `smp-shared` + `no-b
 | regimen wall-clock | 136 s (§11.7 lean) | 136 s |
 
 Post-fix cumulative attributed spins (185.9 M total, same profiler): `irq/sched` `tag=501`
- 53.9%, `openat` `tag=56` **36.6%**, everything else <2%. `openat` is the surfaced next target —
+ 53.9%, `openat` `tag=56` **36.6%**, everything else <2%. *(§12.2 and §11.6 audited 2026-07-31
+against the stale-`.bin` trap: both immune — see §17.1.)* `openat` is the surfaced next target —
 **Phase 2b**, not 2c; the rest of the 2c list is now evidence-led rather than principle-led.
-**DONE, contention-confirmed by A/B — see §13.3 (2026-07-30):** cumulative share cut 13.5% → 2.1%.
+**DONE, contention-confirmed by A/B — see §13.3 (2026-07-30):** cumulative share cut 18.4% → 2.9%
+(re-derived 2026-07-31; originally reported as 13.5% → 2.1%).
 
 ### 12.3 Correctness was verified, not assumed
 
@@ -936,9 +948,11 @@ the available win"* — is confirmed; for this workload it recovered all of it.
 vanished — 36.6% of attributed cross-core BKL wait, second only to `irq/sched`. §11.8 made it
 Phase 2b's first target. Converted, boot-verified (§13.2), and then contention-confirmed by a
 controlled A/B (§13.3): running the identical net4+read4+cp2 workload at SMP=4 under `bkl-profile`
-with the guard on vs. reverted cuts `openat`'s cumulative cross-core BKL share **13.5% → 2.1%**
-(peak per-window 68.1% → 16.0%), and total workload spinning 2.4x, with 0 stuck / 0 PANIC and
-6-of-6 exact digests on both sides.
+with the guard on vs. reverted cuts `openat`'s cumulative cross-core BKL share **18.4% → 2.9%**
+(peak per-window 69.1% → 16.8%), and total workload spinning 1.9x, with 0 stuck / 0 PANIC and
+6-of-6 exact digests on both sides. *(Those are the 2026-07-31 workload-restricted figures; the
+originally-reported 13.5% → 2.1% / 2.4x came from a magnitude-filtered window selection — see the
+dated block at the end of §13.3, and §17 for why this A/B is not affected by the stale-`.bin` bug.)*
 
 ### 13.1 The change
 
@@ -1016,6 +1030,52 @@ figure: most of that share really was `openat`'s own hold, not measurement noise
 `unlinkat` conversion settling. `openat`'s holds were sub-threshold even BKL-held (0 stuck on both
 sides), so the `[BKLPROF]` attribution — not the `[BKL] stuck` counter — is the discriminator here,
 same as it was for the correctness/contention split in §12.5.
+
+> ### [2026-07-31] Re-derived after the stale-`.bin` fix — conclusion holds, three numbers corrected
+>
+> Re-audited when `scripts/cargo_runner.sh`'s stale-`.bin` bug was found
+> (`BKL_PROCESS_CARVE_OUT.md` §9.8). **This A/B is not exposed to that trap** — both sides used the
+> identical feature set (`devbox-smoltcp,no-tests,bkl-profile`) and differed only in *source* (the
+> guard reverted), so cargo recompiled and the ELF's mtime moved forward before each boot. The trap
+> needs a *cached* artifact uplifted with an mtime older than the `.bin` a different feature set left
+> behind, which a source edit can never produce. Full audit of every A/B in this doc: §17.
+>
+> Both original serial logs survive (`/tmp/akuma_smp4.log` = ON, `/tmp/akuma_smp4_off.log` = OFF) and
+> confirm two genuinely different kernels booted: `openat`'s per-window share tracks the `cp2` phase
+> at 53.7 / 69.1 / 31.3 / 53.1% on the OFF side vs. 2.9 / 4.1 / 16.8% on the ON side. A stale `.bin`
+> boots the *same* image twice, whose signature is no difference — not this. (Both logs also report an
+> identical image extent, `1341 KB`, `0x40100000-0x402dfe38`; that is expected, not suspicious —
+> `linker.ld` page-aligns `.rodata`/`.data`, so a sub-page `.text` delta is absorbed by padding and
+> moves neither `_kernel_phys_end` nor the `.bin` byte count.)
+>
+> What *was* wrong: the window selection. The table above summed "every window >10M spins" rather
+> than "the windows the regimen occupied" — which on the ON side pulled in a pre-regimen probe window
+> (t=120s) and dropped the whole `cp2` phase (t=250–270s). Restricting instead to the regimen
+> interval read off each log (ON: first `curl p*.bin` T175.2 → final `ls` T268.9, windows t=180–270s;
+> OFF: T14.9 → T112.8, windows t=20–120s):
+>
+> | signal | ON (converted) | OFF (BKL-held) | as reported above |
+> |---|---|---|---|
+> | `openat` `tag=56` cumulative share | **2.9%** | **18.4%** | 2.1% vs 13.5% |
+> | `openat` `tag=56` spins | 4,457,032 | 53,530,971 | 3,190,704 vs 49,291,185 |
+> | `openat` peak per-window share | 16.8% | 69.1% | 16.0% vs 68.1% |
+> | workload cumulative spins | 157,164,639 | 295,379,111 (**1.9x**) | 152,786,715 vs 364,902,792 (2.4x) |
+>
+> So the headline gets *stronger* on the share axis (6.3x rather than 6.4x separation, from a higher
+> base on both sides) and weaker on the total-spin axis: **1.9x, not 2.4x**. Every conclusion in this
+> section stands.
+>
+> One confound worth stating, since it is visible in the logs and was not noted at the time: the OFF
+> boot's regimen started 6 s after boot (staging `rm` at T6.1), so its early windows overlap herd/sshd
+> bringup, while the ON boot idled ~175 s first. That inflates OFF's `irq/sched`, not its `openat` —
+> dropping the bringup-contaminated window *raises* OFF's `openat` share (13.7% → 18.4%). The
+> cleanest phase-matched slice is `cp2` alone (32 MiB `cp` ×2, i.e. `O_CREAT`+`O_TRUNC` on a large
+> destination — precisely the hold §13.1 targets), which is bounded identically on both sides:
+> **`openat` 10.3% of 11.7M spins (ON) vs 50.5% of 38.0M spins (OFF)**.
+>
+> Caveat inherited, not introduced: this A/B predates the §16.2 profiler tag-restore fix, so
+> `irq/sched` is over-credited on *both* sides. That does not move `openat`, whose windows are far
+> shorter than a 10 ms tick.
 
 This closes the "argued-correct, not contention-demonstrated" gap this section previously flagged
 before the A/B was run. Remaining 2b (`close`/`dup`/`dup3`/`fcntl`) is not started; the next attribution run should say
@@ -1140,6 +1200,9 @@ pattern (§13, which left a small residual). `mkdirat`'s and `fchmodat`'s shares
 between the two runs (profiler perturbation + normal run-to-run variance, §11.5/§12.5's standing
 caveat), not a sign either was affected by the `renameat` guard.
 
+*[2026-07-31] Audited against the stale-`.bin` trap: **immune** — the `git show HEAD:…` swap is a
+source edit, which always forces a recompile and a fresh ELF mtime (§17.1). No re-run needed.*
+
 ### 14.5 Data integrity
 
 Both `e2fsck -fn` (read-only) passes on the ON- and OFF-side disk images post-run reported the
@@ -1245,6 +1308,9 @@ pattern (§12/§14) more than `openat`'s (§13, which left a small residual). No
 doesn't yet have a friendly name for tag 53; cosmetic only, not fixed here (out of scope for a BKL
 conversion, and every other reading — the syscall-number cross-reference, the self-test names — is
 unambiguous).
+
+*[2026-07-31] Audited against the stale-`.bin` trap: **immune**, same reasoning as §14.4 — the two
+sides differ in source, not in cargo features (§17.1). No re-run needed.*
 
 ### 15.4 Data integrity
 
@@ -1366,7 +1432,9 @@ inodes from that run), same isolated VM setup, identical regimen:
 | `read` | 1.2% | 2.0% | ~flat |
 
 `[BKL] stuck` 0, PANIC/WILD 0/0, 6/6 digests exact — the fix changes attribution only, not
-behavior, exactly as intended. The correction moved ~8 points from `irq/sched` into `clone`/
+behavior, exactly as intended. *(Audited 2026-07-31 against the stale-`.bin` trap: **immune** — pre-
+and post-fix differ in source, same feature set, §17.1. But both are whole-boot cumulative views;
+see §17.2 on why that dilutes.)* The correction moved ~8 points from `irq/sched` into `clone`/
 `execve`, matching the mechanism in §16.2: those are the two syscalls in this workload most
 likely to span a tick boundary. `irq/sched` remains the single largest bucket even corrected
 (58.4%, still bigger than `clone`+`execve` combined at 30.8%) — so Phase 3's premise (§15.5)
@@ -1435,3 +1503,58 @@ guard-and-measure cycle straight off this doc's playbook.
 Every significant-BKL-time step touches state with no inner lock; the BKL is the lock, not a
 redundant wrapper. A carve-out requires either fixing the fork-corruption bug first or building
 the process-table lock the original Phase 3 plan sketched.
+
+---
+
+## 17. Stale-`.bin` audit: do this doc's A/B numbers survive? — 2026-07-31
+
+On 2026-07-31 `scripts/cargo_runner.sh` was found to silently boot the wrong kernel
+(`BKL_PROCESS_CARVE_OUT.md` §9.8, the "stale-`.bin` trap" block). The ELF→flat-binary step was
+guarded by `[ ! -f "$BIN" ] || [ "$ELF" -nt "$BIN" ]`; cargo **uplifts** a cached artifact into
+`target/` when you switch back to a previously-built feature set, and the uplifted ELF can carry an
+mtime *older* than the `.bin` the feature set you built in between left at the same path (`$BIN` is
+just `$ELF.bin`, and every feature set under one profile shares it). objcopy was then skipped and
+QEMU booted the other feature set's kernel. The buggy guard was in the tree from **2026-05-28
+(e771939) to 2026-07-31 (738ff52)** — i.e. for this campaign's entire duration, so every A/B here
+had to be classified rather than dismissed on dates.
+
+### 17.1 What is and isn't exposed
+
+The trap fires **only** when cargo does not recompile, because only then can the ELF's mtime be
+older than the `.bin`. Any A/B whose two sides differ in *source* forces a recompile and stamps a
+fresh mtime on the ELF before every boot — structurally immune. Any A/B whose two sides differ only
+in *cargo features/profile*, alternated, can hit it.
+
+Its failure mode is also worth naming: it boots the **same** image twice, so its signature is *no
+difference between the two sides*. A large, direction-correct difference is positive evidence the
+trap did not fire.
+
+| § | A/B | how the two sides were produced | verdict |
+|---|---|---|---|
+| §8 "⚠ One real regression signal" | `no-bkl-vfs` ON vs OUT, 8 vs 0 `[BKL] stuck` | **cargo feature toggled** | **exposed — but cleared**: the two sides differ (8 vs 0), which the trap cannot produce; and §9 root-caused the mechanism in the IRQ-epilogue code and fixed it, so the finding never rested on this A/B alone |
+| §8 T4 (`ssh cat` truncation) | `no-bkl-vfs` compiled out, still lossy | **cargo feature toggled** | **exposed, not clearable by this A/B**: both sides failing is exactly the trap's signature. The conclusion ("pre-existing, not ours") still holds on independent evidence — T6 moves the same 32 MiB byte-exact through httpd over the same stack, localizing the defect to the sshd exec-channel bridge. Treat the OFF-build *run* as unverified; nothing in the campaign depends on it |
+| §12.2 | `unlinkat` 72.6% → absent | before/after *commit*, same feature set | immune (source differs) |
+| §13.3 | `openat` 13.5% → 2.1% | same feature set, guard **reverted in source** | immune — and re-derived from the original logs, see the 2026-07-31 block in §13.3 |
+| §14.4 | `renameat` 8.3% → absent | `git show HEAD:src/syscall/fs.rs` swapped in | immune (source differs) |
+| §15.3 | `mkdirat` 5.2%, `fchmodat` 3.2% → absent | `git show HEAD:src/syscall/fs.rs` swapped in | immune (source differs) |
+| §16.1 / §16.3 | pre-fix vs post-fix attribution | profiler source fix, same feature set | immune (source differs) |
+| §11.6 | `unlinkat` 72.6% | single run, first build of the then-new `bkl-profile` feature | immune (no cached artifact to uplift) |
+
+**Nothing in §§12–16 needs retracting.** The only feature-toggled A/Bs in this doc are §8's two, both
+from 2026-07-25, and neither carries a contention number the campaign later built on.
+
+### 17.2 The other half: restrict attribution to the workload windows
+
+Re-deriving §13.3 from its saved logs surfaced a methodology bug that is *not* the stale-`.bin` bug
+and that every attribution table in this doc should be read against: `analyze.py`'s default view is
+whole-boot, and the ad-hoc substitute used in §13.3 ("every window >10M spins") is a magnitude
+filter, not a time filter. On a boot whose regimen starts 6 s in, it silently counts service bringup
+as workload; on a boot that idles first, it drops real workload phases that happened to spin less
+than the threshold.
+
+Read `drive.py`'s REGIMEN START/DONE timestamps — or, for a hand-driven run, the first and last
+regimen `execve` in the serial log — and sum `[BKLPROF]` per-tag spins only over the `t=` windows
+spanning that interval. Doing so changed §13.3's total-spin ratio from 2.4x to 1.9x (both
+`openat` shares moved up, and the conclusion strengthened); it changed Phase 3's `clone` number from
+25.2% whole-boot to 19.5% workload (`BKL_PROCESS_CARVE_OUT.md` §9.8). Same conclusions both times —
+but only the workload-restricted numbers are defensible.
