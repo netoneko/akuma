@@ -1,8 +1,9 @@
 # Phase 5: carving memory-management syscalls out from under the BKL
 
-**Status: SHIPPED, 2026-08-01.** `sys_mprotect`/`sys_madvise`/`sys_munmap`/`sys_mremap`/
-`sys_mmap` now run without the Big Kernel Lock under `smp-shared`, behind a new
-`no-bkl-mm` feature (not yet folded into the default `smp-shared` bundle — see §6).
+**Status: COMPLETE, 2026-08-01.** `sys_mprotect`/`sys_madvise`/`sys_munmap`/`sys_mremap`/
+`sys_mmap` now run without the Big Kernel Lock under `smp-shared`, behind the
+`no-bkl-mm` feature (default-on in the `smp-shared` bundle since 2026-08-01 —
+see §6).
 Mirrors the net/vfs/process carve-outs (`docs/archive/BKL_VFS_CARVE_OUT.md`,
 `BKL_PROCESS_CARVE_OUT.md`) but is the first phase where the audit found **real,
 unaudited gaps** rather than rediscovering an existing lock — see §1.
@@ -193,15 +194,14 @@ and shipped a carve-out with no regression," not "cut contention by N%."
 
 ## 6. Status and next steps
 
-**Shipped, not yet default-on.** `no-bkl-mm` is NOT in the `smp-shared` feature
-bundle in `Cargo.toml` (unlike net/vfs/process, which were promoted the same session
-they landed). Given this phase has no attribution signal to point at, promoting it
-should wait for either (a) a workload that actually exercises mmap/munmap/mprotect/
-madvise under contention, to get a real same-binary A/B the way `unlinkat` and
-`netpoll_drain` got one, or (b) a deliberate decision that the audit + boot-suite +
-mmap-stress-tool verification in this doc is sufficient evidence on its own, matching
-the bar `no-bkl-process` cleared before promotion (that phase DID have a contention
-number — `clone` 19.5%→2.5% — this phase doesn't).
+**Shipped and promoted to default-on (2026-08-01).** `no-bkl-mm` is now in the
+`smp-shared` feature bundle in `Cargo.toml`, alongside net/vfs/process. The
+audit + boot-suite + stress-tool verification in this doc was accepted as
+sufficient evidence on its own, matching the bar `no-bkl-process` cleared
+before its promotion (that phase DID have a contention number — `clone`
+19.5%→2.5% — this phase doesn't, but the correctness work — the `free_regions`
+race fix and the `as_lock` gap in the OOM-reclaim path — stands regardless of
+whether any workload currently exercises these syscalls under contention).
 
 `sys_msync`, `sys_brk`, and `sys_fchmod`/`sys_fallocate`/`sys_ftruncate`/
 `sys_truncate` remain fully BKL-held and unaudited by this phase.

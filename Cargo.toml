@@ -170,7 +170,7 @@ smp = ["dep:akuma-smp"]
 # SMP=4 (3 boots × 10 rounds fork-hammer: 0 faults, 0 partial child output, 0
 # `[BKL] stuck`) and contention-confirmed by a same-source `bkl-profile` A/B
 # (`clone` 19.5% → 2.5%, 8.6× fewer spins). Remove from this list to A/B.
-smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process"]
+smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm"]
 
 # Run the native (smoltcp) network syscalls WITHOUT the Big Kernel Lock — the
 # first subsystem carved out of the BKL (docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
@@ -222,7 +222,8 @@ no-bkl-process = ["akuma-exec/no-bkl-process"]
 # Run the memory-management syscalls (`mprotect`/`madvise`/`munmap`/`mremap`/`mmap`)
 # WITHOUT the Big Kernel Lock — Phase 5 of
 # docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md, the fourth subsystem carved out.
-# Unlike net/vfs/process, this phase's own audit found two real gaps rather than
+# Included in `smp-shared` since 2026-08-01 (same as net/vfs/process). Unlike
+# net/vfs/process, this phase's own audit found two real gaps rather than
 # rediscovering an existing lock: `ProcessMemory::free_regions` was a plain
 # unguarded `Vec` (fixed by folding it under the existing `Process::vm_lock`, see
 # `Process::vm_alloc_mmap`/`vm_free_mmap`), and `sys_mmap`'s OOM/reclaim sweep

@@ -863,7 +863,7 @@ work is a BKL-drop guard plus inner-lock hardening. No new locks were introduced
       `&`+`wait` unusable, so parallel shell workloads must join on sentinel files.
 - [x] Combined net+VFS large-download I/O regimen (that doc §8, re-run post-fix §9.4)
 
-### Phase 5 - Memory Management Locks — SHIPPED (2026-08-01, `no-bkl-mm`, not yet default-on)
+### Phase 5 - Memory Management Locks — COMPLETE (2026-08-01, `no-bkl-mm`, default-on in `smp-shared`)
 
 See **[BKL_MM_CARVE_OUT.md](BKL_MM_CARVE_OUT.md)** for the full writeup. Headline,
 same shape as Phases 2/3/4: the sketched new locks below were **not built** —
@@ -907,12 +907,9 @@ one — see that doc's §5.
       total workload spins 47.3M → 42.6M (~10% cut) — but mm syscalls don't appear
       as named holders in this regimen either before or after, so the cut isn't
       attributable specifically to this carve (see the doc's §5)
-- [ ] **Not yet promoted to `smp-shared`'s default bundle** — unlike Phases 2–4,
-      which were promoted the same session they landed, this phase has no
-      contention number to justify default-on the way `no-bkl-process`'s
-      `clone` 19.5%→2.5% did. Promote once a real mmap-heavy contention A/B exists,
-      or on a deliberate decision that the audit + boot-suite + stress-tool
-      verification here is sufficient on its own.
+- [x] **Promoted to `smp-shared`'s default bundle** (2026-08-01). The audit +
+      boot-suite + stress-tool verification was accepted as sufficient evidence
+      on its own, matching the bar `no-bkl-process` cleared.
 
 ### Phase 6 - Device Driver Locks
 - [ ] Device drivers audited

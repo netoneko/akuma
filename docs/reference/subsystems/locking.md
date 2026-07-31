@@ -33,9 +33,9 @@ is not.
 Four carve-outs exist today: `no-bkl-network` (all smoltcp net syscalls +
 socket `read`/`write`), `no-bkl-vfs` (ext2 read paths, `mmap`, `unlinkat`,
 `openat`, `renameat`/`renameat2`, `mkdirat`, `fchmodat`), `no-bkl-process`
-(`fork_process`'s CoW page-copy window — opt-in, not in `smp-shared`), and
-`no-bkl-mm` (`mprotect`/`madvise`/`munmap`/`mremap`/`mmap` — opt-in, not in
-`smp-shared`). `no-bkl-process` is the first that is not about I/O: it overlaps a
+(`fork_process`'s CoW page-copy window), and `no-bkl-mm`
+(`mprotect`/`madvise`/`munmap`/`mremap`/`mmap`). All four are default-on in
+`smp-shared` (since 2026-08-01). `no-bkl-process` is the first that is not about I/O: it overlaps a
 CPU-bound page copy with peer-core EL1 rather than a disk or wire wait, and it is
 the first to lean on a *page-table* inner lock (`as_lock`) rather than a
 subsystem's own state locks. `no-bkl-mm` is the first phase picked by the plan
@@ -349,9 +349,9 @@ under `as_lock`, so the inner lock existed and fork just wasn't taking it.
 
 ### `no-bkl-mm` — `src/syscall/mem.rs`
 
-Phase 5, landed 2026-08-01. Not yet in `smp-shared`'s default bundle (see
-`BKL_MM_CARVE_OUT.md` §6) — picked by the plan, not by attribution (no mm syscall
-has ever measured as a significant BKL holder).
+Phase 5, landed 2026-08-01, promoted to `smp-shared` default-on 2026-08-01.
+Picked by the plan, not by attribution (no mm syscall has ever measured as a
+significant BKL holder).
 
 | syscall | guard scope | inner lock(s) held while BKL dropped |
 |---|---|---|
