@@ -26,7 +26,15 @@ both drop out entirely, matching `unlinkat`/`renameat` — and total workload sp
 285.7M → 246.0M spins (~14%), 0 stuck / 0 PANIC / 6-of-6 digests exact on both sides.
 Remaining 2b (`close`/`dup`/`fcntl`) and 2d are NOT started — to be evidence-led off the next
 attribution. The two pre-existing kernel bugs from §11 stand as before (thread-slot reclaim FIXED
-§11.7; `wait`/SIGCHLD still open §11.3).**
+§11.7; `wait`/SIGCHLD still open §11.3). §16–§18 (2026-07-31) found and fixed a profiler attribution
+bug that had inflated `irq/sched` to 88.4%; corrected, it is 23.0%, and the true largest remaining
+holder was the async-main smoltcp poll loop (`netpoll`, 59.7%) — not a VFS/net syscall at all. §19
+decomposed that into sub-phases (the drain itself: 59.8%, isolated) and audited it as carveable by
+the existing `NetBklGuard` precedent. **§20 (2026-08-01) shipped that carve, contention-confirmed:
+`netpoll_drain`'s share went 57.2% → absent, and total workload spinning cut 144.6M → 47.3M spins
+(−67.3%) — the largest single cut this campaign has measured — 0 stuck / 0 PANIC / 6-of-6 digests
+exact on both sides. Default-on: rides the same `no-bkl-network` gate already bundled into
+`smp-shared`, no new feature flag.**
 
 ---
 
@@ -1981,3 +1989,118 @@ SNAPSHOT=1 DISK=devbox.img MEMORY=4096 SMP=4 cargo run --profile release-smp-sha
 ( cd scripts/bkl_smp_regimen && ../../venv/bin/python -u drive.py 1500 )
 python3 scripts/bkl_smp_regimen/analyze_workload.py --auto run.log
 ```
+
+---
+
+## 20. Carving the drain — DONE, contention-confirmed, 2026-08-01
+
+§19.5's recommendation, carried out: the `while smoltcp_net::poll() {}` block in `src/main.rs`
+now runs BKL-free, using `NetBklGuard`'s own mechanism directly.
+
+### 20.1 The change
+
+```rust
+#[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+akuma_exec::bkl::dropped_window_open();
+let mut polls = 0u32;
+while akuma_net::smoltcp_net::poll() {
+    polls += 1;
+    if polls >= 64 {
+        break;
+    }
+}
+#[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+akuma_exec::bkl::dropped_window_close();
+```
+
+Gated on `kernel_no_bkl_network` specifically, not `kernel_smp_shared` alone — §19.3 explained why:
+that is the cfg that makes `PreemptGuard::new()` mask IRQs for the inner `NETWORK`/`SOCKET_TABLE`
+holds inside `poll()`, which is what keeps a nested IRQ from ever observing this core "holding
+`NETWORK`, wanting the BKL." No new lock was introduced — every piece of state the drain touches
+was already behind one (§19.3). **Already default-on**: `Cargo.toml`'s `smp-shared` feature bundles
+`no-bkl-network` in (`smp-shared = [..., "no-bkl-network", "no-bkl-vfs", "no-bkl-process"]`, made
+default per the `enable fixes by default` commit), so any `smp-shared` build gets this carve for
+free — no new feature flag was added or needed.
+
+Zero-cost when off: `dropped_window_open`/`close` are no-ops outside
+`cfg(all(kernel_smp_shared, target_os = "none"))` (`crates/akuma-exec/src/bkl.rs`), and the whole
+block compiles out entirely on non-`smoltcp` builds.
+
+### 20.2 Verification — build + host tests
+
+Compiles clean (clippy included) on `--release`, `release-smp-shared --features smp-shared`, and
+`release-smp-shared --features devbox-smoltcp,no-tests,bkl-profile`. `crates/akuma-exec`'s full
+host suite — 155 tests, including `bkl::` (the `DroppedWindowLedger` contract this carve depends
+on) and all `sync::thread_tag_tests` — stays green; nothing in the carve touches ledger internals,
+it only calls the existing public `dropped_window_open`/`close` pair.
+
+### 20.3 Verification — boot self-test (correctness), SMP=4
+
+Booted `release-smp-shared --features devbox-smoltcp` (self-tests **on**, `no-tests` off,
+`SNAPSHOT=1 DISK=devbox.img MEMORY=4096 SMP=4`). The two tests that exercise the exact mechanism
+this carve now relies on both passed:
+
+- `smp_shared_dropped_window_survives_irq` **PASSED** (18 eret(s) preserved the window) — the
+  ledger correctly keeps the BKL released across a nested IRQ landing mid-window, which is the
+  scenario a device IRQ hitting the drain between `poll()` calls now exercises for real (previously
+  only `NetBklGuard`'s syscall callers exercised it).
+- `smp_shared_holder_tag_follows_thread` **PASSED** — unaffected; confirms the carve didn't disturb
+  attribution.
+- `smp_shared_cooperative_wait` and `smp_shared_blocking_wait_peer_progress` both **PASSED**,
+  explicitly reporting "no BKL deadlock" / "no BKL freeze" under deliberate cross-core BKL pressure
+  — these run *before* `run_async_main` starts (confirmed against call order in `kernel_main`), so
+  their large `[BKL] stuck` cluster (owner=1, tag=511/unknown, dozens of lines) is that test's own
+  by-design contention stress, not the carve; it is identical in kind to stuck clusters seen in
+  every boot this session and is unrelated to `netpoll_drain`.
+- One unrelated pre-existing failure: `fs_error_to_errno_mapping`'s `PermissionDenied -> EPERM`
+  case expects `-1`, but `src/syscall/fs.rs` deliberately maps `PermissionDenied` to `EACCES` (-13)
+  — a documented, intentional choice ("Linux uses EACCES for filesystem permission errors... EPERM
+  is reserved for capability-style 'operation not permitted'"); the test is stale, not a regression.
+  Also `stp_xzr_ec15_handler_fires` failed with a QEMU EC-generation quirk the test itself already
+  flags. Neither touches networking/BKL code and both predate this session's changes.
+- Post-self-test steady state (45 s observed, sshd `accept` climbing steadily, TMR ticks
+  continuous): 0 `[BKL] stuck`, 0 WATCHDOG, 0 panics.
+
+### 20.4 Verification — controlled A/B (contention), SMP=4, `bkl-profile`, 2026-08-01
+
+Same unmodified `net4 → read4 → cp2 → rm` regimen, `SNAPSHOT=1 DISK=devbox.img MEMORY=4096 SMP=4`,
+`release-smp-shared --features devbox-smoltcp,no-tests,bkl-profile`, two back-to-back boots (not
+reusing §19.2's numbers, to control for host-machine variance across the day boundary): BEFORE ran
+with the two `dropped_window_open`/`close` calls compiled out (`cfg(feature =
+"TEMP_AB_BASELINE_DISABLE")`, an undeclared feature — always false, warns but doesn't error), AFTER
+with them restored. Only that one diff between sides.
+
+| | BEFORE | AFTER | delta |
+|---|---|---|---|
+| `netpoll_drain` share | 57.2% | **absent from top 15** | **−57.2pp** |
+| `netpoll_drain` spins | 78,776,143 | 0 (doesn't place) | — |
+| total contended spins | 144,575,777 | **47,280,739** | **−67.3%** |
+| `irq/sched` | 25.5% (35.15M) | 29.6% (12.38M) | share up (smaller pie), absolute spins down 65% |
+| digests (4 net + 2 cp) | 6/6 exact | 6/6 exact | — |
+| `[BKL] stuck` | 12 | 12 | unchanged |
+| `RECOVERED` | 52 | 78 | both pre-workload (see below) |
+| PANIC / WILD / SPURIOUS | 0 / 0 / 0 | 0 / 0 / 0 | — |
+
+`netpoll_drain` doesn't place in the top 15 tags at all post-carve — the same "drops out entirely"
+signature every successful carve in this campaign has produced (`unlinkat`, `renameat`,
+`mkdirat`/`fchmodat`). The **67.3% cut in total workload spinning is the largest single change this
+campaign has measured** — larger than any prior carve, because the thing being removed was, per
+§19, roughly 3/5 of all contended BKL time on this regimen.
+
+Both sides' `[BKL] stuck` (12/12) and `RECOVERED` (52/78) lines were checked against `[TMR]`
+timestamps the same way as §19.4: every stuck/recovered line on both sides clusters at a single
+pre-workload timestamp (t≈93s before, t≈446s after — the AFTER boot idled longer before the
+regimen started, hence the later absolute time), well outside the auto-selected workload window on
+either side. Not workload signal, not a regression — same caveat as §19.4, now confirmed to hold on
+both sides of this specific A/B.
+
+### 20.5 Status
+
+**Shipped and default-on.** No Cargo.toml change was needed — the carve rides the same
+`no-bkl-network` gate `NetBklGuard` already uses, and that gate has been part of the default
+`smp-shared` bundle since the `enable fixes by default` commit. Non-`smp-shared` and non-`smoltcp`
+builds are byte-for-byte unaffected (both cfg arms compile to nothing).
+
+Nothing else in the `netpoll` family is being carved: `netpoll_maint` (process/thread-table code,
+no fine-grained lock underneath — §19.5) and `netpoll_herd` (safe but below the noise floor) stand
+as recommended against in §19.5.
