@@ -15,7 +15,8 @@ change to the dropped-window ledger or the ext2 guards.
 | `gen_payload.py` | writes the deterministic payload + prints its reference sha256 |
 | `vm.py` | run one command in the VM over ssh (see caveats below) |
 | `drive.py` | stage `job.sh` into the VM, run it detached, poll it to completion |
-| `analyze.py` | count stability signals + summarize `[BKLPROF]` windows from a kernel log |
+| `analyze.py` | count stability signals + summarize `[BKLPROF]` windows from a kernel log (whole-boot) |
+| `analyze_workload.py` | the same attribution restricted to the **workload windows** — the only defensible view (§17.2) |
 
 ## Run
 
@@ -28,13 +29,15 @@ change to the dropped-window ledger or the ext2 guards.
 cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests
 cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests,bkl-profile
 
-# 3. boot (nothing else may hold devbox.img open — see below)
-DISK=devbox.img MEMORY=4096 SMP=4 scripts/cargo_runner.sh \
+# 3. boot (nothing else may hold devbox.img open — see below).
+#    SNAPSHOT=1 discards writes, so the two sides of an A/B start byte-identical.
+SNAPSHOT=1 DISK=devbox.img MEMORY=4096 SMP=4 scripts/cargo_runner.sh \
     target/aarch64-unknown-none/release-smp-shared/akuma > run.log 2>&1 &
 
 # 4. drive + analyze
-./venv/bin/python scripts/bkl_smp_regimen/drive.py 1800
-./venv/bin/python scripts/bkl_smp_regimen/analyze.py run.log
+./venv/bin/python -u scripts/bkl_smp_regimen/drive.py 1800
+python3 scripts/bkl_smp_regimen/analyze_workload.py --auto run.log   # workload only
+./venv/bin/python scripts/bkl_smp_regimen/analyze.py run.log         # whole boot
 ```
 
 ## Caveats that cost real debugging time

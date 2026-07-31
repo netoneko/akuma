@@ -143,6 +143,12 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_smp_shared_dropped_window_survives_irq();
 
+    // BKL-hold ATTRIBUTION must follow the thread, not the core: a thread preempted
+    // mid-excursion must still be attributed to that excursion when it resumes, and the
+    // transient IRQ stamp must never overwrite the interrupted thread's own tag.
+    #[cfg(kernel_smp_shared)]
+    test_smp_shared_holder_tag_follows_thread();
+
     // `no-bkl-vfs`: concurrent fs syscalls (read/stat/getdents) from several processes must
     // stay correct with the BKL dropped, and should lower cross-core BKL contention.
     #[cfg(kernel_smp_shared)]
@@ -1314,6 +1320,100 @@ fn test_smp_shared_dropped_window_survives_irq() {
             nested_close_stayed_free,
             outer_close_reacquired,
             preserved
+        );
+    }
+}
+
+/// BKL-hold attribution must be **thread-scoped**: a kernel excursion belongs to a thread,
+/// survives preemption, and can resume on a different core, so the tag a peer waiter
+/// samples must follow the thread rather than staying stamped on the core.
+///
+/// Before the per-thread table (docs/archive/BKL_VFS_CARVE_OUT.md §18) the tag lived only
+/// in the per-core `HOLDER_TAG`: a timer tick that context-switched mid-syscall left the
+/// incoming thread wearing `irq/sched`, and the preempted thread — never re-entering the
+/// kernel — ran the whole remainder of its syscall under that label. The long excursions
+/// are exactly the ones that get preempted, so the artifact pooled in one bucket.
+///
+/// The assertion is the contract stated as an experiment: stamp a sentinel tag, then cross
+/// the scheduler and real timer IRQs repeatedly, and require the tag to still be there —
+/// both in the thread's own entry and in whatever core we come back on.
+#[cfg(kernel_smp_shared)]
+fn test_smp_shared_holder_tag_follows_thread() {
+    use akuma_exec::sync::{
+        core_tag, set_holder_tag, set_profiling, thread_tag, HOLD_TAG_UNKNOWN,
+    };
+
+    // A tag no real excursion produces: 499 is the last syscall-number bucket, below
+    // HOLD_TAG_FAULT (500). This thread makes no syscalls during the test, so nothing can
+    // legitimately re-stamp it.
+    const SENTINEL: u64 = 499;
+
+    // The profiler is off unless this is a `bkl-profile` build; the accessors are no-ops
+    // while off, so enable it for the measurement and put it back exactly as found.
+    let was_on = cfg!(kernel_bkl_profile);
+    set_profiling(true);
+
+    let tid = akuma_exec::threading::current_thread_id();
+    set_holder_tag(akuma_exec::bkl::current_core_id(), SENTINEL);
+    let stamped_thread = thread_tag(tid) == SENTINEL;
+    let stamped_core = core_tag(akuma_exec::bkl::current_core_id()) == SENTINEL;
+
+    // Cross the scheduler explicitly, then dwell ~3.5 timer ticks so genuine timer IRQs
+    // land on this thread while it is "inside" the sentinel excursion. Both shapes of the
+    // old bug are exercised: IRQ-with-switch (yields) and IRQ-without-switch (the dwell).
+    // Also count cores this thread was observed on: crossing cores is the case a
+    // core-scoped tag cannot represent at all, so a count >1 is the strongest form of the
+    // evidence. (The transient IRQ stamp itself is NOT observable from this thread — while
+    // the dispatch runs, this loop isn't executing — so it is not asserted on.)
+    let mut thread_tag_held = true;
+    let mut cores_seen: u32 = 0;
+    let mut last_core = akuma_exec::bkl::current_core_id();
+    for _ in 0..8 {
+        akuma_exec::threading::yield_now();
+        thread_tag_held &= thread_tag(tid) == SENTINEL;
+    }
+    let start = crate::timer::uptime_us();
+    while crate::timer::uptime_us().saturating_sub(start) < 35_000 {
+        let core = akuma_exec::bkl::current_core_id();
+        if core != last_core {
+            last_core = core;
+            cores_seen = cores_seen.saturating_add(1);
+        }
+        // The core cache may legitimately read HOLD_TAG_IRQ for the instant of a dispatch,
+        // but the thread's own entry must never be touched by it.
+        thread_tag_held &= thread_tag(tid) == SENTINEL;
+        core::hint::spin_loop();
+    }
+
+    // The payoff: a peer waiting on whatever core we are on NOW must be told we are still
+    // in the sentinel excursion — not `irq/sched`, not `unknown`.
+    let resumed_core = akuma_exec::bkl::current_core_id();
+    let final_core_tag = core_tag(resumed_core);
+    let core_followed = final_core_tag == SENTINEL;
+    let thread_survived = thread_tag(tid) == SENTINEL;
+
+    set_holder_tag(resumed_core, HOLD_TAG_UNKNOWN);
+    set_profiling(was_on);
+
+    if stamped_thread && stamped_core && thread_tag_held && thread_survived && core_followed {
+        crate::safe_print!(
+            192,
+            "[Test] smp_shared_holder_tag_follows_thread PASSED (tag {} survived 8 yields + 35 ms of ticks, resumed on core {}, {} core change(s) observed)\n",
+            SENTINEL,
+            resumed_core,
+            cores_seen
+        );
+    } else {
+        crate::safe_print!(
+            255,
+            "[Test] smp_shared_holder_tag_follows_thread FAILED: stamped_thread={} stamped_core={} thread_tag_held={} thread_survived={} core_followed={} (final core tag={}, core={})\n",
+            stamped_thread,
+            stamped_core,
+            thread_tag_held,
+            thread_survived,
+            core_followed,
+            final_core_tag,
+            resumed_core
         );
     }
 }

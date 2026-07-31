@@ -169,11 +169,22 @@ impl Drop for PreemptGuard {
 /// Max cores tracked by the profiler (matches the kernel's `MAX_CORES`).
 const PROFILE_MAX_CORES: usize = 8;
 /// Tag buckets: 0..=499 are syscall numbers (capped), 500 fault, 501 IRQ/scheduler,
-/// 511 unknown/idle. Sized to 512.
+/// 502 idle loop, 503 network poll, 511 unknown. Sized to 512.
 const PROFILE_BUCKETS: usize = 512;
 /// Reserved tag values.
 pub const HOLD_TAG_FAULT: u64 = 500;
 pub const HOLD_TAG_IRQ: u64 = 501;
+/// A core's idle loop holding the BKL: the post-WFI bookkeeping plus the `yield_now()`
+/// that runs the scheduler. Named because an idle thread never enters the kernel through
+/// a syscall or fault, so it would otherwise be attributed [`HOLD_TAG_UNKNOWN`] —
+/// honest but useless. See docs/archive/BKL_VFS_CARVE_OUT.md §18.
+pub const HOLD_TAG_IDLE: u64 = 502;
+/// The async-main smoltcp poll loop holding the BKL across a drain. Same reasoning as
+/// [`HOLD_TAG_IDLE`]: it is a long-lived kernel thread with no tagged entry point.
+pub const HOLD_TAG_NETPOLL: u64 = 503;
+/// No attribution available: the holder is a thread that has never passed a tagging site.
+/// With thread-scoped attribution this is a real answer ("an untagged in-kernel thread"),
+/// not the "profiler is off" placeholder it also serves as.
 pub const HOLD_TAG_UNKNOWN: u64 = 511;
 
 /// Master switch for the BKL-hold profiler. **Default off** so normal boot pays nothing:
@@ -192,17 +203,114 @@ pub fn set_profiling(on: bool) {
 #[repr(align(64))]
 struct CoreTag(AtomicU64);
 
-/// Per-core tag: what the core is doing while it holds (or last held) the BKL.
+/// Per-core tag: what the thread **currently running on this core** is doing in the
+/// kernel. This is the waiter's sampling point (`acquire` reads `HOLDER_TAG[owner_core]`)
+/// and stays core-indexed and cache-line padded for exactly that reason — the waiter
+/// knows only the owner's *core*, never its thread.
+///
+/// It is a **cache**, not the source of truth: [`THREAD_TAG`] is. See that type's docs for
+/// why the distinction exists.
 static HOLDER_TAG: [CoreTag; PROFILE_MAX_CORES] =
     [const { CoreTag(AtomicU64::new(HOLD_TAG_UNKNOWN)) }; PROFILE_MAX_CORES];
 /// Per-tag accumulated peer wait (spin iterations attributed to a holder doing `tag`).
 static WAIT_BY_HOLDER: [AtomicU64; PROFILE_BUCKETS] =
     [const { AtomicU64::new(0) }; PROFILE_BUCKETS];
 
-/// Record what `core_id` is doing while in the kernel (holding the BKL). Called by the
-/// exception entry paths (syscall number / fault / IRQ) so waiters can attribute blame.
+/// Per-thread "what is this thread doing inside the kernel" tag — the authoritative half
+/// of the attribution model.
+///
+/// **Why thread-scoped.** A kernel excursion belongs to a *thread*, not a core: it survives
+/// preemption and can resume on a different core. When attribution lived only in the
+/// per-core [`HOLDER_TAG`], a timer tick that context-switched mid-syscall left the
+/// incoming thread wearing `irq/sched`, and a thread preempted inside a long BKL-held
+/// syscall never re-entered the kernel to correct itself — it ran the whole remainder of
+/// that syscall labelled `irq/sched`. Precisely the long excursions worth finding are the
+/// ones that get preempted, so the artifact concentrated in the one bucket
+/// (docs/archive/BKL_VFS_CARVE_OUT.md §16.2, §18).
+///
+/// This is the same reason [`crate::bkl::DroppedWindowLedger`] is thread-scoped, and the
+/// storage mirrors it: a plain array of relaxed atomics, pure (no target dependencies) so
+/// the contract is host-testable, out-of-range `tid`s inert.
+///
+/// **The contract**, maintained by three operations:
+/// - a kernel *entry* ([`set_holder_tag`]) publishes the thread's tag to both tables;
+/// - a *transient* nested excursion ([`set_core_tag_transient`]) touches only the core
+///   cache, so the interrupted thread's own tag is never clobbered;
+/// - a *thread change* ([`load_thread_tag_to_core`]) reloads the cache from the table.
+///
+/// Together those give the invariant `HOLDER_TAG[c] == THREAD_TAG[thread running on c]`,
+/// except inside a transient excursion where the core cache deliberately reads
+/// [`HOLD_TAG_IRQ`].
+pub struct ThreadTagTable<const N: usize> {
+    tag: [AtomicU64; N],
+}
+
+impl<const N: usize> ThreadTagTable<N> {
+    /// All threads start unattributed.
+    pub const fn new() -> Self {
+        Self {
+            tag: [const { AtomicU64::new(HOLD_TAG_UNKNOWN) }; N],
+        }
+    }
+
+    /// Record what `tid` is doing in the kernel. Tags are clamped into the bucket range so
+    /// the histogram index is always valid; out-of-range `tid`s are ignored.
+    pub fn set(&self, tid: usize, tag: u64) {
+        if let Some(t) = self.tag.get(tid) {
+            t.store(tag.min((PROFILE_BUCKETS - 1) as u64), Ordering::Relaxed);
+        }
+    }
+
+    /// What `tid` is doing, or [`HOLD_TAG_UNKNOWN`] for an unknown/out-of-range thread.
+    pub fn get(&self, tid: usize) -> u64 {
+        self.tag.get(tid).map_or(HOLD_TAG_UNKNOWN, |t| t.load(Ordering::Relaxed))
+    }
+
+    /// Drop `tid`'s attribution back to unknown. For recycled thread slots — a fresh thread
+    /// must not inherit the tag of the one that previously owned the slot.
+    pub fn reset(&self, tid: usize) {
+        if let Some(t) = self.tag.get(tid) {
+            t.store(HOLD_TAG_UNKNOWN, Ordering::Relaxed);
+        }
+    }
+}
+
+impl<const N: usize> Default for ThreadTagTable<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The kernel's per-thread tag table, indexed by thread id.
+static THREAD_TAG: ThreadTagTable<{ crate::threading::MAX_THREADS }> = ThreadTagTable::new();
+
+/// Record what the **current thread** is doing on entering kernel code, and mirror it to
+/// `core_id`'s sampling cache. Called by the exception entry paths (syscall number at
+/// syscall entry, `HOLD_TAG_FAULT` at fault entry) so waiters can attribute blame.
+///
+/// Writing both tables is what makes the attribution survive a context switch: the core
+/// cache serves the waiter now, the thread entry serves this same excursion after it is
+/// preempted and later resumed (possibly on another core).
 #[inline]
 pub fn set_holder_tag(core_id: u32, tag: u64) {
+    if !PROFILE_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let tag = tag.min((PROFILE_BUCKETS - 1) as u64);
+    THREAD_TAG.set(crate::threading::current_thread_id(), tag);
+    let c = core_id as usize;
+    if c < PROFILE_MAX_CORES {
+        HOLDER_TAG[c].0.store(tag, Ordering::Relaxed);
+    }
+}
+
+/// Stamp `core_id`'s sampling cache for a **transient** nested excursion that does not
+/// belong to the interrupted thread — the IRQ/scheduler dispatch. Deliberately does NOT
+/// touch [`THREAD_TAG`]: the interrupted thread is still mid-syscall and must keep its own
+/// tag, so that whichever thread the core ends up running afterwards,
+/// [`load_thread_tag_to_core`] can restore the truth.
+#[inline]
+pub fn set_core_tag_transient(core_id: u32, tag: u64) {
     if !PROFILE_ENABLED.load(Ordering::Relaxed) {
         return;
     }
@@ -212,24 +320,48 @@ pub fn set_holder_tag(core_id: u32, tag: u64) {
     }
 }
 
-/// Read `core_id`'s current holder tag — what it was attributed as doing the last time
-/// `set_holder_tag` ran. Lets a caller that's about to overwrite the tag for a brief
-/// nested excursion (e.g. IRQ dispatch during an in-progress syscall) save it first and
-/// restore it afterward, so peer waiters that start spinning after the nested excursion
-/// still attribute their wait to the excursion that was actually interrupted rather than
-/// to the transient IRQ. Returns `HOLD_TAG_UNKNOWN` (and does no work) while the profiler
-/// is off, matching `set_holder_tag`'s own no-op-when-off behavior.
+/// Point `core_id`'s sampling cache at `tid`'s tag — i.e. "this core is now running this
+/// thread, so waiters blocked on it should be told what *it* is doing."
+///
+/// Called wherever the current thread changes (`set_current_thread_register`, which every
+/// context-switch path funnels through) and at the end of the IRQ dispatch. Those two
+/// cover both shapes of the old bug with one rule: after a switch it installs the incoming
+/// thread's tag, and after an IRQ that did *not* switch it reinstalls the interrupted
+/// thread's own tag — which is why no save/restore of the pre-IRQ tag is needed.
 #[inline]
-pub fn holder_tag(core_id: u32) -> u64 {
+pub fn load_thread_tag_to_core(core_id: u32, tid: usize) {
     if !PROFILE_ENABLED.load(Ordering::Relaxed) {
-        return HOLD_TAG_UNKNOWN;
+        return;
     }
+    let c = core_id as usize;
+    if c < PROFILE_MAX_CORES {
+        HOLDER_TAG[c].0.store(THREAD_TAG.get(tid), Ordering::Relaxed);
+    }
+}
+
+/// Read `tid`'s tag. For assertions and the boot self-test.
+#[inline]
+pub fn thread_tag(tid: usize) -> u64 {
+    THREAD_TAG.get(tid)
+}
+
+/// Read `core_id`'s sampling cache — what a waiter blocked on that core would attribute
+/// its wait to right now. For assertions and the boot self-test.
+#[inline]
+pub fn core_tag(core_id: u32) -> u64 {
     let c = core_id as usize;
     if c < PROFILE_MAX_CORES {
         HOLDER_TAG[c].0.load(Ordering::Relaxed)
     } else {
         HOLD_TAG_UNKNOWN
     }
+}
+
+/// Clear a thread slot's attribution. Called when a slot is claimed for a new thread, so a
+/// recycled slot cannot lend its predecessor's tag to a waiter.
+#[inline]
+pub fn reset_thread_tag(tid: usize) {
+    THREAD_TAG.reset(tid);
 }
 
 /// Read a tag bucket's accumulated peer-wait spins (for the profiler dump).
@@ -798,6 +930,181 @@ pub type RwSpinlockReadGuard<'a, T> = lock_api::RwLockReadGuard<'a, RawRwSpinloc
 
 /// Write guard for `RwSpinlock`.
 pub type RwSpinlockWriteGuard<'a, T> = lock_api::RwLockWriteGuard<'a, RawRwSpinlock, T>;
+
+#[cfg(test)]
+mod thread_tag_tests {
+    use super::*;
+
+    /// The three operations the kernel performs on the attribution tables, replayed
+    /// against a private core cache so the tests are deterministic and can't collide with
+    /// the process-global `HOLDER_TAG` other tests touch. Mirrors `set_holder_tag`,
+    /// `set_core_tag_transient` and `load_thread_tag_to_core` exactly.
+    struct Model<const NT: usize, const NC: usize> {
+        threads: ThreadTagTable<NT>,
+        cores: [u64; NC],
+        /// Which thread each core is currently running (the kernel's TPIDRRO_EL0).
+        running: [usize; NC],
+    }
+
+    impl<const NT: usize, const NC: usize> Model<NT, NC> {
+        fn new() -> Self {
+            Self {
+                threads: ThreadTagTable::new(),
+                cores: [HOLD_TAG_UNKNOWN; NC],
+                running: [0; NC],
+            }
+        }
+        /// Kernel entry (syscall / fault): publish to BOTH tables.
+        fn enter_kernel(&mut self, core: usize, tag: u64) {
+            self.threads.set(self.running[core], tag);
+            self.cores[core] = tag;
+        }
+        /// Transient nested excursion (IRQ dispatch): core cache only.
+        fn irq_stamp(&mut self, core: usize) {
+            self.cores[core] = HOLD_TAG_IRQ;
+        }
+        /// The current thread changed (`set_current_thread_register`).
+        fn switch_to(&mut self, core: usize, tid: usize) {
+            self.running[core] = tid;
+            self.cores[core] = self.threads.get(tid);
+        }
+        /// End of IRQ dispatch: re-point the cache at whoever runs now.
+        fn irq_epilogue(&mut self, core: usize) {
+            self.cores[core] = self.threads.get(self.running[core]);
+        }
+        /// What a peer waiting on `core`'s BKL hold would credit its spins to.
+        fn sampled_by_waiter(&self, core: usize) -> u64 {
+            self.cores[core]
+        }
+    }
+
+    const SYS_WRITE: u64 = 64;
+    const SYS_CLONE: u64 = 220;
+
+    /// The bug this whole change exists to kill (docs/archive/BKL_VFS_CARVE_OUT.md §16.2):
+    /// a thread preempted mid-syscall used to spend the ENTIRE remainder of that syscall
+    /// labelled `irq/sched`, because the tag lived only on the core. Attribution must
+    /// follow the thread back.
+    #[test]
+    fn tag_survives_preemption_and_resume() {
+        let mut m: Model<8, 2> = Model::new();
+        m.switch_to(0, 3);
+        m.enter_kernel(0, SYS_WRITE); // thread 3 starts a long write
+        assert_eq!(m.sampled_by_waiter(0), SYS_WRITE);
+
+        // Timer tick lands mid-write; the scheduler picks thread 5.
+        m.irq_stamp(0);
+        m.switch_to(0, 5);
+        m.irq_epilogue(0);
+        assert_eq!(
+            m.threads.get(3),
+            SYS_WRITE,
+            "the interrupted thread's own tag must not be clobbered by the transient IRQ"
+        );
+
+        // Thread 3 resumes — still inside the same write, and must be attributed as such.
+        m.switch_to(0, 3);
+        assert_eq!(
+            m.sampled_by_waiter(0),
+            SYS_WRITE,
+            "resuming a preempted syscall must NOT read as irq/sched"
+        );
+    }
+
+    /// An IRQ that switches to a thread which was itself preempted mid-syscall must
+    /// install THAT thread's tag, not `irq/sched`. This is the half §16.2.1 deliberately
+    /// left unfixed ("honest, not guessed") — it is no longer a guess, it is a lookup.
+    #[test]
+    fn switch_installs_incoming_threads_own_tag() {
+        let mut m: Model<8, 2> = Model::new();
+        // Thread 5 got as far as a clone on core 1, then was preempted away.
+        m.switch_to(1, 5);
+        m.enter_kernel(1, SYS_CLONE);
+        m.switch_to(1, 2);
+
+        // Core 0 now takes an IRQ and the scheduler hands it thread 5.
+        m.switch_to(0, 4);
+        m.enter_kernel(0, SYS_WRITE);
+        m.irq_stamp(0);
+        m.switch_to(0, 5);
+        m.irq_epilogue(0);
+        assert_eq!(
+            m.sampled_by_waiter(0),
+            SYS_CLONE,
+            "the incoming thread carries its own excursion's tag across cores"
+        );
+    }
+
+    /// With no context switch, the epilogue must restore the interrupted thread's tag —
+    /// the case §16.2.1 fixed with an explicit save/restore, now falling out of the same
+    /// single rule.
+    #[test]
+    fn irq_without_switch_restores_interrupted_tag() {
+        let mut m: Model<8, 1> = Model::new();
+        m.switch_to(0, 1);
+        m.enter_kernel(0, SYS_WRITE);
+        m.irq_stamp(0);
+        assert_eq!(m.sampled_by_waiter(0), HOLD_TAG_IRQ, "IRQ dispatch is honestly IRQ");
+        m.irq_epilogue(0);
+        assert_eq!(m.sampled_by_waiter(0), SYS_WRITE);
+    }
+
+    /// Two cores running two threads must not read each other's attribution.
+    #[test]
+    fn cores_and_threads_stay_isolated() {
+        let mut m: Model<8, 2> = Model::new();
+        m.switch_to(0, 1);
+        m.switch_to(1, 2);
+        m.enter_kernel(0, SYS_WRITE);
+        m.enter_kernel(1, SYS_CLONE);
+        assert_eq!(m.sampled_by_waiter(0), SYS_WRITE);
+        assert_eq!(m.sampled_by_waiter(1), SYS_CLONE);
+        assert_eq!(m.threads.get(1), SYS_WRITE);
+        assert_eq!(m.threads.get(2), SYS_CLONE);
+    }
+
+    /// Storage contract: unknown by default, clamped into the histogram's bucket range,
+    /// resettable for recycled slots, inert for out-of-range tids.
+    #[test]
+    fn thread_tag_table_defaults_clamp_reset_and_bounds() {
+        let t: ThreadTagTable<4> = ThreadTagTable::new();
+        assert_eq!(t.get(0), HOLD_TAG_UNKNOWN, "a thread starts unattributed");
+
+        t.set(0, SYS_WRITE);
+        assert_eq!(t.get(0), SYS_WRITE);
+        assert_eq!(t.get(1), HOLD_TAG_UNKNOWN, "tags are per-thread");
+
+        // A syscall number past the bucket array must clamp, never index out of bounds.
+        t.set(1, 100_000);
+        assert_eq!(t.get(1), (PROFILE_BUCKETS - 1) as u64);
+
+        // Recycled slot.
+        t.reset(0);
+        assert_eq!(t.get(0), HOLD_TAG_UNKNOWN);
+
+        // Out-of-range tid: no panic, reads as unknown.
+        t.set(99, SYS_WRITE);
+        assert_eq!(t.get(99), HOLD_TAG_UNKNOWN);
+        t.reset(99);
+    }
+
+    /// The kernel's real accessors must be no-ops while the profiler is off (the default),
+    /// so a non-measurement build pays nothing and reads as unknown.
+    #[test]
+    fn accessors_are_inert_while_profiling_is_off() {
+        assert!(
+            !PROFILE_ENABLED.load(Ordering::Relaxed),
+            "profiler must default off"
+        );
+        set_holder_tag(0, SYS_WRITE);
+        set_core_tag_transient(0, HOLD_TAG_IRQ);
+        load_thread_tag_to_core(0, 0);
+        assert_eq!(thread_tag(0), HOLD_TAG_UNKNOWN);
+        assert_eq!(core_tag(0), HOLD_TAG_UNKNOWN);
+        // Out-of-range core is inert too.
+        assert_eq!(core_tag(999), HOLD_TAG_UNKNOWN);
+    }
+}
 
 #[cfg(test)]
 mod tests {

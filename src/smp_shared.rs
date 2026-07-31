@@ -729,6 +729,12 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
         // Re-take the BKL for our brief kernel work before the next halt (idempotent
         // if the waking IRQ's reconcile already re-acquired it for us).
         akuma_exec::bkl::enter_kernel();
+        // Profiler only: this bootstrap idle loop has no syscall/fault entry point, so
+        // name its hold rather than leaving it "unknown" (BKL_VFS_CARVE_OUT.md §18).
+        akuma_exec::sync::set_holder_tag(
+            akuma_exec::bkl::current_core_id(),
+            akuma_exec::sync::HOLD_TAG_IDLE,
+        );
         set_core_idle(core, false);
     }
 }

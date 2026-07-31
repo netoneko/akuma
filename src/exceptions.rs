@@ -1577,17 +1577,17 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
 
     // Device IRQ, or a scheduler SGI that preempted EL1 (BKL held): run holding the BKL.
     akuma_exec::bkl::enter_kernel();
-    // Profiler bookkeeping only (no-op unless `bkl-profile` is on): save the tag this
-    // core was attributed with before we stamp it IRQ for the dispatch below, and put it
-    // back afterward. Without this, a device IRQ or scheduler SGI landing mid-syscall
-    // (interrupted_el0 == false, so the BKL stays held and this core resumes the same
-    // excursion after dispatch) would leave the core mislabeled "irq/sched" in the
-    // holder-tag histogram for the rest of that syscall's duration — attributing any
-    // peer contention against the *remainder* of a long syscall to the brief IRQ instead.
+    // Profiler bookkeeping only (no-op unless `bkl-profile` is on): the IRQ dispatch is a
+    // TRANSIENT excursion that does not belong to the interrupted thread, so it stamps the
+    // per-core sampling cache alone and leaves the interrupted thread's own per-thread tag
+    // intact. Without this the core would stay mislabeled "irq/sched" for the rest of the
+    // syscall it interrupted, attributing peer contention against the *remainder* of a long
+    // syscall to the brief IRQ instead.
     #[cfg(kernel_smp_shared)]
-    let prev_holder_tag = akuma_exec::sync::holder_tag(akuma_exec::bkl::current_core_id());
-    #[cfg(kernel_smp_shared)]
-    akuma_exec::sync::set_holder_tag(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_IRQ);
+    akuma_exec::sync::set_core_tag_transient(
+        akuma_exec::bkl::current_core_id(),
+        akuma_exec::sync::HOLD_TAG_IRQ,
+    );
 
     let new_sp = if let Some(irq) = irq_opt {
         if irq == crate::gic::SGI_SCHEDULER {
@@ -1602,16 +1602,17 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
         0
     };
 
-    // Only restore the saved tag if we're resuming the SAME excursion (no context
-    // switch): `prev_holder_tag` describes the thread that was interrupted, and a
-    // scheduler SGI that picked a *different* READY thread (`new_sp != 0`) is about to
-    // resume work this handler knows nothing about — reapplying the old thread's tag to
-    // it would misattribute in the other direction. Leave it as IRQ (honest: "just
-    // scheduled, not yet profiled") rather than guess.
+    // End of the transient excursion: point the sampling cache back at whichever thread
+    // this core is about to run. ONE rule covers both outcomes, which is why the old
+    // `if new_sp == 0 { restore saved tag }` special case is gone — after a switch
+    // (`new_sp != 0`) `current_thread_id()` is the INCOMING thread and we install its own
+    // tag (previously it inherited `irq/sched` and kept it for the rest of its syscall);
+    // with no switch it is the interrupted thread and we reinstall the tag it never lost.
     #[cfg(kernel_smp_shared)]
-    if new_sp == 0 {
-        akuma_exec::sync::set_holder_tag(akuma_exec::bkl::current_core_id(), prev_holder_tag);
-    }
+    akuma_exec::sync::load_thread_tag_to_core(
+        akuma_exec::bkl::current_core_id(),
+        akuma_exec::threading::current_thread_id(),
+    );
 
     #[cfg(kernel_smp_shared)]
     {

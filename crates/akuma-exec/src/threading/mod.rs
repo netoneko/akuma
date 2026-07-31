@@ -622,6 +622,15 @@ fn set_current_thread_register(tid: usize) {
     unsafe {
         core::arch::asm!("msr tpidrro_el0, {}", in(reg) tid as u64);
     }
+    // BKL-hold profiler only (no-op unless `bkl-profile` turned it on; absent entirely
+    // outside `smp-shared`). This is THE choke point for "the current thread changed" —
+    // every switch path funnels through it (`commit_switch`, the network-thread boost in
+    // `schedule_indices`, per-core idle adoption, boot) — so re-pointing the per-core
+    // sampling cache here is what makes BKL attribution follow the thread across
+    // preemption and cross-core migration instead of being smeared into `irq/sched`.
+    // See `crate::sync::ThreadTagTable`.
+    #[cfg(kernel_smp_shared)]
+    crate::sync::load_thread_tag_to_core(crate::bkl::current_core_id(), tid);
 }
 
 #[cfg(not(target_os = "none"))]
@@ -674,6 +683,11 @@ fn claim_free_slot(start: usize, end: usize) -> Option<usize> {
             THREAD_SIGNAL_MASK[i].store(0, Ordering::Release);
             // A recycled slot must not carry a stale rt_sigsuspend restore-mask.
             THREAD_RESTORE_SIGMASK_PENDING[i].store(false, Ordering::Release);
+            // ...nor a stale BKL-profiler attribution: the new thread would lend the
+            // previous occupant's tag to any peer that samples this slot before its first
+            // kernel entry. Profiler-only; see `crate::sync::ThreadTagTable`.
+            #[cfg(kernel_smp_shared)]
+            crate::sync::reset_thread_tag(i);
             return Some(i);
         }
     }
@@ -2638,6 +2652,15 @@ pub fn idle_halt() {
     // lock. No-op unless smp-shared.
     if !crate::bkl::in_dropped_window() {
         crate::bkl::enter_kernel();
+        // Profiler only: name this hold. An idle thread never passes a syscall/fault
+        // tagging site, so without this its BKL time (this bookkeeping plus the
+        // `yield_now()` that follows in the idle loop) is attributed "unknown". Gated on
+        // IS_IDLE_THREAD because non-idle callers use `idle_halt()` as a plain wait and
+        // must keep their own excursion's tag.
+        #[cfg(kernel_smp_shared)]
+        if tid < MAX_THREADS && IS_IDLE_THREAD[tid].load(Ordering::Relaxed) {
+            crate::sync::set_holder_tag(crate::bkl::current_core_id(), crate::sync::HOLD_TAG_IDLE);
+        }
     }
     let halted = (runtime().uptime_us)().saturating_sub(entered);
     if tid < MAX_THREADS && halted > 0 {

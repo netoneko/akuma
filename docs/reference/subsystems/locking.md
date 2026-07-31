@@ -352,15 +352,43 @@ measurement-only and perturbs timing, which is why it's a separate feature
 rather than part of `smp-shared` — never compare absolute spin counts across
 sessions, only shares/ranks within one same-binary run, and prefer the
 `[BKL] stuck` threshold counter (present in every build) as the
-profiler-independent cross-check. A core's holder tag is also only a
-best-effort label: a timer tick or device IRQ landing mid-excursion briefly
-overwrote it to "irq/sched" pre-2026-07-30 with no restore, so any
-BKL-holding operation that outlived one 10ms tick bled its later contention
-into that bucket — fixed by saving/restoring the tag around the transient IRQ
-dispatch (`BKL_VFS_CARVE_OUT.md` §16.2); the correction moved ~8 points off
-`irq/sched` into `clone`/`execve` on one campaign's regimen. Re-verify this
-class of bug hasn't recurred before trusting a big "irq/sched" share at face
-value.
+profiler-independent cross-check.
+
+**Attribution is thread-scoped** (since 2026-07-31, `BKL_VFS_CARVE_OUT.md` §18).
+A kernel excursion belongs to a thread — it survives preemption and can resume
+on another core — so the authoritative tag lives in a per-thread table
+(`sync::ThreadTagTable`, indexed by `current_thread_id()`), and the per-core
+`HOLDER_TAG` the waiter samples is a *cache* of it. Three operations maintain
+the invariant `HOLDER_TAG[c] == THREAD_TAG[thread running on c]`:
+`set_holder_tag` (kernel entry) writes both; `set_core_tag_transient` (the IRQ
+dispatch stamp) writes only the core cache, so the interrupted thread's tag is
+never clobbered; `load_thread_tag_to_core` reloads the cache wherever the
+current thread changes (`set_current_thread_register`, which every switch path
+funnels through) and at the IRQ epilogue.
+
+This replaced a per-core-only tag that was **not** trustworthy: a tick that
+context-switched handed the incoming thread the "irq/sched" label, and a thread
+preempted inside a long BKL-held syscall never re-entered the kernel to correct
+itself, so it ran that syscall's whole remainder labelled "irq/sched". Because
+the long excursions are the ones that get preempted, the artifact pooled in one
+bucket — on the campaign's SMP=4 regimen, `irq/sched` measured **88.8%** before
+the fix and **23.0%** after, on a matched same-disk A/B. Do not compare a
+pre-2026-07-31 `irq/sched` share with a later one.
+
+Buckets: `0..=499` syscall numbers, `500` fault, `501` irq/sched, `502` idle,
+`503` netpoll, `511` unknown. `idle`/`netpoll` name the two long-lived kernel
+threads that hold the BKL with no syscall or fault entry point (the per-core
+idle loops; the async-main smoltcp drain) — before they were named, their holds
+inherited whatever their core last did, which is how they fed `irq/sched`.
+`unknown` now means "held by a thread that never passed a tagging site", a real
+answer — except in a build without `bkl-profile`, where `tag=511` everywhere
+just means the profiler isn't compiled in.
+
+Read attribution over the **workload windows**, not whole-boot
+(`BKL_VFS_CARVE_OUT.md` §17.2): `scripts/bkl_smp_regimen/analyze_workload.py
+--auto <serial.log>` derives the interval from the regimen's own `execve`
+footprint and sums per-tag spins over just those windows. `analyze.py`'s default
+whole-boot view is diluted by bringup and idle.
 
 ```
 cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests,bkl-profile

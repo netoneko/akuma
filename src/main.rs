@@ -1571,6 +1571,13 @@ fn run_async_main() -> ! {
                 core::arch::asm!("wfi", options(nomem, nostack));
             }
             akuma_exec::bkl::enter_kernel();
+            // Profiler only: the network poll thread is a long-lived kernel thread with
+            // no syscall/fault entry point, so name its hold instead of leaving the whole
+            // smoltcp drain attributed "unknown" (BKL_VFS_CARVE_OUT.md §18).
+            akuma_exec::sync::set_holder_tag(
+                akuma_exec::bkl::current_core_id(),
+                akuma_exec::sync::HOLD_TAG_NETPOLL,
+            );
         }
         #[cfg(not(all(kernel_smp_shared, feature = "smoltcp")))]
         threading::yield_now();

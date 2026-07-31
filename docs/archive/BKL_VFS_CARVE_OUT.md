@@ -1558,3 +1558,225 @@ spanning that interval. Doing so changed §13.3's total-spin ratio from 2.4x to 
 `openat` shares moved up, and the conclusion strengthened); it changed Phase 3's `clone` number from
 25.2% whole-boot to 19.5% workload (`BKL_PROCESS_CARVE_OUT.md` §9.8). Same conclusions both times —
 but only the workload-restricted numbers are defensible.
+
+---
+
+## 18. `irq/sched` was an artifact: thread-scoped attribution — 2026-07-31
+
+§16.2 found the profiler over-credits `irq/sched` and §16.2.1 fixed half of it, deliberately
+leaving the other half in place. This section closes it, and the answer changes the campaign's
+direction: **`irq/sched` is not ~88% of remaining cross-core BKL wait. It is ~23%.**
+
+### 18.1 Why the remaining half mattered
+
+`BKL_PROCESS_CARVE_OUT.md` §9.8's workload-restricted A/B put `irq/sched` at **88.4%** on the
+carved side, and by the campaign's evidence-led rule that number picked the next target. But it
+was also the campaign's least trustworthy number, for a mechanism the code stated plainly
+(`src/exceptions.rs`, pre-fix):
+
+```rust
+if new_sp == 0 {
+    set_holder_tag(current_core_id(), prev_holder_tag);   // no switch: restore
+}
+// new_sp != 0: left as HOLD_TAG_IRQ — "honest, not guessed"
+```
+
+`HOLDER_TAG` was a flat per-**core** array stamped only at kernel-*entry* sites (syscall number,
+`HOLD_TAG_FAULT`, `HOLD_TAG_IRQ`). So a timer tick that context-switched handed the incoming
+thread the `irq/sched` label, and a thread preempted mid-EL1 inside a long BKL-held syscall never
+re-enters the kernel — it ran the whole remainder of that syscall labelled `irq/sched`.
+
+Which excursions get preempted? The long ones — exactly the ones worth finding. The bucket that
+systematically absorbed them was ~88% of the pie.
+
+### 18.2 The fix: attribution follows the thread
+
+A kernel excursion belongs to a **thread**. It survives preemption and can resume on another core,
+so core-scoped state cannot represent it — the same reason `DroppedWindowLedger`
+(`crates/akuma-exec/src/bkl.rs`) is thread-scoped.
+
+Two shapes were considered. **(b)** a per-thread array with a core→thread indirection at the
+sampling point was rejected: the waiter knows only the owner's *core* (`owner` encodes core
+`cur - 1`), and nothing maps core → current thread — `LAST_CORE` runs the other way — so (b) would
+have had to add a core→tid mirror **anyway**, plus an extra dependent load on the sampling path.
+**(a)** was taken: keep the cache-line-padded per-core `HOLDER_TAG` as the sampling point,
+unchanged, and make it a *cache* of an authoritative per-thread table.
+
+`crates/akuma-exec/src/sync.rs` gains `ThreadTagTable<N>` (pure, host-testable, out-of-range tids
+inert — `DroppedWindowLedger`'s shape) as `THREAD_TAG`, and three operations that together give the
+invariant `HOLDER_TAG[c] == THREAD_TAG[thread running on c]`:
+
+| operation | writes | called from |
+|---|---|---|
+| `set_holder_tag(core, tag)` | **both** tables | kernel entry: syscall nr, `HOLD_TAG_FAULT` |
+| `set_core_tag_transient(core, tag)` | core cache **only** | the IRQ dispatch stamp |
+| `load_thread_tag_to_core(core, tid)` | core cache, from the table | `set_current_thread_register` + IRQ epilogue |
+
+The transient stamp is the key: because the IRQ dispatch never touches `THREAD_TAG`, the
+interrupted thread's own tag is never lost, and the epilogue does not need to remember it.
+
+**§16.2.1's `new_sp == 0` special case is gone, not kept alongside.** The epilogue is now
+unconditional:
+
+```rust
+load_thread_tag_to_core(current_core_id(), current_thread_id());
+```
+
+One rule covers both outcomes. After a switch, `current_thread_id()` is the *incoming* thread and
+we install its own tag — the case §16.2.1 declined to guess at is now a lookup, not a guess. With
+no switch it is the interrupted thread and we reinstall the tag it never lost.
+
+`set_current_thread_register` (`threading/mod.rs`) is the choke point every switch path funnels
+through — `commit_switch`, the network-thread boost in `schedule_indices`, per-core idle adoption,
+boot — so hooking it there also fixed a case the old code never even reached: the
+`sched_bklfree_el0` EL0-preemption path returns from `rust_irq_handler_with_sp` early and touched
+no tags at all, leaving an incoming EL1 thread wearing the outgoing EL0 thread's label.
+
+Recycled thread slots are reset in `claim_free_slot`, so a fresh thread cannot lend its
+predecessor's tag to a waiter.
+
+Profiler-only and gated exactly as the rest of `bkl-profile` is: every accessor is an early-return
+no-op unless `PROFILE_ENABLED`, and every call site is `#[cfg(kernel_smp_shared)]`. Verified
+compiling clean (clippy included) on `--release`, `release-smp-shared` with `smp-shared` only, and
+`release-smp-shared` with `devbox-smoltcp,no-tests,bkl-profile`.
+
+### 18.3 Naming the two in-kernel holders
+
+The first post-fix run answered the headline question and immediately raised another: `irq/sched`
+collapsed to **12.1%** — and **66.0%** landed in `unknown`.
+
+That is honest, and it is a real answer rather than the "profiler is off" placeholder: `unknown`
+means *the BKL was held by a thread that never passed a tagging site*. Two such threads exist
+structurally, both long-lived kernel threads with no syscall or fault entry point:
+
+- the **async-main smoltcp poll loop** (`src/main.rs`), which holds the BKL across its whole drain;
+- the **idle loops** (`idle_halt`'s post-WFI bookkeeping plus the `yield_now()` that follows, and
+  the secondary bootstrap loop in `src/smp_shared.rs`).
+
+Pre-fix these inherited whatever their core last did, which is precisely how they fed the
+`irq/sched` bucket. Two new tags name them (`HOLD_TAG_IDLE` 502, `HOLD_TAG_NETPOLL` 503) — the
+minimum needed to make the measurement *actionable* rather than trading one uninformative bucket
+for another. Also named: syscall 301 (Akuma's `SPAWN`), which read as a bare `nr301` and shows up
+on `[BKL] stuck` lines under this regimen.
+
+### 18.4 Result — matched A/B, SMP=4, 2026-07-31
+
+Both sides: `SNAPSHOT=1 DISK=devbox.img MEMORY=4096 SMP=4`,
+`--profile release-smp-shared --features devbox-smoltcp,no-tests,bkl-profile`, the unmodified
+`net4 → read4 → cp2 → rm` regimen (`scripts/bkl_smp_regimen/`), driven by `drive.py`. `SNAPSHOT=1`
+so both boots start from **byte-identical disk state** (writes discarded) — §16.3 had to take a
+fresh clone by hand for this reason. The only difference between the two sides is profiler source.
+
+Attribution restricted to the workload windows per §17.2, via the new
+`scripts/bkl_smp_regimen/analyze_workload.py --auto`, which derives the interval from the
+regimen's own `execve` footprint in the serial log and rounds outward to window boundaries. It is
+reproducible and self-adjusting — the two boots reached the regimen at different uptimes (T=8 s
+and T=34 s), which a hand-picked `t=40..100` would have silently mis-sliced.
+
+| holder | pre-fix (HEAD profiler) | post-fix | delta |
+|---|---|---|---|
+| `irq/sched` | **88.8%** | **23.0%** | **−65.8pp** |
+| `netpoll` (async-main) | *not expressible* | **59.7%** | new |
+| `execve` | 2.5% | 6.0% | +3.5pp |
+| `clone` | 2.1% | 3.5% | +1.4pp |
+| `nanosleep` | 1.0% | 2.7% | +1.7pp |
+| `read` | 0.1% | 1.5% | +1.4pp |
+| `mmap` | 1.5% | 1.1% | −0.4pp |
+| `ppoll` | 1.5% | 1.1% | −0.4pp |
+| `idle` | *not expressible* | 0.6% | new |
+| `openat` | 2.1% | 0.6% | −1.5pp |
+
+| | pre-fix | post-fix |
+|---|---|---|
+| workload windows | 9 (t=10–90 s) | 9 (t=40–120 s) |
+| attributed spins | 163,353,234 | 136,902,871 |
+| regimen wall-clock | 90 s | 92 s |
+| digests (4 net + 2 cp) | **6/6 exact** | **6/6 exact** |
+| PANIC / WILD / SPURIOUS | 0 / 0 / 0 | 0 / 0 / 0 |
+| stale dropped-window heals | 0 | 0 |
+| `[BKL] stuck` | 0 | 18 (all in the final window — see below) |
+
+The pre-fix side independently reproduces `BKL_PROCESS_CARVE_OUT.md` §9.8's **88.4%** at
+**88.8%**, on a different boot with a different harness path — good evidence that the window
+selection here matches the one that produced the number being audited.
+
+**The decomposition is separable.** A third run (thread-scoping only, before §18.3's two tags)
+read `irq/sched` **12.1%** with `unknown` at **66.0%**; adding the tags resolved that 66% into
+`netpoll` 59.7% + `idle` 0.6%. So the two changes can be read independently: thread-scoping is what
+moved the mass off `irq/sched`, and naming the in-kernel holders is what made the destination
+legible. (`irq/sched` reads 12.1% on that boot and 23.0% on the matched one — run-to-run variance
+under a profiler that perturbs by design. Both are far from 88%.)
+
+**Prediction stated before measuring, and how it fared.** The prediction was: if the residual bleed
+is real, `irq/sched` falls and the long-tail holders (`execve`, `clone`, bulk ext2 writes) rise.
+Direction confirmed on every count — `irq/sched` −65.8pp, `execve` +3.5pp, `clone` +1.4pp, `read`
++1.4pp. But the *magnitude* went somewhere the prediction did not anticipate, because it could not:
+the dominant recipient is a holder the old profiler had no bucket for at all.
+
+Two honest caveats on the post-fix numbers:
+
+- The 18 `[BKL] stuck` all land in the **t=120 s window**, the regimen tail; every other workload
+  window is 0, and the other post-fix boot logged 0 across the entire boot. Same shape as §9.8's
+  own caveat. This is measurement-build perturbation at the tail (the new code adds two relaxed
+  stores per context switch *while profiling is on*), not a behavioural change — the shipping
+  builds compile all of it out, and `--release` is byte-unaffected.
+- `netpoll` is a **thread-granularity** label. `THREAD_TAG` persists on the async-main thread, so
+  everything that thread does BKL-held is credited to it — the smoltcp drain, but also the herd
+  output/heartbeat polls and `bkl_profile::maybe_dump` itself. The dump runs once per 10 s and
+  costs microseconds, so it cannot account for 60%; the drain plausibly can, on a regimen that
+  moves 128 MiB over the NIC. But "netpoll" names the thread, not exclusively the poll.
+
+### 18.5 Does Phase 3's `irq/sched` premise survive? No.
+
+**It does not.** `irq/sched` is **23.0%** of workload cross-core BKL wait, not 88.4%. The scheduler
+and IRQ path are not the dominant remaining cost on this regimen, and a Phase 3 aimed at them on
+the strength of the 88% figure would have been spent on the wrong subsystem — which is exactly what
+this audit existed to check.
+
+What the corrected numbers say instead, by the same evidence-led rule that picked every target so
+far: the single largest holder is the **async-main kernel thread at 59.7%**, holding the BKL across
+its poll drain on the BSP while four cores run a network- and I/O-heavy workload. That is a
+different kind of target from anything in this campaign — not a syscall wrapper to guard, but a
+long-lived kernel loop's hold discipline. Note it already drops the BKL and `WFI`s once per
+iteration (`src/main.rs`, added precisely because holding it starved peers); the question the
+numbers now pose is whether the *drain itself* should run BKL-free, which is a `NetBklGuard`-shaped
+question about smoltcp's own locking, not a scheduler question.
+
+Nothing was carved this session, per scope. In particular the device-IRQ path's unconditional
+`enter_kernel()` (§9.1) was left alone: it is the mechanism the whole dropped-window-ledger story
+rests on, and it should be decided on trustworthy numbers — which now exist.
+
+Also worth re-stating before any future scheduler work: M5c steps 1 and 2 already landed
+(`smp-shared.md` §Status) — the run-queue lock is split out and the scheduler runs BKL-free on EL0
+preemption (`sched_bklfree_el0`, default ON since 2026-07-24). `irq/sched` was never greenfield,
+and at 23% it is no longer the headline either.
+
+### 18.6 Tests
+
+- **Host** (`crates/akuma-exec/src/sync.rs`, `thread_tag_tests`): six tests over a replay model of
+  the three operations against a private core cache. `tag_survives_preemption_and_resume` is the
+  bug itself as an assertion; `switch_installs_incoming_threads_own_tag` covers the half §16.2.1
+  declined to guess; `irq_without_switch_restores_interrupted_tag` covers the half it fixed, now
+  falling out of the same single rule. Plus isolation, and the storage contract (defaults, bucket
+  clamping, reset for recycled slots, out-of-range tids inert). 155 akuma-exec tests green.
+- **Boot self-test** (`test_smp_shared_holder_tag_follows_thread`, SMP=4, `smp-shared`): stamps a
+  sentinel tag, crosses the scheduler 8 times and dwells ~3.5 timer ticks, and requires the tag to
+  survive in both the thread's entry and whatever core it resumes on. PASSED. Note the transient
+  IRQ stamp is *not* asserted on — while the dispatch runs, the asserting loop is not executing, so
+  it is structurally unobservable from the same thread.
+
+### 18.7 Reproducing
+
+```bash
+./venv/bin/python scripts/bkl_smp_regimen/gen_payload.py /tmp/bklpay
+( cd /tmp/bklpay && python3 -m http.server 8899 --bind 127.0.0.1 & )
+SNAPSHOT=1 DISK=devbox.img MEMORY=4096 SMP=4 cargo run --profile release-smp-shared \
+    --features devbox-smoltcp,no-tests,bkl-profile > run.log
+# once port 2222 answers:
+( cd scripts/bkl_smp_regimen && ../../venv/bin/python -u drive.py 1500 )
+python3 scripts/bkl_smp_regimen/analyze_workload.py --auto run.log
+```
+
+Both kernels were hash-verified distinct before booting, and the booted `.bin` was byte-searched
+for a string only the post-fix image contains (`netpoll`) — the §17 stale-`.bin` discipline. This
+A/B differs in *source*, so it is structurally immune to that trap anyway (§17.1).

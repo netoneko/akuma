@@ -166,6 +166,10 @@ pub fn syscall_name(nr: usize) -> &'static str {
         19 => "eventfd2",
         34 => "mkdirat", 45 => "truncate",
         291 => "statx",
+        // Akuma-specific (src/syscall/mod.rs `SPAWN`): the fork+exec fast path busybox
+        // takes. Named here because it shows up as a real BKL holder under the SMP=4
+        // regimen and read as a bare `nr301` before (BKL_VFS_CARVE_OUT.md §18).
+        301 => "spawn",
         435 => "clone3", 439 => "faccessat2",
         _ => "",
     }
