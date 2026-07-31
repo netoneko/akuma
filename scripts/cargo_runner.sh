@@ -73,11 +73,27 @@ GDB_PORT="${GDB_PORT:-$((1234 + INSTANCE))}"
 # Convert ELF to flat binary.
 # The binary starts with a branch instruction (not ARM64 Image magic),
 # so QEMU loads it at RAM_BASE (0x40000000) without any offset.
-# Skip if $BIN is already up-to-date — keeps parallel runs from racing on
-# the same output file.
-if [ ! -f "$BIN" ] || [ "$ELF" -nt "$BIN" ]; then
-  rust-objcopy -O binary "$ELF" "$BIN"
-fi
+#
+# ALWAYS regenerate. This used to be guarded by `[ "$ELF" -nt "$BIN" ]`, which is
+# unsound: cargo *uplifts* a cached artifact into target/ when you switch back to a
+# previously-built feature set, and the uplifted ELF can carry an mtime OLDER than the
+# .bin left behind by the feature set you built in between. The guard then skipped
+# objcopy and QEMU booted the OTHER feature set's kernel — silently, with a "Finished
+# in 0.1s" cargo line that looks like a normal cache hit.
+#
+# That breaks exactly the workflow this repo relies on most: a same-source A/B that
+# alternates feature sets (e.g. `--features …,no-bkl-vfs` vs without, or any BKL
+# carve-out validation). Observed 2026-07-31: a `devbox-smoltcp` boot whose ELF had the
+# in-kernel SSH server compiled OUT still printed "[Main] Spawning built-in SSH server
+# thread" and served the in-kernel banner, because the .bin was from a plain
+# `smp-shared` build minutes earlier.
+#
+# objcopy on a 4 MB image is ~50 ms, so unconditional regeneration costs nothing. The
+# temp-file + atomic `mv` preserves the original guard's purpose (two concurrent runs
+# must not read a half-written .bin) without depending on timestamps.
+BIN_TMP="${BIN}.$$.tmp"
+rust-objcopy -O binary "$ELF" "$BIN_TMP"
+mv -f "$BIN_TMP" "$BIN"
 
 # Size guard: catch binary bloat before it silently breaks boot.
 BIN_BYTES=$(wc -c < "$BIN")

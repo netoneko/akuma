@@ -585,26 +585,59 @@ Every connection that completed returned **all 8** child markers — i.e. each
 forked child executed correctly and its CoW-shared text/data/stack pages
 resolved, which is the data-integrity bar rather than "exited 0".
 
-**NOT run: the SMP=4 fork-hammer and the `bkl-profile` A/B.** Both drive the
-workload over SSH, and SSH into the VM wedges at SMP=4 — *independently of this
-carve-out*. Measured, same boot recipe, single connection:
+**Fork-hammer at SMP=4** — same harness, `devbox-smoltcp` (userspace `/bin/sshd`
+serving), 3 boots × 10 rounds:
 
-| | `no-bkl-process` | baseline (BKL-held fork) |
+| | `no-bkl-process` | baseline |
 |---|---|---|
-| SSH connect at SMP=4 | times out (75 s) | times out (75 s) |
-| `[BKL] stuck` during the attempt | 1842 | 1848 |
-| PANIC / WILD | 0 / 0 | 0 / 0 |
-| the same connect at SMP=2 | succeeds, `fork_ok_1` + `OK` | — |
+| verdict | **PASS** | PASS |
+| fault signatures | **0** | 0 |
+| children with partial/garbled output | **0** | 0 |
+| boots clean | 3 / 3 | 3 / 3 |
+| `[BKL] stuck` across the run | **0** | 0 |
 
-So it is a pre-existing SMP=4 SSH wedge, present with fork fully BKL-held, and
-the carve-out neither causes nor worsens it (marginally fewer stuck events). It
-blocks the two remaining verification steps until it is root-caused separately.
-Note the listener involved is the **in-kernel** SSH server (banner
-`SSH-2.0-Akuma_0.1`), not the userspace `/bin/sshd`
-(`SSH-2.0-Akuma_0.1_User`) — on a `devbox-smoltcp` boot the in-kernel server has
-bound guest :22 long before herd's 10 s `start_delay_ms` elapses, even though
-the `userspace-sshd` feature is documented as compiling it out. That mismatch is
-its own pre-existing issue.
+Rounds 5–10 of each boot lose all 8 connections to the pre-existing sshd
+exhaustion, so roughly the first 4 rounds (~256 forks/boot) plus the herd
+bringup do the actual hammering.
+
+> ### The stale-`.bin` trap — read this before trusting ANY A/B on this repo
+>
+> An earlier pass of this same verification concluded "SSH wedges at SMP=4,
+> pre-existing, 1842 vs 1848 `[BKL] stuck`". **That conclusion was an artifact
+> and is wrong** — the correctly-built SMP=4 run above has *zero* stuck events.
+>
+> Root cause, in `scripts/cargo_runner.sh`: the ELF→flat-binary conversion was
+> guarded by `if [ ! -f "$BIN" ] || [ "$ELF" -nt "$BIN" ]`. Cargo **uplifts** a
+> cached artifact into `target/` when you switch back to a previously-built
+> feature set, and the uplifted ELF can carry an mtime **older** than the `.bin`
+> left behind by the feature set you built in between. The guard then skips
+> `objcopy` and **QEMU boots the other feature set's kernel** — silently, behind
+> a `Finished … in 0.12s` cargo line that reads as an ordinary cache hit.
+>
+> This poisons precisely the workflow the BKL campaign depends on: a same-source
+> A/B that alternates feature sets. The tell that exposed it here: a
+> `devbox-smoltcp` boot printed `[Main] Spawning built-in SSH server thread`
+> even though `objcopy`-ing its freshly built ELF showed that string was not in
+> the image at all (the `userspace-sshd` feature had correctly compiled it out).
+> The booted `.bin` was a plain `smp-shared` build from minutes earlier — which
+> is also why the in-kernel SSH server appeared to be running on a config that
+> disables it, and why it needed a key in `/etc/sshd/authorized_keys`.
+>
+> **Fixed**: `cargo_runner.sh` now always regenerates, via a temp file plus an
+> atomic `mv` (which preserves the original guard's real purpose — two
+> concurrent runs must not read a half-written `.bin` — without depending on
+> timestamps). objcopy on a 4 MB image is ~50 ms.
+>
+> If you are re-deriving any earlier result in this campaign, check whether it
+> alternated feature sets under the old guard before trusting it.
+
+**NOT run: the `bkl-profile` A/B** (`clone`'s `[BKLPROF]` share with the guard on
+vs off). The correctness bar above is met; the contention half — the number that
+says "this conversion measurably helped" rather than "this syscall was never
+contended" — has not been measured yet. Per the playbook's rule 5 that is the
+step that distinguishes the two, so this carve-out should be treated as
+*correct but not yet contention-demonstrated*, the same status §13.3 of the VFS
+doc flagged for `openat` before its A/B was run.
 
 **Harness fixes made along the way** (`scripts/validate_fork_smp.py`), all
 pre-existing bugs that made the harness unable to validate anything:
@@ -629,6 +662,21 @@ pre-existing bugs that made the harness unable to validate anything:
    some pages resolved, some didn't) from *zero* output with the trailing `OK`
    present (the documented sshd session teardown under 8 concurrent connections —
    measured strictly all-or-nothing, and at the same rate BKL-held as BKL-free).
+
+Taken together, (1)+(2)+(3) mean this harness could never have produced a
+meaningful result before: it polled a port that was never open, so
+`wait_for_sshd` always exhausted its 120 s, the hammer rounds never ran, and the
+run then "failed" on the doc-banner false positive. That is exactly the artifact
+that was sitting in the tree as `fork_hammer_result.txt`:
+
+```
+FAILED: crashed during boot 1
+  [Fault] Process N (name) SIGSEGV after Xs
+```
+
+The "3 boots × 10 rounds, 0 faults" line at the top of
+`docs/runbooks/debug-smp-fork-corruption.md` is therefore **not corroborated by
+the harness it cites** and should be re-derived before being relied on.
 
 ### 9.9 Feature wiring
 
