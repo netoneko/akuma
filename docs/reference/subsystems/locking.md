@@ -277,6 +277,11 @@ ledger primitive, no `VfsBklGuard`/`NetBklGuard` struct):
 Phase 3, landed 2026-07-31, **opt-in** (not in the `smp-shared` feature set, unlike
 the other two — fork/CoW is where the SMP=4 corruption bug lived, so it stays
 behind an explicit `--features …,no-bkl-process` until it has comparable soak).
+
+Contention-confirmed by a same-source `bkl-profile` A/B at SMP=4 on the standing
+regimen: **`clone` 19.5% → 2.5%** of workload-window contended time (23.9M → 2.8M
+spins, 8.6×), dropping it from the #2 holder to a minor one, with total workload
+spins down 9% and 6/6 digests exact on both sides.
 `ProcessBklGuard` (`process/bkl_guard.rs`) mirrors `VfsBklGuard`: runtime toggle
 `process_bkl_drop_enabled()` (default on, latched at construction), same
 dropped-window ledger.

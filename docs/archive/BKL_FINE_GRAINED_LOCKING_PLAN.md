@@ -795,6 +795,11 @@ not worry about being preempted mid-copy.
       peer's CoW fault
 - [x] Boot self-test `test_fork_bkl_drop` (ledger balance + latching + real
       share/demote across chunk boundaries, both toggle positions) passing at SMP=2
+- [x] Fork-hammer at SMP=4, 3 boots × 10 rounds: 0 faults, 0 partial-output
+      children, 0 `[BKL] stuck` — matched by the BKL-held baseline
+- [x] Contention A/B under `bkl-profile` at SMP=4: **`clone` 19.5% → 2.5%**
+      (23.9M → 2.8M spins, 8.6×; #2 holder → minor), total workload spins −9%,
+      6/6 digests exact both sides
 - [x] Incidental: `FORK_IN_PROGRESS` no longer leaks on the OOM early-return (RAII)
 - [ ] Not carved: steps 5–8, `replace_image`, the eager-copy (unreachable) fork branch
 

@@ -631,13 +631,48 @@ bringup do the actual hammering.
 > If you are re-deriving any earlier result in this campaign, check whether it
 > alternated feature sets under the old guard before trusting it.
 
-**NOT run: the `bkl-profile` A/B** (`clone`'s `[BKLPROF]` share with the guard on
-vs off). The correctness bar above is met; the contention half — the number that
-says "this conversion measurably helped" rather than "this syscall was never
-contended" — has not been measured yet. Per the playbook's rule 5 that is the
-step that distinguishes the two, so this carve-out should be treated as
-*correct but not yet contention-demonstrated*, the same status §13.3 of the VFS
-doc flagged for `openat` before its A/B was run.
+**Contention A/B under `bkl-profile`, SMP=4** — the playbook's rule-5 step, which
+separates "this conversion measurably helped" from "this syscall was never
+contended". Identical source, identical `net4 → read4 → cp2 → rm` regimen
+(`scripts/bkl_smp_regimen/`, 4×32 MiB downloads → 4 concurrent `sha256sum` →
+2 concurrent `cp`+verify → `rm`), `devbox-smoltcp,no-tests,bkl-profile` with and
+without `no-bkl-process` as the only difference.
+
+Attribution restricted to the windows the workload actually occupied (t=40–100 s;
+the regimen ran t≈45–92 s both times), so idle and teardown windows don't dilute
+the comparison:
+
+| | OFF (fork BKL-held) | ON (`no-bkl-process`) |
+|---|---|---|
+| **`clone` cumulative share** | **19.5%** | **2.5%** |
+| **`clone` spins** | **23,924,016** | **2,790,561** (**8.6× fewer**) |
+| `clone` rank among holders | **#2** (behind `irq/sched`) | #6 |
+| total workload attributed spins | 122,503,755 | 112,066,857 (0.91×) |
+| `irq/sched` share | 70.3% | 88.4% |
+| `[BKL] stuck` during the workload | 0 | 0 |
+| PANIC / WILD / SPURIOUS | 0 / 0 / 0 | 0 / 0 / 0 |
+| stale dropped-window heals | 0 | 0 |
+| digests (4 net + 2 cp) | **6/6 exact** | **6/6 exact** |
+
+Whole-boot cumulative (the `analyze.py` default view) agrees directionally:
+`clone` 25.2% → 1.1%.
+
+This is the same shape as the VFS conversions: the converted syscall's share
+collapses and the remainder concentrates into `irq/sched` (70.3% → 88.4%), which
+is now essentially the only holder left on this regimen. Total workload spin
+count also fell 9%, so the win is a real reduction in cross-core waiting, not
+just a re-labelling of it.
+
+Two honest caveats on the numbers:
+
+- The ON boot logged 8 `[BKL] stuck` on its whole-boot count, but all 8 land in
+  the t=120 s window — **after** the regimen finished at ~92 s, in the idle/
+  teardown phase, alongside a 179 M-spin outlier window unrelated to the
+  workload. Inside the workload windows both sides are 0. Do not read the
+  whole-boot `stuck` counts as a workload signal here.
+- `bkl-profile` perturbs timing by design, so only shares and ranks *within* one
+  run are meaningful — never compare absolute spin counts across sessions
+  (`locking.md`, "Attribution tooling").
 
 **Harness fixes made along the way** (`scripts/validate_fork_smp.py`), all
 pre-existing bugs that made the harness unable to validate anything:
