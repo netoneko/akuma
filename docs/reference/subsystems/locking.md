@@ -184,6 +184,95 @@ Each of these was a real bug found during a carve-out, not a hypothetical.
   gate (which provides no actual safety — a CAS on the state transition does).
   (§11.4/§11.7.)
 
+## Syscall → lock map
+
+Ground truth as of 2026-07-31, verified against `src/syscall/{fs,net,mem,proc}.rs`
+and the inner-lock call sites in `crates/akuma-ext2/src/ext2.rs`,
+`crates/akuma-exec/src/process/fd.rs`, `src/block.rs`, `src/vfs/mod.rs`, and
+`crates/akuma-net/src/{socket,smoltcp_net}.rs` — not transcribed from the
+archive doc's prose. Re-derive rather than trust this table once it's more
+than a few months old; grep the guard names below to check it hasn't drifted.
+
+### `no-bkl-vfs` — `src/syscall/fs.rs` / `src/syscall/mem.rs`
+
+| syscall | guard scope | inner lock(s) held while BKL dropped |
+|---|---|---|
+| `sys_read` (File arm, `fs.rs:390`) | inside `File` match arm | fd table `Spinlock` → ext2 `read_state` (`read_at`, `ext2.rs:1918`) → block cache + `BLOCK_DEVICE` `Spinlock` (`block.rs:244`) |
+| `sys_pread64` (`fs.rs:714`) | inside `File` arm | same as `sys_read` |
+| `sys_pwrite64` (`fs.rs:782`) | inside `File` arm | ext2 `write_state` (`write_at`, `ext2.rs:1962`) |
+| `sys_write` (`fs.rs:807`, `new_if`) | whole fn (match nested in per-chunk loop) | ext2 `write_state` (`write_at`) |
+| `sys_lseek` (`fs.rs:1540`, `new_if`) | whole fn | ext2 `read_state` (`metadata`, `ext2.rs:2268`, via `file_size`) |
+| `sys_fstat` (`fs.rs:1590`) | inside `File` arm | ext2 `read_state` (`metadata`) |
+| `sys_newfstatat` (`fs.rs:1716`) | after `#[cfg(kernel_smp)]` cross-core forward arm | ext2 `read_state` (`is_symlink`, `read_symlink`, `metadata`) |
+| `sys_statx` (`fs.rs:1964`) | after path resolution | ext2 `read_state` (`is_symlink`, `metadata`) |
+| `sys_getdents64` (`fs.rs:2448`) | after `File`-kind match | ext2 `read_state` (`read_dir`, `ext2.rs:1825`) |
+| `sys_openat` (`fs.rs:1381`) | after cross-core forward arm + all `/dev/*`/`/proc/self/exe` fast paths | ext2 `read_state` (`exists`/`lookup_path`), then `write_state` for `O_CREAT`/`O_TRUNC` (`write_file`, `ext2.rs:1869`) + `chmod` |
+| `sys_mkdirat` (`fs.rs:2214`) | after dirfd/base-path resolution | ext2 `write_state` (`create_dir`, `ext2.rs:2045`) |
+| `sys_fchmodat` (`fs.rs:1845`) | after dirfd/base-path resolution | ext2 `read_state` (`resolve_symlinks`) then `write_state` (`chmod`, `ext2.rs:2286`) |
+| `sys_unlinkat` (`fs.rs:2268`) | after dirfd/base-path resolution | ext2 `write_state` (`remove_file` `ext2.rs:2126`, `remove_dir` `ext2.rs:2162`) — the multi-second-hold case (§ archive doc §7.2) |
+| `sys_renameat` (`fs.rs:2309`) | whole fn after path-arg copies | ext2 `write_state` (`rename`, `ext2.rs:2234`) |
+| `sys_renameat2` (`fs.rs:2343`) | whole fn, incl. `RENAME_NOREPLACE` exists probe | ext2 `read_state` (`exists`) then `write_state` (`rename`) |
+| `sys_mmap` eager fill (`mem.rs:360`) | around per-frame disk-fill loop, before install | ext2 `read_state` (`read_at`) |
+| `sys_mmap` lazy inode-resolve (`mem.rs:296`) | around `resolve_inode` only | ext2 `read_state` (`lookup_path`) |
+| `mmap_eager_to_lazy_fallback` (`mem.rs:175`) | around `resolve_inode` only | same |
+
+**Not converted (still fully BKL-held):** `sys_dup`/`sys_dup3` (`fs.rs:1121`,
+`1146`), `sys_close`/`sys_close_range` (`fs.rs:1429`, `1476`), `sys_fstatfs`
+(`fs.rs:1081`, synthesized — no real VFS touch but no guard either),
+`sys_fcntl` (`fs.rs:2107`), `sys_fchmod` (`fs.rs:1797`, calls `write_state`
+BKL-held), `sys_fallocate`/`sys_ftruncate`/`sys_truncate` (`fs.rs:1863/1880/1894`,
+call `write_state` BKL-held), `sys_faccessat2` (`fs.rs:2046`), `sys_getcwd`
+(`fs.rs:2088`, no I/O — cached `proc.cwd`, no guard needed), `sys_symlinkat`
+(`fs.rs:2361`), `sys_linkat` (`fs.rs:2380`, copy not hardlink), `sys_readlinkat`
+(`fs.rs:2394`), `sys_fchdir`/`sys_chdir` (`fs.rs:2508`, `2529`).
+
+**Footnote for whoever converts `truncate` next:** `Ext2Filesystem::truncate`
+(`ext2.rs:2331-2355`) takes only `read_state()` — a shared guard — even though
+it mutates the inode via `write_inode`. Works today because `write_inode`/
+`write_block` only need `&Ext2State` (the block-cache `Spinlock` guards the
+actual mutation, not the `RwSpinlock`), but it means truncate's mutation isn't
+serialized against concurrent readers the way `write_file`/`create_dir` are.
+Not currently exposed to a BKL-free window — audit this before converting
+`truncate`/`ftruncate`.
+
+### `no-bkl-network` — `src/syscall/net.rs`
+
+`NetBklGuard` is purely compile-time gated (no runtime toggle, no latching
+needed — unlike `VfsBklGuard`).
+
+| syscall | guard scope | inner lock(s) held while BKL dropped |
+|---|---|---|
+| `sys_socket` (`net.rs:123`) | whole fn | fd table; `SOCKET_TABLE` `Spinlock` (`akuma-net/src/socket.rs:256`) |
+| `sys_bind`/`sys_listen` (`net.rs:239`, `269`) | whole fn | `SOCKET_TABLE`; `NETWORK` `Spinlock` under `PreemptGuard` (`smoltcp_net.rs:106`) |
+| `sys_accept`/`sys_accept4` (`net.rs:286`, `332`) | whole fn, incl. blocking wait (no lock held across it) | `SOCKET_TABLE`; `NETWORK` |
+| `sys_connect` (`net.rs:388`) | whole fn | same |
+| `sys_getsockname`/`sys_getpeername` (`net.rs:426`, `455`) | whole fn | `SOCKET_TABLE`; `NETWORK` |
+| `sys_sendto`/`sys_recvfrom` (`net.rs:508`, `594`) | after the unix-socket pipe-routing check (deliberately BKL-held to avoid an AB-BA with a nested IRQ) | `SOCKET_TABLE`; `NETWORK` |
+| `sys_setsockopt`/`sys_getsockopt` (`net.rs:723`, `807`) | whole fn | `SOCKET_TABLE`(; `NETWORK` for getsockopt) |
+| `sys_sendmsg`/`sys_recvmsg` (smoltcp build, `net.rs:901`, `1051`) | after unix-socket iovec check | `SOCKET_TABLE`; `NETWORK` |
+| `sys_resolve_host` (DNS, `net.rs:1317`) | whole fn | `NETWORK` |
+| `sys_read`/`sys_write` on `Socket` fd (`fs.rs:417`, `913`) | inside `Socket` match arm | `SOCKET_TABLE`; `NETWORK` |
+
+Not converted / correctly guardless: `sys_socketpair` (AF_UNIX, pipe-only,
+never touches `SOCKET_TABLE`), `sys_shutdown` (hardcoded no-op), `sendmsg`/
+`recvmsg` on the non-smoltcp rump-sysproxy build (pipe-only path).
+
+### Adjacent BKL-drop sites outside the named carve-outs
+
+These call `akuma_exec::bkl::dropped_window_open()/close()` directly (same
+ledger primitive, no `VfsBklGuard`/`NetBklGuard` struct):
+
+| site | toggle | scope | inner lock |
+|---|---|---|---|
+| `sys_execve` ELF read (`proc.rs:649`, inside `sys_execve` `proc.rs:544`) | `exec_bkl_drop_enabled()` (`smp_shared.rs:87`) | whole-file `read_file` — **only** in the single-image smp-shared build (`not(kernel_profile_size)`, `not(kernel_smp)`); size build reads just a 256-byte shebang header, multikernel build forwards cross-core, neither takes this window | ext2 `read_state` |
+| Data-Abort demand-page fill (`exceptions.rs:2964`/`3017`) | `fault_bkl_drop_enabled()` (`smp_shared.rs:68`) | per-page fill loop only; page-table install is separate, BKL-held | ext2 `read_state` |
+| Instruction-Abort demand-page fill (`exceptions.rs:3487`/`3533`) | same | mirror of Data-Abort path | same |
+
+`fork_process` (`crates/akuma-exec/src/process/mod.rs:1487`) and its caller
+`src/syscall/proc.rs` have **no** BKL-drop treatment at all — confirmed by
+grep, matching the archive doc's §16.5 audit. This is Phase 3's flagged-but-
+not-started target; see that section before touching it.
+
 ## Attribution tooling
 
 `bkl-profile` (cargo feature → `cfg(kernel_bkl_profile)`, `src/bkl_profile.rs`)
