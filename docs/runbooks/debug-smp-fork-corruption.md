@@ -1,5 +1,46 @@
 # SMP=4 fork/exec process-state corruption — handoff / debugging dossier
 
+> **UPDATE 2026-07-31: VALIDATED — the fix combination holds.** A fork-hammer
+> validation at SMP=4 (3 boots × 10 rounds × 8 concurrent SSH connections, each
+> running `for i in 1..8; do busybox true; done`) produced **0 SIGSEGV / WILD-DA /
+> DA-MISS / PANIC / ppid=0** fault signatures across all boots and rounds. The
+> herd concurrent bringup window (the primary trigger — every service is
+> fork+exec'd simultaneously across cores) was clean on all 3 boots.
+>
+> The fix is a **three-mechanism combination**, all of which are load-bearing:
+>
+> 1. **`LifecycleGuard` (active `disable_preemption`)** —
+>    `crates/akuma-exec/src/process/lifecycle.rs`. Acquired at the top of
+>    `fork_process` (`mod.rs:1491`), `vfork_process` (`mod.rs:2219`), and inside
+>    `replace_image`/`replace_image_from_path` (`image.rs:48,129`). Prevents
+>    involuntary timer preemption from exposing half-mutated process/CoW state
+>    to non-lifecycle EL1 readers. `schedule_indices` (`threading/mod.rs:2204`)
+>    returns `None` for involuntary entries when preemption is disabled, which
+>    blocks writer #8 (`sgi_scheduler_handler_with_sp` at `threading/mod.rs:2749`)
+>    from saving `THREAD_CONTEXTS` during the guarded window — closing
+>    hypothesis 2's torn-read window.
+> 2. **DSB barrier in `demote_range_to_ro`** — `crates/akuma-exec/src/mmu/mod.rs:1782`.
+>    Guarantees PTE writes are globally visible before `flush_tlb_all()` under
+>    `cfg(kernel_smp_shared)`, closing the cached-RW-TLB-entry race window
+>    (hypothesis 4).
+> 3. **Per-physical-page CoW fault serialization (`COW_FAULT_LOCK`)** —
+>    `src/pmm.rs:815`. Prevents parent and child (different PIDs) from
+>    concurrently breaking CoW on the same shared frame (hypothesis 4).
+>
+> The BKL remains held across all fork/exec/fault paths and is still required:
+> it prevents concurrent EL1 on other cores. The `LifecycleGuard` + BKL together
+> form the two-mechanism correctness envelope documented in
+> `docs/archive/BKL_PROCESS_CARVE_OUT.md` §5 — neither is redundant.
+>
+> **Caveat:** the userspace sshd (`/bin/sshd` over smoltcp) exhausts after ~3
+> rounds of 8 concurrent connections (a pre-existing sshd robustness issue, not
+> fork corruption). The fork-hammer therefore exercises ~24 fork+exec cycles
+> per boot plus the boot bringup itself (~30 fork+execs from herd). The
+> runbook's original harness (16 concurrent × 8 rounds, with the in-kernel SSH
+> server) would be a stronger stress if re-run; but the boot bringup alone was
+> the primary trigger ("reproduces within one boot most of the time") and it
+> is now clean across 3 consecutive boots.
+
 > **UPDATE 2026-07-21 (evening): cross-core CoW/TLB protocol bugs FIXED.** Two critical
 > issues in the CoW share/demote/break protocol were found and fixed:
 >

@@ -270,8 +270,13 @@ ledger primitive, no `VfsBklGuard`/`NetBklGuard` struct):
 
 `fork_process` (`crates/akuma-exec/src/process/mod.rs:1487`) and its caller
 `src/syscall/proc.rs` have **no** BKL-drop treatment at all — confirmed by
-grep, matching the archive doc's §16.5 audit. This is Phase 3's flagged-but-
-not-started target; see that section before touching it.
+grep, matching the archive doc's §16.5 audit. **A full step-by-step audit was
+completed 2026-07-31** ([`BKL_PROCESS_CARVE_OUT.md`](../../archive/BKL_PROCESS_CARVE_OUT.md)):
+no carve-out was implemented. Every significant-BKL-time step touches state with
+no inner lock (`THREAD_CONTEXTS`, process table, parent page tables); the BKL
+is the lock, not a redundant wrapper. A carve-out requires either fixing the
+open fork-corruption bug first or building the process-table lock the original
+Phase 3 plan sketched.
 
 ## Attribution tooling
 
@@ -308,6 +313,10 @@ Driving workload: `net4` (concurrent downloads → net + ext2 write), `read4`
   carve-out, worked in full: guard latching, IRQ-mask-per-attempt, the
   dropped-window ledger root-cause/fix, and the `unlinkat`/`openat`
   attribution + conversion sessions.
+- [`BKL_PROCESS_CARVE_OUT.md`](../../archive/BKL_PROCESS_CARVE_OUT.md) — the
+  Phase 3 audit of `clone`/`fork_process`/`execve`: why no carve-out was
+  implemented (no inner lock on process/CoW state; the BKL is the lock), and
+  what prerequisites would unblock one.
 - [`BKL_FINE_GRAINED_LOCKING_PLAN.md`](../../archive/BKL_FINE_GRAINED_LOCKING_PLAN.md)
   — the overall phased plan; §"Phase 2" has the network carve-out's design
   notes (why a coarse `NETWORK_LOCK` doesn't work, the SIGPIPE self-deadlock,

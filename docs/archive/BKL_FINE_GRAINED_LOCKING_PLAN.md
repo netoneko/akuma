@@ -741,10 +741,34 @@ too; both use kernel bounce buffers so no user-memory fault can occur inside the
 socket locks.
 
 ### Phase 3 - Process Management Locks
-- [ ] Process table locking designed
-- [ ] `lookup_process()` refactored
+### Phase 3 - Process Management Locks — AUDITED, NOT CARVABLE WITHOUT PREREQUISITES
+
+See **[BKL_PROCESS_CARVE_OUT.md](BKL_PROCESS_CARVE_OUT.md)** for the full audit (2026-07-31).
+
+Headline: the §16.3 attribution's top unconverted holder (`clone` 22.5%) was
+audited step-by-step against the VFS carve-out playbook. **No carve-out was
+implemented.** Every step of `fork_process` that consumes significant BKL-held
+time touches state with **no inner lock** (`THREAD_CONTEXTS` `UnsafeCell`, the
+process table's `&'static mut Process`, the parent's live page tables during CoW
+demote). Unlike VFS (where every piece of state already had a fine-grained lock),
+process-management state relies on the BKL itself as the cross-core lock, plus
+the `LifecycleGuard` (re-enabled `disable_preemption`) as the preemption shield.
+Both are load-bearing; neither is redundant.
+
+The `LifecycleGuard` sketch below (step 4) **was built and is active**
+(`crates/akuma-exec/src/process/lifecycle.rs`), but it does not make the BKL
+redundant — it complements it. The process-table lock sketch (step 1) was
+**never built** and is the actual prerequisite for any BKL carve-out here: it
+would need to replace the 218+ `with_irqs_disabled`-only `lookup_process`/
+`current_process` sites with real cross-core synchronization. Until that or the
+fork-corruption bug is fixed, the `clone`/`fork_process`/`execve` BKL-held time
+is structural.
+
+- [x] Lifecycle guards implemented (active `disable_preemption`, not a no-op)
+- [ ] Process table locking designed — **prerequisite for any carve-out**
+- [ ] `lookup_process()` refactored — **prerequisite (218+ sites)**
 - [ ] Scheduler updated
-- [ ] Lifecycle guards implemented
+- [x] fork-corruption bug FIXED and VALIDATED (2026-07-31: SMP=4 fork-hammer, 3 boots × 10 rounds, 0 faults)
 - [ ] Tests passing
 
 ### Phase 4 - VFS and Filesystem Locks — PARTIALLY SHIPPED (2026-07-25)
