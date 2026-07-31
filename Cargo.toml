@@ -192,6 +192,25 @@ no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network"]
 # build that doesn't set both features.
 no-bkl-vfs = ["akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs", "akuma-net/no-bkl-vfs"]
 
+# Run `fork_process`'s CoW share/demote pass WITHOUT the Big Kernel Lock — Phase 3 of
+# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md, the third subsystem carved out (after
+# net and vfs) and the first that is NOT about I/O: `clone` was the largest remaining
+# non-irq/sched BKL holder once every syscall attribution had ever named was converted.
+# build.rs emits `cfg(kernel_no_bkl_process)` from CARGO_FEATURE_NO_BKL_PROCESS, and
+# `fork_process` then drops the BKL for the page-copy window, relying on the address
+# space's own `as_lock` — the SAME lock the CoW fault handler already takes BKL-free —
+# held in bounded chunks around every parent-page-table access, plus the existing
+# COW_REFCOUNTS / PMM / allocator spinlocks. Steps 5–8 (ProcessInfo, THREAD_CONTEXTS
+# capture, thread spawn, register+READY) stay fully BKL-held: they touch state with no
+# inner lock, where the BKL IS the lock.
+#
+# NOT included in `smp-shared`, unlike no-bkl-network/no-bkl-vfs: fork/CoW is the code
+# path the SMP=4 corruption bug lived in, so this stays opt-in until it has comparable
+# soak. Enable explicitly:
+#   cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests,no-bkl-process
+# A no-op (byte-for-byte unchanged) on every build that doesn't set both features.
+no-bkl-process = ["akuma-exec/no-bkl-process"]
+
 # BKL-hold attribution (measurement builds only — never ship it). Enables the
 # per-tag BKL profiler in `akuma_exec::sync` for the whole boot and makes the
 # async-main loop print a periodic `[BKLPROF]` delta histogram: which syscall /

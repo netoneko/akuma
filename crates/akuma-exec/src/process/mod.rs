@@ -14,8 +14,10 @@ pub mod spawn;
 pub mod exec;
 pub mod diag;
 pub mod lifecycle;
+pub mod bkl_guard;
 
 pub use lifecycle::LifecycleGuard;
+pub use bkl_guard::{process_bkl_drop_enabled, set_process_bkl_drop_enabled, ProcessBklGuard};
 
 pub use types::*;
 pub use table::*;
@@ -79,6 +81,143 @@ pub fn fork_page_count_for_len(len: usize) -> Option<usize> {
 const MAX_FORK_BRK_COPY_PAGES: usize = 8 * 1024 * 1024; // 32 GiB of pages
 
 const FORK_COPY_PROGRESS_INTERVAL_PAGES: usize = 8192;
+
+/// Pages handled per `as_lock` hold in [`fork_process`]'s CoW share/demote pass —
+/// the `no-bkl-process` carve-out's chunk size (see [`bkl_guard`] constraint 2).
+///
+/// Each hold masks local IRQs, so it must stay short and bounded: the whole point of
+/// the carve-out is that the BKL is dropped for the copy, and a hold spanning the
+/// entire copy would starve this core's timer for milliseconds *and* reopen the AB-BA
+/// wedge (this core holding `as_lock` while a nested IRQ hard-spins for the BKL,
+/// against a peer holding the BKL and waiting on `as_lock` in `munmap`). Each hold
+/// also carries fixed overhead (lock, DSB, TLB range invalidate), so it must not be
+/// tiny either. 64 pages = 256 KiB of VA per hold, and stays well under
+/// `flush_tlb_range_all_asid`'s 512-page full-flush threshold so the per-chunk
+/// invalidate remains a targeted `tlbi vaae1is` sweep.
+pub const FORK_AS_CHUNK_PAGES: usize = 64;
+
+/// Sets [`FORK_IN_PROGRESS`] for its lifetime and clears it on **every** exit path.
+///
+/// The flag only drives the timer handler's `[TMR]` log frequency (`src/timer.rs`), but
+/// the old inline `store(true)`/`store(false)` pair leaked it permanently whenever the
+/// copy loop took a `?` early-return (OOM mid-fork), leaving the console logging 10×
+/// for the rest of the boot. RAII also pins the ordering the `no-bkl-process` carve-out
+/// wants: declared BEFORE [`ProcessBklGuard`], so the flag is set while still BKL-held
+/// and cleared only after the BKL has been re-acquired (locals drop in reverse
+/// declaration order).
+struct ForkInProgressGuard;
+
+impl ForkInProgressGuard {
+    #[inline]
+    fn new() -> Self {
+        FORK_IN_PROGRESS.store(true, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for ForkInProgressGuard {
+    #[inline]
+    fn drop(&mut self) {
+        FORK_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
+
+/// CoW-share one VA range from a parent address space into a child, **and demote the
+/// parent's copy of it to read-only** in the same pass.
+///
+/// For each mapped page in `[va_start, va_start + len)`: increment the CoW refcount,
+/// map the same PA into `child_as` as RO (preserving UXN/PXN from the parent's PTE),
+/// track the frame in the child's address space, and drop the parent's PTE to RO so the
+/// parent's own later writes fault too. Returns the number of pages shared.
+///
+/// The work is split across a chunked [`Process::as_lock`] hold (see
+/// [`FORK_AS_CHUNK_PAGES`]) into two phases, and the split is what makes
+/// [`fork_process`]'s `no-bkl-process` window sound:
+///
+/// - **Phase A, under `as_lock`** — snapshot the parent PTEs, take the CoW reference,
+///   demote, invalidate. These four MUST be one atomic step against a peer core's CoW
+///   fault on this address space. Split them and this race is live: fork reads a PTE
+///   naming frame X, a peer's fault breaks X (`cow_ref_dec` → 0 → frame freed, VA
+///   remapped to Y), and fork then `cow_ref_inc`s the freed X and hands it to the child.
+///   The fault handler performs its own break under this same lock, so one hold
+///   serializes the two. The phase is allocation-free apart from the refcount map:
+///   `scratch` must be pre-reserved to `FORK_AS_CHUNK_PAGES` by the caller, outside
+///   every lock, so the collect reuses capacity instead of growing under an IRQ mask.
+///
+/// - **Phase B, unlocked** — build the child's page tables. This is the expensive,
+///   allocating half (page-table frames, the user-frame Vec) and must stay OUT of an
+///   IRQ-masked hold. The child is private stack-local state until `fork_process`'s
+///   step 8, so no other core can observe it regardless.
+///
+/// The demote used to be a separate second walk over every range after all sharing was
+/// done; merging it here is what makes the per-page transition atomic, and it drops a
+/// full redundant page-table walk of the parent.
+///
+/// # Safety-relevant preconditions
+/// `parent_l0` must be the live L0 root of the address space that `as_lock` guards —
+/// for a `CLONE_THREAD` group that is the **leader's** lock, resolved by
+/// [`address_space_owner_pid_for_fault`], not the calling thread's.
+pub fn cow_share_and_demote_range(
+    parent_l0: *const u64,
+    as_lock: &Spinlock<()>,
+    va_start: usize,
+    len: usize,
+    child_as: &mut mmu::UserAddressSpace,
+    scratch: &mut alloc::vec::Vec<(usize, usize, u64)>,
+    label: &str,
+) -> Result<usize, &'static str> {
+    let pages = fork_page_count_for_len(len).ok_or("CoW share page count overflow")?;
+    let mut count = 0usize;
+    let mut done = 0usize;
+    while done < pages {
+        let chunk = (pages - done).min(FORK_AS_CHUNK_PAGES);
+        let chunk_va = done
+            .checked_mul(mmu::PAGE_SIZE)
+            .and_then(|off| va_start.checked_add(off))
+            .ok_or("CoW share VA overflow")?;
+
+        // ── Phase A: parent page table, under `as_lock`, IRQs masked ──
+        {
+            #[cfg(kernel_smp_shared)]
+            let _asg = AsLockHold::new(as_lock);
+            #[cfg(not(kernel_smp_shared))]
+            let _ = as_lock;
+            mmu::collect_mapped_pages_with_flags_into(parent_l0, chunk_va, chunk, scratch);
+            for (_, pa, _) in scratch.iter() {
+                // Inserts with count=2 on first share.
+                (runtime().cow_ref_inc)(*pa);
+            }
+            // SAFETY: `parent_l0` is the live L0 root of the address space this
+            // `as_lock` guards (see the preconditions above).
+            unsafe {
+                mmu::demote_range_to_ro(parent_l0.cast_mut(), chunk_va, chunk);
+            }
+            // Invalidate before releasing the lock so a sibling thread on a peer core
+            // can't keep writing through a stale RW TLB entry for a page the child now
+            // references. (The old code demoted every range and then flushed once at
+            // the very end; with the demote merged into the share, that single trailing
+            // flush would leave this window open for the whole copy instead of for one
+            // chunk.) `chunk` <= FORK_AS_CHUNK_PAGES keeps this a targeted
+            // `tlbi vaae1is` sweep, under `flush_tlb_range_all_asid`'s full-flush
+            // threshold.
+            mmu::flush_tlb_range_all_asid(chunk_va, chunk);
+        }
+
+        // ── Phase B: child page table, unlocked, BKL-free ──
+        for &(va, pa, pte_flags) in scratch.iter() {
+            // Force AP to RO, preserving UXN/PXN from the original PTE
+            let child_flags = (pte_flags & !(mmu::flags::AP_RO_ALL)) | mmu::flags::AP_RO_ALL;
+            child_as.map_page(va, pa, child_flags)?;
+            child_as.track_user_frame(PhysFrame::new(pa));
+        }
+        count += scratch.len();
+        done += chunk;
+    }
+    if config().syscall_debug_info_enabled && count > 0 {
+        log::debug!("[fork-cow] {} shared {} pages", label, count);
+    }
+    Ok(count)
+}
 
 /// Initialize the process subsystem
 pub fn init() {
@@ -1600,6 +1739,29 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         mmu::phys_to_virt(l0_addr) as *const u64
     };
 
+    // The `as_lock` that serializes THIS address space's page tables — the very lock
+    // the CoW fault handler takes (`AsLockHold::new(&owner.as_lock)` in
+    // src/exceptions.rs). The `no-bkl-process` carve-out holds it in bounded chunks
+    // around every parent-PTE access below, which is what lets the BKL be dropped for
+    // the copy.
+    //
+    // It is the thread-group LEADER's lock, not necessarily this thread's:
+    // `CLONE_THREAD` siblings each get a fresh `Spinlock` in their own `Process` (see
+    // the struct literal above) while SHARING one address space, and the fault handler
+    // resolves its owner from the live TTBR0 via `address_space_owner_pid_for_fault`.
+    // A worker-thread fork (pid != tgid) that took `parent.as_lock` would hold a lock
+    // no fault handler ever waits on, and the window would exclude nothing. Inside
+    // fork the live TTBR0 *is* the parent's address space, so this resolves to exactly
+    // the pid the fault handler would pick.
+    let as_lock: &Spinlock<()> = {
+        let owner_pid = address_space_owner_pid_for_fault().unwrap_or(parent_pid);
+        if owner_pid == parent_pid {
+            &parent.as_lock
+        } else {
+            lookup_process_shared(owner_pid).map_or(&parent.as_lock, |p| &p.as_lock)
+        }
+    };
+
     fn copy_range_phys(
         parent_l0: *const u64,
         src_va: usize,
@@ -1665,44 +1827,20 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
     if config().cow_fork_enabled {
         // ── CoW fork: share physical pages read-only instead of copying ──
+        //
+        // `no-bkl-process` (docs/archive/BKL_PROCESS_CARVE_OUT.md §9): this pass runs
+        // with the Big Kernel Lock DROPPED. Everything it touches is either private to
+        // the not-yet-published child, or covered by an inner lock: the parent's page
+        // tables by `as_lock` (taken per chunk below — the same lock, and the same
+        // discipline, the CoW fault handler already uses BKL-free), the CoW refcounts
+        // by `COW_REFCOUNTS`, the frame pool and heap by the PMM/allocator's own locks.
+        // Steps 5–8 that follow stay fully BKL-held: they touch `THREAD_CONTEXTS` and
+        // the process table, which have no inner lock and where the BKL *is* the lock.
         (runtime().print_str)("[FORK-DBG] step4: CoW fork\n");
-        FORK_IN_PROGRESS.store(true, Ordering::Release);
         let cow_start_us = (runtime().uptime_us)();
         let mut total_shared: usize = 0;
 
-        // Helper: share a VA range via CoW.  For each mapped page in parent,
-        // increment the CoW refcount, map the same PA into the child as RO
-        // (preserving UXN/PXN), and track the frame in the child's address
-        // space.  Returns the number of pages shared.
-        fn cow_share_range(
-            parent_l0: *const u64,
-            va_start: usize,
-            len: usize,
-            child_as: &mut mmu::UserAddressSpace,
-            label: &str,
-        ) -> Result<usize, &'static str> {
-            let pages = fork_page_count_for_len(len).ok_or("CoW share page count overflow")?;
-            let mapped = mmu::collect_mapped_pages_with_flags(parent_l0, va_start, pages);
-            let count = mapped.len();
-            for (va, pa, pte_flags) in mapped {
-                // Increment CoW refcount (inserts with count=2 on first share)
-                (runtime().cow_ref_inc)(pa);
-                // Force AP to RO, preserving UXN/PXN from the original PTE
-                let child_flags = (pte_flags & !(mmu::flags::AP_RO_ALL)) | mmu::flags::AP_RO_ALL;
-                child_as.map_page(va, pa, child_flags)?;
-                child_as.track_user_frame(PhysFrame::new(pa));
-            }
-            if config().syscall_debug_info_enabled && count > 0 {
-                log::debug!("[fork-cow] {} shared {} pages", label, count);
-            }
-            Ok(count)
-        }
 
-        // Share stack
-        total_shared += cow_share_range(parent_l0, stack_start, stack_size,
-            &mut new_proc.address_space, "stack")?;
-
-        // Share code+brk.
         // code_start is the lowest VA we need to scan for code/data pages:
         //   - Large binaries (code_end >= 256 MB): loaded at or above 0x1000_0000.
         //   - Typical musl/TCC binaries: loaded at 0x400000, scan from 0x400000.
@@ -1715,49 +1853,27 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         } else {
             0x400000
         };
-        if parent.brk > code_start {
-            let brk_len = parent.brk - code_start;
-            total_shared += cow_share_range(parent_l0, code_start, brk_len,
-                &mut new_proc.address_space, "brk")?;
-        }
-
-        // Share interpreter region
         let interp_base = 0x3000_0000usize;
         let interp_scan_size = 2 * 1024 * 1024;
-        if mmu::translate_user_va(parent_l0, interp_base).is_some() {
-            total_shared += cow_share_range(parent_l0, interp_base, interp_scan_size,
-                &mut new_proc.address_space, "interp")?;
-        }
 
-        // Share mmap regions.
+        // ── Collected BKL-held, BEFORE the dropped window opens ──
         //
-        // Size the share from `region.pages`, NOT `region.frames.len()`: when the
-        // parent is itself a CoW-forked child its regions are `inherited` (extent
-        // known, no owned frames), and using the frame count would compute a
-        // zero-length range and silently skip the region — leaving this child with
-        // no mapping at all for a VA its parent has resident and will hand it a
-        // live pointer into. That is exactly the deterministic SIGSEGV in
-        // docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md: a grandchild of the
-        // process that ran `mmap` (`( cmd; cmd ) &` — shell forks a subshell,
-        // subshell forks to exec) faulted on musl's first malloc arena.
-        for region in &parent.mmap_regions {
-            if region.pages > 0 {
-                total_shared += cow_share_range(parent_l0, region.start_va, region.len_bytes(),
-                    &mut new_proc.address_space, "mmap")?;
-            }
-        }
-
-        // Share EAGER mmap regions owned by *sibling threads* of the same thread
-        // group.  Each thread has its own `Process` with a private `mmap_regions`
-        // Vec, and `mmap` pushes eager mappings (e.g. a small pthread stack ≤256
-        // pages) onto the *calling* thread's struct.  When a worker thread forks
-        // we must replicate every sibling's eager mappings too — otherwise the
-        // child's libc `fork()` thread-list fixup faults dereferencing a sibling
-        // pthread node whose stack was never copied (docs/RUST_TOOLCHAIN.md §4b′).
-        // All threads share one address space (`parent_l0`), so the same CoW
-        // share applies.  `for_each_process` runs IRQs-disabled and forbids
-        // allocation in its callback, so collect (va,len) into a pre-reserved Vec
-        // (push within capacity does not allocate), then share afterwards.
+        // Sibling-thread EAGER mmap regions. Each thread has its own `Process` with a
+        // private `mmap_regions` Vec, and `mmap` pushes eager mappings (e.g. a small
+        // pthread stack ≤256 pages) onto the *calling* thread's struct. When a worker
+        // thread forks we must replicate every sibling's eager mappings too —
+        // otherwise the child's libc `fork()` thread-list fixup faults dereferencing a
+        // sibling pthread node whose stack was never copied (docs/RUST_TOOLCHAIN.md
+        // §4b′). All threads share one address space (`parent_l0`), so the same CoW
+        // share applies. `for_each_process` runs IRQs-disabled and forbids allocation
+        // in its callback, so collect (va,len) into a pre-reserved Vec (push within
+        // capacity does not allocate), then share afterwards.
+        //
+        // This scan walks the PROCESS TABLE, which the `no-bkl-process` carve-out does
+        // NOT cover — the table hands out `&'static mut Process` under nothing but a
+        // local IRQ mask, so the BKL is its only cross-core lock. It therefore has to
+        // run before the window opens. The code already collected into a local Vec; the
+        // only change is that it now happens up front rather than mid-copy.
         let sibling_ranges: alloc::vec::Vec<(usize, usize)> = {
             let mut ranges: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(2048);
             let mut overflow = false;
@@ -1779,95 +1895,106 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             }
             ranges
         };
-        for (va_start, len) in &sibling_ranges {
-            total_shared += cow_share_range(parent_l0, *va_start, *len,
-                &mut new_proc.address_space, "sibling-mmap")?;
-        }
-        // CoW fork doesn't track per-region frame lists — frames are shared,
-        // not owned.  On write fault, new frames are allocated and tracked in
-        // user_frames.  We keep each region's VA *and page count* so munmap can
-        // size it and so this child's own forks can share it (see `MmapRegion`).
-        new_proc.mmap_regions = inherit_mmap_regions_for_cow_child(&parent.mmap_regions);
 
-        // Share lazy region pages (demand-paged pages in parent), AND propagate the
-        // parent's lazy-region *descriptors* themselves to the child's own tgid —
-        // see `propagate_lazy_regions_to_child`'s doc comment for why: `cow_share_range`
-        // only shares pages *currently resident* in the parent, so a lazy region the
-        // parent registered but hasn't fully touched yet would otherwise vanish for the
-        // child (not resident, not registered). Note: this closes a real correctness
-        // gap, but is NOT a fix for the specific fork-then-exec SIGSEGV investigated in
+        // Lazy regions, likewise snapshotted BKL-held. We share the pages the parent
+        // has *resident* in each lazy range, AND propagate the parent's lazy-region
+        // *descriptors* to the child's own tgid — see `propagate_lazy_regions_to_child`'s
+        // doc comment for why: `cow_share_and_demote_range` only shares resident pages, so a lazy
+        // region the parent registered but hasn't fully touched yet would otherwise
+        // vanish for the child (not resident, not registered). Note: this closes a real
+        // correctness gap, but is NOT a fix for the specific fork-then-exec SIGSEGV in
         // docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md — that crash's faulting VA
-        // was confirmed unregistered in the parent too, so nothing here would have
-        // covered it. That bug remains open.
-        {
-            let parent_regions: alloc::vec::Vec<crate::process::types::LazyRegion> = with_irqs_disabled(|| {
+        // was confirmed unregistered in the parent too. That bug remains open.
+        //
+        // One snapshot now serves both the share and the demote (the old code read
+        // `LAZY_REGION_TABLE` twice for the identical `parent_tgid` entry, once per
+        // pass); `propagate_lazy_regions_to_child` MUTATES the table and stays out here,
+        // BKL-held, since it registers under the child's key.
+        let parent_lazy_regions: alloc::vec::Vec<crate::process::types::LazyRegion> =
+            with_irqs_disabled(|| {
                 let table = LAZY_REGION_TABLE.lock();
                 table.get(&parent_tgid)
                     .map(|regions| regions.values().cloned().collect())
                     .unwrap_or_default()
             });
-            for region in &parent_regions {
-                total_shared += cow_share_range(parent_l0, region.start_va, region.size,
-                    &mut new_proc.address_space, "lazy")?;
-            }
-            propagate_lazy_regions_to_child(parent_tgid, child_pid);
-        }
+        propagate_lazy_regions_to_child(parent_tgid, child_pid);
 
-        // Demote ALL parent RW pages to RO so writes in the parent also
-        // trigger CoW faults.  We demote the same ranges we just shared.
-        unsafe {
-            let parent_l0_mut = parent_l0 as *mut u64;
-            let stack_pages = fork_page_count_for_len(stack_size).unwrap_or(0);
-            mmu::demote_range_to_ro(parent_l0_mut, stack_start, stack_pages);
+        // Per-chunk PTE snapshot buffer, reserved ONCE here so no `as_lock` hold below
+        // ever has to grow it (see `FORK_AS_CHUNK_PAGES`).
+        let mut chunk_scratch: alloc::vec::Vec<(usize, usize, u64)> =
+            alloc::vec::Vec::with_capacity(FORK_AS_CHUNK_PAGES);
 
+        {
+            // Locals drop in reverse declaration order, so on every exit path —
+            // including the `?` early-returns below — `_bkl` re-acquires the BKL first
+            // and only then `_forking` clears FORK_IN_PROGRESS, BKL-held again.
+            let _forking = ForkInProgressGuard::new();
+            let _bkl = ProcessBklGuard::new();
+
+            // Share stack
+            total_shared += cow_share_and_demote_range(parent_l0, as_lock, stack_start, stack_size,
+                &mut new_proc.address_space, &mut chunk_scratch, "stack")?;
+
+            // Share code+brk.
             if parent.brk > code_start {
-                let brk_pages = fork_page_count_for_len(parent.brk - code_start).unwrap_or(0);
-                mmu::demote_range_to_ro(parent_l0_mut, code_start, brk_pages);
+                let brk_len = parent.brk - code_start;
+                total_shared += cow_share_and_demote_range(parent_l0, as_lock, code_start, brk_len,
+                    &mut new_proc.address_space, &mut chunk_scratch, "brk")?;
             }
 
+            // Share interpreter region
             if mmu::translate_user_va(parent_l0, interp_base).is_some() {
-                let interp_pages = interp_scan_size / mmu::PAGE_SIZE;
-                mmu::demote_range_to_ro(parent_l0_mut, interp_base, interp_pages);
+                total_shared += cow_share_and_demote_range(parent_l0, as_lock, interp_base, interp_scan_size,
+                    &mut new_proc.address_space, &mut chunk_scratch, "interp")?;
             }
 
-            // Demote by `pages` for the same reason we shared by it: an inherited
-            // region has no owned frames, and demoting 0 pages would leave the
-            // parent writing straight through a page it now shares with the child.
+            // Share mmap regions.
+            //
+            // Size the share from `region.pages`, NOT `region.frames.len()`: when the
+            // parent is itself a CoW-forked child its regions are `inherited` (extent
+            // known, no owned frames), and using the frame count would compute a
+            // zero-length range and silently skip the region — leaving this child with
+            // no mapping at all for a VA its parent has resident and will hand it a
+            // live pointer into. That is exactly the deterministic SIGSEGV in
+            // docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md: a grandchild of the
+            // process that ran `mmap` (`( cmd; cmd ) &` — shell forks a subshell,
+            // subshell forks to exec) faulted on musl's first malloc arena.
             for region in &parent.mmap_regions {
-                mmu::demote_range_to_ro(parent_l0_mut, region.start_va, region.pages);
+                if region.pages > 0 {
+                    total_shared += cow_share_and_demote_range(parent_l0, as_lock, region.start_va,
+                        region.len_bytes(), &mut new_proc.address_space, &mut chunk_scratch,
+                        "mmap")?;
+                }
             }
 
-            // Demote sibling-thread eager mmap regions we just CoW-shared, so a
-            // sibling thread's later write also triggers a CoW fault instead of
-            // silently mutating a page the child still references.
             for (va_start, len) in &sibling_ranges {
-                let pages = fork_page_count_for_len(*len).unwrap_or(0);
-                mmu::demote_range_to_ro(parent_l0_mut, *va_start, pages);
+                total_shared += cow_share_and_demote_range(parent_l0, as_lock, *va_start, *len,
+                    &mut new_proc.address_space, &mut chunk_scratch, "sibling-mmap")?;
             }
 
-            let lazy_ranges2: alloc::vec::Vec<(usize, usize)> = with_irqs_disabled(|| {
-                let table = LAZY_REGION_TABLE.lock();
-                table.get(&parent_tgid)
-                    .map(|regions| regions.values().map(|r| (r.start_va, r.size)).collect())
-                    .unwrap_or_default()
-            });
-            for (va, size) in lazy_ranges2 {
-                let pages = fork_page_count_for_len(size).unwrap_or(0);
-                mmu::demote_range_to_ro(parent_l0_mut, va, pages);
+            for region in &parent_lazy_regions {
+                total_shared += cow_share_and_demote_range(parent_l0, as_lock, region.start_va, region.size,
+                    &mut new_proc.address_space, &mut chunk_scratch, "lazy")?;
             }
+
+            // Belt-and-braces global invalidate on top of the per-chunk range flushes.
+            // MUST be flush_tlb_all() (tlbi vmalle1): user processes run under their
+            // own non-zero ASID (ttbr0 = (asid<<48)|l0), so flush_tlb_asid(0) only
+            // invalidates ASID 0 and MISSES the parent's stale RW entries — the parent
+            // would then write through to a still-shared CoW page (no fault), clobbering
+            // the child's snapshot (e.g. saved return addresses on a shared stack page)
+            // and the child later ret's to a garbage/zero LR → SIGSEGV. (Intermittent
+            // because the next context switch's activate()/deactivate() flush_tlb_all
+            // closes the window; only writes before the parent is preempted corrupt.)
+            mmu::flush_tlb_all();
         }
+        // ── BKL re-acquired from here ──
 
-        // Flush parent TLB so the demoted (RO) PTEs take effect immediately.
-        // MUST be flush_tlb_all() (tlbi vmalle1): user processes run under their
-        // own non-zero ASID (ttbr0 = (asid<<48)|l0), so flush_tlb_asid(0) only
-        // invalidates ASID 0 and MISSES the parent's stale RW entries — the parent
-        // would then write through to a still-shared CoW page (no fault), clobbering
-        // the child's snapshot (e.g. saved return addresses on a shared stack page)
-        // and the child later ret's to a garbage/zero LR → SIGSEGV. (Intermittent
-        // because the next context switch's activate()/deactivate() flush_tlb_all
-        // closes the window; only writes before the parent is preempted corrupt.)
-        mmu::flush_tlb_all();
-
+        // CoW fork doesn't track per-region frame lists — frames are shared,
+        // not owned.  On write fault, new frames are allocated and tracked in
+        // user_frames.  We keep each region's VA *and page count* so munmap can
+        // size it and so this child's own forks can share it (see `MmapRegion`).
+        new_proc.mmap_regions = inherit_mmap_regions_for_cow_child(&parent.mmap_regions);
         new_proc.lazy_regions = Vec::new();
         new_proc.memory.next_mmap.store(parent.memory.next_mmap.load(Ordering::Relaxed), Ordering::Relaxed);
 
@@ -1879,9 +2006,17 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 format_args!("[FORK-COW] shared {} pages in {}µs\n", total_shared, cow_elapsed_us));
             if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
         }
-        FORK_IN_PROGRESS.store(false, Ordering::Release);
     } else {
         // ── Eager-copy fork (legacy path) ──
+        //
+        // Deliberately NOT carved out of the BKL. `COW_FORK_ENABLED` is `true`
+        // (src/config.rs), so this branch is unreachable on every shipping build and
+        // there is no contention here to relieve — and unlike the CoW path it copies
+        // page *contents* out of the parent, which would need `as_lock` held across the
+        // 4 KiB copy (not just the PTE read) to be safe against a peer core's CoW break
+        // freeing the source frame mid-copy. Carving it would mean auditing that for a
+        // path nothing runs; the playbook's "scope the window as narrowly as possible"
+        // says leave it.
         (runtime().print_str)("[FORK-DBG] step4: copying stack\n");
         copy_range_phys(
             parent_l0,
@@ -1938,7 +2073,9 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
         const MAX_FORK_MMAP_PAGES: usize = 2048;
         let mmap_snapshot: Vec<MmapRegion> = parent.mmap_regions.clone();
-        FORK_IN_PROGRESS.store(true, Ordering::Release);
+        // RAII so a `?` early-return (OOM mid-copy) can't strand the flag set for the
+        // rest of the boot, as the bare store/store pair did.
+        let _forking = ForkInProgressGuard::new();
         let mut total_copied_pages: usize = 0;
         let mut child_mmap_regions: Vec<MmapRegion> = Vec::new();
 
@@ -2078,7 +2215,6 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             }
         }
 
-        FORK_IN_PROGRESS.store(false, Ordering::Release);
         (runtime().print_str)("[FORK-DBG] step4: lazy done\n");
     }
 
@@ -2088,7 +2224,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     //
     // CRITICAL: Re-map PROCESS_INFO_ADDR AFTER the CoW fork.  For Go ARM64
     // binaries, code_start = PAGE_SIZE = 0x1000 = PROCESS_INFO_ADDR.
-    // cow_share_range copies the parent's PTE for 0x1000 into the child,
+    // cow_share_and_demote_range copies the parent's PTE for 0x1000 into the child,
     // overwriting the child's process info mapping.  Without this re-map,
     // the child reads the PARENT's PID from PROCESS_INFO_ADDR, causing
     // current_process() / read_current_pid() to return the wrong PID.

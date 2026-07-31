@@ -34,6 +34,13 @@ no-bkl-network = []
 # `smp-shared`.
 no-bkl-vfs = []
 
+# Run `fork_process`'s CoW share/demote pass WITHOUT the Big Kernel Lock (Phase 3 of
+# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), forwarded from the bin crate. Makes
+# this crate's build.rs emit `cfg(kernel_no_bkl_process)`, activating `ProcessBklGuard`
+# (process/bkl_guard.rs) and the chunked `as_lock` holds it depends on. Only meaningful
+# with `smp-shared`.
+no-bkl-process = []
+
 [dependencies]
 spinning_top = "0.3"
 lock_api = "0.4"

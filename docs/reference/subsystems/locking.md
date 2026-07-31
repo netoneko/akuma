@@ -30,10 +30,14 @@ BKL is simply *redundant* for syscalls that only touch that state. See
 `docs/reference/subsystems/smp.md` for the other, share-nothing SMP model this
 is not.
 
-Two carve-outs exist today: `no-bkl-network` (all smoltcp net syscalls +
-socket `read`/`write`) and `no-bkl-vfs` (ext2 read paths, `mmap`, `unlinkat`,
-`openat`, `renameat`/`renameat2`, `mkdirat`, `fchmodat`). Both follow the same
-shape below.
+Three carve-outs exist today: `no-bkl-network` (all smoltcp net syscalls +
+socket `read`/`write`), `no-bkl-vfs` (ext2 read paths, `mmap`, `unlinkat`,
+`openat`, `renameat`/`renameat2`, `mkdirat`, `fchmodat`), and `no-bkl-process`
+(`fork_process`'s CoW page-copy window — opt-in, not in `smp-shared`). All three
+follow the same shape below. `no-bkl-process` is the first that is not about
+I/O: it overlaps a CPU-bound page copy with peer-core EL1 rather than a disk or
+wire wait, and it is the first to lean on a *page-table* inner lock (`as_lock`)
+rather than a subsystem's own state locks.
 
 ## The carve-out playbook
 
@@ -268,15 +272,52 @@ ledger primitive, no `VfsBklGuard`/`NetBklGuard` struct):
 | Data-Abort demand-page fill (`exceptions.rs:2964`/`3017`) | `fault_bkl_drop_enabled()` (`smp_shared.rs:68`) | per-page fill loop only; page-table install is separate, BKL-held | ext2 `read_state` |
 | Instruction-Abort demand-page fill (`exceptions.rs:3487`/`3533`) | same | mirror of Data-Abort path | same |
 
-`fork_process` (`crates/akuma-exec/src/process/mod.rs:1487`) and its caller
-`src/syscall/proc.rs` have **no** BKL-drop treatment at all — confirmed by
-grep, matching the archive doc's §16.5 audit. **A full step-by-step audit was
-completed 2026-07-31** ([`BKL_PROCESS_CARVE_OUT.md`](../../archive/BKL_PROCESS_CARVE_OUT.md)):
-no carve-out was implemented. Every significant-BKL-time step touches state with
-no inner lock (`THREAD_CONTEXTS`, process table, parent page tables); the BKL
-is the lock, not a redundant wrapper. A carve-out requires either fixing the
-open fork-corruption bug first or building the process-table lock the original
-Phase 3 plan sketched.
+### `no-bkl-process` — `crates/akuma-exec/src/process/mod.rs`
+
+Phase 3, landed 2026-07-31, **opt-in** (not in the `smp-shared` feature set, unlike
+the other two — fork/CoW is where the SMP=4 corruption bug lived, so it stays
+behind an explicit `--features …,no-bkl-process` until it has comparable soak).
+`ProcessBklGuard` (`process/bkl_guard.rs`) mirrors `VfsBklGuard`: runtime toggle
+`process_bkl_drop_enabled()` (default on, latched at construction), same
+dropped-window ledger.
+
+| site | guard scope | inner lock(s) held while BKL dropped |
+|---|---|---|
+| `fork_process` CoW share/demote pass | the copy loop only — after the `for_each_process` sibling scan, the `LAZY_REGION_TABLE` snapshot, and `propagate_lazy_regions_to_child` (all hoisted BKL-held ahead of it); before steps 5–8 | thread-group **leader's** `Process::as_lock` in 64-page chunks (`FORK_AS_CHUNK_PAGES`, IRQ-masked via `AsLockHold`), plus `COW_REFCOUNTS` `Spinlock` and the PMM/allocator locks |
+
+Two things about this one differ from the fs/net pattern and are easy to get
+wrong:
+
+- **It's the thread-group leader's `as_lock`, not the forking thread's.**
+  `CLONE_THREAD` siblings each get a fresh `Spinlock` in their own `Process`
+  while sharing one address space; the fault handler picks its owner with
+  `address_space_owner_pid_for_fault()` (TTBR0 → the non-shared process owning
+  that L0), so fork resolves the same way. Taking `parent.as_lock` from a worker
+  thread would hold a lock nothing else waits on.
+- **The hold is chunked, and the PTE read + `cow_ref_inc` + demote + range-flush
+  are one hold.** `AsLockHold` masks IRQs, so it cannot span the copy (timer
+  starvation, and the AB-BA against a BKL-holding `munmap` that wants
+  `as_lock`); but the four steps above must be atomic against a peer's CoW fault
+  or fork can `cow_ref_inc` a frame that fault just freed. That constraint is
+  what merged the demote into the share pass — it used to be a separate second
+  walk.
+
+**Still fully BKL-held in `fork_process`:** steps 1–3 (allocation only, nothing
+to relieve) and steps 5–8 — `ProcessInfo` write, `get_saved_user_context` /
+`update_thread_context` (`THREAD_CONTEXTS` is an unlocked `UnsafeCell`),
+`spawn_user_thread_initializing`, `register_process` + `mark_thread_ready` (the
+publication point). Those touch state with no inner lock, where the BKL *is* the
+lock — the original audit's finding there stands. Also still BKL-held: the
+eager-copy (non-CoW) fork branch (unreachable, `COW_FORK_ENABLED = true`) and
+`sys_clone`'s routing layer (`VFORK_WAITERS`, nanosecond-scale). `execve`'s
+`replace_image` destructive window remains the single most dangerous carve-out
+target in the space and is untouched.
+
+Background: [`BKL_PROCESS_CARVE_OUT.md`](../../archive/BKL_PROCESS_CARVE_OUT.md)
+— §§1–8 are the original audit (which concluded no carve-out was possible), §9
+is what actually landed and why §2.4a's "the parent's page tables have no lock"
+was wrong: the CoW fault handler was already editing those same PTEs BKL-free
+under `as_lock`, so the inner lock existed and fork just wasn't taking it.
 
 ## Attribution tooling
 

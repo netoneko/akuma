@@ -646,6 +646,11 @@ pub fn run_all_tests() {
     test_mkdirat();
     test_fchmodat();
 
+    // `no-bkl-process` (Phase 3): ProcessBklGuard's ledger balance + latching, and the
+    // real `cow_share_and_demote_range` pass fork's dropped-BKL window runs — pins what
+    // the carve-out must preserve (BKL_PROCESS_CARVE_OUT.md §9).
+    test_fork_bkl_drop();
+
     // Phantom-SVC tripwire: runs LAST so it covers every EL0 trap the suite above
     // generated (fork/exec/signal/mmap stress). A nonzero count means an EC_SVC64
     // trap arrived whose insn@ELR-4 was not an `svc` — either stale I-cache or the
@@ -2558,6 +2563,268 @@ const BENCH_VA_BASE: usize = 0x10_0000_0000;
 /// Keep at least this many physical pages free so a benchmark can never
 /// drive the kernel out of memory (16 MiB of headroom).
 const BENCH_FREE_HEADROOM_PAGES: usize = 4096;
+
+/// `no-bkl-process` (Phase 3 BKL carve-out): `fork_process`'s CoW share/demote pass runs
+/// with the BKL dropped, under chunked `as_lock` holds. Pins the two things that can
+/// break — the guard's ledger balance, and the share/demote itself — so a regression in
+/// either shows up at boot rather than as SMP=4 memory corruption.
+///
+/// Why this doesn't drive `handle_syscall(CLONE, …)` end-to-end the way `test_unlinkat`
+/// drives `UNLINKAT`: a real fork needs the calling thread to have a saved EL0 context
+/// (`get_saved_user_context`, `fork_process` step 6) and needs the live TTBR0 to *be*
+/// the forking process's address space, so `parent_l0` walks user tables. Neither holds
+/// for the boot self-test thread — it is a kernel thread on the boot tables with no EL0
+/// frame, so a `CLONE` here would fail at step 6 having exercised nothing, and pointing
+/// `parent_l0` at the boot L0 would have it CoW-share the *kernel's* mappings. So this
+/// covers the carve-out at the two seams that are actually reachable from here:
+///
+///  - **Phase 1** — [`ProcessBklGuard`]'s ledger contract, including the latching rule
+///    (a toggle flipped from ON to OFF *while a guard is live* must still re-acquire on
+///    drop; re-reading the toggle in `drop` is what unbalances the ticket FIFO).
+///  - **Phases 2/3** — the real [`cow_share_and_demote_range`] on a synthetic parent
+///    address space, run once with the toggle ON and once OFF, spanning multiple
+///    `FORK_AS_CHUNK_PAGES` chunks plus a partial trailing one, checking the child's
+///    mappings, both sides' permissions, the CoW refcounts, and page contents.
+///  - **Phase 4** — the OOM early-return leaves the ledger balanced (the `?` path out of
+///    the copy loop must still close the window).
+///
+/// [`ProcessBklGuard`]: akuma_exec::process::ProcessBklGuard
+/// [`cow_share_and_demote_range`]: akuma_exec::process::cow_share_and_demote_range
+/// [`FORK_AS_CHUNK_PAGES`]: akuma_exec::process::FORK_AS_CHUNK_PAGES
+fn test_fork_bkl_drop() {
+    use akuma_exec::bkl;
+    use akuma_exec::mmu::{self, flags, user_flags};
+    use akuma_exec::process::{cow_share_and_demote_range, ProcessBklGuard, FORK_AS_CHUNK_PAGES};
+    // Go through the `smp_shared` re-exports where they exist, so the boot image's
+    // single "all BKL toggles live here" module is the one under test (and doesn't rot
+    // into dead code). The atomic itself lives in akuma-exec — see `bkl_guard.rs`.
+    #[cfg(kernel_smp_shared)]
+    use crate::smp_shared::{process_bkl_drop_enabled, set_process_bkl_drop_enabled};
+    #[cfg(not(kernel_smp_shared))]
+    use akuma_exec::process::{process_bkl_drop_enabled, set_process_bkl_drop_enabled};
+    use spinning_top::Spinlock;
+
+    /// Enough to cross a chunk boundary twice and leave a partial trailing chunk, so an
+    /// off-by-one in the `while done < pages` loop (dropped tail, re-shared chunk, or a
+    /// double `cow_ref_inc`) is visible rather than masked by a single-chunk range.
+    const PAGES: usize = FORK_AS_CHUNK_PAGES * 2 + 5;
+    /// Clear of `BENCH_VA_BASE` so a leaked benchmark mapping can't alias this.
+    const VA_BASE: usize = 0x11_0000_0000;
+
+    let mut fails = 0u32;
+    let toggle_was = process_bkl_drop_enabled();
+
+    // ── Phase 1: guard ledger contract ──────────────────────────────────────
+    // `in_dropped_window()` is a stub returning false unless
+    // `all(kernel_smp_shared, target_os = "none")`, so the "closed afterwards"
+    // assertions below hold on every build; the "open inside" one is only meaningful
+    // where the guard actually does something.
+    if bkl::in_dropped_window() {
+        fails += 1;
+        crate::safe_print!(96, "[Test] fork-bkl-drop: window already open on entry\n");
+    }
+    {
+        set_process_bkl_drop_enabled(true);
+        let _g = ProcessBklGuard::new();
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_process))]
+        if !bkl::in_dropped_window() {
+            fails += 1;
+            crate::safe_print!(96, "[Test] fork-bkl-drop: guard did not open the window\n");
+        }
+    }
+    if bkl::in_dropped_window() {
+        fails += 1;
+        crate::safe_print!(96, "[Test] fork-bkl-drop: window still open after guard drop\n");
+    }
+
+    // Latching: construct with the toggle ON, flip it OFF while the guard is live, drop.
+    // A guard that re-read the toggle in `drop()` would skip the re-acquire here and
+    // leave the BKL released for the rest of the caller — the exact unbalance
+    // BKL_VFS_CARVE_OUT.md §2.4 documents. Balance must not depend on the flip.
+    {
+        set_process_bkl_drop_enabled(true);
+        let _g = ProcessBklGuard::new();
+        set_process_bkl_drop_enabled(false);
+    }
+    if bkl::in_dropped_window() {
+        fails += 1;
+        crate::safe_print!(96, "[Test] fork-bkl-drop: ON->OFF flip left the window open\n");
+    }
+    // And the mirror: constructed while OFF, it must not close a window it never opened.
+    {
+        set_process_bkl_drop_enabled(false);
+        let _g = ProcessBklGuard::new();
+        set_process_bkl_drop_enabled(true);
+    }
+    if bkl::in_dropped_window() {
+        fails += 1;
+        crate::safe_print!(96, "[Test] fork-bkl-drop: OFF->ON flip unbalanced the ledger\n");
+    }
+
+    // ── Phases 2/3: the real share+demote, toggle ON then OFF ───────────────
+    // Same inputs, same expected outputs both ways: the toggle only decides whether the
+    // BKL is dropped around the pass, never what the pass computes.
+    for &toggle in &[true, false] {
+        set_process_bkl_drop_enabled(toggle);
+
+        let (_total, _alloc, free) = crate::pmm::stats();
+        if free < PAGES + BENCH_FREE_HEADROOM_PAGES {
+            crate::safe_print!(96, "[Test] fork-bkl-drop: SKIPPED phase (low memory)\n");
+            continue;
+        }
+
+        let Some(mut parent_as) = mmu::UserAddressSpace::new() else {
+            crate::safe_print!(96, "[Test] fork-bkl-drop: SKIPPED phase (parent AS alloc)\n");
+            continue;
+        };
+        // Fill each page with a byte pattern derived from its index so a page mapped at
+        // the wrong VA in the child (a chunk-offset bug) is detectable, not just "some
+        // mapping exists".
+        let mut mapped = 0usize;
+        for i in 0..PAGES {
+            let va = VA_BASE + i * mmu::PAGE_SIZE;
+            let Some(frame) = crate::pmm::alloc_page_zeroed() else { break };
+            if parent_as.map_page(va, frame.addr, user_flags::RW).is_err() {
+                crate::pmm::free_page(frame);
+                break;
+            }
+            unsafe { core::ptr::write(mmu::phys_to_virt(frame.addr), (i & 0xff) as u8) };
+            parent_as.track_user_frame(frame);
+            mapped += 1;
+        }
+        if mapped != PAGES {
+            crate::safe_print!(96, "[Test] fork-bkl-drop: SKIPPED phase (mapped {}/{})\n", mapped, PAGES);
+            continue;
+        }
+        let Some(mut child_as) = mmu::UserAddressSpace::new() else {
+            crate::safe_print!(96, "[Test] fork-bkl-drop: SKIPPED phase (child AS alloc)\n");
+            continue;
+        };
+
+        let parent_l0 = mmu::phys_to_virt(parent_as.l0_phys()) as *const u64;
+        // Stand-in for the thread-group leader's `Process::as_lock`; uncontended here,
+        // but it exercises the same acquire/release (and IRQ mask) the real path takes.
+        let as_lock: Spinlock<()> = Spinlock::new(());
+        let mut scratch: alloc::vec::Vec<(usize, usize, u64)> =
+            alloc::vec::Vec::with_capacity(FORK_AS_CHUNK_PAGES);
+
+        // Record the parent's PAs BEFORE the share, so we can prove the child got the
+        // same physical frames (CoW share, not a copy) and the parent kept them.
+        let before = mmu::collect_mapped_pages_with_flags(parent_l0, VA_BASE, PAGES);
+        let shared = cow_share_and_demote_range(
+            parent_l0,
+            &as_lock,
+            VA_BASE,
+            PAGES * mmu::PAGE_SIZE,
+            &mut child_as,
+            &mut scratch,
+            "selftest",
+        );
+
+        match shared {
+            Ok(n) if n == PAGES => {}
+            Ok(n) => {
+                fails += 1;
+                crate::safe_print!(96, "[Test] fork-bkl-drop(toggle={}): shared {} of {} pages\n",
+                    u8::from(toggle), n, PAGES);
+            }
+            Err(e) => {
+                fails += 1;
+                crate::safe_print!(128, "[Test] fork-bkl-drop(toggle={}): share FAILED: {}\n",
+                    u8::from(toggle), e);
+            }
+        }
+
+        // The guard must leave the ledger balanced across the whole pass.
+        if bkl::in_dropped_window() {
+            fails += 1;
+            crate::safe_print!(96, "[Test] fork-bkl-drop(toggle={}): window open after share\n",
+                u8::from(toggle));
+        }
+
+        let child_l0 = mmu::phys_to_virt(child_as.l0_phys()) as *const u64;
+        let after = mmu::collect_mapped_pages_with_flags(parent_l0, VA_BASE, PAGES);
+        let child_pages = mmu::collect_mapped_pages_with_flags(child_l0, VA_BASE, PAGES);
+
+        if before.len() != PAGES || after.len() != PAGES || child_pages.len() != PAGES {
+            fails += 1;
+            crate::safe_print!(128,
+                "[Test] fork-bkl-drop(toggle={}): page counts before={} after={} child={} (want {})\n",
+                u8::from(toggle), before.len(), after.len(), child_pages.len(), PAGES);
+        } else {
+            for i in 0..PAGES {
+                let va = VA_BASE + i * mmu::PAGE_SIZE;
+                let (bva, bpa, bflags) = before[i];
+                let (ava, apa, aflags) = after[i];
+                let (cva, cpa, cflags) = child_pages[i];
+                let mut bad = None;
+                if bva != va || ava != va || cva != va {
+                    bad = Some("va mismatch");
+                } else if bflags & flags::AP_RO_ALL != flags::AP_RW_ALL {
+                    bad = Some("parent was not RW before the share");
+                } else if apa != bpa || cpa != bpa {
+                    // The whole point of CoW: one frame, three references to it.
+                    bad = Some("pa changed (copied, not shared)");
+                } else if aflags & flags::AP_RO_ALL != flags::AP_RO_ALL {
+                    bad = Some("parent not demoted to RO");
+                } else if cflags & flags::AP_RO_ALL != flags::AP_RO_ALL {
+                    bad = Some("child not mapped RO");
+                } else if crate::pmm::cow_ref_get(bpa) != 2 {
+                    // First share of a private page inserts count=2 (parent + child). A
+                    // double-inc at a chunk boundary would show up as 3.
+                    bad = Some("cow refcount != 2");
+                } else if unsafe { core::ptr::read(mmu::phys_to_virt(bpa).cast_const()) }
+                    != (i & 0xff) as u8
+                {
+                    bad = Some("page content changed");
+                }
+                if let Some(why) = bad {
+                    fails += 1;
+                    crate::safe_print!(160,
+                        "[Test] fork-bkl-drop(toggle={}) page {}: {} (pa={:#x} pflags={:#x} cflags={:#x} rc={})\n",
+                        u8::from(toggle), i, why, bpa, aflags, cflags, crate::pmm::cow_ref_get(bpa));
+                    break; // one report per phase is enough
+                }
+            }
+        }
+
+        // Teardown: child drops first (each frame 2→1, nothing freed), then parent
+        // (1→0, freed exactly once). A leak or double-free here would show up in
+        // `test_pmm_conserved_across_spawn_exit_reap`.
+        drop(child_as);
+        drop(parent_as);
+    }
+
+    // ── Phase 4: early-error path stays balanced ────────────────────────────
+    // Mirrors the `?` early-returns inside the copy loop (OOM mid-fork): the guard's
+    // destructor runs on the error path too, so the ledger must come back to zero.
+    set_process_bkl_drop_enabled(true);
+    {
+        fn failing_pass() -> Result<(), &'static str> {
+            let _g = ProcessBklGuard::new();
+            Err("simulated OOM inside the fork page-copy window")
+        }
+        if failing_pass().is_ok() {
+            fails += 1;
+            crate::safe_print!(96, "[Test] fork-bkl-drop: error-path harness did not fail\n");
+        }
+    }
+    if bkl::in_dropped_window() {
+        fails += 1;
+        crate::safe_print!(96, "[Test] fork-bkl-drop: window leaked on the error path\n");
+    }
+
+    set_process_bkl_drop_enabled(toggle_was);
+
+    if fails == 0 {
+        crate::safe_print!(160,
+            "[Test] fork-bkl-drop PASSED (ledger balance + latching, {} pages shared/demoted x2 toggles, error path)\n",
+            PAGES);
+    } else {
+        crate::safe_print!(96, "[Test] fork-bkl-drop FAILED ({} checks)\n", fails);
+        panic!("test_fork_bkl_drop: {fails} checks failed");
+    }
+}
 
 // ── munmap / user_frames refcount regression tests ────────────────────────
 //

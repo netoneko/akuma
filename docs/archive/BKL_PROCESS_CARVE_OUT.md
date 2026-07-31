@@ -4,7 +4,16 @@ Companion to [BKL_VFS_CARVE_OUT.md](BKL_VFS_CARVE_OUT.md) §16.5, which flagged
 `clone`/`fork_process` as the next Phase 3 candidate without starting it. This
 doc is the audit that §16.5 recommended as the right-sized next task.
 
-**Status: AUDIT COMPLETE — no carve-out implemented.** The audit's conclusion is
+> **SUPERSEDED IN PART, 2026-07-31.** §§1–8 are the original audit and its
+> "no carve-out is possible" conclusion. **[§9](#9-the-carve-out-that-did-land--no-bkl-process-2026-07-31)
+> is the carve-out that subsequently landed**, and it revises §2's step-4
+> classification: the audit missed that the CoW fault handler already edits the
+> *same* parent PTEs BKL-free under the address space's `as_lock`, so an inner
+> lock did exist — fork simply wasn't taking it. Read §9 for what the code does
+> now; read §§1–8 for why steps 5–8 are still fully BKL-held (that finding
+> stands unchanged).
+
+**Status of §§1–8: AUDIT COMPLETE — no carve-out implemented.** The audit's conclusion is
 that **no step of `fork_process`, `clone`, or the remaining uncovered portion of
 `execve` is safe to carve out from the BKL without either (a) first fixing the
 open SMP=4 fork-corruption bug, or (b) introducing a new lock.** Neither is a
@@ -349,4 +358,291 @@ conclusion:
    caller src/syscall/proc.rs have no BKL-drop treatment at all — confirmed by
    grep."* This is accurate and remains so after this audit — no carve-out was
    implemented. No correction needed; this section will need updating when/if a
-   carve-out lands.
+   carve-out lands. **(Done — see §9 below and the `no-bkl-process` table in
+   `locking.md`.)**
+
+---
+
+## 9. The carve-out that DID land — `no-bkl-process` (2026-07-31)
+
+**Status: IMPLEMENTED, opt-in behind the `no-bkl-process` Cargo feature.**
+
+### 9.1 What §2.4a got wrong
+
+§2's step-4a table says the parent's L0 page table has **"NONE — direct PTE
+writes via raw pointer"** for a lock, and concludes the demote is not carvable.
+That is an accurate description of `fork_process` as it was written, but it is
+**not a property of the operation**, and the audit drew the wrong conclusion
+from it.
+
+The CoW fault handler edits *the very same parent PTEs* — `remap_current_user_page`,
+`update_current_user_page_flags`, `map_page` — and it does so **with the BKL
+already dropped** (`fault_bkl_drop_enabled()`, the M5b Stage 4a window). What
+serializes those edits is `Process::as_lock`, taken as
+`AsLockHold::new(&owner.as_lock)` at eleven sites in `src/exceptions.rs`. So the
+parent's page tables *do* have an inner lock, of exactly the kind the VFS
+playbook asks for. Fork was simply the one page-table mutator in the kernel that
+never took it — it relied on the BKL instead, which is why the audit's grep for
+"what lock protects this" came back empty.
+
+Once `as_lock` is in the picture, step 4 fits the playbook's model after all:
+*the BKL is redundant here, because the state already carries a finer lock.*
+
+The audit's other findings are unaffected. Steps 6–8 (`THREAD_CONTEXTS`, the
+process table's unprotected `&'static mut Process`, `mark_thread_ready` as the
+publication point) have no inner lock and are **still fully BKL-held**. So is
+`replace_image`'s destructive window (§4). The carve-out is step 4 only.
+
+### 9.2 Why a process-table lock was NOT needed for this
+
+The original Phase 3 plan (`BKL_FINE_GRAINED_LOCKING_PLAN.md` §201–270) made a
+`PROCESS_TABLE_LOCK` + per-process `ProcessLock` — and the 218-site
+`lookup_process` refactor behind it — a prerequisite (§7 "(b)" above). It isn't
+one, for this window:
+
+1. **The page-copy window never touches the process table.** It walks page
+   tables and shares frames. The child `Process` is private stack-local state
+   (`Box<Process>`, not registered until step 8). The parent `Process` fields it
+   reads — `brk`, `memory.code_end`, `memory.stack_top`, `mmap_regions`,
+   `memory.next_mmap` — are set at process creation / ELF load and are not
+   mutated during a syscall; the parent is the current thread, inside this
+   syscall, so it cannot be concurrently in `mmap`/`brk`/`exec`.
+
+2. **The one process-table access in the window was hoisted out.** The
+   sibling-thread mmap scan (`for_each_process`) *does* walk the table, so it now
+   runs **before** the window opens, collecting into the local `Vec` it already
+   used. Same for the `LAZY_REGION_TABLE` snapshot and
+   `propagate_lazy_regions_to_child` (which mutates the table).
+
+3. **A process-table lock would be the wrong shape anyway.** It would be a new
+   coarse lock held across a milliseconds-long copy — the exact anti-pattern
+   `locking.md` §"Don't invent a new coarse lock" warns about. Adopting the
+   existing safe `with_process(pid, f)` API at 218 sites is worth doing on its
+   own merits, but it is a separate refactor and must not be coupled to this.
+
+### 9.3 The design
+
+`ProcessBklGuard` (`crates/akuma-exec/src/process/bkl_guard.rs`), modelled on
+`VfsBklGuard`: gated by `cfg(all(kernel_smp_shared, kernel_no_bkl_process))`,
+runtime toggle `process_bkl_drop_enabled()` (default on, **latched at
+construction** — §2.4 of the VFS doc), opening/closing the per-thread dropped-
+window ledger via `bkl::dropped_window_open()/close()`. Scoped to the CoW
+share/demote pass in `fork_process` and nothing else.
+
+Three constraints shaped the rest, and each of them contradicts a detail of the
+obvious "just take `as_lock` around the copy" sketch:
+
+**(a) It must be the thread-group LEADER's `as_lock`.** `CLONE_THREAD` siblings
+each get a *fresh* `Spinlock` in their own `Process` (see `fork_process`'s
+struct literal) while **sharing one address space**. The fault handler resolves
+its owner via `address_space_owner_pid_for_fault()` — TTBR0 → the non-shared
+process owning that L0. A worker-thread fork (`pid != tgid`) that took
+`parent.as_lock` would hold a lock no fault handler ever waits on, and the
+window would exclude nothing. `fork_process` now resolves the same way; inside
+fork the live TTBR0 *is* the parent's address space, so the two always agree.
+
+**(b) The hold must be chunked, never spanning the copy.** `AsLockHold` masks
+IRQs for its duration, and it has to: without the mask, a timer IRQ inside the
+BKL-free window does an unconditional `enter_kernel()` hard-spin for the BKL
+while this core holds `as_lock`, against a peer that holds the BKL and wants
+`as_lock` in `munmap`/`mprotect` — the AB-BA wedge the network Phase 2
+`PreemptGuard` fix exists to prevent. But masking IRQs across a
+milliseconds-long page copy is equally unacceptable (`locking.md`: "mask per
+*attempt*, never across an unbounded wait"), and `AsLockHold`'s contract also
+forbids page-frame allocation inside the hold, which `map_page` does on every
+page. Hence `FORK_AS_CHUNK_PAGES = 64`: bounded holds, with the allocating
+child-side work outside them.
+
+**(c) The PTE read, the `cow_ref_inc`, and the demote must be in ONE hold.**
+Split them and this race is live: fork reads a PTE naming frame X; a peer's CoW
+fault breaks X (`cow_ref_dec` → 0 → frame freed, VA remapped to Y); fork then
+`cow_ref_inc`s the freed X and maps it into the child. The fault handler
+performs its break under this same `as_lock`, so one hold serializes the two.
+**This is why the demote was merged into the share pass** rather than left as
+the separate second walk it used to be — and the merge is a correctness
+improvement independent of the carve-out: share and demote are now atomic per
+page instead of separated by the whole copy. It also deletes one full redundant
+page-table walk of the parent.
+
+So `cow_share_and_demote_range` (hoisted to module level so the boot self-test
+drives the real code) is, per 64-page chunk:
+
+| phase | lock | work |
+|---|---|---|
+| A | `as_lock` (leader's), IRQs masked | snapshot parent PTEs into a **pre-reserved** scratch `Vec`, `cow_ref_inc` each, `demote_range_to_ro`, `flush_tlb_range_all_asid` |
+| B | none | `child_as.map_page` + `track_user_frame` (allocating; child is private) |
+
+Phase A is allocation-free apart from `cow_ref_inc`'s `BTreeMap` insert — the
+scratch buffer is reserved once, outside every lock, so the collect reuses
+capacity instead of growing under an IRQ mask. (Heap allocation under `as_lock`
+is already the status quo: the fault handler's `track_user_frame` at
+`exceptions.rs:2780` does it. The rule `AsLockHold`'s doc states is about
+*page-frame* allocation, whose OOM/reclaim path can re-enter the lock.)
+
+The per-chunk TLB invalidate is new and is required *by the merge*: with the
+demote interleaved into the share, the single trailing `flush_tlb_all()` would
+leave a sibling core's stale RW TLB entry live for the whole copy instead of for
+one chunk. 64 pages keeps it under `flush_tlb_range_all_asid`'s 512-page
+full-flush threshold, so it stays a targeted `tlbi vaae1is` sweep. The trailing
+`flush_tlb_all()` is kept as-is.
+
+### 9.4 Lock order
+
+`BKL > as_lock`, unchanged and uninverted. Peers hold BKL → `as_lock`
+(`munmap`/`mprotect`/`mmap`). Fork holds *no* BKL → `as_lock`. The fault handler
+holds no BKL → `as_lock`. No cycle. The IRQ mask inside each hold is what keeps
+it that way (constraint (b)).
+
+### 9.5 What stayed outside the window
+
+- Steps 1–3 (AS creation, process-info frame, `Box<Process>`) — pure allocation,
+  no contention to relieve, and no I/O to overlap.
+- Steps 5–8 — genuinely BKL-dependent, per §§2.5–2.8. Unchanged.
+- The `for_each_process` sibling scan, the `LAZY_REGION_TABLE` snapshot, and
+  `propagate_lazy_regions_to_child` — hoisted to just before the window (§9.2).
+- **The eager-copy (non-CoW) branch** — `COW_FORK_ENABLED` is `true`
+  (`src/config.rs`), so it is unreachable on every shipping build; and unlike the
+  CoW path it copies page *contents* out of the parent, which would need
+  `as_lock` held across each 4 KiB copy (not just the PTE read) to be safe
+  against a peer's CoW break freeing the source frame mid-copy. Auditing that for
+  a path nothing runs fails the "scope narrowly" test.
+
+### 9.6 Incidental fix: leaked `FORK_IN_PROGRESS`
+
+`fork_process` set `FORK_IN_PROGRESS` with a bare `store(true)`/`store(false)`
+pair, so any `?` early-return from the copy loop (OOM mid-fork) stranded it
+`true` for the rest of the boot — the timer handler then logged `[TMR]` 10× as
+often forever. Now a `ForkInProgressGuard` (RAII), declared *before* the
+`ProcessBklGuard` so the flag is set BKL-held and cleared only after the BKL is
+re-acquired. The flag has no correctness consumers (grep: `src/timer.rs` log
+frequency only), so this is hygiene, not a bug fix.
+
+### 9.7 Self-test
+
+`test_fork_bkl_drop` (`src/process_tests.rs`). It deliberately does **not** drive
+`handle_syscall(CLONE, …)` end-to-end the way `test_unlinkat` drives `UNLINKAT`:
+a real fork needs the calling thread to have a saved EL0 context
+(`get_saved_user_context`, step 6) and needs the live TTBR0 to *be* the forking
+process's address space so `parent_l0` walks user tables. Neither holds for the
+boot self-test thread — it is a kernel thread on the boot tables with no EL0
+frame, so a `CLONE` there would fail at step 6 having exercised nothing, and
+pointing `parent_l0` at the boot L0 would have it CoW-share the *kernel's*
+mappings. Instead it covers the seams that are reachable:
+
+1. Guard ledger balance, including the **latching** rule: a toggle flipped ON→OFF
+   while a guard is live must still re-acquire on drop, and the OFF→ON mirror
+   must not close a window it never opened.
+2. The real `cow_share_and_demote_range` on a synthetic parent AS of
+   `FORK_AS_CHUNK_PAGES * 2 + 5` pages (two full chunks plus a partial trailing
+   one, so an off-by-one in the chunk loop shows as a dropped tail, a re-shared
+   chunk, or a doubled refcount). Checks: child maps the *same* PAs (share, not
+   copy), parent demoted to RO, child mapped RO, `cow_ref_get == 2` exactly, and
+   per-page content preserved (each page carries an index-derived byte, so a
+   page landing at the wrong VA is caught). Run twice, toggle on and off — same
+   inputs must give the same outputs either way.
+3. The OOM early-return path leaves the ledger balanced.
+
+### 9.8 Verification — what was run, and what could not be
+
+**Builds** — clean on all four relevant configs, plus clippy (`-D dead-code`,
+pedantic) and the host test suite:
+
+| config | guard |
+|---|---|
+| `cargo build --release` | compiled out entirely |
+| `--profile release-smp-shared --features devbox-smoltcp,no-tests` | compiled out (feature off) |
+| `… ,no-bkl-process` | **active** |
+| `… ,bkl-profile,no-bkl-process` | active + profiler |
+
+**Boot self-test at SMP=2** — `test_fork_bkl_drop` PASSED (`133 pages
+shared/demoted x2 toggles`), full suite green. Compared against a same-config
+baseline boot with the feature off:
+
+| signal | `no-bkl-process` | baseline |
+|---|---|---|
+| suite | green, `Process Execution Tests Done` | green |
+| PANIC / WILD-DA / DA-MISS | 0 / 0 / 0 | 0 / 0 / 0 |
+| `[BKL] stuck` | 16 | 16 |
+
+The 16 `[BKL] stuck` are pre-existing and identical on both sides — they come
+from the NEON preemptive-scheduling stress test (two deliberately busy threads),
+well before the fork test runs.
+
+**Fork-hammer at SMP=2** — `scripts/validate_fork_smp.py`, 3 boots × 10 rounds ×
+8 concurrent SSH connections, each doing 8 `busybox true` + 8
+`busybox echo fork_ok_<i>`:
+
+| | `no-bkl-process` | baseline |
+|---|---|---|
+| verdict | **PASS** | PASS |
+| fault signatures (SIGSEGV / WILD-DA / DA-MISS / PANIC / `ppid=0`) | **0** | 0 |
+| children with partial/garbled output | **0** | 0 |
+| boots clean | 3 / 3 | 3 / 3 |
+| sshd session teardowns (pre-existing, not faults) | 43 | 33 |
+| rounds lost to sshd exhaustion | 0 | 4 (boot 1, rounds 7–10) |
+
+Every connection that completed returned **all 8** child markers — i.e. each
+forked child executed correctly and its CoW-shared text/data/stack pages
+resolved, which is the data-integrity bar rather than "exited 0".
+
+**NOT run: the SMP=4 fork-hammer and the `bkl-profile` A/B.** Both drive the
+workload over SSH, and SSH into the VM wedges at SMP=4 — *independently of this
+carve-out*. Measured, same boot recipe, single connection:
+
+| | `no-bkl-process` | baseline (BKL-held fork) |
+|---|---|---|
+| SSH connect at SMP=4 | times out (75 s) | times out (75 s) |
+| `[BKL] stuck` during the attempt | 1842 | 1848 |
+| PANIC / WILD | 0 / 0 | 0 / 0 |
+| the same connect at SMP=2 | succeeds, `fork_ok_1` + `OK` | — |
+
+So it is a pre-existing SMP=4 SSH wedge, present with fork fully BKL-held, and
+the carve-out neither causes nor worsens it (marginally fewer stuck events). It
+blocks the two remaining verification steps until it is root-caused separately.
+Note the listener involved is the **in-kernel** SSH server (banner
+`SSH-2.0-Akuma_0.1`), not the userspace `/bin/sshd`
+(`SSH-2.0-Akuma_0.1_User`) — on a `devbox-smoltcp` boot the in-kernel server has
+bound guest :22 long before herd's 10 s `start_delay_ms` elapses, even though
+the `userspace-sshd` feature is documented as compiling it out. That mismatch is
+its own pre-existing issue.
+
+**Harness fixes made along the way** (`scripts/validate_fork_smp.py`), all
+pre-existing bugs that made the harness unable to validate anything:
+
+1. **Wrong port.** It polled `2323 + 100*INSTANCE` (the *tel* forward, guest :23)
+   believing the devbox sshd binds :23. It binds :22 (`/bin/sshd --port 22`), so
+   the harness waited 120 s on a port that was never open. Now `2222 + 100*INSTANCE`.
+2. **Disk/memory env ignored.** It exported `DEVBOX_DISK`/`DEVBOX_MEMORY`, which
+   are `run-smoltcp.sh`'s variable names — `cargo_runner.sh` reads `DISK`/`MEMORY`.
+   Every "devbox at 4 GB" run in its history actually booted `disk.img` at the
+   256 M default. Now `DISK`/`MEMORY`, both overridable.
+3. **False-positive fault detection.** `src/tests.rs` prints a bun-install
+   memory-requirements banner containing the literal line
+   `[Fault] Process N (name) SIGSEGV after Xs`. The harness matched "SIGSEGV" and
+   declared a crash on every boot before the hammer even started — which is
+   exactly what the stale `fork_hammer_result.txt` in the tree recorded. Now
+   filtered by `FAULT_FALSE_POSITIVES`.
+4. **`FEATURES` is now overridable**, so the same harness can validate a carve-out
+   build instead of only the default feature set.
+5. **Data-integrity check added** (`verify_round`): children must produce correct
+   output, not merely exit 0. It distinguishes *partial* output (real corruption:
+   some pages resolved, some didn't) from *zero* output with the trailing `OK`
+   present (the documented sshd session teardown under 8 concurrent connections —
+   measured strictly all-or-nothing, and at the same rate BKL-held as BKL-free).
+
+### 9.9 Feature wiring
+
+`no-bkl-process` is **not** in the `smp-shared` feature set, unlike
+`no-bkl-network`/`no-bkl-vfs`. Fork/CoW is the code path the SMP=4 corruption bug
+lived in, so it stays opt-in until it has comparable soak:
+
+```
+cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests,no-bkl-process
+```
+
+Unlike the other two carve-outs, the cfg has to reach `akuma-exec` (the guard is
+constructed inside `fork_process`, not in a bin-crate syscall wrapper), so
+`crates/akuma-exec/build.rs` emits `kernel_no_bkl_process` too. The runtime
+toggle's atomic lives in `akuma-exec` for the same reason;
+`src/smp_shared.rs` re-exports the accessors so all BKL toggles stay reachable
+from one module.

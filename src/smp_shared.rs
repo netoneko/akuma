@@ -119,6 +119,29 @@ pub fn set_vfs_bkl_drop_enabled(on: bool) {
     VFS_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
 }
 
+/// Runtime toggle (default **on**) for `no-bkl-process` (Phase 3 of
+/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md) — drop the BKL for `fork_process`'s
+/// CoW share/demote pass, relying on the address space's own `as_lock` (the same lock
+/// the CoW fault handler takes BKL-free) held in bounded chunks around every
+/// parent-page-table access, plus the existing `COW_REFCOUNTS` / PMM / allocator
+/// spinlocks. `ProcessBklGuard` latches this at construction so an ON→OFF flip
+/// mid-fork cannot unbalance the ticket FIFO.
+///
+/// Unlike the toggles above, the atomic itself lives in `akuma_exec::process::bkl_guard`
+/// — the guard is constructed inside `fork_process`, which cannot name bin-crate items.
+/// These are thin re-exports so every BKL toggle stays reachable from one module.
+#[inline]
+pub fn process_bkl_drop_enabled() -> bool {
+    akuma_exec::process::process_bkl_drop_enabled()
+}
+
+/// Enable/disable the fork page-copy BKL-drop at runtime. Used by the boot self-test
+/// `test_fork_bkl_drop` for its A/B phase; also the kill switch and the handle for an
+/// interactive same-binary A/B under `bkl-profile`.
+pub fn set_process_bkl_drop_enabled(on: bool) {
+    akuma_exec::process::set_process_bkl_drop_enabled(on);
+}
+
 /// Runtime toggle (default **off**) for the M5c optimization: run the scheduler SGI
 /// BKL-free when it preempted EL0 (userspace, no BKL held), so peer cores' timer ticks
 /// don't serialize on the BKL. Correct at SMP=2. Left **off** because at SMP≥4 it opens a

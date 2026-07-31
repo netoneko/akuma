@@ -88,6 +88,28 @@ re-add what they need. `Cargo.toml:208-216`.
 | `smp` | Multikernel / one-kernel-per-core. Emits `cfg(kernel_smp)` via build.rs. Paired with `release-smp`. | `Cargo.toml:138` |
 | `no-tests` | Drops boot self-test suites; sets `akuma-net/small-sockets`. | `Cargo.toml:128` |
 
+### SMP / Big Kernel Lock
+
+`smp` (multikernel) and `smp-shared` (real shared-kernel SMP) are the two SMP
+models and are **mutually exclusive** — build.rs asserts. The `no-bkl-*` features
+are carve-outs from the Big Kernel Lock and are only meaningful together with
+`smp-shared`; each is a byte-for-byte no-op on any build that doesn't set both.
+See [`locking.md`](locking.md) for the carve-out playbook and the syscall→lock map.
+
+| Feature | cfg emitted | In `smp-shared` by default? | Effect |
+|---|---|---|---|
+| `smp-shared` | `kernel_smp_shared` | — | One kernel across all cores; activates the BKL. Paired with `release-smp-shared`. |
+| `no-bkl-network` | `kernel_no_bkl_network` | **yes** (since 2026-07-24) | smoltcp net syscalls + socket `read`/`write` run BKL-free on `SOCKET_TABLE`/`NETWORK`. |
+| `no-bkl-vfs` | `kernel_no_bkl_vfs` | **yes** (since 2026-07-25) | fs syscalls run BKL-free on the ext2/block-cache/fd-table spinlocks. |
+| `no-bkl-process` | `kernel_no_bkl_process` | **no — opt-in** | `fork_process`'s CoW page-copy window runs BKL-free on the address space's `as_lock`, held in 64-page IRQ-masked chunks. Opt-in because fork/CoW is where the SMP=4 corruption bug lived; needs comparable soak first. Also emitted by `crates/akuma-exec/build.rs` (the only carve-out whose guard is constructed outside the bin crate). |
+| `bkl-profile` | `kernel_bkl_profile` | **no — measurement only** | Per-tag BKL-hold profiler + periodic `[BKLPROF]` histogram. Perturbs timing; never ship it. |
+
+Each carve-out also has a **runtime** toggle (default on) for same-binary A/B and
+as a kill switch — `vfs_bkl_drop_enabled()`, `exec_bkl_drop_enabled()`,
+`fault_bkl_drop_enabled()`, `process_bkl_drop_enabled()`, all reachable from
+`src/smp_shared.rs`. Guards latch the toggle at construction and must never
+re-read it in `drop()` (that unbalances the BKL ticket FIFO).
+
 ## Env vars (runtime — read by `scripts/cargo_runner.sh`)
 
 ### Memory / disk / instance

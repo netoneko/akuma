@@ -740,36 +740,63 @@ path — its PSTATS shows `read=`/`write=`, not recvfrom) now take `NetBklGuard`
 too; both use kernel bounce buffers so no user-memory fault can occur inside the
 socket locks.
 
-### Phase 3 - Process Management Locks
-### Phase 3 - Process Management Locks — AUDITED, NOT CARVABLE WITHOUT PREREQUISITES
+### Phase 3 - Process Management Locks — PARTIALLY SHIPPED (2026-07-31)
 
-See **[BKL_PROCESS_CARVE_OUT.md](BKL_PROCESS_CARVE_OUT.md)** for the full audit (2026-07-31).
+See **[BKL_PROCESS_CARVE_OUT.md](BKL_PROCESS_CARVE_OUT.md)**: §§1–8 are the audit
+(2026-07-31, morning), §9 is the carve-out that landed the same day.
 
-Headline: the §16.3 attribution's top unconverted holder (`clone` 22.5%) was
-audited step-by-step against the VFS carve-out playbook. **No carve-out was
-implemented.** Every step of `fork_process` that consumes significant BKL-held
-time touches state with **no inner lock** (`THREAD_CONTEXTS` `UnsafeCell`, the
-process table's `&'static mut Process`, the parent's live page tables during CoW
-demote). Unlike VFS (where every piece of state already had a fine-grained lock),
-process-management state relies on the BKL itself as the cross-core lock, plus
-the `LifecycleGuard` (re-enabled `disable_preemption`) as the preemption shield.
-Both are load-bearing; neither is redundant.
+Headline, in two parts.
 
-The `LifecycleGuard` sketch below (step 4) **was built and is active**
-(`crates/akuma-exec/src/process/lifecycle.rs`), but it does not make the BKL
-redundant — it complements it. The process-table lock sketch (step 1) was
-**never built** and is the actual prerequisite for any BKL carve-out here: it
-would need to replace the 218+ `with_irqs_disabled`-only `lookup_process`/
-`current_process` sites with real cross-core synchronization. Until that or the
-fork-corruption bug is fixed, the `clone`/`fork_process`/`execve` BKL-held time
-is structural.
+**The audit said no carve-out was possible.** The §16.3 attribution's top
+unconverted holder (`clone` 22.5%) was walked step-by-step against the VFS
+playbook, and every step consuming significant BKL-held time appeared to touch
+state with no inner lock (`THREAD_CONTEXTS` `UnsafeCell`, the process table's
+`&'static mut Process`, the parent's live page tables during CoW demote).
+
+**One of those three was wrong.** The parent's page tables *do* have an inner
+lock — `Process::as_lock` — and the CoW fault handler was already editing the
+same PTEs BKL-free under it (eleven `AsLockHold::new(&owner.as_lock)` sites in
+`src/exceptions.rs`, inside the `fault_bkl_drop_enabled()` window). `fork_process`
+was simply the one page-table mutator in the kernel that never took it. Once it
+does, step 4 fits the playbook's model exactly: the BKL is redundant because the
+state already carries a finer lock. That is `no-bkl-process`.
+
+The audit's other two findings stand: `THREAD_CONTEXTS` and the process table
+have no inner lock, so steps 5–8 (context capture, thread spawn,
+`register_process` + `mark_thread_ready`) are **still fully BKL-held**, as is
+`replace_image`'s destructive window. The carve-out is step 4 only.
+
+**The process-table lock sketch below (step 1) was NOT needed and was NOT
+built.** The page-copy window never touches the process table: the child is
+private stack-local state, the parent fields it reads are immutable during a
+syscall, and the one table walk it did contain (the `for_each_process` sibling
+mmap scan) was hoisted to before the window. Building a `PROCESS_TABLE_LOCK`
+held across a milliseconds-long copy would have been the "new coarse lock"
+anti-pattern; refactoring 218+ `lookup_process` sites onto `with_process(pid, f)`
+remains worth doing on its own merits but is a separate task, not a prerequisite
+for this. Same outcome as Phases 2 and 4: the sketched lock hierarchy turned out
+to be unnecessary, and the work was a BKL-drop guard plus inner-lock discipline.
+
+The `LifecycleGuard` sketch (step 4 below) **was built and is active**
+(`crates/akuma-exec/src/process/lifecycle.rs`); it complements the BKL rather
+than replacing it, and it is what lets the carve-out's chunked `as_lock` holds
+not worry about being preempted mid-copy.
 
 - [x] Lifecycle guards implemented (active `disable_preemption`, not a no-op)
-- [ ] Process table locking designed — **prerequisite for any carve-out**
-- [ ] `lookup_process()` refactored — **prerequisite (218+ sites)**
+- [x] ~~Process table locking designed~~ — **unnecessary for this carve-out** (see above)
+- [x] ~~`lookup_process()` refactored (218+ sites)~~ — **not a prerequisite**; still
+      worth doing independently
 - [ ] Scheduler updated
 - [x] fork-corruption bug FIXED and VALIDATED (2026-07-31: SMP=4 fork-hammer, 3 boots × 10 rounds, 0 faults)
-- [ ] Tests passing
+- [x] `no-bkl-process` feature + `cfg(kernel_no_bkl_process)` + runtime A/B toggle
+- [x] `fork_process` CoW share/demote pass converted: chunked leader-`as_lock` holds
+      (`FORK_AS_CHUNK_PAGES = 64`, IRQ-masked), demote merged into the share pass so
+      PTE-read + `cow_ref_inc` + demote + range-flush are atomic per page against a
+      peer's CoW fault
+- [x] Boot self-test `test_fork_bkl_drop` (ledger balance + latching + real
+      share/demote across chunk boundaries, both toggle positions) passing at SMP=2
+- [x] Incidental: `FORK_IN_PROGRESS` no longer leaks on the OOM early-return (RAII)
+- [ ] Not carved: steps 5–8, `replace_image`, the eager-copy (unreachable) fork branch
 
 ### Phase 4 - VFS and Filesystem Locks — PARTIALLY SHIPPED (2026-07-25)
 

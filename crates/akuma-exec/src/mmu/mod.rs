@@ -1654,10 +1654,30 @@ pub fn collect_mapped_pages_with_flags(
     pages: usize,
 ) -> alloc::vec::Vec<(usize, usize, u64)> {
     let mut result = alloc::vec::Vec::new();
-    if pages == 0 { return result; }
+    collect_mapped_pages_with_flags_into(l0_ptr, va_start, pages, &mut result);
+    result
+}
+
+/// [`collect_mapped_pages_with_flags`] into a caller-owned buffer, so the walk itself
+/// performs **no heap allocation** when `out` was pre-reserved to hold `pages` entries.
+///
+/// `out` is cleared first (its capacity is retained). This variant exists for the
+/// `no-bkl-process` fork carve-out, whose per-chunk PTE snapshot runs inside an
+/// IRQ-masked `as_lock` hold: a `Vec` growing under that hold would allocate — and the
+/// hold's whole purpose is to be short, bounded, and allocation-free. Reserve once
+/// outside the hold, reuse the buffer per chunk.
+pub fn collect_mapped_pages_with_flags_into(
+    l0_ptr: *const u64,
+    va_start: usize,
+    pages: usize,
+    out: &mut alloc::vec::Vec<(usize, usize, u64)>,
+) {
+    let result = out;
+    result.clear();
+    if pages == 0 { return; }
     let va_end = match va_start.checked_add(pages.saturating_mul(PAGE_SIZE)) {
         Some(e) => e,
-        None => return result,
+        None => return,
     };
     let mut va = va_start;
     while va < va_end {
@@ -1707,7 +1727,6 @@ pub fn collect_mapped_pages_with_flags(
             va = l2_range_end;
         }
     }
-    result
 }
 
 /// Demote all RW L3 PTEs in [va_start, va_start + pages*PAGE_SIZE) to RO.
