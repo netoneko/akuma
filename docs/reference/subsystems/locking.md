@@ -274,9 +274,8 @@ ledger primitive, no `VfsBklGuard`/`NetBklGuard` struct):
 
 ### `no-bkl-process` — `crates/akuma-exec/src/process/mod.rs`
 
-Phase 3, landed 2026-07-31, **opt-in** (not in the `smp-shared` feature set, unlike
-the other two — fork/CoW is where the SMP=4 corruption bug lived, so it stays
-behind an explicit `--features …,no-bkl-process` until it has comparable soak).
+Phase 3, landed 2026-07-31 and **on by default in `smp-shared`** since the same
+day, like the other two.
 
 Contention-confirmed by a same-source `bkl-profile` A/B at SMP=4 on the standing
 regimen: **`clone` 19.5% → 2.5%** of workload-window contended time (23.9M → 2.8M

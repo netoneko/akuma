@@ -164,7 +164,13 @@ smp = ["dep:akuma-smp"]
 # Includes `no-bkl-vfs` (BKL-free VFS syscalls) since 2026-07-25 — same pattern
 # as net: every piece of VFS state already carries its own spinlock, so the BKL
 # is redundant for fs syscalls. Remove from this list to A/B.
-smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared", "no-bkl-network", "no-bkl-vfs"]
+# Includes `no-bkl-process` (BKL-free fork page-copy) since 2026-07-31: the CoW
+# fault handler already edited the parent's PTEs BKL-free under the address
+# space's `as_lock`, so the BKL was redundant for fork's copy too. Validated at
+# SMP=4 (3 boots × 10 rounds fork-hammer: 0 faults, 0 partial child output, 0
+# `[BKL] stuck`) and contention-confirmed by a same-source `bkl-profile` A/B
+# (`clone` 19.5% → 2.5%, 8.6× fewer spins). Remove from this list to A/B.
+smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process"]
 
 # Run the native (smoltcp) network syscalls WITHOUT the Big Kernel Lock — the
 # first subsystem carved out of the BKL (docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
@@ -204,10 +210,12 @@ no-bkl-vfs = ["akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs", "akuma-net/no-bk
 # capture, thread spawn, register+READY) stay fully BKL-held: they touch state with no
 # inner lock, where the BKL IS the lock.
 #
-# NOT included in `smp-shared`, unlike no-bkl-network/no-bkl-vfs: fork/CoW is the code
-# path the SMP=4 corruption bug lived in, so this stays opt-in until it has comparable
-# soak. Enable explicitly:
-#   cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests,no-bkl-process
+# Included in `smp-shared` since 2026-07-31 (same as net and vfs). To A/B against the
+# BKL-held fork path, drop it from the `smp-shared` list above and rebuild — and note
+# that alternating feature sets is exactly the workflow the stale-`.bin` bug in
+# scripts/cargo_runner.sh used to corrupt (fixed 2026-07-31; see
+# docs/archive/BKL_PROCESS_CARVE_OUT.md §9.8). There is also a runtime kill switch,
+# `smp_shared::set_process_bkl_drop_enabled(false)`, which needs no rebuild.
 # A no-op (byte-for-byte unchanged) on every build that doesn't set both features.
 no-bkl-process = ["akuma-exec/no-bkl-process"]
 

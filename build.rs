@@ -69,11 +69,11 @@ fn main() {
     // mirroring `kernel_no_bkl_network` / `kernel_no_bkl_vfs`. `cfg(kernel_no_bkl_process)`
     // makes `fork_process` drop the BKL for its CoW share/demote pass, relying on the
     // address space's own `as_lock` (the same lock the CoW fault handler already takes
-    // BKL-free) plus `COW_REFCOUNTS`. Only meaningful under shared-kernel SMP. NOT
-    // included in the `smp-shared` feature set — unlike net/vfs it is opt-in until it
-    // has the same soak behind it. Emitted independently of `smp_shared` so the guard
-    // body (gated on `all(kernel_smp_shared, kernel_no_bkl_process)`) can compile-check
-    // in either combination.
+    // BKL-free) plus `COW_REFCOUNTS`. Only meaningful under shared-kernel SMP, and
+    // included in the `smp-shared` feature set since 2026-07-31 (same as net and vfs).
+    // Emitted independently of `smp_shared` so the guard body (gated on
+    // `all(kernel_smp_shared, kernel_no_bkl_process)`) can compile-check in either
+    // combination.
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_PROCESS");
     if std::env::var("CARGO_FEATURE_NO_BKL_PROCESS").is_ok() {
         println!("cargo:rustc-cfg=kernel_no_bkl_process");

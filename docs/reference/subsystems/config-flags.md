@@ -101,7 +101,7 @@ See [`locking.md`](locking.md) for the carve-out playbook and the syscall→lock
 | `smp-shared` | `kernel_smp_shared` | — | One kernel across all cores; activates the BKL. Paired with `release-smp-shared`. |
 | `no-bkl-network` | `kernel_no_bkl_network` | **yes** (since 2026-07-24) | smoltcp net syscalls + socket `read`/`write` run BKL-free on `SOCKET_TABLE`/`NETWORK`. |
 | `no-bkl-vfs` | `kernel_no_bkl_vfs` | **yes** (since 2026-07-25) | fs syscalls run BKL-free on the ext2/block-cache/fd-table spinlocks. |
-| `no-bkl-process` | `kernel_no_bkl_process` | **no — opt-in** | `fork_process`'s CoW page-copy window runs BKL-free on the address space's `as_lock`, held in 64-page IRQ-masked chunks. Opt-in because fork/CoW is where the SMP=4 corruption bug lived; needs comparable soak first. Also emitted by `crates/akuma-exec/build.rs` (the only carve-out whose guard is constructed outside the bin crate). |
+| `no-bkl-process` | `kernel_no_bkl_process` | **yes** (since 2026-07-31) | `fork_process`'s CoW page-copy window runs BKL-free on the address space's `as_lock`, held in 64-page IRQ-masked chunks. Also emitted by `crates/akuma-exec/build.rs` (the only carve-out whose guard is constructed outside the bin crate). |
 | `bkl-profile` | `kernel_bkl_profile` | **no — measurement only** | Per-tag BKL-hold profiler + periodic `[BKLPROF]` histogram. Perturbs timing; never ship it. |
 
 Each carve-out also has a **runtime** toggle (default on) for same-binary A/B and

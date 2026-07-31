@@ -715,13 +715,11 @@ the harness it cites** and should be re-derived before being relied on.
 
 ### 9.9 Feature wiring
 
-`no-bkl-process` is **not** in the `smp-shared` feature set, unlike
-`no-bkl-network`/`no-bkl-vfs`. Fork/CoW is the code path the SMP=4 corruption bug
-lived in, so it stays opt-in until it has comparable soak:
-
-```
-cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests,no-bkl-process
-```
+`no-bkl-process` is **in the `smp-shared` feature set** since 2026-07-31, same as
+`no-bkl-network`/`no-bkl-vfs` — promoted once the SMP=4 fork-hammer and the
+contention A/B above both came back clean. To A/B against the BKL-held path,
+drop it from the `smp-shared` list in `Cargo.toml`, or flip the runtime kill
+switch `smp_shared::set_process_bkl_drop_enabled(false)` (no rebuild).
 
 Unlike the other two carve-outs, the cfg has to reach `akuma-exec` (the guard is
 constructed inside `fork_process`, not in a bin-crate syscall wrapper), so

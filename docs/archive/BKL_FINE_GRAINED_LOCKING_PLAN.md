@@ -801,6 +801,7 @@ not worry about being preempted mid-copy.
       (23.9M → 2.8M spins, 8.6×; #2 holder → minor), total workload spins −9%,
       6/6 digests exact both sides
 - [x] Incidental: `FORK_IN_PROGRESS` no longer leaks on the OOM early-return (RAII)
+- [x] Promoted to DEFAULT-ON for `smp-shared` (2026-07-31), same as net and vfs
 - [ ] Not carved: steps 5–8, `replace_image`, the eager-copy (unreachable) fork branch
 
 ### Phase 4 - VFS and Filesystem Locks — PARTIALLY SHIPPED (2026-07-25)
