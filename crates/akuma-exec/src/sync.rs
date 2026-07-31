@@ -181,7 +181,26 @@ pub const HOLD_TAG_IRQ: u64 = 501;
 pub const HOLD_TAG_IDLE: u64 = 502;
 /// The async-main smoltcp poll loop holding the BKL across a drain. Same reasoning as
 /// [`HOLD_TAG_IDLE`]: it is a long-lived kernel thread with no tagged entry point.
+///
+/// Generic/fallback member of the `netpoll` family — used only for the sliver of the
+/// loop body not covered by the more specific `HOLD_TAG_NETPOLL_*` sub-tags below (the
+/// gap between re-acquiring the BKL post-WFI and the top-of-loop tag call). See
+/// docs/archive/BKL_VFS_CARVE_OUT.md §19 for why the family was split.
 pub const HOLD_TAG_NETPOLL: u64 = 503;
+/// Async-main loop, top-of-iteration housekeeping: heartbeat/pstats logging,
+/// `reclaim_terminated_slots`, and (measurement builds) `bkl_profile::maybe_dump`.
+/// Runs every iteration before the smoltcp drain begins.
+pub const HOLD_TAG_NETPOLL_MAINT: u64 = 504;
+/// Async-main loop, the `while smoltcp_net::poll() {}` burst-drain itself — the part of
+/// the iteration [`HOLD_TAG_NETPOLL`]'s doc calls "the drain" and §18.4 flagged as the
+/// plausible bulk of the 59.7% figure.
+pub const HOLD_TAG_NETPOLL_DRAIN: u64 = 505;
+/// Async-main loop, the memory-monitor future's poll. Zero-cost when
+/// `config::MEM_MONITOR_ENABLED` is false (the default): the poll call itself is
+/// skipped, so this tag is never installed on that build.
+pub const HOLD_TAG_NETPOLL_MEMMON: u64 = 506;
+/// Async-main loop, herd supervisor output/exit-code polling.
+pub const HOLD_TAG_NETPOLL_HERD: u64 = 507;
 /// No attribution available: the holder is a thread that has never passed a tagging site.
 /// With thread-scoped attribution this is a real answer ("an untagged in-kernel thread"),
 /// not the "profiler is off" placeholder it also serves as.

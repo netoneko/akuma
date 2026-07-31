@@ -19,13 +19,14 @@
 
 use akuma_exec::sync::{
     contention_spins, set_profiling, wait_by_holder, HOLD_TAG_FAULT, HOLD_TAG_IDLE,
-    HOLD_TAG_IRQ, HOLD_TAG_NETPOLL, HOLD_TAG_UNKNOWN,
+    HOLD_TAG_IRQ, HOLD_TAG_NETPOLL, HOLD_TAG_NETPOLL_DRAIN, HOLD_TAG_NETPOLL_HERD,
+    HOLD_TAG_NETPOLL_MAINT, HOLD_TAG_NETPOLL_MEMMON, HOLD_TAG_UNKNOWN,
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Tag-bucket count in `akuma_exec::sync` (0..=499 syscall nrs, 500 fault, 501 IRQ,
-/// 502 idle, 503 netpoll, 511 unknown). Kept in sync by the `buckets` assertion in the
-/// boot self-test.
+/// 502 idle, 503 netpoll, 504-507 netpoll sub-phases, 511 unknown). Kept in sync by the
+/// `buckets` assertion in the boot self-test.
 const BUCKETS: usize = 512;
 
 /// How often to print a window. Short enough that a single workload step (one bulk
@@ -60,6 +61,10 @@ fn tag_label(tag: usize, buf: &mut [u8; 16]) -> &str {
         HOLD_TAG_IRQ => return "irq/sched",
         HOLD_TAG_IDLE => return "idle",
         HOLD_TAG_NETPOLL => return "netpoll",
+        HOLD_TAG_NETPOLL_MAINT => return "netpoll_maint",
+        HOLD_TAG_NETPOLL_DRAIN => return "netpoll_drain",
+        HOLD_TAG_NETPOLL_MEMMON => return "netpoll_memmon",
+        HOLD_TAG_NETPOLL_HERD => return "netpoll_herd",
         HOLD_TAG_UNKNOWN => return "unknown",
         _ => {}
     }

@@ -1454,6 +1454,17 @@ fn run_async_main() -> ! {
     crate::bkl_profile::init();
 
     loop {
+        // Profiler only: name the top-of-iteration housekeeping (heartbeat/pstats
+        // logging, reclaim_terminated_slots, bkl_profile::maybe_dump) separately from
+        // the smoltcp drain and herd polling below it, so a `netpoll` measurement
+        // decomposes instead of crediting the whole iteration to one bucket
+        // (BKL_VFS_CARVE_OUT.md §19).
+        #[cfg(all(kernel_smp_shared, feature = "smoltcp"))]
+        akuma_exec::sync::set_holder_tag(
+            akuma_exec::bkl::current_core_id(),
+            akuma_exec::sync::HOLD_TAG_NETPOLL_MAINT,
+        );
+
         // Periodic heartbeat
         let count = LOOP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let now_us = timer::uptime_us();
@@ -1516,6 +1527,13 @@ fn run_async_main() -> ! {
         // driven by rump_server + the per-box sysproxy path instead.
         #[cfg(feature = "smoltcp")]
         {
+            // Profiler only: isolate the burst-drain itself from the maintenance work
+            // above it (BKL_VFS_CARVE_OUT.md §19 sub-tag split).
+            #[cfg(kernel_smp_shared)]
+            akuma_exec::sync::set_holder_tag(
+                akuma_exec::bkl::current_core_id(),
+                akuma_exec::sync::HOLD_TAG_NETPOLL_DRAIN,
+            );
             let mut polls = 0u32;
             while akuma_net::smoltcp_net::poll() {
                 polls += 1;
@@ -1527,10 +1545,24 @@ fn run_async_main() -> ! {
 
         GLOBAL_POLL_STEP.store(2, Ordering::Relaxed);
         if config::MEM_MONITOR_ENABLED {
+            // Profiler only: attribute the (normally disabled) mem-monitor poll
+            // separately from the drain (BKL_VFS_CARVE_OUT.md §19).
+            #[cfg(all(kernel_smp_shared, feature = "smoltcp"))]
+            akuma_exec::sync::set_holder_tag(
+                akuma_exec::bkl::current_core_id(),
+                akuma_exec::sync::HOLD_TAG_NETPOLL_MEMMON,
+            );
             let _ = mem_monitor_pinned.as_mut().poll(&mut cx);
         }
-        
+
         GLOBAL_POLL_STEP.store(3, Ordering::Relaxed);
+        // Profiler only: isolate herd output/heartbeat polling from the drain above it
+        // (BKL_VFS_CARVE_OUT.md §19 sub-tag split).
+        #[cfg(all(kernel_smp_shared, feature = "smoltcp"))]
+        akuma_exec::sync::set_holder_tag(
+            akuma_exec::bkl::current_core_id(),
+            akuma_exec::sync::HOLD_TAG_NETPOLL_HERD,
+        );
         // Poll herd output
         if let Some(ref channel) = herd_channel {
             if let Some(output) = channel.try_read() {
@@ -1571,9 +1603,10 @@ fn run_async_main() -> ! {
                 core::arch::asm!("wfi", options(nomem, nostack));
             }
             akuma_exec::bkl::enter_kernel();
-            // Profiler only: the network poll thread is a long-lived kernel thread with
-            // no syscall/fault entry point, so name its hold instead of leaving the whole
-            // smoltcp drain attributed "unknown" (BKL_VFS_CARVE_OUT.md §18).
+            // Profiler only: names the sliver between re-acquiring the BKL post-WFI and
+            // the top-of-loop HOLD_TAG_NETPOLL_MAINT call above — negligible, but must
+            // be something other than whatever HOLD_TAG_NETPOLL_HERD left behind
+            // (BKL_VFS_CARVE_OUT.md §18, §19).
             akuma_exec::sync::set_holder_tag(
                 akuma_exec::bkl::current_core_id(),
                 akuma_exec::sync::HOLD_TAG_NETPOLL,

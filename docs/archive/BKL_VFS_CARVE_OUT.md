@@ -1780,3 +1780,204 @@ python3 scripts/bkl_smp_regimen/analyze_workload.py --auto run.log
 Both kernels were hash-verified distinct before booting, and the booted `.bin` was byte-searched
 for a string only the post-fix image contains (`netpoll`) — the §17 stale-`.bin` discipline. This
 A/B differs in *source*, so it is structurally immune to that trap anyway (§17.1).
+
+---
+
+## 19. Decomposing `netpoll` (59.7%): the drain, isolated — and why it's a real carve candidate — 2026-07-31
+
+§18.4 flagged its own biggest caveat before this section closed it: `netpoll` is a
+**thread-granularity** label. `THREAD_TAG` persists on the async-main thread for its whole
+iteration, so the smoltcp burst-drain, the top-of-loop heartbeat/pstats/reclaim housekeeping, and
+the herd output/exit polling were all credited to one bucket. §18.5 called the drain "plausibly"
+the bulk of it, on the strength of one independent, non-circular hint — the `PreemptGuard` doc
+comment's "async-main poller ... spins on `NETWORK` near-constantly" — and explicitly declined to
+act on "plausibly." This section resolves it to a measurement.
+
+### 19.1 Splitting the label
+
+Four sub-tags were added to the `HOLD_TAG_NETPOLL` family in `crates/akuma-exec/src/sync.rs`
+(free buckets, per §18.3's numbering: 500 fault, 501 irq, 502 idle, 503 netpoll, 511 unknown):
+
+| tag | value | covers |
+|---|---|---|
+| `HOLD_TAG_NETPOLL_MAINT` | 504 | top-of-iteration: heartbeat/pstats logging, `reclaim_terminated_slots`, `bkl_profile::maybe_dump` |
+| `HOLD_TAG_NETPOLL_DRAIN` | 505 | the `while smoltcp_net::poll() {}` burst-drain itself |
+| `HOLD_TAG_NETPOLL_MEMMON` | 506 | the (default-disabled) mem-monitor future's poll |
+| `HOLD_TAG_NETPOLL_HERD` | 507 | herd supervisor output/exit-code polling |
+
+`HOLD_TAG_NETPOLL` (503) stays as the family's generic fallback — it now only ever labels the
+sliver between re-acquiring the BKL post-WFI and the next loop-top `MAINT` call, a few
+instructions.
+
+Each sub-tag is installed with **`set_holder_tag`, not `set_core_tag_transient`** — every one of
+these phases genuinely belongs to the async-main thread (unlike the IRQ dispatch stamp, which
+belongs to no thread and must not clobber the interrupted one). Using the transient form here
+would have been the exact mistake §18.2 built the two-table split to prevent, just introduced
+fresh. `src/bkl_profile.rs`'s `tag_label` gained the four matching labels
+(`netpoll_maint`/`netpoll_drain`/`netpoll_memmon`/`netpoll_herd`).
+
+Same discipline as §18: every call site `#[cfg(all(kernel_smp_shared, feature = "smoltcp"))]` (or
+narrower, matching the block it's in), every accessor an early-return no-op unless
+`PROFILE_ENABLED`, zero behavioural change on any build. Verified compiling clean (clippy
+included) on `--release`, `release-smp-shared --features smp-shared`, and `release-smp-shared
+--features devbox-smoltcp,no-tests,bkl-profile`. `crates/akuma-exec`'s host `sync::` suite (27
+tests, including all six `thread_tag_tests`) stays green — the sub-tags reuse `set_holder_tag`
+unchanged, they don't touch its contract.
+
+### 19.2 Result — single instrumented run, SMP=4, 2026-07-31
+
+`SNAPSHOT=1 DISK=devbox.img MEMORY=4096 SMP=4`, `--profile release-smp-shared --features
+devbox-smoltcp,no-tests,bkl-profile`, the unmodified `net4 → read4 → cp2 → rm` regimen, attribution
+restricted to the workload windows via `analyze_workload.py --auto` (§17.2/§18.4's method). This is
+a single boot, not a matched A/B: the question here is "how does an existing bucket split," not
+"did a profiler change perturb the numbers," so §18.4's two-boot discipline doesn't apply — same
+reasoning as why §18's own thread-scoping fix needed a matched pair and this doesn't.
+
+```
+selection: auto: regimen execve T=214..295s -> windows t=220..300s
+windows: 9  (w21 t=220s .. w29 t=300s)
+total contended spins: 138521182   attributed: 138521182
+
+   share  holder            tag  spins
+   59.8%  netpoll_drain     505  77421466
+   23.4%  irq/sched         501  30285803
+    4.5%  execve            221  5881295
+    2.9%  clone             220  3692354
+    2.5%  openat             56  3209854
+    2.4%  mmap              222  3151739
+    1.6%  nanosleep         101  2055512
+    1.1%  netpoll_maint     504  1469708
+    0.9%  ppoll              73  1140984
+    0.3%  writev             66  340382
+    0.2%  netpoll_herd      507  262808
+    0.2%  idle              502  218627
+```
+
+`netpoll` (503, the residual fallback) doesn't place in the top 12 at all — confirming the sliver
+it now covers really is negligible. `irq/sched` reads 23.4%, matching §18.4's matched-pair 23.0%
+closely enough to confirm this run is measuring the same thing the earlier one did.
+
+**The decomposition is not close.** `netpoll_drain` alone is 59.8% — essentially the *entire*
+prior 59.7% `netpoll` figure — while `netpoll_maint` (1.1%) and `netpoll_herd` (0.2%) are both
+noise. §18.5's "plausibly" is now a measurement: the drain isn't part of the story, it *is* the
+story, to within run-to-run variance.
+
+Correctness: 6/6 digests exact (4 net + 2 cp), 0 PANIC/WILD/SPURIOUS/stale-dropped-window, regimen
+completed in 92s wall-clock. 14 `[BKL] stuck` and 73 `RECOVERED` lines appear in the raw log, but
+both are pre-workload boot noise, not workload signal — see §19.4.
+
+### 19.3 Auditing the drain: does it already have its own lock?
+
+Yes. `crates/akuma-net/src/smoltcp_net.rs::poll()` — the function the `while` loop in
+`src/main.rs` calls up to 64 times per iteration — already wraps its entire body in exactly the
+pattern the VFS and net carve-outs rely on:
+
+```rust
+let _pg = PreemptGuard::new();
+let mut guard = NETWORK.lock();
+```
+
+Every piece of state `poll()` touches lives behind that one lock: `net.iface` (the smoltcp
+interface), `net.device` (the `VirtIONetRaw` wrapper — no separate device lock is needed because
+the whole `NetworkState` struct, device included, sits behind the single `NETWORK` spinlock), the
+DHCP handle, and `pending_removal`. The one thing `poll()` touches *outside* that lock —
+`socket::with_table(...)`'s wake-up pass — is deliberately done **after** `guard` drops, per the
+comment already in that function: taking `SOCKET_TABLE` while holding `NETWORK` would AB-BA
+against `socket_can_recv_tcp` et al., which take the reverse order. `SOCKET_TABLE` is itself
+`PreemptGuard`-protected (same table in §1's precedent list). No new lock would be needed to carve
+this — it is *already* the same shape §1 describes for VFS: "every piece of state the [subsystem]
+touches already carries its own fine-grained lock."
+
+There is also no separate device-interrupt path to worry about: `grep` for an IRQ handler
+registration touching net device state outside `poll()` finds none — the only `irq::register_handler`
+call in the tree is the timer (IRQ 27, `src/main.rs:945`). The virtio-net IRQ line has no handler
+of its own; it exists only to make the `wfi` in the main loop return promptly (the comment at the
+WFI call site is explicit about this). All net-device state changes happen synchronously inside
+`poll()`'s `NETWORK`-locked section — there is nothing for a carve-out to race against.
+
+**The AB-BA risk the `PreemptGuard` doc warns about does not apply to this carve, and here is why,
+concretely rather than by assertion.** The doc's warning describes a core running a `no-bkl-*`
+critical section (holding `NETWORK`) that takes a nested IRQ, whose `enter_kernel()` hard-spins for
+the BKL while `NETWORK` is still held — deadlocking against whichever core owns the BKL if *that*
+core is itself spinning to acquire `NETWORK`. Today the async-main poller cannot be the *victim* of
+that shape (it holds the BKL throughout, so its own nested IRQs take the reentrant fast path,
+never spin) — but it is explicitly named as the likely *culprit*, spinning on `NETWORK` while
+holding the BKL, wedging any BKL-free-and-`NETWORK`-holding syscall core that gets interrupted.
+
+If the drain is carved with `NetBklGuard`'s own mechanism (`akuma_exec::bkl::dropped_window_open`/
+`close` around the `while` loop, `#[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]` — the
+exact gate every `src/syscall/net.rs` syscall already uses), the poller stops being a BKL-holding
+`NETWORK`-waiter altogether: it becomes one more `NETWORK` contender running under the identical
+protocol every net syscall already runs under, `PreemptGuard` included. **The load-bearing detail
+is that `PreemptGuard`'s IRQ-masking arm is gated on `no-bkl-network`/`no-bkl-vfs`, not on
+`smp-shared` alone** (`crates/akuma-exec/src/sync.rs`, the `saved_daif` field and `irq_save_mask()`
+call are both `#[cfg(... any(feature = "no-bkl-network", feature = "no-bkl-vfs"))]`). That is what
+makes a `NETWORK`-holder's own nested IRQ a non-event today for every existing BKL-free syscall,
+and it is what would make the drain's carve safe by the same mechanism, *provided the carve is
+gated on `kernel_no_bkl_network` specifically* (not merely `kernel_smp_shared`, which happens to
+imply it today only because `Cargo.toml`'s `smp-shared` feature bundles `no-bkl-network` in —
+`smp-shared = [..., "no-bkl-network", "no-bkl-vfs", "no-bkl-process"]`). Gate on the coincidence
+and a future feature split silently reintroduces the deadlock; gate on the actual dependency (the
+same way `NetBklGuard` already does) and it can't.
+
+### 19.4 Tangential finding: `[BKL] stuck`/`RECOVERED` in this run are pre-workload, not workload
+
+Not investigated further (out of scope — these are the two "standing signals" the task explicitly
+carried forward, not assigned to this session), but worth recording precisely since the numbers are
+easy to misread. All 14 `[BKL] stuck` lines in this run's log carry the same `[TMR] t=93000`
+timestamp, tagged `openat` (56) and Akuma's `SPAWN` (301) — i.e. they cluster in one moment during
+boot/service bringup, at uptime t=93s, well *before* the auto-selected workload window (t=220–300s).
+None involve `netpoll`/`netpoll_drain`. Likewise `RECOVERED` (73 this run, vs. the 31–57/run range
+noted previously) is counted over the whole log by `analyze_workload.py --auto` — its "stability
+inside the workload only" comment is aspirational for the `--auto` path: `region` is bound to the
+*entire* log text there, not sliced to `lo..hi`, so these two counts are whole-boot, not
+workload-window numbers, despite the neighboring print implying otherwise. Manually checking against
+`[TMR]` timestamps (as done here) is currently the only way to tell the two apart. This is a
+pre-existing characteristic of the analysis script, not something this session's change touched;
+flagged for whoever next relies on those two counts.
+
+### 19.5 Recommendation
+
+**Carve, following `NetBklGuard`'s existing shape exactly.** The dominant sub-phase (`netpoll_drain`,
+59.8%, effectively all of the prior `netpoll` figure) already has every piece of state it touches
+behind its own `PreemptGuard`-protected lock (`NETWORK`, transitively `SOCKET_TABLE`), matching the
+VFS precedent's carving condition precisely: nothing new to lock, only a BKL window to stop holding.
+The specific deadlock the `PreemptGuard` doc warns about is closed by gating the carve on
+`kernel_no_bkl_network` (not `kernel_smp_shared`), the same way every existing net syscall already
+is — that is not a new mitigation invented for this carve, it is reusing the one already proven in
+production for `sys_recv`/`sys_send`/`sys_accept`/etc.
+
+The two smaller sub-phases should **not** be carved, on the opposite finding from §1's condition:
+- `netpoll_maint` (1.1%) touches `reclaim_terminated_slots`, `dump_running_process_stats`, and
+  `dump_thread_resume_points` — process/thread-table code in the same family
+  `BKL_PROCESS_CARVE_OUT.md` already audited and left alone (`fork_process`, §9 there) because it
+  relies on the BKL itself for exclusivity, not a fine-grained lock underneath it. Small *and*
+  unsafe to carve without first giving that state its own lock — a materially bigger job than this
+  one, and not evidence-led at 1.1%.
+- `netpoll_herd` (0.2%) touches `ProcessChannel`, which — checked while auditing, not assumed — is
+  already fully self-contained (`Spinlock`-protected buffer/poller set, `AtomicBool`/`AtomicI32`
+  exit state; `crates/akuma-exec/src/process/channel.rs`), so it is *not* unsafe to carve, just not
+  worth it: 0.2% is below the noise floor this campaign has been treating as "done" since §15.
+
+Nothing was carved this session, per scope — this is a recommendation, not a change. If Phase 4
+picks this up, the concrete unit of work is: wrap the `while smoltcp_net::poll() {}` loop in
+`src/main.rs` with `akuma_exec::bkl::dropped_window_open()`/`dropped_window_close()` (or a thin
+`NetBklGuard`-alike reusing that pair, mirroring `src/syscall/net.rs`'s struct), gated
+`#[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]`, and verify with the same three-part
+regimen this campaign has used throughout: boot self-test correctness, a controlled A/B for
+contention (this section's 59.8% is the number that A/B should move), and the 6/6 digest check this
+section already ran once.
+
+### 19.6 Reproducing
+
+Same as §18.7 — the sub-tags are unconditionally present in the tree now, no separate flag needed:
+
+```bash
+./venv/bin/python scripts/bkl_smp_regimen/gen_payload.py /tmp/bklpay
+( cd /tmp/bklpay && python3 -m http.server 8899 --bind 127.0.0.1 & )
+SNAPSHOT=1 DISK=devbox.img MEMORY=4096 SMP=4 cargo run --profile release-smp-shared \
+    --features devbox-smoltcp,no-tests,bkl-profile > run.log
+# once port 2222 answers:
+( cd scripts/bkl_smp_regimen && ../../venv/bin/python -u drive.py 1500 )
+python3 scripts/bkl_smp_regimen/analyze_workload.py --auto run.log
+```
