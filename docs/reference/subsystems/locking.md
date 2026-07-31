@@ -194,7 +194,15 @@ measurement-only and perturbs timing, which is why it's a separate feature
 rather than part of `smp-shared` — never compare absolute spin counts across
 sessions, only shares/ranks within one same-binary run, and prefer the
 `[BKL] stuck` threshold counter (present in every build) as the
-profiler-independent cross-check.
+profiler-independent cross-check. A core's holder tag is also only a
+best-effort label: a timer tick or device IRQ landing mid-excursion briefly
+overwrote it to "irq/sched" pre-2026-07-30 with no restore, so any
+BKL-holding operation that outlived one 10ms tick bled its later contention
+into that bucket — fixed by saving/restoring the tag around the transient IRQ
+dispatch (`BKL_VFS_CARVE_OUT.md` §16.2); the correction moved ~8 points off
+`irq/sched` into `clone`/`execve` on one campaign's regimen. Re-verify this
+class of bug hasn't recurred before trusting a big "irq/sched" share at face
+value.
 
 ```
 cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests,bkl-profile

@@ -212,6 +212,26 @@ pub fn set_holder_tag(core_id: u32, tag: u64) {
     }
 }
 
+/// Read `core_id`'s current holder tag — what it was attributed as doing the last time
+/// `set_holder_tag` ran. Lets a caller that's about to overwrite the tag for a brief
+/// nested excursion (e.g. IRQ dispatch during an in-progress syscall) save it first and
+/// restore it afterward, so peer waiters that start spinning after the nested excursion
+/// still attribute their wait to the excursion that was actually interrupted rather than
+/// to the transient IRQ. Returns `HOLD_TAG_UNKNOWN` (and does no work) while the profiler
+/// is off, matching `set_holder_tag`'s own no-op-when-off behavior.
+#[inline]
+pub fn holder_tag(core_id: u32) -> u64 {
+    if !PROFILE_ENABLED.load(Ordering::Relaxed) {
+        return HOLD_TAG_UNKNOWN;
+    }
+    let c = core_id as usize;
+    if c < PROFILE_MAX_CORES {
+        HOLDER_TAG[c].0.load(Ordering::Relaxed)
+    } else {
+        HOLD_TAG_UNKNOWN
+    }
+}
+
 /// Read a tag bucket's accumulated peer-wait spins (for the profiler dump).
 pub fn wait_by_holder(tag: usize) -> u64 {
     WAIT_BY_HOLDER.get(tag).map_or(0, |a| a.load(Ordering::Relaxed))

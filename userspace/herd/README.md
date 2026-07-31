@@ -16,6 +16,11 @@ for Akuma — deliberately small, config-file driven, and `no_std` (musl libc vi
 - **Related docs:** [`docs/CORE_AWARE_SCHEDULING.md`](docs/CORE_AWARE_SCHEDULING.md)
   (pinning services to multikernel cores) and the kernel's
   `docs/MULTIKERNEL.md`.
+- **Known issue (proposed fix, not implemented):**
+  [`docs/SIGNAL_EXIT_HANDLING.md`](docs/SIGNAL_EXIT_HANDLING.md) — a
+  signal-killed service is misread as a clean `exit 0`, so it restarts without
+  delay or a retry ceiling; and `stop_service`'s `kill` is a no-op that leaves
+  the process running.
 
 ---
 

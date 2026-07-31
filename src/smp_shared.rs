@@ -164,18 +164,20 @@ pub fn set_vfs_bkl_drop_enabled(on: bool) {
 ///    a FIFO ticket lock (`akuma_exec::sync`), which removes the residual.
 ///
 /// The two-part fix above makes this toggle safe against the *cooperative-wait* deadlock it
-/// was created for. **But it is NOT yet safe under load and defaults OFF.** It was briefly
-/// enabled by default (2026-07-20) and reverted the same day: under heavy fork/exec churn at
-/// SMP≥4 the BKL-free EL0-preempt path leaks a ticket in the fair `KernelLock`. It is the only
-/// path that acquires the BKL via `reconcile_for_spsr` WITHOUT a paired `enter_kernel`
-/// (`exceptions.rs`, the `sched_bklfree_el0_enabled()` branch), so a `next_ticket` advance ends
-/// up with no matching `now_serving` advance; once the counters drift the lock hard-deadlocks
-/// with `owner==0` (unowned) and every core spins in the ticket wait. lldb-confirmed
-/// 2026-07-20 (core spinning at `rust_irq_handler_with_sp` on `now_serving != my_ticket`,
-/// `owner==0`); A/B: with the flag ON the mixed fork/exec+meow load wedges within seconds
-/// (thousands of `[BKL] stuck`), with it OFF the identical load runs 13/13 meow turns clean.
-/// The POOL-over-switch foundation (step 1 of M5c) is always active regardless. Turning this
-/// back on needs the ticket-accounting leak in the reconcile path fixed first.
+/// was created for. It was ALSO briefly enabled by default (2026-07-20) and reverted the same
+/// day for a separate bug: under heavy fork/exec churn at SMP≥4 the BKL-free EL0-preempt path
+/// leaked a ticket in the fair `KernelLock` — it is the only path that acquires the BKL via
+/// `reconcile_for_spsr` WITHOUT a paired `enter_kernel` (`exceptions.rs`, the
+/// `sched_bklfree_el0_enabled()` branch), so a `next_ticket` advance had no matching
+/// `now_serving` advance; once the counters drifted the lock hard-deadlocked with `owner==0`
+/// (unowned) and every core spun in the ticket wait. lldb-confirmed 2026-07-20 (core spinning
+/// at `rust_irq_handler_with_sp` on `now_serving != my_ticket`, `owner==0`).
+///
+/// **Fixed 2026-07-24** (commit "more smp fixes"): the reconcile path for this branch now uses
+/// `reconcile_for_spsr_no_ticket` (`akuma_exec::bkl`), a variant that never takes a ticket in
+/// the first place (`KernelLock::acquire_no_ticket`) — so there is nothing for `now_serving` to
+/// fail to match. Default flipped back to ON the same day. The POOL-over-switch foundation
+/// (step 1 of M5c) is always active regardless.
 /// Only affects `cfg(kernel_smp_shared)` builds — the default release build is untouched.
 static SCHED_BKLFREE_EL0_ENABLED: AtomicBool = AtomicBool::new(true);
 
@@ -185,8 +187,8 @@ pub fn sched_bklfree_el0_enabled() -> bool {
     SCHED_BKLFREE_EL0_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Enable/disable the BKL-free EL0-preempt scheduler path (M5c step 2). Default OFF
-/// (leaks a BKL ticket under load — see the static's doc). Opt-in for A/B debugging.
+/// Enable/disable the BKL-free EL0-preempt scheduler path (M5c step 2). Default ON since
+/// 2026-07-24 (the ticket-leak fix above). Kept toggleable for A/B debugging.
 #[allow(dead_code)]
 pub fn set_sched_bklfree_el0_enabled(on: bool) {
     SCHED_BKLFREE_EL0_ENABLED.store(on, Ordering::Relaxed);

@@ -1272,3 +1272,160 @@ alone accounting for two-thirds-plus of all attributed spin (66.3–73.2%, climb
 syscalls convert) — per §7's evidence-led rule, the next attribution run should check whether
 Phase 3 (scheduler/IRQ) now dominates the remaining opportunity enough to redirect effort there
 instead of chasing the rest of 2b/2d's now much smaller shares.
+
+## 16. Fresh Phase 2c baseline + a profiler attribution bug found and fixed — 2026-07-30
+
+§15.5 asked the obvious next question: is `irq/sched` genuinely dominant now, and if so what does
+a first Phase 3 step look like? Re-running the attribution regimen to answer it surfaced a bug in
+the attribution tool itself, which had to be fixed before the question could be answered honestly.
+
+### 16.1 Fresh baseline confirms Phase 2c is fully closed
+
+Same-shape run as §14.4/§15.3 (private disk clone + `INSTANCE=1` ports, isolated from another
+agent's own VM on this host — `devbox.img` was already held open by a concurrent SMP=2 instance),
+`net4+read4+cp2+meta+rm` regimen (§14.1's `meta` phase re-added as the same scratch edit to
+`payload/job.sh`, restored via `git checkout` afterward), SMP=4, `bkl-profile`, current tree
+(`unlinkat`/`renameat`/`renameat2`/`mkdirat`/`fchmodat` all converted):
+
+| signal | result |
+|---|---|
+| regimen wall-clock | 136 s |
+| `[BKL] stuck` | 0 |
+| PANIC / WILD | 0 / 0 |
+| digests (4 net + 2 cp) | 6/6 exact |
+| VFS syscalls in top-12 attribution | **none** |
+
+No VFS syscall this campaign ever converted shows up in the attribution table at all — the Phase
+2c conversions hold under a workload that specifically drives `mkdir`/`mv`/`chmod` concurrently.
+`irq/sched` 66.3%, `clone` 16.5%, `execve` 7.0% round out the top three (raw, pre-fix numbers —
+see §16.3 for the corrected version).
+
+### 16.2 The attribution tool over-credits `irq/sched`: found while sanity-checking the numbers
+
+`irq/sched`'s dominance was suspicious on its own terms: the M5c step-2 scheduler-BKL-free-on-
+EL0-preemption optimization (`sched_bklfree_el0`, `src/smp_shared.rs`) has been shipping
+**default ON since commit 80262af, 2026-07-24** — six days before this campaign's §14/§15 runs —
+so every prior "irq/sched ~66-73%" number already had that optimization applied and still showed
+irq/sched as dominant. That's consistent with a real cost, but the *code* said otherwise once
+read closely.
+
+`src/bkl_profile.rs`'s attribution model: `akuma_exec::sync::set_holder_tag(core, tag)` stamps a
+per-core "what am I doing while I hold the BKL" tag at every kernel-entry site — syscall number
+at syscall entry (`src/exceptions.rs:2257`), `HOLD_TAG_FAULT` at fault entry, `HOLD_TAG_IRQ` at
+IRQ/scheduler-SGI entry (`src/exceptions.rs:1581`, pre-fix). A waiting core samples the *current*
+holder tag once, the first time it notices contention (`KernelLock::acquire`'s `wait_tag`,
+`crates/akuma-exec/src/sync.rs`), and credits every spin of that wait to whatever tag it sampled.
+
+The bug: `rust_irq_handler_with_sp` (`src/exceptions.rs`) stamps `HOLD_TAG_IRQ` **unconditionally**
+whenever a device IRQ or a scheduler SGI that preempted EL1 fires — including a timer tick landing
+mid-syscall, where the BKL stays held and the *same* excursion resumes right after the brief IRQ
+dispatch. Nothing ever restored the interrupted excursion's own tag afterward; the core stayed
+labeled `irq/sched` for the rest of that syscall, no matter how long it ran. Any BKL-holding
+operation that survives one or more 10 ms timer ticks — which under SMP=4 load is exactly the
+long tail (`clone`, `execve`, big ext2 writes) — bleeds its later contention into the `irq/sched`
+bucket. Short, already-carved-out operations (a `VfsBklGuard` window is typically <<10 ms) never
+cross a tick boundary, so they don't get mislabeled — which is also exactly why converted VFS
+syscalls "drop out entirely" rather than shrink gradually (§15.3's own observation): once an
+operation's *remaining* BKL-held portion is short enough to outrun the tick, it stops feeding this
+artifact, not because the underlying cost fully vanished.
+
+This is a genuine analysis of the *profiler's* code path, not conjecture: `set_holder_tag` in
+`crates/akuma-exec/src/sync.rs` has no restore-on-return; `HOLDER_TAG` is a flat per-core array
+with no save/restore stack.
+
+### 16.2.1 The fix
+
+Minimal, profiler-only, zero behavioral risk (gated the same way the rest of `bkl-profile` is —
+a no-op unless the runtime `PROFILE_ENABLED` flag is on, itself gated behind `cfg(kernel_smp_shared)`):
+
+- `crates/akuma-exec/src/sync.rs`: new `holder_tag(core_id) -> u64` reader (mirrors
+  `set_holder_tag`'s off-is-no-op behavior, returning `HOLD_TAG_UNKNOWN` when profiling is off).
+- `src/exceptions.rs` (`rust_irq_handler_with_sp`): save the core's tag before stamping
+  `HOLD_TAG_IRQ` for the dispatch, restore it after — but **only when `new_sp == 0`** (no context
+  switch happened, i.e. the same excursion resumes on this core). If the scheduler picked a
+  *different* thread to run (`new_sp != 0`), the saved tag belongs to the thread being switched
+  away from, not the one about to run — reapplying it would misattribute in the other direction,
+  so that case is left as `HOLD_TAG_IRQ` (honest "just scheduled, not yet re-profiled") rather than
+  guessed at.
+
+Verified compiling clean on `--release` (default, tag calls fully absent), `release-smp-shared`
+with `smp-shared` only (tag calls present, profiler off, no warnings), and `release-smp-shared`
+with `devbox-smoltcp,no-tests,bkl-profile` (the attribution build).
+
+### 16.3 Corrected attribution — same regimen, same tree, only the profiler's tag-restore fixed
+
+Fresh disk clone (the §16.1 clone had 120 leftover `meta`-phase directories and dirty e2fsck
+inodes from that run), same isolated VM setup, identical regimen:
+
+| holder | pre-fix (§16.1) | post-fix | delta |
+|---|---|---|---|
+| `irq/sched` | 66.3% | **58.4%** | **−7.9pp** |
+| `clone` | 16.5% | **22.5%** | **+6.0pp** |
+| `execve` | 7.0% | **8.3%** | +1.3pp |
+| `nanosleep` | 2.8% | 3.1% | ~flat |
+| `read` | 1.2% | 2.0% | ~flat |
+
+`[BKL] stuck` 0, PANIC/WILD 0/0, 6/6 digests exact — the fix changes attribution only, not
+behavior, exactly as intended. The correction moved ~8 points from `irq/sched` into `clone`/
+`execve`, matching the mechanism in §16.2: those are the two syscalls in this workload most
+likely to span a tick boundary. `irq/sched` remains the single largest bucket even corrected
+(58.4%, still bigger than `clone`+`execve` combined at 30.8%) — so Phase 3's premise (§15.5)
+survives the correction, just at a smaller, more trustworthy magnitude. (Also observed, both
+runs: 68–75 `[BKL] RECOVERED (reticket-skipped)` lines — the still-open, self-healing ticket-leak
+family described in `smp-shared.md`'s 2026-07-21 update, not new and not this session's doing;
+7–8 `[WATCHDOG] Preemption disabled for >1.7s at sync.rs:126` warnings during the `meta` phase in
+*both* runs, equally present pre- and post-fix — also pre-existing, not investigated further here,
+out of scope for a profiler-attribution fix.)
+
+### 16.4 Tangential finding: stale doc comments on an already-shipped fix
+
+While tracing `sched_bklfree_el0`'s default (needed to know whether §16.1's baseline already had
+M5c step-2 applied), found that `src/smp_shared.rs`'s doc comment on `SCHED_BKLFREE_EL0_ENABLED`
+and `docs/reference/subsystems/smp-shared.md`'s M5c status row both still described the flag as
+"defaults OFF, not yet safe under load, leaks a ticket" — but the code has read
+`AtomicBool::new(true)` since commit 80262af ("more smp fixes", 2026-07-24), which added
+`reconcile_for_spsr_no_ticket`/`KernelLock::acquire_no_ticket` specifically to fix that leak
+(`crates/akuma-exec/src/bkl.rs`, `crates/akuma-exec/src/sync.rs`) and flipped the default the
+same commit. `docs/runbooks/debug-smp.md` was updated correctly in that commit; the other two
+were not. Fixed both to match the code (git-blame-verified against 80262af before editing) —
+worth flagging since this is exactly the "stability grade" trust the doc header promises being
+briefly violated by a same-day partial doc update.
+
+### 16.5 Next: `clone`/`fork_process` is the concrete Phase 3 candidate — flagged, not started
+
+Per §7's rule, the corrected numbers (§16.3) name the next target directly: `clone` (22.5%) is now
+larger than any VFS syscall this campaign ever measured (`unlinkat`'s peak was 72.6%, but that was
+against a workload where nothing else was converted yet; every other VFS syscall topped out at
+≤5.2%), and unlike `execve` (8.3%, already partially covered — `set_exec_bkl_drop_enabled`,
+default on, drops the BKL around the ELF-read portions of `do_execve` and the dynamic-linker load,
+per `debug-smp.md`), `fork_process` (`crates/akuma-exec/src/process/mod.rs:1487`) has **no BKL-drop
+treatment at all** — grepped for `VfsBklGuard`/`NetBklGuard`/`PreemptGuard`/`BklGuard` in that
+function and its call sites in `src/syscall/proc.rs`; none found. The whole fork body (CoW
+page-table walk/copy, `ProcessInfo` write, context capture, child-thread registration) runs BKL-
+held start to finish.
+
+This is a legitimate "first concrete Phase 3 step" candidate by the same evidence-led rule that
+picked every VFS target so far — but **it is a materially different risk profile than any VFS
+conversion in this doc**, flagged rather than started this session:
+
+- Every VFS carve-out target (§4, §12–§15) touches state with an *already-existing* fine-grained
+  lock one level down (fd table, ext2 superblock/BGD, block cache) — the work was proven to be "a
+  BKL-drop guard plus inner-lock hardening," never a new lock (§ "Headline" in the Background
+  section / `BKL_FINE_GRAINED_LOCKING_PLAN.md`'s Phase 4 progress note). Whether `fork_process`'s
+  state has the same property is unaudited — CoW page-table sharing is live, cross-core-visible
+  state the instant the child thread is marked `READY`, not a self-contained per-fd or per-inode
+  structure.
+- `smp-shared.md`'s "Separate issues surfaced 2026-07-20" section documents an **unresolved**
+  SMP=4 memory-corruption family in exactly this code path: forked children crash with
+  heterogeneous signatures (zeroed GPRs, kernel-address user PC, empty mmap-region lists) during
+  the bringup window, root-caused to fork/exec/exit not being atomic across preemption. A BKL-
+  scoping change to `fork_process` would be edited directly adjacent to that live, open bug — any
+  new symptom during verification would need to be triaged against "did the carve-out cause this"
+  vs. "this is the pre-existing corruption," which the VFS carve-out never had to contend with.
+
+Recommendation: before touching `fork_process`'s locking, first audit which of its steps
+(`FORK-DBG step1`..`step8` in the debug logging) touch state that already has its own lock vs.
+state that's genuinely BKL-dependent for cross-core CoW correctness — the same audit VFS got for
+free (every subsystem already had a lock; process/CoW state might not). That audit, plus reading
+`docs/runbooks/debug-smp-fork-corruption.md` in full first, is the right-sized next task — not a
+guard-and-measure cycle straight off this doc's playbook.
