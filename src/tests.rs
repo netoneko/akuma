@@ -4146,15 +4146,17 @@ fn test_clone_vm_mmap_regions_on_owner() -> bool {
     let child_regions = akuma_exec::process::lookup_process(child_pid)
         .map_or(0, |p| p.mmap_regions.len());
 
-    // Cleanup
-    let _ = akuma_exec::process::unregister_process(child_pid);
-    let mut pp = akuma_exec::process::unregister_process(parent_pid);
-    if let Some(ref mut p) = pp {
+    // Cleanup. Free the manually-injected mmap frames while the process is still
+    // ACTIVE (and thus visible to lookup_process) — unregister_process now retires
+    // rather than returning ownership, see its doc comment, so this must happen
+    // before, not after.
+    if let Some(p) = akuma_exec::process::lookup_process(parent_pid) {
         for reg in p.mmap_regions.drain(..) {
             for f in reg.frames { crate::pmm::free_page(f); }
         }
     }
-    drop(pp);
+    let _ = akuma_exec::process::unregister_process(child_pid);
+    let _ = akuma_exec::process::unregister_process(parent_pid);
     crate::pmm::free_page(info);
 
     let pass = parent_regions == 1 && child_regions == 0;
@@ -4225,15 +4227,17 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
         None
     });
 
-    // Cleanup
-    let _ = akuma_exec::process::unregister_process(worker_pid);
-    let mut op = akuma_exec::process::unregister_process(owner_pid);
-    if let Some(ref mut p) = op {
+    // Cleanup. Free the manually-injected mmap frames while the process is still
+    // ACTIVE (and thus visible to lookup_process) — unregister_process now retires
+    // rather than returning ownership, see its doc comment, so this must happen
+    // before, not after.
+    if let Some(p) = akuma_exec::process::lookup_process(owner_pid) {
         for reg in p.mmap_regions.drain(..) {
             for f in reg.frames { crate::pmm::free_page(f); }
         }
     }
-    drop(op);
+    let _ = akuma_exec::process::unregister_process(worker_pid);
+    let _ = akuma_exec::process::unregister_process(owner_pid);
     crate::pmm::free_page(info);
 
     let pass = found_via_owner == Some((region_base, pages)) && found_via_worker.is_none();

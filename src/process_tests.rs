@@ -558,6 +558,9 @@ pub fn run_all_tests() {
     test_borrow_tracker_disabled_no_serial_flood();
     test_process_table_capacity();
     test_wait4_reaps_zombie();
+    // Phase 7e "Free" half: deferred process-table reclamation
+    test_process_reclaim_respects_cooldown();
+    test_unregister_process_second_call_loses_cas();
 
     // Thread leak and exit_group tests (2026-04-10 fixes)
     test_unregister_process_terminates_thread();
@@ -8975,12 +8978,12 @@ fn test_zombie_process_unregistered_after_return_to_kernel() {
     clear_lazy_regions(sibling_pid);
     let _ = unregister_process(sibling_pid);
 
-    if still_registered && is_exited && sibling_gone && dropped.is_some() && gone_after {
+    if still_registered && is_exited && sibling_gone && dropped && gone_after {
         console::print("[Test] zombie_process_unregistered_after_return_to_kernel PASSED\n");
     } else {
         crate::safe_print!(160,
             "[Test] zombie_process_unregistered_after_return_to_kernel FAILED: reg={} exited={} sib_gone={} dropped={} gone={}\n",
-            still_registered, is_exited, sibling_gone, dropped.is_some(), gone_after);
+            still_registered, is_exited, sibling_gone, dropped, gone_after);
     }
 }
 
@@ -9016,10 +9019,10 @@ fn test_fork_page_count_for_len() {
 fn test_exit_unregisters_process() {
     let fake_pid: u32 = 0xDEAD_BEEF;
     let result = akuma_exec::process::table::unregister_process(fake_pid);
-    if result.is_none() {
+    if !result {
         console::print("[Test] exit_unregisters_process PASSED\n");
     } else {
-        console::print("[Test] exit_unregisters_process FAILED: got Some for non-existent PID\n");
+        console::print("[Test] exit_unregisters_process FAILED: got true for non-existent PID\n");
     }
 }
 
@@ -12307,9 +12310,9 @@ fn test_process_table_register_get_unregister() {
     // lookup_process returns &mut Process via raw pointer (lock-free)
     let name_ok = lookup_process(pid).is_some_and(|p| p.name == "lockfree_test");
 
-    // Unregister returns Box<Process>
-    let removed = unregister_process(pid);
-    let removed_ok = removed.is_some();
+    // Unregister retires the process (see its doc comment for why it no longer
+    // returns/drops the Box synchronously).
+    let removed_ok = unregister_process(pid);
 
     // Table no longer has it
     let gone = lookup_process(pid).is_none();
@@ -12712,7 +12715,7 @@ fn test_wait4_reaps_zombie() {
 
     // Step 3: after reaping, zombie is gone
     let gone_after_reap = lookup_process(child_pid).is_none();
-    let reaped_ok = reaped.is_some();
+    let reaped_ok = reaped;
 
     // Clean up parent
     let _ = unregister_process(parent_pid);
@@ -12724,6 +12727,95 @@ fn test_wait4_reaps_zombie() {
         crate::safe_print!(128,
             "[Test] wait4_reaps_zombie FAILED: zombie={} ch_exit={} gone={} reaped={}\n",
             zombie_in_table, channel_exited, gone_after_reap, reaped_ok);
+    }
+}
+
+/// Phase 7e "Free" half: `unregister_process` now retires a process (RETIRED
+/// slot state) instead of freeing it synchronously, and `reclaim_retired_processes`
+/// is the deferred collector — see `unregister_process`'s doc comment for why: a
+/// peer core can hold a raw `*mut Process` across a BKL-dropped window
+/// (no-bkl-vfs/no-bkl-mm/no-bkl-process), and freeing the memory the instant a
+/// reaping syscall returns would use-after-free it. This pins the two properties
+/// that make the deferred design safe — the direct process-table analog of
+/// `test_thread_slot_reclaim_on_spawn` for THREAD_STATES:
+/// - a RETIRED slot inside its cooldown (`PROCESS_RECLAIM_COOLDOWN_US`, 10ms) is
+///   NOT reclaimed — the memory a peer might still be reading stays live;
+/// - the same slot, sampled again past its cooldown, IS reclaimed without any
+///   extra prompting (no caller-identity gate, unlike the thread-slot collector's
+///   default "only thread 0" gate — see `reclaim_retired_processes`'s docs for why
+///   that gate has no equivalent here).
+fn test_process_reclaim_respects_cooldown() {
+    use akuma_exec::process::table::{register_process, unregister_process,
+        reclaim_retired_processes, reclaim_retired_processes_force, retired_process_count};
+
+    // Baseline: flush anything already pending from earlier tests (which also
+    // leave RETIRED zombies now) so the deltas below are ours alone.
+    let _ = reclaim_retired_processes_force();
+    let before = retired_process_count();
+
+    let pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    register_process(pid, make_test_process(pid));
+
+    let retired = unregister_process(pid);
+    let after_retire = retired_process_count();
+
+    // Sample immediately: PROCESS_RECLAIM_COOLDOWN_US is 10ms, far longer than
+    // this call takes, so a correct implementation must decline to reclaim yet.
+    let reclaimed_hot = reclaim_retired_processes();
+    let after_hot_reclaim = retired_process_count();
+
+    // Burn past the cooldown, then reclaim — this must now collect it.
+    let deadline = crate::timer::uptime_us() + 200_000; // 200ms >> 10ms cooldown
+    while crate::timer::uptime_us() < deadline {
+        akuma_exec::threading::yield_now();
+    }
+    let reclaimed_cold = reclaim_retired_processes();
+    let after_cold_reclaim = retired_process_count();
+
+    let ok = retired
+        && after_retire == before + 1
+        && after_hot_reclaim == after_retire
+        && reclaimed_cold >= 1
+        && after_cold_reclaim < after_hot_reclaim;
+    if ok {
+        console::print("[Test] process_reclaim_respects_cooldown PASSED\n");
+    } else {
+        crate::safe_print!(160,
+            "[Test] process_reclaim_respects_cooldown FAILED: retired={} before={} after_retire={} hot_reclaimed={} after_hot={} cold_reclaimed={} after_cold={}\n",
+            retired, before, after_retire, reclaimed_hot, after_hot_reclaim, reclaimed_cold, after_cold_reclaim);
+    }
+}
+
+/// A racing second `unregister_process(pid)` for the same, already-retired pid
+/// must lose the ACTIVE->RETIRED CAS and return `false` — not find the slot again
+/// (it's no longer ACTIVE) and not double-count it as retired. This is what makes
+/// it safe for a slow waiter and a fast reaper to both call `unregister_process`
+/// on the same pid: exactly one of them performs the thread-termination side
+/// effect and exactly one eventual `reclaim_retired_processes` frees the memory.
+fn test_unregister_process_second_call_loses_cas() {
+    use akuma_exec::process::table::{register_process, unregister_process,
+        reclaim_retired_processes_force, retired_process_count};
+
+    let pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    register_process(pid, make_test_process(pid));
+
+    let before = retired_process_count();
+    let first = unregister_process(pid);
+    let after_first = retired_process_count();
+    let second = unregister_process(pid);
+    let after_second = retired_process_count();
+
+    let ok = first && !second && after_first == before + 1 && after_second == after_first;
+
+    // Clean up regardless of outcome.
+    let _ = reclaim_retired_processes_force();
+
+    if ok {
+        console::print("[Test] unregister_process_second_call_loses_cas PASSED\n");
+    } else {
+        crate::safe_print!(160,
+            "[Test] unregister_process_second_call_loses_cas FAILED: first={} second={} before={} after_first={} after_second={}\n",
+            first, second, before, after_first, after_second);
     }
 }
 

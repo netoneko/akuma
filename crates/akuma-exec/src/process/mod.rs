@@ -238,8 +238,7 @@ fn on_thread_cleanup(tid: usize) {
         });
 
         if remaining_threads == 0 {
-            if let Some(_proc) = table::unregister_process(pid) {
-            }
+            table::unregister_process(pid);
         }
     }
     // No fallback scan needed: spawn_process_with_channel now registers
@@ -934,9 +933,11 @@ pub unsafe fn enter_user_mode(_ctx: &UserContext) -> ! {
 /// and Process::drop() was never called, leaking all physical pages.
 ///
 /// Now, the Process is heap-allocated via Box and owned by PROCESS_TABLE.
-/// When return_to_kernel() calls unregister_process(), the Box is returned
-/// and dropped, calling Process::drop() -> UserAddressSpace::drop() which
-/// frees all physical pages (code, data, stack, heap, page tables).
+/// When return_to_kernel() calls unregister_process(), the process is retired
+/// (see that function's doc comment) and later dropped by
+/// `reclaim_retired_processes` after a cooldown, calling Process::drop() ->
+/// UserAddressSpace::drop() which frees all physical pages (code, data, stack,
+/// heap, page tables).
 #[allow(dead_code)]
 fn execute_boxed(mut process: Box<Process>) -> ! {
     // Prepare the process (set state, write process info page)
@@ -1259,12 +1260,14 @@ pub fn kill_child_processes_for_thread_group(l0_phys: usize) {
 /// Exit code is communicated via ProcessChannel for async callers.
 #[unsafe(no_mangle)]
 pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
+    (runtime().print_str)("[DBG7E] return_to_kernel ENTRY\n");
     // Serialize the entire teardown (channel notify, fd close, AS deactivate,
     // child/box kill, unregister) against concurrent lifecycle ops on peer cores.
     // Released explicitly before the terminal yield loop (this function never
     // returns, so the RAII guard would otherwise hold the lock forever — wedging
     // every future fork/exec/exit on the box). See `process/lifecycle.rs`.
     let lifecycle = LifecycleGuard::acquire();
+    (runtime().print_str)("[DBG7E] return_to_kernel got lifecycle guard\n");
     let lr: u64;
     #[cfg(target_os = "none")]
     unsafe { core::arch::asm!("mov {}, x30", out(reg) lr); }
@@ -1283,16 +1286,20 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     // For kill_thread_group: the process is still registered (only marked
     //   zombie), current_process() succeeds → pid = Some → we can unregister
     //   below, preventing the process from leaking in PROCESS_TABLE.
+    (runtime().print_str)("[DBG7E] before current_process\n");
     let pid = if let Some(proc) = current_process() {
+        (runtime().print_str)("[DBG7E] current_process Some, before cleanup_process_fds\n");
         let pid = proc.pid;
         if !already_terminated {
             cleanup_process_fds(proc);
         }
+        (runtime().print_str)("[DBG7E] after cleanup_process_fds\n");
         Some(pid)
     } else {
+        (runtime().print_str)("[DBG7E] current_process None\n");
         None
     };
-    
+
     // Publish the child exit + raise SIGCHLD BEFORE the thread-channel set_exited
     // below. `publish_child_exit`'s `has_exited` guard means: if a crash path
     // already called `notify_child_channel_exited_pub`, this is a no-op (no
@@ -1391,21 +1398,25 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     }
 
     // Deactivate user address space - restore boot TTBR0
-    // CRITICAL: This must happen BEFORE we drop the Process (via unregister_process)
-    // because Drop frees the page tables. If we drop first, TTBR0 would point to
-    // freed memory causing a crash on any TLB miss.
+    // CRITICAL: This must happen BEFORE we unregister the Process, since TTBR0
+    // must never point at page tables that could be freed out from under it.
     crate::mmu::UserAddressSpace::deactivate();
-    
-    // Now unregister and DROP the process
-    // This calls Process::drop() -> UserAddressSpace::drop() which frees:
+
+    // Now unregister (retire) the process. `unregister_process` no longer drops
+    // it synchronously — see its doc comment — but the ordering constraint above
+    // still holds: retiring makes it eligible for `reclaim_retired_processes` to
+    // free after a cooldown, and TTBR0 must already be off these page tables by
+    // then. When the deferred drop does run, it frees:
     // - All user pages (code, data, stack, heap, mmap)
     // - All page table frames (L0, L1, L2, L3)
     // - The ASID
     // This fixes the memory leak where processes would never free their pages.
     if let Some(pid) = pid {
+        (runtime().print_str)("[DBG7E] before find_primary_box\n");
         // Check if this was a primary process for an active box.
         // If so, the entire box should be shut down.
         let box_to_kill = find_primary_box(pid);
+        (runtime().print_str)("[DBG7E] after find_primary_box\n");
 
         if let Some(bid) = box_to_kill {
             log::debug!("[Process] Primary PID {} exited, shutting down box {:08x}", pid, bid);
@@ -1429,6 +1440,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             Some(p) => (p.address_space.l0_phys(), p.address_space.is_shared()),
             None => (0usize, true),
         };
+        (runtime().print_str)("[DBG7E] before kill_child_processes*\n");
         if l0_phys != 0 {
             if is_shared {
                 kill_child_processes(pid);
@@ -1436,12 +1448,15 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
                 kill_child_processes_for_thread_group(l0_phys);
             }
         }
+        (runtime().print_str)("[DBG7E] after kill_child_processes*\n");
 
         // If this process owns the address space (not shared), kill all
         // sibling CLONE_VM threads BEFORE dropping. Dropping the owner frees
         // all page tables; siblings still using them would cause EL1 faults.
         if !is_shared && l0_phys != 0 {
+            (runtime().print_str)("[DBG7E] before kill_thread_group\n");
             kill_thread_group(pid, l0_phys, exit_code);
+            (runtime().print_str)("[DBG7E] after kill_thread_group\n");
         }
 
         let (start_us, proc_name) = lookup_process(pid)
@@ -1460,8 +1475,11 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         // Read tgid BEFORE unregister (for future signal-based group exit).
         let _tgid = lookup_process(pid).map(|p| p.tgid);
 
+        (runtime().print_str)("[DBG7E] before clear_lazy_regions\n");
         clear_lazy_regions(pid);
-        let _dropped_process = unregister_process(pid);
+        (runtime().print_str)("[DBG7E] before unregister_process\n");
+        unregister_process(pid);
+        (runtime().print_str)("[DBG7E] after unregister_process\n");
         log::debug!("[Process] PID {} thread {} exited ({}) [{}.{:02}s]", pid, tid, exit_code, secs, frac);
 
         // DO NOT kill the thread group leader from a goroutine thread's exit path.
@@ -1603,7 +1621,7 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
         let frac = (elapsed_us % 1_000_000) / 10_000;
 
         clear_lazy_regions(pid);
-        let _dropped_process = unregister_process(pid);
+        unregister_process(pid);
         log::debug!("[Process] PID {} thread {} faulted ({}) [{}.{:02}s]", pid, tid, exit_code, secs, frac);
     } else {
         log::debug!("[Process] Thread {} faulted ({})", tid, exit_code);

@@ -539,6 +539,7 @@ pub(crate) fn build_exec_runtime(
         network_thread_ratio: config::NETWORK_THREAD_RATIO,
         deferred_thread_cleanup: config::DEFERRED_THREAD_CLEANUP,
         thread_cleanup_cooldown_us: config::THREAD_CLEANUP_COOLDOWN_US,
+        process_reclaim_cooldown_us: config::PROCESS_RECLAIM_COOLDOWN_US,
         syscall_debug_info_enabled: config::SYSCALL_DEBUG_INFO_ENABLED,
         fork_brk_serial_progress: config::FORK_BRK_SERIAL_PROGRESS,
         enable_sgi_debug_prints: config::ENABLE_SGI_DEBUG_PRINTS,
@@ -1510,6 +1511,13 @@ fn run_async_main() -> ! {
         if now_us.saturating_sub(last_reclaim) >= RECLAIM_INTERVAL_US {
             LAST_RECLAIM_US.store(now_us, Ordering::Relaxed);
             threading::reclaim_terminated_slots();
+            // Same steady-state-collector reasoning as reclaim_terminated_slots above,
+            // for RETIRED process-table slots (Phase 7e "Free" half): without a caller
+            // that runs under load, not just idle, zombies awaiting their cooldown pile
+            // up and register_process's on-demand retry (table.rs) is the only other
+            // path that collects them. See
+            // docs/archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md.
+            akuma_exec::process::reclaim_retired_processes();
         }
 
         #[cfg(kernel_bkl_profile)]

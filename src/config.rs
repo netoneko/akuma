@@ -590,6 +590,14 @@ pub const DEFERRED_THREAD_CLEANUP: bool = true;
 /// 10ms is enough for context switches to complete while not blocking tests.
 pub const THREAD_CLEANUP_COOLDOWN_US: u64 = 10_000; // 10ms
 
+/// Minimum time (microseconds) a reaped process's memory sits RETIRED before
+/// `process::reclaim_retired_processes` frees it. Must outlast any BKL-dropped
+/// window (no-bkl-vfs/no-bkl-mm/no-bkl-process) that could still hold a raw
+/// pointer to it — see `unregister_process`'s doc comment and
+/// docs/archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md. Same order of magnitude as
+/// THREAD_CLEANUP_COOLDOWN_US since the windows being outlasted are the same kind.
+pub const PROCESS_RECLAIM_COOLDOWN_US: u64 = 10_000; // 10ms
+
 pub const THREADING_HEARTBEAT_INTERVAL: u64 = 50_000_000; // BSP idle heartbeat print cadence (raised to keep serial from throttling the guest)
 
 // ============================================================================

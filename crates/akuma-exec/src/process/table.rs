@@ -1,12 +1,12 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicPtr, Ordering};
 use spinning_top::Spinlock;
 
 use crate::process::Process;
 use crate::process::types::{Pid, LazyRegion};
-use crate::runtime::with_irqs_disabled;
+use crate::runtime::{config, runtime, with_irqs_disabled};
 
 /// Maximum number of concurrent processes.
 pub const MAX_PROCESSES: usize = 256;
@@ -18,28 +18,68 @@ pub static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 pub mod slot_state {
     pub const FREE: u8 = 0;
     pub const ACTIVE: u8 = 1;
+    /// Reaped (`unregister_process`'d) but not yet freed. Invisible to
+    /// `get_process_ptr`/`for_each_process`/`register_process`'s free-slot scan —
+    /// exactly like ACTIVE is invisible to allocation and FREE is invisible to
+    /// lookup. The `Process` and its address space stay live in memory until
+    /// `reclaim_retired_processes` frees them; see that function's docs for why.
+    pub const RETIRED: u8 = 2;
 }
 
-/// Per-slot state: FREE or ACTIVE.
+/// Per-slot state: FREE, ACTIVE, or RETIRED.
 static SLOT_STATES: [AtomicU8; MAX_PROCESSES] = {
     const INIT: AtomicU8 = AtomicU8::new(slot_state::FREE);
     [INIT; MAX_PROCESSES]
 };
 
-/// Per-slot process pointer. Non-null when ACTIVE, null when FREE.
+/// Per-slot process pointer. Non-null when ACTIVE or RETIRED, null when FREE.
 /// Points to a heap-allocated Process (from Box::into_raw).
 static PROCESS_SLOTS: [AtomicPtr<Process>; MAX_PROCESSES] = {
     const INIT: AtomicPtr<Process> = AtomicPtr::new(core::ptr::null_mut());
     [INIT; MAX_PROCESSES]
 };
 
+/// Per-slot retirement timestamp (uptime_us), valid while the slot is RETIRED.
+/// Read by `reclaim_retired_processes` to enforce the cooldown; see its docs.
+static RETIRE_TIME: [AtomicU64; MAX_PROCESSES] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_PROCESSES]
+};
+
 /// Register a process in the table (takes ownership via Box).
 ///
 /// Finds a free slot via CAS, stores the Process pointer.
-/// The Process is kept alive until `unregister_process` reclaims it.
+/// The Process is kept alive until `unregister_process` + `reclaim_retired_processes`
+/// reclaim it.
 pub fn register_process(_pid: Pid, proc: Box<Process>) {
     let ptr = Box::into_raw(proc);
-    // Claim a free slot
+    if try_claim_free_slot(ptr) {
+        return;
+    }
+    // Miss: deliberately NOT calling `reclaim_retired_processes` here, even though
+    // the table may simply be full of cooled-down zombies awaiting periodic
+    // reclamation rather than genuinely out of slots (the same shape
+    // `spawn_user_thread_fn_internal`'s on-demand `reclaim_terminated_slots` retry
+    // solves for THREAD_STATES). `register_process` is called from deep inside
+    // fork/clone/spawn paths whose lock context it doesn't control; reclaiming runs
+    // arbitrary `Process::drop` code (frees page-table frames, releases an ASID —
+    // `UserAddressSpace::drop`), which needs its own locks. A caller already holding
+    // one of those locks (or anything downstream of them) self-deadlocks the instant
+    // reclaim tries to take it again on the same core — this is exactly the boot
+    // hang found and root-caused while landing this phase (real fork/exec/pipe
+    // traffic through `test_sigpipe_terminate_no_deadlock`; see
+    // docs/archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md §"the on-demand reclaim that
+    // wasn't"). The periodic `netpoll_maint` collector (100ms cadence, a call site
+    // with no such ambient lock context) is the only reclaimer. If a spawn storm
+    // ever starves it the way `THREAD_STATES` was starved before
+    // `reclaim_terminated_slots` dropped its caller-identity gate, the fix must be a
+    // *different* collector call site — not this one.
+    unsafe { drop(Box::from_raw(ptr)); }
+    panic!("Process table full ({} slots)", MAX_PROCESSES);
+}
+
+/// Try to claim one FREE slot and install `ptr` into it. Returns whether it succeeded.
+fn try_claim_free_slot(ptr: *mut Process) -> bool {
     for i in 0..MAX_PROCESSES {
         if SLOT_STATES[i].compare_exchange(
             slot_state::FREE,
@@ -48,19 +88,32 @@ pub fn register_process(_pid: Pid, proc: Box<Process>) {
             Ordering::Relaxed,
         ).is_ok() {
             PROCESS_SLOTS[i].store(ptr, Ordering::Release);
-            return;
+            return true;
         }
     }
-    // No free slot — reclaim the Box to avoid leak, then panic
-    unsafe { drop(Box::from_raw(ptr)); }
-    panic!("Process table full ({} slots)", MAX_PROCESSES);
+    false
 }
 
-/// Unregister a process from the table.
+/// Retire a process from the table: makes it invisible to `get_process_ptr`,
+/// `for_each_process`, `current_process`, and every other lookup, and ineligible
+/// for `register_process`'s free-slot scan — but does **not** free the `Process`
+/// or drop its address space yet. Returns `true` if `pid` was found and this call
+/// is the one that retired it (a racing second `unregister_process(pid)` for the
+/// same pid loses the CAS below and returns `false`).
 ///
-/// Returns the owned Box<Process> so the caller controls when it is dropped.
-/// Dropping the Box triggers UserAddressSpace::drop() to free all physical pages.
-pub fn unregister_process(pid: Pid) -> Option<Box<Process>> {
+/// # Why deferred
+/// A BKL-dropped window (`no-bkl-vfs`/`no-bkl-mm`/`no-bkl-process`) lets a peer
+/// core hold a raw `*mut`/`*const Process` (from `lookup_process`/`get_process_ptr`/
+/// `lookup_process_shared`) across real work with the BKL released. If this pid's
+/// `Process` were freed here — as it used to be, synchronously, via
+/// `Box::from_raw` + drop — that peer core's pointer becomes a use-after-free the
+/// instant this call returns, with nothing but `with_irqs_disabled` (mutual
+/// exclusion on one core) standing between them. Retiring instead of freeing keeps
+/// the memory valid until `reclaim_retired_processes` frees it well after any such
+/// window could still be open. See docs/archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md
+/// (Phase 7e, "Free" half) and docs/archive/BKL_PHASE7_AUDIT.md §2.1/§2.1.1.
+pub fn unregister_process(pid: Pid) -> bool {
+    (runtime().print_str)("[DBG7E] unregister_process ENTRY\n");
     for i in 0..MAX_PROCESSES {
         if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
             continue;
@@ -69,31 +122,117 @@ pub fn unregister_process(pid: Pid) -> Option<Box<Process>> {
         if ptr.is_null() {
             continue;
         }
-        if unsafe { (*ptr).pid } == pid {
-            // Mark the process's thread as TERMINATED before unregistering.
-            // This prevents orphaned threads that stay READY forever after
-            // their process is reaped. Without this, kthreads shows "user-process"
-            // threads with no corresponding process, and switching to them hangs.
-            //
-            // IMPORTANT: Only mark terminated if this is NOT the current thread.
-            // Tests call unregister_process from the same thread to clean up,
-            // and marking ourselves terminated would cause Thread 0's cleanup
-            // to zero our context while we're still running.
-            if let Some(tid) = unsafe { (*ptr).thread_id } {
-                let current_tid = crate::threading::current_thread_id();
-                if tid != current_tid {
-                    crate::threading::mark_thread_terminated(tid);
-                }
-            }
-            // Found it — swap to null and mark FREE
-            let old = PROCESS_SLOTS[i].swap(core::ptr::null_mut(), Ordering::AcqRel);
-            SLOT_STATES[i].store(slot_state::FREE, Ordering::Release);
-            if !old.is_null() {
-                return Some(unsafe { Box::from_raw(old) });
+        if unsafe { (*ptr).pid } != pid {
+            continue;
+        }
+        (runtime().print_str)("[DBG7E] unregister_process found slot, CAS-ing\n");
+        // Claim the ACTIVE -> RETIRED transition exclusively. Losing this CAS means
+        // another thread already retired (or is retiring) this exact slot; the
+        // scalar `pid` match above can't tell those apart from us, the CAS can.
+        if SLOT_STATES[i].compare_exchange(
+            slot_state::ACTIVE,
+            slot_state::RETIRED,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ).is_err() {
+            continue;
+        }
+        (runtime().print_str)("[DBG7E] unregister_process CAS ok, storing retire time\n");
+        RETIRE_TIME[i].store((runtime().uptime_us)(), Ordering::Release);
+        (runtime().print_str)("[DBG7E] unregister_process retire time stored\n");
+        // Mark the process's thread as TERMINATED before unregistering.
+        // This prevents orphaned threads that stay READY forever after
+        // their process is reaped. Without this, kthreads shows "user-process"
+        // threads with no corresponding process, and switching to them hangs.
+        //
+        // IMPORTANT: Only mark terminated if this is NOT the current thread.
+        // Tests call unregister_process from the same thread to clean up,
+        // and marking ourselves terminated would cause Thread 0's cleanup
+        // to zero our context while we're still running.
+        if let Some(tid) = unsafe { (*ptr).thread_id } {
+            let current_tid = crate::threading::current_thread_id();
+            if tid != current_tid {
+                (runtime().print_str)("[DBG7E] unregister_process calling mark_thread_terminated\n");
+                crate::threading::mark_thread_terminated(tid);
+                (runtime().print_str)("[DBG7E] unregister_process mark_thread_terminated returned\n");
             }
         }
+        (runtime().print_str)("[DBG7E] unregister_process returning true\n");
+        return true;
     }
-    None
+    (runtime().print_str)("[DBG7E] unregister_process returning false\n");
+    false
+}
+
+/// Free the memory of every RETIRED slot whose cooldown
+/// (`config().process_reclaim_cooldown_us`) has elapsed. Returns the count freed.
+///
+/// No caller-identity gate (unlike thread-slot cleanup's "only thread 0" default) —
+/// there is no steady-state collector here that only runs when the system is idle,
+/// so there is nothing to relax. Called periodically from `netpoll_maint` and
+/// on-demand from `register_process` on a full-table miss.
+///
+/// # Why a time cooldown and not a caller-identity or reference-count gate
+/// Same reasoning as `threading::reclaim_terminated_slots`: the thing that makes
+/// freeing safe is that any BKL-dropped window holding a stale pointer has had time
+/// to close, not who calls this function. `process_reclaim_cooldown_us` must outlast
+/// any such window; those windows are single bounded I/O ops or PTE-chunk copies, not
+/// open-ended, so the same order of magnitude as `THREAD_CLEANUP_COOLDOWN_US` (10ms)
+/// is generous. See docs/archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md.
+pub fn reclaim_retired_processes() -> usize {
+    reclaim_retired_processes_internal(false)
+}
+
+/// Reclaim regardless of cooldown. **Tests only** — never safe in production, the
+/// same way `threading::cleanup_terminated_force` is test-only: it removes the
+/// margin that guarantees no peer core still holds a stale pointer into the slot
+/// being freed.
+pub fn reclaim_retired_processes_force() -> usize {
+    reclaim_retired_processes_internal(true)
+}
+
+fn reclaim_retired_processes_internal(ignore_cooldown: bool) -> usize {
+    let now = (runtime().uptime_us)();
+    let cooldown_us = config().process_reclaim_cooldown_us;
+    let mut count = 0;
+    for i in 0..MAX_PROCESSES {
+        if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::RETIRED {
+            continue;
+        }
+        if !ignore_cooldown {
+            let retire_time = RETIRE_TIME[i].load(Ordering::Acquire);
+            if retire_time > 0 && now.saturating_sub(retire_time) < cooldown_us {
+                continue;
+            }
+        }
+        // Extract the pointer BEFORE releasing the slot for reuse: the state stays
+        // RETIRED throughout this swap, so `register_process` (which only claims
+        // FREE slots) can never observe a half-freed slot or race the pointer we're
+        // about to free. Two reclaimers racing the same slot (`reclaim_retired_processes`
+        // has no single-collector gate): exactly one gets the real pointer via this
+        // atomic swap, the other gets null and skips — mirrors how the old synchronous
+        // `unregister_process` handled a racing second call on the same slot.
+        let old = PROCESS_SLOTS[i].swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if old.is_null() {
+            continue;
+        }
+        SLOT_STATES[i].store(slot_state::FREE, Ordering::Release);
+        RETIRE_TIME[i].store(0, Ordering::Relaxed);
+        unsafe { drop(Box::from_raw(old)); }
+        count += 1;
+    }
+    count
+}
+
+/// Number of RETIRED slots awaiting `reclaim_retired_processes`. Diagnostics/tests only.
+pub fn retired_process_count() -> usize {
+    let mut count = 0;
+    for i in 0..MAX_PROCESSES {
+        if SLOT_STATES[i].load(Ordering::Relaxed) == slot_state::RETIRED {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Access a process by PID within a callback. **This is the safe API.**

@@ -1226,6 +1226,7 @@ mod child_channel_drain_tests {
             network_thread_ratio: 0,
             deferred_thread_cleanup: false,
             thread_cleanup_cooldown_us: 0,
+            process_reclaim_cooldown_us: 0,
             syscall_debug_info_enabled: false,
             fork_brk_serial_progress: false,
             enable_sgi_debug_prints: false,
