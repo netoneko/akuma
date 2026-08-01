@@ -200,6 +200,14 @@ pub fn run_all_tests() {
     // Test epoll multi poller pipe
     test_epoll_multi_poller_pipe();
 
+    // DBG7E PROBE: flush any RETIRED-but-uncollected zombies accumulated by
+    // ~200 preceding tests before this one runs, to test the theory that
+    // memory pressure from the deferred-reclaim backlog (no periodic collector
+    // runs during the self-test suite) is why this test now hits OOM instead
+    // of getting SIGPIPE'd promptly.
+    let dbg7e_flushed = akuma_exec::process::table::reclaim_retired_processes_force();
+    crate::safe_print!(96, "[DBG7E] pre-sigpipe-test flush reclaimed {} zombies\n", dbg7e_flushed);
+
     // Regression: EPIPE→SIGPIPE inline-terminate must not self-deadlock
     test_sigpipe_terminate_no_deadlock();
 
