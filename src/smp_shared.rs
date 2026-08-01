@@ -165,6 +165,32 @@ pub fn set_mm_bkl_drop_enabled(on: bool) {
     MM_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
 }
 
+/// Runtime toggle (default **on**) for `no-bkl-drivers` (Phase 6 of
+/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md) — drop the BKL for the
+/// device-driver syscall paths (`sys_getrandom`, `sys_read`/`sys_pread64` on
+/// `/dev/urandom`, `sys_write` on `/dev/dsp`, and the `sys_fb_*` framebuffer
+/// syscalls), relying on each driver's own fine-grained Spinlock — `RNG_DEVICE`,
+/// `SOUND_DEVICE`, `FB_STATE` — for cross-core mutual exclusion instead.
+/// `DriverBklGuard` reads this at construct/drop time (latched, same discipline
+/// as `VfsBklGuard` / `MmBklGuard`) so an `smp-shared` boot with the feature
+/// compiled in can still A/B against the BKL-held path without a rebuild.
+/// The block device (`BLOCK_DEVICE`) and network device (`NETWORK`) are already
+/// BKL-free via `no-bkl-vfs` / `no-bkl-network`; this toggle covers the
+/// remaining drivers only.
+static DRIVERS_BKL_DROP_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Whether the device-driver-syscall BKL-drop (`no-bkl-drivers`) is currently enabled.
+#[inline]
+pub fn drivers_bkl_drop_enabled() -> bool {
+    DRIVERS_BKL_DROP_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Enable/disable the device-driver-syscall BKL-drop at runtime. Used by A/B
+/// measurement; also serves as a runtime kill-switch, same as the other phases.
+pub fn set_drivers_bkl_drop_enabled(on: bool) {
+    DRIVERS_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
+}
+
 /// Runtime toggle (default **off**) for the M5c optimization: run the scheduler SGI
 /// BKL-free when it preempted EL0 (userspace, no BKL held), so peer cores' timer ticks
 /// don't serialize on the BKL. Correct at SMP=2. Left **off** because at SMP≥4 it opens a

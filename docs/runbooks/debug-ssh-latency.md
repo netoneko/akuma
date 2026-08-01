@@ -25,7 +25,7 @@ network-level connection issues, see [`debug-network.md`](debug-network.md).
 | Delete key inserts `~` (Mac fn+backspace `\x1b[3~`) | `EscapeState::Bracket` reset to Normal on `b'3'` with empty arm; trailing `~` printed literal | FIXED | `BracketNum(u8)` variant holds the digit, waits for `~`; handles Delete/Home/End |
 | Full-screen apps (vi, less) use 80×24 regardless of real terminal; `ioctl(TIOCGWINSZ)` returns defaults | 3 gaps: kernel `TerminalState::default()` created after `pty-req` without copying dims; `bridge_process` dropped `window-change`; no `TIOCSWINSZ` (`0x5414`) handler | FIXED | Copy dims on pty-req; handle window-change; kernel `src/syscall/term.rs` implements `TIOCSWINSZ`; `userspace/libakuma` `set_terminal_size` |
 | Command chaining: `nonexistent; echo x` prints only the error; `ls && pwd` → "pwd not found" | (a) Exec breaks chain on any failure, ignoring `;` vs `&&`; (b) missing `pwd`/`cd` builtins; (c) chaining only in SSH exec mode, not interactive/console | OPEN | Track `prev_operator`; only break on `&&` failure; add `pwd`/`cd`; call `parse_command_chain()` in interactive + console |
-| SSH exit code always 255 | Separate known issue | OPEN | — |
+| SSH exit code always 255 | sshd did not send `SSH_MSG_CHANNEL_EXIT_STATUS`/`CHANNEL_CLOSE` | FIXED | commit `e54oba9`: `protocol.rs:392,400` sends exit-status + close |
 
 ## Measuring SSH latency
 

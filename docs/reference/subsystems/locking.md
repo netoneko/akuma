@@ -1,7 +1,8 @@
 # Kernel locking: the BKL and how carve-outs work
 
-> **Stability: B (verify behaviour).** The rules below are extracted from two
-> completed carve-outs (`no-bkl-network`, `no-bkl-vfs`) and are consistent
+> **Stability: B (verify behaviour).** The rules below are extracted from five
+> completed carve-outs (`no-bkl-network`, `no-bkl-vfs`, `no-bkl-process`,
+> `no-bkl-mm`, `no-bkl-drivers`) and are consistent
 > across both, but the underlying BKL-removal effort is itself grade **C** —
 > check `smp-shared.md` and the archive docs below for what has landed since
 > this was written.
@@ -30,12 +31,13 @@ BKL is simply *redundant* for syscalls that only touch that state. See
 `docs/reference/subsystems/smp.md` for the other, share-nothing SMP model this
 is not.
 
-Four carve-outs exist today: `no-bkl-network` (all smoltcp net syscalls +
+Five carve-outs exist today: `no-bkl-network` (all smoltcp net syscalls +
 socket `read`/`write`), `no-bkl-vfs` (ext2 read paths, `mmap`, `unlinkat`,
 `openat`, `renameat`/`renameat2`, `mkdirat`, `fchmodat`), `no-bkl-process`
-(`fork_process`'s CoW page-copy window), and `no-bkl-mm`
-(`mprotect`/`madvise`/`munmap`/`mremap`/`mmap`). All four are default-on in
-`smp-shared` (since 2026-08-01). `no-bkl-process` is the first that is not about I/O: it overlaps a
+(`fork_process`'s CoW page-copy window), `no-bkl-mm`
+(`mprotect`/`madvise`/`munmap`/`mremap`/`mmap`), and `no-bkl-drivers`
+(`getrandom`, `/dev/urandom` read/pread, `/dev/dsp` write, `fb_init`/`fb_draw`/
+`fb_info`). All five are default-on in `smp-shared` (since 2026-08-01). `no-bkl-process` is the first that is not about I/O: it overlaps a
 CPU-bound page copy with peer-core EL1 rather than a disk or wire wait, and it is
 the first to lean on a *page-table* inner lock (`as_lock`) rather than a
 subsystem's own state locks. `no-bkl-mm` is the first phase picked by the plan
@@ -214,10 +216,10 @@ Each of these was a real bug found during a carve-out, not a hypothetical.
 
 ## Syscall → lock map
 
-Ground truth as of 2026-08-01, verified against `src/syscall/{fs,net,mem,proc}.rs`
+Ground truth as of 2026-08-01, verified against `src/syscall/{fs,net,mem,proc,fb}.rs`
 and the inner-lock call sites in `crates/akuma-ext2/src/ext2.rs`,
-`crates/akuma-exec/src/process/fd.rs`, `src/block.rs`, `src/vfs/mod.rs`, and
-`crates/akuma-net/src/{socket,smoltcp_net}.rs` — not transcribed from the
+`crates/akuma-exec/src/process/fd.rs`, `src/block.rs`, `src/vfs/mod.rs`,
+`src/{rng,audio,ramfb}.rs`, and `crates/akuma-net/src/{socket,smoltcp_net}.rs` — not transcribed from the
 archive doc's prose. Re-derive rather than trust this table once it's more
 than a few months old; grep the guard names below to check it hasn't drifted.
 
@@ -379,6 +381,39 @@ the contention regimen), §4 is a same-binary Akuma-vs-native-Linux tok/s compar
 (bonus, not part of the carve-out itself), §5 explains why this phase has no
 before/after contention number the way `unlinkat`/`netpoll_drain` do.
 
+### `no-bkl-drivers` — `src/syscall/{fs,proc,fb}.rs`
+
+Phase 6, landed 2026-08-01, promoted to `smp-shared` default-on 2026-08-01.
+Plan-driven (Phase 6 of the locking plan), like `no-bkl-mm` — no device-driver
+syscall has ever measured as a significant BKL holder. The audit found that
+virtio-blk and virtio-net were already BKL-free via `no-bkl-vfs` and
+`no-bkl-network` (their `BLOCK_DEVICE`/`NETWORK` Spinlocks are the inner locks
+credited in those phases' syscall→lock maps); this phase covers the remaining
+drivers. All virtio devices are polling-based (no IRQ handlers registered
+except the timer IRQ 27, which is scheduler-coupled and belongs to Phase 7).
+`DriverBklGuard` (`src/syscall/fs.rs`, `pub(super)`) mirrors `MmBklGuard`:
+runtime toggle `drivers_bkl_drop_enabled()` (default on, latched at
+construction), same dropped-window ledger.
+
+| site | guard scope | inner lock(s) held while BKL dropped |
+|---|---|---|
+| `sys_getrandom` (`proc.rs`, after `validate_user_ptr`) | whole chunked-read loop | `RNG_DEVICE` `Spinlock` (`rng.rs:498`) |
+| `sys_read` → `DevUrandom` (`fs.rs`, after multikernel secondary forward) | `fill_bytes` + `copy_to_user_safe` | `RNG_DEVICE` |
+| `sys_pread64` → `DevUrandom` (`fs.rs`, same) | same | `RNG_DEVICE` |
+| `sys_write` → `DevDsp` (`fs.rs`) | `audio::play` call | `SOUND_DEVICE` `Spinlock` (`audio.rs:205`) |
+| `sys_fb_init` (`fb.rs`, after dimension validation) | `ramfb::init` call | `FB_STATE` `Spinlock` (`ramfb.rs:39`) |
+| `sys_fb_draw` (`fb.rs`, after validation + `is_initialized` check) | whole copy+draw loop | `FB_STATE` |
+| `sys_fb_info` (`fb.rs`, after validation) | `ramfb::info` call | `FB_STATE` |
+
+**virtio-gpu does not exist** in this codebase (zero matches for `gpu`/`GPU`).
+Graphics output is via QEMU `ramfb` (a fw_cfg-backed RAM framebuffer, not a
+virtio device).
+
+Background: [`BKL_DRIVERS_CARVE_OUT.md`](../../archive/BKL_DRIVERS_CARVE_OUT.md)
+— §1 is the full driver audit (which found most work already done by preceding
+phases), §2 explains why the plan's IRQ-handler goal belongs to Phase 7
+(scheduler), §3 confirms virtio-gpu's absence.
+
 ## Attribution tooling
 
 `bkl-profile` (cargo feature → `cfg(kernel_bkl_profile)`, `src/bkl_profile.rs`)
@@ -450,6 +485,10 @@ Driving workload: `net4` (concurrent downloads → net + ext2 write), `read4`
   `mprotect`/`madvise`/`munmap`/`mremap`/`mmap` carve-out: the two real locking
   gaps it found and closed, and why (unlike the other three) it has no
   attribution-backed contention number.
+- [`BKL_DRIVERS_CARVE_OUT.md`](../../archive/BKL_DRIVERS_CARVE_OUT.md) — the
+  Phase 6 device-driver carve-out: the full driver audit (which found most work
+  already done by `no-bkl-vfs`/`no-bkl-network`), why the plan's IRQ-handler
+  goal belongs to Phase 7, and why virtio-gpu is a no-op (it does not exist).
 - [`BKL_FINE_GRAINED_LOCKING_PLAN.md`](../../archive/BKL_FINE_GRAINED_LOCKING_PLAN.md)
   — the overall phased plan; §"Phase 2" has the network carve-out's design
   notes (why a coarse `NETWORK_LOCK` doesn't work, the SIGPIPE self-deadlock,

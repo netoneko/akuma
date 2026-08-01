@@ -662,6 +662,11 @@ pub fn run_all_tests() {
     // paths, plus the runtime kill switch — pins what the carve-out must preserve.
     test_mm_bkl_drop();
 
+    // `no-bkl-drivers` (Phase 6): DriverBklGuard's ledger balance across
+    // sys_getrandom and the sys_fb_* entry points, on early-error paths and a
+    // real guarded path, plus the runtime kill switch.
+    test_drivers_bkl_drop();
+
     // Phantom-SVC tripwire: runs LAST so it covers every EL0 trap the suite above
     // generated (fork/exec/signal/mmap stress). A nonzero count means an EC_SVC64
     // trap arrived whose insn@ELR-4 was not an `svc` — either stale I-cache or the
@@ -3048,6 +3053,92 @@ fn test_mm_bkl_drop() {
     } else {
         crate::safe_print!(64, "[Test] mm-bkl-drop FAILED ({} cases)\n", fails);
         panic!("test_mm_bkl_drop: {fails} cases failed");
+    }
+}
+
+/// `sys_getrandom` and the `sys_fb_*` framebuffer syscalls — `DriverBklGuard`'s
+/// ledger balance, Phase 6 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
+/// (`src/syscall/{proc,fb}.rs`, guard in `src/syscall/fs.rs`).
+///
+/// Drives the real syscall ENTRY points via `handle_syscall`, checking two things
+/// per case: the documented return value (or at least not a hard error code for
+/// the real paths), and that `bkl::in_dropped_window()` is false once the call
+/// returns — the guard's ledger must end balanced both on early-error paths that
+/// never open it AND on real paths that do.
+///
+/// Does NOT drive the RNG read path with a real buffer (that needs a mapped user
+/// page — out of scope here, same constraint the mm test respects). Instead
+/// exercises the guard through `sys_fb_init`, which takes dimensions not pointers,
+/// so no user-buffer mapping is needed.
+fn test_drivers_bkl_drop() {
+    use akuma_exec::bkl;
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid};
+    use akuma_exec::threading::current_thread_id;
+    use crate::syscall::{handle_syscall, nr};
+
+    const EFAULT: u64 = (-14i64) as u64;
+    const EINVAL: u64 = (-22i64) as u64;
+
+    let tid = current_thread_id();
+    let pid: u32 = 7704;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+
+    let mut fails = 0u32;
+    let balanced = |what: &str, fails: &mut u32| {
+        if bkl::in_dropped_window() {
+            *fails += 1;
+            crate::safe_print!(96, "[Test] drivers-bkl-drop: {} left the window open\n", what);
+        }
+    };
+
+    // ── Early-error paths: must never open the window ──────────────────────
+    // getrandom with null ptr: validate_user_ptr fails → EFAULT before the guard.
+    let r = handle_syscall(nr::GETRANDOM, &[0, 16, 0, 0, 0, 0]);
+    if r != EFAULT { fails += 1; crate::safe_print!(96, "[Test] drivers-bkl-drop: getrandom(null) FAILED r={} (want EFAULT)\n", r); }
+    balanced("getrandom(null ptr)", &mut fails);
+
+    // fb_init with zero dimensions: EINVAL before the guard.
+    let r = handle_syscall(nr::FB_INIT, &[0, 0, 0, 0, 0, 0]);
+    if r != EINVAL { fails += 1; crate::safe_print!(96, "[Test] drivers-bkl-drop: fb_init(0,0) FAILED r={} (want EINVAL)\n", r); }
+    balanced("fb_init(zero dims)", &mut fails);
+
+    // fb_info with null ptr: EINVAL before the guard.
+    let r = handle_syscall(nr::FB_INFO, &[0, 0, 0, 0, 0, 0]);
+    if r != EINVAL { fails += 1; crate::safe_print!(96, "[Test] drivers-bkl-drop: fb_info(null) FAILED r={} (want EINVAL)\n", r); }
+    balanced("fb_info(null)", &mut fails);
+
+    // fb_draw with null ptr / zero len: EINVAL before the guard.
+    let r = handle_syscall(nr::FB_DRAW, &[0, 0, 0, 0, 0, 0]);
+    if r != EINVAL { fails += 1; crate::safe_print!(96, "[Test] drivers-bkl-drop: fb_draw(0,0) FAILED r={} (want EINVAL)\n", r); }
+    balanced("fb_draw(null)", &mut fails);
+
+    // ── Real guarded path ──────────────────────────────────────────────────
+    // fb_init with valid dims: guard IS constructed. ramfb::init may succeed (0)
+    // or fail (EIO if no fw_cfg); either way the guard must be balanced.
+    let _ = handle_syscall(nr::FB_INIT, &[320, 240, 0, 0, 0, 0]);
+    balanced("fb_init(320x240)", &mut fails);
+
+    // Runtime kill switch: with the toggle off, the guard must never open the
+    // window at all — same kill-switch contract as the other phases.
+    #[cfg(kernel_smp_shared)]
+    {
+        use crate::smp_shared::{drivers_bkl_drop_enabled, set_drivers_bkl_drop_enabled};
+        let was = drivers_bkl_drop_enabled();
+        set_drivers_bkl_drop_enabled(false);
+        let _ = handle_syscall(nr::FB_INIT, &[320, 240, 0, 0, 0, 0]);
+        balanced("fb_init(toggle off)", &mut fails);
+        set_drivers_bkl_drop_enabled(was);
+    }
+
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    if fails == 0 {
+        crate::safe_print!(160, "[Test] drivers-bkl-drop PASSED (4 early-error + fb_init + kill switch)\n");
+    } else {
+        crate::safe_print!(64, "[Test] drivers-bkl-drop FAILED ({} cases)\n", fails);
+        panic!("test_drivers_bkl_drop: {fails} cases failed");
     }
 }
 

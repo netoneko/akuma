@@ -1182,6 +1182,7 @@ pub(super) fn sys_geteuid() -> u64 {
 
 pub(super) fn sys_getrandom(ptr: u64, len: usize) -> u64 {
     if !validate_user_ptr(ptr, len) { return EFAULT; }
+    let _drv_bkl = super::fs::DriverBklGuard::new();
     let mut remaining = len;
     let mut current_ptr = ptr;
     while remaining > 0 {

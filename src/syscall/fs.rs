@@ -94,6 +94,64 @@ impl Drop for VfsBklGuard {
     }
 }
 
+/// RAII guard that runs a device-driver syscall **without** the Big Kernel Lock
+/// — Phase 6 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md. Mirrors
+/// [`MmBklGuard`] (and `VfsBklGuard`) exactly, including the latching discipline.
+///
+/// Constructed inside the device-driver syscall paths (`sys_getrandom`, the
+/// `DevUrandom` arm of `sys_read`/`sys_pread64`, the `DevDsp` arm of `sys_write`,
+/// and `sys_fb_init`/`sys_fb_draw`/`sys_fb_info`): `new()` DROPS the BKL so this
+/// core runs the device I/O concurrently with peer cores, and `drop()`
+/// RE-ACQUIRES it on every return path. Correctness rests on each driver's state
+/// already carrying its own fine-grained Spinlock — `RNG_DEVICE` (virtio-rng,
+/// `src/rng.rs`), `SOUND_DEVICE` (virtio-sound, `src/audio.rs`), and `FB_STATE`
+/// (ramfb, `src/ramfb.rs`) — so the BKL is redundant for them. The block device
+/// (`BLOCK_DEVICE`) and network device (`NETWORK`) are already BKL-free via
+/// `no-bkl-vfs` / `no-bkl-network`; this guard covers the remaining drivers.
+///
+/// All virtio devices in this kernel are **polling-based** (no virtio IRQ
+/// handlers are registered — only the timer IRQ 27), so device I/O is a
+/// synchronous busy-wait under the driver's Spinlock, not an interrupt-driven
+/// completion. The BKL-drop lets peer cores run while this core polls.
+///
+/// Like `MmBklGuard`, none of the driver Spinlocks need to know a BKL-free window
+/// is calling them — their acquisition is already unconditional. Zero-cost no-op
+/// unless BOTH `kernel_smp_shared` and `kernel_no_bkl_drivers` are set (or the
+/// runtime toggle `drivers_bkl_drop_enabled()` is off).
+pub(super) struct DriverBklGuard {
+    /// Whether `new()` actually dropped the BKL, **latched at construction** —
+    /// same reasoning as `VfsBklGuard::dropped_bkl` / `MmBklGuard::dropped_bkl`.
+    #[cfg(all(kernel_smp_shared, kernel_no_bkl_drivers))]
+    dropped_bkl: bool,
+}
+
+impl DriverBklGuard {
+    #[inline]
+    pub(super) fn new() -> Self {
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_drivers))]
+        let dropped_bkl = crate::smp_shared::drivers_bkl_drop_enabled();
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_drivers))]
+        if dropped_bkl {
+            akuma_exec::bkl::dropped_window_open();
+        }
+        Self {
+            #[cfg(all(kernel_smp_shared, kernel_no_bkl_drivers))]
+            dropped_bkl,
+        }
+    }
+}
+
+impl Drop for DriverBklGuard {
+    #[inline]
+    fn drop(&mut self) {
+        // Latched in `new()` — deliberately NOT a fresh `drivers_bkl_drop_enabled()` read.
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_drivers))]
+        if self.dropped_bkl {
+            akuma_exec::bkl::dropped_window_close();
+        }
+    }
+}
+
 /// Bounded, always-on diagnostic counter for `read()` returning EBADF.
 ///
 /// A process calling `read()` on a descriptor that is *absent* from its fd
@@ -616,6 +674,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
                 return count as u64;
             }
+            let _drv_bkl = DriverBklGuard::new();
             if crate::rng::fill_bytes(&mut temp).is_ok() {
                 if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
                     return EFAULT;
@@ -756,6 +815,7 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
                 }
                 return count as u64;
             }
+            let _drv_bkl = DriverBklGuard::new();
             if crate::rng::fill_bytes(&mut temp).is_ok() {
                 if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
                     return EFAULT;
@@ -984,6 +1044,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             akuma_exec::process::FileDescriptor::DevDsp => {
                 // Blocking PCM playback. The audio driver re-chunks into bounded
                 // periods internally; consumes the whole slice or errors.
+                let _drv_bkl = DriverBklGuard::new();
                 if let Ok(n) = crate::audio::play(buf_slice) { n as u64 } else {
                     if total_written > 0 { return total_written as u64; }
                     return EIO;

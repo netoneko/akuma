@@ -7,6 +7,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_vfs)");
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_process)");
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_mm)");
+    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_drivers)");
     println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
 
     // Multikernel (one-kernel-per-core) gate. ALL secondary-core code lives behind
@@ -94,6 +95,23 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_MM");
     if std::env::var("CARGO_FEATURE_NO_BKL_MM").is_ok() {
         println!("cargo:rustc-cfg=kernel_no_bkl_mm");
+    }
+
+    // BKL-free device-driver syscalls (Phase 6 of
+    // docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), mirroring `kernel_no_bkl_mm`.
+    // `cfg(kernel_no_bkl_drivers)` makes the device-driver syscall paths
+    // (`sys_getrandom`, `sys_read`/`sys_pread64` on `/dev/urandom`, `sys_write` on
+    // `/dev/dsp`, and the `sys_fb_*` framebuffer syscalls) drop the BKL for their
+    // duration, relying on each driver's own fine-grained Spinlock — `RNG_DEVICE`,
+    // `SOUND_DEVICE`, `FB_STATE` — for cross-core mutual exclusion instead. Only
+    // meaningful under shared-kernel SMP. Emitted independently of `smp_shared` so
+    // the guard body (gated on `all(kernel_smp_shared, kernel_no_bkl_drivers)`)
+    // can compile-check in either combination. The block device (`BLOCK_DEVICE`)
+    // and network device (`NETWORK`) are already BKL-free via `no-bkl-vfs` and
+    // `no-bkl-network` respectively; this phase covers the remaining drivers.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_DRIVERS");
+    if std::env::var("CARGO_FEATURE_NO_BKL_DRIVERS").is_ok() {
+        println!("cargo:rustc-cfg=kernel_no_bkl_drivers");
     }
 
     // BKL-hold attribution build. Turns on the per-tag profiler in

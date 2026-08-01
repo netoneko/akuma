@@ -8,6 +8,7 @@ pub(super) fn sys_fb_init(width: u32, height: u32) -> u64 {
         return i64::from(-libc_errno::EINVAL) as u64;
     }
 
+    let _drv_bkl = super::fs::DriverBklGuard::new();
     match crate::ramfb::init(width, height) {
         Ok(()) => 0,
         Err(_) => i64::from(-libc_errno::EIO) as u64,
@@ -24,6 +25,7 @@ pub(super) fn sys_fb_draw(buf_ptr: u64, buf_len: usize) -> u64 {
         return i64::from(-libc_errno::EIO) as u64;
     }
 
+    let _drv_bkl = super::fs::DriverBklGuard::new();
     // Use a large kernel buffer for FB drawing (e.g. 1MB chunk)
     let chunk_size = buf_len.min(1024 * 1024);
     let mut kernel_buf = alloc::vec![0u8; chunk_size];
@@ -51,6 +53,7 @@ pub(super) fn sys_fb_info(info_ptr: u64) -> u64 {
     }
     if !validate_user_ptr(info_ptr, core::mem::size_of::<crate::ramfb::FBInfo>()) { return EFAULT; }
 
+    let _drv_bkl = super::fs::DriverBklGuard::new();
     match crate::ramfb::info() {
         Some(info) => {
             if unsafe { copy_to_user_safe(info_ptr as *mut u8, (&raw const info).cast::<u8>(), core::mem::size_of::<crate::ramfb::FBInfo>()).is_err() } {

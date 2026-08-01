@@ -71,8 +71,9 @@ r = subprocess.run(["ssh","-o","StrictHostKeyChecking=no","-o","UserKnownHostsFi
 out = re.sub(r'\x1b\[[0-9;]*[KmHm]', '', r.stdout.decode(errors='replace'))
 ```
 
-Strip ANSI (above). `rc=255` is normal after a long command (SSH drops) —
-verify via stdout, not rc.
+Strip ANSI (above). `rc=255` was normal with older sshd builds (no
+exit-status); a rebuilt sshd (commit `e54eba9`) sends the real exit code.
+Verify via stdout if using an older disk image.
 
 ## Mini-shell limitations
 

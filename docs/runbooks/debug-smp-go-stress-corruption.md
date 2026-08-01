@@ -354,9 +354,8 @@ descheduled) — not necessarily the same leak.
   RAM — its lazy-path expectation of `-11` predated clean file-page eviction,
   which now legitimately lets the oversized-mmap process finish with exit 0.
   The test accepts both; the kernel-stays-up assertion is unchanged.)
-- **ssh always exits 255** ("Connection to localhost closed by remote host"):
-  `userspace/sshd` never sends `SSH_MSG_CHANNEL_EXIT_STATUS`/`CHANNEL_CLOSE` —
-  `handle_connection` just returns and drops the socket. Chronic, not a
-  regression; makes `ssh`'s exit code useless for gating. Harnesses must grade
-  in-band (`<cmd>; echo INBAND_EXIT=$?`). Proper fix: send exit-status (from
-  the `waitpid` the bridge already does) + CHANNEL_CLOSE before returning.
+- **~~ssh always exits 255~~** (FIXED, commit `e54eba9`): `userspace/sshd` now
+  sends `SSH_MSG_CHANNEL_EXIT_STATUS` + `CHANNEL_CLOSE` (`protocol.rs:392,400`),
+  so `ssh` returns the real exit code. Harnesses that still gate on in-band
+  markers (`echo INBAND_EXIT=$?`) are harmless — the exit code is now also
+  correct. Older disk images without the rebuilt sshd still return 255.

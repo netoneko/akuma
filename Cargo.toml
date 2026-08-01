@@ -170,7 +170,7 @@ smp = ["dep:akuma-smp"]
 # SMP=4 (3 boots × 10 rounds fork-hammer: 0 faults, 0 partial child output, 0
 # `[BKL] stuck`) and contention-confirmed by a same-source `bkl-profile` A/B
 # (`clone` 19.5% → 2.5%, 8.6× fewer spins). Remove from this list to A/B.
-smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm"]
+smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers"]
 
 # Run the native (smoltcp) network syscalls WITHOUT the Big Kernel Lock — the
 # first subsystem carved out of the BKL (docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
@@ -245,6 +245,25 @@ no-bkl-process = ["akuma-exec/no-bkl-process"]
 # BKL_VFS_CARVE_OUT.md §19.3) — so this is a bin-crate-only feature with nothing
 # to forward into `akuma-exec`.
 no-bkl-mm = []
+
+# Run the device-driver syscalls (`getrandom`, `read`/`pread64` on `/dev/urandom`,
+# `write` on `/dev/dsp`, and the `fb_*` framebuffer syscalls) WITHOUT the Big Kernel
+# Lock — Phase 6 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md, the fifth
+# subsystem carved out. Included in `smp-shared` since 2026-08-01 (same as
+# net/vfs/process/mm). Like the preceding phases, every piece of state these
+# syscalls touch already carries its own fine-grained Spinlock — `RNG_DEVICE`
+# (virtio-rng, polling), `SOUND_DEVICE` (virtio-sound, polling), and `FB_STATE`
+# (ramfb framebuffer) — so the BKL is redundant for them. The block device
+# (`BLOCK_DEVICE`) and network device (`NETWORK`) are already BKL-free via
+# `no-bkl-vfs` / `no-bkl-network`; this phase covers the remaining drivers.
+# build.rs emits `cfg(kernel_no_bkl_drivers)` from CARGO_FEATURE_NO_BKL_DRIVERS.
+# Like `no-bkl-mm`, none of the underlying driver locks need to know this feature
+# exists — their Spinlock acquisition is already unconditional — so this is a
+# bin-crate-only feature with nothing to forward into `akuma-exec`. A no-op
+# (byte-for-byte unchanged) on every build that doesn't set both features.
+# Note: virtio-gpu does not exist in this codebase; graphics output is via QEMU
+# ramfb (a fw_cfg-backed RAM framebuffer, not a virtio device).
+no-bkl-drivers = []
 
 # BKL-hold attribution (measurement builds only — never ship it). Enables the
 # per-tag BKL profiler in `akuma_exec::sync` for the whole boot and makes the

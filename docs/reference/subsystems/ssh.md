@@ -4,9 +4,11 @@ Current-state architecture for both SSH servers: the built-in in-kernel sshd
 (smoltcp) and the userspace sshd (devbox).
 
 > **Stability: A (stable).** Low per-doc churn; the echo path is sub-ms after
-> the waker/poll fixes. Open items are minor: command chaining, exit code 255,
-> true real-time streaming. The load-bearing invariant: `block_on` uses
-> `yield_now()` (not `schedule_blocking()`) and re-polls on progress.
+> the waker/poll fixes. Open items are minor: command chaining,
+> true real-time streaming. Exit code 255 is fixed (commit `e54eba9` — sshd now
+> sends `SSH_MSG_CHANNEL_EXIT_STATUS` + `CHANNEL_CLOSE`). The load-bearing
+> invariant: `block_on` uses `yield_now()` (not `schedule_blocking()`) and
+> re-polls on progress.
 
 For debugging, see [`../../runbooks/debug-ssh-latency.md`](../../runbooks/debug-ssh-latency.md).
 

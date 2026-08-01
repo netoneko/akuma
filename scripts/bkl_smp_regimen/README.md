@@ -51,7 +51,10 @@ python3 scripts/bkl_smp_regimen/analyze_workload.py --auto run.log   # workload 
   Akuma's ext2 driver handles the 32-block-group image fine. The recurring `HTREE … invalid root
   node / HTREE INDEX CLEARED` fsck complaint is cosmetic — Akuma's ext2 writes don't maintain
   htree indexes.
-- **`ssh` always exits 255.** This sshd never sends exit-status; key on stdout, never `$?`.
+- **`ssh` exit code is now correct.** The userspace sshd sends
+  `SSH_MSG_CHANNEL_EXIT_STATUS` + `CHANNEL_CLOSE` (commit `e54eba9`), so `ssh`
+  returns the real exit code. Older disk images without the fix still return 255
+  — rebuild sshd (`userspace/build.sh --sshd-only`) if you see that.
 - **Disable ssh keepalives.** They time out when the cores are pegged and the server then tears
   the channel down mid-command. Hence: run the regimen detached (`nohup sh /tmp/job.sh &`) and
   poll it over short-lived connections.
