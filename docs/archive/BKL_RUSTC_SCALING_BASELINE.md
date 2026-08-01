@@ -107,9 +107,63 @@ seconds — otherwise a successful Phase 7 will look like a failure.
   an unlocked `static UART` (audit §4.2). Confirmed live in every boot log here. They
   inflate Akuma's exec-heavy cells by an unmeasured amount. **Re-baseline after they are
   removed**, or measure both ways.
-- **`big conc=4` at SMP=1 failed both reps** — artifact absent, rustc silent. Most likely
-  memory pressure (4 concurrent 63 MB-dylib compiles, 1 core, 4 GB). Not investigated; it
-  is the one missing cell.
+- **`big conc=4` at SMP=1 failed both reps** — artifact absent, rustc silent. Originally
+  guessed as memory pressure (4 concurrent 63 MB-dylib compiles, 1 core, 4 GB) and left
+  uninvestigated. **That hypothesis is wrong** — see the correction immediately below.
+
+### 5.1 What the `big` failure actually is (investigated 2026-08-02)
+
+Reproduced at **SMP=4, conc=1** — one rustc, four cores — which already rules the original
+guess out, and the kernel log rules it out with a number: free memory never dropped below
+**790,312 of 1,048,576 pages (75% free, ~3.0 GB)** across the whole run. There is also no
+region-count cap in play (max 1,954 lazy regions observed; pid 212 held 516).
+
+It is intermittent (1 failure in 6 attempts) and **pre-existing** — a same-session `git
+stash` HEAD build on the same disk at the same SMP reproduces it with an identical
+signature, so it is not attributable to any in-flight Phase 7f work.
+
+**Why only `big`:** it is the only input large enough for rustc to split codegen across
+multiple units and spawn `opt cgu.N` worker threads. `hello_std`/`hello_nostd` are
+single-CGU and never call `clone_thread`. So `big` is not "the big one" — it is *the
+threaded one*.
+
+**The sequence, from the T187.24–187.30 window of a captured failure:**
+
+1. A worker thread (tid 18) is already running with a corrupt register context when a
+   fault hits it: `[signal] deliver sig=11 slot=18 fault_pc=0x4016f138 user_sp=0xd4`.
+   Both values are impossible for EL0 — `0x4016f138` is *kernel text*
+   (`KERNEL_PHYS_BASE` 0x4010_0000 + 0x6f138) and `0xd4` is not a stack.
+2. rustc's own SIGSEGV handler runs (correctly, on its altstack), and `sigreturn` faithfully
+   restores the corrupt context — `[sigreturn] restoring: sp=0xd4 pc=0x4016f138` — so the
+   `eret` instruction-aborts immediately: `Process 220 (opt cgu.1) SIGSEGV`.
+3. The register file at the fault looks like a **kernel** call frame, not a user one:
+   `x0=0x0, x1=0x12, x2=0x40146d54, x3=0xd4`. `x1 = 18` is the faulting thread's own tid,
+   `x2` is another kernel text address, and `x3 = 0xd4 = 212` is the process's own PID.
+   That is an EL0 return carrying a kernel register context — the trap-frame /
+   context-switch corruption family, not a userspace bug.
+4. The resulting `exit_group` tears the process down **while sibling threads are still
+   on-CPU**: four log lines after pid 212 is recorded with 516 lazy regions, the fault path
+   reports `lookup_process(212) returned None!` and `pid has 0 lazy regions`, and a sibling
+   still spinning in a `clock_gettime` loop takes a `[WILD-DA]` on unmapped memory
+   (`FAR=0x16f66e020`). A third thread `eret`s to `0x700000006` and takes an `EC=0x22` PC
+   alignment fault. Those are **consequences** of the teardown, not independent bugs.
+5. `exit_group` kills the process before any diagnostic is flushed — which is precisely
+   why the harness sees "artifact absent, rustc silent". The silence is the teardown, not
+   a compiler error.
+
+**So: root cause is an EL0 return with a kernel register context in a
+thread-creation-heavy workload** — the known `clone_thread` SIGSEGV family, adjacent to
+the phantom-SVC / trap-frame corruption issues in
+[`SMP_PHANTOM_SVC_ESR_SNAPSHOT`-era notes](BKL_PHASE7_AUDIT.md). The peer-teardown
+cascade in step 4 is separately interesting: it is a live instance of the
+process-table-freed-under-running-threads hazard that
+[`BKL_PHASE7_AUDIT.md`](BKL_PHASE7_AUDIT.md) §2.1.1 describes ("the documented safety
+argument covers self-free, not peer-free").
+
+**One unexplained detail worth keeping**, offered as a lead rather than a conclusion:
+`SP_EL0` and `x3` both hold `0xd4`, which is exactly this process's PID (212), while `x1`
+holds exactly its faulting tid (18). A PID and a TID landing in an EL0 register context is
+a strong hint about *which* kernel frame leaked, and is the thread to pull first.
 - **Docker is not bare metal** — Docker Desktop runs a Linux VM on the same host, so this
   is VM-vs-VM, which is the fairer comparison. Host: 12 logical / 8 performance cores.
 - No `[BKLPROF]` attribution was captured on *this* workload. That is the obvious

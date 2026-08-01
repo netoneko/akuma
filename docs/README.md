@@ -51,7 +51,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | `[BKL] stale dropped-window ... healed` / converting a syscall off the BKL | [`reference/subsystems/locking.md`](reference/subsystems/locking.md) -> "The per-syscall BKL opt-out list" + [`archive/BKL_PHASE7F_OPTOUT_LIST.md`](archive/BKL_PHASE7F_OPTOUT_LIST.md) |
 | `test_epoll_multi_poller_pipe FAILED: woken=1` / a boot-suite test that fails ~1 boot in 3 | [`archive/EPOLL_MULTI_POLLER_PIPE_FLAKE.md`](archive/EPOLL_MULTI_POLLER_PIPE_FLAKE.md) — test defect, not a kernel bug; do not accept/reject a change on one boot |
 | Benchmarking in-VM rustc / SMP scaling vs Linux | [`archive/BKL_RUSTC_SCALING_BASELINE.md`](archive/BKL_RUSTC_SCALING_BASELINE.md) + `scripts/bkl_rustc_bench/` |
-| `rustc -O big.rs` produces no artifact and prints nothing / `(opt cgu.N) SIGSEGV` | Pre-existing, not your change — [`archive/BKL_RUSTC_SCALING_BASELINE.md`](archive/BKL_RUSTC_SCALING_BASELINE.md) §5 (memory pressure) + the `clone_thread` SIGSEGV family. Stash-baseline before investigating |
+| `rustc -O big.rs` produces no artifact and prints nothing / `(opt cgu.N) SIGSEGV` | Pre-existing (~1 in 6), not your change — [`archive/BKL_RUSTC_SCALING_BASELINE.md`](archive/BKL_RUSTC_SCALING_BASELINE.md) §5.1: an EL0 return with a *kernel* register context in rustc's codegen worker threads; the silence is `exit_group`, not a compiler error. Stash-baseline before investigating |
 | AB-BA deadlock hunting / "can this `Spinlock` just be an atomic?" | [`reference/subsystems/locking.md`](reference/subsystems/locking.md) -> gate 2 + [`archive/BKL_FINE_GRAINED_LOCKING_PLAN.md`](archive/BKL_FINE_GRAINED_LOCKING_PLAN.md) §7.3a (phase 7g classification table) |
 
 ## Task list - "I want to do X"
