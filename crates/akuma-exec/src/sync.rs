@@ -422,9 +422,12 @@ pub fn reset_wait_by_holder() {
 /// return per kernel excursion, there is exactly one release per excursion — no
 /// per-thread depth needs to travel across context switches. This upgrades the
 /// kernel's pervasive single-core `with_irqs_disabled` invariant (mutual exclusion on
-/// one core only) into a genuine cross-core one, so the ~218 legacy
-/// `lookup_process() -> &'static mut Process` sites become correct without per-site
-/// changes (docs/archive/SMP_SHARED.md, M1). Uncontended on a single-core build and in
+/// one core only) into a genuine cross-core one — historically this is what made the
+/// ~218 legacy `lookup_process() -> &'static mut Process` sites correct without
+/// per-site changes (docs/archive/SMP_SHARED.md, M1); Phase 7e's "Access" half has
+/// since deleted that API in favor of `lookup_process_shared`/`with_process`, but
+/// same-core field races on a live ACTIVE process still lean on the BKL exactly the
+/// same way. Uncontended on a single-core build and in
 /// M0/M1 (secondaries parked).
 ///
 /// **IRQ state:** the IRQ/eret paths call in with local IRQs masked (hardware masks on

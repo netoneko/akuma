@@ -140,7 +140,7 @@ impl ProcFilesystem {
 
     /// Check if a process exists
     fn process_exists(pid: Pid) -> bool {
-        process::lookup_process(pid).is_some()
+        process::lookup_process_shared(pid).is_some()
     }
 
     /// Returns a human-readable description string for an fd entry (used by readlinkat).
@@ -192,7 +192,7 @@ pub fn proc_fd_description(path: &str) -> Option<String> {
 
     // Handle "self/fd/<n>"
     let path = if let Some(rest) = path.strip_prefix("self/") {
-        let pid = process::current_process().map(|p| p.pid)?;
+        let pid = process::current_process_shared().map(|p| p.pid)?;
         alloc::format!("{pid}/{rest}")
     } else {
         alloc::string::String::from(path)
@@ -202,7 +202,7 @@ pub fn proc_fd_description(path: &str) -> Option<String> {
     if parts.len() == 3 && parts[1] == "fd" {
         let pid: Pid = parts[0].parse().ok()?;
         let fd: u32 = parts[2].parse().ok()?;
-        let proc = process::lookup_process(pid)?;
+        let proc = process::lookup_process_shared(pid)?;
         let fd_entry = proc.get_fd(fd)?;
         Some(ProcFilesystem::fd_description(&fd_entry, fd))
     } else {
@@ -217,7 +217,7 @@ impl Filesystem for ProcFilesystem {
 
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
         let path = path.trim_matches('/');
-        let current_box_id = akuma_exec::process::current_process().map_or(0, |p| p.box_id);
+        let current_box_id = akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id);
 
         if path.is_empty() {
             // Root: list all process PIDs as directories, filtered by box_id
@@ -228,7 +228,7 @@ impl Filesystem for ProcFilesystem {
                     // Box 0 (Host) sees everything. Box N only sees its own.
                     if current_box_id == 0 {
                         true
-                    } else if let Some(proc) = process::lookup_process(p.pid) {
+                    } else if let Some(proc) = process::lookup_process_shared(p.pid) {
                         proc.box_id == current_box_id
                     } else {
                         false
@@ -369,7 +369,7 @@ impl Filesystem for ProcFilesystem {
                 return Err(FsError::NotFound);
             }
 
-            let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
+            let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
             let mut entries = alloc::vec![];
             // Always include std fds (Stdin/Stdout/Stderr are not in the BTreeMap)
             for fd_num in [0u32, 1, 2] {
@@ -432,9 +432,9 @@ impl Filesystem for ProcFilesystem {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
             if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status" || parts[1] == "stat")
                 && let Ok(pid) = parts[0].parse::<Pid>() {
-                    let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
+                    let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
                     let current_box_id =
-                        akuma_exec::process::current_process().map_or(0, |p| p.box_id);
+                        akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id);
                     if current_box_id != 0 && proc.box_id != current_box_id {
                         return Err(FsError::NotFound);
                     }
@@ -453,10 +453,10 @@ impl Filesystem for ProcFilesystem {
         }
 
         let (pid, fd_num) = Self::parse_fd_path(path)?;
-        let current_proc = akuma_exec::process::current_process();
+        let current_proc = akuma_exec::process::current_process_shared();
         let current_box_id = current_proc.as_ref().map_or(0, |p| p.box_id);
 
-        let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
+        let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
         
         // BOX ISOLATION: Box N only sees its own processes.
         if current_box_id != 0 && proc.box_id != current_box_id {
@@ -500,7 +500,7 @@ impl Filesystem for ProcFilesystem {
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
         let path = path.trim_start_matches('/');
-        let current_proc = akuma_exec::process::current_process();
+        let current_proc = akuma_exec::process::current_process_shared();
         let current_box_id = current_proc.as_ref().map_or(0, |p| p.box_id);
 
         // Handle /proc/boxes
@@ -592,7 +592,7 @@ impl Filesystem for ProcFilesystem {
                 && let Ok(pid) = parts[0].parse::<Pid>() {
                     // Box isolation check: only allow if same box or host
                     if current_box_id != 0
-                        && let Some(proc) = process::lookup_process(pid)
+                        && let Some(proc) = process::lookup_process_shared(pid)
                             && proc.box_id != current_box_id {
                                 return Err(FsError::NotFound);
                             }
@@ -606,7 +606,7 @@ impl Filesystem for ProcFilesystem {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
             if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status" || parts[1] == "stat")
                 && let Ok(pid) = parts[0].parse::<Pid>() {
-                    let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
+                    let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
                     if current_box_id != 0 && proc.box_id != current_box_id {
                         return Err(FsError::NotFound);
                     }
@@ -620,10 +620,10 @@ impl Filesystem for ProcFilesystem {
 
         let (pid, fd_num) = Self::parse_fd_path(path)?;
 
-        let current_proc = akuma_exec::process::current_process();
+        let current_proc = akuma_exec::process::current_process_shared();
         let current_box_id = current_proc.as_ref().map_or(0, |p| p.box_id);
 
-        let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
+        let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
         
         // BOX ISOLATION: Box N only sees its own processes.
         if current_box_id != 0 && proc.box_id != current_box_id {
@@ -640,11 +640,11 @@ impl Filesystem for ProcFilesystem {
 
     fn write_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
         let (target_pid, fd_num) = Self::parse_fd_path(path)?;
-        let caller_proc = akuma_exec::process::current_process();
+        let caller_proc = akuma_exec::process::current_process_shared();
         let caller_pid = process::read_current_pid();
         let caller_box_id = caller_proc.as_ref().map_or(0, |p| p.box_id);
 
-        let target = process::lookup_process(target_pid).ok_or(FsError::NotFound)?;
+        let target = process::lookup_process_shared(target_pid).ok_or(FsError::NotFound)?;
 
         // BOX ISOLATION: Box N only sees its own processes.
         if caller_box_id != 0 && target.box_id != caller_box_id {
@@ -718,7 +718,7 @@ impl Filesystem for ProcFilesystem {
         }
 
         if path == "boxes" || path == "cores" {
-            let current_box_id = akuma_exec::process::current_process().map_or(0, |p| p.box_id);
+            let current_box_id = akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id);
             return current_box_id == 0;
         }
 
@@ -734,7 +734,7 @@ impl Filesystem for ProcFilesystem {
         if let Ok((pid, fd_num)) = Self::parse_fd_path(path) {
             if !Self::process_exists(pid) { return false; }
             if fd_num <= 1 { return true; }
-            return process::lookup_process(pid)
+            return process::lookup_process_shared(pid)
                 .is_some_and(|p| p.get_fd(fd_num).is_some());
         }
 
@@ -755,9 +755,9 @@ impl Filesystem for ProcFilesystem {
                 if !Self::process_exists(pid) {
                     return false;
                 }
-                if let Some(proc) = process::lookup_process(pid) {
+                if let Some(proc) = process::lookup_process_shared(pid) {
                     let current_box_id =
-                        akuma_exec::process::current_process().map_or(0, |p| p.box_id);
+                        akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id);
                     return current_box_id == 0 || proc.box_id == current_box_id;
                 }
                 return false;
@@ -795,7 +795,7 @@ impl Filesystem for ProcFilesystem {
         }
 
         if path == "boxes" || path == "cores" {
-            let current_box_id = akuma_exec::process::current_process().map_or(0, |p| p.box_id);
+            let current_box_id = akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id);
             if current_box_id != 0 {
                 return Err(FsError::NotFound);
             }
@@ -860,7 +860,7 @@ impl Filesystem for ProcFilesystem {
 
         // Try fd path first
         if let Ok((pid, fd_num)) = Self::parse_fd_path(path) {
-            let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
+            let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
             let size = match fd_num {
                 0 => proc.stdin.lock().len() as u64,
                 1 => proc.stdout.lock().len() as u64,
@@ -900,9 +900,9 @@ impl Filesystem for ProcFilesystem {
             }
             // <pid>/cmdline and <pid>/status
             if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status" || parts[1] == "stat") {
-                let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
+                let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
                 let current_box_id =
-                    akuma_exec::process::current_process().map_or(0, |p| p.box_id);
+                    akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id);
                 if current_box_id != 0 && proc.box_id != current_box_id {
                     return Err(FsError::NotFound);
                 }
@@ -955,7 +955,7 @@ impl Filesystem for ProcFilesystem {
 
         // Handle "self/fd/<n>" -> resolve to current process
         if let Some(rest) = path.strip_prefix("self/") {
-            let pid = process::current_process().map(|p| p.pid).ok_or(FsError::NotFound)?;
+            let pid = process::current_process_shared().map(|p| p.pid).ok_or(FsError::NotFound)?;
             let new_path = format!("{pid}/{rest}");
             return self.read_symlink(&new_path);
         }
@@ -970,7 +970,7 @@ impl Filesystem for ProcFilesystem {
             let pid: Pid = parts[0].parse().map_err(|_| FsError::NotFound)?;
             let fd: u32 = parts[2].parse().map_err(|_| FsError::NotFound)?;
 
-            let proc = process::lookup_process(pid).ok_or(FsError::NotFound)?;
+            let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
             if let Some(fd_entry) = proc.get_fd(fd) {
                 use akuma_exec::process::FileDescriptor;
                 if let FileDescriptor::File(f) = fd_entry {

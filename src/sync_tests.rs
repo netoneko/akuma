@@ -1928,7 +1928,7 @@ fn test_epoll_eintr_when_signal_pending() {
     let tid = current_thread_id();
     let pid = 7010u32;
 
-    // Register test process so current_process() works inside epoll
+    // Register test process so current_process_shared() works inside epoll
     let proc = crate::process_tests::make_test_process(pid);
     register_process(pid, proc);
     register_thread_pid(tid, pid);
@@ -1939,7 +1939,7 @@ fn test_epoll_eintr_when_signal_pending() {
 
     // Create a pipe and put the read end in the process fd table
     let pipe_id = pipe_create();
-    let pipe_fd = akuma_exec::process::current_process()
+    let pipe_fd = akuma_exec::process::current_process_shared()
         .unwrap()
         .alloc_fd(FileDescriptor::PipeRead(pipe_id));
 

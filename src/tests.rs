@@ -4117,8 +4117,8 @@ fn test_compute_thread_limit() -> bool {
 /// Bug 8: CLONE_VM child's mmap_regions is empty — lookups must use owner PID.
 ///
 /// Registers a parent and a CLONE_VM child in PROCESS_TABLE. Adds mmap_regions
-/// to the parent. Verifies lookup_process(parent) sees the regions while
-/// lookup_process(child) sees none.
+/// to the parent. Verifies lookup_process_shared(parent) sees the regions while
+/// lookup_process_shared(child) sees none.
 fn test_clone_vm_mmap_regions_on_owner() -> bool {
     console::print("\n[TEST] CLONE_VM: mmap_regions only on address-space owner\n");
 
@@ -4141,17 +4141,19 @@ fn test_clone_vm_mmap_regions_on_owner() -> bool {
     akuma_exec::process::register_process(parent_pid, parent_proc);
     akuma_exec::process::register_process(child_pid, child_proc);
 
-    let parent_regions = akuma_exec::process::lookup_process(parent_pid)
+    let parent_regions = akuma_exec::process::lookup_process_shared(parent_pid)
         .map_or(0, |p| p.mmap_regions.len());
-    let child_regions = akuma_exec::process::lookup_process(child_pid)
+    let child_regions = akuma_exec::process::lookup_process_shared(child_pid)
         .map_or(0, |p| p.mmap_regions.len());
 
     // Cleanup. Free the manually-injected mmap frames while the process is still
     // ACTIVE (and thus visible to lookup_process) — unregister_process now retires
     // rather than returning ownership, see its doc comment, so this must happen
     // before, not after.
-    if let Some(p) = akuma_exec::process::lookup_process(parent_pid) {
-        for reg in p.mmap_regions.drain(..) {
+    if let Some(p) = akuma_exec::process::lookup_process_shared(parent_pid) {
+        // Detach under vm_lock (mem::take is allocation-free), free outside it.
+        let regions = p.vm_with_regions(core::mem::take);
+        for reg in regions {
             for f in reg.frames { crate::pmm::free_page(f); }
         }
     }
@@ -4208,7 +4210,7 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
     let page_va = fault_va & !0xFFF;
 
     // Search via owner PID (correct path after fix)
-    let found_via_owner = akuma_exec::process::lookup_process(owner_pid).and_then(|p| {
+    let found_via_owner = akuma_exec::process::lookup_process_shared(owner_pid).and_then(|p| {
         for reg in &p.mmap_regions {
             if reg.contains(page_va) {
                 return Some((reg.start_va, reg.pages));
@@ -4218,7 +4220,7 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
     });
 
     // Search via worker PID (broken path before fix)
-    let found_via_worker = akuma_exec::process::lookup_process(worker_pid).and_then(|p| {
+    let found_via_worker = akuma_exec::process::lookup_process_shared(worker_pid).and_then(|p| {
         for reg in &p.mmap_regions {
             if reg.contains(page_va) {
                 return Some((reg.start_va, reg.pages));
@@ -4231,8 +4233,10 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
     // ACTIVE (and thus visible to lookup_process) — unregister_process now retires
     // rather than returning ownership, see its doc comment, so this must happen
     // before, not after.
-    if let Some(p) = akuma_exec::process::lookup_process(owner_pid) {
-        for reg in p.mmap_regions.drain(..) {
+    if let Some(p) = akuma_exec::process::lookup_process_shared(owner_pid) {
+        // Detach under vm_lock (mem::take is allocation-free), free outside it.
+        let regions = p.vm_with_regions(core::mem::take);
+        for reg in regions {
             for f in reg.frames { crate::pmm::free_page(f); }
         }
     }
@@ -5277,9 +5281,9 @@ fn test_kill_process_cascades_to_children() -> bool {
 
     let kill_ok = akuma_exec::process::kill_process(parent_pid).is_ok();
     // After kill, processes should be zombies (still in table, but exited=true)
-    let parent_zombie = akuma_exec::process::lookup_process(parent_pid)
+    let parent_zombie = akuma_exec::process::lookup_process_shared(parent_pid)
         .is_some_and(|p| p.exited);
-    let child_zombie = akuma_exec::process::lookup_process(child_pid)
+    let child_zombie = akuma_exec::process::lookup_process_shared(child_pid)
         .is_some_and(|p| p.exited);
 
     // Clean up zombies (simulates what wait4/on_thread_cleanup would do)
@@ -6427,7 +6431,7 @@ fn test_large_mmap_limit() -> bool {
 
 /// Test: sys_close_range implementation
 ///
-/// Creates a temporary test process and registers it so that current_process()
+/// Creates a temporary test process and registers it so that current_process_shared()
 /// works inside sys_close_range. This is necessary because memory tests run
 /// during early boot before any user process exists.
 fn test_close_range() -> bool {
@@ -6443,7 +6447,7 @@ fn test_close_range() -> bool {
     let tid = akuma_exec::threading::current_thread_id();
     akuma_exec::process::register_thread_pid(tid, test_pid);
 
-    let proc = akuma_exec::process::lookup_process(test_pid).unwrap();
+    let proc = akuma_exec::process::lookup_process_shared(test_pid).unwrap();
 
     // 1. Setup a few FDs
     let fd1 = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);

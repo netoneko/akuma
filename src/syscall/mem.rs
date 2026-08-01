@@ -12,7 +12,7 @@ use akuma_exec::process::MmapRegion;
 /// the BKL so this core runs the syscall concurrently with peer cores, and
 /// `drop()` RE-ACQUIRES it on every return path. Correctness rests on the state
 /// these syscalls mutate already carrying its own fine-grained lock —
-/// `Process::as_lock` (page-table PTE edits, via `AsLockHold`/`as_lock_hold`),
+/// `Process::as_lock` (page-table PTE edits, via `Process::with_address_space`),
 /// `Process::vm_lock` (`mmap_regions` AND the mmap free-list, via
 /// `vm_with_regions`/`vm_alloc_mmap`/`vm_free_mmap`), `LAZY_REGION_TABLE`, PMM/
 /// `FRAME_TRACKER` (never held across a yield), and `SHARED_FILE_MAPPINGS` — so
@@ -140,7 +140,7 @@ pub(super) fn flush_and_clear_shared_file_mappings(tgid: u32) {
             .collect()
     };
     if entries.is_empty() { return; }
-    if let Some(proc) = akuma_exec::process::lookup_process(tgid) {
+    if let Some(proc) = akuma_exec::process::lookup_process_shared(tgid) {
         for (base, path, foff, mlen) in &entries {
             let pas = proc.vm_with_regions(|r| {
                 r.iter().find(|reg| reg.start_va == *base)
@@ -160,8 +160,8 @@ pub(super) fn flush_and_clear_shared_file_mappings(tgid: u32) {
 /// no-op (return success), matching Linux for clean/private ranges.
 pub(super) fn sys_msync(addr: usize, len: usize, _flags: u32) -> u64 {
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
-    let proc = match akuma_exec::process::lookup_process(owner_pid) {
+    let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
+    let proc = match akuma_exec::process::lookup_process_shared(owner_pid) {
         Some(p) => p,
         None => return ESRCH,
     };
@@ -215,8 +215,8 @@ pub fn mmap_fixed_overlaps_kernel_va(addr: usize, len: usize) -> bool {
 
 pub(super) fn sys_brk(new_brk: usize) -> u64 {
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
-    if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
+    let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
+    if let Some(proc) = akuma_exec::process::lookup_process_shared(owner_pid) {
         if new_brk == 0 { proc.get_brk() as u64 } else { proc.set_brk(new_brk) as u64 }
     } else { 0 }
 }
@@ -278,8 +278,8 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     }
 
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
-    let proc = match akuma_exec::process::lookup_process(owner_pid) {
+    let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
+    let proc = match akuma_exec::process::lookup_process_shared(owner_pid) {
         Some(p) => p,
         None => return ESRCH,
     };
@@ -299,12 +299,12 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             let _ = akuma_exec::process::munmap_lazy_regions_in_range(proc.tgid, addr, pages * 4096);
             // Page-table edits under `as_lock` (shared-kernel SMP): excludes a
             // concurrent BKL-free fault on this address space. No alloc/IO here.
-            #[cfg(kernel_smp_shared)]
-            let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
-            for i in 0..pages {
-                let va = addr + i * 4096;
-                let _ = proc.address_space.unmap_page(va);
-            }
+            proc.with_address_space(|aspace| {
+                for i in 0..pages {
+                    let va = addr + i * 4096;
+                    let _ = aspace.unmap_page(va);
+                }
+            });
         }
         addr
     } else if let Some(a) = proc.vm_alloc_mmap(pages * 4096) { a } else {
@@ -452,26 +452,24 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     }
 
     let frames = frame_batch;
-    {
-        // Page-table install under `as_lock` (shared-kernel SMP): frames were already
-        // allocated above (alloc must stay OUTSIDE the hold — the PMM OOM/reclaim path
-        // can unmap pages and re-enter `as_lock`) and already carry their file content,
-        // so they install with the final `page_flags` directly (no RW_NO_EXEC window +
-        // permission fix-up pass). Excludes concurrent BKL-free faults. No I/O here.
-        #[cfg(kernel_smp_shared)]
-        let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+    // Page-table install under `as_lock` (shared-kernel SMP): frames were already
+    // allocated above (alloc must stay OUTSIDE the hold — the PMM OOM/reclaim path
+    // can unmap pages and re-enter `as_lock`) and already carry their file content,
+    // so they install with the final `page_flags` directly (no RW_NO_EXEC window +
+    // permission fix-up pass). Excludes concurrent BKL-free faults. No I/O here.
+    proc.with_address_space(|aspace| {
         for (i, frame) in frames.iter().enumerate() {
             let (table_frames, _) = unsafe {
                 akuma_exec::mmu::map_user_page_no_flush(mmap_addr + i * 4096, frame.addr, page_flags)
             };
-            proc.address_space.track_user_frame(*frame);
+            aspace.track_user_frame(*frame);
             for tf in table_frames {
-                proc.address_space.track_page_table_frame(tf);
+                aspace.track_page_table_frame(tf);
             }
         }
         // Single TLB flush for the entire mmap range (still under the hold).
         akuma_exec::mmu::flush_tlb_range(mmap_addr, pages);
-    }
+    });
     crate::pmm::dp_count(&crate::pmm::EAGER_MMAP_PAGES, pages);
 
     // Record writable MAP_SHARED file mappings so their pages get written back to
@@ -512,8 +510,8 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
     // the BKL so far resolves its process reference before opening the drop window
     // rather than re-walking the table inside it.
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
-    let proc = akuma_exec::process::lookup_process(owner_pid);
+    let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
+    let proc = akuma_exec::process::lookup_process_shared(owner_pid);
     let _mm_window = MmBklGuard::new();
 
     if flags & MREMAP_MAYMOVE == 0 {
@@ -544,18 +542,16 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
                 return ENOMEM;
             }
         }
-        {
-            // Page-table install under `as_lock` (shared-kernel SMP). PTE edits only.
-            #[cfg(kernel_smp_shared)]
-            let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+        // Page-table install under `as_lock` (shared-kernel SMP). PTE edits only.
+        proc.with_address_space(|aspace| {
             for (i, frame) in new_frames.iter().enumerate() {
                 let (table_frames, _) = unsafe { akuma_exec::mmu::map_user_page(new_addr + i * 4096, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC) };
-                proc.address_space.track_user_frame(*frame);
+                aspace.track_user_frame(*frame);
                 for tf in table_frames {
-                    proc.address_space.track_page_table_frame(tf);
+                    aspace.track_page_table_frame(tf);
                 }
             }
-        }
+        });
 
         let copy_len = old_size.min(new_size);
         if validate_user_ptr(old_addr as u64, copy_len) {
@@ -591,9 +587,7 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
             // Unmap + user-frame bookkeeping under `as_lock`; collect frames to free
             // and free them AFTER releasing the hold (free stays outside).
             let mut to_free = alloc::vec::Vec::new();
-            {
-                #[cfg(kernel_smp_shared)]
-                let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+            proc.with_address_space(|aspace| {
                 for i in 0..old_region_pages {
                     let va = old_addr + i * 4096;
                     match old_frames.get(i) {
@@ -601,20 +595,20 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
                         // last reference; an aliased/shared PA is freed by its
                         // surviving owner instead.
                         Some(&frame) => {
-                            let _ = proc.address_space.unmap_page(va);
-                            if proc.address_space.remove_user_frame(frame) {
+                            let _ = aspace.unmap_page(va);
+                            if aspace.remove_user_frame(frame) {
                                 to_free.push(frame);
                             }
                         }
                         // CoW-inherited page: take the PA from the live PTE.
                         None => {
-                            if let Some(frame) = proc.address_space.unmap_and_free_page(va) {
+                            if let Some(frame) = aspace.unmap_and_free_page(va) {
                                 to_free.push(frame);
                             }
                         }
                     }
                 }
-            }
+            });
             for frame in to_free { crate::pmm::free_page(frame); }
             proc.vm_free_mmap(old_addr, freed_size);
             found_eager = true;
@@ -624,23 +618,21 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
             let lazy_results = akuma_exec::process::munmap_lazy_regions_in_range(proc.tgid, old_addr, old_pages * 4096);
             // Unmap under `as_lock`; free the returned frames after the hold.
             let mut to_free = alloc::vec::Vec::new();
-            {
-                #[cfg(kernel_smp_shared)]
-                let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+            proc.with_address_space(|aspace| {
                 for &(freed_start, freed_pages) in &lazy_results {
                     for i in 0..freed_pages {
-                        if let Some(frame) = proc.address_space.unmap_and_free_page(freed_start + i * 4096) {
+                        if let Some(frame) = aspace.unmap_and_free_page(freed_start + i * 4096) {
                             to_free.push(frame);
                         }
                     }
                 }
                 for i in 0..old_pages {
                     let va = old_addr + i * 4096;
-                    if let Some(frame) = proc.address_space.unmap_and_free_page(va) {
+                    if let Some(frame) = aspace.unmap_and_free_page(va) {
                         to_free.push(frame);
                     }
                 }
-            }
+            });
             for frame in to_free { crate::pmm::free_page(frame); }
             proc.vm_free_mmap(old_addr, old_pages * 4096);
         }
@@ -659,8 +651,8 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
             // Pre-fault pages in lazy regions that aren't yet mapped.
             // This is advisory; OOM during pre-faulting is silently ignored.
             let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
-            let proc = match akuma_exec::process::lookup_process(owner_pid) {
+    let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
+            let proc = match akuma_exec::process::lookup_process_shared(owner_pid) {
                 Some(p) => p,
                 None => return 0,
             };
@@ -699,30 +691,28 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
                 Some(v) => v,
                 None => return 0, // advisory — ignore OOM
             };
-            {
-                // Prefault install under `as_lock` (shared-kernel SMP); frames were
-                // allocated above (alloc stays outside the hold).
-                #[cfg(kernel_smp_shared)]
-                let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+            // Prefault install under `as_lock` (shared-kernel SMP); frames were
+            // allocated above (alloc stays outside the hold).
+            proc.with_address_space(|aspace| {
                 for (idx, (page_va, flags)) in prefault.into_iter().enumerate() {
                     let frame = frames[idx];
                     let (table_frames, _) = unsafe {
                         akuma_exec::mmu::map_user_page_no_flush(page_va, frame.addr, flags)
                     };
-                    proc.address_space.track_user_frame(frame);
+                    aspace.track_user_frame(frame);
                     for tf in table_frames {
-                        proc.address_space.track_page_table_frame(tf);
+                        aspace.track_page_table_frame(tf);
                     }
                 }
                 // Flush the entire requested range (covers all newly mapped pages).
                 akuma_exec::mmu::flush_tlb_range(aligned_addr, (end - aligned_addr) / 4096);
-            }
+            });
             0
         }
         MADV_DONTNEED => {
             let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
-            let proc = match akuma_exec::process::lookup_process(owner_pid) {
+    let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
+            let proc = match akuma_exec::process::lookup_process_shared(owner_pid) {
                 Some(p) => p,
                 None => return 0,
             };
@@ -730,15 +720,13 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
             let aligned_addr = addr & !0xFFF;
             let aligned_len = ((addr + len + 0xFFF) & !0xFFF) - aligned_addr;
             let pages = aligned_len / 4096;
-            {
-                // `zero_mapped_page` reads page-table state to find each frame; hold
-                // `as_lock` so a concurrent BKL-free fault can't edit the tables under it.
-                #[cfg(kernel_smp_shared)]
-                let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+            // `zero_mapped_page` reads page-table state to find each frame; hold
+            // `as_lock` so a concurrent BKL-free fault can't edit the tables under it.
+            proc.with_address_space(|aspace| {
                 for i in 0..pages {
-                    proc.address_space.zero_mapped_page(aligned_addr + i * 4096);
+                    aspace.zero_mapped_page(aligned_addr + i * 4096);
                 }
-            }
+            });
             0
         }
         MADV_FREE => 0,
@@ -773,32 +761,30 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     let new_flags = akuma_exec::mmu::user_flags::from_prot(prot);
     let adding_exec = prot & 0x4 != 0;
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
+    let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
     crate::tprint!(128, "[mprotect] pid={} owner={} addr=0x{:x} len=0x{:x} prot={:#x}\n",
         current_pid, owner_pid, addr, pages * 4096, prot);
-    if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
+    if let Some(proc) = akuma_exec::process::lookup_process_shared(owner_pid) {
         let _mm_window = MmBklGuard::new();
         akuma_exec::process::update_lazy_region_flags(proc.tgid, addr, pages * 4096, new_flags);
 
         // Update all page table entries with no_flush, then issue a single
         // TLB range flush. Previously each update_page_flags call issued its
         // own dsb+tlbi+dsb+isb, causing O(pages) expensive barrier sequences.
-        let mut any_updated = false;
-        {
-            // Permission edits under `as_lock` (shared-kernel SMP). PTE edits only.
-            #[cfg(kernel_smp_shared)]
-            let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+        // Permission edits under `as_lock` (shared-kernel SMP). PTE edits only.
+        proc.with_address_space(|aspace| {
+            let mut any_updated = false;
             for i in 0..pages {
                 let va = addr + i * 4096;
-                if proc.address_space.is_mapped(va) {
-                    let _ = proc.address_space.update_page_flags_no_flush(va, new_flags);
+                if aspace.is_mapped(va) {
+                    let _ = aspace.update_page_flags_no_flush(va, new_flags);
                     any_updated = true;
                 }
             }
             if any_updated {
                 akuma_exec::mmu::flush_tlb_range(addr, pages);
             }
-        }
+        });
         if adding_exec {
             for i in 0..pages {
                 let va = addr + i * 4096;
@@ -826,8 +812,8 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
 
 pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process(current_pid).map_or(current_pid, |p| p.tgid);
-    let proc = match akuma_exec::process::lookup_process(owner_pid) {
+    let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
+    let proc = match akuma_exec::process::lookup_process_shared(owner_pid) {
         Some(p) => p,
         None => return ESRCH,
     };
@@ -883,9 +869,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
         // Unmap + user-frame bookkeeping under `as_lock` (shared-kernel SMP); free the
         // dropped frames AFTER releasing the hold (free stays outside).
         let mut to_free = alloc::vec::Vec::new();
-        {
-            #[cfg(kernel_smp_shared)]
-            let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+        proc.with_address_space(|aspace| {
             for i in 0..n {
                 let va = base + i * 4096;
                 match frames.get(i) {
@@ -894,8 +878,8 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
                     // reference; an aliased/shared PA is freed by its surviving
                     // owner instead.
                     Some(&frame) => {
-                        let _ = proc.address_space.unmap_page_no_flush(va);
-                        if proc.address_space.remove_user_frame(frame) {
+                        let _ = aspace.unmap_page_no_flush(va);
+                        if aspace.remove_user_frame(frame) {
                             to_free.push(frame);
                         }
                     }
@@ -903,14 +887,14 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
                     // from the live PTE instead, which also covers the case where
                     // a CoW write fault already swapped in a private frame.
                     None => {
-                        if let Some(frame) = proc.address_space.unmap_and_free_page_no_flush(va) {
+                        if let Some(frame) = aspace.unmap_and_free_page_no_flush(va) {
                             to_free.push(frame);
                         }
                     }
                 }
             }
             akuma_exec::mmu::flush_tlb_range_all_asid(base, n);
-        }
+        });
         for frame in to_free { crate::pmm::free_page(frame); }
         proc.vm_free_mmap(addr, n * 4096);
         return 0;
@@ -920,16 +904,14 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     if !results.is_empty() {
         for &(freed_start, freed_pages) in &results {
             let mut to_free = alloc::vec::Vec::new();
-            {
-                #[cfg(kernel_smp_shared)]
-                let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+            proc.with_address_space(|aspace| {
                 for i in 0..freed_pages {
-                    if let Some(frame) = proc.address_space.unmap_and_free_page_no_flush(freed_start + i * 4096) {
+                    if let Some(frame) = aspace.unmap_and_free_page_no_flush(freed_start + i * 4096) {
                         to_free.push(frame);
                     }
                 }
                 akuma_exec::mmu::flush_tlb_range_all_asid(freed_start, freed_pages);
-            }
+            });
             let had_physical = !to_free.is_empty();
             for frame in to_free { crate::pmm::free_page(frame); }
             // Only recycle the VA range when physical pages were actually freed.
@@ -954,13 +936,11 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
         skip.push(proc.vm_with_regions(|r| r.iter().any(|reg| reg.contains(va))));
     }
     let mut to_free = alloc::vec::Vec::new();
-    {
-        #[cfg(kernel_smp_shared)]
-        let _asg = akuma_exec::process::Process::as_lock_hold(&proc.as_lock);
+    proc.with_address_space(|aspace| {
         for (i, &skipped) in skip.iter().enumerate() {
             if skipped { continue; }
             let va = addr + i * 4096;
-            if let Some(frame) = proc.address_space.unmap_and_free_page_no_flush(va) {
+            if let Some(frame) = aspace.unmap_and_free_page_no_flush(va) {
                 to_free.push(frame);
             }
         }
@@ -970,7 +950,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
         if total_pages > 0 {
             akuma_exec::mmu::flush_tlb_range_all_asid(addr, total_pages);
         }
-    }
+    });
     for frame in to_free { crate::pmm::free_page(frame); }
     0
 }

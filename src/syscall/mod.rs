@@ -518,7 +518,7 @@ fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
                         akuma_exec::mmu::map_user_page(va, page_frame.addr, map_flags)
                     };
                     let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-                    if let Some(owner) = akuma_exec::process::lookup_process(owner_pid) {
+                    if let Some(owner) = akuma_exec::process::lookup_process_shared(owner_pid) {
                         if installed {
                             owner.address_space.track_user_frame(page_frame);
                         } else {
@@ -586,17 +586,17 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
 
     akuma_exec::threading::set_thread_current_syscall(syscall_num);
     let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
+    if let Some(proc) = akuma_exec::process::lookup_process_shared(owner_pid) {
         proc.last_syscall.store(syscall_num, Ordering::Relaxed);
         proc.current_syscall.store(syscall_num, Ordering::Relaxed);
     }
 
     if akuma_exec::process::is_current_interrupted() {
-        if let Some(proc) = akuma_exec::process::current_process() {
-            proc.exited = true;
-            proc.exit_code = 130;
-            proc.state = akuma_exec::process::ProcessState::Zombie(130);
-        }
+        akuma_exec::process::with_current_process(|p| {
+            p.exited = true;
+            p.exit_code = 130;
+            p.state = akuma_exec::process::ProcessState::Zombie(130);
+        });
         return EINTR;
     }
 
@@ -634,7 +634,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     let track_time = crate::config::PROCESS_SYSCALL_STATS;
     if track_time {
         let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-        if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
+        if let Some(proc) = akuma_exec::process::lookup_process_shared(owner_pid) {
             proc.syscall_stats.inc(syscall_num);
         }
     }
@@ -997,7 +997,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     };
 
     akuma_exec::threading::set_thread_current_syscall(!0u64);
-    if let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
+    if let Some(proc) = akuma_exec::process::lookup_process_shared(owner_pid) {
         proc.current_syscall.store(!0u64, Ordering::Relaxed);
     }
 
@@ -1005,7 +1005,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         let elapsed = crate::timer::uptime_us().saturating_sub(t0);
         let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
         if track_time
-            && let Some(proc) = akuma_exec::process::lookup_process(owner_pid) {
+            && let Some(proc) = akuma_exec::process::lookup_process_shared(owner_pid) {
                 proc.syscall_stats.add_time_us(syscall_num, elapsed);
             }
         if crate::config::PROC_SYSCALL_LOG_ENABLED && owner_pid != 0 {

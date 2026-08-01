@@ -53,7 +53,7 @@ pub(super) fn sys_pidfd_open(pid: u32, flags: u32) -> u64 {
         return ESRCH;
     }
 
-    let proc = match akuma_exec::process::current_process() {
+    let proc = match akuma_exec::process::current_process_shared() {
         Some(p) => p,
         None => return ENOSYS,
     };

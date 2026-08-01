@@ -348,7 +348,7 @@ pub fn pipe_can_write(id: u32) -> bool {
 
 pub(super) fn sys_pipe2(fds_ptr: u64, flags: u32) -> u64 {
     if !validate_user_ptr(fds_ptr, 8) { return EFAULT; }
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ENOSYS };
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ENOSYS };
 
     let pipe_id = pipe_create();
     let fd_r = proc.alloc_fd(akuma_exec::process::FileDescriptor::PipeRead(pipe_id));

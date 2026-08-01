@@ -4,7 +4,7 @@ use spinning_top::Spinlock;
 use crate::process::types::{Pid, ProcessState, SignalAction, MAX_SIGNALS};
 use crate::process::table;
 use crate::process::channel::{remove_channel, get_channel};
-use crate::process::children::lookup_process;
+use crate::process::children::lookup_process_shared;
 use crate::process::cleanup_process_fds;
 use crate::process::lifecycle::LifecycleGuard;
 use crate::threading;
@@ -54,7 +54,7 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     }
 
     // Look up the process
-    let proc = lookup_process(pid).ok_or("Process not found")?;
+    let proc = lookup_process_shared(pid).ok_or("Process not found")?;
 
     // Get thread_id before cleanup (needed for channel removal and thread termination).
     // Some synthetic test processes don't have a started thread yet; still allow
@@ -82,10 +82,12 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     // The zombie is reaped by on_thread_cleanup when the thread slot is recycled,
     // or by return_to_kernel if the thread reaches it.
     // (Bug #24 + #31: eager unregister caused ECHILD in wait4)
-    proc.exited = true;
-    proc.exit_code = -9;
-    proc.state = ProcessState::Zombie(-9);
-    proc.thread_id = None; // prevent entry_point_trampoline from matching this zombie
+    table::with_process(pid, |p| {
+        p.exited = true;
+        p.exit_code = -9;
+        p.state = ProcessState::Zombie(-9);
+        p.thread_id = None; // prevent entry_point_trampoline from matching this zombie
+    });
 
     // Notify the CHILD channel so the parent's wait4 unblocks, and raise
     // SIGCHLD so a shell parked in `sigsuspend` (busybox ash `wait`) wakes.
@@ -112,7 +114,7 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
 pub fn kill_process_with_signal(pid: Pid, sig: u32) -> Result<(), &'static str> {
     // Serialize against concurrent lifecycle ops — reentrant. See `process/lifecycle.rs`.
     let _lifecycle = LifecycleGuard::acquire();
-    let proc = lookup_process(pid).ok_or("Process not found")?;
+    let proc = lookup_process_shared(pid).ok_or("Process not found")?;
     let thread_id = proc.thread_id;
 
     if let Some(tid) = thread_id {
@@ -127,10 +129,12 @@ pub fn kill_process_with_signal(pid: Pid, sig: u32) -> Result<(), &'static str> 
     cleanup_process_fds(proc);
 
     let exit_code = -(sig as i32);
-    proc.exited = true;
-    proc.exit_code = exit_code;
-    proc.state = ProcessState::Zombie(exit_code);
-    proc.thread_id = None;
+    table::with_process(pid, |p| {
+        p.exited = true;
+        p.exit_code = exit_code;
+        p.state = ProcessState::Zombie(exit_code);
+        p.thread_id = None;
+    });
 
     // Do NOT unregister — leave zombie for wait4 to reap.
 

@@ -65,7 +65,7 @@ pub(super) fn timerfd_can_read(timer_id: u32) -> bool {
 
 pub(super) fn sys_timerfd_create(clockid: i32, flags: i32) -> u64 {
     let timer_id = TIMERFD_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::TimerFd(timer_id));
         crate::safe_print!(96, "[timerfd] create id={} fd={} clk={} fl={}\n", timer_id, fd, clockid, flags);
         u64::from(fd)
@@ -75,7 +75,7 @@ pub(super) fn sys_timerfd_create(clockid: i32, flags: i32) -> u64 {
 }
 
 pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old_value: usize) -> u64 {
-    let timer_id = match akuma_exec::process::current_process().and_then(|p| p.get_fd(fd_num)) {
+    let timer_id = match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(fd_num)) {
         Some(akuma_exec::process::FileDescriptor::TimerFd(id)) => id,
         _ => return EBADF,
     };
@@ -135,7 +135,7 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
 }
 
 pub(super) fn sys_timerfd_gettime(fd_arg0: u64, out_ptr: u64) -> u64 {
-    let timer_id = match akuma_exec::process::current_process().and_then(|p| p.get_fd(fd_arg0 as u32)) {
+    let timer_id = match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(fd_arg0 as u32)) {
         Some(akuma_exec::process::FileDescriptor::TimerFd(id)) => id,
         _ => return EBADF,
     };

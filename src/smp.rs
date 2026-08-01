@@ -2674,7 +2674,7 @@ fn secondary_init_local_nic(idx: usize) {
         utc_seconds: crate::timer::utc_seconds,
         yield_now: akuma_exec::threading::yield_now,
         blocking_relax: akuma_exec::threading::blocking_relax,
-        current_box_id: || akuma_exec::process::current_process().map_or(0, |p| p.box_id),
+        current_box_id: || akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id),
         is_current_interrupted: akuma_exec::process::is_current_interrupted,
         rng_fill: secondary_net_rng_stub,
         current_thread_id: || akuma_exec::threading::current_thread_id() as u32,

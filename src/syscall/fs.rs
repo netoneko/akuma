@@ -203,13 +203,13 @@ pub(super) fn resolve_path_at(dirfd: i32, raw_path: &str) -> String {
         return crate::vfs::canonicalize_path(raw_path);
     }
     let base = if dirfd == -100 {
-        if let Some(proc) = akuma_exec::process::current_process() {
+        if let Some(proc) = akuma_exec::process::current_process_shared() {
             proc.cwd.clone()
         } else {
             String::from("/")
         }
     } else if dirfd >= 0 {
-        if let Some(proc) = akuma_exec::process::current_process() {
+        if let Some(proc) = akuma_exec::process::current_process_shared() {
             if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                 f.path
             } else {
@@ -256,7 +256,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         return EFAULT;
     }
-    let proc = if let Some(p) = akuma_exec::process::current_process() { p } else {
+    let proc = if let Some(p) = akuma_exec::process::current_process_shared() { p } else {
         trace_read_ebadf("no-current-process", fd_num, buf_ptr);
         return EBADF;
     };
@@ -765,7 +765,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
     if offset < 0 { return EINVAL; }
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
     let fd = match proc.get_fd(fd_num) { Some(e) => e, None => return EBADF };
 
     match fd {
@@ -834,7 +834,7 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
 pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
     if offset < 0 { return EINVAL; }
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
     let fd = match proc.get_fd(fd_num) { Some(e) => e, None => return EBADF };
 
     match fd {
@@ -856,7 +856,7 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
 
 pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
     let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return EBADF };
 
     // write(2) to a real file runs BKL-free. Unlike `sys_read`, the on-disk work here
@@ -1175,7 +1175,7 @@ pub(super) fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
 
 pub(super) fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
     if !validate_user_ptr(buf_ptr, 120) { return EFAULT; }
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         if proc.get_fd(fd).is_none() { return EBADF; }
     } else { return ENOSYS; }
     #[repr(C)]
@@ -1214,7 +1214,7 @@ pub(super) fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
 }
 
 pub(super) fn sys_dup(oldfd: u32) -> u64 {
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ENOSYS };
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ENOSYS };
     let entry = match proc.get_fd(oldfd) {
         Some(e) => e,
         None => return EBADF,
@@ -1240,7 +1240,7 @@ pub(super) fn sys_dup(oldfd: u32) -> u64 {
 
 pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
     if oldfd == newfd { return EINVAL; }
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ENOSYS };
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ENOSYS };
     let entry = match proc.get_fd(oldfd) {
         Some(e) => e,
         None => return EBADF,
@@ -1311,13 +1311,13 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         crate::vfs::canonicalize_path(&raw_path)
     } else {
         let base = if dirfd == -100 {
-            if let Some(proc) = akuma_exec::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process_shared() {
                 proc.cwd.clone()
             } else {
                 String::from("/")
             }
         } else if dirfd >= 0 {
-            if let Some(proc) = akuma_exec::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process_shared() {
                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                     f.path
                 } else {
@@ -1359,7 +1359,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
     let path = crate::vfs::resolve_symlinks(&path);
 
     if path == "/dev/null" {
-        if let Some(proc) = akuma_exec::process::current_process() {
+        if let Some(proc) = akuma_exec::process::current_process_shared() {
             let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
             if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
                 proc.set_cloexec(fd);
@@ -1373,7 +1373,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
     }
 
     if path == "/dev/urandom" || path == "/dev/random" {
-        if let Some(proc) = akuma_exec::process::current_process() {
+        if let Some(proc) = akuma_exec::process::current_process_shared() {
             let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevUrandom);
             if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
                 proc.set_cloexec(fd);
@@ -1387,7 +1387,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
     }
 
     if path == "/dev/zero" {
-        if let Some(proc) = akuma_exec::process::current_process() {
+        if let Some(proc) = akuma_exec::process::current_process_shared() {
             let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevZero);
             if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
                 proc.set_cloexec(fd);
@@ -1404,7 +1404,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
     // boot (audio::is_available()); otherwise falls through to the normal path
     // (→ ENOENT), so the node simply doesn't exist when the feature is off.
     if (path == "/dev/dsp" || path == "/dev/audio") && crate::audio::is_available() {
-        if let Some(proc) = akuma_exec::process::current_process() {
+        if let Some(proc) = akuma_exec::process::current_process_shared() {
             let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevDsp);
             if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
                 proc.set_cloexec(fd);
@@ -1426,7 +1426,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         if !akuma_net::rump_tap::is_ready() {
             return ENODEV;
         }
-        if let Some(proc) = akuma_exec::process::current_process() {
+        if let Some(proc) = akuma_exec::process::current_process_shared() {
             let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Tap {
                 nonblock: flags & 0x800 != 0, // O_NONBLOCK
             });
@@ -1442,7 +1442,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
     }
 
     let path = if path == "/proc/self/exe" {
-        if let Some(proc) = akuma_exec::process::current_process() {
+        if let Some(proc) = akuma_exec::process::current_process_shared() {
             proc.name.clone()
         } else {
             return ENOENT;
@@ -1463,7 +1463,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         if (r as i64) < 0 {
             return r;
         }
-        let Some(proc) = akuma_exec::process::current_process() else {
+        let Some(proc) = akuma_exec::process::current_process_shared() else {
             let _ = crate::smp::fwd_close(r as u32); // don't leak the owner handle
             return ESRCH;
         };
@@ -1510,7 +1510,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         }
     }
 
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         let file_existed = crate::fs::exists(&path);
         if !file_existed && (flags & akuma_exec::process::open_flags::O_CREAT != 0) {
             let _ = crate::fs::write_file(&path, &[]);
@@ -1532,7 +1532,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
 }
 
 pub fn sys_close(fd: u32) -> u64 {
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         if let Some(entry) = proc.remove_fd(fd) {
             proc.clear_cloexec(fd);
             match entry {
@@ -1580,7 +1580,7 @@ pub fn sys_close(fd: u32) -> u64 {
 
 pub fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
     const CLOSE_RANGE_CLOEXEC: u32 = 4;
-    let proc = match akuma_exec::process::current_process() {
+    let proc = match akuma_exec::process::current_process_shared() {
         Some(p) => p,
         None => return EBADF,
     };
@@ -1626,7 +1626,7 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
 }
 
 pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         if matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevZero)) {
             return 0;
         }
@@ -1685,7 +1685,7 @@ pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
 pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
     let stat_size = core::mem::size_of::<Stat>();
     if !validate_user_ptr(stat_ptr, stat_size) { return EFAULT; }
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ESRCH };
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ESRCH };
     
     let mut stat = Stat::default();
     let res = match proc.get_fd(fd) {
@@ -1773,13 +1773,13 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
          String::from(&path)
     } else {
         let base_path = if dirfd == -100 {
-             if let Some(proc) = akuma_exec::process::current_process() {
+             if let Some(proc) = akuma_exec::process::current_process_shared() {
                  proc.cwd.clone()
              } else {
                  return ESRCH;
              }
         } else if dirfd >= 0 {
-             if let Some(proc) = akuma_exec::process::current_process() {
+             if let Some(proc) = akuma_exec::process::current_process_shared() {
                  if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                      f.path
                  } else {
@@ -1900,7 +1900,7 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
 }
 
 pub(super) fn sys_fchmod(fd: u32, mode: u32) -> u64 {
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
     match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
             match crate::vfs::chmod(&f.path, mode) {
@@ -1924,12 +1924,12 @@ pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> u64 {
     let base: Option<String> = if raw_path.starts_with('/') {
         None
     } else if dirfd == -100 {
-        match akuma_exec::process::current_process() {
+        match akuma_exec::process::current_process_shared() {
             Some(proc) => Some(proc.cwd.clone()),
             None => return EBADF,
         }
     } else if dirfd >= 0 {
-        let proc = match akuma_exec::process::current_process() {
+        let proc = match akuma_exec::process::current_process_shared() {
             Some(p) => p,
             None => return EBADF,
         };
@@ -1969,7 +1969,7 @@ pub(super) fn sys_fallocate(fd: u32, mode: i32, offset: i64, len: i64) -> u64 {
     if offset < 0 || len <= 0 {
         return super::EINVAL;
     }
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
     match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
             match crate::vfs::fallocate(&f.path, mode, offset as u64, len as u64) {
@@ -1983,7 +1983,7 @@ pub(super) fn sys_fallocate(fd: u32, mode: i32, offset: i64, len: i64) -> u64 {
 }
 
 pub(super) fn sys_ftruncate(fd: u32, length: i64) -> u64 {
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
     match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
             match crate::vfs::truncate(&f.path, length as u64) {
@@ -2003,7 +2003,7 @@ pub(super) fn sys_truncate(path_ptr: u64, length: i64) -> u64 {
     };
     let resolved = if path.starts_with('/') {
         path
-    } else if let Some(proc) = akuma_exec::process::current_process() {
+    } else if let Some(proc) = akuma_exec::process::current_process_shared() {
         crate::vfs::resolve_path(&proc.cwd, &path)
     } else {
         return EBADF;
@@ -2026,7 +2026,7 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
     let resolved_path = if path.is_empty() {
         const AT_EMPTY_PATH: u32 = 0x1000;
         if flags & AT_EMPTY_PATH != 0 && dirfd >= 0 {
-            if let Some(proc) = akuma_exec::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process_shared() {
                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                     f.path
                 } else {
@@ -2042,13 +2042,13 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
         String::from(&path)
     } else {
         let base_path = if dirfd == -100 {
-            if let Some(proc) = akuma_exec::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process_shared() {
                 proc.cwd.clone()
             } else {
                 return EBADF;
             }
         } else if dirfd >= 0 {
-            if let Some(proc) = akuma_exec::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process_shared() {
                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                     f.path
                 } else {
@@ -2158,13 +2158,13 @@ pub(super) fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32)
          path
     } else {
         let base_path = if dirfd == -100 {
-             if let Some(proc) = akuma_exec::process::current_process() {
+             if let Some(proc) = akuma_exec::process::current_process_shared() {
                  proc.cwd.clone()
              } else {
                  return ESRCH;
              }
         } else if dirfd >= 0 {
-             if let Some(proc) = akuma_exec::process::current_process() {
+             if let Some(proc) = akuma_exec::process::current_process_shared() {
                  if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                      f.path
                  } else {
@@ -2192,7 +2192,7 @@ pub(super) fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32)
 
 pub(super) fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, size) { return EFAULT; }
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         let cwd_bytes = proc.cwd.as_bytes();
         if cwd_bytes.len() + 1 > size {
             return i64::from(-libc_errno::ERANGE) as u64;
@@ -2223,7 +2223,7 @@ pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const FD_CLOEXEC: u64 = 1;
     const O_NONBLOCK: u64 = 0x800;
 
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
 
     if proc.get_fd(fd).is_none() {
         return EBADF;
@@ -2295,12 +2295,12 @@ pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, _mode: u32) -> u64 {
     let base: Option<String> = if raw_path.starts_with('/') {
         None
     } else if dirfd == -100 {
-        match akuma_exec::process::current_process() {
+        match akuma_exec::process::current_process_shared() {
             Some(proc) => Some(proc.cwd.clone()),
             None => return EBADF,
         }
     } else if dirfd >= 0 {
-        let proc = match akuma_exec::process::current_process() {
+        let proc = match akuma_exec::process::current_process_shared() {
             Some(p) => p,
             None => return EBADF,
         };
@@ -2349,12 +2349,12 @@ pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> u64 {
     let base: Option<String> = if path.starts_with('/') {
         None
     } else if dirfd == -100 {
-        match akuma_exec::process::current_process() {
+        match akuma_exec::process::current_process_shared() {
             Some(proc) => Some(proc.cwd.clone()),
             None => return EBADF,
         }
     } else if dirfd >= 0 {
-        let proc = match akuma_exec::process::current_process() {
+        let proc = match akuma_exec::process::current_process_shared() {
             Some(p) => p,
             None => return EBADF,
         };
@@ -2505,7 +2505,7 @@ pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: u
 
     if path == "/proc/self/exe" {
         if !validate_user_ptr(buf_ptr, bufsize) { return EFAULT; }
-        let exe = if let Some(proc) = akuma_exec::process::current_process() {
+        let exe = if let Some(proc) = akuma_exec::process::current_process_shared() {
             proc.name.clone()
         } else {
             String::from("/bin/unknown")
@@ -2542,7 +2542,7 @@ pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: u
 
 pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
     if !validate_user_ptr(ptr, size) { return EFAULT; }
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ESRCH };
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ESRCH };
     let f = match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::File(f)) => f,
         _ => return EBADF,
@@ -2611,7 +2611,7 @@ pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
 }
 
 pub(super) fn sys_fchdir(fd: u32) -> u64 {
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ESRCH };
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ESRCH };
     let entry = match proc.get_fd(fd) {
         Some(e) => e,
         None => return EBADF,
@@ -2622,7 +2622,10 @@ pub(super) fn sys_fchdir(fd: u32) -> u64 {
     };
     if let Ok(meta) = crate::vfs::metadata(&path)
         && meta.is_dir {
-            proc.set_cwd(&path);
+            // Move a pre-built String in; `with_current_process` runs IRQ-masked
+            // and must not allocate (dropping the old cwd is fine).
+            let new_cwd = path.clone();
+            akuma_exec::process::with_current_process(|p| p.cwd = new_cwd);
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                 crate::safe_print!(128, "[syscall] fchdir(fd={}) -> \"{}\"\n", fd, path);
             }
@@ -2637,13 +2640,14 @@ pub(super) fn sys_chdir(ptr: u64) -> u64 {
         Err(e) => return e,
     };
     
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         let new_cwd = crate::vfs::resolve_path(&proc.cwd, &path);
         
         if crate::fs::exists(&new_cwd)
             && let Ok(meta) = crate::vfs::metadata(&new_cwd)
                 && meta.is_dir {
-                    proc.set_cwd(&new_cwd);
+                    // Pre-built String moved into the IRQ-masked closure (no alloc inside).
+                    akuma_exec::process::with_current_process(|p| p.cwd = new_cwd);
                     return 0;
                 }
         return ENOENT;

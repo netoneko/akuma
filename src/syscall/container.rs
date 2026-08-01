@@ -68,7 +68,7 @@ pub(super) fn sys_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64, _fla
         }
     };
 
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         if proc.box_id == 0 {
             match crate::vfs::mount(&target, fs) {
                 Ok(()) => 0,
@@ -91,7 +91,7 @@ pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> u64 {
         Err(e) => return e,
     };
 
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         if proc.box_id == 0 {
             EPERM
         } else {
@@ -106,7 +106,7 @@ pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> u64 {
 }
 
 pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, fstype_ptr: u64, fstype_len: usize) -> u64 {
-    let caller_box = akuma_exec::process::current_process()
+    let caller_box = akuma_exec::process::current_process_shared()
         .map_or(0, |p| p.box_id);
     if caller_box != 0 {
         return EPERM;

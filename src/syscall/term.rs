@@ -28,7 +28,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         crate::safe_print!(128, "[syscall] ioctl(fd={}, cmd=0x{:x}, arg=0x{:x})\n", fd, cmd, arg);
     }
 
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ESRCH };
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ESRCH };
 
     match cmd {
         FIONBIO => {
@@ -108,7 +108,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 _ => None,
             };
             let ts = match child_pid {
-                Some(pid) => akuma_exec::process::lookup_process(pid).map(|p| p.terminal_state.clone()),
+                Some(pid) => akuma_exec::process::lookup_process_shared(pid).map(|p| p.terminal_state.clone()),
                 None => akuma_exec::process::current_terminal_state(),
             };
             match ts {
@@ -462,7 +462,7 @@ pub(super) fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
 
         if let Some(pid) = akuma_exec::process::find_pid_by_thread(i) {
             stat.pid = pid;
-            if let Some(proc) = akuma_exec::process::lookup_process(pid) {
+            if let Some(proc) = akuma_exec::process::lookup_process_shared(pid) {
                 stat.box_id = proc.box_id;
                 let name_bytes = proc.name.as_bytes();
                 let to_copy = name_bytes.len().min(stat.name.len());

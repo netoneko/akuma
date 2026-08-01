@@ -169,7 +169,7 @@ where
         let maybe_arc = {
             let overrides = SPAWN_NS_OVERRIDE.lock();
             if let Some(ns) = overrides.get(&tid) {
-                let cwd = akuma_exec::process::current_process()
+                let cwd = akuma_exec::process::current_process_shared()
                     .map_or_else(|| String::from("/"), |p| p.cwd.clone());
                 let absolute = resolve_path(&cwd, path);
                 let ns_mount = ns.mount.lock();
@@ -183,7 +183,7 @@ where
         }
     }
 
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         let absolute = resolve_path(&proc.cwd, path);
 
         // Try process namespace first (lock released before I/O).
@@ -318,7 +318,7 @@ pub fn fallocate(path: &str, mode: i32, offset: u64, len: u64) -> Result<(), FsE
 
 /// Resolve a path to its absolute form through the process's CWD.
 fn resolve_absolute(path: &str) -> String {
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         resolve_path(&proc.cwd, path)
     } else {
         normalize_path_owned(path)
@@ -331,7 +331,7 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
     let new_abs = resolve_absolute(new_path);
 
     // Try process namespace first (lock released before I/O).
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         let ns_arcs = {
             let ns_mount = proc.namespace.mount.lock();
             match (ns_mount.resolve_arc(&old_abs), ns_mount.resolve_arc(&new_abs)) {
@@ -446,7 +446,7 @@ pub fn resolve_symlinks(path: &str) -> String {
 fn get_child_mount_points(parent_path: &str) -> Vec<DirEntry> {
     let mut entries = Vec::new();
 
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         let ns_mount = proc.namespace.mount.lock();
         for entry in ns_mount.child_mount_points(parent_path) {
             entries.push(entry);

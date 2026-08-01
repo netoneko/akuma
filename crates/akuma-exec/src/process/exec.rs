@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 use crate::runtime::config;
 use crate::process::types::{Pid, YieldOnce};
 use crate::process::channel::{ProcessChannel, get_channel};
-use crate::process::children::{lookup_process, read_current_pid};
+use crate::process::children::{lookup_process_shared, read_current_pid};
 use crate::process::spawn::spawn_process_with_channel_cwd;
 use super::get_box_info;
 
@@ -220,7 +220,7 @@ where
 pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid) -> Result<(), &'static str> {
     // 1. Validate hierarchy permissions
     let (caller_box_id, channel) = if let Some(pid) = caller_pid {
-        let caller = lookup_process(pid).ok_or("Caller not found")?;
+        let caller = lookup_process_shared(pid).ok_or("Caller not found")?;
         (caller.box_id, caller.channel.clone())
     } else {
         // Kernel caller (e.g. built-in SSH shell)
@@ -231,7 +231,7 @@ pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid) -> Result<
     };
 
     let target_box_id = {
-        let target = lookup_process(target_pid).ok_or("Target not found")?;
+        let target = lookup_process_shared(target_pid).ok_or("Target not found")?;
         target.box_id
     };
 
@@ -255,18 +255,17 @@ pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid) -> Result<
 
     // 2. Perform the delegation
     if let Some(pid) = caller_pid {
-        let caller = lookup_process(pid).ok_or("Caller not found")?;
-        caller.delegate_pid = Some(target_pid);
+        crate::process::table::with_process(pid, |p| p.delegate_pid = Some(target_pid))
+            .ok_or("Caller not found")?;
     } else {
         // For kernel caller, we don't have a 'Process' struct to set delegate_pid,
         // but we still want to link the channel to the target.
     }
 
-    // Target process now uses caller's output channel
-    {
-        let target = lookup_process(target_pid).ok_or("Target not found")?;
-        target.channel = channel;
-    }
+    // Target process now uses caller's output channel. Move the pre-built
+    // Option<Arc> in; the replaced value's drop is only a refcount decrement.
+    crate::process::table::with_process(target_pid, |p| p.channel = channel)
+        .ok_or("Target not found")?;
 
     if config().syscall_debug_info_enabled {
         log::debug!("[Process] Reattached (caller={:?}) -> PID {}", caller_pid, target_pid);

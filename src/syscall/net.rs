@@ -60,7 +60,7 @@ pub fn net_bounce_size_plan(want: usize) -> [usize; 2] {
 /// the cross-core forwarder on a secondary.
 #[cfg(kernel_smp)]
 pub(super) fn remote_socket_handle(fd: u32) -> Option<u32> {
-    let proc = akuma_exec::process::current_process()?;
+    let proc = akuma_exec::process::current_process_shared()?;
     match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::RemoteFd {
             handle,
@@ -137,7 +137,7 @@ pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
         if (r as i64) < 0 {
             return r;
         }
-        let Some(proc) = akuma_exec::process::current_process() else {
+        let Some(proc) = akuma_exec::process::current_process_shared() else {
             let _ = crate::smp::fwd_close(r as u32);
             return ESRCH;
         };
@@ -151,7 +151,7 @@ pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
         return u64::from(fd);
     }
     if let Some(idx) = socket::alloc_socket(base_type) {
-        if let Some(proc) = akuma_exec::process::current_process() {
+        if let Some(proc) = akuma_exec::process::current_process_shared() {
             let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(idx));
             if cloexec {
                 proc.set_cloexec(fd);
@@ -193,7 +193,7 @@ pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: u
     if !validate_user_ptr(sv_ptr, 8) {
         return EFAULT;
     }
-    let proc = match akuma_exec::process::current_process() {
+    let proc = match akuma_exec::process::current_process_shared() {
         Some(p) => p,
         None => return ESRCH,
     };
@@ -294,7 +294,7 @@ pub(super) fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
         if (r as i64) < 0 {
             return r;
         }
-        let Some(proc) = akuma_exec::process::current_process() else {
+        let Some(proc) = akuma_exec::process::current_process_shared() else {
             let _ = crate::smp::fwd_close(r as u32);
             return ESRCH;
         };
@@ -314,7 +314,7 @@ pub(super) fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     let nonblock = fd_is_nonblock(fd);
     match socket::socket_accept(idx, nonblock) {
         Ok((new_idx, addr)) => {
-            let proc = match akuma_exec::process::current_process() {
+            let proc = match akuma_exec::process::current_process_shared() {
                 Some(p) => p,
                 None => return ESRCH,
             };
@@ -340,7 +340,7 @@ pub(super) fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u
         if (r as i64) < 0 {
             return r;
         }
-        let Some(proc) = akuma_exec::process::current_process() else {
+        let Some(proc) = akuma_exec::process::current_process_shared() else {
             let _ = crate::smp::fwd_close(r as u32);
             return ESRCH;
         };
@@ -365,7 +365,7 @@ pub(super) fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u
     let nonblock = fd_is_nonblock(fd);
     match socket::socket_accept(idx, nonblock) {
         Ok((new_idx, addr)) => {
-            let proc = match akuma_exec::process::current_process() {
+            let proc = match akuma_exec::process::current_process_shared() {
                 Some(p) => p,
                 None => return ESRCH,
             };
@@ -1022,7 +1022,7 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     // `rsp_len` bytes, so concatenation is wire-identical.
     // (See docs/archive/RUMP_SYSPROXY_LATENCY_FIX.md Phase 3q.)
     let tx = {
-        let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return EBADF };
+        let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
         match proc.get_fd(fd) {
             Some(akuma_exec::process::FileDescriptor::UnixSocket { tx, .. }) => tx,
             _ => return EBADF,
@@ -1187,12 +1187,12 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
 }
 
 pub(super) fn get_socket_from_fd(fd: u32) -> Option<usize> {
-    let proc = akuma_exec::process::current_process()?;
+    let proc = akuma_exec::process::current_process_shared()?;
     if let Some(akuma_exec::process::FileDescriptor::Socket(idx)) = proc.get_fd(fd) { Some(idx) } else { None }
 }
 
 pub(super) fn fd_is_nonblock(fd: u32) -> bool {
-    akuma_exec::process::current_process().is_some_and(|p| p.is_nonblock(fd))
+    akuma_exec::process::current_process_shared().is_some_and(|p| p.is_nonblock(fd))
 }
 
 /// True if `fd` is one endpoint of an AF_UNIX socketpair (backed by two kernel
@@ -1203,7 +1203,7 @@ pub(super) fn fd_is_nonblock(fd: u32) -> bool {
 /// path and surfaced as `the CLOEXEC pipe failed: … Bad file descriptor`
 /// (docs/RUST_TOOLCHAIN.md §4d).
 pub(super) fn fd_is_unix_socket(fd: u32) -> bool {
-    akuma_exec::process::current_process().is_some_and(|p| {
+    akuma_exec::process::current_process_shared().is_some_and(|p| {
         matches!(p.get_fd(fd), Some(akuma_exec::process::FileDescriptor::UnixSocket { .. }))
     })
 }

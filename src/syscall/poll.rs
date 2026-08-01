@@ -85,7 +85,7 @@ fn fd_wants_rump_poll_interval(fd: i32) -> bool {
     if fd < 0 {
         return false;
     }
-    let Some(proc) = akuma_exec::process::current_process() else { return false };
+    let Some(proc) = akuma_exec::process::current_process_shared() else { return false };
     matches!(
         proc.get_fd(fd as u32),
         Some(
@@ -294,7 +294,7 @@ const EPOLL_CLOEXEC: u32 = 0o2000000;
 
 #[cfg(feature = "sc-epoll")]
 pub fn sys_epoll_create1(flags: u32) -> u64 {
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         let epoll_id = NEXT_EPOLL_ID.fetch_add(1, Ordering::SeqCst);
         EPOLL_TABLE.lock().insert(epoll_id, EpollInstance {
             interest_list: BTreeMap::new(),
@@ -316,7 +316,7 @@ pub fn sys_epoll_create1(flags: u32) -> u64 {
 /// AArch64 **`epoll_event`** — see **`docs/GO_FORKTEST_DEBUG.md`** if **`x8==EPOLL_CTL`** at SIGSEGV.
 #[cfg(feature = "sc-epoll")]
 pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
-    let epoll_id = match akuma_exec::process::current_process().and_then(|p| p.get_fd(epfd)) {
+    let epoll_id = match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(epfd)) {
         Some(akuma_exec::process::FileDescriptor::EpollFd(id)) => id,
         _ => return EBADF,
     };
@@ -382,7 +382,7 @@ pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
 }
 
 pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Waker>) -> u32 {
-    let fd_entry = akuma_exec::process::current_process().and_then(|p| p.get_fd(fd_num));
+    let fd_entry = akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(fd_num));
     let fd_entry = match fd_entry {
         Some(e) => e,
         None => return EPOLLHUP | EPOLLERR,
@@ -583,7 +583,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
     let out_size = maxevents * EPOLL_EVENT_SIZE;
     if !validate_user_ptr(events_ptr as u64, out_size) { return EFAULT; }
 
-    let epoll_id = match akuma_exec::process::current_process().and_then(|p| p.get_fd(epfd)) {
+    let epoll_id = match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(epfd)) {
         Some(akuma_exec::process::FileDescriptor::EpollFd(id)) => id,
         _ => return EBADF,
     };
@@ -848,7 +848,7 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
             if !in_read && !in_write { continue; }
 
             let _socket_idx = if fd > 2 {
-                if let Some(proc) = akuma_exec::process::current_process() {
+                if let Some(proc) = akuma_exec::process::current_process_shared() {
                     if let Some(akuma_exec::process::FileDescriptor::Socket(idx)) = proc.get_fd(fd as u32) {
                         Some(idx)
                     } else { None }

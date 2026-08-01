@@ -249,13 +249,41 @@ pub fn with_process<T, F: FnOnce(&mut Process) -> T>(pid: Pid, f: F) -> Option<T
     })
 }
 
+/// Run `f` with exclusive `&mut Process` access and NO lock or IRQ mask — the
+/// accessor for the process-LIFECYCLE paths (`execve`'s `replace_image*`,
+/// self-teardown) that mutate the whole `Process` (address-space swap, context
+/// rewrite) and allocate/do block I/O while doing it, which rules out
+/// [`with_process`]'s IRQ-masked closure.
+///
+/// This is the explicit, enumerated residue of the Phase 7e "Access" migration
+/// (docs/archive/BKL_PHASE7_AUDIT.md §5): the execve/clone-class destructive
+/// windows stay `&mut`-exclusive and belong to Phase 7f. Do not add call sites
+/// casually — everything else goes through `lookup_process_shared`/
+/// [`with_process`].
+///
+/// # Safety
+/// The caller must guarantee exclusivity STRUCTURALLY, not via this call:
+///
+/// - `pid` must be the calling thread's own process (which cannot be freed or
+///   concurrently image-replaced by its own syscall path), or a process no
+///   other core can reach (not yet published / already isolated);
+/// - the call must be on a BKL-held path, which is what excludes every peer
+///   core's accessor for the closure's duration — this function adds nothing;
+/// - no other reference (shared or `&mut`) to this `Process` may be live on
+///   this thread across the call.
+pub unsafe fn with_process_exclusive<T, F: FnOnce(&mut Process) -> T>(pid: Pid, f: F) -> Option<T> {
+    let ptr = get_process_ptr(pid)?;
+    Some(f(unsafe { &mut *ptr }))
+}
+
 /// Look up a process by PID. Returns a raw pointer.
 ///
 /// # Safety
 /// The pointer is valid only while IRQs are disabled or no other thread
-/// can call `unregister_process`. Prefer `with_process()` for safe access.
-/// This function exists for the 218+ legacy call sites that use
-/// `lookup_process() -> &'static mut Process`.
+/// can call `unregister_process` + `reclaim_retired_processes`. Prefer
+/// `with_process()` for safe access, or `lookup_process_shared` for reads —
+/// the `&'static mut`-returning wrappers over this pointer were deleted in
+/// Phase 7e's "Access" half.
 pub fn get_process_ptr(pid: Pid) -> Option<*mut Process> {
     with_irqs_disabled(|| get_process_ptr_inner(pid))
 }
@@ -399,7 +427,7 @@ pub static THREAD_PID_MAP: Spinlock<BTreeMap<usize, Pid>> =
 /// Global lazy region table, keyed by PID then by start_va.
 /// The inner BTreeMap allows O(log n) range lookups via `range(..=va).next_back()`.
 /// Stored separately from Process to avoid aliasing/corruption issues
-/// with &mut Process references from current_process().
+/// with the `&mut Process` references the pre-Phase-7e `current_process()` handed out.
 pub static LAZY_REGION_TABLE: Spinlock<BTreeMap<Pid, BTreeMap<usize, LazyRegion>>> =
     Spinlock::new(BTreeMap::new());
 

@@ -99,11 +99,14 @@ pub(super) fn sys_setpgid(pid: u32, pgid: u32) -> u64 {
 
     let target_pgid = if pgid == 0 { target_pid } else { pgid };
 
-    if let Some(proc) = akuma_exec::process::lookup_process(target_pid) {
+    if let Some(old_pgid) = akuma_exec::process::with_process(target_pid, |p| {
+        let old = p.pgid;
+        p.pgid = target_pgid;
+        old
+    }) {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::safe_print!(128, "[syscall] setpgid(pid={}, pgid={}): old={}, new={}\n", target_pid, pgid, proc.pgid, target_pgid);
+            crate::safe_print!(128, "[syscall] setpgid(pid={}, pgid={}): old={}, new={}\n", target_pid, pgid, old_pgid, target_pgid);
         }
-        proc.pgid = target_pgid;
         0
     } else {
         // Linux: setpgid(2) returns ESRCH for a pid that is not a child of the
@@ -125,7 +128,7 @@ pub(super) fn sys_getpgid(pid: u32) -> u64 {
         pid
     };
 
-    if let Some(proc) = akuma_exec::process::lookup_process(target_pid) {
+    if let Some(proc) = akuma_exec::process::lookup_process_shared(target_pid) {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED && pid == 0 {
             crate::safe_print!(128, "[syscall] getpgid(0) for PID {}: returning PGID {}\n", target_pid, proc.pgid);
         }
@@ -139,9 +142,11 @@ pub(super) fn sys_getpgid(pid: u32) -> u64 {
 }
 
 pub(super) fn sys_setsid() -> u64 {
-    if let Some(proc) = akuma_exec::process::current_process() {
-        proc.pgid = proc.pid;
-        u64::from(proc.pid)
+    if let Some(pid) = akuma_exec::process::with_current_process(|p| {
+        p.pgid = p.pid;
+        p.pid
+    }) {
+        u64::from(pid)
     } else {
         // Per setsid(2): EPERM if the calling process is already a process
         // group leader. Here the caller has no current process at all, so
@@ -176,25 +181,28 @@ pub(super) fn sys_uname(buf: u64) -> u64 {
 }
 
 pub(super) fn sys_set_tid_address(tidptr: u64) -> u64 {
-    if let Some(proc) = akuma_exec::process::current_process() {
-        proc.clear_child_tid = tidptr;
-        return u64::from(proc.pid);
+    if let Some(pid) = akuma_exec::process::with_current_process(|p| {
+        p.clear_child_tid = tidptr;
+        p.pid
+    }) {
+        return u64::from(pid);
     }
     1
 }
 
 pub(super) fn sys_set_robust_list(head: u64, len: usize) -> u64 {
     if len != 24 { return EINVAL; }
-    if let Some(proc) = akuma_exec::process::current_process() {
-        proc.robust_list_head = head;
-        proc.robust_list_len = len;
+    if akuma_exec::process::with_current_process(|p| {
+        p.robust_list_head = head;
+        p.robust_list_len = len;
+    }).is_some() {
         return 0;
     }
     ENOSYS
 }
 
 pub(super) fn sys_exit(code: i32) -> u64 {
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         if crate::config::FUTEX_DBG_ENABLED {
             crate::tprint!(96, "[exit93] tid={} pid={} tgid={}\n",
                 akuma_exec::threading::current_thread_id(), proc.pid, proc.tgid);
@@ -208,9 +216,11 @@ pub(super) fn sys_exit(code: i32) -> u64 {
         }
         let pid = proc.pid;
         let proc_tid = proc.thread_id;
-        proc.exited = true;
-        proc.exit_code = code;
-        proc.state = akuma_exec::process::ProcessState::Zombie(code);
+        akuma_exec::process::with_current_process(|p| {
+            p.exited = true;
+            p.exit_code = code;
+            p.state = akuma_exec::process::ProcessState::Zombie(code);
+        });
         if crate::config::PROC_SYSCALL_LOG_ENABLED {
             crate::syscall::log::mark_exited(pid);
         }
@@ -278,7 +288,7 @@ pub fn sys_exit_group_pub(code: i32) -> ! {
 }
 
 pub(super) fn sys_exit_group(code: i32) -> u64 {
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         if crate::config::FUTEX_DBG_ENABLED {
             crate::tprint!(96, "[exit94] tid={} pid={} tgid={}\n",
                 akuma_exec::threading::current_thread_id(), proc.pid, proc.tgid);
@@ -294,9 +304,11 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         let tgid = proc.tgid;
         let proc_tid = proc.thread_id;
         let l0_phys = proc.address_space.l0_phys();
-        proc.exited = true;
-        proc.exit_code = code;
-        proc.state = akuma_exec::process::ProcessState::Zombie(code);
+        akuma_exec::process::with_current_process(|p| {
+            p.exited = true;
+            p.exit_code = code;
+            p.state = akuma_exec::process::ProcessState::Zombie(code);
+        });
         if crate::config::PROC_SYSCALL_LOG_ENABLED {
             crate::syscall::log::mark_exited(pid);
         }
@@ -421,7 +433,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
     // to the next syscall.  Routing clone(0) to fork_process creates a
     // fork bomb: each fork child runs the Go scheduler → newosproc → clone.
     if flags & CLONE_VFORK != 0 || flags & 0xFF == 0x11 {
-        let parent_proc = match akuma_exec::process::current_process() {
+        let parent_proc = match akuma_exec::process::current_process_shared() {
             Some(p) => p,
             None => return ESRCH,
         };
@@ -465,7 +477,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                         let pidfd_fd = super::pidfd::sys_pidfd_open(new_pid, 0 /* no flags */);
                         if (pidfd_fd as i64) >= 0 {
                             // Linux clone3 with CLONE_PIDFD always sets O_CLOEXEC.
-                            if let Some(proc) = akuma_exec::process::current_process() {
+                            if let Some(proc) = akuma_exec::process::current_process_shared() {
                                 proc.set_cloexec(pidfd_fd as u32);
                             }
                             let fd_i32 = pidfd_fd as i32;
@@ -573,7 +585,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 
     let resolved_path = if path.starts_with('/') {
         path
-    } else if let Some(proc) = akuma_exec::process::current_process() {
+    } else if let Some(proc) = akuma_exec::process::current_process_shared() {
         crate::vfs::resolve_path(&proc.cwd, &path)
     } else {
         path
@@ -682,7 +694,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
             return exec_shebang(&resolved_path, data, args, env);
         }
 
-    let proc = match akuma_exec::process::current_process() {
+    let cur_pid = match akuma_exec::process::current_pid() {
         Some(p) => p,
         None => return ESRCH,
     };
@@ -692,16 +704,29 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     #[cfg(kernel_profile_size)]
     let file_data: Option<alloc::vec::Vec<u8>> = None;
 
-    let replace_result = if let Some(ref data) = file_data {
-        proc.replace_image(data, &args, &env)
-    } else {
-        let file_size = match crate::vfs::file_size(&resolved_path) {
+    // Resolve the on-demand load's file size before entering the exclusive
+    // window so the stat-failure early return stays outside it.
+    let file_size = if file_data.is_none() {
+        match crate::vfs::file_size(&resolved_path) {
             Ok(sz) => sz as usize,
             Err(e) => {
                 crate::safe_print!(128, "[syscall] execve: failed to stat {}\n", resolved_path);
                 return super::fs::fs_error_to_errno(e);
             }
-        };
+        }
+    } else {
+        0
+    };
+
+    // SAFETY: `cur_pid` is the calling thread's own process on the BKL-held
+    // execve path; `replace_image*` is the destructive window that stays
+    // `&mut`-exclusive (Phase 7f owns converting it). No other Process
+    // reference is live on this thread.
+    let ret = unsafe {
+        akuma_exec::process::with_process_exclusive(cur_pid, |proc| {
+    let replace_result = if let Some(ref data) = file_data {
+        proc.replace_image(data, &args, &env)
+    } else {
         proc.replace_image_from_path(&resolved_path, file_size, &args, &env)
     };
 
@@ -761,9 +786,13 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
 
     proc.address_space.activate();
 
-    unsafe {
-        akuma_exec::process::enter_user_mode(&proc.context);
-    }
+    // Never returns (lexically inside the `with_process_exclusive` unsafe block).
+    akuma_exec::process::enter_user_mode(&proc.context);
+        })
+    };
+    // `None` means the process vanished between `current_pid` and the lookup;
+    // a successful exec never gets here (enter_user_mode does not return).
+    ret.unwrap_or(ESRCH)
 }
 
 fn exec_shebang(script_path: &str, file_data: &[u8], original_args: Vec<String>, env: Vec<String>) -> u64 {
@@ -831,7 +860,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
         let p = pid as u32;
         // Waiting on a process that is not our child (thread-group-wise) must
         // fail with ECHILD, not block — see is_child_of_group.
-        let waiter_tgid = akuma_exec::process::current_process().map_or(current_pid, |pr| pr.tgid);
+        let waiter_tgid = akuma_exec::process::current_process_shared().map_or(current_pid, |pr| pr.tgid);
         if !akuma_exec::process::is_child_of_group(p, waiter_tgid) {
             return i64::from(-libc_errno::ECHILD) as u64;
         }
@@ -975,7 +1004,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
     let waiter_tid = akuma_exec::threading::current_thread_id();
     // Waits may come from any thread of a multithreaded parent (Go M's), so
     // parentage is checked against the caller's thread group.
-    let waiter_tgid = akuma_exec::process::current_process().map_or(current_pid, |p| p.tgid);
+    let waiter_tgid = akuma_exec::process::current_process_shared().map_or(current_pid, |p| p.tgid);
     let result: Option<(u32, i32)> = match idtype {
         P_PID => {
             if !akuma_exec::process::is_child_of_group(id, waiter_tgid) {
@@ -1016,7 +1045,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
         #[cfg(feature = "sc-pidfd")]
         P_PIDFD => {
             // `id` is the fd number of a pidfd; resolve it to a target PID.
-            let target_pid = if let Some(proc) = akuma_exec::process::current_process() {
+            let target_pid = if let Some(proc) = akuma_exec::process::current_process_shared() {
                 match proc.get_fd(id) {
                     Some(akuma_exec::process::FileDescriptor::PidFd(pidfd_id)) => {
                         match super::pidfd::pidfd_get_pid(pidfd_id) {
@@ -1186,7 +1215,7 @@ pub(super) fn sys_core_init(core_idx: usize, init_program_ptr: u64) -> u64 {
 }
 
 pub(super) fn sys_getppid() -> u64 {
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         u64::from(proc.parent_pid)
     } else {
         ESRCH
@@ -1308,7 +1337,7 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
 
     match akuma_exec::process::spawn_process_with_channel_ext(&path, Some(&args_refs), Some(&env_vec), stdin_slice, None, 0, pty) {
         Ok((_tid, ch, pid)) => {
-            if let Some(proc) = akuma_exec::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process_shared() {
                 akuma_exec::process::register_child_channel(pid, ch, proc.pid);
                 return u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32);
             }
@@ -1375,7 +1404,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
         if path.contains("rump_server") && crate::rump_proxy::box_is_rump(o.box_id) {
             crate::rump_proxy::attach_server(o.box_id, pid);
         }
-        if let Some(proc) = akuma_exec::process::current_process() {
+        if let Some(proc) = akuma_exec::process::current_process_shared() {
             akuma_exec::process::register_child_channel(pid, ch, proc.pid);
             return u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32);
         }
@@ -1404,8 +1433,8 @@ pub fn sys_set_box_stack(box_id: u64, stack: u64) -> u64 {
 /// Authorization mirrors the procfs `/proc/<pid>/fd/0` write path: only the
 /// spawner may close its child's stdin, and box isolation is enforced.
 pub(super) fn sys_close_child_stdin(pid: u32) -> u64 {
-    let caller = match akuma_exec::process::current_process() { Some(p) => p, None => return ESRCH };
-    let target = match akuma_exec::process::lookup_process(pid) { Some(p) => p, None => return ESRCH };
+    let caller = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ESRCH };
+    let target = match akuma_exec::process::lookup_process_shared(pid) { Some(p) => p, None => return ESRCH };
 
     // Box isolation: a boxed caller may only touch its own box's processes.
     if caller.box_id != 0 && target.box_id != caller.box_id {
@@ -1432,14 +1461,14 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
 
     // sig=0 is a "does the process exist?" probe — don't actually send anything.
     if sig == 0 {
-        return if akuma_exec::process::lookup_process(pid).is_some() { 0 } else { ESRCH };
+        return if akuma_exec::process::lookup_process_shared(pid).is_some() { 0 } else { ESRCH };
     }
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED || crate::config::SYSCALL_DEBUG_NET_ENABLED {
         crate::tprint!(96, "[signal] kill(pid={}, sig={})\n", pid, sig);
     }
 
-    if let Some(proc) = akuma_exec::process::lookup_process(pid) {
+    if let Some(proc) = akuma_exec::process::lookup_process_shared(pid) {
         let tgid = proc.tgid;
         let l0_phys = proc.address_space.l0_phys();
 
@@ -1543,17 +1572,19 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
                     return EFAULT;
                 }
                 let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
-                if let Ok(name) = core::str::from_utf8(&name_bytes[..end])
-                    && let Some(proc) = akuma_exec::process::current_process() {
-                        proc.name = alloc::string::String::from(name);
-                    }
+                if let Ok(name) = core::str::from_utf8(&name_bytes[..end]) {
+                    // Build the String outside the IRQ-masked closure; only the
+                    // move (and the old name's drop) happens inside.
+                    let new_name = alloc::string::String::from(name);
+                    akuma_exec::process::with_current_process(|p| p.name = new_name);
+                }
             }
             0
         }
         PR_GET_NAME => {
             // Get process name
             if arg2 != 0 && validate_user_ptr(arg2, 16)
-                && let Some(proc) = akuma_exec::process::current_process() {
+                && let Some(proc) = akuma_exec::process::current_process_shared() {
                     let name = proc.name.as_bytes();
                     let len = name.len().min(15);
                     let mut kernel_buf = [0u8; 16];

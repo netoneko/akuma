@@ -507,7 +507,7 @@ fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
         heap_total / 1024 / 1024,
     );
     // Kill the current process if there is one; otherwise panic the kernel.
-    if akuma_exec::process::current_process().is_some() {
+    if akuma_exec::process::current_process_shared().is_some() {
         akuma_exec::process::return_to_kernel(-12); // ENOMEM
     }
     panic!("kernel OOM: allocation of {} bytes failed", layout.size());

@@ -18,7 +18,7 @@ pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigs
     if sig == 9 || sig == 19 { return EINVAL; }
     let sigset_ok = sigsetsize == 8;
 
-    let proc = match akuma_exec::process::current_process() {
+    let proc = match akuma_exec::process::current_process_shared() {
         Some(p) => p,
         None => return ENOSYS,
     };
@@ -258,7 +258,7 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset
         return EINVAL;
     }
 
-    let _proc = match akuma_exec::process::current_process() {
+    let _proc = match akuma_exec::process::current_process_shared() {
         Some(p) => p,
         None => return ENOSYS,
     };
@@ -338,7 +338,7 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
     // *target* thread's mask (docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D).
     let target_mask = akuma_exec::threading::thread_signal_mask_of(tid as usize);
     let target_handler = if let Some(pid) = akuma_exec::process::find_pid_by_thread(tid as usize) {
-        if let Some(proc) = akuma_exec::process::lookup_process(pid) {
+        if let Some(proc) = akuma_exec::process::lookup_process_shared(pid) {
             let idx = (sig - 1) as usize;
             let actions = proc.signal_actions.actions.lock();
             actions[idx].handler
@@ -386,7 +386,7 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
 /// threads with no owning process). See docs/AKUMA_SELF_HOSTING.md §7k.5.
 pub(super) fn sys_tgkill(tgid: u32, tid: u32, sig: u32) -> u64 {
     if let Some(pid) = akuma_exec::process::find_pid_by_thread(tid as usize)
-        && let Some(proc) = akuma_exec::process::lookup_process(pid)
+        && let Some(proc) = akuma_exec::process::lookup_process_shared(pid)
         && proc.tgid != tgid
     {
         return ESRCH;

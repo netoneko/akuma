@@ -7,7 +7,7 @@ use core::fmt::Write;
 use crate::runtime::runtime;
 use crate::process::types::Pid;
 use crate::process::table;
-use crate::process::children::lookup_process;
+use crate::process::children::lookup_process_shared;
 
 static PROCESS_SYSCALL_STATS_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -117,7 +117,7 @@ pub fn dump_running_process_stats() {
     for (pid, name, start_us) in pids {
         let elapsed = now.saturating_sub(start_us);
         if elapsed < 10_000_000 { continue; } // skip processes running < 10s
-        if let Some(proc) = lookup_process(pid) {
+        if let Some(proc) = lookup_process_shared(pid) {
             proc.syscall_stats.dump(pid, &name, elapsed);
         }
     }

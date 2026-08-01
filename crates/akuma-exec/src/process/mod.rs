@@ -254,7 +254,7 @@ pub use crate::box_registry::{
 
 /// Write data to a process's stdin
 pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str> {
-    let proc = children::lookup_process(pid).ok_or("Process not found")?;
+    let proc = children::lookup_process_shared(pid).ok_or("Process not found")?;
     
     if let Some(target_pid) = proc.delegate_pid {
         return write_to_process_stdin(target_pid, data);
@@ -281,7 +281,7 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str>
 /// the bug that made `exec cat` hang for the full idle timeout. Mirrors the wake
 /// path in `write_to_process_stdin`.
 pub fn close_process_stdin(pid: Pid) -> Result<(), &'static str> {
-    let proc = children::lookup_process(pid).ok_or("Process not found")?;
+    let proc = children::lookup_process_shared(pid).ok_or("Process not found")?;
 
     if let Some(target_pid) = proc.delegate_pid {
         return close_process_stdin(target_pid);
@@ -523,6 +523,51 @@ impl Process {
         #[cfg(not(kernel_smp_shared))]
         {
             f()
+        }
+    }
+
+    /// Run `f` with `&mut UserAddressSpace` under this address space's
+    /// [`Process::as_lock`] with IRQs disabled (on `smp-shared`; a plain call
+    /// elsewhere, exactly like [`Process::with_as_locked`]) — the accessor that
+    /// lets the shared-reference (`&Process`) syscall paths call the `&mut self`
+    /// page-table mutators (`unmap_page*`, `update_page_flags*`,
+    /// `unmap_and_free_page*`, `map_and_track`, …) without materializing a
+    /// `&mut Process`.
+    ///
+    /// Interior mutability follows [`Process::vm_with_regions`]'s discipline:
+    /// `as_lock` (held here, IRQs masked) is what serializes every page-table
+    /// mutator on this address space across cores, so the raw-pointer `&mut` is
+    /// the unique live reference for the closure's duration. On builds without
+    /// `kernel_smp_shared` there is no lock — exclusion is the pre-existing
+    /// single-core/BKL invariant, byte-for-byte the shape the old
+    /// `&'static mut Process` call sites relied on.
+    ///
+    /// Same rules as [`Process::with_as_locked`]/[`AsLockHold`]: keep the closure
+    /// short — PTE edits, frame bookkeeping, TLB flushes. It MUST NOT allocate
+    /// page frames (the PMM OOM/reclaim path re-enters `as_lock`), do block I/O,
+    /// or yield. Allocate frames before, free them after.
+    #[inline]
+    pub fn with_address_space<R>(&self, f: impl FnOnce(&mut UserAddressSpace) -> R) -> R {
+        #[cfg(kernel_smp_shared)]
+        {
+            // Locals drop in reverse declaration order: `_g` (release lock) before
+            // `_irq` (restore DAIF) — release the lock before re-enabling IRQs.
+            let _irq = crate::runtime::IrqGuard::new();
+            let _g = self.as_lock.lock();
+            // SAFETY: `as_lock` is held with IRQs masked; see the doc comment.
+            let aspace = unsafe {
+                &mut *(core::ptr::addr_of!(self.address_space) as *mut UserAddressSpace)
+            };
+            f(aspace)
+        }
+        #[cfg(not(kernel_smp_shared))]
+        {
+            // SAFETY: single-core / BKL-serialized, the invariant every previous
+            // `&'static mut Process` caller of these mutators already relied on.
+            let aspace = unsafe {
+                &mut *(core::ptr::addr_of!(self.address_space) as *mut UserAddressSpace)
+            };
+            f(aspace)
         }
     }
 
@@ -779,7 +824,7 @@ impl Process {
 
     /// Read from this process's stdin
     /// Returns number of bytes read
-    pub fn read_stdin(&mut self, buf: &mut [u8]) -> usize {
+    pub fn read_stdin(&self, buf: &mut [u8]) -> usize {
         let mut stdin = self.stdin.lock();
         stdin.read(buf)
     }
@@ -788,13 +833,13 @@ impl Process {
     ///
     /// Applies "last write wins" policy: if adding data would exceed
     /// PROC_STDOUT_MAX_SIZE, clears buffer before writing.
-    pub fn write_stdout(&mut self, data: &[u8]) {
+    pub fn write_stdout(&self, data: &[u8]) {
         let mut stdout = self.stdout.lock();
         stdout.write_with_limit(data, config().proc_stdout_max_size);
     }
 
     /// Take captured stdout (transfers ownership)
-    pub fn take_stdout(&mut self) -> Vec<u8> {
+    pub fn take_stdout(&self) -> Vec<u8> {
         let mut stdout = self.stdout.lock();
         core::mem::take(&mut stdout.data)
     }
@@ -807,7 +852,14 @@ impl Process {
     /// Set program break, returns new value.
     /// Maps any new pages between old and new brk.
     /// Returns the exact requested value (matching Linux brk ABI).
-    pub fn set_brk(&mut self, new_brk: usize) -> usize {
+    ///
+    /// `&self`: page installs go through [`Process::with_address_space`]
+    /// (`as_lock` + IRQs masked on smp-shared, frame allocated outside the hold,
+    /// same shape as the old inline `AsLockHold`), and the `brk` scalar store is
+    /// serialized under [`Process::vm_lock`] (pure bookkeeping, matching that
+    /// lock's discipline). Concurrent *readers* of `brk` race the store exactly
+    /// as they did against the old `&mut self` write.
+    pub fn set_brk(&self, new_brk: usize) -> usize {
         if new_brk < self.initial_brk {
             return self.brk;
         }
@@ -823,16 +875,21 @@ impl Process {
                     let rt = runtime();
                     if let Some(frame) = (rt.alloc_page_zeroed)() {
                         (rt.track_frame)(frame, FrameSource::ElfLoader);
-                        #[cfg(kernel_smp_shared)]
-                        let _asg = AsLockHold::new(&self.as_lock);
-                        let _ = self.address_space.map_and_track(page, frame, crate::mmu::user_flags::RW_NO_EXEC);
+                        let _ = self.with_address_space(|aspace| {
+                            aspace.map_and_track(page, frame, crate::mmu::user_flags::RW_NO_EXEC)
+                        });
                     }
                 }
                 page += 0x1000;
             }
         }
-        self.brk = new_brk;
-        self.brk
+        with_irqs_disabled(|| {
+            let _g = self.vm_lock.lock();
+            // SAFETY: `vm_lock` serializes this store against other `vm_*` bookkeeping;
+            // see the doc comment above.
+            unsafe { *(core::ptr::addr_of!(self.brk) as *mut usize) = new_brk; }
+        });
+        new_brk
     }
 
     /// Reset I/O state for execution
@@ -981,7 +1038,7 @@ fn execute_boxed(mut process: Box<Process>) -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn check_process_exit() -> bool {
     // Use per-process exit flag instead of global
-    match current_process() {
+    match current_process_shared() {
         Some(proc) => proc.exited,
         None => false,
     }
@@ -1090,7 +1147,7 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
 
     // PHASE 2: Now safe to clean up resources - siblings can't run.
     for (sib_pid, sib_tid) in &siblings {
-        if let Some(proc) = lookup_process(*sib_pid) {
+        if let Some(proc) = lookup_process_shared(*sib_pid) {
             cleanup_process_fds(proc);
         }
 
@@ -1179,13 +1236,15 @@ fn teardown_forked_process_thread_group(child_pid: Pid, l0_phys: usize) {
     kill_thread_group(child_pid, l0_phys, 137);
 
     for (pid, tid, _) in &members {
-        if let Some(proc) = lookup_process(*pid) {
+        if let Some(proc) = lookup_process_shared(*pid) {
             cleanup_process_fds(proc);
-            proc.exited = true;
-            proc.exit_code = 137;
-            proc.state = ProcessState::Zombie(137);
-            proc.thread_id = None;
         }
+        table::with_process(*pid, |p| {
+            p.exited = true;
+            p.exit_code = 137;
+            p.state = ProcessState::Zombie(137);
+            p.thread_id = None;
+        });
         // Same Arc as register_child_channel / notify_child_channel_exited /
         // return_to_kernel::remove_channel.  If the child already called
         // exit_group / return_to_kernel, `has_exited` is true with the real code
@@ -1224,7 +1283,7 @@ fn kill_fork_subtree_recursive(child_pid: Pid, l0_phys: usize) {
         kill_fork_subtree_recursive(npid, nl0);
     }
 
-    if lookup_process(child_pid).is_none() {
+    if lookup_process_shared(child_pid).is_none() {
         return;
     }
     teardown_forked_process_thread_group(child_pid, l0_phys);
@@ -1279,12 +1338,12 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     let already_terminated = crate::threading::is_thread_terminated(tid);
     
     // Always try to resolve the PID so we can unregister the process later.
-    // For kill_process: the process is already unregistered, current_process()
+    // For kill_process: the process is already unregistered, current_process_shared()
     //   returns None → pid = None → cleanup section is skipped.
     // For kill_thread_group: the process is still registered (only marked
-    //   zombie), current_process() succeeds → pid = Some → we can unregister
+    //   zombie), current_process_shared() succeeds → pid = Some → we can unregister
     //   below, preventing the process from leaking in PROCESS_TABLE.
-    let pid = if let Some(proc) = current_process() {
+    let pid = if let Some(proc) = current_process_shared() {
         let pid = proc.pid;
         if !already_terminated {
             cleanup_process_fds(proc);
@@ -1325,7 +1384,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     // point to a lazily-mapped page that was never faulted in, and writing
     // from EL1 won't trigger demand paging (only EL0 faults do).
     if !already_terminated {
-        if let Some(proc) = lookup_process(pid.unwrap_or(0)) {
+        if let Some(proc) = lookup_process_shared(pid.unwrap_or(0)) {
             let tid_addr = proc.clear_child_tid;
             if tid_addr != 0 {
                 if crate::mmu::is_current_user_page_mapped(tid_addr as usize) {
@@ -1428,7 +1487,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         // includes *all* thread PIDs in `parents`, so any child whose parent_pid
         // is the main thread would be matched whenever *any* worker exits — killing
         // live `compile` subprocesses still needed by other threads (exit 137).
-        let (l0_phys, is_shared) = match lookup_process(pid) {
+        let (l0_phys, is_shared) = match lookup_process_shared(pid) {
             Some(p) => (p.address_space.l0_phys(), p.address_space.is_shared()),
             None => (0usize, true),
         };
@@ -1447,7 +1506,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             kill_thread_group(pid, l0_phys, exit_code);
         }
 
-        let (start_us, proc_name) = lookup_process(pid)
+        let (start_us, proc_name) = lookup_process_shared(pid)
             .map(|p| (p.start_time_us, p.name.clone()))
             .unwrap_or((0, alloc::string::String::from("?")));
         let elapsed_us = (runtime().uptime_us)().saturating_sub(start_us);
@@ -1455,13 +1514,13 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         let frac = (elapsed_us % 1_000_000) / 10_000; // centiseconds
 
         if process_syscall_stats_enabled() {
-            if let Some(proc) = lookup_process(pid) {
+            if let Some(proc) = lookup_process_shared(pid) {
                 proc.syscall_stats.dump(pid, &proc_name, elapsed_us);
             }
         }
 
         // Read tgid BEFORE unregister (for future signal-based group exit).
-        let _tgid = lookup_process(pid).map(|p| p.tgid);
+        let _tgid = lookup_process_shared(pid).map(|p| p.tgid);
 
         clear_lazy_regions(pid);
         unregister_process(pid);
@@ -1542,7 +1601,7 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
     let already_terminated = crate::threading::is_thread_terminated(tid);
 
     let pid = if !already_terminated {
-        if let Some(proc) = current_process() {
+        if let Some(proc) = current_process_shared() {
             let pid = proc.pid;
             cleanup_process_fds(proc);
             Some(pid)
@@ -1582,7 +1641,7 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
             }
         }
 
-        let (l0_phys, is_shared) = match lookup_process(pid) {
+        let (l0_phys, is_shared) = match lookup_process_shared(pid) {
             Some(p) => (p.address_space.l0_phys(), p.address_space.is_shared()),
             None => (0usize, true),
         };
@@ -1598,7 +1657,7 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
             kill_thread_group(pid, l0_phys, exit_code);
         }
 
-        let start_us = lookup_process(pid)
+        let start_us = lookup_process_shared(pid)
             .map(|p| p.start_time_us)
             .unwrap_or(0);
         let elapsed_us = (runtime().uptime_us)().saturating_sub(start_us);
@@ -1640,10 +1699,36 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
 
 /// Clean up all file descriptors owned by a process.
 ///
-/// With shared fd tables (CLONE_FILES), only the last thread referencing the
-/// table performs actual cleanup. Other threads just drop their Arc reference.
+/// With shared fd tables (CLONE_FILES), only the last **live** user of the
+/// table performs actual cleanup; while siblings are alive, their fds must not
+/// be closed out from under them (the git sideband-thread bug `sys_exit`'s
+/// comment documents).
+///
+/// "Live" is decided by scanning the process table for other not-yet-exited
+/// processes sharing this same `Arc<SharedFdTable>` — NOT by
+/// `Arc::strong_count == 1`, which this used to test. Phase 7e's "Free" half
+/// defers `Process::drop` (RETIRED slots wait for `reclaim_retired_processes`),
+/// so a killed CLONE_THREAD sibling's `Arc` clone now stays alive long after
+/// the sibling is dead: under the old count test, an externally-killed
+/// multithreaded group (`kill -9`, `kill_process*`) NEVER saw the count reach 1
+/// and its pipes/sockets were released only by the deferred collector — which
+/// during the synchronous boot self-test phase never runs at all. Same defect
+/// class as `sys_exit_group`'s close-after-notify (BKL_PHASE7E §3b): a pipe
+/// read end held forever hangs the peer. RETIRED processes are invisible to
+/// `for_each_process`, and kill paths mark `exited` (or retire) each member
+/// before/without ever re-entering here for it, so the last member's cleanup
+/// correctly sees itself as the sole live user and closes. `close_all` stays
+/// idempotent, so over-calling on already-emptied tables is harmless.
 fn cleanup_process_fds(proc: &Process) {
-    if Arc::strong_count(&proc.fds) == 1 {
+    let mut live_sharers = 0usize;
+    table::for_each_process(|p| {
+        if !p.exited && Arc::ptr_eq(&p.fds, &proc.fds) {
+            live_sharers += 1;
+        }
+    });
+    // `live_sharers` counts `proc` itself unless it is already marked exited
+    // or already retired; in every such caller the table should be closed.
+    if live_sharers <= 1 {
         proc.fds.close_all();
     }
 }
@@ -1676,7 +1761,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     if (runtime().is_memory_low)() {
         return Err("Kernel memory low, cannot fork");
     }
-    let parent = current_process().ok_or("No current process")?;
+    let parent = current_process_shared().ok_or("No current process")?;
     let parent_pid = parent.pid;
     // Lazy mmap regions are keyed by *thread-group id* (see `mmap` →
     // `push_lazy_region(proc.tgid, …)`): every thread sharing this address space
@@ -2269,7 +2354,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // cow_share_and_demote_range copies the parent's PTE for 0x1000 into the child,
     // overwriting the child's process info mapping.  Without this re-map,
     // the child reads the PARENT's PID from PROCESS_INFO_ADDR, causing
-    // current_process() / read_current_pid() to return the wrong PID.
+    // current_process_shared() / read_current_pid() to return the wrong PID.
     // This broke vfork_complete (wrong child PID → parent never unblocked)
     // and the CoW fault handler (resolved pages in the wrong address space).
     (runtime().print_str)("[FORK-DBG] step5a: re-mapping PROCESS_INFO_ADDR\n");
@@ -2328,8 +2413,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
     new_proc.thread_id = Some(tid);
 
-    // Register in THREAD_PID_MAP so current_process() returns child PID for this thread.
-    // Without this, current_process() falls back to reading the parent's PROCESS_INFO_ADDR
+    // Register in THREAD_PID_MAP so current_process_shared() returns child PID for this thread.
+    // Without this, current_process_shared() falls back to reading the parent's PROCESS_INFO_ADDR
     // (not yet updated) and returns the parent PID, causing vfork_complete to fire on the
     // wrong child PID and leaving the parent permanently blocked.
     with_irqs_disabled(|| {
@@ -2398,7 +2483,7 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
     if (runtime().is_memory_low)() {
         return Err("Kernel memory low, cannot vfork");
     }
-    let parent = current_process().ok_or("No current process")?;
+    let parent = current_process_shared().ok_or("No current process")?;
     let parent_pid = parent.pid;
 
     // Share the parent's L0 page table (same mechanism as CLONE_THREAD).
@@ -2522,7 +2607,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     if (runtime().is_memory_low)() {
         return Err("Kernel memory low, cannot clone thread");
     }
-    let parent = current_process().ok_or("No current process")?;
+    let parent = current_process_shared().ok_or("No current process")?;
     let parent_pid = parent.pid;
     let child_pid = allocate_pid();
 
@@ -2634,7 +2719,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     // caused wait4(-1) to block forever on git's sideband demux pthread, which never exited
     // because it was waiting for data from a pipe whose write-end git itself held open.
 
-    // Register in THREAD_PID_MAP so current_process() works for this thread
+    // Register in THREAD_PID_MAP so current_process_shared() works for this thread
     with_irqs_disabled(|| {
         THREAD_PID_MAP.lock().insert(tid, child_pid);
     });

@@ -238,7 +238,7 @@ pub fn has_children(parent_pid: Pid) -> bool {
 
 /// Get channel for the current thread (used by syscall handlers)
 pub fn current_channel() -> Option<Arc<ProcessChannel>> {
-    if let Some(proc) = current_process() {
+    if let Some(proc) = current_process_shared() {
         if let Some(ref ch) = proc.channel {
             return Some(ch.clone());
         }
@@ -320,23 +320,14 @@ pub fn read_current_pid() -> Option<Pid> {
     if pid == 0 { None } else { Some(pid) }
 }
 
-/// Look up a process by PID.
-///
-/// # Safety warning
-/// Returns `&'static mut Process` that is ONLY valid while the process stays
-/// registered. If another thread calls `unregister_process` between this call
-/// and your use of the reference, you get use-after-free.
-///
-/// **Prefer `crate::process::table::with_process(pid, |p| ...)` for safe access.**
-///
-/// This function exists for the 218+ legacy call sites in syscall handlers.
-/// Most are safe in practice because syscall handlers run in a single thread
-/// context and the process can't be freed during a syscall by its own thread.
-pub fn lookup_process(pid: Pid) -> Option<&'static mut Process> {
-    let ptr = crate::process::table::get_process_ptr(pid)?;
-    crate::process::diag::borrow_inc(pid);
-    Some(unsafe { &mut *ptr })
-}
+// `lookup_process(pid) -> Option<&'static mut Process>` is GONE (Phase 7e
+// "Access" half, 2026-08-01): two cores could each materialize `&'static mut`
+// to the same `Process` (aliasing UB), and the `'static` lifetime structurally
+// outlives the RETIRED→FREE deferred reclamation the "Free" half introduced.
+// Use [`lookup_process_shared`] for reads and `&self` methods,
+// `table::with_process` for short IRQ-masked field writes, and
+// `table::with_process_exclusive` (unsafe, enumerated call sites only) for the
+// execve/first-run lifecycle windows Phase 7f owns.
 
 /// Look up a process by PID, returning a **shared** `&'static Process`.
 ///
@@ -414,7 +405,7 @@ pub fn fault_slot_acquire(as_owner: Pid, page_va: usize) -> FaultSlot {
         // see docs/OPTIONAL_SMOLTCP.md: that was `clone_thread` handing the
         // child a stale TTBR0.)
         let outcome = with_irqs_disabled(|| {
-            let proc = match lookup_process(as_owner) {
+            let proc = match lookup_process_shared(as_owner) {
                 Some(p) => p,
                 None => return Some(FaultSlot::NoProc),
             };
@@ -460,7 +451,7 @@ pub fn fault_slot_release(as_owner: Pid, page_va: usize) {
     // from the EL0 demand-paging fault path (IRQs-enabled), and contended across
     // CLONE_VM siblings sharing the leader's one `fault_mutex`.
     with_irqs_disabled(|| {
-        if let Some(proc) = lookup_process(as_owner) {
+        if let Some(proc) = lookup_process_shared(as_owner) {
             let mut faults = proc.fault_mutex.lock();
             if faults.get(&page_va).copied() == Some(my_tid) {
                 faults.remove(&page_va);
@@ -469,23 +460,36 @@ pub fn fault_slot_release(as_owner: Pid, page_va: usize) {
     });
 }
 
-/// Get the current process (for syscall handlers).
-///
-/// For CLONE_THREAD children, uses the thread-to-PID map since they share
-/// the parent's ProcessInfo page. Otherwise reads PID from the process info page.
-///
-/// Same safety caveats as `lookup_process`. Prefer `with_process` for new code.
-pub fn current_process() -> Option<&'static mut Process> {
-    let tid = crate::threading::current_thread_id();
-    let thread_pid = with_irqs_disabled(|| {
-        THREAD_PID_MAP.lock().get(&tid).copied()
-    });
-    if let Some(pid) = thread_pid {
-        return lookup_process(pid);
-    }
-    let pid = read_current_pid()?;
-    lookup_process(pid)
+// `current_process() -> Option<&'static mut Process>` is GONE — see the note
+// above `lookup_process_shared`. Use [`current_process_shared`] /
+// [`with_current_process`].
 
+/// Get the current process as a **shared** `&'static Process` — the
+/// [`lookup_process_shared`] counterpart of [`current_process`], resolving the
+/// PID the same way (thread-to-PID map first, then the ProcessInfo page).
+///
+/// This is the accessor for the Phase 7e "Access" migration: reads and calls
+/// to `&self` methods (fd table, `vm_*`, `with_as_locked`, `Arc` fields) go
+/// through this; plain-field *writes* go through [`with_current_process`] /
+/// `table::with_process` instead, so no call site materializes a long-lived
+/// `&'static mut Process` (aliasing UB when two cores hold one to the same
+/// object). Same lifetime caveat as [`lookup_process_shared`]: valid only
+/// while the process stays registered.
+pub fn current_process_shared() -> Option<&'static Process> {
+    lookup_process_shared(current_pid()?)
+}
+
+/// Run `f` on the current process with IRQs disabled — the current-process
+/// counterpart of `table::with_process`, resolving the PID exactly like
+/// [`current_process`] (thread-to-PID map first, then the ProcessInfo page).
+///
+/// Same contract as `with_process`: the callback runs with IRQs disabled and
+/// MUST NOT allocate on the heap (moving a pre-built value into a field, or
+/// letting the replaced value drop, is fine — deallocation cannot re-enter the
+/// OOM path). Use it for short plain-field writes and scalar copies; use
+/// [`current_process_shared`] for reads and `&self` methods.
+pub fn with_current_process<T>(f: impl FnOnce(&mut Process) -> T) -> Option<T> {
+    crate::process::table::with_process(current_pid()?, f)
 }
 
 /// Resolve the current process PID (checking THREAD_PID_MAP first, then ProcessInfo page).
@@ -509,7 +513,7 @@ pub fn current_terminal_state() -> Option<Arc<Spinlock<terminal::TerminalState>>
     }
 
     // 2. Fallback to process table
-    current_process().map(|p| p.terminal_state.clone())
+    current_process_shared().map(|p| p.terminal_state.clone())
 }
 
 /// Allocate mmap region for current process
@@ -517,7 +521,7 @@ pub fn current_terminal_state() -> Option<Arc<Spinlock<terminal::TerminalState>>
 pub fn alloc_mmap(size: usize) -> usize {
     // Use address-space owner so CLONE_VM threads share allocation state.
     let pid = address_space_owner_pid_for_fault().unwrap_or(0);
-    let proc = match lookup_process(pid) {
+    let proc = match lookup_process_shared(pid) {
         Some(p) => p,
         None => {
             (runtime().print_str)("[mmap] ERROR: No current process\n");
@@ -542,17 +546,8 @@ pub fn alloc_mmap(size: usize) -> usize {
 /// The frames Vec should contain all physical frames for this region.
 pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
     let pid = address_space_owner_pid_for_fault().unwrap_or(0);
-    if let Some(proc) = lookup_process(pid) {
+    if let Some(proc) = lookup_process_shared(pid) {
         proc.vm_with_regions(|r| r.push(MmapRegion::owned(start_va, frames)));
-    }
-}
-
-/// Record a lazy mmap region — VA reserved, no physical pages.
-/// `page_flags` = 0 for PROT_NONE (needs mprotect), non-zero for demand-paged.
-pub fn record_lazy_region(start_va: usize, size: usize, page_flags: u64) {
-    let pid = address_space_owner_pid_for_fault().unwrap_or(0);
-    if let Some(proc) = lookup_process(pid) {
-        proc.lazy_regions.push(LazyRegion { start_va, size, flags: page_flags, source: LazySource::Zero });
     }
 }
 
@@ -642,7 +637,7 @@ pub fn reclaim_clean_file_pages(want: usize) -> usize {
     });
     if n == 0 { return 0; }
 
-    let proc = match lookup_process(pid) {
+    let proc = match lookup_process_shared(pid) {
         Some(p) => p,
         None => return 0,
     };
@@ -677,11 +672,7 @@ pub fn reclaim_clean_file_pages(want: usize) -> usize {
             // holding it across the entire sweep would starve this core's timer for
             // however long the scan runs, exactly the "mask per attempt, never across
             // an unbounded wait" rule (docs/reference/subsystems/locking.md).
-            let evicted = {
-                #[cfg(kernel_smp_shared)]
-                let _asg = Process::as_lock_hold(&proc.as_lock);
-                proc.address_space.try_evict_ro_page(va)
-            };
+            let evicted = proc.with_address_space(|aspace| aspace.try_evict_ro_page(va));
             if let Some(frame) = evicted {
                 (runtime().free_page)(frame);
                 freed += 1;
@@ -727,7 +718,7 @@ pub fn address_space_owner_pid_for_fault() -> Option<Pid> {
         }
     }
     // Fallback: THREAD_PID_MAP tgid, then ProcessInfo page.
-    current_process().map(|p| p.tgid).or_else(read_current_pid)
+    current_process_shared().map(|p| p.tgid).or_else(read_current_pid)
 }
 
 /// Like [`lazy_region_lookup_for_pid`], but resolves demand-paging metadata keyed by the
@@ -1050,7 +1041,7 @@ pub fn is_in_lazy_region(va: usize) -> bool {
 /// Remove and return mmap region starting at the given VA
 pub fn remove_mmap_region(start_va: usize) -> Option<Vec<PhysFrame>> {
     let pid = address_space_owner_pid_for_fault().unwrap_or(0);
-    let proc = lookup_process(pid)?;
+    let proc = lookup_process_shared(pid)?;
     
     // Find & remove the region under vm_lock (pure Vec op).
     let region = proc.vm_with_regions(|r| {
@@ -1067,7 +1058,7 @@ pub fn remove_mmap_region(start_va: usize) -> Option<Vec<PhysFrame>> {
 
 /// Get stack bounds for current process
 pub fn get_stack_bounds() -> (usize, usize) {
-    match current_process() {
+    match current_process_shared() {
         Some(p) => (p.memory.stack_bottom, p.memory.stack_top),
         None => (0, 0),
     }
@@ -1115,7 +1106,7 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
         let state_str = match info.state {
             0 => "ready", 1 => "running", 2 => "blocked", _ => "zombie",
         };
-        let (name, args) = if let Some(proc) = lookup_process(info.pid) {
+        let (name, args) = if let Some(proc) = lookup_process_shared(info.pid) {
             if proc.name.len() <= 4096 && proc.args.len() <= 256 {
                 (proc.name.clone(), proc.args.clone())
             } else {

@@ -243,7 +243,7 @@ pub fn attach_server(box_id: u64, server_pid: process::Pid) {
     // px: kernel→server (server reads via its rx); py: server→kernel.
     let px = pipe::pipe_create();
     let py = pipe::pipe_create();
-    let Some(server) = process::lookup_process(server_pid) else {
+    let Some(server) = process::lookup_process_shared(server_pid) else {
         SERVER_PIDS.lock().remove(&server_pid);
         PROXIES.lock().insert(box_id, ProxyEntry::Failed);
         return;
@@ -324,7 +324,7 @@ pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
         return None; // no rump box exists → single relaxed load, no lock
     }
     let pid = process::read_current_pid().unwrap_or(0);
-    let proc: &Process = process::lookup_process(pid)?;
+    let proc: &Process = process::lookup_process_shared(pid)?;
     let box_id = proc.box_id;
     if !box_is_rump(box_id) {
         return None; // not a rump box → native stack is correct
@@ -1280,7 +1280,7 @@ impl ClientMem for DiscardMem {
 /// (the proxy latency applies).
 pub fn rump_socket_readable(rump_fd: i32) -> bool {
     let pid = process::read_current_pid().unwrap_or(0);
-    let Some(proc) = process::lookup_process(pid) else {
+    let Some(proc) = process::lookup_process_shared(pid) else {
         return false;
     };
     let box_id = proc.box_id;
@@ -1466,7 +1466,7 @@ pub fn run_rump() {
     // Install the server end at fd 3 BEFORE it runs. Single-core: we have not
     // yielded since spawn, so the child is not scheduled until our first blocking
     // read yields — and the server only touches fd 3 after rump_init() anyway.
-    let Some(p) = process::lookup_process(pid) else {
+    let Some(p) = process::lookup_process_shared(pid) else {
         crate::console::print("[Test] rump_sysproxy FAILED: lookup_process\n");
         let _ = process::kill_process(pid);
         return;

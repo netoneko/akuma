@@ -574,6 +574,8 @@ pub fn run_all_tests() {
     // Phase 7e "Free" half: deferred process-table reclamation
     test_process_reclaim_respects_cooldown();
     test_unregister_process_second_call_loses_cas();
+    // Phase 7e "Access" half: eager fd release on external kill
+    test_external_kill_closes_shared_fds();
 
     // Thread leak and exit_group tests (2026-04-10 fixes)
     test_unregister_process_terminates_thread();
@@ -3734,12 +3736,12 @@ fn test_pmm_conserved_across_spawn_exit_reap() {
         // gate — exactly the production reap path, just on demand).
         //
         // Both forces are required since Phase 7e: `unregister_process` only moves the
-        // slot ACTIVE → RETIRED, which already makes `lookup_process(pid)` return None
+        // slot ACTIVE → RETIRED, which already makes `lookup_process_shared(pid)` return None
         // while the address space is still fully allocated. Driving only the thread
         // cleanup therefore exits this loop with every page still held, and the test
         // read that as a ~542-pages-per-cycle PMM leak.
         let t1 = crate::timer::uptime_us();
-        while process::lookup_process(pid).is_some() {
+        while process::lookup_process_shared(pid).is_some() {
             akuma_exec::threading::cleanup_terminated_force();
             if crate::timer::uptime_us() - t1 > 5_000_000 {
                 return false;
@@ -3765,14 +3767,14 @@ fn test_pmm_conserved_across_spawn_exit_reap() {
         for _ in 0..50 {
             akuma_exec::threading::yield_now();
         }
-        if process::lookup_process(pid).is_none() {
+        if process::lookup_process_shared(pid).is_none() {
             return false; // already gone — can't exercise the kill path
         }
         if process::kill_process(pid).is_err() {
             return false;
         }
         let t1 = crate::timer::uptime_us();
-        while process::lookup_process(pid).is_some() {
+        while process::lookup_process_shared(pid).is_some() {
             akuma_exec::threading::cleanup_terminated_force();
             if crate::timer::uptime_us() - t1 > 5_000_000 {
                 return false;
@@ -4471,7 +4473,7 @@ fn test_rt_sigtimedwait() {
     let sig = 13; // SIGPIPE
     let wait_mask = 1u64 << (sig - 1);
 
-    // 1. Register current thread as a process so current_process() works
+    // 1. Register current thread as a process so current_process_shared() works
     let proc = make_test_process(pid);
     register_process(pid, proc);
     register_thread_pid(tid, pid);
@@ -4553,7 +4555,7 @@ fn test_sigpipe_handler_reentrancy() {
     register_process(pid, proc);
     
     // Simulate signal delivery (we can't easily call try_deliver_signal here 
-    // because it needs a real TrapFrame and current_process() context).
+    // because it needs a real TrapFrame and current_process_shared() context).
     
     // But we can check if our masking logic in try_deliver_signal uses proc.signal_mask.
     // Actually, I can just verify that proc.signal_mask is updated after delivery.
@@ -4570,7 +4572,7 @@ fn test_sigpipe_handler_reentrancy() {
 
 /// Verify that exit_group marks siblings as Zombies but does NOT remove them
 /// from the process table immediately.  Removing them while the thread is still
-/// running causes current_process() to return None, leading to crashes/ENOSYS.
+/// running causes current_process_shared() to return None, leading to crashes/ENOSYS.
 fn test_exit_group_does_not_unregister_while_siblings_running() {
     use akuma_exec::process::{ProcessState, register_process, unregister_process, kill_thread_group};
 
@@ -4598,7 +4600,7 @@ fn test_exit_group_does_not_unregister_while_siblings_running() {
 
     // Verify sibling still exists in table but is marked Zombie
     let (exists, is_zombie) = crate::irq::with_irqs_disabled(|| {
-        if let Some(proc) = akuma_exec::process::lookup_process(sib_pid) {
+        if let Some(proc) = akuma_exec::process::lookup_process_shared(sib_pid) {
             (true, matches!(proc.state, ProcessState::Zombie(_)))
         } else {
             (false, false)
@@ -4621,7 +4623,7 @@ fn test_exit_group_does_not_unregister_while_siblings_running() {
 }
 
 /// Verify that after exit_group has run, a sibling thread can still make
-/// syscalls that require current_process() (like rt_sigaction) without getting
+/// syscalls that require current_process_shared() (like rt_sigaction) without getting
 /// ENOSYS or crashing.
 fn test_rt_sigaction_after_exit_group_not_enosys() {
     use akuma_exec::process::{register_process, unregister_process, kill_thread_group, register_thread_pid, unregister_thread_pid};
@@ -4665,18 +4667,18 @@ fn test_rt_sigaction_after_exit_group_not_enosys() {
     // doesn't unregister, the process stays.
     
     // We need to check if we can lookup the process.
-    // But syscalls rely on `current_process()`, which uses `THREAD_PID_MAP`.
+    // But syscalls rely on `current_process_shared()`, which uses `THREAD_PID_MAP`.
     
     // Let's check if the sibling is still in THREAD_PID_MAP.
     let in_map = crate::irq::with_irqs_disabled(|| {
         // We can't access THREAD_PID_MAP directly from here easily as it's static in process module.
-        // But `current_process()` uses it.
-        // So if we fake the current thread ID to be sib_tid, current_process() should work.
+        // But `current_process_shared()` uses it.
+        // So if we fake the current thread ID to be sib_tid, current_process_shared() should work.
         // But we can't fake current_thread_id() easily.
         
-        // Instead, let's just check if lookup_process(sib_pid) works, which implies
-        // it's still in the table. The crash happens because `current_process()` returns None.
-        akuma_exec::process::lookup_process(sib_pid).is_some()
+        // Instead, let's just check if lookup_process_shared(sib_pid) works, which implies
+        // it's still in the table. The crash happens because `current_process_shared()` returns None.
+        akuma_exec::process::lookup_process_shared(sib_pid).is_some()
     });
 
     // Cleanup
@@ -6629,7 +6631,7 @@ fn test_lseek_nonseekable_returns_espipe() {
 
     // The boot suite has no current process; register a throwaway one bound to
     // this thread so the lseek syscall has a process/fd-table to operate on.
-    if akuma_exec::process::current_process().is_some() {
+    if akuma_exec::process::current_process_shared().is_some() {
         console::print("[Test] lseek_nonseekable_returns_espipe SKIP (process already current)\n");
         return;
     }
@@ -6640,7 +6642,7 @@ fn test_lseek_nonseekable_returns_espipe() {
 
     // Install a pipe read-end fd on the current process (read=1, write=1).
     let pipe_id = crate::syscall::pipe::pipe_create();
-    let fd = akuma_exec::process::current_process().unwrap().alloc_fd(FileDescriptor::PipeRead(pipe_id));
+    let fd = akuma_exec::process::current_process_shared().unwrap().alloc_fd(FileDescriptor::PipeRead(pipe_id));
 
     // lseek on a pipe → ESPIPE (non-seekable), NOT the old EINVAL.
     let pipe_ret = crate::syscall::handle_syscall(NR_LSEEK, &[u64::from(fd), 0, SEEK_CUR, 0, 0, 0]);
@@ -6648,7 +6650,7 @@ fn test_lseek_nonseekable_returns_espipe() {
     let bad_ret = crate::syscall::handle_syscall(NR_LSEEK, &[9999, 0, SEEK_CUR, 0, 0, 0]);
 
     // Cleanup: drop the fd, tear down the pipe, and unregister the process.
-    if let Some(p) = akuma_exec::process::current_process() { p.remove_fd(fd); }
+    if let Some(p) = akuma_exec::process::current_process_shared() { p.remove_fd(fd); }
     crate::syscall::pipe::pipe_close_read(pipe_id);  // read=0
     crate::syscall::pipe::pipe_close_write(pipe_id); // write=0 → destroyed
     unregister_thread_pid(tid);
@@ -6693,7 +6695,7 @@ fn test_failed_exec_preserves_cloexec_fds() {
 
     // The boot suite has no current process; register a throwaway one bound to
     // this thread so do_execve has a process to operate on.
-    if akuma_exec::process::current_process().is_some() {
+    if akuma_exec::process::current_process_shared().is_some() {
         console::print("[Test] failed_exec_preserves_cloexec_fds SKIP (process already current)\n");
         let _ = crate::fs::remove_file(TMP_PATH);
         return;
@@ -6705,8 +6707,8 @@ fn test_failed_exec_preserves_cloexec_fds() {
 
     // Install a close-on-exec pipe write-end (mirrors libstd's CLOEXEC pipe).
     let pipe_id = crate::syscall::pipe::pipe_create(); // read=1, write=1
-    let fd = akuma_exec::process::current_process().unwrap().alloc_fd(FileDescriptor::PipeWrite(pipe_id));
-    akuma_exec::process::current_process().unwrap().set_cloexec(fd);
+    let fd = akuma_exec::process::current_process_shared().unwrap().alloc_fd(FileDescriptor::PipeWrite(pipe_id));
+    akuma_exec::process::current_process_shared().unwrap().set_cloexec(fd);
 
     // Attempt the doomed execve. `do_execve` returns an errno on failure (it
     // only enters user mode on success), so it is safe to call here.
@@ -6717,13 +6719,13 @@ fn test_failed_exec_preserves_cloexec_fds() {
     // The exec must have FAILED (a successful one never returns) and the
     // close-on-exec fd must survive intact.
     let failed = (ret as i64) < 0;
-    let (still_present, still_cloexec) = match akuma_exec::process::current_process() {
+    let (still_present, still_cloexec) = match akuma_exec::process::current_process_shared() {
         Some(p) => (p.get_fd(fd).is_some(), p.is_cloexec(fd)),
         None => (false, false),
     };
 
     // Cleanup: drop the fd + pipe, remove the temp file, unregister the process.
-    if let Some(p) = akuma_exec::process::current_process() {
+    if let Some(p) = akuma_exec::process::current_process_shared() {
         p.clear_cloexec(fd);
         p.remove_fd(fd);
     }
@@ -7227,7 +7229,7 @@ fn test_socketpair_recv_send_via_socket_syscalls() {
     #[repr(C)]
     struct IoVec { iov_base: u64, iov_len: u64 }
 
-    if akuma_exec::process::current_process().is_some() {
+    if akuma_exec::process::current_process_shared().is_some() {
         console::print("[Test] socketpair_recv_send_via_socket_syscalls SKIP (process already current)\n");
         return;
     }
@@ -7240,7 +7242,7 @@ fn test_socketpair_recv_send_via_socket_syscalls() {
     // is exactly one reader + one writer endpoint per direction (no clone_ref).
     let px = crate::syscall::pipe::pipe_create();
     let py = crate::syscall::pipe::pipe_create();
-    let proc = akuma_exec::process::current_process().unwrap();
+    let proc = akuma_exec::process::current_process_shared().unwrap();
     let fd_a = proc.alloc_fd(FileDescriptor::UnixSocket { rx: px, tx: py });
     let fd_b = proc.alloc_fd(FileDescriptor::UnixSocket { rx: py, tx: px });
 
@@ -7275,7 +7277,7 @@ fn test_socketpair_recv_send_via_socket_syscalls() {
     crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
 
     // Cleanup: drop fds, tear down both pipes, unregister.
-    if let Some(p) = akuma_exec::process::current_process() {
+    if let Some(p) = akuma_exec::process::current_process_shared() {
         p.remove_fd(fd_a);
         p.remove_fd(fd_b);
     }
@@ -7478,7 +7480,7 @@ fn test_dup3_no_einval_for_valid_args() {
 
     // Allocate a PipeRead fd in the process (next_fd starts at 3)
     let pipe_id = pipe_create();
-    let src_fd = akuma_exec::process::current_process()
+    let src_fd = akuma_exec::process::current_process_shared()
         .unwrap()
         .alloc_fd(FileDescriptor::PipeRead(pipe_id));
 
@@ -7845,7 +7847,7 @@ fn test_epoll_socket_waker() {
         return;
     }
 
-    let current_proc = akuma_exec::process::current_process().unwrap();
+    let current_proc = akuma_exec::process::current_process_shared().unwrap();
 
     let sock_idx = akuma_net::socket::alloc_socket(1).expect("Failed to create socket");
     let fd = current_proc.alloc_fd(FileDescriptor::Socket(sock_idx));
@@ -7917,7 +7919,7 @@ fn test_epoll_poll_socket_readiness_no_deadlock() {
     register_process(pid, proc);
     register_thread_pid(tid, pid);
 
-    let current_proc = akuma_exec::process::current_process().unwrap();
+    let current_proc = akuma_exec::process::current_process_shared().unwrap();
     let sock_idx = akuma_net::socket::alloc_socket(1).expect("Failed to create socket for deadlock test");
     let fd = current_proc.alloc_fd(FileDescriptor::Socket(sock_idx));
 
@@ -8026,7 +8028,7 @@ fn test_epoll_multi_poller_pipe() {
     register_thread_pid(tid, pid);
 
     let pipe_id = pipe_create();
-    let current_proc = akuma_exec::process::current_process().unwrap();
+    let current_proc = akuma_exec::process::current_process_shared().unwrap();
     let fd_r = current_proc.alloc_fd(FileDescriptor::PipeRead(pipe_id));
 
     // Create two epoll instances
@@ -8044,7 +8046,7 @@ fn test_epoll_multi_poller_pipe() {
 
     // Spawn two threads to wait on the two epoll instances.
     // Each thread must register with the process so sys_epoll_pwait can
-    // find the fd table via current_process().
+    // find the fd table via current_process_shared().
     let _thread1 = akuma_exec::threading::spawn_user_thread_fn(move || {
         let my_tid = akuma_exec::threading::current_thread_id();
         akuma_exec::process::register_thread_pid(my_tid, pid);
@@ -8353,7 +8355,7 @@ fn test_kill_thread_group_preserves_lazy_regions() {
 /// cloned to sibling PIDs (same as `lazy_region_lookup_for_pid` after `clone_lazy_regions`).
 fn test_lazy_region_lookup_for_page_fault_clone() {
     use akuma_exec::process::{
-        lookup_process, register_process, unregister_process, push_lazy_region, clear_lazy_regions,
+        lookup_process_shared, register_process, unregister_process, push_lazy_region, clear_lazy_regions,
         clone_lazy_regions, lazy_region_lookup_for_page_fault,
     };
     use akuma_exec::mmu::user_flags;
@@ -8368,7 +8370,7 @@ fn test_lazy_region_lookup_for_page_fault_clone() {
 
     let mut sib_proc = make_test_process(sibling_pid);
     sib_proc.tgid = owner_pid;
-    let l0 = lookup_process(owner_pid).expect("owner").address_space.l0_phys();
+    let l0 = lookup_process_shared(owner_pid).expect("owner").address_space.l0_phys();
     sib_proc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap();
     register_process(sibling_pid, sib_proc);
 
@@ -8394,7 +8396,7 @@ fn test_lazy_region_lookup_for_page_fault_clone() {
 /// worker PID or an unrelated id, as long as [`current_process`] maps to a CLONE_VM sibling.
 fn test_lazy_region_lookup_resolves_tgid_for_demand_paging() {
     use akuma_exec::process::{
-        register_process, unregister_process, lookup_process,
+        register_process, unregister_process, lookup_process_shared,
         push_lazy_region, clear_lazy_regions, lazy_region_lookup_for_page_fault,
         register_thread_pid, unregister_thread_pid,
     };
@@ -8410,7 +8412,7 @@ fn test_lazy_region_lookup_resolves_tgid_for_demand_paging() {
 
     let mut worker_proc = make_test_process(worker);
     worker_proc.tgid = leader;
-    let l0 = lookup_process(leader).expect("leader").address_space.l0_phys();
+    let l0 = lookup_process_shared(leader).expect("leader").address_space.l0_phys();
     worker_proc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap();
     register_process(worker, worker_proc);
 
@@ -8447,7 +8449,7 @@ fn test_lazy_region_lookup_resolves_tgid_for_demand_paging() {
 /// holder-tracked `fault_slot_acquire` must reclaim a dead holder's slot.
 fn test_fault_mutex_insert_remove() {
     use akuma_exec::process::{
-        register_process, unregister_process, lookup_process, fault_slot_acquire,
+        register_process, unregister_process, lookup_process_shared, fault_slot_acquire,
         fault_slot_release, FaultSlot,
     };
     use akuma_exec::threading;
@@ -8460,10 +8462,10 @@ fn test_fault_mutex_insert_remove() {
     // (1) Clean acquire records us as holder; release clears it.
     let va = 0x5000usize;
     ok &= matches!(fault_slot_acquire(pid, va), FaultSlot::Acquired);
-    ok &= lookup_process(pid)
+    ok &= lookup_process_shared(pid)
         .is_some_and(|p| p.fault_mutex.lock().get(&va).copied() == Some(me));
     fault_slot_release(pid, va);
-    ok &= lookup_process(pid).is_some_and(|p| p.fault_mutex.lock().is_empty());
+    ok &= lookup_process_shared(pid).is_some_and(|p| p.fault_mutex.lock().is_empty());
 
     // (2) Poison recovery: a slot held by a DEAD thread must be reclaimable,
     // not an infinite spin. Simulate the dead holder with a parked test slot.
@@ -8472,7 +8474,7 @@ fn test_fault_mutex_insert_remove() {
         let dead_tid = claimed[0];
         threading::set_thread_state(dead_tid, threading::thread_state::TERMINATED);
         let va2 = 0x6000usize;
-        if let Some(p) = lookup_process(pid) {
+        if let Some(p) = lookup_process_shared(pid) {
             p.fault_mutex.lock().insert(va2, dead_tid); // poison: holder already dead
         }
         match fault_slot_acquire(pid, va2) {
@@ -8480,10 +8482,10 @@ fn test_fault_mutex_insert_remove() {
             _ => ok = false,
         }
         // Slot now belongs to us; releasing it empties the map.
-        ok &= lookup_process(pid)
+        ok &= lookup_process_shared(pid)
             .is_some_and(|p| p.fault_mutex.lock().get(&va2).copied() == Some(me));
         fault_slot_release(pid, va2);
-        ok &= lookup_process(pid).is_some_and(|p| p.fault_mutex.lock().is_empty());
+        ok &= lookup_process_shared(pid).is_some_and(|p| p.fault_mutex.lock().is_empty());
         threading::release_test_thread_slot(dead_tid);
     } else {
         ok = false;
@@ -8491,11 +8493,11 @@ fn test_fault_mutex_insert_remove() {
 
     // (3) A release by a non-owner must NOT remove someone else's entry.
     let va3 = 0x7000usize;
-    if let Some(p) = lookup_process(pid) {
+    if let Some(p) = lookup_process_shared(pid) {
         p.fault_mutex.lock().insert(va3, me.wrapping_add(0xDEAD)); // owned by a phantom tid
     }
     fault_slot_release(pid, va3); // we (tid `me`) don't own it -> no-op
-    ok &= lookup_process(pid)
+    ok &= lookup_process_shared(pid)
         .is_some_and(|p| p.fault_mutex.lock().get(&va3).copied().is_some());
 
     unregister_process(pid);
@@ -8512,7 +8514,7 @@ fn test_fault_mutex_insert_remove() {
 /// from the process table (Linux auto-reap for CLONE_THREAD).
 fn test_kill_thread_group_marks_siblings_zombie() {
     use akuma_exec::process::{
-        register_process, unregister_process, lookup_process,
+        register_process, unregister_process, lookup_process_shared,
         kill_thread_group, clear_lazy_regions,
     };
 
@@ -8534,9 +8536,9 @@ fn test_kill_thread_group_marks_siblings_zombie() {
     kill_thread_group(leader_pid, l0_phys, 0);
 
     // Sibling should be unregistered (auto-reaped)
-    let sibling_exists = lookup_process(sibling_pid).is_some();
+    let sibling_exists = lookup_process_shared(sibling_pid).is_some();
     // Leader should still exist
-    let leader_exists = lookup_process(leader_pid).is_some();
+    let leader_exists = lookup_process_shared(leader_pid).is_some();
 
     clear_lazy_regions(leader_pid);
     let _ = unregister_process(leader_pid);
@@ -8620,7 +8622,7 @@ fn test_kill_thread_group_reaps_futex_blocked_sibling() {
         terminated = threading::is_thread_terminated(sib_tid);
         polls += 1;
     }
-    let unregistered = akuma_exec::process::lookup_process(sib_pid).is_none(); // auto-reaped
+    let unregistered = akuma_exec::process::lookup_process_shared(sib_pid).is_none(); // auto-reaped
 
     // Cleanup. The sibling may have really RUN (smp-shared boundary path), so
     // recycle it via cleanup_terminated (safe: skips a still-current thread)
@@ -8991,7 +8993,7 @@ fn test_exit_group_yields_after_killing_siblings() {
 /// The sibling is unregistered (auto-reaped), so we verify via thread state.
 fn test_kill_thread_group_clears_thread_id() {
     use akuma_exec::process::{
-        register_process, unregister_process, lookup_process,
+        register_process, unregister_process, lookup_process_shared,
         kill_thread_group, clear_lazy_regions,
     };
     use akuma_exec::threading::{get_thread_state, thread_state, cleanup_terminated_force};
@@ -9023,10 +9025,10 @@ fn test_kill_thread_group_clears_thread_id() {
     kill_thread_group(leader_pid, l0_phys, 0);
 
     // Sibling should be unregistered and its thread marked TERMINATED
-    let sibling_exists = lookup_process(sibling_pid).is_some();
+    let sibling_exists = lookup_process_shared(sibling_pid).is_some();
     let sibling_thread_state = get_thread_state(sibling_tid);
     // Leader should still exist with its thread_id intact
-    let leader_tid_after = lookup_process(leader_pid).map(|p| p.thread_id);
+    let leader_tid_after = lookup_process_shared(leader_pid).map(|p| p.thread_id);
 
     clear_lazy_regions(leader_pid);
     let _ = unregister_process(leader_pid);
@@ -9106,7 +9108,7 @@ fn test_entry_point_trampoline_no_zombie_match() {
 /// it only sets exited/Zombie on the explicit caller path.
 fn test_zombie_process_unregistered_after_return_to_kernel() {
     use akuma_exec::process::{
-        register_process, unregister_process, lookup_process,
+        register_process, unregister_process, lookup_process_shared,
         kill_thread_group, clear_lazy_regions, ProcessState,
     };
 
@@ -9124,22 +9126,22 @@ fn test_zombie_process_unregistered_after_return_to_kernel() {
 
     // exit_group: the caller marks itself exited+Zombie (as sys_exit_group does)
     // BEFORE tearing down the group, then kills the siblings.
-    if let Some(caller) = lookup_process(caller_pid) {
+    akuma_exec::process::table::with_process(caller_pid, |caller| {
         caller.exited = true;
         caller.exit_code = 0;
         caller.state = ProcessState::Zombie(0);
-    }
+    });
     kill_thread_group(caller_pid, l0_phys, 0);
 
     // The caller remains a registered zombie; the sibling is auto-reaped.
-    let still_registered = lookup_process(caller_pid).is_some();
-    let is_exited = lookup_process(caller_pid).is_some_and(|p| p.exited);
-    let sibling_gone = lookup_process(sibling_pid).is_none();
+    let still_registered = lookup_process_shared(caller_pid).is_some();
+    let is_exited = lookup_process_shared(caller_pid).is_some_and(|p| p.exited);
+    let sibling_gone = lookup_process_shared(sibling_pid).is_none();
 
     // return_to_kernel then unregisters the zombie caller.
     clear_lazy_regions(caller_pid);
     let dropped = unregister_process(caller_pid);
-    let gone_after = lookup_process(caller_pid).is_none();
+    let gone_after = lookup_process_shared(caller_pid).is_none();
 
     // Defensive cleanup if the sibling somehow survived.
     clear_lazy_regions(sibling_pid);
@@ -9370,7 +9372,7 @@ fn test_futex_wake_unmapped_returns_zero() {
 /// Verify tgid is correctly stored and readable via lookup_process.
 /// Leader: tgid == self. Goroutine: tgid == leader. Fork child: tgid == self.
 fn test_tgid_inheritance() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process};
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
 
     let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let thread_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
@@ -9388,9 +9390,9 @@ fn test_tgid_inheritance() {
     fork.tgid = fork_pid; // fork child gets own tgid
     register_process(fork_pid, fork);
 
-    let leader_ok = lookup_process(leader_pid).is_some_and(|p| p.tgid == leader_pid);
-    let thread_ok = lookup_process(thread_pid).is_some_and(|p| p.tgid == leader_pid);
-    let fork_ok = lookup_process(fork_pid).is_some_and(|p| p.tgid == fork_pid && p.tgid != leader_pid);
+    let leader_ok = lookup_process_shared(leader_pid).is_some_and(|p| p.tgid == leader_pid);
+    let thread_ok = lookup_process_shared(thread_pid).is_some_and(|p| p.tgid == leader_pid);
+    let fork_ok = lookup_process_shared(fork_pid).is_some_and(|p| p.tgid == fork_pid && p.tgid != leader_pid);
 
     let _ = unregister_process(leader_pid);
     let _ = unregister_process(thread_pid);
@@ -9555,7 +9557,7 @@ fn test_fork_brk_len_no_underflow_go_binary() {
 }
 
 /// Regression: fork_process was missing THREAD_PID_MAP.insert(tid, child_pid).
-/// Without it, current_process() for the child thread returned the parent PID,
+/// Without it, current_process_shared() for the child thread returned the parent PID,
 /// so vfork_complete fired on the wrong PID and left the parent permanently blocked.
 /// This test verifies the logical invariant: a forked child gets its own PID entry.
 fn test_fork_thread_pid_map_invariant() {
@@ -9566,7 +9568,7 @@ fn test_fork_thread_pid_map_invariant() {
     // _child_tid: 17 — symbolic; real tid assigned at runtime
 
     // Simulate: before fix, the tid was NOT in THREAD_PID_MAP.
-    // current_process() would fall back to PROCESS_INFO_ADDR and return parent_pid.
+    // current_process_shared() would fall back to PROCESS_INFO_ADDR and return parent_pid.
     // Simulate the fix: tid IS in the map with child_pid.
     let map_has_child_entry = true; // post-fix invariant
     let resolved_pid = if map_has_child_entry { child_pid } else { parent_pid };
@@ -10130,20 +10132,20 @@ fn test_kill_process_exit_code_uses_negative_signal() {
 /// Verify that kill_process marks the process as exited and zombie.
 /// (We can't test actual thread termination from a test — that would kill the test runner.)
 fn test_exit_terminates_calling_thread() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process};
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
 
     let pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     register_process(pid, make_test_process(pid));
 
     // Before kill: not exited
-    let before = lookup_process(pid).is_none_or(|p| p.exited);
+    let before = lookup_process_shared(pid).is_none_or(|p| p.exited);
 
     // Kill it
     let _ = akuma_exec::process::kill_process(pid);
 
     // After kill: exited=true, state=Zombie
-    let after_exited = lookup_process(pid).is_some_and(|p| p.exited);
-    let after_zombie = lookup_process(pid).is_some_and(|p|
+    let after_exited = lookup_process_shared(pid).is_some_and(|p| p.exited);
+    let after_zombie = lookup_process_shared(pid).is_some_and(|p|
         matches!(p.state, akuma_exec::process::ProcessState::Zombie(_))
     );
 
@@ -10196,7 +10198,7 @@ fn test_fd_table_lock_consistency() {
 /// (no zombie row left behind).
 fn test_kill_child_processes_basic() {
     use akuma_exec::process::{
-        register_process, unregister_process, lookup_process,
+        register_process, unregister_process, lookup_process_shared,
         kill_child_processes, clear_lazy_regions,
     };
 
@@ -10212,7 +10214,7 @@ fn test_kill_child_processes_basic() {
 
     kill_child_processes(parent_pid);
 
-    let child_gone = lookup_process(child_pid).is_none();
+    let child_gone = lookup_process_shared(child_pid).is_none();
 
     clear_lazy_regions(parent_pid);
     let _ = unregister_process(child_pid);
@@ -10230,7 +10232,7 @@ fn test_kill_child_processes_basic() {
 /// grandchild removed before child, both unregistered from `PROCESS_TABLE`.
 fn test_kill_child_processes_recursive() {
     use akuma_exec::process::{
-        register_process, unregister_process, lookup_process,
+        register_process, unregister_process, lookup_process_shared,
         kill_child_processes, clear_lazy_regions,
     };
 
@@ -10251,8 +10253,8 @@ fn test_kill_child_processes_recursive() {
 
     kill_child_processes(parent_pid);
 
-    let child_gone = lookup_process(child_pid).is_none();
-    let grandchild_gone = lookup_process(grandchild_pid).is_none();
+    let child_gone = lookup_process_shared(child_pid).is_none();
+    let grandchild_gone = lookup_process_shared(grandchild_pid).is_none();
 
     clear_lazy_regions(parent_pid);
     let _ = unregister_process(grandchild_pid);
@@ -10274,7 +10276,7 @@ fn test_kill_child_processes_recursive() {
 /// must not.
 fn test_kill_child_processes_thread_group_matches_fork_parent() {
     use akuma_exec::process::{
-        register_process, unregister_process, lookup_process,
+        register_process, unregister_process, lookup_process_shared,
         kill_child_processes, kill_child_processes_for_thread_group, clear_lazy_regions,
     };
 
@@ -10295,10 +10297,10 @@ fn test_kill_child_processes_thread_group_matches_fork_parent() {
     register_process(compile_pid, compile);
 
     kill_child_processes(main_pid);
-    let missed_by_main = lookup_process(compile_pid).is_some_and(|p| !p.exited);
+    let missed_by_main = lookup_process_shared(compile_pid).is_some_and(|p| !p.exited);
 
     kill_child_processes_for_thread_group(l0);
-    let compile_gone = lookup_process(compile_pid).is_none();
+    let compile_gone = lookup_process_shared(compile_pid).is_none();
 
     clear_lazy_regions(main_pid);
     clear_lazy_regions(worker_pid);
@@ -10327,7 +10329,7 @@ fn test_pidfd_cloexec() {
     let proc = make_test_process(pid);
     register_process(pid, proc);
 
-    let proc_ref = akuma_exec::process::lookup_process(pid).unwrap();
+    let proc_ref = akuma_exec::process::lookup_process_shared(pid).unwrap();
 
     // Simulate what sys_clone_pidfd now does: alloc_fd then set_cloexec.
     let fd = proc_ref.alloc_fd(akuma_exec::process::FileDescriptor::Stdin);
@@ -10356,7 +10358,7 @@ fn test_alloc_fd_lowest_available() {
     let proc = make_test_process(pid);
     register_process(pid, proc);
 
-    let proc_ref = akuma_exec::process::lookup_process(pid).unwrap();
+    let proc_ref = akuma_exec::process::lookup_process_shared(pid).unwrap();
 
     let fd0 = proc_ref.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
     let fd1 = proc_ref.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
@@ -10549,13 +10551,13 @@ fn test_sigaltstack_set_and_query() {
     // Set sigaltstack: ss_sp=0x200004000, ss_flags=0, ss_size=0x8000
     // sigaltstack(ss, old_ss) — NR 132
     // We test the process field directly since we can't pass user pointers.
-    if let Some(p) = akuma_exec::process::lookup_process(pid) {
+    akuma_exec::process::table::with_process(pid, |p| {
         p.sigaltstack_sp = 0x200004000;
         p.sigaltstack_flags = 0;
         p.sigaltstack_size = 0x8000;
-    }
+    });
 
-    let (sp, flags, size) = if let Some(p) = akuma_exec::process::lookup_process(pid) {
+    let (sp, flags, size) = if let Some(p) = akuma_exec::process::lookup_process_shared(pid) {
         (p.sigaltstack_sp, p.sigaltstack_flags, p.sigaltstack_size)
     } else {
         (0, 0, 0)
@@ -10932,7 +10934,7 @@ fn test_kill_thread_group_sets_child_channel_exited() {
     let sib_code = sib_ch.exit_code();
 
     // Sibling should be unregistered
-    let sib_exists = akuma_exec::process::lookup_process(sibling_pid).is_some();
+    let sib_exists = akuma_exec::process::lookup_process_shared(sibling_pid).is_some();
 
     // Clean up
     clear_lazy_regions(leader_pid);
@@ -11301,7 +11303,7 @@ fn test_msgqueue_waker_idempotent() {
 /// from the table and their thread IDs from THREAD_PID_MAP.
 /// After cleanup, list_processes must not crash (no dangling pointers).
 fn test_goroutine_crash_kills_thread_group() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process, list_processes};
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared, list_processes};
 
     let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let g1_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
@@ -11326,10 +11328,10 @@ fn test_goroutine_crash_kills_thread_group() {
     akuma_exec::process::kill_thread_group(leader_pid, 0, 0);
 
     // Siblings gone
-    let g1_gone = lookup_process(g1_pid).is_none();
-    let g2_gone = lookup_process(g2_pid).is_none();
+    let g1_gone = lookup_process_shared(g1_pid).is_none();
+    let g2_gone = lookup_process_shared(g2_pid).is_none();
     // Leader survives
-    let leader_alive = lookup_process(leader_pid).is_some();
+    let leader_alive = lookup_process_shared(leader_pid).is_some();
     // Table count decreased
     let count_after = akuma_exec::process::table::process_count();
     let count_decreased = count_after < count_before;
@@ -11354,7 +11356,7 @@ fn test_goroutine_crash_kills_thread_group() {
 /// Verify tgid field is correctly set: leader gets tgid=self,
 /// goroutine gets tgid=leader. kill_thread_group uses this to find siblings.
 fn test_tgid_leader_vs_member_cleanup() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process};
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
 
     let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let member_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
@@ -11368,14 +11370,14 @@ fn test_tgid_leader_vs_member_cleanup() {
     register_process(member_pid, member);
 
     // Verify tgid values
-    let leader_tgid_ok = lookup_process(leader_pid)
+    let leader_tgid_ok = lookup_process_shared(leader_pid)
         .is_some_and(|p| p.tgid == leader_pid);
-    let member_tgid_ok = lookup_process(member_pid)
+    let member_tgid_ok = lookup_process_shared(member_pid)
         .is_some_and(|p| p.tgid == leader_pid && p.tgid != member_pid);
 
     // Kill from leader — member should be cleaned up
     akuma_exec::process::kill_thread_group(leader_pid, 0, 0);
-    let member_gone = lookup_process(member_pid).is_none();
+    let member_gone = lookup_process_shared(member_pid).is_none();
 
     let _ = unregister_process(leader_pid);
     let _ = unregister_process(member_pid);
@@ -11545,14 +11547,14 @@ fn test_spsr_el0t_bits() {
 }
 
 /// replace_image (execve) must operate on the CHILD's Process, not the parent's.
-/// current_process() during execve must return the child PID (via THREAD_PID_MAP).
+/// current_process_shared() during execve must return the child PID (via THREAD_PID_MAP).
 fn test_replace_image_preserves_pid() {
     // In the vfork child: tid=30, THREAD_PID_MAP[30]=child_pid (e.g. 25).
-    // replace_image is called on `proc` which is current_process() → PID 25.
+    // replace_image is called on `proc` which is current_process_shared() → PID 25.
     // It must NOT accidentally modify PID 23 (the parent).
     let parent_pid: u32 = 23;
     let child_pid: u32 = 25;
-    // _child_tid: 30 — THREAD_PID_MAP[30] = 25 → current_process() returns PID 25
+    // _child_tid: 30 — THREAD_PID_MAP[30] = 25 → current_process_shared() returns PID 25
     let resolved_pid = child_pid; // via THREAD_PID_MAP
     let correct = resolved_pid == child_pid && resolved_pid != parent_pid;
 
@@ -11659,7 +11661,7 @@ fn test_sigkill_bypasses_handlers() {
 /// Verify SIGTERM vs SIGKILL produce different exit codes on a real process.
 /// SIGTERM: exit_code = -15. SIGKILL: exit_code = -9.
 fn test_sigterm_vs_sigkill_behavior() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process};
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
 
     let pid_term = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let pid_kill = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
@@ -11670,8 +11672,8 @@ fn test_sigterm_vs_sigkill_behavior() {
     let _ = akuma_exec::process::kill_process_with_signal(pid_term, 15);
     let _ = akuma_exec::process::kill_process_with_signal(pid_kill, 9);
 
-    let term_code = lookup_process(pid_term).map_or(0, |p| p.exit_code);
-    let kill_code = lookup_process(pid_kill).map_or(0, |p| p.exit_code);
+    let term_code = lookup_process_shared(pid_term).map_or(0, |p| p.exit_code);
+    let kill_code = lookup_process_shared(pid_kill).map_or(0, |p| p.exit_code);
 
     let _ = unregister_process(pid_term);
     let _ = unregister_process(pid_kill);
@@ -11740,7 +11742,7 @@ fn test_pend_vs_interrupt_delivers_handler() {
 /// exit_group/crash primitive — it correctly tears the leader down, so the test
 /// was asserting the opposite of what the function does.
 fn test_normal_goroutine_exit_does_not_kill_group() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process, kill_thread_group};
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared, kill_thread_group};
 
     let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let goroutine_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
@@ -11761,7 +11763,7 @@ fn test_normal_goroutine_exit_does_not_kill_group() {
 
     // Replicate return_to_kernel's gate for the goroutine's normal exit: only an
     // address-space OWNER tears down the group. A shared goroutine must not.
-    let (l0_phys, is_shared) = lookup_process(goroutine_pid)
+    let (l0_phys, is_shared) = lookup_process_shared(goroutine_pid)
         .map_or((0, true), |p| (p.address_space.l0_phys(), p.address_space.is_shared()));
     if !is_shared && l0_phys != 0 {
         kill_thread_group(goroutine_pid, l0_phys, 0);
@@ -11770,12 +11772,12 @@ fn test_normal_goroutine_exit_does_not_kill_group() {
     let _ = unregister_process(goroutine_pid);
 
     // Leader must still be alive and intact.
-    let leader_alive = lookup_process(leader_pid).is_some();
-    let leader_name_ok = lookup_process(leader_pid)
+    let leader_alive = lookup_process_shared(leader_pid).is_some();
+    let leader_name_ok = lookup_process_shared(leader_pid)
         .is_some_and(|p| p.name == "leader_test");
-    let leader_not_exited = lookup_process(leader_pid)
+    let leader_not_exited = lookup_process_shared(leader_pid)
         .is_some_and(|p| !p.exited);
-    let goroutine_gone = lookup_process(goroutine_pid).is_none();
+    let goroutine_gone = lookup_process_shared(goroutine_pid).is_none();
 
     // Cleanup — unregister anything still in the table
     let _ = unregister_process(leader_pid);
@@ -11865,7 +11867,7 @@ fn test_kill_thread_group_preserves_exit_code() {
 /// After kill_process_with_signal on a child, the child becomes a zombie
 /// but the PARENT must remain completely unaffected.
 fn test_crash_goroutine_exit_kills_group() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process};
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
 
     let parent_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let child_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
@@ -11882,14 +11884,14 @@ fn test_crash_goroutine_exit_kills_group() {
     let _ = akuma_exec::process::kill_process_with_signal(child_pid, 11);
 
     // Parent must be completely unaffected
-    let parent_alive = lookup_process(parent_pid).is_some();
-    let parent_name = lookup_process(parent_pid)
+    let parent_alive = lookup_process_shared(parent_pid).is_some();
+    let parent_name = lookup_process_shared(parent_pid)
         .is_some_and(|p| p.name == "parent_survives");
-    let parent_not_exited = lookup_process(parent_pid)
+    let parent_not_exited = lookup_process_shared(parent_pid)
         .is_some_and(|p| !p.exited);
 
     // Child should be zombie
-    let child_zombie = lookup_process(child_pid)
+    let child_zombie = lookup_process_shared(child_pid)
         .is_some_and(|p| p.exited);
 
     // Cleanup
@@ -11909,7 +11911,7 @@ fn test_crash_goroutine_exit_kills_group() {
 /// kill_thread_group must only kill siblings (same tgid, different pid),
 /// never the caller itself, and never processes in a different thread group.
 fn test_leader_exit_never_kills_group() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process};
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
 
     let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let sib_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
@@ -11933,12 +11935,12 @@ fn test_leader_exit_never_kills_group() {
     akuma_exec::process::kill_thread_group(leader_pid, 0, 0);
 
     // Leader must survive (kill_thread_group excludes caller)
-    let leader_alive = lookup_process(leader_pid).is_some();
+    let leader_alive = lookup_process_shared(leader_pid).is_some();
     // Sibling must be gone (auto-reaped)
-    let sib_gone = lookup_process(sib_pid).is_none();
+    let sib_gone = lookup_process_shared(sib_pid).is_none();
     // Unrelated process must be unaffected
-    let other_alive = lookup_process(other_pid).is_some();
-    let other_not_exited = lookup_process(other_pid)
+    let other_alive = lookup_process_shared(other_pid).is_some();
+    let other_not_exited = lookup_process_shared(other_pid)
         .is_some_and(|p| !p.exited);
 
     // Cleanup — unregister everything that might still be in the table
@@ -12109,7 +12111,7 @@ fn test_exit_leaves_zombie_for_wait() {
     // On Akuma (after fix): exit() → zombie → parent wait() → reap via cleanup
 
     // The invariant: after sys_exit, the Process is still in PROCESS_TABLE
-    // with state=Zombie.  lookup_process(pid) must still return Some.
+    // with state=Zombie.  lookup_process_shared(pid) must still return Some.
     let zombie_stays_in_table = true; // after removing unregister_process
     let wait4_can_find_it = zombie_stays_in_table;
 
@@ -12467,7 +12469,7 @@ fn test_rwspinlock_table_concurrent_reads() {
 
 /// Verify the register → lookup → unregister lifecycle with lock-free table.
 fn test_process_table_register_get_unregister() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process};
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
 
     let pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let mut proc = make_test_process(pid);
@@ -12475,14 +12477,14 @@ fn test_process_table_register_get_unregister() {
     register_process(pid, proc);
 
     // lookup_process returns &mut Process via raw pointer (lock-free)
-    let name_ok = lookup_process(pid).is_some_and(|p| p.name == "lockfree_test");
+    let name_ok = lookup_process_shared(pid).is_some_and(|p| p.name == "lockfree_test");
 
     // Unregister retires the process (see its doc comment for why it no longer
     // returns/drops the Box synchronously).
     let removed_ok = unregister_process(pid);
 
     // Table no longer has it
-    let gone = lookup_process(pid).is_none();
+    let gone = lookup_process_shared(pid).is_none();
 
     if name_ok && removed_ok && gone {
         console::print("[Test] process_table_register_get_unregister PASSED\n");
@@ -12495,14 +12497,14 @@ fn test_process_table_register_get_unregister() {
 
 /// Verify the backward-compatible lookup_process shim returns a usable &mut Process.
 fn test_lookup_process_shim_returns_valid_ref() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process};
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
 
     let pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let mut proc = make_test_process(pid);
     proc.exit_code = 42;
     register_process(pid, proc);
 
-    let ref_ok = if let Some(p) = lookup_process(pid) {
+    let ref_ok = if let Some(p) = lookup_process_shared(pid) {
         p.exit_code == 42
     } else {
         false
@@ -12511,7 +12513,7 @@ fn test_lookup_process_shim_returns_valid_ref() {
     let _ = unregister_process(pid);
 
     // After unregister, lookup should return None
-    let gone = lookup_process(pid).is_none();
+    let gone = lookup_process_shared(pid).is_none();
 
     if ref_ok && gone {
         console::print("[Test] lookup_process_shim_returns_valid_ref PASSED\n");
@@ -12524,7 +12526,7 @@ fn test_lookup_process_shim_returns_valid_ref() {
 
 /// Verify the borrow tracker increments on lookup_process calls.
 fn test_borrow_tracker_increments() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process};
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
     use akuma_exec::process::diag::BORROW_TRACKING_ENABLED;
 
     if !BORROW_TRACKING_ENABLED {
@@ -12536,8 +12538,8 @@ fn test_borrow_tracker_increments() {
     register_process(pid, make_test_process(pid));
 
     // Each lookup_process call increments borrow count (monotonic, no dec at call sites)
-    let _ = lookup_process(pid);
-    let _ = lookup_process(pid);
+    let _ = lookup_process_shared(pid);
+    let _ = lookup_process_shared(pid);
     // If we got here without a panic, the tracker is working
     // (it logs [BORROW-ALIAS] but does not panic)
 
@@ -12548,10 +12550,10 @@ fn test_borrow_tracker_increments() {
 
 /// Verify current_process returns None in kernel context (no user process mapped).
 fn test_get_current_process_returns_arc() {
-    use akuma_exec::process::current_process;
+    use akuma_exec::process::current_process_shared;
 
     // In kernel test context (no user process mapped), should return None
-    let result = current_process();
+    let result = current_process_shared();
     let is_none = result.is_none();
 
     if is_none {
@@ -12659,8 +12661,8 @@ fn test_kill_process_notifies_child_channel() {
     let after = ch.has_exited();
 
     // Zombie should still be in the table (wait4 needs to find it)
-    let zombie_exists = akuma_exec::process::lookup_process(child_pid).is_some();
-    let is_zombie = akuma_exec::process::lookup_process(child_pid)
+    let zombie_exists = akuma_exec::process::lookup_process_shared(child_pid).is_some();
+    let is_zombie = akuma_exec::process::lookup_process_shared(child_pid)
         .is_some_and(|p| p.exited);
 
     // Clean up
@@ -12680,7 +12682,7 @@ fn test_kill_process_notifies_child_channel() {
 /// cleaned up but the process table must not contain dangling pointers.
 /// Verify by killing a process then scanning the table for corruption.
 fn test_sigkill_goroutine_does_not_kill_leader() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process, list_processes};
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared, list_processes};
 
     let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let g1_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
@@ -12704,11 +12706,11 @@ fn test_sigkill_goroutine_does_not_kill_leader() {
     let _ = akuma_exec::process::kill_process_with_signal(leader_pid, 9);
 
     // Goroutines must be gone (auto-reaped by kill_thread_group)
-    let g1_gone = lookup_process(g1_pid).is_none();
-    let g2_gone = lookup_process(g2_pid).is_none();
+    let g1_gone = lookup_process_shared(g1_pid).is_none();
+    let g2_gone = lookup_process_shared(g2_pid).is_none();
 
     // Leader is zombie (killed by kill_process_with_signal)
-    let leader_zombie = lookup_process(leader_pid)
+    let leader_zombie = lookup_process_shared(leader_pid)
         .is_some_and(|p| p.exited);
 
     // list_processes must not crash (no dangling pointers)
@@ -12734,7 +12736,7 @@ fn test_sigkill_goroutine_does_not_kill_leader() {
 /// wait4 can find it and collect the exit status. Only wait4 or
 /// on_thread_cleanup should reap it.
 fn test_zombie_stays_for_wait4_reap() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process};
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
 
     let pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     register_process(pid, make_test_process(pid));
@@ -12743,15 +12745,15 @@ fn test_zombie_stays_for_wait4_reap() {
     let _ = akuma_exec::process::kill_process_with_signal(pid, 9);
 
     // Zombie must be in the table
-    let in_table = lookup_process(pid).is_some();
-    let is_exited = lookup_process(pid).is_some_and(|p| p.exited);
-    let is_zombie_state = lookup_process(pid).is_some_and(|p| matches!(p.state, akuma_exec::process::ProcessState::Zombie(_)));
-    let exit_code = lookup_process(pid).map_or(0, |p| p.exit_code);
-    let tid_cleared = lookup_process(pid).is_some_and(|p| p.thread_id.is_none());
+    let in_table = lookup_process_shared(pid).is_some();
+    let is_exited = lookup_process_shared(pid).is_some_and(|p| p.exited);
+    let is_zombie_state = lookup_process_shared(pid).is_some_and(|p| matches!(p.state, akuma_exec::process::ProcessState::Zombie(_)));
+    let exit_code = lookup_process_shared(pid).map_or(0, |p| p.exit_code);
+    let tid_cleared = lookup_process_shared(pid).is_some_and(|p| p.thread_id.is_none());
 
     // Simulate wait4 reaping
     let _ = unregister_process(pid);
-    let gone = lookup_process(pid).is_none();
+    let gone = lookup_process_shared(pid).is_none();
 
     let pass = in_table && is_exited && is_zombie_state && exit_code == -9 && tid_cleared && gone;
     if pass {
@@ -12768,7 +12770,7 @@ fn test_zombie_stays_for_wait4_reap() {
 /// the expected behavior: orphaned children remain in the process table until
 /// explicitly cleaned up.
 fn test_orphan_children_become_zombies() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process};
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
 
     let parent_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let child_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
@@ -12782,14 +12784,14 @@ fn test_orphan_children_become_zombies() {
     let _ = akuma_exec::process::kill_process(parent_pid);
 
     // Parent should be zombie
-    let parent_zombie = lookup_process(parent_pid).is_some_and(|p| p.exited);
+    let parent_zombie = lookup_process_shared(parent_pid).is_some_and(|p| p.exited);
 
     // Child should also be zombie (kill_process cascades)
-    let child_zombie = lookup_process(child_pid).is_some_and(|p| p.exited);
+    let child_zombie = lookup_process_shared(child_pid).is_some_and(|p| p.exited);
 
     // Both still in table (no reaper)
-    let parent_in_table = lookup_process(parent_pid).is_some();
-    let child_in_table = lookup_process(child_pid).is_some();
+    let parent_in_table = lookup_process_shared(parent_pid).is_some();
+    let child_in_table = lookup_process_shared(child_pid).is_some();
 
     // Clean up
     let _ = unregister_process(parent_pid);
@@ -12849,12 +12851,12 @@ fn test_process_table_capacity() {
 /// This is the fundamental contract Go's runtime depends on:
 /// 1. kill(child, SIGKILL) → child becomes zombie (stays in table)
 /// 2. waitpid(child) → collects exit status, zombie removed from table
-/// 3. After waitpid, lookup_process(child) returns None
+/// 3. After waitpid, lookup_process_shared(child) returns None
 ///
 /// Without wait4 reaping, zombies accumulate and the 256-slot table fills up,
 /// causing go build to fail when spawning compile processes.
 fn test_wait4_reaps_zombie() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process,
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared,
         register_child_channel};
     use akuma_exec::process::channel::ProcessChannel;
 
@@ -12872,7 +12874,7 @@ fn test_wait4_reaps_zombie() {
 
     // Step 1: kill → zombie (stays in table, channel notified)
     let _ = akuma_exec::process::kill_process_with_signal(child_pid, 9);
-    let zombie_in_table = lookup_process(child_pid).is_some();
+    let zombie_in_table = lookup_process_shared(child_pid).is_some();
     let channel_exited = ch.has_exited();
 
     // Step 2: simulate wait4 reaping — this is what sys_wait4 now does
@@ -12881,7 +12883,7 @@ fn test_wait4_reaps_zombie() {
     akuma_exec::process::remove_child_channel(child_pid);
 
     // Step 3: after reaping, zombie is gone
-    let gone_after_reap = lookup_process(child_pid).is_none();
+    let gone_after_reap = lookup_process_shared(child_pid).is_none();
     let reaped_ok = reaped;
 
     // Clean up parent
@@ -12986,6 +12988,70 @@ fn test_unregister_process_second_call_loses_cas() {
     }
 }
 
+/// Phase 7e "Access"-half regression: an externally-killed CLONE_THREAD group
+/// must release its CLONE_FILES-shared fd table EAGERLY, from the killer's own
+/// `cleanup_process_fds`, not when the deferred process collector eventually
+/// drops the zombies' `Arc` clones. The old `Arc::strong_count == 1` gate never
+/// fired once the "Free" half deferred `Process::drop` (RETIRED siblings keep
+/// their clones alive), so a pipe read end owned by such a group stayed held
+/// until `reclaim_retired_processes` ran — which during the synchronous boot
+/// self-test phase is NEVER — hanging any writer parked on that pipe: the same
+/// defect class as `sys_exit_group`'s close-after-notify
+/// (BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md §3b). `cleanup_process_fds` now counts
+/// live (not-exited, still-ACTIVE) sharers instead of `Arc` refs; this test
+/// deliberately holds its own extra `Arc` clone to pin the count-independence.
+fn test_external_kill_closes_shared_fds() {
+    use akuma_exec::process::{register_process, unregister_process,
+        reclaim_retired_processes_force, FileDescriptor};
+
+    // Flush earlier tests' RETIRED zombies so the group below is self-contained.
+    let _ = reclaim_retired_processes_force();
+
+    // A pipe whose READ end lives only in the group's shared fd table.
+    let pipe_id = crate::syscall::pipe::pipe_create();
+
+    let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let sib_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let leader = make_test_process(leader_pid);
+    let mut sib = make_test_process(sib_pid);
+    sib.tgid = leader_pid;          // CLONE_THREAD sibling of the leader
+    sib.parent_pid = leader_pid;
+    sib.fds = leader.fds.clone();   // CLONE_FILES: one shared table
+    let table_handle = leader.fds.clone(); // test's own extra Arc ref (see doc)
+    leader.set_fd(3, FileDescriptor::PipeRead(pipe_id));
+    let l0 = leader.address_space.l0_phys();
+    register_process(leader_pid, leader);
+    register_process(sib_pid, sib);
+
+    // The external SIGKILL flow (sys_kill sig==9): tear down the group's
+    // siblings, then hard-kill the target itself.
+    akuma_exec::process::kill_thread_group(leader_pid, l0, -9);
+    let _ = akuma_exec::process::kill_process_with_signal(leader_pid, 9);
+
+    // The killer must have emptied the shared table — releasing the pipe read
+    // end — even though the RETIRED sibling's Arc clone (and ours) is still
+    // alive. Cross-check via the pipe itself: a write to a reader-less pipe
+    // fails (EPIPE), which is exactly the wake a blocked `yes`-style writer
+    // needs to ever exit.
+    let table_empty = akuma_exec::runtime::with_irqs_disabled(|| table_handle.table.lock().is_empty());
+    let write_res = crate::syscall::pipe::pipe_write(pipe_id, b"x");
+
+    if table_empty && write_res.is_err() {
+        console::print("[Test] external_kill_closes_shared_fds PASSED\n");
+    } else {
+        crate::safe_print!(160,
+            "[Test] external_kill_closes_shared_fds FAILED: table_empty={} pipe_write_err={} (fds held for the deferred collector)\n",
+            table_empty, write_res.is_err());
+    }
+
+    // Cleanup: the kill paths leave zombies for wait4 — reap + collect them,
+    // and drop the pipe's write end.
+    crate::syscall::pipe::pipe_close_write(pipe_id);
+    let _ = unregister_process(leader_pid);
+    let _ = unregister_process(sib_pid);
+    let _ = reclaim_retired_processes_force();
+}
+
 // ============================================================================
 // Thread Leak and Exit Group Tests (2026-04-10 fixes)
 // ============================================================================
@@ -13079,7 +13145,7 @@ fn test_kill_thread_group_two_phase() {
     kill_thread_group(leader_pid, l0_phys, 0);
     
     // Sibling should be unregistered (kill_thread_group removes it)
-    let sibling_gone = akuma_exec::process::lookup_process(sibling_pid).is_none();
+    let sibling_gone = akuma_exec::process::lookup_process_shared(sibling_pid).is_none();
     
     // Clean up
     clear_lazy_regions(leader_pid);
@@ -13116,7 +13182,7 @@ fn test_mark_terminated_ignores_large_ids() {
 /// Test: Boot tests using fake thread IDs don't affect real system threads
 fn test_alloc_mmap_resolves_tgid() {
     use akuma_exec::process::{
-        register_process, unregister_process, lookup_process,
+        register_process, unregister_process, lookup_process_shared,
         alloc_mmap, register_thread_pid, unregister_thread_pid,
     };
 
@@ -13128,20 +13194,20 @@ fn test_alloc_mmap_resolves_tgid() {
 
     let mut wproc = make_test_process(worker);
     wproc.tgid = leader;
-    let l0 = lookup_process(leader).expect("leader").address_space.l0_phys();
+    let l0 = lookup_process_shared(leader).expect("leader").address_space.l0_phys();
     wproc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap();
     register_process(worker, wproc);
 
-    let leader_next_before = lookup_process(leader).unwrap().memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed);
-    let worker_next_before = lookup_process(worker).unwrap().memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed);
+    let leader_next_before = lookup_process_shared(leader).unwrap().memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed);
+    let worker_next_before = lookup_process_shared(worker).unwrap().memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed);
 
     register_thread_pid(0, worker);
 
     let size = 0x1000;
     let addr = alloc_mmap(size);
 
-    let leader_next_after = lookup_process(leader).unwrap().memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed);
-    let worker_next_after = lookup_process(worker).unwrap().memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed);
+    let leader_next_after = lookup_process_shared(leader).unwrap().memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed);
+    let worker_next_after = lookup_process_shared(worker).unwrap().memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed);
 
     unregister_thread_pid(0);
     let _ = unregister_process(leader);
@@ -13157,7 +13223,7 @@ fn test_alloc_mmap_resolves_tgid() {
 
 fn test_lazy_region_lookup_resolves_tgid() {
     use akuma_exec::process::{
-        register_process, unregister_process, lookup_process,
+        register_process, unregister_process, lookup_process_shared,
         push_lazy_region, lazy_region_lookup, clear_lazy_regions,
         register_thread_pid, unregister_thread_pid,
     };
@@ -13176,7 +13242,7 @@ fn test_lazy_region_lookup_resolves_tgid() {
     // Worker belongs to leader's thread group (CLONE_VM)
     let mut wproc = make_test_process(worker);
     wproc.tgid = leader;
-    let l0 = lookup_process(leader).expect("leader").address_space.l0_phys();
+    let l0 = lookup_process_shared(leader).expect("leader").address_space.l0_phys();
     wproc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap();
     register_process(worker, wproc);
 

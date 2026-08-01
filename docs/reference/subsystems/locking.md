@@ -277,6 +277,23 @@ Each of these was a real bug found during a carve-out, not a hypothetical.
   gate (which provides no actual safety — a CAS on the state transition does).
   (§11.4/§11.7.)
 
+- **Deferring a `Drop` also invalidates every `Arc::strong_count`-based
+  liveness test on what the dropped object held.** `cleanup_process_fds` closed
+  a CLONE_FILES-shared fd table when `Arc::strong_count(&proc.fds) == 1` —
+  correct while reaping freed a dead sibling's `Process` (and its `Arc` clone)
+  synchronously. Phase 7e's deferred reclamation keeps RETIRED zombies' clones
+  alive for ≥10ms (and, during the synchronous boot self-test phase, forever),
+  so an externally-killed multithreaded group never reached count 1 and its
+  pipe read ends were released only by the deferred collector — the same
+  hung-peer shape as the exit_group close-after-notify entry above. Fix:
+  decide liveness by scanning for other *live* (not-exited, still-ACTIVE)
+  processes sharing the same `Arc` (`for_each_process` + `Arc::ptr_eq`), not by
+  refcount. General form: after deferring a drop, audit not just the side
+  effects the `Drop` provided (the entry above) but every *predicate* that
+  used the object's prompt destruction as a signal.
+  (`test_external_kill_closes_shared_fds`;
+  [`BKL_PHASE7E_ACCESS_HALF.md`](../../archive/BKL_PHASE7E_ACCESS_HALF.md) §3.)
+
 - **"Reclaim on demand at the allocation-miss site," the rule just above, has a
   precondition the THREAD_STATES case happened to satisfy and the process table
   didn't: the reclaimed object's teardown must not need any lock the caller
@@ -419,9 +436,10 @@ to relieve) and steps 5–8 — `ProcessInfo` write, `get_saved_user_context` /
 `mark_thread_ready` (the publication point). As of Phase 7d, `THREAD_CONTEXTS`
 itself is no longer why this window needs the BKL — it has a real proof
 independent of it (§"`no-bkl-process`'s `THREAD_CONTEXTS`" below). `ProcessInfo`
-and `register_process` still are: they touch the process table, which has no
-inner lock for the *registration* path (Phase 7e "Access" half, unstarted) — the
-original audit's finding there stands for writers. The process table's *reaping*
+and `register_process` still are: they touch the process table, whose
+*registration* path is still BKL-serialized (the Access half, landed
+2026-08-01, retired the `&'static mut` accessors; it did not add a
+registration lock) — the original audit's finding there stands for writers. The process table's *reaping*
 path (`unregister_process`) got its own fix in Phase 7e's "Free" half (landed
 2026-08-01, see below) — a different hazard (peer-core free racing an in-flight
 BKL-dropped reader), not this one. Also still BKL-held: the
@@ -458,7 +476,7 @@ claim with real `std::thread`s. See
 [`BKL_PHASE7D_THREAD_CONTEXTS.md`](../../archive/BKL_PHASE7D_THREAD_CONTEXTS.md).
 
 This does not touch `ProcessInfo`/`register_process` — registering a *new* pid
-remains fully BKL-held (Phase 7e "Access" half, unstarted; see below).
+remains fully BKL-held (see the Access-half section below).
 
 #### `no-bkl-process`'s process-table `Free` half (Phase 7e, landed 2026-08-01)
 
@@ -509,8 +527,32 @@ both properties, mirroring `test_thread_slot_reclaim_on_spawn`. See
 [`BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md`](../../archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md).
 
 This does **not** touch same-core field races on a live ACTIVE process, or
-`ProcessInfo`/`register_process`'s BKL dependency — those remain the Access
-half's job, unstarted.
+`ProcessInfo`/`register_process`'s BKL dependency — see the Access half, below.
+
+#### `no-bkl-process`'s process-table `Access` half (Phase 7e, landed 2026-08-01)
+
+The `&'static mut Process` accessors (`lookup_process`, `current_process`) are
+**deleted**. Every former call site (~250 in production code) now uses
+`lookup_process_shared`/`current_process_shared` for reads and `&self` methods,
+`table::with_process`/`with_current_process` (IRQ-masked closure, no allocation)
+for short plain-field writes, `Process::with_address_space` (an
+`as_lock`-holding closure handing out `&mut UserAddressSpace`, replacing the
+open-coded `AsLockHold` + disjoint-field-borrow pattern) for page-table
+mutators, or — at exactly two enumerated lifecycle sites, `sys_execve`'s
+`replace_image*` tail and `spawn::run_registered_process` — the `unsafe`
+`table::with_process_exclusive`, whose exclusivity is structural (own process,
+BKL-held path) and whose call-site list is Phase 7f's `execve`/`clone`
+worklist. Three signal-path PTE edits that ran with no `as_lock` at all
+(`ensure_cow_page_writable`, `try_resolve_el1_cow_fault`,
+`try_deliver_signal`'s RX fix-up) were folded under `with_address_space` in
+the process. This is behaviour-preserving per site and proceeds with the BKL
+in place: cross-core exclusion for plain `Process` fields is **still the BKL**
+(the row in the load-bearing table below stands for same-core-races/writers);
+what's gone is the aliasing UB of two cores materializing `&mut` to one
+`Process`, and the `'static` lifetime that outlived RETIRED→FREE reclamation.
+See [`BKL_PHASE7E_ACCESS_HALF.md`](../../archive/BKL_PHASE7E_ACCESS_HALF.md),
+including the `cleanup_process_fds` fd-liveness fix it forced (the
+"correctness rules" entry below).
 
 ### `no-bkl-mm` — `src/syscall/mem.rs`
 
@@ -590,7 +632,7 @@ gave the queue a real `Spinlock` and removed the `critical_section` dependency �
 
 | structure | where | current guard | measured BKL share |
 |---|---|---|---|
-| process table `&'static mut Process` (300 call sites) | `process/table.rs` (`with_process`, `get_process_ptr`, `for_each_process`, …), `process/children.rs` (`lookup_process`, `current_process`) | `with_irqs_disabled` only, for same-core field races on a live ACTIVE process — Access half, unstarted. The cross-core **free** path is no longer bare `with_irqs_disabled`: `unregister_process` retires (RETIRED slot state) instead of freeing, and `reclaim_retired_processes` defers the actual free past a cooldown (Phase 7e "Free" half, landed 2026-08-01 — closes the peer-free UAF for the five carve-outs' *bounded* windows specifically; does **not** cover a `schedule_blocking()`-spanning window, see the Phase 7b note just below, which is a different hazard shape). Known since Phase 3 (`BKL_PROCESS_CARVE_OUT.md` §7 "(b)"). `lookup_process`'s "safe because a process can't be freed by its own thread" argument covers self-teardown only — peer cores free *other* PIDs at `process/mod.rs:1116`/`:1209` | underlies `execve`/`clone`/`wait4`/`netpoll_maint` |
+| process table — plain `Process` fields (writers via `with_process`/`with_current_process`, IRQ-mask only) | `process/table.rs` (`with_process`, `with_process_exclusive`, `get_process_ptr`, `for_each_process`, …), `process/children.rs` (`lookup_process_shared`, `current_process_shared`) | `with_irqs_disabled` only, for same-core field races on a live ACTIVE process — the Access half (landed 2026-08-01) deleted the `&'static mut` accessors (`lookup_process`/`current_process`) and routed page-table mutation under `as_lock` (`with_address_space`), but plain-field writes still have no cross-core lock beyond the BKL. The cross-core **free** path is no longer bare `with_irqs_disabled`: `unregister_process` retires (RETIRED slot state) instead of freeing, and `reclaim_retired_processes` defers the actual free past a cooldown (Phase 7e "Free" half, landed 2026-08-01 — closes the peer-free UAF for the five carve-outs' *bounded* windows specifically; does **not** cover a `schedule_blocking()`-spanning window, see the Phase 7b note just below, which is a different hazard shape). Known since Phase 3 (`BKL_PROCESS_CARVE_OUT.md` §7 "(b)"); peer cores free *other* PIDs at `process/mod.rs:1116`/`:1209` | underlies `execve`/`clone`/`wait4`/`netpoll_maint` |
 | `replace_image` destructive window | `process/image.rs:29`, `:121` | `LifecycleGuard` = per-thread `disable_preemption()`, **not a lock** | `execve` ~22% |
 | `fork_process` steps 5–8 | `process/mod.rs` | none for `ProcessInfo`/`register_process` (process-table row above). `THREAD_CONTEXTS` moved off this list in Phase 7d — see "`no-bkl-process`'s `THREAD_CONTEXTS`" above | `clone` ~10–13% |
 | console UART | `src/console.rs:60` | bare `static UART` | `netpoll_herd` ~1% |
@@ -613,17 +655,15 @@ table above; the whole-syscall carve is blocked on the process-table row above p
 finding just noted), pipes (`PIPES`), futex (`FUTEX_WAITERS`), eventfd/timerfd, and
 `idle_halt`'s post-WFI bookkeeping (`POOL`).
 
-**The migration pattern for the process table already exists** and is worth knowing before
-anyone designs a new one: `lookup_process_shared` (`process/children.rs:341`) replaces
-`&'static mut` exclusivity with `&self` methods plus an explicit `Process::as_lock`, and
-already carries the M5b BKL-free page-fault path. That is the shape to extend — **not** a
-new `PROCESS_TABLE_LOCK`, which `BKL_PROCESS_CARVE_OUT.md` §9.2 rejected as exactly the
-coarse lock the playbook warns against. The *free* path — `unregister_process`'s
-`Box::drop` needing deferred reclamation — is no longer unprecedented: Phase 7e's "Free"
-half built it, the same time-cooldown shape `reclaim_terminated_slots` uses (see
-"`no-bkl-process`'s process-table `Free` half" above). What remains unprecedented is the
-*Access* half itself: extending `lookup_process_shared`'s pattern to the other ~300
-call sites and deleting the `&'static mut` API.
+**The process-table migration is done on both axes** (see the two Phase 7e
+sections above): the *free* path defers reclamation (RETIRED + cooldown
+collector), and the *Access* half extended `lookup_process_shared`'s
+`&self` + `as_lock`/`vm_lock` pattern to every call site and deleted the
+`&'static mut` API — with **no** `PROCESS_TABLE_LOCK`, which
+`BKL_PROCESS_CARVE_OUT.md` §9.2 rejected as exactly the coarse lock the
+playbook warns against. What remains for 7f: plain-field writers still lean on
+the BKL (the table row above), and the two `with_process_exclusive` lifecycle
+windows (`replace_image`, first-run) are the `execve`/`clone` conversions.
 
 ## Attribution tooling
 
@@ -715,10 +755,14 @@ Driving workload: `net4` (concurrent downloads → net + ext2 write), `read4`
   the CAS exclusivity and publish-without-a-lock claims on actual hardware.
 - [`BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md`](../../archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md)
   — Phase 7e "Free" half: the peer-free use-after-free the five default-on
-  carve-outs already created, the RETIRED-slot-state + cooldown-collector fix
-  (mirroring `reclaim_terminated_slots`), and why the "Access" half (~300
-  `lookup_process`/`current_process` call sites) is a separate, still-unstarted
-  piece of work.
+  carve-outs already created, and the RETIRED-slot-state + cooldown-collector
+  fix (mirroring `reclaim_terminated_slots`).
+- [`BKL_PHASE7E_ACCESS_HALF.md`](../../archive/BKL_PHASE7E_ACCESS_HALF.md)
+  — Phase 7e "Access" half: the `lookup_process`/`current_process`
+  (`&'static mut`) deletion, the replacement accessor surface
+  (`*_shared`/`with_process`/`with_address_space`/`with_process_exclusive`),
+  the unlocked signal-path PTE edits it folded under `as_lock`, and the
+  fd-liveness fix + boot self-test.
 - [`BKL_FINE_GRAINED_LOCKING_PLAN.md`](../../archive/BKL_FINE_GRAINED_LOCKING_PLAN.md)
   — the overall phased plan. §"Phase 2" has the network carve-out's design
   notes (why a coarse `NETWORK_LOCK` doesn't work, the SIGPIPE self-deadlock,

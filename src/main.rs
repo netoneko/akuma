@@ -1274,7 +1274,7 @@ fn run_async_main() -> ! {
             utc_seconds: timer::utc_seconds,
             yield_now: threading::yield_now,
             blocking_relax: threading::blocking_relax,
-            current_box_id: || process::current_process().map_or(0, |p| p.box_id),
+            current_box_id: || process::current_process_shared().map_or(0, |p| p.box_id),
             is_current_interrupted: process::is_current_interrupted,
             rng_fill: |buf| rng::fill_bytes(buf).expect("RNG required for networking"),
             current_thread_id: || threading::current_thread_id() as u32,

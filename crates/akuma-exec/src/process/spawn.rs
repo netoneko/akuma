@@ -9,7 +9,7 @@ use crate::runtime::{runtime, config};
 use crate::process::types::{Pid, DEFAULT_ENV};
 use crate::process::channel::{ProcessChannel, register_channel, remove_channel};
 use crate::process::table::{register_process};
-use crate::process::children::{lookup_process, current_terminal_state};
+use crate::process::children::{lookup_process_shared, current_terminal_state};
 use crate::process::lifecycle::LifecycleGuard;
 
 use super::{Process, enter_user_mode, read_current_pid, get_box_name};
@@ -299,7 +299,7 @@ pub fn spawn_process_with_channel_ext(
     // Set up isolation context (Inherit from caller by default)
     let (caller_box_id, caller_namespace) = match read_current_pid() {
         Some(pid) => {
-            if let Some(proc) = lookup_process(pid) {
+            if let Some(proc) = lookup_process_shared(pid) {
                 (proc.box_id, proc.namespace.clone())
             } else {
                 (0, akuma_isolation::global_namespace())
@@ -342,7 +342,7 @@ pub fn spawn_process_with_channel_ext(
     let _lifecycle = LifecycleGuard::acquire();
 
     // CRITICAL: Register the process in the table immediately.
-    // This ensures that lookup_process(pid) works as soon as this function returns,
+    // This ensures that lookup_process_shared(pid) works as soon as this function returns,
     // allowing reattach() to succeed without races.
     register_process(pid, boxed_process);
 
@@ -354,10 +354,12 @@ pub fn spawn_process_with_channel_ext(
     let thread_id = crate::threading::spawn_user_thread_fn_for_process(move || {
         let tid = crate::threading::current_thread_id();
         
-        // Update thread_id in the registered process
-        if let Some(p) = lookup_process(pid) {
+        // Update thread_id in the registered process (Arc clone in the closure
+        // is refcount-only — no allocation).
+        if let Some(ch) = crate::process::table::with_process(pid, |p| {
             p.thread_id = Some(tid);
-
+            p.channel.as_ref().unwrap().clone()
+        }) {
             // Register in THREAD_PID_MAP so on_thread_cleanup can reap this
             // process when the thread slot is recycled.  Without this, the
             // process becomes a permanent zombie.
@@ -367,8 +369,8 @@ pub fn spawn_process_with_channel_ext(
 
             // Move the channel registration to the correct TID
             remove_channel(0);
-            register_channel(tid, p.channel.as_ref().unwrap().clone());
-            
+            register_channel(tid, ch);
+
             // Execute the process (already in the table)
             run_registered_process(pid);
         } else {
@@ -384,9 +386,7 @@ pub fn spawn_process_with_channel_ext(
     .map_err(|e| format!("Failed to spawn thread: {}", e))?;
 
     // Set the thread ID in the process table entry for the parent to see immediately
-    if let Some(p) = lookup_process(pid) {
-        p.thread_id = Some(thread_id);
-    }
+    let _ = crate::process::table::with_process(pid, |p| p.thread_id = Some(thread_id));
 
     Ok((thread_id, channel, pid))
 }
@@ -455,15 +455,17 @@ pub fn spawn_process_from_image_with_args(name: &str, argv: &[String], elf_data:
 
     let thread_id = crate::threading::spawn_user_thread_fn_for_process(move || {
         let tid = crate::threading::current_thread_id();
-        if let Some(p) = lookup_process(pid) {
+        if let Some(ch) = crate::process::table::with_process(pid, |p| {
             p.thread_id = Some(tid);
+            p.channel.as_ref().unwrap().clone()
+        }) {
             // Register in THREAD_PID_MAP so the thread-cleanup path reaps the process
             // normally (not a leaked zombie).
             crate::runtime::with_irqs_disabled(|| {
                 crate::process::table::THREAD_PID_MAP.lock().insert(tid, pid);
             });
             remove_channel(0);
-            register_channel(tid, p.channel.as_ref().unwrap().clone());
+            register_channel(tid, ch);
             run_registered_process(pid);
         } else {
             // Mark terminated BEFORE parking so the scheduler switches away permanently
@@ -475,27 +477,31 @@ pub fn spawn_process_from_image_with_args(name: &str, argv: &[String], elf_data:
     })
     .map_err(|e| format!("Failed to spawn thread for {name}: {e}"))?;
 
-    if let Some(p) = lookup_process(pid) {
-        p.thread_id = Some(thread_id);
-    }
+    let _ = crate::process::table::with_process(pid, |p| p.thread_id = Some(thread_id));
     Ok((thread_id, pid))
 }
 
 /// Execute a process that is already registered in the PROCESS_TABLE
 pub(crate) fn run_registered_process(pid: Pid) -> ! {
-    let proc = lookup_process(pid).expect("Process not found in run_registered_process");
-    
-    // Prepare the process (set state, write process info page)
-    proc.prepare_for_execution();
-    
-    // Activate the user address space (sets TTBR0)
-    proc.address_space.activate();
-
-    // Now safe to enable IRQs - TTBR0 is set to user tables
-    (runtime().enable_irqs)();
-
-    // Enter user mode via ERET - this never returns
+    // SAFETY: called only from the process's own just-spawned thread (or the
+    // spawner handing off to it) on a BKL-held path, before first entry to
+    // user mode — no other reference to this Process is live. First-run
+    // lifecycle window, same class as execve's `replace_image` (Phase 7f).
     unsafe {
-        enter_user_mode(&proc.context);
+        let _ = crate::process::table::with_process_exclusive::<(), _>(pid, |proc| {
+            // Prepare the process (set state, write process info page)
+            proc.prepare_for_execution();
+
+            // Activate the user address space (sets TTBR0)
+            proc.address_space.activate();
+
+            // Now safe to enable IRQs - TTBR0 is set to user tables
+            (runtime().enable_irqs)();
+
+            // Enter user mode via ERET - this never returns
+            enter_user_mode(&proc.context);
+        });
     }
+    // Reached only if the process vanished between spawn and first run.
+    panic!("Process not found in run_registered_process");
 }

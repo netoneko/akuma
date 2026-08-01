@@ -3332,7 +3332,7 @@ pub fn dump_thread_resume_points() {
         // Correlate to a pid + its current syscall (which subsystem it's in).
         let (pid, sc, tg, l0) = match crate::process::find_pid_by_thread(tid) {
             Some(p) => {
-                match crate::process::lookup_process(p) {
+                match crate::process::lookup_process_shared(p) {
                     Some(pr) => (p as i64, pr.current_syscall.load(Ordering::Relaxed),
                                  pr.tgid as i64, pr.address_space.l0_phys() as u64),
                     None => (p as i64, !0, -1, 0),

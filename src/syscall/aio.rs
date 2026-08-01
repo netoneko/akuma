@@ -66,7 +66,7 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
 
     // ── Allocate the ring-buffer page ────────────────────────────────────────
     let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let proc = match akuma_exec::process::lookup_process(owner_pid) {
+    let proc = match akuma_exec::process::lookup_process_shared(owner_pid) {
         Some(p) => p,
         None => return EFAULT,
     };

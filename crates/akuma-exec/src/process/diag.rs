@@ -82,27 +82,6 @@ pub fn borrow_dec(pid: u32) {
     BORROW_COUNTS[idx].fetch_sub(1, Ordering::Relaxed);
 }
 
-/// RAII guard that decrements borrow count on drop.
-pub struct BorrowGuard {
-    pid: u32,
-}
-
-impl Drop for BorrowGuard {
-    fn drop(&mut self) {
-        borrow_dec(self.pid);
-    }
-}
-
-/// Look up a process with explicit RAII borrow tracking.
-/// New code should prefer this over `lookup_process()`.
-pub fn lookup_process_tracked(pid: crate::process::types::Pid) -> Option<(&'static mut crate::process::Process, BorrowGuard)> {
-    let proc = crate::process::children::lookup_process(pid)?;
-    let guard = BorrowGuard { pid };
-    // borrow_inc is already called inside lookup_process, so we skip it here
-    // and just provide the guard for decrement
-    Some((proc, guard))
-}
-
 fn log_borrow_alias(pid: u32, count: u32) {
     use core::fmt::Write;
     let mut buf = StackBuf::<128>::new();

@@ -44,7 +44,7 @@ static MSGQUEUE_TABLE: Spinlock<BTreeMap<(u64, u32), MsgQueue>> = Spinlock::new(
 static NEXT_MSQID: AtomicU32 = AtomicU32::new(1);
 
 fn current_box_id() -> u64 {
-    akuma_exec::process::current_process().map_or(0, |p| p.box_id)
+    akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id)
 }
 
 pub fn sys_msgget(key: i32, flags: i32) -> u64 {

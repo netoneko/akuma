@@ -126,7 +126,7 @@ pub fn eventfd_add_poller(id: u32, tid: usize) {
 }
 
 pub(super) fn sys_eventfd2(initval: u32, flags: u32) -> u64 {
-    let proc = match akuma_exec::process::current_process() { Some(p) => p, None => return ENOSYS };
+    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ENOSYS };
     let efd_id = eventfd_create(initval, flags);
     let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::EventFd(efd_id));
     if flags & EFD_CLOEXEC != 0 {

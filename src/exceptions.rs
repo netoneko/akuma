@@ -852,15 +852,19 @@ fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
         let dst = akuma_exec::mmu::phys_to_virt(new_frame.addr);
         core::ptr::copy_nonoverlapping::<u8>(src, dst, 0x1000);
     }
-    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
-        let _ = owner.address_space.map_page(
-            page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
-        );
-        akuma_exec::mmu::flush_tlb_page(page_va);
-        owner.address_space.track_user_frame(new_frame);
-        // CoW: old page freed via the global CoW refcount (cow_ref_dec), not
-        // user_frames — drop the bookkeeping ref but never free here.
-        let _ = owner.address_space.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
+    if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+        // PTE remap + frame bookkeeping under `as_lock` (`with_address_space`),
+        // excluding a concurrent BKL-free fault on this address space.
+        owner.with_address_space(|aspace| {
+            let _ = aspace.map_page(
+                page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
+            );
+            akuma_exec::mmu::flush_tlb_page(page_va);
+            aspace.track_user_frame(new_frame);
+            // CoW: old page freed via the global CoW refcount (cow_ref_dec), not
+            // user_frames — drop the bookkeeping ref but never free here.
+            let _ = aspace.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
+        });
         crate::pmm::cow_ref_dec(old_pa);
         true
     } else {
@@ -893,7 +897,7 @@ fn ensure_user_page_mapped(pid: u32, page_va: usize) -> bool {
                     akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
                 };
                 if installed {
-                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
+                    if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                         owner.address_space.track_user_frame(page_frame);
                         for tf in table_frames {
                             owner.address_space.track_page_table_frame(tf);
@@ -904,7 +908,7 @@ fn ensure_user_page_mapped(pid: u32, page_va: usize) -> bool {
                     }
                 } else {
                     crate::pmm::free_page(page_frame);
-                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
+                    if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                         for tf in table_frames {
                             owner.address_space.track_page_table_frame(tf);
                         }
@@ -950,7 +954,7 @@ fn ensure_sigreturn_trampoline(pid: u32) -> Option<usize> {
         akuma_exec::mmu::map_user_page(SIGRETURN_TRAMPOLINE_ADDR, frame.addr, akuma_exec::mmu::user_flags::RX)
     };
 
-    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
+    if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
         if installed {
             owner.address_space.track_user_frame(frame);
         } else {
@@ -993,7 +997,7 @@ pub fn syscall_is_non_restartable(nr: u64) -> bool {
 /// Returns true if delivery succeeded (caller should return signal number as x0).
 fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, is_fault: bool, entry_esr: u64) -> bool {
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let proc = match akuma_exec::process::lookup_process(pid) {
+    let proc = match akuma_exec::process::lookup_process_shared(pid) {
         Some(p) => p,
         None => return false,
     };
@@ -1288,11 +1292,15 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         // (If fault_pc is in the 0x6000_0000 kernel-RAM VA range, that is a
         // separate bug: user tried to *execute* identity-mapped RAM — usually UXN.)
         let handler_va = handler_addr & !0xFFF;
-        let _ = proc.address_space.update_page_flags(handler_va, akuma_exec::mmu::user_flags::RX);
         let restorer_va = restorer & !0xFFF;
-        let _ = proc.address_space.update_page_flags(restorer_va, akuma_exec::mmu::user_flags::RX);
-        proc.address_space.invalidate_icache_for_page_va(handler_va);
-        proc.address_space.invalidate_icache_for_page_va(restorer_va);
+        // PTE permission edits under `as_lock` (`with_address_space`); the
+        // icache invalidates ride in the same short hold to keep the old order.
+        proc.with_address_space(|aspace| {
+            let _ = aspace.update_page_flags(handler_va, akuma_exec::mmu::user_flags::RX);
+            let _ = aspace.update_page_flags(restorer_va, akuma_exec::mmu::user_flags::RX);
+            aspace.invalidate_icache_for_page_va(handler_va);
+            aspace.invalidate_icache_for_page_va(restorer_va);
+        });
 
         if action.flags & SA_SIGINFO != 0 {
             (*frame).x1 = (new_sp + SIGFRAME_SIGINFO) as u64;
@@ -1722,13 +1730,16 @@ fn try_resolve_el1_cow_fault() -> bool {
     }
 
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    if let Some(owner) = akuma_exec::process::lookup_process(pid) {
-        let _ = owner.address_space.map_page(page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
-        akuma_exec::mmu::flush_tlb_page(page_va);
-        owner.address_space.track_user_frame(new_frame);
-        // CoW: old page freed via the global CoW refcount (cow_ref_dec), not
-        // user_frames — drop the bookkeeping ref but never free here.
-        let _ = owner.address_space.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
+    if let Some(owner) = akuma_exec::process::lookup_process_shared(pid) {
+        // PTE remap + frame bookkeeping under `as_lock` (`with_address_space`).
+        owner.with_address_space(|aspace| {
+            let _ = aspace.map_page(page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
+            akuma_exec::mmu::flush_tlb_page(page_va);
+            aspace.track_user_frame(new_frame);
+            // CoW: old page freed via the global CoW refcount (cow_ref_dec), not
+            // user_frames — drop the bookkeeping ref but never free here.
+            let _ = aspace.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
+        });
         crate::pmm::cow_ref_dec(old_pa);
         true // Caller returns; ERET retries the faulting instruction
     } else {
@@ -1909,14 +1920,16 @@ extern "C" fn rust_sync_el1_handler() {
             }
             let _ = writeln!(w, "  EC=0x25 in kernel code — killing current process (EFAULT)");
             w.flush();
-            if let Some(proc) = akuma_exec::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process_shared() {
                 let _ = writeln!(w, "  Killing PID {} ({})", proc.pid, proc.name);
                 w.flush();
                 let l0_phys = proc.address_space.l0_phys();
                 let pid = proc.pid;
-                proc.exited = true;
-                proc.exit_code = -14; // EFAULT
-                proc.state = akuma_exec::process::ProcessState::Zombie(-14);
+                akuma_exec::process::with_current_process(|p| {
+                    p.exited = true;
+                    p.exit_code = -14; // EFAULT
+                    p.state = akuma_exec::process::ProcessState::Zombie(-14);
+                });
                 akuma_exec::process::kill_thread_group(pid, l0_phys, -14);
                 crate::syscall::proc::notify_child_channel_exited_pub(pid, -14);
                 crate::syscall::proc::vfork_complete(pid);
@@ -2124,7 +2137,7 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
     }
     
     // User process info (if any)
-    if let Some(proc) = akuma_exec::process::current_process() {
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
         let mem = &proc.memory;
         let stack_size = mem.stack_top - mem.stack_bottom;
         let stack_used = if user_sp >= mem.stack_bottom as u64 && user_sp < mem.stack_top as u64 {
@@ -2169,7 +2182,7 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
             proc.address_space.page_table_frame_count(),
         );
         w.flush();
-        if let Some(owner) = akuma_exec::process::lookup_process(proc.tgid) {
+        if let Some(owner) = akuma_exec::process::lookup_process_shared(proc.tgid) {
             let _ = writeln!(w, "    Tracked(owner tgid={}): user_frames={} refs={} page_tables={}",
                 proc.tgid,
                 owner.address_space.user_frame_count(),
@@ -2541,7 +2554,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                     akuma_exec::mmu::map_user_page(page_va, pf.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
                                 };
                                 if installed {
-                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
+                                    if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                                         owner.address_space.track_user_frame(pf);
                                         for tf in tfs { owner.address_space.track_page_table_frame(tf); }
                                     } else {
@@ -2550,7 +2563,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                     }
                                 } else {
                                     crate::pmm::free_page(pf);
-                                    if let Some(owner) = akuma_exec::process::lookup_process(as_owner) {
+                                    if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                                         for tf in tfs { owner.address_space.track_page_table_frame(tf); }
                                     } else {
                                         for tf in tfs { crate::pmm::free_page(tf); }
@@ -2579,7 +2592,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 if try_deliver_signal(frame, 4, elr, true, esr) {
                     return 4; // signal number in x0 for the handler
                 }
-                if let Some(proc) = akuma_exec::process::current_process() {
+                if let Some(proc) = akuma_exec::process::current_process_shared() {
                     crate::safe_print!(128,
                         "[SPURIOUS-SVC] Process {} ({}) killed (SIGILL, phantom SVC)\n",
                         proc.pid, proc.name);
@@ -2651,7 +2664,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             }
             
             // Check if process exited - if so, return to kernel
-            if let Some(proc) = akuma_exec::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process_shared() {
                 if proc.exited {
                     let exit_code = proc.exit_code;
                     
@@ -2841,7 +2854,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 if lazy_found.is_none() {
                     let lr_count = akuma_exec::process::lazy_region_count_for_pid(pid);
                     // Also check the parent PID - maybe lazy regions weren't cloned
-                    let parent_pid = akuma_exec::process::lookup_process(as_owner)
+                    let parent_pid = akuma_exec::process::lookup_process_shared(as_owner)
                         .map_or(0, |p| p.parent_pid);
                     let parent_lr_count = akuma_exec::process::lazy_region_count_for_pid(parent_pid);
                     let parent_has_va = akuma_exec::process::lazy_region_lookup_for_pid(parent_pid, far_usize).is_some();
@@ -3242,7 +3255,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         return unsafe { (*frame).x0 };
                     }
                     // Dump mmap_regions for debugging: shows what the eager fallback searched
-                    if let Some(dbg_proc) = akuma_exec::process::lookup_process(as_owner) {
+                    if let Some(dbg_proc) = akuma_exec::process::lookup_process_shared(as_owner) {
                         let n = dbg_proc.vm_with_regions(|r| r.len());
                         crate::tprint!(128, "[DP] eager miss: pid={} va=0x{:x} checked {} mmap_regions\n",
                             pid, far_usize, n);
@@ -3359,7 +3372,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 frame_ref.x19, frame_ref.x20, frame_ref.x29, frame_ref.x30);
             crate::safe_print!(128, "[Fault]  SP_EL0={:#x} SPSR={:#x} TPIDR_EL0={:#x}\n",
                 frame_ref.sp_el0, frame_ref.spsr_el1, frame_ref.tpidr_el0);
-            if let Some(proc) = akuma_exec::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process_shared() {
                 let elapsed_us = (akuma_exec::runtime::runtime().uptime_us)()
                     .saturating_sub(proc.start_time_us);
                 let secs = elapsed_us / 1_000_000;
@@ -3412,7 +3425,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 let lazy_found = akuma_exec::process::lazy_region_lookup_for_page_fault(pid, far_usize);
                 if lazy_found.is_none() {
                     let lr_count = akuma_exec::process::lazy_region_count_for_pid(pid);
-                    let parent_pid = akuma_exec::process::lookup_process(as_owner)
+                    let parent_pid = akuma_exec::process::lookup_process_shared(as_owner)
                         .map_or(0, |p| p.parent_pid);
                     let parent_lr_count = akuma_exec::process::lazy_region_count_for_pid(parent_pid);
                     let parent_has_va = akuma_exec::process::lazy_region_lookup_for_pid(parent_pid, far_usize).is_some();
@@ -3730,7 +3743,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 frame_ref.x19, frame_ref.x20, frame_ref.x29, frame_ref.x30);
             crate::safe_print!(128, "[Fault]  SP_EL0={:#x} ELR={:#x} SPSR={:#x}\n",
                 frame_ref.sp_el0, frame_ref.elr_el1, frame_ref.spsr_el1);
-            if let Some(proc) = akuma_exec::process::current_process() {
+            if let Some(proc) = akuma_exec::process::current_process_shared() {
                 let elapsed_us = (akuma_exec::runtime::runtime().uptime_us)()
                     .saturating_sub(proc.start_time_us);
                 let secs = elapsed_us / 1_000_000;
