@@ -1,6 +1,14 @@
-# Phase 7f milestone 0 + tranche 1: the per-syscall BKL opt-out list
+# Phase 7f: the per-syscall BKL opt-out list (milestone 0, tranche 1, tranche 2)
 
-**Status**: Landed 2026-08-01 (uncommitted at time of writing). Milestone 0 (the
+**Status (tranche 2)**: Landed 2026-08-02, uncommitted at time of writing. Adds the
+`as_lock` pre-flight (§3), the blocking-window analysis that gates every further
+blocking conversion (§4), two conversions — `rt_sigprocmask` and `nanosleep` (§5) —
+and the dead-thread ledger-clear fix that `nanosleep` exposed (§5.1). First tranche
+of this phase to move the contention needle: `nanosleep` 6.7% → absent (§5.3).
+Sections 1–2 below are tranche 1's original text, unchanged; they were committed in
+`761d147`.
+
+**Status (milestone 0 + tranche 1)**: Landed 2026-08-01. Milestone 0 (the
 mechanism, seeded empty) verified behaviour-identical against a same-day HEAD baseline
 boot; tranche 1 (the `no-bkl-network` whole-fn-guard family + `getrandom`) converted
 one step at a time on top of it. Executes
@@ -184,7 +192,334 @@ there** — a pre-existing sshd exec-channel drain gap (the known
 keepalive/channel-teardown family), not a Phase 7f regression. In-VM md5s (write,
 `cp`, readback) and concurrent-download digests are exact on the tranche build.
 
-## 3. What this unblocks
+## 3. Tranche 2 pre-flight: the `as_lock` gap in the demand-paging helpers
+
+§2's flagged follow-up, closed before any tranche-2 conversion.
+`ensure_user_pages_mapped` (`src/syscall/mod.rs`) and its sibling
+`ensure_user_page_mapped` (`src/exceptions.rs`) installed PTEs (`map_user_page`) and
+recorded frames (`track_user_frame`/`track_page_table_frame`) with **no `as_lock`**,
+and both are reachable from BKL-free windows today — every whole-fn net/vfs guard
+calls `validate_user_ptr`, and tranche 1 made `getrandom`'s prologue join that class.
+Both now fold the PTE install + frame bookkeeping under the address space's
+`as_lock` (`Process::with_as_locked`), the same fix 7e applied to the three
+signal-path PTE sites.
+
+What had to stay outside the hold, and why — this is the part that is not
+interchangeable with the 7e sites:
+
+- **Frame allocation.** `exceptions.rs`'s helper allocates with
+  `pmm::alloc_page_zeroed_user`, whose PMM-pressure path calls
+  `reclaim_clean_file_pages`, which takes `as_lock` once per swept page
+  (`process/children.rs`). Allocating under the hold would re-enter a
+  non-reentrant `Spinlock` on the same core — the *exact* failure shape 7e's
+  `register_process` on-demand reclaim hit (§3 of the reclaim doc). The
+  `syscall/mod.rs` helper uses the kernel `alloc_page_zeroed`, whose only
+  fallback is `allocator::reclaim_to_pmm` (heap spans, no `as_lock`), so it is
+  not exposed — but the alloc is kept outside the hold there too, so the two
+  helpers keep one discipline.
+- **The file fill.** `ensure_user_pages_mapped`'s `LazySource::File` arm reads
+  through the VFS into the fresh page. Block I/O under an IRQ-masked hold is
+  barred outright.
+- **The frees.** `free_page` runs after the hold is released.
+
+Why the install and the tracking must be *together* inside the hold (they were two
+separate steps before): `reclaim_clean_file_pages`'s `try_evict_ro_page` clears a
+live RO PTE and then declines to free a frame it does not find tracked. A peer
+observing the mapped-but-untracked instant therefore unmaps our page, frees nothing,
+and we then track a frame that is no longer mapped — a re-fault leak, and the
+`user_frame_count`-far-exceeds-mapped-VA signature that `mmu/mod.rs`'s
+`user_frame_count` doc already names as the leak tell.
+
+**Deviation from the workplan's assumption, recorded per the standing rule:** the
+workplan said "fold under `with_address_space`, or a per-page `AsLockHold`". Neither
+was used verbatim. `with_address_space` hands out `&mut UserAddressSpace`, but
+`map_user_page` is a free function that resolves the L0 from `TTBR0_EL1` rather than
+from an `AddressSpace`, so the closure would take the lock and then not use its own
+argument; `AsLockHold` is `cfg(kernel_smp_shared)`-only and would need a `#[cfg]` at
+the call site. `Process::with_as_locked` is the accessor that fits both — it takes
+the same lock with the same IRQ masking and compiles to a plain call off `smp-shared`.
+
+Two further deviations found while reading, both fixed here rather than deferred:
+
+1. **The lock must be the L0 owner's, not the caller's.** `syscall/mod.rs`'s helper
+   resolved only `read_current_pid()`. A CLONE_VM sibling gets a *fresh* `as_lock`
+   from `fork_process` (`process/bkl_guard.rs`'s rule 1), so holding the current
+   thread's would have excluded nothing. The lock owner is now resolved once per
+   call via `address_space_owner_pid_for_fault()`. Frame *tracking* deliberately
+   still goes to `read_current_pid()`'s process — changing which process owns the
+   frames is a separate behavioural change, out of scope here. **Flagged for
+   whoever picks that up:** for a shared-AS sibling this tracks frames in a
+   `new_shared` view whose frames are documented (`mmu/mod.rs`'s
+   `remove_user_frame`) as owned by the L0 owner instead.
+2. **A frame leak on the lost-CAS path.** The two helpers disagreed on when to
+   return the data frame. `exceptions.rs` freed it iff `!installed || owner.is_none()`
+   (correct); `syscall/mod.rs` freed it iff `installed && owner.is_none()` — so every
+   time `map_user_page`'s PTE compare-exchange lost the race to a concurrent
+   installer with a live owner, the frame was neither mapped nor tracked nor freed.
+   Both now use the first rule. BKL-free windows make that CAS race strictly more
+   likely, so this was worth fixing before converting anything else.
+
+### 3.1 Verification (pre-flight)
+
+Boot suite, `release-smp-shared --features devbox-smoltcp`, `DISK=devbox.img
+MEMORY=4096 SMP=2 INSTANCE=60`, A/B against a same-session `git stash` HEAD baseline:
+
+| | PASSED (`grep -ac`) | `[Test] … PASSED` | FAIL | stuck | PANIC/WILD/RECOVERED/SPURIOUS/stale-heals |
+|---|---|---|---|---|---|
+| HEAD baseline (stashed) | 250 | 242 | 2 | 18 | 0 |
+| pre-flight | 251 | 243 | 2 | 18 | 0 |
+
+Delta is exactly the one new self-test. The 2 FAILs are the standing pre-existing
+pair. **Note for future runs:** §1.2/§2.1 quote 249 PASS at SMP=2 for this same tree;
+today's same-methodology HEAD baseline is **250** (242 `[Test]`). Cross-boot variance
+in the non-`[Test]` PASS lines is real — take a fresh stash baseline in the same
+session rather than diffing against a number in this doc.
+
+New boot self-test `test_ensure_user_pages_mapped_as_lock` (`src/process_tests.rs`)
+covers the bail-out path: a VA with no lazy region must leave the PMM free count
+untouched (the leak class above) and leave no `as_lock` hold behind. It deliberately
+does **not** drive the install path — that needs a real user address space in TTBR0,
+and faking it would install PTEs into, and track page-table frames from, the *boot*
+address space, so the test process's teardown would free live boot page-table frames
+back to the PMM. Same call the `test_drivers_bkl_drop` comment makes about the RNG
+read path. The install half is covered for real by every fork/exec in the suite.
+
+## 4. The blocking-window analysis
+
+This is the §2-flagged gate for tranche 2: which families may open a BKL-free window
+that spans `schedule_blocking()`. It was written before converting anything that
+blocks, because `BKL_PHASE7B_PPOLL_CARVE_OUT.md` §3–4 is the precedent — the one
+blocking-window carve in this campaign produced real, intermittent data corruption
+and was reverted the same session.
+
+### 4.1 The finding that reframes the question
+
+**The BKL is not held across a blocking wait — not for converted syscalls, and not
+for unconverted ones either.** This is a property of the mechanism, read out of the
+code rather than assumed:
+
+- `KERNEL_LOCK` is a **per-core** lock (`bkl::current_core_id()` is the owner
+  identity), not a per-thread one.
+- `bkl::reconcile_for_spsr(spsr)` computes `release = target_is_el0 ||
+  in_dropped_window()` and reconciles **for the thread the core is about to run**.
+  So when thread A blocks and the core switches to thread B, the epilogue makes the
+  lock state right for B. A's "hold" simply evaporates; nothing hands it back to A
+  until A is resumed and its own epilogue re-acquires.
+- `threading::schedule_blocking` never calls `leave_kernel` — it doesn't need to.
+  It marks the thread WAITING, fires the voluntary-reschedule SGI, and `wfi`s; the
+  scheduler switch that follows is what re-points the lock.
+
+Consequences, and they cut both ways:
+
+1. A "BKL-held" blocking syscall is really *BKL-held during each runnable stretch* —
+   before the first block, and after each wake. The wait itself is unserialized
+   today, for every syscall in the kernel.
+2. Therefore converting a blocking syscall does **not** newly expose the wait. It
+   changes the serialization of the runnable stretches only — exactly what
+   converting a non-blocking syscall does.
+3. Therefore any `Process`-derived reference a syscall carries *across* its wait is
+   already unprotected today. The BKL was never covering it. That is a pre-existing
+   bug class, not something a conversion creates — but a conversion must not
+   *inherit* it silently.
+
+This also explains why tranche 1 was uneventful: `accept`/`accept4`/`connect` and
+`resolve_host` already ran blocking BKL-free windows, and have since Phase 2's
+whole-fn `NetBklGuard`. Stronger still — `schedule_blocking`'s own wait loop calls
+`process::is_current_interrupted()` → `current_process_shared()` on every `wfi`
+iteration. A bounded process-table lookup from inside a blocking BKL-free window is
+therefore **already production-proven on every boot**, months before this phase.
+
+### 4.2 The rule this yields
+
+> A blocking-window conversion is safe when every `Process`-derived reference in the
+> excursion is re-acquired after each wake and used only within a bounded span
+> (≪ the 10 ms `PROCESS_RECLAIM_COOLDOWN_US`). No reference, raw pointer, or derived
+> pointer may live across `schedule_blocking()`.
+
+Bounded lookup-then-use is precisely what 7e's RETIRED + 10 ms cooldown covers: the
+lookup filters on `ACTIVE`, and the cooldown outlasts the microseconds to the deref.
+A reference held across an indefinite wait is what it explicitly does not cover, and
+`locking.md`'s load-bearing table says so in as many words.
+
+A second, independent gate applies to every conversion, blocking or not, and the
+workplan did not name it: **every inner lock the excursion takes must mask local
+IRQs**, or a nested IRQ's unconditional `enter_kernel()` hard-spin deadlocks AB-BA
+against a peer that holds the BKL and wants that inner lock (`locking.md`,
+"Correctness rules learned the hard way"; the reason `PreemptGuard` masks IRQs).
+
+### 4.3 Per-candidate verdicts
+
+| candidate | reference held across the wait? | inner locks mask IRQs? | verdict |
+|---|---|---|---|
+| `nanosleep` (101) | **No.** The loop body is `timer::uptime_us()`, `is_current_interrupted()`, `schedule_blocking(deadline)`. `is_current_interrupted` re-looks-up every iteration and clones an `Arc<ProcessChannel>` — refcounted, so its lifetime is independent of the `Process` slot. Nothing survives a wake. | n/a — no inner table lock; per-thread atomics only | **Convertible now** |
+| `rt_sigprocmask` (135) | n/a — never blocks, and touches no process-table state at all: the mask is per-thread (`threading::thread_signal_mask`) | n/a | **Convertible now** (non-blocking; listed here because the audit sits with its siblings) |
+| `read` (63) on a pipe fd | **Yes.** `sys_read` binds `proc = current_process_shared()` (`fs.rs:259`) *before* the arm match and uses it inside the `PipeRead`/`Stdin` loops, across `schedule_blocking(u64::MAX)` — an indefinite wait, orders of magnitude past the 10 ms cooldown. | `PIPES` — yes, every access is wrapped in `with_irqs_disabled` | **Not cleared.** Per §4.1(3) this hazard exists *today* and conversion would not widen it, but it must be fixed, not inherited: re-acquire `proc` after each wake (or capture the pipe id and drop `proc` before the loop). Convert only after that. |
+| `futex` (98) | No — the wait loop holds only `key = (tgid, uaddr)` and `deadline`, all plain values; `futex_key_tgid` returns a `u32`. | **No.** `FUTEX_WAITERS` is a bare `Spinlock` and `src/syscall/sync.rs` contains **zero** `IrqGuard`/`with_irqs_disabled`. | **Blocked** on the second gate. Converting futex makes a live AB-BA: window holds `FUTEX_WAITERS`, nested IRQ hard-spins for the BKL, peer holds the BKL inside `futex_do_wake` spinning on `FUTEX_WAITERS`. Latent today only because nothing BKL-free reaches it. Fix = wrap every `FUTEX_WAITERS` access in `with_irqs_disabled`, then re-audit. |
+| `ppoll` piece 2 (73/72/22) | No — `kernel_fds` is a kernel `Vec`, the waker is per-thread, and `epoll_check_fd_readiness` re-resolves each fd per sweep. | Mixed: `PIPES` yes; `EPOLL_TABLE` is a bare `Spinlock` with only 4 IRQ-masking sites in `poll.rs` — needs the same sweep as futex before the whole-syscall carve. | **Not cleared** — see §4.4. |
+
+### 4.4 Why `ppoll` piece 2 stays parked
+
+By the §4.2 rule alone `ppoll` would pass: it carries nothing across its wait. That
+is exactly why it is not enough. 7b's root cause was **never pinned** — §4 of that
+doc offers the peer-teardown hypothesis as best evidence, not as a diagnosis. 7e has
+since landed the fix for that hypothesis, and 7b §6 anticipated that `PollBklGuard`
+could then "very likely be re-tried unchanged". But:
+
+- The observed failure rate was **1 run in 2**. A single clean regimen run is not
+  evidence — 7b's own run 2 was clean *with the bug present*. Clearing it needs a
+  run count chosen against that rate (≥4 clean regimen runs puts a ≥50% failure mode
+  below ~6% likelihood), not the single A/B the other tranches use.
+- `EPOLL_TABLE`'s IRQ-masking gap (§4.3) is an unrelated second defect that a
+  whole-syscall carve would activate.
+
+Both are concrete and cheap relative to the risk; neither was in scope for this
+tranche. Parked with those two as the entry criteria, replacing 7b §6's "wait for
+7e" (now satisfied).
+
+### 4.5 Conclusion
+
+Cleared and converted in tranche 2a/2b: `rt_sigprocmask`, `nanosleep`.
+Cleared-in-principle but gated on a named prerequisite fix, in ascending cost:
+`futex` (mask IRQs around `FUTEX_WAITERS`), `read` (re-acquire `proc` after wake),
+`ppoll` piece 2 (mask IRQs around `EPOLL_TABLE`, then a ≥4-run regimen). None of the
+three needs an epoch/RCU scheme — that remains reserved for the plain-`Process`-field
+writers and the two `with_process_exclusive` sites, which are still the last across.
+
+Two candidates the workplan listed as "easy auditables" were **rejected** on reading:
+
+- **`getcwd` (17)** — `locking.md` calls it "no I/O, cached `proc.cwd`, no guard
+  needed", which is true about the *VFS* and misleading about the BKL. `proc.cwd` is
+  a plain `String` field on `Process`; `chdir`/`fchdir` write it BKL-held. Converting
+  the reader would let a BKL-free `getcwd` read a `String` whose heap buffer a peer's
+  `chdir` is reallocating — a torn read at best. This is precisely the
+  plain-`Process`-field row the workplan's rule 5 puts out of scope; the rule applies
+  to readers of those fields, not only writers.
+- **`sendto`/`recvfrom`/`sendmsg`/`recvmsg`** — unchanged from tranche 1. The body
+  split was not attempted: `DroppedWindowPause` holds the BKL, so the unix-socket arm
+  it would wrap must not span the pipe blocking wait, and getting that boundary wrong
+  reproduces the meow→LLM freeze. Each split syscall needs its own boot, which this
+  tranche did not have room for.
+
+## 5. Tranche 2: what landed
+
+Converted, one at a time, each boot-verified at SMP=2 before the next:
+
+| # | syscall | why it was clear |
+|---|---|---|
+| 135 | `rt_sigprocmask` | per-thread signal mask (plain atomics); zero process-table touch |
+| 101 | `nanosleep` | blocking, but carries no `Process`-derived reference across the wait (§4.3) |
+
+### 5.1 `nanosleep` found a real mechanism gap — the dead-thread ledger leak
+
+Listing `nanosleep` turned `test_no_stale_window_heals` red **deterministically**: 3
+heals, identical across two boots, each log line immediately preceded by
+`[Cleanup] Thread 8 recycled after Nus cooldown`.
+
+That is documented root cause #2 from `BKL_PHASE7B_PPOLL_CARVE_OUT.md` §4 ("a thread
+getting recycled while a window was still open"), reproduced deterministically for
+the first time. The dropped-window ledger is indexed by **thread id**. A thread killed
+while parked inside a converted syscall never reaches its window close, so its slot
+goes back to `FREE` with a stale depth, and the *next* occupant of that tid inherits
+it — its EL1 excursions then run BKL-free until the EL0-entry tripwire heals them.
+
+`nanosleep` is simply the first converted syscall that parks a thread long enough for
+the kill-then-recycle to land inside the window. Nothing about the bug is specific to
+it; every future blocking conversion would have hit it.
+
+Fix: `bkl::clear_dropped_windows_for_dead_thread(tid)` — a ledger-only clear (no lock
+operation, unlike `reset_dropped_windows`, because a TERMINATED thread will never
+resume and there is no invariant to restore) called from
+`threading::reclaim_terminated_slots` immediately before the slot goes `FREE`, i.e.
+before any spawn can claim it. `DroppedWindowLedger::reset`'s own doc comment already
+said "and for recycled thread slots"; the caller had simply never been wired up.
+
+`test_syscall_bkl_optout` gained a case for it: stage a window on a foreign tid, clear
+it, assert the returned prior depth, the zeroed residual, and that this core's BKL
+state is untouched.
+
+**This is the tranche's most portable result.** It is a prerequisite for `read`,
+`futex`, and `ppoll` piece 2 as much as it was for `nanosleep`, and it retires one of
+the two mechanisms 7b §4 offered for its unexplained corruption — which is
+independently interesting, since 7b's window also spanned a scheduler and its thread
+17 was recycled.
+
+### 5.2 Verification
+
+Boot suite, `release-smp-shared --features devbox-smoltcp`, `DISK=devbox.img
+MEMORY=4096 INSTANCE=60`. `[Test] … PASSED` is the stable count; `grep -ac PASSED`
+is given too for continuity with §1.2.
+
+| | `[Test]` PASSED | `grep -ac PASSED` | non-flake FAIL | stuck | heals | PANIC/WILD/RECOVERED/SPURIOUS |
+|---|---|---|---|---|---|---|
+| HEAD baseline, SMP=2 (stash) | 242 | 250 | 2 known | 18 | 0 | 0 |
+| tranche 2 complete, SMP=2 | 243 | 251 | 2 known | 18 | 0 | 0 |
+| tranche 2 complete, SMP=1 | 235 (+15 SKIP) | 243 | 2 known | 0 | 0 | 0 |
+| tranche 2 complete, SMP=4 | 240 (+9 SKIP) | 248 | 2 known | 46 | 0 | 0 |
+
+All four suite-end tripwires PASSED on every boot above
+(`no_spurious_svc_traps`, `no_bkl_ticket_recoveries`, `no_stale_window_heals`,
+`syscall_bkl_optout`), plus the new `ensure_user_pages_mapped_as_lock`.
+
+Host: full-workspace `cargo test` green (akuma-exec 158 passed, 0 failed anywhere);
+clippy clean on `release-smp-shared --features devbox-smoltcp`, `--release`, and
+`release-smp --features smp`; `size` and `extreme-size` both build.
+
+### 5.3 Contention A/B — the first tranche with a real delta
+
+Same-binary-configuration A/B, SMP=4, `release-smp-shared --features
+devbox-smoltcp,no-tests,bkl-profile`, `MEMORY=4096`, `SNAPSHOT=1`, the unmodified
+`net4 → read4 → cp2 → rm` regimen, toggled **in source** (seed entries commented in/
+out, feature set byte-identical), summed over `analyze_workload.py --auto`'s
+auto-selected workload windows:
+
+| | side B (tranche-1 seed) | side A (tranche-2 seed) |
+|---|---|---|
+| total contended workload spins | 26.31M | 26.78M |
+| **`nanosleep`** | **6.7%** (1.67M spins) | **absent** |
+| `execve` | 21.6% | 28.1% |
+| `clone` | 16.7% | 19.9% |
+| `irq/sched` | 14.7% | 17.6% |
+| `netpoll_maint` | 13.8% | 11.4% |
+| `idle` | 19.9% | 10.1% |
+| digests / stuck / PANIC / WILD / SPURIOUS / stale / RECOVERED | 6/6 exact, all 0 | 6/6 exact, all 0 |
+
+**`nanosleep` drops out of the histogram entirely** — 6.7% → 0, the same "drops out"
+signature every successful carve in this campaign has produced, and the first real
+contention delta of Phase 7f (tranche 1 was all previously-guarded syscalls, so it
+correctly showed none).
+
+Read the rest of the table carefully, because it is easy to over-claim:
+
+- **Total contended spins did not fall** (26.31M → 26.78M, within noise). The freed
+  share is *redistributed* to `execve`/`clone`/`irq/sched`, not eliminated. This
+  workload is lifecycle-bound, and those are exactly the syscalls Phase 7f is
+  forbidden to touch until the plain-`Process`-field story lands. Removing a 6.7%
+  holder from a saturated lock moves the queue along; it does not shrink it.
+- **`read` (2.9% side B, absent side A) is NOT this tranche's doing** — `read` is
+  unconverted on both sides. That is cross-boot variance of exactly the kind 7b
+  documented (`read` 56.4% → absent between two of its runs). Ignore it.
+- The regimen wall-clock was 92s (side A) vs 136s (side B). Suggestive, but n=1 per
+  side and the harness timing includes host HTTP variance — **not** quotable as a
+  speedup without repeated runs.
+
+Per the campaign's standing rule: re-measure before quoting any of these numbers.
+
+### 5.4 `test_epoll_multi_poller_pipe` is flaky at SMP=2, not only SMP=4
+
+Worth recording because it cost a conversion decision. After listing
+`rt_sigprocmask`, this test failed (`woken=1`, expected 2) on two consecutive SMP=2
+boots — which looks exactly like a regression, and the workplan only documents the
+flake at SMP=4. Backing the entry out and re-running produced **1 failure in 4** boots
+*without* the change; going back in produced 2 more clean boots (5 with-change boots
+total, 2 failures).
+
+So: 2/5 with, 1/4 without — the same population, no separable effect, and
+`rt_sigprocmask` touches neither epoll nor pipes. The test is a pre-existing SMP=2
+flake too. **The lesson for the next tranche: at this failure rate a single boot
+cannot distinguish a regression from the flake.** Budget the extra boots, or the
+first suspicious result will either cost a good conversion or hide a bad one.
+
+## 6. What this unblocks
 
 The opt-out list is now the single place the remaining traversal happens: each of the
 14 untouched syscall families (and the ~13 leftover `fs` syscalls) is one seed entry
@@ -194,6 +529,22 @@ scope** until the plain-`Process`-field story lands (the two
 `reconcile_for_spsr`, the ledger, and the five guards must survive until the
 un-converted set is empty — the ledger's invariant is precisely what makes the mixed
 state safe.
+
+After tranche 2 the traversal's remaining work is no longer "audit each syscall" but
+four **named, shared prerequisites**, each unblocking a group at once:
+
+1. **Mask IRQs around the bare `Spinlock` tables** — `FUTEX_WAITERS`
+   (`src/syscall/sync.rs`, zero IRQ-masked sites today) and `EPOLL_TABLE`
+   (`src/syscall/poll.rs`). Unblocks `futex` and `ppoll` piece 2. Mechanical; the
+   pattern is `pipe.rs`'s `with_irqs_disabled` wrapping.
+2. **Stop carrying `proc` across blocking waits** — `sys_read` binds it before the
+   arm match (`fs.rs:259`) and derefs it after an indefinite park. Unblocks `read`
+   (4.4% measured), and the same shape should be swept for in `write`/`recvfrom`.
+   Note this is a live pre-existing bug, not merely a conversion blocker (§4.1).
+3. **The plain-`Process`-field story** — still the gate for `execve`/`clone`/`wait4`/
+   mm, and now also for *readers* of those fields such as `getcwd` (§4.5).
+4. **Body splits for the four unix-socket-routing net syscalls**, with the
+   `DroppedWindowPause`/blocking-wait boundary rule from §4.5.
 
 ## Background
 

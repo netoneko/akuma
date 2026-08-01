@@ -265,6 +265,25 @@ const SYSCALL_BKL_OPTOUT_SEED: &[u64] = &[
     // folding ensure_user_pages_mapped under as_lock).
     278, // getrandom
     300, // resolve_host (Akuma-private DNS) — blocking wait, same note as accept
+    // Phase 7f tranche 2a: syscalls whose whole body was audited to touch no
+    // plain `Process` field and no process-table state beyond a bounded lookup.
+    // `rt_sigprocmask`: the POSIX mask is PER-THREAD (`threading::
+    // thread_signal_mask`/`set_thread_signal_mask`, plain atomics — the fix from
+    // docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D), so the body touches no
+    // process-table state at all. Only `validate_user_ptr` + two user copies sit
+    // outside it, the same exposure class `getrandom` already joined in tranche 1
+    // (and now folded under `as_lock` by this tranche's pre-flight).
+    135, // rt_sigprocmask
+    // Phase 7f tranche 2b: the first conversion cleared by the blocking-window
+    // analysis (archive doc §4). `nanosleep`'s window spans `schedule_blocking`,
+    // but it carries NO `Process`-derived reference across the wait — the loop is
+    // `uptime_us()` / `is_current_interrupted()` / `schedule_blocking()`, and
+    // `is_current_interrupted` re-looks-up each iteration and clones an
+    // `Arc<ProcessChannel>` whose lifetime is refcount-independent of the slot.
+    // Every lookup-then-use is bounded far inside the 10ms reclaim cooldown. The
+    // BKL was never held across the wait anyway (§4.1): `reconcile_for_spsr`
+    // re-points the per-core lock at whichever thread the core resumes.
+    101, // nanosleep
 ];
 
 /// Syscalls that must NEVER be opted out, mechanism-level (not merely "not yet

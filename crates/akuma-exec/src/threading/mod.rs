@@ -1210,6 +1210,14 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
                 cb(i);
             }
             
+            // Clear any dropped-BKL window this slot's late occupant left open. A
+            // thread killed while parked inside a converted (BKL-opted-out) syscall
+            // never reaches its window close — the ledger is tid-indexed, so the next
+            // occupant of this slot would inherit the depth and run its EL1 excursions
+            // BKL-free until the EL0-entry tripwire healed it. Must happen before the
+            // slot goes FREE, i.e. before any spawn can claim it.
+            let _stale_depth = crate::bkl::clear_dropped_windows_for_dead_thread(i);
+
             // NOW set to FREE - cleanup is complete, spawn can safely claim this slot
             THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
             

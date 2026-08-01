@@ -892,29 +892,46 @@ fn ensure_user_page_mapped(pid: u32, page_va: usize) -> bool {
         }
         if matches!(source, akuma_exec::process::LazySource::Zero) {
             let map_flags = if flags != 0 { flags } else { akuma_exec::mmu::user_flags::RW };
+            // The alloc stays OUTSIDE the `as_lock` hold below: under PMM pressure
+            // `alloc_page_zeroed_user` calls `reclaim_clean_file_pages`, which takes
+            // `as_lock` once per swept page — allocating under the hold would
+            // self-deadlock on a non-reentrant `Spinlock`.
             if let Some(page_frame) = crate::pmm::alloc_page_zeroed_user() {
-                let (table_frames, installed) = unsafe {
-                    akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
+                // PTE install + frame bookkeeping under `as_lock` (Phase 7f
+                // pre-flight; same fold Phase 7e applied to the signal-path PTE
+                // sites). `as_owner` is the L0-owning thread-group leader, so this is
+                // the lock that actually guards these tables, and it is also the
+                // process the frames are tracked against. The two steps must be
+                // atomic against a peer's `try_evict_ro_page` on this page: it clears
+                // a live RO PTE and declines to free an untracked frame, so the
+                // mapped-but-untracked instant is a re-fault leak.
+                let owner = akuma_exec::process::lookup_process_shared(as_owner);
+                let install = || {
+                    let (table_frames, installed) = unsafe {
+                        akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
+                    };
+                    if let Some(owner) = owner {
+                        if installed {
+                            owner.address_space.track_user_frame(page_frame);
+                        }
+                        for tf in &table_frames {
+                            owner.address_space.track_page_table_frame(*tf);
+                        }
+                    }
+                    (table_frames, installed)
                 };
-                if installed {
-                    if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
-                        owner.address_space.track_user_frame(page_frame);
-                        for tf in table_frames {
-                            owner.address_space.track_page_table_frame(tf);
-                        }
-                    } else {
-                        crate::pmm::free_page(page_frame);
-                        for tf in table_frames { crate::pmm::free_page(tf); }
-                    }
-                } else {
+                let (table_frames, installed) = match owner {
+                    Some(owner) => owner.with_as_locked(install),
+                    None => install(),
+                };
+                // Frees after the hold is released; ownership rules unchanged — the
+                // data frame goes back to the PMM iff nothing mapped it (lost CAS
+                // race) or there is no owner to track it against.
+                if !installed || owner.is_none() {
                     crate::pmm::free_page(page_frame);
-                    if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
-                        for tf in table_frames {
-                            owner.address_space.track_page_table_frame(tf);
-                        }
-                    } else {
-                        for tf in table_frames { crate::pmm::free_page(tf); }
-                    }
+                }
+                if owner.is_none() {
+                    for tf in table_frames { crate::pmm::free_page(tf); }
                 }
                 return true;
             }

@@ -408,14 +408,43 @@ opted-out excursion cannot leak depth; `exit`/`exit_group`/`rt_sigreturn` are on
 structural deny list. The EL0-entry heal tripwire now feeds a counter
 (`exceptions::stale_window_heal_count()`) asserted 0 by the boot suite.
 
-Currently listed (tranche 1, all previously whole-fn-guarded so conversion only
+Currently listed — tranche 1 (all previously whole-fn-guarded, so conversion only
 deleted the entry/exit lock round-trip): `socket`, `bind`, `listen`, `accept`,
 `accept4`, `connect`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt`,
-`resolve_host`, `getrandom`. **`sendto`/`recvfrom`/`sendmsg`/`recvmsg` must not be
-listed wholesale** — their unix-socket routing arm runs before their guard and stays
-BKL-held (the AB-BA note below). `KernelLock`/`reconcile_for_spsr`/the ledger/the
-guards must survive until the un-converted set is empty. See
+`resolve_host`, `getrandom`. Tranche 2: `rt_sigprocmask` (per-thread mask, no
+process-table touch) and `nanosleep` (blocking, cleared by the blocking-window
+analysis below). **`sendto`/`recvfrom`/`sendmsg`/`recvmsg` must not be listed
+wholesale** — their unix-socket routing arm runs before their guard and stays
+BKL-held (the AB-BA note below). **`getcwd` must not be listed** either, despite the
+VFS map calling it guardless: it *reads* `proc.cwd`, a plain `String` `Process`
+field that `chdir` writes BKL-held (see the load-bearing table). `KernelLock`/
+`reconcile_for_spsr`/the ledger/the guards must survive until the un-converted set
+is empty. See
 [`BKL_PHASE7F_OPTOUT_LIST.md`](../../archive/BKL_PHASE7F_OPTOUT_LIST.md).
+
+**Two gates every further conversion must clear** (Phase 7f tranche 2, §4 of the
+archive doc):
+
+1. **No `Process`-derived reference may live across `schedule_blocking()`.** Bounded
+   lookup-then-use is fine — that is what 7e's RETIRED + 10 ms cooldown covers. A
+   reference held across an indefinite park is not. `sys_read` violates this today
+   (binds `proc` at `fs.rs:259`, derefs it after the park); this is a live
+   pre-existing bug, not merely a conversion blocker.
+2. **Every inner lock the excursion takes must mask local IRQs**, or a nested IRQ's
+   unconditional `enter_kernel()` deadlocks AB-BA against a peer holding the BKL and
+   waiting on that lock. `PIPES` complies; `FUTEX_WAITERS` (`syscall/sync.rs`) and
+   `EPOLL_TABLE` (`syscall/poll.rs`) do **not** — fix before converting `futex` or
+   re-attempting the whole-syscall `ppoll` carve.
+
+**The dropped-window ledger is thread-id-indexed, so a recycled slot must be
+cleared.** A thread killed while parked inside a converted syscall never reaches its
+window close; without a clear, the next occupant of that tid inherits the depth and
+runs BKL-free until the EL0-entry tripwire heals it.
+`threading::reclaim_terminated_slots` now calls
+`bkl::clear_dropped_windows_for_dead_thread(tid)` before the slot goes `FREE`
+(ledger-only — a TERMINATED thread has no invariant to restore). Listing `nanosleep`
+reproduced this deterministically (3 heals/boot); it is a prerequisite for every
+further blocking conversion.
 
 ### `no-bkl-network` — `src/syscall/net.rs`
 
@@ -703,6 +732,29 @@ signature matches a known physical-page-reuse-race pattern. That guard was rever
 **Any future BKL-free window that can span a `schedule_blocking()`/context-switch point
 (not just a single bounded I/O op) should be treated as touching this row, whether or not
 it looks like it does.**
+
+**Refinement (Phase 7f tranche 2, archive doc §4.1) — what the BKL actually covers
+here.** `KERNEL_LOCK` is a **per-core** lock, and `bkl::reconcile_for_spsr` reconciles
+it for *the thread the core is about to run*. So when a thread blocks and the core
+switches away, that thread's hold simply evaporates; nothing restores it until the
+thread is resumed and its own eret epilogue re-acquires. `schedule_blocking` never
+calls `leave_kernel` because it does not need to. Three consequences worth having
+written down:
+
+- A "BKL-held" blocking syscall is BKL-held during each *runnable stretch*, never
+  across the wait. This is true of every syscall in the kernel, converted or not.
+- Converting a blocking syscall therefore does not newly expose the wait — it changes
+  the serialization of the runnable stretches, exactly as converting a non-blocking
+  syscall does.
+- Any reference carried *across* a wait is already unprotected today. The row above
+  still stands, but the hazard it names is "reference outlives the 10 ms reclaim
+  cooldown", not "window spans a scheduler".
+
+Corroboration: `schedule_blocking`'s own wait loop calls
+`process::is_current_interrupted()` → `current_process_shared()` on every `wfi`
+iteration, and `accept`/`connect`/`resolve_host` have run blocking BKL-free windows
+since Phase 2's whole-fn `NetBklGuard`. A bounded process-table lookup inside a
+blocking BKL-free window is production-proven, not novel.
 
 By contrast these hold the BKL but already have a real inner lock, so they are ordinary
 carve-out candidates: `ppoll`/`epoll_*`'s `EPOLL_TABLE` and per-fd-type locks (only the

@@ -711,6 +711,11 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_syscall_bkl_optout();
 
+    // Phase 7f pre-flight: the demand-paging helpers `validate_user_ptr` reaches from
+    // inside BKL-free windows now install PTEs + track frames under `as_lock`. Covers
+    // the bail-out path's frame accounting and that no hold outlives the call.
+    test_ensure_user_pages_mapped_as_lock();
+
     // Phantom-SVC tripwire: runs LAST so it covers every EL0 trap the suite above
     // generated (fork/exec/signal/mmap stress). A nonzero count means an EC_SVC64
     // trap arrived whose insn@ELR-4 was not an `svc` — either stale I-cache or the
@@ -3610,6 +3615,46 @@ fn test_syscall_bkl_optout() {
         bkl::enter_kernel();
     }
 
+    // ── Dead-thread ledger clear (tranche 2b) ──────────────────────────────
+    // A thread killed while parked inside a converted syscall never reaches its
+    // window close. The slot recycler must clear the tid-indexed depth before the
+    // slot goes FREE, or the next occupant inherits it and runs BKL-free until the
+    // EL0-entry tripwire heals. Drive the primitive directly on a foreign tid: it
+    // must return the prior depth, leave the entry at zero, and — unlike
+    // `reset_dropped_windows` — perform no lock operation on our behalf.
+    {
+        // A high tid this suite never spawns into, so clobbering it is inert.
+        const DEAD_TID: usize = akuma_exec::threading::MAX_THREADS - 1;
+        let held_before = bkl::held_by_current();
+        let prior = bkl::clear_dropped_windows_for_dead_thread(DEAD_TID);
+        if prior != 0 {
+            fails += 1;
+            crate::safe_print!(128,
+                "[Test] syscall-bkl-optout: dead-thread slot {} started with depth {} (expected 0)\n",
+                DEAD_TID, prior);
+        }
+        // Simulate the killed-while-parked shape: open a window on that slot's
+        // behalf, then recycle it.
+        akuma_exec::bkl::dropped_window_open_for_tid_test(DEAD_TID);
+        let cleared = bkl::clear_dropped_windows_for_dead_thread(DEAD_TID);
+        if cleared != 1 {
+            fails += 1;
+            crate::safe_print!(128,
+                "[Test] syscall-bkl-optout: dead-thread clear returned {} (expected prior depth 1)\n",
+                cleared);
+        }
+        if bkl::clear_dropped_windows_for_dead_thread(DEAD_TID) != 0 {
+            fails += 1;
+            crate::safe_print!(96,
+                "[Test] syscall-bkl-optout: dead-thread clear left a residual depth\n");
+        }
+        if bkl::held_by_current() != held_before {
+            fails += 1;
+            crate::safe_print!(96,
+                "[Test] syscall-bkl-optout: dead-thread clear changed this core's BKL state\n");
+        }
+    }
+
     let recoveries_after = akuma_exec::sync::kernel_lock_recoveries();
     if recoveries_after != recoveries_before {
         fails += 1;
@@ -3622,7 +3667,7 @@ fn test_syscall_bkl_optout() {
     unregister_thread_pid(tid);
 
     if fails == 0 {
-        crate::safe_print!(160, "[Test] syscall_bkl_optout PASSED (list + latch + ledger balance + pause)\n");
+        crate::safe_print!(160, "[Test] syscall_bkl_optout PASSED (list + latch + ledger + pause + dead-thread clear)\n");
     } else {
         crate::safe_print!(64, "[Test] syscall_bkl_optout FAILED ({} cases)\n", fails);
         panic!("test_syscall_bkl_optout: {fails} cases failed");
@@ -3643,6 +3688,87 @@ fn test_no_stale_window_heals() {
     } else {
         crate::safe_print!(96,
             "[Test] no_stale_window_heals FAILED: {} stale dropped-window heal(s) during boot suite\n", n);
+    }
+}
+
+/// Phase 7f pre-flight: `ensure_user_pages_mapped` (`src/syscall/mod.rs`) and its
+/// sibling `ensure_user_page_mapped` (`src/exceptions.rs`) now install PTEs and track
+/// frames under the address space's `as_lock`, because `validate_user_ptr` reaches
+/// them from inside BKL-free syscall windows (every whole-fn net/vfs guard, and since
+/// tranche 1 `getrandom`'s prologue). The restructuring moved the alloc and the file
+/// fill outside that hold and unified the frame-ownership rule with the sibling's.
+///
+/// This pins what a boot test can drive safely — the bail-out path:
+///
+/// 1. **No frame is leaked before the early return.** A VA with no lazy region
+///    backing it must leave the PMM free count untouched. This is the regression
+///    class the restructuring could plausibly introduce (an allocated frame dropped
+///    on a path that returns `false`), and it also covers the old ownership bug the
+///    rewrite fixed: the previous code freed the data frame iff
+///    `installed && owner.is_none()`, leaking it on every lost PTE-CAS race.
+/// 2. **No `as_lock` hold outlives the call** — the leader's lock is free afterwards.
+///
+/// What this does NOT prove: assertion 2 is a cheap tripwire, not proof the hold is
+/// taken, because this path maps nothing. The *install* path is deliberately not
+/// driven here, for the same reason `test_drivers_bkl_drop` doesn't drive the RNG
+/// read path — it needs a real user address space in TTBR0. Faking it would install
+/// PTEs into, and track page-table frames from, the *boot* address space, and the
+/// test process's teardown would then free live boot page-table frames back to the
+/// PMM. Real coverage for that half is every fork/exec in this suite: userspace
+/// demand paging runs both helpers constantly.
+fn test_ensure_user_pages_mapped_as_lock() {
+    use akuma_exec::process::{
+        lookup_process_shared, register_process, register_thread_pid, unregister_process,
+        unregister_thread_pid,
+    };
+    use akuma_exec::threading::current_thread_id;
+
+    // High user VA (bit 46), below the 48-bit limit, with no lazy region registered
+    // for this pid — the helper must walk, find nothing, and bail out.
+    const UNBACKED_VA: usize = 0x7F00_0000_0000;
+
+    let tid = current_thread_id();
+    let pid: u32 = 7706;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+
+    let mut fails = 0u32;
+
+    // IRQs disabled for the measurement, same reason as the munmap PMM tests below:
+    // it keeps a local preemption from making the free-count comparison flaky.
+    let (mapped, free_before, free_after) = crate::irq::with_irqs_disabled(|| {
+        let (_t, _a, free_before) = crate::pmm::stats();
+        let mapped = crate::syscall::ensure_user_pages_mapped_for_test(UNBACKED_VA, 0x2000);
+        let (_t, _a, free_after) = crate::pmm::stats();
+        (mapped, free_before, free_after)
+    });
+
+    if mapped {
+        fails += 1;
+        crate::safe_print!(96,
+            "[Test] ensure_user_pages_mapped_as_lock: unbacked VA reported as mapped\n");
+    }
+    if free_after != free_before {
+        fails += 1;
+        crate::safe_print!(128,
+            "[Test] ensure_user_pages_mapped_as_lock: PMM free drifted {} -> {} on the bail-out path\n",
+            free_before, free_after);
+    }
+    if let Some(p) = lookup_process_shared(pid)
+        && p.as_lock.try_lock().is_none()
+    {
+        fails += 1;
+        crate::safe_print!(96,
+            "[Test] ensure_user_pages_mapped_as_lock: as_lock still held after the call\n");
+    }
+
+    unregister_thread_pid(tid);
+    let _ = unregister_process(pid);
+
+    if fails == 0 {
+        console::print("[Test] ensure_user_pages_mapped_as_lock PASSED\n");
+    } else {
+        console::print("[Test] ensure_user_pages_mapped_as_lock FAILED\n");
     }
 }
 

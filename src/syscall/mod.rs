@@ -445,6 +445,12 @@ pub fn user_va_limit_value() -> u64 {
     user_va_limit()
 }
 
+/// Exposed for kernel tests only — see `test_ensure_user_pages_mapped_as_lock`.
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+pub fn ensure_user_pages_mapped_for_test(start: usize, len: usize) -> bool {
+    ensure_user_pages_mapped(start, len)
+}
+
 fn user_va_limit() -> u64 {
     // Allow the full user (TTBR0) address range.
     //
@@ -482,9 +488,28 @@ fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     true
 }
 
+/// Demand-page any lazy user pages covering `[start, start+len)` so a kernel-side
+/// access (`validate_user_ptr`'s callers) can touch them.
+///
+/// **Phase 7f pre-flight**: this helper runs inside BKL-free syscall windows (every
+/// whole-fn net/vfs guard reaches it through `validate_user_ptr`, and the opt-out
+/// list made `getrandom`'s prologue join that class), so the BKL no longer serializes
+/// its PTE installs against a peer core. Each page's PTE install + frame bookkeeping
+/// therefore runs under the address space's `as_lock`, the same fix Phase 7e applied
+/// to the three signal-path PTE sites. Frame allocation and the file fill stay
+/// OUTSIDE that hold: the hold masks IRQs and `as_lock` is a non-reentrant
+/// `Spinlock`, so block I/O must never run under it, and the PMM's pressure path
+/// (`reclaim_clean_file_pages`) re-enters `as_lock` per page.
 fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
     let page_start = start & !0xFFF;
     let page_end = (start + len + 0xFFF) & !0xFFF;
+    // The `as_lock` guarding THIS address space's page tables lives on the
+    // thread-group leader that owns the L0 root — a CLONE_VM sibling gets a fresh
+    // `as_lock` from `fork_process`, so holding the current thread's would exclude
+    // nothing (`process/bkl_guard.rs`'s rule 1). Resolved once for the whole range;
+    // it cannot change under us, this is our own address space.
+    let as_lock_owner = akuma_exec::process::address_space_owner_pid_for_fault()
+        .and_then(akuma_exec::process::lookup_process_shared);
     let mut va = page_start;
     while va < page_end {
         if !akuma_exec::mmu::is_current_user_page_mapped(va) {
@@ -514,23 +539,45 @@ fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
                             }
                         }
                     }
-                    let (table_frames, installed) = unsafe {
-                        akuma_exec::mmu::map_user_page(va, page_frame.addr, map_flags)
-                    };
+                    // Everything above (alloc + file fill) ran with no `as_lock` held.
+                    // The PTE install and the frame bookkeeping must be atomic against
+                    // a peer core's page-table edit on this same page — in particular
+                    // against `reclaim_clean_file_pages`, whose `try_evict_ro_page`
+                    // clears a live RO PTE and only returns the frame if it is already
+                    // tracked. Installing outside the hold lets it observe the
+                    // mapped-but-untracked instant: it clears our PTE, declines to free
+                    // (untracked), and we then track a frame that is no longer mapped —
+                    // a re-fault leak. One hold per page, never spanning the loop.
                     let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-                    if let Some(owner) = akuma_exec::process::lookup_process_shared(owner_pid) {
-                        if installed {
-                            owner.address_space.track_user_frame(page_frame);
-                        } else {
-                            crate::pmm::free_page(page_frame);
+                    let owner = akuma_exec::process::lookup_process_shared(owner_pid);
+                    let install = || {
+                        let (table_frames, installed) = unsafe {
+                            akuma_exec::mmu::map_user_page(va, page_frame.addr, map_flags)
+                        };
+                        if let Some(owner) = owner {
+                            if installed {
+                                owner.address_space.track_user_frame(page_frame);
+                            }
+                            for tf in &table_frames {
+                                owner.address_space.track_page_table_frame(*tf);
+                            }
                         }
-                        for tf in table_frames {
-                            owner.address_space.track_page_table_frame(tf);
-                        }
-                    } else {
-                        if installed {
-                            crate::pmm::free_page(page_frame);
-                        }
+                        (table_frames, installed)
+                    };
+                    let (table_frames, installed) = match as_lock_owner {
+                        Some(leader) => leader.with_as_locked(install),
+                        None => install(),
+                    };
+                    // Frees run after the hold is released. Ownership rule, matching
+                    // `exceptions.rs`'s `ensure_user_page_mapped` sibling: the data
+                    // frame goes back to the PMM iff the PTE CAS race was lost (nothing
+                    // mapped it) or there is no owner to track it. The previous version
+                    // freed it iff `installed && owner.is_none()`, which leaked the
+                    // frame on every lost CAS race with a live owner.
+                    if !installed || owner.is_none() {
+                        crate::pmm::free_page(page_frame);
+                    }
+                    if owner.is_none() {
                         for tf in table_frames { crate::pmm::free_page(tf); }
                     }
                 } else {

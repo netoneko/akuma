@@ -236,6 +236,36 @@ pub fn reset_dropped_windows() -> u32 {
     prior
 }
 
+/// Clear a **foreign, dead** thread slot's dropped-BKL window depth, returning the prior
+/// depth. Ledger-only: unlike [`reset_dropped_windows`] it performs no lock operation,
+/// because there is no invariant to restore — the thread is TERMINATED and will never
+/// resume, so nobody is waiting to be handed a BKL-held execution.
+///
+/// Called from the thread-slot recycler (`threading::reclaim_terminated_slots`) just
+/// before a TERMINATED slot goes FREE. The ledger is indexed by thread id, so without
+/// this the *next* occupant of the slot inherits the dead thread's depth and its EL1
+/// excursions silently run BKL-free until the syscall-entry tripwire heals them. That
+/// heal is a self-repair, not a design: it fires only at the next EL0 entry, and only
+/// [`reset_dropped_windows`]'s counter records that it happened.
+///
+/// A thread can die mid-window whenever a converted syscall parks: the kill path marks
+/// it TERMINATED while it sits in `schedule_blocking`, so its excursion never reaches
+/// the close. Phase 7f tranche 2b found this the moment `nanosleep` — the first
+/// converted syscall that parks a thread for a long time — was listed.
+#[cfg(all(kernel_smp_shared, target_os = "none"))]
+pub fn clear_dropped_windows_for_dead_thread(tid: usize) -> u32 {
+    DROPPED_WINDOWS.reset(tid)
+}
+
+/// Open a window on a FOREIGN tid's ledger entry, without touching the BKL. Exists
+/// only so `test_syscall_bkl_optout` can stage the "thread died mid-window" shape that
+/// [`clear_dropped_windows_for_dead_thread`] exists to clean up, without actually
+/// killing a parked thread. Never call this outside tests.
+#[cfg(all(kernel_smp_shared, target_os = "none"))]
+pub fn dropped_window_open_for_tid_test(tid: usize) {
+    DROPPED_WINDOWS.open(tid);
+}
+
 /// This core's identity (MPIDR aff0). Matches the `mpidr & 0xff` indexing used by the
 /// SMP bringup path and `trigger_sgi_core`. Always `0` on non-SMP builds and on host
 /// tests, so callers (e.g. the scheduler's per-core idle) can use it unconditionally.
@@ -424,6 +454,12 @@ pub fn in_dropped_window() -> bool {
 #[cfg(not(all(kernel_smp_shared, target_os = "none")))]
 #[inline(always)]
 pub fn reset_dropped_windows() -> u32 {
+    0
+}
+
+#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[inline(always)]
+pub fn clear_dropped_windows_for_dead_thread(_tid: usize) -> u32 {
     0
 }
 
