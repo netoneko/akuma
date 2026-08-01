@@ -310,6 +310,32 @@ Each of these was a real bug found during a carve-out, not a hypothetical.
   lock context) is the only reclaimer. See
   [`BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md`](../../archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md).
 
+- **Every caller of a lock must agree on IRQ discipline — a struct with two
+  independent spinlocks doesn't get that for free.** `ProcessChannel` keeps
+  `buffer` and `pollers` as two *separate* `Spinlock`s (unlike `KernelPipe`,
+  which protects both under one lock). Every pre-existing `pollers` access
+  (`add_poller`, the wake loops in `write`/`write_stdin`/`set_exited`,
+  `is_poller_registered`) took it with IRQs *enabled*. Adding
+  `check_set_writer` (exec-channel write backpressure) needed `buffer` and
+  `pollers` locked *together*, under `with_irqs_disabled`, to close its own
+  TOCTOU against a concurrent drain — making it the first caller ever to take
+  `pollers` with IRQs *disabled*. Mixing the two disciplines on the same lock
+  is a live deadlock, not just untidy: if a thread holding `pollers` (IRQs
+  enabled) is preempted by a timer tick, and the preempting thread then spins
+  on `pollers` with IRQs disabled, that spinner can never itself be preempted
+  back off — so the original holder never resumes to release the lock.
+  Permanent freeze, no panic, and the timer tick itself stops firing, so even
+  a periodic debug heartbeat goes silent. Reproduced within seconds of real
+  throughput (a producer child outrunning a 1 KiB-at-a-time reader). Fixed by
+  making *every* access to both locks consistently `with_irqs_disabled`, not
+  by special-casing the new call site. General form: before adding a caller
+  that needs a stricter discipline (masked IRQs, nested locking) than a lock's
+  existing callers use, audit every existing caller — don't assume a "small"
+  new critical section is safe just because it's short.
+  (`test_process_channel_write_bounded_backpressure`;
+  [`EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md`](../../../userspace/sshd/docs/EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md)
+  §7.2.)
+
 ## Syscall → lock map
 
 Ground truth as of 2026-08-01, verified against `src/syscall/{fs,net,mem,proc,fb}.rs`

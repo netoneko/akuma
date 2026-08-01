@@ -915,15 +915,43 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
 
                 if let Some(ch) = akuma_exec::process::current_channel() {
-                    if ch.is_stdin_closed() {
-                        ch.write(buf_slice);
+                    let translated_buf;
+                    let data_to_write: &[u8] = if ch.is_stdin_closed() {
+                        buf_slice
+                    } else if let Some(ts_lock) = akuma_exec::process::current_terminal_state() {
+                        translated_buf = ts_lock.lock().translate_output(buf_slice);
+                        &translated_buf
                     } else {
-                        let term_state_opt = akuma_exec::process::current_terminal_state();
-                        if let Some(ts_lock) = term_state_opt {
-                            let translated = ts_lock.lock().translate_output(buf_slice);
-                            ch.write(&translated);
-                        } else {
-                            ch.write(buf_slice);
+                        buf_slice
+                    };
+
+                    if ch.is_terminal() {
+                        ch.write(data_to_write);
+                    } else {
+                        // Exec-channel (non-PTY) child: real backpressure instead of
+                        // ProcessChannel::write's drop-oldest scrollback semantics — a
+                        // producer that outruns the SSH bridge must block, not silently
+                        // lose the middle of its output (see
+                        // EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md). Write everything
+                        // before returning rather than reporting a short write, since
+                        // `data_to_write` may be a translated (expanded) copy that no
+                        // longer lines up 1:1 with `this_chunk`, the raw byte count
+                        // write(2) needs back — mirrors `pipe_write_all_blocking`.
+                        let mut off = 0usize;
+                        while off < data_to_write.len() {
+                            let n = ch.write_bounded(&data_to_write[off..]);
+                            if n > 0 {
+                                off += n;
+                                continue;
+                            }
+                            if akuma_exec::process::is_current_interrupted() {
+                                if total_written > 0 { return total_written as u64; }
+                                return EINTR;
+                            }
+                            let tid = akuma_exec::threading::current_thread_id();
+                            if !ch.check_set_writer(tid) {
+                                akuma_exec::threading::schedule_blocking(u64::MAX);
+                            }
                         }
                     }
                 }

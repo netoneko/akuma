@@ -41,6 +41,35 @@ grep -a "THR-DUMP\|panic\|FAULT\|deadlock" devbox.log
 (`grep -a` — QEMU/HVF emits a control byte that makes plain `grep` treat the
 log as binary.)
 
+## Trap: ad-hoc debug prints can manufacture a fake wedge
+
+Before trusting a wedge you're seeing *while adding your own
+`safe_print!`/`log::` tracing*, rule this out first — it cost real time on
+`EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md` (2026-08-01), where the first two
+hypotheses chasing a genuine deadlock were both artifacts of the tracing
+itself:
+
+- `console::print`/`safe_print!` → `console::emit` wraps every byte write in
+  its **own** `with_irqs_disabled`. A print call placed inside code that is
+  *already* holding a spinlock (especially one also under IRQs-disabled) adds
+  real work — and its own IRQ-disable/UART-write loop — to a region that was
+  meant to be short. Under heavy call volume (a print per loop iteration in a
+  hot retry/wake path) this can visibly stall progress or overflow the host
+  console pipe, producing the exact symptom of §"When to suspect a deadlock"
+  below (100% CPU, log goes silent) even when the underlying logic is correct.
+- The fix: never print from inside a locked/IRQs-disabled critical section.
+  Print only at call sites where no lock is held (function entry, after a
+  lock guard has dropped) and throttle high-frequency loops (print every
+  Nth iteration, not every one). If a "hang" only reproduces with your own
+  tracing added and disappears when you strip it back out, that's your
+  answer — rebuild clean and re-test before spending more time on the
+  original hypothesis.
+- This does **not** mean tracing is safe to skip entirely — it's how the
+  *real* bug in that investigation was eventually found (once the tracing was
+  placed correctly). It means: add prints minimally, outside locks, and
+  always confirm a suspected hang still reproduces with tracing fully removed
+  before concluding it's real.
+
 ## Step 3: Enable diagnostics for the next boot
 
 Flip these in `src/config.rs` and rebuild (see
@@ -86,6 +115,7 @@ kills; otherwise the disk is as last written.
 | BSP idle busy-yield | ~100% CPU at idle on a clean boot | **FIXED 2026-07-07** (`idle_halt()`) | — |
 | Scheduler/timer freeze under `execve` load | VM unresponsive under heavy execve | **FIXED** (`sgi_scheduler_handler_with_sp` now `POOL.try_lock()`) | — |
 | Single rump client slot wedge | One rump box client blocked holds the slot | **Open** | Avoid concurrent heavy rump box clients. |
+| `ProcessChannel` mixed-IRQ-discipline lock | New lock user (`check_set_writer`) took `pollers` under `with_irqs_disabled`; every pre-existing caller (`add_poller`, wake loops) took it with IRQs enabled — a preempted unprotected holder can never resume once another thread spins on the same lock with IRQs off | **FIXED 2026-08-01** (all `ProcessChannel.pollers`/`.buffer` access now consistently `with_irqs_disabled`) | See `userspace/sshd/docs/EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md` §7.2 |
 
 See `archive/KNOWN_ISSUES.md` for the full history.
 

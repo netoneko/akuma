@@ -100,7 +100,7 @@ impl ProcessChannel {
         // CRITICAL: Disable IRQs while holding the lock!
         with_irqs_disabled(|| {
             let mut buf = self.buffer.lock();
-            
+
             // Check for buffer overflow
             if buf.len() + kernel_copy.len() > MAX_BUFFER_SIZE {
                 // If the write itself is larger than the buffer, truncate it
@@ -109,7 +109,7 @@ impl ProcessChannel {
                 } else {
                     &kernel_copy
                 };
-                
+
                 // Remove old data to make room
                 let current_len = buf.len();
                 let overflow = (current_len + data_to_write.len()).saturating_sub(MAX_BUFFER_SIZE);
@@ -122,24 +122,94 @@ impl ProcessChannel {
             }
         });
 
-        // Wake all pollers waiting for output
-        let mut pollers = self.pollers.lock();
-        while let Some(tid) = pollers.pop_first() {
-            crate::threading::get_waker_for_thread(tid).wake();
+        self.wake_pollers();
+    }
+
+    /// Write as much of `data` as fits under `MAX_BUFFER_SIZE` and return the
+    /// number of bytes accepted (`0` means the buffer is full). Unlike `write`,
+    /// this never drops already-buffered bytes to make room — callers that hit
+    /// `0` must block (see `check_set_writer`) and retry, mirroring
+    /// `pipe_write`'s short-write contract. For exec-channel (non-terminal)
+    /// children, where drop-oldest silently corrupts a byte-faithful stdout
+    /// stream — see `EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md`. Terminal
+    /// channels keep using `write`'s drop-oldest scrollback behaviour.
+    pub fn write_bounded(&self, data: &[u8]) -> usize {
+        if data.is_empty() { return 0; }
+
+        let n = with_irqs_disabled(|| {
+            let mut buf = self.buffer.lock();
+            let available = MAX_BUFFER_SIZE.saturating_sub(buf.len());
+            let n = data.len().min(available);
+            buf.extend(&data[..n]);
+            n
+        });
+
+        if n > 0 {
+            self.wake_pollers();
         }
+        n
+    }
+
+    /// Atomically check whether `write_bounded` has room, and if not, register
+    /// `tid` as a blocked writer so it is woken once a reader drains the
+    /// buffer. Returns `true` if the caller should NOT block. Checking and
+    /// registering happen under the same `buffer` lock so a concurrent drain
+    /// can never land in the gap between "found full" and "registered" and
+    /// leave the writer parked with nobody left to wake it — mirrors
+    /// `pipe_check_set_writer`'s TOCTOU fix.
+    pub fn check_set_writer(&self, tid: usize) -> bool {
+        with_irqs_disabled(|| {
+            let buf = self.buffer.lock();
+            if buf.len() < MAX_BUFFER_SIZE {
+                return true;
+            }
+            self.pollers.lock().insert(tid);
+            false
+        })
+    }
+
+    /// Wake every thread registered in `pollers` (blocked readers waiting for
+    /// data, or blocked writers waiting for space) and clear the set.
+    ///
+    /// Always under `with_irqs_disabled`, like every other `pollers` access
+    /// (`add_poller`, `check_set_writer`, `is_poller_registered`) — `pollers`
+    /// and `buffer` are two independent spinlocks, and `check_set_writer`
+    /// locks both together (nested) to close its TOCTOU window. If any other
+    /// site locked `pollers` with IRQs enabled, a timer tick could preempt it
+    /// mid-hold and switch to a thread spinning on `pollers` with IRQs
+    /// *disabled* (inside `check_set_writer`'s `with_irqs_disabled`): that
+    /// spinner can never be preempted back off, so the original holder never
+    /// resumes to release the lock — a permanent, silent freeze (no panic, no
+    /// log, the timer tick itself stops firing). Reproduced empirically
+    /// 2026-08-01 while adding exec-channel backpressure: `add_poller` was
+    /// unprotected and got hammered by sshd's tight non-blocking read loop
+    /// racing a blocked writer's `check_set_writer` under heavy throughput.
+    fn wake_pollers(&self) {
+        with_irqs_disabled(|| {
+            let mut pollers = self.pollers.lock();
+            while let Some(tid) = pollers.pop_first() {
+                crate::threading::get_waker_for_thread(tid).wake();
+            }
+        });
     }
 
     /// Read available data from the channel (non-blocking)
     /// Returns None if no data is available
     pub fn try_read(&self) -> Option<Vec<u8>> {
-        with_irqs_disabled(|| {
+        let data = with_irqs_disabled(|| {
             let mut buf = self.buffer.lock();
             if buf.is_empty() {
                 None
             } else {
-                Some(buf.drain(..).collect())
+                Some(buf.drain(..).collect::<Vec<u8>>())
             }
-        })
+        });
+
+        if data.is_some() {
+            // Draining frees space for any writer parked in `check_set_writer`.
+            self.wake_pollers();
+        }
+        data
     }
 
     /// Read available data from the channel into a buffer
@@ -160,37 +230,52 @@ impl ProcessChannel {
         if n == 0 {
             // Register current thread as reader so it can be woken by next write
             self.add_poller(crate::threading::current_thread_id());
+        } else {
+            // Draining frees space for any writer parked in `check_set_writer`.
+            self.wake_pollers();
         }
         n
     }
 
     /// Register a thread to be woken when new data arrives or the process exits.
     pub fn add_poller(&self, tid: usize) {
-        self.pollers.lock().insert(tid);
+        with_irqs_disabled(|| {
+            self.pollers.lock().insert(tid);
+        });
     }
 
     /// Check if a thread is registered as a poller (test helper).
     pub fn is_poller_registered(&self, tid: usize) -> bool {
-        self.pollers.lock().contains(&tid)
+        with_irqs_disabled(|| {
+            self.pollers.lock().contains(&tid)
+        })
     }
 
     pub fn has_stdout_data(&self) -> bool {
-        !self.buffer.lock().is_empty()
+        with_irqs_disabled(|| {
+            !self.buffer.lock().is_empty()
+        })
     }
 
     /// Read all remaining data from the channel
     pub fn read_all(&self) -> Vec<u8> {
-        with_irqs_disabled(|| {
+        let data: Vec<u8> = with_irqs_disabled(|| {
             let mut buf = self.buffer.lock();
             buf.drain(..).collect()
-        })
+        });
+
+        if !data.is_empty() {
+            // Draining frees space for any writer parked in `check_set_writer`.
+            self.wake_pollers();
+        }
+        data
     }
 
     /// Write data to stdin buffer (SSH -> process)
     pub fn write_stdin(&self, data: &[u8]) {
         with_irqs_disabled(|| {
             let mut buf = self.stdin_buffer.lock();
-            
+
             // Check for buffer overflow
             if buf.len() + data.len() > MAX_BUFFER_SIZE {
                 let data_to_write = if data.len() > MAX_BUFFER_SIZE {
@@ -198,7 +283,7 @@ impl ProcessChannel {
                 } else {
                     data
                 };
-                
+
                 let current_len = buf.len();
                 let overflow = (current_len + data_to_write.len()).saturating_sub(MAX_BUFFER_SIZE);
                 if overflow > 0 {
@@ -214,10 +299,7 @@ impl ProcessChannel {
         // sshd: write_to_process_stdin fills this buffer, but a process sleeping in
         // ppoll(fd 0) only wakes when a registered poller is notified). Without this
         // the shell never sees typed input. Mirrors the stdout `write` wake path.
-        let mut pollers = self.pollers.lock();
-        while let Some(tid) = pollers.pop_first() {
-            crate::threading::get_waker_for_thread(tid).wake();
-        }
+        self.wake_pollers();
     }
 
     /// Read from stdin buffer (process reads from SSH input)
@@ -258,12 +340,9 @@ impl ProcessChannel {
     pub fn set_exited(&self, code: i32) {
         self.exit_code.store(code, Ordering::Release);
         self.exited.store(true, Ordering::Release);
-        
+
         // Wake all pollers waiting for output (EOF/exit is an event)
-        let mut pollers = self.pollers.lock();
-        while let Some(tid) = pollers.pop_first() {
-            crate::threading::get_waker_for_thread(tid).wake();
-        }
+        self.wake_pollers();
     }
 
     /// Check if the process has exited

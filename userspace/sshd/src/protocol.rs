@@ -135,7 +135,7 @@ async fn run_exec_session(
     arg_refs.push(cmd_str);
     println(&format!("[SSH] Exec: {} {:?}", shell_path, arg_refs));
     if let Some(res) = spawn(&shell_path, Some(&arg_refs)) {
-        return bridge_process(stream, session, res.pid, res.stdout_fd).await;
+        return bridge_process(stream, session, res.pid, res.stdout_fd, false).await;
     }
     fail_spawn(stream, session, &shell_path, "exec").await
 }
@@ -165,7 +165,7 @@ async fn run_shell_session(
         // fresh TerminalState from the pty spawn, so its fd (ChildStdout) is
         // the handle the kernel resolves to that state.
         set_terminal_size(res.stdout_fd as i32, session.term_width as u16, session.term_height as u16);
-        return bridge_process(stream, session, res.pid, res.stdout_fd).await;
+        return bridge_process(stream, session, res.pid, res.stdout_fd, true).await;
     }
     fail_spawn(stream, session, &shell_path, "shell").await
 }
@@ -189,11 +189,32 @@ async fn fail_spawn(
     send_exit_report(stream, session, WaitStatus { pid: 0, raw: (127 << 8) }).await
 }
 
+/// `\n` → `\r\n` for a client PTY, byte-identical passthrough otherwise. A PTY
+/// needs it because the shell's stdout is a pipe, not a terminal, so no line
+/// discipline cooks it for us (mirrors the in-kernel sshd's cooked-mode
+/// output). An exec channel's stdout is a raw byte stream, not terminal
+/// text — translating it corrupts any binary or digest-checked output. See
+/// `EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md` root cause B.
+fn cook_output(data: &[u8], pty: bool) -> Vec<u8> {
+    if !pty {
+        return data.to_vec();
+    }
+    let mut out = Vec::with_capacity(data.len() + 8);
+    for &byte in data {
+        if byte == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(byte);
+    }
+    out
+}
+
 async fn bridge_process(
     stream: &mut SshStream,
     session: &mut SshSession,
     pid: u32,
     stdout_fd: u32,
+    pty: bool,
 ) -> Result<(), NetError> {
     let mut buf = [0u8; 1024];
 
@@ -232,12 +253,17 @@ async fn bridge_process(
     // from a clean success. The only way out of this loop other than the reap is
     // a `?`, and those all mean the client is already gone.
     let status = loop {
-        // 1. Shell exited → drain remaining stdout, then stop.
+        // 1. Shell exited → drain remaining stdout, then stop. Must apply the
+        //    same cook_output() gating as the live loop below — this drain
+        //    used to send raw bytes unconditionally, so which bytes of a PTY
+        //    session's output got \r\n-translated depended on whether the
+        //    bridge happened to read them before or after the child exited.
         if let Some(status) = waitpid_status(pid) {
             loop {
                 let n = read_fd(stdout_fd as i32, &mut buf);
                 if n > 0 {
-                    send_channel_data(stream, session, &buf[..n as usize]).await?;
+                    let out = cook_output(&buf[..n as usize], pty);
+                    send_channel_data(stream, session, &out).await?;
                 } else {
                     break;
                 }
@@ -247,19 +273,10 @@ async fn bridge_process(
 
         let mut did_io = false;
 
-        // 2. Output from process to SSH (non-blocking). Translate bare \n → \r\n
-        //    so a client PTY (`ssh -tt`) renders lines without stair-stepping —
-        //    the shell's stdout is a pipe, not a terminal, so no line discipline
-        //    cooks it for us (mirrors the in-kernel sshd's cooked-mode output).
+        // 2. Output from process to SSH (non-blocking). See cook_output().
         let n = read_fd(stdout_fd as i32, &mut buf);
         if n > 0 {
-            let mut out = Vec::with_capacity(n as usize + 8);
-            for &byte in &buf[..n as usize] {
-                if byte == b'\n' {
-                    out.push(b'\r');
-                }
-                out.push(byte);
-            }
+            let out = cook_output(&buf[..n as usize], pty);
             send_channel_data(stream, session, &out).await?;
             did_io = true;
         }

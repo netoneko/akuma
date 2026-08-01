@@ -337,6 +337,11 @@ pub fn run_all_tests() {
     test_pipe_double_close_no_panic();
     test_pipe_eof_after_data_flush();
 
+    // ProcessChannel exec-channel backpressure (EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md
+    // root cause A): a non-terminal channel must block a writer at MAX_BUFFER_SIZE
+    // instead of silently dropping the oldest buffered bytes, mirroring the pipe fix.
+    test_process_channel_write_bounded_backpressure();
+
     // socketpair (syscall 199) — rustc's linker spawn needs AF_UNIX socketpair
     test_socketpair_not_enosys();
     test_socketpair_domain_rejected();
@@ -7294,6 +7299,62 @@ fn test_pipe_read_wakes_writer_and_write_all_spans_capacity() {
     }
     pipe_close_write(id);
     pipe_close_read(id);
+}
+
+/// `ProcessChannel::write_bounded` for a non-terminal (exec-channel) child must
+/// cap at `MAX_BUFFER_SIZE` without dropping already-buffered bytes, tell a
+/// writer at capacity to block via `check_set_writer`, and wake that writer
+/// when a reader drains the buffer — mirrors
+/// `test_pipe_read_wakes_writer_and_write_all_spans_capacity`. Regression test
+/// for `EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md` root cause A: `ProcessChannel::write`
+/// used to silently drain the oldest unread bytes on overflow instead of
+/// exerting backpressure, corrupting a byte-faithful exec stdout stream.
+fn test_process_channel_write_bounded_backpressure() {
+    use akuma_exec::process::channel::ProcessChannel;
+    const MAX_BUFFER_SIZE: usize = 1024 * 1024;
+
+    let ch = alloc::sync::Arc::new(ProcessChannel::new());
+    ch.set_terminal(false);
+    let tid = akuma_exec::threading::current_thread_id();
+
+    // Fill to the cap in bounded chunks — nothing must be silently dropped.
+    let chunk = alloc::vec![0x41u8; 65536];
+    let mut total = 0usize;
+    loop {
+        let n = ch.write_bounded(&chunk);
+        if n == 0 { break; }
+        total += n;
+    }
+    let filled_to_cap = total == MAX_BUFFER_SIZE;
+
+    // At capacity: further writes accept nothing, and the caller must be told
+    // to block (registered as a poller), not have its data dropped.
+    let extra = ch.write_bounded(b"overflow");
+    let must_block = !ch.check_set_writer(tid);
+    let registered = ch.is_poller_registered(tid);
+
+    // Draining must wake the parked writer and clear its registration.
+    let mut buf = [0u8; 4096];
+    let drained = ch.read(&mut buf);
+    let woken = !ch.is_poller_registered(tid);
+    let writable_again = ch.check_set_writer(tid);
+
+    // Nothing was lost: the rest of the fill is still buffered intact.
+    let remaining = total - drained;
+    let mut sink = alloc::vec![0u8; remaining];
+    let drained2 = ch.read(&mut sink);
+    let nothing_lost = drained2 == remaining;
+
+    if filled_to_cap && extra == 0 && must_block && registered && drained == 4096
+        && woken && writable_again && nothing_lost
+    {
+        console::print("[Test] process_channel_write_bounded_backpressure PASSED\n");
+    } else {
+        crate::safe_print!(256,
+            "[Test] process_channel_write_bounded_backpressure FAILED: filled_to_cap={} extra={} must_block={} registered={} drained={} woken={} writable_again={} nothing_lost={}\n",
+            filled_to_cap, extra, must_block, registered, drained, woken, writable_again, nothing_lost,
+        );
+    }
 }
 
 /// Calling pipe_close_write twice (second call after pipe is DESTROY'd) must
