@@ -1593,14 +1593,54 @@ extern "C" fn thread_exit_stub() -> ! {
 use core::cell::UnsafeCell;
 
 /// Wrapper to make UnsafeCell<Context> Sync
-/// SAFETY: THREAD_CONTEXTS is safe to share because:
-/// 1. Each context is only modified by the scheduler with IRQs masked
-/// 2. A context is only accessed when its thread is not running on any CPU
-/// 3. We're single-CPU, so no concurrent access is possible
+///
+/// SAFETY: THREAD_CONTEXTS\[idx\] is safe to share across cores under `smp-shared`
+/// (real cross-core concurrency, not just IRQ-masked single-core mutual exclusion)
+/// because every access falls into one of three cases, none of which depends on
+/// the BKL:
+///
+/// 1. **Scheduler switch** (`SGI` context save/restore, `ThreadPool::get_context_ptrs`
+///    callers): the outgoing and incoming slots are both touched only while `POOL`
+///    (a real `Spinlock<ThreadPool>`) is held across the *entire* switch — decision,
+///    context save, and context load — per the M5c note at the switch call site.
+///    `POOL` is the actual inner lock here; the scheduler never picks a slot whose
+///    state isn't READY (see `schedule_indices`), so a slot mid-setup is never a
+///    switch target.
+/// 2. **Spawn / reclaim setup**: a slot is only written by the thread that just won
+///    the `FREE -> INITIALIZING` (or `TERMINATED -> INITIALIZING`, see
+///    `reclaim_terminated_slots`) transition via `THREAD_STATES[idx].compare_exchange`
+///    (SeqCst). The CAS gives the winner exclusive ownership of that index — no
+///    other core can also win it — and the scheduler ignores INITIALIZING slots, so
+///    nothing else touches THREAD_CONTEXTS\[idx\] until the owner publishes it.
+///    Publication is `mark_thread_ready`'s plain `Ordering::SeqCst` store: a SeqCst
+///    store is a release, so every write to THREAD_CONTEXTS\[idx\] that precedes it in
+///    the owner's program order is guaranteed visible to any core whose SeqCst load
+///    (the scheduler's `THREAD_STATES[idx].load`) observes READY — this is a real
+///    memory-model guarantee, not something that happens to hold only while the BKL
+///    also serializes everything. (Host test:
+///    `ready_transition_publishes_context_writes_without_a_lock`.)
+/// 3. **Self-read of the live thread** (`get_saved_user_context`/fork's
+///    `get_saved_user_context(current_thread_id())`): a thread reading its own slot
+///    cannot race itself — there is only one execution of "this thread" at a time by
+///    construction.
+///
+/// What this does NOT cover: the debug/stat dump paths (`dump_thread_resume_points`,
+/// `list_kernel_threads`) read arbitrary threads' contexts, including ones RUNNING on
+/// a peer core, with no synchronization at all. That is a deliberate, accepted race —
+/// display-only, single aligned `u64` reads (no torn multi-word reads, no memory
+/// unsafety), tolerant of a stale value. Do not use that pattern for anything that
+/// feeds a correctness decision.
+///
+/// See `docs/archive/BKL_PHASE7D_THREAD_CONTEXTS.md` for the full audit (including
+/// the dead, latently-racy `ThreadPool::spawn`/`spawn_with_stack_size`/
+/// `spawn_system_closure`/`spawn_user_closure` methods removed alongside this fix —
+/// they scanned for FREE slots with a plain load instead of a CAS, which is only
+/// sound because nothing else ever called them).
 #[repr(transparent)]
 struct SyncContext(UnsafeCell<Context>);
 
-// SAFETY: See above - single CPU with IRQs masked during access
+// SAFETY: See the invariant written out above — real cross-core exclusion via
+// `POOL` (case 1) or a `THREAD_STATES` CAS (case 2), not single-core IRQ masking.
 unsafe impl Sync for SyncContext {}
 
 impl SyncContext {
@@ -1614,15 +1654,19 @@ impl SyncContext {
     }
 }
 
-/// Per-thread CPU contexts - accessed without POOL lock
-/// Safety: Access only when IRQs are masked and thread state is valid
+/// Per-thread CPU contexts, kept out of `POOL` so the scheduler can access them
+/// without holding that lock across a context switch.
+/// Safety: see `SyncContext`'s SAFETY comment above — POOL / a THREAD_STATES CAS /
+/// self-read, not IRQ masking alone.
 static THREAD_CONTEXTS: [SyncContext; MAX_THREADS] = {
     const INIT: SyncContext = SyncContext::new();
     [INIT; MAX_THREADS]
 };
 
 /// Get a mutable pointer to a thread's context
-/// SAFETY: Caller must ensure IRQs are masked and thread is not running
+/// SAFETY: caller must be in one of the three cases `SyncContext` documents
+/// (holds `POOL` across the switch, owns the slot's INITIALIZING CAS, or is
+/// reading its own live thread).
 #[inline]
 fn get_context_mut(idx: usize) -> *mut Context {
     THREAD_CONTEXTS[idx].get()
@@ -1864,297 +1908,6 @@ impl ThreadPool {
             (runtime().free_pages_contiguous)(frame, pages);
             self.stacks[slot_idx] = StackInfo::empty();
         }
-    }
-
-    /// Reallocate stack for a slot with new size (only if slot is Free)
-    fn reallocate_stack(&mut self, slot_idx: usize, new_size: usize) -> Result<(), &'static str> {
-        if slot_idx == 0 {
-            return Err("Cannot reallocate boot stack");
-        }
-        if slot_idx >= MAX_THREADS {
-            return Err("Invalid slot index");
-        }
-        if THREAD_STATES[slot_idx].load(Ordering::SeqCst) != thread_state::FREE {
-            return Err("Can only reallocate stack for free slot");
-        }
-
-        // Free old PMM-backed stack
-        self.free_stack_for_slot(slot_idx);
-
-        // Allocate new stack from PMM
-        if !self.allocate_stack_for_slot(slot_idx, new_size) {
-            return Err("Failed to allocate thread stack from PMM");
-        }
-
-        Ok(())
-    }
-
-    /// Spawn a new thread with extern "C" entry function and default stack
-    pub fn spawn(
-        &mut self,
-        entry: extern "C" fn() -> !,
-        cooperative: bool,
-    ) -> Result<usize, &'static str> {
-        self.spawn_with_stack_size(entry, config().default_thread_stack_size, cooperative)
-    }
-
-    /// Spawn a new thread with extern "C" entry function and custom stack size
-    pub fn spawn_with_stack_size(
-        &mut self,
-        entry: extern "C" fn() -> !,
-        stack_size: usize,
-        cooperative: bool,
-    ) -> Result<usize, &'static str> {
-        if !self.initialized {
-            return Err("Thread pool not initialized");
-        }
-
-        // Find first free slot (skip slot 0 = idle)
-        for i in 1..MAX_THREADS {
-            if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE {
-                // Reallocate stack if size differs
-                if self.stacks[i].size != stack_size {
-                    self.reallocate_stack(i, stack_size)?;
-                }
-
-                // Setup the thread
-                let stack = &self.stacks[i];
-                let sp = (stack.top & !0xF) as u64;
-                let entry_addr = entry as *const () as u64;
-
-                // Write context fields to THREAD_CONTEXTS (not in slot)
-                // Get STORED boot TTBR0 (not current, which could be user process's!)
-                let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
-
-                unsafe {
-                    let ctx = &mut *get_context_mut(i);
-                    // Magic value for integrity checking
-                    ctx.magic = CONTEXT_MAGIC;
-                    ctx.x19 = entry_addr;
-                    ctx.x20 = 0;
-                    ctx.x21 = 0;
-                    ctx.x22 = 0;
-                    ctx.x23 = 0;
-                    ctx.x24 = 0;
-                    ctx.x25 = 0;
-                    ctx.x26 = 0;
-                    ctx.x27 = 0;
-                    ctx.x28 = 0;
-                    ctx.x29 = 0;
-                    ctx.x30 = thread_start as *const () as u64;
-                    ctx.sp = sp;
-                    ctx.daif = 0;
-                    // Set ELR to thread entry point - if any code path accidentally ERETs,
-                    // we'll jump to a valid address instead of crashing with ELR=0
-                    ctx.elr = thread_start as *const () as u64;
-                    // SPSR for kernel threads: EL1h (bits[3:0]=5)
-                    ctx.spsr = 0x00000005; // EL1h
-                    ctx.ttbr0 = boot_ttbr0;
-                    // User process fields - 0 for kernel threads
-                    ctx.user_entry = 0;
-                    ctx.user_sp = 0;
-                    ctx.is_user_process = 0;
-                }
-
-                // Write slot metadata
-                self.slots[i].cooperative = cooperative;
-                self.slots[i].start_time_us = 0;
-                self.slots[i].timeout_us = if cooperative {
-                    COOPERATIVE_TIMEOUT_US
-                } else {
-                    0
-                };
-
-                // Set state last (makes thread visible to scheduler)
-                THREAD_STATES[i].store(thread_state::READY, Ordering::SeqCst);
-
-                return Ok(i);
-            }
-        }
-
-        Err("No free thread slots")
-    }
-
-    /// Spawn a thread for system services (SSH sessions, etc.)
-    ///
-    /// Only searches slots 1..RESERVED_THREADS.
-    /// Uses SYSTEM_THREAD_STACK_SIZE (256KB).
-    /// System threads are preemptible (not cooperative).
-    pub fn spawn_system_closure(
-        &mut self,
-        trampoline_fn: fn(*mut ()) -> !,
-        closure_ptr: *mut (),
-    ) -> Result<usize, &'static str> {
-        if !self.initialized {
-            return Err("Thread pool not initialized");
-        }
-
-        // Only search in system thread range (skip thread 0 = boot/async)
-        for i in 1..config().reserved_threads {
-            if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE {
-                // System thread stacks should be pre-allocated at correct size
-                // If not, something corrupted them (bug in spawn_closure_with_stack_size)
-                debug_assert!(
-                    self.stacks[i].size == config().system_thread_stack_size,
-                    "System thread {} has wrong stack size: {} (expected {})",
-                    i, self.stacks[i].size, config().system_thread_stack_size
-                );
-                
-                let stack = &self.stacks[i];
-                // Initial SP is BELOW the exception area (which is at the top)
-                // Exception handlers use [stack_top - EXCEPTION_STACK_SIZE, stack_top]
-                // Kernel code uses [stack_base, stack_top - EXCEPTION_STACK_SIZE]
-                let stack_top = ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64;
-                
-                // Get STORED boot TTBR0 (not current, which could be user process's!)
-                let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
-
-                // Set up fake IRQ frame for stack-based context switching
-                // When the IRQ handler restores from this stack, it will "return" to
-                // thread_start_closure with x19/x20/x21 set up correctly
-                let sp = setup_fake_irq_frame(
-                    stack_top,
-                    thread_start_closure as *const () as u64,  // ELR - where to jump
-                    trampoline_fn as *const () as u64,          // x19 - trampoline
-                    closure_ptr as u64,                         // x20 - closure data
-                    0,                                          // x21 - enable IRQs
-                );
-                
-                // Safe print without heap allocation
-                safe_print!(256, "[spawn_system] tid={} stack_top=0x{:x} irq_frame_sp=0x{:x}\n",
-                    i, stack_top, sp);
-
-                // Write minimal context - only SP and TTBR0 are needed now
-                // All other registers are on the stack in the fake IRQ frame
-                unsafe {
-                    let ctx = &mut *get_context_mut(i);
-                    ctx.magic = CONTEXT_MAGIC;
-                    ctx.sp = sp;
-                    ctx.ttbr0 = boot_ttbr0;
-                    // Legacy fields - kept for compatibility but not used in simple path
-                    ctx.x19 = trampoline_fn as *const () as u64;
-                    ctx.x20 = closure_ptr as u64;
-                    ctx.x21 = 0;
-                    ctx.x30 = thread_start_closure as *const () as u64;
-                    ctx.elr = thread_start_closure as *const () as u64;
-                    ctx.spsr = 0x00000345; // EL1h, IRQs enabled
-                }
-
-                // System threads are preemptible (not cooperative)
-                self.slots[i].cooperative = false;
-                self.slots[i].start_time_us = 0;
-                self.slots[i].timeout_us = 0;
-
-                THREAD_STATES[i].store(thread_state::READY, Ordering::SeqCst);
-
-                return Ok(i);
-            }
-        }
-
-        Err("No free system thread slots")
-    }
-
-    /// Spawn a thread for user processes (only in user thread range)
-    ///
-    /// Only searches slots RESERVED_THREADS..MAX_THREADS.
-    /// Uses USER_THREAD_STACK_SIZE (128KB).
-    pub fn spawn_user_closure(
-        &mut self,
-        trampoline_fn: fn(*mut ()) -> !,
-        closure_ptr: *mut (),
-        cooperative: bool,
-    ) -> Result<usize, &'static str> {
-        if !self.initialized {
-            return Err("Thread pool not initialized");
-        }
-
-        // Only search in user thread range
-        for i in config().reserved_threads..thread_limit() {
-            if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE {
-                // User thread stacks should be pre-allocated at correct size
-                debug_assert!(
-                    self.stacks[i].size == config().user_thread_stack_size,
-                    "User thread {} has wrong stack size: {} (expected {})",
-                    i, self.stacks[i].size, config().user_thread_stack_size
-                );
-                
-                let stack = &self.stacks[i];
-                let stack_top = ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64;
-                
-                // Get STORED boot TTBR0
-                let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
-
-                // Set up fake IRQ frame for stack-based context switching
-                let sp = setup_fake_irq_frame(
-                    stack_top,
-                    thread_start_closure as *const () as u64,  // ELR
-                    trampoline_fn as *const () as u64,          // x19 - trampoline
-                    closure_ptr as u64,                         // x20 - closure data
-                    0,                                          // x21 - enable IRQs
-                );
-                
-                safe_print!(96, "[spawn_user] tid={} stack_top={:#x} irq_sp={:#x}\n",
-                    i, stack_top, sp);
-
-                // Write minimal context
-                unsafe {
-                    let ctx = &mut *get_context_mut(i);
-                    ctx.magic = CONTEXT_MAGIC;
-                    ctx.sp = sp;
-                    ctx.ttbr0 = boot_ttbr0;
-                    // Legacy fields
-                    ctx.x19 = trampoline_fn as *const () as u64;
-                    ctx.x20 = closure_ptr as u64;
-                    ctx.x30 = thread_start_closure as *const () as u64;
-                    ctx.elr = thread_start_closure as *const () as u64;
-                    ctx.spsr = 0x00000345;
-                    ctx.is_user_process = 1; // Mark as user process thread
-                }
-
-                self.slots[i].cooperative = cooperative;
-                self.slots[i].start_time_us = 0;
-                self.slots[i].timeout_us = if cooperative {
-                    COOPERATIVE_TIMEOUT_US
-                } else {
-                    0
-                };
-
-                THREAD_STATES[i].store(thread_state::READY, Ordering::SeqCst);
-
-                return Ok(i);
-            }
-        }
-
-        Err("No free user thread slots")
-    }
-
-    /// Reclaim a terminated thread slot (just mark as Free)
-    pub fn reclaim(&mut self, idx: usize) {
-        if idx > 0 && idx < MAX_THREADS && 
-           THREAD_STATES[idx].load(Ordering::SeqCst) == thread_state::TERMINATED
-        {
-            THREAD_STATES[idx].store(thread_state::FREE, Ordering::SeqCst);
-            // Re-initialize canary for reuse
-            if config().enable_stack_canaries && self.stacks[idx].is_allocated() {
-                init_stack_canary(self.stacks[idx].base);
-            }
-        }
-    }
-
-    /// Clean up all terminated threads
-    pub fn cleanup_terminated(&mut self) -> usize {
-        let mut count = 0;
-        for i in 1..MAX_THREADS {
-            if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::TERMINATED {
-                THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
-                // Re-initialize canary for reuse
-                if config().enable_stack_canaries && self.stacks[i].is_allocated() {
-                    init_stack_canary(self.stacks[i].base);
-                }
-                count += 1;
-            }
-        }
-        count
     }
 
     /// Select next ready thread (round-robin) - LOCK-FREE for state transitions
@@ -2493,39 +2246,6 @@ pub fn init() {
         THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
     }
     set_current_thread_register(0);  // Initialize CPU register for boot thread
-}
-
-/// Spawn a new preemptible thread with extern "C" entry and default stack
-pub fn spawn(entry: extern "C" fn() -> !) -> Result<usize, &'static str> {
-    spawn_with_options(entry, false)
-}
-
-/// Spawn a cooperative thread with extern "C" entry and default stack
-pub fn spawn_cooperative(entry: extern "C" fn() -> !) -> Result<usize, &'static str> {
-    spawn_with_options(entry, true)
-}
-
-/// Spawn with options and default stack (extern "C" entry)
-pub fn spawn_with_options(
-    entry: extern "C" fn() -> !,
-    cooperative: bool,
-) -> Result<usize, &'static str> {
-    with_irqs_disabled(|| {
-        let mut pool = POOL.lock();
-        pool.spawn(entry, cooperative)
-    })
-}
-
-/// Spawn with custom stack size (extern "C" entry)
-pub fn spawn_with_stack_size(
-    entry: extern "C" fn() -> !,
-    stack_size: usize,
-    cooperative: bool,
-) -> Result<usize, &'static str> {
-    with_irqs_disabled(|| {
-        let mut pool = POOL.lock();
-        pool.spawn_with_stack_size(entry, stack_size, cooperative)
-    })
 }
 
 /// Trampoline function that calls a boxed FnOnce closure
@@ -3716,30 +3436,6 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserCo
     })
 }
 
-/// Spawn a user thread with a specific trampoline and data pointer
-/// Used by fork_process to spawn the child thread
-pub fn spawn_user_thread(
-    trampoline_fn: extern "C" fn() -> !,
-    data_ptr: *mut (), // Passed as x0 to trampoline? No, entry_point_trampoline takes no args
-    cooperative: bool
-) -> Result<usize, &'static str> {
-    // We reuse spawn_user_closure but cast our function
-    // entry_point_trampoline doesn't take args, so data_ptr is ignored by it
-    // but spawn_user_closure expects a function taking *mut ()
-    
-    let trampoline_casted = unsafe {
-        core::mem::transmute::<
-            extern "C" fn() -> !,
-            fn(*mut ()) -> !
-        >(trampoline_fn)
-    };
-    
-    with_irqs_disabled(|| {
-        let mut pool = POOL.lock();
-        pool.spawn_user_closure(trampoline_casted, data_ptr, cooperative)
-    })
-}
-
 // ============================================================================
 // Stack Protection Functions
 // ============================================================================
@@ -4066,5 +3762,125 @@ mod pending_kill_tests {
         request_thread_kill(MAX_THREADS + 5);
         assert!(!has_pending_kill(MAX_THREADS + 5));
         assert!(!take_kill_request_via_tid(MAX_THREADS + 5));
+    }
+}
+
+/// Phase 7d: real-concurrency proof for `SyncContext`'s SAFETY comment above
+/// `THREAD_CONTEXTS`. Uses real `std::thread`s (standing in for cores) against the
+/// actual `THREAD_STATES` atomics and `THREAD_CONTEXTS` accessors — not a model — to
+/// check the two claims that comment makes: `claim_free_slot`'s FREE -> INITIALIZING
+/// CAS gives exclusive ownership of a slot's context under contention, and a plain
+/// `Ordering::SeqCst` store is enough to publish a context write to a peer without any
+/// coarse lock. Confined to slots 50..64 (a range no other test in this file touches)
+/// so it can run under `cargo test`'s default parallelism without colliding with
+/// `signal_mask_tests`/`pending_kill_tests`'s fixed tids.
+#[cfg(test)]
+mod thread_contexts_invariant_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    const RANGE_START: usize = 50;
+    const RANGE_END: usize = 64; // exclusive; MAX_THREADS == 64
+
+    #[test]
+    fn claim_free_slot_never_double_claims_under_contention() {
+        const N_THREADS: usize = 8;
+        const ITERS: usize = 500;
+
+        let barrier = Arc::new(Barrier::new(N_THREADS));
+        let mismatches = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for t in 0..N_THREADS {
+            let barrier = Arc::clone(&barrier);
+            let mismatches = Arc::clone(&mismatches);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..ITERS {
+                    let Some(idx) = claim_free_slot(RANGE_START, RANGE_END) else {
+                        // Pool momentarily exhausted by peer threads — fine, retry.
+                        continue;
+                    };
+                    // We just won the CAS: nobody else should be touching this slot's
+                    // context. Stamp it, yield to widen the window for a would-be
+                    // clobberer, then check our stamp is still intact.
+                    let marker = (idx as u64) << 32 | t as u64;
+                    unsafe {
+                        (*get_context_mut(idx)).x19 = marker;
+                    }
+                    thread::yield_now();
+                    let seen = unsafe { (*get_context(idx)).x19 };
+                    if seen != marker {
+                        mismatches.fetch_add(1, Ordering::SeqCst);
+                    }
+                    release_test_thread_slot(idx);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            mismatches.load(Ordering::SeqCst),
+            0,
+            "a THREAD_CONTEXTS write was clobbered by a concurrent claimant of the same \
+             slot — the FREE->INITIALIZING CAS is not actually giving exclusive ownership"
+        );
+    }
+
+    /// The half of the SAFETY comment that isn't about mutual exclusion at all: once a
+    /// writer publishes via `mark_thread_ready` (a plain SeqCst store), is that by
+    /// itself enough for a peer core to see the context write that preceded it? This is
+    /// the concern `BKL_PHASE7_AUDIT.md` §2.2 raised ("relying on the BKL for
+    /// publication ordering") — prove it holds on the atomics alone.
+    #[test]
+    fn ready_transition_publishes_context_writes_without_a_lock() {
+        const ITERS: usize = 2000;
+        const MAX_SPINS: u32 = 20_000_000;
+
+        for iter in 0..ITERS {
+            let Some(idx) = claim_free_slot(RANGE_START, RANGE_END) else {
+                continue;
+            };
+            let marker = (idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | (iter as u64) << 1 | 1;
+            let mismatch = Arc::new(AtomicUsize::new(0));
+
+            let reader = {
+                let mismatch = Arc::clone(&mismatch);
+                thread::spawn(move || {
+                    let mut spins = 0u32;
+                    loop {
+                        if get_thread_state(idx) == thread_state::READY {
+                            let val = unsafe { (*get_context(idx)).x19 };
+                            if val != marker {
+                                mismatch.store(1, Ordering::SeqCst);
+                            }
+                            return;
+                        }
+                        spins += 1;
+                        assert!(spins < MAX_SPINS, "writer never published READY for slot {idx}");
+                        std::hint::spin_loop();
+                    }
+                })
+            };
+
+            unsafe {
+                (*get_context_mut(idx)).x19 = marker;
+            }
+            mark_thread_ready(idx);
+
+            reader.join().unwrap();
+            assert_eq!(
+                mismatch.load(Ordering::SeqCst),
+                0,
+                "reader observed THREAD_STATES==READY before the THREAD_CONTEXTS write \
+                 that happened-before it in the writer's program order — publication is \
+                 not actually safe on the atomics alone"
+            );
+
+            release_test_thread_slot(idx);
+        }
     }
 }

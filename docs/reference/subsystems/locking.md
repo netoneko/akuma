@@ -357,10 +357,13 @@ wrong:
 
 **Still fully BKL-held in `fork_process`:** steps 1–3 (allocation only, nothing
 to relieve) and steps 5–8 — `ProcessInfo` write, `get_saved_user_context` /
-`update_thread_context` (`THREAD_CONTEXTS` is an unlocked `UnsafeCell`),
-`spawn_user_thread_initializing`, `register_process` + `mark_thread_ready` (the
-publication point). Those touch state with no inner lock, where the BKL *is* the
-lock — the original audit's finding there stands. Also still BKL-held: the
+`update_thread_context`, `spawn_user_thread_initializing`, `register_process` +
+`mark_thread_ready` (the publication point). As of Phase 7d, `THREAD_CONTEXTS`
+itself is no longer why this window needs the BKL — it has a real proof
+independent of it (§"`no-bkl-process`'s `THREAD_CONTEXTS`" below). `ProcessInfo`
+and `register_process` still are: they touch the process table, which has no
+inner lock (Phase 7e, unstarted) — the original audit's finding there stands.
+Also still BKL-held: the
 eager-copy (non-CoW) fork branch (unreachable, `COW_FORK_ENABLED = true`) and
 `sys_clone`'s routing layer (`VFORK_WAITERS`, nanosecond-scale). `execve`'s
 `replace_image` destructive window remains the single most dangerous carve-out
@@ -371,6 +374,30 @@ Background: [`BKL_PROCESS_CARVE_OUT.md`](../../archive/BKL_PROCESS_CARVE_OUT.md)
 is what actually landed and why §2.4a's "the parent's page tables have no lock"
 was wrong: the CoW fault handler was already editing those same PTEs BKL-free
 under `as_lock`, so the inner lock existed and fork just wasn't taking it.
+
+#### `no-bkl-process`'s `THREAD_CONTEXTS` (Phase 7d, landed 2026-08-01)
+
+Not a carve-out (no new guard, no runtime toggle) — a correctness proof for a structure
+`fork_process` steps 5–8 write to. `THREAD_CONTEXTS: [SyncContext; MAX_THREADS]`
+(`threading/mod.rs`) used to justify its `unsafe impl Sync` with "we're single-CPU,"
+false under `smp-shared`. Phase 7d classified every live access site into one of three
+cases that hold without the BKL: the scheduler switch (real cross-core `POOL` Spinlock
+held across the whole switch), spawn/reclaim setup (the `THREAD_STATES[idx]`
+`FREE`/`TERMINATED -> INITIALIZING` `compare_exchange` gives exclusive ownership, and
+`mark_thread_ready`'s plain `Ordering::SeqCst` store is — provably, not just
+plausibly — sufficient to publish the write to a peer without any lock), and self-read
+of the live thread's own slot (fork/clone capturing `current_thread_id()`'s context,
+which can't race itself). The audit also found four `ThreadPool` methods
+(`spawn`/`spawn_with_stack_size`/`spawn_system_closure`/`spawn_user_closure`) and two
+more (`reclaim`/`cleanup_terminated`) that used a plain load instead of a CAS and would
+have violated case 2 under real contention — dead code, zero callers anywhere in the
+workspace, deleted rather than fixed. New host tests
+(`threading::thread_contexts_invariant_tests`) hammer the CAS and the publish-without-a-lock
+claim with real `std::thread`s. See
+[`BKL_PHASE7D_THREAD_CONTEXTS.md`](../../archive/BKL_PHASE7D_THREAD_CONTEXTS.md).
+
+This does not touch `ProcessInfo`/`register_process`/the process table itself — that
+remains fully BKL-held (Phase 7e, unstarted; see below).
 
 ### `no-bkl-mm` — `src/syscall/mem.rs`
 
@@ -451,9 +478,8 @@ gave the queue a real `Spinlock` and removed the `critical_section` dependency �
 | structure | where | current guard | measured BKL share |
 |---|---|---|---|
 | process table `&'static mut Process` (300 call sites) | `process/table.rs` (`with_process`, `get_process_ptr`, `for_each_process`, …), `process/children.rs` (`lookup_process`, `current_process`) | `with_irqs_disabled` only; `unregister_process` frees the `Box`. Known since Phase 3 (`BKL_PROCESS_CARVE_OUT.md` §7 "(b)"). `lookup_process`'s "safe because a process can't be freed by its own thread" argument covers self-teardown only — peer cores free *other* PIDs at `process/mod.rs:1116`/`:1209` | underlies `execve`/`clone`/`wait4`/`netpoll_maint` |
-| `THREAD_CONTEXTS` | `threading/mod.rs:1619` | bare `UnsafeCell` + hand-written `unsafe impl Sync`; its SAFETY comment still says "we're single-CPU" | part of `clone` ~10–13% |
 | `replace_image` destructive window | `process/image.rs:29`, `:121` | `LifecycleGuard` = per-thread `disable_preemption()`, **not a lock** | `execve` ~22% |
-| `fork_process` steps 5–8 | `process/mod.rs` | none (`ProcessInfo`, `THREAD_CONTEXTS`, `register_process` publication) | `clone` ~10–13% |
+| `fork_process` steps 5–8 | `process/mod.rs` | none for `ProcessInfo`/`register_process` (process-table row above). `THREAD_CONTEXTS` moved off this list in Phase 7d — see "`no-bkl-process`'s `THREAD_CONTEXTS`" above | `clone` ~10–13% |
 | console UART | `src/console.rs:60` | bare `static UART` | `netpoll_herd` ~1% |
 
 **The process-table row above is not hypothetical — a Phase 7b A/B hit it.** A
@@ -566,6 +592,11 @@ Driving workload: `net4` (concurrent downloads → net + ext2 write), `read4`
   — Phase 7a: `ALARM_QUEUE`'s real `Spinlock`, the `critical_section` removal,
   and the BKL-free timer-IRQ dispatch (`no-bkl-irq`), with the same-binary A/B
   (`irq/sched` 24.7%→10.2%).
+- [`BKL_PHASE7D_THREAD_CONTEXTS.md`](../../archive/BKL_PHASE7D_THREAD_CONTEXTS.md)
+  — Phase 7d: the `THREAD_CONTEXTS` ownership proof (three cases covering every
+  live access site, none needing the BKL), the dead plain-load spawn/reclaim
+  methods it found and deleted, and the real-concurrency host tests that check
+  the CAS exclusivity and publish-without-a-lock claims on actual hardware.
 - [`BKL_FINE_GRAINED_LOCKING_PLAN.md`](../../archive/BKL_FINE_GRAINED_LOCKING_PLAN.md)
   — the overall phased plan. §"Phase 2" has the network carve-out's design
   notes (why a coarse `NETWORK_LOCK` doesn't work, the SIGPIPE self-deadlock,
