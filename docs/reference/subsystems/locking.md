@@ -207,6 +207,48 @@ Each of these was a real bug found during a carve-out, not a hypothetical.
   holding — a same-core self-deadlock that then starves every peer piled up
   on the BKL. (Network Phase 2, `test_sigpipe_terminate_no_deadlock`.)
 
+- **The allocator is a lock re-entrant too: never grow an unbounded buffer
+  inside a lock the OOM path takes.** The same `PIPES` lock had a second,
+  subtler instance of the rule above. `pipe.buffer` was an unbounded
+  `VecDeque` and `pipe_write` extended it while holding `PIPES` with IRQs
+  disabled, so a failing allocation ran `alloc_error_handler` *inline* with
+  `PIPES` still held → `return_to_kernel` → `cleanup_process_fds` →
+  `pipe_close_write` → same non-reentrant lock. Note the pattern: it isn't
+  only *your* code that can re-enter — any allocation inside a locked section
+  is a call into the OOM path, which is allowed to tear down processes. The fix
+  is to bound the buffer (`PIPE_CAPACITY`, 64 KiB, matching Linux) so the
+  allocator is never reached there; growing to ~2 GB also starved the reader
+  outright, since each multi-hundred-MB realloc-and-copy ran with IRQs off and
+  the BKL held. Bounding pipes means writes can now be **short** — see
+  `pipe_write`'s contract and `pipe_write_all_blocking` for framed in-kernel
+  callers, which silently truncated frames until they were audited.
+  (`test_pipe_write_caps_at_capacity`.)
+
+- **Wake blocked writers on the last-reader close, symmetrically with readers
+  on the last-writer close.** Once writers could block (above), the missing
+  mirror image of `pipe_close_write`'s EOF wake became a permanent hang: a
+  writer parked on a full pipe learns the pipe broke only by retrying and
+  seeing `read_count == 0`, so nothing woke it and it never took the EPIPE that
+  raises SIGPIPE. Any state a sleeper can only observe by re-polling needs a
+  wake on *every* transition into it, not just the one you had a sleeper for
+  when you wrote the code.
+  (`test_pipe_close_read_wakes_blocked_writer`.)
+
+- **Release your own resources before notifying anyone who could reap you.**
+  `sys_exit_group` closed its fd table *after* `notify_child_channel_exited`,
+  which wakes the parent's `wait4`; the parent could reap the process on a peer
+  core and `unregister_process` → `mark_thread_terminated` stopped the exiting
+  thread mid-syscall, before it ever released its fds. This survived only by
+  accident for years: the reap freed the `Process` synchronously and
+  `SharedFdTable`'s `Drop` closes the table, so the reaper did it on the
+  victim's behalf. Phase 7e deferred that drop and the accident stopped
+  working — during the boot self-test suite the collector never runs at all, so
+  `head`'s pipe read end was held forever and `yes` slept forever on a full
+  pipe. Don't let releasing your own state depend on winning a race, and treat
+  "a `Drop` somewhere else happens to clean this up" as a latent bug, not a
+  design. (`test_sigpipe_terminate_no_deadlock`; same ordering hazard the
+  `kill_thread_group`-before-notify comment already documents.)
+
 - **Don't hard-terminate a sibling thread mid-EL1.** Marking a sibling
   `TERMINATED` while it's preempted inside a kernel excursion stranded
   whatever spinlock it was holding (a forktest child died holding

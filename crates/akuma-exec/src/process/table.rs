@@ -113,7 +113,6 @@ fn try_claim_free_slot(ptr: *mut Process) -> bool {
 /// window could still be open. See docs/archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md
 /// (Phase 7e, "Free" half) and docs/archive/BKL_PHASE7_AUDIT.md §2.1/§2.1.1.
 pub fn unregister_process(pid: Pid) -> bool {
-    (runtime().print_str)("[DBG7E] unregister_process ENTRY\n");
     for i in 0..MAX_PROCESSES {
         if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
             continue;
@@ -125,7 +124,6 @@ pub fn unregister_process(pid: Pid) -> bool {
         if unsafe { (*ptr).pid } != pid {
             continue;
         }
-        (runtime().print_str)("[DBG7E] unregister_process found slot, CAS-ing\n");
         // Claim the ACTIVE -> RETIRED transition exclusively. Losing this CAS means
         // another thread already retired (or is retiring) this exact slot; the
         // scalar `pid` match above can't tell those apart from us, the CAS can.
@@ -137,9 +135,7 @@ pub fn unregister_process(pid: Pid) -> bool {
         ).is_err() {
             continue;
         }
-        (runtime().print_str)("[DBG7E] unregister_process CAS ok, storing retire time\n");
         RETIRE_TIME[i].store((runtime().uptime_us)(), Ordering::Release);
-        (runtime().print_str)("[DBG7E] unregister_process retire time stored\n");
         // Mark the process's thread as TERMINATED before unregistering.
         // This prevents orphaned threads that stay READY forever after
         // their process is reaped. Without this, kthreads shows "user-process"
@@ -152,15 +148,11 @@ pub fn unregister_process(pid: Pid) -> bool {
         if let Some(tid) = unsafe { (*ptr).thread_id } {
             let current_tid = crate::threading::current_thread_id();
             if tid != current_tid {
-                (runtime().print_str)("[DBG7E] unregister_process calling mark_thread_terminated\n");
                 crate::threading::mark_thread_terminated(tid);
-                (runtime().print_str)("[DBG7E] unregister_process mark_thread_terminated returned\n");
             }
         }
-        (runtime().print_str)("[DBG7E] unregister_process returning true\n");
         return true;
     }
-    (runtime().print_str)("[DBG7E] unregister_process returning false\n");
     false
 }
 
@@ -169,8 +161,9 @@ pub fn unregister_process(pid: Pid) -> bool {
 ///
 /// No caller-identity gate (unlike thread-slot cleanup's "only thread 0" default) —
 /// there is no steady-state collector here that only runs when the system is idle,
-/// so there is nothing to relax. Called periodically from `netpoll_maint` and
-/// on-demand from `register_process` on a full-table miss.
+/// so there is nothing to relax. Called *only* periodically, from `netpoll_maint` —
+/// `register_process` deliberately does not reclaim on a full-table miss; see the
+/// comment there for the self-deadlock that ruled that call site out.
 ///
 /// # Why a time cooldown and not a caller-identity or reference-count gate
 /// Same reasoning as `threading::reclaim_terminated_slots`: the thing that makes

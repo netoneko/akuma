@@ -1314,7 +1314,13 @@ impl PipeIo for KernelPipeIo {
         pipe::pipe_read(id, buf)
     }
     fn write(&mut self, id: u32, buf: &[u8]) -> bool {
-        pipe::pipe_write(id, buf).is_ok()
+        // Write-all, not `pipe_write(..).is_ok()`: pipes are capped at
+        // `PIPE_CAPACITY`, so a plain `pipe_write` can accept only part of the
+        // buffer (or none, returning `Ok(0)`). `is_ok()` reported that as success
+        // and silently dropped the rest of the frame — and the sysproxy peer reads
+        // a frame's declared length back out, so a truncated write desyncs the
+        // transport permanently rather than failing visibly.
+        pipe::pipe_write_all_blocking(id, buf).is_ok()
     }
     fn wait_readable(&mut self, id: u32, deadline_us: u64) {
         // Event-driven block (replaces the old ~1 ms poll). Register this thread as

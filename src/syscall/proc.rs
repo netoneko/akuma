@@ -315,6 +315,28 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         // (docs §7g). Killing the thread group first guarantees every sibling is
         // terminated + woken regardless of when the parent runs.
         akuma_exec::process::kill_thread_group(pid, l0_phys, code);
+        // Close all fds immediately so pipe write-ends are decremented and
+        // epoll pollers (e.g. Go's parent waiting for compile stdout EOF) are
+        // woken now. close_all() is idempotent — cleanup_process_fds() later
+        // will find an empty table and skip any double-close.
+        //
+        // ORDERING IS LOAD-BEARING, for the same reason as kill_thread_group above:
+        // this MUST happen before notify_child_channel_exited(). That notify wakes the
+        // parent's wait4, which can immediately reap this process on the peer core;
+        // `unregister_process` then calls `mark_thread_terminated` on *this* thread, so
+        // a reap that lands mid-syscall stops us dead before we release our own fds.
+        //
+        // That race was survivable only by accident until Phase 7e: the reap used to
+        // free the `Process` synchronously, and `SharedFdTable`'s Drop closes the fd
+        // table, so the reaper released them on our behalf. Phase 7e defers that drop
+        // to `reclaim_retired_processes`, which during the boot self-test suite never
+        // runs at all (it is wired into `netpoll_maint`) — so losing the race meant the
+        // fds were held indefinitely. Concretely, in `yes | head -n 1`: `head`'s pipe
+        // read end was never released, `yes` never saw read_count reach 0, never got
+        // EPIPE/SIGPIPE, and slept forever on a full pipe
+        // (`test_sigpipe_terminate_no_deadlock`). Closing first makes releasing our own
+        // fds independent of who wins the reap race.
+        proc.fds.close_all();
         notify_child_channel_exited(pid, code);
         // If a goroutine thread (tgid != pid) is calling exit_group, the parent's
         // wait4 waits on CHILD_CHANNELS[tgid], not CHILD_CHANNELS[pid].  Notify
@@ -322,11 +344,6 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         if tgid != pid {
             notify_child_channel_exited(tgid, code);
         }
-        // Close all fds immediately so pipe write-ends are decremented and
-        // epoll pollers (e.g. Go's parent waiting for compile stdout EOF) are
-        // woken now. close_all() is idempotent — cleanup_process_fds() later
-        // will find an empty table and skip any double-close.
-        proc.fds.close_all();
         vfork_complete(pid);
 
         // Terminate the calling thread — exit_group() must never return to EL0.

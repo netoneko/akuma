@@ -1041,8 +1041,12 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         }
         off += len;
     }
-    match super::pipe::pipe_write(tx, &buf) {
-        Ok(n) => n as u64,
+    // Write-all: the "one write = one complete frame" invariant above is what keeps the
+    // client's `read_exact(rsp_len)` in sync, and pipes are capped at `PIPE_CAPACITY`, so
+    // a plain `pipe_write` may accept only part of a large reply. Returning that short
+    // count would leave the client waiting on bytes this server already discarded.
+    match super::pipe::pipe_write_all_blocking(tx, &buf) {
+        Ok(()) => total_len as u64,
         Err(e) => (-i64::from(e)) as u64,
     }
 }

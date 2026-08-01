@@ -52,6 +52,13 @@ fn test_sigpipe_terminate_no_deadlock() {
                 }
                 if crate::timer::uptime_us().saturating_sub(start) > 10_000_000 {
                     console::print("  [FAIL] test_sigpipe_terminate_no_deadlock (pipeline did not exit in 10s)\n");
+                    // A timeout here means a thread in the pipeline is *parked*, not slow —
+                    // so dump every live thread's state, pid, current syscall and resume PC.
+                    // Without this the failure is a bare "did not exit" and the next reader
+                    // has to re-instrument the execve/pipe paths from scratch to find out
+                    // which side stopped and where (which is exactly what happened while
+                    // chasing the Phase 7e regression).
+                    akuma_exec::threading::dump_thread_resume_points();
                     return;
                 }
                 akuma_exec::threading::yield_now();
@@ -200,14 +207,6 @@ pub fn run_all_tests() {
     // Test epoll multi poller pipe
     test_epoll_multi_poller_pipe();
 
-    // DBG7E PROBE: flush any RETIRED-but-uncollected zombies accumulated by
-    // ~200 preceding tests before this one runs, to test the theory that
-    // memory pressure from the deferred-reclaim backlog (no periodic collector
-    // runs during the self-test suite) is why this test now hits OOM instead
-    // of getting SIGPIPE'd promptly.
-    let dbg7e_flushed = akuma_exec::process::table::reclaim_retired_processes_force();
-    crate::safe_print!(96, "[DBG7E] pre-sigpipe-test flush reclaimed {} zombies\n", dbg7e_flushed);
-
     // Regression: EPIPE→SIGPIPE inline-terminate must not self-deadlock
     test_sigpipe_terminate_no_deadlock();
 
@@ -329,6 +328,12 @@ pub fn run_all_tests() {
     test_pipe_write_wakes_registered_reader();
     test_pipe_poller_woken_by_write();
     test_pipe_close_write_wakes_poller();
+    // Bounded pipes (PIPE_CAPACITY) + the writer-side wakeups they made necessary.
+    // `close_read_wakes_blocked_writer` is the regression test for the
+    // `test_sigpipe_terminate_no_deadlock` hang.
+    test_pipe_write_caps_at_capacity();
+    test_pipe_close_read_wakes_blocked_writer();
+    test_pipe_read_wakes_writer_and_write_all_spans_capacity();
     test_pipe_double_close_no_panic();
     test_pipe_eof_after_data_flush();
 
@@ -3722,11 +3727,17 @@ fn test_pmm_conserved_across_spawn_exit_reap() {
         }
         // Wait for reap. A cleanly-exiting spawned process becomes a Zombie
         // (exit_group leaves it for wait4); the AS is only freed when the thread
-        // slot is recycled → on_thread_cleanup → unregister_process →
+        // slot is recycled → on_thread_cleanup → unregister_process, and then
+        // `reclaim_retired_processes` actually drops the `Process` →
         // UserAddressSpace::drop. During the synchronous boot-test phase nothing
-        // drives that recycle, so we force it (bypasses the cooldown + main-thread
-        // gate — exactly the production reap path, just on demand). Until
-        // lookup_process(pid) is None the AS frames are still held.
+        // drives either step, so we force both (bypassing the cooldown + main-thread
+        // gate — exactly the production reap path, just on demand).
+        //
+        // Both forces are required since Phase 7e: `unregister_process` only moves the
+        // slot ACTIVE → RETIRED, which already makes `lookup_process(pid)` return None
+        // while the address space is still fully allocated. Driving only the thread
+        // cleanup therefore exits this loop with every page still held, and the test
+        // read that as a ~542-pages-per-cycle PMM leak.
         let t1 = crate::timer::uptime_us();
         while process::lookup_process(pid).is_some() {
             akuma_exec::threading::cleanup_terminated_force();
@@ -3735,6 +3746,7 @@ fn test_pmm_conserved_across_spawn_exit_reap() {
             }
             akuma_exec::threading::yield_now();
         }
+        akuma_exec::process::table::reclaim_retired_processes_force();
         true
     }
 
@@ -3767,6 +3779,9 @@ fn test_pmm_conserved_across_spawn_exit_reap() {
             }
             akuma_exec::threading::yield_now();
         }
+        // Same as the clean path: retire alone frees nothing, so drive the
+        // deferred `Process` drop that actually releases the address space.
+        akuma_exec::process::table::reclaim_retired_processes_force();
         true
     }
 
@@ -6942,6 +6957,150 @@ fn test_pipe_close_write_wakes_poller() {
             before, after,
         );
     }
+    pipe_close_read(id);
+}
+
+/// The mirror image of `test_pipe_close_write_wakes_poller`, and the regression test
+/// for the `test_sigpipe_terminate_no_deadlock` hang: dropping the LAST READER must
+/// wake writers parked on a full pipe.
+///
+/// Once `PIPE_CAPACITY` bounded the buffer, `sys_write` began parking a writer that
+/// finds the pipe full — registered in `pollers`, sleeping on an untimed
+/// `schedule_blocking(u64::MAX)`. Such a writer can only discover the pipe broke by
+/// retrying `pipe_write` and seeing `read_count == 0`, so if the last-reader close
+/// doesn't wake it, it sleeps forever and never takes the EPIPE that should raise
+/// SIGPIPE. `pipe_close_write` had this wake from the start (EOF for blocked readers);
+/// `pipe_close_read` did not, because uncapped pipes never blocked a writer.
+///
+/// That is exactly `busybox yes | busybox head -n 1`: `yes` fills the buffer and parks,
+/// `head` reads its one line and exits, and the close lands while `yes` is asleep.
+fn test_pipe_close_read_wakes_blocked_writer() {
+    use crate::syscall::pipe::*;
+    let id = pipe_create();
+    let tid = akuma_exec::threading::current_thread_id();
+
+    // Fill to capacity so a writer would genuinely have to block.
+    let chunk = [0x5Au8; 4096];
+    let mut filled = 0usize;
+    while filled < PIPE_CAPACITY {
+        match pipe_write(id, &chunk) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => break,
+        }
+    }
+    if filled != PIPE_CAPACITY {
+        crate::safe_print!(96,
+            "[Test] pipe_close_read_wakes_blocked_writer FAILED: filled {} of {}\n",
+            filled, PIPE_CAPACITY,
+        );
+        pipe_close_write(id);
+        pipe_close_read(id);
+        return;
+    }
+
+    // A further write must be refused (not grow the buffer) and must register the
+    // would-be writer as a waiter — the state `sys_write` parks in.
+    let refused = pipe_write(id, b"one byte past the cap");
+    let registered = !pipe_check_set_writer(id, tid) && pipe_is_poller_registered(id, tid);
+
+    // Dropping the last reader must drain the waiter set (i.e. wake the writer).
+    pipe_close_read(id);
+    let woken = !pipe_is_poller_registered(id, tid);
+    // ...and the retry the writer now performs must report the broken pipe.
+    let broken = pipe_write(id, b"after last reader closed").is_err();
+
+    if matches!(refused, Ok(0)) && registered && woken && broken {
+        console::print("[Test] pipe_close_read_wakes_blocked_writer PASSED\n");
+    } else {
+        crate::safe_print!(160,
+            "[Test] pipe_close_read_wakes_blocked_writer FAILED: refused={:?} registered={} woken={} broken={}\n",
+            refused, registered, woken, broken,
+        );
+    }
+    pipe_close_write(id);
+}
+
+/// `pipe_write` must bound the buffer at `PIPE_CAPACITY` and report a SHORT write
+/// rather than absorbing everything.
+///
+/// Unbounded growth is what let `yes` drive the kernel to ~2 GB and then OOM *inside*
+/// `PIPES.lock()`, where `alloc_error_handler` runs inline and re-enters the same
+/// non-reentrant lock via `cleanup_process_fds` → `pipe_close_write`. Keeping the
+/// allocator out of the locked section is the actual fix; see `PIPE_CAPACITY`.
+fn test_pipe_write_caps_at_capacity() {
+    use crate::syscall::pipe::*;
+    let id = pipe_create();
+
+    // One oversized write must be truncated to the capacity, not accepted whole.
+    let big = alloc::vec![0xC3u8; PIPE_CAPACITY + 8192];
+    let first = pipe_write(id, &big);
+    let buffered = pipe_bytes_available(id);
+    // With the buffer full, the next write accepts nothing and does not grow it.
+    let second = pipe_write(id, b"nope");
+    let still = pipe_bytes_available(id);
+    // `pipe_can_write` must report the pipe as not-writable so poll/epoll POLLOUT
+    // doesn't spin a userspace event loop on a full pipe.
+    let cannot_write = !pipe_can_write(id);
+
+    if matches!(first, Ok(n) if n == PIPE_CAPACITY)
+        && buffered == PIPE_CAPACITY
+        && matches!(second, Ok(0))
+        && still == PIPE_CAPACITY
+        && cannot_write
+    {
+        console::print("[Test] pipe_write_caps_at_capacity PASSED\n");
+    } else {
+        crate::safe_print!(192,
+            "[Test] pipe_write_caps_at_capacity FAILED: first={:?} buffered={} second={:?} still={} cannot_write={}\n",
+            first, buffered, second, still, cannot_write,
+        );
+    }
+    pipe_close_write(id);
+    pipe_close_read(id);
+}
+
+/// Draining a full pipe must wake writers waiting for space, and `pipe_write_all_blocking`
+/// must deliver a whole frame across the capacity boundary.
+///
+/// The rump sysproxy encodes a frame length and reads exactly that many bytes back, so a
+/// silently-truncated write desyncs the transport permanently. `KernelPipeIo::write` used
+/// `pipe_write(..).is_ok()`, which counts a full-pipe `Ok(0)` as success.
+fn test_pipe_read_wakes_writer_and_write_all_spans_capacity() {
+    use crate::syscall::pipe::*;
+    let id = pipe_create();
+    let tid = akuma_exec::threading::current_thread_id();
+
+    // Fill, then park a writer.
+    let chunk = [0x77u8; 8192];
+    while matches!(pipe_write(id, &chunk), Ok(n) if n > 0) {}
+    let registered = !pipe_check_set_writer(id, tid) && pipe_is_poller_registered(id, tid);
+
+    // A read that frees space must wake the parked writer.
+    let mut buf = [0u8; 4096];
+    let (drained, _) = pipe_read(id, &mut buf);
+    let woken = !pipe_is_poller_registered(id, tid);
+    // Space is available again, so a writer must no longer be told to block.
+    let writable = pipe_check_set_writer(id, tid) && pipe_can_write(id);
+
+    // `pipe_write_all_blocking` on a pipe with room for only part of the frame:
+    // drain concurrently is impossible single-threaded, so verify the non-blocking
+    // case (frame fits) and that a partial `pipe_write` is followed to completion.
+    let mut sink = alloc::vec![0u8; PIPE_CAPACITY];
+    let _ = pipe_read(id, &mut sink); // empty it
+    let frame = alloc::vec![0x2Bu8; PIPE_CAPACITY];
+    let all_ok = pipe_write_all_blocking(id, &frame).is_ok();
+    let all_buffered = pipe_bytes_available(id) == PIPE_CAPACITY;
+
+    if registered && drained == 4096 && woken && writable && all_ok && all_buffered {
+        console::print("[Test] pipe_read_wakes_writer_and_write_all_spans_capacity PASSED\n");
+    } else {
+        crate::safe_print!(192,
+            "[Test] pipe_read_wakes_writer_and_write_all_spans_capacity FAILED: registered={} drained={} woken={} writable={} all_ok={} all_buffered={}\n",
+            registered, drained, woken, writable, all_ok, all_buffered,
+        );
+    }
+    pipe_close_write(id);
     pipe_close_read(id);
 }
 

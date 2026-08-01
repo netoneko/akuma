@@ -1814,11 +1814,19 @@ pipe_clone_ref(pipe_id, false);
 // Writer thread: writes 1MB in 1KB chunks
 threading::spawn_fn(move || {
     let chunk = [0xAAu8; 1024]; // 1KB chunk
-    for _ in 0..1024 { // 1MB total
-        if pipe_write(pipe_id, &chunk).is_err() {
-            break;
+    'chunks: for _ in 0..1024 { // 1MB total
+        // 1 MB through a 64 KiB pipe: every chunk must be pushed to completion,
+        // yielding to the reader whenever the buffer is full. Counting a short
+        // (or `Ok(0)`) write as a delivered chunk is what made this test miss the
+        // `total_read == 1 MiB` assertion once `PIPE_CAPACITY` bounded the buffer.
+        let mut off = 0usize;
+        while off < chunk.len() {
+            match pipe_write(pipe_id, &chunk[off..]) {
+                Ok(n) => off += n,
+                Err(_) => break 'chunks,
+            }
+            threading::yield_now();
         }
-        threading::yield_now();
     }
     pipe_close_write(pipe_id); // Drop writer ref
     threading::mark_current_terminated();

@@ -153,6 +153,78 @@ anything that runs real `Drop` code (page tables, address spaces, file
 handles, sockets) probably does not, and needs the same audit this section
 just did before trusting the pattern.
 
+## 3b. The second hang: the safety net this phase removed
+
+Removing the on-demand reclaim of §3 did not make the boot verification pass.
+`test_sigpipe_terminate_no_deadlock` still hung, at a different point, for a
+reason that turned out not to live in this phase's code at all — but that this
+phase is nonetheless responsible for exposing.
+
+**Symptom.** `yes`'s writes kept succeeding and the in-kernel pipe buffer grew
+without bound (100 MB → 300 MB → 500 MB → ~1 GB → OOM at ~2 GB) instead of
+`head` draining it. The kernel's OOM handler then called
+`return_to_kernel(-12)` inline and that call never returned
+(`[BKL] stuck: owner=X waiter=Y` forever).
+
+**Two independent pre-existing defects, both in `src/syscall/pipe.rs` and
+`src/syscall/proc.rs`, neither touched by this phase:**
+
+1. *Unbounded pipes.* `pipe.buffer` was an unbounded `VecDeque` extended while
+   holding `PIPES` with IRQs disabled. Each multi-hundred-MB realloc-and-copy is
+   a long window with no preemption, which starved the reader and let the writer
+   grow it further; and the eventual failing allocation ran
+   `alloc_error_handler` *inline with `PIPES` still held* →
+   `cleanup_process_fds` → `pipe_close_write` → the same non-reentrant lock.
+   That is the exact shape of the SIGPIPE-inside-the-lock self-deadlock fixed on
+   2026-07-24 (see the comment in `pipe_write`), rediscovered via the allocator
+   instead of via signal delivery. Fixed by bounding the buffer at
+   `PIPE_CAPACITY` (64 KiB, matching Linux), which keeps the allocator out of
+   the locked section entirely. Bounding it made writes *short*, which then
+   required auditing every `pipe_write` caller — `KernelPipeIo::write` and
+   `sys_sendmsg` were silently dropping frame tails via
+   `pipe_write(..).is_ok()`, now `pipe_write_all_blocking` — and adding the
+   writer-side wake that `pipe_close_read` had never needed before
+   (`locking.md`, "Wake blocked writers on the last-reader close").
+
+2. *`sys_exit_group` released its fds after notifying its reaper.* This is the
+   defect that actually made `head` fail to drain, and the one this phase
+   exposed. `proc.fds.close_all()` ran *after*
+   `notify_child_channel_exited(pid, code)`. That notify wakes the parent's
+   `wait4`; the parent reaps the child on a peer core, and
+   `unregister_process` → `mark_thread_terminated` stops the exiting thread
+   **mid-syscall, before it releases its own fds**. Confirmed directly by
+   tracing: `head` enters `exit_group` with `current_process() == Some`, and no
+   `[pipe] close_read` is ever logged. Fixed by closing the fd table before the
+   notify — the same "ORDERING IS LOAD-BEARING" hazard the adjacent
+   `kill_thread_group`-before-notify comment already documents, one step further
+   down the function.
+
+**Why this phase is what exposed it.** Defect 2 was survivable purely by
+accident for as long as reaping freed the `Process` synchronously: `Process`
+owns an `Arc<SharedFdTable>` whose `Drop` calls `close_all()`, so when the old
+`unregister_process` handed back a `Box<Process>` that the caller dropped, the
+*reaper* released the victim's fds on its behalf. Retiring instead of freeing
+defers that `Drop` to `reclaim_retired_processes` — which, wired into
+`netpoll_maint`, does not run at all during the synchronous boot self-test
+phase. So the lost race stopped being invisible and became a permanent hold:
+`head`'s pipe read end was never released, `read_count` never reached 0, `yes`
+never got EPIPE/SIGPIPE, and it slept forever on a full pipe.
+
+**Lesson, and it generalises past pipes.** Deferring a `Drop` silently
+withdraws every side effect that `Drop` was incidentally providing on someone
+else's behalf. Before deferring one, enumerate what its `Drop` chain actually
+releases (here: an fd table, and through it pipe refcounts, sockets, and child
+channels) and check that each of those has an owner that releases it eagerly.
+"Some `Drop` somewhere happens to clean this up" is a latent bug, not a design
+— and the accident is invisible precisely until something changes the timing.
+
+The same deferral broke one boot self-test's premise outright:
+`test_pmm_conserved_across_spawn_exit_reap` drove `cleanup_terminated_force()`
+and waited for `lookup_process(pid)` to return `None`, which under this phase
+is true at *retire*, while the whole address space is still allocated. It read
+that as a ~542-page-per-cycle PMM leak. Fixed by having the test also force
+`reclaim_retired_processes_force()` — a stale-premise fix, not a real leak.
+
 ## 4. Why a CAS, not just a state store
 
 `unregister_process` claims the `ACTIVE -> RETIRED` transition with
@@ -212,7 +284,33 @@ every one of those query paths from the start.
 
 ## 7. Boot verification
 
-<!-- Filled in after the SMP boot run below completes. -->
+`cargo build --profile release-smp-shared --features devbox-smoltcp`, booted
+`DISK=devbox.img MEMORY=4096 SMP=2`:
+
+- `test_sigpipe_terminate_no_deadlock` **PASSES**, with the pipe trace showing the
+  release that never used to happen: `[pipe] close_read id=11 write_count=1
+  read_count=0` → `yes` takes EPIPE → SIGPIPE terminates it.
+- `test_pmm_conserved_across_spawn_exit_reap` **PASSES** at `clean 4x drift=0p`,
+  `kill 4x drift=0p` once the test drives the deferred reclaim (§3b) — confirming
+  the apparent ~542 pages/cycle was undriven deferral, not a leak.
+- Three new pipe self-tests pass: `test_pipe_write_caps_at_capacity`,
+  `test_pipe_close_read_wakes_blocked_writer`,
+  `test_pipe_read_wakes_writer_and_write_all_spans_capacity`.
+- Suite total 348 PASS / 2 FAIL. Both failures are pre-existing and unrelated to
+  this phase (identical on runs before these fixes): the `PermissionDenied ->
+  EPERM` errno-mapping case, and `stp_xzr_ec15_handler_fires`, which is
+  self-describing environmental (QEMU/HVF raises EC=0x25 rather than EC=0x15).
+- Boot completes to a live userspace: `herd` + `sshd` running, SmolNet active,
+  PMM flat at 898259 free pages across 120s+ of idle. `ssh` in and running
+  `busybox yes | busybox head -n 1` returns exactly one line and terminates —
+  the real-world form of the hang. (`ssh` still exits 255 regardless of command
+  status; that is the separate known "sshd never sends exit-status" issue.)
+
+A `dump_thread_resume_points()` call was added to the test's timeout path. It is
+what identified the root cause here — it showed `yes` blocked in `writev` (sc=66,
+fd 1) against a `head` whose thread was already TERMINATED — and it means a
+future regression reports *where* the pipeline stopped instead of a bare "did not
+exit in 10s".
 
 ## 8. What this unblocks, and what it doesn't
 

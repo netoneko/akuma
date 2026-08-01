@@ -997,22 +997,56 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
             }
             akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
-                match super::pipe::pipe_write(pipe_id, buf_slice) {
-                    Ok(n) => n as u64,
-                    Err(e) => {
-                        crate::safe_print!(128, "[syscall] write: PipeWrite fd={} pipe_id={} EPIPE ({} bytes)\n", fd_num, pipe_id, buf_slice.len());
-                        if total_written > 0 { return total_written as u64; }
-                        return (-i64::from(e)) as u64;
+                // Pipes are capped at `PIPE_CAPACITY`, so a write can now come up short
+                // or accept nothing at all — block and retry like write(2), rather than
+                // reporting a 0-byte "success" that userspace reads as EOF-on-write.
+                let nonblock = super::net::fd_is_nonblock(fd_num as u32);
+                loop {
+                    match super::pipe::pipe_write(pipe_id, buf_slice) {
+                        Ok(0) => {
+                            // Pipe buffer full. If we already wrote data in
+                            // previous chunks, return that rather than blocking.
+                            if total_written > 0 { return total_written as u64; }
+                            if nonblock { return EAGAIN; }
+                            if akuma_exec::process::is_current_interrupted() {
+                                return EINTR;
+                            }
+                            let tid = akuma_exec::threading::current_thread_id();
+                            if !super::pipe::pipe_check_set_writer(pipe_id, tid) {
+                                akuma_exec::threading::schedule_blocking(u64::MAX);
+                            }
+                            // After waking, retry pipe_write
+                        }
+                        Ok(n) => break n as u64,
+                        Err(e) => {
+                            crate::safe_print!(128, "[syscall] write: PipeWrite fd={} pipe_id={} EPIPE ({} bytes)\n", fd_num, pipe_id, buf_slice.len());
+                            if total_written > 0 { return total_written as u64; }
+                            return (-i64::from(e)) as u64;
+                        }
                     }
                 }
             }
             // AF_UNIX socketpair endpoint: write to this endpoint's `tx` pipe.
             akuma_exec::process::FileDescriptor::UnixSocket { tx, .. } => {
-                match super::pipe::pipe_write(tx, buf_slice) {
-                    Ok(n) => n as u64,
-                    Err(e) => {
-                        if total_written > 0 { return total_written as u64; }
-                        return (-i64::from(e)) as u64;
+                let nonblock = super::net::fd_is_nonblock(fd_num as u32);
+                loop {
+                    match super::pipe::pipe_write(tx, buf_slice) {
+                        Ok(0) => {
+                            if total_written > 0 { return total_written as u64; }
+                            if nonblock { return EAGAIN; }
+                            if akuma_exec::process::is_current_interrupted() {
+                                return EINTR;
+                            }
+                            let tid = akuma_exec::threading::current_thread_id();
+                            if !super::pipe::pipe_check_set_writer(tx, tid) {
+                                akuma_exec::threading::schedule_blocking(u64::MAX);
+                            }
+                        }
+                        Ok(n) => break n as u64,
+                        Err(e) => {
+                            if total_written > 0 { return total_written as u64; }
+                            return (-i64::from(e)) as u64;
+                        }
                     }
                 }
             }
