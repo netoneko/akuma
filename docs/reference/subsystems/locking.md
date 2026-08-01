@@ -534,9 +534,14 @@ Driving workload: `net4` (concurrent downloads → net + ext2 write), `read4`
   share, §2 is the load-bearing inventory above, §4 the ticket-accounting bug it
   found and fixed, §5 the 7a–7f decomposition).
 - [`BKL_FINE_GRAINED_LOCKING_PLAN.md`](../../archive/BKL_FINE_GRAINED_LOCKING_PLAN.md)
-  — the overall phased plan; §"Phase 2" has the network carve-out's design
+  — the overall phased plan. §"Phase 2" has the network carve-out's design
   notes (why a coarse `NETWORK_LOCK` doesn't work, the SIGPIPE self-deadlock,
-  the AB-BA nested-IRQ fix).
+  the AB-BA nested-IRQ fix). **§7 is the replanned Phase 7**, and §7.3 is its
+  canonical approach: *don't remove the BKL, invert its default* via a
+  per-syscall opt-in list seeded empty, so it withers into provably-dead code
+  instead of being deleted in one step — note the constraint that
+  `reconcile_for_spsr` and the dropped-window ledger must survive the whole
+  traversal.
 - [`SMP_SHARED.md`](../../archive/SMP_SHARED.md) — full shared-kernel SMP
   progress log (M0–M5).
 - [`smp-shared.md`](smp-shared.md) — current-state milestone status for
