@@ -11,9 +11,13 @@ Prompt C: **7b partially done** (2026-08-01,
 `no-bkl-network` gate; piece 2 (a whole-syscall `PollBklGuard`) was built, found to cause
 an intermittent data-corruption race in a same-binary A/B, and reverted the same
 session — root cause points at the still-unlocked process table, `BKL_PHASE7_AUDIT.md`
-§2.1/§2.1.1). 7c–7f are not started — **do not re-attempt 7b piece 2 before 7e
-(process-table locking) lands**; resume at 7c (re-audit the already-carved residual)
-next.
+§2.1/§2.1.1). **7c done** (2026-08-01,
+[`../archive/BKL_PHASE7C_OPENAT_RESIDUAL.md`](../archive/BKL_PHASE7C_OPENAT_RESIDUAL.md)
+— `sys_openat`'s `VfsBklGuard` moved to open before `resolve_symlinks` instead of after
+it, matching `sys_fchmodat`/`sys_newfstatat`'s existing placement; same-binary A/B:
+`openat` share 13.1%→not in top 12). 7d–7f are not started — **do not re-attempt 7b
+piece 2 before 7e (process-table locking) lands**; resume at 7d (`THREAD_CONTEXTS`
+ownership proof) next.
 
 Two self-contained prompts, in order. **A** establishes a throughput baseline the campaign
 does not currently have; **B** executes Phase 7 against it. B depends on A's output.

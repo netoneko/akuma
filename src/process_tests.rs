@@ -2226,6 +2226,41 @@ fn test_openat() {
         crate::safe_print!(64, "[Test] openat missing FAILED r={} (want ENOENT)\n", r);
     }
 
+    // 8. Real on-disk symlink: openat() must follow it and read the target's
+    //    content. Exercises `resolve_symlinks` -> `read_symlink` -> `with_fs`, a
+    //    real ext2 lookup, now running INSIDE the dropped-BKL window (Phase 7c,
+    //    docs/archive/BKL_PHASE7C_OPENAT_RESIDUAL.md moved the guard to open
+    //    before `resolve_symlinks` instead of after it) — the guard must stay
+    //    balanced across it.
+    let target_path = format!("{ROOT}/target.txt");
+    let link_path = format!("{ROOT}/link.txt");
+    let payload: &[u8] = b"symlink-payload";
+    let _ = crate::fs::write_file(&target_path, payload);
+    let symlink_created = crate::vfs::create_symlink(&link_path, &target_path).is_ok();
+    if !symlink_created {
+        fails += 1;
+        crate::safe_print!(96, "[Test] openat symlink FAILED to create fixture\n");
+    } else {
+        let p = cstr(&link_path);
+        let r = openat(AT_FDCWD, &p, open_flags::O_RDONLY, 0);
+        if (r as i64) < 0 {
+            fails += 1;
+            crate::safe_print!(96, "[Test] openat symlink FAILED to open r={}\n", r);
+        } else {
+            let mut rbuf = [0u8; 32];
+            let rret = handle_syscall(nr::READ, &[r, rbuf.as_mut_ptr() as u64, rbuf.len() as u64, 0, 0, 0]);
+            if rret != payload.len() as u64 || &rbuf[..rret as usize] != payload {
+                fails += 1;
+                crate::safe_print!(96, "[Test] openat symlink FAILED content rret={}\n", rret);
+            }
+            close(r);
+        }
+        if akuma_exec::bkl::in_dropped_window() {
+            fails += 1;
+            crate::safe_print!(96, "[Test] openat symlink: guard left the window open\n");
+        }
+    }
+
     BYPASS_VALIDATION.store(false, Ordering::Release);
     unregister_process(pid);
     unregister_thread_pid(tid);
@@ -2235,14 +2270,16 @@ fn test_openat() {
     let _ = crate::fs::remove_file(&format!("{ROOT}/trunc.txt"));
     let _ = crate::fs::remove_file(&format!("{ROOT}/sub/rel.txt"));
     let _ = crate::fs::remove_file(&format!("{ROOT}/cwd.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/link.txt"));
+    let _ = crate::fs::remove_file(&format!("{ROOT}/target.txt"));
     let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
     let _ = crate::fs::remove_dir(ROOT);
 
     if fails == 0 {
-        crate::safe_print!(128, "[Test] openat PASSED (7 cases: O_CREAT/O_TRUNC/dirfd/cwd-rel/dev-null/EBADF/ENOENT)\n");
+        crate::safe_print!(128, "[Test] openat PASSED (8 cases: O_CREAT/O_TRUNC/dirfd/cwd-rel/dev-null/EBADF/ENOENT/symlink)\n");
     } else {
-        crate::safe_print!(64, "[Test] openat FAILED ({} of 7 cases)\n", fails);
-        panic!("test_openat: {fails} of 7 cases failed");
+        crate::safe_print!(64, "[Test] openat FAILED ({} of 8 cases)\n", fails);
+        panic!("test_openat: {fails} of 8 cases failed");
     }
 }
 

@@ -1305,6 +1305,23 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         }
     };
 
+    // Phase 7c (docs/archive/BKL_PHASE7C_OPENAT_RESIDUAL.md): opened HERE, before
+    // `resolve_symlinks`, not after it. `resolve_symlinks` calls `read_symlink` ->
+    // `with_fs`, a real on-disk ext2 lookup for any path that names a symlink — the
+    // exact same class of I/O `sys_fchmodat` (fs.rs, `VfsBklGuard` before its own
+    // `resolve_symlinks` call) and `sys_newfstatat` (guard before its conditional
+    // `resolve_symlinks`) already run BKL-free. Moving the guard here brings `openat`
+    // in line with those two and removes the prologue's ext2 work from the BKL-held
+    // measurement window the audit flagged (`BKL_PHASE7_AUDIT.md` §5, 7c: "10.5% for
+    // a converted syscall's prologue/epilogue is high enough that either the window
+    // starts too late or the re-acquire costs more than expected"). The `#[cfg(kernel_smp)]`
+    // multikernel forward arm below still reads as "must keep the BKL" in the source,
+    // but that comment describes a build where this guard is compiled to a no-op:
+    // `kernel_smp` (multikernel) and `kernel_smp_shared`+`kernel_no_bkl_vfs` (this
+    // guard's only live cfg) are mutually exclusive (`build.rs`'s
+    // `smp`/`smp-shared` assertion), so the two code paths never coexist in one binary.
+    let _vfs_bkl = VfsBklGuard::new();
+
     let path = crate::vfs::resolve_symlinks(&path);
 
     if path == "/dev/null" {
@@ -1430,17 +1447,10 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
     // From here on is the on-disk open work — existence probes, O_CREAT create /
     // O_TRUNC truncate (both `write_file`; truncating a large file frees its blocks
     // under the ext2 write guard, the same long hold §7.2 measured at ~40 s for an
-    // unlink), and `chmod`. Run it BKL-free, exactly like `sys_newfstatat` below:
-    // the window opens AFTER the cross-core forward arm, which marshals through the
-    // BKL-protected bounce and must keep the lock (carve-out doc §4). `openat`
-    // (syscall 56) surfaced as 36.6% of all cross-core BKL wait once §12 converted
-    // `unlinkat` — docs/archive/BKL_VFS_CARVE_OUT.md §12.2 — making it Phase 2b's
-    // first target. `/dev/*` fast paths above and `resolve_symlinks` earlier return
-    // / run outside the window: they do no ext2 I/O (or, for symlink resolution on
-    // simple absolute paths, none worth unserializing), so they keep the BKL like
-    // the non-`File` arms in `sys_read`.
-    let _vfs_bkl = VfsBklGuard::new();
-
+    // unlink), and `chmod`. Already BKL-free: the guard opened above, before
+    // `resolve_symlinks` (Phase 7c). `openat` (syscall 56) surfaced as 36.6% of all
+    // cross-core BKL wait once §12 converted `unlinkat` —
+    // docs/archive/BKL_VFS_CARVE_OUT.md §12.2 — making it Phase 2b's first target.
     if !crate::fs::exists(&path) {
         let is_creat = flags & akuma_exec::process::open_flags::O_CREAT != 0;
         if !is_creat {

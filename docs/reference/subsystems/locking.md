@@ -257,7 +257,7 @@ than a few months old; grep the guard names below to check it hasn't drifted.
 | `sys_newfstatat` (`fs.rs:1716`) | after `#[cfg(kernel_smp)]` cross-core forward arm | ext2 `read_state` (`is_symlink`, `read_symlink`, `metadata`) |
 | `sys_statx` (`fs.rs:1964`) | after path resolution | ext2 `read_state` (`is_symlink`, `metadata`) |
 | `sys_getdents64` (`fs.rs:2448`) | after `File`-kind match | ext2 `read_state` (`read_dir`, `ext2.rs:1825`) |
-| `sys_openat` (`fs.rs:1381`) | after cross-core forward arm + all `/dev/*`/`/proc/self/exe` fast paths | ext2 `read_state` (`exists`/`lookup_path`), then `write_state` for `O_CREAT`/`O_TRUNC` (`write_file`, `ext2.rs:1869`) + `chmod` |
+| `sys_openat` (`fs.rs:1323`) | before `resolve_symlinks`, i.e. before the `/dev/*`/`/proc/self/exe` fast paths and the (never-co-compiled, see Phase 7c) cross-core forward arm | ext2 `read_state` (`resolve_symlinks`'s `read_symlink`, `exists`/`lookup_path`), then `write_state` for `O_CREAT`/`O_TRUNC` (`write_file`, `ext2.rs:1869`) + `chmod` |
 | `sys_mkdirat` (`fs.rs:2214`) | after dirfd/base-path resolution | ext2 `write_state` (`create_dir`, `ext2.rs:2045`) |
 | `sys_fchmodat` (`fs.rs:1845`) | after dirfd/base-path resolution | ext2 `read_state` (`resolve_symlinks`) then `write_state` (`chmod`, `ext2.rs:2286`) |
 | `sys_unlinkat` (`fs.rs:2268`) | after dirfd/base-path resolution | ext2 `write_state` (`remove_file` `ext2.rs:2126`, `remove_dir` `ext2.rs:2162`) — the multi-second-hold case (§ archive doc §7.2) |
