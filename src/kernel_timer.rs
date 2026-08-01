@@ -10,13 +10,11 @@
 //! which uses the physical timer (CNTP) for preemptive scheduling.
 
 use core::arch::asm;
-use core::cell::RefCell;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use critical_section::Mutex;
+use spinning_top::Spinlock;
 
 // ============================================================================
 // Duration
@@ -120,58 +118,57 @@ impl ScheduledWake {
     }
 }
 
-struct AlarmQueue {
-    queue: Mutex<RefCell<[ScheduledWake; QUEUE_SIZE]>>,
-}
-
-impl AlarmQueue {
-    const fn new() -> Self {
-        const EMPTY: ScheduledWake = ScheduledWake::empty();
-        Self {
-            queue: Mutex::new(RefCell::new([EMPTY; QUEUE_SIZE])),
-        }
-    }
-}
-
-static ALARM_QUEUE: AlarmQueue = AlarmQueue::new();
+/// A real cross-core lock, replacing the old `critical_section::Mutex<RefCell<..>>`
+/// (BKL Phase 7a). The `critical_section` crate's own `Impl` for this kernel was a
+/// process-global nesting counter (`CS_NESTING`/`CS_SAVED_DAIF`) that gave no
+/// cross-core exclusion at all — under `smp-shared`, core A's `acquire` and core B's
+/// `release` shared the same counter, so a concurrent pair could restore DAIF while a
+/// critical section was still open elsewhere. The BKL hid that by serializing all of
+/// EL1; giving the queue its own `Spinlock` removes the dependency on it.
+static ALARM_QUEUE: Spinlock<[ScheduledWake; QUEUE_SIZE]> = Spinlock::new({
+    const EMPTY: ScheduledWake = ScheduledWake::empty();
+    [EMPTY; QUEUE_SIZE]
+});
 
 /// Schedule a waker to fire at a given deadline (in microseconds)
 pub fn schedule_wake(at_us: u64, waker: &Waker) {
-    critical_section::with(|cs| {
-        let mut queue = ALARM_QUEUE.queue.borrow(cs).borrow_mut();
+    // Callers run in ordinary EL1 code with IRQs enabled, so mask them for the hold —
+    // otherwise the timer IRQ firing on this same core while we hold the lock would
+    // have `on_timer_interrupt` spin forever on a `Spinlock` this core already owns.
+    let _irq_guard = crate::irq::IrqGuard::new();
+    let mut queue = ALARM_QUEUE.lock();
 
-        // Find a slot - prefer empty slots or replace matching waker
-        let mut found_slot = None;
-        let mut earliest_idx = 0;
-        let mut earliest_time = u64::MAX;
+    // Find a slot - prefer empty slots or replace matching waker
+    let mut found_slot = None;
+    let mut earliest_idx = 0;
+    let mut earliest_time = u64::MAX;
 
-        for (i, entry) in queue.iter_mut().enumerate() {
-            if entry.waker.is_none() {
-                found_slot = Some(i);
-                break;
-            }
-
-            // Same waker -- update in place
-            if entry.waker.as_ref().is_some_and(|w| w.will_wake(waker)) {
-                entry.at = at_us;
-                update_hardware_timer(&queue);
-                return;
-            }
-
-            if entry.at < earliest_time {
-                earliest_time = entry.at;
-                earliest_idx = i;
-            }
+    for (i, entry) in queue.iter_mut().enumerate() {
+        if entry.waker.is_none() {
+            found_slot = Some(i);
+            break;
         }
 
-        let slot = found_slot.unwrap_or(earliest_idx);
-        queue[slot] = ScheduledWake {
-            at: at_us,
-            waker: Some(waker.clone()),
-        };
+        // Same waker -- update in place
+        if entry.waker.as_ref().is_some_and(|w| w.will_wake(waker)) {
+            entry.at = at_us;
+            update_hardware_timer(&queue);
+            return;
+        }
 
-        update_hardware_timer(&queue);
-    });
+        if entry.at < earliest_time {
+            earliest_time = entry.at;
+            earliest_idx = i;
+        }
+    }
+
+    let slot = found_slot.unwrap_or(earliest_idx);
+    queue[slot] = ScheduledWake {
+        at: at_us,
+        waker: Some(waker.clone()),
+    };
+
+    update_hardware_timer(&queue);
 }
 
 /// Alarm servicing is driven by the periodic preemption tick, which owns the
@@ -186,15 +183,17 @@ fn update_hardware_timer(_queue: &[ScheduledWake; QUEUE_SIZE]) {}
 
 /// Check and fire expired alarms. Call from IRQ 27 handler.
 ///
-/// Wakers are collected inside the critical section but woken OUTSIDE
-/// to avoid deadlocks or increased interrupt latency.
+/// Wakers are collected while the queue lock is held but woken OUTSIDE it, to avoid
+/// deadlocks or increased interrupt latency. No `IrqGuard` needed here: this runs from
+/// IRQ context, where the CPU has already masked IRQs on this core since exception
+/// entry (BKL Phase 7a — this queue no longer needs the BKL to be safe cross-core).
 pub fn on_timer_interrupt() {
     let now = now_us();
 
     let mut wakers_to_wake: [Option<Waker>; QUEUE_SIZE] = Default::default();
 
-    critical_section::with(|cs| {
-        let mut queue = ALARM_QUEUE.queue.borrow(cs).borrow_mut();
+    {
+        let mut queue = ALARM_QUEUE.lock();
 
         for (i, entry) in queue.iter_mut().enumerate() {
             if entry.waker.is_some() && entry.at <= now {
@@ -204,7 +203,7 @@ pub fn on_timer_interrupt() {
         }
 
         update_hardware_timer(&queue);
-    });
+    }
 
     let mut any_woken = false;
     for waker in wakers_to_wake.into_iter().flatten() {
@@ -306,49 +305,3 @@ impl Future for Timer {
     }
 }
 
-// ============================================================================
-// critical-section implementation for bare-metal aarch64
-// ============================================================================
-
-// Nesting counter approach -- disables IRQs via DAIF and tracks depth.
-// This is necessary because the trait's RawRestoreState is fixed to () in this version.
-
-static CS_NESTING: AtomicU8 = AtomicU8::new(0);
-static CS_SAVED_DAIF: AtomicU64 = AtomicU64::new(0);
-
-struct CriticalSection;
-
-critical_section::set_impl!(CriticalSection);
-
-unsafe impl critical_section::Impl for CriticalSection {
-    unsafe fn acquire() -> critical_section::RawRestoreState {
-        // Read current DAIF and disable IRQs atomically
-        let daif: u64;
-        unsafe {
-            asm!(
-                "mrs {0}, daif",
-                "msr daifset, #2",
-                "isb",
-                out(reg) daif,
-                options(nomem, nostack)
-            );
-        }
-
-        // Only save the FIRST daif state (the one we'll eventually restore)
-        let nesting = CS_NESTING.fetch_add(1, Ordering::SeqCst);
-        if nesting == 0 {
-            CS_SAVED_DAIF.store(daif, Ordering::SeqCst);
-        }
-    }
-
-    unsafe fn release(_restore_state: critical_section::RawRestoreState) {
-        let nesting = CS_NESTING.fetch_sub(1, Ordering::SeqCst);
-        if nesting == 1 {
-            // Restore the saved DAIF on the final release
-            let daif = CS_SAVED_DAIF.load(Ordering::SeqCst);
-            unsafe {
-                asm!("msr daif, {}", in(reg) daif, options(nomem, nostack));
-            }
-        }
-    }
-}

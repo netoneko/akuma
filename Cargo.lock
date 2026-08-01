@@ -54,7 +54,6 @@ dependencies = [
  "akuma-terminal",
  "akuma-vfs",
  "arm_pl031",
- "critical-section",
  "ed25519-dalek",
  "embedded-io-async",
  "fdt",

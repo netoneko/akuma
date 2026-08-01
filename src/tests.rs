@@ -96,10 +96,12 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_with_irqs_disabled_nesting, "with_irqs_disabled_nesting");
     run_test!(test_map_user_page_preserves_irq_state, "map_user_page_preserves_irq_state");
 
-    // Timer and critical-section invariants (regression tests for go-build hang investigation)
+    // Timer invariant (regression test for go-build hang investigation). The
+    // critical_section-based DAIF-preservation tests that used to live here were removed
+    // when BKL Phase 7a dropped the `critical_section` crate from kernel_timer.rs in favor
+    // of `IrqGuard` + a real `Spinlock` — `test_irqguard_nesting_preserves_state` and
+    // `test_with_irqs_disabled_nesting` above already cover the same DAIF-nesting invariant.
     run_test!(test_timer_interval_no_overflow,      "timer_interval_no_overflow");
-    run_test!(test_critical_section_daif_preserved, "critical_section_daif_preserved");
-    run_test!(test_critical_section_nesting,        "critical_section_nesting");
     run_test!(test_thread_pool_stats_sane,          "thread_pool_stats_sane");
     run_test!(test_siginfo_fields_set,              "siginfo_fields_set");
     run_test!(test_reentrant_signal_repend,         "reentrant_signal_repend");
@@ -8257,69 +8259,6 @@ fn test_timer_interval_no_overflow() -> bool {
             return false;
         }
         crate::safe_print!(96, "  freq={} ticks={} ok\n", freq, ticks);
-    }
-    console::print("  PASS\n");
-    true
-}
-
-/// Test: `critical_section::with` (kernel_timer.rs implementation) restores DAIF correctly:
-/// (a) IRQs enabled before → re-enabled after; (b) IRQs disabled before → stay disabled after.
-fn test_critical_section_daif_preserved() -> bool {
-    console::print("\n[TEST] critical_section DAIF preserved\n");
-
-    fn irqs_enabled() -> bool {
-        let daif: u64;
-        unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)); }
-        (daif >> 7) & 1 == 0 // I-bit clear = IRQs enabled
-    }
-
-    // Case A: IRQs enabled before → must be re-enabled after
-    let before_a = irqs_enabled();
-    critical_section::with(|_| {});
-    let after_a = irqs_enabled();
-    if !before_a || !after_a {
-        crate::safe_print!(96, "  FAIL (A): before={} after={}\n", before_a, after_a);
-        return false;
-    }
-
-    // Case B: IRQs disabled before → must stay disabled after
-    unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
-    critical_section::with(|_| {});
-    let after_b = irqs_enabled();
-    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); }
-    if after_b {
-        console::print("  FAIL (B): IRQs were re-enabled but should have stayed disabled\n");
-        return false;
-    }
-
-    console::print("  PASS\n");
-    true
-}
-
-/// Test: nested `critical_section::with` calls restore DAIF correctly at the outermost exit.
-fn test_critical_section_nesting() -> bool {
-    console::print("\n[TEST] critical_section nesting DAIF restore\n");
-
-    fn irqs_enabled() -> bool {
-        let daif: u64;
-        unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)); }
-        (daif >> 7) & 1 == 0
-    }
-
-    let before = irqs_enabled();
-    critical_section::with(|_| {
-        critical_section::with(|_| {
-            critical_section::with(|_| {
-                critical_section::with(|_| {
-                    // deepest nesting — IRQs must be masked here
-                });
-            });
-        });
-    });
-    let after = irqs_enabled();
-    if !before || !after {
-        crate::safe_print!(96, "  FAIL: before={} after={}\n", before, after);
-        return false;
     }
     console::print("  PASS\n");
     true

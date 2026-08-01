@@ -1,5 +1,13 @@
 # BKL Phase 7: work plan and agent prompts
 
+**Status**: Prompt A done (2026-08-01, `docs/archive/BKL_RUSTC_SCALING_BASELINE.md`).
+Prompt B: **7a done** (2026-08-01,
+[`../archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md`](../archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md)
+— `ALARM_QUEUE`'s real `Spinlock`, `critical_section` removed, timer-IRQ dispatch
+BKL-free behind `no-bkl-irq`; same-binary A/B: `irq/sched` 24.7%→10.2%). Per this
+doc's own instruction ("start at 7a and stop there for review"), 7b–7f are not
+started — resume at 7b (`ppoll`/`epoll_*` carve) next.
+
 Two self-contained prompts, in order. **A** establishes a throughput baseline the campaign
 does not currently have; **B** executes Phase 7 against it. B depends on A's output.
 

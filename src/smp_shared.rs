@@ -191,6 +191,41 @@ pub fn set_drivers_bkl_drop_enabled(on: bool) {
     DRIVERS_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
 }
 
+/// Runtime toggle (default **on**) for `no-bkl-irq` (Phase 7a of
+/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md §7) — dispatch the timer IRQ (27) in
+/// `rust_irq_handler_with_sp` without acquiring the BKL at all, relying on the alarm
+/// queue's own `Spinlock` (`kernel_timer::ALARM_QUEUE`) and the lock-free preemption
+/// watchdog / GIC MMIO the handler otherwise touches. Unlike `VfsBklGuard` and friends
+/// this is not a dropped-BKL "window" latched per-call — there is no `enter_kernel` to
+/// balance on this path in the first place — so the read happens once, directly in
+/// `rust_irq_handler_with_sp`, with no latch-at-construction discipline needed.
+///
+/// Unlike `no-bkl-mm`/`no-bkl-drivers`, `no-bkl-irq` is not (yet) in the default
+/// `smp-shared` feature bundle, so a plain `smp-shared` build never reaches the call
+/// site in `rust_irq_handler_with_sp` that reads this — hence `allow(dead_code)` here,
+/// matching `set_sched_bklfree_el0_enabled`'s same situation above.
+///
+/// A/B'd 2026-08-01 on the SMP=4 contention regimen (source-toggled, byte-identical
+/// feature set): `irq/sched` 24.7% (off, matches the pre-Phase-7a ~23.5% baseline) →
+/// 10.2% (on), 6/6 digests exact both sides, 0 stuck/RECOVERED/PANIC/WILD/SPURIOUS —
+/// see docs/archive/BKL_PHASE7_AUDIT.md §7a.
+#[allow(dead_code)]
+static IRQ_BKL_DROP_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Whether the timer-IRQ BKL-drop (`no-bkl-irq`) is currently enabled.
+#[inline]
+#[allow(dead_code)]
+pub fn irq_bkl_drop_enabled() -> bool {
+    IRQ_BKL_DROP_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Enable/disable the timer-IRQ BKL-drop at runtime. Used by A/B measurement; also
+/// serves as a runtime kill-switch, same as the other phases.
+#[allow(dead_code)]
+pub fn set_irq_bkl_drop_enabled(on: bool) {
+    IRQ_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
+}
+
 /// Runtime toggle (default **off**) for the M5c optimization: run the scheduler SGI
 /// BKL-free when it preempted EL0 (userspace, no BKL held), so peer cores' timer ticks
 /// don't serialize on the BKL. Correct at SMP=2. Left **off** because at SMP≥4 it opens a

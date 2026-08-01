@@ -667,6 +667,12 @@ pub fn run_all_tests() {
     // real guarded path, plus the runtime kill switch.
     test_drivers_bkl_drop();
 
+    // `no-bkl-irq` (Phase 7a): the timer IRQ (27) dispatch no longer needs the BKL at
+    // all — pins that this core's BKL hold state is unchanged across real timer ticks,
+    // plus the runtime kill switch.
+    #[cfg(kernel_smp_shared)]
+    test_timer_irq_preserves_bkl_state();
+
     // Phantom-SVC tripwire: runs LAST so it covers every EL0 trap the suite above
     // generated (fork/exec/signal/mmap stress). A nonzero count means an EC_SVC64
     // trap arrived whose insn@ELR-4 was not an `svc` — either stale I-cache or the
@@ -3173,6 +3179,65 @@ fn test_drivers_bkl_drop() {
     } else {
         crate::safe_print!(64, "[Test] drivers-bkl-drop FAILED ({} cases)\n", fails);
         panic!("test_drivers_bkl_drop: {fails} cases failed");
+    }
+}
+
+/// `no-bkl-irq` (Phase 7a): the timer IRQ (27) dispatch in `rust_irq_handler_with_sp`
+/// no longer calls `enter_kernel`/`reconcile_for_spsr` at all — unlike
+/// `test_drivers_bkl_drop` above there is no dropped-BKL "window" to check for
+/// balance, because there is no `enter_kernel` on this path to balance in the first
+/// place. The invariant to pin instead: this core's BKL hold state must be *exactly*
+/// the same before and after a stretch spanning several real timer ticks, whether it
+/// started held or not — a leaked acquire, a spurious release, or any other pairing
+/// break on the new fast path would flip it. Also exercises the runtime kill switch,
+/// which must preserve the same invariant via the fallback (BKL-held) path.
+#[cfg(kernel_smp_shared)]
+fn test_timer_irq_preserves_bkl_state() {
+    use akuma_exec::bkl;
+
+    fn busy_wait_us(us: u64) {
+        let start = crate::timer::uptime_us();
+        while crate::timer::uptime_us().saturating_sub(start) < us {
+            core::hint::spin_loop();
+        }
+    }
+
+    // Default state (toggle on, or off if a prior test left it that way — either way,
+    // "before == after" must hold).
+    let held_before = bkl::held_by_current();
+    busy_wait_us(50_000); // spans several ~10ms timer ticks
+    let held_after = bkl::held_by_current();
+
+    let mut fails = 0u32;
+    if held_before != held_after {
+        fails += 1;
+        crate::safe_print!(128,
+            "[Test] timer_irq_preserves_bkl_state FAILED: before={} after={}\n",
+            held_before, held_after);
+    }
+
+    // Runtime kill switch: forcing the fallback (BKL-held) path must preserve the same
+    // invariant, same discipline as `test_drivers_bkl_drop`'s toggle-off check.
+    {
+        use crate::smp_shared::{irq_bkl_drop_enabled, set_irq_bkl_drop_enabled};
+        let was = irq_bkl_drop_enabled();
+        set_irq_bkl_drop_enabled(false);
+        let held_before_off = bkl::held_by_current();
+        busy_wait_us(50_000);
+        let held_after_off = bkl::held_by_current();
+        if held_before_off != held_after_off {
+            fails += 1;
+            crate::safe_print!(128,
+                "[Test] timer_irq_preserves_bkl_state (toggle off) FAILED: before={} after={}\n",
+                held_before_off, held_after_off);
+        }
+        set_irq_bkl_drop_enabled(was);
+    }
+
+    if fails == 0 {
+        crate::safe_print!(96, "[Test] timer_irq_preserves_bkl_state PASSED (held={})\n", held_before);
+    } else {
+        panic!("test_timer_irq_preserves_bkl_state: {fails} cases failed");
     }
 }
 

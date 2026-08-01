@@ -265,6 +265,24 @@ no-bkl-mm = []
 # ramfb (a fw_cfg-backed RAM framebuffer, not a virtio device).
 no-bkl-drivers = []
 
+# Run the timer IRQ (27) dispatch WITHOUT the Big Kernel Lock — Phase 7a of
+# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md §7 (see
+# docs/archive/BKL_PHASE7_AUDIT.md §2.3/§5). The timer is the only device IRQ this
+# kernel registers (`irq::register_handler(27, timer::timer_irq_handler)`), and its
+# handler no longer touches anything the BKL alone protects: the alarm queue has its
+# own `Spinlock` (this same phase), the preemption watchdog and fork-in-progress
+# check are per-thread/global atomics, and the GIC ack/EOI/SGI-trigger calls are raw
+# MMIO — all already cross-core safe independent of the BKL. build.rs emits
+# `cfg(kernel_no_bkl_irq)` from CARGO_FEATURE_NO_BKL_IRQ. Unlike net/vfs/process/mm,
+# this isn't a syscall-entry carve-out (no dropped-BKL "window" — the device-IRQ
+# path in `rust_irq_handler_with_sp` simply never calls `enter_kernel`/
+# `reconcile_for_spsr` at all, so there is nothing to reconcile: no context switch
+# happens on this path, and the interrupted thread's own BKL hold state is left
+# completely untouched). NOT yet included in `smp-shared`'s default bundle — like
+# `no-bkl-mm`, land it opt-in until an A/B against the contention regimen and the
+# full boot self-test suite validate it, then fold it in.
+no-bkl-irq = []
+
 # BKL-hold attribution (measurement builds only — never ship it). Enables the
 # per-tag BKL profiler in `akuma_exec::sync` for the whole boot and makes the
 # async-main loop print a periodic `[BKLPROF]` delta histogram: which syscall /
@@ -418,7 +436,6 @@ smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv
 virtio-drivers = { version = "0.7", default-features = false }
 arm_pl031 = { version = "0.2", default-features = false }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize", "fast"] }
-critical-section = { version = "1.2", default-features = false }
 embedded-io-async = { version = "0.6", default-features = false }
 
 [patch.crates-io]

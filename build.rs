@@ -8,6 +8,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_process)");
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_mm)");
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_drivers)");
+    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_irq)");
     println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
 
     // Multikernel (one-kernel-per-core) gate. ALL secondary-core code lives behind
@@ -112,6 +113,20 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_DRIVERS");
     if std::env::var("CARGO_FEATURE_NO_BKL_DRIVERS").is_ok() {
         println!("cargo:rustc-cfg=kernel_no_bkl_drivers");
+    }
+
+    // BKL-free timer-IRQ dispatch (Phase 7a of
+    // docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md §7, docs/archive/BKL_PHASE7_AUDIT.md
+    // §2.3/§5). `cfg(kernel_no_bkl_irq)` makes `rust_irq_handler_with_sp` dispatch the
+    // timer IRQ (27, the only device IRQ registered) without ever calling
+    // `enter_kernel`/`reconcile_for_spsr` — the handler's state (the alarm queue's own
+    // Spinlock, per-thread preemption-watchdog atomics, raw GIC MMIO) no longer needs the
+    // BKL. Only meaningful under shared-kernel SMP. Emitted independently of `smp_shared`
+    // so the guard body (gated on `all(kernel_smp_shared, kernel_no_bkl_irq)`) can
+    // compile-check in either combination, exactly like the other `no-bkl-*` gates.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_IRQ");
+    if std::env::var("CARGO_FEATURE_NO_BKL_IRQ").is_ok() {
+        println!("cargo:rustc-cfg=kernel_no_bkl_irq");
     }
 
     // BKL-hold attribution build. Turns on the per-tag profiler in

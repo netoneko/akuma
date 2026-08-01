@@ -1,9 +1,9 @@
 # Kernel locking: the BKL and how carve-outs work
 
-> **Stability: B (verify behaviour).** The rules below are extracted from five
+> **Stability: B (verify behaviour).** The rules below are extracted from six
 > completed carve-outs (`no-bkl-network`, `no-bkl-vfs`, `no-bkl-process`,
-> `no-bkl-mm`, `no-bkl-drivers`) and are consistent
-> across both, but the underlying BKL-removal effort is itself grade **C** —
+> `no-bkl-mm`, `no-bkl-drivers`, `no-bkl-irq`) and are consistent
+> across all of them, but the underlying BKL-removal effort is itself grade **C** —
 > check `smp-shared.md` and the archive docs below for what has landed since
 > this was written.
 
@@ -31,20 +31,28 @@ BKL is simply *redundant* for syscalls that only touch that state. See
 `docs/reference/subsystems/smp.md` for the other, share-nothing SMP model this
 is not.
 
-Five carve-outs exist today: `no-bkl-network` (all smoltcp net syscalls +
+Six carve-outs exist today: `no-bkl-network` (all smoltcp net syscalls +
 socket `read`/`write`), `no-bkl-vfs` (ext2 read paths, `mmap`, `unlinkat`,
 `openat`, `renameat`/`renameat2`, `mkdirat`, `fchmodat`), `no-bkl-process`
 (`fork_process`'s CoW page-copy window), `no-bkl-mm`
-(`mprotect`/`madvise`/`munmap`/`mremap`/`mmap`), and `no-bkl-drivers`
+(`mprotect`/`madvise`/`munmap`/`mremap`/`mmap`), `no-bkl-drivers`
 (`getrandom`, `/dev/urandom` read/pread, `/dev/dsp` write, `fb_init`/`fb_draw`/
-`fb_info`). All five are default-on in `smp-shared` (since 2026-08-01). `no-bkl-process` is the first that is not about I/O: it overlaps a
+`fb_info`), and `no-bkl-irq` (the timer IRQ's dispatch in
+`rust_irq_handler_with_sp`). The first five are default-on in `smp-shared`
+(since 2026-08-01); `no-bkl-irq` (Phase 7a, 2026-08-01) is opt-in, staged the
+same way `no-bkl-mm` was before it folded in. `no-bkl-process` is the first
+that is not about I/O: it overlaps a
 CPU-bound page copy with peer-core EL1 rather than a disk or wire wait, and it is
 the first to lean on a *page-table* inner lock (`as_lock`) rather than a
 subsystem's own state locks. `no-bkl-mm` is the first phase picked by the plan
 rather than by attribution (no mm syscall has ever been measured as a significant
 BKL holder) — see `BKL_MM_CARVE_OUT.md` §5 — and the first where the audit found
 real gaps (an unguarded free-list, a page-table mutation with no `as_lock`) rather
-than only rediscovering an existing lock.
+than only rediscovering an existing lock. `no-bkl-irq` is the first carve-out
+that is not a *syscall* excursion at all — the timer IRQ never calls
+`enter_kernel` in the first place on this path, so there is no dropped-BKL
+"window" to open/close, only a single `if` at the dispatch site; see
+[`BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md`](../../archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md).
 
 ## The carve-out playbook
 
@@ -129,7 +137,12 @@ For a given syscall or subsystem:
    holders are the process-lifecycle syscalls, which have no inner lock at all
    (`execve` ~22%, `clone` ~10–13%). See
    [`BKL_PHASE7_AUDIT.md`](../../archive/BKL_PHASE7_AUDIT.md) §1 for the current
-   numbers and §5 for where the effort belongs now.
+   numbers and §5 for where the effort belongs now. Phase 7a (`no-bkl-irq`,
+   below) then moved it again: a same-binary A/B on the same regimen measured
+   **24.7% (BKL-held) → 10.2% (`no-bkl-irq` on)** — see
+   [`BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md`](../../archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md)
+   §5. Same rule applies to *this* number too: it is one A/B on one regimen,
+   not a new standing baseline — re-measure before quoting it elsewhere.
 
 ## Correctness rules learned the hard way
 
@@ -430,13 +443,15 @@ Audited 2026-08-01 with all five carve-outs on
 ([`BKL_PHASE7_AUDIT.md`](../../archive/BKL_PHASE7_AUDIT.md) §2). These are the structures
 where the BKL is not redundant — it *is* the cross-core lock, because the only other
 guard is `with_irqs_disabled` (mutual exclusion on one core). **Do not remove the BKL
-from syscall entry while any of these stands.**
+from syscall entry while any of these stands.** (The audit's §2.3 entry, `ALARM_QUEUE` +
+`critical_section`'s process-global nesting counter, is no longer on this list: Phase 7a
+gave the queue a real `Spinlock` and removed the `critical_section` dependency — see
+[`BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md`](../../archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md).)
 
 | structure | where | current guard | measured BKL share |
 |---|---|---|---|
 | process table `&'static mut Process` (300 call sites) | `process/table.rs` (`with_process`, `get_process_ptr`, `for_each_process`, …), `process/children.rs` (`lookup_process`, `current_process`) | `with_irqs_disabled` only; `unregister_process` frees the `Box`. Known since Phase 3 (`BKL_PROCESS_CARVE_OUT.md` §7 "(b)"). `lookup_process`'s "safe because a process can't be freed by its own thread" argument covers self-teardown only — peer cores free *other* PIDs at `process/mod.rs:1116`/`:1209` | underlies `execve`/`clone`/`wait4`/`netpoll_maint` |
 | `THREAD_CONTEXTS` | `threading/mod.rs:1619` | bare `UnsafeCell` + hand-written `unsafe impl Sync`; its SAFETY comment still says "we're single-CPU" | part of `clone` ~10–13% |
-| `ALARM_QUEUE` + `critical_section` nesting | `src/kernel_timer.rs:124`, `:316` | `critical_section` = DAIF mask + a **process-global** nesting counter — no cross-core exclusion | the substance of `irq/sched` ~21–23% (every core's timer tick walks it) |
 | `replace_image` destructive window | `process/image.rs:29`, `:121` | `LifecycleGuard` = per-thread `disable_preemption()`, **not a lock** | `execve` ~22% |
 | `fork_process` steps 5–8 | `process/mod.rs` | none (`ProcessInfo`, `THREAD_CONTEXTS`, `register_process` publication) | `clone` ~10–13% |
 | console UART | `src/console.rs:60` | bare `static UART` | `netpoll_herd` ~1% |
@@ -533,6 +548,10 @@ Driving workload: `net4` (concurrent downloads → net + ext2 write), `read4`
   audit: why BKL removal is **not** executable yet (§1 corrects the `irq/sched`
   share, §2 is the load-bearing inventory above, §4 the ticket-accounting bug it
   found and fixed, §5 the 7a–7f decomposition).
+- [`BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md`](../../archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md)
+  — Phase 7a: `ALARM_QUEUE`'s real `Spinlock`, the `critical_section` removal,
+  and the BKL-free timer-IRQ dispatch (`no-bkl-irq`), with the same-binary A/B
+  (`irq/sched` 24.7%→10.2%).
 - [`BKL_FINE_GRAINED_LOCKING_PLAN.md`](../../archive/BKL_FINE_GRAINED_LOCKING_PLAN.md)
   — the overall phased plan. §"Phase 2" has the network carve-out's design
   notes (why a coarse `NETWORK_LOCK` doesn't work, the SIGPIPE self-deadlock,
