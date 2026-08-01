@@ -38,10 +38,8 @@ socket `read`/`write`), `no-bkl-vfs` (ext2 read paths, `mmap`, `unlinkat`,
 (`mprotect`/`madvise`/`munmap`/`mremap`/`mmap`), `no-bkl-drivers`
 (`getrandom`, `/dev/urandom` read/pread, `/dev/dsp` write, `fb_init`/`fb_draw`/
 `fb_info`), and `no-bkl-irq` (the timer IRQ's dispatch in
-`rust_irq_handler_with_sp`). The first five are default-on in `smp-shared`
-(since 2026-08-01); `no-bkl-irq` (Phase 7a, 2026-08-01) is opt-in, staged the
-same way `no-bkl-mm` was before it folded in. `no-bkl-process` is the first
-that is not about I/O: it overlaps a
+`rust_irq_handler_with_sp`). All six are default-on in `smp-shared`
+(since 2026-08-01). `no-bkl-process` is the first that is not about I/O: it overlaps a
 CPU-bound page copy with peer-core EL1 rather than a disk or wire wait, and it is
 the first to lean on a *page-table* inner lock (`as_lock`) rather than a
 subsystem's own state locks. `no-bkl-mm` is the first phase picked by the plan

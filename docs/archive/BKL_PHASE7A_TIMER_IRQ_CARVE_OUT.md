@@ -1,7 +1,7 @@
 # Phase 7a: the alarm queue's real lock, and a BKL-free timer IRQ
 
-**Status**: Landed 2026-08-01. Opt-in (`no-bkl-irq`), not yet in the default
-`smp-shared` bundle.
+**Status**: Landed 2026-08-01. Default-on in `smp-shared` since 2026-08-01,
+after the A/B in §5 validated it.
 **Feature**: `no-bkl-irq` → `cfg(kernel_no_bkl_irq)`
 **Toggle**: `smp_shared::irq_bkl_drop_enabled()` / `set_irq_bkl_drop_enabled()`
 (default **on**)
@@ -155,18 +155,24 @@ path preserves the same invariant on its own terms.
   only shares within one run), the identical 6 watchdog warnings on both
   sides are further evidence the regimen ran the same workload both times.
 
-## 6. Not (yet) default-on
+## 6. Default-on
 
-Unlike `no-bkl-network`/`no-bkl-vfs`/`no-bkl-process`/`no-bkl-mm`/
-`no-bkl-drivers`, `no-bkl-irq` is **not** folded into `smp-shared`'s default
-feature bundle. This mirrors `no-bkl-mm`'s staging (`BKL_MM_CARVE_OUT.md` §5):
-land it opt-in, let it sit, then fold it in once it's had more exposure than
-one session's A/B. Unlike `no-bkl-mm`, this phase *was* attribution-driven
-(picked because `irq/sched` was the single largest tag in the audit's fresh
-baseline) and *did* move the needle in the A/B above — so the remaining
-reason to hold off default-on is exposure time, not evidence.
+Folded into `smp-shared`'s default feature bundle the same session, alongside
+`no-bkl-network`/`no-bkl-vfs`/`no-bkl-process`/`no-bkl-mm`/`no-bkl-drivers` —
+unlike `no-bkl-mm`'s initial staging (`BKL_MM_CARVE_OUT.md` §5, opt-in for a
+session before folding in), this phase *was* attribution-driven (picked
+because `irq/sched` was the single largest tag in the audit's fresh baseline),
+*did* move the needle in the A/B above, and both the boot self-test suite and
+the A/B came back completely clean — no reason found to hold off. Removing
+`no-bkl-irq` from the `smp-shared` list in `Cargo.toml` still A/Bs it against
+the BKL-held path if that's ever needed again.
 
 ## 7. What's next (7b–7f)
+
+`../runbooks/bkl-phase7-workplan.md`'s Prompt C is the ready-to-run prompt for
+7b, scoping it to all three affected syscalls (`sys_ppoll`, `sys_pselect6`,
+`sys_epoll_pwait` — not just `ppoll`) and separating the low-risk
+`netpoll_drain`-style fix from the higher-risk full-syscall carve.
 
 Per `BKL_PHASE7_AUDIT.md` §5: 7b (`ppoll`/`epoll_*` carve, including the
 BKL-held `smoltcp_net::poll()` call inside `ppoll` — the same shape the §20
@@ -202,4 +208,5 @@ change without re-measuring).
 - [`BKL_DRIVERS_CARVE_OUT.md`](BKL_DRIVERS_CARVE_OUT.md) §2 — where the
   IRQ-handler goal was deferred from Phase 6 to Phase 7.
 - [`BKL_MM_CARVE_OUT.md`](BKL_MM_CARVE_OUT.md) §5 — the staged-rollout
-  precedent this phase follows for not yet being default-on.
+  precedent `no-bkl-mm` set (opt-in first, fold in once validated); this
+  phase's evidence was strong enough to fold in the same session instead.

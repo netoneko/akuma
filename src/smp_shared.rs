@@ -200,28 +200,24 @@ pub fn set_drivers_bkl_drop_enabled(on: bool) {
 /// balance on this path in the first place — so the read happens once, directly in
 /// `rust_irq_handler_with_sp`, with no latch-at-construction discipline needed.
 ///
-/// Unlike `no-bkl-mm`/`no-bkl-drivers`, `no-bkl-irq` is not (yet) in the default
-/// `smp-shared` feature bundle, so a plain `smp-shared` build never reaches the call
-/// site in `rust_irq_handler_with_sp` that reads this — hence `allow(dead_code)` here,
-/// matching `set_sched_bklfree_el0_enabled`'s same situation above.
+/// Included in `smp-shared`'s default bundle since 2026-08-01, same as
+/// `no-bkl-mm`/`no-bkl-drivers` above — a plain `smp-shared` build always reaches the
+/// call site in `rust_irq_handler_with_sp` that reads this.
 ///
 /// A/B'd 2026-08-01 on the SMP=4 contention regimen (source-toggled, byte-identical
 /// feature set): `irq/sched` 24.7% (off, matches the pre-Phase-7a ~23.5% baseline) →
 /// 10.2% (on), 6/6 digests exact both sides, 0 stuck/RECOVERED/PANIC/WILD/SPURIOUS —
-/// see docs/archive/BKL_PHASE7_AUDIT.md §7a.
-#[allow(dead_code)]
+/// see docs/archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md §5.
 static IRQ_BKL_DROP_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Whether the timer-IRQ BKL-drop (`no-bkl-irq`) is currently enabled.
 #[inline]
-#[allow(dead_code)]
 pub fn irq_bkl_drop_enabled() -> bool {
     IRQ_BKL_DROP_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Enable/disable the timer-IRQ BKL-drop at runtime. Used by A/B measurement; also
 /// serves as a runtime kill-switch, same as the other phases.
-#[allow(dead_code)]
 pub fn set_irq_bkl_drop_enabled(on: bool) {
     IRQ_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
 }

@@ -244,6 +244,108 @@ and the load-bearing inventory).
 
 ---
 
+## Prompt C — execute 7b (`ppoll`/`pselect6`/`epoll_pwait`)
+
+> **Read first:** `docs/archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md` (7a, just landed — same
+> playbook, same verification bar), then `docs/archive/BKL_PHASE7_AUDIT.md` §3/§5 (7b's
+> scope and why it's next), then `docs/archive/BKL_VFS_CARVE_OUT.md` §19–20 (the
+> `netpoll_drain` carve — the exact mechanism this phase reuses), then
+> `docs/reference/subsystems/locking.md` (the playbook and the "already habit" table listing
+> `ppoll`/`epoll_*`).
+>
+> **Scope, precisely.** Three syscalls in `src/syscall/poll.rs`, not one — the audit's "ppoll"
+> shorthand covers all of them, all with the same loop shape (poll network → check per-fd
+> readiness → sleep/`schedule_blocking` if nothing ready):
+> - `sys_epoll_pwait` (`poll.rs:578`), `smoltcp_net::poll()` at `poll.rs:605`
+> - `sys_pselect6` (`poll.rs:776`), `smoltcp_net::poll()` at `poll.rs:819`
+> - `sys_ppoll` (`poll.rs:880`), `smoltcp_net::poll()` at `poll.rs:925`
+>
+> **Two separable pieces — do them in this order, and stop after the first for review if
+> you're unsure about the second.**
+>
+> **Piece 1 (do this; it's the audit's literal ask and the lower-risk of the two).** Move
+> each of the three BKL-held `smoltcp_net::poll()` calls into a dropped-BKL window, using
+> `akuma_exec::bkl::dropped_window_open()`/`dropped_window_close()` **directly** (no new
+> guard struct needed — `src/main.rs`'s `netpoll_drain` carve, `BKL_VFS_CARVE_OUT.md` §20.1,
+> is the copy-paste precedent):
+> ```rust
+> #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+> akuma_exec::bkl::dropped_window_open();
+> #[cfg(feature = "smoltcp")]
+> akuma_net::smoltcp_net::poll();
+> #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+> akuma_exec::bkl::dropped_window_close();
+> ```
+> **Gate on `kernel_no_bkl_network` specifically, not `kernel_smp_shared` alone** — §19.3 of
+> that doc spells out why: `PreemptGuard`'s IRQ-masking arm (inside `smoltcp_net::poll()`'s
+> own `NETWORK`/`SOCKET_TABLE` locks) is itself gated on `no-bkl-network`, and that's what
+> keeps a nested IRQ from ever observing "holding `NETWORK`, wanting the BKL." Gate on the
+> coincidence that `smp-shared` currently bundles `no-bkl-network` in and a future feature
+> split silently reintroduces the AB-BA deadlock the `PreemptGuard` doc warns about.
+>
+> **Piece 2 (audit before touching — this is the part that could go wrong).** The rest of
+> each syscall's BKL-held duration: `EPOLL_TABLE` (own `Spinlock`, `poll.rs:24`) and every
+> per-fd-type readiness check in `epoll_check_fd_readiness` (`poll.rs:384`) — sockets (via
+> `akuma_net`), pipes (`PIPES`), eventfd/timerfd (own locks), `ChildStdout`/`PidFd` (via
+> `get_child_channel`, `CHILD_CHANNELS` — its own `Spinlock`,
+> `crates/akuma-exec/src/process/children.rs:16`, independent of the process table), and
+> rump sockets (`rump_proxy::rump_socket_readable`, which calls
+> `process::lookup_process(read_current_pid())` — **the calling thread's own PID**, i.e. the
+> self-teardown-only case the audit's §2.1.1 says is safe, not a peer lookup). On a first
+> read, **every fd-type touches either its own fine-grained lock or a self-only
+> `lookup_process`/`current_process()` call — never a peer PID**. If that holds up under
+> your own re-check (don't take my word for it — this exact kind of assumption is what
+> burned Phase 3's "`as_lock` was right there" miss and this audit's own truncated-grep
+> near-miss, `BKL_PHASE7_AUDIT.md` §2.1.1's method note), then dropping the BKL for the
+> *whole* syscall body (a `PpollBklGuard`/`EpollBklGuard`, matching `VfsBklGuard`'s shape —
+> latched at construction, `dropped_window_open`/`close` around the syscall entry/exit) is
+> the bigger win, worth doing in the same phase. If it does NOT hold up — if you find a
+> fd-type or a future addition that calls `lookup_process(other_pid)` — **stop, do not build
+> the guard, and leave piece 1 as the whole of 7b** (matching the audit's own caution: a
+> carve that outruns its lock inventory is exactly the Phase 7 mistake this whole campaign
+> keeps re-deriving lessons about).
+>
+> **Also check, don't assume:** `schedule_blocking`'s call sites inside these loops —
+> `locking.md`'s "never hold a lock across a blocking wait" rule, and the note in this
+> workplan's Prompt B section 4.4 tracing through why `schedule_blocking` itself is fine (it
+> drops the BKL via the idle thread's own `leave_kernel` before its `wfi`) — confirm that
+> still holds if piece 2 changes what's held around the call.
+>
+> **Hard don'ts:**
+> - **Don't build a new coarse `EPOLL_LOCK`/`POLL_LOCK`.** `EPOLL_TABLE` and every per-fd
+>   lock already exist; the playbook (`locking.md` rule 2) rejects a new coarse lock for
+>   exactly the reason `no-bkl-network`/`no-bkl-vfs` already learned: anything that blocks
+>   (these loops do, via `schedule_blocking`) can't hold a coarse lock across the wait.
+> - **Don't skip the AB-BA re-check even though `netpoll_drain` already proved the pattern
+>   safe in `main.rs`.** That proof is for the async-main poller specifically; re-verify the
+>   same argument applies with these three syscalls' own call stack (are they ever reached
+>   with some OTHER lock already held above them on the same core? grep the actual call
+>   chain, don't assume "it's the same function so it's the same case").
+>
+> **The bar** (same three as 7a, `docs/reference/subsystems/locking.md`'s playbook items
+> 3–6, and this workplan's Prompt B "bar for each sub-phase"):
+> 1. Boot self-test in `src/process_tests.rs` driving the real `handle_syscall` entry points
+>    for all three syscalls (early-error paths staying balanced, plus a real
+>    guarded/dropped-window path), following `test_drivers_bkl_drop`'s shape. If piece 2
+>    lands, it needs its own guard-latching test (`vfs_bkl_guard_latched_arm_stays_balanced_
+>    across_toggle_flip`'s shape, `BKL_VFS_CARVE_OUT.md` §2.4).
+> 2. Same-binary A/B at SMP=4 on the contention regimen (`scripts/bkl_smp_regimen/`),
+>    source-toggled per playbook rule 5, reporting `[BKLPROF]` `ppoll`/`epoll_pwait`/
+>    `pselect6` share, 6/6 digests exact, 0 stuck/RECOVERED/PANIC/WILD/SPURIOUS/stale heals.
+>    The audit's baseline puts `ppoll` at 6.3–13.0% (it moves between runs, §1.2 vs §6.1 —
+>    treat it as a range) — that's the number this A/B should move.
+> 3. Clippy clean on all three configs (`--release`, `--profile release-smp-shared --features
+>    smp-shared`, `--profile release-smp-shared --features
+>    devbox-smoltcp,no-tests,bkl-profile[,no-bkl-irq]`) and the host suite (`cargo test -p
+>    akuma-exec`) green.
+>
+> **Working conventions**, same as Prompt B: never `git commit`/push; `safe_print!` not
+> `console::print`; no milestone tags in identifiers; doc updates go in `docs/` with a
+> Background footer + a triage-matrix row; check a reference doc's stability grade before
+> trusting it.
+
+---
+
 ## Background
 
 - [`../archive/BKL_PHASE7_AUDIT.md`](../archive/BKL_PHASE7_AUDIT.md) — the audit these

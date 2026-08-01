@@ -170,7 +170,15 @@ smp = ["dep:akuma-smp"]
 # SMP=4 (3 boots × 10 rounds fork-hammer: 0 faults, 0 partial child output, 0
 # `[BKL] stuck`) and contention-confirmed by a same-source `bkl-profile` A/B
 # (`clone` 19.5% → 2.5%, 8.6× fewer spins). Remove from this list to A/B.
-smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers"]
+# Includes `no-bkl-irq` (BKL-free timer-IRQ dispatch, Phase 7a) since
+# 2026-08-01: the timer is the only device IRQ this kernel registers, and its
+# handler's state (the alarm queue's own Spinlock, per-thread preemption-
+# watchdog atomics, raw GIC MMIO) no longer needs the BKL. Validated at SMP=2/4
+# boot self-test (0 PANIC/WILD/SPURIOUS, the BKL-hold-state invariant test
+# passing) and a same-binary `bkl-profile` A/B on the contention regimen
+# (`irq/sched` 24.7% → 10.2%, 6/6 digests exact both sides). Remove from this
+# list to A/B.
+smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers", "no-bkl-irq"]
 
 # Run the native (smoltcp) network syscalls WITHOUT the Big Kernel Lock — the
 # first subsystem carved out of the BKL (docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
@@ -278,9 +286,12 @@ no-bkl-drivers = []
 # path in `rust_irq_handler_with_sp` simply never calls `enter_kernel`/
 # `reconcile_for_spsr` at all, so there is nothing to reconcile: no context switch
 # happens on this path, and the interrupted thread's own BKL hold state is left
-# completely untouched). NOT yet included in `smp-shared`'s default bundle — like
-# `no-bkl-mm`, land it opt-in until an A/B against the contention regimen and the
-# full boot self-test suite validate it, then fold it in.
+# completely untouched). Included in `smp-shared` since 2026-08-01, after the boot
+# self-test suite (SMP=2/4) and a same-binary `bkl-profile` A/B on the contention
+# regimen validated it (`irq/sched` 24.7% → 10.2%, 6/6 digests exact both sides,
+# 0 stuck/RECOVERED/PANIC/WILD/SPURIOUS both sides) — see
+# docs/archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md §5. Remove from the `smp-shared`
+# list to A/B against the BKL-held path.
 no-bkl-irq = []
 
 # BKL-hold attribution (measurement builds only — never ship it). Enables the
