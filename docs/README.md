@@ -48,6 +48,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | Porting a new binary (missing syscalls) | [`reference/subsystems/syscalls.md`](reference/subsystems/syscalls.md) -> Porting + `archive/*_MISSING_SYSCALLS.md` |
 | A/B run shows no difference / boot doesn't match the features you built | [`reference/subsystems/locking.md`](reference/subsystems/locking.md) -> playbook rule 5 + `archive/BKL_VFS_CARVE_OUT.md` §17 |
 | `[BKL] RECOVERED` lines under SMP load / "can I just delete the BKL?" | [`reference/subsystems/locking.md`](reference/subsystems/locking.md) -> "What the BKL is still the only lock for" + [`archive/BKL_PHASE7_AUDIT.md`](archive/BKL_PHASE7_AUDIT.md) |
+| Benchmarking in-VM rustc / SMP scaling vs Linux | [`archive/BKL_RUSTC_SCALING_BASELINE.md`](archive/BKL_RUSTC_SCALING_BASELINE.md) + `scripts/bkl_rustc_bench/` |
 
 ## Task list - "I want to do X"
 
