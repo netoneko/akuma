@@ -519,6 +519,12 @@ flake too. **The lesson for the next tranche: at this failure rate a single boot
 cannot distinguish a regression from the flake.** Budget the extra boots, or the
 first suspicious result will either cost a good conversion or hide a bad one.
 
+Written up separately, with the full 16-boot rate table and the two test defects that
+cause it (no registration handshake; a wake budget exactly equal to
+`BLOCKING_POLL_INTERVAL_US`), in
+[`EPOLL_MULTI_POLLER_PIPE_FLAKE.md`](EPOLL_MULTI_POLLER_PIPE_FLAKE.md). The wake path
+itself is correct — the flake is not a kernel bug.
+
 ## 6. What this unblocks
 
 The opt-out list is now the single place the remaining traversal happens: each of the
