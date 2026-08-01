@@ -434,7 +434,7 @@ from syscall entry while any of these stands.**
 
 | structure | where | current guard | measured BKL share |
 |---|---|---|---|
-| process table `&'static mut Process` (300 call sites) | `process/table.rs` (`with_process`, `get_process_ptr`, `for_each_process`, …), `process/children.rs` (`lookup_process`, `current_process`) | `with_irqs_disabled` only; `unregister_process` frees the `Box` | underlies `execve`/`clone`/`wait4`/`netpoll_maint` |
+| process table `&'static mut Process` (300 call sites) | `process/table.rs` (`with_process`, `get_process_ptr`, `for_each_process`, …), `process/children.rs` (`lookup_process`, `current_process`) | `with_irqs_disabled` only; `unregister_process` frees the `Box`. Known since Phase 3 (`BKL_PROCESS_CARVE_OUT.md` §7 "(b)"). `lookup_process`'s "safe because a process can't be freed by its own thread" argument covers self-teardown only — peer cores free *other* PIDs at `process/mod.rs:1116`/`:1209` | underlies `execve`/`clone`/`wait4`/`netpoll_maint` |
 | `THREAD_CONTEXTS` | `threading/mod.rs:1619` | bare `UnsafeCell` + hand-written `unsafe impl Sync`; its SAFETY comment still says "we're single-CPU" | part of `clone` ~10–13% |
 | `ALARM_QUEUE` + `critical_section` nesting | `src/kernel_timer.rs:124`, `:316` | `critical_section` = DAIF mask + a **process-global** nesting counter — no cross-core exclusion | the substance of `irq/sched` ~21–23% (every core's timer tick walks it) |
 | `replace_image` destructive window | `process/image.rs:29`, `:121` | `LifecycleGuard` = per-thread `disable_preemption()`, **not a lock** | `execve` ~22% |
@@ -444,6 +444,15 @@ from syscall entry while any of these stands.**
 By contrast these hold the BKL but already have a real inner lock, so they are ordinary
 carve-out candidates: `ppoll`/`epoll_*` (`EPOLL_TABLE`), pipes (`PIPES`), futex
 (`FUTEX_WAITERS`), eventfd/timerfd, and `idle_halt`'s post-WFI bookkeeping (`POOL`).
+
+**The migration pattern for the process table already exists** and is worth knowing before
+anyone designs a new one: `lookup_process_shared` (`process/children.rs:341`) replaces
+`&'static mut` exclusivity with `&self` methods plus an explicit `Process::as_lock`, and
+already carries the M5b BKL-free page-fault path. That is the shape to extend — **not** a
+new `PROCESS_TABLE_LOCK`, which `BKL_PROCESS_CARVE_OUT.md` §9.2 rejected as exactly the
+coarse lock the playbook warns against. The part with no precedent is the *free* path:
+`unregister_process`'s `Box::drop` needs deferred reclamation (epoch/RCU, or the time
+cooldown `reclaim_terminated_slots` uses).
 
 ## Attribution tooling
 

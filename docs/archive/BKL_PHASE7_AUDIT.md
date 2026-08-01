@@ -17,6 +17,12 @@ disqualifying:
    entire safety argument is `with_irqs_disabled` (single-core mutual exclusion).
    Removing the BKL from syscall entry converts every one of those sites into a
    cross-core data race and a use-after-free window against `unregister_process`.
+   **This half was already known** — `BKL_PROCESS_CARVE_OUT.md` §7 "(b)" named it as
+   Phase 3's unblock condition and sized it at "218+ sites". §2.1 credits that and states
+   what is actually new: it now gates the *whole phase* rather than one syscall family
+   (§2.1), the documented safety argument covers self-teardown but not peer-core teardown
+   (§2.1.1), and a viable migration pattern already ships in the M5b fault path, which
+   makes it a large refactor rather than a research problem (§2.1.2).
 
 Phase 7 therefore has to become a *prerequisites* phase, not a removal phase. §5
 proposes the decomposition. §4 records three defects the audit turned up, one of them
@@ -106,11 +112,34 @@ needs a lock **built** first. That is the shape of Phase 7's real work.
 "Load-bearing" here means: remove the BKL and this becomes a cross-core race, because
 no other lock covers it. Each item was verified against the source, not inferred.
 
-### 2.1 The process table — the blocker
+### 2.1 The process table — the blocker (already audited; this section only re-scopes it)
 
-`crates/akuma-exec/src/process/table.rs`. `PROCESS_SLOTS` is an `AtomicPtr` array with
-`SLOT_STATES` — lock-free for *finding* a slot. But every accessor then hands out a
-`&mut Process` guarded by nothing but a local IRQ mask:
+**This is not a new finding, and it should not be read as one.**
+[`BKL_PROCESS_CARVE_OUT.md`](BKL_PROCESS_CARVE_OUT.md) §7 "(b)" already named it as the
+thing that would unblock Phase 3 and already sized it:
+
+> **(b) A real inner lock is added to the process table and `THREAD_CONTEXTS`.** This is
+> Phase 3's original plan (`BKL_FINE_GRAINED_LOCKING_PLAN.md` §201–270:
+> `PROCESS_TABLE_LOCK` + per-process `ProcessLock`). It was never built — the VFS
+> carve-out succeeded *without* its planned lock hierarchy because VFS state already had
+> locks, and process state does not. Building it is real design work (218+
+> `lookup_process` sites to refactor), not a guard-and-measure cycle.
+
+`lookup_process`'s own docstring (children.rs:323–334) states the hazard out loud too.
+So the state of the world was known. What this audit adds is three things:
+
+1. **The prerequisite is still unmet at HEAD** — nothing in Phases 4–6 touched it, and
+   §9.2 explicitly (and correctly) declined to couple it to the `no-bkl-process` window.
+2. **It is now the *removal* blocker, not just a fork/exec blocker.** Phase 3 needed it
+   for one syscall family. Phase 7 wants the BKL gone from `rust_sync_el0_handler` for
+   *every* syscall, which promotes it from "would unblock a carve-out" to "gates the
+   whole phase."
+3. **The documented safety argument is single-core reasoning and does not cover the
+   cross-core case** — see §2.1.1, which is the genuinely new part.
+
+The mechanics, for reference: `PROCESS_SLOTS` is an `AtomicPtr` array with `SLOT_STATES`
+— lock-free for *finding* a slot. But every accessor then hands out a `&mut Process`
+guarded by nothing but a local IRQ mask:
 
 - `with_process(pid, |p: &mut Process| …)` — `with_irqs_disabled` only (table.rs:113)
 - `get_process_ptr(pid) -> *mut Process` — same (table.rs:127)
@@ -134,9 +163,68 @@ scan walks the PROCESS TABLE, which the `no-bkl-process` carve-out does NOT cove
 table hands out `&'static mut Process` under nothing but a local IRQ mask, so the BKL is
 its only cross-core lock."*
 
-Scale: **300** call sites across `src/` and `crates/`, and **263** `with_irqs_disabled`
-uses overall. This is not a carve-out; it is a redesign of the kernel's core ownership
-model.
+Scale: **300** call sites across `src/` and `crates/` (Phase 3 counted "218+"; the number
+has grown, not shrunk), and **263** `with_irqs_disabled` uses overall. This is not a
+carve-out; it is a redesign of the kernel's core ownership model.
+
+### 2.1.1 The documented safety argument covers self-free, not peer-free
+
+`lookup_process` (children.rs:332–334) justifies the 218+ legacy sites like this:
+
+> This function exists for the 218+ legacy call sites in syscall handlers. Most are safe
+> in practice because syscall handlers run in a single thread context and the process
+> can't be freed during a syscall by its own thread.
+
+That argument is sound for **self**-teardown, and it is why the pattern was never a bug on
+single-core. It does not cover a **peer** freeing your `Process`, and the kernel does
+exactly that in production:
+
+| site | what it frees |
+|---|---|
+| `process/mod.rs:1116` (`kill_thread_group` sibling teardown) | `table::unregister_process(*sib_pid)` — *other* PIDs |
+| `process/mod.rs:1209` (box kill) | `table::unregister_process(*pid)` over a collected list |
+| `process/mod.rs:241` (`kill_process`) | another process by PID |
+| `process/mod.rs:1464`, `:1606` (`return_to_kernel`, fault teardown) | self — the case the docstring covers |
+
+`unregister_process` (table.rs:63–97) nulls the slot and returns the `Box`, whose drop
+runs `Process::drop` → `UserAddressSpace::drop` and frees the page tables. So the
+cross-core shape — core A holding a `&'static mut Process` from `lookup_process` while
+core B runs sibling/box teardown for that same PID — is a real use-after-free whose only
+guard today is the BKL. Under Phase 7's proposed removal it becomes reachable.
+
+(Method note, since it nearly cost this audit a wrong conclusion: a first pass concluded
+`unregister_process` was **test-only**. It was a truncation artifact — `grep -rn … src
+crates | head` searches `src/` first, so `src/tests.rs` hits filled the window and every
+`crates/` production caller was cut off. Re-run without `head`, or grep the crate
+directly. This is the same class of near-miss as §9.1's empty grep for a lock that
+existed.)
+
+### 2.1.2 A migration shape already exists — 7e is less open-ended than Phase 3 assumed
+
+The one genuinely encouraging finding. `lookup_process_shared` (children.rs:341–350) was
+added for the M5b BKL-free page-fault path and does precisely what a post-BKL world needs:
+
+> The shared-kernel-SMP (M5b) BKL-free page-fault path uses this instead of
+> [`lookup_process`] so two cores faulting in different address spaces don't both
+> materialize `&'static mut` to the same object (aliasing UB). Every address-space
+> mutation the fault path needs is a `&self` method (`track_user_frame`,
+> `track_page_table_frame`, `vm_with_regions`, `with_as_locked`) or a free function
+> (`mmu::map_user_page*`); the actual cross-core mutual exclusion on the raw page-table
+> writes comes from [`Process::as_lock`], not from `&mut` exclusivity.
+
+That is §9.1's lesson already applied and shipped: `&mut` exclusivity replaced by
+`&self` + an explicit inner lock, for one whole subsystem's worth of call sites. So 7e is
+not "invent `PROCESS_TABLE_LOCK`" (which §9.2 correctly rejected as the wrong shape — a
+new coarse lock). It is: **extend the `lookup_process_shared` + per-field-lock pattern to
+the remaining accessors, and delete `lookup_process`/`current_process`.** Still large, but
+it is an incremental refactor with a working precedent and it can proceed with the BKL
+in place — not a research problem.
+
+The residual hard part is the **free** path, which `as_lock` does not address: the
+`Box::drop` in `unregister_process` needs deferred reclamation (an epoch/RCU scheme, or
+the thread-slot cooldown pattern already used for `reclaim_terminated_slots`) so a peer
+holding a reference cannot have it freed underneath. Phase 8 already floats RCU for
+exactly this.
 
 ### 2.2 `THREAD_CONTEXTS`
 
@@ -349,14 +437,22 @@ machine already guarantees "not running on any CPU" (then the fix is a corrected
 comment plus a host test over the state transitions), or add per-slot ownership. Cheap
 if the former, and it is a prerequisite for anything touching `clone`.
 
-**7e — process-table locking (§2.1).** The real blocker, and a research task before it
-is an implementation task. 300 sites, `&'static mut` aliasing, and a use-after-free
-window against `unregister_process`. Options worth costing: per-`Process` lock with an
-enforced ordering vs. the existing `as_lock`/`vm_lock`/fd-table locks; RCU-style
-epoch reclamation for the free path (Phase 8 already floats RCU); or a `with_process`-only
-API with `lookup_process`/`current_process` deleted, converted incrementally with the
-BKL still in place. **Nothing about removing the BKL from syscall entry should be
-attempted before this lands.**
+**7e — process-table locking (§2.1).** The real blocker, but §2.1.2 downgrades it from
+"research task" to "large incremental refactor with a shipped precedent." Two separable
+halves:
+
+- *Access* — extend `lookup_process_shared`'s `&self` + `as_lock`/`vm_lock` pattern
+  (children.rs:341, already carrying the M5b BKL-free fault path) to the remaining
+  accessors and delete `lookup_process`/`current_process`. 300 sites, mechanical per site,
+  proceeds with the BKL in place, and is worth doing on its own merits — §9.2 said so.
+  Do **not** build `PROCESS_TABLE_LOCK`; §9.2 already rejected that shape.
+- *Free* — deferred reclamation for `unregister_process`'s `Box::drop`, which no existing
+  inner lock covers (§2.1.1: peer-core sibling/box teardown frees other PIDs' `Process`).
+  Epoch/RCU, or the time-cooldown pattern `reclaim_terminated_slots` already uses for
+  thread slots. This half is the genuinely new design work.
+
+**Nothing about removing the BKL from syscall entry should be attempted before both
+halves land.**
 
 **7f — removal, if and only if 7a–7e land.** Only at that point do the plan's original
 four tasks (syscall-entry BKL removal, `reconcile_for_spsr` deletion, `KernelLock`
