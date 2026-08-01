@@ -413,7 +413,9 @@ deleted the entry/exit lock round-trip): `socket`, `bind`, `listen`, `accept`,
 `accept4`, `connect`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt`,
 `resolve_host`, `getrandom`. Tranche 2: `rt_sigprocmask` (per-thread mask, no
 process-table touch) and `nanosleep` (blocking, cleared by the blocking-window
-analysis below). **`sendto`/`recvfrom`/`sendmsg`/`recvmsg` must not be listed
+analysis below). Tranche 3: `futex` — the first entry with **no** pre-existing guard,
+so conversion moved its whole body BKL-free; cleared once gate 2 below was closed for
+`FUTEX_WAITERS`. **`sendto`/`recvfrom`/`sendmsg`/`recvmsg` must not be listed
 wholesale** — their unix-socket routing arm runs before their guard and stays
 BKL-held (the AB-BA note below). **`getcwd` must not be listed** either, despite the
 VFS map calling it guardless: it *reads* `proc.cwd`, a plain `String` `Process`
@@ -427,14 +429,39 @@ archive doc):
 
 1. **No `Process`-derived reference may live across `schedule_blocking()`.** Bounded
    lookup-then-use is fine — that is what 7e's RETIRED + 10 ms cooldown covers. A
-   reference held across an indefinite park is not. `sys_read` violates this today
-   (binds `proc` at `fs.rs:259`, derefs it after the park); this is a live
-   pre-existing bug, not merely a conversion blocker.
+   reference held across an indefinite park is not. `sys_read`/`sys_write` violated
+   this (bound `proc` before the arm match, deref'd it after the park) — a live
+   pre-existing bug, since the BKL never covered those references either; fixed in
+   tranche 3 by **scoping** the binding to the fd-table clone and re-resolving at the
+   post-park derefs. Prefer scoping to a comment: it stops the next arm someone adds
+   from reintroducing it.
 2. **Every inner lock the excursion takes must mask local IRQs**, or a nested IRQ's
    unconditional `enter_kernel()` deadlocks AB-BA against a peer holding the BKL and
-   waiting on that lock. `PIPES` complies; `FUTEX_WAITERS` (`syscall/sync.rs`) and
-   `EPOLL_TABLE` (`syscall/poll.rs`) do **not** — fix before converting `futex` or
-   re-attempting the whole-syscall `ppoll` carve.
+   waiting on that lock. `PIPES`, `FUTEX_WAITERS` (`syscall/sync.rs`) and
+   `EPOLL_TABLE` (`syscall/poll.rs`) all comply as of tranche 3. **Still
+   non-compliant: `Process::terminal_state` and its nested `input_waker`** — those
+   sites use `disable_preemption()`, which stops the scheduler but does *not* mask
+   IRQs, and `write_to_process_stdin`/`close_process_stdin` take the same lock
+   BKL-held. That is what blocks converting `read`, whose Stdin arm holds it across a
+   park. Surface: `syscall/term.rs` (~12 sites), `syscall/fs.rs`, `process/mod.rs`.
+
+   **Before masking a lock, check whether it can stop being a lock.** `UTC_OFFSET_US`
+   (`src/timer.rs`) was a bare `Spinlock<Option<u64>>` reachable BKL-free through
+   `futex(FUTEX_WAIT_BITSET|CLOCK_REALTIME)`; because it guarded one scalar with no
+   companion state it became an `AtomicU64` instead of a masked hold, which takes it
+   off this inventory rather than adding another hold that must keep its discipline.
+   That generalizes into phase **7g** — see
+   [`BKL_FINE_GRAINED_LOCKING_PLAN.md`](../../archive/BKL_FINE_GRAINED_LOCKING_PLAN.md)
+   §7.3a for the classification table. It does **not** apply to `FUTEX_WAITERS` or
+   `EPOLL_TABLE`: they guard `BTreeMap`s, where an atomic trades contention for torn
+   reads.
+
+   Masking is also not sufficient on its own — the hold must contain nothing that can
+   block. `sys_epoll_ctl` held `EPOLL_TABLE` across `validate_user_ptr`, which
+   demand-pages a file-backed lazy page through the VFS; the user copy had to be
+   **hoisted out** of the hold (with a membership probe kept ahead of it so `EBADF`
+   still precedes `EFAULT`), not merely masked. Console writes are the same class: the
+   epoll-ctl `tprint!`s moved out too.
 
 **The dropped-window ledger is thread-id-indexed, so a recycled slot must be
 cleared.** A thread killed while parked inside a converted syscall never reaches its

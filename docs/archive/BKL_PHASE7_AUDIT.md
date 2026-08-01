@@ -471,6 +471,17 @@ validate them), are written up in
 the canonical statement of this phase. `execve` (§2.4) and `clone` (§2.5) are the last two
 across, after 7e.
 
+**7g — audit which locks can become atomics, before the deletion.** Slotted between 7f's
+traversal and the BKL infrastructure's removal. Every hardening fix this campaign has
+made is a *discipline* fix (mask IRQs, shorten the span, hoist the user copy out), and
+discipline is a standing obligation that every future call site has to honour. A lock that
+becomes a plain atomic stops being an obligation: it cannot AB-BA against the BKL, cannot
+be held across a blocking wait, and leaves the load-bearing inventory. 7f tranche 3 found
+the first instance by accident — `UTC_OFFSET_US` was a `Spinlock<Option<u64>>` guarding
+one scalar, and became an `AtomicU64`. The classification table and the "don't do this for
+speed" caveat are in
+[`BKL_FINE_GRAINED_LOCKING_PLAN.md`](BKL_FINE_GRAINED_LOCKING_PLAN.md) §7.3a.
+
 A note on ordering rationale: this list deliberately does *not* follow contention rank.
 `execve` at 22.3% outranks everything in 7a–7d, but it has no inner lock and is
 documented as the most dangerous target in the campaign; converting it before the

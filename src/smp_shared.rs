@@ -284,6 +284,23 @@ const SYSCALL_BKL_OPTOUT_SEED: &[u64] = &[
     // BKL was never held across the wait anyway (§4.1): `reconcile_for_spsr`
     // re-points the per-core lock at whichever thread the core resumes.
     101, // nanosleep
+    // Phase 7f tranche 3: `futex`, the second blocking conversion, cleared once its
+    // named prerequisite landed. The archive doc's §4.3 verdict was
+    // "cleared-in-principle, BLOCKED on the second gate" — `FUTEX_WAITERS` was a bare
+    // `Spinlock` with zero IRQ-masked sites, so a BKL-free window holding it plus a
+    // nested IRQ hard-spinning for the BKL deadlocks AB-BA against a peer that holds
+    // the BKL inside `futex_do_wake`. Every access now masks IRQs (`syscall/sync.rs`).
+    //
+    // Gate 1 (nothing `Process`-derived across the wait) holds: the loop carries only
+    // `key = (tgid, uaddr)` and `deadline`, both plain values, and `futex_key_tgid`
+    // returns a `u32` read out of the TTBR0-resident ProcessInfo page, not the table.
+    //
+    // The rest of the body is the audited surface: `validate_user_ptr` (folded under
+    // `as_lock` by tranche 2's pre-flight), per-thread atomics (`peek_pending_signal`,
+    // `current_thread_id`), lock-free timer reads (`uptime_us`; `utc_time_us` became an
+    // atomic in this tranche for exactly this reason), and `get_waker_for_thread`, which
+    // builds a `RawWaker` from a thread id and takes no lock.
+    98, // futex
 ];
 
 /// Syscalls that must NEVER be opted out, mechanism-level (not merely "not yet

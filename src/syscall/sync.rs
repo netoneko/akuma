@@ -9,6 +9,26 @@ use akuma_exec::mmu::user_access::copy_from_user_safe;
 ///   VA collisions when different processes have the same virtual address (no ASLR).
 /// - For FUTEX_SHARED (non-private) operations, `tgid = 0`.
 /// - For kernel-internal wakes (clear_child_tid, robust futex), `tgid = 0`.
+/// # Why every access below masks local IRQs
+///
+/// `FUTEX_WAITERS` is reachable from a BKL-free syscall window (Phase 7f). A nested IRQ
+/// taken on a core that holds this table runs `enter_kernel()` and hard-spins for the
+/// BKL; if a peer core holds the BKL and is inside `futex_do_wake` waiting on this
+/// table, neither can advance — the AB-BA shape `locking.md`'s "Correctness rules
+/// learned the hard way" describes, and the reason `PreemptGuard` masks IRQs. Masking
+/// makes each hold un-interruptible on its own core, which is the discipline `PIPES`
+/// (`syscall/pipe.rs`) and `Process::fault_mutex` (`process/children.rs`) already use.
+///
+/// Two of the critical sections below read the futex word from user memory *inside* the
+/// hold, which the lost-wakeup argument requires (see `sys_futex`'s FUTEX_WAIT arm).
+/// That is safe under masked IRQs because the word is already mapped: `sys_futex`
+/// validates `uaddr` with `validate_user_ptr` (which demand-pages via
+/// `ensure_user_pages_mapped`) before any lock op, and a futex word is writable
+/// anonymous memory, so `reclaim_clean_file_pages` — which only evicts clean RO *file*
+/// pages — can never unmap it underneath us. A fault there therefore means userspace
+/// raced an `munmap` against its own `FUTEX_WAIT`, and with the lazy region gone
+/// `try_resolve_el1_user_copy_lazy_fault` declines the fault, so it resolves through
+/// `copy_from_user_safe`'s fixup to `EFAULT` rather than demand-paging under the hold.
 static FUTEX_WAITERS: Spinlock<BTreeMap<(u32, usize), Vec<usize>>> = Spinlock::new(BTreeMap::new());
 
 /// Returns the TGID to use as the futex key namespace.
@@ -23,23 +43,25 @@ fn futex_key_tgid(is_private: bool) -> u32 {
 }
 
 pub fn futex_do_wake(tgid: u32, uaddr: usize, max_wake: u32) -> u64 {
-    let mut waiters = FUTEX_WAITERS.lock();
     let key = (tgid, uaddr);
-    
-    if let Some(queue) = waiters.get_mut(&key) {
+
+    // The wakes deliberately run *outside* the hold: `Waker::wake` touches the
+    // scheduler, which must not be entered with the futex table held.
+    let to_wake: Vec<usize> = crate::irq::with_irqs_disabled(|| {
+        let mut waiters = FUTEX_WAITERS.lock();
+        let Some(queue) = waiters.get_mut(&key) else { return Vec::new() };
         let count = (max_wake as usize).min(queue.len());
-        let to_wake: Vec<usize> = queue.drain(..count).collect();
+        let drained: Vec<usize> = queue.drain(..count).collect();
         if queue.is_empty() {
             waiters.remove(&key);
         }
-        drop(waiters);
-        for tid in &to_wake {
-            akuma_exec::threading::get_waker_for_thread(*tid).wake();
-        }
-        to_wake.len() as u64
-    } else {
-        0
+        drained
+    });
+
+    for tid in &to_wake {
+        akuma_exec::threading::get_waker_for_thread(*tid).wake();
     }
+    to_wake.len() as u64
 }
 
 /// Kernel-internal futex wake (clear_child_tid, robust futex).
@@ -69,12 +91,132 @@ pub fn futex_wake(tgid: u32, uaddr: usize, max_wake: i32) {
 pub fn futex_wait_at_tgid_for_test(tgid: u32, uaddr: usize) {
     let tid = akuma_exec::threading::current_thread_id();
     let key = (tgid, uaddr);
-    {
+    crate::irq::with_irqs_disabled(|| {
         let mut waiters = FUTEX_WAITERS.lock();
         waiters.entry(key).or_default().push(tid);
-    }
+    });
     akuma_exec::threading::schedule_blocking(u64::MAX);
     // futex_do_wake removed us from the queue before calling wake()
+}
+
+/// Atomically re-check the futex word and enqueue `tid` as a waiter on `key`.
+///
+/// The user read happens INSIDE the hold on purpose — that is what makes it atomic with
+/// respect to `futex_do_wake`. A concurrent wake either runs before we take the table
+/// (and changes the futex value, so we observe the new value and report `EAGAIN`) or
+/// after we insert our tid (so it finds us and wakes us). Splitting the read out would
+/// reopen the lost-wakeup window. See the `FUTEX_WAITERS` doc comment for why doing the
+/// read under masked IRQs cannot demand-page.
+///
+/// `Err` carries the errno the caller must return; `Ok` means we are enqueued.
+fn futex_check_and_enqueue(key: (u32, usize), tid: usize, uaddr: usize, val: u32) -> Result<(), u64> {
+    crate::irq::with_irqs_disabled(|| {
+        let mut waiters = FUTEX_WAITERS.lock();
+        let mut current_val: u32 = 0;
+        if unsafe { copy_from_user_safe((&raw mut current_val).cast::<u8>(), uaddr as *const u8, 4).is_err() } {
+            return Err(EFAULT);
+        }
+        if current_val != val {
+            return Err(EAGAIN);
+        }
+        waiters.entry(key).or_default().push(tid);
+        Ok(())
+    })
+}
+
+/// Move waiters off `key1`: take up to `max_wake` of them for the caller to wake, and
+/// requeue up to `max_requeue` of the rest onto `key2` (skipped when `key2`'s uaddr is
+/// 0). Shared verbatim by FUTEX_REQUEUE and FUTEX_CMP_REQUEUE, which differ only in the
+/// value pre-check they do before calling.
+///
+/// Returns the tids to wake and how many were requeued. The wakes are deliberately left
+/// to the caller so they happen outside the hold.
+fn futex_requeue_table(
+    key1: (u32, usize),
+    key2: (u32, usize),
+    max_wake: u32,
+    max_requeue: u32,
+) -> (Vec<usize>, usize) {
+    let has_requeue_target = key2.1 != 0;
+    crate::irq::with_irqs_disabled(|| {
+        let mut waiters = FUTEX_WAITERS.lock();
+
+        let (to_wake, to_requeue) = if let Some(queue) = waiters.remove(&key1) {
+            let wake_count = (max_wake as usize).min(queue.len());
+            let mut remaining: Vec<usize> = queue;
+            let to_wake: Vec<usize> = remaining.drain(..wake_count).collect();
+
+            let requeue_count = if has_requeue_target {
+                (max_requeue as usize).min(remaining.len())
+            } else {
+                0
+            };
+            let to_requeue: Vec<usize> = remaining.drain(..requeue_count).collect();
+
+            // Put back any remaining waiters
+            if !remaining.is_empty() {
+                waiters.insert(key1, remaining);
+            }
+
+            (to_wake, to_requeue)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        if !to_requeue.is_empty() && has_requeue_target {
+            waiters.entry(key2).or_default().extend(to_requeue.iter().copied());
+        }
+
+        (to_wake, to_requeue.len())
+    })
+}
+
+/// Remove `tid` from `key`'s waiter queue, dropping the queue if it empties.
+fn futex_dequeue(key: (u32, usize), tid: usize) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut waiters = FUTEX_WAITERS.lock();
+        if let Some(queue) = waiters.get_mut(&key) {
+            queue.retain(|&t| t != tid);
+            if queue.is_empty() { waiters.remove(&key); }
+        }
+    });
+}
+
+/// Test hooks for the boot self-test in `src/process_tests.rs`.
+///
+/// The requeue table logic below was factored out of two byte-identical copies
+/// (FUTEX_REQUEUE / FUTEX_CMP_REQUEUE) while masking IRQs, so it is exactly the kind of
+/// change that wants a deterministic test rather than a log grep. The waiter table needs
+/// no user address space, so it is fully drivable from the boot suite — unlike
+/// `futex_check_and_enqueue`, whose in-hold user read has no valid `uaddr` there.
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+pub mod test_hooks {
+    use super::{FUTEX_WAITERS, futex_dequeue, futex_requeue_table};
+    use alloc::vec::Vec;
+
+    pub fn enqueue(key: (u32, usize), tid: usize) {
+        crate::irq::with_irqs_disabled(|| {
+            FUTEX_WAITERS.lock().entry(key).or_default().push(tid);
+        });
+    }
+
+    /// `None` when no queue exists for `key` (distinct from an empty one, which the
+    /// table never stores — every removal path drops an emptied queue).
+    pub fn queue(key: (u32, usize)) -> Option<Vec<usize>> {
+        crate::irq::with_irqs_disabled(|| FUTEX_WAITERS.lock().get(&key).cloned())
+    }
+
+    pub fn requeue(key1: (u32, usize), key2: (u32, usize), max_wake: u32, max_requeue: u32) -> (Vec<usize>, usize) {
+        futex_requeue_table(key1, key2, max_wake, max_requeue)
+    }
+
+    pub fn dequeue(key: (u32, usize), tid: usize) {
+        futex_dequeue(key, tid);
+    }
+
+    pub fn drop_key(key: (u32, usize)) {
+        crate::irq::with_irqs_disabled(|| { FUTEX_WAITERS.lock().remove(&key); });
+    }
 }
 
 pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr2: usize, val3: u32) -> u64 {
@@ -133,21 +275,8 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 return EINVAL;
             }
 
-            {
-                let mut waiters = FUTEX_WAITERS.lock();
-                // Read value INSIDE the lock — atomic with respect to futex_do_wake.
-                // A concurrent wake either runs before we lock (and changes the futex
-                // value, so we see the new value and return EAGAIN) or after we insert
-                // our TID (so it finds us and calls wake, setting the sticky flag).
-                let mut current_val: u32 = 0;
-                if unsafe { copy_from_user_safe((&raw mut current_val).cast::<u8>(), uaddr as *const u8, 4).is_err() } {
-                    return EFAULT;
-                }
-                if current_val != val {
-                    return EAGAIN;
-                }
-                let queue = waiters.entry(key).or_default();
-                queue.push(tid);
+            if let Err(errno) = futex_check_and_enqueue(key, tid, uaddr, val) {
+                return errno;
             }
 
             let is_realtime = (op & FUTEX_CLOCK_REALTIME) != 0;
@@ -155,11 +284,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
                 if unsafe { copy_from_user_safe((&raw mut ts).cast::<u8>(), timeout_ptr as *const u8, 16).is_err() } {
                     // Remove ourselves from the waiter queue before returning.
-                    let mut waiters = FUTEX_WAITERS.lock();
-                    if let Some(queue) = waiters.get_mut(&key) {
-                        queue.retain(|&t| t != tid);
-                        if queue.is_empty() { waiters.remove(&key); }
-                    }
+                    futex_dequeue(key, tid);
                     return EFAULT;
                 }
                 let timeout_us = (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000;
@@ -213,7 +338,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 akuma_exec::threading::schedule_blocking(deadline);
 
                 // Check whether we were genuinely woken (removed from queue by FUTEX_WAKE).
-                let woken_by_futex = {
+                let woken_by_futex = crate::irq::with_irqs_disabled(|| {
                     let mut waiters = FUTEX_WAITERS.lock();
                     let in_queue = waiters.get(&key).is_some_and(|q| q.contains(&tid));
                     if in_queue {
@@ -224,7 +349,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                         }
                     }
                     !in_queue
-                };
+                });
 
                 // If we were woken by a pending signal, return EINTR (Linux spec).
                 if akuma_exec::threading::peek_pending_signal(tid) != 0 {
@@ -250,20 +375,11 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 }
 
                 // Spurious wakeup before deadline.  Re-check the futex value
-                // (under the lock to avoid lost-wakeup races) and re-enqueue.
-                {
-                    let mut waiters = FUTEX_WAITERS.lock();
-                    let mut current_val: u32 = 0;
-                    if unsafe { copy_from_user_safe((&raw mut current_val).cast::<u8>(), uaddr as *const u8, 4).is_err() } {
-                        return EFAULT;
-                    }
-                    if current_val != val {
-                        // Value changed — wakeup condition was met; report as EAGAIN
-                        // so the caller re-evaluates its own condition variable.
-                        return EAGAIN;
-                    }
-                    let queue = waiters.entry(key).or_default();
-                    queue.push(tid);
+                // (under the lock to avoid lost-wakeup races) and re-enqueue. A changed
+                // value is reported as EAGAIN so the caller re-evaluates its own
+                // condition variable.
+                if let Err(errno) = futex_check_and_enqueue(key, tid, uaddr, val) {
+                    return errno;
                 }
             }
         }
@@ -287,41 +403,8 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 return EFAULT;
             }
 
-            let mut waiters = FUTEX_WAITERS.lock();
-
-            // Extract waiters from uaddr
-            let (to_wake, to_requeue) = if let Some(queue) = waiters.remove(&key1) {
-                let wake_count = (val as usize).min(queue.len());
-                let mut remaining: Vec<usize> = queue;
-                let to_wake: Vec<usize> = remaining.drain(..wake_count).collect();
-
-                let requeue_count = if uaddr2 != 0 {
-                    (max_requeue as usize).min(remaining.len())
-                } else {
-                    0
-                };
-                let to_requeue: Vec<usize> = remaining.drain(..requeue_count).collect();
-
-                // Put back any remaining waiters
-                if !remaining.is_empty() {
-                    waiters.insert(key1, remaining);
-                }
-
-                (to_wake, to_requeue)
-            } else {
-                (Vec::new(), Vec::new())
-            };
-
-            // Add requeued waiters to uaddr2
-            if !to_requeue.is_empty() && uaddr2 != 0 {
-                let queue2 = waiters.entry(key2).or_default();
-                queue2.extend(to_requeue.iter().copied());
-            }
-
+            let (to_wake, requeued) = futex_requeue_table(key1, key2, val, max_requeue);
             let woken = to_wake.len();
-            let requeued = to_requeue.len();
-
-            drop(waiters);
 
             for tid in &to_wake {
                 akuma_exec::threading::get_waker_for_thread(*tid).wake();
@@ -352,38 +435,8 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 return EFAULT;
             }
 
-            let mut waiters = FUTEX_WAITERS.lock();
-
-            let (to_wake, to_requeue) = if let Some(queue) = waiters.remove(&key1) {
-                let wake_count = (val as usize).min(queue.len());
-                let mut remaining: Vec<usize> = queue;
-                let to_wake: Vec<usize> = remaining.drain(..wake_count).collect();
-
-                let requeue_count = if uaddr2 != 0 {
-                    (max_requeue as usize).min(remaining.len())
-                } else {
-                    0
-                };
-                let to_requeue: Vec<usize> = remaining.drain(..requeue_count).collect();
-
-                if !remaining.is_empty() {
-                    waiters.insert(key1, remaining);
-                }
-
-                (to_wake, to_requeue)
-            } else {
-                (Vec::new(), Vec::new())
-            };
-
-            if !to_requeue.is_empty() && uaddr2 != 0 {
-                let queue2 = waiters.entry(key2).or_default();
-                queue2.extend(to_requeue.iter().copied());
-            }
-
+            let (to_wake, requeued) = futex_requeue_table(key1, key2, val, max_requeue);
             let woken = to_wake.len();
-            let requeued = to_requeue.len();
-
-            drop(waiters);
 
             for tid in &to_wake {
                 akuma_exec::threading::get_waker_for_thread(*tid).wake();

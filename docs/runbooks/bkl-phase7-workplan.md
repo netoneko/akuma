@@ -1,6 +1,19 @@
 # BKL Phase 7: work plan and agent prompts
 
-**Status**: Prompt A done (2026-08-01, `docs/archive/BKL_RUSTC_SCALING_BASELINE.md`).
+**Status (2026-08-02, current)**: 7a/7c/7d/7e done; 7b piece 1 done, piece 2 parked; **7f
+is where the work now happens** — milestone 0 + tranches 1, 2 and 3 landed, 15 syscalls
+converted. Read [`../archive/BKL_PHASE7F_OPTOUT_LIST.md`](../archive/BKL_PHASE7F_OPTOUT_LIST.md)
+first; its §11 is the live prerequisite list and supersedes the per-prompt status text
+below. A new phase **7g** (audit which locks can become atomics, before the BKL is
+deleted) was added to the plan's §7.3a after tranche 3 found `UTC_OFFSET_US`.
+
+Next up, highest value first: **IRQ-mask `terminal_state`/`input_waker`** (§10 — the one
+thing blocking `read`, the biggest measured un-converted holder), then `ppoll` piece 2's
+≥4-run gate.
+
+---
+
+**Status (historical, as of 2026-08-01)**: Prompt A done (2026-08-01, `docs/archive/BKL_RUSTC_SCALING_BASELINE.md`).
 Prompt B: **7a done** (2026-08-01,
 [`../archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md`](../archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md)
 — `ALARM_QUEUE`'s real `Spinlock`, `critical_section` removed, timer-IRQ dispatch

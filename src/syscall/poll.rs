@@ -252,7 +252,9 @@ fn log_epoll_pwait_return(
 
 #[cfg(feature = "sc-epoll")]
 pub fn epoll_destroy(epoll_id: u32) {
-    EPOLL_TABLE.lock().remove(&epoll_id);
+    crate::irq::with_irqs_disabled(|| {
+        EPOLL_TABLE.lock().remove(&epoll_id);
+    });
 }
 
 /// No-op when epoll is gated out: there is no interest table to reset, and the
@@ -300,8 +302,10 @@ const EPOLL_CLOEXEC: u32 = 0o2000000;
 pub fn sys_epoll_create1(flags: u32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         let epoll_id = NEXT_EPOLL_ID.fetch_add(1, Ordering::SeqCst);
-        EPOLL_TABLE.lock().insert(epoll_id, EpollInstance {
-            interest_list: BTreeMap::new(),
+        crate::irq::with_irqs_disabled(|| {
+            EPOLL_TABLE.lock().insert(epoll_id, EpollInstance {
+                interest_list: BTreeMap::new(),
+            });
         });
         let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::EpollFd(epoll_id));
         if flags & EPOLL_CLOEXEC != 0 {
@@ -325,64 +329,84 @@ pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
         _ => return EBADF,
     };
 
-    let mut table = EPOLL_TABLE.lock();
-    let instance = match table.get_mut(&epoll_id) {
-        Some(inst) => inst,
-        None => return EBADF,
-    };
-
     const EPOLL_EVENT_SIZE: usize = core::mem::size_of::<EpollEvent>();  // 16 on ARM64
 
-    match op {
-        EPOLL_CTL_ADD => {
+    // The user copy is hoisted out of the EPOLL_TABLE hold. `validate_user_ptr`
+    // demand-pages through `ensure_user_pages_mapped`, whose `LazySource::File` arm
+    // reads the page in through the VFS — and the hold below now masks IRQs, where
+    // block I/O is barred outright (locking.md). The membership probe keeps EBADF
+    // ahead of EFAULT, which is the precedence the un-hoisted code had.
+    let event = match op {
+        EPOLL_CTL_ADD | EPOLL_CTL_MOD => {
+            if !crate::irq::with_irqs_disabled(|| EPOLL_TABLE.lock().contains_key(&epoll_id)) {
+                return EBADF;
+            }
             if !validate_user_ptr(event_ptr as u64, EPOLL_EVENT_SIZE) { return EFAULT; }
             let mut ev = EpollEvent { events: 0, _pad: 0, data: 0 };
             if unsafe { copy_from_user_safe((&raw mut ev).cast::<u8>(), event_ptr as *const u8, EPOLL_EVENT_SIZE).is_err() } {
                 return EFAULT;
             }
-            let ev_events = { ev.events };
-            let ev_data = { ev.data };
-            if let Some(entry) = instance.interest_list.get_mut(&fd) {
-                entry.events = ev_events;
-                entry.data = ev_data;
-                entry.last_ready = 0;
-                crate::tprint!(96, "[epoll] ctl ADD->MOD epfd={} fd={} events=0x{:x}\n", epfd, fd, ev_events);
-            } else {
-                instance.interest_list.insert(fd, EpollEntry {
-                    events: ev_events,
-                    data: ev_data,
-                    last_ready: 0,
-                });
-                crate::tprint!(96, "[epoll] ctl ADD epfd={} fd={} events=0x{:x}\n", epfd, fd, ev_events);
-            }
-            0
+            Some(({ ev.events }, { ev.data }))
         }
-        EPOLL_CTL_MOD => {
-            if !validate_user_ptr(event_ptr as u64, EPOLL_EVENT_SIZE) { return EFAULT; }
-            let mut ev = EpollEvent { events: 0, _pad: 0, data: 0 };
-            if unsafe { copy_from_user_safe((&raw mut ev).cast::<u8>(), event_ptr as *const u8, EPOLL_EVENT_SIZE).is_err() } {
-                return EFAULT;
-            }
-            let ev_events = { ev.events };
-            let ev_data = { ev.data };
-            match instance.interest_list.get_mut(&fd) {
-                Some(entry) => {
+        _ => None,
+    };
+
+    // Outcome of the ADD arm, logged after the hold is released — a UART write is far
+    // too slow to sit inside an IRQ-masked spinlock hold.
+    let mut added_as: Option<&'static str> = None;
+
+    let result = crate::irq::with_irqs_disabled(|| {
+        let mut table = EPOLL_TABLE.lock();
+        let instance = match table.get_mut(&epoll_id) {
+            Some(inst) => inst,
+            None => return EBADF,
+        };
+
+        match op {
+            EPOLL_CTL_ADD => {
+                let (ev_events, ev_data) = event.expect("ADD populates `event` above");
+                if let Some(entry) = instance.interest_list.get_mut(&fd) {
                     entry.events = ev_events;
                     entry.data = ev_data;
                     entry.last_ready = 0;
-                    0
+                    added_as = Some("ADD->MOD");
+                } else {
+                    instance.interest_list.insert(fd, EpollEntry {
+                        events: ev_events,
+                        data: ev_data,
+                        last_ready: 0,
+                    });
+                    added_as = Some("ADD");
                 }
-                None => ENOENT,
+                0
             }
-        }
-        EPOLL_CTL_DEL => {
-            match instance.interest_list.remove(&fd) {
-                Some(_) => 0,
-                None => ENOENT,
+            EPOLL_CTL_MOD => {
+                let (ev_events, ev_data) = event.expect("MOD populates `event` above");
+                match instance.interest_list.get_mut(&fd) {
+                    Some(entry) => {
+                        entry.events = ev_events;
+                        entry.data = ev_data;
+                        entry.last_ready = 0;
+                        0
+                    }
+                    None => ENOENT,
+                }
             }
+            EPOLL_CTL_DEL => {
+                match instance.interest_list.remove(&fd) {
+                    Some(_) => 0,
+                    None => ENOENT,
+                }
+            }
+            _ => EINVAL,
         }
-        _ => EINVAL,
+    });
+
+    if let Some(kind) = added_as {
+        let ev_events = event.map_or(0, |(e, _)| e);
+        crate::tprint!(96, "[epoll] ctl {} epfd={} fd={} events=0x{:x}\n", kind, epfd, fd, ev_events);
     }
+    result
 }
 
 pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Waker>) -> u32 {
@@ -627,25 +651,25 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
         // We use a stack-allocated array for common small interest lists (up to 128).
         const STACK_SNAPSHOT_SIZE: usize = 128;
         let mut stack_snapshot = [0u32; STACK_SNAPSHOT_SIZE];
-        let mut heap_snapshot = None;
-        let snapshot_count;
 
-        {
+        let snapshot = crate::irq::with_irqs_disabled(|| {
             let table = EPOLL_TABLE.lock();
-            let instance = match table.get(&epoll_id) {
-                Some(inst) => inst,
-                None => return EBADF,
-            };
+            let instance = table.get(&epoll_id)?;
 
-            snapshot_count = instance.interest_list.len();
-            if snapshot_count <= STACK_SNAPSHOT_SIZE {
+            let count = instance.interest_list.len();
+            if count <= STACK_SNAPSHOT_SIZE {
                 for (i, (&fd, _)) in instance.interest_list.iter().enumerate() {
                     stack_snapshot[i] = fd;
                 }
+                Some((count, None))
             } else {
-                heap_snapshot = Some(instance.interest_list.keys().copied().collect::<alloc::vec::Vec<u32>>());
+                Some((count, Some(instance.interest_list.keys().copied().collect::<alloc::vec::Vec<u32>>())))
             }
-        }
+        });
+        let (snapshot_count, heap_snapshot) = match snapshot {
+            Some(s) => s,
+            None => return EBADF,
+        };
 
         let fds: &[u32] = if let Some(ref h) = heap_snapshot { 
             h 
@@ -657,10 +681,10 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
             if ready_count >= maxevents { break; }
 
             // Re-acquire lock to get entry details (MUST NOT hold during readiness check)
-            let entry_info = {
+            let entry_info = crate::irq::with_irqs_disabled(|| {
                 let table = EPOLL_TABLE.lock();
                 table.get(&epoll_id).and_then(|inst| inst.interest_list.get(&fd)).map(|e| (e.events, e.data, e.last_ready))
-            };
+            });
 
             let (raw_events, data, last_ready) = match entry_info {
                 Some(info) => info,
@@ -677,13 +701,13 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
             if is_et {
                 let new_bits = revents & !last_ready;
                 // Update last_ready in the table
-                {
+                crate::irq::with_irqs_disabled(|| {
                     let mut table = EPOLL_TABLE.lock();
                     if let Some(inst) = table.get_mut(&epoll_id)
                         && let Some(entry) = inst.interest_list.get_mut(&fd) {
                             entry.last_ready = revents;
                         }
-                }
+                });
                 if new_bits != 0 {
                     kernel_events.push(EpollEvent { events: new_bits, _pad: 0, data });
                     ready_count += 1;

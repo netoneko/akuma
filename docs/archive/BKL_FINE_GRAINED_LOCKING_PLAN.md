@@ -577,6 +577,55 @@ locking gaps): 14 syscall families with zero carve-out — `poll`, `proc`, `sign
 `fchmod`, `fallocate`/`ftruncate`/`truncate`, `faccessat2`, `symlinkat`, `linkat`,
 `readlinkat`, `chdir`/`fchdir`, `fstatfs`).
 
+### 7.3a 7g: audit which locks can become atomics — before the BKL is deleted
+
+**Ordering: after the traversal, before the deletion.** Not an optimization pass for Phase
+8, and not something to do early either. It has to come *after* 7f's traversal because
+that is what enumerates the locks a BKL-free window can actually reach, and *before* the
+deletion because a lock removed outright is one fewer entry that has to keep its
+discipline forever.
+
+**The observation this comes from.** Every "make this hold safe" fix in this campaign has
+been a *discipline* fix — mask IRQs, shorten the span, hoist the user copy out. Discipline
+is a standing obligation: it has to be re-derived by every future reader and re-checked at
+every new call site, and `locking.md`'s "Correctness rules learned the hard way" list is
+the record of what happens when it lapses. A lock that becomes a plain atomic stops being
+an obligation at all. It cannot AB-BA against the BKL, cannot be held across a blocking
+wait, cannot be taken from an IRQ epilogue, and drops off the load-bearing inventory.
+
+**The concrete precedent.** Phase 7f tranche 3 hit this on `UTC_OFFSET_US`
+(`src/timer.rs`), a `Spinlock<Option<u64>>` reachable BKL-free through
+`futex(FUTEX_WAIT_BITSET|CLOCK_REALTIME)`. The obvious fix was to mask IRQs around its two
+sites. The better fix — the one that landed — was to notice it guards **one scalar with no
+other state published alongside it** and make it an `AtomicU64` with a sentinel for the
+old `None`. Two loads became one, the AB-BA became unrepresentable, and the entry left the
+inventory. Nothing in the campaign's process would have surfaced that; it was noticed by
+asking the question directly.
+
+**The audit's shape.** Walk the load-bearing inventory in
+[`../reference/subsystems/locking.md`](../reference/subsystems/locking.md) and classify
+each entry:
+
+| class | test | action |
+|---|---|---|
+| single scalar, no companion state | does anything else have to change atomically with it? | replace with an atomic + sentinel (the `UTC_OFFSET_US` shape) |
+| flag / counter / generation number | is it only ever read to decide, never read-then-written as a unit? | atomic; use CAS where the read-then-write *is* the unit |
+| small fixed struct, one writer | is there exactly one writer, or is the writer already serialized elsewhere? | seqlock or per-writer atomics; **write the ownership proof down** — the phase's own §7.2 lesson |
+| collection (`BTreeMap`, `Vec`, ring) | — | keep the lock; atomics do not apply. `FUTEX_WAITERS`, `EPOLL_TABLE`, `PIPES` are all this class |
+| anything held across I/O or a blocking wait | — | keep the lock; the problem is the span, not the primitive |
+
+**Do not convert a lock to atomics to make it "faster."** The reason is correctness
+surface, not cycles — an atomic that replaces a lock guarding two related fields trades a
+contention problem for a torn-read problem, which is strictly worse and much harder to
+see. The `getcwd` rejection in
+[`BKL_PHASE7F_OPTOUT_LIST.md`](BKL_PHASE7F_OPTOUT_LIST.md) §4.5 is the same mistake in the
+opposite direction: `proc.cwd` is a `String`, so no amount of atomics makes an unlocked
+read of it safe.
+
+**Deliverable:** a table in the reference doc marking each inventory entry
+converted / keep-the-lock / needs-an-ownership-proof, so the entries that survive to the
+post-BKL world are ones someone decided to keep rather than ones nobody re-examined.
+
 ### Deliverables
 - [ ] **7a** `ALARM_QUEUE` locked, `critical_section` per-core, IRQ 27 dispatch BKL-free
 - [ ] **7b** `ppoll`/`epoll_*` carved; `smoltcp_net::poll()` in `sys_ppoll` BKL-free
@@ -584,8 +633,11 @@ locking gaps): 14 syscall families with zero carve-out — `poll`, `proc`, `sign
 - [ ] **7d** `THREAD_CONTEXTS` + `Process::context` ownership proven or locked
 - [ ] **7e** `Process` fields grouped and locked; ~274 accessor sites converted;
       `lookup_process`/`current_process` deleted; deferred reclamation for the free path
-- [ ] **7f** per-syscall opt-in list landed empty; all families traversed; BKL
-      infrastructure deleted as dead code
+- [ ] **7f** per-syscall opt-in list landed empty; all families traversed
+- [ ] **7g** every load-bearing lock classified atomic-able / keep / needs-proof (§7.3a);
+      the single-scalar ones converted **before** the BKL infrastructure is deleted
+- [ ] BKL infrastructure (`KernelLock`, `reconcile_for_spsr`, the ledger, the five guards)
+      deleted as dead code
 - [ ] Extended SMP=4 stability run (the original "24 hours"; see §7.4 on the bar)
 
 ### 7.4 Success criteria
@@ -594,6 +646,10 @@ locking gaps): 14 syscall families with zero carve-out — `poll`, `proc`, `sign
   **this, not "the BKL is gone," is the phase's actual goal**
 - The opt-in list is empty, and `KernelLock`/`reconcile_for_spsr`/the ledger/the five
   guards are deleted as unreachable
+- **Every surviving lock in the load-bearing inventory was deliberately kept** — 7g
+  (§7.3a) classified each one, the single-scalar entries became atomics, and the rest
+  carry a written reason. The post-BKL inventory should be the locks someone chose, not
+  the ones nobody re-read.
 - Sustained SMP=4 load with **0 `[BKL] stuck`, 0 `RECOVERED` (the new
   `kernel_lock_recoveries()` tripwire), 0 PANIC/WILD/SPURIOUS, 0 stale dropped-window
   heals, and exact digests** — the campaign's standing bar, which is stronger evidence

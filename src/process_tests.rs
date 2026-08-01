@@ -477,6 +477,8 @@ pub fn run_all_tests() {
     test_orphaned_fork_children_have_own_tgid();
     // futex WAIT on unmapped returns EAGAIN not EFAULT
     test_futex_wait_unmapped_returns_eagain();
+    // Phase 7f tranche 3: IRQ-masked futex waiter table + the shared requeue helper
+    test_futex_table_irq_masked_requeue();
     // sigreturn SPSR validation prevents kernel halt
     test_sigreturn_validates_spsr();
     test_sigreturn_validates_sp();
@@ -9767,6 +9769,80 @@ fn test_futex_wake_unmapped_returns_zero() {
         console::print("[Test] futex_wake_unmapped_returns_zero PASSED\n");
     } else {
         console::print("[Test] futex_wake_unmapped_returns_zero FAILED\n");
+    }
+}
+
+/// Phase 7f tranche 3: the futex waiter table's critical sections now mask local IRQs.
+///
+/// Why they must: `FUTEX_WAITERS` is a bare `Spinlock`, and once `futex` moves onto the
+/// BKL opt-out list a nested IRQ taken while a core holds it does an unconditional
+/// `enter_kernel()` hard-spin — AB-BA against a peer that holds the BKL and wants the
+/// same table (`BKL_PHASE7F_OPTOUT_LIST.md` §4.3, and `locking.md`'s "Correctness rules
+/// learned the hard way").
+///
+/// Masking came with a refactor worth pinning: FUTEX_REQUEUE and FUTEX_CMP_REQUEUE's two
+/// byte-identical table bodies collapsed into one `futex_requeue_table`. This drives that
+/// arithmetic — wake N, requeue M, put the remainder back, drop emptied queues — plus the
+/// nesting property the whole discipline rests on: every helper must be callable from a
+/// caller that has *already* masked IRQs.
+fn test_futex_table_irq_masked_requeue() {
+    use crate::syscall::futex_test_hooks as fx;
+    use alloc::vec;
+
+    // A tgid namespace no real process can occupy (PIDs are small and monotonic), so the
+    // test cannot collide with a live waiter on a busy boot.
+    const TEST_TGID: u32 = 0xF07E_0001;
+    let key1 = (TEST_TGID, 0x1000usize);
+    let key2 = (TEST_TGID, 0x2000usize);
+    fx::drop_key(key1);
+    fx::drop_key(key2);
+
+    for tid in [101usize, 102, 103, 104, 105] {
+        fx::enqueue(key1, tid);
+    }
+
+    // Wake the first 2, requeue the next 2 onto key2, leave one behind.
+    let (to_wake, requeued) = fx::requeue(key1, key2, 2, 2);
+    let wake_ok = to_wake == vec![101usize, 102];
+    let requeue_ok = requeued == 2;
+    let src_ok = fx::queue(key1) == Some(vec![105usize]);
+    let dst_ok = fx::queue(key2) == Some(vec![103usize, 104]);
+
+    // uaddr2 == 0 means "wake only" — nothing is moved, and the emptied source queue is
+    // dropped rather than left behind as an empty Vec (every other removal path agrees).
+    let (to_wake2, requeued2) = fx::requeue(key1, (TEST_TGID, 0), 5, 5);
+    let no_target_ok = to_wake2 == vec![105usize] && requeued2 == 0;
+    let drained_ok = fx::queue(key1).is_none();
+
+    // Dequeue drops an emptied queue too.
+    fx::dequeue(key2, 103);
+    let dequeue_ok = fx::queue(key2) == Some(vec![104usize]);
+    fx::dequeue(key2, 104);
+    let dequeue_empty_ok = fx::queue(key2).is_none();
+
+    // An absent key yields no wakes and must not materialize an empty queue.
+    let (absent_wake, absent_requeue) = fx::requeue(key1, key2, 4, 4);
+    let absent_ok = absent_wake.is_empty() && absent_requeue == 0 && fx::queue(key1).is_none();
+
+    // Nesting: safe to call with IRQs already masked. `with_irqs_disabled` is reentrant,
+    // and the callers that mask above these helpers depend on that.
+    let nested_ok = crate::irq::with_irqs_disabled(|| {
+        fx::enqueue(key1, 201);
+        let (w, r) = fx::requeue(key1, key2, 1, 0);
+        w == vec![201usize] && r == 0
+    });
+
+    fx::drop_key(key1);
+    fx::drop_key(key2);
+
+    if wake_ok && requeue_ok && src_ok && dst_ok && no_target_ok && drained_ok
+        && dequeue_ok && dequeue_empty_ok && absent_ok && nested_ok {
+        console::print("[Test] futex_table_irq_masked_requeue PASSED\n");
+    } else {
+        crate::safe_print!(224,
+            "[Test] futex_table_irq_masked_requeue FAILED: wake={} requeue={} src={} dst={} no_target={} drained={} deq={} deq_empty={} absent={} nested={}\n",
+            wake_ok, requeue_ok, src_ok, dst_ok, no_target_ok, drained_ok,
+            dequeue_ok, dequeue_empty_ok, absent_ok, nested_ok);
     }
 }
 

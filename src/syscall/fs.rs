@@ -256,13 +256,24 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         return EFAULT;
     }
-    let proc = if let Some(p) = akuma_exec::process::current_process_shared() { p } else {
-        trace_read_ebadf("no-current-process", fd_num, buf_ptr);
-        return EBADF;
-    };
-    let fd = if let Some(e) = proc.get_fd(fd_num as u32) { e } else {
-        trace_read_ebadf("fd-not-in-table", fd_num, buf_ptr);
-        return EBADF;
+    // Deliberately scoped: `current_process_shared()` hands out `&'static Process`, but
+    // that lifetime is not one the process table can honour across a blocking park. The
+    // RETIRED + `PROCESS_RECLAIM_COOLDOWN_US` scheme bounds a *lookup-then-use* span of
+    // microseconds; several arms below park in `schedule_blocking(u64::MAX)` for as long
+    // as a pipe stays empty, and a peer core can retire and free the slot in between. So
+    // bind the reference only long enough to clone the fd entry out of the table, keep
+    // the pid as a scalar for the trace paths, and re-resolve at the few derefs that can
+    // be reached after a park. See BKL_PHASE7F_OPTOUT_LIST.md §4.2.
+    let (pid, fd) = {
+        let Some(proc) = akuma_exec::process::current_process_shared() else {
+            trace_read_ebadf("no-current-process", fd_num, buf_ptr);
+            return EBADF;
+        };
+        let Some(fd) = proc.get_fd(fd_num as u32) else {
+            trace_read_ebadf("fd-not-in-table", fd_num, buf_ptr);
+            return EBADF;
+        };
+        (proc.pid, fd)
     };
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED && fd_num == 0 {
@@ -273,6 +284,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         akuma_exec::process::FileDescriptor::Stdin => {
             let ch = if let Some(c) = akuma_exec::process::current_channel() { c } else {
                 let mut temp = alloc::vec![0u8; count];
+                let Some(proc) = akuma_exec::process::current_process_shared() else { return EBADF };
                 let n = proc.read_stdin(&mut temp);
                 if n > 0 
                     && unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
@@ -456,7 +468,9 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                         if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
                             return EFAULT;
                         }
-                        proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.position += n; });
+                        if let Some(proc) = akuma_exec::process::current_process_shared() {
+                            proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.position += n; });
+                        }
                     }
                     if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                         crate::safe_print!(256, "[syscall] read(fd={}, file={}, pos={}, req={}) = {}\n", fd_num, &f.path, f.position, to_read, n);
@@ -559,7 +573,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     crate::tprint!(
                         224,
                         "[pipe-read] enter pid={} tid={} fd={} pipe={} buf={:#x} cnt={}\n",
-                        proc.pid,
+                        pid,
                         tid,
                         fd_num,
                         pipe_id,
@@ -576,7 +590,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                             crate::tprint!(
                                 224,
                                 "[pipe-read] EFAULT copy_to_user pid={} fd={} pipe={} buf={:#x} copy_len={}\n",
-                                proc.pid,
+                                pid,
                                 fd_num,
                                 pipe_id,
                                 buf_ptr,
@@ -737,7 +751,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             let r = match kind {
                 akuma_exec::process::RemoteKind::Vfs => crate::smp::fwd_read(handle, &mut kbuf),
                 akuma_exec::process::RemoteKind::Socket => {
-                    crate::smp::fwd_recvfrom(handle, &mut kbuf, proc.is_nonblock(fd_num as u32), None)
+                    crate::smp::fwd_recvfrom(handle, &mut kbuf, super::net::fd_is_nonblock(fd_num as u32), None)
                 }
             };
             if (r as i64) < 0 {
@@ -856,8 +870,14 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
 
 pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
-    let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
-    let fd = match proc.get_fd(fd_num as u32) { Some(e) => e, None => return EBADF };
+    // Scoped for the same reason as `sys_read`'s: the Stdout/pipe/unix arms below park in
+    // `schedule_blocking(u64::MAX)` inside the per-chunk loop, and a `&'static Process`
+    // may not outlive a park (BKL_PHASE7F_OPTOUT_LIST.md §4.2). Keep the pid as a scalar
+    // for the trace paths; re-resolve at the derefs that can follow a park.
+    let (pid, fd) = {
+        let Some(proc) = akuma_exec::process::current_process_shared() else { return EBADF };
+        match proc.get_fd(fd_num as u32) { Some(e) => (proc.pid, e), None => return EBADF }
+    };
 
     // write(2) to a real file runs BKL-free. Unlike `sys_read`, the on-disk work here
     // isn't confined to one `match` arm — the match is *inside* the per-chunk loop, and
@@ -900,7 +920,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             akuma_exec::process::FileDescriptor::Stdout | akuma_exec::process::FileDescriptor::Stderr => {
                 if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                     if total_written == 0 {
-                      crate::safe_print!(96, "[OUT] pid={} fd={} len={}\n", proc.pid, fd_num, count);
+                      crate::safe_print!(96, "[OUT] pid={} fd={} len={}\n", pid, fd_num, count);
                     } else {
                     let display_len = this_chunk.min(64);
                     let mut snippet = [0u8; 64];
@@ -910,7 +930,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                         if *byte < 32 || *byte > 126 { *byte = b'.'; }
                     }
                     let snippet_str = core::str::from_utf8(&snippet[..n]).unwrap_or("...");
-                    crate::tprint!(192, "[OUT] pid={} fd={} len={} \"{}\"\n", proc.pid, fd_num, count, snippet_str);
+                    crate::tprint!(192, "[OUT] pid={} fd={} len={} \"{}\"\n", pid, fd_num, count, snippet_str);
                     }
                 }
 
@@ -957,7 +977,10 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
                 
                 if crate::config::STDOUT_TO_KERNEL_LOG_COPY_ENABLED {
-                    proc.write_stdout(buf_slice);
+                    // Re-resolved: the backpressure loop just above can have parked.
+                    if let Some(proc) = akuma_exec::process::current_process_shared() {
+                        proc.write_stdout(buf_slice);
+                    }
                 }
 
                 // Multikernel §8.2: a process PINNED to a secondary core has no BSP-side
@@ -977,13 +1000,15 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     Ok(n) => {
                         write_pos += n;
                         let new_pos = write_pos;
-                        proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry {
-                            if file.flags & akuma_exec::process::open_flags::O_APPEND != 0 {
-                                file.position = new_pos;
-                            } else {
-                                file.position += n;
-                            }
-                        });
+                        if let Some(proc) = akuma_exec::process::current_process_shared() {
+                            proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry {
+                                if file.flags & akuma_exec::process::open_flags::O_APPEND != 0 {
+                                    file.position = new_pos;
+                                } else {
+                                    file.position += n;
+                                }
+                            });
+                        }
                         n as u64
                     }
                     Err(e) => {
@@ -1120,7 +1145,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 let r = match kind {
                     akuma_exec::process::RemoteKind::Vfs => crate::smp::fwd_write(handle, buf_slice),
                     akuma_exec::process::RemoteKind::Socket => {
-                        crate::smp::fwd_sendto(handle, buf_slice, proc.is_nonblock(fd_num as u32), None)
+                        crate::smp::fwd_sendto(handle, buf_slice, super::net::fd_is_nonblock(fd_num as u32), None)
                     }
                 };
                 if (r as i64) < 0 {

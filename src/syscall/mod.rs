@@ -43,6 +43,9 @@ mod timerfd;
 pub use sync::futex_wake;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub use sync::futex_do_wake;
+/// Futex waiter-table hooks for `process_tests::test_futex_table_irq_masked_requeue`.
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+pub use sync::test_hooks as futex_test_hooks;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub use sync::futex_wait_at_tgid_for_test;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]

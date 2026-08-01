@@ -1,4 +1,12 @@
-# Phase 7f: the per-syscall BKL opt-out list (milestone 0, tranche 1, tranche 2)
+# Phase 7f: the per-syscall BKL opt-out list (milestone 0, tranche 1, tranche 2, tranche 3)
+
+**Status (tranche 3)**: Landed 2026-08-02, uncommitted at time of writing. Closes two of
+the four shared prerequisites §6 named — the `sys_read`/`sys_write` reference-across-park
+bug (§7) and the IRQ-masking sweep (§8) — converts `futex` (§9), and records two findings
+the §6 list did not anticipate: a **fourth** unmasked lock on futex's own path that became
+an atomic rather than a masked hold (§8.3), and a **third** bare-`Spinlock` family that
+blocks `read` and was missing from prerequisite 1 (§10). Sections 1–6 are tranches 0–2's
+original text, unchanged.
 
 **Status (tranche 2)**: Landed 2026-08-02, uncommitted at time of writing. Adds the
 `as_lock` pre-flight (§3), the blocking-window analysis that gates every further
@@ -552,10 +560,240 @@ four **named, shared prerequisites**, each unblocking a group at once:
 4. **Body splits for the four unix-socket-routing net syscalls**, with the
    `DroppedWindowPause`/blocking-wait boundary rule from §4.5.
 
+## 7. Tranche 3 prerequisite: `sys_read`/`sys_write` held `proc` across a park
+
+§6's prerequisite 2, closed. `sys_read` bound `proc = current_process_shared()` at
+`fs.rs:259`, before the arm match, and `sys_write` did the same at `fs.rs:859` — a
+`&'static Process` whose lifetime the process table cannot honour across
+`schedule_blocking(u64::MAX)`. 7e's RETIRED + `PROCESS_RECLAIM_COOLDOWN_US` bounds a
+*lookup-then-use* span of microseconds; a pipe reader parks for as long as the pipe stays
+empty.
+
+**This is a live bug, not only a conversion blocker** (§4.1(3)): the BKL never covered
+those references, because `reconcile_for_spsr` re-points the per-core lock at whichever
+thread the core resumes. It has been reachable on every SMP boot to date.
+
+Which derefs actually sat after a park, having read every use in both functions:
+
+| site | verdict |
+|---|---|
+| `sys_write` `proc.write_stdout` (Stdout arm) | **Real.** Directly follows the exec-channel backpressure loop's `schedule_blocking(u64::MAX)`, same iteration. |
+| `sys_write` `proc.pid` in the two `[OUT]` traces | **Real** for chunk > 0, which follows a prior chunk's park. Debug-gated. |
+| `sys_read` `proc.pid` in the `[pipe-read]` EFAULT trace | **Real.** Inside the retry loop, after any number of parks. Debug-gated. |
+| `sys_read`/`sys_write` `File` arm `proc.update_fd` | **Not** a park — the VFS read/write path contains no `schedule_blocking`/`blocking_relax` (checked `src/fs.rs`, `src/block*`, `src/drivers/`). |
+| `sys_read` Stdin arm | Uses the `Arc<ProcessChannel>` clone, never `proc`, after its park. |
+| multikernel `RemoteFd` arms' `proc.is_nonblock` | `cfg(kernel_smp)`; does not co-compile with `smp-shared`. Fixed anyway. |
+
+Fix: the binding is now **scoped** rather than commented. Both functions bind `proc` only
+long enough to clone the fd entry out of the table (`get_fd` returns an owned
+`FileDescriptor`) and copy `pid` out as a scalar; the borrow ends at the block. The few
+post-park derefs re-resolve via `current_process_shared()` (or `net::fd_is_nonblock`,
+which is that idiom already). Making it structural matters more than the individual
+sites — the next arm someone adds cannot reintroduce the bug by accident.
+
+`net.rs` was swept for the same shape and is **clean**: `accept`/`accept4` already
+re-resolve after `socket_accept` blocks, `recvfrom`/`recvmsg` never bind `proc`, and
+`sendmsg`'s binding is scoped above `pipe_write_all_blocking`.
+
+## 8. Tranche 3 prerequisite: the IRQ-masking sweep
+
+§6's prerequisite 1. Both named tables now mask local IRQs on every access.
+
+### 8.1 `FUTEX_WAITERS` (`src/syscall/sync.rs`) — 6 sites, zero masked before
+
+Two of the six read the futex word from user memory *inside* the hold, which the
+lost-wakeup argument requires. That is safe under masked IRQs, and the reasoning is worth
+recording because it is not the generic case: `sys_futex` calls `validate_user_ptr` (which
+demand-pages through `ensure_user_pages_mapped`) before any lock op, and a futex word is
+writable anonymous memory, so `reclaim_clean_file_pages` — which evicts only clean RO
+*file* pages — cannot unmap it underneath us. A fault inside the hold therefore means
+userspace raced `munmap` against its own `FUTEX_WAIT`; with the lazy region gone
+`try_resolve_el1_user_copy_lazy_fault` declines the fault, so it resolves through
+`copy_from_user_safe`'s fixup to `EFAULT` instead of demand-paging under the hold.
+
+The sweep also collapsed FUTEX_REQUEUE and FUTEX_CMP_REQUEUE's two byte-identical table
+bodies into one `futex_requeue_table` (they differ only in the value pre-check they do
+before calling), and pulled the enqueue/dequeue paths into named helpers so the
+early-return arms could move inside closures without changing behaviour. Wakes stay
+**outside** every hold — `Waker::wake` enters the scheduler.
+
+### 8.2 `EPOLL_TABLE` (`src/syscall/poll.rs`) — 8 sites, 2 masked before
+
+Seven were mechanical. `sys_epoll_ctl` was not: it held the table across
+`validate_user_ptr` **and** `copy_from_user_safe` for the 16-byte `epoll_event`, and
+unlike the futex word an epoll event pointer has had no prior `validate_user_ptr`, so
+`ensure_user_pages_mapped`'s `LazySource::File` arm can read it in through the VFS. Block
+I/O under an IRQ-masked hold is barred outright. The user copy is therefore **hoisted out
+of the hold**, with a membership probe before it so `EBADF` still precedes `EFAULT` — the
+precedence the un-hoisted code had. The ADD arm's two `tprint!` calls moved out too: a
+UART write has no business inside an IRQ-masked spinlock hold.
+
+### 8.3 A fourth lock the prerequisite list missed — and the case for atomics
+
+Auditing what `futex` touches outside a guard turned up `utc_time_us` (`src/timer.rs`),
+reached from `FUTEX_WAIT_BITSET|CLOCK_REALTIME` when it converts an absolute wall-clock
+deadline. It took `UTC_OFFSET_US`, a bare `Spinlock<Option<u64>>`, with a peer able to
+hold the BKL inside `clock_gettime`/`gettimeofday` and want the same lock — the same
+AB-BA, on a lock nobody had listed.
+
+The obvious fix was a third `with_irqs_disabled`. The fix that landed was to notice the
+lock guards **one scalar with no companion state** and make it an `AtomicU64` with
+`u64::MAX` as the old `None` (a real offset is ~1.7e15 µs, four orders off the sentinel).
+Two loads became one and the AB-BA became unrepresentable rather than merely avoided.
+
+That generalizes, and it is now a phase of its own: **7g**, an audit of which
+load-bearing locks can become atomics, slotted after 7f's traversal and *before* the BKL
+infrastructure is deleted — classification table and the "don't do this for speed" caveat
+in [`BKL_FINE_GRAINED_LOCKING_PLAN.md`](BKL_FINE_GRAINED_LOCKING_PLAN.md) §7.3a. Every
+hardening fix in this campaign so far has been a *discipline* fix, and discipline is an
+obligation every future call site inherits. Deleting a lock ends the obligation.
+`FUTEX_WAITERS` and `EPOLL_TABLE` are emphatically **not** candidates — they guard
+`BTreeMap`s, where an atomic trades contention for torn reads.
+
+### 8.4 Verification (prerequisites, before any tranche-3 conversion)
+
+Boot suite, `release-smp-shared --features devbox-smoltcp`, `DISK=devbox.img MEMORY=4096
+SMP=2 INSTANCE=60 SNAPSHOT=1`, A/B against a same-session `git stash` HEAD baseline —
+both ELFs built before either boot, so the comparison is same-session and same-disk.
+
+| | `[Test]` PASSED | `grep -ac PASSED` | FAIL | SKIP | stuck | PANIC/WILD |
+|---|---|---|---|---|---|---|
+| HEAD baseline (stashed), SMP=2 | 244 | 251 | 2 known | 7 | 22 | 0 |
+| prerequisites, SMP=2 | 245 | 252 | 2 known | 7 | 21 | 0 |
+
+Delta is exactly the one new self-test. All tripwire self-tests PASSED on both sides
+(`no_spurious_svc_traps`, `no_bkl_ticket_recoveries`, `no_stale_window_heals`,
+`syscall_bkl_optout`, `ensure_user_pages_mapped_as_lock`), as did
+`test_epoll_multi_poller_pipe` — the §5.4 flake, fixed since (`EPOLL_MULTI_POLLER_PIPE_FLAKE.md`).
+
+New boot self-test `test_futex_table_irq_masked_requeue` (`src/process_tests.rs`) drives
+the shared requeue helper — wake N, requeue M, remainder put back, emptied queues dropped
+rather than left as empty `Vec`s, absent key yields no wakes — plus the nesting property
+the discipline rests on: every helper must be callable from a caller that has *already*
+masked IRQs. It runs against a `tgid` namespace (`0xF07E_0001`) no real process occupies,
+so it cannot collide with a live waiter on a busy boot.
+
+## 9. Tranche 3: `futex` (98) converted
+
+The §4.3 verdict was "cleared-in-principle, **blocked** on the second gate." §8.1 closed
+that gate; gate 1 was already satisfied (the wait loop carries only `key` and `deadline`,
+both plain values, and `futex_key_tgid` reads the TTBR0-resident ProcessInfo page, not the
+table).
+
+Unlike every tranche-1 entry, `futex` has **no pre-existing guard**, so conversion moves
+the whole body BKL-free. The per-call surface, audited piece by piece:
+`validate_user_ptr` (folded under `as_lock` by tranche 2's §3 pre-flight), per-thread
+atomics (`peek_pending_signal`, `current_thread_id`), lock-free timer reads (`uptime_us`;
+`utc_time_us` as of §8.3), and `get_waker_for_thread`, which builds a `RawWaker` from a
+thread id and takes no lock. `schedule_blocking` re-looks-up per iteration — the bounded
+self-lookup §4.1 notes is production-proven on every boot.
+
+### 9.1 Verification
+
+Boot suite, `release-smp-shared --features devbox-smoltcp`, `DISK=devbox.img MEMORY=4096
+INSTANCE=60 SNAPSHOT=1`:
+
+| | `[Test]` PASSED | `grep -ac PASSED` | FAIL | SKIP | stuck | PANIC/WILD |
+|---|---|---|---|---|---|---|
+| prerequisites only, SMP=2 | 245 | 252 | 2 known | 7 | 21 | 0 |
+| **+ `futex`, SMP=2** | 245 | 252 | 2 known | 7 | 21 | 0 |
+| **+ `futex`, SMP=4** | 243 | 250 | 2 known | 9 | 61 | 0 |
+
+Byte-identical to the prerequisite boot at SMP=2; SMP=4 sits inside the documented
+pre-existing 46–63 band (§5.2, §1.2). All five tripwire self-tests PASSED on every boot.
+
+**Live futex workload — in-VM `rustc` at SMP=4** (`scripts/bkl_rustc_bench/pbench.py`,
+`devbox-smoltcp,no-tests`). This is the strongest functional test available for this
+conversion: Rust std routes every `Mutex`/`Once`/`Condvar` through `futex`, the harness
+*verifies artifact bytes* rather than trusting wall-clock, and the 2026-08-01 baseline in
+[`BKL_RUSTC_SCALING_BASELINE.md`](BKL_RUSTC_SCALING_BASELINE.md) is directly comparable.
+
+| cell | baseline 2026-08-01 | tranche 3 |
+|---|---|---|
+| `nostd` conc=1 | 5.72s | 5.16s |
+| `nostd` conc=4 | 13.15s | 13.20s |
+| `std` conc=1 | 13.36s | 12.91s |
+| `std` conc=4 | 40.78s | 42.68s |
+
+Within noise both ways (n=2 per cell), artifacts byte-identical across every rep. Read as
+"no throughput regression", not as a speedup — futex never appeared in the standing
+regimen's holder histogram, so no delta was expected there either.
+
+**On the `big` cell, which failed once here:** artifact absent, `rustc` silent. That is
+the **pre-existing, already-documented** signature — `BKL_RUSTC_SCALING_BASELINE.md` §5
+records `big conc=4` failing both reps at SMP=1 with "artifact absent, rustc silent",
+attributed to memory pressure and left as the one missing cell. Confirmed pre-existing
+rather than assumed: a same-session `git stash` HEAD build, same disk, same SMP=4, hit it
+too (run 2: rep0 OK, rep1 FAIL at 29.1s with the identical empty-output signature). The
+kernel-side companion is the known `clone_thread` SIGSEGV family, visible here as
+`[Fault] Process N (opt cgu.0/1) SIGSEGV` — rustc's codegen-unit worker threads, which
+only the `big` input spawns.
+
+Head-to-head over the whole session, worth recording but **n=1 per side — do not quote as
+a result**: the tranche-3 build completed 5/6 `big` compiles and logged **0** `[BKL]
+stuck` across the entire bench; the HEAD baseline wedged twice at SMP=4 under the same
+workload (`[BKL] stuck: owner=1 waiter=2/3/4 tag=511` repeating, 9855 lines in run 1,
+SSH unreachable thereafter). Suggestive that the tranche does not worsen SMP=4 rustc
+stability, and possibly the reverse; establishing either needs the repeated-run count
+§4.4 argues for.
+
+Host: full-workspace `cargo test` green (479 passed, 0 failed). Clippy clean on
+`--release`, `release-smp-shared --features smp-shared`, and `release-smp-shared
+--features devbox-smoltcp,no-tests,bkl-profile`. `release-smp --features smp`, `size`,
+and `extreme-size` all build.
+
+**Not done: the standing `bkl_smp_regimen` contention A/B.** Every prior tranche carries
+one. Skipped deliberately here — futex is absent from that regimen's histogram on both
+sides (it is a `net4 → read4 → cp2 → rm` workload with no futex contention), so the A/B
+would report the same "no delta above the noise floor" tranche 1 got, at the cost of two
+more SMP=4 boots. The rustc pairing above is the workload that actually exercises the
+converted syscall. Re-run the regimen before quoting any contention share.
+
+## 10. What tranche 3 did NOT do, and why
+
+**`read` (63) stays unconverted, and prerequisite 1's list was incomplete.** Closing
+prerequisite 2 was supposed to unblock it. It does not, because `read`'s Stdin arm takes a
+**third** bare-`Spinlock` family the §6 list never named: `Process::terminal_state`
+(`Arc<Spinlock<TerminalState>>`) and its nested `input_waker` `Spinlock`. The sites use
+`disable_preemption()`/`enable_preemption()`, which stops the scheduler but does **not**
+mask IRQs — so a nested IRQ still runs its unconditional `enter_kernel()` hard-spin. And
+the lock is demonstrably taken BKL-held from the other side:
+`write_to_process_stdin`/`close_process_stdin` (`process/mod.rs:269`/`:294`). That is a
+complete AB-BA the moment `read` goes on the list.
+
+`sys_read`'s own comment on the `File` arm already said as much — "the Stdin arm parks in
+`schedule_blocking` while taking non-IRQ-masked terminal-state locks, which this carve-out
+has not audited" — which is why the `File` arm's `VfsBklGuard` is scoped to that one arm.
+The surface is larger than futex's and epoll's combined: `src/syscall/term.rs` (~12
+sites), `src/syscall/fs.rs`, and `process/mod.rs`. Attempting it alongside two other
+prerequisites and a conversion in one session is how the campaign's known-bad sessions
+started, so it is named rather than half-done.
+
+**`ppoll` piece 2 stays parked** on its other entry criterion — §4.4's ≥4 clean regimen
+runs, chosen against the 1-in-2 failure rate 7b actually observed. §8.2 satisfied only the
+`EPOLL_TABLE` half.
+
+## 11. The prerequisite list, restated after tranche 3
+
+Replacing §6's four:
+
+1. ~~Mask IRQs around `FUTEX_WAITERS` / `EPOLL_TABLE`~~ — **done** (§8), plus
+   `UTC_OFFSET_US` as an atomic (§8.3).
+2. ~~Stop carrying `proc` across blocking waits~~ — **done** (§7).
+3. **NEW — IRQ-mask `terminal_state` / `input_waker`** (§10). Blocks `read`. The single
+   highest-value remaining item: `read` is the biggest measured un-converted holder
+   (2.9–4.4% on the standing regimen; 56.4% in one 7b run).
+4. **`ppoll` piece 2's run-count gate** — ≥4 clean regimen runs (§4.4). Its lock-side
+   prerequisite is now satisfied.
+5. **The plain-`Process`-field story** — unchanged; still the gate for
+   `execve`/`clone`/`wait4`/mm and for *readers* such as `getcwd` (§4.5).
+6. **Body splits for the four unix-socket-routing net syscalls** — unchanged (§4.5).
+
 ## Background
 
 - [`BKL_FINE_GRAINED_LOCKING_PLAN.md`](BKL_FINE_GRAINED_LOCKING_PLAN.md) §7.3 — the
-  canonical statement this phase implements.
+  canonical statement this phase implements; §7.3a is the 7g atomics audit this tranche
+  motivated.
 - [`BKL_PHASE7_AUDIT.md`](BKL_PHASE7_AUDIT.md) §5 — the 7a–7f decomposition and the
   7f entry's ledger-survival constraint.
 - [`BKL_PHASE7E_ACCESS_HALF.md`](BKL_PHASE7E_ACCESS_HALF.md) /

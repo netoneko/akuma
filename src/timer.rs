@@ -6,8 +6,23 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spinning_top::Spinlock;
 
 // UTC offset in microseconds since Unix epoch (1970-01-01 00:00:00)
-// Can be set via set_utc_offset() to sync with real time
-static UTC_OFFSET_US: Spinlock<Option<u64>> = Spinlock::new(None);
+// Can be set via set_utc_time_us() to sync with real time.
+//
+// A lock-free atomic rather than a `Spinlock<Option<u64>>`: the value is one scalar with
+// no other state published alongside it, and the read path is reachable from a BKL-free
+// syscall window (`futex(FUTEX_WAIT_BITSET|CLOCK_REALTIME)` converts its absolute
+// wall-clock deadline through `utc_time_us`). A bare `Spinlock` there is an AB-BA waiting
+// to happen — a nested IRQ's unconditional `enter_kernel()` hard-spins for the BKL while
+// a peer holds the BKL inside `clock_gettime`/`gettimeofday` waiting on this lock
+// (`locking.md`, "Correctness rules learned the hard way"). Deleting the lock is better
+// than masking IRQs around it: it takes the entry off the load-bearing inventory instead
+// of adding one more hold that has to keep its discipline.
+//
+// `UNSET` encodes the old `None`. A real offset is a Unix-epoch microsecond count minus
+// uptime — on the order of 1.7e15 — so the sentinel is unreachable by four orders of
+// magnitude.
+const UTC_OFFSET_UNSET: u64 = u64::MAX;
+static UTC_OFFSET_US: AtomicU64 = AtomicU64::new(UTC_OFFSET_UNSET);
 
 // PL031 RTC instance for reading real-time clock from QEMU
 // The standard PL031 address for QEMU virt machine is 0x9010000
@@ -190,15 +205,16 @@ pub fn init_utc_from_rtc() -> bool {
 // unix_epoch_us: microseconds since Unix epoch (1970-01-01 00:00:00 UTC)
 pub fn set_utc_time_us(unix_epoch_us: u64) {
     let boot_time = uptime_us();
-    let mut offset = UTC_OFFSET_US.lock();
-    *offset = Some(unix_epoch_us.saturating_sub(boot_time));
+    UTC_OFFSET_US.store(unix_epoch_us.saturating_sub(boot_time), Ordering::Release);
 }
 
 // Get current UTC time in microseconds since Unix epoch
 // Returns None if UTC time has not been set
 pub fn utc_time_us() -> Option<u64> {
-    let offset = UTC_OFFSET_US.lock();
-    offset.map(|off| off.wrapping_add(uptime_us()))
+    match UTC_OFFSET_US.load(Ordering::Acquire) {
+        UTC_OFFSET_UNSET => None,
+        off => Some(off.wrapping_add(uptime_us())),
+    }
 }
 
 // Get current UTC time in seconds since Unix epoch
