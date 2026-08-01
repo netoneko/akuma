@@ -318,6 +318,8 @@ ledger primitive, no `VfsBklGuard`/`NetBklGuard` struct):
 | `sys_execve` ELF read (`proc.rs:649`, inside `sys_execve` `proc.rs:544`) | `exec_bkl_drop_enabled()` (`smp_shared.rs:87`) | whole-file `read_file` — **only** in the single-image smp-shared build (`not(kernel_profile_size)`, `not(kernel_smp)`); size build reads just a 256-byte shebang header, multikernel build forwards cross-core, neither takes this window | ext2 `read_state` |
 | Data-Abort demand-page fill (`exceptions.rs:2964`/`3017`) | `fault_bkl_drop_enabled()` (`smp_shared.rs:68`) | per-page fill loop only; page-table install is separate, BKL-held | ext2 `read_state` |
 | Instruction-Abort demand-page fill (`exceptions.rs:3487`/`3533`) | same | mirror of Data-Abort path | same |
+| `netpoll_drain`'s `smoltcp_net::poll()` loop (`main.rs`, `BKL_VFS_CARVE_OUT.md` §19–20) | none — unconditional under the cfg gate | the whole burst-drain `while poll() {}` loop | `NETWORK`/`SOCKET_TABLE` |
+| `sys_epoll_pwait`/`sys_pselect6`/`sys_ppoll`'s per-iteration `smoltcp_net::poll()` call (`poll.rs:605`/`819`/`925`, Phase 7b piece 1, `BKL_PHASE7B_PPOLL_CARVE_OUT.md`) | none — unconditional under the cfg gate, same as `netpoll_drain` | one `poll()` call per readiness-loop iteration | `NETWORK`/`SOCKET_TABLE` |
 
 ### `no-bkl-process` — `crates/akuma-exec/src/process/mod.rs`
 
@@ -454,9 +456,23 @@ gave the queue a real `Spinlock` and removed the `critical_section` dependency �
 | `fork_process` steps 5–8 | `process/mod.rs` | none (`ProcessInfo`, `THREAD_CONTEXTS`, `register_process` publication) | `clone` ~10–13% |
 | console UART | `src/console.rs:60` | bare `static UART` | `netpoll_herd` ~1% |
 
+**The process-table row above is not hypothetical — a Phase 7b A/B hit it.** A
+whole-syscall `ppoll`/`epoll_pwait` BKL-free window (spanning `schedule_blocking()`, i.e.
+real scheduler activity, unlike every other carve-out's single bounded I/O op) produced
+one intermittent data-corruption run out of two in the standing regimen, alongside a
+`[BKL] stale dropped-window depth 1 healed at EL0 entry` line and a thread crash whose
+signature matches a known physical-page-reuse-race pattern. That guard was reverted; see
+[`BKL_PHASE7B_PPOLL_CARVE_OUT.md`](../../archive/BKL_PHASE7B_PPOLL_CARVE_OUT.md) §3–4.
+**Any future BKL-free window that can span a `schedule_blocking()`/context-switch point
+(not just a single bounded I/O op) should be treated as touching this row, whether or not
+it looks like it does.**
+
 By contrast these hold the BKL but already have a real inner lock, so they are ordinary
-carve-out candidates: `ppoll`/`epoll_*` (`EPOLL_TABLE`), pipes (`PIPES`), futex
-(`FUTEX_WAITERS`), eventfd/timerfd, and `idle_halt`'s post-WFI bookkeeping (`POOL`).
+carve-out candidates: `ppoll`/`epoll_*`'s `EPOLL_TABLE` and per-fd-type locks (only the
+`smoltcp_net::poll()` call itself is carved so far — see the "Adjacent BKL-drop sites"
+table above; the whole-syscall carve is blocked on the process-table row above per the
+finding just noted), pipes (`PIPES`), futex (`FUTEX_WAITERS`), eventfd/timerfd, and
+`idle_halt`'s post-WFI bookkeeping (`POOL`).
 
 **The migration pattern for the process table already exists** and is worth knowing before
 anyone designs a new one: `lookup_process_shared` (`process/children.rs:341`) replaces

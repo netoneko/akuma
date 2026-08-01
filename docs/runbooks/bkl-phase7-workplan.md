@@ -4,9 +4,16 @@
 Prompt B: **7a done** (2026-08-01,
 [`../archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md`](../archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md)
 — `ALARM_QUEUE`'s real `Spinlock`, `critical_section` removed, timer-IRQ dispatch
-BKL-free behind `no-bkl-irq`; same-binary A/B: `irq/sched` 24.7%→10.2%). Per this
-doc's own instruction ("start at 7a and stop there for review"), 7b–7f are not
-started — resume at 7b (`ppoll`/`epoll_*` carve) next.
+BKL-free behind `no-bkl-irq`; same-binary A/B: `irq/sched` 24.7%→10.2%).
+Prompt C: **7b partially done** (2026-08-01,
+[`../archive/BKL_PHASE7B_PPOLL_CARVE_OUT.md`](../archive/BKL_PHASE7B_PPOLL_CARVE_OUT.md)
+— piece 1 (the `netpoll_drain`-shaped per-call window) landed and rides the existing
+`no-bkl-network` gate; piece 2 (a whole-syscall `PollBklGuard`) was built, found to cause
+an intermittent data-corruption race in a same-binary A/B, and reverted the same
+session — root cause points at the still-unlocked process table, `BKL_PHASE7_AUDIT.md`
+§2.1/§2.1.1). 7c–7f are not started — **do not re-attempt 7b piece 2 before 7e
+(process-table locking) lands**; resume at 7c (re-audit the already-carved residual)
+next.
 
 Two self-contained prompts, in order. **A** establishes a throughput baseline the campaign
 does not currently have; **B** executes Phase 7 against it. B depends on A's output.

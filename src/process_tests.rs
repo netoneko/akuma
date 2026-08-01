@@ -673,6 +673,14 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_timer_irq_preserves_bkl_state();
 
+    // Phase 7b piece 1: the per-call dropped window around `smoltcp_net::poll()` inside
+    // `sys_ppoll`/`sys_pselect6`/`sys_epoll_pwait`'s readiness loop (gated on
+    // `kernel_no_bkl_network`) — ledger balance on early-error and real guarded paths.
+    // Piece 2 (a whole-syscall `PollBklGuard`) was attempted and reverted: a same-binary
+    // A/B found an intermittent data-corruption race (docs/archive/
+    // BKL_PHASE7B_PPOLL_CARVE_OUT.md §4) — this test now covers piece 1 only.
+    test_poll_bkl_drop();
+
     // Phantom-SVC tripwire: runs LAST so it covers every EL0 trap the suite above
     // generated (fork/exec/signal/mmap stress). A nonzero count means an EC_SVC64
     // trap arrived whose insn@ELR-4 was not an `svc` — either stale I-cache or the
@@ -3238,6 +3246,153 @@ fn test_timer_irq_preserves_bkl_state() {
         crate::safe_print!(96, "[Test] timer_irq_preserves_bkl_state PASSED (held={})\n", held_before);
     } else {
         panic!("test_timer_irq_preserves_bkl_state: {fails} cases failed");
+    }
+}
+
+/// `sys_ppoll`/`sys_pselect6`/`sys_epoll_pwait` entry-point regression coverage, plus
+/// piece 1's per-call dropped-window ledger balance (Phase 7b piece 1 of
+/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md §7 — the `smoltcp_net::poll()` wrap in
+/// `src/syscall/poll.rs`, gated on `kernel_no_bkl_network`). Piece 2 (a whole-syscall
+/// `PollBklGuard`) was attempted and reverted after a same-binary A/B found an
+/// intermittent data-corruption race — see docs/archive/BKL_PHASE7B_PPOLL_CARVE_OUT.md
+/// §4 for the root-cause writeup. This test no longer exercises piece 2.
+///
+/// Drives the real syscall ENTRY points via `handle_syscall`, checking that
+/// `bkl::in_dropped_window()` is false once each call returns — piece 1's window must
+/// end balanced (trivially, since it never spans more than the single `poll()` call and
+/// closes long before any of the checks below run). The real-path cases use a freshly
+/// created pipe's WRITE end: `pipe_can_write` is true the instant the pipe exists
+/// (`read_count` starts at 1), so requesting `POLLOUT`/`EPOLLOUT` on it is ready on the
+/// very first loop iteration — every syscall below returns without ever reaching
+/// `schedule_blocking`, which is what makes this safe to drive from a boot self-test (a
+/// real block would need a second thread to wake it).
+fn test_poll_bkl_drop() {
+    use akuma_exec::bkl;
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid};
+    use akuma_exec::threading::current_thread_id;
+    use crate::syscall::{handle_syscall, nr, BYPASS_VALIDATION};
+    use core::sync::atomic::Ordering;
+
+    const EINVAL: u64 = (-22i64) as u64;
+    const EBADF: u64 = (-9i64) as u64;
+    const POLLOUT: i16 = 4;
+
+    #[repr(C)]
+    struct TestPollFd { fd: i32, events: i16, revents: i16 }
+    #[repr(C)]
+    struct TestTimespec { tv_sec: u64, tv_nsec: u64 }
+
+    let tid = current_thread_id();
+    let pid: u32 = 7705;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+
+    // Same trick `test_openat`/`test_unlinkat` use: let a kernel stack/heap address
+    // stand in for a user VA, since `copy_from_user_safe`/`copy_to_user_safe` are plain
+    // fault-guarded byte copies with no separate TTBR0-range check of their own (that's
+    // `validate_user_ptr`'s job, which this bypasses).
+    BYPASS_VALIDATION.store(true, Ordering::Release);
+    let mut fails = 0u32;
+    let balanced = |what: &str, fails: &mut u32| {
+        if bkl::in_dropped_window() {
+            *fails += 1;
+            crate::safe_print!(96, "[Test] poll-bkl-drop: {} left the window open\n", what);
+        }
+    };
+
+    // ── Early-error paths: must never open the window ──────────────────────
+    let r = handle_syscall(nr::PPOLL, &[0, 0, 0, 0, 0, 0]);
+    if r != 0 { fails += 1; crate::safe_print!(96, "[Test] poll-bkl-drop: ppoll(nfds=0) FAILED r={} (want 0)\n", r); }
+    balanced("ppoll(nfds=0)", &mut fails);
+
+    let r = handle_syscall(nr::PSELECT6, &[0, 0, 0, 0, 0, 0]);
+    if r != 0 { fails += 1; crate::safe_print!(96, "[Test] poll-bkl-drop: pselect6(nfds=0) FAILED r={} (want 0)\n", r); }
+    balanced("pselect6(nfds=0)", &mut fails);
+
+    #[cfg(feature = "sc-epoll")]
+    {
+        let r = handle_syscall(nr::EPOLL_PWAIT, &[0, 0, 0, 0, 0, 0]);
+        if r != EINVAL { fails += 1; crate::safe_print!(96, "[Test] poll-bkl-drop: epoll_pwait(maxevents=0) FAILED r={} (want EINVAL)\n", r); }
+        balanced("epoll_pwait(maxevents=0)", &mut fails);
+
+        let mut ev_buf = [0u8; 16];
+        let r = handle_syscall(nr::EPOLL_PWAIT, &[999, ev_buf.as_mut_ptr() as u64, 1, 0, 0, 0]);
+        if r != EBADF { fails += 1; crate::safe_print!(96, "[Test] poll-bkl-drop: epoll_pwait(bad epfd) FAILED r={} (want EBADF)\n", r); }
+        balanced("epoll_pwait(bad epfd)", &mut fails);
+    }
+
+    // ── Real guarded path ────────────────────────────────────────────────
+    let mut fds_buf = [0i32; 2];
+    let pipe_r = handle_syscall(nr::PIPE2, &[fds_buf.as_mut_ptr() as u64, 0, 0, 0, 0, 0]);
+    if pipe_r != 0 {
+        fails += 1;
+        crate::safe_print!(96, "[Test] poll-bkl-drop: pipe2 FAILED r={}\n", pipe_r as i64);
+    } else {
+        let write_fd = fds_buf[1];
+
+        let mut pfd = TestPollFd { fd: write_fd, events: POLLOUT, revents: 0 };
+        let ts = TestTimespec { tv_sec: 0, tv_nsec: 0 };
+        let r = handle_syscall(nr::PPOLL, &[(&raw mut pfd) as u64, 1, (&raw const ts) as u64, 0, 0, 0]);
+        if r != 1 || pfd.revents & POLLOUT == 0 {
+            fails += 1;
+            crate::safe_print!(96, "[Test] poll-bkl-drop: ppoll(pipe write fd) FAILED r={} revents={}\n", r as i64, pfd.revents);
+        }
+        balanced("ppoll(pipe write fd)", &mut fails);
+
+        let mut writefds: u64 = 1u64 << write_fd;
+        let ts2 = TestTimespec { tv_sec: 0, tv_nsec: 0 };
+        let r = handle_syscall(nr::PSELECT6, &[
+            (write_fd as u64) + 1,
+            0,
+            (&raw mut writefds) as u64,
+            0,
+            (&raw const ts2) as u64,
+            0,
+        ]);
+        if r != 1 || writefds & (1u64 << write_fd) == 0 {
+            fails += 1;
+            crate::safe_print!(96, "[Test] poll-bkl-drop: pselect6(pipe write fd) FAILED r={} mask={:#x}\n", r as i64, writefds);
+        }
+        balanced("pselect6(pipe write fd)", &mut fails);
+
+        #[cfg(feature = "sc-epoll")]
+        {
+            const EPOLL_CTL_ADD: u64 = 1;
+            const EPOLLOUT: u32 = 0x004;
+            let epfd = handle_syscall(nr::EPOLL_CREATE1, &[0, 0, 0, 0, 0, 0]);
+            if (epfd as i64) < 0 {
+                fails += 1;
+                crate::safe_print!(96, "[Test] poll-bkl-drop: epoll_create1 FAILED r={}\n", epfd as i64);
+            } else {
+                let ev = crate::syscall::poll::EpollEvent { events: EPOLLOUT, _pad: 0, data: 42 };
+                let ctl_r = handle_syscall(nr::EPOLL_CTL, &[epfd, EPOLL_CTL_ADD, write_fd as u64, (&raw const ev) as u64, 0, 0]);
+                if ctl_r != 0 {
+                    fails += 1;
+                    crate::safe_print!(96, "[Test] poll-bkl-drop: epoll_ctl ADD FAILED r={}\n", ctl_r as i64);
+                }
+                let mut out_ev = crate::syscall::poll::EpollEvent { events: 0, _pad: 0, data: 0 };
+                let r = handle_syscall(nr::EPOLL_PWAIT, &[epfd, (&raw mut out_ev) as u64, 1, 0, 0, 0]);
+                if r != 1 || out_ev.events & EPOLLOUT == 0 {
+                    fails += 1;
+                    crate::safe_print!(96, "[Test] poll-bkl-drop: epoll_pwait(pipe write fd) FAILED r={} events={:#x}\n", r as i64, out_ev.events);
+                }
+                balanced("epoll_pwait(pipe write fd)", &mut fails);
+            }
+        }
+
+        handle_syscall(nr::CLOSE, &[fds_buf[0] as u64, 0, 0, 0, 0, 0]);
+        handle_syscall(nr::CLOSE, &[write_fd as u64, 0, 0, 0, 0, 0]);
+    }
+
+    BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    if fails == 0 {
+        crate::safe_print!(160, "[Test] poll-bkl-drop PASSED (early-error paths + ppoll/pselect6/epoll_pwait real guarded path)\n");
+    } else {
+        crate::safe_print!(64, "[Test] poll-bkl-drop FAILED ({} cases)\n", fails);
+        panic!("test_poll_bkl_drop: {fails} cases failed");
     }
 }
 

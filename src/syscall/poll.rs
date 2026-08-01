@@ -599,10 +599,21 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
     let mut iterations = 0u64;
     loop {
         iterations += 1;
-        
-        // Drive network stack (only once per loop)
+
+        // Drive network stack (only once per loop). BKL carve-out (Phase 7b piece 1,
+        // docs/archive/BKL_PHASE7_AUDIT.md §3): every piece of state `poll()` touches is
+        // already behind its own `PreemptGuard`-protected `NETWORK`/`SOCKET_TABLE` lock —
+        // same precedent as the `netpoll_drain` carve in `src/main.rs`
+        // (`BKL_VFS_CARVE_OUT.md` §19–20), whose mechanism this reuses directly. Gated on
+        // `kernel_no_bkl_network` specifically, not `kernel_smp_shared` alone: that is what
+        // makes `PreemptGuard::new()` mask IRQs for the inner holds, which is what keeps a
+        // nested IRQ from ever observing this core "holding NETWORK, wanting the BKL".
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        akuma_exec::bkl::dropped_window_open();
         #[cfg(feature = "smoltcp")]
         akuma_net::smoltcp_net::poll();
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        akuma_exec::bkl::dropped_window_close();
 
         let mut kernel_events = alloc::vec![];
         let mut ready_count = 0usize;
@@ -815,8 +826,14 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
     let has_rump_fd = fd_set_wants_rump_poll_interval(&orig_read, &orig_write, nfds);
 
     loop {
+        // BKL carve-out (Phase 7b piece 1) — see the identical comment on the
+        // `sys_epoll_pwait` poll() call above.
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        akuma_exec::bkl::dropped_window_open();
         #[cfg(feature = "smoltcp")]
         akuma_net::smoltcp_net::poll();
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        akuma_exec::bkl::dropped_window_close();
         let mut ready_count: u64 = 0;
         let mut out_read = [0u64; MAX_FDS / 64];
         let mut out_write = [0u64; MAX_FDS / 64];
@@ -921,8 +938,14 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
     let has_rump_fd = kernel_fds.iter().any(|p| fd_wants_rump_poll_interval(p.fd));
 
     loop {
+        // BKL carve-out (Phase 7b piece 1) — see the identical comment on the
+        // `sys_epoll_pwait` poll() call above.
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        akuma_exec::bkl::dropped_window_open();
         #[cfg(feature = "smoltcp")]
         akuma_net::smoltcp_net::poll();
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        akuma_exec::bkl::dropped_window_close();
         let mut ready_count = 0;
 
         for fd in &mut kernel_fds {
