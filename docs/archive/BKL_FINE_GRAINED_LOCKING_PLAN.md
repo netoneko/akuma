@@ -598,6 +598,16 @@ locking gaps): 14 syscall families with zero carve-out — `poll`, `proc`, `sign
   `kernel_lock_recoveries()` tripwire), 0 PANIC/WILD/SPURIOUS, 0 stale dropped-window
   heals, and exact digests** — the campaign's standing bar, which is stronger evidence
   than wall-clock uptime alone
+- **The rustc/cargo scaling curve improves** (SMP=1 `-j1` → SMP=4 `-j4` speedup). This is
+  the throughput metric the campaign has been missing: `contention_spins` is a proxy,
+  digests are correctness-only, and the existing llama.cpp tok/s comparison is
+  compute/mmap-bound and barely touches process lifecycle. A Rust build hammers exactly
+  the un-carved holders (`execve`, `clone`, `openat`). Baseline it **before** starting 7a
+  — harness + prompt in
+  [`../runbooks/bkl-phase7-workplan.md`](../runbooks/bkl-phase7-workplan.md), results in
+  `BKL_RUSTC_SCALING_BASELINE.md`. If that curve turns out to be flat for reasons other
+  than the BKL (e.g. ext2-read-bound), it re-orders this phase — which is exactly why it
+  goes first.
 - No regression on the single-core default build (unaffected by construction: every BKL
   entry point is a `cfg(kernel_smp_shared)` no-op shim)
 
