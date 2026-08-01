@@ -152,12 +152,71 @@ pub fn dropped_window_close() {
     }
 }
 
+/// Close the current thread's innermost dropped-BKL window WITHOUT re-acquiring the
+/// BKL when it was the outermost one.
+///
+/// The exit half of the per-syscall BKL opt-out (Phase 7f,
+/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md §7.3): an opted-out syscall's whole
+/// EL0→EL1 excursion is one open dropped window that was opened WITHOUT a prior
+/// `enter_kernel` (the entry handler skipped the acquire), so its close must not take
+/// the lock either — the excursion ends by `eret`ing to EL0, where the BKL is released
+/// anyway. Everything in between (IRQ epilogues, preemption, migration, nested
+/// carve-out guards at depth ≥ 2) sees a perfectly ordinary dropped window, which is
+/// what keeps the mixed converted/unconverted state safe. Pair strictly with a
+/// `dropped_window_open()` made on the never-acquired entry path; every other dropper
+/// keeps using [`dropped_window_close`].
+#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[inline]
+pub fn dropped_window_close_no_reacquire() {
+    let _ = DROPPED_WINDOWS.close(crate::threading::current_thread_id());
+}
+
 /// `true` if the current thread is inside a deliberately-dropped-BKL window, i.e. its
 /// EL1 code must be resumed with the BKL RELEASED.
 #[cfg(all(kernel_smp_shared, target_os = "none"))]
 #[inline]
 pub fn in_dropped_window() -> bool {
     DROPPED_WINDOWS.is_open(crate::threading::current_thread_id())
+}
+
+/// RAII pause of the current thread's dropped-BKL window(s): construction closes every
+/// open window and takes the BKL (via [`reset_dropped_windows`]); drop reopens the same
+/// number of windows, releasing the lock again.
+///
+/// For the few cold paths a BKL-opted-out syscall (Phase 7f) shares with everything
+/// else that still genuinely need BKL-held execution — plain `Process`-field writes
+/// (cross-core exclusion for those is still the BKL, see locking.md's load-bearing
+/// table) and the phantom-SVC/QEMU-misroute fallout in the trap prologue. The depth is
+/// LATCHED at construction (the guard-latching rule): drop restores exactly what it
+/// found, regardless of runtime-toggle changes in between. On a thread with no open
+/// window (every non-converted path) both halves are no-ops, and off `smp-shared` the
+/// whole type compiles to nothing.
+pub struct DroppedWindowPause {
+    reopen_depth: u32,
+}
+
+impl DroppedWindowPause {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            reopen_depth: reset_dropped_windows(),
+        }
+    }
+}
+
+impl Default for DroppedWindowPause {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for DroppedWindowPause {
+    #[inline]
+    fn drop(&mut self) {
+        for _ in 0..self.reopen_depth {
+            dropped_window_open();
+        }
+    }
 }
 
 /// Force-clear the current thread's dropped-BKL windows and restore the "EL1 holds the
@@ -351,6 +410,10 @@ pub fn dropped_window_open() {}
 #[cfg(not(all(kernel_smp_shared, target_os = "none")))]
 #[inline(always)]
 pub fn dropped_window_close() {}
+
+#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[inline(always)]
+pub fn dropped_window_close_no_reacquire() {}
 
 #[cfg(not(all(kernel_smp_shared, target_os = "none")))]
 #[inline(always)]

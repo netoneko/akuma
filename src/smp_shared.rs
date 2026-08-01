@@ -222,6 +222,120 @@ pub fn set_irq_bkl_drop_enabled(on: bool) {
     IRQ_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
 }
 
+// --- The per-syscall BKL opt-out list (Phase 7f) ---------------------------------
+//
+// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md §7.3: instead of removing the BKL from
+// syscall entry in one step, `rust_sync_el0_handler` acquires it UNLESS the trapped
+// syscall's number is on this list. A listed syscall's whole EL0→EL1 excursion runs as
+// ONE open dropped-BKL window (opened without an acquire, closed without a re-acquire —
+// see `akuma_exec::bkl::dropped_window_close_no_reacquire`), relying on the same inner
+// locks its carve-out guard already proved sufficient; the guard itself stays in the
+// syscall body and self-neutralizes to a nested (depth-2) window, so REMOVING a syscall
+// from this list at runtime restores today's guard-scoped behaviour exactly.
+//
+// The compile-time seed starts EMPTY: an empty-list boot is behaviour-identical to one
+// without the mechanism (every syscall takes the `enter_kernel`/`leave_kernel` path,
+// verified by an A/B boot when this landed). Syscalls move onto the seed one at a time
+// under the standing A/B + digest discipline, each individually revertible at runtime
+// via `set_syscall_bkl_optout` (the per-syscall kill switch every prior phase leaned on).
+
+/// Compile-time seed for the opt-out list: syscall numbers whose whole excursion is
+/// BKL-free from boot. Keep this list SHORT-COMMENTED per entry with the phase that
+/// validated it. Entries must already run their entire body under a whole-fn
+/// carve-out guard (so conversion only deletes the entry/exit lock round-trip) —
+/// audit the code outside the guard before adding one.
+const SYSCALL_BKL_OPTOUT_SEED: &[u64] = &[
+    // Phase 7f tranche 1: the `no-bkl-network` family — whole-fn `NetBklGuard`
+    // since Phase 2, so the body already runs BKL-free; nothing outside the guard
+    // but the dispatch-arm casts. sendto/recvfrom/sendmsg/recvmsg are deliberately
+    // ABSENT: their unix-socket routing arm must stay BKL-held (AB-BA, locking.md).
+    198, // socket
+    200, // bind
+    201, // listen
+    202, // accept — window spans the blocking wait, exactly as its guard already did
+    203, // connect — blocking wait, same note as accept
+    204, // getsockname
+    205, // getpeername
+    208, // setsockopt
+    209, // getsockopt
+    242, // accept4
+    // getrandom (no-bkl-drivers family): DriverBklGuard covered everything but
+    // validate_user_ptr, which now also runs BKL-free — same exposure it already has
+    // inside every whole-fn net/vfs window (see the archive doc's follow-up note on
+    // folding ensure_user_pages_mapped under as_lock).
+    278, // getrandom
+    300, // resolve_host (Akuma-private DNS) — blocking wait, same note as accept
+];
+
+/// Syscalls that must NEVER be opted out, mechanism-level (not merely "not yet
+/// audited"): `exit` (93) and `exit_group` (94) never return through the opt-out exit
+/// path and their teardown must run BKL-held (`return_to_kernel`'s ledger reset is a
+/// safety net, not a design), and `rt_sigreturn` (139) is dispatched from the trap
+/// prologue before the opt-out window's assumptions about the excursion shape hold.
+const SYSCALL_BKL_OPTOUT_DENIED: &[u64] = &[93, 94, 139];
+
+/// Bitmap of syscall numbers (0..512 covers every Linux + Akuma-private number in
+/// `syscall::nr`) currently opted out of the syscall-entry BKL.
+static SYSCALL_BKL_OPTOUT: [AtomicU64; 8] = seeded_syscall_bkl_optout();
+
+const fn seeded_syscall_bkl_optout() -> [AtomicU64; 8] {
+    let mut words = [0u64; 8];
+    let mut i = 0;
+    while i < SYSCALL_BKL_OPTOUT_SEED.len() {
+        let nr = SYSCALL_BKL_OPTOUT_SEED[i];
+        assert!(nr < 512, "opt-out seed entry out of bitmap range");
+        let mut j = 0;
+        while j < SYSCALL_BKL_OPTOUT_DENIED.len() {
+            assert!(
+                nr != SYSCALL_BKL_OPTOUT_DENIED[j],
+                "opt-out seed entry is on the structural deny list"
+            );
+            j += 1;
+        }
+        words[(nr / 64) as usize] |= 1u64 << (nr % 64);
+        i += 1;
+    }
+    [
+        AtomicU64::new(words[0]),
+        AtomicU64::new(words[1]),
+        AtomicU64::new(words[2]),
+        AtomicU64::new(words[3]),
+        AtomicU64::new(words[4]),
+        AtomicU64::new(words[5]),
+        AtomicU64::new(words[6]),
+        AtomicU64::new(words[7]),
+    ]
+}
+
+/// Whether syscall `nr` is currently opted out of the syscall-entry BKL. Read ONCE at
+/// trap entry and latched for the excursion (locking.md's guard-latching rule) — the
+/// exit path must use the entry's decision, never a re-read.
+#[inline]
+pub fn syscall_bkl_optout(nr: u64) -> bool {
+    if nr >= 512 {
+        return false;
+    }
+    SYSCALL_BKL_OPTOUT[(nr / 64) as usize].load(Ordering::Relaxed) & (1u64 << (nr % 64)) != 0
+}
+
+/// Add/remove one syscall from the opt-out list at runtime — the per-syscall kill
+/// switch and the same-binary A/B handle. Returns `false` (and does nothing) for
+/// numbers outside the bitmap or on the structural deny list. In-flight excursions are
+/// unaffected either way: the entry handler latched its decision.
+pub fn set_syscall_bkl_optout(nr: u64, on: bool) -> bool {
+    if nr >= 512 || SYSCALL_BKL_OPTOUT_DENIED.contains(&nr) {
+        return false;
+    }
+    let word = &SYSCALL_BKL_OPTOUT[(nr / 64) as usize];
+    let bit = 1u64 << (nr % 64);
+    if on {
+        word.fetch_or(bit, Ordering::Relaxed);
+    } else {
+        word.fetch_and(!bit, Ordering::Relaxed);
+    }
+    true
+}
+
 /// Runtime toggle (default **off**) for the M5c optimization: run the scheduler SGI
 /// BKL-free when it preempted EL0 (userspace, no BKL held), so peer cores' timer ticks
 /// don't serialize on the BKL. Correct at SMP=2. Left **off** because at SMP≥4 it opens a

@@ -1319,6 +1319,13 @@ pub fn kill_child_processes_for_thread_group(l0_phys: usize) {
 /// Exit code is communicated via ProcessChannel for async callers.
 #[unsafe(no_mangle)]
 pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
+    // A BKL-opted-out syscall (Phase 7f per-syscall opt-out list) runs its whole EL0
+    // excursion inside an open dropped-BKL window, and this function never returns to
+    // that excursion's exit path — clear the thread's ledger and restore the "EL1
+    // holds the BKL" invariant before the teardown below touches shared lifecycle
+    // state (mirrors `return_to_kernel_from_fault`). No-op (depth 0) for every
+    // non-opted-out caller, i.e. all of them until the opt-out list is populated.
+    crate::bkl::reset_dropped_windows();
     // Serialize the entire teardown (channel notify, fd close, AS deactivate,
     // child/box kill, unregister) against concurrent lifecycle ops on peer cores.
     // Released explicitly before the terminal yield loop (this function never

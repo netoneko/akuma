@@ -699,6 +699,13 @@ pub fn run_all_tests() {
     // BKL_PHASE7B_PPOLL_CARVE_OUT.md §4) — this test now covers piece 1 only.
     test_poll_bkl_drop();
 
+    // Phase 7f milestone 0: the per-syscall BKL opt-out list (seeded empty) — list
+    // set/query + deny list, ledger balance across a real opted-out `handle_syscall`
+    // dispatch, the latched kill switch flipping mid-excursion, and
+    // `DroppedWindowPause` restoring BKL-held execution inside an opted-out window.
+    #[cfg(kernel_smp_shared)]
+    test_syscall_bkl_optout();
+
     // Phantom-SVC tripwire: runs LAST so it covers every EL0 trap the suite above
     // generated (fork/exec/signal/mmap stress). A nonzero count means an EC_SVC64
     // trap arrived whose insn@ELR-4 was not an `svc` — either stale I-cache or the
@@ -711,6 +718,11 @@ pub fn run_all_tests() {
     // FIFO ticket lock had to self-heal — see `test_no_bkl_ticket_recoveries`.
     #[cfg(kernel_smp_shared)]
     test_no_bkl_ticket_recoveries();
+
+    // Stale dropped-window tripwire: the "0 stale-depth heals" pass criterion, made a
+    // suite assertion. Runs LAST for the same coverage reason as the two above.
+    #[cfg(kernel_smp_shared)]
+    test_no_stale_window_heals();
 
     console::print("--- Process Execution Tests Done ---\n\n");
 }
@@ -3448,6 +3460,184 @@ fn test_poll_bkl_drop() {
     } else {
         crate::safe_print!(64, "[Test] poll-bkl-drop FAILED ({} cases)\n", fails);
         panic!("test_poll_bkl_drop: {fails} cases failed");
+    }
+}
+
+/// The per-syscall BKL opt-out list (Phase 7f milestone 0,
+/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md §7.3): an opted-out syscall's whole
+/// excursion runs as one open dropped-BKL window, opened without an `enter_kernel` and
+/// closed without a re-acquire, with the decision LATCHED at entry. This test drives a
+/// real opted-out dispatch through `handle_syscall` between the exact entry/exit
+/// primitives `rust_sync_el0_handler` uses, and pins:
+///
+/// - list query/set + the structural deny list (`exit`/`exit_group`/`rt_sigreturn`);
+/// - ledger balance across a real opted-out dispatch whose body guard
+///   (`DriverBklGuard` inside `sys_getrandom`) nests as an inner window, and across an
+///   early-error dispatch;
+/// - the kill switch flipping MID-excursion: the exit path follows the latched entry
+///   decision, so the ledger and the ticket FIFO stay balanced (the guard-latching
+///   rule, locking.md);
+/// - `DroppedWindowPause` restoring genuine BKL-held execution inside an opted-out
+///   window (the `handle_syscall` interrupted-arm / phantom-SVC shape) and resuming
+///   the window on drop.
+///
+/// The boot-test thread runs at EL1 holding the BKL, so the "entry" half here is
+/// `dropped_window_open()` (which releases the held lock — the opted-out steady state
+/// is identical from there on) and the test re-acquires after the "exit" half to
+/// restore its own invariant.
+#[cfg(kernel_smp_shared)]
+fn test_syscall_bkl_optout() {
+    use akuma_exec::bkl;
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid};
+    use akuma_exec::threading::current_thread_id;
+    use crate::smp_shared::{set_syscall_bkl_optout, syscall_bkl_optout};
+    use crate::syscall::{handle_syscall, nr, BYPASS_VALIDATION};
+    use core::sync::atomic::Ordering;
+
+    const EFAULT: u64 = (-14i64) as u64;
+
+    let tid = current_thread_id();
+    let pid: u32 = 7706;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+
+    let mut fails = 0u32;
+
+    // ── List semantics: set/clear, deny list ───────────────────────────────
+    // GETRANDOM may legitimately arrive opted out via the compile-time seed
+    // (tranche 1) — remember and restore rather than assuming an empty list.
+    let getrandom_was_opted_out = syscall_bkl_optout(nr::GETRANDOM);
+    if !set_syscall_bkl_optout(nr::GETRANDOM, true) || !syscall_bkl_optout(nr::GETRANDOM) {
+        fails += 1;
+        crate::safe_print!(96, "[Test] syscall-bkl-optout: set(GETRANDOM, on) did not take\n");
+    }
+    for denied in [93u64, 94, 139, 512, 4096] {
+        if set_syscall_bkl_optout(denied, true) || syscall_bkl_optout(denied) {
+            fails += 1;
+            crate::safe_print!(96, "[Test] syscall-bkl-optout: denied nr={} was accepted\n", denied);
+        }
+    }
+
+    // ── Real opted-out dispatch: ledger balanced, inner guard nests ────────
+    let recoveries_before = akuma_exec::sync::kernel_lock_recoveries();
+    {
+        // Entry half (rust_sync_el0_handler shape): latch, open the window.
+        let latched = syscall_bkl_optout(nr::GETRANDOM);
+        bkl::dropped_window_open();
+        if bkl::held_by_current() {
+            fails += 1;
+            crate::safe_print!(96, "[Test] syscall-bkl-optout: BKL still held inside the opted-out window\n");
+        }
+        BYPASS_VALIDATION.store(true, Ordering::Release);
+        let mut buf = [0u8; 16];
+        let r = handle_syscall(nr::GETRANDOM, &[buf.as_mut_ptr() as u64, 16, 0, 0, 0, 0]);
+        BYPASS_VALIDATION.store(false, Ordering::Release);
+        if r != 16 {
+            fails += 1;
+            crate::safe_print!(96, "[Test] syscall-bkl-optout: getrandom FAILED r={} (want 16)\n", r as i64);
+        }
+        if !bkl::in_dropped_window() {
+            fails += 1;
+            crate::safe_print!(96, "[Test] syscall-bkl-optout: window closed early (inner guard re-acquired?)\n");
+        }
+        // Exit half: the latched decision closes without re-acquiring.
+        if latched {
+            bkl::dropped_window_close_no_reacquire();
+        }
+        bkl::enter_kernel(); // test scaffolding: restore the boot thread's held state
+    }
+    if bkl::in_dropped_window() {
+        fails += 1;
+        crate::safe_print!(96, "[Test] syscall-bkl-optout: real dispatch left the window open\n");
+    }
+
+    // ── Early-error dispatch inside the window: still balanced ─────────────
+    {
+        bkl::dropped_window_open();
+        let r = handle_syscall(nr::GETRANDOM, &[0, 16, 0, 0, 0, 0]);
+        if r != EFAULT {
+            fails += 1;
+            crate::safe_print!(96, "[Test] syscall-bkl-optout: getrandom(null) FAILED r={} (want EFAULT)\n", r as i64);
+        }
+        bkl::dropped_window_close_no_reacquire();
+        bkl::enter_kernel();
+    }
+    if bkl::in_dropped_window() {
+        fails += 1;
+        crate::safe_print!(96, "[Test] syscall-bkl-optout: early-error dispatch left the window open\n");
+    }
+
+    // ── Kill switch mid-excursion: exit follows the LATCHED decision ───────
+    {
+        let latched = syscall_bkl_optout(nr::GETRANDOM);
+        bkl::dropped_window_open();
+        set_syscall_bkl_optout(nr::GETRANDOM, false); // flip while "in flight"
+        if latched {
+            bkl::dropped_window_close_no_reacquire();
+        }
+        bkl::enter_kernel();
+        if bkl::in_dropped_window() {
+            fails += 1;
+            crate::safe_print!(96, "[Test] syscall-bkl-optout: mid-flight toggle flip unbalanced the ledger\n");
+        }
+        if syscall_bkl_optout(nr::GETRANDOM) {
+            fails += 1;
+            crate::safe_print!(96, "[Test] syscall-bkl-optout: kill switch did not clear the bit\n");
+        }
+    }
+    set_syscall_bkl_optout(nr::GETRANDOM, getrandom_was_opted_out);
+
+    // ── DroppedWindowPause: held inside the window, window resumes on drop ──
+    {
+        bkl::dropped_window_open();
+        {
+            let _held = bkl::DroppedWindowPause::new();
+            if bkl::in_dropped_window() || !bkl::held_by_current() {
+                fails += 1;
+                crate::safe_print!(96, "[Test] syscall-bkl-optout: pause did not restore BKL-held state\n");
+            }
+        }
+        if !bkl::in_dropped_window() {
+            fails += 1;
+            crate::safe_print!(96, "[Test] syscall-bkl-optout: pause drop did not resume the window\n");
+        }
+        bkl::dropped_window_close_no_reacquire();
+        bkl::enter_kernel();
+    }
+
+    let recoveries_after = akuma_exec::sync::kernel_lock_recoveries();
+    if recoveries_after != recoveries_before {
+        fails += 1;
+        crate::safe_print!(128,
+            "[Test] syscall-bkl-optout: ticket recoveries moved {} -> {} (accounting unbalanced)\n",
+            recoveries_before, recoveries_after);
+    }
+
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    if fails == 0 {
+        crate::safe_print!(160, "[Test] syscall_bkl_optout PASSED (list + latch + ledger balance + pause)\n");
+    } else {
+        crate::safe_print!(64, "[Test] syscall_bkl_optout FAILED ({} cases)\n", fails);
+        panic!("test_syscall_bkl_optout: {fails} cases failed");
+    }
+}
+
+/// Asserts the EL0-entry stale dropped-window tripwire never fired across the suite —
+/// the "0 stale-depth heals" pass criterion every carve-out phase (and the Phase 7f
+/// opt-out list especially) runs under. A heal means a window leaked past its
+/// excursion: with the opt-out mechanism live, that would be an opted-out syscall
+/// whose exit path failed to close, or a never-return path that skipped the
+/// `return_to_kernel` ledger reset. Runs LAST, like `test_no_spurious_svc_traps`.
+#[cfg(kernel_smp_shared)]
+fn test_no_stale_window_heals() {
+    let n = crate::exceptions::stale_window_heal_count();
+    if n == 0 {
+        console::print("[Test] no_stale_window_heals PASSED (0 heals)\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] no_stale_window_heals FAILED: {} stale dropped-window heal(s) during boot suite\n", n);
     }
 }
 

@@ -361,6 +361,36 @@ serialized against concurrent readers the way `write_file`/`create_dir` are.
 Not currently exposed to a BKL-free window — audit this before converting
 `truncate`/`ftruncate`.
 
+### The per-syscall BKL opt-out list — Phase 7f (`src/smp_shared.rs` + `src/exceptions.rs`)
+
+Since 2026-08-01, `rust_sync_el0_handler` acquires the BKL **unless the trapped
+syscall's number is on the opt-out list** (`SYSCALL_BKL_OPTOUT`, a 512-bit atomic
+bitmap seeded from the compile-time `SYSCALL_BKL_OPTOUT_SEED`) — the §7.3 "invert the
+default" mechanism from the fine-grained-locking plan. A listed syscall's whole
+excursion runs as ONE open dropped-BKL window: opened at entry *without* an acquire,
+closed at exit *without* a re-acquire (`bkl::dropped_window_close_no_reacquire`), the
+decision latched at entry. IRQ epilogues consult the ledger exactly as for guard
+windows, the body's now-redundant carve-out guard nests as a depth-2 window (guards
+are deliberately left in place — removing a syscall from the list at runtime via
+`set_syscall_bkl_optout(nr, false)`, the per-syscall kill switch, restores the
+guard-scoped behaviour without a rebuild), and the cold shared paths that genuinely
+need BKL-held execution pause the window (`bkl::DroppedWindowPause`): the
+`handle_syscall` interrupted-arm plain-field write, the phantom-SVC give-up path, the
+STP-XZR-misroute demand-page path. `return_to_kernel` force-clears the ledger at its
+top (mirroring `return_to_kernel_from_fault`) so never-return exits inside an
+opted-out excursion cannot leak depth; `exit`/`exit_group`/`rt_sigreturn` are on a
+structural deny list. The EL0-entry heal tripwire now feeds a counter
+(`exceptions::stale_window_heal_count()`) asserted 0 by the boot suite.
+
+Currently listed (tranche 1, all previously whole-fn-guarded so conversion only
+deleted the entry/exit lock round-trip): `socket`, `bind`, `listen`, `accept`,
+`accept4`, `connect`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt`,
+`resolve_host`, `getrandom`. **`sendto`/`recvfrom`/`sendmsg`/`recvmsg` must not be
+listed wholesale** — their unix-socket routing arm runs before their guard and stays
+BKL-held (the AB-BA note below). `KernelLock`/`reconcile_for_spsr`/the ledger/the
+guards must survive until the un-converted set is empty. See
+[`BKL_PHASE7F_OPTOUT_LIST.md`](../../archive/BKL_PHASE7F_OPTOUT_LIST.md).
+
 ### `no-bkl-network` — `src/syscall/net.rs`
 
 `NetBklGuard` is purely compile-time gated (no runtime toggle, no latching

@@ -2250,16 +2250,36 @@ pub fn spurious_svc_count() -> u64 {
 /// on another core) and the live syndrome registers then belong to someone
 /// else's trap. Same for ELR_EL1 — use the frame's saved copy.
 extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u64) -> u64 {
-    akuma_exec::bkl::enter_kernel();
+    // Per-syscall BKL opt-out (Phase 7f, BKL_FINE_GRAINED_LOCKING_PLAN.md §7.3):
+    // acquire the BKL UNLESS the trapped syscall's number is on the opt-out list.
+    // The decision is LATCHED here and reused verbatim on every exit path below —
+    // never re-read (the guard-latching rule in locking.md; a mid-syscall toggle
+    // flip must not unbalance entry against exit). An opted-out excursion runs as
+    // ONE open dropped-BKL window, opened after the tripwire and closed without a
+    // re-acquire at exit, so an IRQ landing anywhere inside reconciles to
+    // "released" via the ledger instead of silently re-acquiring-and-holding, and
+    // the body's now-redundant carve-out guard nests as an inner (depth-2) window.
+    // Faults (EC != SVC64) always take the lock. `frame` is this thread's own
+    // kernel stack — reading x8 pre-acquire touches no shared state.
+    #[cfg(kernel_smp_shared)]
+    let bkl_optout = ((esr >> 26) & 0x3F) == esr::EC_SVC64
+        && crate::smp_shared::syscall_bkl_optout(unsafe { (*frame).x8 });
+    #[cfg(not(kernel_smp_shared))]
+    let bkl_optout = false;
+    if !bkl_optout {
+        akuma_exec::bkl::enter_kernel();
+    }
     // Tripwire: a thread entering from EL0 can have no open dropped-BKL window — the
     // guards live entirely inside one excursion. A nonzero depth here is a leak (an
     // abnormal unwind skipped a guard's destructor, or a recycled slot inherited state);
     // left in place it would make this excursion's IRQ epilogues silently RELEASE the
-    // BKL mid-syscall. Heal it and say so.
+    // BKL mid-syscall. Heal it and say so. Must stay AHEAD of the opt-out window open
+    // below so it can never mistake this excursion's own legitimate window for a leak.
     #[cfg(kernel_smp_shared)]
     if akuma_exec::bkl::in_dropped_window() {
         let leaked = akuma_exec::bkl::reset_dropped_windows();
         if leaked != 0 {
+            STALE_WINDOW_HEALS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             static STALE_WINDOW_TRACE: core::sync::atomic::AtomicU32 =
                 core::sync::atomic::AtomicU32::new(0);
             if STALE_WINDOW_TRACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
@@ -2271,6 +2291,12 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
                 );
             }
         }
+    }
+    // Open the opted-out excursion's window. `dropped_window_open`'s `leave_kernel`
+    // is the idempotent-release no-op on the common path (we never acquired) and the
+    // genuine release on the just-healed-tripwire path (the heal re-acquired).
+    if bkl_optout {
+        akuma_exec::bkl::dropped_window_open();
     }
     // Record that this core serviced a user (EL0) trap — the M3 cross-core-userspace
     // proof (an EL0 trap only comes from userspace running on this core).
@@ -2285,15 +2311,41 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
     // "freeze"). The thread still holds the BKL at this point (same state as
     // the sys_exit/sys_exit_group self-termination paths); mark + yield
     // reconciles the BKL on switch-out. (Never reached for the exit paths,
-    // which don't return from `_inner`.)
+    // which don't return from `_inner`.) An opted-out excursion first closes
+    // its window and takes the lock — it never returns to EL0, so this is the
+    // window's real end, and the terminal mark+yield must run in the same
+    // BKL-held state every other path gives it.
     #[cfg(kernel_smp_shared)]
     if akuma_exec::threading::take_thread_kill_request() {
+        if bkl_optout {
+            akuma_exec::bkl::dropped_window_close_no_reacquire();
+            akuma_exec::bkl::enter_kernel();
+        }
         let tid = akuma_exec::threading::current_thread_id();
         akuma_exec::threading::mark_thread_terminated(tid);
         loop { akuma_exec::threading::yield_now(); }
     }
-    akuma_exec::bkl::leave_kernel();
+    if bkl_optout {
+        akuma_exec::bkl::dropped_window_close_no_reacquire();
+    } else {
+        akuma_exec::bkl::leave_kernel();
+    }
     ret
+}
+
+/// Total stale dropped-window depths healed at EL0 entry (the tripwire in
+/// [`rust_sync_el0_handler`]). Healthy runs keep this at 0 — a nonzero count means a
+/// window leaked past an excursion's end (abnormal unwind skipping a guard destructor,
+/// or a recycled thread slot inheriting depth) and is part of every phase's pass
+/// criterion; the boot suite asserts it stays 0 (see `process_tests`).
+#[cfg(kernel_smp_shared)]
+static STALE_WINDOW_HEALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read the stale-window heal counter (see [`STALE_WINDOW_HEALS`]).
+#[cfg(kernel_smp_shared)]
+#[cfg_attr(any(feature = "no-tests", kernel_profile_size), allow(dead_code))]
+pub fn stale_window_heal_count() -> u64 {
+    STALE_WINDOW_HEALS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) -> u64 {
@@ -2540,6 +2592,12 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     let prev_is_svc = prev_instr
                         .is_some_and(|i| (i & 0xFFE0001F) == 0xD4000001);
                     if !prev_is_svc {
+                        // Misrouted trap with a garbage x8 that may have latched a BKL
+                        // opt-out: the demand-page install below (map_user_page +
+                        // frame tracking, no `as_lock`) ran BKL-held before Phase 7f —
+                        // pause the window so it stays that way. Reopens on the early
+                        // return (outer close stays balanced); no-op when no window.
+                        let _held = akuma_exec::bkl::DroppedWindowPause::new();
                         let base = if rn < 31 {
                             unsafe { core::ptr::read_volatile((frame as *const u64).add(rn)) }
                         } else { 0 };
@@ -2586,6 +2644,12 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             // the trap PC; with no handler, kill the thread group like any
             // other fatal fault.
             if spurious_svc_give_up {
+                // The garbage x8 may have latched a BKL opt-out for this excursion —
+                // the signal/kill fallout below is lifecycle work and must run
+                // BKL-held. Pause the window (no-op when none is open): the deliver
+                // branch reopens it on return (the outer close stays balanced); the
+                // kill branch never returns and `return_to_kernel` resets the ledger.
+                let _held = akuma_exec::bkl::DroppedWindowPause::new();
                 let elr = frame_ref.elr_el1;
                 crate::safe_print!(128,
                     "[SPURIOUS-SVC] undispatchable phantom SVC at elr={:#x} — delivering SIGILL\n", elr);
