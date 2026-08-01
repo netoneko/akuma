@@ -1,8 +1,10 @@
 # `test_epoll_multi_poller_pipe`: a boot-suite flake that is a test defect, not a kernel bug
 
 **Status**: Investigated 2026-08-02 during Phase 7f tranche 2
-([`BKL_PHASE7F_OPTOUT_LIST.md`](BKL_PHASE7F_OPTOUT_LIST.md) §5.4). Not fixed — the
-test is unchanged. This doc exists because the flake **cost a conversion decision**:
+([`BKL_PHASE7F_OPTOUT_LIST.md`](../archive/BKL_PHASE7F_OPTOUT_LIST.md) §5.4). **Fixed
+2026-08-02** as its own change — both defects in §4 remedied exactly as §6 proposed;
+verification series in §8. Sections 1–5 are the original investigation, kept verbatim.
+This doc exists because the flake **cost a conversion decision**:
 it fired twice in a row immediately after a BKL opt-out entry was added, looked
 exactly like a regression, and took six extra boots to exonerate.
 
@@ -17,7 +19,7 @@ single boot to accept or reject a change.
 
 Never `woken=0`. Never a hang, a panic, or a tripwire. The suite continues normally
 and every other test passes. Prior documentation
-([`BKL_PHASE7B_PPOLL_CARVE_OUT.md`](BKL_PHASE7B_PPOLL_CARVE_OUT.md) §5) recorded it as
+([`BKL_PHASE7B_PPOLL_CARVE_OUT.md`](../archive/BKL_PHASE7B_PPOLL_CARVE_OUT.md) §5) recorded it as
 "pre-existing SMP=4 scheduling-jitter flakiness", seen once in three boots. That
 undersells both the rate and the core count.
 
@@ -146,7 +148,7 @@ For a binary accept/reject on a change that plausibly touches scheduling, pipes,
 epoll, treat ≥4 clean boots as the bar and compare against a same-session
 stash baseline, not against a count written in a doc.
 
-## 6. Suggested fix (not applied)
+## 6. The fix (applied 2026-08-02)
 
 Both defects have a direct remedy, and the primitive for the first one **already
 exists** — `pipe_pollers_count()` (`src/syscall/pipe.rs:326`), a test-only helper
@@ -165,11 +167,26 @@ With both, the test asserts what it is named for — that *multiple* pollers on 
 are all woken — instead of asserting that two threads win a race against a 10 ms
 timer. Failure would then mean a real multi-poller wake bug.
 
-Deliberately **not** done here: this is a test change in the middle of a locking
-campaign that uses the boot suite's pass counts as its A/B instrument, and changing a
-test's outcome distribution mid-campaign would invalidate the baseline comparisons the
-tranche-2 verification rests on. It should land as its own change, with its own
-before/after boot series.
+Deliberately **not** done during tranche 2: this is a test change in the middle of a
+locking campaign that uses the boot suite's pass counts as its A/B instrument, and
+changing a test's outcome distribution mid-campaign would invalidate the baseline
+comparisons the tranche-2 verification rests on. It landed afterwards as its own
+change, with its own boot series (§8).
+
+### 6.1 What was applied
+
+`src/process_tests.rs`, `test_epoll_multi_poller_pipe`. No kernel change — §4.1 stands,
+the wake path was never at fault.
+
+1. The 2 ms sleep is replaced by a spin on `pipe_pollers_count(pipe_id) >= 2`, bounded
+   at 500 ms. `pollers` is only ever drained by a write or a close, none of which has
+   happened at that point, so the count is monotonic up to 2 and the poll is race-free.
+2. Missing the handshake is now its own FAIL line — `pollers=N (expected 2) … pollers
+   never registered` — distinct from the wake failure, so a real registration bug
+   surfaces instead of being masked as `woken=1`.
+3. The wake budget is `WAKE_BUDGET_US = 100_000` (was 10 000, equal to
+   `BLOCKING_POLL_INTERVAL_US`), still 50× under the threads' own 5000 ms
+   `epoll_pwait` timeout.
 
 ## 7. Reproduction
 
@@ -188,17 +205,42 @@ for run in 1 2 3 4 5 6; do
 done
 ```
 
-Expect roughly 1–2 failures in 6. Note the NULs in the log (`grep -a`), and that
-nothing else may hold `devbox.img` open.
+Expect roughly 1–2 failures in 6 **before** the §6.1 fix; 0 in 6 after (§8). Note the
+NULs in the log (`grep -a`), and that nothing else may hold `devbox.img` open.
+
+## 8. Verification of the fix
+
+10 boots, `release-smp-shared --features devbox-smoltcp`, `DISK=devbox.img
+MEMORY=4096 INSTANCE=60`, single session, all with the fix:
+
+| SMP | boots | failures |
+|---|---|---|
+| 1 | 1 | 0 |
+| 2 | 6 | 0 |
+| 4 | 3 | 0 |
+| **total** | **10** | **0** |
+
+The SMP=2 leg is the §7 repro verbatim, which predicts 1–2 failures in 6 unfixed. All
+10 suites ran to `Process Execution Tests Done`. Pass counts were identical across
+boots at each core count (353 at SMP=2, 351 at SMP=4, 345 at SMP=1), with the same two
+pre-existing unrelated failures in every boot (`PermissionDenied -> EPERM` errno
+mapping, and `stp_xzr_ec15_handler_fires`, which depends on whether QEMU emits EC=0x15
+or EC=0x25). Host tests and clippy clean.
+
+Zero failures in 10 does not by itself prove the mechanism is gone — at the old 31%
+rate it is p ≈ 0.02, strong but not conclusive. The reason to believe it is §4: both
+inputs to the race were removed, not merely made less likely. Note also that §5's rule
+still applies to *other* changes: this test getting quieter does not make a single boot
+a valid A/B instrument.
 
 ---
 
 ## Background
 
-- [`BKL_PHASE7F_OPTOUT_LIST.md`](BKL_PHASE7F_OPTOUT_LIST.md) §5.4 — the tranche-2
+- [`BKL_PHASE7F_OPTOUT_LIST.md`](../archive/BKL_PHASE7F_OPTOUT_LIST.md) §5.4 — the tranche-2
   conversion decision this flake nearly derailed, and the boot-count methodology it
   forced.
-- [`BKL_PHASE7B_PPOLL_CARVE_OUT.md`](BKL_PHASE7B_PPOLL_CARVE_OUT.md) §5 — the earlier
+- [`BKL_PHASE7B_PPOLL_CARVE_OUT.md`](../archive/BKL_PHASE7B_PPOLL_CARVE_OUT.md) §5 — the earlier
   sighting ("once out of three SMP=4 boots"), recorded as SMP=4-only.
 - [`../reference/subsystems/locking.md`](../reference/subsystems/locking.md) — the
   A/B playbook whose "re-measure before quoting" rule this is a concrete case of.

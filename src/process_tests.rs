@@ -8394,7 +8394,7 @@ fn test_epoll_check_fd_readiness_unknown_fd() {
 /// Test that multiple epoll instances waiting on the same pipe are all woken.
 fn test_epoll_multi_poller_pipe() {
     use crate::syscall::poll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait};
-    use crate::syscall::pipe::{pipe_create, pipe_write, pipe_close_write, pipe_close_read};
+    use crate::syscall::pipe::{pipe_create, pipe_write, pipe_close_write, pipe_close_read, pipe_pollers_count};
     use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid, FileDescriptor};
     use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -8448,16 +8448,37 @@ fn test_epoll_multi_poller_pipe() {
         loop { akuma_exec::threading::yield_now(); }
     }).expect("thread 2 spawn failed");
 
-    // Small delay to ensure they are waiting
+    // Handshake: wait until BOTH threads have actually registered as pollers on
+    // the pipe, rather than assuming a fixed sleep was long enough for them to be
+    // scheduled. A timed delay here made the test flake at ~30% of SMP>=2 boots
+    // (docs/archive/EPOLL_MULTI_POLLER_PIPE_FLAKE.md §4.2): under boot-suite load a
+    // freshly spawned thread can miss the window entirely, which pushes it onto the
+    // 10ms epoll re-poll fallback. `pollers` is only ever drained by a write/close,
+    // none of which has happened yet, so the count is monotonic up to 2 here.
+    const REGISTER_TIMEOUT_US: u64 = 500_000;
     let wait_start = crate::timer::uptime_us();
-    while crate::timer::uptime_us() - wait_start < 2000 { akuma_exec::threading::yield_now(); }
+    while pipe_pollers_count(pipe_id) < 2
+        && (crate::timer::uptime_us() - wait_start < REGISTER_TIMEOUT_US)
+    {
+        akuma_exec::threading::yield_now();
+    }
+    // Report separately from the wake count: a genuine registration bug must
+    // surface here instead of being masked as a missing wakeup below.
+    let registered = pipe_pollers_count(pipe_id);
 
     // Trigger event
     pipe_write(pipe_id, b"data").unwrap();
 
-    // Wait for both to be woken
+    // Wait for both to be woken. The budget must be comfortably larger than
+    // BLOCKING_POLL_INTERVAL_US (10ms, src/syscall/poll.rs): a poller that takes the
+    // interval fallback re-checks at t ~= 10ms, so a 10ms budget made the outcome a
+    // coin flip between two identical timers (same doc, §4.3). 100ms is still 50x
+    // under the 5000ms epoll_pwait timeout the threads themselves use.
+    const WAKE_BUDGET_US: u64 = 100_000;
     let wait_start = crate::timer::uptime_us();
-    while WOKEN_COUNT.load(Ordering::SeqCst) < 2 && (crate::timer::uptime_us() - wait_start < 10000) {
+    while WOKEN_COUNT.load(Ordering::SeqCst) < 2
+        && (crate::timer::uptime_us() - wait_start < WAKE_BUDGET_US)
+    {
         akuma_exec::threading::yield_now();
     }
 
@@ -8476,7 +8497,13 @@ fn test_epoll_multi_poller_pipe() {
     unregister_process(pid);
     unregister_thread_pid(tid);
 
-    if final_count == 2 {
+    if registered < 2 {
+        crate::safe_print!(
+            160,
+            "[Test] test_epoll_multi_poller_pipe FAILED: pollers={} (expected 2) after {}ms — pollers never registered\n",
+            registered, REGISTER_TIMEOUT_US / 1000
+        );
+    } else if final_count == 2 {
         console::print("[Test] test_epoll_multi_poller_pipe PASSED\n");
     } else {
         crate::safe_print!(128, "[Test] test_epoll_multi_poller_pipe FAILED: woken={} (expected 2)\n", final_count);
