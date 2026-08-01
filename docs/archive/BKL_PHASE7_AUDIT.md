@@ -454,10 +454,22 @@ halves:
 **Nothing about removing the BKL from syscall entry should be attempted before both
 halves land.**
 
-**7f — removal, if and only if 7a–7e land.** Only at that point do the plan's original
-four tasks (syscall-entry BKL removal, `reconcile_for_spsr` deletion, `KernelLock`
-deletion, extended SMP=4 stress) become well-defined. `execve` (§2.4) and `clone` (§2.5)
-would still need converting or explicitly re-serializing under a narrower lock.
+**7f — wither the BKL; do not remove it.** The plan's original tasks 1–3 are replaced by a
+per-syscall opt-in list: `rust_sync_el0_handler` goes from "always acquire" to "acquire
+unless this syscall is converted," seeded **empty** (byte-identical behaviour), then
+syscalls move across one at a time. Bisectable, keeps the per-syscall kill switch every
+prior phase relied on, and makes `KernelLock`/`reconcile_for_spsr`/the ledger/the five
+guards *provably* dead code at the end — so deleting them is bookkeeping, not a
+behavioural change. Critically, the ledger and `reconcile_for_spsr` must **survive** the
+whole traversal: a converted syscall is a permanently-open dropped window, and the
+ledger's invariant is what makes the mixed state safe.
+
+Rationale, and the remaining conversion surface (14 untouched syscall families + ~13
+leftover `fs` syscalls, none above the noise floor — so no attribution signal to guide or
+validate them), are written up in
+[`BKL_FINE_GRAINED_LOCKING_PLAN.md`](BKL_FINE_GRAINED_LOCKING_PLAN.md) §7.3, which is now
+the canonical statement of this phase. `execve` (§2.4) and `clone` (§2.5) are the last two
+across, after 7e.
 
 A note on ordering rationale: this list deliberately does *not* follow contention rank.
 `execve` at 22.3% outranks everything in 7a–7d, but it has no inner lock and is

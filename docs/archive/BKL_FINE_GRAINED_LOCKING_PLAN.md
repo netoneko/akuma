@@ -1,8 +1,11 @@
 # BKL Fine-Grained Locking Plan
 
-**Status**: Phase 0 Complete - Network Audit Done  
-**Strategy**: Phased Removal (eliminate BKL completely)  
-**Target First**: Networking stack
+**Status** (2026-08-01): Phases 0–6 complete and default-on in `smp-shared`. **Phase 7
+replanned** — the originally-planned removal is not executable; see
+[`BKL_PHASE7_AUDIT.md`](BKL_PHASE7_AUDIT.md) and §7 below.  
+**Strategy**: Phased carve-out, then *wither* the BKL via a per-syscall opt-in list
+(§7.3) rather than removing it in one step.  
+**Target First**: Networking stack (done)
 
 ---
 
@@ -10,11 +13,26 @@
 
 This plan breaks up the Big Kernel Lock (BKL) into fine-grained subsystem locks, eliminating it completely through a phased approach. The networking stack is targeted first because it has well-defined boundaries and some existing BKL-drop optimizations.
 
-**Current State** (2026-07-24):
+**Current State** (2026-07-24, as written at the time):
 - Single fair FIFO `KernelLock` serializes all kernel (EL1) execution across cores
 - Held "iff a core is in EL1", reconciled at EL transitions
-- Scheduler/IRQ path holds ~70% of contended BKL time
+- ~~Scheduler/IRQ path holds ~70% of contended BKL time~~ — **WRONG, and this line is
+  where the error propagated from.** It was a Phase 0 estimate; when finally measured it
+  was 27%, and the 66–73% figure that later seemed to confirm it came from a profiler that
+  credited a preempted thread's whole remaining syscall to `irq/sched`. Fixed and
+  re-measured: **23.0%**, and ~21–23% fresh at HEAD after Phases 5–6 and the
+  `netpoll_drain` carve. Largest remaining holders are `execve` (~22%) and `clone`
+  (~10–13%). See [`BKL_PHASE7_AUDIT.md`](BKL_PHASE7_AUDIT.md) §1.
 - Networking has existing fine-grained locks but still requires BKL at syscall boundaries
+
+**Current State** (2026-08-01, measured):
+- Phases 1–6 landed: `no-bkl-network`, `no-bkl-vfs`, `no-bkl-process`, `no-bkl-mm`,
+  `no-bkl-drivers`, plus the `netpoll_drain` carve — all default-on in `smp-shared`
+- The BKL is still **load-bearing**, not redundant, for six structures whose only
+  cross-core guard is `with_irqs_disabled` (audit §2). It is a shim over the single-core
+  ownership model `main` still has, not debt this effort added.
+- Removal is gated on giving those structures real locks — not on further syscall
+  carve-outs
 
 **Goal**: Replace BKL with subsystem-specific locks while maintaining correctness and improving multi-core performance.
 
@@ -423,56 +441,165 @@ This plan breaks up the Big Kernel Lock (BKL) into fine-grained subsystem locks,
 
 ---
 
-## Phase 7: BKL Removal & Hardening
+## Phase 7: BKL Removal & Hardening — REPLANNED 2026-08-01
 
-**Week 11-12** - Eliminate BKL entirely
+> **The version of this phase originally planned here is not executable.** It was
+> audited after Phases 2–6 all landed default-on, and the audit
+> ([`BKL_PHASE7_AUDIT.md`](BKL_PHASE7_AUDIT.md)) found both of its premises wrong. The
+> original four tasks are preserved verbatim in §7.0 below; §7.1 onward is the
+> replacement.
 
-### Tasks
+### 7.0 What this section originally said, and why it fails
 
-1. **Remove BKL from Syscall Entry**:
+The original plan was: (1) strip `bkl::enter_kernel()`/`leave_kernel()` out of
+`rust_sync_el0_handler`, (2) delete the `reconcile_for_spsr` logic from the context-switch
+path, (3) delete `KernelLock` + the BKL profiler + the entry/exit points, (4) run a
+24-hour SMP=4 stress test.
 
-   **Update `rust_sync_el0_handler`**:
-   ```rust
-   extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u64) -> u64 {
-       // NO BKL acquisition
-       let result = rust_sync_el0_handler_inner(frame, esr, far);
-       result
-   }
-   ```
+Two disqualifying findings:
 
-2. **Update Context Switch Path**:
+- **The motivating number was an artifact.** This document's Overview claimed
+  "Scheduler/IRQ path holds ~70% of contended BKL time," and §16 of the VFS carve-out
+  measured 66–73% — but with a profiler that credited a preempted thread's whole
+  remaining syscall to `irq/sched`. Fixed and re-measured: **23.0%**, and ~21–23% fresh
+  at HEAD after two further carve-outs. The BKL is *not* primarily a scheduler lock; the
+  process-lifecycle syscalls (`execve` ~22%, `clone` ~10–13%) are the largest remaining
+  holders, and they are precisely the ones with no inner lock.
+- **Task 1 alone is unsound.** Removing BKL acquisition from syscall entry converts every
+  BKL-dependent structure into a cross-core race in one step. Six such structures remain
+  (audit §2), headed by the ~274-site `&'static mut Process` family whose entire safety
+  argument is `with_irqs_disabled` — single-core mutual exclusion.
 
-   **Remove BKL reconciliation**:
-   - Clean up SPSR handling
-   - Remove `reconcile_for_spsr` logic
-   - Simplify EL transitions
+### 7.1 Prerequisites, cheapest-first
 
-3. **Remove BKL Infrastructure**:
+Deliberately **not** in contention rank — `execve` outranks all of 7a–7d but has no inner
+lock, so converting it first would build on the thing that needs replacing. 7a–7c address
+~30% of measured contention without touching the process table.
 
-   **Delete**:
-   - `KernelLock` implementation (`crates/akuma-exec/src/sync.rs`)
-   - BKL profiler (or migrate to general lock profiler)
-   - BKL entry/exit points
+| | target | what it needs | audit ref |
+|---|---|---|---|
+| **7a** | alarm queue + `critical_section` | Real `Spinlock` on `ALARM_QUEUE`; per-core (not process-global) nesting counter, or drop the `critical_section` dep for `IrqGuard` + a Spinlock. Then IRQ 27 dispatch runs BKL-free. One file, smallest blast radius, biggest single tag. | §2.3 |
+| **7b** | `ppoll` / `epoll_*` | Ordinary carve-out — `EPOLL_TABLE` exists. Plus move the BKL-held `smoltcp_net::poll()` at `poll.rs:925` into a dropped window (the §20 `netpoll_drain` precedent). | §3 |
+| **7c** | already-carved residual | Measurement first, not code: `sys_openat` at ~10% for a *converted* syscall means the window starts too late or the re-acquire costs more than expected. | §3 |
+| **7d** | `THREAD_CONTEXTS` + `Process::context` | Either prove `POOL`'s state machine already guarantees "not running on any CPU" (fix = corrected SAFETY comment + host test over the transitions), or add per-slot ownership. Same problem class as `Process::context`; solve together. | §2.2 |
+| **7e** | process table | Two separable halves — see 7.2. | §2.1 |
+| **7f** | wither the BKL | See 7.3. **Not** the original tasks 1–3. | §5 |
 
-4. **Stress Testing**:
+### 7.2 7e: the process table, in two halves
 
-   **Extended testing**:
-   ```bash
-   # 24-hour SMP=4 stress test
-   SMP=4 timeout 86400 cargo run --profile release-smp-shared --features smp-shared
-   ```
+**Do not build `PROCESS_TABLE_LOCK`.** The original Phase 3 plan (§201–270 of this
+document) called for `PROCESS_TABLE_LOCK` + per-process `ProcessLock`;
+`BKL_PROCESS_CARVE_OUT.md` §9.2 rejected that shape as exactly the coarse lock the
+playbook warns against — it would be held across millisecond-scale work.
+
+- **Access half — a large refactor with a shipped precedent.** `lookup_process_shared`
+  (`process/children.rs:341`) already replaced `&'static mut` exclusivity with `&self`
+  methods plus an explicit `Process::as_lock`, and carries the whole M5b BKL-free
+  page-fault path (17 sites). Extend that pattern and delete
+  `lookup_process`/`current_process`.
+
+  **But the accessor edit is the tail, not the work.** `Process` has ~40 fields and locks
+  for about a third: `vm_lock` (`mmap_regions`, `memory.free_regions`), `as_lock` (page
+  tables), `fault_mutex`, `fds`, `stdin`/`stdout`, `terminal_state`, `signal_actions`. The
+  remaining ~25 are plain fields mutated through `&mut Process` — `name`, `state`,
+  `context`, `parent_pid`, `pgid`/`tgid`, `brk`/`initial_brk`, `entry_point`, `memory`,
+  `args`, `cwd`, `exited`, `exit_code`, `dynamic_page_tables`, `lazy_regions`,
+  `thread_id`, `spawner_pid`, `box_id`, `delegate_pid`, `clear_child_tid`,
+  `robust_list_*`, `signal_mask`, `address_space`. So the real sequence is: **group the
+  fields by access pattern → give each group a lock or prove it single-writer → then
+  convert the sites.** This half proceeds with the BKL still in place and is worth doing
+  on its own merits.
+
+  Current production surface: `current_process()` 142, bare `lookup_process` ~124,
+  `get_process_ptr` 8 — ~274 sites, against only **6** uses of the safe
+  `with_process(pid, f)` API.
+
+- **Free half — the one genuinely undesigned piece.** `unregister_process`
+  (`table.rs:63`) nulls the slot and drops the `Box`, running `Process::drop` →
+  `UserAddressSpace::drop`. No inner lock covers this, and it is not only self-teardown:
+  peer cores free *other* PIDs' `Process` at `process/mod.rs:1116` (sibling teardown),
+  `:1209` (box kill) and `:241` (`kill_process`). `lookup_process`'s stated safety
+  argument ("a process can't be freed during a syscall by its own thread") covers the
+  self case only. Needs deferred reclamation: epoch/RCU (Phase 8 already floats RCU), or
+  the time-cooldown pattern `reclaim_terminated_slots` already uses for thread slots.
+
+### 7.3 7f: don't remove the BKL — invert its default
+
+This replaces original tasks 1–3, and it is the part of this replan that changes the risk
+profile rather than just the ordering.
+
+**The problem with a big-bang removal** is that the default inverts. Today an un-audited
+EL1 path is *safe by default* — the BKL serializes it whether anyone reasoned about it or
+not. After removal it is a *race by default*. You cannot grep for a missing lock, and the
+failure mode is silent corruption under load, not a panic. Every bug this campaign found
+was caught by a digest mismatch or a wedge — i.e. after the fact.
+
+**Instead:** change `rust_sync_el0_handler` from *"always acquire"* to *"acquire unless
+this syscall is on the converted list."* Seed the list **empty** — byte-identical
+behaviour, a no-op commit — then move syscalls across one at a time under the existing A/B
++ digest discipline.
+
+```rust
+// Sketch. The list is the single source of truth for "who no longer needs the BKL".
+extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u64) -> u64 {
+    let bkl_free = syscall_is_converted(syscall_nr_of(frame, esr));
+    if !bkl_free { akuma_exec::bkl::enter_kernel(); }
+    let ret = rust_sync_el0_handler_inner(frame, esr, far);
+    if !bkl_free { akuma_exec::bkl::leave_kernel(); }
+    ret
+}
+```
+
+Why this is the better shape:
+
+- **Bisectable.** A regression names one syscall, not "the removal."
+- **Keeps the per-syscall kill switch.** Every phase here leaned on one
+  (`vfs_bkl_drop_enabled`, `mm_bkl_drop_enabled`, `drivers_bkl_drop_enabled`, …). A
+  big-bang removal discards that capability exactly when it is most needed.
+- **The BKL withers instead of being deleted.** When the un-converted list is empty,
+  `KernelLock`, `reconcile_for_spsr`, the dropped-window ledger and all five guards are
+  *provably* dead code, and deleting them is bookkeeping rather than a behavioural
+  change. Original tasks 2–3 stop being a risky step and become cleanup.
+- **It collapses the guards.** The guards currently mark "BKL-free is permitted *here*";
+  an opt-in list expresses the same thing per syscall, so the ledger + guard machinery
+  can be removed at the end instead of carefully preserved through the transition.
+- **Reconciliation must survive until the list is complete.** `reconcile_for_spsr` and the
+  dropped-window ledger stay live for the whole traversal — a converted syscall is
+  precisely a permanently-open dropped window, so the ledger's invariant is what makes the
+  mixed state safe. Deleting it early is the one way to get this wrong.
+
+**Remaining conversion surface for the traversal** (nothing measured above the noise
+floor, so there is no attribution signal to guide *or validate* these — the same blind
+spot `BKL_MM_CARVE_OUT.md` §5 flagged for Phase 5, which is the phase that found two real
+locking gaps): 14 syscall families with zero carve-out — `poll`, `proc`, `signal`,
+`sync`/futex, `term`, `pipe`, `msgqueue`, `eventfd`, `timerfd`, `aio`, `container`,
+`time`, `pidfd`, `log` — plus ~13 leftover `fs` syscalls (`dup`, `close`, `fcntl`,
+`fchmod`, `fallocate`/`ftruncate`/`truncate`, `faccessat2`, `symlinkat`, `linkat`,
+`readlinkat`, `chdir`/`fchdir`, `fstatfs`).
 
 ### Deliverables
-- [ ] BKL removed from syscall entry
-- [ ] Context switch path updated
-- [ ] BKL infrastructure deleted
-- [ ] 24-hour stability tests passing
+- [ ] **7a** `ALARM_QUEUE` locked, `critical_section` per-core, IRQ 27 dispatch BKL-free
+- [ ] **7b** `ppoll`/`epoll_*` carved; `smoltcp_net::poll()` in `sys_ppoll` BKL-free
+- [ ] **7c** carved-residual re-measured; `sys_openat`'s ~10% explained
+- [ ] **7d** `THREAD_CONTEXTS` + `Process::context` ownership proven or locked
+- [ ] **7e** `Process` fields grouped and locked; ~274 accessor sites converted;
+      `lookup_process`/`current_process` deleted; deferred reclamation for the free path
+- [ ] **7f** per-syscall opt-in list landed empty; all families traversed; BKL
+      infrastructure deleted as dead code
+- [ ] Extended SMP=4 stability run (the original "24 hours"; see §7.4 on the bar)
 
-### Success Criteria
-- BKL completely removed
-- System stable at SMP=4 under sustained load
-- No deadlocks or livelocks
-- Performance improved over BKL baseline
+### 7.4 Success criteria
+
+- Every item in audit §2 has a real lock or a written, tested ownership proof —
+  **this, not "the BKL is gone," is the phase's actual goal**
+- The opt-in list is empty, and `KernelLock`/`reconcile_for_spsr`/the ledger/the five
+  guards are deleted as unreachable
+- Sustained SMP=4 load with **0 `[BKL] stuck`, 0 `RECOVERED` (the new
+  `kernel_lock_recoveries()` tripwire), 0 PANIC/WILD/SPURIOUS, 0 stale dropped-window
+  heals, and exact digests** — the campaign's standing bar, which is stronger evidence
+  than wall-clock uptime alone
+- No regression on the single-core default build (unaffected by construction: every BKL
+  entry point is a `cfg(kernel_smp_shared)` no-op shim)
 
 ---
 
@@ -912,16 +1039,43 @@ one — see that doc's §5.
       on its own, matching the bar `no-bkl-process` cleared.
 
 ### Phase 6 - Device Driver Locks
-- [ ] Device drivers audited
-- [ ] Per-driver locks added
-- [ ] IRQ handlers BKL-free
-- [ ] Tests passing
+- [x] Device drivers audited (`BKL_DRIVERS_CARVE_OUT.md` §1 — most work already done by
+      `no-bkl-vfs`/`no-bkl-network`; virtio-gpu does not exist in this codebase)
+- [x] Per-driver locks: already present (`RNG_DEVICE`, `SOUND_DEVICE`, `FB_STATE`);
+      `DriverBklGuard` added to drop the BKL around them
+- [x] `sys_getrandom`, `/dev/urandom` read/pread, `/dev/dsp` write, `fb_init`/`fb_draw`/
+      `fb_info` converted
+- [x] Boot self-test `test_drivers_bkl_drop`; **promoted to `smp-shared` default**
+      (2026-08-01)
+- [~] IRQ handlers BKL-free — **deferred to Phase 7a**. All virtio devices are polling;
+      the only IRQ handler is the timer (PPI 27), which is scheduler-coupled
+      (`BKL_DRIVERS_CARVE_OUT.md` §2)
 
-### Phase 7 - BKL Removal & Hardening
-- [ ] BKL removed from syscall entry
-- [ ] Context switch path updated
-- [ ] BKL infrastructure deleted
-- [ ] 24-hour tests passing
+### Phase 7 - BKL Removal & Hardening — REPLANNED (see §7)
+Audited 2026-08-01; the four items below were the original plan and are **not
+executable** as written ([`BKL_PHASE7_AUDIT.md`](BKL_PHASE7_AUDIT.md)):
+- [x] ~~BKL removed from syscall entry~~ → replaced by the per-syscall opt-in list (§7.3)
+- [x] ~~Context switch path updated~~ → `reconcile_for_spsr` + the ledger must **survive**
+      the traversal; deleting them early is the way to get this wrong
+- [x] ~~BKL infrastructure deleted~~ → becomes dead-code cleanup once the list is empty
+- [ ] Extended SMP=4 stability run (bar restated in §7.4 — signal counts + digests, not
+      just uptime)
+
+Replanned prerequisites:
+- [ ] 7a alarm queue + `critical_section` (→ timer IRQ dispatch BKL-free)
+- [ ] 7b `ppoll`/`epoll_*` carve-out
+- [ ] 7c carved-residual re-measurement (`sys_openat` ~10%)
+- [ ] 7d `THREAD_CONTEXTS` + `Process::context` ownership
+- [ ] 7e process table: field grouping + locks, ~274 accessor sites, deferred reclamation
+- [ ] 7f opt-in list landed empty, all 14 families + ~13 `fs` syscalls traversed,
+      infrastructure deleted
+
+Landed during the audit:
+- [x] `KernelLock::acquire_no_ticket` ticket-accounting fix (`now_serving` was advancing
+      without an allocation → `reticket-skipped` storms; 46 → 0 at SMP=4)
+- [x] `sync::kernel_lock_recoveries()` counter + host test
+      `kernel_lock_no_ticket_acquire_release_stays_balanced` + boot self-test
+      `test_no_bkl_ticket_recoveries`
 
 ### Phase 8 - Performance Optimization
 - [ ] Lock contention analyzed
@@ -944,10 +1098,22 @@ one — see that doc's §5.
 ## Notes
 
 - **Phased approach**: Each phase builds on the previous, can be stopped if issues arise
-- **Backward compatibility**: Default build (single-core) unaffected until Phase 7
+- **Backward compatibility**: Default build (single-core) unaffected — **including through
+  Phase 7**, since every BKL entry point is a `cfg(kernel_smp_shared)` no-op shim. The
+  original note said "until Phase 7"; the §7.3 opt-in list preserves that property.
 - **Performance first**: Networking chosen first due to well-defined boundaries
 - **Safety critical**: Extensive testing at each phase
 - **Documentation heavy**: Lock ordering and rules well-documented to prevent deadlocks
+- **Estimate honestly, or not at all** (added 2026-08-01): 7a–7d are each days. 7e's
+  access half is roughly a week of mechanical work *after* the field-ownership design,
+  which is the genuinely uncertain part. The un-carved-family traversal and the free-path
+  reclamation should not be estimated before the field grouping exists.
+- **Two premises this plan got wrong**, both by asserting instead of measuring, and worth
+  re-reading before trusting any other number here: the Phase 0 "~70% scheduler/IRQ"
+  estimate (§Overview), and Phase 3's "no inner lock exists" for the parent page tables —
+  `as_lock` was already there and the fault handler was already using it
+  (`BKL_PROCESS_CARVE_OUT.md` §9.1). Both cost a phase's worth of misdirection.
 
-**Last Updated**: 2026-07-24  
+**Last Updated**: 2026-08-01 (Phase 7 replanned; Overview + Phase 6/7 checklists
+corrected)  
 **Status**: Phase 0 Complete, ready to begin Phase 1
