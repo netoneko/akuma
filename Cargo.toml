@@ -130,6 +130,7 @@ default = [
     "tls-rsa",
     "sound",
     "rump",
+    "fs-cache",
     "sc-aio", "sc-sysv-ipc", "sc-framebuffer", "sc-containers",
     "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
 ]
@@ -366,9 +367,21 @@ extreme = ["akuma-exec/extreme", "akuma-ext2/extreme"]
 
 # Large RAM-sized ext2 block cache with clock eviction (crates/akuma-ext2). Keeps
 # the read-only toolchain resident across the many process spawns in a self-host
-# `cargo build`, instead of re-reading it off virtio-blk per spawn. Opt-in (not in
-# any default set); the cache cap is auto-derived from detected RAM at mount. Not
-# combined with `extreme` (the 4 MB profile has no cache at all).
+# `cargo build`, instead of re-reading it off virtio-blk per spawn. The cache cap
+# is auto-derived from detected RAM at mount (`min(25% RAM, 512 MB)`, src/fs.rs).
+#
+# In `default` since 2026-08-02. Without it `akuma-ext2` falls back to
+# `BlockRingCache`: 64 slots / 256 KB, FIFO, linear-scan lookup. That is far
+# smaller than a single demand-fault's 1 MB readahead, so a fault evicts its own
+# double-indirect blocks ~4x while filling, and every page of a >4 MB file costs
+# two extra indirect block reads off virtio-blk. Measured on the rustc workload
+# (`docs/archive/BKL_RUSTC_SCALING_BASELINE.md`): `rustc --version` — zero
+# compilation — spent 1.43 s in 118 instruction-abort demand-page faults, 12.1 ms
+# each, against `librustc_driver` (63 MB) + `libLLVM` (176 MB).
+#
+# The `size`/`extreme` builds pass --no-default-features and do not re-add this,
+# so they are unaffected. Never combined with `extreme` (the 4 MB profile has no
+# cache at all) — akuma-ext2's build.rs gates the cfg on that.
 fs-cache = ["akuma-ext2/fs-cache"]
 
 # Per-family syscall gates. Default-on so `cargo build`/`run`/`test` keep every
