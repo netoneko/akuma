@@ -58,6 +58,22 @@ pub fn reset_contention_spins() {
     CONTENTION_SPINS.store(0, Ordering::Relaxed);
 }
 
+/// Times a [`KernelLock`] wait had to self-heal its FIFO ticket accounting (the
+/// `[BKL] RECOVERED` log lines: `reticket-owned`, `reticket-skipped`, `advanced-lost`).
+///
+/// Every one of these is a *symptom*, never a healthy event: the fair ticket lock cannot
+/// lose or overshoot a ticket unless the acquire/`now_serving`-advance pairing has been
+/// broken somewhere. The self-heal exists because the alternative is a hard wedge, but the
+/// count belongs in a test assertion so a regression shows up as a failure rather than as
+/// log lines nobody greps. Read via [`kernel_lock_recoveries`].
+static KERNEL_LOCK_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot the BKL ticket-recovery counter (see [`KERNEL_LOCK_RECOVERIES`]). Healthy runs
+/// keep this at 0.
+pub fn kernel_lock_recoveries() -> u64 {
+    KERNEL_LOCK_RECOVERIES.load(Ordering::Relaxed)
+}
+
 // --- PreemptGuard ---------------------------------------------------------------
 
 /// RAII guard that disables scheduler preemption (and, under the BKL-drop features,
@@ -667,7 +683,7 @@ impl KernelLock {
             irq_restore(daif);
             return;
         }
-        // Spin-wait for ownership WITHOUT taking a ticket. This is only safe when
+        // Spin-wait for ownership WITHOUT waiting on a ticket. This is only safe when
         // we know the lock will be released by a path that doesn't expect our ticket
         // (i.e., the BKL-free scheduler path where we're reconciling to EL1 after
         // having run BKL-free). The wait is unfair here, but the BKL-free path is
@@ -680,6 +696,25 @@ impl KernelLock {
                 .compare_exchange(0, me, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
+                // Account for the serving slot this barge consumed.
+                //
+                // We did not WAIT on a ticket, but the hold we just took still ends in an
+                // ordinary `release` — the thread we reconcile into returns to EL0 through
+                // the normal epilogue (`reconcile_for_spsr` → `release`), which advances
+                // `now_serving` by one. Advancing without a matching allocation drives
+                // `now_serving` AHEAD of `next_ticket`, and from then on every contended
+                // acquirer takes a ticket already behind `now_serving`, is told it was
+                // skipped, and re-tickets — the `[BKL] RECOVERED (reticket-skipped)` bursts
+                // measured at SMP=4 under fork/exec churn, which degrade the fair lock to
+                // an unfair test-and-set for the length of the burst.
+                //
+                // Bumping here (AFTER winning ownership, so a losing CAS allocates nothing)
+                // keeps the pairing exact. It is also the right FIFO semantics: if a waiter
+                // was sitting at `now_serving` when we barged in, its own CAS just failed
+                // and it re-ticketed to the tail ("reticket-owned"), leaving that slot
+                // vacant — so our release *should* advance past it. If there was no queue,
+                // we allocate and consume one slot and the counters return to equal.
+                self.next_ticket.fetch_add(1, Ordering::Relaxed);
                 irq_restore(daif);
                 return;
             }
@@ -750,6 +785,7 @@ fn log_kernel_lock_stuck(owner: u32, me: u32) {
 /// note there). Every line here is a live sighting of the ticket-accounting leak —
 /// keep them until the leak is root-caused. Stack-buffered (IRQ-masked context).
 fn log_kernel_lock_recovered(me: u32, kind: &str) {
+    KERNEL_LOCK_RECOVERIES.fetch_add(1, Ordering::Relaxed);
     use core::fmt::Write;
     struct Buf([u8; 96], usize);
     impl Write for Buf {
@@ -1413,6 +1449,51 @@ mod tests {
         assert!(bkl.held_by(2));
         bkl.release(2);
         assert!(!bkl.is_held());
+    }
+
+    #[test]
+    fn kernel_lock_no_ticket_acquire_release_stays_balanced() {
+        // The BKL-free EL0-preempt scheduler path (`bkl::reconcile_for_spsr_no_ticket` →
+        // `reconcile_no_ticket` → `acquire_no_ticket`) gains ownership WITHOUT taking a
+        // ticket: it never called `enter_kernel`, so taking one would leak it. But the
+        // thread it resumes into is ordinary EL1 code, and its eventual EL1→EL0 return
+        // goes through the NORMAL epilogue (`reconcile_for_spsr` → `release`).
+        //
+        // So the pair is asymmetric by construction, and the invariant that keeps the FIFO
+        // honest — `now_serving` advances exactly once per ticket handed out — has to be
+        // maintained by `release` declining to advance for a hold that took no ticket.
+        // Without that, `now_serving` runs AHEAD of `next_ticket`, and then every
+        // contended acquirer takes a ticket already behind `now_serving`, is told it was
+        // "skipped", and re-tickets — the `[BKL] RECOVERED (reticket-skipped)` bursts seen
+        // at SMP=4 under fork/exec churn (46 in one 80 s workload window, 0
+        // `advanced-lost`), which degrade the fair lock to an unfair test-and-set for the
+        // length of the burst.
+        let bkl = KernelLock::new();
+        for round in 0..2000u32 {
+            let core = round % 4;
+            let peer = (core + 1) % 4;
+            // Scheduler SGI preempted EL0, ran BKL-free, and reconciles into an EL1 thread.
+            bkl.acquire_no_ticket(core);
+            assert!(bkl.held_by(core));
+            // That thread returns to EL0 through the normal epilogue.
+            bkl.release(core);
+            assert!(!bkl.is_held(), "round {round}: not free after no-ticket release");
+            assert_eq!(
+                bkl.next_ticket.load(Ordering::Relaxed),
+                bkl.now_serving.load(Ordering::Relaxed),
+                "round {round}: now_serving drifted from next_ticket across a no-ticket hold"
+            );
+            // A normal ticketed excursion in between must still be served on its own
+            // ticket — no drift means no re-ticket.
+            bkl.acquire(peer);
+            assert!(bkl.held_by(peer));
+            bkl.release(peer);
+            assert_eq!(
+                bkl.next_ticket.load(Ordering::Relaxed),
+                bkl.now_serving.load(Ordering::Relaxed),
+                "round {round}: ticketed excursion left the counters skewed"
+            );
+        }
     }
 
     #[test]

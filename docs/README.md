@@ -47,6 +47,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | Filesystem / ext2 / procfs errors | [`reference/subsystems/vfs.md`](reference/subsystems/vfs.md) + `archive/EXT2_FIRST_DATA_BLOCK_FIX.md` |
 | Porting a new binary (missing syscalls) | [`reference/subsystems/syscalls.md`](reference/subsystems/syscalls.md) -> Porting + `archive/*_MISSING_SYSCALLS.md` |
 | A/B run shows no difference / boot doesn't match the features you built | [`reference/subsystems/locking.md`](reference/subsystems/locking.md) -> playbook rule 5 + `archive/BKL_VFS_CARVE_OUT.md` §17 |
+| `[BKL] RECOVERED` lines under SMP load / "can I just delete the BKL?" | [`reference/subsystems/locking.md`](reference/subsystems/locking.md) -> "What the BKL is still the only lock for" + [`archive/BKL_PHASE7_AUDIT.md`](archive/BKL_PHASE7_AUDIT.md) |
 
 ## Task list - "I want to do X"
 

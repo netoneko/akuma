@@ -108,9 +108,9 @@ pub fn maybe_dump(now_us: u64) {
     // Collect this window's per-tag delta, and rank.
     let mut top: [(usize, u64); TOP_N] = [(0, 0); TOP_N];
     let mut window_total: u64 = 0;
-    for tag in 0..BUCKETS {
+    for (tag, slot) in PREV.iter().enumerate() {
         let now = wait_by_holder(tag);
-        let prev = PREV[tag].swap(now, Ordering::Relaxed);
+        let prev = slot.swap(now, Ordering::Relaxed);
         let delta = now.saturating_sub(prev);
         if delta == 0 {
             continue;

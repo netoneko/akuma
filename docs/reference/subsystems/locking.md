@@ -116,10 +116,20 @@ For a given syscall or subsystem:
    names. This kept paying off down to small holders: `renameat` (2.8%),
    `mkdirat` (2.6%), and `fchmodat` (1.8%) only showed up at all once the
    driving workload was extended with a `mkdir`+`rename`+`chmod` phase — the
-   standing regimen never exercised them. Once every syscall an attribution
-   run had ever named was converted, `irq/sched` alone was 66–73% of
-   remaining spin — the signal that the next round of effort belongs in
-   Phase 3, not further down the VFS syscall list.
+   standing regimen never exercised them.
+
+   **Corollary, learned by getting it wrong: re-measure before quoting a share,
+   and never quote one across a profiler change.** This rule used to conclude
+   here that `irq/sched` was 66–73% of remaining spin once every named syscall
+   was converted. That figure came from `BKL_VFS_CARVE_OUT.md` §16, whose
+   profiler over-credited `irq/sched` (per-core instead of per-thread
+   attribution); §18 re-measured the same workload at **88.8% → 23.0%** after
+   fixing it, and two carve-outs landed after that. Measured fresh at HEAD with
+   Phases 2–6 all on, `irq/sched` is **~21–23%** and the largest remaining
+   holders are the process-lifecycle syscalls, which have no inner lock at all
+   (`execve` ~22%, `clone` ~10–13%). See
+   [`BKL_PHASE7_AUDIT.md`](../../archive/BKL_PHASE7_AUDIT.md) §1 for the current
+   numbers and §5 for where the effort belongs now.
 
 ## Correctness rules learned the hard way
 
@@ -414,6 +424,27 @@ Background: [`BKL_DRIVERS_CARVE_OUT.md`](../../archive/BKL_DRIVERS_CARVE_OUT.md)
 phases), §2 explains why the plan's IRQ-handler goal belongs to Phase 7
 (scheduler), §3 confirms virtio-gpu's absence.
 
+## What the BKL is still the only lock for
+
+Audited 2026-08-01 with all five carve-outs on
+([`BKL_PHASE7_AUDIT.md`](../../archive/BKL_PHASE7_AUDIT.md) §2). These are the structures
+where the BKL is not redundant — it *is* the cross-core lock, because the only other
+guard is `with_irqs_disabled` (mutual exclusion on one core). **Do not remove the BKL
+from syscall entry while any of these stands.**
+
+| structure | where | current guard | measured BKL share |
+|---|---|---|---|
+| process table `&'static mut Process` (300 call sites) | `process/table.rs` (`with_process`, `get_process_ptr`, `for_each_process`, …), `process/children.rs` (`lookup_process`, `current_process`) | `with_irqs_disabled` only; `unregister_process` frees the `Box` | underlies `execve`/`clone`/`wait4`/`netpoll_maint` |
+| `THREAD_CONTEXTS` | `threading/mod.rs:1619` | bare `UnsafeCell` + hand-written `unsafe impl Sync`; its SAFETY comment still says "we're single-CPU" | part of `clone` ~10–13% |
+| `ALARM_QUEUE` + `critical_section` nesting | `src/kernel_timer.rs:124`, `:316` | `critical_section` = DAIF mask + a **process-global** nesting counter — no cross-core exclusion | the substance of `irq/sched` ~21–23% (every core's timer tick walks it) |
+| `replace_image` destructive window | `process/image.rs:29`, `:121` | `LifecycleGuard` = per-thread `disable_preemption()`, **not a lock** | `execve` ~22% |
+| `fork_process` steps 5–8 | `process/mod.rs` | none (`ProcessInfo`, `THREAD_CONTEXTS`, `register_process` publication) | `clone` ~10–13% |
+| console UART | `src/console.rs:60` | bare `static UART` | `netpoll_herd` ~1% |
+
+By contrast these hold the BKL but already have a real inner lock, so they are ordinary
+carve-out candidates: `ppoll`/`epoll_*` (`EPOLL_TABLE`), pipes (`PIPES`), futex
+(`FUTEX_WAITERS`), eventfd/timerfd, and `idle_halt`'s post-WFI bookkeeping (`POOL`).
+
 ## Attribution tooling
 
 `bkl-profile` (cargo feature → `cfg(kernel_bkl_profile)`, `src/bkl_profile.rs`)
@@ -489,6 +520,10 @@ Driving workload: `net4` (concurrent downloads → net + ext2 write), `read4`
   Phase 6 device-driver carve-out: the full driver audit (which found most work
   already done by `no-bkl-vfs`/`no-bkl-network`), why the plan's IRQ-handler
   goal belongs to Phase 7, and why virtio-gpu is a no-op (it does not exist).
+- [`BKL_PHASE7_AUDIT.md`](../../archive/BKL_PHASE7_AUDIT.md) — the Phase 7
+  audit: why BKL removal is **not** executable yet (§1 corrects the `irq/sched`
+  share, §2 is the load-bearing inventory above, §4 the ticket-accounting bug it
+  found and fixed, §5 the 7a–7f decomposition).
 - [`BKL_FINE_GRAINED_LOCKING_PLAN.md`](../../archive/BKL_FINE_GRAINED_LOCKING_PLAN.md)
   — the overall phased plan; §"Phase 2" has the network carve-out's design
   notes (why a coarse `NETWORK_LOCK` doesn't work, the SIGPIPE self-deadlock,

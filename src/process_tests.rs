@@ -674,6 +674,12 @@ pub fn run_all_tests() {
     // sync_el0_handler). Re-check after acceptance stress runs too.
     test_no_spurious_svc_traps();
 
+    // BKL ticket-accounting tripwire: like the phantom-SVC check above, runs LAST so it
+    // covers every kernel excursion the suite generated. A nonzero count means the fair
+    // FIFO ticket lock had to self-heal — see `test_no_bkl_ticket_recoveries`.
+    #[cfg(kernel_smp_shared)]
+    test_no_bkl_ticket_recoveries();
+
     console::print("--- Process Execution Tests Done ---\n\n");
 }
 
@@ -738,6 +744,34 @@ fn test_no_spurious_svc_traps() {
     } else {
         crate::safe_print!(96,
             "[Test] no_spurious_svc_traps FAILED: {} phantom SVC trap(s) during boot suite\n", n);
+    }
+}
+
+/// Asserts the BKL's fair FIFO ticket lock never had to self-heal its accounting.
+///
+/// The `[BKL] RECOVERED` paths (`reticket-owned`, `reticket-skipped`, `advanced-lost`) are
+/// wedge-avoidance, not normal operation: the ticket lock cannot lose or overshoot a ticket
+/// unless the "one `now_serving` advance per ticket handed out" pairing is broken. It was —
+/// `acquire_no_ticket` (the BKL-free EL0-preempt scheduler reconcile) took ownership without
+/// allocating a serving slot while its release still advanced one, so `now_serving` drifted
+/// ahead of `next_ticket` and every contended acquirer afterwards was told it had been
+/// skipped and re-ticketed. Measured at SMP=4 on the contention regimen: 46
+/// `reticket-skipped` in one 80 s workload window, in bursts of ~20, with 0
+/// `advanced-lost`. Host regression:
+/// `sync::tests::kernel_lock_no_ticket_acquire_release_stays_balanced`.
+///
+/// Non-zero here means a *new* pairing break, so keep it a failure rather than a log line.
+#[cfg(kernel_smp_shared)]
+fn test_no_bkl_ticket_recoveries() {
+    let n = akuma_exec::sync::kernel_lock_recoveries();
+    if n == 0 {
+        console::print("[Test] no_bkl_ticket_recoveries PASSED (0 BKL ticket self-heals)\n");
+    } else {
+        crate::safe_print!(
+            112,
+            "[Test] no_bkl_ticket_recoveries FAILED: {} BKL ticket self-heal(s) during boot suite\n",
+            n
+        );
     }
 }
 
