@@ -96,8 +96,16 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     // real exit code or raise a duplicate SIGCHLD.
     crate::process::publish_child_exit(pid, -9);
 
-    // Remove and notify the thread channel, terminate the thread
-    if let Some(tid) = thread_id {
+    // Remove and notify the thread channel, terminate the thread.
+    //
+    // `thread_id` was snapshotted before the five `yield_now()`s and the fd cleanup
+    // above, so it can be stale by now: the target may have exited under us, had its
+    // slot recycled (~10 ms cooldown) and re-claimed by an unrelated process. Acting
+    // on the stale number kills an innocent thread and strands its process with no
+    // thread at all. `slot_still_owned_by` re-checks the slot's current owner.
+    if let Some(tid) = thread_id
+        && slot_still_owned_by(tid, pid)
+    {
         if let Some(channel) = remove_channel(tid) {
             channel.set_exited(-9);
         }
@@ -142,7 +150,10 @@ pub fn kill_process_with_signal(pid: Pid, sig: u32) -> Result<(), &'static str> 
     // SIGCHLD (e.g. `kill -9 <child>` from a shell must wake its `wait`).
     crate::process::publish_child_exit(pid, exit_code);
 
-    if let Some(tid) = thread_id {
+    // Same staleness hazard as `kill_process` — see the comment there.
+    if let Some(tid) = thread_id
+        && slot_still_owned_by(tid, pid)
+    {
         if let Some(channel) = remove_channel(tid) {
             channel.set_exited(exit_code);
         }
@@ -150,4 +161,37 @@ pub fn kill_process_with_signal(pid: Pid, sig: u32) -> Result<(), &'static str> 
     }
 
     Ok(())
+}
+
+/// Does thread slot `tid` still belong to `pid`?
+///
+/// Thread slots are recycled (`cleanup_terminated_internal`, ~10 ms cooldown), so a
+/// `thread_id` snapshotted before any yielding operation can name a slot that has
+/// since been handed to an unrelated process. Terminating such a slot kills an
+/// innocent thread and leaves its process alive with no thread: unschedulable, unable
+/// to exit, never reaped, with its parent's `wait4` blocked forever.
+///
+/// `THREAD_PID_MAP` records the slot's current owner. Only an entry naming a
+/// *different* pid proves the slot was reassigned; a missing entry means nobody has
+/// claimed it, and terminating it is still correct (the orphaned-READY-thread case
+/// `table::unregister_process` describes).
+fn slot_still_owned_by(tid: usize, pid: Pid) -> bool {
+    let owner = crate::runtime::with_irqs_disabled(
+        || table::THREAD_PID_MAP.lock().get(&tid).copied(),
+    );
+    match owner {
+        Some(owner) if owner != pid => {
+            let mut buf = [0u8; 112];
+            let mut pos = 0;
+            let _ = core::fmt::write(
+                &mut crate::process::FmtBuf { buf: &mut buf, pos: &mut pos },
+                format_args!("[kill] pid={} stale tid={} now owned by pid={}\n",
+                    pid, tid, owner));
+            if let Ok(s) = core::str::from_utf8(&buf[..pos]) {
+                (crate::runtime::runtime().print_str)(s);
+            }
+            false
+        }
+        _ => true,
+    }
 }

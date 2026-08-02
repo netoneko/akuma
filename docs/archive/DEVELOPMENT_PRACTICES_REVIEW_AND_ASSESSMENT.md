@@ -157,6 +157,16 @@ defect class in a different subsystem, each found and fixed independently:
 - **Signal mask scoped per-process instead of per-thread** — found once for Go
   (`SIGNAL_HELL`/`GOLANG_IPC`), rediscovered months later for rustc
   (`AKUMA_SELF_HOSTING` §7k.3) as an unrelated-looking "intermittent SIGSEGV."
+- **A recorded slot index used after the slot could have been recycled** — a
+  `Process` keeps `thread_id: Option<usize>`, a bare index into a table whose
+  entries are reused on a ~10 ms cooldown. Three teardown paths act on that
+  field; two (`kill_process`, `kill_fork_subtree_recursive`) clear it first,
+  one (`kill_thread_group` PHASE 2) did not, so it terminated whichever process
+  had since claimed the slot. See
+  [`STALE_THREAD_SLOT_KILL.md`](STALE_THREAD_SLOT_KILL.md). Same shape as the
+  ON_CPU gate bug (`SMP_SHARED_ONCPU_GATE.md`) and the RETIRE/reclaim cooldowns
+  (`BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md`): a raw index or pointer outliving the
+  thing it names. It is now the project's most-repeated defect shape.
 
 One entry stands out as a distinct risk, not a knowledge-transfer gap:
 `SPLIT_SYSCALLS.md` logs `sys_nanosleep` and `sys_pselect6`/`sys_ppoll` being
@@ -237,10 +247,29 @@ converged on in one pass instead of three or four.
 - Consider a lightweight lint or a guard type that makes "signal raised / OOM
   triggered while holding a spinlock" a compile-time or debug-assert-time
   error, given it has independently cost four separate debugging sessions.
+- **Draw the lifecycles.** The archive documents these subsystems almost
+  entirely in prose and per-bug narrative; there is no diagram anywhere of the
+  process/thread lifecycle — no state machine for a thread slot
+  (`FREE → INITIALIZING → READY ⇄ RUNNING/WAITING → TERMINATED → cooldown →
+  FREE`), no state machine for a process slot (`ACTIVE → RETIRED → cooldown →
+  reclaimed`), and no picture of which references point across those two.
+  That omission is not cosmetic. `STALE_THREAD_SLOT_KILL.md` is a bug you
+  cannot see by reading any one function — every individual step is correct —
+  but which is *immediately* visible the moment you draw `Process.thread_id`
+  as an arrow into a table that recycles underneath it, then ask what the arrow
+  points at after a `TERMINATED → FREE → claimed` cycle. The same drawing makes
+  the ON_CPU switch-out window and the RETIRE cooldown obviously the same
+  question asked about two different tables. A handful of state diagrams in
+  `docs/reference/subsystems/` would turn a class of "found it after four hours
+  of log archaeology" bugs into ones spotted at review time — and would give
+  the two cooldown constants (~10 ms thread, process reclaim) a single place
+  where their relationship to each other is stated rather than being folk
+  knowledge spread across three doc comments.
 
 None of these are urgent — they are exactly the kind of unifying refactor that
 becomes obvious only after the third instance of a bug, which is where this
-project currently sits.
+project currently sits. The diagram item is the cheapest of the four and the
+only one that pays off across all of them.
 
 ---
 

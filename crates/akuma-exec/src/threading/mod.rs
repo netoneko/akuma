@@ -763,6 +763,10 @@ static TERMINATION_TIME: [AtomicU64; MAX_THREADS] = {
 /// Mark a thread as terminated (lock-free)
 pub fn mark_thread_terminated(idx: usize) {
     if idx != IDLE_THREAD_IDX && idx < MAX_THREADS {
+        // Cross-thread kill tracer: whoever terminates a slot that is not its own
+        // is killing a thread that may since have been recycled to an unrelated
+        // process. Prints the victim's owning pid and its live state so a
+        // "process survives with no thread" hang can be attributed to its killer.
         // Record termination time for cooldown tracking
         TERMINATION_TIME[idx].store((runtime().uptime_us)(), Ordering::SeqCst);
         THREAD_STATES[idx].store(thread_state::TERMINATED, Ordering::SeqCst);

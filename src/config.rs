@@ -183,7 +183,7 @@ pub const FUTEX_DBG_ENABLED: bool = false;
 /// saved kernel/user resume point (`[THR-DUMP]`) once `>= 2` threads are WAITING.
 /// A deadlock-hunt aid (docs §7g) for locating where parked threads are stuck
 /// without SSH (which can itself wedge). Off by default — noisy under normal load.
-pub const DEADLOCK_THREAD_DUMP_ENABLED: bool = false;
+pub const DEADLOCK_THREAD_DUMP_ENABLED: bool = true;
 
 /// Fail tests if test binaries are missing
 ///

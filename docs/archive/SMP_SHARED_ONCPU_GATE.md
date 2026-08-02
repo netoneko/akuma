@@ -115,6 +115,19 @@ Host: full-workspace `cargo test` 478 passed / 0 failed; clippy clean on
 
 ## 6. What remains: the contained rustc stall/hang
 
+> **CLOSED 2026-08-02 — and none of the three suspects below was right.** The hang is
+> a *stale thread-slot index*: `kill_thread_group`'s PHASE 2 re-read a dead sibling's
+> `Process::thread_id` after that slot had been recycled to an unrelated process, so a
+> finishing `rustc` terminated a **different** `rustc`'s `gcc`/`collect2`. The victim
+> keeps its `Process` record but has no thread — unschedulable, unable to exit, never
+> reaped — so its parent's `wait4` blocks forever and the compile goes silent. The
+> futex waits recorded below are that parent's threads correctly waiting on a linker
+> that will never finish: a symptom, not the defect. Full write-up, captured
+> `[XTERM]-CROSS` evidence and the deterministic regression test in
+> [`STALE_THREAD_SLOT_KILL.md`](STALE_THREAD_SLOT_KILL.md). Suspect 1 (`ppoll` lost
+> wakeup) is ruled out: the process that stops is single-threaded `gcc`, which never
+> calls `ppoll`. The text below is kept verbatim as the state of knowledge at the time.
+
 With the fix, `big.rs` conc=4 rounds still intermittently take ~4× the normal
 wall-clock or fail with "artifact absent, rustc silent" — but the failure is now
 *contained*, not corruption: the VM stays fully healthy (sshd serving, no

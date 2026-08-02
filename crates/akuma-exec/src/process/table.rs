@@ -166,9 +166,36 @@ pub fn unregister_process(pid: Pid) -> bool {
         // Tests call unregister_process from the same thread to clean up,
         // and marking ourselves terminated would cause Thread 0's cleanup
         // to zero our context while we're still running.
+        //
+        // IMPORTANT: `thread_id` is only a *recorded* slot number, and thread slots
+        // are recycled (`cleanup_terminated_internal`, ~10 ms cooldown). A process
+        // whose thread already self-terminated can have that slot handed to a brand
+        // new, unrelated process before this runs — `kill_thread_group` PHASE 2 is
+        // the path that gets there late, because PHASE 1 only *requests* deferred
+        // kills and then grace-waits up to 2 s for siblings to reach their EL1→EL0
+        // boundary. Terminating a recycled slot kills an innocent thread and leaves
+        // ITS process alive with no thread at all: unschedulable, unable to exit,
+        // never reaped, and its parent's `wait4` blocked forever. That is the silent
+        // `rustc big.rs` hang (a linker `gcc` lost its only thread mid-link).
+        //
+        // So consult THREAD_PID_MAP, which records the slot's *current* owner. Only
+        // an entry naming a different pid proves the slot was stolen; a missing entry
+        // means nobody has claimed it, and terminating it is still the right thing
+        // (that is the orphaned-READY-thread case the paragraph above describes).
         if let Some(tid) = unsafe { (*ptr).thread_id } {
             let current_tid = crate::threading::current_thread_id();
-            if tid != current_tid {
+            let slot_owner = with_irqs_disabled(|| THREAD_PID_MAP.lock().get(&tid).copied());
+            let recycled = matches!(slot_owner, Some(owner) if owner != pid);
+            if recycled {
+                let mut buf = [0u8; 112];
+                let mut pos = 0;
+                let _ = core::fmt::write(
+                    &mut crate::process::FmtBuf { buf: &mut buf, pos: &mut pos },
+                    format_args!("[unregister] pid={} stale tid={} now owned by pid={}\n",
+                        pid, tid, slot_owner.unwrap_or(0)));
+                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+            }
+            if tid != current_tid && !recycled {
                 crate::threading::mark_thread_terminated(tid);
             }
         }

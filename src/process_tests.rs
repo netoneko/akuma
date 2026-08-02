@@ -414,6 +414,7 @@ pub fn run_all_tests() {
     test_zombie_process_unregistered_after_return_to_kernel();
     test_trap_frame_cleared_when_thread_slot_recycled();
     test_on_cpu_gate_lifecycle();
+    test_unregister_skips_recycled_thread_slot();
 
     // fd table lock consistency + orphan cleanup + pidfd cloexec
     test_fd_table_lock_consistency();
@@ -10027,6 +10028,91 @@ fn test_trap_frame_cleared_when_thread_slot_recycled() {
             "[Test] trap_frame_cleared_when_thread_slot_recycled FAILED: tid={} \
              clear_when_free={} published={} recycled={} cleared_on_recycle={}\n",
             tid, clear_when_free, published, recycled, cleared_on_recycle);
+    }
+}
+
+/// Regression test for the stale-thread-slot kill (`docs/archive/STALE_THREAD_SLOT_KILL.md`).
+///
+/// `Process::thread_id` is a bare index into a table whose slots are recycled on a
+/// ~10 ms cooldown, so a record written when the process was spawned can name a slot
+/// that now belongs to somebody else. `unregister_process` used to terminate that slot
+/// unconditionally, killing an innocent thread and leaving *its* process alive with no
+/// thread at all — unschedulable, unable to exit, never reaped, with the parent's
+/// `wait4` blocked forever. That was the silent `rustc -O big.rs` hang: a linker `gcc`
+/// lost its only thread mid-link.
+///
+/// Two halves, because the naive fix (never terminate a foreign slot) would regress the
+/// behaviour the original code existed for:
+///   1. slot re-claimed by an unrelated process → must be left alone;
+///   2. slot still ours (no other claimant) → must still be terminated, or reaped
+///      processes strand READY threads that the scheduler will happily switch to.
+fn test_unregister_skips_recycled_thread_slot() {
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
+    use akuma_exec::process::table::THREAD_PID_MAP;
+    use akuma_exec::threading::{
+        claim_test_thread_slots, release_test_thread_slot, get_thread_state, set_thread_state,
+        thread_state,
+    };
+
+    let claimed = claim_test_thread_slots(2);
+    if claimed.len() != 2 {
+        for s in &claimed { release_test_thread_slot(*s); }
+        console::print("[Test] unregister_skips_recycled_thread_slot SKIPPED: no free slots\n");
+        return;
+    }
+    let (stolen_tid, own_tid) = (claimed[0], claimed[1]);
+
+    // Half 1: `dead_pid` recorded `stolen_tid` at spawn; the slot has since been
+    // recycled and re-claimed by the unrelated `victim_pid`, which is running on it.
+    let dead_pid = 63_100u32;
+    let victim_pid = 63_101u32;
+    let mut dead = make_test_process(dead_pid);
+    dead.thread_id = Some(stolen_tid);
+    register_process(dead_pid, dead);
+
+    let mut victim = make_test_process(victim_pid);
+    victim.thread_id = Some(stolen_tid);
+    register_process(victim_pid, victim);
+    akuma_exec::runtime::with_irqs_disabled(|| {
+        THREAD_PID_MAP.lock().insert(stolen_tid, victim_pid);
+    });
+    set_thread_state(stolen_tid, thread_state::READY);
+
+    let _ = unregister_process(dead_pid);
+
+    let victim_thread_survived = get_thread_state(stolen_tid) != thread_state::TERMINATED;
+    let victim_still_registered = lookup_process_shared(victim_pid).is_some();
+
+    // Half 2: nobody else claims the slot, so the terminate must still happen.
+    let solo_pid = 63_102u32;
+    let mut solo = make_test_process(solo_pid);
+    solo.thread_id = Some(own_tid);
+    register_process(solo_pid, solo);
+    akuma_exec::runtime::with_irqs_disabled(|| {
+        THREAD_PID_MAP.lock().insert(own_tid, solo_pid);
+    });
+    set_thread_state(own_tid, thread_state::READY);
+
+    let _ = unregister_process(solo_pid);
+    let own_thread_terminated = get_thread_state(own_tid) == thread_state::TERMINATED;
+
+    // Teardown: drop the map entries and both slots.
+    akuma_exec::runtime::with_irqs_disabled(|| {
+        let mut map = THREAD_PID_MAP.lock();
+        map.remove(&stolen_tid);
+        map.remove(&own_tid);
+    });
+    let _ = unregister_process(victim_pid);
+    release_test_thread_slot(stolen_tid);
+    release_test_thread_slot(own_tid);
+
+    if victim_thread_survived && victim_still_registered && own_thread_terminated {
+        console::print("[Test] unregister_skips_recycled_thread_slot PASSED\n");
+    } else {
+        crate::safe_print!(192,
+            "[Test] unregister_skips_recycled_thread_slot FAILED: victim_thread_survived={} \
+             victim_still_registered={} own_thread_terminated={}\n",
+            victim_thread_survived, victim_still_registered, own_thread_terminated);
     }
 }
 
