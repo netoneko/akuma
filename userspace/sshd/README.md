@@ -56,6 +56,7 @@ ignored.
 | `shell` | `/bin/sh` | Login shell for both interactive and `exec` sessions |
 | `port` | `2222` | Listen port |
 | `disable_key_verification` | `false` | Accept **any** auth without checking `authorized_keys` — dev/demo only |
+| `banner` | `true` | Print the ASCII-art welcome banner on interactive `shell` sessions (mirrors the in-kernel server's login banner) |
 
 Booleans accept `true`/`yes`/`1`/`on`.
 
@@ -66,11 +67,15 @@ Flags override the config file. Precedence for the port is CLI → config → 22
 ```bash
 /bin/sshd --port 22 --shell /bin/sh
 /bin/sshd --shell /bin/toybox --shell-arg sh    # multicall: argv = ["/bin/toybox", "sh"]
+/bin/sshd --no-banner                           # skip the welcome banner
 ```
 
 `--shell-arg` may be repeated and appends one argument each time; it exists for
 multicall binaries that select an applet by argv. It is CLI-only — there is no
 config-file equivalent.
+
+`--no-banner` is CLI-only (disable-only); to re-enable a banner turned off in
+the config file, set `banner = true` in `sshd.conf` instead.
 
 Under `herd`, the whole command line goes in `args`:
 
