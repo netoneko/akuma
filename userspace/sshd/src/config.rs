@@ -39,6 +39,9 @@ pub struct SshdConfig {
     /// (the default `/bin/sh` dispatches via its own argv[0] basename).
     pub shell_args: Vec<String>,
     pub port: Option<u16>,
+    /// Print the ASCII-art welcome banner on interactive `shell` sessions,
+    /// mirroring the in-kernel SSH server's login banner. Enabled by default.
+    pub banner: bool,
 }
 
 /// Default shell: busybox's multicall entry point, present on every
@@ -52,6 +55,7 @@ impl Default for SshdConfig {
             shell: String::from(DEFAULT_SHELL),
             shell_args: Vec::new(),
             port: None, // Default port is handled in main.rs
+            banner: true,
         }
     }
 }
@@ -82,6 +86,9 @@ impl SshdConfig {
                     if let Ok(p) = value.parse::<u16>() {
                         self.port = Some(p);
                     }
+                }
+                "banner" => {
+                    self.banner = parse_bool(value);
                 }
                 _ => {}
             }

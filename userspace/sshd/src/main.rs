@@ -143,6 +143,10 @@ pub extern "C" fn main() {
                     }
                 }
             }
+            "--no-banner" => {
+                ssh_config.banner = false;
+                println("[SSHD] Banner disabled from CLI");
+            }
             _ => {
                 println(&format!("[SSHD] Unknown argument: {}", arg));
             }

@@ -1,6 +1,7 @@
 //! SSH-2 Protocol Implementation (Userspace)
 
 use alloc::format;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::TryInto;
@@ -30,7 +31,7 @@ use libakuma::net::Error as NetError;
 // SSH Constants
 // ============================================================================
 
-const SSH_VERSION: &[u8] = b"SSH-2.0-Akuma_0.1_User\r\n";
+const SSH_VERSION: &[u8] = b"SSH-2.0-Akuma_0.1\r\n";
 
 const SSH_MSG_DISCONNECT: u8 = 1;
 const SSH_MSG_SERVICE_REQUEST: u8 = 5;
@@ -140,12 +141,49 @@ async fn run_exec_session(
     fail_spawn(stream, session, &shell_path, "exec").await
 }
 
+/// ASCII-art welcome banner, mirroring the in-kernel SSH server's login
+/// banner (`src/ssh/protocol.rs`). Kept as a local copy (`akuma_40.txt`)
+/// rather than reaching across into the kernel's source tree.
+const BANNER_ART: &str = include_str!("akuma_40.txt");
+
+/// Builds the same banner text the in-kernel SSH server prints on login,
+/// minus the "Type 'help'..." line (there's no built-in shell here — the
+/// spawned shell prints its own prompt).
+fn build_banner() -> String {
+    let mut welcome = String::from("\r\n");
+    for line in BANNER_ART.lines() {
+        welcome.push_str(line);
+        welcome.push_str("\r\n");
+    }
+    let boxed = [
+        "      Welcome to Akuma SSH Server",
+        "   now with sick beats by Tokyo Rider",
+        " https://tokyorider.bandcamp.com/album/omegashima",
+    ];
+    let longest = boxed.iter().map(|l| l.len()).max().unwrap_or(0);
+    let divider = "=".repeat(core::cmp::min(longest + 1, 50));
+    welcome.push_str("\r\n");
+    welcome.push_str(&divider);
+    welcome.push_str("\r\n");
+    for line in boxed {
+        welcome.push_str(line);
+        welcome.push_str("\r\n");
+    }
+    welcome.push_str(&divider);
+    welcome.push_str("\r\n\r\n");
+    welcome
+}
+
 /// Interactive `shell` channel request. There is no built-in fallback shell
 /// — a spawn failure ends the session with an error message.
 async fn run_shell_session(
     stream: &mut SshStream,
     session: &mut SshSession,
 ) -> Result<(), NetError> {
+    if session.config.banner {
+        let banner = build_banner();
+        send_channel_data(stream, session, banner.as_bytes()).await?;
+    }
     let shell_path = session.config.shell.clone();
     // Extra argv for multicall shells (busybox/toybox): the kernel sets
     // argv[0] = shell_path, then these follow (e.g. ["sh"]).
