@@ -82,15 +82,23 @@ pub fn init() -> Result<(), FsError> {
     }
     
     // Size the ext2 block cache from detected RAM before mounting (the cache is
-    // allocated in Ext2Filesystem::new). Cap at min(25% RAM, 512 MB): generous
-    // enough on a self-host VM (6–16 GB) to keep the read-only toolchain resident
-    // across the many rustc/cc/ld spawns, bounded so it can't starve user pages.
+    // allocated in Ext2Filesystem::new). Cap at min(12.5% RAM, 128 MB): enough to
+    // keep the read-only toolchain's hot pages resident across the many
+    // rustc/cc/ld spawns, bounded so it can't starve user pages.
     // No-op unless the kernel is built with the `fs-cache` feature.
+    //
+    // The ceiling was 512 MB / 25% until 2026-08-02. That was too aggressive: on
+    // the rustc benchmark the cache filled to the cap and the kernel heap grew to
+    // 1152 MB (`[HEAP-GROW] ... claimed=131074 pages`), taking PMM from 908 518 to
+    // 678 073 free pages (~900 MB, never returned) and leaving sshd accepting
+    // connections but resetting at key exchange. 128 MB comfortably covers the
+    // measured working set: `rustc --version` touches ~71 distinct 1 MB windows of
+    // librustc_driver + libLLVM. See docs/archive/BKL_RUSTC_SCALING_BASELINE.md.
     {
         const PAGE: usize = 4096;
-        const CACHE_CEILING: usize = 512 * 1024 * 1024;
+        const CACHE_CEILING: usize = 128 * 1024 * 1024;
         let ram_bytes = crate::pmm::total_count().saturating_mul(PAGE);
-        let cap = core::cmp::min(ram_bytes / 4, CACHE_CEILING);
+        let cap = core::cmp::min(ram_bytes / 8, CACHE_CEILING);
         akuma_ext2::set_cache_cap_bytes(cap);
     }
 

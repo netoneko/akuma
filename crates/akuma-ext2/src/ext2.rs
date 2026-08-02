@@ -169,13 +169,32 @@ pub fn cache_stats() -> (u64, u64) {
     }
 }
 
-/// Clock (second-chance) block cache. Slots are allocated lazily (the backing
-/// `Vec` grows in block-size steps) up to `capacity_blocks`; thereafter the clock
-/// hand sweeps, clearing reference bits, and evicts the first unreferenced slot.
+/// Target size of one backing chunk. The backing grows a whole chunk at a time,
+/// so this is the largest single allocation the cache ever asks for, regardless
+/// of `capacity_blocks`.
+///
+/// A single contiguous `Vec<u8>` was the original design and it does not scale:
+/// `Vec` growth doubles, so a 512 MB cap meant a `realloc(256 MB -> 512 MB)` with
+/// both buffers live (~768 MB transient) and a 512 MB contiguous demand on the
+/// kernel heap. Observed 2026-08-02 on the rustc benchmark: `[HEAP-GROW]
+/// total=1152MB ... claimed=131074 pages`, PMM 908 518 -> 678 073 free pages
+/// (~900 MB, never returned), after which sshd accepted connections but reset at
+/// key exchange. Chunking bounds the allocation and never copies existing slots.
+#[cfg(any(ext2_fs_cache, test))]
+const CACHE_CHUNK_BYTES: usize = 1 << 20; // 1 MB
+
+/// Clock (second-chance) block cache. Slots are allocated lazily (one backing
+/// chunk at a time) up to `capacity_blocks`; thereafter the clock hand sweeps,
+/// clearing reference bits, and evicts the first unreferenced slot.
 #[cfg(any(ext2_fs_cache, test))]
 pub(crate) struct ClockBlockCache {
-    /// Contiguous slot data; `slot * block_size .. + block_size` per slot.
-    backing: Vec<u8>,
+    /// Slot data, split into fixed-size chunks of `chunk_blocks` slots each.
+    /// Slot `i` lives in `chunks[i / chunk_blocks]` at byte offset
+    /// `(i % chunk_blocks) * block_size`. Never reallocated once pushed, so a
+    /// grow costs one `CACHE_CHUNK_BYTES` allocation and zero copying.
+    chunks: Vec<Vec<u8>>,
+    /// Slots per chunk; `>= 1` even when `block_size > CACHE_CHUNK_BYTES`.
+    chunk_blocks: usize,
     /// Block number occupying each slot; `u32::MAX` = empty hole.
     tags: Vec<u32>,
     /// Clock reference bit per slot. `Cell` so a read (`get`) can set the bit
@@ -201,7 +220,8 @@ impl ClockBlockCache {
     /// on the global `CACHE_CAP_BYTES` when run in parallel).
     pub(crate) fn with_capacity_blocks(block_size: usize, capacity_blocks: usize) -> Self {
         Self {
-            backing: Vec::new(),
+            chunks: Vec::new(),
+            chunk_blocks: core::cmp::max(1, CACHE_CHUNK_BYTES / block_size.max(1)),
             tags: Vec::new(),
             ref_bits: Vec::new(),
             index: BTreeMap::new(),
@@ -211,22 +231,32 @@ impl ClockBlockCache {
         }
     }
 
+    /// Byte range of `slot` within its chunk.
+    fn slot_pos(&self, slot: usize) -> (usize, usize) {
+        (slot / self.chunk_blocks, (slot % self.chunk_blocks) * self.block_size)
+    }
+
     pub(crate) fn get(&self, block_num: u32) -> Option<&[u8]> {
         if let Some(&slot) = self.index.get(&block_num) {
             self.ref_bits[slot].set(true);
-            let s = slot * self.block_size;
-            Some(&self.backing[s..s + self.block_size])
+            let (chunk, off) = self.slot_pos(slot);
+            Some(&self.chunks[chunk][off..off + self.block_size])
         } else {
             None
         }
     }
 
-    /// Pick a slot for a new block: grow the backing while under capacity (the
-    /// `Vec`s grow geometrically, so amortized O(1)), otherwise run the clock.
+    /// Pick a slot for a new block: grow the backing while under capacity —
+    /// pushing at most one `CACHE_CHUNK_BYTES` chunk, and only when the current
+    /// chunk is full — otherwise run the clock.
     fn alloc_slot(&mut self) -> usize {
         let slots = self.tags.len();
         if slots < self.capacity_blocks {
-            self.backing.resize((slots + 1) * self.block_size, 0);
+            if slots % self.chunk_blocks == 0 {
+                // New chunk needed. Its size is fixed, so heap demand never
+                // scales with capacity_blocks and existing slots never move.
+                self.chunks.push(vec![0u8; self.chunk_blocks * self.block_size]);
+            }
             self.tags.push(u32::MAX);
             self.ref_bits.push(Cell::new(false));
             return slots;
@@ -257,8 +287,9 @@ impl ClockBlockCache {
         if prev != u32::MAX {
             self.index.remove(&prev);
         }
-        let s = slot * self.block_size;
-        self.backing[s..s + self.block_size].copy_from_slice(data);
+        let (chunk, off) = self.slot_pos(slot);
+        let bs = self.block_size;
+        self.chunks[chunk][off..off + bs].copy_from_slice(data);
         self.tags[slot] = block_num;
         self.ref_bits[slot].set(true);
         self.index.insert(block_num, slot);

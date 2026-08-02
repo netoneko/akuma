@@ -39,6 +39,18 @@ a codegen-bound contrast — still a single `rustc` invocation, no cargo.
   hypothesis.
 - 2 reps/cell; rep-to-rep spread was <1% on every cell that passed verification.
 
+> **Superseded for absolute times (2026-08-02).** The numbers in §3 were measured
+> with the large ext2 block cache **not compiled in** — `fs-cache` was opt-in and no
+> shipping build opted in, leaving a 256 KB / 64-slot FIFO ring against a 1 MB
+> readahead. Enabling it made `std c=1` 2.7× faster (13.72 → 5.15 s) and dropped the
+> RAM floor for `big` from >2 GB to 1 GB. See
+> [`EXT2_BLOCK_CACHE_DEFAULT_AND_CHUNKING.md`](EXT2_BLOCK_CACHE_DEFAULT_AND_CHUNKING.md),
+> which closes §6 follow-up 3.
+>
+> **The §4 analysis still holds** — it is about *ratios* (startup vs codegen, 1→4
+> core scaling), and those are what Phase 7 is judged on. Re-baseline before quoting
+> any absolute second count from §3.
+
 ## 3. Results
 
 Wall-clock seconds, median of 2. `c` = concurrent `rustc` invocations.
@@ -180,6 +192,15 @@ a strong hint about *which* kernel frame leaked, and is the thread to pull first
    That is `rustc_compile_ext2_mmap` territory (lazy/file-backed mmap of the 63 MB dylib),
    not Phase 7 — but it is where the wall-clock actually is, and it should not be
    mis-attributed to locking.
+
+   **CLOSED 2026-08-02** — and the guess above was wrong about the mechanism. The 63 MB
+   dylib is `DT_NEEDED`, not the PT_INTERP the kernel loads, and userspace ld-musl was
+   already mapping it lazily; `MMAP_FILE_BACKED_LAZY` had been doing its job all along.
+   The real cause was one layer down: the ext2 block cache was never compiled in, so
+   each 1 MB readahead fault re-read its own double-indirect blocks off virtio-blk at
+   12.1 ms/fault. Enabling it → 0.7 ms/fault warm, `std c=1` 13.72 → 5.15 s. Full
+   write-up in
+   [`EXT2_BLOCK_CACHE_DEFAULT_AND_CHUNKING.md`](EXT2_BLOCK_CACHE_DEFAULT_AND_CHUNKING.md).
 
 ## 7. Reproducing
 
