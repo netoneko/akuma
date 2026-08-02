@@ -69,13 +69,25 @@ pub fn register_process(_pid: Pid, proc: Box<Process>) {
     // hang found and root-caused while landing this phase (real fork/exec/pipe
     // traffic through `test_sigpipe_terminate_no_deadlock`; see
     // docs/archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md §"the on-demand reclaim that
-    // wasn't"). The periodic `netpoll_maint` collector (100ms cadence, a call site
-    // with no such ambient lock context) is the only reclaimer. If a spawn storm
-    // ever starves it the way `THREAD_STATES` was starved before
-    // `reclaim_terminated_slots` dropped its caller-identity gate, the fix must be a
-    // *different* collector call site — not this one.
+    // wasn't"). The fix for a starved collector had to be a *different* call site, and
+    // that is what `process::reclaim` now provides: five drain sites (the exit-path
+    // terminal parks, the idle loops, the allocator's pressure ladder) plus the
+    // original 100 ms `netpoll_maint` one. Requesting a drain is lock-free, so it IS
+    // safe from here — collecting is not.
+    crate::process::reclaim::request_retired_reclaim();
     unsafe { drop(Box::from_raw(ptr)); }
-    panic!("Process table full ({} slots)", MAX_PROCESSES);
+    // OPEN (docs/reference/subsystems/memory.md → "OPEN: a full process table still
+    // panics the kernel"): this should return an error so fork/clone/spawn surface
+    // -EAGAIN — "collector starved, retry" — instead of halting the box, since every
+    // slot here may be a reclaimable zombie. Blocked only on making this function
+    // fallible, which means threading a `Result` through every spawn caller. The
+    // request above at least guarantees the next drain site collects; it cannot help
+    // *this* caller, which is already dead by the line below.
+    panic!(
+        "Process table full ({} slots, {} reclaimable RETIRED)",
+        MAX_PROCESSES,
+        retired_process_count()
+    );
 }
 
 /// Try to claim one FREE slot and install `ptr` into it. Returns whether it succeeded.
@@ -136,6 +148,15 @@ pub fn unregister_process(pid: Pid) -> bool {
             continue;
         }
         RETIRE_TIME[i].store((runtime().uptime_us)(), Ordering::Release);
+        // Stamp how much memory this slot is parking and flag that a collector is
+        // wanted. Scalar, taken here while the `Process` is provably alive — a reader
+        // on the pressure path must never dereference a RETIRED `Process` to size it,
+        // since that races the very drop it is trying to schedule. See
+        // `process::reclaim`.
+        crate::process::reclaim::note_retired(
+            i,
+            unsafe { (*ptr).address_space.resident_pages() } as u32,
+        );
         // Mark the process's thread as TERMINATED before unregistering.
         // This prevents orphaned threads that stay READY forever after
         // their process is reaped. Without this, kthreads shows "user-process"
@@ -211,6 +232,7 @@ fn reclaim_retired_processes_internal(ignore_cooldown: bool) -> usize {
         }
         SLOT_STATES[i].store(slot_state::FREE, Ordering::Release);
         RETIRE_TIME[i].store(0, Ordering::Relaxed);
+        crate::process::reclaim::clear_retired_slot(i);
         unsafe { drop(Box::from_raw(old)); }
         count += 1;
     }

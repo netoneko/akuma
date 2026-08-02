@@ -36,6 +36,8 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | SSH unreachable or slow to connect | [`runbooks/debug-devbox.md`](runbooks/debug-devbox.md) (devbox) / [`runbooks/debug-ssh-latency.md`](runbooks/debug-ssh-latency.md) |
 | VM wedged, 100% CPU, unresponsive | [`runbooks/recover-wedged-vm.md`](runbooks/recover-wedged-vm.md) |
 | Kernel panic / OOM / allocation failure | [`runbooks/debug-memory-oom.md`](runbooks/debug-memory-oom.md) |
+| PMM free pinned near the reserve while `[PSTATS]` shows `retired=N/Mp` non-zero (exec failures, "No current user process" cascades) | Reclaimable memory is parked, not leaked: [`reference/subsystems/memory.md`](reference/subsystems/memory.md) -> "Reclaim under memory pressure" + [`archive/OOM_KILL_DEFERRED_RECLAIM_GAP.md`](archive/OOM_KILL_DEFERRED_RECLAIM_GAP.md) |
+| Kernel panic `Process table full (256 slots)` | **Known OPEN item**, not a capacity limit — the slots are reclaimable zombies and `register_process` panics instead of failing the spawn: [`reference/subsystems/memory.md`](reference/subsystems/memory.md) -> "OPEN: a full process table still panics the kernel" |
 | Kernel panic with ESR_EL1/FAR_EL1 / "unhandled exception" / EL1 crash | [`runbooks/debug-exceptions.md`](runbooks/debug-exceptions.md) |
 | Network doesn't work / can't connect out | [`runbooks/debug-network.md`](runbooks/debug-network.md) (smoltcp) / [`runbooks/debug-devbox.md`](runbooks/debug-devbox.md) (rump) |
 | `cargo` or `rustc` crashes in the devbox | [`runbooks/debug-devbox.md`](runbooks/debug-devbox.md) -> Toolchain crashes |

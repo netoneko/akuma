@@ -15,6 +15,7 @@ pub mod exec;
 pub mod diag;
 pub mod lifecycle;
 pub mod bkl_guard;
+pub mod reclaim;
 
 pub use lifecycle::LifecycleGuard;
 pub use bkl_guard::{process_bkl_drop_enabled, set_process_bkl_drop_enabled, ProcessBklGuard};
@@ -1591,6 +1592,16 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     unsafe {
         core::arch::asm!("msr daifclr, #2", "isb", options(nomem, nostack));
     }
+    // Pressure-driven reclaim of previously RETIRED processes — the first of
+    // `process::reclaim`'s vetted drain sites, and the one that matters under an
+    // OOM-kill storm (`docs/archive/OOM_KILL_DEFERRED_RECLAIM_GAP.md` §5 candidate 1).
+    // Everything that makes this context safe is above us: the lifecycle guard is
+    // released (so a multi-thousand-page free cannot trip its 100 ms preemption
+    // watchdog, and `Process::drop`'s fd-table close cannot re-enter it), the address
+    // space is deactivated, the dropped-window ledger is reset, IRQs are back on, and
+    // no drop-path lock is held. Our OWN slot was retired microseconds ago and is
+    // still inside its cooldown, so this can never free the `Process` we just left.
+    crate::process::reclaim::drain_retired_if_requested();
     loop {
         crate::threading::yield_now();
     }
@@ -1720,6 +1731,12 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
     unsafe {
         core::arch::asm!("msr daifclr, #2", "isb", options(nomem, nostack));
     }
+
+    // Same vetted drain site as `return_to_kernel` — see the comment there. Placed
+    // after the IRQ re-enable above deliberately: this path inherits the *faulting*
+    // code's DAIF, and running a multi-thousand-page free with IRQs still masked would
+    // starve this core's timer for the duration.
+    crate::process::reclaim::drain_retired_if_requested();
 
     loop {
         crate::threading::yield_now();

@@ -966,6 +966,12 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
             akuma_exec::sync::HOLD_TAG_IDLE,
         );
         set_core_idle(core, false);
+        // Per-core half of `process::reclaim`'s idle drain site (the BSP's lives in
+        // thread 0's idle loop): a secondary that has nothing to run is a collector
+        // this box would otherwise never use. We hold the BKL here, which sits ABOVE
+        // every drop-path lock in the order (`BKL > as_lock > {PMM, ...}`) — the same
+        // context netpoll_maint's reclaim already runs in.
+        akuma_exec::process::reclaim::drain_retired_if_requested();
     }
 }
 

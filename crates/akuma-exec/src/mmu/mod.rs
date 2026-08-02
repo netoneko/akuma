@@ -717,6 +717,19 @@ impl UserAddressSpace {
         let _irq = IrqGuard::new();
         self.page_table_frames.lock().len()
     }
+    /// Physical frames this address space will hand back to the PMM when it drops:
+    /// tracked user pages + intermediate page tables + the L0. A **shared** view owns
+    /// none of them (the L0 owner does), so it reports 0.
+    ///
+    /// Snapshotted into `process::reclaim`'s per-slot stamp at retirement, so the
+    /// memory-pressure path can size the reclaimable backlog without dereferencing a
+    /// RETIRED `Process` — which would race the deferred drop it is scheduling.
+    pub fn resident_pages(&self) -> usize {
+        if self.shared {
+            return 0;
+        }
+        self.user_frame_count() + self.page_table_frame_count() + 1
+    }
     /// Drop one tracked reference to `frame`'s physical address.  O(log n) map
     /// lookup (was an O(n) linear scan — the dominant `munmap`/exit cost, see
     /// docs/COW_OPTIMIZATIONS.md).  A PA can be tracked more than once (mapped

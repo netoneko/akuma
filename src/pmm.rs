@@ -753,6 +753,29 @@ pub fn alloc_page_zeroed_user() -> Option<PhysFrame> {
         // before giving up — mirrors `alloc_page`'s reclaim-under-pressure.
         crate::allocator::reclaim_to_pmm();
         if user_alloc_would_starve(free_count()) {
+            // Still starved: hand back the memory of processes that are already DEAD
+            // before evicting anything from a process that is still alive. Since Phase
+            // 7e's "Free" half a reaped process's whole address space sits in a RETIRED
+            // slot until a collector drops it, and the only steady-state collector
+            // (netpoll_maint, 100 ms) is exactly what this kind of pressure starves —
+            // measured: ~35 K pages parked while the PMM sat pinned at the reserve
+            // (docs/archive/OOM_KILL_DEFERRED_RECLAIM_GAP.md).
+            //
+            // This rung sits ABOVE the eviction below on purpose: freeing a dead
+            // process's pages costs zero re-faults, while evicting a live process's
+            // clean file pages buys a disk read per page on the next touch. It honors
+            // the RETIRE cooldown (never the `_force` variant), so a process killed
+            // microseconds ago is deliberately NOT collected here and we fall through
+            // to eviction as before.
+            //
+            // Lock context: every caller of this function is the EL0 fault handler,
+            // which holds neither `as_lock` nor the PMM lock here — the same invariant
+            // `reclaim_clean_file_pages` below already relies on (it takes `as_lock`
+            // per page). `drain_retired_under_pressure` additionally declines when
+            // nothing is parked and guards against reentry. See `process::reclaim`.
+            akuma_exec::process::reclaim::drain_retired_under_pressure();
+        }
+        if user_alloc_would_starve(free_count()) {
             // Still starved: page out clean, read-only file-backed pages (e.g.
             // model weights mmap'd larger than RAM) and let them re-fault from
             // the file. This is the page-reclaim half of demand paging — it is

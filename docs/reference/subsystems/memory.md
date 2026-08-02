@@ -5,9 +5,12 @@ fork, and userspace address spaces. For debugging, see
 [`../../runbooks/debug-memory-oom.md`](../../runbooks/debug-memory-oom.md).
 
 > **Stability: C (active risk).** Highest-churn subsystem through 2026-06.
-> Two items still OPEN: per-run kernel-heap creep; reclaim-after-OOM below
-> ~5 MB. The recurring bug class is *region-boundary computed with a wrong
-> constant* — verify any new region math against the invariants below.
+> Three items still OPEN: per-run kernel-heap creep; reclaim-after-OOM below
+> ~5 MB; and a full process table panicking instead of failing the spawn (see
+> [OPEN: a full process table still panics the
+> kernel](#open-a-full-process-table-still-panics-the-kernel)). The recurring
+> bug class is *region-boundary computed with a wrong constant* — verify any
+> new region math against the invariants below.
 
 ## Memory layout
 
@@ -54,7 +57,7 @@ was hardcoded `0xC0000000`).
 | API | Purpose |
 |---|---|
 | `alloc_page` / `alloc_page_zeroed` | Single page (zeroed via `phys_to_virt` + cache clean) |
-| `alloc_page_zeroed_user` | Gated by `USER_PAGE_RESERVE`=16 (user pages can't drain the last kernel reserve) |
+| `alloc_page_zeroed_user` | Gated by `USER_PAGE_RESERVE`=16 (user pages can't drain the last kernel reserve). On starvation walks the [pressure ladder](#alloc_page_zeroed_users-pressure-ladder) before returning `None` |
 | `alloc_pages_contiguous_zeroed(count)` / `free_pages_contiguous` | Thread stacks |
 | `free_page` | Returns `FreeOutcome { Freed, DoubleFree, OutOfRange }`; only `Freed` decrements `ALLOCATED_PAGES` |
 | `cow_ref_inc(pa)` / `cow_ref_dec(pa) -> bool` | CoW refcounts (separate from bitmap). `dec` true ⇒ last ref, caller frees. |
@@ -127,9 +130,99 @@ recoverable; over-free crashes the kernel).
 - **Eviction:** `try_evict_ro_page` + `reclaim_clean_file_pages` evict clean
   `AP_RO_ALL` file-backed pages under pressure (lets models > RAM run).
 
+## Reclaim under memory pressure
+
+A dead process's memory does **not** return to the PMM when it exits. Since
+Phase 7e's "Free" half, `unregister_process` only RETIREs the slot; the
+`Process` drop — which frees every user frame, every page-table frame and the
+ASID — happens later, in `table::reclaim_retired_processes`, once a cooldown
+(`PROCESS_RECLAIM_COOLDOWN_US`, 10 ms) has outlasted any BKL-dropped window
+that could still hold a raw `*Process`. **Do not shorten or bypass that
+cooldown**; `reclaim_retired_processes_force` is tests-only.
+
+### `alloc_page_zeroed_user`'s pressure ladder
+
+Rungs, in order. Each is tried only if the previous left free PMM at or below
+`USER_PAGE_RESERVE`:
+
+| # | Rung | Cost of the memory it frees |
+|---|---|---|
+| 1 | `allocator::reclaim_to_pmm()` | none — fully-free heap spans |
+| 2 | `process::reclaim::drain_retired_under_pressure()` | none — the pages belong to processes that are already dead |
+| 3 | `process::reclaim_clean_file_pages()` | one disk read per page, on the next touch by a **live** process |
+| 4 | return `None` ⇒ caller SIGSEGVs the faulting process | — |
+
+Rung 2 sits above rung 3 deliberately: evicting a live process's clean file
+pages is the more expensive and more destructive of the two.
+
+### Who actually runs the collector
+
+`process::reclaim` splits "notice pressure" from "run `Process::drop`", because
+the drop takes PMM, `ASID_ALLOCATOR`, `SHARED_L0_TABLE` and (via
+`Arc<SharedFdTable>`) VFS/socket locks — a caller already holding one
+self-deadlocks. So:
+
+- **`request_retired_reclaim()`** — three atomic ops, no locks, no drop code.
+  Safe from anywhere, including drop-path lock holders and IRQ context.
+- **`drain_retired*()`** — runs the drop. **Only** from these vetted sites,
+  each with no drop-path lock held:
+
+| Site | Covers |
+|---|---|
+| `sys_exit_group` / `sys_exit` terminal park (`src/syscall/proc.rs`) | every clean userspace exit — the common case |
+| `return_to_kernel` / `return_to_kernel_from_fault` terminal park | fault-kills and kernel-spawned process exits |
+| thread 0's idle loop; the `smp-shared` per-core idle loop | the regime where `netpoll_maint` is starved |
+| `alloc_page_zeroed_user` rung 2 | demand-paging pressure |
+| `netpoll_maint`, 100 ms (pre-existing) | steady state |
+
+Adding a *sixth* site means auditing its ambient lock context first. If you
+cannot, call `request_retired_reclaim()` instead and let one of the five
+collect.
+
+Runtime toggle `process::reclaim::set_pressure_reclaim_enabled` (default on) is
+both the kill switch and the same-binary A/B lever used by
+`test_retired_reclaim_pressure_ab`.
+
+### OPEN: a full process table still panics the kernel
+
+`register_process` is **infallible**. On a full-table miss it prints
+`Process table full (256 slots)` and `panic!`s — even when every one of those
+`MAX_PROCESSES` slots is a RETIRED zombie whose memory is reclaimable and whose
+only problem is that no collector has run yet. It deliberately does not reclaim
+inline; that call site is ruled out by the self-deadlock in the module note
+above, and the ban is correct.
+
+What is *not* correct is the panic. The intended fix is to return an error when
+`retired_process_count() > 0` so fork/clone/spawn surface `-EAGAIN` instead of
+halting the box — "collector starved, retry" rather than "kernel dead". It was
+left out of the pressure-reclaim change because making `register_process`
+fallible means threading a `Result` through every fork/clone/spawn caller, a
+wider diff than the whole collector mechanism.
+
+Until then the mitigation is indirect: the five drain sites above make a
+zombie-full table far less reachable than it was, but they do not make it
+impossible — a spawn storm that outruns every collector still ends in the
+panic. Treat `Process table full` as this open item, not as a genuine
+capacity limit.
+
+### Reading the signature
+
+`[PSTATS]`'s `retired=N/Mp` field is the live form of the detection signature:
+`pmm=` pinned near the reserve while `retired=` is non-zero means reclaimable
+memory exists and the collectors are starved — not that memory leaked. A high
+`retired=` count (approaching `MAX_PROCESSES`=256) is also the run-up to the
+`Process table full` panic above.
+
 ## Background
 
 - `archive/MEMORY_LAYOUT.md` (partly superseded on heap sizing).
 - `archive/USERSPACE_MEMORY_MODEL.md`, `archive/COW_OPTIMIZATIONS.md`.
 - `archive/LOW_MEMORY_ENVIRONMENT.md` — the densest source; extreme hardening.
 - `archive/HEAP_AND_MEMORY_IMPROVEMENTS.md` — watermark + admission control.
+- `archive/OOM_KILL_DEFERRED_RECLAIM_GAP.md` — the risk statement that the
+  pressure-reclaim section above closes (triggers, the lock-context constraint
+  on call sites, detection signature).
+- `archive/BOOT_SUITE_PMM_DEFERRED_RECLAIM.md` — the measurement it came from
+  (~35 K pages parked, PMM pinned at the reserve for 500 polls).
+- `archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md` — why the free is deferred at
+  all, and the self-deadlock that constrains where reclaim may be called.

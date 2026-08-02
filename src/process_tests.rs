@@ -295,6 +295,12 @@ pub fn run_all_tests() {
     // process, not panic the kernel. Skips unless /models has a file > RAM.
     test_mmap_file_oom_survives();
 
+    // Pressure-driven reclaim of RETIRED processes: the flag/drain split, the
+    // allocator's pressure rung, and a same-binary A/B of the whole mechanism.
+    test_retired_reclaim_request_flag_tracks_backlog();
+    test_retired_reclaim_pressure_rung_frees_parked_pages();
+    test_retired_reclaim_pressure_ab();
+
     // EC=0x18 DC ZVA emulation (Go runtime memclrNoHeapPointers fix)
     test_dc_zva_emulation();
 
@@ -7963,6 +7969,307 @@ fn test_oom_user_page_reserve() {
     pmm::free_page(c);
 
     console::print("  [PASS] test_oom_user_page_reserve\n");
+}
+
+// ============================================================================
+// Pressure-driven reclaim of RETIRED processes
+// (docs/archive/OOM_KILL_DEFERRED_RECLAIM_GAP.md)
+// ============================================================================
+
+/// Park `pages` real PMM frames inside a freshly RETIRED process slot and return
+/// (pid, frames actually parked). The frames are tracked in the address space, so the
+/// deferred `Process::drop` is what hands them back — exactly the shape an OOM-killed
+/// process leaves behind, without needing a >RAM file on disk to produce it.
+///
+/// Returns `None` if the machine is too small to park this much without touching the
+/// reserve; callers should SKIP in that case.
+fn park_retired_process_with_pages(pages: usize) -> Option<(u32, usize)> {
+    use crate::pmm;
+
+    // Never park so much that we approach the reserve: this test must not itself
+    // create the pressure it is measuring the response to.
+    if pmm::free_count() < pages * 2 + 4096 {
+        return None;
+    }
+
+    let pid = akuma_exec::process::table::NEXT_PID
+        .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let proc = make_test_process(pid);
+    let mut parked = 0usize;
+    for _ in 0..pages {
+        match pmm::alloc_page_zeroed() {
+            Some(f) => {
+                proc.address_space.track_user_frame(f);
+                parked += 1;
+            }
+            None => break,
+        }
+    }
+    akuma_exec::process::table::register_process(pid, proc);
+    if !akuma_exec::process::table::unregister_process(pid) {
+        return None;
+    }
+    Some((pid, parked))
+}
+
+/// Burn past `PROCESS_RECLAIM_COOLDOWN_US` so a just-retired slot is genuinely
+/// collectable.
+///
+/// `blocking_relax`, not a bare `yield_now` loop: under `smp-shared` a tight yield
+/// loop re-takes the BKL every iteration and the peer core reports us as a stuck owner
+/// (measured: 12 spurious `[BKL] stuck owner=1 waiter=2` lines per boot from exactly
+/// this shape). `blocking_relax` adds the `idle_halt` that drops the lock while we
+/// wait, which is what the rest of the suite's wait loops use.
+fn wait_out_reclaim_cooldown() {
+    let deadline = crate::timer::uptime_us() + crate::config::PROCESS_RECLAIM_COOLDOWN_US * 5;
+    while crate::timer::uptime_us() < deadline {
+        akuma_exec::threading::blocking_relax();
+    }
+}
+
+/// The request flag is the half of the mechanism that is safe to set from contexts
+/// holding drop-path locks (`register_process`'s full-table miss, an IRQ, an
+/// allocation failure deep inside a syscall) — it must therefore mean exactly "parked
+/// memory exists and nobody has collected it", and must survive a drain that could not
+/// collect anything yet.
+///
+/// Pins three properties that the drain sites depend on:
+/// - retiring a process raises the flag and stamps its resident pages;
+/// - a drain inside the cooldown frees nothing and **leaves the flag set**, so the next
+///   safe point retries instead of the request being dropped on the floor;
+/// - past the cooldown the parked pages actually return to the PMM.
+///
+/// The last one is asserted as an *outcome*, not as "this call did it": under
+/// `smp-shared` the secondary core's idle loop is a second collector, and it can win the
+/// race while this thread is waiting out the cooldown. Attribution is printed, not
+/// asserted — the mechanism is correct either way, and asserting the winner is what made
+/// an earlier version of this test fail at SMP=2 while the memory came back fine.
+fn test_retired_reclaim_request_flag_tracks_backlog() {
+    use crate::pmm;
+    use akuma_exec::process::reclaim;
+    use akuma_exec::process::table::reclaim_retired_processes_force;
+
+    let was_enabled = reclaim::pressure_reclaim_enabled();
+    reclaim::set_pressure_reclaim_enabled(true);
+    // Start from an empty backlog: earlier tests leave RETIRED zombies of their own.
+    let _ = reclaim_retired_processes_force();
+    let _ = reclaim::drain_retired();
+
+    let baseline_pages = reclaim::retired_pages_pending();
+    let Some((_pid, parked)) = park_retired_process_with_pages(64) else {
+        console::print("  [SKIP] retired_reclaim_request_flag: not enough free PMM\n");
+        reclaim::set_pressure_reclaim_enabled(was_enabled);
+        return;
+    };
+    let free_parked = pmm::free_count();
+
+    let requested_after_retire = reclaim::reclaim_requested();
+    let stamped = reclaim::retired_pages_pending().saturating_sub(baseline_pages);
+
+    // Inside the cooldown: nothing may be freed — by us or by any peer collector — and
+    // the request must persist so the next safe point retries.
+    let freed_hot = reclaim::drain_retired();
+    let requested_still = reclaim::reclaim_requested();
+    let pages_hot = reclaim::retired_pages_pending();
+
+    wait_out_reclaim_cooldown();
+
+    let freed_cold = reclaim::drain_retired();
+    let free_after = pmm::free_count();
+
+    // `stamped` counts the parked user frames plus the address space's own page-table
+    // frames and L0, so it must be at least what we parked.
+    let ok = requested_after_retire
+        && stamped >= parked
+        && freed_hot == 0
+        && pages_hot >= baseline_pages + stamped
+        && requested_still
+        && free_after >= free_parked + parked;
+
+    if ok {
+        crate::safe_print!(224,
+            "  [PASS] retired_reclaim_request_flag: parked {}p (stamped {}p), hot drain freed 0 + kept request, past cooldown free {} -> {} (this call freed {})\n",
+            parked, stamped, free_parked, free_after, freed_cold);
+    } else {
+        crate::safe_print!(256,
+            "  [FAIL] retired_reclaim_request_flag: requested_after_retire={} stamped={} parked={} freed_hot={} pages_hot={} baseline={} requested_still={} freed_cold={} free_parked={} free_after={}\n",
+            requested_after_retire, stamped, parked, freed_hot, pages_hot,
+            baseline_pages, requested_still, freed_cold, free_parked, free_after);
+    }
+
+    let _ = reclaim_retired_processes_force();
+    reclaim::set_pressure_reclaim_enabled(was_enabled);
+}
+
+/// The rung added to `pmm::alloc_page_zeroed_user`'s pressure ladder must actually
+/// return parked pages to the PMM — and must decline cheaply when there is nothing
+/// parked, so the common allocation-failure path pays one lock-free scan and no more.
+///
+/// Driving `alloc_page_zeroed_user` itself would mean draining real RAM to the reserve
+/// inside the boot suite; instead this calls the rung's own entry point directly (the
+/// gating predicate, `pmm::user_alloc_would_starve`, is unit-tested at the boundary by
+/// `test_oom_user_page_reserve`). What is asserted here is the part the ladder cannot
+/// fake: pages come back.
+fn test_retired_reclaim_pressure_rung_frees_parked_pages() {
+    use crate::pmm;
+    use akuma_exec::process::reclaim;
+    use akuma_exec::process::table::reclaim_retired_processes_force;
+
+    let was_enabled = reclaim::pressure_reclaim_enabled();
+    reclaim::set_pressure_reclaim_enabled(true);
+    let _ = reclaim_retired_processes_force();
+    let _ = reclaim::drain_retired();
+
+    // Nothing parked: the rung must be a no-op, not a table sweep.
+    let idle_result = reclaim::drain_retired_under_pressure();
+
+    const PARK: usize = 512;
+    let free_before_park = pmm::free_count();
+    let Some((_pid, parked)) = park_retired_process_with_pages(PARK) else {
+        console::print("  [SKIP] retired_reclaim_pressure_rung: not enough free PMM\n");
+        reclaim::set_pressure_reclaim_enabled(was_enabled);
+        return;
+    };
+    let free_parked = pmm::free_count();
+    // Wait out the cooldown with the mechanism OFF, so a peer core's idle-loop drain
+    // cannot collect the backlog before the rung under test gets a chance at it. Without
+    // this the rung reports `freed=0` at SMP=2 — correct behaviour (someone else got
+    // there first), but it makes the test unable to say anything about the rung itself.
+    reclaim::set_pressure_reclaim_enabled(false);
+    wait_out_reclaim_cooldown();
+    reclaim::set_pressure_reclaim_enabled(true);
+
+    let freed = reclaim::drain_retired_under_pressure();
+    let free_after = pmm::free_count();
+
+    // Every page the parked address space held must be back. `free_after` can exceed
+    // `free_before_park` (the AS's own page tables are freed too), never fall short.
+    let recovered = free_after.saturating_sub(free_parked);
+    let ok = idle_result == 0
+        && parked == PARK
+        && recovered >= parked
+        && free_after >= free_before_park;
+
+    if ok {
+        crate::safe_print!(224,
+            "  [PASS] retired_reclaim_pressure_rung: parked {}p, free {} -> {} -> {} ({} recovered, {} slot(s) freed by the rung itself)\n",
+            parked, free_before_park, free_parked, free_after, recovered, freed);
+    } else {
+        crate::safe_print!(256,
+            "  [FAIL] retired_reclaim_pressure_rung: idle_result={} parked={} freed={} free_before={} free_parked={} free_after={} recovered={}\n",
+            idle_result, parked, freed, free_before_park, free_parked, free_after, recovered);
+    }
+
+    let _ = reclaim_retired_processes_force();
+    reclaim::set_pressure_reclaim_enabled(was_enabled);
+}
+
+/// Same-binary A/B of the whole mechanism, per `docs/reference/subsystems/locking.md`
+/// rule 5: one boot, one binary, identical workload on both sides, only
+/// `process::reclaim`'s runtime toggle flipped between them.
+///
+/// Each side parks a dead process holding real frames, waits out the RETIRE cooldown,
+/// then runs a **real process exit** (`/bin/hello`) — nothing else. That exit is the
+/// only thing that can collect the backlog, because the boot suite runs ahead of
+/// `run_async_main_preemptive`, so `netpoll_maint` (the sole steady-state collector
+/// before this change) does not exist yet, and thread 0 is *running this test* rather
+/// than idling in its own collector. The measurement is therefore attributable to
+/// exactly one thing: the drain site in `return_to_kernel`.
+///
+/// Expected: OFF strands the parked pages (the measured pre-fix behaviour — free stays
+/// down, the slot stays RETIRED); ON returns them on the first process exit.
+fn test_retired_reclaim_pressure_ab() {
+    use crate::pmm;
+    use akuma_exec::process::reclaim;
+    use akuma_exec::process::table::{reclaim_retired_processes_force, retired_process_count};
+
+    const PARK: usize = 1024; // 4 MB — far above any per-exit noise from /bin/hello
+    let was_enabled = reclaim::pressure_reclaim_enabled();
+
+    // (recovered_pages, retired_slots_left) per side.
+    let mut result: [(usize, usize); 2] = [(0, 0); 2];
+    let mut skipped = false;
+
+    for (idx, on) in [false, true].into_iter().enumerate() {
+        // Settle to a clean baseline on BOTH sides so the two are comparable.
+        akuma_exec::threading::cleanup_terminated_force();
+        let _ = reclaim_retired_processes_force();
+        crate::allocator::reclaim_to_pmm();
+        reclaim::set_pressure_reclaim_enabled(on);
+
+        let Some((_pid, parked)) = park_retired_process_with_pages(PARK) else {
+            skipped = true;
+            break;
+        };
+        let free_parked = pmm::free_count();
+        let retired_parked = retired_process_count();
+        // Past the cooldown the backlog is genuinely collectable — so anything still
+        // parked after this point is a missing collector, not a safety margin.
+        wait_out_reclaim_cooldown();
+
+        // The workload: one real process exit. This is the drain site under test.
+        match process::exec_with_io("/bin/hello", Some(&["1", "5"]), None) {
+            Ok(_) => {}
+            Err(e) => {
+                crate::safe_print!(96,
+                    "  [SKIP] retired_reclaim_ab: exec /bin/hello failed: {}\n", e);
+                skipped = true;
+                break;
+            }
+        }
+        // `exec_with_io` returns on the child's channel notification, which teardown
+        // publishes BEFORE it reaches the drain site — give the dying thread time to
+        // get there. Bounded; a missing collector simply never lowers the count.
+        let deadline = crate::timer::uptime_us() + 500_000;
+        while crate::timer::uptime_us() < deadline
+            && retired_process_count() >= retired_parked
+        {
+            akuma_exec::threading::blocking_relax();
+        }
+
+        result[idx] = (
+            pmm::free_count().saturating_sub(free_parked),
+            retired_process_count(),
+        );
+
+        // Hand the memory back regardless of which side we are on.
+        akuma_exec::threading::cleanup_terminated_force();
+        let _ = reclaim_retired_processes_force();
+        crate::allocator::reclaim_to_pmm();
+        let _ = parked;
+    }
+
+    reclaim::set_pressure_reclaim_enabled(was_enabled);
+
+    if skipped {
+        console::print("  [SKIP] retired_reclaim_ab: not enough free PMM to park a test address space\n");
+        return;
+    }
+
+    let (off_recovered, off_retired) = result[0];
+    let (on_recovered, on_retired) = result[1];
+    // The A side must strand it (that IS the gap), the B side must recover it. Both are
+    // compared against PARK rather than against each other, so a change that breaks
+    // BOTH sides fails instead of looking like a null result.
+    //
+    // The ON side recovers slightly less than PARK, by design of the measurement rather
+    // than of the mechanism: the workload IS a process, and at the moment we sample,
+    // `/bin/hello` is an ACTIVE zombie awaiting `wait4` — its own footprint has not been
+    // reaped yet and is netted out of the free count. Measured ~55 pages of it, so the
+    // bar is three quarters, and the retired-slot counts printed alongside are the
+    // noise-free confirmation (1 left vs 0 left).
+    let ok = off_recovered < PARK / 4 && on_recovered >= PARK * 3 / 4;
+
+    if ok {
+        crate::safe_print!(256,
+            "  [PASS] retired_reclaim_ab: parked {}p, one /bin/hello exit -> OFF recovered {}p ({} slot(s) still RETIRED), ON recovered {}p ({} left)\n",
+            PARK, off_recovered, off_retired, on_recovered, on_retired);
+    } else {
+        crate::safe_print!(256,
+            "  [FAIL] retired_reclaim_ab: parked {}p, OFF recovered {}p (retired {}), ON recovered {}p (retired {}) — expected OFF to strand (<{}p) and ON to recover (>={}p)\n",
+            PARK, off_recovered, off_retired, on_recovered, on_retired,
+            PARK / 4, PARK * 3 / 4);
+    }
 }
 
 /// Live regression for the llama.cpp `mmap=true` kernel abort

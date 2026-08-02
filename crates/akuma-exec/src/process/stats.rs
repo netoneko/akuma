@@ -96,10 +96,16 @@ impl ProcessSyscallStats {
         }
 
         let total_time_ms = total_time_us / 1000;
+        // `retired=` is the live form of the gap doc's detection signature: PMM free
+        // pinned at the reserve while reclaimable memory sits parked means the
+        // collectors are starved, not that memory is gone
+        // (docs/archive/OOM_KILL_DEFERRED_RECLAIM_GAP.md §6).
         let msg = format!(
-            "[PSTATS] PID {} ({}) {}.{:02}s: {} syscalls ({}/s) in_kernel={}ms pmm={}free/{}tot pgfault={}({}pg) | {}\n",
+            "[PSTATS] PID {} ({}) {}.{:02}s: {} syscalls ({}/s) in_kernel={}ms pmm={}free/{}tot retired={}/{}p pgfault={}({}pg) | {}\n",
             pid, name, secs, frac, total, rate, total_time_ms,
-            pmm_free, pmm_total, pf, pf_pg, top,
+            pmm_free, pmm_total,
+            table::retired_process_count(), crate::process::reclaim::retired_pages_pending(),
+            pf, pf_pg, top,
         );
         (runtime().print_str)(&msg);
     }

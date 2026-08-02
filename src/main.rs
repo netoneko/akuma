@@ -1142,6 +1142,13 @@ fn run_async_main_preemptive() -> ! {
                         console::print_dec(cleaned);
                         console::print(" terminated threads\n");
                     }
+                    // Second of `process::reclaim`'s vetted drain sites, and the one
+                    // that covers the regime where netpoll_maint starves: if memory
+                    // pressure is bad enough to block the maintenance thread, something
+                    // is blocked, and the idle loop is what runs. No drop-path lock is
+                    // held here — this is the same context that already runs
+                    // `cleanup_terminated`'s kernel-stack frees.
+                    akuma_exec::process::reclaim::drain_retired_if_requested();
                 }
                 
                 // Heartbeat every 1000 iterations to show thread 0 is alive

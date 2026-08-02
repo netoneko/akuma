@@ -271,10 +271,31 @@ pub(super) fn sys_exit(code: i32) -> u64 {
             }
             // Do NOT unregister_process — leave as zombie for wait4.
             akuma_exec::threading::mark_thread_terminated(tid);
+            drain_retired_before_parking();
             loop { akuma_exec::threading::yield_now(); }
         }
     }
     code as u64
+}
+
+/// Pressure-driven reclaim of RETIRED processes, from the terminal park of `sys_exit`
+/// and `sys_exit_group`.
+///
+/// This is `process::reclaim`'s teardown drain site for the path userspace actually
+/// takes. `return_to_kernel` has the same call, but a process that calls `exit_group`
+/// (every musl `exit()`, i.e. nearly every clean exit) never gets there: it marks its
+/// own thread terminated and parks in the `yield_now` loop below, so without this the
+/// most common process exit in the system collected nothing.
+///
+/// Safe here for the same reasons as the `return_to_kernel` site: fds are already
+/// closed, the thread group is torn down, the parent has been notified, no lifecycle
+/// guard is held (neither exit path takes one), and the only lock we hold is the BKL —
+/// which sits above every drop-path lock in the order, exactly like the `netpoll_maint`
+/// collector's context. The calling process is still an ACTIVE zombie awaiting `wait4`,
+/// not RETIRED, so this can never free the address space we are standing on.
+#[inline]
+fn drain_retired_before_parking() {
+    akuma_exec::process::reclaim::drain_retired_if_requested();
 }
 
 /// Public wrapper for sys_exit_group, callable from exception handlers.
@@ -367,6 +388,7 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
                 io_ch.set_exited(code);
             }
             akuma_exec::threading::mark_thread_terminated(tid);
+            drain_retired_before_parking();
             // Yield to trigger scheduler. Once terminated, we should never run again.
             loop { akuma_exec::threading::yield_now(); }
         }
