@@ -87,17 +87,15 @@ report, retired/active counts, and `mmu::shared_l0_stats()` — a new
 diagnostic for frames parked in `SHARED_L0_TABLE`'s deferred-free entries) so
 one failing test can no longer halt the suite.
 
-## 5. Open question worth keeping
+## 5. Open kernel risk (split out)
 
-In production the chain is fine (netpoll_maint runs every 100 ms). But the
-round-1 shape generalizes: a large process OOM-killed while `netpoll_maint`
-is starved, wedged, or not yet started strands its whole address space, and
-memory pressure is exactly when that reclaim matters most. There is no
-pressure-driven reclaim trigger — `handle_oom`/eviction do not attempt
-`reclaim_retired_processes` (deliberately, per the lock-context reasoning in
-`table.rs::register_process`). If a real workload ever reproduces the
-"suite-collapse" shape, a dedicated low-ambient-lock reclaim call site under
-PMM pressure is the direction.
+The round-1 shape generalizes beyond the boot suite: there is **no
+pressure-driven reclaim trigger** for RETIRED processes, so a large process
+OOM-killed while `netpoll_maint` is starved, wedged, or not yet started
+strands its whole address space exactly when memory matters most. Full risk
+statement — triggers, the lock-context constraint that rules out naive
+on-demand reclaim, candidate call sites, and detection signature — in
+[`OOM_KILL_DEFERRED_RECLAIM_GAP.md`](OOM_KILL_DEFERRED_RECLAIM_GAP.md).
 
 ## Background
 

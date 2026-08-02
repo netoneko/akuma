@@ -407,6 +407,7 @@ pub fn run_all_tests() {
     test_entry_point_trampoline_no_zombie_match();
     test_zombie_process_unregistered_after_return_to_kernel();
     test_trap_frame_cleared_when_thread_slot_recycled();
+    test_on_cpu_gate_lifecycle();
 
     // fd table lock consistency + orphan cleanup + pidfd cloexec
     test_fd_table_lock_consistency();
@@ -9719,6 +9720,55 @@ fn test_trap_frame_cleared_when_thread_slot_recycled() {
             "[Test] trap_frame_cleared_when_thread_slot_recycled FAILED: tid={} \
              clear_when_free={} published={} recycled={} cleared_on_recycle={}\n",
             tid, clear_when_free, published, recycled, cleared_on_recycle);
+    }
+}
+
+/// Regression test for the ON_CPU scheduler gate (the SMP=4 cross-core
+/// stack-sharing corruption: boot-time `[BKL] stuck owner=N` storms from EL1
+/// wild branches, and BKL_RUSTC_SCALING_BASELINE.md §5.1's ERET-to-EL0 with a
+/// kernel register file). The gate must be: set for the thread a core is
+/// running (latched at bringup and re-latched by every commit_switch), clear
+/// on a freshly claimed slot, and bounded by 2×cores system-wide (one running
+/// thread per core plus at most one mid-switch outgoing gate per core) — an
+/// unbounded count means `rust_switch_finished` clears are being missed, which
+/// starves READY threads.
+fn test_on_cpu_gate_lifecycle() {
+    use akuma_exec::threading::{
+        claim_test_thread_slots, release_test_thread_slot, current_thread_id,
+        on_cpu_flag, on_cpu_count, yield_now, MAX_CORES,
+    };
+
+    // 1. The calling thread is on a CPU right now — its gate must be set.
+    let self_set_before = on_cpu_flag(current_thread_id());
+
+    // 2. A freshly claimed (never-run) slot must have a clear gate.
+    let claimed = claim_test_thread_slots(1);
+    let fresh_clear = if let Some(&tid) = claimed.first() {
+        let clear = !on_cpu_flag(tid);
+        release_test_thread_slot(tid);
+        clear
+    } else {
+        true // no free slot — don't fail the invariant we couldn't observe
+    };
+
+    // 3. Cross real scheduler switches, then re-check: commit_switch must have
+    //    re-latched our gate on the switch back in (yield may be a no-op on a
+    //    quiescent core; the gate must be set either way).
+    yield_now();
+    yield_now();
+    let self_set_after = on_cpu_flag(current_thread_id());
+
+    // 4. Global bound: at most one running + one mid-switch gate per core.
+    let count = on_cpu_count();
+    let bounded = (1..=2 * MAX_CORES).contains(&count);
+
+    if self_set_before && fresh_clear && self_set_after && bounded {
+        console::print("[Test] on_cpu_gate_lifecycle PASSED\n");
+    } else {
+        crate::safe_print!(192,
+            "[Test] on_cpu_gate_lifecycle FAILED: self_before={} fresh_clear={} \
+             self_after={} count={} (bound {})\n",
+            self_set_before, fresh_clear, self_set_after, count, 2 * MAX_CORES);
     }
 }
 

@@ -309,6 +309,48 @@ static CURRENT_TRAP_FRAME: [AtomicU64; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
+/// ON-CPU gate for the cross-core stack-sharing races (the SMP=4 boot-storm EL1
+/// crashes / BKL_RUSTC_SCALING_BASELINE.md §5.1 corruption family).
+///
+/// Set while a thread is (or may still be) executing on some core; a thread may
+/// be PICKED by a scheduler only when its gate is clear. Two distinct races
+/// require this, and thread STATE alone catches neither:
+///
+/// 1. **Switch-out tail.** `commit_switch` marks the outgoing thread READY and
+///    POOL is released when `sgi_scheduler_handler_with_sp` returns — but the
+///    switching core keeps EXECUTING ON THE OUTGOING THREAD'S KERNEL STACK
+///    until the vector asm's `mov sp, x0` (Rust epilogues, BKL reconcile and
+///    tag bookkeeping all run on it after POOL is gone). A peer picking the
+///    thread in that window resumes it onto a stack still in use.
+/// 2. **Wake-before-switch-out.** `schedule_blocking` stores WAITING (often
+///    with an already-expired deadline) while the thread is STILL RUNNING,
+///    before its yield-SGI fires. A peer's wake-pass / `mark_thread_ready`
+///    flips it READY and a peer scheduler resumes it from its STALE `ctx.sp`
+///    (the previous switch-out's frame) while it is still running elsewhere —
+///    a double-run on one stack. Observed as EL1 `ret` into kernel data /
+///    `ELR=0x8` with SP in another thread's stack, and as §5.1's ERET to EL0
+///    with a kernel register file.
+///
+/// Protocol: `commit_switch` sets the gate for the INCOMING thread (and
+/// defensively re-asserts the outgoing thread's, which stays set from its own
+/// switch-in); the outgoing tid is recorded per-core and its gate is cleared by
+/// `rust_switch_finished`, called from the vector asm immediately AFTER
+/// `mov sp, x0`. Bringup sites (boot thread, per-core idle claim) set the gate
+/// for the thread they start life running. Pickers and the slot recycler skip
+/// gated threads.
+static ON_CPU: [AtomicU8; MAX_THREADS] = {
+    const INIT: AtomicU8 = AtomicU8::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// Per-core: the tid whose [`ON_CPU`] gate this core must clear once the
+/// vector asm has switched SP (`usize::MAX` = none pending). Sized by
+/// `types::MAX_CORES`, the SMP bringup cap.
+static PER_CORE_OFFCPU: [AtomicUsize; MAX_CORES] = {
+    const INIT: AtomicUsize = AtomicUsize::new(usize::MAX);
+    [INIT; MAX_CORES]
+};
+
 /// Per-thread user-copy fault handler address (set around copy_from/to_user).
 ///
 /// Lock-free, for the same reason as `CURRENT_TRAP_FRAME`: it is read by the DATA
@@ -1093,6 +1135,14 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
             continue;
         }
 
+        // The core that switched away from this thread may still be executing on
+        // its kernel stack (commit → `mov sp, x0` window). Don't recycle the slot
+        // — and above all don't free the stack — until the gate clears; the next
+        // pass gets it. See ON_CPU's doc for the race.
+        if ON_CPU[i].load(Ordering::SeqCst) != 0 {
+            continue;
+        }
+
         // In deferred mode, respect the settling time unless the caller opts out.
         if !ignore_cooldown && config().deferred_thread_cleanup {
             let term_time = TERMINATION_TIME[i].load(Ordering::SeqCst);
@@ -1380,7 +1430,10 @@ pub fn adopt_current_as_core_idle(
         ctx.ttbr0 = crate::mmu::get_boot_ttbr0();
         ctx.is_user_process = 0;
     }
-    // This core is now the idle thread.
+    // This core is now the idle thread. Latch its ON_CPU gate: it starts life
+    // running (never switched into via commit_switch), and a stuck-clear gate
+    // would otherwise let a peer resume it mid-run.
+    ON_CPU[slot].store(1, Ordering::SeqCst);
     set_current_thread_register(slot);
     set_current_exception_stack(exc_stack_top);
     THREAD_STATES[slot].store(thread_state::RUNNING, Ordering::SeqCst);
@@ -2022,7 +2075,15 @@ impl ThreadPool {
             self.network_boost_counter += 1;
             if self.network_boost_counter >= config().network_thread_ratio {
                 self.network_boost_counter = 0;
-                if THREAD_STATES[net_tid].load(Ordering::SeqCst) == thread_state::READY {
+                if THREAD_STATES[net_tid].load(Ordering::SeqCst) == thread_state::READY
+                    && ON_CPU[net_tid].load(Ordering::SeqCst) == 0
+                {
+                    // Same ON_CPU latch as commit_switch (this path bypasses it).
+                    ON_CPU[current_idx].store(1, Ordering::SeqCst);
+                    ON_CPU[net_tid].store(1, Ordering::SeqCst);
+                    if core_id < MAX_CORES {
+                        PER_CORE_OFFCPU[core_id].store(current_idx, Ordering::SeqCst);
+                    }
                     if current_state != thread_state::TERMINATED && current_state != thread_state::WAITING {
                         THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
                     }
@@ -2048,6 +2109,7 @@ impl ThreadPool {
             && hinted != current_idx
             && !IS_IDLE_THREAD[hinted].load(Ordering::Relaxed)
             && THREAD_STATES[hinted].load(Ordering::SeqCst) == thread_state::READY
+            && ON_CPU[hinted].load(Ordering::SeqCst) == 0
         {
             hinted
         } else {
@@ -2068,6 +2130,7 @@ impl ThreadPool {
                 if state == thread_state::READY
                     && next_idx != current_idx
                     && !IS_IDLE_THREAD[next_idx].load(Ordering::Relaxed)
+                    && ON_CPU[next_idx].load(Ordering::SeqCst) == 0
                 {
                     // Found a ready, non-idle thread to switch TO.
                     break;
@@ -2085,6 +2148,11 @@ impl ThreadPool {
                         return None;
                     }
                     let idle = idle as usize;
+                    if ON_CPU[idle].load(Ordering::SeqCst) != 0 {
+                        // Should be unreachable (only THIS core runs its idle), but
+                        // never switch onto a stack another core may still be on.
+                        return None;
+                    }
                     self.commit_switch(current_idx, idle, now);
                     return Some((current_idx, idle));
                 }
@@ -2105,6 +2173,19 @@ impl ThreadPool {
     /// publish it as this core's current thread (TPIDRRO_EL0). Shared by the normal
     /// round-robin path and the per-core idle fallback.
     fn commit_switch(&mut self, current_idx: usize, next_idx: usize, now: u64) {
+        // ON_CPU protocol (see its doc): the incoming thread is about to run on
+        // this core; the outgoing thread's gate stays set (re-asserted here for
+        // robustness) until `rust_switch_finished` clears it after the vector
+        // asm's `mov sp, x0` — this core keeps executing on its kernel stack
+        // until then, well after POOL is released. SeqCst orders the latch
+        // before the READY publication below for any SeqCst reader (pickers).
+        ON_CPU[current_idx].store(1, Ordering::SeqCst);
+        ON_CPU[next_idx].store(1, Ordering::SeqCst);
+        let core = crate::bkl::current_core_id() as usize;
+        if core < MAX_CORES {
+            PER_CORE_OFFCPU[core].store(current_idx, Ordering::SeqCst);
+        }
+
         // Don't change state if the outgoing thread is TERMINATED or WAITING —
         // WAITING threads keep their state so the wake-pass handles them.
         let current_state = THREAD_STATES[current_idx].load(Ordering::SeqCst);
@@ -2269,6 +2350,10 @@ pub fn init() {
     // Initialize atomic thread states to match ThreadPool state
     // Thread 0 is RUNNING (boot thread), all others are FREE
     THREAD_STATES[0].store(thread_state::RUNNING, Ordering::SeqCst);
+    // Boot thread starts life running on core 0 without ever being switched
+    // into — latch its ON_CPU gate so a peer can never pick it while it runs
+    // (it becomes READY-visible the moment it blocks in schedule_blocking).
+    ON_CPU[0].store(1, Ordering::SeqCst);
     for i in 1..MAX_THREADS {
         THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
     }
@@ -2561,10 +2646,32 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             {
                 let elr = ((new_sp + 240) as *const u64).read_volatile();
                 let spsr = ((new_sp + 248) as *const u64).read_volatile();
-                if (spsr & 0xF) == 0 && elr >= 0x4000_0000 {
+                let kernel_text = (0x4010_0000..0x6000_0000).contains(&elr);
+                // EL0-target frames must not eret into kernel text (NOT merely
+                // ≥0x4000_0000 — user mmap VAs legitimately reach 0x1_xxxx_xxxx+);
+                // EL1-target frames must eret INTO kernel text (ELR=0x8 shape).
+                let poison = if (spsr & 0xF) == 0 { kernel_text } else { !kernel_text };
+                if poison {
                     safe_print!(128,
-                        "[SGI-S POISON] eret->EL0 elr={:#x} spsr={:#x} old_tid={} new_tid={} sp={:#x}\n",
+                        "[SGI-S POISON] eret elr={:#x} spsr={:#x} old_tid={} new_tid={} sp={:#x}\n",
                         elr, spsr, old_idx, new_idx, new_sp);
+                }
+            }
+
+            // Stack-aliasing tripwire (same corruption family): the frame we are
+            // about to restore MUST lie within the incoming thread's own kernel
+            // stack. A miss means ctx.sp points into another thread's (or a freed
+            // and reused) stack — the restore would eret with whatever kernel
+            // locals live there, which is exactly the §5.1 "EL0 return with a
+            // kernel register context" shape (BKL_RUSTC_SCALING_BASELINE.md).
+            {
+                let si = &pool.stacks[new_idx];
+                let lo = si.base as u64;
+                let hi = si.top as u64;
+                if si.size != 0 && (new_sp < lo || new_sp + 832 > hi) {
+                    safe_print!(160,
+                        "[SGI-S STACK] new_sp={:#x} outside stack [{:#x},{:#x}) old_tid={} new_tid={}\n",
+                        new_sp, lo, hi, old_idx, new_idx);
                 }
             }
 
@@ -2574,6 +2681,35 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     }
     
     0  // No switch needed
+}
+
+/// Called from the IRQ vector asm immediately after `mov sp, x0`: this core is
+/// now off the outgoing thread's kernel stack, so peers may pick that thread up
+/// (or recycle its slot). Clears the off-CPU gate `commit_switch` latched.
+/// Runs with IRQs masked on the incoming thread's stack; takes no locks.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_switch_finished() {
+    let core = crate::bkl::current_core_id() as usize;
+    if core < MAX_CORES {
+        let tid = PER_CORE_OFFCPU[core].swap(usize::MAX, Ordering::SeqCst);
+        if tid < MAX_THREADS {
+            ON_CPU[tid].store(0, Ordering::Release);
+        }
+    }
+}
+
+/// Test/diagnostic accessor: whether `tid`'s [`ON_CPU`] gate is set.
+pub fn on_cpu_flag(tid: usize) -> bool {
+    tid < MAX_THREADS && ON_CPU[tid].load(Ordering::SeqCst) != 0
+}
+
+/// Test/diagnostic accessor: how many [`ON_CPU`] gates are set. Bounded by the
+/// number of cores on a healthy system (each core runs exactly one thread, plus
+/// at most one not-yet-cleared outgoing gate per core mid-switch).
+pub fn on_cpu_count() -> usize {
+    (0..MAX_THREADS)
+        .filter(|&i| ON_CPU[i].load(Ordering::SeqCst) != 0)
+        .count()
 }
 
 /// Update a thread's context for a new execution (e.g., after execve or fork)

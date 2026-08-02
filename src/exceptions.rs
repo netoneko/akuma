@@ -80,7 +80,9 @@ sync_el1_handler:
     stp     x0, x1, [sp, #-16]!
     stp     x2, x3, [sp, #-16]!     // Save extra regs for IL bit fix
     
-    // Call Rust handler
+    // Call Rust handler with a pointer to the saved-register block
+    // (layout from the pushes above: +0 x2, +8 x3, +16 x0, +24 x1, +32 x29, +40 x30)
+    mov     x0, sp
     bl      rust_sync_el1_handler
     
     // Clear IL bit in SPSR before ERET to prevent EC=0xe
@@ -344,6 +346,11 @@ irq_el0_handler:
     // Check if context switch needed (x0 != 0)
     cbz     x0, 4f
     mov     sp, x0              // Switch SP in assembly!
+    // This core is now OFF the outgoing thread's stack — clear its off-CPU
+    // gate so peers may pick it up. Clobbers only caller-saved regs + x30,
+    // all of which the restore below overwrites. Uses the incoming thread's
+    // free stack space below its frame.
+    bl      rust_switch_finished
 4:
     
     // ============================================================
@@ -501,6 +508,8 @@ irq_handler:
     // Check if context switch needed (x0 != 0)
     cbz     x0, 3f
     mov     sp, x0              // Switch SP in assembly!
+    // Same off-CPU gate clear as the EL0 IRQ path — see there.
+    bl      rust_switch_finished
 3:
     
     // ============================================================
@@ -1548,6 +1557,30 @@ extern "C" fn rust_default_exception_handler() {
 #[cfg(kernel_smp_shared)]
 const IRQ_FRAME_SPSR_OFFSET: usize = 248;
 
+/// Tripwire for the SMP=4 mixed-EL corruption (BKL_RUSTC_SCALING_BASELINE.md §5.1):
+/// inspect the IRQ frame the asm epilogue is about to restore (ELR at +240, SPSR at
+/// +248 — see `IRQ_FRAME_SPSR_OFFSET`). An EL0-target frame whose ELR sits in kernel
+/// text would eret userspace into kernel text. Covers BOTH epilogue outcomes (switch
+/// and no-switch); complements `[SGI-S POISON]`, which only sees the switch branch.
+#[inline]
+#[allow(clippy::verbose_bit_mask)]
+fn irq_eret_poison_check(final_sp: u64, switched: bool) {
+    // SAFETY: `final_sp` is the live IRQ trap frame the asm restores next.
+    let elr = unsafe { core::ptr::read_volatile((final_sp as usize + 240) as *const u64) };
+    let spsr = unsafe { core::ptr::read_volatile((final_sp as usize + 248) as *const u64) };
+    let kernel_text = (crate::config::KERNEL_PHYS_BASE as u64..0x6000_0000).contains(&elr);
+    // EL0-target frames must not eret into kernel text; EL1-target frames must
+    // eret INTO kernel text (an EL1 ELR like 0x8 is the boot-storm crash shape).
+    let poison = if (spsr & 0xF) == 0 { kernel_text } else { !kernel_text };
+    if poison {
+        crate::safe_print!(160,
+            "[IRQ POISON] eret elr={:#x} spsr={:#x} switched={} tid={} core={}\n",
+            elr, spsr, u64::from(switched),
+            akuma_exec::threading::current_thread_id(),
+            akuma_exec::bkl::current_core_id());
+    }
+}
+
 /// IRQ / SGI entry from the vector asm. Under real shared-kernel SMP this runs the
 /// scheduler and device handlers holding the Big Kernel Lock, then reconciles the BKL
 /// to the EL the pending `eret` will enter (release when returning to EL0, keep for
@@ -1600,6 +1633,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
             core::ptr::read_volatile((final_sp as usize + IRQ_FRAME_SPSR_OFFSET) as *const u64)
         };
         akuma_exec::bkl::reconcile_for_spsr_no_ticket(spsr);
+        irq_eret_poison_check(final_sp, new_sp != 0);
         return new_sp;
     }
 
@@ -1672,6 +1706,10 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
             core::ptr::read_volatile((final_sp as usize + IRQ_FRAME_SPSR_OFFSET) as *const u64)
         };
         akuma_exec::bkl::reconcile_for_spsr(spsr);
+    }
+    {
+        let final_sp = if new_sp != 0 { new_sp } else { current_sp };
+        irq_eret_poison_check(final_sp, new_sp != 0);
     }
     new_sp
 }
@@ -1827,8 +1865,13 @@ fn try_resolve_el1_user_copy_lazy_fault() -> bool {
 
 /// Synchronous exception handler from EL1 (kernel mode)
 /// Uses static buffers to avoid heap allocation during crash
+///
+/// `saved_regs` points at the block the vector pushed:
+/// `[x2, x3, x0, x1, x29, x30]` (see `sync_el1_handler` asm). x30 in particular
+/// names the CALLER when the fault is a wild branch (`blr` through a corrupt
+/// pointer leaves the call site + 4 in LR).
 #[unsafe(no_mangle)]
-extern "C" fn rust_sync_el1_handler() {
+extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
     // Quick CoW pre-check: avoid the full debug dump for expected CoW write faults.
     // EC=0x25 + DFSC=0x0F (permission fault L3) + WnR + user VA → almost certainly CoW.
     // Quick CoW pre-check: resolve CoW write faults before full debug dump.
@@ -1888,7 +1931,21 @@ extern "C" fn rust_sync_el1_handler() {
     w.flush();
     let _ = writeln!(w, "  SP={sp:#x}, SP_EL0={sp_el0:#x}");
     w.flush();
-    
+    // Saved-register block from the vector: [x2, x3, x0, x1, x29, x30].
+    // x30 names the caller when ELR is a wild branch target (blr through a
+    // corrupt pointer leaves call site + 4 in LR).
+    if !saved_regs.is_null() {
+        let (r_x2, r_x3, r_x0, r_x1, r_x29, r_x30) = unsafe {
+            (saved_regs.read(), saved_regs.add(1).read(), saved_regs.add(2).read(),
+             saved_regs.add(3).read(), saved_regs.add(4).read(), saved_regs.add(5).read())
+        };
+        let _ = writeln!(w, "  x0={r_x0:#x} x1={r_x1:#x} x2={r_x2:#x} x3={r_x3:#x}");
+        w.flush();
+        let _ = writeln!(w, "  x29={r_x29:#x} x30(LR)={r_x30:#x} core={}",
+            akuma_exec::bkl::current_core_id());
+        w.flush();
+    }
+
     // Try to read the faulting instruction (if ELR is in kernel range)
     if (0x4000_0000..0x8000_0000).contains(&elr) {
         let instr = unsafe { *(elr as *const u32) };
@@ -2349,6 +2406,22 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
         akuma_exec::bkl::dropped_window_close_no_reacquire();
     } else {
         akuma_exec::bkl::leave_kernel();
+    }
+    // Tripwire for the SMP=4 mixed-EL corruption (BKL_RUSTC_SCALING_BASELINE.md §5.1):
+    // after this returns, the asm epilogue erets to EL0 straight from this frame with
+    // no further checks — this is one of the two eret paths the existing POISON
+    // tripwires do not cover. An ELR in kernel text here means the frame was clobbered
+    // during the excursion; catch it with ids before the eret makes it a userspace
+    // SIGSEGV with a kernel register file.
+    {
+        let f = unsafe { &*frame };
+        if (crate::config::KERNEL_PHYS_BASE as u64..0x6000_0000).contains(&f.elr_el1) {
+            crate::safe_print!(224,
+                "[SVC POISON] eret->EL0 elr={:#x} spsr={:#x} sp_el0={:#x} x0={:#x} x1={:#x} x3={:#x} x8={:#x} tid={} core={}\n",
+                f.elr_el1, f.spsr_el1, f.sp_el0, f.x0, f.x1, f.x3, f.x8,
+                akuma_exec::threading::current_thread_id(),
+                akuma_exec::bkl::current_core_id());
+        }
     }
     ret
 }
