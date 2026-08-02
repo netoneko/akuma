@@ -406,6 +406,7 @@ pub fn run_all_tests() {
     test_kill_thread_group_clears_thread_id();
     test_entry_point_trampoline_no_zombie_match();
     test_zombie_process_unregistered_after_return_to_kernel();
+    test_trap_frame_cleared_when_thread_slot_recycled();
 
     // fd table lock consistency + orphan cleanup + pidfd cloexec
     test_fd_table_lock_consistency();
@@ -9559,6 +9560,80 @@ fn test_zombie_process_unregistered_after_return_to_kernel() {
         crate::safe_print!(160,
             "[Test] zombie_process_unregistered_after_return_to_kernel FAILED: reg={} exited={} sib_gone={} dropped={} gone={}\n",
             still_registered, is_exited, sibling_gone, dropped, gone_after);
+    }
+}
+
+/// Verify a recycled thread slot never inherits the previous occupant's EL0
+/// trap-frame pointer (`CURRENT_TRAP_FRAME[tid]`).
+///
+/// The pointer is published on every syscall (`set_current_trap_frame`) and used to
+/// be cleared on exactly one path: the SVC epilogue. No exit path reaches that
+/// epilogue — `return_to_kernel` unwinds into the scheduler from *inside* the
+/// syscall window — so every process that exited left its slot pointing at its own
+/// kernel stack, which the recycler then hands back to the PMM. The next occupant
+/// started life with a dangling frame pointer that no reader validates
+/// (`get_saved_user_context`, `current_trap_frame_elr`, `dump_thread_resume_points`).
+///
+/// Covers the authoritative clear — the slot recycler, which is also the only one
+/// that catches peer-killed threads (they run no exit path at all). The redundant
+/// clears in `claim_free_slot` / `spawn_user_closure_initializing` are not reachable
+/// from here: `claim_test_thread_slots` claims slots directly, by design.
+/// See `docs/archive/CURRENT_TRAP_FRAME_STALE_ON_EXIT.md`.
+fn test_trap_frame_cleared_when_thread_slot_recycled() {
+    use akuma_exec::threading::{
+        claim_test_thread_slots, release_test_thread_slot, cleanup_terminated_force,
+        mark_thread_terminated, get_thread_state, thread_state,
+        trap_frame_ptr_for_thread, set_trap_frame_ptr_for_tid_test,
+    };
+
+    let claimed = claim_test_thread_slots(1);
+    if claimed.is_empty() {
+        console::print("[Test] trap_frame_cleared_when_thread_slot_recycled SKIPPED: no free slots\n");
+        return;
+    }
+    let tid = claimed[0];
+
+    // The FREE-slot invariant: a slot handed out for reuse carries no live frame. This
+    // is what the pre-fix kernel violated for every recycled slot.
+    let clear_when_free = trap_frame_ptr_for_thread(tid) == 0;
+
+    // Model the exit that skips the epilogue: publish a frame pointer, then let the
+    // thread die without ever clearing it. The stand-in is a real, readable, zeroed
+    // trap-frame-sized buffer rather than a poison value — the heartbeat's
+    // `dump_thread_resume_points` dereferences any non-zero entry on a non-FREE slot,
+    // and it can fire while this test runs.
+    let stand_in = [0u64; 104]; // 832 bytes == size_of::<UserTrapFrame>() + NEON block
+    let frame_ptr = stand_in.as_ptr() as u64;
+    set_trap_frame_ptr_for_tid_test(tid, frame_ptr);
+    let published = trap_frame_ptr_for_thread(tid) == frame_ptr;
+
+    mark_thread_terminated(tid);
+    cleanup_terminated_force();
+
+    // The recycler must have zeroed the entry before releasing the slot. Ordering
+    // matters: it also frees the slot's kernel stack, so a clear that came after
+    // would leave a window where the entry aims at PMM-owned memory.
+    let recycled = get_thread_state(tid) == thread_state::FREE;
+    let cleared_on_recycle = trap_frame_ptr_for_thread(tid) == 0;
+
+    // Only reclaim our own state. If `stand_in` is still published the recycler
+    // skipped the slot, so clear it — the buffer dies with this stack frame. If the
+    // entry holds something else, a real thread has already claimed the recycled slot
+    // and published its own frame; leave both the entry and the slot alone.
+    if trap_frame_ptr_for_thread(tid) == frame_ptr {
+        set_trap_frame_ptr_for_tid_test(tid, 0);
+    }
+    if get_thread_state(tid) == thread_state::TERMINATED {
+        release_test_thread_slot(tid);
+    }
+
+    if clear_when_free && published && recycled && cleared_on_recycle {
+        console::print("[Test] trap_frame_cleared_when_thread_slot_recycled PASSED\n");
+    } else {
+        crate::safe_print!(192,
+            "[Test] trap_frame_cleared_when_thread_slot_recycled FAILED: tid={} \
+             clear_when_free={} published={} recycled={} cleared_on_recycle={}\n",
+            tid, clear_when_free, published, recycled, cleared_on_recycle);
     }
 }
 

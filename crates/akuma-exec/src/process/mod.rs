@@ -929,6 +929,13 @@ pub unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
                 ctx.pc, ctx.spsr, crate::threading::current_thread_id()));
         if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
     }
+    // This `eret` drops to EL0 without returning through the syscall wrapper (initial
+    // process launch / execve), so the SVC epilogue's `clear_current_trap_frame` never
+    // runs for the trap that got us here. On the execve path that leaves the slot
+    // pointing at the abandoned execve trap frame while userspace runs — stale for
+    // every reader until the next SVC republishes. No live frame exists at an ERET to
+    // user, so clear it unconditionally.
+    crate::threading::clear_current_trap_frame();
     // Real shared-kernel SMP: this `eret` drops to EL0 without returning through the
     // syscall wrapper (initial process launch / execve), so release the BKL here —
     // otherwise it would stay held while running userspace. No-op unless
@@ -1554,6 +1561,16 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         log::debug!("[Process] Thread {} exited ({})", tid, exit_code);
     }
     
+    // Drop this thread's EL0 trap-frame pointer before the slot becomes eligible for
+    // recycling. This function never returns to the SVC epilogue that would otherwise
+    // clear it (`exceptions.rs`: `clear_current_trap_frame` sits *after* the
+    // exited-process check that jumps here), so every syscall exit — i.e. essentially
+    // every process — used to leave the entry pointing at its own kernel stack. The
+    // recycler clears it too; doing it here closes the window in between, during which
+    // the diagnostic readers (`current_trap_frame_elr`, `dump_thread_resume_points`)
+    // would report this zombie's dead frame.
+    crate::threading::clear_current_trap_frame();
+
     // Mark thread as terminated so scheduler stops scheduling it
     // Idempotent - safe to call even if already marked by kill_process
     crate::threading::mark_current_terminated();
@@ -1677,6 +1694,11 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
     } else {
         log::debug!("[Process] Thread {} faulted ({})", tid, exit_code);
     }
+
+    // Drop the trap-frame pointer before the slot can be recycled — same reasoning as
+    // `return_to_kernel`. Doubly needed here: the frame this thread published sits on
+    // the kernel stack that the EL1 fault ABANDONED.
+    crate::threading::clear_current_trap_frame();
 
     crate::threading::mark_current_terminated();
 

@@ -1,5 +1,39 @@
 # `CURRENT_TRAP_FRAME[tid]` survives thread death — 2026-08-02
 
+**Status: FIXED (2026-08-02).** All three items of §6 landed, plus a fourth site the
+trace missed:
+
+1. **Slot recycler** (`threading/mod.rs`, `cleanup_terminated_internal`) — zeroes
+   `CURRENT_TRAP_FRAME[i]` alongside the other per-slot resets, *before*
+   `free_stack_for_slot`. Authoritative: covers peer-killed threads, which run no
+   exit path at all.
+2. **Exit paths** (`process/mod.rs`) — `return_to_kernel` and
+   `return_to_kernel_from_fault` clear the entry immediately before
+   `mark_current_terminated()`, i.e. before the slot becomes recyclable. Placed late
+   rather than at function entry so the teardown window keeps its
+   `dump_thread_resume_points` syscall-arg diagnostics.
+3. **Slot claim** (`threading/mod.rs`, `claim_free_slot` **and**
+   `spawn_user_closure_initializing`, which claims a slot without going through it).
+4. **`enter_user_mode`** (`process/mod.rs`) — the ERET-to-EL0 that bypasses the SVC
+   epilogue (execve / initial launch). Not identified below: on the execve path the
+   slot kept pointing at the abandoned execve trap frame for the whole time
+   userspace ran, until the next SVC republished it. Stale-but-mapped rather than
+   freed, so diagnostic-only.
+
+Boot-suite self-test: `test_trap_frame_cleared_when_thread_slot_recycled`
+(`src/process_tests.rs`), covering items 1 and 3. It publishes a real readable
+832-byte stand-in frame rather than a poison value, because
+`dump_thread_resume_points` dereferences any non-zero entry on a non-`FREE` slot and
+the heartbeat can fire mid-test. Verified single-core `--release` (238 → 239 PASSED,
+no new failures).
+
+§5.1's incorrect IRQ-frame layout comments (`src/exceptions.rs`) are also corrected:
+NEON is at +288 and x10/x11 at +816, matching `setup_fake_irq_frame`.
+
+§4 is unaffected: this was never established as the cause of
+`BKL_RUSTC_SCALING_BASELINE.md` §5.1, and §3's masking argument still stands — that
+failure remains open.
+
 A per-thread pointer to a live EL0 trap frame is published on every syscall and
 cleared on exactly one path. Process exit does not take that path, and thread
 teardown does not clear it either — so a recycled thread slot inherits a pointer

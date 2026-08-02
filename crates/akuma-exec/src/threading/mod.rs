@@ -683,6 +683,11 @@ fn claim_free_slot(start: usize, end: usize) -> Option<usize> {
             THREAD_SIGNAL_MASK[i].store(0, Ordering::Release);
             // A recycled slot must not carry a stale rt_sigsuspend restore-mask.
             THREAD_RESTORE_SIGMASK_PENDING[i].store(false, Ordering::Release);
+            // ...nor a previous occupant's EL0 trap-frame pointer, which by now aims at a
+            // kernel stack that may have been freed. The recycler already clears this
+            // (`cleanup_terminated_internal`); this is the second belt, so a slot reaching
+            // FREE by any other route still starts its new occupant with no live frame.
+            CURRENT_TRAP_FRAME[i].store(0, Ordering::Release);
             // ...nor a stale BKL-profiler attribution: the new thread would lend the
             // previous occupant's tag to any peer that samples this slot before its first
             // kernel entry. Profiler-only; see `crate::sync::ThreadTagTable`.
@@ -803,6 +808,11 @@ impl ThreadPool {
                 if THREAD_STATES[i].compare_exchange(thread_state::FREE, thread_state::INITIALIZING, Ordering::SeqCst, Ordering::SeqCst).is_err() {
                     continue;
                 }
+
+                // This path claims a slot directly instead of via `claim_free_slot`, so
+                // repeat its stale-trap-frame clear: the new thread must not start life
+                // with the previous occupant's frame pointer (see `CURRENT_TRAP_FRAME`).
+                CURRENT_TRAP_FRAME[i].store(0, Ordering::Release);
 
                 // Lazy stacks: on the extreme profile WARM_FREE_USER=0, so a freshly
                 // claimed slot has no stack (StackInfo::empty(), top=0). Allocate it on
@@ -1156,6 +1166,15 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
             // occupant with permanently-deferred preemption.
             PREEMPTION_DISABLED[i].store(0, Ordering::Release);
             PREEMPTION_DISABLED_SINCE[i].store(0, Ordering::Release);
+            // Drop the dead occupant's EL0 trap-frame pointer. `clear_current_trap_frame`
+            // (the SVC epilogue) is the only other clear, and no exit path reaches it:
+            // `return_to_kernel` never returns to the epilogue, and a peer-killed thread
+            // never runs it at all. The frame lives on THIS slot's kernel stack, which
+            // `free_stack_for_slot` below hands back to the PMM — so leaving the entry set
+            // arms every reader (`get_saved_user_context`, `current_trap_frame_elr`,
+            // `dump_thread_resume_points`, none of which validate) with a pointer into
+            // freed memory the moment the slot is recycled. Must precede the stack free.
+            CURRENT_TRAP_FRAME[i].store(0, Ordering::Release);
             // Reset per-thread sigaltstack so the next occupant starts clean.
             THREAD_SIGALTSTACK_SP[i].store(0, Ordering::Release);
             THREAD_SIGALTSTACK_SIZE[i].store(0, Ordering::Release);
@@ -3289,10 +3308,39 @@ pub fn set_current_trap_frame(frame: *const UserTrapFrame) {
 }
 
 /// Clear the current trap frame pointer for a thread.
+///
+/// The SVC epilogue's clear is not the only one needed: an exit path that never
+/// returns to the epilogue (`return_to_kernel`, `return_to_kernel_from_fault`) and
+/// an EL0 entry that bypasses it (`enter_user_mode`, i.e. execve / initial launch)
+/// must clear it too, or the thread's slot keeps a pointer to a trap frame that is
+/// no longer live — and, once the slot is recycled, no longer even allocated.
 pub fn clear_current_trap_frame() {
     let tid = current_thread_id();
     if tid < MAX_THREADS {
         CURRENT_TRAP_FRAME[tid].store(0, Ordering::Release);
+    }
+}
+
+/// Raw `CURRENT_TRAP_FRAME` entry for `tid`; 0 when no live EL0 trap frame is
+/// registered. Returns the pointer *without* dereferencing it — for the boot-suite
+/// self-test that asserts thread teardown drops the entry.
+pub fn trap_frame_ptr_for_thread(tid: usize) -> u64 {
+    if tid < MAX_THREADS {
+        CURRENT_TRAP_FRAME[tid].load(Ordering::Acquire)
+    } else {
+        0
+    }
+}
+
+/// Test-only: publish a raw trap-frame pointer on another thread's slot, modelling a
+/// thread that died inside a syscall without running the SVC epilogue.
+///
+/// Callers must pass a readable, `UserTrapFrame`-aligned address that stays valid for
+/// the length of the test: the heartbeat's `dump_thread_resume_points` will
+/// dereference any non-zero entry belonging to a non-`FREE` slot.
+pub fn set_trap_frame_ptr_for_tid_test(tid: usize, ptr: u64) {
+    if tid < MAX_THREADS {
+        CURRENT_TRAP_FRAME[tid].store(ptr, Ordering::Release);
     }
 }
 

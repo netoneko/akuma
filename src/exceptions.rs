@@ -265,11 +265,14 @@ sync_el0_handler:
 // UNIFIED: Stack-based save/restore, same mechanism as EL1 IRQ handler.
 // Context switch: Rust handler returns new SP, assembly does the actual switch.
 // 
-// EL0 IRQ frame layout (832 bytes total):
-//   [sp+0]:   x30 + padding           (GPR block: 304 bytes)
-//   ...
-//   [sp+288]: x10, x11
-//   [sp+304]: Q0-Q31, FPCR, FPSR      (NEON block: 528 bytes)
+// EL0 IRQ frame layout (832 bytes total) — full field list in
+// `threading::setup_fake_irq_frame`, which writes this exact layout:
+//   [sp+0..287]:   GPR block (x30, x28-x29, ..., x0-x1, ELR, SPSR, SP_EL0, TPIDR)
+//   [sp+288..815]: NEON block (Q0-Q31 at +288, FPCR at +800, FPSR at +808)
+//   [sp+816..831]: x10, x11 (scratch, pushed first / popped last)
+//
+// NOT interchangeable with the EL0 *sync* frame (`UserTrapFrame`), which is also
+// 832 bytes but orders its GPRs differently and starts NEON at +304.
 irq_el0_handler:
     // ============================================================
     // SAVE PHASE: Push all registers to stack in fixed layout
@@ -423,9 +426,9 @@ irq_el0_handler:
 // Context switch: Rust handler returns new SP, assembly does the actual switch.
 //
 // UNIFIED IRQ frame layout (832 bytes total) - same as EL0:
-//   [sp+0..303]:   GPR block (x30, x28-x29, ..., x0-x1, ELR, SPSR, SP_EL0, TPIDR)
-//   [sp+304..831]: NEON block (Q0-Q31, FPCR, FPSR)
-//   [sp+832..847]: x10, x11 (scratch, outermost)
+//   [sp+0..287]:   GPR block (x30, x28-x29, ..., x0-x1, ELR, SPSR, SP_EL0, TPIDR)
+//   [sp+288..815]: NEON block (Q0-Q31 at +288, FPCR at +800, FPSR at +808)
+//   [sp+816..831]: x10, x11 (scratch, outermost — inside the frame, not past it)
 irq_handler:
     // ============================================================
     // SAVE PHASE: Push all registers to stack in fixed layout
