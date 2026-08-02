@@ -17,24 +17,24 @@ rules see [`locking.md`](locking.md); for the process table see
 
 ```mermaid
 stateDiagram-v2
-    state "THREAD SLOT (THREAD_STATES[tid], atomics)" as T {
+    state "THREAD SLOT (THREAD_STATES, atomics)" as T {
         [*] --> Free
-        Free --> Initializing : claim_free_slot (CAS)
-        Initializing --> Ready : spawn_* / clone_thread
+        Free --> Initializing : claim_free_slot CAS
+        Initializing --> Ready : spawn or clone_thread
         Ready --> Running : schedule_indices (POOL try_lock, IRQ ctx)
-        Running --> Ready : preempt / yield
+        Running --> Ready : preempt or yield
         Running --> Blocked : schedule_blocking
-        Blocked --> Ready : ThreadWaker::wake (lock-free)
-        Running --> Terminated : exit / kill consumed / hard-terminate
-        Terminated --> Initializing : cleanup_terminated (CAS, ≥10ms cooldown)
+        Blocked --> Ready : ThreadWaker.wake (lock-free)
+        Running --> Terminated : exit, kill consumed, hard-terminate
+        Terminated --> Initializing : cleanup_terminated CAS, 10ms cooldown
         Initializing --> Free : slot scrub + CLEANUP_CALLBACK
     }
 
-    state "PROCESS SLOT (SLOT_STATES[i], atomics)" as P {
-        [*] --> FreeP : <i>FREE</i>
-        FreeP --> Active : register_process
-        Active --> Retired : unregister_process (CAS ACTIVE→RETIRED)
-        Retired --> FreeP : reclaim_retired_processes<br/>(≥cooldown; drop(Box&lt;Process&gt;))
+    state "PROCESS SLOT (SLOT_STATES, atomics)" as P {
+        [*] --> FreeSlot
+        FreeSlot --> Active : register_process
+        Active --> Retired : unregister_process CAS
+        Retired --> FreeSlot : reclaim_retired_processes, cooldown, drops the Process box
     }
 ```
 

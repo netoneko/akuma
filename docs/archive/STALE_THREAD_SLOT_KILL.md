@@ -240,6 +240,15 @@ why it is the one path that must not clear it — and exactly why the guard belo
 for the diagnosis: `stale tid=` fired **0 times** in the hung boot, proving the guard
 never engaged and the PHASE 2 edit was the only behavioural delta.
 
+> **Addendum (2026-08-02, later the same day):** the hang evidence above is
+> superseded. The post-revert build hung identically at the same uptime, and the
+> hang was root-caused to an unrelated defect: the execve stack leak ratcheting
+> the kernel heap into the OOM wall (`EXECVE_STACK_LEAK_OOM_HANG.md`). "The
+> PHASE 2 edit was the only behavioural delta" was wrong — exec count was the
+> hidden variable. The *reasoning* in this section (PHASE 1's grace-gap needs
+> the `unregister_process` backstop) stands on its own and is unchanged; only
+> the "it hung the box" corroboration should not be cited as evidence.
+
 ## 6. Verification
 
 **Boot-suite self-test** — `test_unregister_skips_recycled_thread_slot`
