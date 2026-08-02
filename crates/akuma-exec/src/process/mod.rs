@@ -1173,16 +1173,20 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
             }
         }
 
-        // Drop the sibling's recorded thread slot BEFORE unregistering, exactly as
-        // `kill_process` and `kill_fork_subtree_recursive` already do. PHASE 1 has
-        // already terminated (or requested the kill of) this thread, so there is
-        // nothing left for `unregister_process` to terminate — and by now the slot
-        // may well have been recycled to an unrelated process, since PHASE 1's
-        // grace-wait can run for up to 2 s while the cleanup cooldown is only ~10 ms.
-        // Acting on the stale number there is what left a linker `gcc` with no thread
-        // and hung `rustc big.rs` forever. `unregister_process` also guards this via
-        // THREAD_PID_MAP; clearing here keeps the three teardown paths consistent.
-        table::with_process(*sib_pid, |p| { p.thread_id = None; });
+        // Deliberately do NOT clear `p.thread_id` here, even though `kill_process` and
+        // `kill_fork_subtree_recursive` do. Under `kernel_smp_shared` PHASE 1 only
+        // *requests* a deferred kill and its grace-wait exits as soon as each sibling
+        // has consumed the request — which is before the sibling has actually marked
+        // itself TERMINATED. `unregister_process` re-reading this field is the backstop
+        // that finishes the job; clearing it here removes that backstop and lets a
+        // sibling keep running against a RETIRED `Process` (measured: wedged the box
+        // mid-`execve(ld)` at SMP=1, 99% CPU, SSH dead).
+        //
+        // The staleness hazard that motivated clearing it is handled precisely inside
+        // `unregister_process` instead: it terminates the slot when the slot is still
+        // this sibling's, and skips only when THREAD_PID_MAP proves the slot has been
+        // recycled to an unrelated process. Backstop kept, innocent threads spared.
+        // See docs/archive/STALE_THREAD_SLOT_KILL.md §5.
 
         // CLONE_THREAD siblings are NOT fork children — they don't need wait4
         // to reap them. On Linux, CLONE_THREAD children are auto-reaped.
