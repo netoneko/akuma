@@ -3136,13 +3136,13 @@ fn test_mm_bkl_drop() {
     balanced("mmap(len=0)", &mut fails);
 
     // ── Real guarded paths, on state that can't alias anything live ────────
-    // mprotect on a never-mapped VA: real as_lock + LAZY_REGION_TABLE touch, no PTE
+    // mprotect on a never-mapped VA: real as_lock + lazy-region touch, no PTE
     // actually flips (`is_mapped()` is false for every page), returns 0.
     let r = handle_syscall(nr::MPROTECT, &[VA, 4096, 0, 0, 0, 0]);
     if r != 0 { fails += 1; crate::safe_print!(96, "[Test] mm-bkl-drop: mprotect(unmapped) FAILED r={} (want 0)\n", r); }
     balanced("mprotect(unmapped)", &mut fails);
 
-    // madvise(WILLNEED) on a VA that isn't in any lazy region: real LAZY_REGION_TABLE
+    // madvise(WILLNEED) on a VA that isn't in any lazy region: real lazy-region
     // lookup, empty prefault set, returns 0 without touching PMM/as_lock.
     let r = handle_syscall(nr::MADVISE, &[VA, 4096, MADV_WILLNEED, 0, 0, 0]);
     if r != 0 { fails += 1; crate::safe_print!(96, "[Test] mm-bkl-drop: madvise(WILLNEED, unmapped) FAILED r={} (want 0)\n", r); }
@@ -4601,7 +4601,7 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<akuma_exec::process::Pro
         stdout: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
         exited: false, exit_code: 0,
         dynamic_page_tables: Vec::new(), mmap_regions: Vec::new(),
-        lazy_regions: Vec::new(),
+        lazy_regions: Spinlock::new(process::LazyRegionMap::new()),
         fds: Arc::new(SharedFdTable::new()),
         fault_mutex: Spinlock::new(alloc::collections::BTreeMap::new()),
         vm_lock: Spinlock::new(()),
@@ -9193,7 +9193,8 @@ fn test_lazy_region_lookup_for_page_fault_clone() {
     }
 }
 
-/// `LAZY_REGION_TABLE` is keyed by TGID (see `sys_mmap` / `proc.tgid`). Demand paging must
+/// Lazy regions are keyed by TGID (see `sys_mmap` / `proc.tgid`, which pushes them onto the
+/// *leader's* `Process::lazy_regions`). Demand paging must
 /// resolve lazy metadata via the thread-group leader even when the fault path passes a
 /// worker PID or an unrelated id, as long as [`current_process`] maps to a CLONE_VM sibling.
 fn test_lazy_region_lookup_resolves_tgid_for_demand_paging() {

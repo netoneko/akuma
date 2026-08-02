@@ -14,7 +14,7 @@ use akuma_exec::process::MmapRegion;
 /// these syscalls mutate already carrying its own fine-grained lock —
 /// `Process::as_lock` (page-table PTE edits, via `Process::with_address_space`),
 /// `Process::vm_lock` (`mmap_regions` AND the mmap free-list, via
-/// `vm_with_regions`/`vm_alloc_mmap`/`vm_free_mmap`), `LAZY_REGION_TABLE`, PMM/
+/// `vm_with_regions`/`vm_alloc_mmap`/`vm_free_mmap`), `Process::lazy_regions`, PMM/
 /// `FRAME_TRACKER` (never held across a yield), and `SHARED_FILE_MAPPINGS` — so
 /// the BKL is redundant for them. Two gaps this phase's audit found (a plain
 /// unguarded `ProcessMemory::free_regions`, and `sys_mmap`'s OOM/reclaim sweep
@@ -22,7 +22,7 @@ use akuma_exec::process::MmapRegion;
 /// see `Process::vm_alloc_mmap`/`vm_free_mmap` and
 /// `reclaim_clean_file_pages`'s per-page `as_lock_hold`.
 ///
-/// Unlike the VFS/net carve-outs, none of `as_lock`/`vm_lock`/`LAZY_REGION_TABLE`/
+/// Unlike the VFS/net carve-outs, none of `as_lock`/`vm_lock`/`lazy_regions`/
 /// PMM need to know a BKL-free window is calling them — their IRQ-masking is
 /// already unconditional (not gated on being reachable from a dropped-BKL window
 /// the way `PreemptGuard` is, see BKL_VFS_CARVE_OUT.md §19.3), so there is no

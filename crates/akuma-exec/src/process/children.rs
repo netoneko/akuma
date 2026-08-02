@@ -6,7 +6,7 @@ use spinning_top::Spinlock;
 use crate::process::Process;
 use crate::process::types::{Pid, ProcessInfo, PROCESS_INFO_ADDR, LazyRegion, LazySource, MmapRegion, ProcessInfo2, ProcessState};
 use crate::process::channel::{ProcessChannel, get_channel};
-use crate::process::table::{LAZY_REGION_TABLE, THREAD_PID_MAP, find_process};
+use crate::process::table::{THREAD_PID_MAP, find_process};
 use crate::runtime::{with_irqs_disabled, runtime, PhysFrame};
 use akuma_terminal as terminal;
 
@@ -551,46 +551,244 @@ pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
     }
 }
 
-/// Check if a virtual address falls within any lazy region of the current process.
-/// Returns `(flags, source, region_start, region_size)` if found.
-/// The source is cloned so the caller can release the table lock before performing I/O.
-pub fn lazy_region_lookup(va: usize) -> Option<(u64, LazySource, usize, usize)> {
-    let pid = address_space_owner_pid_for_fault()?;
-    with_irqs_disabled(|| {
-        let table = LAZY_REGION_TABLE.lock();
-        if let Some(regions) = table.get(&pid) {
-            // O(log n): last region whose start_va <= va, then range-check.
-            if let Some((_key, r)) = regions.range(..=va).next_back() {
-                if va < r.start_va + r.size {
-                    return Some((r.flags, r.source.clone(), r.start_va, r.size));
+// ==========================================================================
+// LazyRegionMap — the per-process lazy-region bookkeeping.
+//
+// This is the pure data-structure layer, lifted out of the former global
+// `LAZY_REGION_TABLE` so it can live as a field on `Process` (`lazy_regions:
+// Spinlock<LazyRegionMap>`). Owning the map per-process is what closes the
+// rule-2 hang class for this subsystem: a `BTreeMap::insert` that OOMs under
+// the lock routes through `alloc_error_handler` → `return_to_kernel`, whose
+// teardown used to re-enter the *global* `LAZY_REGION_TABLE` (`clear_lazy_regions`)
+// and spin forever (the abandoned `SpinlockGuard` is never dropped — no
+// unwinding). With the map owned by the dying `Process`, the field drops inside
+// `Process::drop` on the existing reclaim path and teardown no longer
+// re-acquires it. See docs/archive/LAZY_REGION_TABLE_ALLOC_UNDER_LOCK_HANG.md.
+//
+// Keeping the logic in a standalone newtype also means it is unit-testable
+// without a registered `Process` (the host regression tests construct one
+// directly), preserving the coverage the old global-table tests gave us.
+// ==========================================================================
+
+/// A process's set of demand-paged lazy regions, keyed by `start_va`.
+pub struct LazyRegionMap {
+    regions: BTreeMap<usize, LazyRegion>,
+}
+
+impl LazyRegionMap {
+    pub const fn new() -> Self {
+        Self { regions: BTreeMap::new() }
+    }
+
+    pub fn len(&self) -> usize {
+        self.regions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+
+    /// O(log n) lookup of the region covering `va`, if any. The `LazySource` is
+    /// cloned out so the caller can drop the lock before doing I/O.
+    pub fn lookup(&self, va: usize) -> Option<(u64, LazySource, usize, usize)> {
+        let (_key, r) = self.regions.range(..=va).next_back()?;
+        (va < r.start_va + r.size)
+            .then(|| (r.flags, r.source.clone(), r.start_va, r.size))
+    }
+
+    /// Insert/replace a region. Returns the new region count.
+    pub fn push(&mut self, start_va: usize, size: usize, flags: u64, source: LazySource) -> usize {
+        self.regions.insert(
+            start_va,
+            LazyRegion { start_va, size, flags, source },
+        );
+        self.regions.len()
+    }
+
+    pub fn remove(&mut self, start_va: usize) -> Option<LazyRegion> {
+        self.regions.remove(&start_va)
+    }
+
+    pub fn clear(&mut self) -> usize {
+        let n = self.regions.len();
+        self.regions.clear();
+        n
+    }
+
+    /// Deep-clone of the whole map (fork propagation snapshots).
+    pub fn clone_all(&self) -> BTreeMap<usize, LazyRegion> {
+        self.regions.clone()
+    }
+
+    /// Snapshot every `LazySource::File` region's `(start_va, size)` onto a
+    /// stack buffer for `reclaim_clean_file_pages` (which cannot allocate — it
+    /// runs on the OOM path). `out` is filled up to `N` entries; returns the
+    /// count written.
+    pub fn snapshot_file_regions<const N: usize>(
+        &self,
+        out: &mut [(usize, usize); N],
+    ) -> usize {
+        let mut n = 0usize;
+        for r in self.regions.values() {
+            if matches!(r.source, LazySource::File { .. }) && n < N {
+                out[n] = (r.start_va, r.size);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Merge every region in `src` into `self`, replacing any existing entry at
+    /// the same `start_va` and leaving entries at other VAs alone (fork's
+    /// `propagate_lazy_regions_to_child`). Returns the number of entries in
+    /// `self` after the merge.
+    pub fn extend_from_slice(&mut self, src: &[LazyRegion]) -> usize {
+        for r in src {
+            self.regions.insert(r.start_va, r.clone());
+        }
+        self.regions.len()
+    }
+
+    /// Replace `self`'s contents with a deep clone of `src` (fork's
+    /// `clone_lazy_regions`).
+    pub fn replace_with_clone(&mut self, src: &BTreeMap<usize, LazyRegion>) {
+        self.regions = src.clone();
+    }
+
+    /// Update flags on all regions overlapping `[range_start, range_end)`,
+    /// splitting partially-overlapping regions as needed.
+    pub fn update_flags(&mut self, range_start: usize, range_size: usize, new_flags: u64) {
+        let range_end = range_start + range_size;
+        // Collect keys of regions that overlap [range_start, range_end).
+        let keys: alloc::vec::Vec<usize> = self
+            .regions
+            .range(..range_end)
+            .filter(|x| *x.0 + x.1.size > range_start)
+            .map(|x| *x.0)
+            .collect();
+
+        for key in keys {
+            let r_start = key;
+            let r_size = self.regions[&key].size;
+            let r_end = r_start + r_size;
+            let r_flags = self.regions[&key].flags;
+            let r_source = self.regions[&key].source.clone();
+
+            let clip_start = r_start.max(range_start);
+            let clip_end = r_end.min(range_end);
+
+            if clip_start == r_start && clip_end == r_end {
+                // Fully contained: update in place.
+                self.regions.get_mut(&key).unwrap().flags = new_flags;
+            } else {
+                // Partially overlapping: remove and re-insert up to 3 pieces.
+                self.regions.remove(&key);
+                if clip_start > r_start {
+                    self.regions.insert(r_start, LazyRegion {
+                        start_va: r_start,
+                        size: clip_start - r_start,
+                        flags: r_flags,
+                        source: r_source.clone(),
+                    });
+                }
+                self.regions.insert(clip_start, LazyRegion {
+                    start_va: clip_start,
+                    size: clip_end - clip_start,
+                    flags: new_flags,
+                    source: r_source.clone(),
+                });
+                if clip_end < r_end {
+                    self.regions.insert(clip_end, LazyRegion {
+                        start_va: clip_end,
+                        size: r_end - clip_end,
+                        flags: r_flags,
+                        source: r_source,
+                    });
                 }
             }
         }
-        None
-    })
+    }
+
+    /// Clip/remove the first region overlapping `[range_start, range_end)` for
+    /// munmap. Returns `Some((op, freed_start_va, freed_pages))` if a region was
+    /// touched, so the caller can loop for further overlaps. `op` is the clip
+    /// shape — `F`ull / `P`refix / `S`uffix / `M`iddle-split — carried out for the
+    /// caller's `[LR*]` debug line; region splitting is where this code has gone
+    /// wrong before, and the shape is the first thing you want in the log.
+    pub fn munmap_one_overlap(
+        &mut self,
+        range_start: usize,
+        range_end: usize,
+    ) -> Option<(char, usize, usize)> {
+        let key = self
+            .regions
+            .range(..range_end)
+            .filter(|x| *x.0 + x.1.size > range_start)
+            .map(|x| *x.0)
+            .next()?;
+
+        let reg_start = key;
+        let reg_size = self.regions[&key].size;
+        let reg_end = reg_start + reg_size;
+        let reg_flags = self.regions[&key].flags;
+        let reg_source = self.regions[&key].source.clone();
+
+        let clip_start = range_start.max(reg_start);
+        let clip_end = range_end.min(reg_end);
+
+        if clip_start == reg_start && clip_end == reg_end {
+            self.regions.remove(&key);
+            Some(('F', reg_start, reg_size / 4096))
+        } else if clip_start == reg_start {
+            // Trim prefix: remove old entry, insert remainder at new start_va.
+            self.regions.remove(&key);
+            self.regions.insert(clip_end, LazyRegion {
+                start_va: clip_end,
+                size: reg_end - clip_end,
+                flags: reg_flags,
+                source: reg_source,
+            });
+            Some(('P', clip_start, (clip_end - clip_start) / 4096))
+        } else if clip_end == reg_end {
+            // Trim suffix: shorten the existing entry in place (key unchanged).
+            self.regions.get_mut(&key).unwrap().size = clip_start - reg_start;
+            Some(('S', clip_start, (reg_end - clip_start) / 4096))
+        } else {
+            // Middle split: shorten left piece, insert right piece.
+            self.regions.get_mut(&key).unwrap().size = clip_start - reg_start;
+            self.regions.insert(clip_end, LazyRegion {
+                start_va: clip_end,
+                size: reg_end - clip_end,
+                flags: reg_flags,
+                source: reg_source,
+            });
+            Some(('M', clip_start, (clip_end - clip_start) / 4096))
+        }
+    }
+
+    /// Debug iterator (first 8 regions) for `lazy_region_debug`.
+    pub fn for_each_debug<F: FnMut(usize, usize)>(&self, mut f: F) {
+        for r in self.regions.values().take(8) {
+            f(r.start_va, r.size);
+        }
+    }
 }
 
-/// Like lazy_region_lookup but takes an explicit PID (for tests and non-current-process use).
+/// Check if a virtual address falls within any lazy region of the current process.
+/// Returns `(flags, source, region_start, region_size)` if found.
+/// The source is cloned so the caller can release the lock before performing I/O.
+pub fn lazy_region_lookup(va: usize) -> Option<(u64, LazySource, usize, usize)> {
+    let pid = address_space_owner_pid_for_fault()?;
+    lookup_process_shared(pid).and_then(|p| with_irqs_disabled(|| p.lazy_regions.lock().lookup(va)))
+}
+
+/// Number of lazy regions registered for `pid` (0 if the pid isn't registered).
 pub fn lazy_region_count_for_pid(pid: Pid) -> usize {
-    with_irqs_disabled(|| {
-        let table = LAZY_REGION_TABLE.lock();
-        table.get(&pid).map_or(0, |r| r.len())
-    })
+    lookup_process_shared(pid).map_or(0, |p| with_irqs_disabled(|| p.lazy_regions.lock().len()))
 }
 
 pub fn lazy_region_lookup_for_pid(pid: Pid, va: usize) -> Option<(u64, LazySource, usize, usize)> {
-    with_irqs_disabled(|| {
-        let table = LAZY_REGION_TABLE.lock();
-        if let Some(regions) = table.get(&pid) {
-            // O(log n): find the last region whose start_va <= va, then range-check.
-            if let Some((_key, r)) = regions.range(..=va).next_back() {
-                if va < r.start_va + r.size {
-                    return Some((r.flags, r.source.clone(), r.start_va, r.size));
-                }
-            }
-        }
-        None
-    })
+    lookup_process_shared(pid).and_then(|p| with_irqs_disabled(|| p.lazy_regions.lock().lookup(va)))
 }
 
 /// Rotating sweep cursor (VA) for [`reclaim_clean_file_pages`], so successive
@@ -619,28 +817,17 @@ pub fn reclaim_clean_file_pages(want: usize) -> usize {
         None => return 0,
     };
 
-    // Snapshot the file-backed regions onto the stack — no heap allocation, since
-    // we are already under memory pressure and a Vec growth could recurse into
-    // the allocator's OOM handler. 64 regions is ample (llama uses ~37 total).
-    let mut regions: [(usize, usize); 64] = [(0, 0); 64];
-    let mut n = 0usize;
-    with_irqs_disabled(|| {
-        let table = LAZY_REGION_TABLE.lock();
-        if let Some(map) = table.get(&pid) {
-            for r in map.values() {
-                if matches!(r.source, LazySource::File { .. }) && n < regions.len() {
-                    regions[n] = (r.start_va, r.size);
-                    n += 1;
-                }
-            }
-        }
-    });
-    if n == 0 { return 0; }
-
     let proc = match lookup_process_shared(pid) {
         Some(p) => p,
         None => return 0,
     };
+
+    // Snapshot the file-backed regions onto the stack — no heap allocation, since
+    // we are already under memory pressure and a Vec growth could recurse into
+    // the allocator's OOM handler. 64 regions is ample (llama uses ~37 total).
+    let mut regions: [(usize, usize); 64] = [(0, 0); 64];
+    let n = with_irqs_disabled(|| proc.lazy_regions.lock().snapshot_file_regions(&mut regions));
+    if n == 0 { return 0; }
 
     // Cap pages scanned per call so a sparse (mostly-unmapped) region set can't
     // spin; eviction is the slow path, but it must still bound its own work.
@@ -698,7 +885,8 @@ fn owner_pid_for_l0_phys(l0_phys: usize) -> Option<Pid> {
 }
 
 /// Thread group leader PID for page-fault / CoW paths: all `CLONE_VM` threads in a group must
-/// share one [`Process::fault_mutex`] and match [`LAZY_REGION_TABLE`] (see `clone_lazy_regions`,
+/// share one [`Process::fault_mutex`] and resolve to the leader's [`Process::lazy_regions`]
+/// (see `clone_lazy_regions`,
 /// forktest / GO_FORKTEST_DEBUG).
 ///
 /// Uses TTBR0-derived lookup as the primary mechanism: the current TTBR0_EL1 unambiguously
@@ -725,7 +913,7 @@ pub fn address_space_owner_pid_for_fault() -> Option<Pid> {
 /// thread-group id ([`Process::tgid`]) first — the same key as `sys_mmap` uses via `proc.tgid`
 /// — then falls back to `pid` (e.g. [`read_current_pid`] from EL0).
 ///
-/// Ordering matters when `LAZY_REGION_TABLE` only has entries under the leader but the caller
+/// Ordering matters when only the leader's `Process` holds the regions but the caller
 /// passes another thread id (clone snapshot keys, or stale ProcessInfo).
 pub fn lazy_region_lookup_for_page_fault(pid: Pid, va: usize) -> Option<(u64, LazySource, usize, usize)> {
     if let Some(owner) = address_space_owner_pid_for_fault() {
@@ -762,24 +950,27 @@ impl<const N: usize> core::fmt::Write for LazyDebugWriter<N> {
 }
 
 pub fn lazy_region_debug(va: usize) {
+    use core::fmt::Write;
     let pid = address_space_owner_pid_for_fault().unwrap_or(0);
+    let Some(proc) = lookup_process_shared(pid) else {
+        let mut w = LazyDebugWriter::<128>::new();
+        let _ = writeln!(w, "[DP] lazy miss: pid={} va={:#x} no process entry", pid, va);
+        w.flush();
+        return;
+    };
     with_irqs_disabled(|| {
-        use core::fmt::Write;
-        let table = LAZY_REGION_TABLE.lock();
-        if let Some(regions) = table.get(&pid) {
-            let mut w = LazyDebugWriter::<256>::new();
-            let _ = write!(w, "[DP] lazy miss: pid={} va={:#x} regions={} [", pid, va, regions.len());
-            for (i, (_, r)) in regions.iter().enumerate().take(8) {
-                if i > 0 { let _ = w.write_str(","); }
-                let _ = write!(w, "{:#x}+{:#x}", r.start_va, r.size);
-            }
-            let _ = w.write_str("]\n");
-            w.flush();
-        } else {
-            let mut w = LazyDebugWriter::<128>::new();
-            let _ = writeln!(w, "[DP] lazy miss: pid={} va={:#x} no entry in table", pid, va);
-            w.flush();
-        }
+        let g = proc.lazy_regions.lock();
+        let count = g.len();
+        let mut w = LazyDebugWriter::<256>::new();
+        let _ = write!(w, "[DP] lazy miss: pid={} va={:#x} regions={} [", pid, va, count);
+        let mut i = 0;
+        g.for_each_debug(|sv, sz| {
+            if i > 0 { let _ = w.write_str(","); }
+            let _ = write!(w, "{:#x}+{:#x}", sv, sz);
+            i += 1;
+        });
+        let _ = w.write_str("]\n");
+        w.flush();
     });
 }
 
@@ -788,18 +979,20 @@ pub fn push_lazy_region(pid: Pid, start_va: usize, size: usize, page_flags: u64)
 }
 
 pub fn push_lazy_region_with_source(pid: Pid, start_va: usize, size: usize, page_flags: u64, source: LazySource) -> usize {
-    let len = with_irqs_disabled(|| {
-        let mut table = LAZY_REGION_TABLE.lock();
-        let regions = table.entry(pid).or_insert_with(alloc::collections::BTreeMap::new);
-        regions.insert(start_va, LazyRegion { start_va, size, flags: page_flags, source });
-        regions.len()
-    });
-    len
+    let Some(proc) = lookup_process_shared(pid) else { return 0 };
+    with_irqs_disabled(|| proc.lazy_regions.lock().push(start_va, size, page_flags, source))
 }
 
-/// Copy every lazy-region descriptor registered for `parent_pid` into a fresh
-/// entry for `child_pid`.
+/// Copy every lazy-region descriptor in `parent_regions` into `child`.
 ///
+/// `child` is taken by reference rather than by pid deliberately: `fork_process`
+/// builds the child as a local `Box<Process>` and only calls `register_process`
+/// at the very end, so a pid-keyed variant would silently find nothing to write
+/// to and drop the propagation on the floor (which is exactly the SIGSEGV this
+/// function exists to prevent). Both fork call sites already hold a
+/// `Vec<LazyRegion>` snapshot of the parent, so the parent is read once.
+///
+
 /// `fork_process`'s CoW-sharing (`cow_share_range`) only shares pages that are
 /// *currently resident* in the parent — a lazy region the parent registered but
 /// hasn't fully touched yet (a `.data`/`.bss` page nobody wrote to since exec, a
@@ -813,25 +1006,15 @@ pub fn push_lazy_region_with_source(pid: Pid, start_va: usize, size: usize, page
 /// process hasn't had time to fault every lazy page in yet.
 /// See docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md.
 ///
-/// Returns the number of regions copied (0 if the parent has none registered).
-pub fn propagate_lazy_regions_to_child(parent_pid: Pid, child_pid: Pid) -> usize {
-    let parent_regions: alloc::vec::Vec<LazyRegion> = with_irqs_disabled(|| {
-        let table = LAZY_REGION_TABLE.lock();
-        table.get(&parent_pid)
-            .map(|regions| regions.values().cloned().collect())
-            .unwrap_or_default()
-    });
-    let count = parent_regions.len();
-    if count > 0 {
-        with_irqs_disabled(|| {
-            let mut table = LAZY_REGION_TABLE.lock();
-            let child_regions = table.entry(child_pid).or_insert_with(alloc::collections::BTreeMap::new);
-            for region in parent_regions {
-                child_regions.insert(region.start_va, region);
-            }
-        });
+/// Returns the child's total region count after the merge (0 if the parent had
+/// none — the child is left untouched in that case).
+pub fn propagate_lazy_regions_to_child(parent_regions: &[LazyRegion], child: &Process) -> usize {
+    if parent_regions.is_empty() {
+        return 0;
     }
-    count
+    // Only the child's lock is taken, and the parent snapshot was produced
+    // before this call — the two maps' locks never nest.
+    with_irqs_disabled(|| child.lazy_regions.lock().extend_from_slice(parent_regions))
 }
 
 /// Derive a CoW-forked child's `mmap_regions` from its parent's.
@@ -860,74 +1043,13 @@ pub fn inherit_mmap_regions_for_cow_child(parent_regions: &[MmapRegion]) -> allo
 
 /// Update flags on all lazy regions that overlap [range_start, range_start+range_size).
 pub fn update_lazy_region_flags(pid: Pid, range_start: usize, range_size: usize, new_flags: u64) {
-    let range_end = range_start + range_size;
-    with_irqs_disabled(|| {
-        let mut table = LAZY_REGION_TABLE.lock();
-        if let Some(regions) = table.get_mut(&pid) {
-            // Collect keys of regions that overlap [range_start, range_end).
-            // Any overlapping region must have start_va < range_end AND start_va + size > range_start.
-            let keys: alloc::vec::Vec<usize> = regions
-                .range(..range_end)
-                .filter(|x| *x.0 + x.1.size > range_start)
-                .map(|x| *x.0)
-                .collect();
-
-            for key in keys {
-                let r_start = key;
-                let r_size = regions[&key].size;
-                let r_end = r_start + r_size;
-                let r_flags = regions[&key].flags;
-                let r_source = regions[&key].source.clone();
-
-                let clip_start = r_start.max(range_start);
-                let clip_end = r_end.min(range_end);
-
-                if clip_start == r_start && clip_end == r_end {
-                    // Fully contained: update in place.
-                    regions.get_mut(&key).unwrap().flags = new_flags;
-                } else {
-                    // Partially overlapping: remove and re-insert up to 3 pieces.
-                    regions.remove(&key);
-                    // "before" tail keeps old flags.
-                    if clip_start > r_start {
-                        regions.insert(r_start, LazyRegion {
-                            start_va: r_start,
-                            size: clip_start - r_start,
-                            flags: r_flags,
-                            source: r_source.clone(),
-                        });
-                    }
-                    // Overlapping slice gets new flags.
-                    regions.insert(clip_start, LazyRegion {
-                        start_va: clip_start,
-                        size: clip_end - clip_start,
-                        flags: new_flags,
-                        source: r_source.clone(),
-                    });
-                    // "after" tail keeps old flags.
-                    if clip_end < r_end {
-                        regions.insert(clip_end, LazyRegion {
-                            start_va: clip_end,
-                            size: r_end - clip_end,
-                            flags: r_flags,
-                            source: r_source,
-                        });
-                    }
-                }
-            }
-        }
-    });
+    let Some(proc) = lookup_process_shared(pid) else { return };
+    with_irqs_disabled(|| proc.lazy_regions.lock().update_flags(range_start, range_size, new_flags));
 }
 
 pub fn remove_lazy_region(pid: Pid, start_va: usize) -> Option<LazyRegion> {
-    with_irqs_disabled(|| {
-        let mut table = LAZY_REGION_TABLE.lock();
-        if let Some(regions) = table.get_mut(&pid) {
-            regions.remove(&start_va)
-        } else {
-            None
-        }
-    })
+    let proc = lookup_process_shared(pid)?;
+    with_irqs_disabled(|| proc.lazy_regions.lock().remove(start_va))
 }
 
 /// Handle munmap across all lazy regions overlapping [unmap_addr, unmap_addr+unmap_len).
@@ -946,91 +1068,57 @@ pub fn munmap_lazy_regions_in_range(pid: Pid, unmap_addr: usize, unmap_len: usiz
 }
 
 fn munmap_lazy_region_overlapping(pid: Pid, range_start: usize, range_end: usize) -> Option<(usize, usize)> {
-    let result = with_irqs_disabled(|| {
-        let mut table = LAZY_REGION_TABLE.lock();
-        let regions = table.get_mut(&pid)?;
-
-        // Find the first region overlapping [range_start, range_end).
-        // A region overlaps if start_va < range_end AND start_va + size > range_start.
-        let key = regions
-            .range(..range_end)
-            .filter(|x| *x.0 + x.1.size > range_start)
-            .map(|x| *x.0)
-            .next()?;
-
-        let reg_start = key;
-        let reg_size = regions[&key].size;
-        let reg_end = reg_start + reg_size;
-        let reg_flags = regions[&key].flags;
-        let reg_source = regions[&key].source.clone();
-
-        let clip_start = range_start.max(reg_start);
-        let clip_end = range_end.min(reg_end);
-
-        if clip_start == reg_start && clip_end == reg_end {
-            regions.remove(&key);
-            Some(('F', reg_start, reg_size / 4096))
-        } else if clip_start == reg_start {
-            // Trim prefix: remove old entry, insert remainder at new start_va.
-            regions.remove(&key);
-            regions.insert(clip_end, LazyRegion {
-                start_va: clip_end,
-                size: reg_end - clip_end,
-                flags: reg_flags,
-                source: reg_source,
-            });
-            let freed = (clip_end - clip_start) / 4096;
-            Some(('P', clip_start, freed))
-        } else if clip_end == reg_end {
-            // Trim suffix: shorten the existing entry in place (key unchanged).
-            regions.get_mut(&key).unwrap().size = clip_start - reg_start;
-            let freed = (reg_end - clip_start) / 4096;
-            Some(('S', clip_start, freed))
-        } else {
-            // Middle split: shorten left piece, insert right piece.
-            regions.get_mut(&key).unwrap().size = clip_start - reg_start;
-            regions.insert(clip_end, LazyRegion {
-                start_va: clip_end,
-                size: reg_end - clip_end,
-                flags: reg_flags,
-                source: reg_source,
-            });
-            let freed = (clip_end - clip_start) / 4096;
-            Some(('M', clip_start, freed))
-        }
-    });
-
-    if let Some((op, freed_start, freed_pages)) = result {
-        log::debug!("[LR{}] pid={} munmap {:#x}+{:#x} ({} pages)",
-            op as char, pid, freed_start, freed_pages * 4096, freed_pages);
-        Some((freed_start, freed_pages))
-    } else {
-        None
-    }
+    let proc = lookup_process_shared(pid)?;
+    let (op, freed_start, freed_pages) =
+        with_irqs_disabled(|| proc.lazy_regions.lock().munmap_one_overlap(range_start, range_end))?;
+    log::debug!("[LR{}] pid={} munmap {:#x}+{:#x} ({} pages)",
+        op, pid, freed_start, freed_pages * 4096, freed_pages);
+    Some((freed_start, freed_pages))
 }
 
+/// Clear every lazy region registered for `pid`. No-op if `pid` isn't a registered
+/// process. Note: the per-process teardown paths (`return_to_kernel*`,
+/// `teardown_forked_process_thread_group`) deliberately do NOT call this — the
+/// field drops inside `Process::drop` on the reclaim path, so calling it from the
+/// exit/OOM-kill path would re-enter the very lock an OOM'd mutator frame is
+/// still holding (the rule-2 hang in
+/// docs/archive/LAZY_REGION_TABLE_ALLOC_UNDER_LOCK_HANG.md). It is kept for the
+/// zombie-reap paths (`sys_wait4`/`sys_waitid` in `syscall/proc.rs`), which release
+/// a *child's* map early from the reaping parent's syscall context — a context that
+/// holds no lazy-region lock, so there is nothing to re-enter. Purely an
+/// optimization there: the map would drop with the `Process` anyway.
+///
+/// The execve image-replacement path does not come through here — `replace_image`
+/// owns `&mut self` and clears `self.lazy_regions` directly.
 pub fn clear_lazy_regions(pid: Pid) {
-    let count = with_irqs_disabled(|| {
-        let mut table = LAZY_REGION_TABLE.lock();
-        let count = table.get(&pid).map_or(0, |r| r.len());
-        table.remove(&pid);
-        count
-    });
+    let Some(proc) = lookup_process_shared(pid) else { return };
+    let count = with_irqs_disabled(|| proc.lazy_regions.lock().clear());
     if count > 0 {
         log::debug!("[LR!] clear pid={} ({} regions)", pid, count);
     }
 }
 
 pub fn clone_lazy_regions(from_pid: Pid, to_pid: Pid) {
-    with_irqs_disabled(|| {
-        let mut table = LAZY_REGION_TABLE.lock();
-        if let Some(regions) = table.get(&from_pid) {
-            let cloned = regions.clone();
-            let len = cloned.len();
-            table.insert(to_pid, cloned);
-            log::debug!("[LR] clone pid={}->{} ({} regions)", from_pid, to_pid, len);
-        }
-    });
+    let (Some(from), Some(to)) = (lookup_process_shared(from_pid), lookup_process_shared(to_pid)) else {
+        return;
+    };
+    // Snapshot under the parent's lock, clone under the child's — never nested.
+    let snapshot = with_irqs_disabled(|| from.lazy_regions.lock().clone_all());
+    if snapshot.is_empty() {
+        return;
+    }
+    let len = snapshot.len();
+    with_irqs_disabled(|| to.lazy_regions.lock().replace_with_clone(&snapshot));
+    log::debug!("[LR] clone pid={}->{} ({} regions)", from_pid, to_pid, len);
+}
+
+/// Owned snapshot of a pid's lazy regions (`None` if the pid isn't registered).
+/// Diagnostic/test replacement for the former direct
+/// `LAZY_REGION_TABLE.lock().get(&pid)` inspection (that global is gone) — allocates
+/// (clones the map),
+/// so call only from non-pressure contexts.
+pub fn lazy_regions_snapshot(pid: Pid) -> Option<BTreeMap<usize, LazyRegion>> {
+    lookup_process_shared(pid).map(|p| with_irqs_disabled(|| p.lazy_regions.lock().clone_all()))
 }
 
 /// Check if a virtual address falls within any lazy region.
@@ -1319,33 +1407,41 @@ mod lazy_region_propagation_tests {
     //! otherwise a page the parent registered but hadn't touched yet is neither
     //! resident (nothing to share) nor lazy (no entry to demand-page from) for the
     //! child, and the first touch is an unconditional SIGSEGV.
+    //!
+    //! These exercise [`LazyRegionMap`] rather than the pid-keyed wrapper: since
+    //! the per-process move (docs/archive/LAZY_REGION_TABLE_ALLOC_UNDER_LOCK_HANG.md)
+    //! `propagate_lazy_regions_to_child` is a null-check plus one
+    //! `extend_from_slice` call, and building a real `Process` on the host needs a
+    //! page allocator the stub test runtime doesn't have.
     use super::*;
 
-    fn clear(pid: Pid) {
-        LAZY_REGION_TABLE.lock().remove(&pid);
+    /// The parent-side snapshot both fork arms take before propagating.
+    fn snapshot(map: &LazyRegionMap) -> alloc::vec::Vec<LazyRegion> {
+        map.clone_all().into_values().collect()
+    }
+
+    fn file_source(path: &str, inode: u32) -> LazySource {
+        LazySource::File {
+            path: alloc::string::String::from(path),
+            inode,
+            file_offset: 0,
+            filesz: 0x2000,
+            segment_va: 0x2000_0000,
+        }
     }
 
     #[test]
     fn copies_all_parent_regions_to_child() {
-        let parent: Pid = 900_001;
-        let child: Pid = 900_002;
-        clear(parent);
-        clear(child);
+        let mut parent = LazyRegionMap::new();
+        let mut child = LazyRegionMap::new();
 
-        push_lazy_region(parent, 0x1000_0000, 0x1000, 0x1);
-        push_lazy_region_with_source(parent, 0x2000_0000, 0x2000, 0x2, LazySource::File {
-            path: alloc::string::String::from("/bin/busybox"),
-            inode: 42,
-            file_offset: 0,
-            filesz: 0x2000,
-            segment_va: 0x2000_0000,
-        });
+        parent.push(0x1000_0000, 0x1000, 0x1, LazySource::Zero);
+        parent.push(0x2000_0000, 0x2000, 0x2, file_source("/bin/busybox", 42));
 
-        let copied = propagate_lazy_regions_to_child(parent, child);
-        assert_eq!(copied, 2);
+        let total = child.extend_from_slice(&snapshot(&parent));
+        assert_eq!(total, 2);
 
-        let table = LAZY_REGION_TABLE.lock();
-        let child_regions = table.get(&child).expect("child should have a lazy-region entry");
+        let child_regions = child.clone_all();
         assert_eq!(child_regions.len(), 2);
 
         let r1 = &child_regions[&0x1000_0000];
@@ -1363,46 +1459,54 @@ mod lazy_region_propagation_tests {
             }
             _ => panic!("expected a File-backed lazy source to survive propagation"),
         }
-        drop(table);
-        clear(parent);
-        clear(child);
+
+        // The parent keeps its own regions — propagation is a copy, not a move.
+        assert_eq!(parent.len(), 2);
     }
 
     #[test]
     fn parent_with_no_regions_copies_nothing() {
-        let parent: Pid = 900_003;
-        let child: Pid = 900_004;
-        clear(parent);
-        clear(child);
+        let parent = LazyRegionMap::new();
+        let mut child = LazyRegionMap::new();
 
-        let copied = propagate_lazy_regions_to_child(parent, child);
-        assert_eq!(copied, 0);
-        assert!(LAZY_REGION_TABLE.lock().get(&child).is_none());
+        assert_eq!(child.extend_from_slice(&snapshot(&parent)), 0);
+        assert!(child.is_empty());
     }
 
     #[test]
     fn does_not_clobber_childs_existing_regions_at_other_vas() {
-        let parent: Pid = 900_005;
-        let child: Pid = 900_006;
-        clear(parent);
-        clear(child);
+        let mut parent = LazyRegionMap::new();
+        let mut child = LazyRegionMap::new();
 
         // Child already has its own region (e.g. from an earlier setup step) at a
         // VA the parent doesn't use; propagation must not wipe it out.
-        push_lazy_region(child, 0x3000_0000, 0x1000, 0x1);
-        push_lazy_region(parent, 0x1000_0000, 0x1000, 0x1);
+        child.push(0x3000_0000, 0x1000, 0x1, LazySource::Zero);
+        parent.push(0x1000_0000, 0x1000, 0x1, LazySource::Zero);
 
-        let copied = propagate_lazy_regions_to_child(parent, child);
-        assert_eq!(copied, 1);
+        assert_eq!(child.extend_from_slice(&snapshot(&parent)), 2);
 
-        let table = LAZY_REGION_TABLE.lock();
-        let child_regions = table.get(&child).unwrap();
-        assert_eq!(child_regions.len(), 2);
+        let child_regions = child.clone_all();
         assert!(child_regions.contains_key(&0x1000_0000));
         assert!(child_regions.contains_key(&0x3000_0000));
-        drop(table);
-        clear(parent);
-        clear(child);
+    }
+
+    #[test]
+    fn parent_region_replaces_a_child_region_at_the_same_va() {
+        // Same `start_va` on both sides: the parent's descriptor wins, so a child
+        // forked off a parent that re-mmap'd a VA inherits the *current* mapping
+        // rather than a stale one.
+        let mut parent = LazyRegionMap::new();
+        let mut child = LazyRegionMap::new();
+
+        child.push(0x1000_0000, 0x1000, 0x1, LazySource::Zero);
+        parent.push(0x1000_0000, 0x8000, 0x7, file_source("/bin/dash", 7));
+
+        assert_eq!(child.extend_from_slice(&snapshot(&parent)), 1);
+
+        let (flags, source, start_va, size) =
+            child.lookup(0x1000_4000).expect("the parent's larger region now covers this VA");
+        assert_eq!((start_va, size, flags), (0x1000_0000, 0x8000, 0x7));
+        assert!(matches!(source, LazySource::File { inode: 7, .. }));
     }
 }
 

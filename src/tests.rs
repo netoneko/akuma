@@ -3153,38 +3153,68 @@ fn test_alloc_mmap_free_region_recycling() -> bool {
 
 const TEST_PID: u32 = 9999;
 
+/// RAII registration of a minimal `Process`, so a synthetic test PID has
+/// somewhere to keep its lazy regions.
+///
+/// Lazy regions used to live in a global `LAZY_REGION_TABLE` keyed by PID, which
+/// happily accepted entries for PIDs that had no `Process` at all. They now live
+/// on `Process::lazy_regions` (docs/archive/LAZY_REGION_TABLE_ALLOC_UNDER_LOCK_HANG.md),
+/// so `push_lazy_region` on an unregistered PID is a silent no-op and any test
+/// that skips this guard would assert on an empty map and pass vacuously.
+///
+/// Retires the process on drop, so the OOM early-`return`s these tests are full
+/// of still clean up.
+struct LazyTestProcess(u32);
+
+impl LazyTestProcess {
+    fn new(pid: u32) -> Self {
+        akuma_exec::process::register_process(pid, crate::process_tests::make_test_process(pid));
+        Self(pid)
+    }
+}
+
+impl Drop for LazyTestProcess {
+    fn drop(&mut self) {
+        akuma_exec::process::clear_lazy_regions(self.0);
+        let _ = akuma_exec::process::unregister_process(self.0);
+        // `unregister_process` only RETIRES the slot, and retired slots are
+        // ineligible for `register_process`'s free-slot scan until a drain runs.
+        // Two dozen tests each parking a slot until the periodic collector wakes
+        // is how the suite would walk into `Process table full (256 slots)`, so
+        // force the collection here — the same thing the PMM tests do
+        // (docs/reference/subsystems/memory.md -> "Reclaim under memory pressure").
+        let _ = akuma_exec::process::table::reclaim_retired_processes_force();
+    }
+}
+
+/// `(start_va, size, flags)` for every lazy region registered to `pid`, sorted by
+/// `start_va`. Replaces the direct `LAZY_REGION_TABLE.lock().get(&pid)` peeking
+/// these tests used before the map moved onto `Process`.
+fn lazy_regions_of(pid: u32) -> Vec<(usize, usize, u64)> {
+    akuma_exec::process::lazy_regions_snapshot(pid).map_or(Vec::new(), |m| {
+        m.values().map(|r| (r.start_va, r.size, r.flags)).collect()
+    })
+}
+
 /// Verify push_lazy_region stores the region and it can be found
 fn test_lazy_region_push_lookup() -> bool {
     console::print("\n[TEST] lazy_region: push and lookup\n");
 
-    akuma_exec::process::clear_lazy_regions(TEST_PID);
+    let _proc = LazyTestProcess::new(TEST_PID);
 
     let start = 0x5000_0000usize;
     let size = 0x1000_0000usize;
     akuma_exec::process::push_lazy_region(TEST_PID, start, size, 0);
 
-    let found = crate::irq::with_irqs_disabled(|| {
-        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
-        if let Some(regions) = table.get(&TEST_PID) {
-            let mid = start + size / 2;
-            regions.values().any(|r| mid >= r.start_va && mid < r.start_va + r.size)
-        } else {
-            false
-        }
-    });
+    let covers = |va: usize| {
+        lazy_regions_of(TEST_PID)
+            .iter()
+            .any(|&(s, sz, _)| va >= s && va < s + sz)
+    };
 
+    let found = covers(start + size / 2);
     // Verify address outside region is NOT found
-    let outside = crate::irq::with_irqs_disabled(|| {
-        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
-        if let Some(regions) = table.get(&TEST_PID) {
-            let outside_va = start + size + 0x1000;
-            regions.values().any(|r| outside_va >= r.start_va && outside_va < r.start_va + r.size)
-        } else {
-            false
-        }
-    });
-
-    akuma_exec::process::clear_lazy_regions(TEST_PID);
+    let outside = covers(start + size + 0x1000);
 
     let ok = found && !outside;
     crate::safe_print!(64, "  found_inside={} found_outside={}\n", found, outside);
@@ -3196,22 +3226,18 @@ fn test_lazy_region_push_lookup() -> bool {
 fn test_lazy_region_munmap_full() -> bool {
     console::print("\n[TEST] lazy_region: munmap full region\n");
 
-    akuma_exec::process::clear_lazy_regions(TEST_PID);
+    let _proc = LazyTestProcess::new(TEST_PID);
     akuma_exec::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
 
     let results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_0000, 0x1_0000);
 
-    let remaining = crate::irq::with_irqs_disabled(|| {
-        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
-        table.get(&TEST_PID).map_or(0, alloc::collections::BTreeMap::len)
-    });
+    let remaining = lazy_regions_of(TEST_PID).len();
 
     let ok = results.len() == 1 && results[0] == (0x5000_0000, 16) && remaining == 0;
     if !ok {
         crate::safe_print!(128, "  results.len()={}, remaining={}\n", results.len(), remaining);
     }
 
-    akuma_exec::process::clear_lazy_regions(TEST_PID);
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
@@ -3220,28 +3246,22 @@ fn test_lazy_region_munmap_full() -> bool {
 fn test_lazy_region_munmap_prefix() -> bool {
     console::print("\n[TEST] lazy_region: munmap prefix\n");
 
-    akuma_exec::process::clear_lazy_regions(TEST_PID);
+    let _proc = LazyTestProcess::new(TEST_PID);
     akuma_exec::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
 
     let results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_0000, 0x4000);
 
-    let (start, size) = crate::irq::with_irqs_disabled(|| {
-        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
-        match table.get(&TEST_PID) {
-            Some(regions) if regions.len() == 1 => {
-                let r = regions.values().next().unwrap();
-                (r.start_va, r.size)
-            }
-            _ => (0, 0),
-        }
-    });
+    let remaining = lazy_regions_of(TEST_PID);
+    let (start, size) = match remaining.as_slice() {
+        [(s, sz, _)] => (*s, *sz),
+        _ => (0, 0),
+    };
 
     let ok = results.len() == 1
         && results[0] == (0x5000_0000, 4)
         && start == 0x5000_4000
         && size == 0xC000;
 
-    akuma_exec::process::clear_lazy_regions(TEST_PID);
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
@@ -3250,28 +3270,22 @@ fn test_lazy_region_munmap_prefix() -> bool {
 fn test_lazy_region_munmap_suffix() -> bool {
     console::print("\n[TEST] lazy_region: munmap suffix\n");
 
-    akuma_exec::process::clear_lazy_regions(TEST_PID);
+    let _proc = LazyTestProcess::new(TEST_PID);
     akuma_exec::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
 
     let results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_C000, 0x4000);
 
-    let (start, size) = crate::irq::with_irqs_disabled(|| {
-        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
-        match table.get(&TEST_PID) {
-            Some(regions) if regions.len() == 1 => {
-                let r = regions.values().next().unwrap();
-                (r.start_va, r.size)
-            }
-            _ => (0, 0),
-        }
-    });
+    let remaining = lazy_regions_of(TEST_PID);
+    let (start, size) = match remaining.as_slice() {
+        [(s, sz, _)] => (*s, *sz),
+        _ => (0, 0),
+    };
 
     let ok = results.len() == 1
         && results[0] == (0x5000_C000, 4)
         && start == 0x5000_0000
         && size == 0xC000;
 
-    akuma_exec::process::clear_lazy_regions(TEST_PID);
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
@@ -3280,29 +3294,23 @@ fn test_lazy_region_munmap_suffix() -> bool {
 fn test_lazy_region_munmap_middle() -> bool {
     console::print("\n[TEST] lazy_region: munmap middle (split)\n");
 
-    akuma_exec::process::clear_lazy_regions(TEST_PID);
+    let _proc = LazyTestProcess::new(TEST_PID);
     akuma_exec::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
 
     let results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_4000, 0x4000);
 
-    let regions = crate::irq::with_irqs_disabled(|| {
-        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
-        table.get(&TEST_PID).map_or(Vec::new(), |r| {
-            r.values().map(|lr| (lr.start_va, lr.size)).collect::<Vec<_>>()
-        })
-    });
+    let regions = lazy_regions_of(TEST_PID);
 
     let ok = results.len() == 1
         && results[0] == (0x5000_4000, 4)
         && regions.len() == 2
-        && regions.iter().any(|&(s, sz)| s == 0x5000_0000 && sz == 0x4000)
-        && regions.iter().any(|&(s, sz)| s == 0x5000_8000 && sz == 0x8000);
+        && regions.iter().any(|&(s, sz, _)| s == 0x5000_0000 && sz == 0x4000)
+        && regions.iter().any(|&(s, sz, _)| s == 0x5000_8000 && sz == 0x8000);
 
     if !ok {
         crate::safe_print!(192, "  freed={:?} regions={:?}\n", results, regions);
     }
 
-    akuma_exec::process::clear_lazy_regions(TEST_PID);
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
@@ -3311,29 +3319,23 @@ fn test_lazy_region_munmap_middle() -> bool {
 fn test_lazy_region_munmap_multi() -> bool {
     console::print("\n[TEST] lazy_region: munmap spanning two regions\n");
 
-    akuma_exec::process::clear_lazy_regions(TEST_PID);
+    let _proc = LazyTestProcess::new(TEST_PID);
     akuma_exec::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
     akuma_exec::process::push_lazy_region(TEST_PID, 0x5001_0000, 0x1_0000, 0);
 
     let results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_8000, 0x1_0000);
 
-    let remaining = crate::irq::with_irqs_disabled(|| {
-        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
-        table.get(&TEST_PID).map_or(Vec::new(), |r| {
-            r.values().map(|lr| (lr.start_va, lr.size)).collect::<Vec<_>>()
-        })
-    });
+    let remaining = lazy_regions_of(TEST_PID);
 
     let ok = results.len() == 2
         && remaining.len() == 2
-        && remaining.iter().any(|&(s, sz)| s == 0x5000_0000 && sz == 0x8000)
-        && remaining.iter().any(|&(s, sz)| s == 0x5001_8000 && sz == 0x8000);
+        && remaining.iter().any(|&(s, sz, _)| s == 0x5000_0000 && sz == 0x8000)
+        && remaining.iter().any(|&(s, sz, _)| s == 0x5001_8000 && sz == 0x8000);
 
     if !ok {
         crate::safe_print!(192, "  freed={:?} remain={:?}\n", results, remaining);
     }
 
-    akuma_exec::process::clear_lazy_regions(TEST_PID);
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
@@ -3345,8 +3347,8 @@ fn test_lazy_region_clone() -> bool {
     const PARENT_PID: u32 = 0xDEAD;
     const CHILD_PID: u32 = 0xBEEF;
 
-    akuma_exec::process::clear_lazy_regions(PARENT_PID);
-    akuma_exec::process::clear_lazy_regions(CHILD_PID);
+    let _parent = LazyTestProcess::new(PARENT_PID);
+    let _child = LazyTestProcess::new(CHILD_PID);
 
     // Create regions in parent
     akuma_exec::process::push_lazy_region(PARENT_PID, 0x1000_0000, 0x100_0000, 0x3);
@@ -3357,12 +3359,7 @@ fn test_lazy_region_clone() -> bool {
     akuma_exec::process::clone_lazy_regions(PARENT_PID, CHILD_PID);
 
     // Verify child has all regions
-    let child_regions: Vec<(usize, usize, u64)> = crate::irq::with_irqs_disabled(|| {
-        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
-        table.get(&CHILD_PID).map_or(Vec::new(), |r| {
-            r.values().map(|lr| (lr.start_va, lr.size, lr.flags)).collect()
-        })
-    });
+    let child_regions = lazy_regions_of(CHILD_PID);
 
     let ok = child_regions.len() == 3
         && child_regions.iter().any(|&(s, sz, f)| s == 0x1000_0000 && sz == 0x100_0000 && f == 0x3)
@@ -3370,21 +3367,13 @@ fn test_lazy_region_clone() -> bool {
         && child_regions.iter().any(|&(s, sz, f)| s == 0x5000_0000 && sz == 0x50_0000 && f == 0x7);
 
     // Verify parent still has its regions (clone should not remove them)
-    let parent_regions: Vec<(usize, usize)> = crate::irq::with_irqs_disabled(|| {
-        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
-        table.get(&PARENT_PID).map_or(Vec::new(), |r| {
-            r.values().map(|lr| (lr.start_va, lr.size)).collect()
-        })
-    });
+    let parent_regions = lazy_regions_of(PARENT_PID);
     let parent_ok = parent_regions.len() == 3;
 
     if !ok || !parent_ok {
         crate::safe_print!(192, "  child_regions={:?} parent_count={}\n",
             child_regions, parent_regions.len());
     }
-
-    akuma_exec::process::clear_lazy_regions(PARENT_PID);
-    akuma_exec::process::clear_lazy_regions(CHILD_PID);
 
     let result = ok && parent_ok;
     crate::safe_print!(64, "  Result: {}\n", if result { "PASS" } else { "FAIL" });
@@ -3398,8 +3387,8 @@ fn test_lazy_region_lookup_pid_isolation() -> bool {
     const PID_A: u32 = 0xAAAA;
     const PID_B: u32 = 0xBBBB;
 
-    akuma_exec::process::clear_lazy_regions(PID_A);
-    akuma_exec::process::clear_lazy_regions(PID_B);
+    let _a = LazyTestProcess::new(PID_A);
+    let _b = LazyTestProcess::new(PID_B);
 
     // Create region only in PID_A
     akuma_exec::process::push_lazy_region(PID_A, 0x3000_0000, 0x100_0000, 0x3);
@@ -3419,9 +3408,6 @@ fn test_lazy_region_lookup_pid_isolation() -> bool {
         crate::safe_print!(128, "  found_a={} found_b={} found_zero={}\n",
             found_a, found_b, found_zero);
     }
-
-    akuma_exec::process::clear_lazy_regions(PID_A);
-    akuma_exec::process::clear_lazy_regions(PID_B);
 
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
@@ -3708,8 +3694,10 @@ fn test_eager_mmap_pages_survive_subrange_munmap() -> bool {
     // Step 1: exact start match in mmap_regions?
     let exact = mmap_regions.iter().position(|(start, _)| *start == sub_addr);
 
-    // Step 2: lazy region match?
-    akuma_exec::process::clear_lazy_regions(TEST_PID);
+    // Step 2: lazy region match? (the process is registered but has no lazy
+    // regions, so this exercises the real "registered, no match" path rather than
+    // the "no such process" shortcut.)
+    let _proc = LazyTestProcess::new(TEST_PID);
     let lazy_results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, sub_addr, sub_len);
 
     // With Bug 5 fix: neither matches → return success, no pages unmapped
@@ -3757,7 +3745,7 @@ fn make_test_process(
         stdout: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
         exited: false, exit_code: 0,
         dynamic_page_tables: Vec::new(), mmap_regions: Vec::new(),
-        lazy_regions: Vec::new(),
+        lazy_regions: Spinlock::new(akuma_exec::process::LazyRegionMap::new()),
         fds: alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::new()),
         fault_mutex: Spinlock::new(BTreeMap::new()),
         vm_lock: Spinlock::new(()),
@@ -4724,6 +4712,7 @@ fn test_mprotect_updates_lazy_flags() -> bool {
     console::print("\n[TEST] Bug 12: mprotect updates lazy region flags\n");
 
     let test_pid = akuma_exec::process::allocate_pid();
+    let _proc = LazyTestProcess::new(test_pid);
     let va_start: usize = 0xE000_0000;
     let region_size: usize = 16 * 4096;
 
@@ -5057,6 +5046,7 @@ fn test_lazy_munmap_frees_demand_paged_frames() -> bool {
     console::print("\n[TEST] lazy munmap: frees demand-paged physical frames\n");
 
     let test_pid = akuma_exec::process::allocate_pid();
+    let _proc = LazyTestProcess::new(test_pid);
     let mut addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (addr_space)\n"); return false; };
 
     let base_va: usize = 0x7000_0000;
@@ -5126,6 +5116,7 @@ fn test_madvise_dontneed_frees_pages() -> bool {
     console::print("\n[TEST] MADV_DONTNEED: zeroes pages in place, preserves mapping & lazy region\n");
 
     let test_pid = akuma_exec::process::allocate_pid();
+    let _proc = LazyTestProcess::new(test_pid);
     let mut addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (addr_space)\n"); return false; };
 
     let base_va: usize = 0xA000_0000;
@@ -5173,14 +5164,9 @@ fn test_madvise_dontneed_frees_pages() -> bool {
     let no_pmm_change = free_before == free_after;
 
     // Lazy region must still exist
-    let region_exists = crate::irq::with_irqs_disabled(|| {
-        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
-        table.get(&test_pid).is_some_and(|r| {
-            r.values().any(|lr| lr.start_va == base_va && lr.size == region_size)
-        })
-    });
-
-    akuma_exec::process::clear_lazy_regions(test_pid);
+    let region_exists = lazy_regions_of(test_pid)
+        .iter()
+        .any(|&(s, sz, _)| s == base_va && sz == region_size);
 
     let pass = zeroed == num_pages && no_pmm_change && region_exists;
     if !pass {
@@ -5229,30 +5215,28 @@ fn test_madvise_dontneed_loop_no_leak() -> bool {
     pass
 }
 
-/// Verify that kill_process clears lazy regions from LAZY_REGION_TABLE.
+/// Verify that `clear_lazy_regions` empties a process's lazy-region map.
 fn test_kill_process_clears_lazy_regions() -> bool {
     console::print("\n[TEST] kill_process: clears lazy regions\n");
 
     let test_pid = akuma_exec::process::allocate_pid();
+    let _proc = LazyTestProcess::new(test_pid);
 
     akuma_exec::process::push_lazy_region(test_pid, 0x8000_0000, 0x10_0000, 0);
     akuma_exec::process::push_lazy_region(test_pid, 0x9000_0000, 0x10_0000, 0);
 
-    let before = crate::irq::with_irqs_disabled(|| {
-        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
-        table.get(&test_pid).map_or(0, alloc::collections::BTreeMap::len)
-    });
+    let before = akuma_exec::process::lazy_region_count_for_pid(test_pid);
 
     akuma_exec::process::clear_lazy_regions(test_pid);
 
-    let after = crate::irq::with_irqs_disabled(|| {
-        let table = akuma_exec::process::LAZY_REGION_TABLE.lock();
-        table.contains_key(&test_pid)
-    });
+    // The map is now empty. The `Process` itself outlives the clear — it is the
+    // owner of the map, and it goes away with `unregister_process` (here, the
+    // guard's `Drop`), not with `clear_lazy_regions`.
+    let after = akuma_exec::process::lazy_region_count_for_pid(test_pid);
 
-    let pass = before == 2 && !after;
+    let pass = before == 2 && after == 0;
     if !pass {
-        crate::safe_print!(128, "  before={} after_contains={}\n", before, after);
+        crate::safe_print!(128, "  before={} after={}\n", before, after);
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
@@ -5557,6 +5541,7 @@ fn test_arena_trim_crash_pattern() -> bool {
     console::print("\n[TEST] Bun crash: mimalloc arena trim (mmap 8GB → munmap → re-mmap small)\n");
 
     let test_pid = akuma_exec::process::allocate_pid();
+    let _proc = LazyTestProcess::new(test_pid);
 
     const LARGE_SIZE: usize = 0x2_0000_0000; // 8 GB
     const SMALL_SIZE: usize = 0x851000;       // ~8.3 MB (matches bun trace)
@@ -5661,6 +5646,7 @@ fn test_multi_arena_trim_crash() -> bool {
     console::print("\n[TEST] Bun multi-arena crash (18 regions, FAR=0x2346b2ad68 pattern)\n");
 
     let test_pid = akuma_exec::process::allocate_pid();
+    let _proc = LazyTestProcess::new(test_pid);
 
     let mut mem = akuma_exec::process::ProcessMemory::new(
         0x1000_0000,
@@ -5775,11 +5761,12 @@ fn test_multi_arena_trim_crash() -> bool {
 // ============================================================================
 
 /// Test that mremap of a lazy region copies demand-faulted data and
-/// removes the old lazy region entry from LAZY_REGION_TABLE.
+/// removes the old lazy region entry from the process's lazy-region map.
 fn test_mremap_lazy_region_moves_data() -> bool {
     console::print("\n[TEST] mremap: lazy region moves data and removes old entry\n");
 
     let test_pid = akuma_exec::process::allocate_pid();
+    let _proc = LazyTestProcess::new(test_pid);
     let base_va: usize = 0xB000_0000;
     let old_size: usize = 512 * 4096; // >256 pages = lazy
 
@@ -5807,6 +5794,7 @@ fn test_mremap_lazy_region_shrink() -> bool {
     console::print("\n[TEST] mremap: shrink returns old address (no-op)\n");
 
     let test_pid = akuma_exec::process::allocate_pid();
+    let _proc = LazyTestProcess::new(test_pid);
     let base_va: usize = 0xC000_0000;
     let old_size: usize = 1024 * 4096;
     let new_size: usize = 512 * 4096;
@@ -5836,6 +5824,7 @@ fn test_mremap_lazy_cleans_old_ptes() -> bool {
     console::print("\n[TEST] mremap: old lazy region removed after move\n");
 
     let test_pid = akuma_exec::process::allocate_pid();
+    let _proc = LazyTestProcess::new(test_pid);
     let base_va: usize = 0xD000_0000;
     let region_size: usize = 512 * 4096;
 
@@ -7044,8 +7033,7 @@ fn test_lazy_region_lookup_for_pid_explicit() -> bool {
     let va: usize = 0x2000_0000;
     let size: usize = 0x10_0000_0000; // 64 GB (Gigacage-like)
 
-    // Clean up any prior state
-    clear_lazy_regions(test_pid);
+    let _proc = LazyTestProcess::new(test_pid);
 
     // Register a lazy region under the test PID
     push_lazy_region(test_pid, va, size, user_flags::RW);
@@ -7085,7 +7073,7 @@ fn test_lazy_region_lookup_pid_consistency() -> bool {
     let va: usize = 0x6000_0000;
     let size: usize = 0x1000_0000;
 
-    clear_lazy_regions(test_pid);
+    let _proc = LazyTestProcess::new(test_pid);
     push_lazy_region(test_pid, va, size, user_flags::RW);
 
     // With PID=0 (what a racy/missing read_current_pid returns) -- must miss
@@ -8520,7 +8508,7 @@ fn test_lazy_region_btreemap_boundary_lookup() -> bool {
     console::print("  lazy_region_btreemap_boundary: ");
 
     let test_pid = 99990;
-    clear_lazy_regions(test_pid);
+    let _proc = LazyTestProcess::new(test_pid);
 
     // Region A: [0x1000_0000, 0x1000_0000 + 0x10000) = 16 pages
     push_lazy_region(test_pid, 0x1000_0000, 0x10000, 0x3);

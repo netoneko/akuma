@@ -151,7 +151,40 @@ the §3 drain while holding their lock):
 | `syscall/term.rs:195,241,257,338` | `TerminalState` |
 | `syscall/signal.rs:42` old-sigaction copy | `SharedSignalTable.actions` |
 
-The in-tree correct patterns to copy: `syscall/fs.rs:318/353/398` (`drop(ts)`
+### 5.1b Lazy-region alloc-under-lock — CLOSED by ownership (`mmap`/`mprotect` writers)
+
+The `mmap`/`mprotect` writers still allocate on the heap while holding a
+lazy-region lock with IRQs masked, but that is no longer rule-2 fuel, because
+the lock is no longer *global*.
+
+The map used to be `LAZY_REGION_TABLE: Spinlock<BTreeMap<Pid, BTreeMap<usize,
+LazyRegion>>>` in `process/table.rs`. A `BTreeMap::insert` that OOM'd inside
+`push_lazy_region_with_source` / `update_lazy_region_flags` routed through
+`alloc_error_handler` → `return_to_kernel`, whose teardown called
+`clear_lazy_regions` → `LAZY_REGION_TABLE.lock()` — re-entering the lock the
+abandoned frame still held, and (since there is no unwinding) wedging that lock
+for the rest of the boot. That was the `-j4` self-host freeze of 2026-08-02.
+
+It now lives on the process: `Process::lazy_regions: Spinlock<LazyRegionMap>`
+(fix direction (3), "structural (durable)", in the archive doc). Consequences:
+
+- The lock is reachable only through a `Process`, and each process has its own,
+  so a hang would need the dying thread's *own* map — and the teardown paths no
+  longer touch it. `return_to_kernel`, `return_to_kernel_from_fault` and
+  `teardown_forked_process_thread_group` dropped their `clear_lazy_regions`
+  calls; the field is released by `Process::drop` on the existing reclaim path.
+- `clear_lazy_regions` survives only for the `sys_wait4`/`sys_waitid` zombie
+  reap, which runs in the *parent's* syscall context holding no lazy-region lock.
+- `LazyRegionMap` (in `process/children.rs`) is the pure data structure and is
+  unit-tested on the host; the pid-keyed free functions are thin wrappers that
+  resolve `pid` → `Process` first.
+
+Full audit, the deadlock chain, and why the tactical `try_lock`-and-skip fix
+would *not* have been sufficient:
+[`../../archive/LAZY_REGION_TABLE_ALLOC_UNDER_LOCK_HANG.md`](../../archive/LAZY_REGION_TABLE_ALLOC_UNDER_LOCK_HANG.md).
+
+The general in-tree patterns for keeping allocation out of a lock hold, for the
+sites that still share a global one: `syscall/fs.rs:318/353/398` (`drop(ts)`
 before the copy), `syscall/poll.rs:334-339` (copy hoisted out of the lock),
 `exceptions.rs:1180-1190` (pre-map then write).
 
@@ -168,8 +201,15 @@ when a `copy_*_safe` window is open.
 `SHARED_L0_TABLE` insert (fork), `fds.table` clone in `close_all`,
 `pipe_write` buffer growth, epoll/eventfd interest inserts, heap allocation
 inside `with_irqs_disabled` process-table scans
-(`process/mod.rs:1077,1226,1251,1302`). Any of these failing under heap
-pressure becomes rule-2 hang fuel.
+(`process/mod.rs:1077,1226,1251,1302`). Any of these failing under heap pressure
+becomes rule-2 hang fuel.
+
+The lazy-region writers (`push_lazy_region*`, `update_lazy_region_flags`,
+`munmap_lazy_region_overlapping`, `clone_lazy_regions`) used to belong on this
+list and no longer do — see §5.1b for why owning the map per-process took them
+out of rule-2's reach. That is the template for retiring the rest: give the
+state an owner whose drop is already on the teardown path, rather than a global
+the teardown has to reach back into.
 
 ## Verify
 

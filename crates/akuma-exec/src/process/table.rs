@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicPtr, Ordering};
 use spinning_top::Spinlock;
 
 use crate::process::Process;
-use crate::process::types::{Pid, LazyRegion};
+use crate::process::types::Pid;
 use crate::runtime::{config, runtime, with_irqs_disabled};
 
 /// Maximum number of concurrent processes.
@@ -471,13 +471,6 @@ pub fn process_count() -> usize {
 /// Needed because thread clones share the parent's ProcessInfo page, so
 /// read_current_pid() would return the parent's PID.
 pub static THREAD_PID_MAP: Spinlock<BTreeMap<usize, Pid>> =
-    Spinlock::new(BTreeMap::new());
-
-/// Global lazy region table, keyed by PID then by start_va.
-/// The inner BTreeMap allows O(log n) range lookups via `range(..=va).next_back()`.
-/// Stored separately from Process to avoid aliasing/corruption issues
-/// with the `&mut Process` references the pre-Phase-7e `current_process()` handed out.
-pub static LAZY_REGION_TABLE: Spinlock<BTreeMap<Pid, BTreeMap<usize, LazyRegion>>> =
     Spinlock::new(BTreeMap::new());
 
 pub fn register_thread_pid(tid: usize, pid: Pid) {

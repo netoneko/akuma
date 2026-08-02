@@ -328,7 +328,13 @@ pub struct Process {
     pub exit_code: i32,
     pub dynamic_page_tables: Vec<PhysFrame>,
     pub mmap_regions: Vec<MmapRegion>,
-    pub lazy_regions: Vec<LazyRegion>,
+    /// Per-process demand-paged lazy regions, keyed by `start_va`. Owned here
+    /// (not in a global table) so a `BTreeMap::insert` that OOMs under the lock
+    /// cannot self-deadlock on teardown — the field drops inside `Process::drop`
+    /// on the reclaim path, and `return_to_kernel*` no longer re-acquires it. See
+    /// docs/archive/LAZY_REGION_TABLE_ALLOC_UNDER_LOCK_HANG.md and
+    /// [`LazyRegionMap`].
+    pub lazy_regions: Spinlock<LazyRegionMap>,
     pub fds: Arc<SharedFdTable>,
     pub thread_id: Option<usize>,
     pub spawner_pid: Option<Pid>,
@@ -613,10 +619,17 @@ impl Process {
             pid, brk, stack_bottom, stack_top, memory.next_mmap.load(Ordering::Relaxed), memory.mmap_limit);
 
         // Register demand-paged regions for heap and stack growth.
+        //
+        // Built as a local and moved into the struct below. The pid-keyed
+        // `push_lazy_region` cannot be used here: it resolves `pid` through the
+        // process table, and this `Process` does not exist yet — let alone is
+        // registered — so every region would be silently dropped and the first
+        // heap or deep-stack touch would SIGSEGV.
+        let mut lazy_regions = LazyRegionMap::new();
         let heap_lazy_size = compute_heap_lazy_size(brk, &memory);
-        push_lazy_region(pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
+        lazy_regions.push(brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
         let lazy_stack_start = stack_top.saturating_sub(LAZY_STACK_MAX);
-        push_lazy_region(pid, lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC);
+        lazy_regions.push(lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
 
         Ok(Self {
             pid,
@@ -640,7 +653,7 @@ impl Process {
             exit_code: 0,
             dynamic_page_tables: Vec::new(),
             mmap_regions: Vec::new(),
-            lazy_regions: Vec::new(),
+            lazy_regions: Spinlock::new(lazy_regions),
             fds: Arc::new(SharedFdTable::with_stdio()),
             thread_id: None,
             // Spawner PID - set when spawned by another process
@@ -683,6 +696,10 @@ impl Process {
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
 
+        // Collected into a local and moved into the struct below — see the
+        // sibling constructor for why the pid-keyed API can't reach a `Process`
+        // that hasn't been built yet.
+        let mut lazy_regions = LazyRegionMap::new();
         for seg in &deferred_segments {
             let source = match &seg.file_source {
                 Some(fs) => LazySource::File {
@@ -694,7 +711,7 @@ impl Process {
                 },
                 None => LazySource::Zero,
             };
-            push_lazy_region_with_source(pid, seg.start_va, seg.size, seg.page_flags, source);
+            lazy_regions.push(seg.start_va, seg.size, seg.page_flags, source);
         }
 
         let process_info_frame = (runtime().alloc_page_zeroed)().ok_or(ElfError::OutOfMemory)?;
@@ -716,9 +733,9 @@ impl Process {
             pid, brk, stack_bottom, stack_top, memory.next_mmap.load(Ordering::Relaxed), memory.mmap_limit);
 
         let heap_lazy_size = compute_heap_lazy_size(brk, &memory);
-        push_lazy_region(pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
+        lazy_regions.push(brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
         let lazy_stack_start = stack_top.saturating_sub(LAZY_STACK_MAX);
-        push_lazy_region(pid, lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC);
+        lazy_regions.push(lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
 
         Ok(Self {
             pid,
@@ -742,7 +759,7 @@ impl Process {
             exit_code: 0,
             dynamic_page_tables: Vec::new(),
             mmap_regions: Vec::new(),
-            lazy_regions: Vec::new(),
+            lazy_regions: Spinlock::new(lazy_regions),
             fds: Arc::new(SharedFdTable::with_stdio()),
             thread_id: None,
             spawner_pid: None,
@@ -1288,7 +1305,10 @@ fn teardown_forked_process_thread_group(child_pid: Pid, l0_phys: usize) {
                 THREAD_PID_MAP.lock().remove(tid);
             });
         }
-        clear_lazy_regions(*pid);
+        // NOTE: clear_lazy_regions(*pid) is intentionally NOT called here — the
+        // per-process `lazy_regions` field drops inside `Process::drop` on the
+        // reclaim path. Calling it from teardown would re-enter the lock an
+        // OOM'd mutator frame may still hold (rule-2 hang).
         let _ = table::unregister_process(*pid);
     }
 }
@@ -1552,7 +1572,10 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         // Read tgid BEFORE unregister (for future signal-based group exit).
         let _tgid = lookup_process_shared(pid).map(|p| p.tgid);
 
-        clear_lazy_regions(pid);
+        // NOTE: clear_lazy_regions(pid) is intentionally NOT called here — the
+        // per-process `lazy_regions` field drops inside `Process::drop` on the
+        // reclaim path. Calling it from teardown would re-enter the lock an
+        // OOM'd mutator frame may still hold (rule-2 hang).
         unregister_process(pid);
         log::debug!("[Process] PID {} thread {} exited ({}) [{}.{:02}s]", pid, tid, exit_code, secs, frac);
 
@@ -1714,7 +1737,7 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
         let secs = elapsed_us / 1_000_000;
         let frac = (elapsed_us % 1_000_000) / 10_000;
 
-        clear_lazy_regions(pid);
+        // NOTE: clear_lazy_regions(pid) intentionally omitted (see return_to_kernel).
         unregister_process(pid);
         log::debug!("[Process] PID {} thread {} faulted ({}) [{}.{:02}s]", pid, tid, exit_code, secs, frac);
     } else {
@@ -1807,9 +1830,10 @@ pub fn waitpid(pid: Pid) -> Option<(Pid, i32)> {
 /// Returns the new PID to the parent.
 ///
 /// **Locks:** `clone_deep_for_fork` and the lazy-region snapshot take
-/// `SharedFdTable` / `LAZY_REGION_TABLE` only inside short `with_irqs_disabled`
-/// windows. The long eager copies do **not** hold those locks, so fork is not
-/// expected to deadlock the global lazy-region or fd tables. A pathological
+/// `SharedFdTable` / the parent's `Process::lazy_regions` only inside short
+/// `with_irqs_disabled` windows. The long eager copies do **not** hold those locks,
+/// so fork is not expected to deadlock the fd table or either process's
+/// lazy-region map. A pathological
 /// huge `brk` can still monopolize CPU for a long time (see `MAX_FORK_BRK_COPY_PAGES`).
 pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str> {
     // Serialize lifecycle against preemption under shared-kernel SMP. See
@@ -1843,7 +1867,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             format_args!("[FORK-DBG] parent_pid={} child_pid={} brk=0x{:x} code_end=0x{:x} mmap_regions={} lazy_regs={}\n",
                 parent_pid, child_pid, parent.brk, parent.memory.code_end,
                 parent.mmap_regions.len(),
-                parent.lazy_regions.len()));
+                parent.lazy_regions.lock().len()));
         if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
     }
     // #endregion
@@ -1887,7 +1911,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         exit_code: 0,
         dynamic_page_tables: Vec::new(),
         mmap_regions: Vec::new(),
-        lazy_regions: Vec::new(),
+        lazy_regions: Spinlock::new(LazyRegionMap::new()),
         fds: Arc::new(parent.fds.clone_deep_for_fork()),
         thread_id: None,
         spawner_pid: parent.spawner_pid,
@@ -2094,18 +2118,15 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         // docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md — that crash's faulting VA
         // was confirmed unregistered in the parent too. That bug remains open.
         //
-        // One snapshot now serves both the share and the demote (the old code read
-        // `LAZY_REGION_TABLE` twice for the identical `parent_tgid` entry, once per
-        // pass); `propagate_lazy_regions_to_child` MUTATES the table and stays out here,
-        // BKL-held, since it registers under the child's key.
+        // One snapshot serves the share, the demote AND the descriptor
+        // propagation — `propagate_lazy_regions_to_child` writes straight into
+        // `new_proc`, which is not registered in the process table until the very
+        // end of this function, so it must be reached by reference here.
         let parent_lazy_regions: alloc::vec::Vec<crate::process::types::LazyRegion> =
-            with_irqs_disabled(|| {
-                let table = LAZY_REGION_TABLE.lock();
-                table.get(&parent_tgid)
-                    .map(|regions| regions.values().cloned().collect())
-                    .unwrap_or_default()
-            });
-        propagate_lazy_regions_to_child(parent_tgid, child_pid);
+            lazy_regions_snapshot(parent_tgid)
+                .map(|m| m.into_values().collect())
+                .unwrap_or_default();
+        propagate_lazy_regions_to_child(&parent_lazy_regions, &new_proc);
 
         // Per-chunk PTE snapshot buffer, reserved ONCE here so no `as_lock` hold below
         // ever has to grow it (see `FORK_AS_CHUNK_PAGES`).
@@ -2183,7 +2204,12 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         // user_frames.  We keep each region's VA *and page count* so munmap can
         // size it and so this child's own forks can share it (see `MmapRegion`).
         new_proc.mmap_regions = inherit_mmap_regions_for_cow_child(&parent.mmap_regions);
-        new_proc.lazy_regions = Vec::new();
+        // NOTE: `new_proc.lazy_regions` is deliberately NOT cleared here — the
+        // parent's descriptors were propagated into it above, and wiping them
+        // reinstates the first-touch SIGSEGV of
+        // docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md. (Pre-`LazyRegionMap`
+        // this line reset a vestigial `Vec` field that nothing read, while the real
+        // state lived in the global table.)
         new_proc.memory.next_mmap.store(parent.memory.next_mmap.load(Ordering::Relaxed), Ordering::Relaxed);
 
         let cow_elapsed_us = (runtime().uptime_us)() - cow_start_us;
@@ -2333,7 +2359,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         }
 
         new_proc.mmap_regions = child_mmap_regions;
-        new_proc.lazy_regions = Vec::new();
+        // `new_proc.lazy_regions` starts empty and is filled by the propagation
+        // just below; clearing it here would undo that (see the CoW arm's note).
         new_proc.memory.next_mmap.store(parent.memory.next_mmap.load(Ordering::Relaxed), Ordering::Relaxed);
         (runtime().print_str)("[FORK-DBG] step4: mmap done\n");
 
@@ -2345,13 +2372,11 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             // eagerly copying whatever's *resident* in the parent's lazy ranges is
             // not enough; the child needs its own lazy-region registration too, for
             // whatever wasn't resident yet in the parent at fork time).
-            let parent_regions: alloc::vec::Vec<crate::process::types::LazyRegion> = with_irqs_disabled(|| {
-                let table = LAZY_REGION_TABLE.lock();
-                table.get(&parent_tgid)
-                    .map(|regions| regions.values().cloned().collect())
-                    .unwrap_or_default()
-            });
-            propagate_lazy_regions_to_child(parent_tgid, child_pid);
+            let parent_regions: alloc::vec::Vec<crate::process::types::LazyRegion> =
+                lazy_regions_snapshot(parent_tgid)
+                    .map(|m| m.into_values().collect())
+                    .unwrap_or_default();
+            propagate_lazy_regions_to_child(&parent_regions, &new_proc);
             let num_regions = parent_regions.len();
             let mut lazy_pages_copied = 0usize;
             let mut lazy_pages_scanned = 0usize;
@@ -2501,7 +2526,12 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     (runtime().print_str)("[FORK-DBG] step8: registering process\n");
     // #endregion
     register_process(child_pid, new_proc);
-    clone_lazy_regions(parent_pid, child_pid);
+    // No `clone_lazy_regions(parent_pid, child_pid)` here: both fork arms above
+    // already propagated the parent *thread-group leader*'s descriptors into
+    // `new_proc` before registration. Re-cloning from `parent_pid` would replace
+    // that with the forking thread's own (per-thread, possibly stale) map — lazy
+    // regions are tgid-keyed (`sys_mmap` uses `proc.tgid`), so the leader's map is
+    // the authoritative one.
     
     // Now safe to start the thread
     // #region agent log
@@ -2576,7 +2606,7 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
         exit_code: 0,
         dynamic_page_tables: Vec::new(),
         mmap_regions: Vec::new(),  // shares parent's via the shared L0
-        lazy_regions: Vec::new(),
+        lazy_regions: Spinlock::new(LazyRegionMap::new()),
         fds: Arc::new(parent.fds.clone_deep_for_fork()),
         thread_id: None,
         spawner_pid: parent.spawner_pid,
@@ -2709,7 +2739,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         exit_code: 0,
         dynamic_page_tables: Vec::new(),
         mmap_regions: Vec::new(),
-        lazy_regions: Vec::new(), // managed via LAZY_REGION_TABLE
+        lazy_regions: Spinlock::new(LazyRegionMap::new()), // per-process; dropped in Process::drop
         fds: parent.fds.clone(), // Arc::clone — shared fd table (CLONE_FILES)
         thread_id: None,
         spawner_pid: parent.spawner_pid,

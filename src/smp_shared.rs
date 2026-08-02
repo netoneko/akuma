@@ -146,7 +146,7 @@ pub fn set_process_bkl_drop_enabled(on: bool) {
 /// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md) — drop the BKL for the whole
 /// duration of `sys_mprotect`/`sys_madvise`/`sys_munmap`/`sys_mremap`/`sys_mmap`,
 /// relying on `Process::as_lock` (page tables), `Process::vm_lock` (`mmap_regions`
-/// and the mmap free-list), `LAZY_REGION_TABLE`, PMM/`FRAME_TRACKER`, and
+/// and the mmap free-list), `Process::lazy_regions`, PMM/`FRAME_TRACKER`, and
 /// `SHARED_FILE_MAPPINGS` for cross-core mutual exclusion instead. `MmBklGuard`
 /// reads this at construct/drop time (latched, same discipline as
 /// `VFS_BKL_DROP_ENABLED`) so an `smp-shared` boot with the feature compiled in can

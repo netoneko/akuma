@@ -4,7 +4,6 @@ use alloc::format;
 use crate::mmu;
 use crate::runtime::{runtime, config, FrameSource};
 use crate::process::types::{ProcessMemory, LazySource, SignalHandler, SignalAction, PROCESS_INFO_ADDR, ProcessInfo};
-use crate::process::children::{clear_lazy_regions, push_lazy_region, push_lazy_region_with_source};
 use crate::process::lifecycle::LifecycleGuard;
 use super::Process;
 
@@ -57,16 +56,21 @@ impl Process {
         self.initial_brk = brk;
         self.memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
         self.mmap_regions.clear();
-        self.lazy_regions.clear();
-        clear_lazy_regions(self.pid);
+        self.lazy_regions.lock().clear();
         self.dynamic_page_tables.clear();
         self.args = args.to_vec();
         self.clear_child_tid = 0;
 
+        // Written through the owned field rather than the pid-keyed
+        // `push_lazy_region`: that would resolve `self.pid` back to this very
+        // `Process` through a *shared* table lookup while we hold `&mut self`.
         let heap_lazy_size = compute_heap_lazy_size(brk, &self.memory);
-        push_lazy_region(self.pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
         let lazy_stack_start = stack_top.saturating_sub(LAZY_STACK_MAX);
-        push_lazy_region(self.pid, lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC);
+        {
+            let mut lazy = self.lazy_regions.lock();
+            lazy.push(brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
+            lazy.push(lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
+        }
 
         if config().syscall_debug_info_enabled {
             log::debug!("[Process] PID {} replaced: entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}",
@@ -136,30 +140,38 @@ impl Process {
         self.initial_brk = brk;
         self.memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
         self.mmap_regions.clear();
-        self.lazy_regions.clear();
-        clear_lazy_regions(self.pid);
+        self.lazy_regions.lock().clear();
         self.dynamic_page_tables.clear();
         self.args = args.to_vec();
         self.clear_child_tid = 0;
 
-        for seg in &deferred_segments {
-            let source = match &seg.file_source {
-                Some(fs) => LazySource::File {
-                    path: fs.path.clone(),
-                    inode: fs.inode,
-                    file_offset: fs.file_offset,
-                    filesz: fs.filesz,
-                    segment_va: fs.segment_va,
-                },
-                None => LazySource::Zero,
-            };
-            push_lazy_region_with_source(self.pid, seg.start_va, seg.size, seg.page_flags, source);
+        {
+            let mut lazy = self.lazy_regions.lock();
+            for seg in &deferred_segments {
+                let source = match &seg.file_source {
+                    Some(fs) => LazySource::File {
+                        path: fs.path.clone(),
+                        inode: fs.inode,
+                        file_offset: fs.file_offset,
+                        filesz: fs.filesz,
+                        segment_va: fs.segment_va,
+                    },
+                    None => LazySource::Zero,
+                };
+                lazy.push(seg.start_va, seg.size, seg.page_flags, source);
+            }
         }
 
+        // Written through the owned field rather than the pid-keyed
+        // `push_lazy_region`: that would resolve `self.pid` back to this very
+        // `Process` through a *shared* table lookup while we hold `&mut self`.
         let heap_lazy_size = compute_heap_lazy_size(brk, &self.memory);
-        push_lazy_region(self.pid, brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC);
         let lazy_stack_start = stack_top.saturating_sub(LAZY_STACK_MAX);
-        push_lazy_region(self.pid, lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC);
+        {
+            let mut lazy = self.lazy_regions.lock();
+            lazy.push(brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
+            lazy.push(lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
+        }
 
         if config().syscall_debug_info_enabled {
             log::debug!("[Process] PID {} replaced (on-demand): entry=0x{:x}, brk=0x{:x}, stack=0x{:x}-0x{:x}, sp=0x{:x}",
