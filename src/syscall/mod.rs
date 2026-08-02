@@ -1071,7 +1071,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // Log when a syscall returns a dangerous negative error code.  Go's runtime may
     // not check the error and dereference the negative return value as a pointer,
     // causing a WILD-DA crash (FAR = the error code).
-    if result == EFAULT || result == ENOSYS || result == EINVAL {
+    if crate::config::SYSCALL_ERRNO_DIAG_ENABLED && (result == EFAULT || result == ENOSYS || result == EINVAL) {
         let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
         let err_name = if result == EFAULT { "EFAULT" } else if result == ENOSYS { "ENOSYS" } else { "EINVAL" };
 

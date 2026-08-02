@@ -461,6 +461,18 @@ pub const SYSCALL_ERRNO_DIAG_EXTRA: bool = true;
 #[cfg(kernel_profile_extreme)]
 pub const SYSCALL_ERRNO_DIAG_EXTRA: bool = false;
 
+/// Master switch for the EFAULT/ENOSYS/EINVAL dangerous-errno log line itself
+/// (see `SYSCALL_ERRNO_DIAG_EXTRA` above for its format, not whether it fires).
+///
+/// Some callers legitimately hit these errnos at high volume with no bug
+/// involved — e.g. `readlinkat` on a real (non-symlink) path correctly
+/// returns `EINVAL` per POSIX, and cargo/rustc probe "is this a symlink?" on
+/// every file of every extracted crate during a build, which floods this at
+/// tens of thousands of lines/build (docs/archive/SELFHOST_DEVBOX_SMOLTCP_2026-08-02.md).
+/// Flip to `false` to silence it (e.g. for a quieter self-host build run);
+/// leave `true` to keep the WILD-DA-crash diagnostic live for the general case.
+pub const SYSCALL_ERRNO_DIAG_ENABLED: bool = false;
+
 /// Stale-instruction-cache **spurious-SVC** guard (§7k.4 root cause).
 ///
 /// At an `EC_SVC64` trap the CPU sets `ELR_EL1` to the instruction *after* the
@@ -686,6 +698,31 @@ pub const SSH_BUILT_INS_FIRST: bool = false;
 /// failed`, the rump-default bring-up) print regardless. Flip to `true` to debug
 /// the sysproxy path.
 pub const RUMP_SP_TRACE: bool = false;
+
+// ============================================================================
+// Syscall trace prints (high-volume; off by default outside active debugging)
+// ============================================================================
+
+/// Emit the `[munmap] pid=… addr=… (N pages, M owned, base=…)` trace on every
+/// `munmap()` syscall (`src/syscall/mem.rs`), plus its shared-writeback
+/// counterpart.
+///
+/// Off by default: a single process can issue thousands of small `munmap()`
+/// calls during exit/teardown (observed ~2,900/exit during a self-host cargo
+/// build), each paying a `tprint!` — see
+/// docs/archive/SELFHOST_DEVBOX_SMOLTCP_2026-08-02.md, where this was 35% of
+/// total log volume. Flip to `true` to debug region unmap/frame-free issues.
+pub const TRACE_MUNMAP: bool = false;
+
+/// Emit the `[signal] tkill(tid=…, sig=…)` trace on every `tkill()` syscall
+/// (`src/syscall/signal.rs`).
+///
+/// Off by default: some userspace runtimes (observed with rustc/musl on
+/// thread/process startup) call `tkill` on themselves in fixed-size retry
+/// bursts (100 calls/spawn, harmless but noisy) — see
+/// docs/archive/SELFHOST_DEVBOX_SMOLTCP_2026-08-02.md. Flip to `true` to
+/// debug signal delivery.
+pub const TRACE_TKILL: bool = false;
 
 // ============================================================================
 // Dynamic Configuration Functions

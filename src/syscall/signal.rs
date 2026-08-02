@@ -332,7 +332,9 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
     if sig == 0 { return 0; }
     if sig as usize > akuma_exec::process::MAX_SIGNALS { return EINVAL; }
 
-    crate::safe_print!(96, "[signal] tkill(tid={}, sig={})\n", tid, sig);
+    if crate::config::TRACE_TKILL {
+        crate::safe_print!(96, "[signal] tkill(tid={}, sig={})\n", tid, sig);
+    }
 
     // Handler is process-wide (sigaction); the mask is PER-THREAD — read the
     // *target* thread's mask (docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D).

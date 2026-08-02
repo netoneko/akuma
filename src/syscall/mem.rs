@@ -852,8 +852,10 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
         }
     });
     if let Some((base, n, frames)) = detached {
-        crate::tprint!(128, "[munmap] pid={} addr=0x{:x} ({} pages, {} owned, base=0x{:x})\n",
-            proc.pid, addr, n, frames.len(), base);
+        if crate::config::TRACE_MUNMAP {
+            crate::tprint!(128, "[munmap] pid={} addr=0x{:x} ({} pages, {} owned, base=0x{:x})\n",
+                proc.pid, addr, n, frames.len(), base);
+        }
         // Writable MAP_SHARED file mapping: flush its (still-resident) pages back
         // to the backing file BEFORE the frames are freed below.
         let wb = SHARED_FILE_MAPPINGS.lock().remove(&(proc.tgid, base));
@@ -861,8 +863,10 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
             let pas: Vec<usize> = frames.iter().map(|f| f.addr).collect();
             let flush_len = m.len.min(n * 4096);
             let written = writeback_shared_pages(&m.path, m.file_offset, flush_len, &pas);
-            crate::tprint!(192, "[munmap] pid={} shared-writeback file={} off={} {} bytes\n",
-                proc.pid, &m.path, m.file_offset, written);
+            if crate::config::TRACE_MUNMAP {
+                crate::tprint!(192, "[munmap] pid={} shared-writeback file={} off={} {} bytes\n",
+                    proc.pid, &m.path, m.file_offset, written);
+            }
         }
         // Defer the TLB flush: clear each PTE without a per-page barrier,
         // then flush the whole region once (cheap-win E, COW_OPTIMIZATIONS.md).

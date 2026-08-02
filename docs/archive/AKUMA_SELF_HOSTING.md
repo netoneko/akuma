@@ -1535,6 +1535,29 @@ when a build-unit rustc SIGSEGVs.
 
 ---
 
+### 7l. Retest on `devbox-smoltcp` after the execve-leak fix (Aug 2 2026)
+
+Full write-up: `docs/archive/SELFHOST_DEVBOX_SMOLTCP_2026-08-02.md`. Short
+version: re-ran self-host, this time on the **`release-smp-shared` profile +
+`devbox-smoltcp` feature** (§7j's original success was the plain rump
+`devbox`) at HEAD `5ea6024`, specifically to stress-test the execve-heap-leak
+fix (`docs/archive/EXECVE_STACK_LEAK_OOM_HANG.md`) under real cargo-scale
+exec volume. Six genuine, reproducible setup bugs found and fixed before the
+build could even start (disk silently empty because Docker was down during
+prep; `populate_disk.sh`'s base copy ships the wrong, Phase-2-multikernel
+`sshd.conf` for `devbox-smoltcp` — needs `--overlay overlays/devbox/rootfs`;
+`--with-rust-toolchain` never installs apk `cargo`; `/bin/git` is `scratch`
+(no shallow-clone support), needs apk `git` at `/usr/bin/git`;
+`scripts/selfhost_driver.py`'s build step was missing `-p akuma`; and public
+GitHub HEAD lagged local HEAD by the very feature under test, worked around
+by serving local HEAD via `git daemon` + `git clone git://10.0.2.2:9418/...`
+instead of publishing). Also found and gated three high-volume debug prints behind new `config.rs`
+flags (`SYSCALL_ERRNO_DIAG_ENABLED`, `TRACE_MUNMAP`, `TRACE_TKILL`) — see
+that doc for the `[munmap]`-is-35%-of-log-volume finding. See the linked doc
+for the final PASS/FAIL, artifact md5, and build wall-clock time.
+
+---
+
 ## 8. Other known issues
 
 - **Intermittent kernel crash during exec at high RAM.** Once, during an
