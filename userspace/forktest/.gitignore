@@ -7,3 +7,4 @@ c_stress/mmap_file
 c_stress/fpfault
 c_stress/neonfault
 c_stress/mmapsum
+c_stress/futextest
