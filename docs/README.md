@@ -35,6 +35,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | VM won't boot / hangs early | [`runbooks/debug-boot-hang.md`](runbooks/debug-boot-hang.md) |
 | SSH unreachable or slow to connect | [`runbooks/debug-devbox.md`](runbooks/debug-devbox.md) (devbox) / [`runbooks/debug-ssh-latency.md`](runbooks/debug-ssh-latency.md) |
 | VM wedged, 100% CPU, unresponsive | [`runbooks/recover-wedged-vm.md`](runbooks/recover-wedged-vm.md) |
+| `[OOM] allocation of N bytes failed (heap …MB used) — killing process` repeating, sshd can't spawn `/bin/sh` — OR serial log frozen + 100% CPU with **no** `[OOM]` under exec-heavy load | Kernel-heap wall from the execve stack leak (FIXED) and its lock-abandonment hang class: [`reference/subsystems/thread-lifecycle.md`](reference/subsystems/thread-lifecycle.md) §4-§5 + [`archive/EXECVE_STACK_LEAK_OOM_HANG.md`](archive/EXECVE_STACK_LEAK_OOM_HANG.md) |
 | Kernel panic / OOM / allocation failure | [`runbooks/debug-memory-oom.md`](runbooks/debug-memory-oom.md) |
 | PMM free pinned near the reserve while `[PSTATS]` shows `retired=N/Mp` non-zero (exec failures, "No current user process" cascades) | Reclaimable memory is parked, not leaked: [`reference/subsystems/memory.md`](reference/subsystems/memory.md) -> "Reclaim under memory pressure" + [`archive/OOM_KILL_DEFERRED_RECLAIM_GAP.md`](archive/OOM_KILL_DEFERRED_RECLAIM_GAP.md) |
 | Kernel panic `Process table full (256 slots)` | **Known OPEN item**, not a capacity limit — the slots are reclaimable zombies and `register_process` panics instead of failing the spawn: [`reference/subsystems/memory.md`](reference/subsystems/memory.md) -> "OPEN: a full process table still panics the kernel" |
@@ -78,6 +79,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | Boot / MMU / DTB | [`reference/subsystems/boot.md`](reference/subsystems/boot.md) | B |
 | Memory (PMM, heap, COW) | [`reference/subsystems/memory.md`](reference/subsystems/memory.md) | **C** |
 | Scheduler / threads | [`reference/subsystems/scheduler.md`](reference/subsystems/scheduler.md) | A |
+| Thread & thread-group lifecycle (states, teardown lock tree, eret leaves) | [`reference/subsystems/thread-lifecycle.md`](reference/subsystems/thread-lifecycle.md) | **C** |
 | SMP / multikernel | [`reference/subsystems/smp.md`](reference/subsystems/smp.md) | **C** |
 | Kernel locking (BKL + carve-outs) | [`reference/subsystems/locking.md`](reference/subsystems/locking.md) | B |
 | Networking (box model, two stacks) | [`reference/subsystems/networking.md`](reference/subsystems/networking.md) | **C** |

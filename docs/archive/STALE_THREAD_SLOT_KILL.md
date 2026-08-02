@@ -110,6 +110,9 @@ one did not.
 | `kill_fork_subtree_recursive` (`mod.rs:1254`) | **yes** — `p.thread_id = None` |
 | `kill_thread_group` PHASE 2 (`mod.rs:1181`) | **no** |
 
+(That asymmetry is real but must be left alone — `kill_thread_group` *depends* on
+`unregister_process` acting on `thread_id` as a backstop. See §5.1.)
+
 and `table::unregister_process` re-reads the field and terminates whatever it names:
 
 ```rust
@@ -205,13 +208,37 @@ Two layers, in `crates/akuma-exec`:
 2. **`process/signal.rs` — `kill_process` / `kill_process_with_signal`.** Same
    ownership re-check (`slot_still_owned_by`) before acting on the pre-yield snapshot.
 
-Plus hygiene: **`process/mod.rs` — `kill_thread_group` PHASE 2** now clears
-`p.thread_id` before unregistering, matching the other two teardown paths. PHASE 1 has
-already terminated (or requested the kill of) that thread, so there was never anything
-for PHASE 2 to terminate.
-
 Both guards log when they fire (`[unregister] pid=… stale tid=… now owned by pid=…`),
 so the race is observable rather than silent if it recurs.
+
+### 5.1 The obvious "consistency" fix is wrong — do not reapply it
+
+The tempting third change is to make `kill_thread_group` PHASE 2 clear `p.thread_id`
+before unregistering, matching the other two teardown paths in §3.2. **That was tried
+and it hung the box** (SMP=1, round 4 of the verification hammer: 99 % CPU, SSH dead,
+frozen mid-`execve(.../bin/ld)`).
+
+The reasoning that motivates it — "PHASE 1 already killed the sibling, so
+`unregister_process` has nothing left to do" — is false under `kernel_smp_shared`.
+PHASE 1 only *requests* a deferred kill, and its grace loop exits as soon as each
+sibling has **consumed** the request:
+
+```rust
+crate::threading::is_thread_terminated(tid) || !crate::threading::has_pending_kill(tid)
+```
+
+`!has_pending_kill` becomes true the moment the sibling takes the request — strictly
+*before* it marks itself TERMINATED. `unregister_process`'s terminate is the backstop
+covering that gap. Remove it and a sibling can keep running against a RETIRED
+`Process`.
+
+So the asymmetry in §3.2's table is **not** an oversight to be tidied away:
+`kill_thread_group` needs `unregister_process` to act on `thread_id`, which is exactly
+why it is the one path that must not clear it — and exactly why the guard belongs
+*inside* `unregister_process`, where it can distinguish "still the sibling's slot"
+(terminate — the backstop) from "recycled to an unrelated process" (skip). Attribution
+for the diagnosis: `stale tid=` fired **0 times** in the hung boot, proving the guard
+never engaged and the PHASE 2 edit was the only behavioural delta.
 
 ## 6. Verification
 
@@ -274,6 +301,13 @@ rebuild. That is an Akuma-side mmap/file-size issue and deserves its own chase.
   SMP=1 box badly enough that *all four* jobs blew a 330 s budget — a clean false
   positive. Contention is indistinguishable from the bug at the harness level; the tell
   is that the real bug hangs **one** job while its siblings finish normally.
+- **Distinguish the three failure shapes before drawing any conclusion.** They look
+  identical in the driver's `stuck=[…]` output and mean completely different things:
+  *(a)* one job stuck, siblings fine, VM answers SSH → the bug; *(b)* all four stuck,
+  VM answers SSH → host contention; *(c)* VM at ~100 % CPU with a **frozen serial log**
+  and no SSH → the box is unresponsive, which is a different defect entirely. Check
+  `ls -la <boot>.log` against `date` first — a log that stopped growing settles (c)
+  in one command.
 - **`LC_ALL=C` on every grep/awk over serial logs** (SMP interleaving emits invalid
   multibyte sequences).
 
