@@ -831,11 +831,36 @@ pub fn spawn_user_thread_initializing(
     let trampoline_casted = unsafe {
         core::mem::transmute::<extern "C" fn() -> !, fn(*mut ()) -> !>(trampoline_fn)
     };
-    
-    with_irqs_disabled(|| {
-        let mut pool = POOL.lock();
-        pool.spawn_user_closure_initializing(trampoline_casted, data_ptr, cooperative)
-    })
+
+    let attempt = || {
+        with_irqs_disabled(|| {
+            let mut pool = POOL.lock();
+            pool.spawn_user_closure_initializing(trampoline_casted, data_ptr, cooperative)
+        })
+    };
+
+    // On slot exhaustion, collect cooled-down terminated slots ourselves and retry
+    // once before failing — the pool is usually not exhausted, just uncollected (see
+    // `reclaim_terminated_slots`). This is the same fallback
+    // `spawn_user_thread_fn_internal` / `spawn_system_thread_fn` already do; without
+    // it, this path — every fork/vfork/clone_thread, i.e. every real pthread_create —
+    // reports EAGAIN to userspace while the slots it needs sit TERMINATED waiting for
+    // an idle loop that a busy system never reaches. A tight
+    // pthread_create/pthread_join loop failed deterministically at ~iteration 58 of
+    // 200 with MAX_THREADS=64.
+    //
+    // The reclaim must happen HERE and not inside `spawn_user_closure_initializing`:
+    // that runs with the POOL lock held, and `reclaim_terminated_slots` takes POOL
+    // itself, so calling it there would deadlock on the non-reentrant spinlock.
+    match attempt() {
+        Err("No free user thread slots") => {
+            if reclaim_terminated_slots() == 0 {
+                return Err("No free user thread slots");
+            }
+            attempt()
+        }
+        other => other,
+    }
 }
 
 impl ThreadPool {

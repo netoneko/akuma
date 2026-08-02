@@ -563,6 +563,63 @@ has. Next: apply that fix, re-run `futextest_c`/`futextest_rs` phase 2 to
 confirm it clears, then see whether it also changes the `-j4` self-host
 build's failure rate/signature.
 
+### Fixed and A/B-verified (2026-08-03)
+
+Applied, but **one level up from where the previous section pointed**. The
+retry could not go inside `ThreadPool::spawn_user_closure_initializing`
+itself: that method runs with the `POOL` lock held (its only caller takes it
+at `mod.rs:837`), and `reclaim_terminated_slots` →
+`cleanup_terminated_internal` takes `POOL` itself (`mod.rs:1202`, and again
+at `mod.rs:1245` on the size profile). Calling it from inside the method
+would have self-deadlocked on the non-reentrant spinlock. The fallback
+therefore went into the wrapper `threading::spawn_user_thread_initializing`
+(`crates/akuma-exec/src/threading/mod.rs:826-864`), which is *outside* the
+lock and is also the single funnel all three exhaustion-prone callers pass
+through — `fork_process` (`process/mod.rs:2494`), `vfork_process`
+(`process/mod.rs:2653`) and `clone_thread` (`process/mod.rs:2782`) — so one
+site covers fork, vfork and `pthread_create` alike. The shape matches
+`spawn_user_thread_fn_internal` (`mod.rs:3322-3333`) and
+`spawn_system_thread_fn` (`mod.rs:3172-3183`) exactly: miss →
+`reclaim_terminated_slots()` → retry once → still-miss → fail. Duplicated
+rather than factored into a shared helper, deliberately: the three call
+sites claim from different ranges and under different lock disciplines.
+
+A/B on one VM (`INSTANCE=1 DISK=disk_selfhost.img MEMORY=8192 SMP=4
+SNAPSHOT=0`, guest fetches the stripped static binaries over
+`curl http://10.0.2.2:<port>/…` — note this rootfs has **`curl`, not
+`wget`**, and no `scp`/SFTP):
+
+| | `FUTEXTEST_PHASE=2 /tmp/futextest_c` |
+|---|---|
+| before (HEAD as of §"Confirmed root cause") | `[2] pthread_create FAILED at iter 68: rc=11 (Resource temporarily unavailable)`, exit 1 |
+| after | `[2] ok` → `=== FUTEXTEST_C DONE — all phases passed ===`, exit 0 |
+
+The pre-fix failure iteration is **not** fixed at 58 — this session's
+baseline run on the same binary failed at **68**. It moves with how many
+slots background system threads (herd/httpd/sshd/the SSH session) hold and
+how recently they churned, which is what a collection-rate bug should look
+like; the *deterministic* part is that a 200-iteration tight loop always
+hits the wall well before 200.
+
+Full suites after the fix, both binaries, all 7 phases `ok` and exit 0:
+`/tmp/futextest_c` (pure C, musl `pthread`) and `/tmp/futextest_rs` (Rust
+`std::thread`, cross-compiled `rustc --target aarch64-unknown-linux-musl -O
+-C linker=aarch64-linux-musl-gcc userspace/selfhost_repro/futextest.rs`).
+Phases 3-7 (fan-out, mutex+condvar, barrier, wake-before-wait, park/unpark)
+were already passing before the fix and still pass — no regression in the
+futex paths from reclaiming on the spawn path.
+
+**Relationship to the two still-open bugs: still unconfirmed, and this fix
+does not close them.** Neither the `-j4`-only `SIGABRT` ("current thread
+handle already set during thread spawn") nor the lost-wakeup hang was
+re-tested here. A weak argument for a link: a spawn that returns `EAGAIN`
+and one that lands on an under-recycled slot are both symptoms of slots
+being reused/refused under churn, and this path is now the one that
+*reclaims* before spawning. A stronger argument against: `EAGAIN` is a clean
+`Result::Err` that never constructs a thread at all, whereas both open bugs
+involve a thread that *did* start and then observed inconsistent state. Treat
+them as independent until a `-j4` run says otherwise.
+
 ## Reproducing this session end-to-end
 
 ```bash
