@@ -455,6 +455,7 @@ pub fn run_all_tests() {
     test_fork_preserves_parent_cwd();
     // execve preserves CWD (replace_image doesn't reset it)
     test_execve_preserves_cwd();
+    test_execve_no_heap_leak();
     // wait status encoding (exit code vs signal kill)
     test_encode_wait_status_clean_exit();
     test_encode_wait_status_signal_kill();
@@ -11045,6 +11046,77 @@ fn test_fork_preserves_parent_cwd() {
     } else {
         crate::safe_print!(128, "[Test] fork_preserves_parent_cwd FAILED: cwd={} resolved={}\n",
             child_cwd, resolved);
+    }
+}
+
+/// Regression test for the execve stack leak
+/// (docs/archive/EXECVE_STACK_LEAK_OOM_HANG.md): a successful execve ends in
+/// `enter_user_mode`'s eret, which abandons the syscall stack without running
+/// destructors — the whole-file ELF buffer (~1.1 MB for busybox) plus argv/env
+/// leaked on every exec until `do_execve` learned to drop them first.
+///
+/// `sh -c '/bin/busybox true'` makes sh EXECVE busybox (the one-command exec
+/// optimization), so each cycle is a real execve of a >1 MB image. Eight
+/// leaked cycles would pin ≥8 MB of kernel heap; the 4 MB pass threshold has
+/// ample headroom above post-warmup noise (ext2 cache, retired bookkeeping).
+fn test_execve_no_heap_leak() {
+    if crate::fs::read_file("/bin/busybox").is_err() {
+        console::print("[Test] execve_no_heap_leak SKIPPED (no /bin/busybox)\n");
+        return;
+    }
+    let args: &[&str] = &["sh", "-c", "/bin/busybox true"];
+    let run_one = |label: &str| -> bool {
+        match process::spawn_process_with_channel("/bin/busybox", Some(args), None) {
+            Ok((_t, ch, _p)) => {
+                let start = crate::timer::uptime_us();
+                while !ch.has_exited() {
+                    if crate::timer::uptime_us().saturating_sub(start) > 10_000_000 {
+                        crate::safe_print!(96,
+                            "[Test] execve_no_heap_leak FAILED ({} cycle did not exit in 10s)\n", label);
+                        return false;
+                    }
+                    akuma_exec::threading::yield_now();
+                    akuma_exec::threading::idle_halt();
+                }
+                true
+            }
+            Err(e) => {
+                crate::safe_print!(96, "[Test] execve_no_heap_leak SKIPPED (spawn failed: {})\n", e);
+                false
+            }
+        }
+    };
+    // Deferred teardown parks memory (RETIRED slots, terminated thread slots);
+    // force-drive it so the measurement sees only genuinely live bytes — same
+    // discipline as the PMM boot-suite tests (boot_suite_deferred_reclaim).
+    let settle = || {
+        for _ in 0..20 { akuma_exec::threading::yield_now(); }
+        akuma_exec::threading::cleanup_terminated_force();
+        akuma_exec::process::table::reclaim_retired_processes_force();
+    };
+
+    // Warm-up execs grow caches and the heap watermark; not part of the measurement.
+    for _ in 0..2 {
+        if !run_one("warmup") { return; }
+    }
+    settle();
+    let before = crate::allocator::allocated_bytes();
+
+    const CYCLES: usize = 8;
+    for _ in 0..CYCLES {
+        if !run_one("measured") { return; }
+    }
+    settle();
+    let after = crate::allocator::allocated_bytes();
+
+    let grown = after.saturating_sub(before);
+    if grown < 4 * 1024 * 1024 {
+        crate::safe_print!(128, "[Test] execve_no_heap_leak PASSED ({} execs, heap +{} KB)\n",
+            CYCLES, grown / 1024);
+    } else {
+        crate::safe_print!(160,
+            "[Test] execve_no_heap_leak FAILED (heap +{} KB over {} execs = {} KB/exec — execve frame leaking again?)\n",
+            grown / 1024, CYCLES, grown / 1024 / CYCLES);
     }
 }
 

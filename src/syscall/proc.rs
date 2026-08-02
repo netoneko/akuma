@@ -652,7 +652,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     // Read just the first 256 bytes — enough for shebang detection — and
     // use the path-based loader for the actual ELF.
     #[cfg(kernel_profile_size)]
-    let file_data: Option<alloc::vec::Vec<u8>> = {
+    let mut file_data: Option<alloc::vec::Vec<u8>> = {
         let mut head = alloc::vec![0u8; 256];
         match crate::fs::read_at(&resolved_path, 0, &mut head) {
             Ok(n) => { head.truncate(n); Some(head) }
@@ -667,7 +667,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     // `curl`) has no local VFS — forward the whole-file read to the owner. `/proc`/`/dev` (and
     // the non-smp / BSP case) take the normal local read.
     #[cfg(all(not(kernel_profile_size), kernel_smp))]
-    let file_data = if crate::smp::is_on_secondary()
+    let mut file_data = if crate::smp::is_on_secondary()
         && !resolved_path.starts_with("/proc") && !resolved_path.starts_with("/dev")
     {
         let Ok(data) = crate::smp::secondary_forward_read_file(&resolved_path) else {
@@ -686,7 +686,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
         }
     };
     #[cfg(all(not(kernel_profile_size), not(kernel_smp)))]
-    let file_data = {
+    let mut file_data = {
         // M5c hold-shortening: DROP the BKL around the whole-file ELF read so peer cores can
         // enter the kernel while this core waits on disk (execve's dominant BKL-held window).
         // Safe: this runs before `replace_image` touches the process, and the read goes only
@@ -711,10 +711,13 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
         }
     };
 
-    if let Some(ref data) = file_data
-        && data.len() >= 2 && data[0] == b'#' && data[1] == b'!' {
-            return exec_shebang(&resolved_path, data, args, env);
-        }
+    if file_data.as_ref().is_some_and(|d| d.len() >= 2 && d[0] == b'#' && d[1] == b'!') {
+        // Owned handoff: exec_shebang frees the script bytes (and the original
+        // argv) BEFORE recursing into do_execve — the inner exec's eret abandons
+        // every frame below it, so nothing big may still be owned here.
+        let data = file_data.take().unwrap_or_default();
+        return exec_shebang(resolved_path, data, args, env);
+    }
 
     let cur_pid = match akuma_exec::process::current_pid() {
         Some(p) => p,
@@ -724,7 +727,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     // On the size profile file_data only holds the 256-byte shebang probe —
     // always use replace_image_from_path for the actual ELF load.
     #[cfg(kernel_profile_size)]
-    let file_data: Option<alloc::vec::Vec<u8>> = None;
+    let mut file_data: Option<alloc::vec::Vec<u8>> = None;
 
     // Resolve the on-demand load's file size before entering the exclusive
     // window so the stat-failure early return stays outside it.
@@ -745,9 +748,16 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     // `&mut`-exclusive (Phase 7f owns converting it). No other Process
     // reference is live on this thread.
     let ret = unsafe {
-        akuma_exec::process::with_process_exclusive(cur_pid, |proc| {
-    let replace_result = if let Some(ref data) = file_data {
-        proc.replace_image(data, &args, &env)
+        akuma_exec::process::with_process_exclusive(cur_pid, move |proc| {
+    let replace_result = if let Some(data) = file_data.take() {
+        let r = proc.replace_image(&data, &args, &env);
+        // Free the whole-file image buffer HERE, success or failure. The
+        // enter_user_mode below erets to EL0 and never returns, so any heap
+        // still owned by this frame at that point is leaked kernel heap —
+        // this exact leak (~1.1 MB per `busybox sh` execve) ratcheted the
+        // heap into the [OOM] wall under exec-heavy load (the rustc hammer).
+        drop(data);
+        r
     } else {
         proc.replace_image_from_path(&resolved_path, file_size, &args, &env)
     };
@@ -801,6 +811,14 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
         crate::safe_print!(128, "[syscall] execve: replaced image for PID {} with {}\n", proc.pid, resolved_path);
     }
 
+    // This frame is abandoned by the eret below (enter_user_mode never
+    // returns), so destructors will not run: explicitly free every heap
+    // local the closure still owns. args/env were last used by
+    // replace_image*; resolved_path by the name/debug lines above.
+    drop(args);
+    drop(env);
+    drop(resolved_path);
+
     // Wake any CLONE_VFORK parent that was blocked waiting for this exec.
     // Must happen before enter_user_mode (which never returns).
     let pid = proc.pid;
@@ -817,12 +835,17 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     ret.unwrap_or(ESRCH)
 }
 
-fn exec_shebang(script_path: &str, file_data: &[u8], original_args: Vec<String>, env: Vec<String>) -> u64 {
+fn exec_shebang(script_path: String, file_data: Vec<u8>, original_args: Vec<String>, env: Vec<String>) -> u64 {
+    // Parse everything we need out of `file_data` into OWNED strings first:
+    // this function recurses into do_execve, whose successful exec erets and
+    // abandons every frame below it — so the script bytes and the original
+    // argv must be freed BEFORE the recursion, not after it "returns".
     let line_end = file_data.iter().position(|&b| b == b'\n').unwrap_or_else(|| file_data.len().min(256));
-    let shebang_line = if let Ok(s) = core::str::from_utf8(&file_data[2..line_end]) { s.trim() } else {
+    let Ok(shebang_line) = core::str::from_utf8(&file_data[2..line_end]) else {
         crate::safe_print!(128, "[syscall] execve: invalid shebang in {}\n", script_path);
         return ENOENT;
     };
+    let shebang_line = shebang_line.trim();
 
     if shebang_line.is_empty() {
         crate::safe_print!(128, "[syscall] execve: empty shebang in {}\n", script_path);
@@ -830,14 +853,15 @@ fn exec_shebang(script_path: &str, file_data: &[u8], original_args: Vec<String>,
     }
 
     let (interpreter, shebang_arg) = match shebang_line.split_once(char::is_whitespace) {
-        Some((interp, arg)) => (interp.trim(), Some(arg.trim())),
+        Some((interp, arg)) => (interp.trim(), Some(String::from(arg.trim()))),
         None => (shebang_line, None),
     };
 
     let interpreter = crate::vfs::resolve_symlinks(interpreter);
+    drop(file_data); // last borrow (shebang_line) ended above
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        if let Some(arg) = shebang_arg {
+        if let Some(ref arg) = shebang_arg {
             crate::safe_print!(128, "[syscall] execve: shebang {} {} {}\n", interpreter, arg, script_path);
         } else {
             crate::safe_print!(128, "[syscall] execve: shebang {} {}\n", interpreter, script_path);
@@ -848,12 +872,13 @@ fn exec_shebang(script_path: &str, file_data: &[u8], original_args: Vec<String>,
     new_args.push(interpreter.clone());
     if let Some(arg) = shebang_arg
         && !arg.is_empty() {
-            new_args.push(String::from(arg));
+            new_args.push(arg);
         }
-    new_args.push(String::from(script_path));
+    new_args.push(script_path);
     if original_args.len() > 1 {
         new_args.extend_from_slice(&original_args[1..]);
     }
+    drop(original_args);
 
     do_execve(interpreter, new_args, env)
 }
