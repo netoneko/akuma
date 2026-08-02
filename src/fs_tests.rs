@@ -473,20 +473,22 @@ fn test_rename_operations() -> bool {
 // ============================================================================
 
 /// Verify every FsError variant maps to the correct Linux errno.
-/// Critically: only PermissionDenied should map to EPERM.
+/// Critically: nothing maps to EPERM — filesystem permission denial is EACCES
+/// on Linux (EPERM is reserved for ownership/privilege checks, which the VFS
+/// layer doesn't surface through FsError). Conformance change: f5f7196.
 fn test_fs_error_to_errno_mapping() -> bool {
     use crate::vfs::FsError;
 
     log("[FS Tests] Test: fs_error_to_errno_mapping\n");
 
     // Linux errno values (negated, as u64)
-    let eperm: u64 = (-1i64) as u64;
     let enoent: u64 = (-2i64) as u64;
     let eio: u64 = (-5i64) as u64;
     let eexist: u64 = (-17i64) as u64;
     let enotdir: u64 = (-20i64) as u64;
     let eisdir: u64 = (-21i64) as u64;
     let einval: u64 = (-22i64) as u64;
+    let eacces: u64 = (-13i64) as u64;
     let emfile: u64 = (-24i64) as u64;
     let enospc: u64 = (-28i64) as u64;
     let erofs: u64 = (-30i64) as u64;
@@ -494,7 +496,7 @@ fn test_fs_error_to_errno_mapping() -> bool {
 
     let cases: &[(FsError, u64, &str)] = &[
         (FsError::NotFound, enoent, "NotFound -> ENOENT"),
-        (FsError::PermissionDenied, eperm, "PermissionDenied -> EPERM"),
+        (FsError::PermissionDenied, eacces, "PermissionDenied -> EACCES"),
         (FsError::AlreadyExists, eexist, "AlreadyExists -> EEXIST"),
         (FsError::NotADirectory, enotdir, "NotADirectory -> ENOTDIR"),
         (FsError::NotAFile, eisdir, "NotAFile -> EISDIR"),

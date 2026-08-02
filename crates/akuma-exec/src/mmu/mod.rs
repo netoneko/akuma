@@ -354,6 +354,28 @@ struct SharedL0Entry {
 static SHARED_L0_TABLE: Spinlock<BTreeMap<usize, SharedL0Entry>> =
     Spinlock::new(BTreeMap::new());
 
+/// Diagnostics: (entries, deferred user frames, deferred page-table frames)
+/// currently parked in `SHARED_L0_TABLE`. A non-zero deferred count with no
+/// live threads means an owner died while a shared view leaked — those frames
+/// are stranded until the view drops. Boot-suite PMM-conservation tests use
+/// this to tell "frames parked here" apart from a genuine PMM leak.
+pub fn shared_l0_stats() -> (usize, usize, usize) {
+    with_irqs_disabled(|| {
+        let table = SHARED_L0_TABLE.lock();
+        let mut deferred_user = 0usize;
+        let mut deferred_pt = 0usize;
+        for e in table.values() {
+            if let Some(uf) = &e.deferred_user_frames {
+                deferred_user += uf.len();
+            }
+            if let Some(pf) = &e.deferred_pt_frames {
+                deferred_pt += pf.len();
+            }
+        }
+        (table.len(), deferred_user, deferred_pt)
+    })
+}
+
 pub struct UserAddressSpace {
     l0_frame: PhysFrame,
     page_table_frames: Spinlock<Vec<PhysFrame>>,
