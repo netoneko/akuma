@@ -15,6 +15,20 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   canaried over every faulting touch).
 - `neonfault` — data integrity of NEON loads that cross a page boundary into an
   unmapped demand-paged page (the quantized-GEMM access shape).
+- `futextest` — pthread/futex behaviour in 7 phases (spawn+join, tight
+  spawn/join loop, fan-out, mutex+condvar, barrier, wake-before-wait,
+  park/unpark). Pure-C control for `userspace/selfhost_repro/futextest.rs`:
+  run both to tell a kernel-level thread/futex bug (fails in *both*) from a
+  Rust-runtime one (fails only in the Rust binary). Phase 2 is the regression
+  test for the 2026-08-03 `clone_thread` slot-reclaim fix.
+- `futexops` — probes `sys_futex` op-by-op against Linux semantics
+  (`FUTEX_WAKE_OP`'s `uaddr2` write and second wake, `WAKE_BITSET`
+  selectivity, a bad `timeout` pointer, and a requeued waiter that times out).
+  Prints PASS/FAIL per probe. **Calibrate it by running the same binary on
+  real Linux** — every FAIL there means the probe is wrong, not the kernel:
+  `docker run --rm --platform linux/arm64 -v "$PWD/futexops:/futexops:ro" alpine /futexops`.
+  As of 2026-08-03: 5 FAIL on Akuma, 5 PASS on Linux — see
+  `docs/reference/subsystems/syscalls/sync.md` §"Known divergences from Linux".
 
 ## Build (host)
 

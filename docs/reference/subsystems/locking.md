@@ -613,9 +613,11 @@ is the deferred collector: it frees a RETIRED slot only after
 generous relative to the bounded I/O-or-PTE-chunk windows it needs to outlast —
 called periodically from `netpoll_maint` (100ms cadence, mirroring
 `threading::reclaim_terminated_slots`). **Deliberately not** called on-demand
-from `register_process` on a full-table miss, unlike
-`spawn_user_thread_fn_internal`'s `reclaim_terminated_slots` retry-once
-pattern this was originally modeled on: `register_process` is reachable from
+from `register_process` on a full-table miss, unlike the spawn paths'
+`reclaim_terminated_slots` retry-once pattern this was originally modeled on
+(`spawn_user_thread_fn_internal`, `spawn_system_thread_fn`, and since
+2026-08-03 `spawn_user_thread_initializing` too — see
+[`thread-lifecycle.md`](thread-lifecycle.md) §2.1): `register_process` is reachable from
 deep inside fork/clone/spawn, whose lock context it doesn't control, and
 `Process` teardown (`Box::drop` → `UserAddressSpace::drop`) needs its own
 locks (page-table frame free, ASID release) — unlike a thread slot's plain

@@ -59,7 +59,7 @@ Lock legend: **M** = acquisition wrapped in `with_irqs_disabled`/`IrqGuard`;
 
 | Edge | Entry points | Locks taken (in order) | Notes |
 |---|---|---|---|
-| spawn thread | `spawn_user_thread_initializing`, `spawn_*_fn` | `POOL` M | stack alloc from PMM **inside** the `POOL` hold (`threading/mod.rs:754,870`) |
+| spawn thread | `spawn_user_thread_initializing`, `spawn_*_fn` | `POOL` M | stack alloc from PMM **inside** the `POOL` hold (`threading/mod.rs:754,895`); slot-exhaustion reclaim-retry sits **outside** it — see §2.1 |
 | clone thread | `clone_thread` | `THREAD_PID_MAP` M; `LAZY_REGION_TABLE` M | P held across the whole clone incl. **raw user writes** of parent/child tid (`process/mod.rs:2799,2803`) |
 | fork | `fork_process` | `THREAD_PID_MAP` M; `SHARED_L0_TABLE` M | `SHARED_L0_TABLE` insert **allocates under the lock** (`mmu/mod.rs:421-430`) |
 | execve | `do_execve` → `replace_image*` → `enter_user_mode` | VFS/ext2/block (BKL-dropped window); `as_lock` via exclusive access | **eret leaf** — see §4. Frame abandoned on success |
@@ -72,6 +72,42 @@ Lock legend: **M** = acquisition wrapped in `with_irqs_disabled`/`IrqGuard`;
 | retired reclaim | `reclaim_retired_processes` | none in sweep | `drop(Box<Process>)` = the whole §3 tree |
 | pressure drain | `drain_retired_under_pressure` (from `alloc_page_zeroed_user`) | same as reclaim | ambient context = **whatever faulted** — see §5.2 |
 | scheduler (IRQ) | `sgi_scheduler_handler_with_sp` | `POOL` **try_lock** M | never blocks; no other subsystem lock reachable from IRQ context |
+
+### 2.1 Every spawn path reclaims before it reports exhaustion (2026-08-03)
+
+A `FREE`-slot scan that misses does **not** mean the pool is full — far more
+often the slots are `TERMINATED` and simply uncollected, because deferred
+cleanup's steady-state collector is thread 0's *idle* loop, which a busy system
+never reaches (`BKL_VFS_CARVE_OUT.md` §11.4: p50 24 s, max 192 s uncollected
+against a 10 ms cooldown). Every spawn entry point therefore does **miss →
+`reclaim_terminated_slots()` → retry once → still-miss → fail**:
+
+| Entry point | Site | Claims from |
+|---|---|---|
+| `spawn_user_thread_fn_internal` | `threading/mod.rs:3347` | `reserved_threads..thread_limit()` |
+| `spawn_system_thread_fn` | `threading/mod.rs:3197` | `1..reserved_threads` |
+| `spawn_user_thread_initializing` | `threading/mod.rs:826-864` | `reserved_threads..thread_limit()` |
+
+The third was added 2026-08-03 and is the one that covers **fork, vfork and
+`clone_thread`** — i.e. every real `pthread_create` — since all three funnel
+through it (`process/mod.rs:2494,2653,2782`). Until then that path had a single
+linear scan and returned `EAGAIN` straight to userspace: a tight, correctly
+`pthread_join`ed 200× `pthread_create` loop died at iteration ~58-68 of 200 with
+`MAX_THREADS = 64`, while most of the pool sat `TERMINATED`.
+
+**Placement is forced by the lock, not style.** The retry cannot live inside
+`ThreadPool::spawn_user_closure_initializing` where the scan is: that method
+runs with `POOL` held (`threading/mod.rs:837`), and `reclaim_terminated_slots`
+→ `cleanup_terminated_internal` takes `POOL` itself (`:1227`, again at `:1270`
+on the size profile). It has to go in the wrapper, outside the hold. This is the
+thread-slot echo of the `register_process` rule in
+[`locking.md`](locking.md#no-bkl-process): on-demand reclaim is safe exactly
+where the caller controls its own lock context.
+
+> ⚠ **Untested by the boot suite.** `test_thread_slot_reclaim_on_spawn`
+> (`src/process_tests.rs:1273`) drives `spawn_user_thread_fn`, i.e. only the
+> `_fn_internal` row. The `_initializing` row is covered only by the userspace
+> repro (`userspace/forktest/c_stress/futextest.c` phase 2).
 
 ## 3. The `drop(Box<Process>)` lock tree (teardown leaf)
 

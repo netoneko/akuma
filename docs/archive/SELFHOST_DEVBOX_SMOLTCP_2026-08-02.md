@@ -335,6 +335,99 @@ the same code path.
 
 **Status: open, not yet root-caused, and NOT the same bug as either the
 `LAZY_REGION_TABLE` spin (fixed) or the `-j4` thread-spawn `SIGABRT` above.**
+
+### Futex audit: five confirmed Linux divergences, one of them a real lost-wakeup generator (2026-08-03)
+
+A direct audit of `sys_futex` against Linux semantics, driven by a new probe
+(`userspace/forktest/c_stress/futexops.c`). Method matters here: the **same
+stripped static binary** was run on Akuma and on real Linux aarch64
+(`docker run --rm --platform linux/arm64 … alpine /futexops`). It scores
+**5 FAIL on Akuma, 5 PASS on Linux**, so every finding below is a measured
+divergence, not a claim about what Linux "ought" to do. Full table and
+citations now live in the current-state reference,
+[`docs/reference/subsystems/syscalls/sync.md`](../reference/subsystems/syscalls/sync.md)
+§"Known divergences from Linux".
+
+**Two corrections to the reading of the `[THR-DUMP]` evidence above, before
+the findings.** Both were my own initial misreads, caught while checking them:
+
+1. `a1=0x89` is `FUTEX_WAIT_BITSET|PRIVATE`, and I first took that to mean
+   tid=32 held a *timeout* that never fired — which would have been a damning
+   anomaly on its own. It isn't: **Rust std always emits `FUTEX_WAIT_BITSET`,
+   passing a NULL timespec when the wait is untimed.** So `0x89` says nothing
+   about whether a timeout was set, and both stuck threads are plausibly plain
+   untimed waits. No failed-timeout anomaly to explain.
+2. The identical `elr=0x30060cc4` across a `0x80` waiter and a `0x89` waiter
+   does **not** mean both came from the same library. On a static musl link
+   both Rust std's raw `syscall()` and musl's internal futex calls funnel
+   through the same `svc` trampoline, so one PC is expected.
+
+**What was ruled OUT** (checked in code, all sound — recording so the next
+pass doesn't re-walk them):
+
+- *The wake never targeting the right bucket.* `read_current_pid` resolves
+  tid → pid → **tgid** (`process/children.rs:286-291`), so private-futex keys
+  really are tgid-scoped. (One caveat, below.)
+- *The enqueue → park race.* `ThreadWaker::wake` sets the sticky
+  `WOKEN_STATES[tid]` **unconditionally**, before and independently of the
+  `WAITING` check (`threading/mod.rs:2810-2837`), and `schedule_blocking`
+  consumes it on entry (`:2917`). A wake landing in the window between
+  `futex_check_and_enqueue` and the park is not lost.
+- *Timed waits never being re-readied.* The scheduler's wake-pass runs on
+  **every** scheduler entry, including preempt-disabled timer entries, and
+  readies any `WAITING` thread whose deadline passed
+  (`threading/mod.rs:2059-2071`).
+
+**The finding that matters — one-sided requeue bookkeeping.**
+`futex_requeue_table` moves a waiter's tid from `key1`'s queue into `key2`'s
+(`sync.rs:144-168`), but the waiting thread's loop only ever checks/removes
+itself from the key it *originally* waited on (`key`, a local from
+`sync.rs:266`; membership check at `:341-352`). After a requeue those disagree,
+so any loop exit other than "drained by a wake on `key2`" strands the tid in
+`key2`'s queue **permanently**. Measured directly: after the requeued waiter
+timed out *and had been `pthread_join`ed*, `FUTEX_WAKE(key2, 1)` still reported
+**1 woken** — the kernel counted a dead tid as the wake's recipient. Linux
+reports 0. The probe also caught a second symptom of the same defect: the
+requeued waiter's timeout returns **0 (success), not `ETIMEDOUT`**, because it
+finds itself absent from its original key and concludes it was genuinely woken.
+
+Why this one is the plausible candidate for the `typenum` stall, stated with
+its limits: it is the only one of the five on a path ordinary musl userspace
+takes constantly (`pthread_cond_broadcast` *is* `FUTEX_REQUEUE`;
+`pthread_cond_timedwait` supplies the timeout that does the stranding), it
+**accumulates** over a process's lifetime, and its signature is precisely
+"thread parked forever on a wake the kernel already counted as delivered."
+rustc links LLVM, whose C++ condvars go through musl's pthread_cond.
+
+**But it is NOT proven to be what hit pid 137, and I did not prove it.** The
+stall was not reproduced under this hypothesis; no `[futex-dbg]` trace was
+captured from a stalled build; and rustc's *own* Rust-level condvars use raw
+futex, not pthread_cond, so the requeue path is reached only via its C/C++
+dependencies. Treat it as the best-supported lead, not the root cause. The
+decisive next experiment is cheap: rebuild with `FUTEX_DBG_ENABLED`, reproduce
+the `-j4` stall, and check whether a `REQUEUE` precedes the stranded address —
+or instrument `futex_do_wake` to count wakes delivered to tids that are not in
+`WAITING`, which would make stale-entry consumption self-reporting.
+
+**On "all three bugs are connected":** partly, and less than it looks.
+The slot-reclaim bug fixed above and these futex gaps are independent defects
+in different subsystems — the fix for one does not touch the other. What *is*
+shared is the aggravating condition: `-j4` drives thread churn, which drives
+both slot pressure and condvar broadcast/timeout traffic, so both get more
+reachable at once. The genuinely suspicious overlap is narrower: divergence #3
+(an unreadable timespec silently becoming an *infinite* wait, `sync.rs:283`)
+is reachable **under memory pressure**, because `validate_user_ptr`
+demand-pages through `ensure_user_pages_mapped`. That turns a transient
+allocation failure into a permanently parked thread — the same "transient
+condition, permanent symptom" shape as the slot starvation, and worth ruling
+in or out on any repro that also shows `[OOM]`/`[HEAP-GROW]` lines.
+
+**One unprobed sharp edge, flagged not fixed:** `futex_key_tgid` →
+`read_current_pid()` ends in `.unwrap_or(pid)` (`process/children.rs:290`). A
+failed process-table lookup silently degrades the futex key from tgid to the
+thread's own pid — waiter and waker would key different buckets, which is
+exactly the stranding class the sync.md Stability note already warns about. Not
+observed; called out because the fallback is silent rather than an error.
 Three separate failure signatures are now in play from this one `-j4`
 self-host attempt:
 1. `LAZY_REGION_TABLE` alloc-under-lock — **fixed**, 100%-CPU spin signature.

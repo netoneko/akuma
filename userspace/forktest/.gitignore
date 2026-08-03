@@ -8,3 +8,4 @@ c_stress/fpfault
 c_stress/neonfault
 c_stress/mmapsum
 c_stress/futextest
+c_stress/futexops

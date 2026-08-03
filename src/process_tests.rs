@@ -165,6 +165,10 @@ pub fn run_all_tests() {
     // collect cooled-down terminated slots itself instead of reporting ENOMEM.
     test_thread_slot_reclaim_on_spawn();
 
+    // Same contract, other entry point: the one fork/vfork/clone_thread use, i.e. every
+    // real pthread_create. It had no reclaim retry until 2026-08-03 and returned EAGAIN.
+    test_thread_slot_reclaim_on_spawn_initializing();
+
     // Real (shared-kernel) SMP M5c step-2 regression: a kernel thread that exec's an EL0
     // child and cooperatively waits for it must NOT hold the BKL across the wait, or the
     // BKL-free EL0-preempt scheduler lets a peer strand the child -> cross-core deadlock.
@@ -1368,6 +1372,109 @@ fn test_thread_slot_reclaim_on_spawn() {
         crate::safe_print!(224,
             "[Test] thread_slot_reclaim_on_spawn FAILED: hot_reclaim={} (want 0) respawn_ok={} gated_from_other_thread={} (want 0)\n",
             reclaimed_hot, respawn_ok, gated);
+    }
+}
+
+/// Body for the `spawn_user_thread_initializing` probe below. It is never scheduled —
+/// the spawn deliberately leaves the slot INITIALIZING and the test terminates it
+/// without calling `mark_thread_ready` — but a spawn entry point needs a real fn
+/// pointer, and if the contract ever changed this body must still be safe to run:
+/// terminate self, then park like the fill threads do.
+extern "C" fn reclaim_probe_never_ready() -> ! {
+    let my_tid = akuma_exec::threading::current_thread_id();
+    akuma_exec::threading::mark_thread_terminated(my_tid);
+    loop {
+        akuma_exec::threading::yield_now();
+    }
+}
+
+/// The same reclaim-on-exhaustion contract as `test_thread_slot_reclaim_on_spawn`, for
+/// the OTHER spawn entry point: `threading::spawn_user_thread_initializing`.
+///
+/// That test covers `spawn_user_thread_fn` → `spawn_user_thread_fn_internal`, which has
+/// had the reclaim-then-retry fallback since `BKL_VFS_CARVE_OUT.md` §11.4. The fallback
+/// was never applied to `spawn_user_thread_initializing`, which is the path
+/// `fork_process`/`vfork_process`/`clone_thread` all funnel through
+/// (`process/mod.rs:2494,2653,2782`) — i.e. every real `pthread_create`. Until
+/// 2026-08-03 it did a single linear scan and handed `EAGAIN` straight to userspace: a
+/// tight, correctly-`pthread_join`ed 200x `pthread_create` loop died around iteration
+/// 58-68 of 200 with `MAX_THREADS = 64` while most of the pool sat TERMINATED
+/// (`docs/archive/SELFHOST_DEVBOX_SMOLTCP_2026-08-02.md`, repro
+/// `userspace/forktest/c_stress/futextest.c` phase 2).
+///
+/// The discriminator is `free_at_spawn == 0`: with no FREE slot left in the user range,
+/// an `Ok` can only come from the spawn path reclaiming cooled-down TERMINATED slots
+/// itself. If something else collected them first the outcome proves nothing, so the
+/// test reports INCONCLUSIVE rather than a false PASS.
+fn test_thread_slot_reclaim_on_spawn_initializing() {
+    // Baseline: reclaim anything already pending so the counts below are ours.
+    akuma_exec::threading::cleanup_terminated_force();
+    let free_before = akuma_exec::threading::user_threads_available();
+    if free_before < 4 {
+        crate::safe_print!(144,
+            "[Test] thread_slot_reclaim_on_spawn_initializing SKIPPED: only {} free user slots\n",
+            free_before);
+        return;
+    }
+
+    // Fill the pool exactly as the sibling test does: every spawned thread marks itself
+    // terminated immediately, so each slot ends up TERMINATED-but-occupied — and, being
+    // freshly terminated, inside its cooldown and so not yet reclaimable.
+    let mut spawned = 0usize;
+    while spawned <= free_before + 8
+        && akuma_exec::threading::spawn_user_thread_fn(|| {
+            let my_tid = akuma_exec::threading::current_thread_id();
+            akuma_exec::threading::mark_thread_terminated(my_tid);
+            loop {
+                akuma_exec::threading::yield_now();
+            }
+        })
+        .is_ok()
+    {
+        spawned += 1;
+    }
+    // Let every spawned thread run far enough to mark itself terminated.
+    for _ in 0..64 {
+        akuma_exec::threading::yield_now();
+    }
+
+    // Burn past the cooldown so the filled slots become reclaimable.
+    let deadline = crate::timer::uptime_us() + 200_000; // 200ms >> 10ms cooldown
+    while crate::timer::uptime_us() < deadline {
+        akuma_exec::threading::yield_now();
+    }
+
+    let free_at_spawn = akuma_exec::threading::user_threads_available();
+    let spawn = akuma_exec::threading::spawn_user_thread_initializing(
+        reclaim_probe_never_ready,
+        core::ptr::null_mut(),
+        false,
+    );
+
+    // Hand the probe's slot back without ever scheduling it. The spawn leaves it
+    // INITIALIZING (that is the whole point of this entry point — the caller marks it
+    // READY once the address space is set up), so nothing has run on it and the
+    // TERMINATED → cooldown → free path is the clean way to release it.
+    if let Ok(tid) = spawn {
+        akuma_exec::threading::mark_thread_terminated(tid);
+    }
+
+    // Leave the pool clean for the tests that follow.
+    for _ in 0..64 {
+        akuma_exec::threading::yield_now();
+    }
+    akuma_exec::threading::cleanup_terminated_force();
+
+    match (free_at_spawn, spawn) {
+        (0, Ok(_)) => crate::safe_print!(176,
+            "[Test] thread_slot_reclaim_on_spawn_initializing PASSED (filled {} slots, 0 free at spawn, spawn reclaimed)\n",
+            spawned),
+        (0, Err(e)) => crate::safe_print!(208,
+            "[Test] thread_slot_reclaim_on_spawn_initializing FAILED: spawn refused with \"{}\" instead of reclaiming (filled {} slots)\n",
+            e, spawned),
+        (n, _) => crate::safe_print!(208,
+            "[Test] thread_slot_reclaim_on_spawn_initializing INCONCLUSIVE: {} slots already free at spawn, nothing forced a reclaim (filled {})\n",
+            n, spawned),
     }
 }
 
