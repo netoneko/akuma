@@ -1452,20 +1452,34 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     // Verify the page is actually mapped before writing — the address may
     // point to a lazily-mapped page that was never faulted in, and writing
     // from EL1 won't trigger demand paging (only EL0 faults do).
+    //
+    // Deliberately NOT gated on `!already_terminated`, unlike the robust-list walk
+    // below. A thread killed from outside (`kill_thread_group`, a fault-kill, a
+    // consumed `PENDING_KILL`) is exactly the case that needs this most: it never ran
+    // its own exit epilogue, so the *only* thing that can release what it held is the
+    // kernel. musl leans on this directly — `pthread_create` passes
+    // `&__thread_list_lock` (a `libc.bss` global) as the `CLONE_CHILD_CLEARTID` word,
+    // so the kernel's store+wake here IS how the thread-list lock is released on
+    // thread exit. Skipping it leaves that lock owned by a dead tid, and every
+    // subsequent `pthread_create`/`pthread_exit` in the process parks in `__tl_lock`
+    // forever — one killed thread wedges the whole process, with the futex table
+    // showing a perfectly ordinary, correctly-queued waiter.
+    if let Some(proc) = lookup_process_shared(pid.unwrap_or(0)) {
+        let tid_addr = proc.clear_child_tid;
+        if tid_addr != 0 {
+            if crate::mmu::is_current_user_page_mapped(tid_addr as usize) {
+                unsafe { core::ptr::write(tid_addr as *mut u32, 0); }
+            }
+            // Wake pthread_join waiters regardless of whether the page was
+            // mappable: futex_wake reads the kernel waiter table, not user
+            // memory, and a joiner must be woken even if we couldn't zero the
+            // word (else join() futex-waits forever).
+            (runtime().futex_wake)(proc.tgid, tid_addr as usize, i32::MAX);
+        }
+    }
+
     if !already_terminated {
         if let Some(proc) = lookup_process_shared(pid.unwrap_or(0)) {
-            let tid_addr = proc.clear_child_tid;
-            if tid_addr != 0 {
-                if crate::mmu::is_current_user_page_mapped(tid_addr as usize) {
-                    unsafe { core::ptr::write(tid_addr as *mut u32, 0); }
-                }
-                // Wake pthread_join waiters regardless of whether the page was
-                // mappable: futex_wake reads the kernel waiter table, not user
-                // memory, and a joiner must be woken even if we couldn't zero the
-                // word (else join() futex-waits forever).
-                (runtime().futex_wake)(proc.tgid, tid_addr as usize, i32::MAX);
-            }
-
             // Robust futex list cleanup: walk the list and mark owned futexes
             // with FUTEX_OWNER_DIED so waiters don't deadlock.
             let robust_head = proc.robust_list_head;

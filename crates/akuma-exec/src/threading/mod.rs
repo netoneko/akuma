@@ -833,6 +833,10 @@ static TERMINATION_TIME: [AtomicU64; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
+/// Cross-thread terminations seen so far; rate-limits the tracer in
+/// [`mark_thread_terminated`].
+static CROSS_KILLS: AtomicUsize = AtomicUsize::new(0);
+
 /// Mark a thread as terminated (lock-free)
 pub fn mark_thread_terminated(idx: usize) {
     if idx != IDLE_THREAD_IDX && idx < MAX_THREADS {
@@ -840,6 +844,25 @@ pub fn mark_thread_terminated(idx: usize) {
         // is killing a thread that may since have been recycled to an unrelated
         // process. Prints the victim's owning pid and its live state so a
         // "process survives with no thread" hang can be attributed to its killer.
+        //
+        // A thread killed from outside never runs its own exit epilogue, so anything
+        // only *its* userspace publishes is lost — most visibly musl's
+        // `pthread_join`, which parks on `&t->detach_state` and has no kernel-side
+        // substitute. That is a hang with no futex-table evidence at all (the waiter
+        // stays correctly queued forever), so this line is the only place it becomes
+        // attributable to a killer. Normal `exit_group` teardown also lands here, so
+        // it is rate-limited rather than gated: the first few are the interesting ones.
+        let killer = get_current_thread_register();
+        if killer != idx
+            && CROSS_KILLS.fetch_add(1, Ordering::Relaxed) < 32
+            && let Some(victim_pid) = crate::process::find_pid_by_thread(idx)
+        {
+            safe_print!(160,
+                "[kill] tid={} (pid={}) terminated by tid={} (pid={}) victim_state={}\n",
+                idx, victim_pid, killer,
+                crate::process::find_pid_by_thread(killer).unwrap_or(0),
+                THREAD_STATES[idx].load(Ordering::SeqCst));
+        }
         // Record termination time for cooldown tracking
         TERMINATION_TIME[idx].store((runtime().uptime_us)(), Ordering::SeqCst);
         THREAD_STATES[idx].store(thread_state::TERMINATED, Ordering::SeqCst);

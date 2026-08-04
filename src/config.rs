@@ -203,6 +203,22 @@ pub const CANARY_WORDS: usize = 8;
 /// wake delivery is correct and prompt — ~401 µs — see `test_futex_wake_latency_prompt`.)
 pub const FUTEX_DBG_ENABLED: bool = false;
 
+/// Track, per thread, the last 16 `FUTEX_WAITERS` transitions it took part in
+/// (enqueue / self-remove / popped-by-wake / purged / requeued / park / unpark),
+/// and report any thread parked inside `sys_futex` that is **not** queued anywhere
+/// (`[FUTEX-ORPHAN]`, printed by `futex_dump`).
+///
+/// That invariant — "parked in FUTEX_WAIT ⇒ present in `FUTEX_WAITERS`" — is what
+/// separates a lost wakeup from an ordinary userspace deadlock, and `[FUTEX-DUMP]`
+/// alone cannot check it: it shows who *is* queued, never who *should* be. The
+/// per-tid history then names the path that removed the orphan, which is the whole
+/// diagnosis (see `docs/runbooks/debug-futex-lost-wakeup.md`).
+///
+/// Cost when true: two relaxed stores per futex table op, no printing. Cheap enough
+/// to leave on — a rustc self-host run issues ~10M futex ops and the added stores do
+/// not show up against the syscall entry cost. Compiles out entirely when false.
+pub const FUTEX_ORPHAN_DIAG: bool = true;
+
 /// When true, the Thread-0 heartbeat periodically dumps every non-idle thread's
 /// saved kernel/user resume point (`[THR-DUMP]`) once `>= 2` threads are WAITING.
 /// A deadlock-hunt aid (docs §7g) for locating where parked threads are stuck

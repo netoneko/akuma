@@ -29,6 +29,15 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   `docker run --rm --platform linux/arm64 -v "$PWD/futexops:/futexops:ro" alpine /futexops`.
   As of 2026-08-03: 5 FAIL on Akuma, 5 PASS on Linux — see
   `docs/reference/subsystems/syscalls/sync.md` §"Known divergences from Linux".
+- `futexkey` — does a futex key leak between address spaces? Forks a waiter that
+  parks on a `.bss` global, then issues the wake **from the parent**, i.e. a
+  different address space at the identical VA (no ASLR). A correct kernel wakes
+  0; a kernel keying by virtual address alone reports `woken=1` and has just
+  stolen another process's wake. Deterministic — one fork, one wake, no stress
+  loop — which is the point: the "8 concurrent copies of `futextest_rs`" repro
+  it replaces passed 95/96 on **both** arms of the 2026-08-04 fix and could not
+  detect it. Regression test for the musl `__thread_list_lock` collision;
+  diagnosis in `docs/runbooks/debug-futex-lost-wakeup.md`.
 
 ## Build (host)
 

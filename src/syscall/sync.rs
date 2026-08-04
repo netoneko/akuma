@@ -10,12 +10,13 @@ type Waiter = (usize, u32);
 
 /// Futex waiter table.
 ///
-/// Key is `(tgid, uaddr)`:
-/// - For FUTEX_PRIVATE operations, `tgid` is the thread-group leader's PID (from
-///   `PROCESS_INFO_ADDR`), scoping the futex to the process. This prevents cross-process
-///   VA collisions when different processes have the same virtual address (no ASLR).
-/// - For FUTEX_SHARED (non-private) operations, `tgid = 0`.
-/// - For kernel-internal wakes (clear_child_tid, robust futex), `tgid = 0`.
+/// Key is `(tgid, uaddr)`, where `tgid` is the thread-group leader's PID (from
+/// `PROCESS_INFO_ADDR`) — scoping the futex to one address space, which is what keeps
+/// two processes that happen to use the same virtual address (Akuma has no ASLR) off
+/// each other's queues. `tgid = 0` is the VA-only global namespace and is reserved for
+/// memory genuinely shared *between* address spaces; `futex_key_tgid` documents why
+/// the `FUTEX_PRIVATE` flag does not decide which of the two applies. Kernel-internal
+/// wakes (clear_child_tid, robust futex) publish to both.
 /// # Why every access below masks local IRQs
 ///
 /// `FUTEX_WAITERS` is reachable from a BKL-free syscall window (Phase 7f). A nested IRQ
@@ -40,15 +41,197 @@ static FUTEX_WAITERS: Spinlock<BTreeMap<(u32, usize), Vec<Waiter>>> = Spinlock::
 
 const BITSET_MATCH_ANY: u32 = 0xFFFFFFFF;
 
+// ─── Futex bookkeeping trace (`FUTEX_ORPHAN_DIAG`) ───────────────────────────
+//
+// `[FUTEX-DUMP]` shows which tids ARE queued. The failure we are hunting is a thread
+// that is parked inside `sys_futex` and is queued NOWHERE — no wake can ever reach it,
+// so it sleeps until the process is killed. Detecting that needs the complement of the
+// dump (every thread whose `thread_current_syscall` is FUTEX and whose state is
+// WAITING), and explaining it needs to know which of the six paths that can remove a
+// tid from `FUTEX_WAITERS` ran last. Both are recorded here.
+//
+// `FUTEX_TID_HIST[tid]` is a 16-deep ring of 4-bit event codes, newest in the low
+// nibble; `FUTEX_TID_TS[tid]` is the uptime of the newest event and `FUTEX_TID_KEY`
+// the `uaddr` it concerned. A wedged thread stops emitting events, so its ring freezes
+// on exactly the transition that stranded it.
+const FE_ENQ: u64 = 1; // enqueued (first entry into the wait)
+const FE_REENQ: u64 = 2; // re-enqueued after a spurious wake
+const FE_SELFRM: u64 = 3; // removed itself at `key` in the wait loop
+const FE_WOKE: u64 = 4; // popped by `futex_do_wake`
+const FE_PURGE: u64 = 5; // dropped by `futex_purge_tid` (terminate / slot recycle)
+const FE_RQ: u64 = 6; // moved to the requeue target by `futex_requeue_table`
+const FE_DEQ: u64 = 7; // `futex_dequeue` (timeout / EFAULT cleanup)
+const FE_RMANY: u64 = 8; // `futex_remove_tid_anywhere`
+const FE_PARK: u64 = 9; // about to call `schedule_blocking`
+const FE_UNPARK: u64 = 10; // `schedule_blocking` returned
+const FE_RET: u64 = 11; // `sys_futex` returning to user
+
+const FE_CHARS: [u8; 12] = *b"-EeSWPQDApuX";
+
+static FUTEX_TID_HIST: [core::sync::atomic::AtomicU64;
+    akuma_exec::threading::MAX_THREADS] = {
+    [const { core::sync::atomic::AtomicU64::new(0) }; akuma_exec::threading::MAX_THREADS]
+};
+static FUTEX_TID_TS: [core::sync::atomic::AtomicU64;
+    akuma_exec::threading::MAX_THREADS] = {
+    [const { core::sync::atomic::AtomicU64::new(0) }; akuma_exec::threading::MAX_THREADS]
+};
+static FUTEX_TID_KEY: [core::sync::atomic::AtomicU64;
+    akuma_exec::threading::MAX_THREADS] = {
+    [const { core::sync::atomic::AtomicU64::new(0) }; akuma_exec::threading::MAX_THREADS]
+};
+
+/// Record one futex bookkeeping event for `tid`. Relaxed throughout: this is a
+/// diagnostic ring read only by `futex_dump` long after the fact, never a
+/// synchronisation point, and it must not add ordering to the futex fast path.
+#[inline]
+fn fe(tid: usize, ev: u64, uaddr: usize) {
+    if !crate::config::FUTEX_ORPHAN_DIAG || tid >= akuma_exec::threading::MAX_THREADS {
+        return;
+    }
+    use core::sync::atomic::Ordering::Relaxed;
+    let h = FUTEX_TID_HIST[tid].load(Relaxed);
+    FUTEX_TID_HIST[tid].store((h << 4) | ev, Relaxed);
+    FUTEX_TID_TS[tid].store(crate::timer::uptime_us(), Relaxed);
+    FUTEX_TID_KEY[tid].store(uaddr as u64, Relaxed);
+}
+
+// ─── Wake ring ───────────────────────────────────────────────────────────────
+//
+// The complement of the orphan check, for the *other* half of a lost wakeup: the
+// waiter is queued correctly and the wake simply never reached its key. Post-mortem,
+// `[FUTEX-DUMP]` cannot tell "the waker never ran" from "the waker ran and published
+// to a different `(tgid, uaddr)`" — both look like a waiter sitting there forever.
+//
+// Every `FUTEX_WAKE`-family op appends `(tgid, uaddr, woken, waker_tid, ts)` here.
+// A wedged process stops generating futex traffic the instant it wedges, so its own
+// last wakes stay in the ring — but only if a *busy* process cannot evict them. One
+// flat ring cannot manage that: `cargo`'s poll loop emits ~100 wakes per millisecond
+// in bursts, which flushed a 128-entry global ring in 1.2 ms and left nothing from
+// the wedged process. So the ring is bucketed **by tgid**: a noisy process floods
+// only its own bucket, and every other process keeps its last `WAKE_PER_BUCKET`.
+//
+// Buckets collide (`tgid % WAKE_BUCKETS`), so each entry carries its real tgid and
+// the dump prints it — a colliding neighbour is visible rather than confusing. The
+// dump also scans *every* bucket for the stuck `uaddr`, which is what catches a wake
+// published to the WRONG tgid (the lost-wakeup shape where waiter and waker disagree
+// about the key namespace); such an entry lands in the waker's bucket, not the
+// waiter's, and would be invisible to a per-tgid lookup alone.
+//
+// Slots are written field-by-field without a lock, so a reader racing a writer can
+// see one torn entry. That is acceptable for a post-mortem dump and is why the ring
+// is never used for a correctness decision.
+const WAKE_BUCKETS: usize = 64;
+const WAKE_PER_BUCKET: usize = 16;
+const WAKE_RING: usize = WAKE_BUCKETS * WAKE_PER_BUCKET;
+
+static WAKE_RING_IDX: [core::sync::atomic::AtomicUsize; WAKE_BUCKETS] = {
+    [const { core::sync::atomic::AtomicUsize::new(0) }; WAKE_BUCKETS]
+};
+static WAKE_RING_KEY: [core::sync::atomic::AtomicU64; WAKE_RING] = {
+    [const { core::sync::atomic::AtomicU64::new(0) }; WAKE_RING]
+};
+/// Packed `tgid << 32 | woken << 16 | waker_tid`.
+static WAKE_RING_META: [core::sync::atomic::AtomicU64; WAKE_RING] = {
+    [const { core::sync::atomic::AtomicU64::new(0) }; WAKE_RING]
+};
+static WAKE_RING_TS: [core::sync::atomic::AtomicU64; WAKE_RING] = {
+    [const { core::sync::atomic::AtomicU64::new(0) }; WAKE_RING]
+};
+
+fn wake_ring_record(tgid: u32, uaddr: usize, woken: u64) {
+    if !crate::config::FUTEX_ORPHAN_DIAG {
+        return;
+    }
+    use core::sync::atomic::Ordering::Relaxed;
+    let b = tgid as usize % WAKE_BUCKETS;
+    let i = b * WAKE_PER_BUCKET + WAKE_RING_IDX[b].fetch_add(1, Relaxed) % WAKE_PER_BUCKET;
+    let tid = akuma_exec::threading::current_thread_id() as u64;
+    WAKE_RING_KEY[i].store(uaddr as u64, Relaxed);
+    WAKE_RING_META[i].store((u64::from(tgid) << 32) | ((woken & 0xFFFF) << 16) | (tid & 0xFFFF), Relaxed);
+    WAKE_RING_TS[i].store(crate::timer::uptime_us(), Relaxed);
+}
+
+fn wake_ring_print(i: usize, tag: &str) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let ts = WAKE_RING_TS[i].load(Relaxed);
+    if ts == 0 {
+        return;
+    }
+    let meta = WAKE_RING_META[i].load(Relaxed);
+    tprint!(128, "  {} tgid={} uaddr={:#x} woken={} by_tid={} ts={}us\n",
+        tag, meta >> 32, WAKE_RING_KEY[i].load(Relaxed), (meta >> 16) & 0xFFFF, meta & 0xFFFF, ts);
+}
+
+/// Report the wakes relevant to one stuck waiter: every recorded wake on its `uaddr`
+/// under ANY tgid (`same-addr`), then its own tgid's bucket (`bucket`) for context.
+/// Called from `futex_dump` only when something is actually stuck, so it costs
+/// nothing on a healthy system.
+fn wake_ring_dump_for(tgid: u32, uaddr: usize) {
+    tprint!(96, "[FUTEX-WAKERING] for stuck waiter tgid={} uaddr={:#x}\n", tgid, uaddr);
+    use core::sync::atomic::Ordering::Relaxed;
+    for (i, slot) in WAKE_RING_KEY.iter().enumerate() {
+        if slot.load(Relaxed) == uaddr as u64 {
+            wake_ring_print(i, "same-addr");
+        }
+    }
+    let b = tgid as usize % WAKE_BUCKETS;
+    let head = WAKE_RING_IDX[b].load(Relaxed);
+    for n in 0..WAKE_PER_BUCKET {
+        wake_ring_print(b * WAKE_PER_BUCKET + (head + n) % WAKE_PER_BUCKET, "bucket");
+    }
+}
+
 /// Returns the TGID to use as the futex key namespace.
-/// For private futex: returns the current process's PID (shared among CLONE_VM threads via
-/// `PROCESS_INFO_ADDR`). For non-private (shared): returns 0.
-fn futex_key_tgid(is_private: bool) -> u32 {
-    if is_private {
+///
+/// The thread group's leader PID (shared among CLONE_VM threads via
+/// `PROCESS_INFO_ADDR`) for anything living in this address space alone; `0` — the
+/// VA-only global namespace — only for memory genuinely shared between address
+/// spaces.
+///
+/// # Why `is_private` alone does not decide this
+///
+/// Linux keys a futex by the *address space* whenever the page is anonymous,
+/// **whether or not `FUTEX_PRIVATE` was passed**: `get_futex_key` only reaches the
+/// `(inode, index)` form for a page with a `page->mapping`, and falls back to
+/// `(mm, address)` otherwise. Keying every non-private op to `(0, uaddr)` therefore
+/// diverges from Linux — and because Akuma has no ASLR, `(0, uaddr)` is the *same*
+/// key in every process running the same binary.
+///
+/// That is not a corner case, it is musl's thread-list lock. `__tl_lock` /
+/// `__tl_unlock` wait and wake on `&__thread_list_lock` — a `libc.bss` global at a
+/// fixed VA — with `priv = 0`, and `pthread_create` hands the kernel that same
+/// address as the `CLONE_CHILD_CLEARTID` word, so *every thread create and exit in
+/// every musl process* used one global queue. `FUTEX_WAKE(&__thread_list_lock, 1)`
+/// in process A pops the FIFO head, which is often a thread of process B: B is woken
+/// spuriously, the wake is counted as delivered, and A's own waiter stays parked
+/// forever. It needs several multi-threaded processes running at once to show up,
+/// which is exactly the `-j4` rustc self-host build and not the single-process
+/// futex probes (`futexops`, `futextest`) that passed throughout.
+fn futex_key_tgid(is_private: bool, uaddr: usize) -> u32 {
+    let own_tgid = current_tgid_for_futex_key();
+    if !is_private
+        && own_tgid != 0
+        && crate::syscall::mem::is_shared_file_mapping(own_tgid, uaddr)
+    {
+        // Genuinely cross-address-space memory: the global namespace is the point.
+        // (Still VA-keyed, so it only pairs processes that mapped it at the same
+        // address — the pre-existing limit of Akuma's shared-futex support, now the
+        // ONLY thing that can land in this namespace.)
+        return 0;
+    }
+    own_tgid
+}
+
+/// The address-space-scoped half of [`futex_key_tgid`], split out because the
+/// degradation warning below is about *identity resolution* and applies equally to
+/// private and non-private ops.
+fn current_tgid_for_futex_key() -> u32 {
+    {
         if let Some(tgid) = akuma_exec::process::read_current_pid() {
             tgid
         } else {
-            // A PRIVATE futex that cannot resolve its tgid does NOT belong in the shared
+            // A futex whose tgid cannot be resolved does NOT belong in the shared
             // namespace — that is a correctness event, not a graceful fallback, and it is
             // logged rather than silently absorbed.
             //
@@ -56,28 +239,23 @@ fn futex_key_tgid(is_private: bool) -> u32 {
             // every process running the same binary parks on the same addresses; N copies
             // of one program collapse into one queue. `FUTEX_WAKE(uaddr, 1)` from one
             // process then pops a *different* process's waiter, counts it as woken, and
-            // leaves the real waiter parked forever — a cross-process lost wakeup that
-            // only appears when several copies of a binary run at once (the `-j4` rustc
-            // and concurrent-`futextest_rs` signatures).
+            // leaves the real waiter parked forever — the cross-process lost wakeup
+            // described on `futex_key_tgid`.
             //
             // Measured at ZERO occurrences across boot, 8-way and 16-way thread-churn runs
             // (2026-08-04): with `VFORK_FASTPATH_ENABLED`, `read_current_pid` resolves via
             // `THREAD_PID_MAP` and returns before this branch is reachable. Kept as a
             // tripwire, not a known-hot path — and rate-limited in case that ever changes.
-            // Do NOT read a `tgid=0` entry in a futex trace as evidence this fired: ordinary
-            // non-private ops (`op & 128 == 0`) key to 0 by design.
             let n = FUTEX_KEY_DEGRADED_TO_SHARED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
             if n <= 10 || n.is_multiple_of(1000) {
                 tprint!(192,
-                    "[futex] WARNING: PRIVATE futex key degraded to tgid=0 (read_current_pid \
+                    "[futex] WARNING: futex key degraded to tgid=0 (read_current_pid \
                      returned None) — shares the VA-only namespace with every other process; \
                      occurrence {}\n",
                     n);
             }
             0
         }
-    } else {
-        0
     }
 }
 
@@ -118,8 +296,10 @@ pub fn futex_do_wake(tgid: u32, uaddr: usize, max_wake: u32, wake_mask: u32) -> 
     });
 
     for tid in &to_wake {
+        fe(*tid, FE_WOKE, uaddr);
         akuma_exec::threading::get_waker_for_thread(*tid).wake();
     }
+    wake_ring_record(tgid, uaddr, to_wake.len() as u64);
     to_wake.len() as u64
 }
 
@@ -175,8 +355,9 @@ fn futex_check_and_enqueue(
     bitset: u32,
     uaddr: usize,
     val: u32,
+    first: bool,
 ) -> Result<(), u64> {
-    crate::irq::with_irqs_disabled(|| {
+    let r = crate::irq::with_irqs_disabled(|| {
         let mut waiters = FUTEX_WAITERS.lock();
         let mut current_val: u32 = 0;
         if unsafe { copy_from_user_safe((&raw mut current_val).cast::<u8>(), uaddr as *const u8, 4).is_err() } {
@@ -187,7 +368,11 @@ fn futex_check_and_enqueue(
         }
         waiters.entry(key).or_default().push((tid, bitset));
         Ok(())
-    })
+    });
+    if r.is_ok() {
+        fe(tid, if first { FE_ENQ } else { FE_REENQ }, uaddr);
+    }
+    r
 }
 
 /// Move waiters off `key1`: take up to `max_wake` of them for the caller to wake, and
@@ -234,6 +419,9 @@ fn futex_requeue_table(
         if !to_requeue.is_empty() && has_requeue_target {
             waiters.entry(key2).or_default().extend(to_requeue.iter().copied());
         }
+        for (t, _) in &to_requeue {
+            fe(*t, FE_RQ, key2.1);
+        }
 
         (to_wake, to_requeue.len())
     })
@@ -248,6 +436,7 @@ fn futex_dequeue(key: (u32, usize), tid: usize) {
             if queue.is_empty() { waiters.remove(&key); }
         }
     });
+    fe(tid, FE_DEQ, key.1);
 }
 
 /// Remove `tid` from *whichever* queue under `tgid` currently holds it, or do nothing
@@ -277,6 +466,7 @@ fn futex_remove_tid_anywhere(tgid: u32, tid: usize) {
         {
             q.retain(|(t, _)| *t != tid);
             if q.is_empty() { waiters.remove(&k); }
+            fe(tid, FE_RMANY, k.1);
         }
     });
 }
@@ -295,20 +485,125 @@ fn futex_remove_tid_anywhere(tgid: u32, tid: usize) {
 ///
 /// Printed next to `[THR-DUMP]`/`[PIPE-DUMP]` under `DEADLOCK_THREAD_DUMP_ENABLED`.
 pub fn futex_dump() {
-    crate::irq::with_irqs_disabled(|| {
+    let now = crate::timer::uptime_us();
+    let stuck: Vec<(u32, usize)> = crate::irq::with_irqs_disabled(|| {
         let waiters = FUTEX_WAITERS.lock();
         if waiters.is_empty() {
             tprint!(48, "[FUTEX-DUMP] table empty\n");
-            return;
+            return Vec::new();
         }
         tprint!(48, "[FUTEX-DUMP] {} keys\n", waiters.len());
+        let mut stuck = Vec::new();
         for (&(tgid, uaddr), q) in waiters.iter() {
             tprint!(120, "  key tgid={} uaddr={:#x} waiters={}\n", tgid, uaddr, q.len());
             for (tid, bitset) in q.iter().take(8) {
-                tprint!(80, "    tid={} bitset={:#x}\n", tid, bitset);
+                // Age comes from the per-tid event ring (last transition = its enqueue),
+                // so a long-queued waiter is visible without widening `Waiter` itself.
+                let age = if crate::config::FUTEX_ORPHAN_DIAG {
+                    now.saturating_sub(FUTEX_TID_TS[*tid].load(core::sync::atomic::Ordering::Relaxed))
+                } else {
+                    0
+                };
+                if age > STUCK_WAITER_US {
+                    stuck.push((tgid, uaddr));
+                }
+                let hist = fmt_hist(*tid);
+                tprint!(128, "    tid={} bitset={:#x} queued_for={}us hist={}\n",
+                    tid, bitset, age, core::str::from_utf8(&hist).unwrap_or("?"));
             }
         }
+        stuck
     });
+    let orphans = futex_orphan_check();
+    // Only when something is actually wedged, and only a few times per boot: each
+    // report is tens of lines of serial output, which is itself enough to perturb a
+    // timing bug.
+    if crate::config::FUTEX_ORPHAN_DIAG
+        && !(stuck.is_empty() && orphans.is_empty())
+        && WAKE_RING_DUMPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 3
+    {
+        for (tgid, uaddr) in stuck.iter().chain(orphans.iter()) {
+            wake_ring_dump_for(*tgid, *uaddr);
+        }
+    }
+}
+
+/// A waiter queued this long is wedged, not merely slow: the longest legitimate
+/// untimed park in these workloads (a jobserver token, a codegen unit handoff) is
+/// orders of magnitude shorter, and every timed wait carries its own deadline.
+const STUCK_WAITER_US: u64 = 60_000_000;
+
+static WAKE_RING_DUMPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Report every thread parked inside `sys_futex` that is queued on no key.
+///
+/// The complement of `futex_dump`, and the only one of the two that can *falsify*
+/// anything: "parked in FUTEX_WAIT ⇒ queued in `FUTEX_WAITERS`" is an invariant of
+/// the wait loop, so a violation is a kernel bug by construction — no wake can ever
+/// reach that thread again. An ordinary userspace deadlock, by contrast, leaves every
+/// parked thread correctly queued.
+///
+/// Render `tid`'s 16-deep event ring as text, oldest first, so it reads left-to-right
+/// in time. See [`futex_orphan_check`] for the legend.
+fn fmt_hist(tid: usize) -> [u8; 16] {
+    let mut buf = [b'-'; 16];
+    if !crate::config::FUTEX_ORPHAN_DIAG || tid >= akuma_exec::threading::MAX_THREADS {
+        return buf;
+    }
+    let hist = FUTEX_TID_HIST[tid].load(core::sync::atomic::Ordering::Relaxed);
+    for (i, slot) in buf.iter_mut().enumerate() {
+        let ev = ((hist >> (4 * (15 - i))) & 0xF) as usize;
+        *slot = FE_CHARS[ev.min(FE_CHARS.len() - 1)];
+    }
+    buf
+}
+
+/// Each orphan is printed with its 16-deep event ring (oldest first, so it reads
+/// left-to-right in time) naming the path that removed it:
+/// `E`=enqueue `e`=re-enqueue `S`=self-removed `W`=woken-by-wake `P`=purged
+/// `Q`=requeued `D`=dequeue `A`=remove-anywhere `p`=park `u`=unpark `X`=return.
+///
+/// Returns each orphan's `(tgid, uaddr)` so the caller can pull the matching wakes.
+fn futex_orphan_check() -> Vec<(u32, usize)> {
+    let mut found = Vec::new();
+    if !crate::config::FUTEX_ORPHAN_DIAG {
+        return found;
+    }
+    use akuma_exec::threading::{MAX_THREADS, thread_state};
+    let queued: Vec<usize> = crate::irq::with_irqs_disabled(|| {
+        FUTEX_WAITERS.lock().values().flatten().map(|(t, _)| *t).collect()
+    });
+    for tid in 0..MAX_THREADS {
+        if akuma_exec::threading::get_thread_state(tid) != thread_state::WAITING {
+            continue;
+        }
+        // 98 == FUTEX (see the syscall table in `src/syscall/mod.rs`).
+        if akuma_exec::threading::thread_current_syscall(tid) != 98 {
+            continue;
+        }
+        if queued.contains(&tid) {
+            continue;
+        }
+        use core::sync::atomic::Ordering::Relaxed;
+        let uaddr = FUTEX_TID_KEY[tid].load(Relaxed) as usize;
+        // The orphan's own key namespace, resolved the same way `futex_key_tgid` does
+        // for the *waker* — so a mismatch between the two shows up in the wake report.
+        let tgid = akuma_exec::process::find_pid_by_thread(tid)
+            .and_then(|p| akuma_exec::process::lookup_process_shared(p).map(|pr| pr.tgid))
+            .unwrap_or(0);
+        found.push((tgid, uaddr));
+        let buf = fmt_hist(tid);
+        tprint!(176,
+            "[FUTEX-ORPHAN] tid={} tgid={} uaddr={:#x} last_ev_ts={}us now={}us hist={}\n",
+            tid,
+            tgid,
+            uaddr,
+            FUTEX_TID_TS[tid].load(Relaxed),
+            crate::timer::uptime_us(),
+            core::str::from_utf8(&buf).unwrap_or("?"),
+        );
+    }
+    found
 }
 
 /// Drop every queued reference to `tid`, across **all** keys and thread groups.
@@ -334,8 +629,11 @@ pub fn futex_purge_tid(tid: usize) {
         for (&k, q) in waiters.iter_mut() {
             let before = q.len();
             q.retain(|(t, _)| *t != tid);
-            if q.len() != before && q.is_empty() {
-                emptied.push(k);
+            if q.len() != before {
+                fe(tid, FE_PURGE, k.1);
+                if q.is_empty() {
+                    emptied.push(k);
+                }
             }
         }
         for k in emptied {
@@ -431,7 +729,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
     match cmd {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             let tid = akuma_exec::threading::current_thread_id();
-            let tgid = futex_key_tgid(is_private);
+            let tgid = futex_key_tgid(is_private, uaddr);
             let key = (tgid, uaddr);
 
             if crate::config::FUTEX_DBG_ENABLED {
@@ -448,7 +746,8 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             // equivalent to FUTEX_BITSET_MATCH_ANY.
             let waiter_bitset: u32 = if cmd == FUTEX_WAIT_BITSET { val3 } else { BITSET_MATCH_ANY };
 
-            if let Err(errno) = futex_check_and_enqueue(key, tid, waiter_bitset, uaddr, val) {
+            if let Err(errno) = futex_check_and_enqueue(key, tid, waiter_bitset, uaddr, val, true) {
+                fe(tid, FE_RET, uaddr);
                 return errno;
             }
 
@@ -523,7 +822,9 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             //                            signal, cleaning up the requeue target so no
             //                            dead tid is left to eat a future wake)
             loop {
+                fe(tid, FE_PARK, uaddr);
                 akuma_exec::threading::schedule_blocking(deadline);
+                fe(tid, FE_UNPARK, uaddr);
 
                 // Locate ourselves under this tgid (requeue never crosses tgid), and
                 // — if we are still on the ORIGINAL key — drop ourselves so the
@@ -544,6 +845,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                     {
                         q.retain(|(t, _)| *t != tid);
                         if q.is_empty() { waiters.remove(&k); }
+                        fe(tid, FE_SELFRM, k.1);
                     }
                     found
                 });
@@ -559,6 +861,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                     if crate::config::FUTEX_DBG_ENABLED {
                         tprint!(128, "[futex-dbg] WOKE tid={} addr={:#x} result=EINTR ts={}us\n", tid, uaddr, crate::timer::uptime_us());
                     }
+                    fe(tid, FE_RET, uaddr);
                     return EINTR;
                 }
 
@@ -568,6 +871,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                         if crate::config::FUTEX_DBG_ENABLED {
                             tprint!(128, "[futex-dbg] WOKE tid={} addr={:#x} result=0 ts={}us\n", tid, uaddr, crate::timer::uptime_us());
                         }
+                        fe(tid, FE_RET, uaddr);
                         return 0;
                     }
                     Some(k) if k == key => {
@@ -579,9 +883,11 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                             if crate::config::FUTEX_DBG_ENABLED {
                                 tprint!(128, "[futex-dbg] WOKE tid={} addr={:#x} result=ETIMEDOUT ts={}us\n", tid, uaddr, crate::timer::uptime_us());
                             }
+                            fe(tid, FE_RET, uaddr);
                             return ETIMEDOUT;
                         }
-                        if let Err(errno) = futex_check_and_enqueue(key, tid, waiter_bitset, uaddr, val) {
+                        if let Err(errno) = futex_check_and_enqueue(key, tid, waiter_bitset, uaddr, val, false) {
+                            fe(tid, FE_RET, uaddr);
                             return errno;
                         }
                     }
@@ -599,6 +905,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                             if crate::config::FUTEX_DBG_ENABLED {
                                 tprint!(128, "[futex-dbg] WOKE tid={} addr={:#x} result=ETIMEDOUT (requeued) ts={}us\n", tid, uaddr, crate::timer::uptime_us());
                             }
+                            fe(tid, FE_RET, uaddr);
                             return ETIMEDOUT;
                         }
                         // Spurious: stay parked at the requeue target and re-loop.
@@ -607,7 +914,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             }
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
-            let tgid = futex_key_tgid(is_private);
+            let tgid = futex_key_tgid(is_private, uaddr);
             // WAKE_BITSET restricts the wake to waiters whose bitset intersects val3.
             let mask = if cmd == FUTEX_WAKE_BITSET { val3 } else { BITSET_MATCH_ANY };
             let woken = futex_do_wake(tgid, uaddr, val, mask);
@@ -625,7 +932,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             // Wake up to val waiters, requeue rest to uaddr2
             // val2 (passed as timeout_ptr) is max to requeue
             let max_requeue = timeout_ptr as u32;
-            let tgid = futex_key_tgid(is_private);
+            let tgid = futex_key_tgid(is_private, uaddr);
             let key1 = (tgid, uaddr);
             let key2 = (tgid, uaddr2);
 
@@ -648,7 +955,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
         FUTEX_CMP_REQUEUE => {
             // Like FUTEX_REQUEUE but also checks val3 against uaddr value
             let max_requeue = timeout_ptr as u32;
-            let tgid = futex_key_tgid(is_private);
+            let tgid = futex_key_tgid(is_private, uaddr);
             let key1 = (tgid, uaddr);
             let key2 = (tgid, uaddr2);
 
@@ -677,7 +984,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
         FUTEX_WAKE_OP => {
             // val2 (uaddr2 wake count) rides in the timeout argument slot.
             let val2 = timeout_ptr as u32;
-            let tgid = futex_key_tgid(is_private);
+            let tgid = futex_key_tgid(is_private, uaddr);
 
             if uaddr2 == 0 || uaddr2 & 3 != 0 || !validate_user_ptr(uaddr2 as u64, 4) {
                 return EFAULT;

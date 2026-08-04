@@ -107,6 +107,22 @@ struct SharedFileMapping {
 static SHARED_FILE_MAPPINGS: Spinlock<BTreeMap<(u32, usize), SharedFileMapping>> =
     Spinlock::new(BTreeMap::new());
 
+/// Does `uaddr` fall inside a writable `MAP_SHARED` file mapping owned by `tgid`?
+///
+/// This is Akuma's *entire* notion of memory genuinely shared between address
+/// spaces: `MAP_SHARED|MAP_ANONYMOUS` gets no special handling (fork copies it) and
+/// there is no shm, so any other mapping is private to one address space no matter
+/// what flags created it. `futex_key_tgid` uses this to decide whether a
+/// non-private futex may legitimately share a key namespace with another process —
+/// see its doc comment for why keying every non-private op globally was a
+/// cross-process lost wakeup.
+pub(super) fn is_shared_file_mapping(tgid: u32, uaddr: usize) -> bool {
+    let map = SHARED_FILE_MAPPINGS.lock();
+    map.range(..=(tgid, uaddr))
+        .next_back()
+        .is_some_and(|(&(t, base), m)| t == tgid && uaddr < base.saturating_add(m.len))
+}
+
 /// Copy `len` bytes from the resident pages at physical addresses `pas` back to
 /// `path`, starting at `file_offset`. Returns the number of bytes written.
 pub fn writeback_shared_pages(path: &str, file_offset: usize, len: usize, pas: &[usize]) -> usize {

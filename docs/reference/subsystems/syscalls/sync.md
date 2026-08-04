@@ -24,13 +24,29 @@ queued entry is `(tid, bitset)`:
   `FUTEX_WAKE`, or `val3` for `FUTEX_WAIT_BITSET`. `FUTEX_WAKE_BITSET` only
   drains waiters whose `bitset` intersects its own `val3` (see
   `futex_do_wake`'s `wake_mask` arg).
-- **`FUTEX_PRIVATE_FLAG` set:** `tgid` = the calling thread's process PID
-  (`futex_key_tgid`, via `read_current_pid()`), scoping the futex to one
-  process — this is what prevents cross-process VA collisions (no ASLR
-  means two unrelated processes can legitimately share a futex address).
-- **Not private (shared):** `tgid = 0`.
-- **Kernel-internal wakes** (`clear_child_tid`, robust futex): `tgid = 0`
-  by convention at the call site, but see `futex_wake` below.
+- **Default (private *or* non-private):** `tgid` = the calling thread's process
+  PID (`futex_key_tgid`, via `read_current_pid()`), scoping the futex to one
+  address space — this is what prevents cross-process VA collisions (no ASLR
+  means two copies of one binary put every global at the same address).
+- **`tgid = 0` (the VA-only global namespace):** only when the op is
+  non-private **and** `uaddr` falls inside a writable `MAP_SHARED` **file**
+  mapping (`mem::is_shared_file_mapping`) — Akuma's entire notion of memory
+  genuinely shared between address spaces.
+- **Kernel-internal wakes** (`clear_child_tid`, robust futex): published to
+  both, see `futex_wake` below.
+
+  > `FUTEX_PRIVATE_FLAG` deliberately does **not** decide this, and Linux does
+  > not let it either: `get_futex_key` only reaches the shared `(inode, index)`
+  > form for a page with a `page->mapping`, falling back to `(mm, address)` for
+  > an anonymous page whichever flag was passed. Keying every non-private op to
+  > `(0, uaddr)` (the behaviour before 2026-08-04) put musl's
+  > `&__thread_list_lock` — a `libc.bss` global at a fixed VA, waited on with
+  > `priv=0` by `__tl_lock` and handed to the kernel as the
+  > `CLONE_CHILD_CLEARTID` word by `pthread_create` — in **one queue shared by
+  > every musl process on the system**. A `FUTEX_WAKE(addr, 1)` then popped
+  > whichever process's waiter happened to be at the head. Deterministic
+  > regression probe: `userspace/forktest/c_stress/futexkey.c`; diagnosis:
+  > [`../../../runbooks/debug-futex-lost-wakeup.md`](../../../runbooks/debug-futex-lost-wakeup.md).
 
 `futex_do_wake(tgid, uaddr, max_wake, wake_mask)` (`src/syscall/sync.rs:61`)
 pops up to `max_wake` waiters whose stored bitset intersects `wake_mask` from
@@ -38,8 +54,16 @@ one `(tgid, uaddr)` bucket and fires their wakers. The public
 `futex_wake(tgid, uaddr, max_wake)` (used by `clear_child_tid` /
 `CLONE_CHILD_CLEARTID` cleanup in `sys_exit`, see [`proc.md`](proc.md)) passes
 `BITSET_MATCH_ANY` and wakes **both** the shared bucket (`tgid=0`) **and**, if
-`tgid != 0`, the private bucket — because the kernel-internal caller cannot
-know whether the userspace waiter used `FUTEX_WAIT` or `FUTEX_WAIT_PRIVATE`.
+`tgid != 0`, the address-space bucket — because the kernel-internal caller
+cannot know which namespace the userspace waiter landed in.
+
+This wake is **not** gated on the thread having exited cleanly (`return_to_kernel`
+runs it whether or not the thread was already marked TERMINATED). A thread killed
+from outside is the case that needs it most: musl passes `&__thread_list_lock` as
+the `CLONE_CHILD_CLEARTID` word, so this store+wake *is* how the thread-list lock
+is released on thread exit. Skipping it leaves that lock owned by a dead tid and
+every later `pthread_create`/`pthread_exit` in the process parks in `__tl_lock`
+forever — with a perfectly ordinary, correctly-queued waiter in `[FUTEX-DUMP]`.
 
 ## FUTEX_WAIT / FUTEX_WAIT_BITSET
 
