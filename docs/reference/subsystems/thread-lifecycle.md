@@ -40,9 +40,36 @@ stateDiagram-v2
 
 The coupling points:
 
+- **Per-slot state is scrubbed by one function, `scrub_thread_slot`**
+  (`threading/mod.rs`), called from *both* Free→Initializing claim paths
+  (`claim_free_slot` and the direct claim inside
+  `ThreadPool::spawn_user_closure_initializing`, which is the one every real
+  `pthread_create` takes) and once more before a slot returns to `Free`. Before
+  2026-08-04 those three sites each cleared a *different* subset, so a cloned
+  thread inherited the previous occupant's `THREAD_SIGNAL_MASK`,
+  `THREAD_RESTORE_SIGMASK_PENDING`, `WOKEN_STATES`, `USER_COPY_FAULT_HANDLER`
+  and the `[THR-DUMP]`/`[PSTATS]` diagnostic registers. **Add new per-slot
+  state to that function, never to a call site** — the drift is the bug.
+  Excluded on purpose: `THREAD_STATES` (the caller's CAS owns it),
+  `IS_IDLE_THREAD` (permanent property of idle slots), `ON_CPU`,
+  `THREAD_CONTEXTS`. Background:
+  [`../../archive/SELFHOST_DEVBOX_SMOLTCP.md`](../../archive/SELFHOST_DEVBOX_SMOLTCP.md)
+  §"per-slot state inherited across thread-slot recycling".
+- **A `TERMINATED` slot still occupies its index** for at least
+  `THREAD_CLEANUP_COOLDOWN_US` (10 ms) *and* until some path runs a reclaim
+  pass, so the usable ceiling under a spawn-heavy load is
+  `ceiling − (deaths/sec × 0.01s)`, not `ceiling`. Measured: 43 of 56 slots
+  held by corpses while only 13 threads were live. The `[threads]` census on
+  the exhaustion path prints the live/terminated split precisely so this is
+  distinguishable from genuine capacity; `threadmax` (`userspace/forktest/
+  c_stress/`) measures both (simultaneous ceiling 51 + main, churn 400/400).
 - `THREAD_PID_MAP` (Spinlock) binds tid → pid; written on spawn/clone/fork,
   erased on exit/kill/recycle. The `slot_still_owned_by` guard (dc4684a)
-  re-reads it before acting on a pre-yield `thread_id` snapshot.
+  re-reads it before acting on a pre-yield `thread_id` snapshot. It is the
+  **sole** authority for thread identity when `VFORK_FASTPATH_ENABLED` (default
+  true): `read_current_pid` consults it first and only falls through to the
+  `PROCESS_INFO` page on a miss, so its accuracy across slot recycling is a
+  correctness dependency, not a cache.
 - `unregister_process` terminates the thread named by `p.thread_id` as a
   backstop for `kill_thread_group`'s grace-gap (see
   `../../archive/STALE_THREAD_SLOT_KILL.md` §5.1 — do **not** "tidy" that

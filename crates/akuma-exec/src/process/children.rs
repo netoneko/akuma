@@ -275,6 +275,12 @@ pub fn interrupt_thread(thread_id: usize) {
 /// This prevents PID spoofing since the page is read-only for userspace.
 ///
 /// Returns None if TTBR0 points to boot page tables (no user process context).
+/// Count of `read_current_pid` tgid resolutions that fell back to the thread's own pid
+/// because the process table would not resolve the mapped pid. Non-zero is the signature
+/// of the identity-degradation window described at the fallback site.
+pub static TGID_RESOLVE_MISSES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 pub fn read_current_pid() -> Option<Pid> {
     // vfork fast-path: a shared-AS child reads the *parent's* PROCESS_INFO page,
     // so the page no longer uniquely identifies the caller.  THREAD_PID_MAP is
@@ -287,7 +293,30 @@ pub fn read_current_pid() -> Option<Pid> {
         let tid = crate::threading::current_thread_id();
         let mapped = with_irqs_disabled(|| THREAD_PID_MAP.lock().get(&tid).copied());
         if let Some(pid) = mapped {
-            return Some(crate::process::table::with_process(pid, |p| p.tgid).unwrap_or(pid));
+            return Some(match crate::process::table::with_process(pid, |p| p.tgid) {
+                Some(tgid) => tgid,
+                // The map named a pid the process table will not resolve. `with_process`
+                // only matches slots in state ACTIVE, so this is the window between
+                // `unregister_process`'s ACTIVE→RETIRED CAS and the thread's last
+                // instruction — the identity silently degrades from tgid to the thread's
+                // OWN pid for whatever runs in it.
+                //
+                // That matters most for `futex_key_tgid`: a non-leader thread degrading
+                // here parks on key `(own_pid, uaddr)` while every waker publishes to
+                // `(tgid, uaddr)`, which is a lost wakeup that only affects multi-threaded
+                // processes. Counted and logged (first 10) rather than silently absorbed —
+                // an earlier pass wrongly blamed the sibling `unwrap_or(0)` for this class
+                // without ever confirming it fired.
+                None => {
+                    let n = TGID_RESOLVE_MISSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                    if n <= 10 {
+                        (runtime().print_str)(
+                            "[identity] WARNING: THREAD_PID_MAP pid not ACTIVE in process table \
+                             — tgid degraded to own pid (futex keys may not match wakers)\n");
+                    }
+                    pid
+                }
+            });
         }
         // No THREAD_PID_MAP entry → fall through to the page read below
         // (early boot, or a thread not yet registered).

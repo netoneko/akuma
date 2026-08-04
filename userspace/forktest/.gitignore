@@ -9,3 +9,6 @@ c_stress/neonfault
 c_stress/mmapsum
 c_stress/futextest
 c_stress/futexops
+c_stress/threadmax
+c_stress/futextest_rs
+

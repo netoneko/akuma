@@ -749,3 +749,209 @@ Builds on `AKUMA_SELF_HOSTING.md` (the original self-host bring-up, June
 propagate-through-exec quirk, and the icache-coherency root cause behind the
 earlier "x8 race" crashes. See also `docs/archive/EXECVE_STACK_LEAK_OOM_HANG.md`
 for the heap-leak bug this session was retesting against.
+
+---
+
+# Retest after the futex-divergence fixes (2026-08-04)
+
+Rerun of the whole experiment at HEAD `b4e641b` ("more fixes", the five-op futex
+audit closure documented in `FUTEX_REQUEUE_LOST_WAKEUP.md`), same recipe as
+"Reproducing this session end-to-end" above but `SMP=4` + `cargo -j4`, guest
+cloning local HEAD from the host `git daemon` (§6 method). Disk was already
+prepared; §§1-4 did not recur.
+
+**Result: FAIL. Both open issues reproduce unchanged. The futex fixes are
+real and correct, and they are not the cause of either.**
+
+## The futex fixes verified good — and exonerated
+
+`userspace/forktest/c_stress/futexops` (unchanged binary, only its comments
+moved in `b4e641b`) run in-guest:
+
+```
+=== FUTEXOPS DONE — 0 divergence(s) from Linux ===
+```
+
+5 FAIL → 5 PASS against the same probe that produced the original audit table.
+`futextest` (7 phases, both the C and Rust builds) also passes end to end on an
+idle VM. So the requeue/bitset/EFAULT/WAKE_OP work is confirmed landed — and
+confirmed *not* to be what stalls the self-host build.
+
+## The `-j4` build still dies the same way
+
+Failed at +121s, with the **same** abort as 2026-08-03 but on different crates:
+
+```
+fatal runtime error: current thread handle already set during thread spawn, aborting
+error: could not compile `proc-macro2` (build script)
+error: could not compile `const-oid` (lib)
+```
+
+Previously this hit `quote`. Two different crates this run, so it is a **race,
+not a crate-specific defect** — worth recording because the original entry could
+be read as implicating `quote`'s build script specifically.
+
+Two rustc processes then hard-stalled while cargo drained (`typenum` again,
+byte-identical `[PSTATS]` syscall counts across 118s→208s, host QEMU at 3.2%),
+so the build never returned. Same signature as "Open issue #2".
+
+## The useful outcome: a minimal repro with no rustc, no cargo, no clone
+
+The stall reproduces from **8 concurrent copies of a ~100-line Rust program**:
+
+```bash
+# host: cross-compile the existing probe
+rustc --target aarch64-unknown-linux-musl -O -C linker=aarch64-linux-musl-gcc \
+      -C target-feature=+crt-static userspace/selfhost_repro/futextest.rs -o futextest_rs
+# guest: 8 at once, phase 2 only (the 200x spawn/join loop)
+for i in $(seq 0 7); do
+  busybox nohup busybox sh -c 'busybox env FUTEXTEST_PHASE=2 /tmp/futextest_rs' &
+done
+```
+
+One instance alone passes all 7 phases. **Eight at once wedged 7 of 8.** Every
+wedged process had only its main thread left, parked in `FUTEX_WAIT_PRIVATE`:
+
+```
+tid=13 st=? pid=1469 tgid=1469 sc=98 tsc=98 a0=0x21824ad8 a1=0x80
+tid=23 st=? pid=1891 tgid=1891 sc=98 tsc=98 a0=0x21824ad8 a1=0x80
+```
+
+Note pid 1469 and pid 1891 — two unrelated processes — parked on the **identical
+VA**. Akuma has no ASLR, so every copy of a binary lays out identically; that is
+expected, and harmless *provided* the futex key includes the thread group.
+
+**Caveat that matters for anyone using this repro: it is timing-sensitive.**
+Later 8× runs passed 8/8 on kernels that differed only by added logging. Any
+claim of "fixed" needs many trials, not one green run.
+
+## Two wrong-key hypotheses, both disproven by measurement
+
+The natural reading of the above is a futex key-namespace collision, via one of
+the two silent fallbacks on `crates/akuma-exec/src/process/children.rs:290`:
+
+1. `futex_key_tgid` (`src/syscall/sync.rs`) → `read_current_pid().unwrap_or(0)`,
+   which drops a PRIVATE futex into the shared `(0, uaddr)` bucket keyed by VA
+   alone — where, with no ASLR, N copies of one binary share one queue.
+2. `read_current_pid` → `with_process(pid, |p| p.tgid).unwrap_or(pid)`, which
+   degrades tgid → the thread's **own** pid. `get_process_ptr_inner`
+   (`process/table.rs:341`) only matches slots in state `ACTIVE`, so this is
+   reachable in the window between `unregister_process`'s ACTIVE→RETIRED CAS and
+   the thread's last instruction. It would bite non-leader threads only — which
+   matches the archive's stalled `typenum` threads (`pid=144 tgid=137`) exactly.
+
+Both were instrumented (a rate-limited `[futex] WARNING` at the first site, an
+`[identity] WARNING` + `TGID_RESOLVE_MISSES` counter at the second) and both
+fired **zero times** — across boot, an 8× run, and a 16× run that included
+stalls, EAGAIN panics and ~1600 thread creations.
+
+**So neither fallback triggers on these workloads, and the earlier reasoning in
+this session that blamed them was wrong.** Recorded because the argument is
+seductive and someone will re-derive it: `VFORK_FASTPATH_ENABLED` is `true`, so
+`THREAD_PID_MAP` is consulted first and *hits* for every registered user thread,
+returning before `unwrap_or(0)` is reachable at all. Reaching it needs a map miss
+**and** boot TTBR0 or a zero pid page — which an EL0 futex syscall does not have.
+The `tgid=0` waits visible in a `FUTEX_DBG_ENABLED` trace are ordinary
+**non-private** ops (`op & 128 == 0`), which key to 0 by design. Do not read a
+`tgid=0` WAIT line as evidence of degradation; the `WAKE` trace line now prints
+its `tgid` so the two sides of a key can actually be compared.
+
+## What *was* found: per-slot state inherited across thread-slot recycling
+
+Auditing every `[_; MAX_THREADS]` array against what each slot transition clears
+turned up three **different** scrub lists that had drifted apart:
+
+| path | cleared |
+|---|---|
+| `claim_free_slot` (`threading/mod.rs:708`) | signal mask, restore-mask pending, trap frame, BKL tag |
+| direct claim in `ThreadPool::spawn_user_closure_initializing` | **trap frame only** |
+| `cleanup_terminated_internal` | pending signals, pending kill, preemption counters, trap frame, sigaltstack, context |
+
+The middle row is the path **every real `pthread_create` takes** (`clone_thread`
+→ `spawn_user_thread_initializing` → this claim). So a cloned thread inherited
+the previous slot occupant's `THREAD_SIGNAL_MASK` and
+`THREAD_RESTORE_SIGMASK_PENDING`, plus nine other registers no list cleared:
+`WOKEN_STATES` (the sticky wake flag), `USER_COPY_FAULT_HANDLER` (a fixup address
+into a syscall frame that no longer exists), `WAKE_TIMES`, `LAST_SIGCHLD`,
+`THREAD_CURRENT_SYSCALL`, `LAST_CORE`, `TOTAL_CPU_TIMES`, `PREEMPTION_DISABLED_AT`.
+
+An inherited blocked signal mask is a plausible mechanism for the
+jobserver-`SIGUSR1` storm already documented under "Noise encountered" above: a
+signal the new thread never blocked is silently never delivered, the helper's
+blocking `read()` is never interrupted, and all 100 `tkill`s fire. **Not proven
+to be that bug's cause** — recorded as a mechanism that now cannot happen.
+
+The stale diagnostic registers deserve their own warning: `THREAD_CURRENT_SYSCALL`
+and `LAST_CORE` feed `[THR-DUMP]`/`[PSTATS]`, so before this fix a freshly
+claimed slot could *display* the previous occupant's syscall number — i.e. the
+evidence used to diagnose hangs in this very document could be stale.
+
+**Fix:** one `#[inline] fn scrub_thread_slot(i)` in `threading/mod.rs`, called
+from both claim paths and once more before a slot returns to `FREE`, so the lists
+cannot drift again. Deliberately excluded: `THREAD_STATES` (the caller's CAS owns
+it), `IS_IDLE_THREAD` (a permanent property of idle slots), `ON_CPU`,
+`THREAD_CONTEXTS`. 163 host unit tests pass; clippy clean.
+
+**This is not claimed to fix the stall.** The 8× repro passed 8/8 after it, but
+also passed 8/8 before it on a differently-instrumented build.
+
+## Thread-slot capacity, measured
+
+New probe `userspace/forktest/c_stress/threadmax.c` separates the two questions
+that both surface as `EAGAIN` from `pthread_create`:
+
+```
+[A] simultaneous live threads reached: 51 (+1 main)
+[A] stopped by: rc=11 (Resource temporarily unavailable)
+[B] 400x sequential spawn/join: ok
+=== THREADMAX DONE — ceiling=51, churn ok ===
+```
+
+So one process can hold **51** threads at once against a kernel ceiling of 56
+(`MAX_THREADS=64` − `RESERVED_THREADS=8`); the missing 5 are herd, httpd, sshd
+and the SSH session. Churn is healthy — the 2026-08-03 reclaim-and-retry fix
+holds at 400/400.
+
+**But the usable ceiling under load is far below 56, and not because of
+concurrency.** New `[threads]` census logging on the exhaustion path:
+
+```
+[threads] slots exhausted (live=13 terminated=43 ceiling=56) — reclaimed 39 and retrying
+[threads] slots exhausted (live=22 terminated=34 ceiling=56) — reclaimed 31 and retrying
+[threads] slots exhausted (live=30 terminated=26 ceiling=56) — reclaimed 20 and retrying
+```
+
+Only 13 threads were *running* while **43 of 56 slots were corpses**. A dead
+thread's slot stays `TERMINATED` for at least `THREAD_CLEANUP_COOLDOWN_US`
+(10 ms, `src/config.rs:603`) and only becomes `FREE` when something runs a
+reclaim pass. Effective capacity is therefore
+
+```
+usable ≈ ceiling − (thread deaths/sec × 0.01s)
+```
+
+16 concurrent copies of the repro hold at most 32 live threads — comfortably
+under 56 — yet produce enough deaths per 10 ms window to fill the pool with
+corpses, and three of them died with
+
+```
+failed to spawn thread: Os { code: 11, kind: WouldBlock }
+```
+
+That is genuine exhaustion, so **16× is a bad repro configuration** — its
+failures confound slot starvation with the stall under investigation. Use 8×,
+which showed zero exhaustion in every run.
+
+## Status of the three signatures after this session
+
+1. `LAZY_REGION_TABLE` alloc-under-lock — still fixed.
+2. Thread-spawn `SIGABRT` — **open**, unchanged, now known to be crate-agnostic.
+3. Lost-wakeup stall — **open**, unchanged, but now reproducible in ~2 minutes
+   from a small Rust binary instead of a multi-hour cargo build.
+
+Instrumentation left in place for the next pass (all default-on except the
+verbose tracing): `[futex] WARNING` on shared-namespace degradation, `[identity]
+WARNING` on tgid-resolution miss, `tgid` on the `FUTEX_DBG_ENABLED` `WAKE` line,
+`[threads]` high-water and exhaustion census. `FUTEX_DBG_ENABLED` itself is back
+to `false` — note that turning it on perturbs timing enough to sometimes hide
+the stall.

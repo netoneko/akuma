@@ -702,6 +702,71 @@ fn get_current_thread_register() -> usize {
 #[inline]
 fn get_current_thread_register() -> usize { 0 }
 
+/// Reset every per-slot register to its power-on value, so a recycled slot cannot leak
+/// its previous occupant's state into the next thread.
+///
+/// This exists because the scrub lists had drifted apart: `claim_free_slot` cleared the
+/// signal mask, the restore-mask flag and the trap frame; the direct claim in
+/// `ThreadPool::spawn_user_closure_initializing` (the path *every real `pthread_create`*
+/// takes) cleared only the trap frame; and `cleanup_terminated_internal` cleared a third,
+/// different set. Anything on one list and not another was inherited. The worst of those
+/// was `THREAD_SIGNAL_MASK`: a `clone_thread` slot inherited the dead thread's blocked
+/// set, so a signal the new thread never blocked was silently never delivered.
+///
+/// Call it from every path that takes a slot FREE → INITIALIZING, and once more when a
+/// slot goes back to FREE. Adding per-slot state? Add it here, not to a call site.
+///
+/// Deliberately NOT reset here:
+/// - `THREAD_STATES` — the caller's CAS owns the state machine.
+/// - `IS_IDLE_THREAD` — a permanent property of the per-core idle slots, not occupant state.
+/// - `ON_CPU` — owned by the scheduler's run/parked bookkeeping.
+/// - `THREAD_CONTEXTS` — bulk register file, zeroed by its own `Context::zero()`.
+#[inline]
+fn scrub_thread_slot(i: usize) {
+    if i >= MAX_THREADS { return; }
+
+    // Signal state. A stale mask or restore-mask is invisible until a signal is
+    // *not* delivered, which reads as a hang rather than an error.
+    PENDING_SIGNALS[i].store(0, Ordering::Release);
+    PENDING_KILL[i].store(false, Ordering::Release);
+    THREAD_SIGNAL_MASK[i].store(0, Ordering::Release);
+    THREAD_RESTORE_SIGMASK[i].store(0, Ordering::Release);
+    THREAD_RESTORE_SIGMASK_PENDING[i].store(false, Ordering::Release);
+    LAST_SIGCHLD[i].store(0, Ordering::Release);
+    THREAD_SIGALTSTACK_SP[i].store(0, Ordering::Release);
+    THREAD_SIGALTSTACK_SIZE[i].store(0, Ordering::Release);
+    THREAD_SIGALTSTACK_FLAGS[i].store(2, Ordering::Release); // SS_DISABLE
+
+    // Blocking/scheduling state. `WOKEN_STATES` is the sticky wake flag consumed on
+    // entry to `schedule_blocking` — a stale `true` spends a phantom wake on the new
+    // occupant's first park.
+    WOKEN_STATES[i].store(false, Ordering::Release);
+    WAKE_TIMES[i].store(0, Ordering::Release);
+    PREEMPTION_DISABLED[i].store(0, Ordering::Release);
+    PREEMPTION_DISABLED_SINCE[i].store(0, Ordering::Release);
+    PREEMPTION_DISABLED_AT[i].store(0, Ordering::Release);
+
+    // Kernel-entry state. A stale `USER_COPY_FAULT_HANDLER` is a fixup address into a
+    // syscall frame that no longer exists — a fault before the new occupant installs
+    // its own would jump there.
+    CURRENT_TRAP_FRAME[i].store(0, Ordering::Release);
+    USER_COPY_FAULT_HANDLER[i].store(0, Ordering::Release);
+
+    // Diagnostics. Stale values here are not a correctness bug but a *debugging* one:
+    // `[THR-DUMP]`/`[PSTATS]` would attribute the previous occupant's syscall and core
+    // to a thread that never made it, which is exactly the kind of evidence a hang hunt
+    // reads as ground truth.
+    THREAD_CURRENT_SYSCALL[i].store(u64::MAX, Ordering::Release);
+    LAST_CORE[i].store(0xFF, Ordering::Release);
+    TOTAL_CPU_TIMES[i].store(0, Ordering::Release);
+    TERMINATION_TIME[i].store(0, Ordering::Release);
+
+    // Profiler attribution: without this the new thread lends the previous occupant's
+    // tag to any peer sampling this slot before its first kernel entry.
+    #[cfg(kernel_smp_shared)]
+    crate::sync::reset_thread_tag(i);
+}
+
 /// Atomically claim a free slot in the given range
 /// Returns the slot index if successful, None if no free slots
 /// NOTE: Sets state to INITIALIZING, not READY - caller must set to READY after context setup!
@@ -719,22 +784,10 @@ fn claim_free_slot(start: usize, end: usize) -> Option<usize> {
             )
             .is_ok()
         {
-            // Reset the per-thread signal mask: slots are recycled, so a fresh
-            // thread must not inherit a terminated thread's blocked set. Clone/fork
-            // re-seed it from the parent afterwards (POSIX inheritance).
-            THREAD_SIGNAL_MASK[i].store(0, Ordering::Release);
-            // A recycled slot must not carry a stale rt_sigsuspend restore-mask.
-            THREAD_RESTORE_SIGMASK_PENDING[i].store(false, Ordering::Release);
-            // ...nor a previous occupant's EL0 trap-frame pointer, which by now aims at a
-            // kernel stack that may have been freed. The recycler already clears this
-            // (`cleanup_terminated_internal`); this is the second belt, so a slot reaching
-            // FREE by any other route still starts its new occupant with no live frame.
-            CURRENT_TRAP_FRAME[i].store(0, Ordering::Release);
-            // ...nor a stale BKL-profiler attribution: the new thread would lend the
-            // previous occupant's tag to any peer that samples this slot before its first
-            // kernel entry. Profiler-only; see `crate::sync::ThreadTagTable`.
-            #[cfg(kernel_smp_shared)]
-            crate::sync::reset_thread_tag(i);
+            // A slot may reach FREE by a route that skipped the recycler, so scrub every
+            // per-slot register here rather than trusting the previous owner's teardown.
+            // Clone/fork re-seed what they need afterwards (POSIX inheritance).
+            scrub_thread_slot(i);
             return Some(i);
         }
     }
@@ -853,13 +906,78 @@ pub fn spawn_user_thread_initializing(
     // that runs with the POOL lock held, and `reclaim_terminated_slots` takes POOL
     // itself, so calling it there would deadlock on the non-reentrant spinlock.
     match attempt() {
+        Ok(slot) => {
+            note_user_thread_highwater();
+            Ok(slot)
+        }
         Err("No free user thread slots") => {
-            if reclaim_terminated_slots() == 0 {
+            // Census BEFORE the reclaim, so the log distinguishes the two very different
+            // states that produce the same error: genuinely full (`live` at the ceiling)
+            // versus merely uncollected (`terminated` holding the slots). Only the first
+            // is a real capacity limit.
+            // NB: `free` is 0 by construction here — this arm only runs because the scan
+            // just failed to find a FREE slot. The diagnostic value is the live/terminated
+            // split: `terminated` high means the slots exist and are merely uncollected
+            // (collection is lazy — TERMINATED→FREE needs the cooldown AND someone to run
+            // a reclaim pass), whereas `live` at the ceiling is a genuine capacity limit.
+            let (live, terminated, _free) = user_slot_census();
+            let reclaimed = reclaim_terminated_slots();
+            if reclaimed == 0 {
+                safe_print!(192,
+                    "[threads] SPAWN FAILED: live={} terminated={} ceiling={} — nothing \
+                     reclaimable (high-water {})\n",
+                    live, terminated, thread_limit() - config().reserved_threads,
+                    USER_THREAD_HIGHWATER.load(Ordering::Relaxed));
                 return Err("No free user thread slots");
             }
-            attempt()
+            safe_print!(192,
+                "[threads] slots exhausted (live={} terminated={} ceiling={}) — reclaimed {} \
+                 and retrying\n",
+                live, terminated, thread_limit() - config().reserved_threads, reclaimed);
+            let r = attempt();
+            if r.is_ok() {
+                note_user_thread_highwater();
+            }
+            r
         }
         other => other,
+    }
+}
+
+/// Highest number of simultaneously-live user thread slots seen this boot.
+static USER_THREAD_HIGHWATER: AtomicUsize = AtomicUsize::new(0);
+
+/// Count user slots (i.e. excluding the reserved system range) by state.
+/// Returns `(live, terminated, free)`, where `live` is anything occupied and not yet
+/// terminated — the number that actually competes for the ceiling.
+fn user_slot_census() -> (usize, usize, usize) {
+    let (mut live, mut terminated, mut free) = (0, 0, 0);
+    for i in config().reserved_threads..thread_limit() {
+        match THREAD_STATES[i].load(Ordering::Relaxed) {
+            thread_state::FREE => free += 1,
+            thread_state::TERMINATED => terminated += 1,
+            _ => live += 1,
+        }
+    }
+    (live, terminated, free)
+}
+
+/// Record a new simultaneous-live-thread high-water mark, logging each time it rises.
+/// This is how many threads this kernel actually sustained at once, as opposed to the
+/// `MAX_THREADS` ceiling — the two diverge because a TERMINATED slot still holds its
+/// index for a ~10 ms cooldown, so a spawn-heavy workload runs out of *usable* slots
+/// well before `live` reaches the ceiling.
+fn note_user_thread_highwater() {
+    let (live, terminated, free) = user_slot_census();
+    let prev = USER_THREAD_HIGHWATER.load(Ordering::Relaxed);
+    if live > prev
+        && USER_THREAD_HIGHWATER
+            .compare_exchange(prev, live, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        safe_print!(160,
+            "[threads] new high-water: {} live user threads (terminated={} free={} ceiling={})\n",
+            live, terminated, free, thread_limit() - config().reserved_threads);
     }
 }
 
@@ -880,10 +998,11 @@ impl ThreadPool {
                     continue;
                 }
 
-                // This path claims a slot directly instead of via `claim_free_slot`, so
-                // repeat its stale-trap-frame clear: the new thread must not start life
-                // with the previous occupant's frame pointer (see `CURRENT_TRAP_FRAME`).
-                CURRENT_TRAP_FRAME[i].store(0, Ordering::Release);
+                // This path claims a slot directly instead of via `claim_free_slot`, and
+                // it is the one every real `pthread_create` takes — so it must run the
+                // same scrub. It previously repeated only the trap-frame clear, which is
+                // why a cloned thread inherited the dead occupant's blocked signal mask.
+                scrub_thread_slot(i);
 
                 // Lazy stacks: on the extreme profile WARM_FREE_USER=0, so a freshly
                 // claimed slot has no stack (StackInfo::empty(), top=0). Allocate it on
@@ -1315,6 +1434,12 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
             // BKL-free until the EL0-entry tripwire healed it. Must happen before the
             // slot goes FREE, i.e. before any spawn can claim it.
             let _stale_depth = crate::bkl::clear_dropped_windows_for_dead_thread(i);
+
+            // Final scrub before the slot becomes claimable. The individual clears above
+            // stay because some are order-sensitive (CURRENT_TRAP_FRAME must precede the
+            // stack free); this is the catch-all that keeps the recycler's list from
+            // drifting away from the claim paths' again.
+            scrub_thread_slot(i);
 
             // NOW set to FREE - cleanup is complete, spawn can safely claim this slot
             THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);

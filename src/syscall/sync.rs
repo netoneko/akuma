@@ -45,11 +45,43 @@ const BITSET_MATCH_ANY: u32 = 0xFFFFFFFF;
 /// `PROCESS_INFO_ADDR`). For non-private (shared): returns 0.
 fn futex_key_tgid(is_private: bool) -> u32 {
     if is_private {
-        akuma_exec::process::read_current_pid().unwrap_or(0)
+        match akuma_exec::process::read_current_pid() {
+            Some(tgid) => tgid,
+            // A PRIVATE futex that cannot resolve its tgid does NOT belong in the shared
+            // namespace — that is a correctness event, not a graceful fallback, and it is
+            // logged rather than silently absorbed.
+            //
+            // Key `(0, uaddr)` is keyed by virtual address ALONE. Akuma has no ASLR, so
+            // every process running the same binary parks on the same addresses; N copies
+            // of one program collapse into one queue. `FUTEX_WAKE(uaddr, 1)` from one
+            // process then pops a *different* process's waiter, counts it as woken, and
+            // leaves the real waiter parked forever — a cross-process lost wakeup that
+            // only appears when several copies of a binary run at once (the `-j4` rustc
+            // and concurrent-`futextest_rs` signatures).
+            //
+            // Rate-limited: measured at 2477 of 5678 waits (44%) under 8-way thread churn,
+            // so an unconditional print would drown the log it is meant to make readable.
+            None => {
+                let n = FUTEX_KEY_DEGRADED_TO_SHARED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                if n <= 10 || n.is_multiple_of(1000) {
+                    tprint!(192,
+                        "[futex] WARNING: PRIVATE futex key degraded to tgid=0 (read_current_pid \
+                         returned None) — shares the VA-only namespace with every other process; \
+                         occurrence {}\n",
+                        n);
+                }
+                0
+            }
+        }
     } else {
         0
     }
 }
+
+/// Count of `futex_key_tgid` degradations to the shared namespace. Drives the rate limit
+/// above; a non-zero value is itself the bug signature.
+static FUTEX_KEY_DEGRADED_TO_SHARED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Pop up to `max_wake` waiters from the `(tgid, uaddr)` bucket whose stored bitset
 /// intersects `wake_mask` (`BITSET_MATCH_ANY` for plain `FUTEX_WAKE`/kernel-internal
@@ -514,7 +546,12 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             let mask = if cmd == FUTEX_WAKE_BITSET { val3 } else { BITSET_MATCH_ANY };
             let woken = futex_do_wake(tgid, uaddr, val, mask);
             if crate::config::FUTEX_DBG_ENABLED {
-                tprint!(128, "[futex-dbg] WAKE addr={:#x} max={} mask={:#x} woken={} ts={}us\n", uaddr, val, mask, woken, crate::timer::uptime_us());
+                // `tgid` is printed because it is the half of the key that can silently
+                // differ between waker and waiter: an exiting thread whose process entry
+                // is already RETIRED resolves `read_current_pid` differently from the
+                // joiner still sitting in the same thread group. Without it, a
+                // `woken=0` line cannot be told apart from "published to the wrong queue".
+                tprint!(160, "[futex-dbg] WAKE tgid={} addr={:#x} max={} mask={:#x} woken={} ts={}us\n", tgid, uaddr, val, mask, woken, crate::timer::uptime_us());
             }
             woken
         }
