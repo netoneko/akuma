@@ -83,6 +83,22 @@ pub fn set_cleanup_callback(cb: fn(usize)) {
     CLEANUP_CALLBACK.store(cb as usize, Ordering::SeqCst);
 }
 
+/// Kernel-registered purge for per-tid state this crate cannot reach.
+///
+/// `scrub_thread_slot` covers the per-slot arrays that live in this module, but other
+/// subsystems register a *thread id* and rely on that thread to deregister itself —
+/// `FUTEX_WAITERS` (`src/syscall/sync.rs`) most importantly, where a tid left queued by a
+/// thread that died while parked is inherited by the slot's next occupant and silently
+/// absorbs that address's next wake. Those tables live in the kernel crate, so the kernel
+/// registers a hook here and the recycler calls it alongside `CLEANUP_CALLBACK`.
+static SLOT_PURGE_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+/// Register the per-tid purge invoked when a thread slot is recycled. Runs with no lock
+/// of this module held (same point as `CLEANUP_CALLBACK`), so the hook may take its own.
+pub fn set_slot_purge_callback(cb: fn(usize)) {
+    SLOT_PURGE_CALLBACK.store(cb as usize, Ordering::SeqCst);
+}
+
 /// Thread ID of the network polling loop (run_async_main).
 /// Set at boot by set_network_thread_id(). usize::MAX means not yet registered.
 static NETWORK_THREAD_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -761,6 +777,10 @@ fn scrub_thread_slot(i: usize) {
     TOTAL_CPU_TIMES[i].store(0, Ordering::Release);
     TERMINATION_TIME[i].store(0, Ordering::Release);
 
+    // Reclaim re-entrancy guard. A thread killed inside `drain_retired` leaves this set,
+    // and the next occupant then takes the "already draining" early return forever.
+    crate::process::reclaim::clear_draining(i);
+
     // Profiler attribution: without this the new thread lends the previous occupant's
     // tag to any peer sampling this slot before its first kernel entry.
     #[cfg(kernel_smp_shared)]
@@ -823,6 +843,23 @@ pub fn mark_thread_terminated(idx: usize) {
         // Record termination time for cooldown tracking
         TERMINATION_TIME[idx].store((runtime().uptime_us)(), Ordering::SeqCst);
         THREAD_STATES[idx].store(thread_state::TERMINATED, Ordering::SeqCst);
+
+        // Drop cross-subsystem tid registrations NOW, not at recycle. The slot stays
+        // TERMINATED for at least the cooldown (10 ms) and often far longer under load,
+        // and for that entire window a tid left in `FUTEX_WAITERS` is still a wake target:
+        // `futex_do_wake` pops it, counts it toward `max_wake`, and wakes a thread that is
+        // never going to run again — so a `FUTEX_WAKE(uaddr, 1)` is consumed and the real
+        // waiter stays parked. Purging at recycle alone would leave that window open.
+        //
+        // Safe to drop this early precisely because a queue entry is of no further use to
+        // a terminated thread — unlike its trap frame, kernel stack or sigaltstack, which
+        // the terminal park may still touch and which therefore stay until the recycler.
+        // Holds no lock of this module, so the hook may take its own.
+        let purge_addr = SLOT_PURGE_CALLBACK.load(Ordering::Relaxed);
+        if purge_addr != 0 {
+            let purge: fn(usize) = unsafe { core::mem::transmute(purge_addr) };
+            purge(idx);
+        }
     }
 }
 
@@ -1425,6 +1462,16 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
             if cb_addr != 0 {
                 let cb: fn(usize) = unsafe { core::mem::transmute(cb_addr) };
                 cb(i);
+            }
+
+            // Drop per-tid registrations held by subsystems outside this crate before the
+            // slot can be re-claimed — otherwise the next occupant inherits them under the
+            // same tid. Same lock context as the callback above (none of this module's
+            // locks held), so the hook is free to take its own.
+            let purge_addr = SLOT_PURGE_CALLBACK.load(Ordering::Relaxed);
+            if purge_addr != 0 {
+                let purge: fn(usize) = unsafe { core::mem::transmute(purge_addr) };
+                purge(i);
             }
             
             // Clear any dropped-BKL window this slot's late occupant left open. A

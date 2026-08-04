@@ -45,8 +45,9 @@ const BITSET_MATCH_ANY: u32 = 0xFFFFFFFF;
 /// `PROCESS_INFO_ADDR`). For non-private (shared): returns 0.
 fn futex_key_tgid(is_private: bool) -> u32 {
     if is_private {
-        match akuma_exec::process::read_current_pid() {
-            Some(tgid) => tgid,
+        if let Some(tgid) = akuma_exec::process::read_current_pid() {
+            tgid
+        } else {
             // A PRIVATE futex that cannot resolve its tgid does NOT belong in the shared
             // namespace — that is a correctness event, not a graceful fallback, and it is
             // logged rather than silently absorbed.
@@ -59,19 +60,21 @@ fn futex_key_tgid(is_private: bool) -> u32 {
             // only appears when several copies of a binary run at once (the `-j4` rustc
             // and concurrent-`futextest_rs` signatures).
             //
-            // Rate-limited: measured at 2477 of 5678 waits (44%) under 8-way thread churn,
-            // so an unconditional print would drown the log it is meant to make readable.
-            None => {
-                let n = FUTEX_KEY_DEGRADED_TO_SHARED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-                if n <= 10 || n.is_multiple_of(1000) {
-                    tprint!(192,
-                        "[futex] WARNING: PRIVATE futex key degraded to tgid=0 (read_current_pid \
-                         returned None) — shares the VA-only namespace with every other process; \
-                         occurrence {}\n",
-                        n);
-                }
-                0
+            // Measured at ZERO occurrences across boot, 8-way and 16-way thread-churn runs
+            // (2026-08-04): with `VFORK_FASTPATH_ENABLED`, `read_current_pid` resolves via
+            // `THREAD_PID_MAP` and returns before this branch is reachable. Kept as a
+            // tripwire, not a known-hot path — and rate-limited in case that ever changes.
+            // Do NOT read a `tgid=0` entry in a futex trace as evidence this fired: ordinary
+            // non-private ops (`op & 128 == 0`) key to 0 by design.
+            let n = FUTEX_KEY_DEGRADED_TO_SHARED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 10 || n.is_multiple_of(1000) {
+                tprint!(192,
+                    "[futex] WARNING: PRIVATE futex key degraded to tgid=0 (read_current_pid \
+                     returned None) — shares the VA-only namespace with every other process; \
+                     occurrence {}\n",
+                    n);
             }
+            0
         }
     } else {
         0
@@ -274,6 +277,39 @@ fn futex_remove_tid_anywhere(tgid: u32, tid: usize) {
         {
             q.retain(|(t, _)| *t != tid);
             if q.is_empty() { waiters.remove(&k); }
+        }
+    });
+}
+
+/// Drop every queued reference to `tid`, across **all** keys and thread groups.
+///
+/// Registered as the threading subsystem's slot-purge hook and invoked when a thread slot
+/// is recycled, because `futex_remove_tid_anywhere` only ever runs on the waiter's *own*
+/// timeout/EINTR path. A thread that dies while parked — `exit_group` killing siblings, a
+/// consumed `PENDING_KILL`, a fault-kill — never runs that path, so its tid stayed queued
+/// forever. Once the slot is recycled, that stale entry names a *live, unrelated* thread:
+/// `futex_do_wake` pops it, calls `wake()` on the new occupant, and counts it toward
+/// `max_wake` — so a `FUTEX_WAKE(uaddr, 1)` is consumed by a thread that was never waiting
+/// while the real waiter stays parked. That is the same "stale entry absorbs a wake"
+/// defect the requeue fix closed for requeued waiters, left open for dead ones.
+///
+/// Unlike `futex_remove_tid_anywhere` this cannot bound the scan by `tgid`: the caller is
+/// the slot recycler, which by then has no process context to derive one from. The map is
+/// small (only addresses with live waiters) and this runs once per slot recycle, not per
+/// futex op.
+pub fn futex_purge_tid(tid: usize) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut waiters = FUTEX_WAITERS.lock();
+        let mut emptied: Vec<(u32, usize)> = Vec::new();
+        for (&k, q) in waiters.iter_mut() {
+            let before = q.len();
+            q.retain(|(t, _)| *t != tid);
+            if q.len() != before && q.is_empty() {
+                emptied.push(k);
+            }
+        }
+        for k in emptied {
+            waiters.remove(&k);
         }
     });
 }

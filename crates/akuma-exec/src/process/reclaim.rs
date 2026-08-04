@@ -197,6 +197,19 @@ pub fn drain_retired() -> usize {
     freed
 }
 
+/// Clear a recycled slot's re-entrancy guard.
+///
+/// `drain_retired` sets `DRAINING[tid]` and clears it on the way out, but its own docs
+/// note the terminal-teardown site "runs on an already-terminated thread" and can be
+/// permanently preempted mid-sweep. That leaves the flag set, and once the slot is
+/// recycled the next occupant is treated as already inside a drain forever — it takes the
+/// early return on every call and never collects. Called from `scrub_thread_slot`.
+pub(crate) fn clear_draining(tid: usize) {
+    if tid < MAX_THREADS {
+        DRAINING[tid].store(false, Ordering::Release);
+    }
+}
+
 /// [`drain_retired`], skipped when nothing is parked. The form the hot drain sites use.
 #[inline]
 pub fn drain_retired_if_requested() -> usize {

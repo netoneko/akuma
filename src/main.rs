@@ -929,6 +929,12 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print("Initializing threading...\n");
     threading::init();
     process::init(); // Initialize process subsystem (registers cleanup callback)
+    // Per-tid state owned by THIS crate, dropped when a thread slot is recycled. The
+    // threading crate scrubs its own per-slot arrays but cannot reach kernel tables that
+    // are keyed by tid — chiefly `FUTEX_WAITERS`, where a tid left queued by a thread that
+    // died while parked is inherited by the slot's next occupant and silently absorbs that
+    // address's next wake.
+    threading::set_slot_purge_callback(syscall::futex_purge_tid);
     process::init_box_registry(); // Init Box 0
     console::print("Threading system initialized\n");
 
