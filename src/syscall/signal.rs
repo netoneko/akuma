@@ -82,7 +82,7 @@ pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigs
 /// likewise storm SIGRTMIN (cancellation/timer). So the POSIX-correct fix belongs
 /// in `tkill`'s handler attribution, not in this table — until then this stays
 /// limited to signals that are not used as async wakeups.
-fn signal_is_fatal_default(sig: u32) -> bool {
+pub fn signal_is_fatal_default(sig: u32) -> bool {
     matches!(sig, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 11 | 13 | 14 | 15 | 24 | 25 | 26 | 27 | 31)
 }
 
@@ -333,7 +333,8 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
     if sig as usize > akuma_exec::process::MAX_SIGNALS { return EINVAL; }
 
     if crate::config::TRACE_TKILL {
-        crate::safe_print!(96, "[signal] tkill(tid={}, sig={})\n", tid, sig);
+        crate::safe_print!(128, "[signal] tkill(tid={}, sig={}) from slot={}\n",
+            tid, sig, akuma_exec::threading::current_thread_id());
     }
 
     // Handler is process-wide (sigaction); the mask is PER-THREAD — read the
@@ -357,12 +358,23 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
         return 0;
     }
 
+    if crate::config::TRACE_TKILL {
+        let kind = match target_handler {
+            akuma_exec::process::SignalHandler::Ignore => "IGN",
+            akuma_exec::process::SignalHandler::Default => "DFL",
+            akuma_exec::process::SignalHandler::UserFn(_) => "FN",
+        };
+        crate::safe_print!(128, "[signal]   tkill disp={} mask={:#x} blocked={} fatal={}\n",
+            kind, target_mask, (target_mask & (1u64 << (sig - 1))) != 0,
+            signal_is_fatal_default(sig));
+    }
+
     match target_handler {
         akuma_exec::process::SignalHandler::Ignore => 0,
         akuma_exec::process::SignalHandler::Default => {
             let bit = 1u64 << (sig - 1);
             let blocked = (target_mask & bit) != 0;
-            
+
             if signal_is_fatal_default(sig) && !blocked {
                 super::proc::sys_exit_group(-(sig as i32));
             } else if signal_is_fatal_default(sig) && blocked {

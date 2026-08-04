@@ -35,6 +35,39 @@ in.
 For the CoW share/demote/fault mechanics and invariants, see
 [`../memory.md`](../memory.md) "CoW fork" — do not duplicate here.
 
+### TID vs PID — the two id namespaces
+
+A `CLONE_THREAD` child gets **two** unrelated ids, from two different counters:
+
+| id | Where it comes from | What it indexes |
+|---|---|---|
+| **TID** (kernel thread slot) | `threading::spawn_user_thread_initializing` | every per-thread array: pending signals, signal masks, sigaltstacks, wakers, saved contexts |
+| **PID** | `allocate_pid()`, stored as `Process::pid` | the process table, fd tables, CHILD_CHANNELS, `wait4` |
+
+`Process::thread_id` maps PID → TID; `THREAD_PID_MAP` maps TID → PID.
+
+**Everything userspace sees as a "tid" must be the TID.** Three syscalls
+publish one, and all three must agree:
+
+- `gettid()` → `threading::current_thread_id()`
+- `clone(CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID)` → the word written at
+  `parent_tid`/`child_tid`, **and** clone's return value (`clone_thread`)
+- `set_tid_address()` → its return value (`sys_set_tid_address`)
+
+`tkill`/`tgkill` take that value straight to `pend_signal_for_thread` and
+`thread_signal_mask_of`, which are slot-indexed. Publishing a PID instead
+therefore aims every self-signal at whatever unrelated thread happens to sit
+in that slot — `clone_thread` and `set_tid_address` both did, which is why
+`abort()` never worked on a spawned thread (see
+[`signal.md`](signal.md) "Default action for pended signals" and
+`archive/SELFHOST_DEVBOX_SMOLTCP.md` "SIGABRT delivery").
+
+**Known residual divergence:** `getpid()` returns `Process::pid`, so each
+thread in a group sees a *different* value; Linux returns the shared `tgid`.
+`sys_tgkill`'s `proc.tgid != tgid` check consequently rejects a caller that
+passes `getpid()` from a non-leader thread. Not yet fixed — `getpid` is load
+bearing for `wait4`/CHILD_CHANNELS keying, so the change needs its own pass.
+
 ## execve
 
 `do_execve` → `Process::replace_image[_from_path]`

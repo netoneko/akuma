@@ -1352,6 +1352,61 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         signal, handler_addr, restorer);
     true
 }
+
+/// Apply the *default* action for a pended signal that `try_deliver_signal`
+/// declined, terminating the thread group when that action is termination.
+///
+/// `try_deliver_signal` only ever installs a **user** handler, so it returns
+/// false for two unrelated reasons: the disposition is SIG_DFL/SIG_IGN (nothing
+/// to jump to), or a `UserFn` delivery was deliberately re-pended (no
+/// sigaltstack yet, re-entrant on the altstack). Re-reading the action here
+/// separates them — only SIG_DFL is a disposition question, and the re-pend
+/// paths are unreachable without a `UserFn` handler, so they are never mistaken
+/// for "kill me".
+///
+/// Callers previously just returned normally on false, which silently **dropped**
+/// every fatal SIG_DFL signal that arrived via the pending queue. That is why
+/// `abort()` never worked from a spawned thread: musl blocks SIGABRT, `tkill`s
+/// itself — and `sys_tkill` pends rather than acts when the signal is blocked —
+/// then unblocks it. Delivery at that `rt_sigprocmask` return found SIG_DFL,
+/// returned false, and discarded the signal, so musl fell through to its
+/// `a_crash()` (`strb wzr, [x0]`) and the process died reporting *SIGSEGV at
+/// FAR=0* instead of SIGABRT. Repro: `userspace/forktest/c_stress/abortsig.c`.
+///
+/// Fatality uses `signal_is_fatal_default`, which is deliberately conservative
+/// (no SIGUSR1/2, no RT signals — see its doc comment); this path must not turn
+/// the self-host build's SIGUSR1 storm into a kill.
+///
+/// Diverges when the signal is fatal; returns normally otherwise.
+fn apply_default_signal_action(signal: u32) {
+    if crate::config::TRACE_TKILL {
+        crate::safe_print!(96, "[signal] default-action check sig={} slot={}\n",
+            signal, akuma_exec::threading::current_thread_id());
+    }
+    let Some(pid) = akuma_exec::process::read_current_pid() else { return };
+    let Some(proc) = akuma_exec::process::lookup_process_shared(pid) else { return };
+
+    let idx = (signal as usize).wrapping_sub(1);
+    if idx >= akuma_exec::process::MAX_SIGNALS {
+        return;
+    }
+    let handler = {
+        let actions = proc.signal_actions.actions.lock();
+        actions[idx].handler
+    };
+    if !matches!(handler, akuma_exec::process::SignalHandler::Default) {
+        return;
+    }
+    if !crate::syscall::signal::signal_is_fatal_default(signal) {
+        return;
+    }
+
+    crate::safe_print!(128,
+        "[signal] Process {} ({}) terminated by signal {} (default action)\n",
+        proc.pid, proc.name, signal);
+    crate::syscall::proc::sys_exit_group_pub(-(signal as i32)) // never returns
+}
+
 /// Restore saved context from a signal frame on the user stack (rt_sigreturn).
 /// Returns the saved x0 value, or None if the frame is invalid.
 ///
@@ -2600,6 +2655,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                 if try_deliver_signal(frame, sig, 0, false, esr) {
                                     return u64::from(sig);
                                 }
+                                apply_default_signal_action(sig); // diverges if fatal
                             }
                         }
                         // handle_syscall was not invoked; do not clear CURRENT_SYSCALL_NR /
@@ -2787,6 +2843,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             if try_deliver_signal(frame, sig, 0, false, esr) {
                                 return u64::from(sig);
                             }
+                            apply_default_signal_action(sig); // diverges if fatal
                         }
                     }
                     return saved_x0;
@@ -2861,6 +2918,16 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             // sees it at the next syscall boundary (async delivery via pending queue).
             let sig_mask = akuma_exec::threading::thread_signal_mask();
 
+            if crate::config::TRACE_TKILL {
+                let slot = akuma_exec::threading::current_thread_id();
+                let pend = akuma_exec::threading::pending_signals_raw(slot);
+                if pend != 0 {
+                    crate::safe_print!(128,
+                        "[signal] syscall-ret nr={} slot={} pending={:#x} mask={:#x}\n",
+                        syscall_num, slot, pend, sig_mask);
+                }
+            }
+
             if let Some(sig) = akuma_exec::threading::take_pending_signal(sig_mask) {
                 // For async signals like SIGURG (23), check if sigaltstack is configured.
                 // Go threads call sigaltstack during mstart1 - if not yet configured,
@@ -2879,8 +2946,13 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     if try_deliver_signal(frame, sig, 0, false, esr) {
                         return u64::from(sig); // x0 = signal number for the handler
                     }
+                    // No user handler took it — apply the default action, which
+                    // for a fatal signal (SIGABRT from abort(), SIGTERM from
+                    // kill(2), …) kills the thread group and never returns.
+                    apply_default_signal_action(sig);
                 }
-                // Delivery failed (no handler / bad stack); just return normally.
+                // Delivery failed (re-pended / bad stack) or the default action is
+                // to discard; just return normally.
             }
 
             ret

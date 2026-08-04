@@ -2694,6 +2694,11 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
 
 /// Clone a thread within the same process (CLONE_THREAD | CLONE_VM).
 /// The child shares the parent's address space and file descriptors.
+///
+/// Returns the child's **TID** (kernel thread slot) — the same namespace as
+/// `gettid()`, `tkill`, and every per-thread array. Not the child's PID: the
+/// thread's process-table entry has its own id, and callers that need it must
+/// resolve it through `THREAD_PID_MAP`.
 pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u64) -> Result<u32, &'static str> {
     // Serialize lifecycle against preemption under shared-kernel SMP — see
     // `process/lifecycle.rs`. CLONE_THREAD creates a new thread + Process and
@@ -2830,19 +2835,33 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     register_process(child_pid, new_proc);
     clone_lazy_regions(parent_pid, child_pid);
 
-    // Write child TID/PID to parent_tid_ptr (CLONE_PARENT_SETTID).
+    // Publish the child's TID (CLONE_PARENT_SETTID / CLONE_CHILD_CLEARTID).
+    //
+    // This MUST be the kernel thread slot `tid`, not `child_pid`. The slot is
+    // Akuma's thread-id namespace: `gettid()` returns `current_thread_id()`, and
+    // every per-thread array — pending signals, signal masks, sigaltstacks,
+    // wakers — is indexed by it. `child_pid` is a *process-table* id from a
+    // different counter, and the two only coincide by accident.
+    //
+    // Publishing `child_pid` here made musl cache the wrong value in
+    // `pthread_self()->tid`, so every later `tkill(self->tid, …)` addressed an
+    // unrelated slot: `abort()` on a spawned thread pended SIGABRT on some other
+    // process's thread (observed landing on sshd, which then spun forever with a
+    // stuck pending signal) while the aborting thread saw nothing and fell
+    // through to musl's `a_crash()`. Repro: userspace/forktest/c_stress/abortsig.c.
+    //
     // Plain EL1 store is safe here: the bits-32+ guard in sys_clone_pidfd
     // prevents garbage flags from entering clone_thread, so the caller is
     // always a legitimate CLONE_THREAD|CLONE_VM request with writable pages.
     // copy_to_user_safe was tried here but its byte-by-byte strb through
     // the fault-handler mechanism silently returned EFAULT on some pages,
     // leaving mp.procid=0 and crashing the Go runtime.
+    let child_tid = tid as u32;
     if parent_tid_ptr != 0 {
-        unsafe { core::ptr::write(parent_tid_ptr as *mut u32, child_pid); }
+        unsafe { core::ptr::write(parent_tid_ptr as *mut u32, child_tid); }
     }
-    // Write child TID/PID to child_tid_ptr (CLONE_CHILD_CLEARTID).
     if child_tid_ptr != 0 {
-        unsafe { core::ptr::write(child_tid_ptr as *mut u32, child_pid); }
+        unsafe { core::ptr::write(child_tid_ptr as *mut u32, child_tid); }
     }
 
     // POSIX: the new thread inherits the CREATING thread's signal mask — and it must be
@@ -2860,7 +2879,9 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         log::debug!("[syscall] clone_thread: PID {} -> thread PID {} (tid {})", parent_pid, child_pid, tid);
     }
 
-    Ok(child_pid)
+    // Linux returns the child's TID from clone(2), and it must agree with what
+    // `gettid()` and CLONE_PARENT_SETTID report — see the TID note above.
+    Ok(child_tid)
 }
 
 /// Allocate a new unique PID (uses the same global counter as Process::from_elf)

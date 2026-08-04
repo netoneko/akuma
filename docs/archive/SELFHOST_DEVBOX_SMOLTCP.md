@@ -1380,3 +1380,146 @@ WARNING` on tgid-resolution miss, `tgid` on the `FUTEX_DBG_ENABLED` `WAKE` line,
 `[threads]` high-water and exhaustion census. `FUTEX_DBG_ENABLED` itself is back
 to `false` — note that turning it on perturbs timing enough to sometimes hide
 the stall.
+
+---
+
+# SIGABRT delivery: `abort()` on a spawned thread never died (2026-08-04, FIXED)
+
+Closes signature 2 above ("thread-spawn `SIGABRT`, open, crate-agnostic"). The
+`-j4` failure was never two bugs alternating between `signal: 6` and
+`signal: 11` — it is one `rtabort!` whose SIGABRT the kernel dropped, and the
+`SIGSEGV at FAR=0` was musl giving up, not memory corruption.
+
+## The probe
+
+`userspace/forktest/c_stress/abortsig.c` forks a child per case, aborts, and
+reports `WTERMSIG` from the parent — SIGABRT means delivery worked, SIGSEGV
+means musl reached `a_crash()` (`strb wzr, [x0]`, `x0` deliberately zeroed) two
+instructions past the `rt_sigprocmask` in `abort+0xc`. Before the fix:
+
+```
+[A main-thread abort ] signal 6  -- SIGABRT (delivery OK)
+[B new-thread abort  ] signal 11 -- SIGSEGV (musl a_crash -- SIGABRT NOT DELIVERED)
+[C thread-then-abort ] signal 11 -- SIGSEGV
+[D] 20x new-thread abort: 20 did NOT die by SIGABRT
+```
+
+(An earlier run had B passing; re-running showed B is simply flaky, so B/C/D are
+one phenomenon, not two. "Brand new thread vs running thread" was a red herring —
+so was "timing".)
+
+## Two independent bugs, both required
+
+`TRACE_TKILL` on the failing case printed the whole story in six lines:
+
+```
+[signal] tkill(tid=8, sig=6) from slot=15
+[signal]   tkill disp=DFL mask=0xfffffffc7ffbfeff blocked=true fatal=true
+[signal] syscall-ret nr=101 slot=10 pending=0x20 mask=0xfffffffc7ffbfeff
+[signal] syscall-ret nr=202 slot=10 pending=0x20 mask=0xfffffffc7ffbfeff
+   … repeating forever on slot 10 …
+```
+
+**(1) `tkill` was being handed a PID, not a TID.** The aborting thread runs on
+kernel thread slot **15** but `tkill`s **8**. `pend_signal_for_thread` and
+`thread_signal_mask_of` index the per-thread arrays by slot, so the SIGABRT
+landed on slot 8 — a different thread, in a different process. The repeating
+`slot=10` lines above are **sshd**: `nanosleep`/`accept`/`recvfrom` in a loop
+with a stuck pending SIGABRT it can never take, injected by an unrelated
+process's `abort()`.
+
+Cause: `clone_thread` wrote `child_pid` into the `CLONE_PARENT_SETTID` /
+`CLONE_CHILD_CLEARTID` words and returned it, while `gettid()` returns
+`current_thread_id()` — two different counters published as the same thing.
+musl caches the SETTID value in `pthread_self()->tid` and uses it for every
+later `raise`/`pthread_kill`/`abort`. `sys_set_tid_address` had the same bug
+(it returned `p.pid`), which is what musl's `__init_tp` caches for the
+**initial** thread.
+
+That also explains why case A "worked": the main thread's `tkill(tid=6)` from
+slot 13 read slot 6's mask, found `0x0`, decided "not blocked", and took
+`sys_tkill`'s *immediate* `sys_exit_group` path — which acts on the **current**
+process, not the target. Right answer, wrong reasoning, pure luck.
+
+**(2) A fatal `SIG_DFL` signal arriving through the pending queue was
+discarded.** Fix (1) alone is not enough. musl's `abort()` blocks SIGABRT
+before `tkill`ing itself, so `sys_tkill` takes the *blocked* branch and pends
+rather than acting. At the following `rt_sigprocmask(SIG_UNBLOCK)` return,
+`take_pending_signal` produced the signal, `try_deliver_signal` returned
+`false` (no `UserFn` handler — Rust installs one for SIGSEGV/SIGBUS, not
+SIGABRT), and the caller commented *"Delivery failed (no handler / bad stack);
+just return normally"* and dropped it. musl then ran out of ways to die and
+executed `a_crash()`.
+
+The same hole meant `kill(pid, SIGTERM)` on a default-disposition process did
+nothing: `sys_kill` pends on every thread with no disposition check at all.
+
+## The fix
+
+- `crates/akuma-exec/src/process/mod.rs` — `clone_thread` publishes and returns
+  the thread slot, not `child_pid`.
+- `src/syscall/proc.rs` — `sys_set_tid_address` returns `current_thread_id()`.
+- `src/exceptions.rs` — new `apply_default_signal_action`, called at all three
+  pended-signal delivery sites when `try_deliver_signal` returns `false`. It
+  re-reads the disposition so the two legitimate re-pend cases (`SA_ONSTACK`
+  with no altstack, re-entrant on altstack) are not mistaken for a kill, and
+  applies `sys_exit_group_pub(-sig)` for `SIG_DFL` + `signal_is_fatal_default`.
+- `src/syscall/signal.rs` — `signal_is_fatal_default` made `pub(crate)`, plus
+  richer `TRACE_TKILL` output (disposition/mask/blocked/fatal, and the
+  pending-set at syscall return).
+
+Fatality still comes from `signal_is_fatal_default`, which deliberately
+excludes SIGUSR1/2 and the RT range (§7k.5) — so the rustc SIGUSR1 storm, which
+now actually reaches its intended threads, still cannot kill anything.
+
+## Verification
+
+`abortsig`, same VM, after the fix — and the trace now shows self-targeting
+(`tid == slot`) and the pend/unblock/default-action path for **case A too**,
+rather than the lucky shortcut:
+
+```
+[A main-thread abort ] signal 6 -- SIGABRT (delivery OK)
+[B new-thread abort  ] signal 6 -- SIGABRT (delivery OK)
+[C thread-then-abort ] signal 6 -- SIGABRT (delivery OK)
+[D] 20x new-thread abort: 0 did NOT die by SIGABRT
+=== ABORTSIG DONE — all aborts delivered ===
+```
+
+```
+[signal] tkill(tid=13, sig=6) from slot=13
+[signal]   tkill disp=DFL mask=0xfffffffc7ffbfeff blocked=true fatal=true
+[signal] syscall-ret nr=130 slot=13 pending=0x20 mask=0xfffffffc7ffbfeff
+[signal] syscall-ret nr=135 slot=13 pending=0x20 mask=0x0
+[signal] default-action check sig=6 slot=13
+[signal] Process 6 (/tmp/abortsig) terminated by signal 6 (default action)
+```
+
+Regression sweep, same boot, all clean: `segvchild`, `pipewake`, `tlsdirty`
+(`dirty_hits=0 alias_hits=0`), `futexops` (0 divergences), `threadmax`
+(ceiling 243, 400/400 churn). Host unit tests pass.
+
+## What this exposes: the real `rtabort!`
+
+Fixing delivery does **not** make the `-j4` build pass — it makes the failure
+legible. Same build, after the fix, deterministically:
+
+```
+fatal runtime error: current thread handle already set during thread spawn, aborting
+error: could not compile `curve25519-dalek` (build script)
+  … (signal: 6, SIGABRT: process abort signal)
+```
+
+That is Rust std's `thread::set_current` `rtabort!`: a **newly spawned thread
+found its `CURRENT` thread-local already non-empty**. `CURRENT` lives in ELF
+TLS (`.tbss`), which musl expects to be zero because `pthread_create` mmaps a
+fresh stack+TLS block each time. So the next question is whether Akuma hands
+back a recycled anonymous mapping without zeroing it, leaving a previous
+thread's handle in the new thread's `.tbss`.
+
+Note `tlsdirty` reports `dirty_hits=0 alias_hits=0` — it checks `__thread`
+variables across sequential spawn/join and a 24-thread fan-out, so it either
+doesn't cover the `.tbss` range Rust's `CURRENT` occupies, or the aliasing needs
+the concurrency `-j4` supplies. Extending that probe is the cheap next step.
+
+Signature 3 (lost-wakeup stall) is untouched by any of this and remains open.

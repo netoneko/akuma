@@ -190,14 +190,20 @@ pub(super) fn sys_uname(buf: u64) -> u64 {
     0
 }
 
+/// set_tid_address(2) — record the clear_child_tid futex address and return the
+/// caller's **TID**.
+///
+/// Returning the PID here is not harmless bookkeeping: musl's `__init_tp` caches
+/// this value in the initial thread's `pthread_self()->tid`, and every later
+/// `raise`/`pthread_kill`/`abort` passes it to `tkill`, which indexes the
+/// per-thread arrays by kernel thread slot. A PID sent a self-signal to whatever
+/// unrelated thread happened to occupy that slot. Same namespace rule as
+/// `clone_thread`'s CLONE_PARENT_SETTID write and `gettid()`.
 pub(super) fn sys_set_tid_address(tidptr: u64) -> u64 {
-    if let Some(pid) = akuma_exec::process::with_current_process(|p| {
+    akuma_exec::process::with_current_process(|p| {
         p.clear_child_tid = tidptr;
-        p.pid
-    }) {
-        return u64::from(pid);
-    }
-    1
+    });
+    akuma_exec::threading::current_thread_id() as u64
 }
 
 pub(super) fn sys_set_robust_list(head: u64, len: usize) -> u64 {

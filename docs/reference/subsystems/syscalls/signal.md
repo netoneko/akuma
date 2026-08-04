@@ -8,8 +8,11 @@ build/unwind lives in `src/exceptions.rs` (`try_deliver_signal`,
 `rt_sigsuspend`/`rt_sigtimedwait` see [`../scheduler.md`](../scheduler.md)
 "Blocking & wait/wake".
 
-> **Stability: C (active risk).** Last touched 2026-06-22, inside the Jun
-> 2026 "memory + signal crisis" fire window (`docs/README.md`). The recurring
+> **Stability: C (active risk).** Last touched 2026-08-04 (fatal `SIG_DFL`
+> signals arriving via the pending queue were dropped, and `tkill` was being
+> handed PIDs — see "Default action for pended signals"); before that
+> 2026-06-22, inside the Jun 2026 "memory + signal crisis" fire window
+> (`docs/README.md`). The recurring
 > lesson: **signal *disposition* is process-wide, signal *mask* and
 > *sigaltstack* are per-thread** — `proc.signal_actions.actions` is a shared
 > `Spinlock<[SignalAction; 64]>` (correct: POSIX handlers are shared across
@@ -99,6 +102,35 @@ bottom out in.
   (prevents mis-delivery to a tid recycled into a different process); falls
   through to `tkill`'s own handling otherwise.
 - `send_sigpipe()` (pipe writes) is just `sys_tkill(current_tid, 13)`.
+
+**`tid` here is a kernel thread slot, never a PID.** `pend_signal_for_thread`
+and `thread_signal_mask_of` index the per-thread arrays directly with whatever
+`tkill` was handed, so a caller that cached a PID signals an unrelated thread —
+possibly in another process. See [`proc.md`](proc.md) "TID vs PID" for the
+three syscalls that must publish the same value.
+
+### Default action for pended signals
+
+`try_deliver_signal` only ever installs a **user** handler; it returns `false`
+for `SIG_DFL`/`SIG_IGN`. The pended-signal delivery sites in
+`rust_sync_el0_handler` (normal syscall return, after `rt_sigreturn`, and the
+JIT/IC-flush replay path) therefore call `apply_default_signal_action`
+(`exceptions.rs`) on `false`: it re-reads the disposition and, for `SIG_DFL`
+plus `signal_is_fatal_default`, calls `sys_exit_group_pub(-sig)`.
+
+Re-reading the action is what separates "no handler" from the two re-pend
+cases (`SA_ONSTACK` with no altstack yet, re-entrant on the altstack), which
+are unreachable without a `UserFn` handler and so can never be mistaken for
+"kill me".
+
+Without this step a fatal `SIG_DFL` signal that arrived through the *pending*
+queue was silently discarded — the queue is the only path for a signal pended
+while blocked, so `abort()` (musl blocks SIGABRT, `tkill`s itself, then
+unblocks) and `kill(pid, SIGTERM)` on a default-disposition process both did
+nothing. `abort()` then fell through to musl's `a_crash()` (`strb wzr, [x0]`),
+reporting **SIGSEGV at FAR=0** for what was really an undelivered SIGABRT.
+Repro: `userspace/forktest/c_stress/abortsig.c`
+(`archive/SELFHOST_DEVBOX_SMOLTCP.md` "SIGABRT delivery").
 
 ## rt_sigreturn (frame unwind)
 
