@@ -1011,6 +1011,197 @@ Measured effect on `MEMORY=8192 SMP=4`:
 Three host tests hard-coded the old 64 (`constants_sanity` and two
 `calculate_stack_requirements` cases); they now derive from `MAX_THREADS`.
 
+### Rebuild after all of the above: still fails, identically
+
+Fresh clone, `-j4`, kernel carrying the slot scrub, the futex purge hook and
+`MAX_THREADS=256`. **Same abort, same +121s, fourth distinct crate**
+(`unicode-ident`; previously `quote`, `proc-macro2`, `const-oid`) — conclusively
+crate-agnostic. It reached 9 `Compiling` lines instead of 7, which is race
+jitter, not progress.
+
+`uname` did confirm the build-identity work is live:
+`Akuma akuma 0.0.7 8b82119-release-smp-shared aarch64 Linux`.
+
+**Thread exhaustion is ruled out for this run.** The only two exhaustion events
+in an 84 k-line log are at lines 1546-1547, and the build's cargo does not appear
+until line 7962 — they belong to a `threadmax` probe run earlier in the same boot.
+Peak during the build was ~40 live threads against a 248 ceiling. The two failure
+modes are also distinguishable by their symptom: slot exhaustion surfaces as Rust's
+`failed to spawn thread: Os { code: 11 }` **panic (exit 101)**, which is exactly
+what the 16× `futextest_rs` runs produced; this is an **abort (signal 6)**.
+
+**After the abort, cargo hangs forever.** Every rustc child exits, and cargo sits
+in "waiting for other jobs to finish" indefinitely with both of its own threads
+parked in `FUTEX_WAIT_BITSET|PRIVATE` and nothing left to wait for. `/tmp/build.rc`
+is never written. So one `-j4` run now reproduces **both** open issues in ~2 minutes
+— previously the stall needed a multi-hour build.
+
+### Where the abort comes from in Rust, exactly
+
+`rtabort!("current thread handle already set during thread spawn")` is
+`library/std/src/thread/lifecycle.rs:162`, in `ThreadInit::init`, which runs **on
+the freshly spawned OS thread before its closure**. It fires when `set_current`
+(`library/std/src/thread/current.rs:121`) returns `Err`, and there are *two* ways
+for that — the second is easy to miss:
+
+```rust
+if CURRENT.get() != NONE { return Err(thread); }   // TLS pointer non-null
+match id::get() {
+    Some(id) if id == thread.id() => {}
+    None => id::set(thread.id()),
+    _ => return Err(thread),                        // stale thread-id in TLS
+}
+```
+
+Both read thread-local storage. musl's `__copy_tls` on aarch64 memcpy's only
+`.tdata` and relies on the fresh `mmap(MAP_ANONYMOUS)` behind `.tbss` arriving
+zeroed. So the abort reduces to a kernel-contract question: **did a new thread
+read non-zero from storage that had to arrive as zeros, or did its TPIDR_EL0 aim
+at another thread's block?**
+
+### `tlsdirty.c` — the contract probe, and four falsified hypotheses
+
+New probe `userspace/forktest/c_stress/tlsdirty.c` tests that contract with no
+Rust runtime: every spawned thread asserts its own `.tbss` reads zero, scribbles a
+sentinel, and exits, so a VA recycled without re-zeroing is caught by name; a
+fan-out phase publishes `&tls_current` per live thread to detect TLS aliasing.
+Phases: 2000× sequential churn, 24-way fan-out, and churn-under-fan-out.
+
+**On a clean boot it passes: `dirty_hits=0 alias_hits=0`, exit 0.** So on an idle
+system Akuma delivers zeroed TLS and never aliases it.
+
+Four hypotheses were tested and **falsified** — recorded so they are not re-derived:
+
+| hypothesis | test | result |
+|---|---|---|
+| Dirty/aliased TLS on a fresh thread | `tlsdirty`, clean boot | zero hits |
+| Thread-slot exhaustion causes the abort | log line numbers + symptom | exhaustion → exit 101 panic, not signal 6 |
+| A neighbouring Rust abort misdelivers its signal/stderr | `boom` (deliberate `std::process::abort` from a thread) × 400 run alongside `tlsdirty` | `tlsdirty` exit 0, zero `BOOM-MARKER` leakage |
+| Deleted-file pages leak into fresh files | write 200 KB marker file → delete → create small file, ×6 | correct sizes, zero marker hits |
+
+### RESOLVED: the "foreign abort text" was a filesystem bug, and it faked a SIGABRT
+
+Run on a VM that had already run a *failing* build, the pure-C `tlsdirty` and
+(earlier, separately) the pure-C `futextest` both appeared to exit **134
+(SIGABRT)** with fragments of the *rustc* abort text in their own redirected
+output files. Neither C binary contains that string (`strings | grep -c` = 0).
+That looked like signal/stderr misdelivery. **It was not. Nothing was
+misdelivered, and the C programs never aborted.**
+
+Isolated with a `GDB=1` boot that reproduced the `-j4` jam **without any abort
+occurring in that boot at all** (0 `fatal runtime error` in the build log) — so
+no live process could possibly have produced the string. `tlsdirty` was then run,
+and while it was **still running** (`ps` showed it alive, its `.rc` file never
+written) its output file already read:
+
+```
+fatal runtime error: current thread handle already set during thread spawn, aborting
+ each time
+```
+
+`" each time"` is the tail of *tlsdirty's own* line "…checking TLS is zero each
+time". The abort line is 85 bytes, that tail is 11 — exactly the 96 bytes the
+file reports. So the first 85 bytes are foreign and only the tail is the real
+writer's.
+
+**The harness assumption was wrong first: `/tmp` is on the persistent ext2 disk,
+not tmpfs.** With `SNAPSHOT=0` the image survives reboots, and `/tmp` still held
+`build.out` from an earlier boot containing that exact line (verified: it is line
+10 of that file). Every conclusion drawn from a `.out`/`.rc` file in this
+document was therefore drawn from storage that is **not** cleared between runs.
+That alone explains the misreadings.
+
+**What is left over and NOT explained** — stated as an open anomaly, not a root
+cause, because it has not been isolated: `jam.out` was a *freshly created* inode
+(6935, made after an `rm -f`) whose first 85 bytes were content no process in
+that boot wrote, with the writer's own bytes appearing only from offset 85. It is
+not live block sharing — `build.out` (inode 22) is byte-intact at 1166 bytes with
+no `tlsdirty` text in it. Simple create/delete/create and truncate-on-open cycles
+do **not** reproduce it. Whether that is stale block content, a size/offset
+bookkeeping bug, or an artifact of the long-running writer is **unproven**; do
+not cite it as a known filesystem defect without reproducing it deliberately.
+
+**The consequence that matters for every earlier conclusion in this document:
+`rc=134` was almost certainly stale `.rc` content too.** The wrapper writes
+`echo $? > /tmp/<tag>.rc`, so those files are subject to the same defect, and a
+`134` written by a genuinely-aborting run can resurface in a later run's `.rc`.
+In the isolated case above the process was demonstrably alive with an empty
+`.rc`. **So the entire "pure C programs get SIGABRT under load" thread was a
+measurement artifact of this filesystem bug, not a kernel signal defect.**
+
+Four other hypotheses had already been falsified before this one landed (dirty
+TLS, slot exhaustion, live abort misdelivery, naive block reuse) — see the table
+above. The lesson for future passes: **on this rootfs, `/tmp` is disk-backed and
+persistent; never trust an output or `.rc` file as evidence without checking its
+size against what the writer actually emitted**, and prefer a fresh disk or a
+unique filename per run.
+
+**Still open, and not touched by this:** the rustc `-j4` abort itself is real —
+cargo reports `signal: 6` for a specific rustc it spawned, which is its own wait
+status and not file content. And the jam is real and now reproducible *without*
+the abort (see above), which proves the two are independent defects.
+
+### The jam: a child dies and the parent never finds out (2026-08-04)
+
+The `GDB=1` boot that jammed with **zero aborts** gives the clearest picture yet.
+
+Exactly one fault occurred in the whole boot:
+
+```
+[T47.12] [Fault] Data abort from EL0 at FAR=0x0, ELR=0x300204e8, ISS=0x47
+[Fault]  x0=0x0 x1=0x16667f908 x2=0x0 x3=0x8
+[Fault] Process 79 (/usr/local/bin/rustc) SIGSEGV after 0.02s
+[Fault] SIGSEGV in clone_thread, calling exit_group
+```
+
+A rustc NULL-dereferenced **inside `clone_thread`**, 0.02 s into its life. Note
+this is a *different* failure from the `-j4` SIGABRT — a kernel-delivered SIGSEGV,
+not a userspace `rtabort!` — and it is the same signature seen once before in the
+`futexdbg` boot.
+
+**Cargo never learned.** `build.out` records 8 `Compiling` lines, **0 errors** — a
+reaped `signal: 11` child always produces `could not compile … (signal: 11)`. The
+build then stopped dead: no rustc alive, no new output for 20+ minutes, and the
+artifact tree shows exactly where it stalled — `libcfg_if-*.rmeta` and
+`libproc_macro2-*.rmeta` exist with **no matching `.rlib`**, i.e. pipelined rustc
+runs that emitted metadata and then vanished mid-compile.
+
+`[THR-DUMP]` for cargo's thread group (tgid=11) shows why it stays alive — and
+**no thread is in `wait4`**:
+
+```
+tid=11 pid=26 tgid=11  sc=-1 tsc=63  a0=0x5           read() on the jobserver pipe
+tid=15 pid=11 tgid=11  sc=98 tsc=98  a1=0x89          leader, FUTEX_WAIT_BITSET
+tid=12 pid=73 tgid=11  sc=-1 tsc=98  a0=0x160034244
+tid=39 pid=66 tgid=11  sc=-1 tsc=98  a0=0x160034244   same address as tid=12
+tid=21 pid=70 tgid=11  sc=-1 tsc=98  a0=0x300c2030
+tid=22 pid=80 tgid=11  sc=-1 tsc=98  a0=0x300c2030    same address as tid=21
+```
+
+So cargo is not blocked reaping — it is blocked on its own job/token accounting:
+a slot is held by a job it believes is still running, its jobserver token is
+never returned, and the helper's `read(fd=5)` waits forever for a token that will
+never be written.
+
+**The suspicious site, flagged not proven** (`src/exceptions.rs:3543-3550`):
+
+```rust
+let is_clone_thread = proc.address_space.is_shared();
+if is_clone_thread {
+    sys_exit_group_pub(-11);                       // never returns
+}
+notify_child_channel_exited_pub(proc.pid, -11);    // unreachable on that path
+vfork_complete(proc.pid);                          // unreachable on that path
+```
+
+`sys_exit_group` does perform its own `notify_child_channel_exited` for both
+`pid` and `tgid` (with a load-bearing ordering comment), so the notify is
+*attempted* and this is not self-evidently the bug. Also note `is_shared()` is
+true for a **vfork child** as well as a `clone_thread` sibling, so this branch can
+fire for a process whose parent is waiting on it directly. Whether the notify is
+lost, aimed at the wrong channel, or races the teardown is the open question —
+now answerable, because the whole thing reproduces in ~10 minutes.
+
 ### `threadmax` phase B: cooldown wall, not a regression
 
 Phase B failed at iteration 0 in one run, having passed 400/400 earlier. Cause

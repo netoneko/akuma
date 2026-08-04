@@ -11,4 +11,7 @@ c_stress/futextest
 c_stress/futexops
 c_stress/threadmax
 c_stress/futextest_rs
+c_stress/tlsdirty
+c_stress/boom
+c_stress/segvchild
 
