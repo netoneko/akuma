@@ -1537,7 +1537,7 @@ when a build-unit rustc SIGSEGVs.
 
 ### 7l. Retest on `devbox-smoltcp` after the execve-leak fix (Aug 2 2026)
 
-Full write-up: `docs/archive/SELFHOST_DEVBOX_SMOLTCP_2026-08-02.md`. Short
+Full write-up: `docs/archive/SELFHOST_DEVBOX_SMOLTCP.md`. Short
 version: re-ran self-host, this time on the **`release-smp-shared` profile +
 `devbox-smoltcp` feature** (§7j's original success was the plain rump
 `devbox`) at HEAD `5ea6024`, specifically to stress-test the execve-heap-leak

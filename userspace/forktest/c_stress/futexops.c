@@ -3,7 +3,7 @@
  * semantics, op by op, to find lost-wakeup generators.
  *
  * Written for the "Open issue #2" lost-wakeup stall in
- * docs/archive/SELFHOST_DEVBOX_SMOLTCP_2026-08-02.md: two rustc worker threads
+ * docs/archive/SELFHOST_DEVBOX_SMOLTCP.md: two rustc worker threads
  * parked in an unreturned futex syscall forever, low CPU. futextest.c already
  * showed the *common* paths (WAIT/WAKE, condvar, barrier, park/unpark) are fine,
  * so this probes the less-travelled ops that a lost wakeup could hide in.

@@ -1399,7 +1399,7 @@ extern "C" fn reclaim_probe_never_ready() -> ! {
 /// 2026-08-03 it did a single linear scan and handed `EAGAIN` straight to userspace: a
 /// tight, correctly-`pthread_join`ed 200x `pthread_create` loop died around iteration
 /// 58-68 of 200 with `MAX_THREADS = 64` while most of the pool sat TERMINATED
-/// (`docs/archive/SELFHOST_DEVBOX_SMOLTCP_2026-08-02.md`, repro
+/// (`docs/archive/SELFHOST_DEVBOX_SMOLTCP.md`, repro
 /// `userspace/forktest/c_stress/futextest.c` phase 2).
 ///
 /// The discriminator is `free_at_spawn == 0`: with no FREE slot left in the user range,

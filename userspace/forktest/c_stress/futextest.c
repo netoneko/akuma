@@ -2,7 +2,7 @@
  * futextest.c — pure-C control for userspace/selfhost_repro/futextest.rs, to
  * disambiguate kernel-vs-Rust-runtime thread/futex hangs on Akuma
  * (docs/archive/AKUMA_SELF_HOSTING.md §7g/§7h, docs/archive/
- * SELFHOST_DEVBOX_SMOLTCP_2026-08-02.md "Open issue #2").
+ * SELFHOST_DEVBOX_SMOLTCP.md "Open issue #2").
  *
  * Mirrors futextest.rs phase-for-phase using raw pthread + a raw FUTEX_WAIT/
  * FUTEX_WAKE park/unpark for phase 7 (std::thread::park has no direct POSIX

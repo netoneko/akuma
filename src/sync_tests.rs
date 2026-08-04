@@ -2135,7 +2135,7 @@ fn test_futex_private_tgid_isolation() {
     let uaddr = FUTEX_WORD_TI.as_ptr() as usize;
 
     // Wake with wrong tgid (99) — should find no waiters at (99, uaddr).
-    let woken_wrong = crate::syscall::futex_do_wake(99, uaddr, u32::MAX);
+    let woken_wrong = crate::syscall::futex_do_wake(99, uaddr, u32::MAX, u32::MAX);
     assert!(woken_wrong == 0, "test_futex_private_tgid_isolation: wrong tgid should wake 0, got {woken_wrong}");
 
     for _ in 0..5 { threading::yield_now(); }
@@ -2143,7 +2143,7 @@ fn test_futex_private_tgid_isolation() {
         "test_futex_private_tgid_isolation: thread must not have run after wrong-tgid wake");
 
     // Wake with correct tgid (0) — wakes the thread.
-    let woken_right = crate::syscall::futex_do_wake(0, uaddr, 1);
+    let woken_right = crate::syscall::futex_do_wake(0, uaddr, 1, u32::MAX);
     assert!(woken_right == 1, "test_futex_private_tgid_isolation: correct tgid should wake 1, got {woken_right}");
 
     let mut done = false;
@@ -2221,7 +2221,7 @@ fn test_futex_do_wake_zero_misses_nonzero_tgid_waiter() {
     for _ in 0..15 { threading::yield_now(); }
 
     // Wake only the (0, addr) queue — must miss our (42, addr) waiter.
-    let woken = crate::syscall::futex_do_wake(0, uaddr, u32::MAX);
+    let woken = crate::syscall::futex_do_wake(0, uaddr, u32::MAX, u32::MAX);
     assert_eq!(woken, 0,
         "test_futex_do_wake_zero_misses_nonzero_tgid_waiter: do_wake(0) should miss (42,addr), got {woken}");
     for _ in 0..10 { threading::yield_now(); }
