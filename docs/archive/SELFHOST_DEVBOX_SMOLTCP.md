@@ -1141,7 +1141,132 @@ cargo reports `signal: 6` for a specific rustc it spawned, which is its own wait
 status and not file content. And the jam is real and now reproducible *without*
 the abort (see above), which proves the two are independent defects.
 
-### The jam: a child dies and the parent never finds out (2026-08-04)
+### Signal-mask inheritance was missing on fork/vfork, and racy on clone (2026-08-04, FIXED)
+
+Found by auditing every thread/process creation leaf for mask correctness after the
+crash evidence kept landing in the post-fork, pre-exec window.
+
+**Why it hid.** There are *two* masks. `Process.signal_mask` **is** inherited on fork
+(`process/mod.rs:1927/2622/2755`), so the code reads as correct at a glance — but signal
+delivery deliberately does not use that field. `exceptions.rs:1246` says so outright:
+*"per-thread mask (NOT proc.signal_mask, which is shared across CLONE_THREAD siblings)"*.
+The authoritative per-thread mask (`THREAD_SIGNAL_MASK`, what `sys_rt_sigprocmask`
+reads and writes) was **never seeded on fork**, and `claim_free_slot`/`scrub_thread_slot`
+zero it on slot reuse — so a forked child started with **everything unblocked**.
+
+That is a straight Linux/POSIX divergence (fork inherits the mask), and it is
+load-bearing for `Command::spawn`: the runtime blocks every signal in the parent
+immediately before forking precisely so the child cannot take one in the pre-exec
+window, where its handler state and sigaltstack are not yet valid — the window that
+produces `[signal] sig N needs sigaltstack but slot M has none — re-pending`. Akuma
+reopened exactly the window the caller paid a syscall to close.
+
+**Second defect, same audit: the one seeding that did exist was racy.** `clone_thread`
+called `mark_thread_ready(tid)` (`process/mod.rs:2836`) *before returning*, and
+`sys_clone` seeded the mask afterwards (`syscall/proc.rs:445`). On SMP the child could
+already be executing with a zeroed mask before the seed landed.
+
+**Fix — seed at every creation leaf, before the child is runnable:**
+
+| leaf | before | after |
+|---|---|---|
+| `fork_process` | per-thread mask never seeded | seeded from parent before `mark_thread_ready` |
+| `vfork_process` | never seeded | same |
+| `clone_thread` | seeded *after* readiness | seeded before readiness; the syscall-layer seed is now an idempotent repeat |
+| `execve` | untouched | verified correct — POSIX preserves the mask across exec |
+| slot claim / recycle | zeroed | correct as a baseline, since every creator now seeds |
+
+163 host tests pass, clippy clean.
+
+**It did not fix the `-j4` build.** The build still jams, and a rustc still dies at
+0.04 s. Recorded as a genuine ABI bug fixed on its own merits, not as the self-host cure.
+
+### The crash has a fixed address (2026-08-04)
+
+Across two independent boots the fault is **byte-identical**:
+
+```
+FAR=0x0  ELR=0x300204e8  ISS=0x47  x0=0x0  x3=0x8  x30=0x30020498
+[Fault] Process N (/usr/local/bin/rustc) SIGSEGV after 0.02-0.05s
+[Fault] SIGSEGV in clone_thread, calling exit_group
+```
+
+Same faulting PC, same link register, same NULL dereference. `last_sc` is the
+"no syscall" sentinel, so the thread faults **before issuing a single syscall** — i.e.
+at thread startup — with `TPIDR_EL0` already valid. Every victim is 0.02-0.05 s old.
+
+This is the same family as the `-j4` SIGABRT (`current thread handle already set during
+thread spawn`): both say *a newly created thread's startup state is not what it should
+be*. One reads a NULL where a pointer belongs; the other reads a non-zero where zero
+belongs.
+
+A later run produced **three** faults in one build and refined the picture — there are
+*two* recurring PCs, and at one of them the faulting address varies:
+
+```
+FAR=0x7  ELR=0x3801c58c   pid 60, SIGSEGV after 0.03s
+FAR=0x5  ELR=0x3801c58c   pid 61, SIGSEGV after 0.02s
+FAR=0x0  ELR=0x300204e8   pid 62, SIGSEGV after 0.03s
+```
+
+**That rules out a corrupted pointer.** Garbage pointers are large; `0`, `5`, `7` are
+small integers — the shape of an **errno, an fd, or a count being used where a pointer
+belongs**. So the failing code is reading a value that is *legitimately* a small integer
+in some other context, i.e. an unchecked error return or a union/tag confusion, rather
+than memory that was scribbled on.
+
+Worth noting what this exonerates: Akuma's errno convention is correct
+(`const EINVAL: u64 = (-22i64) as u64`, `syscall/mod.rs:409`), so this is not the classic
+"positive errno read as success" ABI bug.
+
+**Next step, and it is cheap:** symbolize `0x300204e8` and `0x3801c58c` in the guest's
+libstd/musl. Two addresses, both recurring across boots, both in threads younger than
+0.05 s. That names the exact code and turns a kernel-side guessing game into a specific
+question. No session has ever had a live PC for this failure; now there are two, and they
+are reproducible in under two minutes.
+
+**Every victim is a brand-new thread** (`SIGSEGV in clone_thread`, `last_sc` = the
+"no syscall yet" sentinel), which is the same statement the `-j4` SIGABRT makes:
+*a newly created thread's startup state is not what it should be*. One victim was even
+named `coordinator` — rustc's parallel-codegen coordinator thread.
+
+### ASID free/flush ordering (2026-08-04, FIXED — but not the cure either)
+
+Chased because every victim is 20-50 ms old, i.e. 2-5× `PROCESS_RECLAIM_COOLDOWN_US`
+(10 ms) — the window on which `Process::drop` runs and recycles resources, **including
+the ASID** (`docs/reference/subsystems/memory.md`).
+
+`Drop for UserAddressSpace` (`mmu/mod.rs`) did this:
+
+```rust
+with_irqs_disabled(|| ASID_ALLOCATOR.lock().free(self.asid));
+flush_tlb_asid(self.asid);                      // ← after the free
+```
+
+`AsidAllocator::alloc` (`mmu/asid.rs:20`) only flips a bit — it performs **no** TLB
+maintenance — so that `flush_tlb_asid` is the sole invalidation for the dying address
+space. Freeing first opens an SMP window: a peer core can `alloc()` the same ASID,
+install it in TTBR0 and start executing while the dead space's translations are still
+live, so the new owner reads the **dead process's memory** through them. That produces
+plausible-looking junk rather than obvious garbage — precisely the small integers
+(`0`, `5`, `7`) seen in `FAR`. Fixed by flushing before freeing; `tlbi aside1is` is
+inner-shareable so peers are covered.
+
+**Also fixed: ASID exhaustion was silent.** `alloc()` returning `None` propagated through
+`?`, so address-space creation simply began failing with nothing in the log. With
+`MAX_ASID = 256` and a build spawning thousands of processes, one missed
+`UserAddressSpace::drop` leaks an ASID permanently. Now rate-limit-logged as
+`[asid] EXHAUSTED`. Measured on a full `-j4` run: **zero occurrences** — so ASIDs are
+not leaking today, and the diagnostic stands as a tripwire.
+
+**Neither change fixed the build.** A run immediately after still failed with two
+`SIGSEGV`s at the same two PCs. Both are recorded as correctness fixes on their own
+merits, not as the self-host cure — the same standing as the signal-mask work above.
+
+### The jam: a child dies and the parent never finds out (2026-08-04) — SUPERSEDED
+
+*The reasoning in this section was wrong; kept because the measurements are still
+useful and the retraction is instructive. See the correction at the end.*
 
 The `GDB=1` boot that jammed with **zero aborts** gives the clearest picture yet.
 
@@ -1196,11 +1321,41 @@ vfork_complete(proc.pid);                          // unreachable on that path
 
 `sys_exit_group` does perform its own `notify_child_channel_exited` for both
 `pid` and `tgid` (with a load-bearing ordering comment), so the notify is
-*attempted* and this is not self-evidently the bug. Also note `is_shared()` is
-true for a **vfork child** as well as a `clone_thread` sibling, so this branch can
-fire for a process whose parent is waiting on it directly. Whether the notify is
-lost, aimed at the wrong channel, or races the teardown is the open question —
-now answerable, because the whole thing reproduces in ~10 minutes.
+*attempted* and this is not self-evidently the bug.
+
+**CORRECTION — this section's conclusion is retracted.** Three independent results
+killed it:
+
+1. **`segvchild.c`** (new probe) tests the exact claim: a parent forks a child that
+   dies via each path, and watchdogs its `wait4`. Cases A (normal exit), B (main-thread
+   SIGSEGV) and C (**SIGSEGV inside `clone_thread`** — the suspect path) all **reap
+   correctly**, and still do under 8-way concurrency × 6 rounds (48 runs, zero hangs).
+2. A later `-j4` run **did** have cargo reap and report a dying rustc:
+   `error: could not compile 'byteorder' … (signal: 11, SIGSEGV)`, exiting cleanly.
+3. The "leader in `exit`" reading was a **field misread**. In `[THR-DUMP]`, `sc` is the
+   *Process*-level `current_syscall` and `tsc` is the per-thread one
+   (`threading/mod.rs:3726-3750`). The thread showed `tsc=98` with `a1=0x80`
+   (`FUTEX_WAIT|PRIVATE`) and an address in `a0` — for `exit(93)` `x0` would be a small
+   exit code. **All three rustc threads were parked in futex; none was exiting.**
+
+So the reap path is sound and nothing was orphaned by an `exit`/`exit_group` asymmetry.
+What the dumps do show is the original "Open issue #2" shape: rustc's whole thread group
+parked in `FUTEX_WAIT`, one of them at `0x3cda5fc4` — the *same* address as the very
+first `typenum` stall recorded in this document.
+
+**Pipes are also exonerated**, via the new `pipe_dump()`:
+
+```
+[PIPE-DUMP] 3 live
+  pipe=10 bytes=1 readers=3 writers=3 pollers=0     token available, nobody waiting
+  pipe=30 bytes=0 readers=1 writers=1 pollers=1
+  pipe=31 bytes=0 readers=1 writers=1 pollers=1
+```
+
+No pipe holds buffered data with a parked reader — the jobserver pipe even has a spare
+token and zero pollers. `pipewake.c` (new probe: blocked-read handoff, cross-process
+echo, write-before-read) passes single and 8-way. The kernel is not sitting on an
+undelivered pipe wakeup.
 
 ### `threadmax` phase B: cooldown wall, not a regression
 

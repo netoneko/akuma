@@ -338,6 +338,21 @@ use asid::AsidAllocator;
 
 static ASID_ALLOCATOR: Spinlock<AsidAllocator> = Spinlock::new(AsidAllocator::new());
 
+/// Rate-limited report that the ASID space is full. Non-zero means either genuine
+/// concurrency above MAX_ASID or — far more likely — leaked ASIDs from address spaces
+/// whose `Drop` never ran.
+fn asid_exhausted_warn() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 5 || n.is_multiple_of(100) {
+        (crate::runtime::runtime().print_str)(
+            "[asid] EXHAUSTED: no free ASID (MAX_ASID=256) — address-space creation failing; \
+             suspect leaked ASIDs from address spaces whose Drop never ran\n");
+    }
+}
+
+
 /// Tracks shared L0 page table reference counts and deferred frame lists.
 ///
 /// When CLONE_THREAD creates shared views of an address space, we need to
@@ -394,7 +409,18 @@ impl UserAddressSpace {
         let rt = runtime();
         let l0_frame = (rt.alloc_page_zeroed)()?;
         (rt.track_frame)(l0_frame, FrameSource::UserPageTable);
-        let asid = with_irqs_disabled(|| ASID_ALLOCATOR.lock().alloc())?;
+        let asid = match with_irqs_disabled(|| ASID_ALLOCATOR.lock().alloc()) {
+            Some(a) => a,
+            // Exhaustion used to propagate silently through `?`: address-space creation
+            // just started failing, so fork/exec returned an error with nothing in the
+            // log to say why. With only MAX_ASID=256 slots and a build that spawns
+            // thousands of processes, a single missed `UserAddressSpace::drop` leaks an
+            // ASID permanently, and enough of them wedge process creation invisibly.
+            None => {
+                asid_exhausted_warn();
+                return None;
+            }
+        };
         let mut addr_space = Self {
             l0_frame,
             page_table_frames: Spinlock::new(Vec::new()),
@@ -416,7 +442,18 @@ impl UserAddressSpace {
     /// Create a shared view of an existing address space (for CLONE_THREAD).
     /// Uses the same L0 page table; Drop will NOT free the pages.
     pub fn new_shared(parent_l0_phys: usize) -> Option<Self> {
-        let asid = with_irqs_disabled(|| ASID_ALLOCATOR.lock().alloc())?;
+        let asid = match with_irqs_disabled(|| ASID_ALLOCATOR.lock().alloc()) {
+            Some(a) => a,
+            // Exhaustion used to propagate silently through `?`: address-space creation
+            // just started failing, so fork/exec returned an error with nothing in the
+            // log to say why. With only MAX_ASID=256 slots and a build that spawns
+            // thousands of processes, a single missed `UserAddressSpace::drop` leaks an
+            // ASID permanently, and enough of them wedge process creation invisibly.
+            None => {
+                asid_exhausted_warn();
+                return None;
+            }
+        };
         with_irqs_disabled(|| {
             let mut table = SHARED_L0_TABLE.lock();
             table.entry(parent_l0_phys)
@@ -1141,8 +1178,23 @@ impl Drop for UserAddressSpace {
                 (rt.free_page)(l0);
             }
         }
-        with_irqs_disabled(|| ASID_ALLOCATOR.lock().free(self.asid));
+        // ORDER IS LOAD-BEARING: flush BEFORE returning the ASID to the allocator.
+        //
+        // `AsidAllocator::alloc` (mmu/asid.rs) only flips a bit — it does no TLB
+        // maintenance of its own — so this is the sole invalidation for the dying
+        // address space. Freeing first opens a window on SMP: a peer core can `alloc()`
+        // this very ASID, install it in TTBR0 and start executing while our stale
+        // translations are still live, so the new owner reads the DEAD process's memory
+        // through them. That yields plausible-looking junk rather than obvious garbage —
+        // small integers where pointers belong — and the victim is always a process only
+        // tens of ms old, because this drop runs on the `PROCESS_RECLAIM_COOLDOWN_US`
+        // (10 ms) reclaim path (see docs/reference/subsystems/memory.md).
+        //
+        // Flushing first closes it: by the time the ASID is allocatable again, no
+        // translation for it remains. `tlbi aside1is` is inner-shareable, so peers are
+        // covered too.
         flush_tlb_asid(self.asid);
+        with_irqs_disabled(|| ASID_ALLOCATOR.lock().free(self.asid));
     }
 }
 
