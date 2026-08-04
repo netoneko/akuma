@@ -55,6 +55,19 @@ The coupling points:
   `THREAD_CONTEXTS`. Background:
   [`../../archive/SELFHOST_DEVBOX_SMOLTCP.md`](../../archive/SELFHOST_DEVBOX_SMOLTCP.md)
   §"per-slot state inherited across thread-slot recycling".
+- **Per-tid state owned by other subsystems is purged at death, not at recycle.**
+  `threading::set_slot_purge_callback` registers a kernel hook (the tables live
+  in the bin crate) invoked from **`mark_thread_terminated`** *and* the recycler.
+  It must run at death because a slot stays `Terminated` for ≥10 ms — often far
+  longer — and for that whole window a tid left in `FUTEX_WAITERS` is still a
+  wake target: `futex_do_wake` pops it, counts it toward `max_wake`, and wakes a
+  thread that will never run, consuming a `FUTEX_WAKE(uaddr, 1)` the real waiter
+  needed. Dropping it early is safe only because a queue entry is of no further
+  use to a dead thread — unlike its trap frame, kernel stack or sigaltstack,
+  which the terminal park may still touch and which therefore wait for the
+  recycler. **The rule: scrub slot registers at the ownership boundary, purge
+  external registrations at death.** Do not move this cleanup "to the
+  termination leaf" — see §4: the abandoned-stack leaves never run it.
 - **A `TERMINATED` slot still occupies its index** for at least
   `THREAD_CLEANUP_COOLDOWN_US` (10 ms) *and* until some path runs a reclaim
   pass, so the usable ceiling under a spawn-heavy load is
@@ -62,7 +75,16 @@ The coupling points:
   held by corpses while only 13 threads were live. The `[threads]` census on
   the exhaustion path prints the live/terminated split precisely so this is
   distinguishable from genuine capacity; `threadmax` (`userspace/forktest/
-  c_stress/`) measures both (simultaneous ceiling 51 + main, churn 400/400).
+  c_stress/`) measures both, and on a refusal retries after a settle to report
+  which of the two it hit.
+- **`MAX_THREADS` is defined once**, in `threading/types.rs` (256; 64 under
+  `kernel_profile_size`), and `config::MAX_THREADS` is a `pub use` of it. It is
+  the compile-time array size and the ceiling `set_thread_limit` clamps against
+  — **not** the working limit, which `compute_thread_limit` derives from RAM at
+  boot. The two used to be independent literals joined by a "must match"
+  comment; raising only one silently did nothing (boot logged `Thread limit:
+  256` while the census kept reporting `ceiling=56`). At 256 one process holds
+  **244** simultaneous threads for +33 KB of `.bss`.
 - `THREAD_PID_MAP` (Spinlock) binds tid → pid; written on spawn/clone/fork,
   erased on exit/kill/recycle. The `slot_still_owned_by` guard (dc4684a)
   re-reads it before acting on a pre-yield `thread_id` snapshot. It is the

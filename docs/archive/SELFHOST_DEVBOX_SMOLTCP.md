@@ -938,9 +938,88 @@ corpses, and three of them died with
 failed to spawn thread: Os { code: 11, kind: WouldBlock }
 ```
 
-That is genuine exhaustion, so **16× is a bad repro configuration** — its
-failures confound slot starvation with the stall under investigation. Use 8×,
-which showed zero exhaustion in every run.
+That is genuine exhaustion, so **16× was a bad repro configuration** — its
+failures confounded slot starvation with the stall under investigation. (Both
+constraints below were lifted later the same day; 16× is now clean.)
+
+## Follow-ups the same session
+
+### `FUTEX_WAITERS` never dropped a dead thread's tid
+
+`futex_remove_tid_anywhere` is called only from the waiter's **own** timeout/EINTR
+path (`sync.rs:491,532`). A thread that dies while parked — `exit_group` killing
+siblings, a consumed `PENDING_KILL`, a fault-kill — never runs it, so its tid
+stayed queued forever. Once the slot recycled, that entry named a *live,
+unrelated* thread: `futex_do_wake` pops it, wakes the new occupant, and counts it
+toward `max_wake`, so a `FUTEX_WAKE(uaddr, 1)` is consumed while the real waiter
+stays parked. Same "stale entry absorbs a wake" defect the requeue fix closed for
+requeued waiters, left open for dead ones — and invisible to `futexops`, which
+never kills a parked thread.
+
+Fixed with `futex_purge_tid`, registered via a new
+`threading::set_slot_purge_callback` hook (the kernel tables are unreachable from
+`akuma-exec`) and called at **both** ends:
+
+- `mark_thread_terminated` — immediately, because the slot stays TERMINATED for
+  ≥10 ms and often far longer, and for that whole window a dead tid is still a
+  live wake target. Safe to drop this early precisely because a queue entry is of
+  no further use to a terminated thread, unlike its trap frame/stack/sigaltstack.
+- the recycler — catches anything that reached TERMINATED via a leaf that skipped
+  the first call.
+
+`DRAINING[tid]` (`process/reclaim.rs`) had the same shape — set on entry to
+`drain_retired`, cleared on the way out, and its own docs admit the terminal
+site "runs on an already-terminated thread" and can be preempted mid-sweep. A
+recycled occupant then took the "already draining" early return forever. Cleared
+in `scrub_thread_slot`.
+
+**Why not scrub at every termination leaf instead?** Because the leaves are the
+unreliable place — the three abandoned-stack leaves (§4 of
+`../reference/subsystems/thread-lifecycle.md`) end a kernel stack without
+unwinding, so a fault-killed or peer-killed thread never runs code placed there;
+a terminating thread is still *using* its trap frame and stack (the recycler's
+`CURRENT_TRAP_FRAME` clear must precede `free_stack_for_slot`); and a peer killer
+running on another core would race a victim that may still be executing. The rule
+that came out of it: **scrub slot registers at the ownership boundary, purge
+external registrations at death.**
+
+### The thread ceiling was a stale duplicated constant, not memory
+
+`compute_thread_limit` (`src/main.rs:389`) already scales the pool from RAM —
+¼ of user pages ÷ `USER_THREAD_STACK_SIZE` — then clamps to `MAX_THREADS`. On an
+8 GB devbox it produced a far larger figure and clamped, so **RAM was never the
+constraint**.
+
+Raising `config::MAX_THREADS` alone did nothing, and the failure was silent and
+instructive: boot logged `Thread limit: 256 slots` while `[threads]` census lines
+kept printing `ceiling=56`. `akuma-exec` carried its *own*
+`threading/types.rs:11` `MAX_THREADS = 64` — the real static-array size and the
+value `set_thread_limit` clamps against — with only a "must match" comment
+binding them. `config::MAX_THREADS` is now a `pub use` re-export of the crate
+constant, so they cannot diverge again, and the profile split lives at the
+definition: 256 normally, 64 under `kernel_profile_size` (4 MB floor).
+
+Measured effect on `MEMORY=8192 SMP=4`:
+
+| | before | after |
+|---|---|---|
+| `threadmax` phase A ceiling | 52 | **244** |
+| 16× `futextest_rs` phase 2 | 3 × `EAGAIN` panic, stalls | **16/16 exit 0** |
+| `.bss` (release-smp-shared) | `0x8ff40` | `0x98580` (**+33 KB**) |
+| `size` profile | 64 slots | unchanged |
+
+Three host tests hard-coded the old 64 (`constants_sanity` and two
+`calculate_stack_requirements` cases); they now derive from `MAX_THREADS`.
+
+### `threadmax` phase B: cooldown wall, not a regression
+
+Phase B failed at iteration 0 in one run, having passed 400/400 earlier. Cause
+was the probe, not the kernel: it started churning immediately after phase A
+joined 52 threads, so every slot was inside its 10 ms cooldown. The probe now
+settles 300 ms first and, on a refusal, retries after 100 ms and **reports which
+it was** — a retry that succeeds means a transient cooldown wall, a retry that
+fails means real collector starvation. Rerun: `[B] ok`, 400/400, twice, without
+ever entering the retry path.
 
 ## Status of the three signatures after this session
 

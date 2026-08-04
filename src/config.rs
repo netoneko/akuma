@@ -75,7 +75,31 @@ pub const USER_STACK_SIZE_OVERRIDE: usize = 0; // auto-scale; set to e.g. 8MB to
 /// Total number of thread slots in the thread pool.
 /// Thread 0 is reserved for the boot/idle thread.
 /// Actual usable threads = MAX_THREADS - 1
-pub const MAX_THREADS: usize = 64;
+///
+/// This is the **compile-time ceiling**, not the working limit: it sizes the per-slot
+/// static arrays (`THREAD_STATES`, `THREAD_CONTEXTS`, the signal/preemption registers,
+/// `ThreadPool::{states,cooperative,sps,stacks}`), which are BSS whether or not a slot is
+/// ever used. The *working* limit is chosen at boot from actual RAM by
+/// `compute_thread_limit` → `threading::set_thread_limit`, which takes ¼ of user pages
+/// and divides by `USER_THREAD_STACK_SIZE` — so thread capacity already scales with
+/// memory, and this constant is only the cap that scaling clamps against.
+///
+/// 64 was that cap until 2026-08-04, and on a `MEMORY=8192` devbox it was the *binding*
+/// constraint, not RAM: `compute_thread_limit` produced a far larger figure and clamped.
+/// Measured effect — one process could hold 51-52 threads (56 user slots minus herd/
+/// httpd/sshd/the SSH session), and a 16-way `pthread_create` load hit genuine
+/// exhaustion, because a slot also stays TERMINATED for `THREAD_CLEANUP_COOLDOWN_US`
+/// after its thread dies (see `docs/reference/subsystems/thread-lifecycle.md`).
+///
+/// Raised to 256 for the non-`size` profiles, where a few hundred KB of BSS is free
+/// relative to an 8 GB box. `size`/`extreme-size` keep 64: those target a 4 MB RAM floor
+/// where per-slot BSS is a real cost and nothing spawns hundreds of threads anyway.
+///
+/// **Re-exported, not redeclared.** This and `akuma_exec`'s copy were independent literals
+/// carrying a "must match" comment; they silently diverged the first time one was raised
+/// (boot logged the new limit, `set_thread_limit` clamped to the crate's old one, and the
+/// ceiling never moved). The profile split now lives at the definition.
+pub use akuma_exec::threading::types::MAX_THREADS;
 
 /// Number of kernel threads reserved for system services
 ///

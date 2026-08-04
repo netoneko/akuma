@@ -77,16 +77,33 @@ int main(void)
         pthread_join(t[i], NULL);
     printf("[A] all %d joined\n", n);
 
-    /* ---- phase B: churn, never more than 2 alive ---- */
-    printf("[B] 400x sequential spawn/join: start\n");
+    /* ---- phase B: churn, never more than 2 alive ----
+     *
+     * Phase A just terminated `n` threads at once, and a slot stays TERMINATED for
+     * THREAD_CLEANUP_COOLDOWN_US (10ms) before it can be recycled. Running phase B
+     * immediately therefore measures the cooldown wall, not the churn path. Settle
+     * first, and if a spawn still fails, retry after a further sleep and report
+     * WHICH of the two it was — a retry that succeeds means the slots existed and
+     * were merely cooling (transient), a retry that fails means real starvation.
+     */
+    usleep(300000);
+    printf("[B] 400x sequential spawn/join: start (after 300ms settle)\n");
     for (int i = 0; i < 400; i++) {
         pthread_t th;
         rc = pthread_create(&th, &attr, noop, NULL);
         if (rc != 0) {
-            printf("[B] FAILED at iter %d: rc=%d (%s) — collector starvation, "
-                   "not a capacity limit\n", i, rc, strerror(rc));
-            printf("=== THREADMAX DONE — phase B failed ===\n");
-            return 1;
+            printf("[B] spawn refused at iter %d: rc=%d (%s) — retrying after 100ms\n",
+                   i, rc, strerror(rc));
+            usleep(100000);
+            rc = pthread_create(&th, &attr, noop, NULL);
+            if (rc != 0) {
+                printf("[B] FAILED at iter %d after retry: rc=%d (%s) — real collector "
+                       "starvation, not a cooldown wall\n", i, rc, strerror(rc));
+                printf("=== THREADMAX DONE — phase B failed ===\n");
+                return 1;
+            }
+            printf("[B] retry succeeded at iter %d — COOLDOWN WALL (transient), "
+                   "slots existed but were still cooling\n", i);
         }
         pthread_join(th, NULL);
     }

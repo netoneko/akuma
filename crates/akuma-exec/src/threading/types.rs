@@ -7,7 +7,25 @@
 
 use alloc::string::String;
 
-/// Compile-time constant for static array sizes (must match ExecConfig::max_threads).
+/// Compile-time constant for static array sizes, and the ceiling
+/// `threading::set_thread_limit` clamps against. `config::MAX_THREADS` in the bin crate
+/// re-exports this, so the two can no longer disagree — they used to be independent
+/// literals with a "must match" comment, and on 2026-08-04 raising only the bin-crate one
+/// silently did nothing: boot logged `Thread limit: 256` while `thread_limit()` clamped
+/// straight back to this 64 and the measured ceiling never moved.
+///
+/// This is NOT the working limit. `compute_thread_limit` picks that at boot from actual
+/// RAM (¼ of user pages ÷ `USER_THREAD_STACK_SIZE`) and clamps to this value — so thread
+/// capacity already scales with memory, and this is only the cap it scales against.
+///
+/// 256 on normal profiles: the per-slot statics here are BSS whether used or not, and a
+/// few hundred KB is free on a multi-GB box, while 64 was measurably binding (one process
+/// could hold ~52 threads, and 16-way `pthread_create` load hit genuine exhaustion).
+/// `size`/`extreme-size` keep 64 — they target a 4 MB RAM floor where that BSS is real
+/// money and nothing there spawns hundreds of threads.
+#[cfg(not(kernel_profile_size))]
+pub const MAX_THREADS: usize = 256;
+#[cfg(kernel_profile_size)]
 pub const MAX_THREADS: usize = 64;
 
 /// Default timeout for cooperative threads in microseconds (100ms)
@@ -331,7 +349,11 @@ mod tests {
     #[test]
     fn constants_sanity() {
         assert_eq!(CONTEXT_MAGIC, 0xDEAD_BEEF_1234_5678, "CONTEXT_MAGIC must match expected value");
-        assert_eq!(MAX_THREADS, 64, "MAX_THREADS should be 64");
+        // Derived, not literal: MAX_THREADS is profile-dependent (256 normally, 64 on
+        // the size profiles). Pinning the literal here is what made the constant look
+        // safe to raise while three tests silently encoded the old value.
+        assert!(MAX_THREADS >= 64, "MAX_THREADS must leave room for the reserved range");
+        assert!(MAX_THREADS.is_power_of_two(), "MAX_THREADS should stay a power of two");
         assert_eq!(IRQ_FRAME_SIZE, 304 + 528, "IRQ_FRAME_SIZE = 304 + 528");
         assert_eq!(IRQ_FRAME_SIZE, 832, "IRQ_FRAME_SIZE should be 832 bytes");
         assert!(EXCEPTION_STACK_SIZE > 0, "EXCEPTION_STACK_SIZE must be positive");
@@ -485,9 +507,9 @@ mod tests {
         );
 
         assert_eq!(summary.system_thread_count, 3, "reserved - 1");
-        assert_eq!(summary.user_thread_count, 60, "MAX_THREADS - reserved");
+        assert_eq!(summary.user_thread_count, MAX_THREADS - reserved, "MAX_THREADS - reserved");
         assert_eq!(summary.system_total, 3 * 32 * 1024);
-        assert_eq!(summary.user_total, 60 * 64 * 1024);
+        assert_eq!(summary.user_total, (MAX_THREADS - reserved) * 64 * 1024);
         assert_eq!(
             summary.total_bytes,
             kernel_stack + summary.system_total + summary.user_total
@@ -511,7 +533,7 @@ mod tests {
     fn calculate_stack_requirements_single_system_thread() {
         let summary = calculate_stack_requirements(2, 32 * 1024, 16 * 1024, 32 * 1024, MAX_THREADS);
         assert_eq!(summary.system_thread_count, 1);
-        assert_eq!(summary.user_thread_count, 62);
+        assert_eq!(summary.user_thread_count, MAX_THREADS - 2);
     }
 
     // --- verify_stack_memory_params ---
