@@ -42,6 +42,7 @@ mod timerfd;
 
 pub use sync::futex_wake;
 pub use sync::futex_purge_tid;
+pub use sync::futex_dump;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub use sync::futex_do_wake;
 /// Futex waiter-table hooks for `process_tests::test_futex_table_irq_masked_requeue`.

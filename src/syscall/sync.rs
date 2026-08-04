@@ -281,6 +281,36 @@ fn futex_remove_tid_anywhere(tgid: u32, tid: usize) {
     });
 }
 
+/// Dump the whole futex waiter table: every `(tgid, uaddr)` key and the tids queued on it.
+///
+/// The decisive diagnostic for the lost-wakeup jam
+/// (docs/archive/SELFHOST_DEVBOX_SMOLTCP.md "Open issue #2"). `[THR-DUMP]` shows a thread
+/// parked with `tsc=98` and its `uaddr` in `a0`, but not whether the kernel still has it
+/// ENQUEUED, which is what separates the two possible bugs:
+///
+/// - waiter IS queued at `(tgid, uaddr)` => no wake was ever delivered to that key; the
+///   waker either never ran or computed a different key.
+/// - waiter is NOT queued anywhere => it was dequeued by a wake that then failed to make
+///   it runnable, i.e. the defect is in the wake/scheduler handoff, not the queueing.
+///
+/// Printed next to `[THR-DUMP]`/`[PIPE-DUMP]` under `DEADLOCK_THREAD_DUMP_ENABLED`.
+pub fn futex_dump() {
+    crate::irq::with_irqs_disabled(|| {
+        let waiters = FUTEX_WAITERS.lock();
+        if waiters.is_empty() {
+            tprint!(48, "[FUTEX-DUMP] table empty\n");
+            return;
+        }
+        tprint!(48, "[FUTEX-DUMP] {} keys\n", waiters.len());
+        for (&(tgid, uaddr), q) in waiters.iter() {
+            tprint!(120, "  key tgid={} uaddr={:#x} waiters={}\n", tgid, uaddr, q.len());
+            for (tid, bitset) in q.iter().take(8) {
+                tprint!(80, "    tid={} bitset={:#x}\n", tid, bitset);
+            }
+        }
+    });
+}
+
 /// Drop every queued reference to `tid`, across **all** keys and thread groups.
 ///
 /// Registered as the threading subsystem's slot-purge hook and invoked when a thread slot

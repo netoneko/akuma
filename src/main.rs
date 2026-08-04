@@ -1188,6 +1188,8 @@ fn run_async_main_preemptive() -> ! {
                             && stats.waiting >= 2
                         {
                             threading::dump_thread_resume_points();
+                            crate::syscall::pipe::pipe_dump();
+                            crate::syscall::futex_dump();
                         }
                     }
                 }
@@ -1504,6 +1506,8 @@ fn run_async_main() -> ! {
             // point is actually observable.
             if crate::config::DEADLOCK_THREAD_DUMP_ENABLED {
                 threading::dump_thread_resume_points();
+                crate::syscall::pipe::pipe_dump();
+                crate::syscall::futex_dump();
             }
         }
 

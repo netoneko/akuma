@@ -14,4 +14,4 @@ c_stress/futextest_rs
 c_stress/tlsdirty
 c_stress/boom
 c_stress/segvchild
-
+c_stress/pipewake

@@ -43,6 +43,46 @@ pub const PIPE_CAPACITY: usize = 65536;
 static PIPES: Spinlock<BTreeMap<u32, KernelPipe>> = Spinlock::new(BTreeMap::new());
 static NEXT_PIPE_ID: AtomicU32 = AtomicU32::new(1);
 
+/// Dump every live pipe: buffered bytes, endpoint refcounts, and the tids parked on it.
+///
+/// The decisive diagnostic for the `-j4` self-host jam
+/// (docs/archive/SELFHOST_DEVBOX_SMOLTCP.md): at the jam cargo's jobserver helper sits
+/// in `read(fd=5)` forever with no child alive. Two very different causes produce that
+/// same `[THR-DUMP]` line, and only pipe state separates them:
+///
+/// - `bytes>0` with a parked reader  => a genuine LOST WAKEUP in the kernel: data is
+///   available and the reader was never woken.
+/// - `bytes=0`, reader parked, `writers>0` => the kernel is behaving; nobody wrote the
+///   token, i.e. the stall is userspace/jobserver accounting (a token lost with a dead
+///   child), and the kernel is exonerated.
+///
+/// Printed next to `[THR-DUMP]` under the same `DEADLOCK_THREAD_DUMP_ENABLED` gate.
+pub fn pipe_dump() {
+    crate::irq::with_irqs_disabled(|| {
+        let pipes = PIPES.lock();
+        if pipes.is_empty() {
+            return;
+        }
+        tprint!(48, "[PIPE-DUMP] {} live\n", pipes.len());
+        for (id, p) in pipes.iter() {
+            // Reader tids are printed so the parked `read()` in `[THR-DUMP]` can be
+            // matched to the pipe it is parked on.
+            let mut waiters = [0usize; 8];
+            let mut n = 0;
+            for t in p.pollers.iter() {
+                if n >= waiters.len() { break; }
+                waiters[n] = *t;
+                n += 1;
+            }
+            tprint!(160, "  pipe={} bytes={} readers={} writers={} pollers={}\n",
+                id, p.buffer.len(), p.read_count, p.write_count, p.pollers.len());
+            for w in waiters.iter().take(n) {
+                tprint!(48, "    poller tid={}\n", w);
+            }
+        }
+    });
+}
+
 pub fn pipe_create() -> u32 {
     let id = NEXT_PIPE_ID.fetch_add(1, Ordering::SeqCst);
     crate::irq::with_irqs_disabled(|| {
