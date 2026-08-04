@@ -183,6 +183,18 @@ echo "Building mmap_file (C, file-backed mmap OOM probe)..."
 cp forktest/c_stress/mmap_file ../bootstrap/bin/
 echo "mmap_file (C) copied to bootstrap/bin/"
 
+# pthread_kill_eintr: does a pthread_kill signal interrupt a blocking read?
+# Shaped after jobserver-rs's Helper::join (the path every rustc that reaches
+# codegen runs). Also asserts an SA_RESTART handler does NOT interrupt, which
+# is what keeps Go's SIGURG preemption working. Tiny; built unconditionally.
+echo "Building pthread_kill_eintr (C, pthread_kill EINTR probe)..."
+(
+    cd eintr_repro
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o pthread_kill_eintr pthread_kill_eintr.c
+)
+cp eintr_repro/pthread_kill_eintr ../bootstrap/bin/
+echo "pthread_kill_eintr (C) copied to bootstrap/bin/"
+
 # Build forktest (Go, opt-in via --with-forktest)
 if [ "$WITH_FORKTEST" = true ]; then
     echo "Building forktest (Go)..."

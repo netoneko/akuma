@@ -841,7 +841,7 @@ fn proxy_accept(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
 
     let (addr_ptr, len_ptr) = (args[1], args[2]);
     loop {
-        if akuma_exec::process::is_current_interrupted() {
+        if akuma_exec::process::should_interrupt_blocking_syscall() {
             return neg_linux_errno(LINUX_EINTR);
         }
         let mut mem = ProcMem::new();
@@ -904,7 +904,7 @@ const RECV_BLOCK_SLICE_US: u64 = 100_000;
 fn proxy_recv_blocking(proxy: &Arc<BoxProxy>, rump_fd: i32, buf: u64, len: u64) -> u64 {
     let deadline = crate::timer::uptime_us() + RECV_BLOCK_SLICE_US;
     loop {
-        if akuma_exec::process::is_current_interrupted() {
+        if akuma_exec::process::should_interrupt_blocking_syscall() {
             return neg_linux_errno(LINUX_EINTR);
         }
         let mut mem = ProcMem::new();

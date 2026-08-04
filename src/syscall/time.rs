@@ -86,7 +86,7 @@ pub(super) fn sys_nanosleep(a0: u64, a1: u64) -> u64 {
     let deadline = crate::timer::uptime_us().saturating_add(total_us);
     loop {
         if crate::timer::uptime_us() >= deadline { return 0; }
-        if akuma_exec::process::is_current_interrupted() { return EINTR; }
+        if akuma_exec::process::should_interrupt_blocking_syscall() { return EINTR; }
         akuma_exec::threading::schedule_blocking(deadline);
     }
 }

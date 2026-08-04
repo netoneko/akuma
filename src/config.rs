@@ -347,6 +347,20 @@ pub const COW_FORK_ENABLED: bool = true;
 /// Set to false to fall back to copy-fork for vfork (clean kill switch).
 pub const VFORK_FASTPATH_ENABLED: bool = true;
 
+/// Let a `pthread_kill` (`tkill`/`tgkill`) signal interrupt a blocking syscall
+/// with `EINTR`, per Linux semantics.
+///
+/// Before this, `EINTR` was reported only from `ProcessChannel::is_interrupted`,
+/// which is set solely by Ctrl-C and `sys_kill` — so a signal pended on a single
+/// thread woke it but could never break it out of a blocking loop.
+/// `SA_RESTART` handlers are still never interrupted (the loop just takes another
+/// pass, which is exactly a restart), so Go's SIGURG preemption is unaffected.
+///
+/// Set to false to restore the old Ctrl-C-only behavior (clean kill switch —
+/// use it to A/B any regression in blocking-syscall behavior).
+/// See `akuma_exec::process::should_interrupt_blocking_syscall`.
+pub const PTHREAD_KILL_EINTR_ENABLED: bool = true;
+
 /// Eager/lazy threshold for **anonymous private** `mmap` (docs/COW_OPTIMIZATIONS.md,
 /// "lazy/zero-on-demand population").  An anonymous mapping of more than this many
 /// pages is registered as a lazy region and demand-paged (zero-fill on first touch)

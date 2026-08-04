@@ -9,8 +9,10 @@ build/unwind lives in `src/exceptions.rs` (`try_deliver_signal`,
 "Blocking & wait/wake".
 
 > **Stability: C (active risk).** Last touched 2026-08-04 (fatal `SIG_DFL`
-> signals arriving via the pending queue were dropped, and `tkill` was being
-> handed PIDs — see "Default action for pended signals"); before that
+> signals arriving via the pending queue were dropped, `tkill` was being
+> handed PIDs, and a `tkill`-pended signal could not interrupt a blocking
+> syscall — see "Default action for pended signals" and "EINTR from a pended
+> signal"); before that
 > 2026-06-22, inside the Jun 2026 "memory + signal crisis" fire window
 > (`docs/README.md`). The recurring
 > lesson: **signal *disposition* is process-wide, signal *mask* and
@@ -131,6 +133,51 @@ nothing. `abort()` then fell through to musl's `a_crash()` (`strb wzr, [x0]`),
 reporting **SIGSEGV at FAR=0** for what was really an undelivered SIGABRT.
 Repro: `userspace/forktest/c_stress/abortsig.c`
 (`archive/SELFHOST_DEVBOX_SMOLTCP.md` "SIGABRT delivery").
+
+### EINTR from a pended signal (`pthread_kill`)
+
+A pended signal wakes its target's waker, but waking is not interrupting. Every
+blocking loop re-tests its own predicate on wake, so until 2026-08-04 they all
+asked only `is_current_interrupted()` — a `ProcessChannel` flag set solely by
+Ctrl-C and `sys_kill`. A `tkill`-pended signal therefore woke the thread, failed
+that test, and the loop blocked again: **`pthread_kill` could never interrupt a
+blocking syscall**, and the handler never ran either, since delivery happens at
+syscall *return* and the syscall never returned.
+
+Blocking loops now call **`should_interrupt_blocking_syscall()`**
+(`process/children.rs`), which is `is_current_interrupted()` OR'd with the new
+per-thread `current_thread_has_pending_interrupt()`. The latter reports true only
+for a signal that is pending, **not blocked**, carries a `UserFn` handler, and
+whose action **lacks `SA_RESTART`** — matching when Linux reports `EINTR` rather
+than restarting. It early-outs on one atomic load when nothing is pending, so the
+hot path is unchanged.
+
+`SA_RESTART` needs no restart machinery here: these are all "retry until the
+predicate holds" loops, so declining to report the interrupt *is* the restart.
+That is what keeps Go working — its SIGURG preemption handler is installed with
+`sa_flags=0x18000004` (`SA_ONSTACK|SA_RESTART|SA_SIGINFO`), so it never
+interrupts a blocking syscall.
+
+The `wait4`/`waitid` loops additionally moved their check to *before*
+`schedule_blocking`, so a woken waiter re-tests `has_exited()` first. SIGCHLD
+pends exactly when a child exits, so the two race by design and Linux hands back
+the child; checking after the block would have turned the common successful wait
+into a spurious `EINTR`.
+
+Not covered: a signal that *does* set `SA_RESTART` still has its handler deferred
+until the blocking syscall finishes, where Linux would run it immediately and then
+restart. Nothing in the tree depends on the stricter timing, and the strict form
+means re-entering blocking syscalls from scratch — which silently extends
+`nanosleep`/`ppoll` deadlines (the reason Linux carries a `restart_block`).
+
+Motivating case: jobserver-rs's `Helper::join` installs SIGUSR1 with
+`SA_SIGINFO` and *no* `SA_RESTART`, then `pthread_kill`s its helper thread up to
+100 times to break it out of a blocking pipe `read`. All 100 were burned and the
+thread leaked — once per rustc that reaches codegen, quadrupled at `-j4`.
+Kill switch: `config::PTHREAD_KILL_EINTR_ENABLED`.
+Repro: `userspace/eintr_repro/pthread_kill_eintr.c` (A/B'd 2026-08-04 — flag off:
+`read()` never returns, handler runs 0 times; flag on: `-1 EINTR` after 1 handler
+run, with the `SA_RESTART` control unaffected in both).
 
 ## rt_sigreturn (frame unwind)
 

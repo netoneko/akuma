@@ -225,6 +225,10 @@ pub struct ExecConfig {
     /// `config::VFORK_FASTPATH_ENABLED`.
     pub vfork_fastpath_enabled: bool,
 
+    /// Let a `tkill`/`tgkill` (`pthread_kill`) signal interrupt a blocking
+    /// syscall with `EINTR`. See `config::PTHREAD_KILL_EINTR_ENABLED`.
+    pub pthread_kill_eintr_enabled: bool,
+
     /// Always load an exec'd ELF whole (via `runtime().read_file`) instead of the
     /// demand-paged path, regardless of size. Set on a multikernel SECONDARY core, where
     /// the filesystem is `Proxy`'d to the owner: a single forwarded whole-file fetch is far

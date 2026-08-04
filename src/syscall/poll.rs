@@ -774,7 +774,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
                 pid, epfd, elapsed);
         }
 
-        if akuma_exec::process::is_current_interrupted() {
+        if akuma_exec::process::should_interrupt_blocking_syscall() {
             log_epoll_pwait_return(
                 epfd,
                 timeout,

@@ -410,7 +410,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     return 0;
                 }
 
-                if akuma_exec::process::is_current_interrupted() {
+                if akuma_exec::process::should_interrupt_blocking_syscall() {
                     return EINTR;
                 }
 
@@ -548,7 +548,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     if nonblock {
                         return EAGAIN;
                     }
-                    if akuma_exec::process::is_current_interrupted() {
+                    if akuma_exec::process::should_interrupt_blocking_syscall() {
                         return EINTR;
                     }
 
@@ -604,7 +604,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 if eof {
                     return 0;
                 }
-                if akuma_exec::process::is_current_interrupted() {
+                if akuma_exec::process::should_interrupt_blocking_syscall() {
                     return EINTR;
                 }
                 let tid = akuma_exec::threading::current_thread_id();
@@ -631,7 +631,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 if nonblock {
                     return EAGAIN;
                 }
-                if akuma_exec::process::is_current_interrupted() {
+                if akuma_exec::process::should_interrupt_blocking_syscall() {
                     return EINTR;
                 }
                 let tid = akuma_exec::threading::current_thread_id();
@@ -654,7 +654,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     return 8;
                 }
                 if nonblock { return EAGAIN; }
-                if akuma_exec::process::is_current_interrupted() { return EINTR; }
+                if akuma_exec::process::should_interrupt_blocking_syscall() { return EINTR; }
                 let tid = akuma_exec::threading::current_thread_id();
                 super::eventfd::eventfd_add_poller(efd_id, tid);
                 akuma_exec::threading::schedule_blocking(u64::MAX);
@@ -964,7 +964,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                                 off += n;
                                 continue;
                             }
-                            if akuma_exec::process::is_current_interrupted() {
+                            if akuma_exec::process::should_interrupt_blocking_syscall() {
                                 if total_written > 0 { return total_written as u64; }
                                 return EINTR;
                             }
@@ -1061,7 +1061,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                             // previous chunks, return that rather than blocking.
                             if total_written > 0 { return total_written as u64; }
                             if nonblock { return EAGAIN; }
-                            if akuma_exec::process::is_current_interrupted() {
+                            if akuma_exec::process::should_interrupt_blocking_syscall() {
                                 return EINTR;
                             }
                             let tid = akuma_exec::threading::current_thread_id();
@@ -1087,7 +1087,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                         Ok(0) => {
                             if total_written > 0 { return total_written as u64; }
                             if nonblock { return EAGAIN; }
-                            if akuma_exec::process::is_current_interrupted() {
+                            if akuma_exec::process::should_interrupt_blocking_syscall() {
                                 return EINTR;
                             }
                             let tid = akuma_exec::threading::current_thread_id();

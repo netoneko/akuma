@@ -981,11 +981,14 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                     akuma_exec::process::reap_child_channel(p);
                     return u64::from(p);
                 }
-                akuma_exec::threading::schedule_blocking(u64::MAX);
-                // If interrupted (signal or Ctrl+C), return EINTR so the caller retries.
-                if akuma_exec::process::is_current_interrupted() {
+                // Tested *before* blocking so that on wake the loop re-runs
+                // has_exited() first: a reapable child outranks EINTR. SIGCHLD
+                // pends exactly when a child exits, so the two race by design,
+                // and Linux hands back the child.
+                if akuma_exec::process::should_interrupt_blocking_syscall() {
                     return EINTR;
                 }
+                akuma_exec::threading::schedule_blocking(u64::MAX);
             }
         }
     } else if pid == -1 || pid == 0 {
@@ -1036,10 +1039,12 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 akuma_exec::process::reap_child_channel(child_pid);
                 return u64::from(child_pid);
             }
-            akuma_exec::threading::schedule_blocking(u64::MAX);
-            if akuma_exec::process::is_current_interrupted() {
+            // Before blocking, so a child that became reapable while we slept is
+            // returned ahead of EINTR (see the pid>0 arm).
+            if akuma_exec::process::should_interrupt_blocking_syscall() {
                 return EINTR;
             }
+            akuma_exec::threading::schedule_blocking(u64::MAX);
         }
     }
 
@@ -1098,8 +1103,10 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                     if wnohang { break None; }
                     ch.add_poller(waiter_tid);
                     if ch.has_exited() { break Some((id, ch.exit_code())); }
+                    // Before blocking: on wake the loop re-tests has_exited()
+                    // first, so a reapable child outranks EINTR.
+                    if akuma_exec::process::should_interrupt_blocking_syscall() { return EINTR; }
                     akuma_exec::threading::schedule_blocking(u64::MAX);
-                    if akuma_exec::process::is_current_interrupted() { return EINTR; }
                 }
             } else {
                 return i64::from(-libc_errno::ECHILD) as u64;
@@ -1118,8 +1125,10 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                 if let Some((cpid, ch)) = akuma_exec::process::find_exited_child(current_pid) {
                     break Some((cpid, ch.exit_code()));
                 }
+                // Before blocking: on wake the loop re-tests find_exited_child()
+                // first, so a reapable child outranks EINTR.
+                if akuma_exec::process::should_interrupt_blocking_syscall() { return EINTR; }
                 akuma_exec::threading::schedule_blocking(u64::MAX);
-                if akuma_exec::process::is_current_interrupted() { return EINTR; }
             }
         }
         #[cfg(feature = "sc-pidfd")]
@@ -1153,8 +1162,10 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                     if wnohang { break None; }
                     ch.add_poller(waiter_tid);
                     if ch.has_exited() { break Some((target_pid, ch.exit_code())); }
+                    // Before blocking: on wake the loop re-tests has_exited()
+                    // first, so a reapable child outranks EINTR.
+                    if akuma_exec::process::should_interrupt_blocking_syscall() { return EINTR; }
                     akuma_exec::threading::schedule_blocking(u64::MAX);
-                    if akuma_exec::process::is_current_interrupted() { return EINTR; }
                 }
             } else {
                 return i64::from(-libc_errno::ECHILD) as u64;

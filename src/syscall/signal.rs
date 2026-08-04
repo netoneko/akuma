@@ -311,7 +311,7 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset
             return EAGAIN; // Timeout
         }
 
-        if akuma_exec::process::is_current_interrupted() {
+        if akuma_exec::process::should_interrupt_blocking_syscall() {
             return EINTR;
         }
 

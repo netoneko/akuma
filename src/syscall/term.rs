@@ -417,7 +417,7 @@ pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64
                 break;
             }
 
-            if akuma_exec::process::is_current_interrupted() {
+            if akuma_exec::process::should_interrupt_blocking_syscall() {
                 return i64::from(-libc_errno::EINTR) as u64;
             }
 

@@ -544,6 +544,7 @@ pub(crate) fn build_exec_runtime(
         proc_stdout_max_size: config::PROC_STDOUT_MAX_SIZE,
         cow_fork_enabled: config::COW_FORK_ENABLED,
         vfork_fastpath_enabled: config::VFORK_FASTPATH_ENABLED,
+        pthread_kill_eintr_enabled: config::PTHREAD_KILL_EINTR_ENABLED,
         // BSP/single-kernel: use the normal size-based loader. A multikernel secondary flips
         // this to true (it forwards file reads to the owner; whole-file is simplest there).
         prefer_whole_file_load: false,
@@ -1287,7 +1288,9 @@ fn run_async_main() -> ! {
             yield_now: threading::yield_now,
             blocking_relax: threading::blocking_relax,
             current_box_id: || process::current_process_shared().map_or(0, |p| p.box_id),
-            is_current_interrupted: process::is_current_interrupted,
+            // Combined Ctrl-C + pthread_kill check, so a socket read blocked in
+            // `wait_until` honours `tkill` the same way pipe/wait loops do.
+            is_current_interrupted: process::should_interrupt_blocking_syscall,
             rng_fill: |buf| rng::fill_bytes(buf).expect("RNG required for networking"),
             current_thread_id: || threading::current_thread_id() as u32,
         },

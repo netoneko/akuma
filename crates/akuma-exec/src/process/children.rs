@@ -268,6 +268,88 @@ pub fn interrupt_thread(thread_id: usize) {
     }
 }
 
+/// Does the *current thread* have a pending signal that must abort a blocking
+/// syscall with `EINTR`?
+///
+/// This is the per-thread counterpart to [`is_current_interrupted`], which reads
+/// `ProcessChannel::is_interrupted` — a flag set only by Ctrl-C and `sys_kill`.
+/// That makes it structurally blind to `tkill`/`tgkill` (i.e. `pthread_kill`),
+/// which pend a signal on one thread slot and wake it. Without this check a woken
+/// thread re-tests its loop predicate, still sees "not interrupted", and blocks
+/// again — so `pthread_kill` could never interrupt a blocking syscall.
+///
+/// Linux reports `EINTR` when a signal is actually *delivered*: pending, not
+/// blocked, and carrying a userspace handler. Two deliberate exclusions:
+///
+/// - **Blocked signals** stay pending silently and interrupt nothing.
+/// - **`SA_RESTART` handlers** get the syscall transparently restarted instead.
+///   Every caller of this helper is a "retry until the predicate holds" loop, so
+///   *not reporting* the interrupt makes the loop take another pass — which is
+///   exactly a restart. (Go installs its SIGURG preemption handler with
+///   `SA_RESTART`; reporting `EINTR` for it would break every blocking syscall a
+///   Go program makes.)
+///
+/// A `Default`-disposition signal needs no check here: `sys_tkill` applies a
+/// fatal default action inline and only pends it when blocked — and blocked is
+/// already excluded above.
+///
+/// The motivating case is jobserver-rs's `Helper::join`, which sends SIGUSR1 with
+/// `SA_SIGINFO` and *no* `SA_RESTART` specifically to break its helper thread out
+/// of a blocking pipe `read`; every rustc that reaches codegen leaks that thread
+/// otherwise.
+pub fn current_thread_has_pending_interrupt() -> bool {
+    // Hot path: one relaxed-ish atomic load for the overwhelmingly common
+    // "nothing pending" case, before any lookup or lock.
+    let tid = crate::threading::current_thread_id();
+    let pending = crate::threading::pending_signals_raw(tid);
+    if pending == 0 {
+        return false;
+    }
+    let deliverable = pending & !crate::threading::thread_signal_mask();
+    if deliverable == 0 {
+        return false;
+    }
+
+    let Some(pid) = read_current_pid() else { return false };
+    let Some(proc) = crate::process::lookup_process_shared(pid) else { return false };
+
+    /// AArch64 Linux `SA_RESTART`.
+    const SA_RESTART: u64 = 0x1000_0000;
+
+    let actions = proc.signal_actions.actions.lock();
+    let mut bits = deliverable;
+    while bits != 0 {
+        // Bit `i` is signal `i + 1`, and `actions` is indexed by `sig - 1`, so
+        // the bit index indexes `actions` directly.
+        let idx = bits.trailing_zeros() as usize;
+        bits &= bits - 1;
+        if idx >= crate::process::types::MAX_SIGNALS {
+            continue;
+        }
+        let action = actions[idx];
+        if matches!(action.handler, crate::process::SignalHandler::UserFn(_))
+            && action.flags & SA_RESTART == 0
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Should the current blocking syscall give up and return `EINTR`?
+///
+/// Combines the process-wide Ctrl-C / `sys_kill` path
+/// ([`is_current_interrupted`]) with the per-thread `pthread_kill` path
+/// ([`current_thread_has_pending_interrupt`]). Blocking loops should call this
+/// rather than either half.
+pub fn should_interrupt_blocking_syscall() -> bool {
+    if is_current_interrupted() {
+        return true;
+    }
+    crate::runtime::config().pthread_kill_eintr_enabled
+        && current_thread_has_pending_interrupt()
+}
+
 /// Read the current process PID from the process info page
 ///
 /// During a syscall, TTBR0 is still set to the user's page tables,
@@ -1342,6 +1424,7 @@ mod child_channel_drain_tests {
             proc_stdout_max_size: 1 << 20,
             cow_fork_enabled: false,
             vfork_fastpath_enabled: false,
+            pthread_kill_eintr_enabled: true,
             prefer_whole_file_load: false,
         };
         register(rt, cfg);
