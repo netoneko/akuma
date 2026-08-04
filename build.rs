@@ -174,4 +174,56 @@ fn main() {
     //                 stack bounds (main.rs derives them from STACK_TOP/BOTTOM).
     let boot_stack_size: usize = if extreme_profile { 32 * 1024 } else { 1024 * 1024 };
     println!("cargo:rustc-link-arg=--defsym=BOOT_STACK_SIZE={boot_stack_size}");
+
+    // Build identity for `uname -v` (docs/archive/UNAME.md). `sys_uname` used to
+    // report a static "Akuma OS" that said nothing about which build was running;
+    // it now reports `<git-sha>-<profile>`, e.g. `a1b2c3d-release-smp-shared`, so a
+    // running kernel can be tied back to a commit and a build target. `release`
+    // (`uname -r`) comes straight from CARGO_PKG_VERSION on the sys_uname side.
+    //
+    // The SHA is read here rather than in the kernel because the kernel is no_std and
+    // cannot shell out. Not built inside a git checkout (source tarball, vendored
+    // build) → "unknown"; that must stay non-fatal, the build has to work without git.
+    let git_sha = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=AKUMA_GIT_SHA={git_sha}");
+
+    // Rebuild when HEAD moves so the embedded SHA cannot go stale behind a cache hit.
+    // Both files are needed: .git/HEAD changes on branch switch, the ref file changes
+    // on commit. Emitted only when they exist — `rerun-if-changed` on a missing path
+    // makes cargo rebuild unconditionally.
+    if std::path::Path::new(".git/HEAD").exists() {
+        println!("cargo:rerun-if-changed=.git/HEAD");
+        if let Ok(head) = std::fs::read_to_string(".git/HEAD")
+            && let Some(refname) = head.strip_prefix("ref: ").map(str::trim)
+        {
+            let ref_path = format!(".git/{refname}");
+            if std::path::Path::new(&ref_path).exists() {
+                println!("cargo:rerun-if-changed={ref_path}");
+            }
+        }
+    }
+
+    // Which build target produced this kernel. Cargo's own PROFILE is "release" for
+    // every profile inheriting release (see the OPT_LEVEL note above), so the name is
+    // reconstructed from the same discriminators used throughout this script.
+    let build_profile = if extreme_profile {
+        "extreme-size"
+    } else if size_profile {
+        "size"
+    } else if smp_shared {
+        "release-smp-shared"
+    } else if smp {
+        "release-smp"
+    } else {
+        "release"
+    };
+    println!("cargo:rustc-env=AKUMA_BUILD_PROFILE={build_profile}");
 }

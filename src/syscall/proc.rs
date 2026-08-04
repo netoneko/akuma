@@ -167,10 +167,20 @@ pub(super) fn sys_uname(buf: u64) -> u64 {
         base[start..start + len].copy_from_slice(&value[..len]);
     }
 
+    // `release` tracks the kernel crate version, and `version` carries the build
+    // identity `<git-sha>-<profile>` (e.g. `a1b2c3d-release-smp-shared`) that build.rs
+    // embeds — enough for `uname -a` to say which commit and build target is running.
+    // See docs/archive/UNAME.md. sysname/nodename/domainname stay static literals:
+    // sethostname/setdomainname are not wired into the dispatch table, so there is no
+    // write path for them to track.
     write_field(&mut kernel_buf, 0, b"Akuma");
     write_field(&mut kernel_buf, 1, b"akuma");
-    write_field(&mut kernel_buf, 2, b"0.1.0");
-    write_field(&mut kernel_buf, 3, b"Akuma OS");
+    write_field(&mut kernel_buf, 2, env!("CARGO_PKG_VERSION").as_bytes());
+    write_field(
+        &mut kernel_buf,
+        3,
+        concat!(env!("AKUMA_GIT_SHA"), "-", env!("AKUMA_BUILD_PROFILE")).as_bytes(),
+    );
     write_field(&mut kernel_buf, 4, b"aarch64");
     write_field(&mut kernel_buf, 5, b"(none)");
 
