@@ -69,7 +69,7 @@ pub fn pipe_dump() {
             // matched to the pipe it is parked on.
             let mut waiters = [0usize; 8];
             let mut n = 0;
-            for t in p.pollers.iter() {
+            for t in &p.pollers {
                 if n >= waiters.len() { break; }
                 waiters[n] = *t;
                 n += 1;

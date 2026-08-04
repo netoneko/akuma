@@ -2537,6 +2537,12 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // #region agent log
     (runtime().print_str)("[FORK-DBG] step8: marking child READY\n");
     // #endregion
+    // POSIX: a fork()/vfork() child inherits the parent's signal mask, and it must be
+    // in place BEFORE the child can run — the slot claim scrubs the mask to 0, and the
+    // syscall-layer seed lands after this point, so without this the child is briefly
+    // runnable with everything UNBLOCKED. `Command::spawn` blocks all signals right
+    // before forking precisely to keep the pre-exec child from taking one.
+    crate::threading::seed_thread_signal_mask(tid, crate::threading::thread_signal_mask());
     crate::threading::mark_thread_ready(tid);
     // #region agent log
     (runtime().print_str)("[FORK-DBG] fork_process EXIT ok\n");
@@ -2676,6 +2682,12 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
     // first read_current_pid → THREAD_PID_MAP → with_process(child_pid) resolves.
     register_process(child_pid, new_proc);
 
+    // POSIX: a fork()/vfork() child inherits the parent's signal mask, and it must be
+    // in place BEFORE the child can run — the slot claim scrubs the mask to 0, and the
+    // syscall-layer seed lands after this point, so without this the child is briefly
+    // runnable with everything UNBLOCKED. `Command::spawn` blocks all signals right
+    // before forking precisely to keep the pre-exec child from taking one.
+    crate::threading::seed_thread_signal_mask(tid, crate::threading::thread_signal_mask());
     crate::threading::mark_thread_ready(tid);
     Ok(child_pid)
 }
@@ -2832,6 +2844,15 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     if child_tid_ptr != 0 {
         unsafe { core::ptr::write(child_tid_ptr as *mut u32, child_pid); }
     }
+
+    // POSIX: the new thread inherits the CREATING thread's signal mask — and it must be
+    // in place BEFORE the thread can run. `sys_clone` also seeds it on the way out, but
+    // that lands *after* `mark_thread_ready` below, so on SMP the child can already be
+    // executing with a zeroed mask (slot claim scrubs it) and take a signal its creator
+    // had deliberately blocked. Seeding here closes that window; the caller's seed then
+    // becomes a harmless idempotent repeat. We are running in the parent's context, so
+    // `thread_signal_mask()` is the creating thread's.
+    crate::threading::seed_thread_signal_mask(tid, crate::threading::thread_signal_mask());
 
     crate::threading::mark_thread_ready(tid);
 

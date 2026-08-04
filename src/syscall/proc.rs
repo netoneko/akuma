@@ -501,6 +501,23 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
         };
         match fork_result {
             Ok(new_pid) => {
+                // POSIX/Linux: a fork() child inherits the parent's signal mask. Only the
+                // CLONE_THREAD path above seeded it, so a forked child started with mask 0
+                // — everything UNBLOCKED — while `claim_free_slot`/`scrub_thread_slot`
+                // deliberately zero the slot's mask on reuse.
+                //
+                // That gap is load-bearing for `Command::spawn`: the runtime blocks every
+                // signal in the parent immediately before forking precisely so the child
+                // cannot take one in the pre-exec window, where its handler state and
+                // sigaltstack are not yet valid (`[signal] sig N needs sigaltstack but slot
+                // M has none — re-pending`). Starting that child fully unblocked reopens
+                // exactly the window the caller paid a syscall to close.
+                let parent_mask = akuma_exec::threading::thread_signal_mask();
+                if let Some(Some(child_tid)) =
+                    akuma_exec::process::with_process(new_pid, |p| p.thread_id)
+                {
+                    akuma_exec::threading::seed_thread_signal_mask(child_tid, parent_mask);
+                }
                 // CLONE_PIDFD: atomically create a pidfd for the child and write the fd number
                 // back to the caller. Go 1.22+ uses this to get the pidfd in a single syscall.
                 #[cfg(feature = "sc-pidfd")]
