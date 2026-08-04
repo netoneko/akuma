@@ -112,8 +112,7 @@ pub fn timer_irq_handler(_irq: u32) {
     // memory which could deadlock if main code is in the middle of an allocation.
     // Cleanup should be done from user code via threading::cleanup_terminated().
 
-    // #region agent log
-    {
+    if crate::config::TIMER_TICK_HEARTBEAT {
         static TIMER_TICK: AtomicU64 = AtomicU64::new(0);
         let tick = TIMER_TICK.fetch_add(1, Ordering::Relaxed);
         let forking = akuma_exec::process::FORK_IN_PROGRESS.load(Ordering::Relaxed);
@@ -124,7 +123,6 @@ pub fn timer_irq_handler(_irq: u32) {
             crate::safe_print!(96, "[TMR] t={} T={} p={} f={}\n", tick, tid, pdis, u8::from(forking));
         }
     }
-    // #endregion
 
     // Trigger SGI for scheduling - scheduler will decide if switch is needed.
     // Real shared-kernel SMP: this timer handler is shared across cores (one dispatch

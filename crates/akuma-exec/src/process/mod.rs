@@ -38,9 +38,7 @@ use alloc::vec::Vec;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
-// #region agent log
 pub static FORK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-// #endregion
 use spinning_top::Spinlock;
 
 use crate::elf_loader::{self, ElfError};
@@ -51,7 +49,6 @@ use akuma_terminal as terminal;
 
 use self::image::{compute_heap_lazy_size, LAZY_STACK_MAX};
 
-// #region agent log
 pub(crate) struct FmtBuf<'a> { buf: &'a mut [u8], pos: &'a mut usize }
 impl core::fmt::Write for FmtBuf<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
@@ -63,7 +60,29 @@ impl core::fmt::Write for FmtBuf<'_> {
         Ok(())
     }
 }
-// #endregion
+
+/// Is fork/exec/thread-spawn lifecycle tracing on? (`SYSCALL_DEBUG_INFO_ENABLED`)
+///
+/// These traces are step-by-step markers left over from the fork and
+/// thread-spawn investigations. They were unconditional, which put ~20 serial
+/// lines on every `fork()`, 5 on every `execve`, and 2 on every thread spawn —
+/// measured at ~3.5 K lines from a single short boot plus a few probes. A `-j4`
+/// in-VM cargo build does all three continuously, so the UART cost is large and,
+/// worse, it perturbs the timing of exactly the paths where the remaining
+/// thread-spawn race lives. Keep them (they are genuinely useful when a fork
+/// wedges) but behind the flag.
+#[inline]
+pub(crate) fn lifecycle_trace_on() -> bool {
+    config().syscall_debug_info_enabled
+}
+
+/// Emit one lifecycle trace line, when [`lifecycle_trace_on`].
+#[inline]
+pub(crate) fn lifecycle_trace(s: &str) {
+    if lifecycle_trace_on() {
+        (runtime().print_str)(s);
+    }
+}
 
 /// Page count to copy `len` bytes one page at a time. Returns [`None`] if the
 /// computation overflows `usize` (would otherwise wrap and loop forever).
@@ -1840,9 +1859,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // `process/lifecycle.rs`. The guard drops on every return path (including `?`
     // early-returns), so the lock is released exactly when the function exits.
     let _lifecycle = LifecycleGuard::acquire();
-    // #region agent log
-    (runtime().print_str)("[FORK-DBG] fork_process ENTRY\n");
-    // #endregion
+    lifecycle_trace("[FORK-DBG] fork_process ENTRY\n");
     if (runtime().is_memory_low)() {
         return Err("Kernel memory low, cannot fork");
     }
@@ -1859,8 +1876,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // process pid == tgid, so this is a no-op there.
     let parent_tgid = parent.tgid;
 
-    // #region agent log
-    {
+    if lifecycle_trace_on() {
         let mut buf = [0u8; 128];
         let mut pos = 0usize;
         let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
@@ -1870,7 +1886,6 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 parent.lazy_regions.lock().len()));
         if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
     }
-    // #endregion
 
     // 1. Create new address space
     let mut new_address_space = mmu::UserAddressSpace::new().ok_or("Failed to create address space")?;
@@ -2048,7 +2063,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         // by `COW_REFCOUNTS`, the frame pool and heap by the PMM/allocator's own locks.
         // Steps 5–8 that follow stay fully BKL-held: they touch `THREAD_CONTEXTS` and
         // the process table, which have no inner lock and where the BKL *is* the lock.
-        (runtime().print_str)("[FORK-DBG] step4: CoW fork\n");
+        lifecycle_trace("[FORK-DBG] step4: CoW fork\n");
         let cow_start_us = (runtime().uptime_us)();
         let mut total_shared: usize = 0;
 
@@ -2103,7 +2118,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 }
             });
             if overflow {
-                (runtime().print_str)("[FORK-COW] WARNING: sibling mmap region list truncated (>2048 regions)\n");
+                lifecycle_trace("[FORK-COW] WARNING: sibling mmap region list truncated (>2048 regions)\n");
             }
             ranges
         };
@@ -2213,7 +2228,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         new_proc.memory.next_mmap.store(parent.memory.next_mmap.load(Ordering::Relaxed), Ordering::Relaxed);
 
         let cow_elapsed_us = (runtime().uptime_us)() - cow_start_us;
-        {
+        if lifecycle_trace_on() {
             let mut buf = [0u8; 96];
             let mut pos = 0usize;
             let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
@@ -2231,7 +2246,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         // freeing the source frame mid-copy. Carving it would mean auditing that for a
         // path nothing runs; the playbook's "scope the window as narrowly as possible"
         // says leave it.
-        (runtime().print_str)("[FORK-DBG] step4: copying stack\n");
+        lifecycle_trace("[FORK-DBG] step4: copying stack\n");
         copy_range_phys(
             parent_l0,
             stack_start,
@@ -2240,7 +2255,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             None,
             "stack",
         )?;
-        (runtime().print_str)("[FORK-DBG] step4: stack done\n");
+        lifecycle_trace("[FORK-DBG] step4: stack done\n");
 
         let code_start = if parent.memory.code_end >= 0x1000_0000 {
             0x1000_0000
@@ -2251,7 +2266,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         };
         if parent.brk > code_start {
             let brk_len = parent.brk - code_start;
-            {
+            if lifecycle_trace_on() {
                 let mut buf = [0u8; 96];
                 let mut pos = 0usize;
                 let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
@@ -2267,10 +2282,10 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 Some(MAX_FORK_BRK_COPY_PAGES),
                 "brk",
             )?;
-            (runtime().print_str)("[FORK-DBG] step4: brk done\n");
+            lifecycle_trace("[FORK-DBG] step4: brk done\n");
         }
 
-        (runtime().print_str)("[FORK-DBG] step4: copying interp\n");
+        lifecycle_trace("[FORK-DBG] step4: copying interp\n");
         let interp_base = 0x3000_0000usize;
         let interp_scan_size = 2 * 1024 * 1024;
         if mmu::translate_user_va(parent_l0, interp_base).is_some() {
@@ -2283,7 +2298,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 "interp",
             )?;
         }
-        (runtime().print_str)("[FORK-DBG] step4: interp done\n");
+        lifecycle_trace("[FORK-DBG] step4: interp done\n");
 
         const MAX_FORK_MMAP_PAGES: usize = 2048;
         let mmap_snapshot: Vec<MmapRegion> = parent.mmap_regions.clone();
@@ -2296,7 +2311,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         for (region_idx, region) in mmap_snapshot.iter().enumerate() {
             let va_start = &region.start_va;
             let parent_frames = &region.frames;
-            {
+            if lifecycle_trace_on() {
                 let mut buf = [0u8; 128];
                 let mut pos = 0usize;
                 let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
@@ -2342,7 +2357,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                         child_frames.push(frame);
                     }
                     None => {
-                        (runtime().print_str)("[FORK-PG] OOM in inner loop\n");
+                        lifecycle_trace("[FORK-PG] OOM in inner loop\n");
                         ok = false; break;
                     }
                 }
@@ -2362,7 +2377,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         // `new_proc.lazy_regions` starts empty and is filled by the propagation
         // just below; clearing it here would undo that (see the CoW arm's note).
         new_proc.memory.next_mmap.store(parent.memory.next_mmap.load(Ordering::Relaxed), Ordering::Relaxed);
-        (runtime().print_str)("[FORK-DBG] step4: mmap done\n");
+        lifecycle_trace("[FORK-DBG] step4: mmap done\n");
 
         {
             const MAX_FORK_LAZY_PAGES: usize = 4096;
@@ -2380,7 +2395,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             let num_regions = parent_regions.len();
             let mut lazy_pages_copied = 0usize;
             let mut lazy_pages_scanned = 0usize;
-            {
+            if lifecycle_trace_on() {
                 let mut buf = [0u8; 64];
                 let mut pos = 0usize;
                 let _ = core::fmt::Write::write_fmt(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
@@ -2408,7 +2423,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                         lazy_pages_copied += 1;
                     }
                 }
-                if region_idx % 4 == 3 || region_idx == num_regions - 1 {
+                if lifecycle_trace_on() && (region_idx % 4 == 3 || region_idx == num_regions - 1) {
                     let mut buf = [0u8; 96];
                     let mut pos = 0usize;
                     let _ = core::fmt::Write::write_fmt(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
@@ -2418,7 +2433,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 }
             }
             let lazy_elapsed_us = (runtime().uptime_us)() - lazy_start_us;
-            {
+            if lifecycle_trace_on() {
                 let mut buf = [0u8; 96];
                 let mut pos = 0usize;
                 let _ = core::fmt::Write::write_fmt(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
@@ -2428,10 +2443,10 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             }
         }
 
-        (runtime().print_str)("[FORK-DBG] step4: lazy done\n");
+        lifecycle_trace("[FORK-DBG] step4: lazy done\n");
     }
 
-    (runtime().print_str)("[FORK-DBG] step4: done, entering step5\n");
+    lifecycle_trace("[FORK-DBG] step4: done, entering step5\n");
 
     // 5. Write ProcessInfo to child's process info page.
     //
@@ -2443,29 +2458,29 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // current_process_shared() / read_current_pid() to return the wrong PID.
     // This broke vfork_complete (wrong child PID → parent never unblocked)
     // and the CoW fault handler (resolved pages in the wrong address space).
-    (runtime().print_str)("[FORK-DBG] step5a: re-mapping PROCESS_INFO_ADDR\n");
+    lifecycle_trace("[FORK-DBG] step5a: re-mapping PROCESS_INFO_ADDR\n");
     let map_result = new_proc.address_space.map_page(
         PROCESS_INFO_ADDR,
         new_proc.process_info_phys,
         mmu::user_flags::RO | mmu::flags::UXN | mmu::flags::PXN,
     );
     if map_result.is_err() {
-        (runtime().print_str)("[FORK-DBG] step5a: map_page FAILED\n");
+        lifecycle_trace("[FORK-DBG] step5a: map_page FAILED\n");
     }
-    (runtime().print_str)("[FORK-DBG] step5b: writing ProcessInfo\n");
+    lifecycle_trace("[FORK-DBG] step5b: writing ProcessInfo\n");
     unsafe {
         let info_ptr = mmu::phys_to_virt(new_proc.process_info_phys) as *mut ProcessInfo;
         let info = ProcessInfo::new(child_pid, parent_pid, new_proc.box_id);
         core::ptr::write(info_ptr, info);
     }
 
-    (runtime().print_str)("[FORK-DBG] step5: done, entering step6\n");
+    lifecycle_trace("[FORK-DBG] step5: done, entering step6\n");
 
     // 6. Capture parent's user context and create child context
     let parent_tid = crate::threading::current_thread_id();
-    (runtime().print_str)("[FORK-DBG] step6a: getting context\n");
+    lifecycle_trace("[FORK-DBG] step6a: getting context\n");
     let parent_ctx = crate::threading::get_saved_user_context(parent_tid).ok_or("No saved context")?;
-    (runtime().print_str)("[FORK-DBG] step6b: context captured\n");
+    lifecycle_trace("[FORK-DBG] step6b: context captured\n");
     
     let mut child_ctx = parent_ctx;
     child_ctx.x0 = 0;    // fork returns 0 to child
@@ -2487,9 +2502,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // Store context in the Process struct (entry_point_trampoline uses proc.context)
     new_proc.context = child_ctx;
 
-    // #region agent log
-    (runtime().print_str)("[FORK-DBG] step7: spawning child thread\n");
-    // #endregion
+    lifecycle_trace("[FORK-DBG] step7: spawning child thread\n");
     // 7. Allocate thread but keep it INITIALIZING
     let tid = crate::threading::spawn_user_thread_initializing(
         entry_point_trampoline as extern "C" fn() -> !,
@@ -2522,9 +2535,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     register_child_channel(child_pid, exit_channel, parent_pid);
 
     // Register process BEFORE marking thread READY
-    // #region agent log
-    (runtime().print_str)("[FORK-DBG] step8: registering process\n");
-    // #endregion
+    lifecycle_trace("[FORK-DBG] step8: registering process\n");
     register_process(child_pid, new_proc);
     // No `clone_lazy_regions(parent_pid, child_pid)` here: both fork arms above
     // already propagated the parent *thread-group leader*'s descriptors into
@@ -2534,9 +2545,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // the authoritative one.
     
     // Now safe to start the thread
-    // #region agent log
-    (runtime().print_str)("[FORK-DBG] step8: marking child READY\n");
-    // #endregion
+    lifecycle_trace("[FORK-DBG] step8: marking child READY\n");
     // POSIX: a fork()/vfork() child inherits the parent's signal mask, and it must be
     // in place BEFORE the child can run — the slot claim scrubs the mask to 0, and the
     // syscall-layer seed lands after this point, so without this the child is briefly
@@ -2544,9 +2553,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // before forking precisely to keep the pre-exec child from taking one.
     crate::threading::seed_thread_signal_mask(tid, crate::threading::thread_signal_mask());
     crate::threading::mark_thread_ready(tid);
-    // #region agent log
-    (runtime().print_str)("[FORK-DBG] fork_process EXIT ok\n");
-    // #endregion
+    lifecycle_trace("[FORK-DBG] fork_process EXIT ok\n");
 
     Ok(child_pid)
 }
@@ -2893,15 +2900,13 @@ pub fn allocate_pid() -> Pid {
 /// Called by threading::spawn_user_thread
 pub extern "C" fn entry_point_trampoline() -> ! {
     let tid = crate::threading::current_thread_id();
-    // #region agent log
-    {
+    if lifecycle_trace_on() {
         let mut buf = [0u8; 64];
         let mut pos = 0usize;
         let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
             format_args!("[FORK-DBG] trampoline ENTRY tid={}\n", tid));
         if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
     }
-    // #endregion
     let mut proc_ptr: *mut Process = core::ptr::null_mut();
 
     if let Some(pid) = table::find_process(|p| {
@@ -2926,7 +2931,7 @@ pub extern "C" fn entry_point_trampoline() -> ! {
     // Unlike syscall return paths, this is the first entry to userspace for a new
     // thread, so we handle it here before calling run().
     let (alt_sp, _, _) = crate::threading::get_sigaltstack(tid);
-    {
+    if lifecycle_trace_on() {
         let mut buf = [0u8; 96];
         let mut pos = 0usize;
         let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
@@ -2939,7 +2944,7 @@ pub extern "C" fn entry_point_trampoline() -> ! {
         // Clear SIGURG (signal 23) if pending - it will be re-sent by Go later.
         let pending = crate::threading::peek_pending_signal(tid);
         if pending == 23 {
-            (runtime().print_str)("[TRAMP] clearing pending SIGURG\n");
+            lifecycle_trace("[TRAMP] clearing pending SIGURG\n");
             crate::threading::clear_pending_signal(tid, 23);
         }
     }

@@ -1523,3 +1523,154 @@ doesn't cover the `.tbss` range Rust's `CURRENT` occupies, or the aliasing needs
 the concurrency `-j4` supplies. Extending that probe is the cheap next step.
 
 Signature 3 (lost-wakeup stall) is untouched by any of this and remains open.
+
+---
+
+# The `rtabort!` behind the SIGABRT: narrowing (2026-08-04, OPEN)
+
+With delivery fixed (previous section), the `-j4` build fails cleanly and
+legibly instead of ambiguously:
+
+```
+fatal runtime error: current thread handle already set during thread spawn, aborting
+error: could not compile `<crate>` (…)   … (signal: 6, SIGABRT: process abort signal)
+```
+
+This section records what that abort is, and what has been ruled out.
+
+## What the abort actually tests
+
+Read from the guest's own `rust-src` (nightly 1.99.0), not inferred.
+`ThreadInit::init` (`library/std/src/thread/lifecycle.rs:141`) aborts when
+`set_current` (`library/std/src/thread/current.rs:121`) returns `Err`, and that
+happens for exactly **two** reasons:
+
+```rust
+pub(super) fn set_current(thread: Thread) -> Result<(), Thread> {
+    if CURRENT.get() != NONE { return Err(thread); }          // (1)
+    match id::get() {
+        Some(id) if id == thread.id() => {}
+        None => id::set(thread.id()),
+        _ => return Err(thread),                              // (2)
+    }
+    ...
+}
+```
+
+Both `CURRENT` and `id` are `local_pointer!` statics. `aarch64-unknown-linux-musl`
+selects the `target_thread_local` backend (`sys/thread_local/mod.rs`), so these
+are native `#[thread_local]` statics in **`.tbss`** — not pthread keys. So the
+abort means precisely: *a brand-new thread read non-zero out of its own `.tbss`.*
+
+## Ruled out
+
+**Not that compilation.** The exact failing `rustc` invocation, extracted from
+the build log and re-run in-guest **40 times at concurrency 4**: zero failures.
+
+**Not a particular crate.** Re-running the build, the previous victim
+(`curve25519-dalek`) compiled fine and `libm` aborted instead. Crate-agnostic,
+non-deterministic, needs real build load — consistent with the earlier session's
+note, and now with a controlled negative result behind it.
+
+**Not "the kernel hands back unzeroed pages."** Every user page allocation ends
+in `pmm::alloc_page_zeroed()`, which does `write_bytes(0)` over the page, then
+`dc cvac` across all 64 B lines, then `dsb ish` — so zeros are visible through
+the user VA as well as the kernel identity map. The only two `alloc_page` (not
+`_zeroed`) calls in the MMU are page tables, explicitly zeroed on the next line.
+`alloc_page_zeroed_user`'s reclaim rungs all fall through to the same call.
+
+**Not intra-process TLS reuse or aliasing.** `tlsdirty` covers exactly the
+contract in question — 2000 sequential spawn/join checking `.tbss` reads zero,
+a 24-thread fan-out checking no two live threads share `&tls_current`, and churn
+under fan-out — and reports `dirty_hits=0 alias_hits=0` on every run.
+
+**So the probe that was built for the leading hypothesis has falsified it.**
+What remains is a *race at thread startup* rather than stale page content: a new
+thread transiently reading through the wrong `TPIDR_EL0` (another live thread's
+TLS block) would satisfy condition (1) with `CURRENT` genuinely set — by its
+real owner. That is invisible to a single-process probe, load-dependent, and
+crate-agnostic, which fits every observation. Unverified.
+
+## Instrumentation debt found (fixed)
+
+Reading the thread-start path turned up ~25 **unconditional** serial traces
+committed in the fork/exec/thread-spawn hot paths (the `// #region agent log`
+blocks): ~20 lines per `fork()`, 5 per `execve`, 2 per thread spawn. Measured
+**3,580 `[TRAMP]` + 3,545 `[FORK-DBG]`** lines from a single short boot plus a
+few probe runs; the timer IRQ additionally emitted `[TMR]` every 1000 ticks and
+every **100** while a fork was in progress — and under `-j4` a fork is nearly
+always in progress.
+
+They are now behind flags (`akuma_exec::process::lifecycle_trace` /
+`lifecycle_trace_on`, gated by `SYSCALL_DEBUG_INFO_ENABLED`; the heartbeat by
+the new `TIMER_TICK_HEARTBEAT`). Same boot after: **0** such lines.
+
+This matters beyond tidiness. UART writes are slow and partly IRQ-disabled, so
+tracing every fork and thread spawn measurably reshapes the timing of the exact
+paths where the remaining race lives — a race can appear or vanish with the
+tracing knob. Any future claim about this bug should say which way the knob was
+set.
+
+## Re-reading this document's own earlier findings (2026-08-04)
+
+Two things recorded above turned out to matter more than they looked, and both
+were verified against current source rather than taken on the page's word.
+
+### The "zeroed pages behind `.tbss`" contract holds — checked, not assumed
+
+§"A structural read of the abort" reduces the `rtabort!` to *the kernel must
+deliver `mmap(MAP_ANONYMOUS)` pages as zeros, because `__copy_tls` only memcpy's
+`.tdata`*. That contract is **met**: `ext2::allocate_block` zeroes a newly
+allocated block before returning it, and every user page allocation bottoms out
+in `pmm::alloc_page_zeroed` (`write_bytes(0)` + `dc cvac` over all 64 B lines +
+`dsb ish`, so the zeros are visible through the user VA as well as the kernel
+identity map). `alloc_page_zeroed_user`'s three reclaim rungs all fall through
+to the same call. So "the kernel handed back a dirty page" is **not** the
+explanation — consistent with `tlsdirty` passing.
+
+### `/tmp` is disk-backed, and that invalidates file-based evidence
+
+Confirmed live: `df /tmp` → *can't find mount point*; `/tmp` is part of the root
+ext2 image, and with `SNAPSHOT=0` it survives reboots. Combined with the
+unexplained anomaly recorded above (a freshly created inode whose first 85 bytes
+were content no process in that boot wrote), **an `.out`/`.rc` file in `/tmp` is
+not evidence on its own.**
+
+Consequences adopted here:
+
+* Probe results quoted in the SIGABRT-delivery section came from **SSH stdout**,
+  not from redirected files — unaffected.
+* The build driver now writes to a unique per-attempt path and confirms
+  completion by the absence of live `cargo`/`rustc` processes, not by an
+  exit-code file alone.
+
+### The EINTR gap is real, still open, and is the next thing to fix
+
+§"the `tkill`-packs-of-100 pattern" attributes rustc's SIGUSR1 storm to
+`jobserver-rs`'s `Helper::join`, which `pthread_kill`s its helper up to 100
+times trying to break a blocking `read()`. Re-verified at HEAD:
+
+* `sys_tkill` pends the signal and wakes the target — it never calls
+  `interrupt_thread`.
+* The blocking loops (`src/syscall/fs.rs:551`, and the same shape at
+  `fs.rs:413,607,634,657,967,1064,1090`, `poll.rs`, `time.rs`, `term.rs`,
+  `proc.rs`, `crates/akuma-net/src/socket.rs`) return `EINTR` only on
+  `akuma_exec::process::is_current_interrupted()` — which reads
+  `ProcessChannel::is_interrupted`, a flag set solely by `interrupt_thread`
+  (Ctrl-C, and `sys_kill`, which *does* call it).
+
+So a `tkill`-delivered signal wakes a blocked thread, the loop re-checks, finds
+no data and no interrupt flag, and blocks again: **`pthread_kill` can never
+interrupt a blocking syscall.** jobserver therefore burns all 100 attempts and
+leaks its helper thread — one per rustc that reaches codegen, quadrupled at
+`-j4`.
+
+This is the same family as the delivery bug fixed above (a pended signal that
+nothing acts on), and it is a plausible *contributor* to the remaining
+thread-spawn race: more leaked, unkillable blocked threads means more
+thread-lifecycle churn for the race to land in. The fix is a predicate — "a
+signal is pending on this thread and not blocked by its mask" — checked
+alongside `is_current_interrupted()` at those blocking sites. Not yet
+implemented; note that it will make previously-inert pended signals start
+producing `EINTR`, so `SA_RESTART` behaviour and the SIGURG re-pend paths want
+checking with it.

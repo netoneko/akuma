@@ -141,12 +141,22 @@ re-read it in `drop()` (that unbalances the BKL ticket FIFO).
 
 These are **compile-time** `pub const bool` — toggle in source and rebuild.
 
+> **Serial output is not free.** The fork/exec/thread-spawn traces below were
+> once unconditional: ~20 lines per `fork()`, 5 per `execve`, 2 per thread
+> spawn — ~3.5 K lines from one short boot plus a few probes, and far more under
+> an in-VM `-j4` build, which does all three continuously. Beyond the log noise
+> that is enough UART time to move the timing of the very paths being traced, so
+> a race can appear or vanish depending on whether tracing is on. Turn one knob
+> at a time, and re-confirm a "fixed" race with tracing back off.
+
 ### Tracing
 
 | Knob | Default | Effect | Source |
 |---|---|---|---|
 | `RUMP_SP_TRACE` | `false` | One line per proxied socket syscall (box, syscall, fd, result). | `config.rs:680` |
-| `SYSCALL_DEBUG_INFO_ENABLED` | `false` | Full syscall tracing. | `config.rs:292` |
+| `SYSCALL_DEBUG_INFO_ENABLED` | `false` | Full syscall tracing — **and** the `[FORK-DBG]`/`[TRAMP]` fork/exec/thread-spawn lifecycle traces (`akuma_exec::process::lifecycle_trace`). | `config.rs:316` |
+| `TIMER_TICK_HEARTBEAT` | `false` | `[TMR] t=… T=… p=… f=…` from the timer IRQ every 1000 ticks — every **100** while a fork is in progress. | `config.rs:327` |
+| `TRACE_TKILL` | `false` | Per-`tkill` line: target tid, caller slot, disposition, mask, blocked/fatal — plus the pending set at each syscall return. The tool for "a signal was raised but nothing happened". | `config.rs:749` |
 | `FUTEX_DBG_ENABLED` | `false` | Futex diagnostics. | `config.rs:180` |
 | `DEADLOCK_THREAD_DUMP_ENABLED` | `false` | Dumps all threads when a deadlock is suspected. | `config.rs:186` |
 | `DEMAND_PAGE_LOG_ENABLED` | `false` | Demand-paging logs. | `config.rs:268` |

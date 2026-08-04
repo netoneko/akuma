@@ -313,7 +313,20 @@ pub const ENABLE_SSH_ASYNC_EXEC: bool = true;
 pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = false;
 
 /// Option to disable [syscall] debug prints to the kernel log.
+///
+/// Also gates the fork/exec/thread-spawn `[FORK-DBG]`/`[TRAMP]` lifecycle
+/// traces (`akuma_exec::process::lifecycle_trace`). Those were unconditional
+/// and cost ~20 serial lines per `fork()`, 5 per `execve`, and 2 per thread
+/// spawn — enough to dominate the log and shift the timing of the paths they
+/// trace under an in-VM `-j4` build.
 pub const SYSCALL_DEBUG_INFO_ENABLED: bool = false;
+
+/// Print a `[TMR] t=… T=… p=… f=…` scheduler heartbeat from the timer IRQ every
+/// 1000 ticks — and every **100** while any fork is in progress. Left over from
+/// the fork-wedge investigations; `[Heartbeat] … SmolNet Active` already gives
+/// liveness, and under `-j4` a fork is almost always in progress, so the ramped
+/// rate is pure noise on the serial line.
+pub const TIMER_TICK_HEARTBEAT: bool = false;
 
 /// During `fork`, print a short line to **serial** every 8192 brk pages copied (Go heaps are huge).
 /// Independent of `SYSCALL_DEBUG_INFO_ENABLED` so QEMU logs show liveness without log::debug routing.
