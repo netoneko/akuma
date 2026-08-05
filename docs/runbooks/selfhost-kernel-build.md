@@ -273,12 +273,17 @@ Host-side: reusing an `INSTANCE` port across VMs trips ssh's
 `REMOTE HOST IDENTIFICATION HAS CHANGED`, which `StrictHostKeyChecking=no` does
 **not** bypass — add `-o UserKnownHostsFile=/dev/null`.
 
-#### 5.2c `apk` cargo is the HVF workaround, and it costs you the cache
+#### 5.2c `apk` cargo was the HVF workaround, and it cost you the cache
 
-Nightly cargo traps under HVF (`[Exception] Unknown from EL0: EC=0x0` on every
-exec — the "Common failures" row below). The documented workaround, apk's
-`/usr/bin/cargo` with nightly `rustc` on `PATH`, works — but it is a **different
-cargo**, so it does not accept the fingerprints the nightly cargo wrote. It
+> **Obsolete as of 2026-08-06 (§6 fix):** nightly cargo now runs under HVF. Use
+> `/usr/local/bin/cargo` directly. The fallback below is retained for history
+> and for a cold `target/` you specifically want to seed with apk-cargo
+> fingerprints.
+
+Nightly cargo used to die under HVF (`[Exception] Unknown from EL0: EC=0x0` on
+every exec — the "Common failures" row below). The documented workaround, apk's
+`/usr/bin/cargo` with nightly `rustc` on `PATH`, works — but it is a **different**
+cargo, so it does not accept the fingerprints the nightly cargo wrote. It
 re-resolves and starts rebuilding the ~97 dependency crates from scratch, which
 throws away the fast path to the final `akuma` crate (the one §5.1 is about).
 It does not *delete* the old rlibs — the count goes up, not down — so a later
@@ -320,13 +325,35 @@ The disk itself stays clean through all of this — `e2fsck` reported no errors
 after a run that ended with QEMU aborting — so the corruption is purely
 in-memory. Do not go looking for filesystem damage.
 
-## 6. OPEN: nightly `cargo` dies instantly under HVF (`EC=0x0`)
+## 6. FIXED: nightly `cargo` under HVF — undefined instruction delivered as SIGILL (2026-08-06)
 
-Worth fixing rather than working around: it is the **only** reason the self-host
-flow reaches for apk cargo, and that is what costs the dependency fingerprint
-cache (§5.2c) and with it the cheap path to the final crate.
+**Root cause + fix:** `EC=0x0` at the constant `ELR=0x112ac280` was
+**OpenSSL's `OPENSSL_cpuid_setup` armcaps probe executing `SM3SS1`
+(`0xce63c004`, FEAT_SM3)** inside `_armv8_sm3_probe`, statically linked into
+cargo via its git/curl stack. The probe is *meant* to raise `SIGILL`, which a
+userspace handler catches to clear the capability bit and continue — but the
+kernel's `EC=0x0` handler hard-killed the process instead of delivering
+`SIGILL`. Apple Silicon lacks FEAT_SM3/SM4/SVE/SVE2 (so the probes trap under
+HVF `-cpu host`); TCG `-cpu max` implements them, so no trap occurs there and
+`HVF=0` avoided the crash. Full investigation + evidence + rule-outs:
+[`../archive/NIGHTLY_CARGO_HVF_SIGILL.md`](../archive/NIGHTLY_CARGO_HVF_SIGILL.md).
 
-Every exec of `/usr/local/bin/cargo` (nightly 1.99.0) dies before doing any work:
+The fix is one arm of the sync-exception handler in `src/exceptions.rs`: deliver
+`SIGILL` (signal 4) via the existing `try_deliver_signal` path before killing —
+mirroring what the kernel already did for `SIGSEGV` and the spurious-SVC `SIGILL`
+case. Verified end to end: `cargo --version` runs under HVF (RC=0), a
+`cargo build` proceeds (13 `SIGILL` deliveries during startup, all at OpenSSL
+probe PCs, all caught by the handler), and `rustc` still works; `HVF=0` (TCG)
+shows `EC=0x0` count = 0 (the fix is inert there). Host tests + clippy clean.
+
+**Consequence for the cache (§5.2c):** nightly cargo now *runs*, so the
+apk-cargo fallback is no longer needed. The first nightly-cargo build on a
+`target/` previously written by apk cargo still recompiles the ~97 deps once
+(incompatible fingerprints), but that run writes **nightly-cargo** fingerprints,
+so the next nightly-cargo invocation is a `Finished` cache hit — the fast path
+§5.2c said the fallback threw away.
+
+The trace below is the original (pre-fix) symptom, kept for reference:
 
 ```
 [syscall] execve(path="/usr/local/bin/cargo", …)
@@ -336,27 +363,12 @@ Every exec of `/usr/local/bin/cargo` (nightly 1.99.0) dies before doing any work
           mmap=13 mprotect=3 openat=5 read=1 readlinkat=1 brk=6
 ```
 
-What is established (2026-08-05):
-
-- **`ELR` is a constant, `0x112ac280`**, byte-identical across every occurrence,
-  across different pids and threads, across two different kernel builds. So it is
-  one specific instruction at one specific offset in the cargo binary, not a race.
-- It dies **~71 syscalls in**, having only mmap'd/mprotect'd and read a few
-  files — i.e. inside startup, before any build logic.
-- **Nightly `rustc` from the same toolchain is fine** under HVF (it compiles
-  crates all day), as is apk cargo. The problem is this one binary.
-- `EC=0x0` from EL0 is "unknown reason" — an **undefined instruction**. A trapped
-  `CNTP*_EL0` system-register read would raise `EC=0x18` (MSR/MRS), so the
-  long-standing "nightly cargo traps HVF CNTP" note in the failure table above is
-  almost certainly a misattribution. Do not start from it.
-- `HVF=0` (TCG) avoids it, which points at an instruction Apple silicon under
-  `-cpu host` does not implement but TCG's model does.
-
-Next step is cheap and decisive: **disassemble the instruction at that offset.**
-Get the load base from the `[mmap]`/execve lines for the same pid, subtract, then
-`objdump -d --start-address=… --stop-address=…` the cargo binary (pull it out of
-a disk *clone*, never a live image). Prime suspects for something TCG has and
-`-cpu host` does not: FEAT_MOPS (`CPY*`/`SET*`), FEAT_LSE128, or SVE.
+Decoding the load base from the kernel's own `[IA-DP]` line
+(`seg_va=0x10000000`) gives the file offset `0x12ac280`; the 4 bytes there are
+`0xce63c004` = `SM3SS1`, in a table of OpenSSL probes (`_armv8_sm4_probe`,
+`_armv8_sha512_probe`, `_armv8_eor3_probe`, `_armv8_sve_probe`,
+`_armv8_sve2_probe`, `_armv8_cpuid_probe`, `_armv8_sm3_probe`) immediately
+followed by `CRYPTO_memcmp` / `OPENSSL_cleanse`.
 
 ## Verify
 
@@ -426,7 +438,7 @@ same tree.
 | futex/exit_group thread-group reaping | thread-group not fully reaped | FIXED |
 | icache stale (`dc cvau`) | icache not flushed after code write | FIXED |
 | Stale I-cache spurious SVC | spurious svc during execve | FIXED (the headline §7k.6) |
-| `cargo --version` crash (EC=0x0) | **Cause not established** — see §6 below; the long-standing "traps HVF CNTP" reading does not fit the evidence | Use apk cargo + nightly rustc (costs the fingerprint cache, §5.2c); or `HVF=0` |
+| `cargo --version` crash (EC=0x0) | **FIXED 2026-08-06** — OpenSSL `OPENSSL_cpuid_setup` executes `SM3SS1` (FEAT_SM3) which Apple Silicon lacks; the kernel's `EC=0x0` arm didn't deliver SIGILL so the probe handler couldn't recover. Now delivers SIGILL via `try_deliver_signal` (§6). The old "traps HVF CNTP" reading was a misattribution (that would be EC=0x18) | Nightly `/usr/local/bin/cargo` now runs under HVF. (Old workaround: apk cargo + nightly rustc, or `HVF=0` — no longer needed) |
 | `error: could not compile … (signal: 11)`, or all rustc processes frozen with `pthread_join` waiters | freshly-cloned thread SIGSEGVs at a fixed PC | **OPEN** — [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) |
 | Final `akuma` crate sits on `Compiling akuma v0.0.7` forever at `-j4`; waiters on `0x300c2340` with `queued_for` > 900 s, **no** `[kill]` and **no** `[Fault]` lines | Lost scheduler wakeup in `schedule_blocking` — a wake that raced the `WAITING` publication was dropped. **FIXED 2026-08-05** | Fix is in; `-j1` remains the recipe until a `-j4` run confirms it (§5.1). Diagnosis: [`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) §4a |
 | `Exec format error (os error 8)` on the same `build-script-build` every attempt | 0-byte artifact from a crashed link, still "fresh" to cargo | Delete the fingerprint dir (§5.4) — not a kernel bug |

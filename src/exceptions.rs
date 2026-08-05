@@ -4183,10 +4183,27 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             akuma_exec::process::return_to_kernel(-5) // SIGTRAP
         }
         _ => {
-            // Capture additional state for debugging. ELR/SPSR from the trap
-            // frame and FAR from the entry snapshot — the live registers may
-            // belong to a later trap (see rust_sync_el0_handler).
+            // EC=0x0 from EL0 is an undefined instruction. On Apple Silicon
+            // under HVF/-cpu host, several optional AArch64 features that TCG
+            // `-cpu max` implements are absent (FEAT_SM3/SM4/SVE/SVE2/…), so a
+            // binary can reach one at runtime. The common case is a CPU-feature
+            // *probe*: code deliberately executes the feature instruction inside
+            // a SIGILL handler to detect support (OpenSSL's OPENSSL_cpuid_setup
+            // armcaps, statically linked into nightly cargo via its git/curl
+            // stack; libgcc's __init_cpu_features; etc.). Those rely on the
+            // kernel delivering SIGILL to a registered userspace handler, the
+            // way Linux does. Try that first; only fall through to a fatal
+            // SIGILL when no handler is registered.
             let (elr, spsr) = unsafe { ((*frame).elr_el1, (*frame).spsr_el1) };
+            crate::safe_print!(96, "[Exception] Unknown from EL0: EC={:#x}, ISS={:#x} ELR={:#x} — delivering SIGILL\n", ec, iss, elr);
+            if try_deliver_signal(frame, 4, elr, true, esr) {
+                return 4; // SIGILL delivered to a userspace handler
+            }
+
+            // No handler registered — fatal SIGILL. Capture additional state for
+            // debugging. ELR/SPSR from the trap frame and FAR from the entry
+            // snapshot — the live registers may belong to a later trap (see
+            // rust_sync_el0_handler).
             let ttbr0: u64;
             let sp: u64;
             unsafe {
@@ -4195,7 +4212,6 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             }
             let tid = akuma_exec::threading::current_thread_id();
 
-            crate::safe_print!(96, "[Exception] Unknown from EL0: EC={:#x}, ISS={:#x}\n", ec, iss);
             crate::safe_print!(128, "  Thread={}, ELR={:#x}, FAR={:#x}, SPSR={:#x}\n", tid, elr, far, spsr);
             crate::safe_print!(64, "  TTBR0={:#x}, SP={:#x}\n", ttbr0, sp);
 
@@ -4206,10 +4222,10 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             }
 
             if let Some(pid) = akuma_exec::process::read_current_pid() {
-                crate::syscall::proc::notify_child_channel_exited_pub(pid, -1);
+                crate::syscall::proc::notify_child_channel_exited_pub(pid, -4); // SIGILL
                 crate::syscall::proc::vfork_complete(pid);
             }
-            akuma_exec::process::return_to_kernel(-1) // never returns
+            akuma_exec::process::return_to_kernel(-4) // never returns; SIGILL
         }
     }
 }
