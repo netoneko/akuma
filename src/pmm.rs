@@ -784,7 +784,14 @@ pub fn alloc_page_zeroed_user() -> Option<PhysFrame> {
             // sweep over many subsequent faults.
             akuma_exec::process::reclaim_clean_file_pages(USER_RECLAIM_BATCH);
             if user_alloc_would_starve(free_count()) {
-                return None;
+                // The sweep above unmaps pages but cannot free a frame the shared
+                // file-page cache still references, so a cache holding unmapped
+                // pages would let reclaim report progress while freeing nothing.
+                // Drop the entries that actually own memory (no remaining mappers).
+                crate::file_page_cache::shrink(USER_RECLAIM_BATCH);
+                if user_alloc_would_starve(free_count()) {
+                    return None;
+                }
             }
         }
     }

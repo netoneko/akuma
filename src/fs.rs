@@ -123,6 +123,9 @@ pub fn init() -> Result<(), FsError> {
         let ram_bytes = crate::pmm::total_count().saturating_mul(PAGE);
         let cap = core::cmp::min(ram_bytes / 8, CACHE_CEILING);
         akuma_ext2::set_cache_cap_bytes(cap);
+        // Sized from the same RAM figure, but a *different* kind of consumer: this
+        // one dedupes frames that would otherwise exist per-process anyway.
+        crate::file_page_cache::init(ram_bytes);
     }
 
     // Mount ext2 filesystem at root

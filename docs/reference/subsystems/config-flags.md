@@ -180,6 +180,7 @@ These are **compile-time** `pub const bool` — toggle in source and rebuild.
 |---|---|---|---|
 | `COW_FORK_ENABLED` | `true` | Copy-on-Write fork. | `config.rs:301` |
 | `VFORK_FASTPATH_ENABLED` | `true` | vfork fast path. | `config.rs:311` |
+| `SHARED_FILE_PAGES_ENABLED` | `true` | Share one physical frame between all read-only mappers of a file page, keyed `(inode, file_offset)`, instead of a private copy per process. Fixes the `-jN` memory/I-O amplification. Off = per-process private file pages. | `config.rs` |
 | `NETWORK_THREAD_RATIO` | `4` | Scheduler weight for the network thread. | `config.rs:222` |
 | `MAIN_THREAD_PRIORITY_BOOST` | `false` | Legacy; proportional scheduler is now default. | `config.rs:207` |
 | `ENABLE_PREEMPTION_WATCHDOG` | `true` | | `config.rs:275` |

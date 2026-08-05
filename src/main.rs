@@ -42,6 +42,7 @@ mod editor;
 // mod embassy_virtio_driver;
 mod exceptions;
 #[cfg(feature = "sc-framebuffer")]
+mod file_page_cache;
 mod fw_cfg;
 mod kernel_timer;
 mod fs;
@@ -1515,6 +1516,12 @@ fn run_async_main() -> ! {
                     hits, misses, pct, used, cap,
                     crate::pmm::free_count(), crate::pmm::total_count(),
                     crate::allocator::stats().heap_size / 1024 / 1024);
+            }
+            // Shared read-only file pages, same cadence. `hits` is the number of
+            // private frame allocations + `read_at` sweeps this cache avoided, which
+            // is the direct measure of the `-j4` amplification it exists to remove.
+            if crate::config::SHARED_FILE_PAGES_ENABLED {
+                crate::safe_print!(192, "{}", crate::file_page_cache::stats_line());
             }
             // Deadlock-hunt aid: the Thread-0 heartbeat's dump trigger fires
             // every 50M idle loops (~never with idle_halt); piggyback on the

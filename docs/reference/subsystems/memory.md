@@ -150,10 +150,73 @@ Rungs, in order. Each is tried only if the previous left free PMM at or below
 | 1 | `allocator::reclaim_to_pmm()` | none — fully-free heap spans |
 | 2 | `process::reclaim::drain_retired_under_pressure()` | none — the pages belong to processes that are already dead |
 | 3 | `process::reclaim_clean_file_pages()` | one disk read per page, on the next touch by a **live** process |
+| 3b | `file_page_cache::shrink()` | one disk read per page, on the next *mapper* of that page |
 | 4 | return `None` ⇒ caller SIGSEGVs the faulting process | — |
 
 Rung 2 sits above rung 3 deliberately: evicting a live process's clean file
 pages is the more expensive and more destructive of the two.
+
+Rung 3b is not optional garnish — it is what keeps rung 3 honest. The shared
+file-page cache holds a reference on every frame it caches, so `free_page` from
+rung 3's sweep decrements instead of freeing. Without 3b, reclaim would unmap
+pages, report progress, and return no memory at all. 3b drops only entries whose
+frame has **no remaining mappers** (`cow_ref_get(pa) <= 1`), since evicting a
+still-mapped page costs a future re-read while freeing nothing now.
+
+## Shared file pages (`src/file_page_cache.rs`)
+
+**Stability: B — verify behaviour.** Landed 2026-08-05.
+
+Read-only file-backed pages are deduplicated on `(inode, file_offset)`, so every
+process mapping the same page of the same file shares one physical frame.
+
+Before this, each file-backed demand fault allocated a **private** frame and
+copied the file bytes into it. Two processes mapping the same page held two
+copies filled by two `read_at` calls — the mechanism behind "`-j4` is slower than
+`-j1`" on the self-host build (see
+[`runbooks/selfhost-kernel-build.md`](../../runbooks/selfhost-kernel-build.md)
+§5.1a).
+
+### The refcount is the existing CoW refcount
+
+No new teardown code exists, and none should be added. `pmm::free_page` already
+routes through `cow_ref_dec` and declines to free a frame that still has
+references, so process exit, `munmap` and `try_evict_ro_page` all just drop a
+reference. The invariant is:
+
+```
+refcount = (1 if cached) + (number of address spaces mapping it)
+```
+
+An address space contributes **exactly one** reference, because teardown frees
+each distinct PA once regardless of how many VAs map it (`user_frames` counts
+VAs per PA). The cache takes a reference per *fault*, so a second VA in the same
+process mapping an already-held frame hands the surplus back —
+`exceptions::drop_surplus_shared_ref`, gated on `AddressSpace::tracks_user_frame`.
+Removing that guard leaks a frame per occurrence.
+
+### Eligibility is deliberately narrow
+
+Each rule rules out a correctness bug, not merely a risk:
+
+| Rule | What it prevents |
+|---|---|
+| mapped read-only to EL0 (`AP_RO_ALL`) | a writable private mapping would need CoW before sharing; ELF data segments stay private |
+| page fully covered by file data | a page straddling `filesz` has a zero-fill tail belonging to the *mapping*, so two mappers can legitimately disagree |
+| `inode != 0` | the path-only fallback has no stable identity to key on |
+
+### Invalidation is mandatory
+
+A stale shared page is a silent wrong-bytes bug, not a crash: `rustc` mmaps
+`.rlib`/`.rmeta` files that `cargo` rewrites, and ext2 reuses inode numbers.
+Every mutating VFS entry point calls `vfs::invalidate_file_pages`
+(`write_at`, `write_file`, `append_file`, `truncate`, `fallocate`, `remove_file`,
+`rename`). `remove_file` and `rename` resolve the inode **before** the mutation,
+since afterwards the path no longer names it.
+
+Kill switch: `config::SHARED_FILE_PAGES_ENABLED`. Observability: the `[FPCACHE]`
+line in the 30 s PSTATS block — `hits` counts private allocations + `read_at`
+sweeps avoided.
 
 ### Who actually runs the collector
 

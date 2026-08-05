@@ -834,6 +834,23 @@ fn maybe_print_sigsegv_syscall_diag(elr: u64, far: u64, frame: &UserTrapFrame) {
 /// Must be called AFTER ensure_user_page_mapped so the page table entry exists.
 /// Prevents EL1 data aborts when kernel code writes to user memory (signal frame
 /// delivery, futex wake writes, etc.) that hits a CoW-demoted RO page.
+/// Hand back the reference `file_page_cache::lookup_and_ref` just took when this
+/// address space is *already* an owner of that frame.
+///
+/// The cache takes one reference per fault, but an address space frees each
+/// distinct PA exactly once at teardown (`user_frames` counts VAs per PA, and the
+/// teardown loop deliberately frees once per PA). So the second VA in one process
+/// that maps an already-held shared page must not add a second reference, or the
+/// frame outlives the process. Releasing through `free_page` is safe here: the
+/// count cannot reach zero while this address space still maps the page.
+fn drop_surplus_shared_ref(as_owner: u32, pf: crate::pmm::PhysFrame) {
+    if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner)
+        && owner.address_space.tracks_user_frame(pf.addr)
+    {
+        crate::pmm::free_page(pf);
+    }
+}
+
 fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
     let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
     let ttbr0: u64;
@@ -3164,17 +3181,48 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         let region_end = region_start + region_size;
                         let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
 
-                        // Count how many pages actually need allocation (skip mapped)
+                        // Pass A — PLAN. Count pages that need a private frame, and
+                        // resolve the ones already available as shared read-only pages
+                        // (`file_page_cache`) up front so the pool below only covers
+                        // real misses. Doing this here rather than in the fill loop is
+                        // what keeps a fully-cached readahead batch from allocating —
+                        // and immediately freeing — 256 frames per fault.
+                        //
+                        // Each hit already holds a reference for this mapper; anything
+                        // that never gets installed is freed with the race-lost frames
+                        // below, which balances it.
+                        let mut shared: alloc::vec::Vec<(usize, crate::pmm::PhysFrame, bool)> =
+                            alloc::vec::Vec::new();
                         let mut needed = 0usize;
                         {
                             let mut va = page_va;
                             while va < ra_end {
                                 if !akuma_exec::mmu::is_current_user_page_mapped(va) {
-                                    needed += 1;
+                                    // Only whole pages fully covered by file data are
+                                    // shareable: a page straddling `filesz` has a
+                                    // zero-fill tail whose length belongs to the mapping,
+                                    // not the file, so two mappers can legitimately
+                                    // disagree about its contents.
+                                    let full = va >= segment_va
+                                        && va + 0x1000 <= segment_va + filesz;
+                                    let hit = if full && crate::file_page_cache::is_shareable_mapping(map_flags) {
+                                        let file_off = file_offset + (va - segment_va);
+                                        crate::file_page_cache::lookup_and_ref(inode, file_off, is_exec)
+                                    } else {
+                                        None
+                                    };
+                                    match hit {
+                                        Some((pf, needs_ic)) => {
+                                            drop_surplus_shared_ref(as_owner, pf);
+                                            shared.push((va, pf, needs_ic));
+                                        }
+                                        None => needed += 1,
+                                    }
                                 }
                                 va += 0x1000;
                             }
                         }
+                        let mut sh_idx = 0usize;
 
                         // Clamp the readahead batch so file-backed demand paging never
                         // drains the PMM below USER_PAGE_RESERVE — the same floor the
@@ -3231,6 +3279,32 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                 cur_va += 0x1000;
                                 continue;
                             }
+                            // Shared hit resolved in Pass A: already filled by whoever
+                            // faulted it first, so there is nothing to read and no frame
+                            // to consume. `shared` is built in ascending VA order by the
+                            // same walk this loop performs, so an index pointer is enough.
+                            if sh_idx < shared.len() && shared[sh_idx].0 == cur_va {
+                                let (_, pf, needs_ic) = shared[sh_idx];
+                                sh_idx += 1;
+                                if needs_ic {
+                                    // Cached from a plain RO mapper that never ran `ic
+                                    // ivau`; this mapper wants to execute it, so pay the
+                                    // maintenance once and record it for the next mapper.
+                                    let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
+                                    for off in (0..0x1000_usize).step_by(64) {
+                                        unsafe { core::arch::asm!("dc cvau, {}", in(reg) kva + off); }
+                                    }
+                                    unsafe { core::arch::asm!("dsb ish"); }
+                                    for off in (0..0x1000_usize).step_by(64) {
+                                        unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
+                                    }
+                                    let file_off = file_offset + (cur_va - segment_va);
+                                    crate::file_page_cache::mark_icache_clean(inode, file_off, pf);
+                                }
+                                filled.push((cur_va, pf));
+                                cur_va += 0x1000;
+                                continue;
+                            }
                             if pool_idx >= frame_pool.len() {
                                 break;
                             }
@@ -3270,6 +3344,16 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                     // alias of the same frame is equivalent and always mapped.
                                     unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
                                 }
+                            }
+                            // Publish for every other mapper of this file page. Must come
+                            // after the fill and the I-cache maintenance above: a peer core
+                            // can map this frame the instant it lands in the table.
+                            if cur_va >= segment_va
+                                && cur_va + 0x1000 <= segment_va + filesz
+                                && crate::file_page_cache::is_shareable_mapping(map_flags)
+                            {
+                                let file_off = file_offset + (cur_va - segment_va);
+                                crate::file_page_cache::insert(inode, file_off, pf, is_exec);
                             }
                             filled.push((cur_va, pf));
                             cur_va += 0x1000;
@@ -3707,16 +3791,38 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
 
                         // Count needed pages then batch-allocate (single PMM lock).
+                        // Shared read-only file pages are resolved here too, for the same
+                        // reason as the data-abort arm: an already-cached batch must not
+                        // allocate a pool it will immediately free. Executable text is the
+                        // *main* beneficiary — this is the path four concurrent `rustc`s
+                        // take through the same `librustc_driver.so`.
+                        let mut shared: alloc::vec::Vec<(usize, crate::pmm::PhysFrame, bool)> =
+                            alloc::vec::Vec::new();
                         let mut needed = 0usize;
                         {
                             let mut va = page_va;
                             while va < ra_end {
                                 if !akuma_exec::mmu::is_current_user_page_mapped(va) {
-                                    needed += 1;
+                                    let full = va >= segment_va
+                                        && va + 0x1000 <= segment_va + filesz;
+                                    let hit = if full && crate::file_page_cache::is_shareable_mapping(map_flags) {
+                                        let file_off = file_offset + (va - segment_va);
+                                        crate::file_page_cache::lookup_and_ref(inode, file_off, true)
+                                    } else {
+                                        None
+                                    };
+                                    match hit {
+                                        Some((pf, needs_ic)) => {
+                                            drop_surplus_shared_ref(as_owner, pf);
+                                            shared.push((va, pf, needs_ic));
+                                        }
+                                        None => needed += 1,
+                                    }
                                 }
                                 va += 0x1000;
                             }
                         }
+                        let mut sh_idx = 0usize;
                         // Clamp the readahead batch to the kernel reserve — see the
                         // matching comment in the data-abort path. A file-backed exec
                         // mapping larger than RAM must SIGSEGV the process, not drain
@@ -3754,6 +3860,28 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                 cur_va += 0x1000;
                                 continue;
                             }
+                            // Shared hit resolved above: already filled and (because every
+                            // page reaching this arm is executable) already I-cache clean
+                            // unless it was first cached by a plain RO mapper.
+                            if sh_idx < shared.len() && shared[sh_idx].0 == cur_va {
+                                let (_, pf, needs_ic) = shared[sh_idx];
+                                sh_idx += 1;
+                                if needs_ic {
+                                    let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
+                                    for off in (0..0x1000_usize).step_by(64) {
+                                        unsafe { core::arch::asm!("dc cvau, {}", in(reg) kva + off); }
+                                    }
+                                    unsafe { core::arch::asm!("dsb ish"); }
+                                    for off in (0..0x1000_usize).step_by(64) {
+                                        unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
+                                    }
+                                    let file_off = file_offset + (cur_va - segment_va);
+                                    crate::file_page_cache::mark_icache_clean(inode, file_off, pf);
+                                }
+                                filled.push((cur_va, pf));
+                                cur_va += 0x1000;
+                                continue;
+                            }
                             if ia_pool_idx >= ia_frame_pool.len() {
                                 break;
                             }
@@ -3786,6 +3914,15 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                     // IC IVAU by kva, not the user VA — the page isn't mapped yet.
                                     unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
                                 }
+                            }
+                            // Publish after fill + I-cache maintenance (see the data-abort
+                            // arm). `icache_done: true` — this arm always maintains.
+                            if cur_va >= segment_va
+                                && cur_va + 0x1000 <= segment_va + filesz
+                                && crate::file_page_cache::is_shareable_mapping(map_flags)
+                            {
+                                let file_off = file_offset + (cur_va - segment_va);
+                                crate::file_page_cache::insert(inode, file_off, pf, true);
                             }
                             filled.push((cur_va, pf));
                             cur_va += 0x1000;

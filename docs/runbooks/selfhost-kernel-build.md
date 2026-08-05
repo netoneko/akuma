@@ -139,6 +139,38 @@ Use `-j4` for the dependency phase anyway: throughput wins there even though a
 SIGSEGV'd rustc costs a whole crate compile, because a retry resumes — crates
 that compiled stay compiled.
 
+### 5.1a Why `-j4` was also *slow*, separately from the deadlock (fixed 2026-08-05)
+
+The deadlock above is one problem. `-j4` also scaled badly, and that had a
+distinct, purely mechanical cause: **file-backed mmap used to give every process
+a private copy of every page it touched.**
+
+A demand fault on a `LazySource::File` region allocated a fresh PMM frame and
+`read_at`-ed the file bytes into it, per process. Four concurrent `rustc`s
+mapping the same toolchain — `librustc_driver.so` is 295 MB, `rust-lld` 154 MB —
+therefore held *four* physical copies of the same read-only text, filled by four
+separate ext2 read sweeps. Physical memory then ran short, `reclaim_clean_file_pages`
+evicted clean RO file pages, and each eviction bought a fresh disk read on the
+next touch. More jobs → more copies → more pressure → more eviction → more I/O.
+`-j1` never enters that loop because one copy of the working set fits.
+
+`src/file_page_cache.rs` now deduplicates those pages on `(inode, file_offset)`,
+so all mappers share one frame, one fill, and one I-cache maintenance pass.
+Measured on a 1 GB single-core boot, three concurrent `mmap_file` processes over
+the same 8.4 MB file:
+
+| | frames allocated | ext2 page reads |
+| --- | --- | --- |
+| before (per-process copies) | 3 × 2065 | 3 × 2065 |
+| after (`[FPCACHE]` 2065 misses / 4130 hits) | 2065 | 2065 |
+
+Kill switch: `config::SHARED_FILE_PAGES_ENABLED = false` restores private copies
+for a clean A/B. Watch the `[FPCACHE]` line in the 30 s PSTATS block — `hits` is
+exactly the number of private allocations + `read_at` sweeps avoided.
+
+This does **not** fix the `__thread_list_lock` deadlock; `-j1` is still required
+for the final crate.
+
 ### 5.2 Run the build detached, or ssh will throw the work away
 
 ssh into the guest drops roughly every 5 minutes under build load, which kills

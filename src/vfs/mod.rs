@@ -243,12 +243,38 @@ pub fn read_to_string(path: &str) -> Result<String, FsError> {
 
 /// Write data to a file (creates or truncates)
 pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
-    with_fs(path, |fs, rel| fs.write_file(rel, data))
+    let r = with_fs(path, |fs, rel| fs.write_file(rel, data));
+    invalidate_file_pages(path);
+    r
 }
 
 /// Append data to a file
 pub fn append_file(path: &str, data: &[u8]) -> Result<(), FsError> {
-    with_fs(path, |fs, rel| fs.append_file(rel, data))
+    let r = with_fs(path, |fs, rel| fs.append_file(rel, data));
+    invalidate_file_pages(path);
+    r
+}
+
+/// Drop any shared read-only file pages cached for `path`.
+///
+/// Every mutating entry point below calls this, because a stale shared page is a
+/// silent wrong-bytes bug rather than a crash: `rustc` mmaps `.rlib`/`.rmeta`
+/// files that `cargo` later rewrites, and ext2 reuses inode numbers.
+///
+/// Invalidation happens *after* the mutation so the window a concurrent fault
+/// could re-cache into is the write itself (already an application-level race),
+/// not the interval between invalidation and the new bytes landing.
+///
+/// The `len() == 0` guard keeps the extra path walk off the write path entirely
+/// on kernels where nothing has been mmap'd yet; once populated, `resolve_inode`
+/// costs one walk, against a write that already does its own.
+fn invalidate_file_pages(path: &str) {
+    if !crate::config::SHARED_FILE_PAGES_ENABLED || crate::file_page_cache::len() == 0 {
+        return;
+    }
+    if let Ok(inode) = resolve_inode(path) {
+        crate::file_page_cache::invalidate_inode(inode);
+    }
 }
 
 /// Read data from a specific offset within a file
@@ -268,7 +294,9 @@ pub fn read_at_by_inode(path: &str, inode: u32, offset: usize, buf: &mut [u8]) -
 
 /// Write data at a specific offset within a file
 pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
-    with_fs(path, |fs, rel| fs.write_at(rel, offset, data))
+    let r = with_fs(path, |fs, rel| fs.write_at(rel, offset, data));
+    invalidate_file_pages(path);
+    r
 }
 
 /// Create a directory
@@ -278,6 +306,9 @@ pub fn create_dir(path: &str) -> Result<(), FsError> {
 
 /// Remove a file
 pub fn remove_file(path: &str) -> Result<(), FsError> {
+    // Resolve BEFORE the unlink — afterwards the path no longer names the inode,
+    // and ext2 is free to hand that number to the next file created.
+    invalidate_file_pages(path);
     with_fs(path, |fs, rel| fs.remove_file(rel))
 }
 
@@ -308,12 +339,16 @@ pub fn chmod(path: &str, mode: u32) -> Result<(), FsError> {
 
 /// Truncate a file to a specified length
 pub fn truncate(path: &str, length: u64) -> Result<(), FsError> {
-    with_fs(path, |fs, rel| fs.truncate(rel, length))
+    let r = with_fs(path, |fs, rel| fs.truncate(rel, length));
+    invalidate_file_pages(path);
+    r
 }
 
 /// Preallocate disk space for a file
 pub fn fallocate(path: &str, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
-    with_fs(path, |fs, rel| fs.fallocate(rel, mode, offset, len))
+    let r = with_fs(path, |fs, rel| fs.fallocate(rel, mode, offset, len));
+    invalidate_file_pages(path);
+    r
 }
 
 /// Resolve a path to its absolute form through the process's CWD.
@@ -329,6 +364,12 @@ fn resolve_absolute(path: &str) -> String {
 pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
     let old_abs = resolve_absolute(old_path);
     let new_abs = resolve_absolute(new_path);
+
+    // Both sides, before the rename: `new_path` may be an existing file this call
+    // is about to replace (the build-tool "write temp, rename over" idiom), which
+    // unlinks its inode; `old_path` stops naming its inode once the rename lands.
+    invalidate_file_pages(&old_abs);
+    invalidate_file_pages(&new_abs);
 
     // Try process namespace first (lock released before I/O).
     if let Some(proc) = akuma_exec::process::current_process_shared() {

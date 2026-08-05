@@ -731,6 +731,18 @@ impl UserAddressSpace {
         let _irq = IrqGuard::new();
         *self.user_frames.lock().entry(frame.addr).or_insert(0) += 1;
     }
+
+    /// Does this address space already hold `pa` as a user frame?
+    ///
+    /// Teardown frees each distinct PA **exactly once** regardless of how many VAs
+    /// map it, so an address space contributes exactly one reference per frame.
+    /// Callers that take a reference per *fault* (the shared file-page cache) use
+    /// this to detect the second VA mapping an already-held frame and hand the
+    /// surplus reference back, instead of leaking it until reboot.
+    pub fn tracks_user_frame(&self, pa: usize) -> bool {
+        let _irq = IrqGuard::new();
+        self.user_frames.lock().contains_key(&pa)
+    }
     pub fn track_page_table_frame(&self, frame: PhysFrame) {
         let _irq = IrqGuard::new();
         self.page_table_frames.lock().push(frame);

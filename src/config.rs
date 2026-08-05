@@ -363,6 +363,20 @@ pub const COW_FORK_ENABLED: bool = true;
 /// Set to false to fall back to copy-fork for vfork (clean kill switch).
 pub const VFORK_FASTPATH_ENABLED: bool = true;
 
+/// Share one physical frame between every read-only mapper of the same file page,
+/// keyed on `(inode, file_offset)`, instead of giving each process a private copy.
+///
+/// This is the fix for "`-j4` is slower than `-j1`" on the self-host build: four
+/// concurrent `rustc`s mapping the same 295 MB `librustc_driver.so` used to hold
+/// four physical copies filled by four separate `read_at` sweeps, which pushed the
+/// PMM into `reclaim_clean_file_pages` and turned every eviction into a re-read.
+///
+/// Only mappings that give EL0 no write access are shared, so writable data
+/// segments keep their private-copy semantics untouched. Set to false to restore
+/// per-process private file pages (clean kill switch — use it to A/B).
+/// See `crate::file_page_cache`.
+pub const SHARED_FILE_PAGES_ENABLED: bool = true;
+
 /// Let a `pthread_kill` (`tkill`/`tgkill`) signal interrupt a blocking syscall
 /// with `EINTR`, per Linux semantics.
 ///
