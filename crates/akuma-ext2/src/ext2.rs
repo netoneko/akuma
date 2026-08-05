@@ -144,11 +144,20 @@ static CACHE_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 #[cfg(any(ext2_fs_cache, test))]
 static CACHE_MISSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Slots currently allocated / total slots the cap allows. Occupancy is what
+/// distinguishes "the cache is too small and thrashing" from "the working set
+/// fits and misses are just cold-start": a cache that never fills cannot be
+/// improved by raising the cap, whatever the miss count says.
+#[cfg(any(ext2_fs_cache, test))]
+static CACHE_SLOTS_USED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(ext2_fs_cache, test))]
+static CACHE_SLOTS_CAP: AtomicUsize = AtomicUsize::new(0);
+
 /// Set the upper bound (bytes) on the ext2 block cache backing store.
 ///
-/// The kernel derives this from detected RAM (e.g. `min(25% RAM, 512 MB)`) and
-/// calls it once before mounting the filesystem. No-op unless built with the
-/// `fs-cache` feature.
+/// The kernel derives this from detected RAM — `min(RAM/8, 128 MB)` as of
+/// `src/fs.rs` — and calls it once before mounting the filesystem. No-op unless
+/// built with the `fs-cache` feature (which is in the kernel's `default` set).
 #[allow(unused_variables)]
 pub fn set_cache_cap_bytes(bytes: usize) {
     #[cfg(any(ext2_fs_cache, test))]
@@ -162,6 +171,24 @@ pub fn cache_stats() -> (u64, u64) {
     #[cfg(any(ext2_fs_cache, test))]
     {
         (CACHE_HITS.load(Ordering::Relaxed), CACHE_MISSES.load(Ordering::Relaxed))
+    }
+    #[cfg(not(any(ext2_fs_cache, test)))]
+    {
+        (0, 0)
+    }
+}
+
+/// `(slots_in_use, slot_capacity)` for the large block cache.
+///
+/// Equal values mean the cache is full and the clock is evicting;
+/// `slots_in_use` well under capacity means the whole touched working set is
+/// resident and a larger cap would buy nothing. `(0, 0)` unless built with
+/// `fs-cache`.
+#[must_use]
+pub fn cache_occupancy() -> (usize, usize) {
+    #[cfg(any(ext2_fs_cache, test))]
+    {
+        (CACHE_SLOTS_USED.load(Ordering::Relaxed), CACHE_SLOTS_CAP.load(Ordering::Relaxed))
     }
     #[cfg(not(any(ext2_fs_cache, test)))]
     {
@@ -219,6 +246,7 @@ impl ClockBlockCache {
     /// Construct with an explicit slot capacity (tests use this to avoid racing
     /// on the global `CACHE_CAP_BYTES` when run in parallel).
     pub(crate) fn with_capacity_blocks(block_size: usize, capacity_blocks: usize) -> Self {
+        CACHE_SLOTS_CAP.store(capacity_blocks, Ordering::Relaxed);
         Self {
             chunks: Vec::new(),
             chunk_blocks: core::cmp::max(1, CACHE_CHUNK_BYTES / block_size.max(1)),
@@ -259,6 +287,7 @@ impl ClockBlockCache {
             }
             self.tags.push(u32::MAX);
             self.ref_bits.push(Cell::new(false));
+            CACHE_SLOTS_USED.store(self.tags.len(), Ordering::Relaxed);
             return slots;
         }
         loop {

@@ -82,21 +82,44 @@ pub fn init() -> Result<(), FsError> {
     }
     
     // Size the ext2 block cache from detected RAM before mounting (the cache is
-    // allocated in Ext2Filesystem::new). Cap at min(12.5% RAM, 128 MB): enough to
+    // allocated in Ext2Filesystem::new). Cap at min(12.5% RAM, 384 MB): enough to
     // keep the read-only toolchain's hot pages resident across the many
     // rustc/cc/ld spawns, bounded so it can't starve user pages.
     // No-op unless the kernel is built with the `fs-cache` feature.
     //
-    // The ceiling was 512 MB / 25% until 2026-08-02. That was too aggressive: on
-    // the rustc benchmark the cache filled to the cap and the kernel heap grew to
-    // 1152 MB (`[HEAP-GROW] ... claimed=131074 pages`), taking PMM from 908 518 to
-    // 678 073 free pages (~900 MB, never returned) and leaving sshd accepting
-    // connections but resetting at key exchange. 128 MB comfortably covers the
-    // measured working set: `rustc --version` touches ~71 distinct 1 MB windows of
-    // librustc_driver + libLLVM. See docs/archive/BKL_RUSTC_SCALING_BASELINE.md.
+    // The ceiling was 128 MB from 2026-08-02 to 2026-08-05. That was too small:
+    // it was sized against `rustc --version` (~71 distinct 1 MB windows), which
+    // is not the workload. A *real* rustc compile touches far more —
+    // librustc_driver.so alone is 295 MB and rust-lld is 154 MB — so at 128 MB
+    // the cache sat pegged full and evicted blocks before they were reused.
+    // Measured 2026-08-05, 8 sequential in-VM `rustc -O` compiles at
+    // MEMORY=4096, one disk-image clone per arm, `[FSCACHE]` from PSTATS:
+    //
+    //   cap     s/compile (warm)   misses    slots        heap    HEAP-GROW
+    //   128 MB      10.72            701 822  32 768 full  256 MB  none
+    //   256 MB      10.79            155 416  65 536 full  267 MB  none
+    //   384 MB       9.03            226 605  98 304 full  398 MB  none
+    //   512 MB       8.91            206 961 131 072 full  528 MB  total=512MB
+    //
+    // The response is a step, not a slope: 256 MB buys nothing measurable, 384 MB
+    // buys 15.8%, and the extra 128 MB on top of that buys only 1.1 point more
+    // while pushing the heap over the 512 MB boundary. 384 MB is that knee.
+    //
+    // Why this does not re-run the 2026-08-02 regression (heap 1152 MB,
+    // `claimed=131074 pages`, PMM 908 518 -> 678 073 never returned, sshd
+    // resetting at key exchange): that blowup was the contiguous `Vec` doubling a
+    // 256 MB buffer to 512 MB with both live, and it was fixed by chunking the
+    // backing store (CACHE_CHUNK_BYTES, akuma-ext2). The largest claim observed
+    // at 512 MB here is `claimed=258 pages`, and sshd completed key exchange
+    // after every arm. Still, the cache never shrinks — whatever it fills is
+    // committed for the boot's lifetime, which is why the ceiling stays well
+    // under the RAM/8 term rather than chasing the working set (>512 MB: even
+    // the 512 MB arm ran full).
+    //
+    // See docs/archive/BKL_RUSTC_SCALING_BASELINE.md.
     {
         const PAGE: usize = 4096;
-        const CACHE_CEILING: usize = 128 * 1024 * 1024;
+        const CACHE_CEILING: usize = 384 * 1024 * 1024;
         let ram_bytes = crate::pmm::total_count().saturating_mul(PAGE);
         let cap = core::cmp::min(ram_bytes / 8, CACHE_CEILING);
         akuma_ext2::set_cache_cap_bytes(cap);

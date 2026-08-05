@@ -1500,6 +1500,22 @@ fn run_async_main() -> ! {
         if now_us.saturating_sub(last_ps) >= PSTATS_INTERVAL_US {
             LAST_PSTATS_US.store(now_us, Ordering::Relaxed);
             akuma_exec::process::dump_running_process_stats();
+            // ext2 block-cache instrumentation, on the same 30s cadence. The
+            // cache cap (src/fs.rs) can only be sized against a measured hit
+            // rate for the real workload, and `cache_stats()` had no in-kernel
+            // reader. PMM free + heap total ride along because raising the cap
+            // is exactly the change that regressed both (see src/fs.rs).
+            {
+                let (hits, misses) = akuma_ext2::cache_stats();
+                let (used, cap) = akuma_ext2::cache_occupancy();
+                let total = hits + misses;
+                let pct = if total == 0 { 0 } else { hits * 100 / total };
+                crate::safe_print!(192,
+                    "[FSCACHE] hits={} misses={} hit_pct={} slots={}/{} pmm_free={} pmm_total={} heap_mb={}\n",
+                    hits, misses, pct, used, cap,
+                    crate::pmm::free_count(), crate::pmm::total_count(),
+                    crate::allocator::stats().heap_size / 1024 / 1024);
+            }
             // Deadlock-hunt aid: the Thread-0 heartbeat's dump trigger fires
             // every 50M idle loops (~never with idle_halt); piggyback on the
             // 30s PSTATS cadence instead so a wedged thread's parked resume

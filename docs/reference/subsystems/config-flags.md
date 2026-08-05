@@ -84,7 +84,7 @@ re-add what they need. `Cargo.toml:208-216`.
 | `sound` | virtio-sound output (`/dev/dsp`). | `Cargo.toml:180` |
 | `gic-v2` | Legacy GICv2 MMIO driver instead of default GICv3. HVF needs GICv3. | `Cargo.toml:188` |
 | `extreme` | Profile discriminator for build.rs (tighter IMAGE_SIZE/stack). | `Cargo.toml:196` |
-| `fs-cache` | Large ext2 block cache (clock eviction) — keeps toolchain resident across spawns. Opt-in. Not combinable with `extreme`. | `Cargo.toml:203` |
+| `fs-cache` | Large ext2 block cache (clock eviction) — keeps toolchain resident across spawns. **In `default`**, so any build that doesn't pass `--no-default-features` has it. Cap set at mount by `src/fs.rs` as `min(RAM/8, 384 MB)` (ceiling raised from 128 MB 2026-08-05; see the sizing table there). Observe it via the `[FSCACHE]` PSTATS line. Not combinable with `extreme`. | `Cargo.toml:133` |
 | `smp` | Multikernel / one-kernel-per-core. Emits `cfg(kernel_smp)` via build.rs. Paired with `release-smp`. | `Cargo.toml:138` |
 | `no-tests` | Drops boot self-test suites; sets `akuma-net/small-sockets`. | `Cargo.toml:128` |
 

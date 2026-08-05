@@ -240,8 +240,15 @@ same tree.
 - **Nightly is mandatory** (panic-immediate-abort cargo-feature). Host must be
   `aarch64-unknown-linux-musl`.
 - **`cargo build --release`** is the realistic target — no `build-std` needed.
-- **`fs-cache` feature** is the key perf lever: metadata ~19× faster. Consider
-  adding it (opt-in, not in the devbox set). See
+- **`fs-cache` feature** is already **on** — it is in `default`, so
+  `--features devbox-smoltcp,no-tests` includes it. Nothing to add. The lever is
+  its *size*: `src/fs.rs` caps it at `min(RAM/8, 384 MB)` at mount. The ceiling
+  was 128 MB until 2026-08-05, which was sized against `rustc --version` rather
+  than a real compile and left the cache pegged full and evicting; 384 MB cut
+  in-VM `rustc -O` wall time 15.8% (10.72 s → 9.03 s per compile). 256 MB buys
+  nothing and 512 MB buys only 1.1 point more while pushing the heap past
+  512 MB — the response is a step, not a slope. Measure with the `[FSCACHE]`
+  PSTATS line (`hits/misses/slots`); `slots=N/N` means it is evicting. See
   [`../reference/subsystems/config-flags.md`](../reference/subsystems/config-flags.md).
 - **`MAX_ARG_STRLEN`** 128 KB (release) — the Go forktest fix is a regression
   guard.
