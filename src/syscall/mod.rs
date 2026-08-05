@@ -966,14 +966,32 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SCHED_GETAFFINITY => {
             let mask_ptr = args[2] as usize;
             let cpusetsize = args[1] as usize;
+            let mut ret: u64 = 0;
             if cpusetsize >= 8 && validate_user_ptr(mask_ptr as u64, cpusetsize) {
                 let mut kernel_mask = alloc::vec![0u8; cpusetsize];
-                if cpusetsize >= 8 {
-                    unsafe { core::ptr::write(kernel_mask.as_mut_ptr().cast::<u64>(), 1); }
-                }
+                // CPUs the process may run on. On the real shared-kernel SMP
+                // build that is the DTB-reported core count (BSP + secondaries,
+                // all online after `bringup_secondaries`); single-core and
+                // multikernel builds report 1, since a multikernel core runs
+                // only its own kernel. The old code hardcoded `1`, so
+                // `busybox nproc` and cargo's `num_cpus` always saw one CPU and
+                // `cargo build` defaulted to `-j1` even on an SMP=2+ kernel.
+                #[cfg(kernel_smp_shared)]
+                let nr_cpus: usize = crate::smp_shared::probed_core_count();
+                #[cfg(not(kernel_smp_shared))]
+                let nr_cpus: usize = 1;
+                let mask: u64 = if nr_cpus >= 64 { u64::MAX } else { (1u64 << nr_cpus).wrapping_sub(1) };
+                unsafe { core::ptr::write(kernel_mask.as_mut_ptr().cast::<u64>(), mask); }
                 let _ = unsafe { copy_to_user_safe(mask_ptr as *mut u8, kernel_mask.as_ptr(), cpusetsize) };
+                // Linux returns the number of bytes placed in the mask, and
+                // musl's `sched_getaffinity` wrapper zeroes the remainder based
+                // on this count (`if (r < size) memset(mask+r, 0, size-r)`).
+                // Returning 0 made musl wipe the whole buffer, so `busybox
+                // nproc`/cargo saw 0 CPUs and fell back to 1. The mask fits in
+                // one u64 (≤64 CPUs; Akuma's SMP scope), so we wrote 8 bytes.
+                ret = cpusetsize.min(8) as u64;
             }
-            0
+            ret
         }
         nr::TKILL => signal::sys_tkill(args[0] as u32, args[1] as u32),
         nr::TGKILL => signal::sys_tgkill(args[0] as u32, args[1] as u32, args[2] as u32),

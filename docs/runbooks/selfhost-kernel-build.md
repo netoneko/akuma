@@ -325,6 +325,30 @@ The disk itself stays clean through all of this — `e2fsck` reported no errors
 after a run that ended with QEMU aborting — so the corruption is purely
 in-memory. Do not go looking for filesystem damage.
 
+### 5.6 `busybox nproc` reports the real CPU count (was: always 1)
+
+On the `devbox-smoltcp` kernel (real shared-kernel SMP), `busybox nproc` used to
+report **1** even at `SMP=2`/`SMP=4`. cargo's `num_cpus` reads
+`sched_getaffinity`, so `cargo build` with no `-j` silently defaulted to
+**`-j1`** — which (a) serializes the dependency phase, and (b) entirely masks
+the §5.1 `-j4` path: you can neither reproduce the `-j4` final-crate deadlock
+nor benefit from the multikernel parallelism unless you pass `-jN` explicitly.
+(This is why the §6 verification build ran at `-j1` despite `SMP=2`.)
+
+**Cause:** the `SCHED_GETAFFINITY` handler in `src/syscall/mod.rs` had two bugs.
+(1) It wrote a fixed mask of `1` (CPU 0 only), ignoring the online CPU count.
+(2) It returned `0`; musl's `sched_getaffinity` libc wrapper treats the return
+value as the number of bytes written and zeroes the remainder
+(`if (r < size) memset(mask+r, 0, size-r)`), so returning 0 made it wipe the
+whole buffer — `busybox nproc`/cargo then saw 0 CPUs and fell back to 1. (Linux
+returns the byte count placed in the mask.) **FIXED (2026-08-06):** the handler
+now returns `(1 << nr_cpus) - 1` in the mask and the byte count written as the
+return value, where `nr_cpus` is `smp_shared::probed_core_count()` under
+`kernel_smp_shared` (BSP + secondaries, all online after
+`bringup_secondaries`) and `1` on single-core and multikernel builds (a
+multikernel core runs only its own kernel). `busybox nproc` and cargo's `-j`
+default now reflect the actual SMP count.
+
 ## 6. FIXED: nightly `cargo` under HVF — undefined instruction delivered as SIGILL (2026-08-06)
 
 **Root cause + fix:** `EC=0x0` at the constant `ELR=0x112ac280` was
