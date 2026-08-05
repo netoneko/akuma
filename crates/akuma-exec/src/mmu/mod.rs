@@ -1257,8 +1257,14 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> (Vec<P
     let cas_result = pte_atomic.compare_exchange(existing, entry,
         core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire);
     if cas_result.is_ok() {
+        // All-ASID (`vaae1is`), for the reason spelled out on `flush_tlb_range`:
+        // `vale1is` takes its ASID from operand bits [63:48], which `va >> 12`
+        // leaves zero, so it never matched the non-zero ASID a user process
+        // actually runs under. Benign here (this arm only runs when the PTE was
+        // *invalid*, and a faulting translation may not be cached), but it must
+        // not look like it targets an ASID it cannot reach.
         #[cfg(target_os = "none")]
-        { core::arch::asm!("dsb ishst", "tlbi vale1is, {va}", "dsb ish", "isb", va = in(reg) va >> 12); }
+        { core::arch::asm!("dsb ishst", "tlbi vaae1is, {va}", "dsb ish", "isb", va = in(reg) va >> 12); }
         (allocated_tables, true)
     } else {
         // CAS failed: another path installed a page between our check and CAS.
@@ -1393,26 +1399,30 @@ pub unsafe fn map_user_page_no_flush(va: usize, pa: usize, user_flags_val: u64) 
 
 /// Flush TLB entries for a contiguous range of virtual addresses.
 ///
-/// Issues `tlbi vale1is` for each page in [start_va, start_va + pages*4096),
-/// then a single `dsb ish` + `isb` barrier pair.  Use after a batch of
-/// `map_user_page_no_flush` calls to avoid N×(dsb+isb) overhead.
+/// Use after a batch of `map_user_page_no_flush` / `update_page_flags_no_flush`
+/// calls to avoid N×(dsb+isb) overhead.
+///
+/// **All-ASID, and that is required, not conservative.** This used to issue
+/// `tlbi vale1is, va>>12`, which encodes the target ASID in bits [63:48] of the
+/// operand — and `va >> 12` of any user VA leaves those bits **zero**. Every
+/// user process runs under a non-zero ASID (`UserAddressSpace::new` allocates
+/// one), so the invalidation matched nothing and the whole call was a barrier
+/// pair with no effect. `sys_mprotect` publishes its permission edits through
+/// exactly this function (`syscall/mem.rs`), so a downgrade — musl's
+/// `mprotect(guard_page, PROT_NONE)` after a thread-stack `mmap`, or a dynamic
+/// loader's RELRO `mprotect(PROT_READ)` — left the old writable translation
+/// live in the TLB.
+///
+/// Widening to all-ASID rather than "pass the right ASID" is deliberate: a
+/// single L0 table can be live under **several** ASIDs at once, because
+/// `UserAddressSpace::new_shared` allocates a fresh ASID while reusing the
+/// parent's `l0_frame` (CLONE_VM threads and vfork-fastpath children), and
+/// `activate()` installs that view's own ASID. One PTE edit therefore has to
+/// invalidate every ASID aliasing those tables, which is what `vaae1is`
+/// ("VA, All-ASID, EL1") does. Same instruction as `flush_tlb_page`.
 #[inline]
 pub fn flush_tlb_range(start_va: usize, pages: usize) {
-    #[cfg(target_os = "none")]
-    unsafe {
-        // Store-barrier before invalidations so PTEs are visible to other CPUs.
-        core::arch::asm!("dsb ishst");
-        let mut va = start_va;
-        for _ in 0..pages {
-            core::arch::asm!("tlbi vale1is, {}", in(reg) va >> 12);
-            va += 0x1000;
-        }
-        // Completion barrier: wait for all invalidations, then pipeline sync.
-        core::arch::asm!("dsb ish");
-        core::arch::asm!("isb");
-    }
-    #[cfg(not(target_os = "none"))]
-    let _ = (start_va, pages);
+    flush_tlb_range_all_asid(start_va, pages);
 }
 
 /// Flush TLB entries for a contiguous VA range across **all** ASIDs, with a

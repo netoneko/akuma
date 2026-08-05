@@ -19,6 +19,7 @@ Start from the symptom or task on the left.
 | Debugging a boot hang | [`debug-boot-hang.md`](debug-boot-hang.md) |
 | Debugging shared-kernel SMP (BKL deadlock/contention, profiler) | [`debug-smp.md`](debug-smp.md) |
 | Debugging a thread parked forever in `futex` (lost wakeup) | [`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) |
+| Debugging a brand-new `pthread_create`d thread that SIGSEGVs at birth | [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) |
 | Working on BKL Phase 7 (removal) or the rustc scaling baseline | [`bkl-phase7-workplan.md`](bkl-phase7-workplan.md) |
 | Debugging SSH latency / echo / terminal sizing | [`debug-ssh-latency.md`](debug-ssh-latency.md) |
 | Self-hosting (compiling the kernel inside Akuma) | [`selfhost-kernel-build.md`](selfhost-kernel-build.md) |

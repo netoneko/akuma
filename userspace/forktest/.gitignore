@@ -1,6 +1,8 @@
 forktest_child
 forktest_parent
 pattern2_minimal.bin
+c_stress/mprotectlb
+c_stress/clonearg
 c_stress/mmap_stress
 c_stress/pattern2_parent
 c_stress/mmap_file

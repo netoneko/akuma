@@ -281,6 +281,52 @@ lock. Mitigations under discussion: check the fixup handler before the lazy
 resolver enters the pressure ladder, or force `alloc_page_zeroed` (no-drain)
 when a `copy_*_safe` window is open.
 
+### 5.3b The child of `clone_thread` can read stale memory on its first instruction (OPEN, 2026-08-05)
+
+The `-j4` self-host blocker, and the sharpest statement of it available. A
+CLONE_VM child's first EL0 instruction is `ldr x20, [x0]` — loading the pointer
+out of the clone argument its parent wrote milliseconds earlier (Rust's
+`thread_start`: the argument's first word is the `Arc<thread::Inner>` whose
+refcount it then `ldadd`s). It reads `0x0` / `0x7fff0` instead, and dies:
+
+```
+[Fault] Data abort from EL0 at FAR=0x0, ELR=0x3801c58c, ISS=0x7
+[Fault] SIGSEGV in clone_thread, calling exit_group
+```
+
+`[x0]` itself is readable — the *contents* are wrong.
+
+Ruled out by measurement (`userspace/forktest/c_stress/clonearg.c`, 144,260
+children, 0 divergences, calibrated at 0 on Linux): **the clone memory handoff
+itself.** The child's stack, its argument block, and a page the parent mmap'd
+microseconds earlier all arrive intact, including under musl's
+`PROT_NONE`-then-`mprotect` stack shape. `mark_thread_ready` ordering is not a
+candidate either — `THREAD_STATES` uses `SeqCst`. What remains: the argument is
+delivered correctly but has already been *freed* (a small integer where a
+pointer belongs is what a reused heap slot looks like), or the thread is started
+twice.
+
+One real defect *was* found in the same subsystem while measuring this, and is
+**FIXED** (2026-08-05): `flush_tlb_range` invalidated with `tlbi vale1is`, whose
+ASID comes from operand bits [63:48] — zero for every user VA, while user
+processes run under non-zero ASIDs — so `sys_mprotect`'s permission downgrades
+never reached the TLB. It is now `vaae1is` (all-ASID), which is *required*, not
+conservative: `new_shared` allocates a fresh ASID while reusing the parent's
+`l0_frame`, so one L0 table is live under several ASIDs at once and one PTE edit
+must invalidate all of them. Regress with
+`userspace/forktest/c_stress/mprotectlb.c` (3 FAIL before, 3 PASS after, 3 PASS
+on Linux). Not yet shown to be the cause of the crash above.
+
+Also ruled out by measurement, not assumption: TLS/`TPIDR_EL0` (sane, and first
+touched *after* the faulting instruction), pointer corruption (the observed
+values are small integers, not garbage addresses), and the `sigaltstack`
+re-pend that precedes it in the log (a consequence — `SA_ONSTACK` with no
+altstack on a newborn thread — not the cause).
+
+Procedure, including how to symbolize the guest PC against
+`librustc_driver`'s `.symtab`:
+[`../../runbooks/debug-thread-spawn-segv.md`](../../runbooks/debug-thread-spawn-segv.md).
+
 ### 5.3 Alloc-under-lock sites that route to the hijack leaves
 
 `SHARED_L0_TABLE` insert (fork), `fds.table` clone in `close_all`,

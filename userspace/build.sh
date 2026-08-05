@@ -183,6 +183,22 @@ echo "Building mmap_file (C, file-backed mmap OOM probe)..."
 cp forktest/c_stress/mmap_file ../bootstrap/bin/
 echo "mmap_file (C) copied to bootstrap/bin/"
 
+# mprotectlb + clonearg: deterministic thread-spawn / mprotect probes. Both are
+# one-shot (no stress loop) and calibrated against real Linux, so a FAIL is a
+# kernel divergence and nothing else. mprotectlb is the regression guard for the
+# 2026-08-05 `flush_tlb_range` ASID bug (mprotect could not downgrade a cached
+# translation); clonearg checks that a cloned thread sees the memory its parent
+# wrote just before the clone. Tiny; built unconditionally.
+echo "Building mprotectlb + clonearg (C, thread-spawn/mprotect probes)..."
+(
+    cd forktest/c_stress
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o mprotectlb mprotectlb.c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -fno-stack-protector -o clonearg clonearg.c
+)
+cp forktest/c_stress/mprotectlb ../bootstrap/bin/
+cp forktest/c_stress/clonearg ../bootstrap/bin/
+echo "mprotectlb + clonearg (C) copied to bootstrap/bin/"
+
 # pthread_kill_eintr: does a pthread_kill signal interrupt a blocking read?
 # Shaped after jobserver-rs's Helper::join (the path every rustc that reaches
 # codegen runs). Also asserts an SA_RESTART handler does NOT interrupt, which

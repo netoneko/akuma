@@ -29,6 +29,26 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   `docker run --rm --platform linux/arm64 -v "$PWD/futexops:/futexops:ro" alpine /futexops`.
   As of 2026-08-03: 5 FAIL on Akuma, 5 PASS on Linux — see
   `docs/reference/subsystems/syscalls/sync.md` §"Known divergences from Linux".
+- `mprotectlb` — does `mprotect` take effect on a page that is already in the
+  TLB? Three permission *downgrades* on touched pages: RW→PROT_NONE (musl's
+  thread-stack guard page), RW→PROT_READ (a dynamic loader's RELRO), and a guard
+  page inside a larger mapping (which also catches a flush that invalidates the
+  wrong page). Deterministic — one mmap, one touch, one mprotect, one access.
+  Regression test for the 2026-08-05 `flush_tlb_range` bug: it invalidated with
+  `tlbi vale1is, va>>12`, whose ASID field is zero for every user VA, while user
+  processes all run under a non-zero ASID — so the invalidation matched nothing
+  and `sys_mprotect` could not downgrade a cached translation. Measured 3 FAIL
+  before the fix, 3 PASS after, 3 PASS on Linux.
+- `clonearg` — does a freshly cloned thread see the memory its parent wrote
+  immediately before `clone()`? Clones raw (musl `__clone`'s exact register
+  shape) so the child's first instructions are the ones the rustc thread-spawn
+  crash dies on, then checks three things the child reads before its first
+  syscall: the argument popped off its own stack, sentinel words the parent left
+  below it, and a page the parent mmap'd microseconds earlier. Every check is
+  range-checked before dereference, so a stale value is reported rather than
+  crashed on. Built to answer `docs/runbooks/debug-thread-spawn-segv.md`; it
+  found **no** divergence in 144k children, which is what rules the memory
+  handoff out.
 - `futexkey` — does a futex key leak between address spaces? Forks a waiter that
   parks on a `.bss` global, then issues the wake **from the parent**, i.e. a
   different address space at the identical VA (no ASLR). A correct kernel wakes

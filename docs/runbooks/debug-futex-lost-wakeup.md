@@ -145,9 +145,16 @@ Also check for a fault in a freshly cloned thread:
 [signal] sig 11 needs sigaltstack but slot 27 has none — re-pending
 ```
 
-That is a separate **open** bug (thread-spawn), not a lost wakeup — see the
-"Open issue" sections of
-[`../archive/SELFHOST_DEVBOX_SMOLTCP.md`](../archive/SELFHOST_DEVBOX_SMOLTCP.md).
+That is a separate **open** bug (thread-spawn), not a lost wakeup — it has its
+own runbook now: [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md).
+
+As of 2026-08-05 this is the *only* remaining shape in the `-j4` self-host
+wedge. A full retry run produced **zero `[FUTEX-ORPHAN]` lines**: every stuck
+waiter was correctly queued at a correctly address-space-scoped key, and the
+wedged waiters were all musl `pthread_join` on `detach_state`
+(`0x3d90f5e8`/`0x3d90b5e8`) — joining threads the kernel had killed with
+`[Fault] SIGSEGV in clone_thread`. If your dump looks like that, stop reading
+this runbook: the futex layer is behaving and the bug is upstream of it.
 
 ## 5. Cross-process key collision (FIXED 2026-08-04, keep the probe)
 

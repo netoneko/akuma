@@ -8,6 +8,47 @@ build + a nightly toolchain on a separate large disk.
 > stable toolchain. Self-hosting has actually compiled the kernel (147/147
 > units) and the self-built kernel boots.
 
+## Status (2026-08-05) — two builds, only one of them green
+
+Keep these apart; they fail for different reasons and the same word
+("self-host") is used for both.
+
+| | `cargo build --release -j1` (§1-§4 below) | in-VM `-j4` `release-smp-shared` + `devbox-smoltcp` |
+|---|---|---|
+| kernel *source* compiles on the host | yes — clean, clippy clean, 483 host tests pass | same source |
+| in-VM build | reaches the ELF | **blocked** |
+| blocker | — | freshly-cloned rustc threads SIGSEGV at a fixed PC ⇒ [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) |
+
+The `-j4` variant is the one under active investigation:
+
+```sh
+cargo build -p akuma --profile release-smp-shared \
+    --features devbox-smoltcp,no-tests -j4
+```
+
+What changed at the 2026-08-04 futex key-namespace fix
+([`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) §5):
+
+| | before | after |
+|---|---|---|
+| cross-process futex wake leak | `woken=1` (deterministic FAIL) | `woken=0` (PASS, matches Linux) |
+| first failure mode | hung forever, no error | fails in ~40 s with a real `signal: 11` cargo error |
+| how far the build gets | wedged at the final crate / early deps | through the dep graph to `ecdsa`/`heapless`/`ghash` |
+| `[FUTEX-ORPHAN]` lines | present | **zero** — the "parked ⇒ queued" invariant holds throughout |
+
+So the futex layer is doing its job. The wedged waiters that remain are musl
+`pthread_join` parked on `detach_state` (`0x3d90f5e8`/`0x3d90b5e8`) — i.e.
+**joining threads that died**, killed by the thread-spawn SIGSEGV. Diagnose from
+[`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md), not from the futex
+table.
+
+Two traps when measuring progress here: a `Compiling`-line stall heuristic is
+not a liveness signal (use `/proc/<pid>/syscalls` trace liveness,
+[`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) §0), and a build that
+dies on a SIGSEGV'd rustc still *advances* — crates that compiled stay
+compiled — so "it got further" is only meaningful against the failing crate, not
+the count.
+
 ## Prerequisites
 
 - Host: `ollama serve` is NOT needed for self-host (that's for meow). You need
@@ -86,6 +127,7 @@ cargo build --release -j1            # timeout ~7200s; -j1 avoids memory spike
 | icache stale (`dc cvau`) | icache not flushed after code write | FIXED |
 | Stale I-cache spurious SVC | spurious svc during execve | FIXED (the headline §7k.6) |
 | `cargo --version` crash (EC=0x0) | nightly cargo traps HVF CNTP | Use apk cargo + nightly rustc; or `HVF=0` |
+| `error: could not compile … (signal: 11)`, or all rustc processes frozen with `pthread_join` waiters | freshly-cloned thread SIGSEGVs at a fixed PC | **OPEN** — [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) |
 
 ## Background
 
