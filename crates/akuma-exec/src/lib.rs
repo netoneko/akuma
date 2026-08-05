@@ -90,6 +90,10 @@ pub mod bkl;
 /// (deadlock / mutual-exclusion / starvation checks). Compiled only for `cargo test`.
 #[cfg(test)]
 mod bkl_model;
+
+/// Shared host-test scaffolding (stub `ExecRuntime`/`ExecConfig` registration).
+#[cfg(test)]
+pub mod test_support;
 pub mod mmu;
 #[path = "elf/mod.rs"]
 pub mod elf_loader;

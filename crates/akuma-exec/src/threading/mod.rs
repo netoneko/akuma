@@ -3105,6 +3105,56 @@ pub fn sleep_us(us: u64) {
     schedule_blocking(now.saturating_add(us));
 }
 
+/// Publish `WAITING` for `tid` and consume a wake that raced the publication.
+/// Returns `true` if a wake was already pending, meaning the caller must **not** park.
+///
+/// # The lost wakeup this closes
+///
+/// [`ThreadWaker::wake`] is two steps: set the sticky `WOKEN_STATES` flag, then — *only
+/// if the target is already `WAITING`* — flip it to `READY` and ring the scheduler. A
+/// waker that arrives while the target is still `RUNNING` therefore leaves nothing but
+/// the sticky flag behind, and `WOKEN_STATES` is read in exactly one place: this
+/// function and [`schedule_blocking`]'s park loop. Nothing in the scheduler ever
+/// reconsiders a `WAITING` thread on account of it.
+///
+/// So a thread that stores `WAITING` and is descheduled before it re-reads the flag is
+/// stranded forever. That is not a narrow window — `schedule_blocking` *asks* to be
+/// switched out immediately after publishing (`voluntary_schedule_flag` + a self-SGI),
+/// so the common path is that the park loop's own re-check runs only after the thread
+/// is resumed. The unguarded gap is between `schedule_blocking`'s entry check and the
+/// `WAITING` store: a peer core that pops this tid out of `FUTEX_WAITERS` in that gap
+/// records the wake as delivered, and the waiter never runs again.
+///
+/// Diagnosed from `[FUTEX-ORPHAN]` histories ending `EpW` — enqueued, parked, popped by
+/// `futex_do_wake` — with no `u` (`schedule_blocking` returned) ever following, on
+/// musl's `__thread_list_lock` during a `-j4` in-VM self-host build. See
+/// `docs/runbooks/debug-futex-lost-wakeup.md` §4a.
+///
+/// # Why masking IRQs is sufficient
+///
+/// A context switch on this core only happens through an IRQ, so masking makes the
+/// store-then-check pair atomic locally. Against a peer core the two `SeqCst` variables
+/// give a total order with no losing interleaving: if the waker's `WOKEN_STATES` store
+/// precedes our swap we observe it and refuse to park; if it follows our swap, then our
+/// `WAITING` store precedes it too, so the waker's subsequent state load sees `WAITING`
+/// and performs the `READY` transition itself.
+fn publish_waiting_and_take_pending_wake(tid: usize, wake_time_us: u64) -> bool {
+    let _guard = IrqGuard::new();
+    mark_thread_waiting(tid, wake_time_us);
+    if !WOKEN_STATES[tid].swap(false, Ordering::SeqCst) {
+        return false;
+    }
+    // A wake landed before we were visible as WAITING, so the waker did not ready us and
+    // never will. Undo the publication ourselves.
+    WAKE_TIMES[tid].store(0, Ordering::SeqCst);
+    // Same guard as the park loop: `kill_thread_group` may have marked us TERMINATED,
+    // and resuming as RUNNING would return to user mode with freed resources.
+    if THREAD_STATES[tid].load(Ordering::SeqCst) != thread_state::TERMINATED {
+        THREAD_STATES[tid].store(thread_state::RUNNING, Ordering::SeqCst);
+    }
+    true
+}
+
 pub fn schedule_blocking(wake_time_us: u64) {
     let tid = current_thread_id();
 
@@ -3132,8 +3182,15 @@ pub fn schedule_blocking(wake_time_us: u64) {
         enable_preemption();
     }
     
-    // Mark thread as WAITING with wake time
-    mark_thread_waiting(tid, wake_time_us);
+    // Mark thread as WAITING with wake time, and re-check the sticky wake flag
+    // *atomically with respect to being descheduled*. See
+    // `publish_waiting_and_take_pending_wake` — skipping this leaks a wake permanently.
+    if publish_waiting_and_take_pending_wake(tid, wake_time_us) {
+        if was_disabled {
+            disable_preemption();
+        }
+        return;
+    }
 
     // Immediately hand the CPU to a ready thread instead of `WFI`-ing until the next
     // timer tick preempts us. We're already WAITING, so the scheduler switches us out
@@ -4178,6 +4235,133 @@ mod pending_kill_tests {
         request_thread_kill(MAX_THREADS + 5);
         assert!(!has_pending_kill(MAX_THREADS + 5));
         assert!(!take_kill_request_via_tid(MAX_THREADS + 5));
+    }
+}
+
+/// Real-concurrency proof for the park/wake handshake in
+/// [`publish_waiting_and_take_pending_wake`]. Two `std::thread`s stand in for two cores
+/// racing over one thread slot: one runs the parking side of `schedule_blocking`
+/// (entry check → publish `WAITING` → decide whether to park), the other fires a
+/// `ThreadWaker`. The invariant under test is the one the `-j4` self-host wedge
+/// violated: **a wake is never lost** — after both sides finish, the parking side has
+/// either consumed the wake itself, or the waker left the slot `READY` so the scheduler
+/// will resume it. A slot left `WAITING` with the wake already spent is the bug.
+///
+/// Against the pre-fix code (publish `WAITING`, park, only *then* re-check the sticky
+/// flag) this fails within a few hundred iterations. Confined to slots 45..50, a range
+/// no other test in this file touches.
+#[cfg(test)]
+mod park_wake_race_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    // Slots 40/41 are signal_mask_tests, 42-44 pending_kill_tests, 50..64 the contexts
+    // test. 45..50 is ours, and each test below owns a disjoint piece of it so the three
+    // can run under `cargo test`'s default parallelism.
+    const SLOT_START: usize = 45;
+    const SLOTS: usize = 3; // 45, 46, 47 — the race test
+    const SLOT_UNCONTENDED: usize = 48;
+    const SLOT_PENDING: usize = 49;
+
+    #[test]
+    fn a_wake_racing_the_waiting_publication_is_never_lost() {
+        const ITERS: usize = 4000;
+        // `ThreadWaker::wake` calls `runtime().trigger_sgi` on the WAITING branch — the
+        // branch this test is about — which panics if no runtime is registered. Test
+        // order is not guaranteed, so register the stub ourselves rather than relying on
+        // another test having done it.
+        crate::test_support::ensure_test_runtime();
+
+        for i in 0..ITERS {
+            let tid = SLOT_START + (i % SLOTS);
+            THREAD_STATES[tid].store(thread_state::RUNNING, Ordering::SeqCst);
+            WOKEN_STATES[tid].store(false, Ordering::SeqCst);
+            WAKE_TIMES[tid].store(0, Ordering::SeqCst);
+
+            let barrier = Arc::new(Barrier::new(2));
+            let waker_side = {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    ThreadWaker::new(tid).wake();
+                })
+            };
+
+            barrier.wait();
+            // The parking side of `schedule_blocking`: the entry check on the sticky
+            // flag, then the guarded publication — with the work that really sits
+            // between them in place. `schedule_blocking` calls `runtime().uptime_us()`,
+            // compares the deadline and runs the preemption dance there, and *that* span
+            // is the window: a waker landing inside it sees us RUNNING, so it arms the
+            // sticky flag and skips the READY transition, leaving nothing behind. The
+            // spin count is varied so the waker lands on both sides of the gap as well
+            // as inside it.
+            let parked = if WOKEN_STATES[tid].swap(false, Ordering::SeqCst) {
+                false
+            } else {
+                for _ in 0..(i * 37) % 3000 {
+                    std::hint::spin_loop();
+                }
+                !publish_waiting_and_take_pending_wake(tid, u64::MAX)
+            };
+
+            waker_side.join().unwrap();
+
+            if parked {
+                // We committed to sleeping. The waker must have made us runnable, or
+                // nothing ever will — this is the wedge.
+                assert_ne!(
+                    THREAD_STATES[tid].load(Ordering::SeqCst),
+                    thread_state::WAITING,
+                    "iteration {i}: slot {tid} parked WAITING but the wake was already \
+                     consumed — the waker saw us RUNNING and skipped the READY \
+                     transition, so no wake can ever reach this thread again"
+                );
+            }
+
+            THREAD_STATES[tid].store(thread_state::FREE, Ordering::SeqCst);
+            WOKEN_STATES[tid].store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// The uncontended path still behaves: no wake pending ⇒ we publish WAITING and
+    /// report "go ahead and park".
+    #[test]
+    fn no_pending_wake_publishes_waiting_and_parks() {
+        let tid = SLOT_UNCONTENDED;
+        THREAD_STATES[tid].store(thread_state::RUNNING, Ordering::SeqCst);
+        WOKEN_STATES[tid].store(false, Ordering::SeqCst);
+
+        assert!(!publish_waiting_and_take_pending_wake(tid, 12_345));
+        assert_eq!(THREAD_STATES[tid].load(Ordering::SeqCst), thread_state::WAITING);
+        assert_eq!(WAKE_TIMES[tid].load(Ordering::SeqCst), 12_345);
+
+        THREAD_STATES[tid].store(thread_state::FREE, Ordering::SeqCst);
+        WAKE_TIMES[tid].store(0, Ordering::SeqCst);
+    }
+
+    /// A wake that landed while the thread was still RUNNING is consumed, the thread is
+    /// handed back as RUNNING, and the flag is left clear so it cannot fire twice.
+    #[test]
+    fn a_wake_pending_from_the_running_state_is_consumed_not_parked() {
+        let tid = SLOT_PENDING;
+        THREAD_STATES[tid].store(thread_state::RUNNING, Ordering::SeqCst);
+        WOKEN_STATES[tid].store(false, Ordering::SeqCst);
+
+        // Exactly what `ThreadWaker::wake` does to a thread that is not yet WAITING: it
+        // arms the sticky flag and skips the READY transition.
+        ThreadWaker::new(tid).wake();
+        assert_eq!(THREAD_STATES[tid].load(Ordering::SeqCst), thread_state::RUNNING,
+            "waking a RUNNING thread must not transition it — that is the precondition \
+             for this whole race");
+
+        assert!(publish_waiting_and_take_pending_wake(tid, u64::MAX),
+            "the pending wake must be reported so the caller skips the park");
+        assert_eq!(THREAD_STATES[tid].load(Ordering::SeqCst), thread_state::RUNNING);
+        assert!(!WOKEN_STATES[tid].load(Ordering::SeqCst), "flag must be consumed once");
+
+        THREAD_STATES[tid].store(thread_state::FREE, Ordering::SeqCst);
     }
 }
 

@@ -122,12 +122,34 @@ cargo build --release -j1            # timeout ~7200s; -j1 avoids memory spike
 The build does not survive one uninterrupted run. It needs a supervisor. Four
 things each cost a session's worth of time when done the obvious way.
 
-### 5.1 `-j1` for the final `akuma` crate — the whole difference
+### 5.1 The `-j4` deadlock on the final crate — root-caused 2026-08-05
 
-`-j4` **deterministically deadlocks** on the final crate: both attempts wedged
+`-j4` **deterministically deadlocked** on the final crate: both attempts wedged
 ~27 s in, with rustc's threads parked forever on musl's `__thread_list_lock`
 (`0x300c2340`) and `queued_for` climbing past 900 s. `-j1` compiled the same
 crate in **68 s**.
+
+It was never a futex bug and never a musl bug. It was a **lost scheduler
+wakeup**: `schedule_blocking` published `WAITING` and only re-read the sticky
+`WOKEN_STATES` flag *after* asking to be switched out, so a waker that landed in
+the gap between the entry check and the `WAITING` store found the target still
+`RUNNING`, armed the flag, and skipped the `READY` transition. Nothing else in
+the kernel ever reconsiders a `WAITING` thread on account of that flag, so the
+waiter slept forever. Fixed by `publish_waiting_and_take_pending_wake`
+(`crates/akuma-exec/src/threading/mod.rs`), which makes the store-and-recheck
+atomic against being descheduled. Full diagnosis and the evidence that separates
+it from a futex bug:
+[`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) §4a.
+
+`__thread_list_lock` is where it surfaced because musl leans on the kernel there
+harder than anywhere else — `pthread_create` holds that lock across `__clone`,
+and every thread create and exit in the process serialises on it — so one lost
+wake takes down the whole rustc rather than one thread.
+
+**`-j1` is still the safe recipe for the final crate until a `-j4` run confirms
+otherwise.** The fix is verified by a deterministic host race test
+(`park_wake_race_tests`, which fails on iteration 0 against the pre-fix code and
+passes with it), not yet by a full in-VM `-j4` build.
 
 Why `-j1` and not a codegen knob: cargo hands rustc a **jobserver**, and rustc
 sizes its own codegen threads from it — so `-j1` shrinks rustc's *internal*
@@ -168,8 +190,22 @@ Kill switch: `config::SHARED_FILE_PAGES_ENABLED = false` restores private copies
 for a clean A/B. Watch the `[FPCACHE]` line in the 30 s PSTATS block — `hits` is
 exactly the number of private allocations + `read_at` sweeps avoided.
 
-This does **not** fix the `__thread_list_lock` deadlock; `-j1` is still required
-for the final crate.
+**Trap when testing invalidation: stage the test on the ext2 root, never in
+`/tmp`.** `/tmp` is not ext2, so its inode resolves to 0 — and `inode != 0` is an
+eligibility rule (`../reference/subsystems/memory.md` -> "Shared file pages"), so
+nothing there is ever cached. A `/tmp` invalidation test passes without
+exercising a single line of the code under test. Redo it on the ext2 root and
+`cmp` the overlapping bytes after an overwrite. (A whole-file hash mismatch there
+is a red herring — `cp` does not truncate; that is pre-existing and unrelated.)
+
+**Scope of the measurement.** The numbers above come from the single-core
+`release` profile driven by a synthetic `mmap_file` probe. `release-smp-shared`
+builds clean but the real 4-way cargo phase has not been re-measured, so the
+magnitude on the actual build is extrapolated from the frame/read counts, not
+observed.
+
+This is a *separate* fix from the `-j4` deadlock in §5.1 — it made `-j4` slow, it
+never made it wedge.
 
 ### 5.2 Run the build detached, or ssh will throw the work away
 
@@ -190,6 +226,63 @@ busybox sh -c "busybox cat /root/build.rc 2>/dev/null; busybox echo _ALIVE_"
 
 A bare `cat` on a not-yet-existing file returns non-zero, which reads as a dead
 VM and triggers a pointless reboot every time.
+
+#### 5.2a Boot the **`devbox-smoltcp`** kernel, or you get the in-kernel shell
+
+The host kernel that runs the self-host VM must be built with the userspace-sshd
+feature set — the same one §5 builds *inside* the guest:
+
+```bash
+cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests
+```
+
+`--features smp-shared` alone builds the same SMP kernel but serves port 22 from
+the **in-kernel** SSH server, whose shell is a builtin dispatcher, not a login
+shell. It is not a smaller shell, it is a different thing, and the failures it
+produces all look like guest or kernel bugs:
+
+- It **splits the command line on `;` before the guest sees it** — including a
+  `;` inside single quotes — so `sh -c 'a; b'` arrives as `Unknown command: b`,
+  and §5.2's `<BUILD> …; echo $? > rc` detach idiom silently loses its tail.
+  (`&&`/`||` survive, if you are stuck on this path.)
+- A detached `cargo` gets **`Hangup`** written into its own log when the session
+  closes — under `setsid`, under `nohup`, and under both.
+- There is **no `/dev/null`**; `> /dev/null` fails with `Not found`.
+
+Under the `devbox-smoltcp` kernel all three simply go away.
+
+#### 5.2b Two traps that impersonate kernel bugs
+
+- **A disk written by a VM that died with `SNAPSHOT=0` can be left in a state
+  where `cargo` aborts deterministically**, before compiling anything:
+  `rustc - --crate-name ___ --print=file-names …` dies with
+  `(signal: 6, SIGABRT)` on *every* invocation, on a fresh boot, at any `-j`,
+  with **no `[Fault]` line in the kernel log at all**. That is not the
+  thread-spawn bug and not a lost wakeup — the same kernel on a **freshly
+  re-cloned image** compiled crates immediately. `e2fsck` will not flag it
+  (§5.5's "the disk stays clean" is about metadata, not file contents). Re-clone
+  the image before diagnosing a deterministic cargo abort. Note `rustc -` run by
+  hand still succeeds on the damaged disk — only cargo spawning it fails — so a
+  manual probe will *not* reproduce it.
+- **A retry loop with no backoff manufactures §5.5 poisoning by itself**: 1000
+  respawns in 12 minutes left every new process dying instantly, which then reads
+  as a kernel bug. Sleep between attempts, and treat 3 consecutive sub-15-second
+  failures as "reboot", not "retry".
+
+Host-side: reusing an `INSTANCE` port across VMs trips ssh's
+`REMOTE HOST IDENTIFICATION HAS CHANGED`, which `StrictHostKeyChecking=no` does
+**not** bypass — add `-o UserKnownHostsFile=/dev/null`.
+
+#### 5.2c `apk` cargo is the HVF workaround, and it costs you the cache
+
+Nightly cargo traps under HVF (`[Exception] Unknown from EL0: EC=0x0` on every
+exec — the "Common failures" row below). The documented workaround, apk's
+`/usr/bin/cargo` with nightly `rustc` on `PATH`, works — but it is a **different
+cargo**, so it does not accept the fingerprints the nightly cargo wrote. It
+re-resolves and starts rebuilding the ~97 dependency crates from scratch, which
+throws away the fast path to the final `akuma` crate (the one §5.1 is about).
+It does not *delete* the old rlibs — the count goes up, not down — so a later
+nightly-cargo run can still use them.
 
 ### 5.3 Detect the wedge from the kernel console, not from the guest
 
@@ -226,6 +319,44 @@ across a full run was 25 → 97 rlibs over 7 boots. Reboots cost ~10 s.
 The disk itself stays clean through all of this — `e2fsck` reported no errors
 after a run that ended with QEMU aborting — so the corruption is purely
 in-memory. Do not go looking for filesystem damage.
+
+## 6. OPEN: nightly `cargo` dies instantly under HVF (`EC=0x0`)
+
+Worth fixing rather than working around: it is the **only** reason the self-host
+flow reaches for apk cargo, and that is what costs the dependency fingerprint
+cache (§5.2c) and with it the cheap path to the final crate.
+
+Every exec of `/usr/local/bin/cargo` (nightly 1.99.0) dies before doing any work:
+
+```
+[syscall] execve(path="/usr/local/bin/cargo", …)
+[Exception] Unknown from EL0: EC=0x0, ISS=0x0
+  Thread=11, ELR=0x112ac280, FAR=0x112ac220, SPSR=0x800
+[PSTATS] PID 211 (/usr/local/bin/cargo) 0.00s: 71 syscalls …
+          mmap=13 mprotect=3 openat=5 read=1 readlinkat=1 brk=6
+```
+
+What is established (2026-08-05):
+
+- **`ELR` is a constant, `0x112ac280`**, byte-identical across every occurrence,
+  across different pids and threads, across two different kernel builds. So it is
+  one specific instruction at one specific offset in the cargo binary, not a race.
+- It dies **~71 syscalls in**, having only mmap'd/mprotect'd and read a few
+  files — i.e. inside startup, before any build logic.
+- **Nightly `rustc` from the same toolchain is fine** under HVF (it compiles
+  crates all day), as is apk cargo. The problem is this one binary.
+- `EC=0x0` from EL0 is "unknown reason" — an **undefined instruction**. A trapped
+  `CNTP*_EL0` system-register read would raise `EC=0x18` (MSR/MRS), so the
+  long-standing "nightly cargo traps HVF CNTP" note in the failure table above is
+  almost certainly a misattribution. Do not start from it.
+- `HVF=0` (TCG) avoids it, which points at an instruction Apple silicon under
+  `-cpu host` does not implement but TCG's model does.
+
+Next step is cheap and decisive: **disassemble the instruction at that offset.**
+Get the load base from the `[mmap]`/execve lines for the same pid, subtract, then
+`objdump -d --start-address=… --stop-address=…` the cargo binary (pull it out of
+a disk *clone*, never a live image). Prime suspects for something TCG has and
+`-cpu host` does not: FEAT_MOPS (`CPY*`/`SET*`), FEAT_LSE128, or SVE.
 
 ## Verify
 
@@ -295,9 +426,9 @@ same tree.
 | futex/exit_group thread-group reaping | thread-group not fully reaped | FIXED |
 | icache stale (`dc cvau`) | icache not flushed after code write | FIXED |
 | Stale I-cache spurious SVC | spurious svc during execve | FIXED (the headline §7k.6) |
-| `cargo --version` crash (EC=0x0) | nightly cargo traps HVF CNTP | Use apk cargo + nightly rustc; or `HVF=0` |
+| `cargo --version` crash (EC=0x0) | **Cause not established** — see §6 below; the long-standing "traps HVF CNTP" reading does not fit the evidence | Use apk cargo + nightly rustc (costs the fingerprint cache, §5.2c); or `HVF=0` |
 | `error: could not compile … (signal: 11)`, or all rustc processes frozen with `pthread_join` waiters | freshly-cloned thread SIGSEGVs at a fixed PC | **OPEN** — [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) |
-| Final `akuma` crate sits on `Compiling akuma v0.0.7` forever at `-j4`; waiters on `0x300c2340` with `queued_for` > 900 s, **no** `[kill]` and **no** `[Fault]` lines | Deadlock only reachable under `-j4` | Build that crate with **`-j1`** (§5.1). Diagnosis: [`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) §4a |
+| Final `akuma` crate sits on `Compiling akuma v0.0.7` forever at `-j4`; waiters on `0x300c2340` with `queued_for` > 900 s, **no** `[kill]` and **no** `[Fault]` lines | Lost scheduler wakeup in `schedule_blocking` — a wake that raced the `WAITING` publication was dropped. **FIXED 2026-08-05** | Fix is in; `-j1` remains the recipe until a `-j4` run confirms it (§5.1). Diagnosis: [`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) §4a |
 | `Exec format error (os error 8)` on the same `build-script-build` every attempt | 0-byte artifact from a crashed link, still "fresh" to cargo | Delete the fingerprint dir (§5.4) — not a kernel bug |
 | Build restarts lose all progress; ssh dies ~every 5 min | remote cargo killed with the ssh session | Run detached + poll (§5.2) |
 | `qemu-system-aarch64: Assertion failed: (isv), hvf.c:1883` | guest touched MMIO with an instruction HVF can't decode, after the kernel went off the rails | Symptom of the ld-musl class — [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) |

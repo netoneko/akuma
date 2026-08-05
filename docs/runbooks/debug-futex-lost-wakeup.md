@@ -158,7 +158,7 @@ and the bug is upstream of it.
 
 It is **not** the only shape — see §4a.
 
-## 4a. Orphans with no dead thread at all (OPEN, 2026-08-05)
+## 4a. Orphans with no dead thread at all (FIXED 2026-08-05)
 
 The check in §4 has a false negative, and §3's "orphan at a shared address ⇒
 cross-process collision ⇒ §5" has one too. Both were built on runs where a
@@ -187,13 +187,59 @@ What separates it from §4 and §5, and why each of the obvious readings is wron
 
 Reproduce: the final `akuma` crate of the in-VM self-host build at `-j4` wedges
 this way ~27 s in, **deterministically** (2 for 2). The same crate at `-j1`
-compiles in 68 s, which is the current workaround — see
-[`selfhost-kernel-build.md`](selfhost-kernel-build.md) §5.1. That `-j1` fixes it
-says the trigger is concurrency inside one process, not a cross-process key.
+compiles in 68 s — see [`selfhost-kernel-build.md`](selfhost-kernel-build.md)
+§5.1. That `-j1` fixes it says the trigger is concurrency inside one process, not
+a cross-process key.
 
 Do not use a `Compiling`-line stall or guest-side CPU time to detect this wedge
 (§0, and busybox `ps` reports no per-process CPU time); parse `queued_for` out
 of the last `[FUTEX-DUMP]` block instead.
+
+### The answer was in the last event of `hist`, not in the futex table
+
+`hist=...EpW` reads: **E**nqueued, **p**arked, then **W**oken — `futex_do_wake`
+popped this tid and called its waker. The event that never follows is `u`
+(`schedule_blocking` returned). So the futex layer did its whole job and the
+thread still never ran again: this is a **scheduler** handoff defect, and every
+minute spent on key namespaces, wake counts and musl's lock protocol was spent in
+the wrong subsystem. §3 already names this reading of `W`; trust it.
+
+The defect, in `crates/akuma-exec/src/threading/mod.rs`:
+
+- `ThreadWaker::wake` is two steps — set the sticky `WOKEN_STATES[tid]` flag,
+  then, **only if the target is already `WAITING`**, flip it to `READY` and ring
+  the scheduler.
+- `WOKEN_STATES` was read in exactly one place, `schedule_blocking`. Nothing in
+  the scheduler ever reconsiders a `WAITING` thread because of it.
+- `schedule_blocking` published `WAITING` and *then* asked to be switched out
+  (`voluntary_schedule_flag` + a self-SGI) before its park loop re-read the flag.
+
+So a waker landing between `schedule_blocking`'s entry check and its `WAITING`
+store saw `RUNNING`, armed the flag, and left. The victim then published
+`WAITING`, was switched out by its own SGI, and no longer existed as far as any
+future wake was concerned. Untimed waits (`FUTEX_WAIT` with no timeout, which is
+what musl's `__tl_lock` issues) have no deadline to rescue them, hence "forever".
+
+Fixed by `publish_waiting_and_take_pending_wake`, which does the `WAITING` store
+and the flag re-check under a local IRQ mask — a context switch on this core can
+only arrive via IRQ, so the pair is atomic against being descheduled, and against
+a peer core the two `SeqCst` variables leave no losing interleaving.
+
+Why `-j4` and not `-j1`: the window is a handful of instructions wide and needs a
+*concurrent* waker on another core to land inside it. Nothing about it is
+specific to musl, to `__thread_list_lock`, or to rustc — that address is simply
+where a single lost wake does the most damage, because `pthread_create` holds
+that lock across `__clone` and every thread create and exit in the process
+serialises behind it.
+
+Regression test: `park_wake_race_tests` in the same file — two `std::thread`s
+race the park and the wake over one slot, and it fails on iteration 0 against the
+pre-fix ordering. Prefer it to any in-VM stress repro; see
+[`../reference/subsystems/scheduler.md`](../reference/subsystems/scheduler.md)
+-> "Park/wake handshake" for the invariant it encodes.
+
+Still open at the time of the fix: the in-VM `-j4` build has **not** been re-run,
+so `-j1` remains the documented recipe for the final crate.
 
 ## 5. Cross-process key collision (FIXED 2026-08-04, keep the probe)
 

@@ -76,6 +76,41 @@ For SMP/multikernel (one-kernel-per-core), see [`smp.md`](smp.md).
   on a wait queue, then `schedule_blocking()`. The producer fires the waker.
   Classic blocking-syscall pattern (pipes, poll, read on a fd).
 
+### Park/wake handshake — the invariant
+
+`WOKEN_STATES` is read in exactly **one** place, `schedule_blocking`. No part of
+the scheduler ever reconsiders a `Waiting` thread on account of it. That makes
+the following the load-bearing rule of the whole blocking layer:
+
+> A thread must never become `Waiting` *and lose the CPU* without having checked
+> the sticky flag at least once after publishing that state.
+
+The two sides fit together only in this order:
+
+| parking thread | waker (any core, or an IRQ on this one) |
+|---|---|
+| 1. store `WAITING` | a. store `WOKEN_STATES[tid] = true` |
+| 2. take `WOKEN_STATES[tid]`; if set, undo `WAITING` and return | b. **if** state is `WAITING`, store `READY` + ring the scheduler |
+
+Steps 1 and 2 are a unit: `publish_waiting_and_take_pending_wake` runs them under
+a local IRQ mask, because a context switch on this core can only arrive via IRQ.
+Split them and the wake is lost outright — the waker at (b) sees `RUNNING`, so it
+leaves nothing behind but a flag nobody will read again, and an untimed waiter
+sleeps forever. `schedule_blocking` deliberately asks to be switched out
+immediately after step 1 (`voluntary_schedule_flag` + self-SGI), so "the park
+loop rechecks the flag eventually" is **not** a substitute; the loop usually
+first runs only after the thread has been resumed.
+
+Both `SeqCst` orderings are required, not decorative: they are what guarantees
+that if (a) lands after step 2's swap, then step 1's store precedes it, so (b)
+observes `WAITING` and does the transition itself.
+
+This is not hypothetical — it is the `-j4` self-host wedge, which cost several
+sessions inside the futex layer before being found in the scheduler. Diagnosis
+and the `hist=...EpW` signature: `../../runbooks/debug-futex-lost-wakeup.md` §4a.
+Regression test: `park_wake_race_tests`
+(`crates/akuma-exec/src/threading/mod.rs`).
+
 ## Scheduling weights
 
 - **Proportional scheduler** (`schedule_indices`, `threading/mod.rs:1874`).
