@@ -29,6 +29,17 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   `docker run --rm --platform linux/arm64 -v "$PWD/futexops:/futexops:ro" alpine /futexops`.
   As of 2026-08-03: 5 FAIL on Akuma, 5 PASS on Linux — see
   `docs/reference/subsystems/syscalls/sync.md` §"Known divergences from Linux".
+- `dynspawn` + `dynchild` — hammer vfork+exec of a **dynamically linked** binary
+  and check the loader gets each child to `main`. Both binaries are dynamic on
+  purpose: musl implements `posix_spawn` with `CLONE_VM|CLONE_VFORK`, so the
+  child shares the parent's address space until it execs, and the parent's own
+  relocated ld-musl data is what is at risk. After every spawn the parent
+  re-checks its own relocated pointer and makes a PLT call. Point it at a large
+  dynamic binary for demand-paging pressure:
+  `dynspawn 25 4 /usr/local/bin/rustc 0 --version`. Written for the ld-musl
+  instruction-abort class in `docs/runbooks/debug-thread-spawn-segv.md` §3;
+  **does not reproduce it yet** (700 clean spawns), so that class still needs the
+  real build load.
 - `mprotectlb` — does `mprotect` take effect on a page that is already in the
   TLB? Three permission *downgrades* on touched pages: RW→PROT_NONE (musl's
   thread-stack guard page), RW→PROT_READ (a dynamic loader's RELRO), and a guard

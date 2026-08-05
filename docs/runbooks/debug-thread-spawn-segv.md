@@ -162,6 +162,24 @@ With the handoff ruled out (§2a), the live candidates are:
 
 `clone_thread` itself is `crates/akuma-exec/src/process/mod.rs:2723`.
 
+### Measured after the §2b fix (2026-08-05, ~12 min of `-j4` build, SMP=4)
+
+| | pre-fix baseline (~300 s) | with the §2b fix (~720 s) |
+|---|---|---|
+| `SIGSEGV in clone_thread` (the crash above) | 3 | **0** |
+| `Instruction abort from EL0` (the class below) | 6 | 2 |
+| `[FUTEX-ORPHAN]` | 0 | 0 |
+| what killed the build | — | `could not compile primeorder … (signal: 11)` |
+
+Not a controlled A/B — the runs differ in length, and a build's work changes as
+it progresses — so read it as "class 1 stopped appearing and class 2 did not",
+not as proof. A plausible mechanism for class 1 going away: with the guard page
+unwritable again, a thread stack overflow *faults* where it used to scribble
+silently into the neighbouring mapping — and a freshly-malloc'd thread packet is
+exactly the kind of neighbour that would land in.
+
+**The remaining blocker is the class below.**
+
 ### A second, separate crash lives in the same logs — do not conflate them
 
 The `-j4` logs also contain freshly-exec'd rustc processes taking an
@@ -173,17 +191,45 @@ ELR=0x6006c964 → 0x9006c964 → 0xc006c964 → 0xf006c964 → 0x12006c964 → 
 ```
 
 Symbolized, `ld-musl+0x6c964` is a **function prologue**, entered with
-`x0 = 0x30000000` (the loader base) and `x1 = sp+8` — i.e. `_dlstart_c` calling
-`__dls2` through a GOT entry that has had `+= base` applied **N times**. That is
-the signature of ld-musl's `R_AARCH64_RELATIVE` self-relocation running against
-data that was **already relocated**, with N incrementing once per occurrence
-across the boot.
+`x0 = 0x30000000` (the loader base) and `x1 = sp+8` — the `__dls2(base, sp)`
+signature. `x19 = x20 = x29 = x30 = 0` throughout: the process is at its very
+first instructions, and `x30 = 0` says it arrived by a *tail* branch, not a call.
 
-Both victims are processes whose address space is owned by a *different* pid
-(`[IA] pid=119` while the fault block says `Process 125`), i.e. the vfork
-fastpath. Note also `sys_execve` calls `vfork_complete(pid)` **before**
-`proc.address_space.activate()` (`src/syscall/proc.rs`), which wakes the vfork
-parent while the child is still between address spaces.
+Facts established about it, so nobody re-derives them:
+
+- **The branch is indirect.** `objdump -d` over the whole of ld-musl finds no
+  direct branch to `0x6c964` at all, and a PC-relative `b` could not reach a
+  target `0x30000000` away regardless (`b` is ±128 MB). So `__dls2` is entered
+  through a pointer *read from memory* — which is what carries the corruption.
+- **N is a per-boot sequence, not per-process noise.** It starts at 2 and
+  increments by exactly 1 per occurrence, across different processes and
+  different address-space owners, and resets to 2 on the next boot. That means
+  one thing is accumulating, and each fault leaves it one step worse — the shape
+  of a *shared* object being re-relocated, not of independent corruption.
+- **The victim is sometimes running in another pid's address space.**
+  `[IA] pid=247` while the fault block says `Process 270` — a process at its new
+  image's entry point whose address space is owned by pid 247, i.e. a
+  vfork-fastpath child that reached `_dlstart` without its own AS. But not
+  always: the other fault in the same run had `[IA] pid=268` == `Process 268`.
+- **It survives the §2b fix and is now what kills the build**
+  (`could not compile primeorder … (signal: 11)`).
+- Care with the relocation story: aarch64 uses **RELA**, and musl's stage-1
+  relocation is `*rel_addr = base + rel[2]` — an *assignment*, which is
+  idempotent. So "relocations applied twice" cannot by itself produce
+  `base*N + offset`; either `base` is wrong at some point, or the pointer is
+  being written by two parties.
+
+Where to start: `sys_execve` calls `vfork_complete(pid)` **before**
+`proc.address_space.activate()` (`src/syscall/proc.rs`), waking the vfork parent
+while the child is still between address spaces; and `vfork_process` gives the
+child the parent's L0 table under a **new ASID**
+(`child_ctx.ttbr0 = new_proc.address_space.ttbr0()`), so parent and child run the
+same page tables under two ASIDs.
+
+Not reproduced yet by `userspace/forktest/c_stress/dynspawn.c` (posix_spawn —
+musl implements it with `CLONE_VM|CLONE_VFORK` — of a dynamically linked child,
+4 threads): 600 spawns of a tiny dynamic ELF and 100 of `rustc --version` were
+all clean. It currently needs the real build load.
 
 ## 4. Reproduce
 
