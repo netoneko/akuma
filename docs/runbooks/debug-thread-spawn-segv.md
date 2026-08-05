@@ -26,7 +26,34 @@ process parked forever in `futex`, read
 
 ## 0. Confirm it is this bug and not a lost wakeup
 
-Three checks, in order — each is cheap and each has fooled a previous session:
+### 0a. `SIGSEGV in clone_thread` does not mean "a pthread" (2026-08-06)
+
+Read the message as **"a process whose address space is shared"**, which is a
+strictly larger set. The line is emitted from a single predicate:
+
+```rust
+// src/exceptions.rs
+let is_clone_thread = proc.address_space.is_shared();
+```
+
+and `vfork_process` builds its child with `UserAddressSpace::new_shared` on the
+parent's L0 (`crates/akuma-exec/src/process/mod.rs`, `vfork_process`) exactly
+like `clone_thread` does. So a **vfork-fastpath child that faults before it
+execs** prints the same line, and so does any CLONE_VM process. Before pooling
+occurrences into one population — every session so far has — separate them:
+
+| the victim is | evidence |
+|---|---|
+| a real pthread | `ELR` symbolizes inside `Thread::new::thread_start` / a thread entry, and the process is *post*-exec (`ELR` in the exec'd image or one of its `.so`s) |
+| a vfork child | `ELR` is in the interpreter (`0x30000000`+) or in the parent's image at a `fork`/`posix_spawn` return, and `SIGSEGV after 0.00s` on a pid the parent just created |
+
+This matters because §2's class (`librustc_driver`, `thread_start`) and the
+"second, separate crash" (ld-musl `__dls2`) may not be the same *kind* of process
+at all, and averaging their evidence produces theories that fit neither.
+
+### 0b. Three checks that tell this apart from a lost wakeup
+
+Each is cheap and each has fooled a previous session:
 
 | Check | This bug | Not this bug |
 |---|---|---|
@@ -147,6 +174,94 @@ Regress with `userspace/forktest/c_stress/mprotectlb.c` — deterministic, one
 mmap/touch/mprotect/access per phase. Measured **3 FAIL before, 3 PASS after,
 3 PASS on Linux**.
 
+## 2c. Ruled out 2026-08-06 by code reading — do not re-derive these
+
+Four mechanisms that each explain the evidence perfectly and are each false. All
+four were checked against the source, not against a log; the file:line is given
+so the next session can re-check them in a minute rather than re-reason them in
+an hour.
+
+**The kernel never reports failure for a thread it has already started.** This is
+the cleanest possible explanation for a freed packet: Rust's `Thread::new` does
+`drop(Box::from_raw(p))` when `pthread_create` returns nonzero, so a kernel that
+made the child runnable *and* returned an error would hand the child a freed
+argument, which is precisely the observed shape. It does not happen —
+`clone_thread` (`crates/akuma-exec/src/process/mod.rs`) has no fallible step
+between `spawn_user_thread_initializing` and its final `mark_thread_ready`, and
+`sys_clone_pidfd` (`src/syscall/proc.rs`) only converts an `Err` that was
+returned before the slot was ever marked READY. The only `clone_thread failed`
+lines in the `-j4` logs are `No free user thread slots`, a pre-spawn error, and
+they land *after* the faults, not before.
+
+**SA_RESTART cannot re-run `clone`.** A silently replayed `svc` would clone twice
+against one packet — candidate 1 below, delivered. But the rewind at
+`src/exceptions.rs` (`(*frame).elr_el1 -= 4`) is gated on the syscall having
+returned `-EINTR` or `-ERESTARTSYS`; `clone` returns a positive tid or `EAGAIN`,
+neither of which arms it.
+
+**The trampoline cannot pick a stale `Process`.** `entry_point_trampoline`
+resolves its process by *scanning* for `thread_id == Some(tid)`
+(`process/mod.rs`) — a uniqueness assumption with no enforcement — and `sys_exit`
+deliberately leaves an exited thread's `Process` ACTIVE as a zombie ("Do NOT
+unregister_process — leave as zombie for wait4", `src/syscall/proc.rs`), while
+nothing clears `thread_id`. That is a genuine-looking collision: a recycled slot
+whose old `Process` still claims it. It is closed by the recycler's ordering —
+`cleanup_terminated_internal` runs the cleanup callback (`on_thread_cleanup` →
+`unregister_process`, retiring the zombie and making it invisible to the scan)
+**before** it stores `FREE` (`crates/akuma-exec/src/threading/mod.rs`), and only
+`FREE` lets a spawn claim the slot. The window is closed by construction, not by
+timing. (The scan is still worth replacing with `THREAD_PID_MAP` — see
+§"Hardening" — but it is not the bug.)
+
+**ASID reuse is flushed before the ASID is reallocated.** `UserAddressSpace::drop`
+issues `flush_tlb_asid(self.asid)` and only then returns the ASID to the
+allocator, with the ordering documented in place (`crates/akuma-exec/src/mmu/mod.rs`);
+`AsidAllocator` is a plain round-robin bitmap over 256 IDs with no generation
+counter to get wrong (`mmu/asid.rs`).
+
+**No kernel relocation writer can accumulate `base`.** For the ld-musl class
+below: all three appliers — `load_elf`, `load_interpreter`, and the size-profile
+`load_interpreter_from_path` (`crates/akuma-exec/src/elf/mod.rs`) — write
+`*ptr = base + addend`, the idempotent form, and `INTERP_BASE`
+(`elf/types.rs`) is a `const`. So the `base*N` accumulation is not produced by
+any kernel write, which moves the hunt onto musl's own `GETFUNCSYM` static
+pointer being written by two parties.
+
+## 2d. The evidence that reframes the question (2026-08-06)
+
+In the archived `-j4` log (`selfhost_vm_smp4.log`, 2026-08-03) two faults
+**0.32 s apart** are byte-identical in every field:
+
+```
+[T1684.46] Process 428 (/usr/local/bin/rustc)   [T1684.78] Process 433 (/usr/local/bin/rustc)
+tid=26  x19=0x3d96f980  SP_EL0=0x24477d510  FAR=0x2d7463697274732b  ELR=0x3801c58c
+```
+
+`0x2d7463697274732b` is `"+strict-"` — rustc target-feature string heap, the same
+family as `"libder-8"` / `"+outline"`. Both are preceded by a clean
+`trampoline ENTRY tid=26` with a proper `[Cleanup] Thread 26 recycled` between
+them, so this is **not** a double-start of one thread: two different processes,
+two legitimately fresh occupants of slot 26.
+
+Two readings, and the register dump cannot choose between them:
+
+1. **Determinism.** No ASLR, two rustc invocations with the same arguments, so the
+   same allocation sequence puts `"+strict-"` at the same VA in both, and the
+   hand-off is corrupted the same way both times. This is what §2 assumed.
+2. **Aliasing.** The two processes are reading the *same memory* — same physical
+   page under the same VA in two address spaces.
+
+Reading 2 was never on the table before and is the more economical explanation of
+"a pointer slot that holds another process's string". It is also the reading that
+unifies this class with the "victim is sometimes running in another pid's address
+space" observation in the second crash below. Note the honest constraint: this
+pair predates `src/file_page_cache.rs` (2026-08-05), so the *file* page cache
+cannot be the aliasing route for these two — CoW fork, the vfork fastpath's
+shared L0, or a demand-fault double-install are the candidates that were already
+present.
+
+Deciding between the two readings is what §3a's instrumentation exists for.
+
 ## 3. Where to look in the kernel
 
 With the handoff ruled out (§2a), the live candidates are:
@@ -163,7 +278,7 @@ With the handoff ruled out (§2a), the live candidates are:
    `fault_slot_acquire` and `map_user_page` reports `installed=false` on a lost
    race.
 
-`clone_thread` itself is `crates/akuma-exec/src/process/mod.rs:2723`.
+`clone_thread` itself is `crates/akuma-exec/src/process/mod.rs`.
 
 ### Measured after the §2b fix (2026-08-05, ~12 min of `-j4` build, SMP=4)
 
@@ -288,6 +403,112 @@ musl implements it with `CLONE_VM|CLONE_VFORK` — of a dynamically linked child
 4 threads): 600 spawns of a tiny dynamic ELF and 100 of `rustc --version` were
 all clean. It currently needs the real build load.
 
+## 3a. The instrumentation that decides it — read this before reproducing
+
+Landed 2026-08-06, always on, so **any** repro answers the question instead of
+motivating another instrumented build. The class costs 2-4 minutes of `-j4` per
+occurrence; a run that produces a fault and still cannot say which theory is live
+is a wasted run, and three sessions have had one.
+
+The mechanism: musl's `__clone` pushes the child's entry and argument onto the
+new stack before the `svc` (`stp x0,x3,[x1,#-16]!`) and the child pops them
+(`ldp x1,x0,[sp],#16`) — so the `stack` value the kernel is handed **is the
+address of that pair**. `clone_thread` snapshots the two words there, in the
+parent's address space, into per-slot statics (`record_clone_snapshot`,
+`crates/akuma-exec/src/process/mod.rs`). The fatal EL0 data-abort dump re-reads
+them in the child's context and prints the comparison
+(`print_spawn_fault_diag`, `src/exceptions.rs`):
+
+```
+[Fault]  tid=26 ttbr0_live=0x1a000067f00000 ttbr0_proc=0x1a000067f00000
+[Fault]  FAR as ASCII: "+strict-" (freed block reused as string?)
+[Fault]  clone-handoff tid=26 stack=0x24477d510 from pid=417/tid=22 ttbr0=0x...
+[Fault]    at clone: entry=0x37fbd3c0 arg=0x24477d520
+[Fault]    now:      entry=0x37fbd3c0 arg=0x24477d520  (intact)
+[Fault]  [x19=0x3d96f980] = 0x2d7463697274732b ...
+```
+
+Read the three flags:
+
+| what prints | what it means | where to go |
+|---|---|---|
+| `*** AS MISMATCH ***` | the thread is executing in someone else's page tables — every "corrupt pointer" in the dump is a correct pointer resolved in the wrong space | the vfork/exec ordering below, and `Process::run`'s `activate()` |
+| `*** HANDOFF CHANGED ***` | the child's stack page is not the page the parent wrote | aliasing / stale TLB / demand-fault double-install — §2a's probe did *not* cover this, it only covered visibility |
+| both clean, `[x19]` is a string | the argument was delivered correctly and the packet behind it was freed | a genuine lifetime bug — candidate 1 |
+
+`FAR`-as-ASCII is printed unconditionally now, so nobody has to remember the
+`"libder-8"` precedent by hand.
+
+## 3b. Hardening worth doing regardless of the outcome
+
+`entry_point_trampoline` resolves its `Process` with
+`table::find_process(|p| p.thread_id == Some(tid))` — a linear scan resting on an
+invariant (one ACTIVE process per tid) that nothing enforces, sitting on the exact
+path where every fault in this runbook happens. `THREAD_PID_MAP[tid]` is the
+authoritative mapping, `clone_thread`/`vfork_process` both populate it before the
+child can run, and `current_process_shared()` already trusts it. Preferring it
+(scan as fallback) removes a whole class from consideration for free. §2c shows
+the scan is *currently* safe; it is safe by an ordering two subsystems away, which
+is not where you want a hot-path invariant to live.
+
+## 3c. Live theories, ranked (2026-08-06)
+
+Ordered by how much of the evidence each one explains, not by how easy it is to
+test. Every one of them is decided by §3a's three flags, which is why the
+instrumentation went in before any of them was chased.
+
+**T1 — Cross-address-space aliasing (new, best fit).** The child dereferences a
+pointer that is *correct*, in an address space that is *wrong*: same VA, different
+physical page, so the packet slot reads back as another rustc's string heap. This
+is the only theory that explains, without coincidence, why two different processes
+fault byte-identically on the same string (§2d), why `FAR` keeps decoding as
+another process's data rather than as garbage, and why the second crash class has
+a victim "running in another pid's address space". It also predicts §2a's result:
+`clonearg.c` measured the *handoff* and would pass regardless, because the handoff
+is not what is broken. **Decided by:** `*** AS MISMATCH ***`, or by `[x19]`
+reading back differently in the fault dump than it must have at clone time.
+Suspects, in order: `sys_execve` calling `vfork_complete(pid)` **before**
+`proc.address_space.activate()` (`src/syscall/proc.rs`), which wakes the vfork
+parent while the child is between address spaces; `vfork_process` giving the child
+the parent's L0 under a *new* ASID; a demand-fault double-install (`map_user_page`
+reports `installed=false` on a lost race — check every caller honours it).
+
+**T2 — Packet use-after-free (the runbook's original candidate 1).** The argument
+is delivered intact and the memory behind it has already been recycled. §2c kills
+the mechanism that made this attractive (kernel-reports-failure-after-success), so
+it now needs a *different* freeing party — a double-start, or a child that
+completes and is re-entered. **Decided by:** handoff `(intact)` **and**
+`ttbr0_live == ttbr0_proc` **and** `[x19]` printing string bytes. If all three
+hold, this is the answer and the hunt moves into thread-slot lifetime.
+
+**T3 — Stale stack page under the child (residual §2b).** The child's stack VA
+resolves to a page that is not the one the parent wrote — the mprotect/TLB family
+that §2b closed one instance of, possibly with another instance left under
+shared-AS/new-ASID. **Decided by:** `*** HANDOFF CHANGED ***`. Note this is the
+one thing §2a's 144,260-child probe did *not* cover: it proved stores are
+*visible*, not that the child's mapping is the same mapping.
+
+**T4 — Lazy-region snapshot staleness (new, secondary).** `clone_thread` copies
+the parent's lazy-region map into the child (`clone_lazy_regions`), a *snapshot*
+taken at clone time. Fault-time lookups normally resolve through
+`address_space_owner_pid_for_fault()` (TTBR0 → the non-shared owner), which is
+correct — but `lazy_region_lookup_for_page_fault` **falls back to the caller's
+pid**, and that fallback reads the frozen copy. A thread demand-paging a region
+its parent mmap'd after the clone would then get obsolete flags/source, or nothing
+at all. Explains an unmapped-page abort in the mmap range (the third fault in
+`selfhost_vm_smp4.log` has `FAR=0x242b33727`, squarely in the `0x240000000` mmap
+window) better than it explains the `thread_start` class.
+
+**Amplifier, not a cause: thread-slot pressure.** The same log carries
+`clone_thread failed: No free user thread slots` — rustc's rayon pool under `-j4`
+exhausts the 256-slot table. Slot exhaustion means slots are recycled as fast as
+they are freed, which is the precondition every reuse-race theory needs. If a fix
+attempt appears to work, check it did not merely lower slot churn.
+
+**Dead, do not revive:** kernel-reports-failure-after-success, SA_RESTART replay,
+stale-`Process` scan in the trampoline, ASID reuse without flush, implicit-addend
+relocation in the kernel — all five with file:line in §2c.
+
 ## 4. Reproduce
 
 Roughly 1 fault per 2-4 minutes of `-j4` build, with 3 in a 190 s window seen:
@@ -308,6 +529,31 @@ cargo build -p akuma --profile release-smp-shared --features devbox-smoltcp,no-t
 [`selfhost-kernel-build.md`](selfhost-kernel-build.md) — and note that a
 `Compiling`-line stall heuristic is **not** a liveness signal
 (`debug-futex-lost-wakeup.md` §0).
+
+### Getting the in-guest build to actually start (2026-08-06)
+
+Three things cost a session's worth of time before a single fault was observed.
+None of them are about the bug; all of them are about the harness.
+
+- **The workload has to be a cold build.** `cargo build` on the guest's warm
+  `target/` finishes in ~1 minute and spawns almost no threads. Delete
+  `target/aarch64-unknown-none/release-smp-shared` first — the fault rate is a
+  function of concurrent `rustc` processes, not of wall time.
+- **`cargo` cannot reach crates.io from the guest even though the network is
+  fine.** `curl -o /dev/null -w '%{http_code}' https://index.crates.io/config.json`
+  returns `200` in 0.3 s while cargo reports
+  `Failed to connect to index.crates.io:443 after 420 ms`. It is libcurl's HTTP/2
+  multiplexing; `[http] multiplexing = false` in `/root/.cargo/config.toml` (or
+  `CARGO_HTTP_MULTIPLEXING=false`) fixes it. Don't debug the net stack.
+- **`--offline` can fail with sources fully cached.** `no matching package named
+  arm_pl031 found` while `~/.cargo/registry/{cache,src}` both hold it and
+  `~/.cargo/git/db` holds the `embedded-tls` checkout: what is stale is the
+  *index* cache, which a cargo upgrade invalidates. Refresh it once online
+  (`cargo fetch`), then run every subsequent pass `--offline` so a long repro loop
+  never touches the network again.
+- **Detach properly.** `ssh host 'cmd &'` dies with the session. Write the loop to
+  a file on the guest and start it with
+  `busybox setsid busybox sh -c '... > log 2>&1' < /dev/null &`.
 
 ## Verify
 

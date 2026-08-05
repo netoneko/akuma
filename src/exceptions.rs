@@ -824,6 +824,98 @@ fn maybe_print_sigsegv_syscall_diag(elr: u64, far: u64, frame: &UserTrapFrame) {
     );
 }
 
+/// Render an 8-byte little-endian word as the ASCII it may be hiding.
+///
+/// `docs/runbooks/debug-thread-spawn-segv.md`: a `FAR` that decodes to printable
+/// text (`"libder-8"`, `"+outline"`, an ANSI SGR escape) is not a wild pointer —
+/// it is a freed block that has been reused as string heap, and the string names
+/// the allocator neighbour that took it. Two sessions have re-derived this by
+/// hand; print it instead.
+fn word_as_ascii(word: u64, out: &mut [u8; 8]) -> bool {
+    let bytes = word.to_le_bytes();
+    let mut printable = 0usize;
+    for (i, b) in bytes.iter().enumerate() {
+        out[i] = match *b {
+            0x20..=0x7e => { printable += 1; *b }
+            0x1b => { printable += 1; b'^' }      // ESC — the ANSI-escape tell
+            _ => b'.',
+        };
+    }
+    printable >= 6
+}
+
+/// Diagnostics for the thread-spawn SIGSEGV class
+/// (`docs/runbooks/debug-thread-spawn-segv.md`).
+///
+/// Printed on every fatal EL0 data abort, because the class is rare, unpredictable
+/// and expensive to reproduce — one repro must answer the question, not motivate
+/// another instrumented build. It reports the three facts the register dump alone
+/// cannot distinguish between:
+///
+/// 1. **Address space.** `ttbr0_live` (the hardware register) against the
+///    `Process`'s own `ttbr0`. A mismatch means the thread is executing in
+///    someone else's page tables, which turns every "corrupt pointer" in the dump
+///    into a correct pointer resolved in the wrong space.
+/// 2. **The clone hand-off.** musl's `[entry, arg]` pair as the parent wrote it
+///    versus as it reads *now*. Divergence indicts the memory handoff; agreement
+///    exonerates it and points at the packet's lifetime.
+/// 3. **ASCII.** `FAR` decoded as text — see `word_as_ascii`.
+fn print_spawn_fault_diag(far: u64, frame: &UserTrapFrame) {
+    let tid = akuma_exec::threading::current_thread_id();
+
+    let ttbr0_live = akuma_exec::mmu::get_current_ttbr0() as u64;
+    let ttbr0_proc = akuma_exec::process::current_process_shared()
+        .map_or(0, |p| p.address_space.ttbr0());
+    crate::safe_print!(160, "[Fault]  tid={} ttbr0_live={:#x} ttbr0_proc={:#x}{}\n",
+        tid, ttbr0_live, ttbr0_proc,
+        if ttbr0_proc != 0 && ttbr0_live != ttbr0_proc { "  *** AS MISMATCH ***" } else { "" });
+
+    let mut ascii = [0u8; 8];
+    if word_as_ascii(far, &mut ascii)
+        && let Ok(s) = core::str::from_utf8(&ascii) {
+            crate::safe_print!(96, "[Fault]  FAR as ASCII: \"{}\" (freed block reused as string?)\n", s);
+        }
+
+    let Some(snap) = akuma_exec::process::clone_snapshot(tid) else { return };
+    match akuma_exec::process::reread_clone_handoff(&snap) {
+        Some((entry_now, arg_now)) => {
+            let changed = entry_now != snap.entry || arg_now != snap.arg;
+            crate::safe_print!(256,
+                "[Fault]  clone-handoff tid={} stack={:#x} from pid={}/tid={} ttbr0={:#x}\n[Fault]    at clone: entry={:#x} arg={:#x}\n[Fault]    now:      entry={:#x} arg={:#x}{}\n",
+                tid, snap.stack, snap.parent_pid, snap.parent_tid, snap.ttbr0,
+                snap.entry, snap.arg, entry_now, arg_now,
+                if changed { "  *** HANDOFF CHANGED ***" } else { "  (intact)" });
+        }
+        None => {
+            crate::safe_print!(192,
+                "[Fault]  clone-handoff tid={} stack={:#x} UNREADABLE now (was entry={:#x} arg={:#x})\n",
+                tid, snap.stack, snap.entry, snap.arg);
+        }
+    }
+
+    // The word the faulting prologue loaded came from `[x19]` (`ldr x20,[x0]`;
+    // `mov x19,x0`). Dump that block so the reuse pattern — free-list cell, small
+    // integer, or string — is on the record without a second run.
+    let mut probe = [0u64; 4];
+    let ok = unsafe {
+        akuma_exec::mmu::user_access::copy_from_user_safe(
+            probe.as_mut_ptr().cast::<u8>(), frame.x19 as *const u8, 32,
+        ).is_ok()
+    };
+    if ok {
+        crate::safe_print!(192, "[Fault]  [x19={:#x}] = {:#x} {:#x} {:#x} {:#x}\n",
+            frame.x19, probe[0], probe[1], probe[2], probe[3]);
+        for w in probe {
+            if word_as_ascii(w, &mut ascii)
+                && let Ok(s) = core::str::from_utf8(&ascii) {
+                    crate::safe_print!(96, "[Fault]    ascii: \"{}\"\n", s);
+                }
+        }
+    } else {
+        crate::safe_print!(96, "[Fault]  [x19={:#x}] unreadable\n", frame.x19);
+    }
+}
+
 /// Pre-resolve a CoW write barrier: if the page at `page_va` in the current
 /// TTBR0 address space is a CoW-demoted RO page (cow_ref_get > 0), allocate a
 /// private copy, remap it RW, and update frame tracking.
@@ -3685,6 +3777,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 frame_ref.x19, frame_ref.x20, frame_ref.x29, frame_ref.x30);
             crate::safe_print!(128, "[Fault]  SP_EL0={:#x} SPSR={:#x} TPIDR_EL0={:#x}\n",
                 frame_ref.sp_el0, frame_ref.spsr_el1, frame_ref.tpidr_el0);
+            print_spawn_fault_diag(far, frame_ref);
             if let Some(proc) = akuma_exec::process::current_process_shared() {
                 let elapsed_us = (akuma_exec::runtime::runtime().uptime_us)()
                     .saturating_sub(proc.start_time_us);

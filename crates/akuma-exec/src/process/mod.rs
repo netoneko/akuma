@@ -2713,6 +2713,123 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
     Ok(child_pid)
 }
 
+// ============================================================================
+// CLONE_THREAD hand-off snapshot (thread-spawn SIGSEGV diagnostics)
+// ============================================================================
+//
+// `docs/runbooks/debug-thread-spawn-segv.md`: a freshly cloned thread dies at
+// `Thread::new::thread_start`'s first instruction pair — `ldr x20,[x0]` then an
+// atomic fetch-add at `[x20]` — because `[x0]` is not a pointer. Every theory in
+// that runbook turns on one question the fault dump cannot answer: **was the
+// argument the child ran with the one its parent handed over?**
+//
+// musl's `__clone` stores the child's entry and argument at the top of the new
+// stack (`stp x0,x3,[x1,#-16]!`) and the child pops them (`ldp x1,x0,[sp],#16`),
+// so `stack` — the value the kernel is handed — *is* the address of that pair.
+// Snapshot it in the parent's context here, re-read it at the fatal fault, and
+// the three candidates separate cleanly:
+//
+//   - words changed between clone and fault  ⇒ the child's stack page is not the
+//     page the parent wrote (aliasing / stale TLB / double-allocated demand page)
+//   - words identical, `[arg]` is a string    ⇒ true use-after-free of the packet
+//   - `ttbr0_live != ttbr0_proc` at the fault ⇒ wrong address space entirely
+//
+// Cost is three stores and one 16-byte user read per `pthread_create`; the read
+// side runs only on the fatal-SIGSEGV path.
+static CLONE_SNAP_STACK: [AtomicU64; crate::threading::MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; crate::threading::MAX_THREADS]
+};
+static CLONE_SNAP_FN: [AtomicU64; crate::threading::MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; crate::threading::MAX_THREADS]
+};
+static CLONE_SNAP_ARG: [AtomicU64; crate::threading::MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; crate::threading::MAX_THREADS]
+};
+/// Packs the creating thread's identity: `(parent_pid as u64) << 32 | parent_tid`.
+static CLONE_SNAP_PARENT: [AtomicU64; crate::threading::MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; crate::threading::MAX_THREADS]
+};
+/// The TTBR0 the child was created to run under.
+static CLONE_SNAP_TTBR0: [AtomicU64; crate::threading::MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; crate::threading::MAX_THREADS]
+};
+
+/// What `clone_thread` recorded for thread slot `tid`; see [`clone_snapshot`].
+#[derive(Clone, Copy, Debug)]
+pub struct CloneSnapshot {
+    /// The `stack` argument to `clone(2)` — also the address of musl's
+    /// `[entry, arg]` pair, since `__clone` pushes them before the `svc`.
+    pub stack: u64,
+    /// `*(stack)` as the parent left it: musl's `start`/`start_c11`.
+    pub entry: u64,
+    /// `*(stack + 8)` as the parent left it: musl's `struct start_args *`,
+    /// whose `start_arg` field is the Rust thread packet.
+    pub arg: u64,
+    pub parent_pid: Pid,
+    pub parent_tid: u32,
+    pub ttbr0: u64,
+}
+
+/// Record the hand-off for a slot that `clone_thread` has just claimed. Runs in
+/// the *parent's* address space, which is the only context where the words the
+/// parent wrote are guaranteed to be the ones under `stack`.
+fn record_clone_snapshot(tid: usize, stack: u64, parent_pid: Pid, parent_tid: usize, ttbr0: u64) {
+    if tid >= crate::threading::MAX_THREADS { return; }
+    let mut words = [0u64; 2];
+    // Fault-safe: `stack` is user-supplied and a bogus one must not take down
+    // the kernel on a diagnostic read.
+    let ok = unsafe {
+        crate::mmu::user_access::copy_from_user_safe(
+            words.as_mut_ptr().cast::<u8>(), stack as *const u8, 16,
+        ).is_ok()
+    };
+    CLONE_SNAP_STACK[tid].store(stack, Ordering::Release);
+    CLONE_SNAP_FN[tid].store(if ok { words[0] } else { u64::MAX }, Ordering::Release);
+    CLONE_SNAP_ARG[tid].store(if ok { words[1] } else { u64::MAX }, Ordering::Release);
+    CLONE_SNAP_PARENT[tid].store(((parent_pid as u64) << 32) | (parent_tid as u64 & 0xFFFF_FFFF), Ordering::Release);
+    CLONE_SNAP_TTBR0[tid].store(ttbr0, Ordering::Release);
+}
+
+/// The `clone_thread` hand-off recorded for slot `tid`, or `None` if this slot's
+/// current occupant did not arrive through `clone_thread`.
+///
+/// `clone_thread` is the only writer and it writes before the slot is marked
+/// READY, so a value read here belongs to the slot's current occupant unless the
+/// slot has since been recycled to a non-clone thread — which `stack == 0`
+/// (scrubbed on FREE) does not catch. Treat it as diagnostic, not as an
+/// invariant: cross-check `parent_pid` against the faulting process's `tgid`.
+pub fn clone_snapshot(tid: usize) -> Option<CloneSnapshot> {
+    if tid >= crate::threading::MAX_THREADS { return None; }
+    let stack = CLONE_SNAP_STACK[tid].load(Ordering::Acquire);
+    if stack == 0 { return None; }
+    let parent = CLONE_SNAP_PARENT[tid].load(Ordering::Acquire);
+    Some(CloneSnapshot {
+        stack,
+        entry: CLONE_SNAP_FN[tid].load(Ordering::Acquire),
+        arg: CLONE_SNAP_ARG[tid].load(Ordering::Acquire),
+        parent_pid: (parent >> 32) as Pid,
+        parent_tid: (parent & 0xFFFF_FFFF) as u32,
+        ttbr0: CLONE_SNAP_TTBR0[tid].load(Ordering::Acquire),
+    })
+}
+
+/// Re-read the `[entry, arg]` pair a snapshot points at, in the *current*
+/// address space. Returns `None` if the stack page is no longer readable.
+pub fn reread_clone_handoff(snap: &CloneSnapshot) -> Option<(u64, u64)> {
+    let mut words = [0u64; 2];
+    unsafe {
+        crate::mmu::user_access::copy_from_user_safe(
+            words.as_mut_ptr().cast::<u8>(), snap.stack as *const u8, 16,
+        ).ok()?;
+    }
+    Some(words.into())
+}
+
 /// Clone a thread within the same process (CLONE_THREAD | CLONE_VM).
 /// The child shares the parent's address space and file descriptors.
 ///
@@ -2824,7 +2941,12 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     )?;
 
     new_proc.thread_id = Some(tid);
-    
+
+    // Snapshot musl's `[entry, arg]` pair while we are still in the parent's
+    // address space — the thread-spawn SIGSEGV diagnostic; see
+    // `record_clone_snapshot` and docs/runbooks/debug-thread-spawn-segv.md.
+    record_clone_snapshot(tid, stack, parent_pid, parent_tid, shared_ttbr0);
+
     // DO NOT copy sigaltstack from parent thread to child thread.
     // Each Go M-thread must set up its own sigaltstack during mstart1.
     // If we copy the parent's sigaltstack, the SIGURG guard (alt_sp == 0 check)
