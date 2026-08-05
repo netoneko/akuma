@@ -8,23 +8,42 @@ build + a nightly toolchain on a separate large disk.
 > stable toolchain. Self-hosting has actually compiled the kernel (147/147
 > units) and the self-built kernel boots.
 
-## Status (2026-08-05) — two builds, only one of them green
+## Status (2026-08-05) — the `release-smp-shared` build completes
 
-Keep these apart; they fail for different reasons and the same word
-("self-host") is used for both.
-
-| | `cargo build --release -j1` (§1-§4 below) | in-VM `-j4` `release-smp-shared` + `devbox-smoltcp` |
+| | `cargo build --release -j1` (§1-§4 below) | in-VM `release-smp-shared` + `devbox-smoltcp` |
 |---|---|---|
 | kernel *source* compiles on the host | yes — clean, clippy clean, 483 host tests pass | same source |
-| in-VM build | reaches the ELF | **blocked** |
-| blocker | — | freshly-cloned rustc threads SIGSEGV at a fixed PC ⇒ [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) |
-
-The `-j4` variant is the one under active investigation:
+| in-VM build | reaches the ELF | **reaches the ELF** (2026-08-05) |
+| how | — | `-j4` for the ~97 dependency crates, then **`-j1` for the final `akuma` crate** (§5) |
 
 ```sh
 cargo build -p akuma --profile release-smp-shared \
-    --features devbox-smoltcp,no-tests -j4
+    --features devbox-smoltcp,no-tests -j4      # deps
+cargo build -p akuma --profile release-smp-shared \
+    --features devbox-smoltcp,no-tests -j1      # final crate — see §5
 ```
+
+Result, verified end to end:
+
+```
+Finished `release-smp-shared` profile [optimized] target(s) in 1m 08s
+```
+
+rc=0; artifact `target/aarch64-unknown-none/release-smp-shared/akuma`,
+1,998,392 bytes, ELF64 aarch64 ET_EXEC. Extracted with `busybox base64` over
+ssh, `rust-objcopy -O binary` → 1,465,088 bytes (host build of the same tree:
+1,456,901), and **booted**: full boot, userspace sshd, `uname`/`uptime` over
+ssh.
+
+> The tree that was built was the guest's own checkout at **67c2c23**, 12
+> commits behind the host at the time — so that particular self-hosted kernel
+> predates the `mprotect` fix in [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md)
+> §2b. Check `.git/HEAD` in the guest before claiming a self-host build of a
+> given commit; the kernel prints the hash in `uname -a`.
+
+The two crash classes below still fire during the dependency phase and still
+cost whole crate compiles — they are **not** fixed, they are only survivable by
+retrying (§5). See [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md).
 
 What changed at the 2026-08-04 futex key-namespace fix
 ([`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) §5):
@@ -98,12 +117,123 @@ cargo build --release -j1            # timeout ~7200s; -j1 avoids memory spike
 
 `--offline` fallback if crates.io unreachable inside the VM.
 
+## 5. Drive it to completion (`release-smp-shared`, 2026-08-05)
+
+The build does not survive one uninterrupted run. It needs a supervisor. Four
+things each cost a session's worth of time when done the obvious way.
+
+### 5.1 `-j1` for the final `akuma` crate — the whole difference
+
+`-j4` **deterministically deadlocks** on the final crate: both attempts wedged
+~27 s in, with rustc's threads parked forever on musl's `__thread_list_lock`
+(`0x300c2340`) and `queued_for` climbing past 900 s. `-j1` compiled the same
+crate in **68 s**.
+
+Why `-j1` and not a codegen knob: cargo hands rustc a **jobserver**, and rustc
+sizes its own codegen threads from it — so `-j1` shrinks rustc's *internal*
+parallelism too. Unlike `-Ccodegen-units=1` or any `RUSTFLAGS` edit, it changes
+**no fingerprints**, so the ~97 already-built dependency rlibs stay valid.
+Reaching for `RUSTFLAGS` here invalidates every target rlib and costs hours.
+
+Use `-j4` for the dependency phase anyway: throughput wins there even though a
+SIGSEGV'd rustc costs a whole crate compile, because a retry resumes — crates
+that compiled stay compiled.
+
+### 5.2 Run the build detached, or ssh will throw the work away
+
+ssh into the guest drops roughly every 5 minutes under build load, which kills
+the remote `cargo` and discards everything in flight. Detach it and poll:
+
+```sh
+busybox setsid busybox sh -c '<BUILD> > /root/build.log 2>&1;
+                              busybox echo $? > /root/build.rc' &
+```
+
+Poll with a command that exits **0 whenever the VM is alive**, whether or not
+the rc file exists yet:
+
+```sh
+busybox sh -c "busybox cat /root/build.rc 2>/dev/null; busybox echo _ALIVE_"
+```
+
+A bare `cat` on a not-yet-existing file returns non-zero, which reads as a dead
+VM and triggers a pointless reboot every time.
+
+### 5.3 Detect the wedge from the kernel console, not from the guest
+
+Both obvious liveness signals are useless for the final crate: it emits **no log
+output for tens of minutes**, and busybox `ps` reports **no per-process CPU
+time** (the TIME column is `0:00` for everything). Use the kernel's own dump —
+parse the last `[FUTEX-DUMP]` block out of the serial log and treat any
+`queued_for=(\d+)us` over ~300 s as wedged. That fires in minutes instead of
+burning the 90-minute timeout.
+
+### 5.4 A 0-byte artifact will block one crate forever
+
+A crash mid-link leaves a **0-byte `build-script-build`** that cargo still
+considers fresh, so every later attempt dies identically:
+
+```
+could not execute process `…/build/num-traits-<hash>/build-script-build` (never executed)
+Caused by: Exec format error (os error 8)
+```
+
+This is not a kernel bug and no amount of retrying clears it. Find them with
+`busybox find /root/akuma/target -type f -size 0` and delete the whole
+fingerprint directory so cargo rebuilds it. Note that `stderr` files and
+`.cargo-*lock` files are **legitimately** empty — only a zero-length *binary*
+is the defect.
+
+### 5.5 Reboot through the poisoning
+
+One userspace crash can leave the VM in a state where every newly started
+process dies instantly and ssh fails within seconds. Cargo's cache makes this
+survivable: kill QEMU, `e2fsck -fy` the image, boot again, resume. Progress
+across a full run was 25 → 97 rlibs over 7 boots. Reboots cost ~10 s.
+
+The disk itself stays clean through all of this — `e2fsck` reported no errors
+after a run that ended with QEMU aborting — so the corruption is purely
+in-memory. Do not go looking for filesystem damage.
+
 ## Verify
 
 - `/usr/local/bin/rustc --version` contains `"nightly"`.
-- Success = produced ELF at `target/aarch64-unknown-none/release/akuma`.
+- Success = produced ELF at `target/aarch64-unknown-none/release/akuma` (or
+  `…/release-smp-shared/akuma` for the §5 flow).
 - Record the highest milestone reached: manifest parse → build.rs/proc-macro →
   deps → akuma crate → rust-lld link.
+
+Do not stop at "cargo printed Finished" — that has been true while the artifact
+was unusable. Close the loop by booting what the guest built:
+
+```bash
+# 1. pull the ELF out (binary-safe; the guest has busybox base64)
+ssh -p <port> root@localhost \
+  '/bin/busybox base64 /root/akuma/target/aarch64-unknown-none/release-smp-shared/akuma' \
+  | base64 -d > selfhost_akuma.elf
+
+# 2. flatten it — run this from the repo so rust-toolchain.toml selects the
+#    toolchain that actually has llvm-tools, else rust-objcopy is "not found"
+rust-objcopy -O binary selfhost_akuma.elf selfhost_akuma.bin
+
+# 3. boot it on its own disk clone and ports (never the image a live VM holds)
+qemu-system-aarch64 -machine virt,gic-version=3 -accel hvf -cpu host -smp 4 \
+  -m 4096 -serial mon:stdio -display none -semihosting \
+  -netdev user,id=net0,hostfwd=tcp::2622-:22 \
+  -global virtio-mmio.force-legacy=false \
+  -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0 \
+  -drive file=bootcheck.img,if=none,format=raw,id=hd0 \
+  -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
+  -device virtio-rng-device,bus=virtio-mmio-bus.2 \
+  -kernel selfhost_akuma.bin
+```
+
+Expect a full boot and a working `uname -a` over ssh on :2622. `uname` prints
+the **git hash the guest built from** — check it against the commit you meant to
+self-host, because the guest's `/root/akuma` checkout drifts from the host tree
+(it was 12 commits behind on 2026-08-05). Measured sizes for reference: ELF
+1,998,392 B, `.bin` 1,465,088 B, versus 1,456,901 B for the host build of the
+same tree.
 
 ## Key constraints
 
@@ -128,9 +258,17 @@ cargo build --release -j1            # timeout ~7200s; -j1 avoids memory spike
 | Stale I-cache spurious SVC | spurious svc during execve | FIXED (the headline §7k.6) |
 | `cargo --version` crash (EC=0x0) | nightly cargo traps HVF CNTP | Use apk cargo + nightly rustc; or `HVF=0` |
 | `error: could not compile … (signal: 11)`, or all rustc processes frozen with `pthread_join` waiters | freshly-cloned thread SIGSEGVs at a fixed PC | **OPEN** — [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) |
+| Final `akuma` crate sits on `Compiling akuma v0.0.7` forever at `-j4`; waiters on `0x300c2340` with `queued_for` > 900 s, **no** `[kill]` and **no** `[Fault]` lines | Deadlock only reachable under `-j4` | Build that crate with **`-j1`** (§5.1). Diagnosis: [`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) §4a |
+| `Exec format error (os error 8)` on the same `build-script-build` every attempt | 0-byte artifact from a crashed link, still "fresh" to cargo | Delete the fingerprint dir (§5.4) — not a kernel bug |
+| Build restarts lose all progress; ssh dies ~every 5 min | remote cargo killed with the ssh session | Run detached + poll (§5.2) |
+| `qemu-system-aarch64: Assertion failed: (isv), hvf.c:1883` | guest touched MMIO with an instruction HVF can't decode, after the kernel went off the rails | Symptom of the ld-musl class — [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) |
 
 ## Background
 
 - `archive/AKUMA_SELF_HOSTING.md` — the full progression §1–§7j (SELF-HOSTED).
 - [`acceptance/10_selfhost_compile_akuma.md`](../../acceptance/10_selfhost_compile_akuma.md).
-- `scripts/loop_selfhost_kernelbuild.py` — retry loop.
+- `scripts/loop_selfhost_kernelbuild.py` — retry loop. Note it targets the
+  **`--release -j1`** build with a hardcoded `-p 2322`, and it retries in-band
+  over ssh, so it does not cover the §5 flow (detached build, wedge detection,
+  reboot-through-poisoning, `-j1` only for the final crate). Treat it as the
+  starting point, not the harness.

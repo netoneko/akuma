@@ -15,7 +15,10 @@ group:
 [Fault] SIGSEGV in clone_thread, calling exit_group
 ```
 
-This is the **open** blocker for the `-j4` in-VM self-host build (2026-08-05).
+This is still **open** (2026-08-05). It no longer *blocks* the in-VM self-host
+build — that now completes, because a retry resumes and crates that compiled
+stay compiled ([`selfhost-kernel-build.md`](selfhost-kernel-build.md) §5) — but
+each occurrence still costs a whole crate compile, so it is worth fixing.
 It is *not* a futex bug and not a lost wakeup — if you arrived here from a
 process parked forever in `futex`, read
 [`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) §4 first: the parked
@@ -27,7 +30,7 @@ Three checks, in order — each is cheap and each has fooled a previous session:
 
 | Check | This bug | Not this bug |
 |---|---|---|
-| `[FUTEX-ORPHAN]` lines in the log | **zero** | any ⇒ futex table defect, go to `debug-futex-lost-wakeup.md` §3 |
+| `[FUTEX-ORPHAN]` lines in the log | **zero** | any ⇒ `debug-futex-lost-wakeup.md` §3, or §4a if the orphans are all one tgid with no `[kill]`/`[Fault]` anywhere in the boot |
 | `SIGSEGV after N.NNs` on the victim | `0.00`-`0.05` | seconds ⇒ ordinary crash, not a spawn bug |
 | the stuck waiters' `uaddr` | musl `detach_state` (`pthread_join`) | `__thread_list_lock` (`0x300c2340`) ⇒ §5 of the futex runbook |
 
@@ -218,6 +221,60 @@ Facts established about it, so nobody re-derives them:
   idempotent. So "relocations applied twice" cannot by itself produce
   `base*N + offset`; either `base` is wrong at some point, or the pointer is
   being written by two parties.
+
+  Refinement worth keeping (2026-08-05): that idempotence holds *only* because
+  the addend comes from the RELA entry. Any path that takes the addend from the
+  **slot itself** — musl's `DT_REL` implicit-addend form, `*slot = base + *slot`
+  — produces exactly this `base*N` accumulation. That shape is the thing to hunt
+  for. The kernel's own pass (`crates/akuma-exec/src/elf/mod.rs:381`) is
+  `*ptr = base + addend`, i.e. the safe form.
+
+### Ruled out 2026-08-05 — do not re-derive these
+
+Both of the obvious carriers for the growing value are eliminated by direct
+measurement:
+
+- **Not `e_entry`.** `/lib/ld-musl-aarch64.so.1` reads back clean from a running
+  guest with `e_entry = 0x69de8` (`busybox od -A x -t x8 -N 32`). So `0x6c964`
+  is not the entry point at all — consistent with §"the branch is indirect"
+  above, it is the `__dls2` call — and the interpreter file/page-cache is not
+  corrupted.
+- **Not `AT_BASE`.** `load_elf_with_stack` pushes
+  `AT_BASE = interp.base_addr` (`crates/akuma-exec/src/elf/mod.rs:821`), which is
+  the `INTERP_BASE` **constant** and cannot accumulate. The faulting frame
+  agrees: `x0 = 0x30000000`, the correct base. So `base` is right at the moment
+  of the bad branch; it is the branch *target* that is wrong.
+
+Also note the cadence precisely: **N increments once per *fault*, not per exec.**
+One run had ~270 s and many hundreds of successful execs between N=4 and N=5.
+Whatever holds the value is shared across processes *and* only advances when the
+fault happens — which rules out anything recomputed per-exec from the file.
+
+### A data-abort variant of the same class
+
+Same `ELR`, but a **data** abort where `FAR` is an 8-byte ASCII string:
+
+```
+[Fault] Data abort from EL0 at FAR=0x382d72656462696c, ELR=0x3801c58c, ISS=0x21
+[Fault]  x0=0x1 x1=0x382d72656462696c x2=0x0 x3=0x8
+```
+
+`0x382d72656462696c` is `"libder-8"` and `0x656e696c74756f2b` is `"+outline"`
+(little-endian) — both rustc heap content: a `deps/` filename and the
+`+outline-atomics` target feature. `x1 = x20 = FAR` is a pointer slot holding a
+freed block that was reused as a string. Decode `FAR` as ASCII before assuming a
+wild pointer; a printable `FAR` names the data that overwrote the slot and is a
+strong hint about *which* allocator neighbour it was.
+
+One such run also took **QEMU itself** down:
+
+```
+qemu-system-aarch64: Assertion failed: (isv), function hvf_handle_exception, file hvf.c, line 1883
+```
+
+That is HVF failing to decode a guest MMIO access — i.e. the kernel dereferenced
+garbage that landed in the MMIO window. It exits QEMU with status 134, so a
+supervisor loop must treat "QEMU died" as a normal outcome and reboot.
 
 Where to start: `sys_execve` calls `vfork_complete(pid)` **before**
 `proc.address_space.activate()` (`src/syscall/proc.rs`), waking the vfork parent

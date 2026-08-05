@@ -148,13 +148,52 @@ Also check for a fault in a freshly cloned thread:
 That is a separate **open** bug (thread-spawn), not a lost wakeup — it has its
 own runbook now: [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md).
 
-As of 2026-08-05 this is the *only* remaining shape in the `-j4` self-host
-wedge. A full retry run produced **zero `[FUTEX-ORPHAN]` lines**: every stuck
-waiter was correctly queued at a correctly address-space-scoped key, and the
-wedged waiters were all musl `pthread_join` on `detach_state`
-(`0x3d90f5e8`/`0x3d90b5e8`) — joining threads the kernel had killed with
-`[Fault] SIGSEGV in clone_thread`. If your dump looks like that, stop reading
-this runbook: the futex layer is behaving and the bug is upstream of it.
+This was for a while the *only* remaining shape in the `-j4` self-host wedge. One
+retry run produced **zero `[FUTEX-ORPHAN]` lines**: every stuck waiter was
+correctly queued at a correctly address-space-scoped key, and the wedged waiters
+were all musl `pthread_join` on `detach_state` (`0x3d90f5e8`/`0x3d90b5e8`) —
+joining threads the kernel had killed with `[Fault] SIGSEGV in clone_thread`. If
+your dump looks like that, stop reading this runbook: the futex layer is behaving
+and the bug is upstream of it.
+
+It is **not** the only shape — see §4a.
+
+## 4a. Orphans with no dead thread at all (OPEN, 2026-08-05)
+
+The check in §4 has a false negative, and §3's "orphan at a shared address ⇒
+cross-process collision ⇒ §5" has one too. Both were built on runs where a
+thread had died. This shape has **no corpse**:
+
+```
+[FUTEX-ORPHAN] tid=21 tgid=13 uaddr=0x300c2340 last_ev_ts=28894214us now=930202300us hist=XEpWuXXXXXXXXEpW
+[FUTEX-ORPHAN] tid=22 tgid=13 uaddr=0x300c2340 last_ev_ts=27009750us now=930202921us hist=XXXXXXXXXXXXXEpW
+[FUTEX-ORPHAN] tid=23 tgid=13 uaddr=0x300c2340 last_ev_ts=26913810us now=930203369us hist=XXXXXXXXXXXXXEpW
+  key tgid=13 uaddr=0x3cda5fc4 waiters=1
+    tid=16 bitset=0xffffffff queued_for=923645878us hist=--------------Ep
+```
+
+What separates it from §4 and §5, and why each of the obvious readings is wrong:
+
+- **Zero `[kill]` lines and zero `[Fault]` lines in the entire boot.** So §4
+  does not apply: nothing was killed while holding the lock. Grep for both
+  before you assume a dead thread; the absence is the diagnosis.
+- **Every orphan is the same `tgid`.** So §5 does not apply either — the
+  cross-process key collision needs two tgids on one address. `0x300c2340` is
+  `__thread_list_lock`, which is at the same VA in every musl binary, so a
+  shared *address* is not by itself evidence of a shared *key*.
+- `hist=--------------Ep` on the queued waiters means enqueued, parked, and
+  never woken — no prior wake cycle at all, so it is not a wake that got lost
+  mid-handoff.
+
+Reproduce: the final `akuma` crate of the in-VM self-host build at `-j4` wedges
+this way ~27 s in, **deterministically** (2 for 2). The same crate at `-j1`
+compiles in 68 s, which is the current workaround — see
+[`selfhost-kernel-build.md`](selfhost-kernel-build.md) §5.1. That `-j1` fixes it
+says the trigger is concurrency inside one process, not a cross-process key.
+
+Do not use a `Compiling`-line stall or guest-side CPU time to detect this wedge
+(§0, and busybox `ps` reports no per-process CPU time); parse `queued_for` out
+of the last `[FUTEX-DUMP]` block instead.
 
 ## 5. Cross-process key collision (FIXED 2026-08-04, keep the probe)
 
