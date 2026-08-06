@@ -868,6 +868,19 @@ The claim in this runbook that fixing the `N × INTERP_BASE` class was "the
 remaining blocker for a green `-j4`" was optimistic; there is another one behind
 it.
 
+**Update 2026-08-06 — that `FUTEX_WAIT` stall was not a lost wakeup.** It was a
+process left with **no thread**, killed by `kill_thread_group`'s grace-expiry branch
+terminating every recorded sibling tid unconditionally (69 % of those kills had no
+pending kill request at all, and some landed on slots already recycled to unrelated
+processes). The parked waiter was a *parent* blocked on a process that could never
+run. Root-caused, fixed and A/B-verified:
+[`../archive/GRACE_EXPIRED_HARD_KILL_ORPHANS.md`](../archive/GRACE_EXPIRED_HARD_KILL_ORPHANS.md).
+
+With that fixed the build reaches 58+ crates and then dies of **this** runbook's own
+class — `[Fault] Process 778 (/usr/local/bin/cargo) SIGSEGV after 4.54s` /
+`SIGSEGV in clone_thread`. So `-j4` is still not green, and the next blocker is
+thread-spawn, not futex.
+
 ### Fixed alongside — the right function, the wrong instance (superseded by §2h)
 
 `init_thread_slot_context` (`crates/akuma-exec/src/threading/mod.rs`) set

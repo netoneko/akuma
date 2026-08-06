@@ -36,7 +36,19 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicBool, AtomicUsize, Ordering};
+
+/// Rate-limit counter for the `[KTG-MISMATCH]` tripwire in [`kill_thread_group`].
+static KTG_MISMATCHES: AtomicUsize = AtomicUsize::new(0);
+
+/// Rate-limit counter for the `[KTG]` caller trace in [`kill_thread_group`].
+static KTG_TRACES: AtomicUsize = AtomicUsize::new(0);
+
+/// Rate-limit counter for the `[KTG-STALE]` tripwire: a grace-expired hard kill
+/// aimed at a thread slot that had been recycled to an unrelated process.
+/// Only the `kernel_smp_shared` grace-wait has that window, so only it reports.
+#[cfg(kernel_smp_shared)]
+static KTG_STALE_SKIPS: AtomicUsize = AtomicUsize::new(0);
 
 pub static FORK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 use spinning_top::Spinlock;
@@ -1126,6 +1138,33 @@ pub extern "C" fn check_process_exit() -> bool {
 /// Kill all threads in the same thread group (matching tgid).
 /// Used by exit_group and when the address-space owner exits to prevent
 /// sibling threads from running with freed page tables.
+/// May a grace-expired hard kill terminate slot `tid` on behalf of sibling `sib_pid`?
+///
+/// Both halves are load-bearing, and each guards a distinct way the old
+/// unconditional terminate went wrong:
+///
+/// 1. **Still a straggler.** The grace loop's own definition of a straggler is
+///    "has not consumed its kill request". A sibling with no pending request either
+///    already acted on it (it is self-terminating at its boundary) or never had one
+///    armed — in neither case is force warranted. Measured on the pre-fix arm: 179
+///    of 261 hard kills, 69 %, had `pending_kill=false`.
+/// 2. **Slot still theirs.** `siblings` is a snapshot up to `KILL_GRACE_US` (2 s) old
+///    and the thread-slot recycle cooldown is ~10 ms, so the recorded tid may have
+///    been handed to an unrelated process many times over. Terminating it kills that
+///    process's thread and strands the process itself: registered, un-exited, with no
+///    thread to run — so it can never reach `exit_group`, is never reaped, and its
+///    parent's `wait4` never returns.
+///
+/// Note the two overlap heavily but neither implies the other: the recycler clears
+/// `PENDING_KILL` when it frees a slot, so a recycled slot usually fails (1) first.
+/// (2) still has to be checked, for a slot recycled *and* re-armed within the window.
+///
+/// Same rule `unregister_process` applies (`table.rs`, "consult THREAD_PID_MAP");
+/// see `docs/archive/STALE_THREAD_SLOT_KILL.md`.
+pub fn grace_kill_should_terminate(sib_pid: Pid, tid: usize) -> bool {
+    crate::threading::has_pending_kill(tid) && table::pid_for_thread(tid) == Some(sib_pid)
+}
+
 pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
     // Find tgid for the calling process
     let tgid = table::get_process_ptr(my_pid)
@@ -1138,11 +1177,45 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
             siblings.push((p.pid, p.thread_id));
         }
     });
-    if crate::runtime::config().syscall_debug_info_enabled {
-        let mut buf = [0u8; 96]; let mut pos = 0;
+    // Who is tearing down which group, ungated. A group kill is rare and always
+    // interesting: it is the only path that terminates threads it does not own, so
+    // when a long-lived process loses a worker thread this line is what names the
+    // killer. `my_tgid` is printed separately from `my_pid` because the sibling set
+    // is selected by tgid alone — a caller whose row carries somebody else's tgid
+    // takes out somebody else's threads, and that is invisible from `my_pid`.
+    if KTG_TRACES.fetch_add(1, Ordering::Relaxed) < 512 {
+        let mut buf = [0u8; 176];
+        let mut pos = 0;
         let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-            format_args!("[ktg] my_pid={} tgid={} siblings={}\n", my_pid, tgid, siblings.len()));
+            format_args!(
+                "[KTG] my_pid={} my_tgid={} by_tid={} code={} siblings={} first={:?}\n",
+                my_pid, tgid, crate::threading::current_thread_id(), exit_code,
+                siblings.len(), siblings.first()));
         if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+    }
+
+    // Tripwire: every slot this function is about to act on comes from the
+    // recorded `p.thread_id`, which PHASE 2 below deliberately leaves set on dead
+    // siblings. `unregister_process` already refuses to terminate a slot that
+    // THREAD_PID_MAP proves was recycled (table.rs "stale tid"), but PHASE 1's
+    // `request_thread_kill` and PHASE 2's `THREAD_PID_MAP.remove` have no such
+    // guard — so a disagreement here is a kill (or a map eviction) aimed at
+    // whoever holds the slot now. Print both readings and which siblings have no
+    // live thread at all; silent when they agree, so it costs nothing in steady
+    // state. Rate-limited: a teardown storm must not flood the console.
+    for (sib_pid, sib_tid) in &siblings {
+        let map_tid = table::thread_for_pid(*sib_pid);
+        if map_tid != *sib_tid && KTG_MISMATCHES.fetch_add(1, Ordering::Relaxed) < 64 {
+            let mut buf = [0u8; 160];
+            let mut pos = 0;
+            let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                format_args!(
+                    "[KTG-MISMATCH] my_pid={} tgid={} sib_pid={} thread_id={:?} map_tid={:?} \
+                     slot_owner={:?}\n",
+                    my_pid, tgid, sib_pid, sib_tid, map_tid,
+                    sib_tid.and_then(table::pid_for_thread)));
+            if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+        }
     }
 
     // PHASE 1: prevent siblings from running further kernel work.
@@ -1193,8 +1266,48 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
                 log::warn!(
                     "[ktg] pid={}: grace expired, hard-terminating {} straggler(s)",
                     my_pid, stragglers);
-                for (_, t) in &siblings {
+                // Terminate only the actual stragglers, and only while the slot is
+                // still the sibling's.
+                //
+                // `siblings` is a snapshot taken up to KILL_GRACE_US (2 s) ago, and a
+                // thread slot's recycle cooldown is ~10 ms — so by the time this runs a
+                // sibling that already died can have had its slot handed to any number
+                // of unrelated processes. The old loop terminated every recorded tid
+                // unconditionally, which meant:
+                //   * it killed threads that were never stragglers (`has_pending_kill`
+                //     false — either they consumed the request, or the recycler cleared
+                //     the flag when the slot was reused), and
+                //   * it killed whoever holds the slot NOW, leaving *that* process
+                //     registered with no thread at all: unschedulable, unable to reach
+                //     exit_group, never reaped, with its parent's wait4 blocked forever.
+                // Measured directly: `[TERM] tid=23 pid=Some(92) state=5 pending_kill=false`
+                // from this line, followed by `[PROC-ORPHAN] pid=92 tgid=14` for the rest
+                // of the boot — an innocent cargo worker thread, killed as a "straggler".
+                //
+                // This is the same rule `unregister_process` already applies (table.rs,
+                // "consult THREAD_PID_MAP"); the grace path simply never got it.
+                for (sib_pid, t) in &siblings {
                     if let Some(tid) = t {
+                        if !grace_kill_should_terminate(*sib_pid, *tid) {
+                            let owner = table::pid_for_thread(*tid);
+                            if !crate::threading::has_pending_kill(*tid) {
+                                continue;
+                            }
+                            if KTG_STALE_SKIPS.fetch_add(1, Ordering::Relaxed) < 64 {
+                                let mut buf = [0u8; 160];
+                                let mut pos = 0;
+                                let _ = core::fmt::write(
+                                    &mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                                    format_args!(
+                                        "[KTG-STALE] my_pid={} sib_pid={} tid={} recycled to \
+                                         pid={:?} — not terminating\n",
+                                        my_pid, sib_pid, tid, owner));
+                                if let Ok(s) = core::str::from_utf8(&buf[..pos]) {
+                                    (runtime().print_str)(s);
+                                }
+                            }
+                            continue;
+                        }
                         crate::threading::mark_thread_terminated(*tid);
                     }
                 }
@@ -1258,11 +1371,24 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
         let _ = table::unregister_process(*sib_pid);
 
         if let Some(tid) = sib_tid {
-            with_irqs_disabled(|| {
-                THREAD_PID_MAP.lock().remove(tid);
-            });
-            // Already marked terminated in phase 1 (or self-terminated at the
-            // boundary under smp-shared); wake in case it is still parked.
+            // Same staleness rule as the grace path above: evict the map entry only
+            // while it still names THIS sibling. If the slot has been recycled, the
+            // entry belongs to its new occupant, and dropping it makes that thread's
+            // identity unresolvable — `read_current_pid` returns None, which silently
+            // degrades its futex keys into the VA-only `tgid=0` namespace where every
+            // process running the same binary collides (see `futex_key_tgid`).
+            let owner = with_irqs_disabled(|| THREAD_PID_MAP.lock().get(tid).copied());
+            if owner == Some(*sib_pid) {
+                with_irqs_disabled(|| {
+                    THREAD_PID_MAP.lock().remove(tid);
+                });
+            }
+            // The wake stays unconditional. Already marked terminated in phase 1 (or
+            // self-terminated at the boundary under smp-shared); wake in case it is
+            // still parked. Waking the slot's new occupant instead is harmless — every
+            // park loop in the kernel already re-checks its condition and re-parks on a
+            // spurious wake — whereas *not* waking a genuinely parked terminated sibling
+            // leaves it queued forever. Only the map eviction above needs the guard.
             crate::threading::get_waker_for_thread(*tid).wake();
         }
     }
@@ -1270,6 +1396,41 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
     if !siblings.is_empty() {
         log::debug!("[Process] Killed {} sibling thread(s) for PID {}",
             siblings.len(), my_pid);
+    }
+}
+
+/// Debug: name every ACTIVE, un-exited process that has no live thread.
+///
+/// Such a process is unschedulable by construction: nothing can run in it, so it
+/// can never reach `exit_group`, never publishes an exit code, is never reaped,
+/// and its parent's `wait4` blocks forever. It is the terminal state of the
+/// "stale thread slot" class (`docs/archive/STALE_THREAD_SLOT_KILL.md`) and it
+/// leaves *no* trace in the futex tables — the waiter that is really stuck is in
+/// the parent, correctly queued, waiting on a process that cannot move.
+///
+/// Ownership is resolved through `THREAD_PID_MAP` ([`table::thread_for_pid`]),
+/// never `p.thread_id`: a dead process keeps its recorded slot number, so the
+/// recorded field would report a thread that belongs to somebody else now.
+/// Printed next to `[THR-DUMP]`; silent when the system is healthy.
+pub fn dump_orphan_processes() {
+    // Snapshot under the table lock, then resolve the map outside it: every other
+    // nested taker of both goes table -> map, and this keeps it that way.
+    let mut candidates: Vec<(Pid, Pid, Option<usize>, bool)> = Vec::new();
+    table::for_each_process(|p| {
+        candidates.push((p.pid, p.tgid, p.thread_id, p.exited));
+    });
+    for (pid, tgid, thread_id, exited) in candidates {
+        if exited || table::thread_for_pid(pid).is_some() {
+            continue;
+        }
+        let mut buf = [0u8; 160];
+        let mut pos = 0;
+        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+            format_args!(
+                "[PROC-ORPHAN] pid={} tgid={} no live thread; recorded thread_id={:?} \
+                 now owned by pid={:?}\n",
+                pid, tgid, thread_id, thread_id.and_then(table::pid_for_thread)));
+        if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
     }
 }
 
@@ -3197,3 +3358,76 @@ pub extern "C" fn entry_point_trampoline() -> ! {
 
 
 
+
+#[cfg(test)]
+mod grace_kill_tests {
+    //! Regression tests for the grace-expired hard kill in [`kill_thread_group`].
+    //!
+    //! The bug: when the 2 s grace expired, PHASE 1 terminated *every* recorded
+    //! sibling tid unconditionally. Two thirds of those were not stragglers at all,
+    //! and any whose slot had been recycled during the window killed an unrelated
+    //! process's thread — leaving that process registered with no thread, so it could
+    //! never exit and its parent's `wait4` never returned. Reproduced in-VM as
+    //! `[TERM] ... pending_kill=false at=process/mod.rs` followed by a permanent
+    //! `[PROC-ORPHAN]` in cargo's thread group.
+    //!
+    //! Both halves matter: the naive fix (never force anything) would reinstate the
+    //! hang the grace path exists to break, so a real straggler on its own slot must
+    //! still be terminated.
+    use super::*;
+    use crate::process::table::THREAD_PID_MAP;
+    use crate::threading::{request_thread_kill, take_kill_request_via_tid};
+
+    /// Slots well clear of the low ids the other host tests drive, so parallel
+    /// `cargo test` execution can't have two tests arming the same flag.
+    const OWN_TID: usize = 121;
+    const STOLEN_TID: usize = 122;
+    const QUIET_TID: usize = 123;
+
+    fn map_insert(tid: usize, pid: Pid) {
+        with_irqs_disabled(|| { THREAD_PID_MAP.lock().insert(tid, pid); });
+    }
+    fn map_remove(tid: usize) {
+        with_irqs_disabled(|| { THREAD_PID_MAP.lock().remove(&tid); });
+    }
+
+    #[test]
+    fn grace_kill_forces_a_real_straggler_but_spares_recycled_and_quiet_slots() {
+        let sib_pid: Pid = 63_200;
+        let unrelated_pid: Pid = 63_201;
+
+        // 1. A genuine straggler: request still pending, slot still ours.
+        map_insert(OWN_TID, sib_pid);
+        request_thread_kill(OWN_TID);
+
+        // 2. Recycled: the request is still armed on the slot, but THREAD_PID_MAP
+        //    proves the slot now belongs to an unrelated process. This is the shape
+        //    that killed an innocent thread and stranded its process.
+        map_insert(STOLEN_TID, unrelated_pid);
+        request_thread_kill(STOLEN_TID);
+
+        // 3. Not a straggler: still ours, but the request was already consumed.
+        map_insert(QUIET_TID, sib_pid);
+
+        let forced = grace_kill_should_terminate(sib_pid, OWN_TID);
+        let spared_recycled = !grace_kill_should_terminate(sib_pid, STOLEN_TID);
+        let spared_quiet = !grace_kill_should_terminate(sib_pid, QUIET_TID);
+
+        // Cleanup before asserting, so a failure doesn't poison sibling tests.
+        take_kill_request_via_tid(OWN_TID);
+        take_kill_request_via_tid(STOLEN_TID);
+        map_remove(OWN_TID);
+        map_remove(STOLEN_TID);
+        map_remove(QUIET_TID);
+
+        assert!(forced,
+            "a straggler that still owns its slot must be hard-terminated — without \
+             this the grace path cannot break the hang it exists for");
+        assert!(spared_recycled,
+            "a slot recycled to an unrelated process must NOT be terminated: that kills \
+             its thread and strands the process with no thread at all");
+        assert!(spared_quiet,
+            "a sibling with no pending kill request is not a straggler and must be left \
+             to self-terminate at its own boundary");
+    }
+}

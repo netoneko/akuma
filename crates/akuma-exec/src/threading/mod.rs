@@ -1009,9 +1009,36 @@ static TERMINATION_TIME: [AtomicU64; MAX_THREADS] = {
 /// [`mark_thread_terminated`].
 static CROSS_KILLS: AtomicUsize = AtomicUsize::new(0);
 
+/// Rate-limits the `[TERM]` site tracer in [`mark_thread_terminated`].
+static TERM_TRACES: AtomicUsize = AtomicUsize::new(0);
+
 /// Mark a thread as terminated (lock-free)
+///
+/// `#[track_caller]` so the tracer below can name the *site* that killed a slot.
+/// There are a dozen call sites across teardown, signals, spawn failure and the
+/// trampoline, and "which one ran" is the first question every "process survives
+/// with no thread" hang asks. Propagated through [`mark_current_terminated`].
+#[track_caller]
 pub fn mark_thread_terminated(idx: usize) {
     if idx != IDLE_THREAD_IDX && idx < MAX_THREADS {
+        // Attribute EVERY termination to its site, not just cross-thread ones.
+        // The `[kill]` tracer below fires only when `killer != idx`, which under
+        // `kernel_smp_shared` misses the whole deferred-kill path: PHASE 1 posts
+        // `request_thread_kill` and the victim self-marks at its EL1→EL0 boundary,
+        // so `killer == idx` and a thread killed from outside dies with no trace
+        // at all. That blind spot is why a "zero `[kill]` lines" reading cannot be
+        // used to rule out an external kill (docs/runbooks/debug-futex-lost-wakeup.md §4).
+        // Owner comes from THREAD_PID_MAP, never the `p.thread_id` table scan.
+        if TERM_TRACES.fetch_add(1, Ordering::Relaxed) < 4096 {
+            let loc = core::panic::Location::caller();
+            let killer = get_current_thread_register();
+            safe_print!(224,
+                "[TERM] tid={} pid={:?} by_tid={} state={} pending_kill={} at={}:{}\n",
+                idx, crate::process::table::pid_for_thread(idx), killer,
+                THREAD_STATES[idx].load(Ordering::SeqCst),
+                PENDING_KILL[idx].load(Ordering::Acquire),
+                loc.file(), loc.line());
+        }
         // Cross-thread kill tracer: whoever terminates a slot that is not its own
         // is killing a thread that may since have been recycled to an unrelated
         // process. Prints the victim's owning pid and its live state so a
@@ -3616,6 +3643,7 @@ pub fn get_thread_stack_info(tid: usize) -> Option<(usize, usize)> {
 }
 
 /// Mark current thread as terminated (thread 0 cannot be terminated) - LOCK-FREE
+#[track_caller]
 pub fn mark_current_terminated() {
     let idx = get_current_thread_register();
     if idx != IDLE_THREAD_IDX {
@@ -4180,6 +4208,9 @@ pub fn dump_thread_resume_points() {
             "  tid={} st={} pid={} tgid={} l0={:#x} sc={} tsc={} a0={:#x} a1={:#x} elr={:#x}\n",
             tid, stc, pid, tg, l0, sc as i64, tsc, a0, a1, elr);
     }
+    // The inverse view: processes with no thread at all. A hang shows up here and
+    // nowhere else — such a process is absent from the loop above by definition.
+    crate::process::dump_orphan_processes();
 }
 
 /// Debug: saved kernel resume point of a context-switched-out thread, as

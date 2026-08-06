@@ -499,3 +499,20 @@ pub fn unregister_thread_pid(tid: usize) {
 pub fn pid_for_thread(tid: usize) -> Option<Pid> {
     with_irqs_disabled(|| THREAD_PID_MAP.lock().get(&tid).copied())
 }
+
+/// The live thread slot owned by `pid`, or `None` if `pid` has no live thread.
+///
+/// The authoritative inverse of [`pid_for_thread`], and the reason it exists is
+/// the same: `Process::thread_id` is a *recorded* slot number that teardown
+/// paths deliberately leave set, so a process that lost its thread still names a
+/// slot — one that may since have been recycled to an unrelated process. Every
+/// path that acts *on* a slot (terminate it, post a deferred kill to it, drop its
+/// map entry) must resolve through here, or it acts on whoever holds the slot now.
+pub fn thread_for_pid(pid: Pid) -> Option<usize> {
+    with_irqs_disabled(|| {
+        THREAD_PID_MAP
+            .lock()
+            .iter()
+            .find_map(|(tid, owner)| (*owner == pid).then_some(*tid))
+    })
+}

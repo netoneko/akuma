@@ -132,9 +132,49 @@ is the tracer for that (rate-limited to 32 per boot, in
 3=TERMINATED, 4=INITIALIZING, 5=WAITING. A killer of `tid=0`/`tid=4` with
 `pid=0` is a kernel thread, i.e. the spawn/cleanup path, not a peer.
 
-Cross-check `ps` against `[THR-DUMP]`: a process that appears in `ps` with no
-matching `tid=` line has **no live thread** — see
-[`../archive/STALE_THREAD_SLOT_KILL.md`](../archive/STALE_THREAD_SLOT_KILL.md).
+> **`[kill]` lines cannot rule anything out under `smp-shared`.** That tracer fires
+> only when `killer != idx`, and the whole deferred-kill path has the victim
+> **self**-mark at its EL1→EL0 boundary — so `killer == idx` and a thread killed from
+> outside leaves no `[kill]` line at all. §4a below used "zero `[kill]` lines in the
+> entire boot" as positive evidence that nothing had been killed; that inference is
+> invalid, and it cost a session.
+>
+> Use **`[TERM]`** instead, which attributes *every* termination to its call site
+> (`#[track_caller]` on `mark_thread_terminated`) and resolves the owner through
+> `THREAD_PID_MAP`:
+>
+> ```
+> [TERM] tid=23 pid=Some(92) by_tid=17 state=5 pending_kill=false at=…/process/mod.rs:1225
+> ```
+>
+> `by_tid` ≠ subject means cross-thread; `state=5` is WAITING (the victim was parked);
+> `pending_kill=false` at a `kill_thread_group` site means it was killed as a
+> "straggler" without being one. See
+> [`../archive/GRACE_EXPIRED_HARD_KILL_ORPHANS.md`](../archive/GRACE_EXPIRED_HARD_KILL_ORPHANS.md).
+
+You no longer have to cross-check `ps` against `[THR-DUMP]` by hand for this.
+**`[PROC-ORPHAN]`** is printed next to `[THR-DUMP]` and names every ACTIVE, un-exited
+process with no live thread in `THREAD_PID_MAP` — silent on a healthy system:
+
+```
+[PROC-ORPHAN] pid=92 tgid=14 no live thread; recorded thread_id=Some(23) now owned by pid=Some(103)
+```
+
+Such a process is unschedulable by construction: it can never reach `exit_group`, is
+never reaped, and its parent's `wait4` blocks forever. **The parent is what looks
+stuck, and it looks stuck in a futex** — which is why this class keeps being
+mis-filed as a lost wakeup. If the same pid repeats across dumps, stop reading this
+runbook: the futex layer is fine.
+
+Then get the killer from the `[TERM]` line for that process's `recorded thread_id`.
+See [`../archive/STALE_THREAD_SLOT_KILL.md`](../archive/STALE_THREAD_SLOT_KILL.md)
+and [`../archive/GRACE_EXPIRED_HARD_KILL_ORPHANS.md`](../archive/GRACE_EXPIRED_HARD_KILL_ORPHANS.md).
+
+Do **not** trust `[THR-DUMP]`'s own `pid=` column when attributing a slot: it resolves
+via `find_pid_by_thread`, the same `p.thread_id` table scan the trampoline bug was
+about, so a stale process at a lower slot index wins the attribution. The futex tables
+*are* trustworthy — their `tgid` is recorded at enqueue time via `read_current_pid`,
+which goes through `THREAD_PID_MAP`.
 
 Also check for a fault in a freshly cloned thread:
 
