@@ -668,20 +668,109 @@ reports `[FPCACHE] entries=0 hits=0 misses=0 evict=0 inval=0` in every PSTATS
 block. The cache never held a page, so it cannot be the carrier. Do not spend
 another session there.
 
-**The victims share an address space, in groups.** 1521 faults resolve to
-exactly **two** `(live ttbr0, slot PA)` pairs — `0x3f000082642000`/`0x828283b8`
-(1195 faults) and `0x3d000081fcf000`/`0x8232b3b8` (326) — with `N` monotone
-*within* each pair. `l0=0x82642000` belongs to pid 44 in the `[THR-DUMP]`
-blocks. So each group is a set of processes running over one long-lived
-address space's ld-musl data page, one `+= base` per victim.
+**The faults fall into exactly two groups, one per parent.** 3035 faults in
+`relr_probe_run1.log` resolve to two `(live ttbr0, slot PA)` pairs —
+`0x3f000082642000`/`0x828283b8` and `0x3d000081fcf000`/`0x8232b3b8` — with `N`
+monotone *within* each pair. Re-parsing the same log against the `[IA-MISS]`
+lines shows the grouping is by **parent pid**, cleanly and with no exceptions:
 
-**Sharpest open lead.** `/bin/busybox` *and* `/bin/busybox.static` are both
-**static PIEs with no `PT_INTERP`** (`llvm-readobj --program-headers`; entries
-`0x44E4` and `0x4524`), loaded at `0x10000000` — the log's
-`[IA-DP] file region: fault_va=0x10004524 seg_va=0x10000000 filesz=0x109ad0`
-confirms it. A process the kernel names `/bin/busybox.static` should therefore
-have **nothing whatsoever mapped at `0x30000000`**, yet it faults executing
-ld-musl at `0x300c03b8`. Explain that and the class falls.
+| ppid | live ttbr0 | slot PA | `SP_EL0` | faults |
+|---|---|---|---|---|
+| 43 | `0x3f000082642000` | `0x828283b8` | `0x203fffe1f0` | 2335 |
+| 39 | `0x3d000081fcf000` | `0x8232b3b8` | `0x203fffeab0` | 691 |
+
+`SP_EL0` is **constant per parent** and *does not* vary with the child's argv
+(the hammer alternates `busybox true` / `date` / `echo x`, which have different
+initial stack pointers). That is the single most diagnostic number in the whole
+class — see §2h.
+
+**Falsified: `/bin/busybox.static` is not a static PIE on this disk.** The
+earlier "sharpest lead" — that a process the kernel names `/bin/busybox.static`
+cannot have anything mapped at `0x30000000` — rested on `llvm-readobj` run
+against the wrong copy. In the running system, `[mprotect] pid=43 owner=43
+addr=0x300bf000 len=0x1000 prot=0x1` is ld-musl's RELRO being write-protected,
+and pid 43 also mmaps the whole `0x30100000+` loader arena. Pid 43 is
+dynamically linked. `do_execve` *does* keep `proc.name` current
+(`src/syscall/proc.rs:842`), and a fork child inherits `parent.name`, so the
+name on the fault line is the **parent's binary**, not evidence about the
+victim's own image. Do not re-derive this lead.
+
+## 2h. ROOT CAUSE (2026-08-06): fork launched the child at its parent's ELF entry point
+
+`get_saved_user_context` (`crates/akuma-exec/src/threading/mod.rs`) had two
+branches. The good one reads the live EL0 trap frame. The fallback, taken
+whenever `CURRENT_TRAP_FRAME[tid]` is 0, returned the slot's published
+`user_entry` / `user_sp` / `user_tls` triple with every GPR zeroed. All three
+child-creation paths — `fork_process`, `vfork_process`, `clone_thread` — call
+it and use whatever it returns as the child's starting context.
+
+That triple is **not a stale fork return**. `update_thread_context` writes it
+once, at execve, and never again: it records where the *image was first
+entered*. For a dynamically linked parent that address is **ld-musl's
+`_dlstart`**. So the fallback launches a brand-new process at its parent's
+loader entry, on its parent's initial stack, and `_dlstart` re-runs musl's RELR
+apply loop — `*slot += base`, an implicit-addend form — over an address space
+whose interpreter data page the parent relocated long ago. One `+= base` per
+birth on one physical word, then an indirect branch through it.
+
+Every element of the fingerprint is emitted verbatim by that one branch:
+
+| observed | produced by |
+|---|---|
+| PC in ld-musl, `N × INTERP_BASE + 0x6c964` | `pc = ctx.user_entry` (parent's dynamic-binary entry) |
+| `SP_EL0` constant *per parent*, argv-independent | `sp = ctx.user_sp` (parent's initial exec SP) |
+| `x19 = x20 = x29 = x30 = 0`, `x30 = 0` ⇒ tail branch | the fallback zeroes all 31 GPRs |
+| victim owns its own address space (`as_owner == pid`) | `fork_process` overrides `child_ctx.ttbr0` with the child's own |
+| victim never appears in an `execve` log line | it dies in `_dlstart`, before reaching its exec |
+| `N` advances per **fault**, not per exec | only a birth that takes the fallback runs the loop |
+
+**Fixed:** the fallback is gone. `get_saved_user_context` now returns `None`
+when there is no live trap frame, so the fork/vfork/clone syscall fails
+(`ENOMEM`, with `[syscall] clone: fork failed: No saved context`) instead of
+launching a process at its loader entry. Regress with the host test
+`threading::state_transition_guard_tests::a_thread_with_no_trap_frame_never_yields_a_child_context`
+— confirmed two-sided (fails on the pre-fix arm with the `_dlstart` message,
+passes after).
+
+### Why the earlier `init_thread_slot_context` fix did not close it
+
+The 2026-08-06 `c89daca` work found the same fallback and hardened it two ways:
+reset the triple when a slot is recycled, and require `user_entry != 0`. Both
+are correct and both were aimed at a *recycled slot* — a dead occupant's
+context leaking into a new one. That is a real but rarer instance. The one that
+was firing reads the **parent's own live slot**, whose `user_entry` is
+legitimately non-zero and legitimately ld-musl's `_dlstart`. Neither guard
+applies. This is why "reachability from the faulting path is unproven" was the
+right call at the time and still missed it: the reachable path does not need a
+recycled slot at all.
+
+### Still open after 2h — two questions, both now instrumented
+
+1. **Why is the trap frame missing?** `set_current_trap_frame` runs on every
+   SVC before dispatch (`src/exceptions.rs`), and there is only one production
+   `handle_syscall` call site, so a fork syscall should always find its frame.
+   Something clears or bypasses it. The fix prints
+   `[NO-TRAPFRAME] refusing child of tid=… (cur=…) — no live EL0 frame; stale
+   user_entry=… user_sp=… is_user=… count=N` for the first 8 occurrences and
+   then at powers of two (unbounded printing under a fork storm wedges the box
+   by itself — see §"Verification is currently blocked by the wedge"). If
+   `tid != cur`, the answer is a `current_thread_id()` mismatch between publish
+   and read; if they match, hunt the clear. `no_trap_frame_child_count()`
+   exposes the running total.
+2. **Why does the slot *accumulate* rather than sit at `N = 2`?** The child's
+   interpreter range *is* CoW-shared and demoted read-only at fork
+   (`cow_share_and_demote_range`, `interp_base = 0x30000000`,
+   `interp_scan_size = 2 MB` — the slot at `0x300c03b8` is covered). A correct
+   CoW copy would give every victim the parent's value plus one base, i.e.
+   `N = 2` forever. Monotone `N` on a *constant* PA means the write is landing
+   on a frame that is genuinely shared with the long-lived parent, so some path
+   promotes a CoW page to writable without copying. Suspect the refcount
+   accounting around `cow_ref_inc` (inserts `count = 2` on first share) and the
+   write-fault handler's `refcount == 1 ⇒ promote in place` arm. **This is
+   inference from the log, not a read of a confirmed defect** — and with 2h
+   fixed nothing re-runs `_dlstart`, so it no longer produces this crash. It
+   would still corrupt a parent's libc data from any forked child, so it is
+   worth its own session.
 
 ### Two readings that look decisive and are not
 
@@ -714,7 +803,7 @@ Beware also that a per-`execve` probe is not free: an early attempt scanned 256
 pages × 512 words inside `do_execve`'s `with_process_exclusive` window and
 wedged the box in ~130 s under `-j4` all by itself.
 
-### Fixed alongside, but NOT established as this bug's cause
+### Fixed alongside — the right function, the wrong instance (superseded by §2h)
 
 `init_thread_slot_context` (`crates/akuma-exec/src/threading/mod.rs`) set
 `is_user_process = 1` on a recycled slot while leaving the previous occupant's
@@ -730,10 +819,11 @@ Regress with the host test
 `threading::state_transition_guard_tests::a_recycled_slot_does_not_inherit_the_previous_occupants_user_entry`
 — confirmed two-sided (fails on the pre-fix arm, passes after).
 
-**This is a real latent defect, not a demonstrated root cause.** All three
-callers pass `current_thread_id()`, and the SVC prologue publishes a trap
-frame, so a clone syscall normally takes the *trap-frame* branch and never
-reaches the fallback. Reachability from the faulting path is unproven.
+**This is a real latent defect, and it is the same function as the root cause —
+but a different instance.** The reachable path (§2h) reads the *parent's own
+live slot*, where `user_entry` is non-zero and the slot was never recycled, so
+neither guard above fires. Keep both; they close the recycled-slot variant. The
+fallback itself is now gone, which subsumes them.
 
 ### Ruled out 2026-08-05 — do not re-derive these
 
@@ -869,6 +959,15 @@ is not where you want a hot-path invariant to live.
 > theorised about memory aliasing from register dumps, and five minutes of
 > `objdump` on the faulting PC — §1, which the runbook already told you to do
 > first — named the exact musl function and line. Symbolize before you theorise.
+>
+> **Correction, 2026-08-06 (§2h).** T1 does *not* explain the `N × INTERP_BASE`
+> class. Those victims own the address space they fault in — `as_owner == pid`
+> for 3034 of 3035 faults, and `as_owner` resolves the live TTBR0 to its
+> **non-shared** owner, so a vfork/CLONE_VM child would have named its parent
+> instead. The constant L0 and ASID that looked like "one long-lived foreign
+> address space" are a serial fork/exit loop getting the same frame and the same
+> ASID slot back each iteration. Keep T1 for the `AS MISMATCH` class (§2f); do
+> not carry it into this one.
 
 Ordered by how much of the evidence each one explains, not by how easy it is to
 test.
@@ -1019,6 +1118,10 @@ Regression probes for the neighbourhood (all should stay green):
 
 ## Background
 
+- [`../archive/RELR_FORK_PARENT_ENTRY_POINT.md`](../archive/RELR_FORK_PARENT_ENTRY_POINT.md)
+  — the full 2026-08-06 record behind §2h: the three readings that were wrong
+  and why, the `SP_EL0` argument that settled it, the per-parent fault table,
+  and the two questions still open.
 - [`../archive/CLONE_TIDFLAGS_THREAD_LIST_LOCK.md`](../archive/CLONE_TIDFLAGS_THREAD_LIST_LOCK.md)
   — the full 2026-08-06 investigation record behind §2e and §2f: disassembly,
   mechanism, before/after probe tables, the two instrumentation flags that had

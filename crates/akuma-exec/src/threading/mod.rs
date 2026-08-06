@@ -4197,6 +4197,38 @@ pub fn get_saved_kernel_resume(thread_id: usize) -> Option<(u64, u64, u64)> {
     })
 }
 
+/// Count of `get_saved_user_context` calls that found no live EL0 trap frame.
+/// Every one of them used to launch a child at its parent's *initial exec* entry
+/// point; see the function docs.
+static NO_TRAP_FRAME_CHILDREN: AtomicU64 = AtomicU64::new(0);
+
+/// How many `get_saved_user_context` calls found no live EL0 trap frame this boot.
+/// Non-zero means fork/vfork/clone syscalls are being refused — read the
+/// `[NO-TRAPFRAME]` lines for the caller.
+pub fn no_trap_frame_child_count() -> u64 {
+    NO_TRAP_FRAME_CHILDREN.load(Ordering::Relaxed)
+}
+
+/// The user-mode context to give a **new child** of `thread_id` (fork/vfork/clone).
+///
+/// Only the live EL0 trap frame can answer this. It is the register state at the
+/// `svc` that asked for the child, so the child resumes exactly where its parent
+/// did, one instruction on.
+///
+/// **There is deliberately no fallback.** The slot also carries a `user_entry` /
+/// `user_sp` / `user_tls` triple, and reading *that* looks like a graceful
+/// degradation — it is not. Those fields record where the thread's image was
+/// *first entered*, written once by [`update_thread_context`] at execve and never
+/// again. Handing them to a child does not produce a slightly-stale fork return;
+/// it produces a process that starts over at its parent's ELF entry point, on its
+/// parent's initial stack, with every GPR zeroed. For a dynamically linked parent
+/// that entry point is **ld-musl's `_dlstart`**, so the child re-runs musl's RELR
+/// apply loop (`*slot += base`) over an address space whose interpreter data page
+/// the parent already relocated. Each such birth adds one more `base` to the same
+/// physical word and then branches through it: the `N × INTERP_BASE + 0x6c964`
+/// instruction-abort class, `N` climbing by one per event for the whole boot
+/// (`docs/runbooks/debug-thread-spawn-segv.md`, class 2). Returning `None` fails
+/// the syscall instead, which is loud, local, and recoverable.
 pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserContext> {
     if thread_id >= MAX_THREADS {
         return None;
@@ -4232,38 +4264,24 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserCo
         }
     }
 
-    // Fallback to saved context fields (less accurate, no GP registers)
-    with_irqs_disabled(|| {
+    // No live trap frame. There is no correct child context to build — see the
+    // function docs for why the `user_entry`/`user_sp` triple is not one. Report
+    // the stale values that *would* have been returned so the caller is
+    // identifiable from a single log line, then fail the syscall.
+    let (stale_entry, stale_sp, is_user) = with_irqs_disabled(|| {
         let ctx = unsafe { &*get_context(thread_id) };
-        
-        // `is_user_process` alone is not enough: `init_thread_slot_context` sets it
-        // for every process thread at spawn, before the thread has ever published a
-        // user context. Requiring a non-zero `user_entry` means a caller building a
-        // child from this thread (fork/vfork/clone) gets a clean `None` — and fails
-        // the syscall — instead of a context pointing at whatever the slot's previous
-        // occupant was running.
-        if ctx.is_user_process != 0 && ctx.user_entry != 0 {
-            if config().syscall_debug_info_enabled {
-                safe_print!(128, "[threading] get_saved_user_context: fallback for thread {} (entry={:#x})\n", thread_id, ctx.user_entry);
-            }
-            Some(crate::process::UserContext {
-                pc: ctx.user_entry,
-                sp: ctx.user_sp,
-                tpidr: ctx.user_tls,
-                spsr: 0,
-                ttbr0: if ctx.ttbr0 != 0 { ctx.ttbr0 } else { crate::mmu::get_boot_ttbr0() },
-                x0: 0, x1: 0, x2: 0, x3: 0, x4: 0, x5: 0, x6: 0, x7: 0,
-                x8: 0, x9: 0, x10: 0, x11: 0, x12: 0, x13: 0, x14: 0, x15: 0,
-                x16: 0, x17: 0, x18: 0, x19: 0, x20: 0, x21: 0, x22: 0, x23: 0,
-                x24: 0, x25: 0, x26: 0, x27: 0, x28: 0, x29: 0, x30: 0,
-            })
-        } else {
-            if config().syscall_debug_info_enabled {
-                safe_print!(128, "[threading] get_saved_user_context: thread {} is NOT a user process\n", thread_id);
-            }
-            None
-        }
-    })
+        (ctx.user_entry, ctx.user_sp, ctx.is_user_process)
+    });
+    let n = NO_TRAP_FRAME_CHILDREN.fetch_add(1, Ordering::Relaxed);
+    // Unbounded printing would itself wedge the box under a fork storm; the first
+    // few plus a decade-spaced tail is enough to establish rate and identity.
+    if n < 8 || n.is_power_of_two() {
+        safe_print!(192,
+            "[NO-TRAPFRAME] refusing child of tid={} (cur={}) — no live EL0 frame; \
+             stale user_entry={:#x} user_sp={:#x} is_user={} count={}\n",
+            thread_id, current_thread_id(), stale_entry, stale_sp, is_user, n + 1);
+    }
+    None
 }
 
 // ============================================================================
@@ -4789,43 +4807,55 @@ mod state_transition_guard_tests {
         WOKEN_STATES[tid].store(false, Ordering::SeqCst);
     }
 
-    /// A recycled slot must not report the previous occupant's user-mode context.
+    /// A thread with no live EL0 trap frame must not yield a child context — not
+    /// even its own, still-current `user_entry` / `user_sp`.
     ///
     /// This is the `N × INTERP_BASE + 0x6c964` instruction-abort class in miniature
-    /// (`docs/runbooks/debug-thread-spawn-segv.md`, class 2). Occupant A is a
-    /// dynamically linked process, so the entry point it publishes is ld-musl's
-    /// `_dlstart`. If the slot's next occupant can still be asked for that context,
-    /// a fork/vfork/clone off the new thread launches its child straight into
-    /// ld-musl's RELR apply loop over the *old* address space — one `+= base` per
-    /// birth on one physical word.
+    /// (`docs/runbooks/debug-thread-spawn-segv.md`, class 2). The published triple
+    /// records where the *image was first entered*, which for a dynamically linked
+    /// process is ld-musl's `_dlstart` — a perfectly valid-looking address that is
+    /// nonetheless never a correct fork return. A child launched there re-runs
+    /// musl's RELR `*slot += base` loop over an already-relocated interpreter data
+    /// page: one `+= base` per birth on one physical word, `N` climbing for the
+    /// whole boot.
+    ///
+    /// Both halves are load-bearing:
+    /// - a *live* thread (the fork's parent, still owning its slot) must refuse, and
+    /// - a *recycled* slot must refuse, since the triple would then be a dead
+    ///   process's.
     #[test]
-    fn a_recycled_slot_does_not_inherit_the_previous_occupants_user_entry() {
+    fn a_thread_with_no_trap_frame_never_yields_a_child_context() {
         crate::test_support::ensure_test_runtime();
         let tid = 40;
         const LDMUSL_DLSTART: u64 = 0x3006_9de8;
 
-        // Occupant A published a user context and then exited.
+        // A live, dynamically linked process thread: `update_thread_context` published
+        // this triple at its execve and nothing has overwritten it since. This is the
+        // parent of a fork — not a recycled slot.
         unsafe {
             let ctx = &mut *get_context_mut(tid);
             ctx.is_user_process = 1;
             ctx.user_entry = LDMUSL_DLSTART;
-            ctx.user_sp = 0x203f_fffe_1f0;
+            ctx.user_sp = 0x20_3fff_e1f0; // the real per-parent constant from relr_probe_run1.log
             ctx.user_tls = 0x3272_a918;
         }
-        assert_eq!(
-            get_saved_user_context(tid).map(|c| c.pc),
-            Some(LDMUSL_DLSTART),
-            "precondition: while A owns the slot its context is readable",
+        assert!(
+            CURRENT_TRAP_FRAME[tid].load(Ordering::Acquire) == 0,
+            "precondition: this slot has no live EL0 trap frame",
         );
-
-        // The slot is recycled for a brand-new process thread.
-        init_thread_slot_context(tid, 0x8000, 0xbeef_0000, 0, 0, 1, true);
-
         assert!(
             get_saved_user_context(tid).is_none(),
-            "a freshly recycled slot still reported a user context — a child forked \
-             from this thread would start at the previous occupant's entry point \
-             ({LDMUSL_DLSTART:#x}) with its stack pointer",
+            "a live thread with no trap frame handed out its *initial exec* context — \
+             a child forked from it would start at {LDMUSL_DLSTART:#x} (ld-musl's \
+             _dlstart) on the parent's initial stack with every GPR zeroed",
+        );
+
+        // Same answer once the slot is recycled, where the triple is a dead
+        // process's rather than merely the wrong one.
+        init_thread_slot_context(tid, 0x8000, 0xbeef_0000, 0, 0, 1, true);
+        assert!(
+            get_saved_user_context(tid).is_none(),
+            "a freshly recycled slot still reported a user context",
         );
 
         unsafe {
