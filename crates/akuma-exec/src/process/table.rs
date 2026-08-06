@@ -484,3 +484,18 @@ pub fn unregister_thread_pid(tid: usize) {
         THREAD_PID_MAP.lock().remove(&tid);
     });
 }
+
+/// The pid that currently owns thread slot `tid`, or `None` if nobody claims it.
+///
+/// This is the **authoritative** tid→pid mapping. `fork_process`,
+/// `vfork_process` and `clone_thread` all publish it before the child can be
+/// scheduled, `current_process_shared` already trusts it, and
+/// `unregister_process` uses it to decide whether a slot has been recycled out
+/// from under a dying process. Prefer it over scanning the process table for
+/// `p.thread_id == Some(tid)`: `thread_id` is a *recorded* slot number that
+/// several teardown paths deliberately leave set, so the scan can match a
+/// stale process and — because `find_process` returns the first ACTIVE slot —
+/// a stale entry at a lower slot index wins.
+pub fn pid_for_thread(tid: usize) -> Option<Pid> {
+    with_irqs_disabled(|| THREAD_PID_MAP.lock().get(&tid).copied())
+}

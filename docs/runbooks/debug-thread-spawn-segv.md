@@ -695,82 +695,124 @@ dynamically linked. `do_execve` *does* keep `proc.name` current
 name on the fault line is the **parent's binary**, not evidence about the
 victim's own image. Do not re-derive this lead.
 
-## 2h. ROOT CAUSE (2026-08-06): fork launched the child at its parent's ELF entry point
+## 2h. ROOT CAUSE (2026-08-06): the trampoline ran the wrong process
 
-`get_saved_user_context` (`crates/akuma-exec/src/threading/mod.rs`) had two
-branches. The good one reads the live EL0 trap frame. The fallback, taken
-whenever `CURRENT_TRAP_FRAME[tid]` is 0, returned the slot's published
-`user_entry` / `user_sp` / `user_tls` triple with every GPR zeroed. All three
-child-creation paths — `fork_process`, `vfork_process`, `clone_thread` — call
-it and use whatever it returns as the child's starting context.
+`entry_point_trampoline` (`crates/akuma-exec/src/process/mod.rs`) resolved a new
+thread's `Process` with a linear scan:
 
-That triple is **not a stale fork return**. `update_thread_context` writes it
-once, at execve, and never again: it records where the *image was first
-entered*. For a dynamically linked parent that address is **ld-musl's
-`_dlstart`**. So the fallback launches a brand-new process at its parent's
-loader entry, on its parent's initial stack, and `_dlstart` re-runs musl's RELR
-apply loop — `*slot += base`, an implicit-addend form — over an address space
-whose interpreter data page the parent relocated long ago. One `+= base` per
-birth on one physical word, then an indirect branch through it.
+```rust
+table::find_process(|p| if p.thread_id == Some(tid) { Some(p.pid) } else { None })
+```
 
-Every element of the fingerprint is emitted verbatim by that one branch:
+Two things make that unsound.
 
-| observed | produced by |
-|---|---|
-| PC in ld-musl, `N × INTERP_BASE + 0x6c964` | `pc = ctx.user_entry` (parent's dynamic-binary entry) |
-| `SP_EL0` constant *per parent*, argv-independent | `sp = ctx.user_sp` (parent's initial exec SP) |
-| `x19 = x20 = x29 = x30 = 0`, `x30 = 0` ⇒ tail branch | the fallback zeroes all 31 GPRs |
-| victim owns its own address space (`as_owner == pid`) | `fork_process` overrides `child_ctx.ttbr0` with the child's own |
-| victim never appears in an `execve` log line | it dies in `_dlstart`, before reaching its exec |
-| `N` advances per **fault**, not per exec | only a birth that takes the fallback runs the loop |
+1. **`thread_id` is a recorded slot number that teardown paths deliberately
+   leave set.** `kill_thread_group` PHASE 2 says so in as many words: clearing
+   it removes the backstop `unregister_process` relies on. So an ACTIVE process
+   can keep naming a slot it no longer owns.
+2. **`find_process` returns the *first ACTIVE slot* that matches.** A stale
+   process at a lower table index therefore wins outright — and keeps winning,
+   for every future occupant of that slot.
 
-**Fixed:** the fallback is gone. `get_saved_user_context` now returns `None`
-when there is no live trap frame, so the fork/vfork/clone syscall fails
-(`ENOMEM`, with `[syscall] clone: fork failed: No saved context`) instead of
-launching a process at its loader entry. Regress with the host test
-`threading::state_transition_guard_tests::a_thread_with_no_trap_frame_never_yields_a_child_context`
-— confirmed two-sided (fails on the pre-fix arm with the `_dlstart` message,
-passes after).
+The thread then runs *that* process. `Process::run` activates **its** address
+space and erets to **its** `Process.context`, which `replace_image` left as
+`UserContext::new(entry_point, sp)` — the image's entry point, with every GPR
+zeroed. When the stale process is dynamically linked that entry point is
+**ld-musl's `_dlstart`**, so the thread re-runs musl's RELR apply loop
+(`*slot += base`, implicit-addend by design) over an interpreter data page that
+address space already relocated. One `+= base` per occurrence on one physical
+word, then the indirect tail branch through it.
 
-### Why the earlier `init_thread_slot_context` fix did not close it
+Because the stale process is long-lived, its ld-musl data page is one fixed
+frame — which is why `N` is a single global counter that only ever climbs.
 
-The 2026-08-06 `c89daca` work found the same fallback and hardened it two ways:
-reset the triple when a slot is recycled, and require `user_entry != 0`. Both
-are correct and both were aimed at a *recycled slot* — a dead occupant's
-context leaking into a new one. That is a real but rarer instance. The one that
-was firing reads the **parent's own live slot**, whose `user_entry` is
-legitimately non-zero and legitimately ld-musl's `_dlstart`. Neither guard
-applies. This is why "reachability from the faulting path is unproven" was the
-right call at the time and still missed it: the reachable path does not need a
-recycled slot at all.
+### The live evidence
 
-### Still open after 2h — two questions, both now instrumented
+Caught by the `[TRAMP-MISMATCH]` tripwire the fix ships with:
 
-1. **Why is the trap frame missing?** `set_current_trap_frame` runs on every
-   SVC before dispatch (`src/exceptions.rs`), and there is only one production
-   `handle_syscall` call site, so a fork syscall should always find its frame.
-   Something clears or bypasses it. The fix prints
-   `[NO-TRAPFRAME] refusing child of tid=… (cur=…) — no live EL0 frame; stale
-   user_entry=… user_sp=… is_user=… count=N` for the first 8 occurrences and
-   then at powers of two (unbounded printing under a fork storm wedges the box
-   by itself — see §"Verification is currently blocked by the wedge"). If
-   `tid != cur`, the answer is a `current_thread_id()` mismatch between publish
-   and read; if they match, hunt the clear. `no_trap_frame_child_count()`
-   exposes the running total.
-2. **Why does the slot *accumulate* rather than sit at `N = 2`?** The child's
-   interpreter range *is* CoW-shared and demoted read-only at fork
-   (`cow_share_and_demote_range`, `interp_base = 0x30000000`,
-   `interp_scan_size = 2 MB` — the slot at `0x300c03b8` is covered). A correct
-   CoW copy would give every victim the parent's value plus one base, i.e.
-   `N = 2` forever. Monotone `N` on a *constant* PA means the write is landing
-   on a frame that is genuinely shared with the long-lived parent, so some path
-   promotes a CoW page to writable without copying. Suspect the refcount
-   accounting around `cow_ref_inc` (inserts `count = 2` on first share) and the
-   write-fault handler's `refcount == 1 ⇒ promote in place` arm. **This is
-   inference from the log, not a read of a confirmed defect** — and with 2h
-   fixed nothing re-runs `_dlstart`, so it no longer produces this crash. It
-   would still corrupt a parent's libc data from any forked child, so it is
-   worth its own session.
+```
+[TRAMP-MISMATCH] tid=21 THREAD_PID_MAP=89  but table scan found 84 — using 89
+[TRAMP-MISMATCH] tid=21 THREAD_PID_MAP=101 but table scan found 84 — using 101
+[TRAMP-MISMATCH] tid=21 THREAD_PID_MAP=104 but table scan found 84 — using 104
+[TRAMP-MISMATCH] tid=26 THREAD_PID_MAP=129 but table scan found 107 — using 129
+```
+
+One stale process (84) captures slot 21 and wins it back for every new occupant.
+
+And from the `[RELR]` forensics on a pre-fix kernel — the `ttbr0_live` /
+`ttbr0_proc` pair that three sessions never managed to capture on a live fault:
+
+```
+[RELR] fault_pid=136 cur_pid=139 ppid=138 tid=26 N=2 off=0x6c964
+[RELR] ttbr0_live=0xaf000092d57000 ttbr0_proc=0xb9000073b5d000
+       *** AS MISMATCH (foreign page tables) *** expected_l0=0x92d57000 switch_ins=1 gen=15
+[RELR] slot va=0x300c03b8 pa=0x942be3b8 val=0x6006c964
+```
+
+Read it line by line — every field names the mechanism:
+
+| field | value | what it says |
+|---|---|---|
+| `ttbr0_live != ttbr0_proc` | — | the thread is in the stale process's tables, not its own |
+| `expected_l0 == ttbr0_live` | `0x92d57000` | `activate()` **chose** that L0; not a hardware switch glitch |
+| `switch_ins=1` | — | the thread has been switched in once: it ran from birth and faulted, so this is the trampoline path |
+| `tid` constant, `gen` climbing | `tid=26`, `gen=15,17,19` | one recycled *slot*, not one parent — the faults group by tid |
+| `slot pa` constant | `0x942be3b8` | one long-lived frame carries the counter |
+| `SP_EL0` constant, argv-independent | — | it is the stale process's initial exec SP, not the new image's |
+
+**Same bug as the `AS MISMATCH` class (§2f).** `ttbr0_live != ttbr0_proc` is
+precisely the signature of `run()` having activated the wrong process's address
+space. They were tracked as two open classes and are one.
+
+### The fix
+
+`resolve_thread_process(tid)` consults **`THREAD_PID_MAP` first** — the
+authoritative mapping, published by `fork_process`, `vfork_process`,
+`clone_thread` and both `spawn` paths before the child can be scheduled, and
+already trusted by `current_process_shared`. The scan stays as a fallback for a
+*missing* entry (which proves nothing); a *disagreeing* entry is logged as
+`[TRAMP-MISMATCH]`. `Process::run` adds a last gate: if `THREAD_PID_MAP` names a
+different pid, it refuses (`[RUN-REFUSED]`) instead of eret'ing into a foreign
+address space.
+
+Regress with `test_trampoline_resolves_via_thread_pid_map` (boot suite). It is
+two-sided by construction: it asserts the raw scan *does* pick the stale
+process, so the trap is real and not a vacuous setup.
+
+### A/B, same disk clone, same workload, same kernel except the fix
+
+| | pre-fix | fixed |
+|---|---|---|
+| `[RELR]` faults | 27 | **0** |
+| `AS MISMATCH` | 71 | **0** |
+| `SIGSEGV` | 105 | **0** |
+| `[TRAMP-MISMATCH]` | n/a | 15 (caught and corrected) |
+| in-guest `-j4` build | crash-looping | progressing |
+
+The 15 mismatches are the point: the race still happens at the same rate, and
+where the old code ran the wrong process the new code does not.
+
+### Also fixed, but NOT this bug's cause
+
+`get_saved_user_context`'s non-trap-frame fallback returned the slot's
+`user_entry` / `user_sp` / `user_tls` triple — a process's *initial exec* state,
+which is never a valid fork return — to `fork_process` / `vfork_process` /
+`clone_thread`. It is removed (`[NO-TRAPFRAME]`, syscall fails with `ENOMEM`).
+
+It produces the same visible fingerprint, which is why it was mistaken for the
+cause mid-session. **It has not fired once in any instrumented run**
+(`[NO-TRAPFRAME]` count 0 across every arm), so treat it as hardening. If you
+ever see that line, it is a *different* defect and worth its own hunt: the
+missing trap frame would itself be the finding.
+
+### Still open
+
+**Why does the slot accumulate rather than sit at `N = 2`?** With the trampoline
+fixed this no longer produces a crash, but the arithmetic is still unexplained
+on its own terms: each victim runs `_dlstart` once against the stale process's
+live page, so `N` climbing globally is consistent — *provided* the write really
+lands on that shared page rather than on a CoW copy. Worth confirming rather
+than assuming.
 
 ### Two readings that look decisive and are not
 
@@ -787,21 +829,44 @@ recycled slot at all.
   never samples the slot page at `+0xc0000`, so it says nothing about whether
   that page's frame is shared. Probe the slot's own page or don't probe.
 
-### Verification is currently blocked by the wedge
+### Verifying a fix here: A/B on the tripwire, not on the symptom
 
-Fault onset tracks the **start of the `-j4` build**, not uptime: in the one run
-that produced faults they began at **T732.96**, immediately after the build
-loop was launched, and ran to T1020 (1518 faults). Three subsequent runs
-launched the build at T40–T90 and **wedged at T64–T132** — 400 % CPU, log
-frozen, `[BKL] stuck: owner=… waiter=…` repeating — i.e. every one of them died
-*before* reaching the window where faults appear. A post-fix run showing zero
-`[RELR]` lines therefore proves nothing unless it survives past T733 with the
-build running. Check `grep -ac '\[RELR\] slot'` **and** the last `[T…]`
-timestamp before believing any A/B here.
+"Zero faults after the fix" is not, by itself, evidence. The `[NO-TRAPFRAME]`
+guard added in the same session recorded **zero** hits across every instrumented
+run — so an arm carrying it would have shown zero faults whether or not that
+guard mattered. A clean arm only means something when you can also show the race
+still fires and is being handled. That is what `[TRAMP-MISMATCH]` is for:
 
-Beware also that a per-`execve` probe is not free: an early attempt scanned 256
-pages × 512 words inside `do_execve`'s `with_process_exclusive` window and
-wedged the box in ~130 s under `-j4` all by itself.
+```
+pre-fix : 27 [RELR], 71 AS MISMATCH, 105 SIGSEGV
+fixed   :  0 [RELR],  0 AS MISMATCH,   0 SIGSEGV, 15 [TRAMP-MISMATCH] caught
+```
+
+Other traps, learned the hard way:
+
+- **A wedged arm proves nothing.** Build the exposure denominator explicitly.
+  In `relr_probe_run1.log` the first fault came after **28** `execve` lines and
+  567 instruction aborts landed in the first 60 s, so `grep -ac 'syscall\] execve'`
+  is the number to quote alongside `grep -ac '\[RELR\]'`.
+- **The in-guest build dies on its own.** Drive it from a supervisor loop that
+  restarts `cargo build -j4` forever; a single invocation stops at the first
+  crash and stops generating load with it.
+- **A `Compiling` line is not liveness** (`debug-futex-lost-wakeup.md` §0), and
+  neither is a responsive `sshd`. Check `[FUTEX-DUMP] queued_for=` — a waiter
+  parked for hundreds of seconds is a wedge no matter how healthy ssh looks.
+
+### The `-j4` build still does not complete — for a different reason
+
+With this class fixed, a `-j4` self-host build runs crash-free (no `SIGSEGV`, no
+`signal: 11`) and then **stalls in `FUTEX_WAIT`**: `[FUTEX-DUMP]` shows waiters
+`queued_for` 800 s+, parked since T≈60, with QEMU idle at ~3 % CPU. The pre-fix
+arm shows the *same* wait, starting at the *same* point, so it predates this fix
+and is independent of it — it was simply invisible behind the crashes.
+
+That is the lost-wakeup class: [`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md).
+The claim in this runbook that fixing the `N × INTERP_BASE` class was "the
+remaining blocker for a green `-j4`" was optimistic; there is another one behind
+it.
 
 ### Fixed alongside — the right function, the wrong instance (superseded by §2h)
 
@@ -960,19 +1025,25 @@ is not where you want a hot-path invariant to live.
 > `objdump` on the faulting PC — §1, which the runbook already told you to do
 > first — named the exact musl function and line. Symbolize before you theorise.
 >
-> **Correction, 2026-08-06 (§2h).** T1 does *not* explain the `N × INTERP_BASE`
-> class. Those victims own the address space they fault in — `as_owner == pid`
-> for 3034 of 3035 faults, and `as_owner` resolves the live TTBR0 to its
-> **non-shared** owner, so a vfork/CLONE_VM child would have named its parent
-> instead. The constant L0 and ASID that looked like "one long-lived foreign
-> address space" are a serial fork/exit loop getting the same frame and the same
-> ASID slot back each iteration. Keep T1 for the `AS MISMATCH` class (§2f); do
-> not carry it into this one.
+> **Resolved, 2026-08-06 (§2h).** T1 was right, and it is the *same* bug as the
+> `N × INTERP_BASE` class — not a separate one. `entry_point_trampoline`
+> resolved its `Process` with a table scan that a stale entry wins, so the
+> thread ran another process's `run()`: activating that address space and
+> eret'ing to that process's entry point. `ttbr0_live != ttbr0_proc` is the
+> signature of exactly that. Both classes go to zero with the same fix.
+>
+> A mid-session detour is worth recording: the *old* `[RELR]` instrumentation
+> printed an `as_owner` field that made the victims look like they owned the
+> address spaces they faulted in, which retired T1 for a while.
+> `address_space_owner_pid_for_fault` falls back to the current pid when the
+> L0 lookup misses, and it was falling back. Do not read a field with a silent
+> fallback as evidence of the thing it falls back from. The `ttbr0_live` /
+> `ttbr0_proc` pair has no fallback — use it.
 
 Ordered by how much of the evidence each one explains, not by how easy it is to
 test.
 
-**T1 — Cross-address-space aliasing (CONFIRMED 2026-08-06 as a real bug — see §2f).** The child dereferences a
+**T1 — Cross-address-space aliasing (CONFIRMED, and ROOT-CAUSED 2026-08-06 — see §2h).** The child dereferences a
 pointer that is *correct*, in an address space that is *wrong*: same VA, different
 physical page, so the packet slot reads back as another rustc's string heap. This
 is the only theory that explains, without coincidence, why two different processes
@@ -1118,10 +1189,11 @@ Regression probes for the neighbourhood (all should stay green):
 
 ## Background
 
-- [`../archive/RELR_FORK_PARENT_ENTRY_POINT.md`](../archive/RELR_FORK_PARENT_ENTRY_POINT.md)
-  — the full 2026-08-06 record behind §2h: the three readings that were wrong
-  and why, the `SP_EL0` argument that settled it, the per-parent fault table,
-  and the two questions still open.
+- [`../archive/TRAMPOLINE_STALE_PROCESS_RELR.md`](../archive/TRAMPOLINE_STALE_PROCESS_RELR.md)
+  — the full 2026-08-06 record behind §2h: the `[TRAMP-MISMATCH]` and
+  `ttbr0_live`/`ttbr0_proc` evidence, the A/B table, the three readings that
+  were wrong (including the `as_owner` silent fallback that cost a session),
+  and why `AS MISMATCH` turned out to be the same bug.
 - [`../archive/CLONE_TIDFLAGS_THREAD_LIST_LOCK.md`](../archive/CLONE_TIDFLAGS_THREAD_LIST_LOCK.md)
   — the full 2026-08-06 investigation record behind §2e and §2f: disassembly,
   mechanism, before/after probe tables, the two instrumentation flags that had

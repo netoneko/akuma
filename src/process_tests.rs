@@ -415,6 +415,7 @@ pub fn run_all_tests() {
     // Process identity collision fixes (zombie thread_id leak)
     test_kill_thread_group_clears_thread_id();
     test_entry_point_trampoline_no_zombie_match();
+    test_trampoline_resolves_via_thread_pid_map();
     test_zombie_process_unregistered_after_return_to_kernel();
     test_trap_frame_cleared_when_thread_slot_recycled();
     test_on_cpu_gate_lifecycle();
@@ -10005,6 +10006,70 @@ fn test_entry_point_trampoline_no_zombie_match() {
         crate::safe_print!(96,
             "[Test] entry_point_trampoline_no_zombie_match FAILED: found_pid={:?} expected={}\n",
             found_pid, child_pid);
+    }
+}
+
+/// The trampoline must resolve its process from `THREAD_PID_MAP`, not from the
+/// `p.thread_id == Some(tid)` table scan.
+///
+/// `test_entry_point_trampoline_no_zombie_match` above covers the case where the
+/// stale process had its `thread_id` cleared. Several teardown paths deliberately do
+/// **not** clear it (`kill_thread_group` PHASE 2 documents why), and
+/// `table::find_process` returns the *first ACTIVE slot* that matches — so a stale
+/// process registered earlier wins the scan outright. A thread that resolves to it
+/// runs it: `Process::run` activates that process's address space and erets to its
+/// `Process.context`, i.e. its image entry point. When the stale process is
+/// dynamically linked that entry point is ld-musl's `_dlstart`, and the thread
+/// re-runs musl's RELR `*slot += base` loop over an already-relocated interpreter
+/// page — the `N × INTERP_BASE + 0x6c964` class
+/// (`docs/runbooks/debug-thread-spawn-segv.md` §2h).
+///
+/// Two-sided by construction: the test asserts the raw scan *does* pick the stale
+/// process, so it is a genuine trap and not a vacuous setup.
+fn test_trampoline_resolves_via_thread_pid_map() {
+    use akuma_exec::process::{
+        register_process, unregister_process, clear_lazy_regions, resolve_thread_process,
+    };
+    use akuma_exec::process::table::THREAD_PID_MAP;
+
+    let stale_pid = 63_200u32;
+    let live_pid = 63_201u32;
+    // >= MAX_THREADS so mark_thread_terminated / slot bookkeeping ignore it.
+    let slot = 121usize;
+
+    // A stale process that still records the slot — registered FIRST, so it occupies
+    // the lower table index and wins `find_process`.
+    let mut stale = make_test_process(stale_pid);
+    stale.thread_id = Some(slot);
+    register_process(stale_pid, stale);
+
+    // The thread's real owner, published in THREAD_PID_MAP the way fork/vfork/clone do.
+    let mut live = make_test_process(live_pid);
+    live.thread_id = Some(slot);
+    register_process(live_pid, live);
+    akuma_exec::runtime::with_irqs_disabled(|| {
+        THREAD_PID_MAP.lock().insert(slot, live_pid);
+    });
+
+    let scan_pid = akuma_exec::process::table::find_process(|p| {
+        if p.thread_id == Some(slot) { Some(p.pid) } else { None }
+    });
+    let resolved = resolve_thread_process(slot);
+
+    akuma_exec::runtime::with_irqs_disabled(|| { THREAD_PID_MAP.lock().remove(&slot); });
+    clear_lazy_regions(stale_pid);
+    clear_lazy_regions(live_pid);
+    let _ = unregister_process(stale_pid);
+    let _ = unregister_process(live_pid);
+
+    let trap_is_real = scan_pid == Some(stale_pid);
+    if trap_is_real && resolved == Some(live_pid) {
+        console::print("[Test] trampoline_resolves_via_thread_pid_map PASSED\n");
+    } else {
+        crate::safe_print!(192,
+            "[Test] trampoline_resolves_via_thread_pid_map FAILED: scan={:?} (want stale {}) \
+             resolved={:?} (want live {})\n",
+            scan_pid, stale_pid, resolved, live_pid);
     }
 }
 

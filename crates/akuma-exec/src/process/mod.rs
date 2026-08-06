@@ -821,7 +821,32 @@ impl Process {
     ///
     /// This function does not return normally - it jumps to user space.
     /// When the process makes a syscall or exception, control returns to kernel.
+    /// Activate this process's address space and eret to its saved context.
+    ///
+    /// Called only from [`entry_point_trampoline`], for a thread's *first* entry to
+    /// EL0.
     pub fn run(&mut self) -> ! {
+        // Last gate before installing an address space and eret'ing into it: this
+        // thread slot must actually belong to this process. `THREAD_PID_MAP` naming a
+        // *different* pid is proof it does not — running anyway would activate a
+        // foreign address space and jump to this process's entry point inside it,
+        // which is the `N × INTERP_BASE + 0x6c964` class (runbook §2h). A missing
+        // entry is not proof of anything (some spawn paths register late), so only a
+        // positive disagreement refuses.
+        let tid = crate::threading::current_thread_id();
+        if let Some(owner) = table::pid_for_thread(tid)
+            && owner != self.pid
+        {
+            let mut buf = [0u8; 128];
+            let mut pos = 0usize;
+            let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                format_args!("[RUN-REFUSED] tid={} belongs to pid={} but pid={} tried to run it\n",
+                    tid, owner, self.pid));
+            if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+            crate::threading::mark_current_terminated();
+            loop { crate::threading::yield_now(); }
+        }
+
         self.state = ProcessState::Running;
 
         // Activate the user address space
@@ -3073,6 +3098,48 @@ pub fn allocate_pid() -> Pid {
 
 /// Trampoline for new process threads
 /// Called by threading::spawn_user_thread
+/// Which process owns thread slot `tid` — `THREAD_PID_MAP` first, table scan second.
+///
+/// The `p.thread_id == Some(tid)` scan is the historical path and is not safe on its
+/// own. `thread_id` is a *recorded* slot number that several teardown paths
+/// deliberately leave set (`kill_thread_group` PHASE 2 says so in as many words), and
+/// [`table::find_process`] returns the **first ACTIVE slot** that matches — so a stale
+/// process at a lower slot index wins. A thread that resolves to that process then
+/// runs it: [`Process::run`] activates *its* address space and erets to *its*
+/// `Process.context`, which `replace_image` left as `UserContext::new(entry, sp)`,
+/// i.e. the image's entry point. For a dynamically linked stale process that entry
+/// point is ld-musl's `_dlstart`, so the thread re-runs musl's RELR `*slot += base`
+/// loop over an interpreter data page that address space already relocated — one
+/// `+= base` per occurrence on one physical word, then an indirect branch through it.
+/// That is the `N × INTERP_BASE + 0x6c964` class, and its live signature is exactly
+/// this disagreement: `ttbr0_live` (the stale process's, because `run()` activated it)
+/// != `ttbr0_proc` (`THREAD_PID_MAP`'s). See
+/// `docs/runbooks/debug-thread-spawn-segv.md` §2h.
+///
+/// `THREAD_PID_MAP` is authoritative: `fork_process`, `vfork_process`, `clone_thread`
+/// and both `spawn` paths publish it before the child can be scheduled, and
+/// `current_process_shared` already trusts it. A *missing* entry is not evidence of
+/// anything, so the scan stays as the fallback; a *disagreeing* entry is, and is
+/// logged.
+pub fn resolve_thread_process(tid: usize) -> Option<Pid> {
+    let map_pid = table::pid_for_thread(tid);
+    let scan_pid = table::find_process(|p| {
+        if p.thread_id == Some(tid) { Some(p.pid) } else { None }
+    });
+    if let (Some(m), Some(s)) = (map_pid, scan_pid)
+        && m != s
+    {
+        let mut buf = [0u8; 128];
+        let mut pos = 0usize;
+        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+            format_args!(
+                "[TRAMP-MISMATCH] tid={} THREAD_PID_MAP={} but table scan found {} — using {}\n",
+                tid, m, s, m));
+        if let Ok(st) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(st); }
+    }
+    map_pid.or(scan_pid)
+}
+
 pub extern "C" fn entry_point_trampoline() -> ! {
     let tid = crate::threading::current_thread_id();
     if lifecycle_trace_on() {
@@ -3082,15 +3149,9 @@ pub extern "C" fn entry_point_trampoline() -> ! {
             format_args!("[FORK-DBG] trampoline ENTRY tid={}\n", tid));
         if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
     }
-    let mut proc_ptr: *mut Process = core::ptr::null_mut();
-
-    if let Some(pid) = table::find_process(|p| {
-        if p.thread_id == Some(tid) { Some(p.pid) } else { None }
-    }) {
-        if let Some(ptr) = table::get_process_ptr(pid) {
-            proc_ptr = ptr;
-        }
-    }
+    let proc_ptr: *mut Process = resolve_thread_process(tid)
+        .and_then(table::get_process_ptr)
+        .unwrap_or(core::ptr::null_mut());
 
     if proc_ptr.is_null() || crate::threading::is_thread_terminated(tid) {
         if proc_ptr.is_null() {
