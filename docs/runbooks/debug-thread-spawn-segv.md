@@ -626,13 +626,9 @@ New constraints from the 2026-08-06 `-j4` run (instrumented kernel, N ran 2→6)
   one unrelated comment), which is fine for private pages (musl/crt applies
   its own, once) — so the remaining question is ONLY: *which physical page do
   the faulting execs share?* One `+= base` per sharing exec on one shared
-  frame produces the observed global N sequence exactly. Prime suspect: a
-  file-page-cache frame reached through a write that should have CoW'd
-  (`is_shareable_mapping` admits RO PTEs; the victims' RELR slots must be
-  written by their own startup code through what should be a private page —
-  same neighbourhood as the FIXED madvise-WILLNEED zero-fill bug). Decide it
-  by logging the slot value + frame PA at exec / at the CoW fault for the
-  slot's page: same PA across two processes = case closed.
+  frame produces the observed global N sequence exactly. The prime suspect
+  recorded here — a file-page-cache frame written through a missing CoW — was
+  **falsified** the same day; see "What the instrumented runs settled" below.
 - **This class is what wedges `-j4` builds — the "live-but-idle rustc" wedge
   is downstream of it, not a scheduler bug.** Live capture 2026-08-06 T1200:
   jobserver `pipe=3 bytes=0 readers=7 writers=7 pollers=7`, seven futex
@@ -641,6 +637,103 @@ New constraints from the 2026-08-06 `-j4` run (instrumented kernel, N ran 2→6)
   with them. The kernel pipe/futex machinery is exonerated by its own
   decision table (`bytes=0, writers>0`). Fixing THIS class is the remaining
   blocker for a green `-j4`.
+
+### What the instrumented runs settled (2026-08-06, later session)
+
+A kernel-side `[RELR]` forensics block now ships in the instruction-abort
+handler (`src/exceptions.rs`, `interp_relr_forensics`). It fires **only** on a
+`FAR` of the shape `N × INTERP_BASE + off` with `N ≥ 2` and `off < 0x100000`,
+then scans the interpreter's own 1 MB VA window in the *live* tables for words
+equal to `FAR` and prints each hit's **VA, PA and value**, plus
+`ttbr0_live` / `ttbr0_proc` / `expected_l0` / `switch_ins` / `gen`. It costs
+nothing on any other abort. Read it before adding instrumentation of your own.
+
+**The slot is identified exactly.** The accumulating word is ld-musl vaddr
+**`0xc03b8`** (runtime VA `0x300c03b8`), link-time value **`0x6c964`** — which
+is the fault offset itself. The faulting frame's `x3 = 0x300c03d8` points into
+the same RELR slot table, three slots along. Decoded straight out of the disk
+image, no VM required:
+
+```bash
+# 80 RELR slots, with each slot's link-time value
+python3 <ext2 extractor> disk_selfhost_fixtest.img /lib/ld-musl-aarch64.so.1 ld-musl.so
+llvm-readobj --dynamic-table ld-musl.so     # DT_RELR 0x13580, RELRSZ 48
+```
+
+`RELRSZ 48` is 6 entries → 80 slots (one address word, then bitmap words with
+bit *i* meaning "relocate address + 8·(i+1)"). Only `0xc03b8` carries `0x6c964`.
+
+**Falsified: the file-page-cache missing-CoW theory.** The whole 1521-fault run
+reports `[FPCACHE] entries=0 hits=0 misses=0 evict=0 inval=0` in every PSTATS
+block. The cache never held a page, so it cannot be the carrier. Do not spend
+another session there.
+
+**The victims share an address space, in groups.** 1521 faults resolve to
+exactly **two** `(live ttbr0, slot PA)` pairs — `0x3f000082642000`/`0x828283b8`
+(1195 faults) and `0x3d000081fcf000`/`0x8232b3b8` (326) — with `N` monotone
+*within* each pair. `l0=0x82642000` belongs to pid 44 in the `[THR-DUMP]`
+blocks. So each group is a set of processes running over one long-lived
+address space's ld-musl data page, one `+= base` per victim.
+
+**Sharpest open lead.** `/bin/busybox` *and* `/bin/busybox.static` are both
+**static PIEs with no `PT_INTERP`** (`llvm-readobj --program-headers`; entries
+`0x44E4` and `0x4524`), loaded at `0x10000000` — the log's
+`[IA-DP] file region: fault_va=0x10004524 seg_va=0x10000000 filesz=0x109ad0`
+confirms it. A process the kernel names `/bin/busybox.static` should therefore
+have **nothing whatsoever mapped at `0x30000000`**, yet it faults executing
+ld-musl at `0x300c03b8`. Explain that and the class falls.
+
+### Two readings that look decisive and are not
+
+- **The register fingerprint indicts nothing.** `x0=x2=0x30000000`,
+  `x19=x20=x29=x30=0` and a constant `SP_EL0` reads like a forged or inherited
+  context, but `UserContext::new` (`crates/akuma-exec/src/process/types.rs:342`,
+  used by `replace_image`) zeroes *every* GPR, so this is simply what a freshly
+  `execve`'d dynamic binary looks like at `_dlstart`. It is the expected state,
+  not evidence.
+- **"Load-time PAs vary, fault-time PA is constant" is not a comparison.** A
+  load-time probe that reports its *first* hit always reports page 0 of the
+  image (ld-musl's ELF header at `0x30000010` reads as `0x100b70003` =
+  `e_type|e_machine|e_version` — a false positive worth skipping explicitly). It
+  never samples the slot page at `+0xc0000`, so it says nothing about whether
+  that page's frame is shared. Probe the slot's own page or don't probe.
+
+### Verification is currently blocked by the wedge
+
+Fault onset tracks the **start of the `-j4` build**, not uptime: in the one run
+that produced faults they began at **T732.96**, immediately after the build
+loop was launched, and ran to T1020 (1518 faults). Three subsequent runs
+launched the build at T40–T90 and **wedged at T64–T132** — 400 % CPU, log
+frozen, `[BKL] stuck: owner=… waiter=…` repeating — i.e. every one of them died
+*before* reaching the window where faults appear. A post-fix run showing zero
+`[RELR]` lines therefore proves nothing unless it survives past T733 with the
+build running. Check `grep -ac '\[RELR\] slot'` **and** the last `[T…]`
+timestamp before believing any A/B here.
+
+Beware also that a per-`execve` probe is not free: an early attempt scanned 256
+pages × 512 words inside `do_execve`'s `with_process_exclusive` window and
+wedged the box in ~130 s under `-j4` all by itself.
+
+### Fixed alongside, but NOT established as this bug's cause
+
+`init_thread_slot_context` (`crates/akuma-exec/src/threading/mod.rs`) set
+`is_user_process = 1` on a recycled slot while leaving the previous occupant's
+`user_entry` / `user_sp` / `user_tls` intact, and `get_saved_user_context`'s
+fallback path was gated **only** on `is_user_process`. A caller could therefore
+be handed the previous occupant's user entry point and stack — ld-musl's
+`_dlstart` when that occupant was dynamically linked. Both halves are fixed
+(fields reset at slot init; the fallback now also requires a non-zero
+`user_entry`, returning `None` so a clone/fork fails loudly instead of
+launching a child at a stale PC).
+
+Regress with the host test
+`threading::state_transition_guard_tests::a_recycled_slot_does_not_inherit_the_previous_occupants_user_entry`
+— confirmed two-sided (fails on the pre-fix arm, passes after).
+
+**This is a real latent defect, not a demonstrated root cause.** All three
+callers pass `current_thread_id()`, and the SVC prologue publishes a trap
+frame, so a clone syscall normally takes the *trap-frame* branch and never
+reaches the fallback. Reachability from the faulting path is unproven.
 
 ### Ruled out 2026-08-05 — do not re-derive these
 
