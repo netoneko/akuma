@@ -1,4 +1,4 @@
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -33,7 +33,12 @@ pub struct ProcessChannel {
     /// that hangs querying an absent terminal (ESC[6n).
     is_terminal: AtomicBool,
     /// Threads waiting for output (epoll, blocking read)
-    pollers: Spinlock<BTreeSet<usize>>,
+    /// tid -> generation-tagged wake handle, minted at registration (the waiter
+    /// registers itself, so the handle is live by construction). Keyed by tid for
+    /// dedup and `is_poller_registered`; the handle is what gets woken, so an
+    /// entry left behind by a dead poller wakes nobody instead of whoever owns
+    /// the recycled slot (see threading::SLOT_GEN).
+    pollers: Spinlock<BTreeMap<usize, crate::threading::WakeHandle>>,
 }
 
 /// Maximum size for process channel buffers to prevent memory exhaustion (1 MB)
@@ -51,7 +56,7 @@ impl ProcessChannel {
             raw_mode: AtomicBool::new(false),
             stdin_closed: AtomicBool::new(false),
             is_terminal: AtomicBool::new(true),
-            pollers: Spinlock::new(BTreeSet::new()),
+            pollers: Spinlock::new(BTreeMap::new()),
         }
     }
 
@@ -163,7 +168,7 @@ impl ProcessChannel {
             if buf.len() < MAX_BUFFER_SIZE {
                 return true;
             }
-            self.pollers.lock().insert(tid);
+            self.pollers.lock().insert(tid, crate::threading::wake_handle_for_thread(tid));
             false
         })
     }
@@ -187,8 +192,8 @@ impl ProcessChannel {
     fn wake_pollers(&self) {
         with_irqs_disabled(|| {
             let mut pollers = self.pollers.lock();
-            while let Some(tid) = pollers.pop_first() {
-                crate::threading::get_waker_for_thread(tid).wake();
+            while let Some((_tid, handle)) = pollers.pop_first() {
+                crate::threading::wake_by_handle(handle);
             }
         });
     }
@@ -240,14 +245,14 @@ impl ProcessChannel {
     /// Register a thread to be woken when new data arrives or the process exits.
     pub fn add_poller(&self, tid: usize) {
         with_irqs_disabled(|| {
-            self.pollers.lock().insert(tid);
+            self.pollers.lock().insert(tid, crate::threading::wake_handle_for_thread(tid));
         });
     }
 
     /// Check if a thread is registered as a poller (test helper).
     pub fn is_poller_registered(&self, tid: usize) -> bool {
         with_irqs_disabled(|| {
-            self.pollers.lock().contains(&tid)
+            self.pollers.lock().contains_key(&tid)
         })
     }
 

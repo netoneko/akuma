@@ -1,5 +1,6 @@
 use super::*;
-use alloc::collections::{BTreeSet, VecDeque};
+use alloc::collections::{BTreeMap as PollerMap, VecDeque};
+use akuma_exec::threading::{WakeHandle, wake_by_handle, wake_handle_for_thread};
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 const IPC_PRIVATE: i32 = 0;
@@ -27,9 +28,9 @@ struct MsgQueue {
     cbytes: usize,
     messages: VecDeque<KernelMsg>,
     /// Threads waiting to receive a message
-    recv_pollers: BTreeSet<usize>,
+    recv_pollers: PollerMap<usize, WakeHandle>,
     /// Threads waiting to send (queue full)
-    send_pollers: BTreeSet<usize>,
+    send_pollers: PollerMap<usize, WakeHandle>,
 }
 
 // Keyed by (box_id, msqid). SysV message queues use integer keys visible to any
@@ -54,7 +55,7 @@ pub fn sys_msgget(key: i32, flags: i32) -> u64 {
         if key == IPC_PRIVATE {
             let msqid = NEXT_MSQID.fetch_add(1, Ordering::SeqCst);
             let mode = (flags & 0o777) as u32;
-            table.insert((box_id, msqid), MsgQueue { key, mode, cbytes: 0, messages: VecDeque::new(), recv_pollers: BTreeSet::new(), send_pollers: BTreeSet::new() });
+            table.insert((box_id, msqid), MsgQueue { key, mode, cbytes: 0, messages: VecDeque::new(), recv_pollers: PollerMap::new(), send_pollers: PollerMap::new() });
             crate::tprint!(96, "[msgget] box={} IPC_PRIVATE -> msqid={}\n", box_id, msqid);
             u64::from(msqid)
         } else {
@@ -70,7 +71,7 @@ pub fn sys_msgget(key: i32, flags: i32) -> u64 {
             } else if flags & IPC_CREAT != 0 {
                 let msqid = NEXT_MSQID.fetch_add(1, Ordering::SeqCst);
                 let mode = (flags & 0o777) as u32;
-                table.insert((box_id, msqid), MsgQueue { key, mode, cbytes: 0, messages: VecDeque::new(), recv_pollers: BTreeSet::new(), send_pollers: BTreeSet::new() });
+                table.insert((box_id, msqid), MsgQueue { key, mode, cbytes: 0, messages: VecDeque::new(), recv_pollers: PollerMap::new(), send_pollers: PollerMap::new() });
                 crate::tprint!(96, "[msgget] box={} IPC_CREAT key={} -> msqid={}\n", box_id, key, msqid);
                 u64::from(msqid)
             } else {
@@ -86,17 +87,17 @@ pub fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
         IPC_RMID => {
             let pollers_to_wake = crate::irq::with_irqs_disabled(|| {
                 let mut table = MSGQUEUE_TABLE.lock();
-                let mut tids = alloc::vec::Vec::new();
+                let mut handles = alloc::vec::Vec::new();
                 if let Some(q) = table.get_mut(&(box_id, msqid)) {
-                    for tid in q.recv_pollers.iter().chain(q.send_pollers.iter()) {
-                        tids.push(*tid);
+                    for (_, h) in q.recv_pollers.iter().chain(q.send_pollers.iter()) {
+                        handles.push(*h);
                     }
                 }
                 table.remove(&(box_id, msqid));
-                tids
+                handles
             });
-            for tid in pollers_to_wake {
-                akuma_exec::threading::get_waker_for_thread(tid).wake();
+            for handle in pollers_to_wake {
+                wake_by_handle(handle);
             }
             crate::tprint!(96, "[msgctl] box={} IPC_RMID msqid={}\n", box_id, msqid);
             0
@@ -187,19 +188,19 @@ pub fn sys_msgsnd(msqid: u32, msgp: u64, msgsz: usize, flags: i32) -> u64 {
                     return (Some(EAGAIN), alloc::vec::Vec::new());
                 }
                 // Atomically register as poller before releasing lock (TOCTOU prevention)
-                q.send_pollers.insert(tid);
+                q.send_pollers.insert(tid, wake_handle_for_thread(tid));
                 return (None, alloc::vec::Vec::new()); // need to retry
             }
             q.cbytes += msgsz;
             q.messages.push_back(KernelMsg { mtype, data: data.clone() });
             // Wake all threads waiting to receive
-            let recv_tids: alloc::vec::Vec<usize> = q.recv_pollers.iter().copied().collect();
+            let recv_handles: alloc::vec::Vec<WakeHandle> = q.recv_pollers.values().copied().collect();
             q.recv_pollers.clear();
-            (Some(0u64), recv_tids)
+            (Some(0u64), recv_handles)
         });
-        if let (Some(r), tids) = result {
-            for wake_tid in tids {
-                akuma_exec::threading::get_waker_for_thread(wake_tid).wake();
+        if let (Some(r), handles) = result {
+            for handle in handles {
+                wake_by_handle(handle);
             }
             return r;
         }
@@ -247,7 +248,7 @@ pub fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags: i32) 
                     return (Some(ENOMSG), alloc::vec::Vec::new());
                 }
                 // Atomically register as poller before releasing lock (TOCTOU prevention)
-                q.recv_pollers.insert(tid);
+                q.recv_pollers.insert(tid, wake_handle_for_thread(tid));
                 return (None, alloc::vec::Vec::new()); // retry
             };
             let msg = q.messages.remove(idx).unwrap();
@@ -270,9 +271,9 @@ pub fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags: i32) 
                 }
                 q.cbytes -= actual_len;
                 // Wake senders waiting for space
-                let send_tids: alloc::vec::Vec<usize> = q.send_pollers.iter().copied().collect();
+                let send_handles: alloc::vec::Vec<WakeHandle> = q.send_pollers.values().copied().collect();
                 q.send_pollers.clear();
-                return (Some(msgsz as u64), send_tids);
+                return (Some(msgsz as u64), send_handles);
             }
             q.cbytes -= actual_len;
             let mtype_bytes = msg.mtype.to_ne_bytes();
@@ -285,13 +286,13 @@ pub fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags: i32) 
                 }
             }
             // Wake senders waiting for space
-            let send_tids: alloc::vec::Vec<usize> = q.send_pollers.iter().copied().collect();
+            let send_handles: alloc::vec::Vec<WakeHandle> = q.send_pollers.values().copied().collect();
             q.send_pollers.clear();
-            (Some(actual_len as u64), send_tids)
+            (Some(actual_len as u64), send_handles)
         });
-        if let (Some(r), tids) = result {
-            for wake_tid in tids {
-                akuma_exec::threading::get_waker_for_thread(wake_tid).wake();
+        if let (Some(r), handles) = result {
+            for handle in handles {
+                wake_by_handle(handle);
             }
             return r;
         }
@@ -306,7 +307,7 @@ pub fn msgqueue_add_recv_poller(box_id: u64, msqid: u32, tid: usize) {
     crate::irq::with_irqs_disabled(|| {
         let mut table = MSGQUEUE_TABLE.lock();
         if let Some(q) = table.get_mut(&(box_id, msqid)) {
-            q.recv_pollers.insert(tid);
+            q.recv_pollers.insert(tid, wake_handle_for_thread(tid));
         }
     });
 }
@@ -317,7 +318,7 @@ pub fn msgqueue_add_send_poller(box_id: u64, msqid: u32, tid: usize) {
     crate::irq::with_irqs_disabled(|| {
         let mut table = MSGQUEUE_TABLE.lock();
         if let Some(q) = table.get_mut(&(box_id, msqid)) {
-            q.send_pollers.insert(tid);
+            q.send_pollers.insert(tid, wake_handle_for_thread(tid));
         }
     });
 }
@@ -370,7 +371,7 @@ pub fn msgqueue_send_pollers_count(box_id: u64, msqid: u32) -> usize {
 #[allow(dead_code)]
 pub fn msgqueue_is_recv_poller(box_id: u64, msqid: u32, tid: usize) -> bool {
     crate::irq::with_irqs_disabled(|| {
-        MSGQUEUE_TABLE.lock().get(&(box_id, msqid)).is_some_and(|q| q.recv_pollers.contains(&tid))
+        MSGQUEUE_TABLE.lock().get(&(box_id, msqid)).is_some_and(|q| q.recv_pollers.contains_key(&tid))
     })
 }
 
@@ -384,11 +385,11 @@ pub fn msgqueue_push_direct(box_id: u64, msqid: u32, mtype: i64, data: &[u8]) ->
             q.messages.push_back(KernelMsg { mtype, data: data.to_vec() });
             q.cbytes += msg_len;
             // Wake recv pollers
-            let tids: alloc::vec::Vec<usize> = q.recv_pollers.iter().copied().collect();
+            let handles: alloc::vec::Vec<WakeHandle> = q.recv_pollers.values().copied().collect();
             q.recv_pollers.clear();
             drop(table);
-            for tid in tids {
-                akuma_exec::threading::get_waker_for_thread(tid).wake();
+            for handle in handles {
+                wake_by_handle(handle);
             }
             true
         } else {
@@ -406,11 +407,11 @@ pub fn msgqueue_pop_direct(box_id: u64, msqid: u32) -> Option<(i64, alloc::vec::
             if let Some(msg) = q.messages.pop_front() {
                 q.cbytes -= msg.data.len();
                 // Wake send pollers (space freed)
-                let tids: alloc::vec::Vec<usize> = q.send_pollers.iter().copied().collect();
+                let handles: alloc::vec::Vec<WakeHandle> = q.send_pollers.values().copied().collect();
                 q.send_pollers.clear();
                 drop(table);
-                for tid in tids {
-                    akuma_exec::threading::get_waker_for_thread(tid).wake();
+                for handle in handles {
+                    wake_by_handle(handle);
                 }
                 Some((msg.mtype, msg.data))
             } else {

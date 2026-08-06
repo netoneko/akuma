@@ -885,6 +885,17 @@ fn print_spawn_fault_diag(far: u64, frame: &UserTrapFrame) {
         } else if asid_differs {
             "  (asid differs only — normal for a cloned thread)"
         } else { "" });
+    // Discriminators for the AS MISMATCH stories (see thread_expected_l0 /
+    // thread_switch_ins docs): expected==0 ⇒ the thread ran with the tripwire
+    // baseline unset; switch_ins==0 ⇒ no scheduler restore since scrub, so the
+    // live tables came ONLY from the first-entry path (activate → eret);
+    // expected==proc && switch_ins>0 ⇒ every restore was checked and passed —
+    // the corruption entered somewhere the switch path cannot see.
+    crate::safe_print!(160,
+        "[Fault]  expected_l0={:#x} switch_ins={} slot_gen={}\n",
+        akuma_exec::threading::thread_expected_l0(tid),
+        akuma_exec::threading::thread_switch_ins(tid),
+        akuma_exec::threading::thread_generation(tid));
 
     let mut ascii = [0u8; 8];
     if word_as_ascii(far, &mut ascii)

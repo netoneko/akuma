@@ -27,6 +27,12 @@ group:
 > thread executing in *foreign page tables* (`AS MISMATCH: L0 BASE DIFFERS`).
 > That is theory **T1** in §3c, and §2f records the first direct evidence for it.
 > Do not treat a post-2026-08-06 fault as "the same bug" without checking which.
+>
+> **Update, later 2026-08-06:** a concrete mechanism for §2f was found and
+> fixed — a family of lock-free check-then-store races on `THREAD_STATES` that
+> could revive a recycled/half-built thread slot (§2g). Plausible-cause fix,
+> pending `-j4` verification; §2g's TTBR0 tripwires now catch any residual
+> instance at the moment of corruption.
 
 It is *not* a futex bug and not a lost wakeup — if you arrived here from a
 process parked forever in `futex`, read
@@ -396,6 +402,116 @@ Also still open, and possibly related: the same run logged **81 `[BKL] stuck`
 events** and the build wedged with rustc processes alive but making no progress.
 Do not assume that is the same bug.
 
+## 2g. A mechanism for §2f found and fixed: lock-free check-then-store on THREAD_STATES (2026-08-06)
+
+Chasing "how does a thread get switched in under a third party's L0" through the
+switch path (`sgi_scheduler_handler_with_sp` saves live TTBR0 into the outgoing
+context and restores `ctx.ttbr0` for the incoming one — sound on its own) leads
+to the question: *who can corrupt a parked thread's saved context?* Answer: any
+path that makes a slot schedulable when its context does not belong to a
+runnable thread. Four were found, all the same shape — a **check-then-store on
+`THREAD_STATES` with no lock** — and all are now single atomic transitions
+(CAS / `fetch_update`, `crates/akuma-exec/src/threading/mod.rs`):
+
+1. **`ThreadWaker::wake`** (every futex/IO/timer wake funnels through it):
+   loaded `state == WAITING`, then stored `READY` as a second step. The waker
+   runs preemptible with no lock, so between the two steps it can be switched
+   out for *milliseconds* — while the target wakes by timeout, runs, exits, and
+   its slot is reclaimed and re-claimed by a new `clone_thread` (slot churn
+   under `-j4` is constant; see "Amplifier" in §3c). The stale `READY` then
+   lands on an INITIALIZING slot whose context is still the previous
+   occupant's. A peer core picks it and restores the previous occupant's
+   `ttbr0` — a **third party's L0, which is exactly the §2f signature** — and
+   its kernel stack, possibly still in use (double-run; BKL ledger corruption;
+   `[BKL] stuck` storms). Now: `compare_exchange(WAITING, READY)`; a wake can
+   make no other transition.
+2. **The same waker cleared `WAKE_TIMES` after its check.** In the same stale
+   window that clear can erase a *fresh* deadline the slot's next occupant just
+   published — a thread parked forever with no timeout, i.e. the
+   "live-but-idle rustc" wedge shape. The waker no longer touches `WAKE_TIMES`
+   at all (every sleep entry rewrites it; the value is inert on a non-WAITING
+   thread).
+3. **`commit_switch` / the net-boost path** re-READYed the outgoing thread via
+   load-then-store. `mark_thread_terminated` is called cross-thread with no
+   lock (`kill_thread_group`), so a TERMINATED landing in that window was
+   overwritten — resurrecting a killed thread onto page tables its group exit
+   is freeing. Same fix in `publish_waiting_and_take_pending_wake` and both
+   park-loop resume arms (one of which stored RUNNING *unconditionally*), and
+   in `mark_thread_ready` (the spawn publish), which could resurrect a child
+   killed between context setup and publish.
+
+Regression tests: host —
+`threading::state_transition_guard_tests` (waker refuses INITIALIZING /
+TERMINATED / FREE / RUNNING; deadline untouched by a successful wake; publish
+and park-resume refuse TERMINATED); boot-suite — `wake_transition_guards` in
+`src/process_tests.rs` (refusal semantics only; it never flips a contextless
+slot READY in a live kernel).
+
+**Status: plausible-cause fix, not yet proven against the reproducer.** The
+§2f `AS MISMATCH` fired once in one `-j4` run; nothing this cheap to observe
+can confirm the fix. What CAN falsify it fast is the new tripwire pair below.
+
+### TTBR0 tripwires (new instrumentation, always on)
+
+`EXPECTED_L0[tid]` tracks the L0 base each thread is *supposed* to run under
+(written by `update_thread_context` for child inits and by
+`UserAddressSpace::activate`/`deactivate` for self-installs; ASID deliberately
+masked out — see "Read the flag carefully" in §2f). The switch path checks it
+both ways and prints at the moment of corruption, with both tids:
+
+| line | meaning |
+|---|---|
+| `[TTBR SAVE-MISMATCH] core=… old_tid=… live=… expected_l0=…` | the outgoing thread was RUNNING under foreign tables — and the save just wrote that foreign value into its context |
+| `[TTBR LOAD-MISMATCH] core=… new_tid=… ctx=… expected_l0=…` | the incoming thread's saved context was corrupted while it was off-CPU (wrong-old_idx save, or a stale-slot revival) |
+
+Zero of either across a full SMP=4 boot suite (259 PASSED). A `-j4` build that
+produces an EL0 `AS MISMATCH` fault with **zero** tripwire lines before it
+means the corruption enters by a path other than the switch/context machinery —
+that result would be as valuable as a hit.
+
+### Tid generations (`WakeHandle`) — the once-and-for-all half (same day)
+
+The CAS fixes close the *transition* races but leave the design asymmetry that
+bred them: **pids are effectively generational** (`allocate_pid` is a monotonic
+counter — a stale pid misses in the table) while **tids were bare indices into
+a recycled 256-slot array** — a stale tid is indistinguishable from a live one,
+and every per-thread structure is keyed by the ambiguous kind. Two residuals
+survived the CAS alone: a stale waker could still spuriously wake a slot's new
+occupant when that occupant happened to be legitimately WAITING, and its sticky
+`WOKEN_STATES` store could spend a phantom wake on the new occupant's next park.
+
+Now (`crates/akuma-exec/src/threading/mod.rs`): `SLOT_GEN[tid]` bumps once per
+slot lifetime in `scrub_thread_slot` (every claim path runs it under the winning
+FREE→INITIALIZING CAS). A **`WakeHandle`** packs `(generation << 16) | tid`;
+wait registrations store handles, not tids, minted by the waiter itself at
+enqueue time (`current_wake_handle` / `wake_handle_for_thread`), and
+`wake_by_handle` refuses a stale generation *before any side effect*. The
+`core::task::Waker` plumbing packs the handle into the raw-waker data pointer,
+so `Waker`-storing registries (terminal input, ssh) got incarnation-binding for
+free. Converted queues: futex `FUTEX_WAITERS` (`src/syscall/sync.rs`), pipe
+pollers, msgqueue send/recv pollers, eventfd pollers, `VFORK_WAITERS`,
+`ProcessChannel` pollers. Same-tid queue *scans* (dequeue, purge, self-locate)
+still key on `handle.tid()` — they identify entries, they never act on the
+thread through the bare index.
+
+Left on bare tids deliberately: `pend_signal_for_thread`, `request_thread_kill`
+and the kill paths — their callers resolve the tid from live process state at
+call time, and their per-thread *array stores* (pending-signal bits) are a
+staleness surface the wake layer cannot fix. If those ever need it, the
+mechanism is in place (`thread_generation`, `WakeHandle::is_current`).
+
+Regression test: `a_stale_handle_is_refused_even_against_a_waiting_new_occupant`
+(host) — the exact case the CAS alone cannot defend.
+
+### Do not chase `[SGI-S STACK]` lines for idle tids
+
+The stack-aliasing tripwire fired ~20k times per SMP=4 boot for
+`new_tid=1..3`: per-core idle threads are seeded at bringup on their per-core
+*boot* stacks, not the pool stacks registered for their slots, so every switch
+into an idle thread tripped it. Those lines were pure noise (present on known-
+good boots) and are now gated by `IS_IDLE_THREAD`. A remaining `[SGI-S STACK]`
+line for a non-idle tid is a real finding.
+
 ## 3. Where to look in the kernel
 
 With the handoff ruled out (§2a), the live candidates are:
@@ -477,6 +593,54 @@ Facts established about it, so nobody re-derives them:
   — produces exactly this `base*N` accumulation. That shape is the thing to hunt
   for. The kernel's own pass (`crates/akuma-exec/src/elf/mod.rs:381`) is
   `*ptr = base + addend`, i.e. the safe form.
+
+New constraints from the 2026-08-06 `-j4` run (instrumented kernel, N ran 2→6):
+
+- **The carrier is global kernel-side state, not any file's pages.** N=2,3,4
+  hit `rustc`, `rustc`, `cargo` in a 2 s window at boot; N=5 and N=6 hit
+  `/bin/busybox.static` at T872 and T1096 — *different inodes*, so per-inode
+  page-cache/file-buffer theories can't explain one shared counter. All five
+  kernel relocation appliers were re-audited the same day: absolute writes to
+  private `alloc_and_map` frames, applied after the copy — a corrupted GOT
+  byte in the source buffer would be *overwritten* by the absolute relocation,
+  so the interp-GOT-in-shared-cache family is ruled out too.
+- **N advances once per CRASH, not per exec.** Hundreds of successful execs
+  sit between N=4 (T35) and N=5 (T872) without advancing it.
+- **The register fingerprint is byte-identical across victims** —
+  `x0=0x30000000 x2=0x30000000 x3=0x300c03d8 x1/SP=0x203ffff588/80`,
+  callee-saved all zero, `SIGSEGV after 0.00s`. A process at its very first
+  instructions with an already-poisoned branch target reads as much like
+  "ERET'd at the wrong PC from birth" as "branched through a corrupted slot" —
+  instrument `do_execve`'s final entry/ELR value before trusting the branch
+  story.
+- **Cheap live reproducer:** on a devbox-smoltcp guest under `-j4` load, plain
+  `busybox <anything>` invocations over ssh crash with the next N every ~dozen
+  execs. No build harness needed to iterate.
+- **The `+= base` writer exists and is now located (2026-08-06).** ld-musl's
+  `_dlstart` at `0x69f14-0x69f20` does `ldr x3,[x2,x5]; add x3,x3,x2;
+  str x3,[x2,x5]` — *slot += base*, the exact accumulation form. It is musl's
+  **RELR** apply loop: `readobj --dynamic-table` on the disk's ld-musl shows
+  `DT_RELR 0x13580, RELRSZ 48` — Alpine links everything with compressed
+  relative relocations, and **RELR entries are implicit-addend by design**.
+  The kernel has *no* RELR handling anywhere (`grep -ri relr` over the kernel:
+  one unrelated comment), which is fine for private pages (musl/crt applies
+  its own, once) — so the remaining question is ONLY: *which physical page do
+  the faulting execs share?* One `+= base` per sharing exec on one shared
+  frame produces the observed global N sequence exactly. Prime suspect: a
+  file-page-cache frame reached through a write that should have CoW'd
+  (`is_shareable_mapping` admits RO PTEs; the victims' RELR slots must be
+  written by their own startup code through what should be a private page —
+  same neighbourhood as the FIXED madvise-WILLNEED zero-fill bug). Decide it
+  by logging the slot value + frame PA at exec / at the CoW fault for the
+  slot's page: same PA across two processes = case closed.
+- **This class is what wedges `-j4` builds — the "live-but-idle rustc" wedge
+  is downstream of it, not a scheduler bug.** Live capture 2026-08-06 T1200:
+  jobserver `pipe=3 bytes=0 readers=7 writers=7 pollers=7`, seven futex
+  waiters frozen since T≈35 — the exact moment three of these instruction
+  aborts killed two rustcs and a cargo child, taking their jobserver tokens
+  with them. The kernel pipe/futex machinery is exonerated by its own
+  decision table (`bytes=0, writers>0`). Fixing THIS class is the remaining
+  blocker for a green `-j4`.
 
 ### Ruled out 2026-08-05 — do not re-derive these
 
@@ -748,7 +912,13 @@ A fully fixed kernel must then produce, across a full `-j4` build:
 **Status as of 2026-08-06:** the first two are not yet met. The §2e fix took the
 run from a steady stream of faults down to a single one, but that one was an
 `AS MISMATCH` (§2f), and the run also logged 81 `[BKL] stuck` events before
-wedging with live-but-idle `rustc` processes. Both are open.
+wedging with live-but-idle `rustc` processes. The §2g state-transition fixes
+target both (same corruption family) but are unproven against the `-j4`
+reproducer — a verifying run must also show **zero `[TTBR SAVE-MISMATCH]` /
+`[TTBR LOAD-MISMATCH]`** lines (§2g). Note the boot-time `[BKL] stuck` storm
+(onset at the "NEON registers across preemptive scheduling" boot test,
+owner-core near-permanent hold) reproduces on both fixed and unfixed kernels —
+measure it as a rate, not a boolean, when A/B-ing.
 
 Regression probes for the neighbourhood (all should stay green):
 `userspace/forktest/c_stress/tidflags`, `futexkey`, `threadmax`, `tlsdirty`,
@@ -760,6 +930,10 @@ Regression probes for the neighbourhood (all should stay green):
   — the full 2026-08-06 investigation record behind §2e and §2f: disassembly,
   mechanism, before/after probe tables, the two instrumentation flags that had
   to be corrected, and the methodology lessons.
+- [`../archive/THREAD_STATES_RACES_TID_GENERATIONS.md`](../archive/THREAD_STATES_RACES_TID_GENERATIONS.md)
+  — the full record behind §2g: the check-then-store race family, the tid
+  generation / `WakeHandle` design, the boot-probe A/B tables, and why the
+  `[SGI-S STACK]` noise had to be gated.
 - [`../archive/SELFHOST_DEVBOX_SMOLTCP.md`](../archive/SELFHOST_DEVBOX_SMOLTCP.md)
   — "Open issue: thread-spawn SIGABRT under real `-j4` parallelism", "The crash
   has a fixed address (2026-08-04)", and the ASID free/flush ordering fix that

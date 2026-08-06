@@ -1,14 +1,18 @@
 use super::*;
 use akuma_exec::mmu::user_access::copy_to_user_safe;
 use akuma_net::socket::libc_errno;
-use alloc::collections::{BTreeSet, VecDeque};
+use alloc::collections::{BTreeMap as PollerMap, VecDeque};
+use akuma_exec::threading::{WakeHandle, wake_by_handle, wake_handle_for_thread};
 
 struct KernelPipe {
     buffer: VecDeque<u8>,
     write_count: u32,
     read_count: u32,
-    /// Threads waiting on this pipe via read() or epoll/poll
-    pollers: BTreeSet<usize>,
+    /// Threads waiting on this pipe via read() or epoll/poll. Keyed by tid for
+    /// dedup/lookup; the stored [`WakeHandle`] (minted at registration, when the
+    /// tid is live) is what gets woken — so an entry that outlives its thread
+    /// wakes nobody instead of the slot's next occupant.
+    pollers: PollerMap<usize, WakeHandle>,
 }
 
 /// Maximum kernel pipe buffer capacity (bytes). Matches Linux's default pipe size
@@ -69,7 +73,7 @@ pub fn pipe_dump() {
             // matched to the pipe it is parked on.
             let mut waiters = [0usize; 8];
             let mut n = 0;
-            for t in &p.pollers {
+            for t in p.pollers.keys() {
                 if n >= waiters.len() { break; }
                 waiters[n] = *t;
                 n += 1;
@@ -90,7 +94,7 @@ pub fn pipe_create() -> u32 {
             buffer: VecDeque::new(),
             write_count: 1,
             read_count: 1,
-            pollers: BTreeSet::new(),
+            pollers: PollerMap::new(),
         });
     });
     crate::safe_print!(64, "[pipe] create id={}\n", id);
@@ -118,7 +122,7 @@ pub fn pipe_add_poller(id: u32, tid: usize) {
     crate::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
-            pipe.pollers.insert(tid);
+            pipe.pollers.insert(tid, wake_handle_for_thread(tid));
         }
     });
 }
@@ -155,8 +159,8 @@ pub fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
             pipe.buffer.extend(&data[..n]);
 
             // Wake all async pollers (epoll/poll/read)
-            while let Some(tid) = pipe.pollers.pop_first() {
-                akuma_exec::threading::get_waker_for_thread(tid).wake();
+            while let Some((_tid, handle)) = pipe.pollers.pop_first() {
+                wake_by_handle(handle);
             }
 
             Ok(n)
@@ -228,8 +232,8 @@ pub fn pipe_read(id: u32, buf: &mut [u8]) -> (usize, bool) {
                     buf[i] = b;
                 }
                 // Wake writer pollers — space is now available in the buffer.
-                while let Some(tid) = pipe.pollers.pop_first() {
-                    akuma_exec::threading::get_waker_for_thread(tid).wake();
+                while let Some((_tid, handle)) = pipe.pollers.pop_first() {
+                    wake_by_handle(handle);
                 }
                 (n, false)
             } else if pipe.write_count == 0 {
@@ -253,8 +257,8 @@ pub fn pipe_close_write(id: u32) {
             
             // Notify waiters (EOF is an event)
             if pipe.write_count == 0 {
-                while let Some(tid) = pipe.pollers.pop_first() {
-                    akuma_exec::threading::get_waker_for_thread(tid).wake();
+                while let Some((_tid, handle)) = pipe.pollers.pop_first() {
+                    wake_by_handle(handle);
                 }
             }
 
@@ -290,8 +294,8 @@ pub fn pipe_close_read(id: u32) {
             // Uncapped pipes never blocked a writer, so this wake had nothing to wake
             // and the asymmetry was invisible. See `test_pipe_close_read_wakes_blocked_writer`.
             if pipe.read_count == 0 {
-                while let Some(tid) = pipe.pollers.pop_first() {
-                    akuma_exec::threading::get_waker_for_thread(tid).wake();
+                while let Some((_tid, handle)) = pipe.pollers.pop_first() {
+                    wake_by_handle(handle);
                 }
             }
 
@@ -321,7 +325,7 @@ pub fn pipe_check_set_reader(id: u32, tid: usize) -> bool {
             if !pipe.buffer.is_empty() || pipe.write_count == 0 {
                 return true;
             }
-            pipe.pollers.insert(tid);
+            pipe.pollers.insert(tid, wake_handle_for_thread(tid));
             false
         } else {
             true // pipe gone → treat as EOF, don't block
@@ -334,7 +338,7 @@ pub fn pipe_check_set_reader(id: u32, tid: usize) -> bool {
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub fn pipe_is_poller_registered(id: u32, tid: usize) -> bool {
     crate::irq::with_irqs_disabled(|| {
-        PIPES.lock().get(&id).is_some_and(|p| p.pollers.contains(&tid))
+        PIPES.lock().get(&id).is_some_and(|p| p.pollers.contains_key(&tid))
     })
 }
 
@@ -353,7 +357,7 @@ pub fn pipe_check_set_writer(id: u32, tid: usize) -> bool {
             if pipe.buffer.len() < PIPE_CAPACITY {
                 return true; // Space available
             }
-            pipe.pollers.insert(tid);
+            pipe.pollers.insert(tid, wake_handle_for_thread(tid));
             false
         } else {
             true // pipe gone → treat as EPIPE, don't block

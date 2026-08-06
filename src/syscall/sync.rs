@@ -1,12 +1,21 @@
 use super::*;
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
-/// Each waiter is recorded as `(tid, bitset)`. The bitset is `FUTEX_BITSET_MATCH_ANY`
+/// Each waiter is recorded as `(handle, bitset)`. The bitset is `FUTEX_BITSET_MATCH_ANY`
 /// (`0xFFFFFFFF`) for plain `FUTEX_WAIT`/`FUTEX_WAKE`, or `val3` for `FUTEX_WAIT_BITSET`.
 /// `FUTEX_WAKE_BITSET` only drains waiters whose bitset intersects its own `val3` —
 /// ignoring it lets a `val=1` wake be eaten by a non-matching waiter (see the
 /// "Known divergences" note in `docs/reference/subsystems/syscalls/sync.md`).
-type Waiter = (usize, u32);
+///
+/// The wake target is a generation-tagged [`WakeHandle`], NOT a bare tid: a bare tid
+/// popped from this table and then held across a preemption (`futex_do_wake` fires the
+/// wakes outside the table hold, deliberately) can outlive the thread it named and wake
+/// whoever owns the recycled slot instead. The handle is minted by the waiter itself at
+/// enqueue time and goes stale the moment the slot is scrubbed for a new occupant.
+/// Same-tid *scans* (dequeue, purge, self-locate) still key on `handle.tid()` — they
+/// identify queue entries, never act on the thread through the bare index.
+type Waiter = (WakeHandle, u32);
+use akuma_exec::threading::{WakeHandle, current_wake_handle, wake_by_handle};
 
 /// Futex waiter table.
 ///
@@ -274,16 +283,16 @@ static FUTEX_KEY_DEGRADED_TO_SHARED: core::sync::atomic::AtomicU64 =
 pub fn futex_do_wake(tgid: u32, uaddr: usize, max_wake: u32, wake_mask: u32) -> u64 {
     let key = (tgid, uaddr);
 
-    let to_wake: Vec<usize> = crate::irq::with_irqs_disabled(|| {
+    let to_wake: Vec<WakeHandle> = crate::irq::with_irqs_disabled(|| {
         let mut waiters = FUTEX_WAITERS.lock();
         let Some(queue) = waiters.get_mut(&key) else { return Vec::new() };
-        let mut to_wake: Vec<usize> = Vec::new();
+        let mut to_wake: Vec<WakeHandle> = Vec::new();
         let mut i = 0;
         while i < queue.len() && (to_wake.len() as u32) < max_wake {
             if queue[i].1 & wake_mask != 0 {
                 // Matching waiter: drain it (FIFO) for waking.
-                let (tid, _) = queue.remove(i);
-                to_wake.push(tid);
+                let (handle, _) = queue.remove(i);
+                to_wake.push(handle);
             } else {
                 // Non-matching bitset: leave queued, keep scanning.
                 i += 1;
@@ -295,9 +304,12 @@ pub fn futex_do_wake(tgid: u32, uaddr: usize, max_wake: u32, wake_mask: u32) -> 
         to_wake
     });
 
-    for tid in &to_wake {
-        fe(*tid, FE_WOKE, uaddr);
-        akuma_exec::threading::get_waker_for_thread(*tid).wake();
+    // Outside the hold — the generation in each handle is what makes that safe: if this
+    // path is preempted here and a popped waiter's slot is recycled meanwhile, the wake
+    // is refused instead of landing on the slot's new occupant.
+    for h in &to_wake {
+        fe(h.tid(), FE_WOKE, uaddr);
+        wake_by_handle(*h);
     }
     wake_ring_record(tgid, uaddr, to_wake.len() as u64);
     to_wake.len() as u64
@@ -328,11 +340,10 @@ pub fn futex_wake(tgid: u32, uaddr: usize, max_wake: i32) {
 /// queues (the fix for the `clear_child_tid` / `pthread_join` hang).
 #[allow(dead_code)]
 pub fn futex_wait_at_tgid_for_test(tgid: u32, uaddr: usize) {
-    let tid = akuma_exec::threading::current_thread_id();
     let key = (tgid, uaddr);
     crate::irq::with_irqs_disabled(|| {
         let mut waiters = FUTEX_WAITERS.lock();
-        waiters.entry(key).or_default().push((tid, BITSET_MATCH_ANY));
+        waiters.entry(key).or_default().push((current_wake_handle(), BITSET_MATCH_ANY));
     });
     akuma_exec::threading::schedule_blocking(u64::MAX);
     // futex_do_wake removed us from the queue before calling wake()
@@ -366,7 +377,8 @@ fn futex_check_and_enqueue(
         if current_val != val {
             return Err(EAGAIN);
         }
-        waiters.entry(key).or_default().push((tid, bitset));
+        // `tid` is the enqueuing thread itself, so its handle is live by definition.
+        waiters.entry(key).or_default().push((akuma_exec::threading::wake_handle_for_thread(tid), bitset));
         Ok(())
     });
     if r.is_ok() {
@@ -389,7 +401,7 @@ fn futex_requeue_table(
     key2: (u32, usize),
     max_wake: u32,
     max_requeue: u32,
-) -> (Vec<usize>, usize) {
+) -> (Vec<WakeHandle>, usize) {
     let has_requeue_target = key2.1 != 0;
     crate::irq::with_irqs_disabled(|| {
         let mut waiters = FUTEX_WAITERS.lock();
@@ -397,7 +409,7 @@ fn futex_requeue_table(
         let (to_wake, to_requeue) = if let Some(queue) = waiters.remove(&key1) {
             let wake_count = (max_wake as usize).min(queue.len());
             let mut remaining: Vec<Waiter> = queue;
-            let to_wake: Vec<usize> = remaining.drain(..wake_count).map(|(t, _)| t).collect();
+            let to_wake: Vec<WakeHandle> = remaining.drain(..wake_count).map(|(h, _)| h).collect();
 
             let requeue_count = if has_requeue_target {
                 (max_requeue as usize).min(remaining.len())
@@ -419,8 +431,8 @@ fn futex_requeue_table(
         if !to_requeue.is_empty() && has_requeue_target {
             waiters.entry(key2).or_default().extend(to_requeue.iter().copied());
         }
-        for (t, _) in &to_requeue {
-            fe(*t, FE_RQ, key2.1);
+        for (h, _) in &to_requeue {
+            fe(h.tid(), FE_RQ, key2.1);
         }
 
         (to_wake, to_requeue.len())
@@ -432,7 +444,7 @@ fn futex_dequeue(key: (u32, usize), tid: usize) {
     crate::irq::with_irqs_disabled(|| {
         let mut waiters = FUTEX_WAITERS.lock();
         if let Some(queue) = waiters.get_mut(&key) {
-            queue.retain(|(t, _)| *t != tid);
+            queue.retain(|(h, _)| h.tid() != tid);
             if queue.is_empty() { waiters.remove(&key); }
         }
     });
@@ -456,7 +468,7 @@ fn futex_remove_tid_anywhere(tgid: u32, tid: usize) {
         let mut found_key: Option<(u32, usize)> = None;
         for (&k, q) in waiters.iter() {
             if k.0 != tgid { continue; }
-            if q.iter().any(|(t, _)| *t == tid) {
+            if q.iter().any(|(h, _)| h.tid() == tid) {
                 found_key = Some(k);
                 break;
             }
@@ -464,7 +476,7 @@ fn futex_remove_tid_anywhere(tgid: u32, tid: usize) {
         if let Some(k) = found_key
             && let Some(q) = waiters.get_mut(&k)
         {
-            q.retain(|(t, _)| *t != tid);
+            q.retain(|(h, _)| h.tid() != tid);
             if q.is_empty() { waiters.remove(&k); }
             fe(tid, FE_RMANY, k.1);
         }
@@ -496,18 +508,19 @@ pub fn futex_dump() {
         let mut stuck = Vec::new();
         for (&(tgid, uaddr), q) in waiters.iter() {
             tprint!(120, "  key tgid={} uaddr={:#x} waiters={}\n", tgid, uaddr, q.len());
-            for (tid, bitset) in q.iter().take(8) {
+            for (handle, bitset) in q.iter().take(8) {
+                let tid = handle.tid();
                 // Age comes from the per-tid event ring (last transition = its enqueue),
                 // so a long-queued waiter is visible without widening `Waiter` itself.
                 let age = if crate::config::FUTEX_ORPHAN_DIAG {
-                    now.saturating_sub(FUTEX_TID_TS[*tid].load(core::sync::atomic::Ordering::Relaxed))
+                    now.saturating_sub(FUTEX_TID_TS[tid].load(core::sync::atomic::Ordering::Relaxed))
                 } else {
                     0
                 };
                 if age > STUCK_WAITER_US {
                     stuck.push((tgid, uaddr));
                 }
-                let hist = fmt_hist(*tid);
+                let hist = fmt_hist(tid);
                 tprint!(128, "    tid={} bitset={:#x} queued_for={}us hist={}\n",
                     tid, bitset, age, core::str::from_utf8(&hist).unwrap_or("?"));
             }
@@ -571,7 +584,7 @@ fn futex_orphan_check() -> Vec<(u32, usize)> {
     }
     use akuma_exec::threading::{MAX_THREADS, thread_state};
     let queued: Vec<usize> = crate::irq::with_irqs_disabled(|| {
-        FUTEX_WAITERS.lock().values().flatten().map(|(t, _)| *t).collect()
+        FUTEX_WAITERS.lock().values().flatten().map(|(h, _)| h.tid()).collect()
     });
     for tid in 0..MAX_THREADS {
         if akuma_exec::threading::get_thread_state(tid) != thread_state::WAITING {
@@ -628,7 +641,7 @@ pub fn futex_purge_tid(tid: usize) {
         let mut emptied: Vec<(u32, usize)> = Vec::new();
         for (&k, q) in waiters.iter_mut() {
             let before = q.len();
-            q.retain(|(t, _)| *t != tid);
+            q.retain(|(h, _)| h.tid() != tid);
             if q.len() != before {
                 fe(tid, FE_PURGE, k.1);
                 if q.is_empty() {
@@ -656,7 +669,10 @@ pub mod test_hooks {
 
     pub fn enqueue(key: (u32, usize), tid: usize) {
         crate::irq::with_irqs_disabled(|| {
-            FUTEX_WAITERS.lock().entry(key).or_default().push((tid, super::BITSET_MATCH_ANY));
+            FUTEX_WAITERS.lock().entry(key).or_default().push((
+                akuma_exec::threading::wake_handle_for_thread(tid),
+                super::BITSET_MATCH_ANY,
+            ));
         });
     }
 
@@ -669,12 +685,13 @@ pub mod test_hooks {
             FUTEX_WAITERS
                 .lock()
                 .get(&key)
-                .map(|q| q.iter().map(|(t, _)| *t).collect())
+                .map(|q| q.iter().map(|(h, _)| h.tid()).collect())
         })
     }
 
     pub fn requeue(key1: (u32, usize), key2: (u32, usize), max_wake: u32, max_requeue: u32) -> (Vec<usize>, usize) {
-        futex_requeue_table(key1, key2, max_wake, max_requeue)
+        let (to_wake, requeued) = futex_requeue_table(key1, key2, max_wake, max_requeue);
+        (to_wake.into_iter().map(|h| h.tid()).collect(), requeued)
     }
 
     pub fn dequeue(key: (u32, usize), tid: usize) {
@@ -834,7 +851,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                     let mut waiters = FUTEX_WAITERS.lock();
                     let mut found: Option<(u32, usize)> = None;
                     for (&k, q) in waiters.iter() {
-                        if k.0 == tgid && q.iter().any(|(t, _)| *t == tid) {
+                        if k.0 == tgid && q.iter().any(|(h, _)| h.tid() == tid) {
                             found = Some(k);
                             break;
                         }
@@ -843,7 +860,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                         && k == key
                         && let Some(q) = waiters.get_mut(&k)
                     {
-                        q.retain(|(t, _)| *t != tid);
+                        q.retain(|(h, _)| h.tid() != tid);
                         if q.is_empty() { waiters.remove(&k); }
                         fe(tid, FE_SELFRM, k.1);
                     }
@@ -943,8 +960,8 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             let (to_wake, requeued) = futex_requeue_table(key1, key2, val, max_requeue);
             let woken = to_wake.len();
 
-            for tid in &to_wake {
-                akuma_exec::threading::get_waker_for_thread(*tid).wake();
+            for h in &to_wake {
+                wake_by_handle(*h);
             }
 
             if crate::config::FUTEX_DBG_ENABLED {
@@ -975,8 +992,8 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             let (to_wake, requeued) = futex_requeue_table(key1, key2, val, max_requeue);
             let woken = to_wake.len();
 
-            for tid in &to_wake {
-                akuma_exec::threading::get_waker_for_thread(*tid).wake();
+            for h in &to_wake {
+                wake_by_handle(*h);
             }
 
             (woken + requeued) as u64

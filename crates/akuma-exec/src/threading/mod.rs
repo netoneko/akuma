@@ -367,6 +367,168 @@ static PER_CORE_OFFCPU: [AtomicUsize; MAX_CORES] = {
     [INIT; MAX_CORES]
 };
 
+/// Per-thread *expected* TTBR0 L0 base — the physical page-table root this
+/// thread's user context is supposed to run under. 0 = unknown (kernel/idle
+/// threads and slots between scrub and first context write): checks skip it.
+///
+/// Written wherever the canonical value changes hands: `update_thread_context`
+/// when a parent builds a child's context, and `UserAddressSpace::
+/// activate`/`deactivate` (via [`note_current_expected_l0`]) when a thread
+/// installs tables itself. The ASID half of TTBR0 is deliberately masked out —
+/// a cloned thread legitimately runs under the parent's L0 with a different
+/// ASID (see debug-thread-spawn-segv.md §2f "Read the flag carefully").
+///
+/// Consumed by the context-switch tripwires in `sgi_scheduler_handler_with_sp`:
+/// they catch a thread being switched out under (or resumed into) page tables
+/// that are not its own — the §2f `AS MISMATCH` — at the switch where the
+/// corruption happens, with both tids, instead of at the EL0 fault it causes
+/// later.
+static EXPECTED_L0: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// Physical L0-base bits of a TTBR0 value (ASID and CnP masked off).
+pub const TTBR0_L0_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+/// Per-slot generation counter — bumped once per slot *lifetime*, in
+/// `scrub_thread_slot` (which every claim path runs under the winning
+/// FREE→INITIALIZING CAS, so there is exactly one bumper per rebirth).
+///
+/// This gives tids the property pids already get for free from their
+/// monotonic allocator: **staleness is detectable**. A bare tid is an index
+/// into a recycled 256-slot array, so a tid held across the slot's death —
+/// in a futex/pipe/msgqueue wait queue, or in a waker preempted mid-flight —
+/// is indistinguishable from a live one, and acting on it acts on whoever
+/// owns the slot now (see `ThreadWaker::wake` for the corruption that
+/// enabled). A `(generation, tid)` pair ([`WakeHandle`]) names one
+/// *incarnation*: if the generation no longer matches, the wake is refused
+/// before any side effect.
+///
+/// Slots that never recycle (boot/idle/system threads) stay at generation 0
+/// forever, which is fine — a handle minted for them always validates.
+static SLOT_GEN: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// Current generation of `tid`'s slot (0 for out-of-range).
+pub fn thread_generation(tid: usize) -> u64 {
+    if tid < MAX_THREADS {
+        SLOT_GEN[tid].load(Ordering::Acquire)
+    } else {
+        0
+    }
+}
+
+/// Bits of a [`WakeHandle`] that hold the tid. `MAX_THREADS` is 256 (64 on
+/// host), so 16 bits leaves the upper 48 for the generation — at a pathological
+/// million spawns/second that wraps after ~9 years of uptime.
+const WAKE_HANDLE_TID_BITS: u32 = 16;
+const _: () = assert!(MAX_THREADS <= 1 << WAKE_HANDLE_TID_BITS);
+
+/// A generation-tagged wake target: names one *incarnation* of a thread slot,
+/// not the slot itself. Mint one with [`current_wake_handle`] when a waiter
+/// enqueues itself (the tid is self-evidently live), or
+/// [`wake_handle_for_thread`] when the caller otherwise knows the tid is
+/// currently live. Wake it with [`wake_by_handle`]; a handle whose generation
+/// has passed is refused with no side effect at all.
+///
+/// Wait queues must store THIS, not a bare `usize` tid — a bare tid dequeued
+/// and then held across a preemption (or simply left behind by a dead waiter)
+/// wakes whoever owns the slot by then.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WakeHandle(u64);
+
+impl WakeHandle {
+    fn new(tid: usize, generation: u64) -> Self {
+        Self((generation << WAKE_HANDLE_TID_BITS) | tid as u64)
+    }
+
+    /// The slot index this handle points at. Only meaningful for bookkeeping
+    /// keyed by slot (queue purges, diagnostics) — never act on the thread
+    /// through the bare tid.
+    pub fn tid(self) -> usize {
+        (self.0 & ((1 << WAKE_HANDLE_TID_BITS) - 1)) as usize
+    }
+
+    fn generation(self) -> u64 {
+        self.0 >> WAKE_HANDLE_TID_BITS
+    }
+
+    /// `true` while the slot still hosts the incarnation this handle names.
+    pub fn is_current(self) -> bool {
+        thread_generation(self.tid()) == self.generation()
+    }
+}
+
+/// Handle for the calling thread — what a waiter stores in a wait queue.
+pub fn current_wake_handle() -> WakeHandle {
+    wake_handle_for_thread(get_current_thread_register())
+}
+
+/// Handle for `tid`'s CURRENT incarnation. Only meaningful where the caller
+/// knows `tid` is live right now (e.g. it holds the registration that created
+/// it); calling this at wake time on a tid stored long ago just launders a
+/// stale tid into a fresh-looking handle.
+pub fn wake_handle_for_thread(tid: usize) -> WakeHandle {
+    WakeHandle::new(tid, thread_generation(tid))
+}
+
+/// Generation-validated wake: the WAITING→READY transition fires only if the
+/// slot still hosts the incarnation the handle names. Refusal has no side
+/// effect — not even the sticky `WOKEN_STATES` flag, which on a stale tid
+/// would spend a phantom wake on the slot's next occupant.
+pub fn wake_by_handle(handle: WakeHandle) {
+    ThreadWaker { handle }.wake();
+}
+
+/// Record the expected L0 base for `tid` (0 clears / disables the check).
+pub fn note_thread_expected_l0(tid: usize, ttbr0: u64) {
+    if tid < MAX_THREADS {
+        EXPECTED_L0[tid].store(ttbr0 & TTBR0_L0_MASK, Ordering::Release);
+    }
+}
+
+/// Diagnostic accessor for the fault dump: `tid`'s current expected L0 base
+/// (0 = unknown/no-check — see [`EXPECTED_L0`]). An `AS MISMATCH` fault with
+/// this reading 0 means the thread ran without ever passing a checked
+/// switch-in with a known baseline; reading the correct L0 means the tripwire
+/// SHOULD have fired and the corruption entered somewhere it cannot see.
+pub fn thread_expected_l0(tid: usize) -> u64 {
+    if tid < MAX_THREADS {
+        EXPECTED_L0[tid].load(Ordering::Acquire)
+    } else {
+        0
+    }
+}
+
+/// Per-slot count of checked scheduler switch-ins since the slot was scrubbed.
+/// Discriminates two `AS MISMATCH` stories the fault dump alone cannot: 0 means
+/// the thread reached EL0 purely via its first-entry path (trampoline →
+/// activate → eret) and the live TTBR0 diverged with NO switch in between;
+/// >0 means every one of those restores was checked against `EXPECTED_L0`.
+static SWITCH_INS: [AtomicU32; MAX_THREADS] = {
+    const INIT: AtomicU32 = AtomicU32::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// Diagnostic accessor for [`SWITCH_INS`].
+pub fn thread_switch_ins(tid: usize) -> u32 {
+    if tid < MAX_THREADS {
+        SWITCH_INS[tid].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// Record the expected L0 base for the calling thread — hook for
+/// `UserAddressSpace::activate`/`deactivate`, which install tables for the
+/// thread that is executing them.
+pub fn note_current_expected_l0(ttbr0: u64) {
+    note_thread_expected_l0(get_current_thread_register(), ttbr0);
+}
+
 /// Per-thread user-copy fault handler address (set around copy_from/to_user).
 ///
 /// Lock-free, for the same reason as `CURRENT_TRAP_FRAME`: it is read by the DATA
@@ -768,6 +930,16 @@ fn scrub_thread_slot(i: usize) {
     CURRENT_TRAP_FRAME[i].store(0, Ordering::Release);
     USER_COPY_FAULT_HANDLER[i].store(0, Ordering::Release);
 
+    // TTBR0 tripwire baseline: unknown until the new occupant's context is written
+    // (a stale expected-L0 would flag the new occupant's first switch as a mismatch).
+    EXPECTED_L0[i].store(0, Ordering::Release);
+    SWITCH_INS[i].store(0, Ordering::Relaxed);
+
+    // New incarnation: every WakeHandle minted for the previous occupant goes
+    // stale here, before the new occupant is observable. Exactly one bumper per
+    // rebirth — scrub runs under the claim path's winning FREE→INITIALIZING CAS.
+    SLOT_GEN[i].fetch_add(1, Ordering::AcqRel);
+
     // Diagnostics. Stale values here are not a correctness bug but a *debugging* one:
     // `[THR-DUMP]`/`[PSTATS]` would attribute the previous occupant's syscall and core
     // to a thread that never made it, which is exactly the kind of evidence a hang hunt
@@ -928,10 +1100,22 @@ pub fn has_pending_kill(tid: usize) -> bool {
     tid < MAX_THREADS && PENDING_KILL[tid].load(Ordering::Acquire)
 }
 
-/// Mark a thread as ready (lock-free)
+/// Mark a thread as ready (lock-free). The publish half of the spawn protocol:
+/// the owner (clone/fork/vfork) calls this exactly once, after the slot's
+/// context is fully written, to flip it INITIALIZING -> READY.
+///
+/// Refuses to overwrite TERMINATED: `kill_thread_group` /
+/// `mark_thread_terminated` run cross-thread with no lock, so a group kill can
+/// land on a half-built child between context setup and this publish. A plain
+/// READY store would resurrect it — a peer core would then run a thread whose
+/// process teardown (address space, fds) is already in progress.
 pub fn mark_thread_ready(idx: usize) {
     if idx < MAX_THREADS {
-        THREAD_STATES[idx].store(thread_state::READY, Ordering::SeqCst);
+        let _ = THREAD_STATES[idx].fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |s| (s != thread_state::TERMINATED).then_some(thread_state::READY),
+        );
     }
 }
 
@@ -2257,10 +2441,25 @@ impl ThreadPool {
             if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::WAITING {
                 let wake_time = WAKE_TIMES[i].load(Ordering::SeqCst);
                 if wake_time > 0 && now >= wake_time {
-                    // Wake this thread - mark as READY and clear wake time
-                    WAKE_TIMES[i].store(0, Ordering::SeqCst);
-                    THREAD_STATES[i].store(thread_state::READY, Ordering::SeqCst);
-                    woke_any = true;
+                    // Wake this thread — CAS, not store: a lock-free ThreadWaker::wake
+                    // (or a cross-thread kill's TERMINATED) can land between our load
+                    // and this write; an unconditional READY store would overwrite it
+                    // (see ThreadWaker::wake for the corruption that enables). The
+                    // WAKE_TIMES clear only follows a transition WE own; the woken
+                    // thread can't re-park before it lands because parking requires
+                    // running, and running requires a switch under POOL — held here.
+                    if THREAD_STATES[i]
+                        .compare_exchange(
+                            thread_state::WAITING,
+                            thread_state::READY,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                    {
+                        WAKE_TIMES[i].store(0, Ordering::SeqCst);
+                        woke_any = true;
+                    }
                 }
             }
         }
@@ -2308,9 +2507,14 @@ impl ThreadPool {
                     if core_id < MAX_CORES {
                         PER_CORE_OFFCPU[core_id].store(current_idx, Ordering::SeqCst);
                     }
-                    if current_state != thread_state::TERMINATED && current_state != thread_state::WAITING {
-                        THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
-                    }
+                    // Atomic re-READY of the outgoing thread — see commit_switch for
+                    // why this must not be a check-then-store.
+                    let _ = THREAD_STATES[current_idx].fetch_update(
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                        |s| (s != thread_state::TERMINATED && s != thread_state::WAITING)
+                            .then_some(thread_state::READY),
+                    );
                     THREAD_STATES[net_tid].store(thread_state::RUNNING, Ordering::SeqCst);
                     self.slots[net_tid].start_time_us = now;
                     set_current_thread_register(net_tid);
@@ -2410,10 +2614,6 @@ impl ThreadPool {
             PER_CORE_OFFCPU[core].store(current_idx, Ordering::SeqCst);
         }
 
-        // Don't change state if the outgoing thread is TERMINATED or WAITING —
-        // WAITING threads keep their state so the wake-pass handles them.
-        let current_state = THREAD_STATES[current_idx].load(Ordering::SeqCst);
-
         // Accumulate CPU time for the thread being scheduled out.
         let start = self.slots[current_idx].start_time_us;
         if start > 0 {
@@ -2421,9 +2621,20 @@ impl ThreadPool {
             TOTAL_CPU_TIMES[current_idx].fetch_add(elapsed, Ordering::Relaxed);
         }
 
-        if current_state != thread_state::TERMINATED && current_state != thread_state::WAITING {
-            THREAD_STATES[current_idx].store(thread_state::READY, Ordering::SeqCst);
-        }
+        // Put the outgoing thread back to READY — unless it is TERMINATED or
+        // WAITING (WAITING keeps its state so the wake-pass handles it). This
+        // must be one atomic RMW, not check-then-store: `mark_thread_terminated`
+        // is called cross-thread with no lock (kill_thread_group), so a
+        // TERMINATED can land between a load here and a plain READY store —
+        // resurrecting a killed thread whose address space teardown is already
+        // under way. It would then be picked by a peer and run on freed (and
+        // possibly recycled) page tables.
+        let _ = THREAD_STATES[current_idx].fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |s| (s != thread_state::TERMINATED && s != thread_state::WAITING)
+                .then_some(thread_state::READY),
+        );
         THREAD_STATES[next_idx].store(thread_state::RUNNING, Ordering::SeqCst);
         // Record the core the incoming thread is now running on. commit_switch always
         // runs on the core that will run next_idx (single runqueue, each core schedules
@@ -2828,12 +3039,25 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             (*old_ctx).sp = current_sp;
             
             // Save current TTBR0 to old context
-            // CRITICAL: Processes set their own TTBR0 via activate(), 
+            // CRITICAL: Processes set their own TTBR0 via activate(),
             // so we must save it here to restore correctly later
             let current_ttbr0: u64;
             core::arch::asm!("mrs {}, ttbr0_el1", out(reg) current_ttbr0);
             (*old_ctx).ttbr0 = current_ttbr0;
-            
+
+            // TTBR0 tripwire, save side (§2f AS MISMATCH hunt, see EXPECTED_L0):
+            // the live tables at switch-out must be the outgoing thread's own.
+            // A miss here means this thread was RUNNING under someone else's L0
+            // — and the save above just made that permanent in its context.
+            {
+                let expected = EXPECTED_L0[old_idx].load(Ordering::Acquire);
+                if expected != 0 && current_ttbr0 & TTBR0_L0_MASK != expected {
+                    safe_print!(160,
+                        "[TTBR SAVE-MISMATCH] core={} old_tid={} live={:#x} expected_l0={:#x} new_tid={}\n",
+                        core_id, old_idx, current_ttbr0, expected, new_idx);
+                }
+            }
+
             // Load new SP from new context
             let new_sp = (*new_ctx).sp;
             
@@ -2848,6 +3072,21 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             
             // Load TTBR0 for new thread
             let new_ttbr0 = (*new_ctx).ttbr0;
+
+            // TTBR0 tripwire, restore side: the tables we are about to install
+            // must be the incoming thread's own. A miss means its saved context
+            // was corrupted while it was off-CPU (a wrong-old_idx save, or a
+            // stale-slot revival — the READY-on-INITIALIZING race).
+            SWITCH_INS[new_idx].fetch_add(1, Ordering::Relaxed);
+            {
+                let expected = EXPECTED_L0[new_idx].load(Ordering::Acquire);
+                if expected != 0 && new_ttbr0 & TTBR0_L0_MASK != expected {
+                    safe_print!(160,
+                        "[TTBR LOAD-MISMATCH] core={} new_tid={} ctx={:#x} expected_l0={:#x} old_tid={}\n",
+                        core_id, new_idx, new_ttbr0, expected, old_idx);
+                }
+            }
+
             core::arch::asm!(
                 "dsb ish",
                 "msr ttbr0_el1, {ttbr0}",
@@ -2888,7 +3127,12 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             // and reused) stack — the restore would eret with whatever kernel
             // locals live there, which is exactly the §5.1 "EL0 return with a
             // kernel register context" shape (BKL_RUSTC_SCALING_BASELINE.md).
-            {
+            // Idle threads are exempt: each core's idle is seeded at bringup on
+            // its per-core BOOT stack (see the "sp/ttbr0 are captured on the
+            // first switch-out from idle" seeding), which is not the pool stack
+            // registered for its slot — every switch into an idle thread fired
+            // this line, ~20k times per SMP=4 boot, drowning the real signal.
+            if !IS_IDLE_THREAD[new_idx].load(Ordering::Relaxed) {
                 let si = &pool.stacks[new_idx];
                 let lo = si.base as u64;
                 let hi = si.top as u64;
@@ -2961,7 +3205,17 @@ pub fn update_thread_context(thread_id: usize, user_context: &crate::process::Us
             
             ctx.spsr = user_context.spsr;
             ctx.ttbr0 = user_context.ttbr0;
-            
+
+            // TTBR0 tripwire baseline. Only when building ANOTHER thread's context
+            // (clone/fork/vfork child init — the canonical ttbr0 the parent chose).
+            // For the current thread (execve rewriting itself) the expected value
+            // must follow the LIVE tables, which `activate()` stamps when it
+            // installs them; stamping the new L0 here would false-positive the
+            // save-side check if we're preempted before that activate.
+            if thread_id != get_current_thread_register() {
+                note_thread_expected_l0(thread_id, user_context.ttbr0);
+            }
+
             ctx.user_entry = user_context.pc;
             ctx.user_sp = user_context.sp;
             ctx.user_tls = user_context.tpidr;
@@ -2991,27 +3245,65 @@ pub fn update_thread_context(thread_id: usize, user_context: &crate::process::Us
 
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
-/// Waker implementation for thread-based waking
+/// Waker implementation for thread-based waking. Carries a [`WakeHandle`], so
+/// it wakes one *incarnation* of the slot — a waker created for a thread that
+/// has since exited (and whose slot was recycled) does nothing at all.
 pub struct ThreadWaker {
-    thread_id: usize,
+    handle: WakeHandle,
 }
 
 impl ThreadWaker {
+    /// Waker for `thread_id`'s CURRENT incarnation — the caller must know the
+    /// tid is live now (see [`wake_handle_for_thread`]).
     pub fn new(thread_id: usize) -> Self {
-        Self { thread_id }
+        Self { handle: wake_handle_for_thread(thread_id) }
     }
 
     /// Wake the thread associated with this waker
     pub fn wake(&self) {
-        let tid = self.thread_id;
+        let tid = self.handle.tid();
         if tid < MAX_THREADS {
+            // Generation gate FIRST, before any side effect: a stale handle's
+            // sticky-flag store would spend a phantom wake on the slot's next
+            // occupant (an early return from its first park), and its READY
+            // CAS could fire against a new occupant that happens to be
+            // legitimately WAITING — a spurious wake of the wrong thread.
+            // (A recycle that lands between this check and the stores below is
+            // the same benign spurious-wake, shrunk from an unbounded window
+            // to a few instructions; the CAS below keeps it corruption-free.)
+            if !self.handle.is_current() {
+                return;
+            }
+
             // Set sticky wake flag so schedule_blocking knows we were woken
             WOKEN_STATES[tid].store(true, Ordering::SeqCst);
 
-            // Only wake if thread is actually WAITING
-            if THREAD_STATES[tid].load(Ordering::SeqCst) == thread_state::WAITING {
-                WAKE_TIMES[tid].store(0, Ordering::SeqCst);
-                THREAD_STATES[tid].store(thread_state::READY, Ordering::SeqCst);
+            // WAITING -> READY must be a CAS, not check-then-store. This runs with no
+            // lock and is preemptible between the two halves, so a check-then-store
+            // waker that gets switched out after observing WAITING can resume
+            // arbitrarily later — after the target woke by timeout, ran, exited, and
+            // its slot was reclaimed and re-claimed by a new clone — and then stamp
+            // READY onto an INITIALIZING (context half-written) or TERMINATED slot.
+            // A peer scheduler picking that slot restores the PREVIOUS occupant's
+            // context: its ttbr0 (a third party's page tables — the §2f
+            // "AS MISMATCH" in debug-thread-spawn-segv.md) and its kernel stack,
+            // possibly still in use (double-run — the [BKL] stuck storm shape).
+            //
+            // WAKE_TIMES is deliberately NOT cleared here: the same stale-waker
+            // window let the old `store(0)` erase a FRESH deadline the slot's new
+            // occupant had just published (mark_thread_waiting), leaving it parked
+            // forever with no timeout. Every sleep entry rewrites WAKE_TIMES, and
+            // the wake-pass only reads it for WAITING threads, so a leftover value
+            // on a READY thread is inert.
+            if THREAD_STATES[tid]
+                .compare_exchange(
+                    thread_state::WAITING,
+                    thread_state::READY,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
                 // Wakeup locality (gated off — see PREEMPT_WAKE_TID / WAKEUP_LOCALITY_HINT).
                 if WAKEUP_LOCALITY_HINT {
                     PREEMPT_WAKE_TID.store(tid, Ordering::SeqCst);
@@ -3032,22 +3324,17 @@ impl ThreadWaker {
     }
 }
 
-/// Marks the thread with the given ID as READY.
-fn mark_thread_ready_from_waker(thread_id: usize) {
-    let waker = ThreadWaker::new(thread_id);
-    waker.wake();
-}
-
-/// Creates a RawWaker that, when woken, marks the specified thread as READY.
-fn waker_from_thread_id(thread_id: usize) -> RawWaker {
-    let ptr = thread_id as *const ();
+/// Creates a RawWaker around a packed [`WakeHandle`] — the generation rides in
+/// the data pointer, so a `Waker` cloned into an executor or wait registry
+/// stays incarnation-bound with no allocation.
+fn waker_from_handle(handle: WakeHandle) -> RawWaker {
+    let ptr = handle.0 as *const ();
     RawWaker::new(ptr, &THREAD_WAKER_VTABLE)
 }
 
-/// Creates a waker for the current thread.
+/// Creates a waker for the current thread (its current incarnation).
 pub fn current_thread_waker() -> Waker {
-    let tid = get_current_thread_register();
-    unsafe { Waker::from_raw(waker_from_thread_id(tid)) }
+    unsafe { Waker::from_raw(waker_from_handle(current_wake_handle())) }
 }
 
 const THREAD_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
@@ -3058,25 +3345,29 @@ const THREAD_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 );
 
 unsafe fn thread_waker_clone(data: *const ()) -> RawWaker {
-    waker_from_thread_id(data as usize)
+    RawWaker::new(data, &THREAD_WAKER_VTABLE)
 }
 
 unsafe fn thread_waker_wake(data: *const ()) {
-    mark_thread_ready_from_waker(data as usize);
+    wake_by_handle(WakeHandle(data as u64));
 }
 
 unsafe fn thread_waker_wake_by_ref(data: *const ()) {
-    mark_thread_ready_from_waker(data as usize);
+    wake_by_handle(WakeHandle(data as u64));
 }
 
 unsafe fn thread_waker_drop(_data: *const ()) {
     // No-op, waker doesn't own any resources
 }
 
-/// Returns a Waker for the specified thread ID.
-/// When this waker is invoked (wake() is called), the target thread will be marked READY.
+/// Returns a Waker for `thread_id`'s CURRENT incarnation. Only meaningful
+/// where the caller knows the tid is live right now — a waiter registering
+/// itself, or a wake site that has just validated liveness. Calling this at
+/// wake time on a tid stored long ago launders a stale tid into a
+/// fresh-looking handle; store a [`WakeHandle`] at enqueue time instead and
+/// wake with [`wake_by_handle`].
 pub fn get_waker_for_thread(thread_id: usize) -> Waker {
-    unsafe { Waker::from_raw(waker_from_thread_id(thread_id)) }
+    unsafe { Waker::from_raw(waker_from_handle(wake_handle_for_thread(thread_id))) }
 }
 
 /// Block the current thread until the specified wake time, then yield
@@ -3148,11 +3439,23 @@ fn publish_waiting_and_take_pending_wake(tid: usize, wake_time_us: u64) -> bool 
     // never will. Undo the publication ourselves.
     WAKE_TIMES[tid].store(0, Ordering::SeqCst);
     // Same guard as the park loop: `kill_thread_group` may have marked us TERMINATED,
-    // and resuming as RUNNING would return to user mode with freed resources.
-    if THREAD_STATES[tid].load(Ordering::SeqCst) != thread_state::TERMINATED {
-        THREAD_STATES[tid].store(thread_state::RUNNING, Ordering::SeqCst);
-    }
+    // and resuming as RUNNING would return to user mode with freed resources. One
+    // atomic RMW — a TERMINATED landing between a load and a plain store would be
+    // overwritten (see commit_switch).
+    resume_running_unless_terminated(tid);
     true
+}
+
+/// Flip `tid` back to RUNNING unless it has been marked TERMINATED — as one atomic
+/// RMW, so a cross-thread `mark_thread_terminated` (kill_thread_group) can never be
+/// overwritten by the resume. Only ever called by the thread itself as it comes out
+/// of a park, where every state except TERMINATED means "we own the slot again".
+fn resume_running_unless_terminated(tid: usize) {
+    let _ = THREAD_STATES[tid].fetch_update(
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+        |s| (s != thread_state::TERMINATED).then_some(thread_state::RUNNING),
+    );
 }
 
 pub fn schedule_blocking(wake_time_us: u64) {
@@ -3210,10 +3513,9 @@ pub fn schedule_blocking(wake_time_us: u64) {
             // Don't overwrite TERMINATED — kill_thread_group may have marked
             // this thread terminated while we were waiting. Resuming as
             // RUNNING would let the thread return to user mode with freed
-            // resources (lazy regions cleared, fds closed).
-            if THREAD_STATES[tid].load(Ordering::SeqCst) != thread_state::TERMINATED {
-                THREAD_STATES[tid].store(thread_state::RUNNING, Ordering::SeqCst);
-            }
+            // resources (lazy regions cleared, fds closed). Atomic RMW so a
+            // TERMINATED landing mid-check can't be overwritten.
+            resume_running_unless_terminated(tid);
             break;
         }
 
@@ -3221,10 +3523,12 @@ pub fn schedule_blocking(wake_time_us: u64) {
         if state != thread_state::WAITING {
             break;
         }
-        
+
         if crate::process::is_current_interrupted() {
             WAKE_TIMES[tid].store(0, Ordering::SeqCst);
-            THREAD_STATES[tid].store(thread_state::RUNNING, Ordering::SeqCst);
+            // Same TERMINATED guard as above — the old unconditional RUNNING
+            // store here could resurrect a thread killed while it waited.
+            resume_running_unless_terminated(tid);
             break;
         }
         
@@ -4362,6 +4666,155 @@ mod park_wake_race_tests {
         assert!(!WOKEN_STATES[tid].load(Ordering::SeqCst), "flag must be consumed once");
 
         THREAD_STATES[tid].store(thread_state::FREE, Ordering::SeqCst);
+    }
+}
+
+/// Regression tests for the stale-wake / cross-kill state-transition races
+/// (debug-thread-spawn-segv.md §2f). The corruption they pin down: a wake or a
+/// spawn publish landing as a plain READY *store* could overwrite INITIALIZING
+/// (a clone child whose context is half-written — a peer then runs the slot's
+/// previous occupant's ttbr0 and kernel stack: the `AS MISMATCH` / `[BKL] stuck`
+/// shape) or TERMINATED (resurrecting a killed thread onto freed page tables).
+/// Every transition is now a CAS/fetch_update; these tests assert the refusal
+/// semantics directly. Slots 35..40 — disjoint from every other module here
+/// (40/41 signal_mask, 42-44 pending_kill, 45..50 park_wake, 50..64 contexts).
+#[cfg(test)]
+mod state_transition_guard_tests {
+    use super::*;
+
+    #[test]
+    fn a_stale_waker_cannot_revive_a_non_waiting_slot() {
+        crate::test_support::ensure_test_runtime();
+        let tid = 35;
+        for &state in &[
+            thread_state::INITIALIZING, // the §2f corruption: half-built clone child
+            thread_state::TERMINATED,   // a killed thread mid-teardown
+            thread_state::FREE,         // a recycled slot
+            thread_state::RUNNING,      // live on another core
+            thread_state::READY,        // already runnable — nothing to do
+        ] {
+            THREAD_STATES[tid].store(state, Ordering::SeqCst);
+            WOKEN_STATES[tid].store(false, Ordering::SeqCst);
+
+            ThreadWaker::new(tid).wake();
+
+            assert_eq!(
+                THREAD_STATES[tid].load(Ordering::SeqCst), state,
+                "a waker must only ever transition WAITING -> READY; overwriting \
+                 state {state} hands a peer scheduler a slot whose context does \
+                 not belong to a runnable thread"
+            );
+            assert!(WOKEN_STATES[tid].load(Ordering::SeqCst),
+                "the sticky flag is still armed so a wake-before-park is not lost");
+        }
+        THREAD_STATES[tid].store(thread_state::FREE, Ordering::SeqCst);
+        WOKEN_STATES[tid].store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_successful_wake_does_not_touch_the_deadline() {
+        crate::test_support::ensure_test_runtime();
+        let tid = 36;
+        // The old waker cleared WAKE_TIMES *after* its WAITING check; preempted
+        // between the two, the clear could land on a FRESH deadline the slot's
+        // next occupant had just published — a thread parked forever. The waker
+        // now never writes WAKE_TIMES (every sleep entry rewrites it).
+        THREAD_STATES[tid].store(thread_state::WAITING, Ordering::SeqCst);
+        WAKE_TIMES[tid].store(5_555, Ordering::SeqCst);
+        WOKEN_STATES[tid].store(false, Ordering::SeqCst);
+
+        ThreadWaker::new(tid).wake();
+
+        assert_eq!(THREAD_STATES[tid].load(Ordering::SeqCst), thread_state::READY,
+            "the legitimate WAITING -> READY transition still works");
+        assert_eq!(WAKE_TIMES[tid].load(Ordering::SeqCst), 5_555,
+            "the waker must not write WAKE_TIMES — a stale one erasing a fresh \
+             deadline is the parked-forever wedge");
+
+        THREAD_STATES[tid].store(thread_state::FREE, Ordering::SeqCst);
+        WAKE_TIMES[tid].store(0, Ordering::SeqCst);
+        WOKEN_STATES[tid].store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn spawn_publish_cannot_resurrect_a_terminated_child() {
+        let tid = 37;
+        // A group kill that lands on a half-built child between context setup and
+        // the parent's publish must win: READY here would run a thread whose
+        // process teardown is already in progress.
+        THREAD_STATES[tid].store(thread_state::TERMINATED, Ordering::SeqCst);
+        mark_thread_ready(tid);
+        assert_eq!(THREAD_STATES[tid].load(Ordering::SeqCst), thread_state::TERMINATED,
+            "mark_thread_ready must never overwrite TERMINATED");
+
+        // The normal spawn publish still works.
+        THREAD_STATES[tid].store(thread_state::INITIALIZING, Ordering::SeqCst);
+        mark_thread_ready(tid);
+        assert_eq!(THREAD_STATES[tid].load(Ordering::SeqCst), thread_state::READY);
+
+        THREAD_STATES[tid].store(thread_state::FREE, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn park_resume_cannot_resurrect_a_terminated_thread() {
+        let tid = 38;
+        THREAD_STATES[tid].store(thread_state::TERMINATED, Ordering::SeqCst);
+        resume_running_unless_terminated(tid);
+        assert_eq!(THREAD_STATES[tid].load(Ordering::SeqCst), thread_state::TERMINATED,
+            "a thread killed while parked must stay TERMINATED through its resume");
+
+        THREAD_STATES[tid].store(thread_state::WAITING, Ordering::SeqCst);
+        resume_running_unless_terminated(tid);
+        assert_eq!(THREAD_STATES[tid].load(Ordering::SeqCst), thread_state::RUNNING,
+            "a normal park resume still transitions to RUNNING");
+
+        THREAD_STATES[tid].store(thread_state::FREE, Ordering::SeqCst);
+    }
+
+    /// The case the state CAS alone cannot defend: the slot's NEW occupant is
+    /// legitimately WAITING, so a stale waker's WAITING→READY transition would
+    /// succeed — waking the wrong thread with a wake meant for its predecessor.
+    /// The generation in the handle is what refuses it.
+    #[test]
+    fn a_stale_handle_is_refused_even_against_a_waiting_new_occupant() {
+        crate::test_support::ensure_test_runtime();
+        // Slot 39: claim through the REAL claim path so scrub bumps SLOT_GEN.
+        let Some(tid) = claim_free_slot(39, 40) else {
+            panic!("slot 39 unexpectedly busy — this module owns 35..40");
+        };
+        let gen_first = thread_generation(tid);
+        let stale = wake_handle_for_thread(tid);
+        assert!(stale.is_current());
+
+        // The thread dies; the slot is recycled to a new occupant.
+        release_test_thread_slot(tid);
+        let tid2 = claim_free_slot(39, 40).expect("re-claim of slot 39");
+        assert_eq!(tid, tid2, "the range pins the same slot");
+        assert!(thread_generation(tid) > gen_first, "claim-time scrub must bump the generation");
+        assert!(!stale.is_current(), "the old incarnation's handle must have gone stale");
+
+        // New occupant parks, legitimately, with a deadline.
+        THREAD_STATES[tid].store(thread_state::WAITING, Ordering::SeqCst);
+        WAKE_TIMES[tid].store(7_777, Ordering::SeqCst);
+        WOKEN_STATES[tid].store(false, Ordering::SeqCst);
+
+        wake_by_handle(stale);
+
+        assert_eq!(THREAD_STATES[tid].load(Ordering::SeqCst), thread_state::WAITING,
+            "a stale handle must not wake the slot's new occupant");
+        assert!(!WOKEN_STATES[tid].load(Ordering::SeqCst),
+            "a stale handle must not even arm the sticky flag — that spends a \
+             phantom wake on the new occupant's next park");
+        assert_eq!(WAKE_TIMES[tid].load(Ordering::SeqCst), 7_777);
+
+        // A handle for the CURRENT incarnation still works.
+        wake_by_handle(wake_handle_for_thread(tid));
+        assert_eq!(THREAD_STATES[tid].load(Ordering::SeqCst), thread_state::READY);
+        assert!(WOKEN_STATES[tid].load(Ordering::SeqCst));
+
+        WOKEN_STATES[tid].store(false, Ordering::SeqCst);
+        WAKE_TIMES[tid].store(0, Ordering::SeqCst);
+        release_test_thread_slot(tid);
     }
 }
 

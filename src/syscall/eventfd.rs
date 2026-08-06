@@ -1,10 +1,12 @@
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
+use akuma_exec::threading::{WakeHandle, wake_by_handle, wake_handle_for_thread};
 use super::*;
 
 struct KernelEventFd {
     counter: u64,
     flags: u32,
-    pollers: BTreeSet<usize>,
+    /// tid -> generation-tagged handle (minted at registration); see pipe.rs pollers.
+    pollers: BTreeMap<usize, WakeHandle>,
     ref_count: u32,
 }
 
@@ -21,7 +23,7 @@ pub fn eventfd_create(initval: u32, flags: u32) -> u32 {
         EVENTFDS.lock().insert(id, KernelEventFd {
             counter: u64::from(initval),
             flags,
-            pollers: BTreeSet::new(),
+            pollers: BTreeMap::new(),
             ref_count: 1,
         });
     });
@@ -46,8 +48,8 @@ pub(super) fn eventfd_read(id: u32) -> Result<u64, i32> {
             
             // Wake other pollers (e.g. ones waiting for it to become writable,
             // though eventfd is always writable in this implementation).
-            while let Some(tid) = efd.pollers.pop_first() {
-                akuma_exec::threading::get_waker_for_thread(tid).wake();
+            while let Some((_tid, handle)) = efd.pollers.pop_first() {
+                wake_by_handle(handle);
             }
 
             Ok(val)
@@ -67,8 +69,8 @@ pub fn eventfd_write(id: u32, val: u64) -> Result<(), i32> {
             }
             
             // Wake all pollers
-            while let Some(tid) = efd.pollers.pop_first() {
-                akuma_exec::threading::get_waker_for_thread(tid).wake();
+            while let Some((_tid, handle)) = efd.pollers.pop_first() {
+                wake_by_handle(handle);
             }
 
             Ok(val)
@@ -120,7 +122,7 @@ pub fn eventfd_close(id: u32) {
 pub fn eventfd_add_poller(id: u32, tid: usize) {
     crate::irq::with_irqs_disabled(|| {
         if let Some(efd) = EVENTFDS.lock().get_mut(&id) {
-            efd.pollers.insert(tid);
+            efd.pollers.insert(tid, wake_handle_for_thread(tid));
         }
     });
 }

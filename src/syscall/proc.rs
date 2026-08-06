@@ -1,11 +1,15 @@
 use super::*;
 use akuma_net::socket::libc_errno;
 
-// Maps child PID → parent thread ID for processes created with CLONE_VFORK.
-// The parent blocks after fork until the child calls execve (success) or exits.
-// Without this, both parent and child run the Go runtime concurrently in the
-// same address space, causing memory corruption.
-static VFORK_WAITERS: Spinlock<BTreeMap<u32, usize>> = Spinlock::new(BTreeMap::new());
+// Maps child PID → the parent thread's generation-tagged WakeHandle for processes
+// created with CLONE_VFORK. The parent blocks after fork until the child calls
+// execve (success) or exits. Without this, both parent and child run the Go
+// runtime concurrently in the same address space, causing memory corruption.
+// A WakeHandle rather than a bare tid: the parent registers itself (live by
+// definition), and if it is killed and its slot recycled before the child ever
+// execs, the eventual vfork_complete wakes nobody instead of the new occupant.
+static VFORK_WAITERS: Spinlock<BTreeMap<u32, akuma_exec::threading::WakeHandle>> =
+    Spinlock::new(BTreeMap::new());
 
 /// Mark the child channel as exited so `pidfd_can_read` and `find_exited_child`
 /// return immediately, AND raise SIGCHLD on the parent.  Called from
@@ -30,11 +34,11 @@ pub fn notify_child_channel_exited_pub(pid: u32, code: i32) {
 /// Called from do_execve (on successful image replacement), sys_exit_group/sys_exit,
 /// and fault exit paths in exceptions.rs.
 pub fn vfork_complete(child_pid: u32) {
-    let parent_tid = crate::irq::with_irqs_disabled(|| {
+    let parent = crate::irq::with_irqs_disabled(|| {
         VFORK_WAITERS.lock().remove(&child_pid)
     });
-    if let Some(tid) = parent_tid {
-        akuma_exec::threading::get_waker_for_thread(tid).wake();
+    if let Some(handle) = parent {
+        akuma_exec::threading::wake_by_handle(handle);
     }
 }
 
@@ -48,9 +52,8 @@ pub fn vfork_waiters_len() -> usize {
 /// `vfork_complete`, and return whether the entry was cleanly removed.
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub fn test_vfork_complete_mechanism(child_pid: u32) -> bool {
-    let tid = akuma_exec::threading::current_thread_id();
     crate::irq::with_irqs_disabled(|| {
-        VFORK_WAITERS.lock().insert(child_pid, tid);
+        VFORK_WAITERS.lock().insert(child_pid, akuma_exec::threading::current_wake_handle());
     });
     vfork_complete(child_pid);
     let still_present = crate::irq::with_irqs_disabled(|| {
@@ -62,8 +65,7 @@ pub fn test_vfork_complete_mechanism(child_pid: u32) -> bool {
 /// Kernel test helper: insert a fake vfork entry without invoking vfork_complete.
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub fn vfork_waiters_insert_for_test(child_pid: u32) {
-    let tid = akuma_exec::threading::current_thread_id();
-    VFORK_WAITERS.lock().insert(child_pid, tid);
+    VFORK_WAITERS.lock().insert(child_pid, akuma_exec::threading::current_wake_handle());
 }
 
 /// Kernel test helper: check whether a child PID is still in VFORK_WAITERS.
@@ -486,10 +488,9 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
         // marks the child thread READY.  If we insert after fork_process returns, there
         // is a race window where the child can exec, call vfork_complete (which removes
         // the entry), and find nothing — leaving the parent blocked forever.
-        let parent_tid = akuma_exec::threading::current_thread_id();
         if flags & CLONE_VFORK != 0 {
             crate::irq::with_irqs_disabled(|| {
-                VFORK_WAITERS.lock().insert(child_pid, parent_tid);
+                VFORK_WAITERS.lock().insert(child_pid, akuma_exec::threading::current_wake_handle());
             });
         }
 

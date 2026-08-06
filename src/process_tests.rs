@@ -418,6 +418,7 @@ pub fn run_all_tests() {
     test_zombie_process_unregistered_after_return_to_kernel();
     test_trap_frame_cleared_when_thread_slot_recycled();
     test_on_cpu_gate_lifecycle();
+    test_wake_transition_guards();
     test_unregister_skips_recycled_thread_slot();
 
     // fd table lock consistency + orphan cleanup + pidfd cloexec
@@ -10271,6 +10272,59 @@ fn test_on_cpu_gate_lifecycle() {
             "[Test] on_cpu_gate_lifecycle FAILED: self_before={} fresh_clear={} \
              self_after={} count={} (bound {})\n",
             self_set_before, fresh_clear, self_set_after, count, 2 * MAX_CORES);
+    }
+}
+
+/// Regression test for the stale-wake / cross-kill state-transition races
+/// (debug-thread-spawn-segv.md §2f, the `AS MISMATCH` + `[BKL] stuck` family).
+/// A wake must only ever transition WAITING -> READY, and the spawn publish
+/// (`mark_thread_ready`) must never overwrite TERMINATED: either overwrite
+/// hands a peer scheduler a slot whose saved context belongs to a previous
+/// occupant (foreign ttbr0, in-use kernel stack) or to a thread whose process
+/// teardown is under way. Only the *refusal* semantics are probed here — the
+/// positive WAITING -> READY path is exercised by every futex wake this boot,
+/// and flipping a contextless test slot READY in a live kernel would invite the
+/// scheduler to run it.
+fn test_wake_transition_guards() {
+    use akuma_exec::threading::{
+        claim_test_thread_slots, release_test_thread_slot, get_thread_state,
+        get_woken_state, set_woken_state, set_thread_state, mark_thread_ready,
+        thread_state, ThreadWaker,
+    };
+
+    let claimed = claim_test_thread_slots(1);
+    let Some(&tid) = claimed.first() else {
+        console::print("[Test] wake_transition_guards SKIPPED (no free slot)\n");
+        return;
+    };
+
+    // 1. A stale waker must not revive an INITIALIZING slot (half-built clone
+    //    child — the §2f corruption).
+    ThreadWaker::new(tid).wake();
+    let init_kept = get_thread_state(tid) == thread_state::INITIALIZING;
+    let sticky_armed = get_woken_state(tid);
+    set_woken_state(tid, false);
+
+    // 2. The spawn publish must not resurrect a TERMINATED child (group kill
+    //    landing between context setup and publish).
+    set_thread_state(tid, thread_state::TERMINATED);
+    mark_thread_ready(tid);
+    let term_kept_publish = get_thread_state(tid) == thread_state::TERMINATED;
+
+    // 3. Neither must a stale waker.
+    ThreadWaker::new(tid).wake();
+    let term_kept_wake = get_thread_state(tid) == thread_state::TERMINATED;
+    set_woken_state(tid, false);
+
+    release_test_thread_slot(tid);
+
+    if init_kept && sticky_armed && term_kept_publish && term_kept_wake {
+        console::print("[Test] wake_transition_guards PASSED\n");
+    } else {
+        crate::safe_print!(192,
+            "[Test] wake_transition_guards FAILED: init_kept={} sticky={} \
+             term_publish={} term_wake={}\n",
+            init_kept, sticky_armed, term_kept_publish, term_kept_wake);
     }
 }
 

@@ -1085,22 +1085,31 @@ impl UserAddressSpace {
 
     pub fn activate(&self) {
         let _ttbr0 = self.ttbr0();
+        // IRQs masked so the install and the expected-L0 note (the switch-path
+        // tripwire baseline, see threading::EXPECTED_L0) are one atomic step —
+        // a preemption between them would save/check live tables against the
+        // other value and false-positive.
+        let _irq = IrqGuard::new();
         flush_tlb_all();
         #[cfg(target_os = "none")]
         unsafe {
             core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) _ttbr0);
         }
         flush_tlb_all();
+        crate::threading::note_current_expected_l0(_ttbr0);
     }
 
     pub fn deactivate() {
         let _boot_ttbr0 = get_boot_ttbr0();
+        // Same IRQ guard as activate() — install + note must not be split.
+        let _irq = IrqGuard::new();
         flush_tlb_all();
         #[cfg(target_os = "none")]
         unsafe {
             core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) _boot_ttbr0);
         }
         flush_tlb_all();
+        crate::threading::note_current_expected_l0(_boot_ttbr0);
     }
 }
 
