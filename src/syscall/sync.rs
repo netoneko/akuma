@@ -691,7 +691,7 @@ pub mod test_hooks {
 
     pub fn requeue(key1: (u32, usize), key2: (u32, usize), max_wake: u32, max_requeue: u32) -> (Vec<usize>, usize) {
         let (to_wake, requeued) = futex_requeue_table(key1, key2, max_wake, max_requeue);
-        (to_wake.into_iter().map(|h| h.tid()).collect(), requeued)
+        (to_wake.into_iter().map(akuma_exec::threading::WakeHandle::tid).collect(), requeued)
     }
 
     pub fn dequeue(key: (u32, usize), tid: usize) {

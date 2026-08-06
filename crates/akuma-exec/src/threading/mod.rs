@@ -3886,8 +3886,61 @@ where
     spawn_user_thread_fn_internal(f, cooperative, false)
 }
 
+/// Initialize a freshly claimed slot's [`Context`] for a brand-new thread.
+///
+/// Slots are **recycled**, so this must reset every field the previous occupant
+/// could have written — not merely the ones the new thread needs to start.
+///
+/// The published user-mode triple (`user_entry` / `user_sp` / `user_tls`) is the
+/// one that bites. [`get_saved_user_context`]'s fallback path returns it verbatim
+/// for any thread with no live trap frame, gated only on `is_user_process` —
+/// which this function sets. Leaving the triple stale therefore hands a *new*
+/// process the previous occupant's user entry point and stack pointer, with
+/// every general-purpose register zeroed. When that previous occupant was a
+/// dynamically linked binary, the inherited entry point is **ld-musl's
+/// `_dlstart`**, so the new process re-runs musl's RELR `*slot += base` loop over
+/// an address space whose interpreter data page is already relocated. Each such
+/// birth adds one more `base` to the same physical word, which is precisely the
+/// `N × INTERP_BASE + 0x6c964` instruction-abort class (fingerprint: constant
+/// `SP_EL0`, `x19 = x20 = x29 = x30 = 0`, one shared frame PA, `N` monotone per
+/// boot) — see `docs/runbooks/debug-thread-spawn-segv.md`, class 2.
+///
+/// Split out of `spawn_user_thread_fn_internal` only so the reset is reachable
+/// from a host test; `#[inline]` keeps the spawn path's codegen as it was.
+#[inline]
+fn init_thread_slot_context(
+    slot_idx: usize,
+    sp: u64,
+    boot_ttbr0: u64,
+    trampoline: u64,
+    closure_ptr: u64,
+    x21: u64,
+    start_irqs_disabled: bool,
+) {
+    // SAFETY: the slot was just claimed by this caller and is not READY yet, so
+    // no scheduler can be reading the context concurrently.
+    unsafe {
+        let ctx = &mut *get_context_mut(slot_idx);
+        ctx.magic = CONTEXT_MAGIC;
+        ctx.sp = sp;
+        ctx.ttbr0 = boot_ttbr0;
+        // Legacy fields for compatibility with old scheduler path
+        ctx.x19 = trampoline;
+        ctx.x20 = closure_ptr;
+        ctx.x21 = x21;
+        ctx.x30 = thread_start_closure as *const () as u64;
+        ctx.elr = thread_start_closure as *const () as u64;
+        ctx.spsr = 0x00000345; // EL1h, IRQs enabled
+        ctx.is_user_process = if start_irqs_disabled { 1 } else { 0 };
+        // Drop the previous occupant's published user context (see fn docs).
+        ctx.user_entry = 0;
+        ctx.user_sp = 0;
+        ctx.user_tls = 0;
+    }
+}
+
 /// Internal implementation for spawning user threads
-/// 
+///
 /// - cooperative: if true, thread runs cooperatively (longer time slice, no forced preemption)
 /// - start_irqs_disabled: if true, thread starts with IRQs disabled (for process threads)
 fn spawn_user_thread_fn_internal<F>(f: F, cooperative: bool, start_irqs_disabled: bool) -> Result<usize, &'static str>
@@ -3950,21 +4003,15 @@ where
             x21,                                       // x21 - IRQ enable flag
         );
 
-        // Write minimal context - only SP and TTBR0 needed for stack-based switching
-        unsafe {
-            let ctx = &mut *get_context_mut(slot_idx);
-            ctx.magic = CONTEXT_MAGIC;
-            ctx.sp = sp;
-            ctx.ttbr0 = boot_ttbr0;
-            // Legacy fields for compatibility with old scheduler path
-            ctx.x19 = trampoline as *const () as u64;
-            ctx.x20 = closure_ptr as u64;
-            ctx.x21 = x21;
-            ctx.x30 = thread_start_closure as *const () as u64;
-            ctx.elr = thread_start_closure as *const () as u64;
-            ctx.spsr = 0x00000345; // EL1h, IRQs enabled
-            ctx.is_user_process = if start_irqs_disabled { 1 } else { 0 };
-        }
+        init_thread_slot_context(
+            slot_idx,
+            sp,
+            boot_ttbr0,
+            trampoline as *const () as u64,
+            closure_ptr as u64,
+            x21,
+            start_irqs_disabled,
+        );
 
         // Write slot metadata (needs POOL lock)
         {
@@ -4189,7 +4236,13 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserCo
     with_irqs_disabled(|| {
         let ctx = unsafe { &*get_context(thread_id) };
         
-        if ctx.is_user_process != 0 {
+        // `is_user_process` alone is not enough: `init_thread_slot_context` sets it
+        // for every process thread at spawn, before the thread has ever published a
+        // user context. Requiring a non-zero `user_entry` means a caller building a
+        // child from this thread (fork/vfork/clone) gets a clean `None` — and fails
+        // the syscall — instead of a context pointing at whatever the slot's previous
+        // occupant was running.
+        if ctx.is_user_process != 0 && ctx.user_entry != 0 {
             if config().syscall_debug_info_enabled {
                 safe_print!(128, "[threading] get_saved_user_context: fallback for thread {} (entry={:#x})\n", thread_id, ctx.user_entry);
             }
@@ -4734,6 +4787,52 @@ mod state_transition_guard_tests {
         THREAD_STATES[tid].store(thread_state::FREE, Ordering::SeqCst);
         WAKE_TIMES[tid].store(0, Ordering::SeqCst);
         WOKEN_STATES[tid].store(false, Ordering::SeqCst);
+    }
+
+    /// A recycled slot must not report the previous occupant's user-mode context.
+    ///
+    /// This is the `N × INTERP_BASE + 0x6c964` instruction-abort class in miniature
+    /// (`docs/runbooks/debug-thread-spawn-segv.md`, class 2). Occupant A is a
+    /// dynamically linked process, so the entry point it publishes is ld-musl's
+    /// `_dlstart`. If the slot's next occupant can still be asked for that context,
+    /// a fork/vfork/clone off the new thread launches its child straight into
+    /// ld-musl's RELR apply loop over the *old* address space — one `+= base` per
+    /// birth on one physical word.
+    #[test]
+    fn a_recycled_slot_does_not_inherit_the_previous_occupants_user_entry() {
+        crate::test_support::ensure_test_runtime();
+        let tid = 40;
+        const LDMUSL_DLSTART: u64 = 0x3006_9de8;
+
+        // Occupant A published a user context and then exited.
+        unsafe {
+            let ctx = &mut *get_context_mut(tid);
+            ctx.is_user_process = 1;
+            ctx.user_entry = LDMUSL_DLSTART;
+            ctx.user_sp = 0x203f_fffe_1f0;
+            ctx.user_tls = 0x3272_a918;
+        }
+        assert_eq!(
+            get_saved_user_context(tid).map(|c| c.pc),
+            Some(LDMUSL_DLSTART),
+            "precondition: while A owns the slot its context is readable",
+        );
+
+        // The slot is recycled for a brand-new process thread.
+        init_thread_slot_context(tid, 0x8000, 0xbeef_0000, 0, 0, 1, true);
+
+        assert!(
+            get_saved_user_context(tid).is_none(),
+            "a freshly recycled slot still reported a user context — a child forked \
+             from this thread would start at the previous occupant's entry point \
+             ({LDMUSL_DLSTART:#x}) with its stack pointer",
+        );
+
+        unsafe {
+            let ctx = &mut *get_context_mut(tid);
+            ctx.is_user_process = 0;
+        }
+        THREAD_STATES[tid].store(thread_state::FREE, Ordering::SeqCst);
     }
 
     #[test]

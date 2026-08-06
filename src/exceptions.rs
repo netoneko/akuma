@@ -805,6 +805,77 @@ fn syscall_stub_elr_in_diag_window(elr: u64) -> bool {
     elr >= min && elr <= max
 }
 
+/// Forensics for the `N × INTERP_BASE + offset` instruction-abort class
+/// (`docs/runbooks/debug-thread-spawn-segv.md`, class 2).
+///
+/// The branch target is read from a slot in the interpreter's writable data that
+/// musl's **RELR** apply loop mutates with `*slot += base`. A slot that already
+/// carried a relocated value gets `base` added a second time, so `FAR` reads
+/// `N*base + link_time_offset` with `N` = how many times the slot was relocated.
+/// That only happens if two processes' startup code ran over the **same physical
+/// frame**, so the one fact worth capturing is the slot's **PA**: two faults
+/// reporting the same PA means a shared frame, different PAs mean the poisoned
+/// value travelled by copy (a CoW/page-cache fill from an already-bumped source).
+///
+/// Fires only on a `FAR` of that exact shape, and only walks the interpreter's
+/// own VA window, so it costs nothing on any other abort.
+fn interp_relr_forensics(far: usize, pid: u32) {
+    const BASE: usize = akuma_exec::elf_loader::INTERP_BASE;
+    // N >= 2 (N == 1 is a correctly relocated pointer) and a plausible in-image offset.
+    let n = far / BASE;
+    let off = far % BASE;
+    if n < 2 || off >= 0x0010_0000 {
+        return;
+    }
+    let ttbr0 = akuma_exec::mmu::get_current_ttbr0();
+    if ttbr0 == 0 {
+        return;
+    }
+    let l0_addr = ttbr0 & 0x0000_FFFF_FFFF_F000;
+    let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
+    let tid = akuma_exec::threading::current_thread_id();
+    let (cur_pid, ttbr0_proc, ppid) = akuma_exec::process::current_process_shared()
+        .map_or((0, 0, 0), |p| (p.pid, p.address_space.ttbr0(), p.parent_pid));
+    const L0_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+    let base_differs = ttbr0_proc != 0 && (ttbr0 as u64 & L0_MASK) != (ttbr0_proc & L0_MASK);
+    crate::safe_print!(224,
+        "[RELR] fault_pid={} cur_pid={} ppid={} tid={} N={} off={:#x}\n",
+        pid, cur_pid, ppid, tid, n, off);
+    crate::safe_print!(224,
+        "[RELR] ttbr0_live={:#x} ttbr0_proc={:#x}{} expected_l0={:#x} switch_ins={} gen={}\n",
+        ttbr0, ttbr0_proc,
+        if base_differs { "  *** AS MISMATCH (foreign page tables) ***" } else { "" },
+        akuma_exec::threading::thread_expected_l0(tid),
+        akuma_exec::threading::thread_switch_ins(tid),
+        akuma_exec::threading::thread_generation(tid));
+
+    // The writable PT_LOAD of a musl interpreter sits at the top of its image;
+    // 1 MB of VA covers it with room to spare and bounds the scan at 256 pages.
+    let mut found = 0usize;
+    for page in 0..256usize {
+        let page_va = BASE + 0x0010_0000 - (page + 1) * 0x1000;
+        let Some(pa) = akuma_exec::mmu::translate_user_va(l0_ptr, page_va) else {
+            continue;
+        };
+        let kva = akuma_exec::mmu::phys_to_virt(pa & !0xFFF).cast::<u64>();
+        for i in 0..512usize {
+            let v = unsafe { kva.add(i).read_volatile() } as usize;
+            if v == far {
+                crate::safe_print!(160,
+                    "[RELR] slot va={:#x} pa={:#x} val={:#x}\n",
+                    page_va + i * 8, (pa & !0xFFF) + i * 8, v);
+                found += 1;
+                if found >= 4 {
+                    return;
+                }
+            }
+        }
+    }
+    if found == 0 {
+        crate::safe_print!(128, "[RELR] no slot in interp window holds {:#x}\n", far);
+    }
+}
+
 /// Log syscall number (**`x8`**), **FAR**, **pid/tid** when SIGSEGV hits the configured syscall-stub VA window.
 fn maybe_print_sigsegv_syscall_diag(elr: u64, far: u64, frame: &UserTrapFrame) {
     if !crate::config::DEBUG_SIGSEGV_SYSCALL_STUB {
@@ -4226,6 +4297,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             }
 
             crate::safe_print!(128, "[IA] pid={} far={:#x} iss={:#x}\n", pid, far, iss);
+            interp_relr_forensics(far_usize, pid);
             let frame_ref = unsafe { &*frame };
             crate::tprint!(128, "[Fault] Instruction abort from EL0 at FAR={:#x}, ISS={:#x}\n",
                 far, iss);

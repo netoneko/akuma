@@ -966,7 +966,6 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SCHED_GETAFFINITY => {
             let mask_ptr = args[2] as usize;
             let cpusetsize = args[1] as usize;
-            let mut ret: u64 = 0;
             if cpusetsize >= 8 && validate_user_ptr(mask_ptr as u64, cpusetsize) {
                 let mut kernel_mask = alloc::vec![0u8; cpusetsize];
                 // CPUs the process may run on. On the real shared-kernel SMP
@@ -989,9 +988,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
                 // Returning 0 made musl wipe the whole buffer, so `busybox
                 // nproc`/cargo saw 0 CPUs and fell back to 1. The mask fits in
                 // one u64 (≤64 CPUs; Akuma's SMP scope), so we wrote 8 bytes.
-                ret = cpusetsize.min(8) as u64;
+                cpusetsize.min(8) as u64
+            } else {
+                0
             }
-            ret
         }
         nr::TKILL => signal::sys_tkill(args[0] as u32, args[1] as u32),
         nr::TGKILL => signal::sys_tgkill(args[0] as u32, args[1] as u32, args[2] as u32),
