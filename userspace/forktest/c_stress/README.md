@@ -60,6 +60,47 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   crashed on. Built to answer `docs/runbooks/debug-thread-spawn-segv.md`; it
   found **no** divergence in 144k children, which is what rules the memory
   handoff out.
+- `spawnalias` — does a freshly-spawned thread see *its own* address space? The
+  sequel to `clonearg`, which asked the wrong question: `clonearg` verified the
+  clone hand-off and would pass no matter what if the bug is that the child runs
+  in someone else's page tables. So this one gives every process an identity —
+  a 256 KiB canary region holding `nonce(pid) ^ page_index`, one word per page,
+  plus copies in `.data`, in malloc'd heap and in a separate mmap — and has each
+  new thread read all of them before doing anything else. They live in different
+  pages, so a *partial* aliasing event makes exactly one disagree, and since the
+  nonce is a pure function of the pid, the wrong value **names the process it
+  came from** (`*** that is pid 431's nonce ***`). It also carries a
+  Rust-shaped thread packet (first word read like `ldr x20,[x0]`, then an atomic
+  fetch-add) and deliberately poisons the heap between `pthread_create` and
+  `pthread_join` with the exact ASCII the real faults kept decoding to — ANSI SGR
+  escapes and `+strict-align` — so a use-after-free comes back as printable text
+  rather than silent garbage. Load shape is a fan of worker processes with
+  `posix_spawn` churn underneath (musl → `CLONE_VM|CLONE_VFORK` → Akuma's vfork
+  fastpath). `--ownstack` adds caller-allocated stacks with sentinels,
+  `--fanout` adds thread-slot pressure, `--mapfile` adds demand-paging pressure:
+  `spawnalias 2000 4 8 --mapfile /usr/local/lib/librustc_driver-*.so`.
+  Calibrated: PASS on real Linux (300×4×8). Written for
+  `docs/runbooks/debug-thread-spawn-segv.md` §3c — it decides T1 vs T2 vs T3.
+- `tidflags` — does `clone(2)` honour its three tid flags separately? Linux keeps
+  `CLONE_PARENT_SETTID` (write tid to `ptid` at clone), `CLONE_CHILD_SETTID`
+  (write tid to `ctid`, **in the child's context**, so it is not observable the
+  instant `clone` returns) and `CLONE_CHILD_CLEARTID` (write *zero* to `ctid` at
+  child **exit**, plus a futex wake) strictly apart. Akuma conflated them: it
+  wrote the child tid to `ctid` at clone time whatever the flags said, and
+  cleared it at exit whatever the flags said. musl's `pthread_create` passes
+  CLEARTID *without* CHILD_SETTID and the pointer it passes is
+  `&__thread_list_lock` — a global mutex word — so every thread spawn stamped a
+  live tid into musl's thread-list lock. `__tl_lock` then takes its
+  `if (val == tid) { tl_lock_count++; return; }` fast path for exactly the one
+  thread whose tid was written, so the new child ran `__pthread_exit` with no
+  lock held and unlinked itself while its parent was still linking it:
+  `ldp x0,x1,[x19,#8]; str x0,[x1,#8]` with a NULL `self->prev` → SIGSEGV
+  writing to address `0x8`, plus a leaked `tl_lock_count` that wedges every
+  later pthread call in the process. Deterministic — one clone and one load per
+  check — which is the point: `spawnalias` reproduces the same bug only about
+  one run in three, far too flaky to A/B a fix on. Measured **4 FAIL before the
+  2026-08-06 fix, 8 PASS after, 8 PASS on Linux**. Calibrate with
+  `docker run --rm --platform linux/arm64 -v "$PWD/tidflags:/tidflags:ro" alpine /tidflags`.
 - `futexkey` — does a futex key leak between address spaces? Forks a waiter that
   parks on a `.bss` global, then issues the wake **from the parent**, i.e. a
   different address space at the identical VA (no ASLR). A correct kernel wakes

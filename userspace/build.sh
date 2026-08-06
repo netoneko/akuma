@@ -199,6 +199,35 @@ cp forktest/c_stress/mprotectlb ../bootstrap/bin/
 cp forktest/c_stress/clonearg ../bootstrap/bin/
 echo "mprotectlb + clonearg (C) copied to bootstrap/bin/"
 
+# spawnalias: the address-space identity canary for the thread-spawn SIGSEGV
+# class. Unlike clonearg (which proved the clone *handoff* is sound and would
+# pass regardless) this asks whose memory a freshly-spawned thread is actually
+# reading — the nonce is a function of the pid, so a wrong value names the
+# process it leaked from. Stress-shaped, not one-shot; calibrated on Linux.
+# docs/runbooks/debug-thread-spawn-segv.md §3c. Tiny; built unconditionally.
+echo "Building spawnalias (C, address-space identity canary)..."
+(
+    cd forktest/c_stress
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o spawnalias spawnalias.c
+)
+cp forktest/c_stress/spawnalias ../bootstrap/bin/
+echo "spawnalias (C) copied to bootstrap/bin/"
+
+# tidflags: deterministic probe of clone(2)'s three tid flags. Regression guard
+# for the 2026-08-06 bug where clone_thread wrote the child TID into the
+# CLONE_CHILD_CLEARTID pointer at clone time — for musl that word is
+# &__thread_list_lock, so every thread spawn stamped a live tid into the
+# thread-list mutex and __tl_lock's "val == tid" fast path handed the lock to
+# the new child. One clone per check, no stress loop; 4 FAIL before, 8 PASS
+# after, 8 PASS on Linux. Tiny; built unconditionally.
+echo "Building tidflags (C, clone tid-flag semantics probe)..."
+(
+    cd forktest/c_stress
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -fno-stack-protector -o tidflags tidflags.c
+)
+cp forktest/c_stress/tidflags ../bootstrap/bin/
+echo "tidflags (C) copied to bootstrap/bin/"
+
 # pthread_kill_eintr: does a pthread_kill signal interrupt a blocking read?
 # Shaped after jobserver-rs's Helper::join (the path every rustc that reaches
 # codegen runs). Also asserts an SA_RESTART handler does NOT interrupt, which

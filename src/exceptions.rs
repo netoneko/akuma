@@ -866,9 +866,25 @@ fn print_spawn_fault_diag(far: u64, frame: &UserTrapFrame) {
     let ttbr0_live = akuma_exec::mmu::get_current_ttbr0() as u64;
     let ttbr0_proc = akuma_exec::process::current_process_shared()
         .map_or(0, |p| p.address_space.ttbr0());
-    crate::safe_print!(160, "[Fault]  tid={} ttbr0_live={:#x} ttbr0_proc={:#x}{}\n",
+    // Compare the L0 base (bits 47:0) and the ASID (bits 63:48) separately —
+    // they mean very different things here. A CLONE_THREAD child is *supposed*
+    // to run under a ttbr0 whose ASID differs from its own `Process`: it is
+    // handed the parent's ttbr0 verbatim (`shared_ttbr0` in `clone_thread`)
+    // while `new_shared` gives its Process a fresh ASID over the same L0. So
+    // "ASID differs" is routine and must not be flagged. A differing **L0
+    // base** is the real defect: the core is executing in a third party's page
+    // tables, which is the cross-address-space aliasing theory (T1) in
+    // docs/runbooks/debug-thread-spawn-segv.md §3c.
+    const BASE: u64 = 0x0000_FFFF_FFFF_F000;
+    let base_differs = ttbr0_proc != 0 && (ttbr0_live & BASE) != (ttbr0_proc & BASE);
+    let asid_differs = ttbr0_proc != 0 && (ttbr0_live >> 48) != (ttbr0_proc >> 48);
+    crate::safe_print!(224, "[Fault]  tid={} ttbr0_live={:#x} ttbr0_proc={:#x}{}\n",
         tid, ttbr0_live, ttbr0_proc,
-        if ttbr0_proc != 0 && ttbr0_live != ttbr0_proc { "  *** AS MISMATCH ***" } else { "" });
+        if base_differs {
+            "  *** AS MISMATCH: L0 BASE DIFFERS (foreign page tables) ***"
+        } else if asid_differs {
+            "  (asid differs only — normal for a cloned thread)"
+        } else { "" });
 
     let mut ascii = [0u8; 8];
     if word_as_ascii(far, &mut ascii)
@@ -879,12 +895,18 @@ fn print_spawn_fault_diag(far: u64, frame: &UserTrapFrame) {
     let Some(snap) = akuma_exec::process::clone_snapshot(tid) else { return };
     match akuma_exec::process::reread_clone_handoff(&snap) {
         Some((entry_now, arg_now)) => {
-            let changed = entry_now != snap.entry || arg_now != snap.arg;
+            // Do NOT flag a difference here as corruption. musl's `__clone` child
+            // starts with `ldp x1, x0, [sp], #16` — it pops both handoff words and
+            // hands the address straight back to the child as stack, so the child's
+            // own first frame legitimately overwrites them within a few
+            // instructions. These two lines are informational: the `at clone:`
+            // values are the trustworthy ones (they say what the parent actually
+            // handed over), and `now:` is only meaningful for a fault taken before
+            // the child ever ran.
             crate::safe_print!(256,
-                "[Fault]  clone-handoff tid={} stack={:#x} from pid={}/tid={} ttbr0={:#x}\n[Fault]    at clone: entry={:#x} arg={:#x}\n[Fault]    now:      entry={:#x} arg={:#x}{}\n",
+                "[Fault]  clone-handoff tid={} stack={:#x} from pid={}/tid={} ttbr0={:#x}\n[Fault]    at clone: entry={:#x} arg={:#x}\n[Fault]    now:      entry={:#x} arg={:#x} (child frame reuses these; differing is normal)\n",
                 tid, snap.stack, snap.parent_pid, snap.parent_tid, snap.ttbr0,
-                snap.entry, snap.arg, entry_now, arg_now,
-                if changed { "  *** HANDOFF CHANGED ***" } else { "  (intact)" });
+                snap.entry, snap.arg, entry_now, arg_now);
         }
         None => {
             crate::safe_print!(192,

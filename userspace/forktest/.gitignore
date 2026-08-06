@@ -1,7 +1,9 @@
 forktest_child
 forktest_parent
 pattern2_minimal.bin
+c_stress/tidflags
 c_stress/dynspawn
+c_stress/spawnalias
 c_stress/dynchild
 c_stress/mprotectlb
 c_stress/clonearg

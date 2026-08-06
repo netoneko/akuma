@@ -2837,12 +2837,20 @@ pub fn reread_clone_handoff(snap: &CloneSnapshot) -> Option<(u64, u64)> {
 /// `gettid()`, `tkill`, and every per-thread array. Not the child's PID: the
 /// thread's process-table entry has its own id, and callers that need it must
 /// resolve it through `THREAD_PID_MAP`.
-pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u64) -> Result<u32, &'static str> {
+///
+/// `flags` is the raw clone(2) flag word. It is load-bearing: `parent_tid_ptr`
+/// and `child_tid_ptr` are only written when the caller asked for them
+/// (`CLONE_PARENT_SETTID` / `CLONE_CHILD_SETTID`) — see the tid-publication
+/// block below for why writing an unrequested `child_tid_ptr` corrupts musl.
+pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u64, flags: u64) -> Result<u32, &'static str> {
     // Serialize lifecycle against preemption under shared-kernel SMP — see
     // `process/lifecycle.rs`. CLONE_THREAD creates a new thread + Process and
     // registers it; the half-built child must not be observable by a peer core's
     // EL1 code (e.g. a signal-delivery scan) between allocate and mark-ready.
     let _lifecycle = LifecycleGuard::acquire();
+    const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+    const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
     // Reject stack=0: a thread with SP=0 will immediately crash at a near-zero
     // address (e.g. FAR=0x28) when it tries to access stack variables.  This
     // happens when Go's vfork child leaks -ENOSYS into clone flags, causing
@@ -2903,7 +2911,8 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         namespace: parent.namespace.clone(),
         channel: parent.channel.clone(),
         delegate_pid: None,
-        clear_child_tid: child_tid_ptr,
+        // Only a CLONE_CHILD_CLEARTID caller gets the zero-and-wake at exit.
+        clear_child_tid: if flags & CLONE_CHILD_CLEARTID != 0 { child_tid_ptr } else { 0 },
         robust_list_head: 0,
         robust_list_len: 0,
         signal_actions: parent.signal_actions.clone(), // Shared table (Arc clone)
@@ -2978,7 +2987,37 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     register_process(child_pid, new_proc);
     clone_lazy_regions(parent_pid, child_pid);
 
-    // Publish the child's TID (CLONE_PARENT_SETTID / CLONE_CHILD_CLEARTID).
+    // Publish the child's TID — but ONLY where the caller asked for it.
+    //
+    // Linux keeps three tid flags strictly separate, and the difference is
+    // load-bearing for musl:
+    //   CLONE_PARENT_SETTID  write child tid to `parent_tid_ptr` at clone
+    //   CLONE_CHILD_SETTID   write child tid to `child_tid_ptr`  at clone
+    //   CLONE_CHILD_CLEARTID write *zero* to `child_tid_ptr` at **exit**, + futex wake
+    //
+    // Akuma used to write `child_tid_ptr` unconditionally, i.e. it treated
+    // CLEARTID as if it also implied SETTID. musl's `pthread_create` passes
+    // CLEARTID *without* SETTID, and the pointer it passes is
+    // `&__thread_list_lock` — a global mutex word, not a tid slot. So every
+    // thread spawn stamped the new thread's own tid into the thread-list lock.
+    //
+    // That is worse than garbage, because of musl's `__tl_lock`:
+    //     int val = __thread_list_lock;
+    //     if (val == tid) { tl_lock_count++; return; }   // "already mine"
+    // The value we wrote is *exactly* the child's tid, so the child's very
+    // first `__tl_lock()` — the one at the top of `__pthread_exit` — took the
+    // recursive fast path and returned **without the lock**, while the parent
+    // still held it and was mid-way through linking the child into the thread
+    // list. The child then ran the unlink against `self->prev == NULL`:
+    //     ldp x0, x1, [x19, #8]   ;  str x0, [x1, #8]
+    // and died writing to address 0x8. Second-order damage: the bogus
+    // `tl_lock_count++` is never undone, so the parent's `__tl_unlock` only
+    // decrements the count and never releases — every later pthread operation
+    // in that process blocks forever. Repro:
+    // userspace/forktest/c_stress/spawnalias.c;
+    // diagnosis in docs/runbooks/debug-thread-spawn-segv.md.
+    //
+    // Go's `newosproc` passes 0 for both pointers, so it is unaffected either way.
     //
     // This MUST be the kernel thread slot `tid`, not `child_pid`. The slot is
     // Akuma's thread-id namespace: `gettid()` returns `current_thread_id()`, and
@@ -3000,10 +3039,10 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     // the fault-handler mechanism silently returned EFAULT on some pages,
     // leaving mp.procid=0 and crashing the Go runtime.
     let child_tid = tid as u32;
-    if parent_tid_ptr != 0 {
+    if parent_tid_ptr != 0 && flags & CLONE_PARENT_SETTID != 0 {
         unsafe { core::ptr::write(parent_tid_ptr as *mut u32, child_tid); }
     }
-    if child_tid_ptr != 0 {
+    if child_tid_ptr != 0 && flags & CLONE_CHILD_SETTID != 0 {
         unsafe { core::ptr::write(child_tid_ptr as *mut u32, child_tid); }
     }
 

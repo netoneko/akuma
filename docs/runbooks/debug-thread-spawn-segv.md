@@ -15,10 +15,19 @@ group:
 [Fault] SIGSEGV in clone_thread, calling exit_group
 ```
 
-This is still **open** (2026-08-05). It no longer *blocks* the in-VM self-host
-build — that now completes, because a retry resumes and crates that compiled
-stay compiled ([`selfhost-kernel-build.md`](selfhost-kernel-build.md) §5) — but
-each occurrence still costs a whole crate compile, so it is worth fixing.
+> **The dominant cause was found and fixed 2026-08-06 — read §2e first.**
+> `clone_thread` wrote the child TID into the `CLONE_CHILD_CLEARTID` pointer at
+> clone time. For musl that pointer is `&__thread_list_lock`, so every thread
+> spawn stamped a live tid into musl's thread-list mutex and handed the lock to
+> the wrong thread. That is the `FAR=0x0`/`FAR=0x8` fault above. Deterministic
+> regression probe: `userspace/forktest/c_stress/tidflags.c` (4 FAIL before,
+> 8 PASS after, 8 PASS on Linux).
+>
+> A **second, distinct** fault survives the fix and is now the live one: a
+> thread executing in *foreign page tables* (`AS MISMATCH: L0 BASE DIFFERS`).
+> That is theory **T1** in §3c, and §2f records the first direct evidence for it.
+> Do not treat a post-2026-08-06 fault as "the same bug" without checking which.
+
 It is *not* a futex bug and not a lost wakeup — if you arrived here from a
 process parked forever in `futex`, read
 [`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) §4 first: the parked
@@ -262,6 +271,131 @@ present.
 
 Deciding between the two readings is what §3a's instrumentation exists for.
 
+## 2e. FIXED 2026-08-06: the kernel wrote a live TID into musl's thread-list lock
+
+**This was the dominant cause.** Neither reading in §2d was right; both were
+downstream of a syscall-semantics bug.
+
+Linux keeps three `clone(2)` tid flags strictly separate:
+
+| flag | what it does | when |
+|---|---|---|
+| `CLONE_PARENT_SETTID` (`0x0010_0000`) | write child tid to `ptid` | at clone, in the parent |
+| `CLONE_CHILD_SETTID` (`0x0100_0000`) | write child tid to `ctid` | when the child first runs, **in the child's context** (`schedule_tail`) |
+| `CLONE_CHILD_CLEARTID` (`0x0020_0000`) | write **zero** to `ctid`, then futex-wake | at child **exit** |
+
+`CLEARTID` says nothing whatsoever about clone time. Akuma's `clone_thread`
+ignored the flags and wrote unconditionally:
+
+```rust
+if child_tid_ptr != 0 {
+    unsafe { core::ptr::write(child_tid_ptr as *mut u32, child_tid); }   // BUG
+}
+```
+
+musl's `pthread_create` passes `CLEARTID` **without** `CHILD_SETTID`, and the
+pointer it passes is `&__thread_list_lock` — a global mutex word, not a tid
+slot. So every single thread spawn stamped the new thread's own tid into musl's
+thread-list lock. That is uniquely destructive because of `__tl_lock`'s
+recursion fast path:
+
+```c
+int val = __thread_list_lock;
+if (val == tid) { tl_lock_count++; return; }   /* "already mine" */
+```
+
+The value the kernel wrote is *exactly* the child's tid, so the lock appeared to
+be already held **by the one thread that must not hold it**. The child's first
+`__tl_lock()` — the one at the top of `__pthread_exit` — returned without
+acquiring, and the child unlinked itself from the thread list while its parent
+was still linking it:
+
+```
+4071cc: ldp x0, x1, [x19, #8]   ; x0 = self->next, x1 = self->prev  (both NULL)
+4071d0: str x0, [x1, #8]        ; prev->next = next  ->  write to 0x8
+```
+
+which is exactly the `FAR=0x0` / `FAR=0x8`, `x3=0x8`, near-null fault this
+runbook is named after. Second-order damage: the bogus `tl_lock_count++` is
+never undone, so the parent's `__tl_unlock` only decrements the counter and
+**never releases** — every later pthread call in that process blocks forever.
+That is a plausible contributor to the "wedged with threads parked in futex"
+reports, and it is why the fault and the hang always travelled together.
+
+**The fix** (`crates/akuma-exec/src/process/mod.rs`, `clone_thread`) takes the
+raw `flags` word and gates all three writes on their actual flags. Go's
+`newosproc` passes 0 for both pointers, so Go is unaffected either way.
+
+**Regression probe:** `userspace/forktest/c_stress/tidflags.c`. One clone and
+one load per check, no stress loop — because the stress repro (`spawnalias`)
+reproduces this only about one run in three, which is nowhere near enough to A/B
+a fix on (the trap described in
+[`../archive/`](../archive/) and in §3a). Calibrated on real Linux.
+
+| | Linux | Akuma before | Akuma after |
+|---|---|---|---|
+| `tidflags` | 8 PASS | **4 FAIL** — `ctid=0xc` where the child tid was 12 | **8 PASS** |
+
+The three extra FAILs were the same defect seen from other angles: `ctid`
+written with no tid flags set at all, and `ctid` cleared at exit with no
+`CLEARTID` set.
+
+> One calibration subtlety worth keeping: `CHILD_SETTID`'s write is performed
+> **by the child**, so a parent that reads `ctid` the instant `clone` returns
+> sees the old value on *Linux too*. The probe polls for it. An earlier version
+> asserted it synchronously and produced a false FAIL on Linux — which is
+> precisely why every probe in `c_stress/` is calibrated before it is trusted.
+
+## 2f. STILL OPEN after 2e: a thread running in foreign page tables
+
+The first `-j4` build on the fixed kernel got far further — one fault in the
+whole run instead of a steady stream — but it was a **different** fault, and the
+§3a instrumentation caught the thing T1 predicted:
+
+```
+[Fault] Data abort from EL0 at FAR=0x7, ELR=0x3801c58c, ISS=0x7
+[Fault]  tid=28 ttbr0_live=0xf7000088f1d000 ttbr0_proc=0x4000088b1d000  *** AS MISMATCH ***
+[Fault]  clone-handoff tid=28 stack=0x145f4d590 from pid=1988/tid=20 ttbr0=0x2000088b1d000
+[Fault]  [x19=0x3ceb84f0] = 0x7 0x3ceb8ef0 0x6f666e69657363 0x10a80000000000
+[Fault]    ascii: "cseinfo."
+```
+
+Decode the three `ttbr0` values as `ASID:base`:
+
+| | ASID | L0 base |
+|---|---|---|
+| parent (pid 1988) | 2 | `0x88B1D000` |
+| this thread's `Process` | 4 | `0x88B1D000` |
+| **live `TTBR0_EL1`** | **0xF7** | **`0x88F1D000`** |
+
+The parent and the child's `Process` agree on the L0 base, as they must — a
+CLONE_THREAD child shares the parent's L0 under a fresh ASID. The **live**
+register points somewhere else entirely. The core was executing this thread in a
+third party's page tables. Every user pointer it loaded was resolved against the
+wrong translation, which is why `x19` dereferences to a plausible-looking but
+foreign heap word (`"cseinfo."`).
+
+**Read the flag carefully.** `ttbr0_live != ttbr0_proc` on its own means
+nothing: `clone_thread` hands the child `shared_ttbr0` — the parent's ttbr0
+*including the parent's ASID* — while `new_shared` gives the child's `Process` a
+fresh ASID over the same L0, so the ASIDs differ by design on every cloned
+thread. The diagnostic in `src/exceptions.rs` now separates the two and only
+flags **`L0 BASE DIFFERS`**; a bare ASID difference prints
+`(asid differs only — normal for a cloned thread)`. An earlier revision flagged
+both, which would have made every cloned-thread fault look like a smoking gun.
+
+Where to look: the switch path in `crates/akuma-exec/src/threading/mod.rs`
+restores `TTBR0_EL1` from `THREAD_CONTEXTS[new_idx].ttbr0`, which is only
+refreshed when a thread is switched *out*. `clone_thread` already carries a
+comment about that entry being stale for a thread that activated a new address
+space since its last switch-out. That is the first place to look, and note the
+observed live value belongs to *neither* participant, so it is whatever last ran
+on that core.
+
+Also still open, and possibly related: the same run logged **81 `[BKL] stuck`
+events** and the build wedged with rustc processes alive but making no progress.
+Do not assume that is the same bug.
+
 ## 3. Where to look in the kernel
 
 With the handoff ruled out (§2a), the live candidates are:
@@ -428,16 +562,28 @@ them in the child's context and prints the comparison
 [Fault]  [x19=0x3d96f980] = 0x2d7463697274732b ...
 ```
 
-Read the three flags:
+Read the flags:
 
 | what prints | what it means | where to go |
 |---|---|---|
-| `*** AS MISMATCH ***` | the thread is executing in someone else's page tables — every "corrupt pointer" in the dump is a correct pointer resolved in the wrong space | the vfork/exec ordering below, and `Process::run`'s `activate()` |
-| `*** HANDOFF CHANGED ***` | the child's stack page is not the page the parent wrote | aliasing / stale TLB / demand-fault double-install — §2a's probe did *not* cover this, it only covered visibility |
+| `*** AS MISMATCH: L0 BASE DIFFERS ***` | the thread is executing in someone else's page tables — every "corrupt pointer" in the dump is a correct pointer resolved in the wrong space | §2f, then the switch path in `threading/mod.rs` and the vfork/exec ordering below |
+| `(asid differs only — normal…)` | **not a finding.** A cloned thread is handed the parent's ttbr0 while its `Process` gets a fresh ASID over the same L0 | ignore it |
 | both clean, `[x19]` is a string | the argument was delivered correctly and the packet behind it was freed | a genuine lifetime bug — candidate 1 |
 
 `FAR`-as-ASCII is printed unconditionally now, so nobody has to remember the
 `"libder-8"` precedent by hand.
+
+**The `at clone:` / `now:` handoff lines are informational, not a verdict.**
+An earlier revision flagged any difference as `*** HANDOFF CHANGED ***`; that was
+a false positive and has been removed. musl's child starts with
+`ldp x1, x0, [sp], #16` — it pops both handoff words and then uses that same
+address as its stack, so its own first frame legitimately overwrites them within
+a few instructions. The `at clone:` values are the trustworthy half (they record
+what the parent actually handed over); `now:` only means anything for a fault
+taken before the child ever ran. The first fault ever caught by this
+instrumentation printed `HANDOFF CHANGED` and it was pure noise — the real
+signal in that dump was `[x19] = 0x10a66f20 0x0 0x0 0x0`, i.e. a NULL
+`self->prev`, which is what led to §2e.
 
 ## 3b. Hardening worth doing regardless of the outcome
 
@@ -453,11 +599,24 @@ is not where you want a hot-path invariant to live.
 
 ## 3c. Live theories, ranked (2026-08-06)
 
-Ordered by how much of the evidence each one explains, not by how easy it is to
-test. Every one of them is decided by §3a's three flags, which is why the
-instrumentation went in before any of them was chased.
+> **Outcome, same day.** None of T1-T4 was the dominant cause — a clone(2)
+> flag-semantics bug was (§2e), and it was found by reading the faulting PC's
+> disassembly rather than by testing any theory here. The ranking below is kept
+> because **T1 was independently confirmed** as a real, separate bug once the
+> §2e fix removed the noise (§2f): a thread was caught executing in foreign page
+> tables. T1 is now the live hunt. T2 and T3 are weakened — much of what
+> motivated them (the byte-identical string faults of §2d) is explained by §2e
+> instead.
+>
+> The methodological lesson is worth more than the ranking: three sessions
+> theorised about memory aliasing from register dumps, and five minutes of
+> `objdump` on the faulting PC — §1, which the runbook already told you to do
+> first — named the exact musl function and line. Symbolize before you theorise.
 
-**T1 — Cross-address-space aliasing (new, best fit).** The child dereferences a
+Ordered by how much of the evidence each one explains, not by how easy it is to
+test.
+
+**T1 — Cross-address-space aliasing (CONFIRMED 2026-08-06 as a real bug — see §2f).** The child dereferences a
 pointer that is *correct*, in an address space that is *wrong*: same VA, different
 physical page, so the packet slot reads back as another rustc's string heap. This
 is the only theory that explains, without coincidence, why two different processes
@@ -465,8 +624,9 @@ fault byte-identically on the same string (§2d), why `FAR` keeps decoding as
 another process's data rather than as garbage, and why the second crash class has
 a victim "running in another pid's address space". It also predicts §2a's result:
 `clonearg.c` measured the *handoff* and would pass regardless, because the handoff
-is not what is broken. **Decided by:** `*** AS MISMATCH ***`, or by `[x19]`
-reading back differently in the fault dump than it must have at clone time.
+is not what is broken. **Decided by:** `*** AS MISMATCH: L0 BASE DIFFERS ***`,
+which has now fired once (§2f) — a thread whose live `TTBR0_EL1` named neither
+its own `Process` nor its parent, but a third address space entirely.
 Suspects, in order: `sys_execve` calling `vfork_complete(pid)` **before**
 `proc.address_space.activate()` (`src/syscall/proc.rs`), which wakes the vfork
 parent while the child is between address spaces; `vfork_process` giving the child
@@ -484,7 +644,8 @@ hold, this is the answer and the hunt moves into thread-slot lifetime.
 **T3 — Stale stack page under the child (residual §2b).** The child's stack VA
 resolves to a page that is not the one the parent wrote — the mprotect/TLB family
 that §2b closed one instance of, possibly with another instance left under
-shared-AS/new-ASID. **Decided by:** `*** HANDOFF CHANGED ***`. Note this is the
+shared-AS/new-ASID. **No longer decidable by the handoff lines** — see the note
+at the end of §3a explaining why a changed `now:` value is expected. Note this is the
 one thing §2a's 144,260-child probe did *not* cover: it proved stores are
 *visible*, not that the child's mapping is the same mapping.
 
@@ -553,22 +714,52 @@ None of them are about the bug; all of them are about the harness.
   never touches the network again.
 - **Detach properly.** `ssh host 'cmd &'` dies with the session. Write the loop to
   a file on the guest and start it with
-  `busybox setsid busybox sh -c '... > log 2>&1' < /dev/null &`.
+  `busybox setsid busybox sh /root/loop.sh > log 2>&1 < /dev/null &`. Prefer that
+  form over `busybox sh -c '…'`: the inner quoting does not survive the trip
+  through `ssh` and busybox reports `loop.sh: applet not found`.
+- **`scp` to the guest hangs.** Pipe base64 over the existing ssh channel
+  instead — `busybox base64 -d > /root/prog && chmod +x /root/prog` with the
+  encoded bytes on stdin. 145 KB lands in 0.1 s.
+- **The guest has almost no standalone coreutils.** `nproc`, `sleep`, `timeout`,
+  `head`, `nohup`, `which` and `uname` all need a `busybox ` prefix.
+- **Downloads are flakier than the index.** Even with multiplexing off,
+  `static.crates.io` connection failures are common. Add `[net] retry = 20` and
+  run `cargo fetch` in a retry loop until it is clean *before* starting the
+  timed repro, so a network stall is never mistaken for a kernel hang.
 
 ## Verify
 
-A fixed kernel must produce, across a full `-j4` build:
+**Start here — it takes 30 seconds and needs no build load.** Run
+`userspace/forktest/c_stress/tidflags` on the guest. It must print
+`[tidflags] PASS (0 failures)`; anything else means the §2e regression is back
+and there is no point running a `-j4` build yet. `spawnalias` is the
+corroborating stress test, but do not A/B on it — it reproduces this class only
+about one run in three and has passed on a known-broken kernel.
+
+A fully fixed kernel must then produce, across a full `-j4` build:
 
 - zero `[Fault] SIGSEGV in clone_thread` lines,
 - zero `signal: 11` errors in cargo's output,
+- zero `AS MISMATCH: L0 BASE DIFFERS` lines,
+- no `[BKL] stuck` storm,
 - and the build reaching `rust-lld` rather than stalling with `.rmeta` files
   that have no matching `.rlib`.
 
+**Status as of 2026-08-06:** the first two are not yet met. The §2e fix took the
+run from a steady stream of faults down to a single one, but that one was an
+`AS MISMATCH` (§2f), and the run also logged 81 `[BKL] stuck` events before
+wedging with live-but-idle `rustc` processes. Both are open.
+
 Regression probes for the neighbourhood (all should stay green):
-`userspace/forktest/c_stress/futexkey`, `threadmax`, `tlsdirty`, `futextest_rs`.
+`userspace/forktest/c_stress/tidflags`, `futexkey`, `threadmax`, `tlsdirty`,
+`futextest_rs`.
 
 ## Background
 
+- [`../archive/CLONE_TIDFLAGS_THREAD_LIST_LOCK.md`](../archive/CLONE_TIDFLAGS_THREAD_LIST_LOCK.md)
+  — the full 2026-08-06 investigation record behind §2e and §2f: disassembly,
+  mechanism, before/after probe tables, the two instrumentation flags that had
+  to be corrected, and the methodology lessons.
 - [`../archive/SELFHOST_DEVBOX_SMOLTCP.md`](../archive/SELFHOST_DEVBOX_SMOLTCP.md)
   — "Open issue: thread-spawn SIGABRT under real `-j4` parallelism", "The crash
   has a fixed address (2026-08-04)", and the ASID free/flush ordering fix that

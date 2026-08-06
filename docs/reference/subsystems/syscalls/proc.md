@@ -50,9 +50,36 @@ A `CLONE_THREAD` child gets **two** unrelated ids, from two different counters:
 publish one, and all three must agree:
 
 - `gettid()` → `threading::current_thread_id()`
-- `clone(CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID)` → the word written at
-  `parent_tid`/`child_tid`, **and** clone's return value (`clone_thread`)
+- `clone(CLONE_PARENT_SETTID)` → the word written at `parent_tid`, **and**
+  clone's return value (`clone_thread`)
 - `set_tid_address()` → its return value (`sys_set_tid_address`)
+
+### The three tid flags are not interchangeable
+
+They differ in *which* pointer, *what value*, and *when* — and the "when" is
+what bites:
+
+| flag | pointer | value | when |
+|---|---|---|---|
+| `CLONE_PARENT_SETTID` (`0x0010_0000`) | `parent_tid` | child tid | at clone, in the parent |
+| `CLONE_CHILD_SETTID` (`0x0100_0000`) | `child_tid` | child tid | when the child first runs, **in the child's context** — so a parent reading it right after `clone` returns sees the old value, on Linux too |
+| `CLONE_CHILD_CLEARTID` (`0x0020_0000`) | `child_tid` | **zero** | at child **exit**, followed by a futex wake |
+
+`CLEARTID` says nothing about clone time. Until 2026-08-06 `clone_thread`
+wrote `child_tid` unconditionally, i.e. it treated `CLEARTID` as if it also
+implied `CHILD_SETTID`. musl's `pthread_create` passes `CLEARTID` *without*
+`CHILD_SETTID` and the pointer it passes is `&__thread_list_lock` — a global
+mutex word — so every thread spawn stamped a live tid into musl's thread-list
+lock, and `__tl_lock`'s `if (val == tid) { tl_lock_count++; return; }`
+recursion fast path then handed the lock to the newborn child. It unlinked
+itself from the thread list with no lock held and died writing to `0x8`. Full
+diagnosis in
+[`../../../runbooks/debug-thread-spawn-segv.md`](../../../runbooks/debug-thread-spawn-segv.md)
+§2e; regression probe `userspace/forktest/c_stress/tidflags.c`.
+
+The general lesson, and the reason this sits in a stability-A doc: **writing an
+output pointer the caller did not ask for is a memory-corruption bug**, not a
+harmless extra. Userspace is entitled to keep something else in that word.
 
 `tkill`/`tgkill` take that value straight to `pend_signal_for_thread` and
 `thread_signal_mask_of`, which are slot-indexed. Publishing a PID instead
