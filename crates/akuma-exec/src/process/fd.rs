@@ -123,15 +123,23 @@ impl SharedFdTable {
 
     /// Explicitly close all underlying kernel resources and clear the table.
     /// This is used during process exit to ensure immediate cleanup.
+    ///
+    /// Entries are popped and closed ONE AT A TIME, not snapshot-then-cleared.
+    /// The executing thread can be abandoned mid-sweep: a thread marked
+    /// TERMINATED while running its own teardown is never rescheduled after the
+    /// next preemption, and its kernel stack is recycled. With the old
+    /// snapshot+clear, every not-yet-closed entry had already left the table, so
+    /// no later pass (the `Drop` below, `cleanup_process_fds` at reclaim) could
+    /// ever find it — the refcounts leaked for good. Measured 2026-08-07: a
+    /// wrongly-reaped `ld` closed exactly one of its four pipe refs and was then
+    /// descheduled forever; the leaked stderr write refcount kept `rustc` blocked
+    /// in `read()` waiting for an EOF that could no longer arrive (the `-j4`
+    /// self-host wedge). Popping per-iteration bounds an abandoned sweep's damage
+    /// to the single in-flight entry.
     pub fn close_all(&self) {
-        let fds: Vec<FileDescriptor> = with_irqs_disabled(|| {
-            let mut table = self.table.lock();
-            let items: Vec<FileDescriptor> = table.values().cloned().collect();
-            table.clear();
-            items
-        });
-        
-        for fd in fds {
+        loop {
+            let entry = with_irqs_disabled(|| self.table.lock().pop_first());
+            let Some((_fd, fd)) = entry else { break };
             match fd {
                 FileDescriptor::Socket(idx) => {
                     (runtime().remove_socket)(idx);

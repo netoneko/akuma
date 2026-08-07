@@ -604,6 +604,8 @@ pub fn run_all_tests() {
     test_unregister_process_terminates_thread();
     test_unregister_process_skips_current_thread();
     test_kill_thread_group_two_phase();
+    // Recycled-tid channel stamp forged an exit for a live process (-j4 wedge)
+    test_ktg_stale_tid_channel_not_stamped();
     test_mark_terminated_ignores_large_ids();
     test_fake_thread_ids_safe();
 
@@ -14538,6 +14540,92 @@ fn test_kill_thread_group_two_phase() {
     } else {
         console::print("[Test] kill_thread_group_two_phase FAILED: sibling still registered\n");
     }
+}
+
+/// Regression (2026-08-07, the `-j4` self-host wedge): `kill_thread_group`
+/// PHASE 2 stamped `set_exited(group_code)` on the channel resolved by a
+/// sibling's RECORDED tid. A sibling that died before the group kill keeps its
+/// recorded `thread_id`, and once that slot is recycled the tid resolves to an
+/// unrelated process's channel — forging an exit for a live process. Its
+/// parent's `wait4` then reaps it mid-run: measured live as pid 113's group
+/// kill stamping exit(0) onto recycled tid 31 (a freshly spawned `ld`),
+/// collect2 reaping the live `ld`, and the killed thread's abandoned fd
+/// teardown leaking the pipe write refcount that kept rustc in `read()`
+/// forever. PHASE 2 must leave a recycled slot's channel alone — and still
+/// stamp a sibling that legitimately owns its slot (the goroutine-leader case
+/// the stamp exists for).
+fn test_ktg_stale_tid_channel_not_stamped() {
+    use akuma_exec::process::{register_process, unregister_process, kill_thread_group,
+        register_thread_pid, unregister_thread_pid, register_channel, remove_channel,
+        get_channel, clear_lazy_regions, reclaim_retired_processes_force};
+    use akuma_exec::process::channel::ProcessChannel;
+    use akuma_exec::threading::MAX_THREADS;
+    use alloc::sync::Arc;
+
+    let _ = reclaim_retired_processes_force();
+
+    let next_pid = || akuma_exec::process::table::NEXT_PID
+        .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let leader_pid = next_pid();
+    let dead_sib_pid = next_pid();
+    let live_sib_pid = next_pid();
+    let victim_pid = next_pid(); // never registered; only owns the recycled slot
+
+    // Fake tids >= MAX_THREADS: state/kill ops are bounds-checked no-ops, while
+    // the THREAD_PID_MAP and channel registries (plain maps) behave for real.
+    let stale_tid = MAX_THREADS + 40;
+    let owned_tid = MAX_THREADS + 41;
+
+    let mut leader = make_test_process(leader_pid);
+    leader.thread_id = None;
+    let l0 = leader.address_space.l0_phys();
+    register_process(leader_pid, leader);
+
+    // Sibling that died earlier: its recorded slot has been recycled to victim.
+    let mut dead_sib = make_test_process(dead_sib_pid);
+    dead_sib.tgid = leader_pid;
+    dead_sib.thread_id = Some(stale_tid);
+    register_process(dead_sib_pid, dead_sib);
+
+    // Sibling that still owns its slot (the stamp must keep working for it).
+    let mut live_sib = make_test_process(live_sib_pid);
+    live_sib.tgid = leader_pid;
+    live_sib.thread_id = Some(owned_tid);
+    register_process(live_sib_pid, live_sib);
+
+    register_thread_pid(stale_tid, victim_pid);
+    register_thread_pid(owned_tid, live_sib_pid);
+
+    let victim_ch = Arc::new(ProcessChannel::new());
+    register_channel(stale_tid, victim_ch.clone());
+    let sib_ch = Arc::new(ProcessChannel::new());
+    register_channel(owned_tid, sib_ch.clone());
+
+    kill_thread_group(leader_pid, l0, 0);
+
+    // The recycled slot's channel must be untouched: not exit-stamped, not evicted.
+    let victim_untouched = !victim_ch.has_exited() && get_channel(stale_tid).is_some();
+    // The owned slot's channel must still get the group's exit code, and be evicted.
+    let sib_stamped = sib_ch.has_exited() && sib_ch.exit_code() == 0
+        && get_channel(owned_tid).is_none();
+
+    if victim_untouched && sib_stamped {
+        console::print("[Test] ktg_stale_tid_channel_not_stamped PASSED\n");
+    } else {
+        crate::safe_print!(192,
+            "[Test] ktg_stale_tid_channel_not_stamped FAILED: victim_exited={} victim_ch_present={} sib_exited={} sib_code={} sib_ch_evicted={}\n",
+            victim_ch.has_exited(), get_channel(stale_tid).is_some(),
+            sib_ch.has_exited(), sib_ch.exit_code(), get_channel(owned_tid).is_none());
+    }
+
+    // Cleanup: kill_thread_group already unregistered the siblings; drop the
+    // victim's surviving registrations and the leader.
+    let _ = remove_channel(stale_tid);
+    unregister_thread_pid(stale_tid);
+    unregister_thread_pid(owned_tid);
+    clear_lazy_regions(leader_pid);
+    let _ = unregister_process(leader_pid);
+    let _ = reclaim_retired_processes_force();
 }
 
 /// Test: mark_thread_terminated ignores thread IDs >= MAX_THREADS

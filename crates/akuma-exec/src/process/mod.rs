@@ -50,6 +50,13 @@ static KTG_TRACES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(kernel_smp_shared)]
 static KTG_STALE_SKIPS: AtomicUsize = AtomicUsize::new(0);
 
+/// Rate-limit counter for the `[KTG-STALE-CH]` tripwire: PHASE 2 about to evict
+/// and exit-stamp a per-tid channel whose slot has been recycled to an unrelated
+/// process. Unlike `KTG_STALE_SKIPS` this is not smp-shared-only: PHASE 2 runs
+/// in every build, and the snapshot can be stale on entry (a sibling that died
+/// before the group kill started keeps its recorded `thread_id`).
+static KTG_STALE_CH_SKIPS: AtomicUsize = AtomicUsize::new(0);
+
 /// Rate-limit counter for the `[ORPHAN-KILL]` tripwire in
 /// [`kill_children_whose_parent_in`]: a forked child (e.g. a linker) being
 /// force-reaped because its parent is exiting while the child is still alive.
@@ -1265,9 +1272,17 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
     // build stays byte-for-byte unchanged.
     #[cfg(kernel_smp_shared)]
     {
-        for (_sib_pid, sib_tid) in &siblings {
+        for (sib_pid, sib_tid) in &siblings {
             if let Some(tid) = sib_tid {
-                crate::threading::request_thread_kill(*tid);
+                // Ownership test before posting the kill: a sibling that died before
+                // this group kill even started keeps its recorded `thread_id`, and by
+                // now the slot can be FREE or another process's. Posting a deferred
+                // kill to a FREE slot plants a flag its next claimant may inherit;
+                // posting to a recycled slot aims at an innocent thread. Same rule as
+                // the grace-expiry hard kill below.
+                if grace_kill_should_terminate(*sib_pid, *tid) {
+                    crate::threading::request_thread_kill(*tid);
+                }
             }
         }
         // Grace-wait: yield (dropping the BKL under smp-shared) so preempted
@@ -1374,9 +1389,14 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
     {
         // PHASE 1 (single-core): mark ALL sibling threads TERMINATED. The
         // caller is the sole EL1 thread, so none can be mid-critical-section.
-        for (_sib_pid, sib_tid) in &siblings {
+        // Ownership-guarded like the smp-shared path: a sibling that died before
+        // this group kill keeps its recorded `thread_id`, and the slot may have
+        // been recycled to an unrelated process by now.
+        for (sib_pid, sib_tid) in &siblings {
             if let Some(tid) = sib_tid {
-                crate::threading::mark_thread_terminated(*tid);
+                if grace_kill_should_terminate(*sib_pid, *tid) {
+                    crate::threading::mark_thread_terminated(*tid);
+                }
             }
         }
     }
@@ -1388,16 +1408,42 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
         }
 
         if let Some(tid) = sib_tid {
-            if let Some(channel) = remove_channel(*tid) {
-                // Use the GROUP's real exit code, not a hardcoded -9. When a
-                // goroutine calls exit_group(0), the leader is one of these
-                // "siblings" and its channel is the one the shell reads — a
-                // hardcoded -9 here made a clean exit report as "killed by
-                // signal 9" (-9). Never clobber a channel that already recorded
-                // a real code (matches teardown_forked_process_thread_group).
-                if !channel.has_exited() {
-                    channel.set_exited(exit_code);
+            // Same staleness rule as the THREAD_PID_MAP eviction below: the per-tid
+            // channel registry is re-registered by each slot's new owner at spawn, so
+            // once the slot is recycled the entry is the new occupant's channel.
+            // Removing it orphans that process's stdout bridge, and stamping
+            // `set_exited()` on it FORGES AN EXIT for a live, unrelated process: its
+            // parent's `wait4` sees `has_exited()`, reaps it mid-run, and
+            // `unregister_process` terminates the running thread — whose abandoned
+            // fd teardown then leaks pipe write refcounts, so the reader waiting on
+            // that pipe never gets EOF. Measured 2026-08-07 (`-j4` self-host wedge):
+            // pid 113's group kill stamped exit(0) onto recycled tid 31 (= freshly
+            // spawned `ld`, pid 140); collect2 reaped live ld; rustc hung forever in
+            // `read()` on the leaked pipe. A slot that is FREE (owner None) is still
+            // cleaned up — a dead thread's leftover entry is exactly what this
+            // eviction exists to collect.
+            let owner = table::pid_for_thread(*tid);
+            if owner.is_none_or(|o| o == *sib_pid) {
+                if let Some(channel) = remove_channel(*tid) {
+                    // Use the GROUP's real exit code, not a hardcoded -9. When a
+                    // goroutine calls exit_group(0), the leader is one of these
+                    // "siblings" and its channel is the one the shell reads — a
+                    // hardcoded -9 here made a clean exit report as "killed by
+                    // signal 9" (-9). Never clobber a channel that already recorded
+                    // a real code (matches teardown_forked_process_thread_group).
+                    if !channel.has_exited() {
+                        channel.set_exited(exit_code);
+                    }
                 }
+            } else if KTG_STALE_CH_SKIPS.fetch_add(1, Ordering::Relaxed) < 64 {
+                let mut buf = [0u8; 160];
+                let mut pos = 0;
+                let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                    format_args!(
+                        "[KTG-STALE-CH] my_pid={} sib_pid={} tid={} recycled to \
+                         pid={:?} — not stamping channel\n",
+                        my_pid, sib_pid, tid, owner));
+                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
             }
         }
 
