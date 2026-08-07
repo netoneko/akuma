@@ -282,7 +282,9 @@ Still open at the time of the fix: the in-VM `-j4` build has **not** been re-run
 so `-j1` remains the documented recipe for the final crate.
 
 > **Residual variant (2026-08-07, not yet fixed).** A focused probe
-> (`userspace/selfhost_repro/jobserver_stress.rs`) reproduces a *related* lost
+> (`userspace/forktest/selfhost_repro/jobserver_stress.rs` — note the actual
+> path nests under `forktest/`, unlike earlier references to
+> `userspace/selfhost_repro/...`) reproduces a *related* lost
 > wake under real 4-core SMP + CPU-hog preemption pressure: untimed
 > `Condvar`/`Barrier` waits (`a1=0x80`) hang 4/4 while timed waits cycle (their
 > deadline rescues them). `hist` ends `Ep` (wake never *issued* on the key), not
@@ -296,7 +298,11 @@ so `-j1` remains the documented recipe for the final crate.
 > `notify_all` never gets there. No futex-layer safety net can rescue a wake
 > that's never issued. Full diagnosis + a 25-second deterministic repro in
 > [`../archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md`](../archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md)
-> §7.9–§7.10.
+> §7.9–§7.10. For the sequence diagram of the mechanism this bypasses (enqueue,
+> the park/wake handshake, the revalidation safety net, and exactly where this
+> hole sits in it), see
+> [`../reference/subsystems/syscalls/sync.md`](../reference/subsystems/syscalls/sync.md)
+> "Wait/wake flow".
 >
 > That same session found `alarm()`/`pause()` completely broken (`ppoll(NULL,
 > 0, ...)` never blocked, then never returned once it did, then blocking

@@ -14,6 +14,97 @@ duplicated here.
 > silently strands every private-futex waiter (musl's `pthread_join`
 > chief among them).
 
+## Wait/wake flow
+
+The designed mechanism, as implemented (`sys_futex`, `futex_do_wake`,
+`schedule_blocking`/`publish_waiting_and_take_pending_wake` in
+`crates/akuma-exec/src/threading/mod.rs`):
+
+```mermaid
+sequenceDiagram
+    participant W as Waiter (thread A)
+    participant K as sys_futex (kernel)
+    participant T as FUTEX_WAITERS table
+    participant S as Scheduler
+    participant N as Waker (thread B)
+
+    W->>K: futex(uaddr, FUTEX_WAIT[_BITSET], val, timeout)
+    K->>T: lock table, read *uaddr
+    alt value != val
+        K-->>W: EAGAIN (someone already changed it)
+    else value == val (read is INSIDE the table lock — atomic wrt futex_do_wake)
+        K->>T: enqueue (tid, bitset) at (tgid, uaddr)
+        K->>S: schedule_blocking(deadline)
+        Note over K,S: publish_waiting_and_take_pending_wake:<br/>store WAITING; check WOKEN_STATES[tid]<br/>— one local-IRQ-masked, SeqCst pair
+        S--)W: thread parked (self-SGI, off CPU)
+    end
+
+    N->>N: mutate the word at uaddr (e.g. Condvar::notify_all / Mutex unlock)
+    N->>K: futex(uaddr, FUTEX_WAKE[_BITSET], count)
+    K->>T: lock table, pop up to `count` matching waiters (by bitset)
+    K->>S: ThreadWaker::wake(tid) — called OUTSIDE the table lock
+    Note over K,S: sets WOKEN_STATES[tid]=true;<br/>if thread state == WAITING, flip READY + ring scheduler
+    S--)W: thread resumed
+
+    W->>T: locate self across ALL of tgid's queues (not just the original key —<br/>a FUTEX_REQUEUE may have moved it)
+    alt not queued anywhere
+        Note over W: popped by FUTEX_WAKE → genuine wake
+        K-->>W: return 0
+    else still queued at the original key
+        Note over W: spurious (revalidation deadline, or a benign race)
+        W->>K: re-check deadline / pending signal / value (EAGAIN if changed)
+        K->>T: re-enqueue, loop
+    else queued at a different key
+        Note over W: moved by FUTEX_REQUEUE — stay parked there, no value re-check
+    end
+```
+
+Two details the diagram compresses that matter for debugging:
+
+- **The value read and the enqueue are one atomic step**, taken under the same
+  table lock (`futex_check_and_enqueue`). That's what closes the classic
+  futex lost-wakeup race: a concurrent wake either lands before the lock is
+  taken (so the read observes the new value → `EAGAIN`, caller re-evaluates)
+  or after the enqueue (so it finds the new waiter and wakes it). A wake
+  landing in between is impossible by construction — there is no window.
+- **The park/wake handshake below `schedule_blocking` is a separate atomic
+  pair**, not covered by the table lock above: `publish_waiting_and_take_pending_wake`
+  stores `WAITING` and re-checks the sticky `WOKEN_STATES[tid]` flag under one
+  local-IRQ mask, because a context switch on this core can only arrive via
+  IRQ. Split those two steps and a waker landing in the gap leaves nothing
+  behind but a flag nobody reads again. See
+  [`scheduler.md`](../scheduler.md) "Park/wake handshake" for the invariant
+  and the 2026-08-05 bug this closed.
+
+**Untimed waits get a synthetic deadline.** `FUTEX_WAIT`/`FUTEX_WAIT_BITSET`
+with no timeout would otherwise park with `deadline = u64::MAX` — no
+schedule-return ever forces a re-check. Since 2026-08-01,
+`sys_futex` parks untimed waits with `park_deadline = uptime_us() +
+FUTEX_REVALIDATE_US` (200 ms) instead, so the loop above runs periodically
+even with no genuine wake: self-remove, re-read the value via
+`futex_check_and_enqueue` (which reports `EAGAIN` if it changed — the same
+rescue a timed wait gets from its own deadline), re-enqueue, re-park. The
+user-visible timeout semantics are unchanged (the `ETIMEDOUT` checks still
+compare against the *original* `deadline`, still `u64::MAX` here) — this is
+purely a safety net bolted onto the park loop.
+
+> **That safety net has a hole, open as of 2026-08-07.** It can only rescue a
+> waiter whose value *did* change but whose wake got lost somewhere in the
+> `schedule_blocking`/`ThreadWaker::wake` handshake above (the class the
+> 2026-08-05 fix targeted). It cannot rescue a waiter whose value **never
+> changes at all** — i.e. thread B in the diagram never reaches "mutate the
+> word" / never calls `FUTEX_WAKE`. `[FUTEX-DUMP]`'s `hist=uSepuSepuSep...`
+> (unpark→self-remove→re-enqueue→park, repeating, no `W` ever) is what that
+> looks like: the revalidation loop runs exactly as designed, forever, because
+> there is nothing for it to observe. The open question is what happens
+> upstream of thread B's `futex(FUTEX_WAKE)` call — reproduced with a tight,
+> ~25s deterministic probe under real SMP contention; not yet root-caused.
+> See
+> [`../../../runbooks/debug-futex-lost-wakeup.md`](../../../runbooks/debug-futex-lost-wakeup.md)
+> "Residual variant" and
+> [`../../../archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md`](../../../archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md)
+> §7.9–§7.10.
+
 ## Waiter table & the tgid key
 
 `FUTEX_WAITERS: Spinlock<BTreeMap<(u32, usize), Vec<(usize, u32)>>>`

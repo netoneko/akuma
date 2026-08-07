@@ -33,8 +33,8 @@
 
 use std::env;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Barrier};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -178,18 +178,170 @@ fn phase_park_mpsc(producers: u64, total_iters: u64) {
 // ---------------------------------------------------------------------------
 // Phase C: high-fanout barrier — many threads FUTEX_WAIT, last-in FUTEX_WAKEs all.
 // One-to-many wake path, repeated under contention.
+//
+// This is a hand-rolled re-implementation of std::sync::Barrier's exact algorithm
+// (Mutex<{count, generation}> + Condvar, wait_while) rather than std::sync::Barrier
+// itself, so it can be instrumented from the inside. §7.10 of the archive doc found
+// that the periodic-revalidation mitigation never sees the futex *value* change on a
+// hang, meaning the thread that should call notify_all() never gets there — but could
+// not tell whether that's because the arrival count itself is wrong (lost increment
+// under contention) or because the leader thread reaches "about to notify" and then
+// the notify_all() syscall itself never returns. This tracks, per worker-thread slot,
+// which of 7 steps it is in and how long it has been there, plus a global rounds-total
+// heartbeat a watchdog thread polls; on a stall it dumps exactly what every thread was
+// doing and for how long, without spamming a print every round (32000+ rounds would
+// perturb the exact scheduling window this bug needs).
 // ---------------------------------------------------------------------------
+extern "C" {
+    fn gettid() -> i32;
+}
+
+struct BarrierState {
+    count: u64,
+    generation: u64,
+}
+
+// Per-thread step, see the numeric comments at each `set_step` call site below.
+struct InstrBarrier {
+    state: Mutex<BarrierState>,
+    cvar: Condvar,
+    n: u64,
+    start: Instant,
+    rounds_total: AtomicU64,
+    shadow_count: AtomicU64,
+    shadow_gen: AtomicU64,
+    last_notify_tid: AtomicU64,
+    last_notify_round: AtomicU64,
+    step: Vec<AtomicU8>,
+    step_ts_ms: Vec<AtomicU64>,
+    thread_tid: Vec<AtomicU64>,
+}
+
+impl InstrBarrier {
+    fn new(n: u64) -> Self {
+        InstrBarrier {
+            state: Mutex::new(BarrierState { count: 0, generation: 0 }),
+            cvar: Condvar::new(),
+            n,
+            start: Instant::now(),
+            rounds_total: AtomicU64::new(0),
+            shadow_count: AtomicU64::new(0),
+            shadow_gen: AtomicU64::new(0),
+            last_notify_tid: AtomicU64::new(0),
+            last_notify_round: AtomicU64::new(0),
+            step: (0..n).map(|_| AtomicU8::new(0)).collect(),
+            step_ts_ms: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            thread_tid: (0..n).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    fn now_ms(&self) -> u64 { self.start.elapsed().as_millis() as u64 }
+
+    fn set_step(&self, idx: usize, s: u8) {
+        self.step[idx].store(s, Ordering::Relaxed);
+        self.step_ts_ms[idx].store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    fn register(&self, idx: usize) {
+        self.thread_tid[idx].store(unsafe { gettid() } as u64, Ordering::Relaxed);
+    }
+
+    // Steps: 0=idle 1=locking-mutex 2=locked-evaluating 3=LEADER-about-to-notify_all
+    //        4=LEADER-notify_all-returned 5=FOLLOWER-about-to-wait_while
+    //        6=FOLLOWER-woken-returning
+    fn wait(&self, idx: usize, round: u64) {
+        self.set_step(idx, 1);
+        let mut g = self.state.lock().unwrap();
+        self.set_step(idx, 2);
+        g.count += 1;
+        self.shadow_count.store(g.count, Ordering::Relaxed);
+        if g.count < self.n {
+            let local_gen = g.generation;
+            self.set_step(idx, 5);
+            let _g2 = self.cvar.wait_while(g, |st| st.generation == local_gen).unwrap();
+            self.set_step(idx, 6);
+        } else {
+            g.count = 0;
+            g.generation = g.generation.wrapping_add(1);
+            self.shadow_count.store(0, Ordering::Relaxed);
+            self.shadow_gen.store(g.generation, Ordering::Relaxed);
+            self.set_step(idx, 3);
+            self.last_notify_tid.store(unsafe { gettid() } as u64, Ordering::Relaxed);
+            self.last_notify_round.store(round, Ordering::Relaxed);
+            self.cvar.notify_all();
+            self.set_step(idx, 4);
+            drop(g);
+        }
+        self.rounds_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn dump(&self, cur_rounds: u64, stuck_ms: u64) {
+        let mut line = format!(
+            "[barrier-instr] STUCK stuck_for_ms={} rounds_total={} shadow_count={} shadow_gen={} last_notify_tid={} last_notify_round={}",
+            stuck_ms, cur_rounds,
+            self.shadow_count.load(Ordering::Relaxed),
+            self.shadow_gen.load(Ordering::Relaxed),
+            self.last_notify_tid.load(Ordering::Relaxed),
+            self.last_notify_round.load(Ordering::Relaxed),
+        );
+        mark(&line);
+        line.clear();
+        let now = self.now_ms();
+        for i in 0..self.n as usize {
+            let s = self.step[i].load(Ordering::Relaxed);
+            let ts = self.step_ts_ms[i].load(Ordering::Relaxed);
+            let tid = self.thread_tid[i].load(Ordering::Relaxed);
+            mark(&format!(
+                "[barrier-instr]   idx={} tid={} step={} step_age_ms={}",
+                i, tid, s, now.saturating_sub(ts)
+            ));
+        }
+    }
+}
+
+fn spawn_barrier_watchdog(bar: Arc<InstrBarrier>, done: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let poll_ms: u64 = 200;
+        let mut last_rounds = 0u64;
+        let mut stuck_ms: u64 = 0;
+        let mut last_dump_ms: u64 = 0;
+        loop {
+            thread::sleep(Duration::from_millis(poll_ms));
+            if done.load(Ordering::Acquire) { return; }
+            let cur = bar.rounds_total.load(Ordering::Relaxed);
+            if cur == last_rounds {
+                stuck_ms += poll_ms;
+            } else {
+                stuck_ms = 0;
+                last_dump_ms = 0;
+                last_rounds = cur;
+            }
+            // First dump at 2s stuck, then every 2s thereafter — enough resolution to
+            // see a step change without flooding the console under -j4 log volume.
+            if stuck_ms >= 2000 && stuck_ms.saturating_sub(last_dump_ms) >= 2000 {
+                bar.dump(cur, stuck_ms);
+                last_dump_ms = stuck_ms;
+            }
+        }
+    })
+}
+
 fn phase_barrier(threads: u64, rounds: u64) {
     mark(&format!("[barrier] start threads={} rounds={}", threads, rounds));
-    let bar = Arc::new(Barrier::new(threads as usize));
+    let bar = Arc::new(InstrBarrier::new(threads));
+    let done = Arc::new(AtomicBool::new(false));
+    let watchdog = spawn_barrier_watchdog(bar.clone(), done.clone());
     let mut hs = Vec::new();
-    for _ in 0..threads {
+    for idx in 0..threads as usize {
         let b = bar.clone();
         hs.push(thread::spawn(move || {
-            for _ in 0..rounds { b.wait(); }
+            b.register(idx);
+            for round in 0..rounds { b.wait(idx, round); }
         }));
     }
     for h in hs { h.join().unwrap(); }
+    done.store(true, Ordering::Release);
+    let _ = watchdog.join();
     mark("[barrier] ok");
 }
 
