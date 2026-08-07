@@ -1530,9 +1530,30 @@ pub fn spawn_with_env(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, e
 /// Kill a process by PID
 ///
 /// Returns 0 on success, negative errno on error.
+///
+/// **This sends signal 0**, which the kernel treats as a "does the process
+/// exist?" probe and never delivers (`sys_kill` in `src/syscall/proc.rs`). It
+/// checks for the process; it does not stop it. Use [`kill_signal`] to actually
+/// terminate something. The behaviour is kept as-is because call sites outside
+/// herd rely on the probe.
 pub fn kill(pid: u32) -> i32 {
     syscall(syscall::KILL, pid as u64, 0, 0, 0, 0, 0) as i32
 }
+
+/// Send signal `sig` to `pid`. Returns 0 on success, negative errno on error.
+///
+/// `sig = 0` only probes for the process's existence without delivering
+/// anything — the same contract as Linux, and what [`kill`] hardcodes.
+pub fn kill_signal(pid: u32, sig: u32) -> i32 {
+    syscall(syscall::KILL, pid as u64, sig as u64, 0, 0, 0, 0) as i32
+}
+
+/// `SIGTERM` — the polite stop. Catchable, so a service may exit cleanly in
+/// response rather than showing up as a signal death.
+pub const SIGTERM: u32 = 15;
+
+/// `SIGKILL` — uncatchable.
+pub const SIGKILL: u32 = 9;
 
 /// Reattach I/O to a target process
 pub fn reattach(pid: u32) -> i32 {

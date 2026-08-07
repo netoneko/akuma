@@ -1467,6 +1467,19 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
         return EFAULT;
     }
 
+    // Entering a box is a privilege boundary, not a preference: the child takes
+    // that box's `box_id` AND its mount namespace (`spawn.rs`, "Set up isolation
+    // context"). Unchecked, a boxed process spawns straight into box 0's
+    // namespace — or into a sibling's — and reads whatever that box can see.
+    // `box_id == 0` means "inherit the caller's box" and needs no check.
+    if o.box_id != 0 {
+        let (caller_box, caller_pid) = super::container::caller_box_and_pid();
+        let registry = akuma_exec::process::registry_snapshot();
+        if !akuma_exec::process::box_access::can_access_box(&registry, caller_box, o.box_id, caller_pid) {
+            return EPERM;
+        }
+    }
+
     let cwd = if o.cwd_ptr != 0 {
         let mut kernel_cwd = alloc::vec![0u8; o.cwd_len];
         if unsafe { copy_from_user_safe(kernel_cwd.as_mut_ptr(), o.cwd_ptr as *const u8, o.cwd_len).is_err() } {
@@ -1522,6 +1535,15 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
 /// default). herd calls this for a `stack = rump` service. Without the `rump`
 /// kernel feature the call is harmlessly ignored.
 pub fn sys_set_box_stack(box_id: u64, stack: u64) -> u64 {
+    // Repointing a box's network stack decides where its AF_INET syscalls are
+    // proxied, so it is only the owner's call — otherwise any process could
+    // route a box it does not own at a rump server it does.
+    let (caller_box, caller_pid) = super::container::caller_box_and_pid();
+    let registry = akuma_exec::process::registry_snapshot();
+    if !akuma_exec::process::box_access::can_access_box(&registry, caller_box, box_id, caller_pid) {
+        return EPERM;
+    }
+
     #[cfg(feature = "rump")]
     if stack == 1 {
         crate::rump_proxy::mark_box_rump(box_id);

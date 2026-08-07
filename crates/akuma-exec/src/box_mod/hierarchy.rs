@@ -67,19 +67,40 @@ pub fn get_descendants(registry: &BTreeMap<u64, BoxInfo>, parent_id: u64) -> Vec
 }
 
 /// Validate that `child_root_dir` is within the parent's visible namespace.
-/// A child's root must be a sub-path of the parent's root.
+/// A child's root must be the parent's root itself or a directory under it.
+///
+/// `child_root_dir` must already be canonical — the caller normalizes at the
+/// syscall boundary, because an unresolved `..` would make the prefix test below
+/// meaningless. An unresolved component is rejected rather than trusted.
 pub fn validate_nested_root(parent_info: &BoxInfo, child_root_dir: &str) -> Result<(), &'static str> {
     if child_root_dir.is_empty() {
         return Err("Child root_dir is empty");
     }
+    if !child_root_dir.starts_with('/') {
+        return Err("Child root_dir is not absolute");
+    }
+    if child_root_dir.split('/').any(|c| c == ".." || c == ".") {
+        return Err("Child root_dir has an unresolved . or .. component");
+    }
 
-    let parent_root = parent_info.root_dir.as_str();
-
-    if parent_root == "/" {
+    // "/" trims to "", and every absolute path is under the host's root.
+    let parent_root = parent_info.root_dir.trim_end_matches('/');
+    if parent_root.is_empty() {
         return Ok(());
     }
 
-    if child_root_dir.starts_with(parent_root) {
+    let child = child_root_dir.trim_end_matches('/');
+    if child == parent_root {
+        return Ok(());
+    }
+
+    // The match must land on a path-component boundary: `/containers/box10` is a
+    // *sibling* of `/containers/box1`, and a bare `starts_with` would take it for
+    // a child and hand the caller a jail overlapping someone else's.
+    if child.len() > parent_root.len()
+        && child.starts_with(parent_root)
+        && child.as_bytes()[parent_root.len()] == b'/'
+    {
         Ok(())
     } else {
         Err("Child root_dir is not within parent's namespace")
@@ -237,6 +258,39 @@ mod tests {
         let parent = reg.get(&1).unwrap();
         assert!(validate_nested_root(parent, "/containers/box3").is_err());
         assert!(validate_nested_root(parent, "/other").is_err());
+    }
+
+    #[test]
+    fn test_validate_nested_root_rejects_sibling_sharing_a_prefix() {
+        let reg = make_test_registry();
+        let parent = reg.get(&1).unwrap(); // root_dir "/containers/box1"
+        // Not a child: the prefix match must stop at a component boundary.
+        assert!(validate_nested_root(parent, "/containers/box10").is_err());
+        assert!(validate_nested_root(parent, "/containers/box1suffix").is_err());
+        // The boundary case that *is* a child.
+        assert!(validate_nested_root(parent, "/containers/box1/x").is_ok());
+        // Trailing slashes must not change the verdict either way.
+        assert!(validate_nested_root(parent, "/containers/box1/").is_ok());
+        assert!(validate_nested_root(parent, "/containers/box10/").is_err());
+    }
+
+    #[test]
+    fn test_validate_nested_root_rejects_unresolved_traversal() {
+        let reg = make_test_registry();
+        let parent = reg.get(&1).unwrap();
+        // Would pass a bare starts_with test and then escape the parent's jail.
+        assert!(validate_nested_root(parent, "/containers/box1/../box3").is_err());
+        assert!(validate_nested_root(parent, "/containers/box1/./sub").is_err());
+        // Even against the permissive host parent, an unresolved path is refused.
+        let host = reg.get(&0).unwrap();
+        assert!(validate_nested_root(host, "/srv/../etc").is_err());
+    }
+
+    #[test]
+    fn test_validate_nested_root_rejects_relative() {
+        let reg = make_test_registry();
+        let parent = reg.get(&1).unwrap();
+        assert!(validate_nested_root(parent, "containers/box1/sub").is_err());
     }
 
     #[test]

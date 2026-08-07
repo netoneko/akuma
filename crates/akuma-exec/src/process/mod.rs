@@ -297,8 +297,13 @@ fn on_thread_cleanup(tid: usize) {
 pub use crate::box_registry::{
     BoxInfo, register_box, unregister_box, list_boxes,
     find_box_by_name, get_box_name, get_box_info, find_primary_box,
-    init_box_registry,
+    init_box_registry, registry_snapshot,
 };
+
+/// Box permission checks. Every syscall that crosses a box boundary — register,
+/// kill, spawn-into, set-stack — gates on these; see
+/// `docs/reference/subsystems/containers.md`.
+pub use crate::box_registry::access as box_access;
 
 /// Write data to a process's stdin
 pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str> {

@@ -51,6 +51,22 @@ The box rootfs is populated by copying files (`populate_disk.sh` copies the
 (`/bin/rump_server`, `/bin/sshd`, `/bin/sh`, …) must physically exist under
 `box_root` (e.g. `bootstrap/srv/rumpbox/bin/...`). This duplicates them on disk.
 
+## 6. `..` is confined, and `/` cannot be unmounted (2026-08-08)
+
+Two things that used to belong on this list no longer do:
+
+- `SubdirFs` resolves `.`/`..` and clamps at the virtual root before prefixing,
+  so a path cannot ascend out of `box_root` even if it reaches the filesystem
+  without going through `with_fs`'s `resolve_path`.
+- A boxed process cannot `umount2("/")`. That mount **is** the jail; dropping it
+  left the namespace empty, and item 2's fallback (`with_fs` falls back to the
+  global mount table when the namespace has no match) then resolved every path
+  against the host root.
+
+The fallback in item 2 is unchanged and still load-bearing — it is what a box
+with `box_root = "/"` relies on. See
+[`BOX_ISOLATION_SECURITY_FIXES.md`](BOX_ISOLATION_SECURITY_FIXES.md).
+
 ## Future direction
 
 A real per-box devfs + procfs auto-mounted at box creation would remove the

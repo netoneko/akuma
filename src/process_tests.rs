@@ -695,6 +695,12 @@ pub fn run_all_tests() {
     test_mkdirat();
     test_fchmodat();
 
+    // Box isolation at the syscall boundary: kill/register/spawn-into/set-stack
+    // across a box line, umount of the jail root, and `..` inside a SubdirFs jail.
+    // `box_mod::access` was pure-tested but uncalled, so none of these were enforced.
+    #[cfg(feature = "sc-containers")]
+    test_box_isolation_syscall_guards();
+
     // `no-bkl-process` (Phase 3): ProcessBklGuard's ledger balance + latching, and the
     // real `cow_share_and_demote_range` pass fork's dropped-BKL window runs — pins what
     // the carve-out must preserve (BKL_PROCESS_CARVE_OUT.md §9).
@@ -2714,6 +2720,189 @@ fn test_mkdirat() {
     } else {
         crate::safe_print!(64, "[Test] mkdirat FAILED ({} of 6 cases)\n", fails);
         panic!("test_mkdirat: {fails} of 6 cases failed");
+    }
+}
+
+/// Box isolation must be enforced at the SYSCALL boundary, not only in the pure
+/// helpers in `akuma-exec`'s `box_mod::access` (which had host tests but no
+/// callers). Every case here is a real `handle_syscall` issued by a process that
+/// believes it is inside box A; before the guards landed each one succeeded and
+/// handed the box a way out of its jail. See
+/// `docs/reference/subsystems/containers.md` §"Box permissions".
+#[cfg(feature = "sc-containers")]
+fn test_box_isolation_syscall_guards() {
+    use crate::syscall::{handle_syscall, nr, BYPASS_VALIDATION};
+    use crate::vfs::Filesystem;
+    use akuma_exec::process::{
+        register_process, unregister_process, register_thread_pid, unregister_thread_pid,
+        register_box, unregister_box, get_box_info, BoxInfo,
+    };
+    use akuma_exec::threading::current_thread_id;
+    use alloc::string::String;
+    use core::sync::atomic::Ordering;
+
+    const EPERM: u64 = (-1i64) as u64;
+    const BOX_A: u64 = 0x005E_C00A;
+    const BOX_B: u64 = 0x005E_C00B;
+    const BOX_NESTED: u64 = 0x005E_C00C;
+    const ROOT_A: &str = "/tmp/boxsec/a";
+    const ROOT_B: &str = "/tmp/boxsec/b";
+    const NESTED_ROOT: &str = "/tmp/boxsec/a/sub";
+
+    let mut fails = 0u32;
+
+    // Two sibling boxes, both children of the host.
+    for (id, name, root) in [(BOX_A, "boxsec_a", ROOT_A), (BOX_B, "boxsec_b", ROOT_B)] {
+        register_box(BoxInfo {
+            id,
+            name: String::from(name),
+            root_dir: String::from(root),
+            creator_pid: 1,
+            primary_pid: 1,
+            parent_box_id: Some(0),
+        });
+    }
+
+    // Impersonate a process living in box A.
+    let tid = current_thread_id();
+    let pid: u32 = 7731;
+    let mut proc = make_test_process(pid);
+    proc.box_id = BOX_A;
+    register_process(pid, proc);
+    register_thread_pid(tid, pid);
+
+    BYPASS_VALIDATION.store(true, Ordering::Release);
+
+    macro_rules! check {
+        ($label:literal, $got:expr, $want:expr) => {
+            let got = $got;
+            if got != $want {
+                fails += 1;
+                crate::safe_print!(128, "[Test] box guard {} FAILED: got {} want {}\n",
+                    $label, got as i64, $want as i64);
+            }
+        };
+    }
+
+    // 1. A boxed process must not reach a sibling box. Unguarded this kills every
+    //    process in box B and drops B's namespace out from under it.
+    check!("kill_box(sibling)", handle_syscall(nr::KILL_BOX, &[BOX_B, 0, 0, 0, 0, 0]), EPERM);
+
+    // 2. ... nor the host box.
+    check!("kill_box(host)", handle_syscall(nr::KILL_BOX, &[0, 0, 0, 0, 0, 0]), EPERM);
+
+    // 3. The two-syscall escape: mint a box rooted at "/" (no SubdirFs, so it sees
+    //    the global mount table), then spawn into it. Registration is where it dies.
+    let escape_name = b"escape";
+    let slash = b"/";
+    check!("register_box(root=/)", handle_syscall(nr::REGISTER_BOX, &[
+        0x005E_C00D,
+        escape_name.as_ptr() as u64, escape_name.len() as u64,
+        slash.as_ptr() as u64, slash.len() as u64,
+        u64::from(pid),
+    ]), EPERM);
+
+    // 4. ... and the traversal spelling of the same thing.
+    let dotdot = b"/tmp/boxsec/a/../b";
+    check!("register_box(root=../sibling)", handle_syscall(nr::REGISTER_BOX, &[
+        0x005E_C00E,
+        escape_name.as_ptr() as u64, escape_name.len() as u64,
+        dotdot.as_ptr() as u64, dotdot.len() as u64,
+        u64::from(pid),
+    ]), EPERM);
+
+    // 5. Subdividing its OWN jail is legitimate and must still work — the guard
+    //    has to be a boundary, not a blanket denial.
+    let nested_name = b"nested";
+    let nested_root = NESTED_ROOT.as_bytes();
+    check!("register_box(own subtree)", handle_syscall(nr::REGISTER_BOX, &[
+        BOX_NESTED,
+        nested_name.as_ptr() as u64, nested_name.len() as u64,
+        nested_root.as_ptr() as u64, nested_root.len() as u64,
+        u64::from(pid),
+    ]), 0);
+
+    // ... recorded as a CHILD of box A, so A keeps reach over it and its siblings
+    // do not. `parent_box_id` was hardcoded to None before this fix, which left
+    // every ancestry check in `box_mod::hierarchy` permanently blind.
+    match get_box_info(BOX_NESTED) {
+        Some(info) if info.parent_box_id == Some(BOX_A) => {}
+        Some(info) => {
+            fails += 1;
+            crate::safe_print!(128, "[Test] box guard nested-parent FAILED: {:?}\n", info.parent_box_id);
+        }
+        None => {
+            fails += 1;
+            crate::safe_print!(96, "[Test] box guard nested-parent FAILED: box not registered\n");
+        }
+    }
+
+    // 6. Spawning into a sibling's box: the child would take box B's box_id AND
+    //    its mount namespace. The path is deliberately bogus — a guard that fires
+    //    returns EPERM before the spawn is ever attempted.
+    let spawn_opts = crate::syscall::proc::SpawnOptions { box_id: BOX_B, ..Default::default() };
+    let spawn_path = b"/nonexistent-boxsec\0";
+    check!("spawn_ext(sibling box)", handle_syscall(nr::SPAWN_EXT, &[
+        spawn_path.as_ptr() as u64,
+        (&raw const spawn_opts) as u64,
+        0, 0, 0, 0,
+    ]), EPERM);
+
+    // 7. Repointing a sibling's network stack at a rump server it does not own.
+    check!("set_box_stack(sibling)", handle_syscall(nr::SET_BOX_STACK, &[BOX_B, 1, 0, 0, 0, 0]), EPERM);
+
+    // 8. Unmounting the jail root. The namespace goes empty, and `with_fs` then
+    //    falls back to the GLOBAL mount table — the whole host filesystem.
+    let root_path = b"/\0";
+    check!("umount2(jail root)", handle_syscall(nr::UMOUNT2, &[
+        root_path.as_ptr() as u64, 0, 0, 0, 0, 0,
+    ]), EPERM);
+
+    // 9. The jail itself: `..` inside a box must clamp at the virtual root rather
+    //    than walking into the host's files.
+    let _ = crate::fs::create_dir("/tmp/boxsec");
+    let _ = crate::fs::create_dir(ROOT_A);
+    let _ = crate::fs::write_file("/tmp/boxsec/outside.txt", b"HOSTSECRET");
+    let _ = crate::fs::write_file("/tmp/boxsec/a/inside.txt", b"boxdata");
+    if let Some(root_fs) = crate::vfs::get_root_fs() {
+        let jail = akuma_isolation::subdir_fs::SubdirFs::new(root_fs, ROOT_A);
+        if jail.read_file("/inside.txt").as_deref() != Ok(b"boxdata".as_slice()) {
+            fails += 1;
+            crate::safe_print!(96, "[Test] box guard subdirfs-inside FAILED\n");
+        }
+        if let Ok(leaked) = jail.read_file("/../outside.txt") {
+            fails += 1;
+            crate::safe_print!(128, "[Test] box guard subdirfs-escape FAILED: read {} bytes of host file\n", leaked.len());
+        }
+    }
+
+    // 10. Positive control from the host box: the same kill the boxed process was
+    //     refused must succeed, or every case above passes for the wrong reason.
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+    let host_pid: u32 = 7732;
+    register_process(host_pid, make_test_process(host_pid)); // box_id 0
+    register_thread_pid(tid, host_pid);
+    check!("kill_box(sibling) as host", handle_syscall(nr::KILL_BOX, &[BOX_B, 0, 0, 0, 0, 0]), 0);
+
+    // Cleanup.
+    let _ = handle_syscall(nr::KILL_BOX, &[BOX_NESTED, 0, 0, 0, 0, 0]);
+    BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_thread_pid(tid);
+    unregister_process(host_pid);
+    unregister_box(BOX_A);
+    unregister_box(BOX_B);
+    unregister_box(BOX_NESTED);
+    let _ = crate::fs::remove_file("/tmp/boxsec/outside.txt");
+    let _ = crate::fs::remove_file("/tmp/boxsec/a/inside.txt");
+    let _ = crate::fs::remove_dir(ROOT_A);
+    let _ = crate::fs::remove_dir("/tmp/boxsec");
+
+    if fails == 0 {
+        crate::safe_print!(128, "[Test] box isolation syscall guards PASSED (10 cases)\n");
+    } else {
+        crate::safe_print!(96, "[Test] box isolation syscall guards FAILED ({} of 10 cases)\n", fails);
+        panic!("test_box_isolation_syscall_guards: {fails} of 10 cases failed");
     }
 }
 

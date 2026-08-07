@@ -1,43 +1,84 @@
 use super::*;
 use akuma_exec::mmu::user_access::copy_from_user_safe;
 
+/// The calling process's `(box_id, pid)`.
+///
+/// A kernel thread has no `Process`, which is how the built-in shell and the
+/// boot path reach these syscalls; it is the host, box 0. Every check below
+/// keys off this, so it is the one place the caller's identity is decided.
+pub(super) fn caller_box_and_pid() -> (u64, u32) {
+    akuma_exec::process::current_process_shared().map_or((0, 0), |p| (p.box_id, p.pid))
+}
+
 pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root_len: usize, primary_pid: u32) -> u64 {
     if !validate_user_ptr(name_ptr, name_len) { return EFAULT; }
     if !validate_user_ptr(root_ptr, root_len) { return EFAULT; }
-    
+
     let mut name_buf = alloc::vec![0u8; name_len];
     let mut root_buf = alloc::vec![0u8; root_len];
-    
+
     if unsafe { copy_from_user_safe(name_buf.as_mut_ptr(), name_ptr as *const u8, name_len).is_err() } {
         return EFAULT;
     }
     if unsafe { copy_from_user_safe(root_buf.as_mut_ptr(), root_ptr as *const u8, root_len).is_err() } {
         return EFAULT;
     }
-    
+
     let name = core::str::from_utf8(&name_buf).unwrap_or("unknown");
     let root = core::str::from_utf8(&root_buf).unwrap_or("/");
-    let creator_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+    let (caller_box, caller_pid) = caller_box_and_pid();
+
+    // Normalize before deciding anything: `root` becomes the box's `SubdirFs`
+    // jail, and an unresolved `..` would sail through the containment check
+    // below and then resolve on disk to somewhere else entirely.
+    let root = crate::vfs::canonicalize_path(root);
+
+    // Registration is a privilege boundary — the caller is naming a filesystem
+    // subtree that anything spawned into the box will see as `/`. Without this
+    // a boxed process mints a box rooted at `/` and spawns into it.
+    let registry = akuma_exec::process::registry_snapshot();
+    let parent_box_id = match akuma_exec::process::box_access::can_register_box(
+        &registry, caller_box, caller_pid, id, &root,
+    ) {
+        Ok(parent) => parent,
+        Err(reason) => {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(192, "[register_box] denied box={} root={} caller_box={}: {}\n",
+                    id, root, caller_box, reason);
+            }
+            return EPERM;
+        }
+    };
 
     akuma_exec::process::register_box(akuma_exec::process::BoxInfo {
         id,
         name: String::from(name),
-        root_dir: String::from(root),
-        creator_pid,
+        root_dir: root.clone(),
+        creator_pid: caller_pid,
         primary_pid,
-        parent_box_id: None,
+        parent_box_id,
     });
 
-    crate::vfs::create_box_namespace(id, root);
+    crate::vfs::create_box_namespace(id, &root);
 
     0
 }
 
 pub(super) fn sys_kill_box(box_id: u64) -> u64 {
-    crate::vfs::remove_box_namespace(box_id);
+    let (caller_box, caller_pid) = caller_box_and_pid();
+    let registry = akuma_exec::process::registry_snapshot();
+    if !akuma_exec::process::box_access::can_kill_box(&registry, caller_box, box_id, caller_pid) {
+        return EPERM;
+    }
 
-    // kill_box only fails when the box id is unknown.
-    if akuma_exec::process::kill_box(box_id).is_ok() { 0 } else { ESRCH }
+    // kill_box only fails when the box id is unknown (or is box 0, which is
+    // never killable). Drop the namespace only once the kill has taken, so a
+    // rejected call cannot strand a live box without its mounts.
+    if akuma_exec::process::kill_box(box_id).is_err() {
+        return ESRCH;
+    }
+    crate::vfs::remove_box_namespace(box_id);
+    0
 }
 
 pub(super) fn sys_reattach(pid: u32) -> u64 {
@@ -68,6 +109,12 @@ pub(super) fn sys_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64, _fla
         }
     };
 
+    // `MountNamespace::resolve` compares mount points literally, so an
+    // un-normalized target ("/proc/", "/a/../proc") would register a mount point
+    // no lookup can ever match — and would slip past the duplicate check that
+    // keeps a box from shadowing its own root.
+    let target = crate::vfs::canonicalize_path(&target);
+
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         if proc.box_id == 0 {
             match crate::vfs::mount(&target, fs) {
@@ -90,9 +137,16 @@ pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> u64 {
         Ok(s) => s,
         Err(e) => return e,
     };
+    let target = crate::vfs::canonicalize_path(&target);
 
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         if proc.box_id == 0 {
+            EPERM
+        } else if target == "/" {
+            // "/" is the box's `SubdirFs` jail root. Unmounting it empties the
+            // namespace, and `with_fs` then falls back to the GLOBAL mount table
+            // — i.e. the whole host filesystem, read and write. A box may drop a
+            // mount it added (its /proc, a tmpfs); never the floor it stands on.
             EPERM
         } else {
             match proc.namespace.mount.lock().unmount(&target) {
@@ -125,7 +179,8 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
         return EFAULT;
     }
 
-    let target = core::str::from_utf8(&target_buf).unwrap_or("");
+    // Same reason as sys_mount: mount points are matched literally.
+    let target = crate::vfs::canonicalize_path(core::str::from_utf8(&target_buf).unwrap_or(""));
     let fstype = core::str::from_utf8(&fstype_buf).unwrap_or("");
 
     let fs: alloc::sync::Arc<dyn crate::vfs::Filesystem> = match fstype {
@@ -134,7 +189,7 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
         _ => return ENODEV,
     };
 
-    match crate::vfs::mount_in_namespace(box_id, target, fs) {
+    match crate::vfs::mount_in_namespace(box_id, &target, fs) {
         Ok(()) => 0,
         Err(_) => EINVAL,
     }

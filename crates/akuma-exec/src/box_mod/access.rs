@@ -55,6 +55,67 @@ pub fn can_kill_box(
     can_access_box(registry, killer_box_id, target_box_id, killer_pid)
 }
 
+/// Decide whether a process may (re)register box `target_box_id` rooted at
+/// `canonical_root_dir`, and what `parent_box_id` the registration should record.
+///
+/// Registration is a privilege boundary, not bookkeeping: the box's `root_dir`
+/// becomes a `SubdirFs` jail that anything spawned into the box sees as `/`. Left
+/// unchecked, a boxed process can mint a box rooted at `/` and spawn into it, or
+/// overwrite the host box's entry.
+///
+/// `canonical_root_dir` must already be normalized (see
+/// [`hierarchy::validate_nested_root`]).
+///
+/// Returns the parent box id to record, or the reason the caller may not do this.
+pub fn can_register_box(
+    registry: &BTreeMap<u64, BoxInfo>,
+    caller_box_id: u64,
+    caller_pid: Pid,
+    target_box_id: u64,
+    canonical_root_dir: &str,
+) -> Result<Option<u64>, &'static str> {
+    match registry.get(&target_box_id) {
+        // Re-registration of a live box. herd does this legitimately — once with
+        // a placeholder pid, then with the real one — so it must stay allowed for
+        // whoever owns the box, and denied for everyone else. The recorded parent
+        // is kept: a box must never be able to re-parent itself out from under
+        // its creator and inherit the creator's reach.
+        Some(existing) => {
+            if !can_access_box(registry, caller_box_id, target_box_id, caller_pid) {
+                return Err("Box is outside the caller's hierarchy");
+            }
+            validate_root_under_caller(registry, caller_box_id, canonical_root_dir)?;
+            Ok(existing.parent_box_id)
+        }
+        // A brand-new box. Anyone may create one — nesting is a supported use —
+        // but it becomes a child of the caller's box and its root must lie inside
+        // the caller's own root, so a box can only ever subdivide its own jail.
+        None => {
+            if target_box_id == 0 {
+                return Err("Box 0 is the host and cannot be created");
+            }
+            validate_root_under_caller(registry, caller_box_id, canonical_root_dir)?;
+            Ok(Some(caller_box_id))
+        }
+    }
+}
+
+/// A root a caller is allowed to hand a box: inside the caller's own jail.
+/// The host (box 0) is rooted at `/`, so nothing constrains it.
+fn validate_root_under_caller(
+    registry: &BTreeMap<u64, BoxInfo>,
+    caller_box_id: u64,
+    canonical_root_dir: &str,
+) -> Result<(), &'static str> {
+    if caller_box_id == 0 {
+        return Ok(());
+    }
+    let caller = registry
+        .get(&caller_box_id)
+        .ok_or("Caller's own box is not registered")?;
+    hierarchy::validate_nested_root(caller, canonical_root_dir)
+}
+
 /// Get the ordered list of box IDs to kill when cascade-killing `target_box_id`.
 /// Returns descendants in reverse depth order (deepest children first)
 /// so that cleanup proceeds leaf-to-root.
@@ -168,6 +229,59 @@ mod tests {
         assert!(can_kill_box(&reg, 1, 1, 101));
         assert!(can_kill_box(&reg, 1, 2, 101));
         assert!(!can_kill_box(&reg, 2, 1, 103));
+    }
+
+    #[test]
+    fn test_can_register_box_host_may_register_anything() {
+        let reg = make_test_registry();
+        // New box, anywhere on the filesystem.
+        assert_eq!(can_register_box(&reg, 0, 1, 42, "/srv/newbox"), Ok(Some(0)));
+        // Re-registering an existing box keeps its recorded parent.
+        assert_eq!(can_register_box(&reg, 0, 1, 2, "/containers/box1/nested"), Ok(Some(1)));
+    }
+
+    #[test]
+    fn test_can_register_box_new_box_is_a_child_of_the_caller() {
+        let reg = make_test_registry();
+        // A process in box 1 creating box 42 under its own root: box 42's parent
+        // is box 1, so box 1 keeps reach over it and box 3 does not.
+        assert_eq!(can_register_box(&reg, 1, 101, 42, "/containers/box1/sub"), Ok(Some(1)));
+    }
+
+    #[test]
+    fn test_can_register_box_rejects_root_outside_callers_jail() {
+        let reg = make_test_registry();
+        // The escape this check exists for: mint a box rooted at "/" and later
+        // spawn into it for an unjailed view of the host filesystem.
+        assert!(can_register_box(&reg, 1, 101, 42, "/").is_err());
+        assert!(can_register_box(&reg, 1, 101, 42, "/etc").is_err());
+        // A sibling box's root is off limits too.
+        assert!(can_register_box(&reg, 1, 101, 42, "/containers/box3").is_err());
+    }
+
+    #[test]
+    fn test_can_register_box_rejects_hijacking_the_host_entry() {
+        let reg = make_test_registry();
+        // Overwriting box 0's BoxInfo would reset the host's root_dir and pids.
+        assert!(can_register_box(&reg, 1, 101, 0, "/containers/box1").is_err());
+        assert!(can_register_box(&reg, 2, 103, 0, "/containers/box1/nested").is_err());
+    }
+
+    #[test]
+    fn test_can_register_box_rejects_reregistering_an_unrelated_box() {
+        let reg = make_test_registry();
+        // Box 3 is a sibling of box 1, not a descendant.
+        assert!(can_register_box(&reg, 1, 101, 3, "/containers/box1/sub").is_err());
+        // ... and a child cannot re-register its parent.
+        assert!(can_register_box(&reg, 2, 103, 1, "/containers/box1/nested/x").is_err());
+    }
+
+    #[test]
+    fn test_can_register_box_rejects_unregistered_caller_box() {
+        let reg = make_test_registry();
+        // A caller claiming a box id that is not in the registry has no root to
+        // validate against, so it gets nothing rather than a free pass.
+        assert!(can_register_box(&reg, 77, 500, 42, "/srv/x").is_err());
     }
 
     #[test]

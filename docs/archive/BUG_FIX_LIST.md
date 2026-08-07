@@ -9,8 +9,8 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 507
-- **Docs contributing at least one fix:** 149
+- **Total distinct fixes counted:** 518
+- **Docs contributing at least one fix:** 151
 - **Subsystem categories:** 15
 
 Updated 2026-08-07: +32 fixes / +19 docs, covering everything landed since
@@ -31,24 +31,32 @@ range as explicitly zero-count; `J4_HANG_LIVE_AUTOPSY.md` is the verbatim
 session record for the stale-tid fix, counted once under
 `KTG_STALE_TID_EXIT_STAMP_J4_HANG.md`.
 
+Updated 2026-08-08: +11 fixes / +2 docs — the box isolation audit
+(`BOX_ISOLATION_SECURITY_FIXES.md`, 9 fixes) and herd's signal-vs-clean-exit
+handling (`userspace/herd/docs/SIGNAL_EXIT_HANDLING.md`, 2 fixes; moved out of
+the zero-count list below, where it sat as "proposed, not implemented"). The box
+items are unusual for this file in that eight of the nine were *never-enforced
+boundaries* rather than regressions: the permission logic existed in
+`crates/akuma-exec/src/box_mod/` with passing unit tests and no callers.
+
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 116 | 22.9% | 15 |
-| Memory & Virtual Memory | 89 | 17.6% | 25 |
-| Scheduler & Process Management | 72 | 14.2% | 16 |
-| SMP & Locking | 59 | 11.6% | 24 |
-| Networking | 30 | 5.9% | 12 |
-| Userspace Apps & Libraries | 30 | 5.9% | 15 |
-| Rump Kernel & Syscall Proxy | 24 | 4.7% | 5 |
-| Toolchain & Self-Hosting | 31 | 6.1% | 4 |
-| SSH | 12 | 2.4% | 10 |
-| VFS & Filesystem | 13 | 2.6% | 9 |
-| Boot & Drivers | 9 | 1.8% | 5 |
-| Signals & Exceptions | 10 | 2.0% | 4 |
-| Misc / Cross-cutting | 8 | 1.6% | 1 |
+| Syscall / ABI Compatibility Audits | 116 | 22.4% | 15 |
+| Memory & Virtual Memory | 89 | 17.2% | 25 |
+| Scheduler & Process Management | 72 | 13.9% | 16 |
+| SMP & Locking | 59 | 11.4% | 24 |
+| Networking | 30 | 5.8% | 12 |
+| Userspace Apps & Libraries | 32 | 6.2% | 16 |
+| Rump Kernel & Syscall Proxy | 24 | 4.6% | 5 |
+| Toolchain & Self-Hosting | 31 | 6.0% | 4 |
+| SSH | 12 | 2.3% | 10 |
+| VFS & Filesystem | 13 | 2.5% | 9 |
+| Boot & Drivers | 9 | 1.7% | 5 |
+| Signals & Exceptions | 10 | 1.9% | 4 |
+| Misc / Cross-cutting | 8 | 1.5% | 1 |
 | Console & Terminal | 3 | 0.6% | 3 |
-| Containers | 1 | 0.2% | 1 |
-| **Total** | **507** | **100.0%** | **149** |
+| Containers | 10 | 1.9% | 2 |
+| **Total** | **518** | **100.0%** | **151** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -588,7 +596,7 @@ session record for the stale-tid fix, counted once under
 - `force-legacy` incorrectly defaulted to true, masking the modern VirtIO MMIO v2 path
 
 
-## Userspace Apps & Libraries (30 fixes, 15 docs)
+## Userspace Apps & Libraries (32 fixes, 16 docs)
 
 ### docs/archive/DOOM.md
 - SIGSEGV in `R_Init` — `strncpy` stub off-by-one corrupted an adjacent struct field
@@ -649,6 +657,10 @@ session record for the stale-tid fix, counted once under
 
 ### userspace/scratch/docs/POSSIBLE_MEMORY_LEAK.md
 - scratch memory-leak case, fixed (Feb 5 2026)
+
+### userspace/herd/docs/SIGNAL_EXIT_HANDLING.md
+- herd reaped with `waitpid`, which returns `WEXITSTATUS` only, so a service killed by a signal decoded as exit code 0 and took the clean-exit branch — respawning with no `restart_delay_ms`, `restart_count` reset to 0, `max_retries` never consulted and `ServiceState::Failed` unreachable (a service crashing on startup became a hot restart loop); now reaped with `waitpid_status` and classified through the host-tested `herd::exit::classify`, recording `shell_code()` (128+signal)
+- `stop_service` called `libakuma::kill`, which hardcodes signal 0 — the kernel's existence probe, never delivered — so herd cleared `svc.pid`, marked the service `Stopped` and left the process running unsupervised while `start_stopped_services` spawned a second copy; now sends a real SIGTERM via the new `libakuma::kill_signal`
 
 
 ## Rump Kernel & Syscall Proxy (24 fixes, 5 docs)
@@ -869,10 +881,22 @@ session record for the stale-tid fix, counted once under
 - Layout struct corruption during a function call (workaround applied)
 
 
-## Containers (1 fixes, 1 docs)
+## Containers (10 fixes, 2 docs)
 
 ### docs/archive/BOX_CONTAINERS.md
 - Arguments were not passed to containerized processes
+
+### docs/archive/BOX_ISOLATION_SECURITY_FIXES.md
+- `sys_register_box` accepted any box id, name and `root_dir` from any caller — a boxed process could mint a box rooted at `/` (which gets no `SubdirFs`, so its empty namespace falls back to the global mount table) or overwrite box 0's registry entry; now gated on the new `can_register_box`
+- `parent_box_id` was hardcoded `None` at registration, so no box ever recorded a parent and every ancestry rule in `box_mod::access`/`hierarchy` was permanently blind; a new box is now recorded as a child of the caller's box, and re-registration preserves the existing parent
+- `validate_nested_root` used a bare `starts_with`, accepting a sibling subtree (`/containers/box10` as a "child" of `/containers/box1`) as well as unresolved `..` and relative paths; now matches on a path-component boundary and rejects both
+- `sys_spawn_ext` passed `box_id` through unchecked, so a boxed process could spawn a child directly into a sibling's (or any) box — inheriting that box's `box_id`, mount namespace and network routing; now gated on `can_access_box`
+- `sys_kill_box` ran no permission check at all: any process could kill every process in any other box; now gated on `can_kill_box`
+- `sys_kill_box` removed the victim box's namespace **before** attempting the kill, so a call that then failed (e.g. box 0, which `kill_box` refuses) still stranded a live box without its mounts; the namespace is now dropped only after the kill succeeds
+- `sys_set_box_stack` let any process mark any box as rump, routing that box's AF_INET syscalls at a `rump_server` the caller controls; now gated on `can_access_box`
+- `sys_umount2` let a boxed process unmount `/` — its own `SubdirFs` jail root — leaving an empty namespace that falls back to the global mount table, i.e. the whole host filesystem, read and write; now refused
+- `SubdirFs` concatenated `prefix + path` with no `..` sanitization, contrary to the safety requirement in `BOX_CONTAINERS.md`; `.`/`..` are now resolved and clamped at the virtual root (canonical paths still take the allocation-free stack-buffer path)
+- `sys_mount` / `sys_umount2` / `sys_mount_in_ns` did not canonicalize their target, though `MountNamespace` compares mount points literally — an un-normalized target registered a mount point no lookup could match and side-stepped the duplicate check protecting the box root
 
 
 ---
@@ -883,4 +907,4 @@ Also re-scanned 2026-08-07: DEVELOPMENT_PRACTICES_REVIEW_AND_ASSESSMENT (pure me
 
 docs/archive: 4MB_STABLE_AGENT, AI_DEBUGGING, ARCHITECTURE, BKL_DRIVERS_CARVE_OUT, BKL_PHASE7B_PPOLL_CARVE_OUT (piece 2 reverted after A/B caught real corruption), BKL_PHASE7D_THREAD_CONTEXTS (dead/unreachable code removed, not a live bug), BKL_PHASE7F_OPTOUT_LIST, BKL_RUSTC_SCALING_BASELINE, BOX_SUBDIR_FS_LIMITATIONS, C_STUBS, CGI, COMMAND_CHAINING_SSH_BUGS, CONCURRENCY, CONTAINERS_STAGE_1_PLAN, CONTAINERS_STAGE_2_PLAN, CP_MV_IMPLEMENTATION_PLAN, CRUSH_MISSING_SYSCALLS (all gaps, none marked fixed), CWD, DEAD_CODE_ANALYSIS, DEAD_CODE_SWEEP_FINDINGS (findings only, explicitly "nothing here is fixed. No source was edited"), DEV_RANDOM, DEV_ZERO, DOCKER, EMBASSY_REMOVAL, ERRORS_TO_CHECK, EXTREME_STACK_TRIMMING (perf, not bugs), FRANKENLIBC_EVAL, FREEZE_INSTRUMENTATION_PLAN, HEAP_AND_MEMORY_IMPROVEMENTS, HERD, HERD_ADD_AND_PATH_VALIDATION, HIJACK_VS_KERNEL_PROXY (analysis/validation only), IMPLEMENTATION_PLAN (rump phases, milestones only), INTERACTIVE_IO, J4_HANG_LIVE_AUTOPSY (verbatim session record; its 3 fixes are counted once under KTG_STALE_TID_EXIT_STAMP_J4_HANG.md), KILL_COMMAND, LARGE_BINARY_LOAD_PERFORMANCE, LINE_COUNT_ANALYSIS (line-count/dead-code statistics and cross-kernel comparison, not a bugfix), LOCK_REFERENCE, LOOPBACK_TIMEOUT_FIX_PLAN (plan, not landed), MEMORY_LAYOUT (duplicate of AKUMA_SELF_HOSTING §3), MULTIKERNEL, MULTITASKING, MUSL_COMPATIBILITY, NAMESPACES, NATIVE_STACK_INTERNET, NEEDLE_SERVER, NETWORKING_PERFORMANCE_AND_THREAD_SAFETY_ANALYSIS, ON_DEMAND_ELF_LOADER, OOM_BEHAVIOR, OOM_RECOVERY_OPTIONS, PAWS_PLAN, PAWS_TO_SSH_SHELL_PLAN, PHASE01_BUILDRUMP, PHASE1_COMPLETION_BASELINE, PHASE1_NETWORK_LOCK_FOUNDATION, PHASE2_RUMPUSER, PHASE3_KERNEL_TAP, PLAN_SIGSEGV_COMPILE_FIX, POSSIBLE_MEMORY_LEAK, POST_EXIT_PMM_RECLAIM, PROCESS_MEMORY_CLEANUP, PROCFS, PROPER_EXECVE_PLAN, QJS, refactor_plan, RSA_FEATURE_GATE, RUMP_LATENCY_SLEEP_FIX (hypothesis disproven, patches reverted), RUMP_PLUS_HERD, SCHEDULING_TIMING_ISSUES (open/critical, not fixed), SCRATCH, SEPARATE_SHELL_BINARY, SHARED_FD_TABLES, SHELL_ENVIRONMENT_VARIABLES, SHELL_LIMITATIONS, SIGNAL_DELIVERY_FORKTEST_EVIDENCE (summary of fixes counted elsewhere), SMOLTCP_MIGRATION_SUMMARY (duplicate summary), SMP_SHARED_M5_FAULT_LOCK_PLAN, SSH, SSH_PERFORMANCE_FIX_2026, SSH_THREADING_BUG (superseded, duplicate), STRATEGY_A_IMMEDIATE_TUNING, STRATEGY_B_SMOLTCP_MIGRATION (duplicate), STRATEGY_C_IRQ_WAKEUPS, SYSCALL_BLOCKING, SYSCALL_ERRNO_COMPLIANCE_CHANGES, SYSCALL_HARDENING, TCC_LOW_MEMORY, TCP_SEQUENCE_UNDERFLOW_PANIC, TERMINAL_SYSCALLS (duplicate reference), TLS_DOWNLOAD_PERFORMANCE, TLS_INFRASTRUCTURE, TOP_CORE_COLUMN_PLAN, TRIM_FAT_PART_1, TRIMMING_FAT_PART_2, TWO_VMS_AGENT_DEMO, UNIFIED_CONTEXT_ARCHITECTURE (duplicate of FAR_0x5/THREADING_RACE_CONDITIONS fixes), UNIFIED_PROCESS_ABI, UNSAFE_POINTERS_AND_ATOMICITY, USERSPACE_MEMORY_MODEL, USERSPACE_SOCKET_API, VFS_LOCK_OPTIMIZATION_PLAN, WAIT_QUEUES, MEOW.
 
-userspace: apk-tools/BUILD_NOTES, apk-tools/PIE_LOADER, box/OCI_IMAGE_PULL, box/TESTING (duplicate of libakuma-tls TLS fix), crush/IMPLEMENTATION_DETAILS, forktest/IMPLEMENTATION_PLAN, herd/CORE_AWARE_SCHEDULING, herd/SIGNAL_EXIT_HANDLING (explicitly "proposed, not implemented"), httpd/TIMESTAMPS, libakuma/ALLOCATOR_OPTIONS, libakuma/MKDIR_P_IMPROVEMENTS, libakuma/SYSCALLS, libakuma/TERMINAL_SYSCALLS, meow/CONFIG, meow/HOTKEYS, meow/SHELL, meow/TESTING, scratch/LARGE_FILE_CHECKOUT_OPTIMIZATION, scratch/SIDEBAND_PARSER_FIX (duplicate of docs/archive/SIDEBAND_PARSER_FIX.md), sshd/LIMITATIONS, sshd/MIGRATION_SUMMARY, tar/IMPLEMENTATION_PLAN, tar/STREAMING_EXTRACTION, tcc/DISTRIBUTION_PLAN, tcc/IMPLEMENTATION_DETAILS, tcc/IMPLEMENTATION_PLAN, tcc/LIBTCC1.
+userspace: apk-tools/BUILD_NOTES, apk-tools/PIE_LOADER, box/OCI_IMAGE_PULL, box/TESTING (duplicate of libakuma-tls TLS fix), crush/IMPLEMENTATION_DETAILS, forktest/IMPLEMENTATION_PLAN, herd/CORE_AWARE_SCHEDULING, httpd/TIMESTAMPS, libakuma/ALLOCATOR_OPTIONS, libakuma/MKDIR_P_IMPROVEMENTS, libakuma/SYSCALLS, libakuma/TERMINAL_SYSCALLS, meow/CONFIG, meow/HOTKEYS, meow/SHELL, meow/TESTING, scratch/LARGE_FILE_CHECKOUT_OPTIMIZATION, scratch/SIDEBAND_PARSER_FIX (duplicate of docs/archive/SIDEBAND_PARSER_FIX.md), sshd/LIMITATIONS, sshd/MIGRATION_SUMMARY, tar/IMPLEMENTATION_PLAN, tar/STREAMING_EXTRACTION, tcc/DISTRIBUTION_PLAN, tcc/IMPLEMENTATION_DETAILS, tcc/IMPLEMENTATION_PLAN, tcc/LIBTCC1.

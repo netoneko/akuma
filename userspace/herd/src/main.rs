@@ -15,9 +15,11 @@ use alloc::vec::Vec;
 
 use libakuma::{
     print, exit, open, read_fd, write_fd, close, fstat, lseek,
-    open_flags, seek_mode, spawn, kill, waitpid, read_dir, uptime,
-    sleep_ms, mkdir_p, SpawnResult,
+    open_flags, seek_mode, spawn, kill_signal, waitpid_status, read_dir, uptime,
+    sleep_ms, mkdir_p, SpawnResult, SIGTERM,
 };
+
+use herd::exit::{classify, Exit, Outcome, Policy};
 
 // ============================================================================
 // Constants
@@ -1252,7 +1254,12 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
 fn stop_service(state: &mut HerdState, name: &str) {
     if let Some(svc) = state.services.get_mut(name) {
         if let Some(pid) = svc.pid {
-            let _ = kill(pid);
+            // Must carry a real signal: `libakuma::kill` hardcodes sig 0, which
+            // the kernel treats as an existence probe and never delivers — so
+            // this used to leave the process running, unsupervised, while herd
+            // marked the service Stopped and start_stopped_services spawned a
+            // second copy.
+            let _ = kill_signal(pid, SIGTERM);
         }
         if let Some(fd) = svc.stdout_fd {
             close(fd as i32);
@@ -1292,23 +1299,29 @@ fn poll_all_stdout(state: &mut HerdState) {
 // ============================================================================
 
 fn check_process_exits(state: &mut HerdState, now_ms: u64) {
-    let mut exited: Vec<(String, i32)> = Vec::new();
+    // Reap with waitpid_status, not waitpid: the latter returns WEXITSTATUS only,
+    // so a service killed by a signal reports 0 and is indistinguishable from a
+    // clean success. See docs/SIGNAL_EXIT_HANDLING.md.
+    let mut exited: Vec<(String, Exit, i32)> = Vec::new();
 
     for (name, svc) in state.services.iter() {
         if svc.state == ServiceState::Running {
             if let Some(pid) = svc.pid {
-                if let Some((_, exit_code)) = waitpid(pid) {
-                    exited.push((name.clone(), exit_code));
+                if let Some(status) = waitpid_status(pid) {
+                    let how = Exit { signaled: status.signaled(), exit_code: status.exit_code() };
+                    // 128+signal for a signal death, the $? convention — so a
+                    // SIGSEGV is reported as 139 rather than as a success.
+                    exited.push((name.clone(), how, status.shell_code()));
                 }
             }
         }
     }
 
-    for (name, exit_code) in exited {
+    for (name, how, reported_code) in exited {
         print("[herd] Service ");
         print(&name);
-        print(" exited with code ");
-        print_dec(exit_code as usize);
+        print(if how.signaled { " killed by signal, code " } else { " exited with code " });
+        print_dec(reported_code as usize);
         print("\n");
 
         if let Some(svc) = state.services.get_mut(&name) {
@@ -1318,39 +1331,43 @@ fn check_process_exits(state: &mut HerdState, now_ms: u64) {
             }
             svc.pid = None;
             svc.stdout_fd = None;
-            svc.last_exit_code = Some(exit_code);
+            svc.last_exit_code = Some(reported_code);
 
-            // A oneshot service ran its single time: move it to the terminal
-            // Completed state (never restarted — start_stopped_services only revives
-            // Stopped), regardless of exit code. A reboot runs it again.
-            if svc.config.oneshot {
-                svc.state = ServiceState::Completed;
-                svc.restart_count = 0;
-                print("[herd] Oneshot service ");
-                print(&name);
-                print(" completed\n");
-            } else if exit_code != 0 && svc.config.restart {
-                // Schedule restart on non-zero exit (unless restart is disabled).
-                let should_restart = svc.config.max_retries == 0
-                    || svc.restart_count < svc.config.max_retries;
+            let policy = Policy {
+                oneshot: svc.config.oneshot,
+                restart: svc.config.restart,
+                max_retries: svc.config.max_retries,
+            };
 
-                if should_restart {
+            match classify(policy, svc.restart_count, how) {
+                // A oneshot service ran its single time: move it to the terminal
+                // Completed state (never restarted — start_stopped_services only
+                // revives Stopped), regardless of exit code. A reboot runs it again.
+                Outcome::Completed => {
+                    svc.state = ServiceState::Completed;
+                    svc.restart_count = 0;
+                    print("[herd] Oneshot service ");
+                    print(&name);
+                    print(" completed\n");
+                }
+                Outcome::Restart => {
                     svc.restart_count += 1;
                     svc.restart_at_ms = Some(now_ms + svc.config.restart_delay_ms);
                     svc.state = ServiceState::PendingRestart;
                     print("[herd] Scheduling restart for ");
                     print(&name);
                     print("\n");
-                } else {
+                }
+                Outcome::Failed => {
                     svc.state = ServiceState::Failed;
                     print("[herd] Service ");
                     print(&name);
                     print(" failed after max retries\n");
                 }
-            } else {
-                // Clean exit
-                svc.state = ServiceState::Stopped;
-                svc.restart_count = 0;
+                Outcome::Stopped => {
+                    svc.state = ServiceState::Stopped;
+                    svc.restart_count = 0;
+                }
             }
         }
     }

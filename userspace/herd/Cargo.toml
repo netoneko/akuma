@@ -3,5 +3,15 @@ name = "herd"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# On by default; everything except the host-testable `src/exit.rs` needs it.
+# `--no-default-features` drops libakuma so `cargo test --lib` can link against
+# a std host target — libakuma defines #[panic_handler] and #[global_allocator],
+# which collide with std's. See src/lib.rs.
+default = ["akuma"]
+akuma = ["dep:libakuma"]
+
 [dependencies]
-libakuma = { path = "../libakuma" }
+# Optional only so the `exit` unit tests can build for the host — the binary
+# always needs it (see [features]).
+libakuma = { path = "../libakuma", optional = true }
