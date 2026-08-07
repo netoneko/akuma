@@ -58,6 +58,19 @@ lifecycle, and the userspace build.
 [`build-profiles.md`](build-profiles.md) — the same seven targets as a
 "which one do I build/run" comparison table (sizes, networking, purpose).
 
+### Scripts
+
+[`scripts/`](scripts/) — index of the standalone `scripts/*` debugging and
+regression helpers not covered by `build-system.md` or a script's own
+`README.md` (log/crash analysis, multi-VM hang hunting, fork/SMP regression
+harnesses, container/env helpers).
+
+### Devbox overlays
+
+[`overlay/`](overlay/) — the `overlays/devbox/` and `overlays/devbox-smoltcp/`
+dev-VM images: what each is for, and how to tell apart the two
+similarly-named "devbox-smoltcp" things.
+
 ## Not yet written (deferred gap list)
 
 Tier A and B are now done (drivers above + the subsystems listed above); only

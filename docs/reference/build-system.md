@@ -113,7 +113,7 @@ excluded from the kernel workspace). See
 Special cases: `meow` ships size-optimized (rebuilds `core`/`alloc` with
 `panic=immediate-abort`, `-Crelocation-model=static`); `tcc` ships only
 `libtcc1.tar` (musl sysroot is **not** shipped — install on Akuma with
-`apk add musl-dev`); `apk-tools`/`libakuma`/`libakuma-tls`/`crush`/`nca`
+`apk add musl-dev`); `apk-tools`/`libakuma`/`libakuma-tls`/`nca`
 produce no binary in `/bin` (their build.rs deploys directly).
 
 Built binaries land in `bootstrap/bin/` (consumed by `populate_disk.sh`).
