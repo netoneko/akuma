@@ -278,18 +278,48 @@ pub struct MmapRegion {
     pub start_va: usize,
     pub pages: usize,
     pub frames: Vec<PhysFrame>,
+    /// The protection this mapping is *supposed* to have, in `mmu::user_flags`
+    /// terms — the eager counterpart of `LazyRegion::flags`.
+    ///
+    /// Without it an eager region records extent and frames but no permission, so
+    /// the EL0 write-permission-fault handler cannot tell a PTE that is wrongly
+    /// read-only (page state lost some other way) from a mapping that is
+    /// legitimately read-only (`mprotect(PROT_READ)`). Lazy regions carry flags and
+    /// therefore get a permission upgrade; eager regions had no such path and died
+    /// with SIGSEGV instead. See
+    /// `docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md` §3.
+    pub flags: u64,
 }
 
 impl MmapRegion {
-    /// Region created by this process: it owns every frame.
+    /// Region created by this process: it owns every frame, protection unrecorded.
+    ///
+    /// Defaults to `NONE` **deliberately**. `flags` exists so the fault handler can
+    /// grant a write it would otherwise refuse, so an unknown protection has to be
+    /// the one that grants nothing: a wrong `RW` default would silently defeat
+    /// `mprotect(PROT_READ)` on any region built through this constructor. `NONE`
+    /// leaves such a region behaving exactly as it did before `flags` existed.
+    /// Callers that know the real protection use [`MmapRegion::owned_with_flags`].
     pub fn owned(start_va: usize, frames: Vec<PhysFrame>) -> Self {
-        Self { start_va, pages: frames.len(), frames }
+        Self::owned_with_flags(start_va, frames, crate::mmu::user_flags::NONE)
     }
 
-    /// Region inherited by a CoW-forked child: extent known, no owned frames.
-    pub fn inherited(start_va: usize, pages: usize) -> Self {
-        Self { start_va, pages, frames: Vec::new() }
+    /// Region created by this process, with its real protection recorded.
+    pub fn owned_with_flags(start_va: usize, frames: Vec<PhysFrame>, flags: u64) -> Self {
+        Self { start_va, pages: frames.len(), frames, flags }
     }
+
+    /// Region inherited by a CoW-forked child: extent known, no owned frames,
+    /// protection unrecorded (`NONE` — see [`MmapRegion::owned`] for why).
+    pub fn inherited(start_va: usize, pages: usize) -> Self {
+        Self::inherited_with_flags(start_va, pages, crate::mmu::user_flags::NONE)
+    }
+
+    /// Region inherited by a CoW-forked child, carrying the parent's protection.
+    pub fn inherited_with_flags(start_va: usize, pages: usize, flags: u64) -> Self {
+        Self { start_va, pages, frames: Vec::new(), flags }
+    }
+
 
     pub fn len_bytes(&self) -> usize {
         self.pages * 4096

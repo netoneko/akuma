@@ -1162,7 +1162,27 @@ pub extern "C" fn check_process_exit() -> bool {
 /// Same rule `unregister_process` applies (`table.rs`, "consult THREAD_PID_MAP");
 /// see `docs/archive/STALE_THREAD_SLOT_KILL.md`.
 pub fn grace_kill_should_terminate(sib_pid: Pid, tid: usize) -> bool {
-    crate::threading::has_pending_kill(tid) && table::pid_for_thread(tid) == Some(sib_pid)
+    // The gate is **ownership alone**: THREAD_PID_MAP must still say this slot
+    // belongs to the sibling we recorded it for. That is what stops the hard kill
+    // from taking out an unrelated process's thread when the slot was recycled
+    // during the 2 s window — the orphan class in
+    // docs/archive/GRACE_EXPIRED_HARD_KILL_ORPHANS.md, and the reason this
+    // predicate exists at all.
+    //
+    // It deliberately does **not** also require `has_pending_kill`. That conjunct
+    // looked conservative and was not. The request is consumed at the EL1→EL0
+    // boundary (`take_thread_kill_request`), and a thread parked in an *untimed*
+    // `FUTEX_WAIT` never reaches one: `request_thread_kill` wakes it, it re-checks
+    // its futex, finds it unsatisfied, and re-parks. Anything that clears the flag
+    // without the thread dying therefore made this return false — the sibling was
+    // spared and stayed parked forever, its `Process` never reaped and its parent's
+    // `wait4` blocked for the rest of the boot. Measured on a *normal* rustc exit
+    // (`[KTG] my_pid=122 code=0 siblings=2 first=Some((123, Some(16)))`) with tid=16
+    // still in `FUTEX_WAIT` 557 s later and no `[KTG-STALE]` line to show for it.
+    //
+    // Ownership is the safety property; the pending flag was only ever evidence
+    // about *timing*, and after a 2 s grace it is evidence of nothing.
+    table::pid_for_thread(tid) == Some(sib_pid)
 }
 
 pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
@@ -1249,19 +1269,44 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
         const KILL_GRACE_US: u64 = 2_000_000; // 2 s
         let started = (crate::runtime::runtime().uptime_us)();
         loop {
-            let all_done = siblings.iter().all(|(_, t)| {
+            let all_done = siblings.iter().all(|(sib_pid, t)| {
                 t.is_none_or(|tid| {
-                    // Done once the sibling consumed the request (it is between
-                    // take and mark, or already TERMINATED) OR its slot is
-                    // gone (TERMINATED/FREE, incl. scheduler recycling).
+                    // Only *death* completes a kill.
+                    //
+                    // This used to also accept `!has_pending_kill(tid)`, which
+                    // conflates "the sibling consumed the request" with "the
+                    // sibling acted on it". The request is consumed at the EL1→EL0
+                    // boundary (`take_thread_kill_request`), and a thread parked in
+                    // an **untimed** `FUTEX_WAIT` never reaches that boundary: it is
+                    // woken by `request_thread_kill`, re-checks its futex, finds it
+                    // unsatisfied and re-parks. Anything that clears the flag
+                    // without the thread dying therefore made it read as done — so
+                    // the loop broke immediately, the grace-expiry hard kill below
+                    // never ran, and the sibling was left running forever with its
+                    // `Process` un-reaped and its parent's `wait4` blocked.
+                    //
+                    // Measured: `[KTG] my_pid=122 my_tgid=122 code=0 siblings=2
+                    // first=Some((123, Some(16)))` — a *normal* rustc exit — with
+                    // tid=16 still parked in `FUTEX_WAIT` 557 s later and cargo's
+                    // wait4 thread parked 583 s. No `[KTG-STALE]`, no hard kill.
+                    //
+                    // The second arm is the same ownership test the expiry path
+                    // uses: if the slot is no longer this sibling's, there is
+                    // nothing left for us to kill and waiting on it is pointless.
                     crate::threading::is_thread_terminated(tid)
-                        || !crate::threading::has_pending_kill(tid)
+                        || !grace_kill_should_terminate(*sib_pid, tid)
                 })
             });
             if all_done { break; }
             if (crate::runtime::runtime().uptime_us)() - started > KILL_GRACE_US {
+                // Count what the loop below will actually act on — live threads we
+                // still own — not what still carries a pending flag: a sibling that
+                // swallowed its request is exactly the case this path exists for.
                 let stragglers = siblings.iter()
-                    .filter(|(_, t)| t.is_some_and(|tid| crate::threading::has_pending_kill(tid)))
+                    .filter(|(sib_pid, t)| t.is_some_and(|tid| {
+                        !crate::threading::is_thread_terminated(tid)
+                            && grace_kill_should_terminate(*sib_pid, tid)
+                    }))
                     .count();
                 log::warn!(
                     "[ktg] pid={}: grace expired, hard-terminating {} straggler(s)",
@@ -1288,11 +1333,11 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
                 // "consult THREAD_PID_MAP"); the grace path simply never got it.
                 for (sib_pid, t) in &siblings {
                     if let Some(tid) = t {
+                        if crate::threading::is_thread_terminated(*tid) {
+                            continue;
+                        }
                         if !grace_kill_should_terminate(*sib_pid, *tid) {
                             let owner = table::pid_for_thread(*tid);
-                            if !crate::threading::has_pending_kill(*tid) {
-                                continue;
-                            }
                             if KTG_STALE_SKIPS.fetch_add(1, Ordering::Relaxed) < 64 {
                                 let mut buf = [0u8; 160];
                                 let mut pos = 0;
@@ -2564,7 +2609,11 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             }
             if ok {
                 total_copied_pages += child_frames.len();
-                child_mmap_regions.push(MmapRegion::owned(*va_start, child_frames));
+                // Carry the parent's recorded protection: the child's copy of an
+                // eagerly-forked region is the same mapping, and losing `flags` here
+                // would cost the child the fault handler's eager-region repair path.
+                child_mmap_regions.push(
+                    MmapRegion::owned_with_flags(*va_start, child_frames, region.flags));
             } else {
                 if config().syscall_debug_info_enabled {
                     log::debug!("[fork] OOM copying mmap region 0x{:x}, skipping rest", va_start);
@@ -3411,7 +3460,9 @@ mod grace_kill_tests {
 
         let forced = grace_kill_should_terminate(sib_pid, OWN_TID);
         let spared_recycled = !grace_kill_should_terminate(sib_pid, STOLEN_TID);
-        let spared_quiet = !grace_kill_should_terminate(sib_pid, QUIET_TID);
+        // Still ours, request already consumed, still alive after the 2 s grace.
+        // This must ALSO be forced — see below.
+        let forced_quiet = grace_kill_should_terminate(sib_pid, QUIET_TID);
 
         // Cleanup before asserting, so a failure doesn't poison sibling tests.
         take_kill_request_via_tid(OWN_TID);
@@ -3426,8 +3477,18 @@ mod grace_kill_tests {
         assert!(spared_recycled,
             "a slot recycled to an unrelated process must NOT be terminated: that kills \
              its thread and strands the process with no thread at all");
-        assert!(spared_quiet,
-            "a sibling with no pending kill request is not a straggler and must be left \
-             to self-terminate at its own boundary");
+        // This assertion used to read the other way — "a sibling with no pending kill
+        // request is not a straggler and must be left to self-terminate at its own
+        // boundary". That rationale holds only if the thread will *reach* a boundary.
+        // The request is consumed at the EL1→EL0 return, and a thread parked in an
+        // untimed FUTEX_WAIT never gets there: it is woken, re-checks its futex, and
+        // re-parks. After the 2 s grace, "still ours, still alive, flag gone" is not
+        // evidence of an orderly exit in progress — it is the hang itself, observed as
+        // a normal rustc exit whose sibling was still parked 557 s later.
+        assert!(forced_quiet,
+            "a sibling that still owns its slot must be terminated even with no pending \
+             request: the flag is consumed at the EL0 boundary an untimed FUTEX_WAIT \
+             never reaches, so sparing it leaves the thread parked forever and its \
+             parent's wait4 blocked");
     }
 }

@@ -474,10 +474,29 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     // so they install with the final `page_flags` directly (no RW_NO_EXEC window +
     // permission fix-up pass). Excludes concurrent BKL-free faults. No I/O here.
     proc.with_address_space(|aspace| {
+        // `map_user_page_no_flush` REFUSES a VA whose PTE is already valid and
+        // reports that as `false`. Discarding the flag is how a VA-lifetime bug
+        // becomes silent memory corruption: the caller keeps the previous
+        // occupant's page *and its permissions* while believing it received fresh
+        // zeroed anonymous memory, and the freshly allocated frame below is
+        // tracked but never mapped. A later store then takes a write permission
+        // fault on a page with no lazy region (eager mmaps register none) and no
+        // CoW reference — the `[WPF] ... cow_ref=0 lazy_self=NONE` signature that
+        // killed cargo mid-build. Count the refusals and name the range; the
+        // condition is an invariant violation, never normal traffic.
+        let mut declined = 0usize;
+        let mut first_va = 0usize;
         for (i, frame) in frames.iter().enumerate() {
-            let (table_frames, _) = unsafe {
-                akuma_exec::mmu::map_user_page_no_flush(mmap_addr + i * 4096, frame.addr, page_flags)
+            let va = mmap_addr + i * 4096;
+            let (table_frames, installed) = unsafe {
+                akuma_exec::mmu::map_user_page_no_flush(va, frame.addr, page_flags)
             };
+            if !installed {
+                if declined == 0 {
+                    first_va = va;
+                }
+                declined += 1;
+            }
             aspace.track_user_frame(*frame);
             for tf in table_frames {
                 aspace.track_page_table_frame(tf);
@@ -485,6 +504,21 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         }
         // Single TLB flush for the entire mmap range (still under the hold).
         akuma_exec::mmu::flush_tlb_range(mmap_addr, pages);
+        if declined > 0 {
+            // Resolve the surviving (stale) PA for the first refusal — the walk is
+            // only paid on the broken path.
+            let ttbr0: u64;
+            #[cfg(target_os = "none")]
+            unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+            #[cfg(not(target_os = "none"))]
+            { ttbr0 = 0; }
+            let l0 = akuma_exec::mmu::phys_to_virt((ttbr0 & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+            let stale_pa = akuma_exec::mmu::translate_user_va(l0, first_va).unwrap_or(0) & !0xFFF;
+            crate::safe_print!(255,
+                "[MMAP-STALE-PTE] pid={} tgid={} base={:#x} pages={} declined={} first_va={:#x} \
+                 stale_pa={:#x} prot={:#x} flags={:#x}\n",
+                proc.pid, proc.tgid, mmap_addr, pages, declined, first_va, stale_pa, prot, flags);
+        }
     });
     crate::pmm::dp_count(&crate::pmm::EAGER_MMAP_PAGES, pages);
 
@@ -500,7 +534,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 proc.pid, fd, &f.path, offset, len, mmap_addr);
         }
 
-    proc.vm_with_regions(|r| r.push(MmapRegion::owned(mmap_addr, frames)));
+    proc.vm_with_regions(|r| r.push(MmapRegion::owned_with_flags(mmap_addr, frames, page_flags)));
 
     mmap_addr as u64
 }
@@ -585,7 +619,13 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
             }
         }
 
-        proc.vm_with_regions(|r| r.push(MmapRegion::owned(new_addr, new_frames)));
+        // A remap moves and resizes a mapping; it does not reprotect it, so the new
+        // region carries the old one's recorded protection.
+        let old_flags = proc.vm_with_regions(|r| {
+            r.iter().find(|reg| reg.start_va == old_addr).map(|reg| reg.flags)
+        });
+        proc.vm_with_regions(|r| r.push(MmapRegion::owned_with_flags(
+            new_addr, new_frames, old_flags.unwrap_or(akuma_exec::mmu::user_flags::NONE))));
 
         let mut found_eager = false;
         // Remove the old region under the lock, then unmap/free its frames after
@@ -783,6 +823,9 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     if let Some(proc) = akuma_exec::process::lookup_process_shared(owner_pid) {
         let _mm_window = MmBklGuard::new();
         akuma_exec::process::update_lazy_region_flags(proc.tgid, addr, pages * 4096, new_flags);
+        // Eager regions need the same bookkeeping: they are the ones whose PTEs the
+        // fault handler can only repair if it knows the intended protection.
+        akuma_exec::process::update_eager_region_flags(proc.tgid, addr, pages * 4096, new_flags);
 
         // Update all page table entries with no_flush, then issue a single
         // TLB range flush. Previously each update_page_flags call issued its
@@ -863,6 +906,9 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
                 start_va: reg.start_va + unmap_pages * 4096,
                 pages: region_pages - unmap_pages,
                 frames: remaining,
+                // The surviving suffix keeps the protection of the region it was
+                // split out of; a partial unmap changes extent, not permission.
+                flags: reg.flags,
             });
             Some((reg.start_va, unmap_pages, prefix))
         }

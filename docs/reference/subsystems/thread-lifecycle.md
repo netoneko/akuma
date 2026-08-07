@@ -114,7 +114,7 @@ Lock legend: **M** = acquisition wrapped in `with_irqs_disabled`/`IrqGuard`;
 | execve | `do_execve` → `replace_image*` → `enter_user_mode` | VFS/ext2/block (BKL-dropped window); `as_lock` via exclusive access | **eret leaf** — see §4. Frame abandoned on success |
 | run → terminated | `mark_thread_terminated`, kill-request consume | none (atomics) | consume site holds the **BKL** across the terminal yield loop |
 | exit / exit_group | `sys_exit*` → `return_to_kernel` | `PROCESS_CHANNELS` M, `THREAD_PID_MAP` M, `LAZY_REGION_TABLE` M, pipe/VFS via `cleanup_process_fds` | P for most of it; robust-futex walk touches user memory under P; **`!` leaf** — see §4 |
-| kill group P1 | `kill_thread_group` | none (atomics + wakers) | up to 2 s grace-wait under the caller's P |
+| kill group P1 | `kill_thread_group` | none (atomics + wakers) | up to 2 s grace-wait under the caller's P; grace-expiry termination is now ownership-gated (`grace_kill_should_terminate`, fixed 2026-08-06 — see Background) |
 | kill group P2 | same | pipe/VFS via `cleanup_process_fds`; `PROCESS_CHANNELS` M; `THREAD_PID_MAP` M | then `unregister_process` (below) |
 | unregister | `unregister_process` | `THREAD_PID_MAP` M (recycled-slot proof) | CAS ACTIVE→RETIRED; `note_retired` atomics |
 | slot recycle | `cleanup_terminated_internal` | `POOL` M (short holds) | `CLEANUP_CALLBACK` re-enters process subsystem (`THREAD_PID_MAP` ×3, `unregister_process`) with no lock held |
@@ -142,7 +142,10 @@ The third was added 2026-08-03 and is the one that covers **fork, vfork and
 through it (`process/mod.rs:2494,2653,2782`). Until then that path had a single
 linear scan and returned `EAGAIN` straight to userspace: a tight, correctly
 `pthread_join`ed 200× `pthread_create` loop died at iteration ~58-68 of 200 with
-`MAX_THREADS = 64`, while most of the pool sat `TERMINATED`.
+`MAX_THREADS = 64`, while most of the pool sat `TERMINATED`. Full record of the
+fix: [`../../archive/SELFHOST_DEVBOX_SMOLTCP.md`](../../archive/SELFHOST_DEVBOX_SMOLTCP.md)
+§"Confirmed root cause (one of several): `clone_thread` never reclaims
+cooled-down slots (2026-08-03)".
 
 **Placement is forced by the lock, not style.** The retry cannot live inside
 `ThreadPool::spawn_user_closure_initializing` where the scan is: that method
@@ -307,15 +310,10 @@ pointer belongs is what a reused heap slot looks like), or the thread is started
 twice.
 
 One real defect *was* found in the same subsystem while measuring this, and is
-**FIXED** (2026-08-05): `flush_tlb_range` invalidated with `tlbi vale1is`, whose
-ASID comes from operand bits [63:48] — zero for every user VA, while user
-processes run under non-zero ASIDs — so `sys_mprotect`'s permission downgrades
-never reached the TLB. It is now `vaae1is` (all-ASID), which is *required*, not
-conservative: `new_shared` allocates a fresh ASID while reusing the parent's
-`l0_frame`, so one L0 table is live under several ASIDs at once and one PTE edit
-must invalidate all of them. Regress with
-`userspace/forktest/c_stress/mprotectlb.c` (3 FAIL before, 3 PASS after, 3 PASS
-on Linux). Not yet shown to be the cause of the crash above.
+**FIXED** (2026-08-05): a wrong-scope TLB invalidation left `sys_mprotect`
+permission downgrades silently unenforced whenever a page already had a
+cached translation. Not yet shown to be the cause of the crash above. Full
+record: [`../../archive/MPROTECT_TLB_ASID_BUG.md`](../../archive/MPROTECT_TLB_ASID_BUG.md).
 
 Also ruled out by measurement, not assumption: TLS/`TPIDR_EL0` (sane, and first
 touched *after* the faulting instruction), pointer corruption (the observed
@@ -364,3 +362,17 @@ the teardown has to reach back into.
 - `docs/archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md` — the earlier
   self-deadlock that ruled out reclaim-from-`register_process`; the same
   argument governs §4 rule 2.
+- `docs/archive/GRACE_EXPIRED_HARD_KILL_ORPHANS.md` — `kill_thread_group`'s
+  PHASE 1 grace-expiry branch force-terminated every recorded sibling
+  unconditionally on a stale `thread_id` snapshot; fixed 2026-08-06
+  (`grace_kill_should_terminate` + a PHASE 2 `THREAD_PID_MAP` ownership guard).
+- `docs/archive/TRAMPOLINE_STALE_PROCESS_RELR.md` — `entry_point_trampoline`
+  resolved a new thread's `Process` via a stale-`thread_id` table scan; fixed
+  2026-08-06 via `THREAD_PID_MAP`-based resolution.
+- `docs/archive/THREAD_STATES_RACES_TID_GENERATIONS.md`,
+  `docs/archive/CLONE_TIDFLAGS_THREAD_LIST_LOCK.md`,
+  `docs/archive/SMP_SHARED_ONCPU_GATE.md`,
+  `docs/archive/CURRENT_TRAP_FRAME_STALE_ON_EXIT.md` — the rest of the
+  cross-core thread-slot-recycling defect cluster found during the same
+  `-j4` self-host investigation as §5.3b.
+- `docs/archive/MPROTECT_TLB_ASID_BUG.md` — the TLB invalidation bug in §5.3b.

@@ -1148,8 +1148,53 @@ pub fn propagate_lazy_regions_to_child(parent_regions: &[LazyRegion], child: &Pr
 pub fn inherit_mmap_regions_for_cow_child(parent_regions: &[MmapRegion]) -> alloc::vec::Vec<MmapRegion> {
     parent_regions
         .iter()
-        .map(|r| MmapRegion::inherited(r.start_va, r.pages))
+        .map(|r| MmapRegion::inherited_with_flags(r.start_va, r.pages, r.flags))
         .collect()
+}
+
+/// Protection recorded for the **eager** mmap region covering `va`, if any.
+///
+/// The eager counterpart of [`lazy_region_lookup_for_page_fault`], and resolved the
+/// same way: eager regions live on the address-space owner's `mmap_regions`, so a
+/// CLONE_VM worker must look them up under the owner, not its own pid.
+///
+/// Used by the EL0 write-permission-fault handler to decide whether a read-only PTE
+/// inside an eager mapping is a repairable inconsistency or a genuine access
+/// violation.
+pub fn eager_region_flags_for_page_fault(pid: Pid, va: usize) -> Option<u64> {
+    let lookup = |p: Pid| -> Option<u64> {
+        let proc = lookup_process_shared(p)?;
+        proc.vm_with_regions(|r| r.iter().find(|reg| reg.contains(va)).map(|reg| reg.flags))
+    };
+    if let Some(owner) = address_space_owner_pid_for_fault()
+        && let Some(f) = lookup(owner)
+    {
+        return Some(f);
+    }
+    lookup(pid)
+}
+
+/// Update flags on all **eager** mmap regions overlapping
+/// `[range_start, range_start+range_size)`.
+///
+/// `mprotect`'s eager counterpart to [`update_lazy_region_flags`]. Unlike the lazy
+/// map this does not split regions: `MmapRegion` keys its frame list to `start_va`,
+/// and splitting one would have to split `frames` in step. A sub-range `mprotect`
+/// therefore records the *new* protection for the whole region, which is
+/// deliberately conservative in the safe direction — the fault handler only ever
+/// uses these flags to grant a write, so widening the recorded range of a
+/// downgrade can never turn a legitimate SIGSEGV into a silent success. Recording
+/// nothing at all, which is what happened before, is what could.
+pub fn update_eager_region_flags(pid: Pid, range_start: usize, range_size: usize, new_flags: u64) {
+    let Some(proc) = lookup_process_shared(pid) else { return };
+    let range_end = range_start.saturating_add(range_size);
+    proc.vm_with_regions(|r| {
+        for reg in r.iter_mut() {
+            if reg.start_va < range_end && reg.start_va + reg.len_bytes() > range_start {
+                reg.flags = new_flags;
+            }
+        }
+    });
 }
 
 /// Update flags on all lazy regions that overlap [range_start, range_start+range_size).
@@ -1551,6 +1596,7 @@ mod mmap_region_inheritance_tests {
     //! VAs its parent had resident. `MmapRegion::pages` carries the extent
     //! independently of frame ownership so that chain holds up.
     use super::*;
+    use crate::mmu::user_flags;
     use crate::runtime::PhysFrame;
 
     fn frames(n: usize) -> alloc::vec::Vec<PhysFrame> {
@@ -1567,6 +1613,33 @@ mod mmap_region_inheritance_tests {
         assert!(r.contains(0x2012_2fff));
         assert!(!r.contains(0x2012_3000));
         assert_eq!(r.frame_for(0x2012_1000).map(|f| f.addr), Some(0x4000_1000));
+    }
+
+    /// An eager region must carry the protection it was created with, and a CoW
+    /// child must inherit it.
+    ///
+    /// This is what lets the EL0 write-permission-fault handler tell a repairable
+    /// read-only PTE inside a writable eager mapping from a genuine access
+    /// violation. Two-sided on purpose: the writable region grants the upgrade, the
+    /// `PROT_READ` one must not, and the unrecorded default must not either —
+    /// revert `MmapRegion::owned`'s default to `RW_NO_EXEC` and the third assertion
+    /// fails, which is the regression that would silently defeat `mprotect`.
+    #[test]
+    fn eager_region_records_protection_and_child_inherits_it() {
+        let rw = MmapRegion::owned_with_flags(0x2012_0000, frames(2), user_flags::RW_NO_EXEC);
+        let ro = MmapRegion::owned_with_flags(0x2013_0000, frames(1), user_flags::RO);
+        let unknown = MmapRegion::owned(0x2014_0000, frames(1));
+
+        let writable = |r: &MmapRegion| r.flags & crate::mmu::flags::AP_MASK == crate::mmu::flags::AP_RW_ALL;
+        assert!(writable(&rw), "a PROT_WRITE region must permit the upgrade");
+        assert!(!writable(&ro), "mprotect(PROT_READ) must still fault");
+        assert!(!writable(&unknown),
+            "an unrecorded protection must grant nothing — a permissive default \
+             would silently defeat mprotect on every region built this way");
+
+        let child = inherit_mmap_regions_for_cow_child(&[rw, ro]);
+        assert_eq!(child[0].flags, user_flags::RW_NO_EXEC, "child loses the repair path otherwise");
+        assert_eq!(child[1].flags, user_flags::RO, "child must not gain write on a RO mapping");
     }
 
     /// A CoW child keeps the extent but owns no frames — the exact state whose

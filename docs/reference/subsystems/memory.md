@@ -287,5 +287,8 @@ memory exists and the collectors are starved — not that memory leaked. A high
   on call sites, detection signature).
 - `archive/BOOT_SUITE_PMM_DEFERRED_RECLAIM.md` — the measurement it came from
   (~35 K pages parked, PMM pinned at the reserve for 500 polls).
+- `archive/FILE_PAGE_CACHE_MMAP_AMPLIFICATION.md` — the fix behind "Shared
+  file pages" above (per-process private page copies causing `-j4` mmap
+  amplification).
 - `archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md` — why the free is deferred at
   all, and the self-deadlock that constrains where reclaim may be called.

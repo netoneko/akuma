@@ -1,10 +1,18 @@
 # Behind the orphan bug: a write permission fault with no recovery path, and a half-written linker output — 2026-08-07
 
-**Status**: **OPEN.** Two distinct terminal failures isolated, characterised and
-partitioned; neither is root-caused to a line yet. The
+**Status**: **PARTIALLY FIXED, `-j4` still not green.** Three distinct failures now
+separated. One (**C**, below) is root-caused and fixed with a two-sided host test.
+One (**A**) has its *unrecoverability* fixed — the fault handler can now repair the
+page state instead of dying — while what corrupts the page state remains unknown.
+One (**B**) is characterised but unfixed, and is now the dominant blocker. The
 [grace-expired hard kill](GRACE_EXPIRED_HARD_KILL_ORPHANS.md) fix is **confirmed
-holding** — it is no longer what stops `-j4`. Instrumentation for both failures is
-in the tree (`[WPF]`, `[MMAP-STALE-PTE]`), uncommitted.
+holding**. All changes uncommitted.
+
+| | what it is | state |
+| --- | --- | --- |
+| **A** | write permission fault with no recovery path | recovery path added (`[EAGER-UPGRADE]`, fires); origin of the bad page state still unknown |
+| **B** | linker leaves a truncated/empty output, cargo execs it | **unfixed — the current blocker** |
+| **C** | a thread survives its thread group's `exit_group`, parked in `FUTEX_WAIT` forever | **root-caused and fixed** |
 
 This doc exists because both failures were previously reported only as "run 1 hit a
 zero-byte `rust-lld` output" and "run 2 got `SIGSEGV in clone_thread`" — two
@@ -216,6 +224,28 @@ never written, is a linker that **started writing and never finished**.
   `SHARED_FILE_MAPPINGS` / `writeback_shared_pages` are not involved.
 - **An ext2 sparse-block / allocation bug** — §4.3, the control disk.
 
+### 4.4a Three instances, one signature: mode `0666`
+
+Failure B has now been caught on three different crates in three runs —
+`curve25519-dalek`, `embedded-io-async`, `typenum` — always a **build-script link**,
+never the same crate twice. The instances look different in size and shape:
+
+| instance | size | control size | ELF magic | mode |
+| --- | --- | --- | --- | --- |
+| `embedded-io-async` | 457252 | 744256 | zeroed header, phdrs intact at `0x40` | **0666** |
+| `typenum` | **0** | 675600 | — (empty) | **0666** |
+
+So "zero-byte output" (the earlier session's note) and "truncated with a zeroed
+header" are the *same* bug caught at different points, not two bugs — which is why
+that note read as wrong against the `embedded-io-async` instance and right against
+this one.
+
+The invariant across all of them is the **mode**. `ld` creates its output `0666` and
+makes it executable at the end; every *correct* build script on both disks is `0777`.
+A `0666` output means the linker never got to the end. Combined with cargo going on
+to *execute* it, the failure is: a child that did not finish its work, whose exit
+status the parent read as success.
+
 ### 4.5 Leading hypothesis (not proven)
 
 Cargo went on to *execute* the output, so cargo believed the link command **exited
@@ -227,6 +257,77 @@ filesystem bug.
 Not proven. In particular, "no `ld` exec line mentions the crate" is **not**
 evidence the linker never ran: the `execve` tracer truncates its args well before
 the output path.
+
+---
+
+## 4a. Failure C — a thread that outlived its own `exit_group`
+
+Found by letting A and B get out of the way: with the fault handler no longer
+killing cargo, one run reached **88 crates** and then stalled with the *original*
+symptom this whole saga started from — untimed `FUTEX_WAIT`, ~3 % CPU.
+
+### The evidence
+
+`[THR-DUMP]` gives the whole story in one line. rustc `tgid=122` has exactly **one**
+thread — `tid=16`, belonging to pid 123 — and no thread for its leader, pid 122:
+
+```
+tid=16 st=? pid=123 tgid=122 ... a0=0x3cda5fc4   (futex, queued 557 s)
+```
+
+And 557 s earlier, at T42.34:
+
+```
+[KTG] my_pid=122 my_tgid=122 by_tid=22 code=0 siblings=2 first=Some((123, Some(16)))
+```
+
+rustc 122 exited **normally** (`code=0`) with two siblings to kill. `tid=16` was
+never terminated. Because it never exits, its `Process` is never reaped, so cargo's
+`wait4` never returns — cargo's `tid=13` is parked 583 s on the same dump. The whole
+build is held by one thread that ignored a kill.
+
+Not the previous bug: `[PROC-ORPHAN]` is **0** (pid 123 *has* a thread — this is the
+inverse shape, a thread that outlived its group), and neither `[KTG-STALE]` line in
+the run names pid 122 or 123, so the grace-kill fix did not refuse this one.
+
+### The root cause
+
+Two predicates in `kill_thread_group` both treat *"the kill request is no longer
+pending"* as *"the thread died"*:
+
+```rust
+// grace-wait completion
+crate::threading::is_thread_terminated(tid) || !crate::threading::has_pending_kill(tid)
+// and the hard-kill gate
+has_pending_kill(tid) && table::pid_for_thread(tid) == Some(sib_pid)
+```
+
+The request is consumed at the **EL1→EL0 boundary** — `take_thread_kill_request()`
+in `rust_sync_el0_handler`, the only consumer in the tree. A thread parked in an
+**untimed `FUTEX_WAIT` never reaches that boundary**: `request_thread_kill` wakes it,
+it re-checks its futex, finds it unsatisfied, and re-parks. So anything that clears
+the flag without the thread dying makes the grace loop declare success immediately —
+the 2 s expiry never runs — *and* makes the hard-kill gate refuse. The thread is
+spared twice over and parked forever.
+
+Ownership (`pid_for_thread(tid) == Some(sib_pid)`) is the real safety property; it is
+what stops the hard kill from taking out a recycled slot's new owner. The pending
+flag was only ever evidence about *timing*, and after a 2 s grace it is evidence of
+nothing.
+
+### The fix
+
+- `grace_kill_should_terminate` gates on **ownership alone**.
+- The grace-wait completion test requires actual termination (or that the slot is no
+  longer ours), so a sibling that swallowed its request now reaches the 2 s expiry
+  and gets hard-terminated instead of surviving.
+
+Regression: `grace_kill_forces_a_real_straggler_but_spares_recycled_and_quiet_slots`,
+whose third assertion had to be **inverted**. It previously read "a sibling with no
+pending kill request … must be left to self-terminate at its own boundary". That
+rationale holds only if the thread will *reach* a boundary; this failure is the proof
+that it need not. The assertion now requires such a sibling to be terminated, with
+the reasoning recorded inline so the next reader does not "fix" it back.
 
 ---
 
@@ -283,23 +384,67 @@ code reading and died on a tripwire. Build the probe.
 
 ---
 
+## 6a. What the fixes are, and what the runs did and did not prove
+
+**Failure A — the recovery path (`MmapRegion::flags` + `[EAGER-UPGRADE]`).** An eager
+`mmap` installs its pages up front and registers **no lazy region**, and
+`MmapRegion` recorded extent and frames but no protection. So a read-only page
+inside a writable eager mapping reached neither the CoW break (no `cow_ref`) nor the
+lazy-region upgrade, and there was no third path: SIGSEGV by construction. The fix
+gives `MmapRegion` a `flags` field, threads the real protection through `sys_mmap`,
+`sys_mremap`, the munmap split and the fork child, teaches `sys_mprotect` to update
+it, and adds the symmetric upgrade to the fault handler — **gated on the region
+actually being writable**, so `mprotect(PROT_READ)` and `PROT_NONE` guard pages still
+fault as they must.
+
+The default for the unrecorded case is `NONE`, not `RW_NO_EXEC`, deliberately: these
+flags only ever *grant* a write, so an unknown protection must grant nothing. A
+permissive default would silently defeat `mprotect` on every region built through the
+bare constructor. The host test is two-sided on exactly that — flipping the default
+back fails it on the asserted line.
+
+`[EAGER-UPGRADE]` **fired twice** in a later run, so the path is real and exercised.
+But this repairs the *symptom*: what leaves a page mapped read-only with `cow_ref=0`
+inside a writable eager region is still unknown, and is still worth finding.
+
+**Do not credit the fix with the 88-crate run.** That run showed zero `[WPF]`, zero
+SIGSEGV — and zero `[EAGER-UPGRADE]`. The repair never fired, so the improvement from
+24 to 88 crates is unattributed and may be variance. Two runs, two different
+failures, is not an A/B.
+
+**A regression risk introduced here, stated plainly.** Failure C's fix makes the
+grace-wait loop require *actual termination*, so the 2 s expiry — and the hard kill
+behind it — is now **reachable more often** than when the loop could short-circuit on
+a consumed flag. The run after that change died at 7 crates (Failure B on `typenum`)
+against 88 the run before. That is one run against one run of a **racy** failure, so
+it attributes nothing (§5.2's lesson applies to this doc's own results). It is
+recorded because it is the obvious thing to A/B next, not because there is evidence
+for it. The 7 hard kills in that run were all `pending_kill=true`, i.e. targets the
+old predicate would also have taken.
+
+---
+
 ## 7. Next steps
 
-1. **Failure A.** The open question is what produces a mapped, read-only,
-   `cow_ref=0` page inside an eager mmap region. Instrument the *producer*, not the
-   consumer: log the eager-region install with its final PTE flags, and add a
-   tripwire on any transition of a user PTE to read-only that is not accompanied by
-   a `cow_ref_inc`. Independently: eager mmap regions have **no** permission-upgrade
-   path in the fault handler (§3.4), which is a structural gap worth closing whether
-   or not it is this bug.
-2. **Failure B.** Log every `ld`/`collect2` exit status alongside the parent's
-   `wait4` result, and check whether the linker is among the processes torn down by
-   `kill_thread_group`. If a non-zero exit is being reported to cargo as success,
-   that is the bug and it is shared with the rest of the saga.
-3. Fix the discarded return value in `sys_mmap`'s eager install loop on its own
+1. **Failure B is now the blocker — start here.** Log every `ld`/`collect2`/`cc` exit
+   status next to the parent's `wait4` result, and check whether the linker is among
+   the processes torn down by `kill_thread_group`. The `0666` mode (§4.4a) says the
+   linker stopped early; cargo executing the output says cargo saw success. Find
+   which of those two is the lie. Note the `execve` tracer truncates its args, so
+   "no `ld` line names the crate" proves nothing — widen the trace first.
+2. **A/B the Failure C fix against the 2 s grace-expiry reachability** (§6a). Same
+   kernel, toggle only the completion predicate, several runs per arm, and count
+   Failure B occurrences per rustc invocation — not per run, since runs end at
+   different depths.
+3. **Failure A's producer.** What leaves a page read-only with `cow_ref=0` inside a
+   writable eager region? Instrument the producer, not the consumer: a tripwire on
+   any user PTE transitioning to read-only without a matching `cow_ref_inc`. The
+   `[EAGER-UPGRADE]` path now masks the symptom, so this will get quieter, not
+   louder — do it before the evidence disappears.
+4. Fix the discarded return value in `sys_mmap`'s eager install loop on its own
    merits (§5.2), independent of Failure A.
-4. Re-run `-j4` only after (1) or (2) lands. Both failures reproduce in minutes;
-   there is no need for the long stall runs that dominated earlier sessions.
+5. All three failures reproduce in **2–12 minutes**; there is no need for the long
+   stall runs that dominated earlier sessions.
 
 ---
 

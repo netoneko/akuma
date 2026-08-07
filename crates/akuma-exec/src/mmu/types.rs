@@ -36,6 +36,9 @@ pub mod flags {
     pub const AP_RW_ALL: u64 = 1 << 6;
     pub const AP_RO_EL1: u64 = 2 << 6;
     pub const AP_RO_ALL: u64 = 3 << 6;
+    /// AP field mask (bits [7:6]) — isolates the access-permission bits from a PTE
+    /// or a `user_flags` value so the two can be compared.
+    pub const AP_MASK: u64 = 3 << 6;
     pub const USER: u64 = 1 << 6;
     pub const PXN: u64 = 1 << 53;
     pub const UXN: u64 = 1 << 54;

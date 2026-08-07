@@ -2003,6 +2003,56 @@ extern "C" fn el1_fault_recovery_pad() {
 
 /// Fast-path CoW write fault resolver for EL1 kernel code.
 ///
+/// Explain a *write* permission fault that reached SIGSEGV instead of resolving.
+///
+/// A write to a mapped-but-read-only user page has exactly two recovery paths in
+/// the EL0 data-abort arm: the CoW break (taken when `cow_ref_get(pa) > 0`) and the
+/// lazy-region permission upgrade behind it. When neither fires the process dies
+/// with nothing in the `[Fault]` block naming *which* one declined, and the
+/// candidate causes are indistinguishable after the fact:
+///
+/// - `cow_ref=0`  — the RO page carries no CoW reference, so the break is skipped.
+///   This is what a shared `file_page_cache` frame looks like once its reference has
+///   been dropped, and what an ELF segment page mapped RO outside the cache looks
+///   like always.
+/// - `cow_ref>0` — the break was eligible and still failed: PMM exhaustion
+///   (`alloc_page_zeroed` → `None`) or no `lookup_process_shared(as_owner)`. `free=`
+///   separates those two.
+/// - `lazy_self=None lazy_owner=Some(..)` — the upgrade at the bottom of the
+///   permission-fault block looks the region up under `pid` while `mmap_regions`
+///   live on the address-space owner, so a CLONE_VM thread misses a region that is
+///   really there.
+///
+/// Cheap enough to leave unconditional: it runs once, on the way to a fatal signal.
+fn print_write_perm_fault_diag(far: u64, iss: u64, pid: u32, as_owner: u32) {
+    // DFSC[5:2] == 0b0011 (permission fault) with WnR set. Anything else reached
+    // SIGSEGV by a path this diagnostic cannot explain.
+    if (iss & 0x3C) != 0x0C || (iss & (1 << 6)) == 0 {
+        return;
+    }
+    let far_usize = far as usize;
+    let page_va = far_usize & !0xFFF;
+    let ttbr0: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+    let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
+    let pa = akuma_exec::mmu::translate_user_va(l0_ptr, page_va).map(|p| p & !0xFFF);
+    let cow = pa.map_or(0, crate::pmm::cow_ref_get);
+    // `.0` is the region's user flags; `is_none` on it is what gates the upgrade.
+    let lazy_self = akuma_exec::process::lazy_region_lookup_for_page_fault(pid, far_usize).map(|t| t.0);
+    let lazy_owner =
+        akuma_exec::process::lazy_region_lookup_for_page_fault(as_owner, far_usize).map(|t| t.0);
+    let (_total, _alloc, free) = crate::pmm::stats();
+    crate::safe_print!(255,
+        "[WPF] pid={} as_owner={} va={:#x} pa={:#x} mapped={} cow_ref={} lazy_self={:#x} \
+         lazy_owner={:#x} have_owner={} free={}\n",
+        pid, as_owner, page_va,
+        pa.unwrap_or(0), pa.is_some(), cow,
+        lazy_self.unwrap_or(u64::MAX), lazy_owner.unwrap_or(u64::MAX),
+        akuma_exec::process::lookup_process_shared(as_owner).is_some(),
+        free);
+}
+
 /// Returns true if the fault was a CoW write permission fault, the CoW page was
 /// successfully resolved (new frame allocated, old PA remapped), and the caller
 /// should return immediately to retry the faulting instruction via ERET.
@@ -3289,6 +3339,38 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             return unsafe { (*frame).x0 };
                         }
                     }
+
+                // Eager region permission upgrade — the same repair, for the regions
+                // that had no path to it. An eager `mmap` installs its pages up front
+                // and registers no lazy region, so a page inside one that is somehow
+                // read-only reached neither the CoW break (no `cow_ref`) nor the
+                // upgrade above (no lazy region) and died with SIGSEGV, even though
+                // the mapping is writable and the write is legitimate. That is the
+                // `[WPF] ... cow_ref=0 lazy_self=NONE` signature that killed cargo
+                // mid-build.
+                //
+                // Gated on the region actually being writable, so `mprotect(PROT_READ)`
+                // and `PROT_NONE` guard pages still fault the way they must — which is
+                // exactly what `MmapRegion::flags` was added to make knowable.
+                if is_write
+                    && let Some(region_flags) =
+                        akuma_exec::process::eager_region_flags_for_page_fault(pid, far_usize)
+                    && region_flags & akuma_exec::mmu::flags::AP_MASK
+                        == akuma_exec::mmu::flags::AP_RW_ALL
+                {
+                    let page_va = far_usize & !(0xFFF);
+                    if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+                        #[cfg(kernel_smp_shared)]
+                        let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
+                        #[cfg(not(kernel_smp_shared))]
+                        let _ = &owner;
+                        akuma_exec::mmu::update_current_user_page_flags(page_va, region_flags);
+                        crate::safe_print!(192,
+                            "[EAGER-UPGRADE] pid={} as_owner={} va={:#x} flags={:#x}\n",
+                            pid, as_owner, page_va, region_flags);
+                        return unsafe { (*frame).x0 };
+                    }
+                }
             }
 
             if is_translation_fault {
@@ -3882,6 +3964,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             crate::safe_print!(128, "[Fault]  SP_EL0={:#x} SPSR={:#x} TPIDR_EL0={:#x}\n",
                 frame_ref.sp_el0, frame_ref.spsr_el1, frame_ref.tpidr_el0);
             print_spawn_fault_diag(far, frame_ref);
+            print_write_perm_fault_diag(far, iss, pid, as_owner);
             if let Some(proc) = akuma_exec::process::current_process_shared() {
                 let elapsed_us = (akuma_exec::runtime::runtime().uptime_us)()
                     .saturating_sub(proc.start_time_us);
