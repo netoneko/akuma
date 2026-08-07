@@ -185,6 +185,53 @@ Sources: [Phoronix — rustc/Cargo on Redox](https://www.phoronix.com/news/Redox
 Akuma row: `docs/archive/AKUMA_SELF_HOSTING.md` §7j,
 `docs/runbooks/selfhost-kernel-build.md`.
 
+### License, funding, and AI-contribution policy
+
+Three more axes the size/capability table doesn't touch, checked directly against
+each project's repo (GitHub license API, `CONTRIBUTING`/README text, code search
+over each tree) rather than recalled — the AI-policy column marks "not found"
+where that search came up empty, which is an absence-of-evidence result, not a
+confirmed "no policy."
+
+| Project | License | Funded? | AI-contribution policy |
+|---|---|---|---|
+| **Redox** | MIT | **Yes.** Colorado 501(c)(4) nonprofit; NLnet/NGI Zero Commons + Core grants under the EU's Next Generation Internet initiative (one, "Virtualized Redox," is €50k for four part-time devs); ~$17k community donations plus a $390k anonymous crypto donation; self-reported ~$3k/month costs against <$1k/month revenue | **Banned, Feb 2026, enforced.** Any contribution "clearly labelled as LLM-generated" is closed immediately; bypassing it is a project ban. Paired with a new Certificate-of-Origin requirement |
+| **Asterinas** | MPL-2.0 | **Yes.** Sponsored by Ant Group and Intel; most commits come from PhD students at SUSTech, Peking University, and Fudan University | **Explicitly welcomed, and built into the repo.** Stated policy: *"AI is welcome, but the human is responsible."* Ships `@boterinas codex` (OpenAI-Codex-powered inline PR review) and a `.agents/skills/aster-code-review/` package — a benchmark-driven review skill running under both Claude Code and Codex, used by maintainers and designed as the review step of an autonomous agent write→test→review loop |
+| **Sortix** | ISC | **Yes, modestly.** One NLnet NGI0 Commons Fund grant; otherwise a solo project | Not found (`CONTRIBUTING`/README/code search came up empty) |
+| **ToaruOS** | NCSA | **No.** Personal project; no sponsors surfaced | Not found |
+| **Aero** | GPL-3.0 | **No.** Solo/community project | Not found |
+| **Maestro** | AGPL-3.0 | **No.** Solo project | Not found |
+| **Akuma** | **None declared** — no `LICENSE` file, no `license` field in `Cargo.toml` | **No.** One maintainer | No formal policy — a question this project hasn't had to face at Redox/Asterinas's contributor scale |
+
+**What this adds to the peer-group reading.** Funding and code size move together
+here: the two projects with institutional money (Asterinas: Ant Group + Intel +
+three universities; Redox: an EU-grant-funded nonprofit) are also the two with an
+order of magnitude more contributors, and they are the two that had to write an
+explicit AI policy at all — Sortix, ToaruOS, Aero, Maestro, and Akuma are all
+solo-or-near-solo efforts where the question apparently never came up formally.
+And the two funded projects went to **opposite poles**: Redox bans LLM-generated
+contributions outright and enforces it with expulsion; Asterinas's policy is the
+inverse of that stance, shipping a Codex-backed review bot and framing AI review
+as the mechanism that lets human maintainers keep up with AI-accelerated
+contribution volume, and floating a fully autonomous review-driven agent loop as
+the next step. Same underlying pressure — AI-accelerated contribution throughput
+outrunning maintainer review capacity — two structurally opposite answers, both
+from funded, multi-institution projects. Akuma sits outside that pressure
+entirely: single maintainer, so there's no review bottleneck to legislate around
+yet, and this very document is one data point on how it's actually built.
+
+Sources: [Redox donate page](https://www.redox-os.org/donate/) ·
+[OSnews — Redox bans code regurgitated by "AI"](https://www.osnews.com/story/144574/redox-bans-code-regurgitated-by-ai/) ·
+[HN — Redox's no-LLM + Certificate of Origin policy](https://news.ycombinator.com/item?id=47320661) ·
+[Ant Open Source Projects](https://opensource.antgroup.com/en/projects) ·
+[asterinas/asterinas: `book/src/to-contribute/boterinas.md`](https://github.com/asterinas/asterinas/blob/main/book/src/to-contribute/boterinas.md),
+[`.agents/skills/aster-code-review/`](https://github.com/asterinas/asterinas/tree/main/.agents/skills/aster-code-review),
+[`.agents/skills/aster-code-review/spec/motivation.md`](https://github.com/asterinas/asterinas/blob/main/.agents/skills/aster-code-review/spec/motivation.md) ·
+[sortix.org — license](https://sortix.org/license/) · [NLnet — Sortix](https://nlnet.nl/project/) ·
+GitHub license API for Redox/Asterinas/ToaruOS/Aero/Maestro (`api.github.com/repos/<org>/<repo>/license`).
+
+---
+
 **Reading C — the distribution is the interesting part, not the total.**
 `src/exceptions.rs` (3,011 prod lines) and `src/smp.rs` (2,629) are the two
 largest production files, and they are also where most of this project's
