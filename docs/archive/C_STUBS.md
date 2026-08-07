@@ -1,6 +1,6 @@
 # C Library Stubs - Future Refactoring
 
-> **Note:** sqld has been removed as part of a codebase trimming effort (see `docs/TRIMMING_FAT_PART_2.md`). The sqld stubs described below no longer exist; only qjs stubs remain.
+> **Note:** sqld has been removed as part of a codebase trimming effort (see `docs/TRIMMING_FAT_PART_2.md`), and qjs has since been removed too (see `docs/TRIMMING_FAT_PART_3.md`). Neither stub file described below exists anymore; this document is kept for historical reference.
 
 ## Current State
 

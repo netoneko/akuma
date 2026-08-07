@@ -16,7 +16,6 @@ members = [
     "hello",
     "herd",
     "httpd",
-    "quickjs",
     "stackstress",
     "termtest",
     "allocstress",

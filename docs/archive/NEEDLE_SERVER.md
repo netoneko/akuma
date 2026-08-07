@@ -1,5 +1,7 @@
 # needle-server
 
+> **Note:** `userspace/needle-server` has been removed as part of a codebase trimming effort (see `docs/TRIMMING_FAT_PART_3.md`). This document is kept for historical reference.
+
 HTTP inference server for the Needle function-routing model.  It exposes an
 OpenAI-compatible `/v1/chat/completions` endpoint so `meow` can use it as a
 local provider without a full LLM.

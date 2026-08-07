@@ -24,3 +24,4 @@ c_stress/segvchild
 c_stress/pipewake
 c_stress/abortsig
 c_stress/futexkey
+c_stress/pthread_kill_eintr

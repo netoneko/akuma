@@ -1,5 +1,7 @@
 # Plan: Explain top's 95% CPU thread + add a CORE column to `top`
 
+> **Note:** `userspace/top` has been removed as part of a codebase trimming effort (see `docs/TRIMMING_FAT_PART_3.md`). This document is kept for historical reference.
+
 ## Context
 
 `top` showed one kernel thread (TID 2, PID 0) pinned at ~94% CPU. The user asked

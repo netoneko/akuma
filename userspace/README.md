@@ -7,7 +7,7 @@ This guide explains how to create, build, and package new userspace applications
 All userspace software in Akuma relies on two primary components:
 
 1.  **`libakuma`**: The core Rust library that provides safe wrappers for Akuma system calls.
-2.  **`musl`**: A lightweight C library used for C-compatibility and as a foundation for more complex software (like `tcc` or `quickjs`).
+2.  **`musl`**: A lightweight C library used for C-compatibility and as a foundation for more complex software (like `tcc`).
 
 ## Project Structure
 
@@ -129,7 +129,7 @@ fn main() {
     // To package the binary produced by the current crate, you have two options:
     // 1. Use a separate "package" crate that depends on your app and packages it.
     // 2. Have build.rs package assets/libraries, and use a workspace-level tool to collect the final binary.
-    // For C-based tools (like TCC or QuickJS), build.rs can compile the C code and package it directly.
+    // For C-based tools (like TCC), build.rs can compile the C code and package it directly.
 
     // 3. Create the Tar Archive (The "Particular" Way)
     if !dist_dir.exists() {

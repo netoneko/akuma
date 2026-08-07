@@ -175,7 +175,7 @@ Motivating case: jobserver-rs's `Helper::join` installs SIGUSR1 with
 100 times to break it out of a blocking pipe `read`. All 100 were burned and the
 thread leaked — once per rustc that reaches codegen, quadrupled at `-j4`.
 Kill switch: `config::PTHREAD_KILL_EINTR_ENABLED`.
-Repro: `userspace/eintr_repro/pthread_kill_eintr.c` (A/B'd 2026-08-04 — flag off:
+Repro: `userspace/forktest/c_stress/pthread_kill_eintr.c` (A/B'd 2026-08-04 — flag off:
 `read()` never returns, handler runs 0 times; flag on: `-1 EINTR` after 1 handler
 run, with the `SA_RESTART` control unaffected in both).
 

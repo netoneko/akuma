@@ -64,9 +64,7 @@ if [ -n "$MEMBER_ONLY" ]; then
     done
     if [ "$is_no_bin" = false ]; then
         mkdir -p ../bootstrap/bin
-        if [ "$MEMBER_ONLY" == "quickjs" ] && [ -f "target/aarch64-unknown-none/release/qjs" ]; then
-            cp "target/aarch64-unknown-none/release/qjs" ../bootstrap/bin/
-        elif [ -f "target/aarch64-unknown-none/release/$MEMBER_ONLY" ]; then
+        if [ -f "target/aarch64-unknown-none/release/$MEMBER_ONLY" ]; then
             cp "target/aarch64-unknown-none/release/$MEMBER_ONLY" ../bootstrap/bin/
         else
             echo "Warning: Binary $MEMBER_ONLY not found"
@@ -86,7 +84,6 @@ MEMBERS=(
     "herd"
     "httpd"
     "meow"
-    "quickjs"
     "stackstress"
     "termtest"
     "allocstress"
@@ -130,7 +127,6 @@ BINARIES=(
     "elftest"
     "httpd"
     "meow"
-    "quickjs"
     "herd"
     "termtest"
     "allocstress"
@@ -147,10 +143,7 @@ for bin in "${BINARIES[@]}"; do
     if [ -f "$SRC" ]; then
         cp "$SRC" ../bootstrap/bin/
     else
-        # For quickjs the bin name might be qjs
-        if [ "$bin" == "quickjs" ] && [ -f "target/aarch64-unknown-none/release/qjs" ]; then
-            cp "target/aarch64-unknown-none/release/qjs" ../bootstrap/bin/
-	elif [ "$bin" == "tcc" ] && [ -f "target/aarch64-unknown-none/release/tcc" ]; then
+        if [ "$bin" == "tcc" ] && [ -f "target/aarch64-unknown-none/release/tcc" ]; then
             cp "target/aarch64-unknown-none/release/tcc" ../bootstrap/bin/tcc
         else
             echo "Warning: Binary $bin not found at $SRC"
@@ -225,10 +218,10 @@ echo "tidflags (C) copied to bootstrap/bin/"
 # is what keeps Go's SIGURG preemption working. Tiny; built unconditionally.
 echo "Building pthread_kill_eintr (C, pthread_kill EINTR probe)..."
 (
-    cd eintr_repro
+    cd forktest/c_stress
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o pthread_kill_eintr pthread_kill_eintr.c
 )
-cp eintr_repro/pthread_kill_eintr ../bootstrap/bin/
+cp forktest/c_stress/pthread_kill_eintr ../bootstrap/bin/
 echo "pthread_kill_eintr (C) copied to bootstrap/bin/"
 
 # eager_mprotect_probe: does mprotect still hold on an EAGER mmap after the

@@ -1,5 +1,7 @@
 # Crush: Missing or Partial Syscalls and VFS Features
 
+> **Note:** `userspace/crush` has been removed as part of a codebase trimming effort (see `docs/TRIMMING_FAT_PART_3.md`). This document is kept for historical reference.
+
 This document tracks the syscalls and kernel features that were found to be missing or insufficient during the porting of `crush` (and its `modernc.org/sqlite` dependency) to Akuma OS.
 
 ## 1. POSIX File Locking (`fcntl`)

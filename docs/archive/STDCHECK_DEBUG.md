@@ -1,5 +1,7 @@
 # stdcheck Debugging Notes
 
+> **Note:** `userspace/stdcheck` has been removed as part of a codebase trimming effort (see `docs/TRIMMING_FAT_PART_3.md`). This document is kept for historical reference.
+
 ## Status: RESOLVED (Jan 3, 2026)
 
 The `stdcheck` test suite now passes all tests (Vec, String::from, String::push_str).

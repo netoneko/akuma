@@ -104,7 +104,6 @@ See [`docs/AKUMA_SELF_HOSTING.md`](docs/AKUMA_SELF_HOSTING.md).
 | **Rust compiler (rustc)** | Two toolchains run on-target: Alpine `rustc` 1.91 (`rustc -C linker=clang hello.rs` → runnable native binary) and a **nightly musl toolchain** with the `aarch64-unknown-none` std, which compiles and links the **entire Akuma kernel in-VM** (`cargo build --release` over a populated disk, ≥6 GB RAM). Needed in-kernel support: `MAP_SHARED` writeback for linker output, 128 KB argv strings, the futex/`exit_group` thread-group reaping fixes, and `getpriority`. See [`docs/AKUMA_SELF_HOSTING.md`](docs/AKUMA_SELF_HOSTING.md) and [`docs/RUST_TOOLCHAIN.md`](docs/RUST_TOOLCHAIN.md) |
 | **C compiler (Clang/GCC)** | LLVM `clang`/`clang-21` and GCC/binutils (`cc`, `ld`, `as`) from Alpine apk |
 | **JavaScript (Bun)** | Bun runtime for running JS/TS scripts |
-| **JavaScript (QuickJS)** | ES2020 runtime — BigInt, Promises, async/await, console API |
 | **Git** | `git` from Alpine apk — `apk add git` |
 | **Vi editor (neatvi)** | Vi-like text editor, compilable on-target with TCC |
 
@@ -169,7 +168,6 @@ crates/           Extracted kernel crates
 userspace/
   libakuma/         Rust syscall wrapper library
   meow/             AI coding assistant
-  quickjs/          JavaScript interpreter
   tcc/              Tiny C Compiler
   herd/             Process supervisor
   scratch/          minimal Git implementation (HTTPS only)
