@@ -15,7 +15,7 @@ bulk of the build, distinct from C — surfaced in a fresh repro and is
 | **A** | write permission fault with no recovery path | recovery path added (`[EAGER-UPGRADE]`, fires); origin of the bad page state still unknown |
 | **B** | linker leaves a truncated/empty output, cargo execs it | **unfixed — the current blocker** |
 | **C** | a thread survives its thread group's `exit_group`, parked in `FUTEX_WAIT` forever | **root-caused and fixed** |
-| **D** | an rustc thread-group *leader* (never reaching `exit_group`) parked in `FUTEX_WAIT` almost since its own start | **observed once, not root-caused** — see §7 |
+| **D** | an rustc thread-group *leader* (never reaching `exit_group`) parked in `FUTEX_WAIT` almost since its own start | **reproduced with a tight, fast probe — see §7.9.** The §7.8 stress test was *positive*: the raw Condvar/barrier primitive loses an untimed wake under real SMP preemption pressure (`futextest_rs`'s 1:1 patterns do not). Root cause narrowed to a residual wake-loss window in the `schedule_blocking`/`wake_by_handle` handshake (§4a-adjacent), not yet pinned to a fix. |
 
 This doc exists because both failures were previously reported only as "run 1 hit a
 zero-byte `rust-lld` output" and "run 2 got `SIGSEGV in clone_thread`" — two
@@ -598,6 +598,14 @@ surface on `typenum`, not the same bug returning. **Not verified** — would be
 worth confirming which lock implementation Rust std actually selects for this
 exact target triple before fully discarding this lead.
 
+> **Confirmed by the §7.9 repro (2026-08-07).** The stuck primitive's observed
+> futex op is `a1=0x80` (`FUTEX_WAIT|PRIVATE`, untimed) and the cycling mutex
+> waiters are `a1=0x89` (`FUTEX_WAIT_BITSET|PRIVATE`, timed) — both **raw
+> futex**, never `FUTEX_REQUEUE`. So Rust std on `aarch64-unknown-linux-musl`
+> does use its own raw-futex Condvar (not musl's pthread_cond), and the
+> 2026-08-04 `FUTEX_REQUEUE`/`pthread_cond_broadcast` fix is **not** the
+> mechanism here. This lead can be retired.
+
 ### 7.8 The concrete next step: an untried, already-built probe
 
 `userspace/selfhost_repro/futextest.rs` (→ built as `futextest_rs`) already
@@ -628,6 +636,147 @@ Also still open: identify `0x3d90e5e8`-style precisely (§7.5), and check
 whether `[TERM]`/`[Fault]`/`[kill]`/`[PROC-ORPHAN]` ever name these specific
 tgids (checked for tgid=315 and tgid=26 this session: **zero hits, both
 runs** — ruling out "a sibling died before it could wake me" as the cause).
+
+---
+
+## 7.9 §7.8 stress test: POSITIVE — a tight, fast kernel repro (2026-08-07)
+
+**The §7.8 hypothesis was confirmed.** Running the probe under real 4-core SMP
+contention reproduces the lost-wake — but only the jobserver-*shape* primitive,
+not `futextest_rs`'s 1:1 patterns. This converts Failure D from a ~15-minute
+rustc build into a **~25-second deterministic-on-demand repro**.
+
+### The probe
+
+A new focused probe was written: `userspace/selfhost_repro/jobserver_stress.rs`.
+It matches jobserver's `HelperState::for_each_request` shape (§7.5) more closely
+than `futextest.rs`'s phase 4: a **multi-producer / single-consumer** `Mutex`+
+`Condvar` with an **untimed** `cvar.wait()` (the exact `0x3cda5fc4` primitive,
+`a1=0x80`), plus a `Barrier` phase (one-to-many wake), a `park`/`unpark` MPSC
+phase, and a spawn/join churn phase. Each phase prints `start`/`ok`; a missing
+`ok` is the repro. Env knobs (`JS_PHASE`, `JS_PRODUCERS`, `JS_REQUESTS`, …) run
+one phase at a time. Cross-compile on host:
+`rustc --target aarch64-unknown-linux-musl -C linker=aarch64-linux-musl-gcc -O
+userspace/selfhost_repro/jobserver_stress.rs`, or compile in-guest with
+`rustc -O jobserver_stress.rs` (the self-host image has rustc).
+
+### The result — and the condition that gates it
+
+| config | outcome |
+| --- | --- |
+| 4 concurrent `barrier` copies, **no** background load | **0 / 4 hang** |
+| 4 concurrent `barrier` copies, **+ 4 CPU hog loops** | **4 / 4 hang** |
+| 4 concurrent copies of the **all-phases** probe + 4 hogs | `condvar-mpsc` and `barrier` both hang; `futextest_rs` (1:1) passes all 7 phases |
+
+The gate is **real scheduler preemption pressure**, exactly the condition the
+already-fixed 2026-08-05 bug needed (`debug-futex-lost-wakeup.md` §4a: "needs a
+*concurrent* waker on another core to land inside it"). Without the CPU hogs the
+4 barrier copies never preempt each other at the losing window and complete
+cleanly. `futextest_rs` passes regardless — its 1:1 producer/consumer does not
+hit the window — which is *why* §5 of that runbook measured it at 95/96 on both
+arms of the cross-process-key fix: it cannot reproduce *this* class either.
+
+### The shape, from `[FUTEX-DUMP]` / `[FUTEX-WAKERING]` / `hist=`
+
+Four barrier processes (e.g. tgid 6987–6990), each with **one thread permanently
+parked on a Condvar futex word** (a static address, e.g. `0x30338ac0`, identical
+across the 4 processes — no ASLR), `a1=0x80` (**untimed** `FUTEX_WAIT|PRIVATE`),
+`queued_for` climbing to **220 s** and beyond:
+
+```
+key tgid=6987 uaddr=0x30338ac0 waiters=1
+  tid=19 bitset=0xffffffff queued_for=220072704us hist=pWuXEpWuXEpWuXEp
+key tgid=6988 uaddr=0x30338ac0 waiters=1
+  tid=20 ... queued_for=220044945us hist=pWuXEpWuXEpWuXEp
+```
+
+- `hist=pWuXEpWuXEpWuXEp` — a **healthy** `Enqueue→park→Wake→unpark→eXit`
+  cycle repeating, then a **final `Ep`**: the thread enqueued and parked and
+  the wake that should follow (`W`) **never arrives**. (Distinct from §4a's
+  `...EpW` — woken but never unparked. Here the wake is never *issued* on this
+  key while the waiter is queued.)
+- The **Mutex** futex word (`0x30130fa0` / `0x30130fc0`) by contrast **cycles
+  normally**: `waiters` comes and goes, `queued_for` stays in the 5–50 s range,
+  same healthy `pWuXEp…` hist. The mutex is being acquired/released fine.
+
+### What that shape says about the root cause
+
+1. **Untimed waits hang; timed waits survive.** The stuck threads are all
+   `a1=0x80` (untimed). The cycling mutex waiters are `a1=0x89`
+   (`FUTEX_WAIT_BITSET`, **timed**). The kernel loses wakes for *both* — but a
+   timed wait's deadline (`WAKE_TIMES`) eventually reschedules it, re-running the
+   futex value re-check and recovering. An untimed wait (`deadline = u64::MAX`)
+   has **no deadline rescue**, so one lost wake strands it forever. This is
+   exactly why jobserver's *untimed* `cvar.wait` (§7.5) is the address that
+   sticks, and why the bug is invisible on `-j1` (no concurrent waker to land in
+   the window) but surfaces under `-j4` + load.
+
+2. **The wake is not reaching the futex layer for this key** (`hist` ends `Ep`,
+   no `W`). That is the §7.6 "no wake issued in this namespace" shape, not §4a's
+   "issued but dropped by the scheduler". The implication is a chain: the thread
+   that should call `Condvar::notify_*` (the barrier's last arrival / the
+   jobserver token requester) never reaches the `notify`, because *it* is itself
+   parked on an untimed wait whose single wake was lost. Somewhere at the head
+   of the chain is a thread whose wake genuinely vanished between
+   `futex_do_wake`'s dequeue and `schedule_blocking` returning.
+
+3. **The residual window is in the `schedule_blocking` ↔ `wake_by_handle`
+   handshake**, §4a-adjacent. `publish_waiting_and_take_pending_wake` closed the
+   entry-check-vs-`WAITING`-store gap under a local IRQ mask + SeqCst pair, and
+   that pair is re-verified airtight on paper. A remaining hole is not yet
+   identified by reading; the repro is now cheap enough to instrument directly
+   (see Next steps).
+
+### A candidate worth testing (not confirmed)
+
+`futex_check_and_enqueue` re-reads the futex word via `copy_from_user_safe`, which
+is `__arch_copy_user_memory` (a plain byte load) wrapped in `compiler_fence` — a
+**compiler** barrier only, no CPU acquire/`DMB ISH`. The waker's value-change
+(Rust std's `Condvar::notify_one` does `fetch_add` then `FUTEX_WAKE`) is **outside**
+the `FUTEX_WAITERS` lock. Linux's futex has the same structure and relies on the
+hash-bucket lock handoff carrying the happens-before of the userspace store; if
+Akuma's spinlock pair or the plain user load doesn't provide the equivalent
+ordering under contention, a waiter can re-read a stale value, re-enqueue, and
+park past a wake that already ran. **Not proven** — the intermittent,
+preemption-gated nature fits a timing window better than a consistent ordering
+bug, and the lock structure mirrors Linux. Test it by making the value load
+acquire-ordered and re-running the repro; if the hang rate drops to zero, this
+was it.
+
+### A separate bug found along the way: `alarm()` / `SIGALRM` does not work
+
+`alarm(3)` followed by `pause()` ran past 12 s and did not terminate — `alarm()`
+is either not arming the timer or `SIGALRM` is not being delivered. This means
+**any probe that relies on `alarm()` for a self-kill timeout will hang forever on
+a lost wake** instead of timing out (the `jobserver_stress` probe's
+`JS_TIMEOUT_SECS` is inert in-guest); the host/guest-side stress harnesses here
+work around it with an external `kill -9` watchdog. Worth its own investigation;
+recorded so the next session doesn't build a timeout on top of `alarm()`.
+
+### Reproduce it (deterministic, ~25 s)
+
+Boot `release-smp-shared` + `devbox-smoltcp,no-tests`, `SMP=4`, `MEMORY=4096`,
+`DISK=disk_selfhost_fixtest.img`. SSH in, then:
+
+```sh
+# (one time) compile the probe in-guest, or scp the host cross-build
+rustc -O /tmp/jobserver_stress.rs -o /tmp/jobserver_stress   # if source is present
+# 4 CPU hogs are REQUIRED — without them the window is never hit (0/4 hang)
+hog() { while :; do :; done; }
+for h in 1 2 3 4; do hog & done; HOGS=$!
+for i in 1 2 3 4; do
+  JS_PHASE=barrier JS_BARRIER_THREADS=4 JS_BARRIER_ROUNDS=8000 \
+    /tmp/jobserver_stress > /tmp/r$i.log 2>&1 &
+done
+sleep 25
+for i in 1 2 3 4; do grep -q DONE /tmp/r$i.log && echo "$i PASS" || echo "$i HANG"; done
+kill -9 $HOGS
+```
+
+Expect `HANG` on all 4 copies. `[FUTEX-DUMP]` (within 60 s) shows the stuck
+untimed condvar waiters; the cycling mutex waiters are the control. The guest
+helper scripts used this session are at `/tmp/repro_hog.sh`, `/tmp/narrow.sh`,
+`/tmp/stress_futex.sh` (not committed — recreate from this section).
 
 ---
 
@@ -777,6 +926,17 @@ from scratch next time `-j4` log evidence needs cross-core attribution.
 
 ## 9. Next steps
 
+0. **Failure D now has a 25-second deterministic repro — root-cause it first
+   (§7.9).** The cheapest open question. With `jobserver_stress` + 4 CPU hogs,
+   untimed `Condvar`/`Barrier` waits hang 4/4 while timed waits cycle. Pin the
+   residual wake-loss window in the `schedule_blocking`↔`wake_by_handle`
+   handshake: enable `FUTEX_DBG_ENABLED` (rebuild) and run the minimal barrier
+   repro to capture the exact WAIT/WAKE/value sequence around a hang, OR add a
+   targeted tripwire that fires when `futex_do_wake` dequeues a waiter
+   (`hist`→`W`) whose `schedule_blocking` does not return within a short window
+   (no following `u`). Also test the §7.9 acquire-load candidate. `alarm()`
+   being broken (§7.9) means any in-guest timeout must be an external
+   `kill -9` watchdog, not `alarm()`.
 1. **Failure B is now the blocker — start here.** Log every `ld`/`collect2`/`cc` exit
    status next to the parent's `wait4` result, and check whether the linker is among
    the processes torn down by `kill_thread_group`. The `0666` mode (§4.4a) says the

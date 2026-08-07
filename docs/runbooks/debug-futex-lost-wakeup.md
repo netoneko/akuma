@@ -281,6 +281,18 @@ pre-fix ordering. Prefer it to any in-VM stress repro; see
 Still open at the time of the fix: the in-VM `-j4` build has **not** been re-run,
 so `-j1` remains the documented recipe for the final crate.
 
+> **Residual variant (2026-08-07, not yet fixed).** A focused probe
+> (`userspace/selfhost_repro/jobserver_stress.rs`) reproduces a *related* lost
+> wake under real 4-core SMP + CPU-hog preemption pressure: untimed
+> `Condvar`/`Barrier` waits (`a1=0x80`) hang 4/4 while timed waits cycle (their
+> deadline rescues them). `hist` ends `Ep` (wake never *issued* on the key), not
+> §4a's `EpW` (issued but dropped) — so it may be upstream of this fix or a
+> different window in the same handshake. `futextest_rs` does **not** reproduce
+> it (1:1 patterns miss the window). Full diagnosis + a 25-second deterministic
+> repro in
+> [`../archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md`](../archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md)
+> §7.9.
+
 ## 5. Cross-process key collision (FIXED 2026-08-04, keep the probe)
 
 Akuma has no ASLR, so every copy of a binary places its globals at the same
