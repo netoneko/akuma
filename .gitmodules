@@ -7,9 +7,6 @@
 [submodule "userspace/llama.cpp/llama.cpp"]
 	path = userspace/llama.cpp/llama.cpp
 	url = https://github.com/netoneko/llama.cpp.git
-[submodule "userspace/crush/crush"]
-	path = userspace/crush/crush
-	url = https://github.com/netoneko/crush.git
 [submodule "userspace/nca/native-cli-ai"]
 	path = userspace/nca/native-cli-ai
 	url = https://github.com/netoneko/native-cli-ai.git

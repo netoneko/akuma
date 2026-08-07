@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-# NOTE (self-hosting): the submodule-backed members — meow, tcc, llama.cpp, crush,
+# NOTE (self-hosting): the submodule-backed members — meow, tcc, llama.cpp,
 # nca — are temporarily removed from the workspace so the first-party crates build
 # without every submodule checked out. Cargo requires *every* listed member's
 # Cargo.toml to be present just to load the workspace, so a missing submodule
@@ -18,16 +18,12 @@ members = [
     "httpd",
     "quickjs",
     "stackstress",
-    "stdcheck",
     "termtest",
     "allocstress",
-    "top",
     "tar",
     "sshd",
-    "stp_test",
     "wavplay",
     "scratch",
-    "needle-server"
 ]
 # selfhost_repro is intentionally NOT a member: it is a throwaway crate built
 # only *inside* the VM (via its own --manifest-path) to reproduce the
