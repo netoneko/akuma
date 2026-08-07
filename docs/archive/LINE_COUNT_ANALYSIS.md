@@ -32,6 +32,23 @@ Trust check: per-file diff against `cloc 2.08` over all 172 Rust files —
 blank line inside a multi-line string (`src/sync_tests.rs:2531`), which this
 counter calls code (it is part of a string token) and cloc calls blank.
 
+### Scope limit: first-party only
+
+Every count below covers `src/` + `crates/` and **nothing else**. Akuma links a
+substantial amount of third-party Rust — smoltcp, embedded-tls, curve25519/
+ed25519-dalek, sha2, aes, crypto-bigint, virtio-drivers, talc, fdt, arm_pl031,
+spinning_top — and none of it appears in the 48,942 figure while all of it ships
+in the image.
+
+The byte measurements show how large that gap is. In the `size` image, the
+`crypto` (63,580 B), `tls/x509` (76,596 B) and `smoltcp` (58,570 B) groups are
+**entirely dependency code** — ~199 KB, over 22% of sized symbols — contributing
+zero lines to the count, with more dependency code (talc, virtio-drivers, fdt)
+folded into the unattributed remainder. So "49k lines" describes *the code this
+project maintains*, not the code it ships. Both are legitimate numbers; they
+answer different questions, and only the first one is measured here. See
+[Planned: Linked Code Size](#planned-linked-code-size-lcs).
+
 ---
 
 ## The numbers
@@ -84,7 +101,7 @@ reference points most people carry:
 |---|---|---|
 | xv6-riscv | ~6–7k C (kernel) | no |
 | seL4 (verified core) | ~10k C | no (microkernel; needs a userland OS personality) |
-| Akuma | 48,942 Rust | yes |
+| Akuma | 48,942 Rust (first-party) | yes |
 | Linux | ~30M+ | it *is* the reference |
 
 **Reading B — "it's small for what it does," and this is the one that holds.**
@@ -106,6 +123,67 @@ So the honest framing is that **line count tracks ABI surface, not feature
 count**, and a fair yardstick has to be a kernel that runs an unmodified Linux
 userspace. Against xv6 the number looks bloated; against anything that hosts a
 real toolchain it doesn't.
+
+### The actual peer group
+
+Projects in the same territory — an independent kernel with a POSIX-ish or
+Linux-compatible userspace, capable enough to run real third-party software.
+Figures below are from public sources (linked at the end of this section);
+**only the Akuma row is measured here.**
+
+| Project | Started | Language / shape | Size | Capability high-water mark | Hosts a Rust toolchain? |
+|---|---|---|---|---|---|
+| **Redox** | 2015 | Rust, microkernel | kernel <30k–50k lines (own docs vary) | `relibc`; Linux-compatible at API *and* syscall-ABI level; COSMIC desktop | **Yes — Jan 2026.** rustc + cargo run natively; can build Rust CLI/TUI programs; first merge request submitted from inside Redox. Third attempt; ~10.5 years from project start |
+| **Asterinas** | ~2022 | Rust, framekernel (monolithic address space, safe-Rust services) | **>100K lines Rust, 50+ contributors** | 210+ Linux syscalls (230+ by 0.18); Ext2/exFAT32/overlay, TCP/UDP/Unix; Nginx 1.26.2, Redis 7.0.15, SQLite 3.46.1 at ~Linux parity (Nginx *faster*: 22,912 vs 19,227 rps); TCB 14.0% | **No.** The paper benchmarks server workloads; no compiler runs on it |
+| **Sortix** | 2011 | C | — | POSIX; installable on real hardware | Self-hosting **C** toolchain at 1.0 (Mar 2016) — ~5 years |
+| **ToaruOS** | Jan 2011 | C, from scratch | — | own libc, compositing GUI, dynamic linker, network stack; replaced all third-party runtime deps in 2018 (1.6) | Not established |
+| **Aero** | ~2021 | Rust, monolithic | — | Unix-like, Linux-inspired, SMP, 5-level paging | No evidence found either way |
+| **Maestro** | ~2018 | Rust | — | Linux-compatible; own init (Solfège), utils, package manager | No evidence found either way |
+| **Akuma** | 2026 | Rust, monolithic | 48,942 first-party lines | 17 syscall families; CoW fork, threads, lazy mmap; ext2, TCP/IP, in-kernel SSH; runs apk, rustc, llama.cpp | **Yes — builds its own kernel.** 147 units, 8m29s, self-built ELF boots (2026-06-19); `release-smp-shared` in-VM build reaches the ELF (2026-08-05) |
+
+**What this comparison actually shows:**
+
+**Hosting your own build is close to a two-project club, and the two got there
+differently.** Redox's January 2026 milestone was *running* rustc and cargo and
+compiling Rust programs — not building the OS itself. Akuma builds its own kernel
+and the result boots. On that specific axis Akuma is further along, having reached
+it with roughly half the first-party code and one maintainer, where Redox took a
+decade, a team, and three attempts.
+
+**Three caveats keep that from being a brag.** (1) Akuma's route is easier in one
+concrete way: Linux ABI + musl means *unmodified* rustc binaries, whereas Redox
+had to port rustc onto `relibc` and upstream a target triple — different work, not
+less. (2) Redox has vastly more breadth — desktop, driver coverage, package
+ecosystem, multiple architectures. (3) The Akuma build needs retry rounds (an
+intermittent rayon-worker rustc SIGSEGV) and `-j1` for the final crate, so
+"self-hosting" is achieved but not yet *reliable*.
+
+**Asterinas is the sharpest lesson, because it optimized for the opposite thing.**
+Twice the code, 50+ contributors, three years — and it beats Linux on Nginx
+throughput while not running a compiler at all. Capability is not one axis, and
+"lines of code" predicts position on none of them. A project can be larger, faster,
+more rigorously verified *and* less self-sufficient simultaneously.
+
+**Size comparisons across kernel architectures are close to meaningless.** Redox's
+30–50k is a *microkernel*: drivers, much of POSIX, and the network stack live in
+userspace and are excluded from that count, while Akuma's 49k includes smoltcp,
+VFS, SSH, and a shell. Comparing the two numbers without that adjustment would
+flatter or damn this project arbitrarily — the same trap as Reading A's xv6 row.
+And per [Scope limit](#scope-limit-first-party-only), the Akuma figure omits every
+linked crate, which is exactly what
+[LCS](#planned-linked-code-size-lcs) would fix.
+
+Sources: [Phoronix — rustc/Cargo on Redox](https://www.phoronix.com/news/Redox-OS-January-2026) ·
+[heise — Redox compiles code on itself](https://www.heise.de/en/news/Redox-OS-compiles-code-on-itself-for-the-first-time-11173992.html) ·
+[The Register (2019) — nearly self-hosting after four years](https://www.theregister.com/2019/11/29/after_four_years_rusty_os_nearly_selfhosting/) ·
+[Redox book — microkernels](https://doc.redox-os.org/book/microkernels.html) ·
+[Asterinas, USENIX ATC'25](https://arxiv.org/abs/2506.03876) (local copy: `atc25-peng-yuke.pdf`) ·
+[asterinas/asterinas](https://github.com/asterinas/asterinas) ·
+[Sortix](https://sortix.org/) · [ToaruOS at 5 Years](https://toaruos.org/toaruos-at-5-years.html) ·
+[Aero](https://github.com/Andy-Python-Programmer/aero) ·
+[Maestro](https://github.com/maestro-os/maestro).
+Akuma row: `docs/archive/AKUMA_SELF_HOSTING.md` §7j,
+`docs/runbooks/selfhost-kernel-build.md`.
 
 **Reading C — the distribution is the interesting part, not the total.**
 `src/exceptions.rs` (3,011 prod lines) and `src/smp.rs` (2,629) are the two
@@ -391,7 +469,64 @@ in pre-commit. Each converts a class of silent failure into a loud one.
   exist; how completely each implements its family is unmeasured.
 - **Anything about size.** A 30 KB precomputed table is one line of Rust
   (`ED25519_BASEPOINT_TABLE` is exactly that). Lines are a proxy for maintenance
-  burden, never for image size.
+  burden, never for image size. [Linked Code Size](#planned-linked-code-size-lcs)
+  is the metric that would close this gap; it is not measured yet.
+- **How much code actually ships.** The counts are first-party only, and this
+  project links many crates — see [Scope limit](#scope-limit-first-party-only).
+
+---
+
+## Planned: Linked Code Size (LCS)
+
+**To be measured and added to this doc.** Not done yet.
+
+Both metrics in this analysis are flawed in the same direction, and the flaw is
+the one that matters most for this codebase: **it links a lot of crates.**
+
+- The **line count** covers only first-party `src/` + `crates/`, so it silently
+  omits every dependency — while >22% of the image's sized symbols are dependency
+  code (see [Scope limit](#scope-limit-first-party-only)).
+- The **symbol attribution** in [`reference/build-profiles.md`](../reference/build-profiles.md)
+  does include dependencies, but LTO + `codegen-units = 1` charge inlined code to
+  whatever it was inlined into, so per-group totals are floors rather than
+  measurements.
+
+The Asterinas ATC'25 paper introduces the metric that fixes both, for exactly the
+reason that applies here — quoting it:
+
+> directly comparing lines of code across crates is not ideal, as not all code
+> within a crate is necessarily utilized […] we introduce a metric called Linked
+> Code Size (LCS), which measures the number of lines of code that are ultimately
+> compiled and linked during the OS build. We leverage the LLVM toolchain to
+> estimate [it].
+
+That is the right number for this project. A crate contributes its *linked*
+lines, not its repository size: pull in `curve25519-dalek` and you are charged for
+the code that survives into the binary, not for the whole crate, and not for zero
+as today.
+
+**Why it is worth doing here specifically:**
+
+1. It makes the first-party/third-party boundary irrelevant — one number covers
+   both, so "how big is this kernel" stops having two incompatible answers.
+2. It is per-profile, so it would finally quantify what `--no-default-features`
+   buys on `size`/`extreme-size` in code terms rather than in stripped bytes.
+3. It sidesteps the LTO attribution problem: linked-ness is a property of the
+   build, not of a symbol name that inlining may have erased.
+4. It is directly comparable to a published kernel — Asterinas reports LCS
+   per-component against Linux 6.12.0 (task scheduler 1.6 vs 27.2 KLoC = 17×,
+   slab allocator 1.6 vs 8.7 = 6×, frame allocator 1.2 vs 7.1), which is a far
+   better yardstick than the ones used in Stat 1.
+
+**Sketch of how:** build with debug info retained and line tables intact, then map
+the linked symbols back to source lines via DWARF (`llvm-dwarfdump
+--debug-line`, or `llvm-symbolizer` over the symbols `scripts/symbol_sizes.py`
+already enumerates), dedupe by `file:line`, and count distinct source lines
+reached. Per-crate rollup comes free from the file paths. The paper's own
+estimate is LLVM-based, so this is the same approach rather than an invention.
+
+Until that exists, treat the numbers in this doc as **first-party maintenance
+burden**, which is what they honestly are.
 
 ---
 
