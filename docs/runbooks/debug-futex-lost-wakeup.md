@@ -288,10 +288,22 @@ so `-j1` remains the documented recipe for the final crate.
 > deadline rescues them). `hist` ends `Ep` (wake never *issued* on the key), not
 > §4a's `EpW` (issued but dropped) — so it may be upstream of this fix or a
 > different window in the same handshake. `futextest_rs` does **not** reproduce
-> it (1:1 patterns miss the window). Full diagnosis + a 25-second deterministic
-> repro in
+> it (1:1 patterns miss the window). Two mitigations (a direct cross-core wake
+> SGI, and a periodic bounded re-park for untimed waits) were tried and
+> **confirmed not to fix it** — `[FUTEX-DUMP]` shows the periodic re-park
+> cycling healthily (`hist=uSepuSepuSep...`) but never observing a real `W`,
+> because the futex *value* never changes: whatever thread should call
+> `notify_all` never gets there. No futex-layer safety net can rescue a wake
+> that's never issued. Full diagnosis + a 25-second deterministic repro in
 > [`../archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md`](../archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md)
-> §7.9.
+> §7.9–§7.10.
+>
+> That same session found `alarm()`/`pause()` completely broken (`ppoll(NULL,
+> 0, ...)` never blocked, then never returned once it did, then blocking
+> syscalls couldn't be interrupted by a signal with no registered handler) —
+> unrelated to the futex investigation, now fixed, see §7.11 of the archive
+> doc above. Any future probe can use `alarm()` for an in-guest timeout again
+> instead of an external `kill -9` watchdog.
 
 ## 5. Cross-process key collision (FIXED 2026-08-04, keep the probe)
 

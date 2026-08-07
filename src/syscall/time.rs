@@ -1,11 +1,180 @@
 use super::*;
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
+use akuma_exec::threading::MAX_THREADS;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct LocalTimespec {
     tv_sec: u64,
     tv_nsec: u64,
+}
+
+// ---------------------------------------------------------------------------
+// ITIMER_REAL / alarm() support
+//
+// musl on aarch64 implements alarm() via setitimer(ITIMER_REAL, ...).  This
+// module stores the per-thread-slot deadline and periodic interval, checked
+// every timer tick from `kernel_timer::on_timer_interrupt`.
+// ---------------------------------------------------------------------------
+
+/// Per-thread ITIMER_REAL deadline in uptime microseconds (0 = disarmed).
+/// Only the thread-group leader's slot is meaningful (alarm is per-process).
+static ITIMER_DEADLINE: [AtomicU64; MAX_THREADS] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// Per-thread ITIMER_REAL periodic interval in microseconds (0 = one-shot).
+static ITIMER_INTERVAL: [AtomicU64; MAX_THREADS] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LocalTimeval {
+    tv_sec: u64,
+    tv_usec: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LocalItimerval {
+    it_interval: LocalTimeval,
+    it_value: LocalTimeval,
+}
+
+/// Check and fire expired ITIMER_REAL timers. Called from the timer tick
+/// (`kernel_timer::on_timer_interrupt`). Sends SIGALRM (14) to each thread
+/// whose deadline has passed.
+///
+/// Runs in timer-IRQ context on whichever core took the interrupt — "current
+/// process" there is whatever happened to be interrupted, not the itimer's
+/// owner, so this must NOT apply SIGALRM's default (fatal) action inline the
+/// way `sys_tkill` does for a same-thread caller. It follows `sys_kill`'s
+/// cross-context pattern instead: `interrupt_thread` sets the target's
+/// `ProcessChannel::interrupted` flag, which `is_current_interrupted()` (the
+/// unconditional first half of `should_interrupt_blocking_syscall`) checks
+/// regardless of signal disposition — unlike the mask-and-handler-gated second
+/// half, `current_thread_has_pending_interrupt`, which by design only reports
+/// signals with a registered handler (see its doc comment) and would never
+/// break a `pause()`/`ppoll(NULL, 0, NULL)` out of an infinite block for a
+/// handler-less SIGALRM. The actual default action then applies safely at the
+/// target thread's own next syscall-return dispatch, where "current process"
+/// is correct.
+///
+/// `interrupt_thread` alone is not enough: it sets the flag via `get_channel`,
+/// keyed by `PROCESS_CHANNELS[tid]` — populated once at the original spawn
+/// point and never re-registered on each subsequent fork/exec. What the
+/// target thread will actually read back is `current_channel()`, which tries
+/// `Process::channel` FIRST (inherited by value through fork, so it follows
+/// the process down as many fork/exec generations as it likes) and only
+/// falls back to `get_channel`. A process several generations removed from
+/// the original registration point — e.g. anything an SSH session execs —
+/// has a populated `Process::channel` but no `PROCESS_CHANNELS[tid]` entry,
+/// so `interrupt_thread` alone silently no-ops for it. Set both.
+pub fn check_itimers() {
+    let now = crate::timer::uptime_us();
+    for tid in 0..MAX_THREADS {
+        let deadline = ITIMER_DEADLINE[tid].load(Ordering::Relaxed);
+        if deadline > 0 && now >= deadline {
+            // Fire SIGALRM
+            akuma_exec::process::interrupt_thread(tid);
+            if let Some(pid) = akuma_exec::process::find_pid_by_thread(tid)
+                && let Some(proc) = akuma_exec::process::lookup_process_shared(pid)
+                && let Some(ch) = proc.channel.as_ref()
+            {
+                ch.set_interrupted();
+            }
+            akuma_exec::threading::pend_signal_for_thread(tid, 14);
+            // Re-arm if periodic, else disarm
+            let interval = ITIMER_INTERVAL[tid].load(Ordering::Relaxed);
+            if interval > 0 {
+                ITIMER_DEADLINE[tid].store(
+                    now.saturating_add(interval),
+                    Ordering::Relaxed,
+                );
+            } else {
+                ITIMER_DEADLINE[tid].store(0, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// setitimer(ITIMER_REAL) — arms/disarms the real-time interval timer that
+/// delivers SIGALRM on expiration. musl's alarm() is a thin wrapper around this.
+pub(super) fn sys_setitimer(which: u32, new_ptr: u64, old_ptr: u64) -> u64 {
+    const ITIMER_REAL: u32 = 0;
+    if which != ITIMER_REAL {
+        // ITIMER_VIRTUAL (1) and ITIMER_PROF (2) are not implemented.
+        return crate::syscall::ENOSYS;
+    }
+
+    let tid = akuma_exec::threading::current_thread_id();
+    if tid >= MAX_THREADS {
+        return crate::syscall::EINVAL;
+    }
+
+    // Write old timer state if requested
+    if old_ptr != 0 {
+        let old_deadline = ITIMER_DEADLINE[tid].load(Ordering::Relaxed);
+        let old_interval = ITIMER_INTERVAL[tid].load(Ordering::Relaxed);
+        let now = crate::timer::uptime_us();
+        let remaining = old_deadline.saturating_sub(now);
+        let old = LocalItimerval {
+            it_interval: LocalTimeval {
+                tv_sec: old_interval / 1_000_000,
+                tv_usec: old_interval % 1_000_000,
+            },
+            it_value: LocalTimeval {
+                tv_sec: remaining / 1_000_000,
+                tv_usec: remaining % 1_000_000,
+            },
+        };
+        let _ = unsafe {
+            copy_to_user_safe(
+                old_ptr as *mut u8,
+                (&raw const old).cast::<u8>(),
+                core::mem::size_of::<LocalItimerval>(),
+            )
+        };
+    }
+
+    // Read and apply new timer state if requested
+    if new_ptr != 0 {
+        let mut new_val = LocalItimerval::default();
+        if unsafe {
+            copy_from_user_safe(
+                (&raw mut new_val).cast::<u8>(),
+                new_ptr as *const u8,
+                core::mem::size_of::<LocalItimerval>(),
+            )
+        }
+        .is_err()
+        {
+            return crate::syscall::EFAULT;
+        }
+
+        let interval_us =
+            new_val.it_interval.tv_sec.saturating_mul(1_000_000) + new_val.it_interval.tv_usec;
+        let value_us =
+            new_val.it_value.tv_sec.saturating_mul(1_000_000) + new_val.it_value.tv_usec;
+
+        let now = crate::timer::uptime_us();
+        if value_us > 0 {
+            ITIMER_DEADLINE[tid].store(now.saturating_add(value_us), Ordering::Relaxed);
+            ITIMER_INTERVAL[tid].store(interval_us, Ordering::Relaxed);
+        } else {
+            // Disarm
+            ITIMER_DEADLINE[tid].store(0, Ordering::Relaxed);
+            ITIMER_INTERVAL[tid].store(0, Ordering::Relaxed);
+        }
+    }
+
+    0
 }
 
 pub(super) fn sys_clock_gettime(clock_id_arg: u64, tp_ptr: u64) -> u64 {

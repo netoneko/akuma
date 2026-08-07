@@ -24,6 +24,7 @@ pub fn ensure_test_runtime() {
         end_of_interrupt: |_| {},
         trigger_sgi: |_| {},
         wake_remote_idle: || {},
+        wake_core: |_| {},
         alloc_page_zeroed: || None,
         alloc_page: || None,
         free_page: |_| {},

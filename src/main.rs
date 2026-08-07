@@ -440,6 +440,12 @@ pub(crate) fn build_exec_runtime(
         wake_remote_idle: smp_shared::wake_remote_idle,
         #[cfg(not(kernel_smp_shared))]
         wake_remote_idle: || {},
+        // Direct a scheduler SGI at the woken thread's last-known core so its
+        // scheduler picks up the READY thread promptly. No-op off shared-SMP.
+        #[cfg(kernel_smp_shared)]
+        wake_core: smp_shared::wake_core,
+        #[cfg(not(kernel_smp_shared))]
+        wake_core: |_| {},
         alloc_page_zeroed: || pmm::alloc_page_zeroed(),
         alloc_page: || pmm::alloc_page(),
         free_page: pmm::free_page,

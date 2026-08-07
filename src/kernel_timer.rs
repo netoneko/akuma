@@ -214,6 +214,9 @@ pub fn on_timer_interrupt() {
     if any_woken {
         signal_wake();
     }
+
+    // Check ITIMER_REAL / alarm() expirations and deliver SIGALRM.
+    crate::syscall::check_itimers();
 }
 
 // ============================================================================

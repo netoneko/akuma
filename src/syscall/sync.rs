@@ -827,6 +827,24 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 u64::MAX
             };
 
+            // Safety net for untimed waits (deadline == u64::MAX).
+            //
+            // The scheduler's wake/schedule handshake (`schedule_blocking` ↔
+            // `ThreadWaker::wake`) has residual wake-loss windows under heavy SMP
+            // preemption (docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md
+            // §7.9: 4/4 untimed Barrier/Condvar hangs under CPU-hog pressure; timed
+            // waits survive because their deadline forces a schedule_blocking return,
+            // letting the value re-check below rescue the lost wake via EAGAIN).
+            //
+            // For untimed waits there is no deadline to force that return, so one lost
+            // wake strands the thread forever.  We convert u64::MAX into a periodic
+            // bounded "revalidation" deadline: when it expires the thread self-removes,
+            // re-reads the futex word (via futex_check_and_enqueue, which returns EAGAIN
+            // if the value changed — exactly the lost-wake rescue), and re-parks.  This
+            // is correct per the futex contract (spurious wakes are always allowed) and
+            // costs one wakeup per interval per untimed waiter.
+            const FUTEX_REVALIDATE_US: u64 = 200_000; // 200 ms — safety net, well above scheduling latency
+
             // Main wait loop — handles spurious wakeups from schedule_blocking.
             //
             // We distinguish genuine FUTEX_WAKE from spurious by locating ourselves
@@ -839,8 +857,18 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             //                            signal, cleaning up the requeue target so no
             //                            dead tid is left to eat a future wake)
             loop {
+                // For untimed waits, park with the revalidation deadline instead of
+                // u64::MAX so the scheduler's wake-pass eventually returns us.  The
+                // ETIMEDOUT checks below still compare against the original `deadline`
+                // (u64::MAX), so the user-visible behaviour is unchanged.
+                let park_deadline = if deadline == u64::MAX {
+                    crate::timer::uptime_us().saturating_add(FUTEX_REVALIDATE_US)
+                } else {
+                    deadline
+                };
+
                 fe(tid, FE_PARK, uaddr);
-                akuma_exec::threading::schedule_blocking(deadline);
+                akuma_exec::threading::schedule_blocking(park_deadline);
                 fe(tid, FE_UNPARK, uaddr);
 
                 // Locate ourselves under this tgid (requeue never crosses tgid), and

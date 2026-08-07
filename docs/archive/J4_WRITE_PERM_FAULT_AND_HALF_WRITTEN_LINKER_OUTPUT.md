@@ -15,7 +15,7 @@ bulk of the build, distinct from C — surfaced in a fresh repro and is
 | **A** | write permission fault with no recovery path | recovery path added (`[EAGER-UPGRADE]`, fires); origin of the bad page state still unknown |
 | **B** | linker leaves a truncated/empty output, cargo execs it | **unfixed — the current blocker** |
 | **C** | a thread survives its thread group's `exit_group`, parked in `FUTEX_WAIT` forever | **root-caused and fixed** |
-| **D** | an rustc thread-group *leader* (never reaching `exit_group`) parked in `FUTEX_WAIT` almost since its own start | **reproduced with a tight, fast probe — see §7.9.** The §7.8 stress test was *positive*: the raw Condvar/barrier primitive loses an untimed wake under real SMP preemption pressure (`futextest_rs`'s 1:1 patterns do not). Root cause narrowed to a residual wake-loss window in the `schedule_blocking`/`wake_by_handle` handshake (§4a-adjacent), not yet pinned to a fix. |
+| **D** | an rustc thread-group *leader* (never reaching `exit_group`) parked in `FUTEX_WAIT` almost since its own start | **reproduced with a tight, fast probe — see §7.9.** Two mitigations (direct cross-core wake SGI, periodic revalidation of untimed waits) landed and were re-verified **not** to fix it (§7.10) — new evidence shows the wake is never *issued* on the key at all (the notifying thread never reaches `notify_all`), which no futex-layer mitigation can rescue. Still not root-caused. |
 
 This doc exists because both failures were previously reported only as "run 1 hit a
 zero-byte `rust-lld` output" and "run 2 got `SIGSEGV in clone_thread`" — two
@@ -777,6 +777,107 @@ Expect `HANG` on all 4 copies. `[FUTEX-DUMP]` (within 60 s) shows the stuck
 untimed condvar waiters; the cycling mutex waiters are the control. The guest
 helper scripts used this session are at `/tmp/repro_hog.sh`, `/tmp/narrow.sh`,
 `/tmp/stress_futex.sh` (not committed — recreate from this section).
+
+### 7.10 Two mitigations landed, neither fixes the repro (2026-08-07, next session)
+
+Two changes were left uncommitted at handoff: `wake_core` (a direct scheduler
+SGI to a woken thread's last-known core, `crates/akuma-exec/src/threading/mod.rs`
+`ThreadWaker::wake` + `src/smp_shared.rs`) and `FUTEX_REVALIDATE_US` (a periodic
+bounded re-park for untimed waits, `src/syscall/sync.rs::sys_futex`, tried at
+5 ms/50 ms/200 ms). **Both were re-verified against the exact §7.9 repro on a
+freshly rebuilt tree and neither closes it — `hangs=4` at every revalidation
+interval tried, with `wake_core` also active.** (The tree didn't even build at
+handoff — an unrelated `setitimer` patch landed in the same uncommitted diff had
+`copy_to_user_safe`'s `dst`/`src` args swapped; fixed, see §7.11.)
+
+`[FUTEX-DUMP]` after a hung run shows the revalidation safety net **is** firing
+as designed — the 4 stuck condvar waiters (`0x30338ac0` in this build) show
+`hist=uSepuSepuSepuSep`, a clean repeating **u**npark→**S**elf-remove→r**e**-enqueue→**p**ark
+cycle from the periodic re-park — but every cycle ends `p`, never `W`. Per
+[`../runbooks/debug-futex-lost-wakeup.md`](../runbooks/debug-futex-lost-wakeup.md)
+§2, "no entry for that key at all" reading: **no wake is ever issued on that key**,
+which the revalidation safety net cannot rescue by construction — it re-checks
+the futex *value*, and the value never changes because nothing ever calls
+`notify_all`. This is exactly the §7.9 point 2 hypothesis ("the thread that
+should call `notify_*` never reaches it because it is itself parked on a lost
+wake") and rules out "the mitigations just need tuning" — the fix has to be
+upstream of both `sys_futex` and the scheduler wake path, in whatever the
+*notifying* thread of each barrier is blocked on. **Next step: instrument which
+thread in each stuck process (`tid` in the same `tgid`, not shown queued on
+`0x30338ac0`) is the one due to call `notify_all`, and find what it's actually
+doing** — the `[THR-DUMP]` block for one stuck tgid this session showed 4 other
+threads per process either mid-syscall (`sc=-1` between calls) or `st=?`
+(WAITING) on the barrier's own `Mutex` word (`0x30130fa0`, healthy
+`pWuXEpWuXEp` cycle) — none of them looked obviously wedged from a single
+snapshot, so this needs the same kind of tight, repeatable probe §7.8 built,
+not another read of one dump.
+
+### 7.11 Two real, unrelated bugs fixed this session (2026-08-07)
+
+Neither touches the Failure D root cause above, but both were flagged in §7.9
+as open and are now closed:
+
+1. **Build break**: `sys_setitimer`'s old-value write (`src/syscall/time.rs`)
+   called `copy_to_user_safe(dst, src, len)` with `dst`/`src` swapped —
+   `(&raw const old).cast::<u8>()` (a `*const u8`, meant to be `src`) passed
+   where `dst: *mut u8` is expected. Didn't type-check; the tree was in this
+   state at handoff. Fixed by swapping the two arguments back.
+2. **`alarm()`/`pause()` now works** (§7.9 flagged this as broken and "worth
+   its own investigation" — it's a real, three-part bug, unrelated to the
+   scheduler/futex investigation above):
+   - `sys_ppoll` (`src/syscall/poll.rs`) short-circuited `nfds == 0` to an
+     immediate `return 0`. Linux's `ppoll(NULL, 0, timeout, sigmask)` is the
+     standard idiom musl's `pause()` compiles down to, and it's supposed to
+     *block* until the timeout or a signal — the short-circuit made `pause()`
+     return instantly instead of blocking at all.
+   - Once that was fixed to actually block, `sys_ppoll`'s loop was still
+     missing the `should_interrupt_blocking_syscall()` check that its sibling
+     `sys_epoll_pwait` already has a few functions up — so an infinite
+     `ppoll(NULL, 0, NULL, ...)` had no way to ever return: no fds means
+     `ready_count` never exceeds zero, and `infinite=true` means the timeout
+     branch never fires either. Added the same check `sys_nanosleep` and
+     `sys_epoll_pwait` already use.
+   - Even with both fixed, `alarm(3); pause();` still hung. `check_itimers`
+     (`src/syscall/time.rs`, added this session to drive `ITIMER_REAL`) pends
+     SIGALRM with plain `pend_signal_for_thread`, but `should_interrupt_
+     blocking_syscall`'s handler-aware half
+     (`current_thread_has_pending_interrupt`, `crates/akuma-exec/src/process/
+     children.rs`) deliberately does **not** treat a handler-less
+     default-disposition signal as interrupt-worthy — its own doc comment
+     explains why: `sys_tkill` is supposed to apply a fatal default action
+     *inline*, at send time, in the sender's own context, so a "merely
+     pending" default-fatal signal is assumed to mean "blocked, wait for the
+     mask to lift." `check_itimers` runs in **timer-IRQ context on whichever
+     core took the interrupt** — "current process" there is whatever got
+     interrupted, not the itimer's owner, so it structurally cannot apply the
+     fatal action inline the way `sys_tkill` does. It has to follow `sys_kill`'s
+     pattern instead: set the target's `ProcessChannel::interrupted` flag
+     (`is_current_interrupted()`, the *unconditional* first half of
+     `should_interrupt_blocking_syscall`, checked regardless of disposition)
+     so the blocking syscall gives up with `EINTR`, and let the signal's
+     actual default action apply safely at the target thread's own next
+     syscall-return dispatch (`src/exceptions.rs`, `take_pending_signal`),
+     where "current process" is correct again. But the existing
+     `interrupt_thread(tid)` helper alone wasn't sufficient either: it sets
+     the flag via `get_channel`/`PROCESS_CHANNELS[tid]`, a map populated once
+     at the *original* spawn point and never re-registered per fork/exec —
+     while what the target will actually read back is `current_channel()`,
+     which tries `Process::channel` (inherited by value through every fork,
+     so it survives arbitrarily many fork/exec generations) *first*. A
+     process a few generations removed from the original registration point
+     — e.g. anything an SSH session execs — has a populated `Process::channel`
+     but no `PROCESS_CHANNELS[tid]` entry, so `interrupt_thread` alone
+     silently no-ops. Fixed by also setting `Process::channel`'s flag
+     directly via `find_pid_by_thread` + `lookup_process_shared`. Verified
+     end-to-end in-VM: `alarm(3); pause();` now blocks ~3.1 s and is killed
+     with `Alarm clock` / exit 142, and `alarm(2)` interrupting a
+     `nanosleep`-based loop (which happened to already work, via the
+     short-sleep-then-syscall-return path rather than this one) still does.
+   - This same `PROCESS_CHANNELS`-vs-`Process::channel` divergence likely
+     affects `sys_kill`'s existing `interrupt_thread` calls too, for any
+     target process several fork/exec generations from where its channel was
+     registered — not fixed there, out of scope here, but worth knowing if
+     Ctrl-C/`kill` is ever seen not reaching a deeply-nested child.
 
 ---
 

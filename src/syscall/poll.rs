@@ -923,9 +923,14 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
 }
 
 pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 {
-    if nfds == 0 { return 0; }
+    // nfds == 0 is NOT "nothing to do, return immediately" — Linux blocks until
+    // the timeout (or forever, if timeout is NULL) or a signal, and musl's
+    // pause() is implemented as exactly `ppoll(NULL, 0, NULL, ...)`. Returning 0
+    // here made pause() (and therefore alarm()+pause()) a no-op that returned
+    // instantly instead of blocking. fds_ptr/fds_size stay unvalidated/unused
+    // below when nfds == 0, matching musl passing a NULL fds pointer.
     let fds_size = nfds * core::mem::size_of::<PollFd>();
-    if !validate_user_ptr(fds_ptr, fds_size) { return EFAULT; }
+    if nfds > 0 && !validate_user_ptr(fds_ptr, fds_size) { return EFAULT; }
 
     let infinite = timeout_ptr == 0;
     let timeout_us = if !infinite {
@@ -947,7 +952,9 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
 
     let start_time = crate::timer::uptime_us();
     let mut kernel_fds = alloc::vec![PollFd { fd: 0, events: 0, revents: 0 }; nfds];
-    if unsafe { copy_from_user_safe(kernel_fds.as_mut_ptr().cast::<u8>(), fds_ptr as *const u8, fds_size).is_err() } {
+    if nfds > 0
+        && unsafe { copy_from_user_safe(kernel_fds.as_mut_ptr().cast::<u8>(), fds_ptr as *const u8, fds_size).is_err() }
+    {
         return EFAULT;
     }
 
@@ -997,7 +1004,9 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
         }
 
         if ready_count > 0 {
-            if unsafe { copy_to_user_safe(fds_ptr as *mut u8, kernel_fds.as_ptr().cast::<u8>(), fds_size).is_err() } {
+            if nfds > 0
+                && unsafe { copy_to_user_safe(fds_ptr as *mut u8, kernel_fds.as_ptr().cast::<u8>(), fds_size).is_err() }
+            {
                 return EFAULT;
             }
             return ready_count as u64;
@@ -1005,6 +1014,16 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
 
         if !infinite && (crate::timer::uptime_us() - start_time) >= timeout_us {
             return 0;
+        }
+
+        // Without this, a pending signal (e.g. SIGALRM from setitimer/alarm())
+        // just wakes schedule_blocking below, finds nothing ready, and goes
+        // right back to sleep — the signal is never delivered because nothing
+        // ever returns to the syscall-return path that dispatches it. This is
+        // the same check sys_epoll_pwait makes above; ppoll was missing it,
+        // which made alarm()+pause() hang instead of interrupting.
+        if akuma_exec::process::should_interrupt_blocking_syscall() {
+            return EINTR;
         }
 
         let abs_deadline = if infinite { u64::MAX } else { start_time + timeout_us };

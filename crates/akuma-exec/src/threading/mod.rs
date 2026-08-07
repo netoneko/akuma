@@ -3337,15 +3337,17 @@ impl ThreadWaker {
                 }
                 // Trigger SGI to ensure scheduler runs and picks up the thread
                 (runtime().trigger_sgi)(0);
-                // NOTE: cross-core wakeup (`runtime().wake_remote_idle()`) is deliberately
-                // NOT fired here. Under the Big Kernel Lock, ringing an idle peer on every
-                // wake just makes it spin on the BKL (it can't enter the kernel until this
-                // waker releases it anyway), which measured a ~40x jump in lock-contention
-                // spins for no real latency win. The mechanism is kept (idle-core mask +
-                // `wake_remote_idle`) and becomes worthwhile once the BKL is split into
-                // fine-grained locks (M5). Woken threads still run promptly: the waker's
-                // own core reschedules (self-SGI above), and remote cores pick them up on
-                // the next ~10 ms tick.
+                // Under real shared-kernel SMP, also nudge the woken thread's last-known
+                // core directly so its scheduler picks up the READY thread within this
+                // SGI's latency rather than waiting for the ~10 ms timer tick. Without
+                // this, a cross-core wake relies on the target core's timer tick to
+                // notice the READY thread, which under heavy POOL contention can be
+                // delayed by many ticks — long enough for a barrier/condvar round to
+                // stall until the futex revalidation timeout rescues it.
+                let last_core = LAST_CORE[tid].load(Ordering::Relaxed);
+                if last_core != 0xFF {
+                    (runtime().wake_core)(last_core);
+                }
             }
         }
     }

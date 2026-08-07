@@ -43,6 +43,7 @@ mod timerfd;
 pub use sync::futex_wake;
 pub use sync::futex_purge_tid;
 pub use sync::futex_dump;
+pub use time::check_itimers;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 pub use sync::futex_do_wake;
 /// Futex waiter-table hooks for `process_tests::test_futex_table_irq_masked_requeue`.
@@ -913,9 +914,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::PREAD64 => fs::sys_pread64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
         nr::PWRITE64 => fs::sys_pwrite64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
         nr::SETITIMER => {
-            crate::tprint!(128, "[stub] setitimer(which={}, new_value={:#x}, old_value={:#x})\n",
-                args[0], args[1], args[2]);
-            0
+            time::sys_setitimer(args[0] as u32, args[1], args[2])
         }
         nr::MEMBARRIER => mem::membarrier_cmd(args[0] as u32),
         nr::PRCTL => proc::sys_prctl(args[0] as i32, args[1], args[2], args[3], args[4]),

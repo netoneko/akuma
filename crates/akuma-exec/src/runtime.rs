@@ -100,6 +100,10 @@ pub struct ExecRuntime {
     // thread runs there promptly instead of waiting for that core's next timer tick.
     // No-op on single-core / non-SMP builds.
     pub wake_remote_idle: fn(),
+    // Real shared-kernel SMP: send a scheduler SGI to a specific core (the woken
+    // thread's last-known core) so its scheduler picks up the just-READY thread
+    // without waiting for the ~10 ms timer tick. No-op on single-core / non-SMP.
+    pub wake_core: fn(u8),
 
     // PMM
     pub alloc_page_zeroed: fn() -> Option<PhysFrame>,

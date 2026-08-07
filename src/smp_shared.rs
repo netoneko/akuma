@@ -472,6 +472,18 @@ pub fn wake_remote_idle() {
     crate::gic::trigger_sgi_core(target, SCHED_SGI);
 }
 
+/// Send a scheduler SGI to a specific core so its scheduler picks up a just-woken
+/// READY thread without waiting for the ~10 ms timer tick. Called from
+/// `ThreadWaker::wake` via the `wake_core` runtime hook. Best-effort: a race that
+/// finds the core already processing an SGI just falls back to the timer tick.
+pub fn wake_core(core_id: u8) {
+    let self_aff0 = (read_mpidr() & 0xff) as u8;
+    if core_id == self_aff0 || core_id == 0xFF {
+        return; // self-SGI already fired by trigger_sgi; or no last-known core
+    }
+    crate::gic::trigger_sgi_core(core_id as u32, SCHED_SGI);
+}
+
 unsafe extern "C" {
     /// The secondary trampoline (asm, `.text.boot`, defined below). Taking its
     /// address gives the identity-mapped PA to hand PSCI `CPU_ON` as the entry point.
