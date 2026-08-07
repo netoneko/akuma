@@ -4191,10 +4191,11 @@ pub fn current_trap_frame_elr() -> Option<u64> {
 /// Used by the heartbeat to locate where parked threads are stuck during a hang,
 /// without needing SSH (which can itself wedge). Compact, allocation-free.
 ///
-/// The printed `elr=` is `Context.elr`, which is STALE for any ordinary thread
-/// past its first switch — see `get_saved_kernel_resume`'s doc comment and
+/// The printed `elr=` is the live `ELR_EL1` read out of the thread's saved IRQ
+/// frame at `Context.sp + 240` (see `get_saved_kernel_resume`'s doc comment and
 /// docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §7.14 for
-/// why, and where the live value actually is (`Context.sp + 240`).
+/// why `Context.elr` itself is dead after thread creation). Prints 0 if the
+/// thread has never been switched out via the IRQ path yet (`Context.sp == 0`).
 pub fn dump_thread_resume_points() {
     safe_print!(16, "[THR-DUMP]\n");
     for tid in 0..MAX_THREADS {
@@ -4202,7 +4203,14 @@ pub fn dump_thread_resume_points() {
         if st == thread_state::FREE { continue; }
         let elr = {
             let ctx = unsafe { &*get_context(tid) };
-            ctx.elr
+            if ctx.sp == 0 {
+                0
+            } else {
+                // SAFETY: Context.sp points at the 832-byte IRQ trap frame this
+                // thread was last switched out from (src/exceptions.rs:266-278);
+                // ELR_EL1 lives at offset +240 in that frame.
+                unsafe { core::ptr::read_volatile((ctx.sp as usize + 240) as *const u64) }
+            }
         };
         let stc = match st {
             x if x == thread_state::READY => 'r',
@@ -4256,10 +4264,10 @@ pub fn dump_thread_resume_points() {
 }
 
 /// Debug: saved kernel resume point of a context-switched-out thread, as
-/// `(x30 /* saved LR */, elr, sp)`.
+/// `(x30 /* dead field, see below */, live_elr, sp)`.
 ///
-/// **STALE as of 2026-08-07 (docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md
-/// §7.14): `x30`/`elr` do NOT reflect where a switched-out thread will resume.**
+/// **`Context.x30`/`.elr` are dead fields after thread creation**
+/// (docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §7.14).
 /// `sgi_scheduler_handler_with_sp` (the only switch path, voluntary or
 /// involuntary) writes just `.sp`/`.ttbr0` into `Context` on every switch — never
 /// `.elr`/`.x30`. For an ordinary `clone_thread` worker those two fields are set
@@ -4267,15 +4275,27 @@ pub fn dump_thread_resume_points() {
 /// switch has somewhere to land) and never touched again. The real, live register
 /// state — including the actual current `ELR_EL1` — lives on the thread's own
 /// kernel stack, in the IRQ frame `.sp` points to (`src/exceptions.rs:266-278`:
-/// `ELR` at `sp+240`, `SPSR` at `sp+248`). Read that instead of `.elr` if you need
-/// where a stuck thread actually is. Returns None for out-of-range ids.
+/// `ELR` at `sp+240`, `SPSR` at `sp+248`). The `live_elr` returned here is read
+/// from that frame, not from `Context.elr`. `x30` is still the dead, creation-time
+/// value — kept in the tuple for callers that want it, but don't read it as a
+/// resume point. Returns `live_elr == 0` if the thread has never been switched
+/// out via the IRQ path yet (`Context.sp == 0`). Returns `None` for out-of-range
+/// ids.
 pub fn get_saved_kernel_resume(thread_id: usize) -> Option<(u64, u64, u64)> {
     if thread_id >= MAX_THREADS {
         return None;
     }
     with_irqs_disabled(|| {
         let ctx = unsafe { &*get_context(thread_id) };
-        Some((ctx.x30, ctx.elr, ctx.sp))
+        let live_elr = if ctx.sp == 0 {
+            0
+        } else {
+            // SAFETY: Context.sp points at the 832-byte IRQ trap frame this
+            // thread was last switched out from (src/exceptions.rs:266-278);
+            // ELR_EL1 lives at offset +240 in that frame.
+            unsafe { core::ptr::read_volatile((ctx.sp as usize + 240) as *const u64) }
+        };
+        Some((ctx.x30, live_elr, ctx.sp))
     })
 }
 

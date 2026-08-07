@@ -1180,6 +1180,98 @@ rebuild+reboot+repro cycle to verify against a live hang, and this session's
 budget was already spent confirming the *cause* of the staleness rather than
 shipping the fix.
 
+### 7.15 The `elr=` fix landed and verified live — threads are moving, none caught inside `notify_all` (2026-08-07, next session)
+
+Made the fix §7.14 specified: `dump_thread_resume_points` and
+`get_saved_kernel_resume` (`crates/akuma-exec/src/threading/mod.rs`, ~4198 and
+~4284) now read `*(u64*)(Context.sp + 240)` (guarded: `0` if `Context.sp == 0`,
+i.e. never yet switched out via the IRQ path) instead of the dead
+`Context.elr`. Rebuilt (`release-smp-shared` + `devbox-smoltcp,no-tests`),
+booted fresh on `disk_selfhost_fixtest.img`, re-ran the exact §7.9/§7.12 repro
+(4× `jobserver_stress barrier`, `JS_BARRIER_THREADS=4 JS_BARRIER_ROUNDS=8000
+JS_TIMEOUT_SECS=90`, + 4 CPU hogs, `SMP=4 MEMORY=4096`).
+
+**The fix works as designed.** `elr=` values are no longer a single frozen
+`__clone+0x20` — they're varied, and symbolize to real, distinct functions
+(`aarch64-elf-addr2line -f -e target/.../akuma <addr>`):
+
+| `elr=` | Symbol | Meaning |
+| --- | --- | --- |
+| `0x40136c5c` | `gic::trigger_sgi_self` | voluntary yield into `schedule_blocking` — the common "genuinely parked" PC |
+| `0x401ba81c` | `secondary_shared_start` | idle-core spin loop (tid 1–3) |
+| `0x4012a13c` | `rust_sync_el0_handler` | mid syscall-entry dispatch |
+| `0x401a74f4` / `0x401a64e8` | `handle_syscall` | mid generic syscall dispatch |
+| `0x4021ecb4` | `akuma_exec::process::children::read_current_pid` | mid a kernel helper call, not a wait primitive at all |
+
+Reproduced the hang cleanly (`[FUTEX-DUMP]` showed the identical §7.9/§7.12
+signature: `tid=16,17,18,19` — one per `tgid` 42–45 — parked on
+`uaddr=0x3053cac0 a1=0x80`, `hist=uSepuSepuSep...`, `queued_for` climbing past
+140 s). Two `[THR-DUMP]` snapshots were captured 30 s apart (T210 and T240) for
+the same tids while the hang was in progress, to test the fix's real
+discriminating power — a frozen PC across both samples means genuinely stuck,
+a changed PC means real forward progress:
+
+- **The four `[FUTEX-DUMP]`-named waiters (`tid=16,17,18,19`) showed
+  `elr=0x40136c5c` (`trigger_sgi_self`) in *both* samples, unchanged.** This
+  independently corroborates `[FUTEX-DUMP]`'s own bookkeeping via a completely
+  different mechanism (a raw memory read of the saved IRQ frame, not the futex
+  table): these threads really are sitting in the ordinary voluntary-park path,
+  not lying dormant somewhere else. Not a new fact, but the first time it's
+  been confirmed by something other than the futex subsystem's own accounting.
+- **Other threads in the same `tgid`s moved between the two samples** — e.g.
+  `tid=30` (`tgid=44`) went `rust_sync_el0_handler` → `handle_syscall`;
+  `tid=33` (`tgid=45`) went `trigger_sgi_self` → `read_current_pid`; `tid=22`
+  (`tgid=42`) went from mid a timed `FUTEX_WAIT_BITSET` on the barrier's own
+  Mutex word (`0x10070f58`, `tsc=98`) to fully back in userspace (`tsc=-1`,
+  `sc=-1`, state `R`, no live syscall at all). These are real state
+  transitions, not sampling noise — direct confirmation (via a third,
+  independent mechanism, after §7.12's `last_core=`/`cpu_us=` and §7.13's GDB
+  cross-check) that participant threads in a hung barrier process are not
+  wedged as a group. Only the specific thread each `[FUTEX-DUMP]` key names is
+  actually stuck; its siblings keep working (contending for the Mutex,
+  re-entering syscalls, returning to userspace) around it.
+- **No sample caught any thread's live PC inside `Condvar::notify_all` /
+  `pthread_cond_broadcast` / the barrier's leader branch, or inside
+  `sys_futex`'s `FUTEX_WAKE` arm.** Expected from only two 30-second-spaced
+  snapshots against what should be a fast call — this doesn't rule that thread
+  out, it just means point-in-time sampling is the wrong tool to catch it. The
+  §7.12 next-steps item 2 (a kernel-side tripwire logging `FUTEX_WAKE` *entry*,
+  not just its existing completion-only trace) is still the right instrument
+  for this, and is now more clearly the next step than reading more `elr=`
+  snapshots would be.
+
+**A separate, unplanned finding, not investigated:** all 4 probe processes
+this run also logged a single spawned-thread panic each (different `tid` each
+time: 20, 21, 11, 32) — `` thread '<unnamed>' (N) panicked ... assertion `left
+== right` failed: left: 38, right: 4 `` at `library/std/src/sys/thread/
+unix.rs:581:17` of the in-guest `/usr/bin/rustc`'s bundled std (commit
+`31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd` — did not match either locally
+installed host toolchain's `unix.rs:581`, which is unrelated code in both, so
+the line can't be resolved without that exact std source). Did **not** affect
+the outcome: a panic in a non-main spawned thread only kills that thread by
+Rust's default unwind semantics, and `[FUTEX-DUMP]` still showed the barrier
+threads parked normally throughout. All 4 processes still self-terminated
+correctly at `T294.77`–`T294.99` via `code=-14` (`SIGALRM`,
+`JS_TIMEOUT_SECS=90`) — an independent re-confirmation that §7.11's
+`alarm()`/`SIGALRM` fix still holds under this exact repro. Flagged so a
+future session recognizes the panic message and doesn't mistake it for part of
+the barrier bug; not chased further (this session compiled the probe
+**in-guest**, per the method notes, which pulled in whatever std the disk
+image's `/usr/bin/rustc` bundles — not necessarily the same std a host
+cross-compile would link, so this may be specific to that toolchain and not
+reproducible via the host cross-compile path prior sessions used).
+
+**Net effect on the root-cause search:** narrows further, doesn't close it.
+"Some thread is stuck somewhere unexpected" and "the whole process is wedged"
+are now both ruled out by direct, trustworthy PC evidence — only the specific
+condvar-waiting thread per process is actually parked; everyone else is live.
+The remaining candidates are exactly §7.12's numbered list: (1) the
+arrival-count increment lost under contention, or (2) a `notify_all` call
+entered but never completing inside the kernel. Point-in-time `elr=` sampling,
+now trustworthy, has done what it can — next session should build the
+`sys_futex` `FUTEX_WAKE`-entry tripwire (§7.12 item 2) rather than take more
+snapshots.
+
 ---
 
 ## 8. Instrumentation added for Failure B, this session (2026-08-07, uncommitted)
