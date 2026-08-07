@@ -260,6 +260,56 @@ pub(super) fn sys_nanosleep(a0: u64, a1: u64) -> u64 {
     }
 }
 
+/// `clock_nanosleep(2)`. Missing entirely until 2026-08-07
+/// (`docs/archive/THREAD_SLEEP_MISSING_CLOCK_NANOSLEEP.md`): every unimplemented
+/// syscall falls through to the generic `ENOSYS` handler, and `std::thread::sleep`
+/// on any `target_os = "linux"` build calls this syscall specifically (not plain
+/// `nanosleep`) — so every `thread::sleep()` call, on any thread, panicked instead
+/// of sleeping. Modeled directly on [`sys_nanosleep`], plus `clockid`/`TIMER_ABSTIME`
+/// handling to cover the full POSIX contract, not just std's relative-sleep case.
+///
+/// Returns the ordinary Linux syscall convention (0 / `-errno`) — the POSIX
+/// library function's unusual "return the positive error number" contract is a
+/// userspace libc wrapper detail (musl negates the raw syscall's `-errno` back to
+/// positive), not something this syscall itself needs to implement.
+pub(super) fn sys_clock_nanosleep(clock_id: u32, flags: i32, request_ptr: u64, remain_ptr: u64) -> u64 {
+    const TIMER_ABSTIME: i32 = 1;
+    let _ = remain_ptr; // Linux only fills this on an interrupted *relative* sleep; sys_nanosleep doesn't either.
+
+    if !validate_user_ptr(request_ptr, 16) { return EFAULT; }
+    let mut ts = LocalTimespec::default();
+    if unsafe { copy_from_user_safe((&raw mut ts).cast::<u8>(), request_ptr as *const u8, 16).is_err() } {
+        return EFAULT;
+    }
+    let req_us = (ts.tv_sec.saturating_mul(1_000_000)).saturating_add(ts.tv_nsec / 1_000);
+
+    let deadline = if flags & TIMER_ABSTIME != 0 {
+        // Absolute deadline in `clock_id`'s own time base. Mirrors `sys_clock_gettime`'s
+        // clock_id==0 (CLOCK_REALTIME) vs everything-else (uptime-based) split, and
+        // `sys_futex`'s FUTEX_CLOCK_REALTIME absolute-deadline conversion in
+        // `src/syscall/sync.rs` — same wall-clock-to-uptime math, different caller.
+        if clock_id == 0 {
+            match crate::timer::utc_time_us() {
+                Some(utc_now) if req_us > utc_now => crate::timer::uptime_us() + (req_us - utc_now),
+                Some(_) => crate::timer::uptime_us(), // already past -> immediate return
+                None => req_us,
+            }
+        } else {
+            req_us
+        }
+    } else {
+        // Relative sleep, same as plain nanosleep.
+        if req_us == 0 { return 0; }
+        crate::timer::uptime_us().saturating_add(req_us)
+    };
+
+    loop {
+        if crate::timer::uptime_us() >= deadline { return 0; }
+        if akuma_exec::process::should_interrupt_blocking_syscall() { return EINTR; }
+        akuma_exec::threading::schedule_blocking(deadline);
+    }
+}
+
 pub(super) fn sys_times(buf_ptr: usize) -> u64 {
     if buf_ptr != 0 {
         const TMS_SIZE: usize = 32;

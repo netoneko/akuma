@@ -274,53 +274,44 @@ impl InstrBarrier {
         }
         self.rounds_total.fetch_add(1, Ordering::Relaxed);
     }
-
-    fn dump(&self, cur_rounds: u64, stuck_ms: u64) {
-        let mut line = format!(
-            "[barrier-instr] STUCK stuck_for_ms={} rounds_total={} shadow_count={} shadow_gen={} last_notify_tid={} last_notify_round={}",
-            stuck_ms, cur_rounds,
-            self.shadow_count.load(Ordering::Relaxed),
-            self.shadow_gen.load(Ordering::Relaxed),
-            self.last_notify_tid.load(Ordering::Relaxed),
-            self.last_notify_round.load(Ordering::Relaxed),
-        );
-        mark(&line);
-        line.clear();
-        let now = self.now_ms();
-        for i in 0..self.n as usize {
-            let s = self.step[i].load(Ordering::Relaxed);
-            let ts = self.step_ts_ms[i].load(Ordering::Relaxed);
-            let tid = self.thread_tid[i].load(Ordering::Relaxed);
-            mark(&format!(
-                "[barrier-instr]   idx={} tid={} step={} step_age_ms={}",
-                i, tid, s, now.saturating_sub(ts)
-            ));
-        }
-    }
 }
 
+extern "C" {
+    fn getpid() -> i32;
+    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn open(path: *const u8, flags: i32, mode: u32) -> i32;
+}
+
+// §7.12 found the original stall-gated watchdog an unreliable narrator: its
+// `[barrier-instr] STUCK` dump never fired even across an 800+ second hang.
+// §7.17 found why: `thread::sleep` (the only non-futex primitive the watchdog's
+// poll loop used) panicked on its very first call, every run, because
+// `clock_nanosleep` was an unimplemented syscall — the watchdog thread died
+// silently before ever reaching its own dump logic. Now fixed upstream (kernel),
+// but this watchdog is kept on its own dedicated fd + raw `libc::write()`
+// (bypassing `io::Stdout`) anyway: it's a cheap way to sidestep `sys_write`'s
+// shared-fd position race too (§7.15/CONCURRENT_WRITE_POSITION_RACE.md),
+// whether or not a given build has that fix.
 fn spawn_barrier_watchdog(bar: Arc<InstrBarrier>, done: Arc<AtomicBool>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let poll_ms: u64 = 200;
-        let mut last_rounds = 0u64;
-        let mut stuck_ms: u64 = 0;
-        let mut last_dump_ms: u64 = 0;
+        let pid = unsafe { getpid() };
+        let path = format!("/root/wd_{}.log\0", pid);
+        let fd = unsafe { open(path.as_ptr(), 0o1101 /* O_WRONLY|O_CREAT|O_TRUNC */, 0o666) };
+        let poll_ms: u64 = 1000;
         loop {
             thread::sleep(Duration::from_millis(poll_ms));
             if done.load(Ordering::Acquire) { return; }
-            let cur = bar.rounds_total.load(Ordering::Relaxed);
-            if cur == last_rounds {
-                stuck_ms += poll_ms;
-            } else {
-                stuck_ms = 0;
-                last_dump_ms = 0;
-                last_rounds = cur;
-            }
-            // First dump at 2s stuck, then every 2s thereafter — enough resolution to
-            // see a step change without flooding the console under -j4 log volume.
-            if stuck_ms >= 2000 && stuck_ms.saturating_sub(last_dump_ms) >= 2000 {
-                bar.dump(cur, stuck_ms);
-                last_dump_ms = stuck_ms;
+            let line = format!(
+                "t={} rounds_total={} shadow_count={} shadow_gen={} last_notify_tid={} last_notify_round={}\n",
+                bar.now_ms(),
+                bar.rounds_total.load(Ordering::Relaxed),
+                bar.shadow_count.load(Ordering::Relaxed),
+                bar.shadow_gen.load(Ordering::Relaxed),
+                bar.last_notify_tid.load(Ordering::Relaxed),
+                bar.last_notify_round.load(Ordering::Relaxed),
+            );
+            if fd >= 0 {
+                unsafe { write(fd, line.as_ptr(), line.len()) };
             }
         }
     })
@@ -330,7 +321,15 @@ fn phase_barrier(threads: u64, rounds: u64) {
     mark(&format!("[barrier] start threads={} rounds={}", threads, rounds));
     let bar = Arc::new(InstrBarrier::new(threads));
     let done = Arc::new(AtomicBool::new(false));
-    let watchdog = spawn_barrier_watchdog(bar.clone(), done.clone());
+    // JS_NO_WATCHDOG: A/B control for the 2026-08-07 clock_nanosleep fix — isolates
+    // whether the fix itself (or the watchdog's own periodic real-timer wake
+    // activity, which could perturb SMP scheduling enough to dodge the hang
+    // incidentally) is what makes the hang stop reproducing.
+    let watchdog = if env_or("JS_NO_WATCHDOG", 0) == 0 {
+        Some(spawn_barrier_watchdog(bar.clone(), done.clone()))
+    } else {
+        None
+    };
     let mut hs = Vec::new();
     for idx in 0..threads as usize {
         let b = bar.clone();
@@ -341,7 +340,7 @@ fn phase_barrier(threads: u64, rounds: u64) {
     }
     for h in hs { h.join().unwrap(); }
     done.store(true, Ordering::Release);
-    let _ = watchdog.join();
+    if let Some(w) = watchdog { let _ = w.join(); }
     mark("[barrier] ok");
 }
 

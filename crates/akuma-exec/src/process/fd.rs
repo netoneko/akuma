@@ -80,6 +80,47 @@ impl SharedFdTable {
         }
     }
 
+    /// Atomically reserve `count` bytes of file position on a plain (non-`O_APPEND`)
+    /// `File` fd and return the reservation's starting offset — i.e. read the current
+    /// position and advance it past the reservation in one lock hold, instead of two
+    /// separate ones with disk I/O in between.
+    ///
+    /// `sys_write` used to read `.position` via [`Process::get_fd`] (a clone of the
+    /// table entry), perform the actual disk write using that snapshot, and only
+    /// write the new position back afterward via [`Process::update_fd`]. Both of
+    /// those individual steps are lock-protected, but the *sequence* is not: two
+    /// threads sharing this fd (`CLONE_FILES`, e.g. any pair of `clone_thread`
+    /// siblings) racing `write()` could both clone the same not-yet-advanced
+    /// `.position`, both write to the same on-disk offset, and corrupt each other's
+    /// data — reproduced directly with a raw multi-thread `write()` probe (no
+    /// userspace locking involved, so the race is entirely in this gap). See
+    /// `docs/archive/CONCURRENT_WRITE_POSITION_RACE.md`. Returns `None` for a
+    /// non-`File` fd, a missing fd, or an `O_APPEND` fd (append's position is
+    /// derived from the live file size per write, a separate, pre-existing race
+    /// this does not address — see the call site).
+    ///
+    /// Once reserved, the range belongs to this call alone: even a short/failed
+    /// write must never move `.position` backward to "give back" the unused tail,
+    /// since a concurrent writer may already have reserved past it — the correct
+    /// on-disk result of a partial write here is a sparse hole, not a rewound
+    /// position that reopens this exact race. [`reserve_write_pos_tests`] covers
+    /// both the single-caller and the concurrent-callers case directly.
+    pub fn reserve_write_pos(&self, fd: u32, count: usize) -> Option<usize> {
+        with_irqs_disabled(|| {
+            let mut table = self.table.lock();
+            match table.get_mut(&fd) {
+                Some(FileDescriptor::File(file))
+                    if file.flags & crate::process::types::open_flags::O_APPEND == 0 =>
+                {
+                    let pos = file.position;
+                    file.position = pos.saturating_add(count);
+                    Some(pos)
+                }
+                _ => None,
+            }
+        })
+    }
+
     /// Explicitly close all underlying kernel resources and clear the table.
     /// This is used during process exit to ensure immediate cleanup.
     pub fn close_all(&self) {
@@ -202,43 +243,10 @@ impl Process {
         })
     }
 
-    /// Atomically reserve `count` bytes of file position on a plain (non-`O_APPEND`)
-    /// `File` fd and return the reservation's starting offset — i.e. read the current
-    /// position and advance it past the reservation in one lock hold, instead of two
-    /// separate ones with disk I/O in between.
-    ///
-    /// `sys_write` used to read `.position` via [`Process::get_fd`] (a clone of the
-    /// table entry), perform the actual disk write using that snapshot, and only
-    /// write the new position back afterward via [`Process::update_fd`]. Both of
-    /// those individual steps are lock-protected, but the *sequence* is not: two
-    /// threads sharing this fd (`CLONE_FILES`, e.g. any pair of `clone_thread`
-    /// siblings) racing `write()` could both clone the same not-yet-advanced
-    /// `.position`, both write to the same on-disk offset, and corrupt each other's
-    /// data — reproduced directly with a raw multi-thread `write()` probe (no
-    /// userspace locking involved, so the race is entirely in this gap). Returns
-    /// `None` for a non-`File` fd, a missing fd, or an `O_APPEND` fd (append's
-    /// position is derived from the live file size per write, a separate,
-    /// pre-existing race this does not address — see the call site).
-    ///
-    /// Once reserved, the range belongs to this call alone: even a short/failed
-    /// write must never move `.position` backward to "give back" the unused tail,
-    /// since a concurrent writer may already have reserved past it — the correct
-    /// on-disk result of a partial write here is a sparse hole, not a rewound
-    /// position that reopens this exact race.
+    /// See [`SharedFdTable::reserve_write_pos`] — thin delegator so `sys_write` can
+    /// call it the same way it calls every other per-fd `Process` method.
     pub fn reserve_write_pos(&self, fd: u32, count: usize) -> Option<usize> {
-        with_irqs_disabled(|| {
-            let mut table = self.fds.table.lock();
-            match table.get_mut(&fd) {
-                Some(FileDescriptor::File(file))
-                    if file.flags & crate::process::types::open_flags::O_APPEND == 0 =>
-                {
-                    let pos = file.position;
-                    file.position = pos.saturating_add(count);
-                    Some(pos)
-                }
-                _ => None,
-            }
-        })
+        self.fds.reserve_write_pos(fd, count)
     }
 
     pub fn set_cloexec(&self, fd: u32) {
@@ -296,5 +304,119 @@ impl Process {
     /// Get a reference to the shared fd table (for direct access in sys_close_range, etc.)
     pub fn fd_table(&self) -> &Arc<SharedFdTable> {
         &self.fds
+    }
+}
+
+/// Regression coverage for `docs/archive/CONCURRENT_WRITE_POSITION_RACE.md` — the
+/// TOCTOU race where `sys_write` used to read `.position` from a `get_fd()` clone,
+/// do the disk write, and only write the advanced position back afterward, letting
+/// two threads racing `write()` on the same fd both read the same stale position
+/// and overlap on disk. `reserve_write_pos` closes it by making read-and-advance one
+/// locked operation; these tests exercise that directly against `SharedFdTable`; the
+/// bug itself was only ever observable end-to-end (bytes on disk), so a raw
+/// multi-thread `write()` reproduction lives in that doc, not here — this covers the
+/// reservation *logic* the fix actually changed.
+#[cfg(test)]
+mod reserve_write_pos_tests {
+    use super::*;
+    use crate::process::types::{KernelFile, open_flags};
+
+    fn table_with_file(fd: u32, flags: u32) -> SharedFdTable {
+        let t = SharedFdTable::new();
+        t.table.lock().insert(fd, FileDescriptor::File(KernelFile::new("/x".into(), flags)));
+        t
+    }
+
+    #[test]
+    fn sequential_reservations_never_overlap() {
+        let t = table_with_file(3, open_flags::O_WRONLY);
+        // Three single-threaded reservations of different sizes must tile the file
+        // exactly: each one starts where the last one ended, with no gap and no
+        // overlap — the property the old clone-then-write-back sequence could
+        // violate under concurrency, verified here in the simple non-racing case.
+        assert_eq!(t.reserve_write_pos(3, 10), Some(0));
+        assert_eq!(t.reserve_write_pos(3, 25), Some(10));
+        assert_eq!(t.reserve_write_pos(3, 1), Some(35));
+        assert_eq!(t.table.lock().get(&3).map(|e| match e {
+            FileDescriptor::File(f) => f.position,
+            _ => unreachable!(),
+        }), Some(36));
+    }
+
+    #[test]
+    fn append_fd_is_left_to_the_caller() {
+        // O_APPEND is explicitly out of scope (its position comes from a live
+        // file-size query, not `.position` — see the doc comment); the reservation
+        // must refuse rather than silently do the wrong thing for it.
+        let t = table_with_file(4, open_flags::O_WRONLY | open_flags::O_APPEND);
+        assert_eq!(t.reserve_write_pos(4, 100), None);
+    }
+
+    #[test]
+    fn missing_or_non_file_fd_returns_none() {
+        let t = SharedFdTable::new(); // fd 5 was never inserted
+        assert_eq!(t.reserve_write_pos(5, 10), None);
+        t.table.lock().insert(6, FileDescriptor::Stdout);
+        assert_eq!(t.reserve_write_pos(6, 10), None);
+    }
+
+    #[test]
+    fn zero_length_reservation_is_a_true_no_op() {
+        let t = table_with_file(7, open_flags::O_WRONLY);
+        assert_eq!(t.reserve_write_pos(7, 0), Some(0));
+        assert_eq!(t.reserve_write_pos(7, 0), Some(0)); // position did not move
+        assert_eq!(t.reserve_write_pos(7, 5), Some(0));
+    }
+
+    /// The actual regression test: hammer one fd with many concurrent, real
+    /// `std::thread`s each reserving a fixed-size chunk with no coordination
+    /// beyond `reserve_write_pos` itself, and prove the reserved ranges tile the
+    /// file perfectly — no two threads ever got an overlapping offset, and no
+    /// byte range was skipped. This is exactly the invariant whose absence let
+    /// `sys_write` corrupt concurrent writers' data before the fix: before it,
+    /// the equivalent "read position, unlock, do work, relock, write position"
+    /// sequence would have produced duplicate/overlapping starting offsets under
+    /// this same contention.
+    #[test]
+    fn concurrent_reservations_tile_without_overlap() {
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        const THREADS: usize = 16;
+        const RESERVES_PER_THREAD: usize = 500;
+        const CHUNK: usize = 17; // odd size so a miscomputed overlap isn't hidden by alignment
+
+        let table = StdArc::new(table_with_file(1, open_flags::O_WRONLY));
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let table = StdArc::clone(&table);
+            handles.push(thread::spawn(move || {
+                let mut starts = alloc::vec::Vec::with_capacity(RESERVES_PER_THREAD);
+                for _ in 0..RESERVES_PER_THREAD {
+                    starts.push(table.reserve_write_pos(1, CHUNK).expect("fd 1 is a plain File"));
+                }
+                starts
+            }));
+        }
+
+        let mut all_starts: alloc::vec::Vec<usize> =
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        all_starts.sort_unstable();
+
+        // Every reserved range is CHUNK bytes wide; sorted starts must be an exact
+        // arithmetic progression with no repeats (overlap) and no gaps (a lost
+        // reservation — e.g. two threads both getting the same start would also
+        // show up here as a repeat, and a dropped final `file.position` write
+        // would show up as a gap at the very end).
+        let total = THREADS * RESERVES_PER_THREAD;
+        assert_eq!(all_starts.len(), total);
+        for (i, &start) in all_starts.iter().enumerate() {
+            assert_eq!(start, i * CHUNK, "reservation {} did not tile exactly — overlap or gap", i);
+        }
+        let final_pos = table.table.lock().get(&1).map(|e| match e {
+            FileDescriptor::File(f) => f.position,
+            _ => unreachable!(),
+        });
+        assert_eq!(final_pos, Some(total * CHUNK));
     }
 }

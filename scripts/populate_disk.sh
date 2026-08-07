@@ -249,6 +249,22 @@ if [ -z "$OVERLAY_DIR" ]; then
                 ln -sf $BB /mnt/disk/bin/$cmd 2>/dev/null || true
             done
             echo "Created busybox symlinks -> $BB"
+
+            # Full applet set by default (not just --full-busybox): every prior
+            # session that used this disk without --full-busybox hit missing
+            # `sleep`/`ps`/`wc`/`md5sum`/etc — real time lost to `busybox <applet>`
+            # workarounds discovered one command at a time over SSH. busybox'"'"'s own
+            # `--install -s` does exactly what the FULL_BUSYBOX_CMD block below
+            # hand-curates, using the binary'"'"'s actual applet list instead of a
+            # maintained-by-hand one, so make it the default. Never clobbers a real
+            # shipped binary (git->scratch, vi->neatvi, tcc, curl, ...): busybox
+            # itself skips an existing non-symlink target the same way the curated
+            # loop below does. `-s` for symlinks, matching every other link this
+            # script creates (a hardlink set would silently diverge if $BB is ever
+            # replaced without re-running populate).
+            /mnt/disk/bin/$BB --install -s /mnt/disk/bin 2>/dev/null \
+                && echo "Installed full busybox applet set -> $BB (--install -s)" \
+                || echo "WARN: busybox --install failed; only the essential symlinks above exist (pass --full-busybox for the curated fallback list)"
         else
             echo "WARN: no busybox binary on disk; skipping essential busybox symlinks"
         fi

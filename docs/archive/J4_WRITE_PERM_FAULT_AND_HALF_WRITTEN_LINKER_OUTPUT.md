@@ -1377,6 +1377,133 @@ cycles, but perhaps *starving* one specific thread — the barrier's would-be
 FIFO-ordering or fairness violation in the mutex's own wake sequence, not as
 a "no wake issued" signature at all.
 
+### 7.17 `std::thread::sleep()` has never worked on this kernel — found while building the §7.16 instrument, not the barrier bug itself, but it explains why every watchdog in this investigation has been silently dying (2026-08-07, same session)
+
+Went to build the §7.16-item-(a) instrument — read `InstrBarrier`'s
+`shadow_count`/`shadow_gen` live during a hang, via a more robust watchdog
+thread (unconditional dump, its own dedicated fd, a raw `libc::write()`
+bypassing `io::Stdout` entirely — removing every point of doubt §7.12's
+original stall-gated `mark()`-based dump left open). Rebuilt the probe with
+this new watchdog, ran the §7.9/§7.12/§7.15 repro: **the new watchdog's log
+file was created (so the thread ran) but stayed at 0 bytes for 70+ seconds —
+still an unreliable narrator, just via a different-looking symptom.**
+
+The `[barrier-instr] STUCK`-shaped panic this doc's §7.15 already logged as
+an unrelated, unexplained side-finding (`` assertion `left == right` failed:
+left: 38, right: 4 `` at `library/std/src/sys/thread/unix.rs:581:17`,
+appearing on *some* thread in *every* probe run this session, dismissed at
+the time as "worth its own investigation") turned out to be the actual
+explanation. `thread::sleep` is the *only* call in the entire probe that
+uses `Duration`-based sleeping rather than a futex primitive, and the new
+watchdog is the only thread that calls it. Isolated with the smallest
+possible reproduction — no barrier, no threads even:
+
+```rust
+fn main() { std::thread::sleep(std::time::Duration::from_millis(1)); }
+```
+
+Panics **every single time**, deterministically, unconditionally:
+
+```
+thread 'main' (18) panicked at .../library/std/src/sys/thread/unix.rs:581:17:
+assertion `left == right` failed
+  left: 38
+ right: 4
+```
+
+**Root cause, confirmed by reading Rust's own std source for this exact
+build** (`rustc 1.96.1`, commit `31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd`,
+fetched via `gh api repos/rust-lang/rust/contents/library/std/src/sys/thread/
+unix.rs?ref=<that commit>`): `std::thread::sleep` on any `target_os =
+"linux"` build (aarch64-unknown-linux-musl included) calls `clock_nanosleep`
+specifically, not plain `nanosleep` — and **Akuma has never implemented the
+`clock_nanosleep` syscall** (aarch64 Linux syscall #115). Every unimplemented
+syscall number falls through to `syscall/mod.rs`'s generic catch-all, which
+returns `ENOSYS` (`38`). musl's `clock_nanosleep()` library wrapper follows
+POSIX's unusual contract for this one function — "return the positive error
+number directly, don't use `errno`" — so it turns the kernel's raw `-38`
+(`-ENOSYS`) into `+38` as its own return value. Rust's std code only ever
+expects two outcomes from that wrapper: `0` (slept fully) or exactly
+`libc::EINTR` (`4`, a signal interrupted the sleep, retry the remainder) —
+and asserts exactly that with `assert_eq!(r, libc::EINTR)`. `38 != 4`, so the
+assertion fires, on literally the first `thread::sleep` call any thread ever
+makes, on any duration, unconditionally. Decoding the panic's own numbers
+(`left: 38, right: 4`) already names `ENOSYS` and `EINTR` without needing the
+source at all, in hindsight.
+
+**This is not the Failure D bug** — it's independent, was hiding behind it,
+and both are real. But it directly explains something this doc's own §7.12
+flagged as unexplained and moved past without resolving: "the watchdog
+itself turned out to be an unreliable narrator... its own dump never fired
+even across an 800+ second hang." That original watchdog *also* called
+`thread::sleep` in its poll loop. It didn't fail to fire because of some
+subtle scheduling starvation theory — it panicked and died on its very first
+iteration, every single run, for the entire span of this investigation
+(§7.9 onward). Every prior session's watchdog-based diagnostic in this
+document was silently non-functional from the moment it was written.
+
+**Fixed**: implemented `sys_clock_nanosleep` (`src/syscall/time.rs`,
+dispatched at `src/syscall/mod.rs` as syscall `115`), modeled directly on
+the existing `sys_nanosleep` plus `clockid`/`TIMER_ABSTIME` handling for the
+full POSIX contract (relative sleep, and an absolute deadline in either
+`CLOCK_REALTIME` or an uptime-based clock — mirroring the existing
+`CLOCK_REALTIME`-vs-everything-else split already used by `sys_clock_gettime`
+and `sys_futex`'s `FUTEX_CLOCK_REALTIME` handling). Returns the ordinary
+Linux syscall convention (`0`/`-errno`) — the "return positive errno"
+contract is musl's wrapper-level detail, not something the syscall itself
+needs to implement. Verified: the minimal one-liner above now exits `0`
+instead of panicking; a spawned-thread variant (`thread::spawn(|| { sleep;
+println!(...) })`) now prints its post-sleep line and joins cleanly.
+
+**One clean, load-bearing, and slightly humbling additional finding**: fixing
+this did **not** fix Failure D, but it changed whether the exact §7.9 repro
+reproduces at all — and isolating *why* required its own controlled A/B, run
+directly against the fixed kernel:
+
+| watchdog thread present (calls the now-working `thread::sleep` every 1s) | Failure D repro outcome |
+| --- | --- |
+| Yes | **No hang.** All 4 processes ran 8000-round barriers cleanly for the full 90s budget, `rounds_total` climbing continuously and rapidly (no stall, ever) the entire time; `[FUTEX-DUMP]` stayed empty throughout; all 4 self-terminated via the ordinary `JS_TIMEOUT_SECS` `SIGALRM` because they simply hadn't finished all 8000 rounds yet, not because anything hung. |
+| No (`JS_NO_WATCHDOG=1`, same fixed kernel, same binary, same hogs) | **Hang reproduces**, the exact classic signature: `[FUTEX-DUMP]` shows all 4 processes' condvar waiter stuck on `0x30338ac0` with `hist=uSepuSepuSep...`, present at T330 and still present unchanged at T390 (60s later — a persistent stall, not a blip), all 4 self-terminated via `SIGALRM` at ~T396 having made no further progress. |
+
+**Interpretation, stated carefully so it isn't over-claimed:** the
+`clock_nanosleep` fix itself does not close Failure D — the control run
+(no watchdog, same fixed kernel) reproduces the identical hang. What
+changes the outcome is specifically having an *extra thread that wakes up
+on a real 1-second timer*, which was never possible before this session
+because that call always panicked instantly. This is exactly the shape
+§7.9 already predicted ("the gate is real scheduler preemption pressure")
+— apparently a periodic, unrelated timer-driven wake on another core is
+enough to perturb the SMP scheduling pattern past the narrow window this
+bug needs, without touching whatever the actual defect is. That makes this
+a **genuine, reproducible lever for controlling the hang's reproduction
+rate**, not a fix — and a warning: any future session that adds a
+`thread::sleep`-based watchdog, health-check, or timeout to *anything*
+running under this exact stress pattern risks silently making Failure D
+stop reproducing without curing it, which would be very easy to
+misinterpret as a fix. Root-causing Failure D itself still needs the same
+next step §7.16 already named (a `sys_futex` `FUTEX_WAKE`-entry tripwire,
+or a live GDB read of `shadow_count`) — run with `JS_NO_WATCHDOG=1` to
+guarantee the hang stays reproducible while doing it.
+
+**Full writeup**: [`THREAD_SLEEP_MISSING_CLOCK_NANOSLEEP.md`](THREAD_SLEEP_MISSING_CLOCK_NANOSLEEP.md)
+(the sleep/`clock_nanosleep` bug itself, standalone, since it's a real,
+generally-useful fix independent of Failure D). This section is the
+Failure-D-specific half: what changed when it was fixed, and why that
+result has to be read carefully rather than taken as a fix.
+
+**Provenance, worth recording plainly**: the specific function whose stale
+doc comment kick-started this whole chain — `get_saved_kernel_resume`
+(§7.13/§7.14) — was not found by searching this session, or even last
+session. The engineer pointed the agent at it directly, by hand, after the
+agent's own search (in the *prior* session) twice converged on the wrong
+function in `crates/akuma-exec/src/threading/mod.rs` (a ~5,000-line file)
+first. Worth remembering next time an agent's own search feels confident:
+this entire thread — the elr/Context fix, ruling out the ordering and
+key-mismatch theories, finding the fd-position race, and finding the
+`clock_nanosleep` gap — traces back to a human doing the one thing grep
+couldn't: recognizing the *right* function from its doc comment once it was
+in front of them.
+
 ---
 
 ## 8. Instrumentation added for Failure B, this session (2026-08-07, uncommitted)

@@ -103,15 +103,17 @@ is not fixed here; see "Not fixed" below.
 
 ## The fix
 
-Added `Process::reserve_write_pos` (`crates/akuma-exec/src/process/fd.rs`),
-which reads the current position **and** advances it past the caller's
-reservation in one lock hold — closing the gap between "read" and
-"write-back" instead of leaving disk I/O in the middle of it:
+Added `SharedFdTable::reserve_write_pos` (`crates/akuma-exec/src/process/fd.rs`,
+with `Process::reserve_write_pos` as a thin delegator so `sys_write` calls it
+the same way it calls every other per-fd `Process` method), which reads the
+current position **and** advances it past the caller's reservation in one
+lock hold — closing the gap between "read" and "write-back" instead of
+leaving disk I/O in the middle of it:
 
 ```rust
 pub fn reserve_write_pos(&self, fd: u32, count: usize) -> Option<usize> {
     with_irqs_disabled(|| {
-        let mut table = self.fds.table.lock();
+        let mut table = self.table.lock();
         match table.get_mut(&fd) {
             Some(FileDescriptor::File(file))
                 if file.flags & open_flags::O_APPEND == 0 =>
@@ -159,8 +161,29 @@ RESULT: PASS
 Also re-ran with 8 threads (`total_bytes=102400`, `bad_blocks=0`, all 8
 threads' blocks clean) to check the fix isn't thread-count-sensitive.
 
-Host unit tests (`cargo test -p akuma-exec --target <host-triple>`): 174
-passed, 0 failed — no regression in the fd-table test suite.
+**End-to-end regression check, real workload:** HTTPS download via `curl` to
+a file (exercises the plain, non-append `File` write path this fix changed)
+— md5 matched a host-side download of the same URL bit for bit, both
+single-threaded and with 4 concurrent `curl` processes each writing their own
+file. Confirms the fix doesn't disturb the overwhelmingly common
+single-writer-per-fd case; TLS/HTTPS itself is unaffected since that traffic
+goes through the `Socket` fd arm, untouched by this change.
+
+Host unit tests (`cargo test -p akuma-exec --target <host-triple>`): all 179
+passed, 0 failed. Five of those are dedicated regression coverage for this
+fix, added the same session (`crates/akuma-exec/src/process/fd.rs`,
+`reserve_write_pos_tests`): sequential non-overlapping reservations, the
+`O_APPEND` refusal, missing/non-`File` fd handling, a zero-length no-op, and
+— the one that actually exercises the bug's shape — 16 real `std::thread`s
+each issuing 500 concurrent `reserve_write_pos` calls with no coordination
+beyond the function itself, asserting the resulting 8,000 reservations tile
+the file exactly (sorted starts form an exact arithmetic progression: no
+repeats, i.e. no overlap; no gaps, i.e. nothing lost). This is a logic-level
+regression test for `reserve_write_pos` itself, run entirely on the host
+without a VM boot; it complements, but does not replace, the raw-`write()`
+guest probe above, which is what actually proved the original *bytes on
+disk* were corrupted and confirmed the fix closes that specific path through
+`sys_write`.
 
 ## Not fixed (left for a future session)
 

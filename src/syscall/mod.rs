@@ -336,6 +336,7 @@ pub mod nr {
     pub const CLOSE_RANGE: u64 = 436;
     pub const SYSINFO: u64 = 179;
     pub const CLOCK_GETRES: u64 = 114;
+    pub const CLOCK_NANOSLEEP: u64 = 115;
     pub const EPOLL_CREATE1: u64 = 20;
     pub const EPOLL_CTL: u64 = 21;
     pub const EPOLL_PWAIT: u64 = 22;
@@ -743,6 +744,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::LSEEK => fs::sys_lseek(args[0] as u32, args[1] as i64, args[2] as i32),
         nr::FSTAT => fs::sys_fstat(args[0] as u32, args[1]),
         nr::NANOSLEEP => time::sys_nanosleep(args[0], args[1]),
+        nr::CLOCK_NANOSLEEP => time::sys_clock_nanosleep(args[0] as u32, args[1] as i32, args[2], args[3]),
         // AF_INET socket ops. In a rump box these never reach here (the rump proxy
         // short-circuits above); with the smoltcp native stack compiled out they
         // have no implementation, so a stray box-0 call gets a clean ENETDOWN
