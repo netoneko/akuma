@@ -58,6 +58,10 @@ lifecycle, and the userspace build.
 [`build-profiles.md`](build-profiles.md) — the same seven targets as a
 "which one do I build/run" comparison table (sizes, networking, purpose).
 
+[`userspace-layout.md`](userspace-layout.md) — current `userspace/` member
+list with one-line purposes; what `CLAUDE.md`'s Layout section points to
+instead of hardcoding names that drift.
+
 ### Scripts
 
 [`scripts/`](scripts/) — index of the standalone `scripts/*` debugging and

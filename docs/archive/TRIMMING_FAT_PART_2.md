@@ -56,6 +56,11 @@ Continued removal of components that add build complexity and maintenance burden
 
 ## Removed: scratch
 
+> **Note:** This removal was later reverted (commit `f577eca`, "bring back
+> scratch") — `userspace/scratch/` is back in the workspace. The rationale
+> below is kept for historical reference; see `docs/reference/userspace-layout.md`
+> for scratch's current status.
+
 **What:** `userspace/scratch/` — a custom `no_std` Git client implementing Git Smart HTTP protocol (clone, fetch, pull, push, commit, branch, tag, status).
 
 **Why removed:** With Alpine apk available, `git` can be installed via `apk add git`, providing a full standard Git implementation without maintaining a bespoke no_std client. The custom implementation also required a 256+ KB stack for zlib decompression and had ongoing compatibility issues.

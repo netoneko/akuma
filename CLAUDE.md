@@ -6,7 +6,7 @@ Bare-metal Rust OS for AArch64 (QEMU virt). In-kernel SSH, networking, ext2 VFS,
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates: `akuma-{editor,exec,ext2,isolation,net,rump,shell,smp,ssh,ssh-crypto,terminal,vfs}`
-- `userspace/` — ELF binaries (musl libc): paws, dash, herd, meow, quickjs, tcc, sbase, box, sshd, httpd, crush, tar, llama.cpp, rumpkernel, plus small repro/stress programs
+- `userspace/` — ELF binaries (musl libc); current member list + one-liners: `docs/reference/userspace-layout.md`
 - `docs/` — Documentation (see below)
 - `scripts/` — Build and debug helpers
 - `overlays/devbox/` — Devbox distro rootfs + `run.sh` / `run-smoltcp.sh`
