@@ -181,6 +181,6 @@ linker.ld         Kernel linker script
 
 ## License
 
-MIT. Userspace components under different licenses (GPL2, LGPL2) follow their respective licenses.
+BSD 2-Clause. Userspace components under different licenses (GPL2, LGPL2) follow their respective licenses.
 
 `userspace/rumpkernel` is under BSD License same as NetBSD rumpkernel project.

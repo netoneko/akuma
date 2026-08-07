@@ -68,6 +68,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_profile_size)', 'cf
 name = "akuma"
 version = "0.0.7"
 edition = "2024"
+license = "BSD-2-Clause"
 
 [[bin]]
 name = "akuma"

@@ -68,6 +68,51 @@ dies on a SIGSEGV'd rustc still *advances* — crates that compiled stay
 compiled — so "it got further" is only meaningful against the failing crate, not
 the count.
 
+## Status (2026-08-07) — `--release` at `-j4` completes, twice
+
+The `--release` (default-feature) kernel build now runs to completion in-VM at
+`-j4`, **including the final `akuma` crate** — no `-j1` step:
+
+```sh
+cargo build --release -p akuma -j4 --offline     # disk_selfhost.img, SMP=4, MEMORY=14336
+```
+
+| run | date | wall | result |
+|---|---|---|---|
+| 1st green | 2026-08-07 | 11m 21s | 97 deps + final crate through LTO, 4.3 MB ELF. Kernel = pre-`kill_thread_group`-fix tree |
+| 2nd green | 2026-08-07 | **9m 43s** | 108 `Compiling` lines from an empty `target/`, `EXIT=0`, 4.3 MB ELF at `target/aarch64-unknown-none/release/akuma`. Kernel = the `kill_thread_group` stale-tid fix ([`../archive/KTG_STALE_TID_EXIT_STAMP_J4_HANG.md`](../archive/KTG_STALE_TID_EXIT_STAMP_J4_HANG.md)) |
+
+**Scope — this does not close §5.1.** Both runs built the `release` profile with
+default features. §5.1's deterministic final-crate deadlock was on
+`release-smp-shared` + `devbox-smoltcp`, which has **not** been re-run at `-j4`;
+`-j1` remains the documented recipe for that profile's final crate.
+
+What the second run proves that the first could not: the forged-exit hang is
+gone under real load. The `[KTG-STALE-CH]` guard fired **63 times in that single
+build** — 63 occasions where PHASE 2 would have stamped a group exit code
+through a recycled tid onto a live process. Each fire looks like:
+
+```
+[KTG-STALE-CH] my_pid=138 sib_pid=140 tid=26 recycled to pid=Some(148) — not stamping channel
+```
+
+which is the shape of the original autopsy (`my_pid=113 sib_pid=117 tid=31
+recycled to pid=140`). Pre-fix, any one of them could reap a live linker and
+leak the pipe write refcount that hung `rustc` in `read()` forever. Note the
+print is rate-limited to the first 64 fires, so 63 is near the cap and a longer
+run under-reports — reboot between measurements rather than looping in one boot.
+
+**Still not reliable, for a different reason.** Of three known `-j4` attempts,
+two finished and one **hard-wedged at T459** (~7.6 min in): all 4 vCPUs pinned at
+100 %, serial console silent from mid-`[mmap]` storm onward, guest sshd accepting
+the forwarded TCP connection but never sending a banner, kernel heartbeat
+stopped. That run had **zero** `[KTG-STALE-CH]`, zero `[PROC-ORPHAN]`, no
+`PANIC`, no `[WILD-DA]`, and PMM was 89 % free — so it is neither the KTG class
+nor OOM. Unexplained and **OPEN**. Boot with `GDB=1` (gdbstub on `1234+INSTANCE`)
+so it can be dissected with lldb if it recurs; a serial log that stops advancing
+is the only load-independent wedge signal (SSH banner timeouts are normal under
+build load and mean nothing).
+
 ## Prerequisites
 
 - Host: `ollama serve` is NOT needed for self-host (that's for meow). You need
@@ -146,10 +191,14 @@ harder than anywhere else — `pthread_create` holds that lock across `__clone`,
 and every thread create and exit in the process serialises on it — so one lost
 wake takes down the whole rustc rather than one thread.
 
-**`-j1` is still the safe recipe for the final crate until a `-j4` run confirms
-otherwise.** The fix is verified by a deterministic host race test
-(`park_wake_race_tests`, which fails on iteration 0 against the pre-fix code and
-passes with it), not yet by a full in-VM `-j4` build.
+**`-j1` is still the safe recipe for the final crate of *this* profile.** The fix
+is verified by a deterministic host race test (`park_wake_race_tests`, which
+fails on iteration 0 against the pre-fix code and passes with it), and — since
+2026-08-07 — by two full in-VM `-j4` builds that compiled the final `akuma`
+crate without a `-j1` step. Both of those were the **`release`** profile
+(default features), not `release-smp-shared` + `devbox-smoltcp`, so they are
+strong circumstantial evidence rather than a direct retest of the deadlock
+documented here. See "Status (2026-08-07)" above.
 
 Why `-j1` and not a codegen knob: cargo hands rustc a **jobserver**, and rustc
 sizes its own codegen threads from it — so `-j1` shrinks rustc's *internal*

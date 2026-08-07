@@ -139,7 +139,7 @@ Figures below are from public sources (linked at the end of this section);
 | **ToaruOS** | Jan 2011 | C, from scratch | — | own libc, compositing GUI, dynamic linker, network stack; replaced all third-party runtime deps in 2018 (1.6) | Not established |
 | **Aero** | ~2021 | Rust, monolithic | — | Unix-like, Linux-inspired, SMP, 5-level paging | No evidence found either way |
 | **Maestro** | ~2018 | Rust | — | Linux-compatible; own init (Solfège), utils, package manager | No evidence found either way |
-| **Akuma** | 2026 | Rust, monolithic | 48,942 first-party lines | 17 syscall families; CoW fork, threads, lazy mmap; ext2, TCP/IP, in-kernel SSH; runs apk, rustc, llama.cpp | **Yes — builds its own kernel.** 147 units, 8m29s, self-built ELF boots (2026-06-19); `release-smp-shared` in-VM build reaches the ELF (2026-08-05) |
+| **Akuma** | 2026 | Rust, monolithic | 48,942 first-party lines | 17 syscall families; CoW fork, threads, lazy mmap; ext2, TCP/IP, in-kernel SSH; runs apk, rustc, llama.cpp | **Yes — builds its own kernel.** 147 units, 8m29s, self-built ELF boots (2026-06-19); `release-smp-shared` in-VM build reaches the ELF (2026-08-05); a full build has since completed **in one go** under SMP=4 `-j4` (9m43s, EXIT=0, 108 crates, ELF emitted) — at least 2 clean runs so far |
 
 **What this comparison actually shows:**
 
@@ -154,9 +154,12 @@ decade, a team, and three attempts.
 concrete way: Linux ABI + musl means *unmodified* rustc binaries, whereas Redox
 had to port rustc onto `relibc` and upstream a target triple — different work, not
 less. (2) Redox has vastly more breadth — desktop, driver coverage, package
-ecosystem, multiple architectures. (3) The Akuma build needs retry rounds (an
-intermittent rayon-worker rustc SIGSEGV) and `-j1` for the final crate, so
-"self-hosting" is achieved but not yet *reliable*.
+ecosystem, multiple architectures. (3) Reliability is improving but not settled:
+earlier full builds needed retry rounds (an intermittent rayon-worker rustc
+SIGSEGV) and `-j1` for the final crate; a full SMP=4 `-j4` build has since
+completed in one go with no retries (9m43s, EXIT=0, 108 crates, ELF emitted), and
+at least one more clean run followed it — still a small sample, not a reliability
+claim yet, but "self-hosting" is achieved and getting steadier.
 
 **Asterinas is the sharpest lesson, because it optimized for the opposite thing.**
 Twice the code, 50+ contributors, three years — and it beats Linux on Nginx
@@ -201,7 +204,7 @@ confirmed "no policy."
 | **ToaruOS** | NCSA | **No.** Personal project; no sponsors surfaced | Not found |
 | **Aero** | GPL-3.0 | **No.** Solo/community project | Not found |
 | **Maestro** | AGPL-3.0 | **No.** Solo project | Not found |
-| **Akuma** | **None declared** — no `LICENSE` file, no `license` field in `Cargo.toml` | **No.** One maintainer | No formal policy — a question this project hasn't had to face at Redox/Asterinas's contributor scale |
+| **Akuma** | **BSD-2-Clause** — was undeclared at the time the row above was first measured (no `LICENSE` file, no `license` field in `Cargo.toml`); added 2026-08-07 (`LICENSE`, `Cargo.toml` `license =`) | **No.** One maintainer | No formal policy — a question this project hasn't had to face at Redox/Asterinas's contributor scale |
 
 **What this adds to the peer-group reading.** Funding and code size move together
 here: the two projects with institutional money (Asterinas: Ant Group + Intel +
