@@ -1416,7 +1416,7 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
             // parent's `wait4` sees `has_exited()`, reaps it mid-run, and
             // `unregister_process` terminates the running thread — whose abandoned
             // fd teardown then leaks pipe write refcounts, so the reader waiting on
-            // that pipe never gets EOF. Measured 2026-08-07 (`-j4` self-host wedge):
+            // that pipe never gets EOF. Measured 2026-08-07 (`-j4` self-host hang):
             // pid 113's group kill stamped exit(0) onto recycled tid 31 (= freshly
             // spawned `ld`, pid 140); collect2 reaped live ld; rustc hung forever in
             // `read()` on the leaked pipe. A slot that is FREE (owner None) is still

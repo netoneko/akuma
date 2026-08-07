@@ -134,7 +134,7 @@ impl SharedFdTable {
     /// wrongly-reaped `ld` closed exactly one of its four pipe refs and was then
     /// descheduled forever; the leaked stderr write refcount kept `rustc` blocked
     /// in `read()` waiting for an EOF that could no longer arrive (the `-j4`
-    /// self-host wedge). Popping per-iteration bounds an abandoned sweep's damage
+    /// self-host hang). Popping per-iteration bounds an abandoned sweep's damage
     /// to the single in-flight entry.
     pub fn close_all(&self) {
         loop {

@@ -604,7 +604,7 @@ pub fn run_all_tests() {
     test_unregister_process_terminates_thread();
     test_unregister_process_skips_current_thread();
     test_kill_thread_group_two_phase();
-    // Recycled-tid channel stamp forged an exit for a live process (-j4 wedge)
+    // Recycled-tid channel stamp forged an exit for a live process (-j4 hang)
     test_ktg_stale_tid_channel_not_stamped();
     test_mark_terminated_ignores_large_ids();
     test_fake_thread_ids_safe();
@@ -14542,7 +14542,7 @@ fn test_kill_thread_group_two_phase() {
     }
 }
 
-/// Regression (2026-08-07, the `-j4` self-host wedge): `kill_thread_group`
+/// Regression (2026-08-07, the `-j4` self-host hang): `kill_thread_group`
 /// PHASE 2 stamped `set_exited(group_code)` on the channel resolved by a
 /// sibling's RECORDED tid. A sibling that died before the group kill keeps its
 /// recorded `thread_id`, and once that slot is recycled the tid resolves to an

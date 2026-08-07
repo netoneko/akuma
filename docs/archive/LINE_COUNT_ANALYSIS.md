@@ -246,26 +246,34 @@ code.
 **Reading B — the interesting 69% is test code that never runs**, which the
 0.53x ratio in Stat 2 counts as coverage. Two clusters, different causes:
 
-- **`src/tests.rs`** — 6 allocator pattern tests (296 lines) plus `run_all`
-  itself. The entry point is dead: `src/tests.rs:3` documents "Run with
-  `tests::run_all()` after scheduler initialization" and nothing calls it
-  (`src/main.rs:1015` calls `async_tests::run_all()`, a different module). The
-  file's whole suite is unwired, which is *why* its tests are unreachable.
-- **`src/syscall/msgqueue.rs`** — 9 dead functions, plus the 5 msgqueue tests in
-  `process_tests.rs` written against them (277 lines). The syscall family is
-  wired (`MSGGET`/`MSGCTL`/`MSGRCV`/`MSGSND`, `src/syscall/mod.rs:960-966`), but
-  the poller layer on top of it is not: `msgqueue_add_recv_poller`,
-  `add_send_poller`, `recv_pollers_count`, `send_pollers_count`,
-  `is_recv_poller`, `push_direct`, `pop_direct`, `message_count`,
-  `cleanup_box_queues`. Poller support and its tests landed without being hooked
-  up.
+- **`src/tests.rs` — 6 allocator pattern tests (296 lines), silently dropped.**
+  Zero call sites anywhere; no comment explains it. The rest of the file *does*
+  run (`src/main.rs:1007` `run_memory_tests()`, `:1062` `run_threading_tests()`,
+  `:1099` `run_benchmarks()`), and the dead `run_all` aggregate (`src/tests.rs:492`)
+  doesn't call these six either — so they are orphaned individually, not by a dead
+  entry point.
+- **`src/syscall/msgqueue.rs` — 5 waker tests deliberately disabled (277 lines),
+  with the reason recorded at `src/process_tests.rs:570-579`**: they drive real
+  thread slots into WAITING/READY without valid context, crashing the scheduler
+  with `sp=0`; the TODO is to rework them onto mock tids ≥ `MAX_THREADS`. The 9
+  msgqueue functions that show up dead alongside them are **external test seams**
+  for poller state, dead because those tests are off. The poller layer itself is
+  live in production (`sys_msgsnd:190`, `sys_msgrcv:250` register inline;
+  `sys_msgctl:88` wakes on RMID) — it is the *wake path's tests* that are missing,
+  not the wake path.
 
-Also dead: `src/process_tests.rs:4636 test_forktest_parent_mmap` (52 lines) —
-mmap-under-fork being a path with its own bug history.
+Also disabled, with a stated reason: `test_forktest_parent_mmap`
+(`src/process_tests.rs:4636`, 52 lines) — "runs for up to 60s" (`:627`).
+
+One of the nine msgqueue functions is **not** a test seam and is a real defect:
+`cleanup_box_queues` documents "Called from sys_kill_box" and has no callers. See
+[`DEAD_CODE_SWEEP_FINDINGS.md`](DEAD_CODE_SWEEP_FINDINGS.md) §1.
 
 This sharpens Stat 2 rather than contradicting it: 609 of 26,035 test lines
 (2.3%) are counted as tests but cannot run. Small, but it is exactly the kind of
-error the aggregate ratio is blind to.
+error the aggregate ratio is blind to — and note that 6 of the 7 disabled tests
+carry documented reasons, so the *conduct* here is better than the raw number
+suggests. Only the six allocator tests were dropped silently.
 
 **The remainder is deliberate or benign:**
 
@@ -287,6 +295,83 @@ any boot would need coverage instrumentation, which means booting a VM.
 
 ---
 
+## Conclusion: what the stats say about engineering discipline
+
+The most useful reading of all five stats together is not about size or coverage.
+It is that **the discipline here is real, mechanised where it was mechanised, and
+tracks pain almost perfectly** — which is both a compliment and a prediction.
+
+### What the numbers show as genuinely strong
+
+- **Lint configuration is doing real work.** `dead_code = "deny"` workspace-wide,
+  clippy `all`/`pedantic`/`nursery` at warn, exemptions enumerated per-lint rather
+  than blanket-suppressed. 0.55% dead production code (Stat 5) is that config
+  working, not luck. 76 targeted `#[allow(dead_code)]` against 1 crate-level allow
+  is the right ratio; most codebases invert it.
+- **The pre-commit hook is stricter than typical CI**: clippy `-D warnings` across
+  every crate on the host target, then the `release` *and* `size` profiles, then
+  host tests.
+- **Disabled tests carry root causes.** 6 of the 7 name a reason, and the five
+  msgqueue ones name the failure mode (`sp=0` scheduler crash) *and* the fix (mock
+  tids ≥ `MAX_THREADS`). The common alternatives — delete it, or leave it red —
+  are both worse.
+- **Claims are backed by measurement.** The `Cargo.toml` feature blocks carry A/B
+  numbers, the configs they were validated at, dates, commit refs, and revert
+  instructions. That is why this analysis was possible at all.
+- **Testability is architectural**, not bolted on: `crates/` exists so subsystems
+  can be host-tested outside QEMU.
+
+### What the numbers show as weak — and it is mostly one mechanism
+
+- **Hand-wired test registration accounts for most of what was found.** 282 manual
+  call sites in `process_tests.rs`, 52 in `sync_tests.rs`. A test absent from the
+  list is indistinguishable from a test that does not exist, and nothing checks.
+  That is one missing mechanism, not 17 mistakes — and it is why the six allocator
+  tests vanished silently while everything else got documented. A boot-suite
+  assertion that every `fn test_*` in a file appears in some call list would catch
+  the whole class.
+- **`#[allow(dead_code)]` doubles as a parking space, and that is what cost the one
+  real bug.** `cleanup_box_queues` was dead *and annotated as acceptable*: the lint
+  was configured correctly, then locally overridden at precisely the site where it
+  carried signal. Nothing re-audits the allow list, so the exemption is permanent.
+  76 sites is small enough to audit once.
+- **The pre-commit gap is specific: profiles are checked, feature sets are not.**
+  `clippy --profile size` runs with default features, so `#[cfg(feature = …)]`
+  gating bugs are invisible to it — exactly the shape of the `extreme-size`
+  breakage (see `reference/build-profiles.md`). The 4 MB floor is a stated goal
+  whose build nothing verifies automatically.
+- **Comments assert intent that stopped being true.** `cleanup_box_queues`'
+  "Called from sys_kill_box" is false in-source; `src/tests.rs:3` points readers at
+  a dead entry point. At 31.9% comment density (Stat 3) comments are load-bearing,
+  so wrong ones actively mislead rather than merely age.
+- **Invariants are enforced per-site rather than derived.** The
+  `caller_box != 0 → EPERM` rule appears at 3 sites in `src/syscall/container.rs`
+  and is missing at the 2 that create and destroy box identity
+  ([`DEAD_CODE_SWEEP_FINDINGS.md`](DEAD_CODE_SWEEP_FINDINGS.md) §6).
+
+### The pattern that explains both columns
+
+Scheduler, SMP, BKL, fork/exec: measured, A/B'd, documented across 200+ archive
+docs, and carrying 9,644 lines of self-tests. Those bugs cost weeks, so they got
+instrumentation.
+
+Everything this sweep found sits in the **quiet** areas instead — dead msgqueue
+seams, a missing box-teardown call, orphaned allocator tests, inconsistent box
+authorization. Stat 2 says the same thing structurally: `src/syscall` carries
+9,931 production lines against 117 test lines, and its bugs have been silent so
+far.
+
+That is rational triage for one maintainer, not a defect of character. But it is
+predictive: the next expensive bug comes from an area with no test pressure, and
+per Stat 2 there is no external fuzzer aiming at those areas the way syzkaller
+aims at Linux. **The quiet areas are quiet because nothing is listening.**
+
+The cheapest way to change that is not more tests — it is the three mechanisms
+above: test-registration checking, an allow-list audit, and feature-set coverage
+in pre-commit. Each converts a class of silent failure into a loud one.
+
+---
+
 ## What none of these numbers can tell you
 
 - **Whether the code is correct.** The areas with the most lines and the most
@@ -295,6 +380,13 @@ any boot would need coverage instrumentation, which means booting a VM.
 - **What actually executes.** Stat 5 measures compile-time reachability, not
   runtime coverage. Some of the 48,942 production lines may never run on any
   boot, and nothing here would show it.
+- **Test quality.** Nothing here measures assertion density, or whether the three
+  *running* msgqueue tests check anything meaningful. "Wired into the suite" and
+  "actually covering the behaviour" are different properties, and only the first
+  was measured.
+- **Defect density over history.** This would settle Stat 1's "inherently hairy vs
+  under-decomposed" question for `exceptions.rs`/`smp.rs`; it needs a git-history
+  survey, not a line count.
 - **How much would survive a Linux-ABI conformance suite.** 17 syscall families
   exist; how completely each implements its family is unmeasured.
 - **Anything about size.** A 30 KB precomputed table is one line of Rust
