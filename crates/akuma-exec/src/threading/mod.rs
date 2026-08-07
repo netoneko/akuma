@@ -2552,6 +2552,28 @@ impl ThreadPool {
         }
         // If current thread is the network thread, or counter hasn't reached ratio, use round-robin below
 
+        // EXPERIMENTAL (Failure D falsification test, see `config::PRIORITIZE_NEVER_SCHEDULED`):
+        // unconditionally prefer any READY thread that has never once been scheduled
+        // (`LAST_CORE == 0xFF`) over the wakeup-locality hint and the round-robin scan
+        // below. Not fairness-preserving by design — this is a diagnostic override, not
+        // a real scheduling policy.
+        let never_scheduled = if config().prioritize_never_scheduled {
+            let mut found = None;
+            for i in 0..MAX_THREADS {
+                if i != current_idx
+                    && !IS_IDLE_THREAD[i].load(Ordering::Relaxed)
+                    && THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::READY
+                    && ON_CPU[i].load(Ordering::SeqCst) == 0
+                    && LAST_CORE[i].load(Ordering::Relaxed) == 0xFF
+                {
+                    found = Some(i);
+                    break;
+                }
+            }
+            found
+        } else {
+            None
+        };
 
         // Wakeup locality: if a thread was just woken by an explicit signal
         // (futex/cond), prefer running it NEXT (once) so a producer→consumer
@@ -2560,7 +2582,9 @@ impl ThreadPool {
         // (swap to MAX_THREADS) so it fires once; the preempted current thread
         // stays READY below, so round-robin fairness is preserved across ticks.
         let hinted = PREEMPT_WAKE_TID.swap(MAX_THREADS, Ordering::SeqCst);
-        let next_idx = if hinted < MAX_THREADS
+        let next_idx = if let Some(idx) = never_scheduled {
+            idx
+        } else if hinted < MAX_THREADS
             && hinted != current_idx
             && !IS_IDLE_THREAD[hinted].load(Ordering::Relaxed)
             && THREAD_STATES[hinted].load(Ordering::SeqCst) == thread_state::READY
@@ -4163,10 +4187,14 @@ pub fn current_trap_frame_elr() -> Option<u64> {
 /// Get the saved user context for a thread.
 /// Used by fork() to duplicate the parent's state.
 /// Reads from the live trap frame on the stack when available (captures all registers).
-/// Debug: dump every non-FREE thread's saved kernel resume point to the console.
+/// Debug: dump every non-FREE thread's state to the console (`[THR-DUMP]`).
 /// Used by the heartbeat to locate where parked threads are stuck during a hang,
-/// without needing SSH (which can itself wedge). Resolve the x30/elr against the
-/// kernel symbol map. Compact, allocation-free.
+/// without needing SSH (which can itself wedge). Compact, allocation-free.
+///
+/// The printed `elr=` is `Context.elr`, which is STALE for any ordinary thread
+/// past its first switch — see `get_saved_kernel_resume`'s doc comment and
+/// docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §7.14 for
+/// why, and where the live value actually is (`Context.sp + 240`).
 pub fn dump_thread_resume_points() {
     safe_print!(16, "[THR-DUMP]\n");
     for tid in 0..MAX_THREADS {
@@ -4206,9 +4234,21 @@ pub fn dump_thread_resume_points() {
                 (f.x0, f.x1)
             } else { (0, 0) }
         };
+        // LAST_CORE == 0xFF means never scheduled even once, ever, since this slot's
+        // last claim (Failure D falsification test, 2026-08-07 — see
+        // config::PRIORITIZE_NEVER_SCHEDULED). Printed raw so a hang dump can answer
+        // "are there genuinely never-run threads right now" without inference.
+        let last_core = LAST_CORE[tid].load(Ordering::Relaxed);
+        // Raw TOTAL_CPU_TIMES (not the live-corrected `get_thread_cpu_time`, which takes
+        // POOL.lock() — avoided here to keep this dump lock-free). Undercounts a
+        // currently-RUNNING thread's in-progress quantum, which doesn't matter for a
+        // hang dump: a genuinely stuck thread isn't RUNNING at print time, so this is
+        // exact for the case this field exists to answer — "how much real CPU time has
+        // this thread ever actually gotten".
+        let cpu_us = TOTAL_CPU_TIMES[tid].load(Ordering::Relaxed);
         safe_print!(255,
-            "  tid={} st={} pid={} tgid={} l0={:#x} sc={} tsc={} a0={:#x} a1={:#x} elr={:#x}\n",
-            tid, stc, pid, tg, l0, sc as i64, tsc, a0, a1, elr);
+            "  tid={} st={} pid={} tgid={} l0={:#x} sc={} tsc={} a0={:#x} a1={:#x} elr={:#x} last_core={} cpu_us={}\n",
+            tid, stc, pid, tg, l0, sc as i64, tsc, a0, a1, elr, last_core, cpu_us);
     }
     // The inverse view: processes with no thread at all. A hang shows up here and
     // nowhere else — such a process is absent from the loop above by definition.
@@ -4216,10 +4256,19 @@ pub fn dump_thread_resume_points() {
 }
 
 /// Debug: saved kernel resume point of a context-switched-out thread, as
-/// `(x30 /* saved LR */, elr, sp)`. For a thread parked via the cooperative
-/// switch (yield_now/schedule_blocking), `x30` is where it will resume in kernel
-/// code — resolve it against the kernel symbol table to see *where* a stuck
-/// thread is blocked. Returns None for out-of-range ids.
+/// `(x30 /* saved LR */, elr, sp)`.
+///
+/// **STALE as of 2026-08-07 (docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md
+/// §7.14): `x30`/`elr` do NOT reflect where a switched-out thread will resume.**
+/// `sgi_scheduler_handler_with_sp` (the only switch path, voluntary or
+/// involuntary) writes just `.sp`/`.ttbr0` into `Context` on every switch — never
+/// `.elr`/`.x30`. For an ordinary `clone_thread` worker those two fields are set
+/// once at slot-claim time (to `thread_start_closure`, so the *first* cooperative
+/// switch has somewhere to land) and never touched again. The real, live register
+/// state — including the actual current `ELR_EL1` — lives on the thread's own
+/// kernel stack, in the IRQ frame `.sp` points to (`src/exceptions.rs:266-278`:
+/// `ELR` at `sp+240`, `SPSR` at `sp+248`). Read that instead of `.elr` if you need
+/// where a stuck thread actually is. Returns None for out-of-range ids.
 pub fn get_saved_kernel_resume(thread_id: usize) -> Option<(u64, u64, u64)> {
     if thread_id >= MAX_THREADS {
         return None;

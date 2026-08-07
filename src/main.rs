@@ -541,6 +541,7 @@ pub(crate) fn build_exec_runtime(
         stack_canary: config::STACK_CANARY,
         canary_words: config::CANARY_WORDS,
         network_thread_ratio: config::NETWORK_THREAD_RATIO,
+        prioritize_never_scheduled: config::PRIORITIZE_NEVER_SCHEDULED,
         deferred_thread_cleanup: config::DEFERRED_THREAD_CLEANUP,
         thread_cleanup_cooldown_us: config::THREAD_CLEANUP_COOLDOWN_US,
         process_reclaim_cooldown_us: config::PROCESS_RECLAIM_COOLDOWN_US,

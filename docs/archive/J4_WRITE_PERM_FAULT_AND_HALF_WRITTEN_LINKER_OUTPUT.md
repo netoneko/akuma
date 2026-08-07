@@ -15,7 +15,7 @@ bulk of the build, distinct from C — surfaced in a fresh repro and is
 | **A** | write permission fault with no recovery path | recovery path added (`[EAGER-UPGRADE]`, fires); origin of the bad page state still unknown |
 | **B** | linker leaves a truncated/empty output, cargo execs it | **unfixed — the current blocker** |
 | **C** | a thread survives its thread group's `exit_group`, parked in `FUTEX_WAIT` forever | **root-caused and fixed** |
-| **D** | an rustc thread-group *leader* (never reaching `exit_group`) parked in `FUTEX_WAIT` almost since its own start | **reproduced with a tight, fast probe — see §7.9.** Two mitigations (direct cross-core wake SGI, periodic revalidation of untimed waits) landed and were re-verified **not** to fix it (§7.10) — new evidence shows the wake is never *issued* on the key at all (the notifying thread never reaches `notify_all`), which no futex-layer mitigation can rescue. Still not root-caused. |
+| **D** | an rustc thread-group *leader* (never reaching `exit_group`) parked in `FUTEX_WAIT` almost since its own start | **reproduced with a tight, fast probe — see §7.9.** Two mitigations (direct cross-core wake SGI, periodic revalidation of untimed waits) landed and were re-verified **not** to fix it (§7.10) — new evidence shows the wake is never *issued* on the key at all (the notifying thread never reaches `notify_all`), which no futex-layer mitigation can rescue. §7.12 (2026-08-07, next session): a from-scratch reimplementation of the barrier independently reproduces the identical `hist=uSepuSepuSep` signature, ruling out anything specific to jobserver-rs or std's exact `Barrier` codegen. The leading "never scheduled from birth" theory was tested two ways — a scheduler override forcing never-run threads to the front, and a direct `LAST_CORE` measurement — and **both cleanly disprove it**: every thread in a hung run has run on a real core at least once. Still not root-caused. |
 
 This doc exists because both failures were previously reported only as "run 1 hit a
 zero-byte `rust-lld` output" and "run 2 got `SIGSEGV in clone_thread`" — two
@@ -878,6 +878,307 @@ as open and are now closed:
      target process several fork/exec generations from where its channel was
      registered — not fixed there, out of scope here, but worth knowing if
      Ctrl-C/`kill` is ever seen not reaching a deeply-nested child.
+
+---
+
+## 7.12 A from-scratch reproduction, and the "never scheduled" theory cleanly disproven (2026-08-07, next-next session)
+
+Picked up §7.10's own next step: instrument which thread in a stuck process is
+the one due to call `notify_all`, and find out what it's actually doing.
+**Result: not root-caused, but one specific, plausible theory is now closed
+by direct measurement, and two reusable diagnostics were added.**
+
+### The probe: a from-scratch barrier, not `std::sync::Barrier`
+
+`userspace/forktest/selfhost_repro/jobserver_stress.rs`'s `phase_barrier` was
+rewritten around a hand-rolled `InstrBarrier` — the exact same algorithm
+`std::sync::Barrier` uses internally (`Mutex<{count, generation}>` + `Condvar`,
+`wait_while`) — so it could be instrumented from the inside: per-thread step
+atomics (locking / evaluating leader-vs-follower / about-to-notify /
+notified / about-to-wait / woken), a shadow copy of the mutex-protected
+state for lock-free reading, and a watchdog thread that dumps state on a
+stall. Reusing the **identical algorithm** (not just "a barrier") matters:
+if this reproduces the same hang, it rules out anything specific to
+jobserver-rs's call pattern or std's exact `Barrier` codegen — the bug is in
+the primitive shape itself (Mutex+Condvar+generation under SMP contention),
+confirmed below.
+
+The watchdog itself turned out to be an unreliable narrator — see "A blind
+spot in the probe" below — so its own `[barrier-instr] STUCK` dump never
+fired even across an 800+ second hang. Recorded so the next session doesn't
+rebuild the same watchdog design expecting it to work; the kernel's own
+`[FUTEX-DUMP]`/`[THR-DUMP]` turned out to be the reliable source of truth
+throughout, which is itself a useful lesson (§7.6's runbook is right that a
+userspace probe can be starved by the exact thing it's trying to observe).
+
+### Reproduced cleanly: the exact §7.10 signature, independent of jobserver-rs
+
+4 concurrent copies (`JS_PHASE=barrier JS_BARRIER_THREADS=4
+JS_BARRIER_ROUNDS=8000`) + 4 CPU hogs, `release-smp-shared` + `SMP=4`, same as
+§7.9's recipe. `[FUTEX-DUMP]` on a hung run:
+
+```
+key tgid=92 uaddr=0x1088bad8 waiters=1
+  tid=21 queued_for=43155us hist=uSepuSepuSepuSepuSep
+```
+
+Identical to §7.10's `hist=uSepuSepuSep...`: the periodic-revalidation safety
+net cycling exactly as designed (unpark → self-remove → re-enqueue → park),
+never once seeing a real `W`. Confirmed again: the futex value never changes
+because nothing ever calls `notify_all` — this is not a wake lost in transit,
+it's a wake never issued.
+
+### Theory: "some newly-cloned threads are starved from birth" — tested two ways, both negative
+
+`THR-DUMP`'s `elr=` (`crates/akuma-exec/src/threading/mod.rs`,
+`dump_thread_resume_points` — reads `ctx.elr` from `get_context(tid)`, the
+**scheduler's saved-context slot**, not the live syscall trap frame) showed
+several threads per stuck process frozen at the exact same address across
+every 30 s sample for 200+ seconds. Symbolized against the unstripped probe
+binary (`aarch64-linux-musl-addr2line`/`objdump`), that address is
+`__clone+0x20` — literally the `cbz x0, ...` right after the `clone()`
+syscall returns, before the child has executed a single instruction of its
+actual thread body. A tempting read: these threads were created and then
+never scheduled again, ever — which would also tidily explain why the
+probe's own watchdog thread (itself freshly `clone()`d the same way) never
+ran its polling loop even once.
+
+`docs/reference/subsystems/thread-lifecycle.md` "Open ⚠ leaf traces" (§5.3b)
+independently documents an **open, unresolved** bug in exactly this territory
+— a `clone_thread` child reading stale/already-freed memory on its first
+instruction — which made the theory look more credible, not less. But that
+bug manifests as a visible `[Fault] SIGSEGV in clone_thread`, and this run
+had **zero** `[Fault]` lines total — so if related, it isn't the same
+manifestation.
+
+**Tested directly, two ways, both cleanly negative:**
+
+1. **Falsification via intervention.** Added `config::PRIORITIZE_NEVER_SCHEDULED`
+   (`src/config.rs`, wired through `ExecConfig`/`schedule_indices` in
+   `crates/akuma-exec/src/threading/mod.rs`): when true, the scheduler
+   unconditionally prefers any `READY` thread with `LAST_CORE == 0xFF` (the
+   existing "never scheduled" sentinel, already correctly scrubbed on slot
+   claim — see thread-lifecycle.md §1's `scrub_thread_slot` note) over the
+   wakeup-locality hint and the normal round-robin scan. Rebuilt, rebooted,
+   re-ran the identical repro: **same outcome** — all 4 processes still died
+   via the `JS_TIMEOUT_SECS` `SIGALRM` (`code=-14`) at the same ~90–120 s
+   mark as the unfixed baseline. If any thread were genuinely starved from
+   birth, this override would have caught and run it on the very next
+   scheduling decision (many times a second under this load); it made no
+   difference at all.
+2. **Direct measurement.** Added `last_core=` to every `[THR-DUMP]` line
+   (cheap, read-only, kept permanently). Re-ran the repro with the scheduler
+   unmodified and captured a full dump mid-hang: **every single alive
+   thread — including every thread frozen at the `__clone+0x20` address, and
+   every thread parked on the barrier's own Condvar — showed a real core
+   number (0–3), never `255`.** Every thread has run at least once. The
+   "never scheduled from birth" theory is closed by direct evidence, not
+   inference.
+
+Net effect: `ctx.elr` staying fixed at `__clone+0x20` for 200+ seconds does
+**not** mean "never ran" — it apparently isn't refreshed by every
+scheduling-out path (voluntary vs. involuntary/timer-preempted context
+switches may differ here; not yet investigated, and not needed to close this
+theory). Symbolizing a static `elr` sample is not sufficient evidence of a
+stuck thread on its own; `last_core=` (or better, a monotonic
+"scheduled-out count" if a future session wants finer resolution) is the
+thing to trust.
+
+### Two reusable diagnostics left in the tree (both off/inert by default)
+
+- **`last_core=` in `[THR-DUMP]`** — permanent, zero-cost, answers "was this
+  thread ever scheduled" directly instead of by ELR inference.
+- **`config::PRIORITIZE_NEVER_SCHEDULED`** (default `false`) — a targeted
+  scheduler override for bisecting "starvation" vs. "genuine logic/wake bug"
+  in any future SMP hang; flip to `true` for one A/B, not meant to ship on.
+
+### A side finding, not investigated further: userspace sshd wedges under a connection burst
+
+While uploading the probe binary, ~90 rapid successive SSH connections (one
+per `echo '<b64-chunk>' >> file`, a chunking approach abandoned in favor of a
+single-connection `base64 -d` piped over stdin — see "Method notes" below)
+left the guest's userspace `sshd` (`/bin/sshd`, from `herd`) completely
+wedged: `[PSTATS]` showed its syscall count frozen solid across three
+consecutive 30 s samples (`nanosleep`/`accept` counts identical at T210,
+T240, T270), with **zero** entries in `[FUTEX-DUMP]` at the same time
+(`table empty`) — so whatever wedged it, it wasn't parked in a tracked futex.
+Not reproduced deliberately or investigated; recorded because it's a real,
+apparently deterministic wedge (happened both times a rapid connection burst
+was attempted) that would bite anyone SSHing into this image aggressively.
+Worth its own session if it recurs.
+
+### Method notes for the next session
+
+- **Cross-compile, don't build in-guest, for a probe this size.** `rustc
+  --target aarch64-unknown-linux-musl -C linker=aarch64-linux-musl-gcc -O`
+  on the host; `aarch64-linux-musl-{gcc,strip,nm,objdump,addr2line}` are all
+  present via Homebrew.
+- **Strip before uploading.** The unoptimized `-O` static build is ~4.7 MB;
+  `aarch64-linux-musl-strip` gets it to ~530 KB. Transferring the unstripped
+  binary as a single base64 blob over this guest's SSH implementation was
+  observed to take minutes for ~6 MB of base64 (SSH channel throughput here
+  is slow for bulk data — not investigated further, just budget for it or
+  strip first). **Keep the unstripped copy on the host** — `addr2line`/`nm`
+  need it and the guest never does.
+- **`busybox sh`'s `ash` has no `env` builtin.** `env FOO=bar cmd` fails with
+  `env: not found` (exit 127) and silently produces a `busybox.static`
+  `[PROC-EXIT] ... code=127` line that looks like the target program itself
+  exited abnormally, not like a shell builtin error — costs real time to
+  notice. Use plain `FOO=bar cmd` (POSIX var-prefix assignment, no `env`
+  needed) instead.
+- **A burst of many quick SSH connections in a tight loop is itself
+  dangerous** — see the sshd wedge above. Prefer one persistent connection
+  (pipe a whole payload over stdin) to N short-lived ones.
+- **`[THR-DUMP]`'s `elr=` is the scheduler's saved-context slot
+  (`get_context(tid)`), not the live syscall trap frame** (that's `a0`/`a1`,
+  read separately from `CURRENT_TRAP_FRAME`). Don't conflate a static `elr`
+  sample with "never ran again" without corroborating it against
+  `last_core=` or CPU-time accounting first — see above.
+- **GDB is available and was not used this session, but should be next
+  time.** `GDB=1`/`GDB_WAIT=1` exposes a gdbstub on `:1234`
+  (`scripts/cargo_runner.sh`). Since the kernel ELF (unlike the stripped
+  probe) still has full debug symbols, GDB can read `THREAD_STATES`,
+  `THREAD_CONTEXTS`, `LAST_CORE`, `FUTEX_WAITERS`, etc. directly out of live
+  guest memory without adding a new `tprint!`/rebuild/reboot cycle per
+  hypothesis — likely much faster iteration than this session's
+  print-then-rebuild-then-reboot loop (~2 minutes per iteration) for
+  whatever comes next.
+
+### Next steps
+
+The "never scheduled" theory being closed narrows, not widens, the mystery:
+every participant thread runs at least sometimes, yet the barrier still
+deadlocks with the exact "wake never issued" signature. Candidates left
+standing, in roughly the order §7.9/§7.10 already reasoned through them:
+
+1. The arrival-count increment itself is lost under contention for a
+   specific thread (it never becomes the 4th/last arrival, or two threads
+   race and one's increment is clobbered) — would need instrumenting the
+   `Mutex`-guarded `count`/`generation` fields directly, ideally via GDB
+   watchpoints or a kernel-side value-change tripwire rather than another
+   userspace probe (given this session's watchdog-reliability lesson).
+2. A thread does reach the leader branch and calls `notify_all`
+   (`FUTEX_WAKE`), and *that syscall itself* doesn't complete — test by
+   adding a kernel-side tripwire in `sys_futex`'s `FUTEX_WAKE` arm that logs
+   entry separately from the existing completion-only `tsc`/`[futex-dbg]`
+   tracing, so an entered-but-never-exited wake call would be visible for
+   the first time.
+3. `docs/reference/subsystems/thread-lifecycle.md` §5.3b's open
+   `clone_thread`-reads-stale-memory bug is still an open, uninvestigated
+   possibility for a *quieter* (non-crashing) manifestation than its known
+   crash — not ruled in or out this session, since zero `[Fault]` lines
+   doesn't rule out a variant that corrupts state without a hard fault.
+
+### 7.13 A live GDB cross-check, and one more loose end for next time (2026-08-07)
+
+`aarch64-elf-gdb` (`brew install aarch64-elf-gdb`) attaches to the existing
+`GDB=1` gdbstub (`scripts/cargo_runner.sh`, `:1234`) fine, but this build has
+**no DWARF debug info** (`release-smp-shared` inherits `release`, no
+`debug = true`) — `print <symbol>` fails with "No symbol table is loaded"
+even though `nm`/`objdump` (symtab-only) work and PC values do resolve to
+function names. Use raw address arithmetic against `nm` output instead:
+`aarch64-elf-nm target/aarch64-unknown-none/release-smp-shared/akuma | grep
+THREAD_CONTEXTS` etc., then `x/Nxg <addr>` in gdb. **Do not run bare `bt`** —
+with no CFI/`.debug_frame` info gdb's frame-pointer heuristic produced 7000+
+duplicate garbage frames before anything useful; stick to `x`/`info
+registers`/`info symbol`.
+
+Cross-checked `THREAD_CONTEXTS[30]` (the tid `[FUTEX-DUMP]` named as the
+`0x1088bad8`-condvar waiter) directly from live guest memory: `LAST_CORE=0`,
+`TOTAL_CPU_TIMES=0x4d103` (≈317 ms of real accumulated run time — corroborates
+§7.12's `last_core=`/`cpu_us=` finding independently, via a completely
+different tool), and `Context.elr=0x100da6e8` (matches `[THR-DUMP]` exactly,
+confirming the offset math). But `Context.x30=thread_start_closure` — the
+*kernel* resume point (see the `get_saved_kernel_resume` doc comment,
+`crates/akuma-exec/src/threading/mod.rs`) still sits at the very first
+instruction of thread bootstrap, before `blr x19` even calls into the actual
+closure. `x30`/`elr` are written together in exactly three places, all
+one-time bootstrap init (`crates/akuma-exec/src/threading/mod.rs:1310-1311,
+3869-3870, 3985-3986`, all `ctx.x30 = ctx.elr = thread_start_closure as
+*const () as u64`) plus one `elr`-only site (`update_thread_context`,
+`:3250`, fork/execve-specific — not relevant to a `thread::spawn` worker).
+No Rust-level write updates `x30` for a normal cooperative park/resume, so
+the actual save/restore for `schedule_blocking`'s context switch almost
+certainly happens in hand-written assembly outside grep's reach here — that
+asm routine (find it via `commit_switch`'s callers / the vector table) is
+the concrete next thing to read, not something to infer from this session's
+data. Whether it's writing `x30` correctly for this class of thread and
+`elr` is the field lagging, or the reverse, decides whether "frozen `x30`"
+means anything at all — genuinely open, not concluded either way.
+
+### 7.14 Resolved: `Context.x30`/`.elr` are dead fields after thread creation — `get_saved_kernel_resume`'s doc comment is stale
+
+§7.13's loose end, closed by reading the actual switch handler. Not
+`commit_switch` (that's `ThreadPool`'s bookkeeping helper, called from
+inside the handler below) — the real entry point for **every** context
+switch, voluntary (`schedule_blocking`'s self-SGI) and involuntary (timer
+preemption) alike, is `sgi_scheduler_handler_with_sp`
+(`crates/akuma-exec/src/threading/mod.rs:3026`, invoked from
+`rust_irq_handler_with_sp`, `src/exceptions.rs:1858`). Its entire outgoing-
+context save is two lines:
+
+```rust
+(*old_ctx).sp = current_sp;
+...
+(*old_ctx).ttbr0 = current_ttbr0;
+```
+
+That's it. No write to `.elr`, `.x30`, or any of `x19`-`x29` — ever, for any
+switch, for the rest of a thread's life. Grepping the whole file for `.elr`
+confirms it: only 4 write sites total, and none of them run for a plain
+`clone_thread` (`std::thread::spawn`) worker —
+
+- 3 identical one-time bootstrap sites (`:1310-1311`, `:3869-3870`,
+  `:3985-3986`), all `ctx.x30 = ctx.elr = thread_start_closure as *const
+  () as u64` — run once, when a slot is first claimed, to give the very
+  first cooperative switch *into* a brand-new thread somewhere valid to jump
+  to.
+- 1 site in `update_thread_context` (`:3250`, `ctx.elr = user_context.pc`
+  only, `.x30` untouched) — but that function's only 3 callers
+  (`crates/akuma-exec/src/process/mod.rs:2803,2958,3235`) are all in the
+  fork-a-new-process family (copies `parent_tid`'s sigaltstack, registers a
+  fresh `child_pid` in `THREAD_PID_MAP`), not `clone_thread`.
+
+So for any ordinary worker thread, `Context.x30`/`.elr` are written once at
+creation and **never again** — confirming §7.13's `x30=thread_start_closure`
+finding is not a hang symptom, it's simply what every thread's `x30` shows
+forever after its first switch, hung or not. The *real*, live register state
+for a switched-out thread — including the actual current `ELR_EL1` — lives
+on its own kernel stack, in the 832-byte IRQ frame `Context.sp` points to
+(`src/exceptions.rs:266-278`: fixed layout, `ELR` at `sp+240`, `SPSR` at
+`sp+248`, confirmed by the two live tripwires already reading those same
+offsets at `:1871` and `:3161`). `get_saved_kernel_resume`'s doc comment
+("`x30` is where it will resume in kernel code") describes a design this
+codebase no longer implements — stale documentation, not a bug in the
+switch logic itself. `[THR-DUMP]`'s `elr=` field reads this same dead
+`Context.elr`, so **every `elr=` value this doc (and every prior session's
+`[THR-DUMP]` reading, including the original §3 write-permission-fault
+diagnosis and every `elr=0x...` cited throughout §7) has ever shown for a
+non-freshly-forked thread is this stale, frozen-since-creation value, not a
+live resume point.** That doesn't invalidate conclusions drawn from `a0`/`a1`
+(read from the separately-tracked, genuinely live `CURRENT_TRAP_FRAME`) or
+from `[FUTEX-DUMP]`'s own bookkeeping — those are unaffected — but any
+reasoning that leaned on a *specific* `elr=` value meaning "this is where
+the thread currently is" should be revisited.
+
+**One open loose end, not resolved:** §7.13's raw memory dump showed `.elr`
+(`0x100da6e8`) genuinely differing from `.x30` (`thread_start_closure`) for
+`tid=30` — but per the 4-site accounting above, both are only ever written
+*together*, to the *same* value, for a plain `clone_thread` worker. Nothing
+found this session explains how they diverged. Either a fifth write site
+exists that grep missed (worth a `.elr\s*=` regex sweep with different
+whitespace, or a search for raw pointer writes bypassing named-field syntax
+entirely), or the live GDB read itself raced an update mid-dump in a way
+that produced a misleading snapshot. Not chased further — flagging so the
+next session doesn't treat this specific pairing as fully explained.
+
+**Fix worth making, not done this session:** point `[THR-DUMP]`'s `elr=`
+(and `get_saved_kernel_resume`) at `*(u64*)(Context.sp + 240)` instead of
+`Context.elr`, and correct or remove the stale doc comment. Low risk (read-
+only diagnostic code), but wasn't done here since it needs its own
+rebuild+reboot+repro cycle to verify against a live hang, and this session's
+budget was already spent confirming the *cause* of the staleness rather than
+shipping the fix.
 
 ---
 

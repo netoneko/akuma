@@ -80,6 +80,7 @@ pub fn ensure_test_runtime() {
         stack_canary: 0,
         canary_words: 0,
         network_thread_ratio: 0,
+        prioritize_never_scheduled: false,
         deferred_thread_cleanup: false,
         thread_cleanup_cooldown_us: 0,
         process_reclaim_cooldown_us: 0,

@@ -261,6 +261,20 @@ pub const MAIN_THREAD_PRIORITY_BOOST: bool = false; // legacy option, now using 
 /// Lower values = better network responsiveness, higher = more CPU for downloads
 pub const NETWORK_THREAD_RATIO: u32 = 4;
 
+/// EXPERIMENTAL diagnostic (Failure D investigation, 2026-08-07 —
+/// docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §7): when
+/// true, `schedule_indices` unconditionally prefers any READY thread that has
+/// **never once been scheduled** (`LAST_CORE == 0xFF`) over the wakeup-locality
+/// hint and the normal round-robin scan. This is a falsification test, not a
+/// real fix: if flipping it on makes the `jobserver_stress` barrier hang under
+/// `SMP=4` + CPU-hog contention disappear, some newly-`clone()`d threads can be
+/// starved indefinitely by the normal scheduler under this load pattern — a
+/// thread-admission/fairness bug, not the futex wake-loss bug the rest of that
+/// investigation assumed. If the hang persists unchanged, this rules the theory
+/// out cleanly. Bypasses `round_robin_idx` bookkeeping on the fast path, so it
+/// is not itself fair — leave `false` outside this experiment.
+pub const PRIORITIZE_NEVER_SCHEDULED: bool = false;
+
 pub const IGNORE_THREADING_TESTS: bool = false;
 
 /// Disable all tests at boot
