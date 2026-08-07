@@ -1272,6 +1272,111 @@ now trustworthy, has done what it can — next session should build the
 `sys_futex` `FUTEX_WAKE`-entry tripwire (§7.12 item 2) rather than take more
 snapshots.
 
+### 7.16 §7.12's two remaining candidates narrowed further by reading, not sampling (2026-08-07, same session)
+
+Read the actual futex kernel code (`src/syscall/sync.rs`) end to end rather
+than adding more instrumentation, to test the two candidates §7.12 left
+standing directly against the implementation.
+
+**The "missing acquire barrier" theory (§7.9's "candidate worth testing") is
+now considered unlikely, not confirmed dead.** `FUTEX_WAITERS` is a
+`spinning_top::Spinlock` (`src/syscall/sync.rs:49`) — a well-audited external
+crate, not a hand-rolled one, and it provides real acquire/release ordering on
+`lock()`/`unlock()`, not just mutual exclusion. Reasoned through the actual
+protocol both `futex_check_and_enqueue` (waiter) and `futex_do_wake` (waker)
+follow under that lock: whichever of the two acquires `FUTEX_WAITERS` first
+is guaranteed (by the lock's own ordering) to have its effects visible to
+the other once it acquires the lock second — either the waiter sees the
+waker's new value and returns `EAGAIN` without enqueuing, or the waker's
+search (acquired after) finds the waiter still queued and wakes it. This
+protocol doesn't depend on `copy_from_user_safe`'s compiler-fence-only
+barrier (§7.9's specific suspect) for correctness, because the *lock itself*
+is what's supposed to carry the ordering — not proof positive (not
+re-verified against the actual `spinning_top` source), but the theory no
+longer looks like the leading suspect it did in §7.9.
+
+**A concrete, checkable third candidate — a per-thread tgid-key mismatch
+sending a wake to the wrong bucket — was tested and ruled out.** `futex_key_tgid`
+resolves identity per-thread via `read_current_pid()` → `THREAD_PID_MAP` →
+that pid's `Process.tgid`
+(`crates/akuma-exec/src/process/children.rs:366-432`). If one thread in a
+barrier's process resolved a *different* tgid than its siblings (plausible in
+the abstract: `clone_thread` gives every new worker thread its **own**,
+uniquely-allocated `child_pid` — `crates/akuma-exec/src/process/mod.rs:3128,
+3246` — and `read_current_pid` looks that up through `THREAD_PID_MAP` and then
+reads `.tgid` off of *that* pid's `Process` struct, rather than everyone
+sharing one canonical identity directly), its futex ops would land in a
+different `(tgid, uaddr)` bucket than its siblings' — exactly reproducing
+"wake never reaches this key" with nobody actually stuck on anything. Both of
+the two paths that degrade to a *wrong* key already have their own counters
+and log lines (`FUTEX_KEY_DEGRADED_TO_SHARED` for `read_current_pid()`
+returning `None`; `TGID_RESOLVE_MISSES` / `[identity] WARNING: THREAD_PID_MAP
+pid not ACTIVE...` for a `THREAD_PID_MAP` entry naming a retired pid) — grepped
+the full boot log from the §7.15 hang for both: **zero hits, either one.**
+Ruled out for this run. (Does not rule out a *third*, undiagnosed
+mis-resolution path with no counter — not found, but not exhaustively
+searched either.)
+
+**Re-derived a sharper form of §7.9 point 2 that narrows between the two
+remaining candidates.** The periodic revalidation safety net
+(`FUTEX_REVALIDATE_US = 200_000`, `src/syscall/sync.rs:846`) re-checks the
+*exact* futex word every 200ms using the *same* captured `val` for the whole
+untimed wait (never refreshed mid-loop — only a genuine wake, signal, or a
+changed value ends the loop; there is no timeout branch for `deadline ==
+u64::MAX`, confirmed by reading the loop directly). `Condvar::notify_all()`'s
+first action, in every futex-based `std::sync::Condvar` implementation, is a
+plain userspace atomic `fetch_add` on its own internal epoch — synchronous,
+requires no kernel involvement, and happens *before* the `FUTEX_WAKE` syscall
+is even issued. That means: if `notify_all()` is ever called at all —
+**even if its subsequent `FUTEX_WAKE` syscall then hung or never
+returned** — the epoch bump would already be visible in memory, and the
+waiter's very next 200ms revalidation would observe it and return `EAGAIN`
+(unblocking, regardless of the wake syscall's own fate). Over the 140-200+
+second hangs observed (700+ revalidation cycles), on cache-coherent SMP
+hardware, "the value never changes" cannot be explained by a slow-to-propagate
+write — coherency doesn't hide a write forever, only delay when it's
+observed, and 200ms × hundreds of cycles is not a delay any real coherency
+protocol produces. **This converts §7.9 point 2 from "maybe issued, wake
+lost" to "very likely never called at all"** — i.e. candidate 2
+(`FUTEX_WAKE` entered but not completing) is now the *less* likely of
+§7.12's two remaining candidates, and candidate 1 (the arrival count itself
+never reaches `n`) is the one worth instrumenting next. Caveat: this argument
+assumes QEMU's simulated ARM SMP is genuinely cache-coherent for a plain
+atomic RMW with no explicit barrier — believed true (QEMU's TCG/HVF backends
+model coherent shared memory), not independently re-verified this session.
+
+**Also found, while reading `clone_thread` for the tgid-mismatch check: a
+confirmed, separate, unrelated bug** — a TOCTOU race on file position for
+threads sharing a fd (`CLONE_FILES`), found via a probe's log file
+consistently missing its own first line of output. Root-caused, fixed, and
+verified with a dedicated raw-`write()` reproduction (0/800 corrupted blocks
+after the fix, vs. 136/800 before); full writeup:
+[`CONCURRENT_WRITE_POSITION_RACE.md`](CONCURRENT_WRITE_POSITION_RACE.md).
+**Not the Failure D hang** — a distinct bug, found along the way, real and
+fixed. Flagged here only because it's a plausible (unconfirmed) contributor to
+this doc's own still-open Failure B; see that doc's "Not fixed" section.
+
+**Revised next step:** candidate 1 (arrival count lost) now outranks
+candidate 2 (wake entered but hung) as the thing worth instrumenting.
+`InstrBarrier`'s own `shadow_count`/`shadow_gen`/`last_notify_tid` atomics
+(`userspace/forktest/selfhost_repro/jobserver_stress.rs`) already exist for
+exactly this, lock-free and readable without perturbing the mutex — but the
+watchdog thread that's supposed to print them on a stall has its own
+reliability problem (§7.12: never fired even across an 800+ second hang). Two
+ways to get at that data without depending on the watchdog: (a) a GDB
+memory read of those atomics' live addresses mid-hang (now that GDB usage is
+established, §7.13), reading the *actual* count each stuck process is at —
+directly answers "does count ever reach anywhere near `n`, or does it stall
+at a stable-but-wrong value"; or (b) instrument `sys_futex`'s
+`FUTEX_WAIT`/`FUTEX_WAKE` match arms directly for the barrier's **mutex**
+word (`0x10070f58`-shaped, not the condvar word) to log every acquire/release
+transition with a timestamp — since if the mutex's own wake/unlock protocol
+is what's actually misbehaving (not literally "stuck," since it visibly
+cycles, but perhaps *starving* one specific thread — the barrier's would-be
+4th arrival — indefinitely under contention), that would show up as a
+FIFO-ordering or fairness violation in the mutex's own wake sequence, not as
+a "no wake issued" signature at all.
+
 ---
 
 ## 8. Instrumentation added for Failure B, this session (2026-08-07, uncommitted)

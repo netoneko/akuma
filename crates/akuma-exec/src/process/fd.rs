@@ -202,6 +202,45 @@ impl Process {
         })
     }
 
+    /// Atomically reserve `count` bytes of file position on a plain (non-`O_APPEND`)
+    /// `File` fd and return the reservation's starting offset — i.e. read the current
+    /// position and advance it past the reservation in one lock hold, instead of two
+    /// separate ones with disk I/O in between.
+    ///
+    /// `sys_write` used to read `.position` via [`Process::get_fd`] (a clone of the
+    /// table entry), perform the actual disk write using that snapshot, and only
+    /// write the new position back afterward via [`Process::update_fd`]. Both of
+    /// those individual steps are lock-protected, but the *sequence* is not: two
+    /// threads sharing this fd (`CLONE_FILES`, e.g. any pair of `clone_thread`
+    /// siblings) racing `write()` could both clone the same not-yet-advanced
+    /// `.position`, both write to the same on-disk offset, and corrupt each other's
+    /// data — reproduced directly with a raw multi-thread `write()` probe (no
+    /// userspace locking involved, so the race is entirely in this gap). Returns
+    /// `None` for a non-`File` fd, a missing fd, or an `O_APPEND` fd (append's
+    /// position is derived from the live file size per write, a separate,
+    /// pre-existing race this does not address — see the call site).
+    ///
+    /// Once reserved, the range belongs to this call alone: even a short/failed
+    /// write must never move `.position` backward to "give back" the unused tail,
+    /// since a concurrent writer may already have reserved past it — the correct
+    /// on-disk result of a partial write here is a sparse hole, not a rewound
+    /// position that reopens this exact race.
+    pub fn reserve_write_pos(&self, fd: u32, count: usize) -> Option<usize> {
+        with_irqs_disabled(|| {
+            let mut table = self.fds.table.lock();
+            match table.get_mut(&fd) {
+                Some(FileDescriptor::File(file))
+                    if file.flags & crate::process::types::open_flags::O_APPEND == 0 =>
+                {
+                    let pos = file.position;
+                    file.position = pos.saturating_add(count);
+                    Some(pos)
+                }
+                _ => None,
+            }
+        })
+    }
+
     pub fn set_cloexec(&self, fd: u32) {
         with_irqs_disabled(|| {
             self.fds.cloexec.lock().insert(fd);

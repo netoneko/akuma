@@ -886,15 +886,24 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     // pipe, socket, /dev/*) keeps the BKL.
     let _vfs_bkl = VfsBklGuard::new_if(matches!(fd, akuma_exec::process::FileDescriptor::File(_)));
 
-    // For File descriptors, capture the initial position now (before the loop).
-    // The `fd` variable is a clone — proc.update_fd() updates the real fd table but
-    // `fd` itself never reflects those updates. Track write_pos independently so
-    // multi-chunk writes advance the offset correctly instead of overwriting offset 0.
+    // For File descriptors, reserve the initial position now (before the loop) —
+    // atomically read-and-advance, not a clone-then-write-back-later. `fd` is a
+    // clone (`proc.get_fd()` above), so its own `.position` is only a snapshot;
+    // two threads racing `write()` on the same fd (`CLONE_FILES` — any pair of
+    // `clone_thread` siblings) could both read that same stale position and
+    // corrupt each other's writes on disk. `reserve_write_pos` closes the gap by
+    // reading and advancing the shared position in one lock hold, before any I/O
+    // — see its doc comment for the reproduction. O_APPEND is unchanged: its
+    // position is still derived from the live file size per write (a separate,
+    // pre-existing race this does not address).
     let mut write_pos = if let akuma_exec::process::FileDescriptor::File(ref f) = fd {
         if f.flags & akuma_exec::process::open_flags::O_APPEND != 0 {
             crate::fs::file_size(&f.path).unwrap_or(0) as usize
         } else {
-            f.position
+            match akuma_exec::process::current_process_shared() {
+                Some(p) => p.reserve_write_pos(fd_num as u32, count).unwrap_or(f.position),
+                None => f.position,
+            }
         }
     } else {
         0
@@ -996,18 +1005,29 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 this_chunk as u64
             }
             akuma_exec::process::FileDescriptor::File(ref f) => {
+                let is_append = f.flags & akuma_exec::process::open_flags::O_APPEND != 0;
                 match crate::fs::write_at(&f.path, write_pos, buf_slice) {
                     Ok(n) => {
                         write_pos += n;
-                        let new_pos = write_pos;
-                        if let Some(proc) = akuma_exec::process::current_process_shared() {
-                            proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry {
-                                if file.flags & akuma_exec::process::open_flags::O_APPEND != 0 {
+                        // O_APPEND still needs `.position` published per chunk (its
+                        // start point is re-derived from the live file size on the
+                        // *next* write, not from this field, but readers like
+                        // `lseek(SEEK_CUR)`/`fstat` expect it current). The plain
+                        // case does NOT write `.position` here: `reserve_write_pos`
+                        // already advanced it by the FULL `count` up front, before
+                        // this chunk loop started, so doing it again here would
+                        // double-advance and skip bytes. A short chunk write (n <
+                        // this_chunk) simply leaves the unused tail of the
+                        // reservation as a sparse hole rather than rewinding the
+                        // shared position — see `reserve_write_pos`'s doc comment
+                        // for why rewinding it would reopen the race this closes.
+                        if is_append {
+                            let new_pos = write_pos;
+                            if let Some(proc) = akuma_exec::process::current_process_shared() {
+                                proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry {
                                     file.position = new_pos;
-                                } else {
-                                    file.position += n;
-                                }
-                            });
+                                });
+                            }
                         }
                         n as u64
                     }
