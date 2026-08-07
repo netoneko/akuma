@@ -339,6 +339,13 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
             crate::tprint!(128, "[exit_group] pid={} name={} code={} after {}.{:02}s\n",
                 proc.pid, proc.name, code, secs, frac);
         }
+        // Unconditional (not gated by SYSCALL_DEBUG_NET_ENABLED): correlates with
+        // the `[syscall] execve(path=..., args=...)` line by pid to answer "did the
+        // linker's own exit_group report success" for the truncated-linker-output
+        // investigation — see
+        // docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §4.
+        crate::tprint!(160, "[PROC-EXIT] pid={} tgid={} name={} code={}\n",
+            proc.pid, proc.tgid, proc.name, code);
         let pid = proc.pid;
         let tgid = proc.tgid;
         let proc_tid = proc.thread_id;
@@ -675,7 +682,12 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let env = parse_argv_array(envp_ptr);
 
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    crate::tprint!(192, "[syscall] execve(path=\"{}\", args={:?}) PID {}\n", resolved_path, args, pid);
+    // 192 bytes truncated a linker's full argv (output path included) well before
+    // the interesting part — see
+    // docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §4.5,
+    // "no `ld` line names the crate proves nothing". Widened so the `-o <output>`
+    // argument survives for `cc`/`collect2`/`ld` invocations.
+    crate::tprint!(2048, "[syscall] execve(path=\"{}\", args={:?}) PID {}\n", resolved_path, args, pid);
 
     do_execve(resolved_path, args, env)
 }

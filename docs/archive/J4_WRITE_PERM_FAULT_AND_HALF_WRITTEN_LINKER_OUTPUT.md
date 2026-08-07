@@ -6,13 +6,16 @@ One (**A**) has its *unrecoverability* fixed — the fault handler can now repai
 page state instead of dying — while what corrupts the page state remains unknown.
 One (**B**) is characterised but unfixed, and is now the dominant blocker. The
 [grace-expired hard kill](GRACE_EXPIRED_HARD_KILL_ORPHANS.md) fix is **confirmed
-holding**. All changes uncommitted.
+holding**. A fourth shape (**D**) — rustc threads parked in `FUTEX_WAIT` for the
+bulk of the build, distinct from C — surfaced in a fresh repro and is
+**not yet root-caused**; see §7. All changes uncommitted.
 
 | | what it is | state |
 | --- | --- | --- |
 | **A** | write permission fault with no recovery path | recovery path added (`[EAGER-UPGRADE]`, fires); origin of the bad page state still unknown |
 | **B** | linker leaves a truncated/empty output, cargo execs it | **unfixed — the current blocker** |
 | **C** | a thread survives its thread group's `exit_group`, parked in `FUTEX_WAIT` forever | **root-caused and fixed** |
+| **D** | an rustc thread-group *leader* (never reaching `exit_group`) parked in `FUTEX_WAIT` almost since its own start | **observed once, not root-caused** — see §7 |
 
 This doc exists because both failures were previously reported only as "run 1 hit a
 zero-byte `rust-lld` output" and "run 2 got `SIGSEGV in clone_thread`" — two
@@ -424,7 +427,355 @@ old predicate would also have taken.
 
 ---
 
-## 7. Next steps
+## 7. Failure D — an rustc leader thread parked almost since its own start (2026-08-07, not root-caused)
+
+Found while re-running the repro to widen the `execve` tracer and hunt Failure B
+(§8 covers that instrumentation). This run never reproduced B; it hit something
+else first and was killed once the shape was captured, on the reasoning that a
+stall this reproducible will resurface on its own and can be root-caused then,
+rather than spending this session's remaining budget on a fourth investigation
+mid-stream. **Recorded here, not fixed, not fully explained.**
+
+### 7.1 The symptom
+
+Cold `-j4` build, same repro as always. Progress was normal (25 crates at T+21s,
+104 crates by roughly T+380s), then **stopped advancing entirely**: `grep -c
+Compiling /root/j4.log` returned 104 for the rest of the run, sampled every 20s
+for 9+ minutes (the outer harness's own stall detector fired at the 3-minute
+mark). 11 processes remained alive throughout — this is not a full kernel wedge;
+SSH and `busybox ps`/`grep` kept working the entire time.
+
+### 7.2 The evidence
+
+`[FUTEX-DUMP]` at `T1140.27` (build started at T~0, so ~19 minutes in):
+
+```
+[FUTEX-DUMP] 7 keys
+  key tgid=14 uaddr=0x30859818 waiters=1
+    tid=13 bitset=0xffffffff queued_for=753934600us hist=puSXEpuSXEpuSXEp
+  key tgid=14 uaddr=0x30a555c8 waiters=1
+    tid=14 bitset=0xffffffff queued_for=758672226us hist=--------------Ep
+  key tgid=14 uaddr=0x3196b300 waiters=1
+    tid=12 bitset=0xffffffff queued_for=159068us hist=puSXEpuSXEpuSXEp
+  key tgid=315 uaddr=0x3cda5fc4 waiters=1
+    tid=32 bitset=0xffffffff queued_for=1062208017us hist=pWuXEpWuXEpWuXEp
+  key tgid=315 uaddr=0x3d90e5e8 waiters=1
+    tid=27 bitset=0xffffffff queued_for=1062191730us hist=pWuXEpWuXEpWuXEp
+  key tgid=968 uaddr=0x3cda5fc4 waiters=1
+    tid=19 bitset=0xffffffff queued_for=893967513us hist=pWuXEpWuXEpWuXEp
+  key tgid=968 uaddr=0x3d90f5e8 waiters=1
+    tid=30 bitset=0xffffffff queued_for=893940891us hist=pWuXEpWuXEpWuXEp
+```
+
+`tgid=14` is cargo itself (same convention as §3.2's `Process 14`, confirmed by
+this repro's boot too). `tgid=315` and `tgid=968` are two independent rustc
+invocations, identified from their (garbled, interleaved — see §8.1) `execve`
+lines:
+
+- **pid=315**: `rustc --crate-name build_script_build ... libm-0.2.16/build.rs`,
+  started at `T77.60`. `queued_for=1062208017us` (~1062 s) on both its futex keys
+  means it started waiting at roughly `T78` — **within a couple seconds of
+  starting**, and it is still waiting 1062 s later, i.e. for essentially this
+  process's entire observed lifetime.
+- **pid=968**: `rustc` compiling `zerocopy-derive` (a proc-macro crate, linked
+  against `proc-macro2`/`quote`/`syn`), started ~`T246`. Its futex keys show
+  `queued_for≈894s`, i.e. parked almost immediately after starting, same shape.
+
+### 7.3 Why this is *not* Failure C
+
+Failure C's mechanism requires the thread-group **leader to have already called
+`exit_group`**, with `kill_thread_group` then declining to terminate a sibling
+still parked in an untimed `FUTEX_WAIT`. That is not what the `THR-DUMP` shows
+here:
+
+```
+tid=27 st=? pid=315 tgid=315 l0=0x7318a000 sc=63 tsc=98 a0=0x3d90e5e8 a1=0x80 elr=0x3004839c
+tid=32 st=? pid=319 tgid=315 l0=0x7318a000 sc=-1 tsc=98 a0=0x3cda5fc4 a1=0x80 elr=0x30060cc4
+```
+
+`tid=27` has `pid=315 == tgid=315` — **it is the thread-group leader itself**,
+and it is one of the two parked threads. Rustc's own main thread never reached
+`exit_group`; it is blocked (waiting on a worker, most likely — this looks like
+an internal rayon/thread-pool wait-for-completion, not a syscall exit path) at
+the same time as a sibling (`tid=32`, `pid=319`) is *also* parked. `[KTG]` never
+fires for `my_pid=315` or `my_pid=968` anywhere in this log — `kill_thread_group`
+was never invoked for either, because neither leader ever called `exit_group`.
+Whatever this is, it is upstream of the machinery Failure C's fix touches, not a
+recurrence of it.
+
+The repeated `uaddr=0x3cda5fc4` across two **independent** thread groups (315 and
+968) is consistent with a fixed-ASLR-layout static/TLS futex inside rustc's own
+binary (same address, same binary, no ASLR — matches the VA-reuse pattern
+already noted in §3.4) — i.e. likely the same synchronization primitive in both
+cases, not a coincidence.
+
+The `hist=` field's repeating `pWuXEpWuXEp...` cycle (park–Wake–unpark–eXit–Enter,
+repeating) on both `0x3cda5fc4` waiters suggests each is being woken periodically
+and re-parking without making progress — an unsatisfied-condition loop, not a
+single missed wakeup. Not yet understood; recorded verbatim for whoever picks
+this up.
+
+Cargo's own three parked threads (`tgid=14`, queued 159–759 s) are the most
+likely **downstream** consequence — cargo blocked on subprocess results it will
+never get because pid=315/968 never finish — rather than an independent bug, but
+this is not confirmed either.
+
+### 7.4 Disposition
+
+Killed and the repro re-run to chase Failure B instead (see §8) — but the
+**second** run hit the identical shape again (2-for-2), on `typenum`'s
+build-script rustc and another proc-macro-linked rustc, so it was chased
+further this session. Findings below; not root-caused to a fix, but narrowed a
+lot. **Pick up here.**
+
+### 7.5 What `0x3cda5fc4` actually is (identified from source, not inferred)
+
+`0x3cda5fc4` is the **same address already named in the worked example for the
+already-fixed Failure C** (§4a, `a0=0x3cda5fc4`) — confirmed by grep, not
+coincidence.
+
+Pulled jobserver-rs 0.1.35's actual source (it's on the host at
+`~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/jobserver-0.1.35/src/`
+— `Cargo.lock` pins this version; the guest's own copy is reachable over SSH at
+`/root/.cargo/registry/src/.../jobserver-0.1.35/` if the host copy ever goes
+missing). `HelperState::for_each_request` (`lib.rs:583-606`) — the jobserver
+Helper thread's own loop — does an **untimed** `self.cvar.wait(lock)` whenever
+`requests == 0`. That matches the observed `a1=0x80` (`FUTEX_WAIT|PRIVATE`,
+untimed) exactly, and `HelperState` is one of the first heap allocations
+rustc's codegen backend makes when it sets up its jobserver client — early and
+deterministic enough that, with no ASLR, its `Condvar`'s futex word lands at
+the identical address in every rustc process. That is why it is the *one*
+address that is byte-identical across every stuck invocation (pid=315, 968,
+26, 737 across two separate runs), while each process's *other* stuck address
+(`0x3d90e5e8`/`0x3d90a5e8`/`0x3d90f5e8` — small offset, not identical) is
+something else, allocated later, at a point whose exact address depends on
+incidental prior heap traffic. **Not yet identified** — candidates are
+`imp::Helper::join()`'s `wait_timeout` loop (`unix.rs:349-395`, but that's
+*timed*, `a1` would be `0x89`, so this doesn't match as observed) or
+`JoinHandle::join()`'s own internal `Parker` (a *different*, untimed
+std primitive — matches `futextest.rs` phase 7 below). Needs the same
+source-identification treatment §7.5 gave `0x3cda5fc4` before trusting it.
+
+The Helper's wait is woken only by `HelperThread::request_token()` (someone
+wants a token) or `HelperThread::drop()` (shutdown: `producer_done = true` +
+one `notify_one()`) — both in `lib.rs:552-566`.
+
+### 7.6 The wake was never attempted — not lost, just never issued
+
+`[FUTEX-WAKERING]` (`docs/runbooks/debug-futex-lost-wakeup.md` §2) for
+`uaddr=0x3cda5fc4` shows **zero `same-addr` entries in either entire boot** —
+not "for this tgid", for *any* tgid, across the whole build. Per that runbook's
+own step 2: no wake in that namespace at all means the bug, if any, is
+**upstream of the futex code** — some userspace logic that should have called
+`request_token()` or dropped the `HelperThread` never got there. This rules out
+re-litigating the already-fixed scheduler race (§6a in
+`GRACE_EXPIRED_HARD_KILL_ORPHANS.md`-adjacent territory / the 2026-08-05
+`publish_waiting_and_take_pending_wake` fix): that fix closed a **wake-issued
+but-dropped-by-the-scheduler** gap (`hist` ending `...EpW` with no `u`). What
+we see here ends `...Ep` with **no `W` at all, ever** — a different shape.
+
+### 7.7 A tempting but probably wrong lead — recorded so it isn't re-chased blind
+
+`docs/archive/FUTEX_REQUEUE_LOST_WAKEUP.md` (2026-08-04) fixed a
+`pthread_cond_broadcast`/`FUTEX_REQUEUE` lost-wakeup class, explicitly flagged
+in that doc as *"the plausible candidate for the `typenum` lost-wakeup
+stall"* — and that doc's own text admits *"not reproduced before the fix and
+not re-reproduced after... not a confirmed root-cause-and-cure. A `-j4`
+self-host build that survives past the point it previously stalled is the
+decisive re-test."* That re-test never happened, and **`typenum` is exactly
+what stalled in this session's second run** (pid=26). Tempting to declare this
+the same bug recurring.
+
+**Probably not the mechanism, reasoned but not proven:** that fix targets
+`pthread_cond_broadcast`, which is musl's C-level `pthread_cond` machinery
+(uses `FUTEX_REQUEUE`). jobserver-rs calls plain `std::sync::Condvar`, and
+Rust's std on `target_os = "linux"` (musl included — `target_env` doesn't
+gate this selection) uses its **own raw-futex** `Mutex`/`Condvar`/`Parker`
+primitives, bypassing musl's pthread_cond entirely: plain `FUTEX_WAIT`/
+`FUTEX_WAKE`, never `REQUEUE`. If that's right, the `typenum` name match is
+coincidence — whatever races at this point in the dependency graph happens to
+surface on `typenum`, not the same bug returning. **Not verified** — would be
+worth confirming which lock implementation Rust std actually selects for this
+exact target triple before fully discarding this lead.
+
+### 7.8 The concrete next step: an untried, already-built probe
+
+`userspace/selfhost_repro/futextest.rs` (→ built as `futextest_rs`) already
+exists and already exercises exactly the right primitives in isolation:
+`phase_condvar` (Mutex+Condvar producer/consumer — jobserver's `for_each_request`
+shape) and `phase_park_unpark` (`std::thread::park`'s raw Parker — a candidate
+for the *other*, unidentified address). Both reportedly passed before, but
+**only run in isolation, never under real 4-core contention matching actual
+`-j4` pressure** — which is precisely the condition the already-fixed
+2026-08-05 scheduler bug needed to manifest at all (see
+`debug-futex-lost-wakeup.md` §4a: "why `-j4` and not `-j1`... needs a
+*concurrent* waker on another core to land inside it").
+
+**Do this next:** run many concurrent copies of `futextest_rs` (or a version
+with more rounds / more producer threads, matching jobserver's actual
+multi-producer/single-consumer shape more closely than phase 4's 1:1 pattern)
+under real SMP load — ideally alongside genuine background CPU/scheduler
+pressure, not alone. Much cheaper per iteration than a full rustc build (~15
+min to reproduce vs. seconds), and if it reproduces there, it's a clean kernel
+bug with a tight repro instead of one buried inside rustc. If it does **not**
+reproduce even under heavy stress, that's evidence the bug is specific to
+rustc's actual usage pattern (e.g. the `f(self)`-outside-the-lock timing in
+`for_each_request`, or genuine resource pressure under Akuma's constraints)
+rather than a raw primitive bug — pivot to instrumenting rustc's own jobserver
+call sites at that point instead.
+
+Also still open: identify `0x3d90e5e8`-style precisely (§7.5), and check
+whether `[TERM]`/`[Fault]`/`[kill]`/`[PROC-ORPHAN]` ever name these specific
+tgids (checked for tgid=315 and tgid=26 this session: **zero hits, both
+runs** — ruling out "a sibling died before it could wake me" as the cause).
+
+---
+
+## 8. Instrumentation added for Failure B, this session (2026-08-07, uncommitted)
+
+Landed to make Failure B attributable per §9's original next-steps item 1 ("the
+`execve` tracer truncates its args well before the output path... widen the
+trace first"), then spent chasing Failure D above before B reproduced again:
+
+- **`src/syscall/proc.rs`, `sys_execve`**: the `[syscall] execve(path=...,
+  args=...)` trace buffer was 192 bytes (`tprint!(192, ...)`), which truncates a
+  linker's full argv — including the `-o <output>` path — well before the
+  interesting part, exactly as §4.5 warned. Widened to 2048 bytes. Confirmed
+  safe: `KERNEL_STACK_SIZE` is 1 MB and `safe_print!`/`tprint!` call sites
+  elsewhere already use buffers up to 1024 bytes at comparable (syscall-handler)
+  stack depth.
+- **`src/syscall/proc.rs`, `sys_exit_group`**: added an unconditional (not gated
+  behind `SYSCALL_DEBUG_NET_ENABLED`, which is off by default and would have
+  hidden this) `[PROC-EXIT] pid=... tgid=... name=... code=...` trace, so every
+  process's exit code can be correlated by pid against its `execve` line without
+  needing the net-debug build. This is what identified, e.g., that `pid=1404`
+  (rustc compiling `fdt`) exited normally with `code=0` only ~3 s after
+  starting (§7's stall is unrelated to this pid — noted here only as an example
+  of the new trace in use).
+- **`crates/akuma-exec/src/process/mod.rs`, `kill_children_whose_parent_in`**:
+  added `[ORPHAN-KILL] parent_pid=... child_pid=... already_exited=... name=...`,
+  rate-limited like the existing `[KTG]` family. This is the path (invoked from
+  `return_to_kernel` via `kill_child_processes_for_thread_group`) that
+  force-reaps a still-alive forked child when its parent's whole thread group
+  exits — `already_exited=false` on a linker process (`cc`/`collect2`/`ld`)
+  would mean it was SIGKILL'd mid-write with no flush/close, which would produce
+  exactly Failure B's `0666`-mode truncated-file signature. **Never fired in
+  this run** (0 occurrences) — Failure B did not reproduce this session, so this
+  remains an untested hypothesis, not a ruled-out one. `kill_thread_group`
+  itself (the other candidate named in §9's original item 3) was re-read and
+  confirmed to only ever touch `CLONE_THREAD` siblings (`p.tgid == tgid`), never
+  forked child *processes* — so it structurally cannot be the mechanism that
+  kills a linker; `kill_children_whose_parent_in` is the actual candidate for
+  that role, hence the new tracer's placement.
+
+### 8.1 A gap this run exposed: interleaved console output
+
+Multiple cores print to the same UART concurrently with no per-line locking, so
+under `-j4` many log lines — including `execve` lines carrying the evidence this
+session needed — arrive **byte-interleaved** with lines from other cores (e.g.
+`"PID 968"` split by a `[PSTATS]` line from a different core landing mid-write).
+Worked around here by reading the raw log with a byte-oriented scan (find the
+substring, print surrounding context, strip embedded `[T..]` fragments) rather
+than line-oriented `grep`, and cross-checking against `[mmap]`/`[PSTATS]` lines
+carrying the same pid, which are shorter and interleave less. Not fixed; a
+per-core or lock-protected console buffer would remove the need for this
+workaround, but that is out of scope here.
+
+#### 8.1a Why the existing multikernel fix doesn't cover this
+
+There already *is* a fix for exactly this class of problem, but it doesn't reach
+this build. `src/console.rs`'s `emit()` chokepoint (`docs/reference/subsystems/
+console.md`):
+
+```rust
+fn emit(bytes: &[u8]) {
+    #[cfg(kernel_smp)]
+    if crate::smp::console_emit(bytes) {
+        return;
+    }
+    crate::irq::with_irqs_disabled(|| {
+        for &b in bytes { UART.write(b); }
+    });
+}
+```
+
+Under **multikernel** (`kernel_smp`, the `smp` feature — one isolated kernel per
+core), a secondary can't even map the UART (it's not in its restricted table),
+so it routes output through a per-core `ConsoleRing` (`akuma_smp::ConsoleRing`,
+host-testable) in the shared `MachineConfig` descriptor; a dedicated BSP
+drainer thread (`src/smp.rs`, `start_console_drainer`/`drain_console_rings`)
+empties every ring to the real UART, one core at a time, so only the BSP ever
+touches the hardware. That part genuinely serializes output correctly.
+
+But `#[cfg(kernel_smp)]` and `#[cfg(kernel_smp_shared)]` are mutually exclusive
+builds, and this whole investigation runs on `release-smp-shared` +
+`smp-shared` — **real shared-kernel SMP**, all cores executing one kernel image
+concurrently. There is no `kernel_smp_shared` branch in `emit()` at all, so
+every core falls straight to the `irq::with_irqs_disabled` UART-write loop,
+which only masks the *local* core's IRQs — it does nothing to stop a second
+core writing the same UART register at the same instant. Hence the
+interleaving above.
+
+A further asymmetry matters if this gets ported: multikernel deliberately keeps
+the **BSP's** own path synchronous and ring-free (it's the one core guaranteed
+to still work if the drainer thread is dead or unscheduled). `kernel_smp_shared`
+has no such asymmetric "safe" core — every core is a peer. So a *naive* full
+port (every core → its own ring, one drainer thread empties them all, nobody
+writes UART directly) would make console output dependent on that drainer
+being alive and scheduled. Checked how real that risk is rather than assuming:
+read the two places that print kernel-fatal diagnostics, and both terminate in
+a loop with **no further scheduling, ever**:
+
+- `#[panic_handler]` (`src/main.rs:144-165`): prints the message via
+  `console::print`, then `halt()` → ARM semihosting exit / bare `wfi`. No yield
+  after the print.
+- The unrecoverable branch of `rust_sync_el1_handler` (`src/exceptions.rs`,
+  the true kernel-mode fault path — distinct from the *recoverable* per-process
+  `[Fault]`/`[WPF]` dumps this doc's evidence is built on, which the kernel
+  keeps running and scheduling after): prints the full register/page-table
+  dump via `safe_print!`, then `loop { asm!("wfe") }` forever.
+
+Those are the **only two** call sites that print-then-never-schedule-again.
+Everything else — every other `tprint!`/`safe_print!` in normal kernel/syscall
+code, *including* the recoverable EL0 `[Fault]` path — keeps scheduling
+afterward, so a single drainer thread would flush a ring within one quantum,
+same as the existing multikernel doc's own claim. So the risk isn't "a
+background thread now gates all debugging output"; it's two specific,
+identifiable call sites that need to keep writing the UART directly. A single
+drainer thread for everything else is low-risk — closer to the multikernel
+design's actual intent than the vaguer "full port" framing first written here.
+
+**Design, not yet implemented:**
+
+1. Add a plain shared per-core `ConsoleRing` array (reuse the existing
+   `akuma_smp::ConsoleRing` type — already host-tested, already lock-free SPSC)
+   indexed by `current_core_id()` (`crates/akuma-exec/src/bkl.rs:274` — a bare
+   `mrs mpidr_el1` read, zero dependencies, safe to call from a fault handler).
+2. `emit()` gets a `#[cfg(kernel_smp_shared)]` branch: every core, including
+   whichever one is acting as primary, writes to its own ring instead of the
+   UART.
+3. One drainer thread (same shape as `start_console_drainer`/
+   `drain_console_rings`, generalized to read the new array instead of the
+   `MachineConfig` descriptor) — `loop { drain_all_rings(); yield_now(); }`.
+   Only this thread ever touches `UART.write`, so no lock is needed at all.
+4. The two call sites above (`panic()`, and `rust_sync_el1_handler`'s fatal
+   branch) keep today's synchronous `irq::with_irqs_disabled` direct-UART-write
+   loop, untouched — never routed through the ring.
+
+An alternative for (2)-(4) — a bare spinlock around the existing direct-write
+loop instead of a ring — was considered and rejected as the primary plan: it
+adds lock contention on the exact hot path (`-j4` logging volume) the ring
+avoids entirely, for no benefit now that the drainer-liveness risk turned out
+to be two well-identified call sites rather than an open-ended one. Still
+worth keeping in mind as a fallback if the ring approach hits an unforeseen
+snag.
+
+Not implemented this session — recorded here so the design isn't rediscovered
+from scratch next time `-j4` log evidence needs cross-core attribution.
+
+---
+
+## 9. Next steps
 
 1. **Failure B is now the blocker — start here.** Log every `ld`/`collect2`/`cc` exit
    status next to the parent's `wait4` result, and check whether the linker is among

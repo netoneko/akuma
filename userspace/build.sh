@@ -240,6 +240,18 @@ echo "Building pthread_kill_eintr (C, pthread_kill EINTR probe)..."
 cp eintr_repro/pthread_kill_eintr ../bootstrap/bin/
 echo "pthread_kill_eintr (C) copied to bootstrap/bin/"
 
+# eager_mprotect_probe: does mprotect still hold on an EAGER mmap after the
+# Failure-A recovery path (MmapRegion::flags + [EAGER-UPGRADE])? Guards against
+# the upgrade gate firing when mprotect downgraded the region to read-only or
+# PROT_NONE, which would silently defeat mprotect. Tiny; built unconditionally.
+echo "Building eager_mprotect_probe (C, mprotect-vs-eager-region probe)..."
+(
+    cd forktest/c_stress
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o eager_mprotect_probe eager_mprotect_probe.c
+)
+cp forktest/c_stress/eager_mprotect_probe ../bootstrap/bin/
+echo "eager_mprotect_probe (C) copied to bootstrap/bin/"
+
 # Build forktest (Go, opt-in via --with-forktest)
 if [ "$WITH_FORKTEST" = true ]; then
     echo "Building forktest (Go)..."

@@ -50,6 +50,15 @@ static KTG_TRACES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(kernel_smp_shared)]
 static KTG_STALE_SKIPS: AtomicUsize = AtomicUsize::new(0);
 
+/// Rate-limit counter for the `[ORPHAN-KILL]` tripwire in
+/// [`kill_children_whose_parent_in`]: a forked child (e.g. a linker) being
+/// force-reaped because its parent is exiting while the child is still alive.
+/// Investigating the truncated/empty linker-output failure
+/// (docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §4) — a
+/// child killed here mid-write would explain a `0666`, never-`chmod`-to-`0777`
+/// output exactly.
+static ORPHAN_KILL_TRACES: AtomicUsize = AtomicUsize::new(0);
+
 pub static FORK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 use spinning_top::Spinlock;
 
@@ -1487,14 +1496,32 @@ fn kill_children_whose_parent_in(parents: &BTreeSet<Pid>) {
     // Do not skip `proc.exited`: children may already be Zombie(137) from a
     // prior kill_thread_group without unregister_process; they must still be
     // torn down here or `ps` shows zombies forever.
-    let mut children: Vec<(Pid, Option<usize>, usize)> = Vec::new();
+    let mut children: Vec<(Pid, Pid, Option<usize>, usize, bool, String)> = Vec::new();
     table::for_each_process(|p| {
         if parents.contains(&p.parent_pid) {
-            children.push((p.pid, p.thread_id, p.address_space.l0_phys()));
+            children.push((p.pid, p.parent_pid, p.thread_id, p.address_space.l0_phys(),
+                p.exited, p.name.clone()));
         }
     });
 
-    for (child_pid, _, l0_phys) in &children {
+    // A child force-reaped here *while still alive* (`already_exited=false`) never
+    // got to run its own exit path — no fd flush, no `chmod`, no clean file close.
+    // If that child is a linker (`cc`/`collect2`/`ld`/`rust-lld`), this is the
+    // mechanism behind the truncated/empty linker-output failure: see
+    // docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §4.
+    for (child_pid, parent_pid, _, _, already_exited, name) in &children {
+        if ORPHAN_KILL_TRACES.fetch_add(1, Ordering::Relaxed) < 512 {
+            let mut buf = [0u8; 176];
+            let mut pos = 0;
+            let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
+                format_args!(
+                    "[ORPHAN-KILL] parent_pid={} child_pid={} already_exited={} name={}\n",
+                    parent_pid, child_pid, already_exited, name));
+            if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+        }
+    }
+
+    for (child_pid, _, _, l0_phys, _, _) in &children {
         kill_fork_subtree_recursive(*child_pid, *l0_phys);
     }
 
