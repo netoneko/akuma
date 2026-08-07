@@ -77,10 +77,23 @@ The `--release` (default-feature) kernel build now runs to completion in-VM at
 cargo build --release -p akuma -j4 --offline     # disk_selfhost.img, SMP=4, MEMORY=14336
 ```
 
-| run | date | wall | result |
-|---|---|---|---|
-| 1st green | 2026-08-07 | 11m 21s | 97 deps + final crate through LTO, 4.3 MB ELF. Kernel = pre-`kill_thread_group`-fix tree |
-| 2nd green | 2026-08-07 | **9m 43s** | 108 `Compiling` lines from an empty `target/`, `EXIT=0`, 4.3 MB ELF at `target/aarch64-unknown-none/release/akuma`. Kernel = the `kill_thread_group` stale-tid fix ([`../archive/KTG_STALE_TID_EXIT_STAMP_J4_HANG.md`](../archive/KTG_STALE_TID_EXIT_STAMP_J4_HANG.md)) |
+Six `-j4` attempts are on record, all 2026-08-07 — one before the
+`kill_thread_group` stale-tid fix, five after (each a fresh boot with an empty
+`target/`, so each is an independent sample):
+
+| run | wall | result |
+|---|---|---|
+| pre-fix | 11m 21s | **green** — 97 deps + final crate through LTO, 4.3 MB ELF |
+| 1 | — | **hard wedge at T459** (defect A below) |
+| 2 | 9m 43s | **green** — 108 crates, `EXIT=0`, 4.3 MB ELF at `target/aarch64-unknown-none/release/akuma` |
+| 3 | 91 s | **`EXIT=139`** (SIGSEGV), 15 crates (defect B below) |
+| 4 | 8m 36s | **green** — 108 crates, `EXIT=0` |
+| 5 | 6m 34s | **green** — 108 crates, `EXIT=0` |
+
+So **4 of 6 green, 3 of 5 post-fix** — the build completes in one go more often
+than not, but is not yet dependable. Kernel for runs 1-5 = the
+`kill_thread_group` stale-tid fix
+([`../archive/KTG_STALE_TID_EXIT_STAMP_J4_HANG.md`](../archive/KTG_STALE_TID_EXIT_STAMP_J4_HANG.md)).
 
 **Scope — this does not close §5.1.** Both runs built the `release` profile with
 default features. §5.1's deterministic final-crate deadlock was on
@@ -102,16 +115,44 @@ leak the pipe write refcount that hung `rustc` in `read()` forever. Note the
 print is rate-limited to the first 64 fires, so 63 is near the cap and a longer
 run under-reports — reboot between measurements rather than looping in one boot.
 
-**Still not reliable, for a different reason.** Of three known `-j4` attempts,
-two finished and one **hard-wedged at T459** (~7.6 min in): all 4 vCPUs pinned at
-100 %, serial console silent from mid-`[mmap]` storm onward, guest sshd accepting
-the forwarded TCP connection but never sending a banner, kernel heartbeat
-stopped. That run had **zero** `[KTG-STALE-CH]`, zero `[PROC-ORPHAN]`, no
-`PANIC`, no `[WILD-DA]`, and PMM was 89 % free — so it is neither the KTG class
-nor OOM. Unexplained and **OPEN**. Boot with `GDB=1` (gdbstub on `1234+INSTANCE`)
-so it can be dissected with lldb if it recurs; a serial log that stops advancing
-is the only load-independent wedge signal (SSH banner timeouts are normal under
-build load and mean nothing).
+### The two remaining blockers — both OPEN, neither is the KTG class
+
+**Defect A — all-core wedge (run 1).** Hard-wedged at T459 (~7.6 min in): all 4
+vCPUs pinned at 100 %, serial console silent from mid-`[mmap]` storm onward,
+guest sshd accepting the forwarded TCP connection but never sending a banner,
+kernel heartbeat stopped. **Zero** `[KTG-STALE-CH]`, zero `[PROC-ORPHAN]`, no
+`PANIC`, no `[WILD-DA]`, and PMM 89 % free — so neither the KTG class nor OOM.
+Did not recur in runs 2-5. Boot with `GDB=1` (gdbstub on `1234+INSTANCE`, so
+`:1235` at `INSTANCE=1`) and dissect with lldb if it recurs — QEMU's gdbstub
+must be armed at launch, so a wedge on a VM booted without it is uninspectable.
+A serial log that stops advancing is the only load-independent wedge signal:
+SSH banner timeouts are normal under build load and mean nothing.
+
+**Defect B — cargo's heap corrupts (run 3).** `cargo` (pid 17) took a null
+dereference and the build died with `EXIT=139` after 15 crates:
+
+```
+[WILD-DA] pid=17 FAR=0x0 ELR=0x104e48c8 last_sc=222
+```
+
+Twice at the same PC, 20 ms apart. cargo's text loads at `seg_va=0x10000000`
+(`filesz=0x1da1c6c` — match that, not the 1 MB `0x109ad0` segment another binary
+maps at the same base), so the PC is file offset `0x4e48c8`:
+
+```
+4e48b4 <drop_glue<cargo::compiler::unit::UnitInner>>:
+  4e48c0:  ldr x8, [x0, #288]     ; load the Rc<PackageInner> pointer
+  4e48c8:  ldr x9, [x8]           ; FAULT — x8 == 0
+```
+
+It is the refcount decrement in `Rc::drop`, and the pointer field at
+`UnitInner+288` read back as **zero**. Safe Rust cannot construct a null `Rc`,
+so this is cargo's heap being corrupted underneath it rather than a cargo bug —
+a qword that should hold a live pointer reading as zero. That points at page
+management (a zeroed or wrong page handed back), the same family as the fixed
+`madvise(WILLNEED)` zero-fill of file-backed lazy pages. Previously logged as a
+teardown-only curiosity; it is not teardown-only, it fired at T72 mid-build and
+killed the run.
 
 ## Prerequisites
 
@@ -517,6 +558,8 @@ same tree.
 | `Exec format error (os error 8)` on the same `build-script-build` every attempt | 0-byte artifact from a crashed link, still "fresh" to cargo | Delete the fingerprint dir (§5.4) — not a kernel bug |
 | Build restarts lose all progress; ssh dies ~every 5 min | remote cargo killed with the ssh session | Run detached + poll (§5.2) |
 | `qemu-system-aarch64: Assertion failed: (isv), hvf.c:1883` | guest touched MMIO with an instruction HVF can't decode, after the kernel went off the rails | Symptom of the ld-musl class — [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) |
+| All 4 vCPUs at 100 %, **serial log stops advancing**, sshd accepts TCP but sends no banner, heartbeat gone | Defect A — unexplained all-core wedge. Not KTG (zero `[KTG-STALE-CH]`), not OOM (PMM 89 % free) | **OPEN** — boot with `GDB=1` and take an lldb dump of all vCPUs. Log staleness is the signal; SSH timeouts alone are not (§"Status (2026-08-07)") |
+| Build dies `EXIT=139`; `[WILD-DA] pid=<cargo> FAR=0x0` at a fixed `ELR` | Defect B — a pointer in cargo's heap read back as zero (null `Rc` in `drop_glue`); heap corruption, not a cargo bug | **OPEN** — decode `ELR` against `seg_va=0x10000000 filesz=0x1da1c6c`; suspect page management (§"Status (2026-08-07)") |
 
 ## Background
 
