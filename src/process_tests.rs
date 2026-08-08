@@ -610,6 +610,10 @@ pub fn run_all_tests() {
     test_unregister_process_terminates_thread();
     test_unregister_process_skips_current_thread();
     test_kill_thread_group_two_phase();
+    // execve must destroy other thread-group members before swapping the
+    // address space (docs/archive/PAGE_TABLE_UAF_BKL_STORM.md §4.1) — a live
+    // CLONE_THREAD sibling left running is one trigger for the page-table UAF.
+    test_execve_kills_thread_group_siblings();
     // Recycled-tid channel stamp forged an exit for a live process (-j4 hang)
     test_ktg_stale_tid_channel_not_stamped();
     test_mark_terminated_ignores_large_ids();
@@ -15085,6 +15089,75 @@ fn test_kill_thread_group_two_phase() {
         console::print("[Test] kill_thread_group_two_phase PASSED\n");
     } else {
         console::print("[Test] kill_thread_group_two_phase FAILED: sibling still registered\n");
+    }
+}
+
+/// Regression (docs/archive/PAGE_TABLE_UAF_BKL_STORM.md §4.1): POSIX execve
+/// must destroy every other thread in the calling process's thread group
+/// before the image is replaced. Before the fix, `replace_image` never called
+/// `kill_thread_group` — a live CLONE_THREAD sibling kept running under the
+/// address space `replace_image` was about to free, which is one trigger for
+/// the page-table use-after-free that caused whole-VM freezes under `-j4`
+/// self-host builds. This drives a real `replace_image` (same trick
+/// `test_signal_reset_on_exec` uses: re-exec `/bin/elftest` into itself) with a
+/// registered synthetic CLONE_THREAD sibling sharing the leader's address
+/// space, and asserts the sibling is gone afterward.
+fn test_execve_kills_thread_group_siblings() {
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
+    use akuma_exec::threading::MAX_THREADS;
+    use alloc::string::String;
+
+    const ELF_PATH: &str = "/bin/elftest";
+    let elf_data = if let Ok(d) = fs::read_file(ELF_PATH) { d } else {
+        crate::safe_print!(96, "[Test] execve_kills_thread_group_siblings SKIPPED ({} not found)\n", ELF_PATH);
+        return;
+    };
+
+    let mut leader = match process::Process::from_elf(
+        "elftest", &[String::from("leader")], &[], &elf_data, None,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::safe_print!(64, "[Test] execve_kills_thread_group_siblings: from_elf failed: {:?}\n", e);
+            return;
+        }
+    };
+    let leader_pid = leader.pid;
+
+    // Register a synthetic CLONE_THREAD sibling sharing the leader's address space.
+    let sibling_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let sibling_tid = MAX_THREADS + 42;
+    let mut sibling = make_test_process(sibling_pid);
+    sibling.tgid = leader_pid;
+    sibling.thread_id = Some(sibling_tid);
+    sibling.address_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new_shared(leader.address_space.l0_phys()) {
+        a
+    } else {
+        crate::safe_print!(64, "[Test] execve_kills_thread_group_siblings: new_shared failed\n");
+        return;
+    };
+    register_process(sibling_pid, sibling);
+
+    // Re-exec the leader into the same test binary — this must kill the sibling.
+    let replace_result = leader.replace_image(&elf_data, &[String::from("leader")], &[]);
+
+    let replace_ok = replace_result.is_ok();
+    let sibling_gone = lookup_process_shared(sibling_pid).is_none();
+
+    if replace_ok && sibling_gone {
+        console::print("[Test] execve_kills_thread_group_siblings PASSED\n");
+    } else {
+        crate::safe_print!(
+            160,
+            "[Test] execve_kills_thread_group_siblings FAILED: replace_ok={} sibling_gone={} replace_err={:?}\n",
+            replace_ok, sibling_gone, replace_result.err(),
+        );
+    }
+
+    // Defensive cleanup: if the fix regressed and the sibling is still
+    // registered, don't let it leak into later tests in the suite.
+    if !sibling_gone {
+        let _ = unregister_process(sibling_pid);
     }
 }
 

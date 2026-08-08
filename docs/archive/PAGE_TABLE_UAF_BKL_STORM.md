@@ -207,21 +207,27 @@ older/smaller snapshot than the one behind the original ~1-in-12 measurement,
 so individual GREEN rounds finish in ~165-190s rather than ~11+ minutes — cheap
 enough to run far more rounds for the same wall-clock budget.
 
-Results after 15 completed rounds (campaign still running past this snapshot):
+Results after 17 completed rounds (campaign still running past this snapshot):
 
 | outcome | n |
 | --- | ---: |
-| `GREEN` | 13 |
+| `GREEN` | 15 |
 | **`BKL_STORM`** | **2** |
 | silent wedge | 0 |
 | `EXIT=139` | 0 |
 
-Both storms reproduce the exact signature from §1-§2: `KERNEL_LOCK` HELD
-(`owner=4` = core 3 both times), `allocator::TALC`/`pmm::PMM` both free (rules
-out the silent-wedge class), 3 cores spinning at `KernelLock::acquire+620`, the
-4th core's PC pinned at `exception_vector_table+0x200` — unable to even fetch
-its own fault handler. One of the two rounds (round 9, lane 1) was live-probed
-via `lockprobe.py` while it was actually storming:
+~1 storm per 8-9 rounds here — noisier than the original ~1-in-12, consistent
+with a smaller/faster per-round build giving less total build time between
+samples rather than a higher true underlying rate; not a rate this campaign
+size can pin down precisely (see §4.2.2). Both storms reproduce the exact
+signature from §1-§2: `KERNEL_LOCK` HELD (`owner=4` = core 3 both times),
+`allocator::TALC`/`pmm::PMM` both free (rules out the silent-wedge class), 3
+cores spinning at `KernelLock::acquire+620`, the 4th core's PC pinned at
+`exception_vector_table+0x200` — unable to even fetch its own fault handler.
+Round 9 (lane 1) ran the full 1200s budget (finalized at 1227s, 37,719
+`[BKL] stuck` lines — round 31's earlier capture was 40,082, same order of
+magnitude) and was live-probed via `lockprobe.py` while it was actually
+storming:
 
 ```
 BKL @ 0x40329150 owner=4 next_ticket=6474823 now_serving=6474819
@@ -237,7 +243,7 @@ Even CPU#3's own stack pointer is unreadable through its live translation —
 not just the vector table. **The fix in §4.1 is real and necessary (it closes
 a genuine POSIX gap and a plausible concrete trigger), but it is not
 sufficient**: this campaign is running the fixed binary and the storm still
-hit twice in the first 15 rounds. That is fully consistent with §4.1's own
+hit twice in the first 17 rounds. That is fully consistent with §4.1's own
 "what this does and doesn't close" — the missing cross-core TTBR liveness
 check ahead of `UserAddressSpace::drop`'s frame-free is still the open gap,
 and nothing observed in this campaign points at CLONE_THREAD siblings as this
@@ -247,7 +253,23 @@ so the "hard-terminated straggler leaves its own core's `TTBR0_EL1`
 unreprogrammed" path flagged in §4.1, or some other still-unidentified
 teardown race, remains the live suspect.
 
-### 4.2.1 New instrument: per-core exception-entry counters
+### 4.2.1 Rate caveat — don't over-read 2/17
+
+2 storms in 17 rounds (~12%) looks similar to the original ~1-in-12 estimate,
+but the two campaigns aren't measuring the same thing precisely: rounds here
+are a smaller/older self-host snapshot finishing in ~165-190s rather than the
+original's ~11+ minutes, so each round represents far less total build/exec
+activity. If the storm's true trigger scales with wall-clock build time (or
+total execve count) rather than with "one round," this campaign's per-round
+rate would be expected to *undercount* relative to the original measurement,
+not match it — the fact that it instead came out similar could mean the
+trigger doesn't scale that way, or could just be small-sample noise (a 95%
+CI on 2/17 is roughly 3%-38%, wide enough to be consistent with almost
+anything from "somewhat rarer" to "somewhat more common" than 1-in-12). Take
+this campaign as confirmation the storm still reproduces on the fixed kernel
+and that its signature is unchanged — not as a precise post-fix rate.
+
+### 4.2.2 New instrument: per-core exception-entry counters
 
 Added `exceptions::EXCEPTION_ENTRIES` (`src/exceptions.rs`), an 8-slot
 `AtomicU64` array incremented as the first statement of every exception
@@ -309,10 +331,13 @@ Two independent 2-lane `-j4` campaigns (fresh VM per round, clean
 | --- | ---: | ---: | ---: | ---: | ---: |
 | baseline `600640711...` | 25 | 18 | 6 | 1 | 0 |
 | PMM/TALC fixed `27903e0e...` | 23 | 20 | **0** | **2** | 1 |
+| `execve`-siblings fixed `9a9eb04` (§4.2, smaller/faster build, don't compare rates directly — §4.2.1) | 17 | 15 | 0 | **2** | 0 |
 
 So this storm is **unaffected** by the allocator fix — as expected — and with the
 silent wedge eliminated it is now the **dominant remaining failure** of in-guest
-`-j4` builds, at roughly 1 round in 12.
+`-j4` builds, at roughly 1 round in 12. The `execve`-siblings fix (§4.1) doesn't
+move this number either: it closes a real, separate gap, but this storm's
+actual trigger is still open.
 
 ### 6.1 Second instance, same signature
 
