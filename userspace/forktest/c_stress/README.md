@@ -50,6 +50,19 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   processes all run under a non-zero ASID — so the invalidation matched nothing
   and `sys_mprotect` could not downgrade a cached translation. Measured 3 FAIL
   before the fix, 3 PASS after, 3 PASS on Linux.
+- `cowstale` — **deterministic reproducer for the `EXIT=139` / `[WPF] cow_ref=0
+  lazy_self=NONE` class** (proposals/COWSTALE_FORK_THREAD_SEGV.md). Forks
+  repeatedly from a process that has live reader threads, so several cores hold
+  translations for a range while fork demotes it to read-only; parent and child
+  each write their own pattern and verify the other's is never visible. Written
+  to catch a CoW break landing a write in the wrong frame; what it actually finds
+  first is a fatal fault in ~0.01 s. **Minimal trigger: >=2 fork rounds AND >=2
+  reader threads** — one round passes, one thread passes, both together SEGV.
+  8/8 on Akuma (idle VM, no build load); PASSES on real Linux aarch64
+  (`docker run --rm --platform linux/arm64 -v "$PWD/cowstale:/cowstale:ro" alpine
+  /cowstale 40 32 3`). Usage: `cowstale [rounds] [pages] [reader_threads]`,
+  exit 0 = clean. This replaces the ~1-in-5, ten-minute self-host build as the
+  way to ask "is it fixed yet".
 - `clonearg` — does a freshly cloned thread see the memory its parent wrote
   immediately before `clone()`? Clones raw (musl `__clone`'s exact register
   shape) so the child's first instructions are the ones the rustc thread-spawn

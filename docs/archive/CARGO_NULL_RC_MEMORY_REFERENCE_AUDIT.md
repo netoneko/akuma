@@ -11,9 +11,72 @@ with the evidence behind it, including the **three** theories the evidence has
 already killed. Branch `stabilize-devbox`.
 
 **Current state in one line:** the `[EAGER-UPGRADE]` anomaly turned out not to be a
-lost permission at all — the page table was correct every time — so the hunt has
-moved to *stale translations*, which is the first theory consistent with all the
-measurements.
+lost permission at all — the page table was correct every time — and a purpose-built
+probe (`cowstale`) now reproduces a fault in the same class **deterministically in
+0.01 s**, replacing the ~1-in-5 ten-minute build as the oracle (§0).
+
+**Active brief for continuing this work:**
+[`proposals/COWSTALE_FORK_THREAD_SEGV.md`](../../proposals/COWSTALE_FORK_THREAD_SEGV.md).
+
+---
+
+## 0. The reproducer (2026-08-08, latest)
+
+`userspace/forktest/c_stress/cowstale.c` was written to test D10's malignant face
+— does a CoW break ever land a write in the wrong frame? It found something
+faster: **`EXIT=139` in ~0.01 s, 8 of 8 attempts, on an idle VM with no build
+load.**
+
+```
+[Fault] Data abort from EL0 at FAR=0x420260, ELR=0x400868, ISS=0x4f
+[WPF] pid=7 va=0x420000 pa=0x91dac000 mapped=true cow_ref=0
+      lazy_self=NONE lazy_owner=NONE have_owner=true
+[Fault] Process 8 (/tmp/cowstale) SIGSEGV after 0.01s
+```
+
+`ISS=0x4f` = DFSC `0b001111`, permission fault level 3, WnR set. `[WPF] cow_ref=0
+lazy_self=NONE` is the signature `src/exceptions.rs` names in its own comments as
+the one that killed cargo mid-build.
+
+### 0.1 Minimal trigger
+
+| rounds | reader threads | result |
+| ---: | ---: | --- |
+| 1 | any | PASS |
+| 5 | 0 | PASS |
+| 5 | 1 | PASS |
+| **2** | **2** | **SEGV** |
+| 20 | 2 | SEGV |
+
+**Two or more `fork()` rounds AND two or more live threads** — one fork passes,
+one thread passes, both together fail. Exactly cargo's shape: a multi-threaded
+process forking repeatedly.
+
+### 0.2 The pointer lost bit 28
+
+The mapping is at `0x10420000`; the faulting write went to `0x420260`, landing in
+the binary's own read-only image. `x20=0x420248`, `x2=x3=0x5041524e00000000` (the
+probe's own parent pattern), so this is its fill loop writing through a pointer
+that came back missing `0x10000000`.
+
+The kernel's SIGSEGV is therefore arguably *correct* — that address really is
+read-only. The defect is upstream: a pointer read from the process's own memory
+came back wrong. Same class as "a live pointer qword reads back as zero", which is
+what kills cargo. **Whether they are the same bug is not yet established.**
+
+### 0.3 Calibration
+
+The identical binary **passes on real Linux aarch64** (`docker run --platform
+linux/arm64 alpine /cowstale 40 32 3`, 3.9M reader-checks, 0 faults), so the
+probe's semantics are sound and the failure is the kernel's.
+
+### 0.4 Why this changes the methodology
+
+Four consecutive green `-j4` builds were recorded during this session while
+`cowstale` was failing 8/8 on the same tree. At the documented ~1-in-5 rate, four
+greens in a row happen ~41% of the time with the bug fully intact. **Build runs
+are not a sensitive enough instrument to answer "is it fixed".** Use the
+deterministic probe.
 
 ---
 
@@ -444,9 +507,15 @@ mostly a matter of reusing that helper for the flags case, plus:
 
 ## 11. Next steps
 
-1. **Run 6 verdict**: `[TLB] repeats=0` with a non-zero `stale_write_faults`
-   confirms stale translations. Non-zero `repeats` refutes §3.5/§3.6 and the search
-   reopens.
+Now driven by [`proposals/COWSTALE_FORK_THREAD_SEGV.md`](../../proposals/COWSTALE_FORK_THREAD_SEGV.md).
+Highest-value first step: wire `print_page_forensics` into the `[WPF]`/SIGSEGV
+path, since that is where the deterministic reproducer lands and it would
+immediately say what is mapped at the faulting VA with no region record.
+
+0. **Run 6 verdict (done)**: `stale_write_faults=3`, `repeats=0`,
+   `EAGER-UPGRADE=0` — flushing alone resolved every one, confirming §3.6's
+   mechanical claim. It does **not** separate "stale translation" from "benign
+   race" (§4.3 caveat).
 2. If confirmed, audit every PTE-editing path for its invalidation: which ones
    flush, when relative to the write, and with what barrier. The broadcast
    instructions themselves are correct, so look for a missing flush or an ordering
