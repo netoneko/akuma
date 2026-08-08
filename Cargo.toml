@@ -123,6 +123,25 @@ inherits = "release"
 [profile.devbox]
 inherits = "release"
 
+# DWARF debug-info variant of `release-smp-shared`, for source-level lldb debugging
+# against the gdbstub (see docs/reference/scripts/multi-vm.md) instead of raw
+# addresses. OFF BY DEFAULT: nothing selects this profile unless explicitly
+# requested — `cargo build --profile release-smp-shared-debug --features
+# smp-shared,devbox-smoltcp,no-tests` (or whatever feature set you're debugging).
+# `cargo build --profile release-smp-shared` (the real target) is byte-for-byte
+# unaffected.
+#
+# Only use this on a bug you can ALREADY reproduce reliably. `lockprobe.py`
+# deliberately symbolicates off `.symtab` and skips DWARF entirely because full
+# debug info changes the loaded image by ~100 KB, which can shift a
+# timing-sensitive race (see docs/reference/build-profiles.md). This profile
+# exists for the opposite situation: you have a live repro and want lldb to show
+# you source lines/locals instead of raw PC/LR values — a convenience, not a
+# hunting tool.
+[profile.release-smp-shared-debug]
+inherits = "release-smp-shared"
+debug = true
+
 [features]
 default = [
     "neko",

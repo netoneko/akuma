@@ -1543,6 +1543,23 @@ fn run_async_main() -> ! {
                     exceptions::STALE_TLB_WRITE_FAULTS.load(Ordering::Relaxed),
                     exceptions::STALE_TLB_REPEATS.load(Ordering::Relaxed));
             }
+            // Per-core exception-vector entry counts (docs/archive/PAGE_TABLE_UAF_BKL_STORM.md):
+            // a core stuck in the unreachable-vector storm never gets past the vector's own
+            // first instruction fetch, so its count here freezes solid while healthy cores'
+            // counts keep climbing — a live, external-readable confirmation of "zero forward
+            // progress on this core" that doesn't depend on catching byte-identical registers
+            // across a gdb sample gap. Always prints all MAX_CORES=8 slots — idle/nonexistent
+            // cores just read 0, which is self-explanatory.
+            {
+                use core::sync::atomic::Ordering;
+                let e = &exceptions::EXCEPTION_ENTRIES;
+                crate::tprint!(160,
+                    "[EXC] core0={} core1={} core2={} core3={} core4={} core5={} core6={} core7={}\n",
+                    e[0].load(Ordering::Relaxed), e[1].load(Ordering::Relaxed),
+                    e[2].load(Ordering::Relaxed), e[3].load(Ordering::Relaxed),
+                    e[4].load(Ordering::Relaxed), e[5].load(Ordering::Relaxed),
+                    e[6].load(Ordering::Relaxed), e[7].load(Ordering::Relaxed));
+            }
             // Deadlock-hunt aid: the Thread-0 heartbeat's dump trigger fires
             // every 50M idle loops (~never with idle_halt); piggyback on the
             // 30s PSTATS cadence instead so a wedged thread's parked resume

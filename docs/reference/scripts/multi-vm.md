@@ -46,4 +46,17 @@ those PCs is a test-and-test-and-set inner loop (`isb; ldrb wN,[xB,#off]; cbnz`)
 so `adrp`-base + displacement *is* the lock address, and `info symbol` names it.
 That works even when the waiter holds no register pointing at the lock.
 
+## Want source lines instead of addresses?
+
+Once you already have a reliable repro (not while still hunting — see below),
+[`release-smp-shared-debug`](../build-profiles.md#debug-info-variant-opt-in-off-by-default)
+is a DWARF-enabled build for source-level `lldb` debugging against the same
+gdbstub. It's off by default and separate from the plain `release-smp-shared`
+profile precisely because adding debug info changes the loaded image size
+(+102,720 bytes measured, `text`-only) enough to plausibly move a
+timing-sensitive race — exactly the failure mode `lockprobe.py` avoids by
+symbolicating off `.symtab` instead. Reach for the DWARF profile only after
+you can reproduce the bug on the plain profile; use it to read source instead
+of hunting with it.
+
 Back to [`README.md`](README.md).

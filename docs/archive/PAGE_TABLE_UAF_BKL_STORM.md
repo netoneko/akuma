@@ -195,6 +195,95 @@ core may not have run the switch-out that would reprogram that core's
 same fault, unaffected by this fix, that a real IPI-based TTBR shootdown or a
 liveness check in the PMM free path would still be needed to close.
 
+## 4.2 Post-fix campaign: the storm still reproduces
+
+Methodology mirrors [`PMM_TALC_LOCK_CYCLE_SILENT_WEDGE.md`](PMM_TALC_LOCK_CYCLE_SILENT_WEDGE.md)
+§7: fresh VM boot per round (`SNAPSHOT=1`, writes discarded), `rm -rf
+target/aarch64-unknown-none` before each round, then an in-guest self-host
+`cargo build ... -j4` against the fixed kernel (§4.1's `execve` sibling-kill
+committed at `9a9eb04`), SMP=4, MEMORY=14336. Two parallel lanes, 1200s budget
+per round. The cloned in-guest repo on this run's `disk_selfhost.img` is an
+older/smaller snapshot than the one behind the original ~1-in-12 measurement,
+so individual GREEN rounds finish in ~165-190s rather than ~11+ minutes — cheap
+enough to run far more rounds for the same wall-clock budget.
+
+Results after 15 completed rounds (campaign still running past this snapshot):
+
+| outcome | n |
+| --- | ---: |
+| `GREEN` | 13 |
+| **`BKL_STORM`** | **2** |
+| silent wedge | 0 |
+| `EXIT=139` | 0 |
+
+Both storms reproduce the exact signature from §1-§2: `KERNEL_LOCK` HELD
+(`owner=4` = core 3 both times), `allocator::TALC`/`pmm::PMM` both free (rules
+out the silent-wedge class), 3 cores spinning at `KernelLock::acquire+620`, the
+4th core's PC pinned at `exception_vector_table+0x200` — unable to even fetch
+its own fault handler. One of the two rounds (round 9, lane 1) was live-probed
+via `lockprobe.py` while it was actually storming:
+
+```
+BKL @ 0x40329150 owner=4 next_ticket=6474823 now_serving=6474819
+VERDICT: BKL HELD by core 3
+allocator::TALC: 0x00 (free)   pmm::PMM: 0x00 (free)
+
+CPU#0/1/2  PC = KernelLock::acquire+620
+CPU#3      PC = 0x4011a200 (exception_vector_table)
+           SP = 0x88773330 — Cannot access memory at that address
+```
+
+Even CPU#3's own stack pointer is unreadable through its live translation —
+not just the vector table. **The fix in §4.1 is real and necessary (it closes
+a genuine POSIX gap and a plausible concrete trigger), but it is not
+sufficient**: this campaign is running the fixed binary and the storm still
+hit twice in the first 15 rounds. That is fully consistent with §4.1's own
+"what this does and doesn't close" — the missing cross-core TTBR liveness
+check ahead of `UserAddressSpace::drop`'s frame-free is still the open gap,
+and nothing observed in this campaign points at CLONE_THREAD siblings as this
+particular occurrence's trigger (the self-host build's `execve` targets are
+ordinary fork+exec'd single-threaded tools, not multi-threaded processes) —
+so the "hard-terminated straggler leaves its own core's `TTBR0_EL1`
+unreprogrammed" path flagged in §4.1, or some other still-unidentified
+teardown race, remains the live suspect.
+
+### 4.2.1 New instrument: per-core exception-entry counters
+
+Added `exceptions::EXCEPTION_ENTRIES` (`src/exceptions.rs`), an 8-slot
+`AtomicU64` array incremented as the first statement of every exception
+handler (`rust_sync_el1_handler`, `rust_sync_el0_handler`,
+`rust_irq_handler_with_sp`, `rust_default_exception_handler`), indexed by
+`bkl::current_core_id()`. Printed every 30s alongside `[PSTATS]` as `[EXC]
+core0=N core1=N ...`, and independently readable live via gdbstub even when
+the printer itself can't run.
+
+**What it confirmed, read live via `aarch64-elf-gdb -ex "target remote
+:1235" -ex "x/8gx 0x40258810"` against the storming round-9 VM, two samples
+6s apart:** all four cores' counts were byte-identical across the gap —
+`0xf4ff4 0xffac1 0xfaf5b 0x10507d` unchanged. That is a clean confirmation
+that **zero exception-vector entries succeeded anywhere in the machine** for
+that whole window, not merely on the one core sitting at the unreachable
+vector.
+
+**What it did *not* show, and why:** the original hope was a frozen-vs-climbing
+split — core 3 flat, the other three still climbing, as sharp proof that
+*specifically* core 3 stopped while its peers kept running. That didn't
+happen, because the three peers spin on `KernelLock::acquire` with IRQs
+masked (by design, for the spin loop's own bookkeeping) — they take no
+exceptions at all while waiting, healthy or not. So this counter proves the
+*storm* freezes exception traffic system-wide (useful, and it also would have
+caught the disproven `fault → handler → eret → refault` reading, since that
+shape *would* show the stuck core's count climbing fast while doing nothing
+else — see §2), but it cannot isolate "this one core is uniquely broken" the
+way a per-core instructions-retired count would.
+
+Also tried live: reading `PMCCNTR_EL0` (the ARM PMU cycle counter) via the
+same gdbstub connection, on all four threads. It read `0x0` on every core —
+Akuma's kernel never enables the PMU, so this register carries no signal here.
+Confirming "the broken core retires literally zero instructions while its
+spinning peers keep retiring plenty" would need the kernel to explicitly
+configure and enable a PMU event counter first; not done in this session.
+
 ## 5. Why no instrument caught it
 
 The PMM already has a use-after-free detector (`config::PMM_UAF_QUARANTINE`), and

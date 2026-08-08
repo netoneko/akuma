@@ -80,6 +80,28 @@ Also watch for single symbols dominating a subsystem:
 `curve25519_dalek::…::ED25519_BASEPOINT_TABLE_INNER_DOC_HIDDEN` is 30,720 bytes
 of rodata by itself.
 
+## Debug-info variant (opt-in, off by default)
+
+`release-smp-shared-debug` inherits `release-smp-shared` and adds `debug =
+true` — full DWARF, for source-level `lldb` debugging against the gdbstub
+(see [`scripts/multi-vm.md`](scripts/multi-vm.md) — there is no host `gdb` in
+this environment, so `lldb` targeting QEMU's gdbstub is the debugger of
+record) instead of raw PC/LR addresses.
+
+```bash
+cargo build --profile release-smp-shared-debug --features smp-shared,devbox-smoltcp,no-tests
+```
+
+Nothing selects this profile unless asked for by name — `release-smp-shared`
+itself is byte-for-byte unaffected. **Only use it on a bug you can already
+reproduce reliably.** `lockprobe.py` deliberately symbolicates off `.symtab`
+alone and skips DWARF for exactly the opposite reason this profile exists:
+measured here, DWARF shifts the *loaded* image (`text`, via `llvm-size`) by
++102,720 bytes (1,331,276 → 1,433,996 at `9a9eb04`) — `data`/`bss` unaffected.
+That is enough to move a timing-sensitive race, so reach for this profile only
+once you're past the hunting phase and just want lldb to show source lines and
+locals instead of addresses.
+
 ## What `userspace-sshd` actually does
 
 `userspace-sshd` (used by `devbox` and `devbox-smoltcp`) does **not** compile the

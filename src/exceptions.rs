@@ -1769,6 +1769,7 @@ pub fn init() {
 /// CRITICAL: Must NOT return if ELR/SPSR are invalid, or ERET will crash!
 #[unsafe(no_mangle)]
 extern "C" fn rust_default_exception_handler() {
+    note_exception_entry();
     let esr: u64;
     let elr: u64;
     let spsr: u64;
@@ -1856,6 +1857,7 @@ fn irq_eret_poison_check(final_sp: u64, switched: bool) {
 /// switch, is the *incoming* thread's frame. No-op unless `cfg(kernel_smp_shared)`.
 #[unsafe(no_mangle)]
 extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
+    note_exception_entry();
     // Under shared SMP, read the interrupted frame's SPSR up front: SPSR.M[3:0]==0 means
     // we preempted EL0 (userspace), where this core holds NO BKL (the invariant is "held
     // iff in EL1"). That is exactly the case where the scheduler SGI can run BKL-FREE
@@ -2062,6 +2064,33 @@ fn print_write_perm_fault_diag(far: u64, iss: u64, pid: u32, as_owner: u32) {
         eager.unwrap_or(u64::MAX), pte.unwrap_or(0), ap_rw,
         akuma_exec::process::lookup_process_shared(as_owner).is_some(),
         free);
+}
+
+/// Per-core count of successful exception-vector entries (sync EL1, sync EL0, IRQ —
+/// anything that got far enough to run its Rust handler body). Indexed by
+/// `bkl::current_core_id()`.
+///
+/// This exists to distinguish two failure shapes that look identical from the
+/// outside (all cores pinned, ~400% host CPU, no console progress):
+/// a `fault -> handler -> eret -> refault` loop keeps *entering* the handler over
+/// and over (this counter climbs fast on that core), versus the page-table UAF
+/// storm (docs/archive/PAGE_TABLE_UAF_BKL_STORM.md) where the vector's own first
+/// instruction fetch fails — the handler is never entered at all, so this counter
+/// on that core freezes solid while the other cores' counters keep climbing.
+/// A frozen-vs-climbing split, read live via a debugger, is a harder proof of
+/// "zero forward progress on this core" than byte-identical register snapshots.
+pub static EXCEPTION_ENTRIES: [core::sync::atomic::AtomicU64; akuma_exec::threading::MAX_CORES] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [INIT; akuma_exec::threading::MAX_CORES]
+};
+
+#[inline(always)]
+fn note_exception_entry() {
+    let core = akuma_exec::bkl::current_core_id() as usize;
+    if core < EXCEPTION_ENTRIES.len() {
+        EXCEPTION_ENTRIES[core].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Write faults absorbed because the PTE already granted the write — the access
@@ -2399,6 +2428,7 @@ fn try_resolve_el1_user_copy_lazy_fault() -> bool {
 /// pointer leaves the call site + 4 in LR).
 #[unsafe(no_mangle)]
 extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
+    note_exception_entry();
     // Quick CoW pre-check: avoid the full debug dump for expected CoW write faults.
     // EC=0x25 + DFSC=0x0F (permission fault L3) + WnR + user VA → almost certainly CoW.
     // Quick CoW pre-check: resolve CoW write faults before full debug dump.
@@ -2854,6 +2884,7 @@ pub fn spurious_svc_count() -> u64 {
 /// on another core) and the live syndrome registers then belong to someone
 /// else's trap. Same for ELR_EL1 — use the frame's saved copy.
 extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u64) -> u64 {
+    note_exception_entry();
     // Per-syscall BKL opt-out (Phase 7f, BKL_FINE_GRAINED_LOCKING_PLAN.md §7.3):
     // acquire the BKL UNLESS the trapped syscall's number is on the opt-out list.
     // The decision is LATCHED here and reused verbatim on every exit path below —
