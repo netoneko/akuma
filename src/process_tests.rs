@@ -630,6 +630,9 @@ pub fn run_all_tests() {
     // munmap" + ba60d72 "even faster munmap"). Guards the PMM-free invariant of
     // the BTreeMap user_frames refcount and deferred-TLB teardown path.
     test_munmap_teardown_conserves_pmm();
+    // munmap must drain EVERY eager region a range touches, not just one matched by
+    // exact start_va (proposals/CARGO_HEAP_NULL_RC.md D8).
+    test_munmap_spans_multiple_eager_regions();
     test_aliased_pa_not_double_freed();
     test_unmap_and_free_respects_refcount();
 
@@ -4111,6 +4114,111 @@ fn test_ensure_user_pages_mapped_as_lock() {
 /// real munmap primitive (`unmap_and_free_page` → `free_page`) must return the
 /// PMM to exactly its starting free count — no leak, no over-free. Expected to
 /// PASS on a correct teardown path; fails if the refcount/free pairing drifts.
+/// `munmap` over a range that spans several eager regions — and starts inside the
+/// first one — must detach every page in the range and leave the rest intact.
+///
+/// The old code matched a single region by exact `start_va` and returned, so this
+/// shape unmapped only the first region's pages, reported success, and left the
+/// remainder mapped with its VA never recycled. A leftover region is also a live
+/// protection record for an address that has moved on, which
+/// `eager_region_flags_for_page_fault` will answer from — see
+/// proposals/CARGO_HEAP_NULL_RC.md (D8/D9). Host tests in `akuma-exec` cover the
+/// clipping shapes; this one pins the kernel-side integration: real frames, the
+/// real region list under `vm_lock`, and PMM conservation across the whole cycle.
+fn test_munmap_spans_multiple_eager_regions() {
+    use akuma_exec::mmu::user_flags;
+    use akuma_exec::process::MmapRegion;
+    const REGIONS: usize = 3;
+    const PAGES_PER: usize = 4;
+    const BASE: usize = BENCH_VA_BASE + 0x40_0000;
+
+    let (free_before, free_after, detached_pages, survived_pages, frames_seen) =
+        crate::irq::with_irqs_disabled(|| {
+            let (_t, _a, free_before) = crate::pmm::stats();
+            let (detached_pages, survived_pages, frames_seen) = {
+                let mut p = make_test_process(992_100);
+                // Three adjacent 4-page regions, each owning real frames.
+                for r in 0..REGIONS {
+                    let mut frames = alloc::vec::Vec::new();
+                    for i in 0..PAGES_PER {
+                        let va = BASE + (r * PAGES_PER + i) * 0x1000;
+                        let Some(frame) = crate::pmm::alloc_page_zeroed() else { break };
+                        if p.address_space.map_page(va, frame.addr, user_flags::RW).is_err() {
+                            crate::pmm::free_page(frame);
+                            break;
+                        }
+                        p.address_space.track_user_frame(frame);
+                        frames.push(frame);
+                    }
+                    p.vm_with_regions(|list| list.push(MmapRegion::owned_with_flags(
+                        BASE + r * PAGES_PER * 0x1000, frames, user_flags::RW)));
+                }
+
+                // Unmap from the middle of region 0 through the middle of region 2:
+                // 2 + 4 + 2 = 8 pages, touching all three regions.
+                let start = BASE + 2 * 0x1000;
+                let end = BASE + 10 * 0x1000;
+                let pieces = p.vm_with_regions(|list| {
+                    akuma_exec::process::detach_eager_regions_in_range(list, start, end)
+                });
+                let detached_pages: usize = pieces.iter().map(|(_, n, _)| *n).sum();
+                let mut frames_seen = 0usize;
+                for (base, n, frames) in pieces {
+                    frames_seen += frames.len();
+                    for i in 0..n {
+                        let va = base + i * 0x1000;
+                        match frames.get(i) {
+                            Some(&f) => {
+                                let _ = p.address_space.unmap_page(va);
+                                if p.address_space.remove_user_frame(f) {
+                                    crate::pmm::free_page(f);
+                                }
+                            }
+                            None => {
+                                if let Some(f) = p.address_space.unmap_and_free_page(va) {
+                                    crate::pmm::free_page(f);
+                                }
+                            }
+                        }
+                    }
+                }
+                let survived_pages = p.vm_with_regions(|list|
+                    list.iter().filter(|r| r.start_va >= BASE).map(|r| r.pages).sum::<usize>());
+
+                // Free what survived, so the conservation check below measures the
+                // detach path rather than this test's own leftovers.
+                let leftovers = p.vm_with_regions(|list| {
+                    let mut out = alloc::vec::Vec::new();
+                    list.retain(|r| {
+                        if r.start_va >= BASE { out.push((r.start_va, r.pages)); false } else { true }
+                    });
+                    out
+                });
+                for (base, n) in leftovers {
+                    for i in 0..n {
+                        if let Some(f) = p.address_space.unmap_and_free_page(base + i * 0x1000) {
+                            crate::pmm::free_page(f);
+                        }
+                    }
+                }
+                (detached_pages, survived_pages, frames_seen)
+            };
+            let (_t, _a, free_after) = crate::pmm::stats();
+            (free_before, free_after, detached_pages, survived_pages, frames_seen)
+        });
+
+    let pages_ok = detached_pages == 8 && survived_pages == 4 && frames_seen == 8;
+    let pmm_ok = free_after == free_before;
+    if pages_ok && pmm_ok {
+        console::print("[Test] munmap_spans_multiple_eager_regions PASSED\n");
+    } else {
+        crate::safe_print!(192,
+            "[Test] munmap_spans_multiple_eager_regions FAILED: detached={} (want 8) survived={} \
+             (want 4) frames={} (want 8) free_before={} free_after={}\n",
+            detached_pages, survived_pages, frames_seen, free_before, free_after);
+    }
+}
+
 fn test_munmap_teardown_conserves_pmm() {
     use akuma_exec::mmu::user_flags;
     const N: usize = 64;

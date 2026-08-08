@@ -1174,6 +1174,106 @@ pub fn eager_region_flags_for_page_fault(pid: Pid, va: usize) -> Option<u64> {
     lookup(pid)
 }
 
+/// Detach every eager region overlapping `[range_start, range_end)`, clipping
+/// partial ones at both ends, and return one `(base_va, pages, owned_frames)`
+/// piece per region touched. Surviving head/tail pieces are left in `regions`.
+///
+/// This is `munmap`'s region bookkeeping, split out from `sys_munmap` so it can be
+/// tested directly: region splitting is where this code has gone wrong before, and
+/// the shapes that matter (full / prefix / suffix / middle / multi-region /
+/// CoW-inherited) are all reachable from a plain `Vec` without a live process.
+///
+/// The caller does the page unmapping and frame freeing **after** releasing
+/// `vm_lock` — those take other locks and must not run under it.
+///
+/// # Why it clips rather than matching one region
+///
+/// The original matched a single region by exact `start_va` and stopped there, so
+/// an unmap starting mid-region or spanning two of them freed only the first
+/// region's pages, returned success, and left the rest mapped with their VA never
+/// recycled. A leftover region is also a live protection record for an address
+/// that has moved on, which `eager_region_flags_for_page_fault` will happily answer
+/// from. See proposals/CARGO_HEAP_NULL_RC.md (D8/D9).
+///
+/// Page counts come from `MmapRegion::pages`, never `frames.len()`: a CoW-inherited
+/// region has every page mapped but owns no frames.
+pub fn detach_eager_regions_in_range(
+    regions: &mut alloc::vec::Vec<MmapRegion>,
+    range_start: usize,
+    range_end: usize,
+) -> alloc::vec::Vec<(usize, usize, alloc::vec::Vec<PhysFrame>)> {
+    let mut pieces = alloc::vec::Vec::new();
+    if range_end <= range_start {
+        return pieces;
+    }
+    let mut i = 0usize;
+    while i < regions.len() {
+        let reg_start = regions[i].start_va;
+        let reg_pages = regions[i].pages;
+        let reg_end = reg_start + reg_pages * crate::mmu::PAGE_SIZE;
+        if reg_start >= range_end || reg_end <= range_start {
+            i += 1;
+            continue;
+        }
+        let clip_start = range_start.max(reg_start);
+        let clip_end = range_end.min(reg_end);
+        let head_pages = (clip_start - reg_start) / crate::mmu::PAGE_SIZE;
+        let clip_pages = (clip_end - clip_start) / crate::mmu::PAGE_SIZE;
+        let tail_pages = (reg_end - clip_end) / crate::mmu::PAGE_SIZE;
+
+        // Split the frame vector in step with the extent. `filter_map(next)`
+        // tolerates the CoW-inherited case (`frames` empty): every piece then
+        // carries its page count and no frames, which is exactly right.
+        let reg = regions.remove(i);
+        let flags = reg.flags;
+        let mut it = reg.frames.into_iter();
+        let head: alloc::vec::Vec<PhysFrame> = (0..head_pages).filter_map(|_| it.next()).collect();
+        let mid: alloc::vec::Vec<PhysFrame> = (0..clip_pages).filter_map(|_| it.next()).collect();
+        let tail: alloc::vec::Vec<PhysFrame> = it.collect();
+
+        // Survivors keep the protection of the region they came from: a partial
+        // unmap changes extent, not permission. Both lie entirely outside
+        // [range_start, range_end), so re-examining them costs one overlap test
+        // and cannot loop.
+        if head_pages > 0 {
+            regions.push(MmapRegion { start_va: reg_start, pages: head_pages, frames: head, flags });
+        }
+        if tail_pages > 0 {
+            regions.push(MmapRegion { start_va: clip_end, pages: tail_pages, frames: tail, flags });
+        }
+        if clip_pages > 0 {
+            pieces.push((clip_start, clip_pages, mid));
+        }
+        // `remove(i)` shifted the next candidate into slot `i`; do not advance.
+    }
+    pieces
+}
+
+/// Every eager region covering `va`, as `(start_va, pages, flags)`.
+///
+/// [`eager_region_flags_for_page_fault`] answers from the **first** `Vec` match,
+/// so if two regions cover one VA the winner is decided by insertion order and an
+/// obsolete record can shadow the live one — which is indistinguishable, from the
+/// fault handler's side, from a page whose protection was legitimately recorded.
+/// This exists so an anomaly report can say how many regions actually claim the
+/// address: more than one is a bookkeeping bug, not a close call. See
+/// proposals/CARGO_HEAP_NULL_RC.md.
+pub fn eager_regions_containing(pid: Pid, va: usize) -> alloc::vec::Vec<(usize, usize, u64)> {
+    let owner = address_space_owner_pid_for_fault().unwrap_or(pid);
+    let collect = |p: Pid| -> alloc::vec::Vec<(usize, usize, u64)> {
+        lookup_process_shared(p).map_or_else(alloc::vec::Vec::new, |proc| {
+            proc.vm_with_regions(|r| {
+                r.iter()
+                    .filter(|reg| reg.contains(va))
+                    .map(|reg| (reg.start_va, reg.pages, reg.flags))
+                    .collect()
+            })
+        })
+    };
+    let owned = collect(owner);
+    if owned.is_empty() && owner != pid { collect(pid) } else { owned }
+}
+
 /// Update flags on all **eager** mmap regions overlapping
 /// `[range_start, range_start+range_size)`.
 ///
@@ -1723,6 +1823,133 @@ mod mmap_region_inheritance_tests {
         assert_eq!(r.frame_for(0x2012_0338), None);
         assert_eq!(r.frame_for(0x9999_0000), None);
     }
+    // ── `detach_eager_regions_in_range` — munmap's region bookkeeping ──────────
+    //
+    // Region splitting is where this code has gone wrong before, so every shape is
+    // pinned here rather than inferred: the pieces handed back must account for
+    // exactly the pages inside the range, the survivors must account for exactly
+    // the pages outside it, and frames must follow their pages in both directions.
+
+    /// Total pages a region list covers, for conservation assertions.
+    fn total_pages(r: &alloc::vec::Vec<MmapRegion>) -> usize {
+        r.iter().map(|x| x.pages).sum()
+    }
+
+    /// A range covering the whole region detaches it entirely, leaving nothing.
+    #[test]
+    fn detach_full_region_removes_it() {
+        let mut r = alloc::vec![MmapRegion::owned_with_flags(0x1000_0000, frames(4), user_flags::RW)];
+        let pieces = detach_eager_regions_in_range(&mut r, 0x1000_0000, 0x1000_4000);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].0, 0x1000_0000);
+        assert_eq!(pieces[0].1, 4);
+        assert_eq!(pieces[0].2.len(), 4, "all frames go with the detached pages");
+        assert!(r.is_empty(), "nothing should survive a full-cover unmap");
+    }
+
+    /// A prefix unmap keeps the suffix, with the suffix's frames and its flags.
+    #[test]
+    fn detach_prefix_keeps_suffix() {
+        let mut r = alloc::vec![MmapRegion::owned_with_flags(0x1000_0000, frames(6), user_flags::RW)];
+        let pieces = detach_eager_regions_in_range(&mut r, 0x1000_0000, 0x1000_2000);
+        assert_eq!(pieces[0].1, 2);
+        assert_eq!(pieces[0].2.len(), 2);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].start_va, 0x1000_2000);
+        assert_eq!(r[0].pages, 4);
+        assert_eq!(r[0].frames.len(), 4);
+        assert_eq!(r[0].flags, user_flags::RW, "extent changed, permission did not");
+    }
+
+    /// A suffix unmap keeps the head at the original base.
+    #[test]
+    fn detach_suffix_keeps_head() {
+        let mut r = alloc::vec![MmapRegion::owned_with_flags(0x1000_0000, frames(6), user_flags::RW)];
+        let pieces = detach_eager_regions_in_range(&mut r, 0x1000_4000, 0x1000_6000);
+        assert_eq!(pieces[0].0, 0x1000_4000);
+        assert_eq!(pieces[0].1, 2);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].start_va, 0x1000_0000);
+        assert_eq!(r[0].pages, 4);
+    }
+
+    /// A middle unmap leaves TWO survivors, and every frame lands in exactly one
+    /// of the three parts.
+    #[test]
+    fn detach_middle_splits_into_two_survivors() {
+        let mut r = alloc::vec![MmapRegion::owned_with_flags(0x1000_0000, frames(6), user_flags::RW)];
+        let pieces = detach_eager_regions_in_range(&mut r, 0x1000_2000, 0x1000_4000);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].0, 0x1000_2000);
+        assert_eq!(pieces[0].1, 2);
+        assert_eq!(r.len(), 2, "head and tail both survive a middle unmap");
+        assert_eq!(total_pages(&r), 4);
+        let frames_kept: usize = r.iter().map(|x| x.frames.len()).sum();
+        assert_eq!(frames_kept + pieces[0].2.len(), 6, "frames are conserved across the split");
+    }
+
+    /// The defect this function exists to fix: a range spanning several regions
+    /// must detach ALL of them, not just the one starting at `addr`.
+    #[test]
+    fn detach_spans_multiple_regions() {
+        let mut r = alloc::vec![
+            MmapRegion::owned_with_flags(0x1000_0000, frames(2), user_flags::RW),
+            MmapRegion::owned_with_flags(0x1000_2000, frames(2), user_flags::RO),
+            MmapRegion::owned_with_flags(0x1000_4000, frames(2), user_flags::RW),
+        ];
+        let pieces = detach_eager_regions_in_range(&mut r, 0x1000_0000, 0x1000_6000);
+        assert_eq!(pieces.len(), 3, "every overlapped region must be detached");
+        let detached_pages: usize = pieces.iter().map(|p| p.1).sum();
+        assert_eq!(detached_pages, 6);
+        assert!(r.is_empty());
+    }
+
+    /// An unmap starting mid-region and running into the next one: the old
+    /// exact-`start_va` match found nothing here and silently unmapped nothing.
+    #[test]
+    fn detach_starting_mid_region_reaches_the_next() {
+        let mut r = alloc::vec![
+            MmapRegion::owned_with_flags(0x1000_0000, frames(4), user_flags::RW),
+            MmapRegion::owned_with_flags(0x1000_4000, frames(4), user_flags::RW),
+        ];
+        let pieces = detach_eager_regions_in_range(&mut r, 0x1000_2000, 0x1000_6000);
+        let detached_pages: usize = pieces.iter().map(|p| p.1).sum();
+        assert_eq!(detached_pages, 4, "2 pages from each region");
+        assert_eq!(total_pages(&r), 4, "the untouched halves survive");
+    }
+
+    /// A CoW-inherited region owns no frames but still covers pages; its extent
+    /// must split without inventing frames for the pieces.
+    #[test]
+    fn detach_cow_inherited_region_splits_by_pages() {
+        let mut r = alloc::vec![MmapRegion::inherited_with_flags(0x1000_0000, 6, user_flags::RW)];
+        let pieces = detach_eager_regions_in_range(&mut r, 0x1000_2000, 0x1000_4000);
+        assert_eq!(pieces[0].1, 2, "pages come from `pages`, not `frames.len()`");
+        assert!(pieces[0].2.is_empty(), "an inherited region owns no frames to hand over");
+        assert_eq!(total_pages(&r), 4);
+        assert!(r.iter().all(|x| x.frames.is_empty()));
+    }
+
+    /// A range touching nothing leaves the list alone.
+    #[test]
+    fn detach_non_overlapping_range_is_a_noop() {
+        let mut r = alloc::vec![MmapRegion::owned_with_flags(0x1000_0000, frames(2), user_flags::RW)];
+        let pieces = detach_eager_regions_in_range(&mut r, 0x2000_0000, 0x2000_2000);
+        assert!(pieces.is_empty());
+        assert_eq!(r.len(), 1);
+        assert_eq!(total_pages(&r), 2);
+    }
+
+    /// An empty range detaches nothing — and, since survivors are re-pushed onto
+    /// the same vector the loop is scanning, must not spin.
+    #[test]
+    fn detach_empty_range_terminates() {
+        let mut r = alloc::vec![MmapRegion::owned_with_flags(0x1000_0000, frames(2), user_flags::RW)];
+        let pieces = detach_eager_regions_in_range(&mut r, 0x1000_0000, 0x1000_0000);
+        assert!(pieces.is_empty());
+        assert_eq!(total_pages(&r), 2);
+    }
+
 }
 
 #[cfg(test)]

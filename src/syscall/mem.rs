@@ -944,41 +944,32 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     let _mm_window = MmBklGuard::new();
 
     let unmap_len = if len > 0 { (len + 4095) & !4095 } else { 4096 };
-    let unmap_pages = unmap_len / 4096;
 
-    // Locate & detach the eager region under vm_lock (pure Vec ops only): for a
-    // full unmap, remove it; for a partial prefix, remove it, split off the prefix
-    // frames, and re-push the remaining suffix. The actual page unmap + frame free
-    // happens AFTER the lock is released (it takes other locks and must not run
-    // while vm_lock is held). Returns (base_va, pages_to_unmap, owned_frames) or None.
+    // Detach EVERY eager region overlapping the range, clipping partial ones at
+    // both ends, under vm_lock (pure Vec ops only). The actual page unmap + frame
+    // free happens AFTER the lock is released (it takes other locks and must not
+    // run while vm_lock is held). Yields one `(base_va, pages, owned_frames)` piece
+    // per region touched.
     //
-    // `pages_to_unmap` comes from `MmapRegion::pages`, not the frame count: a
-    // CoW-inherited region has every page mapped but owns no frames, and sizing
-    // the unmap by `frames.len()` would silently unmap nothing and leak the VA
-    // range back to `alloc_mmap` while the pages stayed live.
+    // This used to match a single region by **exact `start_va`** and return. Any
+    // unmap that began mid-region, or spanned more than one, therefore unmapped only
+    // the first region's worth of pages, reported success, and left the rest mapped
+    // with their VA never recycled. Nothing created split regions often enough for
+    // that to show — but every mechanism that does (a partial `mprotect` that splits
+    // for flags, a stale region left by an earlier clipped unmap) turns it into a
+    // silent leak, and a leftover region also lets an obsolete protection record
+    // shadow the live one in `eager_region_flags_for_page_fault`. See
+    // proposals/CARGO_HEAP_NULL_RC.md (D8/D9).
+    //
+    // Page counts come from `MmapRegion::pages`, not the frame count: a CoW-inherited
+    // region has every page mapped but owns no frames, and sizing the unmap by
+    // `frames.len()` would silently unmap nothing while recycling the VA range.
+    let unmap_end = addr.saturating_add(unmap_len);
     let detached = proc.vm_with_regions(|r| {
-        let idx = r.iter().position(|reg| reg.start_va == addr)?;
-        let region_pages = r[idx].pages;
-        if unmap_pages >= region_pages {
-            let reg = r.remove(idx);
-            Some((addr, region_pages, reg.frames))
-        } else {
-            let reg = r.remove(idx);
-            let mut iter = reg.frames.into_iter();
-            let prefix: Vec<crate::pmm::PhysFrame> = (0..unmap_pages).filter_map(|_| iter.next()).collect();
-            let remaining: Vec<crate::pmm::PhysFrame> = iter.collect();
-            r.push(MmapRegion {
-                start_va: reg.start_va + unmap_pages * 4096,
-                pages: region_pages - unmap_pages,
-                frames: remaining,
-                // The surviving suffix keeps the protection of the region it was
-                // split out of; a partial unmap changes extent, not permission.
-                flags: reg.flags,
-            });
-            Some((reg.start_va, unmap_pages, prefix))
-        }
+        akuma_exec::process::detach_eager_regions_in_range(r, addr, unmap_end)
     });
-    if let Some((base, n, frames)) = detached {
+    let unmapped_any_eager = !detached.is_empty();
+    for (base, n, frames) in detached {
         if crate::config::TRACE_MUNMAP {
             crate::tprint!(128, "[munmap] pid={} addr=0x{:x} ({} pages, {} owned, base=0x{:x})\n",
                 proc.pid, addr, n, frames.len(), base);
@@ -1027,10 +1018,12 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
             akuma_exec::mmu::flush_tlb_range_all_asid(base, n);
         });
         for frame in to_free { crate::pmm::free_page(frame); }
-        proc.vm_free_mmap(addr, n * 4096);
-        return 0;
+        proc.vm_free_mmap(base, n * 4096);
     }
 
+    // Lazy regions in the same range. Previously unreachable whenever an eager
+    // region matched, because that path returned — so a range covering both kinds
+    // left the lazy half mapped.
     let results = akuma_exec::process::munmap_lazy_regions_in_range(proc.tgid, addr, unmap_len);
     if !results.is_empty() {
         for &(freed_start, freed_pages) in &results {
@@ -1055,6 +1048,9 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
                 proc.vm_free_mmap(freed_start, freed_pages * 4096);
             }
         }
+        return 0;
+    }
+    if unmapped_any_eager {
         return 0;
     }
 

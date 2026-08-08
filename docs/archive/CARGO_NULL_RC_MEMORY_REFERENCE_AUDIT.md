@@ -6,10 +6,14 @@ build dies with `EXIT=139`. Safe Rust cannot construct a null `Rc`, so a live
 pointer qword in cargo's anonymous heap read back as zero — a kernel
 memory-management bug.
 
-This file records what the instrumentation has established, what it has ruled
-out, and the theories still standing. It is a **live investigation log**, not a
-conclusion: statements are tagged with the evidence behind them. Branch
-`stabilize-devbox`.
+This is a **live investigation log**, not a conclusion. Every statement is tagged
+with the evidence behind it, including the **three** theories the evidence has
+already killed. Branch `stabilize-devbox`.
+
+**Current state in one line:** the `[EAGER-UPGRADE]` anomaly turned out not to be a
+lost permission at all — the page table was correct every time — so the hunt has
+moved to *stale translations*, which is the first theory consistent with all the
+measurements.
 
 ---
 
@@ -28,188 +32,374 @@ process faulted dereferencing a pointer loaded from that same page:
 Those were the only two `[EAGER-UPGRADE]` lines in 86k lines of log, and both were
 pid 17 (cargo) on heap pages.
 
-`[EAGER-UPGRADE]` (`src/exceptions.rs`, the last arm of the permission-fault
-block) fires on exactly one state: **a write fault on a VALID but read-only PTE,
-inside an eager `mmap` region whose recorded flags say RW, where
-`cow_ref_get(pa) == 0` and no lazy region covers the page.** It forces the PTE to
-RW and resumes — which is why the process survived another 20 ms before reading a
-corrupt value.
+### 1.1 Where `[EAGER-UPGRADE]` sits
+
+It is the **last arm of the permission-fault ladder** — the fallback taken when
+every other repair declines:
+
+```mermaid
+flowchart LR
+    W["write fault<br/>on a valid page"] --> C{"cow_ref &gt; 0?"}
+    C -->|yes| BRK["CoW break<br/>copy, remap RW"]
+    C -->|no| L{"lazy region<br/>covers va?"}
+    L -->|yes| LU["lazy upgrade<br/>PTE := region flags"]
+    L -->|no| E{"eager region<br/>flags say RW?"}
+    E -->|yes| EU["EAGER-UPGRADE<br/>rewrite PTE flags, resume"]
+    E -->|no| SEG["SIGSEGV"]
+```
 
 ---
 
-## 2. What the instrumentation established
+## 2. The two systems audited
 
-Instruments added on this branch (all boot-suite tested, see
-`src/process_tests.rs`):
+### 2.1 Frame ownership — a frame is owned by consensus
+
+Nothing holds *the* reference to a physical frame. Several structures hold partial
+claims, and the frame survives only as long as they agree.
+
+```mermaid
+flowchart TB
+    FORK["fork<br/>cow_share_and_demote_range"]
+    FPC["file_page_cache<br/>insert / lookup_and_ref"]
+    MAP["map paths<br/>mmap / demand fault / CoW break"]
+
+    COW["COW_REFCOUNTS<br/>pa to u16 — first share inserts at 2<br/>overloaded: fork sharing AND cache residency"]
+    UF["UserAddressSpace.user_frames<br/>pa to VA count, per address space<br/>teardown frees each distinct pa once"]
+
+    FREE["free_page pa<br/>cow_ref_dec FIRST — returns early unless it hits 0"]
+    BITMAP["PMM bitmap<br/>1 bit per frame — ground truth"]
+
+    FORK -->|"+1 per shared page"| COW
+    FPC -->|"+1 cached, +1 per mapper"| COW
+    MAP -->|"+1 per VA"| UF
+    COW -->|"dec"| FREE
+    UF -->|"last VA released"| FREE
+    FREE -->|"only at 0"| BITMAP
+```
+
+Every path to the bitmap runs through one gate, which makes the design sound and
+the accounting fragile: one decrement too many frees a live page, one too few leaks
+it. D2/D3/D4 are the places a claim can move without its partner ledger knowing.
+
+### 2.2 Protection — recorded three times, only one is real
+
+The CPU obeys the PTE. Everything else is a *record* of what the PTE ought to say,
+and the fault handler consults those records to decide whether a faulting write is
+legitimate.
+
+```mermaid
+flowchart TB
+    MMAP["mmap<br/>eager: PTE + region"]
+    MPROT["mprotect<br/>writes all three"]
+    DEMOTE["fork demote<br/>PTE only"]
+    BREAK["CoW break<br/>PTE only"]
+
+    PTE["PTE — AP bits<br/>the only thing the CPU obeys"]
+    EAGER["MmapRegion.flags — eager<br/>split by munmap, NOT by mprotect<br/>eager regions register no lazy region"]
+    LAZY["LazyRegion.flags — lazy<br/>split into up to 3 pieces by mprotect"]
+
+    FAULT["permission-fault handler"]
+
+    MMAP --> PTE
+    MMAP --> EAGER
+    MPROT --> PTE
+    MPROT --> EAGER
+    MPROT --> LAZY
+    DEMOTE --> PTE
+    BREAK --> PTE
+    EAGER -->|"read to decide"| FAULT
+    LAZY -->|"read to decide"| FAULT
+    FAULT -->|"grants write, promotes"| PTE
+```
+
+**This section framed the first three theories, and all three were wrong.** The
+records were never the problem — see §4.
+
+---
+
+## 3. What the instrumentation established
+
+Instruments on this branch, all boot-suite tested (`src/process_tests.rs`):
 
 | Instrument | Question it answers |
 | --- | --- |
 | `pmm::is_page_free(pa)` | Is the PA behind a live PTE *also* on the free list? |
-| free ledger (`record_free` / `last_free_record`) | Which thread released this frame, how recently? |
+| free ledger | Which thread released this frame, how recently? |
 | poison quarantine (`config::PMM_UAF_QUARANTINE`) | Did anyone write through a freed frame? |
-| CoW event ring + durable bitset (`config::COW_REF_LEDGER`) | Was this frame ever CoW-shared, and by whom? |
-| `MADV_DONTNEED` audit counters | Is that handler's divergence from Linux being exercised? |
-| `[MPROT-WIDEN]` | Does an `mprotect` upgrade record "writable" outside its own range? |
+| CoW event ring + durable bitset (`config::COW_REF_LEDGER`) | Was this frame ever CoW-shared? |
+| `MADV_DONTNEED` audit counters | Is that handler's divergence from Linux exercised? |
+| `[MPROT-WIDEN]` | Does an `mprotect` upgrade record "writable" outside its range? |
+| `[REGIONS]` | How many eager regions claim the faulting VA? |
+| `[PTE]` + `ap_name` | What do the AP bits actually say? |
+| `[LAZY]` | Does a lazy region also cover this VA? |
+| `[TLB]` counters | How many write faults hit an already-writable page? |
 
-### 2.1 The anomaly is common, and not itself fatal — OBSERVED
+### 3.1 The anomaly is common, and not fatal — OBSERVED
 
-`[EAGER-UPGRADE]` fired in **both** instrumented runs. Run 1 fired one and still
-went **green** (`EXIT=0`, 109 crates, 9m52s). So the anomaly is a precondition,
-not the trigger; something else has to coincide with it to corrupt data.
+`[EAGER-UPGRADE]` fired in every instrumented run (1, 1, 3, 6 occurrences), and
+**every one of those runs went green**. It is not the trigger.
 
-### 2.2 Not a premature free — STRONG NEGATIVE EVIDENCE
+### 3.2 Not a premature free — RULED OUT
 
-The leading theory going in was a frame handed back to the PMM while a process
-still mapped it, with the next `alloc_page_zeroed` wiping it under its live owner.
-The forensic dump at the anomaly says otherwise:
+`FREE=false`, `tracked=true`, `last_free=(tid=-1 age=-1)` at every anomaly, page
+contents intact (not zeros, not poison). Independently, **`PMM-UAF=0` and
+`PMM-QUAR-DF=0` across four complete 4-way self-host builds**, with the detector
+proven to fire every boot.
 
-```
-[EAGER-UPGRADE] pid=9 va=0x31b6f000 pa=0x9ec99000 FREE=false cow_ref=0
-                tracked=true last_free=(tid=-1 age=-1) head=0x38,0xff000000000b,...
-```
+### 3.3 D1 (`mprotect` widening) does not fire — RULED OUT
 
-- `FREE=false` — the frame is not on the free list.
-- `tracked=true` — the address space legitimately owns it in `user_frames`.
-- `last_free` absent — never freed inside the ledger window.
-- head words are live data, **not zeros and not poison**.
+| | |
+| --- | --- |
+| `mprotect` calls | **3043** |
+| `[EAGER-UPGRADE]` repairs | 3 |
+| `[MPROT-WIDEN]` | **0** |
 
-Independently: **`PMM-UAF=0` and `PMM-QUAR-DF=0` across a complete 10-minute 4-way
-self-host build**, with the detector proven to fire every boot (the self-test's
-deliberate use-after-free is caught). That is meaningful negative evidence against
-the whole premature-free family.
+`update_eager_region_flags` runs constantly and never once widened an upgrade. D1
+is a real latent bug (§6) but not this defect.
 
-### 2.3 CoW involvement — UNTESTED, previously overclaimed
+### 3.4 D9 (stale overlapping region) — RULED OUT
 
-An earlier reading of `[COW-HIST] no recorded reference events` was written up as
-"this frame was never CoW-shared". **That inference was too strong.**
-`cow_share_and_demote_range` emits one `cow_ref_inc` per shared page, so a single
-fork of a large process can evict the entire 4096-entry ring; "no events in the
-window" may mean *aged out*.
+`[REGIONS] claimed_by=1` on every sample. Exactly one region claims each VA, and
+its recorded flags are **correct** (`0x60000000000040` = `RW_NO_EXEC`). The record
+was never lying.
 
-Fixed by adding a durable one-bit-per-frame record (`COW_EVER`, sized from RAM at
-`pmm::init`, ~1 KiB per 32 MiB) that never ages out. The report now distinguishes
-the three cases explicitly:
+### 3.5 The PTE was writable the whole time — THE REFRAME
+
+Run 5, six anomalies, unanimous:
 
 ```
-[COW-HIST] pa=… no events in window: NEVER shared (durable bitset clear)
-[COW-HIST] pa=… no events in window: shared earlier, detail aged out
-[COW-HIST] pa=… no events in window: instrument off — says nothing
+[PTE] va=0x31b5b000 raw=0x6000009c21bf4f ap=AP_RW_ALL(writable)   [LAZY] no lazy region
+[PTE] va=0x3197e000 raw=0x600000d69b6f4f ap=AP_RW_ALL(writable)   [LAZY] no lazy region
+[PTE] va=0x31987000 raw=0x600000d377cf4f ap=AP_RW_ALL(writable)   [LAZY] no lazy region
+[PTE] va=0x31982000 raw=0x600000c3a9ff4f ap=AP_RW_ALL(writable)   [LAZY] no lazy region
+[PTE] va=0x31720000 raw=0x600000c54c7f4f ap=AP_RW_ALL(writable)   [LAZY] no lazy region
+[PTE] va=0x31721000 raw=0x600000c63ddf4f ap=AP_RW_ALL(writable)   [LAZY] no lazy region
 ```
 
-Until a run produces the first of those, **CoW is neither implicated nor
-exonerated.**
+Decoding `0x6000009c21bf4f`: `VALID`, page descriptor, `AF` set, `nG` set,
+inner-shareable, `AP = 0b01` = **writable at EL0**, `UXN|PXN`. Nothing is wrong
+with that entry.
+
+**There was never a lost permission.** The page table was correct at every
+anomaly. What the ladder has been absorbing is a **spurious write-permission fault
+on an already-writable page** — the CPU faulted against a translation that no
+longer matches memory.
+
+### 3.6 The old repair was a TLB flush wearing a costume
+
+`EAGER-UPGRADE` calls `update_current_user_page_flags`, which rewrites the AP bits
+and then calls `flush_tlb_page(va)`. Given §3.5, the rewrite was a **no-op** — the
+bits already said writable. The flush is what resolved the fault. The repair has
+been working for a reason nobody wrote down, which is also why it never led
+anywhere: it was treating the symptom of a stale translation as a permissions
+problem.
 
 ---
 
-## 3. The leading theory: `mprotect` widens an upgrade across a whole region
+## 4. Current leading theory: stale translations
 
-`update_eager_region_flags` (`crates/akuma-exec/src/process/children.rs`) sets
-`reg.flags = new_flags` on **every region the range overlaps**, without splitting:
+A core faulting against a translation that memory has moved past explains §3.5
+exactly. It is also the first theory consistent with *all* the measurements: it
+needs no refcount desync, no premature free, no bad record, and no overlap — all
+of which have now been ruled out.
 
-```rust
-for reg in r.iter_mut() {
-    if reg.start_va < range_end && reg.start_va + reg.len_bytes() > range_start {
-        reg.flags = new_flags;          // whole region, however small the range
-    }
-}
+The same root cause has a benign and a malignant face:
+
+```mermaid
+flowchart TB
+    EDIT["a PTE is updated<br/>mprotect / CoW break / remap"]
+    STALE["a peer core still holds<br/>the OLD translation"]
+
+    BENIGN["BENIGN — old entry said read-only<br/>write faults spuriously<br/>ladder absorbs it, flush fixes it"]
+    MALIGN["MALIGNANT — old entry names the OLD FRAME<br/>the write lands in the pre-copy page<br/>reader sees the new frame, still zeroed"]
+
+    OBS["what we observe:<br/>EAGER-UPGRADE, 6 of 6 already writable"]
+    NULLRC["what killed run 3:<br/>a live pointer qword reads back as 0"]
+
+    EDIT --> STALE
+    STALE --> BENIGN
+    STALE --> MALIGN
+    BENIGN --> OBS
+    MALIGN --> NULLRC
 ```
 
-Its doc comment argues this is safe, and the argument is sound **for a
-downgrade**:
+The malignant path is the one that matters: after a CoW break swaps in a new
+frame, a thread still writing through a stale entry stores into the **old** frame,
+while every reader sees the new one — which still holds the pre-copy contents. That
+produces a zeroed pointer field with **no fault at the moment of corruption** and
+no allocator involvement, which is precisely the signature that has resisted every
+allocator-side instrument.
 
-> "the fault handler only ever uses these flags to grant a write, so widening the
-> recorded range of a *downgrade* can never turn a legitimate SIGSEGV into a
-> silent success"
+**What is NOT yet explained:** the broadcast invalidations look correct.
+`flush_tlb_page` issues `tlbi vaae1is` and `flush_tlb_range_all_asid` /
+`flush_tlb_all` issue `tlbi vaae1is` / `vmalle1is` under `kernel_smp_shared` — all
+inner-shareable, so peers should see them. So the gap is not "we used a local
+invalidate"; it is somewhere subtler — a path that edits a PTE and skips the flush,
+one that flushes before the write is visible, or an ordering problem around the
+`dsb`.
 
-The code applies the same widening to **upgrades**. An
-`mprotect(sub_range, PROT_READ|PROT_WRITE)` records "writable" for every page in
-the region, including pages userspace deliberately left read-only or `PROT_NONE`.
-That record is exactly the input the `[EAGER-UPGRADE]` arm reads before granting a
-write — so the handler promotes a protected page and lets the write through,
-which is the one outcome the comment claims is impossible.
+### 4.1 Prior art: the same class, fixed three days earlier
 
-**Reaching the firing state needs two `mprotect` calls on one region:** one that
-downgrades a sub-range (clobbering the record to RO), and a later one that
-upgrades some sub-range (flipping the whole record back to RW) while the first
-sub-range's PTEs are still RO.
+[`MPROTECT_TLB_ASID_BUG.md`](MPROTECT_TLB_ASID_BUG.md) (fixed 2026-08-05) is this
+defect's mirror image and the strongest reason to take D10 seriously:
 
-This fits every forensic field observed: no CoW reference needed, no free needed,
-frame owned and tracked, content intact, region claiming RW while the PTE says
-otherwise.
+- **Then:** a `PROT_NONE`/`PROT_READ` **downgrade** did not take effect, because
+  `flush_tlb_range` used `tlbi vale1is` whose ASID comes from operand bits [63:48]
+  — `va >> 12` leaves those zero, so the invalidation matched nothing. Guard pages
+  stayed writable; RELRO GOTs stayed writable.
+- **Now:** an **upgrade** appears not to be visible on the faulting core — the
+  same subsystem, the same "PTE in memory disagrees with the cached translation",
+  in the opposite direction.
 
-**Consequence if it fires on a guard page or a deliberately-RO page:** a stray
-write that should have raised SIGSEGV instead lands in live neighbouring data.
-That is a corruption primitive sufficient to explain a zeroed/garbage pointer
-field in cargo's heap, and it requires an actual overrun to occur — which matches
-the load dependence and the ~1-in-5 rate.
+Two things carry over. First, that fix widened the invalidation to `vaae1is`
+(VA, All-ASID) **because one L0 table can be live under several ASIDs at once** —
+`UserAddressSpace::new_shared` allocates a fresh ASID while reusing the parent's
+`l0_frame`, so `CLONE_VM` threads and vfork-fastpath children share a table across
+ASIDs and one PTE edit has to invalidate under all of them. Any new invalidation
+added while chasing D10 must respect that. Second, it establishes that this
+subsystem's TLB maintenance has been wrong before in a way that stayed invisible
+for a long time, because the failure mode is silent.
 
-### 3.1 The stated reason not to split is contradicted by existing code
+Its regression test — `userspace/forktest/c_stress/mprotectlb.c`, calibrated
+against real Linux aarch64 — is the natural place to add an **upgrade**-direction
+phase if D10 holds.
 
-The comment justifies not splitting with:
+### 4.2 Deferred-flush audit — no missing flush found
 
-> "`MmapRegion` keys its frame list to `start_va`, and splitting one would have to
-> split `frames` in step"
+Every caller of the `*_no_flush` primitives was checked for a following
+invalidation:
 
-`sys_munmap` (`src/syscall/mem.rs`) **already does exactly that** — it removes the
-region, splits `frames` with an iterator, re-pushes the suffix at
-`start_va + unmap_pages * 4096`, and carries `flags` across:
+| Site | Follows with |
+| --- | --- |
+| `sys_mmap` eager install | `flush_tlb_range` after the loop |
+| `sys_mprotect` PTE loop | `flush_tlb_range` when any page updated |
+| `sys_munmap` (all three paths) | `flush_tlb_range_all_asid` per batch |
+| `madvise(WILLNEED)` prefault | `flush_tlb_range` over the whole range |
+| fault-path readahead (2 sites) | `flush_tlb_range(page_va, pages_mapped)` |
 
-```rust
-let mut iter = reg.frames.into_iter();
-let prefix: Vec<PhysFrame> = (0..unmap_pages).filter_map(|_| iter.next()).collect();
-let remaining: Vec<PhysFrame> = iter.collect();
-r.push(MmapRegion { start_va: reg.start_va + unmap_pages * 4096,
-                    pages: region_pages - unmap_pages,
-                    frames: remaining, flags: reg.flags });
+So D10 is **not** a plainly missing flush. Remaining shapes to examine: an
+invalidation whose *range* does not cover every page it published (the readahead
+sites flush `[page_va, page_va + pages_mapped)`, which assumes every filled VA lies
+at or above `page_va`), ordering around the `dsb` relative to the PTE store, and
+paths that edit a descriptor through a route these primitives do not cover.
+
+### 4.3 The experiment now running (run 6)
+
+The `EAGER-UPGRADE` arm now checks the PTE **first**: if it already grants the
+write, flush that VA and retry rather than rewriting flags. Bounded — the same VA
+returning more than twice in a row logs `[TLB-STALE]` and falls through to the old
+path, so it cannot spin on fault → flush → retry → fault.
+
+Two counters in the 30 s PSTATS block:
+
+```
+[TLB] stale_write_faults=N repeats=M
 ```
 
-So the fix has precedent in the same subsystem: split the eager region on a
-partial `mprotect` the way `munmap` splits it on a partial unmap, and give each
-piece its own flags. The lazy path already splits properly
-(`LazyRegions::update_flags`, up to three pieces).
+- `stale_write_faults` — faults absorbed by a flush alone.
+- `repeats` — **must stay 0**. Non-zero means flushing is *not* what resolves them
+  and the reading in §3.5/§3.6 is wrong.
 
-**Status: found by inspection, consistent with every observation, NOT yet observed
-firing.** `[MPROT-WIDEN]` logs the region, the requested range, and how many pages
-outside the call just became recorded-writable. `[MPROT-WIDEN]` and
-`[EAGER-UPGRADE]` on the same region is the proof chain, and it should be in hand
-before the behaviour is changed — fixing it first would remove the evidence.
+**A caveat this experiment does not settle.** Two readings fit §3.5 equally well:
+
+1. **Stale translation** — the PTE was already RW and this core faulted against a
+   cached restrictive entry.
+2. **Benign race** — the PTE genuinely *was* restrictive at fault time, and a peer
+   thread made it writable in the microseconds before the handler read it. Cargo
+   and rustc are multi-threaded, so a thread faulting on a page another thread is
+   concurrently `mprotect`-ing is entirely ordinary.
+
+Both predict "flush and retry succeeds", so `stale_write_faults` alone cannot tell
+them apart — under reading 2 the retry succeeds because the PTE changed, and the
+flush is incidental. Distinguishing them needs the PTE sampled *at fault entry*
+rather than inside the handler, or a per-VA correlation against concurrent
+`mprotect` calls. Worth doing before any invalidation is "fixed", because under
+reading 2 there is no kernel bug here at all — only a benign spurious fault, and
+the null `Rc` is still unexplained.
 
 ---
 
-## 4. Standing divergence points found during the audit
+## 5. Fixes landed
 
-Each is a place where one bookkeeping structure can drift from another. Only D1 is
-implicated so far; the rest are recorded so the audit is not repeated.
+### 5.1 D8 — `munmap` now drains every region a range touches
+
+`sys_munmap` matched a single eager region by **exact `start_va`** and returned. An
+unmap starting mid-region, or spanning two, freed only the first region's pages,
+reported success, and left the rest mapped with its VA never recycled. It also
+never reached lazy regions whenever an eager one matched.
+
+- Extracted `detach_eager_regions_in_range` into `akuma-exec` — pure, so the
+  clipping shapes are host-testable: full / prefix / suffix / middle /
+  multi-region / mid-region start / CoW-inherited (no frames) / non-overlapping /
+  empty range. **9 host tests.**
+- Boot self-test `munmap_spans_multiple_eager_regions` covers the kernel-side
+  integration: real frames, the real region list under `vm_lock`, PMM conservation.
+- Lazy regions in the range are now drained even when an eager region matched.
+
+Verified green on a full `-j4` self-host build (run 5, `EXIT=0`, 109 crates).
+
+---
+
+## 6. Standing divergence points
 
 | ID | Divergence | Status |
 | --- | --- | --- |
-| **D1** | `update_eager_region_flags` widens an *upgrade* across a whole region (§3) | **Leading theory** |
-| D2 | `file_page_cache::lookup_and_ref` takes its `cow_ref_inc` **outside** the `PAGES` lock; a concurrent `invalidate_inode`/`shrink` can free the frame in that window, after which the inc resurrects a count on a freed frame and the caller maps it | Suspected, not observed. `inval=1466` in the crashing run made the window reachable; `evict=0` means `shrink` was idle |
-| D3 | `file_page_cache::insert`'s lost-race path returns early without inserting but still runs `cow_ref_inc` on its own private frame → permanent +1 | Code-visible leak |
-| D4 | The three CoW-break sites call `cow_ref_dec` directly and discard the "last reference" return; if every sharer breaks, the original frame is freed by nobody | Code-visible leak |
-| D5 | `MADV_DONTNEED` memsets the *physical frame* (Linux drops the *mapping*), with no check for `cow_ref > 0` or cache membership; and rounds an unaligned start **down** where Linux returns `EINVAL` | Instrumented (`[MADV]` counters); no data yet |
-| D6 | Eager regions register **no** lazy region, so `MmapRegion.flags` is the fault handler's only repair input — which is what makes D1 dangerous rather than merely untidy | Structural |
-| D7 | `try_evict_ro_page` evicts *any* RO page inside a `LazySource::File` region, which would include a CoW-demoted anon page if a VA range were stale or recycled | Suspected |
-| D8 | `sys_munmap`'s eager path returns before `munmap_lazy_regions_in_range`, so a lazy region covering the same VA would survive the unmap | Suspected |
+| **D10** | Stale translations: a core faults against, or writes through, a translation memory has moved past (§4) | **Leading theory — run 6 testing** |
+| D8 | `sys_munmap` matched one region by exact `start_va` | **FIXED** (§5.1) |
+| D1 | `update_eager_region_flags` widens an *upgrade* across a whole region | **Latent** — 0 occurrences in 3043 `mprotect` calls; fix plan §7 |
+| D9 | A stale/overlapping region shadows the live one in `eager_region_flags_for_page_fault` | **Ruled out** — `claimed_by=1` every time |
+| D2 | `file_page_cache::lookup_and_ref` takes its `cow_ref_inc` **outside** the `PAGES` lock; a concurrent `invalidate_inode`/`shrink` can free the frame in that window | Suspected, not observed |
+| D3 | `file_page_cache::insert`'s lost-race path returns early without inserting but still increments its own private frame | Code-visible leak |
+| D4 | The three CoW-break sites call `cow_ref_dec` directly and discard the "last reference" return; if every sharer breaks, the frame is freed by nobody | Code-visible leak |
+| D5 | `MADV_DONTNEED` memsets the *physical frame* where Linux drops the *mapping*, with no shared-frame check; and rounds an unaligned start **down** where Linux returns `EINVAL` | Instrumented, no data yet |
+| D6 | Eager regions register no lazy region, so `MmapRegion.flags` is the handler's only repair input | Structural |
+| D7 | `try_evict_ro_page` evicts *any* RO page inside a `LazySource::File` region | Suspected |
 
 ---
 
-## 5. Ruled out for this defect
+## 7. D1 fix plan (deferred — latent, not this defect)
 
-- **Premature free / use-after-free** (§2.2) — `PMM-UAF=0` over a full build with a
-  proven-live detector, plus `FREE=false`/`tracked=true`/no-free-record at the
-  anomaly.
-- **`ENOSYS`/errno-as-pointer** — the class the `SYSCALL_ERRNO_DIAG` flag exists
-  for. The crashing run's syscall ring contains **zero** `ENOSYS`, `EFAULT` or
-  `EINVAL` results; the only negative result anywhere is `-110` (`ETIMEDOUT`) from
-  `futex`. The fault also has `FAR=0x0` with the null loaded *from memory*
-  (`ldr x8,[x0,#288]`), not from `x0` after an `svc`. Enabling that diagnostic
-  would add tens of thousands of `readlinkat`-`EINVAL` lines per build and hide the
-  two lines that matter.
+`update_eager_region_flags` sets `reg.flags = new_flags` on every overlapping
+region without splitting. Its doc comment's safety argument holds for a
+*downgrade* and is silently applied to *upgrades*, which records "writable" for
+pages outside the call.
+
+| | Approach | Cost | Risk |
+| --- | --- | --- | --- |
+| **A** | Refuse to widen an upgrade; leave the more restrictive record | ~5 lines | Record stays conservative, so a page needing repair could take the SIGSEGV `EAGER-UPGRADE` exists to prevent |
+| **B** | Split into up to 3 pieces, as `LazyRegions::update_flags` and `sys_munmap` already do | Moderate | Grows the region count on an O(n) scan |
+| **D** | Optional per-page flags vector, allocated only on a partial `mprotect` | Moderate | New field on a struct built in 5 places |
+
+**Recommendation: B.** The comment's justification — "splitting would have to split
+`frames` in step" — is contradicted by `sys_munmap`, which does exactly that, and
+whose splitting logic is now the shared, tested `detach_eager_regions_in_range`
+(§5.1). Its prerequisite (the munmap range loop) is already done, so B is now
+mostly a matter of reusing that helper for the flags case, plus:
+
+1. Extract `split_region_for_flags` alongside it, covering the CoW-inherited case.
+2. Wire it in behind a runtime toggle (`set_eager_flag_split_enabled`, default on)
+   for a same-binary A/B per `docs/reference/subsystems/locking.md` rule 5.
+3. Coalesce adjacent identical-flag regions to bound growth — **after** confirming
+   `sys_mremap`'s exact-`start_va` lookup can cope, since merging moves keys.
+4. Boot self-tests: prefix/middle/suffix extents and flags, frame conservation,
+   full-cover still updates in place, pages outside the call keep their old flags.
 
 ---
 
-## 6. Noise, and things not to chase
+## 8. Ruled out
+
+- **Premature free / use-after-free** (§3.2).
+- **`mprotect` upgrade widening (D1)** as the cause of the observed anomalies (§3.3).
+- **Stale overlapping regions (D9)** (§3.4).
+- **A lost permission of any kind** (§3.5) — the PTE was writable at every anomaly.
+- **`ENOSYS`/errno-as-pointer** — the crashing run's syscall ring contains zero
+  `ENOSYS`/`EFAULT`/`EINVAL` results; the only negative result is `-110`
+  (`ETIMEDOUT`) from `futex`. The fault also has `FAR=0x0` with the null loaded
+  *from memory* (`ldr x8,[x0,#288]`), not from `x0` after an `svc`.
+
+---
+
+## 9. Noise, and things not to chase
 
 - `[BKL] stuck tag=511` storms — known separate class, hundreds per build.
 - Two boot-suite tests fail on this branch **and on a pristine tree**
@@ -221,7 +411,7 @@ implicated so far; the rest are recorded so the audit is not repeated.
 
 ---
 
-## 7. Instrument hazards learned the hard way
+## 10. Instrument hazards learned the hard way
 
 - **`free_page` must not call `read_current_pid()`.** It resolves through
   `THREAD_PID_MAP` and the process table, and `free_page` is reachable from inside
@@ -231,23 +421,40 @@ implicated so far; the rest are recorded so the audit is not repeated.
 - **The quarantine must surrender its hold-back before an allocation fails.**
   `quarantine_drain_all` sits on `alloc_page`'s pressure ladder so 512 parked
   frames can never be the reason a build OOMs.
-- **A "no record" sentinel must not be printed as a plausible number.** The first
-  version printed `last_free=(tid=4294967295 age=38240)` where the age was computed
-  against a default seq of 0 — a large number that reads exactly like a real,
-  innocent age. It now prints `-1` for both, with the meaning in the line.
+- **A "no record" sentinel must not print as a plausible number.** The first
+  version printed `last_free=(tid=4294967295 age=38240)`, where the age was
+  computed against a default seq of 0 — a large number that reads exactly like a
+  real, innocent age. It now prints `-1` with the meaning on the line.
+- **A ring is not a record.** `cow_share_and_demote_range` emits one event per
+  shared page, so one fork of a large process evicts a 4096-entry ring entirely;
+  "no events" meant nothing until a durable one-bit-per-frame record backed it.
+  That bit is per *frame* and since boot, so a set bit can belong to a previous
+  owner — the clear direction is the strong one.
+- **Index instruments the way the subject indexes itself.** The first bitset used
+  absolute PAs where the PMM bitmap is relative to `base_addr`, so it silently
+  recorded nothing. Caught only because the self-test used a real managed frame; an
+  earlier version used a synthetic address and passed against a dead instrument.
+- **Print the field that discriminates, not the field that is easy.** Three
+  theories died only after `[PTE]` printed the AP bits. `FREE=`, `cow_ref=`,
+  `tracked=`, `claimed_by=` all pointed at "something took this page's permission
+  away" — and the permission had never been taken away. One decoded field settled
+  what four indirect ones could not.
 
 ---
 
-## 8. Next steps
+## 11. Next steps
 
-1. Run the `-j4` build with `[MPROT-WIDEN]` armed until it fires (or several runs
-   establish that it does not). Correlate against `[EAGER-UPGRADE]` by region.
-2. If correlated: split the eager region on partial `mprotect` (§3.1), keeping the
-   existing behaviour behind a same-binary A/B toggle per
-   `docs/reference/subsystems/locking.md` rule 5, and re-run.
-3. Either way, close D3/D4 (both are code-visible leaks) and decide on D5 —
-   `MADV_DONTNEED` should drop the mapping rather than memset a possibly-shared
-   frame, and should reject an unaligned start with `EINVAL` like Linux.
+1. **Run 6 verdict**: `[TLB] repeats=0` with a non-zero `stale_write_faults`
+   confirms stale translations. Non-zero `repeats` refutes §3.5/§3.6 and the search
+   reopens.
+2. If confirmed, audit every PTE-editing path for its invalidation: which ones
+   flush, when relative to the write, and with what barrier. The broadcast
+   instructions themselves are correct, so look for a missing flush or an ordering
+   gap rather than a wrong opcode.
+3. Keep the TLB-only repair regardless — it is strictly more honest than rewriting
+   flags that are already correct, and its counters make the condition visible.
+4. Close D3/D4 (code-visible leaks) and decide on D5.
+5. D1 (§7) whenever convenient; its prerequisite is now done.
 
 ## Background
 
@@ -257,3 +464,8 @@ implicated so far; the rest are recorded so the audit is not repeated.
   "Status (2026-08-07)", Defect A and B.
 - [`BKL_VFS_CARVE_OUT.md`](BKL_VFS_CARVE_OUT.md) §10 — the `MADV_WILLNEED`
   zero-fill corruption, the closest prior defect in this family.
+- [`MPROTECT_TLB_ASID_BUG.md`](MPROTECT_TLB_ASID_BUG.md) — the previous
+  TLB-invalidation defect in this subsystem: `mprotect` downgrades silently did not
+  reach the TLB because `vale1is` took its ASID from bits [63:48] of `va >> 12`.
+  The closest prior art for D10, and the source of the multi-ASID-per-L0 constraint
+  any new invalidation has to respect (§4.1).

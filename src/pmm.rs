@@ -634,7 +634,7 @@ fn cow_ledger_record(pa: usize, is_dec: bool, before: u16, after: u16) {
     let idx = seq & (COW_LEDGER_SLOTS - 1);
     let tid = akuma_exec::threading::current_thread_id();
     let meta = (tid << 32)
-        | ((is_dec as usize) << 24)
+        | (usize::from(is_dec) << 24)
         | (((before as usize) & 0xFFF) << 12)
         | ((after as usize) & 0xFFF);
     COW_LEDGER_SEQ[idx].store(seq, Ordering::Relaxed);

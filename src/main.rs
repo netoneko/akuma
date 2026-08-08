@@ -1534,6 +1534,15 @@ fn run_async_main() -> ! {
             // Both counters are expected to stay 0; either going non-zero means
             // this handler is zeroing frames Linux would have left alone.
             crate::safe_print!(128, "{}", crate::syscall::mem::dontneed_audit_line());
+            // Write faults on pages the page table already allows — i.e. absorbed
+            // stale TLB entries. `repeats` must stay 0; a non-zero value means the
+            // flush is not what is resolving them (proposals/CARGO_HEAP_NULL_RC.md).
+            {
+                use core::sync::atomic::Ordering;
+                crate::safe_print!(128, "[TLB] stale_write_faults={} repeats={}\n",
+                    exceptions::STALE_TLB_WRITE_FAULTS.load(Ordering::Relaxed),
+                    exceptions::STALE_TLB_REPEATS.load(Ordering::Relaxed));
+            }
             // Deadlock-hunt aid: the Thread-0 heartbeat's dump trigger fires
             // every 50M idle loops (~never with idle_halt); piggyback on the
             // 30s PSTATS cadence instead so a wedged thread's parked resume

@@ -2053,6 +2053,68 @@ fn print_write_perm_fault_diag(far: u64, iss: u64, pid: u32, as_owner: u32) {
         free);
 }
 
+/// Write faults absorbed because the PTE already granted the write — i.e. the
+/// fault came from a stale TLB entry, not a missing permission.
+pub static STALE_TLB_WRITE_FAULTS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Times the flush-and-retry did NOT settle it and we fell through to the
+/// permission rewrite. A non-zero value means "PTE says writable" is not the whole
+/// story and this repair is masking something else.
+pub static STALE_TLB_REPEATS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Last VA each thread absorbed as a stale-TLB fault, and how many times running.
+/// Per thread, so two cores faulting on different pages never confuse each other.
+static STALE_TLB_LAST: [core::sync::atomic::AtomicUsize; akuma_exec::threading::types::MAX_THREADS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; akuma_exec::threading::types::MAX_THREADS];
+static STALE_TLB_RUN: [core::sync::atomic::AtomicU32; akuma_exec::threading::types::MAX_THREADS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; akuma_exec::threading::types::MAX_THREADS];
+
+/// Should this write fault be repaired by invalidating the TLB rather than by
+/// rewriting permissions?
+///
+/// True when the live PTE already grants EL0 write access, which means the page
+/// table is correct and only this core's cached translation is stale. Bounded: if
+/// the same VA comes back more than twice in a row the flush is not resolving it,
+/// so we decline and let the normal repair path run instead of spinning on
+/// fault → flush → retry → fault.
+fn stale_tlb_repair_applies(page_va: usize) -> bool {
+    use core::sync::atomic::Ordering;
+    let ttbr0: u64;
+    #[cfg(target_os = "none")]
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    #[cfg(not(target_os = "none"))]
+    { ttbr0 = 0; }
+    if ttbr0 == 0 {
+        return false;
+    }
+    let l0 = akuma_exec::mmu::phys_to_virt((ttbr0 & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+    let Some(pte) = akuma_exec::mmu::user_pte_raw(l0, page_va) else { return false };
+    if pte & akuma_exec::mmu::flags::AP_MASK != akuma_exec::mmu::flags::AP_RW_ALL {
+        return false;
+    }
+    let tid = akuma_exec::threading::current_thread_id();
+    if tid >= akuma_exec::threading::types::MAX_THREADS {
+        return false;
+    }
+    let run = if STALE_TLB_LAST[tid].swap(page_va, Ordering::Relaxed) == page_va {
+        STALE_TLB_RUN[tid].fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        STALE_TLB_RUN[tid].store(1, Ordering::Relaxed);
+        1
+    };
+    if run > 2 {
+        STALE_TLB_REPEATS.fetch_add(1, Ordering::Relaxed);
+        crate::safe_print!(160,
+            "[TLB-STALE] va={:#x} still faulting after {} flushes — PTE grants write but the \
+             fault persists; falling through to the permission repair\n", page_va, run - 1);
+        return false;
+    }
+    STALE_TLB_WRITE_FAULTS.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
 /// Forensic probe of the physical page behind a live user VA, printed at an
 /// anomaly.
 ///
@@ -2097,7 +2159,7 @@ fn print_page_forensics(tag: &str, pid: u32, va: usize) {
     // default seq of 0 yields a large number that reads exactly like a real
     // (innocent) age, so report the absence instead.
     let (tid_freed, free_age) = match crate::pmm::last_free_record(pa) {
-        Some((tid, seq)) => (tid as i64, crate::pmm::free_ledger_seq().wrapping_sub(seq) as i64),
+        Some((tid, seq)) => (i64::from(tid), i64::from(crate::pmm::free_ledger_seq().wrapping_sub(seq))),
         None => (-1, -1),
     };
     let tracked = akuma_exec::process::lookup_process_shared(pid)
@@ -2113,6 +2175,41 @@ fn print_page_forensics(tag: &str, pid: u32, va: usize) {
     // The reference history is what separates "this page's count was legitimately
     // 0" from "someone decremented it once too often".
     crate::pmm::print_cow_history(pa);
+
+    // How many eager regions claim this VA? The fault handler answers from the
+    // first `Vec` match, so two overlapping regions mean the record it consulted
+    // may describe a mapping that no longer exists — the current leading theory
+    // for this anomaly. One region refutes it; more than one convicts.
+    let regions = akuma_exec::process::eager_regions_containing(pid, page_va);
+    crate::safe_print!(96, "  [REGIONS] va={:#x} claimed_by={}\n", page_va, regions.len());
+    for (start, pages, flags) in regions.iter().take(4) {
+        crate::safe_print!(128, "    start={:#x} pages={} flags={:#x}\n", start, pages, flags);
+    }
+
+    // What the PTE actually says. A write can permission-fault on a read-only page,
+    // on a `PROT_NONE` guard page, and on a kernel-only page — three different
+    // defects that a PA alone cannot tell apart, and the repair above grants the
+    // write in all three cases.
+    if let Some(pte) = akuma_exec::mmu::user_pte_raw(l0_ptr, page_va) {
+        crate::safe_print!(160, "  [PTE] va={:#x} raw={:#x} ap={}\n",
+            page_va, pte, akuma_exec::mmu::ap_name(pte));
+    } else {
+        crate::safe_print!(96, "  [PTE] va={:#x} no valid descriptor\n", page_va);
+    }
+
+    // A lazy region covering the same VA as an eager one is invisible to
+    // `[REGIONS]` but decisive here: a `PROT_NONE` lazy region makes the fault
+    // handler skip its own lazy arm and fall through to the eager repair, which
+    // then promotes a page userspace asked to be unmapped.
+    if let Some((flags, _src, start, size)) =
+        akuma_exec::process::lazy_region_lookup_for_page_fault(pid, page_va)
+    {
+        crate::safe_print!(192,
+            "  [LAZY] va={:#x} ALSO covered by lazy region start={:#x} size={:#x} flags={:#x} prot_none={}\n",
+            page_va, start, size, flags, akuma_exec::mmu::user_flags::is_none(flags));
+    } else {
+        crate::safe_print!(96, "  [LAZY] va={:#x} no lazy region\n", page_va);
+    }
 }
 
 /// Returns true if the fault was a CoW write permission fault, the CoW page was
@@ -3421,6 +3518,21 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         == akuma_exec::mmu::flags::AP_RW_ALL
                 {
                     let page_va = far_usize & !(0xFFF);
+                    // Does the PTE ALREADY grant this write? If so the page table is
+                    // fine and the fault came from a stale TLB entry on this core, not
+                    // from a lost permission — so the correct repair is an
+                    // invalidation, not a permission rewrite. (The old repair happened
+                    // to work for exactly this reason: `update_current_user_page_flags`
+                    // ends in `flush_tlb_page`, so it was flushing the TLB while
+                    // appearing to fix flags.) Distinguishing the two matters: a core
+                    // that can hold a stale translation for a VA can also hold one
+                    // pointing at a frame that has since been remapped, and *that*
+                    // sends writes to the wrong page — see
+                    // proposals/CARGO_HEAP_NULL_RC.md.
+                    if stale_tlb_repair_applies(page_va) {
+                        akuma_exec::mmu::flush_tlb_page(page_va);
+                        return unsafe { (*frame).x0 };
+                    }
                     if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                         #[cfg(kernel_smp_shared)]
                         let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
