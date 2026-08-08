@@ -9,8 +9,8 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 518
-- **Docs contributing at least one fix:** 151
+- **Total distinct fixes counted:** 525
+- **Docs contributing at least one fix:** 155
 - **Subsystem categories:** 15
 
 Updated 2026-08-07: +32 fixes / +19 docs, covering everything landed since
@@ -39,24 +39,41 @@ items are unusual for this file in that eight of the nine were *never-enforced
 boundaries* rather than regressions: the permission logic existed in
 `crates/akuma-exec/src/box_mod/` with passing unit tests and no callers.
 
+Updated 2026-08-09: +7 fixes / +4 docs, covering the `-j4` self-host
+stabilization campaign of 2026-08-08 – 2026-08-09 (commits `6a0ae74`…`5e2a222`).
+Three new docs land under SMP & Locking: `PMM_TALC_LOCK_CYCLE_SILENT_WEDGE.md`
+(1 fix — the silent all-core wedge, previously misfiled as a BKL symptom),
+`PAGE_TABLE_UAF_BKL_STORM.md` (2 fixes — the `execve`-siblings POSIX gap and
+the per-core live-TTBR0 registry that closed the page-table-freed-under-a-
+running-core storm), and `CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` (3 fixes —
+`sys_munmap`'s single-region-match gap, the BKL's lost-FIFO-ticket-on-barge
+bug, and the stale-write-fault-absorbed fix for the CoW-break loser race;
+its cargo-null-`Rc` namesake defect itself remains open). One new doc lands
+under Console & Terminal: `SERIAL_TRACE_TRAFFIC_AUDIT.md` (1 fix — a dead
+`DEMAND_PAGE_LOG_ENABLED` flag left the largest per-event kernel trace
+ungated, saturating the shared UART under parallel load). `TRIMMING_FAT_PART_3.md`
+and edits to five already-zero-counted docs (marking `crush`/`needle-server`/
+`qjs`/`stdcheck`/`top` as removed) added to the zero-count list, contributing
+nothing.
+
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 116 | 22.4% | 15 |
-| Memory & Virtual Memory | 89 | 17.2% | 25 |
-| Scheduler & Process Management | 72 | 13.9% | 16 |
-| SMP & Locking | 59 | 11.4% | 24 |
-| Networking | 30 | 5.8% | 12 |
-| Userspace Apps & Libraries | 32 | 6.2% | 16 |
+| Syscall / ABI Compatibility Audits | 116 | 22.1% | 15 |
+| Memory & Virtual Memory | 89 | 17.0% | 25 |
+| Scheduler & Process Management | 72 | 13.7% | 16 |
+| SMP & Locking | 65 | 12.4% | 27 |
+| Networking | 30 | 5.7% | 12 |
+| Userspace Apps & Libraries | 32 | 6.1% | 16 |
 | Rump Kernel & Syscall Proxy | 24 | 4.6% | 5 |
-| Toolchain & Self-Hosting | 31 | 6.0% | 4 |
+| Toolchain & Self-Hosting | 31 | 5.9% | 4 |
 | SSH | 12 | 2.3% | 10 |
 | VFS & Filesystem | 13 | 2.5% | 9 |
 | Boot & Drivers | 9 | 1.7% | 5 |
 | Signals & Exceptions | 10 | 1.9% | 4 |
 | Misc / Cross-cutting | 8 | 1.5% | 1 |
-| Console & Terminal | 3 | 0.6% | 3 |
+| Console & Terminal | 4 | 0.8% | 4 |
 | Containers | 10 | 1.9% | 2 |
-| **Total** | **518** | **100.0%** | **151** |
+| **Total** | **525** | **100.0%** | **155** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -429,7 +446,7 @@ boundaries* rather than regressions: the permission logic existed in
 - `CURRENT_TRAP_FRAME[tid]` was never cleared on process exit or thread teardown, so a recycled thread slot inherited a pointer into an already-freed kernel stack, dereferenced by diagnostic readers (`current_trap_frame_elr`, `dump_thread_resume_points`); fixed by clearing it at slot-recycle, both exit paths, slot-claim, and `enter_user_mode`
 
 
-## SMP & Locking (59 fixes, 24 docs)
+## SMP & Locking (65 fixes, 27 docs)
 
 ### docs/archive/SMP_SHARED.md
 - M2c bug 1: 16KiB secondary stack overflow
@@ -537,6 +554,19 @@ boundaries* rather than regressions: the permission logic existed in
 
 ### docs/archive/MPROTECT_TLB_ASID_BUG.md
 - `flush_tlb_range` invalidated with `tlbi vale1is`, whose ASID comes from operand bits [63:48] — zero for every user VA, while user processes run under non-zero ASIDs — so `sys_mprotect`'s permission downgrades (musl's guard-page `PROT_NONE`, RELRO GOT `PROT_READ`) never reached the TLB and stayed silently writable; fixed by widening to `vaae1is` (all-ASID), required because `new_shared` puts one L0 table under several live ASIDs at once
+
+### docs/archive/PMM_TALC_LOCK_CYCLE_SILENT_WEDGE.md
+- `BitmapAllocator::alloc_pages` allocated a `Vec` **while holding the `PMM` spinlock**, and the kernel heap's OOM-growth path (`PmmOomHandler::handle_oom`) takes `PMM` while `TALC` is held — a cycle between two non-reentrant, ownerless `RawSpinlock`s that froze all four cores with zero console output (the `PMM` side spins inside `with_irqs_disabled`, so the stuck core takes no timer IRQ and looked identical to "busy, not hung" from outside); previously misfiled as the `[BKL] stuck` storm, though the BKL was idle throughout (6 of 7 campaign deaths, vs. 1 genuine storm). Fixed via `alloc_pages_into`, reserving the result `Vec`'s capacity with `try_reserve_exact` *before* taking `PMM.lock()` instead of growing it while the lock is held; A/B-verified 6/25 silent wedges → 0/23 (Fisher p=0.023)
+
+### docs/archive/PAGE_TABLE_UAF_BKL_STORM.md
+- `execve` swapped in the new address space with no equivalent of `exit_group`'s "kill sibling `CLONE_VM` threads before dropping the owner" step, so a `CLONE_THREAD` sibling that outlived the phase that spawned it (a parked thread-pool worker — rustc uses one) could keep running under the address space `execve` was about to free, a POSIX-correctness gap and a plausible trigger for page tables being freed and PMM-poisoned while a peer core's `TTBR0_EL1` still pointed at them; fixed via `kill_exec_siblings` in `replace_image`/`replace_image_from_path`, reaping other thread-group members after the new ELF loads and before the destructive address-space swap
+- No path that frees page-table frames ever checked whether any core's live `TTBR0_EL1` still pointed at them — three independent routes (a reaper on another core racing the exiting thread's final switch, `exit_group`'s own reclaim freeing the table the calling core still stood on mid-syscall, and a grace-expired hard-killed straggler whose core never ran the switch-out) could each free and poison a page table still installed in a running core's `TTBR0`, which then faulted un-fetchably on its own exception vector while holding the BKL forever (`[BKL] stuck owner=N` storms of tens of thousands of lines); fixed via a per-core live-TTBR0 registry (`ACTIVE_L0`/`PREV_L0` in `crates/akuma-exec/src/mmu/mod.rs`) that defers a page-table frame's free to `PENDING_TTBR_FREES` (`[AS-FREE-DEFER]`) instead of releasing it whenever a peer core is still on that table, draining once the holder has demonstrably moved off; A/B-verified 4 storms in 21 rounds (~19%) → 0 storms in 32 rounds
+
+### docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md
+(grab-bag investigation doc chasing a cargo null-`Rc` defect that itself remains open; three unrelated bugs were found and fixed along the way)
+- §5.1 (D8): `sys_munmap` matched only a single eager region by exact `start_va`, so an unmap starting mid-region or spanning several regions freed only the first match, reported success, left the rest mapped with its VA never recycled, and skipped lazy regions entirely whenever an eager one matched; fixed by extracting `detach_eager_regions_in_range` to drain every region a range touches (9 host tests + a boot self-test)
+- §12.4/§12.7: the BKL's out-of-band `acquire_no_ticket` barge (the BKL-free EL0-preempt reconcile) compensated with a `next_ticket.fetch_add(1)` that kept the ticket counters equal in aggregate, but a waiter that lost the ownership CAS at its own turn abandoned its allocated ticket for a fresh one with nothing left to ever advance `now_serving` past the abandoned slot — a genuinely lost FIFO ticket producing `[BKL] stuck owner=0` storms (lock reads *idle* while cores spin) until a 20M-spin self-heal forced recovery; fixed by having a waiter that loses that CAS keep its ticket and keep spinning in place instead of re-ticketing, and by having the barge leave the ticket queue completely untouched on both acquire and release
+- §12.2–§12.4: on a multi-threaded `fork()`, every sibling thread that touches the same demoted page faults at once; the first thread through `fault_slot_acquire` breaks CoW and repairs the PTE, but the threads behind it — now holding a fault for a write that is already legal — had no repair path for pages with no lazy/eager region record (an ELF `.data`/`.bss` page from the image loader is never registered as either), so they fell through to a spurious SIGSEGV and took the whole `CLONE_VM` process down with them; fixed via `stale_write_fault_absorbed`, re-reading the PTE at EL0 permission-fault entry and absorbing (invalidate + retry) whenever it already grants the write, budgeted per-(VA, PTE) so a genuinely-declined repair still runs; A/B-verified 10/10 and 8/8 probe SIGSEGVs → 0
 
 
 ## Networking (30 fixes, 12 docs)
@@ -869,7 +899,7 @@ boundaries* rather than regressions: the permission logic existed in
 - Bug 13: IrqGuard DAIF save/restore regression
 
 
-## Console & Terminal (3 fixes, 3 docs)
+## Console & Terminal (4 fixes, 4 docs)
 
 ### docs/archive/PIPE_TTY_FIX.md
 - Pipe TTY processing root-cause fix
@@ -879,6 +909,9 @@ boundaries* rather than regressions: the permission logic existed in
 
 ### docs/archive/STDCHECK_DEBUG.md
 - Layout struct corruption during a function call (workaround applied)
+
+### docs/archive/SERIAL_TRACE_TRAFFIC_AUDIT.md
+- Three per-event kernel traces (`[IA-DP] file region:` demand-page, `[pipe]` lifecycle, `[mmap]`/`[mprotect]`) printed unconditionally, saturating the single shared UART under a parallel `-j4` build (~270 KB/s, a 115200-baud line ~20x over-saturated) and serializing every logging core on the console lock — turning an in-VM self-host build from "never completes in over an hour" into a 2m21s green run once gated; `DEMAND_PAGE_LOG_ENABLED`, the flag meant to gate the largest of the three, was dead — defined and documented but with zero readers anywhere in the tree — so fixing it required wiring a live check, not flipping an existing one
 
 
 ## Containers (10 fixes, 2 docs)
@@ -905,6 +938,8 @@ boundaries* rather than regressions: the permission logic existed in
 
 Also re-scanned 2026-08-07: DEVELOPMENT_PRACTICES_REVIEW_AND_ASSESSMENT (pure meta-analysis of process/git history, zero concrete bug-fix content) and BKL_RUSTC_SCALING_BASELINE (re-verified still accurate as perf-not-bugs; its inconclusive `big.rs`-failure investigation is fully resolved later by SMP_SHARED_ONCPU_GATE.md and STALE_THREAD_SLOT_KILL.md, counted there).
 
-docs/archive: 4MB_STABLE_AGENT, AI_DEBUGGING, ARCHITECTURE, BKL_DRIVERS_CARVE_OUT, BKL_PHASE7B_PPOLL_CARVE_OUT (piece 2 reverted after A/B caught real corruption), BKL_PHASE7D_THREAD_CONTEXTS (dead/unreachable code removed, not a live bug), BKL_PHASE7F_OPTOUT_LIST, BKL_RUSTC_SCALING_BASELINE, BOX_SUBDIR_FS_LIMITATIONS, C_STUBS, CGI, COMMAND_CHAINING_SSH_BUGS, CONCURRENCY, CONTAINERS_STAGE_1_PLAN, CONTAINERS_STAGE_2_PLAN, CP_MV_IMPLEMENTATION_PLAN, CRUSH_MISSING_SYSCALLS (all gaps, none marked fixed), CWD, DEAD_CODE_ANALYSIS, DEAD_CODE_SWEEP_FINDINGS (findings only, explicitly "nothing here is fixed. No source was edited"), DEV_RANDOM, DEV_ZERO, DOCKER, EMBASSY_REMOVAL, ERRORS_TO_CHECK, EXTREME_STACK_TRIMMING (perf, not bugs), FRANKENLIBC_EVAL, FREEZE_INSTRUMENTATION_PLAN, HEAP_AND_MEMORY_IMPROVEMENTS, HERD, HERD_ADD_AND_PATH_VALIDATION, HIJACK_VS_KERNEL_PROXY (analysis/validation only), IMPLEMENTATION_PLAN (rump phases, milestones only), INTERACTIVE_IO, J4_HANG_LIVE_AUTOPSY (verbatim session record; its 3 fixes are counted once under KTG_STALE_TID_EXIT_STAMP_J4_HANG.md), KILL_COMMAND, LARGE_BINARY_LOAD_PERFORMANCE, LINE_COUNT_ANALYSIS (line-count/dead-code statistics and cross-kernel comparison, not a bugfix), LOCK_REFERENCE, LOOPBACK_TIMEOUT_FIX_PLAN (plan, not landed), MEMORY_LAYOUT (duplicate of AKUMA_SELF_HOSTING §3), MULTIKERNEL, MULTITASKING, MUSL_COMPATIBILITY, NAMESPACES, NATIVE_STACK_INTERNET, NEEDLE_SERVER, NETWORKING_PERFORMANCE_AND_THREAD_SAFETY_ANALYSIS, ON_DEMAND_ELF_LOADER, OOM_BEHAVIOR, OOM_RECOVERY_OPTIONS, PAWS_PLAN, PAWS_TO_SSH_SHELL_PLAN, PHASE01_BUILDRUMP, PHASE1_COMPLETION_BASELINE, PHASE1_NETWORK_LOCK_FOUNDATION, PHASE2_RUMPUSER, PHASE3_KERNEL_TAP, PLAN_SIGSEGV_COMPILE_FIX, POSSIBLE_MEMORY_LEAK, POST_EXIT_PMM_RECLAIM, PROCESS_MEMORY_CLEANUP, PROCFS, PROPER_EXECVE_PLAN, QJS, refactor_plan, RSA_FEATURE_GATE, RUMP_LATENCY_SLEEP_FIX (hypothesis disproven, patches reverted), RUMP_PLUS_HERD, SCHEDULING_TIMING_ISSUES (open/critical, not fixed), SCRATCH, SEPARATE_SHELL_BINARY, SHARED_FD_TABLES, SHELL_ENVIRONMENT_VARIABLES, SHELL_LIMITATIONS, SIGNAL_DELIVERY_FORKTEST_EVIDENCE (summary of fixes counted elsewhere), SMOLTCP_MIGRATION_SUMMARY (duplicate summary), SMP_SHARED_M5_FAULT_LOCK_PLAN, SSH, SSH_PERFORMANCE_FIX_2026, SSH_THREADING_BUG (superseded, duplicate), STRATEGY_A_IMMEDIATE_TUNING, STRATEGY_B_SMOLTCP_MIGRATION (duplicate), STRATEGY_C_IRQ_WAKEUPS, SYSCALL_BLOCKING, SYSCALL_ERRNO_COMPLIANCE_CHANGES, SYSCALL_HARDENING, TCC_LOW_MEMORY, TCP_SEQUENCE_UNDERFLOW_PANIC, TERMINAL_SYSCALLS (duplicate reference), TLS_DOWNLOAD_PERFORMANCE, TLS_INFRASTRUCTURE, TOP_CORE_COLUMN_PLAN, TRIM_FAT_PART_1, TRIMMING_FAT_PART_2, TWO_VMS_AGENT_DEMO, UNIFIED_CONTEXT_ARCHITECTURE (duplicate of FAR_0x5/THREADING_RACE_CONDITIONS fixes), UNIFIED_PROCESS_ABI, UNSAFE_POINTERS_AND_ATOMICITY, USERSPACE_MEMORY_MODEL, USERSPACE_SOCKET_API, VFS_LOCK_OPTIMIZATION_PLAN, WAIT_QUEUES, MEOW.
+Also re-scanned 2026-08-09: CRUSH_MISSING_SYSCALLS, C_STUBS, NEEDLE_SERVER, QJS, and TOP_CORE_COLUMN_PLAN each picked up a one-line "removed as part of a codebase trimming effort" note pointing at TRIMMING_FAT_PART_3.md; STDCHECK_DEBUG picked up the same note but keeps its existing 1-fix count (Console & Terminal, above) — the note doesn't touch its fix content. None of these notes describe a fix on their own.
+
+docs/archive: 4MB_STABLE_AGENT, AI_DEBUGGING, ARCHITECTURE, BKL_DRIVERS_CARVE_OUT, BKL_PHASE7B_PPOLL_CARVE_OUT (piece 2 reverted after A/B caught real corruption), BKL_PHASE7D_THREAD_CONTEXTS (dead/unreachable code removed, not a live bug), BKL_PHASE7F_OPTOUT_LIST, BKL_RUSTC_SCALING_BASELINE, BOX_SUBDIR_FS_LIMITATIONS, C_STUBS, CGI, COMMAND_CHAINING_SSH_BUGS, CONCURRENCY, CONTAINERS_STAGE_1_PLAN, CONTAINERS_STAGE_2_PLAN, CP_MV_IMPLEMENTATION_PLAN, CRUSH_MISSING_SYSCALLS (all gaps, none marked fixed), CWD, DEAD_CODE_ANALYSIS, DEAD_CODE_SWEEP_FINDINGS (findings only, explicitly "nothing here is fixed. No source was edited"), DEV_RANDOM, DEV_ZERO, DOCKER, EMBASSY_REMOVAL, ERRORS_TO_CHECK, EXTREME_STACK_TRIMMING (perf, not bugs), FRANKENLIBC_EVAL, FREEZE_INSTRUMENTATION_PLAN, HEAP_AND_MEMORY_IMPROVEMENTS, HERD, HERD_ADD_AND_PATH_VALIDATION, HIJACK_VS_KERNEL_PROXY (analysis/validation only), IMPLEMENTATION_PLAN (rump phases, milestones only), INTERACTIVE_IO, J4_HANG_LIVE_AUTOPSY (verbatim session record; its 3 fixes are counted once under KTG_STALE_TID_EXIT_STAMP_J4_HANG.md), KILL_COMMAND, LARGE_BINARY_LOAD_PERFORMANCE, LINE_COUNT_ANALYSIS (line-count/dead-code statistics and cross-kernel comparison, not a bugfix), LOCK_REFERENCE, LOOPBACK_TIMEOUT_FIX_PLAN (plan, not landed), MEMORY_LAYOUT (duplicate of AKUMA_SELF_HOSTING §3), MULTIKERNEL, MULTITASKING, MUSL_COMPATIBILITY, NAMESPACES, NATIVE_STACK_INTERNET, NEEDLE_SERVER, NETWORKING_PERFORMANCE_AND_THREAD_SAFETY_ANALYSIS, ON_DEMAND_ELF_LOADER, OOM_BEHAVIOR, OOM_RECOVERY_OPTIONS, PAWS_PLAN, PAWS_TO_SSH_SHELL_PLAN, PHASE01_BUILDRUMP, PHASE1_COMPLETION_BASELINE, PHASE1_NETWORK_LOCK_FOUNDATION, PHASE2_RUMPUSER, PHASE3_KERNEL_TAP, PLAN_SIGSEGV_COMPILE_FIX, POSSIBLE_MEMORY_LEAK, POST_EXIT_PMM_RECLAIM, PROCESS_MEMORY_CLEANUP, PROCFS, PROPER_EXECVE_PLAN, QJS, refactor_plan, RSA_FEATURE_GATE, RUMP_LATENCY_SLEEP_FIX (hypothesis disproven, patches reverted), RUMP_PLUS_HERD, SCHEDULING_TIMING_ISSUES (open/critical, not fixed), SCRATCH, SEPARATE_SHELL_BINARY, SHARED_FD_TABLES, SHELL_ENVIRONMENT_VARIABLES, SHELL_LIMITATIONS, SIGNAL_DELIVERY_FORKTEST_EVIDENCE (summary of fixes counted elsewhere), SMOLTCP_MIGRATION_SUMMARY (duplicate summary), SMP_SHARED_M5_FAULT_LOCK_PLAN, SSH, SSH_PERFORMANCE_FIX_2026, SSH_THREADING_BUG (superseded, duplicate), STRATEGY_A_IMMEDIATE_TUNING, STRATEGY_B_SMOLTCP_MIGRATION (duplicate), STRATEGY_C_IRQ_WAKEUPS, SYSCALL_BLOCKING, SYSCALL_ERRNO_COMPLIANCE_CHANGES, SYSCALL_HARDENING, TCC_LOW_MEMORY, TCP_SEQUENCE_UNDERFLOW_PANIC, TERMINAL_SYSCALLS (duplicate reference), TLS_DOWNLOAD_PERFORMANCE, TLS_INFRASTRUCTURE, TOP_CORE_COLUMN_PLAN, TRIM_FAT_PART_1, TRIMMING_FAT_PART_2, TRIMMING_FAT_PART_3 (pure component-removal log, no bugfix content — same shape as TRIMMING_FAT_PART_2), TWO_VMS_AGENT_DEMO, UNIFIED_CONTEXT_ARCHITECTURE (duplicate of FAR_0x5/THREADING_RACE_CONDITIONS fixes), UNIFIED_PROCESS_ABI, UNSAFE_POINTERS_AND_ATOMICITY, USERSPACE_MEMORY_MODEL, USERSPACE_SOCKET_API, VFS_LOCK_OPTIMIZATION_PLAN, WAIT_QUEUES, MEOW.
 
 userspace: apk-tools/BUILD_NOTES, apk-tools/PIE_LOADER, box/OCI_IMAGE_PULL, box/TESTING (duplicate of libakuma-tls TLS fix), crush/IMPLEMENTATION_DETAILS, forktest/IMPLEMENTATION_PLAN, herd/CORE_AWARE_SCHEDULING, httpd/TIMESTAMPS, libakuma/ALLOCATOR_OPTIONS, libakuma/MKDIR_P_IMPROVEMENTS, libakuma/SYSCALLS, libakuma/TERMINAL_SYSCALLS, meow/CONFIG, meow/HOTKEYS, meow/SHELL, meow/TESTING, scratch/LARGE_FILE_CHECKOUT_OPTIMIZATION, scratch/SIDEBAND_PARSER_FIX (duplicate of docs/archive/SIDEBAND_PARSER_FIX.md), sshd/LIMITATIONS, sshd/MIGRATION_SUMMARY, tar/IMPLEMENTATION_PLAN, tar/STREAMING_EXTRACTION, tcc/DISTRIBUTION_PLAN, tcc/IMPLEMENTATION_DETAILS, tcc/IMPLEMENTATION_PLAN, tcc/LIBTCC1.
