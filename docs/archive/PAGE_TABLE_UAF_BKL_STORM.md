@@ -482,10 +482,41 @@ Same methodology as §4.2 (2 lanes, fresh VM + clean `target/` per round,
 SMP=4, MEMORY=14336, 1200 s budget, `logs/j4_campaign_ttbrgate/`). On the
 unfixed kernel this session, **both of the first 2 rounds per lane stormed**
 (2 storms in 4 rounds; combined with §4.2, 4 storms in 21 rounds on
-`9a9eb04`+instrumentation). Results on the fixed kernel: see
-`logs/j4_campaign_ttbrgate/results.jsonl` — recorded below at campaign end.
+`9a9eb04`+instrumentation). Results on the fixed kernel (`logs/j4_campaign_ttbrgate/results.jsonl`,
+32 rounds, 2026-08-09):
 
-<!-- CAMPAIGN-RESULTS-PLACEHOLDER -->
+| outcome | n | note |
+| --- | ---: | --- |
+| `GREEN` | 31 | ~166-227 s/round |
+| **this storm** | **0** | |
+| build stall (driver label `SILENT_WEDGE`) | 1 | round 29 — **not this defect and not the TALC/PMM wedge**, see below |
+| `EXIT=139` / `BOOT_FAIL` | 0 | |
+
+Against the unfixed baseline — 4 storms in 21 rounds on
+`9a9eb04`+instrumentation (§4.2's 2/17 plus 2 storms in the first 4
+instrumented rounds of `logs/j4_campaign_astrace/`), a ~19% per-round rate —
+0 storms in 32 rounds has a one-sided probability of about
+(1 − 0.19)³² ≈ 0.001 under the old rate. The storm is gone at this
+campaign's power, not merely rarer.
+
+**The gate demonstrably fired in anger, five times, all in GREEN rounds:**
+`[AS-FREE-DEFER]` once each in lane 1 rounds 8, 9, 13 and lane 2 rounds
+25, 26 — a mix of `path=owner` and `path=last-view`, round 9's directly
+adjacent to a `[KTG-HARD]` (the §4.1 straggler route, caught live). Every
+defer was released by exactly one later `path=drained` free — no leaks. On
+the unfixed kernel each of those five events would have been a poisoned
+page table under a live `TTBR0`.
+
+**Round 29's stall is a different, pre-existing defect.** Its auto-probe
+(`lockprobe_lane2_round29.txt`) shows the BKL idle, `TALC`/`PMM`/COW/ext2
+all free, and all four cores *executing* (PCs moving across samples) in
+`smoltcp_net::poll` — the machine is alive, the in-guest build simply hung
+at guest T81.7 s (last activity: a fork mid-flight). Only 2 `[BKL] stuck`
+lines all round, zero `[AS-FREE-DEFER]`, no OOM/ENOSPC markers. This
+matches the known open "build hang, cores idle, everything free" residual
+(the rustc futex-hang class that predates this work) — the driver's
+`SILENT_WEDGE` label is a timeout bucket, not a diagnosis; the real silent
+wedge (§1's discriminator) requires `TALC`/`PMM` held, which they are not.
 
 ## Background
 
