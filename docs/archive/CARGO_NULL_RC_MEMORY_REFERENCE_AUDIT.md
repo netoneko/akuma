@@ -759,6 +759,19 @@ UART, with four cores contending for its lock. Gated (default off), the same cle
 101-crate `-j4` self-host build finishes in **2m21s, `EXIT=0`**. Full writeup:
 [`SERIAL_TRACE_TRAFFIC_AUDIT.md`](SERIAL_TRACE_TRAFFIC_AUDIT.md).
 
+> **CORRECTION 2026-08-08 — the "silent wedge" rows below are a SEPARATE DEFECT,
+> not the BKL.** They were root-caused as a `TALC`↔`PMM` lock cycle:
+> `BitmapAllocator::alloc_pages` allocated a `Vec` while holding `PMM`, and the
+> kernel heap's growth path (`PmmOomHandler::handle_oom`) takes `PMM`. Captured
+> live with `scripts/lockprobe.py`: both lock bytes `0x01`, every core in a spin
+> loop, **BKL idle** (`owner=0`, ticket queue balanced). Fixed; writeup at
+> [`PMM_TALC_LOCK_CYCLE_SILENT_WEDGE.md`](PMM_TALC_LOCK_CYCLE_SILENT_WEDGE.md).
+>
+> This matters for reading the table: grouping the storm and the wedges as one
+> "storm/wedge class" made the BKL look like the stability ceiling. A 25-round
+> re-run on 2026-08-08 (after the BKL ticket fix) split 18 GREEN / **6 silent
+> wedges** / 1 storm — the wedge is the common case and never touched the BKL.
+
 **Campaign result — 15 rounds, fresh VM each, full `rm -rf target` clean build:**
 
 | outcome | n | note |

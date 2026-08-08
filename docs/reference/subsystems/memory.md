@@ -153,6 +153,15 @@ All four cores burning ~399% host CPU in test-and-test-and-set loops. The BKL is
 idle throughout, which is what distinguishes this from the `[BKL] stuck` storm it
 was previously filed with.
 
+Full investigation, including how the locks were named without debug info and the
+three ways the regression test was wrong first:
+[`../../archive/PMM_TALC_LOCK_CYCLE_SILENT_WEDGE.md`](../../archive/PMM_TALC_LOCK_CYCLE_SILENT_WEDGE.md).
+
+Regression tests: `pmm_heap_lock_order` (`src/tests.rs`, single-core) and
+`pmm_heap_lock_order_smp` (`src/process_tests.rs`, cross-core). **Both detect a
+regression by HANGING the boot suite, not by failing** — the `PMM` side spins
+with IRQs masked, so there is no verdict to print.
+
 ## Kernel heap allocator
 
 `src/allocator.rs`. **Not a slab** — a dynamic linked-list/talc allocator:
