@@ -134,6 +134,12 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_smp_shared_migration();
 
+    // PMM/heap lock-order regression: concurrent page-batch alloc + heap churn.
+    // Must run HERE (not in tests.rs) — it needs live worker threads, and the memory
+    // suite runs before the scheduler can schedule them.
+    #[cfg(kernel_smp_shared)]
+    test_pmm_heap_lock_order_smp();
+
     // Real (shared-kernel) SMP M5b Stage 4a: A/B-measure whether dropping the BKL
     // around a file-fault's block I/O reduces cross-core BKL contention.
     #[cfg(kernel_smp_shared)]
@@ -15596,4 +15602,130 @@ fn test_vfork_child_context_ttbr0_not_stale() {
     }
 
     console::print("[Test] vfork_child_ttbr0_not_stale PASSED\n");
+}
+
+/// The cross-core half of `tests::test_pmm_heap_lock_order`: the real ABBA needs two
+/// cores, one holding each lock. Worker threads hammer the kernel heap while this
+/// thread hammers batch page allocation, so `talc_alloc` (TALC held, wanting PMM)
+/// and `alloc_pages_zeroed` (PMM held, wanting TALC) overlap in time.
+///
+/// Skipped on a single-CPU boot. Same failure mode as above: it hangs, it does
+/// not return false.
+#[cfg(kernel_smp_shared)]
+fn test_pmm_heap_lock_order_smp() {
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    console::print("\n[TEST] pmm/heap lock order: concurrent page-batch + heap churn (SMP)\n");
+
+    if crate::smp_shared::probed_core_count() <= 1 {
+        console::print("[Test] pmm_heap_lock_order_smp SKIPPED (single CPU; boot with SMP>1)\n");
+        return;
+    }
+
+    static STOP: AtomicBool = AtomicBool::new(false);
+    static CHURNED: AtomicUsize = AtomicUsize::new(0);
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    STOP.store(false, Ordering::SeqCst);
+    CHURNED.store(0, Ordering::SeqCst);
+    LIVE.store(0, Ordering::SeqCst);
+
+    fn churn_worker() -> ! {
+        LIVE.fetch_add(1, Ordering::SeqCst);
+        while !STOP.load(Ordering::Relaxed) {
+            let mut v: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+            for i in 0..6usize {
+                v.push(alloc::vec![0u8; 4096 * (1 + (i % 3))]);
+            }
+            core::hint::black_box(v.len());
+            drop(v);
+            // Count per round, not once at the end: a worker still spinning when the
+            // measurement window closes would otherwise report zero progress and make
+            // the test look like a failure when it simply had not finished yet.
+            CHURNED.fetch_add(1, Ordering::Relaxed);
+            // sleep_us, not yield_now: a boot self-test runs BKL-held, and yield_now
+            // does not drop it. A tight alloc loop then owns the BKL for the whole
+            // window and starves the peers into a `[BKL] stuck` storm — observed
+            // wedging this very suite before this was changed.
+            akuma_exec::threading::sleep_us(1000);
+        }
+        LIVE.fetch_sub(1, Ordering::SeqCst);
+        // Same self-termination idiom as `smp_shared::demo_exit`: mark the slot
+        // terminated so it can be reclaimed, then park. System thread slots are
+        // scarce (RESERVED_THREADS) and later self-tests need them back.
+        akuma_exec::threading::mark_current_terminated();
+        loop {
+            akuma_exec::threading::yield_now();
+        }
+    }
+
+    let mut spawned = 0usize;
+    for _ in 0..2 {
+        if akuma_exec::threading::spawn_system_thread_fn(churn_worker).is_ok() {
+            spawned += 1;
+        }
+    }
+    if spawned == 0 {
+        console::print("[Test] pmm_heap_lock_order_smp SKIPPED (no system thread slots)\n");
+        return;
+    }
+
+    // Wait for the workers to actually be RUNNING before opening the measurement
+    // window. Spawning only queues them; if the window opens and closes before they
+    // are scheduled, this measures nothing and reports a false failure. Yield+halt
+    // is what gives the secondaries a chance to pick them up.
+    let spin_up = crate::timer::uptime_us();
+    while LIVE.load(Ordering::SeqCst) < spawned
+        && crate::timer::uptime_us().saturating_sub(spin_up) < 1_000_000
+    {
+        akuma_exec::threading::yield_now();
+        akuma_exec::threading::idle_halt();
+    }
+    if LIVE.load(Ordering::SeqCst) == 0 {
+        STOP.store(true, Ordering::SeqCst);
+        console::print("[Test] pmm_heap_lock_order_smp SKIPPED (churn workers never scheduled)\n");
+        return;
+    }
+
+    let (_t, _a, free_before) = crate::pmm::stats();
+    let start = crate::timer::uptime_us();
+    let mut batches = 0usize;
+    while crate::timer::uptime_us().saturating_sub(start) < 400_000 {
+        let count = 8 + (batches % 4) * 16;
+        if let Some(frames) = crate::pmm::alloc_pages_zeroed(count) {
+            for f in &frames { crate::pmm::free_page(*f); }
+            batches += 1;
+        } else {
+            break;
+        }
+        // Give the BKL up regularly; see the note in `churn_worker`.
+        akuma_exec::threading::sleep_us(500);
+    }
+
+    STOP.store(true, Ordering::SeqCst);
+    // Let the workers observe STOP and exit so their thread slots come back.
+    let drain = crate::timer::uptime_us();
+    while LIVE.load(Ordering::SeqCst) > 0
+        && crate::timer::uptime_us().saturating_sub(drain) < 2_000_000
+    {
+        akuma_exec::threading::yield_now();
+        akuma_exec::threading::idle_halt();
+    }
+
+    let (_t2, _a2, free_after) = crate::pmm::stats();
+    // NOT equality: the concurrent heap churn legitimately RETURNS spans to the PMM
+    // (`reclaim_to_pmm`), and the workers' stacks are freed when they terminate, so
+    // free_after routinely ends up HIGHER. The invariant that matters is "no leak".
+    let conserved = free_after >= free_before;
+    let progressed = batches > 0 && CHURNED.load(Ordering::SeqCst) > 0;
+    let pass = conserved && progressed;
+    crate::safe_print!(
+        192,
+        "  batches={} churn_rounds={} workers={} free_before={} free_after={}\n",
+        batches, CHURNED.load(Ordering::SeqCst), spawned, free_before, free_after
+    );
+    crate::safe_print!(
+        96,
+        "[Test] pmm_heap_lock_order_smp {}\n",
+        if pass { "PASSED" } else { "FAILED" }
+    );
 }

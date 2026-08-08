@@ -66,6 +66,93 @@ was hardcoded `0xC0000000`).
 **Untracked-frame policy:** never free a frame you didn't track (leak is
 recoverable; over-free crashes the kernel).
 
+## PMM ↔ heap lock flow
+
+Two independent spinlocks govern all memory allocation, and **they call each
+other**:
+
+- `pmm::PMM` (`0x402460b8` in a `release-smp-shared` build) — the page bitmap.
+- `allocator::TALC` — the kernel heap.
+
+Both are `spinning_top` `RawSpinlock`s: a **single bool, no owner field, not
+reentrant**. Nothing records who holds one, so neither a self-deadlock nor a
+cycle can be detected at runtime — the box simply stops.
+
+```mermaid
+flowchart TB
+    subgraph HEAP["TALC — kernel heap"]
+        MALLOC["talc_alloc / __rust_dealloc<br/>TALC.lock()"]
+        OOM["PmmOomHandler::handle_oom<br/>runs with TALC HELD<br/>(talc hands it &mut Talc)"]
+        RECL["reclaim_to_pmm()<br/>TALC.try_lock() — declines if reentered"]
+    end
+
+    subgraph PAGES["PMM — page bitmap"]
+        APCZ["alloc_pages_contiguous_zeroed<br/>PMM.lock() inside with_irqs_disabled"]
+        APZ["alloc_pages_zeroed<br/>PMM.lock() ... Pmm::alloc_pages"]
+        VECC["Vec::with_capacity(count)<br/>HEAP ALLOCATION, PMM STILL HELD"]
+    end
+
+    MALLOC -->|"heap exhausted"| OOM
+    OOM -->|"claim pages — TALC -> PMM"| APCZ
+    RECL -->|"free spans — TALC -> PMM"| APCZ
+    APZ --> VECC
+    VECC -->|"PMM -> TALC (the inversion)"| MALLOC
+
+    style VECC fill:#b3202c,color:#fff
+```
+
+**The intended order is `TALC → PMM`**, stated in `reclaim_to_pmm`'s own comment,
+and the heap side honours it: `handle_oom` runs with TALC held and takes PMM
+beneath it, while `reclaim_to_pmm` uses `try_lock` so a reentry from inside
+`malloc` declines instead of self-deadlocking.
+
+**`alloc_pages_zeroed` violates it.** `Pmm::alloc_pages` builds its result with
+`alloc::vec::Vec::with_capacity(count)` — a heap allocation — and is called at
+`pmm.rs:1307` while `PMM.lock()` is held at `pmm.rs:1306`. That is the reverse
+edge, and it closes a cycle:
+
+| core | holds | wants | where |
+|---|---|---|---|
+| A | **PMM** | TALC | `alloc_pages_zeroed` → `Vec::with_capacity` → `talc_alloc` |
+| B | **TALC** | PMM | `talc_alloc` → `handle_oom` → `alloc_pages_contiguous_zeroed` |
+
+Two consequences make it worse than an ordinary ABBA:
+
+- **It can deadlock a single core against itself.** If that `Vec::with_capacity`
+  is the allocation that exhausts the heap, `handle_oom` runs on the same core
+  and calls `alloc_pages_contiguous_zeroed` → `PMM.lock()`, which this core
+  already holds. Non-reentrant, so it spins forever. No second core required.
+- **It is silent.** The PMM side spins inside `with_irqs_disabled`, so the
+  stuck core cannot take a timer IRQ — no preemption, no `PSTATS`, no console.
+  A wedged VM and a console-starved VM look identical from outside.
+
+### Rule
+
+**Never allocate on the heap while holding `PMM`.** Compute into a fixed-size
+buffer, or allocate the container *before* taking the lock and fill it after.
+The same applies to any `Spinlock<BTreeMap<..>>` in `pmm.rs` (`COW_FAULT_LOCK`,
+`COW_REFCOUNTS`): a map insert can allocate, so those nest into TALC too.
+
+### Observed signature
+
+Captured 2026-08-08 with [`scripts/lockprobe.py`](../../../scripts/lockprobe.py)
+on a `-j4` in-guest self-host build (SMP=4), 5 of 6 deaths in a 22-round
+campaign:
+
+```
+allocator::TALC @ 0x402db750: 0x01   <- HELD
+pmm::PMM        @ 0x402460b8: 0x01   <- HELD
+KERNEL_LOCK: owner=0, next_ticket == now_serving   (BKL idle — not the BKL)
+CPU#0 __rust_dealloc+64                 spinning on TALC
+CPU#1 alloc_pages_contiguous_zeroed+40  spinning on PMM
+CPU#2 __rust_dealloc+60                 spinning on TALC
+CPU#3 talc_alloc+80                     spinning on TALC
+```
+
+All four cores burning ~399% host CPU in test-and-test-and-set loops. The BKL is
+idle throughout, which is what distinguishes this from the `[BKL] stuck` storm it
+was previously filed with.
+
 ## Kernel heap allocator
 
 `src/allocator.rs`. **Not a slab** — a dynamic linked-list/talc allocator:

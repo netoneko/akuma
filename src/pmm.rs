@@ -304,14 +304,22 @@ impl BitmapAllocator {
         None
     }
 
-    /// Allocate multiple pages in a single bitmap scan.
-    /// Pages are not necessarily contiguous. Returns None if fewer than
-    /// `count` pages are available.
-    fn alloc_pages(&mut self, count: usize) -> Option<alloc::vec::Vec<PhysFrame>> {
-        if count == 0 { return Some(alloc::vec::Vec::new()); }
-        if self.free_pages < count { return None; }
+    /// Allocate multiple pages in a single bitmap scan, appending them to `result`.
+    /// Pages are not necessarily contiguous. Returns `false` (having rolled back)
+    /// if fewer than `count` pages are available.
+    ///
+    /// **`result` must already have capacity for `count` frames, reserved by the
+    /// caller BEFORE it took the PMM lock.** This function runs with `PMM` held,
+    /// and a `Vec` growth here would call the kernel heap, whose own growth path
+    /// (`PmmOomHandler::handle_oom`) takes `PMM` — the inversion that deadlocked
+    /// `-j4` self-host builds. `push` beyond capacity would reallocate, so the
+    /// loops below stop at exactly `count`. See
+    /// `docs/reference/subsystems/memory.md` -> "PMM ↔ heap lock flow".
+    fn alloc_pages_into(&mut self, count: usize, result: &mut alloc::vec::Vec<PhysFrame>) -> bool {
+        debug_assert!(result.capacity() >= count, "caller must reserve before locking PMM");
+        if count == 0 { return true; }
+        if self.free_pages < count { return false; }
 
-        let mut result = alloc::vec::Vec::with_capacity(count);
         let start_word = self.next_free_hint / 64;
 
         // First pass: from hint to end
@@ -325,7 +333,7 @@ impl BitmapAllocator {
                 result.push(PhysFrame::new(self.base_addr + page_idx * PAGE_SIZE));
                 if result.len() == count {
                     self.next_free_hint = page_idx + 1;
-                    return Some(result);
+                    return true;
                 }
             }
         }
@@ -341,18 +349,19 @@ impl BitmapAllocator {
                 result.push(PhysFrame::new(self.base_addr + page_idx * PAGE_SIZE));
                 if result.len() == count {
                     self.next_free_hint = page_idx + 1;
-                    return Some(result);
+                    return true;
                 }
             }
         }
 
         // Not enough pages — roll back
-        for frame in &result {
+        for frame in result.iter() {
             let page_idx = (frame.addr - self.base_addr) / PAGE_SIZE;
             self.mark_free(page_idx);
             self.free_pages += 1;
         }
-        None
+        result.clear();
+        false
     }
 
     /// Allocate `count` contiguous pages. Returns the first frame's address.
@@ -1302,12 +1311,28 @@ const USER_RECLAIM_BATCH: usize = 512;
 pub fn alloc_pages_zeroed(count: usize) -> Option<alloc::vec::Vec<PhysFrame>> {
     use akuma_exec::mmu::phys_to_virt;
 
-    let frames = crate::irq::with_irqs_disabled(|| {
+    // Reserve the result buffer BEFORE taking PMM. Growing a `Vec` calls the kernel
+    // heap, and the heap's growth path (`PmmOomHandler::handle_oom`) takes PMM — so
+    // allocating under the lock closes a TALC<->PMM cycle. That deadlocked `-j4`
+    // self-host builds (5 of 6 deaths in a 22-round campaign, 2026-08-08) and can
+    // even self-deadlock one core, since these spinlocks are not reentrant.
+    // See docs/reference/subsystems/memory.md -> "PMM ↔ heap lock flow".
+    let mut frames: alloc::vec::Vec<PhysFrame> = alloc::vec::Vec::new();
+    if frames.try_reserve_exact(count).is_err() {
+        return None;
+    }
+
+    let ok = crate::irq::with_irqs_disabled(|| {
         let mut pmm = PMM.lock();
-        let result = pmm.alloc_pages(count)?;
+        if !pmm.alloc_pages_into(count, &mut frames) {
+            return false;
+        }
         ALLOCATED_PAGES.fetch_add(count, Ordering::Relaxed);
-        Some(result)
-    })?;
+        true
+    });
+    if !ok {
+        return None;
+    }
 
     unsafe {
         const CACHE_LINE_SIZE: usize = 64;

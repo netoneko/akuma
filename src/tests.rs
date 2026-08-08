@@ -151,6 +151,7 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_alloc_pages_batch_free, "alloc_pages_batch_free");
     run_test!(test_alloc_pages_batch_insufficient, "alloc_pages_batch_insufficient");
     run_test!(test_alloc_pages_batch_interleaved, "alloc_pages_batch_interleaved");
+    run_test!(test_pmm_heap_lock_order, "pmm_heap_lock_order");
 
     // mprotect IC IALLU optimization
     run_test!(test_mprotect_flag_update_with_cache_maintenance, "mprotect_flag_update_cache_maint");
@@ -5412,6 +5413,66 @@ fn test_alloc_pages_batch_interleaved() -> bool {
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
+}
+
+/// Regression for the TALC <-> PMM lock cycle.
+/// See `docs/reference/subsystems/memory.md` -> "PMM ↔ heap lock flow".
+///
+/// `BitmapAllocator::alloc_pages` used to build its `Vec<PhysFrame>` *while
+/// holding `PMM`*. The kernel heap's own growth path (`PmmOomHandler::handle_oom`)
+/// takes `PMM`, so that closed a cycle between two non-reentrant spinlocks.
+///
+/// **How a regression here presents: the boot suite HANGS, it does not fail.**
+/// The PMM side spins inside `with_irqs_disabled`, so the stuck core takes no
+/// timer IRQ — no preemption, no console, no panic. "The suite stopped printing
+/// at this test" IS the failure signal. That is also why this reproduced in the
+/// field as a *silent* all-core wedge at ~399% host CPU rather than a crash.
+///
+/// This phase is single-core and deterministic: it interleaves batch page
+/// allocation with heap traffic sized to force `handle_oom` to run.
+fn test_pmm_heap_lock_order() -> bool {
+    console::print("\n[TEST] pmm/heap lock order: batch alloc interleaved with heap growth\n");
+
+    let (_t, _a, free_before) = crate::pmm::stats();
+
+    // Each round: take a page batch, then churn the heap hard enough that talc
+    // must claim new spans from the PMM. Pre-fix, the `Vec` inside the PMM lock
+    // could itself be the allocation that triggered that claim -> self-deadlock
+    // on one core, no second core required.
+    for round in 0..8usize {
+        let count = 32 + round * 16;
+        let Some(frames) = crate::pmm::alloc_pages_zeroed(count) else {
+            console::print("  OOM (batch)\n");
+            return false;
+        };
+        if frames.len() != count {
+            crate::safe_print!(96, "  short batch: got {} want {}\n", frames.len(), count);
+            for f in &frames { crate::pmm::free_page(*f); }
+            return false;
+        }
+
+        // Heap traffic while those pages are held.
+        let mut ballast: Vec<Vec<u8>> = Vec::new();
+        for i in 0..24usize {
+            ballast.push(alloc::vec![(i & 0xff) as u8; 4096 * (1 + (i % 4))]);
+        }
+        // Touch it so nothing is optimised away.
+        let mut sum = 0usize;
+        for b in &ballast { sum = sum.wrapping_add(b[0] as usize); }
+        core::hint::black_box(sum);
+        drop(ballast);
+
+        for f in &frames { crate::pmm::free_page(*f); }
+    }
+
+    let (_t2, _a2, free_after) = crate::pmm::stats();
+    let conserved = free_after == free_before;
+    if !conserved {
+        crate::safe_print!(128, "  PMM leak: free_before={} free_after={}\n",
+            free_before, free_after);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if conserved { "PASS" } else { "FAIL" });
+    conserved
 }
 
 /// Test that mprotect flag updates work: RW_NO_EXEC -> RX via update_page_flags,
