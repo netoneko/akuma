@@ -651,6 +651,14 @@ pub fn run_all_tests() {
     // symptom, measured at page granularity rather than the MB [Mem] line.
     test_pmm_conserved_across_spawn_exit_reap();
 
+    // Use-after-free instrumentation for the cargo null-`Rc` defect
+    // (proposals/CARGO_HEAP_NULL_RC.md): the poison quarantine must catch a write
+    // through a freed frame, and `MADV_DONTNEED`'s range divergence from Linux
+    // must stay pinned, or a clean run proves nothing.
+    test_uaf_quarantine_instrument();
+    test_cow_ref_ledger_records_history();
+    test_madvise_dontneed_range_semantics();
+
     // Boot-stack reservation is now derived from the linked image size in
     // linker.ld (STACK_BOTTOM / STACK_TOP absolute symbols), replacing the old
     // 3-way per-profile IMAGE_SIZE lockstep. Guard the invariants so a linker.ld
@@ -4338,6 +4346,165 @@ fn test_heap_no_runaway_on_page_multiple_alloc() {
 /// shows up as flat-after-warmup; a genuine per-process artifact (an untracked
 /// user page, an unfreed page-table frame, a non-reclaimable heap span) shows up
 /// as a monotonic decline of `free_count` across the repeated cycles.
+/// The UAF instrument for the cargo null-`Rc` defect
+/// (proposals/CARGO_HEAP_NULL_RC.md) must actually detect a write through a
+/// stale mapping — otherwise a clean `UAF=0` on a self-host build proves nothing.
+///
+/// Covers the whole chain on one frame: the free-list probe
+/// (`pmm::is_page_free`), the free ledger, the poison fill, and the detector
+/// firing on a write to a quarantined frame. The last one deliberately commits
+/// the use-after-free this hunts, so it discounts its own detection afterwards to
+/// keep the `[Mem] UAF=` signal honest (same discipline as
+/// `pmm::discount_double_frees`).
+fn test_uaf_quarantine_instrument() {
+    if !crate::config::PMM_UAF_QUARANTINE {
+        console::print("[Test] uaf_quarantine SKIPPED (instrument disabled on this profile)\n");
+        return;
+    }
+    // Start from an empty quarantine so every assertion below is about our frame.
+    crate::pmm::quarantine_drain_all();
+
+    let f = if let Some(f) = crate::pmm::alloc_page() { f } else {
+        console::print("[Test] uaf_quarantine SKIPPED (no frame)\n");
+        return;
+    };
+    let pa = f.addr;
+
+    // An allocated frame is never free. This is the invariant the EAGER-UPGRADE /
+    // WILD-DA probes assert against a live PTE's PA: `FREE=true` there means the
+    // frame has two owners.
+    assert!(!crate::pmm::is_page_free(pa), "allocated frame reported free: pa={pa:#x}");
+
+    crate::pmm::free_page(f);
+
+    // Quarantined, so still NOT on the free list — which is what makes the rest of
+    // this test race-free: no other core can allocate the frame out from under it.
+    assert!(!crate::pmm::is_page_free(pa), "quarantined frame reported free: pa={pa:#x}");
+    let (quar_len, uaf_before) = crate::pmm::quarantine_stats();
+    assert!(quar_len > 0, "free did not park the frame in the quarantine");
+
+    // The ledger must name the freeing context, so an anomaly report can point at
+    // a caller rather than a class.
+    assert!(crate::pmm::last_free_record(pa).is_some(),
+        "free ledger has no record for pa={pa:#x}");
+
+    // The frame is poisoned, not zeroed: a stale owner reading it sees a value it
+    // cannot mistake for valid data, and a stale owner *writing* it destroys a
+    // pattern we can recognise.
+    let first = unsafe { akuma_exec::mmu::phys_to_virt(pa).cast::<u64>().read_volatile() };
+    assert!(first != 0, "freed frame was not poisoned (reads as zero) pa={pa:#x}");
+
+    // Commit the use-after-free this instrument exists to catch: write through the
+    // frame as a process with a stale mapping would.
+    unsafe {
+        akuma_exec::mmu::phys_to_virt(pa).cast::<u64>().add(3).write_volatile(0x1234_5678);
+    }
+    crate::pmm::quarantine_drain_all();
+
+    let (_, uaf_after) = crate::pmm::quarantine_stats();
+    assert!(uaf_after == uaf_before + 1,
+        "quarantine missed a write to a freed frame: UAF {uaf_before} -> {uaf_after}");
+    crate::pmm::discount_uaf_detections(1);
+
+    // Drained frames go back to the free list.
+    assert!(crate::pmm::is_page_free(pa), "drained frame not returned to the PMM: pa={pa:#x}");
+
+    console::print("[Test] uaf_quarantine PASSED\n");
+}
+
+/// The CoW reference ledger must record the increment/decrement history that the
+/// `EAGER-UPGRADE` report reads back (proposals/CARGO_HEAP_NULL_RC.md).
+///
+/// The anomaly under investigation is a page whose share count sits at 0 while its
+/// owner still maps it, i.e. one decrement too many — a claim only provable from
+/// the history. This pins that a normal share/unshare cycle is recorded, and that
+/// the counter it mirrors still round-trips.
+fn test_cow_ref_ledger_records_history() {
+    if !crate::config::COW_REF_LEDGER {
+        console::print("[Test] cow_ref_ledger SKIPPED (ledger disabled on this profile)\n");
+        return;
+    }
+    // A PA that no real frame uses: the ledger is keyed purely on the address, so
+    // this exercises it without perturbing a live frame's accounting.
+    const SCRATCH_PA: usize = 0xDEAD_0000;
+    let before = crate::pmm::cow_event_count(SCRATCH_PA);
+
+    // First share of an untracked frame inserts at 2 ("owner + sharer"), which is
+    // the encoding every consumer of `cow_ref_get` assumes.
+    crate::pmm::cow_ref_inc(SCRATCH_PA);
+    assert!(crate::pmm::cow_ref_get(SCRATCH_PA) == 2,
+        "first cow_ref_inc must land at 2, got {}", crate::pmm::cow_ref_get(SCRATCH_PA));
+
+    // One unmapper leaves the frame owned; the last one hands over the free.
+    assert!(!crate::pmm::cow_ref_dec(SCRATCH_PA), "dec 2->1 must not claim the last ref");
+    assert!(crate::pmm::cow_ref_dec(SCRATCH_PA), "dec 1->0 must claim the last ref");
+    assert!(crate::pmm::cow_ref_get(SCRATCH_PA) == 0, "count must be gone at 0");
+
+    let after = crate::pmm::cow_event_count(SCRATCH_PA);
+    assert!(after == before + 3,
+        "ledger must record all 3 events (1 inc + 2 dec): {before} -> {after}");
+
+    // The durable bitset is what makes a *negative* history meaningful: the ring
+    // is a recent window that one fork can evict, so "no events in the window"
+    // only means "never shared" if this says so.
+    //
+    // It is indexed off the PMM's `base_addr`, so it must be exercised with a
+    // **real managed frame** — a synthetic address tests nothing but the
+    // out-of-range guard (an earlier version of this test used one, and passed a
+    // bitset that never recorded anything).
+    if let Some(f) = crate::pmm::alloc_page() {
+        // No "clear before" assertion: the record is per frame and since boot, so a
+        // recycled frame can legitimately carry a previous owner's bit. The
+        // transition to set is the property that matters.
+        crate::pmm::cow_ref_inc(f.addr);
+        let marked = crate::pmm::cow_ever_touched(f.addr);
+        assert!(marked == Some(true),
+            "durable bitset must record a real frame that was just shared: {marked:?}");
+        // Two decrements, because the first share of an untracked frame inserts at
+        // 2 ("owner + sharer") — leaving the count at 1 here would hand `free_page`
+        // below a frame it then refuses to release.
+        assert!(!crate::pmm::cow_ref_dec(f.addr), "scratch frame dec 2->1 must not be the last ref");
+        assert!(crate::pmm::cow_ref_dec(f.addr), "scratch frame dec 1->0 must be the last ref");
+        crate::pmm::free_page(f);
+    }
+
+    // Out of managed RAM: answerable ("never"), not a panic and not `None` —
+    // `None` is reserved for "instrument off", which means something different.
+    let out_of_range = crate::pmm::cow_ever_touched(0xDEAD_0000_0000);
+    assert!(out_of_range == Some(false),
+        "address outside managed RAM must read as never-shared: {out_of_range:?}");
+
+    console::print("[Test] cow_ref_ledger PASSED\n");
+}
+
+/// `MADV_DONTNEED` zeroes a strict superset of the range Linux would clear when
+/// the start address is unaligned — the head page it pulls in belongs to the
+/// caller and holds live bytes (theory 3 of proposals/CARGO_HEAP_NULL_RC.md).
+///
+/// Pins the divergence as a fact rather than a reading of the handler, so the
+/// audit counter it feeds has a defined meaning.
+fn test_madvise_dontneed_range_semantics() {
+    use crate::syscall::mem::dontneed_zero_range;
+
+    // Aligned start: identical to Linux — [start, PAGE_ALIGN(start+len)).
+    assert!(dontneed_zero_range(0x4000, 4096) == (0x4000, 1));
+    assert!(dontneed_zero_range(0x4000, 4097) == (0x4000, 2));
+    assert!(dontneed_zero_range(0x4000, 1) == (0x4000, 1));
+
+    // Unaligned start: Linux returns EINVAL and clears nothing. This rounds down,
+    // so the zeroed range begins BELOW the address the caller named — the bytes in
+    // [0x4000, 0x4800) are live data Linux would never have touched.
+    let (start, pages) = dontneed_zero_range(0x4800, 4096);
+    assert!(start == 0x4000, "unaligned start must round down today: {start:#x}");
+    assert!(start < 0x4800, "zeroed range must be shown to precede the caller's addr");
+    assert!(pages == 2, "unaligned start spills into a second page: {pages}");
+
+    // Zero length still clears the head page when the start is unaligned.
+    assert!(dontneed_zero_range(0x4800, 0) == (0x4000, 1));
+
+    console::print("[Test] madvise_dontneed_range PASSED\n");
+}
+
 fn test_pmm_conserved_across_spawn_exit_reap() {
     const HELLO_PATH: &str = "/bin/hello";
     if !check_binary_exists(HELLO_PATH) {

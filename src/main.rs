@@ -1530,6 +1530,10 @@ fn run_async_main() -> ! {
             if crate::config::SHARED_FILE_PAGES_ENABLED {
                 crate::safe_print!(192, "{}", crate::file_page_cache::stats_line());
             }
+            // `MADV_DONTNEED` divergence audit (proposals/CARGO_HEAP_NULL_RC.md).
+            // Both counters are expected to stay 0; either going non-zero means
+            // this handler is zeroing frames Linux would have left alone.
+            crate::safe_print!(128, "{}", crate::syscall::mem::dontneed_audit_line());
             // Deadlock-hunt aid: the Thread-0 heartbeat's dump trigger fires
             // every 50M idle loops (~never with idle_halt); piggyback on the
             // 30s PSTATS cadence instead so a wedged thread's parked resume
@@ -1796,6 +1800,14 @@ async fn memory_monitor() -> ! {
         // Written straight into the stack buffer; no heap alloc in the mem monitor.
         if reclaimed_pages > 0 {
             let _ = write!(buf, " | reclaimed={}KB", reclaimed_pages * 4);
+        }
+        // UAF quarantine (proposals/CARGO_HEAP_NULL_RC.md): `quar` is how many
+        // frames are parked awaiting their poison check, `UAF` how many were
+        // written after being freed. `UAF` is the number that matters and must be
+        // 0; it is shown only when the instrument is armed.
+        if config::PMM_UAF_QUARANTINE {
+            let (quar_len, uaf) = pmm::quarantine_stats();
+            let _ = write!(buf, " | quar={quar_len} UAF={uaf}");
         }
         // Heap high-water diagnostic: how much PMM the heap is sitting on and how
         // much of it is stuck (spans pinned by a live allocation, so reclaim

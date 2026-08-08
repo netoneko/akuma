@@ -248,6 +248,20 @@ impl BitmapAllocator {
         }
     }
 
+    /// Is the page containing physical address `pa` marked free?
+    ///
+    /// Address-taking counterpart of [`is_free`], for callers holding a PA out of
+    /// a page-table entry rather than a page index. Out-of-range addresses (below
+    /// `base_addr`, or past the managed area) report `false`: this allocator has
+    /// no claim on them, so "free" is not a statement it can make.
+    fn is_page_free_pa(&self, pa: usize) -> bool {
+        if pa < self.base_addr {
+            return false;
+        }
+        let page_idx = (pa - self.base_addr) / PAGE_SIZE;
+        page_idx < self.total_pages && self.is_free(page_idx)
+    }
+
     /// Allocate a single page
     fn alloc_page(&mut self) -> Option<PhysFrame> {
         // Start searching from hint
@@ -460,6 +474,449 @@ static ALLOCATED_PAGES: AtomicUsize = AtomicUsize::new(0);
 static DOUBLE_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // ============================================================================
+// UAF hunt: "is this frame on the free list?" + a ring of recent frees
+// ============================================================================
+//
+// The cargo null-`Rc` defect (proposals/CARGO_HEAP_NULL_RC.md) has the shape of a
+// frame handed back to the PMM while a process still maps it: the next
+// `alloc_page_zeroed` wipes the page under its live owner, so a qword holding a
+// pointer reads back as 0 with no fault at the moment of corruption. Both probes
+// below exist to make that state *observable at the anomaly* rather than
+// inferred from the crash 20 ms downstream:
+//
+// - [`is_page_free`] answers "is the PA behind this live PTE simultaneously on
+//   the free list?" in O(1). A `true` is proof of the premature free.
+// - [`record_free`]/[`last_free_record`] name the pid that freed it last, so the
+//   report points at a caller instead of a class.
+//
+// Both are cheap enough to leave on: one bitmap probe, and one lock-free store
+// per `free_page`.
+
+/// Slots in the recent-free ring. Power of two so the index wrap is a mask.
+/// 4096 frees is ~2 s of build traffic at the observed rate — long enough that a
+/// frame faulted on right after being freed is still in the window.
+const FREE_LEDGER_SLOTS: usize = 4096;
+
+static FREE_LEDGER_PA: [AtomicUsize; FREE_LEDGER_SLOTS] =
+    [const { AtomicUsize::new(0) }; FREE_LEDGER_SLOTS];
+/// `tid << 32 | seq` for the matching `FREE_LEDGER_PA` slot.
+static FREE_LEDGER_META: [AtomicUsize; FREE_LEDGER_SLOTS] =
+    [const { AtomicUsize::new(0) }; FREE_LEDGER_SLOTS];
+static FREE_LEDGER_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// Note that `pa` was returned to the PMM by thread `tid`. Lock-free and
+/// IRQ-safe: two relaxed stores and a fetch_add, so it is callable from inside
+/// the PMM's own paths and from a `Process` drop.
+fn record_free(pa: usize, tid: u32) {
+    let seq = FREE_LEDGER_NEXT.fetch_add(1, Ordering::Relaxed);
+    let idx = seq & (FREE_LEDGER_SLOTS - 1);
+    // Meta first, PA last with Release: a reader that observes the PA sees the
+    // meta that belongs to it (a torn pair would misattribute the free).
+    FREE_LEDGER_META[idx].store(((tid as usize) << 32) | (seq & 0xFFFF_FFFF), Ordering::Relaxed);
+    FREE_LEDGER_PA[idx].store(pa, Ordering::Release);
+}
+
+/// Most recent ledger entry for `pa`, as `(tid, seq)` — `None` if this frame has
+/// not been freed inside the ring's window. Linear scan of the ring; only ever
+/// called from an anomaly report, never on a hot path.
+pub fn last_free_record(pa: usize) -> Option<(u32, u32)> {
+    let mut best: Option<(u32, u32)> = None;
+    for i in 0..FREE_LEDGER_SLOTS {
+        if FREE_LEDGER_PA[i].load(Ordering::Acquire) != pa {
+            continue;
+        }
+        let meta = FREE_LEDGER_META[i].load(Ordering::Relaxed);
+        let (tid, seq) = ((meta >> 32) as u32, (meta & 0xFFFF_FFFF) as u32);
+        if best.is_none_or(|(_, prev)| seq.wrapping_sub(prev) < u32::MAX / 2) {
+            best = Some((tid, seq));
+        }
+    }
+    best
+}
+
+/// Sequence number the next free will be stamped with. Paired with the `seq` in a
+/// [`last_free_record`] result it gives the *distance* to that free — "freed 40
+/// frees ago" and "freed 300 000 frees ago" are very different findings, and the
+/// raw seq alone cannot tell them apart.
+pub fn free_ledger_seq() -> u32 {
+    (FREE_LEDGER_NEXT.load(Ordering::Relaxed) & 0xFFFF_FFFF) as u32
+}
+
+// ── CoW/share refcount event ledger ─────────────────────────────────────────
+//
+// `COW_REFCOUNTS` is the one counter that decides whether a frame is still owned:
+// `free_page` frees only when a decrement reaches 0. The `EAGER-UPGRADE` anomaly
+// is a page sitting read-only with that count at **0** while the process still
+// maps and owns it — which means the count was driven to zero by more decrements
+// than there were shares. This records every inc/dec so the anomaly report can
+// print the frame's whole reference history and show that imbalance directly,
+// with the thread behind each event.
+//
+// Same shape as the free ledger: fixed arrays, relaxed atomics, no allocation, so
+// it is callable from inside `cow_ref_inc`/`cow_ref_dec`'s IRQ-masked sections.
+
+/// Exact, durable record of "this frame has had at least one CoW/share reference
+/// event since boot" — one bit per physical frame, sized from RAM at [`init`].
+///
+/// The ring below is a *recent window*: `cow_share_and_demote_range` emits one
+/// event per shared page, so a single fork of a large process can evict the whole
+/// ring. That makes "no events in the ring" ambiguous — aged out, or never
+/// happened? — and the difference decides whether a page's history is even
+/// relevant. This bitset answers it exactly: a clear bit means the frame has never
+/// been through `cow_ref_inc`/`cow_ref_dec`, full stop.
+///
+/// Empty (and therefore a no-op in both directions) until `init` fills it, which
+/// it skips when [`crate::config::COW_REF_LEDGER`] is off — so the low-RAM
+/// profiles pay nothing, with no `cfg` on the call sites.
+static COW_EVER: Spinlock<Vec<u64>> = Spinlock::new(Vec::new());
+
+/// Base physical address the bitset is indexed from — the PMM's own `base_addr`.
+/// The bitset has one bit per *managed* frame, so an absolute PA has to be
+/// rebased before use, exactly like `BitmapAllocator::is_page_free_pa` does.
+static COW_EVER_BASE: AtomicUsize = AtomicUsize::new(0);
+
+/// Bit index for `pa`, or `None` when it falls outside managed RAM.
+fn cow_ever_index(pa: usize, len_words: usize) -> Option<usize> {
+    let base = COW_EVER_BASE.load(Ordering::Relaxed);
+    let idx = pa.checked_sub(base)? / PAGE_SIZE;
+    (idx / 64 < len_words).then_some(idx)
+}
+
+/// Note that `pa` has taken part in a reference event.
+fn cow_ever_mark(pa: usize) {
+    crate::irq::with_irqs_disabled(|| {
+        let mut bits = COW_EVER.lock();
+        let Some(idx) = cow_ever_index(pa, bits.len()) else { return };
+        bits[idx / 64] |= 1u64 << (idx % 64);
+    });
+}
+
+/// Has `pa` ever taken part in a reference event? `None` when the instrument is
+/// off (which says nothing at all — not the same as "no").
+///
+/// The record is **per frame, since boot**, so it survives the frame being freed
+/// and handed to a new owner. A set bit therefore means "this *frame* was shared
+/// at some point", not "this frame's current owner shared it"; a clear bit is the
+/// strong direction — proof the frame has never been through
+/// `cow_ref_inc`/`cow_ref_dec` at all.
+pub fn cow_ever_touched(pa: usize) -> Option<bool> {
+    crate::irq::with_irqs_disabled(|| {
+        let bits = COW_EVER.lock();
+        if bits.is_empty() {
+            return None;
+        }
+        // Out of managed range reads as "never" rather than `None`: the bitset is
+        // initialised, it simply has nothing to say about non-RAM addresses.
+        let Some(idx) = cow_ever_index(pa, bits.len()) else { return Some(false) };
+        Some(bits[idx / 64] & (1u64 << (idx % 64)) != 0)
+    })
+}
+
+/// Recent-window ring of reference events. Deliberately small: it carries the
+/// *detail* (order, thread, before→after) for the last few thousand events, while
+/// [`COW_EVER`] carries the durable yes/no for all of RAM.
+const COW_LEDGER_SLOTS: usize = 4096;
+static COW_LEDGER_PA: [AtomicUsize; COW_LEDGER_SLOTS] =
+    [const { AtomicUsize::new(0) }; COW_LEDGER_SLOTS];
+/// `tid << 32 | op << 24 | before << 12 | after` (op: 0 = inc, 1 = dec).
+static COW_LEDGER_META: [AtomicUsize; COW_LEDGER_SLOTS] =
+    [const { AtomicUsize::new(0) }; COW_LEDGER_SLOTS];
+static COW_LEDGER_SEQ: [AtomicUsize; COW_LEDGER_SLOTS] =
+    [const { AtomicUsize::new(0) }; COW_LEDGER_SLOTS];
+static COW_LEDGER_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+fn cow_ledger_record(pa: usize, is_dec: bool, before: u16, after: u16) {
+    if !crate::config::COW_REF_LEDGER {
+        return;
+    }
+    cow_ever_mark(pa);
+    let seq = COW_LEDGER_NEXT.fetch_add(1, Ordering::Relaxed);
+    let idx = seq & (COW_LEDGER_SLOTS - 1);
+    let tid = akuma_exec::threading::current_thread_id();
+    let meta = (tid << 32)
+        | ((is_dec as usize) << 24)
+        | (((before as usize) & 0xFFF) << 12)
+        | ((after as usize) & 0xFFF);
+    COW_LEDGER_SEQ[idx].store(seq, Ordering::Relaxed);
+    COW_LEDGER_META[idx].store(meta, Ordering::Relaxed);
+    COW_LEDGER_PA[idx].store(pa, Ordering::Release);
+}
+
+/// Number of reference events currently recorded for `pa`. Lets a boot self-test
+/// assert the ledger is actually recording without parsing console output — its
+/// only caller, so it compiles out wherever that suite does.
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+pub fn cow_event_count(pa: usize) -> usize {
+    if !crate::config::COW_REF_LEDGER {
+        return 0;
+    }
+    (0..COW_LEDGER_SLOTS)
+        .filter(|&i| COW_LEDGER_PA[i].load(Ordering::Acquire) == pa)
+        .count()
+}
+
+/// Print every recorded reference event for `pa`, oldest first (up to 12).
+///
+/// Read the `before->after` column: a healthy frame's history alternates around
+/// its share count and only reaches 0 on the last unmapper. A history whose
+/// decrements outnumber its increments is the accounting bug the null-`Rc` hunt
+/// is looking for, and the `tid` on the offending decrement names the caller.
+pub fn print_cow_history(pa: usize) {
+    if !crate::config::COW_REF_LEDGER {
+        return;
+    }
+    // Selection-sort the matches by seq as we print: at most 12 entries, and this
+    // runs once on an anomaly path, so an O(n²) pass over the hits is free.
+    let mut printed = 0usize;
+    let mut last_seq: Option<usize> = None;
+    while printed < 12 {
+        let mut best: Option<(usize, usize)> = None; // (seq, idx)
+        for i in 0..COW_LEDGER_SLOTS {
+            if COW_LEDGER_PA[i].load(Ordering::Acquire) != pa {
+                continue;
+            }
+            let seq = COW_LEDGER_SEQ[i].load(Ordering::Relaxed);
+            if last_seq.is_some_and(|l| seq <= l) {
+                continue;
+            }
+            if best.is_none_or(|(bs, _)| seq < bs) {
+                best = Some((seq, i));
+            }
+        }
+        let Some((seq, idx)) = best else { break };
+        let meta = COW_LEDGER_META[idx].load(Ordering::Relaxed);
+        crate::safe_print!(160, "  [COW-HIST] pa={:#x} seq={} tid={} {} {}->{}\n",
+            pa, seq, meta >> 32,
+            if (meta >> 24) & 1 == 1 { "dec" } else { "inc" },
+            (meta >> 12) & 0xFFF, meta & 0xFFF);
+        last_seq = Some(seq);
+        printed += 1;
+    }
+    if printed == 0 {
+        // Say which of the two possible meanings this is. "No events in the ring"
+        // is ambiguous on its own — one fork can evict the whole window — so the
+        // durable bitset is what makes the negative worth anything.
+        let verdict = match cow_ever_touched(pa) {
+            Some(false) => "NEVER shared (durable bitset clear)",
+            // Per-frame and since boot, so this can be a *previous* owner of the
+            // frame — enough to keep the frame in scope, not enough to convict.
+            Some(true) => "shared at some point (frame, not necessarily this owner)",
+            None => "instrument off — says nothing",
+        };
+        crate::safe_print!(160, "  [COW-HIST] pa={:#x} no events in window: {}\n", pa, verdict);
+    }
+}
+
+/// Is the frame containing `pa` currently marked **free** in the PMM bitmap?
+///
+/// The invariant every caller of this cares about: a physical address reachable
+/// through a live user PTE must never be free. When it is, the frame has two
+/// owners and one of them is about to have its data zeroed by the next
+/// `alloc_page_zeroed`.
+///
+/// Returns `false` for addresses outside managed RAM (nothing to say about them).
+pub fn is_page_free(pa: usize) -> bool {
+    crate::irq::with_irqs_disabled(|| {
+        let pmm = PMM.lock();
+        pmm.is_page_free_pa(pa)
+    })
+}
+
+// ============================================================================
+// UAF hunt: poison quarantine
+// ============================================================================
+//
+// [`is_page_free`] proves a premature free only if something happens to *look* at
+// the right frame at the right moment. This catches it unconditionally.
+//
+// A freed frame is filled with a PA-derived poison word and parked in a FIFO
+// instead of going straight back to the bitmap. It is released only after
+// `QUARANTINE_SLOTS` further frees, and the poison is verified on the way out. A
+// frame that some process still maps will have been *written* during that window
+// — heap traffic, a CoW break, anything — and the broken poison names the frame,
+// the offset, and (via the ledger) the pid that gave it up. That turns a silent
+// use-after-free into a deterministic log line at a bounded distance from the
+// cause, instead of a null pointer read minutes later in another process.
+//
+// Costs: one 4 KiB store per free, and `QUARANTINE_SLOTS` pages (2 MiB) held back.
+// The hold-back is given up the moment allocation actually fails
+// ([`quarantine_drain_all`] sits on the pressure ladder), so it cannot turn into
+// an OOM of its own.
+
+/// Frames held back before release. 512 frees of lag is far more than the
+/// window between a premature free and the first write through the stale mapping.
+const QUARANTINE_SLOTS: usize = 512;
+
+/// Poison base; XORed with the PA so a frame written with *another* frame's
+/// poison (a stale copy, a mis-targeted memset) is still a mismatch.
+const POISON_MAGIC: u64 = 0xFEED_FACE_DEAD_0000;
+
+#[inline]
+fn poison_word(pa: usize) -> u64 {
+    POISON_MAGIC ^ (pa as u64)
+}
+
+struct Quarantine {
+    pa: [usize; QUARANTINE_SLOTS],
+    head: usize,
+    len: usize,
+}
+
+static QUARANTINE: Spinlock<Quarantine> =
+    Spinlock::new(Quarantine { pa: [0; QUARANTINE_SLOTS], head: 0, len: 0 });
+
+/// Frames written after being freed — every one is a use-after-free with a live
+/// second owner. Surfaced in the `[Mem]` line; must be 0.
+static UAF_DETECTED: AtomicUsize = AtomicUsize::new(0);
+
+/// Direct-mapped "is this PA in the quarantine" table. Approximate (collisions
+/// yield false negatives, never false positives), which is all a *detector* needs:
+/// it upgrades double-frees that today slip through because the page was
+/// re-allocated between the two frees.
+const QUAR_PRESENT_SLOTS: usize = 2048;
+static QUAR_PRESENT: [AtomicUsize; QUAR_PRESENT_SLOTS] =
+    [const { AtomicUsize::new(0) }; QUAR_PRESENT_SLOTS];
+
+#[inline]
+fn quar_slot(pa: usize) -> usize {
+    (pa >> 12) & (QUAR_PRESENT_SLOTS - 1)
+}
+
+/// Fill `pa`'s page with its poison word.
+///
+/// No cache maintenance: this VA and the user VA that may still map the frame are
+/// both Normal Inner-Shareable cacheable, so they are hardware-coherent, and the
+/// verify below reads back through this same identity mapping either way.
+fn poison_page(pa: usize) {
+    let p = akuma_exec::mmu::phys_to_virt(pa).cast::<u64>();
+    let word = poison_word(pa);
+    for i in 0..(PAGE_SIZE / 8) {
+        unsafe { p.add(i).write_volatile(word) };
+    }
+}
+
+/// First word of `pa`'s page that is no longer its poison, as `(byte_offset, got)`.
+fn verify_poison(pa: usize) -> Option<(usize, u64)> {
+    let p = akuma_exec::mmu::phys_to_virt(pa).cast::<u64>();
+    let want = poison_word(pa);
+    for i in 0..(PAGE_SIZE / 8) {
+        let got = unsafe { p.add(i).read_volatile() };
+        if got != want {
+            return Some((i * 8, got));
+        }
+    }
+    None
+}
+
+/// Verify a frame leaving quarantine and hand it back to the bitmap.
+fn release_from_quarantine(pa: usize) {
+    if let Some((off, got)) = verify_poison(pa) {
+        UAF_DETECTED.fetch_add(1, Ordering::Relaxed);
+        let (tid_freed, seq_freed) = last_free_record(pa).unwrap_or((u32::MAX, 0));
+        crate::safe_print!(255,
+            "[PMM-UAF] pa={:#x} WRITTEN AFTER FREE: off={:#x} got={:#x} want={:#x} \
+             freed_by=(tid={} seq={}) cow_ref={}\n",
+            pa, off, got, poison_word(pa), tid_freed, seq_freed, cow_ref_get(pa));
+    }
+    QUAR_PRESENT[quar_slot(pa)].compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).ok();
+
+    let frame = PhysFrame::new(pa);
+    let outcome = crate::irq::with_irqs_disabled(|| {
+        let mut pmm = PMM.lock();
+        // The bitmap must still read USED: quarantined frames are not free, and
+        // nothing else may have marked this one free behind our back. If it did,
+        // re-marking would double it on the free list — refuse and report instead.
+        if pmm.is_page_free_pa(pa) {
+            return FreeOutcome::DoubleFree;
+        }
+        pmm.free_page(frame)
+    });
+    match outcome {
+        FreeOutcome::Freed => {
+            ALLOCATED_PAGES.fetch_sub(1, Ordering::Relaxed);
+            USER_PAGES_FREED.fetch_add(1, Ordering::Relaxed);
+        }
+        FreeOutcome::DoubleFree => { DOUBLE_FREE_COUNT.fetch_add(1, Ordering::Relaxed); }
+        FreeOutcome::OutOfRange => {}
+    }
+}
+
+/// Poison `pa` and park it. Returns the frame displaced from the ring's tail, if
+/// the ring was full, for the caller to verify and release **outside** the lock.
+/// `None` also covers the "already parked" case — a double free, reported here.
+fn quarantine_push(pa: usize) -> Option<usize> {
+    if QUAR_PRESENT[quar_slot(pa)].load(Ordering::Acquire) == pa {
+        DOUBLE_FREE_COUNT.fetch_add(1, Ordering::Relaxed);
+        let (tid_freed, seq_freed) = last_free_record(pa).unwrap_or((u32::MAX, 0));
+        crate::safe_print!(192,
+            "[PMM-QUAR-DF] pa={:#x} freed twice while quarantined, prev freed_by=(tid={} seq={})\n",
+            pa, tid_freed, seq_freed);
+        return None;
+    }
+    poison_page(pa);
+    QUAR_PRESENT[quar_slot(pa)].store(pa, Ordering::Release);
+    crate::irq::with_irqs_disabled(|| {
+        let mut q = QUARANTINE.lock();
+        if q.len < QUARANTINE_SLOTS {
+            let idx = (q.head + q.len) % QUARANTINE_SLOTS;
+            q.pa[idx] = pa;
+            q.len += 1;
+            None
+        } else {
+            let head = q.head;
+            let evicted = q.pa[head];
+            q.pa[head] = pa;
+            q.head = (head + 1) % QUARANTINE_SLOTS;
+            Some(evicted)
+        }
+    })
+}
+
+/// Empty the quarantine, verifying every frame on the way out. Sits on the
+/// allocator's pressure ladder so held-back frames are always given up before an
+/// allocation is allowed to fail: the instrument must never be the reason a build
+/// OOMs. Returns the number of frames released.
+pub fn quarantine_drain_all() -> usize {
+    let mut released = 0usize;
+    loop {
+        let pa = crate::irq::with_irqs_disabled(|| {
+            let mut q = QUARANTINE.lock();
+            if q.len == 0 {
+                return None;
+            }
+            let pa = q.pa[q.head];
+            q.head = (q.head + 1) % QUARANTINE_SLOTS;
+            q.len -= 1;
+            Some(pa)
+        });
+        // Verify/release outside the quarantine lock — it takes the PMM lock.
+        match pa {
+            Some(pa) => { release_from_quarantine(pa); released += 1; }
+            None => break,
+        }
+    }
+    released
+}
+
+/// Discount `n` detections from the running total. Only for boot self-tests that
+/// deliberately write through a freed frame to exercise the detector, so the
+/// `[Mem] UAF=` signal keeps reflecting only *real* use-after-free writes.
+/// Mirrors [`discount_double_frees`], including its build gating: the boot suite
+/// is its only caller, so it compiles out wherever that suite does.
+#[doc(hidden)]
+#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+pub fn discount_uaf_detections(n: usize) {
+    UAF_DETECTED.fetch_sub(n, Ordering::Relaxed);
+}
+
+/// Frames currently held in the quarantine, and the number of use-after-free
+/// writes it has caught. Diagnostics (`[Mem]`).
+pub fn quarantine_stats() -> (usize, usize) {
+    let len = crate::irq::with_irqs_disabled(|| QUARANTINE.lock().len);
+    (len, UAF_DETECTED.load(Ordering::Relaxed))
+}
+
+// ============================================================================
 // Leak-debugging: per-site demand-paging frame counters (temporary instrument)
 // ============================================================================
 // Each demand-paging map site bumps the matching counter once per page it maps,
@@ -502,6 +959,15 @@ pub fn init(ram_base: usize, ram_size: usize, kernel_end: usize) {
 
     TOTAL_PAGES.store(pmm.total_pages, Ordering::Release);
     ALLOCATED_PAGES.store(pmm.total_pages - pmm.free_pages, Ordering::Release);
+
+    // One bit per frame for the durable "was this ever CoW-shared" record — 1 KiB
+    // per 32 MiB of RAM. Left empty (and so inert) when the instrument is off,
+    // which is what keeps the low-RAM profiles free of it.
+    if crate::config::COW_REF_LEDGER {
+        let words = pmm.total_pages.div_ceil(64);
+        COW_EVER_BASE.store(pmm.base_addr, Ordering::Release);
+        *COW_EVER.lock() = alloc::vec![0u64; words];
+    }
 }
 
 /// Multikernel (smp): remove `[base, base+len)` from the BSP's free pool so a
@@ -537,7 +1003,16 @@ pub fn alloc_page() -> Option<PhysFrame> {
     if let Some(frame) = alloc_page_once() {
         return Some(frame);
     }
-    // Out of free pages: try clawing back fully-free kernel-heap spans (the
+    // Out of free pages: give back whatever the UAF quarantine is holding first.
+    // It parks up to `QUARANTINE_SLOTS` frames purely to catch writes through
+    // stale mappings, and that debt must never be the reason an allocation fails.
+    if crate::config::PMM_UAF_QUARANTINE
+        && quarantine_drain_all() > 0
+        && let Some(frame) = alloc_page_once()
+    {
+        return Some(frame);
+    }
+    // Still short: try clawing back fully-free kernel-heap spans (the
     // heap grows one-way via the OOM handler; this returns the watermark), then
     // retry once. `reclaim_to_pmm` is a no-op if the heap lock is already held
     // (i.e. we were reentered from the allocator), so this can't deadlock.
@@ -577,6 +1052,24 @@ pub fn free_page(frame: PhysFrame) {
     // If we free first then untrack, another CPU could reallocate the same
     // frame and track it before we untrack, causing us to remove their tracking.
     untrack_frame(frame);
+
+    // Name the thread that gave this frame up, so an anomaly report on a
+    // still-mapped frame can point at the caller that released it (see
+    // `last_free_record`). Deliberately the *thread id* and not
+    // `read_current_pid()`: that resolves through `THREAD_PID_MAP` and the process
+    // table, and `free_page` is reachable from inside both (a `Process` drop frees
+    // every frame of its address space), so calling it here deadlocks on a
+    // non-reentrant `Spinlock`. `current_thread_id` is a register read.
+    record_free(frame.addr, akuma_exec::threading::current_thread_id() as u32);
+
+    // Poison and park instead of releasing immediately, so a write through a
+    // mapping that outlived this free is caught with the frame still named.
+    if crate::config::PMM_UAF_QUARANTINE {
+        if let Some(evicted) = quarantine_push(frame.addr) {
+            release_from_quarantine(evicted);
+        }
+        return;
+    }
 
     // CRITICAL: Disable IRQs to prevent deadlock!
     let outcome = crate::irq::with_irqs_disabled(|| {
@@ -854,32 +1347,44 @@ static COW_REFCOUNTS: Spinlock<BTreeMap<usize, u16>> = Spinlock::new(BTreeMap::n
 /// First call for a new address inserts it with count=2 (parent + child).
 /// Subsequent calls increment by 1 (additional fork children).
 pub fn cow_ref_inc(pa: usize) {
-    crate::irq::with_irqs_disabled(|| {
+    let (before, after) = crate::irq::with_irqs_disabled(|| {
         let mut table = COW_REFCOUNTS.lock();
         let entry = table.entry(pa).or_insert(1);
+        let before = *entry;
         *entry = entry.saturating_add(1);
+        (before, *entry)
     });
+    // Recorded outside the `COW_REFCOUNTS` hold: the ledger takes no lock, but
+    // keeping it out keeps the hot path's critical section exactly as short as it
+    // was before the instrument existed.
+    cow_ledger_record(pa, false, before, after);
 }
 
 /// Decrement the CoW reference count.  Returns true if the count reached 0
 /// (meaning the caller should free the physical frame).  Removes the entry
 /// from the table when count reaches 0 to avoid unbounded growth.
 pub fn cow_ref_dec(pa: usize) -> bool {
-    crate::irq::with_irqs_disabled(|| {
+    let (before, after, last) = crate::irq::with_irqs_disabled(|| {
         let mut table = COW_REFCOUNTS.lock();
         match table.get_mut(&pa) {
             Some(count) => {
+                let before = *count;
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     table.remove(&pa);
-                    true
+                    (before, 0, true)
                 } else {
-                    false
+                    (before, *count, false)
                 }
             }
-            None => true, // Not tracked → single owner → safe to free
+            // Not tracked → single owner → safe to free. Recorded as `0->0` so an
+            // untracked decrement is still visible in the history: a run of these
+            // on a frame that *should* be shared is itself the desync.
+            None => (0, 0, true),
         }
-    })
+    });
+    cow_ledger_record(pa, true, before, after);
+    last
 }
 
 /// Acquire the CoW fault lock for a physical page.

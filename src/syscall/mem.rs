@@ -84,6 +84,55 @@ pub const MAP_FIXED_NOREPLACE: u32 = 0x100000;
 pub const PROT_NONE: u32 = 0;
 pub const PROT_WRITE: u32 = 0x2;
 
+// ── `MADV_DONTNEED` divergence audit ─────────────────────────────────────────
+//
+// Akuma's `MADV_DONTNEED` zeroes the *physical frame* in place, where Linux drops
+// the *mapping* and lets the next touch fault in a fresh zero page. The two agree
+// for a page owned by one address space and disagree — destructively — for a
+// shared one. These counters say whether that divergence is actually being
+// exercised, which is what separates theory 3 in proposals/CARGO_HEAP_NULL_RC.md
+// from the refcount theories above it. Both are expected to read 0; a non-zero
+// value is a lead, not noise.
+
+/// `MADV_DONTNEED` calls whose start address was not page-aligned. Linux rejects
+/// these with `EINVAL`; rounding the start DOWN pulls the caller's live head page
+/// into the zeroed range.
+pub static DONTNEED_UNALIGNED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Pages zeroed by `MADV_DONTNEED` whose frame carried a share reference
+/// (`cow_ref > 0`) — i.e. a post-fork CoW page or a `file_page_cache` page. Each
+/// one wiped a frame some other address space still maps.
+pub static DONTNEED_SHARED_FRAME: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// The page range `MADV_DONTNEED` actually zeroes for `(addr, len)`, as
+/// `(start_va, pages)`.
+///
+/// Extracted so the divergence from Linux is assertable at the boundary rather
+/// than inferred from the handler (same reasoning as
+/// [`mmap_fixed_addr_unaligned_einval`]). Linux requires a page-aligned `start`
+/// and rejects anything else with `EINVAL`, then zeroes
+/// `[start, PAGE_ALIGN(start+len))`. This rounds an unaligned start **down**
+/// instead, so for `addr & 0xFFF != 0` the range Akuma clears is a strict
+/// superset of Linux's — it includes the caller's partial head page, whose live
+/// bytes Linux would never have touched.
+pub fn dontneed_zero_range(addr: usize, len: usize) -> (usize, usize) {
+    let start = addr & !0xFFF;
+    let end = (addr.saturating_add(len) + 0xFFF) & !0xFFF;
+    (start, (end - start) / 4096)
+}
+
+/// One-line summary of the `MADV_DONTNEED` audit counters for the PSTATS block.
+pub fn dontneed_audit_line() -> alloc::string::String {
+    use core::sync::atomic::Ordering;
+    alloc::format!(
+        "[MADV] dontneed_unaligned={} dontneed_shared_frame={}\n",
+        DONTNEED_UNALIGNED.load(Ordering::Relaxed),
+        DONTNEED_SHARED_FRAME.load(Ordering::Relaxed),
+    )
+}
+
 /// Writable `MAP_SHARED` file-backed mappings whose dirty pages must be flushed
 /// back to the backing file.
 ///
@@ -773,14 +822,30 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
                 None => return 0,
             };
             let _mm_window = MmBklGuard::new();
-            let aligned_addr = addr & !0xFFF;
-            let aligned_len = ((addr + len + 0xFFF) & !0xFFF) - aligned_addr;
-            let pages = aligned_len / 4096;
+            let (aligned_addr, pages) = dontneed_zero_range(addr, len);
+            // Audit both ways this handler can differ from Linux and wipe live data
+            // (proposals/CARGO_HEAP_NULL_RC.md, theory 3). Counters only — behaviour
+            // is unchanged until the evidence says which one fires.
+            if addr & 0xFFF != 0 {
+                // Linux returns EINVAL for an unaligned start; rounding it DOWN
+                // instead means the partial head page — someone else's live data —
+                // is inside the range about to be zeroed.
+                DONTNEED_UNALIGNED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
             // `zero_mapped_page` reads page-table state to find each frame; hold
             // `as_lock` so a concurrent BKL-free fault can't edit the tables under it.
             proc.with_address_space(|aspace| {
                 for i in 0..pages {
-                    aspace.zero_mapped_page(aligned_addr + i * 4096);
+                    let va = aligned_addr + i * 4096;
+                    // Linux drops the *mapping*; this handler memsets the *frame*. On
+                    // a frame shared with another address space — CoW after fork, or a
+                    // `file_page_cache` page — that wipes the peer's live copy too.
+                    if let Some(pa) = aspace.translate(va)
+                        && crate::pmm::cow_ref_get(pa & !0xFFF) > 0
+                    {
+                        DONTNEED_SHARED_FRAME.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    aspace.zero_mapped_page(va);
                 }
             });
             0

@@ -2053,6 +2053,68 @@ fn print_write_perm_fault_diag(far: u64, iss: u64, pid: u32, as_owner: u32) {
         free);
 }
 
+/// Forensic probe of the physical page behind a live user VA, printed at an
+/// anomaly.
+///
+/// This exists for the cargo null-`Rc` defect (proposals/CARGO_HEAP_NULL_RC.md),
+/// whose signature is a heap qword that reads back as zero with **no fault at the
+/// moment of corruption**. The mechanism that produces that silently is a frame
+/// returned to the PMM while a process still maps it: the next
+/// `alloc_page_zeroed` wipes the page under its live owner. So the one question
+/// worth asking at any page-level anomaly is whether the PA behind this PTE is
+/// *simultaneously on the free list* — `free=true` is proof, not a hint, and
+/// `last_free` then names the pid that released it.
+///
+/// `first_words` distinguishes the two downstream states that otherwise look
+/// alike: a page whose content is intact but whose permissions were lost (an
+/// accounting bug) versus one that has already been wiped (the frame is gone).
+///
+/// Runs only on anomaly paths (`EAGER-UPGRADE`, `WILD-DA`), never per-fault.
+fn print_page_forensics(tag: &str, pid: u32, va: usize) {
+    let page_va = va & !0xFFF;
+    let ttbr0: u64;
+    #[cfg(target_os = "none")]
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    #[cfg(not(target_os = "none"))]
+    { ttbr0 = 0; }
+    let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+    let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
+    let Some(pa) = akuma_exec::mmu::translate_user_va(l0_ptr, page_va).map(|p| p & !0xFFF) else {
+        crate::safe_print!(128, "[{}] pid={} va={:#x} UNMAPPED\n", tag, pid, page_va);
+        return;
+    };
+
+    // Read through the kernel identity map, not the user VA: the point is to
+    // inspect the frame regardless of what the user PTE currently permits.
+    let words = unsafe {
+        let p = akuma_exec::mmu::phys_to_virt(pa).cast::<u64>();
+        [p.read_volatile(), p.add(1).read_volatile(),
+         p.add(2).read_volatile(), p.add(3).read_volatile()]
+    };
+    // Distance, not the raw seq: "freed 40 frees ago" and "freed 300 000 frees
+    // ago" are different findings, and only the first implicates this frame. With
+    // no record at all there IS no distance — printing one computed against a
+    // default seq of 0 yields a large number that reads exactly like a real
+    // (innocent) age, so report the absence instead.
+    let (tid_freed, free_age) = match crate::pmm::last_free_record(pa) {
+        Some((tid, seq)) => (tid as i64, crate::pmm::free_ledger_seq().wrapping_sub(seq) as i64),
+        None => (-1, -1),
+    };
+    let tracked = akuma_exec::process::lookup_process_shared(pid)
+        .is_some_and(|p| p.address_space.tracks_user_frame(pa));
+    crate::safe_print!(255,
+        "[{}] pid={} va={:#x} pa={:#x} FREE={} cow_ref={} tracked={} \
+         last_free=(tid={} age={}) [-1 = never freed] head={:#x},{:#x},{:#x},{:#x}\n",
+        tag, pid, page_va, pa,
+        crate::pmm::is_page_free(pa),
+        crate::pmm::cow_ref_get(pa),
+        tracked, tid_freed, free_age,
+        words[0], words[1], words[2], words[3]);
+    // The reference history is what separates "this page's count was legitimately
+    // 0" from "someone decremented it once too often".
+    crate::pmm::print_cow_history(pa);
+}
+
 /// Returns true if the fault was a CoW write permission fault, the CoW page was
 /// successfully resolved (new frame allocated, old PA remapped), and the caller
 /// should return immediately to retry the faulting instruction via ERET.
@@ -3364,6 +3426,14 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
                         #[cfg(not(kernel_smp_shared))]
                         let _ = &owner;
+                        // Probe BEFORE the repair: once the PTE is RW the anomalous
+                        // state is gone, and it is the state — not the repair — that
+                        // the null-`Rc` hunt needs on the record. In run 3 of the
+                        // self-host build this arm fired on cargo's heap page
+                        // 0x314da000 six log lines before the process read a zeroed
+                        // pointer off that same page, so whatever this prints is the
+                        // closest look at the defect we have.
+                        print_page_forensics("EAGER-UPGRADE", pid, page_va);
                         akuma_exec::mmu::update_current_user_page_flags(page_va, region_flags);
                         crate::safe_print!(192,
                             "[EAGER-UPGRADE] pid={} as_owner={} va={:#x} flags={:#x}\n",
@@ -3915,6 +3985,21 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         frame_ref.x12, frame_ref.x13, frame_ref.x14, frame_ref.x15);
                     crate::tprint!(128, "  x16={:#x} x17={:#x} x18={:#x} x28={:#x}\n",
                         frame_ref.x16, frame_ref.x17, frame_ref.x18, frame_ref.x28);
+
+                    // A null FAR means the *pointer* was corrupt, not the access —
+                    // the interesting page is the one the null was loaded FROM, not
+                    // FAR itself. In the run-3 autopsy that was `x0`
+                    // (`ldr x8,[x0,#288]` with x0 in cargo's heap), so probe the page
+                    // behind the argument registers most likely to hold that base.
+                    // Frames on the PMM free list here are the null-`Rc` defect
+                    // caught in the act (proposals/CARGO_HEAP_NULL_RC.md).
+                    for (name, val) in [("x0", frame_ref.x0), ("x1", frame_ref.x1),
+                                        ("x19", frame_ref.x19), ("FAR", far_usize as u64)] {
+                        // Skip obvious non-pointers: page 0 and kernel-range values.
+                        if val >= 0x1000 && (val as usize) < akuma_exec::process::types::ProcessMemory::KERNEL_VA_START {
+                            print_page_forensics(name, pid, val as usize);
+                        }
+                    }
 
                     // Auto-dump syscall log for post-crash diagnosis.
                     // Note: CLONE_VM threads share the address space owner's process info

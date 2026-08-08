@@ -1083,6 +1083,14 @@ impl UserAddressSpace {
         self.is_page_mapped(l0_ptr, va)
     }
 
+    /// Physical address `va` maps to in **this** address space, or `None` when it
+    /// is unmapped. Walks this space's own L0 rather than the live `TTBR0`, so it
+    /// is answerable for a process that is not the one currently running.
+    pub fn translate(&self, va: usize) -> Option<usize> {
+        let l0_ptr = phys_to_virt(self.l0_frame.addr) as *const u64;
+        translate_user_va(l0_ptr, va)
+    }
+
     pub fn activate(&self) {
         let _ttbr0 = self.ttbr0();
         // IRQs masked so the install and the expected-L0 note (the switch-path

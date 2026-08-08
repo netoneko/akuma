@@ -540,6 +540,42 @@ pub const PROC_SYSVIPC_ENABLED: bool = false;
 /// Verbose file I/O logging (openat, read, readv, fstat paths + sizes).
 pub const SYSCALL_DEBUG_IO_ENABLED: bool = false;
 
+/// Poison-and-quarantine freed physical frames to catch use-after-free writes
+/// (`pmm::quarantine_push`).
+///
+/// On for the cargo null-`Rc` investigation (proposals/CARGO_HEAP_NULL_RC.md):
+/// that defect's signature is a heap qword reading back as zero, which is what a
+/// frame handed to the PMM while a process still maps it looks like once the next
+/// `alloc_page_zeroed` wipes it. With this on, the still-mapped owner's next write
+/// lands on poison instead, and `[PMM-UAF]` names the frame and the pid that freed
+/// it — at a bounded distance from the cause instead of minutes downstream.
+///
+/// Costs a 4 KiB store per `free_page` and holds back 512 frames (2 MiB); the
+/// hold-back is surrendered on the first allocation failure
+/// (`pmm::quarantine_drain_all` sits on the pressure ladder), so it cannot cause
+/// an OOM. Forced `false` on the low-RAM profiles, where 2 MiB is a real fraction
+/// of RAM and the debug cost is not wanted in a shipped image.
+#[cfg(not(any(kernel_profile_size, kernel_profile_extreme)))]
+pub const PMM_UAF_QUARANTINE: bool = true;
+#[cfg(any(kernel_profile_size, kernel_profile_extreme))]
+pub const PMM_UAF_QUARANTINE: bool = false;
+
+/// Record every CoW/share refcount increment and decrement in a ring, so an
+/// anomaly can print a frame's whole reference history (`pmm::print_cow_history`).
+///
+/// `COW_REFCOUNTS` decides when a frame is freed, and the `EAGER-UPGRADE` anomaly
+/// is a page whose count reached **0** while its owner still maps it read-only —
+/// one decrement more than there were shares. The counter alone cannot say who
+/// over-decremented it; the history can, and it names the thread behind each
+/// event. See proposals/CARGO_HEAP_NULL_RC.md.
+///
+/// ~98 KB of BSS and two relaxed stores per refcount operation, so it is gated off
+/// on the low-RAM profiles alongside the quarantine.
+#[cfg(not(any(kernel_profile_size, kernel_profile_extreme)))]
+pub const COW_REF_LEDGER: bool = true;
+#[cfg(any(kernel_profile_size, kernel_profile_extreme))]
+pub const COW_REF_LEDGER: bool = false;
+
 /// Extended diagnostics for syscalls that return EFAULT/ENOSYS/EINVAL.
 ///
 /// When enabled, the dangerous-errno log line in `handle_syscall` includes
