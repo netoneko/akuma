@@ -634,6 +634,25 @@ Same tree, same boot parameters, one variable:
 Note the third row against §0.1's "1 round → PASS": one fork round is enough, and
 the original table read a probability as a threshold.
 
+### 12.5a It needs two cores
+
+The same pristine kernel, same probe, only `SMP` changed:
+
+| | `bssfork 20 3` |
+| --- | --- |
+| pristine, **SMP=1** | **10/10 PASS** |
+| pristine, **SMP=4** | **8/8 SEGV** |
+
+Which is what the mechanism predicts: the loser of the race has to be *executing*
+its own fault while the winner holds the page's fault slot, and on one core the
+holder runs to completion first. So single-core builds (`cargo run --release`) were
+never exposed to this — it is a `smp-shared` / devbox / self-host defect only.
+
+Caveat on how far that goes: **wider shapes are not measurable at SMP=1**, because
+the probe's workers are CPU-bound and never sleep, so 4+ of them on one core starve
+sshd and every result comes back empty. That is the probe's shape, not a kernel
+finding, and it is why the table above stops at 3 threads.
+
 Boot self-test: `test_stale_write_fault_absorbed` (`src/process_tests.rs`) drives
 the decision against a scratch address space — absorb when the PTE grants the
 write, decline for RO, decline for unmapped, exhaust the budget on an unchanged
@@ -664,11 +683,117 @@ whose own comment records that it had never been confirmed to fire. Fixed kernel
 stucks, 13 recoveries — but pristine dies of *this* defect long before it can
 sustain the load, so that is not a clean A/B.
 
-Working reading: the fix does not create that race, it **reaches** it — contended
-multi-threaded fork workloads now survive to run their teardown path. The test
-that decides it is a load whose absorb counter stays 0 while the storm still
-appears. `bssfork` at >=3 threads is the fastest known trigger, which is itself
-new: this race had no reproducer before.
+**Settled: the storm is pre-existing and load-driven, not this fix.** `bssfork`
+gained a `spread=1` mode — same threads, same fork churn, one page per thread, so
+no two threads ever fault on the same page — which finally makes the load runnable
+on *both* arms (nothing contends, so the unfixed kernel doesn't die of §12.2 first):
+
+| `bssfork 20 3 1`, 15 runs | `[BKL] stuck` lines | absorbed write faults |
+| --- | ---: | ---: |
+| pristine `f9ef0b7` | 7842 | n/a |
+| + this fix | 10959 | **0** |
+
+Both storm on the identical load, and the fixed kernel storms with its new repair
+path provably never firing (`stale_write_faults=0`). So the fix is not the cause;
+the earlier `[identity]` correlation was coincidence (the storm also occurs with
+zero identity hits). What *is* new is a trigger: this race had no reproducer, and
+`bssfork` at >=3 threads produces it in ~0.1 s. `TGID_RESOLVE_MISSES` and the
+`children.rs:392` window remain worth chasing on their own.
+
+**It is not probe-only.** Round 6 of the `-j4` campaign (§12.8) — a plain
+`cargo build -j4`, no probe anywhere — produced **52,738 `[BKL] stuck` lines** and
+ate a 90-minute budget, after five consecutive 181 s greens. This is the stability
+ceiling for multi-threaded-fork workloads, not a probe artifact.
+
+#### What `tag=511` actually narrows it to
+
+`511` is `HOLD_TAG_UNKNOWN`, and reading it as "the owner is somewhere that doesn't
+stamp a tag" is too weak. Follow the value:
+
+- `ThreadTagTable::new()` starts every slot at `HOLD_TAG_UNKNOWN`.
+- `reset_thread_tag(tid)` (`sync.rs:398`) puts a slot *back* to it, and has exactly
+  one caller: `threading/mod.rs:959`, when a slot is **claimed for a new thread** —
+  deliberately, "so a recycled slot cannot lend its predecessor's tag to a waiter".
+- A waiter samples `HOLDER_TAG[owner_core]`, which tracks the running thread's tag.
+
+So `owner=N tag=511` most likely means **the BKL owner is a thread in its spawn
+path that has not yet made a kernel entry to stamp a tag** — a freshly claimed
+slot. That is a short list of code, not the whole kernel.
+
+It fits the onset evidence: every capture begins during thread churn
+(`[threads] new high-water`, `[Cleanup] Thread N recycled`, `[TERM]`), and the
+storm's other signature is that `[BKL] RECOVERED` never fires afterwards.
+
+Hypothesis to test first, stated so it can be falsified: *a newly spawned thread
+holds the BKL across its startup path and, under churn, fails to release it.* The
+cheap discriminator is to stamp a distinct tag (e.g. `HOLD_TAG_SPAWN`) at the point
+a claimed slot first takes the BKL — if storms then report that tag instead of 511,
+the owner is confirmed and the window is bounded to that path. If they still report
+511, this reading is wrong and the owner is genuinely untagged code.
+
+Caveat kept explicit: the tag is a *diagnostic*. A wrong or stale tag cannot wedge
+anything by itself — the wedge is the BKL not being released. The tag only names
+the suspect.
+
+### 12.8 The `-j4` oracle was unusable, for an unrelated reason
+
+Question 1 needs ~15 clean builds. Not one completed: builds ran **over an hour**
+and VMs appeared to wedge. Cause was not the kernel under test but the console —
+three per-event traces printing unconditionally at ~270 KB/s through one shared
+UART, with four cores contending for its lock. Gated (default off), the same clean
+101-crate `-j4` self-host build finishes in **2m21s, `EXIT=0`**. Full writeup:
+[`SERIAL_TRACE_TRAFFIC_AUDIT.md`](SERIAL_TRACE_TRAFFIC_AUDIT.md).
+
+**Campaign result — 15 rounds, fresh VM each, full `rm -rf target` clean build:**
+
+| outcome | n | note |
+| --- | ---: | --- |
+| `GREEN` (`EXIT=0`, 101 crates) | **11** | 180–181 s every time, no variance |
+| `EXIT=139` — the defect under test | **0** | |
+| BKL storm (round 6) | 1 | 186 584 `[BKL] stuck` lines |
+| silent wedge (rounds 9, 13, 15) | 3 | console dies mid-build; **not** a heap runaway — green rounds peak *higher* (418–424 MB vs 258–328 MB) |
+
+So the `-j4` oracle is finally usable, and it says: **zero `EXIT=139` in 11
+completed builds.** Against the documented ~1-in-5 rate that is `0.8^11 = 8.6%`,
+i.e. ~91% confidence the rate is now under 20% — short of the ~95% the brief asked
+for, and honestly reported as such. Getting the rest needs the storm/wedge class
+fixed first: **4 of 15 rounds (27%) died of it**, and that is now the thing
+stopping a clean campaign, not the defect this document is about.
+
+Two lessons for this investigation specifically:
+
+- **A wedged VM prints nothing**, and a console-starved VM also stops answering
+  ssh, so those two states are indistinguishable from an ssh probe. One poll loop
+  in this session waited an hour on a VM that had died 60 seconds in. Check the
+  console log's *size* growing (`PSTATS` every 30 s), never ssh reachability.
+- §0.4's "build runs are not a sensitive enough instrument" was right for the wrong
+  reason. It isn't only the ~1-in-5 rate — the instrument itself was mis-calibrated
+  by 25× in wall-clock, which is what made 15 runs look like days of work.
+
+### 12.9 Question 1: probably a different bug
+
+The build statistics (§12.8) are consistent with "fixed" but cannot prove it —
+0 of 11 at ~91% confidence. The mechanism argument is the stronger evidence, and
+it points the other way: the two failures do not compose.
+
+| | this defect | cargo null `Rc` |
+| --- | --- | --- |
+| what userspace observes | a **fatal signal** at an apparently-illegal write | a pointer qword that **reads back zero**, silently |
+| memory contents | never touched — the absorbed write lands in the correct frame | corrupted |
+| fault at the moment of damage | yes, that *is* the event | **none** |
+
+There is no path by which "a legal write is wrongly refused" zeroes a qword. If
+they were the same bug, cargo's crash would be a SIGSEGV *at the store*, not a null
+deref discovered later — and §1's autopsy decoded the latter (`ldr x8,[x0,#288]`
+with `FAR=0`). So `CARGO_HEAP_NULL_RC.md` most likely still needs its own handle.
+
+The one thread connecting them is worth keeping: §1's `[EAGER-UPGRADE]` on cargo's
+heap page, 6 lines before the null read, is now known to be the *same stale-write-
+fault race* (§3.5 already proved the PTE was writable). So cargo demonstrably hit
+this race — it just survived it, because heap `mmap` regions have an eager record
+to repair from and `.bss` pages do not. Whether the losing thread's absorbed write
+is where the zero came from is the question that remains, and it is a question
+about the CoW break's *copy*, not about the permission.
 
 ---
 

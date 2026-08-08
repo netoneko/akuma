@@ -67,6 +67,11 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   proved the `[BKL] stuck tag=511` storm seen at high thread counts is load-driven
   and pre-existing (it storms identically on an unmodified kernel, and on the fixed
   one with `stale_write_faults=0`, i.e. the repair never firing).
+  Needs **SMP>=2**: 8/8 SEGV at `SMP=4`, 10/10 PASS at `SMP=1` on the same pristine
+  kernel, because the losing thread has to be executing its fault while the winner
+  holds the page's slot. Note the workers are CPU-bound and never sleep, so more
+  than ~3 of them on one core starve sshd and runs come back with no output — at
+  `SMP=1` keep `threads` at or below the core count.
   Usage: `bssfork [rounds] [threads] [spread]`. Calibrate:
   `docker run --rm --platform linux/arm64 -v "$PWD/bssfork:/bssfork:ro" alpine /bssfork 20 8`.
 - `cowstale` — **deterministic reproducer for the `EXIT=139` / `[WPF] cow_ref=0
