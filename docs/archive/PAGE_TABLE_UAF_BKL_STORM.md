@@ -2,7 +2,12 @@
 
 **Date:** 2026-08-08. **Branch:** `stabilize-devbox`. **Kernel:** `159c3db`
 (`release-smp-shared` + `devbox-smoltcp,no-tests`), SMP=4, MEMORY=14336, HVF,
-in-guest `cargo build -j4`. **Status:** root-caused, **NOT fixed**.
+in-guest `cargo build -j4`. **Status:** root-caused; one confirmed concrete
+gap fixed and live-verified (§4.1 — `execve` now kills thread-group siblings
+before dropping the old address space); **campaign-level verification against
+the storm's own reproduction rate still pending**, and a second, independent
+gap (no cross-core TTBR liveness check before freeing page-table frames) is
+still open.
 
 **One line:** a core kept running with `TTBR0_EL1` pointing at an address space
 whose page-table frames had already been freed and **poisoned**, so it could no
@@ -129,6 +134,66 @@ space that was reclaimed underneath it.
 **Not yet established:** which teardown path frees the frames, and whether the
 gap is a missing cross-core quiescence (no "is any core still on this AS?" check
 / no TLB+TTBR shootdown) or a refcount that drops early. That is the next step.
+
+## 4.1 A confirmed, concrete gap: `execve` never killed thread-group siblings
+
+`execve` is POSIX-required to destroy every other thread in the calling
+process's thread group before the image is replaced — the calling thread is
+the only survivor. Akuma's `exit_group`/`kill` path already implements exactly
+this for its own teardown (`crates/akuma-exec/src/process/mod.rs:1894-1899`):
+
+> "If this process owns the address space (not shared), kill all sibling
+> CLONE_VM threads BEFORE dropping. Dropping the owner frees all page tables;
+> siblings still using them would cause EL1 faults."
+
+— i.e. the exact symptom this storm produces. `Process::replace_image` /
+`replace_image_from_path` (`crates/akuma-exec/src/process/image.rs`), however,
+swapped `self.address_space` with no equivalent call anywhere in the `execve`
+path. A `CLONE_THREAD` sibling that outlives the phase that spawned it (a
+parked rayon/thread-pool worker is the textbook case — rustc uses one) keeps
+running under the old address space's `l0`/ASID while `execve` drops it: if the
+software refcount (`SHARED_L0_TABLE`, `mmu/mod.rs`) doesn't see that sibling as
+a live view for any reason, or the sibling is mid-teardown itself, the frames
+free and poison out from under a peer core that still has them loaded in
+`TTBR0_EL1` — the fault this doc documents.
+
+**Fixed** (`crates/akuma-exec/src/process/image.rs`, `kill_exec_siblings`):
+both `replace_image` and `replace_image_from_path` now call
+`kill_thread_group` on any other thread-group member, mirroring the exit
+path, right after the new ELF has loaded successfully (so a failed exec still
+leaves siblings untouched) and before the destructive AS swap.
+
+Verified live (SMP=4, `devbox-smoltcp`): a pthread worker parked in a tight
+loop, then the main thread `execve`'s into `/bin/echo`. The console shows the
+new call firing and the sibling being fully reaped before the swap:
+
+```
+[KTG] my_pid=21 my_tgid=21 by_tid=10 code=0 siblings=1 first=Some((22, Some(11)))
+[KTG] my_pid=21 my_tgid=21 by_tid=10 code=0 siblings=0 first=None   <- exit_group's own
+                                                                         call now finds nothing left
+```
+
+Repeated 6× back to back: exec succeeded every time, PMM free count held
+steady across runs (no leak from the new kill), and no `[BKL] stuck` /
+poison / `TTBR SAVE-MISMATCH` / `TTBR LOAD-MISMATCH` line appeared.
+
+**What this does and doesn't close:** this removes a real, previously-missing
+POSIX-correctness guarantee and the most plausible concrete trigger for a
+sibling thread outliving an `execve`-time AS drop. It has **not** been
+verified against the storm's actual reproduction rate (~1 round in 12 of a
+`-j4` self-host `cargo build`) — that requires a multi-hour, multi-round
+campaign of the kind run for
+[`PMM_TALC_LOCK_CYCLE_SILENT_WEDGE.md`](PMM_TALC_LOCK_CYCLE_SILENT_WEDGE.md),
+not yet repeated here. It also does **not** address the deeper, independently
+real gap: there is still no cross-core check ("is any core's live `TTBR0_EL1`
+resident on this L0 right now") before `UserAddressSpace::drop` frees
+page-table frames (§5) — only a refcount over *software objects*. A `kill_thread_group`
+straggler that is hard-terminated after its 2 s grace period (`process/mod.rs`,
+the `KILL_GRACE_US` path) is marked dead from the killer's side while its own
+core may not have run the switch-out that would reprogram that core's
+`TTBR0_EL1` away from the dying AS — a second, independent way to reach the
+same fault, unaffected by this fix, that a real IPI-based TTBR shootdown or a
+liveness check in the PMM free path would still be needed to close.
 
 ## 5. Why no instrument caught it
 

@@ -3,9 +3,33 @@ use alloc::format;
 
 use crate::mmu;
 use crate::runtime::{runtime, config, FrameSource};
-use crate::process::types::{ProcessMemory, LazySource, SignalHandler, SignalAction, PROCESS_INFO_ADDR, ProcessInfo};
+use crate::process::types::{ProcessMemory, LazySource, SignalHandler, SignalAction, PROCESS_INFO_ADDR, ProcessInfo, Pid};
 use crate::process::lifecycle::LifecycleGuard;
 use super::Process;
+
+/// True if some OTHER process shares `tgid` — a live CLONE_THREAD sibling of `pid`.
+fn has_thread_group_siblings(pid: Pid, tgid: Pid) -> bool {
+    let mut found = false;
+    crate::process::table::for_each_process(|p| {
+        found |= p.pid != pid && p.tgid == tgid;
+    });
+    found
+}
+
+/// POSIX execve destroys every other thread in the calling process's thread group
+/// before the image is replaced. Without this, a CLONE_THREAD sibling (e.g. a
+/// still-parked rayon/thread-pool worker) keeps running under the address space
+/// `self.address_space` is about to be overwritten with — and dropping the old
+/// `UserAddressSpace` frees (and PMM-poisons) its page-table frames while a peer
+/// core's `TTBR0_EL1` can still be resident on them. See
+/// docs/archive/PAGE_TABLE_UAF_BKL_STORM.md. Called after the new image has
+/// loaded successfully (the point of no return for exec) and before the
+/// destructive swap, matching the point close-on-exec fds are handled at.
+fn kill_exec_siblings(pid: Pid, tgid: Pid) {
+    if has_thread_group_siblings(pid, tgid) {
+        super::kill_thread_group(pid, 0, 0);
+    }
+}
 
 /// Maximum virtual address range registered for demand-paged stack growth.
 /// Physical pages are only allocated on fault, so this costs nothing unless used.
@@ -32,6 +56,8 @@ impl Process {
             crate::elf_loader::load_elf_with_stack(elf_data, args, env, config().user_stack_size, interp_prefix)
             .map_err(|e| format!("Failed to load ELF: {}", e))?;
         crate::process::lifecycle_trace("[FORK-DBG] replace_image: ELF loaded, deactivating old AS\n");
+
+        kill_exec_siblings(self.pid, self.tgid);
 
         // Serialize the DESTRUCTIVE window against preemption under shared-kernel SMP —
         // from the AS deactivate/swap and `mmap_regions.clear()` onward the process is
@@ -123,6 +149,8 @@ impl Process {
         let (entry_point, mut address_space, sp, brk, stack_bottom, stack_top, mmap_floor, deferred_segments) =
             crate::elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config().user_stack_size, interp_prefix)
             .map_err(|e| format!("Failed to load ELF: {}", e))?;
+
+        kill_exec_siblings(self.pid, self.tgid);
 
         // Guard the destructive window only — acquired AFTER the header read above,
         // which does block I/O. See the comment in `replace_image`.
