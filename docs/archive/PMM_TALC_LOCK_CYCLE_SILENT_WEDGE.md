@@ -230,9 +230,36 @@ fresh VM + `rm -rf target/aarch64-unknown-none` per round:
 which is expected: the BKL ticket fix that preceded this addressed the *storm*,
 and the storm was never the common case.
 
-Verification on the fixed kernel (`27903e0ef22d07e75c2a3acd85a49b93`) uses the
-identical recipe. Because `devbox-smoltcp` builds with `no-tests`, the pmm change
-is the only delta between the two binaries.
+Verification on the fixed kernel (`27903e0ef22d07e75c2a3acd85a49b93`), identical
+recipe. Because `devbox-smoltcp` builds with `no-tests`, the pmm change is the
+only delta between the two binaries:
+
+| outcome | baseline | **fixed** |
+| --- | ---: | ---: |
+| `GREEN` | 18 | **20** |
+| **silent wedge (this defect)** | **6** | **0** |
+| BKL storm (a *different*, open defect) | 1 | 2 |
+| `EXIT=139` | 0 | 1 |
+| rounds | 25 | 23 |
+
+**The silent wedge is gone: 6/25 → 0/23.** Fisher exact two-sided **p = 0.023**;
+and if the rate were truly unchanged, seeing zero in 23 rounds has probability
+`0.76^23 = 0.0018` (~1 in 550). That is the fix, measured on the workload the
+defect was found in.
+
+Two honest caveats:
+
+- **The BKL storm did not improve** (1 → 2) and is expected not to: it is the
+  page-table use-after-free in
+  [`PAGE_TABLE_UAF_BKL_STORM.md`](PAGE_TABLE_UAF_BKL_STORM.md), and `TALC`/`PMM`
+  both read **free** during it. It is now the dominant remaining failure.
+- **One `EXIT=139` appeared** (0/25 baseline → 1/23 fixed), i.e. the original
+  `CARGO_HEAP_NULL_RC` class, which was never fixed — only unobserved. The fault
+  was an instruction abort *from EL0* at `enter_user_mode+528` with `SPSR=0x0`
+  (the stale-`Process`/AS-MISMATCH shape), which has no mechanical connection to
+  moving a `Vec` reservation outside a lock. 0/25 vs 1/23 is Fisher p≈0.48, i.e.
+  indistinguishable from chance — but it is **not** evidence of absence and
+  should be watched.
 
 ### 7.1 Method notes
 

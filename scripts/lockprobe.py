@@ -233,6 +233,17 @@ def decode_esr(val):
 
 def analyse(raw, syms, bkl_base, offs):
     out = []
+
+    # A dead/absent target must NOT produce a verdict. gdb happily prints zeros for
+    # memory it cannot read, so without this guard a probe against a VM that is
+    # already gone reports a confident "BKL idle ... TALC free, PMM free" — the exact
+    # opposite of the truth, in a file someone reads days later. Observed 2026-08-08.
+    if "No threads." in raw or "@@REGS" not in raw or not re.search(r'^CPU#\d', raw, re.M):
+        out.append("*** NO TARGET *** gdb attached to nothing (VM already dead, wrong "
+                   "port, or stub refused). Every value below is unreadable memory "
+                   "defaulting to zero — draw NO conclusions from it.")
+        return "\n".join(out)
+
     fields = {}
     for m in re.finditer(r'@@F (\w+)\s*\n[^:\n]*:\s*(0x[0-9a-f]+)', raw):
         fields[m.group(1)] = int(m.group(2), 16)
@@ -251,13 +262,21 @@ def analyse(raw, syms, bkl_base, offs):
     else:
         out.append("BKL: could not decode")
 
-    for m in re.finditer(r'@@OTHER ([^@\n]+?) @ (0x[0-9a-f]+)\s*\n[^:\n]*:\s*([0-9a-fx\t ]+)', raw):
-        label, addr, data = m.group(1).strip(), m.group(2), m.group(3).split()
-        first = data[0] if data else '?'
-        held = ''
-        if 'lock byte' in label:
-            held = '  <- HELD' if first not in ('0x00', '0x0') else '  <- free'
-        out.append(f"{label} @ {addr}: {' '.join(data[:8])}{held}")
+    # `echo` output can land on the SAME line as the preceding x/ dump, so the byte
+    # values may follow the marker on that line or the next. Accept either, and if
+    # nothing parses say UNKNOWN — an earlier version defaulted an unparsed value to
+    # "HELD", which invented a lock state out of a formatting quirk.
+    for m in re.finditer(r'@@OTHER ([^@\n]+?) @ (0x[0-9a-f]+)(.*?)(?=@@|\Z)', raw, re.S):
+        label, addr = m.group(1).strip(), m.group(2)
+        data = re.findall(r'0x[0-9a-f]{2}\b', m.group(3))
+        if 'lock byte' not in label:
+            out.append(f"{label} @ {addr}: {' '.join(data[:8]) if data else '<unparsed>'}")
+            continue
+        if not data:
+            out.append(f"{label} @ {addr}: <UNPARSED — state UNKNOWN, do not assume>")
+        else:
+            held = '  <- HELD' if data[0] not in ('0x00',) else '  <- free'
+            out.append(f"{label} @ {addr}: {' '.join(data[:8])}{held}")
 
     tid2cpu = dict(re.findall(r'^\*?\s*(\d+)\s+Thread \S+ \(CPU#(\d+)',
                               raw.split("@@SYSREGS")[0], re.M))
