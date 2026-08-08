@@ -213,6 +213,11 @@ pub(crate) fn clear_draining(tid: usize) {
 /// [`drain_retired`], skipped when nothing is parked. The form the hot drain sites use.
 #[inline]
 pub fn drain_retired_if_requested() -> usize {
+    // Piggyback the TTBR-deferred frame drain on the same periodic sites: frames
+    // parked because a core's TTBR0 was still on a dying L0 (mmu::any_core_on_l0)
+    // must eventually free even if no further address space ever drops. Lock-free
+    // count check inside; costs nothing when the list is empty.
+    crate::mmu::drain_pending_ttbr_frees();
     if !reclaim_requested() {
         return 0;
     }

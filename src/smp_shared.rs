@@ -481,7 +481,7 @@ pub fn wake_core(core_id: u8) {
     if core_id == self_aff0 || core_id == 0xFF {
         return; // self-SGI already fired by trigger_sgi; or no last-known core
     }
-    crate::gic::trigger_sgi_core(core_id as u32, SCHED_SGI);
+    crate::gic::trigger_sgi_core(u32::from(core_id), SCHED_SGI);
 }
 
 unsafe extern "C" {

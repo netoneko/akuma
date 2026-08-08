@@ -214,6 +214,8 @@ pub fn spawn_process_with_channel_ext(
             }
         }
     };
+    crate::mmu::as_trace(format_args!("[AS-NEW] pid={} l0=0x{:x} asid=0x{:x} via=spawn\n",
+        process.pid, process.address_space.l0_phys(), process.address_space.asid()));
 
     // Always create a fresh channel per spawned process.
     // Reusing the parent's channel would cause the child's set_exited() call

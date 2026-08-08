@@ -3138,6 +3138,11 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
                 }
             }
 
+            // Publish the transition to the per-core live-TTBR0 registry (the
+            // page-table-UAF free gate, see mmu::any_core_on_l0): PREV covers the
+            // outgoing table across the msr window, ACTIVE covers the incoming one
+            // from before the hardware can walk it.
+            let pub_core = crate::mmu::publish_l0_begin(new_ttbr0);
             core::arch::asm!(
                 "dsb ish",
                 "msr ttbr0_el1, {ttbr0}",
@@ -3147,6 +3152,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
                 "isb",
                 ttbr0 = in(reg) new_ttbr0,
             );
+            crate::mmu::publish_l0_end(pub_core);
             
             if config().enable_sgi_debug_prints {
                 safe_print!(64, "[SGI-S] returning new_sp={:#x}\n", new_sp);

@@ -614,6 +614,9 @@ pub fn run_all_tests() {
     // address space (docs/archive/PAGE_TABLE_UAF_BKL_STORM.md §4.1) — a live
     // CLONE_THREAD sibling left running is one trigger for the page-table UAF.
     test_execve_kills_thread_group_siblings();
+    // The free-side gate for the same storm family: dropping an AS whose L0 a
+    // core's TTBR0 still shows must park the frames, not free+poison them.
+    test_as_drop_defers_while_core_on_l0();
     // Recycled-tid channel stamp forged an exit for a live process (-j4 hang)
     test_ktg_stale_tid_channel_not_stamped();
     test_mark_terminated_ignores_large_ids();
@@ -4274,6 +4277,79 @@ fn test_munmap_teardown_conserves_pmm() {
         crate::safe_print!(128,
             "[Test] munmap_teardown_conserves_pmm FAILED: free_before={} free_after={} (leak or over-free)\n",
             free_before, free_after);
+    }
+}
+
+/// The page-table-UAF liveness gate: `UserAddressSpace::drop` must NOT free
+/// page-table frames while some core's live `TTBR0_EL1` is still resident on
+/// the dying L0 — freeing (and PMM-poisoning) them under a running core is
+/// the `[BKL] stuck` storm of docs/archive/PAGE_TABLE_UAF_BKL_STORM.md (the
+/// core can no longer fetch even its own exception vector). The gate
+/// (`mmu::any_core_on_l0` in `free_or_defer_as_frames`) parks the frames
+/// instead; a later `drain_pending_ttbr_frees` releases them once the core
+/// has demonstrably moved off. Faked here via `test_publish_core_l0` on core
+/// slot 7, which no real bringup (SMP≤4) ever publishes.
+fn test_as_drop_defers_while_core_on_l0() {
+    use akuma_exec::mmu;
+
+    // Start from a drained state so the parked-entry accounting below is ours.
+    mmu::drain_pending_ttbr_frees();
+    let (parked0, _, _) = mmu::pending_ttbr_free_stats();
+
+    let (ok, msg, d1, d2) = crate::irq::with_irqs_disabled(|| {
+        let (_t, _a, free_before) = crate::pmm::stats();
+
+        let Some(mut as_space) = mmu::UserAddressSpace::new() else {
+            return (false, "OOM allocating AS", 0usize, 0usize);
+        };
+        let l0 = as_space.l0_phys();
+        // One mapped user page so the user-frame half of the deferred free is
+        // exercised alongside the page-table frames.
+        if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+            if as_space.map_page(BENCH_VA_BASE, frame.addr, akuma_exec::mmu::user_flags::RW).is_ok() {
+                as_space.track_user_frame(frame);
+            } else {
+                crate::pmm::free_page(frame);
+            }
+        }
+
+        // Fake a peer core parked with TTBR0 on this L0, then tear down.
+        mmu::test_publish_core_l0(7, l0);
+        drop(as_space);
+
+        // 1. The frames must be parked, not freed.
+        let (parked_now, _, _) = mmu::pending_ttbr_free_stats();
+        if parked_now <= parked0 {
+            mmu::test_publish_core_l0(7, 0);
+            return (false, "drop freed frames despite live TTBR0 (gate missing)", 0, 0);
+        }
+        // 2. A drain while the core still shows the L0 must not release them.
+        mmu::drain_pending_ttbr_frees();
+        let (parked_held, _, _) = mmu::pending_ttbr_free_stats();
+        if parked_held <= parked0 {
+            mmu::test_publish_core_l0(7, 0);
+            return (false, "drain released frames while core still on L0", 0, 0);
+        }
+        // 3. Core moves off → drain releases everything; PMM is conserved.
+        mmu::test_publish_core_l0(7, 0);
+        mmu::drain_pending_ttbr_frees();
+        let (parked_after, _, _) = mmu::pending_ttbr_free_stats();
+        if parked_after != parked0 {
+            return (false, "entry still parked after core moved off", parked_after, parked0);
+        }
+        let (_t2, _a2, free_after) = crate::pmm::stats();
+        if free_after != free_before {
+            return (false, "PMM free count not conserved", free_before, free_after);
+        }
+        (true, "", 0, 0)
+    });
+
+    if ok {
+        console::print("[Test] as_drop_defers_while_core_on_l0 PASSED\n");
+    } else {
+        crate::safe_print!(160,
+            "[Test] as_drop_defers_while_core_on_l0 FAILED: {} ({} vs {})\n",
+            msg, d1, d2);
     }
 }
 

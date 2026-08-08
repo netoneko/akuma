@@ -26,10 +26,16 @@ For SMP/multikernel (one-kernel-per-core), see [`smp.md`](smp.md).
 
 ### Slot state machine
 
-`THREAD_STATES[tid]` (`types.rs:76`) is the lock-free source of truth. `INITIALIZING`
-exists so the scheduler cannot pick a slot whose context is half-built, and the
-`TERMINATED → FREE` edge is deliberately delayed by a cooldown so a dying thread is never
-recycled while a peer still holds a reference to it.
+`THREAD_STATES[tid]` (`crates/akuma-exec/src/threading/mod.rs:316`; the state values
+themselves are the `thread_state` constants module, `types.rs:76`) is the lock-free
+source of truth. `INITIALIZING` exists so the scheduler cannot pick a slot whose context
+is half-built, and the `TERMINATED → FREE` edge is deliberately delayed by a cooldown so
+a dying thread is never recycled while a peer still holds a reference to it.
+
+`mark_thread_terminated()` (`threading/mod.rs:1022`, the state store itself at `:1067`) is
+an **unconditional store, callable from any state** — not just `RUNNING`. `kill_thread_group`,
+`request_thread_kill`, and a spawn failure all terminate a slot directly regardless of
+whether it was `READY`, `WAITING`, or still `INITIALIZING`.
 
 ```mermaid
 stateDiagram-v2
@@ -41,6 +47,9 @@ stateDiagram-v2
     RUNNING --> WAITING: schedule_blocking()
     WAITING --> READY: waker sees WAITING (park/wake handshake)
     RUNNING --> TERMINATED: mark_thread_terminated()
+    READY --> TERMINATED: mark_thread_terminated() (kill_thread_group / request_thread_kill)
+    WAITING --> TERMINATED: mark_thread_terminated() (kill_thread_group / request_thread_kill)
+    INITIALIZING --> TERMINATED: mark_thread_terminated() (spawn failure)
     TERMINATED --> FREE: cleanup_terminated_internal() after cooldown
 ```
 
@@ -56,8 +65,12 @@ the CPU.
 - `PREEMPT_WAKE_TID` / `WOKEN_STATES`: "sticky wake" flags set by `wake()`,
   consumed in `schedule_indices`. A woken thread runs promptly via the SGI.
 - **Preemption watchdog** (`ENABLE_PREEMPTION_WATCHDOG`, default true): warns
-  if preemption disabled >100 ms, **panics** at 5 s (`types.rs:42-45`). This is
-  the tripwire for the "yield inside a critical section" bug class.
+  if preemption disabled >100 ms (`PREEMPTION_WATCHDOG_WARN_US`, `types.rs:66`); at 5 s
+  (`PREEMPTION_WATCHDOG_PANIC_US`, `types.rs:69`) it prints a rate-limited `[WATCHDOG]`
+  critical line and **keeps running** — `check_preemption_watchdog`
+  (`crates/akuma-exec/src/threading/mod.rs:1928-1932`) deliberately never panics ("DO NOT
+  use panic! here - we're in IRQ context"); the constant is merely *named*
+  `PANIC_US`. This is the tripwire for the "yield inside a critical section" bug class.
 - `with_irqs_disabled` (`runtime.rs:256`) is the primitive; nesting is counted
   (`preemption_disabled_count`).
 
@@ -76,11 +89,20 @@ the CPU.
 > open and reproducible.
 
 `POOL: Spinlock<ThreadPool>` (`threading/mod.rs:2775`) is a **single global lock** guarding
-the slot table. Under `smp-shared` it is also what makes the context switch atomic: since
-M5c step-2 the scheduler SGI runs **BKL-free** and holds `POOL` across the *entire* switch
-— decision, outgoing context save, and incoming load. It has to, because
-`schedule_indices`/`commit_switch` mark the outgoing thread `READY` (so a peer core may
-pick it), and a peer that restored a not-yet-saved SP would run a corrupt stack.
+the slot table. Under `smp-shared` it is also what makes the context switch atomic:
+`sgi_scheduler_handler_with_sp` holds `POOL` across the *entire* switch — decision,
+outgoing context save, and incoming load — **on every path**, unconditionally. It has to,
+because `schedule_indices`/`commit_switch` mark the outgoing thread `READY` (so a peer
+core may pick it), and a peer that restored a not-yet-saved SP would run a corrupt stack.
+
+Only *half* of that switch is BKL-free, though — "the scheduler SGI runs BKL-free" is
+overstated as a blanket claim. Since M5c step-2, a scheduler SGI that preempted **EL0**
+runs the whole switch without ever taking the BKL, gated on `interrupted_el0 &&
+sched_bklfree_el0_enabled() && irq == SGI_SCHEDULER` (`src/exceptions.rs:1893-1908`). An
+SGI that instead preempted **EL1** falls through to `bkl::enter_kernel()`
+(`exceptions.rs:1931`) and runs `sgi_scheduler_handler_with_sp` **BKL-held**
+(`exceptions.rs:1946`), exactly like any other device IRQ. So the BKL-free path is the
+EL0-preempt arm only; the `POOL`-across-the-whole-switch guarantee above holds either way.
 
 The load-bearing consequence: **`POOL` is the gate on all preemption.** The SGI handler
 takes it with `try_lock` and, on failure, skips the tick entirely.
@@ -130,9 +152,11 @@ So the invariant that keeps preemption alive is:
 That is a circular wait *through the scheduler itself*, and no lock-ordering rule catches
 it — there is no global hierarchy in this kernel by design
 ([`locking.md`](locking.md)). It is also invisible to the existing tripwire: the
-**preemption watchdog panics at 5 s** of disabled preemption (`types.rs:69`), but it
-watches the per-thread `PREEMPTION_DISABLED` counters, *not* consecutive SGI skips. A
-`POOL`-gated wedge trips no counter, so the watchdog stays silent through it.
+**preemption watchdog** only **prints a critical warning** at 5 s of disabled
+preemption and keeps running — it never panics (see [Preemption](#preemption) above;
+`types.rs:69`) — and it watches the per-thread `PREEMPTION_DISABLED` counters, *not*
+consecutive SGI skips. A `POOL`-gated wedge trips no counter, so the watchdog stays
+silent through it.
 
 ### The observed wedge (open)
 

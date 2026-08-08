@@ -2,12 +2,13 @@
 
 **Date:** 2026-08-08. **Branch:** `stabilize-devbox`. **Kernel:** `159c3db`
 (`release-smp-shared` + `devbox-smoltcp,no-tests`), SMP=4, MEMORY=14336, HVF,
-in-guest `cargo build -j4`. **Status:** root-caused; one confirmed concrete
-gap fixed and live-verified (§4.1 — `execve` now kills thread-group siblings
-before dropping the old address space); **campaign-level verification against
-the storm's own reproduction rate still pending**, and a second, independent
-gap (no cross-core TTBR liveness check before freeing page-table frames) is
-still open.
+in-guest `cargo build -j4`. **Status:** CLOSED 2026-08-09 — the remaining
+trigger was root-caused with live captures (§7: the retired-process reclaim
+frees a dead process's address space while the exiting thread's core still
+has it in `TTBR0_EL1`; two concrete routes caught in the act), and the
+structural gap is fixed by a per-core live-TTBR0 registry gating every
+page-table-frame free (§7.3). §4.1's `execve` sibling-kill fix stands on its
+own and remains in place.
 
 **One line:** a core kept running with `TTBR0_EL1` pointing at an address space
 whose page-table frames had already been freed and **poisoned**, so it could no
@@ -361,7 +362,7 @@ free; silent wedge = BKL idle + allocator locks held.**
 > byte values never parsed, and the unparsed case defaulted to HELD. Fixed to
 > print `<UNPARSED — state UNKNOWN>`; the direct read above is what settled it.
 
-### 6.1 Harness note
+### 6.2 Harness note
 
 This storm is a **slow burn** — roughly 20 `[BKL] stuck` lines/second, ~18k over
 the round. A watchdog that flags "more than N stuck lines in a 20 s window" can
@@ -369,6 +370,122 @@ sit just under the threshold and, because the console *is* still growing, keep
 reporting the VM as healthy. The round then burns its entire budget. Detect it by
 `owner=` being pinned to one value across thousands of lines, not by console
 growth or by rate alone.
+
+## 7. Root cause confirmed: reclaim frees the AS before the exiting core moves off it (2026-08-09)
+
+§4.2 left the trigger open: the storm reproduced on the `execve`-siblings-fixed
+kernel, and the self-host build's exec targets are not CLONE_THREAD-heavy. The
+missing link was that the console had **no way to tie a PID to an ASID/L0** —
+a lockprobe capture names the stuck core's `TTBR0` precisely, but nothing in
+the log said whose table that was or who freed it.
+
+### 7.1 The instrument that settled it
+
+Heap-free `[AS-*]` lifecycle traces (`mmu::as_trace`, same stack-buffer pattern
+as `[KTG]`), emitted at every point an address space is created, swapped, or
+has its frames freed:
+
+```
+[AS-NEW]  pid=N l0=0x… asid=0x… via=fork|vfork|clone|spawn parent=M
+[AS-EXEC] pid=N old_l0=0x… old_asid=0x… new_l0=0x… new_asid=0x… core=C
+[AS-DEFER] / [AS-FREE] l0=0x… asid=0x… path=owner|last-view core=C
+[KTG-HARD] my_pid=… sib_pid=… tid=… core=C      (grace-expiry hard terminate)
+```
+
+With these, a storm capture's `TTBR0 = (asid, l0)` greps straight to the
+owning pid and the exact free that killed the machine. Both lanes of the very
+first instrumented campaign stormed (rounds 2 and 14, `logs/j4_campaign_astrace/`),
+and both correlated completely.
+
+### 7.2 Two routes, one gap — caught in the act
+
+**Route A — cross-core: the reaper races the exiting core's final switch**
+(lane 1 round 2). pid 323 (`num-traits` build script) runs on CPU#2 under
+`(asid 0x88, l0 0x99f3c000)`:
+
+```
+[T41.22] [PROC-EXIT] pid=323 … code=0
+[TERM] tid=15 pid=Some(323) by_tid=17 state=1 … at=table.rs:199   <- parent's wait4 reap
+        (state=1 = READY: tid 15 had NOT finished its own exit path)
+  … ~100 ms of thread-slot cleanup …
+[AS-FREE] l0=0x99f3c000 asid=0x88 path=owner core=3               <- reclaim, on core 3
+[BKL] stuck: owner=3 …                                            <- CPU#2 storms
+```
+
+The live probe shows CPU#2 pinned at `exception_vector_table+512`
+(`ESR=0x86000004`) with `x8 = 0x0088_0000_99f3c000` — pid 323's exact
+ASID+L0. The parent's `wait4` → `unregister_process` (table.rs:199) marked the
+still-live thread TERMINATED from another core; `reclaim_retired_processes`
+then freed the `Process` — and with it the address space — on the 10 ms
+cooldown, while tid 15's core had never run the switch that would move its
+`TTBR0_EL1` off the dying table. Under `-j4` BKL contention an exit epilogue
+easily outlives 10 ms.
+
+**Route B — same-core: exit_group's own drain frees the table it stands on**
+(lane 2 round 14). pid 1185 (`collect2`) on core 2 under `(0x97, 0xcbbdd000)`:
+
+```
+[T124.52] [PROC-EXIT] pid=1185 … code=0
+[TERM] tid=14 pid=Some(1185) by_tid=17 state=1 … at=table.rs:199  <- parent reap (retires 1185)
+[TERM] tid=14 pid=Some(1185) by_tid=14 state=2 at=proc.rs:415     <- its own exit_group
+[AS-FREE] l0=0xcbbdd000 asid=0x97 path=owner core=2               <- freed BY core 2, ON core 2
+```
+
+`sys_exit_group` marks its own thread TERMINATED and then calls
+`drain_retired_before_parking()` → `reclaim_retired_processes` — which
+reclaims its **own just-retired Process** and frees the L0 the calling core is
+still executing under, mid-syscall, before the `loop { yield_now() }` ever
+switches away. The stuck core (CPU#2, holding the BKL) matches, with
+`x8 = 0xcbbdd000`.
+
+Same round: 39 `[KTG-HARD]` grace-expiry hard-terminates fired — §4.1's
+"straggler's core keeps its TTBR0" path is real and frequent too. All three
+routes (reap-race, self-drain, KTG straggler) are the one structural gap
+from §5: **nothing on the free side ever checked the hardware.**
+
+### 7.3 The fix: a per-core live-TTBR0 registry gating every frame free
+
+`crates/akuma-exec/src/mmu/mod.rs`:
+
+- `ACTIVE_L0[core]` / `PREV_L0[core]` — published atomics updated by **every**
+  `TTBR0_EL1` write in the kernel (there are exactly three: `activate()`,
+  `deactivate()`, and the SGI context-switch in `threading/mod.rs`). Publish
+  protocol on a transition A→B: `PREV=A; ACTIVE=B; msr ttbr0_el1; PREV=0` —
+  at every instant the live L0 base is in {ACTIVE, PREV}, so a scanner that
+  sees neither knows the core is off the table. A dying L0 cannot be *newly*
+  installed (installing requires a live `UserAddressSpace`, which forbids the
+  drop), so "not held" is stable, not a racy snapshot.
+- `free_or_defer_as_frames(...)` — the **sole exit** for page-table + user
+  frames from both `UserAddressSpace::drop` branches (owner-immediate and
+  last-shared-view). If `any_core_on_l0(l0)` hits, the frames park in
+  `PENDING_TTBR_FREES` (`[AS-FREE-DEFER]` trace) instead of being freed and
+  poisoned; `drain_pending_ttbr_frees()` releases them once the holder has
+  demonstrably reprogrammed (retried from every `UserAddressSpace::drop` and
+  from `drain_retired_if_requested`). ASID flush/release ordering unchanged.
+- Worst case (a core wedged in a non-yielding EL1 loop forever) converts the
+  storm into a bounded deferred free — a leak-until-switch, not a dead machine.
+
+Boot-suite regression test: `test_as_drop_defers_while_core_on_l0`
+(`src/process_tests.rs`) — fakes a peer core on the L0 via
+`mmu::test_publish_core_l0`, asserts drop parks instead of freeing, drains
+refuse while held, release after, and PMM conservation. PASSED at SMP=4.
+
+Note for future readers: `[Test] thread_slot_reclaim_on_spawn` FAILS
+(`hot_reclaim≈190, want 0`) on this boot config (disk_selfhost.img, SMP=4,
+MEMORY=14336) on **unmodified HEAD `1f263a0` too** — pre-existing timing
+sensitivity in that test (the ~250-slot fill loop outlives the 10 ms
+cooldown), unrelated to this fix.
+
+### 7.4 Post-fix campaign
+
+Same methodology as §4.2 (2 lanes, fresh VM + clean `target/` per round,
+SMP=4, MEMORY=14336, 1200 s budget, `logs/j4_campaign_ttbrgate/`). On the
+unfixed kernel this session, **both of the first 2 rounds per lane stormed**
+(2 storms in 4 rounds; combined with §4.2, 4 storms in 21 rounds on
+`9a9eb04`+instrumentation). Results on the fixed kernel: see
+`logs/j4_campaign_ttbrgate/results.jsonl` — recorded below at campaign end.
+
+<!-- CAMPAIGN-RESULTS-PLACEHOLDER -->
 
 ## Background
 

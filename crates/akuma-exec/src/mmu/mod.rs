@@ -11,7 +11,7 @@ pub mod user_access;
 
 pub use types::*;
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::runtime::{PhysFrame, FrameSource, runtime, with_irqs_disabled, IrqGuard};
 
 /// MMU initialization state
@@ -352,6 +352,220 @@ fn asid_exhausted_warn() {
     }
 }
 
+
+/// Heap-free formatted print for address-space lifecycle tracing. The `[AS-*]`
+/// lines are the correlation record for the page-table-UAF storm hunt
+/// (docs/archive/PAGE_TABLE_UAF_BKL_STORM.md): a lockprobe capture gives the
+/// stuck core's TTBR0 (ASID + L0 physical), and these lines are what link that
+/// L0 back to a pid and a teardown path in the console log.
+pub(crate) fn as_trace(args: core::fmt::Arguments) {
+    struct Buf<'a> { buf: &'a mut [u8], pos: &'a mut usize }
+    impl core::fmt::Write for Buf<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let bytes = s.as_bytes();
+            let n = core::cmp::min(bytes.len(), self.buf.len() - *self.pos);
+            self.buf[*self.pos..*self.pos + n].copy_from_slice(&bytes[..n]);
+            *self.pos += n;
+            Ok(())
+        }
+    }
+    let mut buf = [0u8; 160];
+    let mut pos = 0usize;
+    let _ = core::fmt::write(&mut Buf { buf: &mut buf, pos: &mut pos }, args);
+    if let Ok(s) = core::str::from_utf8(&buf[..pos]) {
+        (runtime().print_str)(s);
+    }
+}
+
+// ===== Per-core live-TTBR0 registry =====
+//
+// The page-table-UAF storm (docs/archive/PAGE_TABLE_UAF_BKL_STORM.md): an
+// address space's page-table frames were freed and PMM-poisoned while some
+// core's TTBR0_EL1 was still loaded with that L0 — the next TLB miss on that
+// core (including the fetch of its own exception vector, which also goes
+// through TTBR0) then walks poison and the core stops retiring instructions
+// forever, taking the BKL with it. The software refcount over
+// `UserAddressSpace` objects (SHARED_L0_TABLE) cannot see the *hardware*
+// register, so every teardown path that can outrun a core's switch-out is a
+// trigger (killer-side hard-terminate in `kill_thread_group`, the parent's
+// wait4-reap → 10ms `reclaim_retired_processes` racing the exiting core's
+// final switch, ...).
+//
+// This registry closes the gap at the free side. Every TTBR0_EL1 write
+// publishes the new L0 base here, and `UserAddressSpace::drop` refuses to
+// free page-table frames while any core still shows the dying L0 — the
+// frames park in `PENDING_TTBR_FREES` and are freed by a later drain, once
+// the holder has demonstrably moved off (every switch path reprograms TTBR0
+// and republishes).
+//
+// Publish protocol (no unsafe instant): on a transition A→B the writer
+// stores PREV=A, then ACTIVE=B, then executes the `msr`, then clears PREV.
+// At every instant the live TTBR0 base is contained in {ACTIVE, PREV}, so a
+// scanner that sees neither slot equal to X knows TTBR0 != X — and since a
+// dying L0 can never be *newly* installed (installing requires a live
+// `UserAddressSpace`, whose existence forbids the drop that runs this scan),
+// "not held now" is stable for the dying table, not merely a snapshot.
+
+/// Per-core slots sized for the largest supported SMP configuration.
+pub const TTBR_TRACK_CORES: usize = 8;
+
+const L0_BASE_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+#[allow(clippy::declare_interior_mutable_const)]
+const ATOMIC_U64_ZERO: AtomicU64 = AtomicU64::new(0);
+/// L0 base currently programmed in each core's TTBR0_EL1 (0 = boot/kernel
+/// table or never published — the boot table is never freed, so 0 is safe).
+static ACTIVE_L0: [AtomicU64; TTBR_TRACK_CORES] = [ATOMIC_U64_ZERO; TTBR_TRACK_CORES];
+/// L0 base a core is transitioning *away from* (non-zero only inside the
+/// few-instruction msr window of a TTBR0 write).
+static PREV_L0: [AtomicU64; TTBR_TRACK_CORES] = [ATOMIC_U64_ZERO; TTBR_TRACK_CORES];
+
+/// Begin a TTBR0 transition on this core: publish the new L0 while keeping
+/// the old one visible. Call immediately BEFORE the `msr ttbr0_el1` (IRQs
+/// must already be masked so the pair can't migrate cores). Returns the core
+/// index to pass to [`publish_l0_end`].
+#[inline]
+pub(crate) fn publish_l0_begin(new_ttbr0: u64) -> usize {
+    let core = (crate::bkl::current_core_id() as usize) % TTBR_TRACK_CORES;
+    let old = ACTIVE_L0[core].load(Ordering::Relaxed);
+    PREV_L0[core].store(old, Ordering::SeqCst);
+    ACTIVE_L0[core].store(new_ttbr0 & L0_BASE_MASK, Ordering::SeqCst);
+    core
+}
+
+/// Finish a TTBR0 transition: the `msr` has retired, only ACTIVE covers us now.
+#[inline]
+pub(crate) fn publish_l0_end(core: usize) {
+    PREV_L0[core].store(0, Ordering::SeqCst);
+}
+
+/// Is any core's live TTBR0 (or in-flight transition) on this L0 base?
+/// Returns the first core index found, for diagnostics.
+pub fn any_core_on_l0(l0_phys: usize) -> Option<usize> {
+    let l0 = l0_phys as u64 & L0_BASE_MASK;
+    if l0 == 0 {
+        return None;
+    }
+    for (c, (active, prev)) in ACTIVE_L0.iter().zip(PREV_L0.iter()).enumerate() {
+        if active.load(Ordering::SeqCst) == l0 || prev.load(Ordering::SeqCst) == l0 {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// Test hook: fake a core's published live L0 (boot-suite self-tests only —
+/// they can't get a peer core to genuinely park its TTBR0 on a test table).
+#[doc(hidden)]
+pub fn test_publish_core_l0(core: usize, l0_phys: usize) {
+    ACTIVE_L0[core % TTBR_TRACK_CORES].store(l0_phys as u64 & L0_BASE_MASK, Ordering::SeqCst);
+}
+
+/// Frames of a torn-down address space whose free was deferred because some
+/// core's TTBR0 was still resident on the L0 (see module comment above).
+struct PendingAsFree {
+    l0_frame: PhysFrame,
+    user_frames: BTreeMap<usize, u32>,
+    pt_frames: Vec<PhysFrame>,
+    asid: u16,
+}
+
+static PENDING_TTBR_FREES: Spinlock<Vec<PendingAsFree>> = Spinlock::new(Vec::new());
+/// Lock-free mirror of `PENDING_TTBR_FREES.len()` so hot paths can skip the
+/// drain without taking the lock.
+static PENDING_TTBR_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// (entries, user frames, page-table frames) parked awaiting a TTBR-clear
+/// drain. Diagnostics + boot-suite PMM-conservation accounting.
+pub fn pending_ttbr_free_stats() -> (usize, usize, usize) {
+    with_irqs_disabled(|| {
+        let pending = PENDING_TTBR_FREES.lock();
+        let mut uf = 0;
+        let mut pf = 0;
+        for e in pending.iter() {
+            uf += e.user_frames.len();
+            pf += e.pt_frames.len() + 1; // + the L0 itself
+        }
+        (pending.len(), uf, pf)
+    })
+}
+
+/// Free the frames of a dead address space, or park them if some core's
+/// TTBR0 is still resident on `l0_addr`. The sole exit for page-table frames
+/// from both `UserAddressSpace::drop` branches (owner-immediate and
+/// last-shared-view), so the liveness gate cannot be bypassed.
+fn free_or_defer_as_frames(
+    l0_addr: usize,
+    asid: u16,
+    l0_frame: PhysFrame,
+    user_frames: BTreeMap<usize, u32>,
+    pt_frames: Vec<PhysFrame>,
+    path: &str,
+) {
+    if let Some(core) = any_core_on_l0(l0_addr) {
+        as_trace(format_args!(
+            "[AS-FREE-DEFER] l0=0x{:x} asid=0x{:x} path={} held_by_core={}\n",
+            l0_addr, asid, path, core));
+        with_irqs_disabled(|| {
+            let mut pending = PENDING_TTBR_FREES.lock();
+            pending.push(PendingAsFree { l0_frame, user_frames, pt_frames, asid });
+            PENDING_TTBR_FREE_COUNT.store(pending.len(), Ordering::Release);
+        });
+        return;
+    }
+    as_trace(format_args!("[AS-FREE] l0=0x{:x} asid=0x{:x} path={} core={}\n",
+        l0_addr, asid, path, crate::bkl::current_core_id()));
+    free_as_frames_now(l0_frame, &user_frames, &pt_frames);
+}
+
+/// Unconditional frame release — only reachable through the liveness gate.
+fn free_as_frames_now(l0_frame: PhysFrame, user_frames: &BTreeMap<usize, u32>, pt_frames: &[PhysFrame]) {
+    let rt = runtime();
+    {
+        let _irq = IrqGuard::new();
+        // Free each distinct physical page exactly ONCE. `user_frames` counts
+        // how many VAs map a PA, not how many times it was allocated.
+        for (&addr, &_count) in user_frames {
+            (rt.free_page)(PhysFrame::new(addr));
+        }
+    }
+    {
+        let _irq = IrqGuard::new();
+        for frame in pt_frames { (rt.free_page)(*frame); }
+    }
+    (rt.free_page)(l0_frame);
+}
+
+/// Re-check parked address-space frames and free the ones whose L0 no core
+/// holds any more. Returns how many entries were released. Called
+/// opportunistically from `UserAddressSpace::drop` and from the periodic
+/// retired-process reclaim; boot-suite tests call it directly.
+pub fn drain_pending_ttbr_frees() -> usize {
+    if PENDING_TTBR_FREE_COUNT.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    let ready: Vec<PendingAsFree> = with_irqs_disabled(|| {
+        let mut pending = PENDING_TTBR_FREES.lock();
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < pending.len() {
+            if any_core_on_l0(pending[i].l0_frame.addr).is_none() {
+                ready.push(pending.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        PENDING_TTBR_FREE_COUNT.store(pending.len(), Ordering::Release);
+        ready
+    });
+    let n = ready.len();
+    for e in ready {
+        as_trace(format_args!("[AS-FREE] l0=0x{:x} asid=0x{:x} path=drained core={}\n",
+            e.l0_frame.addr, e.asid, crate::bkl::current_core_id()));
+        free_as_frames_now(e.l0_frame, &e.user_frames, &e.pt_frames);
+    }
+    n
+}
 
 /// Tracks shared L0 page table reference counts and deferred frame lists.
 ///
@@ -1101,7 +1315,9 @@ impl UserAddressSpace {
         flush_tlb_all();
         #[cfg(target_os = "none")]
         unsafe {
+            let _core = publish_l0_begin(_ttbr0);
             core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) _ttbr0);
+            publish_l0_end(_core);
         }
         flush_tlb_all();
         crate::threading::note_current_expected_l0(_ttbr0);
@@ -1114,7 +1330,9 @@ impl UserAddressSpace {
         flush_tlb_all();
         #[cfg(target_os = "none")]
         unsafe {
+            let _core = publish_l0_begin(_boot_ttbr0);
             core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) _boot_ttbr0);
+            publish_l0_end(_core);
         }
         flush_tlb_all();
         crate::threading::note_current_expected_l0(_boot_ttbr0);
@@ -1123,6 +1341,10 @@ impl UserAddressSpace {
 
 impl Drop for UserAddressSpace {
     fn drop(&mut self) {
+        // Opportunistic retry of earlier TTBR-deferred frees: address spaces die
+        // constantly under load, so this keeps the parked list near-empty without
+        // needing a dedicated collector to run first.
+        drain_pending_ttbr_frees();
         let l0_addr = self.l0_frame.addr;
         if !self.shared {
             // Owner dropping — check if shared views still exist
@@ -1134,6 +1356,8 @@ impl Drop for UserAddressSpace {
                 // #region agent log
                 log::debug!("[FORK-DBG] AS owner L0=0x{:x} DEFERRING free (siblings alive)", l0_addr);
                 // #endregion
+                as_trace(format_args!("[AS-DEFER] l0=0x{:x} asid=0x{:x} core={}\n",
+                    l0_addr, self.asid, crate::bkl::current_core_id()));
                 let user_frames = { let _irq = IrqGuard::new(); core::mem::take(&mut *self.user_frames.lock()) };
                 let pt_frames = { let _irq = IrqGuard::new(); core::mem::take(&mut *self.page_table_frames.lock()) };
                 let l0 = self.l0_frame;
@@ -1146,27 +1370,15 @@ impl Drop for UserAddressSpace {
                     }
                 });
             } else {
-                // No shared views (or all already dropped) — free immediately
-                let rt = runtime();
-                {
-                    let _irq = IrqGuard::new();
-                    // Free each distinct physical page exactly ONCE.  `user_frames`
-                    // counts how many VAs map a PA, not how many times it was
-                    // allocated — a page mapped at N VAs was still allocated once.
-                    // The old `for _ in 0..count` freed aliased pages N times, an
-                    // over-free that only the PMM double-free guard hid (and that
-                    // handed live pages to new owners under memory pressure — the
-                    // EL1 EC=0x22 crash).
-                    for (&addr, &_count) in &*self.user_frames.lock() {
-                        (rt.free_page)(PhysFrame::new(addr));
-                    }
-                }
-                {
-                    let _irq = IrqGuard::new();
-                    for frame in &*self.page_table_frames.lock() { (rt.free_page)(*frame); }
-                }
-                (rt.free_page)(self.l0_frame);
+                // No shared views (or all already dropped) — release now, THROUGH
+                // the per-core TTBR liveness gate: a peer core whose TTBR0_EL1 is
+                // still resident on this L0 (killer-side hard-terminate, a reap
+                // outrunning the exiting core's final switch) must not have the
+                // tables freed and poisoned under it. See `free_or_defer_as_frames`.
+                let user_frames = { let _irq = IrqGuard::new(); core::mem::take(&mut *self.user_frames.lock()) };
+                let pt_frames = { let _irq = IrqGuard::new(); core::mem::take(&mut *self.page_table_frames.lock()) };
                 with_irqs_disabled(|| { SHARED_L0_TABLE.lock().remove(&l0_addr); });
+                free_or_defer_as_frames(l0_addr, self.asid, self.l0_frame, user_frames, pt_frames, "owner");
             }
         } else {
             // Shared view dropping — decrement refcount
@@ -1196,15 +1408,10 @@ impl Drop for UserAddressSpace {
                 // #endregion
             }
             if let (Some(uf), Some(pf), Some(l0)) = deferred {
-                let rt = runtime();
-                // Free each distinct physical page exactly once (see owner-drop
-                // branch above): the count is a mapping refcount, not an alloc
-                // count.
-                for (&addr, &_count) in &uf {
-                    (rt.free_page)(PhysFrame::new(addr));
-                }
-                for frame in &pf { (rt.free_page)(*frame); }
-                (rt.free_page)(l0);
+                // Same TTBR liveness gate as the owner-drop branch: the killer-side
+                // hard-terminate in `kill_thread_group` can leave a straggler's core
+                // parked on this very L0 while the last software view drops here.
+                free_or_defer_as_frames(l0.addr, self.asid, l0, uf, pf, "last-view");
             }
         }
         // ORDER IS LOAD-BEARING: flush BEFORE returning the ASID to the allocator.

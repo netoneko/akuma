@@ -1382,6 +1382,12 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
                             }
                             continue;
                         }
+                        // [KTG-HARD] is the candidate-2 marker for the page-table-UAF
+                        // storm hunt: a hard-terminated straggler's core never runs the
+                        // switch-out that would move its TTBR0_EL1 off the dying AS.
+                        mmu::as_trace(format_args!(
+                            "[KTG-HARD] my_pid={} sib_pid={} tid={} core={}\n",
+                            my_pid, sib_pid, tid, crate::bkl::current_core_id()));
                         crate::threading::mark_thread_terminated(*tid);
                     }
                 }
@@ -2212,7 +2218,9 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
     // 1. Create new address space
     let mut new_address_space = mmu::UserAddressSpace::new().ok_or("Failed to create address space")?;
-    
+    mmu::as_trace(format_args!("[AS-NEW] pid={} l0=0x{:x} asid=0x{:x} via=fork parent={}\n",
+        child_pid, new_address_space.l0_phys(), new_address_space.asid(), parent_pid));
+
     // 2. Allocate process info page
     let process_info_frame = (runtime().alloc_page_zeroed)().ok_or("OOM process info")?;
     (runtime().track_frame)(process_info_frame, FrameSource::UserData);
@@ -2921,6 +2929,8 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
     let parent_l0_phys = parent.address_space.l0_phys();
     let new_address_space = mmu::UserAddressSpace::new_shared(parent_l0_phys)
         .ok_or("Failed to create shared address space")?;
+    mmu::as_trace(format_args!("[AS-NEW] pid={} l0=0x{:x} asid=0x{:x} via=vfork parent={}\n",
+        child_pid, parent_l0_phys, new_address_space.asid(), parent_pid));
 
     let mut new_proc = Box::try_new(Process {
         pid: child_pid,
@@ -3181,6 +3191,8 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     let parent_l0_phys = parent.address_space.ttbr0() & 0x0000_FFFF_FFFF_F000;
     let shared_as = mmu::UserAddressSpace::new_shared(parent_l0_phys as usize)
         .ok_or("Failed to create shared address space")?;
+    mmu::as_trace(format_args!("[AS-NEW] pid={} l0=0x{:x} asid=0x{:x} via=clone parent={}\n",
+        child_pid, parent_l0_phys, shared_as.asid(), parent_pid));
     // CLONE_VM: the child shares the parent's address space, so its kernel
     // context ttbr0 MUST be the parent's *actual* top-of-page-table physical
     // base. `get_saved_user_context(parent)` below reads the stale

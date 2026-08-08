@@ -71,10 +71,17 @@ opposite signatures:
 | an advance with no allocation behind it | **ahead** of `next_ticket` | `RECOVERED (reticket-skipped)` bursts; fair lock degrades to test-and-set |
 | an allocation with no ownership episode behind it | **behind** — a lost slot | `[BKL] stuck owner=0` bursts, then `RECOVERED (advanced-lost)` after 20M spins |
 
-**A re-ticket is always the second kind.** When a waiter abandons `my_ticket` and takes a
-new one, the abandoned allocation never gets its own episode — this is true of *both*
-`reticket-owned` and `reticket-skipped`, which is why fixing only one of them does not
-help.
+**A re-ticket is not automatically a leak.** `reticket-skipped` — a waiter finds
+`now_serving` has already advanced past its ticket — is benign rebalancing: the release
+that advanced `now_serving` past the waiter's slot is exactly what consumed that
+allocation, so re-ticketing costs nothing (`sync.rs:608-611`). The kind that actually
+leaked was `reticket-owned`: a waiter reaching `serving == my_ticket` found someone else
+already owning the lock at that exact turn and abandoned its ticket for a fresh one —
+and nothing else ever consumed the abandoned allocation, so `now_serving` ended one short
+of `next_ticket` until the 20M-spin `advanced-lost` self-heal forced it. That path has
+been **removed**: at HEAD, a waiter that loses the ownership CAS at its own turn falls
+through and keeps its ticket, spinning in place until the holder's release lands it in
+the `reticket-skipped` case above (`sync.rs:595-612`).
 
 The out-of-band acquirer is what forces re-tickets. `acquire_no_ticket` (the BKL-free
 EL0-preempt reconcile, `reconcile_for_spsr_no_ticket`, **default-on** via
@@ -96,14 +103,21 @@ still wedged, for exactly the phantom-ticket reason above.
 - `RECOVERED (advanced-lost)` is the only kind that means a ticket was genuinely lost;
   `reticket-skipped` is benign rebalancing. They are counted separately —
   `kernel_lock_lost_ticket_recoveries()` vs the aggregate `kernel_lock_recoveries()` — and
-  an assertion that wants "the accounting is sound" must watch the former, or a benign skip
-  masks a real leak.
+  an assertion that wants "the accounting is sound" must watch the former. The real failure
+  mode of watching the aggregate instead is **false alarms**, not missed leaks: the fix
+  above converts what used to leak into benign `reticket-skipped` recoveries, and those
+  bump the aggregate on a perfectly healthy, contended run (`sync.rs:1616-1618`).
 
 Regression: `sync::tests::kernel_lock_barge_against_waiters_does_not_leak_serving_slots`
 (host). Note that asserting *final drift* does not catch this class — the `advanced-lost`
 self-heal repairs the counters, so a leaking build still ends balanced (it just pays a 20M
-spin freeze per leak). Assert the lost-ticket counter instead. Boot self-test:
-`test_no_bkl_ticket_recoveries`.
+spin freeze per leak). The leak-specific signal is `kernel_lock_lost_ticket_recoveries()`
+— non-zero there means a ticket was genuinely lost, full stop. The boot self-test
+`test_no_bkl_ticket_recoveries` (`src/process_tests.rs:874`) currently asserts the
+*aggregate* `kernel_lock_recoveries()` instead, which — per the false-alarm note just
+above — can fail on a healthy run that merely saw `reticket-skipped` bursts under real
+contention; treat a failure there as "go check `kernel_lock_lost_ticket_recoveries()`",
+not as proof of a leak by itself.
 
 ## The carve-out playbook
 

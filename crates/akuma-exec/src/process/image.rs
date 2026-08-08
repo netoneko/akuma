@@ -69,6 +69,10 @@ impl Process {
         let _lifecycle = LifecycleGuard::acquire();
 
         crate::process::lifecycle_trace("[FORK-DBG] replace_image: deactivating\n");
+        mmu::as_trace(format_args!(
+            "[AS-EXEC] pid={} old_l0=0x{:x} old_asid=0x{:x} new_l0=0x{:x} new_asid=0x{:x} core={}\n",
+            self.pid, self.address_space.l0_phys(), self.address_space.asid(),
+            address_space.l0_phys(), address_space.asid(), crate::bkl::current_core_id()));
         mmu::UserAddressSpace::deactivate();
         crate::process::lifecycle_trace("[FORK-DBG] replace_image: swapping AS\n");
         self.address_space = address_space;
@@ -156,6 +160,10 @@ impl Process {
         // which does block I/O. See the comment in `replace_image`.
         let _lifecycle = LifecycleGuard::acquire();
 
+        mmu::as_trace(format_args!(
+            "[AS-EXEC] pid={} old_l0=0x{:x} old_asid=0x{:x} new_l0=0x{:x} new_asid=0x{:x} core={}\n",
+            self.pid, self.address_space.l0_phys(), self.address_space.asid(),
+            address_space.l0_phys(), address_space.asid(), crate::bkl::current_core_id()));
         mmu::UserAddressSpace::deactivate();
 
         self.address_space = address_space;

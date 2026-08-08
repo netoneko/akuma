@@ -78,6 +78,18 @@ Both are `spinning_top` `RawSpinlock`s: a **single bool, no owner field, not
 reentrant**. Nothing records who holds one, so neither a self-deadlock nor a
 cycle can be detected at runtime — the box simply stops.
 
+**The intended order is `TALC → PMM`**, stated in `reclaim_to_pmm`'s own
+comment. `handle_oom` runs with TALC held and takes PMM beneath it;
+`reclaim_to_pmm` uses `try_lock` so a reentry from inside `malloc` declines
+instead of self-deadlocking. The PMM side keeps to the same order by
+construction: `alloc_pages_zeroed` (`pmm.rs:1311`) reserves its result `Vec`'s
+capacity with `try_reserve_exact` (`pmm.rs:1321`) **before** calling
+`PMM.lock()` (`pmm.rs:1326`), and the locked helper it calls,
+`Pmm::alloc_pages_into(count, &mut result)` (`pmm.rs:318`), only ever `push`es
+into that pre-reserved buffer — a `debug_assert!` at its top (`pmm.rs:319`)
+enforces the precondition that the caller reserved capacity first. No heap
+allocation happens while `PMM` is held.
+
 ```mermaid
 flowchart TB
     subgraph HEAP["TALC — kernel heap"]
@@ -87,57 +99,45 @@ flowchart TB
     end
 
     subgraph PAGES["PMM — page bitmap"]
+        RESV["Vec::try_reserve_exact(count)<br/>HEAP ALLOCATION — BEFORE PMM.lock()"]
         APCZ["alloc_pages_contiguous_zeroed<br/>PMM.lock() inside with_irqs_disabled"]
-        APZ["alloc_pages_zeroed<br/>PMM.lock() ... Pmm::alloc_pages"]
-        VECC["Vec::with_capacity(count)<br/>HEAP ALLOCATION, PMM STILL HELD"]
+        APZ["alloc_pages_zeroed<br/>PMM.lock() ... alloc_pages_into(pre-reserved buf)"]
     end
 
     MALLOC -->|"heap exhausted"| OOM
     OOM -->|"claim pages — TALC -> PMM"| APCZ
     RECL -->|"free spans — TALC -> PMM"| APCZ
-    APZ --> VECC
-    VECC -->|"PMM -> TALC (the inversion)"| MALLOC
-
-    style VECC fill:#b3202c,color:#fff
+    RESV --> APZ
 ```
 
-**The intended order is `TALC → PMM`**, stated in `reclaim_to_pmm`'s own comment,
-and the heap side honours it: `handle_oom` runs with TALC held and takes PMM
-beneath it, while `reclaim_to_pmm` uses `try_lock` so a reentry from inside
-`malloc` declines instead of self-deadlocking.
-
-**`alloc_pages_zeroed` violates it.** `Pmm::alloc_pages` builds its result with
-`alloc::vec::Vec::with_capacity(count)` — a heap allocation — and is called at
-`pmm.rs:1307` while `PMM.lock()` is held at `pmm.rs:1306`. That is the reverse
-edge, and it closes a cycle:
-
-| core | holds | wants | where |
-|---|---|---|---|
-| A | **PMM** | TALC | `alloc_pages_zeroed` → `Vec::with_capacity` → `talc_alloc` |
-| B | **TALC** | PMM | `talc_alloc` → `handle_oom` → `alloc_pages_contiguous_zeroed` |
-
-Two consequences make it worse than an ordinary ABBA:
-
-- **It can deadlock a single core against itself.** If that `Vec::with_capacity`
-  is the allocation that exhausts the heap, `handle_oom` runs on the same core
-  and calls `alloc_pages_contiguous_zeroed` → `PMM.lock()`, which this core
-  already holds. Non-reentrant, so it spins forever. No second core required.
-- **It is silent.** The PMM side spins inside `with_irqs_disabled`, so the
-  stuck core cannot take a timer IRQ — no preemption, no `PSTATS`, no console.
-  A wedged VM and a console-starved VM look identical from outside.
+**Historical bug, FIXED in commit `159c3db`.** `Pmm::alloc_pages` (since
+removed) used to build its result with `alloc::vec::Vec::with_capacity(count)`
+— a heap allocation — *while `PMM.lock()` was already held*. That was the
+reverse edge and it closed a real cycle: core A held PMM and wanted TALC
+(`alloc_pages_zeroed` → `Vec::with_capacity` → `talc_alloc`) while core B held
+TALC and wanted PMM (`talc_alloc` → `handle_oom` →
+`alloc_pages_contiguous_zeroed`) — worse than an ordinary ABBA because a single
+core could deadlock against itself if that same `Vec::with_capacity` was the
+allocation that exhausted the heap, and because the PMM side spins inside
+`with_irqs_disabled`, so the stuck core could take no timer IRQ — no
+preemption, no `PSTATS`, no console, indistinguishable from outside from a
+console-starved VM. The fix hoists the reservation above the lock (the
+reserve-before-lock flow diagrammed above) and changes the locked helper to
+fill an already-capacity'd buffer instead of growing one itself.
 
 ### Rule
 
 **Never allocate on the heap while holding `PMM`.** Compute into a fixed-size
-buffer, or allocate the container *before* taking the lock and fill it after.
-The same applies to any `Spinlock<BTreeMap<..>>` in `pmm.rs` (`COW_FAULT_LOCK`,
-`COW_REFCOUNTS`): a map insert can allocate, so those nest into TALC too.
+buffer, or allocate the container *before* taking the lock and fill it after —
+`alloc_pages_zeroed` above is the reference example. The same applies to any
+`Spinlock<BTreeMap<..>>` in `pmm.rs` (`COW_FAULT_LOCK`, `COW_REFCOUNTS`): a map
+insert can allocate, so those nest into TALC too.
 
 ### Observed signature
 
-Captured 2026-08-08 with [`scripts/lockprobe.py`](../../../scripts/lockprobe.py)
-on a `-j4` in-guest self-host build (SMP=4), 5 of 6 deaths in a 22-round
-campaign:
+Captured 2026-08-08, before the fix, with
+[`scripts/lockprobe.py`](../../../scripts/lockprobe.py) on a `-j4` in-guest
+self-host build (SMP=4), 5 of 6 deaths in a 22-round campaign:
 
 ```
 allocator::TALC @ 0x402db750: 0x01   <- HELD
