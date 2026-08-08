@@ -52,6 +52,59 @@ that is not a *syscall* excursion at all — the timer IRQ never calls
 "window" to open/close, only a single `if` at the dispatch site; see
 [`BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md`](../../archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md).
 
+### The FIFO ticket invariant
+
+The fair wait is a ticket lock: `acquire` takes `next_ticket`, spins until `now_serving`
+reaches it, and the owner's `release` advances `now_serving` by one. The invariant that
+keeps it live is **not** "the two counters stay equal in aggregate" — it is:
+
+> Every **allocated ticket** must be matched by exactly one **ownership episode** that
+> advances `now_serving` past it.
+
+Aggregate equality is strictly weaker and admits a wedge: a ticket value that no core will
+ever hold still has to be *passed*, and nothing advances past it, so the next acquirer
+waits on a `now_serving` that can never arrive. Two ways to break the real invariant, with
+opposite signatures:
+
+| Break | `now_serving` ends up | Log signature |
+|---|---|---|
+| an advance with no allocation behind it | **ahead** of `next_ticket` | `RECOVERED (reticket-skipped)` bursts; fair lock degrades to test-and-set |
+| an allocation with no ownership episode behind it | **behind** — a lost slot | `[BKL] stuck owner=0` bursts, then `RECOVERED (advanced-lost)` after 20M spins |
+
+**A re-ticket is always the second kind.** When a waiter abandons `my_ticket` and takes a
+new one, the abandoned allocation never gets its own episode — this is true of *both*
+`reticket-owned` and `reticket-skipped`, which is why fixing only one of them does not
+help.
+
+The out-of-band acquirer is what forces re-tickets. `acquire_no_ticket` (the BKL-free
+EL0-preempt reconcile, `reconcile_for_spsr_no_ticket`, **default-on** via
+`SCHED_BKLFREE_EL0_ENABLED`) takes ownership without occupying a queue slot. It must
+therefore leave the FIFO **completely** untouched — no ticket on acquire, and no advance on
+release (a per-core `barged` flag on `KernelLock` tells `release` which kind of hold it is
+ending). Anything less consumes a live waiter's slot and forces that waiter to re-ticket.
+An earlier compensating `next_ticket.fetch_add(1)` in the barge kept the counters equal and
+still wedged, for exactly the phantom-ticket reason above.
+
+**Reading the diagnostics.** `[BKL] stuck` prints `owner=`, `waiter=`, `tag=`:
+
+- **`owner=0` means the lock is FREE** while cores spin — a lost ticket, *not* a holder
+  that won't let go. Chase the ticket accounting, not the "owner".
+- `tag=` is meaningless unless the build has `bkl-profile`: `set_profiling` is only enabled
+  there (`src/bkl_profile.rs:48`), every tag-writing function early-returns when it is off,
+  and `HOLDER_TAG` initialises to `HOLD_TAG_UNKNOWN`, so **`tag=511` on a normal build just
+  means "profiler off"**. It narrows nothing. See [Attribution tooling](#attribution-tooling).
+- `RECOVERED (advanced-lost)` is the only kind that means a ticket was genuinely lost;
+  `reticket-skipped` is benign rebalancing. They are counted separately —
+  `kernel_lock_lost_ticket_recoveries()` vs the aggregate `kernel_lock_recoveries()` — and
+  an assertion that wants "the accounting is sound" must watch the former, or a benign skip
+  masks a real leak.
+
+Regression: `sync::tests::kernel_lock_barge_against_waiters_does_not_leak_serving_slots`
+(host). Note that asserting *final drift* does not catch this class — the `advanced-lost`
+self-heal repairs the counters, so a leaking build still ends balanced (it just pays a 20M
+spin freeze per leak). Assert the lost-ticket counter instead. Boot self-test:
+`test_no_bkl_ticket_recoveries`.
+
 ## The carve-out playbook
 
 For a given syscall or subsystem:

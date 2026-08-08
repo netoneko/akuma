@@ -4,7 +4,7 @@
 //! with writer priority to prevent reader starvation — and `KernelLock`, the
 //! recursive Big Kernel Lock used by real (shared-kernel) SMP.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Mask local IRQs (set `DAIF.I`) and return the prior `DAIF` for [`irq_restore`]. Used by
 /// [`KernelLock::acquire`] to make its FIFO ticket wait atomic against local exception
@@ -72,6 +72,27 @@ static KERNEL_LOCK_RECOVERIES: AtomicU64 = AtomicU64::new(0);
 /// keep this at 0.
 pub fn kernel_lock_recoveries() -> u64 {
     KERNEL_LOCK_RECOVERIES.load(Ordering::Relaxed)
+}
+
+/// Times the **lost-ticket** self-heal specifically (`advanced-lost`) had to force
+/// `now_serving` forward — the subset of [`KERNEL_LOCK_RECOVERIES`] that means the FIFO
+/// genuinely wedged: a ticket was handed out that nothing will ever consume, so every
+/// contended acquirer spins `LOST_TICKET_RECOVERY_SPINS` before one of them breaks the
+/// deadlock by hand.
+///
+/// Split out from the aggregate because the three recovery kinds are not equally bad.
+/// `reticket-skipped` is *ordinary* rebalancing whenever an out-of-band barge
+/// (`acquire_no_ticket`) overtakes a waiter — benign and self-correcting within one
+/// acquire. `advanced-lost` is the wedge, and it costs 20M spins per occurrence plus the
+/// `[BKL] stuck owner=0` bursts those spins print. Assertions that want "the accounting is
+/// sound" must watch this one, not the aggregate, or a benign skip masks a real leak.
+/// Read via [`kernel_lock_lost_ticket_recoveries`].
+static KERNEL_LOCK_LOST_TICKET_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot the lost-ticket (`advanced-lost`) recovery counter. Must stay 0: see
+/// [`KERNEL_LOCK_LOST_TICKET_RECOVERIES`].
+pub fn kernel_lock_lost_ticket_recoveries() -> u64 {
+    KERNEL_LOCK_LOST_TICKET_RECOVERIES.load(Ordering::Relaxed)
 }
 
 // --- PreemptGuard ---------------------------------------------------------------
@@ -448,6 +469,10 @@ pub fn reset_wait_by_holder() {
 /// the ticket counters stay balanced across the non-lexical acquire/release that context
 /// switches create (one ticket per EL0→EL1 crossing, one `now_serving` advance per
 /// EL1→EL0 crossing, per core).
+/// Cores tracked by [`KernelLock::barged`]. Matches `PROFILE_MAX_CORES`; a core id at or
+/// beyond this falls back to the aggregate-balance compensation in `acquire_no_ticket`.
+const BARGE_MAX_CORES: usize = 8;
+
 pub struct KernelLock {
     /// `0` = free; otherwise `owner_core_aff0 + 1`. Written by the ticket winner on
     /// acquire and cleared by the owner on release; the source of truth for
@@ -458,6 +483,18 @@ pub struct KernelLock {
     /// The ticket currently permitted to take ownership. The owner's release advances it
     /// by one, handing the lock to the next waiter in arrival order.
     now_serving: AtomicU32,
+    /// Per-core: "this core's current hold came from [`KernelLock::acquire_no_ticket`]".
+    ///
+    /// A barge takes ownership *out of band* — it never occupies a queue slot. If its
+    /// release still advanced `now_serving`, that advance would consume the slot of whatever
+    /// waiter was sitting at its turn, forcing that waiter to re-ticket; and a re-ticket is
+    /// an allocation with no matching ownership episode, i.e. a permanently lost slot. So a
+    /// barge must leave the queue *completely* untouched: no ticket on acquire, no advance
+    /// on release. This flag is what lets `release` tell the two kinds of hold apart.
+    ///
+    /// Only ever written by the owning core for its own index, so the read-modify-write in
+    /// `release` races with nothing.
+    barged: [AtomicBool; BARGE_MAX_CORES],
 }
 
 impl Default for KernelLock {
@@ -473,6 +510,7 @@ impl KernelLock {
             owner: AtomicU32::new(0),
             next_ticket: AtomicU32::new(0),
             now_serving: AtomicU32::new(0),
+            barged: [const { AtomicBool::new(false) }; BARGE_MAX_CORES],
         }
     }
 
@@ -554,10 +592,23 @@ impl KernelLock {
                 {
                     break;
                 }
-                // Someone owns it at our turn (recovery race): rejoin the queue.
-                my_ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
-                log_kernel_lock_recovered(me, "reticket-owned");
-                continue;
+                // Someone owns it at our turn: a barge (`acquire_no_ticket`, the BKL-free
+                // EL0-preempt reconcile) took ownership out of band, or a recovery advanced
+                // onto our ticket while a peer still held it.
+                //
+                // Do NOT re-ticket here. Abandoning `my_ticket` at the exact moment
+                // `now_serving` sits on it LEAKS the slot: nothing else consumes that
+                // allocation (the barger's release advance pays for the barger's own
+                // compensating ticket), so `now_serving` ends one short of `next_ticket`
+                // and the next contended acquirer freezes until `LOST_TICKET_RECOVERY_SPINS`
+                // forces an `advanced-lost`. Measured 1:1 — 25 `reticket-owned` produced
+                // exactly 25 `advanced-lost` over 30 `bssfork 20 3 1` runs, with every
+                // intervening `[BKL] stuck` line reading `owner=0` (lock free, queue frozen).
+                //
+                // Instead keep our place and spin. The holder's release advances
+                // `now_serving` past us, landing us in the `skipped` path below — which is
+                // balanced, because that advance is what consumed our slot. Falling through
+                // (rather than `continue`) keeps the stuck detector and spin accounting live.
             }
             if (serving.wrapping_sub(my_ticket) as i32) > 0 {
                 // `now_serving` passed us (skipped shape above): rejoin the queue.
@@ -580,6 +631,7 @@ impl KernelLock {
                         )
                         .is_ok()
                     {
+                        KERNEL_LOCK_LOST_TICKET_RECOVERIES.fetch_add(1, Ordering::Relaxed);
                         log_kernel_lock_recovered(me, "advanced-lost");
                     }
                     continue;
@@ -638,7 +690,20 @@ impl KernelLock {
             // Hand the lock to the next waiter in arrival order (exactly one advance per
             // owning release — reentrant/idempotent releases don't reach here, keeping
             // `now_serving` balanced against the tickets `acquire` handed out).
-            self.now_serving.fetch_add(1, Ordering::Release);
+            //
+            // UNLESS this hold came from a barge (`acquire_no_ticket`), which took no
+            // ticket: advancing for it would consume the slot of the waiter sitting at its
+            // turn, and that waiter would have to re-ticket — an allocation with no
+            // ownership episode behind it, i.e. a slot `now_serving` can never reach. See
+            // [`KernelLock::barged`]. Only this core writes this flag, so the swap is safe
+            // even though `owner` is already clear above.
+            let barged = self
+                .barged
+                .get(core_id as usize)
+                .is_some_and(|f| f.swap(false, Ordering::Relaxed));
+            if !barged {
+                self.now_serving.fetch_add(1, Ordering::Release);
+            }
         }
     }
 
@@ -699,25 +764,38 @@ impl KernelLock {
                 .compare_exchange(0, me, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                // Account for the serving slot this barge consumed.
+                // Mark the hold as a barge so `release` declines to advance `now_serving`
+                // for it, leaving the FIFO exactly as we found it.
                 //
-                // We did not WAIT on a ticket, but the hold we just took still ends in an
-                // ordinary `release` — the thread we reconcile into returns to EL0 through
-                // the normal epilogue (`reconcile_for_spsr` → `release`), which advances
-                // `now_serving` by one. Advancing without a matching allocation drives
-                // `now_serving` AHEAD of `next_ticket`, and from then on every contended
-                // acquirer takes a ticket already behind `now_serving`, is told it was
-                // skipped, and re-tickets — the `[BKL] RECOVERED (reticket-skipped)` bursts
+                // This replaces an earlier compensating `next_ticket.fetch_add(1)` here.
+                // That kept the two counters equal in aggregate, but equality is not the
+                // invariant that matters: every allocated ticket must be matched by an
+                // ownership episode that advances `now_serving` past it. The compensating
+                // bump allocated a ticket value NO core would ever hold, so once
+                // `now_serving` reached it the next acquirer took the value above it and
+                // waited for an advance that could never come — a freeze, ended only by
+                // `LOST_TICKET_RECOVERY_SPINS` and an `advanced-lost`. It also still let the
+                // barge's own release consume a live waiter's slot, forcing that waiter to
+                // re-ticket, which loses a slot the same way. Measured: the compensating
+                // form wedged 102 times in one run of
+                // `kernel_lock_barge_against_waiters_does_not_leak_serving_slots`; taking
+                // the queue out of the barge's path entirely brings it to 0.
+                //
+                // (Original note, still the reason a plain "advance anyway" is also wrong:
+                // advancing without a matching allocation drives `now_serving` AHEAD of
+                // `next_ticket`, and every contended acquirer afterwards is told it was
+                // skipped and re-tickets — the `[BKL] RECOVERED (reticket-skipped)` bursts
                 // measured at SMP=4 under fork/exec churn, which degrade the fair lock to
-                // an unfair test-and-set for the length of the burst.
+                // an unfair test-and-set for the length of the burst. Neither direction is
+                // acceptable; not touching the queue at all is the only balanced option.)
                 //
-                // Bumping here (AFTER winning ownership, so a losing CAS allocates nothing)
-                // keeps the pairing exact. It is also the right FIFO semantics: if a waiter
-                // was sitting at `now_serving` when we barged in, its own CAS just failed
-                // and it re-ticketed to the tail ("reticket-owned"), leaving that slot
-                // vacant — so our release *should* advance past it. If there was no queue,
-                // we allocate and consume one slot and the counters return to equal.
-                self.next_ticket.fetch_add(1, Ordering::Relaxed);
+                // A core id past the tracked range has no flag to set, so it falls back to
+                // the old aggregate compensation rather than silently over-advancing.
+                if let Some(f) = self.barged.get(core_id as usize) {
+                    f.store(true, Ordering::Relaxed);
+                } else {
+                    self.next_ticket.fetch_add(1, Ordering::Relaxed);
+                }
                 irq_restore(daif);
                 return;
             }
@@ -779,7 +857,12 @@ fn log_kernel_lock_stuck(owner: u32, me: u32) {
     );
     if buf.1 > 0 {
         if let Ok(s) = core::str::from_utf8(&buf.0[..buf.1]) {
-            (crate::runtime::runtime().print_str)(s);
+            // `is_registered` first: a contended acquire can run before/without a registered
+            // runtime (host unit tests drive `KernelLock` directly), and a diagnostic must
+            // never be the thing that panics.
+            if crate::runtime::is_registered() {
+                (crate::runtime::runtime().print_str)(s);
+            }
         }
     }
 }
@@ -804,7 +887,11 @@ fn log_kernel_lock_recovered(me: u32, kind: &str) {
     let _ = writeln!(buf, "[BKL] RECOVERED ({kind}) by core {me} (aff0+1)");
     if buf.1 > 0 {
         if let Ok(s) = core::str::from_utf8(&buf.0[..buf.1]) {
-            (crate::runtime::runtime().print_str)(s);
+            // See `log_kernel_lock_stuck`: probe before printing so a host unit test driving
+            // `KernelLock` without a registered runtime records the counter and stays quiet.
+            if crate::runtime::is_registered() {
+                (crate::runtime::runtime().print_str)(s);
+            }
         }
     }
 }
@@ -1497,6 +1584,94 @@ mod tests {
                 "round {round}: ticketed excursion left the counters skewed"
             );
         }
+    }
+
+    #[test]
+    fn kernel_lock_barge_against_waiters_does_not_leak_serving_slots() {
+        // Regression for the `[BKL] stuck owner=0` storm (the `advanced-lost` family).
+        //
+        // The dual of `kernel_lock_no_ticket_acquire_release_stays_balanced` above. That one
+        // pins the direction where `now_serving` runs AHEAD of `next_ticket`. This one pins
+        // the direction where it falls BEHIND, which the sequential tests cannot reach
+        // because it needs a barge to land while a ticketed waiter is *exactly at its turn*:
+        //
+        //   `acquire` reaches `serving == my_ticket`, its ownership CAS loses to a barger
+        //   (`acquire_no_ticket`), and — before the fix — it abandoned `my_ticket` and
+        //   re-ticketed to the tail. Nothing ever consumed that abandoned allocation: the
+        //   barger's release advance pays for the barger's own compensating ticket. So each
+        //   occurrence left `now_serving` one short of `next_ticket` permanently, and the
+        //   next contended acquirer spun `LOST_TICKET_RECOVERY_SPINS` (20M) before forcing
+        //   an `advanced-lost`. On QEMU SMP=4 that measured 1:1 — 25 `reticket-owned`
+        //   produced exactly 25 `advanced-lost` over 30 `bssfork 20 3 1` runs, with all 140
+        //   intervening `[BKL] stuck` lines reading `owner=0` (lock free, queue frozen).
+        //
+        // What to assert took one wrong turn worth recording. Final drift
+        // (`next_ticket == now_serving` after every thread drains) does NOT work: the
+        // `advanced-lost` self-heal repairs each leaked slot, so the counters balance in the
+        // end either way. Measured on the buggy code this test passed — while taking 52.7s
+        // against 21.3s fixed, the 2.5x being the 20M-spin freezes it was silently paying.
+        //
+        // So assert the wedge never happened rather than that it was cleaned up afterwards:
+        // `advanced-lost` fires if and only if a ticket was genuinely lost. It must be the
+        // dedicated counter, not the aggregate [`kernel_lock_recoveries`] — the fix converts
+        // these collisions into benign `reticket-skipped` recoveries, which bump the
+        // aggregate on a healthy run.
+        use std::sync::Arc;
+        use std::thread;
+
+        let lost_before = kernel_lock_lost_ticket_recoveries();
+
+        let bkl = Arc::new(KernelLock::new());
+        let rounds = 3000u32;
+        let mut handles = Vec::new();
+
+        // Ticketed cores: ordinary EL0→EL1 excursions through the FIFO.
+        for core in 1..4u32 {
+            let bkl = Arc::clone(&bkl);
+            handles.push(thread::spawn(move || {
+                for _ in 0..rounds {
+                    bkl.acquire(core);
+                    assert!(bkl.held_by(core));
+                    bkl.release(core);
+                }
+            }));
+        }
+        // Core 0 stands in for the BKL-free EL0-preempt scheduler reconcile, which takes
+        // ownership out of band and so can land on a waiter's turn.
+        {
+            let bkl = Arc::clone(&bkl);
+            handles.push(thread::spawn(move || {
+                for _ in 0..rounds {
+                    bkl.acquire_no_ticket(0);
+                    assert!(bkl.held_by(0));
+                    bkl.release(0);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        // Everything drained and the lock is free, so the FIFO must be exactly balanced.
+        // (Necessary but not sufficient — see the note above on why this alone passed on the
+        // buggy code. Kept because a leak the self-heal did *not* get to still shows here.)
+        assert!(!bkl.is_held(), "lock still held after all threads finished");
+        let next = bkl.next_ticket.load(Ordering::Relaxed);
+        let serving = bkl.now_serving.load(Ordering::Relaxed);
+        assert_eq!(
+            next,
+            serving,
+            "leaked {} serving slot(s) the self-heal never reclaimed",
+            next.wrapping_sub(serving)
+        );
+
+        // The real assertion: no ticket was ever lost, so the lost-ticket self-heal never ran.
+        let lost = kernel_lock_lost_ticket_recoveries() - lost_before;
+        assert_eq!(
+            lost, 0,
+            "the FIFO wedged {lost} time(s): a barge landed on a waiter's turn, the waiter \
+             abandoned its ticket, and `now_serving` had to be forced forward after 20M spins"
+        );
     }
 
     #[test]

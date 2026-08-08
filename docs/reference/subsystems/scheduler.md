@@ -3,8 +3,10 @@
 Current-state architecture for preemptive threading, the scheduler, context
 switch, synchronization primitives, and blocking.
 
-> **Stability: A (stable).** Threading churn was concentrated in Jan–Mar and
-> has been quiet since. The proportional scheduler + SGI preemption model is
+> **Stability: A (stable)** for everything below **except**
+> [The `POOL` gate](#the-pool-gate-shared-smp), which is **C (active risk)** — it carries an
+> open, reproducible wedge under shared-SMP fork churn. Threading churn was concentrated in
+> Jan–Mar and has been quiet since. The proportional scheduler + SGI preemption model is
 > settled. The recurring lesson across the codebase: **never `yield_now()` or
 > do slow I/O inside a preemption-disabled closure** — that is the single most
 > common cause of hangs (see `../../runbooks/debug-network.md`).
@@ -21,6 +23,31 @@ For SMP/multikernel (one-kernel-per-core), see [`smp.md`](smp.md).
 - **Thread states** (`crates/akuma-exec/src/threading/types.rs:126`):
   `Free → Ready → Running → Terminated`. Tracked in lock-free atomics
   `THREAD_STATES: [AtomicU8; MAX_THREADS]` (no mutex on the hot path).
+
+### Slot state machine
+
+`THREAD_STATES[tid]` (`types.rs:76`) is the lock-free source of truth. `INITIALIZING`
+exists so the scheduler cannot pick a slot whose context is half-built, and the
+`TERMINATED → FREE` edge is deliberately delayed by a cooldown so a dying thread is never
+recycled while a peer still holds a reference to it.
+
+```mermaid
+stateDiagram-v2
+    [*] --> FREE
+    FREE --> INITIALIZING: claim_free_slot() CAS + scrub_thread_slot()
+    INITIALIZING --> READY: context built, stack ensured
+    READY --> RUNNING: schedule_indices() picks it
+    RUNNING --> READY: SGI preempt / yield_now()
+    RUNNING --> WAITING: schedule_blocking()
+    WAITING --> READY: waker sees WAITING (park/wake handshake)
+    RUNNING --> TERMINATED: mark_thread_terminated()
+    TERMINATED --> FREE: cleanup_terminated_internal() after cooldown
+```
+
+The `RUNNING → WAITING → READY` edge is the one with the sharp invariant — see
+[Park/wake handshake](#parkwake-handshake--the-invariant). The parking thread may also
+take `WAITING → RUNNING` itself, by consuming a sticky wake that arrived before it lost
+the CPU.
 
 ## Preemption
 
@@ -42,6 +69,99 @@ For SMP/multikernel (one-kernel-per-core), see [`smp.md`](smp.md).
   affects shared L0 entries — sibling threads share L0 with different ASIDs.
   Stale TTBR0 was the dominant bug class in `fork`/`vfork`/`clone_thread`
   (all three call sites now set `child_ctx.ttbr0 = new_proc.address_space.ttbr0()`).
+
+## The `POOL` gate (shared-SMP)
+
+> **Stability: C (active risk).** The wedge described at the end of this section is
+> open and reproducible.
+
+`POOL: Spinlock<ThreadPool>` (`threading/mod.rs:2775`) is a **single global lock** guarding
+the slot table. Under `smp-shared` it is also what makes the context switch atomic: since
+M5c step-2 the scheduler SGI runs **BKL-free** and holds `POOL` across the *entire* switch
+— decision, outgoing context save, and incoming load. It has to, because
+`schedule_indices`/`commit_switch` mark the outgoing thread `READY` (so a peer core may
+pick it), and a peer that restored a not-yet-saved SP would run a corrupt stack.
+
+The load-bearing consequence: **`POOL` is the gate on all preemption.** The SGI handler
+takes it with `try_lock` and, on failure, skips the tick entirely.
+
+```mermaid
+flowchart TD
+    T["10 ms timer IRQ"] --> SGI["SCHED_SGI → this core"]
+    SGI --> H["sgi_scheduler_handler_with_sp()"]
+    H --> TL{"POOL.try_lock()"}
+    TL -->|"None (contended)"| SKIP["SGI_POOL_SKIP += 1<br/>return 0 — no preemption this tick"]
+    TL -->|Some| DEC["schedule_indices(voluntary, core_id)"]
+    DEC --> SW["save outgoing ctx + load incoming<br/>(POOL held across the whole switch)"]
+    SW --> RET["return new SP (guard drops)"]
+    RET --> ASM["assembly switches SP"]
+    ASM --> ERET["eret epilogue →<br/>reconcile_for_spsr_no_ticket → BKL"]
+    SKIP --> NEXT["next tick retries"]
+    NEXT -.-> T
+```
+
+`try_lock` rather than `lock` is mandatory, not an optimisation: the handler runs in IRQ
+context with `PSTATE.I` masked, so a blocking acquire against a `POOL` held by the very
+thread it interrupted would spin forever. Skipping a tick is safe **for a transient
+holder** — the comment's "the next tick retries" is only true if the holder is guaranteed
+to make progress without being preempted.
+
+### Reasoning about the transitions
+
+Every ordinary `POOL` holder is bounded and lock-free internally, which is why the design
+works day to day:
+
+| Holder | Held across | Bounded by |
+|---|---|---|
+| SGI handler (`try_lock`) | one context switch | register save/load |
+| spawn (`spawn_*_thread_*`) | slot claim + context build | no I/O |
+| recycle (`cleanup_terminated_internal`) | three short windows, each under `IrqGuard` | per-slot field writes |
+| `ensure_slot_stack` | PMM alloc + page zeroing | **no-op on `release`** (slots pre-allocated); only the size profile allocates lazily |
+| `idle_halt` (`try_lock`) | post-WFI bookkeeping | skippable |
+| diagnostics (`list_kernel_threads`, canary/stack checks) | a read scan | slot count |
+
+So the invariant that keeps preemption alive is:
+
+> A `POOL` holder must never wait on anything that requires **another thread to be
+> scheduled**. Doing so is unrecoverable: the thread it is waiting for can only be switched
+> in by the SGI handler, and every core's SGI handler skips its tick for as long as that
+> holder keeps `POOL` — so the wait blocks the very mechanism that could end it.
+
+That is a circular wait *through the scheduler itself*, and no lock-ordering rule catches
+it — there is no global hierarchy in this kernel by design
+([`locking.md`](locking.md)). It is also invisible to the existing tripwire: the
+**preemption watchdog panics at 5 s** of disabled preemption (`types.rs:69`), but it
+watches the per-thread `PREEMPTION_DISABLED` counters, *not* consecutive SGI skips. A
+`POOL`-gated wedge trips no counter, so the watchdog stays silent through it.
+
+### The observed wedge (open)
+
+Reproduced 2026-08-08 on `release-smp-shared` + `devbox-smoltcp`, SMP=4, under 6
+concurrent `bssfork` instances (heavy fork + thread churn):
+
+- `[SGI] POOL contended, skipped N ticks` climbs without bound (69 000+ and still going),
+  alternating between just two tids — the message reports the *interrupted* thread, so
+  this says two threads keep getting timer IRQs and neither can ever be switched out.
+- The console keeps printing, so IRQs and the UART are alive — **the box is not dead, it
+  is unscheduled.** ssh stops answering because no userspace thread can be switched in.
+- Onset is always thread-churn heavy: a burst of `[PROC-EXIT]` / `[TERM]` /
+  `[Cleanup] Thread N recycled` immediately precedes it.
+- The preemption watchdog does not fire, per the blind spot above.
+
+**Established:** it is *pre-existing and independent of the BKL ticket accounting* — it
+reproduces on both arms of that A/B, on the same load, and the fixed kernel reaches it
+with zero `[BKL] stuck` lines, so the two defects do not share a mechanism.
+
+**Not yet established:** which `POOL` holder wedges. `Spinlock` carries no owner, so the
+skip message names the *interrupted* thread on the skipping core, never the holder — the
+same trap that made `tag=511` useless for the BKL storm (see
+[`locking.md`](locking.md#attribution-tooling)). Reading the skipping tid as the culprit
+is the mistake to avoid here.
+
+**Cheap discriminator, not yet run:** record the holder. A `POOL_OWNER: AtomicUsize`
+(plus a `#[track_caller]` site) stored immediately after every successful `lock()`/
+`try_lock()` and cleared before release turns the skip line into a naming of the actual
+holder, which reduces the suspect list to a handful of call sites in one run.
 
 ## Synchronization primitives
 

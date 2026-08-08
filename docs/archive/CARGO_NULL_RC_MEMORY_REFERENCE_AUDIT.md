@@ -667,6 +667,21 @@ the main thread forks. No mmap, no patterns. PASSES on real Linux aarch64
 
 ### 12.7 Open: the storm behind the fix
 
+> **RESOLVED 2026-08-08 — and two claims below are wrong.** The storm was a lost FIFO
+> ticket in the BKL (a barge consuming a waiter's serving slot), fixed; 30 runs of
+> `bssfork 20 3 1` went 140 `[BKL] stuck` / 25 `advanced-lost` → 0 / 0. Current-state
+> writeup: [`../reference/subsystems/locking.md`](../reference/subsystems/locking.md)
+> -> "The FIFO ticket invariant".
+>
+> The two errors, kept visible because both are easy to repeat: (1) the `tag=511`
+> reading below is unsound — `set_profiling` is only enabled by the `bkl-profile`
+> feature, every tag-writing function early-returns when it is off, so `tag=511` on a
+> normal build means "profiler off" and narrows nothing. The proposed `HOLD_TAG_SPAWN`
+> discriminator would have printed 511 either way and "falsified" the hypothesis
+> regardless of its truth. (2) The informative field was `owner=`, printed on the same
+> line all along: `owner=0` says the lock was **free** while cores spun, which is a lost
+> ticket, not an owner in a spawn path. The original text is left unedited below.
+
 At sustained multi-threaded fork load the VM drops into the `[BKL] stuck tag=511`
 storm — no `[WPF]`, no SIGSEGV, `stale_write_faults`/`repeats` both 0. Every
 occurrence is immediately preceded by:

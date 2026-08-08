@@ -64,9 +64,14 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   `spread=1` is the control — same threads, same fork churn, one page per thread,
   so no two threads ever fault on the same page. Use it to tell "this load is too
   much for the machine" from "this load hits the contended-fault path": it is what
-  proved the `[BKL] stuck tag=511` storm seen at high thread counts is load-driven
-  and pre-existing (it storms identically on an unmodified kernel, and on the fixed
+  proved the `[BKL] stuck` storm seen at high thread counts is independent of the
+  write-fault repair (it storms identically on an unmodified kernel, and on the fixed
   one with `stale_write_faults=0`, i.e. the repair never firing).
+  **`bssfork 20 3 1` at SMP=4 is now also the reproducer for that storm**, which was
+  root-caused 2026-08-08 as a lost FIFO ticket in the BKL — a barge consuming a
+  waiter's serving slot — and **fixed**: 30 runs went 140 `[BKL] stuck` / 25
+  `advanced-lost` → **0 / 0**. See `docs/reference/subsystems/locking.md` -> "The FIFO
+  ticket invariant". Read `owner=` in a stuck line, never `tag=` (511 = profiler off).
   Needs **SMP>=2**: 8/8 SEGV at `SMP=4`, 10/10 PASS at `SMP=1` on the same pristine
   kernel, because the losing thread has to be executing its fault while the winner
   holds the page's slot. Note the workers are CPU-bound and never sleep, so more

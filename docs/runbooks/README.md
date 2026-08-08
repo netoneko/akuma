@@ -18,6 +18,8 @@ Start from the symptom or task on the left.
 | Debugging an EL1 crash / data abort / unhandled exception | [`debug-exceptions.md`](debug-exceptions.md) |
 | Debugging a boot hang | [`debug-boot-hang.md`](debug-boot-hang.md) |
 | Debugging shared-kernel SMP (BKL deadlock/contention, profiler) | [`debug-smp.md`](debug-smp.md) |
+| `[BKL] stuck` bursts under fork/thread churn — check `owner=` **first** | `owner=0` = the lock is *free*, so it is a lost FIFO ticket, not a stuck holder; `tag=511` means nothing without `bkl-profile`. **FIXED 2026-08-08** (barges no longer touch the queue): [`../reference/subsystems/locking.md`](../reference/subsystems/locking.md) -> "The FIFO ticket invariant". Reproduce with `c_stress/bssfork 20 3 1` at SMP=4 |
+| `[SGI] POOL contended, skipped N ticks` climbing forever; console still printing but ssh dead | **OPEN.** The box is *unscheduled*, not hung — `POOL` gates all preemption. The preemption watchdog cannot see it, and the tid in the message is the interrupted thread, **not** the holder: [`../reference/subsystems/scheduler.md`](../reference/subsystems/scheduler.md) -> "The `POOL` gate" |
 | Debugging a thread parked forever in `futex` (lost wakeup) | [`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) |
 | Debugging a brand-new `pthread_create`d thread that SIGSEGVs at birth | [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) |
 | A process that forks while multi-threaded dies with `EXIT=139` / `[WPF] cow_ref=0 lazy_self=NONE` | **FIXED 2026-08-08** — [`../archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md`](../archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md) §12. Regression: `c_stress/bssfork 20 3` |
