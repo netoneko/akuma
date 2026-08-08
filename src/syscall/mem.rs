@@ -406,8 +406,10 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
 
     if use_lazy {
         let count = akuma_exec::process::push_lazy_region(proc.tgid, mmap_addr, pages * 4096, page_flags);
-        crate::tprint!(192, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (lazy, {} regions)\n",
-            proc.pid, len, prot, flags, mmap_addr, count);
+        if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+            crate::tprint!(192, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (lazy, {} regions)\n",
+                proc.pid, len, prot, flags, mmap_addr, count);
+        }
         return mmap_addr as u64;
     }
 
@@ -437,8 +439,10 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             };
             let count = akuma_exec::process::push_lazy_region_with_source(
                 proc.tgid, mmap_addr, pages * 4096, page_flags, source);
-            crate::tprint!(192, "[mmap] pid={} fd={} file={} off={} len=0x{:x} = 0x{:x} (lazy-file, {} regions)\n",
-                proc.pid, fd, &path, offset, len, mmap_addr, count);
+            if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+                crate::tprint!(192, "[mmap] pid={} fd={} file={} off={} len=0x{:x} = 0x{:x} (lazy-file, {} regions)\n",
+                    proc.pid, fd, &path, offset, len, mmap_addr, count);
+            }
             return mmap_addr as u64;
         }
 
@@ -511,7 +515,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                     proc.pid, fd, &path, offset, len, mmap_addr, bytes_read);
             }
         }
-    } else {
+    } else if crate::config::MEM_SYSCALL_TRACE_ENABLED {
         crate::tprint!(128, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (eager)\n",
             proc.pid, len, prot, flags, mmap_addr);
     }
@@ -579,8 +583,10 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 (proc.tgid, mmap_addr),
                 SharedFileMapping { path: f.path.clone(), file_offset: offset, len },
             );
-            crate::tprint!(192, "[mmap] pid={} fd={} file={} off={} len=0x{:x} = 0x{:x} (shared-writable, writeback on)\n",
-                proc.pid, fd, &f.path, offset, len, mmap_addr);
+            if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+                crate::tprint!(192, "[mmap] pid={} fd={} file={} off={} len=0x{:x} = 0x{:x} (shared-writable, writeback on)\n",
+                    proc.pid, fd, &f.path, offset, len, mmap_addr);
+            }
         }
 
     proc.vm_with_regions(|r| r.push(MmapRegion::owned_with_flags(mmap_addr, frames, page_flags)));
@@ -883,8 +889,10 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     let adding_exec = prot & 0x4 != 0;
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
-    crate::tprint!(128, "[mprotect] pid={} owner={} addr=0x{:x} len=0x{:x} prot={:#x}\n",
-        current_pid, owner_pid, addr, pages * 4096, prot);
+    if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+        crate::tprint!(128, "[mprotect] pid={} owner={} addr=0x{:x} len=0x{:x} prot={:#x}\n",
+            current_pid, owner_pid, addr, pages * 4096, prot);
+    }
     if let Some(proc) = akuma_exec::process::lookup_process_shared(owner_pid) {
         let _mm_window = MmBklGuard::new();
         akuma_exec::process::update_lazy_region_flags(proc.tgid, addr, pages * 4096, new_flags);

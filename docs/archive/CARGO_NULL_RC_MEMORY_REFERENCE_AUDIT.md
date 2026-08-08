@@ -10,13 +10,17 @@ This is a **live investigation log**, not a conclusion. Every statement is tagge
 with the evidence behind it, including the **three** theories the evidence has
 already killed. Branch `stabilize-devbox`.
 
-**Current state in one line:** the `[EAGER-UPGRADE]` anomaly turned out not to be a
-lost permission at all — the page table was correct every time — and a purpose-built
-probe (`cowstale`) now reproduces a fault in the same class **deterministically in
-0.01 s**, replacing the ~1-in-5 ten-minute build as the oracle (§0).
+**Current state in one line:** the `cowstale` fault is **root-caused and fixed** —
+it was never a corrupted pointer, it was the fault handler judging a write
+permission fault against state a sibling thread had already moved past (§12).
+Whether that was also cargo's null `Rc` is a separate question, still open.
 
 **Active brief for continuing this work:**
 [`proposals/COWSTALE_FORK_THREAD_SEGV.md`](../../proposals/COWSTALE_FORK_THREAD_SEGV.md).
+
+> **§0.2 below is wrong and is kept only because it shaped a day of work.** The
+> faulting address was a `.bss` global, not a corrupted pointer. §12 has the
+> correction and how one `readelf -S` settles it.
 
 ---
 
@@ -52,7 +56,7 @@ the one that killed cargo mid-build.
 one thread passes, both together fail. Exactly cargo's shape: a multi-threaded
 process forking repeatedly.
 
-### 0.2 The pointer lost bit 28
+### 0.2 The pointer lost bit 28 — WRONG, see §12
 
 The mapping is at `0x10420000`; the faulting write went to `0x420260`, landing in
 the binary's own read-only image. `x20=0x420248`, `x2=x3=0x5041524e00000000` (the
@@ -524,6 +528,149 @@ immediately say what is mapped at the faulting VA with no region record.
    flags that are already correct, and its counters make the condition visible.
 4. Close D3/D4 (code-visible leaks) and decide on D5.
 5. D1 (§7) whenever convenient; its prerequisite is now done.
+
+## 12. The `cowstale` fault, solved (2026-08-08)
+
+**It was never a corrupted pointer.** The fault handler was killing processes for
+writes the page table already permitted.
+
+### 12.1 The correction: `0x420260` is a `.bss` global
+
+§0.2 read `FAR=0x420260` against the mapping at `0x10420000`, saw the difference
+as `0x10000000`, and concluded a pointer had lost bit 28. One `readelf` refutes it:
+
+```
+$ aarch64-linux-musl-readelf -SW cowstale | grep -E '\.data|\.bss'
+[10] .data  PROGBITS  0000000000420000  010000  000210  WA
+[11] .bss   NOBITS    0000000000420210  010210  000708  WA
+$ aarch64-linux-musl-readelf -sW cowstale | grep 42024
+46: 0000000000420248  8  OBJECT  LOCAL  g_map
+49: 0000000000420260  8  OBJECT  LOCAL  g_reader_checks
+```
+
+`FAR` is `g_reader_checks`. `x20 = 0x420248` is `&g_map` — the base the compiler
+kept for the whole `.bss` block, not a data pointer. And the instruction:
+
+```
+$ aarch64-linux-musl-objdump -d --start-address=0x400868 cowstale
+400868: f9000e80  str x0, [x20, #24]      ← inside reader()
+```
+
+`0x420248 + 24 = 0x420260`. It is `g_reader_checks++`. Every register in the
+`[Fault]` block agrees: `x2 = x3 = 0x5041524e00000005` is `parent_word(5)`, the
+value the reader loop compares against.
+
+The resemblance to the mmap base was coincidence — `mmap` returned `0x10420000`,
+and both addresses carry `0x420000` in their low bits. **A write to a global is a
+legal write; the SIGSEGV was the kernel's error, not the program's.**
+
+### 12.2 Root cause: a write fault judged against state that moved on
+
+`fork` demotes the whole address space to read-only (`cow_share_and_demote_range`).
+Every thread that then writes the same page faults at once. The first one through
+`fault_slot_acquire` breaks CoW: new frame, PTE rewritten RW, `cow_ref_dec`. The
+threads behind it are serialised on that same slot and arrive holding a fault for
+a write that is now perfectly legal — and nothing downstream can say so:
+
+| repair path | why it declines |
+| --- | --- |
+| CoW break | re-reads the PTE, gets the **new** PA, `cow_ref_get == 0` — the winner consumed the reference |
+| lazy-region upgrade | no lazy region: an ELF segment is not a lazy mapping |
+| eager-region upgrade | no eager region either — **`mmap_regions` only ever records `mmap`**, never the image the loader placed |
+
+So the loser falls through to SIGSEGV, and because it is a `CLONE_VM` sibling,
+`exit_group` takes the whole process with it.
+
+The structural half of this is worth stating on its own: **an ELF `.data`/`.bss`
+page has no region record of any kind**, so it has exactly one recovery route
+after a fork demote, and that route is single-use per reference. Every other
+mapping in the system has a second chance; image pages do not.
+
+### 12.3 The evidence
+
+`[WPF]` gained `eager=`, `pte=` and `ap_rw=` (`print_write_perm_fault_diag`). The
+decisive field is the last one:
+
+```
+[WPF] pid=8 as_owner=8 va=0x420000 pa=0x79bf8000 mapped=true cow_ref=0
+      lazy_self=NONE lazy_owner=NONE eager=NONE pte=0x60000079bf8f4f
+      ap_rw=true have_owner=true free=1860727
+```
+
+`pte & AP_MASK == AP_RW_ALL`. **The page table granted the write at the moment the
+kernel decided to kill the process.** Not a lost permission, not a bad frame — a
+fault evaluated too late, against a page someone else had already repaired.
+
+Confirmed at the mechanism, not just the outcome: a temporary trace in the absorb
+path printed four *different* tids absorbing on `va=0x420000` in one run — the
+losing-threads-on-the-`.bss`-page story, directly observed.
+
+### 12.4 The fix
+
+`stale_write_fault_absorbed`, first thing in the write arm of the EL0 permission
+fault: re-read the PTE; if it already grants EL0 write, invalidate and let the
+instruction re-execute. This is the re-check every SMP kernel needs — Linux does
+the same under the page-table lock (`pte_same`).
+
+Bounded on **(VA, PTE)**, not VA alone. The old `stale_tlb_repair_applies` keyed
+on VA and gave up after 2 consecutive hits, which is wrong here: a thread faults
+on the same global's page every fork round, forever. A *changed* PTE means real
+work happened in between (a CoW break installed a new frame), so the budget
+restarts; an *unchanged* PTE means retrying is not clearing it, and only then does
+it decline and let the normal repair run. That call is now the only one — the copy
+inside the eager-region arm was unreachable for the mappings that needed it.
+
+### 12.5 Numbers
+
+Same tree, same boot parameters, one variable:
+
+| probe | pristine | fixed |
+| --- | --- | --- |
+| `cowstale 5 8 3` | **10/10 SEGV** | 0 SEGV |
+| `bssfork 20 3` | **8/8 SEGV** | 0 SEGV |
+| `bssfork 1 3` | **5/25 SEGV** | 0 SEGV |
+| full `cowstale` matrix (9 shapes) | — | 0 SEGV, ~25 runs |
+
+Note the third row against §0.1's "1 round → PASS": one fork round is enough, and
+the original table read a probability as a threshold.
+
+Boot self-test: `test_stale_write_fault_absorbed` (`src/process_tests.rs`) drives
+the decision against a scratch address space — absorb when the PTE grants the
+write, decline for RO, decline for unmapped, exhaust the budget on an unchanged
+PTE, and get a fresh budget when the PTE changes.
+
+### 12.6 New probe: `bssfork`
+
+`userspace/forktest/c_stress/bssfork.c` — the defect with nothing else attached:
+T threads incrementing adjacent `.bss` counters (one page, so they contend) while
+the main thread forks. No mmap, no patterns. PASSES on real Linux aarch64
+(`docker run --platform linux/arm64 alpine /bssfork 20 8`).
+
+### 12.7 Open: the storm behind the fix
+
+At sustained multi-threaded fork load the VM drops into the `[BKL] stuck tag=511`
+storm — no `[WPF]`, no SIGSEGV, `stale_write_faults`/`repeats` both 0. Every
+occurrence is immediately preceded by:
+
+```
+[identity] WARNING: THREAD_PID_MAP pid not ACTIVE in process table
+           — tgid degraded to own pid (futex keys may not match wakers)
+```
+
+which is the **pre-existing** ACTIVE→RETIRED window documented at
+`crates/akuma-exec/src/process/children.rs:392` (counter `TGID_RESOLVE_MISSES`),
+whose own comment records that it had never been confirmed to fire. Fixed kernel:
+3 hits / 25 runs, `RECOVERED` never. Pristine, same load: 0 hits, 46 transient
+stucks, 13 recoveries — but pristine dies of *this* defect long before it can
+sustain the load, so that is not a clean A/B.
+
+Working reading: the fix does not create that race, it **reaches** it — contended
+multi-threaded fork workloads now survive to run their teardown path. The test
+that decides it is a load whose absorb counter stays 0 while the storm still
+appears. `bssfork` at >=3 threads is the fastest known trigger, which is itself
+new: this race had no reproducer before.
+
+---
 
 ## Background
 

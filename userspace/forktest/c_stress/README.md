@@ -50,6 +50,25 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   processes all run under a non-zero ASID — so the invalidation matched nothing
   and `sys_mprotect` could not downgrade a cached translation. Measured 3 FAIL
   before the fix, 3 PASS after, 3 PASS on Linux.
+- `bssfork` — **the regression test for the fork-from-a-threaded-process SIGSEGV**
+  (`docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` §12), and the narrowest
+  statement of it: T threads incrementing adjacent `.bss` counters — one page, so
+  they contend — while the main thread forks. No mmap, no patterns. Every write in
+  it is legal at every instant on any OS; the failure is the kernel refusing one.
+  The defect: `fork` demotes the address space read-only, all the threads fault on
+  the same page, the first breaks CoW and consumes the CoW reference, and the ones
+  behind it arrive holding a fault for a write that is now legal — which the kernel
+  judged against the old state and answered with SIGSEGV, because an ELF
+  `.data`/`.bss` page has no `mmap` region to fall back on. Measured **8/8 SEGV at
+  `20 3` and 5/25 at `1 3` before the fix, 0 after**; PASSES on real Linux aarch64.
+  `spread=1` is the control — same threads, same fork churn, one page per thread,
+  so no two threads ever fault on the same page. Use it to tell "this load is too
+  much for the machine" from "this load hits the contended-fault path": it is what
+  proved the `[BKL] stuck tag=511` storm seen at high thread counts is load-driven
+  and pre-existing (it storms identically on an unmodified kernel, and on the fixed
+  one with `stale_write_faults=0`, i.e. the repair never firing).
+  Usage: `bssfork [rounds] [threads] [spread]`. Calibrate:
+  `docker run --rm --platform linux/arm64 -v "$PWD/bssfork:/bssfork:ro" alpine /bssfork 20 8`.
 - `cowstale` — **deterministic reproducer for the `EXIT=139` / `[WPF] cow_ref=0
   lazy_self=NONE` class** (proposals/COWSTALE_FORK_THREAD_SEGV.md). Forks
   repeatedly from a process that has live reader threads, so several cores hold
@@ -63,6 +82,13 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   /cowstale 40 32 3`). Usage: `cowstale [rounds] [pages] [reader_threads]`,
   exit 0 = clean. This replaces the ~1-in-5, ten-minute self-host build as the
   way to ask "is it fixed yet".
+  **Fixed 2026-08-08** (`stale_write_fault_absorbed`, audit §12): 10/10 SEGV at
+  `5 8 3` before, 0 after. Two corrections to the notes above, both of which cost
+  time: the faulting address was never a corrupted pointer — it is
+  `g_reader_checks`, a `.bss` global (`readelf -sW` says so) — and the minimal
+  trigger is **>=2 threads**, not two rounds. One round fails too, just less often
+  (`bssfork 1 3`: 5/25). Prefer `bssfork` for the regression; it isolates the same
+  defect without the mmap machinery this probe carries for other reasons.
 - `clonearg` — does a freshly cloned thread see the memory its parent wrote
   immediately before `clone()`? Clones raw (musl `__clone`'s exact register
   shape) so the child's first instructions are the ones the rustc thread-spawn

@@ -155,11 +155,13 @@ These are **compile-time** `pub const bool` — toggle in source and rebuild.
 |---|---|---|---|
 | `RUMP_SP_TRACE` | `false` | One line per proxied socket syscall (box, syscall, fd, result). | `config.rs:680` |
 | `SYSCALL_DEBUG_INFO_ENABLED` | `false` | Full syscall tracing — **and** the `[FORK-DBG]`/`[TRAMP]` fork/exec/thread-spawn lifecycle traces (`akuma_exec::process::lifecycle_trace`). | `config.rs:316` |
+| `PIPE_TRACE_ENABLED` | `false` | `[pipe] create` / `clone_ref` / `close_write` / `close_read` refcount lines. Unconditional until 2026-08-08; 6.6k lines in one `-j4` build. These are how the SIGPIPE/close-ordering deadlocks were cracked, so they are one flag away, not gone. `WARN`/`DESTROY` are not gated. | `config.rs:341` |
+| `DEMAND_PAGE_LOG_ENABLED` | `false` | The per-fault `[IA-DP] file region:` trace. **The const existed and was documented here, but had no reader anywhere in the tree** until 2026-08-08 — it gated nothing, while that line printed unconditionally at 34.7k lines per `-j4` build (the single largest source). Now wired to it. Its old docstring claimed `[DA-DP]`/`[DP]`/`[DP-eager]`; those are *anomaly* lines (pool exhausted, OOM, region miss) and stay unconditional by design. | `config.rs:332` |
+| `MEM_SYSCALL_TRACE_ENABLED` | `false` | `[mmap]` / `[mprotect]` per-call lines. **Unconditional until 2026-08-08**, which cost a `-j4` self-host build 68 MB of serial output in 20 minutes (~270 KB/s through one console, four cores contending) and stretched a ~10-minute build past an hour. Turn it on to debug mmap itself, never for timing work. Failures (`EINVAL`, region complaints) are not gated and stay visible. | `config.rs:354` |
 | `TIMER_TICK_HEARTBEAT` | `false` | `[TMR] t=… T=… p=… f=…` from the timer IRQ every 1000 ticks — every **100** while a fork is in progress. | `config.rs:327` |
 | `TRACE_TKILL` | `false` | Per-`tkill` line: target tid, caller slot, disposition, mask, blocked/fatal — plus the pending set at each syscall return. The tool for "a signal was raised but nothing happened". | `config.rs:749` |
 | `FUTEX_DBG_ENABLED` | `false` | Futex diagnostics. | `config.rs:180` |
 | `DEADLOCK_THREAD_DUMP_ENABLED` | `false` | Dumps all threads when a deadlock is suspected. | `config.rs:186` |
-| `DEMAND_PAGE_LOG_ENABLED` | `false` | Demand-paging logs. | `config.rs:268` |
 | `STDOUT_TO_KERNEL_LOG_COPY_ENABLED` | `false` | Mirrors userspace stdout into the kernel log. | `config.rs:289` |
 | `MEM_MONITOR_ENABLED` | `false` | Periodic memory monitor (every `MEM_MONITOR_PERIOD_SECONDS`). | `config.rs:263` |
 

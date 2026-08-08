@@ -316,10 +316,42 @@ pub const SKIP_FILESYSTEM_INIT: bool = false;
 pub const MEM_MONITOR_PERIOD_SECONDS: u64 = 3;
 pub const MEM_MONITOR_ENABLED: bool = false;
 
-/// Gate demand-paging serial prints ([DA-DP] / [DP] / [DP-eager]).
-/// These fire on every page fault; disable for clean TPS benchmarks where the
-/// serial writes would pollute timing (especially during initial model load).
+/// Gate the per-fault demand-paging trace — today the `[IA-DP] file region:` line
+/// on the instruction-abort path, which fires on every file-backed demand page.
+///
+/// This const had **no reader anywhere in the tree** until 2026-08-08: it was
+/// defined here and documented in `config-flags.md`, and gated nothing. Meanwhile
+/// the line above printed unconditionally and was the single largest source of
+/// serial traffic under load — 34.7k lines in one `-j4` self-host build sample.
+///
+/// Its old docstring claimed to gate `[DA-DP]` / `[DP]` / `[DP-eager]`. Those do
+/// exist, but they are *anomaly* lines (readahead pool exhausted, single-page
+/// fallback OOM, anon alloc failed, lazy/eager region miss, kernel-VA fault), and
+/// anomaly lines should not be switchable off — they stay unconditional. Only the
+/// success-path trace is gated here.
 pub const DEMAND_PAGE_LOG_ENABLED: bool = false;
+
+/// Gate the routine pipe lifecycle trace (`[pipe] create` / `clone_ref` /
+/// `close_write` / `close_read`).
+///
+/// Several lines per pipe, and a parallel build makes thousands of them — 6.6k
+/// lines in one `-j4` build sample, second only to the demand-paging trace. The
+/// refcount lines are how the SIGPIPE/close-ordering deadlocks were cracked, so
+/// they stay one flag away rather than deleted. `WARN` and `DESTROY` are NOT gated.
+pub const PIPE_TRACE_ENABLED: bool = false;
+
+/// Gate the per-call memory-syscall trace (`[mmap]` / `[mprotect]` / `[munmap]`).
+///
+/// One line per call, on every call. That is affordable for a single process and
+/// ruinous for a parallel build: an in-VM `-j4` self-host build emitted **68 MB of
+/// serial output in 20 minutes** (~270 KB/s) through the one shared console, which
+/// turned a ~10-minute build into well over an hour and put four cores in
+/// contention for the console lock. The trace was unconditional until 2026-08-08.
+///
+/// Turn it on when working on mmap/mprotect/munmap themselves; leave it off for
+/// anything throughput- or timing-sensitive. Failures and anomalies (`EINVAL`,
+/// region-bookkeeping complaints) are NOT gated by this — they stay visible.
+pub const MEM_SYSCALL_TRACE_ENABLED: bool = false;
 
 /// Enable preemption watchdog
 ///

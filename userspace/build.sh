@@ -173,17 +173,19 @@ echo "mmap_file (C) copied to bootstrap/bin/"
 # 2026-08-05 `flush_tlb_range` ASID bug (mprotect could not downgrade a cached
 # translation); clonearg checks that a cloned thread sees the memory its parent
 # wrote just before the clone. Tiny; built unconditionally.
-echo "Building mprotectlb + clonearg + cowstale (C, thread-spawn/mprotect/CoW probes)..."
+echo "Building mprotectlb + clonearg + cowstale + bssfork (C, thread-spawn/mprotect/CoW probes)..."
 (
     cd forktest/c_stress
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o mprotectlb mprotectlb.c
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -fno-stack-protector -o clonearg clonearg.c
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o cowstale cowstale.c -pthread
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o bssfork bssfork.c -pthread
 )
 cp forktest/c_stress/mprotectlb ../bootstrap/bin/
 cp forktest/c_stress/clonearg ../bootstrap/bin/
 cp forktest/c_stress/cowstale ../bootstrap/bin/
-echo "mprotectlb + clonearg + cowstale (C) copied to bootstrap/bin/"
+cp forktest/c_stress/bssfork ../bootstrap/bin/
+echo "mprotectlb + clonearg + cowstale + bssfork (C) copied to bootstrap/bin/"
 
 # spawnalias: the address-space identity canary for the thread-spawn SIGSEGV
 # class. Unlike clonearg (which proved the clone *handoff* is sound and would

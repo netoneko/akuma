@@ -97,7 +97,9 @@ pub fn pipe_create() -> u32 {
             pollers: PollerMap::new(),
         });
     });
-    crate::safe_print!(64, "[pipe] create id={}\n", id);
+    if crate::config::PIPE_TRACE_ENABLED {
+        crate::safe_print!(64, "[pipe] create id={}\n", id);
+    }
     id
 }
 
@@ -107,10 +109,14 @@ pub fn pipe_clone_ref(id: u32, is_write: bool) {
         if let Some(pipe) = pipes.get_mut(&id) {
             if is_write {
                 pipe.write_count += 1;
-                crate::safe_print!(128, "[pipe] clone_ref id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
+                if crate::config::PIPE_TRACE_ENABLED {
+                    crate::safe_print!(128, "[pipe] clone_ref id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
+                }
             } else {
                 pipe.read_count += 1;
-                crate::safe_print!(128, "[pipe] clone_ref id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
+                if crate::config::PIPE_TRACE_ENABLED {
+                    crate::safe_print!(128, "[pipe] clone_ref id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
+                }
             }
         }
     });
@@ -253,7 +259,9 @@ pub fn pipe_close_write(id: u32) {
         if let Some(pipe) = pipes.get_mut(&id) {
             pipe.write_count = pipe.write_count.saturating_sub(1);
             // Always log close_write so we can trace use-after-close bugs.
-            crate::safe_print!(128, "[pipe] close_write id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
+            if crate::config::PIPE_TRACE_ENABLED {
+                crate::safe_print!(128, "[pipe] close_write id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
+            }
             
             // Notify waiters (EOF is an event)
             if pipe.write_count == 0 {
@@ -278,7 +286,9 @@ pub fn pipe_close_read(id: u32) {
         if let Some(pipe) = pipes.get_mut(&id) {
             pipe.read_count = pipe.read_count.saturating_sub(1);
             // Always log close_read so we can trace use-after-close bugs.
-            crate::safe_print!(128, "[pipe] close_read id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
+            if crate::config::PIPE_TRACE_ENABLED {
+                crate::safe_print!(128, "[pipe] close_read id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
+            }
 
             // Losing the last reader is an event for blocked *writers*, exactly as
             // losing the last writer is one for blocked readers (see the mirror-image

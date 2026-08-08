@@ -2042,45 +2042,76 @@ fn print_write_perm_fault_diag(far: u64, iss: u64, pid: u32, as_owner: u32) {
     let lazy_self = akuma_exec::process::lazy_region_lookup_for_page_fault(pid, far_usize).map(|t| t.0);
     let lazy_owner =
         akuma_exec::process::lazy_region_lookup_for_page_fault(as_owner, far_usize).map(|t| t.0);
+    let eager = akuma_exec::process::eager_region_flags_for_page_fault(pid, far_usize);
+    // The live PTE, decoded. `ap_rw=true` here means the page table ALREADY grants
+    // this write, so the access was legal and the SIGSEGV is spurious — the fault
+    // was taken before some other thread repaired the page and is being judged
+    // after. That is a different defect from "the permission is genuinely missing"
+    // and the two are indistinguishable without this field.
+    let pte = akuma_exec::mmu::user_pte_raw(l0_ptr, page_va);
+    let ap_rw = pte.is_some_and(|p| {
+        p & akuma_exec::mmu::flags::AP_MASK == akuma_exec::mmu::flags::AP_RW_ALL
+    });
     let (_total, _alloc, free) = crate::pmm::stats();
     crate::safe_print!(255,
         "[WPF] pid={} as_owner={} va={:#x} pa={:#x} mapped={} cow_ref={} lazy_self={:#x} \
-         lazy_owner={:#x} have_owner={} free={}\n",
+         lazy_owner={:#x} eager={:#x} pte={:#x} ap_rw={} have_owner={} free={}\n",
         pid, as_owner, page_va,
         pa.unwrap_or(0), pa.is_some(), cow,
         lazy_self.unwrap_or(u64::MAX), lazy_owner.unwrap_or(u64::MAX),
+        eager.unwrap_or(u64::MAX), pte.unwrap_or(0), ap_rw,
         akuma_exec::process::lookup_process_shared(as_owner).is_some(),
         free);
 }
 
-/// Write faults absorbed because the PTE already granted the write — i.e. the
-/// fault came from a stale TLB entry, not a missing permission.
+/// Write faults absorbed because the PTE already granted the write — the access
+/// was legal by the time the handler looked, so the fault was stale.
 pub static STALE_TLB_WRITE_FAULTS: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-/// Times the flush-and-retry did NOT settle it and we fell through to the
-/// permission rewrite. A non-zero value means "PTE says writable" is not the whole
-/// story and this repair is masking something else.
+/// Times the same thread came back to the same VA with the *same* PTE still
+/// granting the write. Retrying did not clear it, so something other than a stale
+/// view is at work and we decline rather than loop. Non-zero wants investigating.
 pub static STALE_TLB_REPEATS: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-/// Last VA each thread absorbed as a stale-TLB fault, and how many times running.
-/// Per thread, so two cores faulting on different pages never confuse each other.
+/// Last (VA, PTE) each thread absorbed, and how many times running. Per thread, so
+/// two cores faulting on different pages never confuse each other. The PTE is part
+/// of the key because a *different* PTE means real work happened in between (a CoW
+/// break installed a new frame, an mprotect rewrote flags) — that is progress, not
+/// a loop, and must not count toward the bound.
 static STALE_TLB_LAST: [core::sync::atomic::AtomicUsize; akuma_exec::threading::types::MAX_THREADS] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; akuma_exec::threading::types::MAX_THREADS];
+static STALE_TLB_LAST_PTE: [core::sync::atomic::AtomicU64; akuma_exec::threading::types::MAX_THREADS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; akuma_exec::threading::types::MAX_THREADS];
 static STALE_TLB_RUN: [core::sync::atomic::AtomicU32; akuma_exec::threading::types::MAX_THREADS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; akuma_exec::threading::types::MAX_THREADS];
 
-/// Should this write fault be repaired by invalidating the TLB rather than by
-/// rewriting permissions?
+/// How many times one thread may absorb a write fault on the same VA with an
+/// unchanged PTE before we stop absorbing. One retry is the expected case (the
+/// instruction re-executes and succeeds); a run means the retry isn't taking.
+const STALE_WRITE_FAULT_RETRY_LIMIT: u32 = 2;
+
+/// Is this write fault already satisfied by the live page table?
 ///
-/// True when the live PTE already grants EL0 write access, which means the page
-/// table is correct and only this core's cached translation is stale. Bounded: if
-/// the same VA comes back more than twice in a row the flush is not resolving it,
-/// so we decline and let the normal repair path run instead of spinning on
-/// fault → flush → retry → fault.
-fn stale_tlb_repair_applies(page_va: usize) -> bool {
-    use core::sync::atomic::Ordering;
+/// A write permission fault says only what the CPU saw *when it took the fault*.
+/// By the time this handler examines the address space, a sibling thread on
+/// another core may already have repaired the page — most often by breaking CoW on
+/// it, which replaces the frame and marks the PTE writable. The loser of that race
+/// arrives holding a fault for a write that is now perfectly legal, and every
+/// downstream repair path declines it: the CoW break sees `cow_ref == 0` (the
+/// winner consumed the reference), and the region lookups find nothing for a VA
+/// that never had an `mmap` record — an ELF `.data`/`.bss` page has none. The
+/// process then dies on a write to its own global variable.
+///
+/// So: re-read the PTE and, if it grants EL0 write access, invalidate and let the
+/// instruction re-execute. This is the page-fault re-check every SMP kernel needs;
+/// Linux does the same thing under the page-table lock (`pte_same`).
+///
+/// Bounded by [`STALE_WRITE_FAULT_RETRY_LIMIT`] on (VA, PTE) so a fault that
+/// genuinely cannot be cleared this way falls through to the normal repair instead
+/// of spinning on fault → retry → fault.
+fn stale_write_fault_absorbed(page_va: usize) -> bool {
     let ttbr0: u64;
     #[cfg(target_os = "none")]
     unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
@@ -2090,25 +2121,44 @@ fn stale_tlb_repair_applies(page_va: usize) -> bool {
         return false;
     }
     let l0 = akuma_exec::mmu::phys_to_virt((ttbr0 & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+    let tid = akuma_exec::threading::current_thread_id();
+    if !stale_write_fault_absorbed_in(l0, page_va, tid) {
+        return false;
+    }
+    // The peer that repaired the page broadcasts its own invalidation, so this is
+    // belt-and-braces — but the fault is already paid for, and a second `tlbi` is
+    // far cheaper than a wrongly-fatal signal if any repair path ever forgets one.
+    akuma_exec::mmu::flush_tlb_page(page_va);
+    true
+}
+
+/// The decision half of [`stale_write_fault_absorbed`], against an explicit L0 and
+/// thread id so the boot suite can drive it without a live TTBR0. Does the
+/// bookkeeping and the counters; the caller does the TLB invalidation.
+pub fn stale_write_fault_absorbed_in(l0: *const u64, page_va: usize, tid: usize) -> bool {
+    use core::sync::atomic::Ordering;
     let Some(pte) = akuma_exec::mmu::user_pte_raw(l0, page_va) else { return false };
     if pte & akuma_exec::mmu::flags::AP_MASK != akuma_exec::mmu::flags::AP_RW_ALL {
         return false;
     }
-    let tid = akuma_exec::threading::current_thread_id();
     if tid >= akuma_exec::threading::types::MAX_THREADS {
         return false;
     }
-    let run = if STALE_TLB_LAST[tid].swap(page_va, Ordering::Relaxed) == page_va {
+    // Both `swap`s must run — short-circuiting the second would leave the stored
+    // PTE stale and make the *next* call compare against the wrong baseline.
+    let same_va = STALE_TLB_LAST[tid].swap(page_va, Ordering::Relaxed) == page_va;
+    let same_pte = STALE_TLB_LAST_PTE[tid].swap(pte, Ordering::Relaxed) == pte;
+    let run = if same_va && same_pte {
         STALE_TLB_RUN[tid].fetch_add(1, Ordering::Relaxed) + 1
     } else {
         STALE_TLB_RUN[tid].store(1, Ordering::Relaxed);
         1
     };
-    if run > 2 {
+    if run > STALE_WRITE_FAULT_RETRY_LIMIT {
         STALE_TLB_REPEATS.fetch_add(1, Ordering::Relaxed);
         crate::safe_print!(160,
-            "[TLB-STALE] va={:#x} still faulting after {} flushes — PTE grants write but the \
-             fault persists; falling through to the permission repair\n", page_va, run - 1);
+            "[TLB-STALE] va={:#x} still faulting after {} retries — PTE grants write but the \
+             fault persists; falling through to the normal repair\n", page_va, run - 1);
         return false;
     }
     STALE_TLB_WRITE_FAULTS.fetch_add(1, Ordering::Relaxed);
@@ -3405,6 +3455,16 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 if is_write {
                     let page_va = far_usize & !(0xFFF);
 
+                    // Did someone already fix this? A sibling thread on another core
+                    // can break CoW on this page between the CPU taking the fault and
+                    // this handler running, which leaves the write legal and every
+                    // repair path below unable to say so — the CoW reference the
+                    // winner consumed is gone, and an ELF `.data`/`.bss` page has no
+                    // region record to fall back on. Ask the page table first.
+                    if stale_write_fault_absorbed(page_va) {
+                        return unsafe { (*frame).x0 };
+                    }
+
                     // Serialize CoW fault handling per-page to prevent races
                     // when multiple CLONE_VM threads fault on the same page.
                     // Holder-tracked so a sibling can reclaim the slot if the
@@ -3518,21 +3578,13 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         == akuma_exec::mmu::flags::AP_RW_ALL
                 {
                     let page_va = far_usize & !(0xFFF);
-                    // Does the PTE ALREADY grant this write? If so the page table is
-                    // fine and the fault came from a stale TLB entry on this core, not
-                    // from a lost permission — so the correct repair is an
-                    // invalidation, not a permission rewrite. (The old repair happened
-                    // to work for exactly this reason: `update_current_user_page_flags`
-                    // ends in `flush_tlb_page`, so it was flushing the TLB while
-                    // appearing to fix flags.) Distinguishing the two matters: a core
-                    // that can hold a stale translation for a VA can also hold one
-                    // pointing at a frame that has since been remapped, and *that*
-                    // sends writes to the wrong page — see
-                    // proposals/CARGO_HEAP_NULL_RC.md.
-                    if stale_tlb_repair_applies(page_va) {
-                        akuma_exec::mmu::flush_tlb_page(page_va);
-                        return unsafe { (*frame).x0 };
-                    }
+                    // "The PTE already grants this write" is handled at the top of the
+                    // write arm now (`stale_write_fault_absorbed`), for every mapping
+                    // rather than only the ones with an eager region — an ELF
+                    // `.data`/`.bss` page has no region at all and was dying here.
+                    // Reaching this point therefore means the PTE really is read-only
+                    // (or the retry bound gave up), so a permission rewrite is the
+                    // right repair, not an invalidation.
                     if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                         #[cfg(kernel_smp_shared)]
                         let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
@@ -4261,8 +4313,10 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
 
 
                     if let akuma_exec::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
-                        crate::tprint!(256, "[IA-DP] file region: fault_va={:#x} seg_va={:#x} filesz={:#x} file_off={:#x}\n",
-                            far_usize, segment_va, filesz, file_offset);
+                        if crate::config::DEMAND_PAGE_LOG_ENABLED {
+                            crate::tprint!(256, "[IA-DP] file region: fault_va={:#x} seg_va={:#x} filesz={:#x} file_off={:#x}\n",
+                                far_usize, segment_va, filesz, file_offset);
+                        }
                         const READAHEAD_PAGES: usize = 256;
                         let region_end = region_start + region_size;
                         let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);

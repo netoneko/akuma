@@ -662,6 +662,10 @@ pub fn run_all_tests() {
     test_cow_ref_ledger_records_history();
     test_madvise_dontneed_range_semantics();
 
+    // A write fault the page table already permits must be absorbed, not turned
+    // into SIGSEGV — the fix for proposals/COWSTALE_FORK_THREAD_SEGV.md.
+    test_stale_write_fault_absorbed();
+
     // Boot-stack reservation is now derived from the linked image size in
     // linker.ld (STACK_BOTTOM / STACK_TOP absolute symbols), replacing the old
     // 3-way per-profile IMAGE_SIZE lockstep. Guard the invariants so a linker.ld
@@ -4583,6 +4587,78 @@ fn test_cow_ref_ledger_records_history() {
         "address outside managed RAM must read as never-shared: {out_of_range:?}");
 
     console::print("[Test] cow_ref_ledger PASSED\n");
+}
+
+/// A write fault on a page the page table ALREADY permits writing must be
+/// absorbed, never escalated to SIGSEGV.
+///
+/// This is the fix for proposals/COWSTALE_FORK_THREAD_SEGV.md. When a threaded
+/// process forks, every thread that writes a shared page faults at once; the first
+/// one through breaks CoW (new frame, PTE now writable, `cow_ref` consumed) and the
+/// rest arrive holding a fault for a write that has since become legal. Nothing
+/// downstream can say so — the CoW break sees `cow_ref == 0`, and an ELF
+/// `.data`/`.bss` page has no `mmap` region to fall back on — so the process died
+/// writing its own global. Re-reading the PTE is what distinguishes "already
+/// repaired" from "genuinely read-only".
+///
+/// Drives the decision function directly against a scratch address space, since a
+/// real EL0 race isn't reproducible from the boot suite. Four properties:
+/// absorb when the PTE grants the write, decline when it does not, decline when
+/// the VA isn't mapped at all, and bound the absorbing so a fault that retrying
+/// cannot clear falls through instead of looping — with the bound keyed on the PTE,
+/// so a page that genuinely changed (a CoW break installing a new frame) gets a
+/// fresh budget rather than inheriting a spent one.
+fn test_stale_write_fault_absorbed() {
+    use akuma_exec::mmu::{self, user_flags};
+    use core::sync::atomic::Ordering;
+
+    const WRITABLE_VA: usize = 0x3000_0000;
+    const READONLY_VA: usize = 0x3000_1000;
+    const UNMAPPED_VA: usize = 0x3000_2000;
+
+    let mut p = make_test_process(994_001);
+    let (Some(rw_frame), Some(ro_frame)) =
+        (crate::pmm::alloc_page_zeroed(), crate::pmm::alloc_page_zeroed())
+    else {
+        console::print("[Test] stale_write_fault_absorbed SKIPPED (no memory)\n");
+        return;
+    };
+    assert!(p.address_space.map_page(WRITABLE_VA, rw_frame.addr, user_flags::RW).is_ok(),
+        "scratch RW mapping failed");
+    assert!(p.address_space.map_page(READONLY_VA, ro_frame.addr, user_flags::RO).is_ok(),
+        "scratch RO mapping failed");
+    let l0 = mmu::phys_to_virt(p.address_space.l0_phys()) as *const u64;
+
+    // This thread's own slot: it is not faulting concurrently, so no peer can
+    // perturb the run counter mid-test.
+    let tid = akuma_exec::threading::current_thread_id();
+    let absorbed = |va| crate::exceptions::stale_write_fault_absorbed_in(l0, va, tid);
+
+    // A read-only page is a genuine permission fault: the handler must decline and
+    // let SIGSEGV (or a real repair) happen. Also resets the run counter for the
+    // budget assertions below, since it changes the (VA, PTE) key.
+    assert!(!absorbed(READONLY_VA), "an RO page must not be absorbed as a stale fault");
+    assert!(!absorbed(UNMAPPED_VA), "an unmapped VA must not be absorbed as a stale fault");
+
+    // The case the probe hits: PTE grants the write, so the fault is stale.
+    assert!(absorbed(WRITABLE_VA), "a write the PTE already permits must be absorbed");
+    assert!(absorbed(WRITABLE_VA), "the second retry is still within budget");
+
+    // Budget spent on an unchanged (VA, PTE): stop absorbing rather than loop.
+    let repeats_before = crate::exceptions::STALE_TLB_REPEATS.load(Ordering::Relaxed);
+    assert!(!absorbed(WRITABLE_VA), "an unchanged PTE must exhaust the retry budget");
+    assert!(crate::exceptions::STALE_TLB_REPEATS.load(Ordering::Relaxed) == repeats_before + 1,
+        "exhausting the budget must be counted");
+
+    // A changed PTE means real work happened in between — the same shape a CoW
+    // break produces — so the budget starts over instead of staying spent.
+    assert!(p.address_space.update_page_flags(WRITABLE_VA, user_flags::RW_NO_EXEC).is_ok(),
+        "flag update failed");
+    assert!(absorbed(WRITABLE_VA), "a changed PTE must get a fresh retry budget");
+
+    if let Some(f) = p.address_space.unmap_and_free_page(WRITABLE_VA) { crate::pmm::free_page(f); }
+    if let Some(f) = p.address_space.unmap_and_free_page(READONLY_VA) { crate::pmm::free_page(f); }
+    console::print("[Test] stale_write_fault_absorbed PASSED\n");
 }
 
 /// `MADV_DONTNEED` zeroes a strict superset of the range Linux would clear when
