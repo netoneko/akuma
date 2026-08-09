@@ -7,9 +7,23 @@ description = "SSH-2 cryptographic primitives for no_std kernels"
 [lints]
 workspace = true
 
+[features]
+# Both on by default so the in-kernel SSH server (crates/akuma-ssh, wrapped
+# into the kernel binary) keeps its existing behavior unchanged. Userspace
+# `sshd` opts out of both (`default-features = false`) to shed the ~30 KB
+# curve25519-dalek precomputed basepoint table and the zeroize machinery,
+# which only pay for themselves on a hot signing/verification path — sshd
+# signs once per connection, so neither speedup is worth its size.
+default = ["fast", "zeroize"]
+# ed25519-dalek's fast basepoint-multiplication tables (curve25519-dalek's
+# `precomputed-tables`, ~30 KB of static data).
+fast = ["ed25519-dalek/fast"]
+# Zero secret key material on drop.
+zeroize = ["ed25519-dalek/zeroize"]
+
 [dependencies]
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
 aes = { version = "0.8", default-features = false }
 ctr = { version = "0.9", default-features = false }
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize", "fast"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }

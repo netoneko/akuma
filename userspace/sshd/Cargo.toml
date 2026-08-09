@@ -19,13 +19,16 @@ akuma = ["dep:libakuma"]
 libakuma = { path = "../libakuma", features = ["net-async"], optional = true }
 # Shared, host-testable SSH-2 wire-format/crypto primitives (also used by the
 # in-kernel SSH server via crates/akuma-ssh) instead of a hand-rolled duplicate.
-akuma-ssh-crypto = { path = "../../crates/akuma-ssh-crypto" }
+# `default-features = false`: sshd doesn't need the fast (precomputed-table)
+# ed25519 basepoint multiplication or key zeroize-on-drop — see the crate's
+# own Cargo.toml for why those stay on by default for the in-kernel server.
+akuma-ssh-crypto = { path = "../../crates/akuma-ssh-crypto", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
 aes = { version = "0.8", default-features = false }
 ctr = { version = "0.9", default-features = false }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
 rand_core = { version = "0.6", default-features = false }
 embedded-io-async = { version = "0.6", default-features = false }
 spinning_top = "0.3"
