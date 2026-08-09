@@ -784,7 +784,20 @@ pub const THREADING_HEARTBEAT_INTERVAL: u64 = 50_000_000; // BSP idle heartbeat 
 /// When enabled, the kernel will spawn /bin/herd as a userspace process
 /// after the network stack is initialized. Herd manages background services
 /// defined in /etc/herd/enabled/.
-pub const AUTO_START_HERD: bool = true;
+/// On by default. The one exception is the 4 MB extreme profile once the
+/// built-in SSH server is compiled out (`userspace-sshd`): there herd plus its
+/// service tree costs more RAM than the box has to spare, and the only service
+/// it would start is `/bin/sshd`, which [`AUTO_START_SSHD`] starts directly.
+pub const AUTO_START_HERD: bool =
+    !(cfg!(kernel_profile_extreme) && cfg!(feature = "userspace-sshd"));
+
+/// Spawn `/bin/sshd` straight from the kernel, with no supervisor.
+///
+/// Only meaningful when there is no built-in SSH server (`userspace-sshd`) and
+/// herd is not running — otherwise herd owns service startup and starting a
+/// second sshd would collide on the listening port. This is what keeps a
+/// herd-less image reachable.
+pub const AUTO_START_SSHD: bool = cfg!(feature = "userspace-sshd") && !AUTO_START_HERD;
 
 /// Multikernel: let **herd** (userspace) manage secondary-core activation.
 ///

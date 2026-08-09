@@ -2648,8 +2648,13 @@ fn test_parallel_processes() -> bool {
     console::print("  Waiting for processes to complete...\n");
     let complete_timeout = 40_000_000; // 40 seconds
     let complete_start = crate::timer::uptime_us();
-    let mut ps_done = false;
-    let mut kthreads_done = false;
+    // Without the in-kernel shell these two checks cannot run at all; start them
+    // satisfied so the loop below does not spin waiting for a result that will
+    // never arrive, and `checks_ok` stays meaningful.
+    #[cfg_attr(not(kernel_builtin_ssh), allow(unused_mut))]
+    let mut ps_done = !cfg!(kernel_builtin_ssh);
+    #[cfg_attr(not(kernel_builtin_ssh), allow(unused_mut))]
+    let mut kthreads_done = !cfg!(kernel_builtin_ssh);
     let mut checks_attempted = false;
 
     loop {
@@ -2678,6 +2683,11 @@ fn test_parallel_processes() -> bool {
         if (!p1_done || !p2_done) && (!ps_done || !kthreads_done) {
             checks_attempted = true;
 
+            // ps/kthreads are checked by running them through the IN-KERNEL shell
+            // pipeline, which exists only alongside the built-in SSH server. With
+            // that gone there is nothing to drive them through, so the checks are
+            // reported as satisfied (see `ps_done`/`kthreads_done` init).
+            #[cfg(kernel_builtin_ssh)]
             if !ps_done {
                 let ps_result =
                     crate::async_tests::run_async_test(async { crate::shell_tests::execute_pipeline_test(b"ps").await });
@@ -2692,6 +2702,7 @@ fn test_parallel_processes() -> bool {
                 }
             }
 
+            #[cfg(kernel_builtin_ssh)]
             if !kthreads_done {
                 let kthreads_result =
                     crate::async_tests::run_async_test(async { crate::shell_tests::execute_pipeline_test(b"kthreads").await });

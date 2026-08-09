@@ -21,6 +21,8 @@ extern crate alloc;
 
 mod akuma;
 mod allocator;
+// Async VFS wrappers used only by the in-kernel shell command set.
+#[cfg(kernel_builtin_ssh)]
 mod async_fs;
 mod audio;
 // mod async_net;
@@ -36,6 +38,8 @@ mod console;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod daif_tests;
 #[cfg(feature = "neko")]
+// In-kernel editor (neko). Reachable only from the built-in SSH shell.
+#[cfg(kernel_builtin_ssh)]
 mod editor;
 // mod embassy_net_driver;
 // mod embassy_time_driver; // replaced by kernel_timer
@@ -71,8 +75,11 @@ mod rump_proxy;
     any(not(feature = "no-tests"), feature = "rump-tests"),
 ))]
 mod rump_tests;
+// In-kernel shell. Its only driver is the built-in SSH session; a userspace
+// sshd image runs a userspace shell instead.
+#[cfg(kernel_builtin_ssh)]
 mod shell;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), kernel_builtin_ssh))]
 mod shell_tests;
 #[cfg(kernel_smp)]
 mod smp;
@@ -93,9 +100,9 @@ mod sync_tests;
 mod ssh;
 #[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), kernel_builtin_ssh))]
 mod ssh_tests;
-// Every image needs some way in: either the built-in server or a userspace one.
-#[cfg(all(not(kernel_builtin_ssh), not(feature = "userspace-sshd")))]
-compile_error!("no in-kernel SSH without `smoltcp`; enable the `userspace-sshd` feature (userspace /bin/sshd)");
+// No compile-time guard on "is there an sshd": every profile except `extreme`
+// now serves SSH from the userspace /bin/sshd, which is a property of the disk
+// and of `config::AUTO_START_HERD`/`AUTO_START_SSHD`, not of the feature set.
 mod syscall;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod tests;
@@ -1089,7 +1096,10 @@ fn kernel_main(dtb_ptr: usize) -> ! {
                                 // Run process execution tests
                                 process_tests::run_all_tests();
 
-                                // Run shell tests (pipelines with /bin binaries)
+                                // Run shell tests (pipelines with /bin binaries).
+                                // Drives the in-kernel command registry, so it is
+                                // present only where that registry is.
+                                #[cfg(kernel_builtin_ssh)]
                                 shell_tests::run_all_tests();
                             }
 
@@ -1448,6 +1458,23 @@ fn run_async_main() -> ! {
     } else {
         (0, None)
     };
+
+    // No supervisor: start the userspace sshd ourselves, or the box has no way in.
+    // Port 22 (the QEMU hostfwd target) with /bin/sh as the login shell — the same
+    // command line herd's sshd.conf would hand it, minus the core pinning.
+    if config::AUTO_START_SSHD && _herd_tid == 0 && fs::is_initialized() {
+        const SSHD_PATH: &str = "/bin/sshd";
+        const SSHD_ARGS: &[&str] = &["--port", "22", "--shell", "/bin/sh"];
+        if fs::exists(SSHD_PATH) {
+            crate::safe_print!(64, "[Main] Starting userspace sshd (no supervisor)...\n");
+            match process::spawn_process(SSHD_PATH, Some(SSHD_ARGS), None) {
+                Ok(tid) => crate::safe_print!(64, "[Main] sshd started (tid={})\n", tid),
+                Err(e) => crate::safe_print!(64, "[Main] ERROR: Failed to start sshd: {}\n", e),
+            }
+        } else {
+            crate::safe_print!(64, "[Main] WARNING: /bin/sshd not found, no SSH available\n");
+        }
+    }
 
     // Loop iteration counter for debugging hangs
     use core::sync::atomic::{AtomicU64, Ordering};

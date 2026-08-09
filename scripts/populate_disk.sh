@@ -253,18 +253,32 @@ if [ -z "$OVERLAY_DIR" ]; then
             # Full applet set by default (not just --full-busybox): every prior
             # session that used this disk without --full-busybox hit missing
             # `sleep`/`ps`/`wc`/`md5sum`/etc — real time lost to `busybox <applet>`
-            # workarounds discovered one command at a time over SSH. busybox'"'"'s own
-            # `--install -s` does exactly what the FULL_BUSYBOX_CMD block below
-            # hand-curates, using the binary'"'"'s actual applet list instead of a
-            # maintained-by-hand one, so make it the default. Never clobbers a real
-            # shipped binary (git->scratch, vi->neatvi, tcc, curl, ...): busybox
-            # itself skips an existing non-symlink target the same way the curated
-            # loop below does. `-s` for symlinks, matching every other link this
-            # script creates (a hardlink set would silently diverge if $BB is ever
-            # replaced without re-running populate).
-            /mnt/disk/bin/$BB --install -s /mnt/disk/bin 2>/dev/null \
-                && echo "Installed full busybox applet set -> $BB (--install -s)" \
-                || echo "WARN: busybox --install failed; only the essential symlinks above exist (pass --full-busybox for the curated fallback list)"
+            # workarounds discovered one command at a time over SSH.
+            #
+            # Do NOT use `busybox --install -s` here. It points every link at the
+            # path busybox was INVOKED as — /mnt/disk/bin/busybox, the mount point
+            # inside this container. That path does not exist in the guest, where
+            # the image is mounted at /, so all ~295 applet links dangle while the
+            # handful written by the loop above (bare relative target) keep working.
+            # That is what left `head`/`wc`/`sed`/`ps` "not found" over SSH on a
+            # disk that visibly had busybox and 300+ symlinks in /bin.
+            #
+            # Use the binary'"'"'s own applet list, but link RELATIVELY, exactly like
+            # the FULL_BUSYBOX_CMD block below.
+            APPLETS="$(/mnt/disk/bin/$BB --list 2>/dev/null || true)"
+            if [ -n "$APPLETS" ]; then
+                for app in $APPLETS; do
+                    # Never clobber a real (non-symlink) binary we ship
+                    # (git->scratch, vi->neatvi, tcc, meow, curl, scratch, ...).
+                    if [ -e /mnt/disk/bin/$app ] && [ ! -L /mnt/disk/bin/$app ]; then
+                        continue
+                    fi
+                    ln -sf $BB /mnt/disk/bin/$app 2>/dev/null || true
+                done
+                echo "Installed full busybox applet set -> $BB (relative links)"
+            else
+                echo "WARN: busybox --list produced nothing; only the essential symlinks above exist (pass --full-busybox for the curated fallback list)"
+            fi
         else
             echo "WARN: no busybox binary on disk; skipping essential busybox symlinks"
         fi

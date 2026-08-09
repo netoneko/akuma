@@ -31,6 +31,7 @@ impl Duration {
         Self { us: secs * 1_000_000 }
     }
 
+    #[cfg(kernel_builtin_ssh)]
     pub const fn from_millis(ms: u64) -> Self {
         Self { us: ms * 1_000 }
     }
@@ -46,8 +47,10 @@ impl Duration {
 
 /// Error returned when a future times out
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(kernel_builtin_ssh)]
 pub struct TimeoutError;
 
+#[cfg(kernel_builtin_ssh)]
 impl core::fmt::Display for TimeoutError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "timeout")
@@ -252,6 +255,7 @@ pub fn init() {
 
 /// Wrap a future with a timeout. Returns `Err(TimeoutError)` if the deadline
 /// elapses before the inner future completes.
+#[cfg(kernel_builtin_ssh)]
 pub async fn with_timeout<F: Future>(
     duration: Duration,
     future: F,

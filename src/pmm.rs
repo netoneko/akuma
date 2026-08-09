@@ -94,6 +94,10 @@ impl FrameTracker {
         }
     }
 
+    // Frame-leak diagnostic. Its only in-tree caller was the built-in shell's
+    // memory command; kept because it pairs with DEBUG_FRAME_TRACKING and is what
+    // you reach for from the debugger when frames go missing.
+    #[allow(dead_code)]
     fn leak_count(&self) -> usize {
         self.allocations.len()
     }
@@ -114,6 +118,9 @@ impl FrameTracker {
 
 /// Statistics from frame tracking
 #[derive(Debug, Clone)]
+// A full diagnostic snapshot: the periodic report prints some of these, the rest
+// are read from the debugger / by whoever is chasing a frame leak.
+#[allow(dead_code)]
 pub struct FrameTrackingStats {
     pub current_tracked: usize,
     pub kernel_count: usize,
@@ -152,6 +159,7 @@ pub fn tracking_stats() -> Option<FrameTrackingStats> {
 }
 
 /// Get number of potentially leaked frames (only meaningful if DEBUG_FRAME_TRACKING is enabled)
+#[allow(dead_code)]
 pub fn leak_count() -> usize {
     if DEBUG_FRAME_TRACKING {
         FRAME_TRACKER.lock().leak_count()

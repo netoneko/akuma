@@ -9,6 +9,10 @@
 //! - Command chaining via `;` and `&&` operators
 //! - Output redirection via `>` and `>>`
 
+// The in-kernel command set exists only to serve the built-in SSH shell
+// (src/ssh/protocol.rs) and the boot suite that drives it. Both go with the
+// built-in server, and so does this.
+#[cfg(kernel_builtin_ssh)]
 pub mod commands;
 
 use alloc::format;
