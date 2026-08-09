@@ -54,6 +54,13 @@ ssh -o StrictHostKeyChecking=no -p 2222 root@localhost
 Port derives from `INSTANCE` (host `2222` → guest `:22` for INSTANCE=0). For
 the devbox/rump, use `-p 2223` (`RUMP_SSH_PORT`).
 
+> **`-p 2222` only answers on `extreme-size` right now.** That is the one
+> profile still carrying the built-in (guest `:22`) SSH server. Every other
+> profile serves SSH from the userspace `/bin/sshd`, which herd starts on guest
+> `:23` per `bootstrap/etc/herd/enabled/sshd.conf` — so connect with **`-p 2323`**
+> and expect `Connection reset by peer` on 2222. Background and the pending
+> decision: [`../archive/BUILTIN_SSH_REMOVAL.md`](../archive/BUILTIN_SSH_REMOVAL.md).
+
 After a disk rebuild (new host key): `ssh-keygen -R "[localhost]:2222"`.
 
 ## Verify

@@ -17,6 +17,9 @@ use spinning_top::Spinlock;
 use crate::smoltcp_net::{self, SocketHandle, with_network};
 #[cfg(feature = "smoltcp")]
 use crate::runtime::runtime;
+// Only `with_table` uses this, and that is smoltcp-only — without the gate a
+// rump-only build (scripts/build_devbox.sh) fails on `unused_imports = "deny"`.
+#[cfg(feature = "smoltcp")]
 use crate::runtime::PreemptGuard;
 #[cfg(feature = "smoltcp")]
 use smoltcp::socket::tcp;

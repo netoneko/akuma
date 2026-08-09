@@ -9,9 +9,53 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 536
-- **Docs contributing at least one fix:** 158
+- **Total distinct fixes counted:** 539
+- **Docs contributing at least one fix:** 160
 - **Subsystem categories:** 15
+
+Updated 2026-08-10 (branch `trim-fat-sshd`, second entry): +3 fixes / +2 docs —
+`docs/archive/BUILTIN_SSH_REMOVAL.md`. The fix is in
+`scripts/populate_disk.sh`: `busybox --install -s /mnt/disk/bin` links every
+applet to the path busybox was *invoked* as, i.e. the populate container's
+mount point, so 295 of the 304 symlinks in `/bin` dangled in the guest
+(`/bin/head -> /mnt/disk/bin/busybox`). Only the 9 written by the curated
+`ln -sf $BB` loops — relative targets — worked, which is why `/bin/sh` ran fine
+while `head`/`wc`/`sed`/`awk`/`ps` were "not found" on a disk that visibly had
+busybox and 300+ links. Replaced with `busybox --list` + relative `ln -sf`;
+verified on a repopulated image: 0 dangling, 304 total, all applets execute.
+Deterministic on every populate, not a double-run artifact.
+
+The second fix, from the same doc: the `[TESTS] low-mem … skipping boot
+self-test suite` message was printed with no `cfg` guard, so every `no-tests` /
+`size` image — which never compiled a suite at all — claimed at boot that it had
+skipped one. The extreme boot log had been saying this for months. The decision
+and its message now sit inside a block gated on the same
+`not(any(feature = "no-tests", kernel_profile_size))` as the suite itself;
+verified as 0 occurrences in a fresh 4.5 MB extreme boot that still reaches SSH.
+
+The third fix belongs to `docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md`:
+`scripts/build_devbox.sh` (the rump-only devbox, one of seven documented build
+targets) had been failing outright on `unused import:
+crate::runtime::PreemptGuard` (`crates/akuma-net/src/socket.rs:20`). The
+import's only consumer is `with_table`, which is `#[cfg(feature = "smoltcp")]`;
+the import carried no gate, so it was unused on exactly and only a build without
+the native stack. Given `unused_imports = "deny"` workspace-wide, that target had
+been unbuildable — pre-existing, confirmed by stashing this branch and
+reproducing. Import now carries its use site's gate; `build_devbox.sh` produces a
+1.8 MB image again. That doc's other findings (profile/feature pairing unenforced,
+`kernel_profile_size` also meaning extreme, stale size table, missing acceptance
+coverage for four targets, profile-dependent boot markers with profile-blind
+consumers) are observations, not fixes, and are uncounted.
+
+That doc's primary subject — compiling the in-kernel SSH server out of every
+profile but `extreme` — is a **removal/refactor, not a bugfix**, and is not
+counted here. Neither is the third defect it surfaced, which remains open and
+now has its own write-up: `docs/archive/FPCACHE_UNDERSIZED_AT_LOW_RAM.md`, the
+file-page dedup cache capped at `RAM/8` (`src/file_page_cache.rs:104`) — 144
+pages at 4.5 MB against busybox's 273, so `evict` tracks `misses` at 99%,
+concurrent busybox instances stop sharing text, and the box dies on `fork` with
+no `[OOM]` line. Zero-count, listed here so the doc is not mistaken for an
+omission.
 
 Updated 2026-08-10 (branch `rewrite-sshd-libc`): +1 fix / +1 doc —
 `userspace/sshd/docs/PROTOCOL_UNDER_LOAD.md`, an unauthenticated remote crash

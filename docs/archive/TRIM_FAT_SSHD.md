@@ -185,6 +185,16 @@ pursued this round:
 
 ## The in-kernel SSH server is a candidate for removal, not just trimming
 
+> **Outcome (2026-08-10, branch `trim-fat-sshd`).** This is what happened: the
+> built-in server is now compiled out of every profile except `extreme-size`,
+> behind `cfg(kernel_builtin_ssh)`. Measured 217 KB off the extreme image,
+> 1.26 MB off default `--release`, and +308 KB of free RAM at the 4 MB floor.
+> The section below is the original argument, kept verbatim; the measurement,
+> the gating, and the two defects it surfaced are in
+> [`BUILTIN_SSH_REMOVAL.md`](BUILTIN_SSH_REMOVAL.md). The pre-auth panic
+> described below is **still unfixed** in `crates/akuma-ssh`.
+
+
 Everything above trims `userspace/sshd`. But there are **two** independent SSH-2
 server implementations in this codebase: the userspace one (`userspace/sshd` +
 `crates/akuma-ssh-crypto`) and a separate **built-in, in-kernel** one

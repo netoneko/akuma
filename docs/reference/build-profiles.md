@@ -19,11 +19,11 @@ feature (`build.rs` cannot see `OPT_LEVEL` to distinguish them).
 
 | Target | Profile | Build command | Binary size | Networking | Purpose |
 |---|---|---|---|---|---|
-| **release** (default) | `release` | `cargo build --release` / `cargo run --release` | 3.8 MB | smoltcp (native) + built-in SSH | Day-to-day development image. Full feature set: editor, sound, TLS (RSA + Ed25519), rump *available* (opt-in per box), all `sc-*` syscall families. |
-| **size** | `size` (inherits `release`) | `scripts/build_size.sh` | 882 KB text | smoltcp + built-in SSH + `kernel-tls` | Slimmer image for constrained VMs. Drops `neko` and `tls-rsa` (RSA-only HTTPS breaks; SSH is Ed25519-only and unaffected). Keeps every `sc-*` family. |
-| **extreme-size** | `extreme-size` (inherits `size`) | `scripts/build_extreme_size.sh` | 684 KB text | smoltcp + built-in SSH, **no HTTPS** | 4 MB RAM floor target. Same codegen knobs as `size`; the *only* discriminator is the `extreme` feature, since both profiles use `opt-level = "z"`. Drops `kernel-tls` entirely (no in-kernel `curl https://`), `neko`, `tls-rsa`, tighter stack/heap constants via `cfg(kernel_profile_extreme)`. Compiles again since `fix-extreme-size` — see [Fixed](#fixed-extreme-size-build-breakage-was-broken-at-d3f28d6). |
-| **release-smp** | `release-smp` (inherits `release`) | `cargo build --profile release-smp --features smp` | 2.9 MB | smoltcp + built-in SSH | Multikernel / one-kernel-per-core (see `docs/reference/subsystems/smp.md`). Off by default — `cargo build --release` is byte-for-byte single-core; this target adds secondary-core bringup, PSCI `CPU_ON`, the inter-core message bus. |
-| **release-smp-shared** | `release-smp-shared` (inherits `release`) | `cargo build --profile release-smp-shared --features smp-shared` | 4.0 MB | smoltcp + built-in SSH | Real (shared-kernel) SMP — one shared kernel across cores (see `docs/reference/subsystems/smp-shared.md`). The **inverse** of `release-smp`: all cores share one kernel/PMM/heap/run-queue under real locks. Mutually exclusive with `smp` (build.rs panics if both). |
+| **release** (default) | `release` | `cargo build --release` / `cargo run --release` | 3.1 MB | smoltcp (native) + userspace `/bin/sshd` | Day-to-day development image. Full feature set: editor, sound, TLS (RSA + Ed25519), rump *available* (opt-in per box), all `sc-*` syscall families. |
+| **size** | `size` (inherits `release`) | `scripts/build_size.sh` | 882 KB text | smoltcp + userspace `/bin/sshd` + `kernel-tls` | Slimmer image for constrained VMs. Drops `neko` and `tls-rsa` (RSA-only HTTPS breaks; SSH is Ed25519-only and unaffected). Keeps every `sc-*` family. |
+| **extreme-size** | `extreme-size` (inherits `size`) | `scripts/build_extreme_size.sh` | 578 KB text | smoltcp + **built-in SSH (the only profile that keeps it)**, **no HTTPS** | 4 MB RAM floor target. Same codegen knobs as `size`; the *only* discriminator is the `extreme` feature, since both profiles use `opt-level = "z"`. Drops `kernel-tls` entirely (no in-kernel `curl https://`), `neko`, `tls-rsa`, tighter stack/heap constants via `cfg(kernel_profile_extreme)`. Compiles again since `fix-extreme-size` — see [Fixed](#fixed-extreme-size-build-breakage-was-broken-at-d3f28d6). |
+| **release-smp** | `release-smp` (inherits `release`) | `cargo build --profile release-smp --features smp` | 2.9 MB | smoltcp + userspace `/bin/sshd` | Multikernel / one-kernel-per-core (see `docs/reference/subsystems/smp.md`). Off by default — `cargo build --release` is byte-for-byte single-core; this target adds secondary-core bringup, PSCI `CPU_ON`, the inter-core message bus. |
+| **release-smp-shared** | `release-smp-shared` (inherits `release`) | `cargo build --profile release-smp-shared --features smp-shared` | 4.0 MB | smoltcp + userspace `/bin/sshd` | Real (shared-kernel) SMP — one shared kernel across cores (see `docs/reference/subsystems/smp-shared.md`). The **inverse** of `release-smp`: all cores share one kernel/PMM/heap/run-queue under real locks. Mutually exclusive with `smp` (build.rs panics if both). |
 | **devbox** | `devbox` (inherits `release`) | `scripts/build_devbox.sh` / `overlays/devbox/run.sh` | 1.4 MB | **rump only** (no smoltcp, no built-in SSH) | *(deferred — see `devbox-smoltcp`.)* Rump-stack workstation image: NetBSD rump as box 0's default stack, built-in SSH dropped. `--no-default-features`, so smoltcp (and `kernel-tls`/`tls-rsa`/built-in SSH) is compiled out. |
 | **devbox-smoltcp** (default devbox) | `release-smp-shared` | `scripts/build_devbox_smoltcp.sh` / `overlays/devbox/run-smoltcp.sh` | 1.7 MB | smoltcp (native) + userspace `/bin/sshd`, **no built-in SSH** | The **default** "develop inside Akuma" image (2026-07-19). Native smoltcp stack for box 0 + real shared-kernel SMP (`SMP=N`); built-in SSH dropped (`userspace-sshd`) so the userspace `/bin/sshd` (herd) over smoltcp is the only sshd. Keeps the default feature set (smoltcp/`kernel-tls` stay in). rump_server work is deferred. |
 
@@ -102,58 +102,71 @@ That is enough to move a timing-sensitive race, so reach for this profile only
 once you're past the hunting phase and just want lldb to show source lines and
 locals instead of addresses.
 
-## What `userspace-sshd` actually does
+## Which profile has a built-in SSH server
 
-`userspace-sshd` (used by `devbox` and `devbox-smoltcp`) does **not** compile the
-built-in SSH server out, and does not measurably shrink the image. It only sets
+Since `trim-fat-sshd`, exactly one: **`extreme-size`**. Every other profile —
+`release`, `size`, `release-smp`, `release-smp-shared`, `devbox`,
+`devbox-smoltcp` — serves SSH from the userspace `/bin/sshd` and compiles the
+in-kernel server out entirely.
 
-```rust
-pub const ENABLE_USERSPACE_SSHD: bool = cfg!(feature = "userspace-sshd");  // src/config.rs:775
-```
+The gate is `cfg(kernel_builtin_ssh)`, emitted by `build.rs` when
+`smoltcp && extreme && !userspace-sshd`. Extreme keeps it so a 4 MB box can be
+reachable with nothing on disk but a kernel; `userspace-sshd` opts even extreme
+out on top of that.
 
-a runtime `const`, which dead-codes the *startup* branch at `src/main.rs:1409`.
-The SSH code stays reachable through three other paths:
+> **This used to be a runtime switch and is no longer.** `userspace-sshd` only
+> set `config::ENABLE_USERSPACE_SSHD`, which skipped the *startup* branch while
+> `crates/akuma-ssh`, `src/ssh/` and the in-kernel shell stayed linked in. An
+> earlier revision of this doc estimated removal would save ≤34 KB, attributing
+> only `akuma::ssh` + `akuma-ssh*` symbols. That undercounted by 6×, because it
+> missed everything that exists *solely to serve* an SSH session.
 
-| site | reference |
-|---|---|
-| `src/main.rs:1404` | `ssh::init_host_key()` — unconditional under `smoltcp` |
-| `src/main.rs:1827` | `ssh::server::stats()` — the main-loop status line |
-| `src/shell/mod.rs:24` | `use crate::ssh::protocol::SshChannelStream` |
+### What goes with it
 
-The last is the real coupling: the in-kernel shell is written against the SSH
-channel stream, so dropping SSH means giving the shell another transport.
-Compiling SSH out is a `#[cfg]`-gating change, not a feature flip. (The rump
-`devbox` *does* lose it, but as a side effect of dropping `smoltcp` — the built-in
-server is smoltcp-only, so `#[cfg(feature = "smoltcp")]` takes it.)
+The built-in SSH session is the only consumer of the **entire in-kernel shell**.
+Gating the server alone orphans 118 items on extreme and 122 on
+`devbox-smoltcp`, so these are gated on the same cfg: `src/ssh/`, `src/shell/`
+(including all of `commands/`), `src/async_fs.rs`, `src/editor/` (neko),
+`src/ssh_tests.rs`, `src/shell_tests.rs`, plus leaf helpers in `fs`, `vfs`,
+`kernel_timer` and `akuma`. On a build with the boot suite on, only ~8 items go
+dead without the gate — the tests are what keep the shell alive there.
 
-### In-kernel SSH vs. userspace sshd, by the numbers
+Consequence worth knowing: **a non-extreme image has no in-kernel shell.** SSH
+sessions get a userspace shell (`/bin/sh`) via `/bin/sshd`, and there is no
+kernel-side fallback if `/bin/sshd` is missing from the disk.
 
-Relevant when deciding what belongs in a 4 MB image. Measured on the `size`
-profile:
+### By the numbers (measured, not attributed)
 
-| | bytes |
-|---|---|
-| in-kernel SSH, attributed symbols (`akuma::ssh` + `akuma-ssh*`) | 34,853 |
-| crypto shared by SSH and `kernel-tls` (`curve25519_dalek`, `ed25519_dalek`, `sha2`, `aes`, …) | 63,580 |
-| `bootstrap/bin/sshd`, loadable image (`PT_LOAD` memsz, static musl) | 145,148 |
-| `bootstrap/bin/sshd`, on disk | 152,120 |
+`extreme-size`, same commit, built both ways:
 
-Two profile-specific consequences:
+| | built-in SSH | compiled out | delta |
+|---|---|---|---|
+| `.text` | 591,464 | 443,320 | −148,144 (−25%) |
+| `.rodata` | 108,303 | 37,055 | −71,248 (−66%) |
+| file on disk | 803,912 | 586,776 | **−217,136 (−27%)** |
 
-- **On `size` (keeps `kernel-tls`)** the crypto serves both SSH and outbound
-  HTTPS, so it cannot be charged to SSH. Removing the built-in server saves ≤34 KB
-  of ~882 KB text.
-- **On `extreme-size` (drops `kernel-tls`)** that same crypto is SSH-only, so
-  SSH's real cost is much closer to 34 + 62 KB — and correspondingly, the
-  `kernel-tls` drop saves less than its own footprint suggests, because SSH keeps
-  most of the crypto alive regardless.
+Default `--release` (unstripped, no LTO, so the same source costs more):
+**4,506,736 → 3,251,312 bytes, −1,255,424 (−27.9%)**.
 
-Either way, the kernel image shrinking does not mean the *system* footprint
-shrinks: the userspace replacement is a 142 KB loadable image plus runtime heap,
-thread stacks, page tables, the ext2 disk to hold it, and herd supervision —
-against a 4 MB floor whose boot-stack reservation is itself derived from the
-linked image size in `linker.ld`. Runtime RSS of `/bin/sshd` is unmeasured; that
-is the missing number for deciding.
+Free RAM at the 4 MB floor, steady state with disk + herd: **456 KB → 764 KB
+(+308 KB)**. That decomposes exactly as 213 KB of image plus 96 KB for the SSH
+server's system-thread stack, which is never spawned. The image shrink converts
+to free RAM 1:1 — the kernel image occupies PMM pages, so `Code+Stack` loses
+precisely the pages `User pages` gains.
+
+Dropping herd as well (possible only now that `config::AUTO_START_SSHD` can
+start `/bin/sshd` without a supervisor) takes 4.5 MB idle free RAM from 968 KB
+to **2712 KB**. Full derivation, including the herd-less measurement and two
+defects it surfaced: [`../archive/BUILTIN_SSH_REMOVAL.md`](../archive/BUILTIN_SSH_REMOVAL.md).
+
+### Ports
+
+`bootstrap/etc/herd/enabled/sshd.conf` still starts the userspace sshd on
+**port 23** (host `2323`), a choice made when the built-in server owned port 22.
+On every non-extreme image port 22 is now free but nothing binds it, so
+`ssh -p 2222` does not answer — use `-p 2323`. Flipping the config to 22 would
+collide on extreme, which runs the built-in server there *and* starts herd.
+Unresolved.
 
 ## Fixed: `extreme-size` build breakage (was broken at `d3f28d6`)
 
@@ -204,6 +217,13 @@ from `--no-default-features` (unlike `size`/`extreme`/`devbox`). `smp` and
 - **Working inside Akuma as a Unix box (self-hosted toolchain, editor, daily use)** → `devbox-smoltcp` (the default devbox: native smoltcp + real SMP; `overlays/devbox/run-smoltcp.sh`). The rump `devbox` is deferred but still boots via `overlays/devbox/run.sh` (needs `RUMP_NIC=1`).
 - **Exercising real (shared-kernel) SMP** → `release-smp-shared` (`--features smp-shared`); see `docs/reference/subsystems/smp-shared.md`.
 - **Exercising the multikernel (one-kernel-per-core) bringup** → `release-smp`, gated behind the §10/§11 acceptance test in `docs/MULTIKERNEL.md`.
+
+## Known inconsistencies
+
+Profile/feature pairing is enforced only by the build scripts, `kernel_profile_size`
+is also emitted for `extreme`, the size column is hand-maintained, and four of the
+seven targets have no acceptance coverage. Catalogued with evidence in
+[`../archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md`](../archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md).
 
 ## Background
 

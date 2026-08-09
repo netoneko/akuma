@@ -1,7 +1,16 @@
 # SSH
 
 Current-state architecture for both SSH servers: the built-in in-kernel sshd
-(smoltcp) and the userspace sshd (devbox).
+(smoltcp) and the userspace sshd.
+
+> **Where each one exists (since `trim-fat-sshd`).** The built-in server is
+> compiled into the **`extreme-size` profile only**, behind
+> `cfg(kernel_builtin_ssh)` (`smoltcp && extreme && !userspace-sshd`). Every
+> other profile — `release`, `size`, `release-smp`, `release-smp-shared`,
+> `devbox`, `devbox-smoltcp` — serves SSH from the userspace `/bin/sshd` and has
+> **no in-kernel shell at all**, since the built-in session was its only driver.
+> Removing it is worth 217 KB of `extreme` image and +308 KB of free RAM at the
+> 4 MB floor; see [`../../archive/BUILTIN_SSH_REMOVAL.md`](../../archive/BUILTIN_SSH_REMOVAL.md).
 
 > **Stability: A (stable).** Low per-doc churn; the echo path is sub-ms after
 > the waker/poll fixes. Open items are minor: command chaining,
@@ -19,6 +28,10 @@ KEX `curve25519-sha256`; host key `ssh-ed25519`; encryption `aes128-ctr`; MAC
 rejected)**. Up to 4 concurrent sessions (`MAX_CONNECTIONS`).
 
 ## Built-in in-kernel SSH server
+
+**`extreme-size` only** — everything in this section is behind
+`cfg(kernel_builtin_ssh)`, along with `src/shell/` (the in-kernel command set),
+`src/async_fs.rs` and `src/editor/`, which exist solely to serve this session.
 
 `src/ssh/`:
 - `server.rs` — accept loop on a system thread; counter bookkeeping; `block_on`;
@@ -75,7 +88,23 @@ ShellSession → Disconnected`.
 - **`yield_now()` helper** — **must** be used instead of `sleep_ms` inside
   session futures (`sleep_ms` parks the entire OS thread, starving all other
   sessions).
-- Used by the **devbox** image.
+- Used by **every profile except `extreme-size`**.
+- **Started two different ways.** Normally herd launches it from
+  `/etc/herd/enabled/sshd.conf` — which still says `--port 23`, so those images
+  answer on host port **2323**, not 2222 (a leftover from when the built-in
+  server owned 22). On `extreme + userspace-sshd` there is no herd, and
+  `config::AUTO_START_SSHD` spawns `/bin/sshd --port 22 --shell /bin/sh` directly
+  from `kernel_main`.
+
+### Known: unauthenticated pre-auth panic
+
+`crates/akuma-ssh/src/packet.rs:83` computes `packet_len - padding_len - 1`
+unchecked in `process_unencrypted_packet`; a single malformed pre-auth packet
+underflows it. In the **in-kernel** server that panic is at EL1 with
+`panic=abort` — no process boundary, so it takes the whole VM down (confirmed
+with a 10-byte crafted packet). The encrypted-path sibling in the same file
+already bounds-checks. Fixed in the userspace server
+(`userspace/sshd/docs/PROTOCOL_UNDER_LOAD.md`), **still open** in the kernel one.
 
 ## Auth model
 
@@ -109,6 +138,10 @@ ShellSession → Disconnected`.
 
 ## Background
 
+- `archive/BUILTIN_SSH_REMOVAL.md` — why the built-in server is extreme-only,
+  with the size/RAM measurements.
+- `archive/TRIM_FAT_SSHD.md` — userspace sshd size work (−24% via dropping
+  `curve25519-dalek` precomputed tables).
 - `archive/SSH.md`, `archive/SSH_STREAMING_ARCHITECTURE.md`.
 - `archive/RICH_TERMINAL_INTERFACE_OVER_SSH.md`, `archive/INTERACTIVE_IO.md`.
 - `userspace/sshd/docs/FLOW.md`, `userspace/sshd/docs/LIMITATIONS.md`.

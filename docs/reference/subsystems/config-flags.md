@@ -87,6 +87,14 @@ re-add what they need. `Cargo.toml:208-216`.
 | `fs-cache` | Large ext2 block cache (clock eviction) — keeps toolchain resident across spawns. **In `default`**, so any build that doesn't pass `--no-default-features` has it. Cap set at mount by `src/fs.rs` as `min(RAM/8, 384 MB)` (ceiling raised from 128 MB 2026-08-05; see the sizing table there). Observe it via the `[FSCACHE]` PSTATS line. Not combinable with `extreme`. | `Cargo.toml:133` |
 | `smp` | Multikernel / one-kernel-per-core. Emits `cfg(kernel_smp)` via build.rs. Paired with `release-smp`. | `Cargo.toml:138` |
 | `no-tests` | Drops boot self-test suites; sets `akuma-net/small-sockets`. | `Cargo.toml:128` |
+| `userspace-sshd` | Compiles the built-in SSH server **out** (with the whole in-kernel shell behind it) and turns herd off on `extreme`, so `AUTO_START_SSHD` starts `/bin/sshd` directly. Implied by `devbox`/`devbox-smoltcp`. | `Cargo.toml:435` |
+
+#### build.rs-emitted cfgs for the above
+
+| cfg | Emitted when | Gates |
+|---|---|---|
+| `kernel_builtin_ssh` | `smoltcp && extreme && !userspace-sshd` — i.e. the `extreme-size` profile only | `src/ssh/`, `src/shell/` (incl. `commands/`), `src/async_fs.rs`, `src/editor/`, `src/ssh_tests.rs`, `src/shell_tests.rs`, plus leaf helpers in `fs`/`vfs`/`kernel_timer`/`akuma`. See [`build-profiles.md`](../build-profiles.md#which-profile-has-a-built-in-ssh-server). |
+| `kernel_tests` | `!no-tests && OPT_LEVEL != "z"` | Kernel APIs the boot suite needs that would otherwise be shell-only — used as `#[cfg(any(kernel_builtin_ssh, kernel_tests))]` on `fs::append_file` / `vfs::append_file`. Mirrors the `not(any(feature = "no-tests", kernel_profile_size))` condition `main.rs` repeats throughout. |
 
 ### SMP / Big Kernel Lock
 
@@ -186,6 +194,14 @@ These are **compile-time** `pub const bool` — toggle in source and rebuild.
 | `NETWORK_THREAD_RATIO` | `4` | Scheduler weight for the network thread. | `config.rs:222` |
 | `MAIN_THREAD_PRIORITY_BOOST` | `false` | Legacy; proportional scheduler is now default. | `config.rs:207` |
 | `ENABLE_PREEMPTION_WATCHDOG` | `true` | | `config.rs:275` |
+
+### Service autostart
+
+| Knob | Default | Effect | Source |
+|---|---|---|---|
+| `AUTO_START_HERD` | `!(extreme && userspace-sshd)` | Spawn `/bin/herd daemon` after the network comes up. Off **only** in the extreme+`userspace-sshd` combination, where herd plus its service tree costs more RAM than a 4 MB box has to spare. | `config.rs` |
+| `AUTO_START_SSHD` | `userspace-sshd && !AUTO_START_HERD` | Spawn `/bin/sshd --port 22 --shell /bin/sh` straight from `kernel_main` when there is no supervisor and no built-in server — otherwise the image has no way in. Never both this and herd's sshd (they would collide on the port). | `config.rs` |
+| `ENABLE_USERSPACE_SSHD` | `cfg!(feature = "userspace-sshd")` | Legacy runtime flag. Now only meaningful on `extreme`, the one profile that still *has* a built-in server to suppress. | `config.rs` |
 
 ### Test gates (boot self-tests)
 

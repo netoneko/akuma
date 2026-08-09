@@ -987,15 +987,21 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // suite so small RAM boots to SSH — the heuristics are still covered by the
     // pure compute_heap_size/compute_thread_limit unit tests on larger configs,
     // and production uses DISABLE_ALL_TESTS anyway. See docs/LOW_MEMORY_ENVIRONMENT.md.
-    let low_mem_skip_tests = config::LOW_MEM_TEST_SKIP_MB != 0
-        && ram_size <= config::LOW_MEM_TEST_SKIP_MB * 1024 * 1024;
+    //
+    // Both the decision and its message live under the same cfg as the suite
+    // itself: on a `no-tests`/size image there is no suite to skip, and printing
+    // that we skipped one is a lie the extreme boot log told for months.
     #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
-    let boot_tests_enabled = !config::DISABLE_ALL_TESTS && !low_mem_skip_tests;
-    if low_mem_skip_tests {
-        crate::safe_print!(128,
-            "[TESTS] low-mem ({} MB <= {} MB): skipping boot self-test suite\n",
-            ram_size / 1024 / 1024, config::LOW_MEM_TEST_SKIP_MB);
-    }
+    let boot_tests_enabled = {
+        let low_mem_skip_tests = config::LOW_MEM_TEST_SKIP_MB != 0
+            && ram_size <= config::LOW_MEM_TEST_SKIP_MB * 1024 * 1024;
+        if low_mem_skip_tests {
+            crate::safe_print!(128,
+                "[TESTS] low-mem ({} MB <= {} MB): skipping boot self-test suite\n",
+                ram_size / 1024 / 1024, config::LOW_MEM_TEST_SKIP_MB);
+        }
+        !config::DISABLE_ALL_TESTS && !low_mem_skip_tests
+    };
 
     // Run DAIF / IRQ-mask tests first — these verify the foundational
     // invariants that every later subsystem relies on. See
