@@ -92,6 +92,16 @@ until grep -q "SSH Server\] Listening" 01_verify_apk_bootstrap_acceptance.log 2>
 
 If the VM wedges (100% CPU, unresponsive), see `docs/runbooks/recover-wedged-vm.md`.
 
+## Kernel conventions
+
+**Console output must use `safe_print!` / `tprint!`.** No heap allocation on
+any path that ends at the console — no `format!`, no `String`, no hand-rolled
+stack writer, and no `-> String` helper feeding a print. The console is what
+survives when the allocator is what broke. Exemptions (variable-cardinality
+loops, no-runtime-registered paths) and the reasoning are in
+`docs/reference/subsystems/console.md` § "Printing rules"; the violations that
+motivated the rule are in `docs/archive/ALLOC_PRINT_AUDIT.md`.
+
 ## Testing
 
 Host unit tests (crates only):

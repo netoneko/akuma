@@ -77,7 +77,7 @@ use akuma_terminal as terminal;
 
 use self::image::{compute_heap_lazy_size, LAZY_STACK_MAX};
 
-pub(crate) struct FmtBuf<'a> { buf: &'a mut [u8], pos: &'a mut usize }
+pub(crate) struct FmtBuf<'a> { pub(crate) buf: &'a mut [u8], pub(crate) pos: &'a mut usize }
 impl core::fmt::Write for FmtBuf<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         let bytes = s.as_bytes();
@@ -870,12 +870,8 @@ impl Process {
         if let Some(owner) = table::pid_for_thread(tid)
             && owner != self.pid
         {
-            let mut buf = [0u8; 128];
-            let mut pos = 0usize;
-            let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                format_args!("[RUN-REFUSED] tid={} belongs to pid={} but pid={} tried to run it\n",
-                    tid, owner, self.pid));
-            if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+            crate::safe_print!(128, "[RUN-REFUSED] tid={} belongs to pid={} but pid={} tried to run it\n",
+                tid, owner, self.pid);
             crate::threading::mark_current_terminated();
             loop { crate::threading::yield_now(); }
         }
@@ -1017,12 +1013,8 @@ pub unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
     // Tripwire for the SMP=4 mixed-EL corruption: refuse silence if this EL0 entry
     // would land in kernel text (poison minted upstream — see update_thread_context).
     if ctx.pc >= 0x4000_0000 {
-        let mut buf = [0u8; 128];
-        let mut pos = 0usize;
-        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-            format_args!("[EUM POISON] enter_user_mode pc={:#x} spsr={:#x} tid={}\n",
-                ctx.pc, ctx.spsr, crate::threading::current_thread_id()));
-        if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+        crate::safe_print!(128, "[EUM POISON] enter_user_mode pc={:#x} spsr={:#x} tid={}\n",
+            ctx.pc, ctx.spsr, crate::threading::current_thread_id());
     }
     // This `eret` drops to EL0 without returning through the syscall wrapper (initial
     // process launch / execve), so the SVC epilogue's `clear_current_trap_frame` never
@@ -1225,14 +1217,10 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
     // is selected by tgid alone — a caller whose row carries somebody else's tgid
     // takes out somebody else's threads, and that is invisible from `my_pid`.
     if KTG_TRACES.fetch_add(1, Ordering::Relaxed) < 512 {
-        let mut buf = [0u8; 176];
-        let mut pos = 0;
-        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-            format_args!(
-                "[KTG] my_pid={} my_tgid={} by_tid={} code={} siblings={} first={:?}\n",
-                my_pid, tgid, crate::threading::current_thread_id(), exit_code,
-                siblings.len(), siblings.first()));
-        if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+        crate::safe_print!(176,
+            "[KTG] my_pid={} my_tgid={} by_tid={} code={} siblings={} first={:?}\n",
+            my_pid, tgid, crate::threading::current_thread_id(), exit_code,
+            siblings.len(), siblings.first());
     }
 
     // Tripwire: every slot this function is about to act on comes from the
@@ -1247,15 +1235,11 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
     for (sib_pid, sib_tid) in &siblings {
         let map_tid = table::thread_for_pid(*sib_pid);
         if map_tid != *sib_tid && KTG_MISMATCHES.fetch_add(1, Ordering::Relaxed) < 64 {
-            let mut buf = [0u8; 160];
-            let mut pos = 0;
-            let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                format_args!(
-                    "[KTG-MISMATCH] my_pid={} tgid={} sib_pid={} thread_id={:?} map_tid={:?} \
-                     slot_owner={:?}\n",
-                    my_pid, tgid, sib_pid, sib_tid, map_tid,
-                    sib_tid.and_then(table::pid_for_thread)));
-            if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+            crate::safe_print!(160,
+                "[KTG-MISMATCH] my_pid={} tgid={} sib_pid={} thread_id={:?} map_tid={:?} \
+                 slot_owner={:?}\n",
+                my_pid, tgid, sib_pid, sib_tid, map_tid,
+                sib_tid.and_then(table::pid_for_thread));
         }
     }
 
@@ -1368,17 +1352,10 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
                         if !grace_kill_should_terminate(*sib_pid, *tid) {
                             let owner = table::pid_for_thread(*tid);
                             if KTG_STALE_SKIPS.fetch_add(1, Ordering::Relaxed) < 64 {
-                                let mut buf = [0u8; 160];
-                                let mut pos = 0;
-                                let _ = core::fmt::write(
-                                    &mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                                    format_args!(
-                                        "[KTG-STALE] my_pid={} sib_pid={} tid={} recycled to \
-                                         pid={:?} — not terminating\n",
-                                        my_pid, sib_pid, tid, owner));
-                                if let Ok(s) = core::str::from_utf8(&buf[..pos]) {
-                                    (runtime().print_str)(s);
-                                }
+                                crate::safe_print!(160,
+                                    "[KTG-STALE] my_pid={} sib_pid={} tid={} recycled to \
+                                     pid={:?} — not terminating\n",
+                                    my_pid, sib_pid, tid, owner);
                             }
                             continue;
                         }
@@ -1447,14 +1424,10 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
                     }
                 }
             } else if KTG_STALE_CH_SKIPS.fetch_add(1, Ordering::Relaxed) < 64 {
-                let mut buf = [0u8; 160];
-                let mut pos = 0;
-                let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                    format_args!(
-                        "[KTG-STALE-CH] my_pid={} sib_pid={} tid={} recycled to \
-                         pid={:?} — not stamping channel\n",
-                        my_pid, sib_pid, tid, owner));
-                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+                crate::safe_print!(160,
+                    "[KTG-STALE-CH] my_pid={} sib_pid={} tid={} recycled to \
+                     pid={:?} — not stamping channel\n",
+                    my_pid, sib_pid, tid, owner);
             }
         }
 
@@ -1534,14 +1507,10 @@ pub fn dump_orphan_processes() {
         if exited || table::thread_for_pid(pid).is_some() {
             continue;
         }
-        let mut buf = [0u8; 160];
-        let mut pos = 0;
-        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-            format_args!(
-                "[PROC-ORPHAN] pid={} tgid={} no live thread; recorded thread_id={:?} \
-                 now owned by pid={:?}\n",
-                pid, tgid, thread_id, thread_id.and_then(table::pid_for_thread)));
-        if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+        crate::safe_print!(160,
+            "[PROC-ORPHAN] pid={} tgid={} no live thread; recorded thread_id={:?} \
+             now owned by pid={:?}\n",
+            pid, tgid, thread_id, thread_id.and_then(table::pid_for_thread));
     }
 }
 
@@ -1568,13 +1537,9 @@ fn kill_children_whose_parent_in(parents: &BTreeSet<Pid>) {
     // docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §4.
     for (child_pid, parent_pid, _, _, already_exited, name) in &children {
         if ORPHAN_KILL_TRACES.fetch_add(1, Ordering::Relaxed) < 512 {
-            let mut buf = [0u8; 176];
-            let mut pos = 0;
-            let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                format_args!(
-                    "[ORPHAN-KILL] parent_pid={} child_pid={} already_exited={} name={}\n",
-                    parent_pid, child_pid, already_exited, name));
-            if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+            crate::safe_print!(176,
+                "[ORPHAN-KILL] parent_pid={} child_pid={} already_exited={} name={}\n",
+                parent_pid, child_pid, already_exited, name);
         }
     }
 
@@ -2206,14 +2171,10 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     let parent_tgid = parent.tgid;
 
     if lifecycle_trace_on() {
-        let mut buf = [0u8; 128];
-        let mut pos = 0usize;
-        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-            format_args!("[FORK-DBG] parent_pid={} child_pid={} brk=0x{:x} code_end=0x{:x} mmap_regions={} lazy_regs={}\n",
-                parent_pid, child_pid, parent.brk, parent.memory.code_end,
-                parent.mmap_regions.len(),
-                parent.lazy_regions.lock().len()));
-        if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+        crate::safe_print!(128, "[FORK-DBG] parent_pid={} child_pid={} brk=0x{:x} code_end=0x{:x} mmap_regions={} lazy_regs={}\n",
+            parent_pid, child_pid, parent.brk, parent.memory.code_end,
+            parent.mmap_regions.len(),
+            parent.lazy_regions.lock().len());
     }
 
     // 1. Create new address space
@@ -2560,11 +2521,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
         let cow_elapsed_us = (runtime().uptime_us)() - cow_start_us;
         if lifecycle_trace_on() {
-            let mut buf = [0u8; 96];
-            let mut pos = 0usize;
-            let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                format_args!("[FORK-COW] shared {} pages in {}µs\n", total_shared, cow_elapsed_us));
-            if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+            crate::safe_print!(96, "[FORK-COW] shared {} pages in {}µs\n", total_shared, cow_elapsed_us);
         }
     } else {
         // ── Eager-copy fork (legacy path) ──
@@ -2598,12 +2555,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         if parent.brk > code_start {
             let brk_len = parent.brk - code_start;
             if lifecycle_trace_on() {
-                let mut buf = [0u8; 96];
-                let mut pos = 0usize;
-                let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                    format_args!("[FORK-DBG] step4: brk copy 0x{:x}..0x{:x} ({} pages)\n",
-                        code_start, parent.brk, brk_len / mmu::PAGE_SIZE));
-                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+                crate::safe_print!(96, "[FORK-DBG] step4: brk copy 0x{:x}..0x{:x} ({} pages)\n",
+                    code_start, parent.brk, brk_len / mmu::PAGE_SIZE);
             }
             copy_range_phys(
                 parent_l0,
@@ -2643,12 +2596,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             let va_start = &region.start_va;
             let parent_frames = &region.frames;
             if lifecycle_trace_on() {
-                let mut buf = [0u8; 128];
-                let mut pos = 0usize;
-                let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                    format_args!("[FORK-DBG] mmap region {}/{} va=0x{:x} pages={}\n",
-                        region_idx, mmap_snapshot.len(), va_start, parent_frames.len()));
-                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+                crate::safe_print!(128, "[FORK-DBG] mmap region {}/{} va=0x{:x} pages={}\n",
+                    region_idx, mmap_snapshot.len(), va_start, parent_frames.len());
             }
             if total_copied_pages + parent_frames.len() > MAX_FORK_MMAP_PAGES {
                 if config().syscall_debug_info_enabled {
@@ -2731,11 +2680,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             let mut lazy_pages_copied = 0usize;
             let mut lazy_pages_scanned = 0usize;
             if lifecycle_trace_on() {
-                let mut buf = [0u8; 64];
-                let mut pos = 0usize;
-                let _ = core::fmt::Write::write_fmt(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                    format_args!("[FORK-DBG] lazy: {} regions\n", num_regions));
-                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+                crate::safe_print!(64, "[FORK-DBG] lazy: {} regions\n", num_regions);
             }
             'lazy_copy: for (region_idx, region) in parent_regions.into_iter().enumerate() {
                 let (va, size) = (region.start_va, region.size);
@@ -2759,22 +2704,14 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                     }
                 }
                 if lifecycle_trace_on() && (region_idx % 4 == 3 || region_idx == num_regions - 1) {
-                    let mut buf = [0u8; 96];
-                    let mut pos = 0usize;
-                    let _ = core::fmt::Write::write_fmt(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                        format_args!("[FORK-DBG] lazy {}/{} copied={} scanned={}\n",
-                            region_idx + 1, num_regions, lazy_pages_copied, lazy_pages_scanned));
-                    if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+                    crate::safe_print!(96, "[FORK-DBG] lazy {}/{} copied={} scanned={}\n",
+                        region_idx + 1, num_regions, lazy_pages_copied, lazy_pages_scanned);
                 }
             }
             let lazy_elapsed_us = (runtime().uptime_us)() - lazy_start_us;
             if lifecycle_trace_on() {
-                let mut buf = [0u8; 96];
-                let mut pos = 0usize;
-                let _ = core::fmt::Write::write_fmt(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-                    format_args!("[FORK-DBG] lazy: {} pages copied, {} scanned in {}µs\n",
-                        lazy_pages_copied, lazy_pages_scanned, lazy_elapsed_us));
-                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+                crate::safe_print!(96, "[FORK-DBG] lazy: {} pages copied, {} scanned in {}µs\n",
+                    lazy_pages_copied, lazy_pages_scanned, lazy_elapsed_us);
             }
         }
 
@@ -3429,13 +3366,9 @@ pub fn resolve_thread_process(tid: usize) -> Option<Pid> {
     if let (Some(m), Some(s)) = (map_pid, scan_pid)
         && m != s
     {
-        let mut buf = [0u8; 128];
-        let mut pos = 0usize;
-        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-            format_args!(
-                "[TRAMP-MISMATCH] tid={} THREAD_PID_MAP={} but table scan found {} — using {}\n",
-                tid, m, s, m));
-        if let Ok(st) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(st); }
+        crate::safe_print!(128,
+            "[TRAMP-MISMATCH] tid={} THREAD_PID_MAP={} but table scan found {} — using {}\n",
+            tid, m, s, m);
     }
     map_pid.or(scan_pid)
 }
@@ -3443,11 +3376,7 @@ pub fn resolve_thread_process(tid: usize) -> Option<Pid> {
 pub extern "C" fn entry_point_trampoline() -> ! {
     let tid = crate::threading::current_thread_id();
     if lifecycle_trace_on() {
-        let mut buf = [0u8; 64];
-        let mut pos = 0usize;
-        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-            format_args!("[FORK-DBG] trampoline ENTRY tid={}\n", tid));
-        if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+        crate::safe_print!(64, "[FORK-DBG] trampoline ENTRY tid={}\n", tid);
     }
     let proc_ptr: *mut Process = resolve_thread_process(tid)
         .and_then(table::get_process_ptr)
@@ -3468,11 +3397,7 @@ pub extern "C" fn entry_point_trampoline() -> ! {
     // thread, so we handle it here before calling run().
     let (alt_sp, _, _) = crate::threading::get_sigaltstack(tid);
     if lifecycle_trace_on() {
-        let mut buf = [0u8; 96];
-        let mut pos = 0usize;
-        let _ = core::fmt::write(&mut FmtBuf { buf: &mut buf, pos: &mut pos },
-            format_args!("[TRAMP] tid={} alt_sp={:#x}\n", tid, alt_sp));
-        if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+        crate::safe_print!(96, "[TRAMP] tid={} alt_sp={:#x}\n", tid, alt_sp);
     }
     if alt_sp == 0 {
         // Thread's sigaltstack not configured - it's not ready for signal handling.

@@ -358,22 +358,7 @@ fn note_preserved_window() -> bool {
     }
     let n = WINDOWS_PRESERVED.fetch_add(1, Ordering::Relaxed) + 1;
     if n.is_power_of_two() {
-        use core::fmt::Write;
-        struct Buf([u8; 96], usize);
-        impl Write for Buf {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                let b = s.as_bytes();
-                let l = b.len().min(96 - self.1);
-                self.0[self.1..self.1 + l].copy_from_slice(&b[..l]);
-                self.1 += l;
-                Ok(())
-            }
-        }
-        let mut buf = Buf([0u8; 96], 0);
-        let _ = writeln!(buf, "[BKL] dropped window preserved across IRQ x{n}");
-        if let Ok(s) = core::str::from_utf8(&buf.0[..buf.1]) {
-            (crate::runtime::runtime().print_str)(s);
-        }
+        crate::safe_print!(96, "[BKL] dropped window preserved across IRQ x{n}\n");
     }
     true
 }

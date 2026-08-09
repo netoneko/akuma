@@ -1064,9 +1064,7 @@ pub fn lazy_region_debug(va: usize) {
     use core::fmt::Write;
     let pid = address_space_owner_pid_for_fault().unwrap_or(0);
     let Some(proc) = lookup_process_shared(pid) else {
-        let mut w = LazyDebugWriter::<128>::new();
-        let _ = writeln!(w, "[DP] lazy miss: pid={} va={:#x} no process entry", pid, va);
-        w.flush();
+        crate::safe_print!(128, "[DP] lazy miss: pid={} va={:#x} no process entry\n", pid, va);
         return;
     };
     with_irqs_disabled(|| {

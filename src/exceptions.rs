@@ -2451,8 +2451,6 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
     // actual data aborts — moving it earlier increases the window.
     // The debug dump noise for copy_to_user_safe faults is acceptable.
 
-    use core::fmt::Write;
-    
     // Read ESR_EL1 to determine exception type
     let esr: u64;
     let elr: u64;
@@ -2477,17 +2475,10 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
     let iss = esr & 0x1FFFFFF;
     let tid = akuma_exec::threading::current_thread_id();
 
-    // Use static buffer for formatting (no heap allocation)
-    let mut w = StaticWriter::new();
-    
-    let _ = writeln!(w, "[Exception] Sync from EL1: EC={ec:#x}, ISS={iss:#x}");
-    w.flush();
-    let _ = writeln!(w, "  ELR={elr:#x}, FAR={far:#x}, SPSR={spsr:#x}");
-    w.flush();
-    let _ = writeln!(w, "  Thread={tid}, TTBR0={ttbr0:#x}, TTBR1={ttbr1:#x}");
-    w.flush();
-    let _ = writeln!(w, "  SP={sp:#x}, SP_EL0={sp_el0:#x}");
-    w.flush();
+    safe_print!(256, "[Exception] Sync from EL1: EC={ec:#x}, ISS={iss:#x}\n");
+    safe_print!(256, "  ELR={elr:#x}, FAR={far:#x}, SPSR={spsr:#x}\n");
+    safe_print!(256, "  Thread={tid}, TTBR0={ttbr0:#x}, TTBR1={ttbr1:#x}\n");
+    safe_print!(256, "  SP={sp:#x}, SP_EL0={sp_el0:#x}\n");
     // Saved-register block from the vector: [x2, x3, x0, x1, x29, x30].
     // x30 names the caller when ELR is a wild branch target (blr through a
     // corrupt pointer leaves call site + 4 in LR).
@@ -2496,26 +2487,22 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
             (saved_regs.read(), saved_regs.add(1).read(), saved_regs.add(2).read(),
              saved_regs.add(3).read(), saved_regs.add(4).read(), saved_regs.add(5).read())
         };
-        let _ = writeln!(w, "  x0={r_x0:#x} x1={r_x1:#x} x2={r_x2:#x} x3={r_x3:#x}");
-        w.flush();
-        let _ = writeln!(w, "  x29={r_x29:#x} x30(LR)={r_x30:#x} core={}",
+        safe_print!(256, "  x0={r_x0:#x} x1={r_x1:#x} x2={r_x2:#x} x3={r_x3:#x}\n");
+        safe_print!(256, "  x29={r_x29:#x} x30(LR)={r_x30:#x} core={}\n",
             akuma_exec::bkl::current_core_id());
-        w.flush();
     }
 
     // Try to read the faulting instruction (if ELR is in kernel range)
     if (0x4000_0000..0x8000_0000).contains(&elr) {
         let instr = unsafe { *(elr as *const u32) };
-        let _ = writeln!(w, "  Instruction at ELR: {instr:#010x}");
-        w.flush();
-        
+        safe_print!(256, "  Instruction at ELR: {instr:#010x}\n");
+
         // Decode ARM64 load/store instruction to find base register
         // LDR/STR format: opc[31:30] | 111 | V[26] | 00 | opc2[23:22] | imm9 | op[11:10] | Rn[9:5] | Rt[4:0]
         // Or: opc[31:30] | 111 | V[26] | 01 | opc2[23:22] | imm12[21:10] | Rn[9:5] | Rt[4:0]
         let rn = ((instr >> 5) & 0x1F) as usize;
         let rt = (instr & 0x1F) as usize;
-        let _ = writeln!(w, "  Likely: Rn(base)=x{rn}, Rt(dest)=x{rt}");
-        w.flush();
+        safe_print!(256, "  Likely: Rn(base)=x{rn}, Rt(dest)=x{rt}\n");
     }
     
     // Check if FAR is in user space (below 0x40000000)
@@ -2545,18 +2532,13 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
             }
 
             if (0x4000_0000..0x8000_0000).contains(&far) {
-                let _ = writeln!(w, "  HINT: FAR={far:#x} is in kernel identity-mapped RAM range.");
-                w.flush();
-                let _ = writeln!(w, "  Likely cause: phys_to_virt() write to a physical page whose VA");
-                w.flush();
-                let _ = writeln!(w, "  is not mapped in the current user page tables (TTBR0).");
-                w.flush();
+                safe_print!(256, "  HINT: FAR={far:#x} is in kernel identity-mapped RAM range.\n");
+                safe_print!(256, "  Likely cause: phys_to_virt() write to a physical page whose VA\n");
+                safe_print!(256, "  is not mapped in the current user page tables (TTBR0).\n");
             }
-            let _ = writeln!(w, "  EC=0x25 in kernel code — killing current process (EFAULT)");
-            w.flush();
+            safe_print!(256, "  EC=0x25 in kernel code — killing current process (EFAULT)\n");
             if let Some(proc) = akuma_exec::process::current_process_shared() {
-                let _ = writeln!(w, "  Killing PID {} ({})", proc.pid, proc.name);
-                w.flush();
+                safe_print!(256, "  Killing PID {} ({})\n", proc.pid, proc.name);
                 let l0_phys = proc.address_space.l0_phys();
                 let pid = proc.pid;
                 akuma_exec::process::with_current_process(|p| {
@@ -2592,51 +2574,44 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
         
         // Get expected boot TTBR0
         let boot_ttbr0 = akuma_exec::mmu::get_boot_ttbr0();
-        let _ = writeln!(w, "    Expected boot_ttbr0: {boot_ttbr0:#x}");
-        w.flush();
-        let _ = writeln!(w, "    Current TTBR0:       {ttbr0:#x}");
-        w.flush();
-        
+        safe_print!(256, "    Expected boot_ttbr0: {boot_ttbr0:#x}\n");
+        safe_print!(256, "    Current TTBR0:       {ttbr0:#x}\n");
+
         if ttbr0 != boot_ttbr0 {
             safe_print!(64, "    WARNING: TTBR0 mismatch!\n");
         }
-        
+
         // Read L0[0] entry to check if it points to valid L1
         let l0_base = ttbr0 & !0xFFF; // Mask off ASID etc
         let l0_entry = unsafe { *(l0_base as *const u64) };
-        let _ = writeln!(w, "    L0[0] entry: {l0_entry:#018x}");
-        w.flush();
-        
+        safe_print!(256, "    L0[0] entry: {l0_entry:#018x}\n");
+
         // Check if L0[0] looks valid (should be table descriptor)
         let is_valid = (l0_entry & 0x1) == 1;
         let is_table = (l0_entry & 0x2) == 2;
         let l1_addr = l0_entry & 0x0000_FFFF_FFFF_F000;
-        let _ = writeln!(w, "    L0[0]: valid={is_valid}, table={is_table}, L1_addr={l1_addr:#x}");
-        w.flush();
-        
+        safe_print!(256, "    L0[0]: valid={is_valid}, table={is_table}, L1_addr={l1_addr:#x}\n");
+
         // Expected L1 address should be boot_ttbr0 + 8192 (2 pages)
         let expected_l1 = boot_ttbr0 + 8192;
-        let _ = writeln!(w, "    Expected L1 addr: {expected_l1:#x}");
-        w.flush();
-        
+        safe_print!(256, "    Expected L1 addr: {expected_l1:#x}\n");
+
         if l1_addr != expected_l1 {
             safe_print!(128, "    WARNING: L1 address mismatch - page table corrupted!\n");
         }
-        
+
         // Now read L1[0] to check the device memory block entry
         if is_valid && is_table && (0x4000_0000..0x8000_0000).contains(&l1_addr) {
             let l1_entry = unsafe { *(l1_addr as *const u64) };
-            let _ = writeln!(w, "    L1[0] entry: {l1_entry:#018x}");
-            w.flush();
-            
+            safe_print!(256, "    L1[0] entry: {l1_entry:#018x}\n");
+
             // L1[0] should be a 1GB block descriptor for device memory
             // Valid block: bits[1:0] = 01, bits[47:30] = physical address
             let is_l1_valid = (l1_entry & 0x1) == 1;
             let is_block = (l1_entry & 0x2) == 0; // Block, not table
             let block_addr = l1_entry & 0x0000_FFFF_C000_0000;
-            let _ = writeln!(w, "    L1[0]: valid={is_l1_valid}, block={is_block}, phys_addr={block_addr:#x}");
-            w.flush();
-            
+            safe_print!(256, "    L1[0]: valid={is_l1_valid}, block={is_block}, phys_addr={block_addr:#x}\n");
+
             // L1[0] should point to physical 0 (device memory)
             if !is_l1_valid {
                 safe_print!(64, "    WARNING: L1[0] is INVALID!\n");
@@ -2718,40 +2693,35 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
     
     // Kernel heap stats
     let heap_stats = crate::allocator::stats();
-    let _ = writeln!(w, "  Heap: {}/{} bytes used ({} allocs, peak={})",
+    safe_print!(256, "  Heap: {}/{} bytes used ({} allocs, peak={})\n",
         heap_stats.allocated,
         heap_stats.heap_size,
         heap_stats.allocation_count,
         heap_stats.peak_allocated
     );
-    w.flush();
-    
+
     // PMM stats
     let pmm_free = crate::pmm::free_count();
     let pmm_total = crate::pmm::total_count();
-    let _ = writeln!(w, "  PMM: {}/{} pages free ({} KB / {} KB)",
+    safe_print!(256, "  PMM: {}/{} pages free ({} KB / {} KB)\n",
         pmm_free, pmm_total,
         pmm_free * 4, pmm_total * 4
     );
-    w.flush();
-    
+
     // Frame tracking stats if enabled
     if let Some(frame_stats) = crate::pmm::tracking_stats() {
-        let _ = writeln!(w, "  Frames: kernel={}, user_pt={}, user_data={}, elf={}",
+        safe_print!(256, "  Frames: kernel={}, user_pt={}, user_data={}, elf={}\n",
             frame_stats.kernel_count,
             frame_stats.user_page_table_count,
             frame_stats.user_data_count,
             frame_stats.elf_loader_count
         );
-        w.flush();
     }
-    
+
     // Thread stack info
     let (thread_count, running, terminated) = akuma_exec::threading::thread_stats();
-    let _ = writeln!(w, "  Threads: {thread_count} total, {running} running, {terminated} terminated"
-    );
-    w.flush();
-    
+    safe_print!(256, "  Threads: {thread_count} total, {running} running, {terminated} terminated\n");
+
     // Current thread's kernel stack info
     if let Some(stack_info) = akuma_exec::threading::get_thread_stack_info(tid) {
         let kernel_stack_used = if kernel_sp >= stack_info.0 as u64 && kernel_sp <= stack_info.1 as u64 {
@@ -2759,17 +2729,15 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
         } else {
             0 // SP outside expected range
         };
-        let _ = writeln!(w, "  Thread {} kernel stack: base={:#x}, top={:#x}",
+        safe_print!(256, "  Thread {} kernel stack: base={:#x}, top={:#x}\n",
             tid, stack_info.0, stack_info.1
         );
-        w.flush();
-        let _ = writeln!(w, "    SP={kernel_sp:#x}, used={kernel_stack_used} bytes");
-        w.flush();
+        safe_print!(256, "    SP={kernel_sp:#x}, used={kernel_stack_used} bytes\n");
         if kernel_sp < stack_info.0 as u64 || kernel_sp > stack_info.1 as u64 {
             safe_print!(128, "  WARNING: Kernel SP outside thread's stack bounds!\n");
         }
     }
-    
+
     // User process info (if any)
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         let mem = &proc.memory;
@@ -2781,51 +2749,45 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
         };
         let heap_used = proc.brk.saturating_sub(proc.initial_brk);
         let mmap_used = mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed).saturating_sub(0x1000_0000);
-        
+
         // Print in smaller chunks to fit in static buffer
-        let _ = writeln!(w, "  Process PID={} '{}'", proc.pid, proc.name);
-        w.flush();
-        
-        let _ = writeln!(w, "    Stack: {:#x}-{:#x} ({} KB)",
+        safe_print!(256, "  Process PID={} '{}'\n", proc.pid, proc.name);
+
+        safe_print!(256, "    Stack: {:#x}-{:#x} ({} KB)\n",
             mem.stack_bottom, mem.stack_top, stack_size / 1024
         );
-        w.flush();
-        
+
         // Calculate percentage without floating point (integer percentage)
         let stack_pct = if stack_size > 0 { (stack_used * 100) / stack_size } else { 0 };
-        let _ = writeln!(w, "    SP_EL0={user_sp:#x}, used={stack_used} bytes ({stack_pct}%)"
-        );
-        w.flush();
-        
-        let _ = writeln!(w, "    Heap: brk={:#x} (initial={:#x}), grown={} bytes",
+        safe_print!(256, "    SP_EL0={user_sp:#x}, used={stack_used} bytes ({stack_pct}%)\n");
+
+        safe_print!(256, "    Heap: brk={:#x} (initial={:#x}), grown={} bytes\n",
             proc.brk, proc.initial_brk, heap_used
         );
-        w.flush();
-        
-        let _ = writeln!(w, "    Mmap: next={:#x}, limit={:#x}, used={} bytes",
+
+        safe_print!(256, "    Mmap: next={:#x}, limit={:#x}, used={} bytes\n",
             mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit, mmap_used
         );
-        w.flush();
 
         // Leak attribution: how many frames this process tracks vs the VA it
         // mapped, and the global per-site demand-paging page tally.
-        let _ = writeln!(w, "    Tracked(cur pid={}): user_frames={} refs={} page_tables={}",
+        safe_print!(256, "    Tracked(cur pid={}): user_frames={} refs={} page_tables={}\n",
             proc.pid,
             proc.address_space.user_frame_count(),
             proc.address_space.user_frame_total_refs(),
             proc.address_space.page_table_frame_count(),
         );
-        w.flush();
         if let Some(owner) = akuma_exec::process::lookup_process_shared(proc.tgid) {
-            let _ = writeln!(w, "    Tracked(owner tgid={}): user_frames={} refs={} page_tables={}",
+            safe_print!(256, "    Tracked(owner tgid={}): user_frames={} refs={} page_tables={}\n",
                 proc.tgid,
                 owner.address_space.user_frame_count(),
                 owner.address_space.user_frame_total_refs(),
                 owner.address_space.page_table_frame_count(),
             );
-            w.flush();
         }
-        let _ = writeln!(w, "    DP pages (global): {}", crate::pmm::dp_counters_line());
+        let _ = write!(w, "    DP pages (global): ");
+        crate::pmm::dp_counters_line(&mut w);
+        let _ = writeln!(w);
         w.flush();
 
         if user_sp < mem.stack_bottom as u64 {

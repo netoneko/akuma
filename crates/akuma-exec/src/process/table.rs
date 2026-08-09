@@ -187,13 +187,8 @@ pub fn unregister_process(pid: Pid) -> bool {
             let slot_owner = with_irqs_disabled(|| THREAD_PID_MAP.lock().get(&tid).copied());
             let recycled = matches!(slot_owner, Some(owner) if owner != pid);
             if recycled {
-                let mut buf = [0u8; 112];
-                let mut pos = 0;
-                let _ = core::fmt::write(
-                    &mut crate::process::FmtBuf { buf: &mut buf, pos: &mut pos },
-                    format_args!("[unregister] pid={} stale tid={} now owned by pid={}\n",
-                        pid, tid, slot_owner.unwrap_or(0)));
-                if let Ok(s) = core::str::from_utf8(&buf[..pos]) { (runtime().print_str)(s); }
+                crate::safe_print!(112, "[unregister] pid={} stale tid={} now owned by pid={}\n",
+                    pid, tid, slot_owner.unwrap_or(0));
             }
             if tid != current_tid && !recycled {
                 crate::threading::mark_thread_terminated(tid);

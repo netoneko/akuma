@@ -154,13 +154,7 @@ fn panic(info: &PanicInfo) -> ! {
     // Use stack-based formatting to avoid heap allocation during panic
     // This prevents double-panic if the heap is corrupted
     console::print("Message: ");
-    {
-        use core::fmt::Write;
-        let mut buf = console::StackWriter::<256>::new();
-        let _ = write!(buf, "{}", info.message());
-        console::print(buf.as_str());
-    }
-    console::print("\n");
+    crate::safe_print!(256, "{}\n", info.message());
     halt()
 }
 
@@ -1528,12 +1522,18 @@ fn run_async_main() -> ! {
             // private frame allocations + `read_at` sweeps this cache avoided, which
             // is the direct measure of the `-j4` amplification it exists to remove.
             if crate::config::SHARED_FILE_PAGES_ENABLED {
-                crate::safe_print!(192, "{}", crate::file_page_cache::stats_line());
+                let mut w = console::StackWriter::<192>::new();
+                crate::file_page_cache::stats_line(&mut w);
+                w.flush();
             }
             // `MADV_DONTNEED` divergence audit (proposals/CARGO_HEAP_NULL_RC.md).
             // Both counters are expected to stay 0; either going non-zero means
             // this handler is zeroing frames Linux would have left alone.
-            crate::safe_print!(128, "{}", crate::syscall::mem::dontneed_audit_line());
+            {
+                let mut w = console::StackWriter::<128>::new();
+                crate::syscall::mem::dontneed_audit_line(&mut w);
+                w.flush();
+            }
             // Write faults on pages the page table already allows — i.e. absorbed
             // stale TLB entries. `repeats` must stay 0; a non-zero value means the
             // flush is not what is resolving them (proposals/CARGO_HEAP_NULL_RC.md).
@@ -1808,19 +1808,17 @@ async fn memory_monitor() -> ! {
         // free obligations are out of sync with allocations (track_user_frame/
         // cow_ref desync) — see pmm::DOUBLE_FREE_COUNT.
         let dfree = pmm::double_free_count();
-        let dfree_marker = if dfree > 0 {
-            alloc::format!(" | DOUBLE-FREE={dfree}")
-        } else {
-            alloc::string::String::new()
-        };
         let reclaimed_pages = allocator::reclaimed_pages_total();
         buf.clear();
         let _ = write!(
             buf,
-            "[Mem] Uptime {} | RAM: {}/{}MB free ({}KB) | Heap: {}/{}MB free ({} KB used, {} KB peak) | Allocs: {} | Threads: {}/{} ({}r {}rd){}",
+            "[Mem] Uptime {} | RAM: {}/{}MB free ({}KB) | Heap: {}/{}MB free ({} KB used, {} KB peak) | Allocs: {} | Threads: {}/{} ({}r {}rd)",
             uptime_us, free_ram_mb, total_ram_mb, free_ram_kb, free_kb / 1024, heap_mb, allocated_kb, peak_kb, stats.allocation_count,
-            threads_used, threads_max, threads_running, threads_ready, dfree_marker
+            threads_used, threads_max, threads_running, threads_ready
         );
+        if dfree > 0 {
+            let _ = write!(buf, " | DOUBLE-FREE={dfree}");
+        }
         // Pages handed back from the heap to the PMM since boot — non-zero means
         // the heap watermark is being trimmed (see allocator::reclaim_to_pmm).
         // Written straight into the stack buffer; no heap alloc in the mem monitor.

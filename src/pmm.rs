@@ -943,9 +943,13 @@ pub fn dp_count(counter: &AtomicUsize, n: usize) {
     counter.fetch_add(n, Ordering::Relaxed);
 }
 
-/// One-line dump of the demand-paging frame attribution counters.
-pub fn dp_counters_line() -> alloc::string::String {
-    alloc::format!(
+/// One-line dump of the demand-paging frame attribution counters, written into
+/// the caller's buffer. Takes a `&mut dyn Write` (instead of returning a
+/// `String`) so it stays heap-free — this is reached from the sync-EL1 crash
+/// handler, which must not touch the allocator (see ALLOC_PRINT_AUDIT.md §6.3).
+pub fn dp_counters_line(w: &mut dyn core::fmt::Write) {
+    let _ = write!(
+        w,
         "file={} anon={} cow={} protnone={} eager={} freed={}",
         DP_FILE_PAGES.load(Ordering::Relaxed),
         DP_ANON_PAGES.load(Ordering::Relaxed),
@@ -953,7 +957,7 @@ pub fn dp_counters_line() -> alloc::string::String {
         DP_PROTNONE_PAGES.load(Ordering::Relaxed),
         EAGER_MMAP_PAGES.load(Ordering::Relaxed),
         USER_PAGES_FREED.load(Ordering::Relaxed),
-    )
+    );
 }
 
 /// Initialize the physical memory manager

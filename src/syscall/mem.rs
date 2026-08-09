@@ -124,13 +124,16 @@ pub fn dontneed_zero_range(addr: usize, len: usize) -> (usize, usize) {
 }
 
 /// One-line summary of the `MADV_DONTNEED` audit counters for the PSTATS block.
-pub fn dontneed_audit_line() -> alloc::string::String {
+/// Writes into the caller's buffer instead of returning a `String` — same
+/// heap-free rationale as `file_page_cache::stats_line`.
+pub fn dontneed_audit_line(w: &mut dyn core::fmt::Write) {
     use core::sync::atomic::Ordering;
-    alloc::format!(
-        "[MADV] dontneed_unaligned={} dontneed_shared_frame={}\n",
+    let _ = writeln!(
+        w,
+        "[MADV] dontneed_unaligned={} dontneed_shared_frame={}",
         DONTNEED_UNALIGNED.load(Ordering::Relaxed),
         DONTNEED_SHARED_FRAME.load(Ordering::Relaxed),
-    )
+    );
 }
 
 /// Writable `MAP_SHARED` file-backed mappings whose dirty pages must be flushed

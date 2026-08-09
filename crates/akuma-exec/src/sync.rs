@@ -829,18 +829,6 @@ impl KernelLock {
 /// Diagnostic: log when the Big Kernel Lock is stuck spinning (a cross-core deadlock
 /// canary). Stack-buffered to avoid heap use in an IRQ-masked context.
 fn log_kernel_lock_stuck(owner: u32, me: u32) {
-    use core::fmt::Write;
-    struct Buf([u8; 96], usize);
-    impl Write for Buf {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let b = s.as_bytes();
-            let n = b.len().min(96 - self.1);
-            self.0[self.1..self.1 + n].copy_from_slice(&b[..n]);
-            self.1 += n;
-            Ok(())
-        }
-    }
-    let mut buf = Buf([0u8; 96], 0);
     // Attribute the hold: what the owner core was doing when it last entered the kernel
     // (tag: syscall nr, 500=fault, 501=IRQ/scheduler, 511=unknown; see the profiler above).
     // Only meaningful while `set_profiling(true)` — otherwise reads as 511 — but always
@@ -850,13 +838,14 @@ fn log_kernel_lock_stuck(owner: u32, me: u32) {
     } else {
         HOLD_TAG_UNKNOWN
     };
-    let _ = writeln!(
-        buf,
-        "[BKL] stuck: owner={} waiter={} tag={} (aff0+1)",
-        owner, me, tag
+    let mut buf = [0u8; 96];
+    let mut pos = 0usize;
+    let _ = core::fmt::write(
+        &mut crate::process::FmtBuf { buf: &mut buf, pos: &mut pos },
+        format_args!("[BKL] stuck: owner={} waiter={} tag={} (aff0+1)\n", owner, me, tag),
     );
-    if buf.1 > 0 {
-        if let Ok(s) = core::str::from_utf8(&buf.0[..buf.1]) {
+    if pos > 0 {
+        if let Ok(s) = core::str::from_utf8(&buf[..pos]) {
             // `is_registered` first: a contended acquire can run before/without a registered
             // runtime (host unit tests drive `KernelLock` directly), and a diagnostic must
             // never be the thing that panics.
@@ -872,21 +861,14 @@ fn log_kernel_lock_stuck(owner: u32, me: u32) {
 /// keep them until the leak is root-caused. Stack-buffered (IRQ-masked context).
 fn log_kernel_lock_recovered(me: u32, kind: &str) {
     KERNEL_LOCK_RECOVERIES.fetch_add(1, Ordering::Relaxed);
-    use core::fmt::Write;
-    struct Buf([u8; 96], usize);
-    impl Write for Buf {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let b = s.as_bytes();
-            let n = b.len().min(96 - self.1);
-            self.0[self.1..self.1 + n].copy_from_slice(&b[..n]);
-            self.1 += n;
-            Ok(())
-        }
-    }
-    let mut buf = Buf([0u8; 96], 0);
-    let _ = writeln!(buf, "[BKL] RECOVERED ({kind}) by core {me} (aff0+1)");
-    if buf.1 > 0 {
-        if let Ok(s) = core::str::from_utf8(&buf.0[..buf.1]) {
+    let mut buf = [0u8; 96];
+    let mut pos = 0usize;
+    let _ = core::fmt::write(
+        &mut crate::process::FmtBuf { buf: &mut buf, pos: &mut pos },
+        format_args!("[BKL] RECOVERED ({kind}) by core {me} (aff0+1)\n"),
+    );
+    if pos > 0 {
+        if let Ok(s) = core::str::from_utf8(&buf[..pos]) {
             // See `log_kernel_lock_stuck`: probe before printing so a host unit test driving
             // `KernelLock` without a registered runtime records the counter and stays quiet.
             if crate::runtime::is_registered() {
@@ -1038,26 +1020,8 @@ fn log_write_lock_stuck(state: u32) {
     let readers = state & READER_MASK;
     let writer_bit = (state & WRITER_BIT) != 0;
 
-    // Minimal stack-based print to avoid any lock contention
-    use core::fmt::Write;
-    struct Buf([u8; 96], usize);
-    impl Write for Buf {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let b = s.as_bytes();
-            let n = b.len().min(96 - self.1);
-            self.0[self.1..self.1 + n].copy_from_slice(&b[..n]);
-            self.1 += n;
-            Ok(())
-        }
-    }
-    let mut buf = Buf([0u8; 96], 0);
-    let _ = writeln!(buf, "[RWLOCK] write lock stuck: state={:#x} readers={} writer_bit={}",
+    crate::safe_print!(96, "[RWLOCK] write lock stuck: state={:#x} readers={} writer_bit={}\n",
         state, readers, writer_bit);
-    if buf.1 > 0 {
-        if let Ok(s) = core::str::from_utf8(&buf.0[..buf.1]) {
-            (crate::runtime::runtime().print_str)(s);
-        }
-    }
 }
 
 impl RawRwSpinlock {

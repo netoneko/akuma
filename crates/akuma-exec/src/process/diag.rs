@@ -37,10 +37,7 @@ pub fn lock_timer_end(caller: &str, t0: u64) {
 }
 
 fn log_slow_lock(caller: &str, elapsed_us: u64) {
-    use core::fmt::Write;
-    let mut buf = StackBuf::<128>::new();
-    let _ = writeln!(buf, "[PTLOCK] {}: held {}us", caller, elapsed_us);
-    buf.flush();
+    crate::safe_print!(128, "[PTLOCK] {}: held {}us\n", caller, elapsed_us);
 }
 
 // ============================================================================
@@ -83,42 +80,5 @@ pub fn borrow_dec(pid: u32) {
 }
 
 fn log_borrow_alias(pid: u32, count: u32) {
-    use core::fmt::Write;
-    let mut buf = StackBuf::<128>::new();
-    let _ = writeln!(buf, "[BORROW-ALIAS] pid={} count={}", pid, count);
-    buf.flush();
-}
-
-// ============================================================================
-// Stack-based print buffer (no heap allocation)
-// ============================================================================
-
-struct StackBuf<const N: usize> {
-    buf: [u8; N],
-    pos: usize,
-}
-
-impl<const N: usize> StackBuf<N> {
-    fn new() -> Self {
-        Self { buf: [0u8; N], pos: 0 }
-    }
-
-    fn flush(&self) {
-        if self.pos > 0 {
-            if let Ok(s) = core::str::from_utf8(&self.buf[..self.pos]) {
-                (runtime().print_str)(s);
-            }
-        }
-    }
-}
-
-impl<const N: usize> core::fmt::Write for StackBuf<N> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let avail = N - self.pos;
-        let to_copy = bytes.len().min(avail);
-        self.buf[self.pos..self.pos + to_copy].copy_from_slice(&bytes[..to_copy]);
-        self.pos += to_copy;
-        Ok(())
-    }
+    crate::safe_print!(128, "[BORROW-ALIAS] pid={} count={}\n", pid, count);
 }

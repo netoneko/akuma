@@ -32,16 +32,16 @@ pub fn set_current_exception_stack(stack_top: u64) {
 pub fn set_current_exception_stack(_stack_top: u64) {}
 
 /// Stack-based writer for formatting without heap allocation.
-struct StackWriter<const N: usize> {
+pub(crate) struct StackWriter<const N: usize> {
     buf: [u8; N],
     pos: usize,
 }
 
 impl<const N: usize> StackWriter<N> {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self { buf: [0; N], pos: 0 }
     }
-    fn flush(&mut self) {
+    pub(crate) fn flush(&mut self) {
         if let Ok(s) = core::str::from_utf8(&self.buf[..self.pos]) {
             (runtime().print_str)(s);
         }
@@ -60,10 +60,15 @@ impl<const N: usize> core::fmt::Write for StackWriter<N> {
     }
 }
 
+/// Crate-wide safe formatting macro (mirrors `src/console.rs`'s `safe_print!` in
+/// the kernel crate): writes to a stack buffer and prints, no heap allocation.
+/// `#[macro_export]` makes this reachable as `crate::safe_print!` from any
+/// module in this crate, not just `threading` and its descendants.
+#[macro_export]
 macro_rules! safe_print {
     ($size:expr, $($arg:tt)*) => {{
         use core::fmt::Write;
-        let mut writer = StackWriter::<$size>::new();
+        let mut writer = $crate::threading::StackWriter::<$size>::new();
         let _ = write!(writer, $($arg)*);
         writer.flush();
     }};

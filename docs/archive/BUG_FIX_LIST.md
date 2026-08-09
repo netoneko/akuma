@@ -9,8 +9,8 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 525
-- **Docs contributing at least one fix:** 155
+- **Total distinct fixes counted:** 532
+- **Docs contributing at least one fix:** 156
 - **Subsystem categories:** 15
 
 Updated 2026-08-07: +32 fixes / +19 docs, covering everything landed since
@@ -56,24 +56,37 @@ and edits to five already-zero-counted docs (marking `crush`/`needle-server`/
 `qjs`/`stdcheck`/`top` as removed) added to the zero-count list, contributing
 nothing.
 
+Updated 2026-08-09 (second pass, branch `fix-alloc-print`): +7 fixes / +1 doc —
+`ALLOC_PRINT_AUDIT.md`'s remediation pass (§7), all under Console & Terminal.
+Five are heap allocations feeding the kernel console, of which one is the only
+such violation ever found inside the sync-EL1 crash-handler call tree
+(`pmm::dp_counters_line()`); the other two are a stale boot self-test that
+hung every SMP=4 boot and a symbol-window bug that had been silently
+disabling `lockprobe.py`'s automatic storm captures. The audit's §1-§6 survey
+itself contributed zero fixes when it was written (read-only by design) and is
+counted here only for the §7 pass that closed it. The 59 "NOT WARRANTED"
+`safe_print!` conversions in the same branch are **not** counted: the audit is
+explicit that they were consistency/verbosity debt and "none of this is a
+correctness bug".
+
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 116 | 22.1% | 15 |
-| Memory & Virtual Memory | 89 | 17.0% | 25 |
-| Scheduler & Process Management | 72 | 13.7% | 16 |
-| SMP & Locking | 65 | 12.4% | 27 |
-| Networking | 30 | 5.7% | 12 |
-| Userspace Apps & Libraries | 32 | 6.1% | 16 |
-| Rump Kernel & Syscall Proxy | 24 | 4.6% | 5 |
-| Toolchain & Self-Hosting | 31 | 5.9% | 4 |
+| Syscall / ABI Compatibility Audits | 116 | 21.8% | 15 |
+| Memory & Virtual Memory | 89 | 16.7% | 25 |
+| Scheduler & Process Management | 72 | 13.5% | 16 |
+| SMP & Locking | 65 | 12.2% | 27 |
+| Networking | 30 | 5.6% | 12 |
+| Userspace Apps & Libraries | 32 | 6.0% | 16 |
+| Rump Kernel & Syscall Proxy | 24 | 4.5% | 5 |
+| Toolchain & Self-Hosting | 31 | 5.8% | 4 |
 | SSH | 12 | 2.3% | 10 |
-| VFS & Filesystem | 13 | 2.5% | 9 |
+| VFS & Filesystem | 13 | 2.4% | 9 |
 | Boot & Drivers | 9 | 1.7% | 5 |
 | Signals & Exceptions | 10 | 1.9% | 4 |
 | Misc / Cross-cutting | 8 | 1.5% | 1 |
-| Console & Terminal | 4 | 0.8% | 4 |
+| Console & Terminal | 11 | 2.1% | 5 |
 | Containers | 10 | 1.9% | 2 |
-| **Total** | **525** | **100.0%** | **155** |
+| **Total** | **532** | **100.0%** | **156** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -899,7 +912,7 @@ nothing.
 - Bug 13: IrqGuard DAIF save/restore regression
 
 
-## Console & Terminal (4 fixes, 4 docs)
+## Console & Terminal (11 fixes, 5 docs)
 
 ### docs/archive/PIPE_TTY_FIX.md
 - Pipe TTY processing root-cause fix
@@ -909,6 +922,16 @@ nothing.
 
 ### docs/archive/STDCHECK_DEBUG.md
 - Layout struct corruption during a function call (workaround applied)
+
+### docs/archive/ALLOC_PRINT_AUDIT.md
+(§7 remediation pass only. §1-§6 are the read-only survey that found these and contributed no fixes of their own. The branch's 59 `safe_print!` conversions are excluded as consistency debt, per the audit's own "none of this is a correctness bug".)
+- `pmm::dp_counters_line()` returned an `alloc::format!`-built `String` and was called from `log_memory_stats_on_crash`, i.e. from inside the sync-EL1 crash handler — the one place in the kernel whose whole design (`StaticWriter`, "no heap allocation" comment block) exists to avoid the allocator. A fault taken while a core already held the TALC heap lock (a fault inside `alloc`/`dealloc`, or heap corruption — exactly the conditions that produce such a fault) would re-enter that lock and hang the crash handler, losing every diagnostic line after it. The only heap violation ever found inside the crash-handler call tree; fixed by taking `&mut dyn core::fmt::Write` and rendering into the handler's own stack buffer
+- `akuma-exec::process::stats::dump()` built the entire `[PSTATS]` line on the heap — a `String` grown in a per-syscall loop, then a second `format!` for the whole line — and handed it straight to `print_str`, on a periodic sweep gated only by `PROCESS_SYSCALL_STATS_ENABLED`, a diagnostics feature meant to stay safe under the memory pressure a heap-free console exists for; now formats into a fixed 224 B stack buffer plus one `safe_print!`
+- `memory_monitor`'s `DOUBLE-FREE=` marker was built with `alloc::format!`/`String::new()` and folded into an otherwise heap-free stack buffer — a monitor reporting a PMM/allocator health signal via a path that itself required a healthy heap; now appended conditionally straight into the existing buffer
+- `file_page_cache::stats_line()` returned an `alloc::format!` `String` consumed by a single `safe_print!("{}", …)` on the memory-monitor tick; converted to write into the caller's buffer
+- `syscall::mem::dontneed_audit_line()` — same shape, same tick, same fix
+- Boot self-test `test_poll_bkl_drop` called `ppoll(NULL, 0, NULL, …)` expecting an early return, but that is precisely how musl implements `pause()`; once the "`nfds == 0` is not nothing-to-do" fix landed, `sys_ppoll` blocked on it forever and the self-test suite never reached SSH — hanging every SMP=4 boot at that test. Stale test, not a kernel defect; now passes a zero `timespec`
+- `scripts/lockprobe.py` filtered kernel symbols to `0x40100000..0x40400000`, but `.bss` outgrew 3 MB and `KERNEL_LOCK` moved to ~`0x404ce0b8`, so the probe aborted with a misleading `KERNEL_LOCK not found — wrong ELF?` — silently disabling every automatic BKL-storm capture in `j4_selfhost_campaign.py`
 
 ### docs/archive/SERIAL_TRACE_TRAFFIC_AUDIT.md
 - Three per-event kernel traces (`[IA-DP] file region:` demand-page, `[pipe]` lifecycle, `[mmap]`/`[mprotect]`) printed unconditionally, saturating the single shared UART under a parallel `-j4` build (~270 KB/s, a 115200-baud line ~20x over-saturated) and serializing every logging core on the console lock — turning an in-VM self-host build from "never completes in over an hour" into a 2m21s green run once gated; `DEMAND_PAGE_LOG_ENABLED`, the flag meant to gate the largest of the three, was dead — defined and documented but with zero readers anywhere in the tree — so fixing it required wiring a live check, not flipping an existing one

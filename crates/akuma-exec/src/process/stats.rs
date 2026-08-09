@@ -1,6 +1,5 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::format;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::fmt::Write;
 
@@ -82,32 +81,41 @@ impl ProcessSyscallStats {
         let pf = self.pagefaults.load(Ordering::Relaxed);
         let pf_pg = self.pagefault_pages.load(Ordering::Relaxed);
 
-        let mut top = String::new();
-        for (i, (nr, count, time)) in entries.iter().enumerate() {
-            if i > 0 { top.push(' '); }
-            let sname = syscall_name(*nr);
-            let time_ms = *time / 1000;
-            if sname.is_empty() {
-                let _ = write!(&mut top, "nr{}={}({}ms)", nr, count, time_ms);
-            } else {
-                let _ = write!(&mut top, "{}={}({}ms)", sname, count, time_ms);
+        // `top` is genuinely variable-cardinality (0-10 syscalls, runtime-sorted),
+        // so it's built into a fixed stack buffer via `FmtBuf` instead of a heap
+        // `String` — this sweep runs under `PROCESS_SYSCALL_STATS_ENABLED`, a
+        // diagnostics feature meant to stay safe under the memory pressure a
+        // heap-free console path exists for (ALLOC_PRINT_AUDIT.md §3.9).
+        let mut top_buf = [0u8; 224];
+        let mut top_pos = 0usize;
+        {
+            let mut top = super::FmtBuf { buf: &mut top_buf, pos: &mut top_pos };
+            for (i, (nr, count, time)) in entries.iter().enumerate() {
+                if i > 0 { let _ = top.write_str(" "); }
+                let sname = syscall_name(*nr);
+                let time_ms = *time / 1000;
+                if sname.is_empty() {
+                    let _ = write!(top, "nr{}={}({}ms)", nr, count, time_ms);
+                } else {
+                    let _ = write!(top, "{}={}({}ms)", sname, count, time_ms);
+                }
+                if i >= 9 { break; }
             }
-            if i >= 9 { break; }
         }
+        let top = core::str::from_utf8(&top_buf[..top_pos]).unwrap_or("");
 
         let total_time_ms = total_time_us / 1000;
         // `retired=` is the live form of the gap doc's detection signature: PMM free
         // pinned at the reserve while reclaimable memory sits parked means the
         // collectors are starved, not that memory is gone
         // (docs/archive/OOM_KILL_DEFERRED_RECLAIM_GAP.md §6).
-        let msg = format!(
+        crate::safe_print!(384,
             "[PSTATS] PID {} ({}) {}.{:02}s: {} syscalls ({}/s) in_kernel={}ms pmm={}free/{}tot retired={}/{}p pgfault={}({}pg) | {}\n",
             pid, name, secs, frac, total, rate, total_time_ms,
             pmm_free, pmm_total,
             table::retired_process_count(), crate::process::reclaim::retired_pages_pending(),
             pf, pf_pg, top,
         );
-        (runtime().print_str)(&msg);
     }
 }
 

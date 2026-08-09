@@ -53,7 +53,13 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_ELF = os.path.join(REPO, "target/aarch64-unknown-none/release-smp-shared/akuma")
-IMG_LO, IMG_HI = 0x40100000, 0x40400000
+# Window used to reject absolute/host symbols and to sanity-check register values
+# before symbolising them. It must cover the whole loaded image *including .bss* --
+# `KERNEL_LOCK` itself is a .bss symbol, and when the image outgrew a too-tight
+# IMG_HI every probe failed with a misleading "KERNEL_LOCK not found - wrong ELF?".
+# 0x40100000 is KERNEL_PHYS_BASE; 8 MB of headroom keeps this from rotting again
+# (release-smp-shared's .bss ended around 0x404d0000 when this was last widened).
+IMG_LO, IMG_HI = 0x40100000, 0x40900000
 BARGE_MAX_CORES = 8          # KernelLock::barged: [AtomicBool; BARGE_MAX_CORES]
 
 # ESR_EL1 exception class (bits 31:26) -> meaning. Only the classes that show up

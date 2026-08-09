@@ -181,15 +181,8 @@ fn slot_still_owned_by(tid: usize, pid: Pid) -> bool {
     );
     match owner {
         Some(owner) if owner != pid => {
-            let mut buf = [0u8; 112];
-            let mut pos = 0;
-            let _ = core::fmt::write(
-                &mut crate::process::FmtBuf { buf: &mut buf, pos: &mut pos },
-                format_args!("[kill] pid={} stale tid={} now owned by pid={}\n",
-                    pid, tid, owner));
-            if let Ok(s) = core::str::from_utf8(&buf[..pos]) {
-                (crate::runtime::runtime().print_str)(s);
-            }
+            crate::safe_print!(112, "[kill] pid={} stale tid={} now owned by pid={}\n",
+                pid, tid, owner);
             false
         }
         _ => true,

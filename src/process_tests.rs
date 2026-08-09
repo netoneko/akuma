@@ -3718,7 +3718,13 @@ fn test_poll_bkl_drop() {
     };
 
     // ── Early-error paths: must never open the window ──────────────────────
-    let r = handle_syscall(nr::PPOLL, &[0, 0, 0, 0, 0, 0]);
+    // `ppoll(NULL, 0, NULL, ...)` is *not* an early return: it is exactly how musl
+    // implements `pause()`, so `sys_ppoll` blocks on it until a signal — forever, for
+    // this thread. (It used to return 0, which made `alarm()`+`pause()` a no-op; that
+    // was fixed in the "nfds == 0 is NOT nothing-to-do" change.) Pass a zero timeout so
+    // this stays a non-blocking probe of the entry path, which is all it ever tested.
+    let tmo_zero = TestTimespec { tv_sec: 0, tv_nsec: 0 };
+    let r = handle_syscall(nr::PPOLL, &[0, 0, (&raw const tmo_zero) as u64, 0, 0, 0]);
     if r != 0 { fails += 1; crate::safe_print!(96, "[Test] poll-bkl-drop: ppoll(nfds=0) FAILED r={} (want 0)\n", r); }
     balanced("ppoll(nfds=0)", &mut fails);
 

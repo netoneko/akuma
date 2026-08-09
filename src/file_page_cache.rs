@@ -272,14 +272,17 @@ pub fn shrink(want: usize) -> usize {
     n
 }
 
-/// One-line summary for the 30 s PSTATS block.
-pub fn stats_line() -> alloc::string::String {
-    alloc::format!(
-        "[FPCACHE] entries={} hits={} misses={} evict={} inval={}\n",
+/// One-line summary for the 30 s PSTATS block. Writes into the caller's
+/// buffer instead of returning a `String` — this runs on the periodic
+/// memory-monitor tick and shouldn't need a healthy heap to report itself.
+pub fn stats_line(w: &mut dyn core::fmt::Write) {
+    let _ = writeln!(
+        w,
+        "[FPCACHE] entries={} hits={} misses={} evict={} inval={}",
         len(),
         HITS.load(Ordering::Relaxed),
         MISSES.load(Ordering::Relaxed),
         EVICTIONS.load(Ordering::Relaxed),
         INVALIDATIONS.load(Ordering::Relaxed),
-    )
+    );
 }
