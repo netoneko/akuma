@@ -1473,7 +1473,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
     // namespace — or into a sibling's — and reads whatever that box can see.
     // `box_id == 0` means "inherit the caller's box" and needs no check.
     if o.box_id != 0 {
-        let (caller_box, caller_pid) = super::container::caller_box_and_pid();
+        let (caller_box, caller_pid) = super::caller_box_and_pid();
         let registry = akuma_exec::process::registry_snapshot();
         if !akuma_exec::process::box_access::can_access_box(&registry, caller_box, o.box_id, caller_pid) {
             return EPERM;
@@ -1538,7 +1538,7 @@ pub fn sys_set_box_stack(box_id: u64, stack: u64) -> u64 {
     // Repointing a box's network stack decides where its AF_INET syscalls are
     // proxied, so it is only the owner's call — otherwise any process could
     // route a box it does not own at a rump server it does.
-    let (caller_box, caller_pid) = super::container::caller_box_and_pid();
+    let (caller_box, caller_pid) = super::caller_box_and_pid();
     let registry = akuma_exec::process::registry_snapshot();
     if !akuma_exec::process::box_access::can_access_box(&registry, caller_box, box_id, caller_pid) {
         return EPERM;

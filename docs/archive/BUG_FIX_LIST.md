@@ -9,8 +9,8 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 532
-- **Docs contributing at least one fix:** 156
+- **Total distinct fixes counted:** 535
+- **Docs contributing at least one fix:** 157
 - **Subsystem categories:** 15
 
 Updated 2026-08-07: +32 fixes / +19 docs, covering everything landed since
@@ -69,24 +69,36 @@ counted here only for the §7 pass that closed it. The 59 "NOT WARRANTED"
 explicit that they were consistency/verbosity debt and "none of this is a
 correctness bug".
 
+Updated 2026-08-09 (third pass, branch `fix-extreme-size`): +3 fixes / +1 doc —
+`EXTREME_SIZE_BUILD_FIX.md`, all under Misc / Cross-cutting. Two are the
+`extreme-size` build breakage (a `#[cfg]` that had drifted onto the wrong `mod`,
+and a container-gated helper called from ungated syscalls); the third is the
+same stray attribute's silent side effect, `fw_cfg` left un-gated in
+`release`/`size` since June. Unusual for this file in that none of the three
+were runtime regressions — two were compile failures in a profile nobody had
+built since `37be208`, and the third was invisible precisely *because* it kept
+compiling. The doc's `curl` matrix and its two open defects (intermittent
+`/bin/curl` EL1 fault on extreme, ~11 % of boots; `mv`-then-exec resolving a
+stale directory entry) are **not** counted — neither is fixed.
+
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 116 | 21.8% | 15 |
-| Memory & Virtual Memory | 89 | 16.7% | 25 |
+| Syscall / ABI Compatibility Audits | 116 | 21.7% | 15 |
+| Memory & Virtual Memory | 89 | 16.6% | 25 |
 | Scheduler & Process Management | 72 | 13.5% | 16 |
-| SMP & Locking | 65 | 12.2% | 27 |
+| SMP & Locking | 65 | 12.1% | 27 |
 | Networking | 30 | 5.6% | 12 |
 | Userspace Apps & Libraries | 32 | 6.0% | 16 |
 | Rump Kernel & Syscall Proxy | 24 | 4.5% | 5 |
 | Toolchain & Self-Hosting | 31 | 5.8% | 4 |
-| SSH | 12 | 2.3% | 10 |
+| SSH | 12 | 2.2% | 10 |
 | VFS & Filesystem | 13 | 2.4% | 9 |
 | Boot & Drivers | 9 | 1.7% | 5 |
 | Signals & Exceptions | 10 | 1.9% | 4 |
-| Misc / Cross-cutting | 8 | 1.5% | 1 |
+| Misc / Cross-cutting | 11 | 2.1% | 2 |
 | Console & Terminal | 11 | 2.1% | 5 |
 | Containers | 10 | 1.9% | 2 |
-| **Total** | **532** | **100.0%** | **156** |
+| **Total** | **535** | **100.0%** | **157** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -899,7 +911,22 @@ correctness bug".
 - The `EC=0x0` (undefined-instruction) exception handler hard-killed the process instead of delivering SIGILL, so OpenSSL's ARM-feature-probe idiom (deliberately executing an unsupported instruction inside a SIGILL handler) could never recover, crashing nightly `cargo` under HVF at a fixed PC (`SM3SS1`, FEAT_SM3); fixed by routing `EC=0x0` through `try_deliver_signal` like the other fatal-fault arms
 
 
-## Misc / Cross-cutting (8 fixes, 1 docs)
+## Misc / Cross-cutting (11 fixes, 2 docs)
+
+### docs/archive/EXTREME_SIZE_BUILD_FIX.md
+- `mod file_page_cache;` was declared under a `#[cfg(feature = "sc-framebuffer")]`
+  that belonged to the following `mod fw_cfg;` (inserted between attribute and
+  module by `6f01fe7`), breaking every non-`sc-framebuffer` profile with 15 ×
+  `E0433` while ~15 call sites in `fs.rs`/`pmm.rs`/`vfs/mod.rs`/`main.rs`/
+  `exceptions.rs` stayed unconditional — `extreme-size` had not compiled since
+- The same stray gate silently un-gated `fw_cfg` for `release`/`size`, which had
+  been carrying it unconditionally since `27fdf90` intended the opposite;
+  re-gating restores that profile's size intent
+- `sys_spawn_ext` / `sys_set_box_stack` called `super::container::caller_box_and_pid()`
+  unconditionally, but `mod container` is `sc-containers`-gated and both syscalls
+  are dispatched regardless (2 × `E0433` on `extreme-size`); helper moved ungated
+  to `syscall/mod.rs` rather than stubbed, since a `(0, 0)` stub would make every
+  caller look like host/box 0 and defeat `can_access_box`
 
 ### docs/archive/KERNEL_SPLIT_BUGS.md
 - neatvi showed garbage characters at end of newlines

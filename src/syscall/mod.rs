@@ -40,6 +40,18 @@ mod time;
 #[cfg(feature = "sc-timerfd")]
 mod timerfd;
 
+/// The calling process's `(box_id, pid)`.
+///
+/// A kernel thread has no `Process`, which is how the built-in shell and the
+/// boot path reach the box syscalls; it is the host, box 0. Every box-access
+/// check keys off this, so it is the one place the caller's identity is
+/// decided. It lives here rather than in `container` because `proc`'s
+/// `SPAWN_EXT` / `SET_BOX_STACK` gate on it too, and those are dispatched even
+/// when `sc-containers` is off (extreme-size).
+pub(crate) fn caller_box_and_pid() -> (u64, u32) {
+    akuma_exec::process::current_process_shared().map_or((0, 0), |p| (p.box_id, p.pid))
+}
+
 pub use sync::futex_wake;
 pub use sync::futex_purge_tid;
 pub use sync::futex_dump;

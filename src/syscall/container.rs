@@ -1,15 +1,6 @@
 use super::*;
 use akuma_exec::mmu::user_access::copy_from_user_safe;
 
-/// The calling process's `(box_id, pid)`.
-///
-/// A kernel thread has no `Process`, which is how the built-in shell and the
-/// boot path reach these syscalls; it is the host, box 0. Every check below
-/// keys off this, so it is the one place the caller's identity is decided.
-pub(super) fn caller_box_and_pid() -> (u64, u32) {
-    akuma_exec::process::current_process_shared().map_or((0, 0), |p| (p.box_id, p.pid))
-}
-
 pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root_len: usize, primary_pid: u32) -> u64 {
     if !validate_user_ptr(name_ptr, name_len) { return EFAULT; }
     if !validate_user_ptr(root_ptr, root_len) { return EFAULT; }

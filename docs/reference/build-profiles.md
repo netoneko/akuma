@@ -21,7 +21,7 @@ feature (`build.rs` cannot see `OPT_LEVEL` to distinguish them).
 |---|---|---|---|---|---|
 | **release** (default) | `release` | `cargo build --release` / `cargo run --release` | 3.8 MB | smoltcp (native) + built-in SSH | Day-to-day development image. Full feature set: editor, sound, TLS (RSA + Ed25519), rump *available* (opt-in per box), all `sc-*` syscall families. |
 | **size** | `size` (inherits `release`) | `scripts/build_size.sh` | 882 KB text | smoltcp + built-in SSH + `kernel-tls` | Slimmer image for constrained VMs. Drops `neko` and `tls-rsa` (RSA-only HTTPS breaks; SSH is Ed25519-only and unaffected). Keeps every `sc-*` family. |
-| **extreme-size** | `extreme-size` (inherits `size`) | `scripts/build_extreme_size.sh` | 665 KB text | smoltcp + built-in SSH, **no HTTPS** | 4 MB RAM floor target. Same codegen knobs as `size`; the *only* discriminator is the `extreme` feature, since both profiles use `opt-level = "z"`. Drops `kernel-tls` entirely (no in-kernel `curl https://`), `neko`, `tls-rsa`, tighter stack/heap constants via `cfg(kernel_profile_extreme)`. **Does not compile at `d3f28d6` — see [Known breakage](#known-breakage-extreme-size-at-d3f28d6).** |
+| **extreme-size** | `extreme-size` (inherits `size`) | `scripts/build_extreme_size.sh` | 684 KB text | smoltcp + built-in SSH, **no HTTPS** | 4 MB RAM floor target. Same codegen knobs as `size`; the *only* discriminator is the `extreme` feature, since both profiles use `opt-level = "z"`. Drops `kernel-tls` entirely (no in-kernel `curl https://`), `neko`, `tls-rsa`, tighter stack/heap constants via `cfg(kernel_profile_extreme)`. Compiles again since `fix-extreme-size` — see [Fixed](#fixed-extreme-size-build-breakage-was-broken-at-d3f28d6). |
 | **release-smp** | `release-smp` (inherits `release`) | `cargo build --profile release-smp --features smp` | 2.9 MB | smoltcp + built-in SSH | Multikernel / one-kernel-per-core (see `docs/reference/subsystems/smp.md`). Off by default — `cargo build --release` is byte-for-byte single-core; this target adds secondary-core bringup, PSCI `CPU_ON`, the inter-core message bus. |
 | **release-smp-shared** | `release-smp-shared` (inherits `release`) | `cargo build --profile release-smp-shared --features smp-shared` | 4.0 MB | smoltcp + built-in SSH | Real (shared-kernel) SMP — one shared kernel across cores (see `docs/reference/subsystems/smp-shared.md`). The **inverse** of `release-smp`: all cores share one kernel/PMM/heap/run-queue under real locks. Mutually exclusive with `smp` (build.rs panics if both). |
 | **devbox** | `devbox` (inherits `release`) | `scripts/build_devbox.sh` / `overlays/devbox/run.sh` | 1.4 MB | **rump only** (no smoltcp, no built-in SSH) | *(deferred — see `devbox-smoltcp`.)* Rump-stack workstation image: NetBSD rump as box 0's default stack, built-in SSH dropped. `--no-default-features`, so smoltcp (and `kernel-tls`/`tls-rsa`/built-in SSH) is compiled out. |
@@ -155,24 +155,24 @@ against a 4 MB floor whose boot-stack reservation is itself derived from the
 linked image size in `linker.ld`. Runtime RSS of `/bin/sshd` is unmeasured; that
 is the missing number for deciding.
 
-## Known breakage: `extreme-size` at `d3f28d6`
+## Fixed: `extreme-size` build breakage (was broken at `d3f28d6`)
 
-`scripts/build_extreme_size.sh` fails with 15 × `E0433: failed to resolve: could
-not find file_page_cache in the crate root`.
+`scripts/build_extreme_size.sh` used to fail with 17 × `E0433` (15 ×
+`file_page_cache`, 2 × `container`). Both were `mod` declarations sitting under a
+`#[cfg]` that belonged to another module; fixed on `fix-extreme-size`.
 
-`src/main.rs:45` declares `mod file_page_cache;` behind
-`#[cfg(feature = "sc-framebuffer")]`, but the module is called unconditionally
-from `src/pmm.rs:791`, `src/fs.rs:128`, `src/vfs/mod.rs:272,276`,
-`src/main.rs:1531`, and ~10 sites in `src/exceptions.rs`. `extreme-size` builds
-`--no-default-features --features no-tests,smoltcp,extreme`, which excludes
-`sc-framebuffer` — so the declaration disappears while every call site remains.
-Introduced by `37be208`. `release` and `size` are unaffected (both keep
-`sc-framebuffer`).
+The page-cache one also had a silent second effect: the stray gate had been
+un-gating `mod fw_cfg;` since June, so `release` and `size` were carrying
+`fw_cfg` unconditionally. Both are corrected — `file_page_cache` is now
+unconditional and `fw_cfg` is back under `sc-framebuffer`.
 
-Fix is either gating the call sites to match or moving the `mod` declaration out
-from behind `sc-framebuffer`. For measurement only,
-`scripts/build_extreme_size.sh --features sc-framebuffer` compiles — but it adds
-the page cache to the image, so it is not a substitute for the fix.
+Compiling the shared file-page cache into `extreme-size` costs **+9,888 B text
+(+1.4 %)**, and it is live there (`[FPCACHE] entries=390 hits=12` on a 64 MB
+boot with one `curl`).
+
+Full write-up, plus the `curl` matrix (built-in vs `/bin/curl`, plain vs `-v`,
+extreme vs release) and two open defects it surfaced:
+[`docs/archive/EXTREME_SIZE_BUILD_FIX.md`](../archive/EXTREME_SIZE_BUILD_FIX.md).
 
 ## Feature deltas vs. default `release`
 

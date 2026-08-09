@@ -41,8 +41,9 @@ mod editor;
 // mod embassy_time_driver; // replaced by kernel_timer
 // mod embassy_virtio_driver;
 mod exceptions;
-#[cfg(feature = "sc-framebuffer")]
 mod file_page_cache;
+// fw_cfg exists only to configure ramfb, so it follows the framebuffer gate.
+#[cfg(feature = "sc-framebuffer")]
 mod fw_cfg;
 mod kernel_timer;
 mod fs;
