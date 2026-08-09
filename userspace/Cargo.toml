@@ -14,6 +14,7 @@ members = [
     "echo2",
     "elftest",
     "hello",
+    "paws",
     "herd",
     "httpd",
     "stackstress",

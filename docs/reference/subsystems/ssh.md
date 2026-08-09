@@ -90,11 +90,10 @@ ShellSession → Disconnected`.
   sessions).
 - Used by **every profile except `extreme-size`**.
 - **Started two different ways.** Normally herd launches it from
-  `/etc/herd/enabled/sshd.conf` — which still says `--port 23`, so those images
-  answer on host port **2323**, not 2222 (a leftover from when the built-in
-  server owned 22). On `extreme + userspace-sshd` there is no herd, and
-  `config::AUTO_START_SSHD` spawns `/bin/sshd --port 22 --shell /bin/sh` directly
-  from `kernel_main`.
+  `/etc/herd/enabled/sshd.conf` (`--port 22` since 2026-08-10, so host `2222` as
+  documented; disks populated before that still say `--port 23`). On
+  `extreme + userspace-sshd` there is no herd, and `config::AUTO_START_SSHD`
+  spawns `/bin/sshd --port 22 --shell /bin/sh` directly from `kernel_main`.
 
 ### Known: unauthenticated pre-auth panic
 

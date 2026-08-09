@@ -140,18 +140,59 @@ from `kernel_main` instead.
 - Live: default `--release` at 512 MB boots and is reachable — **but on port
   2323, not 2222** (see below).
 
-## Open: the default image moved to port 2323
+## Resolved: the default image is back on port 2222
 
-`bootstrap/etc/herd/enabled/sshd.conf` sets `args = --port 23`, chosen when the
-built-in server owned port 22 and the userspace one had to avoid it. Port 22 is
-now free on every non-extreme image, but `ssh -p 2222` — what `CLAUDE.md`, the
-runbooks and the acceptance playbooks all tell you to use — no longer answers
-there.
+`bootstrap/etc/herd/enabled/sshd.conf` had `args = --port 23`, chosen when the
+built-in server owned port 22 and the userspace one had to avoid it. With the
+built-in server gone from every non-extreme profile, port 22 was free but
+nothing bound it, so `ssh -p 2222` — what `CLAUDE.md`, the runbooks and 11 of
+the 12 acceptance playbooks tell you to use — stopped answering.
 
-Flipping `sshd.conf` to port 22 is not a straight fix: **extreme** still runs
-the built-in server on 22 *and* starts herd (when `userspace-sshd` is off), so
-both would bind the same port. Resolving this needs either a per-profile sshd
-config or extreme dropping herd's sshd entirely. Unresolved as of this doc.
+Changed to `--port 22` and verified live on the default box (`cargo run
+--release`, 256 MB, `disk.img`): `ssh -p 2222` returns `PORT_2222_OK`, and 2323
+now correctly refuses. Existing disks need `scripts/populate_disk.sh --overlay`
+with a tree containing `etc/herd/enabled/sshd.conf` (surgical — no `/etc` wipe,
+so the host key survives).
+
+## Open: extreme double-binds port 22
+
+The flip above breaks `extreme-size`, which is the one profile that still runs
+the built-in server *and* lets herd start `/bin/sshd`. Both now target port 22,
+and **the kernel does not reject the second bind**:
+
+```
+[SSH Server] Starting SSH server on port 22...
+[SSH Server] Listening...
+[herd] Started sshd (pid= 4) on BSP fallback
+[syscall] bind(fd=3, port=22, ip=0.0.0.0)        ← succeeds, no EADDRINUSE
+```
+
+Observed result on a 4.5 MB extreme boot: `ssh -p 2222` **hangs** (90 s, no
+banner). The serial log shows the built-in server taking the connection
+(`[SSH] New SSH connection` → `Client version received` → `Connection ended`)
+while the userspace sshd's child thrashes the page pool:
+
+```
+[IA-DP] pid=5 va=0x100b5a00 readahead pool exhausted, 16 free pages — retrying single page
+```
+
+So it is not a clean "second listener loses" — it is two owners of one port on a
+box with no pages to spare.
+
+Two things to fix here, and they are independent:
+
+1. **`bind()` should return `EADDRINUSE` when an in-kernel listener holds the
+   port.** Silently accepting a conflicting bind is wrong on any profile; it
+   just has nowhere to show up until two servers want the same port. This is the
+   real defect.
+2. **Extreme should not run two sshds.** herd's `/bin/sshd` is pure redundancy
+   there — the built-in server already serves 22 — and it costs RAM on the
+   profile least able to pay. The measured-better configuration is
+   `extreme + userspace-sshd` (2712 KB idle free vs 968 KB), which turns herd off
+   and lets `AUTO_START_SSHD` own port 22 alone. Adopting that for extreme would
+   make the built-in server dead code on every profile and close this out;
+   keeping the built-in server means finding another way to stop herd starting
+   its sshd on a disk shared by all profiles.
 
 ## Found
 

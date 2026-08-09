@@ -161,12 +161,17 @@ defects it surfaced: [`../archive/BUILTIN_SSH_REMOVAL.md`](../archive/BUILTIN_SS
 
 ### Ports
 
-`bootstrap/etc/herd/enabled/sshd.conf` still starts the userspace sshd on
-**port 23** (host `2323`), a choice made when the built-in server owned port 22.
-On every non-extreme image port 22 is now free but nothing binds it, so
-`ssh -p 2222` does not answer — use `-p 2323`. Flipping the config to 22 would
-collide on extreme, which runs the built-in server there *and* starts herd.
-Unresolved.
+`bootstrap/etc/herd/enabled/sshd.conf` now starts the userspace sshd on
+**port 22** (host `2222`), so every profile answers on the documented port —
+the built-in server on `extreme-size`, the userspace one everywhere else. A disk
+populated before 2026-08-10 still carries `--port 23`; re-overlay `bootstrap/etc/`.
+
+**Known break on `extreme-size`.** That profile runs the built-in server on 22
+*and* still lets herd start `/bin/sshd`, which now also binds 22. The kernel does
+not reject the second bind — `[syscall] bind(fd=3, port=22)` succeeds with no
+`EADDRINUSE` — and the result is a hung SSH session plus page-pool starvation on
+a 4.5 MB box. See [`../archive/BUILTIN_SSH_REMOVAL.md`](../archive/BUILTIN_SSH_REMOVAL.md)
+§ "Open: extreme double-binds port 22".
 
 ## Fixed: `extreme-size` build breakage (was broken at `d3f28d6`)
 
