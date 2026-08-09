@@ -82,16 +82,19 @@ mod smp;
 mod smp_shared;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod sync_tests;
-// The built-in (in-kernel) SSH server is built on smoltcp sockets, so it is
-// compiled out with the native stack (devbox / rump-only). SSH there is the
-// userspace /bin/sshd (herd), which routes over rump like any other process.
-#[cfg(feature = "smoltcp")]
+// The built-in (in-kernel) SSH server. Compiled in only under
+// `cfg(kernel_builtin_ssh)` (build.rs): it is built on smoltcp sockets, so it
+// needs the native stack, AND it is pointless once `userspace-sshd` is on —
+// there the userspace /bin/sshd serves SSH and this copy is never started.
+// Gating the module (rather than only `config::ENABLE_USERSPACE_SSHD` at
+// runtime) is what keeps the whole SSH-2 implementation, and the `akuma-ssh`
+// crate behind it, out of the image.
+#[cfg(kernel_builtin_ssh)]
 mod ssh;
-#[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), feature = "smoltcp"))]
+#[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), kernel_builtin_ssh))]
 mod ssh_tests;
-// The only in-kernel SSH server is smoltcp-based; with it gone there must be a
-// userspace sshd, or the image has no way in.
-#[cfg(all(not(feature = "smoltcp"), not(feature = "userspace-sshd")))]
+// Every image needs some way in: either the built-in server or a userspace one.
+#[cfg(all(not(kernel_builtin_ssh), not(feature = "userspace-sshd")))]
 compile_error!("no in-kernel SSH without `smoltcp`; enable the `userspace-sshd` feature (userspace /bin/sshd)");
 mod syscall;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
@@ -1346,6 +1349,8 @@ fn run_async_main() -> ! {
             && ram <= config::LOW_MEM_TEST_SKIP_MB * 1024 * 1024;
         if !config::DISABLE_ALL_TESTS && !low_mem_skip_tests {
             process_tests::run_network_tests();
+            // The SSH suite exercises the built-in server, so it goes when it does.
+            #[cfg(kernel_builtin_ssh)]
             ssh_tests::run_all_tests();
         }
     }
@@ -1394,32 +1399,26 @@ fn run_async_main() -> ! {
     #[cfg(kernel_smp)]
     smp::autostart_bench_core();
 
-    // Initialize SSH host key (built-in SSH server is smoltcp-only).
-    #[cfg(feature = "smoltcp")]
-    ssh::init_host_key();
-
     // Built-in (smoltcp) SSH server. Compiled out entirely when the native stack
-    // is absent (devbox / rump-only) — there SSH is the userspace /bin/sshd.
-    #[cfg(feature = "smoltcp")]
-    if !config::ENABLE_USERSPACE_SSHD {
+    // is absent (devbox / rump-only) or `userspace-sshd` is on — there SSH is the
+    // userspace /bin/sshd, and nothing of this implementation is in the image.
+    #[cfg(kernel_builtin_ssh)]
+    {
+        ssh::init_host_key();
         console::print("[Main] Spawning built-in SSH server thread...\n");
         if let Err(e) = threading::spawn_system_thread_fn(|| ssh::server::run()) {
             console::print("[Main] Failed to spawn SSH server: ");
             console::print(e);
             console::print("\n");
         }
-    } else {
-        console::print("[Main] Built-in SSH server disabled (ENABLE_USERSPACE_SSHD=true)\n");
     }
-    #[cfg(not(feature = "smoltcp"))]
-    console::print("[Main] Built-in SSH server not compiled (rump-only build); userspace /bin/sshd only\n");
+    #[cfg(not(kernel_builtin_ssh))]
+    console::print("[Main] Built-in SSH server not compiled; userspace /bin/sshd only\n");
 
     safe_print!(1024, "[Main] Network ready! Running background polling loop.\n");
-    #[cfg(feature = "smoltcp")]
-    if !config::ENABLE_USERSPACE_SSHD {
-        safe_print!(1024, "[Main] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p {}\n",
-            if crate::config::SSH_PORT == 22 { 2222 } else { crate::config::SSH_PORT });
-    }
+    #[cfg(kernel_builtin_ssh)]
+    safe_print!(1024, "[Main] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p {}\n",
+        if crate::config::SSH_PORT == 22 { 2222 } else { crate::config::SSH_PORT });
 
     // Enable IRQs for the main loop
     unsafe {
@@ -1857,9 +1856,9 @@ async fn memory_monitor() -> ! {
         // for the extreme kernel stacks. Printed on its own line to keep [Mem] short.
         akuma_exec::threading::report_stack_high_water();
 
-        // SSH server stats + stall watchdog. The built-in server is smoltcp-only,
-        // so this whole report compiles out on a rump-only build.
-        #[cfg(feature = "smoltcp")]
+        // SSH server stats + stall watchdog. Reports on the built-in server, so
+        // it compiles out with it (rump-only builds and `userspace-sshd` images).
+        #[cfg(kernel_builtin_ssh)]
         {
         let ssh = ssh::server::stats();
         buf.clear();

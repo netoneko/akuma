@@ -10,6 +10,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_drivers)");
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_irq)");
     println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
+    println!("cargo::rustc-check-cfg=cfg(kernel_builtin_ssh)");
 
     // Multikernel (one-kernel-per-core) gate. ALL secondary-core code lives behind
     // `cfg(kernel_smp)`; with the feature off, none of it compiles and the default
@@ -137,6 +138,27 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BKL_PROFILE");
     if std::env::var("CARGO_FEATURE_BKL_PROFILE").is_ok() {
         println!("cargo:rustc-cfg=kernel_bkl_profile");
+    }
+
+    // Built-in (in-kernel) SSH server gate. Two conditions have to hold for the
+    // server to be worth compiling: it is built on smoltcp sockets (so it needs
+    // the native stack), and `userspace-sshd` must be OFF (with it on the image
+    // serves SSH from the userspace /bin/sshd and the in-kernel copy would never
+    // be started — `config::ENABLE_USERSPACE_SSHD` only stopped it at *runtime*,
+    // leaving the whole SSH-2 implementation resident in the image).
+    //
+    // `cfg(kernel_builtin_ssh)` is what removes it from the build: `mod ssh`, the
+    // `ssh_tests` suite, the shell's interactive SSH entry points and the `[SSH]`
+    // stats report all hang off it, so with the cfg absent nothing references the
+    // `akuma-ssh` crate and LTO drops it entirely. See
+    // docs/archive/TRIM_FAT_SSHD.md § "The in-kernel SSH server is a candidate
+    // for removal".
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMOLTCP");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_USERSPACE_SSHD");
+    let builtin_ssh = std::env::var("CARGO_FEATURE_SMOLTCP").is_ok()
+        && std::env::var("CARGO_FEATURE_USERSPACE_SSHD").is_err();
+    if builtin_ssh {
+        println!("cargo:rustc-cfg=kernel_builtin_ssh");
     }
 
     // OPT_LEVEL is "z" only for profile.size / profile.extreme-size (opt-level = "z").
