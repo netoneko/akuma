@@ -9,9 +9,19 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 535
-- **Docs contributing at least one fix:** 157
+- **Total distinct fixes counted:** 536
+- **Docs contributing at least one fix:** 158
 - **Subsystem categories:** 15
+
+Updated 2026-08-10 (branch `rewrite-sshd-libc`): +1 fix / +1 doc —
+`userspace/sshd/docs/PROTOCOL_UNDER_LOAD.md`, an unauthenticated remote crash
+in userspace `sshd`'s packet framing (unchecked `packet_len - padding_len - 1`
+underflow, panic=abort takes the whole shared process down with every open
+session). Found while auditing the protocol for load-related issues, verified
+live against a fresh `devbox-smoltcp` SMP=4 boot, and fixed. The same bug in
+the **in-kernel** SSH server (`crates/akuma-ssh`, out of scope this session)
+was found and confirmed (full VM wedge, not just a process crash) but left
+unfixed — noted in `docs/archive/TRIM_FAT_SSHD.md`, not counted here.
 
 Updated 2026-08-07: +32 fixes / +19 docs, covering everything landed since
 commit `4c13831` (2026-08-01, when this file was last committed) through the
@@ -91,14 +101,14 @@ stale directory entry) are **not** counted — neither is fixed.
 | Userspace Apps & Libraries | 32 | 6.0% | 16 |
 | Rump Kernel & Syscall Proxy | 24 | 4.5% | 5 |
 | Toolchain & Self-Hosting | 31 | 5.8% | 4 |
-| SSH | 12 | 2.2% | 10 |
+| SSH | 13 | 2.4% | 11 |
 | VFS & Filesystem | 13 | 2.4% | 9 |
 | Boot & Drivers | 9 | 1.7% | 5 |
 | Signals & Exceptions | 10 | 1.9% | 4 |
 | Misc / Cross-cutting | 11 | 2.1% | 2 |
 | Console & Terminal | 11 | 2.1% | 5 |
 | Containers | 10 | 1.9% | 2 |
-| **Total** | **535** | **100.0%** | **157** |
+| **Total** | **536** | **100.0%** | **158** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -798,7 +808,7 @@ stale directory entry) are **not** counted — neither is fixed.
 - `DRAINING[tid]` (the pressure-reclaim in-progress flag) had the identical stuck-forever shape — a recycled slot's new occupant inherited a stale "already draining" flag; fixed by clearing it in `scrub_thread_slot`
 
 
-## SSH (12 fixes, 10 docs)
+## SSH (13 fixes, 11 docs)
 
 ### docs/archive/SSH_TERMINAL_SIZE_FIX.md
 - `TIOCGWINSZ`/`TIOCSWINSZ` in-kernel shell fix
@@ -831,6 +841,9 @@ stale directory entry) are **not** counted — neither is fixed.
 
 ### userspace/sshd/docs/INTERACTIVE_SHELL_BRIDGE_DRAIN_FIX.md
 - Interactive-shell bridge lost command output (empty stdout on connection close)
+
+### userspace/sshd/docs/PROTOCOL_UNDER_LOAD.md
+- Unauthenticated remote crash: `process_unencrypted_packet`/`process_encrypted_packet` computed `packet_len - padding_len - 1` from client-controlled bytes with no check that `padding_len < packet_len`; a single malformed pre-KEX packet (no auth, no valid crypto needed for the unencrypted path) underflowed the subtraction and panicked the later slice bounds-check, and `panic = "abort"` took the whole shared `sshd` process down — dropping every other concurrently-open session with it, not just the offending connection. Verified live on `devbox-smoltcp` (SMP=4): a 10-byte crafted packet killed a bystander session alongside the attacker's, confirmed via `herd`'s exit/restart log and reproduced twice; fixed with the same `payload_len` bound the in-kernel SSH server's own encrypted-path already enforced (that server's unencrypted path, and both of userspace `sshd`'s paths, lacked it before this fix — see the doc for the in-kernel side, tracked separately as unfixed kernel work)
 
 ---
 

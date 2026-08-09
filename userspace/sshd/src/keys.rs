@@ -79,7 +79,7 @@ pub fn base64_decode(data: &str) -> Option<Vec<u8>> {
     let mut result = Vec::new();
     let bytes: Vec<u8> = data.bytes().filter(|&b| b != b'\n' && b != b'\r').collect();
 
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return None;
     }
 
@@ -232,14 +232,14 @@ pub async fn load_or_generate_host_key() -> SigningKey {
     let _ = mkdir_p(SSHD_DIR);
 
     // Try to load existing key
-    if let Ok(data) = read_file_to_vec(HOST_KEY_PATH) {
-        if data.len() == SECRET_KEY_LENGTH {
-            let key_bytes: [u8; SECRET_KEY_LENGTH] = data.try_into().unwrap();
-            let key = SigningKey::from_bytes(&key_bytes);
-            println("[SSH Keys] Loaded host key from filesystem");
-            set_host_key(key.clone());
-            return key;
-        }
+    if let Ok(data) = read_file_to_vec(HOST_KEY_PATH)
+        && data.len() == SECRET_KEY_LENGTH
+    {
+        let key_bytes: [u8; SECRET_KEY_LENGTH] = data.try_into().unwrap();
+        let key = SigningKey::from_bytes(&key_bytes);
+        println("[SSH Keys] Loaded host key from filesystem");
+        set_host_key(key.clone());
+        return key;
     }
 
     // Generate new keypair
@@ -263,12 +263,12 @@ pub async fn load_or_generate_host_key() -> SigningKey {
 pub async fn load_authorized_keys() -> Vec<VerifyingKey> {
     let mut keys = Vec::new();
 
-    if let Ok(data) = read_file_to_vec(AUTHORIZED_KEYS_PATH) {
-        if let Ok(content) = core::str::from_utf8(&data) {
-            for line in content.lines() {
-                if let Some(key) = parse_public_key_ssh(line) {
-                    keys.push(key);
-                }
+    if let Ok(data) = read_file_to_vec(AUTHORIZED_KEYS_PATH)
+        && let Ok(content) = core::str::from_utf8(&data)
+    {
+        for line in content.lines() {
+            if let Some(key) = parse_public_key_ssh(line) {
+                keys.push(key);
             }
         }
     }

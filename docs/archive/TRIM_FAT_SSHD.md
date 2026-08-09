@@ -183,6 +183,60 @@ pursued this round:
   needed (packet encryption); only worth revisiting if a hardware-AES path
   ever becomes available on this target.
 
+## The in-kernel SSH server is a candidate for removal, not just trimming
+
+Everything above trims `userspace/sshd`. But there are **two** independent SSH-2
+server implementations in this codebase: the userspace one (`userspace/sshd` +
+`crates/akuma-ssh-crypto`) and a separate **built-in, in-kernel** one
+(`crates/akuma-ssh`, compiled into the kernel binary itself, started by
+`[Main] Spawning built-in SSH server thread...` on port 22). The
+`devbox-smoltcp` profile — already the *documented default devbox* per
+`overlays/devbox/README.md` — drops the built-in server entirely in favor of
+the userspace one (`userspace-sshd` meta-feature): "built-in SSH dropped in
+favour of the userspace `/bin/sshd`."
+
+That's the direction this should keep going. The in-kernel server is a second,
+independently-maintained copy of the same packet framing / KEX / auth logic
+(it even shares `akuma-ssh-crypto` with the userspace one), permanently
+resident in every kernel build that doesn't explicitly opt out — kernel
+attack surface and maintenance burden for a feature the recommended runtime
+configuration already doesn't use. It should probably be scheduled for
+removal (or made an opt-in feature nobody enables by default) rather than
+kept in sync forever: it's "a lot of support for things we don't need" once
+`devbox-smoltcp`/userspace `sshd` is the standard path.
+
+One live data point for why that matters, found while testing the load
+behavior of userspace `sshd` for a follow-up doc
+(`userspace/sshd/docs/PROTOCOL_UNDER_LOAD.md`): the **in-kernel** server has
+the same unauthenticated-crash bug userspace `sshd` has (see that doc) — a
+single malformed pre-auth packet panics `crates/akuma-ssh/src/packet.rs:83`
+(`process_unencrypted_packet`, unguarded `packet_len - padding_len - 1`) —
+except because it runs *inside the kernel*, the panic doesn't just kill one
+process, it takes the **entire kernel** down: `panic=abort` at EL1 has no
+process boundary to contain it, and the panic handler's own unwind path hit a
+second fault (`WARNING: Kernel accessing user-space address! ... stale
+TTBR0`) and wedged the VM completely (100% CPU, unresponsive to new
+connections, confirmed with a 10-byte crafted packet against a fresh boot).
+That's strictly worse than the userspace equivalent, which — per the
+concurrency model in `PROTOCOL_UNDER_LOAD.md` — only kills the shared
+`sshd` process. Notably, the in-kernel server's *encrypted*-path sibling
+(`process_encrypted_packet`, `crates/akuma-ssh/src/packet.rs`) already has a
+bounds check the unencrypted path (and both of userspace `sshd`'s paths)
+lack:
+```rust
+let payload_len = packet_len - padding_len - 1;
+if 5 + payload_len > decrypted.len() { return None; }
+```
+— so even the in-kernel implementation's own author(s) already knew this
+needed guarding in one spot and missed the other. Two divergent copies of the
+same logic, only one of the four total call sites fixed: exactly the kind of
+drift that argues for deleting the redundant copy rather than patching both
+forever.
+
+Per this session's scope (userspace-only, kernel untouched), no kernel code
+was changed to investigate or confirm this — it's flagged here as a reason to
+prioritize retiring `crates/akuma-ssh` rather than as something fixed.
+
 ## Background
 
 - Superseded plan: `docs/archive/SSHD_IMPLEMENTATION_PLAN.md` (kept verbatim,

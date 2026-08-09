@@ -32,7 +32,7 @@ pub enum AuthResult {
     /// Authentication failed, send failure message with available methods
     Failure,
     /// For publickey queries without signature - key is acceptable
-    PublicKeyOk(Vec<u8>),
+    PublicKeyOk,
 }
 
 // ============================================================================
@@ -165,7 +165,7 @@ async fn handle_publickey_auth(
         // Client is asking if this key is acceptable
         println("[SSH Auth] Key query - key is acceptable");
         return (
-            AuthResult::PublicKeyOk(key_blob.to_vec()),
+            AuthResult::PublicKeyOk,
             build_pk_ok_response(algorithm, key_blob),
         );
     }

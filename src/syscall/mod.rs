@@ -48,7 +48,7 @@ mod timerfd;
 /// decided. It lives here rather than in `container` because `proc`'s
 /// `SPAWN_EXT` / `SET_BOX_STACK` gate on it too, and those are dispatched even
 /// when `sc-containers` is off (extreme-size).
-pub(crate) fn caller_box_and_pid() -> (u64, u32) {
+pub fn caller_box_and_pid() -> (u64, u32) {
     akuma_exec::process::current_process_shared().map_or((0, 0), |p| (p.box_id, p.pid))
 }
 

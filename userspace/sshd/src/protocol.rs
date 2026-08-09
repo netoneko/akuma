@@ -522,13 +522,13 @@ async fn handle_message(
         }
         SSH_MSG_KEX_ECDH_INIT => {
             let mut offset = 0;
-            if let Some(client_pubkey) = read_string(payload, &mut offset) {
-                if let Some(reply) = handle_kex_ecdh_init(session, client_pubkey) {
-                    send_unencrypted_packet(stream, &reply, session).await?;
-                    let newkeys = vec![SSH_MSG_NEWKEYS];
-                    send_unencrypted_packet(stream, &newkeys, session).await?;
-                    session.state = SshState::AwaitingNewKeys;
-                }
+            if let Some(client_pubkey) = read_string(payload, &mut offset)
+                && let Some(reply) = handle_kex_ecdh_init(session, client_pubkey)
+            {
+                send_unencrypted_packet(stream, &reply, session).await?;
+                let newkeys = vec![SSH_MSG_NEWKEYS];
+                send_unencrypted_packet(stream, &newkeys, session).await?;
+                session.state = SshState::AwaitingNewKeys;
             }
         }
         SSH_MSG_NEWKEYS => { session.state = SshState::AwaitingServiceRequest; }
@@ -665,9 +665,9 @@ fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Optio
     let mac_c2s = derive_key(&shared_secret, &exchange_hash, b'E', &session.session_id, MAC_KEY_SIZE);
     let mac_s2c = derive_key(&shared_secret, &exchange_hash, b'F', &session.session_id, MAC_KEY_SIZE);
     use ctr::cipher::KeyIvInit;
-    session.crypto.decrypt_cipher = Some(Aes128Ctr::new(key_c2s[..AES_KEY_SIZE].try_into().unwrap(), iv_c2s[..AES_IV_SIZE].try_into().unwrap()));
+    session.crypto.decrypt_cipher = Some(Aes128Ctr::new(key_c2s[..AES_KEY_SIZE].into(), iv_c2s[..AES_IV_SIZE].into()));
     session.crypto.decrypt_mac_key.copy_from_slice(&mac_c2s[..MAC_KEY_SIZE]);
-    session.crypto.encrypt_cipher = Some(Aes128Ctr::new(key_s2c[..AES_KEY_SIZE].try_into().unwrap(), iv_s2c[..AES_IV_SIZE].try_into().unwrap()));
+    session.crypto.encrypt_cipher = Some(Aes128Ctr::new(key_s2c[..AES_KEY_SIZE].into(), iv_s2c[..AES_IV_SIZE].into()));
     session.crypto.encrypt_mac_key.copy_from_slice(&mac_s2c[..MAC_KEY_SIZE]);
     let mut reply = Vec::new();
     reply.push(SSH_MSG_KEX_ECDH_REPLY);
@@ -678,12 +678,14 @@ fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Optio
 }
 
 async fn send_packet(stream: &mut SshStream, payload: &[u8], session: &mut SshSession) -> Result<(), NetError> {
-    if session.crypto.encrypt_cipher.is_some() && session.state != SshState::AwaitingNewKeys {
+    if session.state != SshState::AwaitingNewKeys
+        && let Some(cipher) = session.crypto.encrypt_cipher.as_mut()
+    {
         let seq = session.crypto.encrypt_seq;
         session.crypto.encrypt_seq = seq.wrapping_add(1);
         let packet = build_encrypted_packet(
             payload,
-            session.crypto.encrypt_cipher.as_mut().unwrap(),
+            cipher,
             &session.crypto.encrypt_mac_key,
             seq,
             &mut session.rng,
@@ -732,6 +734,12 @@ fn process_encrypted_packet(session: &mut SshSession) -> Option<(u8, Vec<u8>)> {
     if mac.verify_slice(received_mac).is_err() { return None; }
     session.crypto.decrypt_seq = seq.wrapping_add(1);
     let padding_len = decrypted[4] as usize;
+    // padding_len is attacker/client-controlled; without this, a packet with
+    // padding_len >= packet_len underflows payload_len (wraps to a huge
+    // usize with this workspace's overflow-checks=false) and the slice below
+    // panics -> panic=abort takes the whole process down, dropping every
+    // other session sharing it. See docs/PROTOCOL_UNDER_LOAD.md.
+    if padding_len >= packet_len { return None; }
     let payload_len = packet_len - padding_len - 1;
     let msg_type = decrypted[5];
     let payload = decrypted[6..5 + payload_len].to_vec();
@@ -745,6 +753,10 @@ fn process_unencrypted_packet(session: &mut SshSession) -> Option<(u8, Vec<u8>)>
     let total_len = 4 + packet_len;
     if session.input_buffer.len() < total_len { return None; }
     let padding_len = session.input_buffer[4] as usize;
+    // Same underflow guard as process_encrypted_packet above -- this path is
+    // reachable pre-auth with no MAC at all, so it's the easier of the two
+    // to trigger. See docs/PROTOCOL_UNDER_LOAD.md.
+    if padding_len >= packet_len { return None; }
     let payload_len = packet_len - padding_len - 1;
     let msg_type = session.input_buffer[5];
     let payload = session.input_buffer[6..5 + payload_len].to_vec();

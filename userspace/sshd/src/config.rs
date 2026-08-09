@@ -61,10 +61,6 @@ impl Default for SshdConfig {
 }
 
 impl SshdConfig {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     fn parse_line(&mut self, line: &str) {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -126,11 +122,11 @@ fn read_file_to_vec(path: &str) -> Result<Vec<u8>, i32> {
 pub async fn load_config() -> SshdConfig {
     let mut config = SshdConfig::default();
 
-    if let Ok(data) = read_file_to_vec(CONFIG_PATH) {
-        if let Ok(content) = core::str::from_utf8(&data) {
-            for line in content.lines() {
-                config.parse_line(line);
-            }
+    if let Ok(data) = read_file_to_vec(CONFIG_PATH)
+        && let Ok(content) = core::str::from_utf8(&data)
+    {
+        for line in content.lines() {
+            config.parse_line(line);
         }
     }
 

@@ -136,11 +136,11 @@ pub extern "C" fn main() {
                 }
             }
             "--port" => {
-                if let Some(port_str) = args.next() {
-                    if let Ok(p) = port_str.parse::<u16>() {
-                        cli_port = Some(p);
-                        println(&format!("[SSHD] Port override from CLI: {}", p));
-                    }
+                if let Some(port_str) = args.next()
+                    && let Ok(p) = port_str.parse::<u16>()
+                {
+                    cli_port = Some(p);
+                    println(&format!("[SSHD] Port override from CLI: {}", p));
                 }
             }
             "--no-banner" => {
