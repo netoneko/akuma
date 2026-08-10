@@ -14,6 +14,7 @@ members = [
     "box",
     "echo2",
     "elftest",
+    "forkprobe",
     "hello",
     "paws",
     "herd",

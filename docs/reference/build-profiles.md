@@ -198,11 +198,39 @@ what it wants:
 
 | Target | Drops vs. default | Adds vs. default |
 |---|---|---|
-| `size` | `neko`, `tls-rsa`, `rump`, `sound` | `no-tests` |
-| `extreme-size` | `neko`, `tls-rsa`, `kernel-tls`, `rump`, `sound` | `no-tests`, `extreme` |
-| `devbox` | `smoltcp`, `kernel-tls`, `tls-rsa` | `devbox` (→ `rump-default` + `userspace-sshd`), `no-tests` |
+| `size` | `neko`, `tls-rsa`, `rump`, `sound`, `many-sessions` | `no-tests` |
+| `extreme-size` | `neko`, `tls-rsa`, `kernel-tls`, `rump`, `sound`, `many-sessions` | `no-tests`, `extreme` |
+| `devbox` | `smoltcp`, `kernel-tls`, `tls-rsa`, `many-sessions` | `devbox` (→ `rump-default` + `userspace-sshd`), `no-tests` |
 | multikernel | `--no-default-features` | `smp`, `smoltcp` |
 | `devbox-smoltcp` | — (inherits default set) | `devbox-smoltcp` (→ `userspace-sshd` + `smp-shared`), `no-tests` |
+
+### `many-sessions` and the userspace sshd
+
+`many-sessions` (default since 2026-08-10) deepens the per-listener backlog from
+8 to 32 and raises the smoltcp socket table on `small-sockets` builds, so a
+server can absorb more than 8 *simultaneous arrivals*. It is the kernel half of
+the process-per-session `/bin/sshd`; the userspace half is that binary's own
+`fork-sessions` feature, also default-on. See
+[`userspace/sshd/docs/PROCESS_PER_SESSION.md`](../../userspace/sshd/docs/PROCESS_PER_SESSION.md).
+
+Cost: ~1 MB of heap per *listening* socket, plus ~44 KB of BSS where the socket
+table also grows. Every `--no-default-features` target above therefore drops it
+automatically, and `kernel_profile_extreme` overrides the constants back to 8/32
+even if the feature is somehow enabled — a belt-and-braces guard so adding
+`many-sessions` to `extreme-size`'s feature list later cannot quietly cost a
+megabyte per listener against the 4 MB floor.
+
+**If `extreme-size` (or any low-RAM image) shows memory pressure, build sshd
+without its half too** — the kernel side is already off there, but the binary is
+shared across images and defaults to a process per session:
+
+```bash
+SSHD_FORK_SESSIONS=0 userspace/build.sh --sshd-only
+```
+
+That reverts `/bin/sshd` to the single-process cooperative executor: one process
+serving all sessions, no `fork()` per connection. See
+[`docs/runbooks/build-extreme-size.md`](../runbooks/build-extreme-size.md).
 
 `devbox-smoltcp` keeps the full
 default feature set and only layer their feature on top, rather than starting

@@ -118,8 +118,25 @@ default = [
     "fs-cache",
     "sc-aio", "sc-sysv-ipc", "sc-framebuffer", "sc-containers",
     "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
+    # Kernel half of the process-per-session sshd. Default since 2026-08-10 —
+    # without it the stack RSTs past 8 simultaneous arrivals and sshd cannot
+    # reach its own max_sessions of 24.
+    "many-sessions",
 ]
 no-tests = ["akuma-net/small-sockets"]
+
+# Support for a server handling many simultaneous connections: a deeper
+# per-listener backlog and a larger socket budget (see
+# `crates/akuma-net/src/socket.rs` `MAX_BACKLOG`). IN `default` — it is the
+# kernel half of the process-per-session `userspace/sshd`, whose `fork-sessions`
+# feature is also on by default.
+#
+# It costs ~1 MB of heap per listening socket plus ~44 KB of BSS, so
+# `extreme-size` stays out: that profile builds `--no-default-features` and
+# `kernel_profile_extreme` additionally overrides the constants, so it keeps the
+# original 8-deep backlog either way. See
+# `docs/runbooks/build-extreme-size.md` for the matching sshd build.
+many-sessions = ["akuma-net/many-sessions"]
 # Allow ONLY rump_tests to compile even when `no-tests` is set — used by the
 # devbox to verify rump regression guards at boot without pulling in the full
 # test suite (which requires default features smoltcp types etc.).

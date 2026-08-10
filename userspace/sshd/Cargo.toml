@@ -8,8 +8,26 @@ edition = "2024"
 # `--no-default-features` drops libakuma so `cargo test --lib` can link against
 # a std host target — libakuma defines #[panic_handler] and #[global_allocator],
 # which collide with std's. See src/lib.rs.
-default = ["akuma"]
+default = ["akuma", "fork-sessions"]
 akuma = ["dep:libakuma"]
+
+# Serve each connection from its own forked process instead of as one future in
+# a single-process cooperative executor. Buys fault isolation (a panic aborts
+# one session, not the server) and real multi-core use, at the cost of a process
+# per session against the kernel's global `MAX_PROCESSES = 64`.
+#
+# ON by default since 2026-08-10. Pairs with the kernel's `many-sessions`
+# feature (also default) — without the deeper listener backlog that provides,
+# the stack RSTs past 8 simultaneous arrivals and `max_sessions` (24) is
+# unreachable.
+#
+# To build WITHOUT it — the memory-constrained case, e.g. `extreme-size`, where
+# a process per session is the wrong trade:
+#     SSHD_FORK_SESSIONS=0 userspace/build.sh --sshd-only
+# which drops to the cooperative single-process executor. See
+# `docs/runbooks/build-extreme-size.md` and
+# `userspace/sshd/docs/PROCESS_PER_SESSION.md`.
+fork-sessions = []
 
 [dependencies]
 # net-async: sshd uses embedded_io_async::{Read,Write} with libakuma's net Error,

@@ -1,0 +1,12 @@
+[package]
+name = "forkprobe"
+version = "0.1.0"
+edition = "2021"
+description = "Proves libakuma::fork() works for a no_std libakuma binary, including socket-fd inheritance"
+
+[[bin]]
+name = "forkprobe"
+path = "src/main.rs"
+
+[dependencies]
+libakuma = { path = "../libakuma", features = ["chunked-allocator"] }

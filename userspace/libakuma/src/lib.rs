@@ -116,6 +116,8 @@ pub mod syscall {
     pub const GETEUID: u64 = 175;
     pub const MOUNT: u64 = 40;
     pub const UMOUNT2: u64 = 39;
+    pub const CLONE: u64 = 220;
+    pub const WAIT4: u64 = 260;
 }
 
 /// Thread CPU statistics for top command
@@ -1558,6 +1560,81 @@ pub const SIGKILL: u32 = 9;
 /// Reattach I/O to a target process
 pub fn reattach(pid: u32) -> i32 {
     syscall(syscall::REATTACH, pid as u64, 0, 0, 0, 0, 0) as i32
+}
+
+/// What [`fork`] returned, from the perspective of whoever is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkResult {
+    /// We are the parent; the child's PID is inside.
+    Parent(u32),
+    /// We are the child.
+    Child,
+}
+
+/// `fork(2)` — duplicate this process, copy-on-write.
+///
+/// Issued as `clone(SIGCHLD)`, which `sys_clone` (`src/syscall/proc.rs`) routes
+/// to `fork_process` on the `flags & 0xFF == 0x11` arm. There is no `libakuma`
+/// `spawn`-style alternative that does what this does: **the child inherits the
+/// parent's whole fd table**, sockets included, refcounted per-fd
+/// (`FdTable::clone_deep_for_fork` → `socket_clone_ref`). That is the only way
+/// in this OS to hand an already-`accept()`ed connection to another process —
+/// `sys_spawn` has no fd argument, and there is no `SCM_RIGHTS`
+/// (`docs/MISSING_SOCKET_MACHINERY.md`).
+///
+/// Both sides return: the parent gets [`ForkResult::Parent`] with the child's
+/// PID, the child gets [`ForkResult::Child`]. The child runs on its own
+/// copy-on-write address space (`COW_FORK_ENABLED`, `src/config.rs`), so writes
+/// after this point are private to whoever made them.
+///
+/// Returns `Err(errno)` (negative) if the kernel refused — `ENOMEM` when memory
+/// is low or the process table is full.
+///
+/// # Reaping
+///
+/// A forked child becomes a zombie until reaped. `fork_process` registers an
+/// exit channel keyed on the child PID, so both [`waitpid`] (poll one known
+/// PID, non-blocking) and [`wait_any`] (reap whatever finished) work on it.
+pub fn fork() -> Result<ForkResult, i32> {
+    // SIGCHLD (17) in the low byte is the standard fork flag combination; every
+    // other bit clear means "new address space, new fd table, new thread group".
+    const SIGCHLD: u64 = 17;
+    let ret = syscall(syscall::CLONE, SIGCHLD, 0, 0, 0, 0, 0) as i64;
+    match ret {
+        0 => Ok(ForkResult::Child),
+        n if n > 0 => Ok(ForkResult::Parent(n as u32)),
+        e => Err(e as i32),
+    }
+}
+
+/// Reap any one exited child, without blocking.
+///
+/// `wait4(-1, WNOHANG)`. Returns `None` when no child has exited (including the
+/// "no children at all" case — the two are not distinguished, matching
+/// [`waitpid`]'s existing contract).
+///
+/// Prefer this over [`waitpid`] when children are anonymous — a server that
+/// forks per connection does not want to track and poll every outstanding PID
+/// individually just to keep zombies from accumulating.
+pub fn wait_any() -> Option<WaitStatus> {
+    const WNOHANG: u64 = 1;
+    let mut status: u32 = 0;
+    let ret = syscall(
+        syscall::WAIT4,
+        u64::MAX, // pid = -1: any child
+        &mut status as *mut u32 as u64,
+        WNOHANG,
+        0, // rusage
+        0,
+        0,
+    ) as i64;
+
+    if ret > 0 {
+        Some(WaitStatus { pid: ret as u32, raw: status })
+    } else {
+        // 0 = children exist but none exited; negative = ECHILD or similar.
+        None
+    }
 }
 
 /// How a reaped child ended: the raw Linux-style wait status plus the accessors

@@ -171,7 +171,19 @@ utilization / fault isolation across SSH sessions, not this wedge), but the
 underlying property it documents — sshd never yields to a peer thread because
 it doesn't have one — is the same shape of constraint that would make "core 1
 is busy and never lets go" plausible without being certain sshd itself is the
-`term_state_lock`/BKL holder in this specific stall. A single point-in-time
+`term_state_lock`/BKL holder in this specific stall.
+
+> **That circumstantial link no longer holds as stated (2026-08-10).** `sshd`
+> is now process-per-session by default
+> (`userspace/sshd/docs/PROCESS_PER_SESSION.md`): sessions are separate
+> processes on the real scheduler, so "sshd has no sibling to hand off to" is
+> false on any current build. This does **not** mean the issue is fixed — it
+> means the reasoning above cannot be used to explain a fresh occurrence, and a
+> repro on a current image would be evidence the wedge was never about sshd's
+> architecture. Worth re-running before spending time here: the `[PSTATS]`
+> `nanosleep`-dominated poll loop that pointed at sshd will now be spread
+> across one listener process plus N session processes, so the attribution
+> looks different even if the underlying stall is identical. A single point-in-time
 snapshot can't prove who held the lock for the whole 94-second window; that
 would need the watchdog (or a fresh repro) to also capture the *owner* core's
 thread identity at the moment it entered the critical section, not just the

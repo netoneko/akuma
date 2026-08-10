@@ -9,6 +9,13 @@ edition = "2024"
 # this crate with `default-features = false` and NOT re-enabling `smoltcp`.
 default = ["smoltcp"]
 small-sockets = []
+# Raise the per-listener backlog (socket.rs `MAX_BACKLOG`) and, on the
+# size-constrained profiles, the total socket budget (smoltcp_net.rs
+# `MAX_SOCKETS`), so a server can absorb more simultaneous *arrivals* than the
+# default 8. Costs ~1 MB of heap per listening socket, so it is opt-in.
+# Paired with `userspace/sshd`'s `fork-sessions` feature — see that crate's
+# `[features]` for why the two are turned on together.
+many-sessions = []
 # Real shared-kernel SMP. Gates the `PreemptGuard` critical-section preemption
 # guards (runtime.rs): under the Big Kernel Lock the base NETWORK/SOCKET_TABLE
 # spinlocks must never be held across a context switch. A no-op otherwise, so

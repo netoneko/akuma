@@ -18,7 +18,20 @@ set -e
 #
 # Run with overlays/devbox/run-smoltcp.sh (SMP=N, no RUMP_NIC, host :2222 -> :22).
 # Extra args are forwarded (e.g. scripts/build_devbox_smoltcp.sh --quiet).
+#
+# `many-sessions` (deeper listener backlog + larger socket budget) rides in on
+# the default feature set — this build does NOT pass --no-default-features. It
+# is the kernel half of the process-per-session sshd; the userspace half is
+# `userspace/build.sh --sshd-only`, also on by default. SSHD_FORK_SESSIONS=0
+# drops both, for memory-constrained images.
 DEVBOX_SMOLTCP_FEATURES="devbox-smoltcp,no-tests"
+if [ "${SSHD_FORK_SESSIONS:-1}" = "0" ]; then
+    echo "SSHD_FORK_SESSIONS=0: NOT implemented for the kernel half here —"
+    echo "  many-sessions is a default feature, so dropping it needs an explicit"
+    echo "  --no-default-features build. Build sshd with SSHD_FORK_SESSIONS=0 and"
+    echo "  leave the kernel as-is: a cooperative sshd on a deep backlog is"
+    echo "  correct, just slightly wasteful. See docs/runbooks/build-extreme-size.md."
+fi
 cargo build \
     --release \
     --features "$DEVBOX_SMOLTCP_FEATURES" \

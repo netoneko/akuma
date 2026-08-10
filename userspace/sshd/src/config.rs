@@ -42,7 +42,25 @@ pub struct SshdConfig {
     /// Print the ASCII-art welcome banner on interactive `shell` sessions,
     /// mirroring the in-kernel SSH server's login banner. Enabled by default.
     pub banner: bool,
+    /// Ceiling on concurrently live session processes. Each accepted connection
+    /// costs one forked `sshd` child plus (once a shell/exec channel opens) one
+    /// spawned shell — two entries in a `MAX_PROCESSES = 64` global table
+    /// (`src/config.rs`) that every other process on the system shares. See
+    /// [`DEFAULT_MAX_SESSIONS`] for why the default is what it is.
+    pub max_sessions: usize,
 }
+
+/// Default [`SshdConfig::max_sessions`].
+///
+/// The binding constraint is not memory but the kernel's global
+/// `MAX_PROCESSES = 64`. A fully-occupied session costs 2 slots (the forked
+/// `sshd` child and the shell it spawns), so 24 sessions is a 48-slot
+/// worst case, leaving ~16 for init, herd, the listener itself, and whatever
+/// the user is actually running. Raising this past ~28 risks `fork()`
+/// returning `ENOMEM` for reasons that have nothing to do with SSH — and a
+/// process-table exhaustion caused by sshd is far more disruptive than a
+/// connection refused at the door.
+pub const DEFAULT_MAX_SESSIONS: usize = 24;
 
 /// Default shell: busybox's multicall entry point, present on every
 /// bootstrap/devbox image (`scripts/populate_disk.sh` always symlinks it).
@@ -56,6 +74,7 @@ impl Default for SshdConfig {
             shell_args: Vec::new(),
             port: None, // Default port is handled in main.rs
             banner: true,
+            max_sessions: DEFAULT_MAX_SESSIONS,
         }
     }
 }
@@ -85,6 +104,16 @@ impl SshdConfig {
                 }
                 "banner" => {
                     self.banner = parse_bool(value);
+                }
+                "max_sessions" => {
+                    // 0 is rejected rather than treated as "unlimited": a
+                    // typo'd/empty value must not silently disable the cap that
+                    // protects the global process table.
+                    if let Ok(n) = value.parse::<usize>()
+                        && n > 0
+                    {
+                        self.max_sessions = n;
+                    }
                 }
                 _ => {}
             }

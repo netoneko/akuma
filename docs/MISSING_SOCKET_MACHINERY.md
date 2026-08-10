@@ -1,5 +1,24 @@
 # Missing fd-passing / cross-process socket handoff
 
+> **Superseded for the use case that prompted it (2026-08-10).** This doc
+> concluded that handing an accepted socket to another process "is not
+> buildable on anything that exists in this kernel today." That conclusion was
+> reached by surveying three mechanisms — `sys_spawn`'s ABI, `SCM_RIGHTS`, and
+> `/proc/<pid>/fd/<n>` — and is correct about all three. It missed a fourth:
+> **`fork()`, where the fd is never handed over at all, it is inherited.**
+>
+> `clone(SIGCHLD)` routes to `fork_process`, which deep-copies the fd table
+> (`FdTable::clone_deep_for_fork`) and takes a real reference on each socket
+> (`socket_clone_ref`); `remove_socket` refcounts on the way out specifically so
+> a fork child's exit cannot close the socket under the parent's live fd. All of
+> that already existed and was already correct. `userspace/forkprobe` proves it
+> end-to-end for a `no_std` libakuma binary, and `userspace/sshd`'s
+> `fork-sessions` build is built on it.
+>
+> Everything below remains accurate and still matters for the cases fork does
+> *not* cover: handing a fd to a process that already exists, or to one that is
+> not your child. Those still need option (1), (2) or (3).
+
 **Stability: reference, not yet acted on.** Written 2026-08-10 while scoping
 whether userspace `sshd` could hand an already-`accept()`ed client socket off
 to a freshly spawned sibling process (for fault isolation — see

@@ -2,6 +2,22 @@
 
 This document outlines the known technical limitations of the current userspace `sshd` implementation in Akuma OS. These constraints are primarily due to the current state of the userspace runtime environment.
 
+> **§1 and §2 describe the `SSHD_FORK_SESSIONS=0` build only (2026-08-10).**
+> The default build now serves each connection from its own forked process, so
+> sessions *are* parallel, they *do* use multiple cores, and a blocking syscall
+> in one no longer stalls its peers. See
+> [`PROCESS_PER_SESSION.md`](PROCESS_PER_SESSION.md). §2's premise — that
+> `libakuma` exposes no way to get concurrency — was also wrong: `fork()` was
+> always available, it just had no wrapper. There is one now
+> (`libakuma::fork`), and `userspace/forkprobe` proves it works from a `no_std`
+> binary.
+>
+> Everything in §1-§2 still applies verbatim if you build with
+> `SSHD_FORK_SESSIONS=0`, which memory-constrained images should
+> ([`docs/runbooks/build-extreme-size.md`](../../../docs/runbooks/build-extreme-size.md)).
+> §3-§6 apply to both builds — and §3 is *more* pressing under the default now
+> that each session is a process against a global `MAX_PROCESSES = 64`.
+
 ## 1. Single-Threaded Concurrency (Cooperative, Not Parallel)
 Concurrent sessions **do** work — this section used to say they didn't, which has
 been wrong since the cooperative multiplexer landed (see

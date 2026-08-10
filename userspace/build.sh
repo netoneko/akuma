@@ -24,6 +24,16 @@ build_member() {
     fi
     if [ "$m" == "meow" ]; then
         cargo build --release -p meow "${MEOW_SIZE_FLAGS[@]}"
+    elif [ "$m" == "sshd" ] && [ "${SSHD_FORK_SESSIONS:-1}" = "0" ]; then
+        # Opt OUT of process-per-session sshd back to the single-process
+        # cooperative executor (userspace/sshd/Cargo.toml `fork-sessions`, on by
+        # default). For memory-constrained images where a process per session is
+        # the wrong trade — see docs/runbooks/build-extreme-size.md.
+        #
+        # --no-default-features drops `akuma` too, so re-add it: it is what
+        # links libakuma, and the binary cannot build without it.
+        echo "  (sshd: fork-sessions DISABLED via SSHD_FORK_SESSIONS=0 — cooperative executor)"
+        cargo build --release -p sshd --no-default-features --features akuma
     else
         cargo build --release -p "$m"
     fi
@@ -80,6 +90,7 @@ MEMBERS=(
     "libakuma-tls"
     "echo2"
     "elftest"
+    "forkprobe"
     "hello"
     "paws"
     "herd"
@@ -127,6 +138,7 @@ BINARIES=(
     "echo2"
     "stackstress"
     "elftest"
+    "forkprobe"
     "httpd"
     "meow"
     "herd"

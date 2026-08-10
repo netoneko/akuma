@@ -32,5 +32,9 @@ echo
 
 # Keep the DEFAULT feature set (smoltcp/kernel-tls stay in); layer the devbox-smoltcp
 # meta-feature (userspace-sshd + smp-shared) + no-tests. Matches build_devbox_smoltcp.sh.
+#
+# This list MUST stay in sync with scripts/build_devbox_smoltcp.sh: this script
+# runs its own `cargo run`, so whatever is missing here gets rebuilt *without*
+# it, silently replacing the image that script just produced.
 DEVBOX_SMOLTCP_FEATURES="devbox-smoltcp,no-tests"
 exec cargo run --release --features "$DEVBOX_SMOLTCP_FEATURES"

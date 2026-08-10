@@ -1,5 +1,21 @@
 # Optional parallelism for sshd: threads vs. processes
 
+> **Landed 2026-08-10 as the process-per-session option, behind the
+> `fork-sessions` feature (off by default).** See
+> [`PROCESS_PER_SESSION.md`](PROCESS_PER_SESSION.md) for what shipped and how it
+> was verified.
+>
+> This note's recommendation was right about *which* option to take and wrong
+> about what blocked it. It said process-per-session should happen "only after
+> `docs/MISSING_SOCKET_MACHINERY.md`'s gap is closed on the kernel side." There
+> was no gap to close: that survey covered `sys_spawn`, `SCM_RIGHTS` and procfs
+> but not `fork()`, which inherits the fd table outright and needs no handoff
+> primitive at all. Zero kernel changes were required for the handoff.
+>
+> The rest of the analysis below held up, including the part most worth keeping:
+> threads would not have fixed fault isolation, because `panic = "abort"` is
+> process-wide.
+
 A design note, not a landed feature. Prompted by two separate observations
 this session: `sshd` used exactly one of four cores in an `SMP=4` boot
 (`PSTATS PID .../bin/sshd` never showed multi-core attribution), and the

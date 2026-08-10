@@ -29,8 +29,27 @@ use crate::runtime::PreemptGuard;
 
 #[cfg(not(any(feature = "small-sockets", kernel_profile_extreme)))]
 const MAX_SOCKETS: usize = 256;
-#[cfg(any(feature = "small-sockets", kernel_profile_extreme))]
+#[cfg(all(
+    any(feature = "small-sockets", kernel_profile_extreme),
+    any(not(feature = "many-sessions"), kernel_profile_extreme)
+))]
 const MAX_SOCKETS: usize = 32;
+/// The size-constrained profiles' budget, raised for `many-sessions`.
+///
+/// `devbox-smoltcp` pulls in `no-tests` → `small-sockets`, so it lands on the
+/// 32-socket arm. That is not enough to host a 32-deep listener backlog *and*
+/// two dozen accepted connections (see `socket::MAX_BACKLOG`) — the listener
+/// alone would consume the entire budget and every `accept()` would fail. 128
+/// covers a full backlog plus sshd's 24 sessions plus the rest of the system,
+/// at 32 KB per socket ≈ 4 MB worst case (plus ~44 KB of BSS for the table
+/// itself), which the devbox's RAM allows and `extreme-size`'s 4 MB floor would
+/// not — hence `kernel_profile_extreme` overriding the feature above.
+#[cfg(all(
+    feature = "small-sockets",
+    feature = "many-sessions",
+    not(kernel_profile_extreme)
+))]
+const MAX_SOCKETS: usize = 128;
 // Reduced from 64KB to 16KB per direction to save heap memory.
 // 40 sockets × 32KB = 1.25MB vs 40 × 128KB = 5MB.
 // 16KB is still plenty for TLS handshakes and HTTP requests.

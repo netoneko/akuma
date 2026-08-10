@@ -9,9 +9,44 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 542
-- **Docs contributing at least one fix:** 161
+- **Total distinct fixes counted:** 544
+- **Docs contributing at least one fix:** 162
 - **Subsystem categories:** 15
+
+Updated 2026-08-10 (branch `better-sshd-and-networking`, fifth entry): +2 fixes
+/ +1 doc — `userspace/sshd/docs/PROCESS_PER_SESSION.md` (one fix counted under
+SSH, one under Networking).
+
+The Networking one is a latent defect independent of sshd:
+`crates/akuma-net/src/socket.rs`'s `MAX_BACKLOG = 8`. This stack has no SYN
+queue — a listener *is* a fixed pool of pre-created sockets already in `Listen`,
+replenished one at a time by `socket_accept` — so that constant was a hard
+ceiling on **simultaneous arrivals**, not the soft hint `backlog` is on Linux.
+Past 8, peers got a RST no matter how fast the server accepted. Measured
+directly before the fix (devbox-smoltcp, SMP=4): 8/8 connections clean, 12/16,
+17/24; after: 16/16 and 24/24. Every caller passed a larger backlog and had it
+silently clamped (`libakuma`'s `TcpListener::bind` asks for 128).
+
+The SSH one is the blast radius `PROTOCOL_UNDER_LOAD.md` documented but only
+mitigated: that entry fixed the one known way to panic a session, while noting
+`panic = "abort"` is process-wide so *any* future panic would still drop every
+concurrent session. `sshd` now serves each connection from its own forked
+process, so a session's death is its own. Verified by killing one live session
+under load and watching exactly one peer end and three continue
+(`scripts/sshd_concurrency_test.py` test D).
+
+Not counted from the same work: the correction to
+`docs/MISSING_SOCKET_MACHINERY.md` (that doc concluded handing an accepted
+socket to another process was unbuildable, having surveyed `sys_spawn`,
+`SCM_RIGHTS` and procfs but not `fork()`, which inherits the fd table outright —
+a wrong conclusion corrected in place, no code changed, no defect fixed);
+`userspace/forkprobe` (a new probe binary proving `fork()` works from a `no_std`
+libakuma binary — test infrastructure, no fix); and the `max_sessions` cap and
+`docs/runbooks/build-extreme-size.md` (new capability and new runbook
+respectively). One **open** item is recorded in `PROCESS_PER_SESSION.md` rather
+than counted here: ~1% of connections fail at setup under a specific
+long-plus-short-churn mix (3 of ~276, against 0 of ~276 for the cooperative
+build) — suggestive but not conclusive at that sample size, and unresolved.
 
 Updated 2026-08-10 (branch `better-sshd-and-networking`, fourth entry): +1 fix
 / +1 doc — `userspace/meow/docs/MLX_SERVER_TOOL_CALLS.md` (Userspace Apps &
@@ -701,7 +736,10 @@ stale directory entry) are **not** counted — neither is fixed.
 - §12.2–§12.4: on a multi-threaded `fork()`, every sibling thread that touches the same demoted page faults at once; the first thread through `fault_slot_acquire` breaks CoW and repairs the PTE, but the threads behind it — now holding a fault for a write that is already legal — had no repair path for pages with no lazy/eager region record (an ELF `.data`/`.bss` page from the image loader is never registered as either), so they fell through to a spurious SIGSEGV and took the whole `CLONE_VM` process down with them; fixed via `stale_write_fault_absorbed`, re-reading the PTE at EL0 permission-fault entry and absorbing (invalidate + retry) whenever it already grants the write, budgeted per-(VA, PTE) so a genuinely-declined repair still runs; A/B-verified 10/10 and 8/8 probe SIGSEGVs → 0
 
 
-## Networking (30 fixes, 12 docs)
+## Networking (31 fixes, 13 docs)
+
+### userspace/sshd/docs/PROCESS_PER_SESSION.md
+- `MAX_BACKLOG = 8` (`crates/akuma-net/src/socket.rs`) was a hard ceiling on **simultaneous connection arrivals**, not the soft hint `listen(2)`'s backlog is on Linux: this stack has no SYN queue, a listener *is* a fixed pool of pre-created sockets sitting in `Listen` that `socket_accept` replenishes one at a time, so arrivals past the 8th got a RST regardless of how fast the server accepted. Every caller's requested backlog was silently clamped to it (`libakuma`'s `TcpListener::bind` asks for 128). Measured on devbox-smoltcp/SMP=4: 8/8 connections clean, 12/16, 17/24 before; 16/16 and 24/24 after. Raised to 32 behind the default-on `many-sessions` feature, which also lifts the smoltcp socket table from 32 to 128 on `small-sockets` builds — a 32-deep backlog is meaningless against a 32-socket budget. `kernel_profile_extreme` overrides both back down, so the 4 MB floor is unaffected
 
 ### docs/archive/NETWORKING_POLLING_AND_ACK_FIXES.md
 - 1: smoltcp 10ms delayed ACK (primary throughput killer)
@@ -905,7 +943,10 @@ stale directory entry) are **not** counted — neither is fixed.
 - `DRAINING[tid]` (the pressure-reclaim in-progress flag) had the identical stuck-forever shape — a recycled slot's new occupant inherited a stale "already draining" flag; fixed by clearing it in `scrub_thread_slot`
 
 
-## SSH (13 fixes, 11 docs)
+## SSH (14 fixes, 12 docs)
+
+### userspace/sshd/docs/PROCESS_PER_SESSION.md
+- Every SSH session ran as one future inside a single `sshd` process, so `panic = "abort"` — which is process-wide, not future- or thread-scoped — meant *any* panic on *any* connection dropped every other live session with it. `PROTOCOL_UNDER_LOAD.md` fixed the one known trigger (a malformed pre-KEX packet) while explicitly noting the blast radius itself remained; this closes that. Each accepted connection is now served by its own `fork()`ed child, which inherits the socket through the fd-table copy (`FdTable::clone_deep_for_fork` → `socket_clone_ref`, refcounted on close by `remove_socket` — machinery that already existed and was already correct for this case). Zero kernel changes were needed: `docs/MISSING_SOCKET_MACHINERY.md` had concluded the handoff was unbuildable, having surveyed `sys_spawn`, `SCM_RIGHTS` and procfs but not `fork()`, where the fd is never handed over at all. Verified by SIGKILLing one live session under load — exactly one peer ended, three ran to completion, the server kept serving. Bounded by a new `max_sessions` (default 24) against the global `MAX_PROCESSES = 64`, since a fully-occupied session now costs two process slots. On by default (`fork-sessions`); `SSHD_FORK_SESSIONS=0` reverts to the cooperative executor for memory-constrained images
 
 ### docs/archive/SSH_TERMINAL_SIZE_FIX.md
 - `TIOCGWINSZ`/`TIOCSWINSZ` in-kernel shell fix

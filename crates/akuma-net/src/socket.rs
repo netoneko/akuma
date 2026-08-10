@@ -31,8 +31,42 @@ use smoltcp::socket::tcp;
 /// Maximum number of concurrent sockets (FDs)
 pub const MAX_SOCKETS: usize = 128;
 
-/// Maximum number of sockets to pre-allocate for a listener's backlog
-#[cfg(feature = "smoltcp")]
+/// Maximum number of sockets to pre-allocate for a listener's backlog.
+///
+/// There is no SYN queue in this stack: a listener *is* its pool of pre-created
+/// smoltcp sockets already in `Listen` state, and `socket_accept` replenishes
+/// the pool one socket at a time as connections are taken off it. So this is
+/// not a soft hint like Linux's `backlog` — it is a hard ceiling on how many
+/// connections can arrive *before the server accepts any of them*. Past it, the
+/// peer gets a RST, which a client reports as
+/// `kex_exchange_identification: read: Connection reset by peer`.
+///
+/// It is 8 unless the `many-sessions` feature is on, which caps simultaneous
+/// arrivals at 8 regardless of how fast the server accepts — measured directly
+/// against `userspace/sshd`: clean at 8 concurrent connections, dropping 2-4 of
+/// 16. That is the binding limit on sshd's concurrency, and it sits well below
+/// sshd's `max_sessions` default of 24, so the process-per-session sshd
+/// (`userspace/sshd`'s `fork-sessions` feature) cannot reach its own limit
+/// without this raised to match.
+///
+/// Each entry costs one smoltcp socket, i.e. `TCP_RX_BUFFER_SIZE +
+/// TCP_TX_BUFFER_SIZE` = 32 KB of heap held for the listener's whole life, so
+/// 32 entries is ~1 MB per listening socket, paid by every listener in the image
+/// (`httpd` included), plus ~44 KB of BSS for the larger socket table.
+/// `many-sessions` raises `smoltcp_net::MAX_SOCKETS` alongside it — a 32-deep
+/// backlog is meaningless if the total socket budget is 32.
+///
+/// `kernel_profile_extreme` overrides the feature and keeps 8. That profile
+/// builds `--no-default-features` so it cannot pick `many-sessions` up by
+/// accident today, but the override is written explicitly so that adding the
+/// feature to its list later cannot quietly cost it a megabyte per listener
+/// against a 4 MB floor.
+#[cfg(all(feature = "smoltcp", feature = "many-sessions", not(kernel_profile_extreme)))]
+const MAX_BACKLOG: usize = 32;
+#[cfg(all(
+    feature = "smoltcp",
+    any(not(feature = "many-sessions"), kernel_profile_extreme)
+))]
 const MAX_BACKLOG: usize = 8;
 
 /// Ephemeral port range start
