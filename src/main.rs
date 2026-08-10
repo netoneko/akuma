@@ -1470,10 +1470,10 @@ fn run_async_main() -> ! {
     // command line herd's sshd.conf would hand it, minus the core pinning.
     if config::AUTO_START_SSHD && _herd_tid == 0 && fs::is_initialized() {
         const SSHD_PATH: &str = "/bin/sshd";
-        const SSHD_ARGS: &[&str] = &["--port", "22", "--shell", "/bin/sh"];
+        let sshd_args: [&str; 4] = ["--port", "22", "--shell", config::USERSPACE_SSHD_SHELL];
         if fs::exists(SSHD_PATH) {
             crate::safe_print!(64, "[Main] Starting userspace sshd (no supervisor)...\n");
-            match process::spawn_process(SSHD_PATH, Some(SSHD_ARGS), None) {
+            match process::spawn_process(SSHD_PATH, Some(&sshd_args), None) {
                 Ok(tid) => crate::safe_print!(64, "[Main] sshd started (tid={})\n", tid),
                 Err(e) => crate::safe_print!(64, "[Main] ERROR: Failed to start sshd: {}\n", e),
             }

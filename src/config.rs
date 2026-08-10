@@ -791,6 +791,14 @@ pub const THREADING_HEARTBEAT_INTERVAL: u64 = 50_000_000; // BSP idle heartbeat 
 pub const AUTO_START_HERD: bool =
     !(cfg!(kernel_profile_extreme) && cfg!(feature = "userspace-sshd"));
 
+/// Login shell handed to the kernel-spawned `/bin/sshd`.
+///
+/// `/bin/paws` is the first-party mini-shell (`userspace/paws`, 7 mapped pages)
+/// rather than busybox's `/bin/sh` (265 pages): on a 4 MB box busybox alone is
+/// ~1.8x the shared file-page dedup cache, so concurrent shells stop sharing
+/// text. See docs/archive/FPCACHE_UNDERSIZED_AT_LOW_RAM.md.
+pub const USERSPACE_SSHD_SHELL: &str = "/bin/paws";
+
 /// Spawn `/bin/sshd` straight from the kernel, with no supervisor.
 ///
 /// Only meaningful when there is no built-in SSH server (`userspace-sshd`) and

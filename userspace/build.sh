@@ -81,6 +81,7 @@ MEMBERS=(
     "echo2"
     "elftest"
     "hello"
+    "paws"
     "herd"
     "httpd"
     "meow"
@@ -122,6 +123,7 @@ mkdir -p ../bootstrap/bin
 # Copy binaries (only if they exist)
 BINARIES=(
     "hello"
+    "paws"
     "echo2"
     "stackstress"
     "elftest"

@@ -1,0 +1,9 @@
+[package]
+name = "paws"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libakuma = { path = "../libakuma" }
+# `noshell` was declared here but never used — main.rs hand-rolls its parser
+# (see the note at the top of it). Dropped on revival so paws is pure libakuma.
