@@ -168,5 +168,5 @@ Hello, Akuma!
 | `/usr/include/stdio.h missing` | `--with-musl-dev` not passed to `populate_disk.sh` |
 | `/usr/lib/tcc/libtcc1.a missing` | `libtcc1.tar` not in `bootstrap/archives/` or extract failed |
 | `tcc: error: file 'libtcc1.a' not found` | `-B /usr/lib/tcc` flag missing |
-| `memory full` from tcc | RAM < 4 MB; use `MEMORY=4608K` |
+| `memory full` from tcc | RAM below the 4.0 MB floor; use `MEMORY=4096K` |
 | `exec /tmp/hello_c` → rc=255, empty out | compile failed silently; check step 5 output |

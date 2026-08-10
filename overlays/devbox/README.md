@@ -64,10 +64,10 @@ behavioural difference is entirely in those two features.
 ### devbox-smoltcp (the default) — the inverse
 
 The recommended image is the **`devbox-smoltcp`** meta-feature on the
-**`release-smp-shared`** profile:
+**`release`** profile (the `smp-shared` feature does the work):
 
 ```
-cargo run --profile release-smp-shared --features devbox-smoltcp,no-tests   # run-smoltcp.sh
+cargo run --release --features devbox-smoltcp,no-tests   # run-smoltcp.sh
 scripts/build_devbox_smoltcp.sh                                             # build-only
 
 [features]
@@ -111,7 +111,8 @@ logs and leaves box 0 on the native stack.
 ### 2. No built-in SSH
 
 Akuma normally runs an **in-kernel** SSH server (the one that prints
-`[SSH Server] Listening`). It is built on smoltcp sockets and runs unboxed on the native
+`[SSH Server] Listening`, a marker that no longer exists — the in-kernel server was
+deleted 2026-08-10). It was built on smoltcp sockets and ran unboxed on the native
 stack — exactly the one thing that would *not* go through rump. The `userspace-sshd`
 feature sets `config::ENABLE_USERSPACE_SSHD = true` so the kernel never starts it
 (`[Main] Built-in SSH server disabled`).

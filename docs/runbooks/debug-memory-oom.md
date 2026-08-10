@@ -52,7 +52,7 @@ If you're below these, you'll hit OOM by design — raise `MEMORY`.
 | Workload | Floor | Profile |
 |---|---|---|
 | Boot to serving SSH (usable) | **4 MB** | extreme (6 MB on `size`) |
-| `meow -c` one-shot LLM | **4.5 MB** | extreme |
+| `meow -c` one-shot LLM | **4.0 MB** | extreme |
 | `tcc -static hello.c` | **4 MB** | extreme (dynamic `/usr/bin/tcc` = 6 MB) |
 | Full meow agentic pipeline | **4 MB** | extreme |
 | `rustc hello.rs` | ≥ 256 MB | release (HVF sweet spot 768 MB–1 GB) |

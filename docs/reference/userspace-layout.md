@@ -22,7 +22,7 @@ pages — not every member has one).
 | `tcc` | Tiny C Compiler port — compile and run C programs on-target |
 | `neatvi` | Vi-like text editor, compilable on-target with TCC |
 | `sshd` | Userspace SSH server |
-| `paws` | **EXPERIMENTAL — `extreme-size` demo only.** Minimal first-party shell (598 lines, pure `libakuma`): 8 RO-mapped pages vs busybox's 265, which is what makes it usable as the login shell on a 4 MB box whose file-page dedup cache holds 144. **Not busybox/ash compatible** — hand-rolled parser, fixed builtin list, no `exec`/`printf`/`test`, unreliable pipes and redirection. Fine for `sshd --shell /bin/paws` execing one binary (that is how `acceptance/08` passes at 4.5 MB); do not point real shell scripts at it. Originally removed at `c0af6c7`, revived 2026-08-10. See [`../archive/BUSYBOX_TOYBOX_SIZING.md`](../archive/BUSYBOX_TOYBOX_SIZING.md) |
+| `paws` | **EXPERIMENTAL — `extreme-size` demo only.** Minimal first-party shell (598 lines, pure `libakuma`): 8 RO-mapped pages vs busybox's 265, which is what makes it usable as the login shell on a 4 MB box whose file-page dedup cache holds 128. **Not busybox/ash compatible** — hand-rolled parser, fixed builtin list, no `exec`/`printf`/`test`, unreliable pipes and redirection. Fine for `sshd --shell /bin/paws` execing one binary (that is how `acceptance/08` passes at 4.0 MB); do not point real shell scripts at it. Originally removed at `c0af6c7`, revived 2026-08-10. See [`../archive/BUSYBOX_TOYBOX_SIZING.md`](../archive/BUSYBOX_TOYBOX_SIZING.md) |
 | `httpd` | HTTP server |
 | `tar` | `tar` utility implementation |
 | `scratch` | Minimal Git client (Git Smart HTTP) — was removed then reverted; see `docs/archive/TRIMMING_FAT_PART_2.md`'s "Removed: scratch" section, which predates the revert |

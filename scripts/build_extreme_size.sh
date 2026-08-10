@@ -12,12 +12,20 @@ set -e
 # that family in the build (used to bisect which family tcc needs).
 #
 # `smoltcp` is listed explicitly: it is now an optional feature (so the devbox
-# can drop the native stack), and extreme keeps its native stack + built-in SSH
-# as before. Drop `smoltcp` here to reclaim its space if extreme goes netless.
+# can drop the native stack). Drop it here to reclaim its space if extreme goes
+# netless.
+#
+# `userspace-sshd` is the DEFAULT for extreme since 2026-08-10: it turns herd off
+# (config::AUTO_START_HERD) and has the kernel spawn /bin/sshd directly with
+# /bin/paws as the login shell (config::AUTO_START_SSHD / USERSPACE_SSHD_SHELL).
+# That is what makes 4.0 MB work: herd + its service tree costs ~1.4 MB, and
+# busybox as the login shell is 265 mapped pages against a 128-page dedup cache
+# at 4 MB, which collapses text sharing and kills the box on fork.
+# Measured at MEMORY=4096K: 1804 KB free idle, acceptance/08 passes.
 cargo +nightly build \
     --profile extreme-size \
     --no-default-features \
-    --features no-tests,smoltcp,extreme \
+    --features no-tests,smoltcp,extreme,userspace-sshd \
     -Z build-std=core,alloc \
     "$@"
 ls -lh target/aarch64-unknown-none/extreme-size/akuma

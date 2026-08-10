@@ -97,14 +97,6 @@ panic = "immediate-abort"
 [profile.release-smp]
 inherits = "release"
 
-# Real (shared-kernel) SMP build (docs/reference/subsystems/smp-shared.md). Inherits
-# `release` codegen; the `smp-shared` FEATURE gates the code. Selected together:
-#   cargo build --profile release-smp-shared --features smp-shared
-# (scripts/build_smp_shared.sh). Mutually exclusive with `smp` (build.rs panics if
-# both are set). `cargo build --release` is unaffected — single-core stays the default.
-[profile.release-smp-shared]
-inherits = "release"
-
 # Devbox build (overlays/devbox). Inherits `release` codegen (so it carries `rump`
 # + `sound`); the DISTINCTION from release is entirely in the `devbox` FEATURE set,
 # selected together by scripts/build_devbox.sh / overlays/devbox/run.sh:
@@ -115,13 +107,12 @@ inherits = "release"
 [profile.devbox]
 inherits = "release"
 
-# DWARF debug-info variant of `release-smp-shared`, for source-level lldb debugging
+# DWARF debug-info variant of `release`, for source-level lldb debugging
 # against the gdbstub (see docs/reference/scripts/multi-vm.md) instead of raw
 # addresses. OFF BY DEFAULT: nothing selects this profile unless explicitly
-# requested — `cargo build --profile release-smp-shared-debug --features
+# requested — `cargo build --profile release-debug --features
 # smp-shared,devbox-smoltcp,no-tests` (or whatever feature set you're debugging).
-# `cargo build --profile release-smp-shared` (the real target) is byte-for-byte
-# unaffected.
+# `cargo build --release` (the real target) is byte-for-byte unaffected.
 #
 # Only use this on a bug you can ALREADY reproduce reliably. `lockprobe.py`
 # deliberately symbolicates off `.symtab` and skips DWARF entirely because full
@@ -130,8 +121,8 @@ inherits = "release"
 # exists for the opposite situation: you have a live repro and want lldb to show
 # you source lines/locals instead of raw PC/LR values — a convenience, not a
 # hunting tool.
-[profile.release-smp-shared-debug]
-inherits = "release-smp-shared"
+[profile.release-debug]
+inherits = "release"
 debug = true
 
 [features]
@@ -162,7 +153,7 @@ smp = ["dep:akuma-smp"]
 # Real (shared-kernel) SMP / classic symmetric multiprocessing. NOT in `default`:
 # all shared-kernel secondary bringup + the shared scheduler/locking live behind
 # `cfg(kernel_smp_shared)`, which build.rs emits only when this feature is set (via
-# CARGO_FEATURE_SMP_SHARED). Paired with the `release-smp-shared` profile. The
+# CARGO_FEATURE_SMP_SHARED). Built with plain `--release`. The
 # INVERSE of `smp`: instead of replicating per-core state, all cores share one
 # kernel image, one PMM/heap, and one run queue under real cross-core locks.
 # Mutually exclusive with `smp` (build.rs enforces). See
@@ -313,7 +304,7 @@ no-bkl-irq = []
 # measured under a real userspace workload). Costs a shared-line store on every
 # kernel entry, so it perturbs timing-sensitive tests — keep it out of
 # `smp-shared` and enable it explicitly:
-#   cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests,bkl-profile
+#   cargo build --release --features devbox-smoltcp,no-tests,bkl-profile
 bkl-profile = []
 
 # Rump-kernel support: a raw L2 packet path so a userspace NetBSD rump TCP/IP
@@ -416,7 +407,7 @@ devbox = ["rump-default", "userspace-sshd"]
 # userspace /bin/sshd from herd serves SSH over smoltcp instead) and real
 # shared-kernel SMP (`smp-shared`). The INVERSE of `devbox` (rump-default):
 # keep smoltcp, drop the built-in ssh, add real SMP. Built with the
-# `release-smp-shared` profile by scripts/build_devbox_smoltcp.sh and layered on
+# plain `--release` by scripts/build_devbox_smoltcp.sh and layered on
 # the default (smoltcp-carrying) feature set. Because smoltcp stays in, the
 # `userspace-sshd` compile guard in main.rs is satisfied. See
 # docs/reference/subsystems/smp-shared.md and overlays/devbox/README.md.

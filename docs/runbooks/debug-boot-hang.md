@@ -42,10 +42,11 @@ Initializing threading...
 ========== Memory Tests ==========     (unless skipped)
 --- Filesystem Initialization ---
 [FS] Filesystem mounted successfully
-[SSH Server] Listening...              ← boot-to-SSH readiness
+[Main] sshd started (tid=8)            ← boot-to-SSH readiness (or [herd] Started sshd)
 ```
 
-The CLAUDE.md wait recipe greps for `"SSH Server] Listening"`. Never wait on
+Wait on `"sshd started|Started sshd"` (the `[SSH Server] Listening` marker was
+the in-kernel server's and no longer exists). Never wait on
 the QEMU process (it runs forever).
 
 ## Boot-time debug knobs

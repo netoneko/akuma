@@ -5,7 +5,7 @@
 # kernel across cores). The inverse of run.sh (rump-only, single kernel).
 # rump_server work is deferred; use run.sh for the rump path.
 #
-# Built with the `release-smp-shared` profile + `devbox-smoltcp` feature
+# Built with `--release` + the `devbox-smoltcp` feature
 # (scripts/build_devbox_smoltcp.sh). QEMU forwards host :2222 -> box :22 (the smoltcp
 # runner default). See overlays/devbox/README.md.
 set -euo pipefail
@@ -33,4 +33,4 @@ echo
 # Keep the DEFAULT feature set (smoltcp/kernel-tls stay in); layer the devbox-smoltcp
 # meta-feature (userspace-sshd + smp-shared) + no-tests. Matches build_devbox_smoltcp.sh.
 DEVBOX_SMOLTCP_FEATURES="devbox-smoltcp,no-tests"
-exec cargo run --profile release-smp-shared --features "$DEVBOX_SMOLTCP_FEATURES"
+exec cargo run --release --features "$DEVBOX_SMOLTCP_FEATURES"

@@ -39,7 +39,7 @@ Poll the log — **never wait on the QEMU process** (it runs forever):
 
 ```bash
 cargo run --release > boot.log 2>&1 &
-until grep -q "SSH Server] Listening" boot.log 2>/dev/null; do sleep 2; done
+until grep -aqE "sshd started|Started sshd" boot.log 2>/dev/null; do sleep 2; done
 ```
 
 Use `grep -a` — QEMU/HVF emits a control byte that makes plain `grep` treat the
@@ -67,7 +67,10 @@ After a disk rebuild (new host key): `ssh-keygen -R "[localhost]:2222"`.
 
 ## Verify
 
-- `[SSH Server] Listening...` in the log (boot readiness).
+- `[Main] sshd started (tid=N)` (extreme: kernel spawns it) or `[herd] Started sshd`
+  (herd-managed images) in the log — boot-to-SSH readiness. The old
+  `[SSH Server] Listening` marker belonged to the in-kernel server, deleted
+  2026-08-10; nothing prints it any more.
 - SSH lands in a shell; `ps`, `ls /`, `pmm` work.
 
 ## SSH from scripts (CLI is policy-blocked)

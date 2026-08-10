@@ -1,11 +1,15 @@
-# Acceptance: meow uses scratch to clone a repo, then compiles and runs hello.c on the extreme kernel at 4.5 MB
+# Acceptance: meow uses scratch to clone a repo, then compiles and runs hello.c on the extreme kernel at 4.0 MB
 
 Verify the full agentic pipeline — meow clones `akuma-playground` with `scratch`,
 compiles `hello.c` from the cloned repo with our static `tcc`, and runs the output
-— on the **extreme-size** kernel at **4.5 MB** RAM.
+— on the **extreme-size** kernel at **4.0 MB** RAM.
 
-At **4.0 MB** the kernel boots and meow can reach ollama, but tcc's ~4.5 MB
-working set makes the compile OOM at that size. **4.5 MB is the current floor.**
+**4.0 MB is the current floor**, as of 2026-08-10. It used to be 4.5 MB —
+tcc's working set tipped 4.0 MB into OOM — but removing the in-kernel SSH
+server, shell, editor and TLS stack, and switching extreme to
+`userspace-sshd` (herd off, `/bin/paws` as the login shell) freed enough that
+the whole flow completes at 4.0 MB with ~1.5 MB still free. See
+`docs/archive/BUILTIN_SSH_REMOVAL.md`.
 
 Ollama must be running on the host before starting the VM:
 ```bash
@@ -44,24 +48,24 @@ This pre-installs `musl-dev` and extracts `libtcc1.tar` into the disk image so
 no `apk add` is needed at VM runtime. It also wipes `/tmp` and re-stages
 `bootstrap/tmp/` so compiled artifacts from prior runs are gone.
 
-### 3. Start the VM at 4.5 MB
+### 3. Start the VM at 4.0 MB
 
 ```bash
 ELF=target/aarch64-unknown-none/extreme-size/akuma
-MEMORY=4608K INSTANCE=0 bash scripts/cargo_runner.sh "$ELF" 2>&1 | tee 05_extreme_4mb.log
+MEMORY=4096K INSTANCE=0 bash scripts/cargo_runner.sh "$ELF" 2>&1 | tee 05_extreme_4mb.log
 ```
 
-`MEMORY=4608K` = 4.5 MB. Use `SNAPSHOT=1` so every boot starts from the
+`MEMORY=4096K` = 4.0 MB. Use `SNAPSHOT=1` so every boot starts from the
 populate-disk state — `/tmp` is clean and `/akuma-playground` doesn't exist:
 
 ```bash
-MEMORY=4608K SNAPSHOT=1 INSTANCE=0 bash scripts/cargo_runner.sh "$ELF" 2>&1 | tee 05_extreme_4mb.log
+MEMORY=4096K SNAPSHOT=1 INSTANCE=0 bash scripts/cargo_runner.sh "$ELF" 2>&1 | tee 05_extreme_4mb.log
 ```
 
 Poll for boot (never call wait on the QEMU process — it runs forever):
 
 ```bash
-until grep -q "\[SSH Server\] Listening" 05_extreme_4mb.log 2>/dev/null; do sleep 2; done
+until grep -aqE "sshd started|Started sshd" 05_extreme_4mb.log 2>/dev/null; do sleep 2; done
 ```
 
 Expected boot banner (approximate):
@@ -70,7 +74,7 @@ Expected boot banner (approximate):
 Akuma OS — extreme profile
 Code+Stack: ~3 MB   Heap: ~768 KB seed   User pages: ~1 MB
 PMM: ~1152 total / ~625 alloc / ~527 free pages
-[SSH Server] Listening on 0.0.0.0:22
+[Main] sshd started (tid=8)
 ```
 
 SSH helper (strip ANSI, ignore known-hosts noise):
@@ -111,7 +115,7 @@ print("scratch ready")
 
 The prompt forces **sequential** shell tool-calls: clone first, then compile, then
 run. Merging compile+run into a single `&&` shell command makes the peak footprints
-overlap, which at 4.5 MB tips into OOM. The phrase
+overlap, which at 4.0 MB tips into OOM. The phrase
 `"run commands one by one using shell tool"` reliably steers `qwen3` to emit
 separate calls.
 
@@ -156,7 +160,7 @@ contains; the assertion checks for `Hello` as a prefix.)
 
 ---
 
-## Memory profile at 4.5 MB (extreme)
+## Memory profile at 4.0 MB (extreme)
 
 Scratch and tcc run sequentially — scratch exits before tcc starts — so their
 working sets do not overlap.
@@ -180,7 +184,7 @@ working sets do not overlap.
 |---|---|
 | VM never reaches SSH | boot OOM — kernel image or stack reserve grew; check `IMAGE_RESERVE` |
 | `pkg install scratch` fails | pkg server not running on host at port 8000, or `bootstrap/bin/scratch` missing; run `userspace/build.sh --scratch-only` first |
-| `scratch clone` OOM | rare at 4.5 MB — scratch's peak (TLS + pack buffer) is ~300 KB; check kernel serial log for `anon alloc failed` |
+| `scratch clone` OOM | rare at 4.0 MB — scratch's peak (TLS + pack buffer) is ~300 KB; check kernel serial log for `anon alloc failed` |
 | `scratch clone` fails with network error | DNS or TLS failure; verify the host has internet access and `github.com` is reachable from the guest via `nslookup github.com` |
 | meow exits with `Failed to create request buffer` or empty path errors | lazy-ELF segment-boundary clobber (see `docs/LOW_MEMORY_ENVIRONMENT.md`); rebuild extreme kernel |
 | tcc prints `memory full`, exit 1 | tcc's own allocator OOM — user pages dropped below tcc's ~4 MB working set; RAM is too low |
@@ -197,7 +201,7 @@ working sets do not overlap.
 | boot + SSH | **4.0 MB** | `logs/oomfix/boot_3mb.log` (3 MB also boots) |
 | `scratch clone` (TLS clone, 4 MB RAM) | **4.0 MB** | verified live 2026-06-06 |
 | `tcc -static hello.c` (direct, no meow) | **4.0 MB** | `scripts/our_tcc_floor.py` (2026-06-06, post heap-backoff fix) |
-| **meow agentically clones + compiles + runs** | **4.5 MB** | this test |
+| **meow agentically clones + compiles + runs** | **4.0 MB** | this test (re-verified 2026-08-10) |
 
 > **2026-06-06 — heap-growth backoff fix.** Fixed by backing off the contiguous
 > run length toward `needed` in `PmmOomHandler::handle_oom`. Re-validated live at

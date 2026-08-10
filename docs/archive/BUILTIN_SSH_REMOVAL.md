@@ -194,6 +194,47 @@ Two things to fix here, and they are independent:
    keeping the built-in server means finding another way to stop herd starting
    its sshd on a disk shared by all profiles.
 
+## Boot-readiness marker: harness divergence
+
+`[SSH Server] Listening` was printed by the **in-kernel** server's accept loop.
+Nothing prints it any more. Every harness that polled for it would wait forever,
+and `CLAUDE.md` still documents it as *the* boot-wait recipe.
+
+Worse than a straight rename: there are now **two** startup paths with two
+different markers, depending on who owns sshd.
+
+| image | who starts sshd | marker |
+|---|---|---|
+| `extreme-size` (`userspace-sshd`, herd off) | kernel, via `config::AUTO_START_SSHD` | `[Main] sshd started (tid=N)` |
+| everything else | herd, from `/etc/herd/enabled/sshd.conf` | `[herd] Started sshd (pid= N)` |
+
+So a profile-neutral wait has to accept either:
+
+```bash
+until grep -aqE "sshd started|Started sshd" boot.log 2>/dev/null; do sleep 2; done
+```
+
+`-a` is required — QEMU/HVF emits a control byte that makes plain `grep` treat
+the log as binary and silently match nothing.
+
+Updated to the pattern above: `acceptance/05_meow_tcc_extreme_4mb.md`,
+`acceptance/08_meow_clone_compile_run.md`, `docs/runbooks/boot-and-connect.md`,
+`docs/runbooks/debug-boot-hang.md`, `scripts/test_memory_split.py`.
+
+**`CLAUDE.md` is not updated** — it is reference-only by project convention, so
+its wait recipe still names the dead marker. Anyone following it verbatim gets a
+hang, not an error. Fixing that is a call for whoever owns that file.
+
+Two other consequences of the same removal, for anyone grepping logs:
+
+- `[Main] Built-in SSH server not compiled; userspace /bin/sshd only` was an
+  interim message from the gated build; the final tree prints
+  `[Main] SSH is the userspace /bin/sshd`.
+- The `[SSH]` stats/stall-watchdog block in the memory monitor is gone with the
+  server it reported on, so `[SSH] ... stall_us=` never appears. The stall
+  watchdog described in `docs/runbooks/debug-ssh-latency.md` no longer has a
+  kernel-side counterpart.
+
 ## Found
 
 - **The file-page dedup cache is undersized at the 4 MB floor. OPEN** — full

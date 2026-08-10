@@ -124,7 +124,7 @@ re-read it in `drop()` (that unbalances the BKL ticket FIFO).
 
 | Var | Default | Effect |
 |---|---|---|
-| `MEMORY` | (per script) | Guest RAM. Devbox: 4096. Self-host: 14336. Extreme: 4608K. |
+| `MEMORY` | (per script) | Guest RAM. Devbox: 4096. Self-host: 14336. Extreme: 4096K (4.0 MB floor). |
 | `DISK` | `disk.img` | Disk image path. |
 | `INSTANCE` | `0` | Instance id (affects SSH port, logging). |
 | `SNAPSHOT` | unset | `1` boots from a QEMU snapshot (writes discarded). |

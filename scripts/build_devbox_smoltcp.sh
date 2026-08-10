@@ -13,13 +13,14 @@ set -e
 # (the userspace sshd routes over it). We layer the
 # `devbox-smoltcp` meta-feature (userspace-sshd + smp-shared) plus `no-tests` (this is
 # a runtime target; skip the boot self-test suite) on top of the default set. Built
-# with the `release-smp-shared` profile so the shared-SMP secondary bringup compiles.
+# with plain `--release`: the `smp-shared` FEATURE gates the code, and the profile
+# that used to pair with it added no codegen of its own (removed 2026-08-10).
 #
 # Run with overlays/devbox/run-smoltcp.sh (SMP=N, no RUMP_NIC, host :2222 -> :22).
 # Extra args are forwarded (e.g. scripts/build_devbox_smoltcp.sh --quiet).
 DEVBOX_SMOLTCP_FEATURES="devbox-smoltcp,no-tests"
 cargo build \
-    --profile release-smp-shared \
+    --release \
     --features "$DEVBOX_SMOLTCP_FEATURES" \
     "$@"
-ls -lh target/aarch64-unknown-none/release-smp-shared/akuma
+ls -lh target/aarch64-unknown-none/release/akuma

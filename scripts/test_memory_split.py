@@ -46,7 +46,7 @@ def wait_boot(log, timeout=240):
     while time.time() - t0 < timeout:
         try:
             with open(log) as f:
-                if "SSH Server] Listening" in f.read():
+                if any(m in f.read() for m in ("sshd started", "Started sshd")):
                     return True
         except FileNotFoundError:
             pass

@@ -84,7 +84,7 @@ MEMORY=4096K SNAPSHOT=1 INSTANCE=0 bash scripts/cargo_runner.sh "$ELF" 2>&1 | te
 Poll for boot (never call wait on the QEMU process — it runs forever):
 
 ```bash
-until grep -q "\[SSH Server\] Listening" 08_meow_clone.log 2>/dev/null; do sleep 2; done
+until grep -aqE "sshd started|Started sshd" 08_meow_clone.log 2>/dev/null; do sleep 2; done
 ```
 
 Define the SSH helper for all VM steps:
@@ -202,7 +202,7 @@ working sets do not overlap.
 | `scratch clone` network error | verify host internet access and `github.com` reachable from guest |
 | meow exits with `Failed to create request buffer` | lazy-ELF segment-boundary clobber; rebuild extreme kernel |
 | `tcc: error: file 'libtcc1.a' not found` | `-B /usr/lib/tcc` missing from tcc command; check meow output |
-| `memory full` from tcc | RAM < 4 MB; use `MEMORY=4608K` |
+| `memory full` from tcc | RAM below the 4.0 MB floor; use `MEMORY=4096K` |
 | `/akuma-playground/` already exists | always boot with `SNAPSHOT=1`; repopulate disk otherwise |
 | model didn't clone/compile/run sequentially | retry; add `"run commands one by one using shell tool"` to prompt; try larger model |
 | meow output empty | check ollama is running on host and `OLLAMA_HOST` in `/etc/meow/config` points to `10.0.2.2:11434` |

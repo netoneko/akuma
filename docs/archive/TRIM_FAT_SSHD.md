@@ -192,7 +192,10 @@ pursued this round:
 > The section below is the original argument, kept verbatim; the measurement,
 > the gating, and the two defects it surfaced are in
 > [`BUILTIN_SSH_REMOVAL.md`](BUILTIN_SSH_REMOVAL.md). The pre-auth panic
-> described below is **still unfixed** in `crates/akuma-ssh`.
+> described below was closed by deletion. Harness fallout — the
+> `[SSH Server] Listening` boot marker no longer exists and every wait loop
+> had to change — is documented there under "Boot-readiness marker: harness
+> divergence".
 
 
 Everything above trims `userspace/sshd`. But there are **two** independent SSH-2
