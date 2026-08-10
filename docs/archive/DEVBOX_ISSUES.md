@@ -313,6 +313,131 @@ path `read_file` (and `metadata`) recognizes and confirm each one is also
 reachable through `read_at`, rather than relying on catching each gap by hand
 like this one.
 
+## Issue 5: devbox images ship with missing busybox applet symlinks (`wc`, `head`, `ps`, …)
+
+**Status: OPEN.** Found 2026-08-11 during the UART SMP-interleave
+verification (`docs/archive/UART_SMP_INTERLEAVE_FIX.md`), which boots
+`disk_selfhost.img` and drives an in-VM `cargo build`. Pre-existing —
+same symptom as Issue 1's "while debugging" note about `devbox.img`, just
+re-confirmed on a different image.
+
+### Symptom
+
+Over SSH on a freshly-built or freshly-refreshed image, basic busybox
+applets return "not found" even though `/bin/busybox` itself works:
+
+```
+$ wc -l Cargo.toml
+/bin/sh: wc: not found
+$ ps
+/bin/sh: ps: not found
+```
+
+`/bin/busybox wc -l Cargo.toml` works as a workaround, so the binary is
+there; only the per-applet symlinks in `/bin` are missing.
+
+### Root cause
+
+The image-build paths that lay down `/bin` sometimes skip the busybox
+applet symlink step. `scripts/populate_disk.sh` *does* have the logic
+(`SYMLINK_CMD`, lines ~230-285, with a "Full applet set by default (not
+just `--full-busybox`)" comment explaining why this is the default), and
+`overlays/devbox/bootstrap.sh` step 4 lays the same set down for the
+devbox rootfs. But neither catches every image-build path:
+`disk_selfhost.img` (built per `acceptance/10_selfhost_compile_akuma.md`,
+which calls `populate_disk.sh --with-rust-toolchain` and a separate
+Docker-based `git clone`) shipped with the applet set missing until a
+manual `DISK=disk_selfhost.img scripts/populate_disk.sh --bin-only
+--full-busybox` re-pass fixed it mid-investigation.
+
+The Issue 1 note already flagged this same shape against `devbox.img`
+and papered it over with a `bootstrap.sh` rebuild. This issue is the same
+bug, different image, fix path that doesn't depend on the devbox overlay.
+
+### Next step, if picked up
+
+Two layers, both worth doing:
+
+1. **Make the symlink step idempotent + cheap**, then call it from every
+   image-build path that touches `/bin`. The step is already idempotent
+   (it skips non-symlinks and uses `ln -sf`); the gap is *invocation*
+   coverage, not logic. Specifically:
+   - `acceptance/10_selfhost_compile_akuma.md`'s prep sequence (steps
+     1-3) should call `populate_disk.sh --bin-only --full-busybox` after
+     the toolchain install and source clone, the same way a devbox
+     rebuild runs through `bootstrap.sh` step 4.
+   - Any new image-build script that writes to `/bin` should be audited
+     for the same gap rather than discovering it one "X: not found" at a
+     time over SSH.
+2. **Add a smoke check** to the boot-time self-test suite (or
+     `acceptance/` regimens) that spawns one busybox applet by its
+     `/bin/<applet>` path (e.g. `/bin/wc -l /Cargo.toml` from inside the
+     VM, or `/bin/wc` via the boot self-tests against a fixture) and
+     fails loud if it returns `ENOENT`. That converts "missing symlink"
+     from an over-SSH papercut to a CI-visible regression.
+
+## Issue 6: `tail -f` ignores `^C` over SSH — signal doesn't break the blocking read
+
+**Status: OPEN.** Found 2026-08-11 during the same self-host session as
+Issue 5 (`docs/archive/UART_SMP_INTERLEAVE_FIX.md`). Not investigated
+beyond a positive repro — adding here so it doesn't get lost; would
+benefit from a gdb repro before any fix.
+
+### Symptom
+
+Over SSH inside the devbox:
+
+```
+$ tail -f /tmp/cargo-build.log
+…output…
+^C^C^C
+…output keeps printing, session does not return to the prompt…
+```
+
+`^C` (SIGINT) does not interrupt the running `tail -f`. The only way out
+is `kill -9 tail_pid` from a second SSH session, or closing the
+connection. Plain `tail` (without `-f`) exits normally on its own and
+`^C` works against any other busybox applet tried (`sleep 30`, `wc` over
+a pipe) — the bug is specific to the blocking-read loop in `-f` mode.
+
+### Likely shape of the bug
+
+Busybox `tail -f` is a tight `read(fd, buf, sz)` loop on the file's fd
+that is supposed to be interrupted by `SIGINT`'s default disposition
+(term the process) — but in Akuma that read either:
+
+- isn't returning `EINTR` when SIGINT is delivered mid-syscall (signal
+  handler install path setting `SA_RESTART` unconditionally, or the read
+  returning to user without checking the signal mask), or
+- the signal is being delivered but the busybox loop is structured
+  around `read` returning `EINTR` and we're not surfacing it, or
+- the signal is being masked/pended indefinitely on this thread and
+  never delivered at all.
+
+`docs/archive/GIT_MISSING_SYSCALLS.md` documents signal-delivery bugs of
+related shape (Issues 12-14 around `CLONE_THREAD`/`wait4` visibility);
+worth checking whether `tail -f`'s read-loop is hitting a related gap
+in `pselect6`/`ppoll`/`read` signal-interrupt semantics before assuming
+this is its own thing.
+
+### Reproducing
+
+```bash
+scripts/build_devbox_smoltcp.sh
+overlays/devbox/run-smoltcp.sh
+ssh -o StrictHostKeyChecking=no -p 2222 root@localhost \
+    'cd /tmp; echo hello > x; tail -f x'   # then mash ^C
+```
+
+### Next step, if picked up
+
+Attach `GDB=1` on a fresh boot and reproduce, breakpoint
+`sys_read`/`sys_rt_sigaction`/`sys_rt_sigreturn` to confirm which of the
+three shapes above is the actual cause. The fix is small once the shape
+is known — `EINTR` propagation in `sys_read`, or unsetting `SA_RESTART`
+for the busybox install path, or wiring the pending-signal drain on
+read-return — but each points at a different file.
+
 ## Background
 
 - `docs/archive/GIT_MISSING_SYSCALLS.md` — Issues 11-14, the CLONE_THREAD /

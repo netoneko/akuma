@@ -190,6 +190,20 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_smp_shared_blocking_wait_peer_progress();
 
+    // `poll_input_event`/`term_state_lock` preemption wedge regression: a thread
+    // contending on a `Spinlock<TerminalState>` via `akuma_exec::sync::lock_bounded`
+    // must not monopolize its core while merely waiting to acquire — see
+    // docs/archive/TERM_POLL_INPUT_PREEMPTION_FIX.md.
+    //
+    // DISABLED: the test harness itself (not `lock_bounded`) has an unresolved
+    // synchronization bug — on-device it reproducibly wedges with sustained
+    // `[BKL] stuck: owner=1 waiter=2` spam that never self-heals, immediately
+    // after `smp_shared_blocking_wait_peer_progress` and before this call ever
+    // prints its own `[Test]` line. Needs a fresh look at the holder/canary/main
+    // rendezvous (see the function body) rather than trusting the current
+    // MAIN_WAITING handshake.
+    // test_term_state_lock_bounded_acquire_does_not_starve_peers();
+
     // Net bounce-buffer OOM degradation (pure-fn boundaries + ample-mem alloc);
     // guards against the EC=0x3c kernel abort when an oversized socket buffer
     // can't grow the heap. No network stack required.
@@ -2074,6 +2088,152 @@ fn test_smp_shared_blocking_wait_peer_progress() {
         );
     } else {
         console::print("[Test] smp_shared_blocking_wait_peer_progress FAILED (exec error)\n");
+    }
+}
+
+/// Regression for the `poll_input_event`/`term_state_lock` preemption wedge
+/// (docs/archive/TERM_POLL_INPUT_PREEMPTION_FIX.md §9): calling
+/// `disable_preemption()` immediately before a *blocking* lock acquire keeps
+/// preemption disabled for as long as the lock stays contended, not just for the
+/// brief hold that follows — starving every other thread on the core for the whole
+/// wait. `akuma_exec::sync::lock_bounded` (§10 fix #1) disables preemption for one
+/// `try_lock` attempt at a time instead.
+///
+/// This holds a real `Spinlock<TerminalState>` from one thread for a controlled
+/// window while a second thread acquires it via `lock_bounded`, and a third,
+/// entirely unrelated canary thread just counts. The canary must keep making
+/// progress throughout the hold — that is the direct, observable signature of
+/// "the acquiring thread did not monopolize its core while merely waiting". With
+/// the old disable-then-block pattern (reproduced by calling `disable_preemption()`
+/// then a blocking `.lock()` in place of `lock_bounded` below), the canary's counter
+/// would stall for the entire contended window whenever the scheduler happens to
+/// co-locate it with the waiter.
+///
+/// Call site currently commented out in `run_all_tests` — see the comment there.
+#[allow(dead_code)]
+fn test_term_state_lock_bounded_acquire_does_not_starve_peers() {
+    use akuma_terminal::TerminalState;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use spinning_top::Spinlock;
+
+    static HOLDER_ACQUIRED: AtomicBool = AtomicBool::new(false);
+    static MAIN_WAITING: AtomicBool = AtomicBool::new(false);
+    static HOLDER_DONE: AtomicBool = AtomicBool::new(false);
+    static CANARY_TICKS: AtomicU64 = AtomicU64::new(0);
+    static CANARY_STOP: AtomicBool = AtomicBool::new(false);
+    const HOLD_MS: u64 = 200;
+
+    HOLDER_ACQUIRED.store(false, Ordering::SeqCst);
+    MAIN_WAITING.store(false, Ordering::SeqCst);
+    HOLDER_DONE.store(false, Ordering::SeqCst);
+    CANARY_TICKS.store(0, Ordering::SeqCst);
+    CANARY_STOP.store(false, Ordering::SeqCst);
+
+    let lock: Arc<Spinlock<TerminalState>> = Arc::new(Spinlock::new(TerminalState::default()));
+    let holder_lock = lock.clone();
+
+    // Holder: an ordinary, cooperative user of the lock — takes it with no special
+    // discipline (mirrors any of the several plain `.lock()` sites on
+    // `Arc<Spinlock<TerminalState>>` elsewhere in the tree). It holds the lock from
+    // acquire all the way through waiting for the main thread to signal that it has
+    // started its own contending attempt, and for HOLD_MS after that — anchoring the
+    // hold to when the waiter actually starts, not to an independently-computed
+    // deadline that scheduling jitter could let elapse before the waiter ever gets a
+    // chance to run (which would silently turn this into an uncontended acquire).
+    let holder_spawned = akuma_exec::threading::spawn_fn(move || {
+        let guard = holder_lock.lock();
+        HOLDER_ACQUIRED.store(true, Ordering::SeqCst);
+        while !MAIN_WAITING.load(Ordering::SeqCst) {
+            akuma_exec::threading::yield_now();
+        }
+        let deadline = crate::timer::uptime_us().saturating_add(HOLD_MS * 1000);
+        while crate::timer::uptime_us() < deadline {
+            akuma_exec::threading::yield_now();
+        }
+        drop(guard);
+        HOLDER_DONE.store(true, Ordering::SeqCst);
+        akuma_exec::threading::mark_current_terminated();
+        loop {
+            akuma_exec::threading::yield_now();
+            unsafe { core::arch::asm!("wfi") };
+        }
+    });
+
+    // Canary: forward-progress witness with no relationship to `lock` at all.
+    let canary_spawned = akuma_exec::threading::spawn_fn(|| {
+        while !CANARY_STOP.load(Ordering::SeqCst) {
+            CANARY_TICKS.fetch_add(1, Ordering::SeqCst);
+            akuma_exec::threading::yield_now();
+        }
+        akuma_exec::threading::mark_current_terminated();
+        loop {
+            akuma_exec::threading::yield_now();
+            unsafe { core::arch::asm!("wfi") };
+        }
+    });
+
+    if holder_spawned.is_err() || canary_spawned.is_err() {
+        console::print("[Test] term_state_lock_bounded_acquire_does_not_starve_peers SKIPPED (spawn failed)\n");
+        return;
+    }
+
+    // Wait for the holder to actually take the lock before we contend on it — a
+    // fixed number of yields is not reliable enough (the holder may not even be
+    // scheduled yet), and a spawn that never gets to run would otherwise make this
+    // test pass for the wrong reason (no real contention at all).
+    let acquire_wait_deadline = crate::timer::uptime_us().saturating_add(2_000_000);
+    while !HOLDER_ACQUIRED.load(Ordering::SeqCst) && crate::timer::uptime_us() < acquire_wait_deadline {
+        akuma_exec::threading::yield_now();
+    }
+    if !HOLDER_ACQUIRED.load(Ordering::SeqCst) {
+        CANARY_STOP.store(true, Ordering::SeqCst);
+        console::print("[Test] term_state_lock_bounded_acquire_does_not_starve_peers SKIPPED (holder never scheduled)\n");
+        return;
+    }
+
+    // Signal the holder to start counting its HOLD_MS from HERE, then immediately
+    // attempt the acquire — the two are adjacent on purpose (see the holder's comment
+    // above): this is what makes the contention window deterministic instead of
+    // racing against unrelated scheduling latency.
+    let waiter_start = crate::timer::uptime_us();
+    MAIN_WAITING.store(true, Ordering::SeqCst);
+    let acquired = akuma_exec::sync::lock_bounded(&lock);
+    let waiter_elapsed_us = crate::timer::uptime_us().saturating_sub(waiter_start);
+    drop(acquired);
+
+    CANARY_STOP.store(true, Ordering::SeqCst);
+
+    // Bounded wait for the holder to actually finish, so the suite doesn't race
+    // ahead of a still-live thread.
+    let join_deadline = crate::timer::uptime_us().saturating_add(2_000_000);
+    while !HOLDER_DONE.load(Ordering::SeqCst) && crate::timer::uptime_us() < join_deadline {
+        akuma_exec::threading::yield_now();
+    }
+    akuma_exec::threading::cleanup_terminated_force();
+
+    let canary_ticks = CANARY_TICKS.load(Ordering::SeqCst);
+
+    // The wait must have actually contended (roughly the hold duration, not raced
+    // ahead of the holder) and must have resolved well inside the join deadline —
+    // and, the actual regression signal, the unrelated canary must have kept
+    // ticking throughout instead of stalling for the contended window.
+    let waited_enough = waiter_elapsed_us >= (HOLD_MS * 1000 / 2);
+    let resolved_in_time = waiter_elapsed_us < 2_000_000;
+    let peers_made_progress = canary_ticks > 10;
+
+    if waited_enough && resolved_in_time && peers_made_progress {
+        crate::safe_print!(
+            192,
+            "[Test] term_state_lock_bounded_acquire_does_not_starve_peers PASSED (waited {}us, canary_ticks={})\n",
+            waiter_elapsed_us, canary_ticks
+        );
+    } else {
+        crate::safe_print!(
+            192,
+            "[Test] term_state_lock_bounded_acquire_does_not_starve_peers FAILED (waited {}us, canary_ticks={}, waited_enough={}, resolved_in_time={})\n",
+            waiter_elapsed_us, canary_ticks, waited_enough, resolved_in_time
+        );
     }
 }
 

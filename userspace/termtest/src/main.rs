@@ -7,8 +7,10 @@ use libakuma::{
     fd, print, println,
     set_cursor_position, set_terminal_attributes, get_terminal_attributes,
     clear_screen, hide_cursor, show_cursor, poll_input_event,
+    args, fork, getpid, waitpid_status, set_terminal_size, ForkResult,
 };
 use alloc::format;
+use alloc::vec::Vec;
 
 // Mode flags for terminal attributes (mirroring kernel's terminal/mod.rs)
 pub mod mode_flags {
@@ -18,8 +20,25 @@ pub mod mode_flags {
     pub const RAW_MODE_DISABLE: u64 = 0x02;
 }
 
+const DEFAULT_STRESS_CHILDREN: u32 = 6;
+const STRESS_ITERS: u32 = 300;
+const STRESS_HEARTBEAT_EVERY: u32 = 50;
+const STRESS_JOIN_TIMEOUT_MS: u64 = 30_000;
+
 #[no_mangle]
 pub extern "C" fn main() {
+    let mut args_iter = args();
+    let _prog = args_iter.next();
+
+    if matches!(args_iter.next(), Some("--stress")) {
+        let child_count: u32 = args_iter
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_STRESS_CHILDREN);
+        run_stress(child_count);
+        return;
+    }
+
     println("Terminal Test Program Started");
 
     // --- 1. Get and store initial terminal attributes ---
@@ -122,4 +141,106 @@ pub extern "C" fn main() {
 
     println("Terminal Test Program Finished");
     libakuma::exit(0);
+}
+
+/// Reproduces the contention pattern behind
+/// `docs/archive/TERM_POLL_INPUT_PREEMPTION_FIX.md`: `fork()`s `child_count`
+/// children off this process. `fork()` clones `terminal_state`, `channel`, and
+/// `stdin` as shared `Arc`s into the child (unlike `spawn_pty`, which mints a
+/// fresh `TerminalState` per session) — so every forked child here races the
+/// SAME `Arc<Spinlock<TerminalState>>`/`input_waker` the wedge doc analyzes,
+/// without needing a second SSH session or a human typing.
+///
+/// Each child alternates blocking `poll_input_event` calls (the exact loop
+/// that wedged) with a terminal ioctl (`TIOCSWINSZ`/`TCGETS`, which also takes
+/// `term_state_lock`), printing a heartbeat every `STRESS_HEARTBEAT_EVERY`
+/// iterations. Run this under `SMP>=2` for the cross-core shape the doc
+/// describes. A hung run shows as one or more pids that stop printing
+/// heartbeats — the parent's own join loop reports exactly which pids never
+/// finished within `STRESS_JOIN_TIMEOUT_MS`.
+fn run_stress(child_count: u32) {
+    println(&format!(
+        "termtest --stress: forking {} children sharing this process's TerminalState",
+        child_count
+    ));
+
+    let mut children: Vec<u32> = Vec::new();
+    for _ in 0..child_count {
+        match fork() {
+            Ok(ForkResult::Child) => {
+                stress_child_loop();
+                libakuma::exit(0);
+            }
+            Ok(ForkResult::Parent(pid)) => {
+                children.push(pid);
+            }
+            Err(e) => {
+                println(&format!("termtest --stress: fork failed: {}", e));
+                libakuma::exit(1);
+            }
+        }
+    }
+
+    println(&format!("termtest --stress: {} children forked, waiting...", children.len()));
+
+    let mut done: Vec<u32> = Vec::new();
+    let mut waited_ms: u64 = 0;
+    while done.len() < children.len() && waited_ms < STRESS_JOIN_TIMEOUT_MS {
+        for &pid in &children {
+            if done.contains(&pid) {
+                continue;
+            }
+            if let Some(status) = waitpid_status(pid) {
+                println(&format!(
+                    "termtest --stress: pid {} exited (code={}, signaled={})",
+                    pid, status.exit_code(), status.signaled()
+                ));
+                done.push(pid);
+            }
+        }
+        if done.len() < children.len() {
+            libakuma::sleep_ms(200);
+            waited_ms += 200;
+        }
+    }
+
+    if done.len() == children.len() {
+        println("termtest --stress: PASS -- all children finished, no wedge");
+        libakuma::exit(0);
+    } else {
+        let stuck: Vec<u32> = children.iter().copied().filter(|p| !done.contains(p)).collect();
+        println(&format!(
+            "termtest --stress: FAIL -- {} children never finished within {}ms: {:?}",
+            stuck.len(),
+            STRESS_JOIN_TIMEOUT_MS,
+            stuck
+        ));
+        libakuma::exit(1);
+    }
+}
+
+/// One stress child's work loop — see [`run_stress`] for the contention shape.
+fn stress_child_loop() {
+    let pid = getpid();
+    let mut buf = [0u8; 64];
+    for i in 0..STRESS_ITERS {
+        // A short timeout keeps each iteration bounded even when no input ever
+        // arrives, so the loop free-runs to completion when the fix holds —
+        // exercises the exact blocking wait loop the wedge doc names.
+        let _ = poll_input_event(20, &mut buf);
+
+        // Alternate a second, independently-contended path on the same
+        // `term_state_lock`: TIOCSWINSZ (write) vs TCGETS-equivalent (read).
+        if i % 3 == 0 {
+            let _ = set_terminal_size(fd::STDIN as i32, 80, 24);
+        } else {
+            let mut flags: u64 = 0;
+            let _ = get_terminal_attributes(fd::STDIN, &mut flags as *mut u64 as u64);
+        }
+
+        if i % STRESS_HEARTBEAT_EVERY == 0 {
+            println(&format!("termtest --stress: pid {} iter {}/{}", pid, i, STRESS_ITERS));
+        }
+    }
+    println(&format!("termtest --stress: pid {} done ({} iters)", pid, STRESS_ITERS));
 }

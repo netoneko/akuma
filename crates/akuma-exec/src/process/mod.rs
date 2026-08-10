@@ -314,15 +314,16 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str>
     }
 
     proc.stdin.lock().write_with_limit(data, config().proc_stdin_max_size);
-    
+
     if let Some(ref channel) = proc.channel {
         channel.write_stdin(data);
 
-        crate::threading::disable_preemption();
-        if let Some(waker) = proc.terminal_state.lock().input_waker.lock().take() {
+        // `lock_bounded` disables preemption only for a single `try_lock` attempt, not
+        // across the whole wait — see docs/archive/TERM_POLL_INPUT_PREEMPTION_FIX.md §10.
+        let waker = crate::sync::lock_bounded(&proc.terminal_state).input_waker.lock().take();
+        if let Some(waker) = waker {
             waker.wake();
         }
-        crate::threading::enable_preemption();
     }
     Ok(())
 }
@@ -343,11 +344,11 @@ pub fn close_process_stdin(pid: Pid) -> Result<(), &'static str> {
     if let Some(ref channel) = proc.channel {
         channel.close_stdin();
 
-        crate::threading::disable_preemption();
-        if let Some(waker) = proc.terminal_state.lock().input_waker.lock().take() {
+        // Same per-attempt-guarded acquire as `write_to_process_stdin` above.
+        let waker = crate::sync::lock_bounded(&proc.terminal_state).input_waker.lock().take();
+        if let Some(waker) = waker {
             waker.wake();
         }
-        crate::threading::enable_preemption();
     }
     Ok(())
 }

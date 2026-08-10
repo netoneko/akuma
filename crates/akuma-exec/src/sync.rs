@@ -195,6 +195,76 @@ impl Drop for PreemptGuard {
     }
 }
 
+/// Acquire a [`spinning_top::Spinlock`], disabling this thread's preemption for one
+/// non-blocking attempt at a time — never across the whole wait.
+///
+/// `disable_preemption()` immediately before a *blocking* `.lock()` (the naive shape)
+/// keeps preemption disabled for as long as the lock stays contended, not just for the
+/// brief hold that follows. If the current holder itself needs to enter the kernel (the
+/// BKL) to finish and release, and this thread's disabled preemption is exactly what
+/// stops the scheduler from ever giving up this core to let that happen, the wait
+/// becomes unbounded — the mechanism behind the `poll_input_event`/`term_state_lock`
+/// wedge (`docs/archive/TERM_POLL_INPUT_PREEMPTION_FIX.md` §9). `docs/reference/
+/// subsystems/locking.md`'s rule is "mask IRQs/preemption per *attempt*, never across an
+/// unbounded wait"; `Ext2Filesystem::read_state`/`write_state`
+/// (`crates/akuma-ext2/src/ext2.rs`) already implement it correctly for a different
+/// lock — this mirrors that shape.
+///
+/// The backoff between failed attempts calls `yield_now()` — a *voluntary* handoff —
+/// rather than only `core::hint::spin_loop()`. Re-enabling preemption alone is not
+/// enough to guarantee this core is ever actually given up: a caller running on a
+/// `cooperative` thread (e.g. the BSP's boot/async-executor thread) is immune to
+/// *involuntary* preemption by design, so between re-enabling preemption and the next
+/// `try_lock`, nothing would otherwise force a handoff to whoever holds the lock. A
+/// voluntary yield works regardless of that flag.
+#[inline]
+pub fn lock_bounded<T>(lock: &spinning_top::Spinlock<T>) -> PreemptBoundedGuard<'_, T> {
+    loop {
+        crate::threading::disable_preemption();
+        if let Some(inner) = lock.try_lock() {
+            return PreemptBoundedGuard { inner, _preempt: PreemptDisabledOnDrop };
+        }
+        crate::threading::enable_preemption();
+        crate::threading::yield_now();
+    }
+}
+
+/// Re-enables preemption on drop; pairs with the `disable_preemption()` call in
+/// [`lock_bounded`]'s successful attempt.
+struct PreemptDisabledOnDrop;
+
+impl Drop for PreemptDisabledOnDrop {
+    #[inline]
+    fn drop(&mut self) {
+        crate::threading::enable_preemption();
+    }
+}
+
+/// The guard returned by [`lock_bounded`].
+///
+/// Field order is drop order: `inner` (the spinlock guard) must release before
+/// `_preempt` re-enables preemption, or there would be an instant where the lock is
+/// still held with preemption already back on.
+pub struct PreemptBoundedGuard<'a, T> {
+    inner: spinning_top::guard::SpinlockGuard<'a, T>,
+    _preempt: PreemptDisabledOnDrop,
+}
+
+impl<T> core::ops::Deref for PreemptBoundedGuard<'_, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+
+impl<T> core::ops::DerefMut for PreemptBoundedGuard<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+}
+
 // --- BKL-hold profiler ---------------------------------------------------------
 // Attributes cross-core BKL wait to WHAT the holding core was doing, so we can see
 // which excursions (which syscall, faults, or the IRQ/scheduler path) cause peers to

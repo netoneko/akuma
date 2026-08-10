@@ -6,13 +6,20 @@
 key translation), see [`../ssh.md`](../ssh.md) "Terminal handling" — not
 duplicated here.
 
-> **Stability: B (watch).** A `TIOCSWINSZ`/`TIOCGWINSZ` propagation bug was
-> fixed across both SSH paths as recently as Jul 5 2026; otherwise low,
-> steady churn (mostly new ioctl codes for audio/tap features, not
-> firefighting). The recurring lesson: **`TerminalState` is per-PTY-spawn,
+> **Stability: B (watch) — one OPEN wedge.** A `TIOCSWINSZ`/`TIOCGWINSZ`
+> propagation bug was fixed across both SSH paths as recently as Jul 5 2026;
+> otherwise low, steady churn (mostly new ioctl codes for audio/tap features,
+> not firefighting). The recurring lesson: **`TerminalState` is per-PTY-spawn,
 > not per-session** — a `pty` spawn gives the child a fresh `Arc`, so a
 > multiplexed daemon (sshd) must reach the child's state through its
 > `ChildStdout(child_pid)` fd, not its own.
+>
+> **OPEN (2026-08-10):** the blocking stdin-read path
+> (`poll_input_event` here + `read`'s Stdin arm) takes
+> `term_state_lock`/`input_waker` with `disable_preemption()` (not IRQs
+> masked) and can spin there long enough under SMP contention to wedge the
+> whole VM — see "Blocking stdin read" below and
+> [`archive/DEVBOX_ISSUES.md`](../../../archive/DEVBOX_ISSUES.md) Issue 2.
 
 ## ioctl (29)
 
@@ -51,6 +58,75 @@ corresponding ANSI escape to the process's output channel), and
 `TerminalState`'s `input_waker`). See [`../ssh.md`](../ssh.md) "Terminal
 handling" for the `EscapeState` key-translation machine that produces the
 input these consume.
+
+## Blocking stdin read — `poll_input_event` (and `read`'s Stdin arm)
+
+`sys_poll_input_event` (`src/syscall/term.rs:376-448`) and `sys_read`'s
+`Stdin` arm (`src/syscall/fs.rs:384-453`) share one poll-wait shape: register
+a waker, try to drain, park via `schedule_blocking`, clear the waker on the
+way out. Both block in the kernel under `smp-shared`.
+
+The **waker handshake** is the load-bearing part. It is built around two
+critical sections taken with **preemption disabled** (not IRQs masked),
+around the per-process `Arc<Spinlock<TerminalState>>` and its nested
+`input_waker: Spinlock<Option<Waker>>`:
+
+```mermaid
+sequenceDiagram
+    participant R as Reader (poll_input_event / read Stdin)
+    participant TS as term_state_lock<br/>(Spinlock<TerminalState>)
+    participant IW as input_waker<br/>(Spinlock<Option<Waker>>)
+    participant W as Writer<br/>(write_to_process_stdin / close_process_stdin)
+    participant S as schedule_blocking<br/>(park + sticky-wake)
+
+    Note over R: loop until data / deadline / signal
+    R->>R: disable_preemption()
+    R->>TS: lock()
+    R->>IW: set(thread_waker)
+    R->>R: enable_preemption()
+    Note over R: preemption off ONLY for the register
+    R->>R: read_stdin() — non-blocking drain
+    alt data available
+        Note over R: break loop, return bytes
+    end
+    R->>S: schedule_blocking(deadline)
+    Note over R: park; preemption force-enabled<br/>inside schedule_blocking
+    Note over W: somewhere on another core,<br/>BKL-held writer arrives
+    W->>W: disable_preemption()
+    W->>TS: lock()
+    W->>IW: take() -> wake(R)
+    W->>R: sticky-wake (WOKEN_STATES)
+    W->>W: enable_preemption()
+    Note over R: scheduled back, re-enters loop
+    R->>R: disable_preemption()
+    R->>TS: lock()
+    Note over R: ← term.rs:432 / fs.rs:448<br/>WATCHDOG FIRES HERE if contended
+    R->>IW: take() (clear stale waker)
+    R->>R: enable_preemption()
+```
+
+### Hazard: preemption-disabled spin on a contended inner lock
+
+The two `disable_preemption()` → `term_state_lock.lock()` blocks are the
+fragile spots. `disable_preemption()` only raises this thread's per-thread
+preemption counter (`PREEMPTION_DISABLED`, `threading/mod.rs:1791`) — it does
+**not** mask IRQs and is **not** a cross-core lock. If the spinlock is
+contended when the reader reaches line 432 (post-wake cleanup), the reader
+spins with preemption disabled, and the preemption watchdog
+(`PREEMPTION_DISABLED_SINCE`) accumulates without bound.
+
+This is the precise site of the open `meow`-TUI wedge documented in
+[`archive/DEVBOX_ISSUES.md`](../../../archive/DEVBOX_ISSUES.md) Issue 2
+(watchdog: `disabled at src/syscall/term.rs:432` for 94 s) and is the same
+non-compliance that [`locking.md`](../locking.md) § "The per-syscall BKL
+opt-out list" → gate 2 lists as **blocking the conversion of `read`'s Stdin
+arm** off the BKL: every `terminal_state`/`input_waker` site uses
+`disable_preemption()` rather than `with_irqs_disabled()`, so a nested IRQ's
+unconditional `enter_kernel()` can deadlock AB-BA against a peer holding the
+BKL and waiting on this lock. Full mechanism analysis (root-caused) and the
+decided fix plan (bound the spin with a per-attempt `try_lock`, restructure
+the waker handshake) live in
+[`archive/TERM_POLL_INPUT_PREEMPTION_FIX.md`](../../../archive/TERM_POLL_INPUT_PREEMPTION_FIX.md).
 
 `get_cpu_stats` (314) is dispatched from this file but is unrelated to
 terminals — it's a `/proc`-adjacent debugging syscall (per-thread CPU time,
@@ -106,3 +182,6 @@ are **real** busy-poll behavior, not a sampling artifact.
   translation feeding `poll_input_event`.
 - `archive/RICH_TERMINAL_INTERFACE_OVER_SSH.md`, `archive/TERMINAL_SYSCALLS.md`.
 - `archive/PIPE_TTY_FIX.md` — the `is_terminal()` / pipe-vs-tty gate above.
+- `archive/DEVBOX_ISSUES.md` Issue 2 — the live `meow`-TUI wedge pinpointing
+  `term.rs:432`. `archive/TERM_POLL_INPUT_PREEMPTION_FIX.md` is the
+  mechanism analysis of the lock pattern that causes it, and the fix plan.

@@ -402,39 +402,43 @@ pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64
             crate::timer::uptime_us().saturating_add(timeout_us)
         };
 
-        loop {
-            {
-                akuma_exec::threading::disable_preemption();
-                let term_state = term_state_lock.lock();
-                let thread_id = akuma_exec::threading::current_thread_id();
-                term_state.set_input_waker(akuma_exec::threading::get_waker_for_thread(thread_id));
-                akuma_exec::threading::enable_preemption();
-            }
+        // Register the waker ONCE for the whole wait rather than once per iteration:
+        // the register and its matching clear (after the loop) are the only two
+        // `term_state_lock` touches this wait needs. `schedule_blocking`'s sticky wake
+        // (`WOKEN_STATES`) already tolerates a wake landing against a still-registered
+        // waker between iterations — it just re-enters the loop, drains nothing new,
+        // and parks again — so re-registering every iteration bought nothing but extra
+        // lock traffic on the exact lock the wedge below hangs off of. Each acquisition
+        // uses `lock_bounded`, which disables preemption only for a single `try_lock`
+        // attempt rather than across the whole (potentially contended, potentially
+        // unbounded) wait — see docs/archive/TERM_POLL_INPUT_PREEMPTION_FIX.md §9-§10.
+        {
+            let thread_id = akuma_exec::threading::current_thread_id();
+            akuma_exec::sync::lock_bounded(&term_state_lock)
+                .set_input_waker(akuma_exec::threading::get_waker_for_thread(thread_id));
+        }
 
+        bytes_read = loop {
             let n = proc_channel.read_stdin(&mut kernel_buf);
             if n > 0 {
-                bytes_read = n;
-                break;
+                break n;
             }
 
             if akuma_exec::process::should_interrupt_blocking_syscall() {
+                akuma_exec::sync::lock_bounded(&term_state_lock).input_waker.lock().take();
                 return i64::from(-libc_errno::EINTR) as u64;
             }
 
             if crate::timer::uptime_us() >= deadline {
-                bytes_read = 0;
-                break;
+                break 0;
             }
 
             akuma_exec::threading::schedule_blocking(deadline);
+        };
 
-            {
-                akuma_exec::threading::disable_preemption();
-                let term_state = term_state_lock.lock();
-                term_state.input_waker.lock().take();
-                akuma_exec::threading::enable_preemption();
-            }
-        }
+        // Clear the waker once the wait is over — the counterpart to the single
+        // register above, covering both remaining exit paths (data ready, deadline hit).
+        akuma_exec::sync::lock_bounded(&term_state_lock).input_waker.lock().take();
     }
 
     if bytes_read > 0 {

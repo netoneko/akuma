@@ -128,7 +128,20 @@ pub struct ProcessedInput {
 }
 
 impl TerminalState {
-    /// Pushes data into the input buffer.
+    /// Pushes data into the input buffer and wakes a parked reader, if any.
+    ///
+    /// Every real `input_waker` consumer (the kernel's `poll_input_event`/`read` Stdin
+    /// arm, and the stdin write/close paths) takes it nested under the enclosing
+    /// `Arc<Spinlock<TerminalState>>` guard with the calling thread's preemption
+    /// disabled for one `try_lock` attempt at a time — never across an unbounded wait,
+    /// which is exactly what turned a naive disable-then-block acquire into a kernel
+    /// wedge (`docs/archive/TERM_POLL_INPUT_PREEMPTION_FIX.md`). This `no_std`,
+    /// dependency-free crate has no access to the kernel's preemption primitives, so
+    /// `push_input` cannot enforce that discipline itself — **any caller must apply it
+    /// externally**: hold the outer lock, with preemption/IRQs disabled only for the
+    /// duration of this call, exactly like every other `input_waker` consumer (see
+    /// `akuma_exec::sync::lock_bounded`). There is currently no caller — this note is
+    /// for whoever wires one up.
     pub fn push_input(&self, data: &[u8]) {
         let mut buffer = self.input_buffer.lock();
         for &byte in data {

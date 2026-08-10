@@ -421,12 +421,14 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     return 0;
                 };
 
+                // `lock_bounded` disables preemption only for a single `try_lock`
+                // attempt, not across the whole (possibly contended, possibly
+                // unbounded) wait — see docs/archive/TERM_POLL_INPUT_PREEMPTION_FIX.md
+                // §9-§10.
                 {
-                    akuma_exec::threading::disable_preemption();
-                    let term_state = term_state_lock.lock();
                     let thread_id = akuma_exec::threading::current_thread_id();
-                    term_state.set_input_waker(akuma_exec::threading::get_waker_for_thread(thread_id));
-                    akuma_exec::threading::enable_preemption();
+                    akuma_exec::sync::lock_bounded(&term_state_lock)
+                        .set_input_waker(akuma_exec::threading::get_waker_for_thread(thread_id));
                 }
 
                 // Re-check AFTER registering the waker to close a lost-wakeup race:
@@ -436,20 +438,13 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 // races `close_process_stdin` (e.g. `cat` over `ssh host cmd` when
                 // the client closes stdin) parks forever. Re-loop instead of parking.
                 if ch.is_stdin_closed() || ch.has_stdin_data() {
-                    akuma_exec::threading::disable_preemption();
-                    term_state_lock.lock().input_waker.lock().take();
-                    akuma_exec::threading::enable_preemption();
+                    akuma_exec::sync::lock_bounded(&term_state_lock).input_waker.lock().take();
                     continue;
                 }
 
                 akuma_exec::threading::schedule_blocking(u64::MAX);
 
-                {
-                    akuma_exec::threading::disable_preemption();
-                    let term_state = term_state_lock.lock();
-                    term_state.input_waker.lock().take();
-                    akuma_exec::threading::enable_preemption();
-                }
+                akuma_exec::sync::lock_bounded(&term_state_lock).input_waker.lock().take();
             }
         }
         akuma_exec::process::FileDescriptor::File(ref f) => {
