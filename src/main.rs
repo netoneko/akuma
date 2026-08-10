@@ -21,9 +21,6 @@ extern crate alloc;
 
 mod akuma;
 mod allocator;
-// Async VFS wrappers used only by the in-kernel shell command set.
-#[cfg(kernel_builtin_ssh)]
-mod async_fs;
 mod audio;
 // mod async_net;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
@@ -37,10 +34,6 @@ mod config;
 mod console;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod daif_tests;
-#[cfg(feature = "neko")]
-// In-kernel editor (neko). Reachable only from the built-in SSH shell.
-#[cfg(kernel_builtin_ssh)]
-mod editor;
 // mod embassy_net_driver;
 // mod embassy_time_driver; // replaced by kernel_timer
 // mod embassy_virtio_driver;
@@ -75,12 +68,6 @@ mod rump_proxy;
     any(not(feature = "no-tests"), feature = "rump-tests"),
 ))]
 mod rump_tests;
-// In-kernel shell. Its only driver is the built-in SSH session; a userspace
-// sshd image runs a userspace shell instead.
-#[cfg(kernel_builtin_ssh)]
-mod shell;
-#[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), kernel_builtin_ssh))]
-mod shell_tests;
 #[cfg(kernel_smp)]
 mod smp;
 // Real (shared-kernel) SMP — the inverse of the multikernel `smp` module. One
@@ -89,20 +76,6 @@ mod smp;
 mod smp_shared;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod sync_tests;
-// The built-in (in-kernel) SSH server. Compiled in only under
-// `cfg(kernel_builtin_ssh)` (build.rs): it is built on smoltcp sockets, so it
-// needs the native stack, AND it is pointless once `userspace-sshd` is on —
-// there the userspace /bin/sshd serves SSH and this copy is never started.
-// Gating the module (rather than only `config::ENABLE_USERSPACE_SSHD` at
-// runtime) is what keeps the whole SSH-2 implementation, and the `akuma-ssh`
-// crate behind it, out of the image.
-#[cfg(kernel_builtin_ssh)]
-mod ssh;
-#[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), kernel_builtin_ssh))]
-mod ssh_tests;
-// No compile-time guard on "is there an sshd": every profile except `extreme`
-// now serves SSH from the userspace /bin/sshd, which is a property of the disk
-// and of `config::AUTO_START_HERD`/`AUTO_START_SSHD`, not of the feature set.
 mod syscall;
 #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
 mod tests;
@@ -1102,11 +1075,6 @@ fn kernel_main(dtb_ptr: usize) -> ! {
                                 // Run process execution tests
                                 process_tests::run_all_tests();
 
-                                // Run shell tests (pipelines with /bin binaries).
-                                // Drives the in-kernel command registry, so it is
-                                // present only where that registry is.
-                                #[cfg(kernel_builtin_ssh)]
-                                shell_tests::run_all_tests();
                             }
 
                             // Run memory benchmarks (always prints, never fails)
@@ -1365,9 +1333,6 @@ fn run_async_main() -> ! {
             && ram <= config::LOW_MEM_TEST_SKIP_MB * 1024 * 1024;
         if !config::DISABLE_ALL_TESTS && !low_mem_skip_tests {
             process_tests::run_network_tests();
-            // The SSH suite exercises the built-in server, so it goes when it does.
-            #[cfg(kernel_builtin_ssh)]
-            ssh_tests::run_all_tests();
         }
     }
 
@@ -1415,26 +1380,10 @@ fn run_async_main() -> ! {
     #[cfg(kernel_smp)]
     smp::autostart_bench_core();
 
-    // Built-in (smoltcp) SSH server. Compiled out entirely when the native stack
-    // is absent (devbox / rump-only) or `userspace-sshd` is on — there SSH is the
-    // userspace /bin/sshd, and nothing of this implementation is in the image.
-    #[cfg(kernel_builtin_ssh)]
-    {
-        ssh::init_host_key();
-        console::print("[Main] Spawning built-in SSH server thread...\n");
-        if let Err(e) = threading::spawn_system_thread_fn(|| ssh::server::run()) {
-            console::print("[Main] Failed to spawn SSH server: ");
-            console::print(e);
-            console::print("\n");
-        }
-    }
-    #[cfg(not(kernel_builtin_ssh))]
-    console::print("[Main] Built-in SSH server not compiled; userspace /bin/sshd only\n");
+    console::print("[Main] SSH is the userspace /bin/sshd
+");
 
     safe_print!(1024, "[Main] Network ready! Running background polling loop.\n");
-    #[cfg(kernel_builtin_ssh)]
-    safe_print!(1024, "[Main] SSH Server: Connect with ssh -o StrictHostKeyChecking=no user@localhost -p {}\n",
-        if crate::config::SSH_PORT == 22 { 2222 } else { crate::config::SSH_PORT });
 
     // Enable IRQs for the main loop
     unsafe {
@@ -1889,71 +1838,6 @@ async fn memory_monitor() -> ! {
         // for the extreme kernel stacks. Printed on its own line to keep [Mem] short.
         akuma_exec::threading::report_stack_high_water();
 
-        // SSH server stats + stall watchdog. Reports on the built-in server, so
-        // it compiles out with it (rump-only builds and `userspace-sshd` images).
-        #[cfg(kernel_builtin_ssh)]
-        {
-        let ssh = ssh::server::stats();
-        buf.clear();
-        if ssh.alive {
-            // Stall watchdog: if the accept loop hasn't ticked SERVER_TICK_US
-            // for >5s while reporting alive, that's a soft hang in the SSH
-            // server. We don't auto-respawn (the dead thread still owns the
-            // listener socket; a parallel respawn would collide on port
-            // SSH_PORT) but a loud log makes the failure mode visible to the
-            // operator and to the Python harness in scripts/ssh_harness.py.
-            const SSH_STALL_THRESHOLD_US: u64 = 5_000_000;
-            let stall_us = uptime_us.saturating_sub(ssh.last_tick_us);
-            let stall_marker = if stall_us > SSH_STALL_THRESHOLD_US {
-                " STALLED"
-            } else {
-                ""
-            };
-            let _ = writeln!(
-                buf,
-                "[SSH]{} listening | active={} open={} close={} hs_fail={} auth_fail={} panic={} stall_us={}",
-                stall_marker, ssh.active, ssh.opened, ssh.closed, ssh.handshake_fail, ssh.auth_fail, ssh.panicked, stall_us
-            );
-            // Phase-1 instrumentation: when STALLED, dump the accept-loop
-            // step + NETWORK lock holder snapshot so the log alone tells us
-            // which of (a) NETWORK contention, (b) poll() stuck, (c) listener
-            // handle freed is responsible. See docs/STABILITY_URGENT_ISSUES.md.
-            if stall_us > SSH_STALL_THRESHOLD_US {
-                let (holder, locked_at, site, polls_in, polls_out) =
-                    akuma_net::smoltcp_net::network_holder_snapshot();
-                let net_held_us = if holder == akuma_net::smoltcp_net::NETWORK_HOLDER_NONE {
-                    0
-                } else {
-                    uptime_us.saturating_sub(locked_at)
-                };
-                let holder_str = if holder == akuma_net::smoltcp_net::NETWORK_HOLDER_NONE {
-                    -1_i64
-                } else {
-                    i64::from(holder)
-                };
-                let _ = writeln!(
-                    buf,
-                    "[SSH] STALL DETAIL | step={}({}) listener_valid={} net_holder={} net_site={} net_held_us={} poll_in={} poll_out={} poll_gap={}",
-                    ssh.last_step,
-                    ssh::server::step::name(ssh.last_step),
-                    ssh.listener_valid,
-                    holder_str,
-                    site.as_str(),
-                    net_held_us,
-                    polls_in,
-                    polls_out,
-                    polls_in.saturating_sub(polls_out),
-                );
-            }
-        } else {
-            let _ = writeln!(
-                buf,
-                "[SSH] no listener | active={} open={} close={} hs_fail={} auth_fail={} panic={}",
-                ssh.active, ssh.opened, ssh.closed, ssh.handshake_fail, ssh.auth_fail, ssh.panicked
-            );
-        }
-        console::print(buf.as_str());
-        }
 
         // Report every 10 seconds (or period from config)
         Timer::after(Duration::from_secs(config::MEM_MONITOR_PERIOD_SECONDS)).await;

@@ -41,7 +41,6 @@ dependencies = [
 name = "akuma"
 version = "0.0.7"
 dependencies = [
- "akuma-editor",
  "akuma-exec",
  "akuma-ext2",
  "akuma-isolation",
@@ -49,8 +48,6 @@ dependencies = [
  "akuma-rump",
  "akuma-shell",
  "akuma-smp",
- "akuma-ssh",
- "akuma-ssh-crypto",
  "akuma-terminal",
  "akuma-vfs",
  "arm_pl031",
@@ -61,13 +58,6 @@ dependencies = [
  "spinning_top",
  "talc",
  "virtio-drivers",
-]
-
-[[package]]
-name = "akuma-editor"
-version = "0.1.0"
-dependencies = [
- "embedded-io-async",
 ]
 
 [[package]]
@@ -137,20 +127,6 @@ dependencies = [
 [[package]]
 name = "akuma-smp"
 version = "0.1.0"
-
-[[package]]
-name = "akuma-ssh"
-version = "0.1.0"
-dependencies = [
- "akuma-ssh-crypto",
- "ctr",
- "ed25519-dalek",
- "embedded-io-async",
- "hmac",
- "log",
- "sha2",
- "x25519-dalek",
-]
 
 [[package]]
 name = "akuma-ssh-crypto"
@@ -1147,16 +1123,6 @@ dependencies = [
  "enumn",
  "log",
  "zerocopy 0.7.35",
-]
-
-[[package]]
-name = "x25519-dalek"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
-dependencies = [
- "curve25519-dalek",
- "rand_core",
 ]
 
 [[package]]

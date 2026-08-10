@@ -3,8 +3,6 @@
 //! Provides a synchronous filesystem API that delegates to the VFS layer.
 //! This module maintains backward compatibility with the original FAT32-based API.
 
-#[cfg(kernel_builtin_ssh)]
-use alloc::string::String;
 use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
@@ -18,41 +16,8 @@ pub use crate::vfs::{DirEntry, FsError};
 // Filesystem Statistics (backward compatible wrapper)
 // ============================================================================
 
-/// Filesystem statistics
-#[derive(Debug, Clone)]
-/// Reported by the in-kernel shell's `df`; no other caller reads it.
-#[cfg(kernel_builtin_ssh)]
-pub struct FsStats {
-    pub cluster_size: u32,
-    pub total_clusters: u32,
-    pub free_clusters: u32,
-}
 
-#[cfg(kernel_builtin_ssh)]
-impl FsStats {
-    pub fn total_bytes(&self) -> u64 {
-        u64::from(self.total_clusters) * u64::from(self.cluster_size)
-    }
 
-    pub fn free_bytes(&self) -> u64 {
-        u64::from(self.free_clusters) * u64::from(self.cluster_size)
-    }
-
-    pub fn used_bytes(&self) -> u64 {
-        self.total_bytes() - self.free_bytes()
-    }
-}
-
-#[cfg(kernel_builtin_ssh)]
-impl From<vfs::FsStats> for FsStats {
-    fn from(stats: vfs::FsStats) -> Self {
-        Self {
-            cluster_size: stats.block_size,
-            total_clusters: stats.total_blocks as u32,
-            free_clusters: stats.free_blocks as u32,
-        }
-    }
-}
 
 // ============================================================================
 // Filesystem State
@@ -209,14 +174,6 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, FsError> {
     }
 }
 
-/// Read file contents as a string
-#[cfg(kernel_builtin_ssh)]
-pub fn read_to_string(path: &str) -> Result<String, FsError> {
-    if !is_initialized() {
-        return Err(FsError::NotInitialized);
-    }
-    vfs::read_to_string(path)
-}
 
 /// Write data to a file (creates or truncates)
 pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
@@ -243,7 +200,7 @@ pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError
 }
 
 /// Append data to a file
-#[cfg(any(kernel_builtin_ssh, kernel_tests))]
+#[cfg(kernel_tests)]
 pub fn append_file(path: &str, data: &[u8]) -> Result<(), FsError> {
     if !is_initialized() {
         return Err(FsError::NotInitialized);
@@ -299,14 +256,6 @@ pub fn file_size(path: &str) -> Result<u64, FsError> {
     vfs::file_size(path)
 }
 
-/// Get filesystem statistics
-#[cfg(kernel_builtin_ssh)]
-pub fn stats() -> Result<FsStats, FsError> {
-    if !is_initialized() {
-        return Err(FsError::NotInitialized);
-    }
-    vfs::stats("/").map(core::convert::Into::into)
-}
 
 // ============================================================================
 // Logging

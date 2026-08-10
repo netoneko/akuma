@@ -2651,10 +2651,10 @@ fn test_parallel_processes() -> bool {
     // Without the in-kernel shell these two checks cannot run at all; start them
     // satisfied so the loop below does not spin waiting for a result that will
     // never arrive, and `checks_ok` stays meaningful.
-    #[cfg_attr(not(kernel_builtin_ssh), allow(unused_mut))]
-    let mut ps_done = !cfg!(kernel_builtin_ssh);
-    #[cfg_attr(not(kernel_builtin_ssh), allow(unused_mut))]
-    let mut kthreads_done = !cfg!(kernel_builtin_ssh);
+    // ps/kthreads were checked by running them through the in-kernel shell
+    // pipeline, which no longer exists; treat them as satisfied.
+    let ps_done = true;
+    let kthreads_done = true;
     let mut checks_attempted = false;
 
     loop {
@@ -2683,46 +2683,6 @@ fn test_parallel_processes() -> bool {
         if (!p1_done || !p2_done) && (!ps_done || !kthreads_done) {
             checks_attempted = true;
 
-            // ps/kthreads are checked by running them through the IN-KERNEL shell
-            // pipeline, which exists only alongside the built-in SSH server. With
-            // that gone there is nothing to drive them through, so the checks are
-            // reported as satisfied (see `ps_done`/`kthreads_done` init).
-            #[cfg(kernel_builtin_ssh)]
-            if !ps_done {
-                let ps_result =
-                    crate::async_tests::run_async_test(async { crate::shell_tests::execute_pipeline_test(b"ps").await });
-                if let Ok(value) = ps_result {
-                    let value_as_str = String::from_utf8_lossy(&value);
-                    let process_name = "/bin/hello";
-                    let process_state = "running";
-                    if value_as_str.lines().any(|line| line.contains(process_name) && line.contains(process_state)) {
-                        ps_done = true;
-                        console::print("  ps check: PASS\n");
-                    }
-                }
-            }
-
-            #[cfg(kernel_builtin_ssh)]
-            if !kthreads_done {
-                let kthreads_result =
-                    crate::async_tests::run_async_test(async { crate::shell_tests::execute_pipeline_test(b"kthreads").await });
-                if let Ok(value) = kthreads_result {
-                    let value_as_str = String::from_utf8_lossy(&value);
-                    let tid1_str = format!("{tid1:>4}");
-                    let tid2_str = format!("{tid2:>4}");
-                    let user_process = "user-process";
-
-                    let has_tid1 = value_as_str.lines().any(|line|
-                        line.contains(&tid1_str) && line.contains(user_process));
-                    let has_tid2 = value_as_str.lines().any(|line|
-                        line.contains(&tid2_str) && line.contains(user_process));
-
-                    if has_tid1 || has_tid2 {
-                        kthreads_done = true;
-                        crate::safe_print!(128, "  kthreads check: PASS (threads {} or {} visible)\n", tid1, tid2);
-                    }
-                }
-            }
         }
 
         if p1_done && p2_done {

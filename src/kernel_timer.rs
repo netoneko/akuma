@@ -31,10 +31,6 @@ impl Duration {
         Self { us: secs * 1_000_000 }
     }
 
-    #[cfg(kernel_builtin_ssh)]
-    pub const fn from_millis(ms: u64) -> Self {
-        Self { us: ms * 1_000 }
-    }
 
     pub const fn as_micros(&self) -> u64 {
         self.us
@@ -45,17 +41,7 @@ impl Duration {
 // Timeout Error
 // ============================================================================
 
-/// Error returned when a future times out
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(kernel_builtin_ssh)]
-pub struct TimeoutError;
 
-#[cfg(kernel_builtin_ssh)]
-impl core::fmt::Display for TimeoutError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "timeout")
-    }
-}
 
 // ============================================================================
 // ARM Timer Hardware Access
@@ -253,33 +239,6 @@ pub fn init() {
 // with_timeout
 // ============================================================================
 
-/// Wrap a future with a timeout. Returns `Err(TimeoutError)` if the deadline
-/// elapses before the inner future completes.
-#[cfg(kernel_builtin_ssh)]
-pub async fn with_timeout<F: Future>(
-    duration: Duration,
-    future: F,
-) -> Result<F::Output, TimeoutError> {
-    let deadline_us = now_us().saturating_add(duration.as_micros());
-    let mut future = core::pin::pin!(future);
-
-    core::future::poll_fn(move |cx| {
-        // Poll the inner future first
-        if let Poll::Ready(val) = future.as_mut().poll(cx) {
-            return Poll::Ready(Ok(val));
-        }
-
-        // Check deadline
-        if now_us() >= deadline_us {
-            return Poll::Ready(Err(TimeoutError));
-        }
-
-        // Schedule a wakeup at the deadline so we don't miss it
-        schedule_wake(deadline_us, cx.waker());
-        Poll::Pending
-    })
-    .await
-}
 
 // ============================================================================
 // Timer (async delay)

@@ -235,12 +235,6 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, FsError> {
     with_fs(path, |fs, rel| fs.read_file(rel))
 }
 
-/// Read file contents as a string
-#[cfg(kernel_builtin_ssh)]
-pub fn read_to_string(path: &str) -> Result<String, FsError> {
-    let bytes = read_file(path)?;
-    String::from_utf8(bytes).map_err(|_| FsError::IoError)
-}
 
 /// Write data to a file (creates or truncates)
 pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
@@ -250,7 +244,7 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
 }
 
 /// Append data to a file
-#[cfg(any(kernel_builtin_ssh, kernel_tests))]
+#[cfg(kernel_tests)]
 pub fn append_file(path: &str, data: &[u8]) -> Result<(), FsError> {
     let r = with_fs(path, |fs, rel| fs.append_file(rel, data));
     invalidate_file_pages(path);
@@ -400,19 +394,7 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
     old_arc.rename(&old_rel, &new_rel)
 }
 
-/// Get filesystem statistics for a path
-#[cfg(kernel_builtin_ssh)]
-pub fn stats(path: &str) -> Result<FsStats, FsError> {
-    with_fs(path, |fs, _| fs.stats())
-}
 
-/// List all mounted filesystems
-#[cfg(kernel_builtin_ssh)]
-pub fn list_mounts() -> Result<Vec<MountInfo>, FsError> {
-    let table = MOUNT_TABLE.lock();
-    let table = table.as_ref().ok_or(FsError::NotInitialized)?;
-    Ok(table.list_mounts())
-}
 
 // ============================================================================
 // Symlink Support

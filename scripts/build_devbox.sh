@@ -7,13 +7,13 @@ set -e
 # `--no-default-features` compiles the native smoltcp stack (and the smoltcp-coupled
 # built-in SSH) OUT entirely — rump is the only networking. We re-add the non-smoltcp
 # defaults the image wants (mirrors scripts/build_size.sh's explicit style): `sound`
-# (virtio-sound for wavplay), `neko` (in-kernel editor), all `sc-*` syscall families,
+# (virtio-sound for wavplay), all `sc-*` syscall families,
 # and `no-tests` (this is a runtime target; the smoltcp-coupled boot suites are off).
 # Omitted vs. the default set: `smoltcp`, `kernel-tls`, `tls-rsa` (no in-kernel HTTPS
 # — use a userspace tool). Boot with RUMP_NIC=1 (overlays/devbox/run.sh does that).
 #
 # Extra args are forwarded (e.g. `scripts/build_devbox.sh --quiet`).
-DEVBOX_FEATURES="devbox,neko,sound,no-tests,rump-tests,sc-aio,sc-sysv-ipc,sc-framebuffer,sc-containers,sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll"
+DEVBOX_FEATURES="devbox,sound,no-tests,rump-tests,sc-aio,sc-sysv-ipc,sc-framebuffer,sc-containers,sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll"
 cargo build \
     --profile devbox \
     --no-default-features \

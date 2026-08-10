@@ -4,7 +4,6 @@ cargo-features = ["panic-immediate-abort"]
 members = [".", "crates/*"]
 default-members = [
     ".",
-    "crates/akuma-editor",
     "crates/akuma-exec",
     "crates/akuma-ext2",
     "crates/akuma-isolation",
@@ -12,7 +11,6 @@ default-members = [
     "crates/akuma-rump",
     "crates/akuma-shell",
     "crates/akuma-smp",
-    "crates/akuma-ssh",
     "crates/akuma-ssh-crypto",
     "crates/akuma-terminal",
     "crates/akuma-vfs",
@@ -144,7 +142,6 @@ debug = true
 
 [features]
 default = [
-    "neko",
     "smoltcp",
     "kernel-tls",
     "tls-rsa",
@@ -359,9 +356,6 @@ kernel-tls = [
 # ~300 KB. Implies `kernel-tls`. SSH is Ed25519-only and unaffected; only
 # RSA-only HTTPS hosts break.
 tls-rsa = ["kernel-tls", "akuma-net/tls-rsa"]
-# In-kernel `neko` text editor. Enabled by default; the size profile drops it
-# via `--no-default-features` in scripts/build_size.sh.
-neko = ["dep:akuma-editor"]
 
 # virtio-sound output driver (src/audio.rs + /dev/dsp). Enabled by default;
 # dropped by the size/extreme profiles' `--no-default-features` builds. Pulls in
@@ -457,10 +451,7 @@ devbox-smoltcp = ["userspace-sshd", "smp-shared"]
 workspace = true
 
 [dependencies]
-akuma-editor = { path = "crates/akuma-editor", optional = true }
 akuma-terminal = { path = "crates/akuma-terminal" }
-akuma-ssh-crypto = { path = "crates/akuma-ssh-crypto" }
-akuma-ssh = { path = "crates/akuma-ssh" }
 akuma-vfs = { path = "crates/akuma-vfs" }
 akuma-ext2 = { path = "crates/akuma-ext2" }
 akuma-shell = { path = "crates/akuma-shell" }
