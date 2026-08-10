@@ -9,8 +9,7 @@ set -e
 # defaults the image wants (mirrors scripts/build_size.sh's explicit style): `sound`
 # (virtio-sound for wavplay), all `sc-*` syscall families,
 # and `no-tests` (this is a runtime target; the smoltcp-coupled boot suites are off).
-# Omitted vs. the default set: `smoltcp`, `kernel-tls`, `tls-rsa` (no in-kernel HTTPS
-# — use a userspace tool). Boot with RUMP_NIC=1 (overlays/devbox/run.sh does that).
+# Omitted vs. the default set: `smoltcp` (rump is the only stack). Boot with RUMP_NIC=1 (overlays/devbox/run.sh does that).
 #
 # Extra args are forwarded (e.g. `scripts/build_devbox.sh --quiet`).
 DEVBOX_FEATURES="devbox,sound,no-tests,rump-tests,sc-aio,sc-sysv-ipc,sc-framebuffer,sc-containers,sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll"

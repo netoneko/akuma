@@ -8,6 +8,7 @@ resolver = "2"
 # standalone) once the submodule + dep story for in-VM builds is settled.
 members = [
     "libakuma",
+    "akuma-ssh-crypto",
     "libakuma-tls",
     "apk-tools",
     "box",
@@ -25,6 +26,7 @@ members = [
     "wavplay",
     "scratch",
 ]
+
 # selfhost_repro is intentionally NOT a member: it is a throwaway crate built
 # only *inside* the VM (via its own --manifest-path) to reproduce the
 # proc-macro2 build-script deadlock (docs §7f). Exclude it so the host workspace
@@ -33,8 +35,52 @@ exclude = [
     "selfhost_repro",
 ]
 
-[profile.dev]
-panic = "abort"
+# Mirrors the root workspace so `akuma-ssh-crypto` keeps the lint level it had
+# under crates/ before moving here (its only consumer is userspace/sshd).
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+module_name_repetitions = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Pedantic/nursery lints allowed workspace-wide — too noisy to enforce on all crates
+doc_markdown = "allow"
+items_after_statements = "allow"
+significant_drop_tightening = "allow"
+missing_const_for_fn = "allow"
+similar_names = "allow"
+wildcard_imports = "allow"
+option_if_let_else = "allow"
+too_many_lines = "allow"
+if_not_else = "allow"
+future_not_send = "allow"
+# Hex literals in kernel: MMIO/protocol constants use intentional groupings
+unreadable_literal = "allow"
+# let-else: 200 complex patterns not auto-fixable
+manual_let_else = "allow"
+# Style preferences not worth enforcing
+too_many_arguments = "allow"
+struct_field_names = "allow"
+cast_precision_loss = "allow"
+trivially_copy_pass_by_ref = "allow"
+match_same_arms = "allow"
+match_wildcard_for_single_variants = "allow"
+branches_sharing_code = "allow"
+same_item_push = "allow"
+used_underscore_binding = "allow"
+slow_vector_initialization = "allow"
+significant_drop_in_scrutinee = "allow"
+pointers_in_nomem_asm_block = "allow"
+
+[workspace.lints.rust]
+dead_code = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_profile_size)', 'cfg(kernel_profile_extreme)', 'cfg(kernel_smp)', 'cfg(ext2_fs_cache)'] }
 
 [profile.release]
 panic = "abort"

@@ -694,16 +694,16 @@ const SIGFRAME_FPSIMD: usize = SIGFRAME_MCONTEXT + 280;   // 584
 const FPSIMD_MAGIC: u32 = 0x46508001;
 
 // Exposed for kernel layout tests.
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub const TEST_SIGFRAME_SIZE: usize = SIGFRAME_SIZE;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub const TEST_SIGFRAME_UCONTEXT: usize = SIGFRAME_UCONTEXT;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub const TEST_SIGFRAME_MCONTEXT: usize = SIGFRAME_MCONTEXT;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub const TEST_SIGFRAME_FPSIMD: usize = SIGFRAME_FPSIMD;
 /// Byte offset of uc_sigmask within the signal frame (ucontext_t + 40).
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub const TEST_SIGFRAME_UC_SIGMASK: usize = SIGFRAME_UCONTEXT + 40;
 
 /// True if `far` is in the kernel identity-RAM VA window (normally UXN for EL0 execute).
@@ -2824,7 +2824,7 @@ static SPURIOUS_SVC_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 
 /// Read the phantom-SVC counter (see [`SPURIOUS_SVC_COUNT`]).
 // Consumed by the boot self-tests, which `no-tests`/size-profile builds omit.
-#[cfg_attr(any(feature = "no-tests", kernel_profile_size), allow(dead_code))]
+#[cfg_attr(not(kernel_tests), allow(dead_code))]
 pub fn spurious_svc_count() -> u64 {
     SPURIOUS_SVC_COUNT.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -2956,7 +2956,7 @@ static STALE_WINDOW_HEALS: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 
 /// Read the stale-window heal counter (see [`STALE_WINDOW_HEALS`]).
 #[cfg(kernel_smp_shared)]
-#[cfg_attr(any(feature = "no-tests", kernel_profile_size), allow(dead_code))]
+#[cfg_attr(not(kernel_tests), allow(dead_code))]
 pub fn stale_window_heal_count() -> u64 {
     STALE_WINDOW_HEALS.load(core::sync::atomic::Ordering::Relaxed)
 }

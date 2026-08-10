@@ -9,8 +9,8 @@ set -e
 # (`smp-shared`). rump_server work is DEFERRED — the rump path stays in-tree/buildable
 # via scripts/build_devbox.sh, but this smoltcp image is the recommended devbox.
 #
-# Unlike build_devbox.sh we do NOT pass --no-default-features: smoltcp / kernel-tls /
-# tls-rsa must stay IN (the userspace sshd + curl route over smoltcp). We layer the
+# Unlike build_devbox.sh we do NOT pass --no-default-features: smoltcp must stay IN
+# (the userspace sshd routes over it). We layer the
 # `devbox-smoltcp` meta-feature (userspace-sshd + smp-shared) plus `no-tests` (this is
 # a runtime target; skip the boot self-test suite) on top of the default set. Built
 # with the `release-smp-shared` profile so the shared-SMP secondary bringup compiles.

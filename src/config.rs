@@ -125,12 +125,9 @@ pub const MAX_PROCESSES: usize = 64;
 // system thread overflowed 64 KB on a deep streaming path (ELR=0x0 / x29→.text
 // corruption, §7k.2). 512 KB makes stack overflow implausible on any release path,
 // so a *persisting* crash decisively rules overflow out. Lazily allocated — only
-// touched pages cost RAM. (size/extreme keep their measured tighter sizes below.)
-#[cfg(not(kernel_profile_size))]
+// touched pages cost RAM. (extreme keeps its measured tighter size below.)
+#[cfg(not(kernel_profile_extreme))]
 pub const SYSTEM_THREAD_STACK_SIZE: usize = 512 * 1024;
-// size (non-extreme): 128 KB — the SSH exec path overflowed 64 KB (ELR=0x0).
-#[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
-pub const SYSTEM_THREAD_STACK_SIZE: usize = 128 * 1024;
 // extreme: 96 KB. The stack high-water probe (threading::report_stack_high_water)
 // measured a true peak of 79 KB across the SSH exec / busybox spawn paths at the
 // 6 MB floor, so 96 KB keeps a 17 KB (~21%) margin above observed worst-case while
@@ -152,9 +149,9 @@ pub const SYSTEM_THREAD_STACK_SIZE: usize = 96 * 1024;
 // release: 512 KB (was 128 KB). Bumped for the §7k stack-overflow experiment —
 // rustc worker threads do a deep demand-paging→ext2→readahead chain plus a nested
 // IRQ trap frame; 512 KB removes overflow as a variable. Lazily allocated.
-#[cfg(not(kernel_profile_size))]
+#[cfg(not(kernel_profile_extreme))]
 pub const USER_THREAD_STACK_SIZE: usize = 512 * 1024;
-#[cfg(kernel_profile_size)]
+#[cfg(kernel_profile_extreme)]
 pub const USER_THREAD_STACK_SIZE: usize = 64 * 1024;
 
 /// Maximum length (bytes) of a single `argv`/`envp` string copied in by
@@ -167,10 +164,8 @@ pub const USER_THREAD_STACK_SIZE: usize = 64 * 1024;
 /// NOTE: exceeding this is a hard `E2BIG` failure of the whole `execve` (matching
 /// Linux); it must NOT silently truncate the argument list (a too-short cap used
 /// to drop the over-long arg and every arg after it, exec'ing a corrupt argv).
-#[cfg(not(kernel_profile_size))]
+#[cfg(not(kernel_profile_extreme))]
 pub const MAX_ARG_STRLEN: usize = 128 * 1024; // Linux MAX_ARG_STRLEN
-#[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
-pub const MAX_ARG_STRLEN: usize = 8 * 1024;
 #[cfg(kernel_profile_extreme)]
 pub const MAX_ARG_STRLEN: usize = 4 * 1024;
 
@@ -587,9 +582,9 @@ pub const SYSCALL_DEBUG_IO_ENABLED: bool = false;
 /// (`pmm::quarantine_drain_all` sits on the pressure ladder), so it cannot cause
 /// an OOM. Forced `false` on the low-RAM profiles, where 2 MiB is a real fraction
 /// of RAM and the debug cost is not wanted in a shipped image.
-#[cfg(not(any(kernel_profile_size, kernel_profile_extreme)))]
+#[cfg(not(kernel_profile_extreme))]
 pub const PMM_UAF_QUARANTINE: bool = true;
-#[cfg(any(kernel_profile_size, kernel_profile_extreme))]
+#[cfg(kernel_profile_extreme)]
 pub const PMM_UAF_QUARANTINE: bool = false;
 
 /// Record every CoW/share refcount increment and decrement in a ring, so an
@@ -603,9 +598,9 @@ pub const PMM_UAF_QUARANTINE: bool = false;
 ///
 /// ~98 KB of BSS and two relaxed stores per refcount operation, so it is gated off
 /// on the low-RAM profiles alongside the quarantine.
-#[cfg(not(any(kernel_profile_size, kernel_profile_extreme)))]
+#[cfg(not(kernel_profile_extreme))]
 pub const COW_REF_LEDGER: bool = true;
-#[cfg(any(kernel_profile_size, kernel_profile_extreme))]
+#[cfg(kernel_profile_extreme)]
 pub const COW_REF_LEDGER: bool = false;
 
 /// Extended diagnostics for syscalls that return EFAULT/ENOSYS/EINVAL.

@@ -9,7 +9,7 @@ The size/extreme-size profiles set `strip = "symbols"`, so build with symbols
 retained first:
 
     scripts/build_size.sh --config 'profile.size.strip=false'
-    scripts/symbol_sizes.py target/aarch64-unknown-none/size/akuma
+    scripts/symbol_sizes.py target/aarch64-unknown-none/extreme-size/akuma
 
 Caveat that matters for every number this prints: the size profiles use
 `lto = true, codegen-units = 1`. Inlined code is attributed to the symbol it was

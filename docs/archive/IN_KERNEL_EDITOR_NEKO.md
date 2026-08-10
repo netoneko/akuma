@@ -1,5 +1,12 @@
 # In-kernel editor (neko)
 
+> **REMOVED 2026-08-10 (branch `trim-fat-sshd`).** The in-kernel editor `neko` (`src/editor/`, `crates/akuma-editor`) was deleted from the
+> tree along with the built-in SSH server that was its only front end. This
+> document is kept verbatim below as the historical record of how it worked;
+> it no longer describes anything in `src/`. See
+> [`BUILTIN_SSH_REMOVAL.md`](BUILTIN_SSH_REMOVAL.md) for what replaced it
+> (userspace `/bin/vi` (neatvi)).
+
 The kernel's built-in text editor, "neko" — a nano-like, modeless-keybinding
 terminal editor with pluggable I/O and filesystem, exposed over the same
 `:2222` SSH session as the [in-kernel shell](shell.md). Source:

@@ -662,7 +662,7 @@ pub fn futex_purge_tid(tid: usize) {
 /// change that wants a deterministic test rather than a log grep. The waiter table needs
 /// no user address space, so it is fully drivable from the boot suite — unlike
 /// `futex_check_and_enqueue`, whose in-hold user read has no valid `uaddr` there.
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub mod test_hooks {
     use super::{FUTEX_WAITERS, futex_dequeue, futex_requeue_table};
     use alloc::vec::Vec;

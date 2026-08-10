@@ -1,5 +1,4 @@
 fn main() {
-    println!("cargo::rustc-check-cfg=cfg(kernel_profile_size)");
     println!("cargo::rustc-check-cfg=cfg(kernel_profile_extreme)");
     println!("cargo::rustc-check-cfg=cfg(kernel_smp)");
     println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
@@ -141,7 +140,7 @@ fn main() {
     }
 
     // Boot self-test suite present. Mirrors the `not(any(feature = "no-tests",
-    // kernel_profile_size))` condition main.rs already repeats a dozen times, so
+    // kernel_profile_extreme))` condition main.rs used to repeat a dozen times, so
     // kernel APIs whose only other caller was the in-kernel shell can say "keep me
     // where either the shell or the tests need me" in one cfg.
     let kernel_tests = std::env::var("CARGO_FEATURE_NO_TESTS").is_err()
@@ -151,14 +150,15 @@ fn main() {
         println!("cargo:rustc-cfg=kernel_tests");
     }
 
-    // OPT_LEVEL is "z" only for profile.size / profile.extreme-size (opt-level = "z").
-    // PROFILE is always "release" for inherited profiles, so we can't use that.
-    let size_profile = std::env::var("OPT_LEVEL").as_deref() == Ok("z");
+    // OPT_LEVEL is "z" only for profile.extreme-size (the one size-optimised
+    // profile). PROFILE is always "release" for inherited profiles, so we
+    // cannot use that.
+    let size_opt = std::env::var("OPT_LEVEL").as_deref() == Ok("z");
 
     // `extreme-size` and `size` are indistinguishable via OPT_LEVEL (both "z"), so
     // the `extreme` Cargo feature (set only by build_extreme_size.sh) is the
     // discriminator. Cargo exposes it to build scripts as CARGO_FEATURE_EXTREME.
-    let extreme_profile = size_profile && std::env::var("CARGO_FEATURE_EXTREME").is_ok();
+    let extreme_profile = size_opt && std::env::var("CARGO_FEATURE_EXTREME").is_ok();
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EXTREME");
     // linker.ld now derives the boot-stack reservation (STACK_BOTTOM / STACK_TOP /
     // IMAGE_RESERVE) from the actual linked image size, so there is no longer a
@@ -167,9 +167,6 @@ fn main() {
     // cache hit.
     println!("cargo:rerun-if-changed=linker.ld");
 
-    if size_profile {
-        println!("cargo:rustc-cfg=kernel_profile_size");
-    }
     if extreme_profile {
         println!("cargo:rustc-cfg=kernel_profile_extreme");
     }
@@ -228,8 +225,6 @@ fn main() {
     // reconstructed from the same discriminators used throughout this script.
     let build_profile = if extreme_profile {
         "extreme-size"
-    } else if size_profile {
-        "size"
     } else if smp_shared {
         "release-smp-shared"
     } else if smp {

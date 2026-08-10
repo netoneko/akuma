@@ -7108,10 +7108,8 @@ fn test_kernel_stack_sizes_sane() {
     let usr = config::USER_THREAD_STACK_SIZE;
     // (sys_floor, usr_floor) per profile. Release must dominate the constrained
     // profiles (whose ceilings are 128 KB sys / 64 KB usr).
-    #[cfg(not(kernel_profile_size))]
+    #[cfg(not(kernel_profile_extreme))]
     let (sys_floor, usr_floor) = (256 * 1024usize, 256 * 1024usize); // release
-    #[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
-    let (sys_floor, usr_floor) = (128 * 1024usize, 64 * 1024usize); // size
     #[cfg(kernel_profile_extreme)]
     let (sys_floor, usr_floor) = (96 * 1024usize, 64 * 1024usize); // extreme
     if sys >= sys_floor && usr >= usr_floor {

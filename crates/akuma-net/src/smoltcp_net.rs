@@ -27,9 +27,9 @@ use crate::runtime::PreemptGuard;
 // Constants
 // ============================================================================
 
-#[cfg(not(any(feature = "small-sockets", kernel_profile_size)))]
+#[cfg(not(any(feature = "small-sockets", kernel_profile_extreme)))]
 const MAX_SOCKETS: usize = 256;
-#[cfg(any(feature = "small-sockets", kernel_profile_size))]
+#[cfg(any(feature = "small-sockets", kernel_profile_extreme))]
 const MAX_SOCKETS: usize = 32;
 // Reduced from 64KB to 16KB per direction to save heap memory.
 // 40 sockets × 32KB = 1.25MB vs 40 × 128KB = 5MB.

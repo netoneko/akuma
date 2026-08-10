@@ -1,5 +1,12 @@
 # In-kernel shell
 
+> **REMOVED 2026-08-10 (branch `trim-fat-sshd`).** The in-kernel shell (`src/shell/`, `crates/akuma-shell` consumers) was deleted from the
+> tree along with the built-in SSH server that was its only front end. This
+> document is kept verbatim below as the historical record of how it worked;
+> it no longer describes anything in `src/`. See
+> [`BUILTIN_SSH_REMOVAL.md`](BUILTIN_SSH_REMOVAL.md) for what replaced it
+> (a userspace shell over the userspace `/bin/sshd` — busybox `ash`, or `userspace/paws` on the 4 MB demo).
+
 The built-in interactive shell exposed over the kernel's own SSH server
 (`:2222`) — distinct from userspace `dash`/`paws`, which run as ordinary ELF
 processes. Source: `src/shell/mod.rs` + `src/shell/commands/`. The command

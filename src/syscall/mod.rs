@@ -28,7 +28,7 @@ pub mod fs;
 pub mod mem;
 mod net;
 /// Boot self-test for the net bounce-buffer allocator (see `net::alloc_net_bounce`).
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub use net::run_net_bounce_tests;
 pub mod pipe;
 pub mod poll;
@@ -56,26 +56,26 @@ pub use sync::futex_wake;
 pub use sync::futex_purge_tid;
 pub use sync::futex_dump;
 pub use time::check_itimers;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub use sync::futex_do_wake;
 /// Futex waiter-table hooks for `process_tests::test_futex_table_irq_masked_requeue`.
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub use sync::test_hooks as futex_test_hooks;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub use sync::futex_wait_at_tgid_for_test;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub use mem::membarrier_cmd;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub use fs::sys_close_range;
 
 // Re-export the mmap alignment-EINVAL helper + the flag bits used by kernel
 // tests. `mod mem` is private; these wrappers keep the module boundary intact.
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub use mem::mmap_fixed_addr_unaligned_einval;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub use mem::{MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE};
 
-#[cfg(all(feature = "sc-epoll", not(any(feature = "no-tests", kernel_profile_size))))]
+#[cfg(all(feature = "sc-epoll", kernel_tests))]
 pub fn epoll_wait_deadline_for_test(timeout: i32, start_time: u64, timeout_us: u64, now: u64) -> u64 {
     poll::epoll_wait_deadline(timeout, start_time, timeout_us, now)
 }
@@ -142,7 +142,7 @@ pub mod syscall_counters {
     pub fn inc_pagefault(pages_mapped: u64) { PAGEFAULT_COUNT.fetch_add(1, Ordering::Relaxed); PAGEFAULT_PAGES.fetch_add(pages_mapped, Ordering::Relaxed); }
     pub fn inc_qemu_dc_zva_ec15() { QEMU_DC_ZVA_EC15_COUNT.fetch_add(1, Ordering::Relaxed); }
     pub fn inc_qemu_stp_xzr_ec15() { QEMU_STP_XZR_EC15_COUNT.fetch_add(1, Ordering::Relaxed); }
-    #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+    #[cfg(kernel_tests)]
     pub fn get_qemu_stp_xzr_ec15() -> u64 { QEMU_STP_XZR_EC15_COUNT.load(Ordering::Relaxed) }
 
     pub fn dump() {
@@ -459,13 +459,13 @@ struct Timespec {
 }
 
 /// Exposed for kernel tests only.
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub fn user_va_limit_value() -> u64 {
     user_va_limit()
 }
 
 /// Exposed for kernel tests only — see `test_ensure_user_pages_mapped_as_lock`.
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub fn ensure_user_pages_mapped_for_test(start: usize, len: usize) -> bool {
     ensure_user_pages_mapped(start, len)
 }

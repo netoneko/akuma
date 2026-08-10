@@ -242,9 +242,9 @@ pub fn load_elf(elf_data: &[u8], interp_prefix: Option<&str>) -> Result<LoadedEl
         if DEBUG_ELF_LOADING {
             log::debug!("[ELF] Loading interpreter: {}", resolved_interp);
         }
-        #[cfg(kernel_profile_size)]
+        #[cfg(kernel_profile_extreme)]
         let interp_info = load_interpreter_from_path(&resolved_interp, &mut address_space)?;
-        #[cfg(not(kernel_profile_size))]
+        #[cfg(not(kernel_profile_extreme))]
         let interp_info = {
             // M5c hold-shortening: drop the BKL around the dynamic-interpreter whole-file read
             // (a second ~1 MB read for dynamically-linked binaries), mirroring the main-binary
@@ -284,7 +284,7 @@ pub fn load_elf(elf_data: &[u8], interp_prefix: Option<&str>) -> Result<LoadedEl
 /// Load the dynamic linker (interpreter) ELF into an existing address space.
 /// Slurp-based; on the size profile the page-by-page `load_interpreter_from_path`
 /// is used instead, so this is only compiled off the size profile.
-#[cfg(not(kernel_profile_size))]
+#[cfg(not(kernel_profile_extreme))]
 fn load_interpreter(elf_data: &[u8], address_space: &mut UserAddressSpace) -> Result<InterpInfo, ElfError> {
     let elf = ElfBytes::<LittleEndian>::minimal_parse(elf_data)
         .map_err(|_| ElfError::InvalidFormat("Interpreter parse failed"))?;
@@ -430,7 +430,7 @@ fn load_interpreter(elf_data: &[u8], address_space: &mut UserAddressSpace) -> Re
 /// it, leaving no room for the process being spawned. This variant reads each
 /// PT_LOAD page with a single `read_at` call (4 KB scratch buffer, immediately
 /// freed), keeping peak heap use under 10 KB regardless of interpreter size.
-#[cfg(kernel_profile_size)]
+#[cfg(kernel_profile_extreme)]
 fn load_interpreter_from_path(path: &str, address_space: &mut UserAddressSpace) -> Result<InterpInfo, ElfError> {
     let hdr_buf = file_read_exact(path, 0, ELF64_EHDR_SIZE)?;
     let ehdr = parse_elf64_ehdr_checked(&hdr_buf)?;
@@ -1087,9 +1087,9 @@ pub fn load_elf_from_path(path: &str, file_size: usize, interp_prefix: Option<&s
         if DEBUG_ELF_LOADING {
             log::debug!("[ELF] Loading interpreter: {}", resolved_interp);
         }
-        #[cfg(kernel_profile_size)]
+        #[cfg(kernel_profile_extreme)]
         let interp_info = load_interpreter_from_path(&resolved_interp, &mut address_space)?;
-        #[cfg(not(kernel_profile_size))]
+        #[cfg(not(kernel_profile_extreme))]
         let interp_info = {
             // M5c hold-shortening: drop the BKL around the dynamic-interpreter whole-file read
             // (a second ~1 MB read for dynamically-linked binaries), mirroring the main-binary

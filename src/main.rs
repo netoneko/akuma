@@ -23,7 +23,7 @@ mod akuma;
 mod allocator;
 mod audio;
 // mod async_net;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 mod async_tests;
 #[cfg(kernel_bkl_profile)]
 mod bkl_profile;
@@ -32,7 +32,7 @@ mod boot;
 mod config;
 #[macro_use]
 mod console;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 mod daif_tests;
 // mod embassy_net_driver;
 // mod embassy_time_driver; // replaced by kernel_timer
@@ -44,18 +44,18 @@ mod file_page_cache;
 mod fw_cfg;
 mod kernel_timer;
 mod fs;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 mod fs_tests;
 mod gic;
 #[cfg(not(feature = "gic-v2"))]
 mod gic_v3;
 mod irq;
-#[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), feature = "smoltcp"))]
+#[cfg(all(kernel_tests, feature = "smoltcp"))]
 mod network_tests;
 mod pmm;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 mod process_tests;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 mod pthread_tests;
 #[cfg(feature = "sc-framebuffer")]
 mod ramfb;
@@ -63,7 +63,7 @@ mod rng;
 #[cfg(feature = "rump")]
 mod rump_proxy;
 #[cfg(all(
-    not(kernel_profile_size),
+    not(kernel_profile_extreme),
     feature = "rump",
     any(not(feature = "no-tests"), feature = "rump-tests"),
 ))]
@@ -74,10 +74,10 @@ mod smp;
 // shared kernel across all cores; see docs/reference/subsystems/smp-shared.md.
 #[cfg(kernel_smp_shared)]
 mod smp_shared;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 mod sync_tests;
 mod syscall;
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 mod tests;
 mod timer;
 mod vfs;
@@ -341,9 +341,9 @@ pub(crate) fn compute_heap_size(ram_size: usize, code_and_stack: usize) -> usize
         // shrinks the heap below 128 MB.
         // On the size profile, seed the heap with only 512 KB — the PmmOomHandler
         // grows it on demand from PMM.  On release keep 4 MB (was 8 MB) for headroom.
-        #[cfg(kernel_profile_size)]
+        #[cfg(kernel_profile_extreme)]
         const SMALL_FLOOR: usize = 512 * 1024;
-        #[cfg(not(kernel_profile_size))]
+        #[cfg(not(kernel_profile_extreme))]
         const SMALL_FLOOR: usize = 4 * MB;
         const MIN_USER: usize = 4 * MB;
         let cap = ram_size
@@ -964,7 +964,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Both the decision and its message live under the same cfg as the suite
     // itself: on a `no-tests`/size image there is no suite to skip, and printing
     // that we skipped one is a lie the extreme boot log told for months.
-    #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+    #[cfg(kernel_tests)]
     let boot_tests_enabled = {
         let low_mem_skip_tests = config::LOW_MEM_TEST_SKIP_MB != 0
             && ram_size <= config::LOW_MEM_TEST_SKIP_MB * 1024 * 1024;
@@ -979,13 +979,13 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Run DAIF / IRQ-mask tests first — these verify the foundational
     // invariants that every later subsystem relies on. See
     // docs/STABILITY_URGENT_ISSUES.md issue #1.
-    #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+    #[cfg(kernel_tests)]
     if boot_tests_enabled {
         daif_tests::run_all_tests();
     }
 
     // Run memory tests (no filesystem dependency)
-    #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+    #[cfg(kernel_tests)]
     {
         if boot_tests_enabled {
             if !tests::run_memory_tests() {
@@ -1037,7 +1037,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
                             }
                         }
 
-                        #[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+                        #[cfg(kernel_tests)]
                         if boot_tests_enabled {
                             // Run filesystem tests
                             fs_tests::run_all_tests();
@@ -1318,7 +1318,7 @@ fn run_async_main() -> ! {
     }
 
     // Run network self-tests if enabled (smoltcp-only suites)
-    #[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), feature = "smoltcp"))]
+    #[cfg(all(kernel_tests, feature = "smoltcp"))]
     if config::RUN_NETWORK_TESTS {
         network_tests::run_tests();
     }
@@ -1326,7 +1326,7 @@ fn run_async_main() -> ! {
     // Recompute here (different function from kernel_main's boot_tests_enabled):
     // these spawn-heavy suites are skipped on tiny machines, see kernel_main.
     // Both suites are smoltcp/SSH-coupled, so they compile out with the native stack.
-    #[cfg(all(not(any(feature = "no-tests", kernel_profile_size)), feature = "smoltcp"))]
+    #[cfg(all(kernel_tests, feature = "smoltcp"))]
     {
         let ram = akuma_exec::mmu::ram_end().saturating_sub(akuma_exec::mmu::ram_base());
         let low_mem_skip_tests = config::LOW_MEM_TEST_SKIP_MB != 0
@@ -1340,7 +1340,7 @@ fn run_async_main() -> ! {
     // they also run on default-smoltcp builds that opt a herd box into rump),
     // not gated on `rump-default`. See `src/rump_tests.rs`.
     #[cfg(all(
-        not(kernel_profile_size),
+        not(kernel_profile_extreme),
         feature = "rump",
         any(not(feature = "no-tests"), feature = "rump-tests"),
     ))]

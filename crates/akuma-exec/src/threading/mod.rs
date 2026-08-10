@@ -134,16 +134,12 @@ static THREAD_LIMIT: AtomicUsize = AtomicUsize::new(MAX_THREADS);
 // *user* stack is the 64 KB that lingers after a process exits (the post-workload
 // step we measured at the floor); free it too. The next user spawn re-allocates
 // its 16 contiguous pages — at the floor workloads are ~serial, so the just-freed
-// stack is immediately available. extreme implies kernel_profile_size, so the
+// stack is immediately available. extreme implies kernel_profile_extreme, so the
 // size branch below must exclude it.
 #[cfg(kernel_profile_extreme)]
 const WARM_FREE_SYSTEM: usize = 0;
 #[cfg(kernel_profile_extreme)]
 const WARM_FREE_USER: usize = 0;
-#[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
-const WARM_FREE_SYSTEM: usize = 1;
-#[cfg(all(kernel_profile_size, not(kernel_profile_extreme)))]
-const WARM_FREE_USER: usize = 1;
 
 // ── Stack high-water probe ───────────────────────────────────────────────────
 // To right-size the 128 KB system / 64 KB user kernel stacks for the extreme
@@ -1659,7 +1655,7 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
             // Safe here — the thread has terminated and cooled down, so it is no
             // longer executing on this stack. Done BEFORE the canary re-init
             // below, which then naturally skips the now-empty stack (base == 0).
-            #[cfg(kernel_profile_size)]
+            #[cfg(kernel_profile_extreme)]
             {
                 let _guard = IrqGuard::new();
                 let mut pool = POOL.lock();
@@ -2313,7 +2309,7 @@ impl ThreadPool {
         // stacks per class; ensure_slot_stack grows the rest on demand at spawn
         // and cleanup_terminated frees back to the floor on recycle. This avoids
         // reserving ~1 MB of PMM for slots that are idle most of the time.
-        #[cfg(not(kernel_profile_size))]
+        #[cfg(not(kernel_profile_extreme))]
         {
             for i in 1..config().reserved_threads {
                 assert!(
@@ -2328,7 +2324,7 @@ impl ThreadPool {
                 );
             }
         }
-        #[cfg(kernel_profile_size)]
+        #[cfg(kernel_profile_extreme)]
         {
             let sys_end = (1 + WARM_FREE_SYSTEM).min(config().reserved_threads);
             for i in 1..sys_end {

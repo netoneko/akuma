@@ -9,9 +9,7 @@ default-members = [
     "crates/akuma-isolation",
     "crates/akuma-net",
     "crates/akuma-rump",
-    "crates/akuma-shell",
     "crates/akuma-smp",
-    "crates/akuma-ssh-crypto",
     "crates/akuma-terminal",
     "crates/akuma-vfs",
 ]
@@ -60,7 +58,7 @@ pointers_in_nomem_asm_block = "allow"
 dead_code = "deny"
 unused_imports = "deny"
 unused_variables = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_profile_size)', 'cfg(kernel_profile_extreme)', 'cfg(kernel_smp)', 'cfg(ext2_fs_cache)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_profile_extreme)', 'cfg(kernel_tests)', 'cfg(kernel_smp)', 'cfg(ext2_fs_cache)'] }
 
 [package]
 name = "akuma"
@@ -73,26 +71,22 @@ name = "akuma"
 bench = false
 test = false
 
-[profile.dev]
-panic = "abort"
-
 [profile.release]
 panic = "abort"
 
-[profile.size]
+
+# The only size-optimised profile (the `size` profile was removed 2026-08-10: it
+# had no unique feature, no acceptance coverage, and was the sole reason
+# `kernel_profile_size` was emitted for two profiles). `build.rs` keys the
+# extreme behaviour off the `extreme` FEATURE, not the profile — they are
+# selected together by scripts/build_extreme_size.sh.
+[profile.extreme-size]
 inherits = "release"
 opt-level = "z"
 lto = true
 codegen-units = 1
 strip = "symbols"
 panic = "immediate-abort"
-
-# Identical knobs to `size`; the ONLY difference between the two builds is the
-# feature set passed on the command line (scripts/build_extreme_size.sh drops the
-# sc-* families). build.rs cannot tell `size` from `extreme-size` via OPT_LEVEL
-# (both are "z"), so the discriminator is the `extreme` feature, not the profile.
-[profile.extreme-size]
-inherits = "size"
 
 # Multikernel build (docs/MULTIKERNEL.md §11). Inherits `release` codegen; carries
 # any SMP-specific knobs later. The profile sets codegen, the `smp` FEATURE gates
@@ -143,8 +137,6 @@ debug = true
 [features]
 default = [
     "smoltcp",
-    "kernel-tls",
-    "tls-rsa",
     "sound",
     "rump",
     "fs-cache",
@@ -339,23 +331,6 @@ rump = ["akuma-net/rump", "dep:akuma-rump"]
 # whole smoltcp path — and the smoltcp-coupled built-in SSH — out. Enables the
 # matching akuma-net feature.
 smoltcp = ["dep:smoltcp", "akuma-net/smoltcp"]
-# In-kernel TLS client for the shell `curl` command's https:// branch (the
-# embedded-tls stack in akuma-net + its X.509 verifier — ~58 KB of kernel
-# .text). Enabled by default and kept by the `size` profile (ECDSA/Ed25519
-# HTTPS); the `extreme` profile omits it (build_extreme_size.sh does not re-add
-# it under --no-default-features), so 4 MB builds carry no built-in HTTPS — use
-# a userspace tool. Fully independent of SSH, which is Ed25519-only via
-# akuma-ssh-crypto and never gated by this. NOTE: its only runtime consumer
-# (http_get) is smoltcp-coupled, so kernel-tls is dead weight without `smoltcp`
-# — every profile that enables it also enables `smoltcp`.
-kernel-tls = [
-    "akuma-net/kernel-tls",
-]
-# RSA cert verification for outbound HTTPS/TLS. Enabled by default; dropped by
-# the size/extreme profiles (their --no-default-features build omits it) to save
-# ~300 KB. Implies `kernel-tls`. SSH is Ed25519-only and unaffected; only
-# RSA-only HTTPS hosts break.
-tls-rsa = ["kernel-tls", "akuma-net/tls-rsa"]
 
 # virtio-sound output driver (src/audio.rs + /dev/dsp). Enabled by default;
 # dropped by the size/extreme profiles' `--no-default-features` builds. Pulls in
@@ -454,7 +429,6 @@ workspace = true
 akuma-terminal = { path = "crates/akuma-terminal" }
 akuma-vfs = { path = "crates/akuma-vfs" }
 akuma-ext2 = { path = "crates/akuma-ext2" }
-akuma-shell = { path = "crates/akuma-shell" }
 akuma-net = { path = "crates/akuma-net", default-features = false }
 akuma-exec = { path = "crates/akuma-exec" }
 # Kernel-side sysproxy client (rumpsp wire + Linux↔NetBSD translation); only the
@@ -470,10 +444,8 @@ fdt = "0.1"
 smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
 virtio-drivers = { version = "0.7", default-features = false }
 arm_pl031 = { version = "0.2", default-features = false }
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize", "fast"] }
 embedded-io-async = { version = "0.6", default-features = false }
 
 [patch.crates-io]
 # Fork based on v0.17.0 (commit 1eaaa136) with exposed handshake/extensions modules
 # After creating the branch, replace with your actual commit hash
-embedded-tls = { git = "https://github.com/netoneko/embedded-tls", branch = "expose-verifier-types" }

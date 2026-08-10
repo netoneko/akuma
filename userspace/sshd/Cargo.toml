@@ -22,7 +22,7 @@ libakuma = { path = "../libakuma", features = ["net-async"], optional = true }
 # `default-features = false`: sshd doesn't need the fast (precomputed-table)
 # ed25519 basepoint multiplication or key zeroize-on-drop — see the crate's
 # own Cargo.toml for why those stay on by default for the in-kernel server.
-akuma-ssh-crypto = { path = "../../crates/akuma-ssh-crypto", default-features = false }
+akuma-ssh-crypto = { path = "../akuma-ssh-crypto", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
 aes = { version = "0.8", default-features = false }

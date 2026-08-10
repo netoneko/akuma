@@ -1350,7 +1350,7 @@ pub(super) fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> 
 /// pool can't grow into, so the infallible `vec![]` routed through
 /// `handle_alloc_error` → `brk #1`). The fix allocates *fallibly* and backs
 /// off to a single page, then to ENOMEM — never aborting.
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub fn run_net_bounce_tests() {
     // --- Pure size-plan boundaries (no RAM touched) ---
     // Empty request still yields a >=1-byte plan (never a zero-cap reserve).

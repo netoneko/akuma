@@ -24,7 +24,7 @@
 // self-tests in `process_tests` (compiled out under `no-tests` / `size`). In those
 // runtime-only builds (e.g. devbox-smoltcp) they are intentionally unused — suppress the
 // dead-code lint there. Test builds still lint dead code normally.
-#![cfg_attr(any(feature = "no-tests", kernel_profile_size), allow(dead_code))]
+#![cfg_attr(not(kernel_tests), allow(dead_code))]
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 

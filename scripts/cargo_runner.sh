@@ -97,7 +97,7 @@ mv -f "$BIN_TMP" "$BIN"
 
 # Size guard: catch binary bloat before it silently breaks boot.
 BIN_BYTES=$(wc -c < "$BIN")
-if echo "$ELF" | grep -q "/size/"; then
+if echo "$ELF" | grep -q "/extreme-size/"; then
   SIZE_LIMIT=$((1 * 1024 * 1024))   # 1 MB for size profile
   SIZE_LABEL="1 MB"
 elif echo "$ELF" | grep -q "/release-smp-shared/"; then

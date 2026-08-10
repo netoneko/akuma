@@ -157,9 +157,9 @@ pub fn spawn_process_with_channel_ext(
     // On the size profile every binary uses the demand-paged path so the kernel
     // heap never needs a scratch buffer sized to the binary (tcc is 723 KB —
     // the whole reason 8 MB couldn't load it despite having >700 KB PMM free).
-    #[cfg(kernel_profile_size)]
+    #[cfg(kernel_profile_extreme)]
     const HEAP_SLURP_MAX: usize = 0;
-    #[cfg(not(kernel_profile_size))]
+    #[cfg(not(kernel_profile_extreme))]
     const HEAP_SLURP_MAX: usize = 1024 * 1024; // 1 MiB
     let stat_size = (runtime().file_size)(elf_path).ok().map(|s| s as usize);
 

@@ -1,23 +1,21 @@
 # SSH
 
-Current-state architecture for both SSH servers: the built-in in-kernel sshd
-(smoltcp) and the userspace sshd.
+Current-state architecture for Akuma's SSH server. Since 2026-08-10 there is
+exactly one: the **userspace `/bin/sshd`** (`userspace/sshd`). The built-in
+in-kernel SSH-2 server (`src/ssh/`, `crates/akuma-ssh`) was deleted from every
+profile — see
+[`../../archive/BUILTIN_SSH_REMOVAL.md`](../../archive/BUILTIN_SSH_REMOVAL.md)
+for the measurements that motivated it (217 KB of `extreme` image, +308 KB of
+free RAM at the 4 MB floor) and
+[`../../archive/IN_KERNEL_SHELL.md`](../../archive/IN_KERNEL_SHELL.md) for the
+in-kernel shell that went with it.
 
-> **Where each one exists (since `trim-fat-sshd`).** The built-in server is
-> compiled into the **`extreme-size` profile only**, behind
-> `cfg(kernel_builtin_ssh)` (`smoltcp && extreme && !userspace-sshd`). Every
-> other profile — `release`, `size`, `release-smp`, `release-smp-shared`,
-> `devbox`, `devbox-smoltcp` — serves SSH from the userspace `/bin/sshd` and has
-> **no in-kernel shell at all**, since the built-in session was its only driver.
-> Removing it is worth 217 KB of `extreme` image and +308 KB of free RAM at the
-> 4 MB floor; see [`../../archive/BUILTIN_SSH_REMOVAL.md`](../../archive/BUILTIN_SSH_REMOVAL.md).
-
-> **Stability: A (stable).** Low per-doc churn; the echo path is sub-ms after
-> the waker/poll fixes. Open items are minor: command chaining,
-> true real-time streaming. Exit code 255 is fixed (commit `e54eba9` — sshd now
-> sends `SSH_MSG_CHANNEL_EXIT_STATUS` + `CHANNEL_CLOSE`). The load-bearing
-> invariant: `block_on` uses `yield_now()` (not `schedule_blocking()`) and
-> re-polls on progress.
+> **Stability: B (verify behaviour).** Downgraded from A on 2026-08-10: the
+> in-kernel implementation this doc used to cover in parallel is gone, so the
+> userspace server is now the only path and has not yet accumulated the same
+> soak time as the pair did. The load-bearing invariant is unchanged:
+> session futures must use `yield_now()`, never `sleep_ms`, or one session
+> starves all the others.
 
 For debugging, see [`../../runbooks/debug-ssh-latency.md`](../../runbooks/debug-ssh-latency.md).
 
@@ -25,53 +23,10 @@ For debugging, see [`../../runbooks/debug-ssh-latency.md`](../../runbooks/debug-
 
 KEX `curve25519-sha256`; host key `ssh-ed25519`; encryption `aes128-ctr`; MAC
 `hmac-sha2-256`; compression `none`; auth **publickey (Ed25519 only — RSA
-rejected)**. Up to 4 concurrent sessions (`MAX_CONNECTIONS`).
-
-## Built-in in-kernel SSH server
-
-**`extreme-size` only** — everything in this section is behind
-`cfg(kernel_builtin_ssh)`, along with `src/shell/` (the in-kernel command set),
-`src/async_fs.rs` and `src/editor/`, which exist solely to serve this session.
-
-`src/ssh/`:
-- `server.rs` — accept loop on a system thread; counter bookkeeping; `block_on`;
-  `SessionGuard` RAII.
-- `protocol.rs` — kernel-coupled orchestration: `handle_connection`,
-  `SshChannelStream`, `run_shell_session`, `bridge_process`, timeouts.
-- `crypto.rs`, `keys.rs`, `config.rs`, `auth.rs`.
-- Protocol *logic* (state machine, kex, packet processing) lives in the
-  **`akuma_ssh` crate**; `protocol.rs` is the kernel integration layer.
-
-**Session lifecycle:** `AwaitingVersion → AwaitingKexInit → AwaitingKexEcdhInit
-→ AwaitingNewKeys → AwaitingServiceRequest → AwaitingUserAuth → Authenticated →
-ShellSession → Disconnected`.
-
-### Accept + threading model (`src/ssh/server.rs`)
-
-1. `run()` creates a listening socket; loops: `with_network` to check for
-   `Established`, hand the socket to a fresh system thread running
-   `run_session`, **recreate** the listener (`recreate_listener_with_retry` —
-   retries forever on pool exhaustion, driving `poll()` to advance GC).
-2. `run_session` wraps work in a `SessionGuard` so on normal return **or**
-   panic-unwind, `socket_close` runs, `ACTIVE_SESSIONS` decrements. (Guard is
-   block-scoped because the fn is `-> !`.)
-3. `block_on` drives the async session future with `current_thread_waker()`
-   (real waker); on `Pending` it calls `smoltcp_net::poll()` and **only**
-   `yield_now()`s when poll reports no progress. **Must use `yield_now()` not
-   `schedule_blocking()`** (SGI-during-poll deadlock — see debug runbook).
-
-### Async exec / streaming
-
-- `exec_streaming()` spawns the ELF via `spawn_process_with_channel` and loops:
-  drain `ProcessChannel` → `output.write_all().await` → `flush().await` → yield.
-- `SshChannelStream` (`src/ssh/protocol.rs:113`) is the `embedded_io_async`
-  bridge: `write` does `send_channel_data` + auto-flush (writes ≤128 B skip
-  ACK-flush, just `poll()` once); implements `InteractiveRead` (10 ms
-  `try_read_interactive`).
-- `execute_external_interactive` is a poll loop enabling apps like `meow` to
-  read stdin while streaming output.
-- Gated by `config::ENABLE_SSH_ASYNC_EXEC = true`; buffered fallback only for
-  builtins/unresolvable commands.
+rejected)**. Wire/crypto primitives live in the host-testable
+`crates/akuma-ssh-crypto` crate, which `userspace/sshd` links with
+`default-features = false` (dropping `fast`+`zeroize`, worth ~38 KB — see
+[`../../archive/TRIM_FAT_SSHD.md`](../../archive/TRIM_FAT_SSHD.md)).
 
 ## Userspace sshd (`userspace/sshd`)
 
@@ -88,22 +43,21 @@ ShellSession → Disconnected`.
 - **`yield_now()` helper** — **must** be used instead of `sleep_ms` inside
   session futures (`sleep_ms` parks the entire OS thread, starving all other
   sessions).
-- Used by **every profile except `extreme-size`**.
+- Used by **every profile**. There is no other sshd.
 - **Started two different ways.** Normally herd launches it from
   `/etc/herd/enabled/sshd.conf` (`--port 22` since 2026-08-10, so host `2222` as
   documented; disks populated before that still say `--port 23`). On
   `extreme + userspace-sshd` there is no herd, and `config::AUTO_START_SSHD`
   spawns `/bin/sshd --port 22 --shell /bin/sh` directly from `kernel_main`.
 
-### Known: unauthenticated pre-auth panic
+### Resolved: unauthenticated pre-auth panic
 
-`crates/akuma-ssh/src/packet.rs:83` computes `packet_len - padding_len - 1`
-unchecked in `process_unencrypted_packet`; a single malformed pre-auth packet
-underflows it. In the **in-kernel** server that panic is at EL1 with
-`panic=abort` — no process boundary, so it takes the whole VM down (confirmed
-with a 10-byte crafted packet). The encrypted-path sibling in the same file
-already bounds-checks. Fixed in the userspace server
-(`userspace/sshd/docs/PROTOCOL_UNDER_LOAD.md`), **still open** in the kernel one.
+An unchecked `packet_len - padding_len - 1` underflow in the unencrypted packet
+path let a single malformed pre-auth packet panic the server. Fixed in
+`userspace/sshd` (`userspace/sshd/docs/PROTOCOL_UNDER_LOAD.md`). The in-kernel
+copy had the same bug and was strictly worse — `panic=abort` at EL1 has no
+process boundary, so a 10-byte crafted packet took the whole VM down — but that
+implementation no longer exists, which closes it by deletion.
 
 ## Auth model
 

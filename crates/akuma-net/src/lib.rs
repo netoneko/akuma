@@ -19,17 +19,6 @@ pub mod socket;
 #[cfg(feature = "smoltcp")]
 pub mod dns;
 pub mod stats;
-// In-kernel TLS client (outbound HTTPS for the shell `curl` command). Gated so
-// the extreme profile builds without embedded-tls / the cert verifier. SSH is
-// independent (akuma-ssh-crypto) and is never gated by this.
-#[cfg(feature = "kernel-tls")]
-pub mod tls;
-#[cfg(feature = "kernel-tls")]
-pub mod tls_rng;
-#[cfg(feature = "kernel-tls")]
-pub mod tls_verifier;
-#[cfg(feature = "smoltcp")]
-pub mod http;
 
 // Lock infrastructure for fine-grained locking (Phase 1 of BKL removal)
 pub mod locks;

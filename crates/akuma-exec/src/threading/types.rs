@@ -23,9 +23,9 @@ use alloc::string::String;
 /// could hold ~52 threads, and 16-way `pthread_create` load hit genuine exhaustion).
 /// `size`/`extreme-size` keep 64 — they target a 4 MB RAM floor where that BSS is real
 /// money and nothing there spawns hundreds of threads.
-#[cfg(not(kernel_profile_size))]
+#[cfg(not(kernel_profile_extreme))]
 pub const MAX_THREADS: usize = 256;
-#[cfg(kernel_profile_size)]
+#[cfg(kernel_profile_extreme)]
 pub const MAX_THREADS: usize = 64;
 
 /// Default timeout for cooperative threads in microseconds (100ms)

@@ -43,14 +43,14 @@ pub fn vfork_complete(child_pid: u32) {
 }
 
 /// Number of entries currently in VFORK_WAITERS.  Used only by kernel tests.
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub fn vfork_waiters_len() -> usize {
     crate::irq::with_irqs_disabled(|| VFORK_WAITERS.lock().len())
 }
 
 /// Kernel test helper: insert a fake pending vfork for `child_pid`, invoke
 /// `vfork_complete`, and return whether the entry was cleanly removed.
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub fn test_vfork_complete_mechanism(child_pid: u32) -> bool {
     crate::irq::with_irqs_disabled(|| {
         VFORK_WAITERS.lock().insert(child_pid, akuma_exec::threading::current_wake_handle());
@@ -63,13 +63,13 @@ pub fn test_vfork_complete_mechanism(child_pid: u32) -> bool {
 }
 
 /// Kernel test helper: insert a fake vfork entry without invoking vfork_complete.
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub fn vfork_waiters_insert_for_test(child_pid: u32) {
     VFORK_WAITERS.lock().insert(child_pid, akuma_exec::threading::current_wake_handle());
 }
 
 /// Kernel test helper: check whether a child PID is still in VFORK_WAITERS.
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub fn vfork_waiters_contains_for_test(child_pid: u32) -> bool {
     VFORK_WAITERS.lock().contains_key(&child_pid)
 }
@@ -697,7 +697,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     // (e.g. the 700+ KB system linker that tcc invokes) would exhaust it.
     // Read just the first 256 bytes — enough for shebang detection — and
     // use the path-based loader for the actual ELF.
-    #[cfg(kernel_profile_size)]
+    #[cfg(kernel_profile_extreme)]
     let mut file_data: Option<alloc::vec::Vec<u8>> = {
         let mut head = alloc::vec![0u8; 256];
         match crate::fs::read_at(&resolved_path, 0, &mut head) {
@@ -712,7 +712,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     // Multikernel (R4b.5 Phase 2): a pinned process exec'ing a real binary (a shell running
     // `curl`) has no local VFS — forward the whole-file read to the owner. `/proc`/`/dev` (and
     // the non-smp / BSP case) take the normal local read.
-    #[cfg(all(not(kernel_profile_size), kernel_smp))]
+    #[cfg(all(not(kernel_profile_extreme), kernel_smp))]
     let mut file_data = if crate::smp::is_on_secondary()
         && !resolved_path.starts_with("/proc") && !resolved_path.starts_with("/dev")
     {
@@ -731,7 +731,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
             }
         }
     };
-    #[cfg(all(not(kernel_profile_size), not(kernel_smp)))]
+    #[cfg(all(not(kernel_profile_extreme), not(kernel_smp)))]
     let mut file_data = {
         // M5c hold-shortening: DROP the BKL around the whole-file ELF read so peer cores can
         // enter the kernel while this core waits on disk (execve's dominant BKL-held window).
@@ -772,7 +772,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
 
     // On the size profile file_data only holds the 256-byte shebang probe —
     // always use replace_image_from_path for the actual ELF load.
-    #[cfg(kernel_profile_size)]
+    #[cfg(kernel_profile_extreme)]
     let mut file_data: Option<alloc::vec::Vec<u8>> = None;
 
     // Resolve the on-demand load's file size before entering the exclusive

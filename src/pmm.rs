@@ -662,7 +662,7 @@ fn cow_ledger_record(pa: usize, is_dec: bool, before: u16, after: u16) {
 /// Number of reference events currently recorded for `pa`. Lets a boot self-test
 /// assert the ledger is actually recording without parsing console output — its
 /// only caller, so it compiles out wherever that suite does.
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub fn cow_event_count(pa: usize) -> usize {
     if !crate::config::COW_REF_LEDGER {
         return 0;
@@ -921,7 +921,7 @@ pub fn quarantine_drain_all() -> usize {
 /// Mirrors [`discount_double_frees`], including its build gating: the boot suite
 /// is its only caller, so it compiles out wherever that suite does.
 #[doc(hidden)]
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub fn discount_uaf_detections(n: usize) {
     UAF_DETECTED.fetch_sub(n, Ordering::Relaxed);
 }
@@ -1121,7 +1121,7 @@ pub fn double_free_count() -> usize {
 /// `[Mem]` signal keeps reflecting only *real* desyncs and operators aren't
 /// misled by a test artifact.
 #[doc(hidden)]
-#[cfg(not(any(feature = "no-tests", kernel_profile_size)))]
+#[cfg(kernel_tests)]
 pub fn discount_double_frees(n: usize) {
     DOUBLE_FREE_COUNT.fetch_sub(n, Ordering::Relaxed);
 }
