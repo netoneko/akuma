@@ -2096,11 +2096,6 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         Ok(written)
     }
 
-    fn append_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        let size = self.metadata(path)?.size as usize;
-        self.write_at(path, size, data)?;
-        Ok(())
-    }
 
     fn create_dir(&self, path: &str) -> Result<(), FsError> {
         // Check if already exists

@@ -199,14 +199,6 @@ pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError
     vfs::write_at(path, offset, data)
 }
 
-/// Append data to a file
-#[cfg(kernel_tests)]
-pub fn append_file(path: &str, data: &[u8]) -> Result<(), FsError> {
-    if !is_initialized() {
-        return Err(FsError::NotInitialized);
-    }
-    vfs::append_file(path, data)
-}
 
 /// Create a directory
 pub fn create_dir(path: &str) -> Result<(), FsError> {

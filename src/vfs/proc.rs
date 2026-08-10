@@ -690,10 +690,6 @@ impl Filesystem for ProcFilesystem {
         Ok(data.len())
     }
 
-    fn append_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        // Append is the same as write for procfs (we always append to buffers)
-        self.write_file(path, data)
-    }
 
     fn create_dir(&self, _path: &str) -> Result<(), FsError> {
         // Cannot create directories in procfs

@@ -4,7 +4,6 @@
 //! These tests are run after filesystem initialization.
 
 use alloc::format;
-use alloc::vec::Vec;
 
 use crate::console;
 use crate::fs;
@@ -119,7 +118,6 @@ fn test_file_operations() -> bool {
 
     let test_file = "/testfile.txt";
     let initial_content = b"Hello, FAT32!";
-    let append_content = b" Appended text.";
 
     // Step 1: Create and write to file
     log("  - Step 1: Create and write file\n");
@@ -157,48 +155,8 @@ fn test_file_operations() -> bool {
         }
     }
 
-    // Step 3: Append to file
-    log("  - Step 3: Append to file\n");
-    match fs::append_file(test_file, append_content) {
-        Ok(()) => {
-            log(&format!("    Appended {} bytes\n", append_content.len()));
-        }
-        Err(e) => {
-            log(&format!("    FAILED to append: {e}\n"));
-            return false;
-        }
-    }
-
-    // Step 4: Read again and verify appended content
-    log("  - Step 4: Read and verify appended content\n");
-    match fs::read_file(test_file) {
-        Ok(content) => {
-            let expected: Vec<u8> = initial_content
-                .iter()
-                .chain(append_content.iter())
-                .copied()
-                .collect();
-            if content != expected {
-                log(&format!(
-                    "    FAILED: Content mismatch after append.\n    Expected: {:?}\n    Got: {:?}\n",
-                    core::str::from_utf8(&expected),
-                    core::str::from_utf8(&content)
-                ));
-                return false;
-            }
-            log(&format!(
-                "    Content verified: {} bytes total\n",
-                content.len()
-            ));
-        }
-        Err(e) => {
-            log(&format!("    FAILED to read after append: {e}\n"));
-            return false;
-        }
-    }
-
-    // Step 5: Delete the file
-    log("  - Step 5: Delete file\n");
+    // Step 3: Delete the file
+    log("  - Step 3: Delete file\n");
     match fs::remove_file(test_file) {
         Ok(()) => {
             log("    File deleted\n");
@@ -209,8 +167,8 @@ fn test_file_operations() -> bool {
         }
     }
 
-    // Step 6: Verify file no longer exists
-    log("  - Step 6: Verify file deleted\n");
+    // Step 4: Verify file no longer exists
+    log("  - Step 4: Verify file deleted\n");
     if fs::exists(test_file) {
         log("    FAILED: File still exists after deletion\n");
         return false;

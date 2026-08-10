@@ -178,14 +178,6 @@ fn write_at_offset() {
     assert_eq!(data, b"hello WORLD");
 }
 
-#[test]
-fn append_to_file() {
-    let fs = mount_empty();
-    fs.write_file("/f.txt", b"hello").unwrap();
-    fs.append_file("/f.txt", b" world").unwrap();
-    let data = fs.read_file("/f.txt").unwrap();
-    assert_eq!(data, b"hello world");
-}
 
 // ── Directory creation ──────────────────────────────────────────────
 

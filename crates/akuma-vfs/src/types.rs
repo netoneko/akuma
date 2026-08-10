@@ -114,7 +114,6 @@ pub trait Filesystem: Send + Sync {
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError>;
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError>;
     fn write_file(&self, path: &str, data: &[u8]) -> Result<(), FsError>;
-    fn append_file(&self, path: &str, data: &[u8]) -> Result<(), FsError>;
 
     fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
         let data = self.read_file(path)?;

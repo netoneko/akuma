@@ -101,10 +101,6 @@ impl Filesystem for SubdirFs {
         self.inner.write_file(p, data)
     }
 
-    fn append_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        full_path!(p, &self.prefix, path);
-        self.inner.append_file(p, data)
-    }
 
     fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
         full_path!(p, &self.prefix, path);
@@ -227,10 +223,6 @@ mod tests {
             self.record(path);
             Ok(())
         }
-        fn append_file(&self, path: &str, _data: &[u8]) -> Result<(), FsError> {
-            self.record(path);
-            Ok(())
-        }
         fn create_dir(&self, path: &str) -> Result<(), FsError> {
             self.record(path);
             Ok(())
@@ -329,7 +321,6 @@ mod tests {
         check!("read_dir", fs.read_dir(escape));
         check!("read_file", fs.read_file(escape));
         check!("write_file", fs.write_file(escape, b"x"));
-        check!("append_file", fs.append_file(escape, b"x"));
         check!("read_at", fs.read_at(escape, 0, &mut buf));
         check!("write_at", fs.write_at(escape, 0, b"x"));
         check!("create_dir", fs.create_dir(escape));

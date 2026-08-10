@@ -257,43 +257,6 @@ impl Filesystem for MemoryFilesystem {
         }
     }
 
-    fn append_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        let mut root = self.root.lock();
-
-        if self.max_size > 0 {
-            let current_size = Self::total_size(&root);
-            if current_size + data.len() as u64 > self.max_size {
-                return Err(FsError::NoSpace);
-            }
-        }
-
-        let (parent, filename) = Self::navigate_parent(&mut root, path)?;
-
-        let now = self.now();
-        match parent.get_mut(&filename) {
-            Some(FsNode::File {
-                data: existing,
-                modified,
-                ..
-            }) => {
-                existing.extend_from_slice(data);
-                *modified = now;
-            }
-            Some(FsNode::Directory { .. }) => return Err(FsError::NotAFile),
-            None => {
-                parent.insert(
-                    filename,
-                    FsNode::File {
-                        data: data.to_vec(),
-                        created: now,
-                        modified: now,
-                    },
-                );
-            }
-        }
-
-        Ok(())
-    }
 
     fn create_dir(&self, path: &str) -> Result<(), FsError> {
         let mut root = self.root.lock();

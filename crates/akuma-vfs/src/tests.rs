@@ -177,15 +177,6 @@ mod memfs_tests {
         assert_eq!(data, b"hello WORLD");
     }
 
-    #[test]
-    fn append_file() {
-        let fs = MemoryFilesystem::new();
-        fs.create_dir("/d").unwrap();
-        fs.write_file("/d/f", b"hello").unwrap();
-        fs.append_file("/d/f", b" world").unwrap();
-        let data = fs.read_file("/d/f").unwrap();
-        assert_eq!(data, b"hello world");
-    }
 
     #[test]
     fn metadata() {

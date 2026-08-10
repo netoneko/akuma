@@ -53,7 +53,7 @@
 //! Stale pages here would be a silent miscompile, not a crash: `rustc` mmaps
 //! `.rlib`/`.rmeta` files that `cargo` later rewrites, and ext2 reuses inodes.
 //! Every mutating VFS entry point therefore calls [`invalidate_inode`]
-//! (`vfs::write_at`, `write_file`, `append_file`, `truncate`, `fallocate`,
+//! (`vfs::write_at`, `write_file`, `truncate`, `fallocate`,
 //! `remove_file`, `rename`) before the mutation lands.
 
 use akuma_exec::PhysFrame;

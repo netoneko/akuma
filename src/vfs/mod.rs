@@ -243,13 +243,6 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
     r
 }
 
-/// Append data to a file
-#[cfg(kernel_tests)]
-pub fn append_file(path: &str, data: &[u8]) -> Result<(), FsError> {
-    let r = with_fs(path, |fs, rel| fs.append_file(rel, data));
-    invalidate_file_pages(path);
-    r
-}
 
 /// Drop any shared read-only file pages cached for `path`.
 ///
