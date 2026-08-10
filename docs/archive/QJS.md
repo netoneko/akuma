@@ -1,6 +1,6 @@
 # qjs - QuickJS JavaScript Runtime for Akuma
 
-> **Note:** `userspace/quickjs` has been removed as part of a codebase trimming effort (see `docs/TRIMMING_FAT_PART_3.md`). This document is kept for historical reference.
+> **Note:** `userspace/quickjs` has been removed as part of a codebase trimming effort (see `docs/TRIM_FAT_PART_3.md`). This document is kept for historical reference.
 
 `qjs` is a userspace JavaScript runtime using Bellard's QuickJS engine, providing ES2020 JavaScript support for the Akuma kernel.
 
@@ -217,7 +217,7 @@ The compiled `qjs` binary is approximately 700KB:
 
 ## Comparison with sqld (removed)
 
-> **Note:** sqld has been removed (see `docs/TRIMMING_FAT_PART_2.md`). This comparison is kept for historical context.
+> **Note:** sqld has been removed (see `docs/TRIM_FAT_PART_2.md`). This comparison is kept for historical context.
 
 ## Comparison with sqld
 

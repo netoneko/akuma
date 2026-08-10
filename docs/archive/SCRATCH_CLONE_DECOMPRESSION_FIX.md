@@ -1,6 +1,6 @@
 # scratch clone: zlib decompression fix
 
-> **Note:** scratch has been removed (see `docs/TRIMMING_FAT_PART_2.md`). This document is kept for historical reference.
+> **Note:** scratch has been removed (see `docs/TRIM_FAT_PART_2.md`). This document is kept for historical reference.
 
 ## Symptom
 

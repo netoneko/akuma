@@ -1,6 +1,6 @@
 # stdcheck Debugging Notes
 
-> **Note:** `userspace/stdcheck` has been removed as part of a codebase trimming effort (see `docs/TRIMMING_FAT_PART_3.md`). This document is kept for historical reference.
+> **Note:** `userspace/stdcheck` has been removed as part of a codebase trimming effort (see `docs/TRIM_FAT_PART_3.md`). This document is kept for historical reference.
 
 ## Status: RESOLVED (Jan 3, 2026)
 
