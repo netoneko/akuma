@@ -27,9 +27,7 @@ subsystems out from under it** — not by inventing a new lock hierarchy, but by
 noticing that most kernel state already has its own fine-grained lock (fd
 table, socket table, ext2 superblock/BGD, block cache, network stack), and the
 BKL is simply *redundant* for syscalls that only touch that state. See
-`smp-shared.md` for the milestone-by-milestone history (M0–M5) and
-`docs/reference/subsystems/smp.md` for the other, share-nothing SMP model this
-is not.
+`smp-shared.md` for the milestone-by-milestone history (M0–M5).
 
 Six carve-outs exist today: `no-bkl-network` (all smoltcp net syscalls +
 socket `read`/`write`), `no-bkl-vfs` (ext2 read paths, `mmap`, `unlinkat`,
@@ -128,9 +126,7 @@ For a given syscall or subsystem:
    Keep outside the window: user-string copies, fd-table-only lookups, and
    every early-error return (`EBADF` etc.) — those don't touch the shared
    state the carve-out is protecting, so they shouldn't pay for a BKL
-   drop+reacquire. Cross-core forwarding arms (multikernel bounce) also stay
-   outside — they marshal through the BKL-protected bounce and must keep the
-   lock.
+   drop+reacquire.
 2. **Don't invent a new coarse lock.** The first instinct — wrap the syscall
    in one new `NETWORK_LOCK`/`VFS_LOCK` — doesn't work for anything that
    blocks: `accept`/`connect`/`recv` and friends yield via `blocking_relax()`,
@@ -422,10 +418,10 @@ than a few months old; grep the guard names below to check it hasn't drifted.
 | `sys_write` (`fs.rs:807`, `new_if`) | whole fn (match nested in per-chunk loop) | ext2 `write_state` (`write_at`) |
 | `sys_lseek` (`fs.rs:1540`, `new_if`) | whole fn | ext2 `read_state` (`metadata`, `ext2.rs:2268`, via `file_size`) |
 | `sys_fstat` (`fs.rs:1590`) | inside `File` arm | ext2 `read_state` (`metadata`) |
-| `sys_newfstatat` (`fs.rs:1716`) | after `#[cfg(kernel_smp)]` cross-core forward arm | ext2 `read_state` (`is_symlink`, `read_symlink`, `metadata`) |
+| `sys_newfstatat` (`fs.rs:1716`) | after path resolution | ext2 `read_state` (`is_symlink`, `read_symlink`, `metadata`) |
 | `sys_statx` (`fs.rs:1964`) | after path resolution | ext2 `read_state` (`is_symlink`, `metadata`) |
 | `sys_getdents64` (`fs.rs:2448`) | after `File`-kind match | ext2 `read_state` (`read_dir`, `ext2.rs:1825`) |
-| `sys_openat` (`fs.rs:1323`) | before `resolve_symlinks`, i.e. before the `/dev/*`/`/proc/self/exe` fast paths and the (never-co-compiled, see Phase 7c) cross-core forward arm | ext2 `read_state` (`resolve_symlinks`'s `read_symlink`, `exists`/`lookup_path`), then `write_state` for `O_CREAT`/`O_TRUNC` (`write_file`, `ext2.rs:1869`) + `chmod` |
+| `sys_openat` (`fs.rs:1323`) | before `resolve_symlinks`, i.e. before the `/dev/*`/`/proc/self/exe` fast paths (see Phase 7c) | ext2 `read_state` (`resolve_symlinks`'s `read_symlink`, `exists`/`lookup_path`), then `write_state` for `O_CREAT`/`O_TRUNC` (`write_file`, `ext2.rs:1869`) + `chmod` |
 | `sys_mkdirat` (`fs.rs:2214`) | after dirfd/base-path resolution | ext2 `write_state` (`create_dir`, `ext2.rs:2045`) |
 | `sys_fchmodat` (`fs.rs:1845`) | after dirfd/base-path resolution | ext2 `read_state` (`resolve_symlinks`) then `write_state` (`chmod`, `ext2.rs:2286`) |
 | `sys_unlinkat` (`fs.rs:2268`) | after dirfd/base-path resolution | ext2 `write_state` (`remove_file` `ext2.rs:2126`, `remove_dir` `ext2.rs:2162`) — the multi-second-hold case (§ archive doc §7.2) |
@@ -569,7 +565,7 @@ ledger primitive, no `VfsBklGuard`/`NetBklGuard` struct):
 
 | site | toggle | scope | inner lock |
 |---|---|---|---|
-| `sys_execve` ELF read (`proc.rs:649`, inside `sys_execve` `proc.rs:544`) | `exec_bkl_drop_enabled()` (`smp_shared.rs:87`) | whole-file `read_file` — **only** in the single-image smp-shared build (`not(kernel_profile_size)`, `not(kernel_smp)`); size build reads just a 256-byte shebang header, multikernel build forwards cross-core, neither takes this window | ext2 `read_state` |
+| `sys_execve` ELF read (`proc.rs:649`, inside `sys_execve` `proc.rs:544`) | `exec_bkl_drop_enabled()` (`smp_shared.rs:87`) | whole-file `read_file` — **only** in the single-image smp-shared build (`not(kernel_profile_extreme)`); the size profile reads just a 256-byte shebang header, which never takes this window | ext2 `read_state` |
 | Data-Abort demand-page fill (`exceptions.rs:2964`/`3017`) | `fault_bkl_drop_enabled()` (`smp_shared.rs:68`) | per-page fill loop only; page-table install is separate, BKL-held | ext2 `read_state` |
 | Instruction-Abort demand-page fill (`exceptions.rs:3487`/`3533`) | same | mirror of Data-Abort path | same |
 | `netpoll_drain`'s `smoltcp_net::poll()` loop (`main.rs`, `BKL_VFS_CARVE_OUT.md` §19–20) | none — unconditional under the cfg gate | the whole burst-drain `while poll() {}` loop | `NETWORK`/`SOCKET_TABLE` |
@@ -784,7 +780,7 @@ construction), same dropped-window ledger.
 | site | guard scope | inner lock(s) held while BKL dropped |
 |---|---|---|
 | `sys_getrandom` (`proc.rs`, after `validate_user_ptr`) | whole chunked-read loop | `RNG_DEVICE` `Spinlock` (`rng.rs:498`) |
-| `sys_read` → `DevUrandom` (`fs.rs`, after multikernel secondary forward) | `fill_bytes` + `copy_to_user_safe` | `RNG_DEVICE` |
+| `sys_read` → `DevUrandom` (`fs.rs`) | `fill_bytes` + `copy_to_user_safe` | `RNG_DEVICE` |
 | `sys_pread64` → `DevUrandom` (`fs.rs`, same) | same | `RNG_DEVICE` |
 | `sys_write` → `DevDsp` (`fs.rs`) | `audio::play` call | `SOUND_DEVICE` `Spinlock` (`audio.rs:205`) |
 | `sys_fb_init` (`fb.rs`, after dimension validation) | `ramfb::init` call | `FB_STATE` `Spinlock` (`ramfb.rs:39`) |

@@ -68,7 +68,7 @@ CLOEXEC stripping at exec). epoll fds are stripped on fork (not refcounted).
 | `/proc/<pid>/status` | human-readable |
 | `/proc/<pid>/cmdline` | argv |
 | `/proc/<pid>/fd/` | fd listing + `/proc/<pid>/fd/<n>` symlinks |
-| `/proc/cores` | per-core state (multikernel) |
+| `/proc/cores` | static single-row table (`0 online bsp`) |
 | `/proc/boxes` | box listing |
 
 > `ps`/`top` parse `/proc/<pid>/stat` (compact), not `status`. The `stat` file

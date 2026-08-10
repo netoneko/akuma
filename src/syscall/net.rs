@@ -54,23 +54,6 @@ pub fn net_bounce_size_plan(want: usize) -> [usize; 2] {
     [full, single_page]
 }
 
-/// Multikernel (R4b.5): if `fd` is a socket whose Net capability is `Proxy`'d to the owner
-/// core (a `RemoteFd` of kind `Socket`), return its owner handle; else `None` (a local
-/// socket / non-socket fd takes the normal path). Used by the socket syscalls to route to
-/// the cross-core forwarder on a secondary.
-#[cfg(kernel_smp)]
-pub(super) fn remote_socket_handle(fd: u32) -> Option<u32> {
-    let proc = akuma_exec::process::current_process_shared()?;
-    match proc.get_fd(fd) {
-        Some(akuma_exec::process::FileDescriptor::RemoteFd {
-            handle,
-            kind: akuma_exec::process::RemoteKind::Socket,
-            ..
-        }) => Some(handle),
-        _ => None,
-    }
-}
-
 /// RAII guard that runs a native (smoltcp) network syscall **without** the Big
 /// Kernel Lock — Phase 2 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md.
 ///
@@ -128,27 +111,6 @@ pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
     if domain != 2 || (base_type != 1 && base_type != 2) {
         crate::safe_print!(96, "[syscall] socket(domain={}, type=0x{:x}): unsupported\n", domain, sock_type);
         return EAFNOSUPPORT;
-    }
-    // On a secondary, Net is Proxy'd to core 0: forward the socket() and hold a RemoteFd
-    // (the cloexec/nonblock flags stay LOCAL on this core's fd table).
-    #[cfg(kernel_smp)]
-    if crate::smp::is_on_secondary() {
-        let r = crate::smp::fwd_socket(domain, base_type, _proto);
-        if (r as i64) < 0 {
-            return r;
-        }
-        let Some(proc) = akuma_exec::process::current_process_shared() else {
-            let _ = crate::smp::fwd_close(r as u32);
-            return ESRCH;
-        };
-        let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::RemoteFd {
-            owner: 0,
-            handle: r as u32,
-            kind: akuma_exec::process::RemoteKind::Socket,
-        });
-        if cloexec { proc.set_cloexec(fd); }
-        if nonblock { proc.set_nonblock(fd); }
-        return u64::from(fd);
     }
     if let Some(idx) = socket::alloc_socket(base_type) {
         if let Some(proc) = akuma_exec::process::current_process_shared() {
@@ -247,11 +209,6 @@ pub(super) fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     }
     let addr = sa.to_addr();
     crate::safe_print!(96, "[syscall] bind(fd={}, port={}, ip={}.{}.{}.{})\n", fd, addr.port, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3]);
-    #[cfg(kernel_smp)]
-    if let Some(h) = remote_socket_handle(fd) {
-        let bytes = unsafe { core::slice::from_raw_parts((&raw const sa).cast::<u8>(), 16) };
-        return crate::smp::fwd_bind(h, bytes);
-    }
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
         None => return EBADF,
@@ -268,10 +225,6 @@ pub(super) fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_listen(fd: u32, backlog: i32) -> u64 {
     let _net_bkl = NetBklGuard::new();
-    #[cfg(kernel_smp)]
-    if let Some(h) = remote_socket_handle(fd) {
-        return crate::smp::fwd_listen(h, backlog);
-    }
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
         None => return EBADF,
@@ -287,26 +240,6 @@ pub(super) fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     let _net_bkl = NetBklGuard::new();
     if addr_ptr != 0 && !validate_user_ptr(addr_ptr, 16) { return EFAULT; }
     if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
-    #[cfg(kernel_smp)]
-    if let Some(h) = remote_socket_handle(fd) {
-        let mut peer = [0u8; 16];
-        let r = crate::smp::fwd_accept(h, fd_is_nonblock(fd), Some(&mut peer));
-        if (r as i64) < 0 {
-            return r;
-        }
-        let Some(proc) = akuma_exec::process::current_process_shared() else {
-            let _ = crate::smp::fwd_close(r as u32);
-            return ESRCH;
-        };
-        if addr_ptr != 0 {
-            let _ = unsafe { copy_to_user_safe(addr_ptr as *mut u8, peer.as_ptr(), 16) };
-        }
-        return u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::RemoteFd {
-            owner: 0,
-            handle: r as u32,
-            kind: akuma_exec::process::RemoteKind::Socket,
-        }));
-    }
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
         None => return EBADF,
@@ -333,31 +266,6 @@ pub(super) fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u
     let _net_bkl = NetBklGuard::new();
     if addr_ptr != 0 && !validate_user_ptr(addr_ptr, 16) { return EFAULT; }
     if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
-    #[cfg(kernel_smp)]
-    if let Some(h) = remote_socket_handle(fd) {
-        let mut peer = [0u8; 16];
-        let r = crate::smp::fwd_accept(h, fd_is_nonblock(fd), Some(&mut peer));
-        if (r as i64) < 0 {
-            return r;
-        }
-        let Some(proc) = akuma_exec::process::current_process_shared() else {
-            let _ = crate::smp::fwd_close(r as u32);
-            return ESRCH;
-        };
-        if addr_ptr != 0 {
-            let _ = unsafe { copy_to_user_safe(addr_ptr as *mut u8, peer.as_ptr(), 16) };
-        }
-        let new_fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::RemoteFd {
-            owner: 0,
-            handle: r as u32,
-            kind: akuma_exec::process::RemoteKind::Socket,
-        });
-        const SOCK_CLOEXEC: u32 = 0x80000;
-        const SOCK_NONBLOCK: u32 = 0x800;
-        if flags & SOCK_CLOEXEC != 0 { proc.set_cloexec(new_fd); }
-        if flags & SOCK_NONBLOCK != 0 { proc.set_nonblock(new_fd); }
-        return u64::from(new_fd);
-    }
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
         None => return EBADF,
@@ -396,11 +304,6 @@ pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     }
     let addr = sa.to_addr();
     crate::safe_print!(96, "[syscall] connect(fd={}, ip={}.{}.{}.{}:{})\n", fd, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3], addr.port);
-    #[cfg(kernel_smp)]
-    if let Some(h) = remote_socket_handle(fd) {
-        let bytes = unsafe { core::slice::from_raw_parts((&raw const sa).cast::<u8>(), 16) };
-        return crate::smp::fwd_connect(h, bytes);
-    }
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
         None => return EBADF,
@@ -514,22 +417,6 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
         return super::fs::sys_write(u64::from(fd), buf_ptr, len);
     }
     let _net_bkl = NetBklGuard::new();
-    // On a secondary, forward to the Net owner (one bounce-sized chunk; short sends loop).
-    #[cfg(kernel_smp)]
-    if let Some(h) = remote_socket_handle(fd) {
-        if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
-        let mut kb = match alloc_net_bounce(len) { Some(b) => b, None => return ENOMEM };
-        let cl = kb.len();
-        if unsafe { copy_from_user_safe(kb.as_mut_ptr(), buf_ptr as *const u8, cl).is_err() } { return EFAULT; }
-        let mut dest = [0u8; 16];
-        let dopt = if dest_addr != 0 && addr_len >= 16 && validate_user_ptr(dest_addr, 16) {
-            if unsafe { copy_from_user_safe(dest.as_mut_ptr(), dest_addr as *const u8, 16).is_err() } { return EFAULT; }
-            Some(&dest[..])
-        } else {
-            None
-        };
-        return crate::smp::fwd_sendto(h, &kb[..cl], fd_is_nonblock(fd), dopt);
-    }
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
     let mut kernel_buf = match alloc_net_bounce(len) {
         Some(b) => b,
@@ -598,31 +485,6 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
         return super::fs::sys_read(u64::from(fd), buf_ptr, len);
     }
     let _net_bkl = NetBklGuard::new();
-    // On a secondary, forward to the Net owner (one bounce-sized chunk; short recvs loop).
-    #[cfg(kernel_smp)]
-    if let Some(h) = remote_socket_handle(fd) {
-        if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
-        let mut kb = match alloc_net_bounce(len) { Some(b) => b, None => return ENOMEM };
-        let cl = kb.len();
-        let mut peer = [0u8; 16];
-        let want_peer = src_addr != 0 && addr_len_ptr != 0;
-        let r = crate::smp::fwd_recvfrom(h, &mut kb[..cl], fd_is_nonblock(fd), if want_peer { Some(&mut peer) } else { None });
-        if (r as i64) < 0 {
-            return r;
-        }
-        let n = (r as usize).min(cl);
-        if n > 0 && unsafe { copy_to_user_safe(buf_ptr as *mut u8, kb.as_ptr(), n).is_err() } {
-            return EFAULT;
-        }
-        if want_peer && validate_user_ptr(src_addr, 16) {
-            let _ = unsafe { copy_to_user_safe(src_addr as *mut u8, peer.as_ptr(), 16) };
-            if validate_user_ptr(addr_len_ptr, 4) {
-                let out_len = 16u32;
-                let _ = unsafe { copy_to_user_safe(addr_len_ptr as *mut u8, (&raw const out_len).cast::<u8>(), 4) };
-            }
-        }
-        return r;
-    }
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
     let mut kernel_buf = match alloc_net_bounce(len) {
         Some(b) => b,
@@ -743,11 +605,6 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
             return EFAULT;
         }
 
-    #[cfg(kernel_smp)]
-    if let Some(h) = remote_socket_handle(fd) {
-        return crate::smp::fwd_setsockopt(h, level, optname, &val.to_ne_bytes());
-    }
-
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
         None => return EBADF,
@@ -820,23 +677,6 @@ pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
         return EFAULT;
     }
     if (len as usize) < 4 || !validate_user_ptr(optval, 4) { return EFAULT; }
-
-    #[cfg(kernel_smp)]
-    if let Some(h) = remote_socket_handle(fd) {
-        let mut v = [0u8; 4];
-        let r = crate::smp::fwd_getsockopt(h, level, optname, &mut v);
-        if (r as i64) < 0 {
-            return r;
-        }
-        if unsafe { copy_to_user_safe(optval as *mut u8, v.as_ptr(), 4).is_err() } {
-            return EFAULT;
-        }
-        let out_len: u32 = 4;
-        if unsafe { copy_to_user_safe(optlen as *mut u8, (&raw const out_len).cast::<u8>(), 4).is_err() } {
-            return EFAULT;
-        }
-        return 0;
-    }
 
     let val: i32 = if level == SOL_SOCKET {
         match optname {
@@ -926,22 +766,6 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     }
 
     let _net_bkl = NetBklGuard::new();
-
-    // On a secondary, forward to the Net owner (first iovec; DNS uses a single iovec).
-    #[cfg(kernel_smp)]
-    if let Some(h) = remote_socket_handle(fd) {
-        let mut kb = match alloc_net_bounce(iov.iov_len) { Some(b) => b, None => return ENOMEM };
-        let cl = kb.len();
-        if unsafe { copy_from_user_safe(kb.as_mut_ptr(), iov.iov_base as *const u8, cl).is_err() } { return EFAULT; }
-        let mut dest = [0u8; 16];
-        let dopt = if msg.msg_name != 0 && msg.msg_namelen >= 16 && validate_user_ptr(msg.msg_name, 16) {
-            if unsafe { copy_from_user_safe(dest.as_mut_ptr(), msg.msg_name as *const u8, 16).is_err() } { return EFAULT; }
-            Some(&dest[..])
-        } else {
-            None
-        };
-        return crate::smp::fwd_sendto(h, &kb[..cl], fd_is_nonblock(fd), dopt);
-    }
 
     let mut kernel_buf = match alloc_net_bounce(iov.iov_len) {
         Some(b) => b,
@@ -1086,31 +910,6 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
 
     // Past the pipe-backed unix-socket branch: safe to drop the BKL (see sys_sendto).
     let _net_bkl = NetBklGuard::new();
-
-    // On a secondary, forward to the Net owner (first iovec; DNS uses a single iovec).
-    #[cfg(kernel_smp)]
-    if let Some(h) = remote_socket_handle(fd) {
-        let mut kb = match alloc_net_bounce(iov.iov_len) { Some(b) => b, None => return ENOMEM };
-        let cl = kb.len();
-        let mut peer = [0u8; 16];
-        let want_peer = msg.msg_name != 0 && msg.msg_namelen >= 16;
-        let r = crate::smp::fwd_recvfrom(h, &mut kb[..cl], fd_is_nonblock(fd), if want_peer { Some(&mut peer) } else { None });
-        if (r as i64) < 0 {
-            return r;
-        }
-        let n = (r as usize).min(cl);
-        if n > 0 && unsafe { copy_to_user_safe(iov.iov_base as *mut u8, kb.as_ptr(), n).is_err() } {
-            return EFAULT;
-        }
-        if want_peer && validate_user_ptr(msg.msg_name, 16) {
-            let _ = unsafe { copy_to_user_safe(msg.msg_name as *mut u8, peer.as_ptr(), 16) };
-            msg.msg_namelen = 16;
-        }
-        msg.msg_controllen = 0;
-        msg.msg_flags = 0;
-        let _ = unsafe { copy_to_user_safe(msg_ptr as *mut u8, (&raw const msg).cast::<u8>(), core::mem::size_of::<MsgHdr>()) };
-        return r;
-    }
 
     let mut kernel_buf = match alloc_net_bounce(iov.iov_len) {
         Some(b) => b,

@@ -172,23 +172,6 @@ pub struct ExecRuntime {
     pub cow_fault_lock: fn(usize),
     pub cow_fault_unlock: fn(usize),
 
-    /// Optional hook run at the tail of `UserAddressSpace::new()`, after the default
-    /// identity kernel mappings are installed. `None` on a normal (single-kernel /
-    /// BSP) build. On a multikernel SECONDARY core it is set to overlay that core's
-    /// REPLICATED kernel writable window (`.data`/`.bss` → its OWN private pages) onto
-    /// the user table, so a syscall the process makes under its TTBR0 resolves kernel
-    /// statics to this core's copies, not the BSP's (docs/MULTIKERNEL.md §4.2/R4b.3a).
-    /// This is the seam that lets the SAME spawn path build a correct user address
-    /// space on the BSP and on a secondary — no secondary-specific spawn entry needed.
-    /// An `Err` aborts address-space creation (propagated as a `None` from `new()`).
-    pub prepare_user_address_space: Option<fn(&mut crate::mmu::UserAddressSpace) -> Result<(), &'static str>>,
-
-    /// Multikernel (docs/MULTIKERNEL.md §8.1): close a [`crate::process::FileDescriptor::RemoteFd`]
-    /// whose backing file/socket lives on the owner core, when the owning process exits with the
-    /// fd still open. Forwards a `close` over the cross-core ring so the owner frees its handle.
-    /// `None` on a normal (single-kernel / BSP) build; set on a secondary core. Args:
-    /// `(owner, handle, kind)`.
-    pub remote_fd_close: Option<fn(u16, u32, crate::process::RemoteKind)>,
 }
 
 /// Compile-time kernel configuration, passed once at init.
@@ -234,13 +217,6 @@ pub struct ExecConfig {
     /// Let a `tkill`/`tgkill` (`pthread_kill`) signal interrupt a blocking
     /// syscall with `EINTR`. See `config::PTHREAD_KILL_EINTR_ENABLED`.
     pub pthread_kill_eintr_enabled: bool,
-
-    /// Always load an exec'd ELF whole (via `runtime().read_file`) instead of the
-    /// demand-paged path, regardless of size. Set on a multikernel SECONDARY core, where
-    /// the filesystem is `Proxy`'d to the owner: a single forwarded whole-file fetch is far
-    /// simpler and more robust than per-page forwarded `read_at` + an inode-keyed file-page
-    /// cache the secondary never set up (docs/MULTIKERNEL.md §10 Part B). `false` on the BSP.
-    pub prefer_whole_file_load: bool,
 }
 
 // Lock-free single-shot cells: must be safe to read from IRQ context.
@@ -265,8 +241,9 @@ pub fn runtime() -> ExecRuntime {
         .expect("akuma-exec: ExecRuntime not registered — call akuma_exec::init() first")
 }
 
-/// Whether the runtime + config have been registered (non-panicking probe). Used by the
-/// multikernel to verify a secondary's per-core runtime is up before spawning on it.
+/// Whether the runtime + config have been registered (non-panicking probe). Lets code
+/// that might run before `init()` (e.g. an early BKL-stuck log or timestamp) degrade
+/// gracefully instead of panicking.
 #[must_use]
 pub fn is_registered() -> bool {
     RUNTIME.get().is_some() && CONFIG.get().is_some()

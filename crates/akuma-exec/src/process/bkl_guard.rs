@@ -92,8 +92,8 @@ pub fn set_process_bkl_drop_enabled(on: bool) {
 ///
 /// Zero-cost no-op unless BOTH `kernel_smp_shared` and `kernel_no_bkl_process` are set
 /// (or the runtime toggle is off): the struct is empty and `new`/`drop` compile to
-/// nothing, so default, `size`, `extreme`, multikernel, and plain `smp-shared` builds
-/// are byte-for-byte unchanged.
+/// nothing, so default, `size`, `extreme`, and plain `smp-shared` builds are
+/// byte-for-byte unchanged.
 pub struct ProcessBklGuard {
     /// Whether `new()` actually dropped the BKL, **latched at construction**.
     ///

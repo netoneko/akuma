@@ -112,13 +112,6 @@ For a real path:
 - `O_CLOEXEC` is honored (`proc.set_cloexec`); `O_APPEND` is honored at
   `read`/`write` time (see below), not at open time.
 
-On `kernel_smp`, an `openat` for anything other than `/proc/*`/`/dev/*` from
-a process pinned to a secondary core is forwarded to the VFS owner (core 0)
-via `crate::smp::fwd_openat`, returning a `FileDescriptor::RemoteFd`; the
-per-fd (not per-syscall) routing then carries through read/write/close/
-lseek/fstat on that fd. `/dev/*` and `/proc/*` stay local because they're
-per-core (procfs) or synthetic (device nodes).
-
 ## `write`/`pwrite64` and `O_APPEND`
 
 `sys_write` resolves the write position **once**, before the chunking loop:

@@ -671,23 +671,6 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         akuma_exec::process::FileDescriptor::DevUrandom => {
             let mut temp = alloc::vec![0u8; count];
-            // On a secondary core the RNG device lives on the owner; forward for entropy so a
-            // pinned process (e.g. curl/mbedTLS seeding from /dev/urandom) gets real bytes.
-            #[cfg(kernel_smp)]
-            if crate::smp::is_on_secondary() {
-                let mut off = 0usize;
-                while off < count {
-                    let r = crate::smp::fwd_getrandom(&mut temp[off..]);
-                    if (r as i64) <= 0 {
-                        return EIO;
-                    }
-                    off += r as usize;
-                }
-                if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
-                    return EFAULT;
-                }
-                return count as u64;
-            }
             let _drv_bkl = DriverBklGuard::new();
             if crate::rng::fill_bytes(&mut temp).is_ok() {
                 if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
@@ -738,31 +721,6 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         #[cfg(feature = "sc-epoll")]
         akuma_exec::process::FileDescriptor::EpollFd(_) => EINVAL,
-        // Multikernel (R4b.5): a Proxy'd file/socket lives on the owner core — forward the
-        // read (a socket RemoteFd becomes a `recv`). One bounce-sized chunk; short reads are
-        // legal, so userspace loops. (Never constructed on a non-smp build.)
-        #[cfg(kernel_smp)]
-        akuma_exec::process::FileDescriptor::RemoteFd { handle, kind, .. } => {
-            if count == 0 {
-                return 0;
-            }
-            let cap = count.min(akuma_smp::FWD_BOUNCE_CAP);
-            let mut kbuf = alloc::vec![0u8; cap];
-            let r = match kind {
-                akuma_exec::process::RemoteKind::Vfs => crate::smp::fwd_read(handle, &mut kbuf),
-                akuma_exec::process::RemoteKind::Socket => {
-                    crate::smp::fwd_recvfrom(handle, &mut kbuf, super::net::fd_is_nonblock(fd_num as u32), None)
-                }
-            };
-            if (r as i64) < 0 {
-                return r;
-            }
-            let n = (r as usize).min(cap);
-            if n > 0 && unsafe { copy_to_user_safe(buf_ptr as *mut u8, kbuf.as_ptr(), n).is_err() } {
-                return EFAULT;
-            }
-            r
-        }
         // Catch-all for fd types that don't support read(2) — Linux returns EBADF.
         // This fires when an fd *exists* in the table but its type can't be read
         // (e.g. a PipeWrite end, a raw Socket, Stderr). A libstd spawn parent
@@ -812,23 +770,6 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
         }
         akuma_exec::process::FileDescriptor::DevUrandom => {
             let mut temp = alloc::vec![0u8; count];
-            // On a secondary core the RNG device lives on the owner; forward for entropy so a
-            // pinned process (e.g. curl/mbedTLS seeding from /dev/urandom) gets real bytes.
-            #[cfg(kernel_smp)]
-            if crate::smp::is_on_secondary() {
-                let mut off = 0usize;
-                while off < count {
-                    let r = crate::smp::fwd_getrandom(&mut temp[off..]);
-                    if (r as i64) <= 0 {
-                        return EIO;
-                    }
-                    off += r as usize;
-                }
-                if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
-                    return EFAULT;
-                }
-                return count as u64;
-            }
             let _drv_bkl = DriverBklGuard::new();
             if crate::rng::fill_bytes(&mut temp).is_ok() {
                 if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
@@ -992,16 +933,6 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     }
                 }
 
-                // Multikernel §8.2: a process PINNED to a secondary core has no BSP-side
-                // parent draining its channel, so route its tty output to this core's
-                // per-core console ring (console::print_bytes → console_emit → the ring →
-                // the BSP UART drainer). On the BSP (UART owner) this is a no-op:
-                // is_on_secondary() is false, so the normal channel path above stands.
-                #[cfg(kernel_smp)]
-                if crate::smp::is_on_secondary() {
-                    crate::console::print_bytes(buf_slice);
-                }
-
                 this_chunk as u64
             }
             akuma_exec::process::FileDescriptor::File(ref f) => {
@@ -1156,23 +1087,6 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     if total_written > 0 { return total_written as u64; }
                     return EIO;
                 }
-            }
-            // Multikernel (R4b.5): a Proxy'd file/socket lives on the owner core — forward the
-            // write (a socket RemoteFd becomes a `send`). One bounce-sized chunk; the outer
-            // loop's short-write handling carries the rest. (Never constructed without smp.)
-            #[cfg(kernel_smp)]
-            akuma_exec::process::FileDescriptor::RemoteFd { handle, kind, .. } => {
-                let r = match kind {
-                    akuma_exec::process::RemoteKind::Vfs => crate::smp::fwd_write(handle, buf_slice),
-                    akuma_exec::process::RemoteKind::Socket => {
-                        crate::smp::fwd_sendto(handle, buf_slice, super::net::fd_is_nonblock(fd_num as u32), None)
-                    }
-                };
-                if (r as i64) < 0 {
-                    if total_written > 0 { return total_written as u64; }
-                    return r;
-                }
-                r
             }
             _ => EBADF
         };
@@ -1421,12 +1335,8 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
     // in line with those two and removes the prologue's ext2 work from the BKL-held
     // measurement window the audit flagged (`BKL_PHASE7_AUDIT.md` §5, 7c: "10.5% for
     // a converted syscall's prologue/epilogue is high enough that either the window
-    // starts too late or the re-acquire costs more than expected"). The `#[cfg(kernel_smp)]`
-    // multikernel forward arm below still reads as "must keep the BKL" in the source,
-    // but that comment describes a build where this guard is compiled to a no-op:
-    // `kernel_smp` (multikernel) and `kernel_smp_shared`+`kernel_no_bkl_vfs` (this
-    // guard's only live cfg) are mutually exclusive (`build.rs`'s
-    // `smp`/`smp-shared` assertion), so the two code paths never coexist in one binary.
+    // starts too late or the re-acquire costs more than expected"). This guard's only
+    // live cfg is `kernel_smp_shared`+`kernel_no_bkl_vfs`; without both it's a no-op.
     let _vfs_bkl = VfsBklGuard::new();
 
     let path = crate::vfs::resolve_symlinks(&path);
@@ -1524,33 +1434,6 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         path
     };
 
-    // Multikernel (R4b.5, §10 Part B): a process pinned to a secondary core has no local
-    // ext2 VFS, so a real-file open is FORWARDED to the VFS owner (core 0). Paths served by
-    // this core's OWN local VFS are NOT forwarded — `/dev/*` nodes (already returned above)
-    // and `/proc/*` (per-core procfs resolving against the local process table). The
-    // returned RemoteFd carries the owner handle; read/write/close/lseek/fstat on it forward
-    // too (routing is per-fd, not by syscall number).
-    #[cfg(kernel_smp)]
-    if crate::smp::is_on_secondary() && !path.starts_with("/proc") && !path.starts_with("/dev") {
-        let r = crate::smp::fwd_openat(&path, flags, mode);
-        if (r as i64) < 0 {
-            return r;
-        }
-        let Some(proc) = akuma_exec::process::current_process_shared() else {
-            let _ = crate::smp::fwd_close(r as u32); // don't leak the owner handle
-            return ESRCH;
-        };
-        let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::RemoteFd {
-            owner: 0,
-            handle: r as u32,
-            kind: akuma_exec::process::RemoteKind::Vfs,
-        });
-        if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
-            proc.set_cloexec(fd);
-        }
-        return u64::from(fd);
-    }
-
     // From here on is the on-disk open work — existence probes, O_CREAT create /
     // O_TRUNC truncate (both `write_file`; truncating a large file frees its blocks
     // under the ext2 write guard, the same long hold §7.2 measured at ~40 s for an
@@ -1638,11 +1521,6 @@ pub fn sys_close(fd: u32) -> u64 {
                 akuma_exec::process::FileDescriptor::DevDsp => {
                     crate::audio::stop();
                 }
-                // Multikernel (R4b.5): forward the close so the owner frees the file/socket.
-                #[cfg(kernel_smp)]
-                akuma_exec::process::FileDescriptor::RemoteFd { handle, .. } => {
-                    let _ = crate::smp::fwd_close(handle);
-                }
                 _ => {}
             }
             proc.clear_nonblock(fd);
@@ -1686,10 +1564,6 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
                 akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
                     super::eventfd::eventfd_close(efd_id);
                 }
-                #[cfg(kernel_smp)]
-                akuma_exec::process::FileDescriptor::RemoteFd { handle, .. } => {
-                    let _ = crate::smp::fwd_close(handle);
-                }
                 _ => {}
             }
             proc.clear_nonblock(fd);
@@ -1702,14 +1576,6 @@ pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         if matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevZero)) {
             return 0;
-        }
-        // Multikernel (R4b.5): forward lseek on a Proxy'd file; a socket isn't seekable.
-        #[cfg(kernel_smp)]
-        if let Some(akuma_exec::process::FileDescriptor::RemoteFd { handle, kind, .. }) = proc.get_fd(fd) {
-            return match kind {
-                akuma_exec::process::RemoteKind::Vfs => crate::smp::fwd_lseek(handle, offset, whence),
-                akuma_exec::process::RemoteKind::Socket => ESPIPE,
-            };
         }
         // SEEK_END needs the on-disk size, so lseek on a real file is a VFS call. It
         // happens *inside* the `update_fd` closure (i.e. under the fd table's
@@ -1807,24 +1673,6 @@ akuma_exec::process::FileDescriptor::PipeWrite(_)) => {
             stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o10600, st_nlink: 1, st_blksize: 4096, ..Default::default() };
             0
         }
-        // Multikernel (R4b.5): a Proxy'd file — forward for its size, synthesize a regular
-        // -file Stat; a Proxy'd socket gets a synthesized S_IFSOCK Stat (no forward needed).
-        #[cfg(kernel_smp)]
-        Some(akuma_exec::process::FileDescriptor::RemoteFd { handle, kind, .. }) => match kind {
-            akuma_exec::process::RemoteKind::Vfs => {
-                let r = crate::smp::fwd_fstat_size(handle);
-                if (r as i64) < 0 {
-                    r
-                } else {
-                    stat = Stat { st_dev: 1, st_ino: 0, st_size: r as i64, st_mode: 0o100644, st_nlink: 1, st_blksize: 4096, st_blocks: ((r as i64) + 511) / 512, ..Default::default() };
-                    0
-                }
-            }
-            akuma_exec::process::RemoteKind::Socket => {
-                stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o140666, st_nlink: 1, st_blksize: 4096, ..Default::default() };
-                0
-            }
-        },
         _ => EBADF,
     };
     
@@ -1867,30 +1715,7 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
         crate::vfs::resolve_path(&base_path, &path)
     };
 
-    // Multikernel (R4b.5 Phase 2): a pinned process (e.g. a shell resolving `curl` on PATH)
-    // stat's real-file paths that live on the owner's ext2. Forward: open+fstat the file on
-    // core 0; synthesize a regular-file Stat from its size. `/proc`/`/dev` resolve locally.
-    #[cfg(kernel_smp)]
-    if crate::smp::is_on_secondary() && !resolved_path.starts_with("/proc") && !resolved_path.starts_with("/dev") {
-        let h = crate::smp::fwd_openat(&resolved_path, 0, 0);
-        if (h as i64) < 0 {
-            return h; // ENOENT etc.
-        }
-        let sz = crate::smp::fwd_fstat_size(h as u32);
-        let _ = crate::smp::fwd_close(h as u32);
-        if (sz as i64) < 0 {
-            return ENOENT;
-        }
-        let stat = Stat { st_dev: 1, st_ino: 0, st_size: sz as i64, st_mode: 0o100755, st_nlink: 1, st_blksize: 4096, st_blocks: ((sz as i64) + 511) / 512, ..Default::default() };
-        if unsafe { copy_to_user_safe(stat_ptr as *mut u8, (&raw const stat).cast::<u8>(), core::mem::size_of::<Stat>()).is_err() } {
-            return EFAULT;
-        }
-        return 0;
-    }
-
-    // Path resolution + `metadata` below are pure VFS work — run them BKL-free. Placed
-    // AFTER the cross-core forwarding arm above, which marshals through the BKL-protected
-    // bounce and must keep the lock.
+    // Path resolution + `metadata` below are pure VFS work — run them BKL-free.
     let _vfs_bkl = VfsBklGuard::new();
 
     let mut stat = Stat::default();

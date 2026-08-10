@@ -568,7 +568,7 @@ impl Process {
     /// docs/archive/SMP_SHARED_M5_FAULT_LOCK_PLAN.md.
     ///
     /// On builds without `kernel_smp_shared` this compiles to just `f()` — no lock, no
-    /// IRQ change — so single-core/size/extreme/multikernel builds are unaffected.
+    /// IRQ change — so single-core/size/extreme builds are unaffected.
     #[inline]
     pub fn with_as_locked<R>(&self, f: impl FnOnce() -> R) -> R {
         #[cfg(kernel_smp_shared)]

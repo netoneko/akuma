@@ -709,29 +709,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
             }
         }
     };
-    // Multikernel (R4b.5 Phase 2): a pinned process exec'ing a real binary (a shell running
-    // `curl`) has no local VFS — forward the whole-file read to the owner. `/proc`/`/dev` (and
-    // the non-smp / BSP case) take the normal local read.
-    #[cfg(all(not(kernel_profile_extreme), kernel_smp))]
-    let mut file_data = if crate::smp::is_on_secondary()
-        && !resolved_path.starts_with("/proc") && !resolved_path.starts_with("/dev")
-    {
-        let Ok(data) = crate::smp::secondary_forward_read_file(&resolved_path) else {
-            crate::safe_print!(96, "[syscall] execve: forwarded read failed for {}\n", resolved_path);
-            return ENOENT;
-        };
-        Some(data)
-    } else {
-        match crate::fs::read_file(&resolved_path) {
-            Ok(data) => Some(data),
-            Err(crate::vfs::FsError::Internal) => None,
-            Err(e) => {
-                crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
-                return super::fs::fs_error_to_errno(e);
-            }
-        }
-    };
-    #[cfg(all(not(kernel_profile_extreme), not(kernel_smp)))]
+    #[cfg(not(kernel_profile_extreme))]
     let mut file_data = {
         // M5c hold-shortening: DROP the BKL around the whole-file ELF read so peer cores can
         // enter the kernel while this core waits on disk (execve's dominant BKL-held window).
@@ -1290,32 +1268,14 @@ pub(super) fn sys_getpid() -> u64 {
     akuma_exec::process::read_current_pid().map_or(ESRCH, u64::from)
 }
 
-/// Multikernel `core_init` (syscall nr::CORE_INIT): activate a parked secondary core
-/// from userspace (an init system like herd drives this — docs/MULTIKERNEL.md R4b
-/// lifecycle, acceptance/12). `init_program_ptr` is an optional NUL-terminated path
-/// (0 ⇒ none): the program the activated core runs as its first (init) process — handed
-/// to the core in the `MSG_CORE_INIT` config (NOT a cross-core spawn). Delegates to the
-/// BSP-served `smp::core_init`. On a non-multikernel build there are no secondaries, so it
-/// returns `-ENOSYS`.
+/// `core_init` (syscall nr::CORE_INIT): activated a parked secondary core in the
+/// removed one-kernel-per-core multikernel (docs/archive/TRIM_FAT_MULTIKERNEL.md).
+/// herd (`userspace/herd`) still calls this to try pinning a service to a
+/// secondary core and already treats `ENOSYS` as the expected result under
+/// shared-kernel SMP, so this stub stays for ABI compatibility.
 pub(super) fn sys_core_init(core_idx: usize, init_program_ptr: u64) -> u64 {
-    #[cfg(kernel_smp)]
-    {
-        // Copy the optional init-program path from user space (NUL-terminated, like spawn).
-        let path = if init_program_ptr != 0 {
-            match copy_from_user_str(init_program_ptr, 512) {
-                Ok(s) => s,
-                Err(_) => return EFAULT,
-            }
-        } else {
-            alloc::string::String::new()
-        };
-        crate::smp::core_init(core_idx, path.as_bytes())
-    }
-    #[cfg(not(kernel_smp))]
-    {
-        let _ = (core_idx, init_program_ptr);
-        (-38i64) as u64 // ENOSYS
-    }
+    let _ = (core_idx, init_program_ptr);
+    (-38i64) as u64 // ENOSYS
 }
 
 pub(super) fn sys_getppid() -> u64 {
@@ -1338,21 +1298,6 @@ pub(super) fn sys_getrandom(ptr: u64, len: usize) -> u64 {
     while remaining > 0 {
         let chunk = remaining.min(256);
         let mut kernel_buf = alloc::vec![0u8; chunk];
-        // On a secondary core the RNG device lives on the owner; forward for entropy (§8.1).
-        #[cfg(kernel_smp)]
-        if crate::smp::is_on_secondary() {
-            let r = crate::smp::fwd_getrandom(&mut kernel_buf);
-            if (r as i64) <= 0 {
-                return EIO;
-            }
-            let got = (r as usize).min(chunk);
-            if unsafe { copy_to_user_safe(current_ptr as *mut u8, kernel_buf.as_ptr(), got).is_err() } {
-                return EFAULT;
-            }
-            remaining -= got;
-            current_ptr += got as u64;
-            continue;
-        }
         if crate::rng::fill_bytes(&mut kernel_buf).is_ok() {
             if unsafe { copy_to_user_safe(current_ptr as *mut u8, kernel_buf.as_ptr(), chunk).is_err() } {
                 return EFAULT;

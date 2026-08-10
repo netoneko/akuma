@@ -93,7 +93,7 @@ spawns + supervises each service. Config schema (`ServiceConfig`, `main.rs:115-1
 | `stack` | "" / "smoltcp" | "rump" routes the box's net to a rump box |
 | `join_box` | "" | join an existing box (e.g. sshd `join_box = rumpnet`) |
 | `mount_fs` | [] | mount points to create ("proc"/"tmpfs"); a fresh-root box has no /proc unless mounted |
-| `core` | 0 | multikernel core pin (mutually exclusive with `boxed`) |
+| `core` | 0 | core pin via the `core_init` syscall (mutually exclusive with `boxed`); the kernel side is now a permanent `ENOSYS` stub — the one-kernel-per-core multikernel it activated was removed, see `docs/archive/TRIM_FAT_MULTIKERNEL.md` — so herd treats it as unavailable on every current build |
 
 **Lifecycle:** service starts → runs → on exit: `oneshot` → `Completed`; else
 `restart` → respawn after `restart_delay_ms`, up to `max_retries`. `herd status`

@@ -66,6 +66,42 @@ lives in [`reference/build-profiles.md`](../reference/build-profiles.md).
 > recalled approximation, marked `~`, and should be re-measured before being
 > cited anywhere. No other kernel's source was available in this session.
 
+> ## Re-measured 2026-08-10 (branch `better-sshd-and-networking`) — multikernel removed
+>
+> Later the same day as the SSH-removal re-measurement above, the multikernel
+> (one-kernel-per-core, `smp`/`cfg(kernel_smp)`) was deleted in full — `src/smp.rs`,
+> the `akuma-smp` crate, `FileDescriptor::RemoteFd`/`RemoteKind`, the
+> `prepare_user_address_space`/`remote_fd_close` runtime hooks, the two
+> `spawn_process_from_image*` entry points, and every `cfg(kernel_smp)` guard
+> scattered through the syscall layer. See
+> [`TRIM_FAT_MULTIKERNEL.md`](TRIM_FAT_MULTIKERNEL.md) for the full accounting
+> and rationale. Same script, same scope (`scripts/cloc_akuma.py src crates`):
+>
+> | | 2026-08-10 (SSH removed) | 2026-08-10 (multikernel removed) | delta |
+> |---|---:|---:|---:|
+> | **Production code** | **42,320** | **38,579** | **−3,741 (−8.8%)** |
+> | Test code | 25,133 | 24,680 | −453 (−1.8%) |
+> | Rust files | 127 | 119 | −8 |
+> | All files | 140 | 131 | −9 |
+> | Physical lines | 102,362 | 95,874 | −6,488 |
+> | comment / code | 35.5% | 34.9% | −0.6 pp |
+> | test / production | 0.59x | 0.64x | +0.05 |
+>
+> `git diff --stat` against the pre-removal tree (which also covers `build.rs`,
+> `Cargo.toml`, and `scripts/cargo_runner.sh` — outside this script's `src
+> crates` scope, and counting blank/comment lines `cloc` excludes) reads **37
+> files changed, 78 insertions(+), 6,695 deletions(-)**: `src/smp.rs` alone
+> (4,174 lines) plus the 7-file `akuma-smp` crate (1,595 lines + an 8-line
+> `Cargo.toml`) account for the bulk; the rest is `cfg(kernel_smp)` guards and
+> now-dead helper functions removed from otherwise-shared files
+> (`syscall/{net,fs,proc}.rs`, `pmm.rs`, `irq.rs`, `console.rs`, `fs.rs`,
+> `main.rs`, plus the `akuma-exec` runtime-hook/spawn-path cleanup).
+>
+> The test-ratio rise (0.59x → 0.64x) is the same shape as the SSH-removal
+> entry above: production shrank faster than tests, not more testing —
+> `process_tests.rs` (10,220) and `tests.rs` (6,483) are unchanged and now an
+> even larger share of the total.
+
 ---
 
 ## Method

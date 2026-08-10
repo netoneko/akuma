@@ -68,10 +68,9 @@ mod rump_proxy;
     any(not(feature = "no-tests"), feature = "rump-tests"),
 ))]
 mod rump_tests;
-#[cfg(kernel_smp)]
-mod smp;
-// Real (shared-kernel) SMP — the inverse of the multikernel `smp` module. One
-// shared kernel across all cores; see docs/reference/subsystems/smp-shared.md.
+// Real (shared-kernel) SMP: one shared kernel across all cores; see
+// docs/reference/subsystems/smp-shared.md. The experimental one-kernel-per-core
+// multikernel was removed 2026-08-10 — docs/archive/TRIM_FAT_MULTIKERNEL.md.
 #[cfg(kernel_smp_shared)]
 mod smp_shared;
 #[cfg(kernel_tests)]
@@ -150,12 +149,6 @@ unsafe extern "C" {
 /// Minimal unsafe entry point - immediately delegates to safe kernel_main
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
-    // Multikernel: snapshot pristine `.data` BEFORE anything mutates a static, so
-    // each secondary's replicated `.data` starts from correct initial values
-    // (docs/MULTIKERNEL.md §4.2). Must be the very first action. smp-only.
-    #[cfg(kernel_smp)]
-    smp::snapshot_pristine_data();
-
     // Early debug: print raw DTB pointer before anything else
     console::print("DTB ptr from boot (x0 arg): 0x");
     console::print_hex(dtb_ptr as u64);
@@ -381,14 +374,7 @@ pub(crate) fn compute_thread_limit(user_pages_size: usize) -> usize {
 }
 
 /// Build the `akuma-exec` runtime callbacks + config from the kernel's functions and
-/// `config::` constants. Factored out of `kernel_main` so a multikernel SECONDARY can
-/// register the SAME runtime in its OWN (replicated) `RUNTIME`/`CONFIG` cells — the BSP
-/// sets those after the `.data` snapshot, so a secondary's copy is pristine and must be
-/// registered locally (docs/MULTIKERNEL.md §15, R3). The function pointers are shared
-/// kernel code that resolves every `static` (PMM/heap) to whichever core runs them.
-///
-/// Stack bounds + canary toggle are parameters because they differ per core: the
-/// secondary's "boot" stack is its isolated per-core stack, not the BSP boot stack.
+/// `config::` constants.
 pub(crate) fn build_exec_runtime(
     boot_stack_base: usize,
     boot_stack_top: usize,
@@ -486,14 +472,6 @@ pub(crate) fn build_exec_runtime(
         cow_ref_get: pmm::cow_ref_get,
         cow_fault_lock: pmm::cow_fault_lock,
         cow_fault_unlock: pmm::cow_fault_unlock,
-        // No user-AS overlay on the BSP / single-kernel build. A multikernel secondary
-        // sets this when it initializes (src/smp.rs) so the normal spawn path builds a
-        // correct user table on it too (docs/MULTIKERNEL.md §4.2/R4b.3a).
-        prepare_user_address_space: None,
-        // No cross-core fd close on the BSP / single-kernel build; a secondary sets it
-        // when it initializes (src/smp.rs) so a RemoteFd left open at exit is freed on the
-        // owner (docs/MULTIKERNEL.md §8.1).
-        remote_fd_close: None,
     };
     let cfg = akuma_exec::ExecConfig {
         max_threads: config::MAX_THREADS,
@@ -531,9 +509,6 @@ pub(crate) fn build_exec_runtime(
         cow_fork_enabled: config::COW_FORK_ENABLED,
         vfork_fastpath_enabled: config::VFORK_FASTPATH_ENABLED,
         pthread_kill_eintr_enabled: config::PTHREAD_KILL_EINTR_ENABLED,
-        // BSP/single-kernel: use the normal size-based loader. A multikernel secondary flips
-        // this to true (it forwards file reads to the owner; whole-file is simplest there).
-        prefer_whole_file_load: false,
     };
     (rt, cfg)
 }
@@ -608,15 +583,9 @@ fn kernel_main(dtb_ptr: usize) -> ! {
 
     let (ram_base, ram_size) = detect_memory(dtb_ptr);
 
-    // Multikernel (docs/MULTIKERNEL.md): snapshot CPU/PSCI info from the DTB NOW,
-    // before the heap allocator (which can be placed exactly at the DTB's address
-    // on large-RAM configs) overwrites it. `bringup_secondaries` later reads the
-    // stash, never the DTB. No-op without the `smp` feature.
-    #[cfg(kernel_smp)]
-    smp::probe_dtb(dtb_ptr);
-
-    // Real (shared-kernel) SMP: same rationale — snapshot CPU/PSCI info before the
-    // heap can overwrite the DTB. No-op without the `smp-shared` feature.
+    // Real (shared-kernel) SMP: snapshot CPU/PSCI info from the DTB NOW, before the
+    // heap allocator (which can be placed exactly at the DTB's address on
+    // large-RAM configs) overwrites it. No-op without the `smp-shared` feature.
     #[cfg(kernel_smp_shared)]
     smp_shared::probe_dtb(dtb_ptr);
 
@@ -749,13 +718,6 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     allocator::mark_pmm_ready();
     console::print("PMM initialized, allocator switched to page mode\n");
 
-    // Multikernel: remove the secondary cores' RAM partitions from the BSP PMM NOW,
-    // before any BSP allocation (e.g. mmu::init below) can claim a page inside one.
-    // Each secondary owns + manages its partition via its own per-core PMM (R2), so
-    // the two pools must be strictly disjoint. (No-op single-core.)
-    #[cfg(kernel_smp)]
-    smp::reserve_secondary_partitions(ram_base, ram_size);
-
     // Reclaim the pre-kernel region.  KERNEL_PHYS_OFFSET (1 MB) bytes before the
     // kernel are unused space — fully consumed by detect_memory() before PMM init
     // and safe to give back.  Hands ~256 pages (1 MB) to the user-page pool.
@@ -804,13 +766,6 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Initialize GIC (Generic Interrupt Controller)
     gic::init();
     console::print("GIC initialized\n");
-
-    // Multikernel (docs/MULTIKERNEL.md) — M0: wake secondary cores. They reuse the
-    // BSP's boot page tables (isolation-by-convention) and park after reporting
-    // Online. No-op when QEMU exposes a single CPU (default `-smp 1`). Gated to the
-    // `smp` feature so the default single-core build never compiles it.
-    #[cfg(kernel_smp)]
-    smp::bringup_secondaries(ram_base, ram_size);
 
     // Real (shared-kernel) SMP: wake secondary cores onto the SHARED boot page tables,
     // PMM, and heap. Each secondary adopts an idle thread and joins the one shared
@@ -1300,9 +1255,8 @@ fn run_async_main() -> ! {
 
     // rump feature: bind the BSP's rump tap (/dev/net/tap0) to NIC1 on virtio-mmio-bus.4
     // (RUMP_NIC=1), leaving NIC0 on smoltcp above. Bound to that SPECIFIC slot — not "the 2nd
-    // virtio-net" — so it never claims bus.5, which is reserved for a secondary core's LOCAL
-    // rump stack (CORE2_NIC=1; see smp::RUMP_NIC_CORE). This lets CORE2_NIC=1 be used ALONE. If
-    // bus.4 has no device (RUMP_NIC=0), init_at fails gracefully and /dev/net/tap0 stays ENODEV.
+    // virtio-net" — so it never claims bus.5. If bus.4 has no device (RUMP_NIC=0), init_at
+    // fails gracefully and /dev/net/tap0 stays ENODEV.
     #[cfg(feature = "rump")]
     match akuma_net::rump_tap::init_at(mmu::DEV_VIRTIO_VA + 4 * 0x200) {
         Ok(mac) => {
@@ -1361,24 +1315,6 @@ fn run_async_main() -> ! {
     // when rump-default owns box 0's stack (avoid a second box-0 rump_server).
     #[cfg(all(feature = "rump", not(feature = "rump-default")))]
     rump_proxy::run_rump();
-
-    // Multikernel: start the console drainer now that preemption is live and the BSP
-    // can spawn system threads. It forwards secondary cores' per-core console rings
-    // (§8.2) to the UART; secondaries have been buffering output since bringup.
-    // (No-op single-core.)
-    #[cfg(kernel_smp)]
-    smp::start_console_drainer();
-
-    // Multikernel: start the persistent forward-server (R4b.2) — drains the BSP inbox
-    // and services cross-core forward requests for the system's lifetime, the steady-
-    // state replacement for the transient bringup wait loop. (No-op single-core.)
-    #[cfg(kernel_smp)]
-    smp::start_fwd_server();
-
-    // Multikernel: activate a secondary for the forward-latency micro-benchmark (no-op unless
-    // the bench is enabled), so a plain `SMP=2` boot measures the transport without disk/herd.
-    #[cfg(kernel_smp)]
-    smp::autostart_bench_core();
 
     console::print("[Main] SSH is the userspace /bin/sshd
 ");

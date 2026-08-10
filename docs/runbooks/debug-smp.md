@@ -1,11 +1,9 @@
 # Debug SMP (shared-kernel multiprocessing)
 
 Symptom-driven debugging for **real (shared-kernel) SMP** — `cfg(kernel_smp_shared)`,
-the `smp-shared` feature on the `release-smp-shared` profile. For architecture see
-[`../reference/subsystems/smp-shared.md`](../reference/subsystems/smp-shared.md); for the
-running dev log see [`../archive/SMP_SHARED.md`](../archive/SMP_SHARED.md). This is the
-*inverse* of the share-nothing multikernel ([`../reference/subsystems/smp.md`](../reference/subsystems/smp.md),
-`cfg(kernel_smp)`); the two are mutually exclusive.
+the `smp-shared` feature, in the default feature set since 2026-08-10. For architecture
+see [`../reference/subsystems/smp-shared.md`](../reference/subsystems/smp-shared.md); for
+the running dev log see [`../archive/SMP_SHARED.md`](../archive/SMP_SHARED.md).
 
 > **Stability: C (active development).** M0–M4 + M5a/M5b/M5c done. The BKL is now a **fair
 > FIFO ticket lock**, which (with `idle_halt` on cooperative waits) fixed the former
@@ -218,6 +216,6 @@ BKL + idle_halt) — if it recurs, treat it as a fresh regression, not "re-run a
 - **`as_lock` must never be held across alloc / block I/O / a context switch** — the PMM
   OOM/reclaim path can re-enter it. Hold it only for short PTE-edit windows (IRQs off).
   Allocate before, free after.
-- The default / size / extreme / multikernel builds compile **none** of this — every
+- The `size` / `extreme` builds compile **none** of this — every
   `bkl`/`as_lock`/profiler entry is a zero-cost no-op unless `cfg(kernel_smp_shared)`.
 - All SMP work is gated; if a change regresses a non-SMP build, you broke a `cfg` gate.

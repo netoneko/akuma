@@ -127,7 +127,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | Memory (PMM, heap, COW) | [`reference/subsystems/memory.md`](reference/subsystems/memory.md) | **C** |
 | Scheduler / threads | [`reference/subsystems/scheduler.md`](reference/subsystems/scheduler.md) | A |
 | Thread & thread-group lifecycle (states, teardown lock tree, eret leaves) | [`reference/subsystems/thread-lifecycle.md`](reference/subsystems/thread-lifecycle.md) | **C** |
-| SMP / multikernel | [`reference/subsystems/smp.md`](reference/subsystems/smp.md) | **C** |
+| SMP (shared-kernel) | [`reference/subsystems/smp-shared.md`](reference/subsystems/smp-shared.md) | **C** |
 | Kernel locking (BKL + carve-outs) | [`reference/subsystems/locking.md`](reference/subsystems/locking.md) | B |
 | Networking (box model, two stacks) | [`reference/subsystems/networking.md`](reference/subsystems/networking.md) | **C** |
 | Rump stack (sysproxy, fiber) | [`reference/subsystems/rump-stack.md`](reference/subsystems/rump-stack.md) | **C** |

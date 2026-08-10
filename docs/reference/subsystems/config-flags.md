@@ -16,8 +16,7 @@ profiles — the profile just sets opt level / codegen units / LTO.
 | `release` | — | default `cargo run` | full feature set |
 | `size` | `release` | `scripts/build_size.sh` | `--no-default-features`, re-adds minimal set |
 | `extreme-size` | `size` | `scripts/build_extreme_size.sh` | 4 MB floor; omits TLS, block cache |
-| `release-smp` | `release` | `cargo build --profile release-smp --features smp` | multikernel; paired with `smp` feature |
-| `release-smp-shared` | `release` | `cargo build --profile release-smp-shared --features smp-shared`; also `scripts/build_devbox_smoltcp.sh` | real shared-kernel SMP; paired with `smp-shared`. Mutually exclusive with `smp` (build.rs panics if both) |
+| `release-smp-shared` | `release` | `cargo build --profile release-smp-shared --features smp-shared`; also `scripts/build_devbox_smoltcp.sh` | real shared-kernel SMP; paired with `smp-shared` |
 | `devbox` | `release` | `scripts/build_devbox.sh`, `overlays/devbox/run.sh` | rump-only, no smoltcp |
 
 There is no `devbox-smoltcp` *profile* — the default devbox target is the
@@ -85,7 +84,6 @@ re-add what they need. `Cargo.toml:208-216`.
 | `gic-v2` | Legacy GICv2 MMIO driver instead of default GICv3. HVF needs GICv3. | `Cargo.toml:188` |
 | `extreme` | Profile discriminator for build.rs (tighter IMAGE_SIZE/stack). | `Cargo.toml:196` |
 | `fs-cache` | Large ext2 block cache (clock eviction) — keeps toolchain resident across spawns. **In `default`**, so any build that doesn't pass `--no-default-features` has it. Cap set at mount by `src/fs.rs` as `min(RAM/8, 384 MB)` (ceiling raised from 128 MB 2026-08-05; see the sizing table there). Observe it via the `[FSCACHE]` PSTATS line. Not combinable with `extreme`. | `Cargo.toml:133` |
-| `smp` | Multikernel / one-kernel-per-core. Emits `cfg(kernel_smp)` via build.rs. Paired with `release-smp`. | `Cargo.toml:138` |
 | `no-tests` | Drops boot self-test suites; sets `akuma-net/small-sockets`. | `Cargo.toml:128` |
 | `userspace-sshd` | Compiles the built-in SSH server **out** (with the whole in-kernel shell behind it) and turns herd off on `extreme`, so `AUTO_START_SSHD` starts `/bin/sshd` directly. Implied by `devbox`/`devbox-smoltcp`. | `Cargo.toml:435` |
 
@@ -98,11 +96,11 @@ re-add what they need. `Cargo.toml:208-216`.
 
 ### SMP / Big Kernel Lock
 
-`smp` (multikernel) and `smp-shared` (real shared-kernel SMP) are the two SMP
-models and are **mutually exclusive** — build.rs asserts. The `no-bkl-*` features
-are carve-outs from the Big Kernel Lock and are only meaningful together with
-`smp-shared`; each is a byte-for-byte no-op on any build that doesn't set both.
-See [`locking.md`](locking.md) for the carve-out playbook and the syscall→lock map.
+`smp-shared` is the real shared-kernel SMP model — one shared kernel across
+all cores under real cross-core locks. The `no-bkl-*` features are carve-outs
+from the Big Kernel Lock and are only meaningful together with `smp-shared`;
+each is a byte-for-byte no-op on any build that doesn't set both. See
+[`locking.md`](locking.md) for the carve-out playbook and the syscall→lock map.
 
 | Feature | cfg emitted | In `smp-shared` by default? | Effect |
 |---|---|---|---|

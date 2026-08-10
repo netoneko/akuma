@@ -21,7 +21,6 @@ feature (`build.rs` cannot see `OPT_LEVEL` to distinguish them).
 |---|---|---|---|---|---|
 | **release** (default) | `release` | `cargo build --release` / `cargo run --release` | 3.1 MB | smoltcp (native) + userspace `/bin/sshd` | Day-to-day development image. Full feature set: editor, sound, TLS (RSA + Ed25519), rump *available* (opt-in per box), all `sc-*` syscall families. |
 | **extreme-size** | `extreme-size` (inherits `release`) | `scripts/build_extreme_size.sh` | 578 KB text | smoltcp + **built-in SSH (the only profile that keeps it)**, **no HTTPS** | 4 MB RAM floor target. Same codegen knobs as `size`; the *only* discriminator is the `extreme` feature, since both profiles use `opt-level = "z"`. Drops `kernel-tls` entirely (no in-kernel `curl https://`), `neko`, `tls-rsa`, tighter stack/heap constants via `cfg(kernel_profile_extreme)`. Compiles again since `fix-extreme-size` — see [Fixed](#fixed-extreme-size-build-breakage-was-broken-at-d3f28d6). |
-| **multikernel** (experimental) | `release` | `cargo build --release --no-default-features --features smp,smoltcp` | 2.9 MB | smoltcp + userspace `/bin/sshd` | One whole kernel **per core** (see `docs/reference/subsystems/smp.md`) — a different model from real SMP, not a variant of it. Needs `--no-default-features` because the default set now carries `smp-shared`, and the two are mutually exclusive (build.rs panics). Adds secondary-core bringup, PSCI `CPU_ON`, the inter-core message bus. |
 | **release** carries this | `release` | `cargo build --release` (`SMP=N` at run time) | 4.0 MB | smoltcp + userspace `/bin/sshd` | **Real SMP, and the default since 2026-08-10** — `smp-shared` is in the default feature set. One shared kernel across all cores: one PMM/heap/run-queue under real cross-core locks, plus the six `no-bkl-*` carve-outs (see `docs/reference/subsystems/smp-shared.md`). This is what "SMP" means here. |
 | **devbox** | `release` | `scripts/build_devbox.sh` / `overlays/devbox/run.sh` | 1.4 MB | **rump only** (no smoltcp, no built-in SSH) | *(deferred — see `devbox-smoltcp`.)* Rump-stack workstation image: NetBSD rump as box 0's default stack, built-in SSH dropped. `--no-default-features`, so smoltcp (and `kernel-tls`/`tls-rsa`/built-in SSH) is compiled out. |
 | **devbox-smoltcp** (default devbox) | `release` | `scripts/build_devbox_smoltcp.sh` / `overlays/devbox/run-smoltcp.sh` | 1.7 MB | smoltcp (native) + userspace `/bin/sshd`, **no built-in SSH** | The **default** "develop inside Akuma" image (2026-07-19). Native smoltcp stack for box 0 + real shared-kernel SMP (`SMP=N`); built-in SSH dropped (`userspace-sshd`) so the userspace `/bin/sshd` (herd) over smoltcp is the only sshd. Keeps the default feature set (smoltcp/`kernel-tls` stay in). rump_server work is deferred. |
@@ -201,7 +200,6 @@ what it wants:
 | `size` | `neko`, `tls-rsa`, `rump`, `sound`, `many-sessions` | `no-tests` |
 | `extreme-size` | `neko`, `tls-rsa`, `kernel-tls`, `rump`, `sound`, `many-sessions` | `no-tests`, `extreme` |
 | `devbox` | `smoltcp`, `kernel-tls`, `tls-rsa`, `many-sessions` | `devbox` (→ `rump-default` + `userspace-sshd`), `no-tests` |
-| multikernel | `--no-default-features` | `smp`, `smoltcp` |
 | `devbox-smoltcp` | — (inherits default set) | `devbox-smoltcp` (→ `userspace-sshd` + `smp-shared`), `no-tests` |
 
 ### `many-sessions` and the userspace sshd
@@ -233,9 +231,8 @@ serving all sessions, no `fork()` per connection. See
 [`docs/runbooks/build-extreme-size.md`](../runbooks/build-extreme-size.md).
 
 `devbox-smoltcp` keeps the full
-default feature set and only layer their feature on top, rather than starting
-from `--no-default-features` (unlike `size`/`extreme`/`devbox`). `smp` and
-`smp-shared` are mutually exclusive (build.rs enforces).
+default feature set and only layers its feature on top, rather than starting
+from `--no-default-features` (unlike `size`/`extreme`/`devbox`).
 
 ## Which one do I want?
 
@@ -244,7 +241,6 @@ from `--no-default-features` (unlike `size`/`extreme`/`devbox`). `smp` and
 - **Verifying the kernel still fits a 4 MB VM** → `extreme-size`. No in-kernel HTTPS; use a userspace tool if you need TLS.
 - **Working inside Akuma as a Unix box (self-hosted toolchain, editor, daily use)** → `devbox-smoltcp` (the default devbox: native smoltcp + real SMP; `overlays/devbox/run-smoltcp.sh`). The rump `devbox` is deferred but still boots via `overlays/devbox/run.sh` (needs `RUMP_NIC=1`).
 - **Exercising real (shared-kernel) SMP** → nothing to do; it is in `--release`. Set `SMP=N` at run time. See `docs/reference/subsystems/smp-shared.md`.
-- **Exercising the multikernel (one-kernel-per-core) bringup** → `--no-default-features --features smp,…`, gated behind the §10/§11 acceptance test in `docs/MULTIKERNEL.md`. Real SMP is already in `--release`.
 
 ## Profiles were consolidated (2026-08-10)
 

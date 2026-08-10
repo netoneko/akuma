@@ -177,8 +177,7 @@ drop(Box<Process>)
 │    ├─ fds.table (M) — values().cloned().collect() ALLOCATES under the lock
 │    ├─ PIPES (M)                    pipe_close_read/write
 │    ├─ SOCKET_TABLE (U,P) → NETWORK (U,P)   remove_socket → smoltcp close
-│    ├─ EVENTFDS (M), EPOLL_TABLE (M), PIDFD_TABLE (M), CHILD_CHANNELS (M)
-│    └─ RemoteFd → blocking cross-core forward (multikernel only)
+│    └─ EVENTFDS (M), EPOLL_TABLE (M), PIDFD_TABLE (M), CHILD_CHANNELS (M)
 └─ String/Vec/BTreeMap/Arc drops → TALC (heap lock) throughout
 ```
 

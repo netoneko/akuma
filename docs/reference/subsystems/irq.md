@@ -6,10 +6,8 @@ exception-vector integration that calls into this file, and the SMP
 doorbell) see [`drivers/gic.md`](drivers/gic.md) "IRQ dispatch to the
 scheduler" — not duplicated here.
 
-> **Stability: B (watch).** Dormant since Dec 2025 except one small,
-> feature-gated addition in the June 2026 multikernel push
-> (`register_handler_no_gic`). Not part of either fire window's bug churn —
-> the recent change is additive, not a fix — but recent enough to flag.
+> **Stability: B (watch).** Dormant since Dec 2025. Not part of either fire
+> window's bug churn.
 
 ## IRQ masking
 
@@ -33,19 +31,12 @@ handler out from under the lock before calling it — holding the spinlock
 across the handler call would deadlock any handler that itself needs to
 register/unregister (e.g. during bring-up).
 
-`register_handler_no_gic` (`:106-112`, `#[cfg(kernel_smp)]`) is the
-secondary-core variant that installs a dispatch-table entry without touching
-the GIC (a secondary enables its own per-PE interrupts directly in its own
-redistributor instead). See [`drivers/gic.md`](drivers/gic.md) for why
-`register_handler`'s `gic::enable_irq` can't be used from a secondary core,
-and for how the top-level exception vector special-cases the scheduler SGI
-versus routing everything else through `dispatch_irq`.
+See [`drivers/gic.md`](drivers/gic.md) for how the top-level exception vector
+special-cases the scheduler SGI versus routing everything else through
+`dispatch_irq`.
 
 ## Background
 
-- `docs/archive/MULTIKERNEL.md` — the secondary-core bring-up sequence
-  (`register_handler_no_gic`, per-core timer PPI, doorbell SGI) this file's
-  SMP path exists for.
 - `docs/archive/STRATEGY_C_IRQ_WAKEUPS.md` — an early plan for moving I/O
   off polling loops onto IRQ-driven wakeups; background/context only, not a
   description of the current `irq.rs` implementation.

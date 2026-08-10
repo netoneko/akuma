@@ -7,8 +7,8 @@
 //!
 //! **Zero-cost when off:** every function here compiles to an empty inline body
 //! unless `cfg(kernel_smp_shared)` is set (the `smp-shared` feature, forwarded from
-//! the bin crate). The default, `size`, `extreme`, and multikernel (`smp`) builds are
-//! byte-for-byte unaffected.
+//! the bin crate). The default, `size`, and `extreme` builds are byte-for-byte
+//! unaffected.
 //!
 //! **M1 wiring:** the syscall path (`rust_sync_el0_handler` entry/exit) and the idle
 //! loop take/drop the BKL, establishing "held while a core executes kernel code" on

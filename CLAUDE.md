@@ -7,7 +7,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 ## Layout
 
 - `src/` — Kernel (no_std Rust)
-- `crates/` — Host-testable extracted crates: `akuma-{exec,ext2,isolation,net,rump,smp,terminal,vfs}`
+- `crates/` — Host-testable extracted crates: `akuma-{exec,ext2,isolation,net,rump,terminal,vfs}`
 - `userspace/` — ELF binaries (musl libc); current member list + one-liners: `docs/reference/userspace-layout.md`
 - `docs/` — Documentation (see below)
 - `scripts/` — Build and debug helpers
@@ -131,3 +131,9 @@ integration coverage. `scripts/` has targeted harnesses too
 `test_sched_bklfree_ticket_fix.py`, …).
 
 Pre-commit hook runs clippy + tests automatically.
+
+## Working with Claude Code in this repo
+
+Never use the `fork` subagent type (or any multi-agent fan-out) in this repo — do the
+work directly instead. Forking copies the whole conversation context into a background
+agent, which costs far more tokens than doing it inline.

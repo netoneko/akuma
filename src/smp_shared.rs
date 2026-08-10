@@ -28,8 +28,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-/// Maximum cores we bring up. Matches the multikernel's `akuma_smp::MAX_CORES` and is
-/// comfortably under the `aff0 < 16` single-cluster limit on QEMU `virt`.
+/// Maximum cores we bring up. Comfortably under the `aff0 < 16` single-cluster limit
+/// on QEMU `virt`.
 const MAX_CORES: usize = 8;
 
 /// Per-core boot/idle stack size shift (64 KiB). This stack backs the secondary's
@@ -987,10 +987,10 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
     }
 }
 
-// Secondary trampoline. Mirrors `crate::smp::secondary_entry` and boot.rs's MMU setup,
-// but loads the SHARED boot TTBR0/TTBR1 (never a restricted per-core table) and tail-
-// calls `secondary_shared_start`. Lives in `.text.boot` so it is identity-reachable
-// with the MMU still off at entry. `boot_ttbr0_addr`/`boot_ttbr1_addr` are the BSP's
+// Secondary trampoline. Mirrors boot.rs's MMU setup, but loads the SHARED boot
+// TTBR0/TTBR1 (never a restricted per-core table) and tail-calls
+// `secondary_shared_start`. Lives in `.text.boot` so it is identity-reachable with
+// the MMU still off at entry. `boot_ttbr0_addr`/`boot_ttbr1_addr` are the BSP's
 // boot-table roots, published MMU-off into `.data.boot` by boot.rs.
 core::arch::global_asm!(
     r#"

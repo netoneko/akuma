@@ -188,39 +188,6 @@ case "$RUMP_NIC" in
     ;;
 esac
 
-# CORE2_NIC - a THIRD virtio-net (NIC2) on virtio-mmio-bus.5, dedicated to a SECONDARY core
-#             so it can run a LOCAL network stack (rump) instead of forwarding sockets to
-#             core 0 (docs/MULTIKERNEL_NETWORKING_EXPERIMENT.md §7, Stage 0/1). Its own
-#             isolated -netdev user SLIRP gives that core's stack DHCP + a 10.0.2.2 gateway,
-#             independent of NIC0 (smoltcp on core 0) and NIC1 (core 0's rump tap).
-#               0 (default) no third NIC
-#               1           add NIC2 on bus.5 -> the secondary's /dev/net/tap0
-CORE2_NIC="${CORE2_NIC:-0}"
-CORE2_NIC_ARGS=()
-case "$CORE2_NIC" in
-  0|off|no|false|FALSE)
-    ;;
-  1|on|yes|true|TRUE)
-    # CORE2_HTTP_PORT - host port -> :80 on NIC2's SLIRP (a plain-HTTP GET from the secondary's
-    #                   rump stack can reach a server you run on the host). Default 8081.
-    # CORE2_SSH_PORT  - host port -> :22 on NIC2's SLIRP, to `ssh` into an sshd running INSIDE
-    #                   core 2's rump box (the whole session + curl then ride the rump stack).
-    #                   Default 2224. Set either empty to drop that forward.
-    CORE2_HTTP_PORT="${CORE2_HTTP_PORT:-8081}"
-    CORE2_SSH_PORT="${CORE2_SSH_PORT:-2224}"
-    C2FWD=""
-    [ -n "$CORE2_HTTP_PORT" ] && C2FWD="${C2FWD},hostfwd=tcp::${CORE2_HTTP_PORT}-:80"
-    [ -n "$CORE2_SSH_PORT" ] && C2FWD="${C2FWD},hostfwd=tcp::${CORE2_SSH_PORT}-:22"
-    CORE2_NIC_ARGS+=(-netdev "user,id=net2${C2FWD}")
-    echo "[cargo_runner] core2 NIC (net2) on virtio-mmio-bus.5; host :${CORE2_HTTP_PORT}->rump:80, :${CORE2_SSH_PORT}->rump:22" >&2
-    CORE2_NIC_ARGS+=(-device "virtio-net-device,netdev=net2,bus=virtio-mmio-bus.5")
-    ;;
-  *)
-    echo "[cargo_runner] ERROR: CORE2_NIC must be 0|1 (got '$CORE2_NIC')" >&2
-    exit 1
-    ;;
-esac
-
 # Accelerator. Defaults to HVF (Apple Hypervisor.framework, near-native AArch64
 # execution) on Apple Silicon where it is available, falling back to TCG (portable
 # software emulation, ~3000x slower for NEON) elsewhere. Override with HVF=1 to
@@ -274,7 +241,6 @@ exec qemu-system-aarch64 \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
   "${RUMP_NIC_ARGS[@]}" \
-  "${CORE2_NIC_ARGS[@]}" \
   "${FB_ARGS[@]}" \
   "${SOUND_ARGS[@]}" \
   -kernel "$BIN" \

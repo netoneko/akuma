@@ -227,7 +227,7 @@ pub fn end_of_interrupt(irq: u32) {
 ///
 /// SGI 0-15 are available. This sends the interrupt to the current CPU.
 // Unused under `kernel_smp_shared` (that build self-targets via `trigger_sgi_self`); kept
-// for the default/single-core and multikernel paths.
+// for the default/single-core path.
 #[allow(dead_code)]
 pub fn trigger_sgi(sgi_id: u32) {
     #[cfg(feature = "gic-v2")]
@@ -236,9 +236,9 @@ pub fn trigger_sgi(sgi_id: u32) {
     crate::gic_v3::trigger_sgi(sgi_id);
 }
 
-/// Trigger an SGI on a specific core (by affinity-0 = `MPIDR & 0xff`). The
-/// multikernel cross-core doorbell; also used by real shared-kernel SMP. GICv3 only.
-#[cfg(all(not(feature = "gic-v2"), any(kernel_smp, kernel_smp_shared)))]
+/// Trigger an SGI on a specific core (by affinity-0 = `MPIDR & 0xff`). Used by real
+/// shared-kernel SMP as the cross-core doorbell. GICv3 only.
+#[cfg(all(not(feature = "gic-v2"), kernel_smp_shared))]
 pub fn trigger_sgi_core(target_aff0: u32, sgi_id: u32) {
     crate::gic_v3::trigger_sgi_core(target_aff0, sgi_id);
 }

@@ -3,38 +3,29 @@
 PL011 UART driver and the kernel's console output/input chokepoint. Source:
 `src/console.rs`.
 
-> **Stability: B (watch).** Dormant since March 2026 (`extract akuma-exec`)
-> except one June 2026 multikernel change (`use console ring`, Jun 29) that
-> rerouted all output through a new `emit()` chokepoint. The change is
-> additive and mechanical — every print helper now funnels through one
-> function instead of writing the UART directly — but recent enough to watch.
+> **Stability: B (watch).** Dormant since March 2026 (`extract akuma-exec`).
 
 ## UART driver
 
 `Uart` (`:19-57`) wraps the PL011 registers at `akuma_exec::mmu::DEV_UART_VA`
 (remapped VA for physical `0x0900_0000`): `write`/`read` hit the data
 register (`DR_OFFSET`), `has_data()` checks the flag register's `RXFE` bit.
-One `static UART: Uart` (`:60`) instance; there is no locking around it — see
-"Single writer path" below for why that's safe.
+One `static UART: Uart` (`:60`) instance; there is no lock around it.
 
 ## Output: the `emit()` chokepoint
 
 Every print helper (`print`, `print_char`, `print_hex`, `print_dec`,
-`print_u64`, `StackWriter::flush`) funnels through `emit(bytes: &[u8])`
-(`:73-83`), added in the June 2026 multikernel change. On a `kernel_smp`
-build, `emit` first tries `crate::smp::console_emit(bytes)` — if the calling
-core is a secondary whose per-core console ring is set, the bytes are
-appended to that ring instead of touching the UART (the UART MMIO isn't even
-mapped in a secondary's restricted table). The BSP (core 0) drains
-secondaries' rings to the real UART on its own schedule. On the BSP, or in
-any pre-bringup / non-SMP path, `console_emit` returns `false` (or doesn't
-exist) and `emit` falls through to writing the UART directly, with IRQs
-disabled (`irq::with_irqs_disabled`, `:78-82`) so a timer preemption can't
-interleave two threads' output mid-message.
+`print_u64`, `StackWriter::flush`) funnels through `emit(bytes: &[u8])`,
+which writes the UART directly with IRQs disabled on the current core
+(`irq::with_irqs_disabled`) so a timer preemption can't interleave two
+*threads on the same core's* output mid-message.
 
-`print_bytes` (`:90-92`, `#[cfg(kernel_smp)]`) is the raw-byte variant used
-by the multikernel console drainer to forward a secondary's ring contents,
-which may straddle a UTF-8 boundary and so can't go through `print(&str)`.
+> **Known gap (2026-08-10):** `with_irqs_disabled` only masks IRQs on the
+> calling core — it is not a cross-core lock. Under `smp-shared` (the
+> default), two threads on two different cores can both be inside `emit()`'s
+> write loop at once, with nothing serializing their byte streams at the
+> shared PL011 register. See `docs/archive/DEVBOX_ISSUES.md` Issue 3 for the
+> full writeup and the fix (a small spinlock around the loop body).
 
 ## Formatting without heap allocation
 
@@ -124,6 +115,6 @@ wrappers kept for callers outside the normal async SSH input path.
   discipline: *volume*. Heap-free prints still saturate a 115200-baud UART and
   serialize every logging core on the console lock; per-event traces need a
   config flag with a live reader.
-- `docs/archive/MULTIKERNEL.md` (§8.2) — the per-core SPSC console ring
-  design this file's `emit()`/`print_bytes` split exists to serve: producer
-  is the secondary core, consumer is the BSP's drain loop.
+- `docs/archive/MULTIKERNEL.md` (§8.2) — the removed one-kernel-per-core
+  design's per-core SPSC console ring, which `emit()` used to route through
+  before the multikernel was removed (`docs/archive/TRIM_FAT_MULTIKERNEL.md`).

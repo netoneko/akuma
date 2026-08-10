@@ -1,6 +1,5 @@
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_profile_extreme)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_smp)");
     println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_network)");
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_vfs)");
@@ -11,37 +10,19 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
     println!("cargo::rustc-check-cfg=cfg(kernel_tests)");
 
-    // Multikernel (one-kernel-per-core) gate. ALL secondary-core code lives behind
-    // `cfg(kernel_smp)`; with the feature off, none of it compiles and the default
-    // build stays byte-for-byte single-core (docs/MULTIKERNEL.md §11). The `smp`
-    // Cargo feature is the discriminator (the `release-smp` profile only sets
-    // codegen; Cargo profiles cannot auto-enable features), exposed to build
-    // scripts as CARGO_FEATURE_SMP. Selected together by scripts/build_smp.sh.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMP");
-    let smp = std::env::var("CARGO_FEATURE_SMP").is_ok();
-    if smp {
-        println!("cargo:rustc-cfg=kernel_smp");
-    }
-
-    // Real (shared-kernel) SMP gate. Distinct from the multikernel: ONE shared
-    // kernel — one set of statics, one page-table set, one PMM/heap, one global run
-    // queue — across all cores under real cross-core locking. All of it lives behind
-    // `cfg(kernel_smp_shared)`, emitted only when the `smp-shared` feature is set
-    // (exposed as CARGO_FEATURE_SMP_SHARED). Paired with the `release-smp-shared`
-    // profile. See docs/reference/subsystems/smp-shared.md.
+    // Real (shared-kernel) SMP gate: ONE shared kernel — one set of statics, one
+    // page-table set, one PMM/heap, one global run queue — across all cores under
+    // real cross-core locking. All of it lives behind `cfg(kernel_smp_shared)`,
+    // emitted only when the `smp-shared` feature is set (exposed as
+    // CARGO_FEATURE_SMP_SHARED). Paired with the `release-smp-shared` profile. See
+    // docs/reference/subsystems/smp-shared.md. The experimental one-kernel-per-core
+    // multikernel (`smp`/`kernel_smp`) was removed 2026-08-10 —
+    // docs/archive/TRIM_FAT_MULTIKERNEL.md.
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMP_SHARED");
     let smp_shared = std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok();
     if smp_shared {
         println!("cargo:rustc-cfg=kernel_smp_shared");
     }
-
-    // The two SMP models are opposites (share-nothing vs. share-everything) and must
-    // never compile together — the shared path assumes globals are NOT replicated,
-    // the multikernel assumes they ARE.
-    assert!(
-        !(smp && smp_shared),
-        "features `smp` (multikernel) and `smp-shared` (real SMP) are mutually exclusive"
-    );
 
     // BKL-free network path (Phase 2 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md).
     // `cfg(kernel_no_bkl_network)` makes the smoltcp net syscalls drop the BKL for their
@@ -227,8 +208,6 @@ fn main() {
         "extreme-size"
     } else if smp_shared {
         "release-smp-shared"
-    } else if smp {
-        "release-smp"
     } else {
         "release"
     };

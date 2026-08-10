@@ -215,6 +215,104 @@ core (and which thread) actually holds it during a stuck window — the
 `[THR-DUMP]` snapshot cadence (every ~30s heartbeat) is too coarse to catch
 the moment of entry into the critical section.
 
+## Issue 3: UART console output can interleave across cores — no cross-core lock
+
+**Status: OPEN.** Noticed 2026-08-10 while reading `src/console.rs` during the
+multikernel removal pass (docs/archive/TRIM_FAT_MULTIKERNEL.md), not from a
+specific repro — this is a code-reading finding, not yet confirmed against a
+live garbled-log capture.
+
+### The race
+
+`console::emit` (the single chokepoint every `print`/`safe_print!`/`tprint!`
+call funnels through) does:
+
+```rust
+fn emit(bytes: &[u8]) {
+    crate::irq::with_irqs_disabled(|| {
+        for &b in bytes {
+            UART.write(b);
+        }
+    });
+}
+```
+
+`with_irqs_disabled` only masks IRQs on the **current core** — it is not a
+lock. Under `smp-shared` (real multi-core, the default since 2026-08-10), two
+threads on two different cores can both be inside `emit()`'s loop at the same
+time, each writing to the same PL011 data register
+(`akuma_exec::mmu::DEV_UART_VA`) with nothing serializing the two byte
+streams. The result would be byte-level interleaving of otherwise-unrelated
+log lines from different cores — exactly the kind of garbled console output
+that's easy to misattribute to something else (a formatting bug, a corrupted
+string) rather than a genuine missing cross-core lock.
+
+### Why this wasn't caught earlier
+
+Single-core builds (and the old multikernel build, which routed secondary
+output through a per-core ring drained serially by the BSP — see the removed
+`smp::console_emit`/`console::print_bytes`, docs/archive/TRIM_FAT_MULTIKERNEL.md)
+never had two cores hitting the same `UART.write` concurrently. `smp-shared`
+becoming the default is what opened this window.
+
+### Next step, if picked up
+
+Wrap the loop body in `emit()` with a small spinlock (cheap: console output
+is not a hot path) so the whole per-call byte sequence is atomic across
+cores, not just IRQ-safe on one. Confirm with a `SMP=4` boot under concurrent
+load (e.g. the fork-hammer / BitTorrent-swarm regimens already used for other
+SMP races) and grep the log for any line that doesn't parse as one coherent
+message.
+
+## Issue 4: `/proc/cores` is unreadable — `read_at` never forwards it to `read_file`
+
+**Status: OPEN.** Found 2026-08-10 while boot-verifying the multikernel removal
+(docs/archive/TRIM_FAT_MULTIKERNEL.md) against an isolated devbox-smoltcp copy.
+Pre-existing — confirmed via `git show HEAD:src/vfs/proc.rs` that the bug
+predates this session's changes; not a regression from the removal.
+
+### Symptom
+
+```
+$ cat /proc/cores
+cat: read error: No such file or directory
+```
+
+`/proc/boxes` and `/proc/net/*` read fine on the same image; only `/proc/cores`
+fails.
+
+### Root cause
+
+`ProcFilesystem::read_at` (`src/vfs/proc.rs`) hardcodes which virtual paths get
+forwarded to `read_file` (the function that actually knows how to render
+`cores`, `boxes`, `net/tcp`, etc.):
+
+```rust
+if path == "boxes" || path.starts_with("net/") || path == "sysvipc/msg" {
+    let data = self.read_file(path)?;
+    ...
+}
+```
+
+`"cores"` was never in that list, so a `read()` on the fd falls through to the
+rest of `read_at` and ultimately `Err(FsError::NotFound)` — even though
+`read_file` has a working `if path == "cores"` branch, and `metadata`/
+`list_dir` both know the file exists (`src/vfs/proc.rs:250,694,771`). `open()`
++ `stat()` succeed; only the actual `read()` 404s, matching busybox's "read
+error" (as opposed to "can't open") phrasing.
+
+### Next step, if picked up
+
+One-line fix: add `|| path == "cores"` to the `read_at` whitelist above.
+
+More broadly: this is a class of bug — a virtual path known to `read_file`/
+`metadata`/`list_dir` but missing from `read_at`'s separate whitelist — that
+could recur any time a new `/proc/*` virtual file is added without updating
+all four spots in lockstep. Worth a dedicated audit later: enumerate every
+path `read_file` (and `metadata`) recognizes and confirm each one is also
+reachable through `read_at`, rather than relying on catching each gap by hand
+like this one.
+
 ## Background
 
 - `docs/archive/GIT_MISSING_SYSCALLS.md` — Issues 11-14, the CLONE_THREAD /
@@ -233,3 +331,5 @@ the moment of entry into the critical section.
   (the `[BKL] stuck` print site, confirms `owner=`/`waiter=` are core IDs).
 - `src/syscall/term.rs` — the blocking-stdin-read-with-timeout loop where the
   watchdog pinpointed the stall (line 432).
+- `src/console.rs` — Issue 3's `emit()` chokepoint (no cross-core lock around
+  the UART MMIO write loop).

@@ -167,11 +167,6 @@ impl ProcFilesystem {
             FileDescriptor::Stderr => String::from("/dev/stderr"),
             FileDescriptor::ChildStdout(child_pid) => format!("pipe:[child:{child_pid}]"),
             FileDescriptor::PidFd(id) => format!("anon_inode:[pidfd:{id}]"),
-            // Multikernel: a Proxy'd file/socket living on the owner core (§8.1).
-            FileDescriptor::RemoteFd { owner, handle, kind } => match kind {
-                akuma_exec::process::RemoteKind::Vfs => format!("remote-file:[core{owner}:{handle}]"),
-                akuma_exec::process::RemoteKind::Socket => format!("socket:[remote:core{owner}:{handle}]"),
-            },
         }
     }
 }
@@ -520,32 +515,15 @@ impl Filesystem for ProcFilesystem {
             return Ok(out.into_bytes());
         }
 
-        // /proc/cores — one row per CPU with its multikernel lifecycle state, so an init
-        // system (herd, on the BSP) can discover PARKED cores and activate them via the
-        // core_init syscall. Machine-global (the BSP owns VFS + the shared descriptor); a
-        // process pinned to a secondary reads it via forwarded openat/read, seeing the same
-        // table. Host context only.
+        // /proc/cores — kept for herd's benefit: it used to list per-core lifecycle state
+        // under the removed one-kernel-per-core multikernel
+        // (docs/archive/TRIM_FAT_MULTIKERNEL.md). Every core now runs the same shared
+        // kernel, so this is a static single-row table.
         if path == "cores" {
             if current_box_id != 0 {
                 return Err(FsError::NotFound);
             }
-            // Build the small fixed table straight into the byte buffer — every field is
-            // a static string or a single digit (core_count <= MAX_CORES = 8), so no
-            // String/format! churn, just the one Vec the FS trait returns.
-            let mut out: Vec<u8> = Vec::with_capacity(160);
-            out.extend_from_slice(b"core state role\n");
-            #[cfg(kernel_smp)]
-            for idx in 0..crate::smp::core_count() {
-                out.push(b'0' + (idx as u8)); // single digit: idx < MAX_CORES (8)
-                out.push(b' ');
-                out.extend_from_slice(crate::smp::core_state_str(idx).as_bytes());
-                out.push(b' ');
-                out.extend_from_slice(if crate::smp::is_bsp(idx) { b"bsp" } else { b"-" });
-                out.push(b'\n');
-            }
-            #[cfg(not(kernel_smp))]
-            out.extend_from_slice(b"0 online bsp\n");
-            return Ok(out);
+            return Ok(b"core state role\n0 online bsp\n".to_vec());
         }
 
         if path == "net/tcp" {

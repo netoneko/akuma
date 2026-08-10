@@ -2814,8 +2814,8 @@ pub fn set_sgi_debug(enable: bool) {
 /// Mark the next scheduler SGI on THIS core as a VOLUNTARY switch, so `schedule_indices`
 /// switches away even from a cooperative thread (the idle thread is cooperative and would
 /// otherwise be left running until its 100 ms timeout). Used by an IRQ-context cross-core
-/// wakeup — e.g. the multikernel forward-reply doorbell — that readies a thread while the
-/// cooperative idle thread is current and must preempt it now. Pair with a self-targeted
+/// wakeup that readies a thread while the cooperative idle thread is current and must
+/// preempt it now. Pair with a self-targeted
 /// scheduler-SGI trigger.
 pub fn request_voluntary_reschedule() {
     voluntary_schedule_flag().store(true, Ordering::Release);

@@ -1,5 +1,9 @@
 # Multikernel Networking Experiment
 
+> **Note:** The multikernel (`smp`/`cfg(kernel_smp)`) has been removed as part of
+> a codebase trimming effort (see `docs/archive/TRIM_FAT_MULTIKERNEL.md`). This
+> document is kept for historical reference.
+
 Cross-core syscall forwarding under the one-kernel-per-core multikernel (see `MULTIKERNEL.md`,
 branch `smp-attempt-0`). A process pinned to a secondary core has no local VFS or network stack,
 so every VFS/socket syscall is *forwarded* to the BSP (core 0), which owns those capabilities.

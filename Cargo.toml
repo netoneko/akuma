@@ -9,7 +9,6 @@ default-members = [
     "crates/akuma-isolation",
     "crates/akuma-net",
     "crates/akuma-rump",
-    "crates/akuma-smp",
     "crates/akuma-terminal",
     "crates/akuma-vfs",
 ]
@@ -58,7 +57,7 @@ pointers_in_nomem_asm_block = "allow"
 dead_code = "deny"
 unused_imports = "deny"
 unused_variables = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_profile_extreme)', 'cfg(kernel_tests)', 'cfg(kernel_smp)', 'cfg(ext2_fs_cache)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_profile_extreme)', 'cfg(kernel_tests)', 'cfg(ext2_fs_cache)'] }
 
 [package]
 name = "akuma"
@@ -109,8 +108,8 @@ debug = true
 [features]
 default = [
     # Real (shared-kernel) SMP is the default since 2026-08-10 — this is *the* SMP.
-    # The multikernel (`smp`) is the experimental one-kernel-per-core alternative and
-    # is mutually exclusive with it, so building that needs --no-default-features.
+    # The multikernel (one-kernel-per-core) alternative was removed 2026-08-10 —
+    # see docs/archive/TRIM_FAT_MULTIKERNEL.md.
     "smp-shared",
     "smoltcp",
     "sound",
@@ -142,24 +141,14 @@ many-sessions = ["akuma-net/many-sessions"]
 # test suite (which requires default features smoltcp types etc.).
 rump-tests = []
 
-# Multikernel / one-kernel-per-core (docs/MULTIKERNEL.md). NOT in `default`: all
-# secondary-core bringup, the per-core descriptor, PSCI CPU_ON, the message bus
-# and forwarding stubs live behind `cfg(kernel_smp)`, which build.rs emits only
-# when this feature is set (via CARGO_FEATURE_SMP). Paired with the `release-smp`
-# profile by scripts/build_smp.sh. With it off, the default build is byte-for-byte
-# single-core. Pulls in the pure, host-testable coordination crate `akuma-smp`
-# (descriptor, lock-free MPSC inbox, memory-reclaim protocol) only under this
-# feature, so the default build never even compiles it.
-smp = ["dep:akuma-smp"]
-
 # Real (shared-kernel) SMP / classic symmetric multiprocessing. NOT in `default`:
 # all shared-kernel secondary bringup + the shared scheduler/locking live behind
 # `cfg(kernel_smp_shared)`, which build.rs emits only when this feature is set (via
-# CARGO_FEATURE_SMP_SHARED). Built with plain `--release`. The
-# INVERSE of `smp`: instead of replicating per-core state, all cores share one
-# kernel image, one PMM/heap, and one run queue under real cross-core locks.
-# Mutually exclusive with `smp` (build.rs enforces). See
-# docs/reference/subsystems/smp-shared.md and docs/archive/SMP_SHARED.md.
+# CARGO_FEATURE_SMP_SHARED). Built with plain `--release`. Every core shares one
+# kernel image, one PMM/heap, and one run queue under real cross-core locks. See
+# docs/reference/subsystems/smp-shared.md and docs/archive/SMP_SHARED.md. The
+# experimental one-kernel-per-core alternative (`smp`) was removed 2026-08-10 —
+# docs/archive/TRIM_FAT_MULTIKERNEL.md.
 # Includes `no-bkl-network` (BKL-free native net syscalls) by default since
 # 2026-07-24: validated at SMP=4 under a real BitTorrent swarm + ssh hammer
 # (0 wedges, 0 corruption) after the socket-refcount / wait_until / pipe-SIGPIPE
@@ -428,9 +417,6 @@ akuma-exec = { path = "crates/akuma-exec" }
 # `rump` feature needs it directly (akuma-net already pulls it for rump_tap).
 akuma-rump = { path = "crates/akuma-rump", optional = true }
 akuma-isolation = { path = "crates/akuma-isolation" }
-# Pure, host-testable multikernel coordination (descriptor, MPSC ring, reclaim
-# protocol). Optional — only the `smp` feature pulls it in (cfg(kernel_smp) code).
-akuma-smp = { path = "crates/akuma-smp", optional = true }
 talc = "4"
 spinning_top = "0.3"
 fdt = "0.1"

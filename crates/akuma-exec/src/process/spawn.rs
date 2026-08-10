@@ -174,11 +174,8 @@ pub fn spawn_process_with_channel_ext(
     // had nothing to kill and panicked the whole kernel (EC=0x3c BRK). On the
     // size profile we now always use the path loader and re-stat if needed,
     // never slurp.
-    // A multikernel secondary forwards file reads to the owner; force the whole-file path
-    // (one forwarded fetch) instead of demand-paging, which would need per-page forwarded
-    // read_at + an inode-keyed file-page cache the secondary never set up.
-    let want_demand_paged = !config().prefer_whole_file_load
-        && (HEAP_SLURP_MAX == 0 || matches!(stat_size, Some(sz) if sz > HEAP_SLURP_MAX));
+    let want_demand_paged =
+        HEAP_SLURP_MAX == 0 || matches!(stat_size, Some(sz) if sz > HEAP_SLURP_MAX);
 
     let mut process = if want_demand_paged {
         // The path loader needs a size; re-stat if the first stat failed rather
@@ -393,95 +390,6 @@ pub fn spawn_process_with_channel_ext(
     Ok((thread_id, channel, pid))
 }
 
-/// Spawn a process from an **in-memory** ELF image as a minimal local process (no VFS
-/// read, no box/namespace, no stdin) on its own user thread. Returns `(thread_id, pid)`.
-///
-/// This is the normal spawn path expressed for a caller that already has the ELF bytes in
-/// memory — used by the multikernel to launch a **pinned process on a secondary core**
-/// (docs/MULTIKERNEL.md §10, acceptance/12): the secondary fetches the binary via forwarded
-/// `open`/`read` to the VFS owner, then spawns it HERE with these bytes. The process runs on
-/// THIS kernel's scheduler and is reaped normally (registered in `THREAD_PID_MAP`).
-///
-/// The per-core kernel-window overlay (so the process's syscalls resolve kernel statics to
-/// this core's private `.data`/`.bss`) is NOT special-cased here: it rides the standard
-/// `runtime().prepare_user_address_space` hook that `UserAddressSpace::new()` invokes inside
-/// `Process::from_elf`, which a secondary sets when it initializes its runtime. So this is
-/// the SAME loader the BSP uses — the per-core-ness lives entirely in that hook + page tables.
-pub fn spawn_process_from_image(name: &str, elf_data: &[u8]) -> Result<(usize, Pid), String> {
-    spawn_process_from_image_with_args(name, &[name.to_string()], elf_data)
-}
-
-/// Like [`spawn_process_from_image`] but with an explicit `argv` (the pinned-process path
-/// on a multikernel secondary, where the command line — program + args — arrives in the
-/// `core_init` activation message and the ELF is fetched over forwarded VFS; §10 Part B).
-/// `argv[0]` is conventionally the program name. The process's `ProcessInfo.args` is set so
-/// userspace sees its arguments (e.g. `curl -sS https://ifconfig.me`).
-pub fn spawn_process_from_image_with_args(name: &str, argv: &[String], elf_data: &[u8]) -> Result<(usize, Pid), String> {
-    // LifecycleGuard acquired at the publish point below (mirrors
-    // `spawn_process_with_channel_ext` — the load phase needs no guard).
-    if crate::threading::user_threads_available() == 0 {
-        return Err("No available user threads for image execution".into());
-    }
-    if (runtime().is_memory_low)() {
-        return Err("Kernel memory low, cannot spawn image".into());
-    }
-
-    let full_args: Vec<String> = if argv.is_empty() {
-        alloc::vec![name.to_string()]
-    } else {
-        argv.to_vec()
-    };
-    let full_env: Vec<String> = DEFAULT_ENV.iter().map(|s| String::from(*s)).collect();
-
-    let mut process = Process::from_elf(name, &full_args, &full_env, elf_data, None)
-        .map_err(|e| format!("Failed to load in-memory ELF for {name}: {e}"))?;
-
-    // Fresh channel so the exit/IO codepaths stay on their normal path (they expect Some);
-    // a piped (non-terminal) stdout. On a secondary the process's tty output is also routed
-    // to the per-core console ring by the write syscall (§8.2), so it reaches the UART even
-    // though no parent drains this channel.
-    let channel = Arc::new(ProcessChannel::new());
-    channel.set_terminal(false);
-    process.channel = Some(channel.clone());
-    // ProcessInfo args = the arguments after argv[0] (empty for a bare spawn).
-    process.args = full_args.get(1..).map(<[String]>::to_vec).unwrap_or_default();
-    process.spawner_pid = read_current_pid();
-
-    let pid = process.pid;
-    let boxed_process =
-        Box::try_new(process).map_err(|_| format!("Failed to allocate Process struct for {name}"))?;
-    // Publish window — see `spawn_process_with_channel_ext`.
-    let _lifecycle = LifecycleGuard::acquire();
-    register_process(pid, boxed_process);
-    register_channel(0, channel);
-
-    let thread_id = crate::threading::spawn_user_thread_fn_for_process(move || {
-        let tid = crate::threading::current_thread_id();
-        if let Some(ch) = crate::process::table::with_process(pid, |p| {
-            p.thread_id = Some(tid);
-            p.channel.as_ref().unwrap().clone()
-        }) {
-            // Register in THREAD_PID_MAP so the thread-cleanup path reaps the process
-            // normally (not a leaked zombie).
-            crate::runtime::with_irqs_disabled(|| {
-                crate::process::table::THREAD_PID_MAP.lock().insert(tid, pid);
-            });
-            remove_channel(0);
-            register_channel(tid, ch);
-            run_registered_process(pid);
-        } else {
-            // Mark terminated BEFORE parking so the scheduler switches away permanently
-            // (reconciling the BKL) rather than busy-spinning in `yield_now` holding the
-            // Big Kernel Lock forever — a peer-freezing wedge under shared-kernel SMP.
-            crate::threading::mark_current_terminated();
-            loop { crate::threading::yield_now(); }
-        }
-    })
-    .map_err(|e| format!("Failed to spawn thread for {name}: {e}"))?;
-
-    let _ = crate::process::table::with_process(pid, |p| p.thread_id = Some(thread_id));
-    Ok((thread_id, pid))
-}
 
 /// Execute a process that is already registered in the PROCESS_TABLE
 pub(crate) fn run_registered_process(pid: Pid) -> ! {

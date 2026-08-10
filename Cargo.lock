@@ -11,7 +11,6 @@ dependencies = [
  "akuma-isolation",
  "akuma-net",
  "akuma-rump",
- "akuma-smp",
  "akuma-terminal",
  "akuma-vfs",
  "arm_pl031",
@@ -68,10 +67,6 @@ dependencies = [
 
 [[package]]
 name = "akuma-rump"
-version = "0.1.0"
-
-[[package]]
-name = "akuma-smp"
 version = "0.1.0"
 
 [[package]]

@@ -63,8 +63,6 @@ pub fn ensure_test_runtime() {
         cow_ref_get: |_| 0,
         cow_fault_lock: |_| {},
         cow_fault_unlock: |_| {},
-        prepare_user_address_space: None,
-        remote_fd_close: None,
     };
     let cfg = ExecConfig {
         max_threads: 64,
@@ -92,7 +90,6 @@ pub fn ensure_test_runtime() {
         cow_fork_enabled: false,
         vfork_fastpath_enabled: false,
         pthread_kill_eintr_enabled: true,
-        prefer_whole_file_load: false,
     };
     register(rt, cfg);
 }

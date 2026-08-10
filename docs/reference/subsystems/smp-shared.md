@@ -2,24 +2,24 @@
 
 Classic symmetric multiprocessing: ONE shared kernel across all cores — one
 page-table set, one PMM/heap, one global run queue, real cross-core locking. Source:
-`src/smp_shared.rs`. Behind `cfg(kernel_smp_shared)` (the `smp-shared` feature, paired
-with the `release-smp-shared` profile); the default build compiles none of it.
+`src/smp_shared.rs`. Behind `cfg(kernel_smp_shared)` (the `smp-shared` feature).
+**In the default feature set since 2026-08-10** — a plain `cargo build --release`
+carries it.
 
 > **Stability: C (active development).** M0–M4 done as of 2026-07-19 (userspace runs +
 > migrates across cores; one open boot item, below). Progress log:
 > [`../../archive/SMP_SHARED.md`](../../archive/SMP_SHARED.md).
 
-This is the **inverse** of the multikernel ([`smp.md`](smp.md), `cfg(kernel_smp)`),
-which is share-nothing (one kernel per core, replicated `.data`/`.bss`, disjoint RAM
-partitions, syscall forwarding). Here nothing is replicated: a kernel `static` is
-genuinely shared cross-core. The two are **mutually exclusive** — `build.rs` panics if
-both features are set.
+One kernel `static` is genuinely shared cross-core — nothing is replicated per core.
+The one-kernel-per-core "multikernel" alternative (share-nothing, replicated
+`.data`/`.bss`, syscall forwarding) was removed 2026-08-10; see
+`docs/archive/TRIM_FAT_MULTIKERNEL.md`.
 
 ## Build & run
 
 ```bash
-cargo build --profile release-smp-shared --features smp-shared
-SMP=2 cargo run --profile release-smp-shared --features smp-shared   # -smp 2 in QEMU
+cargo build --release --features smp-shared   # already the default feature set
+SMP=2 cargo run --release   # -smp 2 in QEMU
 ```
 
 `SMP=N` (cargo_runner.sh) sets QEMU `-smp N`. The primary test image is
@@ -29,7 +29,6 @@ real SMP) — see `scripts/build_devbox_smoltcp.sh` and
 
 ## Design (approved roadmap)
 
-- **Coexist** with the multikernel (new feature, default build untouched).
 - **Big-Kernel-Lock first**, then fine-grained. The BKL upgrades the kernel's
   pervasive single-core invariant — `with_irqs_disabled` (IRQ masking) gives mutual
   exclusion only on one core; the worst offenders are the 218+
@@ -179,5 +178,4 @@ separately:
 ## Background
 
 - [`../../archive/SMP_SHARED.md`](../../archive/SMP_SHARED.md) — full progress log.
-- [`smp.md`](smp.md) — the multikernel (the other, share-nothing SMP model).
 - [`scheduler.md`](scheduler.md) — the base scheduler this extends.

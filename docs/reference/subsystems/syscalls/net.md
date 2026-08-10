@@ -144,12 +144,6 @@ function if you're auditing this path.
   AF_UNIX branches staying compiled in a no-smoltcp build, the rump
   handshake banner send fails and box 0's rump stack never comes up (see
   the doc comments at `net.rs:635` and `net.rs:922`).
-- **Multikernel (`kernel_smp`)**: on a secondary core, `Net` is `Proxy`'d to
-  core 0 — every socket syscall either forwards immediately
-  (`remote_socket_handle` + `crate::smp::fwd_*`) or, for `socket()` itself,
-  allocates a local `FileDescriptor::RemoteFd` wrapping the owner's handle.
-  `cloexec`/`nonblock` flags stay local to the calling core's fd table even
-  though the socket itself lives on core 0.
 
 ## Background
 

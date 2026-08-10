@@ -63,32 +63,15 @@ static UART: Uart = Uart::new(akuma_exec::mmu::DEV_UART_VA);
 // Public API - Safe wrappers around UART operations
 // ============================================================================
 
-/// Single console output chokepoint. On a secondary core whose per-core console ring
-/// is set (multikernel §8.2) the bytes are appended to that ring (the UART is not
-/// mapped in the secondary's restricted table; the BSP drains the ring to the UART);
-/// otherwise — the BSP, or any pre-bringup path — they go straight to the UART. IRQs
-/// are disabled across the UART path so a timer preemption can't interleave two
-/// threads' output mid-message.
+/// Single console output chokepoint. IRQs are disabled across the UART path so a
+/// timer preemption can't interleave two threads' output mid-message.
 #[inline]
 fn emit(bytes: &[u8]) {
-    #[cfg(kernel_smp)]
-    if crate::smp::console_emit(bytes) {
-        return;
-    }
     crate::irq::with_irqs_disabled(|| {
         for &b in bytes {
             UART.write(b);
         }
     });
-}
-
-/// Write raw bytes to the console. Used by the multikernel console drainer to forward
-/// a secondary's ring contents, which may not be valid UTF-8 across a chunk boundary.
-/// (Only the `smp` build has a caller; gated so the default build doesn't see it as
-/// dead code.)
-#[cfg(kernel_smp)]
-pub fn print_bytes(bytes: &[u8]) {
-    emit(bytes);
 }
 
 /// Print a string to the console.

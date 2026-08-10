@@ -17,8 +17,7 @@ Internals of the NetBSD rump TCP/IP stack as it runs inside Akuma: one real
 NetBSD kernel, running as a userspace process, that other Akuma processes
 share over a kernel-mediated remote-syscall protocol ("sysproxy"). For how a
 box picks a stack and how packets flow at the box-routing level, see
-[`networking.md`](networking.md). For running an independent rump instance
-per CPU core, see [`smp.md`](smp.md) "Local-NIC exception".
+[`networking.md`](networking.md).
 
 ## Components
 
@@ -184,36 +183,6 @@ local IPC (never networking), so it always runs natively even on a rump box
 — required for Rust's `std::process::Command`, which uses a socketpair as
 its exec-status channel for every subprocess spawn.
 
-## The multikernel / per-core variant
-
-Under the `smp` feature (`SMP >= 3`, `CORE2_NIC=1`), a secondary CPU core can
-run its **own** rump instance on its **own** dedicated NIC
-(`RUMP_NIC_CORE = 2`, `secondary_init_local_nic`, `smp.rs:2666`) instead of
-forwarding socket syscalls to core 0 — a self-contained per-core NetBSD
-stack with no BSP dependency. All the sysproxy/fiber machinery above is
-reused unchanged (per-core replicated kernel state, own `RUMP_BOXES`); the
-only new piece is mapping a second virtio-net device into the secondary's
-isolated address space. Verdict from the experiment that built it: **native
-smoltcp is still faster per-syscall** (in-process call vs. a proxy
-round-trip), but rump-local closed the gap from ~10× to ~1.5× native on real
-HTTPS workloads once the secondary's scheduler tick was tightened to 1 ms.
-
-> **Caveat (2026-07-19): treat that ~1.5× figure with suspicion.** It came from
-> the `smp` build, which has smoltcp compiled *in* and had a documented
-> `stack=rump`→native-smoltcp **fall-through bug** (later hardened so a rump box
-> can never fall through to native — see `archive/MULTIKERNEL_NETWORKING_EXPERIMENT.md`).
-> A measurement taken before/around that fix could be smoltcp wearing a rump label.
-> The clean, uncontaminated number
-> is the **single-core devbox A/B above** (rump-only, smoltcp compiled out, no
-> fall-through possible): **~8.7× on HTTP, ~6× on HTTPS**. Don't cite the
-> multikernel ~1.5× as the rump tax; the devbox A/B is ground truth.
-
-See [`smp.md`](smp.md) and `archive/MULTIKERNEL_NETWORKING_EXPERIMENT.md`
-for the full latency investigation (event-driven pipe wakeup, the
-`copy_to_user` lazy-page truncation bug, RX-DMA truncation on replicated
-`.bss`) — none of that is rump-specific rework, all of it fed back into the
-shared `rump_proxy.rs`/`sysproxy.rs` code paths this doc describes.
-
 ## Known limitations (current)
 
 - **No supervised restart.** `restart = false` on every `stack=rump` herd
@@ -360,5 +329,6 @@ Kernel side: `rump` feature (in `default`, so a normal `cargo build
   implemented; see "The alternative: `stack=rump` herd box" above).
 - `archive/OPTIONAL_SMOLTCP.md` — making rump the *only* stack for the
   devbox (compiling smoltcp out entirely).
-- `archive/MULTIKERNEL_NETWORKING_EXPERIMENT.md` — the per-core rump variant
-  and its latency investigation (see "The multikernel / per-core variant").
+- `archive/MULTIKERNEL_NETWORKING_EXPERIMENT.md` — the removed per-core rump
+  variant (one secondary core running its own NetBSD stack on a dedicated
+  NIC) and its latency investigation; not part of the current design.

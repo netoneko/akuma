@@ -1,5 +1,9 @@
 # Akuma Multikernel — One Kernel Per Core
 
+> **Note:** The multikernel (`smp`/`cfg(kernel_smp)`) has been removed as part of
+> a codebase trimming effort (see `docs/archive/TRIM_FAT_MULTIKERNEL.md`). This
+> document is kept for historical reference.
+
 **Status:** In progress (2026-07-01), all behind `cfg(kernel_smp)`; the default build is
 untouched. **Headline: the FULL §10 acceptance demo (acceptance/12) runs, both non-interactive AND
 interactive.** Phase 1: `curl https://ifconfig.me` PINNED to secondary core 1 printed its real

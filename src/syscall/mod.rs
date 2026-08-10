@@ -292,10 +292,9 @@ pub mod nr {
     /// completion. Mirrors the in-kernel sshd's `close_process_stdin` on
     /// CHANNEL_EOF; only the spawner may close its child's stdin.
     pub const CLOSE_CHILD_STDIN: u64 = 326;
-    /// Multikernel: activate a parked secondary core (docs/MULTIKERNEL.md R4b lifecycle).
-    /// arg0 = target core index. BSP-served: validates the core, `CPU_ON`s it if it had
-    /// self-shut-down, and sends `MSG_CORE_INIT`. Lets an init system (herd) bring cores
-    /// up from userspace. Returns 0 / -ENODEV / -errno. Only meaningful under `smp`.
+    /// Activated a parked secondary core in the removed one-kernel-per-core multikernel
+    /// (docs/archive/TRIM_FAT_MULTIKERNEL.md). herd still calls this to try pinning a
+    /// service to a secondary core; the kernel side is now a permanent ENOSYS stub.
     pub const CORE_INIT: u64 = 327;
     pub const GETPID: u64 = 172;
     pub const GETPPID: u64 = 173;
@@ -983,11 +982,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
                 let mut kernel_mask = alloc::vec![0u8; cpusetsize];
                 // CPUs the process may run on. On the real shared-kernel SMP
                 // build that is the DTB-reported core count (BSP + secondaries,
-                // all online after `bringup_secondaries`); single-core and
-                // multikernel builds report 1, since a multikernel core runs
-                // only its own kernel. The old code hardcoded `1`, so
-                // `busybox nproc` and cargo's `num_cpus` always saw one CPU and
-                // `cargo build` defaulted to `-j1` even on an SMP=2+ kernel.
+                // all online after `bringup_secondaries`); single-core builds
+                // report 1. The old code hardcoded `1`, so `busybox nproc` and
+                // cargo's `num_cpus` always saw one CPU and `cargo build`
+                // defaulted to `-j1` even on an SMP=2+ kernel.
                 #[cfg(kernel_smp_shared)]
                 let nr_cpus: usize = crate::smp_shared::probed_core_count();
                 #[cfg(not(kernel_smp_shared))]

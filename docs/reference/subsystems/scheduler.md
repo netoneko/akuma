@@ -11,7 +11,7 @@ switch, synchronization primitives, and blocking.
 > do slow I/O inside a preemption-disabled closure** — that is the single most
 > common cause of hangs (see `../../runbooks/debug-network.md`).
 
-For SMP/multikernel (one-kernel-per-core), see [`smp.md`](smp.md).
+For real (shared-kernel) SMP, see [`smp-shared.md`](smp-shared.md).
 
 ## Threading model
 
@@ -264,16 +264,16 @@ Regression test: `park_wake_race_tests`
   (`set_network_thread_id`, called by `run_async_main`), not slot 0.
   Historical bug: boost was hardcoded to slot 0 (idle) → SSH staggering.
 
-## SMP / multikernel
+## Real (shared-kernel) SMP
 
-One kernel **per core** (not SMP sharing), behind `cfg(kernel_smp)`. Now has
-its own full doc: see [`smp.md`](smp.md) for boot/activation, the message
-bus, per-core isolation, syscall forwarding, config knobs, and constraints.
+One shared kernel across all cores under real cross-core locks — see
+[`smp-shared.md`](smp-shared.md) for bring-up, the shared run queue, and the
+BKL carve-outs.
 
 ## Background
 
 - `archive/MULTITASKING.md`, `archive/CONCURRENCY.md`, `archive/LOCK_REFERENCE.md`.
 - `archive/WAIT_QUEUES.md`, `archive/SYSCALL_BLOCKING.md`.
 - `archive/CONTEXT_SWITCH_FIX_2026.md`, `archive/TTBR0_AND_THREADING_FIXES.md`.
-- `archive/MULTIKERNEL.md` (29 commits — the SMP design; see [`smp.md`](smp.md)
-  for the current-state doc).
+- `archive/MULTIKERNEL.md` — the removed one-kernel-per-core design (29
+  commits); see `archive/TRIM_FAT_MULTIKERNEL.md` for the removal.

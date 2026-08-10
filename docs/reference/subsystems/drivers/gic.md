@@ -95,22 +95,16 @@ different stack pointer for a context switch; every other registered IRQ
 is EOI'd by the wrapper. For what the scheduler does once it gets the SGI, see
 [`../scheduler.md`](../scheduler.md).
 
-On a **secondary** core (`smp` feature), `register_handler` cannot be used for
-per-PE interrupts — it pokes core 0's hardcoded redistributor frame, which
-isn't even mapped on a secondary. `register_handler_no_gic` (`irq.rs:106-112`)
-registers the dispatch-table entry only; the secondary enables its own
-SGI/PPI directly in its own redistributor via `secondary_gic_init`
-(`src/smp.rs`).
-
-## Multikernel doorbell
+## Cross-core doorbell (shared-kernel SMP)
 
 `trigger_sgi_core(target_aff0, sgi_id)` (`gic_v3.rs:243-253`,
-`cfg(kernel_smp)` only) targets one specific core by affinity-0
+`cfg(kernel_smp_shared)` only) targets one specific core by affinity-0
 (`MPIDR & 0xff`) via `ICC_SGI1R_EL1`'s 16-bit TargetList, instead of
-`trigger_sgi`'s hardcoded "this CPU" target list. It's the cross-core doorbell
-used to wake a parked or busy peer core; valid only for `aff0 < 16` (QEMU
-`virt`'s single affinity-1 cluster). See [`../scheduler.md`](../scheduler.md)
-"SMP / multikernel" for the one-kernel-per-core design this doorbell serves.
+`trigger_sgi`'s hardcoded "this CPU" target list. `trigger_sgi_self`
+(self-targeted, reading its own `MPIDR`) builds on it so the shared timer
+handler rings *this* core's scheduler SGI rather than always hitting PE0.
+Valid only for `aff0 < 16` (QEMU `virt`'s single affinity-1 cluster). See
+[`../smp-shared.md`](../smp-shared.md).
 
 ## Background
 
@@ -118,4 +112,3 @@ used to wake a parked or busy peer core; valid only for `aff0 < 16` (QEMU
   MMIO (root cause 1) and writeback MMIO addressing (root cause 4) are GIC-
   specific.
 - `archive/DEVICE_MMIO_VA_CONFLICT.md` — why GIC frames live under `L0[1]`.
-- `archive/MULTIKERNEL.md` — the SMP design `trigger_sgi_core` serves.

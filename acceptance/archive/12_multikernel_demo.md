@@ -1,5 +1,9 @@
 # Acceptance: Multikernel demo — userspace-driven core management
 
+> **Note:** The multikernel (`smp`/`cfg(kernel_smp)`) has been removed as part of
+> a codebase trimming effort (see `docs/archive/TRIM_FAT_MULTIKERNEL.md`). This
+> document is kept for historical reference.
+
 The one-kernel-per-core multikernel (`docs/MULTIKERNEL.md`), demonstrated end to end:
 secondary cores boot into a minimal **parked** state and are **activated from
 userspace** — by **herd**, not hardcoded in the kernel — and then host real work.

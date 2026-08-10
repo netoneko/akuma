@@ -16,7 +16,7 @@ churn. See [`../README.md`](../README.md).
 | Boot / MMU / DTB | [`subsystems/boot.md`](subsystems/boot.md) | B |
 | Memory (PMM, heap, COW) | [`subsystems/memory.md`](subsystems/memory.md) | **C** |
 | Scheduler / threads | [`subsystems/scheduler.md`](subsystems/scheduler.md) | A |
-| SMP / multikernel | [`subsystems/smp.md`](subsystems/smp.md) | **C** |
+| SMP (shared-kernel) | [`subsystems/smp-shared.md`](subsystems/smp-shared.md) | **C** |
 | Networking (box model, two stacks) | [`subsystems/networking.md`](subsystems/networking.md) | **C** |
 | Rump stack (sysproxy, fiber) | [`subsystems/rump-stack.md`](subsystems/rump-stack.md) | **C** |
 | SSH (built-in + userspace) | [`subsystems/ssh.md`](subsystems/ssh.md) | A |
