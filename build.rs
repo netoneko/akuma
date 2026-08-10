@@ -9,6 +9,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_irq)");
     println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
     println!("cargo::rustc-check-cfg=cfg(kernel_tests)");
+    println!("cargo::rustc-check-cfg=cfg(kernel_console_lock)");
 
     // Real (shared-kernel) SMP gate: ONE shared kernel — one set of statics, one
     // page-table set, one PMM/heap, one global run queue — across all cores under
@@ -118,6 +119,29 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BKL_PROFILE");
     if std::env::var("CARGO_FEATURE_BKL_PROFILE").is_ok() {
         println!("cargo:rustc-cfg=kernel_bkl_profile");
+    }
+
+    // Console cross-core serialization. Adds a `Spinlock<()>` + owner-core-ID
+    // reentrancy guard around `console::emit`'s UART write loop so that under
+    // `smp-shared` two cores cannot both be inside `emit()` at once and
+    // byte-interleave each other's lines at the shared PL011 data register.
+    // Verified safe under `SMP=4` + `cargo build -j4` self-host load on
+    // 2026-08-11 (see docs/archive/UART_SMP_INTERLEAVE_FIX.md).
+    //
+    // Default ON for the `release` profile (anything with OPT_LEVEL != "z").
+    // The size/extreme profiles are single-core targets where the lock is pure
+    // overhead, so they stay off unless `CONSOLE_LOCK=1` forces it on for an
+    // opt-in test. `CONSOLE_LOCK=0` is an explicit opt-out for `release`.
+    println!("cargo:rerun-if-env-changed=CONSOLE_LOCK");
+    let size_opt_for_console = std::env::var("OPT_LEVEL").as_deref() == Ok("z");
+    let console_lock_default_on = !size_opt_for_console;
+    let console_lock = match std::env::var("CONSOLE_LOCK").as_deref() {
+        Ok("0") => false,                       // explicit opt-out
+        Ok("1") => true,                        // explicit opt-in (size/extreme)
+        _      => console_lock_default_on,      // release default-on
+    };
+    if console_lock {
+        println!("cargo:rustc-cfg=kernel_console_lock");
     }
 
     // Boot self-test suite present. Mirrors the `not(any(feature = "no-tests",

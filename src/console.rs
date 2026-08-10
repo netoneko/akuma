@@ -1,6 +1,10 @@
 use crate::alloc::string::ToString;
 use alloc::vec::Vec;
 use core::fmt::Write;
+#[cfg(kernel_console_lock)]
+use core::sync::atomic::{AtomicU8, Ordering};
+#[cfg(kernel_console_lock)]
+use spinning_top::Spinlock;
 
 // ============================================================================
 // UART Driver - Encapsulates all MMIO access
@@ -60,14 +64,59 @@ impl Uart {
 static UART: Uart = Uart::new(akuma_exec::mmu::DEV_UART_VA);
 
 // ============================================================================
+// Cross-core serialization (opt-in via `CONSOLE_LOCK=1`)
+// ============================================================================
+//
+// `with_irqs_disabled` alone only masks IRQs on the *calling* core, so under
+// `smp-shared` (real multi-core, the default) two cores can both be inside
+// `emit()`'s byte loop at once and byte-interleave each other's lines at the
+// shared PL011 data register. When `kernel_console_lock` is set (build.rs:
+// `CONSOLE_LOCK=1`), a `Spinlock` + owner-core-ID reentrancy guard serializes
+// the loop across cores. The reentrancy guard is what keeps the panic handler
+// (`src/main.rs:127`) and sync-exception paths in `src/exceptions.rs` safe:
+// if a panic/fault lands while *this* core already holds the lock, the owner
+// check short-circuits the acquire instead of self-deadlocking. Background:
+// docs/archive/UART_SMP_INTERLEAVE_FIX.md.
+#[cfg(kernel_console_lock)]
+static CONSOLE_LOCK: Spinlock<()> = Spinlock::new(());
+/// `current_core_id() + 1` of the lock holder, or 0 if free. Per-core
+/// reentrancy guard for the panic / sync-exception path.
+#[cfg(kernel_console_lock)]
+static CONSOLE_OWNER: AtomicU8 = AtomicU8::new(0);
+
+// ============================================================================
 // Public API - Safe wrappers around UART operations
 // ============================================================================
 
 /// Single console output chokepoint. IRQs are disabled across the UART path so a
-/// timer preemption can't interleave two threads' output mid-message.
+/// timer preemption can't interleave two threads' output mid-message. Under
+/// `kernel_console_lock` (opt-in), a cross-core spinlock additionally
+/// serializes the whole byte sequence so two cores can't interleave at the
+/// shared PL011 register.
 #[inline]
 fn emit(bytes: &[u8]) {
     crate::irq::with_irqs_disabled(|| {
+        #[cfg(kernel_console_lock)]
+        {
+            let me = akuma_exec::bkl::current_core_id() as u8 + 1;
+            if CONSOLE_OWNER.load(Ordering::Relaxed) == me {
+                // Reentrant fast path: panic / sync-exception inside an
+                // `emit()` this core already owns. Write directly, do not
+                // re-acquire (Spinlock is not reentrant).
+                for &b in bytes {
+                    UART.write(b);
+                }
+                return;
+            }
+            let _g = CONSOLE_LOCK.lock();
+            CONSOLE_OWNER.store(me, Ordering::Relaxed);
+            for &b in bytes {
+                UART.write(b);
+            }
+            CONSOLE_OWNER.store(0, Ordering::Relaxed);
+            drop(_g);
+        }
+        #[cfg(not(kernel_console_lock))]
         for &b in bytes {
             UART.write(b);
         }

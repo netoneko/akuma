@@ -109,6 +109,7 @@ each is a byte-for-byte no-op on any build that doesn't set both. See
 | `no-bkl-vfs` | `kernel_no_bkl_vfs` | **yes** (since 2026-07-25) | fs syscalls run BKL-free on the ext2/block-cache/fd-table spinlocks. |
 | `no-bkl-process` | `kernel_no_bkl_process` | **yes** (since 2026-07-31) | `fork_process`'s CoW page-copy window runs BKL-free on the address space's `as_lock`, held in 64-page IRQ-masked chunks. Also emitted by `crates/akuma-exec/build.rs` (the only carve-out whose guard is constructed outside the bin crate). |
 | `bkl-profile` | `kernel_bkl_profile` | **no — measurement only** | Per-tag BKL-hold profiler + periodic `[BKLPROF]` histogram. Perturbs timing; never ship it. |
+| `CONSOLE_LOCK` (env) | `kernel_console_lock` | **default-on in `release`; off in size/extreme** | Cross-core spinlock + owner-core-ID reentrancy guard around `console::emit`'s UART write loop, so two cores under `smp-shared` can't byte-interleave each other's lines at the shared PL011 register. Default-on for the `release` profile (OPT_LEVEL != "z") since 2026-08-11 after SMP=4 verification; off in size/extreme (single-core targets, lock is pure overhead). `CONSOLE_LOCK=0` opt-out (debug), `CONSOLE_LOCK=1` force-on in size/extreme (test). Background: `docs/archive/UART_SMP_INTERLEAVE_FIX.md`. |
 
 Each carve-out also has a **runtime** toggle (default on) for same-binary A/B and
 as a kill switch — `vfs_bkl_drop_enabled()`, `exec_bkl_drop_enabled()`,

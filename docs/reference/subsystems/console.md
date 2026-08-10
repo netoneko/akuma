@@ -20,12 +20,16 @@ which writes the UART directly with IRQs disabled on the current core
 (`irq::with_irqs_disabled`) so a timer preemption can't interleave two
 *threads on the same core's* output mid-message.
 
-> **Known gap (2026-08-10):** `with_irqs_disabled` only masks IRQs on the
-> calling core — it is not a cross-core lock. Under `smp-shared` (the
-> default), two threads on two different cores can both be inside `emit()`'s
-> write loop at once, with nothing serializing their byte streams at the
-> shared PL011 register. See `docs/archive/DEVBOX_ISSUES.md` Issue 3 for the
-> full writeup and the fix (a small spinlock around the loop body).
+> **Cross-core serialization (shipped 2026-08-11):** a `Spinlock<()>` +
+> owner-core-ID reentrancy guard around the loop body is **default-on in
+> `release`** (cfg `kernel_console_lock`, gated by `OPT_LEVEL != "z"` in
+> `build.rs`). With it on, the whole per-call byte sequence is atomic
+> across cores, and a panic / sync exception landing while this core
+> already holds the lock takes the reentrant fast path instead of
+> self-deadlocking. Off in size/extreme (single-core targets); opt out
+> in `release` with `CONSOLE_LOCK=0`, force-on in size with
+> `CONSOLE_LOCK=1`. Background and verification:
+> `docs/archive/UART_SMP_INTERLEAVE_FIX.md`.
 
 ## Formatting without heap allocation
 
