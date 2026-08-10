@@ -9,9 +9,42 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 541
-- **Docs contributing at least one fix:** 160
+- **Total distinct fixes counted:** 542
+- **Docs contributing at least one fix:** 161
 - **Subsystem categories:** 15
+
+Updated 2026-08-10 (branch `better-sshd-and-networking`, fourth entry): +1 fix
+/ +1 doc — `userspace/meow/docs/MLX_SERVER_TOOL_CALLS.md` (Userspace Apps &
+Libraries), from the `userspace/meow` submodule advancing `f032e8a` →
+`2641cd1` (commits `0a3b256`/`244479d`/`2641cd1`). The fix: `meow`'s streaming
+client recognized a completed tool call by a literal byte match,
+`json.contains("\"finish_reason\":\"tool_calls\"")`
+(`userspace/meow/src/api/client.rs:757`), which only matches ollama's compact
+JSON serializer. `mlx-server` (Python `json.dumps` defaults) emits the same
+field with a space after the colon, `"finish_reason": "tool_calls"`; the
+literal match never fired, so `meow -c` against an mlx-server-backed provider
+silently dropped every tool call and returned an empty response. Confirmed
+fixed by reading the landed diff directly, not by trusting the doc header —
+`accumulate_tool_call_delta` now calls a new whitespace-tolerant
+`json_field_is` helper, matched exactly against the root cause and reproduction
+steps the doc describes. The doc's own `**Status: OPEN.**` header is stale
+(never updated after the fix landed same-day); counted on code evidence, per
+this file's existing practice of trusting a verified diff over an unmaintained
+status line.
+Not counted from the same submodule range: `TRIM_FAT.md`'s four
+double-allocation findings (all implemented, `Status: FIXED`, but explicitly
+"no behavior change" — allocation-efficiency cleanup on a `no_std`/talc target,
+not a correctness defect; same standard already applied to
+`ALLOC_PRINT_AUDIT.md`'s excluded "NOT WARRANTED" conversions above). Also from
+this branch, in the parent repo: `docs/archive/DEVBOX_ISSUES.md`'s two new
+issues (an HTTPS `git clone` pipe deadlock and a BKL-stuck TUI wedge, both
+**Status: OPEN**, zero fixes), `userspace/sshd/docs/OPTIONAL_PARALLELISM.md`
+(a design note, "not a landed feature"), the further acceptance-suite trim in
+`docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md` (continues to be a
+refactor/reorg, not a bugfix, per this file's existing treatment of that doc
+above), and a one-line path-reference update in
+`userspace/herd/docs/CORE_AWARE_SCHEDULING.md` (`acceptance/12` →
+`acceptance/archive/12`, following the same trim — not a fix).
 
 Updated 2026-08-10 (branch `trim-fat-sshd`, third entry): +2 fixes / +0 docs —
 both in `docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md`, both latent defects
