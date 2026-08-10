@@ -1,15 +1,16 @@
 # The terminal-state preemption wedge: `poll_input_event` spinning with preemption off
 
-**Date:** 2026-08-11 (analysis), refined 2026-08-11 (follow-up, §9-§10).
-**Issue first observed:** 2026-08-10.
+**Date:** 2026-08-11 (analysis), refined 2026-08-11 (follow-up, §9-§10),
+implemented 2026-08-11 (§11). **Issue first observed:** 2026-08-10.
 **Kernel at capture:** devbox-smoltcp, `smp-shared` default feature set, `SMP=2`,
-no gdbstub. **Status:** MECHANISM ROOT-CAUSED (§9) — the code pattern that makes
-the wedge possible *and unbounded, regardless of who the holder is*, is now
-proven from the BKL/scheduler source, not just hypothesized. A fix is designed
-(§10) but **not yet implemented**. The specific holder that produced the
-94-second spin in the captured incident is still not identified — §9's finding
-is that identifying it was never necessary: the defect is in how the waiter
-waits, not in who it waits for.
+no gdbstub. **Status:** FIXED (§11) — the code pattern that made the wedge
+possible *and unbounded, regardless of who the holder is* is proven from the
+BKL/scheduler source (§9), and the fix (§10) is implemented and verified
+on-device. One piece is incomplete: the dedicated kernel regression test has
+its own bug and is currently disabled (§11). The specific holder that produced
+the 94-second spin in the captured incident was never identified and, per §9,
+never needed to be — the defect was in how the waiter waits, not in who it
+waits for.
 
 **One line:** the kernel's blocking stdin-read loop
 (`sys_poll_input_event` in `src/syscall/term.rs:405-437`, mirrored by

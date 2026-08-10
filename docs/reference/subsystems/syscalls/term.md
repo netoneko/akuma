@@ -66,10 +66,22 @@ input these consume.
 a waker, try to drain, park via `schedule_blocking`, clear the waker on the
 way out. Both block in the kernel under `smp-shared`.
 
-The **waker handshake** is the load-bearing part. It is built around two
-critical sections taken with **preemption disabled** (not IRQs masked),
-around the per-process `Arc<Spinlock<TerminalState>>` and its nested
-`input_waker: Spinlock<Option<Waker>>`:
+The **waker handshake** is the load-bearing part, built around the per-process
+`Arc<Spinlock<TerminalState>>` and its nested `input_waker: Spinlock<Option<Waker>>`.
+
+**Current state (fixed 2026-08-11):** every acquisition of `term_state_lock`
+on this path — in `sys_poll_input_event`, `sys_read`'s Stdin arm, and the
+writer sites (`write_to_process_stdin`/`close_process_stdin`) — goes through
+`akuma_exec::sync::lock_bounded`, which disables preemption for one
+non-blocking `try_lock` attempt at a time rather than across the whole wait.
+`sys_poll_input_event` additionally registers its waker once before the loop
+and clears it once on exit, instead of once per iteration. See
+[`archive/TERM_POLL_INPUT_PREEMPTION_FIX.md`](../../../archive/TERM_POLL_INPUT_PREEMPTION_FIX.md)
+§9-§11 for the mechanism and the fix. The diagram below depicts the **pre-fix**
+shape (kept for historical/hazard-explanation value — it is exactly the
+pattern gate 2 in [`locking.md`](../locking.md) still needs closed for a
+future BKL-free conversion of these syscalls, a separate, larger effort this
+fix does not attempt):
 
 ```mermaid
 sequenceDiagram
@@ -105,27 +117,27 @@ sequenceDiagram
     R->>R: enable_preemption()
 ```
 
-### Hazard: preemption-disabled spin on a contended inner lock
+### Hazard (fixed): preemption-disabled spin on a contended inner lock
 
-The two `disable_preemption()` → `term_state_lock.lock()` blocks are the
-fragile spots. `disable_preemption()` only raises this thread's per-thread
-preemption counter (`PREEMPTION_DISABLED`, `threading/mod.rs:1791`) — it does
-**not** mask IRQs and is **not** a cross-core lock. If the spinlock is
-contended when the reader reaches line 432 (post-wake cleanup), the reader
-spins with preemption disabled, and the preemption watchdog
-(`PREEMPTION_DISABLED_SINCE`) accumulates without bound.
-
-This is the precise site of the open `meow`-TUI wedge documented in
+**Historical** — describes the pre-fix code the diagram above depicts. The two
+`disable_preemption()` → `term_state_lock.lock()` blocks were the fragile
+spots: `disable_preemption()` only raises this thread's per-thread preemption
+counter (`PREEMPTION_DISABLED`, `threading/mod.rs:1791`) — it does **not**
+mask IRQs and is **not** a cross-core lock. If the spinlock was contended when
+the reader reached line 432 (post-wake cleanup), the reader spun with
+preemption disabled, and the preemption watchdog (`PREEMPTION_DISABLED_SINCE`)
+accumulated without bound — the open `meow`-TUI wedge documented in
 [`archive/DEVBOX_ISSUES.md`](../../../archive/DEVBOX_ISSUES.md) Issue 2
-(watchdog: `disabled at src/syscall/term.rs:432` for 94 s) and is the same
-non-compliance that [`locking.md`](../locking.md) § "The per-syscall BKL
-opt-out list" → gate 2 lists as **blocking the conversion of `read`'s Stdin
-arm** off the BKL: every `terminal_state`/`input_waker` site uses
-`disable_preemption()` rather than `with_irqs_disabled()`, so a nested IRQ's
-unconditional `enter_kernel()` can deadlock AB-BA against a peer holding the
-BKL and waiting on this lock. Full mechanism analysis (root-caused) and the
-decided fix plan (bound the spin with a per-attempt `try_lock`, restructure
-the waker handshake) live in
+(watchdog: `disabled at src/syscall/term.rs:432` for 94 s).
+
+Fixed by `lock_bounded` (above) — the preemption-disable is now scoped to one
+`try_lock` attempt, never the whole wait. **Not fixed**, and not attempted
+here: these sites still use `disable_preemption()` rather than IRQ-masking, so
+[`locking.md`](../locking.md) § "The per-syscall BKL opt-out list" → gate 2
+still lists `terminal_state`/`input_waker` as blocking a future BKL-free
+conversion of `read`'s Stdin arm (a nested IRQ's unconditional `enter_kernel()`
+could still deadlock AB-BA against a peer holding the BKL and waiting on this
+lock — a separate, larger effort). Full mechanism analysis and the fix live in
 [`archive/TERM_POLL_INPUT_PREEMPTION_FIX.md`](../../../archive/TERM_POLL_INPUT_PREEMPTION_FIX.md).
 
 `get_cpu_stats` (314) is dispatched from this file but is unrelated to
