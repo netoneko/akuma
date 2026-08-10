@@ -134,8 +134,9 @@ feature itself is ever worth removing.
 
 ## Actual results (implemented 2026-08-10)
 
-Landed on branch `better-sshd-and-networking`. Final diff against the
-pre-removal tree: **37 files changed, 78 insertions(+), 6,695 deletions(-)**
+Landed on branch `better-sshd-and-networking`, commit `ebfb73f` ("remove
+multikernel"). Final diff against the pre-removal tree: **37 files changed,
+78 insertions(+), 6,695 deletions(-)**
 (`git diff --stat` over `src/`, `crates/`, `build.rs`, `Cargo.toml`,
 `scripts/cargo_runner.sh`) — within a few percent of the ≈6,230-6,250
 estimate above; see `docs/archive/LINE_COUNT_ANALYSIS.md`'s matching
