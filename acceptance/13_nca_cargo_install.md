@@ -29,10 +29,16 @@ export AR_aarch64_unknown_linux_musl=aarch64-linux-musl-ar
 
 cargo install --git https://github.com/madebyaris/native-cli-ai.git \
     --target aarch64-unknown-linux-musl \
-    -p nca-cli --bin nca \
+    --bin nca \
     --no-default-features \
-    --root /tmp/nca_install
+    --root /tmp/nca_install \
+    nca-cli
 ```
+
+`nca-cli` is a bare positional argument here, not `-p`/`--package` — `cargo
+install` selects the workspace member to install that way (`-p` is a
+`cargo build`/`cargo run` flag; `cargo install` doesn't have it, since without
+`--path`/`--git` the positional already means "crate name").
 
 `--no-default-features` drops the `clipboard` feature (`arboard`/`image` —
 no display server over SSH anyway). Nothing else is touched: no vendored
@@ -40,12 +46,44 @@ source, no submodule, no Akuma-tuned `RUSTFLAGS` — just `cargo install`
 against the real upstream repo, cross-compiled. musl targets are statically
 linked by default, so the output binary needs no extra linker flags.
 
-### 2. Stage it onto the disk
+### 2. Stage the binary and its config onto the disk
 
 ```bash
 mkdir -p bootstrap/bin
 cp /tmp/nca_install/bin/nca bootstrap/bin/nca
 ```
+
+`bootstrap/root/.nca/config.toml` is already checked in — it lands at
+`/root/.nca/config.toml` on the disk (nca's global config path, read on
+every invocation since sshd logs in as root):
+
+```toml
+[provider]
+default = "custom"
+
+[provider.custom]
+compatibility = "openai"
+base_url = "http://10.0.2.2:8080"
+api_key = "mlx"
+model = "mlx-community/Qwen-AgentWorld-35B-A3B-oQ4"
+temperature = 0.7
+
+[provider.openai]
+base_url = "http://10.0.2.2:11434"
+api_key = "ollama"
+model = "qwen3:4b"
+temperature = 0.7
+```
+
+nca only ships four named providers (`minimax`/`anthropic`/`openai`/
+`openrouter`) plus exactly one `[provider.custom]` slot — no equivalent of
+meow's `[provider:mlx]` / `[provider:ollama]` sections, so mlx (the intended
+default) has to be the `custom` slot, and ollama piggybacks on the `openai`
+slot since its `/v1/chat/completions` endpoint is genuinely OpenAI-compatible.
+`default = "custom"` makes mlx the default without any env var; switching to
+ollama at runtime is just `NCA_DEFAULT_PROVIDER=openai nca ...` (no base
+URL/model/key overrides needed — those are already in the `[provider.openai]`
+table above).
 
 ### 3. Build the kernel + userspace and populate the disk
 
@@ -56,9 +94,11 @@ cd userspace && ./build.sh && cd ..
 ./scripts/populate_disk.sh
 ```
 
-`populate_disk.sh` copies everything under `bootstrap/bin/` verbatim, so
-`nca` needs no special-casing. `bootstrap/tmp/hello.c` lands at `/tmp/hello.c`
-the same way it does for the `meow` tests.
+`populate_disk.sh` (full run, no flags) copies the whole `bootstrap/` tree
+onto the disk verbatim, so `bootstrap/bin/nca` and
+`bootstrap/root/.nca/config.toml` need no special-casing.
+`bootstrap/tmp/hello.c` lands at `/tmp/hello.c` the same way it does for the
+`meow` tests.
 
 ### 4. Start the LLM backend(s) on the host
 
@@ -117,30 +157,26 @@ assert "nca" in out, f"nca missing from /bin: {out}"
 print(out)
 ```
 
-### 7. Point nca at Ollama and run its own health check
+### 7. Confirm the staged config is in effect (mlx, the default) and run nca's own health check
 
 ```python
-PROVIDER_ENV = (
-    "export NCA_DEFAULT_PROVIDER=openai "
-    "OPENAI_BASE_URL=http://10.0.2.2:11434 "
-    "OPENAI_API_KEY=ollama "
-    "OPENAI_MODEL=qwen3:4b && "
-)
+_, out, _ = ssh("cat /root/.nca/config.toml")
+assert 'default = "custom"' in out, f"config missing/wrong: {out}"
 
-rc, out, err = ssh(PROVIDER_ENV + "nca doctor", timeout=30)
+rc, out, err = ssh("nca doctor", timeout=30)
 print(f"rc={rc}\n{out}\n{err}")
 ```
 
-### 8. One-shot task — same proof shape as the meow tests
+### 8. One-shot task against mlx (the default — no env vars needed)
 
 ```python
-rc, out, err = ssh(
-    PROVIDER_ENV +
+TASK = (
     'nca -p "Compile /tmp/hello.c with tcc to /tmp/hello_c and run it. '
     'Report the output of the compiled binary." '
-    '--no-tui --permission-mode bypass-permissions --max-turns 5',
-    timeout=180
+    '--no-tui --permission-mode bypass-permissions --max-turns 5'
 )
+
+rc, out, err = ssh(TASK, timeout=180)
 print(f"rc={rc}\nout:\n{out}\nerr:\n{err}")
 ```
 
@@ -149,36 +185,26 @@ print(f"rc={rc}\nout:\n{out}\nerr:\n{err}")
 ```python
 assert "Hello" in out or "Hello" in err, \
     f"Expected 'Hello' in nca output, got:\n{out}\n{err}"
-print("PASS (ollama)")
+print("PASS (mlx, default)")
 ```
 
-### 10. Repeat against mlx (optional — proves the second backend too)
+### 10. Repeat against ollama (optional — proves the second backend too)
+
+Same task, just switching the provider for this one invocation via the env
+var — no config edits, no base-url/model/key overrides:
 
 ```python
-PROVIDER_ENV_MLX = (
-    "export NCA_DEFAULT_PROVIDER=openai "
-    "OPENAI_BASE_URL=http://10.0.2.2:8080 "
-    "OPENAI_API_KEY=mlx "
-    "OPENAI_MODEL=mlx-community/Qwen-AgentWorld-35B-A3B-oQ4 && "
-)
-
-rc, out, err = ssh(
-    PROVIDER_ENV_MLX +
-    'nca -p "Compile /tmp/hello.c with tcc to /tmp/hello_c and run it. '
-    'Report the output of the compiled binary." '
-    '--no-tui --permission-mode bypass-permissions --max-turns 5',
-    timeout=180
-)
+rc, out, err = ssh("NCA_DEFAULT_PROVIDER=openai " + TASK, timeout=180)
 assert "Hello" in out or "Hello" in err, \
     f"Expected 'Hello' in nca output, got:\n{out}\n{err}"
-print("PASS (mlx)")
+print("PASS (ollama)")
 ```
 
 `mlx-server` has a known finish-reason-formatting quirk that silently drops
 tool calls for `meow` specifically (`userspace/meow/docs/MLX_SERVER_TOOL_CALLS.md`)
 — `nca` uses a real JSON parser (serde), so it isn't expected to hit the same
-bug, but if step 10 comes back empty with a fast, low-token response, that's
-the first thing to check.
+bug, but if step 8 (mlx) comes back empty with a fast, low-token response,
+that's the first thing to check.
 
 ---
 
