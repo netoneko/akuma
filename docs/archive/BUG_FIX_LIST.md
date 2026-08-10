@@ -9,9 +9,29 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 539
+- **Total distinct fixes counted:** 541
 - **Docs contributing at least one fix:** 160
 - **Subsystem categories:** 15
+
+Updated 2026-08-10 (branch `trim-fat-sshd`, third entry): +2 fixes / +0 docs —
+both in `docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md`, both latent defects
+exposed by moving `smp-shared` into the default feature set (real SMP is now
+what `--release` builds). (1) `crates/akuma-exec/src/bkl.rs`: `KERNEL_LOCK` was
+`#[cfg(kernel_smp_shared)]` while every user is
+`#[cfg(all(kernel_smp_shared, target_os = "none"))]`, so the first host build
+that saw `smp-shared` carried the static unreferenced and tripped
+`dead_code = "deny"`. (2) `threading::disable_preemption()` called the panicking
+`runtime()` accessor for a diagnostic timestamp, breaking `PreemptGuard`'s
+documented "works … in host tests alike" contract and failing
+`akuma-ext2 tests::append_to_file`; it now probes `is_registered()` and degrades
+to `0`. Both dormant beforehand — the cause was compiling a configuration nobody
+had compiled, the same class as the unbuildable `build_devbox.sh` counted above.
+
+Not counted from the same range: deleting the in-kernel SSH server / shell /
+editor / TLS / cryptography (a removal, ~6,622 production lines — re-measured in
+`docs/archive/LINE_COUNT_ANALYSIS.md`), the profile consolidation 8 → 3, and
+removing the dead `FileSystem::append_file` trait method and its four
+implementations. All refactors, no defect fixed.
 
 Updated 2026-08-10 (branch `trim-fat-sshd`, second entry): +3 fixes / +2 docs —
 `docs/archive/BUILTIN_SSH_REMOVAL.md`. The fix is in

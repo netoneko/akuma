@@ -10,6 +10,58 @@ lives in [`reference/build-profiles.md`](../reference/build-profiles.md).
 
 **Measured at commit `d3f28d6`, branch `another-smp-attempt-0`.**
 
+> ## Re-measured 2026-08-10 (branch `trim-fat-sshd`) — production code down 13.5%
+>
+> The body of this doc is the `d3f28d6` snapshot, kept as written. Since then the
+> in-kernel SSH server, in-kernel shell, in-kernel editor, `async_fs`, and all
+> kernel-side TLS/cryptography were **deleted** (see
+> [`BUILTIN_SSH_REMOVAL.md`](BUILTIN_SSH_REMOVAL.md)), and four crates went with
+> them (`akuma-ssh`, `akuma-shell`, `akuma-editor` deleted; `akuma-ssh-crypto`
+> moved to `userspace/`, out of this doc's scope). Same script, same scope
+> (`scripts/cloc_akuma.py src crates`):
+>
+> | | `d3f28d6` | 2026-08-10 | delta |
+> |---|---:|---:|---:|
+> | **Production code** | **48,942** | **42,320** | **−6,622 (−13.5%)** |
+> | Test code | 26,035 | 25,133 | −902 (−3.5%) |
+> | Rust files | 172 | 127 | −45 |
+> | All files | 189 | 140 | −49 |
+> | Physical lines | 111,120 | 102,362 | −8,758 |
+> | comment / code | 31.9% | 35.5% | +3.6 pp |
+> | test / production | 0.53x | 0.59x | +0.06 |
+>
+> Two whole rows of the "production code by area" table went to **zero**:
+>
+> | area | `d3f28d6` | now |
+> |---|---:|---:|
+> | Shell (in kernel) | 3,425 | **0** |
+> | SSH server (in kernel) | 2,427 | **0** |
+> | Editor + terminal | 840 | 264 (`akuma-terminal` only — it survives; it is the PTY/termios layer the *userspace* sshd needs) |
+>
+> That accounts for ~6.4k of the 6,622-line drop; the remainder is
+> `akuma-net`'s TLS client and X.509 verifier (1,027 lines: `tls.rs`,
+> `tls_rng.rs`, `tls_verifier.rs`, `http.rs`), offset by growth elsewhere.
+>
+> **Two readings this changes, and one it does not.**
+>
+> The "scope limit: first-party only" caveat below gets *less* severe on the
+> dependency side: `crypto` (63,580 B) and `tls/x509` (76,596 B) were named there
+> as pure dependency code inflating the shipped image without contributing
+> lines. Both are now gone from the kernel entirely — 18 crypto crates in the
+> dependency tree became **0** — so the gap between "lines we maintain" and
+> "code we ship" narrowed on both sides at once, not just the numerator.
+>
+> The test ratio moving 0.53x → 0.59x is **not** more testing. Production
+> shrank 13.5% while test code shrank 3.5%; the ratio rose because the
+> denominator fell. `src/process_tests.rs` (10,220 lines) and `src/tests.rs`
+> (6,483) are still the two largest files in the tree by a wide margin, together
+> 39% of all code. Any conclusion in the body below that leans on the ratio
+> should be re-read with that in mind.
+>
+> What does *not* change: the two biggest production areas are still process/
+> threads/MM and the syscall layer. Nothing removed here touched them.
+
+
 > Every Akuma number here is measured. Every number about *another* kernel is a
 > recalled approximation, marked `~`, and should be re-measured before being
 > cited anywhere. No other kernel's source was available in this session.

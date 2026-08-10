@@ -247,6 +247,50 @@ Steps 1–2 are useful on their own even if `size` stays.
 stack the rump image never routes through. On a 1.8 MB dev image that cost is
 probably worth the simplification, but it has not been measured.
 
+## Two latent defects the `smp-shared` default exposed — both FIXED
+
+`smp-shared` moved into the default feature set on 2026-08-10 (real SMP is now
+what `cargo build --release` gives you; the multikernel `smp` is the
+experimental alternative and needs `--no-default-features`). Nothing about that
+change is a bug, but it compiled two configurations that had never been built
+before, and each had a latent defect waiting in it.
+
+**1. `crates/akuma-exec/src/bkl.rs` — cfg mismatch between a static and its users.**
+`KERNEL_LOCK` was gated `#[cfg(kernel_smp_shared)]` while every one of its users
+is `#[cfg(all(kernel_smp_shared, target_os = "none"))]`. Invisible while
+`smp-shared` was opt-in, because no host build ever set it. The moment it became
+default, `cargo test` (host target) compiled the static with nothing referencing
+it and `dead_code = "deny"` failed the build. Fixed by giving the static — and
+its `use crate::sync::KernelLock;` — the same `target_os = "none"` gate as its
+users.
+
+**2. `threading::disable_preemption()` panicked without a registered runtime.**
+It calls `runtime().uptime_us` to stamp `PREEMPTION_DISABLED_SINCE` on the
+0→1 transition, and `runtime()` is the *panicking* accessor
+(`runtime.rs:265`: "ExecRuntime not registered — call akuma_exec::init() first").
+`PreemptGuard::new()` documents itself as needing no registration —
+
+> Direct call: akuma-exec owns threading. No runtime registration needed … so
+> this works during early boot and in host tests alike.
+
+— which that one line made false. It surfaced as `akuma-ext2 tests::append_to_file`
+panicking in the workspace host-test run: `akuma-ext2`'s `no-bkl-vfs` paths take a
+`PreemptGuard`, and once `smp-shared` was unified into the graph the guard became
+real instead of an empty struct. Fixed by probing `crate::runtime::is_registered()`
+and degrading the timestamp to `0` — the documented contract now holds.
+
+Worth noting how it presented, because it wasted a cycle: `cargo test` **aborts**
+on the first failing crate, so the workspace total dropped from 399 to 250 and a
+naive "sum the passed counts" read it as a smaller-but-clean run. The
+`test result: FAILED. 52 passed; 1 failed` line has a different field layout from
+`test result: ok. 198 passed; …`; any harness parsing these must handle both or it
+will report a failure as a pass.
+
+Both defects were pre-existing and dormant. Neither was caused by the SSH
+removal; both were caused by *building a combination nobody had built*, which is
+the same class as finding F above (`scripts/build_devbox.sh` unbuildable) — a
+configuration nothing routinely compiles rots quietly.
+
 ## Acceptance suite: review deferred
 
 Noted here rather than acted on: **we will review the relevance of `acceptance/`
