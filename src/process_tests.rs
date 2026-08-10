@@ -806,14 +806,14 @@ pub fn run_all_tests() {
 }
 
 /// The scheduler records, per thread, the last core it ran on (`LAST_CORE`), which
-/// `top`'s new CORE column reads via `sys_get_cpu_stats`. Spawn a cooperative kernel
-/// thread and yield so the scheduler runs it through `commit_switch`; afterwards its
-/// last-core must no longer be the `0xFF` "never scheduled" sentinel and must be a
-/// valid core id (`< MAX_CORES`). On the single-core boot path it must be exactly 0.
+/// `top`'s new CORE column reads via `sys_get_cpu_stats`. Spawn a kernel thread and
+/// yield so the scheduler runs it through `commit_switch`; afterwards its last-core
+/// must no longer be the `0xFF` "never scheduled" sentinel and must be a valid core
+/// id (`< MAX_CORES`). On the single-core boot path it must be exactly 0.
 fn test_thread_last_core_tracked() {
     use akuma_exec::threading;
 
-    let tid = match threading::spawn_fn_cooperative(|| {
+    let tid = match threading::spawn_fn(|| {
         threading::mark_current_terminated();
         loop {
             threading::yield_now();
@@ -1359,14 +1359,30 @@ fn test_thread_slot_reclaim_on_spawn() {
     {
         spawned += 1;
     }
-    // Let every spawned thread run far enough to mark itself terminated.
+    // Let every spawned thread run far enough to mark itself terminated. No
+    // spawned thread's own termination timestamp can be earlier than this loop's
+    // start, so that's the earliest possible cooldown baseline for the check below.
+    let run_loop_start = crate::timer::uptime_us();
     for _ in 0..64 {
         akuma_exec::threading::yield_now();
     }
 
-    // A terminated slot inside its cooldown must NOT be recycled. Sample immediately;
-    // `thread_cleanup_cooldown_us` is 10ms, far longer than this call takes.
+    // A terminated slot inside its cooldown must NOT be recycled. Sampling
+    // immediately used to be a safe assumption ("`thread_cleanup_cooldown_us` is
+    // 10ms, far longer than this call takes") back when thread 0 was cooperative
+    // and this loop ran with no involuntary preemption of its own between yields.
+    // A fully preemptible thread 0
+    // (`docs/archive/TRIM_FAT_COOPERATIVE_SCHEDULING.md`) can now itself take an
+    // involuntary timer-tick detour mid-loop, so elapsed wall time here is no
+    // longer bounded tightly enough to promise every slot is still inside its
+    // 10ms cooldown. Only assert zero-reclaim when the measured gap since the
+    // earliest possible termination proves it — otherwise a nonzero reclaim is
+    // consistent with the cooldown mechanism (enforced unconditionally inside
+    // `reclaim_terminated_slots` itself, not by this test's timing), not a bug.
     let reclaimed_hot = akuma_exec::threading::reclaim_terminated_slots();
+    let reclaim_sample_at = crate::timer::uptime_us();
+    let hot_reclaim_provably_in_cooldown_window =
+        reclaim_sample_at.saturating_sub(run_loop_start) < crate::config::THREAD_CLEANUP_COOLDOWN_US;
 
     // The caller gate is the ONLY thing on-demand reclaim relaxes: the gated entry point
     // still refuses to collect from a non-thread-0 caller. (Boot tests run ON thread 0, so
@@ -1407,7 +1423,7 @@ fn test_thread_slot_reclaim_on_spawn() {
 
     let gated = GATED_FROM_OTHER_THREAD.load(Ordering::SeqCst);
     let gate_held = gated == 0 || gated == usize::MAX; // MAX = helper never got to run
-    let hot_ok = reclaimed_hot == 0;
+    let hot_ok = reclaimed_hot == 0 || !hot_reclaim_provably_in_cooldown_window;
     let respawn_ok = respawn.is_ok();
 
     // Leave the pool clean for the tests that follow.
@@ -1422,8 +1438,8 @@ fn test_thread_slot_reclaim_on_spawn() {
             spawned, reclaimed_hot);
     } else {
         crate::safe_print!(224,
-            "[Test] thread_slot_reclaim_on_spawn FAILED: hot_reclaim={} (want 0) respawn_ok={} gated_from_other_thread={} (want 0)\n",
-            reclaimed_hot, respawn_ok, gated);
+            "[Test] thread_slot_reclaim_on_spawn FAILED: hot_reclaim={} (want 0, in_cooldown_window={}) respawn_ok={} gated_from_other_thread={} (want 0)\n",
+            reclaimed_hot, hot_reclaim_provably_in_cooldown_window, respawn_ok, gated);
     }
 }
 
@@ -1500,7 +1516,6 @@ fn test_thread_slot_reclaim_on_spawn_initializing() {
     let spawn = akuma_exec::threading::spawn_user_thread_initializing(
         reclaim_probe_never_ready,
         core::ptr::null_mut(),
-        false,
     );
 
     // Hand the probe's slot back without ever scheduling it. The spawn leaves it
@@ -10291,7 +10306,7 @@ fn test_kill_thread_group_reaps_futex_blocked_sibling() {
     register_process(leader_pid, leader_proc);
 
     let Ok(sib_tid) = threading::spawn_user_thread_initializing(
-        futex_sibling_boundary_trampoline, core::ptr::null_mut(), false)
+        futex_sibling_boundary_trampoline, core::ptr::null_mut())
     else {
         unregister_process(leader_pid);
         console::print("[Test] kill_thread_group_reaps_futex_blocked_sibling SKIPPED (no free slot)\n");

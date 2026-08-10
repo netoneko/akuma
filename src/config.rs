@@ -78,7 +78,7 @@ pub const USER_STACK_SIZE_OVERRIDE: usize = 0; // auto-scale; set to e.g. 8MB to
 ///
 /// This is the **compile-time ceiling**, not the working limit: it sizes the per-slot
 /// static arrays (`THREAD_STATES`, `THREAD_CONTEXTS`, the signal/preemption registers,
-/// `ThreadPool::{states,cooperative,sps,stacks}`), which are BSS whether or not a slot is
+/// `ThreadPool::{states,sps,stacks}`), which are BSS whether or not a slot is
 /// ever used. The *working* limit is chosen at boot from actual RAM by
 /// `compute_thread_limit` → `threading::set_thread_limit`, which takes ¼ of user pages
 /// and divides by `USER_THREAD_STACK_SIZE` — so thread capacity already scales with

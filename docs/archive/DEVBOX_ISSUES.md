@@ -105,10 +105,19 @@ rebuild papering over it once doesn't rule out a `populate_disk.sh` or
 
 ## Issue 2: Interactive TUI session wedges the whole VM — BKL stuck, core-pinned
 
-**Status: OPEN.** Found 2026-08-10, same devbox-smoltcp VM as Issue 1, later
-the same session — while `meow` was running interactively in TUI mode
-(idle-polling for keyboard input, no command in flight). No gdbstub attached
-this time either.
+**Status: FIXED 2026-08-11.** Root-caused and fixed in the "fix terminal
+locks" pass: `sys_poll_input_event`/`sys_read`'s Stdin arm took
+`term_state_lock` with preemption disabled but IRQs enabled, and the post-wake
+re-acquire could sit in that state long enough under SMP contention for the
+watchdog to declare the VM stuck — unbounded regardless of who the holder was.
+Deep-dive, the fix, and its verification:
+[`TERM_POLL_INPUT_PREEMPTION_FIX.md`](TERM_POLL_INPUT_PREEMPTION_FIX.md)
+(§9-§11). One piece is incomplete: the dedicated kernel regression test has
+its own bug and is currently disabled (§11) — worth picking up separately.
+
+Found 2026-08-10, same devbox-smoltcp VM as Issue 1, later the same session —
+while `meow` was running interactively in TUI mode (idle-polling for keyboard
+input, no command in flight). No gdbstub attached this time either.
 
 ### Symptom
 
@@ -217,10 +226,20 @@ the moment of entry into the critical section.
 
 ## Issue 3: UART console output can interleave across cores — no cross-core lock
 
-**Status: OPEN.** Noticed 2026-08-10 while reading `src/console.rs` during the
-multikernel removal pass (docs/archive/TRIM_FAT_MULTIKERNEL.md), not from a
-specific repro — this is a code-reading finding, not yet confirmed against a
-live garbled-log capture.
+**Status: FIXED (shipped, default-on in `release`), 2026-08-11.** Fixed in the
+"fix console serialization issue" pass: `console::emit` now takes a
+`Spinlock<()>` + owner-core-ID reentrancy guard around the UART write loop
+when `kernel_console_lock` is set, closing the cross-core interleave window.
+Default ON for the `release` profile (anything with `OPT_LEVEL != "z"`); the
+`size`/`extreme-size` profiles are single-core targets where the lock is pure
+overhead, so it stays off there unless `CONSOLE_LOCK=1` forces it on. Verified
+under `SMP=4` + `cargo build -j4` self-host load. Deep-dive and verification:
+[`UART_SMP_INTERLEAVE_FIX.md`](UART_SMP_INTERLEAVE_FIX.md).
+
+Noticed 2026-08-10 while reading `src/console.rs` during the multikernel
+removal pass (docs/archive/TRIM_FAT_MULTIKERNEL.md), not from a specific
+repro — this was a code-reading finding, not confirmed against a live
+garbled-log capture until the fix's own verification pass.
 
 ### The race
 

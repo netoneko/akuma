@@ -212,11 +212,10 @@ impl Drop for PreemptGuard {
 ///
 /// The backoff between failed attempts calls `yield_now()` — a *voluntary* handoff —
 /// rather than only `core::hint::spin_loop()`. Re-enabling preemption alone is not
-/// enough to guarantee this core is ever actually given up: a caller running on a
-/// `cooperative` thread (e.g. the BSP's boot/async-executor thread) is immune to
-/// *involuntary* preemption by design, so between re-enabling preemption and the next
-/// `try_lock`, nothing would otherwise force a handoff to whoever holds the lock. A
-/// voluntary yield works regardless of that flag.
+/// enough to guarantee this core is ever actually given up: between re-enabling
+/// preemption and the next `try_lock`, nothing forces an *involuntary* handoff to
+/// whoever holds the lock until the next timer tick. A voluntary yield hands off
+/// immediately instead of waiting on the tick.
 #[inline]
 pub fn lock_bounded<T>(lock: &spinning_top::Spinlock<T>) -> PreemptBoundedGuard<'_, T> {
     loop {

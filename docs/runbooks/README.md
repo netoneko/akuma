@@ -30,6 +30,7 @@ Start from the symptom or task on the left.
 | Self-hosting (compiling the kernel inside Akuma) | [`selfhost-kernel-build.md`](selfhost-kernel-build.md) |
 | Adding an apk package to the devbox | [`add-apk-package.md`](add-apk-package.md) |
 | Adding a `sc-*` kernel feature | [`add-syscall-feature.md`](add-syscall-feature.md) |
+| Landed a fix and need to update the bugfix audit | [`update-bug-fix-list.md`](update-bug-fix-list.md) |
 
 ## Conventions
 

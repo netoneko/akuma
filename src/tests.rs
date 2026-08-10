@@ -355,17 +355,14 @@ pub fn run_threading_tests() -> bool {
     run_test!(test_scheduler_init, "scheduler_init");
     run_test!(test_thread_stats, "thread_stats");
     run_test!(test_yield, "yield");
-    run_test!(test_cooperative_timeout, "cooperative_timeout");
     run_test!(test_thread_cleanup, "thread_cleanup");
     run_test!(test_spawn_thread, "spawn_thread");
     run_test!(test_spawn_and_run, "spawn_and_run");
     run_test!(test_spawn_and_cleanup, "spawn_and_cleanup");
     run_test_heavy!(test_spawn_multiple, "spawn_multiple");
     run_test_heavy!(test_spawn_and_yield, "spawn_and_yield");
-    run_test_heavy!(test_spawn_cooperative, "spawn_cooperative");
     run_test_heavy!(test_yield_cycle, "yield_cycle");
-    run_test_heavy!(test_mixed_cooperative_preemptible, "mixed_cooperative_preemptible");
-    
+
     // Waker mechanism tests
     run_test!(test_waker_mechanism, "waker_mechanism");
     run_test!(test_block_on_noop_waker, "block_on_noop_waker");
@@ -1997,26 +1994,6 @@ fn test_yield() -> bool {
     true
 }
 
-/// Test: Cooperative timeout constant is set
-fn test_cooperative_timeout() -> bool {
-    console::print("\n[TEST] Cooperative timeout\n");
-
-    let timeout = threading::COOPERATIVE_TIMEOUT_US;
-    let ok = timeout > 0;
-
-    crate::safe_print!(96, 
-        "  Timeout: {} us ({} seconds)\n",
-        timeout,
-        timeout / 1_000_000
-    );
-    crate::safe_print!(64, 
-        "  Result: {}\n",
-        if ok { "PASS" } else { "DISABLED (0)" }
-    );
-
-    ok
-}
-
 /// Test: Cleanup function exists and doesn't crash
 fn test_thread_cleanup() -> bool {
     console::print("\n[TEST] Thread cleanup\n");
@@ -2328,48 +2305,6 @@ fn test_spawn_and_yield() -> bool {
     ok
 }
 
-/// Test: Cooperative thread spawning
-fn test_spawn_cooperative() -> bool {
-    console::print("\n[TEST] Cooperative thread spawn\n");
-
-    set_test_flag(false);
-
-    console::print("  Spawning cooperative thread...");
-    match threading::spawn_fn_cooperative(|| {
-        set_test_flag(true);
-        threading::mark_current_terminated();
-        loop {
-            threading::yield_now();
-            unsafe { core::arch::asm!("wfi") };
-        }
-    }) {
-        Ok(tid) => crate::safe_print!(32, " tid={}\n", tid),
-        Err(e) => {
-            crate::safe_print!(64, " FAILED: {}\n", e);
-            return false;
-        }
-    }
-
-    // Yield to let it run
-    console::print("  Yielding...");
-    for _ in 0..10 {
-        threading::yield_now();
-    }
-    console::print(" done\n");
-
-    let ran = get_test_flag();
-    crate::safe_print!(64, "  Thread ran: {}\n", ran);
-
-    // Cleanup
-    threading::cleanup_terminated_force();
-
-    crate::safe_print!(64, 
-        "  Result: {}\n",
-        if ran { "PASS" } else { "FAIL" }
-    );
-    ran
-}
-
 // Yield cycle counter
 static YIELD_CYCLE_COUNT: AtomicU32 = AtomicU32::new(0);
 
@@ -2435,125 +2370,6 @@ fn test_yield_cycle() -> bool {
     crate::safe_print!(64, "  Cleaned: {} threads\n", cleaned);
 
     let ok = cycles == CYCLES;
-    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
-    ok
-}
-
-// Flags for mixed thread test
-static COOP_THREAD_DONE: AtomicBool = AtomicBool::new(false);
-static PREEMPT_THREAD_DONE: AtomicBool = AtomicBool::new(false);
-
-fn set_coop_done(val: bool) {
-    COOP_THREAD_DONE.store(val, Ordering::Release);
-}
-
-fn get_coop_done() -> bool {
-    COOP_THREAD_DONE.load(Ordering::Acquire)
-}
-
-fn set_preempt_done(val: bool) {
-    PREEMPT_THREAD_DONE.store(val, Ordering::Release);
-}
-
-fn get_preempt_done() -> bool {
-    PREEMPT_THREAD_DONE.load(Ordering::Acquire)
-}
-
-/// Test: Mixed cooperative and preemptible threads
-/// - 1 cooperative thread: yields for 5ms then exits
-/// - 1 preemptible thread: loops for 15ms then exits  
-/// - Verify both complete and only idle thread remains after cleanup
-fn test_mixed_cooperative_preemptible() -> bool {
-    console::print("\n[TEST] Mixed cooperative & preemptible threads\n");
-
-    set_coop_done(false);
-    set_preempt_done(false);
-
-    let count_before = threading::thread_count();
-    crate::safe_print!(64, "  Threads before: {}\n", count_before);
-
-    // Spawn cooperative thread: yields for ~5ms total
-    console::print("  Spawning cooperative thread (5ms)...");
-    match threading::spawn_fn_cooperative(|| {
-        let start = crate::timer::uptime_us();
-        let target = 5_000; // 5ms
-
-        while crate::timer::uptime_us() - start < target {
-            threading::yield_now();
-        }
-
-        set_coop_done(true);
-        threading::mark_current_terminated();
-        loop {
-            threading::yield_now();
-            unsafe { core::arch::asm!("wfi") };
-        }
-    }) {
-        Ok(tid) => crate::safe_print!(32, " tid={}\n", tid),
-        Err(e) => {
-            crate::safe_print!(64, " FAILED: {}\n", e);
-            return false;
-        }
-    }
-
-    // Spawn preemptible thread: busy-loops for ~15ms
-    console::print("  Spawning preemptible thread (15ms)...");
-    match threading::spawn_fn(|| {
-        let start = crate::timer::uptime_us();
-        let target = 15_000; // 15ms
-
-        // Busy loop - will be preempted by timer
-        while crate::timer::uptime_us() - start < target {
-            // Just spin
-            unsafe { core::arch::asm!("nop") };
-        }
-
-        set_preempt_done(true);
-        threading::mark_current_terminated();
-        loop {
-            threading::yield_now();
-            unsafe { core::arch::asm!("wfi") };
-        }
-    }) {
-        Ok(tid) => crate::safe_print!(32, " tid={}\n", tid),
-        Err(e) => {
-            crate::safe_print!(64, " FAILED: {}\n", e);
-            return false;
-        }
-    }
-
-    let count_mid = threading::thread_count();
-    crate::safe_print!(64, "  Threads after spawn: {}\n", count_mid);
-
-    // Wait for both to complete (max 30ms with some margin)
-    console::print("  Waiting for threads to complete...");
-    let wait_start = crate::timer::uptime_us();
-    let max_wait = 50_000; // 50ms max
-
-    while (!get_coop_done() || !get_preempt_done())
-        && (crate::timer::uptime_us() - wait_start < max_wait)
-    {
-        threading::yield_now();
-    }
-
-    let elapsed = (crate::timer::uptime_us() - wait_start) / 1000;
-    crate::safe_print!(32, " {}ms\n", elapsed);
-
-    // Check completion
-    let coop_done = get_coop_done();
-    let preempt_done = get_preempt_done();
-    crate::safe_print!(64, "  Cooperative done: {}\n", coop_done);
-    crate::safe_print!(64, "  Preemptible done: {}\n", preempt_done);
-
-    // Cleanup
-    let cleaned = threading::cleanup_terminated_force();
-    crate::safe_print!(64, "  Cleaned: {} threads\n", cleaned);
-
-    let count_after = threading::thread_count();
-    crate::safe_print!(64, "  Threads after cleanup: {}\n", count_after);
-
-    // Verify: both threads completed and only idle remains
-    let ok = coop_done && preempt_done && count_after == 1;
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
@@ -9190,40 +9006,82 @@ fn test_cow_prefault_not_cow_page_no_op() -> bool {
 // ThreadWaker tests
 // ============================================================================
 
+/// Trampoline for a thread slot these tests hold in INITIALIZING/WAITING for the
+/// whole test — never actually dispatched. Only runs if a scheduler pass ever
+/// does pick it up (a race these tests don't fully close), in which case it must
+/// not spin forever holding a slot: self-terminate immediately.
+extern "C" fn waker_test_park_trampoline() -> ! {
+    akuma_exec::threading::mark_current_terminated();
+    loop {
+        akuma_exec::threading::yield_now();
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
+/// Spawn a slot for the ThreadWaker tests below with a REAL initialized context
+/// (valid `sp`/`ttbr0`/`elr`), left in INITIALIZING so it is never actually
+/// scheduled while the test pokes its state directly.
+///
+/// The three tests here fabricate WAITING/READY state on a thread slot to probe
+/// `ThreadWaker` in isolation, without spawning the real workload it would
+/// normally belong to. They used to do that on a bare FREE slot — whose
+/// `Context.sp` is still 0, never having gone through any spawn path. On the old
+/// cooperative scheduler that was merely reckless: thread 0 (running the test
+/// suite) enjoyed a 100 ms grace window immune to involuntary preemption, so the
+/// scheduler essentially never got a chance to dispatch to the fabricated slot
+/// before the test restored it to FREE. Removing that flag
+/// (`docs/archive/TRIM_FAT_COOPERATIVE_SCHEDULING.md`) made thread 0 preemptible
+/// like everything else, and a timer tick landing in that narrow window now
+/// dispatches to the phantom slot and hits the scheduler's `[SGI-S FATAL]
+/// new_sp=0x0` halt — the exact failure mode already documented on
+/// `test_kill_thread_group_reaps_futex_blocked_sibling` in
+/// `src/process_tests.rs`, which independently arrived at the same fix: use a
+/// really-spawned slot, not a bare one.
+///
+/// A valid context alone isn't quite enough, though: unlike the old bare-slot
+/// version, this slot is now genuinely schedulable once woken, and its
+/// trampoline self-terminates the instant it is dispatched. On a fully
+/// preemptible thread 0 (post-removal, same doc) a timer tick landing between
+/// `wake()` and the state read below can let it actually run before the test
+/// observes the READY state it just set — flipping the read to TERMINATED and
+/// failing the assertion, not crashing. Each test below wraps that window in
+/// `disable_preemption()`/`enable_preemption()` to make the read deterministic
+/// on the single-core boot the self-test suite normally runs under.
+fn spawn_waker_test_slot() -> Result<usize, &'static str> {
+    akuma_exec::threading::spawn_user_thread_initializing(
+        waker_test_park_trampoline,
+        core::ptr::null_mut(),
+    )
+}
+
 /// Test: ThreadWaker::wake() transitions WAITING→READY and sets WOKEN_STATES flag
 pub fn test_thread_waker_marks_ready() -> bool {
     use akuma_exec::threading::{self, thread_state};
 
     console::print("\n[TEST] ThreadWaker marks thread ready\n");
 
-    // Find an unused thread slot (state == FREE)
-    let mut test_tid = None;
-    for i in 1..threading::MAX_THREADS {
-        if threading::get_thread_state(i) == thread_state::FREE {
-            test_tid = Some(i);
-            break;
+    let tid = match spawn_waker_test_slot() {
+        Ok(tid) => tid,
+        Err(e) => {
+            crate::safe_print!(64, "  spawn FAILED: {}\n  Result: FAIL\n", e);
+            return false;
         }
-    }
-    let tid = if let Some(t) = test_tid { t } else {
-        console::print("  No free thread slot available, skipping\n  Result: PASS\n");
-        return true;
     };
 
-    // Set thread to WAITING
+    // Set thread to WAITING, fire the waker, and read the result all under
+    // disable_preemption() — see spawn_waker_test_slot's docs for why.
+    threading::disable_preemption();
     threading::set_thread_state(tid, thread_state::WAITING);
     threading::set_woken_state(tid, false);
-
-    // Create waker and fire it
     let waker = threading::get_waker_for_thread(tid);
     waker.wake();
-
-    // Check state transitioned to READY
     let state = threading::get_thread_state(tid);
     let woken = threading::get_woken_state(tid);
+    threading::enable_preemption();
 
-    // Restore to FREE
-    threading::set_thread_state(tid, thread_state::FREE);
-    threading::set_woken_state(tid, false);
+    // Reclaim the slot (never actually dispatched; a hard external terminate is safe).
+    threading::mark_thread_terminated(tid);
+    threading::cleanup_terminated_force();
 
     let ok = state == thread_state::READY && woken;
     crate::safe_print!(128, "  state={} (expected {}), woken={} (expected true)\n",
@@ -9238,35 +9096,31 @@ pub fn test_thread_waker_idempotent() -> bool {
 
     console::print("\n[TEST] ThreadWaker idempotent on READY thread\n");
 
-    let mut test_tid = None;
-    for i in 1..threading::MAX_THREADS {
-        if threading::get_thread_state(i) == thread_state::FREE {
-            test_tid = Some(i);
-            break;
+    let tid = match spawn_waker_test_slot() {
+        Ok(tid) => tid,
+        Err(e) => {
+            crate::safe_print!(64, "  spawn FAILED: {}\n  Result: FAIL\n", e);
+            return false;
         }
-    }
-    let tid = if let Some(t) = test_tid { t } else {
-        console::print("  No free thread slot, skipping\n  Result: PASS\n");
-        return true;
     };
 
-    // Set thread to READY (not WAITING)
+    // Set thread to READY, fire the waker twice, and read the result all under
+    // disable_preemption() — see spawn_waker_test_slot's docs for why.
+    threading::disable_preemption();
     threading::set_thread_state(tid, thread_state::READY);
     threading::set_woken_state(tid, false);
-
-    // Fire waker twice on an already-READY thread
     let waker = threading::get_waker_for_thread(tid);
     waker.wake_by_ref();
     waker.wake_by_ref();
-
     // State should still be READY (not corrupted)
     let state = threading::get_thread_state(tid);
     // WOKEN_STATES should be set (sticky flag)
     let woken = threading::get_woken_state(tid);
+    threading::enable_preemption();
 
-    // Restore to FREE
-    threading::set_thread_state(tid, thread_state::FREE);
-    threading::set_woken_state(tid, false);
+    // Reclaim the slot (never actually dispatched; a hard external terminate is safe).
+    threading::mark_thread_terminated(tid);
+    threading::cleanup_terminated_force();
 
     let ok = state == thread_state::READY && woken;
     crate::safe_print!(128, "  state={} (expected {}), woken={}\n",
@@ -9281,34 +9135,30 @@ pub fn test_thread_waker_roundtrip() -> bool {
 
     console::print("\n[TEST] ThreadWaker roundtrip (clone + wake)\n");
 
-    let mut test_tid = None;
-    for i in 1..threading::MAX_THREADS {
-        if threading::get_thread_state(i) == thread_state::FREE {
-            test_tid = Some(i);
-            break;
+    let tid = match spawn_waker_test_slot() {
+        Ok(tid) => tid,
+        Err(e) => {
+            crate::safe_print!(64, "  spawn FAILED: {}\n  Result: FAIL\n", e);
+            return false;
         }
-    }
-    let tid = if let Some(t) = test_tid { t } else {
-        console::print("  No free thread slot, skipping\n  Result: PASS\n");
-        return true;
     };
 
-    // Set thread to WAITING
+    // Set thread to WAITING, fire the waker, and read the result all under
+    // disable_preemption() — see spawn_waker_test_slot's docs for why.
+    threading::disable_preemption();
     threading::set_thread_state(tid, thread_state::WAITING);
     threading::set_woken_state(tid, false);
-
-    // Create waker, clone it, drop original, wake via clone
     let waker = threading::get_waker_for_thread(tid);
     let cloned = waker.clone();
     drop(waker);
     cloned.wake();
-
     let state = threading::get_thread_state(tid);
     let woken = threading::get_woken_state(tid);
+    threading::enable_preemption();
 
-    // Restore
-    threading::set_thread_state(tid, thread_state::FREE);
-    threading::set_woken_state(tid, false);
+    // Reclaim the slot (never actually dispatched; a hard external terminate is safe).
+    threading::mark_thread_terminated(tid);
+    threading::cleanup_terminated_force();
 
     let ok = state == thread_state::READY && woken;
     crate::safe_print!(128, "  state={} (expected {}), woken={}\n",

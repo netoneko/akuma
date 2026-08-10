@@ -2780,7 +2780,6 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     let tid = crate::threading::spawn_user_thread_initializing(
         entry_point_trampoline as extern "C" fn() -> !,
         core::ptr::null_mut(),
-        false
     )?;
 
     new_proc.thread_id = Some(tid);
@@ -2941,7 +2940,6 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
     let tid = crate::threading::spawn_user_thread_initializing(
         entry_point_trampoline as extern "C" fn() -> !,
         core::ptr::null_mut(),
-        false,
     )?;
     new_proc.thread_id = Some(tid);
 
@@ -3209,7 +3207,6 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     let tid = crate::threading::spawn_user_thread_initializing(
         entry_point_trampoline as extern "C" fn() -> !,
         core::ptr::null_mut(),
-        false
     )?;
 
     new_proc.thread_id = Some(tid);

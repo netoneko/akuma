@@ -1151,7 +1151,6 @@ pub fn mark_thread_ready(idx: usize) {
 pub fn spawn_user_thread_initializing(
     trampoline_fn: extern "C" fn() -> !,
     data_ptr: *mut (),
-    cooperative: bool
 ) -> Result<usize, &'static str> {
     let trampoline_casted = unsafe {
         core::mem::transmute::<extern "C" fn() -> !, fn(*mut ()) -> !>(trampoline_fn)
@@ -1160,7 +1159,7 @@ pub fn spawn_user_thread_initializing(
     let attempt = || {
         with_irqs_disabled(|| {
             let mut pool = POOL.lock();
-            pool.spawn_user_closure_initializing(trampoline_casted, data_ptr, cooperative)
+            pool.spawn_user_closure_initializing(trampoline_casted, data_ptr)
         })
     };
 
@@ -1259,7 +1258,6 @@ impl ThreadPool {
         &mut self,
         trampoline_fn: fn(*mut ()) -> !,
         closure_ptr: *mut (),
-        cooperative: bool,
     ) -> Result<usize, &'static str> {
         if !self.initialized { return Err("Thread pool not initialized"); }
 
@@ -1314,9 +1312,7 @@ impl ThreadPool {
                     ctx.is_user_process = 1; // Mark as user process thread
                 }
 
-                self.slots[i].cooperative = cooperative;
                 self.slots[i].start_time_us = 0;
-                self.slots[i].timeout_us = if cooperative { COOPERATIVE_TIMEOUT_US } else { 0 };
 
                 // NOTE: We do NOT store READY here. Caller must call mark_thread_ready().
                 return Ok(i);
@@ -1616,9 +1612,7 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
                 
                 // Clear slot state
                 let mut pool = POOL.lock();
-                pool.slots[i].cooperative = false;
                 pool.slots[i].start_time_us = 0;
-                pool.slots[i].timeout_us = 0;
             }
 
             // Clear any pending signal from the previous occupant of this slot.
@@ -1820,25 +1814,6 @@ pub fn enable_preemption() {
     }
 }
 
-/// Make the idle/boot thread (thread 0) preemptible — i.e. subject to normal
-/// involuntary timer preemption instead of the cooperative 100 ms slice.
-///
-/// The boot thread is marked *cooperative* by [`ThreadPool::init`] because on the BSP
-/// it runs the async executor + network runner, which must not be preempted mid-poll.
-/// A **secondary** core's boot thread, by contrast, is a pure idle/heartbeat loop: while
-/// it is the cooperative RUNNING thread, `schedule_indices` returns early on every
-/// involuntary tick (honoring the timeout) and never runs its WAITING→READY wake pass, so
-/// a just-woken thread (e.g. a rump-sysproxy pipe peer) cannot be scheduled until the
-/// idle thread's 100 ms timeout. Clearing the flag on a secondary gives it *real*
-/// preemptive scheduling: the timer tick preempts idle and round-robins to any runnable
-/// thread. Per-core (replicated statics), so this only affects the calling core.
-pub fn make_idle_preemptible() {
-    let _guard = IrqGuard::new();
-    let mut pool = POOL.lock();
-    pool.slots[IDLE_THREAD_IDX].cooperative = false;
-    pool.slots[IDLE_THREAD_IDX].timeout_us = 0;
-}
-
 /// Real shared-kernel SMP: adopt the CURRENT execution context — a secondary core's
 /// boot/trampoline context, running on its boot stack — as that core's idle thread, so
 /// the one shared scheduler can switch away from it and back like any thread. Claims a
@@ -1861,8 +1836,6 @@ pub fn adopt_current_as_core_idle(
     let _guard = IrqGuard::new();
     let mut pool = POOL.lock();
     let slot = claim_free_slot(1, MAX_THREADS)?;
-    pool.slots[slot].cooperative = false; // preemptible: timer ticks round-robin off it
-    pool.slots[slot].timeout_us = 0;
     pool.slots[slot].start_time_us = (runtime().uptime_us)();
     pool.slots[slot].exception_stack_top = exc_stack_top;
     pool.stacks[slot] = StackInfo::new(stack_base, stack_size);
@@ -2232,7 +2205,7 @@ impl ThreadPool {
 
     /// Initialize the pool - allocate stacks with sizes based on thread role
     ///
-    /// Thread 0: Boot stack (1MB, fixed location) - cooperative for I/O protection
+    /// Thread 0: Boot stack (1MB, fixed location) - preemptible
     /// Threads 1 to RESERVED_THREADS-1: System threads (256KB each) - preemptible
     /// Threads RESERVED_THREADS to MAX_THREADS-1: User process threads (128KB each) - preemptible
     pub fn init(&mut self) {
@@ -2241,12 +2214,7 @@ impl ThreadPool {
         let boot_ttbr0: u64 = crate::mmu::get_boot_ttbr0();
 
         // Slot 0 is the idle/boot thread (uses boot stack, never terminated)
-        // It runs the async executor and network runner, so mark it cooperative
-        // to avoid preemption during critical I/O operations. It still gets
-        // preempted after the timeout to allow other threads to run.
         THREAD_STATES[IDLE_THREAD_IDX].store(thread_state::RUNNING, Ordering::SeqCst);
-        self.slots[IDLE_THREAD_IDX].cooperative = true;
-        self.slots[IDLE_THREAD_IDX].timeout_us = COOPERATIVE_TIMEOUT_US;
         self.slots[IDLE_THREAD_IDX].start_time_us = (runtime().uptime_us)();
         // Real shared-kernel SMP: slot 0 is core 0's per-core idle thread. Registering it
         // makes the scheduler's idle-fallback logic uniform across cores (single-core
@@ -2439,8 +2407,7 @@ impl ThreadPool {
     /// - `voluntary=true`: Thread yielded voluntarily (yield_now) - always switch
     /// - `voluntary=false`: Timer-triggered preemption
     ///   - If preemption is explicitly disabled: Don't switch
-    ///   - Cooperative threads (thread 0): Only switch after timeout elapses
-    ///   - Non-cooperative threads (sessions, user processes): Always preemptible
+    ///   - Otherwise: always preemptible
     ///
     /// Pick the next thread for `core_id` to run. Returns `Some((old, new))` if a
     /// switch is needed. Under real shared-kernel SMP this runs serialized by the Big
@@ -2452,11 +2419,6 @@ impl ThreadPool {
     pub fn schedule_indices(&mut self, voluntary: bool, core_id: usize) -> Option<(usize, usize)> {
         // Use TPIDRRO_EL0 register for current thread ID - more reliable than atomic
         let current_idx = get_current_thread_register();
-        // Read the current slot's scheduling fields by value (Copy) rather than holding
-        // a borrow, so `commit_switch(&mut self)` below doesn't conflict.
-        let current_cooperative = self.slots[current_idx].cooperative;
-        let current_timeout_us = self.slots[current_idx].timeout_us;
-        let current_start_time_us = self.slots[current_idx].start_time_us;
 
         // Wake-pass: mark READY any WAITING thread whose wake deadline has passed.
         // This MUST run on every scheduler entry — including involuntary
@@ -2508,21 +2470,6 @@ impl ThreadPool {
         // (Only gates the context switch — the wake-pass above already ran.)
         if !voluntary && is_preemption_disabled() {
             return None;
-        }
-
-        // For timer-triggered preemption, check if the current thread is cooperative.
-        // Use atomic state check
-        let current_state = THREAD_STATES[current_idx].load(Ordering::SeqCst);
-        if !voluntary && current_cooperative && current_state == thread_state::RUNNING {
-            let timeout = current_timeout_us;
-            if timeout > 0 && current_start_time_us > 0 {
-                let elapsed = now.saturating_sub(current_start_time_us);
-                if elapsed < timeout {
-                    return None;
-                }
-            } else {
-                return None;
-            }
         }
 
         // Proportional scheduling for the network polling thread (run_async_main).
@@ -2787,8 +2734,8 @@ static POOL: Spinlock<ThreadPool> = Spinlock::new(ThreadPool::new());
 /// `schedule_blocking`, `request_voluntary_reschedule`) always pair the flag with a
 /// SELF-targeted scheduler SGI, so producer and consumer are the same core. With one
 /// global flag, a PEER core's concurrent timer SGI would `swap` the flag away — its
-/// involuntary tick ran as voluntary (bypassing that core's cooperative/preemption
-/// checks) while the yielding core's SGI ran as INVOLUNTARY, silently eating the
+/// involuntary tick ran as voluntary (bypassing that core's preemption-disabled
+/// check) while the yielding core's SGI ran as INVOLUNTARY, silently eating the
 /// yield. Mostly-invisible when involuntary switches could stand in for the lost
 /// voluntary one, but fatal for a thread whose involuntary path is gated (a
 /// `LifecycleGuard` holder in a cooperative wait loop spins forever in EL1 holding
@@ -2812,11 +2759,9 @@ pub fn set_sgi_debug(enable: bool) {
 }
 
 /// Mark the next scheduler SGI on THIS core as a VOLUNTARY switch, so `schedule_indices`
-/// switches away even from a cooperative thread (the idle thread is cooperative and would
-/// otherwise be left running until its 100 ms timeout). Used by an IRQ-context cross-core
-/// wakeup that readies a thread while the cooperative idle thread is current and must
-/// preempt it now. Pair with a self-targeted
-/// scheduler-SGI trigger.
+/// switches away even when preemption is explicitly disabled for the current thread.
+/// Used by an IRQ-context cross-core wakeup that readies a thread and must preempt the
+/// current one now. Pair with a self-targeted scheduler-SGI trigger.
 pub fn request_voluntary_reschedule() {
     voluntary_schedule_flag().store(true, Ordering::Release);
 }
@@ -2860,30 +2805,14 @@ fn closure_trampoline<F: FnOnce() -> ! + Send + 'static>(closure_ptr: *mut ()) -
     closure()
 }
 
-/// Spawn a new preemptible thread with a Rust closure and default stack
+/// Spawn a new preemptible thread with a Rust closure and default stack.
+///
+/// Uses user thread slots (RESERVED_THREADS..MAX_THREADS) with fixed 128KB stacks.
 pub fn spawn_fn<F>(f: F) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
 {
-    spawn_fn_with_options(f, false)
-}
-
-/// Spawn a cooperative thread with a Rust closure and default stack
-pub fn spawn_fn_cooperative<F>(f: F) -> Result<usize, &'static str>
-where
-    F: FnOnce() -> ! + Send + 'static,
-{
-    spawn_fn_with_options(f, true)
-}
-
-/// Spawn a thread with a Rust closure and options
-///
-/// Uses user thread slots (RESERVED_THREADS..MAX_THREADS) with fixed 128KB stacks.
-pub fn spawn_fn_with_options<F>(f: F, cooperative: bool) -> Result<usize, &'static str>
-where
-    F: FnOnce() -> ! + Send + 'static,
-{
-    spawn_user_thread_fn_with_options(f, cooperative)
+    spawn_user_thread_fn_internal(f, false)
 }
 
 
@@ -3568,7 +3497,7 @@ pub fn schedule_blocking(wake_time_us: u64) {
     // busy-spin. Without this, a block→switch waits up to one tick: fine on the BSP
     // (device IRQs drive reschedules) but on a secondary two cooperating threads (the
     // rump sysproxy client↔server pipe hop) have NO IRQ between them, so every hop was
-    // tick-bound (~10 ms). A voluntary SGI bypasses the cooperative-idle guard too.
+    // tick-bound (~10 ms). A voluntary SGI bypasses the preemption-disabled guard too.
     voluntary_schedule_flag().store(true, Ordering::Release);
     (runtime().trigger_sgi)(0);
 
@@ -3888,9 +3817,7 @@ where
         // Write slot metadata (needs POOL lock)
         {
             let mut pool = POOL.lock();
-            pool.slots[slot_idx].cooperative = false; // System threads are preemptible
             pool.slots[slot_idx].start_time_us = 0;
-            pool.slots[slot_idx].timeout_us = 0;
         }
         
         // NOW set atomic state to READY - context is fully set up, scheduler can run it
@@ -3931,7 +3858,7 @@ pub fn spawn_user_thread_fn<F>(f: F) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
 {
-    spawn_user_thread_fn_internal(f, false, false)
+    spawn_user_thread_fn_internal(f, false)
 }
 
 /// Spawn a user thread for running a user PROCESS
@@ -3943,15 +3870,7 @@ pub fn spawn_user_thread_fn_for_process<F>(f: F) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
 {
-    spawn_user_thread_fn_internal(f, false, true)
-}
-
-/// Spawn a user thread with cooperative option - LOCK-FREE (legacy wrapper)
-pub fn spawn_user_thread_fn_with_options<F>(f: F, cooperative: bool) -> Result<usize, &'static str>
-where
-    F: FnOnce() -> ! + Send + 'static,
-{
-    spawn_user_thread_fn_internal(f, cooperative, false)
+    spawn_user_thread_fn_internal(f, true)
 }
 
 /// Initialize a freshly claimed slot's [`Context`] for a brand-new thread.
@@ -4009,9 +3928,8 @@ fn init_thread_slot_context(
 
 /// Internal implementation for spawning user threads
 ///
-/// - cooperative: if true, thread runs cooperatively (longer time slice, no forced preemption)
 /// - start_irqs_disabled: if true, thread starts with IRQs disabled (for process threads)
-fn spawn_user_thread_fn_internal<F>(f: F, cooperative: bool, start_irqs_disabled: bool) -> Result<usize, &'static str>
+fn spawn_user_thread_fn_internal<F>(f: F, start_irqs_disabled: bool) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
 {
@@ -4084,9 +4002,7 @@ where
         // Write slot metadata (needs POOL lock)
         {
             let mut pool = POOL.lock();
-            pool.slots[slot_idx].cooperative = cooperative;
             pool.slots[slot_idx].start_time_us = 0;
-            pool.slots[slot_idx].timeout_us = if cooperative { COOPERATIVE_TIMEOUT_US } else { 0 };
         }
         
         // NOW set atomic state to READY - context is fully set up, scheduler can run it
@@ -4496,9 +4412,8 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
         let pool = POOL.lock();
         
         let mut states = [ThreadState::Free; MAX_THREADS];
-        let mut cooperative = [false; MAX_THREADS];
         let mut sps = [0u64; MAX_THREADS];
-        
+
         for i in 0..MAX_THREADS {
             // Read state from atomic array (lock-free source of truth)
             states[i] = match THREAD_STATES[i].load(Ordering::Relaxed) {
@@ -4510,14 +4425,12 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
                 thread_state::WAITING => ThreadState::Ready, // Show waiting threads
                 _ => ThreadState::Free,
             };
-            cooperative[i] = pool.slots[i].cooperative;
             // Read SP from THREAD_CONTEXTS (not from slot)
             sps[i] = unsafe { (*get_context(i)).sp };
         }
-        
+
         ThreadPoolSnapshot {
             states,
-            cooperative,
             sps,
             stacks: pool.stacks,
         }
@@ -4569,14 +4482,12 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
             0 => "bootstrap",
             _ if i == net_tid => "network",
             1..=7 => "system-thread",
-            _ if snapshot.cooperative[i] => "cooperative",
             _ => "user-process",
         };
 
         threads.push(KernelThreadInfo {
             tid: i,
             state: state_str,
-            cooperative: snapshot.cooperative[i],
             stack_base: stack.base,
             stack_size: stack.size,
             stack_used,
@@ -4594,7 +4505,7 @@ pub fn dump_stack_info() {
     for t in threads {
         let size_kb = t.stack_size / 1024;
         let used_kb = t.stack_used / 1024;
-        safe_print!(192, "Thread ID: {} State: {} Cooperative: {} Stack Size: {} KB Used: {} KB\n", t.tid, t.state, t.cooperative, size_kb, used_kb);
+        safe_print!(192, "Thread ID: {} State: {} Stack Size: {} KB Used: {} KB\n", t.tid, t.state, size_kb, used_kb);
     }
 }
 

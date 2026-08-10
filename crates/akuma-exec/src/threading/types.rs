@@ -28,9 +28,6 @@ pub const MAX_THREADS: usize = 256;
 #[cfg(kernel_profile_extreme)]
 pub const MAX_THREADS: usize = 64;
 
-/// Default timeout for cooperative threads in microseconds (100ms)
-pub const COOPERATIVE_TIMEOUT_US: u64 = 100_000;
-
 /// Thread 0 is the boot/idle thread - always protected, never terminated
 pub const IDLE_THREAD_IDX: usize = 0;
 
@@ -191,9 +188,7 @@ impl StackInfo {
 /// NOT in this struct, for lock-free state checks during scheduling.
 #[repr(C)]
 pub struct ThreadSlot {
-    pub cooperative: bool,
     pub start_time_us: u64,
-    pub timeout_us: u64,
     pub exception_stack_top: u64,
     // NOTE: the user-copy fault handler (copy_from/to_user recovery) moved OUT of the
     // POOL-locked slot to the lock-free `USER_COPY_FAULT_HANDLER` atomic array in
@@ -204,9 +199,7 @@ pub struct ThreadSlot {
 impl ThreadSlot {
     pub const fn empty() -> Self {
         Self {
-            cooperative: false,
             start_time_us: 0,
-            timeout_us: 0,
             exception_stack_top: 0,
         }
     }
@@ -227,7 +220,6 @@ pub struct ThreadStatsFull {
 pub struct KernelThreadInfo {
     pub tid: usize,
     pub state: &'static str,
-    pub cooperative: bool,
     pub stack_base: usize,
     pub stack_size: usize,
     pub stack_used: usize,
@@ -238,7 +230,6 @@ pub struct KernelThreadInfo {
 /// Snapshot data copied from thread pool (to minimize IRQ-disabled time)
 pub(crate) struct ThreadPoolSnapshot {
     pub states: [ThreadState; MAX_THREADS],
-    pub cooperative: [bool; MAX_THREADS],
     pub sps: [u64; MAX_THREADS],
     pub stacks: [StackInfo; MAX_THREADS],
 }

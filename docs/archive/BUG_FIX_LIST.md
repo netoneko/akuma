@@ -9,9 +9,39 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 544
-- **Docs contributing at least one fix:** 162
+- **Total distinct fixes counted:** 546
+- **Docs contributing at least one fix:** 163
 - **Subsystem categories:** 15
+
+Updated 2026-08-11 (branch `fix-more-devbox-issues`, sixth entry): +2 fixes /
++1 doc — `docs/archive/TRIM_FAT_COOPERATIVE_SCHEDULING.md` (both counted under
+Scheduler & Process Management).
+
+Implementing the `COOPERATIVE_SCHEDULING_AUDIT.md` removal (thread 0 made
+fully preemptible, the `ThreadSlot.cooperative` flag and `spawn_fn_cooperative`
+API deleted) exposed two latent bugs in the boot self-test suite that the old
+cooperative scheduler had been silently masking:
+
+1. `test_thread_waker_marks_ready`/`_idempotent`/`_roundtrip` fabricated
+   `WAITING`/`READY` state directly on a bare `FREE` thread slot — one whose
+   `Context.sp` was still 0, having never gone through a spawn path. Thread
+   0's old 100 ms cooperative grace window made an actual dispatch to that
+   phantom slot astronomically unlikely; a fully preemptible thread 0 hit it
+   on the very first post-removal boot, crashing with `[SGI-S FATAL]
+   new_sp=0x0 invalid!`. Fixed by spawning a real slot (valid `Context`, held
+   in `INITIALIZING` so it's never actually scheduled) instead of poking a
+   bare one — the same fix `test_kill_thread_group_reaps_futex_blocked_sibling`
+   (`src/process_tests.rs`) had already independently arrived at for the
+   identical failure mode a month earlier.
+2. `test_thread_slot_reclaim_on_spawn` asserted zero slots were hot-reclaimed
+   immediately after a fill-and-terminate loop, reasoning the loop ran well
+   under the 10 ms cooldown. That held only because thread 0 ran the loop
+   with no involuntary detours of its own; once it could take timer-tick
+   detours like any other thread, the loop's wall-clock time was no longer
+   reliably under 10 ms and the assertion started failing on slots the
+   cooldown mechanism had, correctly, already released. Fixed by measuring
+   the actual elapsed time and only asserting zero-reclaim when it's provably
+   inside the cooldown window.
 
 Updated 2026-08-10 (branch `better-sshd-and-networking`, fifth entry): +2 fixes
 / +1 doc — `userspace/sshd/docs/PROCESS_PER_SESSION.md` (one fix counted under
@@ -505,7 +535,7 @@ stale directory entry) are **not** counted — neither is fixed.
 - File-backed `mmap` demand faults allocated a fresh PMM frame per process instead of sharing, so N concurrent processes mapping the same toolchain library (e.g. 4× `rustc` mapping a 295MB `librustc_driver.so`) held N physical copies filled by N separate ext2 read sweeps, driving memory pressure → eviction → re-read in a loop that made `-j4` self-host builds scale far worse than the job count justified; fixed by `src/file_page_cache.rs` deduplicating on `(inode, file_offset)`, reusing the existing CoW refcount for teardown
 
 
-## Scheduler & Process Management (72 fixes, 16 docs)
+## Scheduler & Process Management (74 fixes, 17 docs)
 
 ### docs/archive/GO_FORK_EXEC_FIXES.md
 - 1: PROCESS_INFO_ADDR overwritten by `cow_share_range`
@@ -611,6 +641,10 @@ stale directory entry) are **not** counted — neither is fixed.
 
 ### docs/archive/CURRENT_TRAP_FRAME_STALE_ON_EXIT.md
 - `CURRENT_TRAP_FRAME[tid]` was never cleared on process exit or thread teardown, so a recycled thread slot inherited a pointer into an already-freed kernel stack, dereferenced by diagnostic readers (`current_trap_frame_elr`, `dump_thread_resume_points`); fixed by clearing it at slot-recycle, both exit paths, slot-claim, and `enter_user_mode`
+
+### docs/archive/TRIM_FAT_COOPERATIVE_SCHEDULING.md
+- ThreadWaker tests (`test_thread_waker_marks_ready`/`_idempotent`/`_roundtrip`) fabricated WAITING/READY state on a bare FREE slot with `Context.sp=0`; removing thread 0's cooperative grace window let the scheduler actually dispatch to the phantom slot, crashing with `[SGI-S FATAL] new_sp=0x0 invalid!` — fixed by spawning a real (never-dispatched) slot instead
+- `test_thread_slot_reclaim_on_spawn` assumed its fill-and-terminate loop always ran under the 10ms reclaim cooldown, an assumption that depended on thread 0's old preemption immunity; fixed by measuring elapsed time and only asserting zero-reclaim when it's provably still inside the cooldown window
 
 
 ## SMP & Locking (65 fixes, 27 docs)
