@@ -16,12 +16,15 @@
 //! incoming EL0 thread, re-acquiring for an incoming EL1 thread) lands in M2 alongside
 //! the cross-core scheduler, where it can be exercised under real contention.
 
-#[cfg(kernel_smp_shared)]
+#[cfg(all(kernel_smp_shared, target_os = "none"))]
 use crate::sync::KernelLock;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// The one Big Kernel Lock. Only meaningful under `cfg(kernel_smp_shared)`.
-#[cfg(kernel_smp_shared)]
+/// The one Big Kernel Lock. Only meaningful under `cfg(kernel_smp_shared)`, and
+/// only on the bare-metal target — every user is `target_os = "none"`, so the
+/// host test build (which now sees `smp-shared` because it is in the default
+/// feature set) would otherwise carry it unused and trip `dead_code = "deny"`.
+#[cfg(all(kernel_smp_shared, target_os = "none"))]
 static KERNEL_LOCK: KernelLock = KernelLock::new();
 
 // --- Deliberately-dropped BKL windows -------------------------------------------------

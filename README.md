@@ -1,10 +1,11 @@
 # Akuma OS
 
-Bohemian operating system, now with an official soundtrack, [*Omegashima*](https://tokyorider.bandcamp.com/album/omegashima) by *Tokyo Rider*.
+*Bohemian operating system*, now with an official soundtrack, [*Omegashima*](https://tokyorider.bandcamp.com/album/omegashima) by *Tokyo Rider*.
 
 **This project is built with various AI tools as an experiment** to understand if models at the time could be used to produce some working software and dive into a domain I had some familiarity with but never got to explore. Reading Andrew Tannenbaum 20 years ago certainly helped but looking at the code and putting stuff togeter and getting to the point of running real software on custom bare bones kernel is an exciting hobby even if it only runs in QEMU.
 
 **Bare-metal AArch64 OS in Rust — preemptive kernel, Linux ABI, SSH, containers, apk, TCC/Clang/GCC/rustc, Git**
+
 
 ```
                                              %#%:                +
@@ -73,10 +74,10 @@ See [`docs/AKUMA_SELF_HOSTING.md`](docs/AKUMA_SELF_HOSTING.md).
 | Feature | Details |
 |---|---|
 | **TCP/IP stack** | smoltcp with VirtIO-net driver, TCP and UDP sockets, loopback, DHCP |
-| **SSH-2 server** | In-kernel, port 2222 — curve25519-sha256 key exchange, Ed25519 host keys, AES-128-CTR, public key auth, up to 4 concurrent sessions |
+| **SSH-2 server** | Userspace `/bin/sshd`, port 2222 — curve25519-sha256 key exchange, Ed25519 host keys, AES-128-CTR, public key auth |
 | **HTTP server** | Serves static files and CGI scripts (JS, ELF binaries) |
-| **HTTP client** | Built-in `curl` for HTTP GET with streaming downloads |
-| **TLS 1.3** | Kernel (async) and userspace (blocking) via `embedded-tls` |
+| **HTTP client** | Userspace `/bin/curl` (HTTP + HTTPS) |
+| **TLS 1.3** | Userspace only (`userspace/libakuma-tls`). The kernel carries no TLS and no crypto crates at all |
 | **DNS** | Built-in DNS resolver, `nslookup` command |
 
 ### Filesystems
@@ -91,8 +92,8 @@ See [`docs/AKUMA_SELF_HOSTING.md`](docs/AKUMA_SELF_HOSTING.md).
 
 | Feature | Details |
 |---|---|
-| **Built-in shell** | Pipelines (`\|`), redirection (`>`, `>>`), chaining (`;`, `&&`), variable expansion |
-| **busybox** | Main interactive shell |
+| **busybox** | Main interactive shell (ash) |
+| **paws** | Experimental 8-page minimal shell for the 4 MB extreme demo — see `userspace/paws/README.md` |
 | **System commands** | `ps`, `top`, `kill`, `free`, `df`, `mount`, `uname`, `env` |
 | **File commands** | `ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `chmod`, `ln`, `touch`, `find` |
 
@@ -154,11 +155,15 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@localhost -
 | `akuma-exec` | Threading, process management, MMU page tables, ELF loader |
 | `akuma-net` | Socket layer, TCP/UDP abstractions, smoltcp integration |
 | `akuma-ext2` | ext2 filesystem read/write |
-| `akuma-shell` | Shell parser, command pipeline, redirection, variable expansion |
 | `akuma-vfs` | Virtual filesystem types, mount table, path resolution |
-| `akuma-ssh-crypto` | SSH cryptographic primitives (Ed25519, x25519, AES-128-CTR, HMAC) |
-| `akuma-ssh` | SSH-2 protocol handling, channel management, auth |
-| `akuma-terminal` | Terminal emulation, raw/cooked modes, escape sequences |
+| `akuma-terminal` | Terminal emulation, raw/cooked modes, escape sequences (PTY support for the userspace sshd) |
+| `akuma-isolation` | Container / box isolation primitives |
+| `akuma-rump` | NetBSD rump-kernel sysproxy client |
+| `akuma-smp` | Multikernel core coordination (descriptor, MPSC inbox) |
+
+`akuma-ssh-crypto` moved to `userspace/` in 2026-08 — its only consumer is
+`userspace/sshd`. `akuma-ssh`, `akuma-shell` and `akuma-editor` were deleted
+with the in-kernel SSH server they served.
 
 ## Project Layout
 
@@ -171,6 +176,8 @@ userspace/
   tcc/              Tiny C Compiler
   herd/             Process supervisor
   scratch/          minimal Git implementation (HTTPS only)
+  sshd/             SSH-2 server (the only one)
+  paws/             experimental minimal shell (4 MB demo)
 docs/             Architecture notes and design docs
 scripts/          Build and debug scripts
 config/           Configuration files

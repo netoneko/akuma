@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e
-# Build the devbox kernel: the `devbox` profile (inherits release codegen) plus a
+# Build the devbox kernel: plain `--release` codegen plus a
 # feature set that makes the NetBSD rump stack the DEFAULT network stack for box 0
 # (`rump-default`) and drops the built-in smoltcp SSH server (`userspace-sshd`).
 #
@@ -14,8 +14,8 @@ set -e
 # Extra args are forwarded (e.g. `scripts/build_devbox.sh --quiet`).
 DEVBOX_FEATURES="devbox,sound,no-tests,rump-tests,sc-aio,sc-sysv-ipc,sc-framebuffer,sc-containers,sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll"
 cargo build \
-    --profile devbox \
+    --release \
     --no-default-features \
     --features "$DEVBOX_FEATURES" \
     "$@"
-ls -lh target/aarch64-unknown-none/devbox/akuma
+ls -lh target/aarch64-unknown-none/release/akuma

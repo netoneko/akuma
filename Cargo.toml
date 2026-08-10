@@ -88,25 +88,6 @@ codegen-units = 1
 strip = "symbols"
 panic = "immediate-abort"
 
-# Multikernel build (docs/MULTIKERNEL.md §11). Inherits `release` codegen; carries
-# any SMP-specific knobs later. The profile sets codegen, the `smp` FEATURE gates
-# the code — they are selected together by scripts/build_smp.sh:
-#   cargo build --profile release-smp --features smp
-# Off by default until the §10 acceptance test passes; `cargo build --release`
-# is unaffected and the single-core path stays the only path.
-[profile.release-smp]
-inherits = "release"
-
-# Devbox build (overlays/devbox). Inherits `release` codegen (so it carries `rump`
-# + `sound`); the DISTINCTION from release is entirely in the `devbox` FEATURE set,
-# selected together by scripts/build_devbox.sh / overlays/devbox/run.sh:
-#   cargo run --profile devbox --features devbox
-# The devbox makes the NetBSD rump stack the DEFAULT network stack for box 0 (the
-# root box every process starts in) and drops the built-in smoltcp SSH server, so
-# the only stack you touch — and the only sshd — is rump. See the `devbox` feature.
-[profile.devbox]
-inherits = "release"
-
 # DWARF debug-info variant of `release`, for source-level lldb debugging
 # against the gdbstub (see docs/reference/scripts/multi-vm.md) instead of raw
 # addresses. OFF BY DEFAULT: nothing selects this profile unless explicitly
@@ -127,6 +108,10 @@ debug = true
 
 [features]
 default = [
+    # Real (shared-kernel) SMP is the default since 2026-08-10 — this is *the* SMP.
+    # The multikernel (`smp`) is the experimental one-kernel-per-core alternative and
+    # is mutually exclusive with it, so building that needs --no-default-features.
+    "smp-shared",
     "smoltcp",
     "sound",
     "rump",

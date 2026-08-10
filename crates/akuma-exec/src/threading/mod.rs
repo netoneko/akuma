@@ -1793,7 +1793,14 @@ pub fn disable_preemption() {
     let prev = PREEMPTION_DISABLED[tid].fetch_add(1, Ordering::SeqCst);
     // Record timestamp on first disable (nesting level 0 -> 1)
     if prev == 0 {
-        PREEMPTION_DISABLED_SINCE[tid].store((runtime().uptime_us)(), Ordering::Release);
+        // `runtime()` panics when unregistered, and this is the one line in the
+        // path that needs it — a diagnostic timestamp. PreemptGuard documents
+        // itself as usable "during early boot and in host tests alike", which is
+        // only true if this degrades instead of panicking. (Host tests of
+        // akuma-ext2 reach here via its no-bkl-vfs PreemptGuard once `smp-shared`
+        // is in the default feature set.)
+        let now = if crate::runtime::is_registered() { (runtime().uptime_us)() } else { 0 };
+        PREEMPTION_DISABLED_SINCE[tid].store(now, Ordering::Release);
         PREEMPTION_DISABLED_AT[tid]
             .store(core::panic::Location::caller() as *const _ as u64, Ordering::Relaxed);
     }

@@ -31,4 +31,4 @@ echo
 # Same feature set as scripts/build_devbox.sh: --no-default-features drops smoltcp
 # (and the smoltcp-coupled built-in SSH) entirely; rump is the only stack.
 DEVBOX_FEATURES="devbox,neko,sound,no-tests,rump-tests,sc-aio,sc-sysv-ipc,sc-framebuffer,sc-containers,sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll"
-exec cargo run --profile devbox --no-default-features --features "$DEVBOX_FEATURES"
+exec cargo run --release --no-default-features --features "$DEVBOX_FEATURES"

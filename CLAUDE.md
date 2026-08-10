@@ -1,11 +1,13 @@
 # Akuma OS
 
-Bare-metal Rust OS for AArch64 (QEMU virt). In-kernel SSH, networking, ext2 VFS, containers, JS engine, C compiler.
+Bare-metal Rust OS for AArch64 (QEMU virt). Networking, ext2 VFS, containers, JS engine, C compiler.
+SSH is a userspace daemon (`userspace/sshd`); the kernel has no SSH server, no shell,
+no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_SSH_REMOVAL.md`).
 
 ## Layout
 
 - `src/` — Kernel (no_std Rust)
-- `crates/` — Host-testable extracted crates: `akuma-{editor,exec,ext2,isolation,net,rump,shell,smp,ssh,ssh-crypto,terminal,vfs}`
+- `crates/` — Host-testable extracted crates: `akuma-{exec,ext2,isolation,net,rump,smp,terminal,vfs}`
 - `userspace/` — ELF binaries (musl libc); current member list + one-liners: `docs/reference/userspace-layout.md`
 - `docs/` — Documentation (see below)
 - `scripts/` — Build and debug helpers
@@ -30,7 +32,7 @@ docs/archive/      200+ historical investigation docs, verbatim. Linked from new
 
 - Reference subsystem docs live in `docs/reference/subsystems/` (memory, scheduler,
   smp, smp-shared, networking, rump-stack, ssh, vfs, containers, exceptions,
-  boot, irq, console, rng, async-fs, editor, shell, config-flags, drivers/),
+  boot, irq, console, rng, async-fs, config-flags, drivers/),
   with 17 per-family syscall docs under `docs/reference/subsystems/syscalls/`.
 - Linux ABI / musl notes: `docs/reference/abi/`.
 - Build targets: `docs/reference/build-profiles.md`; every feature and env knob:
@@ -64,16 +66,20 @@ A build target is **profile + feature set**, always selected together. Details
 and tradeoffs in `docs/reference/build-profiles.md`.
 
 ```bash
-scripts/build_size.sh                                     # size (slim)
-scripts/build_extreme_size.sh                             # extreme-size (4 MB RAM floor, no HTTPS)
-cargo build --profile release-smp --features smp          # multikernel (one kernel per core)
-cargo build --profile release-smp-shared --features smp-shared  # real shared-kernel SMP
-scripts/build_devbox_smoltcp.sh && overlays/devbox/run-smoltcp.sh  # default devbox (smoltcp + SMP + userspace sshd)
+scripts/build_extreme_size.sh                             # extreme-size (4.0 MB floor, userspace sshd + paws, single-core)
+scripts/build_devbox_smoltcp.sh && overlays/devbox/run-smoltcp.sh  # default devbox (userspace sshd)
 scripts/build_devbox.sh && overlays/devbox/run.sh         # rump devbox (deferred; needs RUMP_NIC=1)
+cargo build --release --no-default-features --features smp,smoltcp  # multikernel (experimental)
 ```
 
-`smp` and `smp-shared` are mutually exclusive (build.rs enforces).
-`cargo build --release` is single-core.
+**`cargo build --release` is real SMP.** `smp-shared` — one shared kernel across
+all cores under real locks — is in the default feature set; run it with `SMP=N`.
+That is *the* SMP. The `smp` feature is the separate, experimental
+**multikernel** (one whole kernel per core); the two are mutually exclusive
+(build.rs panics), so building it needs `--no-default-features`.
+
+Profiles are only `release`, `extreme-size` and `release-debug` — a build target
+is `--release` plus a feature set.
 
 ## VM Access
 
@@ -87,8 +93,13 @@ subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", "-p", "2222", "root@loc
 
 To wait for VM boot, poll the log file — NEVER call `job_output` with `wait: true` on the QEMU process (it runs forever):
 ```bash
-until grep -q "SSH Server\] Listening" 01_verify_apk_bootstrap_acceptance.log 2>/dev/null; do sleep 2; done
+until grep -aqE "sshd started|Started sshd" 01_verify_apk_bootstrap_acceptance.log 2>/dev/null; do sleep 2; done
 ```
+
+Two markers because there are two startup paths: `extreme-size` has the kernel
+spawn sshd (`[Main] sshd started`), every other profile lets herd do it
+(`[herd] Started sshd`). `-a` is required — QEMU emits a control byte that makes
+plain `grep` treat the log as binary.
 
 If the VM wedges (100% CPU, unresponsive), see `docs/runbooks/recover-wedged-vm.md`.
 
@@ -107,6 +118,8 @@ motivated the rule are in `docs/archive/ALLOC_PRINT_AUDIT.md`.
 Host unit tests (crates only):
 ```bash
 cargo test --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)
+# akuma-ssh-crypto lives under userspace/ (its only consumer is userspace/sshd):
+(cd userspace && cargo test -p akuma-ssh-crypto --target $(rustc -vV | grep '^host:' | cut -d' ' -f2))
 ```
 
 Acceptance playbooks live in `acceptance/` — run them end-to-end for
