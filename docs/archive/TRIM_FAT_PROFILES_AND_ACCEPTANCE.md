@@ -293,50 +293,66 @@ configuration nothing routinely compiles rots quietly.
 
 ## Acceptance suite: trimmed
 
-The review flagged above happened later the same day. Kept: **05, 08, 10, 11**.
-Moved to `acceptance/archive/`: 01, 02, 03, 04, 06, 07, 09, 12. `acceptance/`
-itself is now four files; nothing in the numbering or content of the kept four
-changed, so `acceptance/05_meow_tcc_extreme_4mb.md`,
-`08_meow_clone_compile_run.md`, `10_selfhost_compile_akuma.md`, and
-`11_netbsd_rumpkernel_irc.md` are still the same paths they always were.
+The review flagged above happened later the same day, in two passes. First
+pass kept 05, 08, 10, 11 and archived the other eight. Second pass, once it
+was clear 05 and 08 were near-duplicates of each other (see below), dropped 08
+too. Final kept set: **05, 10, 11**. Moved to `acceptance/archive/`: 01, 02,
+03, 04, 06, 07, 08, 09, 12. `acceptance/` itself is now three files; the kept
+three didn't move, so `acceptance/05_meow_tcc_extreme_4mb.md`,
+`10_selfhost_compile_akuma.md`, and `11_netbsd_rumpkernel_irc.md` are still
+the same paths they always were.
 
-**Why these four.** Each proves a structurally different capability rather than
-a variation on the same one: 05/08 are the extreme-size 4.0 MB floor (scratch
-clone + static tcc compile + run, the tightest resource-constrained path in the
-repo), 10 is the self-hosting probe (rustc building Akuma's own kernel inside
-Akuma), 11 is the NetBSD rump TCP/IP stack proof (the only playbook exercising
-a second network stack end-to-end, including an IRC capstone that actually
-passed). None of the twelve ever covered `devbox`, `devbox-smoltcp`, `size`, or
-`smp`/`smp-shared` (finding G above), so this trim doesn't create that gap —
-it was already there. It also doesn't fully realize the "touch each profile
-once" heuristic from finding G: 10 and 11 both build `release` (per the
-`cargo build/run --release` row in the target-mapping table above), so the kept
-set is extreme-size ×2, release ×2, and still zero for the other four targets.
-The selection optimizes for distinct *capability* coverage, not distinct
-*profile* coverage — worth knowing if `acceptance/` gets revisited again.
+**Why 08 came out too.** 05 and 08 were both: extreme-size kernel, 4.0 MB RAM,
+meow clones `akuma-playground` with `scratch`, compiles `hello.c` with
+`tcc -static`, runs it, asserts "Hello" — same prompt text verbatim, same
+failure-mode table, same floor-reference table. The only real difference was
+*how* `scratch` got installed (05: `pkg install` at runtime; 08: pre-staged by
+`populate_disk.sh`) and 08's stated intent to sweep across model sizes
+(`qwen3:4b` / `gemma4-yolo-4b` / `qwen3.5:0.8b`) — but every row of that sweep
+was still `TBD` in 08's own floor table, so that differentiator was never
+actually exercised. As it stood, 08 was 05 with a different install path and
+an unrealized ambition. If the model-size sweep is ever picked back up, it
+belongs as a section inside 05, not a second playbook.
 
-**Overlap among the eight archived playbooks.** None were deleted — they still
+**Why the remaining three.** Each proves a structurally different capability:
+05 is the extreme-size 4.0 MB floor (scratch clone + static tcc compile + run,
+the tightest resource-constrained path in the repo), 10 is the self-hosting
+probe (rustc building Akuma's own kernel inside Akuma), 11 is the NetBSD rump
+TCP/IP stack proof (the only playbook exercising a second network stack
+end-to-end, including an IRC capstone that actually passed). None of the
+twelve ever covered `devbox`, `devbox-smoltcp`, `size`, or `smp`/`smp-shared`
+(finding G above), so this trim doesn't create that gap — it was already
+there. It also doesn't realize the "touch each profile once" heuristic from
+finding G: 10 and 11 both build `release` (per the `cargo build/run --release`
+row in the target-mapping table above), so the kept set is extreme-size ×1,
+release ×2, and still zero for the other four targets. The selection
+optimizes for distinct *capability* coverage, not distinct *profile*
+coverage — worth knowing if `acceptance/` gets revisited again.
+
+**Overlap among the nine archived playbooks.** None were deleted — they still
 run, and still document real ground — but most were fully or mostly subsumed
-by one of the kept four or by each other:
+by 05 or by each other:
 
 | archived | overlaps with | relationship |
 |---|---|---|
 | 01 (apk bootstrap: install busybox) | 02 | 02's prep is 01's prep verbatim (same SSH-key/apk-tools/disk steps) plus git+tcc on top; 01 is a strict subset |
-| 02 (apk-installed git + tcc, clone + compile + run) | 05, 08 | same clone-then-compile-then-run shape as 05/08, but via `apk add git tcc` instead of `scratch` + static tcc — an earlier, heavier path to the same proof |
+| 02 (apk-installed git + tcc, clone + compile + run) | 05 | same clone-then-compile-then-run shape as 05, but via `apk add git tcc` instead of `scratch` + static tcc — an earlier, heavier path to the same proof |
 | 03 (two-VM meow+tcc, llama.cpp backend) | 04 | identical task to 04 (meow compiles hello.c with tcc) with a second QEMU VM standing in for the Ollama host — same proof, different LLM transport |
-| 04 (meow+tcc memory sweep, release kernel) | 05, 08 | direct ancestor: same meow-drives-tcc-via-Shell-tool pattern, on `release` instead of `extreme-size`; 05/08 repeat its memory-sweep methodology at the lower floor |
+| 04 (meow+tcc memory sweep, release kernel) | 05 | direct ancestor: same meow-drives-tcc-via-Shell-tool pattern, on `release` instead of `extreme-size`; 05 repeats its memory-sweep methodology at the lower floor |
 | 06 (meow+tcc via CGI/httpd) | 05 | says so explicitly in its own header — "the same clone → compile → run task as test 05," only the trigger (HTTP POST vs SSH) differs |
-| 07 (tcc -static prereqs, extreme, no agent) | 05, 08 | the layer underneath 05/08 — same extreme-size 4.0 MB floor, minus the meow/scratch orchestration; 05's and 08's own floor-reference tables cite 07's numbers directly |
-| 09 (nca + Docker chroot, no Akuma kernel) | 08 | carries an explicit "Differences from acceptance/08" comparison table in its own text; same clone+compile+run proof, ported off the Akuma kernel entirely to isolate the memory floor from kernel overhead |
+| 07 (tcc -static prereqs, extreme, no agent) | 05 | the layer underneath 05 — same extreme-size 4.0 MB floor, minus the meow/scratch orchestration; 05's own floor-reference table cites 07's numbers directly |
+| 08 (meow+scratch+tcc, extreme, pre-staged install) | 05 | near-duplicate — see "Why 08 came out too" above; same task, same floor table, differs only in how `scratch` is installed |
+| 09 (nca + Docker chroot, no Akuma kernel) | 05, 08 | carried an explicit "Differences from acceptance/08" comparison table in its own text (08 was still current when 09 was written); same clone+compile+run proof, ported off the Akuma kernel entirely to isolate the memory floor from kernel overhead — now that 08 is archived too, 05 is 09's closest surviving kin |
 | 12 (multikernel demo: core pinning + forwarding) | — | no overlap with the tcc/meow cluster or with each other; distinct subsystem (SMP/multikernel core lifecycle). Archived on suite-size grounds, not redundancy — per finding G it was the *only* playbook covering the experimental `smp` feature, so multikernel now has zero acceptance coverage (`docs/reference/subsystems/smp.md` notes this) |
 
-The one non-obvious exception to "subsumed by a kept test": **04, 06, 07 also
-overlap with each other**, not just with 05/08 — 06 is 05's task via CGI, and
-07 is what both 04 and 06's underlying tcc step reduces to once you strip the
-agent. If `acceptance/archive/` itself ever needs a further cut, that
-04/06/07 trio is the next redundant cluster, with 07 the most load-bearing of
-the three (05/08 cite its measured floor numbers) and 04 the least (fully
-superseded by 08's memory-sweep procedure on the tighter profile).
+The one non-obvious exception to "subsumed by 05": **02, 04, 06, 07, 08 also
+overlap with each other**, not just with 05 — 06 is 05's task via CGI, 08 is
+05's task via a different scratch-install path, and 07 is what 02/04/06/08's
+underlying tcc step reduces to once you strip the agent. If
+`acceptance/archive/` itself ever needs a further cut, that cluster is the
+next redundant one, with 07 the most load-bearing of the group (05's own
+floor table cites its measured numbers) and 04 the least (fully superseded by
+08's — now archived — memory-sweep procedure, which 05 in turn absorbed).
 
 Two facts that motivated the cut, carried over from the original review:
 

@@ -106,7 +106,7 @@ locals instead of addresses.
 Not in any profile. `crates/akuma-ssh`, `src/ssh/`, the in-kernel shell, the
 in-kernel editor and all kernel cryptography were **deleted** on 2026-08-10;
 every image serves SSH from the userspace `/bin/sshd`. The `extreme-size`
-profile was the last holdout and lost it too once `acceptance/08` was verified
+profile was the last holdout and lost it too once `acceptance/archive/08` was verified
 passing at 4.0 MB over userspace sshd — see
 [`../archive/BUILTIN_SSH_REMOVAL.md`](../archive/BUILTIN_SSH_REMOVAL.md).
 
