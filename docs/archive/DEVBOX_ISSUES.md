@@ -1,0 +1,223 @@
+# Devbox-smoltcp issues log
+
+Running log of issues found while dogfooding the devbox-smoltcp image
+(`overlays/devbox/`). One entry per issue; each stands alone.
+
+## Issue 1: `git clone` over HTTPS deadlocks — pipe fills, nobody drains it
+
+**Status: OPEN.** Found 2026-08-10 running `git clone
+https://github.com/madebyaris/native-cli-ai.git` inside a devbox-smoltcp VM
+(real `apk`-installed git 2.54.0, not `scratch`).
+
+### Symptom
+
+`git clone` hangs forever with zero progress output and zero CPU usage. No
+error, no timeout — it just never returns.
+
+### Diagnosis
+
+No gdbstub was attached to this VM (booted without `-s -S`), so this was
+diagnosed entirely from the kernel's always-on deadlock diagnostics
+(`DEADLOCK_THREAD_DUMP_ENABLED`, `[THR-DUMP]`/`[PIPE-DUMP]`/`[PSTATS]`,
+`src/config.rs:221`) plus `/proc` inspection over SSH — no gdb needed.
+
+Process tree:
+
+```
+pid 29  /usr/bin/git                         "git clone <url>"
+  └─ pid 30  /usr/bin/git                    "git remote-https origin <url>"
+       └─ pid 31  /usr/libexec/git-core/git-remote-http  "origin <url>"
+```
+
+`[PIPE-DUMP]` showed one pipe completely full:
+
+```
+pipe=13 bytes=65536 readers=1 writers=2 pollers=1
+  poller tid=13
+```
+
+`[THR-DUMP]` showed all three processes parked, none of them reading it:
+
+```
+tid=13 pid=31  sc=64  tsc=64   a0=0x1  a1=0x30c910ac   # write(fd=1, ...) — blocked, pipe full
+tid=12 pid=30  sc=260 tsc=260  a0=0x1f a1=0x203ffffb24  # wait4(pid=31, ...) — not reading
+tid=11 pid=29  sc=93  tsc=260  a0=0x1e a1=0x0           # tsc (authoritative) = wait4(pid=30, ...) — not reading
+```
+
+(`sc` is the process-level `current_syscall`, which the code itself documents
+as capable of going stale across thread-slot reuse — `crates/akuma-exec/src/threading/mod.rs:944-951`.
+`tsc` is the exact per-thread value and is authoritative; pid 29's `sc=93`
+disagreeing with its own `tsc=260` is exactly that known staleness, not a
+second syscall in flight.)
+
+Two `[THR-DUMP]`/`[PSTATS]` snapshots 30 seconds apart showed **byte-for-byte
+identical** syscall counts for all three PIDs (`pid 31`: `write=921`,
+`pselect6=56`, `recvfrom=447`, `connect=3`, ... unchanged) — this is a
+permanent deadlock, not a slow network.
+
+`/proc/29/fd` confirmed pid 29 holds the *read* end of the stuck pipe at fd 5
+(`pipe:[13]`) — it is the intended reader. `/proc/30/fd` showed pid 30 *also*
+still has the pipe's write end open at fd 1, alongside pid 31's own copy
+(explaining `[PIPE-DUMP]`'s `writers=2`) — a dangling fd pid 30 never closed
+after spawning pid 31, though this is secondary to the actual deadlock, not
+its cause.
+
+### Root cause (best evidence, not fully nailed down)
+
+`docs/archive/GIT_MISSING_SYSCALLS.md` (Issues 12-14) already documents this
+exact shape of problem from an earlier round: git's fetch-pack process is
+supposed to run a second, `pthread_create`/`CLONE_THREAD`-spawned "sideband
+demux" thread (via `start_async`) that continuously drains the remote
+helper's output pipe *while the main thread blocks in `wait4()`* on the
+subprocess tree. That's the only way both halves — draining the pipe and
+reaping children — happen concurrently in one process.
+
+`/proc/29/status` and `/proc/30/status` both report **`Threads: 1`**. That
+demux thread does not exist right now. Either it was never spawned for this
+particular negotiation path, or it was spawned and exited/died silently —
+this VM had no gdbstub and there's no retroactive syscall-history trace, so
+telling those two apart needs a fresh repro with `GDB=1` or temporary
+`clone()`/`pthread_create` logging around this code path.
+
+### Reproducing
+
+```bash
+scripts/build_devbox_smoltcp.sh
+overlays/devbox/run-smoltcp.sh
+ssh -o StrictHostKeyChecking=no -p 2222 root@localhost \
+    'git clone https://github.com/madebyaris/native-cli-ai.git'
+```
+
+Any sufficiently large/slow HTTPS clone should reproduce it — the pipe only
+backs up once the remote helper has more buffered output than the (missing)
+demux thread would have drained.
+
+### While debugging, unrelated finding: `devbox.img` had broken core symlinks
+
+The `devbox.img` in use when this was found had `ps`, `head`, `tail`, and
+other busybox applets returning `not found` despite `/bin/busybox` itself
+working — stale/broken symlinks. Root cause not investigated (the fix was
+just to rebuild the image via `overlays/devbox/bootstrap.sh`, which recreates
+`/bin`'s busybox applet symlinks from scratch — see step 4 of that script).
+Worth a closer look if a future devbox.img shows the same symptom, since a
+rebuild papering over it once doesn't rule out a `populate_disk.sh` or
+`bootstrap.sh` step that produces it non-deterministically.
+
+## Issue 2: Interactive TUI session wedges the whole VM — BKL stuck, core-pinned
+
+**Status: OPEN.** Found 2026-08-10, same devbox-smoltcp VM as Issue 1, later
+the same session — while `meow` was running interactively in TUI mode
+(idle-polling for keyboard input, no command in flight). No gdbstub attached
+this time either.
+
+### Symptom
+
+The VM stops responding entirely — SSH connections hang and time out, the
+running interactive `meow` session stops updating. `qemu-system-aarch64`
+pegs at ~199% CPU (both `SMP=2` cores spinning). No panic, no crash — the
+kernel's own log just keeps printing, forever, with zero forward progress.
+
+### Diagnosis
+
+```
+[BKL] stuck: owner=2 waiter=1 tag=511 (aff0+1)
+[WATCHDOG] Preemption disabled for 1113ms at step 6 tid=11
+[WATCHDOG] disabled at src/syscall/term.rs:432
+...
+[WATCHDOG] Thread 11 preemption disabled 94132ms (critical)
+```
+
+`owner=`/`waiter=` in `[BKL] stuck` are **core IDs**, not PIDs or TIDs —
+confirmed against the print site (`crates/akuma-exec/src/sync.rs:845`) and
+`KernelLock::held_by` (`sync.rs:819`, `owner == core_id + 1`, matching the
+`(aff0+1)` in the log line). So `owner=2 waiter=1` reads as: **core 1 holds
+the Big Kernel Lock, core 0 is stuck spinning for it.** (`tag=511` is always
+meaningless unless the profiler is on — read `owner=` instead, per
+`log_kernel_lock_stuck`'s own comment at `sync.rs:833-835` and the ticket/barge
+history in [`BKL_PHASE7_AUDIT.md`](BKL_PHASE7_AUDIT.md).)
+
+The watchdog names the stuck thread precisely: `tid=11`, which the
+surrounding `[THR-DUMP]`/`[PSTATS]` identify as `pid=15` = `/bin/meow` (the
+interactive TUI session itself), `last_core=0` — consistent with `waiter=1`
+(core 0). It's stuck inside the kernel's blocking-stdin-read-with-timeout
+loop, `src/syscall/term.rs:405-437` — specifically line 432:
+
+```rust
+akuma_exec::threading::disable_preemption();
+let term_state = term_state_lock.lock();   // <-- watchdog fires here
+term_state.input_waker.lock().take();
+akuma_exec::threading::enable_preemption();
+```
+
+Preemption is disabled, then it tries to acquire `term_state_lock` — and the
+watchdog counter climbs past 94 seconds with no progress. That's the shape of
+a self-inflicted stall: a thread spinning for a lock *with preemption off* on
+one core, while whatever holds the lock (or the BKL blocking this thread's
+own forward progress) is on the other core and never gets to run long enough
+to release it — each side effectively starves the other.
+
+**Who's actually on core 1 holding the BKL is not proven**, only
+circumstantial: the `[THR-DUMP]` snapshot taken just before the stall storm
+began shows `tid=9` / `pid=2,tgid=2` (`/bin/sshd`) as the only real
+(non-idle, non-watched) process attributed to `last_core=1`, and its
+`[PSTATS]` line shows nearly all of its runtime (`477378ms` of `479090ms`
+`in_kernel`) spent in `nanosleep` — i.e. a poll loop. That matches
+`userspace/sshd/docs/OPTIONAL_PARALLELISM.md`'s description of `sshd` as a
+**single-process, single-threaded, cooperative-scheduling** server that polls
+across sessions rather than blocking per-session — exactly the kind of
+architecture where a long-held lock inside one poll iteration has no sibling
+thread to hand off to. That doc is about a *different* problem (core
+utilization / fault isolation across SSH sessions, not this wedge), but the
+underlying property it documents — sshd never yields to a peer thread because
+it doesn't have one — is the same shape of constraint that would make "core 1
+is busy and never lets go" plausible without being certain sshd itself is the
+`term_state_lock`/BKL holder in this specific stall. A single point-in-time
+snapshot can't prove who held the lock for the whole 94-second window; that
+would need the watchdog (or a fresh repro) to also capture the *owner* core's
+thread identity at the moment it entered the critical section, not just the
+waiter's.
+
+### Not caused by this session's meow/kernel changes
+
+Nothing touched in this session modified `src/syscall/term.rs`,
+`crates/akuma-exec/src/sync.rs`, or `/bin/sshd` — every kernel-adjacent file
+here was read-only. All source changes this session were confined to
+`userspace/meow/src` (tool-call parsing, allocation cleanup, one UI color).
+This is a pre-existing kernel bug, first observed under ordinary interactive
+use, not a regression from anything fixed alongside it.
+
+### Reproducing
+
+Not yet reliably reproducible on demand — this surfaced during ordinary idle
+TUI polling, not a specific command. Best current lead: run `meow` (no `-c`,
+i.e. interactive TUI) for an extended idle period on a devbox-smoltcp VM
+while `sshd` is otherwise busy (e.g. other SSH sessions cycling), and watch
+`[BKL] stuck`/`[WATCHDOG]` output in the kernel log for `disabled at
+src/syscall/term.rs:432`.
+
+### Next step, if picked up
+
+Attach gdbstub (`GDB=1`) on a fresh boot and reproduce interactively, or add
+temporary logging around `term_state_lock`'s acquire/release to capture which
+core (and which thread) actually holds it during a stuck window — the
+`[THR-DUMP]` snapshot cadence (every ~30s heartbeat) is too coarse to catch
+the moment of entry into the critical section.
+
+## Background
+
+- `docs/archive/GIT_MISSING_SYSCALLS.md` — Issues 11-14, the CLONE_THREAD /
+  sideband-demux-thread / `wait4` visibility bugs Issue 1's root cause most
+  closely resembles (all previously FIXED; this may be a new gap in the same
+  area, not a regression of those specific fixes).
+- `docs/runbooks/debug-devbox.md`, `docs/runbooks/debug-network.md` —
+  general devbox/network triage; `docs/README.md`'s symptom matrix routes
+  "`git clone` hangs or wedges" there, with a row added pointing here too.
+- `userspace/sshd/docs/OPTIONAL_PARALLELISM.md` — Issue 2's circumstantial
+  link: sshd's single-process, single-threaded, cooperative-poll-loop
+  architecture (not a bug in itself, a documented design tradeoff) as the
+  plausible reason core 1 stayed busy long enough to produce a 94-second BKL
+  stall, without proof sshd is the specific lock holder in this instance.
+- `crates/akuma-exec/src/sync.rs` — `KernelLock`, `log_kernel_lock_stuck`
+  (the `[BKL] stuck` print site, confirms `owner=`/`waiter=` are core IDs).
+- `src/syscall/term.rs` — the blocking-stdin-read-with-timeout loop where the
+  watchdog pinpointed the stall (line 432).

@@ -13,9 +13,9 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 - `scripts/` — Build and debug helpers
 - `overlays/devbox/` — Devbox distro rootfs + `run.sh` / `run-smoltcp.sh`
 - `bootstrap/` — Alpine apk bootstrap assets
-- `acceptance/` — Numbered acceptance test playbooks: 05, 10, 11 are the live
-  set (extreme-size 4 MB floor, self-host, rump); `acceptance/archive/` holds
-  the rest, superseded or subsumed by those three
+- `acceptance/` — Numbered acceptance test playbooks: 05, 10, 11, 13 are the
+  live set (extreme-size 4 MB floor, self-host, rump, `cargo install`-built
+  agent); `acceptance/archive/` holds the rest, superseded or subsumed
   (`docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md`).
 - `proposals/` — In-flight design proposals
 

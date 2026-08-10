@@ -32,7 +32,7 @@ paws maps **8 pages** — about 5% of that cache.
   combinations — do not rely on them.
 - `ls` takes directories, not file arguments.
 
-`acceptance/08_meow_clone_compile_run.md` already documented these constraints
+`acceptance/archive/08_meow_clone_compile_run.md` already documented these constraints
 back when paws was the VM's shell: *"It lacks `printf`, `which`, `find -name`,
 `head`, `tail` … Pipes and complex redirections are unreliable."*
 
@@ -43,7 +43,7 @@ to do is exec one binary. That is enough for the agentic demo: meow's Shell tool
 uses its own in-process "pretend shell" (`USE_PRETEND_SHELL = true`), so tool
 commands never touch paws at all.
 
-Verified 2026-08-10: `acceptance/08` passes end to end on a 4.5 MB
+Verified 2026-08-10: `acceptance/archive/08` passes end to end on a 4.5 MB
 `extreme-size` kernel with paws as the login shell — meow (ollama `qwen3:4b`)
 clones with `scratch`, compiles `hello.c` with `tcc`, and runs it.
 
