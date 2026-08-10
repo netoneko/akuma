@@ -102,5 +102,5 @@ complex redirects, and PATH-only exec (cannot exec arbitrary paths like
 
 ## Background
 
-- [`acceptance/01_verify_apk_bootstrap.md`](../../acceptance/01_verify_apk_bootstrap.md) — cold-start disk bootstrap.
+- [`acceptance/archive/01_verify_apk_bootstrap.md`](../../acceptance/archive/01_verify_apk_bootstrap.md) — cold-start disk bootstrap.
 - [`../reference/subsystems/boot.md`](../reference/subsystems/boot.md).

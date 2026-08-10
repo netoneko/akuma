@@ -218,7 +218,9 @@ see `git log --oneline -- src/smp.rs`.
   debt-reclaim protocol, and the forwarding model.
 - `archive/MULTIKERNEL_NETWORKING_EXPERIMENT.md` — the forwarded-syscall
   latency investigation and the case for a NIC-local rump stack.
-- [`acceptance/12_multikernel_demo.md`](../../../acceptance/12_multikernel_demo.md)
+- [`acceptance/archive/12_multikernel_demo.md`](../../../acceptance/archive/12_multikernel_demo.md)
   — the end-to-end demo (pinned `curl`, then interactive `sshd` on a secondary).
+  Archived (2026-08-10) with the rest of the acceptance suite trim, but still the
+  only playbook covering the experimental `smp`/multikernel feature.
 - `userspace/herd/docs/CORE_AWARE_SCHEDULING.md` — herd's side of core pinning
   and the box/core mutual-exclusion rule.

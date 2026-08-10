@@ -5,7 +5,7 @@ Grade: — (index)
 | Script | What it does |
 |---|---|
 | [`run_multiple.sh`](../../../scripts/run_multiple.sh) | Launches N parallel Akuma boots (own disk, own port band, own log) with a log-stall watchdog, for hunting hangs that don't reproduce every boot. `scripts/run_multiple.sh 8`. Background: [`../../archive/STABILITY_URGENT_ISSUES.md`](../../archive/STABILITY_URGENT_ISSUES.md). |
-| [`run_two_vms.sh`](../../../scripts/run_two_vms.sh) | Boots the two-VM agent demo (a `meow` VM + a `llama.cpp` server VM wired together over SLIRP). Used by [`../../../acceptance/03_two_vms_agent_workflow.md`](../../../acceptance/03_two_vms_agent_workflow.md); background in [`../../archive/TWO_VMS_AGENT_DEMO.md`](../../archive/TWO_VMS_AGENT_DEMO.md). |
+| [`run_two_vms.sh`](../../../scripts/run_two_vms.sh) | Boots the two-VM agent demo (a `meow` VM + a `llama.cpp` server VM wired together over SLIRP). Used by [`../../../acceptance/archive/03_two_vms_agent_workflow.md`](../../../acceptance/archive/03_two_vms_agent_workflow.md) (archived — superseded by `acceptance/08_meow_clone_compile_run.md`'s Ollama-backed pipeline); background in [`../../archive/TWO_VMS_AGENT_DEMO.md`](../../archive/TWO_VMS_AGENT_DEMO.md). |
 | [`lockprobe.py`](../../../scripts/lockprobe.py) | Names the lock (and the fault) a **wedged SMP VM** is stuck on, via QEMU's gdbstub. Boot with `GDB=1`, then `scripts/lockprobe.py <gdb-port> -n 3`. Per core: PC/LR/SP symbolised, `ESR_EL1`/`ELR_EL1`/`FAR_EL1` with the exception class decoded, and every register that resolves to a named static (a kernel lock *is* a static, so this names the lock). Decodes `KERNEL_LOCK` into HELD-by-core-N / LOST-TICKET / idle. See the notes below. |
 
 ## `lockprobe.py` — reading it correctly

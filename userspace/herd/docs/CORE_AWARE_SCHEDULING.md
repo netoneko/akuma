@@ -1,7 +1,7 @@
 # herd core-aware scheduling
 
 **Status:** implemented (2026-06-30) for the single-pinned-program case — `/bin/hello` runs on a
-secondary core via `core = 1` in its service config (acceptance/12 Milestone 2). This doc describes
+secondary core via `core = 1` in its service config (acceptance/archive/12 Milestone 2). This doc describes
 the **userspace/herd** half of the multikernel: how herd places a service onto a specific per-core
 kernel.
 

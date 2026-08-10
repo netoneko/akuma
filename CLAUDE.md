@@ -13,7 +13,10 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 - `scripts/` — Build and debug helpers
 - `overlays/devbox/` — Devbox distro rootfs + `run.sh` / `run-smoltcp.sh`
 - `bootstrap/` — Alpine apk bootstrap assets
-- `acceptance/` — Numbered acceptance test playbooks (`01_verify_apk_bootstrap.md` … `12_multikernel_demo.md`)
+- `acceptance/` — Numbered acceptance test playbooks: 05, 08, 10, 11 are the
+  live set (one per shipping target: extreme, extreme+agent, self-host, rump);
+  `acceptance/archive/` holds the rest, superseded or subsumed by those four
+  (`docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md`).
 - `proposals/` — In-flight design proposals
 
 Never glob or list the repo root — it has 1000+ files. Always use a specific subdirectory path.

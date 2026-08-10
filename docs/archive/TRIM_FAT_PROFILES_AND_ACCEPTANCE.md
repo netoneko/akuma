@@ -291,28 +291,62 @@ removal; both were caused by *building a combination nobody had built*, which is
 the same class as finding F above (`scripts/build_devbox.sh` unbuildable) — a
 configuration nothing routinely compiles rots quietly.
 
-## Acceptance suite: review deferred
+## Acceptance suite: trimmed
 
-Noted here rather than acted on: **we will review the relevance of `acceptance/`
-later, and will likely narrow it to a smaller set of key scenarios.** There is a
-lot of build-up in there — twelve numbered playbooks accumulated as each
-milestone was reached, and much of it covers ground that has long since been
-passed and is now exercised incidentally by everything else. Keeping all twelve
-current has a cost that is no longer obviously repaid.
+The review flagged above happened later the same day. Kept: **05, 08, 10, 11**.
+Moved to `acceptance/archive/`: 01, 02, 03, 04, 06, 07, 09, 12. `acceptance/`
+itself is now four files; nothing in the numbering or content of the kept four
+changed, so `acceptance/05_meow_tcc_extreme_4mb.md`,
+`08_meow_clone_compile_run.md`, `10_selfhost_compile_akuma.md`, and
+`11_netbsd_rumpkernel_irc.md` are still the same paths they always were.
 
-Two facts to carry into that review:
+**Why these four.** Each proves a structurally different capability rather than
+a variation on the same one: 05/08 are the extreme-size 4.0 MB floor (scratch
+clone + static tcc compile + run, the tightest resource-constrained path in the
+repo), 10 is the self-hosting probe (rustc building Akuma's own kernel inside
+Akuma), 11 is the NetBSD rump TCP/IP stack proof (the only playbook exercising
+a second network stack end-to-end, including an IRC capstone that actually
+passed). None of the twelve ever covered `devbox`, `devbox-smoltcp`, `size`, or
+`smp`/`smp-shared` (finding G above), so this trim doesn't create that gap —
+it was already there. It also doesn't fully realize the "touch each profile
+once" heuristic from finding G: 10 and 11 both build `release` (per the
+`cargo build/run --release` row in the target-mapping table above), so the kept
+set is extreme-size ×2, release ×2, and still zero for the other four targets.
+The selection optimizes for distinct *capability* coverage, not distinct
+*profile* coverage — worth knowing if `acceptance/` gets revisited again.
 
-- **11 of 12 playbooks reference port 2222.** Only 09 does not. After this
-  branch, that port answers on `extreme-size` alone, so the release-based
-  playbooks (01, 02, 03, 04, 06, 10, 11) need either `-p 2323` or the port
-  decision in `BUILTIN_SSH_REMOVAL.md` resolved first.
-- **Coverage is lopsided, not thin.** Four playbooks exercise the extreme
-  profile and seven exercise release; four other documented targets have none.
-  If the suite is narrowed, the thing to preserve is *target* coverage, not
-  playbook count — a smaller set that touches each shipping profile once would
-  be strictly better than twelve that touch two.
+**Overlap among the eight archived playbooks.** None were deleted — they still
+run, and still document real ground — but most were fully or mostly subsumed
+by one of the kept four or by each other:
 
-No changes made to `acceptance/` in this branch.
+| archived | overlaps with | relationship |
+|---|---|---|
+| 01 (apk bootstrap: install busybox) | 02 | 02's prep is 01's prep verbatim (same SSH-key/apk-tools/disk steps) plus git+tcc on top; 01 is a strict subset |
+| 02 (apk-installed git + tcc, clone + compile + run) | 05, 08 | same clone-then-compile-then-run shape as 05/08, but via `apk add git tcc` instead of `scratch` + static tcc — an earlier, heavier path to the same proof |
+| 03 (two-VM meow+tcc, llama.cpp backend) | 04 | identical task to 04 (meow compiles hello.c with tcc) with a second QEMU VM standing in for the Ollama host — same proof, different LLM transport |
+| 04 (meow+tcc memory sweep, release kernel) | 05, 08 | direct ancestor: same meow-drives-tcc-via-Shell-tool pattern, on `release` instead of `extreme-size`; 05/08 repeat its memory-sweep methodology at the lower floor |
+| 06 (meow+tcc via CGI/httpd) | 05 | says so explicitly in its own header — "the same clone → compile → run task as test 05," only the trigger (HTTP POST vs SSH) differs |
+| 07 (tcc -static prereqs, extreme, no agent) | 05, 08 | the layer underneath 05/08 — same extreme-size 4.0 MB floor, minus the meow/scratch orchestration; 05's and 08's own floor-reference tables cite 07's numbers directly |
+| 09 (nca + Docker chroot, no Akuma kernel) | 08 | carries an explicit "Differences from acceptance/08" comparison table in its own text; same clone+compile+run proof, ported off the Akuma kernel entirely to isolate the memory floor from kernel overhead |
+| 12 (multikernel demo: core pinning + forwarding) | — | no overlap with the tcc/meow cluster or with each other; distinct subsystem (SMP/multikernel core lifecycle). Archived on suite-size grounds, not redundancy — per finding G it was the *only* playbook covering the experimental `smp` feature, so multikernel now has zero acceptance coverage (`docs/reference/subsystems/smp.md` notes this) |
+
+The one non-obvious exception to "subsumed by a kept test": **04, 06, 07 also
+overlap with each other**, not just with 05/08 — 06 is 05's task via CGI, and
+07 is what both 04 and 06's underlying tcc step reduces to once you strip the
+agent. If `acceptance/archive/` itself ever needs a further cut, that
+04/06/07 trio is the next redundant cluster, with 07 the most load-bearing of
+the three (05/08 cite its measured floor numbers) and 04 the least (fully
+superseded by 08's memory-sweep procedure on the tighter profile).
+
+Two facts that motivated the cut, carried over from the original review:
+
+- **11 of 12 playbooks referenced port 2222**, which after this branch answers
+  on `extreme-size` alone (finding I). Only 09 did not.
+- **Coverage was lopsided, not thin** — four playbooks exercised extreme,
+  seven exercised release, four other documented targets had none. That
+  imbalance is why the kept set leans extreme-heavy (05/08) rather than
+  release-heavy: extreme was already the better-proven floor and the harder
+  constraint to keep passing.
 
 ## Background
 
