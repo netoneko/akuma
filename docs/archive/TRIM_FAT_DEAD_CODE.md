@@ -59,6 +59,20 @@ fact rather than folded into the findings above:
 
 Section B was left untouched, per this doc's own recommendation.
 
+One more finding this doc's scan missed entirely, caught later by a stray
+`cargo test` warning (`unexpected cfg condition value: kernel-tls`):
+**`akuma-net/src/tests.rs`'s `tls_tests` and `tls_verifier_tests`** modules
+were gated `#[cfg(all(test, feature = "kernel-tls"))]` and imported
+`crate::tls::TlsOptions` / `crate::tls_verifier::matches_hostname` — but
+commit `bade6ab` ("remove unnecessary profiles and all crypto"), well before
+even this doc's `1f9ed7a` snapshot, deleted the `kernel-tls` feature and both
+of those modules from `akuma-net` (`docs/archive/BUILTIN_SSH_REMOVAL.md`).
+The cfg was permanently false and the imports would not have resolved even if
+it weren't — 100% dead, never compiled once since `bade6ab`. Deleted both
+modules. The original scan's method (grep for a function's callers) can't see
+this class of dead code at all, since the modules reference names that don't
+exist rather than names with no callers.
+
 ## Method
 
 A custom scan (not `cargo check`, which can't see this — see "Method

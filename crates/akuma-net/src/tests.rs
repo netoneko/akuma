@@ -104,68 +104,6 @@ mod net_holder_tests {
     }
 }
 
-#[cfg(all(test, feature = "kernel-tls"))]
-mod tls_tests {
-    use crate::tls::TlsOptions;
-
-    #[test]
-    fn default_options_are_secure() {
-        let opts = TlsOptions::new();
-        assert!(!opts.insecure);
-        assert!(!opts.verbose);
-    }
-
-    #[test]
-    fn insecure_builder() {
-        let opts = TlsOptions::new().insecure();
-        assert!(opts.insecure);
-        assert!(!opts.verbose);
-    }
-
-    #[test]
-    fn verbose_builder() {
-        let opts = TlsOptions::new().verbose();
-        assert!(!opts.insecure);
-        assert!(opts.verbose);
-    }
-
-    #[test]
-    fn chained_builders() {
-        let opts = TlsOptions::new().insecure().verbose();
-        assert!(opts.insecure);
-        assert!(opts.verbose);
-    }
-}
-
-
-#[cfg(all(test, feature = "kernel-tls"))]
-mod tls_verifier_tests {
-    use crate::tls_verifier::matches_hostname;
-
-    #[test]
-    fn exact_match() {
-        assert!(matches_hostname("example.com", "example.com"));
-    }
-
-    #[test]
-    fn wildcard_match() {
-        assert!(matches_hostname("*.example.com", "sub.example.com"));
-        assert!(!matches_hostname("*.example.com", "example.com"));
-        assert!(!matches_hostname("*.example.com", "deep.sub.example.com"));
-    }
-
-    #[test]
-    fn case_insensitive() {
-        assert!(matches_hostname("Example.Com", "example.com"));
-        assert!(matches_hostname("example.com", "EXAMPLE.COM"));
-    }
-
-    #[test]
-    fn no_match() {
-        assert!(!matches_hostname("example.com", "other.com"));
-        assert!(!matches_hostname("*.example.com", "example.org"));
-    }
-}
 
 #[cfg(test)]
 mod errno_tests {
