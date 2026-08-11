@@ -1,44 +1,19 @@
+//! The on-disk image store: creating it, reading it, writing to it.
+//!
+//! Path and name rules live in `boxlib::paths` (host-tested); this file is the
+//! I/O against them and is re-exported flat so callers say `images::layer_dir`
+//! whether the work is a `format!` or a syscall.
+
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use libakuma::{open, close, read_fd, write_fd, open_flags, mkdir_p, read_dir};
 
-const IMAGES_BASE: &str = "/var/lib/box/images";
-/// Extracted layers, keyed by digest and shared across every image that
-/// references them. An image directory holds only metadata.
-const LAYERS_BASE: &str = "/var/lib/box/layers";
-/// Where per-container writable upper directories live.
-const CONTAINERS_BASE: &str = "/var/lib/box/containers";
-
-pub fn image_dir(name: &str) -> String {
-    format!("{}/{}", IMAGES_BASE, name)
-}
-
-pub fn rootfs_dir(name: &str) -> String {
-    format!("{}/{}/rootfs", IMAGES_BASE, name)
-}
-
-pub fn config_path(name: &str) -> String {
-    format!("{}/{}/oci-config.json", IMAGES_BASE, name)
-}
-
-pub fn layers_path(name: &str) -> String {
-    format!("{}/{}/layers", IMAGES_BASE, name)
-}
-
-/// `sha256:abc…` → `/var/lib/box/layers/sha256-abc…`. A digest is already
-/// filename-safe apart from its separator.
-pub fn layer_dir(digest: &str) -> String {
-    format!("{}/{}", LAYERS_BASE, digest.replace(':', "-"))
-}
-
-pub fn container_dir(id: &str) -> String {
-    format!("{}/{}", CONTAINERS_BASE, id)
-}
-
-pub fn container_upper(id: &str) -> String {
-    format!("{}/{}/upper", CONTAINERS_BASE, id)
-}
+pub use boxlib::paths::{
+    config_path, container_dir, container_upper, image_dir, layer_dir, layers_path, rootfs_dir,
+    sanitize_name, IMAGES_BASE,
+};
+use boxlib::paths::{self, CONTAINERS_BASE, LAYERS_BASE};
 
 /// Whether anything exists at `path` — file, directory or symlink.
 pub fn path_exists(path: &str) -> bool {
@@ -52,19 +27,6 @@ pub fn dir_exists(path: &str) -> bool {
         Ok(st) => st.st_mode & 0o170_000 == 0o040_000,
         Err(_) => false,
     }
-}
-
-pub fn sanitize_name(image_str: &str) -> String {
-    let mut s = image_str;
-    if let Some(pos) = s.find('/') {
-        if s[..pos].contains('.') {
-            s = &s[pos + 1..];
-        }
-    }
-    if let Some(rest) = s.strip_prefix("library/") {
-        s = rest;
-    }
-    s.replace('/', "-").replace(':', "-")
 }
 
 pub fn ensure_base_dir() {
@@ -82,69 +44,9 @@ pub fn prepare_image_dir(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Record the image's layers, base-first, as the registry ordered them.
-pub fn save_layers(name: &str, digests: &[String]) -> Result<(), String> {
-    let mut body = String::new();
-    for d in digests {
-        body.push_str(d);
-        body.push('\n');
-    }
-    let path = layers_path(name);
-    let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
-    if fd < 0 {
-        return Err(format!("failed to write {}", path));
-    }
-    write_fd(fd, body.as_bytes());
-    close(fd);
-    Ok(())
-}
-
-/// The image's layer digests, base-first.
-pub fn load_layers(name: &str) -> Vec<String> {
-    let path = layers_path(name);
-    let fd = open(&path, open_flags::O_RDONLY);
-    if fd < 0 {
-        return Vec::new();
-    }
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 4096];
-    loop {
-        let n = read_fd(fd, &mut tmp);
-        if n <= 0 {
-            break;
-        }
-        buf.extend_from_slice(&tmp[..n as usize]);
-    }
-    close(fd);
-
-    core::str::from_utf8(&buf).map_or_else(
-        |_| Vec::new(),
-        |s| s.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect(),
-    )
-}
-
-/// The image's layer directories in overlay lookup order — **topmost-first**,
-/// i.e. the reverse of the order the registry applies them.
-pub fn overlay_lowerdirs(name: &str) -> Vec<String> {
-    let mut dirs: Vec<String> = load_layers(name).iter().map(|d| layer_dir(d)).collect();
-    dirs.reverse();
-    dirs
-}
-
-pub fn save_config(name: &str, config_json: &str) -> Result<(), String> {
-    let path = config_path(name);
-    let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
-    if fd < 0 {
-        return Err(format!("failed to write {}", path));
-    }
-    write_fd(fd, config_json.as_bytes());
-    close(fd);
-    Ok(())
-}
-
-pub fn load_config(name: &str) -> Option<String> {
-    let path = config_path(name);
-    let fd = open(&path, open_flags::O_RDONLY);
+/// Read a whole file, or `None` if it cannot be opened or is not UTF-8.
+fn read_text(path: &str) -> Option<String> {
+    let fd = open(path, open_flags::O_RDONLY);
     if fd < 0 {
         return None;
     }
@@ -161,26 +63,55 @@ pub fn load_config(name: &str) -> Option<String> {
     core::str::from_utf8(&buf).ok().map(String::from)
 }
 
+fn write_text(path: &str, body: &str) -> Result<(), String> {
+    let fd = open(path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
+    if fd < 0 {
+        return Err(format!("failed to write {}", path));
+    }
+    write_fd(fd, body.as_bytes());
+    close(fd);
+    Ok(())
+}
+
+/// Record the image's layers, base-first, as the registry ordered them.
+pub fn save_layers(name: &str, digests: &[String]) -> Result<(), String> {
+    write_text(&layers_path(name), &paths::format_layers(digests))
+}
+
+/// The image's layer digests, base-first.
+pub fn load_layers(name: &str) -> Vec<String> {
+    read_text(&layers_path(name)).map_or_else(Vec::new, |body| paths::parse_layers(&body))
+}
+
+/// The image's layer directories in overlay lookup order — topmost-first.
+pub fn overlay_lowerdirs(name: &str) -> Vec<String> {
+    paths::lowerdirs(&load_layers(name))
+}
+
+pub fn save_config(name: &str, config_json: &str) -> Result<(), String> {
+    write_text(&config_path(name), config_json)
+}
+
+pub fn load_config(name: &str) -> Option<String> {
+    read_text(&config_path(name))
+}
+
 pub fn list_images() -> Vec<String> {
     let mut names = Vec::new();
     if let Some(entries) = read_dir(IMAGES_BASE) {
         for entry in entries {
-            if entry.is_dir {
-                let cfg = format!("{}/{}/oci-config.json", IMAGES_BASE, entry.name);
-                let fd = open(&cfg, open_flags::O_RDONLY);
-                if fd >= 0 {
-                    close(fd);
-                    names.push(String::from(entry.name));
-                }
+            if entry.is_dir && image_exists(&entry.name) {
+                names.push(entry.name.clone());
             }
         }
     }
     names
 }
 
+/// An image counts as present once its config is readable — that is the last
+/// thing `box pull` writes, so a half-finished pull never looks complete.
 pub fn image_exists(name: &str) -> bool {
-    let cfg = config_path(name);
-    let fd = open(&cfg, open_flags::O_RDONLY);
+    let fd = open(&config_path(name), open_flags::O_RDONLY);
     if fd >= 0 {
         close(fd);
         true

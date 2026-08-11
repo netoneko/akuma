@@ -51,6 +51,80 @@ Entrypoint, as `docker run` does.
   **`box pull` no longer creates that directory** — use `box run`.
 - `-I` / `--interactive`, `-d` / `--detached`
 
+## How it works
+
+From a name a user types to a process running in a container:
+
+```mermaid
+flowchart TD
+    subgraph pull["box pull busybox"]
+        REF["parse reference<br/>busybox → registry-1.docker.io / library/busybox : latest"]
+        TOK["GET auth.docker.io/token<br/>scope=repository:library/busybox:pull"]
+        LIST["GET /v2/…/manifests/latest<br/>Accept: manifest.list + image.index"]
+        SEL{"manifest list?"}
+        PLAT["pick linux/arm64 entry<br/>(skips unknown/unknown attestations)"]
+        MAN["platform manifest:<br/>config digest + layer digests"]
+        CFG["GET /v2/…/blobs/&lt;config&gt;<br/>→ images/&lt;name&gt;/oci-config.json"]
+        HAVE{"layers/sha256-…<br/>already on disk?"}
+        BLOB["GET /v2/…/blobs/&lt;layer&gt;<br/>(307 → CDN)"]
+        EXT["gunzip + untar into &lt;dir&gt;.tmp<br/>then rename into place"]
+        REF --> TOK --> LIST --> SEL
+        SEL -->|yes| PLAT --> MAN
+        SEL -->|no| MAN
+        MAN --> CFG --> HAVE
+        HAVE -->|yes| SKIP["skip — digests are content-addressed"]
+        HAVE -->|no| BLOB --> EXT
+    end
+
+    subgraph store["/var/lib/box"]
+        L["layers/sha256-&lt;hex&gt;/<br/>read-only, shared by every image"]
+        I["images/&lt;name&gt;/<br/>oci-config.json + layers list"]
+        C["containers/&lt;id&gt;/upper/<br/>one container's writes"]
+    end
+
+    EXT --> L
+    CFG --> I
+    SKIP --> L
+
+    subgraph run["box run --rm busybox sh"]
+        RARG["parse flags — everything after<br/>the image belongs to the container"]
+        RCFG["read oci-config.json →<br/>Entrypoint + Cmd + WorkingDir"]
+        ARGV["argv = Entrypoint + (user args ?: Cmd)"]
+        REG["REGISTER_BOX (316)<br/>box rooted at containers/&lt;id&gt;"]
+        OVL["MOUNT_IN_NS (325) overlay as the box's /<br/>lowers = layers topmost-first, upper = container"]
+        PROC["mount procfs at /proc"]
+        INJ["inject /etc/resolv.conf + /etc/hosts"]
+        SPAWN["SPAWN_EXT (315) into the box"]
+        RARG --> RCFG --> ARGV --> REG --> OVL --> PROC --> INJ --> SPAWN
+    end
+
+    I -.-> RCFG
+    L -.-> OVL
+    C -.-> OVL
+```
+
+Layer order is where this quietly goes wrong: a registry lists layers
+**base-first**, an overlay resolves lookups **topmost-first**, so `layers` is
+read back and reversed. Get it backwards and the image still boots — it just
+serves the pre-update copy of every file a later layer replaced.
+
+## What of OCI is supported
+
+| Area | Supported | Not yet |
+|------|-----------|---------|
+| **Distribution** (registry API) | Anonymous pull, Docker Hub bearer tokens, `GET /v2/<name>/manifests/<ref>` by tag *or* digest, `GET /v2/<name>/blobs/<digest>`, 307 redirects to CDN blobs | Push, login/credentials, `_catalog`/tag listing, resumable/chunked blob fetch, `Range` retries |
+| **References** | `name`, `name:tag`, `user/name:tag`, `registry[:port]/name:tag`, implicit `library/` + `latest`, `docker.io` → `registry-1.docker.io` | `name@sha256:…` digest pins, digest *verification* of what was downloaded |
+| **Image index / manifest list** | OCI `image.index.v1`, Docker `manifest.list.v2`, detection with no top-level `mediaType`, `linux/arm64` (and `aarch64`) selection, skipping `unknown/unknown` attestations | Variant matching (`v8`, `v7`), `os.version`/`os.features`, multi-platform fallback |
+| **Manifest** | `config.digest`, `layers[].digest` in order, `layers[].size` | Foreign/URL layers, subject/referrers, annotations |
+| **Layers** | `tar+gzip`, whiteouts (`.wh.`) via the kernel overlay, content-addressed dedupe across images, path-traversal rejection at extract | Uncompressed `tar`, `zstd`, `diff_id` verification, layer GC (`box rmi`) |
+| **Image config** | `Entrypoint`, `Cmd`, `WorkingDir` (docker `run` override semantics) | `Env`, `User`, `ExposedPort`, `Volumes`, `StopSignal`, `Labels`, `Healthcheck` |
+| **Runtime** (OCI runtime spec) | Not implemented here — `box` is its own runtime over the kernel's box/overlay primitives | `config.json` bundles, hooks, cgroups/resource limits, seccomp, capabilities, user namespaces |
+
+Signature and digest verification is the significant gap: a pulled layer is
+trusted because the registry served it over TLS, not because its bytes were
+hashed. `userspace/herd` has a separate, partial OCI *runtime-spec* config
+reader — the two are unrelated code paths today.
+
 ## Containers: images, layers, overlay
 
 `box pull` implements the OCI Distribution Spec — image references
@@ -91,9 +165,20 @@ mounted at `/proc`, so `ps` works and shows only the container's processes.
 
 ## Testing
 
+Logic is tested on the **host**, where the suite runs in milliseconds:
+
+```bash
+cd userspace
+cargo test -p box --lib --no-default-features \
+    --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)
 ```
-box test           # offline: JSON parser, OCI ref parser, HTTP header parsing
-box test --net     # + network: downloads busybox manifest and layer from Docker Hub
+
+On the target, `box test` covers what a host cannot — the same code compiled for
+`aarch64-unknown-none`, and the TLS download path:
+
+```
+box test           # on-target smoke: parsing, refs, argv, HTTP header split
+box test --net     # + network: busybox manifest and a full layer from Docker Hub
 ```
 
 See [docs/TESTING.md](docs/TESTING.md). The overlay itself is host-tested in
@@ -102,24 +187,40 @@ See [docs/TESTING.md](docs/TESTING.md). The overlay itself is host-tested in
 
 ## Source layout
 
+The crate is split so that everything that is a *decision* can be host-tested.
+`box` is a Rust keyword, so the library half is `boxlib`; the binary is still
+`box`.
+
 ```
 src/
+  lib.rs       boxlib — the host-testable half (no libakuma, no I/O)
+    json.rs      path-addressed reads over the picojson pull parser
+    oci_ref.rs   image references → registry, repository, tag, URLs
+    manifest.rs  manifest lists, platform selection, config + layer digests
+    paths.rs     the /var/lib/box layout, store names, overlay layer order
+    spec.rs      image config → argv, `box run` flag parsing, box ids
+    boxes.rs     /proc/boxes table parsing and name/id resolution
   main.rs      Command dispatch, box lifecycle (open/close/ps/use/grab/cp)
-  run.rs       `box run`: container creation, overlay mount, entrypoint composition
-  oci.rs       OCI Distribution client (auth, manifests, blob download, layer store)
-  json.rs      Minimal no_std JSON parser
-  images.rs    Local image/layer/container store layout
-  tests.rs     Built-in test suite
+  run.rs       `box run`: container creation, overlay mount, spawn
+  oci.rs       OCI Distribution client (auth, blob download, extraction)
+  images.rs    Image store I/O over boxlib::paths
+  tests.rs     On-target suite (`box test`)
 docs/
   OCI_IMAGE_PULL.md   Pull pipeline architecture
   BOX_RUN.md          Containers, the overlay root, docker compatibility
-  TESTING.md          Test suite reference and bug notes
+  TESTING.md          Both test layers, and what belongs in each
 ```
 
 ## Dependencies
 
 - `libakuma` — syscall wrappers, process spawning, filesystem ops
 - `libakuma-tls` — HTTPS client (embedded-tls, TLS 1.3, AES-128-GCM)
+- `picojson` — JSON. `no_std`, allocation-free, non-recursive pull parser;
+  `box` decides when to allocate. Built without `float`, since a manifest has no
+  fractional numbers
+- `libakuma`, `libakuma-tls` and `akuma-tar` are optional behind the default
+  `akuma` feature, so `--no-default-features` leaves a `boxlib` a std host
+  target can link and test
 - `akuma-tar` (`userspace/tar`) — layer extraction, **linked in, not spawned**.
   It used to run `/bin/tar`, which was silently a busybox applet whose hardlink
   handling expanded a 1.9 MB layer into 467 MB of mode-less copies:

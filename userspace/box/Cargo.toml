@@ -3,12 +3,36 @@ name = "box"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# On by default; everything except the host-testable `boxlib` half needs it.
+# `--no-default-features` drops libakuma (and the two crates that link it) so
+# `cargo test --lib` can build against a std host target — libakuma defines
+# #[panic_handler] and #[global_allocator], which collide with std's. See
+# src/lib.rs.
+default = ["akuma"]
+akuma = ["dep:libakuma", "dep:libakuma-tls", "dep:akuma-tar"]
+
 [dependencies]
-libakuma = { path = "../libakuma", features = ["chunked-allocator"] }
-libakuma-tls = { path = "../libakuma-tls" }
+# Optional only so the `boxlib` unit tests can build for the host — the binary
+# always needs all three (see [features]).
+libakuma = { path = "../libakuma", features = ["chunked-allocator"], optional = true }
+libakuma-tls = { path = "../libakuma-tls", optional = true }
 # Layer extraction is linked in, not spawned as /bin/tar — see tar/src/lib.rs.
-akuma-tar = { package = "tar", path = "../tar" }
+akuma-tar = { package = "tar", path = "../tar", optional = true }
+# JSON. no_std, allocation-free, non-recursive pull parser: it borrows from the
+# document and only touches a caller-owned scratch buffer to un-escape strings,
+# so `box` keeps deciding when to allocate. Built without `float` — an OCI
+# manifest has no fractional numbers, and `float-skip` steps over one rather
+# than failing the document.
+picojson = { version = "0.2", default-features = false, features = ["int64", "float-skip"] }
+
+# `box` is a reserved Rust keyword, so it cannot name a crate — the library half
+# is `boxlib`. The binary keeps the name users type.
+[lib]
+name = "boxlib"
+path = "src/lib.rs"
 
 [[bin]]
 name = "box"
 path = "src/main.rs"
+required-features = ["akuma"]

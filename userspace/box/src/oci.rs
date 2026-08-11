@@ -1,202 +1,90 @@
+//! `box pull` — fetch an OCI image from a registry onto disk.
+//!
+//! The decisions (which reference, which platform, which digests) live in the
+//! host-testable `boxlib` half; this file is the I/O: HTTPS, blobs, extraction.
+
 use alloc::format;
 use alloc::string::String;
-use alloc::vec::Vec;
 use libakuma::{print, println, print_dec, unlink};
 use libakuma_tls::{https_get, download_file_with_headers, HttpHeaders};
 
-use crate::json;
+use boxlib::json;
+use boxlib::manifest::{self, Manifest};
+use boxlib::oci_ref::ImageRef;
+
 use crate::images;
 
-pub struct ImageRef {
-    pub registry: String,
-    pub name: String,
-    pub tag: String,
-}
+/// Accept every manifest media type a registry might answer with. Without the
+/// list types the registry hands back a single-platform manifest chosen for
+/// *its* idea of our architecture.
+const ACCEPT_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json, \
+     application/vnd.oci.image.manifest.v1+json, \
+     application/vnd.docker.distribution.manifest.list.v2+json, \
+     application/vnd.oci.image.index.v1+json";
 
-pub fn parse_image_ref(s: &str) -> ImageRef {
-    let (name_part, tag) = match s.rfind(':') {
-        Some(pos) => {
-            let after = &s[pos + 1..];
-            if after.contains('/') {
-                (s, "latest")
-            } else {
-                (&s[..pos], after)
-            }
-        }
-        None => (s, "latest"),
-    };
-
-    let (registry, name) = if let Some(slash_pos) = name_part.find('/') {
-        let first = &name_part[..slash_pos];
-        if first.contains('.') || first.contains(':') {
-            let reg = if first == "docker.io" {
-                "registry-1.docker.io"
-            } else {
-                first
-            };
-            (String::from(reg), String::from(&name_part[slash_pos + 1..]))
-        } else {
-            (String::from("registry-1.docker.io"), String::from(name_part))
-        }
-    } else {
-        (String::from("registry-1.docker.io"), format!("library/{}", name_part))
-    };
-
-    ImageRef {
-        registry,
-        name,
-        tag: String::from(tag),
+fn auth_headers(token: &str) -> HttpHeaders {
+    let mut headers = HttpHeaders::new();
+    if !token.is_empty() {
+        headers.bearer_auth(token);
     }
+    headers
 }
 
 fn fetch_token(image: &ImageRef) -> Result<String, String> {
-    if image.registry != "registry-1.docker.io" {
+    if !image.needs_token() {
         return Ok(String::new());
     }
 
     print("  Fetching auth token...\n");
-    let url = format!(
-        "https://auth.docker.io/token?service=registry.docker.io&scope=repository:{}:pull",
-        image.name
-    );
     let headers = HttpHeaders::new();
-    let body = https_get(&url, &headers)
+    let body = https_get(&image.token_url(), &headers)
         .map_err(|e| format!("token fetch failed: {:?}", e))?;
     let body_str = core::str::from_utf8(&body)
         .map_err(|_| String::from("invalid token response"))?;
 
-    json::extract_string(body_str, "token")
+    json::string_at(body_str, &["token"])
         .ok_or_else(|| String::from("no token in auth response"))
-}
-
-struct Manifest {
-    config_digest: String,
-    layer_digests: Vec<String>,
 }
 
 fn fetch_manifest(image: &ImageRef, token: &str) -> Result<Manifest, String> {
     print("  Fetching manifest...\n");
 
-    let url = format!(
-        "https://{}/v2/{}/manifests/{}",
-        image.registry, image.name, image.tag
-    );
-    let mut headers = HttpHeaders::new();
-    headers.add(
-        "Accept",
-        "application/vnd.docker.distribution.manifest.v2+json, \
-         application/vnd.oci.image.manifest.v1+json, \
-         application/vnd.docker.distribution.manifest.list.v2+json, \
-         application/vnd.oci.image.index.v1+json",
-    );
-    if !token.is_empty() {
-        headers.bearer_auth(token);
-    }
+    let mut headers = auth_headers(token);
+    headers.add("Accept", ACCEPT_MANIFEST);
 
-    let body = https_get(&url, &headers)
+    let body = https_get(&image.manifest_url(&image.tag), &headers)
         .map_err(|e| format!("manifest fetch failed: {:?}", e))?;
     let body_str = core::str::from_utf8(&body)
         .map_err(|_| String::from("invalid manifest response"))?;
 
-    print("  Response length: ");
-    print_dec(body_str.len());
-    print("\n");
-    let preview_len = core::cmp::min(body_str.len(), 300);
-    print("  Response start: ");
-    println(&body_str[..preview_len]);
-
-    let media_type = json::extract_string(body_str, "mediaType").unwrap_or_default();
-    let has_manifests = json::extract_array(body_str, "manifests").is_some();
-
-    if media_type.contains("manifest.list") || media_type.contains("image.index")
-        || has_manifests
-    {
-        return resolve_platform_manifest(body_str, image, token);
+    if manifest::is_manifest_list(body_str) {
+        let digest = manifest::select_platform_digest(body_str)?;
+        return fetch_manifest_by_digest(image, &digest, token);
     }
 
-    parse_manifest(body_str)
-}
-
-fn resolve_platform_manifest(list_json: &str, image: &ImageRef, token: &str) -> Result<Manifest, String> {
-    let manifests_arr = json::extract_array(list_json, "manifests")
-        .ok_or_else(|| String::from("no manifests array in manifest list"))?;
-
-    for obj in json::iter_array_objects(manifests_arr) {
-        if let Some(platform) = json::extract_object(obj, "platform") {
-            let arch = json::extract_string(platform, "architecture").unwrap_or_default();
-            let os = json::extract_string(platform, "os").unwrap_or_default();
-            if (arch == "arm64" || arch == "aarch64") && os == "linux" {
-                let digest = json::extract_string(obj, "digest")
-                    .ok_or_else(|| String::from("no digest in platform manifest entry"))?;
-                return fetch_manifest_by_digest(image, &digest, token);
-            }
-        }
-    }
-
-    Err(String::from("no linux/arm64 manifest found in manifest list"))
+    manifest::parse_manifest(body_str)
 }
 
 fn fetch_manifest_by_digest(image: &ImageRef, digest: &str, token: &str) -> Result<Manifest, String> {
     print("  Fetching platform manifest...\n");
 
-    let url = format!(
-        "https://{}/v2/{}/manifests/{}",
-        image.registry, image.name, digest
-    );
-    let mut headers = HttpHeaders::new();
-    headers.add(
-        "Accept",
-        "application/vnd.docker.distribution.manifest.v2+json, \
-         application/vnd.oci.image.manifest.v1+json",
-    );
-    if !token.is_empty() {
-        headers.bearer_auth(token);
-    }
+    let mut headers = auth_headers(token);
+    headers.add("Accept", ACCEPT_MANIFEST);
 
-    let body = https_get(&url, &headers)
+    let body = https_get(&image.manifest_url(digest), &headers)
         .map_err(|e| format!("platform manifest fetch failed: {:?}", e))?;
     let body_str = core::str::from_utf8(&body)
         .map_err(|_| String::from("invalid platform manifest response"))?;
 
-    parse_manifest(body_str)
-}
-
-fn parse_manifest(json_str: &str) -> Result<Manifest, String> {
-    let config_obj = json::extract_object(json_str, "config")
-        .ok_or_else(|| String::from("no config in manifest"))?;
-    let config_digest = json::extract_string(config_obj, "digest")
-        .ok_or_else(|| String::from("no digest in manifest config"))?;
-
-    let layers_arr = json::extract_array(json_str, "layers")
-        .ok_or_else(|| String::from("no layers in manifest"))?;
-
-    let mut layer_digests = Vec::new();
-    for obj in json::iter_array_objects(layers_arr) {
-        let digest = json::extract_string(obj, "digest")
-            .ok_or_else(|| String::from("no digest in layer entry"))?;
-        layer_digests.push(digest);
-    }
-
-    Ok(Manifest {
-        config_digest,
-        layer_digests,
-    })
+    manifest::parse_manifest(body_str)
 }
 
 fn fetch_config(image: &ImageRef, digest: &str, token: &str) -> Result<String, String> {
     print("  Fetching config...\n");
 
-    let url = format!(
-        "https://{}/v2/{}/blobs/{}",
-        image.registry, image.name, digest
-    );
-    let mut headers = HttpHeaders::new();
-    if !token.is_empty() {
-        headers.bearer_auth(token);
-    }
-
+    let headers = auth_headers(token);
     let tmp_path = "/tmp/oci-config.json";
-    download_file_with_headers(&url, tmp_path, &headers)
+    download_file_with_headers(&image.blob_url(digest), tmp_path, &headers)
         .map_err(|e| format!("config fetch failed: {:?}", e))?;
 
     let fd = libakuma::open(tmp_path, 0);
@@ -223,16 +111,8 @@ fn download_layer(
     token: &str,
     dest_path: &str,
 ) -> Result<(), String> {
-    let url = format!(
-        "https://{}/v2/{}/blobs/{}",
-        image.registry, image.name, digest
-    );
-    let mut headers = HttpHeaders::new();
-    if !token.is_empty() {
-        headers.bearer_auth(token);
-    }
-
-    download_file_with_headers(&url, dest_path, &headers)
+    let headers = auth_headers(token);
+    download_file_with_headers(&image.blob_url(digest), dest_path, &headers)
         .map_err(|e| format!("layer download failed: {:?}", e))
 }
 
@@ -256,7 +136,7 @@ fn extract_layer(layer_path: &str, rootfs_path: &str) -> Result<(), String> {
 }
 
 pub fn pull_image(image_str: &str) -> Result<(), String> {
-    let image = parse_image_ref(image_str);
+    let image = boxlib::oci_ref::parse_image_ref(image_str);
     let store_name = images::sanitize_name(image_str);
 
     print("box: pulling ");

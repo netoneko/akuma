@@ -119,6 +119,7 @@ version = "0.1.0"
 dependencies = [
  "libakuma",
  "libakuma-tls",
+ "picojson",
  "tar",
 ]
 
@@ -588,6 +589,12 @@ version = "0.1.0"
 dependencies = [
  "libakuma",
 ]
+
+[[package]]
+name = "picojson"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d26d3a48f9e8e1090e1509eb03e2401af322337030997030b13170a63e00876"
 
 [[package]]
 name = "pkcs8"

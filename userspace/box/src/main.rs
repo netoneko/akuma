@@ -19,12 +19,12 @@
 
 extern crate alloc;
 
-mod json;
 mod oci;
 mod images;
 mod run;
 mod tests;
 
+use boxlib::{boxes, spec};
 use libakuma::{exit, print, args, open, read_fd, write_fd, close, open_flags, SpawnResult, waitpid, println, read_dir, mkdir, fstat, mkdir_p, get_cpu_stats, ThreadCpuStat};
 use alloc::vec::Vec;
 use alloc::string::String;
@@ -129,82 +129,24 @@ fn print_usage() {
     print("  box test [--net]                                           Run tests (--net for network)\n");
 }
 
-fn resolve_target_id(target: &str) -> Option<u64> {
-    // 1. Try numeric/hex ID first
-    let mut id_val = 0u64;
-    let mut is_hex = false;
-    let mut s = target;
-    if target.starts_with("0x") {
-        is_hex = true;
-        s = &target[2..];
-    }
-
-    if is_hex {
-        for b in s.as_bytes() {
-            let digit = match *b {
-                b'0'..=b'9' => *b - b'0',
-                b'a'..=b'f' => *b - b'a' + 10,
-                b'A'..=b'F' => *b - b'A' + 10,
-                _ => return None,
-            };
-            id_val = (id_val << 4) | digit as u64;
-        }
-        return Some(id_val);
-    } else {
-        // Try parsing as decimal, but only if all chars are digits
-        let mut all_digits = true;
-        for b in s.as_bytes() {
-            if *b < b'0' || *b > b'9' { all_digits = false; break; }
-            id_val = id_val * 10 + (*b - b'0') as u64;
-        }
-        if all_digits && !target.is_empty() { return Some(id_val); }
-    }
-
-    // 2. Try lookup by name in /proc/boxes
+/// `/proc/boxes` in full, or an empty string if it cannot be read — which is
+/// the normal answer inside a box, where the file does not exist.
+fn read_proc_boxes() -> String {
     let fd = open("/proc/boxes", open_flags::O_RDONLY);
-    if fd >= 0 {
-        let mut buf = [0u8; 2048];
-        let n = read_fd(fd, &mut buf);
-        close(fd);
-        if n > 0 {
-            let content = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
-            for line in content.lines().skip(1) {
-                let mut parts = line.split(',');
-                let id_str = parts.next().unwrap_or("");
-                let bname = parts.next().unwrap_or("");
-                if bname == target {
-                    let mut found_id = 0u64;
-                    for b in id_str.as_bytes() { if *b >= b'0' && *b <= b'9' { found_id = found_id * 10 + (*b - b'0') as u64; } }
-                    return Some(found_id);
-                }
-            }
-        }
+    if fd < 0 {
+        return String::new();
     }
-    None
+    let mut buf = [0u8; 2048];
+    let n = read_fd(fd, &mut buf);
+    close(fd);
+    if n <= 0 {
+        return String::new();
+    }
+    String::from(core::str::from_utf8(&buf[..n as usize]).unwrap_or(""))
 }
 
-fn get_target_root(target_id: u64) -> Option<String> {
-    let fd = open("/proc/boxes", open_flags::O_RDONLY);
-    if fd >= 0 {
-        let mut buf = [0u8; 2048];
-        let n = read_fd(fd, &mut buf);
-        close(fd);
-        if n > 0 {
-            let content = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
-            for line in content.lines().skip(1) {
-                let mut parts = line.split(',');
-                let id_str = parts.next().unwrap_or("");
-                let _bname = parts.next().unwrap_or("");
-                let root = parts.next().unwrap_or("");
-                // ... skip creator, primary
-                
-                let mut found_id = 0u64;
-                for b in id_str.as_bytes() { if *b >= b'0' && *b <= b'9' { found_id = found_id * 10 + (*b - b'0') as u64; } }
-                if found_id == target_id { return Some(String::from(root)); }
-            }
-        }
-    }
-    None
+fn resolve_target_id(target: &str) -> Option<u64> {
+    boxes::resolve(target, &read_proc_boxes())
 }
 
 fn cmd_open(args: libakuma::Args) -> ! {
@@ -249,46 +191,24 @@ fn cmd_open(args: libakuma::Args) -> ! {
         directory = images::rootfs_dir(&store);
 
         if cmd_path.is_none() {
-            if let Some(config_json) = images::load_config(&store) {
-                if let Some(config_obj) = json::extract_object(&config_json, "config") {
-                    let entrypoint = json::extract_string_array(config_obj, "Entrypoint");
-                    let cmd = json::extract_string_array(config_obj, "Cmd");
-
-                    if let Some(wd) = json::extract_string(config_obj, "WorkingDir") {
-                        if !wd.is_empty() {
-                            working_dir = wd;
-                        }
-                    }
-
-                    let mut full_cmd: Vec<String> = Vec::new();
-                    if let Some(ep) = entrypoint {
-                        full_cmd.extend(ep);
-                    }
-                    if let Some(c) = cmd {
-                        full_cmd.extend(c);
-                    }
-
-                    if !full_cmd.is_empty() {
-                        cmd_path = None;
-                        let leaked: Vec<&'static str> = full_cmd.iter().map(|s| {
-                            let boxed = alloc::boxed::Box::leak(s.clone().into_boxed_str());
-                            &*boxed
-                        }).collect();
-                        if let Some((first, rest)) = leaked.split_first() {
-                            cmd_path = Some(*first);
-                            for r in rest {
-                                cmd_args.push(*r);
-                            }
-                        }
-                    }
-                }
+            // No command given: run what the image says to. The argv has to
+            // outlive this scope to be passed to spawn, and `box open` exits
+            // straight after spawning, so leaking it is the whole lifetime.
+            let image_proc = run::image_process(&store);
+            working_dir = image_proc.working_dir.clone();
+            let full_cmd = image_proc.argv_with(&[]);
+            let leaked: Vec<&'static str> = full_cmd
+                .iter()
+                .map(|s| &*alloc::boxed::Box::leak(s.clone().into_boxed_str()))
+                .collect();
+            if let Some((first, rest)) = leaked.split_first() {
+                cmd_path = Some(*first);
+                cmd_args.extend_from_slice(rest);
             }
         }
     }
 
-    let mut box_id = 0u64;
-    for b in name.as_bytes() { box_id = box_id.wrapping_mul(31).wrapping_add(*b as u64); }
-    if box_id == 0 { box_id = 1; }
+    let box_id = spec::box_id_for(name);
 
     libakuma::syscall(SYSCALL_REGISTER_BOX, box_id, name.as_ptr() as u64, name.len() as u64, directory.as_ptr() as u64, directory.len() as u64, 0);
 
@@ -346,10 +266,6 @@ fn cmd_use(args: libakuma::Args) -> ! {
 
     let target_id = resolve_target_id(target).unwrap_or_else(|| {
         print("box use: target not found\n"); exit(1);
-    });
-
-    let target_root = get_target_root(target_id).unwrap_or_else(|| {
-        String::from("/")
     });
 
     let mut interactive = false;
@@ -504,32 +420,20 @@ fn cmd_cp(mut args: libakuma::Args) -> ! {
 }
 
 fn cmd_ps() -> ! {
-    let fd = open("/proc/boxes", open_flags::O_RDONLY);
-    if fd < 0 { print("box ps: failed to open /proc/boxes\n"); exit(1); }
-    let mut buf = [0u8; 2048];
-    let n = read_fd(fd, &mut buf);
-    close(fd);
-
-    if n > 0 {
-        let content = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
-        println("  ID            NAME        ROOT        CREATOR     PRIMARY");
-        println("  ---------------------------------------------------------");
-        for line in content.lines().skip(1) {
-            let mut parts = line.split(',');
-            let id_str = parts.next().unwrap_or("");
-            let name = parts.next().unwrap_or("");
-            let root = parts.next().unwrap_or("");
-            let creator = parts.next().unwrap_or("");
-            let primary = parts.next().unwrap_or("-");
-            
-            let mut id_val = 0u64;
-            for b in id_str.as_bytes() { if *b >= b'0' && *b <= b'9' { id_val = id_val * 10 + (*b - b'0') as u64; } }
-            let id_hex = if id_val == 0 { String::from("0") } else { format!("{:08x}", id_val) };
-
-            println(&format!("  {:<12}  {:<10}  {:<10}  {:<10}  {}", id_hex, name, root, creator, primary));
-        }
-    } else {
+    let entries = boxes::parse(&read_proc_boxes());
+    if entries.is_empty() {
         println("No active boxes found.");
+        exit(0);
+    }
+
+    println("  ID            NAME        ROOT        CREATOR     PRIMARY");
+    println("  ---------------------------------------------------------");
+    for e in &entries {
+        let id_hex = if e.id == 0 { String::from("0") } else { format!("{:08x}", e.id) };
+        println(&format!(
+            "  {:<12}  {:<10}  {:<10}  {:<10}  {}",
+            id_hex, e.name, e.root, e.creator, e.primary
+        ));
     }
     exit(0);
 }
@@ -555,40 +459,12 @@ fn cmd_show(mut args: libakuma::Args) -> ! {
         print("box show: box not found\n"); exit(1);
     });
 
-    let mut box_name = String::new();
-    let mut box_root = String::new();
-    let mut box_creator = String::new();
-
-    let fd = open("/proc/boxes", open_flags::O_RDONLY);
-    if fd >= 0 {
-        let mut buf = [0u8; 2048];
-        let n = read_fd(fd, &mut buf);
-        close(fd);
-        if n > 0 {
-            let content = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
-            for line in content.lines().skip(1) {
-                let mut parts = line.split(',');
-                let id_str = parts.next().unwrap_or("");
-                let bname = parts.next().unwrap_or("");
-                let root = parts.next().unwrap_or("");
-                let creator = parts.next().unwrap_or("");
-                
-                let mut found_id = 0u64;
-                for b in id_str.as_bytes() { if *b >= b'0' && *b <= b'9' { found_id = found_id * 10 + (*b - b'0') as u64; } }
-                if found_id == target_id {
-                    box_name = String::from(bname);
-                    box_root = String::from(root);
-                    box_creator = String::from(creator);
-                    break;
-                }
-            }
-        }
-    }
+    let entry = boxes::find(&read_proc_boxes(), target_id).unwrap_or_default();
 
     println(&format!("Box ID: {:08x}", target_id));
-    println(&format!("Name:   {}", box_name));
-    println(&format!("Root:   {}", box_root));
-    println(&format!("Creator PID: {}", box_creator));
+    println(&format!("Name:   {}", entry.name));
+    println(&format!("Root:   {}", entry.root));
+    println(&format!("Creator PID: {}", entry.creator));
     println("\nMembers:");
     
     let mut stats: [ThreadCpuStat; 64] = [ThreadCpuStat::default(); 64];

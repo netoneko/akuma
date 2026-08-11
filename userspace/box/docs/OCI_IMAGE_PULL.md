@@ -35,9 +35,10 @@ box pull <image>
 
 | Component | Location | Role |
 |-----------|----------|------|
-| Image ref parser | `oci.rs` | Deconstructs `registry/name:tag`, defaults Docker Hub + `library/` prefix |
-| JSON parser | `json.rs` | Minimal hand-rolled JSON extraction (no serde, no_std compatible) |
-| Image store | `images.rs` | Manages `/var/lib/box/images/` layout, config persistence |
+| Image ref parser | `oci_ref.rs` (boxlib) | Deconstructs `registry/name:tag`, defaults Docker Hub + `library/` prefix, builds the v2 URLs |
+| Manifest reader | `manifest.rs` (boxlib) | Manifest-list detection, `linux/arm64` selection, config + layer digests |
+| JSON | `json.rs` (boxlib) | Path-addressed reads (`["config","Cmd","*"]`) over the `picojson` pull parser — `no_std`, allocation-free, non-recursive |
+| Image store | `images.rs` + `paths.rs` (boxlib) | `/var/lib/box/` layout, config persistence |
 | TLS + HTTP | `libakuma-tls` | HTTPS client with redirect following (`download_file_with_headers`) |
 | Tar extraction | `akuma_tar` (`userspace/tar`) | Gzip decompression + tar unpacking, **linked in, not spawned**: `/bin/tar` was silently a busybox applet whose hardlinks go through `link()`, which akuma implements as a full file copy — one 1.9 MB layer became 467 MB with its mode bits lost ([`../../../docs/archive/BOX_DOCKER_COMPAT.md`](../../../docs/archive/BOX_DOCKER_COMPAT.md)) |
 

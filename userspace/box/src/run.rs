@@ -11,58 +11,23 @@ use libakuma::{
     close, exit, mkdir_p, open, open_flags, print, println, read_dir, read_fd, waitpid, write_fd,
 };
 
+use boxlib::spec::{self, ImageProcess, RunArgsError};
+
 use crate::images;
-use crate::json;
 use crate::{SpawnOptions, spawn_ext};
 
 const SYSCALL_REGISTER_BOX: u64 = 316;
 const SYSCALL_KILL_BOX: u64 = 317;
 
-/// What the image's config says to run. Entrypoint and Cmd stay separate
-/// because they are overridden separately.
-pub struct ImageProcess {
-    pub entrypoint: Vec<String>,
-    pub cmd: Vec<String>,
-    pub working_dir: String,
-}
+const USAGE: &str =
+    "Usage: box run [--rm] [-d] [-i] [--name X] [-w dir] <image> [cmd [args...]]\n";
 
-impl ImageProcess {
-    /// Compose the command line the way `docker run` does: arguments on the
-    /// command line replace **Cmd** and are passed to the Entrypoint. Only an
-    /// image with no Entrypoint at all treats them as the program to run.
-    pub fn argv_with(&self, user_args: &[String]) -> Vec<String> {
-        let mut argv = self.entrypoint.clone();
-        if user_args.is_empty() {
-            argv.extend(self.cmd.iter().cloned());
-        } else {
-            argv.extend(user_args.iter().cloned());
-        }
-        argv
-    }
-}
-
+/// What a pulled image says to run. An image with no readable config yields an
+/// empty process, which `cmd_run` reports rather than spawning.
 pub fn image_process(store: &str) -> ImageProcess {
-    let mut entrypoint = Vec::new();
-    let mut cmd = Vec::new();
-    let mut working_dir = String::from("/");
-
-    if let Some(config_json) = images::load_config(store) {
-        if let Some(config_obj) = json::extract_object(&config_json, "config") {
-            if let Some(ep) = json::extract_string_array(config_obj, "Entrypoint") {
-                entrypoint = ep;
-            }
-            if let Some(c) = json::extract_string_array(config_obj, "Cmd") {
-                cmd = c;
-            }
-            if let Some(wd) = json::extract_string(config_obj, "WorkingDir") {
-                if !wd.is_empty() {
-                    working_dir = wd;
-                }
-            }
-        }
-    }
-
-    ImageProcess { entrypoint, cmd, working_dir }
+    images::load_config(store)
+        .map(|json| spec::image_process_from_config(&json))
+        .unwrap_or_default()
 }
 
 /// Resolve a bare program name against the container's `PATH`, the way a shell
@@ -153,63 +118,27 @@ fn remove_tree(path: &str) {
     libakuma::rmdir(path);
 }
 
-fn box_id_for(name: &str) -> u64 {
-    let mut id = 0u64;
-    for b in name.as_bytes() {
-        id = id.wrapping_mul(31).wrapping_add(u64::from(*b));
-    }
-    if id == 0 { 1 } else { id }
-}
-
 pub fn cmd_run(args: libakuma::Args) -> ! {
-    let mut args = args.peekable();
-
-    let mut rm = false;
-    let mut detached = false;
-    let mut interactive = false;
-    let mut name: Option<String> = None;
-    let mut workdir_override: Option<String> = None;
-    let mut entrypoint_override: Option<String> = None;
-    let mut image_ref: Option<String> = None;
-    let mut cmd_argv: Vec<String> = Vec::new();
-
-    while let Some(arg) = args.next() {
-        match arg {
-            "--rm" => rm = true,
-            "-d" | "--detached" => detached = true,
-            "-i" | "-I" | "-it" | "--interactive" => interactive = true,
-            "--name" => {
-                name = Some(String::from(args.next().unwrap_or_else(|| {
-                    print("box run: --name requires a value\n");
-                    exit(1);
-                })));
-            }
-            "--entrypoint" => {
-                entrypoint_override = Some(String::from(args.next().unwrap_or_else(|| {
-                    print("box run: --entrypoint requires a value\n");
-                    exit(1);
-                })));
-            }
-            "-w" | "--workdir" => {
-                workdir_override = Some(String::from(args.next().unwrap_or_else(|| {
-                    print("box run: --workdir requires a value\n");
-                    exit(1);
-                })));
-            }
-            _ => {
-                image_ref = Some(String::from(arg));
-                for a in args {
-                    cmd_argv.push(String::from(a));
-                }
-                break;
-            }
+    let argv: Vec<&str> = args.collect();
+    let parsed = match spec::parse_run_args(&argv) {
+        Ok(p) => p,
+        Err(RunArgsError::MissingValue(flag)) => {
+            print("box run: ");
+            print(flag);
+            print(" requires a value\n");
+            exit(1);
         }
-    }
-
-    let Some(image_ref) = image_ref else {
-        print("Usage: box run [--rm] [-d] [-i] [--name X] [-w dir] <image> [cmd [args...]]\n");
-        exit(1);
+        Err(RunArgsError::NoImage) => {
+            print(USAGE);
+            exit(1);
+        }
     };
+
+    let image_ref = parsed.image;
+    let rm = parsed.rm;
+    let detached = parsed.detached;
+    let interactive = parsed.interactive;
+    let cmd_argv = parsed.argv;
 
     let store = images::sanitize_name(&image_ref);
     if !images::image_exists(&store) {
@@ -238,8 +167,11 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
     }
 
     // A container id that is stable when named and unique when not.
-    let container = name.clone().unwrap_or_else(|| format!("{}-{}", store, libakuma::uptime()));
-    let box_id = box_id_for(&container);
+    let container = parsed
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("{}-{}", store, libakuma::uptime()));
+    let box_id = spec::box_id_for(&container);
 
     let croot = images::container_dir(&container);
     let upper = images::container_upper(&container);
@@ -280,12 +212,8 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
     }
 
     let mut image_proc = image_process(&store);
-    if let Some(ep) = entrypoint_override {
-        // Docker's `--entrypoint`: replace the entrypoint outright and let the
-        // command line supply its arguments. The image's own Cmd is dropped,
-        // since it was written for a different program.
-        image_proc.entrypoint = alloc::vec![ep];
-        image_proc.cmd = Vec::new();
+    if let Some(ep) = &parsed.entrypoint {
+        image_proc.override_entrypoint(ep);
     }
     let argv = image_proc.argv_with(&cmd_argv);
     if argv.is_empty() {
@@ -293,7 +221,7 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
         libakuma::syscall(SYSCALL_KILL_BOX, box_id, 0, 0, 0, 0, 0);
         exit(1);
     }
-    let working_dir = workdir_override.unwrap_or(image_proc.working_dir);
+    let working_dir = parsed.workdir.clone().unwrap_or(image_proc.working_dir);
 
     let path = resolve_in_container(&upper, &lowerdirs, &argv[0]);
     let rest: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
