@@ -16,7 +16,7 @@ pages — not every member has one).
 | `libakuma-tls` | TLS 1.3 client connections for userspace programs |
 | `apk-tools` | Alpine apk bootstrap tooling (no binary — build.rs deploys bootstrap assets directly) |
 | `herd` | Process supervisor — background services, auto-restart, config in `/etc/herd/` |
-| `box` | Container manager (`box open/close/stop/ps/inspect`) |
+| `box` | Container manager: `box run` (Docker images on an overlay root), `box pull`, `box open/close/ps/inspect` |
 | `meow` | AI coding assistant — LLM chat client with filesystem/network tool calling |
 | `nca` | Build wrapper for [native-cli-ai](https://github.com/netoneko/native-cli-ai) (submodule); no binary in `/bin` — build.rs deploys to `bootstrap/bin/nca` |
 | `tcc` | Tiny C Compiler port — compile and run C programs on-target |
@@ -24,7 +24,7 @@ pages — not every member has one).
 | `sshd` | Userspace SSH server |
 | `paws` | **EXPERIMENTAL — `extreme-size` demo only.** Minimal first-party shell (598 lines, pure `libakuma`): 8 RO-mapped pages vs busybox's 265, which is what makes it usable as the login shell on a 4 MB box whose file-page dedup cache holds 128. **Not busybox/ash compatible** — hand-rolled parser, fixed builtin list, no `exec`/`printf`/`test`, unreliable pipes and redirection. Fine for `sshd --shell /bin/paws` execing one binary (that is how `acceptance/05`, and formerly `acceptance/archive/08`, pass at 4.0 MB); do not point real shell scripts at it. Originally removed at `c0af6c7`, revived 2026-08-10. See [`../archive/BUSYBOX_TOYBOX_SIZING.md`](../archive/BUSYBOX_TOYBOX_SIZING.md) |
 | `httpd` | HTTP server |
-| `tar` | `tar` utility implementation |
+| `tar` | Tar extraction. A **library** (`akuma_tar`) that `box` links for layer extraction, plus a thin `/bin/tar` CLI. Header parsing (`format.rs`) is host-testable |
 | `scratch` | Minimal Git client (Git Smart HTTP) — was removed then reverted; see `docs/archive/TRIM_FAT_PART_2.md`'s "Removed: scratch" section, which predates the revert |
 | `llama.cpp` | llama.cpp port — LLM inference on-device |
 | `rumpkernel` | NetBSD rump kernel port — real network stack (DHCP/HTTP/HTTPS) |

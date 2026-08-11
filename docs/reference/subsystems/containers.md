@@ -3,7 +3,9 @@
 Current-state architecture for the box isolation model, the `herd` supervisor,
 and OCI support.
 
-> **Stability: B (watch).** Low volume but active through June. The box model
+> **Stability: B (watch).** Active again 2026-08-11 (OCI overlay roots, `box
+> run`, mount lockdown — see "Mount policy" and "OCI images and the overlay
+> root"). The box model
 > is implemented; the `stack=rump` herd box path is **partly** implemented
 > (Phase 5 / open). herd's config schema is the live surface — verify fields
 > against `userspace/herd/src/main.rs` before relying on one. Box permissions
@@ -45,8 +47,9 @@ the box's recorded `creator_pid`.
 | `KILL_BOX` | `can_kill_box`. The namespace is dropped only after the kill succeeds | `EPERM` |
 | `SPAWN_EXT` (`box_id != 0`) | `can_access_box` — the child inherits that box's `box_id` **and** its mount namespace. `box_id == 0` means "inherit the caller's box" and is unchecked | `EPERM` |
 | `SET_BOX_STACK` | `can_access_box` | `EPERM` |
-| `MOUNT_IN_NS` | caller must be box 0 | `EPERM` |
-| `UMOUNT2` | box 0 may not use it at all; a boxed process may not unmount **`/`** — that is its `SubdirFs` jail root, and an empty namespace falls back to the global mount table | `EPERM` |
+| `MOUNT_IN_NS` | caller must be box 0. With fstype `overlay` at `/`, the target box must additionally have **no processes** and a still-pristine root | `EPERM` |
+| `MOUNT` | caller must be box 0 (since 2026-08-11 — a boxed process could previously mount into its own namespace) | `EPERM` |
+| `UMOUNT2` | nobody: box 0 never used it, and a box may not take mounts away any more than it may add them (since 2026-08-11 — a box could previously unmount anything but `/`) | `EPERM` |
 
 `SubdirFs` resolves `.`/`..` and clamps at the virtual root before prefixing, so
 a `..` cannot ascend out of `box_root` even if a caller reaches the filesystem
@@ -109,19 +112,131 @@ restart = true
 # UNBOXED — box 0 itself is rump under rump-default, no join_box needed
 ```
 
-## OCI bundle support
+## Mount policy: composed from outside, once
 
-`bundle` field points at an OCI bundle directory (`config.json` + rootfs). If
-set, overrides `command`/`box_root`. Status: basic bundle loading works; full
-OCI runtime spec (cgroups, capabilities, seccomp, devices) is **not**
-implemented — Akuma's isolation is namespace + network-stack, not a full
-container runtime. See `archive/CONTAINERS_STAGE_2_PLAN.md`.
+A box's mount namespace is built **entirely by box 0**, through `MOUNT_IN_NS`,
+before anything runs in the box. A boxed process cannot mount, cannot unmount,
+and cannot re-root itself.
+
+The reasoning is that a mount table is the box's whole view of the filesystem.
+Anything a box can mount, it can mount *over* — its own `/proc`, a directory its
+supervisor is watching, the path another process resolves against — and a box
+that can shadow paths inside itself is a box whose isolation is described by
+whatever it did last rather than by what its creator set up.
+
+A box's root gets the same treatment in time as well as space:
+`MountNamespace::replace_pristine_root` fails unless `/` still holds the
+untouched `SubdirFs` jail, and `MOUNT_IN_NS` refuses to re-root a box that
+already has processes. So a root can be set once, at creation, and never
+redirected — swapping a live one would move the filesystem under processes
+holding paths and cwds resolved against the old one. The complementary rule is
+`umount2`, which never lets a box lose its `/` (an empty namespace makes
+`with_fs` fall back to the **global** mount table — the whole host filesystem).
+
+**Consequence: no nested OCI images.** Composing a container root requires an
+overlay mount, and no box can mount. Nested **boxes** are unaffected — they are
+process and network-stack grouping, and a box may still register a child box
+rooted inside its own subtree. Docker-in-docker can be revisited later; nothing
+needs it now.
+
+Regression: `test_box_isolation_syscall_guards` cases 8b–8d.
+
+## OCI images and the overlay root
+
+`box run <image>` starts a container whose root is the image's layers, read-only
+and shared, with a private writable directory on top. Implemented 2026-08-11;
+task-level procedure in
+[`../../runbooks/run-docker-image.md`](../../runbooks/run-docker-image.md).
+
+### Layer store
+
+`box pull` extracts each layer into its own content-addressed directory. The
+image directory holds metadata only:
+
+```
+/var/lib/box/layers/sha256-<hex>/          shared by every image that uses it
+/var/lib/box/images/<name>/oci-config.json
+/var/lib/box/images/<name>/layers          digest per line, base-first
+/var/lib/box/containers/<id>/upper         one container's writable layer
+```
+
+A layer already present is not re-downloaded. Extraction stages in
+`<digest>.tmp` and renames into place, so an interrupted pull cannot leave a
+directory that looks complete. Whiteout entries are left **as files** — they
+are part of the layer per the OCI spec and the overlay interprets them at
+lookup time, so an extracted layer needs no rewriting.
+
+### `OverlayFs`
+
+`crates/akuma-isolation/src/overlay_fs.rs`. One writable upper over N read-only
+lowers, all `SubdirFs` over the same ext2. Layers are indexed topmost-first
+(0 = upper); a name is served by the lowest index that has it.
+
+- **Lookup walks one component at a time**, so a whiteout or opaque marker on an
+  *ancestor* hides the subtree beneath it. A plain file at an intermediate
+  component ends resolution rather than letting the path resume in a layer that
+  file is hiding.
+- **Whiteouts** use the names the registry already ships: `.wh.<name>` hides
+  `<name>` below, `.wh..wh..opq` hides a directory's entire lower content while
+  leaving the directory visible.
+- **Writes copy up**: parent chain materialized in upper, file copied from the
+  winning lower, then delegated. **Deletes** that cannot touch a read-only lower
+  write a whiteout instead. Re-creating a deleted name clears its whiteout.
+- **Directory rename returns `NotSupported`** — the subtree copy-up plus
+  per-name whiteouts it would need is not implemented.
+
+**Every layer must sit on the same underlying filesystem.** `read_at_by_inode`
+is forwarded on the assumption that an inode number identifies a file across all
+of them, and the file page cache is keyed on inode alone
+(`src/file_page_cache.rs`). A `MemoryFilesystem` upper would break this —
+memfs synthesizes inodes by hashing the path — and would hand the page-fault
+path an unrelated file's contents. This is why a tmpfs upper for `--rm` is
+deferred rather than "obviously fine".
+
+Host-tested in the crate: whiteouts at every level, opaque directories, merge
+and dedupe, copy-up, whiteout clearing, layer capping (`MAX_LOWER_LAYERS = 32`).
+
+### How a container root is assembled
+
+1. `box run` registers the box with `root_dir` = the container directory, which
+   is what the kernel validates and jails to.
+2. `create_box_namespace` mounts a `SubdirFs` at `/` as usual.
+3. `MOUNT_IN_NS` with fstype `overlay` and
+   `lowerdir=<top>:…:<base>,upperdir=<container>/upper` **replaces** that `/`
+   via `MountNamespace::replace_pristine_root` — `mount` itself rejects the
+   duplicate. See "Mount policy" above for why this is a one-shot.
+4. `box run` injects `/etc/resolv.conf` and `/etc/hosts` into the upper layer,
+   which no OCI image ships and every networked program expects.
+
+### Not implemented
+
+- Image `Env` is dropped: `SpawnOptions` has no env field, so a container gets
+  `DEFAULT_ENV`. `box run` compensates by resolving a bare Entrypoint against
+  the standard `PATH` directories itself.
+- `spawn_ext` does not honour shebangs (only `execve` does), so a script
+  Entrypoint needs `--entrypoint`.
+- No layer GC, no `box rmi`, no digest pinning.
+- Full OCI runtime spec (cgroups, capabilities, seccomp, devices) — Akuma's
+  isolation is namespace + network-stack, not a full container runtime.
+
+## OCI bundle support (herd)
+
+herd's `bundle` field points at an OCI bundle directory (`config.json` +
+rootfs). If set, overrides `command`/`box_root`. Basic bundle loading works;
+this predates and is separate from the `box run` path above. See
+`archive/CONTAINERS_STAGE_2_PLAN.md`.
 
 ## `box` userspace tool
 
-`userspace/box/` — the CLI for `box use`, `box open --net`, image pull.
-`archive/BOX_CONTAINERS.md` is the proposal; `userspace/box/docs/OCI_IMAGE_PULL.md`
-+ `userspace/box/docs/TESTING.md` cover the implementation.
+`userspace/box/` — the CLI for `box run`, `box use`, `box open`, image pull.
+`archive/BOX_CONTAINERS.md` is the proposal;
+`userspace/box/docs/OCI_IMAGE_PULL.md` (pull pipeline),
+`userspace/box/docs/BOX_RUN.md` (containers + overlay) and
+`userspace/box/docs/TESTING.md` cover the implementation.
+
+Note `box run` and `box open -i` differ: `run` builds an overlay root and is the
+docker-shaped command; `open -i` still points the box root directly at an
+image's legacy flat `rootfs/` directory, which `box pull` no longer creates.
 
 ## PTY-in-box (interactive SSH into a box)
 
@@ -135,4 +250,7 @@ boxed service.
 - `archive/BOX_PTY_INTERACTIVE_SHELL.md`, `archive/BOX_SUBDIR_FS_LIMITATIONS.md`.
 - `archive/BOX_ISOLATION_SECURITY_FIXES.md` — the nine unenforced boundaries and
   how each is gated now.
+- `archive/BOX_DOCKER_COMPAT.md` — `box run`, the layer store and `OverlayFs`,
+  the mount lockdown, and the two bugs found underneath (busybox tar +
+  `linkat`-copies-files; `spawn_ext` and shebangs).
 - `userspace/box/docs/OCI_IMAGE_PULL.md`, `userspace/herd/docs/CORE_AWARE_SCHEDULING.md`.

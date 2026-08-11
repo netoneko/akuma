@@ -28,6 +28,7 @@ Start from the symptom or task on the left.
 | A VM feels slow / unresponsive under parallel load, or an in-VM build crawls | The console may be the bottleneck — three per-event traces were unconditional until 2026-08-08 and cost 270 KB/s: [`../archive/SERIAL_TRACE_TRAFFIC_AUDIT.md`](../archive/SERIAL_TRACE_TRAFFIC_AUDIT.md). Histogram the log before blaming the kernel |
 | Debugging SSH latency / echo / terminal sizing | [`debug-ssh-latency.md`](debug-ssh-latency.md) |
 | Self-hosting (compiling the kernel inside Akuma) | [`selfhost-kernel-build.md`](selfhost-kernel-build.md) |
+| Running a Docker image with `box run` | [`run-docker-image.md`](run-docker-image.md) |
 | Adding an apk package to the devbox | [`add-apk-package.md`](add-apk-package.md) |
 | Adding a `sc-*` kernel feature | [`add-syscall-feature.md`](add-syscall-feature.md) |
 | Landed a fix and need to update the bugfix audit | [`update-bug-fix-list.md`](update-bug-fix-list.md) |

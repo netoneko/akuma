@@ -38,21 +38,43 @@ impl MountNamespace {
         Ok(())
     }
 
-    /// Mount `fs` at `path`, replacing whatever is already mounted there.
+    /// Replace the namespace's root mount, but **only** while it is still the
+    /// pristine one the namespace was born with.
     ///
-    /// The one caller is the overlay mount: a box's namespace is born with a
-    /// `SubdirFs` at `/` (`create_box_namespace`), and turning that root into an
-    /// overlay means swapping it, not stacking on it. There is deliberately no
-    /// syscall that reaches this for `/` from userspace — `umount2` refuses to
-    /// let a box drop the floor it stands on, and this must not become a way
-    /// around that.
-    pub fn mount_replace(&mut self, path: &str, fs: Arc<dyn Filesystem>) {
-        self.mounts.retain(|m| m.path != path);
-        self.mounts.push(NsMountEntry {
-            path: String::from(path),
-            fs,
-        });
-        self.mounts.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+    /// This exists for exactly one move: a box's namespace is created with a
+    /// `SubdirFs` jail at `/` (`create_box_namespace`), and turning that root
+    /// into an overlay is a swap, not a stack — `mount` would reject the
+    /// duplicate path.
+    ///
+    /// Swapping a root is dangerous in a way a plain mount is not: every path a
+    /// running process resolves, and every relative lookup it has in flight,
+    /// silently starts landing somewhere else. So this is written as a one-shot
+    /// rather than a general "replace": it fails unless `/` currently holds a
+    /// filesystem named `expected`, which is true only before anything has
+    /// re-rooted the box. A second call cannot undo the first, and no caller can
+    /// use it to point a live box's `/` at a directory of its choosing.
+    ///
+    /// The complementary rule lives in `umount2`, which refuses to let a box
+    /// drop its own `/`. Between them, a box's root can be set once and never
+    /// removed or redirected.
+    ///
+    /// # Errors
+    /// `PermissionDenied` if `/` is missing or is not `expected`.
+    pub fn replace_pristine_root(
+        &mut self,
+        expected: &str,
+        fs: Arc<dyn Filesystem>,
+    ) -> Result<(), FsError> {
+        let current = self
+            .mounts
+            .iter_mut()
+            .find(|m| m.path == "/")
+            .ok_or(FsError::PermissionDenied)?;
+        if current.fs.name() != expected {
+            return Err(FsError::PermissionDenied);
+        }
+        current.fs = fs;
+        Ok(())
     }
 
     pub fn unmount(&mut self, path: &str) -> Result<(), FsError> {
@@ -196,6 +218,27 @@ mod tests {
         Arc::new(fs)
     }
 
+    /// A stand-in for the overlay: same `Filesystem`, a name that is not the
+    /// pristine one, so the one-shot rule can be exercised.
+    fn overlay_stand_in() -> Arc<dyn Filesystem> {
+        struct Named(Arc<MemoryFilesystem>);
+        impl Filesystem for Named {
+            fn name(&self) -> &str { "overlay" }
+            fn read_dir(&self, p: &str) -> Result<Vec<DirEntry>, FsError> { self.0.read_dir(p) }
+            fn read_file(&self, p: &str) -> Result<Vec<u8>, FsError> { self.0.read_file(p) }
+            fn write_file(&self, p: &str, d: &[u8]) -> Result<(), FsError> { self.0.write_file(p, d) }
+            fn create_dir(&self, p: &str) -> Result<(), FsError> { self.0.create_dir(p) }
+            fn remove_file(&self, p: &str) -> Result<(), FsError> { self.0.remove_file(p) }
+            fn remove_dir(&self, p: &str) -> Result<(), FsError> { self.0.remove_dir(p) }
+            fn exists(&self, p: &str) -> bool { self.0.exists(p) }
+            fn metadata(&self, p: &str) -> Result<akuma_vfs::Metadata, FsError> { self.0.metadata(p) }
+            fn stats(&self) -> Result<akuma_vfs::FsStats, FsError> { self.0.stats() }
+        }
+        let inner = MemoryFilesystem::new();
+        inner.write_file("/tag", b"overlay").unwrap();
+        Arc::new(Named(Arc::new(inner)))
+    }
+
     /// Which filesystem `path` resolves to. A `/` mount is handed the whole
     /// path rather than a relative one, so the marker is read by its own name.
     fn tag_at(ns: &MountNamespace, path: &str) -> String {
@@ -204,34 +247,51 @@ mod tests {
     }
 
     #[test]
-    fn mount_rejects_a_duplicate_but_replace_swaps_it() {
+    fn mount_rejects_a_duplicate_but_a_pristine_root_can_be_swapped() {
         let mut ns = MountNamespace::new();
-        ns.mount("/", tagged("subdir")).unwrap();
-        assert_eq!(ns.mount("/", tagged("overlay")).unwrap_err(), FsError::AlreadyExists);
-        assert_eq!(tag_at(&ns, "/tag"), "subdir");
+        ns.mount("/", tagged("memfs")).unwrap();
+        assert_eq!(ns.mount("/", tagged("memfs")).unwrap_err(), FsError::AlreadyExists);
 
-        ns.mount_replace("/", tagged("overlay"));
+        ns.replace_pristine_root("memfs", overlay_stand_in()).unwrap();
 
         assert_eq!(tag_at(&ns, "/tag"), "overlay");
         assert_eq!(ns.list_mounts().len(), 1, "replace must not leave the old entry behind");
     }
 
+    /// The one-shot rule: once the root is no longer the pristine jail, nothing
+    /// can point it somewhere else.
     #[test]
-    fn replacing_the_root_leaves_deeper_mounts_winning() {
+    fn a_root_that_is_not_pristine_cannot_be_replaced_again() {
         let mut ns = MountNamespace::new();
-        ns.mount("/", tagged("root")).unwrap();
-        ns.mount("/proc", tagged("proc")).unwrap();
+        ns.mount("/", tagged("memfs")).unwrap();
+        ns.replace_pristine_root("memfs", overlay_stand_in()).unwrap();
 
-        ns.mount_replace("/", tagged("overlay"));
-
-        assert_eq!(tag_at(&ns, "/proc/tag"), "proc");
-        assert_eq!(tag_at(&ns, "/etc/tag"), "overlay");
+        assert_eq!(
+            ns.replace_pristine_root("memfs", tagged("attacker")).unwrap_err(),
+            FsError::PermissionDenied
+        );
+        assert_eq!(tag_at(&ns, "/tag"), "overlay", "the root did not move");
     }
 
     #[test]
-    fn replace_on_an_empty_namespace_is_just_a_mount() {
+    fn a_namespace_with_no_root_cannot_have_one_installed_this_way() {
         let mut ns = MountNamespace::new();
-        ns.mount_replace("/", tagged("overlay"));
-        assert_eq!(tag_at(&ns, "/tag"), "overlay");
+        assert_eq!(
+            ns.replace_pristine_root("memfs", overlay_stand_in()).unwrap_err(),
+            FsError::PermissionDenied
+        );
+        assert!(ns.resolve("/tag").is_none());
+    }
+
+    #[test]
+    fn replacing_the_root_leaves_deeper_mounts_winning() {
+        let mut ns = MountNamespace::new();
+        ns.mount("/", tagged("memfs")).unwrap();
+        ns.mount("/proc", tagged("proc")).unwrap();
+
+        ns.replace_pristine_root("memfs", overlay_stand_in()).unwrap();
+
+        assert_eq!(tag_at(&ns, "/proc/tag"), "proc");
+        assert_eq!(tag_at(&ns, "/etc/tag"), "overlay");
     }
 }

@@ -93,17 +93,20 @@ pub fn mount_in_namespace(box_id: u64, path: &str, fs: Arc<dyn Filesystem>) -> R
     ns.mount.lock().mount(path, fs)
 }
 
-/// Mount a filesystem into a box's namespace, replacing whatever is at `path`.
+/// Turn a box's pristine `SubdirFs` root into `fs` (an overlay of image layers).
 ///
-/// Only `MOUNT_IN_NS` with an overlay root reaches this: a box is born with a
-/// `SubdirFs` jail at `/`, and making its root an overlay is a swap. Adding a
-/// second `/` through the ordinary path would be rejected as a duplicate.
+/// Only `MOUNT_IN_NS` with fstype `overlay` reaches this. A box is born with a
+/// `SubdirFs` jail at `/`, and making its root an overlay is a swap, not a
+/// stack — the ordinary mount path would reject the duplicate.
+///
+/// `replace_pristine_root` enforces that the root really is that untouched jail,
+/// so this is a one-shot at box-creation time and never a way to redirect a root
+/// that has already been established.
 #[cfg(feature = "sc-containers")]
-pub fn mount_replace_in_namespace(box_id: u64, path: &str, fs: Arc<dyn Filesystem>) -> Result<(), FsError> {
+pub fn replace_box_root(box_id: u64, fs: Arc<dyn Filesystem>) -> Result<(), FsError> {
     let namespaces = BOX_NAMESPACES.lock();
     let ns = namespaces.get(&box_id).ok_or(FsError::NotFound)?;
-    ns.mount.lock().mount_replace(path, fs);
-    Ok(())
+    ns.mount.lock().replace_pristine_root("subdirfs", fs)
 }
 
 /// Unmount a path from a specific box's namespace.

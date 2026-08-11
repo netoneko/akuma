@@ -3064,6 +3064,37 @@ fn test_box_isolation_syscall_guards() {
         root_path.as_ptr() as u64, 0, 0, 0, 0, 0,
     ]), EPERM);
 
+    // 8b. Mounting *anything* from inside a box. A box's namespace is composed
+    //     from outside, by box 0, before it runs; a box that can mount can shadow
+    //     any path inside itself, including over its own /proc. This is also what
+    //     stops a container from assembling a container: an OCI root needs an
+    //     overlay mount, and no box can mount at all.
+    let proc_target = b"/proc\0";
+    let proc_type = b"proc\0";
+    check!("mount(inside box)", handle_syscall(nr::MOUNT, &[
+        0,
+        proc_target.as_ptr() as u64,
+        proc_type.as_ptr() as u64,
+        0, 0, 0,
+    ]), EPERM);
+
+    // 8c. ... and taking one away, not just the jail root.
+    let tmp_target = b"/tmp\0";
+    check!("umount2(inside box)", handle_syscall(nr::UMOUNT2, &[
+        tmp_target.as_ptr() as u64, 0, 0, 0, 0, 0,
+    ]), EPERM);
+
+    // 8d. Composing another box's namespace is host-only, so a box cannot mount
+    //     an overlay root into the child box case 5 just let it create.
+    let overlay_type = b"overlay\0";
+    let overlay_opts = b"lowerdir=/tmp/boxsec,upperdir=/tmp/boxsec\0";
+    check!("mount_in_ns(overlay, inside box)", handle_syscall(nr::MOUNT_IN_NS, &[
+        BOX_NESTED,
+        root_path.as_ptr() as u64, 1,
+        overlay_type.as_ptr() as u64, 7,
+        overlay_opts.as_ptr() as u64,
+    ]), EPERM);
+
     // 9. The jail itself: `..` inside a box must clamp at the virtual root rather
     //    than walking into the host's files.
     let _ = crate::fs::create_dir("/tmp/boxsec");

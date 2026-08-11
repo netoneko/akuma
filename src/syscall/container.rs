@@ -79,7 +79,33 @@ pub(super) fn sys_reattach(pid: u32) -> u64 {
 
 }
 
+/// A box's mount namespace is composed **entirely from outside**, by box 0,
+/// before anything runs in it (`MOUNT_IN_NS`). A boxed process may not change
+/// it: not add a mount, not remove one, not re-root itself.
+///
+/// The reason is that a mount table is the box's whole view of the filesystem.
+/// Anything a box can mount, it can mount *over* — its own `/proc`, a directory
+/// its supervisor is watching, the path another process resolves against — and
+/// a box that can shadow paths inside itself is a box whose isolation is
+/// described by whatever it did last, not by what its creator set up. Composing
+/// the namespace once, from the outside, keeps that description fixed.
+///
+/// It also means a container cannot build a container: assembling an OCI root
+/// needs an overlay mount, and no box can mount at all. Nested **boxes** still
+/// exist — they are process/network grouping — but nested OCI images do not.
+#[cfg(feature = "sc-containers")]
+fn caller_may_mount() -> bool {
+    akuma_exec::process::current_process_shared().is_none_or(|p| p.box_id == 0)
+}
+
 pub(super) fn sys_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64, _flags: u64, _data_ptr: u64) -> u64 {
+    if !caller_may_mount() {
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(128, "[mount] denied: boxed processes may not mount\n");
+        }
+        return EPERM;
+    }
+
     let target = match copy_from_user_str(target_ptr, 256) {
         Ok(s) => s,
         Err(e) => return e,
@@ -106,48 +132,26 @@ pub(super) fn sys_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64, _fla
     // keeps a box from shadowing its own root.
     let target = crate::vfs::canonicalize_path(&target);
 
-    if let Some(proc) = akuma_exec::process::current_process_shared() {
-        if proc.box_id == 0 {
-            match crate::vfs::mount(&target, fs) {
-                Ok(()) => 0,
-                Err(_) => EINVAL,
-            }
-        } else {
-            match proc.namespace.mount.lock().mount(&target, fs) {
-                Ok(()) => 0,
-                Err(_) => EINVAL,
-            }
-        }
-    } else {
-        EPERM
+    // Only box 0 reaches here, so this is always the global mount table.
+    match crate::vfs::mount(&target, fs) {
+        Ok(()) => 0,
+        Err(_) => EINVAL,
     }
 }
 
+/// Unmounting is host-only, and the host does not unmount through this syscall
+/// either — so it always fails. See [`caller_may_mount`] for why a box may not
+/// take mounts away any more than it may add them; the specific hazard for `/`
+/// is that emptying a box's namespace makes `with_fs` fall back to the GLOBAL
+/// mount table, handing the box the whole host filesystem.
 pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> u64 {
-    let target = match copy_from_user_str(target_ptr, 256) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    let target = crate::vfs::canonicalize_path(&target);
-
-    if let Some(proc) = akuma_exec::process::current_process_shared() {
-        if proc.box_id == 0 {
-            EPERM
-        } else if target == "/" {
-            // "/" is the box's `SubdirFs` jail root. Unmounting it empties the
-            // namespace, and `with_fs` then falls back to the GLOBAL mount table
-            // — i.e. the whole host filesystem, read and write. A box may drop a
-            // mount it added (its /proc, a tmpfs); never the floor it stands on.
-            EPERM
-        } else {
-            match proc.namespace.mount.lock().unmount(&target) {
-                Ok(()) => 0,
-                Err(_) => EINVAL,
-            }
-        }
-    } else {
-        EPERM
+    if let Err(e) = copy_from_user_str(target_ptr, 256) {
+        return e;
     }
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED && !caller_may_mount() {
+        crate::safe_print!(128, "[umount2] denied: boxed processes may not unmount\n");
+    }
+    EPERM
 }
 
 /// Build an `OverlayFs` from a `lowerdir=…,upperdir=…` option string.
@@ -236,8 +240,21 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
     // root replaces that jail rather than stacking on it — `mount` would reject
     // the duplicate. Anywhere else, a duplicate really is a caller error.
     if target == "/" {
-        return match crate::vfs::mount_replace_in_namespace(box_id, &target, fs) {
+        // Re-rooting a box that is already running would move the filesystem
+        // under processes that have paths and cwds resolved against the old one.
+        // The legitimate caller does this between REGISTER_BOX and its first
+        // spawn, so requiring the box to be empty costs nothing and takes the
+        // whole class of live-swap games off the table. `replace_box_root` then
+        // enforces that the root is still the pristine jail.
+        if akuma_exec::process::list_processes().iter().any(|p| p.box_id == box_id) {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(160, "[mount] refusing to re-root live box {}\n", box_id);
+            }
+            return EPERM;
+        }
+        return match crate::vfs::replace_box_root(box_id, fs) {
             Ok(()) => 0,
+            Err(crate::vfs::FsError::PermissionDenied) => EPERM,
             Err(_) => EINVAL,
         };
     }

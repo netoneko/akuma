@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 libakuma = { path = "../libakuma", features = ["chunked-allocator"] }
 libakuma-tls = { path = "../libakuma-tls" }
+# Layer extraction is linked in, not spawned as /bin/tar — see tar/src/lib.rs.
+akuma-tar = { package = "tar", path = "../tar" }
 
 [[bin]]
 name = "box"

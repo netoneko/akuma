@@ -1,7 +1,7 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use libakuma::{print, println, print_dec, unlink, waitpid};
+use libakuma::{print, println, print_dec, unlink};
 use libakuma_tls::{https_get, download_file_with_headers, HttpHeaders};
 
 use crate::json;
@@ -236,20 +236,22 @@ fn download_layer(
         .map_err(|e| format!("layer download failed: {:?}", e))
 }
 
+/// Unpack one gzipped layer tarball into `rootfs_path`.
+///
+/// Linked in rather than shelled out to: `/bin/tar` is a path, and for the whole
+/// life of `box pull` that path was a busybox applet symlink whose hardlink
+/// handling turned a 1.9 MB layer into 467 MB of copies with their mode bits
+/// lost. A dependency cannot be swapped out from under us by a symlink.
 fn extract_layer(layer_path: &str, rootfs_path: &str) -> Result<(), String> {
-    match libakuma::spawn("/bin/tar", Some(&["-xzvf", layer_path, "-C", rootfs_path])) {
-        Some(res) => {
-            loop {
-                if let Some((_, code)) = waitpid(res.pid) {
-                    if code != 0 {
-                        return Err(format!("tar exited with code {}", code));
-                    }
-                    return Ok(());
-                }
-                libakuma::sleep_ms(50);
+    let opts = akuma_tar::ExtractOptions { gzip: true, verbose: false, ..Default::default() };
+    match akuma_tar::extract_file(layer_path, rootfs_path, &opts) {
+        Ok(stats) => {
+            if stats.rejected > 0 {
+                return Err(format!("layer contains {} entries outside the target directory", stats.rejected));
             }
+            Ok(())
         }
-        None => Err(String::from("failed to spawn tar")),
+        Err(e) => Err(format!("extract failed: {}", e.describe())),
     }
 }
 
