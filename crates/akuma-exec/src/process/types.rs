@@ -395,6 +395,91 @@ impl SignalAction {
             restorer: 0,
         }
     }
+
+    /// Should an expired `ITIMER_REAL` (`alarm()`/`setitimer()`) force-interrupt
+    /// a blocking syscall via the unconditional, `SA_RESTART`-blind Ctrl-C-style
+    /// flag (`ProcessChannel::interrupted`), rather than relying solely on
+    /// ordinary signal delivery?
+    ///
+    /// - `Default`: yes — this is the only mechanism that can break a
+    ///   handler-less `alarm(); pause();`; the mask-and-handler-gated
+    ///   `current_thread_has_pending_interrupt` never fires for `SIG_DFL`.
+    /// - `Ignore`: no — Linux delivers nothing observable for an ignored
+    ///   signal, so nothing should interrupt either.
+    /// - `UserFn`: only when the handler did **not** ask for `SA_RESTART`. The
+    ///   signal is still queued via `pend_signal_for_thread` regardless, so an
+    ///   `SA_RESTART` handler is delivered normally at the next syscall
+    ///   return — it just doesn't get this extra, restart-ignorant kick. A
+    ///   handler *with* `SA_RESTART` (e.g. a periodic heartbeat/low-speed-limit
+    ///   timer that expects its own blocking syscalls to keep running after
+    ///   each tick) previously got force-interrupted on every single tick
+    ///   regardless — docs/archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md.
+    pub fn wants_itimer_force_interrupt(&self) -> bool {
+        const SA_RESTART: u64 = 0x1000_0000;
+        match self.handler {
+            SignalHandler::UserFn(_) => self.flags & SA_RESTART == 0,
+            SignalHandler::Default => true,
+            SignalHandler::Ignore => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod signal_action_tests {
+    use super::*;
+
+    #[test]
+    fn default_disposition_wants_force_interrupt() {
+        assert!(SignalAction::default().wants_itimer_force_interrupt());
+    }
+
+    #[test]
+    fn ignore_disposition_never_wants_force_interrupt() {
+        let action = SignalAction { handler: SignalHandler::Ignore, ..SignalAction::default() };
+        assert!(!action.wants_itimer_force_interrupt());
+    }
+
+    #[test]
+    fn handler_without_sa_restart_wants_force_interrupt() {
+        let action = SignalAction {
+            handler: SignalHandler::UserFn(0x1234),
+            flags: 0,
+            ..SignalAction::default()
+        };
+        assert!(action.wants_itimer_force_interrupt());
+    }
+
+    /// The regression: a periodic `SA_RESTART` handler (e.g. curl's
+    /// low-speed-limit heartbeat) must NOT be force-interrupted — that bypasses
+    /// its own restart request and was what made `git clone`'s checkout phase
+    /// die mid-write with a bogus "signal 2" exit code under real network
+    /// latency (docs/archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md).
+    #[test]
+    fn handler_with_sa_restart_does_not_want_force_interrupt() {
+        const SA_RESTART: u64 = 0x1000_0000;
+        let action = SignalAction {
+            handler: SignalHandler::UserFn(0x1234),
+            flags: SA_RESTART,
+            ..SignalAction::default()
+        };
+        assert!(!action.wants_itimer_force_interrupt());
+    }
+
+    #[test]
+    fn sa_restart_bit_ignored_for_non_userfn_handlers() {
+        const SA_RESTART: u64 = 0x1000_0000;
+        // SA_RESTART set but disposition is Default/Ignore — the flag is only
+        // meaningful for a real handler; it must not change the outcome.
+        let default_with_flag = SignalAction { flags: SA_RESTART, ..SignalAction::default() };
+        assert!(default_with_flag.wants_itimer_force_interrupt());
+
+        let ignore_with_flag = SignalAction {
+            handler: SignalHandler::Ignore,
+            flags: SA_RESTART,
+            ..SignalAction::default()
+        };
+        assert!(!ignore_with_flag.wants_itimer_force_interrupt());
+    }
 }
 
 /// Memory regions for a process

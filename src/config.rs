@@ -298,6 +298,13 @@ pub const RUN_NETWORK_TESTS: bool = false;
 /// Run container isolation tests after initialization
 pub const RUN_CONTAINER_TESTS: bool = false;
 
+/// Run `test_forktest_parent_mmap` in the process-tests boot suite.
+///
+/// Off by default: the test runs for up to 60s (regresses the Go
+/// mmap-under-fork SIGSEGV), too slow for every boot. Flip to `true` to run
+/// it deliberately (e.g. before/after touching CoW fork or mmap-region code).
+pub const RUN_SLOW_FORKTEST_PARENT_MMAP: bool = false;
+
 /// Enable DHCP for automatic IP configuration
 pub const ENABLE_DHCP: bool = true;
 

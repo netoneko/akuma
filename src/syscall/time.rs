@@ -1,7 +1,6 @@
 use super::*;
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 use akuma_exec::threading::MAX_THREADS;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -13,25 +12,13 @@ struct LocalTimespec {
 // ---------------------------------------------------------------------------
 // ITIMER_REAL / alarm() support
 //
-// musl on aarch64 implements alarm() via setitimer(ITIMER_REAL, ...).  This
-// module stores the per-thread-slot deadline and periodic interval, checked
-// every timer tick from `kernel_timer::on_timer_interrupt`.
+// musl on aarch64 implements alarm() via setitimer(ITIMER_REAL, ...). The
+// per-thread-slot deadline and periodic interval are stored in
+// `akuma_exec::threading` (via `get_itimer`/`set_itimer`), not here, so that
+// slot recycling (`scrub_thread_slot`) resets them like every other per-slot
+// register — see docs/archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md for the bug
+// that motivated moving this out of a syscall-module-local static.
 // ---------------------------------------------------------------------------
-
-/// Per-thread ITIMER_REAL deadline in uptime microseconds (0 = disarmed).
-/// Only the thread-group leader's slot is meaningful (alarm is per-process).
-static ITIMER_DEADLINE: [AtomicU64; MAX_THREADS] = {
-    #[allow(clippy::declare_interior_mutable_const)]
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_THREADS]
-};
-
-/// Per-thread ITIMER_REAL periodic interval in microseconds (0 = one-shot).
-static ITIMER_INTERVAL: [AtomicU64; MAX_THREADS] = {
-    #[allow(clippy::declare_interior_mutable_const)]
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_THREADS]
-};
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -76,32 +63,47 @@ struct LocalItimerval {
 /// the original registration point — e.g. anything an SSH session execs —
 /// has a populated `Process::channel` but no `PROCESS_CHANNELS[tid]` entry,
 /// so `interrupt_thread` alone silently no-ops for it. Set both.
+///
+/// Gated by [`wants_force_interrupt`]: the Ctrl-C-style flag this sets is
+/// unconditional and ignores `SA_RESTART`, so applying it for every itimer
+/// tick regardless of disposition breaks the *other* legitimate use of a
+/// periodic `ITIMER_REAL` — a heartbeat/low-speed-limit handler installed
+/// with `SA_RESTART` that expects its own blocking syscalls to keep running
+/// after each tick — docs/archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md.
 pub fn check_itimers() {
     let now = crate::timer::uptime_us();
     for tid in 0..MAX_THREADS {
-        let deadline = ITIMER_DEADLINE[tid].load(Ordering::Relaxed);
+        let (deadline, interval) = akuma_exec::threading::get_itimer(tid);
         if deadline > 0 && now >= deadline {
             // Fire SIGALRM
-            akuma_exec::process::interrupt_thread(tid);
-            if let Some(pid) = akuma_exec::process::find_pid_by_thread(tid)
-                && let Some(proc) = akuma_exec::process::lookup_process_shared(pid)
-                && let Some(ch) = proc.channel.as_ref()
-            {
-                ch.set_interrupted();
+            if wants_force_interrupt(tid) {
+                akuma_exec::process::interrupt_thread(tid);
+                if let Some(pid) = akuma_exec::process::find_pid_by_thread(tid)
+                    && let Some(proc) = akuma_exec::process::lookup_process_shared(pid)
+                    && let Some(ch) = proc.channel.as_ref()
+                {
+                    ch.set_interrupted();
+                }
             }
             akuma_exec::threading::pend_signal_for_thread(tid, 14);
             // Re-arm if periodic, else disarm
-            let interval = ITIMER_INTERVAL[tid].load(Ordering::Relaxed);
-            if interval > 0 {
-                ITIMER_DEADLINE[tid].store(
-                    now.saturating_add(interval),
-                    Ordering::Relaxed,
-                );
-            } else {
-                ITIMER_DEADLINE[tid].store(0, Ordering::Relaxed);
-            }
+            let new_deadline = if interval > 0 { now.saturating_add(interval) } else { 0 };
+            akuma_exec::threading::set_itimer(tid, new_deadline, interval);
         }
     }
+}
+
+/// Should an expired `ITIMER_REAL` force-interrupt `tid`'s current blocking
+/// syscall via the Ctrl-C-style flag (bypassing `SA_RESTART`)? No process
+/// context defaults to yes (the conservative, pre-existing behavior). The
+/// actual decision, keyed on SIGALRM's disposition, is
+/// [`SignalAction::wants_itimer_force_interrupt`] — host-tested there since
+/// this module isn't (kernel-binary-only, no `cargo test` target).
+fn wants_force_interrupt(tid: usize) -> bool {
+    let Some(pid) = akuma_exec::process::find_pid_by_thread(tid) else { return true };
+    let Some(proc) = akuma_exec::process::lookup_process_shared(pid) else { return true };
+    let action = { let actions = proc.signal_actions.actions.lock(); actions[13] }; // SIGALRM(14) - 1
+    action.wants_itimer_force_interrupt()
 }
 
 /// setitimer(ITIMER_REAL) — arms/disarms the real-time interval timer that
@@ -120,8 +122,7 @@ pub(super) fn sys_setitimer(which: u32, new_ptr: u64, old_ptr: u64) -> u64 {
 
     // Write old timer state if requested
     if old_ptr != 0 {
-        let old_deadline = ITIMER_DEADLINE[tid].load(Ordering::Relaxed);
-        let old_interval = ITIMER_INTERVAL[tid].load(Ordering::Relaxed);
+        let (old_deadline, old_interval) = akuma_exec::threading::get_itimer(tid);
         let now = crate::timer::uptime_us();
         let remaining = old_deadline.saturating_sub(now);
         let old = LocalItimerval {
@@ -165,12 +166,10 @@ pub(super) fn sys_setitimer(which: u32, new_ptr: u64, old_ptr: u64) -> u64 {
 
         let now = crate::timer::uptime_us();
         if value_us > 0 {
-            ITIMER_DEADLINE[tid].store(now.saturating_add(value_us), Ordering::Relaxed);
-            ITIMER_INTERVAL[tid].store(interval_us, Ordering::Relaxed);
+            akuma_exec::threading::set_itimer(tid, now.saturating_add(value_us), interval_us);
         } else {
             // Disarm
-            ITIMER_DEADLINE[tid].store(0, Ordering::Relaxed);
-            ITIMER_INTERVAL[tid].store(0, Ordering::Relaxed);
+            akuma_exec::threading::set_itimer(tid, 0, 0);
         }
     }
 

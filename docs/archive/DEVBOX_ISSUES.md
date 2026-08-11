@@ -5,7 +5,19 @@ Running log of issues found while dogfooding the devbox-smoltcp image
 
 ## Issue 1: `git clone` over HTTPS deadlocks — pipe fills, nobody drains it
 
-**Status: OPEN.** Found 2026-08-10 running `git clone
+**Status: Did not reproduce, 2026-08-11 — likely superseded.** Revisited
+2026-08-11 to verify a shallow clone of Akuma's own repo over HTTPS with real
+git on `devbox-smoltcp`. The exact symptom described below (permanent hang,
+zero CPU, missing sideband thread) never reproduced across dozens of clone
+attempts. Two different, real bugs did — both in the kernel's `ITIMER_REAL`
+implementation, unrelated to the sideband-thread theory below — root-caused,
+fixed, tested, and verified (15/15 then 10/10 clean clones):
+[`GIT_CLONE_STALE_ITIMER_SIGALRM.md`](GIT_CLONE_STALE_ITIMER_SIGALRM.md).
+Leaving the original write-up below for the historical record; it's very
+likely this was already superseded by whatever fixed Issues 12–14 in
+`GIT_MISSING_SYSCALLS.md`, not by the itimer fixes.
+
+Found 2026-08-10 running `git clone
 https://github.com/madebyaris/native-cli-ai.git` inside a devbox-smoltcp VM
 (real `apk`-installed git 2.54.0, not `scratch`).
 
@@ -463,6 +475,9 @@ read-return — but each points at a different file.
   sideband-demux-thread / `wait4` visibility bugs Issue 1's root cause most
   closely resembles (all previously FIXED; this may be a new gap in the same
   area, not a regression of those specific fixes).
+- `docs/archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md` — the two `ITIMER_REAL`
+  bugs found and fixed 2026-08-11 while re-verifying Issue 1; a different
+  shape of bug than the pipe-deadlock theory above.
 - `docs/runbooks/debug-devbox.md`, `docs/runbooks/debug-network.md` —
   general devbox/network triage; `docs/README.md`'s symptom matrix routes
   "`git clone` hangs or wedges" there, with a row added pointing here too.

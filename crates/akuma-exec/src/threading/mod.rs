@@ -830,6 +830,51 @@ static THREAD_SIGALTSTACK_FLAGS: [AtomicU32; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
+/// Per-thread `ITIMER_REAL` deadline in uptime microseconds (0 = disarmed).
+/// Owned here (not by `src/syscall/time.rs`, the only caller) so that
+/// [`scrub_thread_slot`] — the single place a recycled slot's per-occupant
+/// state gets cleared — can reset it like every other per-slot register.
+/// Before this lived here, a slot that last held a process which armed
+/// `alarm()`/`setitimer()` and then exited without disarming it (e.g. busybox
+/// `wget -T`, which implements its timeout via `alarm()`) kept ticking after
+/// the process was gone. The next unrelated process to land in that reused
+/// slot inherited an already-long-expired deadline and got SIGALRM delivered
+/// as fatal (no handler installed yet) at its very first timer tick —
+/// `docs/archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md`.
+static ITIMER_DEADLINE: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// Per-thread `ITIMER_REAL` periodic interval in microseconds (0 = one-shot).
+static ITIMER_INTERVAL: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// Read a thread slot's `(deadline, interval)` ITIMER_REAL state, in uptime
+/// microseconds. `(0, 0)` means disarmed.
+pub fn get_itimer(tid: usize) -> (u64, u64) {
+    if tid < MAX_THREADS {
+        (
+            ITIMER_DEADLINE[tid].load(Ordering::Relaxed),
+            ITIMER_INTERVAL[tid].load(Ordering::Relaxed),
+        )
+    } else {
+        (0, 0)
+    }
+}
+
+/// Set a thread slot's ITIMER_REAL `(deadline, interval)`, in uptime
+/// microseconds. `deadline = 0` disarms (interval is stored regardless, matching
+/// `setitimer`'s "value 0 disarms, interval is still recorded" contract).
+pub fn set_itimer(tid: usize, deadline: u64, interval: u64) {
+    if tid < MAX_THREADS {
+        ITIMER_DEADLINE[tid].store(deadline, Ordering::Relaxed);
+        ITIMER_INTERVAL[tid].store(interval, Ordering::Relaxed);
+    }
+}
+
 /// Current running thread - stored in TPIDRRO_EL0 register
 /// Using a CPU register avoids race conditions with global atomics.
 /// TPIDRRO_EL0 is accessible from EL1 and provides per-CPU thread tracking.
@@ -915,6 +960,13 @@ fn scrub_thread_slot(i: usize) {
     THREAD_SIGALTSTACK_SP[i].store(0, Ordering::Release);
     THREAD_SIGALTSTACK_SIZE[i].store(0, Ordering::Release);
     THREAD_SIGALTSTACK_FLAGS[i].store(2, Ordering::Release); // SS_DISABLE
+
+    // ITIMER_REAL (alarm()/setitimer()). A stale non-zero deadline here outlives
+    // its process (e.g. exit without disarming) and fires as an immediate,
+    // fatal SIGALRM against whatever unrelated process next claims this slot —
+    // docs/archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md.
+    ITIMER_DEADLINE[i].store(0, Ordering::Release);
+    ITIMER_INTERVAL[i].store(0, Ordering::Release);
 
     // Blocking/scheduling state. `WOKEN_STATES` is the sticky wake flag consumed on
     // entry to `schedule_blocking` — a stale `true` spends a phantom wake on the new
@@ -4637,6 +4689,74 @@ mod pending_kill_tests {
         request_thread_kill(MAX_THREADS + 5);
         assert!(!has_pending_kill(MAX_THREADS + 5));
         assert!(!take_kill_request_via_tid(MAX_THREADS + 5));
+    }
+}
+
+/// Regression coverage for docs/archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md.
+/// Confined to slots 20..24 — disjoint from every other module's fixed/ranged
+/// tids in this file (35.., see `park_wake_race_tests`'s own inventory comment).
+#[cfg(test)]
+mod itimer_tests {
+    use super::*;
+
+    #[test]
+    fn itimer_state_is_independent_per_thread() {
+        let (a, b) = (20usize, 21usize);
+        set_itimer(a, 1_000, 500);
+        set_itimer(b, 2_000, 0);
+        assert_eq!(get_itimer(a), (1_000, 500));
+        assert_eq!(get_itimer(b), (2_000, 0));
+        set_itimer(a, 0, 0); // cleanup
+        set_itimer(b, 0, 0);
+    }
+
+    #[test]
+    fn itimer_out_of_range_tid_is_noop() {
+        assert_eq!(get_itimer(MAX_THREADS), (0, 0));
+        set_itimer(MAX_THREADS, 999, 999); // must not panic or alias a real slot
+        assert_eq!(get_itimer(0), (0, 0));
+    }
+
+    /// The actual regression. A slot that last held a process which armed
+    /// `ITIMER_REAL` (`alarm()`/`setitimer()`) and then exited *without*
+    /// disarming it — e.g. busybox `wget -T`, which implements its timeout via
+    /// `alarm()` — must not leak that deadline into whatever unrelated process
+    /// claims the slot next.
+    ///
+    /// Before `scrub_thread_slot` cleared `ITIMER_DEADLINE`/`ITIMER_INTERVAL`,
+    /// the new occupant inherited an already-long-expired deadline and took a
+    /// fatal SIGALRM (no handler installed yet) at its very first timer tick.
+    /// This is what made `git clone`'s `git-remote-http` helper die near-instantly
+    /// with "Alarm clock" — see docs/archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md.
+    #[test]
+    fn scrub_thread_slot_clears_stale_itimer_on_slot_reuse() {
+        crate::test_support::ensure_test_runtime();
+        const RANGE_START: usize = 22;
+        const RANGE_END: usize = 24;
+
+        let Some(tid) = claim_free_slot(RANGE_START, RANGE_END) else {
+            panic!("test slot range unexpectedly busy");
+        };
+
+        // Simulate the old occupant arming a one-shot alarm that has already
+        // expired (deadline=1us since boot) and exiting without disarming it.
+        set_itimer(tid, 1, 0);
+        assert_eq!(get_itimer(tid), (1, 0));
+        release_test_thread_slot(tid);
+
+        // A completely unrelated process claims the same slot.
+        let tid2 = claim_free_slot(RANGE_START, RANGE_END).expect("re-claim of the same slot");
+        assert_eq!(tid, tid2, "the narrow range pins the same slot");
+
+        assert_eq!(
+            get_itimer(tid2),
+            (0, 0),
+            "a recycled thread slot must not inherit its predecessor's ITIMER_REAL \
+             deadline — that deadline is already in the past, so `check_itimers` \
+             would fire an immediate, fatal SIGALRM against the new occupant"
+        );
+
+        release_test_thread_slot(tid2);
     }
 }
 

@@ -54,7 +54,8 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | Kernel panic with ESR_EL1/FAR_EL1 / "unhandled exception" / EL1 crash | [`runbooks/debug-exceptions.md`](runbooks/debug-exceptions.md) |
 | Network doesn't work / can't connect out | [`runbooks/debug-network.md`](runbooks/debug-network.md) (smoltcp) / [`runbooks/debug-devbox.md`](runbooks/debug-devbox.md) (rump) |
 | `cargo` or `rustc` crashes in the devbox | [`runbooks/debug-devbox.md`](runbooks/debug-devbox.md) -> Toolchain crashes |
-| `git clone` hangs or wedges | [`runbooks/debug-devbox.md`](runbooks/debug-devbox.md) / [`runbooks/debug-network.md`](runbooks/debug-network.md). Specifically over HTTPS with real (apk) git, `[PIPE-DUMP]` full + `[THR-DUMP]` shows the reader parked in `wait4` instead of `read` — **OPEN**: [`archive/DEVBOX_ISSUES.md`](archive/DEVBOX_ISSUES.md) -> "Issue 1" |
+| `git clone` hangs or wedges | [`runbooks/debug-devbox.md`](runbooks/debug-devbox.md) / [`runbooks/debug-network.md`](runbooks/debug-network.md). Original pipe-deadlock theory never reproduced on a 2026-08-11 revisit — **OPEN**: [`archive/DEVBOX_ISSUES.md`](archive/DEVBOX_ISSUES.md) -> "Issue 1" |
+| `git clone` dies instantly with `Alarm clock`, or dies intermittently mid-checkout with exit code 130 | Two `ITIMER_REAL` bugs, both **FIXED** 2026-08-11: a stale itimer deadline surviving thread-slot reuse, and `check_itimers` force-interrupting an `SA_RESTART` handler's blocking syscall. [`archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md`](archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md) |
 | SSH echo lag / staggering / terminal sizing | [`runbooks/debug-ssh-latency.md`](runbooks/debug-ssh-latency.md) |
 | epoll crash / DNS hang under bun | [`runbooks/debug-network.md`](runbooks/debug-network.md) -> epoll |
 | HTTPS download measured in minutes | [`runbooks/debug-network.md`](runbooks/debug-network.md) -> TLS |
