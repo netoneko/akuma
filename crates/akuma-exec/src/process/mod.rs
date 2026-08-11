@@ -447,23 +447,28 @@ pub struct Process {
 ///
 /// When threads are created with CLONE_THREAD (pthreads), they share this table
 /// via Arc — matching Linux CLONE_SIGHAND behavior. Fork/Spawn creates a fresh table.
-/// Kill all processes in a box and unregister it
+/// Kill all processes in a box (and any nested descendant boxes) and unregister them.
+///
+/// Boxes can be nested (`box_access::can_register_box` supports subdividing a box's
+/// own jail), so killing just `box_id` would leave descendant boxes' registry
+/// entries pointing at a dead parent. Cascade leaf-to-root via
+/// `box_access::cascade_kill_order` instead.
 pub fn kill_box(box_id: u64) -> Result<(), &'static str> {
     if box_id == 0 {
         return Err("Cannot kill Box 0 (Host)");
     }
 
-    // 1. Get list of PIDs in this box
-    let pids: Vec<Pid> = table::collect_pids(|p| p.box_id == box_id);
+    let registry = registry_snapshot();
+    let box_ids = box_access::cascade_kill_order(&registry, box_id);
 
-    // 2. Kill each process
-    for pid in pids {
-        // kill_process handles unregistering and thread termination
-        let _ = kill_process(pid);
+    for id in box_ids {
+        let pids: Vec<Pid> = table::collect_pids(|p| p.box_id == id);
+        for pid in pids {
+            // kill_process handles unregistering and thread termination
+            let _ = kill_process(pid);
+        }
+        unregister_box(id);
     }
-
-    // 3. Unregister the box from the global registry
-    unregister_box(box_id);
 
     Ok(())
 }

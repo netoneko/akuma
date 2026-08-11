@@ -13,7 +13,6 @@
 //! reference for the socket/sockaddr quirks.
 
 extern crate alloc;
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 // ── socket-family syscalls ────────────────────────────────────────────────
@@ -264,51 +263,6 @@ pub fn errno_netbsd_to_linux(nb: i32) -> i32 {
     }
 }
 
-// ── per-box fd map (box fd ⇄ rump-server fd) ───────────────────────────────
-
-/// Maps a box process's socket fd numbers to the rump_server's fd numbers (the
-/// box never sees rump fds directly). One per `stack=rump` box.
-#[derive(Default)]
-pub struct FdMap {
-    box_to_rump: BTreeMap<i32, i32>,
-    next_box_fd: i32,
-}
-
-impl FdMap {
-    /// Fresh map. Box-side fds for rump sockets start high to avoid colliding
-    /// with the box's real (host) fds.
-    #[must_use]
-    pub fn new(first_box_fd: i32) -> Self {
-        Self { box_to_rump: BTreeMap::new(), next_box_fd: first_box_fd }
-    }
-
-    /// Register a freshly-created rump fd, returning the box-visible fd.
-    #[must_use]
-    pub fn insert(&mut self, rump_fd: i32) -> i32 {
-        let bf = self.next_box_fd;
-        self.next_box_fd += 1;
-        self.box_to_rump.insert(bf, rump_fd);
-        bf
-    }
-
-    /// Resolve a box fd to its rump fd, if this fd is rump-owned.
-    #[must_use]
-    pub fn to_rump(&self, box_fd: i32) -> Option<i32> {
-        self.box_to_rump.get(&box_fd).copied()
-    }
-
-    /// Is this box fd one of ours (rump-owned)?
-    #[must_use]
-    pub fn is_rump(&self, box_fd: i32) -> bool {
-        self.box_to_rump.contains_key(&box_fd)
-    }
-
-    /// Drop a box fd on close; returns the rump fd to close on the server.
-    pub fn remove(&mut self, box_fd: i32) -> Option<i32> {
-        self.box_to_rump.remove(&box_fd)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,21 +393,5 @@ mod tests {
         assert_eq!(errno_netbsd_to_linux(1), 1); // EPERM
         assert_eq!(errno_netbsd_to_linux(2), 2); // ENOENT
         assert_eq!(errno_netbsd_to_linux(12), 12); // ENOMEM
-    }
-
-    #[test]
-    fn fd_map_basics() {
-        let mut m = FdMap::new(0x4000_0000);
-        let b0 = m.insert(3);
-        let b1 = m.insert(4);
-        assert_eq!(b0, 0x4000_0000);
-        assert_eq!(b1, 0x4000_0001);
-        assert_eq!(m.to_rump(b0), Some(3));
-        assert_eq!(m.to_rump(b1), Some(4));
-        assert!(m.is_rump(b0));
-        assert!(!m.is_rump(5)); // a host fd
-        assert_eq!(m.remove(b0), Some(3));
-        assert!(!m.is_rump(b0));
-        assert_eq!(m.to_rump(b0), None);
     }
 }

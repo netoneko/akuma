@@ -1,14 +1,6 @@
 #[cfg(test)]
 mod dns_tests {
-    use crate::dns::{DnsError, is_loopback};
-
-    #[test]
-    fn loopback_detection() {
-        assert!(is_loopback("localhost"));
-        assert!(is_loopback("127.0.0.1"));
-        assert!(!is_loopback("example.com"));
-        assert!(!is_loopback("10.0.2.15"));
-    }
+    use crate::dns::DnsError;
 
     #[test]
     fn dns_error_messages() {
@@ -16,17 +8,6 @@ mod dns_tests {
         assert_eq!(DnsError::NoConfig.as_str(), "Network not configured");
         assert_eq!(DnsError::InvalidHost.as_str(), "Invalid hostname");
         assert_eq!(DnsError::Timeout.as_str(), "DNS query timed out");
-    }
-
-    #[test]
-    fn loopback_edge_cases() {
-        // These should NOT be considered loopback
-        assert!(!is_loopback("LOCALHOST")); // case sensitive
-        assert!(!is_loopback("127.0.0.2"));
-        assert!(!is_loopback("127.0.0.1:80"));
-        assert!(!is_loopback(""));
-        assert!(!is_loopback("local"));
-        assert!(!is_loopback("host"));
     }
 }
 
@@ -84,29 +65,6 @@ mod socket_addr_tests {
         let converted = sock_in.to_addr();
         assert_eq!(converted.port, 65535);
         assert_eq!(converted.ip, [255, 255, 255, 255]);
-    }
-}
-
-#[cfg(test)]
-mod stats_tests {
-    use crate::stats;
-
-    #[test]
-    fn stats_increment_connections() {
-        let (before, _, _) = stats::get_stats();
-        stats::increment_connections();
-        let (after, _, _) = stats::get_stats();
-        assert_eq!(after, before + 1);
-    }
-
-    #[test]
-    fn stats_bytes_tracking() {
-        let (_, rx_before, tx_before) = stats::get_stats();
-        stats::add_bytes_rx(100);
-        stats::add_bytes_tx(200);
-        let (_, rx_after, tx_after) = stats::get_stats();
-        assert_eq!(rx_after, rx_before + 100);
-        assert_eq!(tx_after, tx_before + 200);
     }
 }
 

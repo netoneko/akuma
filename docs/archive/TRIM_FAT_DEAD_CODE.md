@@ -14,6 +14,51 @@ This doc closes that gap for `crates/`, and adds `src/` for completeness.
 Read as-is at commit `1f9ed7a` (branch `more-devbox-fixes`); nothing here was
 edited or booted to confirm.
 
+## Resolution (2026-08-11)
+
+Everything below this point is the original analysis, unedited. Addendum only —
+here's what actually happened to each Section A candidate, added after the
+fact rather than folded into the findings above:
+
+- **`akuma-net/src/stats.rs`** — deleted (whole module, plus `pub mod stats;`
+  in `lib.rs` and the `stats_tests` module in `tests.rs`). Confirmed no
+  production caller anywhere in the tree before removing.
+- **`akuma-rump/src/syscall_translation.rs::FdMap`** — deleted (struct, impl,
+  its `#[cfg(test)]` case, and the now-unused `BTreeMap` import).
+- **`akuma-net/src/dns.rs::is_loopback`** — deleted. Trimmed the two tests
+  that only exercised it (`loopback_detection`, `loopback_edge_cases`) from
+  `dns_tests`; kept `dns_error_messages`.
+- **`akuma-net/src/locks.rs::network_lock_holder` / `socket_table_lock_holder`**,
+  and **`get_lock_stats` / `reset_lock_stats` + the orphaned `lock_tests.rs`**
+  — **no change, and the "orphaned" framing above is now stale.** Commit
+  `a4b35ba` ("enabled back some tests that used to be disabled"), which landed
+  *after* this doc's `1f9ed7a` snapshot, added `#[cfg(test)] mod lock_tests;`
+  to `akuma-net/src/lib.rs`. `lock_tests.rs` is compiled and its five tests run
+  now, and they call both holder accessors directly — so neither the file nor
+  the accessors are dead by this doc's own test-only-caller definition
+  anymore. (Caught this the hard way: almost deleted `lock_tests.rs` per this
+  doc's stale claim before `git log -p` on `lib.rs` turned up `a4b35ba`.)
+- **`akuma-vfs/src/memfs.rs::with_max_size`** — kept, deliberately not deleted.
+  Unlike the items above, this isn't unwired scaffolding for an abandoned
+  path — it's a correct constructor with real test coverage
+  (`max_size_enforcement`, `stats`), just not yet called from a production
+  `MemFs` construction site. Deleting it would only cost real coverage for no
+  maintenance win.
+- **`akuma-exec/src/elf/types.rs::parse_elf64_ehdr`** — deleted. Its twin
+  `parse_elf64_ehdr_checked` (`elf/mod.rs`) was made `pub(crate)` and the
+  three tests repointed at it (`Option`/`is_none()` assertions rewritten as
+  `Result`/`is_err()`).
+- **`akuma-exec/src/box_mod/access.rs::cascade_kill_order`** — wired in, not
+  deleted. Box nesting turned out to be a real, live feature — exercised by
+  `src/process_tests.rs`'s `BOX_NESTED` case (`#[cfg(feature =
+  "sc-containers")]`, on by default) — so the gap this doc flagged was real:
+  `process::kill_box` now snapshots the registry and calls
+  `box_access::cascade_kill_order` to kill descendant boxes leaf-to-root
+  before unregistering, instead of leaving nested `BoxInfo` entries orphaned
+  pointing at a dead parent.
+
+Section B was left untouched, per this doc's own recommendation.
+
 ## Method
 
 A custom scan (not `cargo check`, which can't see this — see "Method

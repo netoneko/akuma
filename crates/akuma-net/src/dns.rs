@@ -35,12 +35,6 @@ pub enum DnsError {
 // Host Resolution
 // ============================================================================
 
-/// Check if a host is a loopback address
-#[must_use] 
-pub fn is_loopback(host: &str) -> bool {
-    host == "localhost" || host == "127.0.0.1"
-}
-
 /// Resolve a hostname to an IP address.
 ///
 /// Handles localhost, IPv4 literals, and real DNS queries via smoltcp.

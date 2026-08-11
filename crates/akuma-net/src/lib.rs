@@ -18,7 +18,6 @@ pub mod rump_tap;
 pub mod socket;
 #[cfg(feature = "smoltcp")]
 pub mod dns;
-pub mod stats;
 
 // Lock infrastructure for fine-grained locking (Phase 1 of BKL removal)
 pub mod locks;

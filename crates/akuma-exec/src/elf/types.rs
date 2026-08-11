@@ -144,21 +144,6 @@ pub struct Elf64Phdr {
     pub p_memsz: u64,
 }
 
-/// Parse a minimal Elf64_Ehdr from raw bytes.
-pub fn parse_elf64_ehdr(data: &[u8]) -> Option<Elf64Ehdr> {
-    if data.len() < ELF64_EHDR_SIZE { return None; }
-    if data[0..4] != ELF_MAGIC { return None; }
-    if data[4] != ELFCLASS64 || data[5] != ELFDATA2LSB { return None; }
-    Some(Elf64Ehdr {
-        e_type:     read_u16_le(data, 16),
-        e_machine:  read_u16_le(data, 18),
-        e_entry:    read_u64_le(data, 24),
-        e_phoff:    read_u64_le(data, 32),
-        e_phentsize: read_u16_le(data, 54),
-        e_phnum:    read_u16_le(data, 56),
-    })
-}
-
 /// Parse a single Elf64_Phdr from raw bytes.
 pub fn parse_elf64_phdr(data: &[u8]) -> Option<Elf64Phdr> {
     if data.len() < 56 { return None; }
@@ -237,7 +222,7 @@ mod tests {
         const ET_EXEC: u16 = 2;
         const EM_AARCH64: u16 = 183;
         let data = make_valid_elf64_ehdr(ET_EXEC, EM_AARCH64, 0x400000, 64, 56, 1);
-        let ehdr = parse_elf64_ehdr(&data).expect("valid header should parse");
+        let ehdr = super::super::parse_elf64_ehdr_checked(&data).expect("valid header should parse");
         assert_eq!(ehdr.e_type, ET_EXEC);
         assert_eq!(ehdr.e_machine, EM_AARCH64);
         assert_eq!(ehdr.e_entry, 0x400000);
@@ -250,15 +235,15 @@ mod tests {
     fn test_parse_elf64_ehdr_invalid_magic() {
         let mut data = make_valid_elf64_ehdr(2, 183, 0x400000, 64, 56, 1);
         data[0] = 0; // corrupt magic
-        assert!(parse_elf64_ehdr(&data).is_none());
+        assert!(super::super::parse_elf64_ehdr_checked(&data).is_err());
     }
 
     #[test]
     fn test_parse_elf64_ehdr_too_short() {
         let data = [0x7f_u8, b'E', b'L', b'F', 2, 1];
-        assert!(parse_elf64_ehdr(&data).is_none());
+        assert!(super::super::parse_elf64_ehdr_checked(&data).is_err());
         let data63 = &make_valid_elf64_ehdr(2, 183, 0, 0, 56, 1)[..63];
-        assert!(parse_elf64_ehdr(data63).is_none());
+        assert!(super::super::parse_elf64_ehdr_checked(data63).is_err());
     }
 
     fn make_valid_elf64_phdr(p_type: u32, p_flags: u32, p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz: u64) -> [u8; 56] {

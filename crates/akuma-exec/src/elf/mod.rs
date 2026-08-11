@@ -845,7 +845,7 @@ pub fn load_elf_with_stack(
 // On-demand ELF loading from file path (for large binaries)
 // ============================================================================
 
-fn parse_elf64_ehdr_checked(buf: &[u8]) -> Result<Elf64Ehdr, ElfError> {
+pub(crate) fn parse_elf64_ehdr_checked(buf: &[u8]) -> Result<Elf64Ehdr, ElfError> {
     if buf.len() < ELF64_EHDR_SIZE {
         return Err(ElfError::InvalidFormat("Header too short"));
     }
