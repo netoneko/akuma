@@ -26,6 +26,8 @@ pub mod locks;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod lock_tests;
 
 pub use runtime::NetRuntime;
 

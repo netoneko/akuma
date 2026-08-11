@@ -128,19 +128,19 @@ fn test_multiple_acquisitions_same_level() {
 
 #[test]
 fn test_invalid_lock_level_panics() {
-    reset_lock_stats();
-    
+    with_test_serial(|| {
     // Try to use an invalid lock level (this should panic in can_acquire_lock)
-    let result = core::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Try to mark an invalid lock level as held
-        let bit = match 99u8 {
+        let _bit = match 99u8 {
             LOCK_LEVEL_NETWORK => 0,
             LOCK_LEVEL_SOCKET_TABLE => 1,
             LOCK_LEVEL_SOCKET => 2,
             _ => panic!("Unknown lock level: {}", 99),
         };
     }));
-    
+
     // Should panic due to invalid lock level
     assert!(result.is_err());
+    });
 }

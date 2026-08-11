@@ -650,8 +650,11 @@ pub fn run_all_tests() {
     // CLONE_VFORK fast path git's posix_spawn hits, so it wedged git clone)
     test_vfork_child_context_ttbr0_not_stale();
 
-    // Go mmap regression: forktest_parent with mmap_test must not SIGSEGV
-    // test_forktest_parent_mmap(); // disabled: runs for up to 60s
+    // Go mmap regression: forktest_parent with mmap_test must not SIGSEGV.
+    // Runs up to 60s, so off by default at boot: crate::config::RUN_SLOW_FORKTEST_PARENT_MMAP.
+    if crate::config::RUN_SLOW_FORKTEST_PARENT_MMAP {
+        test_forktest_parent_mmap();
+    }
 
     // munmap / user_frames refcount conservation (commits 8e2f625 "faster
     // munmap" + ba60d72 "even faster munmap"). Guards the PMM-free invariant of
