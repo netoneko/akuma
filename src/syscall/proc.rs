@@ -1325,6 +1325,25 @@ pub struct SpawnOptions {
     pub box_id: u64,
 }
 
+// This layout is restated independently in userspace (`boxlib::sys::SpawnOptions`,
+// docs/archive/HERD_PLUS_BOX.md) because a kernel crate cannot depend on a
+// userspace one — see that doc's "kernel's copy stays put" section. Nothing
+// checks the two agree except this: if either side's field order or width
+// drifts, one of the two builds fails here rather than the kernel silently
+// reading `box_id` out of what userspace meant as `stdin_len`.
+const _: () = {
+    assert!(core::mem::size_of::<SpawnOptions>() == 72);
+    assert!(core::mem::offset_of!(SpawnOptions, cwd_ptr) == 0);
+    assert!(core::mem::offset_of!(SpawnOptions, cwd_len) == 8);
+    assert!(core::mem::offset_of!(SpawnOptions, root_dir_ptr) == 16);
+    assert!(core::mem::offset_of!(SpawnOptions, root_dir_len) == 24);
+    assert!(core::mem::offset_of!(SpawnOptions, args_ptr) == 32);
+    assert!(core::mem::offset_of!(SpawnOptions, args_len) == 40);
+    assert!(core::mem::offset_of!(SpawnOptions, stdin_ptr) == 48);
+    assert!(core::mem::offset_of!(SpawnOptions, stdin_len) == 56);
+    assert!(core::mem::offset_of!(SpawnOptions, box_id) == 64);
+};
+
 pub(super) fn parse_argv_array(ptr: u64) -> Vec<String> {
     if ptr == 0 { return Vec::new(); }
     let mut args = Vec::new();
