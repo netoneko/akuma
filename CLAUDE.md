@@ -124,6 +124,16 @@ cargo test --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)
 (cd userspace && cargo test -p akuma-ssh-crypto --target $(rustc -vV | grep '^host:' | cut -d' ' -f2))
 ```
 
+Two userspace binaries split their pure logic into a library half so it can be
+host-tested; both need `--no-default-features` to drop `libakuma`, whose
+`#[panic_handler]`/`#[global_allocator]` collide with std's, and `--lib` so the
+`no_main` binary is not built:
+```bash
+cd userspace && HOST=$(rustc -vV | grep '^host:' | cut -d' ' -f2)
+cargo test -p sshd --lib --no-default-features --target $HOST   # wire.rs
+cargo test -p box  --lib --no-default-features --target $HOST   # boxlib: json, oci, paths, spec
+```
+
 Acceptance playbooks live in `acceptance/` — run them end-to-end for
 integration coverage. `scripts/` has targeted harnesses too
 (`ssh_harness.py`, `forktest_smp_matrix.py`, `run_selfhost_kernelbuild.py`,
