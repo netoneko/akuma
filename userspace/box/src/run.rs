@@ -12,12 +12,9 @@ use libakuma::{
 };
 
 use boxlib::spec::{self, ImageProcess, RunArgsError};
+use boxlib::sys::{self, SpawnOptions, spawn_ext};
 
 use crate::images;
-use crate::{SpawnOptions, spawn_ext};
-
-const SYSCALL_REGISTER_BOX: u64 = 316;
-const SYSCALL_KILL_BOX: u64 = 317;
 
 const USAGE: &str =
     "Usage: box run [--rm] [-d] [-i] [--name X] [-w dir] <image> [cmd [args...]]\n";
@@ -186,21 +183,13 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
     // The box's root is the container directory, which is what the kernel
     // validates and jails to; the overlay then replaces that jail with the
     // union of the image layers over the container's upper directory.
-    libakuma::syscall(
-        SYSCALL_REGISTER_BOX,
-        box_id,
-        container.as_ptr() as u64,
-        container.len() as u64,
-        croot.as_ptr() as u64,
-        croot.len() as u64,
-        0,
-    );
+    sys::register_box(box_id, &container, &croot, 0);
 
     let rc = libakuma::mount_overlay_root(box_id, &lowerdirs, &upper);
     if rc != 0 {
         print("box run: overlay mount failed: errno ");
         println(&format!("{}", -rc));
-        libakuma::syscall(SYSCALL_KILL_BOX, box_id, 0, 0, 0, 0, 0);
+        sys::kill_box(box_id);
         exit(1);
     }
 
@@ -218,7 +207,7 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
     let argv = image_proc.argv_with(&cmd_argv);
     if argv.is_empty() {
         print("box run: image has no Entrypoint or Cmd, and no command was given\n");
-        libakuma::syscall(SYSCALL_KILL_BOX, box_id, 0, 0, 0, 0, 0);
+        sys::kill_box(box_id);
         exit(1);
     }
     let working_dir = parsed.workdir.clone().unwrap_or(image_proc.working_dir);
@@ -253,21 +242,13 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
         print("box run: failed to spawn ");
         println(&path);
         if rm {
-            libakuma::syscall(SYSCALL_KILL_BOX, box_id, 0, 0, 0, 0, 0);
+            sys::kill_box(box_id);
             remove_tree(&croot);
         }
         exit(1);
     };
 
-    libakuma::syscall(
-        SYSCALL_REGISTER_BOX,
-        box_id,
-        container.as_ptr() as u64,
-        container.len() as u64,
-        croot.as_ptr() as u64,
-        croot.len() as u64,
-        u64::from(res.pid),
-    );
+    sys::register_box(box_id, &container, &croot, res.pid);
 
     if detached {
         println(&format!("Started PID {} in {} (detached)", res.pid, container));
@@ -291,7 +272,7 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
     };
 
     if rm {
-        libakuma::syscall(SYSCALL_KILL_BOX, box_id, 0, 0, 0, 0, 0);
+        sys::kill_box(box_id);
         remove_tree(&croot);
     }
     exit(code);

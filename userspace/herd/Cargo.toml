@@ -8,10 +8,19 @@ edition = "2021"
 # `--no-default-features` drops libakuma so `cargo test --lib` can link against
 # a std host target — libakuma defines #[panic_handler] and #[global_allocator],
 # which collide with std's. See src/lib.rs.
+#
+# `boxlib/akuma` rides along on herd's own `akuma` feature rather than being
+# turned on unconditionally on the dependency line, so the host-test build
+# above still never needs to compile libakuma — see docs/archive/HERD_PLUS_BOX.md.
 default = ["akuma"]
-akuma = ["dep:libakuma"]
+akuma = ["dep:libakuma", "boxlib/akuma"]
 
 [dependencies]
 # Optional only so the `exit` unit tests can build for the host — the binary
 # always needs it (see [features]).
 libakuma = { path = "../libakuma", optional = true }
+# `box` is a reserved Rust keyword, so the package is imported as `boxlib`.
+# herd depends on box's library half for the box ABI (`boxlib::sys`) and the
+# box-id convention (`boxlib::spec::box_id_for`) — herd never spawns `box`
+# itself, and stays off `pull` (TLS, tar, the registry client) entirely.
+boxlib = { package = "box", path = "../box", default-features = false }

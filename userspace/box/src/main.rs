@@ -25,63 +25,11 @@ mod run;
 mod tests;
 
 use boxlib::{boxes, spec};
-use libakuma::{exit, print, args, open, read_fd, write_fd, close, open_flags, SpawnResult, waitpid, println, read_dir, mkdir, fstat, mkdir_p, get_cpu_stats, ThreadCpuStat};
+use boxlib::sys::{self, SpawnOptions, spawn_ext};
+use libakuma::{exit, print, args, open, read_fd, write_fd, close, open_flags, waitpid, println, read_dir, mkdir, fstat, mkdir_p, get_cpu_stats, ThreadCpuStat};
 use alloc::vec::Vec;
 use alloc::string::String;
 use alloc::format;
-
-#[repr(C)]
-pub struct SpawnOptions {
-    pub cwd_ptr: u64,
-    pub cwd_len: usize,
-    pub root_dir_ptr: u64,
-    pub root_dir_len: usize,
-    pub args_ptr: u64,
-    pub args_len: usize,
-    pub stdin_ptr: u64,
-    pub stdin_len: usize,
-    pub box_id: u64,
-}
-
-const SYSCALL_SPAWN_EXT: u64 = 315;
-const SYSCALL_REGISTER_BOX: u64 = 316;
-const SYSCALL_KILL_BOX: u64 = 317;
-
-pub fn spawn_ext(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, options: &mut SpawnOptions) -> Option<SpawnResult> {
-    let mut argv = Vec::new();
-    let path_terminated = format!("{}\0", path);
-    argv.push(path_terminated.as_ptr());
-    
-    let mut args_terminated = Vec::new();
-    if let Some(slice) = args {
-        for a in slice {
-            let s = format!("{}\0", a);
-            args_terminated.push(s);
-        }
-    }
-    for s in &args_terminated {
-        argv.push(s.as_ptr());
-    }
-    argv.push(core::ptr::null());
-
-    options.args_ptr = argv.as_ptr() as u64;
-    options.args_len = argv.len();
-    
-    if let Some(s) = stdin {
-        options.stdin_ptr = s.as_ptr() as u64;
-        options.stdin_len = s.len();
-    }
-
-    let result = libakuma::syscall(
-        SYSCALL_SPAWN_EXT,
-        path_terminated.as_ptr() as u64,
-        options as *const _ as u64,
-        0, 0, 0, 0,
-    );
-
-    if (result as i64) < 0 { return None; }
-    Some(SpawnResult { pid: (result & 0xFFFF_FFFF) as u32, stdout_fd: ((result >> 32) & 0xFFFF_FFFF) as u32 })
-}
 
 #[no_mangle]
 pub extern "C" fn main() {
@@ -210,7 +158,7 @@ fn cmd_open(args: libakuma::Args) -> ! {
 
     let box_id = spec::box_id_for(name);
 
-    libakuma::syscall(SYSCALL_REGISTER_BOX, box_id, name.as_ptr() as u64, name.len() as u64, directory.as_ptr() as u64, directory.len() as u64, 0);
+    sys::register_box(box_id, name, &directory, 0);
 
     if cmd_path.is_some() && !detached {
         interactive = true;
@@ -230,7 +178,7 @@ fn cmd_open(args: libakuma::Args) -> ! {
         match spawn_ext(path, args_opt, None, &mut options) {
             Some(res) => {
                 // Update registry with real primary PID
-                libakuma::syscall(SYSCALL_REGISTER_BOX, box_id, name.as_ptr() as u64, name.len() as u64, directory.as_ptr() as u64, directory.len() as u64, res.pid as u64);
+                sys::register_box(box_id, name, &directory, res.pid);
 
                 if detached {
                     println(&format!("Started PID {} in detached mode. (Log persistence TBD)", res.pid));
@@ -445,11 +393,11 @@ fn cmd_close(mut args: libakuma::Args) -> ! {
     });
 
     if box_id == 0 { print("box close: cannot kill Box 0 (Host)\n"); exit(1); }
-    if libakuma::syscall(SYSCALL_KILL_BOX, box_id, 0, 0, 0, 0, 0) == 0 { 
-        print("Closed box "); libakuma::print_hex(box_id as usize); print("\n"); 
-        exit(0); 
-    } else { 
-        print("box close: failed\n"); exit(1); 
+    if sys::kill_box(box_id) {
+        print("Closed box "); libakuma::print_hex(box_id as usize); print("\n");
+        exit(0);
+    } else {
+        print("box close: failed\n"); exit(1);
     }
 }
 

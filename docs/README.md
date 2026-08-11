@@ -122,7 +122,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | Build the `extreme-size` image, or shrink an image that is running out of memory | [`runbooks/build-extreme-size.md`](runbooks/build-extreme-size.md) — includes reverting sshd to one process for all sessions |
 | Understand how sshd serves concurrent connections, or test it under load | [`userspace/sshd/docs/PROCESS_PER_SESSION.md`](../userspace/sshd/docs/PROCESS_PER_SESSION.md) + `scripts/sshd_concurrency_test.py` |
 | Run a Docker image (`box pull` / `box run`) | [`runbooks/run-docker-image.md`](runbooks/run-docker-image.md) |
-| Work on `box` or `herd`, or wonder why both restate the box ABI | [`archive/HERD_PLUS_BOX.md`](archive/HERD_PLUS_BOX.md) — proposed restructuring (herd → `boxlib`), **not implemented**; read before duplicating anything else between them |
+| Work on `box` or `herd`, or wonder why both restate the box ABI | [`archive/TRIM_FAT_HERD_PLUS_BOX.md`](archive/TRIM_FAT_HERD_PLUS_BOX.md) — herd depends on `boxlib` (`SpawnOptions`, syscall numbers, `box_id_for`, JSON reads all shared); implemented 2026-08-12 |
 | Add an apk package to the devbox | [`runbooks/add-apk-package.md`](runbooks/add-apk-package.md) |
 | Add a kernel `sc-*` feature | [`runbooks/add-syscall-feature.md`](runbooks/add-syscall-feature.md) |
 | Recover a wedged/hung VM | [`runbooks/recover-wedged-vm.md`](runbooks/recover-wedged-vm.md) |

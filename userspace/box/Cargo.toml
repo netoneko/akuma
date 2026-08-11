@@ -4,13 +4,18 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-# On by default; everything except the host-testable `boxlib` half needs it.
-# `--no-default-features` drops libakuma (and the two crates that link it) so
-# `cargo test --lib` can build against a std host target — libakuma defines
-# #[panic_handler] and #[global_allocator], which collide with std's. See
-# src/lib.rs.
-default = ["akuma"]
-akuma = ["dep:libakuma", "dep:libakuma-tls", "dep:akuma-tar"]
+# On by default; everything except the host-testable `boxlib` half needs at
+# least `akuma`. `--no-default-features` drops libakuma (and everything that
+# links it) so `cargo test --lib` can build against a std host target —
+# libakuma defines #[panic_handler] and #[global_allocator], which collide
+# with std's. See src/lib.rs.
+#
+# `akuma` and `pull` are split so herd can depend on `boxlib::sys` (the
+# syscall wrappers) without dragging in TLS, tar, and the whole image-pull
+# pipeline it never calls — see docs/archive/HERD_PLUS_BOX.md.
+default = ["akuma", "pull"]
+akuma = ["dep:libakuma"]
+pull = ["akuma", "dep:libakuma-tls", "dep:akuma-tar"]
 
 [dependencies]
 # Optional only so the `boxlib` unit tests can build for the host — the binary
@@ -35,4 +40,4 @@ path = "src/lib.rs"
 [[bin]]
 name = "box"
 path = "src/main.rs"
-required-features = ["akuma"]
+required-features = ["akuma", "pull"]

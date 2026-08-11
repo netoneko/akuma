@@ -1,12 +1,18 @@
 # herd + box: one box library, two clients
 
-**Status: proposed, not implemented.** Nothing in this doc has landed; it
-records the reasoning for a restructuring so the decision does not have to be
-re-derived. **Date:** 2026-08-12.
-
-Rename to `TRIM_FAT_HERD_PLUS_BOX.md` when the consolidation lands — it joins
-the `TRIM_FAT_*` series at that point, and the series is about removing exactly
-this kind of duplication.
+**Status: implemented 2026-08-12.** All four steps under "Order of work" landed
+except the deferred one (OCI types, explicitly gated on a second consumer that
+still does not exist). `boxlib::sys` holds `SpawnOptions`, the box syscall
+numbers, and the `register_box`/`kill_box`/`set_box_stack_rump`/`spawn_ext`
+wrappers; herd depends on `box` (package `boxlib`) with `default-features =
+false` and its own `akuma` feature gating `boxlib/akuma`, so herd's host-test
+build still never links `libakuma`. `box_id_for` and `boxlib::json` are shared
+the same way. The ABI is pinned on both sides: a host test in
+`userspace/box/src/sys.rs` and a `const` assertion beside the kernel's
+`SpawnOptions` in `src/syscall/proc.rs`. Verified by booting a private QEMU
+instance and confirming `box ps`'s id for a herd-started boxed service matches
+an independently-computed `box_id_for` hash, plus `box open`/`use`/`show`/
+`close` round-tripping through the same `boxlib::sys` calls herd uses.
 
 The question: `userspace/herd` and `userspace/box` both manage boxes. If shared
 types live in one place, does **herd depend on box**, box on herd, or neither?
