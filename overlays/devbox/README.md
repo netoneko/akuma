@@ -211,11 +211,12 @@ Layered back on now that SSH-over-rump is solid:
 
 - **Phase 2 networking:** build with `--no-default-features` so smoltcp (and the
   smoltcp-coupled built-in SSH) are compiled out entirely, not just unused.
-- **Toolchains:** `apk` + `musl-dev` + `libtcc1`, `tcc` (`tcc -static`), and a nightly Rust
+- ~~**Toolchains:** `apk` + `musl-dev` + `libtcc1`, `tcc` (`tcc -static`), and a nightly Rust
   toolchain (musl host) under `/usr/local` with `rust-src` and the `aarch64-unknown-linux-musl`
-  / `aarch64-unknown-none` std — via `populate_disk.sh --with-apk --with-musl-dev
-  --with-rust-toolchain`. (Needs `etc/apk` + `etc/ssl` staged into the overlay so `/etc`
-  stays overlay-only.)
+  / `aarch64-unknown-none` std~~ — **DONE**, `bootstrap.sh` now installs apk stable rust +
+  a nightly toolchain (static.rust-lang.org) under `/usr/local`, `DEVBOX_NIGHTLY_RUST=true`
+  by default (`DEVBOX_DISK_MB` default bumped to 6144 accordingly). See
+  `docs/runbooks/build-devbox.md`'s toolchain note.
 - **Editor:** `neatvi` at `/bin/vi` (ISC-licensed C vi clone — see [`NOTICE`](./NOTICE)),
   cross-compiled with the repo's `aarch64-linux-musl-gcc`.
 - **`git`:** `scratch` symlinked to `/bin/git` (clone/push over HTTPS with a GitHub PAT).

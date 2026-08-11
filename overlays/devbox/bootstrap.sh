@@ -15,8 +15,9 @@
 #
 # Env knobs (all optional):
 #   DEVBOX_DISK            output image (default: devbox.img)
-#   DEVBOX_DISK_MB         image size in MB (default: 1024; bumped when the toolchain
-#                          + /src tree are added back)
+#   DEVBOX_DISK_MB         image size in MB (default: 6144 — apk stable rust/cargo + the
+#                          nightly toolchain + C toolchain no longer fit in the old 1024
+#                          MB default now that DEVBOX_NIGHTLY_RUST defaults on)
 #   DEVBOX_BUILD_USERSPACE rebuild herd + sshd from source (default: true; false uses
 #                          the existing bootstrap/bin binaries)
 set -euo pipefail
@@ -26,7 +27,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 DEVBOX_DISK="${DEVBOX_DISK:-devbox.img}"
-DEVBOX_DISK_MB="${DEVBOX_DISK_MB:-1024}"
+DEVBOX_DISK_MB="${DEVBOX_DISK_MB:-6144}"
 DEVBOX_BUILD_USERSPACE="${DEVBOX_BUILD_USERSPACE:-true}"
 
 hr() { echo; echo "=== $* ==="; }
@@ -263,6 +264,59 @@ if [ "${DEVBOX_RUST_TOOLCHAIN:-true}" = "true" ]; then
         '
 else
     echo "Skipping Rust toolchain (DEVBOX_RUST_TOOLCHAIN=false)"
+fi
+
+# ---------------------------------------------------------------------------
+# 7b. Nightly Rust toolchain (aarch64-unknown-linux-musl host), downloaded straight from
+#    static.rust-lang.org/dist and installed under /usr/local. Previously pulled out of
+#    step 7 because nightly `cargo` was found to crash the kernel's EL0 handler on every
+#    invocation (EC=0x0; see docs/archive/RUST_TOOLCHAIN_ISSUES.md §1) — `rustc` alone was
+#    fine. Re-added here, default ON, 2026-08-11: `cargo new`/`cargo build`/running the
+#    resulting binary all worked cleanly under devbox-smoltcp (HVF on) — the crash no
+#    longer reproduces (see docs/runbooks/build-devbox.md's toolchain note). Does not
+#    touch step 7's PATH/profile.d setup, so `cargo`/`rustc` still resolve to apk-stable
+#    by default; invoke /usr/local/bin/{rustc,cargo} explicitly for nightly.
+#    Skip with DEVBOX_NIGHTLY_RUST=false (large download; offline builds).
+# ---------------------------------------------------------------------------
+if [ "${DEVBOX_NIGHTLY_RUST:-true}" = "true" ]; then
+    hr "Installing nightly Rust toolchain (static.rust-lang.org, aarch64-musl host) -> /usr/local"
+    docker run --rm --privileged \
+        -v "$REPO_ROOT/$DEVBOX_DISK:/disk.img" \
+        alpine:latest \
+        sh -c '
+            set -e
+            mkdir -p /mnt/disk
+            mount -o loop /disk.img /mnt/disk
+
+            RUST_HOST=aarch64-unknown-linux-musl
+            DIST=https://static.rust-lang.org/dist
+            PREFIX=/mnt/disk/usr/local
+
+            apk add --no-cache curl xz bash >/dev/null
+
+            mkdir -p /tmp/rust
+            for comp in \
+                rustc-nightly-$RUST_HOST \
+                cargo-nightly-$RUST_HOST \
+                rust-std-nightly-$RUST_HOST \
+                rust-std-nightly-aarch64-unknown-none \
+                rust-src-nightly ; do
+                echo "Downloading $comp ..."
+                curl -fsSL "$DIST/$comp.tar.xz" -o /tmp/rust/$comp.tar.xz
+                echo "Extracting $comp ..."
+                xz -dc /tmp/rust/$comp.tar.xz | tar x -C /tmp/rust
+                echo "Installing $comp -> $PREFIX ..."
+                (cd /tmp/rust/$comp && ./install.sh --prefix="$PREFIX" --disable-ldconfig)
+                rm -rf /tmp/rust/$comp /tmp/rust/$comp.tar.xz
+            done
+
+            echo "Nightly Rust toolchain installed:"
+            ls /mnt/disk/usr/local/bin
+            sync
+            umount /mnt/disk
+        '
+else
+    echo "Skipping nightly Rust toolchain (DEVBOX_NIGHTLY_RUST=false)"
 fi
 
 # ---------------------------------------------------------------------------

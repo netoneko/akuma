@@ -34,11 +34,12 @@ Env knobs (all optional):
 | Var | Default | Effect |
 |---|---|---|
 | `DEVBOX_DISK` | `devbox.img` | Output image path. |
-| `DEVBOX_DISK_MB` | `1024` | Image size in MB. |
+| `DEVBOX_DISK_MB` | `6144` | Image size in MB (bumped from 1024 for apk stable + nightly + C toolchain). |
 | `DEVBOX_BUILD_USERSPACE` | `true` | `false` reuses existing `bootstrap/bin`. |
 | `DEVBOX_CA_CERTS` | `true` | `false` skips the Mozilla CA bundle (offline builds). |
 | `DEVBOX_GIT` | `true` | `false` keeps `git -> scratch` instead of apk git. |
 | `DEVBOX_RUST_TOOLCHAIN` | `true` | `false` skips the apk rust + cargo + C toolchain. |
+| `DEVBOX_NIGHTLY_RUST` | `true` | `false` skips the nightly toolchain (static.rust-lang.org) under `/usr/local`. |
 | `DEVBOX_SOUNDTRACK` | `false` | `true` copies `bootstrap/music`. |
 
 ### What lands on the image
@@ -48,17 +49,33 @@ Env knobs (all optional):
 - `/bin/sshd` — userspace sshd (the only sshd).
 - `/bin/busybox` + full applet symlinks — the shell + coreutils.
 - `/usr/bin/git` (apk) — real git; `/bin/git` → `/usr/bin/git`.
-- `/usr/bin/rustc`, `/usr/bin/cargo` + clang/lld/gcc/binutils/make/musl-dev (apk stable, **not** nightly).
+- `/usr/bin/rustc`, `/usr/bin/cargo` + clang/lld/gcc/binutils/make/musl-dev (apk stable).
+- `/usr/local/bin/rustc`, `/usr/local/bin/cargo` (nightly, static.rust-lang.org) + rust-std for
+  `aarch64-unknown-linux-musl` and `aarch64-unknown-none` + `rust-src`.
 - `/etc/ssl/certs/ca-certificates.crt` — Mozilla roots, for userspace `curl https`.
 - `/etc` comes **only** from `overlays/devbox/rootfs/`.
 
-> **Toolchain note (current truth):** `bootstrap.sh` step 7 installs **apk
+> **Toolchain note (current truth, updated 2026-08-11):** the devbox ships
+> **both** toolchains side by side. `bootstrap.sh` step 7 installs **apk
 > stable** `rust`/`cargo` into `/usr` with `PATH=/usr/bin` set via
-> `/etc/profile.d/rust.sh`. The README roadmap mentions a nightly toolchain
-> under `/usr/local` via `populate_disk.sh --with-rust-toolchain` — that is
-> **not** what the devbox uses. The nightly `cargo` binary crashes the kernel's
-> EL0 handler (EC=0x0); apk stable works. See
-> [`debug-devbox.md` -> Toolchain crashes](debug-devbox.md).
+> `/etc/profile.d/rust.sh`. Step 7b installs **nightly**, downloaded straight
+> from [`static.rust-lang.org/dist`](https://static.rust-lang.org/dist), into
+> `/usr/local` — default on (`DEVBOX_NIGHTLY_RUST=true`). Step 7b does **not**
+> touch `PATH`, so bare `cargo`/`rustc` still resolve to apk stable; invoke
+> `/usr/local/bin/cargo` explicitly for nightly.
+>
+> Nightly `cargo` used to die instantly under HVF (`EC=0x0` at a constant
+> `ELR`) — **root-caused and fixed 2026-08-06**: the trap was OpenSSL's
+> `OPENSSL_cpuid_setup` armcaps probe executing `SM3SS1` (FEAT_SM3), which
+> Apple Silicon's HVF lacks; the probe expects `SIGILL` to detect the missing
+> feature, but the kernel's `EC=0x0` handler hard-killed the process instead
+> of delivering it. Fixed by delivering `SIGILL` via `try_deliver_signal` in
+> `src/exceptions.rs`. Re-verified 2026-08-11 on devbox-smoltcp: `cargo new`,
+> `cargo build`, and running the resulting binary all completed cleanly. Full
+> writeup: [`../archive/NIGHTLY_CARGO_HVF_SIGILL.md`](../archive/NIGHTLY_CARGO_HVF_SIGILL.md);
+> also covered in [`selfhost-kernel-build.md`](selfhost-kernel-build.md) §6.
+> (`docs/archive/RUST_TOOLCHAIN_ISSUES.md` is the original, now-superseded
+> investigation — kept verbatim per repo convention, not the current state.)
 
 ## 2. Boot the kernel
 
@@ -139,4 +156,9 @@ curl https://ifconfig.me               # HTTPS over rump (verifies CA bundle)
 
 - `overlays/devbox/README.md` — the canonical (but partly stale) overlay doc.
 - `archive/OPTIONAL_SMOLTCP.md` — why/how smoltcp was compiled out.
-- `archive/RUST_TOOLCHAIN_ISSUES.md` — why apk stable, not nightly.
+- `archive/RUST_TOOLCHAIN_ISSUES.md` — the original nightly-cargo-crash
+  investigation, superseded by `archive/NIGHTLY_CARGO_HVF_SIGILL.md` (root
+  cause + fix, 2026-08-06) — both toolchains ship together now, see the
+  toolchain note above.
+- `selfhost-kernel-build.md` §6 — the fix in kernel-source terms
+  (`src/exceptions.rs`, `try_deliver_signal`).

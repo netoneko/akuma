@@ -13,17 +13,24 @@ boots but is deferred.
 
 | File | Role |
 |---|---|
-| `bootstrap.sh` | Host build: build `herd`+`sshd` → create image → base binaries → wipe `/etc` → lay down the overlay `/etc`. |
+| `bootstrap.sh` | Host build: build `herd`+`sshd` → create image → base binaries → wipe `/etc` → lay down the overlay `/etc` → apk-stable + nightly Rust. |
 | `run-smoltcp.sh` | **Default.** `release-smp-shared` profile + `devbox-smoltcp` feature (`userspace-sshd` + `smp-shared`, default features kept). No `RUMP_NIC`; box 0 is native smoltcp. SSH is the userspace `/bin/sshd` on `:2222`. `SMP=` env var controls core count (default 2). |
 | `run.sh` | Deferred. `devbox` profile + `devbox` feature (`rump-default` + `userspace-sshd`), single kernel. `RUMP_NIC=1` brings up the second NIC rump DHCPs on. SSH on `:2223`. |
 | `rootfs/` | The **sole** source of the image's `/etc` — `bootstrap.sh` wipes whatever `bootstrap/etc/` shipped and replaces it wholesale. |
 | `README.md` | Full walkthrough: quick start for both paths, the feature-flag mechanics, verification steps, and a papercut backlog. |
 
 ```bash
-overlays/devbox/bootstrap.sh                    # build (Docker; ~1 GB image)
+overlays/devbox/bootstrap.sh                    # build (Docker; 6 GB image)
 overlays/devbox/run-smoltcp.sh                  # boot the default (SMP=2 by default)
 ssh -o StrictHostKeyChecking=no -p 2222 root@localhost
 ```
+
+**Rust:** both toolchains ship by default — apk stable at `/usr/bin/{rustc,cargo}`
+(on `PATH`) and nightly, downloaded from
+[`static.rust-lang.org/dist`](https://static.rust-lang.org/dist), at
+`/usr/local/bin/{rustc,cargo}` (not on `PATH`; invoke explicitly). See
+[`../../runbooks/build-devbox.md`](../../runbooks/build-devbox.md)'s
+toolchain note. `DEVBOX_NIGHTLY_RUST=false` skips the nightly install.
 
 ## Background
 

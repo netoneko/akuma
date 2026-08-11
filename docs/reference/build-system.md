@@ -122,5 +122,8 @@ out flaky rustc crashes under the devbox. See
 ## Background
 
 - `archive/OPTIONAL_SMOLTCP.md` — why smoltcp was made optional (the devbox).
-- `archive/RUST_TOOLCHAIN_ISSUES.md` — why apk stable rust is used over nightly.
+- `archive/RUST_TOOLCHAIN_ISSUES.md` — the original nightly-cargo-crash
+  investigation (superseded — see `archive/NIGHTLY_CARGO_HVF_SIGILL.md` for
+  the actual root cause + fix, 2026-08-06; nightly and apk-stable rust now
+  both work and ship side by side on the devbox, see `runbooks/build-devbox.md`).
 - `archive/AKUMA_SELF_HOSTING.md` — the `fs-cache` feature + self-host design.
