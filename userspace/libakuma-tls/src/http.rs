@@ -310,15 +310,16 @@ fn stream_to_file(mut streamer: Streamer, fd: i32) -> Result<(), Error> {
 
 
 /// Parsed URL components
-struct ParsedUrl<'a> {
-    is_https: bool,
-    host: &'a str,
-    port: u16,
-    path: &'a str,
+pub struct ParsedUrl<'a> {
+    pub is_https: bool,
+    pub host: &'a str,
+    pub port: u16,
+    pub path: &'a str,
 }
 
-/// Parse an HTTP(S) URL
-fn parse_url(url: &str) -> Option<ParsedUrl<'_>> {
+/// Parse an HTTP(S) URL: `http(s)://host[:port]/path`. `path` defaults to
+/// `/` when the URL has none; `port` defaults to 80/443 by scheme.
+pub fn parse_url(url: &str) -> Option<ParsedUrl<'_>> {
     let (is_https, rest) = if let Some(r) = url.strip_prefix("https://") {
         (true, r)
     } else if let Some(r) = url.strip_prefix("http://") {
@@ -819,12 +820,7 @@ impl HttpStream {
                 // Parse headers
                 let header_str = core::str::from_utf8(&self.pending_data[..pos]).unwrap_or("");
 
-                // Extract status code
-                if let Some(status_line) = header_str.lines().next() {
-                    if let Some(code_str) = status_line.split_whitespace().nth(1) {
-                        self.status_code = code_str.parse().unwrap_or(0);
-                    }
-                }
+                self.status_code = parse_status_line(header_str).unwrap_or(0);
 
                 self.headers_parsed = true;
                 self.pending_data.drain(..pos);
@@ -965,11 +961,7 @@ impl<'a> HttpStreamTls<'a> {
             if let Some(pos) = find_headers_end(&self.pending_data) {
                 let header_str = core::str::from_utf8(&self.pending_data[..pos]).unwrap_or("");
 
-                if let Some(status_line) = header_str.lines().next() {
-                    if let Some(code_str) = status_line.split_whitespace().nth(1) {
-                        self.status_code = code_str.parse().unwrap_or(0);
-                    }
-                }
+                self.status_code = parse_status_line(header_str).unwrap_or(0);
 
                 self.headers_parsed = true;
                 self.pending_data.drain(..pos);
@@ -1031,13 +1023,14 @@ fn extract_location_header(headers: &str) -> Option<String> {
     None
 }
 
-fn parse_status_line(headers: &str) -> u16 {
+/// The status code from an HTTP response's first line (`"HTTP/1.1 200 OK"`),
+/// or from a full header block — only the first line is read either way.
+pub fn parse_status_line(headers: &str) -> Option<u16> {
     headers
         .lines()
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
 }
 
 fn parse_cl_header(headers: &str) -> Option<usize> {
@@ -1149,7 +1142,7 @@ fn download_redirects_tls(stream: TcpStream, host: &str, path: &str, dest_path: 
         .ok_or_else(|| Error::HttpError(String::from("No headers in response")))?;
     let header_str = core::str::from_utf8(&hdr_buf[..end])
         .map_err(|_| Error::HttpError(String::from("Invalid headers")))?;
-    let status = parse_status_line(header_str);
+    let status = parse_status_line(header_str).unwrap_or(0);
 
     if status >= 300 && status < 400 && max_redirects > 0 {
         if let Some(location) = extract_location_header(header_str) {
@@ -1204,7 +1197,7 @@ fn download_redirects_tcp(stream: TcpStream, host: &str, path: &str, dest_path: 
         .ok_or_else(|| Error::HttpError(String::from("No headers in response")))?;
     let header_str = core::str::from_utf8(&hdr_buf[..end])
         .map_err(|_| Error::HttpError(String::from("Invalid headers")))?;
-    let status = parse_status_line(header_str);
+    let status = parse_status_line(header_str).unwrap_or(0);
 
     if status >= 300 && status < 400 && max_redirects > 0 {
         if let Some(location) = extract_location_header(header_str) {

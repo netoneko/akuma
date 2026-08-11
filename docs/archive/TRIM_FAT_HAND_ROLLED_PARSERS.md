@@ -30,7 +30,47 @@ and SSH wire-format helpers (`read_string`/`write_string`/`parse_key_blob`).
   akuma-ssh-crypto`) — including `parse_key_blob_rejects_zero_key` and
   `parse_key_blob_rejects_low_order_points` — pass (30/30). `sshd` wire.rs
   host tests pass (11/11).
-- All other findings remain open as of this writing.
+- **HTTP(S) parsing cluster — meow's sites DONE, 2026-08-12 (branch `box-run`).**
+  `libakuma-tls::http` had the canonical `parse_url`/`ParsedUrl` and
+  `parse_status_line` all along, but both were module-private — only
+  `find_headers_end` was actually `pub`, so nothing outside the crate could
+  reuse them despite the doc's consolidation table assuming they were
+  reusable. Made `parse_url`/`ParsedUrl`/`parse_status_line` `pub` and
+  re-exported them from `libakuma_tls`'s crate root alongside
+  `find_headers_end`; changed `parse_status_line`'s signature from
+  `(headers: &str) -> u16` (0 = unparsed) to `(headers: &str) ->
+  Option<u16>`, updating its two existing internal callers
+  (`download_redirects_{tcp,tls}`) to `.unwrap_or(0)`.
+  `userspace/meow/src/tools/net.rs` — deleted its local `ParsedUrl`/
+  `parse_http_url`, `find_headers_end`, and the status-line half of
+  `parse_http_response`, all now calling the shared functions; also fixed a
+  real bug found while touching this code: the plain-HTTP GET request
+  builder used a multi-line string literal *without* backslash
+  continuations, so it sent literal newlines and leading whitespace instead
+  of `\r\n` between header lines — a malformed request most servers would
+  either reject or misparse. `userspace/meow/src/api/client.rs` — deleted
+  its own third copy of `find_headers_end` (named `find_header_end`, and
+  with different semantics: returned the offset *before* `\r\n\r\n` instead
+  of past it, requiring a `+ 4` at every call site) and its crude
+  `header_str.contains(" 200 ")` status check, both replaced with the shared
+  `find_headers_end`/`parse_status_line`. Bonus finds while in
+  `libakuma-tls::http` itself, beyond what the original audit caught:
+  `HttpStream::process_pending_data` and `HttpStreamTls::process_pending_data`
+  each had their *own* third and fourth inline copies of the status-line
+  scan (identical to each other and to the standalone `parse_status_line`
+  the file already had) — collapsed both to call the shared function.
+  Verified end-to-end in a devbox-smoltcp QEMU instance against a real
+  OpenAI-compatible server (mlx-server, plain HTTP not HTTPS — so this
+  exercises `client.rs`'s non-TLS streaming path directly): a tool-calling
+  chat turn streamed correctly, and `HttpFetch` correctly fetched a file
+  from a second plain-HTTP test server, both round-trips text-exact.
+  `scratch`'s and `httpd`'s sites (URL/status-line/header duplicates,
+  `find_crlf` × 2, Content-Length/Location scanners × 3) are unchanged —
+  out of scope for this pass, which was scoped to meow.
+- All other findings (decimal integer parsers × 5, IPv4 parsers × 2,
+  config-file skeleton × 4, `scratch`'s and `httpd`'s HTTP sites, the
+  Content-Length/Location scanner trio in `libakuma-tls::http`) remain open
+  as of this writing.
 
 
 ## Summary
@@ -209,11 +249,11 @@ a 5th config file shows up.
 | Site | Move / consolidate? | Cost / why |
 |---|---|---|
 | `sshd/src/auth.rs` + `sshd/src/keys.rs` duplicates of `akuma_ssh_crypto::{auth,keys}` | **DONE — commit `7e3f5b2`.** | The pattern was already established in the same crate (`sshd/src/crypto.rs` and `sshd/src/wire.rs` re-export `akuma_ssh_crypto`). Fix was mechanical: `pub use akuma_ssh_crypto::auth::AuthResult`, delegate `publickey` verification to `akuma_ssh_crypto::auth::handle_publickey_auth`, re-export `encode_public_key_ssh`/`parse_public_key_ssh` from `akuma_ssh_crypto::keys`. The crypto crate's `handle_publickey_auth` is sync; sshd's `handle_userauth_request` stayed `async` because it `await`s `load_authorized_keys()` — it loads the keys first, then calls the sync helper with `&authorized_keys` as a parameter. Fixed the low-order-point regression for free. QEMU-verified. |
-| URL parsers × 3 | **Yes.** | One canonical `parse_http_url` in `libakuma-tls::http` (or a new tiny `libakuma-http` crate) returning borrowed `ParsedUrl`. `meow/tools/net.rs` and `scratch/http.rs::Url` both wrap it; `Url::parse_internal` keeps its `.git`-suffix logic on top of the parsed result. |
-| `parse_status_line` × 4 | **Yes — trivial.** | One `pub fn parse_status_line(line: &str) -> Option<u16>` in `libakuma-tls::http`. All four sites collapse to one-liners. |
-| `parse_response` / `parse_headers` × 2 (both in `scratch`) | **Yes.** | Same crate, same file shape, byte-identical helpers (`parse_status_line`, `find_crlf`). One `parse_http_response(data) -> Result<{status, headers, body}>` in `scratch` (or move up to `libakuma-tls`); both call sites use it. |
-| `find_crlf` × 2 (both in `scratch`) | **Yes — fold into the response parser fix above.** | Same crate, same one-liner. |
-| `meow/tools/net.rs::find_headers_end` | **Yes — delete.** | `use libakuma_tls::find_headers_end;` like scratch already does. |
+| URL parsers × 3 | **`meow` DONE — 2026-08-12; `scratch` open.** | `libakuma-tls::http::{ParsedUrl, parse_url}` made `pub` and re-exported from the crate root (they existed all along but were module-private, so nothing outside the crate could actually reuse them). `meow/tools/net.rs` now calls `libakuma_tls::parse_url`, its local copy deleted. `scratch/http.rs::Url::parse_internal` still has its own copy (keeps its `.git`-suffix logic on top) — not touched. |
+| `parse_status_line` × 4 (+ 2 more found in-file, see "What actually breaks") | **`meow` + `libakuma-tls`'s own internal dupes DONE — 2026-08-12; `scratch` open.** | `libakuma-tls::http::parse_status_line` made `pub` (signature changed `u16` → `Option<u16>`) and re-exported. `meow/tools/net.rs` and `meow/api/client.rs` (a 5th site the original audit missed — see below) both now call it. `HttpStream`/`HttpStreamTls::process_pending_data` in `libakuma-tls` itself also had their own inline copies (2 more the audit missed) — collapsed to call the same function. `scratch/http.rs` and `scratch/stream.rs`'s copies untouched. |
+| `parse_response` / `parse_headers` × 2 (both in `scratch`) | **Open — not touched.** | Same crate, same file shape, byte-identical helpers (`parse_status_line`, `find_crlf`). One `parse_http_response(data) -> Result<{status, headers, body}>` in `scratch` (or move up to `libakuma-tls`); both call sites use it. |
+| `find_crlf` × 2 (both in `scratch`) | **Open — not touched.** | Same crate, same one-liner. |
+| `meow/tools/net.rs::find_headers_end` (+ `meow/api/client.rs`'s `find_header_end`, a 5th site the audit missed) | **DONE — 2026-08-12.** | Both now `use libakuma_tls::find_headers_end;` like scratch already did. `client.rs`'s copy was also a *different* function despite the near-identical name: it returned the offset *before* `\r\n\r\n` (every call site did `+ 4`), where the canonical one returns the offset *after* — worth checking call-site math when consolidating a "same name, different semantics" duplicate like this one. |
 | `libakuma-tls::http` Content-Length / Location scanners × 3 | **Maybe.** | One `header_line_matches(name: &[u8], line: &str) -> bool` helper replaces the three `take-N-bytes-and-lowercase` blocks. Low priority — all three are in the same file and already local to one consumer. |
 | Decimal integer parsers × 5 | **Yes — trivial.** | Either delete all five and call `str::parse::<uN>()` directly (host `core` has had this forever), or add one `pub fn parse_decimal<T: FromStr>(s: &str) -> Option<T>` to `libakuma` and funnel through it. `libakuma::parse_u8`/`parse_u16` are the only ones with an internal caller (`SocketAddrV4::parse`) — that caller switches to `parse_decimal::<u8>`. |
 | IPv4 parsers × 2 | **Yes.** | Add `SocketAddrV4::parse_ip(s) -> Option<[u8; 4]>` (4-octet, reject 5th) and have `meow/linux_net.rs` call it. Fixes `SocketAddrV4::parse`'s silent 5th-octet acceptance as a side effect. |
@@ -285,7 +325,23 @@ Ranked by severity, most severe first:
    (it's a simple byte scan), but its existence means a future fix to header
    termination detection (e.g. tolerating a lone LF for broken servers) has to
    land in two places, and only one of them is covered by
-   `box/src/tests.rs::test_http_find_headers_end`.
+   `box/src/tests.rs::test_http_find_headers_end`. — **RESOLVED 2026-08-12.**
+7. **`meow/tools/net.rs::tool_http_fetch`'s plain-HTTP GET request was
+   malformed — found while consolidating the URL/status-line parsing above,
+   not by the original audit.** The request template was a multi-line Rust
+   string literal *without* the `\` line-continuations every other request
+   builder in the tree uses (`libakuma-tls::http::build_http_request` and
+   friends, `meow/api/client.rs`'s own POST builders) — so instead of
+   `\r\n`-joined header lines it sent literal `\n` plus the source
+   indentation as leading whitespace on each "header" line: `GET /path
+   HTTP/1.0\n\n             Host: ...\n\n             User-Agent: ...`. A
+   strict HTTP/1.0 parser would either reject this outright or, since a
+   blank line ends the header block, could interpret the request as
+   header-less (`GET /path HTTP/1.0` followed immediately by an empty line)
+   and silently drop `Host`/`User-Agent`/`Connection`. **Fixed** alongside
+   the `parse_url`/`find_headers_end` consolidation in the same function.
+   QEMU-verified: `HttpFetch` correctly round-tripped a real file from a
+   plain-HTTP test server after the fix.
 
 ## Background
 
