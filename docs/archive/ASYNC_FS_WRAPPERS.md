@@ -1,5 +1,12 @@
 # Async filesystem wrappers
 
+> **REMOVED 2026-08-10 (branch `trim-fat-sshd`).** `src/async_fs.rs` was
+> deleted along with the built-in SSH server and in-kernel shell — its only
+> callers (`docs/archive/BUILTIN_SSH_REMOVAL.md`). This document is kept
+> verbatim below as the historical record of how it worked; it no longer
+> describes anything in `src/`. See
+> [`BUILTIN_SSH_REMOVAL.md`](BUILTIN_SSH_REMOVAL.md) for what replaced it.
+
 Async-friendly wrappers around the synchronous VFS API. Source:
 `src/async_fs.rs`. For the underlying `with_fs` critical section these
 wrappers avoid violating, see [`vfs.md`](vfs.md) "Mount table" — read that

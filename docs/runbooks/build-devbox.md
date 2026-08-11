@@ -71,13 +71,18 @@ Equivalent build-only: `scripts/build_devbox.sh`.
 `run.sh` sets `RUMP_NIC=1`, `MEMORY=4096`, unsets `SMP`, and runs:
 
 ```
-cargo run --profile devbox --no-default-features --features \
-  devbox,neko,sound,no-tests,sc-aio,sc-sysv-ipc,sc-framebuffer,sc-containers,\
+cargo run --release --no-default-features --features \
+  devbox,sound,no-tests,rump-tests,sc-aio,sc-sysv-ipc,sc-framebuffer,sc-containers,\
   sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll
 ```
 
-`--no-default-features` compiles **smoltcp out entirely** (and the
-smoltcp-coupled built-in SSH, `kernel-tls`, `tls-rsa`). Rump is the only stack.
+(There is no `devbox` Cargo *profile* — only `release`, `extreme-size`, and
+`release-debug` exist; `devbox` is a feature layered on plain `release`.)
+
+`--no-default-features` compiles **smoltcp out entirely**. Rump is the only
+stack. The built-in SSH server, `kernel-tls`, and `tls-rsa` aren't part of
+this trade anymore — they were deleted from the whole tree (not just this
+profile) on 2026-08-10; see `docs/archive/BUILTIN_SSH_REMOVAL.md`.
 `run.sh` env knobs: `DEVBOX_DISK`, `DEVBOX_MEMORY` (default 4096),
 `RUMP_SSH_PORT` (default 2223).
 

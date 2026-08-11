@@ -339,7 +339,7 @@ extreme = ["akuma-exec/extreme", "akuma-ext2/extreme"]
 # Large RAM-sized ext2 block cache with clock eviction (crates/akuma-ext2). Keeps
 # the read-only toolchain resident across the many process spawns in a self-host
 # `cargo build`, instead of re-reading it off virtio-blk per spawn. The cache cap
-# is auto-derived from detected RAM at mount (`min(25% RAM, 512 MB)`, src/fs.rs).
+# is auto-derived from detected RAM at mount (`min(RAM/8, 384 MB)`, src/fs.rs).
 #
 # In `default` since 2026-08-02. Without it `akuma-ext2` falls back to
 # `BlockRingCache`: 64 slots / 256 KB, FIFO, linear-scan lookup. That is far

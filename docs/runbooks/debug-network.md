@@ -19,7 +19,7 @@ mechanism.
 | Symptom / signature | Cause | Status | Fix |
 |---|---|---|---|
 | Whole-system hang 5+ s; watchdog `Preemption disabled ... (critical)` | Priority-inversion: preemptible userspace thread held a VFS/Block spinlock, preempted; preemption-disabled network thread spun on it | FIXED | `with_fs`/`with_device` disable preemption **before** acquiring the spinlock |
-| Network starves during SSH/auth disk I/O (e.g. `read_file("authorized_keys")`) | Async tasks held "preemption disabled" across slow sync fs I/O | FIXED | `src/async_fs.rs` temporarily **enables** preemption during sync I/O |
+| Network starves during SSH/auth disk I/O (e.g. `read_file("authorized_keys")`) | Async tasks held "preemption disabled" across slow sync fs I/O | FIXED, then N/A | `src/async_fs.rs` temporarily **enabled** preemption during sync I/O; the file (and its only callers, the built-in shell/SSH) was deleted 2026-08-10 — see `docs/archive/ASYNC_FS_WRAPPERS.md` |
 | `sys_sendto` watchdog trips (5+ s preemption-disabled) | Flush loop with `yield_now()` ran **inside** `with_socket_handle` | FIXED | Poll briefly inside the closure; `yield_now()` **outside**. Rule: never yield/block inside `with_socket_handle`. |
 | Panic: `subtract sequence numbers with underflow` (`smoltcp/tcp.rs:81`) during sideband buffers | Out-of-order packet handling / concurrent access state corruption | OPEN (latent) | Mitigated by single `NETWORK` lock + smoltcp migration. Believed largely gone. |
 | EL1 `EC=0x25 FAR=0xffffffff00000000` in `TcpStream::read` → `SocketSet::get_mut` | VirtIO RX buffer overflow: `receive()` built slices from `hdr_len+pkt_len` with no bounds check; OOB write corrupted the SocketSet | FIXED | Bounds-check `hdr_len.saturating_add(pkt_len) > rx_buffer.len()`; `TcpStream` caches + validates `handle_index` on every op |
@@ -55,16 +55,19 @@ network thread not yet ready.
 
 ## TLS / HTTPS issues
 
-Two impls: kernel async (`src/tls.rs`) and userspace blocking
-(`userspace/libakuma-tls/`). Both `embedded-tls 0.17`, `Aes128GcmSha256`
-(ECDHE P-256). TLS 1.3 only.
+One impl now: userspace blocking (`userspace/libakuma-tls/`), `embedded-tls
+0.17`, `Aes128GcmSha256` (ECDHE P-256), TLS 1.3 only. The in-kernel async impl
+(`src/tls.rs`, `src/tls_verifier.rs`, the `kernel-tls`/`tls-rsa` features) was
+deleted entirely (commit `bade6ab`, "remove unnecessary profiles and all
+crypto") — there is no profile that still has it, so there is no full X.509
+verification anywhere in this tree anymore.
 
 | Symptom | Cause | Status | Fix |
 |---|---|---|---|
 | HTTPS downloads measured in minutes | `libakuma-tls/transport.rs` slept **10 ms** on every `WouldBlock` | FIXED | 10 ms → 1 ms; timeout iterations 500→5000 (~5 s idle preserved) |
 | Residual 10 ms sleep | Some flows may still have `sleep_ms(10)` | VERIFY | Check current `transport.rs` before assuming deployed |
-| `curl https://...`: "HTTPS not supported in this build" | `kernel-tls` feature off (extreme/size profile) | BY DESIGN | Use a userspace HTTPS tool |
-| Userspace TLS skips cert verification | Phase-1 libakuma-tls does NoVerify (MITM-vulnerable) | BY DESIGN | Full X.509 only in kernel (`src/tls_verifier.rs`) |
+| `curl https://...` fails in-kernel | There is no in-kernel HTTPS client (the kernel has no shell at all now — SSH is the userspace `/bin/sshd`) | BY DESIGN | Use a userspace HTTPS tool over the userspace shell |
+| Userspace TLS skips cert verification | Phase-1 libakuma-tls does NoVerify (MITM-vulnerable) | OPEN | No kernel fallback exists anymore to do full X.509; would need fixing in `libakuma-tls` itself if this matters |
 
 ## Network debug knobs
 

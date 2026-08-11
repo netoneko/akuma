@@ -8,13 +8,13 @@
 #![allow(clippy::wrong_self_convention)] // kernel types don't follow std naming
 #![allow(clippy::inline_always)] // used for hot syscall paths
 #![allow(clippy::needless_pass_by_value)] // trait bounds often require owned types
-// Rump-only build (devbox: smoltcp compiled out). The whole in-kernel interactive
-// surface — the built-in shell (builtin/fs/exec commands), the `neko` editor, and
-// the `async_fs` helpers behind it — is reached ONLY through the built-in SSH
-// server, which is smoltcp-based and gone here. In this reduced build those
-// subsystems are compiled but unused (SSH is the userspace /bin/sshd, and the
-// shell is userspace busybox), so silence dead-code for this config only. The
-// default/size/extreme builds keep dead-code denied.
+// Rump-only build (devbox: smoltcp compiled out). AF_INET socket syscalls route
+// only through rump here, so the smoltcp-specific socket/net-syscall internals
+// (e.g. `get_socket_from_fd`, `alloc_net_bounce`/`net_bounce_size_plan`,
+// `epoll_on_fd_drained`, `EINPROGRESS`) go unreachable but stay compiled — they
+// aren't individually `cfg`-gated, only reachable through call chains that are.
+// Silence dead-code for this config only; the default/size/extreme builds
+// (smoltcp on) keep dead-code denied.
 #![cfg_attr(not(feature = "smoltcp"), allow(dead_code))]
 
 extern crate alloc;

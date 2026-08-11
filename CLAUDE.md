@@ -72,7 +72,6 @@ and tradeoffs in `docs/reference/build-profiles.md`.
 scripts/build_extreme_size.sh                             # extreme-size (4.0 MB floor, userspace sshd + paws, single-core)
 scripts/build_devbox_smoltcp.sh && overlays/devbox/run-smoltcp.sh  # default devbox (userspace sshd)
 scripts/build_devbox.sh && overlays/devbox/run.sh         # rump devbox (deferred; needs RUMP_NIC=1)
-cargo build --release --no-default-features --features smp,smoltcp  # multikernel (experimental)
 ```
 
 **`cargo build --release` is real SMP.** `smp-shared` — one shared kernel across

@@ -19,7 +19,7 @@ churn. See [`../README.md`](../README.md).
 | SMP (shared-kernel) | [`subsystems/smp-shared.md`](subsystems/smp-shared.md) | **C** |
 | Networking (box model, two stacks) | [`subsystems/networking.md`](subsystems/networking.md) | **C** |
 | Rump stack (sysproxy, fiber) | [`subsystems/rump-stack.md`](subsystems/rump-stack.md) | **C** |
-| SSH (built-in + userspace) | [`subsystems/ssh.md`](subsystems/ssh.md) | A |
+| SSH (userspace `/bin/sshd`) | [`subsystems/ssh.md`](subsystems/ssh.md) | B |
 | VFS (ext2, procfs, pipes) | [`subsystems/vfs.md`](subsystems/vfs.md) | A |
 | Syscalls / Linux ABI | [`subsystems/syscalls.md`](subsystems/syscalls.md) (per-family docs in [`subsystems/syscalls/`](subsystems/syscalls/), grades vary) | A |
 | Containers / boxes / herd | [`subsystems/containers.md`](subsystems/containers.md) | B |
@@ -27,9 +27,6 @@ churn. See [`../README.md`](../README.md).
 | IRQ dispatch | [`subsystems/irq.md`](subsystems/irq.md) | B |
 | Console / UART output | [`subsystems/console.md`](subsystems/console.md) | B |
 | Kernel RNG (VirtIO entropy) | [`subsystems/rng.md`](subsystems/rng.md) | B |
-| Async filesystem wrappers | [`subsystems/async-fs.md`](subsystems/async-fs.md) | A |
-| In-kernel shell | [`subsystems/shell.md`](subsystems/shell.md) | **C** |
-| In-kernel editor ("neko") | [`subsystems/editor.md`](subsystems/editor.md) | A |
 | Exceptions (vector table, trap frame, ESR_EL1) | [`subsystems/exceptions.md`](subsystems/exceptions.md) | **C** |
 
 ### Drivers

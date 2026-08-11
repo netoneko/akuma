@@ -9,60 +9,64 @@ behind any of these, follow the links into `../../archive/`.
 ## Profiles
 
 Codegen profiles live in `Cargo.toml`. Behaviour comes from **features**, not
-profiles — the profile just sets opt level / codegen units / LTO.
+profiles — the profile just sets opt level / codegen units / LTO. Only three
+profiles exist since the 2026-08-10 consolidation removed five that were pure
+`inherits = "release"` duplication (`size`, `release-smp`,
+`release-smp-shared`, `devbox` — see
+[`../build-profiles.md`](../build-profiles.md#profiles-were-consolidated-2026-08-10)).
 
 | Profile | Inherits | Used by | Notes |
 |---|---|---|---|
-| `release` | — | default `cargo run` | full feature set |
-| `size` | `release` | `scripts/build_size.sh` | `--no-default-features`, re-adds minimal set |
-| `extreme-size` | `size` | `scripts/build_extreme_size.sh` | 4 MB floor; omits TLS, block cache |
-| `release-smp-shared` | `release` | `cargo build --profile release-smp-shared --features smp-shared`; also `scripts/build_devbox_smoltcp.sh` | real shared-kernel SMP; paired with `smp-shared` |
-| `devbox` | `release` | `scripts/build_devbox.sh`, `overlays/devbox/run.sh` | rump-only, no smoltcp |
+| `release` | — | default `cargo run` / `cargo build` | full `default` feature set, including real shared-kernel SMP (`smp-shared`) |
+| `extreme-size` | `release` | `scripts/build_extreme_size.sh` | `opt-level=z`, LTO, `codegen-units=1`; 4 MB floor; `--no-default-features` re-adds a minimal set |
+| `release-debug` | `release` | `cargo build --profile release-debug --features ...` (manual only) | adds `debug = true` (DWARF) for source-level `lldb` against the gdbstub |
 
-There is no `devbox-smoltcp` *profile* — the default devbox target is the
-`release-smp-shared` profile plus the `devbox-smoltcp` feature. See
+`devbox` and `devbox-smoltcp` are **not** profiles — both build on plain
+`release` and are told apart entirely by feature set. See
 [`../build-profiles.md`](../build-profiles.md) for the target-level view.
 
-Source: `Cargo.toml:77-123`.
+Source: `Cargo.toml:73-105`.
 
 ## Features
 
-`default` (`Cargo.toml:126-135`):
+`default` (`Cargo.toml:109-124`):
 ```
-neko, smoltcp, kernel-tls, tls-rsa, sound, rump,
+smp-shared, smoltcp, sound, rump, fs-cache,
 sc-aio, sc-sysv-ipc, sc-framebuffer, sc-containers,
-sc-timerfd, sc-eventfd, sc-pidfd, sc-epoll
+sc-timerfd, sc-eventfd, sc-pidfd, sc-epoll,
+many-sessions
 ```
+
+There is no `neko`/`kernel-tls`/`tls-rsa` feature anymore — the in-kernel
+editor, shell, and all in-kernel cryptography were deleted outright on
+2026-08-10 (not gated out), see
+[`../../archive/BUILTIN_SSH_REMOVAL.md`](../../archive/BUILTIN_SSH_REMOVAL.md)
+and commit `bade6ab` for the earlier crypto removal. There is no in-kernel
+HTTPS client anywhere in this tree now; use a userspace tool.
 
 ### Networking stack
 
 | Feature | Effect | Source |
 |---|---|---|
-| `smoltcp` | Native smoltcp TCP/IP stack on NIC0; built-in SSH + DNS/HTTP depend on it. | `Cargo.toml:221` |
-| `rump` | Raw L2 tap path on NIC1 (`/dev/net/tap0`) for a userspace NetBSD rump stack. NIC1 only exists with `RUMP_NIC=1`. | `Cargo.toml:215` |
-| `rump-default` | Makes the rump stack the **default** for box 0 (kernel brings up `/bin/rump_server` at boot). Implies `rump`. | `Cargo.toml:292` |
-| `userspace-sshd` | Disables the built-in (smoltcp) in-kernel SSH server; only herd's `/bin/sshd` runs. Drives `config::ENABLE_USERSPACE_SSHD`. | `Cargo.toml:300` |
-| `devbox` | Meta-feature = `["rump-default", "userspace-sshd"]`. | `Cargo.toml:307` |
-| `devbox-smoltcp` | Meta-feature = `["userspace-sshd", "smp-shared"]` — the **default** devbox. Keeps smoltcp; drops only the built-in SSH. | `Cargo.toml:319` |
+| `smoltcp` | Native smoltcp TCP/IP stack on NIC0; DNS/HTTP depend on it. (No longer gates a built-in SSH server — that was deleted entirely, not just from non-smoltcp builds.) | `Cargo.toml:315` |
+| `rump` | Raw L2 tap path on NIC1 (`/dev/net/tap0`) for a userspace NetBSD rump stack. NIC1 only exists with `RUMP_NIC=1`. | `Cargo.toml:309` |
+| `rump-default` | Makes the rump stack the **default** for box 0 (kernel brings up `/bin/rump_server` at boot). Implies `rump`. | `Cargo.toml:378` |
+| `rump-tests` | Compiles only `rump_tests` even under `no-tests` — used by the devbox to verify rump regression guards at boot without pulling in the full boot-test suite. | `Cargo.toml:142` |
+| `userspace-sshd` | Selects the herd-less startup path: `AUTO_START_HERD` off, kernel spawns `/bin/sshd` directly via `AUTO_START_SSHD`. Drives `config::ENABLE_USERSPACE_SSHD`. There is only ever one sshd (userspace) now — this no longer toggles between a built-in and a userspace server, only who starts the userspace one. | `Cargo.toml:386` |
+| `many-sessions` | Deepens the per-listener backlog (8→32) and raises the socket budget on `small-sockets` builds — the kernel half of the process-per-session `/bin/sshd` (its `fork-sessions` feature is the userspace half). **In `default`** since 2026-08-10 — without it the stack RSTs past 8 simultaneous arrivals. Costs ~1 MB heap per listening socket + ~44 KB BSS. `kernel_profile_extreme` overrides the constants back to 8/32 regardless. | `Cargo.toml:138` |
+| `devbox` | Meta-feature = `["rump-default", "userspace-sshd"]`. | `Cargo.toml:393` |
+| `devbox-smoltcp` | Meta-feature = `["userspace-sshd", "smp-shared"]` — the **default** devbox. Keeps smoltcp; `smp-shared` is a no-op here since it's already in `default`. | `Cargo.toml:405` |
 
 > **Drift note:** `overlays/devbox/README.md:142,211`
 > still say "Phase 2 will build with `--no-default-features`" and "smoltcp is
 > still compiled in (for now)". That is **stale** — `scripts/build_devbox.sh`
-> and `overlays/devbox/run.sh` already pass `--no-default-features`, so smoltcp
-> (and the smoltcp-coupled built-in SSH, `kernel-tls`, `tls-rsa`) are compiled
-> out entirely in the devbox today.
-
-### TLS
-
-| Feature | Effect | Source |
-|---|---|---|
-| `kernel-tls` | In-kernel TLS client (embedded-tls + X.509 verifier, ~58 KB). Only consumer is the shell `curl` https path, which is smoltcp-coupled. Dead weight without `smoltcp`. | `Cargo.toml:164` |
-| `tls-rsa` | RSA cert verification for outbound HTTPS. Implies `kernel-tls`. Dropped by size/extreme. SSH is Ed25519-only and unaffected. | `Cargo.toml:171` |
+> and `overlays/devbox/run.sh` already pass `--no-default-features`, so
+> smoltcp is compiled out entirely in the devbox today.
 
 ### Syscall families (`sc-*`)
 
 Per-family gates. Default-on; minimal builds use `--no-default-features` and
-re-add what they need. `Cargo.toml:208-216`.
+re-add what they need. `Cargo.toml:361-369`.
 
 | Feature | Tier | Notes |
 |---|---|---|
@@ -79,20 +83,21 @@ re-add what they need. `Cargo.toml:208-216`.
 
 | Feature | Effect | Source |
 |---|---|---|
-| `neko` | In-kernel text editor. Dropped by size profile. | `Cargo.toml:174` |
-| `sound` | virtio-sound output (`/dev/dsp`). | `Cargo.toml:180` |
-| `gic-v2` | Legacy GICv2 MMIO driver instead of default GICv3. HVF needs GICv3. | `Cargo.toml:188` |
-| `extreme` | Profile discriminator for build.rs (tighter IMAGE_SIZE/stack). | `Cargo.toml:196` |
-| `fs-cache` | Large ext2 block cache (clock eviction) — keeps toolchain resident across spawns. **In `default`**, so any build that doesn't pass `--no-default-features` has it. Cap set at mount by `src/fs.rs` as `min(RAM/8, 384 MB)` (ceiling raised from 128 MB 2026-08-05; see the sizing table there). Observe it via the `[FSCACHE]` PSTATS line. Not combinable with `extreme`. | `Cargo.toml:133` |
-| `no-tests` | Drops boot self-test suites; sets `akuma-net/small-sockets`. | `Cargo.toml:128` |
-| `userspace-sshd` | Compiles the built-in SSH server **out** (with the whole in-kernel shell behind it) and turns herd off on `extreme`, so `AUTO_START_SSHD` starts `/bin/sshd` directly. Implied by `devbox`/`devbox-smoltcp`. | `Cargo.toml:435` |
+| `sound` | virtio-sound output (`/dev/dsp`). | `Cargo.toml:321` |
+| `gic-v2` | Legacy GICv2 MMIO driver instead of default GICv3. HVF needs GICv3. | `Cargo.toml:329` |
+| `extreme` | Profile discriminator for build.rs (tighter IMAGE_SIZE/stack). | `Cargo.toml:337` |
+| `fs-cache` | Large ext2 block cache (clock eviction) — keeps toolchain resident across spawns. **In `default`**, so any build that doesn't pass `--no-default-features` has it. Cap set at mount by `src/fs.rs` as `min(RAM/8, 384 MB)`. Observe it via the `[FSCACHE]` PSTATS line. Not combinable with `extreme`. | `Cargo.toml:356` |
+| `no-tests` | Drops boot self-test suites; sets `akuma-net/small-sockets`. | `Cargo.toml:125` |
+
+`userspace-sshd` and `many-sessions` are documented under
+[Networking stack](#networking-stack) above, alongside the other
+sshd-related features.
 
 #### build.rs-emitted cfgs for the above
 
 | cfg | Emitted when | Gates |
 |---|---|---|
-| `kernel_builtin_ssh` | `smoltcp && extreme && !userspace-sshd` — i.e. the `extreme-size` profile only | `src/ssh/`, `src/shell/` (incl. `commands/`), `src/async_fs.rs`, `src/editor/`, `src/ssh_tests.rs`, `src/shell_tests.rs`, plus leaf helpers in `fs`/`vfs`/`kernel_timer`/`akuma`. See [`build-profiles.md`](../build-profiles.md#which-profile-has-a-built-in-ssh-server). |
-| `kernel_tests` | `!no-tests && OPT_LEVEL != "z"` | Kernel APIs the boot suite needs that would otherwise be shell-only — used as `#[cfg(any(kernel_builtin_ssh, kernel_tests))]` on `fs::append_file` / `vfs::append_file`. Mirrors the `not(any(feature = "no-tests", kernel_profile_size))` condition `main.rs` repeats throughout. |
+| `kernel_tests` | `!no-tests && OPT_LEVEL != "z"` | Kernel APIs the boot suite needs — `src/main.rs`'s boot self-test suite (`{tests,process_tests,sync_tests,pthread_tests,network_tests}.rs`). There is no `kernel_builtin_ssh` cfg anymore; the in-kernel SSH server, shell, and editor it used to gate were deleted outright on 2026-08-10, not compiled-out-by-cfg (`docs/archive/BUILTIN_SSH_REMOVAL.md`). |
 
 ### SMP / Big Kernel Lock
 
@@ -104,18 +109,23 @@ each is a byte-for-byte no-op on any build that doesn't set both. See
 
 | Feature | cfg emitted | In `smp-shared` by default? | Effect |
 |---|---|---|---|
-| `smp-shared` | `kernel_smp_shared` | — | One kernel across all cores; activates the BKL. Paired with `release-smp-shared`. |
+| `smp-shared` | `kernel_smp_shared` | — | One kernel across all cores; activates the BKL. **In `default`** since 2026-08-10 — this is *the* SMP now, not a separate profile/CLI opt-in (the one-kernel-per-core "multikernel" `smp` feature was removed the same day). |
 | `no-bkl-network` | `kernel_no_bkl_network` | **yes** (since 2026-07-24) | smoltcp net syscalls + socket `read`/`write` run BKL-free on `SOCKET_TABLE`/`NETWORK`. |
 | `no-bkl-vfs` | `kernel_no_bkl_vfs` | **yes** (since 2026-07-25) | fs syscalls run BKL-free on the ext2/block-cache/fd-table spinlocks. |
 | `no-bkl-process` | `kernel_no_bkl_process` | **yes** (since 2026-07-31) | `fork_process`'s CoW page-copy window runs BKL-free on the address space's `as_lock`, held in 64-page IRQ-masked chunks. Also emitted by `crates/akuma-exec/build.rs` (the only carve-out whose guard is constructed outside the bin crate). |
+| `no-bkl-mm` | `kernel_no_bkl_mm` | **yes** (since 2026-08-01) | `mprotect`/`madvise`/`munmap`/`mremap`/`mmap` run BKL-free on `as_lock`/`vm_lock`/`LAZY_REGION_TABLE`/PMM/`SHARED_FILE_MAPPINGS`. Plan-driven, not attribution-driven — bin-crate-only, nothing forwarded to `akuma-exec`. |
+| `no-bkl-drivers` | `kernel_no_bkl_drivers` | **yes** (since 2026-08-01) | `getrandom`, `/dev/urandom`, `/dev/dsp`, `fb_*` run BKL-free on their own driver spinlocks (`RNG_DEVICE`/`SOUND_DEVICE`/`FB_STATE`). Bin-crate-only. |
+| `no-bkl-irq` | `kernel_no_bkl_irq` | **yes** (since 2026-08-01) | Timer IRQ (27) dispatch runs BKL-free — the only device IRQ this kernel registers. A/B: `irq/sched` BKL contention 24.7% → 10.2%. |
 | `bkl-profile` | `kernel_bkl_profile` | **no — measurement only** | Per-tag BKL-hold profiler + periodic `[BKLPROF]` histogram. Perturbs timing; never ship it. |
-| `CONSOLE_LOCK` (env) | `kernel_console_lock` | **default-on in `release`; off in size/extreme** | Cross-core spinlock + owner-core-ID reentrancy guard around `console::emit`'s UART write loop, so two cores under `smp-shared` can't byte-interleave each other's lines at the shared PL011 register. Default-on for the `release` profile (OPT_LEVEL != "z") since 2026-08-11 after SMP=4 verification; off in size/extreme (single-core targets, lock is pure overhead). `CONSOLE_LOCK=0` opt-out (debug), `CONSOLE_LOCK=1` force-on in size/extreme (test). Background: `docs/archive/UART_SMP_INTERLEAVE_FIX.md`. |
+| `CONSOLE_LOCK` (env) | `kernel_console_lock` | **default-on in `release`; off in `extreme-size`** | Cross-core spinlock + owner-core-ID reentrancy guard around `console::emit`'s UART write loop, so two cores under `smp-shared` can't byte-interleave each other's lines at the shared PL011 register. Default-on for `release` (OPT_LEVEL != "z") since 2026-08-11 after SMP=4 verification; off in `extreme-size` (single-core target, lock is pure overhead). `CONSOLE_LOCK=0` opt-out (debug), `CONSOLE_LOCK=1` force-on in `extreme-size` (test). Background: `docs/archive/UART_SMP_INTERLEAVE_FIX.md`. |
 
 Each carve-out also has a **runtime** toggle (default on) for same-binary A/B and
-as a kill switch — `vfs_bkl_drop_enabled()`, `exec_bkl_drop_enabled()`,
-`fault_bkl_drop_enabled()`, `process_bkl_drop_enabled()`, all reachable from
-`src/smp_shared.rs`. Guards latch the toggle at construction and must never
-re-read it in `drop()` (that unbalances the BKL ticket FIFO).
+as a kill switch — `set_fault_bkl_drop_enabled()`, `set_exec_bkl_drop_enabled()`,
+`set_vfs_bkl_drop_enabled()`, `set_process_bkl_drop_enabled()`,
+`set_mm_bkl_drop_enabled()`, `set_drivers_bkl_drop_enabled()`,
+`set_irq_bkl_drop_enabled()`, all reachable from `src/smp_shared.rs`. Guards
+latch the toggle at construction and must never re-read it in `drop()` (that
+unbalances the BKL ticket FIFO).
 
 ## Env vars (runtime — read by `scripts/cargo_runner.sh`)
 
@@ -134,7 +144,7 @@ re-read it in `drop()` (that unbalances the BKL ticket FIFO).
 |---|---|---|---|
 | `RUMP_NIC` | `0` | `1` adds NIC1 on `virtio-mmio-bus.4` → `/dev/net/tap0` for the rump stack. **Required for the devbox.** | `cargo_runner.sh:153` |
 | `RUMP_SSH_PORT` | `2223` | Host port forwarded to `:22` on the rump SLIRP net1. Set empty to disable the forward. | `cargo_runner.sh:164` |
-| `SSH_PORT` | (derived from INSTANCE) | Host port → NIC0 `:22` (smoltcp/built-in sshd). | `cargo_runner.sh:259` |
+| `SSH_PORT` | (derived from INSTANCE) | Host port → NIC0 `:22` (smoltcp, userspace `/bin/sshd`). | `cargo_runner.sh:259` |
 | `TEL_PORT` / `HTTP_PORT` / `MODEL_PORT` / `P44_PORT` / `P4444_PORT` | derived | Other NIC0 hostfwd ports. | `cargo_runner.sh:259` |
 
 ### Acceleration
@@ -177,9 +187,9 @@ These are **compile-time** `pub const bool` — toggle in source and rebuild.
 | Knob | Default | Effect | Source |
 |---|---|---|---|
 | `USER_STACK_SIZE_OVERRIDE` | `0` (auto-scale) | Set e.g. `8MB` to debug Bun/JSC stack depth. | `config.rs:71` |
-| `USER_THREAD_STACK_SIZE` | profile-dependent (512KB release / 64KB size) | Per userspace thread stack. | `config.rs:132-134` |
-| `SYSTEM_THREAD_STACK_SIZE` | profile-dependent (512KB / 128KB / 96KB) | Kernel-side system thread stack. | `config.rs:106-116` |
-| `MAX_ARG_STRLEN` | `128KB` release / `8KB` size / `4KB` extreme | Max single arg string (Linux = 128KB). | `config.rs:147-151` |
+| `USER_THREAD_STACK_SIZE` | `cfg(kernel_profile_extreme)`-gated (512KB release / 64KB extreme-size) | Per userspace thread stack. | `config.rs:53-56` |
+| `SYSTEM_THREAD_STACK_SIZE` | `cfg(kernel_profile_extreme)`-gated (512KB release / 96KB extreme-size) | Kernel-side system thread stack. | `config.rs:30-38` |
+| `MAX_ARG_STRLEN` | `cfg(kernel_profile_extreme)`-gated (`128KB` release / `4KB` extreme-size) | Max single arg string (Linux = 128KB). | `config.rs:167-170` |
 | `KERNEL_HEAP_SIZE_MB` | `0` (auto) | Override kernel heap size. | `config.rs:351` |
 | `ENABLE_STACK_CANARIES` | `true` | Stack-overflow detection. | `config.rs:158` |
 
@@ -199,8 +209,8 @@ These are **compile-time** `pub const bool` — toggle in source and rebuild.
 | Knob | Default | Effect | Source |
 |---|---|---|---|
 | `AUTO_START_HERD` | `!(extreme && userspace-sshd)` | Spawn `/bin/herd daemon` after the network comes up. Off **only** in the extreme+`userspace-sshd` combination, where herd plus its service tree costs more RAM than a 4 MB box has to spare. | `config.rs` |
-| `AUTO_START_SSHD` | `userspace-sshd && !AUTO_START_HERD` | Spawn `/bin/sshd --port 22 --shell /bin/sh` straight from `kernel_main` when there is no supervisor and no built-in server — otherwise the image has no way in. Never both this and herd's sshd (they would collide on the port). | `config.rs` |
-| `ENABLE_USERSPACE_SSHD` | `cfg!(feature = "userspace-sshd")` | Legacy runtime flag. Now only meaningful on `extreme`, the one profile that still *has* a built-in server to suppress. | `config.rs` |
+| `AUTO_START_SSHD` | `userspace-sshd && !AUTO_START_HERD` | Spawn `/bin/sshd --port 22 --shell /bin/sh` straight from `kernel_main` when there is no supervisor — otherwise the image has no way in. Never both this and herd's sshd (they would collide on the port). | `config.rs` |
+| `ENABLE_USERSPACE_SSHD` | `cfg!(feature = "userspace-sshd")` | Legacy name from when there was a built-in server to suppress; that server no longer exists on any profile (deleted 2026-08-10), so this now just gates which startup path (`AUTO_START_HERD` vs `AUTO_START_SSHD`) spawns the one userspace `/bin/sshd`. | `config.rs` |
 
 ### Test gates (boot self-tests)
 

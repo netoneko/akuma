@@ -24,9 +24,14 @@ Source: `src/rump_proxy.rs` (header + `intercept_box_syscall`).
 |---|---|---|
 | **NIC** | NIC0 (always present) | NIC1 (`/dev/net/tap0`), needs `RUMP_NIC=1` |
 | **L2 path** | In-kernel smoltcp | Userspace `/bin/rump_server` over a raw tap |
-| **Built-in SSH** | Yes (in-kernel, smoltcp-based) | N/A (built-in SSH is smoltcp-only) |
+| **SSH** | Userspace `/bin/sshd` over smoltcp | Userspace `/bin/sshd` over rump |
 | **Default for box 0** | Yes (normal builds) | Yes when `rump-default` feature is on (devbox) |
-| **In-kernel HTTPS** | Yes (`kernel-tls`) | N/A (use a userspace tool) |
+| **In-kernel HTTPS** | No (`kernel-tls` was deleted — use a userspace tool) | No (use a userspace tool) |
+
+There used to be an additional row here for an in-kernel SSH server that ran
+only over smoltcp; it was deleted 2026-08-10 along with the in-kernel shell
+behind it — see `docs/archive/BUILTIN_SSH_REMOVAL.md`. SSH is the userspace
+`/bin/sshd` (`docs/reference/subsystems/ssh.md`) on both stacks now.
 
 ### When is each used?
 

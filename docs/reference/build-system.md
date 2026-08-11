@@ -1,6 +1,6 @@
 # Build system
 
-How the kernel is built across the seven build targets, how the disk image is
+How the kernel is built across the build targets, how the disk image is
 staged, and where artifacts land. For the **full feature/env-knob/debug-knob
 tables**, see [`subsystems/config-flags.md`](subsystems/config-flags.md) —
 this doc does not duplicate them. For a "which one do I build/run"
@@ -16,45 +16,38 @@ comparison (sizes, networking, purpose), see
 
 ## The profile / feature pairing model
 
-Codegen lives in `[profile.*]` (`Cargo.toml:77-123`); behaviour comes from
-`[features]`. Most non-default profiles are paired with a `scripts/build_*.sh`
-wrapper; the `--no-default-features` ones re-add a curated set, while the SMP
-and `devbox-smoltcp` targets layer their feature on top of `default` instead.
+Codegen lives in `[profile.*]` (`Cargo.toml:73-105`); behaviour comes from
+`[features]`. There are only three profiles now — `release`, `extreme-size`,
+and `release-debug` (a DWARF-debug variant of `release`, not tied to any
+wrapper script). The `size` profile and the one-kernel-per-core "multikernel"
+(`smp` feature, `release-smp`/`release-smp-shared` profiles) were both removed
+2026-08-10 — see `docs/archive/TRIM_FAT_MULTIKERNEL.md` and
+`docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md`. Real (shared-kernel) SMP,
+`smp-shared`, is now in `default` — it is not a separate profile or an opt-in
+CLI feature anymore.
 
 | Target | Profile | Codegen | Wrapper script | Feature set |
 |---|---|---|---|---|
-| `release` | `release` | `panic=abort` | (plain `cargo run --release`) | full `default` |
-| `size` | `size` | inherits release + `opt-level=z`, LTO, `codegen-units=1`, `strip`, `panic=immediate-abort` | `scripts/build_size.sh` | `--no-default-features`; `no-tests,smoltcp,kernel-tls`, all `sc-*` |
-| `extreme-size` | `extreme-size` | inherits `size` | `scripts/build_extreme_size.sh` (+ `extreme` feature) | `--no-default-features`; `no-tests,smoltcp,extreme` — **drops every `sc-*` family and `kernel-tls`** |
-| `release-smp` | `release-smp` | inherits release | (none — see drift note) | `default` + `smp` (passed on the CLI) |
-| `release-smp-shared` | `release-smp-shared` | inherits release | (none — see drift note) | `default` + `smp-shared` (passed on the CLI) |
-| `devbox` | `devbox` | inherits release | `scripts/build_devbox.sh` | `--no-default-features`; `devbox,neko,sound,no-tests,rump-tests`, all `sc-*` (drops `smoltcp`,`kernel-tls`,`tls-rsa`) |
-| `devbox-smoltcp` | `release-smp-shared` | inherits release | `scripts/build_devbox_smoltcp.sh` | `default` + `devbox-smoltcp,no-tests` (**no** `--no-default-features`) |
+| `release` | `release` | `panic=abort` | (plain `cargo run --release`) | full `default` (includes `smp-shared`) |
+| `extreme-size` | `extreme-size` | inherits `release` + `opt-level=z`, LTO, `codegen-units=1`, `strip`, `panic=immediate-abort` | `scripts/build_extreme_size.sh` (+ `extreme` feature) | `--no-default-features`; `no-tests,smoltcp,extreme,userspace-sshd` |
+| `devbox` (rump-only, deferred) | `release` | inherits release | `scripts/build_devbox.sh` / `overlays/devbox/run.sh` | `--no-default-features`; `devbox,sound,no-tests,rump-tests`, all `sc-*` |
+| `devbox-smoltcp` (default devbox) | `release` | inherits release | `scripts/build_devbox_smoltcp.sh` / `overlays/devbox/run-smoltcp.sh` | `default` + `devbox-smoltcp,no-tests` (**no** `--no-default-features`) |
 
-`devbox-smoltcp` is the default devbox: it reuses the `release-smp-shared`
-profile rather than defining its own, so a target is not always 1:1 with a
-profile. `smp` and `smp-shared` are mutually exclusive — `build.rs` panics if
-both are set.
+`devbox-smoltcp` is the default "develop inside Akuma" image; it layers its
+feature on top of plain `release` rather than defining its own profile, so a
+target is not always 1:1 with a profile.
 
 The `devbox` feature is the meta-feature `["rump-default", "userspace-sshd"]`
-— rump becomes the default stack for box 0 and the built-in smoltcp SSH is
-dropped. `devbox-smoltcp` is `["userspace-sshd", "smp-shared"]` — it keeps
-smoltcp and drops only the *built-in* SSH, leaving herd's `/bin/sshd` as the
-only sshd. `extreme` is **not** a syscall gate: it's the discriminator
-`build.rs` reads (via `CARGO_FEATURE_EXTREME`) to emit `cfg(kernel_profile_extreme)`
-for tighter `IMAGE_SIZE`/stack knobs (forwarded to `akuma-exec`/`akuma-ext2`).
-
-> **Drift:** `Cargo.toml:100`, `Cargo.toml:110`, `Cargo.toml:146`, and
-> `overlays/devbox/README.md:142,211` reference `scripts/build_smp.sh` /
-> `scripts/build_smp_shared.sh` / `scripts/run_smp.sh` and a "Phase 2 will
-> build with `--no-default-features`" devbox plan. **Both are stale** — none
-> of those SMP scripts exist (both SMP builds are invoked directly:
-> `cargo build --profile release-smp --features smp` and
-> `cargo build --profile release-smp-shared --features smp-shared`), and
-> `scripts/build_devbox.sh` + `overlays/devbox/run.sh` already pass
-> `--no-default-features` so smoltcp/`kernel-tls`/`tls-rsa` are compiled out
-> entirely in the devbox today. See [`subsystems/config-flags.md`](subsystems/config-flags.md)
-> "Drift note".
+— rump becomes the default stack for box 0. `devbox-smoltcp` is
+`["userspace-sshd", "smp-shared"]` — it keeps smoltcp and adds real SMP.
+`userspace-sshd` no longer drops a "built-in SSH" on either target: the
+in-kernel SSH server (and the shell/editor behind it) was deleted outright on
+2026-08-10 (`docs/archive/BUILTIN_SSH_REMOVAL.md`), so every profile's SSH is
+now the userspace `/bin/sshd`; the feature only toggles whether herd or
+`AUTO_START_SSHD` starts it. `extreme` is **not** a syscall gate: it's the
+discriminator `build.rs` reads (via `CARGO_FEATURE_EXTREME`) to emit
+`cfg(kernel_profile_extreme)` for tighter `IMAGE_SIZE`/stack knobs (forwarded
+to `akuma-exec`/`akuma-ext2`).
 
 When adding a `sc-*` syscall family, **every** `--no-default-features`
 wrapper must re-add it or that build silently drops it — see
@@ -71,9 +64,9 @@ target/aarch64-unknown-none/<profile>/akuma.bin    # flat Image (rust-objcopy)
 
 `scripts/cargo_runner.sh` is the Cargo runner (set in `.cargo/config.toml`);
 it `rust-objcopy`s the ELF to a flat binary and enforces a per-profile size
-guard before booting QEMU (`scripts/cargo_runner.sh:82-105`): **1 MB**
-(`size`), **4 MB** (`release-smp`, `release-smp-shared`), **4 MB** (everything
-else, including `release`). Oversize aborts the boot.
+guard before booting QEMU (`scripts/cargo_runner.sh:100-108`): **1 MB**
+(`extreme-size`), **4 MB** (everything else, including `release`). Oversize
+aborts the boot.
 
 ## Disk image lifecycle
 

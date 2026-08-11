@@ -64,10 +64,15 @@ behaviour it has always had.
 - **`small-sockets` / `kernel_profile_extreme`** cap the smoltcp socket table at
   32 total, shared by every process. A leak or a pile of `TIME_WAIT` sockets
   shows up as `bind`/`accept` failures long before anything reports OOM.
-- **No `kernel-tls`.** No in-kernel `curl https://`; use a userspace tool.
-- **The built-in SSH server is compiled in on this profile only**, and it binds
-  port 22 alongside the userspace `/bin/sshd` — see `build-profiles.md`
-  § "Known break on `extreme-size`".
+- **No in-kernel HTTPS anywhere.** `kernel-tls` was deleted from the whole
+  tree (commit `bade6ab`), not just this profile; use a userspace tool.
+- **No built-in SSH server anywhere either.** It used to be kept on
+  `extreme-size` only (see `docs/archive/BUILTIN_SSH_REMOVAL.md`), but a
+  follow-up commit (`e9d08f1`, "removed in-kernel ssh") deleted
+  `crates/akuma-ssh`, `crates/akuma-editor`, `src/ssh/`, `src/shell/`, and
+  `src/editor/` outright. This profile's SSH is the same userspace
+  `/bin/sshd` as every other profile — `config::AUTO_START_SSHD` just starts
+  it directly instead of going through herd.
 
 ## Verify the whole thing boots
 
