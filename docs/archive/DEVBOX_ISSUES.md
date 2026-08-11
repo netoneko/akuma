@@ -346,7 +346,33 @@ like this one.
 
 ## Issue 5: devbox images ship with missing busybox applet symlinks (`wc`, `head`, `ps`, …)
 
-**Status: OPEN.** Found 2026-08-11 during the UART SMP-interleave
+**Status: FIXED.** Both image-build paths now lay down a correct,
+relative-target applet symlink set:
+
+- `scripts/populate_disk.sh:252-284` — the essential-symlinks block runs by
+  default (whenever `OVERLAY_DIR` is empty) and installs the **full** applet
+  set, not just `--full-busybox`. Driven by `busybox --list` so the binary's
+  own applet roster is the source of truth.
+- `overlays/devbox/bootstrap.sh:128-154` — step 4 does the same for the
+  devbox rootfs.
+
+The historical bug (documented in the comment at `populate_disk.sh:257-263`)
+was `busybox --install -s` pointing every link at the path busybox was
+*invoked* as — `/mnt/disk/bin/busybox`, the mount-container path — which does
+not exist in the guest where the image is mounted at `/`, leaving ~295
+applet links dangling while the handful written by a bare `ln -sf busybox`
+loop kept working. The fix uses relative `ln -sf $BB` targets throughout and
+never clobbers a real (non-symlink) binary the image ships
+(`git`→scratch, `vi`→neatvi, `tcc`, `meow`, `curl`, …).
+
+**Verified 2026-08-12** on the running `release-smp-shared` devbox image:
+`readlink /bin/{wc,head,tail,ps,sleep,sed,awk,grep,ls,cat,sh}` → `busybox`
+(relative) for all; zero dangling symlinks under `/bin`; every Issue 5
+applet invoked by its `/bin/<applet>` path (`wc -l`, `head -1`, `ps -e`,
+`sleep`, `sed`, `awk`, `grep`) returns rc=0 with correct output. Leaving the
+original write-up below for the historical record.
+
+**Found** 2026-08-11 during the UART SMP-interleave
 verification (`docs/archive/UART_SMP_INTERLEAVE_FIX.md`), which boots
 `disk_selfhost.img` and drives an in-VM `cargo build`. Pre-existing —
 same symptom as Issue 1's "while debugging" note about `devbox.img`, just
@@ -481,6 +507,14 @@ read-return — but each points at a different file.
 - `docs/runbooks/debug-devbox.md`, `docs/runbooks/debug-network.md` —
   general devbox/network triage; `docs/README.md`'s symptom matrix routes
   "`git clone` hangs or wedges" there, with a row added pointing here too.
+- `docs/archive/MINIMAL_DEV_BUSYBOX_APPLETS.md` — the curated minimal applet
+  set for a stable dev environment, with Tier 1 + Tier 2 verified 2026-08-12
+  on a `release-smp-shared` build (49/54 pass; three new bugs found —
+  `utimensat` hardcoded to 0, `getgroups` undispatched, missing `/etc/passwd`
+  on the devbox overlay). Its procfs/sysfs cluster inventory extends Issue 4's
+  "`read_at` whitelist" class of bug to the whole `/proc` + `/sys` surface,
+  and Issue 5's "missing applet symlinks" is the image-build side of the same
+  "what does a dev expect to find operational" question.
 - `userspace/sshd/docs/OPTIONAL_PARALLELISM.md` — Issue 2's circumstantial
   link: sshd's single-process, single-threaded, cooperative-poll-loop
   architecture (not a bug in itself, a documented design tradeoff) as the
