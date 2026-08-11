@@ -62,11 +62,11 @@ host tests pass; clippy clean (smp-shared + default).
   EXIT=0; children handle SIGTERM gracefully; 0 RECOVERED / 0 WATCHDOG / 0 crashes.
 - SMP=4: basic completes, EXIT=0.
 
-## Remaining (separate bugs — see `debug-smp-go-stress-corruption.md`)
+## Remaining (separate bugs — see `SMP_GO_STRESS_CORRUPTION_FIX.md`)
 
 SMP=4 + `-combined_stress` exposed two further kernel bugs, since evidence-mined
 and given their own investigation prompt in
-[`debug-smp-go-stress-corruption.md`](debug-smp-go-stress-corruption.md):
+[`SMP_GO_STRESS_CORRUPTION_FIX.md`](SMP_GO_STRESS_CORRUPTION_FIX.md):
 
 1. **Phantom-SVC misclassification** (present from SMP=2 up, silent): EL0
    demand-paging data aborts in Go's hottest loops (`memclrNoHeapPointers`'

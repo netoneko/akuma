@@ -6,7 +6,7 @@
 
 ## Problem Statement
 
-With the waitid/pidfd fix in (see `debug-forktest-go-hang.md`), the Go forktest
+With the waitid/pidfd fix in (see `FORKTEST_GO_HANG_FIX.md`), the Go forktest
 runs under shared-kernel SMP — and immediately exposes two kernel bugs:
 
 1. **Phantom-SVC exception misclassification** (silent data corruption, present
@@ -175,9 +175,6 @@ automates boot+run+log-scrape; extend it to sweep modes.
   paths), teardown in `process/lifecycle.rs` — bug 2 territory.
 - `src/config.rs` — `FUTEX_DBG_ENABLED`, `DEADLOCK_THREAD_DUMP_ENABLED` debug
   levers (flip for instrumented runs; revert before handing back).
-- `docs/runbooks/debug-smp-fork-corruption.md` — prior dossier (mixed-EL family,
-  LifecycleGuard, POISON tripwires); the phantom-SVC mechanism may explain
-  earlier "context corruption" sightings too.
 
 ## Resolution (2026-07-22)
 
