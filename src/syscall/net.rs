@@ -18,7 +18,7 @@ const NET_BOUNCE_MAX: usize = 64 * 1024;
 /// can't grow — e.g. a process paged in a model larger than RAM and the PMM is
 /// down to a fragmented handful of pages — Talc's `handle_oom` returns `Err`
 /// and Rust routes through `handle_alloc_error`, which under
-/// `panic = "immediate-abort"` (the size/extreme profiles) is a bare `brk #1`:
+/// `panic = "abort"` (every profile) is a bare `brk #1`:
 /// EC=0x3c, the whole kernel dies. A 64 KiB buffer needs 16 *physically
 /// contiguous* pages — exactly the multi-page heap growth a fragmented pool
 /// can't satisfy (single-page growth always can, by the `handle_oom` backoff).

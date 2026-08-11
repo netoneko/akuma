@@ -1,0 +1,42 @@
+[package]
+name = "nettest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone crate: NOT a member of userspace/Cargo.toml's workspace. The
+# workspace targets the no_std kernel (`aarch64-unknown-none`); nettest is a
+# Linux/musl program that uses libcurl via the `curl` crate (same bindings
+# cargo itself uses — see https://github.com/rust-lang/cargo/blob/master/src/cargo/util/network/http_async.rs).
+#
+# Build: see build.sh in this directory (Alpine arm64 docker, links against
+# apk's libcurl + OpenSSL — the exact same libcurl that apk-installed cargo
+# links against inside the VM).
+
+[[bin]]
+name = "nettest"
+path = "src/main.rs"
+
+[dependencies]
+# `static-curl` makes curl-sys build libcurl from source (vendored), the same
+# way the Rust toolchain's bundled cargo builds its own libcurl. Without this
+# curl-sys would link against apk's libcurl.so (which uses c-ares and works on
+# Akuma); the whole point of this probe is to reproduce nightly cargo's
+# failure, which means matching its libcurl build (threaded resolver, vendored
+# OpenSSL). `static-ssl` forces openssl-sys to build OpenSSL from source too.
+# `ssl` is what tells curl-sys to pass `--with-openssl` to libcurl's configure
+# (without it you get a libcurl that rejects https:// — silently, at runtime).
+# `http2` enables nghttp2 in the vendored libcurl, matching cargo's libcurl.
+curl = { version = "0.4", default-features = false, features = ["http2", "ssl", "static-curl", "static-ssl"] }
+
+# Empty [workspace] table opts out of the parent userspace/Cargo.toml workspace
+# (whose target is aarch64-unknown-none). Mirrors the pattern used by
+# userspace/selfhost_repro.
+[workspace]
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+codegen-units = 1
+lto = true
+strip = true

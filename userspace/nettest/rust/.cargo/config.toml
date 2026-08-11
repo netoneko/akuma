@@ -1,0 +1,11 @@
+# Override the inherited repo-root .cargo/config.toml, which forces the
+# no_std kernel target (`aarch64-unknown-none`). nettest is a Linux/musl
+# program; the host build inside Alpine arm64 should target Alpine's native
+# musl triple (`aarch64-alpine-linux-musl` — the only musl std shipped by the
+# Alpine apk `rust` package). The resulting ELF is plain musl+ARM64 and runs
+# on Akuma like any other apk-built binary.
+[build]
+target = "aarch64-alpine-linux-musl"
+
+[target.aarch64-alpine-linux-musl]
+# Nothing extra — Alpine arm64 is native musl, system gcc works as-is.
