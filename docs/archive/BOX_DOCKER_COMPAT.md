@@ -160,6 +160,29 @@ rather than a child's to lose.
   five subsequent runs, including twice back-to-back. Not explained; recorded
   here rather than claimed fixed.
 
+## Open: `-i` from a login shell closes the session
+
+Starting a container interactively from an SSH login shell kills that shell when
+the container exits. Isolated 2026-08-11 by elimination: a plain command,
+`box images`, and `box run -d` all leave the session alive; **everything that
+calls `reattach` kills it**, `box open` included, so this predates `box run`.
+
+Mechanism: `reattach_process_ext` gives the target the caller's
+`Arc<ProcessChannel>` (`crates/akuma-exec/src/process/exec.rs:267`). The
+container and the login shell then hold one channel, and on exit
+`publish_child_exit` stamps `set_exited()` on it
+(`crates/akuma-exec/src/process/children.rs:149`). sshd cannot distinguish "the
+borrowed process exited" from "the login shell exited", so it closes the
+session. Stdin delegation itself works — a container reading stdin gets what you
+type (verified with `read X; echo GOT-$X`).
+
+The fix is to make the borrow explicit: mark the target's channel as borrowed
+when reattaching, skip the exit stamp on a borrowed channel, and clear the
+caller's `delegate_pid` when the borrowee exits. That means touching the group
+exit path, which has history — the `KTG-STALE-CH` comment a few lines up in
+`mod.rs` is a war story about stamping exits onto the wrong channel — so it
+wants its own change with its own testing rather than a drive-by.
+
 ## Verified
 
 ```

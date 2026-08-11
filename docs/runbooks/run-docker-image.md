@@ -84,6 +84,16 @@ box: running '/bin/sh' in busybox-343003896 ( 1 layers, ID= e54c3befa445fd9)
 The hostname in `/etc/hosts` is the container id, which is how you can tell the
 injected file apart from anything the image shipped.
 
+> **Known bug: run it as the ssh *command*, not from a login shell.** Starting a
+> container from an interactive shell over SSH kills that shell when the
+> container exits — the session closes as if you had typed `exit`. `reattach`
+> hands the container the caller's `ProcessChannel`, so the container's exit is
+> stamped on the shell's own channel and sshd reads it as "the login shell
+> exited". This predates `box run`: `box open` and `box use` do the same thing,
+> and anything that does **not** reattach (`box run -d`, `box images`, a plain
+> command) is unaffected. Workarounds: pass it as the ssh command as shown
+> above, or use `-d` and `box grab`.
+
 ## Verify
 
 A run of a pulled image prints the banner, then the program's own output:

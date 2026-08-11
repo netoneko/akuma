@@ -45,6 +45,7 @@ across runs and an unnamed one (`<image>-<uptime>`) is unique.
 | `-p` port mapping, `-v` volumes, `-e` env | ❌ |
 | `USER`, cgroups, capabilities, seccomp | ❌ — isolation here is namespace + network-stack |
 | Docker-in-docker | ❌ **by design** — see below |
+| Interactive (`-i`) from an SSH *login shell* | ⚠️ bug: the container's exit closes the login shell. `reattach` shares the caller's `ProcessChannel`, so `publish_child_exit` stamps the container's exit onto the shell's channel and sshd reads the session as finished. Pre-existing — `box open`/`box use` behave the same. Run it as the ssh command, or use `-d` + `box grab` |
 
 ## No nested OCI images
 

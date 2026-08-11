@@ -35,7 +35,10 @@ box close demo                                   # stop a box
 
 - `--rm` — kill the box and delete the container directory on exit
 - `-d` / `--detached` — start in background, print the pid
-- `-i` / `--interactive` — keep stdin attached (output is always attached in the foreground)
+- `-i` / `--interactive` — keep stdin attached (output is always attached in the
+  foreground). **Known bug:** started from an interactive SSH login shell, the
+  container's exit closes that shell too — run it as the ssh command instead.
+  Shared with `box open`/`box use`; see the runbook's interactive section
 - `--name <id>` — container id (default `<image>-<uptime>`)
 - `--entrypoint <path>` — override the image's Entrypoint
 - `-w <dir>` / `--workdir <dir>` — override `WorkingDir`
