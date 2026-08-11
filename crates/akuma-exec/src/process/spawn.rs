@@ -349,15 +349,32 @@ pub fn spawn_process_with_channel_ext(
     // Actually, current_channel() now uses the field in Process struct, so this is mostly for legacy.
     register_channel(0, channel.clone());
 
+    // The channel THIS spawn created, captured now rather than re-read from the
+    // process below. `p.channel` is the process's *I/O* channel and can be
+    // borrowed: `reattach` points it at the caller's channel so a container's
+    // output appears on the caller's terminal. The per-tid registration is a
+    // different thing — it is the process's identity for exit notification
+    // (`sys_exit` stamps `get_channel(tid)`).
+    //
+    // Re-reading `p.channel` here conflated the two, and lost a race: `box run`
+    // calls `reattach` immediately after `spawn_ext` returns, usually before
+    // this thread first runs, so the container registered the *shell's* channel
+    // as its own. Its exit then stamped that channel, and sshd — which ends the
+    // session when `waitpid_status(shell_pid)` reports the shell's channel
+    // exited — closed the connection every time a container finished. The fork
+    // path has always kept these separate on purpose; see the exit_channel
+    // comment in `process/mod.rs`.
+    let spawn_channel = channel.clone();
+
     // Spawn on a user thread
     let thread_id = crate::threading::spawn_user_thread_fn_for_process(move || {
         let tid = crate::threading::current_thread_id();
-        
+
         // Update thread_id in the registered process (Arc clone in the closure
         // is refcount-only — no allocation).
         if let Some(ch) = crate::process::table::with_process(pid, |p| {
             p.thread_id = Some(tid);
-            p.channel.as_ref().unwrap().clone()
+            spawn_channel.clone()
         }) {
             // Register in THREAD_PID_MAP so on_thread_cleanup can reap this
             // process when the thread slot is recycled.  Without this, the

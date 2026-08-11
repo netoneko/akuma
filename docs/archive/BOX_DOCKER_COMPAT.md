@@ -1,4 +1,4 @@
-# Running Docker images on Akuma — `box run`, overlays, and two bugs underneath
+# Running Docker images on Akuma — `box run`, overlays, and three bugs underneath
 
 **Date:** 2026-08-11. **Branch:** `fix-cargo-networking`. **Verified on:** devbox-smoltcp (SMP=4).
 
@@ -57,6 +57,9 @@ a box that already has processes.
 `/etc/resolv.conf` and `/etc/hosts` injected into the upper layer.
 
 ## Two bugs, both mistaken for overlay bugs
+
+(A third — every `reattach` closing the SSH session — surfaced later and has its
+own section below.)
 
 ### 1. `/bin/tar` was busybox, and `link()` copies whole files
 
@@ -160,28 +163,49 @@ rather than a child's to lose.
   five subsequent runs, including twice back-to-back. Not explained; recorded
   here rather than claimed fixed.
 
-## Open: `-i` from a login shell closes the session
+## The session-closing bug (fixed)
 
-Starting a container interactively from an SSH login shell kills that shell when
-the container exits. Isolated 2026-08-11 by elimination: a plain command,
-`box images`, and `box run -d` all leave the session alive; **everything that
-calls `reattach` kills it**, `box open` included, so this predates `box run`.
+Any SSH session closed — exactly as if you had typed `exit` — as soon as a
+`box run`, `box open` or `box use` child finished. Reported twice during this
+work, once as "interactive busybox exits my shell" and once for a plain
+`box run --entrypoint curl … https://example.com`.
 
-Mechanism: `reattach_process_ext` gives the target the caller's
-`Arc<ProcessChannel>` (`crates/akuma-exec/src/process/exec.rs:267`). The
-container and the login shell then hold one channel, and on exit
-`publish_child_exit` stamps `set_exited()` on it
-(`crates/akuma-exec/src/process/children.rs:149`). sshd cannot distinguish "the
-borrowed process exited" from "the login shell exited", so it closes the
-session. Stdin delegation itself works — a container reading stdin gets what you
-type (verified with `read X; echo GOT-$X`).
+Isolated by elimination: a plain command, `box images` and `box run -d` all left
+the session alive; **everything that called `reattach` killed it**, `box open`
+included, so it predated `box run`.
 
-The fix is to make the borrow explicit: mark the target's channel as borrowed
-when reattaching, skip the exit stamp on a borrowed channel, and clear the
-caller's `delegate_pid` when the borrowee exits. That means touching the group
-exit path, which has history — the `KTG-STALE-CH` comment a few lines up in
-`mod.rs` is a war story about stamping exits onto the wrong channel — so it
-wants its own change with its own testing rather than a drive-by.
+The chain:
+
+1. `reattach_process_ext` points the target's `p.channel` at the **caller's**
+   channel, so the container's output appears on the caller's terminal. That
+   part is intended.
+2. `spawn.rs` registered the per-tid channel — the process's identity for exit
+   notification — by *re-reading `p.channel`* when the spawned thread first ran.
+3. `box run` calls `reattach` immediately after `spawn_ext` returns, which
+   normally beats the new thread to that line. So the container registered the
+   **shell's** channel as its own.
+4. `sys_exit` stamps `get_channel(tid)` (`src/syscall/proc.rs:412`) — i.e. the
+   shell's channel.
+5. sshd ends a session when `waitpid_status(shell_pid)` reports the shell's
+   channel exited (`userspace/sshd/src/protocol.rs:299`). It duly did.
+
+The fix is one line of scope: capture the channel the spawn created and register
+*that*, instead of re-reading a field that a concurrent `reattach` may already
+have retargeted. `p.channel` is borrowable I/O; the per-tid registration is
+identity. The fork path has always kept those separate on purpose — see the
+`exit_channel` comment in `process/mod.rs` — and spawn now does too.
+
+Stdin delegation was never broken: a container reading stdin gets what you type
+(verified with `read X; echo GOT-$X`), and interactive `sh` worked throughout;
+it was only the teardown that took the session with it.
+
+## `/proc` in containers
+
+An OCI image ships an empty `/proc` and expects something mounted there — without
+it `ps` fails and `ls /` complains about the entry. `box run` now mounts a procfs
+into the box's namespace before starting the container. Mounting is host-only, so
+it has to happen from `box` (box 0), which is exactly the shape the mount policy
+above intends. `ps` inside a container sees only that container's processes.
 
 ## Verified
 
@@ -200,4 +224,11 @@ box run --rm --entrypoint curl curlimages-curl -sS https://example.com
     → the page: DNS, TCP over smoltcp from a non-zero box, TLS with the
       image's own CA bundle
 box pull alpine/curl                               → 3 layers, merged, same result
+
+# after the session-closing fix, from an SSH login shell (real pty):
+box run --rm --entrypoint curl curlimages-curl -sS https://example.com
+echo SHELL-SURVIVED-CURL                           → SHELL-SURVIVED-CURL
+box run --rm -i busybox sh
+  / # ps        → only the container's own processes
+  / # exit      → back at the host prompt, session still open
 ```

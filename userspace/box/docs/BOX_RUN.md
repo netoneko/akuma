@@ -16,6 +16,7 @@ box run [--rm] [-d] [-i] [--name X] [-w dir] [--entrypoint P] <image> [cmd …]
   ├─ verify every layer directory exists
   ├─ mkdir /var/lib/box/containers/<id>/upper
   ├─ inject upper/etc/resolv.conf (copied from the host) + upper/etc/hosts
+  ├─ MOUNT_IN_NS(box_id, "/proc", "proc")     — host-only, so it happens here
   ├─ REGISTER_BOX(box_id, root=/var/lib/box/containers/<id>)
   │     → kernel creates the namespace with a SubdirFs jail at /
   ├─ MOUNT_IN_NS(box_id, "/", "overlay", "lowerdir=…,upperdir=…")
@@ -45,7 +46,8 @@ across runs and an unnamed one (`<image>-<uptime>`) is unique.
 | `-p` port mapping, `-v` volumes, `-e` env | ❌ |
 | `USER`, cgroups, capabilities, seccomp | ❌ — isolation here is namespace + network-stack |
 | Docker-in-docker | ❌ **by design** — see below |
-| Interactive (`-i`) from an SSH *login shell* | ⚠️ bug: the container's exit closes the login shell. `reattach` shares the caller's `ProcessChannel`, so `publish_child_exit` stamps the container's exit onto the shell's channel and sshd reads the session as finished. Pre-existing — `box open`/`box use` behave the same. Run it as the ssh command, or use `-d` + `box grab` |
+| Interactive (`-i`), including from an SSH login shell | ✅ (fixed 2026-08-11 — a container's exit used to close the login shell; see the archive doc) |
+| `/proc` in the container | ✅ mounted by `box run`; `ps` sees only the container |
 
 ## No nested OCI images
 

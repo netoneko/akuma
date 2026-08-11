@@ -272,6 +272,13 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
         exit(1);
     }
 
+    // Every image ships an empty /proc and expects something mounted there —
+    // without it `ps` fails and even `ls /` complains about the entry. Mounting
+    // is host-only, so it happens here, from box 0, before the container starts.
+    if libakuma::mount_in_ns(box_id, "/proc", "proc", None) != 0 {
+        print("box run: warning: could not mount /proc in the container\n");
+    }
+
     let mut image_proc = image_process(&store);
     if let Some(ep) = entrypoint_override {
         // Docker's `--entrypoint`: replace the entrypoint outright and let the
