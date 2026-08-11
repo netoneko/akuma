@@ -16,7 +16,7 @@ cd "$REPO_ROOT"
 
 export DISK="${DEVBOX_DISK:-devbox.img}"
 export MEMORY="${DEVBOX_MEMORY:-4096}"
-export SMP="${SMP:-2}"     # real shared-kernel SMP: N cores share one kernel
+export SMP="${SMP:-4}"     # real shared-kernel SMP: N cores share one kernel
 # No RUMP_NIC: box 0 is on the native smoltcp stack, not rump.
 
 if [ ! -f "$DISK" ]; then
