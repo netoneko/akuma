@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 552
-- **Docs contributing at least one fix:** 167
+- **Total distinct fixes counted:** 563
+- **Docs contributing at least one fix:** 171
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 116 | 21.0% | 15 |
-| Memory & Virtual Memory | 89 | 16.1% | 25 |
-| Scheduler & Process Management | 74 | 13.4% | 17 |
-| SMP & Locking | 70 | 12.7% | 29 |
-| Networking | 31 | 5.6% | 13 |
-| Userspace Apps & Libraries | 33 | 6.0% | 17 |
+| Syscall / ABI Compatibility Audits | 116 | 20.6% | 15 |
+| Memory & Virtual Memory | 89 | 15.8% | 25 |
+| Scheduler & Process Management | 74 | 13.1% | 17 |
+| SMP & Locking | 70 | 12.4% | 29 |
+| Networking | 31 | 5.5% | 13 |
+| Userspace Apps & Libraries | 33 | 5.9% | 17 |
 | Rump Kernel & Syscall Proxy | 24 | 4.3% | 5 |
-| Toolchain & Self-Hosting | 31 | 5.6% | 4 |
+| Toolchain & Self-Hosting | 31 | 5.5% | 4 |
 | SSH | 14 | 2.5% | 12 |
-| VFS & Filesystem | 13 | 2.4% | 9 |
+| VFS & Filesystem | 13 | 2.3% | 9 |
 | Boot & Drivers | 9 | 1.6% | 5 |
-| Signals & Exceptions | 12 | 2.2% | 5 |
-| Misc / Cross-cutting | 13 | 2.4% | 3 |
-| Console & Terminal | 11 | 2.0% | 5 |
-| Containers | 12 | 2.2% | 3 |
-| **Total** | **552** | **100.0%** | **167** |
+| Signals & Exceptions | 12 | 2.1% | 5 |
+| Misc / Cross-cutting | 14 | 2.5% | 4 |
+| Console & Terminal | 15 | 2.7% | 7 |
+| Containers | 18 | 3.2% | 4 |
+| **Total** | **563** | **100.0%** | **171** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -878,7 +878,11 @@ aren't recorded anywhere else.)
 - The `EC=0x0` (undefined-instruction) exception handler hard-killed the process instead of delivering SIGILL, so OpenSSL's ARM-feature-probe idiom (deliberately executing an unsupported instruction inside a SIGILL handler) could never recover, crashing nightly `cargo` under HVF at a fixed PC (`SM3SS1`, FEAT_SM3); fixed by routing `EC=0x0` through `try_deliver_signal` like the other fatal-fault arms
 
 
-## Misc / Cross-cutting (13 fixes, 3 docs)
+## Misc / Cross-cutting (14 fixes, 4 docs)
+
+### docs/archive/DEVBOX_ISSUES.md
+(Issue 5 only. Issue 2's fix is counted under `TERM_POLL_INPUT_PREEMPTION_FIX.md` and Issue 3's under `UART_SMP_INTERLEAVE_FIX.md`, the deep-dives it points at; Issues 4 and 6 are open, Issue 1 did not reproduce. Issue 5's `busybox --install -s` link-target half is counted under `BUILTIN_SSH_REMOVAL.md` above — the bullet here is the invocation-coverage half it did not cover.)
+- The busybox applet-symlink step ran only for `--full-busybox`, and no image-build path other than a devbox `bootstrap.sh` rebuild invoked it, so freshly built or refreshed images (`disk_selfhost.img`, and `devbox.img` in Issue 1's "while debugging" note) shipped a `/bin` where every applet but the handful written by a bare `ln -sf` loop was missing — `wc`, `head`, `ps` and the rest answering "not found" while `/bin/busybox wc` worked; the step is now default-on whenever `OVERLAY_DIR` is empty, installs the full roster driven by `busybox --list`, and is mirrored by `overlays/devbox/bootstrap.sh` step 4, never clobbering a real binary the image ships (verified 2026-08-12: zero dangling symlinks under `/bin`)
 
 ### docs/archive/EXTREME_SIZE_BUILD_FIX.md
 - `mod file_page_cache;` was declared under a `#[cfg(feature = "sc-framebuffer")]`
@@ -910,7 +914,15 @@ aren't recorded anywhere else.)
 - The `[TESTS] low-mem … skipping boot self-test suite` message printed with no `cfg` guard, so every `no-tests`/`size` image — which never compiled a suite at all — falsely claimed at boot that it had skipped one; now gated on the same condition as the suite itself
 
 
-## Console & Terminal (11 fixes, 5 docs)
+## Console & Terminal (15 fixes, 7 docs)
+
+### docs/archive/TERM_POLL_INPUT_PREEMPTION_FIX.md
+- The blocking stdin read (`sys_poll_input_event`, mirrored by `sys_read`'s `Stdin` arm) took `term_state_lock` and its nested `input_waker` spinlock with **preemption disabled but IRQs enabled**, so the post-wake re-acquire could sit in that state for as long as the holder took to become schedulable — 94 seconds in the captured incident — and the preemption watchdog declared the whole VM stuck; all 6 sites now use a per-attempt `try_lock()` retry that holds the preemption guard only on success, bounding the spin regardless of who the holder is
+- `sys_poll_input_event` registered and cleared the input waker once per loop iteration; now registered once before the loop and cleared on every exit path (success, timeout, `EINTR`), which `schedule_blocking`'s sticky-wake already tolerates
+- `TerminalState::push_input`/`read_input` locked `input_buffer` then `input_waker` with no preemption guard and no IRQ masking at all, unlike every other producer/consumer of that lock — dead code today, so not part of the live wedge, but a latent trap for whoever wires them up; brought to the same discipline
+
+### docs/archive/UART_SMP_INTERLEAVE_FIX.md
+- `console::emit` masked IRQs only on the calling core (`irq::with_irqs_disabled`), and DAIF is per-core rather than a lock, so under `smp-shared` two cores could be inside the byte loop hitting the shared PL011 data register at once, interleaving unrelated log lines byte by byte; now a `Spinlock<()>` with an owner-core-ID reentrancy guard (so a panic mid-`emit` on the same core cannot deadlock the panic handler), default-on for `release` and off for the single-core `size`/`extreme-size` profiles
 
 ### docs/archive/PIPE_TTY_FIX.md
 - Pipe TTY processing root-cause fix
@@ -935,7 +947,15 @@ aren't recorded anywhere else.)
 - Three per-event kernel traces (`[IA-DP] file region:` demand-page, `[pipe]` lifecycle, `[mmap]`/`[mprotect]`) printed unconditionally, saturating the single shared UART under a parallel `-j4` build (~270 KB/s, a 115200-baud line ~20x over-saturated) and serializing every logging core on the console lock — turning an in-VM self-host build from "never completes in over an hour" into a 2m21s green run once gated; `DEMAND_PAGE_LOG_ENABLED`, the flag meant to gate the largest of the three, was dead — defined and documented but with zero readers anywhere in the tree — so fixing it required wiring a live check, not flipping an existing one
 
 
-## Containers (12 fixes, 3 docs)
+## Containers (18 fixes, 4 docs)
+
+### docs/archive/BOX_DOCKER_COMPAT.md
+- `bootstrap/bin/tar` was never deployed by `userspace/build.sh`, so `/bin/tar` was a busybox applet whose hardlinks go through `link()` — which `sys_linkat` implements as a full file copy that also loses the mode — turning a 1.9 MB busybox layer into 467.7 MB of `0644` copies that a shell's `PATH` search then refused with "Permission denied"; fixed by linking in `akuma_tar`, which applies the archived mode bits (layer store 467.7 MB → 4.1 MB)
+- `spawn.rs` registered a spawned process's per-tid exit channel by re-reading `p.channel`, which a concurrent `reattach` had already retargeted at the caller — so a container adopted the *shell's* channel as its identity and its `sys_exit` closed the SSH session; the spawn now registers the channel it created
+- a boxed process could mount into its own namespace (and unmount anything but `/`), i.e. mount *over* any path including its own `/proc`; `sys_mount` and `sys_umount2` are now box-0-only, so a namespace is composed entirely from outside before the box runs
+- a box's root could be redirected under live processes holding paths resolved against the old one; `replace_pristine_root` now refuses unless `/` is still the birth jail, and re-rooting a box that already has processes is `EPERM`
+- tar extraction accepted entries whose paths escaped the target directory (absolute or containing `..`) and had no ceiling on gzip output; escaping entries are now refused and counted (`box pull` fails the layer), and the gzip path caps decompressed output at 512 MB
+- an OCI image ships an empty `/proc` and expects something mounted there, so `ps` failed and even `ls /` complained; `box run` now mounts a procfs into the box's namespace from box 0 before the container starts
 
 ### docs/archive/TRIM_FAT_DEAD_CODE.md
 - `process::kill_box` killed only processes with a matching `box_id` and unregistered that one box, leaving nested child boxes' `BoxInfo` registry entries orphaned and pointing at a dead parent; now snapshots the registry and cascade-kills descendant boxes leaf-to-root via `box_access::cascade_kill_order` before unregistering
@@ -963,6 +983,8 @@ aren't recorded anywhere else.)
 Also re-scanned 2026-08-07: DEVELOPMENT_PRACTICES_REVIEW_AND_ASSESSMENT (pure meta-analysis of process/git history, zero concrete bug-fix content) and BKL_RUSTC_SCALING_BASELINE (re-verified still accurate as perf-not-bugs; its inconclusive `big.rs`-failure investigation is fully resolved later by SMP_SHARED_ONCPU_GATE.md and STALE_THREAD_SLOT_KILL.md, counted there).
 
 Also re-scanned 2026-08-09: CRUSH_MISSING_SYSCALLS, C_STUBS, NEEDLE_SERVER, QJS, and TOP_CORE_COLUMN_PLAN each picked up a one-line "removed as part of a codebase trimming effort" note pointing at TRIM_FAT_PART_3.md; STDCHECK_DEBUG picked up the same note but keeps its existing 1-fix count (Console & Terminal, above) — the note doesn't touch its fix content. None of these notes describe a fix on their own.
+
+Also re-scanned 2026-08-12: CARGO_CRATES_IO_CONNECT_FAIL (root cause isolated, "fix not yet chosen" — five options, none landed), MINIMAL_DEV_BUSYBOX_APPLETS (an applet-coverage survey; its three verification findings — `utimensat` hardcoded to `0`, `getgroups` undispatched, no `/etc/passwd` on the devbox overlay — carry "fix shape" proposals, not fixes), TRIM_FAT_HAND_ROLLED_JSON (an audit of hand-rolled JSON across the tree; the bugs it reproduces in `herd` and `meow` are unfixed), and userspace/box/BOX_RUN (current-state reference; the one fix it mentions is BOX_DOCKER_COMPAT's session-closing bug, counted there). AKUMA_SELF_HOSTING gained only a quick-start section — no change to its count. The same pass found three docs that had never been counted at all, all now listed above: DEVBOX_ISSUES (Misc), and the two deep-dives its Issues 2 and 3 point at, TERM_POLL_INPUT_PREEMPTION_FIX and UART_SMP_INTERLEAVE_FIX (both Console &amp; Terminal).
 
 docs/archive: 4MB_STABLE_AGENT, AI_DEBUGGING, ARCHITECTURE, BKL_DRIVERS_CARVE_OUT, BKL_PHASE7B_PPOLL_CARVE_OUT (piece 2 reverted after A/B caught real corruption), BKL_PHASE7D_THREAD_CONTEXTS (dead/unreachable code removed, not a live bug), BKL_PHASE7F_OPTOUT_LIST, BKL_RUSTC_SCALING_BASELINE, BOX_SUBDIR_FS_LIMITATIONS, C_STUBS, CGI, COMMAND_CHAINING_SSH_BUGS, CONCURRENCY, CONTAINERS_STAGE_1_PLAN, CONTAINERS_STAGE_2_PLAN, CP_MV_IMPLEMENTATION_PLAN, CRUSH_MISSING_SYSCALLS (all gaps, none marked fixed), CWD, DEAD_CODE_ANALYSIS, DEAD_CODE_SWEEP_FINDINGS (findings only, explicitly "nothing here is fixed. No source was edited"), DEV_RANDOM, DEV_ZERO, DOCKER, EMBASSY_REMOVAL, ERRORS_TO_CHECK, EXTREME_STACK_TRIMMING (perf, not bugs), FORKTEST_GO_HANG_FIX (its one fix — the `sys_waitid` ECHILD-on-non-child parentage check — is the exact same 2026-07-22 investigation already counted under SMP_SHARED.md's "forktest_parent (Go) hang" entry), FRANKENLIBC_EVAL, FREEZE_INSTRUMENTATION_PLAN, HEAP_AND_MEMORY_IMPROVEMENTS, HERD, HERD_ADD_AND_PATH_VALIDATION, HIJACK_VS_KERNEL_PROXY (analysis/validation only), IMPLEMENTATION_PLAN (rump phases, milestones only), INTERACTIVE_IO, J4_HANG_LIVE_AUTOPSY (verbatim session record; its 3 fixes are counted once under KTG_STALE_TID_EXIT_STAMP_J4_HANG.md), KILL_COMMAND, LARGE_BINARY_LOAD_PERFORMANCE, LINE_COUNT_ANALYSIS (line-count/dead-code statistics and cross-kernel comparison, not a bugfix), LOCK_REFERENCE, LOOPBACK_TIMEOUT_FIX_PLAN (plan, not landed), MEMORY_LAYOUT (duplicate of AKUMA_SELF_HOSTING §3), MULTIKERNEL, MULTITASKING, MUSL_COMPATIBILITY, NAMESPACES, NATIVE_STACK_INTERNET, NEEDLE_SERVER, NETWORKING_PERFORMANCE_AND_THREAD_SAFETY_ANALYSIS, ON_DEMAND_ELF_LOADER, OOM_BEHAVIOR, OOM_RECOVERY_OPTIONS, PAWS_PLAN, PAWS_TO_SSH_SHELL_PLAN, PHASE01_BUILDRUMP, PHASE1_COMPLETION_BASELINE, PHASE1_NETWORK_LOCK_FOUNDATION, PHASE2_RUMPUSER, PHASE3_KERNEL_TAP, PLAN_SIGSEGV_COMPILE_FIX, POSSIBLE_MEMORY_LEAK, POST_EXIT_PMM_RECLAIM, PROCESS_MEMORY_CLEANUP, PROCFS, PROPER_EXECVE_PLAN, QJS, refactor_plan, RSA_FEATURE_GATE, RUMP_LATENCY_SLEEP_FIX (hypothesis disproven, patches reverted), RUMP_PLUS_HERD, SCHEDULING_TIMING_ISSUES (open/critical, not fixed), SCRATCH, SEPARATE_SHELL_BINARY, SHARED_FD_TABLES, SHELL_ENVIRONMENT_VARIABLES, SHELL_LIMITATIONS, SIGNAL_DELIVERY_FORKTEST_EVIDENCE (summary of fixes counted elsewhere), SMOLTCP_MIGRATION_SUMMARY (duplicate summary), SMP_SHARED_M5_FAULT_LOCK_PLAN, SSH, SSH_PERFORMANCE_FIX_2026, SSH_THREADING_BUG (superseded, duplicate), STRATEGY_A_IMMEDIATE_TUNING, STRATEGY_B_SMOLTCP_MIGRATION (duplicate), STRATEGY_C_IRQ_WAKEUPS, SYSCALL_BLOCKING, SYSCALL_ERRNO_COMPLIANCE_CHANGES, SYSCALL_HARDENING, TCC_LOW_MEMORY, TCP_SEQUENCE_UNDERFLOW_PANIC, TERMINAL_SYSCALLS (duplicate reference), TLS_DOWNLOAD_PERFORMANCE, TLS_INFRASTRUCTURE, TOP_CORE_COLUMN_PLAN, TRIM_FAT_PART_1, TRIM_FAT_PART_2, TRIM_FAT_PART_3 (pure component-removal log, no bugfix content — same shape as TRIM_FAT_PART_2), TWO_VMS_AGENT_DEMO, UNIFIED_CONTEXT_ARCHITECTURE (duplicate of FAR_0x5/THREADING_RACE_CONDITIONS fixes), UNIFIED_PROCESS_ABI, UNSAFE_POINTERS_AND_ATOMICITY, USERSPACE_MEMORY_MODEL, USERSPACE_SOCKET_API, VFS_LOCK_OPTIMIZATION_PLAN, WAIT_QUEUES, MEOW.
 
