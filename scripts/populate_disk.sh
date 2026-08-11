@@ -179,8 +179,7 @@ fi
 # Akuma runs musl userspace, so we install the aarch64-unknown-linux-musl HOST toolchain
 # (a glibc rustc binary would not run on Akuma). A release kernel build does not need
 # build-std (profile.release = panic="abort" uses the precompiled aarch64-unknown-none
-# std), but we ship rust-src anyway so the size/extreme profiles (panic="immediate-abort")
-# can build-std too.
+# std). rust-src is still shipped for any future build-std profile.
 RUST_CMD=''
 if [ "$WITH_RUST_TOOLCHAIN" = true ]; then
     RUST_CMD='
