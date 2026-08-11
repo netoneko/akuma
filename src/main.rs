@@ -1,6 +1,5 @@
 #![no_std]
 #![no_main]
-#![feature(never_type)]
 #![feature(alloc_error_handler)]
 // Kernel-specific: MMIO and error-code paths require these casts intentionally.
 #![allow(clippy::cast_ptr_alignment)]

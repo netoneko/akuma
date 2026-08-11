@@ -11,6 +11,25 @@ The single-file bring-up that preceded it (`rustc hello.rs`) is in
 
 ---
 
+## 0. Quick start
+
+Start qemu with `devbox-smoltcp` overlay:
+
+```bash
+./overlays/devbox/run-smoltcp.sh
+
+```
+
+Connect via SSH and
+
+```bash
+ssh -o StrictHostKeyChecking=no root@localhost -p 2222
+
+mkdir -p /tmp && cd /tmp && git clone --depth=1 https://github.com/netoneko/akuma.git && cd /tmp/akuma
+
+RUSTC=/usr/local/bin/rustc CARGO_BUILD_TARGET=aarch64-unknown-none ARCH64_UNKNOWN_NONE_RUSTFLAGS=-Clink-arg=-T/tmp/akuma/linker.ld /usr/local/bin/cargo build --release -p akuma --manifest-path /tmp/akuma/Cargo.toml
+```
+
 ## 1. Prerequisites
 
 ### 1.1 A nightly, musl-host Rust toolchain
