@@ -1,16 +1,27 @@
-//! SSH Host Key Management
+//! SSH Host Key Management.
 //!
-//! Handles loading, generating, and persisting SSH host keys.
-//! Keys are stored in /etc/sshd/id_ed25519 (private) and /etc/sshd/id_ed25519.pub (public).
+//! Handles loading, generating, and persisting SSH host keys, plus loading
+//! `/etc/sshd/authorized_keys`. Keys are stored in `/etc/sshd/id_ed25519`
+//! (private) and `/etc/sshd/id_ed25519.pub` (public).
+//!
+//! The base64 codec and SSH wire-format parsing (`encode_public_key_ssh`,
+//! `parse_public_key_ssh`) are re-exported from `akuma_ssh_crypto::keys` —
+//! the host-testable crate shared with the in-kernel SSH server — rather
+//! than duplicated here. See `docs/archive/TRIM_FAT_HAND_ROLLED_PARSERS.md`.
 
-use alloc::string::String;
 use alloc::vec::Vec;
 use ed25519_dalek::{SECRET_KEY_LENGTH, SigningKey, VerifyingKey};
 use spinning_top::Spinlock;
-use core::convert::TryInto;
 
 use super::crypto::new_seeded_rng;
 use libakuma::*;
+
+// Re-export the host-testable SSH wire-format helpers instead of keeping a
+// local copy. `parse_public_key_ssh` is consumed by `load_authorized_keys`
+// below; `encode_public_key_ssh` by `load_or_generate_host_key`. Both are
+// also exercised by `userspace/akuma-ssh-crypto`'s own test suite, which is
+// the point of sharing them.
+pub use akuma_ssh_crypto::keys::{encode_public_key_ssh, parse_public_key_ssh};
 
 // ============================================================================
 // Constants
@@ -20,97 +31,6 @@ const SSHD_DIR: &str = "/etc/sshd";
 const HOST_KEY_PATH: &str = "/etc/sshd/id_ed25519";
 const HOST_KEY_PUB_PATH: &str = "/etc/sshd/id_ed25519.pub";
 const AUTHORIZED_KEYS_PATH: &str = "/etc/sshd/authorized_keys";
-
-// ============================================================================
-// Base64 Encoding (simple implementation for no_std)
-// ============================================================================
-
-const BASE64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Encode bytes to base64
-pub fn base64_encode(data: &[u8]) -> String {
-    let mut result = String::new();
-    let mut i = 0;
-
-    while i < data.len() {
-        let b0 = data[i] as u32;
-        let b1 = if i + 1 < data.len() {
-            data[i + 1] as u32
-        } else {
-            0
-        };
-        let b2 = if i + 2 < data.len() {
-            data[i + 2] as u32
-        } else {
-            0
-        };
-
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-
-        result.push(BASE64_ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
-        result.push(BASE64_ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
-
-        if i + 1 < data.len() {
-            result.push(BASE64_ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-
-        if i + 2 < data.len() {
-            result.push(BASE64_ALPHABET[(triple & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-
-        i += 3;
-    }
-
-    result
-}
-
-/// Decode base64 to bytes
-pub fn base64_decode(data: &str) -> Option<Vec<u8>> {
-    let data = data.trim();
-    if data.is_empty() {
-        return Some(Vec::new());
-    }
-
-    let mut result = Vec::new();
-    let bytes: Vec<u8> = data.bytes().filter(|&b| b != b'\n' && b != b'\r').collect();
-
-    if !bytes.len().is_multiple_of(4) {
-        return None;
-    }
-
-    for chunk in bytes.chunks(4) {
-        let mut vals = [0u8; 4];
-        for (i, &b) in chunk.iter().enumerate() {
-            vals[i] = if b == b'=' {
-                0
-            } else if let Some(pos) = BASE64_ALPHABET.iter().position(|&c| c == b) {
-                pos as u8
-            } else {
-                return None;
-            };
-        }
-
-        let triple = ((vals[0] as u32) << 18)
-            | ((vals[1] as u32) << 12)
-            | ((vals[2] as u32) << 6)
-            | (vals[3] as u32);
-
-        result.push((triple >> 16) as u8);
-        if chunk[2] != b'=' {
-            result.push((triple >> 8) as u8);
-        }
-        if chunk[3] != b'=' {
-            result.push(triple as u8);
-        }
-    }
-
-    Some(result)
-}
 
 // ============================================================================
 // Global Host Key
@@ -130,65 +50,6 @@ pub fn get_host_key() -> Option<SigningKey> {
 }
 
 // ============================================================================
-// Key Format Functions
-// ============================================================================
-
-/// Encode a public key in SSH wire format (for authorized_keys)
-/// Format: "ssh-ed25519 BASE64_KEY"
-pub fn encode_public_key_ssh(key: &VerifyingKey) -> String {
-    use super::crypto::write_string;
-
-    // Build the key blob: string "ssh-ed25519" + string key_bytes
-    let mut blob = Vec::new();
-    write_string(&mut blob, b"ssh-ed25519");
-    write_string(&mut blob, key.as_bytes());
-
-    // Encode as base64
-    let encoded = base64_encode(&blob);
-
-    alloc::format!("ssh-ed25519 {}", encoded)
-}
-
-/// Parse a public key from SSH authorized_keys format
-/// Returns None if parsing fails
-pub fn parse_public_key_ssh(line: &str) -> Option<VerifyingKey> {
-    use super::crypto::read_string;
-
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('#') {
-        return None;
-    }
-
-    // Format: key_type base64_key [comment]
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 2 {
-        return None;
-    }
-
-    if parts[0] != "ssh-ed25519" {
-        return None;
-    }
-
-    // Decode base64
-    let blob = base64_decode(parts[1])?;
-
-    // Parse the blob
-    let mut offset = 0;
-    let key_type = read_string(&blob, &mut offset)?;
-    if key_type != b"ssh-ed25519" {
-        return None;
-    }
-
-    let key_bytes = read_string(&blob, &mut offset)?;
-    if key_bytes.len() != 32 {
-        return None;
-    }
-
-    let key_array: [u8; 32] = key_bytes.try_into().ok()?;
-    VerifyingKey::from_bytes(&key_array).ok()
-}
-
-// ============================================================================
 // Key Loading and Generation
 // ============================================================================
 
@@ -203,14 +64,21 @@ fn generate_keypair() -> SigningKey {
 /// Helper to read file to Vec<u8>
 fn read_file_to_vec(path: &str) -> Result<Vec<u8>, i32> {
     let fd = open(path, open_flags::O_RDONLY);
-    if fd < 0 { return Err(fd); }
-    
+    if fd < 0 {
+        return Err(fd);
+    }
+
     let mut result = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
         let n = read_fd(fd, &mut buf);
-        if n < 0 { close(fd); return Err(n as i32); }
-        if n == 0 { break; }
+        if n < 0 {
+            close(fd);
+            return Err(n as i32);
+        }
+        if n == 0 {
+            break;
+        }
         result.extend_from_slice(&buf[..n as usize]);
     }
     close(fd);
@@ -220,11 +88,17 @@ fn read_file_to_vec(path: &str) -> Result<Vec<u8>, i32> {
 /// Helper to write Vec<u8> to file
 fn write_vec_to_file(path: &str, data: &[u8]) -> Result<(), i32> {
     let fd = open(path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
-    if fd < 0 { return Err(fd); }
-    
+    if fd < 0 {
+        return Err(fd);
+    }
+
     let n = write_fd(fd, data);
     close(fd);
-    if n < 0 { Err(n as i32) } else { Ok(()) }
+    if n < 0 {
+        Err(n as i32)
+    } else {
+        Ok(())
+    }
 }
 
 /// Load or generate the SSH host key (Async version for protocol.rs)

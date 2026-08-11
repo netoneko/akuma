@@ -479,6 +479,7 @@ dependencies = [
 name = "herd"
 version = "0.1.0"
 dependencies = [
+ "box",
  "libakuma",
 ]
 
