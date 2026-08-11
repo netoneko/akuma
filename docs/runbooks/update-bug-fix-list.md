@@ -16,113 +16,133 @@ Skip this for: pure refactors/removals with no bug attached, in-flight
 `proposals/`, or a doc whose content is just table-of-contents narrative
 pointing at fixes counted elsewhere.
 
+The file has exactly three places that track counts — a per-category `##`
+header, the top-of-file `## Statistics` block, and the `| Subsystem | Fixes |
+% | Docs |` breakdown table right under it — and nothing else. There is no
+running changelog of "Updated YYYY-MM-DD: ..." paragraphs; a prior version of
+this file had one at the top, bunched together instead of organized by
+subsystem like the rest of the doc, and it drifted out of sync with the
+actual bullets more than once. `git log -p -- docs/archive/BUG_FIX_LIST.md`
+is where the history of *how* a fix got added lives — don't recreate that
+inside the file itself, and don't note which branch or commit a fix came
+from; `git blame`/`git log` already answer that and a hand-copied branch name
+just goes stale the moment the branch is deleted.
+
 ## Steps
 
-1. **Run the two counting scripts** to see how the automated view of
-   `docs/archive/` + `userspace/*/docs/` has shifted since the doc's numbers
-   were last updated:
-
-   ```bash
-   python3 scripts/count_individual_fixes.py    # heading-granularity count
-   python3 scripts/count_archive_bugfixes.py    # whole-file-granularity count
-   ```
-
-   **Their totals will not match `BUG_FIX_LIST.md`'s "Total distinct fixes
-   counted" line, and that's expected** — the file's number is a hand-curated
-   count following its own stated counting rule (one item per distinct,
-   dated/named bug; duplicates and narrative TOCs excluded), not literally the
-   live output of either script. Treat the scripts as a *signal* ("did my new
-   doc register as fix-shaped at all?"), not the source of truth to copy in.
-   Confirm your new doc/section shows up in `count_individual_fixes.py
-   --verbose` output before moving on — if it doesn't, its heading/status
-   wording probably doesn't match the script's `FIXED`/`RESOLVED` detection
-   (see that script's own docstring for the exact heuristics), which is worth
-   knowing even though you're not copying its number in.
-
-2. **Find the right category section.** `BUG_FIX_LIST.md` groups entries under
+1. **Find the right category section.** `BUG_FIX_LIST.md` groups entries under
    `## <Subsystem> (N fixes, M docs)` headers — pick the one matching your
    fix's dominant subsystem (Scheduler & Process Management, SMP & Locking,
    Networking, etc. — see the file's own `## ` headings for the full list).
    Subsystem tags are assigned **per file**, not per bullet, even for docs
    that mix concerns.
 
-3. **Add a `### docs/archive/<YOUR_DOC>.md` subsection** under that category,
+2. **Add a `### docs/archive/<YOUR_DOC>.md` subsection** under that category,
    with one `- ` bullet per distinct fix in the doc (not one bullet for the
    whole doc, unless it really is a single fix). Match the terse,
    one-sentence-per-bullet style already used by neighboring entries — enough
    to identify the bug and its fix without opening the doc, not a full
-   summary.
+   summary or a restatement of the archive doc's prose.
 
-4. **Bump that category's header count.** `(N fixes, M docs)` → add the
-   number of bullets you just added to `N`, and `+1` to `M` if this is a new
-   file (not an addition to an existing `### docs/archive/...md` subsection).
+   **Before you write any number down, count the bullets you actually just
+   typed** (`grep -c '^- '` over the lines you added, or just recount by eye)
+   — don't carry forward a number from memory or from an earlier draft. Every
+   drift this file has ever had traces back to a bullet count stated
+   somewhere (a category header, a doc's own summary line) that didn't match
+   the bullets actually present (e.g. "9 fixes" written next to a 10-bullet
+   list, or a doc mentioned as added but no `###` subsection ever created for
+   it). The bullets are the ground truth; every count in the file is derived
+   from them, never the other way around.
 
-5. **Bump the top-of-file `## Statistics` block** by the same deltas:
+3. **Bump that category's header count.** `(N fixes, M docs)` → add the
+   number of bullets you just added (the one you just counted in step 2) to
+   `N`, and `+1` to `M` if this is a new file (not an addition to an existing
+   `### docs/archive/...md` subsection).
+
+4. **Bump the top-of-file `## Statistics` block** by the same deltas:
    `Total distinct fixes counted` and `Docs contributing at least one fix`.
    `Subsystem categories` only changes if you added a brand-new `##` category
-   header, which is rare — check the existing list first.
+   header, which is rare — check the existing list first. `Docs contributing`
+   counts doc-*subsections*, not unique files — if one doc's bullets are split
+   across two categories (see the multi-category gotcha below), it adds 1 to
+   this total for each category it lands in, same as the breakdown table.
 
-6. **Add a changelog paragraph** right after the `## Statistics` block,
-   *above* the most recent existing entry (newest-first order). Follow the
-   existing format exactly:
-
-   ```markdown
-   Updated YYYY-MM-DD (branch `<branch-name>`, <Nth> entry): +<fixes> fixes /
-   +<docs> doc — `docs/archive/<YOUR_DOC>.md` (<which category/categories the
-   fixes were counted under>).
-   ```
-
-   followed by 1-3 short paragraphs of prose explaining *what* was fixed and
-   *why it's worth a standalone note* — the existing entries (e.g. the
-   `PROCESS_PER_SESSION.md` one, or the cooperative-scheduling one) are the
-   template: enough context that someone skimming just this changelog block
-   (never opening the linked doc) understands what changed and why it
-   mattered. `<Nth entry>` is the ordinal of this changelog paragraph among
-   all the ones already in the file (count the existing "Updated ..." lines
-   and add one) — it's a running counter, not tied to any external ID.
+5. **Bump the `| Subsystem | Fixes | % | Docs |` breakdown table**, directly
+   under the `## Statistics` block. This is a separate place from the `##`
+   category header in step 3 and the `## Statistics` numbers in step 4 — all
+   three must move together or they silently disagree (this has happened
+   before: a category header got bumped and the table didn't, and the two sat
+   inconsistent for several updates before anyone noticed). Bump your
+   category's row by the same delta as step 3, then recompute *every* row's
+   `%` column as `fixes / new_total * 100` to one decimal (the percentages are
+   relative to the grand total, so any change to any row shifts all of them),
+   and update the `**Total**` row to the new grand total / `100.0%` / new doc
+   total.
 
 ## Gotchas
 
-- **The two counting scripts disagree with each other and with the file.**
-  `count_individual_fixes.py` parses per-heading with a large boilerplate/
-  override heuristic; `count_archive_bugfixes.py` is a coarser whole-file
-  classifier. Neither is "the bug fix list" — `BUG_FIX_LIST.md` itself is the
-  source of truth, maintained by hand, informed by but not generated from
-  either script.
-- **Don't recompute the total from scratch.** The file's `Total distinct
-  fixes counted` is a running tally across many sessions; always add your
-  delta to the existing number rather than trying to re-derive 500+ from the
-  scripts (their differing methodology will not reproduce it, and you'll
-  introduce a spurious diff against history).
 - **One doc can span multiple categories.** If a single archive doc fixes both
   a scheduler bug and a networking bug (like the `PROCESS_PER_SESSION.md`
-  precedent), split its bullets across two `### docs/archive/<doc>.md`
-  subsections under their respective `##` categories, and say so explicitly
-  in the changelog paragraph.
+  precedent, split across SSH and Networking), split its bullets across two
+  `### docs/archive/<doc>.md` subsections under their respective `##`
+  categories, and bump both categories' headers, the table, and the
+  Statistics `Docs contributing` count accordingly.
 - **A removal/cleanup doc isn't automatically zero fixes.** A doc primarily
   about deleting dead code (a `TRIM_FAT_*.md`, say) can still surface and fix
   real bugs along the way — count those bullets normally under whichever
   category they belong to, even though the doc's main subject isn't "a bug."
+- **The two counting scripts** (`scripts/count_individual_fixes.py`,
+  `scripts/count_archive_bugfixes.py`) scan `docs/archive/` and
+  `userspace/*/docs/` with their own heuristics and will **not** match this
+  file's totals — that's expected, not a bug in either. They're a rough
+  external signal ("did my new doc register as fix-shaped at all?" — check
+  with `count_individual_fixes.py --verbose | grep <your-doc-name>`), not
+  something to copy numbers from. The authoritative recount is always
+  internal to `BUG_FIX_LIST.md` itself (see Verify below); it's the one that
+  actually catches header/bullet drift, since the scripts don't parse this
+  file at all.
 
 ## Verify
 
-- `git diff docs/archive/BUG_FIX_LIST.md` shows: the new `###` subsection (or
-  addition to an existing one), its category header's count bumped, the
-  `## Statistics` numbers bumped by the same delta, and a new changelog
-  paragraph inserted above the previous newest one (not replacing it).
-- The category header's `(N fixes, M docs)` matches an actual count of `- `
-  bullets and `### docs/archive/...md` subsections under it (spot-check with
-  `awk`/manual count if the section is long).
-- `python3 scripts/count_individual_fixes.py --verbose | grep <your-doc-name>`
-  shows your new doc contributing at least one counted fix — if it shows zero,
-  your heading/status wording likely needs a `FIXED`/`RESOLVED` signal for the
-  automated view to agree with your manual entry (not blocking, but worth
-  fixing so the two views don't diverge further).
+Recompute directly from the file — don't trust the running numbers, recount
+them. `awk`'s portable across the team's shells but three-arg `match()` isn't
+(gawk-only), so use `python3` instead — every category's stated `(N fixes, M
+docs)` next to what's actually in its section:
+
+```bash
+python3 - <<'EOF'
+import re
+text = open("docs/archive/BUG_FIX_LIST.md").read()
+body = text[text.index("---\n", text.index("## Statistics")):text.index("## Files scanned with zero counted fixes")]
+for m in re.finditer(r'^## (.+?) \((\d+) fixes, (\d+) docs?\)\n(.*?)(?=\n## |\Z)', body, re.S | re.M):
+    name, sf, sd, section = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
+    docs = len(re.findall(r'^### ', section, re.M))
+    fixes = len(re.findall(r'^- ', section, re.M))
+    if "GOLANG_MISSING_SYSCALLS.md" in section:
+        fixes += 44  # only doc in the file that states its count in prose, no bullets
+    status = "OK" if (fixes == sf and docs == sd) else "MISMATCH"
+    print(f"{name:45s} stated={sf}/{sd} actual={fixes}/{docs} {status}")
+EOF
+```
+
+- Every category must print `OK`. A `MISMATCH` means either the header wasn't
+  bumped to match the bullets you added, or (rarer) a doc was mentioned as
+  added somewhere but its `### docs/archive/<doc>.md` subsection was never
+  actually created — grep the file for the doc's filename to check which.
+- Sum all category header `N`/`M` values and confirm they equal the top
+  `## Statistics` block's `Total distinct fixes counted` / `Docs contributing
+  at least one fix`, and the breakdown table's `**Total**` row.
+- `git diff docs/archive/BUG_FIX_LIST.md` should show exactly: the new `###`
+  subsection (or bullets added to an existing one), its category header's
+  count bumped, the `## Statistics` numbers bumped, and the breakdown table's
+  row + `**Total**` + every `%` column bumped. Nothing else moves — no
+  changelog paragraph, no branch name, anywhere in the file.
 
 ## Background
 
 - `scripts/count_individual_fixes.py`, `scripts/count_archive_bugfixes.py` —
-  the two counting scripts, both self-documented with their exact heuristics
-  in their module docstrings.
+  external signal scripts, self-documented with their exact heuristics in
+  their module docstrings; they scan the archive docs themselves, not this
+  file, and are not the source of truth for anything in it.
 - `docs/archive/BUG_FIX_LIST.md` — the file itself states its counting rule
   at the top; read that before adding an entry if anything here is unclear.

@@ -9,268 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 546
-- **Docs contributing at least one fix:** 163
+- **Total distinct fixes counted:** 547
+- **Docs contributing at least one fix:** 164
 - **Subsystem categories:** 15
-
-Updated 2026-08-11 (branch `fix-more-devbox-issues`, sixth entry): +2 fixes /
-+1 doc — `docs/archive/TRIM_FAT_COOPERATIVE_SCHEDULING.md` (both counted under
-Scheduler & Process Management).
-
-Implementing the `COOPERATIVE_SCHEDULING_AUDIT.md` removal (thread 0 made
-fully preemptible, the `ThreadSlot.cooperative` flag and `spawn_fn_cooperative`
-API deleted) exposed two latent bugs in the boot self-test suite that the old
-cooperative scheduler had been silently masking:
-
-1. `test_thread_waker_marks_ready`/`_idempotent`/`_roundtrip` fabricated
-   `WAITING`/`READY` state directly on a bare `FREE` thread slot — one whose
-   `Context.sp` was still 0, having never gone through a spawn path. Thread
-   0's old 100 ms cooperative grace window made an actual dispatch to that
-   phantom slot astronomically unlikely; a fully preemptible thread 0 hit it
-   on the very first post-removal boot, crashing with `[SGI-S FATAL]
-   new_sp=0x0 invalid!`. Fixed by spawning a real slot (valid `Context`, held
-   in `INITIALIZING` so it's never actually scheduled) instead of poking a
-   bare one — the same fix `test_kill_thread_group_reaps_futex_blocked_sibling`
-   (`src/process_tests.rs`) had already independently arrived at for the
-   identical failure mode a month earlier.
-2. `test_thread_slot_reclaim_on_spawn` asserted zero slots were hot-reclaimed
-   immediately after a fill-and-terminate loop, reasoning the loop ran well
-   under the 10 ms cooldown. That held only because thread 0 ran the loop
-   with no involuntary detours of its own; once it could take timer-tick
-   detours like any other thread, the loop's wall-clock time was no longer
-   reliably under 10 ms and the assertion started failing on slots the
-   cooldown mechanism had, correctly, already released. Fixed by measuring
-   the actual elapsed time and only asserting zero-reclaim when it's provably
-   inside the cooldown window.
-
-Updated 2026-08-10 (branch `better-sshd-and-networking`, fifth entry): +2 fixes
-/ +1 doc — `userspace/sshd/docs/PROCESS_PER_SESSION.md` (one fix counted under
-SSH, one under Networking).
-
-The Networking one is a latent defect independent of sshd:
-`crates/akuma-net/src/socket.rs`'s `MAX_BACKLOG = 8`. This stack has no SYN
-queue — a listener *is* a fixed pool of pre-created sockets already in `Listen`,
-replenished one at a time by `socket_accept` — so that constant was a hard
-ceiling on **simultaneous arrivals**, not the soft hint `backlog` is on Linux.
-Past 8, peers got a RST no matter how fast the server accepted. Measured
-directly before the fix (devbox-smoltcp, SMP=4): 8/8 connections clean, 12/16,
-17/24; after: 16/16 and 24/24. Every caller passed a larger backlog and had it
-silently clamped (`libakuma`'s `TcpListener::bind` asks for 128).
-
-The SSH one is the blast radius `PROTOCOL_UNDER_LOAD.md` documented but only
-mitigated: that entry fixed the one known way to panic a session, while noting
-`panic = "abort"` is process-wide so *any* future panic would still drop every
-concurrent session. `sshd` now serves each connection from its own forked
-process, so a session's death is its own. Verified by killing one live session
-under load and watching exactly one peer end and three continue
-(`scripts/sshd_concurrency_test.py` test D).
-
-Not counted from the same work: the correction to
-`docs/MISSING_SOCKET_MACHINERY.md` (that doc concluded handing an accepted
-socket to another process was unbuildable, having surveyed `sys_spawn`,
-`SCM_RIGHTS` and procfs but not `fork()`, which inherits the fd table outright —
-a wrong conclusion corrected in place, no code changed, no defect fixed);
-`userspace/forkprobe` (a new probe binary proving `fork()` works from a `no_std`
-libakuma binary — test infrastructure, no fix); and the `max_sessions` cap and
-`docs/runbooks/build-extreme-size.md` (new capability and new runbook
-respectively). One **open** item is recorded in `PROCESS_PER_SESSION.md` rather
-than counted here: ~1% of connections fail at setup under a specific
-long-plus-short-churn mix (3 of ~276, against 0 of ~276 for the cooperative
-build) — suggestive but not conclusive at that sample size, and unresolved.
-
-Updated 2026-08-10 (branch `better-sshd-and-networking`, fourth entry): +1 fix
-/ +1 doc — `userspace/meow/docs/MLX_SERVER_TOOL_CALLS.md` (Userspace Apps &
-Libraries), from the `userspace/meow` submodule advancing `f032e8a` →
-`2641cd1` (commits `0a3b256`/`244479d`/`2641cd1`). The fix: `meow`'s streaming
-client recognized a completed tool call by a literal byte match,
-`json.contains("\"finish_reason\":\"tool_calls\"")`
-(`userspace/meow/src/api/client.rs:757`), which only matches ollama's compact
-JSON serializer. `mlx-server` (Python `json.dumps` defaults) emits the same
-field with a space after the colon, `"finish_reason": "tool_calls"`; the
-literal match never fired, so `meow -c` against an mlx-server-backed provider
-silently dropped every tool call and returned an empty response. Confirmed
-fixed by reading the landed diff directly, not by trusting the doc header —
-`accumulate_tool_call_delta` now calls a new whitespace-tolerant
-`json_field_is` helper, matched exactly against the root cause and reproduction
-steps the doc describes. The doc's own `**Status: OPEN.**` header is stale
-(never updated after the fix landed same-day); counted on code evidence, per
-this file's existing practice of trusting a verified diff over an unmaintained
-status line.
-Not counted from the same submodule range: `TRIM_FAT.md`'s four
-double-allocation findings (all implemented, `Status: FIXED`, but explicitly
-"no behavior change" — allocation-efficiency cleanup on a `no_std`/talc target,
-not a correctness defect; same standard already applied to
-`ALLOC_PRINT_AUDIT.md`'s excluded "NOT WARRANTED" conversions above). Also from
-this branch, in the parent repo: `docs/archive/DEVBOX_ISSUES.md`'s two new
-issues (an HTTPS `git clone` pipe deadlock and a BKL-stuck TUI wedge, both
-**Status: OPEN**, zero fixes), `userspace/sshd/docs/OPTIONAL_PARALLELISM.md`
-(a design note, "not a landed feature"), the further acceptance-suite trim in
-`docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md` (continues to be a
-refactor/reorg, not a bugfix, per this file's existing treatment of that doc
-above), and a one-line path-reference update in
-`userspace/herd/docs/CORE_AWARE_SCHEDULING.md` (`acceptance/12` →
-`acceptance/archive/12`, following the same trim — not a fix).
-
-Updated 2026-08-10 (branch `trim-fat-sshd`, third entry): +2 fixes / +0 docs —
-both in `docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md`, both latent defects
-exposed by moving `smp-shared` into the default feature set (real SMP is now
-what `--release` builds). (1) `crates/akuma-exec/src/bkl.rs`: `KERNEL_LOCK` was
-`#[cfg(kernel_smp_shared)]` while every user is
-`#[cfg(all(kernel_smp_shared, target_os = "none"))]`, so the first host build
-that saw `smp-shared` carried the static unreferenced and tripped
-`dead_code = "deny"`. (2) `threading::disable_preemption()` called the panicking
-`runtime()` accessor for a diagnostic timestamp, breaking `PreemptGuard`'s
-documented "works … in host tests alike" contract and failing
-`akuma-ext2 tests::append_to_file`; it now probes `is_registered()` and degrades
-to `0`. Both dormant beforehand — the cause was compiling a configuration nobody
-had compiled, the same class as the unbuildable `build_devbox.sh` counted above.
-
-Not counted from the same range: deleting the in-kernel SSH server / shell /
-editor / TLS / cryptography (a removal, ~6,622 production lines — re-measured in
-`docs/archive/LINE_COUNT_ANALYSIS.md`), the profile consolidation 8 → 3, and
-removing the dead `FileSystem::append_file` trait method and its four
-implementations. All refactors, no defect fixed.
-
-Updated 2026-08-10 (branch `trim-fat-sshd`, second entry): +3 fixes / +2 docs —
-`docs/archive/BUILTIN_SSH_REMOVAL.md`. The fix is in
-`scripts/populate_disk.sh`: `busybox --install -s /mnt/disk/bin` links every
-applet to the path busybox was *invoked* as, i.e. the populate container's
-mount point, so 295 of the 304 symlinks in `/bin` dangled in the guest
-(`/bin/head -> /mnt/disk/bin/busybox`). Only the 9 written by the curated
-`ln -sf $BB` loops — relative targets — worked, which is why `/bin/sh` ran fine
-while `head`/`wc`/`sed`/`awk`/`ps` were "not found" on a disk that visibly had
-busybox and 300+ links. Replaced with `busybox --list` + relative `ln -sf`;
-verified on a repopulated image: 0 dangling, 304 total, all applets execute.
-Deterministic on every populate, not a double-run artifact.
-
-The second fix, from the same doc: the `[TESTS] low-mem … skipping boot
-self-test suite` message was printed with no `cfg` guard, so every `no-tests` /
-`size` image — which never compiled a suite at all — claimed at boot that it had
-skipped one. The extreme boot log had been saying this for months. The decision
-and its message now sit inside a block gated on the same
-`not(any(feature = "no-tests", kernel_profile_size))` as the suite itself;
-verified as 0 occurrences in a fresh 4.5 MB extreme boot that still reaches SSH.
-
-The third fix belongs to `docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md`:
-`scripts/build_devbox.sh` (the rump-only devbox, one of seven documented build
-targets) had been failing outright on `unused import:
-crate::runtime::PreemptGuard` (`crates/akuma-net/src/socket.rs:20`). The
-import's only consumer is `with_table`, which is `#[cfg(feature = "smoltcp")]`;
-the import carried no gate, so it was unused on exactly and only a build without
-the native stack. Given `unused_imports = "deny"` workspace-wide, that target had
-been unbuildable — pre-existing, confirmed by stashing this branch and
-reproducing. Import now carries its use site's gate; `build_devbox.sh` produces a
-1.8 MB image again. That doc's other findings (profile/feature pairing unenforced,
-`kernel_profile_size` also meaning extreme, stale size table, missing acceptance
-coverage for four targets, profile-dependent boot markers with profile-blind
-consumers) are observations, not fixes, and are uncounted.
-
-That doc's primary subject — compiling the in-kernel SSH server out of every
-profile but `extreme` — is a **removal/refactor, not a bugfix**, and is not
-counted here. Neither is the third defect it surfaced, which remains open and
-now has its own write-up: `docs/archive/FPCACHE_UNDERSIZED_AT_LOW_RAM.md`, the
-file-page dedup cache capped at `RAM/8` (`src/file_page_cache.rs:104`) — 144
-pages at 4.5 MB against busybox's 273, so `evict` tracks `misses` at 99%,
-concurrent busybox instances stop sharing text, and the box dies on `fork` with
-no `[OOM]` line. Zero-count, listed here so the doc is not mistaken for an
-omission.
-
-Updated 2026-08-10 (branch `rewrite-sshd-libc`): +1 fix / +1 doc —
-`userspace/sshd/docs/PROTOCOL_UNDER_LOAD.md`, an unauthenticated remote crash
-in userspace `sshd`'s packet framing (unchecked `packet_len - padding_len - 1`
-underflow, panic=abort takes the whole shared process down with every open
-session). Found while auditing the protocol for load-related issues, verified
-live against a fresh `devbox-smoltcp` SMP=4 boot, and fixed. The same bug in
-the **in-kernel** SSH server (`crates/akuma-ssh`, out of scope this session)
-was found and confirmed (full VM wedge, not just a process crash) but left
-unfixed — noted in `docs/archive/TRIM_FAT_SSHD.md`, not counted here.
-
-Updated 2026-08-07: +32 fixes / +19 docs, covering everything landed since
-commit `4c13831` (2026-08-01, when this file was last committed) through the
-`-j4` self-host thread-spawn-SIGSEGV investigation of 2026-08-02 – 2026-08-06,
-plus two bugs (`MPROTECT_TLB_ASID_BUG.md`, `FILE_PAGE_CACHE_MMAP_AMPLIFICATION.md`)
-moved here from inline writeups in `docs/reference/subsystems/thread-lifecycle.md`
-and `memory.md` that had no archive record of their own.
-
-Updated 2026-08-07 (second pass, commit `fb564f7` → `0794d81`): +4 fixes / +4
-docs — the concurrent `write()` fd-position TOCTOU race, the `-j4` hang's
-`kill_thread_group` stale-tid exit-stamp root cause (Failure D) plus its
-sibling ownership-race fix in the same investigation (Failure C), and the
-missing `clock_nanosleep` syscall that broke `std::thread::sleep()` on every
-build. `DEAD_CODE_SWEEP_FINDINGS.md` (nothing fixed, findings only) and
-`LINE_COUNT_ANALYSIS.md` (stats/analysis, not a bugfix) added from the same
-range as explicitly zero-count; `J4_HANG_LIVE_AUTOPSY.md` is the verbatim
-session record for the stale-tid fix, counted once under
-`KTG_STALE_TID_EXIT_STAMP_J4_HANG.md`.
-
-Updated 2026-08-08: +11 fixes / +2 docs — the box isolation audit
-(`BOX_ISOLATION_SECURITY_FIXES.md`, 9 fixes) and herd's signal-vs-clean-exit
-handling (`userspace/herd/docs/SIGNAL_EXIT_HANDLING.md`, 2 fixes; moved out of
-the zero-count list below, where it sat as "proposed, not implemented"). The box
-items are unusual for this file in that eight of the nine were *never-enforced
-boundaries* rather than regressions: the permission logic existed in
-`crates/akuma-exec/src/box_mod/` with passing unit tests and no callers.
-
-Updated 2026-08-09: +7 fixes / +4 docs, covering the `-j4` self-host
-stabilization campaign of 2026-08-08 – 2026-08-09 (commits `6a0ae74`…`5e2a222`).
-Three new docs land under SMP & Locking: `PMM_TALC_LOCK_CYCLE_SILENT_WEDGE.md`
-(1 fix — the silent all-core wedge, previously misfiled as a BKL symptom),
-`PAGE_TABLE_UAF_BKL_STORM.md` (2 fixes — the `execve`-siblings POSIX gap and
-the per-core live-TTBR0 registry that closed the page-table-freed-under-a-
-running-core storm), and `CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` (3 fixes —
-`sys_munmap`'s single-region-match gap, the BKL's lost-FIFO-ticket-on-barge
-bug, and the stale-write-fault-absorbed fix for the CoW-break loser race;
-its cargo-null-`Rc` namesake defect itself remains open). One new doc lands
-under Console & Terminal: `SERIAL_TRACE_TRAFFIC_AUDIT.md` (1 fix — a dead
-`DEMAND_PAGE_LOG_ENABLED` flag left the largest per-event kernel trace
-ungated, saturating the shared UART under parallel load). `TRIM_FAT_PART_3.md`
-and edits to five already-zero-counted docs (marking `crush`/`needle-server`/
-`qjs`/`stdcheck`/`top` as removed) added to the zero-count list, contributing
-nothing.
-
-Updated 2026-08-09 (second pass, branch `fix-alloc-print`): +7 fixes / +1 doc —
-`ALLOC_PRINT_AUDIT.md`'s remediation pass (§7), all under Console & Terminal.
-Five are heap allocations feeding the kernel console, of which one is the only
-such violation ever found inside the sync-EL1 crash-handler call tree
-(`pmm::dp_counters_line()`); the other two are a stale boot self-test that
-hung every SMP=4 boot and a symbol-window bug that had been silently
-disabling `lockprobe.py`'s automatic storm captures. The audit's §1-§6 survey
-itself contributed zero fixes when it was written (read-only by design) and is
-counted here only for the §7 pass that closed it. The 59 "NOT WARRANTED"
-`safe_print!` conversions in the same branch are **not** counted: the audit is
-explicit that they were consistency/verbosity debt and "none of this is a
-correctness bug".
-
-Updated 2026-08-09 (third pass, branch `fix-extreme-size`): +3 fixes / +1 doc —
-`EXTREME_SIZE_BUILD_FIX.md`, all under Misc / Cross-cutting. Two are the
-`extreme-size` build breakage (a `#[cfg]` that had drifted onto the wrong `mod`,
-and a container-gated helper called from ungated syscalls); the third is the
-same stray attribute's silent side effect, `fw_cfg` left un-gated in
-`release`/`size` since June. Unusual for this file in that none of the three
-were runtime regressions — two were compile failures in a profile nobody had
-built since `37be208`, and the third was invisible precisely *because* it kept
-compiling. The doc's `curl` matrix and its two open defects (intermittent
-`/bin/curl` EL1 fault on extreme, ~11 % of boots; `mv`-then-exec resolving a
-stale directory entry) are **not** counted — neither is fixed.
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 116 | 21.7% | 15 |
-| Memory & Virtual Memory | 89 | 16.6% | 25 |
-| Scheduler & Process Management | 72 | 13.5% | 16 |
-| SMP & Locking | 65 | 12.1% | 27 |
-| Networking | 30 | 5.6% | 12 |
-| Userspace Apps & Libraries | 32 | 6.0% | 16 |
-| Rump Kernel & Syscall Proxy | 24 | 4.5% | 5 |
-| Toolchain & Self-Hosting | 31 | 5.8% | 4 |
-| SSH | 13 | 2.4% | 11 |
+| Syscall / ABI Compatibility Audits | 116 | 21.2% | 15 |
+| Memory & Virtual Memory | 89 | 16.3% | 25 |
+| Scheduler & Process Management | 74 | 13.5% | 17 |
+| SMP & Locking | 68 | 12.4% | 28 |
+| Networking | 31 | 5.7% | 13 |
+| Userspace Apps & Libraries | 33 | 6.0% | 17 |
+| Rump Kernel & Syscall Proxy | 24 | 4.4% | 5 |
+| Toolchain & Self-Hosting | 31 | 5.7% | 4 |
+| SSH | 14 | 2.6% | 12 |
 | VFS & Filesystem | 13 | 2.4% | 9 |
-| Boot & Drivers | 9 | 1.7% | 5 |
-| Signals & Exceptions | 10 | 1.9% | 4 |
-| Misc / Cross-cutting | 11 | 2.1% | 2 |
-| Console & Terminal | 11 | 2.1% | 5 |
-| Containers | 10 | 1.9% | 2 |
-| **Total** | **536** | **100.0%** | **158** |
+| Boot & Drivers | 9 | 1.6% | 5 |
+| Signals & Exceptions | 10 | 1.8% | 4 |
+| Misc / Cross-cutting | 13 | 2.4% | 3 |
+| Console & Terminal | 11 | 2.0% | 5 |
+| Containers | 11 | 2.0% | 2 |
+| **Total** | **547** | **100.0%** | **164** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -647,7 +407,7 @@ stale directory entry) are **not** counted — neither is fixed.
 - `test_thread_slot_reclaim_on_spawn` assumed its fill-and-terminate loop always ran under the 10ms reclaim cooldown, an assumption that depended on thread 0's old preemption immunity; fixed by measuring elapsed time and only asserting zero-reclaim when it's provably still inside the cooldown window
 
 
-## SMP & Locking (65 fixes, 27 docs)
+## SMP & Locking (68 fixes, 28 docs)
 
 ### docs/archive/SMP_SHARED.md
 - M2c bug 1: 16KiB secondary stack overflow
@@ -769,6 +529,12 @@ stale directory entry) are **not** counted — neither is fixed.
 - §12.4/§12.7: the BKL's out-of-band `acquire_no_ticket` barge (the BKL-free EL0-preempt reconcile) compensated with a `next_ticket.fetch_add(1)` that kept the ticket counters equal in aggregate, but a waiter that lost the ownership CAS at its own turn abandoned its allocated ticket for a fresh one with nothing left to ever advance `now_serving` past the abandoned slot — a genuinely lost FIFO ticket producing `[BKL] stuck owner=0` storms (lock reads *idle* while cores spin) until a 20M-spin self-heal forced recovery; fixed by having a waiter that loses that CAS keep its ticket and keep spinning in place instead of re-ticketing, and by having the barge leave the ticket queue completely untouched on both acquire and release
 - §12.2–§12.4: on a multi-threaded `fork()`, every sibling thread that touches the same demoted page faults at once; the first thread through `fault_slot_acquire` breaks CoW and repairs the PTE, but the threads behind it — now holding a fault for a write that is already legal — had no repair path for pages with no lazy/eager region record (an ELF `.data`/`.bss` page from the image loader is never registered as either), so they fell through to a spurious SIGSEGV and took the whole `CLONE_VM` process down with them; fixed via `stale_write_fault_absorbed`, re-reading the PTE at EL0 permission-fault entry and absorbing (invalidate + retry) whenever it already grants the write, budgeted per-(VA, PTE) so a genuinely-declined repair still runs; A/B-verified 10/10 and 8/8 probe SIGSEGVs → 0
 
+### docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md
+(latent build-config defects exposed by moving `smp-shared` into the default feature set, i.e. compiling a configuration nobody had compiled before)
+- `crates/akuma-exec/src/bkl.rs`'s `KERNEL_LOCK` was gated `#[cfg(kernel_smp_shared)]` while every consumer required `target_os = "none"` too, so the first host build compiling `smp-shared` carried it unreferenced and tripped `dead_code = "deny"`
+- `threading::disable_preemption()` called the panicking `runtime()` accessor for a diagnostic timestamp, breaking `PreemptGuard`'s "works in host tests too" contract and failing `akuma-ext2 tests::append_to_file`; now probes `is_registered()` and degrades to `0`
+- `crates/akuma-net/src/socket.rs`'s `PreemptGuard` import, consumed only by the `smoltcp`-gated `with_table`, carried no gate of its own, tripping `unused_imports = "deny"` on any build without the native stack — `scripts/build_devbox.sh` had been unbuildable; import now carries its use site's gate
+
 
 ## Networking (31 fixes, 13 docs)
 
@@ -830,7 +596,7 @@ stale directory entry) are **not** counted — neither is fixed.
 - `force-legacy` incorrectly defaulted to true, masking the modern VirtIO MMIO v2 path
 
 
-## Userspace Apps & Libraries (32 fixes, 16 docs)
+## Userspace Apps & Libraries (33 fixes, 17 docs)
 
 ### docs/archive/DOOM.md
 - SIGSEGV in `R_Init` — `strncpy` stub off-by-one corrupted an adjacent struct field
@@ -895,6 +661,9 @@ stale directory entry) are **not** counted — neither is fixed.
 ### userspace/herd/docs/SIGNAL_EXIT_HANDLING.md
 - herd reaped with `waitpid`, which returns `WEXITSTATUS` only, so a service killed by a signal decoded as exit code 0 and took the clean-exit branch — respawning with no `restart_delay_ms`, `restart_count` reset to 0, `max_retries` never consulted and `ServiceState::Failed` unreachable (a service crashing on startup became a hot restart loop); now reaped with `waitpid_status` and classified through the host-tested `herd::exit::classify`, recording `shell_code()` (128+signal)
 - `stop_service` called `libakuma::kill`, which hardcodes signal 0 — the kernel's existence probe, never delivered — so herd cleared `svc.pid`, marked the service `Stopped` and left the process running unsupervised while `start_stopped_services` spawned a second copy; now sends a real SIGTERM via the new `libakuma::kill_signal`
+
+### userspace/meow/docs/MLX_SERVER_TOOL_CALLS.md
+- `meow`'s streaming client recognized a completed tool call by a literal byte match, `json.contains("\"finish_reason\":\"tool_calls\"")`, which only matches ollama's compact JSON serializer; `mlx-server`'s spaced `"finish_reason": "tool_calls"` never matched, silently dropping every tool call; fixed via a whitespace-tolerant `json_field_is` helper
 
 
 ## Rump Kernel & Syscall Proxy (24 fixes, 5 docs)
@@ -1096,7 +865,7 @@ stale directory entry) are **not** counted — neither is fixed.
 - The `EC=0x0` (undefined-instruction) exception handler hard-killed the process instead of delivering SIGILL, so OpenSSL's ARM-feature-probe idiom (deliberately executing an unsupported instruction inside a SIGILL handler) could never recover, crashing nightly `cargo` under HVF at a fixed PC (`SM3SS1`, FEAT_SM3); fixed by routing `EC=0x0` through `try_deliver_signal` like the other fatal-fault arms
 
 
-## Misc / Cross-cutting (11 fixes, 2 docs)
+## Misc / Cross-cutting (13 fixes, 3 docs)
 
 ### docs/archive/EXTREME_SIZE_BUILD_FIX.md
 - `mod file_page_cache;` was declared under a `#[cfg(feature = "sc-framebuffer")]`
@@ -1122,6 +891,10 @@ stale directory entry) are **not** counted — neither is fixed.
 - akuma-net extraction: missing explicit `String` type annotation broke build
 - HTTPS `curl` returned "Read error"
 - Bug 13: IrqGuard DAIF save/restore regression
+
+### docs/archive/BUILTIN_SSH_REMOVAL.md
+- `scripts/populate_disk.sh`'s `busybox --install -s /mnt/disk/bin` linked every applet to the path busybox was *invoked* as (the populate container's mount point), dangling 295 of 304 `/bin` symlinks in the guest (`/bin/head -> /mnt/disk/bin/busybox`); replaced with `busybox --list` + relative `ln -sf`
+- The `[TESTS] low-mem … skipping boot self-test suite` message printed with no `cfg` guard, so every `no-tests`/`size` image — which never compiled a suite at all — falsely claimed at boot that it had skipped one; now gated on the same condition as the suite itself
 
 
 ## Console & Terminal (11 fixes, 5 docs)
@@ -1149,7 +922,7 @@ stale directory entry) are **not** counted — neither is fixed.
 - Three per-event kernel traces (`[IA-DP] file region:` demand-page, `[pipe]` lifecycle, `[mmap]`/`[mprotect]`) printed unconditionally, saturating the single shared UART under a parallel `-j4` build (~270 KB/s, a 115200-baud line ~20x over-saturated) and serializing every logging core on the console lock — turning an in-VM self-host build from "never completes in over an hour" into a 2m21s green run once gated; `DEMAND_PAGE_LOG_ENABLED`, the flag meant to gate the largest of the three, was dead — defined and documented but with zero readers anywhere in the tree — so fixing it required wiring a live check, not flipping an existing one
 
 
-## Containers (10 fixes, 2 docs)
+## Containers (11 fixes, 2 docs)
 
 ### docs/archive/BOX_CONTAINERS.md
 - Arguments were not passed to containerized processes
