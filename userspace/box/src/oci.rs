@@ -276,11 +276,25 @@ pub fn pull_image(image_str: &str) -> Result<(), String> {
     let config_json = fetch_config(&image, &manifest.config_digest, &token)?;
 
     images::prepare_image_dir(&store_name)?;
-    let rootfs = images::rootfs_dir(&store_name);
 
     let total = manifest.layer_digests.len();
     for (i, digest) in manifest.layer_digests.iter().enumerate() {
         let short = if digest.len() > 19 { &digest[7..19] } else { digest.as_str() };
+        let dest = images::layer_dir(digest);
+
+        // Layers are content-addressed, so one already on disk is byte-identical
+        // to the one this manifest names — skip the download entirely.
+        if images::dir_exists(&dest) {
+            print("  Layer ");
+            print_dec(i + 1);
+            print("/");
+            print_dec(total);
+            print(" (");
+            print(short);
+            print(") already present\n");
+            continue;
+        }
+
         print("  Downloading layer ");
         print_dec(i + 1);
         print("/");
@@ -292,43 +306,30 @@ pub fn pull_image(image_str: &str) -> Result<(), String> {
         let tmp_path = format!("/tmp/oci-layer-{}.tar.gz", i);
         download_layer(&image, digest, &token, &tmp_path)?;
 
-        {
-            let sz_fd = libakuma::open(&tmp_path, 0);
-            if sz_fd >= 0 {
-                let mut total: usize = 0;
-                let mut probe = [0u8; 4096];
-                let n0 = libakuma::read_fd(sz_fd, &mut probe);
-                if n0 > 0 {
-                    total += n0 as usize;
-                    print("  Layer file header: ");
-                    for b in &probe[..core::cmp::min(n0 as usize, 10)] {
-                        print(&format!("{:02x} ", b));
-                    }
-                    print("\n");
-                    loop {
-                        let n = libakuma::read_fd(sz_fd, &mut probe);
-                        if n <= 0 { break; }
-                        total += n as usize;
-                    }
-                }
-                libakuma::close(sz_fd);
-                print("  Layer file size: ");
-                print_dec(total);
-                print(" bytes\n");
-            }
-        }
-
         print("  Extracting layer ");
         print_dec(i + 1);
         print("/");
         print_dec(total);
         print("...\n");
 
-        extract_layer(&tmp_path, &rootfs)?;
+        // Extract into a staging directory and rename it into place, so an
+        // interrupted pull can never leave a half-populated directory that the
+        // check above would then accept as complete.
+        let staging = format!("{}.tmp", dest);
+        if !libakuma::mkdir_p(&staging) {
+            return Err(format!("failed to create {}", staging));
+        }
+        extract_layer(&tmp_path, &staging)?;
         unlink(&tmp_path);
+
+        let rc = libakuma::rename(&staging, &dest);
+        if rc < 0 {
+            return Err(format!("failed to publish layer {}: errno {}", short, -rc));
+        }
     }
 
     images::save_config(&store_name, &config_json)?;
+    images::save_layers(&store_name, &manifest.layer_digests)?;
 
     print("  Image stored as '");
     print(&store_name);

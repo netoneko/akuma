@@ -38,6 +38,23 @@ impl MountNamespace {
         Ok(())
     }
 
+    /// Mount `fs` at `path`, replacing whatever is already mounted there.
+    ///
+    /// The one caller is the overlay mount: a box's namespace is born with a
+    /// `SubdirFs` at `/` (`create_box_namespace`), and turning that root into an
+    /// overlay means swapping it, not stacking on it. There is deliberately no
+    /// syscall that reaches this for `/` from userspace — `umount2` refuses to
+    /// let a box drop the floor it stands on, and this must not become a way
+    /// around that.
+    pub fn mount_replace(&mut self, path: &str, fs: Arc<dyn Filesystem>) {
+        self.mounts.retain(|m| m.path != path);
+        self.mounts.push(NsMountEntry {
+            path: String::from(path),
+            fs,
+        });
+        self.mounts.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+    }
+
     pub fn unmount(&mut self, path: &str) -> Result<(), FsError> {
         let idx = self
             .mounts
@@ -163,5 +180,58 @@ impl MountNamespace {
 impl Default for MountNamespace {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use akuma_vfs::MemoryFilesystem;
+
+    /// A filesystem carrying one marker file, so `resolve` results are
+    /// distinguishable by content.
+    fn tagged(tag: &str) -> Arc<dyn Filesystem> {
+        let fs = MemoryFilesystem::new();
+        fs.write_file("/tag", tag.as_bytes()).unwrap();
+        Arc::new(fs)
+    }
+
+    /// Which filesystem `path` resolves to. A `/` mount is handed the whole
+    /// path rather than a relative one, so the marker is read by its own name.
+    fn tag_at(ns: &MountNamespace, path: &str) -> String {
+        let (fs, _rel) = ns.resolve(path).expect("nothing mounted for path");
+        String::from_utf8(fs.read_file("/tag").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn mount_rejects_a_duplicate_but_replace_swaps_it() {
+        let mut ns = MountNamespace::new();
+        ns.mount("/", tagged("subdir")).unwrap();
+        assert_eq!(ns.mount("/", tagged("overlay")).unwrap_err(), FsError::AlreadyExists);
+        assert_eq!(tag_at(&ns, "/tag"), "subdir");
+
+        ns.mount_replace("/", tagged("overlay"));
+
+        assert_eq!(tag_at(&ns, "/tag"), "overlay");
+        assert_eq!(ns.list_mounts().len(), 1, "replace must not leave the old entry behind");
+    }
+
+    #[test]
+    fn replacing_the_root_leaves_deeper_mounts_winning() {
+        let mut ns = MountNamespace::new();
+        ns.mount("/", tagged("root")).unwrap();
+        ns.mount("/proc", tagged("proc")).unwrap();
+
+        ns.mount_replace("/", tagged("overlay"));
+
+        assert_eq!(tag_at(&ns, "/proc/tag"), "proc");
+        assert_eq!(tag_at(&ns, "/etc/tag"), "overlay");
+    }
+
+    #[test]
+    fn replace_on_an_empty_namespace_is_just_a_mount() {
+        let mut ns = MountNamespace::new();
+        ns.mount_replace("/", tagged("overlay"));
+        assert_eq!(tag_at(&ns, "/tag"), "overlay");
     }
 }

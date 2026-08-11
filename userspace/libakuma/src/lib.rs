@@ -116,6 +116,8 @@ pub mod syscall {
     pub const GETEUID: u64 = 175;
     pub const MOUNT: u64 = 40;
     pub const UMOUNT2: u64 = 39;
+    pub const MOUNT_IN_NS: u64 = 325;
+    pub const FCHMODAT: u64 = 53;
     pub const CLONE: u64 = 220;
     pub const WAIT4: u64 = 260;
 }
@@ -1159,6 +1161,68 @@ pub fn mount(source: &str, target: &str, fstype: &str) -> i32 {
         0, // flags
         0, 0,
     ) as i32
+}
+
+/// Change a file's permission bits.
+pub fn chmod(path: &str, mode: u32) -> i32 {
+    let path_c = alloc::format!("{}\0", path);
+    syscall(
+        syscall::FCHMODAT,
+        -100i32 as u64, // AT_FDCWD
+        path_c.as_ptr() as u64,
+        u64::from(mode),
+        0,
+        0, 0,
+    ) as i32
+}
+
+/// Remove an empty directory.
+pub fn rmdir(path: &str) -> i32 {
+    const AT_REMOVEDIR: u64 = 0x200;
+    let path_c = alloc::format!("{}\0", path);
+    syscall(
+        syscall::UNLINKAT,
+        -100i32 as u64, // AT_FDCWD
+        path_c.as_ptr() as u64,
+        AT_REMOVEDIR,
+        0,
+        0, 0,
+    ) as i32
+}
+
+/// Mount a filesystem into another box's mount namespace.
+///
+/// Callable only from box 0 — the kernel returns `EPERM` otherwise. `fstype`
+/// takes the same values as [`mount`] plus `"overlay"`, which is the only one
+/// that reads `data`.
+pub fn mount_in_ns(box_id: u64, target: &str, fstype: &str, data: Option<&str>) -> i32 {
+    let target_c = alloc::format!("{}\0", target);
+    let fstype_c = alloc::format!("{}\0", fstype);
+    let data_c = data.map(|d| alloc::format!("{}\0", d));
+    syscall(
+        syscall::MOUNT_IN_NS,
+        box_id,
+        target_c.as_ptr() as u64,
+        target.len() as u64,
+        fstype_c.as_ptr() as u64,
+        fstype.len() as u64,
+        data_c.as_ref().map_or(0, |d| d.as_ptr() as u64),
+    ) as i32
+}
+
+/// Mount an OCI-style overlay as a box's root: read-only image layers
+/// (topmost-first) with a writable container directory on top.
+pub fn mount_overlay_root(box_id: u64, lowerdirs: &[alloc::string::String], upperdir: &str) -> i32 {
+    let mut data = alloc::string::String::from("lowerdir=");
+    for (i, dir) in lowerdirs.iter().enumerate() {
+        if i > 0 {
+            data.push(':');
+        }
+        data.push_str(dir);
+    }
+    data.push_str(",upperdir=");
+    data.push_str(upperdir);
+    mount_in_ns(box_id, "/", "overlay", Some(&data))
 }
 
 /// Unmount a filesystem.

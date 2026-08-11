@@ -22,6 +22,7 @@ extern crate alloc;
 mod json;
 mod oci;
 mod images;
+mod run;
 mod tests;
 
 use libakuma::{exit, print, args, open, read_fd, write_fd, close, open_flags, SpawnResult, waitpid, println, read_dir, mkdir, fstat, mkdir_p, get_cpu_stats, ThreadCpuStat};
@@ -46,7 +47,7 @@ const SYSCALL_SPAWN_EXT: u64 = 315;
 const SYSCALL_REGISTER_BOX: u64 = 316;
 const SYSCALL_KILL_BOX: u64 = 317;
 
-fn spawn_ext(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, options: &mut SpawnOptions) -> Option<SpawnResult> {
+pub fn spawn_ext(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, options: &mut SpawnOptions) -> Option<SpawnResult> {
     let mut argv = Vec::new();
     let path_terminated = format!("{}\0", path);
     argv.push(path_terminated.as_ptr());
@@ -93,7 +94,8 @@ pub extern "C" fn main() {
     };
 
     match command {
-        "open" | "run" => cmd_open(args_iter),
+        "open" => cmd_open(args_iter),
+        "run" => run::cmd_run(args_iter),
         "pull" => cmd_pull(args_iter),
         "images" => cmd_images(),
         "cp" => cmd_cp(args_iter),
@@ -114,6 +116,7 @@ pub extern "C" fn main() {
 fn print_usage() {
     print("box - Container management utility\n\n");
     print("Usage:\n");
+    print("  box run [--rm] [-d] [-i] [--name X] <image> [cmd ...]     Run a container\n");
     print("  box open <name> [-i <img>] [-d] [--root <dir>] [cmd] [args...]             Start a box\n");
     print("  box pull <image>                                          Pull an OCI image\n");
     print("  box images                                                List pulled images\n");

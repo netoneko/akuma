@@ -4,6 +4,7 @@ extern crate alloc;
 
 pub mod mount;
 pub mod net;
+pub mod overlay_fs;
 pub mod subdir_fs;
 
 use alloc::sync::Arc;

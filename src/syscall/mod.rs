@@ -1072,7 +1072,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(feature = "sc-containers")]
         nr::UMOUNT2 => container::sys_umount2(args[0], args[1] as i32),
         #[cfg(feature = "sc-containers")]
-        nr::MOUNT_IN_NS => container::sys_mount_in_ns(args[0], args[1], args[2] as usize, args[3], args[4] as usize),
+        nr::MOUNT_IN_NS => container::sys_mount_in_ns(args[0], args[1], args[2] as usize, args[3], args[4] as usize, args[5]),
         _ => {
             crate::safe_print!(128, "[ENOSYS] nr={} pid={} args=[0x{:x}, 0x{:x}, 0x{:x}]\n",
                 syscall_num, akuma_exec::process::read_current_pid().unwrap_or(0),

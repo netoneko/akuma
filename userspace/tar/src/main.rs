@@ -302,6 +302,7 @@ fn untar_streaming(archive_path: &str, target_dir: &str, verbose: bool) -> Resul
             remaining -= n;
         }
         close(out_fd);
+        apply_mode(&full_path, &header);
 
         // Read past padding to next 512-byte boundary
         let padding = padded_size(size) - (size - remaining);
@@ -317,6 +318,21 @@ fn untar_streaming(archive_path: &str, target_dir: &str, verbose: bool) -> Resul
     println(" entries");
 
     Ok(())
+}
+
+/// Apply the archived permission bits to an extracted file.
+///
+/// Without this every file lands with the creating process's default mode. That
+/// is invisible until something checks: a shell searching `PATH` calls
+/// `access(X_OK)` and refuses a 0644 binary with "Permission denied", which is
+/// exactly how an extracted container image fails to run its own commands.
+/// Only the permission bits are taken; the type bits belong to how the entry was
+/// created.
+fn apply_mode(path: &str, header: &[u8]) {
+    let mode = parse_octal(&header[100..108]) & 0o7777;
+    if mode != 0 {
+        libakuma::chmod(path, mode as u32);
+    }
 }
 
 /// In-memory tar extraction for gzip archives (decompression requires full data).
@@ -457,6 +473,7 @@ fn untar_in_memory(archive_path: &str, target_dir: &str, verbose: bool) -> Resul
                 write_fd(fd, file_data);
             }
             close(fd);
+            apply_mode(&full_path, &hdr);
         } else if verbose {
             eprintln(&format!("tar: error: failed to create file {}: errno {}", full_path, -fd));
         }

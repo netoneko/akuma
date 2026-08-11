@@ -4,6 +4,11 @@ use alloc::vec::Vec;
 use libakuma::{open, close, read_fd, write_fd, open_flags, mkdir_p, read_dir};
 
 const IMAGES_BASE: &str = "/var/lib/box/images";
+/// Extracted layers, keyed by digest and shared across every image that
+/// references them. An image directory holds only metadata.
+const LAYERS_BASE: &str = "/var/lib/box/layers";
+/// Where per-container writable upper directories live.
+const CONTAINERS_BASE: &str = "/var/lib/box/containers";
 
 pub fn image_dir(name: &str) -> String {
     format!("{}/{}", IMAGES_BASE, name)
@@ -15,6 +20,38 @@ pub fn rootfs_dir(name: &str) -> String {
 
 pub fn config_path(name: &str) -> String {
     format!("{}/{}/oci-config.json", IMAGES_BASE, name)
+}
+
+pub fn layers_path(name: &str) -> String {
+    format!("{}/{}/layers", IMAGES_BASE, name)
+}
+
+/// `sha256:abc…` → `/var/lib/box/layers/sha256-abc…`. A digest is already
+/// filename-safe apart from its separator.
+pub fn layer_dir(digest: &str) -> String {
+    format!("{}/{}", LAYERS_BASE, digest.replace(':', "-"))
+}
+
+pub fn container_dir(id: &str) -> String {
+    format!("{}/{}", CONTAINERS_BASE, id)
+}
+
+pub fn container_upper(id: &str) -> String {
+    format!("{}/{}/upper", CONTAINERS_BASE, id)
+}
+
+/// Whether anything exists at `path` — file, directory or symlink.
+pub fn path_exists(path: &str) -> bool {
+    let path_c = format!("{}\0", path);
+    libakuma::fstatat(-100, &path_c, 0).is_ok()
+}
+
+pub fn dir_exists(path: &str) -> bool {
+    let path_c = format!("{}\0", path);
+    match libakuma::fstatat(-100, &path_c, 0) {
+        Ok(st) => st.st_mode & 0o170_000 == 0o040_000,
+        Err(_) => false,
+    }
 }
 
 pub fn sanitize_name(image_str: &str) -> String {
@@ -32,15 +69,66 @@ pub fn sanitize_name(image_str: &str) -> String {
 
 pub fn ensure_base_dir() {
     mkdir_p(IMAGES_BASE);
+    mkdir_p(LAYERS_BASE);
+    mkdir_p(CONTAINERS_BASE);
 }
 
 pub fn prepare_image_dir(name: &str) -> Result<(), String> {
     ensure_base_dir();
-    let rootfs = rootfs_dir(name);
-    if !mkdir_p(&rootfs) {
-        return Err(format!("failed to create {}", rootfs));
+    let dir = image_dir(name);
+    if !mkdir_p(&dir) {
+        return Err(format!("failed to create {}", dir));
     }
     Ok(())
+}
+
+/// Record the image's layers, base-first, as the registry ordered them.
+pub fn save_layers(name: &str, digests: &[String]) -> Result<(), String> {
+    let mut body = String::new();
+    for d in digests {
+        body.push_str(d);
+        body.push('\n');
+    }
+    let path = layers_path(name);
+    let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
+    if fd < 0 {
+        return Err(format!("failed to write {}", path));
+    }
+    write_fd(fd, body.as_bytes());
+    close(fd);
+    Ok(())
+}
+
+/// The image's layer digests, base-first.
+pub fn load_layers(name: &str) -> Vec<String> {
+    let path = layers_path(name);
+    let fd = open(&path, open_flags::O_RDONLY);
+    if fd < 0 {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        let n = read_fd(fd, &mut tmp);
+        if n <= 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n as usize]);
+    }
+    close(fd);
+
+    core::str::from_utf8(&buf).map_or_else(
+        |_| Vec::new(),
+        |s| s.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect(),
+    )
+}
+
+/// The image's layer directories in overlay lookup order — **topmost-first**,
+/// i.e. the reverse of the order the registry applies them.
+pub fn overlay_lowerdirs(name: &str) -> Vec<String> {
+    let mut dirs: Vec<String> = load_layers(name).iter().map(|d| layer_dir(d)).collect();
+    dirs.reverse();
+    dirs
 }
 
 pub fn save_config(name: &str, config_json: &str) -> Result<(), String> {

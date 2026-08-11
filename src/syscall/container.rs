@@ -150,7 +150,55 @@ pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> u64 {
     }
 }
 
-pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, fstype_ptr: u64, fstype_len: usize) -> u64 {
+/// Build an `OverlayFs` from a `lowerdir=…,upperdir=…` option string.
+///
+/// Every layer becomes a `SubdirFs` over the **global** root filesystem, not the
+/// box's — the layer store lives outside any container, and the box is only ever
+/// handed the union. Each directory has to exist and be a directory: a typo that
+/// silently produced an empty layer would surface much later as a missing file
+/// inside the container, with nothing pointing back here.
+#[cfg(feature = "sc-containers")]
+fn build_overlay(data_ptr: u64) -> Result<alloc::sync::Arc<dyn crate::vfs::Filesystem>, u64> {
+    use akuma_isolation::overlay_fs::{OverlayFs, parse_options};
+
+    if data_ptr == 0 {
+        return Err(EINVAL);
+    }
+    let data = copy_from_user_str(data_ptr, 4096)?;
+
+    let opts = parse_options(&data).map_err(|reason| {
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(192, "[mount] overlay options rejected: {}\n", reason);
+        }
+        EINVAL
+    })?;
+
+    let root_fs = crate::vfs::get_root_fs().ok_or(ENODEV)?;
+
+    let mut dirs = alloc::vec::Vec::with_capacity(opts.lowerdirs.len() + 1);
+    dirs.push(crate::vfs::canonicalize_path(&opts.upperdir));
+    for lower in &opts.lowerdirs {
+        dirs.push(crate::vfs::canonicalize_path(lower));
+    }
+
+    let mut layers = alloc::vec::Vec::with_capacity(dirs.len());
+    for dir in &dirs {
+        if !crate::vfs::metadata(dir).is_ok_and(|m| m.is_dir) {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(192, "[mount] overlay layer missing: {}\n", dir);
+            }
+            return Err(ENOENT);
+        }
+        layers.push(alloc::sync::Arc::new(
+            akuma_isolation::subdir_fs::SubdirFs::new(root_fs.clone(), dir),
+        ) as alloc::sync::Arc<dyn crate::vfs::Filesystem>);
+    }
+
+    let upper = layers.remove(0);
+    Ok(alloc::sync::Arc::new(OverlayFs::new(upper, layers)))
+}
+
+pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, fstype_ptr: u64, fstype_len: usize, data_ptr: u64) -> u64 {
     let caller_box = akuma_exec::process::current_process_shared()
         .map_or(0, |p| p.box_id);
     if caller_box != 0 {
@@ -177,8 +225,22 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
     let fs: alloc::sync::Arc<dyn crate::vfs::Filesystem> = match fstype {
         "proc" => alloc::sync::Arc::new(crate::vfs::proc::ProcFilesystem::new()),
         "tmpfs" => alloc::sync::Arc::new(akuma_vfs::MemoryFilesystem::new()),
+        "overlay" => match build_overlay(data_ptr) {
+            Ok(fs) => fs,
+            Err(e) => return e,
+        },
         _ => return ENODEV,
     };
+
+    // A box's namespace already has its `SubdirFs` jail at "/", and an overlay
+    // root replaces that jail rather than stacking on it — `mount` would reject
+    // the duplicate. Anywhere else, a duplicate really is a caller error.
+    if target == "/" {
+        return match crate::vfs::mount_replace_in_namespace(box_id, &target, fs) {
+            Ok(()) => 0,
+            Err(_) => EINVAL,
+        };
+    }
 
     match crate::vfs::mount_in_namespace(box_id, &target, fs) {
         Ok(()) => 0,
