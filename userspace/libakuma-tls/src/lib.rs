@@ -109,12 +109,12 @@ impl<'a> TlsStream<'a> {
 
     /// Read data from the TLS connection
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        self.conn.read(buf).map_err(|_| Error::IoError) // Reverted to generic IoError
+        self.conn.read(buf).map_err(Error::TlsError)
     }
 
     /// Write data to the TLS connection
     pub fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
-        self.conn.write(buf).map_err(|_| Error::IoError) // Reverted to generic IoError
+        self.conn.write(buf).map_err(Error::TlsError)
     }
 
     /// Write all data to the TLS connection
@@ -122,7 +122,7 @@ impl<'a> TlsStream<'a> {
         while !buf.is_empty() {
             let n = self.write(buf)?;
             if n == 0 {
-                return Err(Error::IoError); // Reverted to generic IoError
+                return Err(Error::IoError);
             }
             buf = &buf[n..];
         }
@@ -131,7 +131,7 @@ impl<'a> TlsStream<'a> {
 
     /// Flush the TLS connection
     pub fn flush(&mut self) -> Result<(), Error> {
-        self.conn.flush().map_err(|_| Error::IoError) // Reverted to generic IoError
+        self.conn.flush().map_err(Error::TlsError)
     }
 
     /// Close the TLS connection gracefully

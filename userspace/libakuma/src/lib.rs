@@ -138,10 +138,15 @@ pub struct ThreadCpuStat {
 }
 
 /// File descriptors
+///
+/// `i32` to match every other fd-taking wrapper in this crate (`read_fd`,
+/// `write_fd`, `close`, `fstat`, `lseek`, `recv`, ...) — `read`/`write` used
+/// to be the lone `u64` exception, forcing an `as u64` at every call site
+/// that held a real fd. `docs/archive/LIBAKUMA_AUDIT.md` item 10.
 pub mod fd {
-    pub const STDIN: u64 = 0;
-    pub const STDOUT: u64 = 1;
-    pub const STDERR: u64 = 2;
+    pub const STDIN: i32 = 0;
+    pub const STDOUT: i32 = 1;
+    pub const STDERR: i32 = 2;
 }
 
 /// Fixed address for process info page (read-only, set by kernel)
@@ -219,24 +224,37 @@ pub fn geteuid() -> u32 {
 }
 
 /// Get the current working directory
+///
+/// The syscall and buffer validation happen under `CWD_LOCK`, so two threads
+/// calling `getcwd()` concurrently can no longer race the write to the
+/// shared buffer (the previous `static mut` was UB under concurrent access).
+/// The returned `&'static str` still outlives the lock, so a later
+/// `getcwd()` call from another thread can overwrite the bytes a caller is
+/// still holding a reference to — same caveat as before, just no longer UB.
 pub fn getcwd() -> &'static str {
-    static mut CWD_BUF: [u8; 256] = [0u8; 256];
+    static CWD_LOCK: Spinlock<[u8; 256]> = Spinlock::new([0u8; 256]);
+    let mut guard = CWD_LOCK.lock();
+    let buf_ptr = guard.as_mut_ptr();
     let result: i64;
     unsafe {
         asm!(
             "svc #0",
             in("x8") syscall::GETCWD,
-            in("x0") core::ptr::addr_of_mut!(CWD_BUF) as *mut u8,
+            in("x0") buf_ptr,
             in("x1") 256usize,
             lateout("x0") result,
             options(nostack)
         );
-        if result > 0 {
-            core::str::from_utf8_unchecked(&CWD_BUF[..result as usize - 1])
-        } else {
-            "/"
-        }
     }
+    if result <= 0 {
+        return "/";
+    }
+    let len = (result as usize - 1).min(guard.len());
+    // SAFETY: points into the static CWD_LOCK buffer, which lives for the
+    // program's duration; the lock only needs to cover the write above.
+    let bytes: &'static [u8] = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
+    drop(guard);
+    core::str::from_utf8(bytes).unwrap_or("/")
 }
 
 /// Change the current working directory
@@ -488,10 +506,10 @@ pub extern "C" fn abort() -> ! {
 ///
 /// Returns the number of bytes read, or negative on error
 #[inline(always)]
-pub fn read(fd: u64, buf: &mut [u8]) -> isize {
+pub fn read(fd: i32, buf: &mut [u8]) -> isize {
     syscall(
         syscall::READ,
-        fd,
+        fd as u64,
         buf.as_mut_ptr() as u64,
         buf.len() as u64,
         0,
@@ -504,10 +522,10 @@ pub fn read(fd: u64, buf: &mut [u8]) -> isize {
 ///
 /// Returns the number of bytes written, or negative on error
 #[inline(always)]
-pub fn write(fd: u64, buf: &[u8]) -> isize {
+pub fn write(fd: i32, buf: &[u8]) -> isize {
     syscall(
         syscall::WRITE,
-        fd,
+        fd as u64,
         buf.as_ptr() as u64,
         buf.len() as u64,
         0,
@@ -757,6 +775,13 @@ pub fn listen(fd: i32, backlog: i32) -> i32 {
 
 /// Accept a connection
 pub fn accept(fd: i32) -> i32 {
+    accept_addr(fd).0
+}
+
+/// Accept a connection, also returning the peer address the kernel filled
+/// into the `sockaddr` out-parameter (dropped by the plain `accept` above).
+/// On failure the returned `SocketAddrV4` is `0.0.0.0:0` and must be ignored.
+pub fn accept_addr(fd: i32) -> (i32, SocketAddrV4) {
     let mut sockaddr = SockAddrIn {
         sin_family: 0,
         sin_port: 0,
@@ -764,13 +789,17 @@ pub fn accept(fd: i32) -> i32 {
         sin_zero: [0u8; 8],
     };
     let mut addrlen: u32 = SockAddrIn::SIZE as u32;
-    syscall(
+    let ret = syscall(
         syscall::ACCEPT,
         fd as u64,
         &mut sockaddr as *mut _ as u64,
         &mut addrlen as *mut _ as u64,
         0, 0, 0,
-    ) as i32
+    ) as i32;
+    if ret < 0 {
+        return (ret, SocketAddrV4::new([0, 0, 0, 0], 0));
+    }
+    (ret, sockaddr.to_addr())
 }
 
 /// Connect to a remote address
@@ -1574,6 +1603,10 @@ pub fn spawn_with_env(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>, e
 /// checks for the process; it does not stop it. Use [`kill_signal`] to actually
 /// terminate something. The behaviour is kept as-is because call sites outside
 /// herd rely on the probe.
+#[deprecated(note = "sends signal 0 (a liveness probe), not a real signal — \
+    use kill_signal(pid, sig) to actually terminate a process; this name has \
+    already caused at least 3 call sites to believe they were killing a \
+    child when they were not (docs/archive/LIBAKUMA_AUDIT.md item 11)")]
 pub fn kill(pid: u32) -> i32 {
     syscall(syscall::KILL, pid as u64, 0, 0, 0, 0, 0) as i32
 }
@@ -1585,6 +1618,9 @@ pub fn kill(pid: u32) -> i32 {
 pub fn kill_signal(pid: u32, sig: u32) -> i32 {
     syscall(syscall::KILL, pid as u64, sig as u64, 0, 0, 0, 0) as i32
 }
+
+/// `SIGINT` — terminal interrupt (Ctrl-C). Catchable.
+pub const SIGINT: u32 = 2;
 
 /// `SIGTERM` — the polite stop. Catchable, so a service may exit cleanly in
 /// response rather than showing up as a signal death.
@@ -1772,6 +1808,9 @@ pub fn waitpid_status(pid: u32) -> Option<WaitStatus> {
 /// The exit code is `WEXITSTATUS` only: a child **killed by a signal** reports
 /// 0 here and is indistinguishable from a clean success. Use
 /// [`waitpid_status`] if that distinction matters.
+#[deprecated(note = "a signal-killed child and a clean exit-0 child are both \
+    reported as exit_code 0 — use waitpid_status(pid) (or wait_any()) when \
+    that distinction matters (docs/archive/LIBAKUMA_AUDIT.md item 11)")]
 pub fn waitpid(pid: u32) -> Option<(u32, i32)> {
     waitpid_status(pid).map(|st| (st.pid, st.exit_code()))
 }
@@ -2006,14 +2045,18 @@ pub fn read_dir(path: &str) -> Option<ReadDir> {
 }
 
 // ============================================================================
-// Global Allocator with mmap/brk switch
+// Global Allocator (mmap-backed)
 // ============================================================================
-
-/// Set to true to use mmap-based allocation, false for brk-based
-pub const USE_MMAP_ALLOCATOR: bool = true;
+//
+// This used to have a second, brk-based arm selected by a `USE_MMAP_ALLOCATOR`
+// source constant. That arm's `brk_alloc` did non-atomic
+// load-head/load-end/compute/store-head, so two threads racing it could both
+// read the same head and return overlapping memory — silent heap corruption,
+// latent only because the constant was always `true`. Deleted rather than
+// fixed: nothing sets the constant to `false`, so there was no live use case
+// to preserve. See `docs/archive/LIBAKUMA_AUDIT.md` item 13.
 
 mod allocator {
-    use super::USE_MMAP_ALLOCATOR;
     use core::alloc::{GlobalAlloc, Layout};
     use core::ptr;
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -2036,17 +2079,13 @@ mod allocator {
     #[repr(C, align(256))]
     pub struct HybridAllocator {
         talc: super::Spinlock<talc::Talc<talc::ErrOnOom>>,
-        brk_head: AtomicUsize,
-        brk_end: AtomicUsize,
-        _padding: [u8; 128],
+        _padding: [u8; 144],
     }
 
     #[cfg(not(feature = "chunked-allocator"))]
     #[repr(C, align(256))]
     pub struct HybridAllocator {
-        brk_head: AtomicUsize,
-        brk_end: AtomicUsize,
-        _padding: [u8; 240],
+        _padding: [u8; 256],
     }
 
     unsafe impl Sync for HybridAllocator {}
@@ -2056,31 +2095,15 @@ mod allocator {
         pub const fn new() -> Self {
             Self {
                 talc: super::Spinlock::new(talc::Talc::new(talc::ErrOnOom)),
-                brk_head: AtomicUsize::new(0),
-                brk_end: AtomicUsize::new(0),
-                _padding: [0u8; 128],
+                _padding: [0u8; 144],
             }
         }
 
         #[cfg(not(feature = "chunked-allocator"))]
         pub const fn new() -> Self {
             Self {
-                brk_head: AtomicUsize::new(0),
-                brk_end: AtomicUsize::new(0),
-                _padding: [0u8; 240],
+                _padding: [0u8; 256],
             }
-        }
-
-        pub fn head_addr(&self) -> usize {
-            &self.brk_head as *const _ as usize
-        }
-
-        pub fn head_value(&self) -> usize {
-            self.brk_head.load(Ordering::SeqCst)
-        }
-
-        pub fn end_value(&self) -> usize {
-            self.brk_end.load(Ordering::SeqCst)
         }
 
         // =====================================================================
@@ -2177,85 +2200,18 @@ mod allocator {
             super::munmap_void(ptr as usize, alloc_size);
         }
 
-        // =====================================================================
-        // brk-based allocation (fallback)
-        // =====================================================================
-        
-        fn brk_init(&self) {
-            if self.brk_head.load(Ordering::SeqCst) == 0 {
-                let initial_brk = super::brk(0);
-                if self
-                    .brk_head
-                    .compare_exchange(0, initial_brk, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    let requested_end = initial_brk + 0x10000;
-                    let actual_end = super::brk(requested_end);
-                    self.brk_end.store(actual_end, Ordering::SeqCst);
-                }
-            }
-        }
-
-        fn brk_expand(&self, needed: usize) -> bool {
-            let current_end = self.brk_end.load(Ordering::SeqCst);
-            let grow_by = ((needed + 0xFFF) & !0xFFF).max(4096);
-            let new_end = current_end + grow_by;
-            let result = super::brk(new_end);
-            if result >= new_end {
-                self.brk_end.store(result, Ordering::SeqCst);
-                true
-            } else {
-                false
-            }
-        }
-
-        unsafe fn brk_alloc(&self, layout: Layout) -> *mut u8 {
-            self.brk_init();
-            let current_head = self.brk_head.load(Ordering::SeqCst);
-            let current_end = self.brk_end.load(Ordering::SeqCst);
-            let align = layout.align();
-            let aligned = (current_head + align - 1) & !(align - 1);
-            let new_head = aligned + layout.size();
-            if new_head > current_end {
-                let needed = new_head - current_end;
-                if !self.brk_expand(needed) {
-                    return ptr::null_mut();
-                }
-            }
-            self.brk_head.store(new_head, Ordering::SeqCst);
-            aligned as *mut u8
-        }
     }
 
     unsafe impl GlobalAlloc for HybridAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            if USE_MMAP_ALLOCATOR {
-                self.mmap_alloc(layout)
-            } else {
-                self.brk_alloc(layout)
-            }
+            self.mmap_alloc(layout)
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            if USE_MMAP_ALLOCATOR {
-                self.mmap_dealloc(ptr, layout);
-            }
+            self.mmap_dealloc(ptr, layout);
         }
 
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            if !USE_MMAP_ALLOCATOR {
-                let new_layout = match Layout::from_size_align(new_size, layout.align()) {
-                    Ok(l) => l,
-                    Err(_) => return ptr::null_mut(),
-                };
-                let new_ptr = self.brk_alloc(new_layout);
-                if !new_ptr.is_null() && !ptr.is_null() {
-                    let copy_size = layout.size().min(new_size);
-                    ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
-                }
-                return new_ptr;
-            }
-
             let new_layout = match Layout::from_size_align(new_size, layout.align()) {
                 Ok(l) => l,
                 Err(_) => return ptr::null_mut(),
@@ -2333,14 +2289,16 @@ fn alloc_error(_layout: core::alloc::Layout) -> ! {
     exit(-1);
 }
 
-/// Print allocator debug info (addresses and values)
+/// Print allocator debug info (mmap byte/allocation counters, plus the raw
+/// process break for reference — the allocator itself is mmap-only and never
+/// moves the break).
 pub fn print_allocator_info() {
-    print("  Allocator head addr: 0x");
-    print_hex(allocator::ALLOCATOR.head_addr());
-    print("\n  Allocator head value: 0x");
-    print_hex(allocator::ALLOCATOR.head_value());
-    print("\n  Allocator end value: 0x");
-    print_hex(allocator::ALLOCATOR.end_value());
+    print("  Total allocated: 0x");
+    print_hex(total_allocated());
+    print("\n  Total freed: 0x");
+    print_hex(total_freed());
+    print("\n  Net memory: 0x");
+    print_hex(memory_usage());
     print("\n  brk(0) = 0x");
     print_hex(brk(0));
     print("\n");

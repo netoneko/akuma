@@ -149,12 +149,8 @@ impl TcpListener {
     /// Accept a new incoming connection from this listener.
     pub fn accept(&self) -> Result<(TcpStream, SocketAddrV4), Error> {
         loop {
-            let new_fd = crate::accept(self.fd);
+            let (new_fd, remote_addr) = crate::accept_addr(self.fd);
             if new_fd >= 0 {
-                // For now, we don't get the remote address from accept
-                // TODO: Parse it from the sockaddr returned by accept
-                let remote_addr = SocketAddrV4::new([0, 0, 0, 0], 0);
-
                 return Ok((
                     TcpStream {
                         fd: new_fd,

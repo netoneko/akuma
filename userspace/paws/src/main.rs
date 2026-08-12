@@ -577,7 +577,7 @@ fn stream_output(stdout_fd: u32, pid: u32) -> i32 {
         
         if poll_input_event(10, &mut in_buf) > 0 && in_buf[0] == 0x03 {
             println("^C");
-            kill(pid);
+            kill_signal(pid, SIGINT);
         }
         
         if let Some((_, exit_code)) = waitpid(pid) {

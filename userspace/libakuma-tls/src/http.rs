@@ -217,10 +217,8 @@ fn parse_content_length(data: &[u8]) -> Option<(usize, Option<usize>)> {
     let header_str = core::str::from_utf8(&data[..end]).ok()?;
     let cl = header_str.lines()
         .find(|line| {
-            let lower_start = line.as_bytes().iter().take(16)
-                .map(|b| b.to_ascii_lowercase())
-                .collect::<Vec<u8>>();
-            lower_start.starts_with(b"content-length:")
+            let bytes = line.as_bytes();
+            bytes.len() >= 15 && bytes[..15].eq_ignore_ascii_case(b"content-length:")
         })
         .and_then(|line| line.split(':').nth(1)?.trim().parse::<usize>().ok());
     Some((end, cl))
@@ -381,6 +379,10 @@ fn parse_http_response(data: &[u8]) -> Result<Vec<u8>, Error> {
     let header_str = core::str::from_utf8(&data[..headers_end])
         .map_err(|_| Error::HttpError(String::from("Invalid HTTP headers")))?;
 
+    if is_chunked_encoding(header_str) {
+        return Err(Error::HttpError(String::from("chunked transfer-encoding not supported")));
+    }
+
     let first_line = header_str
         .lines()
         .next()
@@ -527,8 +529,8 @@ fn resolve_redirect_url(location: &str, scheme: &str, host: &str) -> String {
 
 fn extract_location_header(headers: &str) -> Option<String> {
     for line in headers.lines() {
-        let lower: Vec<u8> = line.as_bytes().iter().take(9).map(|b| b.to_ascii_lowercase()).collect();
-        if lower.starts_with(b"location:") {
+        let bytes = line.as_bytes();
+        if bytes.len() >= 9 && bytes[..9].eq_ignore_ascii_case(b"location:") {
             let value = line[9..].trim();
             return Some(String::from(value));
         }
@@ -549,11 +551,23 @@ pub fn parse_status_line(headers: &str) -> Option<u16> {
 fn parse_cl_header(headers: &str) -> Option<usize> {
     headers.lines()
         .find(|line| {
-            let lower: Vec<u8> = line.as_bytes().iter().take(16)
-                .map(|b| b.to_ascii_lowercase()).collect();
-            lower.starts_with(b"content-length:")
+            let bytes = line.as_bytes();
+            bytes.len() >= 15 && bytes[..15].eq_ignore_ascii_case(b"content-length:")
         })
         .and_then(|line| line.split(':').nth(1)?.trim().parse().ok())
+}
+
+/// True if the headers declare `Transfer-Encoding: chunked`. Chunked bodies
+/// are not decoded (`docs/archive/LIBAKUMA_AUDIT.md` item 5) — every read
+/// path checks this once, right after parsing headers, and refuses rather
+/// than handing the caller the raw chunk-size framing as if it were the body.
+fn is_chunked_encoding(headers: &str) -> bool {
+    headers.lines().any(|line| {
+        let bytes = line.as_bytes();
+        bytes.len() >= 18
+            && bytes[..18].eq_ignore_ascii_case(b"transfer-encoding:")
+            && line[18..].to_ascii_lowercase().contains("chunked")
+    })
 }
 
 /// Send the GET request, read headers, follow up to `max_redirects` 3xx
@@ -610,6 +624,10 @@ fn download_impl(
 
     if status < 200 || status >= 300 {
         return Err(Error::HttpError(format!("HTTP error: {}", status)));
+    }
+
+    if is_chunked_encoding(header_str) {
+        return Err(Error::HttpError(String::from("chunked transfer-encoding not supported")));
     }
 
     let content_length = parse_cl_header(header_str);
@@ -689,11 +707,17 @@ fn process_pending(pending: &mut Vec<u8>, headers_parsed: &mut bool, status_code
         if let Some(pos) = find_headers_end(pending) {
             let header_str = core::str::from_utf8(&pending[..pos]).unwrap_or("");
             *status_code = parse_status_line(header_str).unwrap_or(0);
+            let chunked = is_chunked_encoding(header_str);
             *headers_parsed = true;
             pending.drain(..pos);
             if *status_code < 200 || *status_code >= 300 {
                 return StreamResult::Error(Error::HttpError(
                     format!("HTTP error: {}", *status_code)
+                ));
+            }
+            if chunked {
+                return StreamResult::Error(Error::HttpError(
+                    String::from("chunked transfer-encoding not supported")
                 ));
             }
         }
@@ -815,8 +839,7 @@ impl<'a> HttpStreamTls<'a> {
         read_buf: &'a mut [u8],
         write_buf: &'a mut [u8],
     ) -> Result<Self, Error> {
-        // Use dot-printing transport to keep SSH connections alive
-        let transport = TcpTransport::new_with_dots(stream);
+        let transport = TcpTransport::new(stream);
         let tls = TlsStream::connect(transport, host, read_buf, write_buf)?;
 
         Ok(Self {

@@ -4,28 +4,35 @@
 
 ## Available Features
 
-### 1. Default (Page-per-Allocation)
-By default, `libakuma` maps every allocation to a discrete kernel `mmap` region.
+### 1. Chunked Allocator (`chunked-allocator`) — default
 
-*   **Behavior**: `malloc(16)` -> `mmap(4096)`.
-*   **Physical Memory**: Memory is returned to the kernel immediately upon `free`.
-*   **When to use**: Short-running CLI tools or memory-constrained environments where you want to minimize the process's resident set size (RSS).
-
-### 2. Chunked Allocator (`chunked-allocator`)
-Enabled via the `chunked-allocator` Cargo feature.
+Enabled by default (`default = ["chunked-allocator"]` in `libakuma/Cargo.toml`).
 
 *   **Behavior**: Requests 64 KB chunks from the kernel and uses the **Talc** allocator to manage small objects within them.
 *   **Performance**: Significantly faster (orders of magnitude fewer syscalls).
 *   **VAS Protection**: Prevents virtual address space exhaustion for apps that create many small, short-lived strings or objects.
-*   **When to use**: TUI apps (`meow`), background services (`herd`), or any app that performs frequent allocations in a loop.
+*   **When to use**: The default for a reason — TUI apps (`meow`), background services (`herd`), and any app doing frequent allocations in a loop all want this.
+
+### 2. Page-per-Allocation (`default-features = false`)
+
+Opting out of `chunked-allocator` maps every allocation to a discrete kernel `mmap` region instead.
+
+*   **Behavior**: `malloc(16)` -> `mmap(4096)`.
+*   **Physical Memory**: Memory is returned to the kernel immediately upon `free`.
+*   **When to use**: Short-running CLI tools or memory-constrained environments where you want to minimize the process's resident set size (RSS) over allocation throughput.
+
+Both arms are mmap-backed; there is no brk-based allocator anymore (see
+`docs/archive/LIBAKUMA_AUDIT.md` item 13 — the old `USE_MMAP_ALLOCATOR` switch
+and its racy `brk_alloc` fallback were deleted, since nothing ever set it to
+`false`).
 
 ## Usage in `Cargo.toml`
 
-To enable the chunked allocator for your app:
+Chunked is on by default; to opt out and use page-per-allocation instead:
 
 ```toml
 [dependencies]
-libakuma = { path = "../libakuma", features = ["chunked-allocator"] }
+libakuma = { path = "../libakuma", default-features = false }
 ```
 
 ## Debugging

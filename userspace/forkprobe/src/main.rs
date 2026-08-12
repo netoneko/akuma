@@ -124,9 +124,10 @@ fn test_basic() -> bool {
 
 fn test_cow() -> bool {
     // A heap allocation, so this exercises the mmap-backed allocator regions
-    // (libakuma's `USE_MMAP_ALLOCATOR` is true) rather than the near-empty brk.
-    // Those are the regions CoW fork has historically gotten wrong — see
-    // `docs/archive/` on lost mmap region extents.
+    // (libakuma's global allocator is mmap-only — see
+    // `docs/archive/LIBAKUMA_AUDIT.md` item 13 for the brk arm that used to
+    // sit behind this). Those are the regions CoW fork has historically
+    // gotten wrong — see `docs/archive/` on lost mmap region extents.
     let mut owned: Vec<String> = Vec::new();
     for i in 0..64 {
         owned.push(format!("parent-value-{}", i));

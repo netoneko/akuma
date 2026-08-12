@@ -56,7 +56,8 @@ pub extern "C" fn main() {
 
     loop {
         match listener.accept() {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
+                print(&format!("httpd: connection from {}\n", libakuma::net::format_addr(&addr)));
                 handle_connection(stream);
             }
             Err(e) => {

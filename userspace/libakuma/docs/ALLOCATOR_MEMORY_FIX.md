@@ -1,5 +1,11 @@
 # Allocator Memory Fix (Feb 2026)
 
+> **Historical.** The `DeferredFreeQueue` this document describes no longer
+> exists in `userspace/libakuma/src/lib.rs` — dealloc now frees directly
+> (`talc.free`/`munmap`, depending on the `chunked-allocator` feature). Kept
+> for the history of why deferred freeing was tried and what its failure
+> modes were. See `docs/archive/LIBAKUMA_AUDIT.md` item 15.
+
 ## Problem
 The `HybridAllocator` used a `DeferredFreeQueue` to work around a kernel hang when calling `munmap` during `realloc`. However, this queue had two major flaws:
 1. **Limited Capacity**: It only held 16 slots. If more than 16 reallocations occurred without an intervening `dealloc`, subsequent old buffers were leaked.

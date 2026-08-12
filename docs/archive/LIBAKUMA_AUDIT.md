@@ -12,14 +12,13 @@ This is a *current-state* audit. It is not a changelog; the historical fix
 notes under `userspace/libakuma/docs/` and `userspace/libakuma-tls/docs/` are
 linked from the relevant findings and not reproduced.
 
-> **Status (2026-08-12, commit `9cd7a24` "half baked libakuma fixes"):** items
-> **1-4** of the §5 prioritized list are done — `fstatat` null-termination,
-> the `ProcessInfo` doc/struct/constant reconciliation (both sides), the
-> deletion of the dead insecure-TLS API plus a `SECURITY:` banner, and the
-> `http.rs` de-duplication (1,249 → 906 LOC). Everything below is the audit as
-> written; what landed, what landed differently, and what is still open is
-> recorded in **§6 Fix log**, and the affected findings carry an inline
-> *Fixed* note.
+> **Status (2026-08-12):** items **1-13 and 15** of the §5 prioritized list
+> are done. Items 1-4 landed in commit `9cd7a24` ("half baked libakuma
+> fixes"); items 5-13 and 15 landed later the same day, uncommitted as of
+> this writing. Only item **14** (extract pure-logic cores + host tests) is
+> still open. Everything below is the audit as written; what landed, what
+> landed differently, and what is still open is recorded in **§6 Fix log**,
+> and the affected findings carry an inline *Fixed* note.
 
 ## TL;DR
 
@@ -620,17 +619,17 @@ Line numbers are as of the audit (`8b6ba40`); items 1-4 have since moved them.
 | 2 | **High** | S | Reconcile `ProcessInfo` doc/struct/constants against the kernel side; delete stale parts | `libakuma/src/lib.rs:151,154,157,177-203` | **Done** `9cd7a24` |
 | 3 | **High** | M | Delete `TlsOptions`/`_insecure`/`insecure()` (or implement verify). Add `// SECURITY:` banner + reference doc row. | `libakuma-tls/src/lib.rs:60-79`, `http.rs:75` | **Done** `9cd7a24` — minus the reference doc row |
 | 4 | **Med** | M | Refactor `http.rs` to kill the 4× duplication; unify on one stream enum + one read helper. Cuts ~500 LOC. | `libakuma-tls/src/http.rs` | **Done** `9cd7a24` — −343 LOC; `HttpStream`/`HttpStreamTls` still twins |
-| 5 | **Med** | S | Implement or refuse chunked transfer-encoding | `libakuma-tls/src/http.rs:568,612` | Open (now `http.rs:230`) |
-| 6 | **Med** | S | Replace per-line `Vec<u8>` lowercasing with `eq_ignore_ascii_case` (4 sites) | `libakuma-tls/src/http.rs:244,557,1017,1039` | Open — 3 sites left (`221,530,553`) |
-| 7 | **Med** | S | `getcwd`: replace `static mut CWD_BUF` with a `Spinlock` and drop `from_utf8_unchecked` | `libakuma/src/lib.rs:236-248` | Open |
-| 8 | **Med** | S | `accept`: parse the returned `sockaddr`, fix `peer_addr` on accepted sockets | `libakuma/src/net.rs:150-200` | Open |
-| 9 | **Med** | S | Stop mapping every TLS I/O failure to `Error::IoError`; preserve `TlsError` | `libakuma-tls/src/lib.rs:51,124-147` | Open — `HttpIo` defers to it by name |
-| 10 | **Low** | S | Unify fd types on `i32` (`read`/`write`/`fd` module) | `libakuma/src/lib.rs:141-144,504,520` | Open |
-| 11 | **Low** | S | `#[deprecated]` `waitpid` and `kill` (the signal-0 variant), point at the `*_status`/`kill_signal` replacements | `libakuma/src/lib.rs:1589,1787` | Open |
-| 12 | **Low** | S | Delete `transport.rs` dot-printer (layering violation) | `libakuma-tls/src/transport.rs:13-17,29-31,101-107` | Open |
-| 13 | **Low** | S | Delete or feature-gate the brk allocator path (racy, dead by default) | `libakuma/src/lib.rs:2025,2192-2240` | Open |
+| 5 | **Med** | S | Implement or refuse chunked transfer-encoding | `libakuma-tls/src/http.rs:568,612` | **Done** (2026-08-12, uncommitted) — refuse, not implement |
+| 6 | **Med** | S | Replace per-line `Vec<u8>` lowercasing with `eq_ignore_ascii_case` (4 sites) | `libakuma-tls/src/http.rs:244,557,1017,1039` | **Done** (2026-08-12, uncommitted) |
+| 7 | **Med** | S | `getcwd`: replace `static mut CWD_BUF` with a `Spinlock` and drop `from_utf8_unchecked` | `libakuma/src/lib.rs:236-248` | **Done** (2026-08-12, uncommitted) |
+| 8 | **Med** | S | `accept`: parse the returned `sockaddr`, fix `peer_addr` on accepted sockets | `libakuma/src/net.rs:150-200` | **Done** (2026-08-12, uncommitted) |
+| 9 | **Med** | S | Stop mapping every TLS I/O failure to `Error::IoError`; preserve `TlsError` | `libakuma-tls/src/lib.rs:51,124-147` | **Done** (2026-08-12, uncommitted) |
+| 10 | **Low** | S | Unify fd types on `i32` (`read`/`write`/`fd` module) | `libakuma/src/lib.rs:141-144,504,520` | **Done** (2026-08-12, uncommitted) |
+| 11 | **Low** | S | `#[deprecated]` `waitpid` and `kill` (the signal-0 variant), point at the `*_status`/`kill_signal` replacements | `libakuma/src/lib.rs:1589,1787` | **Done** (2026-08-12, uncommitted) — also fixed 3 live call sites that were relying on the signal-0 no-op believing it killed a child |
+| 12 | **Low** | S | Delete `transport.rs` dot-printer (layering violation) | `libakuma-tls/src/transport.rs:13-17,29-31,101-107` | **Done** (2026-08-12, uncommitted) |
+| 13 | **Low** | S | Delete or feature-gate the brk allocator path (racy, dead by default) | `libakuma/src/lib.rs:2025,2192-2240` | **Done** (2026-08-12, uncommitted) — deleted |
 | 14 | **Low** | M | Extract pure-logic cores (`libakuma-core`, `libakuma-tls-core`) and add the first host tests | both crates | Open — still 0 tests |
-| 15 | **Low** | S | Refresh `SYSCALLS.md` / `TERMINAL_SYSCALLS.md` / `ALLOCATOR_MEMORY_FIX.md` against current code | `userspace/libakuma/docs/` | Open |
+| 15 | **Low** | S | Refresh `SYSCALLS.md` / `TERMINAL_SYSCALLS.md` / `ALLOCATOR_MEMORY_FIX.md` against current code | `userspace/libakuma/docs/` | **Done** (2026-08-12, uncommitted) — also refreshed `ALLOCATOR_OPTIONS.md` (found stale on inspection, not in the original list) |
 
 "S" = ≤ 1 hour, "M" = a day or less. None of these require kernel changes
 except item 2's verification step.
@@ -702,6 +701,110 @@ What the refactor did **not** reach, hence "half baked":
 
 Untouched by this commit: BUG-2 (`accept` peer address), BUG-4 (`getcwd`
 `from_utf8_unchecked`), BUG-5 (fd types), TLS-BUG-2/3/4, and items 5-15.
+
+### 2026-08-12 (later, uncommitted) — items 5-13, 15
+
+**Item 5 — chunked transfer-encoding (TLS-BUG-2).** Took the "refuse"
+option, not "implement": added `is_chunked_encoding(headers)` to `http.rs`
+and call it at the three places headers get parsed (`parse_http_response` for
+the in-memory `fetch_to_vec` path, `download_impl` before streaming to a
+file, `process_pending` for the raw `HttpStream`/`HttpStreamTls` API). Each
+now returns `Error::HttpError("chunked transfer-encoding not supported")`
+instead of handing the caller raw chunk-size framing as if it were the body.
+
+**Item 6 — header lowercasing (3 remaining sites).** `http.rs:221`
+(`parse_content_length`), `530` (`extract_location_header`), `553`
+(`parse_cl_header`) replaced the per-line `Vec<u8>` allocate-and-lowercase
+with `bytes[..N].eq_ignore_ascii_case(b"...")`. Zero allocations, same
+matching.
+
+**Item 7 — `getcwd` (BUG-4).** `static mut CWD_BUF: [u8; 256]` replaced with
+a `Spinlock<[u8; 256]>` that guards the syscall write; `from_utf8_unchecked`
+replaced with checked `from_utf8`. The returned `&'static str` still outlives
+the lock (documented on the function), so a second `getcwd()` call from
+another thread can still overwrite bytes a caller holds a reference to — that
+was always true and is a separate, larger fix (caller-supplied buffer, per
+item 14's cross-cutting note); what changed is that concurrent *writes* to
+the buffer are no longer literal UB.
+
+**Item 8 — `accept` peer address (BUG-2).** Added `accept_addr(fd) ->
+(i32, SocketAddrV4)` next to `accept` in `lib.rs`, parsing the `sockaddr` the
+kernel already fills in via `SockAddrIn::to_addr()` instead of discarding it.
+`net.rs`'s `TcpListener::accept`/`try_accept` now use it, so
+`TcpStream::peer_addr()` on an accepted stream reports the real peer instead
+of `0.0.0.0:0`.
+
+**Item 9 — TLS error collapsing (TLS-BUG-3).** `TlsStream::{read,write,flush}`
+in `libakuma-tls/src/lib.rs` now `map_err(Error::TlsError)` instead of
+`map_err(|_| Error::IoError)`. This actually fixes a real behavior bug, not
+just diagnostics: `http.rs`'s `read_until_headers` already special-cased
+`Err(Error::IoError)` as retryable and everything else as fatal ("Non-I/O
+errors (e.g. TLS record corruption) propagate immediately" — a comment that
+predates this fix) — but with every TLS error forced into `Error::IoError`,
+TLS record corruption was silently retried as if it were a transient TCP
+hiccup. Now it propagates immediately, matching what the comment always
+claimed.
+
+**Item 10 — fd type unification.** `fd::{STDIN,STDOUT,STDERR}` and
+`read`/`write` changed from `u64` to `i32`, matching `read_fd`/`write_fd`/
+`close`/etc. The only other `u64`-fd functions in the crate,
+`set_terminal_attributes`/`get_terminal_attributes`, were left alone (out of
+this item's stated scope), so the handful of call sites that fed `fd::STDIN`
+into those two (`termtest`, `meow/src/tui_app.rs`) needed an explicit
+`as u64` added.
+
+**Item 11 — deprecate `waitpid`/`kill`.** Both got `#[deprecated]` pointing at
+`waitpid_status`/`wait_any` and `kill_signal`. Auditing every `kill()` call
+site to add the annotation turned up 3 **live bugs**, not just a naming
+footgun: `paws/src/main.rs`'s Ctrl-C handler and two sites in
+`meow/src/tools/shell.rs` (on-chunk-error abort, 30s timeout abort) all called
+`libakuma::kill(pid)` intending to terminate a child process — but `kill()`
+only ever sends signal 0 (a liveness probe, delivers nothing), so none of the
+three ever actually killed anything. `herd` already had this right
+(`kill_signal(pid, SIGTERM)`, with a comment naming the exact footgun) —
+it just hadn't propagated to the other three call sites. Fixed: paws now
+sends `SIGINT` (added as a new libakuma constant — Ctrl-C's actual signal,
+confirmed fatal-by-default in the kernel's `signal_is_fatal_default`), meow's
+two sites send `SIGTERM` (matching herd's convention for programmatic stop).
+
+**Item 12 — `transport.rs` dot-printer.** Deleted `wait_counter`,
+`dots_printed`, `print_dots`, `new_with_dots`, `dots_printed()`,
+`reset_dots()`, and the `% 50` heuristic. No caller read `dots_printed()`/
+used `reset_dots()`; `new_with_dots`'s only caller was
+`HttpStreamTls::connect`, now just `TcpTransport::new`. meow has its own,
+separate dot-printing in `api/client.rs` for TUI progress display, unrelated
+to this transport-layer mechanism, so the visible "..." while waiting for an
+LLM response is unaffected.
+
+**Item 13 — brk allocator path.** Deleted outright (not feature-gated):
+`USE_MMAP_ALLOCATOR`, `brk_head`/`brk_end` fields, `brk_init`/`brk_expand`/
+`brk_alloc`, and the `if USE_MMAP_ALLOCATOR {...} else {...}` branches in
+`alloc`/`dealloc`/`realloc` — all now unconditionally mmap-backed. Nothing in
+the tree ever set the constant to `false`, so there was no live behavior to
+preserve, only a UB footgun (non-atomic load-head/load-end/compute/store-head
+in `brk_alloc`) to remove. `print_allocator_info` (already dead — zero
+callers in the tree) was updated to stop reading the now-deleted
+`head_addr`/`head_value`/`end_value` and report the still-meaningful
+mmap byte/allocation counters instead.
+
+**Item 15 — doc refresh.** `SYSCALLS.md`: `pipe` no longer says "currently
+stubbed" (it calls `PIPE2` directly); the `execve` row replaced with `spawn`
+(no `execve` wrapper exists). `TERMINAL_SYSCALLS.md`: rewritten past-tense —
+all 7 syscalls are shipped (verified numbers 307-313 against
+`syscall::{SET_TERMINAL_ATTRIBUTES,...}` and each wrapper's real signature),
+including resolving the doc's old "0-indexed or 1-indexed, TBD" on
+`set_cursor_position` (it's 0-indexed; the kernel adds 1 before emitting the
+VT100 sequence). `ALLOCATOR_MEMORY_FIX.md`: marked historical — the
+`DeferredFreeQueue` it describes doesn't exist in the current allocator.
+`ALLOCATOR_OPTIONS.md` (not in the original list, found stale while doing
+this item): it described page-per-`mmap` as the default and
+`chunked-allocator` as opt-in, backwards from `Cargo.toml`'s
+`default = ["chunked-allocator"]` — flipped, and added a note that the old
+brk arm (item 13) is gone.
+
+Full `userspace/build.sh` run clean after each item; `cargo check` used
+per-package during iteration. Item 14 (pure-logic core extraction + first
+host tests for both crates) is the only item left open.
 
 ---
 

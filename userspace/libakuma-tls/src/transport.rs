@@ -9,25 +9,12 @@ use libakuma::net::{Error as NetError, ErrorKind, TcpStream};
 /// Wrapper around TcpStream that implements embedded-io traits
 pub struct TcpTransport {
     stream: TcpStream,
-    /// Counter for printing progress dots during blocking waits
-    wait_counter: u32,
-    /// Number of dots printed so far
-    dots_printed: u32,
-    /// Whether to print dots while waiting
-    print_dots: bool,
 }
 
 impl TcpTransport {
     /// Create a new transport wrapper around a TcpStream (blocking mode)
     pub fn new(stream: TcpStream) -> Self {
-        Self { stream, wait_counter: 0, dots_printed: 0, print_dots: false }
-    }
-
-    /// Create a new transport that prints dots while waiting for data
-    /// 
-    /// This is useful for keeping SSH connections alive during long waits.
-    pub fn new_with_dots(stream: TcpStream) -> Self {
-        Self { stream, wait_counter: 0, dots_printed: 0, print_dots: true }
+        Self { stream }
     }
 
     /// Get a reference to the underlying stream
@@ -38,16 +25,6 @@ impl TcpTransport {
     /// Consume the wrapper and return the underlying stream
     pub fn into_inner(self) -> TcpStream {
         self.stream
-    }
-
-    /// Get the number of dots printed while waiting
-    pub fn dots_printed(&self) -> u32 {
-        self.dots_printed
-    }
-
-    /// Reset the dots counter (call after cleaning up dots)
-    pub fn reset_dots(&mut self) {
-        self.dots_printed = 0;
     }
 }
 
@@ -91,20 +68,10 @@ impl Read for TcpTransport {
         // so we just pass through the result. No retry loop needed.
         loop {
             match self.stream.read(buf) {
-                Ok(n) => {
-                    self.wait_counter = 0;
-                    return Ok(n);
-                }
+                Ok(n) => return Ok(n),
                 Err(ref e) if e.kind == ErrorKind::WouldBlock || e.kind == ErrorKind::TimedOut => {
                     // Kernel already blocks, so these are rare edge cases.
                     // Retry immediately without sleeping.
-                    if self.print_dots {
-                        self.wait_counter += 1;
-                        if self.wait_counter % 50 == 0 {
-                            libakuma::print(".");
-                            self.dots_printed += 1;
-                        }
-                    }
                     continue;
                 }
                 Err(ref e) => return Err(TransportError::from_net_error(e)),

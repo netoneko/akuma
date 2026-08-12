@@ -32,9 +32,9 @@ All pointers passed to syscalls must be within the valid userspace range:
 | `clock_gettime(id, &ts)` | Retrieves the time of the specified clock. |
 | `access(path, mode)` | Checks file access permissions. |
 | `accessat(dirfd, path, mode, flags)` | Checks file access relative to a directory. |
-| `pipe(fds)` | Creates a unidirectional data channel (currently stubbed). |
-| `fork()` | Creates a child process (Linux bridging). |
-| `execve(path, argv, envp)` | Executes a new program (Linux bridging). |
+| `pipe(fds)` | Creates a unidirectional data channel (real `PIPE2` syscall, `flags` hardcoded to 0 — `O_NONBLOCK` not exposed). |
+| `fork()` | Creates a child process. |
+| `spawn(path, args)` | Fork + exec a new program in one call; the common way to run a child. There is no separate `execve` wrapper. |
 | `waitpid(pid, status, options)` | Waits for a process to change state. |
 | `chdir(path)` | Changes the current working directory. |
 | `mkdir(path)` | Creates a new directory. |

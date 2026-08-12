@@ -44,7 +44,7 @@ pub extern "C" fn main() {
     // --- 1. Get and store initial terminal attributes ---
     let mut initial_mode_flags: u64 = 0;
     let res = get_terminal_attributes(
-        fd::STDIN,
+        fd::STDIN as u64,
         &mut initial_mode_flags as *mut u64 as u64,
     );
     if res < 0 {
@@ -57,7 +57,7 @@ pub extern "C" fn main() {
     ));
 
     // --- 2. Set raw mode ---
-    let res = set_terminal_attributes(fd::STDIN, 0, mode_flags::RAW_MODE_ENABLE);
+    let res = set_terminal_attributes(fd::STDIN as u64, 0, mode_flags::RAW_MODE_ENABLE);
     if res < 0 {
         println(&format!("Error setting raw mode: {}", res));
         libakuma::exit(1);
@@ -129,7 +129,7 @@ pub extern "C" fn main() {
     println("Cursor shown.");
 
     // --- 9. Restore original terminal attributes ---
-    let res = set_terminal_attributes(fd::STDIN, 0, initial_mode_flags);
+    let res = set_terminal_attributes(fd::STDIN as u64, 0, initial_mode_flags);
     if res < 0 {
         println(&format!(
             "Error restoring initial terminal attributes: {}",
@@ -232,10 +232,10 @@ fn stress_child_loop() {
         // Alternate a second, independently-contended path on the same
         // `term_state_lock`: TIOCSWINSZ (write) vs TCGETS-equivalent (read).
         if i % 3 == 0 {
-            let _ = set_terminal_size(fd::STDIN as i32, 80, 24);
+            let _ = set_terminal_size(fd::STDIN, 80, 24);
         } else {
             let mut flags: u64 = 0;
-            let _ = get_terminal_attributes(fd::STDIN, &mut flags as *mut u64 as u64);
+            let _ = get_terminal_attributes(fd::STDIN as u64, &mut flags as *mut u64 as u64);
         }
 
         if i % STRESS_HEARTBEAT_EVERY == 0 {

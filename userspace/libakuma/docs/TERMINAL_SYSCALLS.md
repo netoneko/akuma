@@ -1,87 +1,72 @@
 # Terminal Syscalls for Akuma Userspace
 
-This document outlines proposed new syscalls for the Akuma kernel to enable rich interactive Terminal User Interface (TUI) applications, such as `meow` using `ratatui`, within the userspace environment. These syscalls aim to provide the necessary low-level control over the terminal that is currently missing from `libakuma`.
+These syscalls give `libakuma` the low-level terminal control that interactive
+TUI applications (e.g. `meow` using `ratatui`) need: raw mode, cursor
+positioning/visibility, screen clearing, and non-blocking input event
+polling. They shipped; this document is a reference for what exists, not a
+proposal. `docs/archive/LIBAKUMA_AUDIT.md` item 15 is the note that this file
+had drifted into describing a "proposed" API that had, in fact, been live for
+some time.
 
 ## Motivation
 
-Existing `libakuma` provides basic `read` and `write` access to `STDIN`/`STDOUT`. However, modern TUI frameworks like `ratatui` require more granular control, including:
+`libakuma` provides basic `read`/`write` access to `STDIN`/`STDOUT`, but that
+alone is not enough for `ratatui`-style TUIs, which need:
 *   Switching the terminal to raw mode for direct key event capture.
 *   Precise cursor positioning and visibility control.
 *   Efficient screen clearing.
 *   Non-blocking input event polling.
 
-Without these capabilities, interactive TUI applications are not feasible in the Akuma userspace.
+## Syscalls
 
-## Proposed Syscalls
+Wrappers live in `userspace/libakuma/src/lib.rs`; syscall numbers in the
+`syscall` module (`lib.rs:96-102`).
 
-The following syscalls are proposed, inspired by Linux `ioctl` and `termios` functionalities, but simplified for the Akuma kernel.
+### 1. `SET_TERMINAL_ATTRIBUTES` (307) — `set_terminal_attributes(fd, action, mode_flags)`
 
-### 1. `SYS_SET_TERMINAL_ATTRIBUTES` (New Syscall Number: 307)
-
-*   **Description**: Sets terminal control attributes (e.g., raw mode, canonical mode, echo). This is crucial for controlling how terminal input is processed.
-*   **Linux Compatibility**: Analogous to `tcsetattr(3)` with `ICANON`, `ECHO`, `ISIG`, etc., flags from `<termios.h>`.
+*   **Description**: Sets terminal control attributes (raw mode, canonical mode, echo).
+*   **Linux Compatibility**: Analogous to `tcsetattr(3)` with `ICANON`/`ECHO`/`ISIG` from `<termios.h>`.
 *   **Arguments**:
-    *   `fd`: File descriptor of the terminal (typically `STDIN` or `STDOUT`).
-    *   `action`: An integer indicating when to apply the change (e.g., `TCSAFLUSH` for `tcsetattr`). For simplicity, we can start with immediate application.
-    *   `mode_flags`: A bitmask of flags to control terminal behavior.
-        *   `0x01` (RAW_MODE_ENABLE): Enable raw mode (disable canonical, echo, ISIG).
-        *   `0x02` (RAW_MODE_DISABLE): Disable raw mode (restore canonical, echo, ISIG).
-        *   Additional flags could be added for finer control (e.g., `ECHO_ENABLE`, `ECHO_DISABLE`).
+    *   `fd`: File descriptor of the terminal (typically `STDIN`).
+    *   `action`: Applied immediately; not currently used to select a `TCSAFLUSH`-style variant.
+    *   `mode_flags`: `0x01` (`RAW_MODE_ENABLE`) disables canonical/echo/ISIG; `0x02` (`RAW_MODE_DISABLE`) restores them.
 *   **Return**: `0` on success, negative errno on failure.
 
-### 2. `SYS_GET_TERMINAL_ATTRIBUTES` (New Syscall Number: 308)
+### 2. `GET_TERMINAL_ATTRIBUTES` (308) — `get_terminal_attributes(fd, attr_ptr)`
 
-*   **Description**: Retrieves the current terminal control attributes. Useful for saving the terminal state before changing it and restoring it afterwards.
+*   **Description**: Retrieves the current terminal control attributes — used to save state before changing it and restore it afterwards.
 *   **Linux Compatibility**: Analogous to `tcgetattr(3)`.
 *   **Arguments**:
     *   `fd`: File descriptor of the terminal.
-    *   `attr_ptr`: Pointer to a userspace buffer where the current terminal attributes (e.g., `mode_flags`) will be written.
+    *   `attr_ptr`: Pointer to a userspace `u64` that receives the current `mode_flags`.
 *   **Return**: `0` on success, negative errno on failure.
 
-### 3. `SYS_SET_CURSOR_POSITION` (New Syscall Number: 309)
+### 3. `SET_CURSOR_POSITION` (309) — `set_cursor_position(col, row)`
 
-*   **Description**: Sets the cursor position on the terminal screen to `(col, row)`.
-*   **Linux Compatibility**: Achieved via writing VT100 escape sequences (e.g., `\x1b[{row};{col}H`) to `STDOUT`. This syscall would encapsulate that kernel-side.
+*   **Description**: Sets the cursor position on the terminal screen.
+*   **Linux Compatibility**: The kernel writes a VT100 escape sequence (`\x1b[{row+1};{col+1}H`) to the process channel.
+*   **Arguments**: `col`, `row` — both **0-indexed**; the kernel adds 1 before emitting the (1-indexed) escape sequence.
+*   **Return**: `0` on success, negative errno on failure.
+
+### 4. `HIDE_CURSOR` (310) — `hide_cursor()`
+
+Writes `\x1b[?25l`. No arguments. Returns `0` on success, negative errno on failure.
+
+### 5. `SHOW_CURSOR` (311) — `show_cursor()`
+
+Writes `\x1b[?25h`. No arguments. Returns `0` on success, negative errno on failure.
+
+### 6. `CLEAR_SCREEN` (312) — `clear_screen()`
+
+Writes `\x1b[2J`. No arguments. Returns `0` on success, negative errno on failure.
+
+### 7. `POLL_INPUT_EVENT` (313) — `poll_input_event(timeout_ms, event_buf)`
+
+*   **Description**: Checks for pending input events (key presses) without blocking indefinitely.
+*   **Linux Compatibility**: Analogous to `poll(2)`/`select(2)` on `STDIN` combined with `read(2)`.
 *   **Arguments**:
-    *   `col`: Column (0-indexed or 1-indexed, TBD, but 0-indexed is more Rust-idiomatic).
-    *   `row`: Row (0-indexed or 1-indexed, TBD).
-*   **Return**: `0` on success, negative errno on failure.
+    *   `timeout_ms`: milliseconds to wait for an event (converted to microseconds internally). `0` for non-blocking, `u64::MAX` for blocking.
+    *   `event_buf: &mut [u8]`: buffer to receive the raw event bytes; length implied by the slice.
+*   **Return**: Number of bytes read on success, `0` if no event within the timeout, negative `isize` errno on failure.
 
-### 4. `SYS_HIDE_CURSOR` (New Syscall Number: 310)
-
-*   **Description**: Hides the terminal cursor.
-*   **Linux Compatibility**: Achieved via writing VT100 escape sequence `\x1b[?25l` to `STDOUT`.
-*   **Arguments**: None.
-*   **Return**: `0` on success, negative errno on failure.
-
-### 5. `SYS_SHOW_CURSOR` (New Syscall Number: 311)
-
-*   **Description**: Shows the terminal cursor.
-*   **Linux Compatibility**: Achieved via writing VT100 escape sequence `\x1b[?25h` to `STDOUT`.
-*   **Arguments**: None.
-*   **Return**: `0` on success, negative errno on failure.
-
-### 6. `SYS_CLEAR_SCREEN` (New Syscall Number: 312)
-
-*   **Description**: Clears the entire terminal screen.
-*   **Linux Compatibility**: Achieved via writing VT100 escape sequence `\x1b[2J` to `STDOUT`.
-*   **Arguments**: None.
-*   **Return**: `0` on success, negative errno on failure.
-
-### 7. `SYS_POLL_INPUT_EVENT` (New Syscall Number: 313)
-
-*   **Description**: Checks for pending input events (e.g., key presses) without blocking. If an event is available, it is read and returned.
-*   **Linux Compatibility**: Analogous to `poll(2)` or `select(2)` on `STDIN` combined with `read(2)`. For simplicity, this syscall could return the next available event or indicate no event.
-*   **Arguments**:
-    *   `timeout_ms`: Milliseconds to wait for an event. `0` for non-blocking. `usize::MAX` for blocking.
-    *   `event_buf_ptr`: Pointer to a userspace buffer where the event data (e.g., key code) will be written.
-    *   `buf_len`: Length of the event buffer.
-*   **Return**: Number of bytes read (event size) on success, `0` if no event within timeout, negative errno on failure. Event data format (e.g., raw bytes, structured event) would need to be defined.
-
-## Implementation Considerations for Akuma Kernel
-
-*   **Virtual Terminal Management**: The kernel's virtual terminal driver would need to be enhanced to interpret and respond to these new syscalls, sending appropriate escape sequences to the underlying console (or QEMU console).
-*   **Input Handling**: For `SYS_POLL_INPUT_EVENT`, the kernel needs to manage a buffer of incoming keyboard events and provide a non-blocking mechanism to read them.
-*   **`termios`-like State**: The kernel would need to maintain per-terminal state (e.g., `mode_flags`) for each userspace process interacting with the terminal.
-
-These syscalls would provide the foundational elements for building sophisticated TUI applications in the Akuma userspace.
+See also `POLL_INPUT_EVENT_FIX.md` for a correctness fix in this path.
