@@ -32,6 +32,7 @@ Start from the symptom or task on the left.
 | Adding an apk package to the devbox | [`add-apk-package.md`](add-apk-package.md) |
 | Adding a `sc-*` kernel feature | [`add-syscall-feature.md`](add-syscall-feature.md) |
 | Landed a fix and need to update the bugfix audit | [`update-bug-fix-list.md`](update-bug-fix-list.md) |
+| Looking for copy-pasted code before a refactor (PMD CPD) | [`find-duplicated-code.md`](find-duplicated-code.md) |
 
 ## Conventions
 

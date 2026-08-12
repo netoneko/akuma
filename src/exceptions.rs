@@ -1620,6 +1620,49 @@ fn apply_default_signal_action(signal: u32) {
     crate::syscall::proc::sys_exit_group_pub(-(signal as i32)) // never returns
 }
 
+/// Terminal path for a fatal EL0 fault whose signal reached its *default* action
+/// (no `UserFn` handler, or a handler that reset itself to `SIG_DFL` and returned
+/// so the faulting instruction re-executed — what Rust's stack-overflow handler
+/// does for any address outside the guard page).
+///
+/// A fatal default-action signal kills the whole **thread group**, not just the
+/// faulting thread (Linux routes it through `do_group_exit`). `sys_exit_group` is
+/// the only exit path in this kernel whose ordering makes that hold:
+///
+/// ```text
+/// kill_thread_group  ->  fds.close_all  ->  notify parent  ->  self-terminate
+/// ```
+///
+/// **Why the ordering is the whole fix.** These sites used to call
+/// `notify_child_channel_exited_pub` first and then fall into `return_to_kernel`,
+/// whose own `kill_thread_group` call sits *after* that notify. The notify wakes
+/// the parent's `wait4`, and on a peer core the parent can reap us
+/// (`unregister_process`) before we get there. `return_to_kernel` then finds
+/// `current_process_shared() == None`, takes its `pid = None` branch, and skips
+/// its **entire** cleanup block — no `cleanup_process_fds`, no
+/// `kill_child_processes`, no `kill_thread_group`, no `unregister_process`. Every
+/// sibling `CLONE_VM` thread is orphaned: never terminated, never reaped, parked
+/// in `FUTEX_WAIT` with a live `Process` row and a pinned address space for the
+/// rest of the boot.
+///
+/// Measured, `/tmp/akuma-debug/serial.log` (2026-08-12, `SMP=4` devbox-smoltcp):
+/// cargo pid 151 crashed at T219.58, its `[TERM] tid=14 pid=Some(151) by_tid=18`
+/// came from *bash's* reap, no `[KTG] my_pid=151` line was ever printed, and tids
+/// 12/13/22/29 of tgid 151 were still burning CPU in the futex table at T510 —
+/// five minutes later. pid 1280 reproduced it identically at T520.78. Writeup:
+/// `docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` §13.5.
+///
+/// `sys_exit_group_pub` falls through to `return_to_kernel` when there is no
+/// current process (kernel helper thread), which is the old behaviour for that
+/// case, and it never returns for a real user thread.
+///
+/// The `is_shared()` gate this replaced only fired for `CLONE_VM` threads, so the
+/// common case — a multi-threaded process crashing on its **main** thread, which
+/// owns a non-shared address space — was precisely the one that leaked.
+fn fatal_signal_group_exit(code: i32) -> ! {
+    crate::syscall::proc::sys_exit_group_pub(code)
+}
+
 /// Restore saved context from a signal frame on the user stack (rt_sigreturn).
 /// Returns the saved x0 value, or None if the frame is invalid.
 ///
@@ -3274,14 +3317,8 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     crate::safe_print!(128,
                         "[SPURIOUS-SVC] Process {} ({}) killed (SIGILL, phantom SVC)\n",
                         proc.pid, proc.name);
-                    if proc.address_space.is_shared() {
-                        // Fatal signal in a CLONE_VM thread kills the whole group.
-                        crate::syscall::proc::sys_exit_group_pub(-4);
-                    }
-                    crate::syscall::proc::notify_child_channel_exited_pub(proc.pid, -4);
-                    crate::syscall::proc::vfork_complete(proc.pid);
                 }
-                akuma_exec::process::return_to_kernel(-4) // never returns
+                fatal_signal_group_exit(-4) // never returns
             }
 
             // rt_sigreturn (NR 139): restore saved context from signal frame
@@ -3313,11 +3350,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     }
                     return saved_x0;
                 }
-                if let Some(pid) = akuma_exec::process::read_current_pid() {
-                    crate::syscall::proc::notify_child_channel_exited_pub(pid, -11);
-                    crate::syscall::proc::vfork_complete(pid);
-                }
-                akuma_exec::process::return_to_kernel(-11);
+                fatal_signal_group_exit(-11);
             }
 
             // Save trap frame pointer so fork/clone can read full register state
@@ -4214,20 +4247,8 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 let frac = (elapsed_us % 1_000_000) / 10_000;
                 crate::safe_print!(128, "[Fault] Process {} ({}) SIGSEGV after {}.{:02}s\n",
                     proc.pid, proc.name, secs, frac);
-                // Fatal signal in a thread should kill the entire process group.
-                // On Linux, unhandled SIGSEGV triggers exit_group for all threads.
-                // Without this, goroutine crashes leave Go runtime in a broken state.
-                let is_clone_thread = proc.address_space.is_shared();
-                if is_clone_thread {
-                    // This is a clone_thread (goroutine) - kill entire thread group
-                    crate::safe_print!(64, "[Fault] SIGSEGV in clone_thread, calling exit_group\n");
-                    crate::syscall::proc::sys_exit_group_pub(-11);
-                    // sys_exit_group_pub doesn't return
-                }
-                crate::syscall::proc::notify_child_channel_exited_pub(proc.pid, -11);
-                crate::syscall::proc::vfork_complete(proc.pid);
             }
-            akuma_exec::process::return_to_kernel(-11) // SIGSEGV - never returns
+            fatal_signal_group_exit(-11) // SIGSEGV - never returns
         }
         esr::EC_INST_ABORT_LOWER => {
             // `far` is the entry snapshot (see rust_sync_el0_handler).
@@ -4641,10 +4662,8 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 let frac = (elapsed_us % 1_000_000) / 10_000;
                 crate::safe_print!(128, "[Fault] Process {} ({}) SIGSEGV after {}.{:02}s\n",
                     proc.pid, proc.name, secs, frac);
-                crate::syscall::proc::notify_child_channel_exited_pub(proc.pid, -11);
-                crate::syscall::proc::vfork_complete(proc.pid);
             }
-            akuma_exec::process::return_to_kernel(-11) // never returns
+            fatal_signal_group_exit(-11) // never returns
         }
         esr::EC_MSR_MRS_TRAP => {
             // Trapped MSR/MRS/System instruction from EL0.
@@ -4701,11 +4720,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
         }
         esr::EC_BRK_AARCH64 => {
             // BRK instruction — intentional trap/abort from user code
-            if let Some(pid) = akuma_exec::process::read_current_pid() {
-                crate::syscall::proc::notify_child_channel_exited_pub(pid, -5);
-                crate::syscall::proc::vfork_complete(pid);
-            }
-            akuma_exec::process::return_to_kernel(-5) // SIGTRAP
+            fatal_signal_group_exit(-5) // SIGTRAP
         }
         _ => {
             // EC=0x0 from EL0 is an undefined instruction. On Apple Silicon
@@ -4746,11 +4761,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 safe_print!(128, "  WARNING: TTBR0 looks like boot page tables, not user process!\n");
             }
 
-            if let Some(pid) = akuma_exec::process::read_current_pid() {
-                crate::syscall::proc::notify_child_channel_exited_pub(pid, -4); // SIGILL
-                crate::syscall::proc::vfork_complete(pid);
-            }
-            akuma_exec::process::return_to_kernel(-4) // never returns; SIGILL
+            fatal_signal_group_exit(-4) // never returns; SIGILL
         }
     }
 }

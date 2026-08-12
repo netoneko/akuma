@@ -50,6 +50,31 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   processes all run under a non-zero ASID — so the invalidation matched nothing
   and `sys_mprotect` could not downgrade a cached translation. Measured 3 FAIL
   before the fix, 3 PASS after, 3 PASS on Linux.
+- `segvgroup` — **the regression test for the orphaned-thread leak on the fatal-fault
+  path** (`docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` §13.5a). R rounds of
+  "T-threaded child takes an unhandled SIGSEGV on its **main** thread", then asks the
+  box to do ordinary work again. The defect: the EL0 fault handler notified the
+  parent *before* reaping the thread group, the parent's `wait4` reaped the crashed
+  process on a peer core, and `return_to_kernel` — whose `kill_thread_group` call
+  comes after that notify — then resolved no process and skipped all of its teardown.
+  Every worker was orphaned: parked in `FUTEX_WAIT`, never reaped, address space
+  pinned, for the rest of the boot (measured on cargo: four threads still burning CPU
+  five minutes after their process died).
+  **`wait4` cannot see this** — the parent gets 139 on a leaking kernel and a fixed
+  one alike, which is why a shell build loop never noticed and why `segvchild` (which
+  only asks whether `wait4` returns) passes on a leaking kernel. So this probe
+  detects it by *exhausting* the box: the defaults (`40 8 8`) orphan 320 workers
+  against a 248-slot ceiling, and phase 2 — a clean child plus a parent allocation —
+  is what fails. The sharper oracle is the serial log and needs one round: a fixed
+  kernel prints `[PROC-EXIT] pid=N code=-11` and `[KTG] my_pid=N … siblings=T`, a
+  leaking one prints neither and shows the **parent's** tid in the `[TERM]` line.
+  The child's handler is Rust std's stack-overflow shape on purpose (sigaltstack,
+  reset to `SIG_DFL`, return, refault), because that is what cargo runs and the
+  *second* fault is the one that reaches the terminal path.
+  Measured: `[threads] high-water` climbs `68 live / free=178` before the fix, flat
+  at `14 live / free=234` after; PASSES on real Linux aarch64.
+  Usage: `segvgroup [rounds] [threads] [mb]`. Calibrate:
+  `docker run --rm --platform linux/arm64 -v "$PWD/segvgroup:/segvgroup:ro" alpine /segvgroup 40 8 8`.
 - `bssfork` — **the regression test for the fork-from-a-threaded-process SIGSEGV**
   (`docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` §12), and the narrowest
   statement of it: T threads incrementing adjacent `.bss` counters — one page, so

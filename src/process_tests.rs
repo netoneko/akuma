@@ -419,6 +419,7 @@ pub fn run_all_tests() {
     test_fault_mutex_insert_remove();
     test_kill_thread_group_marks_siblings_zombie();
     test_kill_thread_group_reaps_futex_blocked_sibling();
+    test_fatal_fault_group_exit_precedes_parent_notify();
     test_schedule_blocking_respects_terminated();
 
     // kill_thread_group deadlock fix (two-phase termination)
@@ -10391,6 +10392,122 @@ fn test_kill_thread_group_reaps_futex_blocked_sibling() {
         crate::safe_print!(112,
             "[Test] kill_thread_group_reaps_futex_blocked_sibling FAILED: terminated={} unregistered={}\n",
             terminated, unregistered);
+    }
+}
+
+/// Regression for the orphaned-thread leak on the **fatal EL0 fault** path
+/// (`docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` §13.5).
+///
+/// `exit_group` has reaped the thread group before notifying the parent since the
+/// §7h self-host deadlock (see `test_kill_thread_group_reaps_futex_blocked_sibling`
+/// above). The fault path did **not**: it called `notify_child_channel_exited_pub`
+/// and only then fell into `return_to_kernel`, whose `kill_thread_group` call sits
+/// after that notify. The notify wakes the parent's `wait4`, a peer core reaps us,
+/// and `return_to_kernel` then finds `current_process_shared() == None` and skips
+/// its entire cleanup block — group kill included.
+///
+/// The predicate this asserts is the one that makes the ordering safe: **by the
+/// moment the parent can observe the exit, the group is already dead.** So it
+/// checks the sibling's state *at* the instant the child channel flips to exited,
+/// not merely at the end of the sequence — a notify-first regression flips the
+/// channel while the sibling is still registered and still WAITING, and fails here.
+///
+/// It does not (and cannot, from a test that must return) drive `exceptions.rs`'s
+/// terminal path itself; `fatal_signal_group_exit` diverges. Same limitation the
+/// `exit_group` test above carries. The end-to-end reproducer is
+/// `userspace/forktest/c_stress/segvgroup.c`, calibrated against real Linux.
+fn test_fatal_fault_group_exit_precedes_parent_notify() {
+    use alloc::sync::Arc;
+    use akuma_exec::process::{
+        ProcessChannel, kill_thread_group, lookup_process_shared, publish_child_exit,
+        register_child_channel, register_process, register_thread_pid, remove_child_channel,
+        unregister_process, unregister_thread_pid,
+    };
+    use akuma_exec::threading;
+
+    /// A sibling parked in an untimed futex consumes its deferred kill request at
+    /// the EL1→EL0 boundary and self-terminates — see the identically-shaped
+    /// trampoline in `test_kill_thread_group_reaps_futex_blocked_sibling` for why
+    /// the slot must be a real initialized thread rather than a fabricated one.
+    extern "C" fn sibling_boundary_trampoline() -> ! {
+        let _ = threading::take_thread_kill_request();
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); }
+    }
+
+    let parent_pid = 62_200u32;
+    let leader_pid = 62_201u32;
+    let sib_pid = 62_202u32;
+
+    // The crashing process owns its address space — `is_shared() == false`. That is
+    // the case the old `is_clone_thread` gate skipped, and the one cargo crashed in:
+    // a multi-threaded process faulting on its MAIN thread.
+    let leader_proc = make_test_process(leader_pid);
+    let l0 = leader_proc.address_space.l0_phys();
+    let owns_address_space = !leader_proc.address_space.is_shared();
+    register_process(leader_pid, leader_proc);
+
+    let Ok(sib_tid) = threading::spawn_user_thread_initializing(
+        sibling_boundary_trampoline, core::ptr::null_mut())
+    else {
+        let _ = unregister_process(leader_pid);
+        console::print("[Test] fatal_fault_group_exit_precedes_parent_notify SKIPPED (no free slot)\n");
+        return;
+    };
+
+    // A CLONE_VM worker in the leader's group, parked in FUTEX_WAIT — the shape of
+    // the cargo threads that stayed live for five minutes after their process died.
+    let mut sib = make_test_process(sib_pid);
+    sib.tgid = leader_pid;
+    if let Some(shared) = crate::mmu::UserAddressSpace::new_shared(l0) {
+        sib.address_space = shared;
+    }
+    sib.thread_id = Some(sib_tid);
+    register_process(sib_pid, sib);
+    register_thread_pid(sib_tid, sib_pid);
+    threading::set_thread_state(sib_tid, threading::thread_state::WAITING);
+
+    // The channel the parent's wait4 polls. Nothing has been published yet.
+    let child_ch = Arc::new(ProcessChannel::new());
+    register_child_channel(leader_pid, child_ch.clone(), parent_pid);
+    let unexited_before = !child_ch.has_exited();
+
+    // The fixed order, as `sys_exit_group` performs it for every fatal EL0 fault.
+    kill_thread_group(leader_pid, l0, -11);
+
+    // Sample the group's state at the instant the parent could first observe the
+    // exit. Under deferred kill the grace-wait can return an instant before the
+    // sibling's own TERMINATED store lands, so poll for it — but poll BEFORE the
+    // publish, which is exactly the window the ordering exists to close.
+    let mut sib_dead = threading::is_thread_terminated(sib_tid);
+    let mut polls = 0;
+    while !sib_dead && polls < 100 {
+        threading::blocking_relax();
+        sib_dead = threading::is_thread_terminated(sib_tid);
+        polls += 1;
+    }
+    let sib_reaped = lookup_process_shared(sib_pid).is_none();
+
+    publish_child_exit(leader_pid, -11);
+    let parent_sees_exit = child_ch.has_exited();
+    let parent_sees_code = child_ch.exit_code();
+
+    unregister_thread_pid(sib_tid);
+    let _ = remove_child_channel(leader_pid);
+    let _ = unregister_process(leader_pid);
+    let _ = unregister_process(sib_pid);
+    threading::cleanup_terminated();
+
+    if owns_address_space && unexited_before && sib_dead && sib_reaped
+        && parent_sees_exit && parent_sees_code == -11
+    {
+        console::print("[Test] fatal_fault_group_exit_precedes_parent_notify PASSED\n");
+    } else {
+        crate::safe_print!(176,
+            "[Test] fatal_fault_group_exit_precedes_parent_notify FAILED: owns_as={} \
+             unexited_before={} sib_dead={} sib_reaped={} parent_sees={} code={}\n",
+            owns_address_space, unexited_before, sib_dead, sib_reaped,
+            parent_sees_exit, parent_sees_code);
     }
 }
 

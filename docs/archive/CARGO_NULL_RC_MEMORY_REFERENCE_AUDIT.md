@@ -825,6 +825,488 @@ about the CoW break's *copy*, not about the permission.
 
 ---
 
+## 13. 2026-08-12 session: still live, two new symbolized PCs, "zeroed page" theory falsified
+
+Picked the bug back up on the current tree (HEAD `cf03840`, kernel built the same
+day). Booted `devbox-smoltcp` at `SMP=4 MEMORY=4096 SNAPSHOT=1` (the standard
+devbox, not `disk_selfhost.img`), populated `/.cargo` with `/usr/bin/cargo fetch`
+(per [`../userspace/SELF_HOSTING_USERSPACE.md`](../userspace/SELF_HOSTING_USERSPACE.md)
+§3 — nightly cargo's networking is still broken), and drove five cold
+`bash build.sh --sshd-only` runs against `/tmp/akuma/userspace`.
+
+### 13.1 Reproduction rate
+
+**1 of 4 cold builds crashed** (the fifth never started — the loop was satisfied
+after the 4th rc was logged). All green runs rebuilt in ~3 s warm; cold runs
+were 27-28 s. So on a *userspace* self-host (lighter than the kernel `-j4`
+campaign in §12.8) the rate is on the order of 25 % — higher than the §12.9
+"probably fixed" reading of 0/11 at ~91 %, but a different workload on a
+different disk. Treat the §12.8 oracle as unanswered, not as evidence of
+regression.
+
+The crash always lands **after** `Finished release profile [optimized]` and
+**after** the ELF is on disk (verified — `target/.../release/sshd`, 106992 B,
+fresh mtime, byte-identical to the next attempt's green ELF). cargo dies
+walking its `Unit` graph to free it; that is when it dereferences the most
+pointers and statistically surfaces the corruption. This matches the
+[`../userspace/SELF_HOSTING_USERSPACE.md`](../userspace/SELF_HOSTING_USERSPACE.md)
+§4b "trap": `build.sh`'s `set -e` aborts before the `cp` into `bootstrap/bin`,
+so the failure looks worse than it is.
+
+### 13.2 Two new crash PCs symbolized (same cargo subsystem, different Drop impls)
+
+cargo was pulled out of the live disk with `scripts/ext2read.py` (snapshot=on,
+so the running VM is not perturbed). Both crash instances are in cargo's own
+drop glue, both with near-null `FAR`, but at **different functions** — i.e. the
+corruption surfaces wherever cargo happens to walk next, not at one buggy site.
+
+**Crash 1** — pid 151, `FAR=0x0`, `ELR=0x107d7bc4` → file offset `0x7d7bc4`:
+
+```
+hashbrown::raw::RawTable<cargo::compiler::unit::Unit>
+  ::<core::ops::drop::Drop as Drop>::drop:
+    7d7bbc:  sub  x0, x22, x8          ; compute bucket slot addr
+    7d7bc0:  ldr  x8, [x0, #-0x8]!     ; load the Rc<UnitInner> pointer from the bucket
+    7d7bc4:  ldr  x9, [x8]             ; FAULT — x8 == 0
+    7d7bc8:  subs x9, x9, #1           ; (decrement strong refcount)
+    7d7bd4:  bl   Rc<UnitInner>::drop_slow
+```
+
+Same `Rc<UnitInner>` refcount-decrement path as the original §0 autopsy
+(`0x4e48c8`), just the hashbrown-bucket wrapper instead of the direct field at
+`+288`. Same cargo subsystem (`cargo::compiler::unit`).
+
+**Crash 2** — pid 1280, `FAR=0x21`, `ELR=0x114d1ad4` → file offset `0x14d1ad4`:
+
+```
+<semver::identifier::Identifier as core::ops::drop::Drop>::drop:
+    14d1ad4:  ldr  x8, [x0]            ; FAULT — x0 == 0x21 (self is junk)
+    14d1ad8:  cmn  x8, #0x2            ; (niche check: Identifier::Numeric ?)
+```
+
+Drop was called with `self == 0x21`. That is the **caller**'s fault, not
+`Identifier::drop`'s: some upstream drop chain computed `&parent.field` and
+the address came out as `0x21`. The cheapest explanation is a corrupted
+`Vec`/slice pointer in a parent type (`Vec<Comparator>` / `Vec<VersionReq>`
+both contain `Identifier`s) — `vec.ptr + 0` reading back as `0x21` would
+propagate exactly this shape. Different Drop impl, different cargo subsystem
+(semver, a transitive dep) — but the same general "a qword that should hold a
+pointer is holding a small integer" class as crash 1's NULL.
+
+`0x21` itself is suggestive: small but non-zero, plausibly a talc free-list
+size-class tag, an enum discriminant, or a length byte. Different garbage each
+crash (`0x0`, `0x21`) is itself a finding — a deterministic store would
+reproduce the same value.
+
+### 13.3 What the [WILD-DA] forensics say — and a theory that dies
+
+The kernel's `print_page_forensics` (running on every `[WILD-DA]` since the
+§3 instrumentation landed) dumped `[x0]`/`[x19]` for both crashes. Both
+surrounding pages had **real cargo heap content**, not zeroed bytes:
+
+```
+crash 1 [x0]  va=0x305e6000 pa=0x87d0f000 ... head=0xfffffffffffffffe,0x100000001,0x101,0x304abb90
+crash 1 [x19] va=0x301d4000 pa=0x87cf9000 ... head=0x11f46108,0x1e00000000013,0x0,0x1a00000000000
+crash 2 [x1]  va=0x308cf000 pa=0xa5732000 ... head=0x4b505f4f47524143,0x454d414e5f47,0x0,0xff000000000e
+                                    head decoded as ASCII (LE): "CARGO_PKG_NAME..."
+```
+
+The `0xfffffffffffffffe` sentinel and `0x100000001` refcount pair in crash 1
+are exactly talc's bucket-header pattern; the `"CARGO_PKG_NAME"` in crash 2 is
+cargo's env-var block mapped into a heap-adjacent page. **The pages are not
+zeroed.** So the original CARGO_HEAP_NULL_RC hypothesis #1 in its weak form
+— "page management handed back a zeroed page" — is wrong. What is being
+corrupted is a *specific qword field* inside an otherwise-live page.
+
+That sharpens the suspect list. The write that zeroes the qword must be:
+
+1. A wild/stale pointer store **through the live page's VA** (the kernel page
+   tables for both crashes were correct: `ap=AP_RW_ALL(writable)` on the
+   crash-1 victim, the page was `FREE=false tracked=true cow_ref=0`, and the
+   `last_free=(tid=11 age=2375)` ledger shows it was freed and re-allocated
+   legally 2.3 s before the fault). Nothing in the kernel forensics points at
+   page management.
+2. **OR** an in-process use-after-free inside cargo's own talc arena — talc
+   writes free-list metadata (next-pointers, size-class tags) into freed
+   slots, and those metadata bytes look exactly like the values we see
+   (`0x0` end-of-list, small-integer tags). Note this is *cargo*-process UAF,
+   which §3.2 did NOT rule out: §3.2's poison quarantine proves no
+   **kernel-PMM** double-owned frames; it says nothing about cargo's own
+   allocator handing the same address twice inside one process.
+
+Both fit the evidence so far. Distinguishing them is the next step.
+
+### 13.4 What this session rules in and out (delta vs §12)
+
+| | status after 2026-08-12 |
+|---|---|
+| §2f foreign-page-tables / §2g THREAD_STATES races / §2h trampoline (the other "open" classes the SELF_HOSTING_USERSPACE doc said were open) | **RULED OUT for this crash.** Across the two crashes: 0 `[TTBR *-MISMATCH]`, 0 `[TRAMP-MISMATCH]`, 0 `[RELR]`, 0 `AS MISMATCH`, and `ttbr0_live == ttbr0_proc == expected_l0` on both faulting threads. The §2g/§2h fixes appear to have held; only Defect B fires today. |
+| §3.2 PMM-level UAF (kernel handing the same frame to two owners) | **Still ruled out.** Forensics on both crashes: `FREE=false cow_ref=0 tracked=true`, single owner, content intact. |
+| §12 cowstale / "stale write fault" race | **Still ruled out for this crash.** Both faults are reads (`FAR=0x0`, `FAR=0x21`), `ISS=0x7` (data abort, level 3, WnR=0), no `[WPF]` line. The cowstale fix did not address this and was not expected to. |
+| Original hypothesis: "kernel zeroed a whole page" | **RULED OUT** (§13.3 — pages have real content, only a qword is corrupt). |
+| Cargo-process UAF (talc metadata read after free) | **LIVE.** Fits both crashes; not covered by §3.2's kernel-level quarantine. |
+| Wild pointer store through the live VA | **LIVE.** Forensics consistent with it; would surface exactly this way. |
+| §1's `[EAGER-UPGRADE]` correlation | **RULED OUT as a necessary precursor.** Zero `[EAGER-UPGRADE]` lines across the whole boot that produced both crashes — the 2026-08-07 "hard correlation" does not hold for the 2026-08-12 crashes. Either the two are different sub-classes (§12.9 already raised this), or `[EAGER-UPGRADE]` was a secondary symptom in 2026-08-07, not the cause. The latter is more likely: this crash is a *read* of a corrupted qword, with no permission/CoW anomaly in the window. |
+
+### 13.5 SIGSEGV did not tear down cargo's thread group (live-zombie threads) — ROOT-CAUSED AND FIXED 2026-08-12
+
+> **Resolved later the same day.** The cause was **not** the `is_shared()` gate the
+> text below points at — that gate is real and was removed, but
+> `return_to_kernel` calls `kill_thread_group` for a non-shared process anyway, so
+> it alone cannot explain the leak. The actual defect is an **ordering race**, and
+> the serial log named it. Root cause, fix and the A/B are in §13.5a; the original
+> text is kept unedited below because its *evidence* was right and only its
+> mechanism was wrong.
+
+The `[THR-DUMP]` and `[FUTEX-DUMP]` blocks (one every 30 s) reveal a real
+kernel defect that is **not the cargo null-Rc bug** but travels with it.
+When cargo pid 151's main thread (tid 14) took the data abort at T219.55,
+the kernel delivered SIGSEGV to its handler (`[signal] deliver sig=11
+slot=14 handler=0x1165a174`), and on `sigreturn` the fault retried and
+faulted again — but **the process did not die**. Per POSIX, an unhandled
+SIGSEGV (or one whose handler returns and re-faults) must tear down the
+whole thread group via `exit_group`. The kernel only killed the parent
+bash wrapper (`[PROC-EXIT] pid=148 ... code=139`); cargo pid 151 itself
+never produced a `[PROC-EXIT]` line, and its sibling threads tid 12, 13,
+22, 29 kept running.
+
+Every 30 s PSTATS dump from T300 to T570 (~5 minutes after the crash)
+still lists them under `tgid=151`, parked in futexes at
+`uaddr=0x304b47b8` and `uaddr=0x308e4428`, with `cpu_us` climbing
+steadily (tid 12 went 42718 → 45485 → 47617 μs across three dumps). They
+are waking periodically (futex timeout) and burning CPU — they are not
+frozen, they are live zombies.
+
+**Why this is not the cargo null-Rc cause** (despite looking like one):
+attempt 1 of the cold-build loop in §13.1 crashed on a *fresh boot* with
+no prior cargo crash to leak zombies from. So the cargo heap corruption
+does not require zombies to be present. They are a separate kernel bug
+worth fixing in its own right (the `kill_thread_group`/SIGSEGV-default
+path is failing to clean up sibling threads when the signalled thread
+takes a default-action path).
+
+**Why it could still matter indirectly:** the zombies hold address-space
+state (their L0 at `0x81861000`, pipe/futex references, file
+descriptors) that the kernel cannot reclaim. Under a build loop this
+accumulates: each crashed cargo leaks a fresh set. Whether the resulting
+memory pressure changes the corruption *rate* in a measurable way is an
+open A/B — see §13.7.
+
+The bug shape resembles `kill_thread_group`'s grace-expiry branch, which
+`../archive/GRACE_EXPIRED_HARD_KILL_ORPHANS.md` fixed for a different
+symptom (the `[FUTEX_WAIT]` stall in `-j4` self-host). Re-reading that
+doc against this evidence is the next step before adding new
+instrumentation.
+
+### 13.5a Root cause: the fault path notified the parent before reaping the group
+
+**The `is_shared()` gate is a red herring on its own.** `return_to_kernel` *does*
+call `kill_thread_group` when the exiting process owns its address space
+(`process/mod.rs`, `if !is_shared && l0_phys != 0`). So "the main thread skips
+`exit_group`" does not by itself orphan anything. The question the log answers is
+why that call never ran.
+
+#### The evidence: a missing line
+
+`[KTG] my_pid=…` is printed unconditionally at the top of `kill_thread_group`
+(rate-limited to 512; only 156 had been spent when crash 1 landed). Both crashes:
+
+```
+[Fault] Process 151 (/usr/local/bin/cargo) SIGSEGV after 28.33s
+[TERM] tid=14 pid=Some(151) by_tid=18 state=1 … at process/table.rs:194
+[T219.58] [PROC-EXIT] pid=148 tgid=148 name=/bin/bash code=139
+[KTG] my_pid=148 my_tgid=148 by_tid=18 code=139 siblings=0 first=None
+```
+
+There is **no `[KTG] my_pid=151`**, and no `[PROC-EXIT] pid=151`. The thread that
+terminated cargo's tid 14 was `by_tid=18` — *bash's* thread, from
+`unregister_process`. pid 1280 reproduced it identically at T520.78 with
+`by_tid=10`. cargo never ran any of its own teardown.
+
+#### The mechanism
+
+The EL0 fault path did this, in this order:
+
+1. `notify_child_channel_exited_pub(pid, -11)` — wakes the parent's `wait4`
+2. `return_to_kernel(-11)` — whose `kill_thread_group` call is *inside* a block
+   guarded by `if let Some(proc) = current_process_shared()`
+
+Between 1 and 2 the parent reaps us on a peer core. `lookup_process_shared` only
+matches **ACTIVE** slots, so the now-RETIRED row resolves to `None`,
+`return_to_kernel` takes its `pid = None` branch, and skips the **entire** cleanup
+block: no `cleanup_process_fds`, no `kill_child_processes`, no
+`kill_thread_group`, no `unregister_process`. Every `CLONE_VM` sibling is
+orphaned — never terminated, never reaped, parked in `FUTEX_WAIT` with a live
+`Process` row and a pinned address space.
+
+This is the **same race `sys_exit_group` already documents** as load-bearing, and
+fixed for the `-j4` self-host deadlock (§7g/§7h): *"Reap sibling threads BEFORE
+notifying the parent. ORDERING IS LOAD-BEARING."* The EL0 fault path never got
+that treatment. The EL1 abort path (`exceptions.rs`, EC=0x25) already had it —
+`kill_thread_group` then notify — so the fault path was the lone outlier.
+
+#### The fix
+
+Every fatal-default-signal terminal path in `rust_sync_el0_handler` now routes
+through one helper, `fatal_signal_group_exit`, which is `sys_exit_group_pub`:
+
+```text
+kill_thread_group  ->  fds.close_all  ->  notify parent  ->  self-terminate
+```
+
+Six sites, previously five different orderings: data abort (SIGSEGV), instruction
+abort (SIGSEGV), invalid `rt_sigreturn` frame (SIGSEGV), phantom-SVC (SIGILL),
+`BRK` (SIGTRAP), undefined instruction (SIGILL). The `is_shared()` gate is gone
+with them — it only fired for `CLONE_VM` threads, so the common case (a
+multi-threaded process crashing on its **main** thread) was exactly the one that
+leaked. `sys_exit_group_pub` still falls through to `return_to_kernel` when there
+is no current process, so kernel helper threads are unaffected.
+
+#### Numbers
+
+New probe `userspace/forktest/c_stress/segvgroup.c` — R rounds of "T-threaded
+child takes a fatal SIGSEGV on its main thread", then asks the box to do ordinary
+work again. The child's handler is Rust std's shape (sigaltstack, reset to
+`SIG_DFL`, return, refault), because that is what cargo runs. PASSES on real
+Linux aarch64 (`docker run --platform linux/arm64 alpine /segvgroup 40 8 8`).
+
+| | pristine `cf03840` | fixed |
+| --- | --- | --- |
+| `[KTG] my_pid=<crashed pid>` | **absent** | present, `siblings=8` |
+| `[PROC-EXIT] pid=<crashed pid>` | **absent** | `code=-11` |
+| `[threads] high-water` over the run | climbs: `68 live / free=178` | flat: `14 live / free=234` |
+| `segvgroup 40 8 8` | leaks 8 slots per round | **PASS** |
+
+Both arms at `SMP=4`, devbox-smoltcp, `MEMORY=4096`. The pristine arm was the
+user's still-running VM from the reproducing session, so the "absent `[KTG]`"
+row is measured on the same boot that produced §13.2's two crashes.
+
+Note what `wait4` cannot see: the parent gets `139` on **both** arms. That is why
+a shell-level build loop never noticed, and why `segvchild` (which only asks "does
+`wait4` return?") passes on a leaking kernel. The leak is only visible in the
+kernel's own accounting, or by exhausting it.
+
+#### Verified on the real workload
+
+The §13.1 cold-build loop re-run on the fixed kernel — 12 rounds of
+`rm -rf target && bash build.sh --sshd-only` against `/tmp/akuma/userspace`,
+devbox-smoltcp `SMP=4 MEMORY=4096`. Three rounds (1, 3, 7) crashed with
+`EXIT=139`, and all three tore down correctly:
+
+```
+[Fault] Process 419 (/usr/local/bin/cargo) SIGSEGV after 73.70s
+[PROC-EXIT] pid=419 tgid=419 name=/usr/local/bin/cargo code=-11
+[KTG] my_pid=419 my_tgid=419 by_tid=12 code=-11 siblings=1 first=Some((431, Some(10)))
+```
+
+`by_tid=12` is **cargo's own thread**, where §13.5's pre-fix capture had
+`by_tid=18` — the parent. And systemically, after 12 rounds and 3 crashes:
+
+```
+[T840.22] [FUTEX-DUMP] table empty
+[threads] new high-water: 35 live user threads (terminated=0 free=213 ceiling=248)
+```
+
+against the pre-fix VM, where tgid 151 and tgid 1280 were still parked in that
+table an hour after their processes died. (The third crash has no `[KTG]` line
+only because `KTG_TRACES` had spent its 512-line budget by T592; its
+`[PROC-EXIT] … code=-11` proves `sys_exit_group` ran, and that calls
+`kill_thread_group` unconditionally.)
+
+Boot self-test: `test_fatal_fault_group_exit_precedes_parent_notify`
+(`src/process_tests.rs`) asserts the predicate the ordering exists to provide —
+*by the moment the parent can observe the exit, the group is already dead* — by
+sampling the sibling's state at the instant the child channel flips to exited.
+Suite green at `SMP=4`: 275 PASSED / 0 FAILED.
+
+#### What this does not fix
+
+`return_to_kernel`'s `pid = None` branch still silently skips all teardown. The
+ordering fix means the fault path no longer *creates* that window, but any future
+path that publishes an exit before tearing down will leak the same way, silently.
+Hardening that branch (resolving the group by tgid when the row is already
+RETIRED) is a separate change and was not attempted here — it sits on every exit
+path in the system.
+
+### 13.6 Artefacts kept
+
+- Serial log of the reproducing session: `/tmp/akuma-debug/serial.log` (host
+  machine, single-boot, both crashes captured). Two `[WILD-DA]` blocks at
+  T219.55 and T520.74.
+- Extracted cargo binary: `/tmp/akuma-debug/cargo.guest` (46.5 MB,
+  `inode=221844` on `devbox.img`, ELF64 aarch64 PIE with debug info — pulled
+  via `python3 scripts/ext2read.py devbox.img /usr/local/bin/cargo ...`).
+- Symbolization commands for future crash PCs (against the saved binary):
+  `objdump -d --start-address=0x<N> --stop-address=0x<N+0x30> /tmp/akuma-debug/cargo.guest`
+
+### 13.7 Next steps (revised)
+
+The probe-based approach in the original §13.5 (`rcdrop.rs`) did not
+reproduce in 0/30 baseline + 0/5 with fork churn — kept in tree at
+`userspace/forktest/c_stress/rcdrop.rs` as the starting point for the
+next attempt, but it does not mimic the right shape. The orphan-leak
+finding above (§13.5) reframes the work:
+
+1. ~~**Confirm the SIGSEGV-cleanup bug.**~~ **DONE** — `segvgroup.c`, and the
+   defect is root-caused and fixed (§13.5a). It was an ordering race, not the
+   `is_shared()` gate: the fault path notified the parent before reaping the
+   group, so the parent's reap could win and `return_to_kernel` then skipped all
+   of its teardown. Note the shape the probe needed: the leak is invisible to
+   `wait4` (139 on both arms), so it has to be detected by exhausting the box or
+   by reading `[KTG]` in the serial log.
+
+2. ~~**A/B the cargo crash rate with and without zombies.**~~ **DONE — the zombies
+   were incidental.** 12 cold rounds on the fixed kernel: **3 crashes (rounds 1,
+   3, 7) = 25 %**, against §13.1's ~25 % (1 of 4). The rate did not move, which is
+   what §12.9's mechanism argument predicted — "a legal write wrongly refused" and
+   "a qword that reads back as garbage" do not compose. **So the null-`Rc` defect
+   is untouched and remains the open question**; the orphan leak was a real bug
+   that merely travelled with it.
+
+   A third data point for the corruption itself, from round 1 of this loop:
+   `FAR=0xfeedfacea8d0e010`, `ELR=0x30028b50`. `0xfeedface` is a **poison
+   pattern**, and it joins §13.2's `0x0` and `0x21` as a third distinct garbage
+   value — reinforcing that reading (a live-page qword being overwritten, not a
+   deterministic store) and pointing harder at §13.3's option 2, an in-process
+   free-list write inside cargo's own talc arena.
+
+3. **Focus for the null-`Rc` bug** — see §13.8, which supersedes this list. The
+   garbage value from round 1 turned out to be the *kernel's own poison*, and the
+   kernel's own UAF detector fired on the same frame in the same run.
+
+---
+
+## 13.8 The garbage is the kernel's poison: a premature free, caught (2026-08-12)
+
+**§3.2's "premature free / use-after-free — RULED OUT" does not hold.** Round 1 of
+the §13.7-step-2 loop faulted at `FAR=0xfeedfacea8d0e010`, and `0xFEEDFACE` is not
+cargo's, musl's or Rust's — it is `src/pmm.rs`:
+
+```rust
+const POISON_MAGIC: u64 = 0xFEED_FACE_DEAD_0000;
+fn poison_word(pa: usize) -> u64 { POISON_MAGIC ^ (pa as u64) }
+```
+
+The quarantine XORs the poison with the frame's own PA precisely so a word can be
+traced back to the frame it belongs to. Decoding the faulting address does that:
+
+```
+0xfeedfacea8d0e010 - 0x10          = 0xfeedfacea8d0e000   (the pointer in x3)
+0xfeedfacea8d0e000 ^ 0xfeedfacedead0000 = 0x767de000      ← page-aligned
+```
+
+So cargo loaded `poison_word(0x767de000)` out of its heap and dereferenced it at
+`+0x10`. A page-aligned result is a 1-in-4096 coincidence at worst; it is not one.
+
+**Independently confirmed by the kernel, on the same frame, in the same boot:**
+
+```
+[PMM-UAF] pa=0x767de000 WRITTEN AFTER FREE: off=0x20
+          got=0xfeedfacea8d0dfff want=0xfeedfacea8d0e000 freed_by=(tid=3 seq=844871) cow_ref=0
+```
+
+`want → got` is `0xa8d0e000 → 0xa8d0dfff`: **a decrement by exactly one.** That is
+`Rc::drop`'s refcount decrement — `ldr x9,[x8]; subs x9,x9,#1; str x9,[x8]`, the
+sequence §13.2 disassembled at crash 1 — executing through a frame the kernel had
+already freed and poisoned. Three frames tripped the detector in this one boot,
+two of them with the same decrement-by-one signature:
+
+| frame | off | want → got | delta | freed_by |
+| --- | --- | --- | --- | --- |
+| `0x767e2000` | `0x280` | `…a8d32000` → `…00d32000` | high byte cleared | tid=12 seq=842979 |
+| `0x767de000` | `0x20` | `…a8d0e000` → `…a8d0dfff` | **−1** | tid=3 seq=844871 |
+| `0x9a4e0000` | `0x660` | `…44e30000` → `…44e2ffff` | **−1** | tid=15 seq=2334505 |
+
+### 13.8.1 The mechanism this implies
+
+The kernel frees a frame that a live process still has mapped and writable. The
+frame is poisoned and parked in quarantine. cargo, still holding a valid PTE to
+it, goes on using it: it decrements refcounts into it (what the detector catches)
+and reads pointers out of it (what kills it, at whatever `Rc`/`Vec`/`Drop` walks
+there next). Every property §13.3 measured on the *victim* page is consistent with
+this and explains why every instrument said "nothing wrong": the page cargo
+faulted *from* was `FREE=false cow_ref=0 tracked=true last_free=(-1) ap=AP_RW_ALL`
+— clean, live, correctly owned. **The forensics all inspect the destination; the
+defect is at the source.**
+
+It also retires the framing of §13.3, whose two candidates were "cargo-process
+talc UAF" and "wild pointer store". Neither is needed: this is a plain kernel-side
+premature free, and the poison encoding proves the frame's identity.
+
+### 13.8.2 Why §3.2's ruling was not wrong so much as under-powered
+
+§3.2 rested on `PMM-UAF=0` across four self-host builds with the detector proven
+to fire each boot. Two gaps:
+
+- **The detector only catches *writes*.** `verify_poison` compares a quarantined
+  frame's contents on release. A stale mapping that only ever *reads* is invisible
+  to it — and reading a poisoned qword as a pointer is exactly what produces the
+  fatal fault. So "no UAF detected" was never the same statement as "no UAF".
+- **512 frees of quarantine lag** means detection is bounded but not immediate,
+  and the run that reports it need not be the run that crashed. Here they
+  coincided; that is luck, not design.
+
+### 13.8.3 Suggested route to a fix
+
+The class is now known; the *call site* is not. In order of cost:
+
+1. **Make `[PMM-UAF]` name the culprit, not just the victim.** Two additions to
+   the line, both cheap and both already half-present:
+   - the **free site**: the ledger records `freed_by=(tid, seq)` but not *which
+     path* freed it. Record the `FrameSource` / a caller tag alongside, so the
+     line names `cow_break` vs `file_page_cache` vs `munmap` vs `Process::drop`.
+   - the **surviving mapper**: on a poison mismatch, walk the process table for
+     any address space whose page tables still resolve to that PA, and print
+     `pid`/VA. That closes the loop between "the kernel freed it" and "userspace
+     still had it", which is currently inferred rather than observed.
+
+   One reproducing round then names the bug outright.
+
+2. **Test the standing suspects against it — they are already enumerated in §6**,
+   and §2.1's own summary of the design predicts this exact failure: *"one
+   decrement too many frees a live page."*
+   - **D2** — `file_page_cache::lookup_and_ref` takes its `cow_ref_inc` **outside**
+     the `PAGES` lock, so a concurrent `invalidate_inode`/`shrink` can free the
+     frame in that window. This *is* "premature free of a still-mapped frame",
+     listed as "suspected, not observed". It now has something to be tested
+     against.
+   - **D4** — the three CoW-break sites call `cow_ref_dec` directly and discard
+     the last-reference return.
+   - **D7** — `try_evict_ro_page` evicts any RO page inside a `LazySource::File`
+     region.
+   - The `munmap` storm from §13.7 step 3 (`detach_eager_regions_in_range`), whose
+     sibling defect D8 was already found and fixed in §5.1.
+
+3. **Turn the crash into a diagnostic instead of a fault.** A frame must not be
+   released to the bitmap while any live PTE still resolves to it. Checking that
+   on the quarantine-release path (it already walks the frame) converts a silent,
+   minutes-later `Rc` deref into a logged event at a bounded distance from the
+   free — the same trade the quarantine was built to make, one step earlier.
+
+4. Raising `QUARANTINE_SLOTS` widens the detection window; useful for correlation
+   while hunting, not a fix.
+
+**Open:** whether this regressed since 2026-08-08 or was always there and §3.2
+simply could not see it (§13.8.2). The workloads differ — four `-j4` kernel builds
+then, twelve cold userspace builds now — so this is not a clean A/B and should not
+be reported as a regression without one.
+
+3. **If the zombies are incidental,** the most promising lead is the
+   `last_sc=munmap` cluster in crash 2's syscall trail (8 `munmap`s in
+   the 30 ms before the fault). cargo tears down its jobserver state
+   post-build with a munmap storm, and an `munmap` race against the
+   thread-spawn path could leave a stale mapping in the address space
+   that another thread dereferences. This is `sys_munmap` /
+   `detach_eager_regions_in_range` (`akuma-exec`); §5.1 of this audit
+   fixed one variant (D8) — worth a re-read.
+
+If any of these lands, the deliverable per `proposals/CARGO_HEAP_NULL_RC.md`
+is: root cause with evidence, a fix, a regression test in
+`userspace/forktest/c_stress/` calibrated against Linux, and an update to
+this section (§13) — not a new doc.
+
+---
+
 ## Background
 
 - [`proposals/CARGO_HEAP_NULL_RC.md`](../../proposals/CARGO_HEAP_NULL_RC.md) — the
