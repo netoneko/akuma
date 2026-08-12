@@ -690,6 +690,7 @@ pub fn run_all_tests() {
     // through a freed frame, and `MADV_DONTNEED`'s range divergence from Linux
     // must stay pinned, or a clean run proves nothing.
     test_uaf_quarantine_instrument();
+    test_cow_break_dec_only_on_last_va();
     test_cow_ref_ledger_records_history();
     test_madvise_dontneed_range_semantics();
 
@@ -4824,6 +4825,75 @@ fn test_uaf_quarantine_instrument() {
     assert!(crate::pmm::is_page_free(pa), "drained frame not returned to the PMM: pa={pa:#x}");
 
     console::print("[Test] uaf_quarantine PASSED\n");
+}
+
+/// A CoW break must give up the address space's global reference **only** when it
+/// releases the frame's last VA in that address space.
+///
+/// `COW_REFCOUNTS` counts *address spaces* — the first share inserts 2, encoded in
+/// `cow_ref_inc` as "parent + child" — while `user_frames` counts *VAs*, which is
+/// exactly why `remove_user_frame` is `#[must_use]` and reports only the last one.
+/// All three CoW-break sites in `exceptions.rs` used to discard that bool and
+/// decrement per VA broken, so an address space mapping one frame at two VAs threw
+/// away a reference it was still using; the next holder's decrement then freed a
+/// frame that was still mapped, and the process went on reading and writing a
+/// quarantined page. That is the cargo null-`Rc` corruption
+/// (`docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` §13.9).
+///
+/// Driven against a real frame and a real address space, because the bug lives in
+/// the disagreement between the two ledgers — a test on either alone cannot see it.
+fn test_cow_break_dec_only_on_last_va() {
+
+    let Some(frame) = crate::pmm::alloc_page() else {
+        console::print("[Test] cow_break_dec_only_on_last_va SKIPPED (no free frame)\n");
+        return;
+    };
+    let Some(aspace) = crate::mmu::UserAddressSpace::new() else {
+        crate::pmm::free_page(frame);
+        console::print("[Test] cow_break_dec_only_on_last_va SKIPPED (no address space)\n");
+        return;
+    };
+
+    // One address space, the same frame at two VAs — what a second mapping of an
+    // already-held cached page, or an `mremap`, leaves behind.
+    aspace.track_user_frame(frame);
+    aspace.track_user_frame(frame);
+
+    // Shared with a peer address space: the first share lands at 2.
+    crate::pmm::cow_ref_inc(frame.addr);
+    let shared_count = crate::pmm::cow_ref_get(frame.addr);
+
+    // Break the first VA. The address space still maps the frame at the second, so
+    // it must NOT surrender its global reference.
+    let first_release = aspace.remove_user_frame(frame);
+    if first_release {
+        crate::pmm::cow_ref_dec(frame.addr);
+    }
+    let after_first = crate::pmm::cow_ref_get(frame.addr);
+
+    // Break the second. Now the last VA is gone and the reference is given up.
+    let second_release = aspace.remove_user_frame(frame);
+    if second_release {
+        crate::pmm::cow_ref_dec(frame.addr);
+    }
+    let after_second = crate::pmm::cow_ref_get(frame.addr);
+
+    // Drop the peer's reference too, so the frame is genuinely free to return.
+    let peer_owns_free = crate::pmm::cow_ref_dec(frame.addr);
+    drop(aspace);
+    crate::pmm::free_page(frame);
+
+    if shared_count == 2 && !first_release && after_first == 2
+        && second_release && after_second == 1 && peer_owns_free
+    {
+        console::print("[Test] cow_break_dec_only_on_last_va PASSED\n");
+    } else {
+        crate::safe_print!(192,
+            "[Test] cow_break_dec_only_on_last_va FAILED: shared={} first_release={} \
+             after_first={} second_release={} after_second={} peer_owns_free={}\n",
+            shared_count, first_release, after_first, second_release, after_second,
+            peer_owns_free);
+    }
 }
 
 /// The CoW reference ledger must record the increment/decrement history that the

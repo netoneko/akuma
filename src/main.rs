@@ -1653,46 +1653,23 @@ async fn memory_monitor() -> ! {
     use core::fmt::Write;
     use crate::kernel_timer::{Duration, Timer};
 
-    // Stack-allocated buffer to avoid heap allocation when printing stats
-    struct StackBuffer {
-        buf: [u8; 384],
-        pos: usize,
-    }
-
-    impl Write for StackBuffer {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let bytes = s.as_bytes();
-            let remaining = self.buf.len() - self.pos;
-            let to_copy = bytes.len().min(remaining);
-            self.buf[self.pos..self.pos + to_copy].copy_from_slice(&bytes[..to_copy]);
-            self.pos += to_copy;
-            Ok(())
-        }
-    }
-
-    impl StackBuffer {
-        fn new() -> Self {
-            Self {
-                buf: [0; 384],
-                pos: 0,
-            }
-        }
-
-        fn as_str(&self) -> &str {
-            core::str::from_utf8(&self.buf[..self.pos]).unwrap_or("")
-        }
-
-        fn clear(&mut self) {
-            self.pos = 0;
-        }
-    }
+    // `console::StackWriter`, not a local `struct Buf([u8; N], usize)` + `impl
+    // Write`: that hand-rolled shape is the one `docs/reference/subsystems/console.md`
+    // § "Printing rules" names as a re-implementation of the macro body, and whose
+    // eight other copies the console audit removed. This one survived because it
+    // predates the sweep.
+    //
+    // The multi-`write!` composition below is exemption 1, not a violation: the
+    // `[Mem]` line is ~10 conditionally-included segments, and building it into one
+    // fixed stack buffer flushed once is also what stops a peer core interleaving
+    // its output into the middle of the line at SMP=4.
 
     // Wait a bit before starting to let system stabilize
     Timer::after(Duration::from_secs(5)).await;
 
     console::print("[MemMonitor] Memory monitoring started\n");
 
-    let mut buf = StackBuffer::new();
+    let mut buf = console::StackWriter::<384>::new();
 
     loop {
         // Proactively return fully-free kernel-heap spans to the PMM so the free
@@ -1726,7 +1703,6 @@ async fn memory_monitor() -> ! {
         // cow_ref desync) — see pmm::DOUBLE_FREE_COUNT.
         let dfree = pmm::double_free_count();
         let reclaimed_pages = allocator::reclaimed_pages_total();
-        buf.clear();
         let _ = write!(
             buf,
             "[Mem] Uptime {} | RAM: {}/{}MB free ({}KB) | Heap: {}/{}MB free ({} KB used, {} KB peak) | Allocs: {} | Threads: {}/{} ({}r {}rd)",
@@ -1750,6 +1726,14 @@ async fn memory_monitor() -> ! {
             let (quar_len, uaf) = pmm::quarantine_stats();
             let _ = write!(buf, " | quar={quar_len} UAF={uaf}");
         }
+        // `premature` counts frames released while a live address space still
+        // tracked them — the premature free itself, rather than `UAF`'s downstream
+        // evidence of one. It catches read-only survivors too, which `UAF` cannot
+        // (docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md §13.8.2), so it is
+        // the stricter of the two and must be 0.
+        if config::PMM_PREMATURE_FREE_CHECK {
+            let _ = write!(buf, " premature={}", pmm::premature_free_count());
+        }
         // Heap high-water diagnostic: how much PMM the heap is sitting on and how
         // much of it is stuck (spans pinned by a live allocation, so reclaim
         // can't return them). At the low-memory floor, `pinned` not falling back
@@ -1767,7 +1751,7 @@ async fn memory_monitor() -> ! {
             );
         }
         let _ = writeln!(buf);
-        console::print(buf.as_str());
+        buf.flush();
 
         // Stack high-water (no-op unless the probe const is on): right-sizing data
         // for the extreme kernel stacks. Printed on its own line to keep [Mem] short.

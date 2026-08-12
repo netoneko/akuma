@@ -594,6 +594,29 @@ pub const PMM_UAF_QUARANTINE: bool = true;
 #[cfg(kernel_profile_extreme)]
 pub const PMM_UAF_QUARANTINE: bool = false;
 
+/// At every `free_page` that drops the **last** reference, check whether a live
+/// address space still tracks the frame (`pmm::report_premature_free`).
+///
+/// This is the direct form of the question `PMM_UAF_QUARANTINE` can only answer
+/// indirectly. The quarantine catches a *write* through a mapping that outlived
+/// its free; the null-`Rc` defect's fatal access is a **read** — a poisoned qword
+/// loaded as a pointer — which leaves contents intact and is invisible to it
+/// (`docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` §13.8.2). This asks
+/// instead, at the moment of the free, whether anyone still holds the frame, and
+/// reports the freeing thread, the surviving process and the CoW history together.
+///
+/// **Off by default because it perturbs the race it hunts.** It costs a scan of
+/// the process table plus a `BTreeMap` lookup per active address space, on every
+/// frame freed — milliseconds added to each teardown. Armed, the cold-build loop
+/// went 10/10 green against a 25 % crash baseline (`p ≈ 0.056` of happening by
+/// chance), i.e. the instrument most likely hid the defect.
+///
+/// Prefer `pmm::report_poison_value`, wired into the fault path: it decodes a
+/// faulting value that is a quarantine poison word back to the frame it belonged
+/// to and names the thread that freed it, for zero steady-state cost. Turn this on
+/// only to catch a premature free whose victim never faults.
+pub const PMM_PREMATURE_FREE_CHECK: bool = false;
+
 /// Record every CoW/share refcount increment and decrement in a ring, so an
 /// anomaly can print a frame's whole reference history (`pmm::print_cow_history`).
 ///

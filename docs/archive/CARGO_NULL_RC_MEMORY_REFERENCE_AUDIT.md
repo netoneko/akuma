@@ -1291,6 +1291,111 @@ simply could not see it (§13.8.2). The workloads differ — four `-j4` kernel b
 then, twelve cold userspace builds now — so this is not a clean A/B and should not
 be reported as a regression without one.
 
+---
+
+## 13.9 D4, exactly: the CoW break decremented per VA instead of per address space
+
+**Root cause found 2026-08-13.** The premature free of §13.8 is
+[`src/exceptions.rs`](../../src/exceptions.rs)'s three CoW-break sites — the
+"three CoW-break sites call `cow_ref_dec` directly and discard the return" of D4
+(§6), though the consequence is the opposite of what D4 predicted: not a leak, a
+use-after-free.
+
+### 13.9.1 The two ledgers count different things
+
+| ledger | unit | released when |
+| --- | --- | --- |
+| `COW_REFCOUNTS` (`pa -> u16`) | **address spaces** — `cow_ref_inc`'s first share inserts **2**, "parent + child" | one decrement per address space that stops mapping the frame |
+| `UserAddressSpace.user_frames` (`pa -> u32`) | **VAs within one address space** | `remove_user_frame` returns `true` only on the **last** VA |
+
+`remove_user_frame` is `#[must_use = "free the frame only when this returns true;
+freeing otherwise is a double-free"]` and its doc states the invariant outright:
+*"an address space contributes exactly one reference per frame."*
+
+All three break sites wrote `let _ = aspace.remove_user_frame(...)` and then called
+`crate::pmm::cow_ref_dec(old_pa)` **unconditionally**. They had reasoned about not
+*freeing* — the comment "drop the bookkeeping ref but never free here" is correct —
+but not about the decrement itself needing the same gate. So the global count lost
+one reference **per VA broken**, while it had only ever gained one per address
+space.
+
+### 13.9.2 The sequence
+
+```
+AS X maps frame F at VA_a and VA_b; shared with peer Y      cow_ref = 2
+  X breaks CoW on VA_a
+      remove_user_frame: 2 -> 1, returns false  (X still maps F at VA_b)
+      cow_ref_dec anyway:  2 -> 1               ← X's reference is gone, X still maps F
+  Y drops its reference
+      cow_ref_dec:         1 -> 0  = "last reference"  -> free_page(F)
+                                                  ← but X still maps F at VA_b, RW
+```
+
+`F` is poisoned into quarantine while X keeps using it. X's `Rc::drop` decrements a
+refcount **inside the poisoned page** — `want → got` differing by exactly 1, which
+is what `[PMM-UAF]` reported — and X's next pointer load out of that page returns
+`poison_word(F)`, which it dereferences and dies on. Both halves of §13.8's
+evidence, from one bug.
+
+### 13.9.3 Caught end to end
+
+Round 12 of a 20-round cold-build loop, one frame, both instruments agreeing:
+
+```
+[PMM-UAF] pa=0xb2a6d000 WRITTEN AFTER FREE: off=0x9e0
+          want=0xfeedface6c0bd000 got=0xfeedface6c0bcfff        ← Rc refcount, -1
+          freed_by=(tid=15 seq=6650975) cow_ref=0
+  [COW-HIST] pa=0xb2a6d000 seq=62938064 tid=15 dec 1->0         ← the fatal decrement
+
+[WILD-DA] pid=2630 FAR=0x18 ELR=0x30028b50
+  [x0] pid=2630 va=0x302e7000 pa=0xb2a6d000 ... last_free=(tid=15 age=887)
+  [COW-HIST] pa=0xb2a6d000 seq=62938064 tid=15 dec 1->0         ← same frame, same event
+```
+
+cargo faulted through `x0` pointing into the frame tid 15 had freed 887 frees
+earlier, on a `dec 1->0` with no matching increment in the window.
+
+### 13.9.4 The fix
+
+At all three sites, the decrement now takes the gate the `#[must_use]` was there to
+provide:
+
+```rust
+let released_last_va = aspace.remove_user_frame(PhysFrame::new(old_pa));
+if released_last_va {
+    crate::pmm::cow_ref_dec(old_pa);
+}
+```
+
+**The residual error direction is now safe.** Decrements are bounded above by one
+per address space, while increments are at least one per address space (`fork`'s
+`cow_share_and_demote_range` still increments once per *(VA, PA)* entry in
+`scratch`, so a parent mapping one frame at several VAs over-counts). Under-counting
+frees a live page; over-counting leaks one, and a leak is visible in `[Mem]`'s
+free-page accounting rather than silently corrupting a process. **Follow-up:**
+make `cow_share_and_demote_range` increment once per distinct PA so the two sides
+match exactly — deliberately not done in the same change, since it is the risky
+direction and the UAF is the bug that had to stop.
+
+Boot self-test: `test_cow_break_dec_only_on_last_va` (`src/process_tests.rs`) drives
+a real frame and a real address space through the two-VA break, asserting the
+reference survives the first break and is surrendered on the second. It has to use
+both ledgers — the bug lives in their disagreement, so neither alone can see it.
+
+### 13.9.5 Instrumentation added, and one that had to be turned off
+
+- `pmm::poison_word_frame` / `report_poison_value`, wired into the `[WILD-DA]`
+  path: decodes a faulting value that is a quarantine poison word back to the frame
+  it belonged to and names the thread that freed it. Zero steady-state cost — it
+  runs only on a fault. This is the automated form of §13.8's XOR by hand.
+- `[PMM-UAF]` now also prints the surviving mapper and the CoW history.
+- `pmm::report_premature_free` (`config::PMM_PREMATURE_FREE_CHECK`, **default
+  off**): asks at every `free_page` whether a live address space still tracks the
+  frame. Correct and it catches read-only survivors, but it scans the process table
+  per free and **perturbs the race** — armed, the cold-build loop went 10/10 green
+  against a 25 % baseline (`p ≈ 0.056` by chance). Left in, disarmed, for a
+  premature free whose victim never faults.
+
 3. **If the zombies are incidental,** the most promising lead is the
    `last_sc=munmap` cluster in crash 2's syscall trail (8 `munmap`s in
    the 30 ms before the fault). cargo tears down its jobserver state

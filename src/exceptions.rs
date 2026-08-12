@@ -1080,17 +1080,25 @@ fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
     if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
         // PTE remap + frame bookkeeping under `as_lock` (`with_address_space`),
         // excluding a concurrent BKL-free fault on this address space.
-        owner.with_address_space(|aspace| {
+        let released_last_va = owner.with_address_space(|aspace| {
             let _ = aspace.map_page(
                 page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
             );
             akuma_exec::mmu::flush_tlb_page(page_va);
             aspace.track_user_frame(new_frame);
-            // CoW: old page freed via the global CoW refcount (cow_ref_dec), not
-            // user_frames — drop the bookkeeping ref but never free here.
-            let _ = aspace.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
+            // CoW: the old page is freed via the global CoW refcount, never here.
+            aspace.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa))
         });
-        crate::pmm::cow_ref_dec(old_pa);
+        // Give up this address space's global reference ONLY if that was its last
+        // VA on the frame. `COW_REFCOUNTS` counts address spaces — the first share
+        // inserts 2, "parent + child" — while `user_frames` counts VAs, which is
+        // why `remove_user_frame` reports the last one. Decrementing per *VA
+        // broken* drops a reference the address space is still using, and the next
+        // holder's decrement then frees a frame we still map. See
+        // `docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` §13.9.
+        if released_last_va {
+            crate::pmm::cow_ref_dec(old_pa);
+        }
         true
     } else {
         crate::pmm::free_page(new_frame); // no owner — free to avoid leak
@@ -2389,15 +2397,18 @@ fn try_resolve_el1_cow_fault() -> bool {
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     if let Some(owner) = akuma_exec::process::lookup_process_shared(pid) {
         // PTE remap + frame bookkeeping under `as_lock` (`with_address_space`).
-        owner.with_address_space(|aspace| {
+        let released_last_va = owner.with_address_space(|aspace| {
             let _ = aspace.map_page(page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
             akuma_exec::mmu::flush_tlb_page(page_va);
             aspace.track_user_frame(new_frame);
-            // CoW: old page freed via the global CoW refcount (cow_ref_dec), not
-            // user_frames — drop the bookkeeping ref but never free here.
-            let _ = aspace.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
+            // CoW: the old page is freed via the global CoW refcount, never here.
+            aspace.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa))
         });
-        crate::pmm::cow_ref_dec(old_pa);
+        // Only the address space's LAST VA on the frame gives up its global
+        // reference — see the identical gate in `try_break_cow_for_kernel_write`.
+        if released_last_va {
+            crate::pmm::cow_ref_dec(old_pa);
+        }
         true // Caller returns; ERET retries the faulting instruction
     } else {
         // No process owner found: cannot remap — free the new frame to avoid a leak.
@@ -3549,12 +3560,16 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                         // `&Process`; `map_user_page` would refuse the valid PTE).
                                         akuma_exec::mmu::remap_current_user_page(page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
                                         owner.address_space.track_user_frame(new_frame);
-                                        // CoW: old page freed via the global CoW refcount
-                                        // (cow_ref_dec), not user_frames — drop the bookkeeping
-                                        // ref but never free here.
-                                        let _ = owner.address_space.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
-                                        // Decrement CoW refcount (may free old page if last ref)
-                                        crate::pmm::cow_ref_dec(old_pa);
+                                        // CoW: the old page is freed via the global CoW
+                                        // refcount, never here.
+                                        let released_last_va = owner.address_space
+                                            .remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
+                                        // Only this address space's LAST VA on the frame gives
+                                        // up its global reference — see the identical gate in
+                                        // `try_break_cow_for_kernel_write`.
+                                        if released_last_va {
+                                            crate::pmm::cow_ref_dec(old_pa);
+                                        }
                                         did_cow = true;
                                     }
                                 }
@@ -4183,6 +4198,26 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     // behind the argument registers most likely to hold that base.
                     // Frames on the PMM free list here are the null-`Rc` defect
                     // caught in the act (proposals/CARGO_HEAP_NULL_RC.md).
+                    // Before anything else: is the faulting value the PMM's own
+                    // quarantine poison? `poison_word` XORs the magic with the
+                    // frame's PA, so a poisoned pointer carries the identity of the
+                    // frame it came from — and decoding it converts "a qword read
+                    // back as garbage" into "frame P, freed by thread T". That is
+                    // what cracked the 2026-08-12 crash (`FAR=0xfeedfacea8d0e010`
+                    // → `poison_word(0x767de000)` + 0x10), and the kernel should not
+                    // need a human with a calculator to say so
+                    // (docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md §13.8).
+                    //
+                    // Every register the instruction could have used as a base, not
+                    // just FAR: the fault address is base+offset, so the undisplaced
+                    // pointer is the one that decodes cleanly.
+                    for (name, val) in [("FAR", far_usize as u64), ("x0", frame_ref.x0),
+                                        ("x1", frame_ref.x1), ("x2", frame_ref.x2),
+                                        ("x3", frame_ref.x3), ("x8", frame_ref.x8),
+                                        ("x19", frame_ref.x19), ("x20", frame_ref.x20)] {
+                        crate::pmm::report_poison_value(name, val);
+                    }
+
                     for (name, val) in [("x0", frame_ref.x0), ("x1", frame_ref.x1),
                                         ("x19", frame_ref.x19), ("FAR", far_usize as u64)] {
                         // Skip obvious non-pointers: page 0 and kernel-range values.

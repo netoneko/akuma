@@ -825,6 +825,134 @@ fn verify_poison(pa: usize) -> Option<(usize, u64)> {
     None
 }
 
+/// If `word` is a quarantine poison word, the frame it was written for.
+///
+/// `poison_word` XORs the magic with the frame's own PA precisely so a stray word
+/// can be traced back to its frame, and this is the reverse. The check that makes
+/// it trustworthy is **page alignment**: an arbitrary 64-bit value that happens to
+/// carry the `0xFEEDFACE` prefix still has to XOR down to a 4 KiB-aligned,
+/// in-range PA, which is a 1-in-4096 accident on top of a 1-in-2^32 one.
+///
+/// This is what turns the null-`Rc` crash from "a qword read back as garbage" into
+/// "frame P, freed by thread T at free-seq S". The value that motivated it was
+/// `0xfeedfacea8d0e010` — a poisoned pointer for frame `0x767de000`, dereferenced
+/// at `+0x10` (`docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` §13.8).
+pub fn poison_word_frame(word: u64) -> Option<usize> {
+    if !crate::config::PMM_UAF_QUARANTINE {
+        return None;
+    }
+    // Cheap reject first: everything else here is only reached for a word that
+    // already carries the magic's high half.
+    if word >> 32 != POISON_MAGIC >> 32 {
+        return None;
+    }
+    let pa = (word ^ POISON_MAGIC) as usize;
+    if pa & (PAGE_SIZE - 1) != 0 {
+        return None;
+    }
+    // Lock-free bounds (plain atomics with a compile-time fallback), so this stays
+    // callable from the fault path without taking the PMM's own `Spinlock`.
+    if pa < akuma_exec::mmu::ram_base() || pa >= akuma_exec::mmu::ram_end() {
+        return None;
+    }
+    Some(pa)
+}
+
+/// Report a value that decoded as quarantine poison, naming the frame it belonged
+/// to, who freed it and how its reference count got to zero.
+///
+/// Called from the fault path with whatever registers the faulting instruction
+/// used, so it costs nothing until something actually goes wrong — the opposite
+/// trade from [`report_premature_free`], whose per-`free_page` scan is heavy
+/// enough to perturb the very race it hunts (measured: 10 consecutive clean cold
+/// builds with it armed, against a 25 % baseline).
+pub fn report_poison_value(tag: &str, word: u64) {
+    let Some(pa) = poison_word_frame(word) else { return };
+    let (tid_freed, seq_freed) = last_free_record(pa).unwrap_or((u32::MAX, 0));
+    crate::safe_print!(255,
+        "[PMM-POISON] {}={:#x} is quarantine poison for pa={:#x} — the kernel FREED \
+         this frame while the process still had it. freed_by=(tid={} seq={}) now_seq={} cow_ref={}\n",
+        tag, word, pa, tid_freed, seq_freed, free_ledger_seq(), cow_ref_get(pa));
+    if let Some((pid, tgid)) = surviving_mapper(pa) {
+        crate::safe_print!(128,
+            "  [PMM-POISON] pa={:#x} still tracked by pid={} tgid={}\n", pa, pid, tgid);
+    }
+    print_cow_history(pa);
+}
+
+/// Frames released while a live address space still tracked them — the premature
+/// free itself, counted at the moment it happens rather than inferred from a
+/// crash later. Surfaced in the `[Mem]` line; must be 0.
+static PREMATURE_FREES: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of premature frees detected since boot (see [`PREMATURE_FREES`]).
+pub fn premature_free_count() -> usize {
+    PREMATURE_FREES.load(Ordering::Relaxed)
+}
+
+/// The first live address space, other than any this thread is tearing down, that
+/// still tracks `pa` as one of its user frames — as `(pid, tgid)`.
+///
+/// # Why this is the instrument the poison check could not be
+///
+/// `verify_poison` only catches a **write** through a mapping that outlived its
+/// free. The fatal access in the null-`Rc` defect is a **read** — a poisoned qword
+/// loaded as a pointer and dereferenced — which leaves the frame's contents intact
+/// and is therefore structurally invisible to it
+/// (`docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` §13.8.2). This asks the
+/// question directly instead: at the instant the last reference is dropped, does
+/// anyone still hold the frame?
+///
+/// A hit is unambiguous. `free_page` only gets here when `cow_ref_dec` reported
+/// the *last* reference, and `remove_user_frame` removes its entry **before**
+/// handing the free obligation to its caller — so the releasing address space has
+/// already stopped tracking it. Any other address space that still does means the
+/// reference count reached zero while the frame was genuinely still owned, which
+/// is §2.1's "one decrement too many frees a live page".
+///
+/// # Safety of calling this from inside `free_page`
+///
+/// `find_process` is lock-free (slot-state atomics + raw pointers under an IRQ
+/// guard) — it is **not** the §10 re-entrancy hazard that bans `read_current_pid`
+/// here, which deadlocks on `THREAD_PID_MAP`'s `Spinlock`. `tracks_user_frame`
+/// does take a `Spinlock`, but no path holds a `user_frames` lock across a
+/// `free_page` call: `remove_user_frame` drops it before returning `true`, and
+/// address-space teardown moves the whole map out of the lock first
+/// (`free_as_frames_now`). RETIRED slots are skipped by `find_process`, so a
+/// process being reaped cannot report itself.
+fn surviving_mapper(pa: usize) -> Option<(u32, u32)> {
+    akuma_exec::process::table::find_process(|p| {
+        if p.address_space.tracks_user_frame(pa) {
+            Some((p.pid, p.tgid))
+        } else {
+            None
+        }
+    })
+}
+
+/// Report a frame that was freed while a live address space still mapped it.
+///
+/// Prints the victim as well as the culprit, because the two halves are what the
+/// investigation was missing: `freed_by` names the thread that released it, and
+/// `still_mapped_by` names the process that is about to read poison out of it. The
+/// CoW history follows, since a premature free is by construction an accounting
+/// bug and that ledger shows the inc/dec sequence that drove the count to zero.
+fn report_premature_free(pa: usize) {
+    let Some((pid, tgid)) = surviving_mapper(pa) else { return };
+    let n = PREMATURE_FREES.fetch_add(1, Ordering::Relaxed);
+    // Rate-limited: one bad decrement under load can repeat thousands of times,
+    // and a console flood is its own defect (SERIAL_TRACE_TRAFFIC_AUDIT.md).
+    if n >= 64 {
+        return;
+    }
+    crate::safe_print!(255,
+        "[PMM-PREMATURE] pa={:#x} freed by tid={} while still mapped by pid={} tgid={} \
+         cow_ref={} seq={}\n",
+        pa, akuma_exec::threading::current_thread_id(), pid, tgid,
+        cow_ref_get(pa), free_ledger_seq());
+    print_cow_history(pa);
+}
+
 /// Verify a frame leaving quarantine and hand it back to the bitmap.
 fn release_from_quarantine(pa: usize) {
     if let Some((off, got)) = verify_poison(pa) {
@@ -834,6 +962,13 @@ fn release_from_quarantine(pa: usize) {
             "[PMM-UAF] pa={:#x} WRITTEN AFTER FREE: off={:#x} got={:#x} want={:#x} \
              freed_by=(tid={} seq={}) cow_ref={}\n",
             pa, off, got, poison_word(pa), tid_freed, seq_freed, cow_ref_get(pa));
+        // The write proves someone held it; name them and show the accounting that
+        // let go too early. Cheap — this path already runs only on an anomaly.
+        if let Some((pid, tgid)) = surviving_mapper(pa) {
+            crate::safe_print!(160,
+                "  [PMM-UAF] pa={:#x} STILL MAPPED BY pid={} tgid={}\n", pa, pid, tgid);
+        }
+        print_cow_history(pa);
     }
     QUAR_PRESENT[quar_slot(pa)].compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).ok();
 
@@ -1054,6 +1189,16 @@ pub fn free_page(frame: PhysFrame) {
     // every frame of its address space), so calling it here deadlocks on a
     // non-reentrant `Spinlock`. `current_thread_id` is a register read.
     record_free(frame.addr, akuma_exec::threading::current_thread_id() as u32);
+
+    // Ask, at the instant the last reference is dropped, whether anyone still
+    // holds this frame. A hit is the premature free itself — caught at its own
+    // call site with the freeing thread live, instead of inferred from a poisoned
+    // pointer minutes later in another process. Unlike the poison check below it
+    // sees read-only survivors too, which is the class that kills cargo
+    // (docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md §13.8).
+    if crate::config::PMM_PREMATURE_FREE_CHECK {
+        report_premature_free(frame.addr);
+    }
 
     // Poison and park instead of releasing immediately, so a write through a
     // mapping that outlived this free is caught with the frame still named.
