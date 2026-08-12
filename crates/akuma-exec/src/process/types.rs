@@ -45,16 +45,12 @@ impl Future for YieldOnce {
 /// Fixed address for process info page (read-only from userspace)
 pub const PROCESS_INFO_ADDR: usize = 0x1000;
 
-/// Maximum size of argument data in ProcessInfo
-pub const ARGV_DATA_SIZE: usize = 744;
-
-/// Maximum size of cwd data in ProcessInfo
-pub const CWD_DATA_SIZE: usize = 256;
-
 /// Process info structure shared between kernel and userspace
 ///
-/// The kernel writes this, userspace reads it (read-only mapping).
-/// Layout must match libakuma exactly.
+/// The kernel writes it via [`ProcessInfo::new`]; userspace reads it through
+/// the matching struct in `userspace/libakuma/src/lib.rs`. Only `pid`/`ppid`/
+/// `box_id` are meaningful — argv and cwd are not communicated through this
+/// page (argv comes from the entry stack, cwd from the `GETCWD` syscall).
 #[repr(C)]
 pub struct ProcessInfo {
     pub pid: u32,

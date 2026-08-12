@@ -17,13 +17,11 @@ use boxlib::paths::{self, CONTAINERS_BASE, LAYERS_BASE};
 
 /// Whether anything exists at `path` — file, directory or symlink.
 pub fn path_exists(path: &str) -> bool {
-    let path_c = format!("{}\0", path);
-    libakuma::fstatat(-100, &path_c, 0).is_ok()
+    libakuma::fstatat(-100, path, 0).is_ok()
 }
 
 pub fn dir_exists(path: &str) -> bool {
-    let path_c = format!("{}\0", path);
-    match libakuma::fstatat(-100, &path_c, 0) {
+    match libakuma::fstatat(-100, path, 0) {
         Ok(st) => st.st_mode & 0o170_000 == 0o040_000,
         Err(_) => false,
     }

@@ -2,6 +2,11 @@
 //!
 //! Provides functions for HTTP GET/POST requests over HTTP and HTTPS,
 //! including streaming response support.
+//!
+//! All read/stream loops share one code path via the private [`HttpIo`]
+//! trait, dispatched dynamically so there is exactly one copy of each loop
+//! body in the binary regardless of transport. See
+//! `docs/archive/LIBAKUMA_AUDIT.md` item 4.
 
 use alloc::format;
 use alloc::string::String;
@@ -16,6 +21,52 @@ use crate::{Error, TlsStream, TLS_RECORD_SIZE};
 const DEFAULT_MAX_RESPONSE_SIZE: usize = 20 * 1024 * 1024;
 /// Maximum buffer size for HTTP headers before considering them malformed (256KB)
 const MAX_HEADERS_BUFFER_SIZE: usize = 256 * 1024;
+/// Consecutive transient I/O errors tolerated before giving up on a TCP read.
+/// The kernel's recv blocks for up to 30s, so genuine WouldBlock is rare; this
+/// budget absorbs short hiccups without an unbounded hang.
+const TCP_ERROR_BUDGET: u32 = 200;
+
+// ============================================================================
+// Shared transport abstraction
+// ============================================================================
+
+/// Private read/write abstraction over the two transports (`TcpStream` and
+/// `TlsStream`). Methods are written `&mut self` for object safety; helpers
+/// below take `&mut dyn HttpIo` so each loop body exists once in the binary.
+///
+/// Error mapping is transport-specific and intentionally lossy here — a
+/// richer `Error` is the audit's item 9, not this refactor.
+trait HttpIo {
+    /// One read attempt. `Ok(n)` with n>0 = data, `Ok(0)` = EOF, `Err` = failure.
+    fn io_read(&mut self, buf: &mut [u8]) -> Result<usize, Error>;
+    /// Write all bytes (and flush, for TLS). `Err` only on hard failure.
+    fn io_write_all(&mut self, buf: &[u8]) -> Result<(), Error>;
+}
+
+impl HttpIo for TlsStream<'_> {
+    fn io_read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        self.read(buf)
+    }
+    fn io_write_all(&mut self, buf: &[u8]) -> Result<(), Error> {
+        // TLS needs an explicit flush to push the encrypted record onto the
+        // wire; bundle it here so callers don't have to remember per-transport.
+        self.write_all(buf)?;
+        self.flush()
+    }
+}
+
+impl HttpIo for TcpStream {
+    fn io_read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        TcpStream::read(self, buf).map_err(|_| Error::IoError)
+    }
+    fn io_write_all(&mut self, buf: &[u8]) -> Result<(), Error> {
+        TcpStream::write_all(self, buf).map_err(|_| Error::IoError)
+    }
+}
+
+// ============================================================================
+// HTTP headers
+// ============================================================================
 
 /// HTTP headers for requests
 pub struct HttpHeaders {
@@ -63,251 +114,9 @@ impl Default for HttpHeaders {
     }
 }
 
-/// Fetch content from an HTTP or HTTPS URL
-///
-/// # Arguments
-/// * `url` - The URL to fetch (http:// or https://)
-/// * `_insecure` - If true, skip TLS certificate verification (like curl -k)
-/// * `max_size` - Maximum response body size in bytes (None = 20MB default)
-///
-/// # Returns
-/// The response body as a byte vector, or an error
-pub fn https_fetch(url: &str, _insecure: bool, max_size: Option<usize>) -> Result<Vec<u8>, Error> {
-    let limit = max_size.unwrap_or(DEFAULT_MAX_RESPONSE_SIZE);
-    let parsed = parse_url(url).ok_or(Error::InvalidUrl)?;
-
-    // Resolve hostname
-    let ip = resolve(parsed.host).map_err(|_| Error::DnsError)?;
-    let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], parsed.port);
-
-    // Connect TCP
-    let stream = TcpStream::connect(&addr_str)
-        .map_err(|e| Error::ConnectionError(format!("{:?}", e)))?;
-
-    if parsed.is_https {
-        // HTTPS - wrap in TLS
-        let transport = TcpTransport::new(stream);
-
-        // Allocate TLS buffers
-        let mut read_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
-        let mut write_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
-
-        let mut tls = TlsStream::connect(
-            transport,
-            parsed.host,
-            &mut read_buf,
-            &mut write_buf,
-        )?;
-
-        // Send HTTP request
-        let request = build_http_request(parsed.host, parsed.path);
-        tls.write_all(request.as_bytes())?;
-        tls.flush()?;
-
-        // Read response
-        let response = read_response_tls(&mut tls, limit)?;
-
-        // Close TLS gracefully (ignore errors on close)
-        let _ = tls.close();
-
-        // Parse HTTP response
-        parse_http_response(&response)
-    } else {
-        // Plain HTTP
-        let request = build_http_request(parsed.host, parsed.path);
-        stream.write_all(request.as_bytes())
-            .map_err(|_| Error::IoError)?;
-
-        // Read response
-        let response = read_response_tcp(&stream, limit)?;
-
-        // Parse HTTP response
-        parse_http_response(&response)
-    }
-}
-
-/// Download a file from an HTTP or HTTPS URL and save it to disk.
-///
-/// This function streams the response body directly to a file, which is
-/// memory-efficient for large files.
-///
-/// # Arguments
-/// * `url` - The URL to fetch (http:// or https://)
-/// * `dest_path` - The path on the local filesystem to save the file to.
-///
-/// # Returns
-/// Ok(()) on success, or an error.
-pub fn download_file(url: &str, dest_path: &str) -> Result<(), Error> {
-    let parsed = parse_url(url).ok_or(Error::InvalidUrl)?;
-
-    // Resolve hostname
-    let ip = resolve(parsed.host).map_err(|_| Error::DnsError)?;
-    let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], parsed.port);
-
-    // Connect TCP
-    let stream = TcpStream::connect(&addr_str)
-        .map_err(|e| Error::ConnectionError(format!("{:?}", e)))?;
-
-    // Open destination file
-    let fd = libakuma::open(dest_path, libakuma::open_flags::O_WRONLY | libakuma::open_flags::O_CREAT | libakuma::open_flags::O_TRUNC);
-    if fd < 0 {
-        return Err(Error::IoError);
-    }
-
-    let result = if parsed.is_https {
-        // HTTPS - wrap in TLS
-        let transport = TcpTransport::new(stream);
-        let mut read_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
-        let mut write_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
-        let mut tls = TlsStream::connect(transport, parsed.host, &mut read_buf, &mut write_buf)?;
-
-        let request = build_http_request(parsed.host, parsed.path);
-        tls.write_all(request.as_bytes())?;
-        tls.flush()?;
-
-        stream_to_file(Streamer::Tls(&mut tls), fd)
-    } else {
-        // Plain HTTP
-        let request = build_http_request(parsed.host, parsed.path);
-        stream.write_all(request.as_bytes()).map_err(|_| Error::IoError)?;
-
-        stream_to_file(Streamer::Tcp(&stream), fd)
-    };
-
-    libakuma::close(fd);
-    result
-}
-
-// Helper enum to abstract over TlsStream and TcpStream for stream_to_file
-enum Streamer<'a> {
-    Tls(&'a mut TlsStream<'a>),
-    Tcp(&'a TcpStream),
-}
-
-// Read from a stream and write to a file descriptor
-fn stream_to_file(mut streamer: Streamer, fd: i32) -> Result<(), Error> {
-    // First, we need to read and parse headers before streaming the body.
-    // This is a simplified version of read_response_*, but instead of
-    // buffering the body, we write it to the file.
-    let mut response_buf = Vec::new();
-    let mut buf = [0u8; 64 * 1024]; // Increased buffer size
-    let mut headers_end = None;
-
-    // Read until headers are found
-    let mut header_errors = 0u32;
-    while headers_end.is_none() {
-        let read_result = match &mut streamer {
-            Streamer::Tls(s) => s.read(&mut buf),
-            Streamer::Tcp(s) => s.read(&mut buf).map_err(|_| Error::IoError),
-        };
-
-        match read_result {
-            Ok(0) => break,
-            Ok(n) => {
-                header_errors = 0;
-                response_buf.extend_from_slice(&buf[..n]);
-                if response_buf.len() > MAX_HEADERS_BUFFER_SIZE {
-                    return Err(Error::HttpError(String::from("HTTP headers too large or malformed")));
-                }
-                headers_end = find_headers_end(&response_buf);
-            }
-            Err(e) => {
-                 match e {
-                    Error::TlsError(_) => return Err(e),
-                    Error::IoError => {
-                        header_errors += 1;
-                        if header_errors >= 200 {
-                            return Err(Error::IoError);
-                        }
-                        libakuma::sleep_ms(1);
-                        continue;
-                    },
-                    _ => return Err(e),
-                }
-            }
-        }
-    }
-
-    let end_pos = headers_end.ok_or_else(|| Error::HttpError(String::from("Invalid HTTP response")))?;
-    
-    // Parse status and Content-Length
-    let header_str = core::str::from_utf8(&response_buf[..end_pos]).map_err(|_| Error::HttpError(String::from("Invalid HTTP headers")))?;
-    let status: u16 = header_str.lines().next().and_then(|line| line.split_whitespace().nth(1)?.parse().ok())
-        .ok_or_else(|| Error::HttpError(String::from("Invalid status line")))?;
-
-    if status < 200 || status >= 300 {
-        return Err(Error::HttpError(format!("HTTP error: {}", status)));
-    }
-
-    let content_length: Option<usize> = header_str.lines()
-        .find(|line| {
-            let lower: Vec<u8> = line.as_bytes().iter().take(16)
-                .map(|b| b.to_ascii_lowercase()).collect();
-            lower.starts_with(b"content-length:")
-        })
-        .and_then(|line| line.split(':').nth(1)?.trim().parse().ok());
-
-    // Write the part of the body we already read
-    let body_chunk = &response_buf[end_pos..];
-    let mut body_written: usize = 0;
-    if !body_chunk.is_empty() {
-        if libakuma::write_fd(fd, body_chunk) < 0 {
-            return Err(Error::IoError);
-        }
-        body_written += body_chunk.len();
-    }
-
-    // Check if we already have the full body
-    if let Some(cl) = content_length {
-        if body_written >= cl {
-            return Ok(());
-        }
-    }
-
-    // Stream the rest of the body directly to the file
-    let mut consecutive_errors = 0u32;
-    const MAX_CONSECUTIVE_ERRORS: u32 = 200;
-
-    loop {
-         let read_result = match &mut streamer {
-            Streamer::Tls(s) => s.read(&mut buf),
-            Streamer::Tcp(s) => s.read(&mut buf).map_err(|_| Error::IoError),
-        };
-
-        match read_result {
-            Ok(0) => break,
-            Ok(n) => {
-                consecutive_errors = 0;
-                if libakuma::write_fd(fd, &buf[..n]) < 0 {
-                    return Err(Error::IoError);
-                }
-                body_written += n;
-                if let Some(cl) = content_length {
-                    if body_written >= cl {
-                        break;
-                    }
-                }
-            }
-            Err(e) => {
-                 match e {
-                    Error::TlsError(_) => return Err(e),
-                    Error::IoError => {
-                        consecutive_errors += 1;
-                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                            break;
-                        }
-                        libakuma::sleep_ms(1);
-                        continue;
-                    },
-                    _ => return Err(e),
-                 }
-            }
-        }
-    }
-
-    Ok(())
-}
-
+// ============================================================================
+// URL parsing + request building
+// ============================================================================
 
 /// Parsed URL components
 pub struct ParsedUrl<'a> {
@@ -330,13 +139,11 @@ pub fn parse_url(url: &str) -> Option<ParsedUrl<'_>> {
 
     let default_port = if is_https { 443 } else { 80 };
 
-    // Split host:port from path
     let (host_port, path) = match rest.find('/') {
         Some(pos) => (&rest[..pos], &rest[pos..]),
         None => (rest, "/"),
     };
 
-    // Parse host and port
     let (host, port) = match host_port.rfind(':') {
         Some(pos) => {
             let h = &host_port[..pos];
@@ -354,7 +161,7 @@ pub fn parse_url(url: &str) -> Option<ParsedUrl<'_>> {
     })
 }
 
-/// Build an HTTP GET request
+/// Build an HTTP GET request (no custom headers).
 fn build_http_request(host: &str, path: &str) -> String {
     format!(
         "GET {} HTTP/1.0\r\n\
@@ -392,6 +199,253 @@ fn build_post_request(host: &str, path: &str, body: &str, headers: &HttpHeaders)
     )
 }
 
+/// Resolve + connect the TCP socket for a parsed URL.
+fn tcp_connect(parsed: &ParsedUrl) -> Result<TcpStream, Error> {
+    let ip = resolve(parsed.host).map_err(|_| Error::DnsError)?;
+    let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], parsed.port);
+    TcpStream::connect(&addr_str).map_err(|e| Error::ConnectionError(format!("{:?}", e)))
+}
+
+// ============================================================================
+// Shared response readers
+// ============================================================================
+
+/// Parse Content-Length from HTTP headers once we've found the header boundary.
+/// Returns (headers_end_offset, content_length_if_present).
+fn parse_content_length(data: &[u8]) -> Option<(usize, Option<usize>)> {
+    let end = find_headers_end(data)?;
+    let header_str = core::str::from_utf8(&data[..end]).ok()?;
+    let cl = header_str.lines()
+        .find(|line| {
+            let lower_start = line.as_bytes().iter().take(16)
+                .map(|b| b.to_ascii_lowercase())
+                .collect::<Vec<u8>>();
+            lower_start.starts_with(b"content-length:")
+        })
+        .and_then(|line| line.split(':').nth(1)?.trim().parse::<usize>().ok());
+    Some((end, cl))
+}
+
+/// Check if the full HTTP response body has been received based on Content-Length.
+fn response_complete(data: &[u8], max_size: usize) -> bool {
+    if data.len() >= max_size {
+        return true;
+    }
+    if let Some((headers_end, Some(content_length))) = parse_content_length(data) {
+        let body_received = data.len() - headers_end;
+        body_received >= content_length
+    } else {
+        false
+    }
+}
+
+/// Find the end of HTTP headers (\r\n\r\n)
+pub fn find_headers_end(data: &[u8]) -> Option<usize> {
+    for i in 0..data.len().saturating_sub(3) {
+        if &data[i..i + 4] == b"\r\n\r\n" {
+            return Some(i + 4);
+        }
+    }
+    None
+}
+
+/// Read the response body into a Vec, capped at `max_size`.
+///
+/// `error_budget` is the number of consecutive transient I/O errors tolerated
+/// before breaking: 0 for TLS (errors are fatal — record corruption, etc.),
+/// [`TCP_ERROR_BUDGET`] for TCP (WouldBlock after a 30s recv timeout is rare
+/// but recoverable). A successful read resets the budget.
+///
+/// On a hard error before any byte is received, returns `Err(IoError)` so the
+/// caller can distinguish "nothing came" from "truncated mid-stream" (the
+/// compromise documented in `userspace/libakuma-tls/docs/ERROR_HANDLING_FIX.md`).
+fn read_response(s: &mut dyn HttpIo, max_size: usize, error_budget: u32) -> Result<Vec<u8>, Error> {
+    let mut response = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut budget = error_budget;
+    loop {
+        match s.io_read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                budget = error_budget;
+                if response.len() + n > max_size {
+                    let remaining = max_size - response.len();
+                    response.extend_from_slice(&buf[..remaining]);
+                    break;
+                }
+                response.extend_from_slice(&buf[..n]);
+                if response_complete(&response, max_size) {
+                    break;
+                }
+            }
+            Err(_) => {
+                if response.is_empty() {
+                    return Err(Error::IoError);
+                }
+                if budget == 0 {
+                    break;
+                }
+                budget -= 1;
+                libakuma::sleep_ms(1);
+            }
+        }
+    }
+    Ok(response)
+}
+
+/// Read until the end-of-headers marker (`\r\n\r\n`) into `hdr_buf`.
+///
+/// Returns `Err(HttpError)` if headers exceed [`MAX_HEADERS_BUFFER_SIZE`] or
+/// never arrive within [`TCP_ERROR_BUDGET`] consecutive transient errors.
+/// Non-I/O errors (e.g. TLS record corruption) propagate immediately.
+fn read_until_headers(s: &mut dyn HttpIo, hdr_buf: &mut Vec<u8>) -> Result<(), Error> {
+    let mut tmp = [0u8; 16384];
+    let mut retries = 0u32;
+    loop {
+        match s.io_read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => {
+                retries = 0;
+                hdr_buf.extend_from_slice(&tmp[..n]);
+                if find_headers_end(hdr_buf).is_some() {
+                    break;
+                }
+                if hdr_buf.len() > MAX_HEADERS_BUFFER_SIZE {
+                    return Err(Error::HttpError(String::from("Headers too large")));
+                }
+            }
+            Err(Error::IoError) => {
+                retries += 1;
+                if retries >= TCP_ERROR_BUDGET {
+                    return Err(Error::IoError);
+                }
+                libakuma::sleep_ms(1);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Stream the response body to a file descriptor.
+///
+/// `initial` is body data already buffered from the header read; `content_length`
+/// (if known) bounds the total so a server that holds the connection open
+/// (HTTP/1.1 keep-alive ignoring our `Connection: close`) doesn't make us
+/// block until the recv timeout. Transient I/O errors are tolerated up to
+/// [`TCP_ERROR_BUDGET`] times; TLS-record-corruption-class errors stop the
+/// stream immediately.
+fn stream_body_to_fd(s: &mut dyn HttpIo, fd: i32, initial: &[u8], content_length: Option<usize>) {
+    let mut written: usize = 0;
+    if !initial.is_empty() {
+        libakuma::write_fd(fd, initial);
+        written += initial.len();
+    }
+    if let Some(cl) = content_length {
+        if written >= cl {
+            return;
+        }
+    }
+    let mut tmp = [0u8; 16384];
+    let mut errors = 0u32;
+    loop {
+        match s.io_read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => {
+                errors = 0;
+                libakuma::write_fd(fd, &tmp[..n]);
+                written += n;
+                if let Some(cl) = content_length {
+                    if written >= cl {
+                        break;
+                    }
+                }
+            }
+            Err(Error::IoError) => {
+                errors += 1;
+                if errors >= TCP_ERROR_BUDGET {
+                    break;
+                }
+                libakuma::sleep_ms(1);
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Parse HTTP response, extract body
+fn parse_http_response(data: &[u8]) -> Result<Vec<u8>, Error> {
+    let headers_end = find_headers_end(data)
+        .ok_or_else(|| Error::HttpError(String::from("Invalid HTTP response")))?;
+
+    let header_str = core::str::from_utf8(&data[..headers_end])
+        .map_err(|_| Error::HttpError(String::from("Invalid HTTP headers")))?;
+
+    let first_line = header_str
+        .lines()
+        .next()
+        .ok_or_else(|| Error::HttpError(String::from("Empty response")))?;
+
+    let mut parts = first_line.split_whitespace();
+    let _version = parts
+        .next()
+        .ok_or_else(|| Error::HttpError(String::from("Missing HTTP version")))?;
+    let status: u16 = parts
+        .next()
+        .ok_or_else(|| Error::HttpError(String::from("Missing status code")))?
+        .parse()
+        .map_err(|_| Error::HttpError(String::from("Invalid status code")))?;
+
+    if status < 200 || status >= 300 {
+        return Err(Error::HttpError(format!("HTTP error: {}", status)));
+    }
+
+    Ok(data[headers_end..].to_vec())
+}
+
+// ============================================================================
+// In-memory fetch API
+// ============================================================================
+
+/// Connect, send `request`, read the full response into a Vec, parse it.
+/// The transport is chosen by URL scheme; TLS errors are non-retryable, TCP
+/// errors get [`TCP_ERROR_BUDGET`] retries — matching the pre-refactor
+/// behaviour of `read_response_{tls,tcp}`.
+fn fetch_to_vec(parsed: &ParsedUrl, request: &str, max_size: usize) -> Result<Vec<u8>, Error> {
+    let mut stream = tcp_connect(parsed)?;
+    let response = if parsed.is_https {
+        let transport = TcpTransport::new(stream);
+        let mut read_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
+        let mut write_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
+        let mut tls = TlsStream::connect(transport, parsed.host, &mut read_buf, &mut write_buf)?;
+        tls.io_write_all(request.as_bytes())?;
+        let response = read_response(&mut tls, max_size, 0)?;
+        let _ = tls.close();
+        response
+    } else {
+        stream.io_write_all(request.as_bytes())?;
+        read_response(&mut stream, max_size, TCP_ERROR_BUDGET)?
+    };
+    parse_http_response(&response)
+}
+
+/// Fetch content from an HTTP or HTTPS URL
+///
+/// **Certificate verification is disabled** — see the crate-level `// SECURITY:`
+/// banner in `lib.rs`. This channel is MITM-able.
+///
+/// # Arguments
+/// * `url` - The URL to fetch (http:// or https://)
+/// * `max_size` - Maximum response body size in bytes (None = 20MB default)
+///
+/// # Returns
+/// The response body as a byte vector, or an error
+pub fn https_fetch(url: &str, max_size: Option<usize>) -> Result<Vec<u8>, Error> {
+    let parsed = parse_url(url).ok_or(Error::InvalidUrl)?;
+    let request = build_http_request(parsed.host, parsed.path);
+    fetch_to_vec(&parsed, &request, max_size.unwrap_or(DEFAULT_MAX_RESPONSE_SIZE))
+}
+
 /// GET content from an HTTP or HTTPS URL with custom headers
 ///
 /// # Arguments
@@ -417,55 +471,8 @@ pub fn https_get(url: &str, headers: &HttpHeaders) -> Result<Vec<u8>, Error> {
 /// GET with explicit max response size
 pub fn https_get_with_limit(url: &str, headers: &HttpHeaders, max_size: usize) -> Result<Vec<u8>, Error> {
     let parsed = parse_url(url).ok_or(Error::InvalidUrl)?;
-
-    // Resolve hostname
-    let ip = resolve(parsed.host).map_err(|_| Error::DnsError)?;
-    let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], parsed.port);
-
-    // Connect TCP
-    let stream = TcpStream::connect(&addr_str)
-        .map_err(|e| Error::ConnectionError(format!("{:?}", e)))?;
-
-    if parsed.is_https {
-        // HTTPS - wrap in TLS
-        let transport = TcpTransport::new(stream);
-
-        // Allocate TLS buffers
-        let mut read_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
-        let mut write_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
-
-        let mut tls = TlsStream::connect(
-            transport,
-            parsed.host,
-            &mut read_buf,
-            &mut write_buf,
-        )?;
-
-        // Send HTTP request
-        let request = build_get_request_with_headers(parsed.host, parsed.path, headers);
-        tls.write_all(request.as_bytes())?;
-        tls.flush()?;
-
-        // Read response
-        let response = read_response_tls(&mut tls, max_size)?;
-
-        // Close TLS gracefully (ignore errors on close)
-        let _ = tls.close();
-
-        // Parse HTTP response
-        parse_http_response(&response)
-    } else {
-        // Plain HTTP
-        let request = build_get_request_with_headers(parsed.host, parsed.path, headers);
-        stream.write_all(request.as_bytes())
-            .map_err(|_| Error::IoError)?;
-
-        // Read response
-        let response = read_response_tcp(&stream, max_size)?;
-
-        // Parse HTTP response
-        parse_http_response(&response)
-    }
+    let request = build_get_request_with_headers(parsed.host, parsed.path, headers);
+    fetch_to_vec(&parsed, &request, max_size)
 }
 
 /// POST data to an HTTP or HTTPS URL
@@ -496,213 +503,151 @@ pub fn https_post(url: &str, body: &str, headers: &HttpHeaders) -> Result<Vec<u8
 /// POST with explicit max response size
 pub fn https_post_with_limit(url: &str, body: &str, headers: &HttpHeaders, max_size: usize) -> Result<Vec<u8>, Error> {
     let parsed = parse_url(url).ok_or(Error::InvalidUrl)?;
+    let request = build_post_request(parsed.host, parsed.path, body, headers);
+    fetch_to_vec(&parsed, &request, max_size)
+}
 
-    // Resolve hostname
-    let ip = resolve(parsed.host).map_err(|_| Error::DnsError)?;
-    let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], parsed.port);
+// ============================================================================
+// Download-to-disk API (with redirect support)
+// ============================================================================
 
-    // Connect TCP
-    let stream = TcpStream::connect(&addr_str)
-        .map_err(|e| Error::ConnectionError(format!("{:?}", e)))?;
-
-    if parsed.is_https {
-        // HTTPS - wrap in TLS
-        let transport = TcpTransport::new(stream);
-
-        // Allocate TLS buffers
-        let mut read_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
-        let mut write_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
-
-        let mut tls = TlsStream::connect(
-            transport,
-            parsed.host,
-            &mut read_buf,
-            &mut write_buf,
-        )?;
-
-        // Send HTTP request
-        let request = build_post_request(parsed.host, parsed.path, body, headers);
-        tls.write_all(request.as_bytes())?;
-        tls.flush()?;
-
-        // Read response
-        let response = read_response_tls(&mut tls, max_size)?;
-
-        // Close TLS gracefully (ignore errors on close)
-        let _ = tls.close();
-
-        // Parse HTTP response
-        parse_http_response(&response)
+/// Resolve a redirect Location header value to an absolute URL.
+/// Handles relative paths (/path), protocol-relative (//host/path), and absolute URLs.
+fn resolve_redirect_url(location: &str, scheme: &str, host: &str) -> String {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        String::from(location)
+    } else if location.starts_with("//") {
+        format!("{}:{}", scheme, location)
+    } else if location.starts_with('/') {
+        format!("{}://{}{}", scheme, host, location)
     } else {
-        // Plain HTTP
-        let request = build_post_request(parsed.host, parsed.path, body, headers);
-        stream.write_all(request.as_bytes())
-            .map_err(|_| Error::IoError)?;
-
-        // Read response
-        let response = read_response_tcp(&stream, max_size)?;
-
-        // Parse HTTP response
-        parse_http_response(&response)
+        String::from(location)
     }
 }
 
-/// Parse Content-Length from HTTP headers once we've found the header boundary.
-/// Returns (headers_end_offset, content_length_if_present).
-fn parse_content_length(data: &[u8]) -> Option<(usize, Option<usize>)> {
-    let end = find_headers_end(data)?;
-    let header_str = core::str::from_utf8(&data[..end]).ok()?;
-    let cl = header_str.lines()
-        .find(|line| {
-            let lower_start = line.as_bytes().iter().take(16)
-                .map(|b| b.to_ascii_lowercase())
-                .collect::<Vec<u8>>();
-            lower_start.starts_with(b"content-length:")
-        })
-        .and_then(|line| line.split(':').nth(1)?.trim().parse::<usize>().ok());
-    Some((end, cl))
-}
-
-/// Check if the full HTTP response body has been received based on Content-Length.
-/// Returns true if we should stop reading.
-fn response_complete(data: &[u8], max_size: usize) -> bool {
-    if data.len() >= max_size {
-        return true;
-    }
-    if let Some((headers_end, Some(content_length))) = parse_content_length(data) {
-        let body_received = data.len() - headers_end;
-        body_received >= content_length
-    } else {
-        false
-    }
-}
-
-/// Read HTTP response from TLS stream
-fn read_response_tls(tls: &mut TlsStream<'_>, max_size: usize) -> Result<Vec<u8>, Error> {
-    let mut response = Vec::new();
-    let mut buf = [0u8; 4096];
-
-    loop {
-        match tls.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if response.len() + n > max_size {
-                    let remaining = max_size - response.len();
-                    response.extend_from_slice(&buf[..remaining]);
-                    break;
-                }
-                response.extend_from_slice(&buf[..n]);
-                if response_complete(&response, max_size) {
-                    break;
-                }
-            }
-            Err(_) => {
-                if response.is_empty() {
-                    return Err(Error::IoError);
-                }
-                break;
-            }
+fn extract_location_header(headers: &str) -> Option<String> {
+    for line in headers.lines() {
+        let lower: Vec<u8> = line.as_bytes().iter().take(9).map(|b| b.to_ascii_lowercase()).collect();
+        if lower.starts_with(b"location:") {
+            let value = line[9..].trim();
+            return Some(String::from(value));
         }
     }
-
-    Ok(response)
+    None
 }
 
-/// Read HTTP response from TCP stream
-fn read_response_tcp(stream: &TcpStream, max_size: usize) -> Result<Vec<u8>, Error> {
-    let mut response = Vec::new();
-    let mut buf = [0u8; 4096];
-    let mut consecutive_errors = 0u32;
-    const MAX_CONSECUTIVE_ERRORS: u32 = 200;
-
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                consecutive_errors = 0;
-                if response.len() + n > max_size {
-                    let remaining = max_size - response.len();
-                    response.extend_from_slice(&buf[..remaining]);
-                    break;
-                }
-                response.extend_from_slice(&buf[..n]);
-                if response_complete(&response, max_size) {
-                    break;
-                }
-            }
-            Err(ref e)
-                if e.kind == libakuma::net::ErrorKind::WouldBlock
-                    || e.kind == libakuma::net::ErrorKind::TimedOut =>
-            {
-                if response.is_empty() {
-                    return Err(Error::IoError);
-                }
-                consecutive_errors += 1;
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                    break;
-                }
-                libakuma::sleep_ms(1);
-                continue;
-            }
-            Err(_) => {
-                if response.is_empty() {
-                    return Err(Error::IoError);
-                }
-                consecutive_errors += 1;
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                    break;
-                }
-                libakuma::sleep_ms(1);
-                continue;
-            }
-        }
-    }
-
-    Ok(response)
-}
-
-/// Parse HTTP response, extract body
-fn parse_http_response(data: &[u8]) -> Result<Vec<u8>, Error> {
-    // Find headers end
-    let headers_end = find_headers_end(data)
-        .ok_or_else(|| Error::HttpError(String::from("Invalid HTTP response")))?;
-
-    // Parse status line
-    let header_str = core::str::from_utf8(&data[..headers_end])
-        .map_err(|_| Error::HttpError(String::from("Invalid HTTP headers")))?;
-
-    let first_line = header_str
+/// The status code from an HTTP response's first line (`"HTTP/1.1 200 OK"`),
+/// or from a full header block — only the first line is read either way.
+pub fn parse_status_line(headers: &str) -> Option<u16> {
+    headers
         .lines()
         .next()
-        .ok_or_else(|| Error::HttpError(String::from("Empty response")))?;
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+}
 
-    // Parse "HTTP/1.x STATUS MESSAGE"
-    let mut parts = first_line.split_whitespace();
-    let _version = parts
-        .next()
-        .ok_or_else(|| Error::HttpError(String::from("Missing HTTP version")))?;
-    let status: u16 = parts
-        .next()
-        .ok_or_else(|| Error::HttpError(String::from("Missing status code")))?
-        .parse()
-        .map_err(|_| Error::HttpError(String::from("Invalid status code")))?;
+fn parse_cl_header(headers: &str) -> Option<usize> {
+    headers.lines()
+        .find(|line| {
+            let lower: Vec<u8> = line.as_bytes().iter().take(16)
+                .map(|b| b.to_ascii_lowercase()).collect();
+            lower.starts_with(b"content-length:")
+        })
+        .and_then(|line| line.split(':').nth(1)?.trim().parse().ok())
+}
+
+/// Send the GET request, read headers, follow up to `max_redirects` 3xx
+/// responses, then stream the body to `dest_path`. Used for both
+/// [`download_file`] (no redirects) and [`download_file_with_headers`].
+fn download_with_redirects(url: &str, dest_path: &str, headers: &HttpHeaders, max_redirects: u8) -> Result<(), Error> {
+    let parsed = parse_url(url).ok_or_else(|| {
+        libakuma::eprintln(&format!("[dl] InvalidUrl: {:?}", url));
+        Error::InvalidUrl
+    })?;
+    let mut stream = tcp_connect(&parsed)?;
+    if parsed.is_https {
+        let transport = TcpTransport::new(stream);
+        let mut read_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
+        let mut write_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
+        let mut tls = TlsStream::connect(transport, parsed.host, &mut read_buf, &mut write_buf)?;
+        download_impl(&mut tls, "https", parsed.host, parsed.path, dest_path, headers, max_redirects)
+    } else {
+        download_impl(&mut stream, "http", parsed.host, parsed.path, dest_path, headers, max_redirects)
+    }
+}
+
+/// Body of [`download_with_redirects`] after the transport is connected.
+/// Shared between TCP and TLS via `dyn HttpIo`.
+fn download_impl(
+    s: &mut dyn HttpIo,
+    scheme: &str,
+    host: &str,
+    path: &str,
+    dest_path: &str,
+    headers: &HttpHeaders,
+    max_redirects: u8,
+) -> Result<(), Error> {
+    let request = build_get_request_with_headers(host, path, headers);
+    s.io_write_all(request.as_bytes())?;
+
+    let mut hdr_buf = Vec::new();
+    read_until_headers(s, &mut hdr_buf)?;
+
+    let end = find_headers_end(&hdr_buf)
+        .ok_or_else(|| Error::HttpError(String::from("No headers in response")))?;
+    let header_str = core::str::from_utf8(&hdr_buf[..end])
+        .map_err(|_| Error::HttpError(String::from("Invalid headers")))?;
+    let status = parse_status_line(header_str).unwrap_or(0);
+
+    if status >= 300 && status < 400 && max_redirects > 0 {
+        if let Some(location) = extract_location_header(header_str) {
+            let absolute = resolve_redirect_url(&location, scheme, host);
+            // Auth headers stripped on redirect (typical safe default — the
+            // target usually has its own creds in the URL or via cookies).
+            return download_with_redirects(&absolute, dest_path, &HttpHeaders::new(), max_redirects - 1);
+        }
+    }
 
     if status < 200 || status >= 300 {
         return Err(Error::HttpError(format!("HTTP error: {}", status)));
     }
 
-    // Return body
-    Ok(data[headers_end..].to_vec())
+    let content_length = parse_cl_header(header_str);
+    let fd = libakuma::open(
+        dest_path,
+        libakuma::open_flags::O_WRONLY | libakuma::open_flags::O_CREAT | libakuma::open_flags::O_TRUNC,
+    );
+    if fd < 0 {
+        return Err(Error::IoError);
+    }
+
+    stream_body_to_fd(s, fd, &hdr_buf[end..], content_length);
+    libakuma::close(fd);
+    Ok(())
 }
 
-/// Find the end of HTTP headers (\r\n\r\n)
-pub fn find_headers_end(data: &[u8]) -> Option<usize> {
-    for i in 0..data.len().saturating_sub(3) {
-        if &data[i..i + 4] == b"\r\n\r\n" {
-            return Some(i + 4);
-        }
-    }
-    None
+/// Download a file from an HTTP or HTTPS URL and save it to disk.
+///
+/// This function streams the response body directly to a file, which is
+/// memory-efficient for large files. Does not follow redirects — use
+/// [`download_file_with_headers`] for that.
+///
+/// # Arguments
+/// * `url` - The URL to fetch (http:// or https://)
+/// * `dest_path` - The path on the local filesystem to save the file to.
+///
+/// # Returns
+/// Ok(()) on success, or an error.
+pub fn download_file(url: &str, dest_path: &str) -> Result<(), Error> {
+    download_with_redirects(url, dest_path, &HttpHeaders::new(), 0)
+}
+
+/// Download a file from an HTTP/HTTPS URL with custom headers and redirect support.
+///
+/// Follows up to 5 HTTP 3xx redirects. Auth headers are stripped on redirect
+/// (the redirect target typically has its own auth via query parameters).
+pub fn download_file_with_headers(url: &str, dest_path: &str, headers: &HttpHeaders) -> Result<(), Error> {
+    download_with_redirects(url, dest_path, headers, 5)
 }
 
 // ============================================================================
@@ -736,6 +681,33 @@ pub enum StreamResult {
     Error(Error),
 }
 
+/// Shared header/body demultiplexing used by both `HttpStream` and
+/// `HttpStreamTls`. Returns `WouldBlock` until the header terminator is seen,
+/// then hands each subsequent chunk through as `Data`.
+fn process_pending(pending: &mut Vec<u8>, headers_parsed: &mut bool, status_code: &mut u16) -> StreamResult {
+    if !*headers_parsed {
+        if let Some(pos) = find_headers_end(pending) {
+            let header_str = core::str::from_utf8(&pending[..pos]).unwrap_or("");
+            *status_code = parse_status_line(header_str).unwrap_or(0);
+            *headers_parsed = true;
+            pending.drain(..pos);
+            if *status_code < 200 || *status_code >= 300 {
+                return StreamResult::Error(Error::HttpError(
+                    format!("HTTP error: {}", *status_code)
+                ));
+            }
+        }
+        return StreamResult::WouldBlock;
+    }
+
+    if pending.is_empty() {
+        StreamResult::WouldBlock
+    } else {
+        let data = core::mem::take(pending);
+        StreamResult::Data(data)
+    }
+}
+
 impl HttpStream {
     /// Create a new streaming HTTP connection (HTTP only)
     ///
@@ -753,13 +725,7 @@ impl HttpStream {
             return Err(Error::HttpError(String::from("Use HttpStreamTls for HTTPS")));
         }
 
-        // Resolve hostname
-        let ip = resolve(parsed.host).map_err(|_| Error::DnsError)?;
-        let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], parsed.port);
-
-        // Connect TCP
-        let stream = TcpStream::connect(&addr_str)
-            .map_err(|e| Error::ConnectionError(format!("{:?}", e)))?;
+        let stream = tcp_connect(&parsed)?;
 
         Ok(Self {
             conn: ConnectionState::Tcp(stream),
@@ -805,40 +771,12 @@ impl HttpStream {
             Ok(0) => StreamResult::Done,
             Ok(n) => {
                 self.pending_data.extend_from_slice(&buf[..n]);
-                self.process_pending_data()
+                process_pending(&mut self.pending_data, &mut self.headers_parsed, &mut self.status_code)
             }
             Err(ref e) if e.kind == ErrorKind::WouldBlock || e.kind == ErrorKind::TimedOut => {
                 StreamResult::WouldBlock
             }
             Err(_) => StreamResult::Error(Error::IoError),
-        }
-    }
-
-    fn process_pending_data(&mut self) -> StreamResult {
-        if !self.headers_parsed {
-            if let Some(pos) = find_headers_end(&self.pending_data) {
-                // Parse headers
-                let header_str = core::str::from_utf8(&self.pending_data[..pos]).unwrap_or("");
-
-                self.status_code = parse_status_line(header_str).unwrap_or(0);
-
-                self.headers_parsed = true;
-                self.pending_data.drain(..pos);
-
-                if self.status_code < 200 || self.status_code >= 300 {
-                    return StreamResult::Error(Error::HttpError(
-                        format!("HTTP error: {}", self.status_code)
-                    ));
-                }
-            }
-            return StreamResult::WouldBlock;
-        }
-
-        if self.pending_data.is_empty() {
-            StreamResult::WouldBlock
-        } else {
-            let data = core::mem::take(&mut self.pending_data);
-            StreamResult::Data(data)
         }
     }
 
@@ -950,36 +888,9 @@ impl<'a> HttpStreamTls<'a> {
             Ok(0) => StreamResult::Done,
             Ok(n) => {
                 self.pending_data.extend_from_slice(&buf[..n]);
-                self.process_pending_data()
+                process_pending(&mut self.pending_data, &mut self.headers_parsed, &mut self.status_code)
             }
             Err(e) => StreamResult::Error(e),
-        }
-    }
-
-    fn process_pending_data(&mut self) -> StreamResult {
-        if !self.headers_parsed {
-            if let Some(pos) = find_headers_end(&self.pending_data) {
-                let header_str = core::str::from_utf8(&self.pending_data[..pos]).unwrap_or("");
-
-                self.status_code = parse_status_line(header_str).unwrap_or(0);
-
-                self.headers_parsed = true;
-                self.pending_data.drain(..pos);
-
-                if self.status_code < 200 || self.status_code >= 300 {
-                    return StreamResult::Error(Error::HttpError(
-                        format!("HTTP error: {}", self.status_code)
-                    ));
-                }
-            }
-            return StreamResult::WouldBlock;
-        }
-
-        if self.pending_data.is_empty() {
-            StreamResult::WouldBlock
-        } else {
-            let data = core::mem::take(&mut self.pending_data);
-            StreamResult::Data(data)
         }
     }
 
@@ -992,258 +903,4 @@ impl<'a> HttpStreamTls<'a> {
     pub fn headers_parsed(&self) -> bool {
         self.headers_parsed
     }
-}
-
-// ============================================================================
-// Download with Headers + Redirect Support
-// ============================================================================
-
-/// Resolve a redirect Location header value to an absolute URL.
-/// Handles relative paths (/path), protocol-relative (//host/path), and absolute URLs.
-fn resolve_redirect_url(location: &str, scheme: &str, host: &str) -> String {
-    if location.starts_with("http://") || location.starts_with("https://") {
-        String::from(location)
-    } else if location.starts_with("//") {
-        format!("{}:{}", scheme, location)
-    } else if location.starts_with('/') {
-        format!("{}://{}{}", scheme, host, location)
-    } else {
-        String::from(location)
-    }
-}
-
-fn extract_location_header(headers: &str) -> Option<String> {
-    for line in headers.lines() {
-        let lower: Vec<u8> = line.as_bytes().iter().take(9).map(|b| b.to_ascii_lowercase()).collect();
-        if lower.starts_with(b"location:") {
-            let value = line[9..].trim();
-            return Some(String::from(value));
-        }
-    }
-    None
-}
-
-/// The status code from an HTTP response's first line (`"HTTP/1.1 200 OK"`),
-/// or from a full header block — only the first line is read either way.
-pub fn parse_status_line(headers: &str) -> Option<u16> {
-    headers
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-}
-
-fn parse_cl_header(headers: &str) -> Option<usize> {
-    headers.lines()
-        .find(|line| {
-            let lower: Vec<u8> = line.as_bytes().iter().take(16)
-                .map(|b| b.to_ascii_lowercase()).collect();
-            lower.starts_with(b"content-length:")
-        })
-        .and_then(|line| line.split(':').nth(1)?.trim().parse().ok())
-}
-
-/// Download a file from an HTTP/HTTPS URL with custom headers and redirect support.
-///
-/// Follows up to 5 HTTP 3xx redirects. Auth headers are stripped on redirect
-/// (the redirect target typically has its own auth via query parameters).
-pub fn download_file_with_headers(url: &str, dest_path: &str, headers: &HttpHeaders) -> Result<(), Error> {
-    download_with_redirects(url, dest_path, headers, 5)
-}
-
-fn download_with_redirects(url: &str, dest_path: &str, headers: &HttpHeaders, max_redirects: u8) -> Result<(), Error> {
-    let parsed = parse_url(url).ok_or_else(|| {
-        libakuma::eprintln(&format!("[dl] InvalidUrl: {:?}", url));
-        Error::InvalidUrl
-    })?;
-    let ip = resolve(parsed.host).map_err(|_| Error::DnsError)?;
-    let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], parsed.port);
-    let stream = TcpStream::connect(&addr_str)
-        .map_err(|e| Error::ConnectionError(format!("{:?}", e)))?;
-
-    if parsed.is_https {
-        download_redirects_tls(stream, parsed.host, parsed.path, dest_path, headers, max_redirects)
-    } else {
-        download_redirects_tcp(stream, parsed.host, parsed.path, dest_path, headers, max_redirects)
-    }
-}
-
-fn read_until_headers_tls(tls: &mut TlsStream<'_>, hdr_buf: &mut Vec<u8>) -> Result<(), Error> {
-    let mut tmp = [0u8; 16384];
-    let mut retries = 0u32;
-    loop {
-        match tls.read(&mut tmp) {
-            Ok(0) => break,
-            Ok(n) => {
-                retries = 0;
-                hdr_buf.extend_from_slice(&tmp[..n]);
-                if find_headers_end(hdr_buf).is_some() { break; }
-                if hdr_buf.len() > MAX_HEADERS_BUFFER_SIZE {
-                    return Err(Error::HttpError(String::from("Headers too large")));
-                }
-            }
-            Err(Error::IoError) => {
-                retries += 1;
-                if retries >= 200 { return Err(Error::IoError); }
-                libakuma::sleep_ms(1);
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
-fn stream_body_to_fd_tls(tls: &mut TlsStream<'_>, fd: i32, initial: &[u8], content_length: Option<usize>) {
-    let mut written: usize = 0;
-    if !initial.is_empty() {
-        libakuma::write_fd(fd, initial);
-        written += initial.len();
-    }
-    if let Some(cl) = content_length {
-        if written >= cl { return; }
-    }
-    let mut tmp = [0u8; 16384];
-    let mut errors = 0u32;
-    loop {
-        match tls.read(&mut tmp) {
-            Ok(0) => break,
-            Ok(n) => {
-                errors = 0;
-                libakuma::write_fd(fd, &tmp[..n]);
-                written += n;
-                if let Some(cl) = content_length {
-                    if written >= cl { break; }
-                }
-            }
-            Err(Error::IoError) => {
-                errors += 1;
-                if errors >= 200 { break; }
-                libakuma::sleep_ms(1);
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-fn download_redirects_tls(stream: TcpStream, host: &str, path: &str, dest_path: &str, headers: &HttpHeaders, max_redirects: u8) -> Result<(), Error> {
-    let transport = TcpTransport::new(stream);
-    let mut read_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
-    let mut write_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
-    let mut tls = TlsStream::connect(transport, host, &mut read_buf, &mut write_buf)?;
-
-    let request = build_get_request_with_headers(host, path, headers);
-    tls.write_all(request.as_bytes())?;
-    tls.flush()?;
-
-    let mut hdr_buf = Vec::new();
-    read_until_headers_tls(&mut tls, &mut hdr_buf)?;
-
-    let end = find_headers_end(&hdr_buf)
-        .ok_or_else(|| Error::HttpError(String::from("No headers in response")))?;
-    let header_str = core::str::from_utf8(&hdr_buf[..end])
-        .map_err(|_| Error::HttpError(String::from("Invalid headers")))?;
-    let status = parse_status_line(header_str).unwrap_or(0);
-
-    if status >= 300 && status < 400 && max_redirects > 0 {
-        if let Some(location) = extract_location_header(header_str) {
-            let absolute = resolve_redirect_url(&location, "https", host);
-            let _ = tls.close();
-            return download_with_redirects(&absolute, dest_path, &HttpHeaders::new(), max_redirects - 1);
-        }
-    }
-
-    if status < 200 || status >= 300 {
-        let _ = tls.close();
-        return Err(Error::HttpError(format!("HTTP error: {}", status)));
-    }
-
-    let content_length = parse_cl_header(header_str);
-    let fd = libakuma::open(dest_path, libakuma::open_flags::O_WRONLY | libakuma::open_flags::O_CREAT | libakuma::open_flags::O_TRUNC);
-    if fd < 0 { let _ = tls.close(); return Err(Error::IoError); }
-
-    stream_body_to_fd_tls(&mut tls, fd, &hdr_buf[end..], content_length);
-    libakuma::close(fd);
-    let _ = tls.close();
-    Ok(())
-}
-
-fn download_redirects_tcp(stream: TcpStream, host: &str, path: &str, dest_path: &str, headers: &HttpHeaders, max_redirects: u8) -> Result<(), Error> {
-    let request = build_get_request_with_headers(host, path, headers);
-    stream.write_all(request.as_bytes()).map_err(|_| Error::IoError)?;
-
-    let mut hdr_buf = Vec::new();
-    let mut tmp = [0u8; 16384];
-    let mut retries = 0u32;
-    loop {
-        match stream.read(&mut tmp) {
-            Ok(0) => break,
-            Ok(n) => {
-                retries = 0;
-                hdr_buf.extend_from_slice(&tmp[..n]);
-                if find_headers_end(&hdr_buf).is_some() { break; }
-                if hdr_buf.len() > MAX_HEADERS_BUFFER_SIZE {
-                    return Err(Error::HttpError(String::from("Headers too large")));
-                }
-            }
-            Err(_) => {
-                retries += 1;
-                if retries >= 200 { return Err(Error::IoError); }
-                libakuma::sleep_ms(1);
-            }
-        }
-    }
-
-    let end = find_headers_end(&hdr_buf)
-        .ok_or_else(|| Error::HttpError(String::from("No headers in response")))?;
-    let header_str = core::str::from_utf8(&hdr_buf[..end])
-        .map_err(|_| Error::HttpError(String::from("Invalid headers")))?;
-    let status = parse_status_line(header_str).unwrap_or(0);
-
-    if status >= 300 && status < 400 && max_redirects > 0 {
-        if let Some(location) = extract_location_header(header_str) {
-            let absolute = resolve_redirect_url(&location, "http", host);
-            return download_with_redirects(&absolute, dest_path, &HttpHeaders::new(), max_redirects - 1);
-        }
-    }
-
-    if status < 200 || status >= 300 {
-        return Err(Error::HttpError(format!("HTTP error: {}", status)));
-    }
-
-    let content_length = parse_cl_header(header_str);
-    let fd = libakuma::open(dest_path, libakuma::open_flags::O_WRONLY | libakuma::open_flags::O_CREAT | libakuma::open_flags::O_TRUNC);
-    if fd < 0 { return Err(Error::IoError); }
-
-    let body_start = &hdr_buf[end..];
-    let mut written: usize = 0;
-    if !body_start.is_empty() {
-        libakuma::write_fd(fd, body_start);
-        written += body_start.len();
-    }
-    if let Some(cl) = content_length {
-        if written >= cl { libakuma::close(fd); return Ok(()); }
-    }
-
-    let mut errors = 0u32;
-    loop {
-        match stream.read(&mut tmp) {
-            Ok(0) => break,
-            Ok(n) => {
-                errors = 0;
-                libakuma::write_fd(fd, &tmp[..n]);
-                written += n;
-                if let Some(cl) = content_length {
-                    if written >= cl { break; }
-                }
-            }
-            Err(_) => {
-                errors += 1;
-                if errors >= 200 { break; }
-                libakuma::sleep_ms(1);
-            }
-        }
-    }
-
-    libakuma::close(fd);
-    Ok(())
 }

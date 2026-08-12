@@ -150,12 +150,6 @@ pub mod fd {
 /// before the process starts. Userspace can read but not modify.
 pub const PROCESS_INFO_ADDR: usize = 0x1000;
 
-/// Maximum size of argument data in ProcessInfo
-pub const ARGV_DATA_SIZE: usize = 744;
-
-/// Maximum size of cwd data in ProcessInfo
-pub const CWD_DATA_SIZE: usize = 256;
-
 // ============================================================================
 // Memory Layout Constants
 // ============================================================================
@@ -176,29 +170,22 @@ pub const PAGE_SIZE: usize = 4096;
 
 /// Process info structure shared between kernel and userspace
 ///
-/// This is mapped read-only at PROCESS_INFO_ADDR.
-/// The kernel writes it, userspace reads it.
+/// Mapped read-only at [`PROCESS_INFO_ADDR`]. The kernel writes it via
+/// `ProcessInfo::new(pid, ppid, box_id)`; userspace reads `pid`/`ppid`/`box_id`.
+/// The `_reserved` tail (1008 bytes) stays zeroed — argv and cwd are *not*
+/// communicated through this page (argv comes from the entry stack, cwd from
+/// the `GETCWD` syscall).
 ///
-/// WARNING: Must match kernel's ProcessInfo struct exactly!
-/// Layout:
-///   - pid: 4 bytes
-///   - ppid: 4 bytes
-///   - argc: 4 bytes
-///   - argv_len: 4 bytes (total bytes used in argv_data)
-///   - cwd_len: 4 bytes
-///   - _reserved: 4 bytes (alignment padding)
-///   - cwd_data: 256 bytes (current working directory)
-///   - argv_data: 744 bytes (null-separated argument strings)
-///     Total: 24 + 256 + 744 = 1024 bytes
+/// Must match `crates/akuma-exec/src/process/types.rs::ProcessInfo` exactly
+/// (asserted on the kernel side: `size_of == 1024`).
 #[repr(C)]
 pub struct ProcessInfo {
     /// Process ID
     pub pid: u32,
-    /// Parent process ID  
+    /// Parent process ID
     pub ppid: u32,
     /// Box ID
     pub box_id: u64,
-    /// Reserved for future fields
     pub _reserved: [u8; 1008],
 }
 
@@ -975,11 +962,12 @@ pub fn fstat(fd: i32) -> Result<Stat, i32> {
 
 /// Get file status relative to directory
 pub fn fstatat(dirfd: i32, path: &str, flags: u32) -> Result<Stat, i32> {
+    let path_c = alloc::format!("{}\0", path);
     let mut stat = Stat::default();
     let ret = syscall(
         syscall::NEWFSTATAT,
         dirfd as u64,
-        path.as_ptr() as u64,
+        path_c.as_ptr() as u64,
         &mut stat as *mut _ as u64,
         flags as u64,
         0, 0,

@@ -1,14 +1,23 @@
 //! Akuma TLS Library
 //!
 //! Provides TLS 1.3 client connections for userspace programs.
-//! Uses embedded-tls in blocking mode with NoVerify (Phase 1).
+//! Uses embedded-tls in blocking mode.
+//!
+//! # SECURITY: certificate verification is disabled
+//!
+//! Every TLS connection opened by this crate uses `embedded_tls::NoVerify`.
+//! There is no certificate or hostname validation, so the channel is
+//! **vulnerable to man-in-the-middle attacks** and must not be trusted over
+//! an untrusted network. This is a deliberate size trade-off (no bundled CA
+//! root store) tracked by `docs/archive/LIBAKUMA_AUDIT.md` item 3. Do not
+//! assume otherwise from the API shape.
 //!
 //! # Example
 //!
 //! ```no_run
 //! use libakuma_tls::https_fetch;
 //!
-//! let content = https_fetch("https://example.com/file.txt", true, None).unwrap(); // None = 20MB default
+//! let content = https_fetch("https://example.com/file.txt", None).unwrap(); // None = 20MB default
 //! ```
 
 #![no_std]
@@ -54,27 +63,6 @@ pub enum Error {
 impl From<TlsError> for Error {
     fn from(e: TlsError) -> Self {
         Error::TlsError(e)
-    }
-}
-
-/// Options for TLS connections
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TlsOptions {
-    /// Skip certificate verification (like curl -k)
-    /// Note: In Phase 1, this is always true (NoVerify)
-    pub insecure: bool,
-}
-
-impl TlsOptions {
-    /// Create default options
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Enable insecure mode (skip certificate verification)
-    pub fn insecure(mut self) -> Self {
-        self.insecure = true;
-        self
     }
 }
 
