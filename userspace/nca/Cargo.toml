@@ -1,3 +1,10 @@
+# Own workspace root, like meow/ and tcc/: this crate was dropped from
+# userspace/Cargo.toml's members (see the self-hosting note there), so without
+# this table cargo walks up to the userspace — then the repo-root — workspace and
+# refuses with "current package believes it's in a workspace when it's not".
+# userspace/build.sh builds it by --manifest-path.
+[workspace]
+
 [package]
 name = "native-cli-ai"
 version = "0.3.0"

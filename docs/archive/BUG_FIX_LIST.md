@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 563
-- **Docs contributing at least one fix:** 171
+- **Total distinct fixes counted:** 570
+- **Docs contributing at least one fix:** 173
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 116 | 20.6% | 15 |
-| Memory & Virtual Memory | 89 | 15.8% | 25 |
-| Scheduler & Process Management | 74 | 13.1% | 17 |
-| SMP & Locking | 70 | 12.4% | 29 |
-| Networking | 31 | 5.5% | 13 |
-| Userspace Apps & Libraries | 33 | 5.9% | 17 |
-| Rump Kernel & Syscall Proxy | 24 | 4.3% | 5 |
-| Toolchain & Self-Hosting | 31 | 5.5% | 4 |
+| Syscall / ABI Compatibility Audits | 116 | 20.4% | 15 |
+| Memory & Virtual Memory | 89 | 15.6% | 25 |
+| Scheduler & Process Management | 74 | 13.0% | 17 |
+| SMP & Locking | 70 | 12.3% | 29 |
+| Networking | 31 | 5.4% | 13 |
+| Userspace Apps & Libraries | 34 | 6.0% | 18 |
+| Rump Kernel & Syscall Proxy | 24 | 4.2% | 5 |
+| Toolchain & Self-Hosting | 37 | 6.5% | 5 |
 | SSH | 14 | 2.5% | 12 |
 | VFS & Filesystem | 13 | 2.3% | 9 |
 | Boot & Drivers | 9 | 1.6% | 5 |
 | Signals & Exceptions | 12 | 2.1% | 5 |
 | Misc / Cross-cutting | 14 | 2.5% | 4 |
-| Console & Terminal | 15 | 2.7% | 7 |
+| Console & Terminal | 15 | 2.6% | 7 |
 | Containers | 18 | 3.2% | 4 |
-| **Total** | **563** | **100.0%** | **171** |
+| **Total** | **570** | **100.0%** | **173** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -605,7 +605,7 @@ aren't recorded anywhere else.)
 - `force-legacy` incorrectly defaulted to true, masking the modern VirtIO MMIO v2 path
 
 
-## Userspace Apps & Libraries (33 fixes, 17 docs)
+## Userspace Apps & Libraries (34 fixes, 18 docs)
 
 ### docs/archive/DOOM.md
 - SIGSEGV in `R_Init` — `strncpy` stub off-by-one corrupted an adjacent struct field
@@ -674,6 +674,9 @@ aren't recorded anywhere else.)
 ### userspace/meow/docs/MLX_SERVER_TOOL_CALLS.md
 - `meow`'s streaming client recognized a completed tool call by a literal byte match, `json.contains("\"finish_reason\":\"tool_calls\"")`, which only matches ollama's compact JSON serializer; `mlx-server`'s spaced `"finish_reason": "tool_calls"` never matched, silently dropping every tool call; fixed via a whitespace-tolerant `json_field_is` helper
 
+### docs/archive/LIBAKUMA_AUDIT.md
+- `libakuma::fstatat` passed the raw `&str` pointer with no NUL terminator — the one path-taking wrapper of fourteen that skipped `format!("{}\0", path)` — so the kernel's `copy_from_user_str` walked past the string into adjacent memory (usually harmless, occasionally EFAULT, rarely a different file); its only caller had been pre-terminating by hand, which is now dropped
+
 
 ## Rump Kernel & Syscall Proxy (24 fixes, 5 docs)
 
@@ -712,7 +715,7 @@ aren't recorded anywhere else.)
 - `ifcreate` hang — `rumpuser_clock_sleep` didn't release the rump CPU around its sleep
 
 
-## Toolchain & Self-Hosting (31 fixes, 4 docs)
+## Toolchain & Self-Hosting (37 fixes, 5 docs)
 
 ### docs/archive/AKUMA_SELF_HOSTING.md
 - §3: boot self-test VA collision causing MEMORY≥8G `map_user_page` crash
@@ -753,6 +756,14 @@ aren't recorded anywhere else.)
 - `THREAD_SIGNAL_MASK` (the authoritative per-thread mask) was never seeded on `fork_process`/`vfork_process`, and was seeded racily-late (after the child was already runnable) on `clone_thread`, reopening exactly the pre-exec signal window callers block signals to protect; fixed by seeding at every creation leaf before the child becomes runnable
 - `FUTEX_WAITERS` never removed a thread's queue entry when it died while parked (only self-removal on timeout/EINTR existed), so a dead tid could silently absorb a future `FUTEX_WAKE` meant for a live waiter; fixed via `futex_purge_tid`, called at both `mark_thread_terminated` and the slot recycler
 - `DRAINING[tid]` (the pressure-reclaim in-progress flag) had the identical stuck-forever shape — a recycled slot's new occupant inherited a stale "already draining" flag; fixed by clearing it in `scrub_thread_slot`
+
+### docs/archive/USERSPACE_BUILD_SH_OUT_OF_WORKSPACE_MEMBERS.md
+- `userspace/build.sh` still built the four submodule-backed members with `cargo build -p <name>` after they were dropped from `userspace/Cargo.toml`'s `members`, so `set -e` killed the script at `meow` (10th of 21) and `tcc`/`tar`/`sshd`/`llama-cpp`/`wavplay`/`scratch`/`nca` were never built at all — `nca`'s `-p` name had never been right either, its package is `native-cli-ai`; now built through `--manifest-path` from an explicit member table that also skips a member whose submodule is absent
+- `llama.cpp` and `nca` carried no `[workspace]` table (unlike `meow`/`tcc`), so building them standalone failed with "current package believes it's in a workspace when it's not", and excluding them in `userspace/Cargo.toml` only moved the identical error up to the repo-root workspace; fixed with an empty `[workspace]` in each manifest
+- the repo-root `.cargo/config.toml` contributes a *relative* `-Clink-arg=-Tlinker.ld`, which rustc resolves against its cwd — the workspace root — so `meow`/`tcc` built through their own manifests died at the link step with "cannot find linker script linker.ld"; fixed by passing an absolute `-T` via `CARGO_ENCODED_RUSTFLAGS`, which *replaces* the config-file rustflags where a `--config` override would merge with them and keep the relative path
+- the binary copy loop looked under `userspace/target/` for every member, but a member that is its own workspace has its own `target/`, so a freshly built `meow`/`tcc` was never copied into `bootstrap/bin`
+- `llama-cli` and `nca` were in the copy list even though their own build scripts install them into `bootstrap/bin`, so every successful build printed `Warning: Binary … not found` for both
+- every path in the script is relative to `userspace/` while the documented invocation is `userspace/build.sh` from the repo root, where the first `cargo build -p libakuma` resolved against the kernel workspace and failed; fixed by anchoring with `cd "$(dirname "$0")"`, which also fixes toolchain/target resolution for the out-of-workspace members
 
 
 ## SSH (14 fixes, 12 docs)

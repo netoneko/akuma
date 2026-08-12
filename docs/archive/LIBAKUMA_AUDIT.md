@@ -12,6 +12,15 @@ This is a *current-state* audit. It is not a changelog; the historical fix
 notes under `userspace/libakuma/docs/` and `userspace/libakuma-tls/docs/` are
 linked from the relevant findings and not reproduced.
 
+> **Status (2026-08-12, commit `9cd7a24` "half baked libakuma fixes"):** items
+> **1-4** of the §5 prioritized list are done — `fstatat` null-termination,
+> the `ProcessInfo` doc/struct/constant reconciliation (both sides), the
+> deletion of the dead insecure-TLS API plus a `SECURITY:` banner, and the
+> `http.rs` de-duplication (1,249 → 906 LOC). Everything below is the audit as
+> written; what landed, what landed differently, and what is still open is
+> recorded in **§6 Fix log**, and the affected findings carry an inline
+> *Fixed* note.
+
 ## TL;DR
 
 | Crate | LOC | Tests | Consumers | Health |
@@ -102,6 +111,10 @@ a `&str` like every other wrapper, so the next caller will get it wrong.
 Fix is one line: `let path_c = alloc::format!("{}\0", path);` and pass
 `path_c.as_ptr()`. Drop the caller-side termination in `images.rs` afterwards.
 
+> **Fixed** in `9cd7a24` exactly as described: `fstatat` terminates its own
+> path, and `path_exists`/`dir_exists` in `box/src/images.rs` pass the `&str`
+> straight through. §6.
+
 #### BUG-2 — `accept` discards the peer address (`net.rs:150-175`, `186-200`)
 
 `accept(2)` is documented to fill the caller's `sockaddr`; libakuma allocates
@@ -148,6 +161,15 @@ Whose ABI is it? Either:
 This needs a 5-minute check against `src/` (kernel `ProcessInfo`) before
 someone trusts either side. **Severity: potentially high** if the struct is
 the side that's wrong; **cosmetic** otherwise.
+
+> **Fixed** in `9cd7a24`, and the question resolved the benign way: the
+> *struct* was right on both sides (`crates/akuma-exec/src/process/types.rs`
+> declares the same `pid`/`ppid`/`box_id`/`_reserved` layout and asserts
+> `size_of::<ProcessInfo>() == 1024` at compile time), so `box_id` was never
+> reading garbage — the doc comment and the two constants were the stale side.
+> Both `ARGV_DATA_SIZE`/`CWD_DATA_SIZE` pairs are deleted and both doc
+> comments now say where argv (entry stack) and cwd (`GETCWD`) actually come
+> from. §6.
 
 #### BUG-4 — `getcwd` uses `from_utf8_unchecked` on kernel output (`lib.rs:248`)
 
@@ -349,6 +371,13 @@ Until one of those happens, this should be a `// SECURITY:` comment at the
 top of `lib.rs` and a row in `docs/reference/subsystems/ssh.md` (which covers
 the trust boundary).
 
+> **Fixed** in `9cd7a24` by taking option 2: `TlsOptions`, `insecure()` and the
+> `_insecure` parameter are gone (`https_fetch(url, max_size)`), and the crate
+> doc opens with a `# SECURITY: certificate verification is disabled` section
+> pointing back here. Verification itself is still absent — the channel is
+> still MITM-able — and the `docs/reference/subsystems/ssh.md` row was **not**
+> added. §6.
+
 #### TLS-BUG-2 — No chunked transfer-encoding support (`http.rs` throughout)
 
 All read paths assume "Content-Length OR connection-close". `response_complete`
@@ -436,6 +465,13 @@ A unifying `enum MaybeTlsStream<'a> { Tcp(TcpStream), Tls(TlsStream<'a>) }`
 with `read`/`write_all`/`flush` methods would replace the existing
 `Streamer` enum (`http.rs:182`, which is asymmetric — `Tcp(&TcpStream)` is
 non-mut, `Tls(&mut TlsStream)` is mut — and only used in one place).
+
+> **Fixed** in `9cd7a24`, with a `trait HttpIo { io_read, io_write_all }` +
+> `&mut dyn HttpIo` helpers instead of the `MaybeTlsStream` enum sketched here
+> — same "one loop body" effect without threading the TLS lifetime through
+> every signature. The asymmetric `Streamer` enum is gone. 1,249 → 906 LOC
+> (−343, not the ~500 estimated, because the two *streaming* structs were left
+> alone). §6 lists the duplication that survives.
 
 #### Hot-path allocations
 
@@ -576,26 +612,96 @@ These apply to both crates.
 
 ## 5. Prioritized fix list
 
-| # | Sev | Effort | Item | Where |
-|---|---|---|---|---|
-| 1 | **High** | S | Null-terminate `fstatat` path; drop caller-side band-aid in `box/images.rs` | `libakuma/src/lib.rs:977`, `box/src/images.rs:20,25` |
-| 2 | **High** | S | Reconcile `ProcessInfo` doc/struct/constants against the kernel side; delete stale parts | `libakuma/src/lib.rs:151,154,157,177-203` |
-| 3 | **High** | M | Delete `TlsOptions`/`_insecure`/`insecure()` (or implement verify). Add `// SECURITY:` banner + reference doc row. | `libakuma-tls/src/lib.rs:60-79`, `http.rs:75` |
-| 4 | **Med** | M | Refactor `http.rs` to kill the 4× duplication; unify on one stream enum + one read helper. Cuts ~500 LOC. | `libakuma-tls/src/http.rs` |
-| 5 | **Med** | S | Implement or refuse chunked transfer-encoding | `libakuma-tls/src/http.rs:568,612` |
-| 6 | **Med** | S | Replace per-line `Vec<u8>` lowercasing with `eq_ignore_ascii_case` (4 sites) | `libakuma-tls/src/http.rs:244,557,1017,1039` |
-| 7 | **Med** | S | `getcwd`: replace `static mut CWD_BUF` with a `Spinlock` and drop `from_utf8_unchecked` | `libakuma/src/lib.rs:236-248` |
-| 8 | **Med** | S | `accept`: parse the returned `sockaddr`, fix `peer_addr` on accepted sockets | `libakuma/src/net.rs:150-200` |
-| 9 | **Med** | S | Stop mapping every TLS I/O failure to `Error::IoError`; preserve `TlsError` | `libakuma-tls/src/lib.rs:51,124-147` |
-| 10 | **Low** | S | Unify fd types on `i32` (`read`/`write`/`fd` module) | `libakuma/src/lib.rs:141-144,504,520` |
-| 11 | **Low** | S | `#[deprecated]` `waitpid` and `kill` (the signal-0 variant), point at the `*_status`/`kill_signal` replacements | `libakuma/src/lib.rs:1589,1787` |
-| 12 | **Low** | S | Delete `transport.rs` dot-printer (layering violation) | `libakuma-tls/src/transport.rs:13-17,29-31,101-107` |
-| 13 | **Low** | S | Delete or feature-gate the brk allocator path (racy, dead by default) | `libakuma/src/lib.rs:2025,2192-2240` |
-| 14 | **Low** | M | Extract pure-logic cores (`libakuma-core`, `libakuma-tls-core`) and add the first host tests | both crates |
-| 15 | **Low** | S | Refresh `SYSCALLS.md` / `TERMINAL_SYSCALLS.md` / `ALLOCATOR_MEMORY_FIX.md` against current code | `userspace/libakuma/docs/` |
+Line numbers are as of the audit (`8b6ba40`); items 1-4 have since moved them.
+
+| # | Sev | Effort | Item | Where | Status |
+|---|---|---|---|---|---|
+| 1 | **High** | S | Null-terminate `fstatat` path; drop caller-side band-aid in `box/images.rs` | `libakuma/src/lib.rs:977`, `box/src/images.rs:20,25` | **Done** `9cd7a24` |
+| 2 | **High** | S | Reconcile `ProcessInfo` doc/struct/constants against the kernel side; delete stale parts | `libakuma/src/lib.rs:151,154,157,177-203` | **Done** `9cd7a24` |
+| 3 | **High** | M | Delete `TlsOptions`/`_insecure`/`insecure()` (or implement verify). Add `// SECURITY:` banner + reference doc row. | `libakuma-tls/src/lib.rs:60-79`, `http.rs:75` | **Done** `9cd7a24` — minus the reference doc row |
+| 4 | **Med** | M | Refactor `http.rs` to kill the 4× duplication; unify on one stream enum + one read helper. Cuts ~500 LOC. | `libakuma-tls/src/http.rs` | **Done** `9cd7a24` — −343 LOC; `HttpStream`/`HttpStreamTls` still twins |
+| 5 | **Med** | S | Implement or refuse chunked transfer-encoding | `libakuma-tls/src/http.rs:568,612` | Open (now `http.rs:230`) |
+| 6 | **Med** | S | Replace per-line `Vec<u8>` lowercasing with `eq_ignore_ascii_case` (4 sites) | `libakuma-tls/src/http.rs:244,557,1017,1039` | Open — 3 sites left (`221,530,553`) |
+| 7 | **Med** | S | `getcwd`: replace `static mut CWD_BUF` with a `Spinlock` and drop `from_utf8_unchecked` | `libakuma/src/lib.rs:236-248` | Open |
+| 8 | **Med** | S | `accept`: parse the returned `sockaddr`, fix `peer_addr` on accepted sockets | `libakuma/src/net.rs:150-200` | Open |
+| 9 | **Med** | S | Stop mapping every TLS I/O failure to `Error::IoError`; preserve `TlsError` | `libakuma-tls/src/lib.rs:51,124-147` | Open — `HttpIo` defers to it by name |
+| 10 | **Low** | S | Unify fd types on `i32` (`read`/`write`/`fd` module) | `libakuma/src/lib.rs:141-144,504,520` | Open |
+| 11 | **Low** | S | `#[deprecated]` `waitpid` and `kill` (the signal-0 variant), point at the `*_status`/`kill_signal` replacements | `libakuma/src/lib.rs:1589,1787` | Open |
+| 12 | **Low** | S | Delete `transport.rs` dot-printer (layering violation) | `libakuma-tls/src/transport.rs:13-17,29-31,101-107` | Open |
+| 13 | **Low** | S | Delete or feature-gate the brk allocator path (racy, dead by default) | `libakuma/src/lib.rs:2025,2192-2240` | Open |
+| 14 | **Low** | M | Extract pure-logic cores (`libakuma-core`, `libakuma-tls-core`) and add the first host tests | both crates | Open — still 0 tests |
+| 15 | **Low** | S | Refresh `SYSCALLS.md` / `TERMINAL_SYSCALLS.md` / `ALLOCATOR_MEMORY_FIX.md` against current code | `userspace/libakuma/docs/` | Open |
 
 "S" = ≤ 1 hour, "M" = a day or less. None of these require kernel changes
 except item 2's verification step.
+
+---
+
+## 6. Fix log
+
+### 2026-08-12 — `9cd7a24` "half baked libakuma fixes" (items 1-4)
+
+Six files, +453/−826. Verified by building every userspace member
+(`userspace/build.sh`): `libakuma`, `libakuma-tls`, `box`, `meow` and the other
+15 members compile against the new signatures.
+
+**Item 1 — `fstatat` (BUG-1).** `userspace/libakuma/src/lib.rs`: `fstatat` now
+does `let path_c = alloc::format!("{}\0", path);` and passes `path_c.as_ptr()`,
+matching all 13 sibling wrappers. `userspace/box/src/images.rs`:
+`path_exists`/`dir_exists` dropped their own `format!("{}\0", path)`.
+
+**Item 2 — `ProcessInfo` (BUG-3).** Reconciled on **both** sides, and the
+struct — not the doc — turned out to be the truthful one, so nothing was ever
+misreading `box_id`:
+
+- `userspace/libakuma/src/lib.rs`: deleted `ARGV_DATA_SIZE`/`CWD_DATA_SIZE`;
+  replaced the 1024-byte `argc`/`argv_len`/`cwd_data`/`argv_data` layout
+  comment with what the page actually carries (`pid`/`ppid`/`box_id`,
+  `_reserved` stays zeroed) and where argv (entry stack) and cwd (`GETCWD`)
+  really come from.
+- `crates/akuma-exec/src/process/types.rs`: deleted the kernel's copies of the
+  same two constants and the "Layout must match libakuma exactly" wording. The
+  compile-time `const _: () = assert!(size_of::<ProcessInfo>() == 1024)` (and
+  its unit-test twin) stay — that is the invariant worth asserting.
+
+**Item 3 — dead insecure-TLS API (TLS-BUG-1).** Option 2 of the two the audit
+offered. `userspace/libakuma-tls/src/lib.rs`: `TlsOptions`, `TlsOptions::new`,
+`insecure()` and the `_insecure` parameter are gone — `https_fetch(url,
+max_size)` is the signature — and the crate doc now opens with a
+`# SECURITY: certificate verification is disabled` section that names
+`NoVerify`, says the channel is MITM-able, and points back at this audit. The
+`meow` submodule was bumped to the new signature; `box` and `scratch` call
+neither `https_fetch` nor `TlsOptions`, so they needed nothing.
+**Still true: there is no verification.** Not done: the
+`docs/reference/subsystems/ssh.md` trust-boundary row.
+
+**Item 4 — `http.rs` de-duplication.** 1,249 → 906 LOC. Instead of the
+`enum MaybeTlsStream` the audit sketched, a private
+`trait HttpIo { io_read, io_write_all }` is implemented for `TlsStream` and
+`TcpStream`, and every loop body now takes `&mut dyn HttpIo` and exists once:
+`read_response`, `read_until_headers`, `stream_body_to_fd`,
+`parse_content_length`, `response_complete`, `fetch_to_vec`, `download_impl`,
+`process_pending`. The asymmetric `Streamer` enum is gone. The TCP-vs-TLS
+difference that mattered — TLS needs a `flush` after `write_all`, and a TLS
+read error is fatal where a TCP `WouldBlock` is not — survives as
+`io_write_all`'s bundled flush and `read_response`'s `error_budget` parameter
+(0 for TLS, `TCP_ERROR_BUDGET` for TCP).
+
+What the refactor did **not** reach, hence "half baked":
+
+- `HttpStream` (TCP) and `HttpStreamTls` (TLS) are still two structs with
+  parallel `connect`/`post`/`read_chunk`/`status_code`/`headers_parsed`; they
+  share only `process_pending`. They are why the cut was −343 LOC rather than
+  the estimated ~500.
+- `alloc::vec![0u8; TLS_RECORD_SIZE]` is down from 8 sites to 4
+  (`http.rs:418,419` in `fetch_to_vec`, `570,571` in `download_impl`).
+- Items 5, 6 and 9 were left deliberately: `response_complete` is still
+  Content-Length-only (chunked still unhandled), 3 of the 4 lowercase-`Vec`
+  header comparisons remain, and `HttpIo`'s doc comment explicitly defers the
+  error-collapsing to item 9.
+
+Untouched by this commit: BUG-2 (`accept` peer address), BUG-4 (`getcwd`
+`from_utf8_unchecked`), BUG-5 (fd types), TLS-BUG-2/3/4, and items 5-15.
 
 ---
 

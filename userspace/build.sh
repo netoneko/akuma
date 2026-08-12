@@ -1,19 +1,126 @@
 #!/bin/bash
 set -e
 
-# meow ships size-optimized: rebuild core/alloc from source with the
-# immediate-abort panic strategy. This drops the residual panic plumbing the
-# precompiled core carries (panic_fmt landing pads, location records), saving a
-# full page off the binary. Costs a one-time core/alloc recompile (~8s). The
-# trade-off: panics trap immediately instead of printing via the panic handler.
+# Every path below is relative to userspace/ (`../bootstrap/bin`, `tcc/dist`, …)
+# and the nightly toolchain + aarch64-unknown-none target come from
+# userspace/{rust-toolchain.toml,.cargo/config.toml}, which cargo resolves from
+# the *working* directory. The documented invocation is `userspace/build.sh`
+# from the repo root, so anchor there instead of trusting the caller's cwd.
+cd "$(dirname "$0")"
+
+# meow ships size-optimized: rebuild core/alloc from source (here) with the
+# immediate-abort panic strategy (MEOW_RUSTFLAGS below). This drops the residual
+# panic plumbing the precompiled core carries (panic_fmt landing pads, location
+# records), saving a full page off the binary. Costs a one-time core/alloc
+# recompile (~8s). The trade-off: panics trap immediately instead of printing
+# via the panic handler.
 MEOW_SIZE_FLAGS=(
     -Z build-std=core,alloc
-    --config 'target.aarch64-unknown-none.rustflags=["-Zunstable-options","-Cpanic=immediate-abort","-Crelocation-model=static"]'
 )
 
-# Build one workspace member, applying meow's size flags when appropriate.
+# rustflags for the out-of-workspace members below, spelled out because they
+# cannot inherit the config files the way a workspace member does.
+#
+# `.cargo/config.toml` in the repo root contributes `-Clink-arg=-Tlinker.ld` and
+# userspace/.cargo/config.toml the rest (cargo merges the two arrays). The
+# linker-script path is *relative*, and cargo runs rustc with the cwd set to the
+# workspace root — userspace/, where linker.ld lives, for a member; but meow/ or
+# tcc/ for a member that is its own workspace, where it does not exist, and the
+# link fails with "cannot find linker script linker.ld". So make it absolute.
+#
+# CARGO_ENCODED_RUSTFLAGS (\x1f-separated, one element per argument) *replaces*
+# `target.<triple>.rustflags` from every config file rather than merging with it,
+# which is what keeps the relative -Tlinker.ld out.
+EXTERNAL_RUSTFLAGS=(
+    -C relocation-model=static
+    -C link-arg=-z
+    -C link-arg=max-page-size=0x1000
+    -C "link-arg=-T$PWD/linker.ld"
+)
+
+# meow ships with the immediate-abort panic strategy (see MEOW_SIZE_FLAGS).
+MEOW_RUSTFLAGS=(
+    -Zunstable-options
+    -C panic=immediate-abort
+    "${EXTERNAL_RUSTFLAGS[@]}"
+)
+
+# Join arguments with \x1f for CARGO_ENCODED_RUSTFLAGS. Encoded rather than
+# space-separated RUSTFLAGS so a path with a space cannot split an argument.
+encode_rustflags() {
+    local IFS=$'\x1f'
+    echo "$*"
+}
+
+# Members that are NOT in the userspace workspace. The submodule-backed ones
+# were dropped from `members` so a missing submodule cannot block building
+# unrelated crates (see the note at the top of userspace/Cargo.toml) — which
+# also means `cargo build -p <name>` no longer finds them. Each is built through
+# its own manifest instead, and its artifacts land in its own target/ dir.
+#
+#   <name used by this script>|<dir>|<cargo package>|<binary>|<path that must exist>
+#
+# An empty <binary> means the member's build script installs into bootstrap/bin
+# itself (llama-cpp installs llama-cli/-server/-bench, nca installs nca), so
+# there is nothing here to copy. The last field is a file from the member's
+# submodule: absent means the submodule is not checked out, and the member is
+# skipped rather than failing the whole build.
+EXTERNAL_MEMBERS=(
+    "meow|meow|meow|meow|meow/Cargo.toml"
+    "tcc|tcc|tcc|tcc|tcc/tinycc/libtcc.c"
+    "llama-cpp|llama.cpp|llama-cpp||llama.cpp/llama.cpp/CMakeLists.txt"
+    "nca|nca|native-cli-ai||nca/native-cli-ai/Cargo.toml"
+)
+
+# Print the EXTERNAL_MEMBERS row for $1; fail if $1 is an ordinary workspace member.
+external_spec() {
+    local row
+    for row in "${EXTERNAL_MEMBERS[@]}"; do
+        if [ "${row%%|*}" == "$1" ]; then
+            echo "$row"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Print where $1's binary lands. Workspace members share userspace/target; an
+# external member has its own target/ under its directory. Fails (prints
+# nothing) for members whose build script does its own installing.
+member_bin_path() {
+    local spec dir bin
+    if spec=$(external_spec "$1"); then
+        IFS='|' read -r _ dir _ bin _ <<<"$spec"
+        [ -z "$bin" ] && return 1
+        echo "$dir/target/aarch64-unknown-none/release/$bin"
+        return 0
+    fi
+    echo "target/aarch64-unknown-none/release/$1"
+}
+
+# Build one member, applying meow's size flags when appropriate.
 build_member() {
-    local m="$1"
+    local m="$1" spec dir pkg req manifest
+    if spec=$(external_spec "$m"); then
+        IFS='|' read -r _ dir pkg _ req <<<"$spec"
+        if [ ! -e "$req" ]; then
+            echo "  (skipping $m: $req missing — submodule not checked out)"
+            return 0
+        fi
+        manifest="$dir/Cargo.toml"
+        if [ "$FORCE_REBUILD" = true ]; then
+            echo "Force-rebuilding $m (cargo clean -p $pkg)..."
+            cargo clean --release --manifest-path "$manifest" -p "$pkg"
+        fi
+        if [ "$m" == "meow" ]; then
+            CARGO_ENCODED_RUSTFLAGS="$(encode_rustflags "${MEOW_RUSTFLAGS[@]}")" \
+                cargo build --release --manifest-path "$manifest" "${MEOW_SIZE_FLAGS[@]}"
+        else
+            CARGO_ENCODED_RUSTFLAGS="$(encode_rustflags "${EXTERNAL_RUSTFLAGS[@]}")" \
+                cargo build --release --manifest-path "$manifest"
+        fi
+        return 0
+    fi
     # --force-rebuild: wipe this member's artifacts first so its build script
     # re-runs. Needed for members whose build.rs drives an external build (e.g.
     # llama-cpp's CMake) and only declares `rerun-if-changed=build.rs`, so edits
@@ -22,9 +129,7 @@ build_member() {
         echo "Force-rebuilding $m (cargo clean -p $m)..."
         cargo clean --release -p "$m"
     fi
-    if [ "$m" == "meow" ]; then
-        cargo build --release -p meow "${MEOW_SIZE_FLAGS[@]}"
-    elif [ "$m" == "sshd" ] && [ "${SSHD_FORK_SESSIONS:-1}" = "0" ]; then
+    if [ "$m" == "sshd" ] && [ "${SSHD_FORK_SESSIONS:-1}" = "0" ]; then
         # Opt OUT of process-per-session sshd back to the single-process
         # cooperative executor (userspace/sshd/Cargo.toml `fork-sessions`, on by
         # default). For memory-constrained images where a process per session is
@@ -65,19 +170,21 @@ if [ -n "$MEMBER_ONLY" ]; then
             cp "$LIBTCC1_ARCHIVE" ../bootstrap/archives/libtcc1.tar
         fi
     fi
-    # Members that produce no binary (build output handled by their build script)
-    # nca's build.rs deploys the binary directly to bootstrap/bin/nca
-    NO_BIN_MEMBERS=("apk-tools" "libakuma" "libakuma-tls" "nca")
+    # Members that produce no binary of their own: libraries, plus apk-tools
+    # (its build script emits the apk bootstrap assets). The members whose build
+    # script installs into bootstrap/bin itself are handled by member_bin_path,
+    # which deliberately resolves to nothing for them.
+    NO_BIN_MEMBERS=("apk-tools" "libakuma" "libakuma-tls" "akuma-ssh-crypto")
     is_no_bin=false
     for m in "${NO_BIN_MEMBERS[@]}"; do
         [ "$MEMBER_ONLY" == "$m" ] && is_no_bin=true && break
     done
-    if [ "$is_no_bin" = false ]; then
+    if [ "$is_no_bin" = false ] && SRC=$(member_bin_path "$MEMBER_ONLY"); then
         mkdir -p ../bootstrap/bin
-        if [ -f "target/aarch64-unknown-none/release/$MEMBER_ONLY" ]; then
-            cp "target/aarch64-unknown-none/release/$MEMBER_ONLY" ../bootstrap/bin/
+        if [ -f "$SRC" ]; then
+            cp "$SRC" ../bootstrap/bin/
         else
-            echo "Warning: Binary $MEMBER_ONLY not found"
+            echo "Warning: Binary $MEMBER_ONLY not found at $SRC"
         fi
     fi
     echo "Build process completed."
@@ -131,7 +238,9 @@ done
 # Create bin directory if it doesn't exist
 mkdir -p ../bootstrap/bin
 
-# Copy binaries (only if they exist)
+# Copy binaries (only if they exist). llama-cli/-server/-bench and nca are NOT
+# listed: their build scripts install them into bootstrap/bin directly, and they
+# never appear under any target/ dir this script looks in.
 BINARIES=(
     "hello"
     "paws"
@@ -148,20 +257,14 @@ BINARIES=(
     "tcc"
     "tar"
     "sshd"
-    "llama-cli"
-    "nca"
 )
 
 for bin in "${BINARIES[@]}"; do
-    SRC="target/aarch64-unknown-none/release/$bin"
+    SRC=$(member_bin_path "$bin")
     if [ -f "$SRC" ]; then
         cp "$SRC" ../bootstrap/bin/
     else
-        if [ "$bin" == "tcc" ] && [ -f "target/aarch64-unknown-none/release/tcc" ]; then
-            cp "target/aarch64-unknown-none/release/tcc" ../bootstrap/bin/tcc
-        else
-            echo "Warning: Binary $bin not found at $SRC"
-        fi
+        echo "Warning: Binary $bin not found at $SRC"
     fi
 done
 
