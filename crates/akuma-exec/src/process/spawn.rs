@@ -234,6 +234,12 @@ pub fn spawn_process_with_channel_ext(
     // translation — use this for subprocesses that need terminal-style output.
     if let Some(data) = stdin {
         if !data.is_empty() {
+            // Short write is possible in principle (the buffer is bounded at 1 MiB
+            // and `write_stdin` no longer drops to make room), but not in practice
+            // here: the channel was created two statements ago, so the whole
+            // buffer is free and any seed up to 1 MiB lands whole. A larger seed
+            // has nowhere to go — nothing has started draining yet — so there is
+            // no retry to make; the tail is dropped, as it was before.
             channel.write_stdin(data);
             channel.close_stdin();
         }

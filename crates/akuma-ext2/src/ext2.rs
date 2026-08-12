@@ -45,6 +45,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 use spinning_top::RwSpinlock;
 
+use akuma_exec::runtime::OnceCopy;
 use akuma_vfs::{DirEntry, Filesystem, FsError, FsStats, Metadata, path_components, split_path};
 use crate::BlockDevice;
 
@@ -337,33 +338,40 @@ impl ClockBlockCache {
 /// 0 means no write lock is held. Used to detect orphaned locks from killed processes.
 static EXT2_WRITE_LOCK_OWNER: AtomicUsize = AtomicUsize::new(0);
 
-/// Hook function to check if a thread is dead. Set by the kernel at runtime.
-static mut IS_THREAD_DEAD_FN: Option<fn(usize) -> bool> = None;
-
-/// Hook function to get the current thread ID. Set by the kernel at runtime.
-static mut CURRENT_THREAD_ID_FN: Option<fn() -> usize> = None;
-
-/// Initialize the thread hooks. Called once by the kernel.
-/// 
-/// # Safety
-/// Must only be called once during kernel initialization, before any filesystem operations.
-#[allow(dead_code)]
-pub unsafe fn init_thread_hooks(
+/// Kernel callbacks the orphaned-lock recovery path needs. Registered once at
+/// boot by `src/fs.rs`.
+#[derive(Clone, Copy)]
+struct ThreadHooks {
     current_thread_id: fn() -> usize,
     is_thread_dead: fn(usize) -> bool,
-) {
-    unsafe {
-        CURRENT_THREAD_ID_FN = Some(current_thread_id);
-        IS_THREAD_DEAD_FN = Some(is_thread_dead);
-    }
+}
+
+/// Thread hooks, published once at boot and read from the lock-acquisition paths.
+///
+/// Was a pair of `static mut Option<fn>` read without any synchronisation: on
+/// SMP that is a genuine data race (nothing ordered the boot core's write
+/// against a secondary core's read), and it made every use site `unsafe`.
+/// [`OnceCopy`] is the crate-wide answer to exactly this shape — a release store
+/// at init paired with an acquire load at every read — and, unlike a spinlock,
+/// it can never self-deadlock against a reader that interrupted the writer.
+static THREAD_HOOKS: OnceCopy<ThreadHooks> = OnceCopy::new();
+
+/// Initialize the thread hooks. Called once by the kernel, before any
+/// filesystem operations. A second call is ignored.
+#[allow(dead_code)]
+pub fn init_thread_hooks(current_thread_id: fn() -> usize, is_thread_dead: fn(usize) -> bool) {
+    THREAD_HOOKS.set(ThreadHooks {
+        current_thread_id,
+        is_thread_dead,
+    });
 }
 
 fn current_thread_id() -> usize {
-    unsafe { CURRENT_THREAD_ID_FN.map_or(0, |f| f()) }
+    THREAD_HOOKS.get().map_or(0, |h| (h.current_thread_id)())
 }
 
 fn is_thread_dead(tid: usize) -> bool {
-    unsafe { IS_THREAD_DEAD_FN.is_some_and(|f| f(tid)) }
+    THREAD_HOOKS.get().is_some_and(|h| (h.is_thread_dead)(tid))
 }
 
 // ============================================================================

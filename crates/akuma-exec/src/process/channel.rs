@@ -276,35 +276,50 @@ impl ProcessChannel {
         data
     }
 
-    /// Write data to stdin buffer (SSH -> process)
-    pub fn write_stdin(&self, data: &[u8]) {
-        with_irqs_disabled(|| {
+    /// Write as much of `data` into the stdin buffer as fits under
+    /// `MAX_BUFFER_SIZE`, and return the number of bytes accepted (`0` means the
+    /// buffer is full). Never drops already-buffered bytes to make room.
+    ///
+    /// This is the stdin counterpart of [`Self::write_bounded`], and it exists for
+    /// the same reason: stdin is a byte-faithful stream, so drop-oldest on
+    /// overflow silently deletes the middle of the input a process is about to
+    /// read. Until 2026-08-13 only the stdout half had been fixed — the
+    /// exec-channel truncation work
+    /// (`userspace/sshd/docs/EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md`) landed
+    /// `write_bounded` on the stdout copy and left this drop-oldest copy alone,
+    /// the canonical copy-paste outcome documented in
+    /// `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §6. It is
+    /// reachable: sshd forwards client input here through `/proc/<pid>/fd/0`, so
+    /// any client piping more than `MAX_BUFFER_SIZE` past a slow-reading child
+    /// (`ssh host 'cat > f' < big`) outran the drain.
+    ///
+    /// Unlike the stdout side there is deliberately NO `check_set_writer`
+    /// equivalent to park a blocked writer on: the only in-tree writer is sshd's
+    /// `bridge_process`, a single loop that must keep draining the child's
+    /// *stdout* in the same iteration. Blocking it here would recreate exactly
+    /// the deadlock its own "make BOTH ends non-blocking" comment describes.
+    /// Short write plus a userspace retry is the deadlock-free shape.
+    pub fn write_stdin(&self, data: &[u8]) -> usize {
+        if data.is_empty() {
+            return 0;
+        }
+
+        let n = with_irqs_disabled(|| {
             let mut buf = self.stdin_buffer.lock();
-
-            // Check for buffer overflow
-            if buf.len() + data.len() > MAX_BUFFER_SIZE {
-                let data_to_write = if data.len() > MAX_BUFFER_SIZE {
-                    &data[data.len() - MAX_BUFFER_SIZE..]
-                } else {
-                    data
-                };
-
-                let current_len = buf.len();
-                let overflow = (current_len + data_to_write.len()).saturating_sub(MAX_BUFFER_SIZE);
-                if overflow > 0 {
-                    buf.drain(..overflow.min(current_len));
-                }
-                buf.extend(data_to_write);
-            } else {
-                buf.extend(data);
-            }
+            let available = MAX_BUFFER_SIZE.saturating_sub(buf.len());
+            let n = data.len().min(available);
+            buf.extend(&data[..n]);
+            n
         });
 
         // Wake any thread blocked in poll/ppoll on its stdin (e.g. busybox sh over
         // sshd: write_to_process_stdin fills this buffer, but a process sleeping in
         // ppoll(fd 0) only wakes when a registered poller is notified). Without this
         // the shell never sees typed input. Mirrors the stdout `write` wake path.
-        self.wake_pollers();
+        if n > 0 {
+            self.wake_pollers();
+        }
+        n
     }
 
     /// Read from stdin buffer (process reads from SSH input)

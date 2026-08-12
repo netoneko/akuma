@@ -859,7 +859,25 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
             });
             0
         }
-        MADV_FREE => 0,
+        // Akuma does not implement MADV_FREE, so say so instead of fabricating
+        // success. Linux itself returns EINVAL for advice it doesn't support, and
+        // callers that care read it correctly: Redis probes MADV_FREE and treats
+        // EINVAL as "older kernel, presumably unaffected" and starts, where the
+        // fabricated 0 sent it down a THP-corruption self-check it cannot pass
+        // without /proc/<pid>/smaps (docs/archive/LONG_ROAD_TO_REDIS.md §5).
+        //
+        // KNOWN CONSEQUENCE, watch it: allocators that probe MADV_FREE (jemalloc,
+        // mimalloc) fall back to MADV_DONTNEED on EINVAL, and this kernel's
+        // MADV_DONTNEED diverges from Linux — it zeroes the *physical frame* where
+        // Linux drops the *mapping*, so on a frame shared by CoW-after-fork or the
+        // file page cache it also wipes the peer's live copy. That divergence
+        // predates this change; what changes is how much traffic reaches it. The
+        // `DONTNEED_SHARED_FRAME` / `DONTNEED_UNALIGNED` counters above (see the
+        // audit block at the top of this file, reported in PSTATS) exist to make
+        // exactly that measurable — if `DONTNEED_SHARED_FRAME` starts climbing,
+        // fixing MADV_DONTNEED to break sharing rather than zero in place is the
+        // prerequisite, not backing this out.
+        MADV_FREE => EINVAL,
         _ => 0,
     }
 }

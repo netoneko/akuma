@@ -169,6 +169,56 @@ impl ProcFilesystem {
             FileDescriptor::PidFd(id) => format!("anon_inode:[pidfd:{id}]"),
         }
     }
+
+    /// Permission-check and dispatch a write to `/proc/<pid>/fd/<n>`, returning
+    /// how many bytes were **accepted**.
+    ///
+    /// Shared by `write_file` and `write_at` so the two cannot drift on the
+    /// isolation and ownership checks. The count matters for fd 0: the target's
+    /// stdin buffer is bounded and no longer drops buffered bytes to make room,
+    /// so a full buffer produces a short write (possibly 0) that the caller must
+    /// carry back to userspace to retry.
+    fn write_fd_data(path: &str, data: &[u8]) -> Result<usize, FsError> {
+        let (target_pid, fd_num) = Self::parse_fd_path(path)?;
+        let caller_proc = akuma_exec::process::current_process_shared();
+        let caller_pid = process::read_current_pid();
+        let caller_box_id = caller_proc.as_ref().map_or(0, |p| p.box_id);
+
+        let target = process::lookup_process_shared(target_pid).ok_or(FsError::NotFound)?;
+
+        // BOX ISOLATION: Box N only sees its own processes.
+        if caller_box_id != 0 && target.box_id != caller_box_id {
+            return Err(FsError::NotFound);
+        }
+
+        match fd_num {
+            0 => {
+                // stdin: allow if caller is spawner, or if kernel-spawned (spawner_pid == None)
+                if let Some(spawner) = target.spawner_pid {
+                    // Process was spawned by another process
+                    if caller_pid != Some(spawner) {
+                        return Err(FsError::PermissionDenied);
+                    }
+                }
+                // If spawner_pid is None (kernel spawned), allow any caller
+                // If caller_pid is None (kernel context), also allow
+
+                // Use the unified helper to write to both legacy buffer and ProcessChannel
+                process::write_to_process_stdin(target_pid, data).map_err(|_| FsError::Internal)
+            }
+            1 => {
+                // stdout: only owning process can write
+                if caller_pid != Some(target_pid) {
+                    return Err(FsError::PermissionDenied);
+                }
+
+                // Write with size limit (thread-safe via Spinlock)
+                target.stdout.lock().write_with_limit(data, PROC_STDOUT_MAX_SIZE);
+                Ok(data.len())
+            }
+            _ => Err(FsError::NotFound),
+        }
+    }
 }
 
 impl Default for ProcFilesystem {
@@ -617,55 +667,25 @@ impl Filesystem for ProcFilesystem {
     }
 
     fn write_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        let (target_pid, fd_num) = Self::parse_fd_path(path)?;
-        let caller_proc = akuma_exec::process::current_process_shared();
-        let caller_pid = process::read_current_pid();
-        let caller_box_id = caller_proc.as_ref().map_or(0, |p| p.box_id);
-
-        let target = process::lookup_process_shared(target_pid).ok_or(FsError::NotFound)?;
-
-        // BOX ISOLATION: Box N only sees its own processes.
-        if caller_box_id != 0 && target.box_id != caller_box_id {
-            return Err(FsError::NotFound);
-        }
-
-        match fd_num {
-            0 => {
-                // stdin: allow if caller is spawner, or if kernel-spawned (spawner_pid == None)
-                if let Some(spawner) = target.spawner_pid {
-                    // Process was spawned by another process
-                    if caller_pid != Some(spawner) {
-                        return Err(FsError::PermissionDenied);
-                    }
-                }
-                // If spawner_pid is None (kernel spawned), allow any caller
-                // If caller_pid is None (kernel context), also allow
-
-                // Use the unified helper to write to both legacy buffer and ProcessChannel
-                if process::write_to_process_stdin(target_pid, data).is_err() {
-                    return Err(FsError::Internal);
-                }
-                Ok(())
-            }
-            1 => {
-                // stdout: only owning process can write
-                if caller_pid != Some(target_pid) {
-                    return Err(FsError::PermissionDenied);
-                }
-
-                // Write with size limit (thread-safe via Spinlock)
-                target.stdout.lock().write_with_limit(data, PROC_STDOUT_MAX_SIZE);
-                Ok(())
-            }
-            _ => Err(FsError::NotFound),
+        // All-or-nothing contract: a caller with no way to report a residue must
+        // not be told a partial stdin write succeeded. `write_at` is the path
+        // `sys_write` actually takes and it reports the count instead.
+        match Self::write_fd_data(path, data)? {
+            n if n == data.len() => Ok(()),
+            _ => Err(FsError::NoSpace),
         }
     }
 
     fn write_at(&self, path: &str, _offset: usize, data: &[u8]) -> Result<usize, FsError> {
         // For ProcFS, we ignore the offset and treat it as a direct write/append
         // to the process buffers. This avoids the default read-modify-write behavior.
-        self.write_file(path, data)?;
-        Ok(data.len())
+        //
+        // Returns the ACCEPTED count, which for fd 0 can be short (or 0) once the
+        // target's bounded stdin buffer fills — `sys_write` turns that into a
+        // short write / EAGAIN for the caller to retry. It used to report
+        // `data.len()` unconditionally, which is what let the drop-oldest
+        // overflow inside `write_stdin` go unnoticed.
+        Self::write_fd_data(path, data)
     }
 
 

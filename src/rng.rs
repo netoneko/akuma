@@ -11,7 +11,7 @@
 //! panics at init. See docs/VIRTIO_MMIO_LEGACY_TO_MODERN.md.
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{AtomicU16, Ordering, fence};
 
 use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use spinning_top::Spinlock;
@@ -122,12 +122,19 @@ struct VirtqDesc {
 
 /// VirtIO available ring
 /// Layout: flags (u16), idx (u16), ring[QUEUE_SIZE] (u16 each), used_event (u16)
+///
+/// The fields the device also touches are `AtomicU16` — same size and alignment
+/// as `u16`, so the `repr(C)` layout the spec mandates is unchanged, but the
+/// cross-visible accesses now carry real ordering instead of resting on
+/// scattered `fence(SeqCst)` calls. `ring[]` stays plain: the release store on
+/// `idx` is what publishes it, exactly as virtio-drivers models its own
+/// `AvailRing`.
 #[repr(C)]
 struct VirtqAvail {
-    flags: u16,
-    idx: u16,
+    flags: AtomicU16,
+    idx: AtomicU16,
     ring: [u16; QUEUE_SIZE],
-    used_event: u16,
+    used_event: AtomicU16,
 }
 
 /// VirtIO used ring element
@@ -140,12 +147,16 @@ struct VirtqUsedElem {
 
 /// VirtIO used ring
 /// Layout: flags (u16), idx (u16), ring[QUEUE_SIZE], avail_event (u16)
+///
+/// Same treatment as [`VirtqAvail`]: `idx` is the field whose acquire load makes
+/// the matching `ring[]` entry — and the data the device DMA'd into the staging
+/// buffer — valid to read.
 #[repr(C)]
 struct VirtqUsed {
-    flags: u16,
-    idx: u16,
+    flags: AtomicU16,
+    idx: AtomicU16,
     ring: [VirtqUsedElem; QUEUE_SIZE],
-    avail_event: u16,
+    avail_event: AtomicU16,
 }
 
 // ============================================================================
@@ -417,20 +428,23 @@ impl VirtioRngDevice {
                 d.next = 0;
             }
 
-            // Memory barrier before updating available ring
-            fence(Ordering::SeqCst);
-
-            // Add to available ring
+            // Add to available ring. The descriptor fields written above and the
+            // `ring[]` slot written here are both published by the release store
+            // on `idx`: a device that observes the new `idx` is guaranteed to
+            // observe everything that preceded it.
             let ring_idx = (self.avail_idx as usize) % QUEUE_SIZE;
             unsafe {
-                let avail = &mut *self.avail;
-                avail.ring[ring_idx] = desc_idx;
-                fence(Ordering::SeqCst);
-                avail.idx = self.avail_idx.wrapping_add(1);
+                (&raw mut (*self.avail).ring[ring_idx]).write(desc_idx);
+                (*self.avail)
+                    .idx
+                    .store(self.avail_idx.wrapping_add(1), Ordering::Release);
             }
             self.avail_idx = self.avail_idx.wrapping_add(1);
 
-            // Memory barrier before notifying device
+            // Barrier before the MMIO notify. The release store above orders the
+            // ring writes against each other, but this is Normal memory and the
+            // notify below is a Device-memory store — nothing in the release
+            // store keeps the device from seeing the kick before the ring.
             fence(Ordering::SeqCst);
 
             // Notify device
@@ -443,8 +457,11 @@ impl VirtioRngDevice {
             const MAX_ATTEMPTS: u32 = 10_000_000;
 
             loop {
-                fence(Ordering::SeqCst);
-                let used_idx = unsafe { read_volatile(&raw const (*self.used).idx) };
+                // Acquire, not volatile: observing the new `idx` is what makes
+                // `used.ring[…]` and the DMA'd staging buffer valid to read, and
+                // `read_volatile` constrains only the compiler, not the CPU's
+                // load/load reordering.
+                let used_idx = unsafe { (*self.used).idx.load(Ordering::Acquire) };
                 if used_idx != self.last_used_idx {
                     break;
                 }
@@ -455,7 +472,7 @@ impl VirtioRngDevice {
                 core::hint::spin_loop();
             }
 
-            // Get the used element
+            // Get the used element (plain read — covered by the acquire above)
             let used_ring_idx = (self.last_used_idx as usize) % QUEUE_SIZE;
             let used_elem = unsafe { (*self.used).ring[used_ring_idx] };
             self.last_used_idx = self.last_used_idx.wrapping_add(1);
@@ -465,8 +482,20 @@ impl VirtioRngDevice {
                 return Err(RngError::ReadError);
             }
 
-            // Copy data from buffer
-            let copy_len = core::cmp::min(used_elem.len as usize, buf.len() - bytes_read);
+            // Copy data from buffer. `used_elem.len` is written by the DEVICE, so
+            // clamp it to what this request actually offered (`to_read`) — NOT to
+            // the caller's remaining space. The source is a fixed 256-byte staging
+            // allocation; clamping against `buf.len() - bytes_read` lets a device
+            // reporting `len > to_read` over-read that allocation and hand the
+            // spill straight to userspace through `getrandom`. The same distrust
+            // already gates `used_elem.id` just above.
+            let copy_len = core::cmp::min(used_elem.len as usize, to_read);
+            if copy_len == 0 {
+                // A device completing the descriptor without writing anything
+                // would otherwise spin the outer loop forever: `bytes_read` never
+                // advances, so the same request is reissued indefinitely.
+                return Err(RngError::ReadError);
+            }
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     self.buffer,

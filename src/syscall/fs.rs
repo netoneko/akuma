@@ -933,6 +933,25 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             akuma_exec::process::FileDescriptor::File(ref f) => {
                 let is_append = f.flags & akuma_exec::process::open_flags::O_APPEND != 0;
                 match crate::fs::write_at(&f.path, write_pos, buf_slice) {
+                    Ok(0) => {
+                        // The chunk was non-empty, so zero accepted means a bounded
+                        // sink that is currently full. On-disk files never land
+                        // here (they report `NoSpace` as an error instead); the one
+                        // producer is `/proc/<pid>/fd/0`, whose stdin buffer stopped
+                        // dropping bytes to make room. Report progress if there is
+                        // any, else EAGAIN — never fall through, because `written`
+                        // of 0 leaves `total_written < count` and spins this loop
+                        // forever inside the kernel.
+                        //
+                        // EAGAIN rather than blocking even on a blocking fd: the
+                        // only in-tree writer is sshd's `bridge_process`, one loop
+                        // that must keep draining the child's stdout in the same
+                        // iteration to make the space it is waiting for. Parking it
+                        // here is precisely the deadlock its own "make BOTH ends
+                        // non-blocking" comment was written to avoid.
+                        if total_written > 0 { return total_written as u64; }
+                        return EAGAIN;
+                    }
                     Ok(n) => {
                         write_pos += n;
                         // O_APPEND still needs `.position` published per chunk (its

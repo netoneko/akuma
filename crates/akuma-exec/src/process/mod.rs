@@ -334,18 +334,35 @@ pub use crate::box_registry::{
 /// `docs/reference/subsystems/containers.md`.
 pub use crate::box_registry::access as box_access;
 
-/// Write data to a process's stdin
-pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str> {
+/// Write data to a process's stdin, returning how many bytes were accepted.
+///
+/// This is a **short write**, not all-or-nothing: the channel's stdin buffer is
+/// bounded and no longer drops buffered bytes to make room (see
+/// [`ProcessChannel::write_stdin`]), so a caller that gets back less than
+/// `data.len()` must retry the remainder rather than treat it as delivered.
+/// `Ok(0)` means the child has not drained anything yet.
+pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<usize, &'static str> {
     let proc = children::lookup_process_shared(pid).ok_or("Process not found")?;
-    
+
     if let Some(target_pid) = proc.delegate_pid {
         return write_to_process_stdin(target_pid, data);
     }
 
-    proc.stdin.lock().write_with_limit(data, config().proc_stdin_max_size);
+    let Some(ref channel) = proc.channel else {
+        // No channel: the legacy buffer is the only sink, and it has always taken
+        // everything (clearing itself on overflow), so report a full write.
+        proc.stdin.lock().write_with_limit(data, config().proc_stdin_max_size);
+        return Ok(data.len());
+    };
 
-    if let Some(ref channel) = proc.channel {
-        channel.write_stdin(data);
+    let accepted = channel.write_stdin(data);
+
+    // Mirror only the accepted prefix into the legacy buffer, so the two sinks
+    // cannot disagree about what was delivered when the channel comes up short.
+    if accepted > 0 {
+        proc.stdin
+            .lock()
+            .write_with_limit(&data[..accepted], config().proc_stdin_max_size);
 
         // `lock_bounded` disables preemption only for a single `try_lock` attempt, not
         // across the whole wait — see docs/archive/TERM_POLL_INPUT_PREEMPTION_FIX.md §10.
@@ -354,7 +371,7 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<(), &'static str>
             waker.wake();
         }
     }
-    Ok(())
+    Ok(accepted)
 }
 
 /// Signal end-of-input on a process's stdin (the SSH client closed its stdin

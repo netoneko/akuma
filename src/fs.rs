@@ -44,12 +44,10 @@ pub fn init() -> Result<(), FsError> {
     // Initialize ext2 thread hooks for orphaned lock recovery
     // These hooks allow the filesystem to detect when a thread holding the lock has died
     // and force-unlock to prevent permanent deadlock.
-    unsafe {
-        akuma_ext2::init_thread_hooks(
-            akuma_exec::threading::current_thread_id,
-            akuma_exec::threading::is_thread_terminated,
-        );
-    }
+    akuma_ext2::init_thread_hooks(
+        akuma_exec::threading::current_thread_id,
+        akuma_exec::threading::is_thread_terminated,
+    );
     
     // Size the ext2 block cache from detected RAM before mounting (the cache is
     // allocated in Ext2Filesystem::new). Cap at min(12.5% RAM, 384 MB): enough to

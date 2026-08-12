@@ -10,7 +10,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// handlers). No spinlock — readers must never block on writers, because
 /// reading `RUNTIME`/`CONFIG` from inside an IRQ that interrupted code
 /// holding the same lock would self-deadlock on a single CPU.
-struct OnceCopy<T: Copy> {
+///
+/// Public so other crates registering kernel callbacks at boot get the same
+/// guarantee instead of re-deriving it: `akuma-ext2`'s thread hooks use it.
+pub struct OnceCopy<T: Copy> {
     initialized: AtomicBool,
     value: UnsafeCell<MaybeUninit<T>>,
 }
@@ -18,7 +21,8 @@ struct OnceCopy<T: Copy> {
 unsafe impl<T: Copy + Send + Sync> Sync for OnceCopy<T> {}
 
 impl<T: Copy> OnceCopy<T> {
-    const fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             initialized: AtomicBool::new(false),
             value: UnsafeCell::new(MaybeUninit::uninit()),
@@ -27,7 +31,7 @@ impl<T: Copy> OnceCopy<T> {
 
     /// Write the value. Must be called exactly once before any `get()`.
     /// Second call is silently ignored — callers shouldn't rely on that.
-    fn set(&self, v: T) {
+    pub fn set(&self, v: T) {
         if self.initialized.load(Ordering::Acquire) {
             return;
         }
@@ -37,7 +41,8 @@ impl<T: Copy> OnceCopy<T> {
         self.initialized.store(true, Ordering::Release);
     }
 
-    fn get(&self) -> Option<T> {
+    #[must_use]
+    pub fn get(&self) -> Option<T> {
         if self.initialized.load(Ordering::Acquire) {
             // SAFETY: initialized=true means the value was fully written
             // before the Release store; T: Copy lets us read a copy.

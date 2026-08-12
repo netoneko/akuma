@@ -43,6 +43,7 @@ const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
 const SSH_MSG_USERAUTH_REQUEST: u8 = 50;
 const SSH_MSG_CHANNEL_OPEN: u8 = 90;
 const SSH_MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
+const SSH_MSG_CHANNEL_WINDOW_ADJUST: u8 = 93;
 const SSH_MSG_CHANNEL_DATA: u8 = 94;
 const SSH_MSG_CHANNEL_EOF: u8 = 96;
 const SSH_MSG_CHANNEL_CLOSE: u8 = 97;
@@ -267,16 +268,26 @@ async fn bridge_process(
         eprintln(&format!("[SSHD] bridge_process: couldn't open stdin for pid {}", pid));
     }
 
-    // CRITICAL: make BOTH ends non-blocking before the bridge loop. The child's
-    // stdout fd (ChildStdout) and the SSH socket both block by default. Without
-    // this, the loop parks in `read_fd(stdout_fd)` — busybox is waiting in ppoll
-    // on its stdin and emits no output — and never reaches the keystroke
-    // forwarding below, so the shell never receives input: a deadlock (bridge
-    // waits on stdout, shell waits on stdin). Non-blocking lets the loop poll
-    // both directions; `read_fd` returns EAGAIN (<0) and `stream.read` surfaces
-    // it as Err, both of which the loop already tolerates.
+    // CRITICAL: make ALL THREE ends non-blocking before the bridge loop. The
+    // child's stdout fd (ChildStdout), the child's stdin fd and the SSH socket
+    // all block by default. Without this, the loop parks in `read_fd(stdout_fd)`
+    // — busybox is waiting in ppoll on its stdin and emits no output — and never
+    // reaches the keystroke forwarding below, so the shell never receives input:
+    // a deadlock (bridge waits on stdout, shell waits on stdin). Non-blocking
+    // lets the loop poll every direction; `read_fd`/`write_fd` return EAGAIN (<0)
+    // and `stream.read` surfaces it as Err, all of which the loop tolerates.
+    //
+    // `stdin_fd` joined this list on 2026-08-13, when the kernel's stdin buffer
+    // stopped silently dropping its oldest bytes on overflow and started
+    // reporting short writes instead. A client piping more than the buffer holds
+    // past a slow-reading child now gets backpressure, and backpressure on THIS
+    // fd is the one thing this loop must never wait on: it is also the only
+    // thing draining the child's stdout, which is what frees the space.
     set_nonblocking(stdout_fd as i32, true);
     set_nonblocking(stream.as_raw_fd(), true);
+    if stdin_fd >= 0 {
+        set_nonblocking(stdin_fd, true);
+    }
 
     // The session ends when the SHELL exits, not when the client stops sending.
     // A non-interactive client (`echo cmd | ssh`, or anything that closes its
@@ -284,6 +295,22 @@ async fn bridge_process(
     // would drop the shell's output. So after EOF we stop reading input but keep
     // pumping stdout until waitpid(pid) reports the shell has exited.
     let mut client_done = false;
+
+    // Client bytes accepted by this bridge but not yet accepted by the child's
+    // stdin. Non-empty only when the child is behind; carried across iterations
+    // and retried, because a short write whose residue is dropped is the same
+    // data loss the kernel-side fix was made to stop.
+    let mut stdin_pending: Vec<u8> = Vec::new();
+    // The client sent EOF while `stdin_pending` still held data. Deliver the EOF
+    // only once the residue has drained — closing stdin first would make the
+    // shell see end-of-input ahead of its own last bytes.
+    let mut stdin_eof_pending = false;
+    // Inbound bytes the child has consumed but the client has not yet been
+    // granted back (see `send_window_adjust`). Batched so a keystroke session
+    // doesn't emit an adjust packet per character; 64 KiB against the 1 MiB
+    // initial window leaves an ample margin for the round trip.
+    let mut window_credit: u32 = 0;
+    const WINDOW_ADJUST_THRESHOLD: u32 = 64 * 1024;
 
     // Evaluates to how the child ended, which `send_exit_report` below relays to
     // the client. `waitpid_status`, not `waitpid`: the latter returns only
@@ -346,9 +373,14 @@ async fn bridge_process(
                     let mut offset = 0;
                     let _recipient = read_u32(&payload, &mut offset);
                     if let Some(data) = read_string(&payload, &mut offset) {
-                        // Forward to the child's stdin (opened once above).
+                        // Queue for the child's stdin (opened once above). Queued
+                        // rather than written straight through: the write is
+                        // non-blocking and may be short, and whatever the child
+                        // cannot take right now has to survive to the next
+                        // attempt. Step 4 below flushes this in the same
+                        // iteration, so there is no added latency per keystroke.
                         if stdin_fd >= 0 {
-                            write_fd(stdin_fd, data);
+                            stdin_pending.extend_from_slice(data);
                         }
                     }
                 } else if msg_type == SSH_MSG_CHANNEL_EOF || msg_type == SSH_MSG_CHANNEL_CLOSE {
@@ -360,7 +392,11 @@ async fn bridge_process(
                     // ITSELF exits. Tearing down here would drop the command
                     // output; if the client has truly gone, send_channel_data
                     // above fails and the `?` unwinds the loop.
-                    close_child_stdin(pid);
+                    //
+                    // Deferred through `stdin_eof_pending` so the EOF lands
+                    // AFTER the queued input it follows — step 4 closes stdin
+                    // once `stdin_pending` is empty.
+                    stdin_eof_pending = true;
                     client_done = true;
                 } else if msg_type == SSH_MSG_CHANNEL_REQUEST {
                     // A live resize: forward new columns/rows to the child so
@@ -380,6 +416,35 @@ async fn bridge_process(
                     }
                 }
             }
+        }
+
+        // 4. Push queued input at the child's stdin. Non-blocking, so this can
+        //    accept only part of the queue (or nothing at all) when the child is
+        //    behind; keep the remainder and try again next iteration rather than
+        //    dropping it. Outside the `!client_done` guard on purpose: a queue
+        //    left over at EOF still has to be delivered.
+        if stdin_fd >= 0 && !stdin_pending.is_empty() {
+            let n = write_fd(stdin_fd, &stdin_pending);
+            if n > 0 {
+                stdin_pending.drain(..n as usize);
+                window_credit += n as u32;
+                did_io = true;
+            }
+            // n <= 0 is EAGAIN (child's buffer full) — nothing to do but come
+            // back after the stdout drain above has made room.
+        }
+        if stdin_eof_pending && stdin_pending.is_empty() {
+            close_child_stdin(pid);
+            stdin_eof_pending = false;
+        }
+
+        // 5. Give the consumed window back, so the client may send more. Issued
+        //    here — after the bytes reached the child — rather than on arrival,
+        //    which is what makes the SSH window carry the child's backpressure
+        //    all the way to the client instead of just authorising an overrun.
+        if window_credit >= WINDOW_ADJUST_THRESHOLD {
+            send_window_adjust(stream, session, window_credit).await?;
+            window_credit = 0;
         }
 
         // Only yield when both directions were idle, to keep latency low while busy.
@@ -702,6 +767,29 @@ async fn send_unencrypted_packet(stream: &mut SshStream, payload: &[u8], session
     let packet = build_packet(payload);
     session.crypto.encrypt_seq = session.crypto.encrypt_seq.wrapping_add(1);
     stream.write_all(&packet).await
+}
+
+/// RFC 4254 §5.2 flow control: grant the client `bytes` more of inbound window.
+///
+/// The channel-open confirmation advertises a 1 MiB initial window
+/// (`0x100000`), and until 2026-08-13 nothing ever replenished it — so a client
+/// piping more than 1 MiB of stdin sent exactly the window, then waited forever
+/// for an adjust that never came. `ssh host 'cat > f' < 4MiB-file` hung with
+/// precisely 1048576 bytes delivered. Note the coincidence that hid this: the
+/// window happened to equal the kernel's `MAX_BUFFER_SIZE`, so the missing
+/// adjust also capped how much stdin could ever be queued, which is why the
+/// drop-oldest overflow inside `ProcessChannel::write_stdin` was never observed
+/// from a real session.
+///
+/// The grant is issued as the child *consumes* bytes, not as they arrive, so
+/// the client's window is genuine end-to-end backpressure rather than a
+/// permission to overrun a buffer.
+async fn send_window_adjust(stream: &mut SshStream, session: &mut SshSession, bytes: u32) -> Result<(), NetError> {
+    if !session.channel_open || bytes == 0 { return Ok(()); }
+    let mut payload = vec![SSH_MSG_CHANNEL_WINDOW_ADJUST];
+    write_u32(&mut payload, session.client_channel);
+    write_u32(&mut payload, bytes);
+    send_packet(stream, &payload, session).await
 }
 
 async fn send_channel_data(stream: &mut SshStream, session: &mut SshSession, data: &[u8]) -> Result<(), NetError> {
