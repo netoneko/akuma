@@ -175,6 +175,24 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   one run in three, far too flaky to A/B a fix on. Measured **4 FAIL before the
   2026-08-06 fix, 8 PASS after, 8 PASS on Linux**. Calibrate with
   `docker run --rm --platform linux/arm64 -v "$PWD/tidflags:/tidflags:ro" alpine /tidflags`.
+- `smapsdirty` — does `/proc/self/smaps` exist, and does it report `Shared_Dirty`
+  for a CoW page? Four probes: `smaps` present; the rest of `/proc/self/`
+  (`maps`, `status`, `stat`, `statm`, `cmdline`); the `madvise(MADV_FREE)` return
+  value; and a verbatim reproduction of `redis-server`'s ARM64-COW-BUG startup
+  check (`checkLinuxMadvFreeForkBug` in redis/src/syscheck.c). This is why redis
+  refuses to start on Akuma — and **despite the warning's name it is not a CoW
+  bug**: redis prints a *different* message when it genuinely detects CoW
+  corruption, and its return convention is inverted (`>0` healthy, `<0` bug
+  found, `0` could not test). Redis lands on `0` because the child's
+  `fopen("/proc/self/smaps")` returns ENOENT — Akuma implements no
+  `/proc/<pid>/` files at all. Note `MADV_FREE` returning a fabricated `0`
+  (`src/syscall/mem.rs`) is what denies redis its graceful skip: on `EINVAL` it
+  would conclude "older kernel, presumably unaffected" and start. Beware a
+  naive `/proc/smaps` stub — reporting `Shared_Dirty: 0` flips redis to `res=-1`
+  and it announces a CoW bug instead, which is worse. As of 2026-08-12: **probes
+  1, 2 and 4 FAIL on Akuma, 4 PASS on Linux**. Calibrate with
+  `docker run --rm --platform linux/arm64 -v "$PWD/smapsdirty:/smapsdirty:ro" alpine /smapsdirty`.
+  Full investigation: `docs/archive/LONG_ROAD_TO_REDIS.md`.
 - `futexkey` — does a futex key leak between address spaces? Forks a waiter that
   parks on a `.bss` global, then issues the wake **from the parent**, i.e. a
   different address space at the identical VA (no ASLR). A correct kernel wakes
