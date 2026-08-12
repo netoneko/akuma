@@ -2,11 +2,17 @@
 
 **Date:** 2026-08-12
 **Scope:** kernel bin crate (`src/`) + the seven extracted crates (`crates/`).
-Userspace out of scope.
+Userspace out of scope *for the duplication survey* — but a fix may still have to
+reach into it, as Phase 0 item 5 did (a bounded kernel buffer is only correct if
+the userspace writer retries the residue).
 **Companion:** [`UNSAFE_AUDIT.md`](UNSAFE_AUDIT.md) — several findings overlap, because
 deleted code has no `unsafe` in it.
 
-Nothing here has been applied. It is a work list.
+**This doc tracks.** It is a live work list, not a frozen investigation — unlike
+its neighbours in `archive/`, update it as phases land.
+
+**Progress: Phase 0 done (2026-08-13), Phase 1 done. Phase 2a is next.**
+See §8.5 for per-item status.
 
 ---
 
@@ -479,11 +485,22 @@ path — `write_bounded` (`:141`) plus `check_set_writer` (`:165`) — precisely
 because drop-oldest "silently corrupts a byte-faithful stream"
 (`userspace/sshd/docs/EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md`, still open per
 `docs/userspace/sshd.md`). **The stdin copy never got the fix.** `write_stdin`
-is still bare drop-oldest with no bounded sibling and no backpressure, reachable
+was still bare drop-oldest with no bounded sibling and no backpressure, reachable
 from `src/vfs/proc.rs:645` and `process/spawn.rs:237`. Whether it is live-triggerable
 depends on how much unread stdin a caller can queue past `MAX_BUFFER_SIZE` (1 MiB);
 it is at minimum an unreviewed asymmetry, and it is the canonical copy-paste
 outcome — the fix lands on one copy.
+
+> **Resolved 2026-08-13** (Phase 0 item 5, §8.5). `write_stdin` is now bounded
+> and short-writing, and the reachability question has an answer: **not through
+> sshd** — but only by accident. sshd's SSH channel window was 1 MiB and never
+> replenished, the same number as `MAX_BUFFER_SIZE`, so inbound stdin was capped
+> at exactly the size of the buffer that would have overflowed. Two defects whose
+> limits coincided, each hiding the other:
+> [`SSHD_CHANNEL_WINDOW_NEVER_ADJUSTED.md`](SSHD_CHANNEL_WINDOW_NEVER_ADJUSTED.md).
+> The lesson for the rest of this document: "the duplicated copy is probably not
+> reachable" is a claim about *today's* callers, and it can be true for a reason
+> that is itself a bug. The asymmetry was worth fixing on its own terms.
 
 **Implication for tooling.** Do not treat 5,370 as the number. Treat it as the
 lower bound that a tool with no semantic understanding can prove. Type-2
@@ -545,7 +562,7 @@ ELF-loading path into one.
 | # | Item | Lines | Effort | Risk |
 |---|---|---:|---|---|
 | 1 | virtio scaffolding: shared `Hal`, `virtio::probe`, one `VIRTIO_MMIO_ADDRS` | ~90 | small | low |
-| 2 | `channel.rs` stdout/stdin FIFO → one helper; **decide whether `write_stdin` needs the `write_bounded` treatment** | ~40 | small | low, but see §6 |
+| 2 | `channel.rs` stdout/stdin FIFO → one helper; ~~decide whether `write_stdin` needs the `write_bounded` treatment~~ **(decided + shipped 2026-08-13, §8.5 Phase 0 item 5)** — the FIFO-merge half is still open | ~40 | small | low, but see §6 |
 | 3 | `akuma-isolation`/`akuma-vfs` `mount.rs` → shared half into `akuma-vfs` | ~63 | small | low |
 | 4 | The `X`/`X_from_path` **quartet** (`elf/mod.rs` ×3, `process/mod.rs`, `process/image.rs`) — unify on the `elf` crate first | **~650** | medium | medium — ELF load path, boot-critical, but the parser half is verified equivalent (§3) |
 | 5 | `exceptions.rs` duplicated `Drop` impls (`:3703` / `:4315`) | ~142 | medium | **high** — exception path |
@@ -579,17 +596,75 @@ CoW paths) and `userspace/`. Phases are ordered partly to avoid their files.
 
 ### Phase 0 — real defects, independent of any refactor
 
-| | Fix | Files | Notes |
+**DONE 2026-08-13.** All five landed together; `cargo clippy` clean, 413 host
+tests + 11 sshd lib tests green, QEMU-verified (details per row).
+
+| | Fix | Files | Status |
 |---|---|---|---|
-| 1 | `rng.rs`: clamp `copy_len` to `to_read`, not caller-remaining | `src/rng.rs` | device-controlled length over-reads a 256-byte staging buffer into `getrandom`'s output |
-| 2 | `rng.rs`: ring `idx` → `AtomicU16` with Release/Acquire | `src/rng.rs` | no acquire between observing completion and reading the DMA'd data |
-| 3 | ext2 thread hooks → `Spinlock` | `crates/akuma-ext2` | live data race; also −5 `unsafe` |
-| 4 | `MADV_FREE` → `EINVAL` (unblocks redis) | `src/syscall/mem.rs` | see `LONG_ROAD_TO_REDIS.md` §5.1 — **has a real caveat**, allocators fall back to the divergent `MADV_DONTNEED` |
-| 5 | Decide `write_stdin` backpressure (§6) | `process/channel.rs` | the `EXEC_CHANNEL` fix reached stdout only |
+| 1 | `rng.rs`: clamp `copy_len` to `to_read`, not caller-remaining | `src/rng.rs` | **DONE.** Also added a `copy_len == 0` guard — a device completing the descriptor without writing spun the outer loop forever, since `bytes_read` never advanced |
+| 2 | `rng.rs`: ring `idx` → `AtomicU16` with Release/Acquire | `src/rng.rs` | **DONE.** `VirtqAvail`/`VirtqUsed`'s `idx`/`flags`/`*_event` are `AtomicU16` (same layout, `repr(C)` unchanged); release store on publish, acquire load on completion. The pre-notify `fence(SeqCst)` **stays** — it orders Normal memory against a Device-memory store, which the release does not cover |
+| 3 | ext2 thread hooks → lock-free cell | `crates/akuma-ext2`, `crates/akuma-exec/src/runtime.rs`, `src/fs.rs` | **DONE**, but *not* with a `Spinlock` as written above — see the note below. −5 `unsafe`; `init_thread_hooks` is now a safe fn |
+| 4 | `MADV_FREE` → `EINVAL` (unblocks redis) | `src/syscall/mem.rs` | **DONE.** Verified in-VM: `-1 errno=22`, `MADV_DONTNEED`/`MADV_WILLNEED` untouched. The `MADV_DONTNEED` divergence is **still open** and is now the documented tripwire — see below |
+| 5 | Decide `write_stdin` backpressure (§6) | `process/channel.rs` + 4 more | **DONE — decided: short write, not blocking.** Uncovered a second, older bug in the process; both fixed. See below |
+
+**Item 3 — why not a `Spinlock`.** The row above said `Spinlock`, and that would
+have been wrong. `akuma-exec/src/runtime.rs` already carries `OnceCopy<T>` for
+exactly this shape (`RUNTIME`/`CONFIG`), and its doc comment explains why:
+*"No spinlock — readers must never block on writers, because reading
+`RUNTIME`/`CONFIG` from inside an IRQ that interrupted code holding the same
+lock would self-deadlock on a single CPU."* The ext2 hooks are read from the
+lock-acquisition retry loops and have the same hazard. `OnceCopy` was made
+`pub` and reused rather than a second mechanism invented — which is the point of
+this document. A release store at `init_thread_hooks`, an acquire load at each
+read, and the `static mut` data race is closed at zero cost.
+
+**Item 4 — what is still open.** Allocators that probe `MADV_FREE` (jemalloc,
+mimalloc) fall back to `MADV_DONTNEED` on `EINVAL`, and this kernel's
+`MADV_DONTNEED` still zeroes the *physical frame* where Linux drops the
+*mapping* — so on a CoW-after-fork or `file_page_cache` frame it also wipes the
+peer's live copy (`akuma-exec/src/mmu/mod.rs` `zero_mapped_page` takes no
+sharing into account). That divergence predates this change; what changed is how
+much traffic can reach it. The existing `DONTNEED_SHARED_FRAME` /
+`DONTNEED_UNALIGNED` counters are the tripwire, reported on the 30 s `[MADV]`
+PSTATS line. Reading `dontneed_unaligned=0 dontneed_shared_frame=0` after a
+boot's worth of sshd sessions, a tcc compile and an 8 MiB hash, 2026-08-13. **If
+that starts climbing, fixing `MADV_DONTNEED` to break sharing rather than zero in
+place is the prerequisite — not backing item 4 out.**
+
+**Item 5 — the decision, and the bug underneath it.** Blocking the writer (the
+symmetric `check_set_writer` treatment the stdout half got) is *wrong here*:
+sshd's `bridge_process` is a single loop that must keep draining the child's
+stdout to create the stdin space it would be waiting on, which is the deadlock
+its own "make BOTH ends non-blocking" comment exists to prevent. So: `write_stdin`
+returns bytes accepted and never drops; the count is carried out through
+`write_to_process_stdin` → `ProcFilesystem::write_at` → `sys_write` as a short
+write; sshd's stdin fd joined the non-blocking set and gained a residue queue
+with deferred EOF. `sys_write`'s `File` arm returns `EAGAIN` on a 0-byte accept,
+because falling through would spin the chunk loop forever in the kernel.
+
+Verifying it turned up an older, unrelated defect that had been masking this one:
+**sshd advertised a 1 MiB SSH channel window and never sent
+`SSH_MSG_CHANNEL_WINDOW_ADJUST`**, so no session could ever carry more than
+1 MiB of stdin. That window (`0x100000`) is the same number as `MAX_BUFFER_SIZE`,
+which answers §6's open question — the drop-oldest overflow was **not**
+reachable through sshd, only because a second missing feature capped inbound
+stdin at exactly the buffer's size. Fixing either alone would have been worse
+than fixing neither: the window alone converts a visible hang into silent
+corruption. Full writeup:
+[`SSHD_CHANNEL_WINDOW_NEVER_ADJUSTED.md`](SSHD_CHANNEL_WINDOW_NEVER_ADJUSTED.md).
+Verified with 4 MiB through `cat` and 8 MiB through `sha256sum`, both byte-exact.
 
 Not a defect after all: the unchecked `read_*_le` helpers in `elf/types.rs` were
 suspected of being a `panic = "abort"` vector on malformed input. 280 hostile
 header-field mutations panic neither parser — the guards hold. Closed.
+
+**Unrelated known failure, do not chase.** `[FAIL] retired_reclaim_ab: … ON
+recovered 745p … expected >=768p` fires on an unmodified tree (A/B-confirmed
+2026-08-13 by stashing the diff and rebooting; identical numbers both arms). The
+mechanism works — 0p vs 745p is a clean separation — only the pass threshold is
+too tight. It is the sole `[FAIL]` in a default boot, so anything touching memory
+looks guilty; diff the failure *sets*:
+`diff <(grep -aoE "\[FAIL\] [a-z_0-9]+" base.log | sort -u) <(… mine.log …)`.
 
 ### Phase 1 — verification scaffolding
 
