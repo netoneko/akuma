@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 570
+- **Total distinct fixes counted:** 573
 - **Docs contributing at least one fix:** 173
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 116 | 20.4% | 15 |
-| Memory & Virtual Memory | 89 | 15.6% | 25 |
-| Scheduler & Process Management | 74 | 13.0% | 17 |
-| SMP & Locking | 70 | 12.3% | 29 |
+| Syscall / ABI Compatibility Audits | 116 | 20.2% | 15 |
+| Memory & Virtual Memory | 89 | 15.5% | 25 |
+| Scheduler & Process Management | 74 | 12.9% | 17 |
+| SMP & Locking | 73 | 12.7% | 29 |
 | Networking | 31 | 5.4% | 13 |
-| Userspace Apps & Libraries | 34 | 6.0% | 18 |
+| Userspace Apps & Libraries | 34 | 5.9% | 18 |
 | Rump Kernel & Syscall Proxy | 24 | 4.2% | 5 |
 | Toolchain & Self-Hosting | 37 | 6.5% | 5 |
-| SSH | 14 | 2.5% | 12 |
+| SSH | 14 | 2.4% | 12 |
 | VFS & Filesystem | 13 | 2.3% | 9 |
 | Boot & Drivers | 9 | 1.6% | 5 |
 | Signals & Exceptions | 12 | 2.1% | 5 |
-| Misc / Cross-cutting | 14 | 2.5% | 4 |
+| Misc / Cross-cutting | 14 | 2.4% | 4 |
 | Console & Terminal | 15 | 2.6% | 7 |
-| Containers | 18 | 3.2% | 4 |
-| **Total** | **570** | **100.0%** | **173** |
+| Containers | 18 | 3.1% | 4 |
+| **Total** | **573** | **100.0%** | **173** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -407,7 +407,7 @@ from several subsystems under one write-up.
 - `test_thread_slot_reclaim_on_spawn` assumed its fill-and-terminate loop always ran under the 10ms reclaim cooldown, an assumption that depended on thread 0's old preemption immunity; fixed by measuring elapsed time and only asserting zero-reclaim when it's provably still inside the cooldown window
 
 
-## SMP & Locking (70 fixes, 29 docs)
+## SMP & Locking (73 fixes, 29 docs)
 
 ### docs/archive/SMP_GO_STRESS_CORRUPTION_FIX.md
 (standalone writeup of the same 2026-07-22 investigation SMP_SHARED.md's own
@@ -533,10 +533,13 @@ aren't recorded anywhere else.)
 - No path that frees page-table frames ever checked whether any core's live `TTBR0_EL1` still pointed at them — three independent routes (a reaper on another core racing the exiting thread's final switch, `exit_group`'s own reclaim freeing the table the calling core still stood on mid-syscall, and a grace-expired hard-killed straggler whose core never ran the switch-out) could each free and poison a page table still installed in a running core's `TTBR0`, which then faulted un-fetchably on its own exception vector while holding the BKL forever (`[BKL] stuck owner=N` storms of tens of thousands of lines); fixed via a per-core live-TTBR0 registry (`ACTIVE_L0`/`PREV_L0` in `crates/akuma-exec/src/mmu/mod.rs`) that defers a page-table frame's free to `PENDING_TTBR_FREES` (`[AS-FREE-DEFER]`) instead of releasing it whenever a peer core is still on that table, draining once the holder has demonstrably moved off; A/B-verified 4 storms in 21 rounds (~19%) → 0 storms in 32 rounds
 
 ### docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md
-(grab-bag investigation doc chasing a cargo null-`Rc` defect that itself remains open; three unrelated bugs were found and fixed along the way)
+(grab-bag investigation doc chasing a cargo null-`Rc` defect that itself remains open; six bugs were found and fixed along the way — some unrelated to it, some on its own path but not enough to close it)
 - §5.1 (D8): `sys_munmap` matched only a single eager region by exact `start_va`, so an unmap starting mid-region or spanning several regions freed only the first match, reported success, left the rest mapped with its VA never recycled, and skipped lazy regions entirely whenever an eager one matched; fixed by extracting `detach_eager_regions_in_range` to drain every region a range touches (9 host tests + a boot self-test)
 - §12.4/§12.7: the BKL's out-of-band `acquire_no_ticket` barge (the BKL-free EL0-preempt reconcile) compensated with a `next_ticket.fetch_add(1)` that kept the ticket counters equal in aggregate, but a waiter that lost the ownership CAS at its own turn abandoned its allocated ticket for a fresh one with nothing left to ever advance `now_serving` past the abandoned slot — a genuinely lost FIFO ticket producing `[BKL] stuck owner=0` storms (lock reads *idle* while cores spin) until a 20M-spin self-heal forced recovery; fixed by having a waiter that loses that CAS keep its ticket and keep spinning in place instead of re-ticketing, and by having the barge leave the ticket queue completely untouched on both acquire and release
 - §12.2–§12.4: on a multi-threaded `fork()`, every sibling thread that touches the same demoted page faults at once; the first thread through `fault_slot_acquire` breaks CoW and repairs the PTE, but the threads behind it — now holding a fault for a write that is already legal — had no repair path for pages with no lazy/eager region record (an ELF `.data`/`.bss` page from the image loader is never registered as either), so they fell through to a spurious SIGSEGV and took the whole `CLONE_VM` process down with them; fixed via `stale_write_fault_absorbed`, re-reading the PTE at EL0 permission-fault entry and absorbing (invalidate + retry) whenever it already grants the write, budgeted per-(VA, PTE) so a genuinely-declined repair still runs; A/B-verified 10/10 and 8/8 probe SIGSEGVs → 0
+- §13.5a: a fatal EL0 fault called `notify_child_channel_exited_pub` *before* tearing the thread group down, so the woken parent's `wait4` could have a peer core reap the crashed process first — `return_to_kernel` then resolved no current process and skipped its entire cleanup block, orphaning every `CLONE_VM` sibling in `FUTEX_WAIT` with a live `Process` row and a pinned address space; fixed by routing all six fatal-fault terminal paths in `src/exceptions.rs` through `sys_exit_group`'s ordering (`kill_thread_group` → close fds → notify parent → self-terminate) via a new `fatal_signal_group_exit` helper (boot self-test `test_fatal_fault_group_exit_precedes_parent_notify`, probe `userspace/forktest/c_stress/segvgroup.c`)
+- §13.9: `COW_REFCOUNTS` counts *address spaces* (the first share inserts 2, parent + child) while `user_frames` counts *VAs*, but all three CoW-break sites in `src/exceptions.rs` discarded `remove_user_frame`'s `#[must_use]` bool and called `cow_ref_dec` unconditionally, so an address space mapping one frame at several VAs surrendered its reference on the first break and the next holder's decrement freed a frame still mapped RW — a use-after-free whose quarantine poison then read back as a pointer; fixed by gating the decrement on `remove_user_frame` returning true (boot self-test `test_cow_break_dec_only_on_last_va`)
+- §13.9.4: the matching increment side, `cow_share_and_demote_range` (`crates/akuma-exec/src/process/mod.rs`), incremented once per *(VA, PA)* entry, so a parent mapping one frame at several VAs over-counted and the frame outlived its last unmapper (a leak); fixed by taking one reference per distinct PA per address space (boot self-test `test_fork_cow_share_incs_once_per_frame`)
 
 ### docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md
 (latent build-config defects exposed by moving `smp-shared` into the default feature set, i.e. compiling a configuration nobody had compiled before)
