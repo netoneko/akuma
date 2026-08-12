@@ -691,6 +691,7 @@ pub fn run_all_tests() {
     // must stay pinned, or a clean run proves nothing.
     test_uaf_quarantine_instrument();
     test_cow_break_dec_only_on_last_va();
+    test_fork_cow_share_incs_once_per_frame();
     test_cow_ref_ledger_records_history();
     test_madvise_dontneed_range_semantics();
 
@@ -4893,6 +4894,79 @@ fn test_cow_break_dec_only_on_last_va() {
              after_first={} second_release={} after_second={} peer_owns_free={}\n",
             shared_count, first_release, after_first, second_release, after_second,
             peer_owns_free);
+    }
+}
+
+/// `cow_share_and_demote_range` must take **one** reference per address space, not
+/// one per VA — the increment side of `test_cow_break_dec_only_on_last_va`.
+///
+/// It walks the parent's page table and gets one `scratch` entry per mapped *VA*,
+/// so a parent that maps a frame at two VAs used to increment twice and leave the
+/// count one above the number of holders: the frame then outlived its last
+/// unmapper. That is the leak direction of the same mismatch that produced the
+/// use-after-free (`docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` §13.9).
+///
+/// Driven through the real function against a real parent page table, because the
+/// dedupe has to hold for both routes a frame can repeat — twice inside one
+/// `FORK_AS_CHUNK_PAGES` chunk, and again in a later chunk once the child tracks it.
+fn test_fork_cow_share_incs_once_per_frame() {
+    use akuma_exec::process::cow_share_and_demote_range;
+    use spinning_top::Spinlock;
+
+    let Some(frame) = crate::pmm::alloc_page() else {
+        console::print("[Test] fork_cow_share_incs_once_per_frame SKIPPED (no free frame)\n");
+        return;
+    };
+    let (Some(mut parent), Some(mut child)) =
+        (crate::mmu::UserAddressSpace::new(), crate::mmu::UserAddressSpace::new())
+    else {
+        crate::pmm::free_page(frame);
+        console::print("[Test] fork_cow_share_incs_once_per_frame SKIPPED (no address space)\n");
+        return;
+    };
+
+    // One frame, two VAs in the parent — adjacent, so both land in one chunk.
+    const VA_A: usize = 0x2000_0000;
+    const VA_B: usize = 0x2000_1000;
+    let rw = crate::mmu::user_flags::RW_NO_EXEC;
+    if parent.map_page(VA_A, frame.addr, rw).is_err() || parent.map_page(VA_B, frame.addr, rw).is_err() {
+        crate::pmm::free_page(frame);
+        console::print("[Test] fork_cow_share_incs_once_per_frame SKIPPED (map failed)\n");
+        return;
+    }
+    parent.track_user_frame(frame);
+    parent.track_user_frame(frame);
+
+    let before = crate::pmm::cow_ref_get(frame.addr);
+    let as_lock: Spinlock<()> = Spinlock::new(());
+    let mut scratch = alloc::vec::Vec::new();
+    let parent_l0 = akuma_exec::mmu::phys_to_virt(parent.l0_phys()) as *const u64;
+    let shared = cow_share_and_demote_range(
+        parent_l0, &as_lock, VA_A, 2 * crate::mmu::PAGE_SIZE, &mut child, &mut scratch, "test");
+    let after = crate::pmm::cow_ref_get(frame.addr);
+
+    // Both VAs must be shared into the child, but the frame is one holder-pair:
+    // parent + child = 2, never 3.
+    let shared_pages = shared.unwrap_or(0);
+
+    // Unwind: the child gives up its single reference, then the parent's, then the
+    // frame is genuinely free. A count that came back as 3 would strand it here —
+    // which is exactly the leak this guards.
+    drop(child);
+    drop(parent);
+    let residual = crate::pmm::cow_ref_get(frame.addr);
+    while crate::pmm::cow_ref_get(frame.addr) > 0 {
+        if crate::pmm::cow_ref_dec(frame.addr) { break; }
+    }
+    crate::pmm::free_page(frame);
+
+    if before == 0 && shared_pages == 2 && after == 2 && residual <= 1 {
+        console::print("[Test] fork_cow_share_incs_once_per_frame PASSED\n");
+    } else {
+        crate::safe_print!(176,
+            "[Test] fork_cow_share_incs_once_per_frame FAILED: before={} shared={} \
+             after={} (want 2, 3 = per-VA leak) residual_after_drop={}\n",
+            before, shared_pages, after, residual);
     }
 }
 

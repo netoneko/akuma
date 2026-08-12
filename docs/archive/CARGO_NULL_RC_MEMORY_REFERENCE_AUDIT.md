@@ -1382,6 +1382,125 @@ a real frame and a real address space through the two-VA break, asserting the
 reference survives the first break and is surrendered on the second. It has to use
 both ledgers — the bug lives in their disagreement, so neither alone can see it.
 
+### 13.9.4a Numbers
+
+Same VM image, same workload (`rm -rf target && bash build.sh --sshd-only` against
+`/tmp/akuma/userspace`), devbox-smoltcp `SMP=4 MEMORY=4096`, one variable:
+
+| probe | pristine | fixed |
+| --- | --- | --- |
+| cold builds ending `EXIT=139` | **3 / 12** (and §13.1's 1 / 4) | **0 / 20** |
+| `[PMM-UAF]` write-after-free events | 1 in those 12 rounds; 3 in an earlier boot | **0** |
+| `[PMM-POISON]` decodes at a fault | 1 (the T307 crash) | **0** |
+| boot suite (`SMP=4`) | — | 276 PASSED / 0 FAILED |
+
+Against the ~25 % baseline, twenty consecutive clean rounds is `0.75²⁰ ≈ 0.3 %` by
+chance. This is a clean A/B: the perturbing `PMM_PREMATURE_FREE_CHECK` was disarmed
+for both arms (§13.9.5), so the only difference is the `cow_ref_dec` gate.
+
+The honest limit: 20 rounds bounds the rate low, it does not prove zero, and the
+over-count direction noted above means some frames now leak instead. Watch
+`[Mem]`'s free-page accounting across a long self-host campaign before calling the
+whole class closed.
+
+> **Superseded by §13.10.** A second 20-round run, with the increment side also
+> fixed, produced **2 crashes and one `[PMM-UAF]` on the same `dec 1->0` shape**.
+> The 0/20 above was not proof — the premature free is *reduced*, not gone. Read
+> §13.10 before treating this row as closed.
+
+---
+
+## 13.10 STILL OPEN: a second premature-free route, and a second crash shape
+
+**Do not read §13.9 as closing the defect.** The `cow_ref_dec` gate removed *a*
+route to the premature free and cut the crash rate roughly fivefold, but a
+20-round run with both sides of the accounting fixed still crashed twice.
+
+### 13.10.1 The numbers, all arms
+
+Same VM image, same workload, devbox-smoltcp `SMP=4 MEMORY=4096`:
+
+| arm | rounds | `EXIT=139` | `[PMM-UAF]` | `[PMM-POISON]` |
+| --- | ---: | ---: | ---: | ---: |
+| pristine | 16 (12 here + §13.1's 4) | **4 (25 %)** | 1 (+3 in an earlier boot) | 1 |
+| §13.9 dec-gate only | 20 | **0** | 0 | 0 |
+| dec-gate + §13.9.4's increment dedupe | 20 | **2 (10 %)** | 1 | 2 (one frame, two blocks) |
+
+Combined post-fix: **2 / 40 ≈ 5 %**, against a 25 % baseline. The improvement is
+real; the defect is not closed.
+
+**Whether the increment dedupe made things worse is not answerable from this
+data.** 0/20 versus 2/20 is Fisher-exact `p ≈ 0.24` — nowhere near significant, and
+both arms are consistent with a residual rate around 5 %. Do not revert it on this
+evidence, and do not trust it on this evidence either; it is justified by the
+counting argument in §13.9.4, not by these runs. A clean answer needs far more
+rounds per arm than a 45-second build loop delivers in an afternoon.
+
+### 13.10.2 The residual premature free — same shape, different route
+
+The new instrument named it without human arithmetic, which is what it was built
+for:
+
+```
+[PMM-POISON] x3=0xfeedface6346c000 is quarantine poison for pa=0xbdebc000 —
+             the kernel FREED this frame while the process still had it.
+             freed_by=(tid=12 seq=11967324) now_seq=11967771 cow_ref=0
+  [COW-HIST] pa=0xbdebc000 seq=106161004 tid=12 dec 1->0
+
+[PMM-UAF]    pa=0xbdebc000 WRITTEN AFTER FREE: off=0x660
+             got=0xfeedface6346bfff want=0xfeedface6346c000     ← again -1, an Rc decrement
+```
+
+Identical signature to §13.9.3: a single `dec 1->0`, no matching increment in the
+ring window, the frame still mapped by the faulting process. Since the CoW-break
+sites are now gated, **the offending decrement comes from somewhere else.** The
+remaining suspects are the ones §6 already lists and this session did not touch:
+
+- **D2** — `file_page_cache::lookup_and_ref` takes its `cow_ref_inc` **outside**
+  the `PAGES` lock, so a concurrent `invalidate_inode`/`shrink` frees the frame in
+  that window. Still the best-fitting candidate: the victim VA sits in an eager
+  `mmap` region (`start=0x302e4000 pages=16 flags=0x60000000000040`) of exactly the
+  kind cargo uses for registry index files.
+- **D7** — `try_evict_ro_page` evicts *any* RO page inside a `LazySource::File`
+  region.
+- `sys_munmap` / `detach_eager_regions_in_range`, whose sibling defect D8 was fixed
+  in §5.1 and whose munmap-storm correlation is §13.7's step 3.
+
+Next step is the same one that worked here: `[PMM-POISON]` already names the frame
+and the freeing tid, so add the **free site** to the ledger (a `FrameSource` or
+caller tag stored beside `freed_by=`) and one reproducing round names the route.
+
+### 13.10.3 A second, distinct crash shape — near-null, no poison
+
+The other crash in the final run carries **no** UAF and **no** poison:
+
+```
+[WILD-DA] pid=1340 FAR=0x10 ELR=0x30028b50 last_sc=-1
+```
+
+and the pre-fix run produced its twin at `FAR=0x18`, **same `ELR=0x30028b50`**. Two
+properties make this worth separating from the premature free:
+
+- `FAR` is a small offset off a **null** base — the original §0 "a live pointer
+  qword reads back as 0", not a poisoned qword.
+- The faulting PC is identical across crashes and sits at `0x300…`, i.e. in the
+  shared-library/loader mapping rather than cargo's own image at `0x10000000` —
+  where §13.2's crashes were. So this is one specific function, repeatedly.
+
+Whether it is a distinct defect or the same premature free landing on a frame that
+was re-allocated and zeroed before the read is **unresolved**. The discriminating
+step is cheap and not yet done: symbolize `0x30028b50` against the guest's
+`ld-musl-aarch64.so.1` / libc (`objdump -d --start-address=…`, as §13.6 records for
+cargo), which says whether the crash is inside the allocator's own metadata walk.
+
+### 13.10.4 What is safe to claim
+
+- The per-VA over-decrement in the CoW-break sites was real, proven by two
+  independent instruments on one frame, and is fixed (§13.9).
+- The crash rate fell from ~25 % to ~5 %.
+- **The defect is not closed.** At least one more premature-free route exists, plus
+  a near-null crash shape that may or may not be the same bug.
+
 ### 13.9.5 Instrumentation added, and one that had to be turned off
 
 - `pmm::poison_word_frame` / `report_poison_value`, wired into the `[WILD-DA]`

@@ -231,9 +231,38 @@ pub fn cow_share_and_demote_range(
             #[cfg(not(kernel_smp_shared))]
             let _ = as_lock;
             mmu::collect_mapped_pages_with_flags_into(parent_l0, chunk_va, chunk, scratch);
-            for (_, pa, _) in scratch.iter() {
+            // ONE reference per address space, not per VA.
+            //
+            // `COW_REFCOUNTS` counts address spaces — the first share inserts 2,
+            // "parent + child" — while `scratch` holds one entry per mapped *VA*.
+            // A parent that maps one frame at several VAs used to increment once
+            // per VA, so the count outran the number of holders and the frame
+            // outlived its last unmapper: a leak. The release side counts address
+            // spaces (`remove_user_frame` reports only the last VA, and only then
+            // does the CoW break decrement — `exceptions.rs`), so this is the
+            // increment that has to match it. See
+            // `docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` §13.9.
+            //
+            // Two ways the same frame reaches this loop twice, and both are covered:
+            //   - a *later* chunk, when the child already tracks it from an earlier
+            //     one (Phase B of chunk i runs before Phase A of chunk i+1);
+            //   - *this* chunk, caught by the scan over the entries already seen.
+            // The scan is over at most `FORK_AS_CHUNK_PAGES` (64) entries and stops
+            // at the first match, so the duplicate-free case stays a linear pass.
+            //
+            // The increment must stay here in Phase A, before `demote_range_to_ro`:
+            // a frame that is demoted read-only while its count is still 0 sends a
+            // faulting parent thread down `cow_ref_get(pa) == 0` → "not CoW, already
+            // writable", and it writes into a page the child is about to share.
+            for (idx, &(_, pa, _)) in scratch.iter().enumerate() {
+                let seen_in_earlier_chunk = child_as.tracks_user_frame(pa);
+                let seen_in_this_chunk =
+                    scratch[..idx].iter().any(|&(_, prev_pa, _)| prev_pa == pa);
+                if seen_in_earlier_chunk || seen_in_this_chunk {
+                    continue;
+                }
                 // Inserts with count=2 on first share.
-                (runtime().cow_ref_inc)(*pa);
+                (runtime().cow_ref_inc)(pa);
             }
             // SAFETY: `parent_l0` is the live L0 root of the address space this
             // `as_lock` guards (see the preconditions above).

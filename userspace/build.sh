@@ -333,6 +333,22 @@ echo "Building tidflags (C, clone tid-flag semantics probe)..."
 cp forktest/c_stress/tidflags ../bootstrap/bin/
 echo "tidflags (C) copied to bootstrap/bin/"
 
+# smapsdirty: /proc/self/smaps presence + Shared_Dirty accounting, plus the
+# MADV_FREE return value. Reproduces redis-server's ARM64-COW-BUG startup check
+# (redis/src/syscheck.c `checkLinuxMadvFreeForkBug`) verbatim, which is why
+# redis refuses to start: it reads /proc/self/smaps, and Akuma implements no
+# /proc/<pid>/ files at all. Despite the name of the warning this is NOT a CoW
+# bug — redis prints a different message for that. One-shot, calibrated against
+# real Linux (4 PASS there). docs/archive/LONG_ROAD_TO_REDIS.md. Tiny; built
+# unconditionally.
+echo "Building smapsdirty (C, /proc/self/smaps + MADV_FREE probe)..."
+(
+    cd forktest/c_stress
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o smapsdirty smapsdirty.c
+)
+cp forktest/c_stress/smapsdirty ../bootstrap/bin/
+echo "smapsdirty (C) copied to bootstrap/bin/"
+
 # pthread_kill_eintr: does a pthread_kill signal interrupt a blocking read?
 # Shaped after jobserver-rs's Helper::join (the path every rustc that reaches
 # codegen runs). Also asserts an SA_RESTART handler does NOT interrupt, which
