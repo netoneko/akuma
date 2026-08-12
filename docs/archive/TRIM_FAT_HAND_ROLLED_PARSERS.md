@@ -67,10 +67,60 @@ and SSH wire-format helpers (`read_string`/`write_string`/`parse_key_blob`).
   `scratch`'s and `httpd`'s sites (URL/status-line/header duplicates,
   `find_crlf` × 2, Content-Length/Location scanners × 3) are unchanged —
   out of scope for this pass, which was scoped to meow.
-- All other findings (decimal integer parsers × 5, IPv4 parsers × 2,
-  config-file skeleton × 4, `scratch`'s and `httpd`'s HTTP sites, the
-  Content-Length/Location scanner trio in `libakuma-tls::http`) remain open
-  as of this writing.
+- **IPv4 parsers × 2 — DONE, 2026-08-12.** `libakuma::SocketAddrV4` gained a
+  `parse_ip(s: &str) -> Option<[u8; 4]>` associated fn (`splitn(5, '.')` +
+  reject-a-5th-octet, same shape `meow/linux_net.rs::parse_ipv4` already had
+  right), used internally by `SocketAddrV4::parse` for the IP half. Fixes the
+  silent-5th-octet-acceptance bug documented in "What actually breaks" item 3
+  as a side effect — real call sites (`libakuma::net`'s `resolve`-address
+  path, `meow/tools/pretend_shell.rs`) now inherit the fix. `libakuma::parse_u8`/
+  `parse_u16` (the port half) deleted, replaced with `str::parse` — folds into
+  the decimal-integer item below. `meow/linux_net.rs::parse_ipv4` deleted,
+  now calls `SocketAddrV4::parse_ip` at its three call sites (nameserver
+  parsing, `/etc/hosts`, and the resolve() IP-literal fast path).
+- **Decimal integer parsers × 5 — DONE, 2026-08-12.** All five hand-rolled
+  `parse_u32`/`parse_u64`/`parse_u8`/`parse_u16` deleted (`herd`, `hello`,
+  `stackstress`, `libakuma`'s pair) — every call site now does
+  `s.parse::<uN>().ok()` directly, `core`'s own `FromStr`. One real behavior
+  change worth flagging: the hand-rolled versions treated an **empty string**
+  as `Some(0)` (the digit loop just never ran); `str::parse` treats `""` as
+  `Err`. Every call site already does `.unwrap_or(DEFAULT)`, so this changes
+  "empty CLI arg silently becomes 0" into "empty CLI arg falls back to the
+  documented default" (`herd`'s `start_delay`/`core` keys default to 0
+  either way — no change there; `stackstress`'s iteration/mode and `hello`'s
+  outputs/delay defaults are non-zero, so this is a real if obscure behavior
+  change for a deliberately-empty argument, arguably a correctness
+  improvement — an empty string isn't a valid count).
+- **HTTP(S) parsing cluster — `scratch` DONE, 2026-08-12 (branch `box-run`).**
+  `scratch/src/http.rs::Url::parse_internal` now calls `libakuma_tls::parse_url`
+  for the scheme/host/port/path split, keeping only its `.git`-suffix
+  normalization on top — its hand-rolled copy deleted. `scratch/http.rs`'s
+  and `scratch/stream.rs`'s duplicate `parse_status_line`s both deleted,
+  replaced with `libakuma_tls::parse_status_line` (called with the whole
+  header block — it already does `.lines().next()` internally, so this is a
+  drop-in replacement for both "single already-extracted line" and "full
+  block" callers). `find_crlf` (`http.rs`) and `find_crlf_slice` (`stream.rs`)
+  collapsed to one `pub(crate) fn find_crlf` in `http.rs`, used by both.
+  `http.rs::parse_response` and `stream.rs::parse_headers` — near-identical
+  per the original audit — factored into one shared `pub(crate) fn
+  parse_header_block(header_str) -> Result<(u16, Vec<(String,String)>,
+  bool)>` in `http.rs` that both files call; `parse_response` layers its
+  full-buffer `decode_chunked` on top, `stream.rs` layers its incremental
+  `ChunkedState` state machine on top — the streaming-vs-buffered chunked
+  *decoding* genuinely differs and stays separate, only the *header* parsing
+  was actually duplicated. Verified via `cargo check`/`clippy` (workspace-wide,
+  clean) — **not** re-verified live in QEMU against a real git remote this
+  round (time-boxed); worth an `acceptance/`-style clone/fetch smoke test
+  before trusting this in production if it hasn't had one since.
+- **`httpd/src/main.rs:extract_post_body` — DONE, 2026-08-12.** Collapsed its
+  two near-identical `Content-Length:` / `content-length:` branches (checking
+  the same header twice for casing) into one `eq_ignore_ascii_case` check.
+  Scoped narrowly: this is httpd parsing a *request* it received as a server,
+  a different direction from `libakuma-tls::http`'s Content-Length scanners
+  (parsing a *response* as a client) — left those alone, matching the
+  original audit's own "Maybe / low priority" call on that trio.
+- Config-file skeleton × 4 remains open (explicitly deferred by the original
+  audit — shared part is ~5 lines, not worth a generic helper today).
 
 
 ## Summary
@@ -255,8 +305,8 @@ a 5th config file shows up.
 | `find_crlf` × 2 (both in `scratch`) | **Open — not touched.** | Same crate, same one-liner. |
 | `meow/tools/net.rs::find_headers_end` (+ `meow/api/client.rs`'s `find_header_end`, a 5th site the audit missed) | **DONE — 2026-08-12.** | Both now `use libakuma_tls::find_headers_end;` like scratch already did. `client.rs`'s copy was also a *different* function despite the near-identical name: it returned the offset *before* `\r\n\r\n` (every call site did `+ 4`), where the canonical one returns the offset *after* — worth checking call-site math when consolidating a "same name, different semantics" duplicate like this one. |
 | `libakuma-tls::http` Content-Length / Location scanners × 3 | **Maybe.** | One `header_line_matches(name: &[u8], line: &str) -> bool` helper replaces the three `take-N-bytes-and-lowercase` blocks. Low priority — all three are in the same file and already local to one consumer. |
-| Decimal integer parsers × 5 | **Yes — trivial.** | Either delete all five and call `str::parse::<uN>()` directly (host `core` has had this forever), or add one `pub fn parse_decimal<T: FromStr>(s: &str) -> Option<T>` to `libakuma` and funnel through it. `libakuma::parse_u8`/`parse_u16` are the only ones with an internal caller (`SocketAddrV4::parse`) — that caller switches to `parse_decimal::<u8>`. |
-| IPv4 parsers × 2 | **Yes.** | Add `SocketAddrV4::parse_ip(s) -> Option<[u8; 4]>` (4-octet, reject 5th) and have `meow/linux_net.rs` call it. Fixes `SocketAddrV4::parse`'s silent 5th-octet acceptance as a side effect. |
+| Decimal integer parsers × 5 | **DONE — 2026-08-12.** | Deleted all five; every call site now does `s.parse::<uN>().ok()` directly. |
+| IPv4 parsers × 2 | **DONE — 2026-08-12.** | Added `SocketAddrV4::parse_ip(s) -> Option<[u8; 4]>` (4-octet, reject 5th); `SocketAddrV4::parse` and `meow/linux_net.rs` (3 call sites) both use it now. Fixed `SocketAddrV4::parse`'s silent 5th-octet acceptance as a side effect. |
 | Config-file skeleton × 4 | **No / defer.** | Shared part is ~5 lines; per-file dispatch and section semantics differ enough that a generic helper saves little. Revisit if a 5th config format appears. |
 | Anything in `src/` or `crates/` | **N/A — nothing to move.** | Kernel and host-testable crates have no hand-rolled parsers in the categories audited (URL, HTTP, integer, SSH wire, IP, base64, config). ELF/ext2/pack scanners are purpose-built and not duplicated. None of these sites interact with the `safe_print!`/no-allocation-on-console-paths rule from `CLAUDE.md` — all of them are `userspace/*` binaries already using `alloc`. |
 

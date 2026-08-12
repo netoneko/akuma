@@ -208,13 +208,11 @@ fn extract_post_body(initial_data: &[u8], stream: &TcpStream) -> Option<Vec<u8>>
 
     let mut content_length: usize = 0;
     for line in request_str.lines() {
-        if let Some(value) = line.strip_prefix("Content-Length:") {
-            content_length = value.trim().parse().ok()?;
-            break;
-        }
-        if let Some(value) = line.strip_prefix("content-length:") {
-            content_length = value.trim().parse().ok()?;
-            break;
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().ok()?;
+                break;
+            }
         }
     }
 

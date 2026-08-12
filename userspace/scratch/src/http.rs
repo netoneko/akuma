@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use libakuma::net::{resolve, TcpStream};
 use libakuma::{print, print_dec};
 use libakuma_tls::transport::TcpTransport;
-use libakuma_tls::{find_headers_end, TlsStream, TLS_RECORD_SIZE};
+use libakuma_tls::{find_headers_end, parse_status_line, parse_url, TlsStream, TLS_RECORD_SIZE};
 
 use crate::error::{Error, Result};
 
@@ -34,44 +34,19 @@ impl Url {
     }
 
     fn parse_internal(url: &str, strict: bool) -> Result<Self> {
-        let (https, rest) = if let Some(r) = url.strip_prefix("https://") {
-            (true, r)
-        } else if let Some(r) = url.strip_prefix("http://") {
-            (false, r)
-        } else {
-            return Err(Error::invalid_url());
-        };
-
-        let default_port = if https { 443 } else { 80 };
-
-        // Split host from path
-        let (host_port, path) = match rest.find('/') {
-            Some(pos) => (&rest[..pos], &rest[pos..]),
-            None => (rest, "/"),
-        };
-
-        // Parse host and port
-        let (host, port) = match host_port.rfind(':') {
-            Some(pos) => {
-                let h = &host_port[..pos];
-                let p = host_port[pos + 1..].parse::<u16>()
-                    .map_err(|_| Error::invalid_url())?;
-                (h, p)
-            }
-            None => (host_port, default_port),
-        };
+        let parsed = parse_url(url).ok_or_else(Error::invalid_url)?;
 
         // Normalize path (add .git if needed for GitHub and strict mode is on)
-        let path = if strict && !path.ends_with(".git") && !path.ends_with("/") {
-            format!("{}.git", path)
+        let path = if strict && !parsed.path.ends_with(".git") && !parsed.path.ends_with("/") {
+            format!("{}.git", parsed.path)
         } else {
-            String::from(path)
+            String::from(parsed.path)
         };
 
         Ok(Url {
-            https,
-            host: String::from(host),
-            port,
+            https: parsed.is_https,
+            host: String::from(parsed.host),
+            port: parsed.port,
             path,
         })
     }
@@ -375,6 +350,38 @@ fn print_speed_kbps(bytes: usize, elapsed_us: u64) {
     print(" kbps");
 }
 
+/// Parse a complete HTTP status line + header block (everything up to but not
+/// including the blank line that ends it) into the status code, the header
+/// list, and whether `Transfer-Encoding: chunked` was present. Shared with
+/// `stream.rs`, which parses the same shape out of a not-yet-complete
+/// streaming response.
+pub(crate) fn parse_header_block(header_str: &str) -> Result<(u16, Vec<(String, String)>, bool)> {
+    let status = parse_status_line(header_str)
+        .ok_or_else(|| Error::http("missing or invalid status line"))?;
+
+    let mut headers = Vec::new();
+    let mut is_chunked = false;
+
+    for line in header_str.lines().skip(1) {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(colon_pos) = line.find(':') {
+            let name = line[..colon_pos].trim();
+            let value = line[colon_pos + 1..].trim();
+
+            // Check for chunked transfer encoding
+            if name.eq_ignore_ascii_case("Transfer-Encoding") && value.contains("chunked") {
+                is_chunked = true;
+            }
+
+            headers.push((String::from(name), String::from(value)));
+        }
+    }
+
+    Ok((status, headers, is_chunked))
+}
+
 fn parse_response(data: &[u8]) -> Result<Response> {
     // Find end of headers
     let headers_end = find_headers_end(data)
@@ -383,38 +390,11 @@ fn parse_response(data: &[u8]) -> Result<Response> {
     let header_str = core::str::from_utf8(&data[..headers_end])
         .map_err(|_| Error::http("invalid HTTP headers"))?;
 
-    let mut lines = header_str.lines();
-    
-    // Parse status line
-    let status_line = lines.next()
-        .ok_or_else(|| Error::http("missing status line"))?;
-    
-    let status = parse_status_line(status_line)?;
-
-    // Parse headers
-    let mut headers = Vec::new();
-    let mut is_chunked = false;
-    
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(colon_pos) = line.find(':') {
-            let name = line[..colon_pos].trim();
-            let value = line[colon_pos + 1..].trim();
-            
-            // Check for chunked transfer encoding
-            if name.eq_ignore_ascii_case("Transfer-Encoding") && value.contains("chunked") {
-                is_chunked = true;
-            }
-            
-            headers.push((String::from(name), String::from(value)));
-        }
-    }
+    let (status, headers, is_chunked) = parse_header_block(header_str)?;
 
     // Body is everything after headers
     let raw_body = &data[headers_end..];
-    
+
     // Decode chunked encoding if present
     let body = if is_chunked {
         decode_chunked(raw_body)?
@@ -479,22 +459,11 @@ fn decode_chunked(data: &[u8]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-/// Find CRLF in data, returns position of \r
-fn find_crlf(data: &[u8]) -> Option<usize> {
+/// Find CRLF in data, returns position of \r. Shared with `stream.rs`'s
+/// chunked-transfer decoder.
+pub(crate) fn find_crlf(data: &[u8]) -> Option<usize> {
     (0..data.len().saturating_sub(1)).find(|&i| data[i] == b'\r' && data[i + 1] == b'\n')
 }
 
-// find_headers_end is imported from libakuma_tls
-
-fn parse_status_line(line: &str) -> Result<u16> {
-    // Format: "HTTP/1.1 200 OK"
-    let mut parts = line.split_whitespace();
-    let _version = parts.next()
-        .ok_or_else(|| Error::http("missing HTTP version"))?;
-    let status_str = parts.next()
-        .ok_or_else(|| Error::http("missing status code"))?;
-    
-    status_str.parse::<u16>()
-        .map_err(|_| Error::http("invalid status code"))
-}
+// find_headers_end and parse_status_line are imported from libakuma_tls
 

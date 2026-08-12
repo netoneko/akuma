@@ -678,47 +678,31 @@ impl SocketAddrV4 {
         Self { ip, port }
     }
 
+    /// Parse the four dot-separated octets of an IPv4 address. Rejects a 5th
+    /// octet rather than silently ignoring it (`splitn(5, '.')` + a check
+    /// that the 5th slot is empty), unlike a plain `split('.')` over a
+    /// fixed-size array, which would take the first four and drop the rest.
+    pub fn parse_ip(s: &str) -> Option<[u8; 4]> {
+        let mut parts = s.splitn(5, '.');
+        let mut ip = [0u8; 4];
+        for byte in &mut ip {
+            *byte = parts.next()?.parse().ok()?;
+        }
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(ip)
+    }
+
     /// Parse from "ip:port" string
     pub fn parse(s: &str) -> Option<Self> {
         let mut parts = s.split(':');
         let ip_str = parts.next()?;
         let port_str = parts.next()?;
-
-        // Parse IP
-        let mut ip = [0u8; 4];
-        let mut octets = ip_str.split('.');
-        for byte in &mut ip {
-            let octet_str = octets.next()?;
-            *byte = parse_u8(octet_str)?;
-        }
-
-        // Parse port
-        let port = parse_u16(port_str)?;
-
+        let ip = Self::parse_ip(ip_str)?;
+        let port = port_str.parse().ok()?;
         Some(Self { ip, port })
     }
-}
-
-fn parse_u8(s: &str) -> Option<u8> {
-    let mut result: u8 = 0;
-    for c in s.bytes() {
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        result = result.checked_mul(10)?.checked_add(c - b'0')?;
-    }
-    Some(result)
-}
-
-fn parse_u16(s: &str) -> Option<u16> {
-    let mut result: u16 = 0;
-    for c in s.bytes() {
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        result = result.checked_mul(10)?.checked_add((c - b'0') as u16)?;
-    }
-    Some(result)
 }
 
 /// Linux sockaddr_in structure

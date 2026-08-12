@@ -467,10 +467,10 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                         .collect();
                 }
                 "restart_delay" => {
-                    config.restart_delay_ms = parse_u64(value).unwrap_or(DEFAULT_RESTART_DELAY_MS);
+                    config.restart_delay_ms = value.parse::<u64>().ok().unwrap_or(DEFAULT_RESTART_DELAY_MS);
                 }
                 "max_retries" => {
-                    config.max_retries = parse_u32(value).unwrap_or(DEFAULT_MAX_RETRIES);
+                    config.max_retries = value.parse::<u32>().ok().unwrap_or(DEFAULT_MAX_RETRIES);
                 }
                 "boxed" => {
                     config.boxed = value == "true" || value == "1";
@@ -495,13 +495,13 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                         .collect();
                 }
                 "start_delay" => {
-                    config.start_delay_ms = parse_u64(value).unwrap_or(0);
+                    config.start_delay_ms = value.parse::<u64>().ok().unwrap_or(0);
                 }
                 "oneshot" => {
                     config.oneshot = value == "true" || value == "1";
                 }
                 "core" => {
-                    config.core = parse_u64(value).unwrap_or(0) as u32;
+                    config.core = value.parse::<u64>().ok().unwrap_or(0) as u32;
                 }
                 _ => {}
             }
@@ -513,21 +513,6 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
     }
 
     Some(config)
-}
-
-fn parse_u64(s: &str) -> Option<u64> {
-    let mut result: u64 = 0;
-    for c in s.bytes() {
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        result = result.checked_mul(10)?.checked_add((c - b'0') as u64)?;
-    }
-    Some(result)
-}
-
-fn parse_u32(s: &str) -> Option<u32> {
-    parse_u64(s).and_then(|v| u32::try_from(v).ok())
 }
 
 // ============================================================================

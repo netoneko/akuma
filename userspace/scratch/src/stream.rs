@@ -3,7 +3,6 @@
 //! Provides streaming reads to avoid loading entire responses into memory.
 
 use alloc::format;
-use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::vec;
 
@@ -13,7 +12,7 @@ use libakuma_tls::transport::TcpTransport;
 use libakuma_tls::{find_headers_end, TlsStream, TLS_RECORD_SIZE};
 
 use crate::error::{Error, Result};
-use crate::http::Url;
+use crate::http::{find_crlf, parse_header_block, Url};
 
 /// Process a pack file in streaming fashion over HTTPS
 /// This is the main entry point for streaming clone/fetch
@@ -91,8 +90,10 @@ where
                 if !headers_parsed {
                     header_buf.extend_from_slice(&temp[..n]);
                     if let Some(end) = find_headers_end(&header_buf) {
-                        let (status, headers, chunked) = parse_headers(&header_buf[..end])?;
-                        
+                        let header_str = core::str::from_utf8(&header_buf[..end])
+                            .map_err(|_| Error::http("invalid headers"))?;
+                        let (status, headers, chunked) = parse_header_block(header_str)?;
+
                         if status != 200 {
                             return Err(Error::http(&format!("status {}", status)));
                         }
@@ -229,7 +230,7 @@ impl ChunkedState {
             match self.state {
                 ChunkParseState::ExpectingSize => {
                     // Looking for chunk size line
-                    if let Some(crlf_pos) = find_crlf_slice(&self.buffer) {
+                    if let Some(crlf_pos) = find_crlf(&self.buffer) {
                         let size_line = &self.buffer[..crlf_pos];
                         let size_str = core::str::from_utf8(size_line)
                             .map_err(|_| Error::http("invalid chunk size"))?;
@@ -295,57 +296,6 @@ impl ChunkedState {
         
         Ok(result)
     }
-}
-
-fn find_crlf_slice(data: &[u8]) -> Option<usize> {
-    (0..data.len().saturating_sub(1)).find(|&i| data[i] == b'\r' && data[i + 1] == b'\n')
-}
-
-// find_headers_end is imported from libakuma_tls
-
-fn parse_headers(data: &[u8]) -> Result<(u16, Vec<(String, String)>, bool)> {
-    let header_str = core::str::from_utf8(data)
-        .map_err(|_| Error::http("invalid headers"))?;
-    
-    let mut lines = header_str.lines();
-    
-    // Parse status line
-    let status_line = lines.next()
-        .ok_or_else(|| Error::http("missing status line"))?;
-    
-    let status = parse_status_line(status_line)?;
-    
-    let mut headers = Vec::new();
-    let mut is_chunked = false;
-    
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(colon_pos) = line.find(':') {
-            let name = line[..colon_pos].trim();
-            let value = line[colon_pos + 1..].trim();
-            
-            if name.eq_ignore_ascii_case("Transfer-Encoding") && value.contains("chunked") {
-                is_chunked = true;
-            }
-            
-            headers.push((String::from(name), String::from(value)));
-        }
-    }
-    
-    Ok((status, headers, is_chunked))
-}
-
-fn parse_status_line(line: &str) -> Result<u16> {
-    let mut parts = line.split_whitespace();
-    let _version = parts.next()
-        .ok_or_else(|| Error::http("missing HTTP version"))?;
-    let status_str = parts.next()
-        .ok_or_else(|| Error::http("missing status code"))?;
-    
-    status_str.parse::<u16>()
-        .map_err(|_| Error::http("invalid status code"))
 }
 
 fn print_size_kb(bytes: usize) {

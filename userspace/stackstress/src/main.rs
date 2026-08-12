@@ -21,13 +21,13 @@ pub extern "C" fn main() {
     
     // Parse arguments
     let iterations = if argc() > 1 {
-        arg(1).and_then(|s| parse_u32(s)).unwrap_or(DEFAULT_ITERATIONS)
+        arg(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(DEFAULT_ITERATIONS)
     } else {
         DEFAULT_ITERATIONS
     };
     
     let mode = if argc() > 2 {
-        arg(2).and_then(|s| parse_u32(s)).unwrap_or(DEFAULT_MODE)
+        arg(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(DEFAULT_MODE)
     } else {
         DEFAULT_MODE
     };
@@ -125,18 +125,6 @@ fn stress_mixed(iterations: u32) {
 }
 
 // Helper functions
-fn parse_u32(s: &str) -> Option<u32> {
-    let mut result: u32 = 0;
-    for c in s.bytes() {
-        if c >= b'0' && c <= b'9' {
-            result = result.checked_mul(10)?.checked_add((c - b'0') as u32)?;
-        } else {
-            return None;
-        }
-    }
-    Some(result)
-}
-
 fn print_num(n: u32) {
     print_num64(n as u64);
 }
