@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 
 use libakuma::*;
 
-// Note: noshell is available in dependencies but we use a custom robust 
+// Note: noshell is available in dependencies but we use a custom robust
 // parser here to avoid dependency on specific noshell versions/docs
 // until we have more stable internet access for documentation.
 
@@ -569,17 +569,26 @@ fn execute_external_and_capture(args: &[String], output: &mut Vec<u8>) {
 }
 
 fn stream_output(stdout_fd: u32, pid: u32) -> i32 {
+    // `stdout_fd` (the spawned child's stdout) blocks by default, same as any
+    // other pipe fd on this kernel. Without this, `read_fd` below parks
+    // waiting for the child's next byte of output — and a child that's gone
+    // quiet (a server between requests, a long-running build between lines)
+    // never produces one, so the loop never gets back around to
+    // poll_input_event and Ctrl-C is never seen. sshd's own bridge_process
+    // (userspace/sshd/src/protocol.rs) hit and documented this exact
+    // deadlock for the same reason; this mirrors its fix.
+    set_nonblocking(stdout_fd as i32, true);
     let mut buf = [0u8; 1024];
     let mut in_buf = [0u8; 1];
     loop {
         let n = read_fd(stdout_fd as i32, &mut buf);
         if n > 0 { write(fd::STDOUT, &buf[..n as usize]); }
-        
+
         if poll_input_event(10, &mut in_buf) > 0 && in_buf[0] == 0x03 {
             println("^C");
             kill_signal(pid, SIGINT);
         }
-        
+
         if let Some((_, exit_code)) = waitpid(pid) {
             loop {
                 let n = read_fd(stdout_fd as i32, &mut buf);

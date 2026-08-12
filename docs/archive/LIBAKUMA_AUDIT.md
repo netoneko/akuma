@@ -14,11 +14,14 @@ linked from the relevant findings and not reproduced.
 
 > **Status (2026-08-12):** items **1-13 and 15** of the §5 prioritized list
 > are done. Items 1-4 landed in commit `9cd7a24` ("half baked libakuma
-> fixes"); items 5-13 and 15 landed later the same day, uncommitted as of
-> this writing. Only item **14** (extract pure-logic cores + host tests) is
-> still open. Everything below is the audit as written; what landed, what
-> landed differently, and what is still open is recorded in **§6 Fix log**,
-> and the affected findings carry an inline *Fixed* note.
+> fixes"); items 5-13 and 15 landed later the same day in `cf03840`
+> ("multiple libakuma fixes"). A follow-up, uncommitted as of this writing,
+> replaced part of item 11's `paws` fix after QEMU verification caught it
+> not actually working — see the `cf03840` fix log entry's tail and the
+> addendum right after it. Only item **14** (extract pure-logic cores + host
+> tests) is still open. Everything below is the audit as written; what
+> landed, what landed differently, and what is still open is recorded in
+> **§6 Fix log**, and the affected findings carry an inline *Fixed* note.
 
 ## TL;DR
 
@@ -619,17 +622,17 @@ Line numbers are as of the audit (`8b6ba40`); items 1-4 have since moved them.
 | 2 | **High** | S | Reconcile `ProcessInfo` doc/struct/constants against the kernel side; delete stale parts | `libakuma/src/lib.rs:151,154,157,177-203` | **Done** `9cd7a24` |
 | 3 | **High** | M | Delete `TlsOptions`/`_insecure`/`insecure()` (or implement verify). Add `// SECURITY:` banner + reference doc row. | `libakuma-tls/src/lib.rs:60-79`, `http.rs:75` | **Done** `9cd7a24` — minus the reference doc row |
 | 4 | **Med** | M | Refactor `http.rs` to kill the 4× duplication; unify on one stream enum + one read helper. Cuts ~500 LOC. | `libakuma-tls/src/http.rs` | **Done** `9cd7a24` — −343 LOC; `HttpStream`/`HttpStreamTls` still twins |
-| 5 | **Med** | S | Implement or refuse chunked transfer-encoding | `libakuma-tls/src/http.rs:568,612` | **Done** (2026-08-12, uncommitted) — refuse, not implement |
-| 6 | **Med** | S | Replace per-line `Vec<u8>` lowercasing with `eq_ignore_ascii_case` (4 sites) | `libakuma-tls/src/http.rs:244,557,1017,1039` | **Done** (2026-08-12, uncommitted) |
-| 7 | **Med** | S | `getcwd`: replace `static mut CWD_BUF` with a `Spinlock` and drop `from_utf8_unchecked` | `libakuma/src/lib.rs:236-248` | **Done** (2026-08-12, uncommitted) |
-| 8 | **Med** | S | `accept`: parse the returned `sockaddr`, fix `peer_addr` on accepted sockets | `libakuma/src/net.rs:150-200` | **Done** (2026-08-12, uncommitted) |
-| 9 | **Med** | S | Stop mapping every TLS I/O failure to `Error::IoError`; preserve `TlsError` | `libakuma-tls/src/lib.rs:51,124-147` | **Done** (2026-08-12, uncommitted) |
-| 10 | **Low** | S | Unify fd types on `i32` (`read`/`write`/`fd` module) | `libakuma/src/lib.rs:141-144,504,520` | **Done** (2026-08-12, uncommitted) |
-| 11 | **Low** | S | `#[deprecated]` `waitpid` and `kill` (the signal-0 variant), point at the `*_status`/`kill_signal` replacements | `libakuma/src/lib.rs:1589,1787` | **Done** (2026-08-12, uncommitted) — also fixed 3 live call sites that were relying on the signal-0 no-op believing it killed a child |
-| 12 | **Low** | S | Delete `transport.rs` dot-printer (layering violation) | `libakuma-tls/src/transport.rs:13-17,29-31,101-107` | **Done** (2026-08-12, uncommitted) |
-| 13 | **Low** | S | Delete or feature-gate the brk allocator path (racy, dead by default) | `libakuma/src/lib.rs:2025,2192-2240` | **Done** (2026-08-12, uncommitted) — deleted |
+| 5 | **Med** | S | Implement or refuse chunked transfer-encoding | `libakuma-tls/src/http.rs:568,612` | **Done** (2026-08-12, `cf03840`) — refuse, not implement |
+| 6 | **Med** | S | Replace per-line `Vec<u8>` lowercasing with `eq_ignore_ascii_case` (4 sites) | `libakuma-tls/src/http.rs:244,557,1017,1039` | **Done** (2026-08-12, `cf03840`) |
+| 7 | **Med** | S | `getcwd`: replace `static mut CWD_BUF` with a `Spinlock` and drop `from_utf8_unchecked` | `libakuma/src/lib.rs:236-248` | **Done** (2026-08-12, `cf03840`) |
+| 8 | **Med** | S | `accept`: parse the returned `sockaddr`, fix `peer_addr` on accepted sockets | `libakuma/src/net.rs:150-200` | **Done** (2026-08-12, `cf03840`) |
+| 9 | **Med** | S | Stop mapping every TLS I/O failure to `Error::IoError`; preserve `TlsError` | `libakuma-tls/src/lib.rs:51,124-147` | **Done** (2026-08-12, `cf03840`) |
+| 10 | **Low** | S | Unify fd types on `i32` (`read`/`write`/`fd` module) | `libakuma/src/lib.rs:141-144,504,520` | **Done** (2026-08-12, `cf03840`) |
+| 11 | **Low** | S | `#[deprecated]` `waitpid` and `kill` (the signal-0 variant), point at the `*_status`/`kill_signal` replacements | `libakuma/src/lib.rs:1589,1787` | **Done** (2026-08-12, `cf03840`) — also fixed 3 live call sites that were relying on the signal-0 no-op believing it killed a child |
+| 12 | **Low** | S | Delete `transport.rs` dot-printer (layering violation) | `libakuma-tls/src/transport.rs:13-17,29-31,101-107` | **Done** (2026-08-12, `cf03840`) |
+| 13 | **Low** | S | Delete or feature-gate the brk allocator path (racy, dead by default) | `libakuma/src/lib.rs:2025,2192-2240` | **Done** (2026-08-12, `cf03840`) — deleted |
 | 14 | **Low** | M | Extract pure-logic cores (`libakuma-core`, `libakuma-tls-core`) and add the first host tests | both crates | Open — still 0 tests |
-| 15 | **Low** | S | Refresh `SYSCALLS.md` / `TERMINAL_SYSCALLS.md` / `ALLOCATOR_MEMORY_FIX.md` against current code | `userspace/libakuma/docs/` | **Done** (2026-08-12, uncommitted) — also refreshed `ALLOCATOR_OPTIONS.md` (found stale on inspection, not in the original list) |
+| 15 | **Low** | S | Refresh `SYSCALLS.md` / `TERMINAL_SYSCALLS.md` / `ALLOCATOR_MEMORY_FIX.md` against current code | `userspace/libakuma/docs/` | **Done** (2026-08-12, `cf03840`) — also refreshed `ALLOCATOR_OPTIONS.md` (found stale on inspection, not in the original list) |
 
 "S" = ≤ 1 hour, "M" = a day or less. None of these require kernel changes
 except item 2's verification step.
@@ -702,7 +705,7 @@ What the refactor did **not** reach, hence "half baked":
 Untouched by this commit: BUG-2 (`accept` peer address), BUG-4 (`getcwd`
 `from_utf8_unchecked`), BUG-5 (fd types), TLS-BUG-2/3/4, and items 5-15.
 
-### 2026-08-12 (later, uncommitted) — items 5-13, 15
+### 2026-08-12 (later) — `cf03840` "multiple libakuma fixes" — items 5-13, 15
 
 **Item 5 — chunked transfer-encoding (TLS-BUG-2).** Took the "refuse"
 option, not "implement": added `is_chunked_encoding(headers)` to `http.rs`
@@ -805,6 +808,57 @@ brk arm (item 13) is gone.
 Full `userspace/build.sh` run clean after each item; `cargo check` used
 per-package during iteration. Item 14 (pure-logic core extraction + first
 host tests for both crates) is the only item left open.
+
+### 2026-08-12 (later still, uncommitted) — `paws` Ctrl-C actually fixed
+
+Everything above this point was checked with `cargo build`/host tests only.
+Booting a real QEMU instance and driving `paws` through an interactive PTY
+(spawn a real foreground external child, send `0x03`) showed the item-11
+`paws` fix landed in `cf03840` — `kill_signal(pid, SIGINT)` instead of the
+signal-0 `kill(pid)` — **still didn't kill the child**. First diagnosis was
+wrong: theorized `poll_input_event` needed raw terminal mode (canonical mode
+line-buffers a lone Ctrl-C until Enter), so `cf03840` added
+`set_terminal_attributes(..., RAW_MODE_ENABLE)` around `stream_output`'s
+loop. That compiled and looked plausible but didn't fix the live test.
+
+Root cause, found by instrumenting `sys_poll_input_event` and
+`write_to_process_stdin` with temporary `tprint!`s and re-running the same
+PTY test: `sys_poll_input_event` (`src/syscall/term.rs`) calls
+`proc_channel.read_stdin` directly and **never consults `TerminalState` at
+all** — canonical/raw mode is irrelevant to this syscall, so the `cf03840`
+fix was inert. The trace showed `stream_output`'s poll loop calling
+`poll_input_event` exactly twice after the child was spawned, then never
+again for the rest of the session, while the child (an `httpd` instance)
+sat alive and idle. That is `read_fd(stdout_fd)` blocking: the child's
+stdout pipe is blocking by default, so once it stops producing output
+(a server between requests, a build between output lines) `stream_output`
+parks in that `read_fd` call and never gets back around to checking for
+Ctrl-C. `userspace/sshd/src/protocol.rs`'s `bridge_process` hit and fixed
+this exact deadlock class for its own child-stdout-vs-stdin bridge loop
+(`set_nonblocking(stdout_fd, true)`, with a comment naming it); `paws`'s
+`stream_output` never got the same treatment.
+
+Fix: `userspace/paws/src/main.rs`'s `stream_output` now calls
+`set_nonblocking(stdout_fd as i32, true)` before entering its loop,
+mirroring sshd's fix. The `RAW_MODE_ENABLE`/`DISABLE` calls and the local
+`mode_flags` module `cf03840` added are removed — they weren't wrong to
+try, just not what was needed, and keeping code around that claims to fix
+something it doesn't is worse than deleting it.
+
+QEMU-reverified end to end: spawned `/bin/httpd 9099` as a real foreground
+child under `paws`, confirmed via kernel-side `tprint!` tracing that
+`poll_input_event` now keeps firing throughout (not just twice), sent
+`0x03`, saw `^C` / `paws: process /bin/httpd exited with status 0` printed,
+and confirmed via `ps aux` from a second session that the child process was
+actually gone. All temporary debug instrumentation (in `src/syscall/term.rs`
+and `crates/akuma-exec/src/process/mod.rs`) was reverted before this note
+was written.
+
+**Method lesson:** a plausible-sounding, source-reading-only diagnosis
+("canonical mode buffers Ctrl-C") compiled clean and matched the *symptom*
+description, but was wrong — only booting the actual system and tracing the
+real syscall sequence caught it. Neither `cargo build` nor the host test
+suites for this repo can catch this class of bug; only QEMU can.
 
 ---
 

@@ -495,6 +495,112 @@ is known — `EINTR` propagation in `sys_read`, or unsetting `SA_RESTART`
 for the busybox install path, or wiring the pending-signal drain on
 read-return — but each points at a different file.
 
+## Issue 7: `userspace/build.sh` needs bash — busybox `sh` can't run it
+
+**Status: OPEN.** Found 2026-08-12 running the in-guest self-host/devbox
+userspace build (`docs/runbooks/selfhost-kernel-build.md`): `sh build.sh`
+(the guest's `/bin/sh`, busybox ash) fails immediately, and `apk add bash`
+was needed just to get the build running at all.
+
+### Symptom
+
+Inside the guest, `/bin/sh build.sh` (or a plain `./build.sh` when `sh` is
+the default interpreter) fails at the array assignments near the top of the
+script; only `bash build.sh` works.
+
+### Root cause
+
+`userspace/build.sh` uses bash indexed-array syntax (`NAME=(...)` /
+`"${NAME[@]}"`) throughout — the rustflags lists (`MEOW_SIZE_FLAGS`,
+`EXTERNAL_RUSTFLAGS`, `MEOW_RUSTFLAGS`), the member lists (`EXTERNAL_MEMBERS`,
+`NO_BIN_MEMBERS`, `MEMBERS`, `BINARIES`), and several more further down. Arrays
+are not part of POSIX `sh` and busybox `ash` doesn't implement them, so the
+script hard-requires bash. The guest devbox image doesn't ship bash by
+default (it ships busybox `sh`), so building userspace in-guest currently
+means `apk add bash` first — an extra ~dependency pull just to run a build
+script, on an image that otherwise gets by on busybox applets.
+
+### Reproducing
+
+```bash
+overlays/devbox/run-smoltcp.sh   # or run-devbox / self-host disk
+ssh -o StrictHostKeyChecking=no -p 2222 root@localhost \
+    'cd /root/akuma/userspace && sh build.sh'   # fails: array syntax
+```
+
+### Next step, if picked up
+
+Rewrite `build.sh` to avoid bash arrays so it runs under busybox `sh`/dash —
+e.g. newline- or space-separated values in a plain variable consumed with a
+`for` loop / `set --`, or `printf '%s\n' "$LIST" | while read -r item`. The
+harder parts are the rustflags lists, which get joined with `\x1f` via
+`encode_rustflags()` (a bash-array-friendly helper) for
+`CARGO_ENCODED_RUSTFLAGS` — that join needs to keep working with a
+plain-variable/positional-params representation instead of `"${ARR[@]}"`.
+Worth auditing the rest of the script for other bashisms (`[[`, `local -a`,
+`${var//pattern/repl}`, etc.) in the same pass rather than fixing arrays and
+hitting the next bashism on a later run.
+
+## Issue 8: `apk add`/`apk fix` reports "1 error" from busybox's own trigger even on a clean install
+
+**Status: OPEN.** Found 2026-08-12, same session as Issue 7, while installing
+packages (`xz`, then reproduced against `busybox` directly) inside a running
+devbox-smoltcp guest over SSH.
+
+### Symptom
+
+```
+$ apk add --no-cache xz
+(1/1) Installing xz (5.8.3-r0)
+Executing busybox-1.37.0-r31.trigger
+1 error; 693.2 MiB in 57 packages
+
+$ apk fix busybox
+(1/1) Reinstalling busybox (1.37.0-r31)
+  Executing busybox-1.37.0-r31.post-upgrade
+Executing busybox-1.37.0-r31.trigger
+1 error; 57 packages, 156 dirs, 2923 files, 693.2 MiB
+$ echo $?
+1
+```
+
+`apk` exits non-zero and prints "1 error" every time *any* package install
+triggers busybox's own post-install trigger script — but nothing else looks
+broken: `xz` itself works (`xz --version` succeeds right after), and
+`/bin/sh -> /bin/busybox` resolves correctly (`readlink -f /bin/sh` →
+`/bin/busybox`), so this is not a recurrence of Issue 5's dangling-symlink
+bug (that one leaves `/bin/<applet>` pointing at a path that doesn't exist in
+the guest; here the symlinks are fine).
+
+### Not yet root-caused
+
+`apk`/`apk fix` at default and `-v` verbosity both swallow whatever the
+trigger script itself printed to produce "1 error" — neither run surfaced
+the underlying failure over SSH, only the terse summary line. The user
+flagged that this is inconsistent with prior sessions where `apk add`
+returned a clean `OK: ...` with no error (e.g. `apk add git` earlier the same
+session installed 687.7 MiB / 49 packages with `OK`, no trigger error), so
+this looks like a real, if currently cosmetic, regression or environment
+difference rather than an always-present property of this image.
+
+### Reproducing
+
+```bash
+overlays/devbox/run-smoltcp.sh
+ssh -o StrictHostKeyChecking=no -p 2222 root@localhost 'apk fix busybox'
+```
+
+### Next step, if picked up
+
+SSH-level `apk -v` doesn't show the trigger's own stderr — needs either the
+serial console (the trigger may be writing to a fd that doesn't survive the
+ssh session) or extracting `busybox`'s trigger script from
+`/lib/apk/db/scripts.tar.gz` and running it by hand to see what syscall or
+condition it's hitting. Given the pattern of other Issue entries here
+(missing `/proc` forwarding, unimplemented syscalls), a reasonable first
+guess is the trigger calling something Akuma's syscall surface doesn't
+support yet — but that's a guess, not a finding; confirm before acting on it.
+
 ## Background
 
 - `docs/archive/GIT_MISSING_SYSCALLS.md` — Issues 11-14, the CLONE_THREAD /
