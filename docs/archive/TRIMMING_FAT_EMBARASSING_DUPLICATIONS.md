@@ -11,8 +11,8 @@ deleted code has no `unsafe` in it.
 **This doc tracks.** It is a live work list, not a frozen investigation — unlike
 its neighbours in `archive/`, update it as phases land.
 
-**Progress: Phase 0 done (2026-08-13), Phase 1 done. Phase 2a is next.**
-See §8.5 for per-item status.
+**Progress: Phase 0 done (2026-08-13), Phase 1 done, Phase 2a done (2026-08-13).
+Phase 2b is next.** See §8.5 for per-item status.
 
 ---
 
@@ -89,6 +89,11 @@ priorities in §5 exclude them.
 ---
 
 ## 3. The dominant pattern: `X` and `X_from_path`
+
+> **Status.** The `elf/mod.rs` three-of-four (Phase 2a) **landed 2026-08-13** —
+> what the plan below got right and wrong is in §8.5. The `process/mod.rs` and
+> `process/image.rs` pair (Phase 2b) is still open. The analysis below is left
+> as written, because §8.5's corrections only make sense against it.
 
 **Three separate copies of one design decision**, in three different files. Each
 is "load an ELF from bytes" cloned into "load an ELF from a path":
@@ -564,7 +569,7 @@ ELF-loading path into one.
 | 1 | virtio scaffolding: shared `Hal`, `virtio::probe`, one `VIRTIO_MMIO_ADDRS` | ~90 | small | low |
 | 2 | `channel.rs` stdout/stdin FIFO → one helper; ~~decide whether `write_stdin` needs the `write_bounded` treatment~~ **(decided + shipped 2026-08-13, §8.5 Phase 0 item 5)** — the FIFO-merge half is still open | ~40 | small | low, but see §6 |
 | 3 | `akuma-isolation`/`akuma-vfs` `mount.rs` → shared half into `akuma-vfs` | ~63 | small | low |
-| 4 | The `X`/`X_from_path` **quartet** (`elf/mod.rs` ×3, `process/mod.rs`, `process/image.rs`) — unify on the `elf` crate first | **~650** | medium | medium — ELF load path, boot-critical, but the parser half is verified equivalent (§3) |
+| 4 | The `X`/`X_from_path` **quartet** — ~~`elf/mod.rs` ×3~~ **(done 2026-08-13, §8.5 Phase 2a: −151 code lines, 12 clone blocks → 0)**; `process/mod.rs` + `process/image.rs` still open as Phase 2b | ~165 left | medium | medium — ELF load path, boot-critical |
 | 5 | `exceptions.rs` duplicated `Drop` impls (`:3703` / `:4315`) | ~142 | medium | **high** — exception path |
 | 6 | `box_mod` `access.rs` / `hierarchy.rs` | ~60 | small | low |
 | 7 | `rump_proxy.rs` / `akuma-rump` `sysproxy.rs` | ~23 | small | low |
@@ -673,12 +678,133 @@ parser deletion is evidence-backed. Nothing left to build.
 
 ### Phase 2 — ELF quartet, split by file ownership
 
-**2a — do now** (`crates/akuma-exec/src/elf/` only, no contention, ~400 lines):
-unify on the `elf` crate and delete the hand-rolled parser; introduce
-`ElfSource`, separating the *source* axis from the *eager/lazy mapping* axis;
-merge the three `elf/mod.rs` pairs (`load_interpreter`, `load_elf`,
-`load_elf_with_stack`); split the file into `source.rs` / `load.rs` /
-`interp.rs` / `stack.rs`.
+**2a — DONE 2026-08-13.** `crates/akuma-exec/src/elf/` is now five files:
+`mod.rs` (37 lines, re-exports only), `source.rs`, `load.rs`, `interp.rs`,
+`stack.rs`. All four sub-parts landed: the hand-rolled parser is deleted, the
+source and mapping axes are separate parameters, all three `elf/mod.rs` pairs
+are merged, and the file split fell out of the merge exactly as predicted.
+Details, and the four places the plan was wrong, below.
+
+**What the numbers actually were.** CPD over just this directory, at the
+50-token threshold §5.6 argues for:
+
+| | blocks | duplicated lines |
+|---|---:|---:|
+| before | 12 | 254 |
+| after | **0** | **0** |
+
+Executable lines (excluding comments, blanks and `#[cfg(test)]` blocks):
+**1,074 → 923, −151 (−14%)**. Total lines are roughly flat (1,580 → 1,617)
+because the merge came with 63 more lines of test and ~140 more of comment.
+
+**§3's "~486 lines for these two files" was about 3× optimistic**, and the
+overshoot is instructive rather than embarrassing:
+
+1. **The abstraction is not free.** `ElfSource` + `ElfHeaders` are ~121 lines
+   that did not exist in any form before. §7's "subtract 10–20% for the
+   parameters and wrappers you add back" is the right idea at the wrong
+   magnitude — when the *point* of a merge is to introduce a seam, the seam is
+   a large fraction of what you save.
+2. **The pairs were not independent.** §3 sized `load_elf`, `load_interpreter`
+   and `load_elf_with_stack` as three separate merges and summed them. They
+   share the page-mapping loop, so collapsing that loop is counted three times
+   in the estimate and once in reality.
+3. **Line counts in the table were whole-function extents** (comments and
+   blanks included) measured against code-only merged sizes.
+
+The duplication is what actually went away, and it went away completely: **one
+page-mapping loop** (`map_segment_eager`) where there were three, **one
+relocation applier** (`apply_relocations`) where there were two divergent ones,
+**one ELF parser** where there were two.
+
+**What each sub-part turned into.**
+
+- **The parser deletion is smaller than advertised and the tests are the
+  point.** `types.rs` lost 41 lines of code, not 90 — §3's figure counted the
+  doc comments and blanks around `Elf64Ehdr` / `Elf64Phdr` /
+  `parse_elf64_phdr` / `read_u{16,32,64}_le`. What it bought is not lines: the
+  `elf` crate's `parse_ident` / `parse_tail` / `ParsingTable` bounds-check
+  everything the hand-rolled reader indexed raw, and `ProgramHeader::
+  validate_entsize` rejects an `e_phentsize` that is not 56 instead of using it
+  as a stride. §3's proposed API worked exactly as described, first try.
+- **The `elf` crate's low-level pieces are `pub`,** including
+  `parse::ParseAt::validate_entsize`, which §3 did not know. That is what makes
+  the lazy path's header validation equal to `minimal_parse`'s rather than
+  merely similar.
+- **`ElfSource::read_at` returns `Cow<'a, [u8]>`.** Borrowed for a byte source,
+  owned for a path source. So the eager loader still copies straight out of the
+  slurped image with no intermediate allocation, and the lazy loader still holds
+  no more than the chunk it is reading. That is the detail that let one loop
+  serve both without a performance regression on either.
+- **`MapStrategy::Deferred { path, inode }` carries the pager's inputs,** which
+  makes `Deferred` over an in-memory image *unrepresentable*, not merely unused.
+  §3's semantic trap resolves itself: `load_elf_with_stack` now returns
+  `loaded.deferred_segments` unconditionally, and it is empty for an eager load
+  because nothing populated it. The distinction survived by becoming data.
+
+**Four behaviour differences the merge had to resolve** — the pairs were not as
+identical as CPD's token view suggested:
+
+1. **Relocations, symbol-less and unresolvable.** The two appliers disagreed:
+   the main-binary copy wrote `sym_value + addend` (with `sym_value` left at 0)
+   for a GLOB_DAT/JUMP_SLOT naming symbol 0 or an out-of-range symbol; the
+   interpreter copy wrote nothing. Converged on the interpreter's rule (only
+   ABS64 has a defined meaning without a symbol). **Verified, not assumed**: a
+   scan of every ET_EXEC binary in the tree found 118 carrying SHT_RELA, 2,832
+   relocations, **zero** symbol-less ABS64/GLOB_DAT/JUMP_SLOT and **zero**
+   out-of-range symbol indices. The rule changes nothing on real input.
+2. **Malformed-input strictness.** The eager path silently skipped a PT_INTERP
+   or a segment whose file extent ran past EOF (`if off + sz <= elf_data.len()`);
+   the lazy path propagated the error. Converged on strict. Silently dropping
+   PT_INTERP on a dynamic binary means jumping to a non-relocated entry point —
+   a SIGSEGV with no explanation, where the error gives a clean ENOEXEC.
+3. **`InvalidMagic` vs `InvalidFormat`.** The eager path reported
+   `InvalidMagic(bytes)` for any parse failure including truncation; the lazy
+   path reported `InvalidFormat("Bad magic")` with no bytes. Now both read 4
+   bytes *on the failure path only* and report `InvalidMagic` when the magic
+   really is wrong, `InvalidFormat` when it is right but the file is truncated.
+   The four bytes are what tell you "it's a shell script" at a glance.
+4. **Addend arithmetic.** Both copies used plain `+` on
+   `r_addend as usize`, which is a panic if the kernel is ever built with
+   overflow checks on (negative addends become huge `usize`s). Now
+   `wrapping_add`, which is what release builds were already doing.
+
+**PN_XNUM is now rejected explicitly.** `minimal_parse` handled `e_phnum ==
+0xffff` by reading the real count from `shdr[0].sh_info`; the hand-rolled parser
+would have tried to read 65535 phdrs. Neither behaviour is reachable by anything
+this kernel executes, so the merged parser errors out by name rather than
+carrying a branch nothing tests.
+
+**Verification.** `cargo check --release` and `cargo clippy --release` clean;
+414 host tests green (13 new, covering the parsing the deleted parser used to
+do — including a resident subset of §3's hostile-header mutations, since the
+kernel builds `panic = "abort"`). QEMU, `MEMORY=2048`, failure set identical to
+a clean tree (`retired_reclaim_ab` only) across every boot:
+
+| path | exercised by |
+|---|---|
+| Bytes + Eager | `/bin/sshd`, `/bin/paws`, `/bin/tcc` (229 KB) |
+| Path + Deferred | `/bin/busybox` (1,116,408 B, over the 1 MiB `HEAP_SLURP_MAX`) |
+| interpreter, Bytes source | `/usr/bin/tree` + `/lib/ld-musl-aarch64.so.1` |
+| interpreter, **Path** source | same, under a temporary `__probe_path_interp` feature |
+
+That last row needed a trick worth recording. The Path-source interpreter branch
+is `#[cfg(kernel_profile_extreme)]`, and **`ssh host <cmd>` is broken on the
+extreme-size profile** — every session dies instantly at `FAR=0x10
+ELR=0x415330` inside sshd, interactive PTY included. That is **pre-existing**:
+A/B-confirmed by stashing the whole diff, rebuilding extreme-size and getting
+byte-identical fault registers. So the branch was exercised instead by adding a
+throwaway crate feature that forces `ElfSource::Path` on the release profile,
+where ssh works — same code, drivable box. The feature was removed afterwards.
+(The extreme-size sshd fault is not this phase's to fix, but it is a live bug
+and nothing else in the repo records it.)
+
+**Disk state note.** Verifying the interpreter needed a dynamically-linked
+binary, and `disk.img` had none — no `/lib/ld-musl-aarch64.so.1` at all, which
+is why the interpreter loader had gone so long without a live test. It now
+carries `apk add musl tree` plus two ubase binaries at `/bin/dyn_pwdx` and
+`/bin/dyn_df`. Keep them: the ELF loader has no other in-VM coverage of the
+dynamic path.
 
 **2b — park until `process/mod.rs` is free** (~250 lines): move `from_elf` /
 `from_elf_path` into `image.rs` as a **pure move in its own commit** (a reviewer
