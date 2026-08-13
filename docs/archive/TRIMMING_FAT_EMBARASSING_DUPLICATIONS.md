@@ -906,10 +906,10 @@ as the only place negation happens, and the pre-negated `u64` consts derived
 from it rather than hand-written. Then convert the 15 production sites; the 94
 in test files are a separate, mechanical pass.
 
-## 5.8 Open: the runtime-registration machinery is written three times
+## 5.8 The runtime-registration machinery was written three times
 
-**Not yet done.** Found 2026-08-13 while asking why `channel.rs` could not read
-its config from a host test (§6.1). The answer to "extract `ExecConfig` into
+**DONE 2026-08-13.** Found while asking why `channel.rs` could not read its
+config from a host test (§6.1). The answer to "extract `ExecConfig` into
 `akuma-primitives`" is: extract the **registry**, not the payload.
 
 Three crates implement the same "kernel registers callbacks once at boot, then
@@ -932,18 +932,70 @@ per-packet DMA path" — while the struct is still reached through exactly that
 spinlocked read. `akuma-ext2` calls `OnceCopy` "the crate-wide answer to exactly
 this shape". Two crates got the answer; the one on the hottest path did not.
 
-**Suggested shape:** a `Registered<T: Copy>` in `akuma-primitives` wrapping
-`OnceCopy` with the name baked in for the panic message —
-`register`/`get`/`expect`/`is_registered`. Three definitions collapse, akuma-net
-drops a lock from a per-packet path, and the test-injection question §6.1 had to
-solve per-crate becomes a property of the primitive (registration is idempotent,
-so tests inject freely) instead of a `#[cfg(test)]` hook in each crate.
+**Shipped:** `akuma_primitives::Registered<T: Copy>` wraps `OnceCopy` with the
+panic diagnostic baked in — `register` / `get` / `require` / `is_registered`.
+All three crates now use it, with three unit tests on the primitive itself.
+
+### Judge this one on lock acquisitions, not lines
+
+The line count is a **wash and then some**: +69 code lines in `akuma-primitives`
+(≈30 of them the type, the rest its tests) against −22/+21 across the three
+consumers. Third phase running to the same conclusion as §3, §5.555 and Phase 4
+— when the deliverable is a seam, the seam is the cost.
+
+What it actually bought:
+
+- **21 spinlock acquisitions deleted from `akuma-net` read paths**, and they are
+  not cold: `uptime_us` ×10 (every smoltcp `poll()`), `current_box_id` ×5 (per
+  socket op), `blocking_relax` ×3 (blocking socket loop). Every network poll was
+  taking a lock to read a function pointer.
+- **Three definitions → one**, and the `get` (degrade) vs `require` (panic) split
+  is now an explicit choice at each site rather than three different house
+  styles. `akuma-ext2` deliberately keeps `get`, because its lock paths run
+  before `init_thread_hooks` and tid-0/not-dead is the right answer there — that
+  reasoning is now written down next to the static.
+- Idempotent single-shot registration became a **property of the primitive**, so
+  the host-test injection §6.1 solved per-crate does not need re-solving.
+
+**No behaviour change in the conversion**, and the one that looked like a risk
+is not: `akuma-net` went from last-writer-wins (`Spinlock<Option<_>>`) to
+single-shot, but its two `runtime::register` call sites are
+`#[cfg(feature = "smoltcp")]` and `#[cfg(not(…))]` — mutually exclusive, exactly
+one compiled, called once from boot. Same for the other two crates: one `init`
+each, from `src/main.rs` and `src/fs.rs`.
 
 Note this is the *opposite* direction from §4's "nothing in `akuma-vfs` belongs
 in `akuma-primitives`" finding, and for the stated reason: extraction pays when
 the duplicator cannot reach the canonical version. `akuma-net` and `akuma-ext2`
 cannot reach `akuma-exec`'s registry — that edge is precisely what the leaf crate
 exists to avoid — so here the criterion is met.
+
+## 5.9 Host-test coverage by crate (surveyed 2026-08-13)
+
+Taken while acting on §6.1's finding that the bar for host-testing kernel code
+is lower than assumed. Tests per crate, against size:
+
+| crate | code lines | files | files w/ tests | `#[test]` |
+|---|---:|---:|---:|---:|
+| akuma-exec | 23,855 | 37 | 14 | 210 |
+| akuma-ext2 | 3,248 | 3 | 1 | 52 |
+| akuma-net | 3,147 | 9 | 2 | 25 |
+| akuma-isolation | 1,475 | 5 | 3 | 43 |
+| akuma-vfs | 1,448 | 6 | 1 | 39 |
+| akuma-rump | 1,632 | 3 | 3 | 37 |
+| **akuma-virtio** | **1,474** | **6** | **0** | **0** |
+| akuma-primitives | 1,370 | 7 | 6 | 31 |
+| akuma-terminal | 551 | 1 | 1 | 21 |
+
+`akuma-virtio` was the only crate in the workspace with **no tests at all** —
+and it is the crate holding the tree's one hand-rolled virtqueue. Closed to 3;
+see §6.2.
+
+The remaining large untested files are genuinely hardware- or scheduler-bound
+(`threading/mod.rs` 5,128, `process/mod.rs` 3,361, `mmu/mod.rs` 2,176,
+`children.rs` 2,054, `smoltcp_net.rs` 1,115). The lesson from §6.1 still applies
+to them piecewise: the untestable part is usually a thin shell around arithmetic
+that is not, and splitting the arithmetic out is cheap.
 
 ## 6. What CPD cannot see
 
@@ -1085,6 +1137,35 @@ line. Hoisting the wake into a leaf crate needs a mandatory-registration
 contract, not the console hook's optional one. That is a design cost — not an
 impossibility, which is what it had been recorded as.
 
+### 6.2 `akuma-virtio` had no tests, and the audit of it was stale
+
+Applying §6.1's method across the workspace (§5.9) turned up one crate with
+**zero** tests over ~1,470 lines — the crate that owns the tree's only
+hand-rolled virtqueue, which `UNSAFE_AUDIT.md` §4 P2(e) singles out as carrying
+two real defects.
+
+**Both of those defects were already fixed.** The audit still reads as open work
+("the fix is one word: clamp to `to_read`"); the code does clamp to `to_read`,
+`VirtqAvail`/`VirtqUsed` are `AtomicU16` with an acquire load, and there is a
+third guard the audit never anticipated — a device completing with `len == 0` is
+an error, because otherwise `bytes_read` never advances and the driver reissues
+the same request forever. §4 P2(e) now carries a status header saying so.
+
+The gap was that **nothing tested any of it.** A one-word clamp with no test is
+one careless edit from being a heap over-read into `getrandom` output again. So
+the clamp is now a pure `completion_copy_len(device_len: u32, offered: usize)`,
+split out for no reason other than testability, and pinned against a lying
+device (`u32::MAX`, `4096`), an honest one, a short final request, and zero.
+`calc_queue_layout` got tests too: the three DMA rings must not overlap, across
+queue sizes 1…1024, because an overlap is silent corruption of whichever ring
+loses the race — and the deliberate page-over-alignment of the used ring is
+pinned so relaxing it to the spec's 4 bytes has to be a visible decision.
+
+Generalising: the untestable part of a driver is usually a thin shell around
+arithmetic that is not. Two functions, six lines of real logic, and the crate
+went from 0 tests to 3 covering the exact code that a stale audit had left
+everyone believing was still broken.
+
 **Implication for tooling.** Do not treat 5,370 as the number. Treat it as the
 lower bound that a tool with no semantic understanding can prove. Type-2
 detection for Rust needs something else — `ast-grep`/`semgrep` patterns once you
@@ -1153,7 +1234,7 @@ ELF-loading path into one.
 | 7 | `rump_proxy.rs` / `akuma-rump` `sysproxy.rs` | ~23 | small | low |
 | 8 | `mmu/mod.rs` `map_user_page` / `_no_flush` and the three walk clones | ~80 | medium | **high** — see `UNSAFE_AUDIT.md` §5.1 |
 | 9 | Test-file clones (`tests.rs`, `process_tests.rs`) | ~669 | medium | low |
-| 12 | **Runtime-registration machinery (§5.8)** — the same register-once/get-or-panic/probe written in 3 crates; `akuma-net` still pays a spinlock per read where the other two are lock-free. One `Registered<T>` in `akuma-primitives` | 3 defs | small | low |
+| 12 | ~~Runtime-registration machinery (§5.8)~~ **DONE 2026-08-13** — one `akuma_primitives::Registered<T>`; 3 definitions → 1 and **21 spinlock acquisitions removed** from `akuma-net`'s poll/socket paths. Line count a wash; judge it on the locks | 0 left | — | — |
 | 11 | **Errno spellings (§5.7)** — three tables (17 names defined twice, in two representations) + 109 raw negative literals. Run with the Phase 5 syscall sweep | ~130 sites | medium | low |
 | 10 | Trait-impl clusters (§5.5): `ClientMem`/`NoMem` across crates, duplicate `IrqGuard`, BKL guard family → one generic guard, `impl_display!` macro, duplicate `MultiPollFuture`. **In progress — `akuma-primitives` rungs 1–2 done (§5.555); the `~180` is the wrong metric, see there** | ~180 | small–medium | low |
 

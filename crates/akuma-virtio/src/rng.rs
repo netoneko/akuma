@@ -195,6 +195,28 @@ fn calc_queue_layout(queue_size: usize) -> (usize, usize, usize, usize) {
     (desc_offset, avail_offset, used_offset, total_size)
 }
 
+/// How many bytes to copy out of the staging buffer for one completed request.
+///
+/// `device_len` is the length the **device** wrote into the used ring, so it is
+/// untrusted input. It must be clamped to what this request actually offered
+/// (`offered`, i.e. the descriptor's own length) — **not** to the caller's
+/// remaining space. The source is a fixed 256-byte staging allocation; clamping
+/// against the caller's remaining space instead lets a device reporting
+/// `len > offered` over-read that allocation and hand the spill straight to
+/// userspace through `getrandom`. The same distrust already gates `used_elem.id`.
+///
+/// `0` means the device completed the descriptor without writing anything; the
+/// caller must treat that as an error rather than looping, or `bytes_read` never
+/// advances and the same request is reissued forever.
+///
+/// Split out of the completion path purely so it can be tested: the rest of that
+/// path needs a real device. `UNSAFE_AUDIT.md` §4(e) describes both this clamp
+/// and the acquire barrier above as open defects — they were fixed, and this
+/// pins the clamp so it cannot silently regress.
+fn completion_copy_len(device_len: u32, offered: usize) -> usize {
+    core::cmp::min(device_len as usize, offered)
+}
+
 impl VirtioRngDevice {
     /// Create and initialize a new VirtIO RNG device (modern / version 2 transport)
     fn new(base_addr: usize) -> Result<Self, RngError> {
@@ -475,14 +497,7 @@ impl VirtioRngDevice {
                 return Err(RngError::ReadError);
             }
 
-            // Copy data from buffer. `used_elem.len` is written by the DEVICE, so
-            // clamp it to what this request actually offered (`to_read`) — NOT to
-            // the caller's remaining space. The source is a fixed 256-byte staging
-            // allocation; clamping against `buf.len() - bytes_read` lets a device
-            // reporting `len > to_read` over-read that allocation and hand the
-            // spill straight to userspace through `getrandom`. The same distrust
-            // already gates `used_elem.id` just above.
-            let copy_len = core::cmp::min(used_elem.len as usize, to_read);
+            let copy_len = completion_copy_len(used_elem.len, to_read);
             if copy_len == 0 {
                 // A device completing the descriptor without writing anything
                 // would otherwise spin the outer loop forever: `bytes_read` never
@@ -586,4 +601,76 @@ pub fn fill_bytes(buf: &mut [u8]) -> Result<(), RngError> {
 
 fn log(msg: &str) {
     akuma_primitives::console::print_str(msg);
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+/// `akuma-virtio` had **zero** tests before 2026-08-13, across ~1,470 lines —
+/// the only crate in the workspace with none. Most of it genuinely needs
+/// hardware, but not all: the two functions below are pure arithmetic that
+/// decides how much memory a DMA region spans and how many bytes get copied out
+/// of it on a device's say-so. Both are exactly the kind of thing that is
+/// silently wrong until it corrupts memory.
+#[cfg(test)]
+mod tests {
+    use super::{PAGE_SIZE, QUEUE_SIZE, calc_queue_layout, completion_copy_len};
+
+    /// A device that lies about how much it wrote must not cause a read past the
+    /// staging buffer. Regression pin for `UNSAFE_AUDIT.md` §4(e) — which still
+    /// describes this as open, though it was fixed before this test existed.
+    #[test]
+    fn completion_length_is_clamped_to_what_was_offered() {
+        assert_eq!(completion_copy_len(64, 256), 64, "honest device: take its word");
+        assert_eq!(completion_copy_len(256, 256), 256, "exactly full is fine");
+
+        // The whole point: the device claims more than the descriptor offered.
+        assert_eq!(completion_copy_len(4096, 256), 256);
+        assert_eq!(completion_copy_len(u32::MAX, 256), 256);
+
+        // A short final request offers less than the 256-byte buffer holds.
+        assert_eq!(completion_copy_len(256, 7), 7);
+
+        // Zero is the caller's signal to error out rather than spin forever.
+        assert_eq!(completion_copy_len(0, 256), 0);
+    }
+
+    /// The three rings must not overlap: they are written by the device via DMA,
+    /// so an overlap is silent corruption of whichever ring lost the race.
+    #[test]
+    fn queue_layout_regions_are_disjoint_and_aligned() {
+        for queue_size in [1usize, 2, 4, 8, 16, 64, 256, 1024] {
+            let (desc, avail, used, total) = calc_queue_layout(queue_size);
+
+            let desc_size = 16 * queue_size;
+            let avail_size = 2 + 2 + 2 * queue_size + 2;
+            let used_size = 2 + 2 + 8 * queue_size + 2;
+
+            assert_eq!(desc, 0, "qs={queue_size}");
+            assert!(desc + desc_size <= avail, "desc overlaps avail, qs={queue_size}");
+            assert!(avail + avail_size <= used, "avail overlaps used, qs={queue_size}");
+            assert!(used + used_size <= total, "used ring runs past the allocation, qs={queue_size}");
+
+            // Virtio 1.x split-queue alignment: desc 16, avail 2, used 4. This
+            // layout over-aligns `used` to a page, which the comment in
+            // `calc_queue_layout` says is deliberate — pin it so a later
+            // "optimisation" to 4 bytes is a visible decision, not a silent one.
+            assert_eq!(desc % 16, 0, "qs={queue_size}");
+            assert_eq!(avail % 2, 0, "qs={queue_size}");
+            assert_eq!(used % PAGE_SIZE, 0, "used ring must stay page-aligned, qs={queue_size}");
+        }
+    }
+
+    /// The size actually used at runtime, called out separately: `new()` refuses
+    /// a device whose `max_size` is below it, so this is the only layout that
+    /// ships.
+    #[test]
+    fn queue_layout_at_the_shipping_queue_size() {
+        let (desc, avail, used, total) = calc_queue_layout(QUEUE_SIZE);
+        assert_eq!((desc, avail), (0, 32), "QUEUE_SIZE=2 → 2 descriptors of 16 bytes");
+        assert_eq!(used, PAGE_SIZE);
+        assert_eq!(total, PAGE_SIZE + 2 + 2 + 8 * QUEUE_SIZE + 2);
+        assert!(total <= 2 * PAGE_SIZE, "one queue must not need more than two pages");
+    }
 }

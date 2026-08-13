@@ -1,6 +1,6 @@
 #![allow(clippy::missing_safety_doc)]
 
-use spinning_top::Spinlock;
+use akuma_primitives::Registered;
 
 /// Kernel-provided callbacks for the networking crate.
 ///
@@ -49,19 +49,31 @@ pub struct NetRuntime {
 /// arm).
 pub use akuma_primitives::PreemptGuard;
 
-static RUNTIME: Spinlock<Option<NetRuntime>> = Spinlock::new(None);
+/// Was `Spinlock<Option<NetRuntime>>` until 2026-08-13 — a lock taken on
+/// **every** read of the callback table, on a crate whose own `NetRuntime` doc
+/// comment (above) records moving two fields out because the indirection "cost
+/// a spinlocked struct read on the per-packet DMA path". The other two crates
+/// with this exact shape (`akuma-exec`, `akuma-ext2`) were already lock-free;
+/// `Registered` is that mechanism, shared. Beyond the cost, a spinlock is
+/// unsafe here in principle: reading this table from an IRQ handler that
+/// interrupted the lock holder self-deadlocks on a single core.
+///
+/// Registration is single-shot now rather than last-writer-wins. That is not a
+/// behaviour change: the two `runtime::register` call sites in `lib.rs` are
+/// `#[cfg(feature = "smoltcp")]` and `#[cfg(not(...))]`, so exactly one is
+/// compiled, and it is called once from the kernel's boot path.
+static RUNTIME: Registered<NetRuntime> =
+    Registered::new("akuma-net: NetRuntime not registered — call akuma_net::init() first");
 
 /// Register the kernel runtime callbacks. Must be called before `init()`.
 pub fn register(rt: NetRuntime) {
-    *RUNTIME.lock() = Some(rt);
+    RUNTIME.register(rt);
 }
 
 /// Access the registered runtime. Panics if not yet registered.
 #[must_use]
 pub fn runtime() -> NetRuntime {
-    RUNTIME
-        .lock()
-        .expect("akuma-net: NetRuntime not registered — call akuma_net::init() first")
+    RUNTIME.require()
 }
 
 /// Best-effort runtime accessor that returns `None` if not yet registered.
@@ -69,5 +81,5 @@ pub fn runtime() -> NetRuntime {
 /// boot test code before `register()` has been called.
 #[must_use]
 pub fn try_runtime() -> Option<NetRuntime> {
-    *RUNTIME.lock()
+    RUNTIME.get()
 }

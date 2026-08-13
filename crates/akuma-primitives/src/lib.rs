@@ -53,4 +53,4 @@ pub use irq::{
     DAIF_I_MASKED, IrqGuard, irq_restore, irq_save_mask, mask_irqs_sync, read_daif, unmask_irqs,
     unmask_irqs_sync, with_irqs_disabled,
 };
-pub use once::OnceCopy;
+pub use once::{OnceCopy, Registered};

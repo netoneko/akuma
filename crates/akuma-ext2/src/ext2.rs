@@ -45,7 +45,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 use spinning_top::RwSpinlock;
 
-use akuma_primitives::OnceCopy;
+use akuma_primitives::Registered;
 use akuma_vfs::{DirEntry, Filesystem, FsError, FsStats, Metadata, path_components, split_path};
 use crate::BlockDevice;
 
@@ -351,16 +351,23 @@ struct ThreadHooks {
 /// Was a pair of `static mut Option<fn>` read without any synchronisation: on
 /// SMP that is a genuine data race (nothing ordered the boot core's write
 /// against a secondary core's read), and it made every use site `unsafe`.
-/// [`OnceCopy`] is the crate-wide answer to exactly this shape — a release store
-/// at init paired with an acquire load at every read — and, unlike a spinlock,
-/// it can never self-deadlock against a reader that interrupted the writer.
-static THREAD_HOOKS: OnceCopy<ThreadHooks> = OnceCopy::new();
+/// [`Registered`] is the tree-wide answer to exactly this shape — a release
+/// store at init paired with an acquire load at every read — and, unlike a
+/// spinlock, it can never self-deadlock against a reader that interrupted the
+/// writer.
+///
+/// This one keeps using [`Registered::get`] rather than `require()`: the ext2
+/// lock paths run during early boot before `init_thread_hooks`, and degrading
+/// (tid 0, "not dead") is correct there. That is the case the `get`/`require`
+/// split exists for.
+static THREAD_HOOKS: Registered<ThreadHooks> =
+    Registered::new("akuma-ext2: ThreadHooks not registered — call init_thread_hooks() first");
 
 /// Initialize the thread hooks. Called once by the kernel, before any
 /// filesystem operations. A second call is ignored.
 #[allow(dead_code)]
 pub fn init_thread_hooks(current_thread_id: fn() -> usize, is_thread_dead: fn(usize) -> bool) {
-    THREAD_HOOKS.set(ThreadHooks {
+    THREAD_HOOKS.register(ThreadHooks {
         current_thread_id,
         is_thread_dead,
     });

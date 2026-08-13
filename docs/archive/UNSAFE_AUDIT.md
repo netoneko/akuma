@@ -372,6 +372,26 @@ failure prints something useful.
 
 #### (e) The hand-rolled virtqueue in `src/rng.rs`
 
+> **STATUS 2026-08-13: both defects below are FIXED; this section is kept as the
+> analysis, not as open work.** The driver also moved — it is
+> `crates/akuma-virtio/src/rng.rs` now, not `src/rng.rs`.
+>
+> - **The length clamp** is `completion_copy_len(used_elem.len, to_read)`, which
+>   clamps to what the descriptor offered rather than to the caller's remaining
+>   space. There is also a guard the text below does not anticipate: a device
+>   completing with `len == 0` is an error, because otherwise `bytes_read` never
+>   advances and the outer loop reissues the same request forever.
+> - **The acquire barrier** is there: `VirtqAvail`/`VirtqUsed`'s
+>   `idx`/`flags`/`*_event` are `AtomicU16` and the poll loop does
+>   `idx.load(Ordering::Acquire)` — exactly the "fix, matching the library"
+>   proposed at the end of this section.
+>
+> Both were unverified by any test until 2026-08-13, when `completion_copy_len`
+> was split out as a pure function and pinned by
+> `completion_length_is_clamped_to_what_was_offered`. Until then
+> `akuma-virtio` had **zero** tests across ~1,470 lines — the only crate in the
+> workspace with none. See `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §6.2.
+
 There is exactly **one** hand-rolled virtqueue in the tree — `src/rng.rs`
 (`VirtqDesc`/`VirtqAvail`/`VirtqUsedElem`/`VirtqUsed` at lines 116-149, plus its
 own MMIO register block and transport handshake). Nothing else defines a queue

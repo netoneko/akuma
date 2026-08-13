@@ -73,6 +73,140 @@ impl<T: Copy> Default for OnceCopy<T> {
     }
 }
 
+/// A boot-registered callback table: [`OnceCopy`] plus the four operations
+/// every such table needs, and the diagnostic to panic with when it is read
+/// before the kernel registered it.
+///
+/// # Why this exists
+///
+/// Three crates had written the same thing, and they had not agreed:
+///
+/// | crate | was |
+/// |---|---|
+/// | `akuma-exec` | `OnceCopy<ExecRuntime>` + `OnceCopy<ExecConfig>`, four accessors |
+/// | `akuma-net` | **`Spinlock<Option<NetRuntime>>`**, three accessors |
+/// | `akuma-ext2` | `OnceCopy<ThreadHooks>`, hand-rolled `map_or` at each read |
+///
+/// The `akuma-net` copy was the expensive one: it took a spinlock on *every*
+/// read of the runtime table. Its own `NetRuntime` doc comment records that
+/// `virt_to_phys`/`phys_to_virt` were moved out of the struct because the
+/// indirection "cost a spinlocked struct read on the per-packet DMA path" —
+/// while the struct itself was still reached through exactly that. It is
+/// lock-free now, like the other two.
+///
+/// Beyond the cost, a spinlock is the *wrong* mechanism here for the reason
+/// [`OnceCopy`] spells out: a callback table read from an IRQ handler that
+/// interrupted the lock holder self-deadlocks on a single core.
+///
+/// # Registration is single-shot and idempotent
+///
+/// A second `register` is silently ignored (inherited from [`OnceCopy::set`]).
+/// Every in-tree registration happens exactly once, from the kernel's boot
+/// path. That property is also what lets **host unit tests inject a table
+/// unconditionally** from parallel test threads without ordering or races —
+/// see `akuma_exec::runtime::register_config_for_test`.
+pub struct Registered<T: Copy> {
+    cell: OnceCopy<T>,
+    /// Full panic message for [`Self::require`], e.g.
+    /// `"akuma-net: NetRuntime not registered — call akuma_net::init() first"`.
+    /// Stored whole rather than composed so each crate keeps its exact wording.
+    absent: &'static str,
+}
+
+impl<T: Copy> Registered<T> {
+    #[must_use]
+    pub const fn new(absent: &'static str) -> Self {
+        Self {
+            cell: OnceCopy::new(),
+            absent,
+        }
+    }
+
+    /// Publish the table. Call once, from the crate's `init`.
+    pub fn register(&self, v: T) {
+        self.cell.set(v);
+    }
+
+    /// The table, or `None` if the kernel has not registered it yet. For code
+    /// that can run before registration and wants to degrade rather than fail
+    /// — early diagnostics, boot-time instrumentation.
+    #[must_use]
+    pub fn get(&self) -> Option<T> {
+        self.cell.get()
+    }
+
+    /// The table, panicking with this cell's diagnostic if absent. The default
+    /// accessor: everything past `init` should use it, because a missing
+    /// callback table there is a boot-order bug, not a condition to handle.
+    #[must_use]
+    pub fn require(&self) -> T {
+        match self.cell.get() {
+            Some(v) => v,
+            None => panic!("{}", self.absent),
+        }
+    }
+
+    #[must_use]
+    pub fn is_registered(&self) -> bool {
+        self.cell.is_set()
+    }
+}
+
+#[cfg(test)]
+mod registered_tests {
+    use super::Registered;
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    struct Hooks {
+        tick: fn() -> u64,
+    }
+
+    fn forty_two() -> u64 {
+        42
+    }
+
+    #[test]
+    fn absent_until_registered_then_readable() {
+        static R: Registered<Hooks> = Registered::new("test: not registered");
+        assert!(!R.is_registered());
+        assert!(R.get().is_none());
+
+        R.register(Hooks { tick: forty_two });
+
+        assert!(R.is_registered());
+        assert_eq!((R.require().tick)(), 42);
+        assert_eq!((R.get().unwrap().tick)(), 42);
+    }
+
+    /// Single-shot: a second `register` is ignored, not last-writer-wins. This
+    /// is what makes it safe for parallel host tests to inject unconditionally,
+    /// and it is the semantic `akuma-net` changed to when it stopped using
+    /// `Spinlock<Option<_>>` — sound there because its two `register` sites are
+    /// mutually exclusive cfgs, called once from boot.
+    #[test]
+    fn registration_is_single_shot_and_idempotent() {
+        fn seven() -> u64 {
+            7
+        }
+        static R: Registered<Hooks> = Registered::new("test: not registered");
+
+        R.register(Hooks { tick: forty_two });
+        R.register(Hooks { tick: seven });
+
+        assert_eq!((R.require().tick)(), 42, "second register must not win");
+    }
+
+    /// `require()` panics with the cell's own diagnostic, so the message names
+    /// the crate and the init call the caller forgot.
+    #[test]
+    #[should_panic(expected = "akuma-test: Hooks not registered — call init() first")]
+    fn require_panics_with_the_registered_diagnostic() {
+        static R: Registered<Hooks> =
+            Registered::new("akuma-test: Hooks not registered — call init() first");
+        let _ = R.require();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::OnceCopy;

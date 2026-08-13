@@ -8,6 +8,8 @@
 /// `akuma_exec::runtime::OnceCopy` imports keep working.
 pub use akuma_primitives::OnceCopy;
 
+use akuma_primitives::Registered;
+
 /// Physical page frame (mirrors kernel pmm::PhysFrame).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhysFrame {
@@ -186,14 +188,17 @@ pub struct ExecConfig {
 // Lock-free single-shot cells: must be safe to read from IRQ context.
 // A spinlock here causes a self-deadlock if any IRQ handler (e.g. the
 // preemption watchdog) reads while EL1 code is mid-critical-section.
-static RUNTIME: OnceCopy<ExecRuntime> = OnceCopy::new();
-static CONFIG: OnceCopy<ExecConfig> = OnceCopy::new();
+// `Registered` is the shared form of that; see `akuma_primitives::once`.
+static RUNTIME: Registered<ExecRuntime> =
+    Registered::new("akuma-exec: ExecRuntime not registered — call akuma_exec::init() first");
+static CONFIG: Registered<ExecConfig> =
+    Registered::new("akuma-exec: ExecConfig not registered — call akuma_exec::init() first");
 
 /// Register the kernel runtime callbacks. Must be called exactly once,
 /// before any other crate function (including from IRQ handlers).
 pub fn register(rt: ExecRuntime, cfg: ExecConfig) {
-    RUNTIME.set(rt);
-    CONFIG.set(cfg);
+    RUNTIME.register(rt);
+    CONFIG.register(cfg);
     // Point the shared `safe_print!` at the same sink `runtime()` hands out, so
     // every crate's heap-free console output lights up at exactly this moment —
     // which is when it lit up before, back when each crate's own writer called
@@ -211,9 +216,7 @@ pub fn register(rt: ExecRuntime, cfg: ExecConfig) {
 /// Safe to call from IRQ context — never blocks.
 #[must_use]
 pub fn runtime() -> ExecRuntime {
-    RUNTIME
-        .get()
-        .expect("akuma-exec: ExecRuntime not registered — call akuma_exec::init() first")
+    RUNTIME.require()
 }
 
 /// Whether the runtime + config have been registered (non-panicking probe). Lets code
@@ -221,16 +224,14 @@ pub fn runtime() -> ExecRuntime {
 /// gracefully instead of panicking.
 #[must_use]
 pub fn is_registered() -> bool {
-    RUNTIME.get().is_some() && CONFIG.get().is_some()
+    RUNTIME.is_registered() && CONFIG.is_registered()
 }
 
 /// Access the registered config. Panics if not yet registered.
 /// Safe to call from IRQ context — never blocks.
 #[must_use]
 pub fn config() -> ExecConfig {
-    CONFIG
-        .get()
-        .expect("akuma-exec: ExecConfig not registered — call akuma_exec::init() first")
+    CONFIG.require()
 }
 
 /// Register **only** the config half, for host unit tests.
@@ -248,7 +249,7 @@ pub fn config() -> ExecConfig {
 /// [`ExecConfig::for_test`], so there is nothing to race over.
 #[cfg(test)]
 pub(crate) fn register_config_for_test() {
-    CONFIG.set(ExecConfig::for_test());
+    CONFIG.register(ExecConfig::for_test());
 }
 
 #[cfg(test)]
