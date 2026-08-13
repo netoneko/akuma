@@ -1046,6 +1046,112 @@ The remaining large untested files are genuinely hardware- or scheduler-bound
 to them piecewise: the untestable part is usually a thin shell around arithmetic
 that is not, and splitting the arithmetic out is cheap.
 
+## 5.11 The memory arithmetic wants a crate — and one test already proves it (raised 2026-08-13)
+
+**Raised as a question ("could all this memory arithmetic be moved to a separate
+crate?") while auditing the fork/CoW pile.** The answer is yes, and the argument
+does not rest on taste: **the tree already contains a test that tests a copy of
+the production logic instead of the production logic**, purely because the
+production copy is unreachable from the host.
+
+`src/process_tests.rs:11878`:
+
+```rust
+/// Helper mirroring the fork_process code_start selection logic.
+fn fork_code_start(code_end: usize) -> usize { … }
+```
+
+Four boot tests (`:11894`, `:11919`, `:11935`, `:11958`) exercise **that mirror**.
+The production selection is an inline expression written **twice** in
+`fork_process` — `process/mod.rs:2223` (CoW arm) and `:2403` (eager arm) — so the
+logic exists three times and the tests are attached to the copy that cannot ship.
+Those tests cannot fail when production drifts. They are the one kind of test that
+is worse than no test, and the cause is purely structural: the arithmetic has no
+host-reachable home, so the test grew its own.
+
+`pmm::user_readahead_budget` (`src/pmm.rs:1371`) is the same story from the other
+side. Its doc comment says outright:
+
+> Pure fn over the free count so the boundary is unit-testable without draining
+> real RAM.
+
+It was written to be unit-testable — and it lives in `src/`, the kernel binary, so
+it is only reachable from the boot suite. The intent is already correct; only the
+address is wrong.
+
+**What is actually pure** (no MMIO, no page tables, no globals beyond config):
+
+| today | where |
+|---|---|
+| `fork_page_count_for_len` | `akuma-exec` `process/mod.rs:118` (already in a crate ✓) |
+| `code_start` selection | inline ×2 in `fork_process` + a mirror in the test file |
+| `user_readahead_budget` / `user_alloc_would_starve` | `src/pmm.rs:1371` |
+| `poison_word` / `poison_word_frame` | `src/pmm.rs:772`, `:840` — the XOR identity codec |
+| `is_shareable_mapping` | `src/file_page_cache.rs:112` |
+| `MAX_FORK_BRK_COPY_PAGES` / `MAX_FORK_MMAP_PAGES` / `MAX_FORK_LAZY_PAGES` cap ordering | scattered consts in `process/mod.rs` |
+| page/VA masking (`& !0xFFF`), region-end and straddle predicates | open-coded at ~30 fault sites |
+| the CoW refcount *rules* (one ref per address space vs one per mapping) | prose in three comments; §3 of [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) |
+
+**Does it need a stub? Mostly no** — which is the good news, and it also answers
+the follow-up question directly. Everything in the first six rows is integer
+arithmetic over values passed in as arguments; it needs no stub, no fake MMU and
+no fake PMM, just `#[test]`. Only two things need injection, and both have
+precedent from §6.1: the reserve/RAM-window readers (`ram_base`, `ram_end`,
+`kernel_va_end`, `USER_PAGE_RESERVE`), which take a value from config — inject
+with `register_config_for_test()`, do **not** add a production branch that
+tolerates an unregistered config. Anything that must *observe* a real page table
+(`translate_user_va`, `collect_mapped_pages_*`) is the part that stays where it
+is; it is a thin shell over the arithmetic, which is exactly §5.9's point.
+
+Do **not** make this a new crate on day one. `akuma-primitives` already exists as
+the dependency-free leaf and already holds `addr.rs` (`phys_to_virt`) — the same
+category. The first move is to give the `code_start` selection one named home,
+point both fork arms at it, delete the test's mirror, and let the four existing
+tests become host tests. That is a ~20-line change that converts four
+can't-fail boot tests into four real host tests, and it settles whether the leaf
+crate is the right home before anything larger is moved.
+
+## 5.10 Open audit: `#[inline]` across the crate boundary (raised 2026-08-13)
+
+**Not yet done — deferred by request.** Flagged on the grounds that inline
+attributes have been applied ad hoc as code moved out of `src/` into `crates/`,
+and nobody has ever swept them. First measurements, which say the concern is
+real and not stylistic:
+
+| | `src/` | `crates/` |
+|---|---:|---:|
+| `#[inline]` | 64 | 93 |
+| `#[inline(always)]` | 2 | 33 |
+| `#[inline(never)]` | 0 | 2 |
+
+**The load-bearing fact: `[profile.release]` sets no `lto`** (`Cargo.toml:73` —
+only `extreme-size` turns it on, `:85`). So on *the* build target, a call from
+`src/` into `crates/akuma-*` crosses a codegen-unit boundary and is inlined only
+if the callee carries an attribute. In `crates/` just **75 of 756 `pub fn`** do
+(~10%) — and the hot paths now live there: `mmu`, the fault helpers, the Phase 7e
+`with_process`/`shared` accessors that replaced ~250 direct field reads with
+function calls, and `akuma-primitives`' leaf helpers (`current_tid`,
+`with_irqs_disabled`), which are one-liners whose call overhead can exceed their
+bodies.
+
+The audit therefore has two directions, and both matter:
+
+1. **Missing.** Small cross-crate `pub fn`s on fault, syscall-entry and
+   scheduler paths with no attribute — these genuinely do not inline in
+   `--release`. The Phase 7e accessor migration is the prime suspect, because it
+   converted field access into cross-crate calls wholesale.
+2. **Spurious.** 33 `#[inline(always)]` in `crates/` is a lot for a kernel that
+   also ships an `opt-level = "z"` profile, where forced inlining fights the size
+   floor that acceptance 05 gates on (4.0 MB). Some of these were almost
+   certainly cargo-culted from the site next door.
+
+Do not judge this one on attribute counts either way. The metric is (a) IMAGE
+size on `extreme-size` and (b) a microbenchmark on a path that actually crosses
+the boundary — per `PSTATS_TIMING_PREEMPTION_ARTIFACT`, not PSTATS. Worth pairing
+with the question of whether `[profile.release]` should set `lto = "thin"` at
+all, which would make most of direction 1 moot and is a smaller change than
+annotating 700 functions.
+
 ## 6. What CPD cannot see
 
 Two worked examples, both real, both missed:
@@ -1278,13 +1384,15 @@ ELF-loading path into one.
 | 2 | ~~`channel.rs` stdout/stdin FIFO → one helper~~ **DONE 2026-08-13** — five shared bodies, 13 methods collapsed onto them, plus 7 host tests the file never had; the survey named the wrong pair (see §6) | 0 left | — | — |
 | 3 | ~~`akuma-isolation`/`akuma-vfs` `mount.rs` → shared half into `akuma-vfs`~~ **DONE 2026-08-13** — one `MountSet<const MAX>`, both names as type aliases, −145 code lines across 4 files; the bin crate's third path normaliser went with it (§4) | 0 left | — | — |
 | 4 | ~~The `X`/`X_from_path` **quartet**~~ **DONE 2026-08-13** — `elf/mod.rs` ×3 in Phase 2a (−151 code lines, 12 clone blocks → 0), `process/mod.rs` + `process/image.rs` in Phase 2b (−105 code lines, the pairs' 60- and 47-line clone blocks → absent) | 0 left | — | — |
-| 5 | `exceptions.rs` duplicated `Drop` impls (`:3703` / `:4315`) | ~142 | medium | **high** — exception path |
+| 5 | `exceptions.rs` duplicated `Drop` impls — **misdescribed on both counts, see [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §7**: there are **three** guards (`:3511`, `:3716`, `:4348`), their `Drop` bodies are byte-identical and 6 lines each, so the guard merge is ~24 lines. The `~142` was measuring the **demand-paging bodies** the guards sit at the top of (DA `:3708-4086` vs IA `:4337-4659`, ~330 lines) — a separate, genuinely high-risk merge with two *behavioural* divergences (§6 there) | ~24 + ~330 | small / large | low / **high** |
 | 6 | `box_mod` `access.rs` / `hierarchy.rs` — **misdescribed, see §4**: the two *functions* share nothing; the byte-identical thing is `make_test_registry()` in both test modules. Folds into item 9 | ~60 (tests) | small | low |
 | 7 | ~~`rump_proxy.rs` / `akuma-rump` `sysproxy.rs`~~ **DONE 2026-08-13** — 3 impls → 1 `pub NoMem` with `faulting()`/`discarding()`; there was no home to settle (§4). Also closes Phase 4's `ClientMem`/`NoMem` row | 0 left | — | — |
 | 8 | `mmu/mod.rs` `map_user_page` / `_no_flush` and the three walk clones | ~80 | medium | **high** — see `UNSAFE_AUDIT.md` §5.1 |
 | 9 | Test-file clones (`tests.rs`, `process_tests.rs`) | ~669 | medium | low |
 | 12 | ~~Runtime-registration machinery (§5.8)~~ **DONE 2026-08-13** — one `akuma_primitives::Registered<T>`; 3 definitions → 1 and **21 spinlock acquisitions removed** from `akuma-net`'s poll/socket paths. Line count a wash; judge it on the locks | 0 left | — | — |
 | 11 | **Errno spellings (§5.7)** — three tables (17 names defined twice, in two representations) + 109 raw negative literals. Run with the Phase 5 syscall sweep | ~130 sites | medium | low |
+| 13 | **`#[inline]` audit (§5.10)** — deferred by request 2026-08-13. Both directions: missing attrs on cross-crate hot paths (`[profile.release]` sets no `lto`), and 33 `#[inline(always)]` fighting the `extreme-size` floor. Judge on IMAGE size + a microbenchmark, not counts | ~700 fns surveyed | medium | low |
+| 14 | **The fork/CoW pile ([`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md))** — 4 copies of a 45-field `Process` literal, a ~40-line child-publish tail written 3×, 4 disagreeing CoW-break paths. Merge plan in §8 there, cheapest first; items 5–7 of it are defect work, not refactors | −250 mergeable | medium | mixed |
 | 10 | Trait-impl clusters (§5.5): `ClientMem`/`NoMem` across crates, duplicate `IrqGuard`, BKL guard family → one generic guard, `impl_display!` macro, duplicate `MultiPollFuture`. **In progress — `akuma-primitives` rungs 1–2 done (§5.555); the `~180` is the wrong metric, see there** | ~180 | small–medium | low |
 
 Items 1–3 are ~190 lines for an afternoon, and item 1 is the same work as
@@ -1772,12 +1880,31 @@ merge — the two named functions share nothing, and CPD's 60 lines are the
 byte-identical `make_test_registry()` in both test modules (§4). It folds into
 item 9 and drops in priority accordingly.
 
+**DONE 2026-08-13:** the `exceptions.rs` fault guards (§8 item 5) — three
+byte-identical guards (`CowFaultGuard`, `DaFaultGuard`, `FaultGuard`) and their
+three identical `log_fault_reclaim` + `fault_slot_acquire` preambles collapsed
+onto one `FaultSlotGuard` + `fault_slot_hold(pid, as_owner, page_va)`, which
+acquires, traces and guards in one call (a guard travels with its operation — no
+bare release helper was published on the `src/` side). Behaviour-preserving:
+same acquire, same holder-gated release, same order. The merge also fixed the
+field named `pid` that all three assigned `as_owner` to, and moved the release
+contract to one place. `FaultSlot::reclaim_report()` split the "which outcomes
+print" decision into `akuma-exec` with **4 new host tests** (463 → 467), leaving
+the `safe_print!` effect on the fault path. Verified: 4 clippy configs clean,
+467/0 host tests, boot suite at SMP=1 **and** SMP=4 with the failure set
+unchanged, and `cowstale` (`reader_faults=0 failures=0`), `bssfork`
+(`failures=0`) and `forkprobe` (`ALL PASS`) green at SMP=4. What the survey got
+wrong about this item — three guards not two, ~24 lines not ~142 — is in
+[`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §7, along with two smaller latent
+findings the merge surfaced but did not touch.
+
 **Still open, in the order they are worth doing:**
 
 | Item | Notes |
 |---|---|
 | `src/console.rs` `print_dec` / `print_u64` | a genuine 21-line / 82-token **Type-1** clone differing only in `usize` vs `u64`; CPD has always reported it. Found during the `akuma-primitives` work, unrelated to it |
-| `exceptions.rs`'s duplicated `Drop` impls (§8 item 5, ~142 lines) | **high risk — exception path.** Do last, and read `UNSAFE_AUDIT.md` §5.1 first |
+| `exceptions.rs`'s duplicated `Drop` impls (§8 item 5) | **Reclassified 2026-08-13** — see [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §7. Three guards, not two; the merge is ~24 lines, not 142, and is *low* risk (the three `Drop` bodies are byte-identical). The ~142 was measuring the DA/IA demand-paging bodies, which stay open as a separate high-risk item with two behavioural divergences to decide first |
+| The fork/CoW pile (§8 items 13–14) | Audited 2026-08-13 while doing item 5, because item 5's neighbours are these paths. Three defect candidates found, incl. **`cow_fault_lock` provides no mutual exclusion at all**. Merge plan in that doc's §8 |
 
 ### Phase 7 — `#[repr(C)]` `Statx` + `SigFrame`
 
@@ -1789,6 +1916,9 @@ SAFETY comments (11% coverage today), `clippy::undocumented_unsafe_blocks`
 starting on the clean crates and ratcheting inward, `missing_safety_doc` allows
 removed, and the CPD CI gate (§9) — at **50 tokens for the fault/CoW paths**,
 per §5.6.
+
+The `#[inline]` audit (§5.10) belongs here too, but only after the `lto = "thin"`
+question is settled — deciding that first may delete most of the work.
 
 ### Promoted out of "deferred"
 

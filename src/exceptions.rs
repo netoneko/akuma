@@ -706,25 +706,73 @@ pub const TEST_SIGFRAME_FPSIMD: usize = SIGFRAME_FPSIMD;
 #[cfg(kernel_tests)]
 pub const TEST_SIGFRAME_UC_SIGMASK: usize = SIGFRAME_UCONTEXT + 40;
 
-/// True if `far` is in the kernel identity-RAM VA window (normally UXN for EL0 execute).
 /// Log when a per-page demand-paging slot had to be reclaimed from a previous
-/// holder. A `ReclaimedDead` is the smoking gun for the build-script deadlock
+/// holder. A `Dead` cause is the smoking gun for the build-script deadlock
 /// (a thread died mid-fault, e.g. an orphaned rustc probe child, leaving the
-/// slot poisoned); `ReclaimedWedged` means the bounded fallback fired. The
-/// common `Acquired`/`NoProc` paths print nothing (hot path).
+/// slot poisoned); `Wedged` means the bounded fallback fired. The
+/// common `Acquired`/`NoProc` paths print nothing (hot path) — which arm is
+/// silent is decided by `FaultSlot::reclaim_report`, host-tested in `akuma-exec`.
 #[inline]
 fn log_fault_reclaim(pid: u32, page_va: usize, slot: akuma_exec::process::FaultSlot) {
-    match slot {
-        akuma_exec::process::FaultSlot::ReclaimedDead(holder) => crate::safe_print!(192,
+    use akuma_exec::process::ReclaimCause;
+    match slot.reclaim_report() {
+        Some((ReclaimCause::Dead, holder)) => crate::safe_print!(192,
             "[FAULT-RECLAIM] pid={} tid={} page={:#x}: holder tid={} DIED mid-fault — slot reclaimed\n",
             pid, akuma_exec::threading::current_thread_id(), page_va, holder),
-        akuma_exec::process::FaultSlot::ReclaimedWedged(holder) => crate::safe_print!(192,
+        Some((ReclaimCause::Wedged, holder)) => crate::safe_print!(192,
             "[FAULT-RECLAIM] pid={} page={:#x}: holder tid={} WEDGED past spin bound — slot reclaimed\n",
             pid, page_va, holder),
-        _ => {}
+        None => {}
     }
 }
 
+/// RAII holder for the per-page demand-paging serialization slot.
+///
+/// Constructed only by [`fault_slot_hold`]: the acquire and the release travel
+/// together, so there is deliberately no way to build one of these without
+/// acquiring the slot first (`fault_slot_release` is `akuma-exec`'s and stays
+/// there — this side publishes no bare "release the slot" helper).
+///
+/// The `Drop` releases on **all** exit paths from a fault block, including the
+/// early `return unsafe { (*frame).x0 }` successes and fall-through to SIGSEGV.
+/// Release is holder-gated inside `fault_slot_release` — a sibling that reclaimed
+/// the slot from us keeps it — which is also why running it after a `NoProc`
+/// acquire is a no-op rather than a breach of the pairing contract.
+struct FaultSlotGuard {
+    /// The **address-space owner** pid the slot was acquired under, never the
+    /// faulting thread's own pid: `CLONE_VM` siblings serialize on the
+    /// thread-group leader's one `fault_mutex`. (All three predecessors of this
+    /// guard named this field `pid` and assigned `as_owner` to it.)
+    as_owner: u32,
+    page_va: usize,
+}
+
+impl Drop for FaultSlotGuard {
+    fn drop(&mut self) {
+        akuma_exec::process::fault_slot_release(self.as_owner, self.page_va);
+    }
+}
+
+/// Acquire the per-page fault slot for `page_va` under `as_owner`, trace it if it
+/// had to be reclaimed, and hand back the guard that releases it.
+///
+/// `pid` is the faulting process id and is used **only** for the reclaim trace;
+/// the serialization itself is always keyed on `as_owner`.
+///
+/// This replaced three byte-identical guards (`CowFaultGuard`, `DaFaultGuard`,
+/// `FaultGuard`) in the EL0 CoW, data-abort and instruction-abort arms; the
+/// call-site comments say what each one is serializing against.
+#[must_use = "the fault slot is released when the guard drops — discarding it \
+              immediately un-serializes the page"]
+#[inline]
+fn fault_slot_hold(pid: u32, as_owner: u32, page_va: usize) -> FaultSlotGuard {
+    log_fault_reclaim(pid, page_va,
+        akuma_exec::process::fault_slot_acquire(as_owner, page_va));
+    FaultSlotGuard { as_owner, page_va }
+}
+
+/// True if `far` is in the kernel identity-RAM VA window (normally UXN for EL0 execute).
+///
 /// Used when deciding whether an EL0 instruction abort might be “stale translation” vs
 /// a deliberate fault from jumping into kernel RAM.
 #[inline]
@@ -3506,15 +3554,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     // when multiple CLONE_VM threads fault on the same page.
                     // Holder-tracked so a sibling can reclaim the slot if the
                     // holder died mid-fault (see fault_slot_acquire).
-                    log_fault_reclaim(pid, page_va,
-                        akuma_exec::process::fault_slot_acquire(as_owner, page_va));
-                    struct CowFaultGuard { pid: u32, page_va: usize }
-                    impl Drop for CowFaultGuard {
-                        fn drop(&mut self) {
-                            akuma_exec::process::fault_slot_release(self.pid, self.page_va);
-                        }
-                    }
-                    let _cow_fault_guard = CowFaultGuard { pid: as_owner, page_va };
+                    let _cow_fault_guard = fault_slot_hold(pid, as_owner, page_va);
 
                     // Allocate the CoW destination BEFORE taking `as_lock` — alloc must
                     // stay outside the hold (the PMM OOM/reclaim path can re-enter
@@ -3711,15 +3751,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     // multiple CLONE_VM threads fault on the same page.
                     // Holder-tracked so a sibling can reclaim the slot if the
                     // holder died mid-fault (see fault_slot_acquire).
-                    log_fault_reclaim(pid, page_va,
-                        akuma_exec::process::fault_slot_acquire(as_owner, page_va));
-                    struct DaFaultGuard { pid: u32, page_va: usize }
-                    impl Drop for DaFaultGuard {
-                        fn drop(&mut self) {
-                            akuma_exec::process::fault_slot_release(self.pid, self.page_va);
-                        }
-                    }
-                    let _da_fault_guard = DaFaultGuard { pid: as_owner, page_va };
+                    let _da_fault_guard = fault_slot_hold(pid, as_owner, page_va);
 
                     let map_flags = match source {
                         akuma_exec::process::LazySource::File { .. } => {
@@ -4339,19 +4371,10 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     // Serialize page fault handling for this process so concurrent
                     // instruction faults on the same page yield until we are done
                     // mapping. Holder-tracked so a sibling can reclaim the slot if
-                    // the holder died mid-fault (see fault_slot_acquire).
-                    log_fault_reclaim(pid, page_va,
-                        akuma_exec::process::fault_slot_acquire(as_owner, page_va));
-
-                    // RAII guard: release the slot on ALL exit paths from this
-                    // block, including early returns and fall-through.
-                    struct FaultGuard { pid: u32, page_va: usize }
-                    impl Drop for FaultGuard {
-                        fn drop(&mut self) {
-                            akuma_exec::process::fault_slot_release(self.pid, self.page_va);
-                        }
-                    }
-                    let _fault_guard = FaultGuard { pid: as_owner, page_va };
+                    // the holder died mid-fault (see fault_slot_acquire). The guard
+                    // releases on ALL exit paths from this block, including the
+                    // early returns and fall-through to SIGSEGV.
+                    let _fault_guard = fault_slot_hold(pid, as_owner, page_va);
 
                     let map_flags = match source {
                         akuma_exec::process::LazySource::File { .. } => {

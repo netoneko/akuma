@@ -477,6 +477,39 @@ pub enum FaultSlot {
     ReclaimedWedged(usize),
 }
 
+/// Why a [`FaultSlot`] acquisition had to take the slot away from its recorded
+/// holder. Carried out of [`FaultSlot::reclaim_report`] so the caller can pick a
+/// message without re-matching the enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimCause {
+    /// The holder thread had already died without releasing — the root-cause
+    /// poison recovery, and the smoking gun for a build-script deadlock.
+    Dead,
+    /// The holder neither released nor visibly died within
+    /// [`FAULT_SLOT_SPIN_BOUND`]; the bounded fallback fired.
+    Wedged,
+}
+
+impl FaultSlot {
+    /// The decision behind the reclaim trace: `Some((cause, holder_tid))` for the
+    /// two reclaim outcomes, `None` for the hot `Acquired` / `NoProc` paths that
+    /// must print nothing.
+    ///
+    /// Split out from the caller's `safe_print!` so the *decision* is
+    /// host-testable while the *effect* stays on the fault path — the same shape
+    /// as `trace_snippet` in `process/channel.rs`. Callers must keep the silent
+    /// arm silent: this runs on every demand-paging fault, and a print here is a
+    /// console write per page.
+    #[must_use]
+    pub fn reclaim_report(&self) -> Option<(ReclaimCause, usize)> {
+        match *self {
+            FaultSlot::ReclaimedDead(holder) => Some((ReclaimCause::Dead, holder)),
+            FaultSlot::ReclaimedWedged(holder) => Some((ReclaimCause::Wedged, holder)),
+            FaultSlot::NoProc | FaultSlot::Acquired => None,
+        }
+    }
+}
+
 /// Spin bound before [`fault_slot_acquire`] force-reclaims a slot. Generous: any
 /// legitimate concurrent demand-paging of the same page completes in well under
 /// this many cooperative yields; reaching it means the holder is wedged.
@@ -1926,6 +1959,60 @@ mod mmap_region_inheritance_tests {
         assert_eq!(total_pages(&r), 2);
     }
 
+}
+
+#[cfg(test)]
+mod fault_slot_tests {
+    //! Host unit tests for [`FaultSlot::reclaim_report`] — the pure half of the
+    //! per-page demand-paging slot's observability. `fault_slot_acquire` itself
+    //! needs a live thread slot and a registered process, so it stays in the boot
+    //! suite (`src/process_tests.rs`); the classification does not.
+    use super::*;
+
+    /// The hot outcomes must stay silent: this runs on every demand-paging fault,
+    /// so a `Some` here is a console write per page.
+    #[test]
+    fn acquired_and_noproc_report_nothing() {
+        assert_eq!(FaultSlot::Acquired.reclaim_report(), None);
+        assert_eq!(FaultSlot::NoProc.reclaim_report(), None);
+    }
+
+    /// Both reclaim outcomes report, and each carries the *stale holder's* tid —
+    /// not the reclaiming thread's. That tid is the whole diagnostic value: it
+    /// names the thread that died or wedged mid-fault.
+    #[test]
+    fn both_reclaims_report_their_stale_holder() {
+        assert_eq!(
+            FaultSlot::ReclaimedDead(41).reclaim_report(),
+            Some((ReclaimCause::Dead, 41))
+        );
+        assert_eq!(
+            FaultSlot::ReclaimedWedged(42).reclaim_report(),
+            Some((ReclaimCause::Wedged, 42))
+        );
+    }
+
+    /// The two reclaim causes must stay distinguishable: `Dead` is the expected
+    /// recovery from a thread that died mid-fault, `Wedged` means the bounded
+    /// fallback fired and "should be vanishingly rare" — collapsing them would
+    /// hide the second behind the first in the logs.
+    #[test]
+    fn dead_and_wedged_are_distinct_causes() {
+        let dead = FaultSlot::ReclaimedDead(7).reclaim_report();
+        let wedged = FaultSlot::ReclaimedWedged(7).reclaim_report();
+        assert_ne!(dead, wedged);
+    }
+
+    /// Holder tid 0 is a legal thread slot, so it must not be confused with "no
+    /// reclaim" — an `Option<(_, usize)>` keyed on the tid being non-zero would
+    /// silently drop the reclaim of slot 0.
+    #[test]
+    fn holder_tid_zero_still_reports() {
+        assert_eq!(
+            FaultSlot::ReclaimedDead(0).reclaim_report(),
+            Some((ReclaimCause::Dead, 0))
+        );
+    }
 }
 
 #[cfg(test)]

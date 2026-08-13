@@ -54,7 +54,12 @@ cargo test --target "$HOST" 2>&1 \
   | paste -sd+ - | bc
 ```
 
-> **Baseline as of 2026-08-13: 455** (akuma-exec 210, ext2 52, isolation 43,
+> **Baseline as of 2026-08-13: 467** — was 455 when this runbook was written,
+> then 463 before the Phase 6 item 5 guard merge and 467 after it (+4 for
+> `FaultSlot::reclaim_report`). Re-measure rather than trusting this line; it has
+> gone stale twice already. Original composition below.
+>
+> **Superseded: 455** (akuma-exec 210, ext2 52, isolation 43,
 > net 25, primitives 28, rump 37, terminal 21, vfs 39). Do not sum these by
 > hand with `awk -F'[ ;]' '{s+=$4}'` — the consecutive separators shift fields
 > and it silently under-counts. That mis-measurement happened twice while
@@ -110,6 +115,18 @@ grep -aoE '\[FAIL\] [a-z_0-9]+' /tmp/mine.log | sort -u  # expect exactly one li
 `retired_reclaim_ab`** — that one fails on an unmodified tree (threshold too
 tight, `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §8.5 Phase 0).
 
+> **`retired_reclaim_ab` flips run to run — so `94` is really `94 or 95`.**
+> Measured at SMP=4 on 2026-08-13, five boots: the working tree scored
+> 94/95/94 (failure set `{retired_reclaim_ab}`, then **empty**, then
+> `{retired_reclaim_ab}`) and an unmodified `git worktree` at the same commit
+> scored 95 with an **empty** failure set. Both trees produce both outcomes, so
+> a 95-with-no-failures run is not evidence of a fix and a 94 run is not evidence
+> of a regression. Treat `{}` and `{retired_reclaim_ab}` as the same result, and
+> only investigate a failure set containing anything *else*. `main` (b585aed) at
+> SMP=4 scored 93 + `{retired_reclaim_ab}`, so the PASS total also moves with the
+> branch — compare sets, and compare against a worktree at *your* parent commit,
+> never against this number.
+
 Compare failure **sets**, never counts:
 
 ```bash
@@ -161,6 +178,7 @@ Memory / fork / CoW binaries already on `disk.img` — all self-reporting:
 | `forkprobe` | `forkprobe: ALL PASS` |
 | `stackstress` | `stackstress: PASSED after …` |
 | `bssfork` | `failures=0` … `bssfork PASS` |
+| `bssfork spread=1` | **BROKEN PRE-EXISTING — not usable as a control.** Measured 2026-08-13 at SMP=4: fails on `main` (b585aed) with `failures=7`, `thread=7 [never ran] ticks=0`, and fails *worse* on `trim-some-more-fat` (1a5a266) with `failures=8 ticks=0` — no thread runs at all. Reproduced on an unmodified `git worktree` of each. Plain `bssfork` (spread=0) PASSes on both and is the control to use. The 8/8-vs-7/8 gap between main and the branch is an unexplained regression in its own right |
 | `cowstale` | `reader_faults=0 failures=0` … `cowstale PASS` |
 | `mmapsum <path>` | three digests (`madv:`/`mtA:`/`mtB:`); **needs a path argument** |
 | `forktest_parent -duration=20s` | `All children processed via epoll. Parent exiting.` |
