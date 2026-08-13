@@ -345,12 +345,14 @@ def tier4_redis_memtest(results, memory, logdir, build):
 
         # devbox.img fills across sessions and ENOSPC surfaces as an `apk add` network
         # error, so record the free space rather than discovering it the hard way.
-        # Pick the row with the usage percentage, not `tail -1`: busybox wraps long
-        # device names onto a second line, so which line is last is not stable (a
-        # `tail -1` here reported the HEADER once).
+        # Pick the row carrying an actual NN% field, not `tail -1` and not merely a
+        # line containing "%": busybox wraps long device names onto a second line so
+        # the last line is not stably the data row, and the header's own "Use%" matches
+        # a bare "%" test — which is how `tail -1` reported the HEADER once here.
         _, df = ssh(port, "busybox df -h /")
-        row = next((l for l in reversed(df.splitlines()) if "%" in l), "")
-        results["redis.disk"] = " ".join(row.split()[-4:]) if row else "(unknown)"
+        row = next((l for l in reversed(df.splitlines())
+                    if any(re.fullmatch(r"\d+%", t) for t in l.split())), "")
+        results["redis.disk"] = " ".join(row.split()[-4:]) if row else "(unknown — df gave no data row)"
 
         if ssh(port, "command -v redis-server")[0] != 0:
             rc, out = ssh(port, "apk add redis", timeout=600)
