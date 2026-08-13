@@ -12,12 +12,10 @@
 use crate::syscall::pipe;
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 use akuma_exec::{process, threading};
-use akuma_rump::sysproxy::{Client, ClientMem, PipeIo, PipeTransport, MAX_TRANSFER};
+use akuma_rump::sysproxy::{Client, ClientMem, NoMem, PipeIo, PipeTransport, MAX_TRANSFER};
 use akuma_rump::syscall_translation as translation;
 use alloc::vec::Vec;
 
-/// EFAULT (NetBSD/Linux share it).
-const EFAULT: i32 = 14;
 /// Cap a single blocking read so a wedged server fails the request instead of
 /// hanging the boot before herd/SSH come up.
 const READ_TIMEOUT_US: u64 = 8_000_000;
@@ -483,7 +481,7 @@ fn proxy_socket(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
     let Some(proxy) = ensure_box_proxy(box_id) else {
         return neg_linux_errno(LINUX_ENOMEM); // server didn't come up
     };
-    let mut mem = NoMem;
+    let mut mem = NoMem::faulting();
     let res = proxy.with_client(|c| {
         let a = translation::pack_args(&[2, base_type, proto]);
         c.syscall(translation::netbsd_sysno(translation::Op::Socket), &a, &mut mem)
@@ -563,7 +561,7 @@ fn proxy_close(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
     let Some(proxy) = ensure_box_proxy(box_id) else {
         return 0; // server gone; fd already dropped locally
     };
-    let mut mem = NoMem;
+    let mut mem = NoMem::faulting();
     let res = proxy.with_client(|c| {
         let a = translation::pack_args(&[rump_fd as u64]);
         c.syscall(translation::netbsd_sysno(translation::Op::Close), &a, &mut mem)
@@ -805,7 +803,7 @@ fn set_rump_sock_nodelay(proxy: &Arc<BoxProxy>, rump_fd: i32) {
 /// normal blocking-stream semantics.
 fn set_rump_sock_nonblock(proxy: &Arc<BoxProxy>, rump_fd: i32, nonblock: bool) {
     let flag = if nonblock { NETBSD_O_NONBLOCK } else { 0 };
-    let mut mem = NoMem;
+    let mut mem = NoMem::faulting();
     let _ = proxy.with_client(|c| {
         let a = translation::pack_args(&[rump_fd as u64, NETBSD_F_SETFL, flag]);
         c.syscall(NETBSD_FCNTL, &a, &mut mem)
@@ -859,7 +857,7 @@ fn proxy_listen(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    let mut mem = NoMem;
+    let mut mem = NoMem::faulting();
     let res = proxy.with_client(|c| {
         let a = translation::pack_args(&[rump_fd as u64, args[1]]);
         c.syscall(translation::netbsd_sysno(translation::Op::Listen), &a, &mut mem)
@@ -1305,24 +1303,6 @@ fn proxy_recvmsg(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
     }
 }
 
-/// A [`ClientMem`] that discards copyout and faults copyin — for syscalls whose
-/// result we don't keep (the [`rump_socket_readable`] MSG_PEEK probe).
-struct DiscardMem;
-impl ClientMem for DiscardMem {
-    fn copyin(&mut self, _a: u64, _l: usize, _o: &mut Vec<u8>) -> Result<(), i32> {
-        Err(14)
-    }
-    fn copyinstr(&mut self, _a: u64, _m: usize, _o: &mut Vec<u8>) -> Result<(), i32> {
-        Err(14)
-    }
-    fn copyout(&mut self, _a: u64, _d: &[u8]) -> Result<(), i32> {
-        Ok(()) // discard the peeked byte
-    }
-    fn anonmmap(&mut self, _l: usize) -> u64 {
-        0
-    }
-}
-
 /// Is the calling box's rump socket `rump_fd` readable right now? Forwards a
 /// non-blocking `recvfrom(rump_fd, _, 1, MSG_PEEK|MSG_DONTWAIT)` to the rump
 /// server (NetBSD flag values). `n > 0` ⇒ data waiting (POLLIN). This is how
@@ -1339,10 +1319,10 @@ pub fn rump_socket_readable(rump_fd: i32) -> bool {
     let Some(proxy) = ensure_box_proxy(box_id) else {
         return false;
     };
-    // The server copyout's the peeked byte to this addr; DiscardMem drops it, so
-    // any addr works (1-byte peek).
+    // The server copyout's the peeked byte to this addr; `NoMem::discarding`
+    // drops it, so any addr works (1-byte peek).
     let scratch_addr: u64 = 0x1000;
-    let mut mem = DiscardMem;
+    let mut mem = NoMem::discarding();
     let res = proxy.with_client(|c| {
         let a = translation::pack_args(&[
             rump_fd as u64,
@@ -1396,25 +1376,6 @@ impl PipeIo for KernelPipeIo {
     }
     fn now_us(&mut self) -> u64 {
         crate::timer::uptime_us()
-    }
-}
-
-/// A no-op [`ClientMem`] for syscalls with no pointer args (e.g. `socket()`).
-/// The real per-box accessor over the calling process's user VA arrives with the
-/// interception wiring.
-struct NoMem;
-impl ClientMem for NoMem {
-    fn copyin(&mut self, _a: u64, _l: usize, _o: &mut Vec<u8>) -> Result<(), i32> {
-        Err(EFAULT)
-    }
-    fn copyinstr(&mut self, _a: u64, _m: usize, _o: &mut Vec<u8>) -> Result<(), i32> {
-        Err(EFAULT)
-    }
-    fn copyout(&mut self, _a: u64, _d: &[u8]) -> Result<(), i32> {
-        Err(EFAULT)
-    }
-    fn anonmmap(&mut self, _l: usize) -> u64 {
-        0
     }
 }
 
@@ -1552,7 +1513,7 @@ fn drive_socket(px: u32, py: u32) -> Result<i64, alloc::string::String> {
 
     // rump_sys_socket(AF_INET=2, SOCK_STREAM=1, 0) — no pointer args, no copyin.
     let args = translation::pack_args(&[2, 1, 0]);
-    let mut mem = NoMem;
+    let mut mem = NoMem::faulting();
     let fd = match client.syscall(translation::netbsd_sysno(translation::Op::Socket), &args, &mut mem) {
         Ok([fd, _]) if fd >= 0 => fd,
         Ok([fd, _]) => return Err(format!("socket returned {fd}")),
@@ -1593,7 +1554,7 @@ fn drive_listen_accept(
         .syscall(translation::netbsd_sysno(translation::Op::Bind), &a, &mut mem)
         .map_err(|e| format!("bind errno {e}"))?;
 
-    let mut nomem = NoMem;
+    let mut nomem = NoMem::faulting();
     let a = translation::pack_args(&[fd as u64, 1]);
     client
         .syscall(translation::netbsd_sysno(translation::Op::Listen), &a, &mut nomem)

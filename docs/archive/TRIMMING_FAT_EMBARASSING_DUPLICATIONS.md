@@ -345,9 +345,9 @@ boundary, so they are the most likely to drift silently.
 
 | Lines | Pair |
 |---:|---|
-| 60 | `akuma-exec/src/box_mod/access.rs:122` `cascade_kill_order` ↔ `box_mod/hierarchy.rs:75` `validate_nested_root` |
+| 60 | `akuma-exec/src/box_mod/access.rs:122` `cascade_kill_order` ↔ `box_mod/hierarchy.rs:75` `validate_nested_root` — **the wrong two symbols; see below** |
 | 63 (3 blocks) | `akuma-isolation/src/mount.rs` ↔ `akuma-vfs/src/mount.rs` |
-| 23 | `akuma-rump/src/sysproxy.rs` ↔ `src/rump_proxy.rs` |
+| 23 | `akuma-rump/src/sysproxy.rs` ↔ `src/rump_proxy.rs` — **DONE 2026-08-13**, and there were three impls, not two |
 | 22 + 13 | `akuma-net/src/hal.rs` ↔ `src/virtio_hal.rs` |
 | 10 | `akuma-exec/src/process/types.rs` ↔ `akuma-exec/src/threading/types.rs` |
 | 5 | `akuma-exec/src/process/types.rs` ↔ `src/process_tests.rs` |
@@ -390,6 +390,55 @@ unit-tested at both 8 and 16.
 > `MountTable = MountSet<8>` and `akuma_isolation::MountNamespace =
 > MountSet<16>` are type aliases, so no call site moved. The bin crate's
 > third path normaliser is gone. Details at the end of each subsection below.
+
+### The `box_mod` pair names the wrong two symbols (found 2026-08-13)
+
+CPD's 60 lines are real; the attribution is not. `cascade_kill_order`
+(`access.rs:122`) is **four lines** delegating to `hierarchy::get_descendants`;
+`validate_nested_root` (`hierarchy.rs:75`) is a ~35-line path-prefix validator
+with a component-boundary check. They share no logic at all.
+
+What is byte-identical is **`make_test_registry()`**, defined once in each file's
+`#[cfg(test)] mod tests` — same `BoxInfo` literals, same tree. That is where the
+60 lines live.
+
+So item 6 is not a production-code merge; it is test-fixture duplication, and it
+belongs with **item 9**, not ahead of it. Which also downgrades it: a shared
+fixture is the most harmless kind of clone, and the doc's own §6 argument — that
+duplication costs you the *next fix* — barely applies to a `BoxInfo` literal.
+
+The lesson repeats §5.555's: **CPD reports a location, not a subject.** A block
+that straddles or lands inside a test module gets attributed to the nearest
+preceding item in the file listing, and the survey copied that attribution
+without opening the file.
+
+### `ClientMem`'s "home question" was already answered (found 2026-08-13)
+
+§8 item 7 and Phase 4 both carried this as *needs a decision*: does `ClientMem`
+belong in `src/rump_proxy.rs` or `akuma-rump`? There was nothing to decide. The
+trait has lived at `akuma-rump/src/sysproxy.rs:80` throughout, `akuma-rump` is a
+dependency-free leaf, and `src/rump_proxy.rs:15` **already imports it**. The bin
+crate had simply grown its own private `NoMem` next to the import of the trait it
+implements.
+
+**DONE 2026-08-13**, and it was three impls rather than the two the table names:
+
+| was | where | difference |
+|---|---|---|
+| `NoMem` | `akuma-rump/src/sysproxy.rs:487` (private) | — |
+| `NoMem` | `src/rump_proxy.rs:1405` (private) | byte-identical |
+| `DiscardMem` | `src/rump_proxy.rs:1310` | `copyout` returns `Ok(())`; errnos spelled `14` rather than `EFAULT` |
+
+Now one `pub struct NoMem` in `akuma-rump` with the single varying axis as a
+field, reached through named constructors — `NoMem::faulting()` and
+`NoMem::discarding()` — because a bare struct literal at a call site would not
+say which behaviour was meant. Six kernel call sites and one in-crate site moved;
+the bin crate's `const EFAULT` went with the copy, since that was its only user.
+Two host tests pin both behaviours, so the discarding half cannot be lost the way
+§6's `write_bounded` was.
+
+The bare `14` is a live instance of **§5.7**: the comment carried the meaning and
+the literal carried the behaviour, one file away from the constant that names it.
 
 ### Three path normalisers, two of them in `akuma-vfs` itself (found 2026-08-13)
 
@@ -1225,13 +1274,13 @@ ELF-loading path into one.
 
 | # | Item | Lines | Effort | Risk |
 |---|---|---:|---|---|
-| 1 | virtio scaffolding: shared `Hal`, `virtio::probe`, one `VIRTIO_MMIO_ADDRS` | ~90 | small | low |
+| 1 | ~~virtio scaffolding: shared `Hal`, `virtio::probe`, one `VIRTIO_MMIO_ADDRS`~~ **DONE (Phase 3)** — verified 2026-08-13: one `VIRTIO_MMIO_ADDRS` (`akuma-virtio/probe.rs:16`), one `Hal` (`hal.rs:51`), zero hand-rolled probe loops left. The row had simply never been struck | 0 left | — | — |
 | 2 | ~~`channel.rs` stdout/stdin FIFO → one helper~~ **DONE 2026-08-13** — five shared bodies, 13 methods collapsed onto them, plus 7 host tests the file never had; the survey named the wrong pair (see §6) | 0 left | — | — |
 | 3 | ~~`akuma-isolation`/`akuma-vfs` `mount.rs` → shared half into `akuma-vfs`~~ **DONE 2026-08-13** — one `MountSet<const MAX>`, both names as type aliases, −145 code lines across 4 files; the bin crate's third path normaliser went with it (§4) | 0 left | — | — |
 | 4 | ~~The `X`/`X_from_path` **quartet**~~ **DONE 2026-08-13** — `elf/mod.rs` ×3 in Phase 2a (−151 code lines, 12 clone blocks → 0), `process/mod.rs` + `process/image.rs` in Phase 2b (−105 code lines, the pairs' 60- and 47-line clone blocks → absent) | 0 left | — | — |
 | 5 | `exceptions.rs` duplicated `Drop` impls (`:3703` / `:4315`) | ~142 | medium | **high** — exception path |
-| 6 | `box_mod` `access.rs` / `hierarchy.rs` | ~60 | small | low |
-| 7 | `rump_proxy.rs` / `akuma-rump` `sysproxy.rs` | ~23 | small | low |
+| 6 | `box_mod` `access.rs` / `hierarchy.rs` — **misdescribed, see §4**: the two *functions* share nothing; the byte-identical thing is `make_test_registry()` in both test modules. Folds into item 9 | ~60 (tests) | small | low |
+| 7 | ~~`rump_proxy.rs` / `akuma-rump` `sysproxy.rs`~~ **DONE 2026-08-13** — 3 impls → 1 `pub NoMem` with `faulting()`/`discarding()`; there was no home to settle (§4). Also closes Phase 4's `ClientMem`/`NoMem` row | 0 left | — | — |
 | 8 | `mmu/mod.rs` `map_user_page` / `_no_flush` and the three walk clones | ~80 | medium | **high** — see `UNSAFE_AUDIT.md` §5.1 |
 | 9 | Test-file clones (`tests.rs`, `process_tests.rs`) | ~669 | medium | low |
 | 12 | ~~Runtime-registration machinery (§5.8)~~ **DONE 2026-08-13** — one `akuma_primitives::Registered<T>`; 3 definitions → 1 and **21 spinlock acquisitions removed** from `akuma-net`'s poll/socket paths. Line count a wash; judge it on the locks | 0 left | — | — |
@@ -1686,7 +1735,7 @@ four are mop-up once rungs 3–5 settle the hard part:
 | `impl_display!` for `BlockError`/`RngError`/`AudioError` | Phase 3 collected all three into `akuma-virtio`; it is now an intra-crate macro |
 | BKL guard family → one generic guard | 4 of the 5 (`Net`/`Mm`/`Vfs`/`Driver`) are in `src/syscall/`; only `ProcessBklGuard` is in `akuma-exec` |
 | twice-defined `MultiPollFuture` | both copies are in `src/tests.rs` (`:2663`, `:9182`) |
-| `ClientMem`/`NoMem` across two crates | needs `ClientMem`'s home settled (`src/rump_proxy.rs` vs `akuma-rump`), not `akuma-primitives` |
+| ~~`ClientMem`/`NoMem` across two crates~~ **DONE 2026-08-13** | The home never needed settling — the trait was always in `akuma-rump` and the kernel always imported it (§4). Three impls → one `pub NoMem` with `faulting()`/`discarding()` |
 
 ### Phase 5 — the user-copy sweep (−167 `unsafe`, 19% of the tree)
 
@@ -1713,12 +1762,20 @@ bodies (`fifo_push_bounded`, `fifo_push_drop_oldest`, `fifo_drain_into`,
 registry accessors under them. See §6 for the three things the survey had wrong
 and §6.1 for the host-testability finding that came out of it.
 
+**DONE 2026-08-13:** `NoMem`/`DiscardMem` (§8 item 7), which also closes Phase
+4's last row. Three impls → one `pub NoMem { faulting(), discarding() }` in
+`akuma-rump`; the "settle `ClientMem`'s home" question was already answered
+years of commits ago (§4).
+
+**Reclassified 2026-08-13:** `box_mod` (§8 item 6) is not a production-code
+merge — the two named functions share nothing, and CPD's 60 lines are the
+byte-identical `make_test_registry()` in both test modules (§4). It folds into
+item 9 and drops in priority accordingly.
+
 **Still open, in the order they are worth doing:**
 
 | Item | Notes |
 |---|---|
-| `box_mod` `access.rs` / `hierarchy.rs` (§8 item 6, ~60 lines) | low risk |
-| `rump_proxy.rs` / `akuma-rump` `sysproxy.rs` (§8 item 7, ~23 lines) | overlaps Phase 4's `ClientMem`/`NoMem` question — settle `ClientMem`'s home once, for both |
 | `src/console.rs` `print_dec` / `print_u64` | a genuine 21-line / 82-token **Type-1** clone differing only in `usize` vs `u64`; CPD has always reported it. Found during the `akuma-primitives` work, unrelated to it |
 | `exceptions.rs`'s duplicated `Drop` impls (§8 item 5, ~142 lines) | **high risk — exception path.** Do last, and read `UNSAFE_AUDIT.md` §5.1 first |
 

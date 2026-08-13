@@ -182,7 +182,7 @@ impl<T: Transport> Client<T> {
         // `rsp_sysresp` — the server sends a short payload (a 4-byte handshake
         // word), so we must not run `parse_sysresp` (which needs 24 bytes). We
         // only need: a RESP for our reqno = success, ERROR = failure.
-        c.await_response(reqno, &mut NoMem, false)?;
+        c.await_response(reqno, &mut NoMem::faulting(), false)?;
         Ok(c)
     }
 
@@ -482,9 +482,49 @@ impl<P: PipeIo> Transport for PipeTransport<P> {
     }
 }
 
-/// A [`ClientMem`] that faults everything — used for the handshake (which has
-/// no copyin/out) and as a safe default.
-struct NoMem;
+/// A [`ClientMem`] with no user address space behind it: every `copyin` faults
+/// and `anonmmap` returns the tolerated NULL.
+///
+/// The **one** axis that varies between users is `copyout`, so it is a field
+/// rather than a second type. Pick with the named constructors — a bare
+/// `NoMem { .. }` literal at a call site says nothing about which behaviour was
+/// intended.
+///
+/// This used to be three impls: this one (private, for the handshake), a
+/// byte-identical private copy in the kernel's `src/rump_proxy.rs`, and a
+/// `DiscardMem` there that differed only in `copyout` — and that spelled its
+/// errno as a bare `14` where the other two used `EFAULT`
+/// (`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §8 item 7, and §5.7 for the
+/// errno-spelling half). `ClientMem` already lived here and the kernel already
+/// imported it, so there was never a home to settle.
+pub struct NoMem {
+    /// `true` = `copyout` silently succeeds, dropping the data. For syscalls
+    /// whose out-params are deliberately discarded: the `MSG_PEEK` readability
+    /// probe behind `poll`/`select`/`epoll` on a `RumpSocket` asks the server
+    /// for one byte purely to learn whether one exists, and the server
+    /// copyout's it to an address the caller never reads.
+    discard_copyout: bool,
+}
+
+impl NoMem {
+    /// Faults every access. The handshake (no copyin/out at all) and syscalls
+    /// with no pointer arguments, e.g. `socket()`.
+    #[must_use]
+    pub const fn faulting() -> Self {
+        Self {
+            discard_copyout: false,
+        }
+    }
+
+    /// Faults `copyin`, silently drops `copyout`.
+    #[must_use]
+    pub const fn discarding() -> Self {
+        Self {
+            discard_copyout: true,
+        }
+    }
+}
+
 impl ClientMem for NoMem {
     fn copyin(&mut self, _a: u64, _l: usize, _o: &mut Vec<u8>) -> Result<(), i32> {
         Err(EFAULT)
@@ -493,7 +533,11 @@ impl ClientMem for NoMem {
         Err(EFAULT)
     }
     fn copyout(&mut self, _a: u64, _d: &[u8]) -> Result<(), i32> {
-        Err(EFAULT)
+        if self.discard_copyout {
+            Ok(())
+        } else {
+            Err(EFAULT)
+        }
     }
     fn anonmmap(&mut self, _l: usize) -> u64 {
         0
@@ -856,5 +900,33 @@ mod tests {
         let mut t = pt(MockIo::new(&[], 1));
         t.write_all(&[1, 2, 3]).expect("w");
         assert_eq!(t.io.writes, alloc::vec![1, 2, 3]);
+    }
+
+    /// `NoMem` replaced three impls: this crate's private one, a byte-identical
+    /// copy in the kernel's `src/rump_proxy.rs`, and a `DiscardMem` there that
+    /// differed in exactly one method. The two constructors are that difference,
+    /// named — so pin both, or the next merge quietly loses the discarding half
+    /// the way the last one lost `write_bounded` (§6).
+    #[test]
+    fn nomem_faulting_rejects_every_access() {
+        let mut m = NoMem::faulting();
+        let mut out = Vec::new();
+        assert_eq!(m.copyin(0x1000, 8, &mut out), Err(EFAULT));
+        assert_eq!(m.copyinstr(0x1000, 8, &mut out), Err(EFAULT));
+        assert_eq!(m.copyout(0x1000, &[1, 2, 3]), Err(EFAULT));
+        assert_eq!(m.anonmmap(4096), 0, "a NULL map is tolerated by the server");
+    }
+
+    /// The MSG_PEEK readability probe behind `poll`/`select`/`epoll` on a
+    /// `RumpSocket`: the server writes the peeked byte somewhere and we drop it.
+    /// `copyout` must succeed; everything else must still fault.
+    #[test]
+    fn nomem_discarding_swallows_copyout_only() {
+        let mut m = NoMem::discarding();
+        let mut out = Vec::new();
+        assert_eq!(m.copyout(0x1000, &[0xAB]), Ok(()));
+        assert_eq!(m.copyin(0x1000, 8, &mut out), Err(EFAULT));
+        assert_eq!(m.copyinstr(0x1000, 8, &mut out), Err(EFAULT));
+        assert_eq!(m.anonmmap(4096), 0);
     }
 }
