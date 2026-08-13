@@ -189,7 +189,7 @@ def boot_once(smp, instance, memory, logdir, results, run_exercises):
             # A failed boot is the case that most needs triage, so report the three
             # things that distinguish its causes instead of just `booted: False`:
             # how far the self-test suite got, whether the kernel HALTED (a specific
-            # fatal, not a timeout), and whether the host was starving QEMU.
+            # fatal, not a timeout), and whether the run lost guest time.
             text = read_log(log_path)
             results[f"smp{smp}.pass_marker"] = len(re.findall(r"\[PASS\]", text))
             results[f"smp{smp}.host_timejumps"] = len(
@@ -235,17 +235,21 @@ def boot_once(smp, instance, memory, logdir, results, run_exercises):
             port = 2222 + (100 * instance if instance else 0)
             exercise_suite(port, smp, results)
 
-        # Re-read AFTER the exercises: this is HOST starvation, not a kernel property,
-        # and it happens while the exercises run — counting it from the boot snapshot
-        # above would report 0 for exactly the runs it needs to flag.
+        # Re-read AFTER the exercises: lost time accrues while they run, so counting it
+        # from the boot snapshot above would report 0 for exactly the runs it must flag.
         #
-        # The watchdog reports a ~100 ms jump whenever the host descheduled QEMU. A
-        # healthy run is 0. Measured 2026-08-13: a run with 2866 of these had
-        # `cowstale` TIMEOUT at SMP=1 and UNEXPECTED at SMP=4 on a tree where both
-        # pass, and the same tree re-run quiet scored `ok` at both. So read this BEFORE
-        # believing any exercise result — a background cargo/rust-analyzer rebuild
-        # during the run is enough to cause it, and it voids the timing-sensitive half
-        # of the summary.
+        # The watchdog reports a ~100 ms jump for time the guest did not account for.
+        # Its "(host sleep/wake)" text is the kernel's GUESS, not a measurement, and both
+        # causes are real: the host descheduling QEMU (a background cargo/rust-analyzer
+        # rebuild is enough — including this gate's own Tier 1 right before Tier 2), and
+        # the guest losing time itself. A high count means this run's timing is
+        # untrustworthy; it does not name a cause, and it does not explain a failure:
+        # measured 2026-08-13, a clean tree scored 741 and passed every exercise, while
+        # a run with 2866 saw `cowstale` TIMEOUT on a tree where it passes.
+        #
+        # It is also NOT the tell for the intermittent SMP=1 suite wedge
+        # (`COW_PILE_AUDIT.md` §9 F8) — that has been observed with a count of ZERO on an
+        # idle host. The tell for the wedge is the log simply stopping.
         results[f"smp{smp}.host_timejumps"] = len(
             re.findall(r"Time jump detected", read_log(log_path)))
     finally:

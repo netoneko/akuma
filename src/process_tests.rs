@@ -698,6 +698,7 @@ pub fn run_all_tests() {
     // must stay pinned, or a clean run proves nothing.
     test_uaf_quarantine_instrument();
     test_cow_break_dec_only_on_last_va();
+    test_cow_break_on_shared_view_leaks_both_frames();
     test_fork_cow_share_incs_once_per_frame();
     test_cow_ref_ledger_records_history();
     test_madvise_dontneed_range_semantics();
@@ -4833,6 +4834,96 @@ fn test_uaf_quarantine_instrument() {
     assert!(crate::pmm::is_page_free(pa), "drained frame not returned to the PMM: pa={pa:#x}");
 
     console::print("[Test] uaf_quarantine PASSED\n");
+}
+
+/// A kernel-side CoW break attributed to a **`CLONE_VM` sibling's** address-space
+/// view instead of the thread-group leader's leaks both frames it touches — the
+/// mechanism behind F2 (`COW_PILE_AUDIT.md` §4).
+///
+/// `new_shared` gives each sharer the leader's L0 table but its **own empty**
+/// `user_frames` map, and the `shared: true` branch of `Drop` decrements the L0
+/// refcount and drops that map without freeing anything in it. So resolving the wrong
+/// owner produced two leaks per break, in opposite ledgers:
+///
+/// 1. `track_user_frame(new_frame)` landed on the sibling's map → never freed;
+/// 2. `remove_user_frame(old_pa)` missed a map that never held it → returned `false`
+///    → the `released_last_va` gate correctly suppressed `cow_ref_dec` → `old_pa`
+///    kept an elevated global refcount forever.
+///
+/// `try_resolve_el1_cow_fault` resolved with `read_current_pid()` and hit exactly
+/// this; it now uses `address_space_owner_pid_for_fault()` like its two siblings.
+/// This test pins the *mechanism* rather than the call site — it is why the
+/// resolution matters, and it fails if `new_shared`'s ledger separation is ever
+/// "simplified" into shared `user_frames`, which would make the old bug invisible.
+fn test_cow_break_on_shared_view_leaks_both_frames() {
+    let Some(old_frame) = crate::pmm::alloc_page() else {
+        console::print("[Test] cow_break_on_shared_view_leaks_both_frames SKIPPED (no frame)\n");
+        return;
+    };
+    let Some(new_frame) = crate::pmm::alloc_page() else {
+        crate::pmm::free_page(old_frame);
+        console::print("[Test] cow_break_on_shared_view_leaks_both_frames SKIPPED (no frame)\n");
+        return;
+    };
+    let Some(leader) = crate::mmu::UserAddressSpace::new() else {
+        crate::pmm::free_page(old_frame);
+        crate::pmm::free_page(new_frame);
+        console::print("[Test] cow_break_on_shared_view_leaks_both_frames SKIPPED (no aspace)\n");
+        return;
+    };
+    let Some(sibling) = crate::mmu::UserAddressSpace::new_shared(leader.l0_phys()) else {
+        drop(leader);
+        crate::pmm::free_page(old_frame);
+        crate::pmm::free_page(new_frame);
+        console::print("[Test] cow_break_on_shared_view_leaks_both_frames SKIPPED (no shared view)\n");
+        return;
+    };
+
+    // The leader owns the CoW page; a peer address space shares it, so the count is 2.
+    leader.track_user_frame(old_frame);
+    crate::pmm::cow_ref_inc(old_frame.addr);
+
+    // WRONG owner (what F2 did): do the bookkeeping against the sibling's view.
+    sibling.track_user_frame(new_frame);
+    let wrong_released = sibling.remove_user_frame(old_frame);
+    // The sibling never held `old_pa`, so it cannot report a last-VA release, and the
+    // global count stays elevated: leak #2.
+    let wrong_leaves_count = crate::pmm::cow_ref_get(old_frame.addr);
+    // And the leader — the address space that will actually be torn down — has no
+    // record of `new_frame`: leak #1.
+    let leader_missed_new = !leader.tracks_user_frame(new_frame.addr);
+    let sibling_holds_new = sibling.tracks_user_frame(new_frame.addr);
+
+    // RIGHT owner (what it does now): the same two calls against the leader release
+    // the last VA, so the gate fires and the global reference is given up.
+    leader.track_user_frame(new_frame);
+    let right_released = leader.remove_user_frame(old_frame);
+    if right_released {
+        crate::pmm::cow_ref_dec(old_frame.addr);
+    }
+    let right_leaves_count = crate::pmm::cow_ref_get(old_frame.addr);
+
+    // Teardown: drop the peer's share, then both views and both frames.
+    let peer_owns_free = crate::pmm::cow_ref_dec(old_frame.addr);
+    let _ = leader.remove_user_frame(new_frame);
+    let _ = sibling.remove_user_frame(new_frame);
+    drop(sibling);
+    drop(leader);
+    crate::pmm::free_page(old_frame);
+    crate::pmm::free_page(new_frame);
+
+    if !wrong_released && wrong_leaves_count == 2 && leader_missed_new && sibling_holds_new
+        && right_released && right_leaves_count == 1 && peer_owns_free
+    {
+        console::print("[Test] cow_break_on_shared_view_leaks_both_frames PASSED\n");
+    } else {
+        crate::safe_print!(224,
+            "[Test] cow_break_on_shared_view_leaks_both_frames FAILED: wrong_released={} \
+             wrong_count={} leader_missed_new={} sibling_holds_new={} right_released={} \
+             right_count={} peer_owns_free={}\n",
+            wrong_released, wrong_leaves_count, leader_missed_new, sibling_holds_new,
+            right_released, right_leaves_count, peer_owns_free);
+    }
 }
 
 /// A CoW break must give up the address space's global reference **only** when it

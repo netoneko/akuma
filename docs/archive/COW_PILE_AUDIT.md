@@ -214,7 +214,35 @@ The bottom four rows agree — that is §5.6's three-times-applied fix holding. 
 rows above it are where the drift is, and two of them are load-bearing.
 
 ### F1 — the EL1 paths copy the page outside the lock that makes the source valid
-**CONFIRMED (mechanism) / NEEDS-REPRO (consequence).**
+**CONFIRMED (mechanism) / NEEDS-REPRO (consequence). STILL OPEN — implemented and
+backed out 2026-08-13. See F1b below for the mechanism that may make it unsafe as
+prescribed.**
+
+> **Attempt 1 (backed out).** The copy moved inside `with_address_space` in
+> `complete_cow_break`'s `TakingAsLock` arm — §8 row 6 exactly. The VM then wedged in
+> 3 of 4 SMP=1 exercise-suite runs: console output stops entirely, QEMU pegs one core,
+> and it always happens at the transition *between* exercises where sshd forks the next
+> one. One wedge had **zero** `[WATCHDOG] Time jump` lines on an idle host, so it is a
+> spin with IRQs masked, not host descheduling.
+>
+> **It was backed out, and then the attribution collapsed.** With the copy moved back
+> out, the same suite wedged again — 2 clean of 3 runs. So the wedge belongs to neither
+> F1 nor F2; it is a pre-existing, intermittent (~40–50% per suite) hang in the
+> exercise-suite path, and the same shape appeared once during the §8.1 merge cycle. The
+> F1-applied numbers (1 clean of 4) versus F1-reverted (2 of 3) are **not** a
+> measurement at that flake rate. F1 stays out only because there is no way to certify
+> it while the background flake is louder than the signal.
+>
+> **Sequence for whoever picks this up:** characterize and fix the exercise-suite wedge
+> *first* — it currently makes every SMP=1 exercise result a coin flip and blocks any
+> fault-path change from being verified at all. Then re-apply F1 with F1b in mind, and
+> measure over several runs per variant, not one.
+>
+> **On "needs measurement" (the hold-time question):** unresolved, and not resolvable on
+> the development host. The existing benchmarks swing **4×** run to run there
+> (`fork-cow-share` per_page 110 ns → 415 ns on identical trees), which is two orders of
+> magnitude more noise than a 4 KiB memcpy, and no `[BENCH]` line exercises the EL1
+> pre-flight path at all.
 
 The EL0 path states the invariant explicitly (`exceptions.rs:3525-3527`):
 
@@ -237,8 +265,54 @@ This is the trimming document's central thesis — *the explanation lives under 
 copy, and the copies that lack it violate it* — with memory corruption as the
 cost rather than a lost log line.
 
+### F1b — the EL1 paths still *translate* outside the lock
+**CONFIRMED (mechanism) / NEEDS-REPRO (consequence). OPEN — found 2026-08-13 while
+fixing F1.**
+
+§8 row 6 prescribes moving "the 4 KiB copy inside `with_address_space`", and that is
+what landed. It is not the whole invariant. Both EL1 sites still do this:
+
+```
+translate_user_va(fault/live ttbr0, page_va) -> old_pa   // outside as_lock
+cow_ref_get(old_pa) > 0                                  // outside as_lock
+alloc_page_zeroed()                                      // outside, and must stay out
+    -> complete_cow_break(TakingAsLock(owner), ..., old_pa, ...)
+       with_address_space(|aspace| { copy from old_pa; ... })   // NOW inside
+```
+
+So a peer can free `old_pa` between the translate and the acquire. The hold then
+protects a copy from a frame that was already stale when the hold began — a narrower
+window than F1's, in the same class, and the fix for F1 cannot close it. **The EL0 arm
+does not have this**: it takes `AsLockHold` *first* and translates, re-checks the
+refcount and copies inside it, which is why its comment claims the invariant honestly.
+
+Two ways to close it, neither done here because both exceed "fix exactly F1 and F2":
+
+1. **Re-validate inside the hold** — re-run `translate_user_va` in the closure and
+   confirm it still names `old_pa` before copying, bailing otherwise. ~4 lines, no
+   change to the locking structure, but it adds a decline path a caller must handle.
+2. **Restructure the EL1 sites to pre-hold like EL0** — then they use
+   `CallerHoldsAsLock`, `CowRemap` collapses to one variant, and the invariant holds by
+   construction. This also swaps the PTE-write mechanism on both EL1 paths
+   (`aspace.map_page` → `mmu::remap_current_user_page`), which is a fault-path change
+   in its own right and wants its own cycle. Note `map_page` can in principle allocate
+   intermediate page-table frames, which `with_address_space`'s own contract forbids
+   inside the hold — a CoW break never hits that case (the leaf PTE exists), but option
+   2 removes the latent contradiction as a side effect.
+
 ### F2 — `try_resolve_el1_cow_fault` resolves the wrong process
-**CONFIRMED (mechanism) / NEEDS-REPRO (consequence).**
+**CONFIRMED (mechanism) / NEEDS-REPRO (consequence). FIXED 2026-08-13.**
+
+> Now `address_space_owner_pid_for_fault()`, matching its two siblings. No explicit
+> `read_current_pid` fallback: that function already ends its own chain with it
+> (`children.rs:1053`), so chaining another would be unreachable code in a fault
+> handler. The mechanism — a shared view's `user_frames` map as a leak trap — is pinned
+> by the boot test `test_cow_break_on_shared_view_leaks_both_frames`, which asserts both
+> leaks against the wrong owner and their absence against the right one.
+>
+> The test pins the *mechanism*, not the call site: re-introducing `read_current_pid()`
+> in the handler would not fail it. Guarding that would need a fault-path test with a
+> live `CLONE_VM` thread, which the boot suite cannot construct.
 
 `:2397` uses `read_current_pid()` where its two siblings use
 `address_space_owner_pid_for_fault()`. For a single-threaded process these are the
@@ -466,8 +540,18 @@ is already in agreement on the part that matters (`released_last_va`).
 >   is `ensure_cow_page_writable`. Both cross-references are gone: they now point at
 >   the one helper.
 >
-> Items 3–4 of §8 (`spawn_child_thread_and_publish`, `Process::inherit_from`), item 7
-> (the DA/IA merge) and the F1/F2 fixes remain open, as scoped.
+> **Cycle 2 (the "fix second" half) landed HALF, 2026-08-13**, as its own change on top:
+> **F2's owner resolution only.** F1's copy-under-lock was implemented, wedged the VM,
+> and was backed out — then the wedge turned out to reproduce without it too (F8, §9).
+> Cycle 2 also turned up **F1b** (§4): moving the copy under the lock would not close
+> the window anyway, because the *translate* is still outside it.
+>
+> The two-cycle split still paid for itself here. Because the merge had already landed
+> and been verified, the wedge could be A/B'd against a known-good baseline within
+> minutes, and the answer — "this is neither of your two fixes" — was reachable at all.
+>
+> Items 3–4 of §8 (`spawn_child_thread_and_publish`, `Process::inherit_from`) and item 7
+> (the DA/IA merge) remain open, as scoped.
 
 Two of §8's rows do not belong in a change called a CoW merge, and bundling them
 would make it unverifiable:
@@ -514,8 +598,10 @@ unattributable.
 | id | finding | status | verify with |
 |---|---|---|---|
 | F3 | `cow_fault_lock` provides no mutual exclusion; 3 of 4 CoW runtime fn pointers are dead | **CONFIRMED** | `grep -rn COW_FAULT_LOCK src crates` → 3 hits, all in `pmm.rs` |
-| F2 | `try_resolve_el1_cow_fault` resolves the owner with `read_current_pid()`; for `CLONE_VM` workers this leaks two frames per kernel-side CoW break and takes a lock nobody waits on | **CONFIRMED** mechanism, **NEEDS-REPRO** consequence | PMM drift across a threaded workload taking kernel-side user writes; `[AS-*]` traces |
-| F1 | both EL1 CoW-break paths copy 4 KiB from `old_pa` outside the lock the EL0 path documents as required for `old_pa`'s validity | **CONFIRMED** mechanism, **NEEDS-REPRO** consequence | `cowstale`, `bssfork spread=1` at SMP=4; poison decode in `[WILD-DA]` |
+| F2 | `try_resolve_el1_cow_fault` resolves the owner with `read_current_pid()`; for `CLONE_VM` workers this leaks two frames per kernel-side CoW break and takes a lock nobody waits on | **FIXED 2026-08-13** (mechanism was CONFIRMED, consequence still NEEDS-REPRO) | PMM drift across a threaded workload taking kernel-side user writes; `[AS-*]` traces |
+| F1 | both EL1 CoW-break paths copy 4 KiB from `old_pa` outside the lock the EL0 path documents as required for `old_pa`'s validity | **STILL OPEN** — fix implemented and backed out 2026-08-13, blocked by F8 | `cowstale`, `bssfork spread=1` at SMP=4; poison decode in `[WILD-DA]` |
+| F8 | the SMP=1 exercise suite wedges intermittently (~40–50%) at the transition between exercises, where sshd forks the next one: console output stops, one core spins, **zero** time-jump lines on an idle host. Present with F1 applied *and* reverted, so it belongs to neither | **CONFIRMED** (reproduced 4×), cause unknown, **OPEN** | run `--tier 2 --smp 1` repeatedly; a wedged run's log simply stops growing mid-suite |
+| F1b | the EL1 paths still translate the VA and read the refcount outside `as_lock`, so `old_pa` can be stale before the hold begins — the residue F1's prescribed fix cannot reach | **CONFIRMED** mechanism, **NEEDS-REPRO** consequence, **OPEN** | same instruments as F1; the fix is §4 F1b option 1 or 2 |
 | F4 | DA single-page fallback places `dsb ish; isb` before the PTE install, disagreeing with its own batch path and with the IA arm | **CONFIRMED** | inspection; no known symptom |
 | F5 | IA arm claims `icache_done: true` into `file_page_cache` for pages it may map non-exec | **CONFIRMED** | inspection; no known symptom |
 | F6 | re-entrant `fault_slot_acquire` on one page by one thread lets the inner release drop the outer's entry | **CONFIRMED** | inspection; no known trigger |
