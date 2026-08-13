@@ -1,11 +1,22 @@
+use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use alloc::format;
+use core::sync::atomic::Ordering;
 
+use akuma_terminal as terminal;
+use spinning_top::Spinlock;
+
+use crate::elf_loader::{self, ElfError};
 use crate::mmu;
 use crate::runtime::{runtime, config, FrameSource};
 use crate::process::types::{ProcessMemory, LazySource, SignalHandler, SignalAction, PROCESS_INFO_ADDR, ProcessInfo, Pid};
 use crate::process::lifecycle::LifecycleGuard;
-use super::Process;
+use super::{
+    LazyRegionMap, NEXT_PID, Process, ProcessState, ProcessSyscallStats, SharedFdTable,
+    SharedSignalTable, StdioBuffer, UserContext,
+};
 
 /// True if some OTHER process shares `tgid` — a live CLONE_THREAD sibling of `pid`.
 fn has_thread_group_siblings(pid: Pid, tgid: Pid) -> bool {
@@ -249,5 +260,198 @@ impl Process {
         self.sigaltstack_flags = 2; // SS_DISABLE
 
         Ok(())
+    }
+
+    /// Create a new process from ELF data
+    pub fn from_elf(name: &str, args: &[String], env: &[String], elf_data: &[u8], interp_prefix: Option<&str>) -> Result<Self, ElfError> {
+        let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top, mmap_floor, _deferred) =
+            elf_loader::load_elf_with_stack(elf_data, args, env, config().user_stack_size, interp_prefix)?;
+
+        let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+
+        let process_info_frame = (runtime().alloc_page_zeroed)().ok_or(ElfError::OutOfMemory)?;
+        (runtime().track_frame)(process_info_frame, FrameSource::UserData);
+
+        address_space
+            .map_page(
+                PROCESS_INFO_ADDR,
+                process_info_frame.addr,
+                crate::mmu::user_flags::RO | crate::mmu::flags::UXN | crate::mmu::flags::PXN,
+            )
+            .map_err(|_| ElfError::MappingFailed("process info page"))?;
+
+        address_space.track_user_frame(process_info_frame);
+
+        let memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
+
+        log::debug!("[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}",
+            pid, brk, stack_bottom, stack_top, memory.next_mmap.load(Ordering::Relaxed), memory.mmap_limit);
+
+        // Register demand-paged regions for heap and stack growth.
+        //
+        // Built as a local and moved into the struct below. The pid-keyed
+        // `push_lazy_region` cannot be used here: it resolves `pid` through the
+        // process table, and this `Process` does not exist yet — let alone is
+        // registered — so every region would be silently dropped and the first
+        // heap or deep-stack touch would SIGSEGV.
+        let mut lazy_regions = LazyRegionMap::new();
+        let heap_lazy_size = compute_heap_lazy_size(brk, &memory);
+        lazy_regions.push(brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
+        let lazy_stack_start = stack_top.saturating_sub(LAZY_STACK_MAX);
+        lazy_regions.push(lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
+
+        Ok(Self {
+            pid,
+            pgid: pid,
+            tgid: pid, // group leader = self
+            name: String::from(name),
+            state: ProcessState::Ready,
+            address_space,
+            context: UserContext::new(entry_point, stack_pointer),
+            parent_pid: 0,
+            brk,
+            initial_brk: brk,
+            entry_point,
+            memory,
+            process_info_phys: process_info_frame.addr,
+            args: Vec::new(),
+            cwd: String::from("/"),
+            stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
+            stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
+            exited: false,
+            exit_code: 0,
+            dynamic_page_tables: Vec::new(),
+            mmap_regions: Vec::new(),
+            lazy_regions: Spinlock::new(lazy_regions),
+            fds: Arc::new(SharedFdTable::with_stdio()),
+            thread_id: None,
+            // Spawner PID - set when spawned by another process
+            spawner_pid: None,
+            // Terminal State - default for new processes
+            terminal_state: Arc::new(Spinlock::new(terminal::TerminalState::default())),
+
+            box_id: 0,
+            namespace: akuma_isolation::global_namespace(),
+            channel: None,
+            delegate_pid: None,
+            clear_child_tid: 0,
+            robust_list_head: 0,
+            robust_list_len: 0,
+            signal_actions: Arc::new(SharedSignalTable::new()),
+            signal_mask: 0,
+            fault_mutex: Spinlock::new(BTreeMap::new()),
+            vm_lock: Spinlock::new(()),
+            as_lock: Spinlock::new(()),
+            sigaltstack_sp: 0,
+            sigaltstack_flags: 2, // SS_DISABLE
+            sigaltstack_size: 0,
+            start_time_us: (runtime().uptime_us)(),
+            current_syscall: core::sync::atomic::AtomicU64::new(!0),
+            last_syscall: core::sync::atomic::AtomicU64::new(0),
+            syscall_stats: ProcessSyscallStats::new(),
+})
+    }
+
+    /// Create a process from a large ELF file on disk, loading segments on demand.
+    pub fn from_elf_path(name: &str, path: &str, file_size: usize, args: &[String], env: &[String], interp_prefix: Option<&str>) -> Result<Self, ElfError> {
+        {
+            let (allocated, heap_size) = (runtime().heap_stats)();
+            log::debug!("[Process] heap before ELF load: {}MB / {}MB ({}%)",
+                allocated / 1024 / 1024, heap_size / 1024 / 1024,
+                if heap_size > 0 { allocated * 100 / heap_size } else { 0 });
+        }
+        let (entry_point, mut address_space, stack_pointer, brk, stack_bottom, stack_top, mmap_floor, deferred_segments) =
+            elf_loader::load_elf_with_stack_from_path(path, file_size, args, env, config().user_stack_size, interp_prefix)?;
+
+        let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+
+        // Collected into a local and moved into the struct below — see the
+        // sibling constructor for why the pid-keyed API can't reach a `Process`
+        // that hasn't been built yet.
+        let mut lazy_regions = LazyRegionMap::new();
+        for seg in &deferred_segments {
+            let source = match &seg.file_source {
+                Some(fs) => LazySource::File {
+                    path: fs.path.clone(),
+                    inode: fs.inode,
+                    file_offset: fs.file_offset,
+                    filesz: fs.filesz,
+                    segment_va: fs.segment_va,
+                },
+                None => LazySource::Zero,
+            };
+            lazy_regions.push(seg.start_va, seg.size, seg.page_flags, source);
+        }
+
+        let process_info_frame = (runtime().alloc_page_zeroed)().ok_or(ElfError::OutOfMemory)?;
+        (runtime().track_frame)(process_info_frame, FrameSource::UserData);
+
+        address_space
+            .map_page(
+                PROCESS_INFO_ADDR,
+                process_info_frame.addr,
+                crate::mmu::user_flags::RO | crate::mmu::flags::UXN | crate::mmu::flags::PXN,
+            )
+            .map_err(|_| ElfError::MappingFailed("process info page"))?;
+
+        address_space.track_user_frame(process_info_frame);
+
+        let memory = ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
+
+        log::debug!("[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}",
+            pid, brk, stack_bottom, stack_top, memory.next_mmap.load(Ordering::Relaxed), memory.mmap_limit);
+
+        let heap_lazy_size = compute_heap_lazy_size(brk, &memory);
+        lazy_regions.push(brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
+        let lazy_stack_start = stack_top.saturating_sub(LAZY_STACK_MAX);
+        lazy_regions.push(lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
+
+        Ok(Self {
+            pid,
+            pgid: pid,
+            tgid: pid, // group leader = self
+            name: String::from(name),
+            state: ProcessState::Ready,
+            address_space,
+            context: UserContext::new(entry_point, stack_pointer),
+            parent_pid: 0,
+            brk,
+            initial_brk: brk,
+            entry_point,
+            memory,
+            process_info_phys: process_info_frame.addr,
+            args: Vec::new(),
+            cwd: String::from("/"),
+            stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
+            stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
+            exited: false,
+            exit_code: 0,
+            dynamic_page_tables: Vec::new(),
+            mmap_regions: Vec::new(),
+            lazy_regions: Spinlock::new(lazy_regions),
+            fds: Arc::new(SharedFdTable::with_stdio()),
+            thread_id: None,
+            spawner_pid: None,
+            terminal_state: Arc::new(Spinlock::new(terminal::TerminalState::default())),
+            box_id: 0,
+            namespace: akuma_isolation::global_namespace(),
+            channel: None,
+            delegate_pid: None,
+            clear_child_tid: 0,
+            robust_list_head: 0,
+            robust_list_len: 0,
+            signal_actions: Arc::new(SharedSignalTable::new()),
+            signal_mask: 0,
+            fault_mutex: Spinlock::new(BTreeMap::new()),
+            vm_lock: Spinlock::new(()),
+            as_lock: Spinlock::new(()),
+            sigaltstack_sp: 0,
+            sigaltstack_flags: 2, // SS_DISABLE
+            sigaltstack_size: 0,
+            start_time_us: (runtime().uptime_us)(),
+            current_syscall: core::sync::atomic::AtomicU64::new(!0),
+            last_syscall: core::sync::atomic::AtomicU64::new(0),
+            syscall_stats: ProcessSyscallStats::new(),
+})
     }
 }
