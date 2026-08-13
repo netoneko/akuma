@@ -110,7 +110,6 @@ fn execute_single_command(line: &str) {
         "clear" => { clear_screen(); },
         "whoami" => println("akuma"),
         "free" => cmd_free(),
-        "pkg" => cmd_pkg(&args),
         "find" => cmd_find(&args),
         "grep" => cmd_grep(&args),
         "top" => execute_external(&args), // Use external top if available
@@ -410,15 +409,6 @@ fn cmd_sleep(args: &[String]) {
     if args.len() < 2 { return; }
     let sec: u64 = args[1].parse().unwrap_or(0);
     sleep(sec);
-}
-
-fn cmd_pkg(args: &[String]) {
-    if args.len() < 2 {
-        println("Usage: pkg install <package>");
-        return;
-    }
-    // The first argument to the process is the command itself, which is "pkg"
-    execute_external_with_status(args);
 }
 
 /// `free` — total/used/free RAM straight from `sysinfo(2)` (syscall 179).

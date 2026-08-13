@@ -101,15 +101,24 @@ def ssh(cmd, timeout=180):
 
 ## Steps (in VM)
 
-### 4. Install scratch
+### 4. Check scratch is present
 
-`scratch` ships in `bootstrap/bin/` and is served by the pkg server on the host.
+Nothing to install: `scratch` ships in `bootstrap/bin/`, and `populate_disk.sh`
+copies it to `/bin/scratch` and creates the `/bin/git -> scratch` symlink itself
+(step 2 above). Just confirm both landed.
 
 ```python
-rc, out, err = ssh("pkg install scratch --as=/bin/git", timeout=60)
-assert rc == 0, f"scratch install failed: {out} {err}"
+rc, out, err = ssh("busybox ls -l /bin/git /bin/scratch", timeout=30)
+assert rc == 0 and "scratch" in out, f"scratch/git missing from image: {out} {err}"
 print("scratch ready")
 ```
+
+> This step used to run `pkg install scratch --as=/bin/git` against a host
+> package server on `:8000`. **`pkg` no longer exists** — the userspace package
+> manager was deleted on 2026-02-27 (`d12440a`, "add apk-tools and remove
+> userspace pkg") in favour of `apk`, and there is no `/bin/pkg` in
+> `bootstrap/bin/` or on any disk image. The step was also redundant by then,
+> since `populate_disk.sh` already stages both files.
 
 ### 5. Ask meow to clone the repo, compile hello.c, and run it
 
@@ -183,7 +192,9 @@ working sets do not overlap.
 | Symptom | Diagnosis |
 |---|---|
 | VM never reaches SSH | boot OOM — kernel image or stack reserve grew; check `IMAGE_RESERVE` |
-| `pkg install scratch` fails | pkg server not running on host at port 8000, or `bootstrap/bin/scratch` missing; run `userspace/build.sh --scratch-only` first |
+| `/bin/scratch` or `/bin/git` missing | the image was populated before `scratch` was built. Run `userspace/build.sh --scratch-only`, then re-run `scripts/populate_disk.sh` (it creates the `git -> scratch` symlink). There is no package manager to fall back on — `pkg` is gone (see step 4) |
+| `tcc: error: file 'tcc' not found` | the login shell passed the command name twice. **FIXED** 2026-08-13 — [`docs/archive/PAWS_DUPLICATED_ARGV0.md`](../docs/archive/PAWS_DUPLICATED_ARGV0.md). If it reappears, `/bin/paws` on the image predates the fix; rebuild and re-stage it |
+| the compiled binary segfaults | it was linked **without** `-static`. tcc's default (dynamic) output links cleanly and then crashes; keep `-static -B /usr/lib/tcc` exactly as written above |
 | `scratch clone` OOM | rare at 4.0 MB — scratch's peak (TLS + pack buffer) is ~300 KB; check kernel serial log for `anon alloc failed` |
 | `scratch clone` fails with network error | DNS or TLS failure; verify the host has internet access and `github.com` is reachable from the guest via `nslookup github.com` |
 | meow exits with `Failed to create request buffer` or empty path errors | lazy-ELF segment-boundary clobber (see `docs/LOW_MEMORY_ENVIRONMENT.md`); rebuild extreme kernel |
