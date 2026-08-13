@@ -7,64 +7,27 @@ use spinning_top::Spinlock;
 // IRQ Guard - RAII guard for disabling interrupts
 // ============================================================================
 
-/// RAII guard that disables IRQs when created and restores them when dropped.
-/// This ensures IRQs are properly restored even if the guarded code panics.
-pub struct IrqGuard {
-    saved_daif: u64,
-}
+/// RAII guard that masks IRQs when created and restores `DAIF` when dropped, so
+/// IRQs come back even if the guarded code unwinds.
+///
+/// Re-exported from `akuma_primitives::irq`. This crate and `akuma-exec` each
+/// carried an `IrqGuard` under the same name — that shared name is why the
+/// duplicate stayed invisible to a grep — and `akuma-exec/src/sync.rs` carried a
+/// third, barrier-less DAIF implementation beside them. One now, with the `isb`
+/// difference documented and preserved.
+pub use akuma_primitives::irq::{IrqGuard, with_irqs_disabled};
 
-impl IrqGuard {
-    /// Create a new IRQ guard, disabling IRQs.
-    /// The previous IRQ state will be restored when this guard is dropped.
-    #[inline]
-    pub fn new() -> Self {
-        let daif: u64;
-        // SAFETY: Reading and modifying DAIF register is safe - it only affects
-        // interrupt masking for the current CPU
-        unsafe {
-            core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
-            core::arch::asm!("msr daifset, #2", options(nomem, nostack));
-            core::arch::asm!("isb", options(nomem, nostack));
-        }
-        Self { saved_daif: daif }
-    }
-}
-
-impl Drop for IrqGuard {
-    #[inline]
-    fn drop(&mut self) {
-        // SAFETY: Restoring DAIF register to its previous state is safe
-        unsafe {
-            core::arch::asm!("msr daif, {}", in(reg) self.saved_daif, options(nomem, nostack));
-        }
-    }
-}
-
-/// Run a closure with IRQs disabled.
-/// This is a convenience wrapper around IrqGuard.
-#[inline]
-pub fn with_irqs_disabled<T, F: FnOnce() -> T>(f: F) -> T {
-    let _guard = IrqGuard::new();
-    f()
-}
-
-/// Disable IRQs. Caller is responsible for re-enabling with enable_irqs().
-/// Use with_irqs_disabled() when possible for automatic cleanup.
-#[inline]
-pub fn disable_irqs() {
-    unsafe {
-        core::arch::asm!("msr daifset, #2", options(nomem, nostack));
-        core::arch::asm!("isb", options(nomem, nostack));
-    }
-}
-
-/// Enable IRQs. Only call after disable_irqs().
-#[inline]
-pub fn enable_irqs() {
-    unsafe {
-        core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
-    }
-}
+/// Unbalanced IRQ mask/unmask, re-exported under this crate's historical names.
+///
+/// Both had **zero callers** at the time `akuma-primitives` absorbed the DAIF
+/// code — the only greps were their own doc comments and two comments elsewhere
+/// referring to them — while six other sites open-coded exactly what
+/// `enable_irqs` does. Two of those six were in `akuma-exec`, which cannot reach
+/// this module: the missing-crate shape again.
+///
+/// Prefer `with_irqs_disabled()` / `IrqGuard` — these leave the caller
+/// responsible for the matching call and cannot restore a prior masked state.
+pub use akuma_primitives::irq::{mask_irqs_sync as disable_irqs, unmask_irqs as enable_irqs};
 
 // ============================================================================
 // IRQ Handler Registration

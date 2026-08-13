@@ -6,7 +6,7 @@
 //! (`VirtioHal`, used by the block and sound drivers) and
 //! `crates/akuma-net/src/hal.rs` (`NetHal`, used by `smoltcp_net` and
 //! `rump_tap`). They differed in exactly one respect — how they reached
-//! `virt_to_phys`/`phys_to_virt`. `VirtioHal` called `akuma_exec::mmu`
+//! `virt_to_phys`/`phys_to_virt`. `VirtioHal` called `akuma_primitives::addr`
 //! directly; `NetHal` dispatched through `NetRuntime`'s registered function
 //! pointers.
 //!
@@ -19,9 +19,9 @@
 //! It existed so `akuma-net` would not need to depend on `akuma-exec` — but
 //! `akuma-net` acquired that dependency anyway, for the `PreemptGuard` re-export,
 //! so the decoupling it bought had already been spent. Nothing ever registered a
-//! translator other than `akuma_exec::mmu`'s, and no test injected a fake.
+//! translator other than `akuma_primitives::addr`'s, and no test injected a fake.
 //!
-//! # Why this calls `akuma_exec::mmu` instead of doing nothing
+//! # Why this calls `akuma_primitives::addr` instead of doing nothing
 //!
 //! Both translators are currently the identity:
 //!
@@ -38,7 +38,7 @@
 
 use core::ptr::NonNull;
 
-use akuma_exec::mmu::{phys_to_virt, virt_to_phys};
+use akuma_primitives::addr::{phys_to_virt, virt_to_phys};
 use virtio_drivers::{BufferDirection, Hal, PhysAddr};
 
 /// DMA allocation and address translation for every virtio device in the tree.

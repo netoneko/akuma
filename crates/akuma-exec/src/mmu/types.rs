@@ -9,16 +9,15 @@ pub const PAGE_SHIFT: usize = 12;
 pub const ENTRIES_PER_TABLE: usize = 512;
 pub const BITS_PER_LEVEL: usize = 9;
 
-pub const DEV_GIC_DIST_VA: usize = 0x80_0000_0000;
-pub const DEV_GIC_CPU_VA: usize  = 0x80_0000_1000;
-pub const DEV_UART_VA: usize     = 0x80_0000_2000;
-pub const DEV_FW_CFG_VA: usize   = 0x80_0000_3000;
-pub const DEV_VIRTIO_VA: usize   = 0x80_0000_4000;
-/// GICv3 redistributor, CPU0 RD_base frame (PA 0x080A_0000). GICR_WAKER lives here.
-pub const DEV_GICR_RD_VA: usize  = 0x80_0000_5000;
-/// GICv3 redistributor, CPU0 SGI_base frame (PA 0x080B_0000). SGI/PPI enable,
-/// priority and group registers live here.
-pub const DEV_GICR_SGI_VA: usize = 0x80_0000_6000;
+/// The fixed L0[1] device-mapping window, re-exported from
+/// `akuma_primitives::addr`. It moved so `akuma-virtio` could reach
+/// `DEV_VIRTIO_VA` without depending on this crate — the last edge keeping
+/// `akuma-net` on it. See that module's header for why the table moved whole
+/// rather than one constant at a time.
+pub use akuma_primitives::addr::{
+    DEV_FW_CFG_VA, DEV_GIC_CPU_VA, DEV_GIC_DIST_VA, DEV_GICR_RD_VA, DEV_GICR_SGI_VA, DEV_UART_VA,
+    DEV_VIRTIO_VA,
+};
 
 pub const MAIR_DEVICE_NGNRNE: u64 = 0;
 pub const MAIR_NORMAL_NC: u64 = 1;

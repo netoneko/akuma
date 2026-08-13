@@ -52,10 +52,11 @@ workspace = true
 [dependencies]
 # Host-testable rump tap orchestration; pulled in only by the `rump` feature.
 akuma-rump = { path = "../akuma-rump", optional = true }
-# Owns `threading::disable_preemption` and the IRQ-masking `PreemptGuard` (lifted
-# from this crate's runtime.rs so the VFS BKL-drop path can reuse it). Always
-# pulled in — the net crate's `PreemptGuard` re-export comes from here.
-akuma-exec = { path = "../akuma-exec" }
+# `PreemptGuard`, which this crate re-exports. It started life HERE, was lifted to
+# `akuma-exec` so the VFS BKL-drop path could share it — costing this crate a
+# dependency on the whole execution crate — and now lives in the dependency-free
+# leaf, so the sharing is free.
+akuma-primitives = { path = "../akuma-primitives" }
 # The shared `Hal` impl and MMIO probe. Both used to be duplicated here — see
 # akuma-virtio's hal.rs for why this crate no longer carries its own.
 akuma-virtio = { path = "../akuma-virtio" }

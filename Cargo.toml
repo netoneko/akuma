@@ -170,7 +170,7 @@ rump-tests = []
 # passing) and a same-binary `bkl-profile` A/B on the contention regimen
 # (`irq/sched` 24.7% → 10.2%, 6/6 digests exact both sides). Remove from this
 # list to A/B.
-smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers", "no-bkl-irq"]
+smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared", "akuma-primitives/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers", "no-bkl-irq"]
 
 # Run the native (smoltcp) network syscalls WITHOUT the Big Kernel Lock — the
 # first subsystem carved out of the BKL (docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
@@ -182,7 +182,7 @@ smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared", "no-bkl-network",
 # (PreemptGuard additionally masks IRQs for those holds — see
 # crates/akuma-net/src/runtime.rs). A no-op (byte-for-byte unchanged) on every
 # build that doesn't set both features.
-no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network"]
+no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network", "akuma-primitives/no-bkl-network"]
 
 # Run the VFS syscalls WITHOUT the Big Kernel Lock — Phase 4 of
 # docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md, the second subsystem carved out
@@ -196,7 +196,7 @@ no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network"]
 # IRQs for the ext2/block-device holds — the same hardening that closed the
 # SMP=4 ABBA wedge in net's Phase 2. A no-op (byte-for-byte unchanged) on every
 # build that doesn't set both features.
-no-bkl-vfs = ["akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs", "akuma-net/no-bkl-vfs"]
+no-bkl-vfs = ["akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs", "akuma-net/no-bkl-vfs", "akuma-primitives/no-bkl-vfs"]
 
 # Run `fork_process`'s CoW share/demote pass WITHOUT the Big Kernel Lock — Phase 3 of
 # docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md, the third subsystem carved out (after
@@ -334,7 +334,7 @@ gic-v2 = []
 # Forwarded to akuma-exec and akuma-ext2 so their build.rs emits the same cfg
 # (warm-stack floor + kernel-stack right-sizing in akuma-exec; block-cache gate
 # in akuma-ext2).
-extreme = ["akuma-exec/extreme", "akuma-ext2/extreme"]
+extreme = ["akuma-exec/extreme", "akuma-ext2/extreme", "akuma-primitives/extreme"]
 
 # Large RAM-sized ext2 block cache with clock eviction (crates/akuma-ext2). Keeps
 # the read-only toolchain resident across the many process spawns in a self-host

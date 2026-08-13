@@ -1799,9 +1799,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     // with IRQs masked, the yield loop could never switch away. Re-enable IRQs so
     // the terminated thread is always schedulable off-CPU.
     #[cfg(target_os = "none")]
-    unsafe {
-        core::arch::asm!("msr daifclr, #2", "isb", options(nomem, nostack));
-    }
+    akuma_primitives::irq::unmask_irqs_sync();
     // Pressure-driven reclaim of previously RETIRED processes — the first of
     // `process::reclaim`'s vetted drain sites, and the one that matters under an
     // OOM-kill storm (`docs/archive/OOM_KILL_DEFERRED_RECLAIM_GAP.md` §5 candidate 1).
@@ -1938,9 +1936,7 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
     // preempt this terminated thread and reclaim it — turning a VM-wide hang back
     // into a clean single-process kill.
     #[cfg(target_os = "none")]
-    unsafe {
-        core::arch::asm!("msr daifclr, #2", "isb", options(nomem, nostack));
-    }
+    akuma_primitives::irq::unmask_irqs_sync();
 
     // Same vetted drain site as `return_to_kernel` — see the comment there. Placed
     // after the IRQ re-enable above deliberately: this path inherits the *faulting*

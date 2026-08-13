@@ -200,6 +200,11 @@ pub fn register(rt: ExecRuntime, cfg: ExecConfig) {
     // `(runtime().print_str)(…)` directly. Before this call those macros are
     // silent rather than panicking; see `akuma_primitives::console`.
     akuma_primitives::console::set_print_hook(rt.print_str);
+    // Same for the uptime clock. `akuma-primitives`' preemption bookkeeping wants
+    // it for one diagnostic timestamp, and it degrades to 0 before this point —
+    // which is exactly what `disable_preemption` already did behind an
+    // `is_registered()` check. See `akuma_primitives::clock`.
+    akuma_primitives::clock::set_clock_hook(rt.uptime_us);
 }
 
 /// Access the registered runtime. Panics if not yet registered.
@@ -228,49 +233,16 @@ pub fn config() -> ExecConfig {
         .expect("akuma-exec: ExecConfig not registered — call akuma_exec::init() first")
 }
 
-/// Run a closure with IRQs disabled, properly saving and restoring DAIF.
-#[inline]
-pub fn with_irqs_disabled<T, F: FnOnce() -> T>(f: F) -> T {
-    let _guard = IrqGuard::new();
-    f()
-}
-
-/// RAII guard that saves DAIF on creation and restores on drop.
+/// Local-IRQ masking, re-exported from `akuma_primitives::irq`.
 ///
-/// On non-aarch64 targets (host testing), this is a no-op.
-pub struct IrqGuard {
-    #[cfg(target_os = "none")]
-    saved_daif: u64,
-}
-
-impl IrqGuard {
-    #[inline]
-    pub fn new() -> Self {
-        #[cfg(target_os = "none")]
-        {
-            let daif: u64;
-            unsafe {
-                core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
-                core::arch::asm!("msr daifset, #2", options(nomem, nostack));
-                core::arch::asm!("isb", options(nomem, nostack));
-            }
-            Self { saved_daif: daif }
-        }
-        #[cfg(not(target_os = "none"))]
-        {
-            Self {}
-        }
-    }
-}
-
-impl Drop for IrqGuard {
-    #[inline]
-    fn drop(&mut self) {
-        #[cfg(target_os = "none")]
-        unsafe {
-            core::arch::asm!("msr daif, {}", in(reg) self.saved_daif, options(nomem, nostack));
-        }
-    }
-}
+/// This crate carried its own `IrqGuard` — one of two under that name, the other
+/// in the bin crate at `src/irq.rs:12`, plus a third barrier-less DAIF
+/// implementation in this crate's `sync.rs`. All three are now one; see
+/// `akuma_primitives::irq` for the census and for why the `isb` difference
+/// between the guard and `irq_save_mask` is preserved rather than resolved.
+///
+/// Kept as re-exports so `akuma_exec::runtime::{IrqGuard, with_irqs_disabled}`
+/// keeps resolving for the ~34 call sites across this crate and the bin crate.
+pub use akuma_primitives::irq::{IrqGuard, with_irqs_disabled};
 
 // `OnceCopy`'s unit tests moved with it to `akuma-primitives::once`.

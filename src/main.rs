@@ -1241,9 +1241,7 @@ fn run_async_main() -> ! {
         console::print("[Idle] Entering minimal idle loop...\n");
         
         // Enable IRQs so timer can fire
-        unsafe {
-            core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
-        }
+        akuma_primitives::irq::unmask_irqs();
         
         loop {
             threading::yield_now();
@@ -1352,9 +1350,7 @@ fn run_async_main() -> ! {
     safe_print!(1024, "[Main] Network ready! Running background polling loop.\n");
 
     // Enable IRQs for the main loop
-    unsafe {
-        core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
-    }
+    akuma_primitives::irq::unmask_irqs();
 
     // Auto-start herd process supervisor
     let (_herd_tid, mut herd_channel) = if config::AUTO_START_HERD && fs::is_initialized() {

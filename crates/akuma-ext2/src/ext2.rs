@@ -45,7 +45,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 use spinning_top::RwSpinlock;
 
-use akuma_exec::runtime::OnceCopy;
+use akuma_primitives::OnceCopy;
 use akuma_vfs::{DirEntry, Filesystem, FsError, FsStats, Metadata, path_components, split_path};
 use crate::BlockDevice;
 
@@ -576,7 +576,7 @@ struct Ext2State {
 /// **IRQs are masked around the non-blocking `try_*` and the resulting hold only, never
 /// across the acquisition backoff** — see [`Ext2Filesystem::read_state`].
 #[cfg(feature = "no-bkl-vfs")]
-type StateHoldGuard = akuma_exec::sync::PreemptGuard;
+type StateHoldGuard = akuma_primitives::PreemptGuard;
 #[cfg(not(feature = "no-bkl-vfs"))]
 type StateHoldGuard = NoStateHold;
 
@@ -598,7 +598,7 @@ impl Drop for NoStateHold {
 #[inline]
 fn state_hold_guard() -> StateHoldGuard {
     #[cfg(feature = "no-bkl-vfs")]
-    return akuma_exec::sync::PreemptGuard::new();
+    return akuma_primitives::PreemptGuard::new();
     #[cfg(not(feature = "no-bkl-vfs"))]
     NoStateHold
 }

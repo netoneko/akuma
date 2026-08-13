@@ -39,15 +39,15 @@ pub struct NetRuntime {
 /// features, masks local IRQs) for the lifetime of a kernel spinlock critical
 /// section.
 ///
-/// **Lifted** to `akuma_exec::sync::PreemptGuard` so the VFS BKL-drop path
+/// **Lifted** to `akuma_primitives::preempt::PreemptGuard` so the VFS BKL-drop path
 /// (`no-bkl-vfs`) can share the same primitive without duplication. akuma-net
 /// re-exports it here for source compatibility — existing `use
 /// crate::runtime::PreemptGuard` sites (`smoltcp_net.rs`, `socket.rs`) keep
-/// working unchanged. See `akuma_exec::sync::PreemptGuard` for the full
+/// working unchanged. See `akuma_primitives::preempt::PreemptGuard` for the full
 /// rationale (the SMP=4 ABBA hard-wedge this guard prevents, the lift history,
 /// and the `no-bkl-network`/`no-bkl-vfs` cfg union that gates the IRQ-masking
 /// arm).
-pub use akuma_exec::sync::PreemptGuard;
+pub use akuma_primitives::PreemptGuard;
 
 static RUNTIME: Spinlock<Option<NetRuntime>> = Spinlock::new(None);
 

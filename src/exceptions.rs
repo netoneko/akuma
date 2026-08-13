@@ -1809,11 +1809,11 @@ pub fn init() {
             vbar = in(reg) vbar
         );
 
-        // Enable IRQs by clearing the I bit in DAIF
-        core::arch::asm!(
-            "msr daifclr, #2" // Clear IRQ mask (bit 1)
-        );
     }
+
+    // Enable IRQs by clearing DAIF.I, now that VBAR_EL1 is installed and
+    // synchronized above — the ordering that makes taking an interrupt safe.
+    akuma_primitives::irq::unmask_irqs();
 }
 
 /// Default exception handler - logs unexpected exceptions

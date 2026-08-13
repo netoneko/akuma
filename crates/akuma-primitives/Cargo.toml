@@ -6,6 +6,25 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+# Profile discriminator forwarded from the bin crate's `extreme` feature, so
+# build.rs can emit `cfg(kernel_profile_extreme)` and `MAX_THREADS` drops 256 → 64
+# (the per-slot statics here are BSS whether used or not, and the size profiles
+# target a 4 MB RAM floor).
+extreme = []
+
+# Real (shared-kernel) SMP. Without it `PreemptGuard` is a zero-sized no-op and
+# the preemption counters are never touched, matching the pre-existing behaviour
+# on non-`smp-shared` builds.
+smp-shared = []
+
+# BKL-drop features. These upgrade `PreemptGuard` to also mask local IRQs for the
+# hold, which is what keeps a BKL-free core from being caught holding an inner
+# spinlock while a nested IRQ hard-spins on the BKL (the SMP=4 AB-BA wedge).
+# See `preempt::PreemptGuard`. Only meaningful with `smp-shared`.
+no-bkl-network = []
+no-bkl-vfs = []
+
 # No dependencies, by design. This is the leaf every other crate may depend on,
 # so anything added here is added to the whole tree's dependency closure. If a
 # primitive needs a crate, it does not belong here.

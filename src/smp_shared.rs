@@ -949,8 +949,10 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
     crate::timer::enable_timer_interrupts(crate::config::TIMER_INTERVAL_US);
 
     // Unmask IRQs: from here the timer tick drives this core's scheduler.
-    // SAFETY: vectors + GIC + timer are configured; safe to take interrupts now.
-    unsafe { core::arch::asm!("msr daifclr, #2", "isb", options(nomem, nostack)) };
+    // The `isb` matters here specifically: this is the first time this core takes
+    // interrupts, so a tick already pending must be taken before the idle loop is
+    // entered rather than at some later synchronization point.
+    akuma_primitives::irq::unmask_irqs_sync();
 
     // Idle loop. Two requirements pull against each other: (1) don't hammer the BKL
     // when there's nothing to run (a `yield_now()` every iteration livelocks SMP=4 as

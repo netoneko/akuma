@@ -27,9 +27,30 @@
 //! and `akuma-virtio` were each hand-rolling.
 
 #![cfg_attr(not(test), no_std)]
+// `#[inline(always)]` is load-bearing here, not a hint. These wrappers replace
+// open-coded `asm!` at their call sites — several on the BKL acquire and
+// per-packet DMA paths — and the merge is only behaviour-preserving if it emits
+// the same instructions with no call overhead. Both the bin crate
+// (`src/main.rs:8`) and `akuma-exec` (`lib.rs:50`) carry the same allow.
+#![allow(clippy::inline_always)]
+// `const INIT: AtomicUsize = …; [INIT; MAX_THREADS]` is the only way to build a
+// const array of atomics, and it is the pattern every per-slot static in
+// `akuma-exec`'s threading module uses. Allowed there (`lib.rs:22`) for the same
+// reason.
+#![allow(clippy::declare_interior_mutable_const)]
 
+pub mod addr;
+pub mod clock;
 pub mod console;
+pub mod irq;
 pub mod once;
+pub mod preempt;
 
+pub use addr::{phys_to_virt, virt_to_phys};
 pub use console::{FmtBuf, StackWriter};
+pub use preempt::{MAX_THREADS, PreemptGuard};
+pub use irq::{
+    DAIF_I_MASKED, IrqGuard, irq_restore, irq_save_mask, mask_irqs_sync, read_daif, unmask_irqs,
+    unmask_irqs_sync, with_irqs_disabled,
+};
 pub use once::OnceCopy;

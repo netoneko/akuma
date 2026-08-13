@@ -877,28 +877,17 @@ fn set_current_thread_register(tid: usize) {
 #[inline]
 fn set_current_thread_register(_tid: usize) {}
 
-/// Get the current thread ID from TPIDRRO_EL0
-#[cfg(target_os = "none")]
+/// Get the current thread ID from TPIDRRO_EL0.
+///
+/// The *read* lives in `akuma_primitives::preempt::current_tid` — it is a
+/// bounds-checked `mrs` with no scheduler state behind it, and moving it is what
+/// let the preemption counters move too. The *write*
+/// (`set_current_thread_register`, above) deliberately stays here: it also
+/// re-points the per-core BKL attribution cache, which is scheduler business.
 #[inline]
 fn get_current_thread_register() -> usize {
-    let val: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, tpidrro_el0", out(reg) val);
-    }
-    let tid = val as usize;
-    if tid >= MAX_THREADS {
-        safe_print!(256, "[FATAL] TPIDRRO_EL0 CORRUPT: tid=0x{:x} >= MAX_THREADS ({})\nSystem halted - cannot determine current thread\n", 
-            val, MAX_THREADS);
-        loop {
-            unsafe { core::arch::asm!("wfi"); }
-        }
-    }
-    tid
+    akuma_primitives::preempt::current_tid()
 }
-
-#[cfg(not(target_os = "none"))]
-#[inline]
-fn get_current_thread_register() -> usize { 0 }
 
 /// Reset every per-slot register to its power-on value, so a recycled slot cannot leak
 /// its previous occupant's state into the next thread.
@@ -947,9 +936,10 @@ fn scrub_thread_slot(i: usize) {
     // occupant's first park.
     WOKEN_STATES[i].store(false, Ordering::Release);
     WAKE_TIMES[i].store(0, Ordering::Release);
-    PREEMPTION_DISABLED[i].store(0, Ordering::Release);
-    PREEMPTION_DISABLED_SINCE[i].store(0, Ordering::Release);
-    PREEMPTION_DISABLED_AT[i].store(0, Ordering::Release);
+    // The three preemption records live in `akuma_primitives::preempt` now; a
+    // recycled slot inheriting a non-zero disable count would be a thread the
+    // scheduler silently never preempts.
+    akuma_primitives::preempt::scrub_slot(i);
 
     // Kernel-entry state. A stale `USER_COPY_FAULT_HANDLER` is a fixup address into a
     // syscall frame that no longer exists — a fault before the new occupant installs
@@ -1650,12 +1640,13 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
             // Clear a stale deferred-kill request so a recycled slot's next occupant
             // is not wrongly self-terminated at its first EL1→EL0 boundary.
             PENDING_KILL[i].store(false, Ordering::Release);
-            // Reset the per-thread preemption-disable counter. A thread that died with
+            // Reset the per-thread preemption-disable records. A thread that died with
             // a disable outstanding (e.g. a lifecycle op that never released — see
             // process/lifecycle.rs "No-return callers") must not poison the slot's next
-            // occupant with permanently-deferred preemption.
-            PREEMPTION_DISABLED[i].store(0, Ordering::Release);
-            PREEMPTION_DISABLED_SINCE[i].store(0, Ordering::Release);
+            // occupant with permanently-deferred preemption. They live in
+            // `akuma_primitives::preempt` now; this clears the disabled-at location too,
+            // which the old two-store version left stale.
+            akuma_primitives::preempt::scrub_slot(i);
             // Drop the dead occupant's EL0 trap-frame pointer. `clear_current_trap_frame`
             // (the SVC epilogue) is the only other clear, and no exit path reaches it:
             // `return_to_kernel` never returns to the epilogue, and a peer-killed thread
@@ -1758,87 +1749,21 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
 // ============================================================================
 // Preemption Control (Per-Thread)
 // ============================================================================
-
-/// Per-thread preemption disable counters.
-/// Each thread has its own counter to track nested disable_preemption() calls.
-/// This prevents one thread's preemption state from affecting another thread.
-static PREEMPTION_DISABLED: [AtomicUsize; MAX_THREADS] = {
-    const INIT: AtomicUsize = AtomicUsize::new(0);
-    [INIT; MAX_THREADS]
+//
+// The per-thread disable counters, the two diagnostic arrays beside them, the
+// six accessors and the watchdog all moved to `akuma_primitives::preempt`, and
+// are re-exported below so no call site changed.
+//
+// Why they could move: `PreemptGuard` was the only reason `akuma-ext2` and
+// `akuma-net` depended on this crate at all, and the three things the counters
+// needed from outside `core` — a console (the FATAL corrupt-tid halt), a clock
+// (the 0->1 diagnostic timestamp) and IRQ masking — are all available to a leaf
+// crate now. See that module's header, and
+// docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md 5.555.
+pub use akuma_primitives::preempt::{
+    check_preemption_watchdog, disable_preemption, enable_preemption, is_preemption_disabled,
+    preemption_disabled_at, preemption_disabled_count,
 };
-
-/// Per-thread timestamp (in microseconds) when preemption was last disabled.
-/// Used by the watchdog to detect stuck threads.
-static PREEMPTION_DISABLED_SINCE: [AtomicU64; MAX_THREADS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_THREADS]
-};
-
-/// Track last time we ran the watchdog check (for detecting time jumps)
-static LAST_WATCHDOG_CHECK_US: AtomicU64 = AtomicU64::new(0);
-
-/// Diagnostic: source location (`core::panic::Location` pointer) of the
-/// `disable_preemption()` call that took each thread's count 0→1. Read by the
-/// preemption watchdog so a long-disabled thread's log line names the culprit
-/// call site instead of just the tid. Pointer to a `&'static Location`, so a
-/// relaxed usize store is safe.
-static PREEMPTION_DISABLED_AT: [AtomicU64; MAX_THREADS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_THREADS]
-};
-
-/// The file:line that first disabled preemption for `tid` (0→1 transition), if
-/// still disabled. For the watchdog diagnostics.
-pub fn preemption_disabled_at(tid: usize) -> Option<&'static core::panic::Location<'static>> {
-    let ptr = PREEMPTION_DISABLED_AT[tid].load(Ordering::Relaxed) as usize;
-    if ptr == 0 || PREEMPTION_DISABLED[tid].load(Ordering::Relaxed) == 0 {
-        None
-    } else {
-        // SAFETY: only ever stores `Location::caller()` pointers, which are &'static.
-        Some(unsafe { &*(ptr as *const core::panic::Location<'static>) })
-    }
-}
-
-/// Disable preemption for the current thread.
-///
-/// Can be nested - must call `enable_preemption()` the same number of times.
-/// While preemption is disabled, timer interrupts will not cause a context switch
-/// for THIS thread, but IRQs are still enabled and yield_now() still works.
-///
-/// Use this to protect code that uses RefCell or other non-thread-safe structures.
-#[inline]
-#[track_caller]
-pub fn disable_preemption() {
-    let tid = get_current_thread_register();
-    let prev = PREEMPTION_DISABLED[tid].fetch_add(1, Ordering::SeqCst);
-    // Record timestamp on first disable (nesting level 0 -> 1)
-    if prev == 0 {
-        // `runtime()` panics when unregistered, and this is the one line in the
-        // path that needs it — a diagnostic timestamp. PreemptGuard documents
-        // itself as usable "during early boot and in host tests alike", which is
-        // only true if this degrades instead of panicking. (Host tests of
-        // akuma-ext2 reach here via its no-bkl-vfs PreemptGuard once `smp-shared`
-        // is in the default feature set.)
-        let now = if crate::runtime::is_registered() { (runtime().uptime_us)() } else { 0 };
-        PREEMPTION_DISABLED_SINCE[tid].store(now, Ordering::Release);
-        PREEMPTION_DISABLED_AT[tid]
-            .store(core::panic::Location::caller() as *const _ as u64, Ordering::Relaxed);
-    }
-}
-
-/// Re-enable preemption for the current thread.
-///
-/// Must be called once for each call to `disable_preemption()`.
-#[inline]
-pub fn enable_preemption() {
-    let tid = get_current_thread_register();
-    let prev = PREEMPTION_DISABLED[tid].fetch_sub(1, Ordering::SeqCst);
-    debug_assert!(prev > 0, "enable_preemption called without matching disable");
-    // Clear timestamp when fully re-enabled (nesting level 1 -> 0)
-    if prev == 1 {
-        PREEMPTION_DISABLED_SINCE[tid].store(0, Ordering::Release);
-    }
-}
 
 /// Real shared-kernel SMP: adopt the CURRENT execution context — a secondary core's
 /// boot/trampoline context, running on its boot stack — as that core's idle thread, so
@@ -1881,69 +1806,6 @@ pub fn adopt_current_as_core_idle(
     THREAD_STATES[slot].store(thread_state::RUNNING, Ordering::SeqCst);
     register_core_idle(core_id, slot);
     Some(slot)
-}
-
-/// Check if preemption is currently disabled for the current thread.
-#[inline]
-pub fn is_preemption_disabled() -> bool {
-    let tid = get_current_thread_register();
-    PREEMPTION_DISABLED[tid].load(Ordering::SeqCst) > 0
-}
-
-/// Read the per-thread preemption-disable nesting count for `tid`.
-/// Used by diagnostics (e.g. the timer-tick log) to detect a leaked
-/// `disable_preemption()` that starves the scheduler.
-#[inline]
-pub fn preemption_disabled_count(tid: usize) -> usize {
-    PREEMPTION_DISABLED[tid].load(Ordering::SeqCst)
-}
-
-/// Check if preemption has been disabled for too long (watchdog).
-/// Called from timer interrupt handler.
-/// Returns:
-/// - None: preemption not disabled or within normal time
-/// - Some(duration_us): preemption disabled for this many microseconds
-pub fn check_preemption_watchdog() -> Option<u64> {
-    let tid = get_current_thread_register();
-    let now = (runtime().uptime_us)();
-    
-    // Detect time jumps (host sleep/wake)
-    let last_check = LAST_WATCHDOG_CHECK_US.swap(now, Ordering::SeqCst);
-    if last_check > 0 {
-        let gap = now.saturating_sub(last_check);
-        if gap > MAX_EXPECTED_CHECK_GAP_US {
-            // Time jumped - host probably slept. Log and reset timestamps.
-            // Safe print without heap allocation
-            safe_print!(128, "[WATCHDOG] Time jump detected: {}ms (host sleep/wake)\n", gap / 1000);
-            
-            // Reset timestamp for this thread to avoid false alarm
-            let disabled_since = PREEMPTION_DISABLED_SINCE[tid].load(Ordering::Acquire);
-            if disabled_since != 0 {
-                PREEMPTION_DISABLED_SINCE[tid].store(now, Ordering::Release);
-            }
-            return None;
-        }
-    }
-    
-    let disabled_since = PREEMPTION_DISABLED_SINCE[tid].load(Ordering::Acquire);
-    if disabled_since == 0 {
-        return None;
-    }
-    
-    let duration = now.saturating_sub(disabled_since);
-    
-        if duration >= PREEMPTION_WATCHDOG_PANIC_US {
-            // Critical: been disabled way too long - just log and continue
-            // DO NOT use panic! here - we're in IRQ context
-            safe_print!(128, "[WATCHDOG] Thread {} preemption disabled {}ms (critical)\n", tid, duration / 1000);
-            return Some(duration);
-        }
-     else if duration >= PREEMPTION_WATCHDOG_WARN_US {
-        // Warning: something is slow
-        return Some(duration);
-    }
-    
-    None
 }
 
 // ============================================================================
@@ -2876,14 +2738,10 @@ const YIELD_MASKED_WARN_LIMIT: u32 = 8;
 pub fn yield_now() {
     #[cfg(target_os = "none")]
     {
-        let daif: u64;
-        unsafe {
-            core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
-        }
-        // DAIF.I is bit 7. If set, the SGI we are about to trigger will not
-        // be delivered to this core until IRQs are re-enabled — yield_now
-        // becomes a no-op and the caller spins.
-        if (daif & 0x80) != 0 {
+        // If DAIF.I is set, the SGI we are about to trigger will not be delivered
+        // to this core until IRQs are re-enabled — yield_now becomes a no-op and
+        // the caller spins.
+        if (akuma_primitives::irq::read_daif() & akuma_primitives::irq::DAIF_I_MASKED) != 0 {
             YIELD_WITH_IRQS_MASKED.fetch_add(1, Ordering::Relaxed);
             let warns = YIELD_MASKED_WARNED.fetch_add(1, Ordering::Relaxed);
             if warns < YIELD_MASKED_WARN_LIMIT {

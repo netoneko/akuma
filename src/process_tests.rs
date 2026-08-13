@@ -119,6 +119,10 @@ pub fn run_all_tests() {
     // for a whole class of silent cross-subsystem corruption.
     test_stack_canary_overrun_is_reported();
 
+    // `PreemptGuard` must actually disable preemption. Cheap, no spawning, and it
+    // catches a failure mode that is otherwise invisible — see the fn doc.
+    test_preempt_guard_is_live();
+
     // Real (shared-kernel) SMP M0: confirm every secondary the DTB reported came up
     // on the shared kernel. Runs FIRST so it is observed even if a later, unrelated
     // memory-pressure test aborts the suite. No-op on a single-CPU boot.
@@ -16369,6 +16373,93 @@ fn test_pmm_heap_lock_order_smp() {
 /// Two halves, and the first matters as much as the second: no false positive on
 /// a healthy boot (a reporter that cried wolf would be turned off again), and a
 /// real detection when a canary is actually broken.
+/// `PreemptGuard` is only a guard if its `smp-shared` feature reached the crate
+/// that defines it.
+///
+/// It lives in `akuma-primitives` (the leaf crate — see
+/// `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.555), and its whole
+/// body is behind `#[cfg(kernel_smp_shared)]`, which that crate's `build.rs`
+/// emits from its own forwarded `smp-shared` feature. So if the forwarding chain
+/// ever breaks — the bin crate's `smp-shared` not reaching
+/// `akuma-primitives/smp-shared` — the guard silently compiles to a zero-sized
+/// no-op. Nothing fails to build, nothing warns; every inner-spinlock critical
+/// section in the kernel simply stops being protected from preemption, and the
+/// symptom is a rare SMP corruption or wedge somewhere else entirely.
+///
+/// That is exactly the dormant-`cfg` class the tree has been bitten by before
+/// (`akuma-exec` shipped without a `build.rs` once, leaving the demand-paged ELF
+/// loader silently inactive on the size profile). So: assert the guard is real,
+/// on the profile where it is supposed to be real.
+fn test_preempt_guard_is_live() {
+    use akuma_primitives::preempt::{
+        MAX_THREADS, PreemptGuard, current_tid, is_preemption_disabled, preemption_disabled_count,
+    };
+
+    let tid = current_tid();
+    let outer = preemption_disabled_count(tid);
+
+    // Nesting is counted, not boolean: an inner guard dropping must not re-enable
+    // preemption while an outer one is still held.
+    let (inside_1, inside_2, still_held, after) = {
+        let _g1 = PreemptGuard::new();
+        let inside_1 = preemption_disabled_count(tid);
+        let inside_2 = {
+            let _g2 = PreemptGuard::new();
+            preemption_disabled_count(tid)
+        };
+        let still_held = is_preemption_disabled();
+        drop(_g1);
+        (inside_1, inside_2, still_held, preemption_disabled_count(tid))
+    };
+
+    // Under `smp-shared` the guard must bite; without it, it is a documented
+    // no-op and the counts stay flat.
+    #[cfg(kernel_smp_shared)]
+    let expected_live = true;
+    #[cfg(not(kernel_smp_shared))]
+    let expected_live = false;
+
+    let counts_ok = if expected_live {
+        inside_1 == outer + 1 && inside_2 == outer + 2 && still_held && after == outer
+    } else {
+        inside_1 == outer && inside_2 == outer && after == outer
+    };
+
+    // The guard also carries the saved DAIF under the BKL-drop features, so a
+    // zero-sized guard on a `no-bkl-*` build means the IRQ-masking half vanished
+    // too — the AB-BA wedge protection.
+    let size = core::mem::size_of::<PreemptGuard>();
+    let size_ok = if expected_live { size > 0 } else { size == 0 };
+
+    // MAX_THREADS is now defined in `akuma-primitives` and re-exported by
+    // `akuma-exec`; they cannot disagree, but the profile gate that picks 256 vs
+    // 64 is evaluated in the leaf crate's build.rs, so confirm it landed.
+    #[cfg(kernel_profile_extreme)]
+    let threads_ok = MAX_THREADS == 64;
+    #[cfg(not(kernel_profile_extreme))]
+    let threads_ok = MAX_THREADS == 256;
+    let agree_ok = MAX_THREADS == akuma_exec::threading::MAX_THREADS;
+
+    let pass = counts_ok && size_ok && threads_ok && agree_ok;
+    crate::safe_print!(
+        224,
+        "  live={} counts {}->{}/{}->{} held={} size={} max_threads={}\n",
+        expected_live,
+        outer,
+        inside_1,
+        inside_2,
+        after,
+        still_held,
+        size,
+        MAX_THREADS
+    );
+    crate::safe_print!(
+        96,
+        "[Test] preempt_guard_is_live {}\n",
+        if pass { "PASSED" } else { "FAILED" }
+    );
+}
+
 fn test_stack_canary_overrun_is_reported() {
     use akuma_exec::threading;
 

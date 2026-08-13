@@ -22,14 +22,18 @@ fs-cache = []
 # `akuma_exec::sync::PreemptGuard`, so a core running an fs syscall WITHOUT the
 # BKL can never be caught holding an ext2 inner lock while a nested IRQ
 # hard-spins on the BKL (the AB-BA wedge `no-bkl-network` hit at SMP=4).
-# `akuma-exec`'s own `smp-shared` / `no-bkl-vfs` features are enabled by the bin
-# crate; cargo unifies them across the graph, so this flag only gates whether
-# akuma-ext2 *calls* the guard.
-no-bkl-vfs = []
+# Forwarded to `akuma-primitives` so the guard's IRQ-masking half is active even
+# in a graph that does not include `akuma-exec` (e.g. `cargo test -p akuma-ext2`);
+# previously this relied on cargo unifying `akuma-exec`'s copy of the feature.
+no-bkl-vfs = ["akuma-primitives/no-bkl-vfs"]
 
 [dependencies]
 akuma-vfs = { path = "../akuma-vfs" }
-# For `sync::PreemptGuard` (the IRQ-masking inner-lock guard) under `no-bkl-vfs`.
-# No cycle: akuma-exec -> akuma-isolation -> akuma-vfs, and akuma-vfs is a leaf.
-akuma-exec = { path = "../akuma-exec" }
+# `OnceCopy` (the lock-free thread hooks) + `PreemptGuard` (the IRQ-masking
+# inner-lock guard under `no-bkl-vfs`). These two symbols were the ENTIRE reason
+# this crate depended on `akuma-exec` — the 23.8k-line execution crate, for a
+# ~40-line RAII guard and a ~40-line cell. Both live in the dependency-free leaf
+# now, so that edge is gone: see
+# docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md 5.55 / 5.555.
+akuma-primitives = { path = "../akuma-primitives" }
 spinning_top = "0.3"

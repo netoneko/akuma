@@ -6,40 +6,17 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-/// Mask local IRQs (set `DAIF.I`) and return the prior `DAIF` for [`irq_restore`]. Used by
-/// [`KernelLock::acquire`] to make its FIFO ticket wait atomic against local exception
-/// nesting, and by [`PreemptGuard`] to make inner-spinlock critical sections nest-free
-/// under a dropped BKL. Bare-metal AArch64 only; a no-op returning `0` on host builds
-/// (single-threaded tests have no local IRQs).
-#[cfg(target_os = "none")]
-#[inline(always)]
-pub fn irq_save_mask() -> u64 {
-    let daif: u64;
-    // SAFETY: reading DAIF and setting the IRQ mask bit have no memory effects.
-    unsafe {
-        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
-        core::arch::asm!("msr daifset, #0x2", options(nomem, nostack));
-    }
-    daif
-}
-
-/// Restore `DAIF` saved by [`irq_save_mask`]. Bare-metal AArch64 only; no-op on host.
-#[cfg(target_os = "none")]
-#[inline(always)]
-pub fn irq_restore(daif: u64) {
-    // SAFETY: restoring the previously-saved DAIF; no memory effects.
-    unsafe { core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack)) };
-}
-
-#[cfg(not(target_os = "none"))]
-#[inline(always)]
-pub fn irq_save_mask() -> u64 {
-    0
-}
-
-#[cfg(not(target_os = "none"))]
-#[inline(always)]
-pub fn irq_restore(_daif: u64) {}
+/// Bare DAIF save/mask and restore, re-exported from `akuma_primitives::irq`.
+///
+/// Used by [`KernelLock::acquire`] to make its FIFO ticket wait atomic against
+/// local exception nesting, and by [`PreemptGuard`] to make inner-spinlock
+/// critical sections nest-free under a dropped BKL.
+///
+/// These carry **no `isb`**, while `IrqGuard` — the same operation, and until
+/// now a separate implementation — does. That difference is deliberately
+/// preserved by the merge; `akuma_primitives::irq`'s header explains the cost on
+/// each side of resolving it.
+pub use akuma_primitives::irq::{irq_restore, irq_save_mask};
 
 /// Total Big-Kernel-Lock spin iterations across all contended [`KernelLock::acquire`]
 /// calls — a cross-core BKL-wait-time proxy for A/B measurement (e.g. does dropping the
@@ -97,103 +74,20 @@ pub fn kernel_lock_lost_ticket_recoveries() -> u64 {
 
 // --- PreemptGuard ---------------------------------------------------------------
 
-/// RAII guard that disables scheduler preemption (and, under the BKL-drop features,
-/// masks local IRQs) for the lifetime of a kernel spinlock critical section.
+/// RAII guard that disables scheduler preemption (and, under the BKL-drop
+/// features, masks local IRQs) for the lifetime of a kernel spinlock critical
+/// section.
 ///
-/// Under real shared-kernel SMP (`smp-shared` feature), the inner spinlocks protecting
-/// kernel state (`NETWORK`, `SOCKET_TABLE`, `Ext2Filesystem::state`, `BLOCK_DEVICE`,
-/// `proc.fds.table`, ...) must never be held across a context switch. The Big Kernel
-/// Lock is released on an EL1→EL0 return, so a thread descheduled while holding one of
-/// these inner spinlocks strands the lock — and any *other* core that then spins on it
-/// does so **while holding the BKL**, wedging every core (the BKL owner can never be
-/// rescheduled to release the inner lock).
+/// **Moved to `akuma_primitives::preempt`** — see that type's docs for the
+/// `no-bkl-*` AB-BA reasoning and the full lift history. It lived here because
+/// this crate owned both `threading::disable_preemption` and `irq_save_mask`;
+/// the leaf crate owns both now, which is what let `akuma-ext2` and
+/// `akuma-net` stop depending on this one for a ~40-line guard.
 ///
-/// Disabling preemption for the hold keeps the holder on-core until it releases, so
-/// under the BKL the inner lock is never cross-core contended (the BKL already provides
-/// the mutual exclusion; this guard only prevents the strand). The critical sections it
-/// wraps must never voluntarily yield/block — same rule the kernel already followed on
-/// single-core.
-///
-/// A zero-cost no-op on every non-`smp-shared` build: `new`/`drop` compile to nothing,
-/// so the hot path is byte-for-byte unchanged.
-///
-/// **`no-bkl-*` addition — local IRQs are masked for the hold too.** With the Big
-/// Kernel Lock dropped around a subsystem's syscalls (network: `no-bkl-network`, VFS:
-/// `no-bkl-vfs`), this core can be inside one of those critical sections *without*
-/// owning the BKL. A nested IRQ then runs `enter_kernel()` (exceptions.rs), which
-/// hard-spins (IRQs masked) until the BKL frees — while THIS core still holds the inner
-/// spinlock. If the current BKL owner is meanwhile spinning on that same inner lock (the
-/// async-main poller does exactly that on `NETWORK`, near-constantly), the two cores
-/// deadlock AB-BA and every other core piles into the BKL wait: the SMP=4 hard wedge
-/// (`[BKL] stuck`, owner frozen nonzero, guest timer starved). Masking IRQs for the
-/// (short) hold makes the window nest-free, so a core can never be caught "holding an
-/// inner lock, waiting for the BKL". Plain `smp-shared` builds don't need it — there
-/// EL1 always holds the BKL, so the nested `enter_kernel` is the idempotent owner fast
-/// path.
-///
-/// # Lift history
-///
-/// Originally `akuma-net::runtime::PreemptGuard` (where it was wired through the
-/// `NetRuntime` registration callbacks so the net crate could stay decoupled from
-/// `akuma-exec`). Lifted here so the VFS BKL-drop path (`no-bkl-vfs`) can reuse the
-/// same primitive without duplicating it, and because `akuma-exec` owns both
-/// `threading::disable_preemption` and `irq_save_mask` directly — no runtime callback
-/// indirection needed. The net crate re-exports it from
-/// `akuma_net::runtime::PreemptGuard` for source compatibility.
-#[must_use]
-pub struct PreemptGuard {
-    /// Whether `new()` actually disabled preemption. Present only under `smp-shared`;
-    /// other builds carry no state.
-    #[cfg(feature = "smp-shared")]
-    active: bool,
-    /// Saved DAIF to restore on drop (`no-bkl-*` builds only — see type doc).
-    #[cfg(all(feature = "smp-shared", any(feature = "no-bkl-network", feature = "no-bkl-vfs")))]
-    saved_daif: u64,
-}
-
-impl PreemptGuard {
-    /// Disable preemption (under `smp-shared`) until the returned guard drops.
-    #[inline]
-    pub fn new() -> Self {
-        #[cfg(feature = "smp-shared")]
-        {
-            // Direct call: akuma-exec owns threading. No runtime registration needed
-            // (the historical reason net used a callback pointer), so this works during
-            // early boot and in host tests alike.
-            crate::threading::disable_preemption();
-            let active = true;
-            // Mask IRQs AFTER disabling preemption so drop's reverse order re-enables
-            // preemption only once IRQs are live again.
-            #[cfg(any(feature = "no-bkl-network", feature = "no-bkl-vfs"))]
-            return Self { active, saved_daif: irq_save_mask() };
-            #[cfg(not(any(feature = "no-bkl-network", feature = "no-bkl-vfs")))]
-            return Self { active };
-        }
-        #[cfg(not(feature = "smp-shared"))]
-        Self {}
-    }
-}
-
-impl Default for PreemptGuard {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for PreemptGuard {
-    #[inline]
-    fn drop(&mut self) {
-        // Restore IRQs first (reverse of new's order), then re-enable preemption — so
-        // a timer IRQ can't preempt us between enable_preemption and the DAIF restore.
-        #[cfg(all(feature = "smp-shared", any(feature = "no-bkl-network", feature = "no-bkl-vfs")))]
-        irq_restore(self.saved_daif);
-        #[cfg(feature = "smp-shared")]
-        if self.active {
-            crate::threading::enable_preemption();
-        }
-    }
-}
+/// Kept as a re-export so `akuma_exec::sync::PreemptGuard` — and
+/// `akuma_net::runtime::PreemptGuard`, which re-exports it in turn — keep
+/// resolving.
+pub use akuma_primitives::preempt::PreemptGuard;
 
 /// Acquire a [`spinning_top::Spinlock`], disabling this thread's preemption for one
 /// non-blocking attempt at a time — never across the whole wait.

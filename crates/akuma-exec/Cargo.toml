@@ -11,19 +11,19 @@ workspace = true
 # (build_extreme_size.sh). Lets this crate's build.rs emit
 # `cfg(kernel_profile_extreme)` so threading can trim the warm-stack floor and
 # right-size kernel stacks for the extreme low-memory target. NOT a syscall gate.
-extreme = []
+extreme = ["akuma-primitives/extreme"]
 
 # Real (shared-kernel) SMP, forwarded from the bin crate's `smp-shared` feature.
 # Lets this crate's build.rs emit `cfg(kernel_smp_shared)` so the Big Kernel Lock
 # (`bkl`) is active; with it off, `bkl` compiles to zero-overhead no-ops and the
 # default/other builds are unaffected. See docs/reference/subsystems/smp-shared.md.
-smp-shared = []
+smp-shared = ["akuma-primitives/smp-shared"]
 
 # Disable BKL usage for network operations (Phase 2 testing).
 # When enabled, network syscalls skip BKL acquisition and use the new
 # fine-grained network locks instead. Other subsystems still use BKL.
 # Used for testing network BKL-free operations before full BKL removal.
-no-bkl-network = []
+no-bkl-network = ["akuma-primitives/no-bkl-network"]
 
 # Disable BKL usage for VFS operations (Phase 4 of
 # docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), forwarded from the bin crate.
@@ -32,7 +32,7 @@ no-bkl-network = []
 # never be caught holding an inner spinlock while a nested IRQ hard-spins on
 # the BKL (AB-BA wedge — same shape as `no-bkl-network`). Only meaningful with
 # `smp-shared`.
-no-bkl-vfs = []
+no-bkl-vfs = ["akuma-primitives/no-bkl-vfs"]
 
 # Run `fork_process`'s CoW share/demote pass WITHOUT the Big Kernel Lock (Phase 3 of
 # docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), forwarded from the bin crate. Makes

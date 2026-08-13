@@ -225,7 +225,7 @@ impl VirtioBlockDevice {
 /// single-threaded boot.
 ///
 /// If a *new* caller ever reaches [`with_device`] from outside an ext2 state guard, it
-/// must take an `akuma_exec::sync::PreemptGuard` itself — otherwise it reopens the AB-BA
+/// must take an `akuma_primitives::PreemptGuard` itself — otherwise it reopens the AB-BA
 /// window (this core holding BLOCK_DEVICE while a nested IRQ hard-spins for the BKL).
 static BLOCK_DEVICE: Spinlock<Option<VirtioBlockDevice>> = Spinlock::new(None);
 

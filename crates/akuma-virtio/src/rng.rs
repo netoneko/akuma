@@ -327,9 +327,9 @@ impl VirtioRngDevice {
 
         // Program the queue with three independent 64-bit physical addresses,
         // then mark it ready.
-        let desc_phys = akuma_exec::mmu::virt_to_phys(desc as usize) as u64;
-        let avail_phys = akuma_exec::mmu::virt_to_phys(avail as usize) as u64;
-        let used_phys = akuma_exec::mmu::virt_to_phys(used as usize) as u64;
+        let desc_phys = akuma_primitives::addr::virt_to_phys(desc as usize) as u64;
+        let avail_phys = akuma_primitives::addr::virt_to_phys(avail as usize) as u64;
+        let used_phys = akuma_primitives::addr::virt_to_phys(used as usize) as u64;
         unsafe {
             write_volatile(
                 (base_addr + VIRTIO_MMIO_QUEUE_DESC_LOW) as *mut u32,
@@ -415,7 +415,7 @@ impl VirtioRngDevice {
             let desc_idx = 0u16;
             unsafe {
                 let d = &mut *self.desc.add(desc_idx as usize);
-                d.addr = akuma_exec::mmu::virt_to_phys(self.buffer as usize) as u64;
+                d.addr = akuma_primitives::addr::virt_to_phys(self.buffer as usize) as u64;
                 d.len = to_read as u32;
                 d.flags = VIRTQ_DESC_F_WRITE;
                 d.next = 0;

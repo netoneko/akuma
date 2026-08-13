@@ -42,7 +42,7 @@ dependencies = [
 name = "akuma-ext2"
 version = "0.1.0"
 dependencies = [
- "akuma-exec",
+ "akuma-primitives",
  "akuma-vfs",
  "spinning_top",
 ]
@@ -59,7 +59,7 @@ dependencies = [
 name = "akuma-net"
 version = "0.1.0"
 dependencies = [
- "akuma-exec",
+ "akuma-primitives",
  "akuma-rump",
  "akuma-virtio",
  "embedded-io-async",
@@ -95,7 +95,6 @@ dependencies = [
 name = "akuma-virtio"
 version = "0.1.0"
 dependencies = [
- "akuma-exec",
  "akuma-primitives",
  "spinning_top",
  "virtio-drivers",

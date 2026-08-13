@@ -18,15 +18,11 @@ use alloc::string::String;
 /// RAM (¼ of user pages ÷ `USER_THREAD_STACK_SIZE`) and clamps to this value — so thread
 /// capacity already scales with memory, and this is only the cap it scales against.
 ///
-/// 256 on normal profiles: the per-slot statics here are BSS whether used or not, and a
-/// few hundred KB is free on a multi-GB box, while 64 was measurably binding (one process
-/// could hold ~52 threads, and 16-way `pthread_create` load hit genuine exhaustion).
-/// `size`/`extreme-size` keep 64 — they target a 4 MB RAM floor where that BSS is real
-/// money and nothing there spawns hundreds of threads.
-#[cfg(not(kernel_profile_extreme))]
-pub const MAX_THREADS: usize = 256;
-#[cfg(kernel_profile_extreme)]
-pub const MAX_THREADS: usize = 64;
+/// Re-exported from `akuma_primitives::preempt`, which owns the per-slot preemption
+/// statics sized by it. Same reason this const already existed here rather than in the
+/// bin crate: two independent literals with a "must match" comment silently disagreed
+/// once (2026-08-04), so there is exactly one definition.
+pub use akuma_primitives::preempt::MAX_THREADS;
 
 /// Thread 0 is the boot/idle thread - always protected, never terminated
 pub const IDLE_THREAD_IDX: usize = 0;
@@ -58,15 +54,11 @@ pub const EXCEPTION_STACK_SIZE: usize = 16384 * 2;
 /// The NEON block sits between the TPIDR push and x10/x11 in the frame.
 pub const IRQ_FRAME_SIZE: usize = 304 + 528;
 
-/// Maximum time preemption can be disabled before watchdog warning (100ms)
-pub const PREEMPTION_WATCHDOG_WARN_US: u64 = 100_000;
-
-/// Maximum time preemption can be disabled before watchdog panic (5 seconds)
-pub const PREEMPTION_WATCHDOG_PANIC_US: u64 = 5_000_000;
-
-/// Maximum expected gap between watchdog checks (100ms).
-/// If we see a gap larger than this, the host likely slept.
-pub const MAX_EXPECTED_CHECK_GAP_US: u64 = 100_000;
+/// Preemption watchdog thresholds, re-exported from `akuma_primitives::preempt`
+/// along with the watchdog that reads them.
+pub use akuma_primitives::preempt::{
+    MAX_EXPECTED_CHECK_GAP_US, PREEMPTION_WATCHDOG_PANIC_US, PREEMPTION_WATCHDOG_WARN_US,
+};
 
 /// Thread state values for lock-free atomic operations
 pub mod thread_state {

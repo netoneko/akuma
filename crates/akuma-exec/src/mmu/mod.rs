@@ -167,15 +167,14 @@ pub fn init_shared_device_tables() {
 // Physical/Virtual Address Translation
 // =============================================================================
 
-#[inline(always)]
-pub fn phys_to_virt(paddr: usize) -> *mut u8 {
-    paddr as *mut u8
-}
-
-#[inline(always)]
-pub fn virt_to_phys(vaddr: usize) -> usize {
-    vaddr
-}
+/// Kernel virtual/physical translation, re-exported from `akuma_primitives::addr`.
+///
+/// Both are the identity, and both are `#[inline(always)]` — moving them is what
+/// let `akuma-virtio` (and through it `akuma-net`) stop depending on this crate.
+/// Read that module's header before changing either: they must stay free
+/// functions, because Phase 3 deleted the runtime-hook version for costing a
+/// spinlocked read on the per-packet DMA path.
+pub use akuma_primitives::addr::{phys_to_virt, virt_to_phys};
 
 /// Make freshly-written instruction bytes in `[kva, kva + len)` visible to the
 /// instruction-fetch path. `kva` is a *kernel* (identity) virtual address that

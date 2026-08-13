@@ -14,14 +14,14 @@ pub const NUM_SLOTS: usize = 8;
 /// The QEMU virt machine's eight virtio-mmio slots, 0x200 bytes apart, as seen
 /// through the kernel's device mapping (`DEV_VIRTIO_VA`, remapped via L0[1]).
 pub const VIRTIO_MMIO_ADDRS: [usize; NUM_SLOTS] = [
-    akuma_exec::mmu::DEV_VIRTIO_VA,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0x200,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0x400,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0x600,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0x800,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0xa00,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0xc00,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0xe00,
+    akuma_primitives::addr::DEV_VIRTIO_VA,
+    akuma_primitives::addr::DEV_VIRTIO_VA + 0x200,
+    akuma_primitives::addr::DEV_VIRTIO_VA + 0x400,
+    akuma_primitives::addr::DEV_VIRTIO_VA + 0x600,
+    akuma_primitives::addr::DEV_VIRTIO_VA + 0x800,
+    akuma_primitives::addr::DEV_VIRTIO_VA + 0xa00,
+    akuma_primitives::addr::DEV_VIRTIO_VA + 0xc00,
+    akuma_primitives::addr::DEV_VIRTIO_VA + 0xe00,
 ];
 
 /// Offset of the `DeviceID` register in the virtio-mmio layout.
