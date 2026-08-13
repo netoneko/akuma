@@ -5,6 +5,16 @@ dependency below was measured out of the tree on that date; the design decisions
 are recorded with their reasoning so they can be re-argued rather than
 re-discovered.
 
+> **Updated 2026-08-13, after the §8.1 CoW merge landed** (its precondition, see §7).
+> The merge moved three of this plan's numbers, and they are corrected in place below:
+> `ExecRuntime` is now **44 fn pointers of which 13 are the PMM** (`cow_fault_lock`
+> and `cow_fault_unlock` are deleted), so the deletion in §7 step 5 is 13, not 15, and
+> the net indirection saving in §4 is −13 +4 = **−9**. `COW_FAULT_LOCK` is already
+> gone, so §7 step 3 is only the table move. `memmath` gained `next_reclaim_step` /
+> `ReclaimStep`, which §5 must migrate along with the poison codec and the reserve —
+> the escalation's *decision* is already extracted and host-tested; what §4 moves into
+> the crate is its *effects*.
+
 Prompted by the question "would you advise extracting pmm into a crate?" and by
 the observation that answered it: **every extraction so far has landed in
 `akuma-exec`**, which is now 23.8k lines, because it is the only crate holding
@@ -16,20 +26,20 @@ is not aesthetic.
 
 ## 1. The boundary already exists — you are paying for it at runtime
 
-`ExecRuntime` (`crates/akuma-exec/src/runtime.rs`) is **46 function pointers**,
-and **15 of them are the PMM**:
+`ExecRuntime` (`crates/akuma-exec/src/runtime.rs`) is **44 function pointers**
+(46 before the §8.1 merge deleted two), and **13 of them are the PMM**:
 
 ```
 alloc_page              alloc_page_zeroed        alloc_pages_contiguous_zeroed
 free_page               free_pages_contiguous    pmm_stats
 free_count              total_count              track_frame
 cow_ref_inc             cow_ref_dec              cow_ref_get
-cow_fault_lock          cow_fault_unlock         is_memory_low
+is_memory_low
 ```
 
 That indirection exists for exactly one reason: so `akuma-exec` does not have to
 depend on the PMM, which lives in the kernel binary crate. Make the PMM a crate
-and the dependency becomes ordinary, the 15 pointers disappear, and three of them
+and the dependency becomes ordinary, the 13 pointers disappear, and three of them
 (`alloc_page_zeroed`, `track_frame`, `cow_ref_inc`) are on the **fault path**.
 
 This is the same argument Phase 3 of
@@ -39,10 +49,11 @@ already used once, when it deleted the `NetHal` runtime indirection because it
 functions." Same shape, larger scale, and this time the indirection also blocks
 host testing of the tree's most consequential allocator.
 
-Three of those 15 are already dead weight:
-[`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §5 found `cow_ref_dec`,
-`cow_fault_lock` and `cow_fault_unlock` are **never called through the runtime
-table at all** (`cow_ref_inc` at `process/mod.rs:265` is the only live one).
+Two of those 13 are already dead weight: `cow_ref_dec` and `cow_ref_get` are **never
+called through the runtime table at all** — `cow_ref_inc` (`process/mod.rs:298`) is the
+only live CoW pointer. [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §5 found this and
+reported "3 of 4"; measured, it was **4 dead of 5**, and the §8.1 merge deleted two of
+the four (`cow_fault_lock`, `cow_fault_unlock`), leaving these two for step 5.
 
 ## 2. Feasibility: no cycle, and the leaf already has what PMM needs
 
@@ -136,8 +147,23 @@ So the escalation belongs **inside `akuma-pmm`**, which makes the hot call
 | `evict_clean_file_pages(n) -> usize` | `process::reclaim_clean_file_pages` | step 3, pressure only |
 | `shrink_page_cache(n) -> usize` | `file_page_cache::shrink` | step 3b, pressure only |
 
-Net indirection: **−15 (ExecRuntime) +4 (cold PmmHooks) = −11**, and every hot
+Net indirection: **−13 (ExecRuntime) +4 (cold PmmHooks) = −9**, and every hot
 path — `free_count`, `alloc_page*`, `cow_ref_*` — becomes a direct call.
+
+**What the §8.1 merge already did to this table.** The escalation's *order* and its
+give-up decision are no longer in `src/` at all: they are `memmath::next_reclaim_step`
+returning a `ReclaimStep`, host-tested, with `src/pmm.rs` holding only a loop that
+performs the step it is handed. So this section's work is now narrower and lower-risk
+than written — move the four *effects* behind hooks and let the crate call the decision
+function it already has. Two notes for whoever does it:
+
+- **The four hooks' `-> usize` return values are not the progress signal.** The loop
+  deliberately judges progress by re-reading `free_count()`, because
+  `drain_retired_under_pressure` declines *silently* inside its 10 ms cooldown and
+  cannot report whether it helped. Keep the return values for diagnostics if you like,
+  but a hook that returns 0 must not be treated as "this step is exhausted".
+- **`next_reclaim_step` moves with the reserve (§5), not with the effects.** It is pure
+  arithmetic over a free-page count; it belongs wherever `USER_PAGE_RESERVE` ends up.
 
 ### These hooks must be mandatory-registration, not optional
 
@@ -158,12 +184,15 @@ cannot occur before userspace exists.
 §5.11 moved the quarantine poison codec (`POISON_MAGIC`, `poison_word`,
 `poison_decode`, `poison_word_frame`) and the user-page reserve
 (`USER_PAGE_RESERVE`, `user_alloc_would_starve`, `user_readahead_budget`) into
-`akuma_exec::memmath`. Both are **PMM concepts**; they went to `akuma-exec`
-because no PMM crate existed and `src/` was host-unreachable.
+`akuma_exec::memmath`. The §8.1 merge then added a third PMM concept for the same
+reason — **`next_reclaim_step` / `ReclaimStep`**, the reclaim escalation's decision.
+All three are **PMM concepts**; they went to `akuma-exec` because no PMM crate existed
+and `src/` was host-unreachable.
 
 They should migrate to `akuma-pmm` when it lands, leaving `memmath` with the fork
 copy-range math and the mapping predicates — i.e. the things whose consumer really
-is `akuma-exec`. Treat `memmath` as a correct waypoint under a constraint that
+is `akuma-exec`. Take their host tests with them: that is 17 tests in `memmath::tests`
+today, of which 6 are the escalation's. Treat `memmath` as a correct waypoint under a constraint that
 this change removes, not as a mistake and not as a final home.
 
 ## 6. The payoff that is not about line counts
@@ -179,13 +208,26 @@ whose bugs have cost the most:
   drain-under-pressure) is not.
 - **The bitmap allocator** — alloc/free symmetry, contiguous-run search, the
   fragmentation behaviour that `heap_grow_backoff` exists to survive.
-- **The escalation** — five steps with a re-check between each, currently
-  **untested in either place**, because its own boot test says "actually draining
-  RAM to the reserve is unsafe inside the boot suite"
-  (`docs/reference/subsystems/memory.md` → "OOM decision map"). With the four
-  hooks injectable, every step and the cooling-cooldown gap become directly
-  testable: register a `drain_retired` that returns 0 and assert the escalation
-  does not reach `GiveUp` while memory is parked.
+- **The escalation** — four recovery actions plus give-up, with a re-check between
+  each. Its *decision* is **no longer untested**: the §8.1 merge extracted it as
+  `memmath::next_reclaim_step` with 6 host tests, because its own boot test declines
+  to exercise it ("actually draining RAM to the reserve is unsafe inside the boot
+  suite" — `docs/reference/subsystems/memory.md` → "OOM decision map"). What the four
+  injectable hooks add is the *effects*: that each step is actually invoked, in order,
+  and only under pressure.
+
+  **Correction to this bullet as originally written.** It said to "register a
+  `drain_retired` that returns 0 and assert the escalation does not reach `GiveUp`
+  while memory is parked". That is an assertion about a **fix, not about this tree**:
+  a fruitless drain is correctly followed by the remaining steps, and after those the
+  escalation *does* give up, because no step waits for `PROCESS_RECLAIM_COOLDOWN_US`.
+  Writing that test as stated produces a red test, not a caught bug. The behaviour
+  that is real, and is now pinned, is split in two:
+  `fruitless_drain_retired_continues_instead_of_giving_up` (a fruitless step must not
+  short-circuit to `GiveUp`) and
+  `give_up_after_the_last_rung_is_the_known_premature_oom` (after the last step it
+  does, and that is the open defect). Making the cooldown wait is a behavioural change
+  to *when processes get killed* — schedule it as defect work, not as a test.
 
 ### It also subsumes the host-test audit's biggest scaffolding item
 
@@ -208,16 +250,37 @@ not before or during. Both touch the `cow_ref_dec` protocol, and the merge's
 entire verification story is *"nothing changed"* — moving the refcount table to
 another crate inside that window destroys the ability to attribute a regression.
 
+> **The merge LANDED 2026-08-13** (uncommitted at time of writing), so this
+> precondition is satisfied. See §8.1's status block for what it changed and the four
+> errors it corrected.
+>
+> **How to check the precondition, if you need to check it again.** Do **not** grep for
+> `FaultSlotGuard`: that symbol is §8's *row 1* — the per-page demand-paging slot
+> guard — and it landed earlier, in a different change. It is present in trees where
+> the CoW merge is absent, so keying the precondition on it returns a false positive
+> and walks you straight into the unattributable window this section exists to
+> prevent. The reliable checks are:
+>
+> ```bash
+> grep -rn "next_reclaim_step" crates/akuma-exec/src/memmath.rs   # present  => landed
+> grep -rn "cow_fault_lock" src/ crates/                          # absent   => landed
+> grep -rn "complete_cow_break" src/exceptions.rs                 # 3 call sites
+> ```
+
 Suggested order once the merge has landed and been verified:
 
 1. `PmmConfig` + the 4 hooks, still inside `src/` — pure plumbing, no move. Verify.
 2. Move the allocator core + `FrameTracker` + ledgers + quarantine into
    `akuma-pmm`, re-exported from `src/pmm.rs` so no call site changes. Verify.
-3. Move the CoW refcount table and delete `COW_FAULT_LOCK`. Verify.
-4. Move the escalation in; make `free_count` internal. Verify.
-5. Delete the 15 `ExecRuntime` fields and point `akuma-exec` at the crate. Verify.
-6. Migrate the poison codec and reserve out of `memmath` (§5).
-7. Host tests: allocator, refcounts, quarantine, escalation.
+3. Move the CoW refcount table. (`COW_FAULT_LOCK` is already deleted — §8.1 item 2.)
+4. Move the escalation's *effects* in; make `free_count` internal. Its decision is
+   already `memmath::next_reclaim_step` and travels with the reserve in step 6.
+5. Delete the **13** remaining `ExecRuntime` PMM fields and point `akuma-exec` at the
+   crate. Verify.
+6. Migrate the poison codec, the reserve and `next_reclaim_step` out of `memmath` (§5),
+   with their 17 host tests.
+7. Host tests: allocator, refcounts, quarantine, and the escalation's *effects* (the
+   decision already has 6).
 
 **The risk is real and should be stated plainly:** `src/pmm.rs` is the file behind
 the page-table UAF, the premature-free class, and the cargo null-`Rc` defect that

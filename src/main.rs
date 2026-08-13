@@ -506,8 +506,6 @@ pub(crate) fn build_exec_runtime(
         cow_ref_inc: pmm::cow_ref_inc,
         cow_ref_dec: pmm::cow_ref_dec,
         cow_ref_get: pmm::cow_ref_get,
-        cow_fault_lock: pmm::cow_fault_lock,
-        cow_fault_unlock: pmm::cow_fault_unlock,
     };
     let cfg = akuma_exec::ExecConfig {
         max_threads: config::MAX_THREADS,

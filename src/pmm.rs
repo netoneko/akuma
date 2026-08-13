@@ -1311,9 +1311,15 @@ pub fn alloc_page_zeroed() -> Option<PhysFrame> {
 // `akuma_exec::memmath` — pure arithmetic, host-tested there instead of from the
 // boot suite (docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.11).
 // Re-exported so every existing `pmm::USER_PAGE_RESERVE` /
-// `pmm::user_alloc_would_starve` / `pmm::user_readahead_budget` caller is
-// unchanged and there is still exactly one definition.
-pub use akuma_exec::memmath::{USER_PAGE_RESERVE, user_alloc_would_starve, user_readahead_budget};
+// `pmm::user_readahead_budget` caller is unchanged and there is still exactly one
+// definition.
+//
+// `user_alloc_would_starve` is deliberately NOT re-exported: since the reclaim
+// escalation became `memmath::next_reclaim_step`, the predicate has exactly one
+// consumer — that decision function — and nothing in the kernel asks "would this
+// starve?" without also needing the answer to "so what do I do about it?". Import it
+// from `memmath` directly if that ever stops being true.
+pub use akuma_exec::memmath::{USER_PAGE_RESERVE, user_readahead_budget};
 
 /// Allocate a zeroed page for a **user** demand-paging fault (anonymous fill,
 /// ELF demand-load, reserved-region commit). Returns `None` once free PMM has
@@ -1322,54 +1328,64 @@ pub use akuma_exec::memmath::{USER_PAGE_RESERVE, user_alloc_would_starve, user_r
 /// kill path. Kernel-internal callers (page tables, heap growth) keep calling
 /// [`alloc_page_zeroed`], which is allowed to dip into the reserve.
 pub fn alloc_page_zeroed_user() -> Option<PhysFrame> {
-    if user_alloc_would_starve(free_count()) {
-        // One reclaim attempt (return any fully-free heap watermark to the PMM)
-        // before giving up — mirrors `alloc_page`'s reclaim-under-pressure.
-        crate::allocator::reclaim_to_pmm();
-        if user_alloc_would_starve(free_count()) {
-            // Still starved: hand back the memory of processes that are already DEAD
-            // before evicting anything from a process that is still alive. Since Phase
-            // 7e's "Free" half a reaped process's whole address space sits in a RETIRED
+    use akuma_exec::memmath::{ReclaimStep, next_reclaim_step};
+
+    // The ORDER and the give-up decision live in `akuma_exec::memmath`
+    // (`next_reclaim_step`, host-tested); this loop is only the effects. Progress is
+    // judged by re-reading `free_count()` on every turn, never by a rung's return
+    // value — `drain_retired_under_pressure` declines silently inside its cooldown.
+    //
+    // Lock context, common to all four rungs: every caller of this function is the
+    // EL0 fault handler, which holds neither `as_lock` nor the PMM lock here — the
+    // invariant `reclaim_clean_file_pages` already relies on (it takes `as_lock` per
+    // page). `drain_retired_under_pressure` additionally declines when nothing is
+    // parked and guards against reentry. See `process::reclaim`.
+    let mut done = None;
+    loop {
+        let step = next_reclaim_step(free_count(), done);
+        match step {
+            ReclaimStep::Allocate => return alloc_page_zeroed(),
+            // Out of rungs. The caller treats this as OOM and SIGSEGVs the faulting
+            // process, leaving the reserve for page-table completion and the kill
+            // path. Note the known gap `next_reclaim_step` documents: memory parked
+            // more recently than `PROCESS_RECLAIM_COOLDOWN_US` is not collectable by
+            // any rung, so this can be an invented OOM.
+            ReclaimStep::GiveUp => return None,
+            // Return any fully-free heap watermark to the PMM — mirrors
+            // `alloc_page`'s reclaim-under-pressure. Costs nothing anyone misses.
+            ReclaimStep::ReclaimHeap => {
+                crate::allocator::reclaim_to_pmm();
+            }
+            // Hand back the memory of processes that are already DEAD before
+            // evicting anything from a process that is still alive. Since Phase 7e's
+            // "Free" half a reaped process's whole address space sits in a RETIRED
             // slot until a collector drops it, and the only steady-state collector
-            // (netpoll_maint, 100 ms) is exactly what this kind of pressure starves —
-            // measured: ~35 K pages parked while the PMM sat pinned at the reserve
-            // (docs/archive/OOM_KILL_DEFERRED_RECLAIM_GAP.md).
-            //
-            // This rung sits ABOVE the eviction below on purpose: freeing a dead
-            // process's pages costs zero re-faults, while evicting a live process's
-            // clean file pages buys a disk read per page on the next touch. It honors
-            // the RETIRE cooldown (never the `_force` variant), so a process killed
-            // microseconds ago is deliberately NOT collected here and we fall through
-            // to eviction as before.
-            //
-            // Lock context: every caller of this function is the EL0 fault handler,
-            // which holds neither `as_lock` nor the PMM lock here — the same invariant
-            // `reclaim_clean_file_pages` below already relies on (it takes `as_lock`
-            // per page). `drain_retired_under_pressure` additionally declines when
-            // nothing is parked and guards against reentry. See `process::reclaim`.
-            akuma_exec::process::reclaim::drain_retired_under_pressure();
-        }
-        if user_alloc_would_starve(free_count()) {
-            // Still starved: page out clean, read-only file-backed pages (e.g.
-            // model weights mmap'd larger than RAM) and let them re-fault from
-            // the file. This is the page-reclaim half of demand paging — it is
-            // what lets a file mmap bigger than physical RAM make progress
-            // instead of the process OOM-ing here. Evict a batch to amortise the
-            // sweep over many subsequent faults.
-            akuma_exec::process::reclaim_clean_file_pages(USER_RECLAIM_BATCH);
-            if user_alloc_would_starve(free_count()) {
-                // The sweep above unmaps pages but cannot free a frame the shared
-                // file-page cache still references, so a cache holding unmapped
-                // pages would let reclaim report progress while freeing nothing.
-                // Drop the entries that actually own memory (no remaining mappers).
+            // (netpoll_maint, 100 ms) is exactly what this kind of pressure starves
+            // — measured: ~35 K pages parked while the PMM sat pinned at the reserve
+            // (docs/archive/OOM_KILL_DEFERRED_RECLAIM_GAP.md). Honors the RETIRE
+            // cooldown (never the `_force` variant), so a process killed microseconds
+            // ago is deliberately NOT collected here and we fall through to eviction.
+            ReclaimStep::DrainRetired => {
+                akuma_exec::process::reclaim::drain_retired_under_pressure();
+            }
+            // Page out clean, read-only file-backed pages (e.g. model weights mmap'd
+            // larger than RAM) and let them re-fault from the file. This is the
+            // page-reclaim half of demand paging — what lets a file mmap bigger than
+            // physical RAM make progress instead of the process OOM-ing here. A batch,
+            // to amortise the sweep over many subsequent faults.
+            ReclaimStep::EvictCleanFilePages => {
+                akuma_exec::process::reclaim_clean_file_pages(USER_RECLAIM_BATCH);
+            }
+            // The sweep above unmaps pages but cannot free a frame the shared
+            // file-page cache still references, so a cache holding unmapped pages
+            // would let reclaim report progress while freeing nothing. Drop the
+            // entries that actually own memory (no remaining mappers).
+            ReclaimStep::ShrinkPageCache => {
                 crate::file_page_cache::shrink(USER_RECLAIM_BATCH);
-                if user_alloc_would_starve(free_count()) {
-                    return None;
-                }
             }
         }
+        done = Some(step);
     }
-    alloc_page_zeroed()
 }
 
 /// Pages to reclaim per memory-pressure event in [`alloc_page_zeroed_user`].
@@ -1428,12 +1444,6 @@ pub fn alloc_pages_zeroed(count: usize) -> Option<alloc::vec::Vec<PhysFrame>> {
 // Copy-on-Write Reference Counting
 // ============================================================================
 
-/// Global CoW fault serialization lock (per-physical-page).
-/// Under SMP, parent and child can fault on the same shared page concurrently.
-/// The per-PID fault_slot mechanism doesn't serialize across PIDs, so we need
-/// a global per-PA lock to prevent double-free races in the CoW break protocol.
-static COW_FAULT_LOCK: Spinlock<BTreeMap<usize, u32>> = Spinlock::new(BTreeMap::new());
-
 /// Tracks CoW-shared physical frames.  Only pages that are actually shared
 /// between parent and child after fork get entries here.  Non-shared pages
 /// have no overhead.
@@ -1482,30 +1492,6 @@ pub fn cow_ref_dec(pa: usize) -> bool {
     });
     cow_ledger_record(pa, true, before, after);
     last
-}
-
-/// Acquire the CoW fault lock for a physical page.
-/// Serializes CoW break across parent and child processes that share the page.
-/// Must be paired with `cow_fault_unlock`.
-pub fn cow_fault_lock(pa: usize) {
-    // Increment the per-PA lock count
-    crate::irq::with_irqs_disabled(|| {
-        let mut locks = COW_FAULT_LOCK.lock();
-        *locks.entry(pa).or_insert(0) += 1;
-    });
-}
-
-/// Release the CoW fault lock for a physical page.
-pub fn cow_fault_unlock(pa: usize) {
-    crate::irq::with_irqs_disabled(|| {
-        let mut locks = COW_FAULT_LOCK.lock();
-        if let Some(count) = locks.get_mut(&pa) {
-            *count -= 1;
-            if *count == 0 {
-                locks.remove(&pa);
-            }
-        }
-    });
 }
 
 #[allow(dead_code)]

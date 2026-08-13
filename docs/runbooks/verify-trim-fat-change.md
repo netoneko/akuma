@@ -8,8 +8,31 @@ For deduplication / extraction work from
 Those changes are supposed to be behaviour-preserving, so the gate is a
 **comparison against a baseline**, not a green checkmark.
 
-Work in two tiers. Tier 1 is host-only, takes ~2 minutes, and catches most of
-it. Tier 2 needs a VM and only runs when Tier 1 is clean.
+Work in tiers, each one gated on the last being clean: **Tier 1** is host-only and
+takes ~2 minutes; **Tier 2** boots the VM for the self-test suite; **Tier 3** is
+the live I/O and fork/CoW binaries; **Tier 4** is the redis memtest on the devbox,
+for changes in the memory path. Tiers 3 and 4 are conditional — read their
+headers before spending the time.
+
+**Tiers 1–3 are automated: run [`../../scripts/verify_trim.py`](../../scripts/verify_trim.py)
+rather than hand-assembling the commands below.** It runs the four clippy
+configurations, the host-test count, both SMP levels and the Tier 3 binaries, and
+prints one `=== SUMMARY ===` block designed to be diffed against a run on your
+parent commit. Read its module docstring first: every measurement in it is there
+because doing that measurement by hand gave a wrong answer at least once.
+
+```bash
+scripts/verify_trim.py --out mine.txt
+git worktree add /tmp/base <parent-commit>
+(cd /tmp/base && scripts/verify_trim.py --instance 1 --out /tmp/base.txt)
+diff /tmp/base.txt mine.txt
+```
+
+`--instance 1` shifts the forwarded ports and snapshots the disk, so the baseline
+worktree can boot without touching `disk.img`. The exit status is **not** a
+verdict — only the diff is. The prose below is what the script automates, kept
+because it says *why* each step is shaped the way it is, and because Tier 4 is not
+automated.
 
 ---
 
@@ -148,6 +171,10 @@ diff <(grep -aoE '\[FAIL\] [a-z_0-9]+' base.log | sort -u) \
 | `[Exception] Sync from EL1: EC=0x25` ×2 | Pre-existing; present in every archived baseline in `logs/` |
 | A `grep -c SIGSEGV` hit | The boot banner **prints an OOM-signature help block containing the literal text** `[Fault] Process N (name) SIGSEGV after Xs`. Match `^\[.*\] \[Fault\]`, not bare `SIGSEGV` |
 | `[BKL] stuck tag=511` | Load-driven. A real storm is thousands of lines, not tens |
+| `[WATCHDOG] Time jump detected: ~100ms (host sleep/wake)`, repeated | **The host is starving QEMU — every timing-sensitive result in that run is void.** Measured 2026-08-13: a run with 2866 of these had `cowstale` TIMEOUT at SMP=1 and UNEXPECTED at SMP=4 on a tree where both pass; the same tree, re-run quiet, scored `ok` at both. Baseline runs had **zero**. Count them (`grep -ac 'Time jump detected'`) before believing any exercise failure, and re-run rather than debug. The usual local cause is a background `cargo`/rust-analyzer rebuild — editing files while the gate boots is enough to do it |
+| `passed_marker` differs by exactly 1 at SMP=4 while `[PASS]` is unchanged | Usually `thread_slot_reclaim_on_spawn_initializing`, which has a **third self-reported outcome** besides PASSED/SKIPPED: `INCONCLUSIVE: N slots already free at spawn, nothing forced a reclaim`. It needs the slot pool actually exhausted, and at SMP=4 that is a race (measured 2026-08-13: PASSED in one run, INCONCLUSIVE in another on the same tree, 276 vs 275). Confirm by name before treating a ±1 `passed_marker` move as a deleted test: `diff` the `[Test] <name> (PASSED\|SKIPPED)` sets between the two logs |
+| `[SGI-S FATAL] new_sp=0x0 invalid!` mid-suite, boot never reaches sshd | **Known timing-dependent boot-suite race, not necessarily your change.** Several tests fabricate a bare claimed thread slot into `READY`/`WAITING` (`test_unregister_skips_recycled_thread_slot`, `test_kill_thread_group_reaps_futex_blocked_sibling`); a slot whose context has `sp=0` halts the kernel if the scheduler dispatches it before the test tears it down (`src/process_tests.rs:10489`). Measured 2026-08-13: it killed **both** SMP=1 and SMP=4 in one gate run on a loaded host (23 time jumps), and did not reproduce in two clean re-boots of the same tree — 95 `[PASS]` both times. Re-run on a quiet host before debugging; the gate now reports `smpN.halt` and `smpN.pass_marker` even when `booted: False`, so you can see how far the suite got |
+| `smp4.fpcache` present in one summary and absent in another | Harness timing, not behaviour. `[FPCACHE]` is emitted periodically and the gate snapshots the boot log at the sshd marker, so the line lands before the snapshot in some runs and after it in others. Compare `entries=`/`misses=` (stable) and ignore `hits=` (a monotonic counter read at an arbitrary instant) |
 
 ---
 
@@ -190,6 +217,7 @@ Memory / fork / CoW binaries already on `disk.img` — all self-reporting:
 | `forktest_parent -duration=20s` | `All children processed via epoll. Parent exiting.` |
 
 `redis-server` is **not** on `disk.img` — do not treat its absence as a failure.
+It lives on the devbox image instead; see Tier 4.
 
 **Run anything long under `nohup`, output to a file.** sshd's keepalive kills a
 long-lived exec channel and the client reports `Timeout, server localhost not
@@ -205,12 +233,96 @@ name, so pgrep matches itself and the job looks eternal.
 
 ---
 
+## Tier 4 — `redis-server --test-memory` on devbox-smoltcp (memory-path changes only)
+
+**Grade: B** — the command and its expected output are from the Phase 3 driver
+merge (`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.4's verification block, run
+2026-08-13). The polling wrapper below has not been re-run as often as Tiers 1–3.
+
+Run this tier when the change touches the PMM, the fault path, CoW, or the OOM /
+reclaim escalation. Every binary in Tier 3 is a *fork/CoW* exercise; this is the
+only one that puts sustained pressure on `alloc_page_zeroed_user` itself.
+`--test-memory` allocates the requested MiB and runs a write/read/verify sweep
+over all of it, so it walks anonymous demand-paging, `USER_PAGE_RESERVE` and the
+reclaim escalation as one continuous workload, and it **verifies the bytes** —
+a page the fault path filled from the wrong frame is a reported error, not a
+silent pass.
+
+Two scoping caveats, both important:
+
+- **This does not validate redis as a server.** `--test-memory` runs the memtest
+  and exits without reaching normal startup, which is why it works while
+  `redis-server` proper still blocks (`/proc/<pid>/` is empty, so `/proc/self/smaps`
+  is missing — `LONG_ROAD_TO_REDIS.md`). Do not read a passing memtest as "redis
+  works now".
+- **It needs the devbox image, not `disk.img`.** Redis arrives via `apk add`, and
+  the devbox needs a working DNS/HTTP path to do that — so a failure here can be
+  a *networking* failure. Establish that `apk add` itself worked before blaming
+  the memtest.
+
+```bash
+scripts/build_devbox_smoltcp.sh
+pkill -f qemu-system-aarch64; sleep 2
+overlays/devbox/run-smoltcp.sh > /tmp/devbox.log 2>&1 &
+until grep -aqE "Started sshd|sshd started" /tmp/devbox.log; do sleep 3; done
+```
+
+`ssh` is blocked by policy; drive it from Python. The memtest is long — run it
+detached with a sentinel, exactly like Tier 3's binaries, or sshd's keepalive
+kills the channel and the result reads as a hung VM:
+
+```python
+import subprocess, time
+def sh(cmd, t=180):
+    r = subprocess.run(["ssh","-q","-o","StrictHostKeyChecking=no","-p","2222",
+                        "root@localhost",cmd], capture_output=True, timeout=t)
+    return r.returncode, r.stdout.decode(errors="replace")
+
+# devbox.img fills up across sessions, and ENOSPC surfaces as an `apk add`
+# network error. Check before installing, not after it fails.
+print(sh("busybox df -h /")[1])
+if sh("command -v redis-server")[0] != 0:
+    print(sh("apk add redis", t=300)[1])
+
+sh("nohup sh -c '{ redis-server --test-memory 512; echo __EX_DONE__; } "
+   "> /tmp/memtest.log 2>&1' > /dev/null 2>&1 &")
+out = ""
+for _ in range(60):
+    time.sleep(10)
+    out = sh("cat /tmp/memtest.log 2>/dev/null")[1]
+    if "__EX_DONE__" in out:
+        break
+print(out)
+assert "Your memory passed this test" in out, out[-400:]
+```
+
+### Verify
+
+`Your memory passed this test`. Anything else is a finding, and the two failure
+shapes mean different things:
+
+| Output | Read it as |
+|---|---|
+| `*** MEMORY ERROR DETECTED ***` with an address | The fault path served a wrong or stale frame — a **data** bug. This is the outcome this tier exists to catch; capture the log and A/B it |
+| The process dies with SIGSEGV, or `[Fault] Process N (redis-server) SIGSEGV` in the boot log | OOM, not corruption: the escalation gave up and killed the process. Compare `MEMORY=` and the free-page count against the baseline before calling it a regression |
+| `apk add` fails, or `redis-server: not found` | Networking or a full disk (`df` above), not the memory path |
+
+Also run it at a size that does **not** fit, once, when the change touches the
+escalation: `--test-memory 8192` in a 4 GiB box must SIGSEGV the process and
+leave the VM alive and sshable. An invented OOM and a real one look identical in
+the log, so the check here is that the box survives and the *next* boot's
+`[PASS]` count is unchanged — not the memtest's own output.
+
 ## Before calling anything a regression
 
 Three of the "findings" during Phase 6 item 1 were the measurement, not the code:
 a stale VM holding the ports, ssh's banner folded into a stdout parse, and a
 `pgrep` matching its own command line. So:
 
+0. **Check whether the host was starving QEMU**, before anything else:
+   `grep -ac 'Time jump detected' <log>`. A healthy run is 0. This is the cheapest
+   check here and it invalidates a whole run on its own — see the known-benign table.
+   Do not edit files while the gate is booting; that alone can cause it.
 1. **A/B against a `git worktree` at the parent commit.** Logs in `logs/` are
    weeks old and predate current tests — `STACK-OVERFLOW` is absent from all of
    them purely because the test that emits it did not exist yet.

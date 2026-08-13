@@ -1095,6 +1095,105 @@ fn drop_surplus_shared_ref(as_owner: u32, pf: crate::pmm::PhysFrame) {
     }
 }
 
+/// Which mechanism overwrites the PTE during a CoW break, and who holds `as_lock`
+/// while it happens.
+///
+/// This is the one *genuine* disagreement between the three CoW-break sites, so it
+/// stays a parameter instead of becoming a decision made inside the helper.
+/// `COW_PILE_AUDIT.md` §4 (F1) argues the EL1 variant is wrong — it copies `old_pa`
+/// outside the very lock that makes `old_pa` valid — and that fix is deliberately
+/// **not** in this change: the merge lands behaviour-preserving and is verified by
+/// *nothing changed*, so that the later flip is verified by *exactly one thing
+/// changed*. Once F1 lands, this enum collapses to its second variant.
+enum CowRemap<'a> {
+    /// The EL1 paths ([`ensure_cow_page_writable`] and [`try_resolve_el1_cow_fault`]):
+    /// take `as_lock` for the PTE overwrite and the frame bookkeeping, via
+    /// `with_address_space`. The helper's 4 KiB copy therefore runs *outside* the
+    /// hold — F1.
+    TakingAsLock(&'a akuma_exec::process::Process),
+    /// The EL0 fault path: the caller already holds `as_lock` (`AsLockHold`) across
+    /// the whole break, so the helper must not take it again — and it remaps through
+    /// the live TTBR0 rather than through `&mut UserAddressSpace`. The helper's copy
+    /// runs *inside* the caller's hold, which is the invariant F1 wants everywhere.
+    CallerHoldsAsLock(&'a akuma_exec::process::Process),
+}
+
+/// Finish a CoW break: private copy of `old_pa` into `new_frame`, the faulting VA
+/// remapped RW to the copy, and the old frame's **global** CoW reference dropped
+/// only if this address space just gave up its last VA on it.
+///
+/// This is the shared middle of all three CoW-break paths — the EL0 permission
+/// fault, the EL1 pre-flight [`ensure_cow_page_writable`], and the EL1 data abort
+/// [`try_resolve_el1_cow_fault`]. Their *entry* conditions are deliberately not
+/// shared and stay at the call sites (`COW_PILE_AUDIT.md` §8): the EL0 path needs the
+/// stale-fault absorb and the per-page fault slot because it can race a sibling on
+/// the same page, while the EL1 pre-flight is called *before* a kernel write and
+/// must be able to answer "no CoW page here, proceed" without touching a lock.
+/// Owner resolution likewise stays at the call site — that is F2, and one of the two
+/// sites resolves it wrongly today.
+///
+/// The reason this middle is worth one definition is the `released_last_va` gate
+/// below. `COW_REFCOUNTS` counts **address spaces** — the first share inserts 2,
+/// "parent + child" — while `user_frames` counts **VAs**, which is why
+/// `remove_user_frame` reports the last one. Decrementing per *VA broken* drops a
+/// reference the address space is still using, and the next holder's decrement then
+/// frees a frame we still map. That is the §5.6 refcount underflow, and it was fixed
+/// three times because this code existed in three places.
+fn complete_cow_break(
+    remap: CowRemap<'_>,
+    page_va: usize,
+    old_pa: usize,
+    new_frame: crate::pmm::PhysFrame,
+) {
+    crate::pmm::track_frame(new_frame, akuma_exec::runtime::FrameSource::UserData);
+    // SAFETY: `old_pa` came from a valid user PTE and `new_frame` from the PMM, so
+    // both are identity-mapped, page-aligned and 4 KiB wide; the regions cannot
+    // overlap because `new_frame` was just allocated and is not mapped anywhere yet.
+    unsafe {
+        let src = akuma_exec::mmu::phys_to_virt(old_pa).cast_const();
+        let dst = akuma_exec::mmu::phys_to_virt(new_frame.addr);
+        core::ptr::copy_nonoverlapping::<u8>(src, dst, 0x1000);
+    }
+
+    let released_last_va = match remap {
+        CowRemap::TakingAsLock(owner) => owner.with_address_space(|aspace| {
+            let _ = aspace.map_page(
+                page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
+            );
+            akuma_exec::mmu::flush_tlb_page(page_va);
+            aspace.track_user_frame(new_frame);
+            // CoW: the old page is freed via the global CoW refcount, never here.
+            aspace.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa))
+        }),
+        CowRemap::CallerHoldsAsLock(owner) => {
+            // Overwrite PTE: same VA, new PA, RW (free fn → shared `&Process`;
+            // `map_user_page` would refuse the valid PTE).
+            akuma_exec::mmu::remap_current_user_page(
+                page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
+            );
+            owner.address_space.track_user_frame(new_frame);
+            // CoW: the old page is freed via the global CoW refcount, never here.
+            owner.address_space
+                .remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa))
+        }
+    };
+
+    // Only this address space's LAST VA on the frame gives up its global reference.
+    //
+    // **This gate is what makes the cross-process CoW break safe**, and it is the
+    // only thing that does. A deleted `cow_fault_lock` used to sit at the EL0 site
+    // claiming that job: a per-PA counter, incremented and decremented around the
+    // break, that nothing ever read and nothing ever waited on — so it excluded no
+    // one (`COW_PILE_AUDIT.md` §5). Two address spaces breaking the same frame
+    // concurrently is safe because each frees at most one global reference and only
+    // for its own last VA, not because they take turns. Making that counter into a
+    // real lock would put a cross-core serialization point on the hottest path in
+    // the kernel to re-solve a solved problem.
+    if released_last_va {
+        crate::pmm::cow_ref_dec(old_pa);
+    }
+}
+
 fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
     let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
     let ttbr0: u64;
@@ -1119,34 +1218,14 @@ fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
         Some(f) => f,
         None => return false, // OOM
     };
-    crate::pmm::track_frame(new_frame, akuma_exec::runtime::FrameSource::UserData);
-    unsafe {
-        let src = akuma_exec::mmu::phys_to_virt(old_pa).cast_const();
-        let dst = akuma_exec::mmu::phys_to_virt(new_frame.addr);
-        core::ptr::copy_nonoverlapping::<u8>(src, dst, 0x1000);
-    }
+    // Owner resolution is the call site's business (F2): this path resolves the
+    // *address-space owner*, which is the correct pid for a `CLONE_VM` sibling.
+    // `try_resolve_el1_cow_fault` uses `read_current_pid()` and is wrong.
     if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
-        // PTE remap + frame bookkeeping under `as_lock` (`with_address_space`),
-        // excluding a concurrent BKL-free fault on this address space.
-        let released_last_va = owner.with_address_space(|aspace| {
-            let _ = aspace.map_page(
-                page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
-            );
-            akuma_exec::mmu::flush_tlb_page(page_va);
-            aspace.track_user_frame(new_frame);
-            // CoW: the old page is freed via the global CoW refcount, never here.
-            aspace.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa))
-        });
-        // Give up this address space's global reference ONLY if that was its last
-        // VA on the frame. `COW_REFCOUNTS` counts address spaces — the first share
-        // inserts 2, "parent + child" — while `user_frames` counts VAs, which is
-        // why `remove_user_frame` reports the last one. Decrementing per *VA
-        // broken* drops a reference the address space is still using, and the next
-        // holder's decrement then frees a frame we still map. See
-        // `docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` §13.9.
-        if released_last_va {
-            crate::pmm::cow_ref_dec(old_pa);
-        }
+        // `TakingAsLock`: the copy runs outside `as_lock`, the PTE remap and frame
+        // bookkeeping inside it, excluding a concurrent BKL-free fault on this
+        // address space. See `CowRemap` for why that split is preserved as-is.
+        complete_cow_break(CowRemap::TakingAsLock(owner), page_va, old_pa, new_frame);
         true
     } else {
         crate::pmm::free_page(new_frame); // no owner — free to avoid leak
@@ -2435,28 +2514,16 @@ fn try_resolve_el1_cow_fault() -> bool {
         None => return false, // OOM — fall through to kill-process path
     };
 
-    crate::pmm::track_frame(new_frame, akuma_exec::runtime::FrameSource::UserData);
-    unsafe {
-        let src = akuma_exec::mmu::phys_to_virt(old_pa).cast_const();
-        let dst = akuma_exec::mmu::phys_to_virt(new_frame.addr);
-        core::ptr::copy_nonoverlapping::<u8>(src, dst, 0x1000);
-    }
-
+    // F2, PRESERVED DELIBERATELY: this resolves the *current* pid, not the address
+    // space owner, so for a `CLONE_VM` worker it tracks `new_frame` on a shared
+    // address-space view whose `Drop` discards its `user_frames` map and skips the
+    // decrement for `old_pa` — two frames leaked per kernel-side CoW break
+    // (`COW_PILE_AUDIT.md` §4 F2). The fix is `address_space_owner_pid_for_fault()`,
+    // as used by `ensure_cow_page_writable`, and it lands in the next change so that
+    // this merge stays verifiable by "nothing changed".
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     if let Some(owner) = akuma_exec::process::lookup_process_shared(pid) {
-        // PTE remap + frame bookkeeping under `as_lock` (`with_address_space`).
-        let released_last_va = owner.with_address_space(|aspace| {
-            let _ = aspace.map_page(page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
-            akuma_exec::mmu::flush_tlb_page(page_va);
-            aspace.track_user_frame(new_frame);
-            // CoW: the old page is freed via the global CoW refcount, never here.
-            aspace.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa))
-        });
-        // Only the address space's LAST VA on the frame gives up its global
-        // reference — see the identical gate in `try_break_cow_for_kernel_write`.
-        if released_last_va {
-            crate::pmm::cow_ref_dec(old_pa);
-        }
+        complete_cow_break(CowRemap::TakingAsLock(owner), page_va, old_pa, new_frame);
         true // Caller returns; ERET retries the faulting instruction
     } else {
         // No process owner found: cannot remap — free the new frame to avoid a leak.
@@ -3574,44 +3641,16 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             if let Some(old_pa_with_offset) = akuma_exec::mmu::translate_user_va(l0_ptr, page_va) {
                                 let old_pa = old_pa_with_offset & !(0xFFF);
                                 if crate::pmm::cow_ref_get(old_pa) > 0 {
-                                    // Serialize CoW break across parent/child processes that share
-                                    // this physical page. The per-PID fault_slot doesn't serialize
-                                    // across PIDs, so we need a global per-PA lock to prevent
-                                    // double-free races in the CoW protocol.
-                                    crate::pmm::cow_fault_lock(old_pa);
-                                    struct CowFaultLockGuard { pa: usize }
-                                    impl Drop for CowFaultLockGuard {
-                                        fn drop(&mut self) {
-                                            crate::pmm::cow_fault_unlock(self.pa);
-                                        }
-                                    }
-                                    let _cow_lock_guard = CowFaultLockGuard { pa: old_pa };
-
-                                    // Re-check refcount after acquiring the lock — another
-                                    // process may have already broken the CoW while we waited.
-                                    if crate::pmm::cow_ref_get(old_pa) > 0 {
-                                        crate::pmm::track_frame(new_frame, akuma_exec::runtime::FrameSource::UserData);
-                                        unsafe {
-                                            let src = akuma_exec::mmu::phys_to_virt(old_pa).cast_const();
-                                            let dst = akuma_exec::mmu::phys_to_virt(new_frame.addr);
-                                            core::ptr::copy_nonoverlapping(src, dst, 0x1000);
-                                        }
-                                        // Overwrite PTE: same VA, new PA, RW (free fn → shared
-                                        // `&Process`; `map_user_page` would refuse the valid PTE).
-                                        akuma_exec::mmu::remap_current_user_page(page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
-                                        owner.address_space.track_user_frame(new_frame);
-                                        // CoW: the old page is freed via the global CoW
-                                        // refcount, never here.
-                                        let released_last_va = owner.address_space
-                                            .remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa));
-                                        // Only this address space's LAST VA on the frame gives
-                                        // up its global reference — see the identical gate in
-                                        // `try_break_cow_for_kernel_write`.
-                                        if released_last_va {
-                                            crate::pmm::cow_ref_dec(old_pa);
-                                        }
-                                        did_cow = true;
-                                    }
+                                    // `_asg` above already holds `as_lock` for this whole
+                                    // block, so the break must not take it again — and the
+                                    // 4 KiB copy lands inside that hold, which is what keeps
+                                    // `old_pa` valid across it (the invariant F1 wants on the
+                                    // EL1 paths too).
+                                    complete_cow_break(
+                                        CowRemap::CallerHoldsAsLock(owner),
+                                        page_va, old_pa, new_frame,
+                                    );
+                                    did_cow = true;
                                 }
                             }
                         }

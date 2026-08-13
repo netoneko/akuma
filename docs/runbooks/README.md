@@ -33,7 +33,7 @@ Start from the symptom or task on the left.
 | Adding a `sc-*` kernel feature | [`add-syscall-feature.md`](add-syscall-feature.md) |
 | Landed a fix and need to update the bugfix audit | [`update-bug-fix-list.md`](update-bug-fix-list.md) |
 | Looking for copy-pasted code before a refactor (PMD CPD) | [`find-duplicated-code.md`](find-duplicated-code.md) |
-| Confirming a deduplication / extraction change caused no regression — the 4 clippy configs, the host-test count, the 94-`[PASS]` boot baseline, and which log lines are known-benign | [`verify-trim-fat-change.md`](verify-trim-fat-change.md) |
+| Confirming a deduplication / extraction change caused no regression — [`scripts/verify_trim.py`](../../scripts/verify_trim.py) diffed against your parent commit, which log lines are known-benign, and the redis memtest for memory-path changes | [`verify-trim-fat-change.md`](verify-trim-fat-change.md) |
 
 ## Conventions
 

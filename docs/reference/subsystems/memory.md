@@ -134,8 +134,11 @@ fill an already-capacity'd buffer instead of growing one itself.
 **Never allocate on the heap while holding `PMM`.** Compute into a fixed-size
 buffer, or allocate the container *before* taking the lock and fill it after —
 `alloc_pages_zeroed` above is the reference example. The same applies to any
-`Spinlock<BTreeMap<..>>` in `pmm.rs` (`COW_FAULT_LOCK`, `COW_REFCOUNTS`): a map
-insert can allocate, so those nest into TALC too.
+`Spinlock` in `pmm.rs` holding a heap container — `COW_REFCOUNTS`
+(`BTreeMap<usize, u16>`, where an insert can allocate) and `COW_EVER`
+(`Vec<u64>`, which allocates only while `init` fills it): those nest into TALC
+too. (`COW_FAULT_LOCK` was a second such map until 2026-08-13, when it was
+deleted — it was a per-PA counter nothing read; `COW_PILE_AUDIT.md` §5.)
 
 ### Observed signature
 
@@ -275,39 +278,49 @@ tables, heap growth and bookkeeping the kill itself needs.
 
 ### The user-page escalation, exactly as written
 
-`pmm::alloc_page_zeroed_user` (`src/pmm.rs:1324`). Note the re-check between every
-step — and note that step 3's check is a **sibling** of step 2's, not nested
-inside it, so eviction is considered even when step 2 was skipped:
+`pmm::alloc_page_zeroed_user` (`src/pmm.rs:1330`). **The order and the give-up
+decision are not in `src/` at all** — they are `memmath::next_reclaim_step`, which is
+host-tested; `src/pmm.rs` holds only the effects, as one `loop` that asks for the next
+step, performs it, and asks again. Two consequences worth knowing:
+
+- **Progress is judged only by re-reading `free_count()`**, never by a step's return
+  value. `drain_retired_under_pressure` declines *silently* inside its cooldown, so a
+  step cannot report whether it helped.
+- **A step that frees enough short-circuits.** The re-check happens before
+  `next_reclaim_step` consults which step already ran, so a successful step 2 means
+  steps 3 and 3b never run. (Until 2026-08-13 this was five nested `if`s in which
+  step 3's check was a *sibling* of step 2's rather than nested inside it — so under a
+  concurrent free-count change, eviction could run without the drain above it having
+  been tried. The loop cannot do that.)
 
 ```
-  alloc_page_zeroed_user()
+  alloc_page_zeroed_user()                                   :1330
     │
-    ├─ starving?  no ──────────────────────────────────────────────┐
-    │      │ yes                                                   │
-    │      ├─ 1. allocator::reclaim_to_pmm()          :1328        │
-    │      │     fully-free kernel-heap spans          cost: none  │
-    │      │                                                       │
-    │      ├─ still starving? ─ 2. drain_retired_under_pressure()  │
-    │      │                       :1350               cost: none  │
-    │      │                       dead processes' address spaces  │
-    │      │                       *** HONORS THE 10 ms COOLDOWN — │
-    │      │                       memory parked more recently     │
-    │      │                       than that is NOT collected ***  │
-    │      │                                                       │
-    │      └─ still starving? ─ 3. reclaim_clean_file_pages(512)   │
-    │             :1359            cost: 1 disk read per page, on  │
-    │             │                the next touch by a LIVE process│
-    │             │                                               │
-    │             └─ still starving? ─ 3b. file_page_cache::shrink(512)
-    │                    :1365         cost: 1 re-read per future mapper
-    │                    │             Keeps step 3 honest: the cache holds a
-    │                    │             reference, so without this the sweep
-    │                    │             unmaps pages and frees nothing.
-    │                    │
-    │                    └─ still starving? ─ 4. return None    :1367
-    │                                            => SIGSEGV
-    ▼                                                              │
-  alloc_page_zeroed() ─> alloc_page()  <───────────────────────────┘
+    ├─ next_reclaim_step(free_count(), done) ── Allocate ─────────┐
+    │      │                                       :1347         │
+    │      ├─ ReclaimHeap    :1356  allocator::reclaim_to_pmm()   │
+    │      │                        fully-free heap   cost: none  │
+    │      │                                                      │
+    │      ├─ DrainRetired   :1368  drain_retired_under_pressure()│
+    │      │                        dead processes'   cost: none  │
+    │      │                        address spaces               │
+    │      │                        *** HONORS THE 10 ms COOLDOWN │
+    │      │                        — memory parked more recently │
+    │      │                        than that is NOT collected ***│
+    │      │                                                      │
+    │      ├─ EvictCleanFilePages   :1376  reclaim_clean_file_pages(512)
+    │      │                        cost: 1 disk read per page, on the
+    │      │                        next touch by a LIVE process  │
+    │      │                                                      │
+    │      ├─ ShrinkPageCache :1383  file_page_cache::shrink(512)  │
+    │      │                        cost: 1 re-read per future mapper.
+    │      │                        Keeps the step above honest: the cache
+    │      │                        holds a reference, so without this the
+    │      │                        sweep unmaps pages and frees nothing.
+    │      │                                                      │
+    │      └─ GiveUp         :1353  return None => SIGSEGV        │
+    ▼                                                             │
+  alloc_page_zeroed() ─> alloc_page()  <──────────────────────────┘
     │  and the base allocator has TWO fallbacks of its own:
     ├─ a. quarantine_drain_all()   :1103   frames parked only to detect UAF;
     │                                      that debt must never fail an alloc
@@ -339,10 +352,16 @@ has probably added a seventh; check this list first.
 | `USER_RECLAIM_BATCH` | 512 pages | eviction batch, amortises the sweep |
 | `HEAP_GROW_HEADROOM_PAGES` | see `allocator.rs` | extra span so talc metadata still fits |
 
-`user_alloc_would_starve`, `user_readahead_budget`, `heap_grow_initial_pages` and
-`heap_grow_backoff` are all **pure functions** of a free-page count. The first two
-live in `akuma_exec::memmath` and are host-tested; the latter two are still in
+`user_alloc_would_starve`, `user_readahead_budget`, `next_reclaim_step`,
+`heap_grow_initial_pages` and `heap_grow_backoff` are all **pure functions** of a
+free-page count (plus, for `next_reclaim_step`, the step already performed). The first
+three live in `akuma_exec::memmath` and are host-tested; the latter two are still in
 `src/allocator.rs` and therefore reachable only from the boot suite.
+
+`user_alloc_would_starve` is **not** re-exported from `pmm` any more: since the
+escalation became `next_reclaim_step`, the predicate has exactly one consumer, and
+asking "would this starve?" without also asking "so what do I do about it?" is how a
+sixth ad-hoc reclaim path gets added.
 
 ### KNOWN GAP: a premature give-up while memory is merely cooling
 
@@ -358,6 +377,13 @@ It is currently **unfalsifiable in the field**: `retired_pages_pending()` and
 much memory is parked. (This doc's own symptom table used to claim `[PSTATS]`
 shows `retired=N/Mp`; no such format string exists in the kernel.) Surfacing that
 counter is the prerequisite for testing the hypothesis at all.
+
+The gap is now **pinned by a host test** —
+`memmath::tests::give_up_after_the_last_rung_is_the_known_premature_oom` — so the fix
+has to change that test deliberately rather than silently. Its sibling,
+`fruitless_drain_retired_continues_instead_of_giving_up`, pins the half that is
+already correct: a drain that freed nothing because everything is inside the cooldown
+must fall through to the remaining steps, never straight to `GiveUp`.
 
 ## Reclaim under memory pressure
 

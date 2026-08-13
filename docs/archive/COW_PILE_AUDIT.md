@@ -438,7 +438,36 @@ is already in agreement on the part that matters (`released_last_va`).
 
 ---
 
-## 8.1 The scoped "CoW merge" — decided 2026-08-13
+## 8.1 The scoped "CoW merge" — decided 2026-08-13, **LANDED 2026-08-13**
+
+> **Status: all three in-scope items are in the tree** (uncommitted at time of
+> writing). What landed, and the four things this section got wrong:
+>
+> - **Item 1** → `complete_cow_break` + `CowRemap` in `src/exceptions.rs`, replacing
+>   the middle of all three sites. The per-site divergence turned out to be *one*
+>   thing, not two: whether the caller already holds `as_lock`. The copy's position
+>   relative to the lock follows from that automatically (the helper copies first, so
+>   it lands outside a lock the helper takes and inside a lock the caller already
+>   holds), which is why F1 needed no separate parameter.
+> - **Item 2** → deleted, including two `ExecRuntime` fields. The stated purpose moved
+>   onto the `released_last_va` comment inside the new helper.
+> - **Item 3** → `memmath::next_reclaim_step` / `ReclaimStep`, 6 host tests.
+> - **This section said the escalation had FOUR steps; it has four *recovery actions*
+>   plus give-up, behind five re-checks.** `ReclaimStep` therefore has 4 action
+>   variants + `GiveUp` + `Allocate`. `memory.md` had it right ("six distinct recovery
+>   mechanisms, not four" once `alloc_page`'s own two are counted).
+> - **§9's F3 says "3 of 4 CoW runtime fn pointers are dead"; measured, it is 4 dead
+>   of 5.** The five are `cow_ref_inc`/`dec`/`get`/`fault_lock`/`fault_unlock`, and
+>   only `cow_ref_inc` is called through the table (`process/mod.rs:298`). Deleting
+>   `fault_lock`/`unlock` leaves two still-dead fields (`cow_ref_dec`, `cow_ref_get`)
+>   for `PMM_EXTRACT.md` to remove with the other 13.
+> - **Two in-code comments cross-referenced `try_break_cow_for_kernel_write`, a
+>   function that does not exist** in this tree under that name — the EL1 pre-flight
+>   is `ensure_cow_page_writable`. Both cross-references are gone: they now point at
+>   the one helper.
+>
+> Items 3–4 of §8 (`spawn_child_thread_and_publish`, `Process::inherit_from`), item 7
+> (the DA/IA merge) and the F1/F2 fixes remain open, as scoped.
 
 Two of §8's rows do not belong in a change called a CoW merge, and bundling them
 would make it unverifiable:

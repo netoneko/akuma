@@ -62,8 +62,6 @@ pub fn ensure_test_runtime() {
         cow_ref_inc: |_| {},
         cow_ref_dec: |_| false,
         cow_ref_get: |_| 0,
-        cow_fault_lock: |_| {},
-        cow_fault_unlock: |_| {},
     };
     let cfg = ExecConfig {
         max_threads: 64,

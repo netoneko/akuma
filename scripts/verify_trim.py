@@ -75,6 +75,20 @@ EXERCISES = [
 # too. Compared separately so the failure SET stays meaningful.
 FLAKY_BOOT_TESTS = {"retired_reclaim_ab"}
 
+# Tier 4 (opt-in, `--tier 4`): the only exercise that puts sustained pressure on
+# `alloc_page_zeroed_user` itself rather than on fork/CoW, and it verifies the bytes
+# it writes — so a page the fault path filled from the wrong frame is a reported
+# error, not a silent pass. Run it for PMM / fault-path / reclaim changes.
+#
+# It needs the devbox image (redis arrives via `apk add`, so a failure can be a
+# NETWORKING failure) and it is NOT part of `--tier all`: it builds and boots a
+# different profile, which would make the default summary un-diffable against a
+# baseline taken without it. `--test-memory` exits before normal startup, which is why
+# it works while `redis-server` proper still blocks on the empty /proc/<pid>/
+# (LONG_ROAD_TO_REDIS.md) — a pass here says nothing about redis as a server.
+REDIS_MEMTEST_MB = 512
+REDIS_HEALTHY = "Your memory passed this test"
+
 
 def sh(cmd, cwd=REPO, timeout=1800, env=None):
     e = os.environ.copy()
@@ -172,6 +186,23 @@ def boot_once(smp, instance, memory, logdir, results, run_exercises):
         booted = wait_for_marker(log_path)
         results[f"smp{smp}.booted"] = booted
         if not booted:
+            # A failed boot is the case that most needs triage, so report the three
+            # things that distinguish its causes instead of just `booted: False`:
+            # how far the self-test suite got, whether the kernel HALTED (a specific
+            # fatal, not a timeout), and whether the host was starving QEMU.
+            text = read_log(log_path)
+            results[f"smp{smp}.pass_marker"] = len(re.findall(r"\[PASS\]", text))
+            results[f"smp{smp}.host_timejumps"] = len(
+                re.findall(r"Time jump detected", text))
+            # `[SGI-S FATAL] new_sp=0` is a KNOWN, timing-dependent boot-suite race,
+            # not necessarily your change: several tests fabricate a bare claimed
+            # thread slot into READY/WAITING, and a slot with context sp=0 that the
+            # scheduler dispatches halts the kernel (src/process_tests.rs:10489).
+            # Observed 2026-08-13 at BOTH SMP levels in one loaded-host run and in
+            # neither of two clean re-boots of the same tree. Re-run before debugging.
+            halt = re.search(r"\[(SGI-S FATAL|PANIC|Kernel panic)\][^\n]{0,80}", text)
+            if halt:
+                results[f"smp{smp}.halt"] = halt.group(0)[:110]
             return
 
         text = read_log(log_path)
@@ -194,11 +225,29 @@ def boot_once(smp, instance, memory, logdir, results, run_exercises):
         if m:
             # hits=0 with entries=0 means page sharing silently stopped — a
             # mis-wired SHARED_FILE_PAGES_ENABLED looks fine otherwise.
+            # NOTE: `[FPCACHE]` is periodic and this snapshot is taken at the sshd
+            # marker, so whether the line has been printed yet is a race — the key is
+            # absent from some runs on an unchanged tree. Compare entries=/misses=;
+            # `hits` is a monotonic counter read at an arbitrary instant.
             results[f"smp{smp}.fpcache"] = f"entries={m.group(1)} hits>0={int(m.group(2)) > 0}"
 
         if run_exercises:
             port = 2222 + (100 * instance if instance else 0)
             exercise_suite(port, smp, results)
+
+        # Re-read AFTER the exercises: this is HOST starvation, not a kernel property,
+        # and it happens while the exercises run — counting it from the boot snapshot
+        # above would report 0 for exactly the runs it needs to flag.
+        #
+        # The watchdog reports a ~100 ms jump whenever the host descheduled QEMU. A
+        # healthy run is 0. Measured 2026-08-13: a run with 2866 of these had
+        # `cowstale` TIMEOUT at SMP=1 and UNEXPECTED at SMP=4 on a tree where both
+        # pass, and the same tree re-run quiet scored `ok` at both. So read this BEFORE
+        # believing any exercise result — a background cargo/rust-analyzer rebuild
+        # during the run is enough to cause it, and it voids the timing-sensitive half
+        # of the summary.
+        results[f"smp{smp}.host_timejumps"] = len(
+            re.findall(r"Time jump detected", read_log(log_path)))
     finally:
         vm.terminate()
         try:
@@ -261,11 +310,108 @@ def exercise_suite(port, smp, results):
             results[key] = "TIMEOUT (ssh)"
 
 
+def tier4_redis_memtest(results, memory, logdir, build):
+    """`redis-server --test-memory` on devbox-smoltcp. See REDIS_MEMTEST_MB above.
+
+    Deliberately reports WHICH stage failed rather than a bare pass/fail: an `apk add`
+    that could not resolve DNS, a full devbox.img, an OOM kill and a genuine memory
+    error all look like "the memtest didn't say the magic words" from the outside, and
+    only one of them is a finding about this change."""
+    if build:
+        r = sh([os.path.join(REPO, "scripts", "build_devbox_smoltcp.sh")], timeout=3600)
+        if r.returncode != 0:
+            results["redis.stage"] = "BUILD FAILED"
+            results["redis.detail"] = (r.stderr.strip().splitlines() or ["(no stderr)"])[-1][:110]
+            return
+
+    disk = os.path.join(REPO, "devbox.img")
+    if not os.path.exists(disk):
+        results["redis.stage"] = "SKIP (no devbox.img — overlays/devbox/bootstrap.sh)"
+        return
+
+    subprocess.run(["pkill", "-f", "qemu-system-aarch64"], capture_output=True)
+    time.sleep(2)
+    log_path = os.path.join(logdir, "verify_redis.log")
+    log = open(log_path, "w")
+    env = os.environ.copy()
+    env.update({"DEVBOX_MEMORY": str(memory), "DEVBOX_DISK": disk})
+    vm = subprocess.Popen([os.path.join(REPO, "overlays", "devbox", "run-smoltcp.sh")],
+                          cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT)
+    try:
+        if not wait_for_marker(log_path):
+            results["redis.stage"] = "BOOT FAILED"
+            return
+        port = 2222
+
+        # devbox.img fills across sessions and ENOSPC surfaces as an `apk add` network
+        # error, so record the free space rather than discovering it the hard way.
+        # Pick the row with the usage percentage, not `tail -1`: busybox wraps long
+        # device names onto a second line, so which line is last is not stable (a
+        # `tail -1` here reported the HEADER once).
+        _, df = ssh(port, "busybox df -h /")
+        row = next((l for l in reversed(df.splitlines()) if "%" in l), "")
+        results["redis.disk"] = " ".join(row.split()[-4:]) if row else "(unknown)"
+
+        if ssh(port, "command -v redis-server")[0] != 0:
+            rc, out = ssh(port, "apk add redis", timeout=600)
+            if ssh(port, "command -v redis-server")[0] != 0:
+                results["redis.stage"] = "APK FAILED (networking or full disk, not the memory path)"
+                results["redis.detail"] = (out.strip().splitlines() or ["(no output)"])[-1][:110]
+                return
+
+        out_path = "/tmp/verify_redis_memtest.log"
+        ssh(port, f"nohup sh -c '{{ redis-server --test-memory {REDIS_MEMTEST_MB}; "
+                  f"echo __EX_DONE__; }} > {out_path} 2>&1' > /dev/null 2>&1 &")
+        deadline = time.time() + 900
+        out = ""
+        while time.time() < deadline:
+            time.sleep(10)
+            _, out = ssh(port, f"cat {out_path} 2>/dev/null")
+            if "__EX_DONE__" in out:
+                break
+
+        if "__EX_DONE__" not in out:
+            results["redis.stage"] = "TIMEOUT (still running after 900s)"
+        elif REDIS_HEALTHY in out:
+            results["redis.stage"] = "ok"
+        elif "MEMORY ERROR DETECTED" in out:
+            # The outcome this tier exists to catch: the fault path served a wrong or
+            # stale frame. A data bug, not an OOM.
+            results["redis.stage"] = "MEMORY ERROR DETECTED"
+        else:
+            # Most likely the escalation gave up and SIGSEGV'd it — check the boot log
+            # for `[Fault] Process N (redis-server) SIGSEGV` and compare free pages
+            # against the baseline before calling it a regression.
+            results["redis.stage"] = "UNEXPECTED"
+        if results["redis.stage"] != "ok":
+            lines = [l for l in out.splitlines() if l.strip() and "__EX_DONE__" not in l]
+            results["redis.detail"] = (lines[-1] if lines else "(no output)")[:110]
+
+        boot = read_log(log_path)
+        results["redis.vm_sigsegv"] = len(re.findall(r"\[Fault\] Process \d+ \(redis", boot))
+        results["redis.timejumps"] = len(re.findall(r"Time jump detected", boot))
+    finally:
+        vm.terminate()
+        try:
+            vm.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            vm.kill()
+        log.close()
+        subprocess.run(["pkill", "-f", "qemu-system-aarch64"], capture_output=True)
+        time.sleep(1)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--tier", choices=["1", "2", "all"], default="all",
-                    help="1 = host only (~2 min), 2 = boot + exercises, all = both")
+    ap.add_argument("--tier", choices=["1", "2", "4", "all"], default="all",
+                    help="1 = host only (~2 min), 2 = boot + exercises, all = both. "
+                         "4 = the redis memtest on devbox-smoltcp (opt-in, for PMM / "
+                         "fault-path / reclaim changes); NOT included in 'all' because "
+                         "it builds and boots a different profile")
+    ap.add_argument("--no-devbox-build", action="store_true",
+                    help="tier 4 only: reuse the existing devbox-smoltcp kernel image "
+                         "instead of rebuilding it")
     ap.add_argument("--smp", default="1,4",
                     help="comma-separated SMP levels to boot (default 1,4)")
     ap.add_argument("--memory", default="2048")
@@ -293,6 +439,8 @@ def main():
         for smp in [int(s) for s in args.smp.split(",") if s.strip()]:
             boot_once(smp, args.instance, args.memory, logdir, results,
                       not args.no_exercises)
+    if args.tier == "4":
+        tier4_redis_memtest(results, args.memory, logdir, not args.no_devbox_build)
     results["elapsed_s"] = int(time.time() - t0)
 
     lines = ["=== SUMMARY ==="]

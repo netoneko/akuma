@@ -135,9 +135,6 @@ pub struct ExecRuntime {
     pub cow_ref_inc: fn(usize),
     pub cow_ref_dec: fn(usize) -> bool,
     pub cow_ref_get: fn(usize) -> u16,
-    pub cow_fault_lock: fn(usize),
-    pub cow_fault_unlock: fn(usize),
-
 }
 
 /// Compile-time kernel configuration, passed once at init.
