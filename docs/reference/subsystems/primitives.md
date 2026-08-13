@@ -2,7 +2,7 @@
 
 The bottom of the crate graph. Source: `crates/akuma-primitives/`.
 
-> **Stability: A (stable, trust it).** Small, fully host-tested (28 unit tests),
+> **Stability: A (stable, trust it).** Small, fully host-tested (31 unit tests),
 > and every entry point either has no state or degrades to a documented no-op.
 > The one thing to be careful about is **feature forwarding** — see
 > "Features are load-bearing" below, where a mistake is silent rather than loud.
@@ -33,7 +33,7 @@ RAII guard.
 
 | Module | Contents |
 |---|---|
-| `once` | [`OnceCopy<T>`] — single-shot lock-free cell for `Copy` types |
+| `once` | [`OnceCopy<T>`] — single-shot lock-free cell for `Copy` types; [`Registered<T>`] — that cell plus the four operations a boot-registered callback table needs |
 | `console` | `StackWriter<N>`, `FmtBuf<'a>`, the print hook, `safe_print!`, `print_args` |
 | `irq` | all DAIF access: `IrqGuard`, `with_irqs_disabled`, `irq_save_mask`/`irq_restore`, `unmask_irqs`, `unmask_irqs_sync`, `mask_irqs_sync`, `read_daif`, `DAIF_I_MASKED` |
 | `clock` | the uptime hook: `set_clock_hook`, `uptime_us`, `is_clock_registered` |
@@ -50,6 +50,62 @@ the same lock would self-deadlock on a single CPU. `set` is a release store,
 
 This is the tree's *one* mechanism for "registered at boot, read from anywhere".
 Reuse it rather than inventing a second one.
+
+### `Registered<T>` — the callback-table form
+
+`OnceCopy` is the cell. `Registered<T>` is the cell **plus the four operations
+every kernel-callback table wants**, and the diagnostic to panic with when the
+kernel forgot to register it:
+
+| method | use |
+|---|---|
+| `register(v)` | publish, from the crate's `init`. Single-shot: a second call is ignored |
+| `require()` | read, panicking with this cell's diagnostic. **The default** past `init` — an absent table there is a boot-order bug, not a condition to handle |
+| `get()` | read as `Option`. For code that can legitimately run *before* registration and should degrade |
+| `is_registered()` | non-panicking probe |
+
+```rust
+static RUNTIME: Registered<NetRuntime> =
+    Registered::new("akuma-net: NetRuntime not registered — call akuma_net::init() first");
+```
+
+The message is stored whole rather than composed, so each crate keeps its own
+wording and names its own `init`.
+
+**Choosing `get` vs `require` is a real decision, so make it explicitly.**
+`akuma-ext2`'s thread hooks use `get`, because its lock paths genuinely run
+during early boot before `init_thread_hooks` and tid-0 / not-dead is the correct
+answer there. `akuma-exec` and `akuma-net` use `require`, because nothing reads
+their tables before `init`. Before this type the three crates each made that
+call in a different house style, and only one of them wrote down why.
+
+#### Three copies, and one of them was paying for it
+
+| crate | before | read cost |
+|---|---|---|
+| `akuma-exec` | `OnceCopy` ×2 + four accessors | lock-free |
+| `akuma-net` | **`Spinlock<Option<NetRuntime>>`** | **a lock on every read** |
+| `akuma-ext2` | `OnceCopy` + hand-rolled `map_or` per read | lock-free |
+
+`akuma-net` was the expensive one: **21 read sites**, dominated by `uptime_us`
+(×10, called on every smoltcp `poll()`), `current_box_id` (×5, per socket op)
+and `blocking_relax` (×3). Every network poll took a spinlock to read a function
+pointer — in a crate whose own `NetRuntime` doc comment records moving two fields
+*out* of the struct because the indirection "cost a spinlocked struct read on the
+per-packet DMA path". All 21 are lock-free now.
+
+Beyond the cost, a spinlock was the wrong mechanism there for the reason
+[`OnceCopy`] states: a callback table read from an IRQ handler that interrupted
+the lock holder self-deadlocks on a single core.
+
+#### Single-shot registration is what makes host tests possible
+
+Because `register` is idempotent, a host unit test can inject a table
+unconditionally from parallel test threads with nothing to order and nothing to
+race. That is how `akuma_exec::runtime::register_config_for_test` works, and it
+is the supported alternative to giving production code an "is anything
+registered?" branch it does not otherwise need — see
+[Testing](#testing) below.
 
 ### Console: one writer, one macro
 
@@ -213,9 +269,9 @@ akuma-primitives  (core only)
 
 \* `akuma-vfs` does not depend on `akuma-primitives` today; it has no need to.
 
-`akuma-ext2` (`OnceCopy` + `PreemptGuard`), `akuma-net` (`PreemptGuard`) and
-`akuma-virtio` (`PreemptGuard` + the translators + `DEV_VIRTIO_VA`) each reach
-only into this crate. Verify with `cargo tree -p <crate> --edges normal` — an
+`akuma-ext2` (`Registered` + `PreemptGuard`), `akuma-net` (`Registered` +
+`PreemptGuard`) and `akuma-virtio` (`PreemptGuard` + the translators +
+`DEV_VIRTIO_VA` + `console::print_str`) each reach only into this crate. Verify with `cargo tree -p <crate> --edges normal` — an
 import-list grep is not enough, because a transitive edge through another crate
 does not appear in one.
 
@@ -226,7 +282,8 @@ changed. When reading old code or docs, these all resolve to this crate:
 
 | Old path | Now |
 |---|---|
-| `akuma_exec::runtime::OnceCopy` | `once::OnceCopy` |
+| `akuma_exec::runtime::OnceCopy` | `once::OnceCopy` (still re-exported from `akuma_exec::runtime`) |
+| `akuma_net::runtime`'s `Spinlock<Option<NetRuntime>>`, `akuma_exec`'s two `OnceCopy` statics, `akuma_ext2`'s `THREAD_HOOKS` | `once::Registered<T>` — **not** a re-export; the three statics were each rewritten in place, and their public accessors (`runtime()`, `config()`, `try_runtime()`, `is_registered()`) kept their names and signatures, so no call site changed |
 | `akuma_exec::runtime::{IrqGuard, with_irqs_disabled}` | `irq::` |
 | `akuma_exec::sync::{irq_save_mask, irq_restore}` | `irq::` |
 | `akuma_exec::sync::PreemptGuard`, `akuma_net::runtime::PreemptGuard` | `preempt::PreemptGuard` |
@@ -244,10 +301,45 @@ comes from `crate::timer::uptime_us()`, and it is the bin crate's to own.
 cargo test -p akuma-primitives --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)
 ```
 
-28 tests. The non-obvious ones are worth keeping: mid-codepoint UTF-8 truncation
+31 tests. The non-obvious ones are worth keeping: mid-codepoint UTF-8 truncation
 (a naive `as_str` panics), the unregistered-hook no-op, preemption nesting
 counted rather than boolean, `preemption_disabled_at` naming the 0→1 call site
-and not a nested one, and the device-window page-alignment/collision check.
+and not a nested one, the device-window page-alignment/collision check, and
+`Registered`'s single-shot rule — a second `register` must **not** win. That
+last one is load-bearing twice over: it is the property host tests rely on, and
+it is the semantic `akuma-net` moved to when it stopped being last-writer-wins.
+
+### Injecting a table in a host test
+
+Prefer this over adding an "is anything registered?" branch to production code
+for the sake of a test. Such a branch reads like a design principle and usually
+is not: if the code only runs after `init`, the panic it guards against is
+unreachable, and the guard makes every host test **skip** the very path it was
+added to enable.
+
+```rust
+#[cfg(test)]
+mod tests {
+    // Idempotent, so call it unconditionally from every test — `cargo test`
+    // runs them in parallel threads of one process and there is no ordering.
+    fn setup() { crate::runtime::register_config_for_test(); }
+}
+```
+
+`akuma_exec::runtime::register_config_for_test` is the worked example. It
+registers only the `CONFIG` half — the 27-function-pointer `ExecRuntime` has no
+meaningful stub and pure logic never needs it — from a full-literal
+`ExecConfig::for_test()` kept next to the struct, so adding a field breaks it and
+someone has to choose a test value rather than silently getting a zero. Its
+`syscall_debug_info_enabled` is `true` so tracing paths are *executed* by tests
+rather than skipped.
+
+**The bar for host-testing kernel code is lower than it looks.**
+`with_irqs_disabled` is a no-op off `target_os = "none"`, `current_tid` is in
+this crate, and `akuma-exec`'s wake path is atomic-array bookkeeping — so
+registering and signalling a waiter are host-testable; only a thread actually
+stopping and resuming is not. Full reasoning:
+`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §6.1.
 
 ## Background
 
@@ -256,7 +348,12 @@ and not a nested one, and the device-window page-alignment/collision check.
   the two places the plan was wrong.
 - [`archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](../../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
   §5.55 / §5.555 — the survey that diagnosed the missing crate, and Phase 4's
-  running record.
+  running record. **§5.8** is `Registered<T>`: the three-way divergence, the 21
+  lock acquisitions it removed, and why the line count is a wash. **§6.1** is
+  the host-testability argument the injection pattern above came out of.
+- [`../../runbooks/verify-trim-fat-change.md`](../../runbooks/verify-trim-fat-change.md)
+  — the no-regression gate to run after adding to this crate: four clippy
+  configs, the host-test count, the boot baseline.
 - [`console.md`](console.md) § "Printing rules" — the no-alloc console rule and
   its exemptions.
 - [`locking.md`](locking.md) — the BKL carve-outs `PreemptGuard` exists for.
