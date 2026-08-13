@@ -830,8 +830,91 @@ simply never been looked at on a multi-core boot.
 The first is preferable — the whole point of the extreme-size autopsy was that a
 kernel stack overrun is a real, live class in this tree.
 
+## Issue 12: rump devbox — SSH stdin hangs at exactly 1 MiB (stale `/bin/sshd` on `devbox.img`)
+
+**Status: OPEN, and it is an image-staleness bug, not a code bug.** The kernel is
+fine and the fix already exists in `userspace/sshd`; `devbox.img` is carrying a
+`/bin/sshd` built before it. Repopulate the image — do not go looking in
+`rump_proxy.rs`.
+
+**Pre-existing — A/B-confirmed 2026-08-13, NOT a regression.** Found while
+verifying the `NoMem`/`DiscardMem` merge (§8 item 7 of
+[`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)),
+which was the initial suspect because it touches `src/rump_proxy.rs`'s
+`ClientMem` impls, and was cleared.
+
+### Symptom
+
+On `overlays/devbox/run.sh` (rump devbox, `RUMP_NIC=1`, ssh on host `:2223`),
+piping stdin into a remote command works up to 256 KiB and **hangs at 1 MiB**.
+The client never returns; the remote command receives nothing at all (`wc -c`
+prints an empty line, not a short count):
+
+```
+stdin    1024 B: OK
+stdin   65536 B: OK
+stdin  262144 B: OK
+stdin 1048576 B: TIMEOUT, wc -c -> b''
+```
+
+Everything else on the same connection is healthy — 4 MiB **stdout** is
+byte-for-byte correct, five sequential sessions connect cleanly, and the
+sysproxy path itself is fine (`[RUMP-SP] box=0 proxy ready`). It is inbound
+stdin only.
+
+### Cause
+
+[`SSHD_CHANNEL_WINDOW_NEVER_ADJUSTED.md`](SSHD_CHANNEL_WINDOW_NEVER_ADJUSTED.md):
+sshd advertises a 1 MiB initial inbound channel window in
+`SSH_MSG_CHANNEL_OPEN_CONFIRMATION` and never sends
+`SSH_MSG_CHANNEL_WINDOW_ADJUST`, so the client correctly transmits exactly the
+advertised 1 MiB and then waits forever. That was fixed in `userspace/sshd` —
+but the fix ships as a **binary on the image**, and `devbox.img` has an older
+`/bin/sshd` than `disk.img` does.
+
+The same test on `disk.img` (`cargo run --release`, smoltcp) passes at 4 MiB.
+Same kernel, same day, different image: that difference *is* the diagnosis.
+
+### A/B, because "pre-existing" needs proving
+
+`ddbfc55` (the `NoMem` merge) against its parent, both rebuilt and rebooted
+through `overlays/devbox/run.sh`:
+
+| build | stdin 256 KiB | stdin 1 MiB | stdout 1 MiB |
+|---|---|---|---|
+| `ddbfc55` (merge) | ok | **TIMEOUT** | md5 ok |
+| `ddbfc55^` (before) | ok | **TIMEOUT** | md5 ok |
+
+Identical. The merge is exonerated.
+
+### Fix
+
+Repopulate `devbox.img` so it carries the current `userspace/sshd`
+(`overlays/devbox/bootstrap.sh`, or stage the rebuilt binary into the image).
+Nothing in the kernel needs changing.
+
+### The general trap
+
+**`devbox.img` and `disk.img` carry independent copies of every userspace
+binary, and they drift.** A userspace fix verified on one image is not present
+on the other until that image is rebuilt, so the same test can pass on
+`disk.img` and fail on `devbox.img` with no code difference at all. When a
+userspace-shaped symptom appears on only one image, check the binary's age
+before reading any kernel source.
+
+This is also why the wrong VM got used in the first place: `src/rump_proxy.rs`
+is only *executed* under `RUMP_NIC=1` on `overlays/devbox/run.sh`. A default
+`cargo run --release` boot compiles it (`rump` is in the default feature set)
+and then prints `[rump] BSP tap not available: tap: transport init failed (run
+QEMU with RUMP_NIC=1)` — the code never runs, and a boot that looks completely
+clean has verified nothing about it.
+
 ## Background
 
+- [`SSHD_CHANNEL_WINDOW_NEVER_ADJUSTED.md`](SSHD_CHANNEL_WINDOW_NEVER_ADJUSTED.md)
+  — Issue 12's root cause: the missing `SSH_MSG_CHANNEL_WINDOW_ADJUST`, and why
+  its 1 MiB limit coincided with `ProcessChannel::MAX_BUFFER_SIZE` so the two
+  defects hid each other.
 - `docs/archive/GIT_MISSING_SYSCALLS.md` — Issues 11-14, the CLONE_THREAD /
   sideband-demux-thread / `wait4` visibility bugs Issue 1's root cause most
   closely resembles (all previously FIXED; this may be a new gap in the same
