@@ -762,6 +762,74 @@ The rump DHCP path, not sshd. `rump_server` runs and sshd's accept loop is
 healthy, but the rump interface never gets an address, and host `:2223` forwards
 to *rump*:22.
 
+## Issue 11: three spurious `[STACK-OVERFLOW]` lines on every `SMP=N>1` boot
+
+**Status: OPEN.** Not a devbox bug specifically — it fires on any `smp-shared`
+boot with secondaries — but the devbox is where you meet it, because it is the
+default multi-core image and it builds `no-tests` (so the self-test that would
+have shown `spurious=0` isn't there to reassure you).
+
+Every `SMP=4` boot prints, right after `[herd] Started sshd`:
+
+```
+[STACK-OVERFLOW] tid=1 ran off its 64KB kernel stack (base=0x402b5160) — kernel memory below it was corrupted
+[STACK-OVERFLOW] tid=2 ran off its 64KB kernel stack (base=0x402c5160) — kernel memory below it was corrupted
+[STACK-OVERFLOW] tid=3 ran off its 64KB kernel stack (base=0x402d5160) — kernel memory below it was corrupted
+```
+
+**All three are false.** The count is exactly `SMP - 1`, and the tids are exactly
+the per-core idle slots.
+
+### Why
+
+`threading::adopt_current_as_core_idle` takes over a secondary's **boot stack** as
+that core's idle thread. It registers the stack —
+`pool.stacks[slot] = StackInfo::new(stack_base, stack_size)`, so
+`stack.is_allocated()` is true — but it never **paints a canary**, because the
+stack already existed and was never handed out by the allocating paths that paint.
+
+`report_overrun_stack_canaries` then walks every allocated stack and reports any
+whose canary is not intact. An unpainted canary is indistinguishable from a
+smashed one, so each adopted idle slot reports once. Secondaries claim slots via
+`claim_free_slot(1, MAX_THREADS)`, i.e. from 1 upward — hence tid 1..SMP-1.
+
+Confirmed both directions:
+
+| build | secondaries | result |
+|---|---|---|
+| `--release`, `SMP=1`, tests on | 0 | `spurious=0` from `test_stack_canary_overrun_is_reported` |
+| devbox-smoltcp, `SMP=4`, `no-tests` | 3 | exactly 3 lines, tid=1,2,3 |
+
+A/B-confirmed **pre-existing** at `79a18cd` vs `069f1f0` (the `akuma-primitives`
+extraction): 3 lines on both, same tids, only the stack addresses differing.
+The check itself is new — it arrived with
+[`EXTREME_SSHD_KERNEL_STACK_OVERFLOW.md`](EXTREME_SSHD_KERNEL_STACK_OVERFLOW.md),
+which gave a long-painted-but-never-checked canary its first caller — so this has
+simply never been looked at on a multi-core boot.
+
+### Why it is worth fixing rather than living with
+
+1. **It is the loudest message the kernel has** ("kernel memory below it was
+   corrupted"), on a clean boot, three times. That trains people to ignore it —
+   which is the opposite of what a corruption detector is for.
+2. **It masks real overruns on exactly those slots.** The reporter latches:
+   `if CANARY_REPORTED_BASE[i].swap(stack.base) == stack.base { continue }`. The
+   spurious report stores the base, so a *genuine* later overrun on the same
+   per-core idle stack is silently skipped. The three cores' idle stacks are
+   currently un-monitorable.
+
+### Fix options
+
+- **Paint the canary in `adopt_current_as_core_idle`.** Correct and small; the
+  boot stack's base is already known there (`stack_base`), and it then gets real
+  overrun coverage. Needs care that the painted words sit below anything the
+  boot/trampoline context has already pushed.
+- **Or exempt adopted slots** from the sweep with an explicit flag, which is
+  honest but leaves three stacks unchecked.
+
+The first is preferable — the whole point of the extreme-size autopsy was that a
+kernel stack overrun is a real, live class in this tree.
+
 ## Background
 
 - `docs/archive/GIT_MISSING_SYSCALLS.md` — Issues 11-14, the CLONE_THREAD /
