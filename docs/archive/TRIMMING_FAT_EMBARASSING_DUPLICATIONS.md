@@ -357,6 +357,40 @@ most: `akuma-vfs` is the leaf that `akuma-isolation` depends on, so the shared
 half belongs in `akuma-vfs` and there is no dependency obstacle to putting it
 there.
 
+**DONE 2026-08-13.** `MountTable` (8 mounts) and `MountNamespace` (16) were the
+same table: `mount` / `unmount` / `resolve` / `resolve_arc` / `list_mounts` /
+`child_mount_points` byte-identical apart from the capacity constant, plus one
+extra method each (`get_fs`+`sync_all` vs `replace_pristine_root`+`is_empty`).
+Now one `MountSet<const MAX: usize>` in `akuma-vfs`, with both names as **type
+aliases** — every use site (the `MOUNT_TABLE` static, `Namespace.mount:
+Spinlock<MountNamespace>`, and both crates' tests) only ever calls methods, so
+nothing moved. `akuma-isolation/src/mount.rs` went 233 → 74 code lines (the
+remainder is its four box-root tests, which stay because box-root semantics are
+that crate's concern); the four touched files net **−145**.
+
+**`replace_pristine_root` moved with its guard, on purpose.** It is the only
+write to an existing mount's `fs` in the tree, and there is deliberately **no**
+unguarded `replace_root` anywhere — so the `expected`-name check travels with the
+operation rather than living in a wrapper a later caller could bypass. The cost
+is that the kernel's global `MountTable` now also exposes the *guarded* form,
+which has no caller; the alternative was publishing a bare setter for the
+namespace to build on, which is strictly worse.
+
+**Coverage, stated precisely.** `MountSet<8>` matching is exercised on every file
+access in-VM (release and devbox-smoltcp boots: `..` traversal, `..` through a
+mount point, escape-above-root clamping, relative resolution from a CWD, trailing
+slashes — all verified over ssh). `MountSet<16>` *matching* is covered by
+`akuma-isolation`'s four host tests and the new `MountSet<16>` cases, **not**
+in-VM: neither boot created a box namespace, so the namespace arm of `with_fs`
+ran against an empty set and fell through. The two instantiations are the same
+monomorphised body apart from the `mounts.len() >= MAX` comparison, which is
+unit-tested at both 8 and 16.
+
+> **Both DONE 2026-08-13.** One `MountSet<const MAX: usize>` in `akuma-vfs`;
+> `MountTable = MountSet<8>` and `akuma_isolation::MountNamespace =
+> MountSet<16>` are type aliases, so no call site moved. The bin crate's
+> third path normaliser is gone. Details at the end of each subsection below.
+
 ### Three path normalisers, two of them in `akuma-vfs` itself (found 2026-08-13)
 
 Turned up while checking whether anything in `akuma-vfs` wanted to move to
@@ -372,8 +406,29 @@ return types, renamed identifiers.
 The last two are the problem: same name, same stated intent, **different
 results.** A mount path arriving without a leading `/` normalises differently
 depending on which one sees it — the bin crate's forces the slash, `akuma-vfs`'s
-does not. Reconcile on its own terms; it is a correctness question, not a line
-count. Phase 6, next to the `mount.rs` merge above.
+does not.
+
+**FIXED 2026-08-13, and the real defect was worse than "two spellings."**
+`normalize_path_owned` was only ever called in the *no-current-process* arm of
+`vfs::with_fs` and `vfs::resolve_absolute`; the with-process arm called
+`path::resolve_path(&proc.cwd, path)`. Both arms then fed the same
+`MountSet::resolve_arc`. So `.` and `..` were **resolved when a process was
+current and left in the path when one was not** — one call site, two
+normalisation semantics, selected by whether a process happened to exist.
+
+It is now `resolve_path("/", path)` — the same function the other arm uses, with
+the CWD it actually has — behind a named `resolve_without_cwd`. Identical on
+`""`, `"/"`, `"/foo/"`, `"foo"`; on `"foo/../bar"` it yields `/bar` where the old
+code yielded `/foo/../bar`. Pinned by
+`resolve_path_at_root_is_the_no_cwd_normaliser` in `akuma-vfs`'s tests, which
+also records that escaping above root clamps (`"../../etc"` → `/etc`) rather than
+producing a relative path.
+
+`normalize_mount_path` (was `mount.rs`'s `normalize_path`) **stays**, renamed and
+documented as what it is: a non-allocating trailing-slash trim for mount-point
+comparison, deliberately not a path normaliser. It returns a borrow so `resolve`
+can hand back a subslice of its input. It is now the single copy — the namespace
+had inlined the same two lines three times.
 
 ### Nothing in `akuma-vfs` belongs in `akuma-primitives`
 
@@ -904,7 +959,7 @@ ELF-loading path into one.
 |---|---|---:|---|---|
 | 1 | virtio scaffolding: shared `Hal`, `virtio::probe`, one `VIRTIO_MMIO_ADDRS` | ~90 | small | low |
 | 2 | `channel.rs` stdout/stdin FIFO → one helper; ~~decide whether `write_stdin` needs the `write_bounded` treatment~~ **(decided + shipped 2026-08-13, §8.5 Phase 0 item 5)** — the FIFO-merge half is still open | ~40 | small | low, but see §6 |
-| 3 | `akuma-isolation`/`akuma-vfs` `mount.rs` → shared half into `akuma-vfs` | ~63 | small | low |
+| 3 | ~~`akuma-isolation`/`akuma-vfs` `mount.rs` → shared half into `akuma-vfs`~~ **DONE 2026-08-13** — one `MountSet<const MAX>`, both names as type aliases, −145 code lines across 4 files; the bin crate's third path normaliser went with it (§4) | 0 left | — | — |
 | 4 | ~~The `X`/`X_from_path` **quartet**~~ **DONE 2026-08-13** — `elf/mod.rs` ×3 in Phase 2a (−151 code lines, 12 clone blocks → 0), `process/mod.rs` + `process/image.rs` in Phase 2b (−105 code lines, the pairs' 60- and 47-line clone blocks → absent) | 0 left | — | — |
 | 5 | `exceptions.rs` duplicated `Drop` impls (`:3703` / `:4315`) | ~142 | medium | **high** — exception path |
 | 6 | `box_mod` `access.rs` / `hierarchy.rs` | ~60 | small | low |
@@ -1370,11 +1425,22 @@ destination hole), then 167 mechanical conversions. All in `src/syscall/*`, so
 it overlaps nothing above — but it is a large diff, so do not hold it open
 alongside Phase 2's.
 
-### Phase 6 — remaining duplication
+### Phase 6 — remaining duplication — IN PROGRESS
 
-`channel.rs` FIFO merge + restore the missing traces; `mount.rs` shared half into
-`akuma-vfs`; `box_mod`; `rump_proxy`/`sysproxy`; then `exceptions.rs`'s
-duplicated `Drop` impls (high risk).
+**DONE 2026-08-13:** the `mount.rs` shared half into `akuma-vfs` (§8 item 3) as
+one `MountSet<const MAX: usize>`, and with it the bin crate's third path
+normaliser — which turned out to be a real inconsistency, not a spelling
+difference: `.`/`..` were resolved only when a process was current (§4).
+
+**Still open, in the order they are worth doing:**
+
+| Item | Notes |
+|---|---|
+| `channel.rs` FIFO merge + restore the missing traces (§8 item 2) | the `write_stdin` backpressure half already shipped in Phase 0 item 5; this is the remaining stdout/stdin body merge |
+| `box_mod` `access.rs` / `hierarchy.rs` (§8 item 6, ~60 lines) | low risk |
+| `rump_proxy.rs` / `akuma-rump` `sysproxy.rs` (§8 item 7, ~23 lines) | overlaps Phase 4's `ClientMem`/`NoMem` question — settle `ClientMem`'s home once, for both |
+| `src/console.rs` `print_dec` / `print_u64` | a genuine 21-line / 82-token **Type-1** clone differing only in `usize` vs `u64`; CPD has always reported it. Found during the `akuma-primitives` work, unrelated to it |
+| `exceptions.rs`'s duplicated `Drop` impls (§8 item 5, ~142 lines) | **high risk — exception path.** Do last, and read `UNSAFE_AUDIT.md` §5.1 first |
 
 ### Phase 7 — `#[repr(C)]` `Statx` + `SigFrame`
 

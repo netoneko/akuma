@@ -10,7 +10,6 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::format;
 use spinning_top::Spinlock;
 
 // Re-export everything from the crate so existing `use crate::vfs::*` keeps working.
@@ -124,16 +123,25 @@ pub fn list_namespace_mounts(box_id: u64) -> Vec<MountInfo> {
     namespaces.get(&box_id).map_or_else(Vec::new, |ns| ns.mount.lock().list_mounts())
 }
 
-/// Normalize path with allocation (adds leading / if missing)
-fn normalize_path_owned(path: &str) -> String {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        String::from("/")
-    } else if !trimmed.starts_with('/') {
-        format!("/{trimmed}")
-    } else {
-        String::from(trimmed)
-    }
+/// Resolve `path` with no process CWD to resolve against — i.e. as if the CWD
+/// were `/`.
+///
+/// This is the fallback arm of every "resolve a path" site below, taken when
+/// there is no current process (early boot, kernel threads). It used to be a
+/// local `normalize_path_owned` that trimmed trailing slashes and prepended a
+/// leading one but **did not resolve `.` / `..`** — so `..` was resolved when a
+/// process existed and left in the path when one did not, and both arms then fed
+/// the same `MountTable::resolve_arc`. Two normalisation semantics behind one
+/// call, differing by whether a process happened to be current.
+///
+/// `resolve_path("/", path)` is the same function the with-process arm uses,
+/// with the CWD it actually has. Identical on `""`, `"/"`, `"/foo/"` and `"foo"`;
+/// on `"foo/../bar"` it yields `/bar` where the old code yielded
+/// `/foo/../bar`, which is the correction. See
+/// `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §4.
+#[inline]
+fn resolve_without_cwd(path: &str) -> String {
+    resolve_path("/", path)
 }
 
 // ============================================================================
@@ -216,7 +224,7 @@ where
         };
         f(global_arc.0.as_ref(), &global_arc.1)
     } else {
-        let normalized = normalize_path_owned(path);
+        let normalized = resolve_without_cwd(path);
 
         let global_arc = {
             let table = MOUNT_TABLE.lock();
@@ -361,7 +369,7 @@ fn resolve_absolute(path: &str) -> String {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         resolve_path(&proc.cwd, path)
     } else {
-        normalize_path_owned(path)
+        resolve_without_cwd(path)
     }
 }
 

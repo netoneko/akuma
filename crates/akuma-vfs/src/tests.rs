@@ -31,6 +31,32 @@ mod path_tests {
         assert_eq!(resolve_path("/", "foo"), "/foo");
     }
 
+    /// `resolve_path("/", p)` is what the kernel's `vfs::resolve_without_cwd`
+    /// uses when there is no current process to take a CWD from. It replaced a
+    /// local `normalize_path_owned` that trimmed trailing slashes and prepended a
+    /// leading one but did **not** resolve `.` / `..` — so `..` was resolved when
+    /// a process existed and left in the path when one did not, with both arms
+    /// feeding the same `MountSet::resolve_arc`.
+    ///
+    /// The first group is where the two agreed; the second is the correction.
+    #[test]
+    fn resolve_path_at_root_is_the_no_cwd_normaliser() {
+        // Unchanged from the old local helper.
+        assert_eq!(resolve_path("/", ""), "/");
+        assert_eq!(resolve_path("/", "/"), "/");
+        assert_eq!(resolve_path("/", "/foo/"), "/foo");
+        assert_eq!(resolve_path("/", "foo"), "/foo");
+        assert_eq!(resolve_path("/", "/foo/bar"), "/foo/bar");
+
+        // The correction: `..` and `.` are now resolved here too, so a path does
+        // not mean two different things depending on whether a process is current.
+        assert_eq!(resolve_path("/", "foo/../bar"), "/bar");
+        assert_eq!(resolve_path("/", "./foo"), "/foo");
+        assert_eq!(resolve_path("/", "foo/./bar/"), "/foo/bar");
+        // Escaping above root clamps rather than producing a relative path.
+        assert_eq!(resolve_path("/", "../../etc"), "/etc");
+    }
+
     #[test]
     fn split_path_basic() {
         assert_eq!(split_path("/foo/bar/baz"), ("foo/bar", "baz"));
@@ -295,5 +321,186 @@ mod memfs_tests {
         fs.write_at("/tmp/f", 0, b"BB").unwrap();
         let data = fs.read_file("/tmp/f").unwrap();
         assert_eq!(&data, b"BBAAAAAAAA");
+    }
+}
+
+/// Tests for the merge of `MountTable` and `akuma_isolation::MountNamespace` into
+/// one `MountSet<const MAX>` (`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §4).
+///
+/// The two types differed only in capacity (8 vs 16) and in whether they called
+/// the trailing-slash helper or inlined it — so the things worth pinning are the
+/// per-instantiation capacity (the one thing a generic can silently get wrong)
+/// and the normalisation the inlined copies used to do by hand.
+#[cfg(test)]
+mod mount_set_tests {
+    extern crate alloc;
+    use alloc::format;
+    use alloc::sync::Arc;
+    use crate::{Filesystem, FsError, MemoryFilesystem, MountSet};
+
+    fn memfs() -> Arc<dyn Filesystem> {
+        Arc::new(MemoryFilesystem::new())
+    }
+
+    /// `MAX` is per-instantiation, not shared. The kernel's table holds 8 and a
+    /// container namespace holds 16; a generic that leaked one bound into the
+    /// other would be invisible until a box hit the 9th mount.
+    #[test]
+    fn capacity_is_per_instantiation() {
+        let mut small: MountSet<8> = MountSet::new();
+        for i in 0..8 {
+            small.mount(&format!("/m{i}"), memfs()).unwrap();
+        }
+        assert_eq!(small.len(), 8);
+        assert_eq!(small.mount("/m8", memfs()).unwrap_err(), FsError::NoSpace);
+
+        let mut big: MountSet<16> = MountSet::new();
+        for i in 0..16 {
+            big.mount(&format!("/m{i}"), memfs()).unwrap();
+        }
+        assert_eq!(big.len(), 16);
+        assert_eq!(big.mount("/m16", memfs()).unwrap_err(), FsError::NoSpace);
+    }
+
+    #[test]
+    fn new_set_is_empty() {
+        let set: MountSet<8> = MountSet::new();
+        assert!(set.is_empty());
+        assert_eq!(set.len(), 0);
+        assert!(set.resolve("/anything").is_none());
+    }
+
+    /// Trailing slashes must not change which mount is chosen, nor the relative
+    /// path handed to it. The namespace copy open-coded this three times.
+    #[test]
+    fn trailing_slashes_are_normalised_away() {
+        let mut set: MountSet<8> = MountSet::new();
+        set.mount("/", memfs()).unwrap();
+        set.mount("/data", memfs()).unwrap();
+
+        // Exactly the mount point, with and without the slash.
+        assert_eq!(set.resolve("/data").unwrap().1, "/");
+        assert_eq!(set.resolve("/data/").unwrap().1, "/");
+        // Below it.
+        assert_eq!(set.resolve("/data/x/").unwrap().1, "/x");
+        // The empty path collapses to root rather than matching nothing.
+        assert_eq!(set.resolve("").unwrap().1, "/");
+        assert_eq!(set.resolve("/").unwrap().1, "/");
+    }
+
+    /// Longest mount path wins regardless of insertion order — `mount` keeps the
+    /// vec sorted by descending path length, and `resolve` relies on that.
+    #[test]
+    fn deepest_mount_wins_regardless_of_order() {
+        let mut set: MountSet<8> = MountSet::new();
+        set.mount("/a/b", memfs()).unwrap();
+        set.mount("/", memfs()).unwrap();
+        set.mount("/a", memfs()).unwrap();
+
+        assert_eq!(set.resolve("/a/b/c").unwrap().1, "/c");
+        assert_eq!(set.resolve("/a/z").unwrap().1, "/z");
+        // `/ab` must NOT match the `/a` mount — a prefix match has to land on a
+        // path separator.
+        assert_eq!(set.resolve("/ab").unwrap().1, "/ab");
+    }
+
+    /// `resolve` and `resolve_arc` must agree; the latter exists only so the
+    /// caller can drop its lock before doing I/O.
+    #[test]
+    fn resolve_and_resolve_arc_agree() {
+        let mut set: MountSet<8> = MountSet::new();
+        set.mount("/", memfs()).unwrap();
+        set.mount("/proc", memfs()).unwrap();
+
+        for p in ["/", "/proc", "/proc/", "/proc/1/status", "/etc/passwd", ""] {
+            let borrowed = set.resolve(p).map(|(_, rel)| alloc::string::String::from(rel));
+            let owned = set.resolve_arc(p).map(|(_, rel)| rel);
+            assert_eq!(borrowed, owned, "disagreement on {p:?}");
+        }
+    }
+
+    #[test]
+    fn mount_rejects_duplicates_and_unmount_reports_missing() {
+        let mut set: MountSet<8> = MountSet::new();
+        set.mount("/x", memfs()).unwrap();
+        assert_eq!(set.mount("/x", memfs()).unwrap_err(), FsError::AlreadyExists);
+        assert_eq!(set.unmount("/nope").unwrap_err(), FsError::NotFound);
+        set.unmount("/x").unwrap();
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn child_mount_points_lists_direct_children_only() {
+        let mut set: MountSet<16> = MountSet::new();
+        set.mount("/", memfs()).unwrap();
+        set.mount("/a", memfs()).unwrap();
+        set.mount("/a/b", memfs()).unwrap();
+        set.mount("/a/b/c", memfs()).unwrap();
+
+        let mut root: alloc::vec::Vec<_> =
+            set.child_mount_points("/").into_iter().map(|e| e.name).collect();
+        root.sort();
+        assert_eq!(root, ["a"], "only depth-1 children of /");
+
+        let a: alloc::vec::Vec<_> =
+            set.child_mount_points("/a").into_iter().map(|e| e.name).collect();
+        assert_eq!(a, ["b"]);
+
+        // Trailing slash must not change the answer.
+        let a_slash: alloc::vec::Vec<_> =
+            set.child_mount_points("/a/").into_iter().map(|e| e.name).collect();
+        assert_eq!(a_slash, ["b"]);
+    }
+
+    #[test]
+    fn get_fs_matches_the_mount_point_exactly() {
+        let mut set: MountSet<8> = MountSet::new();
+        set.mount("/", memfs()).unwrap();
+        set.mount("/data", memfs()).unwrap();
+
+        assert!(set.get_fs("/data").is_some());
+        assert!(set.get_fs("/data/").is_some(), "normalised before matching");
+        assert!(set.get_fs("/data/sub").is_none(), "not a mount point");
+    }
+
+    /// The one-shot root swap, on the shared type. There is deliberately no
+    /// unguarded `replace_root`; this is the only write to an existing mount's
+    /// `fs` in the tree, and the `expected` check is what makes it safe.
+    #[test]
+    fn pristine_root_swaps_once_and_never_again() {
+        struct Named(&'static str);
+        impl Filesystem for Named {
+            fn name(&self) -> &str { self.0 }
+            fn read_dir(&self, _: &str) -> Result<alloc::vec::Vec<crate::DirEntry>, FsError> { Err(FsError::NotFound) }
+            fn read_file(&self, _: &str) -> Result<alloc::vec::Vec<u8>, FsError> { Err(FsError::NotFound) }
+            fn write_file(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Err(FsError::NotFound) }
+            fn create_dir(&self, _: &str) -> Result<(), FsError> { Err(FsError::NotFound) }
+            fn remove_file(&self, _: &str) -> Result<(), FsError> { Err(FsError::NotFound) }
+            fn remove_dir(&self, _: &str) -> Result<(), FsError> { Err(FsError::NotFound) }
+            fn exists(&self, _: &str) -> bool { false }
+            fn metadata(&self, _: &str) -> Result<crate::Metadata, FsError> { Err(FsError::NotFound) }
+            fn stats(&self) -> Result<crate::FsStats, FsError> { Err(FsError::NotFound) }
+        }
+
+        let mut set: MountSet<16> = MountSet::new();
+        set.mount("/", Arc::new(Named("subdirfs"))).unwrap();
+
+        set.replace_pristine_root("subdirfs", Arc::new(Named("overlay"))).unwrap();
+        assert_eq!(set.resolve("/x").unwrap().0.name(), "overlay");
+        assert_eq!(set.list_mounts().len(), 1, "a swap, not a stack");
+
+        // No longer pristine: nothing can redirect it again.
+        assert_eq!(
+            set.replace_pristine_root("subdirfs", Arc::new(Named("attacker"))).unwrap_err(),
+            FsError::PermissionDenied
+        );
+        assert_eq!(set.resolve("/x").unwrap().0.name(), "overlay");
+
+        // And a set with no root cannot have one installed this way.
+        let mut rootless: MountSet<16> = MountSet::new();
+        assert_eq!(
+            rootless.replace_pristine_root("subdirfs", Arc::new(Named("x"))).unwrap_err(),
+            FsError::PermissionDenied
+        );
     }
 }
