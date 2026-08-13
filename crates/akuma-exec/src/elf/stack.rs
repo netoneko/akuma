@@ -9,19 +9,30 @@ use crate::mmu::{PAGE_SIZE, UserAddressSpace, user_flags};
 use super::load::{LoadedElf, load_elf, load_elf_from_path};
 use super::types::{AuxEntry, DEBUG_ELF_LOADING, DeferredLazySegment, ElfError, auxv};
 
-/// What `load_elf_with_stack*` hands back: entry point, address space, SP, heap
-/// start, stack bottom/top, mmap floor, and the lazy segments (empty unless the
-/// image was loaded with the deferred mapping strategy).
-pub type LoadedWithStack = (
-    usize,
-    UserAddressSpace,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    Vec<DeferredLazySegment>,
-);
+/// What `load_elf_with_stack*` hands back: a loaded image plus the initial user
+/// stack built for it.
+///
+/// A struct rather than the 8-tuple this used to be. Every consumer opened with
+/// the same wide `let (a, b, c, d, e, f, g, h) = …` destructure, which is a large
+/// part of why the four `ProcessImage` entry points were so hard to diff against
+/// each other (Phase 2b).
+pub struct LoadedWithStack {
+    /// Where execution starts: the interpreter's entry point for a dynamically
+    /// linked image, the image's own for a static one.
+    pub entry_point: usize,
+    pub address_space: UserAddressSpace,
+    /// Initial SP, pointing at the argc/argv/envp/auxv block.
+    pub sp: usize,
+    /// Initial program break — the page-aligned end of the loaded image.
+    pub brk: usize,
+    pub stack_bottom: usize,
+    pub stack_top: usize,
+    /// Lowest VA `mmap` may hand out; non-zero only when an interpreter is loaded.
+    pub mmap_floor: usize,
+    /// Segments to register for demand paging. Empty unless the image was loaded
+    /// with the deferred mapping strategy — see [`super::load::MapStrategy`].
+    pub deferred_segments: Vec<DeferredLazySegment>,
+}
 
 /// Helper to build a userspace stack according to Linux AArch64 ABI
 pub struct UserStack {
@@ -312,14 +323,14 @@ fn attach_stack(
     // a demand-paged one. Passing it through unconditionally is what turns the
     // old hardcoded `Vec::new()` in the bytes variant into a property of the
     // mapping strategy — see `MapStrategy` in `load.rs`.
-    Ok((
-        actual_entry,
-        loaded.address_space,
+    Ok(LoadedWithStack {
+        entry_point: actual_entry,
+        address_space: loaded.address_space,
         sp,
-        hs,
+        brk: hs,
         stack_bottom,
         stack_top,
         mmap_floor,
-        loaded.deferred_segments,
-    ))
+        deferred_segments: loaded.deferred_segments,
+    })
 }

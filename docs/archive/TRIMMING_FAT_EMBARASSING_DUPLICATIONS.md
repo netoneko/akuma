@@ -90,10 +90,11 @@ priorities in §5 exclude them.
 
 ## 3. The dominant pattern: `X` and `X_from_path`
 
-> **Status.** The `elf/mod.rs` three-of-four (Phase 2a) **landed 2026-08-13** —
-> what the plan below got right and wrong is in §8.5. The `process/mod.rs` and
-> `process/image.rs` pair (Phase 2b) is still open. The analysis below is left
-> as written, because §8.5's corrections only make sense against it.
+> **Status.** The whole quartet is **done as of 2026-08-13** — the `elf/mod.rs`
+> three-of-four in Phase 2a, the `process/mod.rs` + `process/image.rs` consumer
+> pairs in Phase 2b. What the plan below got right and wrong is in §8.5. The
+> analysis is left as written, because §8.5's corrections only make sense
+> against it.
 
 **Three separate copies of one design decision**, in three different files. Each
 is "load an ELF from bytes" cloned into "load an ELF from a path":
@@ -569,7 +570,7 @@ ELF-loading path into one.
 | 1 | virtio scaffolding: shared `Hal`, `virtio::probe`, one `VIRTIO_MMIO_ADDRS` | ~90 | small | low |
 | 2 | `channel.rs` stdout/stdin FIFO → one helper; ~~decide whether `write_stdin` needs the `write_bounded` treatment~~ **(decided + shipped 2026-08-13, §8.5 Phase 0 item 5)** — the FIFO-merge half is still open | ~40 | small | low, but see §6 |
 | 3 | `akuma-isolation`/`akuma-vfs` `mount.rs` → shared half into `akuma-vfs` | ~63 | small | low |
-| 4 | The `X`/`X_from_path` **quartet** — ~~`elf/mod.rs` ×3~~ **(done 2026-08-13, §8.5 Phase 2a: −151 code lines, 12 clone blocks → 0)**; `process/mod.rs` + `process/image.rs` still open as Phase 2b | ~165 left | medium | medium — ELF load path, boot-critical |
+| 4 | ~~The `X`/`X_from_path` **quartet**~~ **DONE 2026-08-13** — `elf/mod.rs` ×3 in Phase 2a (−151 code lines, 12 clone blocks → 0), `process/mod.rs` + `process/image.rs` in Phase 2b (−105 code lines, the pairs' 60- and 47-line clone blocks → absent) | 0 left | — | — |
 | 5 | `exceptions.rs` duplicated `Drop` impls (`:3703` / `:4315`) | ~142 | medium | **high** — exception path |
 | 6 | `box_mod` `access.rs` / `hierarchy.rs` | ~60 | small | low |
 | 7 | `rump_proxy.rs` / `akuma-rump` `sysproxy.rs` | ~23 | small | low |
@@ -806,12 +807,105 @@ carries `apk add musl tree` plus two ubase binaries at `/bin/dyn_pwdx` and
 `/bin/dyn_df`. Keep them: the ELF loader has no other in-VM coverage of the
 dynamic path.
 
-**2b — park until `process/mod.rs` is free** (~250 lines): move `from_elf` /
-`from_elf_path` into `image.rs` as a **pure move in its own commit** (a reviewer
-must be able to see "nothing changed but the file"), then merge the `from_elf`
-and `replace_image` pairs, restoring the five `[FORK-DBG]` traces and
-reconciling the split comments. Do not combine the move and the merge — the move
-noise buries the semantic diff.
+**2b — DONE 2026-08-13.** The consumer half of the quartet. Two commits, as
+planned: a pure move of `from_elf` / `from_elf_path` out of `process/mod.rs`
+into `process/image.rs` (bodies byte-identical, verified by diffing the cut
+region against the pasted one; the only other change is imports), then the
+merges. Both `ProcessImage` pairs now run one body each, selected by a value:
+
+```rust
+enum ImageSource<'a> {
+    Bytes(&'a [u8]),                             // in the heap already → eager
+    Path { path: &'a str, file_size: usize },    // still on disk → demand-paged
+}
+```
+
+`replace_image` / `replace_image_from_path` → `replace_image_from(source, …)`;
+`from_elf` / `from_elf_path` → `from_image(name, source, …)`. The four public
+entry points survive unchanged as one-line wrappers, so no caller moved.
+
+**What it bought, in order of value:**
+
+1. **The five `[FORK-DBG]` lifecycle traces now cover both exec paths.** They
+   existed only on the in-memory one, so which half of `execve` was traceable
+   depended on the binary's size (`HEAP_SLURP_MAX`). This was the point of the
+   phase; the lines saved are the side effect.
+2. **Each piece of load-bearing reasoning now sits next to the code it
+   describes.** The preemption-guard comment no longer says "(in the `from_path`
+   variant) does block I/O" from inside the variant that doesn't — it says "for
+   an `ImageSource::Path`, does block I/O", in the one function both sources run.
+   The constructors' six-line note on why the pid-keyed `push_lazy_region` can't
+   be used before the `Process` exists, and the replacers' three-line note on why
+   it can't be used while holding `&mut self`, are **different** reasons for
+   different situations: both were kept, one per site. The `from_elf_path`
+   three-line summary deferring to "the sibling constructor" is gone, because
+   there is no sibling any more.
+3. **`LoadedWithStack` is a struct, not an 8-tuple.** Every consumer used to open
+   with the same `let (a, b, c, d, e, f, g, h) = …`, which is a large part of why
+   two functions differing in four places looked like two unrelated 100-line
+   walls. Four destructures → four field-named bodies. Only these four call sites
+   existed, so it was a contained change.
+
+**Measured.** CPD at 50 tokens over the three touched files
+(`process/mod.rs`, `process/image.rs`, `elf/stack.rs`):
+
+| | blocks | duplicated lines |
+|---|---:|---:|
+| before | 22 | 479 |
+| after | 14 | 302 |
+
+Both target blocks are gone: the 60-line/404-token `from_elf` pair and the
+47-line/258-token `replace_image` pair. Code lines (non-blank, non-comment)
+across those three files: **2,337 → 2,232, −105.**
+
+**§3's ~165 was ~1.6× optimistic** — the same failure mode as Phase 2a's 3×, one
+step smaller because there was less new seam to build: `ImageSource` plus the
+shared `push_deferred_regions` helper are ~50 lines that did not exist in any
+form. §3's 165 also counted whole-function extents (comments and blanks) against
+a code-only merged size.
+
+**Three differences the diff-before-merging rule caught**, none of them
+duplication:
+
+1. **Region-push order.** The constructors pushed heap+stack into a fresh
+   `LazyRegionMap`; the path constructor pushed the image's deferred segments
+   *first*. The merged body always does deferred-then-heap-then-stack, which is
+   a no-op reordering for a byte source because `deferred_segments` is empty
+   there — the Phase 2a invariant paying off a second time.
+2. **The heap-usage debug line** (`[Process] heap before ELF load: …MB`) existed
+   only on the path constructor. Kept, for both: the *eager* source is the one
+   that has already slurped the whole binary into that heap, so it is the more
+   interesting of the two to see a figure for.
+3. **`(on-demand)` in the "PID n replaced" debug line** was the only remaining
+   text difference between the replacers. It is now derived from
+   `loaded.deferred_segments.is_empty()` rather than passed in — the mapping
+   strategy reporting itself, not the caller asserting it.
+
+**Verification.** `cargo check --release`, `cargo clippy --release` and
+`cargo clippy --profile extreme-size --no-default-features --features
+no-tests,smoltcp,extreme,userspace-sshd` all warning-clean; 414 host tests green.
+QEMU `MEMORY=2048`, 93 `[PASS]`, failure set identical to a clean tree
+(`retired_reclaim_ab` only). All four merged paths exercised in one boot:
+
+| path | exercised by |
+|---|---|
+| `from_image` + Bytes | every small kernel spawn at boot (`hello`, herd, sshd) |
+| `from_image` + Path | `[PASS] test_sigpipe_terminate_no_deadlock` — spawns `/bin/busybox` (1.09 MB) through `spawn_process_with_channel` |
+| `replace_image_from` + Bytes | `/bin/tcc -v` (229 KB) and `/usr/bin/tree --version` over ssh |
+| `replace_image_from` + Path | `/bin/busybox echo` over ssh |
+
+The boot log also carries `execve: replace_image failed for …: Invalid ELF
+magic: 6e 6f 74 2d` — `process_tests.rs`'s deliberate non-ELF execve, reporting
+`"not-"`, which is Phase 2a's `InvalidMagic`-vs-`InvalidFormat` refinement
+running through the merged replacer.
+
+**What is left in these files, and it is not this quartet.** The 14 residual CPD
+blocks are almost entirely `process/mod.rs`-internal, and the largest family is
+the `Process` struct literal written out four times — `fork_process`,
+`vfork_process`, `clone_thread` and `from_image`, ~45 fields each. That is a
+Phase 6 candidate with a real hazard behind it (a field added to `Process` has
+four initialisers to find), but it is a different pair-of-eyes problem from the
+`X`/`X_from_path` pattern and was left alone.
 
 ### Phase 3 — virtio consolidation (≈ −28 `unsafe`, −90 lines)
 
