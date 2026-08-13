@@ -146,6 +146,17 @@ canary on an idle slot detected exactly once.
   (`COW_FORK_ENABLED = false`) reproduces the fault byte-for-byte. Neither the
   demand-paged loader nor CoW is involved.
 
+## Follow-on: the playbook needed one more fix
+
+With ssh working again, `acceptance/05`'s compile step still failed —
+`tcc: error: file 'tcc' not found`. That is a **second, unrelated** bug, in
+`paws` (extreme's login shell), which passed the command name to `spawn` as an
+argument on top of the `argv[0]` the syscall already prepends. It reproduces on
+`release` via `paws -c`, so it is not a profile bug; it had simply never been
+reachable on `extreme` while ssh was down.
+See [`PAWS_DUPLICATED_ARGV0.md`](PAWS_DUPLICATED_ARGV0.md). With both fixed,
+`tcc -static -B /usr/lib/tcc` compiles and the output runs at the 4.0 MB floor.
+
 ## Background
 
 - [`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)

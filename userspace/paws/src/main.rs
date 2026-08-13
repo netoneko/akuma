@@ -121,12 +121,20 @@ fn execute_single_command(line: &str) {
 
 fn execute_external_reattach(args: &[String]) {
     let path = find_bin(&args[0]);
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    // `skip(1)`: `args[0]` is the command NAME, and the `spawn` syscall builds
+    // argv itself as `[path, ...args]` — passing the name through as an argument
+    // too puts it at argv[1], where it reads as the first positional operand.
+    // busybox hides this (a leading applet name is exactly how the multicall
+    // binary is meant to be invoked, so it just re-dispatches), which is why it
+    // went unnoticed; `tcc` took the duplicate as an input file and died with
+    // `file 'tcc' not found` before compiling anything. The debug print below
+    // already skips it — only the value handed to `spawn` was wrong.
+    let arg_refs: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
     
     // Debug: print arguments
     print("paws: executing (reattach) ");
     print(&path);
-    for arg in arg_refs.iter().skip(1) {
+    for arg in arg_refs.iter() {
         print(" ");
         print(arg);
     }
@@ -248,7 +256,8 @@ fn execute_pipe(left_line: &str, right_line: &str) {
         _ => {
             // Run external with stdin
             let path = find_bin(&right_args[0]);
-            let arg_refs: Vec<&str> = right_args.iter().map(|s| s.as_str()).collect();
+            // skip(1): argv[0] is added by `spawn` — see `execute_external_with_status`.
+            let arg_refs: Vec<&str> = right_args.iter().skip(1).map(|s| s.as_str()).collect();
             if let Some(res) = spawn_with_stdin(&path, Some(&arg_refs), Some(&captured_output)) {
                 stream_output(res.stdout_fd, res.pid);
             } else {
@@ -525,12 +534,20 @@ fn execute_external(args: &[String]) {
 
 fn execute_external_with_status(args: &[String]) -> i32 {
     let path = find_bin(&args[0]);
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    // `skip(1)`: `args[0]` is the command NAME, and the `spawn` syscall builds
+    // argv itself as `[path, ...args]` — passing the name through as an argument
+    // too puts it at argv[1], where it reads as the first positional operand.
+    // busybox hides this (a leading applet name is exactly how the multicall
+    // binary is meant to be invoked, so it just re-dispatches), which is why it
+    // went unnoticed; `tcc` took the duplicate as an input file and died with
+    // `file 'tcc' not found` before compiling anything. The debug print below
+    // already skips it — only the value handed to `spawn` was wrong.
+    let arg_refs: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
     
     // Debug: print arguments
     print("paws: executing ");
     print(&path);
-    for arg in arg_refs.iter().skip(1) {
+    for arg in arg_refs.iter() {
         print(" ");
         print(arg);
     }
@@ -553,7 +570,15 @@ fn execute_external_with_status(args: &[String]) -> i32 {
 
 fn execute_external_and_capture(args: &[String], output: &mut Vec<u8>) {
     let path = find_bin(&args[0]);
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    // `skip(1)`: `args[0]` is the command NAME, and the `spawn` syscall builds
+    // argv itself as `[path, ...args]` — passing the name through as an argument
+    // too puts it at argv[1], where it reads as the first positional operand.
+    // busybox hides this (a leading applet name is exactly how the multicall
+    // binary is meant to be invoked, so it just re-dispatches), which is why it
+    // went unnoticed; `tcc` took the duplicate as an input file and died with
+    // `file 'tcc' not found` before compiling anything. The debug print below
+    // already skips it — only the value handed to `spawn` was wrong.
+    let arg_refs: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
     if let Some(res) = spawn(&path, Some(&arg_refs)) {
         let mut buf = [0u8; 4096];
         loop {
