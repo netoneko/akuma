@@ -438,6 +438,48 @@ is already in agreement on the part that matters (`released_last_va`).
 
 ---
 
+## 8.1 The scoped "CoW merge" — decided 2026-08-13
+
+Two of §8's rows do not belong in a change called a CoW merge, and bundling them
+would make it unverifiable:
+
+- **Items 3–4** (`spawn_child_thread_and_publish`, `Process::inherit_from`) are
+  *fork lifecycle* — 45-field literals and thread publication. They touch
+  `fork_process` without touching one line of CoW break. Separate change.
+- **Item 7** (the ~330-line DA/IA merge) is *demand paging*, a different
+  subsystem that happens to share `exceptions.rs`, and it carries two
+  behavioural divergences (§6) that must be decided deliberately. Separate change.
+
+**In scope, as one change:**
+
+1. The shared middle of the three CoW-break paths — allocate → copy → remap RW →
+   `remove_user_frame` → gated `cow_ref_dec` — as one helper. Entry conditions
+   stay per-site (§8's "what must not be merged": the EL0 path needs the
+   stale-fault absorb and the per-page slot; the EL1 pre-flight must be able to
+   answer "no CoW page here" without touching a lock).
+2. Delete `cow_fault_lock` / `cow_fault_unlock` / `CowFaultLockGuard` and the two
+   dead `ExecRuntime` fields (§5). Part of the same protocol cleanup.
+3. `next_reclaim_step(free, done) -> ReclaimStep` — the pure decision behind
+   `alloc_page_zeroed_user`'s four-step recovery escalation, host-tested, effects
+   left in `src/`. Chosen over fully injecting the escalation because it captures
+   the bug class that bites (a missing re-check between steps, the wrong order, or
+   a premature `GiveUp`) without putting a fn-pointer call on the fault path
+   (`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.11, "Still open here").
+
+**Sequencing: merge first, fix second.** The helper lands strictly
+behaviour-preserving — the EL1 paths keep `read_current_pid()` and the
+outside-the-lock copy, passed in as parameters — and is verified by *nothing
+changed*. A second change then flips both to the correct values (one owner
+resolution via `address_space_owner_pid_for_fault`, one copy inside `as_lock`) and
+is verified by *exactly these two things changed*. F1 and F2 then stop being
+patches and become structurally impossible: with one helper the three paths cannot
+disagree about the owner or the lock again.
+
+The reason for two cycles rather than one: `cowstale`/`bssfork` and the BKL-stuck
+line count are the only instruments here, and if the merge, the owner change and a
+longer `as_lock` hold all land together, a regression in any of them is
+unattributable.
+
 ## 9. Findings summary
 
 | id | finding | status | verify with |

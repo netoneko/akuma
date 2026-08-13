@@ -1174,26 +1174,33 @@ module to a crate is mechanical; the reverse is not.
 
 ### Still open here
 
-`pmm::alloc_page_zeroed_user`'s **four-rung reclaim ladder** (gate →
+`pmm::alloc_page_zeroed_user`'s **four-step recovery escalation** (gate →
 `drain_retired_under_pressure` → `reclaim_clean_file_pages` → `file_page_cache::shrink`
 → give up) is untested in either place, and its own boot test says why:
 *"Actually draining RAM to the reserve is unsafe inside the boot suite."* So the
-rungs that convert an OOM into a clean SIGSEGV — instead of a whole-kernel `BRK`
+steps that convert an OOM into a clean SIGSEGV — instead of a whole-kernel `BRK`
 abort, the 4.5 MB meow+tcc crash — have never been exercised by a test, only by
 production incidents. Three of its five dependencies are already injectable
 (`free_count`, `alloc_page_zeroed` via `ExecRuntime`; two reclaim calls already in
 `akuma-exec`); only `file_page_cache::shrink` would need a hook. Two candidate
 shapes, and the choice matters:
 
-1. Move the whole ladder into `akuma-exec` and register a working fake allocator
-   in `test_support` (one whose free count the test drives). Tests every rung —
-   but converts `free_count()` from a direct in-crate call into a fn-pointer call
-   on the fault path, 1–4 times per user page, with no `lto` (§5.10).
-2. Extract only the *decision* — `next_reclaim_rung(free, tried) -> Rung` — as a
-   pure fn, leaving the effects in `src/`. Captures the bug class that actually
-   bites here (a missing re-check between rungs, or the wrong order), needs no
-   runtime hook, and adds nothing to the fault path. Same shape as
+1. Move the whole escalation into `akuma-exec` and register a working fake
+   allocator in `test_support` (one whose free count the test drives). Tests every
+   step — but converts `free_count()` from a direct in-crate call into a
+   fn-pointer call on the fault path, 1–4 times per user page, with no `lto`
+   (§5.10).
+2. Extract only the *decision* — `next_reclaim_step(free, done) -> ReclaimStep` —
+   as a pure fn, leaving the effects in `src/`. Captures the bug class that
+   actually bites here (a missing re-check between steps, the wrong order, or a
+   premature `GiveUp` while memory is merely inside its reclaim cooldown), needs
+   no runtime hook, and adds nothing to the fault path. Same shape as
    `completion_copy_len` and `trace_snippet`.
+
+Deliberately **not** called `next_reclaim_rung`: "rung" is already this document's
+word for the `akuma-primitives` extraction ladder (§5.555, rungs 1–6), and
+"retry" would be wrong too — each step is a different, more expensive action, and
+the return value also has to encode "allocate now" and "give up".
 
 Shape 2 is the better trade on current evidence and is the recommendation; it is
 still a fault-path control-flow change and wants its own SMP=4 verification, so

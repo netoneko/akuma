@@ -5,10 +5,14 @@ fork, and userspace address spaces. For debugging, see
 [`../../runbooks/debug-memory-oom.md`](../../runbooks/debug-memory-oom.md).
 
 > **Stability: C (active risk).** Highest-churn subsystem through 2026-06.
-> Three items still OPEN: per-run kernel-heap creep; reclaim-after-OOM below
-> ~5 MB; and a full process table panicking instead of failing the spawn (see
+> Four items still OPEN: per-run kernel-heap creep; reclaim-after-OOM below
+> ~5 MB; a full process table panicking instead of failing the spawn (see
 > [OPEN: a full process table still panics the
-> kernel](#open-a-full-process-table-still-panics-the-kernel)). The recurring
+> kernel](#open-a-full-process-table-still-panics-the-kernel)); and the
+> user-page escalation giving up while parked memory is still inside its
+> reclaim cooldown (see [KNOWN GAP: a premature give-up while memory is merely
+> cooling](#known-gap-a-premature-give-up-while-memory-is-merely-cooling)),
+> which is also currently invisible at runtime. The recurring
 > bug class is *region-boundary computed with a wrong constant* — verify any
 > new region math against the invariants below.
 
@@ -226,6 +230,135 @@ with IRQs masked, so there is no verdict to print.
 - **Eviction:** `try_evict_ro_page` + `reclaim_clean_file_pages` evict clean
   `AP_RO_ALL` file-backed pages under pressure (lets models > RAM run).
 
+## OOM decision map
+
+**Stability: B — every path here was read out of the source on 2026-08-13**
+(`src/pmm.rs`, `src/allocator.rs`, `crates/akuma-exec/src/process/reclaim.rs`).
+Not A: this is the highest-churn subsystem in the tree, so re-verify the line
+numbers before relying on them. The *shape* is what this section is for.
+
+Three different callers can run out of memory, and Akuma treats them differently
+on purpose: a user page must never be handed out at the cost of the kernel's
+ability to *kill the process asking for it*. Read this map before changing any
+allocation path — the asymmetry is the whole design.
+
+```
+        WHO IS ASKING                    GATE                      ON FAILURE
+  ─────────────────────────────  ──────────────────────────  ────────────────────────
+  EL0 demand paging              free <= USER_PAGE_RESERVE   None -> caller SIGSEGVs
+  (anon fill, ELF load,          (16 pages / 64 KB)          the faulting process.
+  file readahead, PROT_NONE      user_alloc_would_starve()   The kernel survives.
+  commit)                                │
+    pmm::alloc_page_zeroed_user ─────────┘
+                                                             ┌── escalation below
+  Kernel-internal                NONE — reserve-exempt.      None -> caller-specific.
+  (page tables, fault            Deliberately allowed to     A page-table alloc
+  completion, the OOM            dip into the reserve.       failure fails one
+  kill path itself)                                          syscall, not the box.
+    pmm::alloc_page / alloc_page_zeroed
+
+  Kernel heap (talc)             is_pmm_ready(), then grow   Err -> Rust alloc error
+    PmmOomHandler::handle_oom    the heap from the PMM       -> panic -> `brk #1`,
+                                                             WHOLE-KERNEL abort.
+                                                             This is the one that
+                                                             takes down the box.
+
+  fork / clone / vfork           is_memory_low():            Err("Kernel memory low")
+    (pre-flight, before any      free < 128 pages / 512 KB   -> clone(2) = -ENOMEM.
+     work is done)                                           Refuses early rather
+                                                             than half-building.
+```
+
+The reserve exists precisely so the third row cannot be caused by the first: a
+process consuming all of RAM gets SIGSEGV'd while 16 pages remain for the page
+tables, heap growth and bookkeeping the kill itself needs.
+
+### The user-page escalation, exactly as written
+
+`pmm::alloc_page_zeroed_user` (`src/pmm.rs:1324`). Note the re-check between every
+step — and note that step 3's check is a **sibling** of step 2's, not nested
+inside it, so eviction is considered even when step 2 was skipped:
+
+```
+  alloc_page_zeroed_user()
+    │
+    ├─ starving?  no ──────────────────────────────────────────────┐
+    │      │ yes                                                   │
+    │      ├─ 1. allocator::reclaim_to_pmm()          :1328        │
+    │      │     fully-free kernel-heap spans          cost: none  │
+    │      │                                                       │
+    │      ├─ still starving? ─ 2. drain_retired_under_pressure()  │
+    │      │                       :1350               cost: none  │
+    │      │                       dead processes' address spaces  │
+    │      │                       *** HONORS THE 10 ms COOLDOWN — │
+    │      │                       memory parked more recently     │
+    │      │                       than that is NOT collected ***  │
+    │      │                                                       │
+    │      └─ still starving? ─ 3. reclaim_clean_file_pages(512)   │
+    │             :1359            cost: 1 disk read per page, on  │
+    │             │                the next touch by a LIVE process│
+    │             │                                               │
+    │             └─ still starving? ─ 3b. file_page_cache::shrink(512)
+    │                    :1365         cost: 1 re-read per future mapper
+    │                    │             Keeps step 3 honest: the cache holds a
+    │                    │             reference, so without this the sweep
+    │                    │             unmaps pages and frees nothing.
+    │                    │
+    │                    └─ still starving? ─ 4. return None    :1367
+    │                                            => SIGSEGV
+    ▼                                                              │
+  alloc_page_zeroed() ─> alloc_page()  <───────────────────────────┘
+    │  and the base allocator has TWO fallbacks of its own:
+    ├─ a. quarantine_drain_all()   :1103   frames parked only to detect UAF;
+    │                                      that debt must never fail an alloc
+    └─ b. allocator::reclaim_to_pmm()  :1112   (again — it is also step 1)
+```
+
+So there are **six** distinct recovery mechanisms, not four, and
+`reclaim_to_pmm` appears twice. A change that "adds reclaim to the allocator"
+has probably added a seventh; check this list first.
+
+### Where reclaimed memory actually comes from
+
+| Source | Freed by | Cost to something alive |
+|---|---|---|
+| fully-free kernel-heap spans | `allocator::reclaim_to_pmm` | none — the heap grows one-way; this returns the watermark |
+| dead processes' address spaces | `reclaim_retired_processes` | none — but gated by the 10 ms cooldown |
+| UAF quarantine | `quarantine_drain_all` | none — pure detection debt |
+| clean RO file pages of live processes | `reclaim_clean_file_pages` | one disk read on next touch |
+| shared file-page cache entries with no mappers | `file_page_cache::shrink` | one re-read per future mapper |
+| the process itself | SIGSEGV | the process dies |
+
+### The constants that decide all of it
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `USER_PAGE_RESERVE` | 16 pages (64 KB) | floor user allocation may not cross |
+| `is_memory_low` `LOW_PAGES` | 128 pages (512 KB) | fork/clone pre-flight refusal |
+| `PROCESS_RECLAIM_COOLDOWN_US` | 10 ms | how long a RETIRED slot is ineligible |
+| `USER_RECLAIM_BATCH` | 512 pages | eviction batch, amortises the sweep |
+| `HEAP_GROW_HEADROOM_PAGES` | see `allocator.rs` | extra span so talc metadata still fits |
+
+`user_alloc_would_starve`, `user_readahead_budget`, `heap_grow_initial_pages` and
+`heap_grow_backoff` are all **pure functions** of a free-page count. The first two
+live in `akuma_exec::memmath` and are host-tested; the latter two are still in
+`src/allocator.rs` and therefore reachable only from the boot suite.
+
+### KNOWN GAP: a premature give-up while memory is merely cooling
+
+Step 2 honors the reclaim cooldown, and the escalation has **no step that waits
+for it**. So a process can be SIGSEGV'd for OOM while megabytes sit parked in
+RETIRED slots whose only disqualification is that they were retired less than
+10 ms ago. On a 2 GB box this is invisible; at the `extreme-size` 4 MB floor one
+parked address space is a large share of usable RAM, which makes this a candidate
+for tcc/meow failures at the floor.
+
+It is currently **unfalsifiable in the field**: `retired_pages_pending()` and
+`retired_process_count()` have **no non-test callers**, so nothing ever prints how
+much memory is parked. (This doc's own symptom table used to claim `[PSTATS]`
+shows `retired=N/Mp`; no such format string exists in the kernel.) Surfacing that
+counter is the prerequisite for testing the hypothesis at all.
+
 ## Reclaim under memory pressure
 
 A dead process's memory does **not** return to the PMM when it exits. Since
@@ -236,12 +369,18 @@ ASID — happens later, in `table::reclaim_retired_processes`, once a cooldown
 that could still hold a raw `*Process`. **Do not shorten or bypass that
 cooldown**; `reclaim_retired_processes_force` is tests-only.
 
-### `alloc_page_zeroed_user`'s pressure ladder
+### `alloc_page_zeroed_user`'s pressure escalation
 
-Rungs, in order. Each is tried only if the previous left free PMM at or below
+**Steps** (the word is deliberate — the escalation's decision function is
+`next_reclaim_step` / `ReclaimStep`; "rung" is this tree's word for the
+`akuma-primitives` extraction ladder and means something else). See the
+[OOM decision map](#oom-decision-map) above for the control flow and the two
+further fallbacks inside `alloc_page` itself.
+
+Each step is tried only if the previous left free PMM at or below
 `USER_PAGE_RESERVE`:
 
-| # | Rung | Cost of the memory it frees |
+| # | Step | Cost of the memory it frees |
 |---|---|---|
 | 1 | `allocator::reclaim_to_pmm()` | none — fully-free heap spans |
 | 2 | `process::reclaim::drain_retired_under_pressure()` | none — the pages belong to processes that are already dead |
@@ -249,12 +388,12 @@ Rungs, in order. Each is tried only if the previous left free PMM at or below
 | 3b | `file_page_cache::shrink()` | one disk read per page, on the next *mapper* of that page |
 | 4 | return `None` ⇒ caller SIGSEGVs the faulting process | — |
 
-Rung 2 sits above rung 3 deliberately: evicting a live process's clean file
+Step 2 sits above step 3 deliberately: evicting a live process's clean file
 pages is the more expensive and more destructive of the two.
 
-Rung 3b is not optional garnish — it is what keeps rung 3 honest. The shared
+Step 3b is not optional garnish — it is what keeps step 3 honest. The shared
 file-page cache holds a reference on every frame it caches, so `free_page` from
-rung 3's sweep decrements instead of freeing. Without 3b, reclaim would unmap
+step 3's sweep decrements instead of freeing. Without 3b, reclaim would unmap
 pages, report progress, and return no memory at all. 3b drops only entries whose
 frame has **no remaining mappers** (`cow_ref_get(pa) <= 1`), since evicting a
 still-mapped page costs a future re-read while freeing nothing now.
@@ -331,7 +470,7 @@ self-deadlocks. So:
 | `sys_exit_group` / `sys_exit` terminal park (`src/syscall/proc.rs`) | every clean userspace exit — the common case |
 | `return_to_kernel` / `return_to_kernel_from_fault` terminal park | fault-kills and kernel-spawned process exits |
 | thread 0's idle loop; the `smp-shared` per-core idle loop | the regime where `netpoll_maint` is starved |
-| `alloc_page_zeroed_user` rung 2 | demand-paging pressure |
+| `alloc_page_zeroed_user` step 2 | demand-paging pressure |
 | `netpoll_maint`, 100 ms (pre-existing) | steady state |
 
 Adding a *sixth* site means auditing its ambient lock context first. If you
