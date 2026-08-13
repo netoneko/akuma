@@ -600,7 +600,7 @@ unattributable.
 | F3 | `cow_fault_lock` provides no mutual exclusion; 3 of 4 CoW runtime fn pointers are dead | **CONFIRMED** | `grep -rn COW_FAULT_LOCK src crates` → 3 hits, all in `pmm.rs` |
 | F2 | `try_resolve_el1_cow_fault` resolves the owner with `read_current_pid()`; for `CLONE_VM` workers this leaks two frames per kernel-side CoW break and takes a lock nobody waits on | **FIXED 2026-08-13** (mechanism was CONFIRMED, consequence still NEEDS-REPRO) | PMM drift across a threaded workload taking kernel-side user writes; `[AS-*]` traces |
 | F1 | both EL1 CoW-break paths copy 4 KiB from `old_pa` outside the lock the EL0 path documents as required for `old_pa`'s validity | **STILL OPEN** — fix implemented and backed out 2026-08-13, blocked by F8 | `cowstale`, `bssfork spread=1` at SMP=4; poison decode in `[WILD-DA]` |
-| F8 | the SMP=1 exercise suite wedges intermittently (~40–50%) at the transition between exercises, where sshd forks the next one: console output stops, one core spins, **zero** time-jump lines on an idle host. Present with F1 applied *and* reverted, so it belongs to neither | **CONFIRMED** (reproduced 4×), cause unknown, **OPEN** | run `--tier 2 --smp 1` repeatedly; a wedged run's log simply stops growing mid-suite |
+| F8 | the SMP=1 exercise suite wedges intermittently: console output stops, one core spins at 100%, **zero** time-jump lines on an idle host. **Localized 2026-08-14** to an EL1 sync-fault loop inside `sgi_scheduler_handler_with_sp` — see below. Rate ~1 in 7 on the committed tree, ~3 in 4 with F1 applied, which is why F1 is held back | **CONFIRMED + LOCALIZED**, faulting instruction not yet identified, **OPEN** | `scratchpad/f8_repro.py` (gdbstub + lldb snapshot on stall); a wedged run's log simply stops growing mid-suite |
 | F1b | the EL1 paths still translate the VA and read the refcount outside `as_lock`, so `old_pa` can be stale before the hold begins — the residue F1's prescribed fix cannot reach | **CONFIRMED** mechanism, **NEEDS-REPRO** consequence, **OPEN** | same instruments as F1; the fix is §4 F1b option 1 or 2 |
 | F4 | DA single-page fallback places `dsb ish; isb` before the PTE install, disagreeing with its own batch path and with the IA arm | **CONFIRMED** | inspection; no known symptom |
 | F5 | IA arm claims `icache_done: true` into `file_page_cache` for pages it may map non-exec | **CONFIRMED** | inspection; no known symptom |
@@ -611,6 +611,80 @@ None of F1–F6 is being fixed in this document's change. F1, F2 and F4–F6 are
 recorded here because they are invisible from any single call site and only
 surface when the copies are read side by side — which is the argument for §8's
 items 3 and 4.
+
+## 10. F8 — the suite wedge, localized (2026-08-14)
+
+**Status: the hang *shape* is proven; the faulting access is inferred, not identified.
+The guard below is hardening, and is NOT verified to fix F8.**
+
+### What was measured
+
+Caught under a gdbstub (`GDB=1`, port 1234) with `scratchpad/f8_repro.py`, which drives
+the four exercises and attaches `lldb` against the symbolized ELF the moment the boot log
+stops growing while QEMU is still alive:
+
+```
+pc  = 0x401c1200  akuma`exception_vector_table + 512   (7 of 7 samples — not advancing)
+x30 = 0x402d15cc  akuma`threading::sgi_scheduler_handler_with_sp + 432
+```
+
+Vector offset **0x200 is entry 4 — EL1 synchronous, SP_ELx**. A PC pinned there across
+every sample means a *fault loop*: the sync handler re-faults before it can advance. That
+accounts for every symptom at once, and for why this looked like several different bugs:
+
+| Symptom | Because |
+|---|---|
+| no console output at all | the fault re-raises before anything can print |
+| one core at 100%, VM "alive" | it is spinning in the vector, not halted |
+| zero `[WATCHDOG] Time jump` lines | IRQs are masked in the loop, so nothing measures lost time |
+| guest clock frozen | same — no timer interrupt is ever taken |
+| looked like host starvation | an unresponsive VM with a live QEMU is indistinguishable from a descheduled one from outside |
+
+### The unrecoverable path that was closed
+
+`sgi_scheduler_handler_with_sp` validated the incoming stack pointer as
+`new_sp == 0 || new_sp < 0x4000_0000` — a floor test that accepts **any** garbage at or
+above RAM base: a stale SP, a recycled slot's SP, one past `ram_end`, or a misaligned one.
+Code further down then **dereferences it**: the `[SGI-S POISON]` tripwire reads
+`new_sp + 240` and `new_sp + 248`, and the restore does `ldp` off it. On a bad SP either
+one raises the EL1 sync fault above — and a diagnostic that hangs the machine is worse
+than the corruption it was added to catch.
+
+The check now requires, before any dereference: inside `[ram_base, ram_end)` (read from
+the live window, not a hardcoded floor, since it moves with `MEMORY=`), at least a whole
+256-byte restore frame below `ram_end`, and 16-byte alignment. Failure prints
+`old_tid`/`new_tid`/the RAM window and halts the core as before — so the next occurrence
+is a named, attributable line instead of silence.
+
+An `[SGI-S FATAL] new_sp=0x0` sighting earlier the same day is the same defect with the
+one value the old test happened to catch.
+
+### What is NOT established
+
+- **Which instruction faulted.** `x30` points into the handler and the PC into the vector,
+  but `ELR_EL1`/`ESR_EL1`/`FAR_EL1` were not captured. The repro harness now dumps
+  `register read --all` for exactly this; the next catch settles it.
+- **The invalid-SP inference is REFUTED.** "The tripwire read faulted on an unvalidated SP"
+  was the leading theory. With the guard in place the wedge **reproduced anyway** — full
+  gate, 2026-08-14, SMP=1: `bssfork`/`forkprobe`/`elftest` all TIMEOUT after `cowstale`,
+  zero time jumps, same `[AS-FREE] … path=owner` last line — and **`[SGI-S FATAL]` never
+  printed**, so the SP was valid every time. The fault inside the handler is some other
+  access. (The four clean amplifier runs that preceded this were simply the flake not
+  firing; 0-of-4 was never evidence, as noted at the time.)
+- **The guard is therefore hardening, not the fix.** It is worth keeping — it closes a real
+  unrecoverable path and adds attribution — but it does not close F8, and F8 must not be
+  reported as fixed.
+- **Why an SP goes bad in the first place.** That is the actual defect; the guard only makes
+  it announce itself. Note several boot tests deliberately fabricate bare thread slots into
+  `READY`/`WAITING` (`src/process_tests.rs:10489`), which is a known source of contexts with
+  no valid stack.
+
+### Next step
+
+Run the harness until it catches again and read `ELR_EL1`/`ESR_EL1`/`FAR_EL1`. If ELR lands
+on the tripwire read or the restore `ldp`, the inference is confirmed and the guard is the
+fix; if it lands elsewhere, the fault is a different access inside the handler and the
+guard is merely hardening that happened to be worth having.
 
 ## Background
 

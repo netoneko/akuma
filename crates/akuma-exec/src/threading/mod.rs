@@ -2952,13 +2952,46 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
 
             // Load new SP from new context
             let new_sp = (*new_ctx).sp;
-            
-            // Verify new SP is valid
-            if new_sp == 0 || new_sp < 0x4000_0000 {
-                safe_print!(64, "[SGI-S FATAL] new_sp={:#x} invalid!\n", new_sp);
+
+            // Verify new SP is valid — FULLY, because code below **dereferences** it
+            // (the POISON tripwire reads `new_sp + 240` / `+ 248`) and `ldp`/`stp` on a
+            // bad SP inside this handler is unrecoverable: the EL1 sync fault it raises
+            // re-faults in its own prologue, so the core spins at
+            // `exception_vector_table + 0x200` forever with IRQs masked — no console
+            // output, no watchdog, no clock. That silent hang is what this check exists
+            // to convert into the loud line below.
+            //
+            // The old test was `new_sp == 0 || new_sp < 0x4000_0000`, which accepted any
+            // garbage at or above RAM base: a stale SP, a recycled slot's SP, or one past
+            // RAM end all sailed through and hung the machine at the tripwire read
+            // instead of reporting anything (`COW_PILE_AUDIT.md` §9 F8; a `new_sp=0x0`
+            // sighting is the same defect with the one value the old test caught).
+            //
+            // Three things must hold before any dereference:
+            //   * inside the live RAM window — `ram_base`/`ram_end`, not a hardcoded
+            //     floor, since the window moves with `MEMORY=`;
+            //   * far enough below `ram_end` that the tripwire's `+248` read and the
+            //     restore's own frame stay in RAM;
+            //   * 16-byte aligned, or the first `stp` raises an SP-alignment fault with
+            //     exactly the same unrecoverable shape as an unmapped SP.
+            let ram_base = crate::mmu::ram_base() as u64;
+            let ram_end = crate::mmu::ram_end() as u64;
+            // The restored IRQ frame is 256 bytes (see `setup_fake_irq_frame`); require
+            // it whole rather than just the two tripwire words.
+            const RESTORE_FRAME_BYTES: u64 = 256;
+            let sp_ok = new_sp >= ram_base
+                && ram_end.saturating_sub(new_sp) >= RESTORE_FRAME_BYTES
+                && new_sp % 16 == 0;
+            if !sp_ok {
+                // Name the threads: the culprit is whoever left this SP in `new_idx`'s
+                // context, and without both ids the next occurrence is unattributable.
+                safe_print!(192,
+                    "[SGI-S FATAL] new_sp={:#x} invalid! old_tid={} new_tid={} \
+                     ram=[{:#x},{:#x}) aligned={}\n",
+                    new_sp, old_idx, new_idx, ram_base, ram_end, new_sp % 16 == 0);
                 loop { core::arch::asm!("wfi"); }
             }
-            
+
             // Update exception stack for new thread
             set_current_exception_stack(new_tpidr);
             
