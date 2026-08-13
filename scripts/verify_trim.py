@@ -182,8 +182,10 @@ def boot_once(smp, instance, memory, logdir, results, run_exercises):
         results[f"smp{smp}.fail_set"] = ",".join(sorted(fails - FLAKY_BOOT_TESTS)) or "(empty)"
         results[f"smp{smp}.flaky_seen"] = ",".join(sorted(fails & FLAKY_BOOT_TESTS)) or "(none)"
 
-        # A real BKL storm is thousands of lines, not tens — record the count so a
-        # diff shows movement rather than asking for a judgement call.
+        # INFORMATIONAL, not an equality metric: this is load-driven and drifts
+        # run to run on an unchanged tree (measured 93, 96, 109 at SMP=4 on the
+        # same commit). A real storm is thousands of lines, not tens — compare
+        # orders of magnitude, never exact counts.
         results[f"smp{smp}.bkl_stuck"] = len(re.findall(r"\[BKL\] stuck", text))
         # Spurious at boot on SMP>1 (DEVBOX_ISSUES.md Issue 11), plus one
         # deliberate one from stack_canary_overrun_is_reported.
@@ -208,25 +210,55 @@ def boot_once(smp, instance, memory, logdir, results, run_exercises):
         time.sleep(1)
 
 
+def ssh(port, cmd, timeout=120):
+    r = subprocess.run(
+        ["ssh", "-q", "-o", "StrictHostKeyChecking=no",
+         "-o", "UserKnownHostsFile=/dev/null", "-p", str(port),
+         "root@localhost", cmd],
+        capture_output=True, timeout=timeout)
+    # stdout ALONE: an ssh banner folded into a stdout parse was one of the three
+    # false "findings" the runbook was written after.
+    return r.returncode, r.stdout.decode("utf-8", errors="replace")
+
+
 def exercise_suite(port, smp, results):
-    """CoW / fork / ELF binaries over ssh. Long runs need generous timeouts:
-    sshd's keepalive kills a long-lived exec channel and the client reports
-    `Timeout, server localhost not responding`, which looks like a hung VM."""
+    """CoW / fork / ELF binaries over ssh.
+
+    Each one runs **detached under `nohup`** with output to a file, then is polled.
+    Running them as a plain `ssh <cmd>` does not work for the long ones: sshd's
+    keepalive kills a long-lived exec channel, the client returns rc=255, and the
+    result looks exactly like a failing binary. `cowstale` (which does ~700M
+    reader checks) hit this and was reported as UNEXPECTED on a tree where it
+    passes — the measurement, not the code.
+
+    Polling reads the output file and looks for a sentinel the shell appends after
+    the binary exits. Do NOT poll with `pgrep <name>`: the ssh command line
+    contains the name, so pgrep matches itself and the job looks eternal."""
     for cmd, healthy in EXERCISES:
-        key = f"smp{smp}.ex.{cmd.split()[0]}"
+        name = cmd.split()[0]
+        key = f"smp{smp}.ex.{name}"
+        out_path = f"/tmp/verify_ex_{name}.log"
         try:
-            r = subprocess.run(
-                ["ssh", "-q", "-o", "StrictHostKeyChecking=no",
-                 "-o", "UserKnownHostsFile=/dev/null", "-p", str(port),
-                 "root@localhost", cmd],
-                capture_output=True, timeout=420)
-            out = r.stdout.decode("utf-8", errors="replace")  # stdout ALONE
-            results[key] = "ok" if healthy in out else f"UNEXPECTED (rc={r.returncode})"
+            # `{ cmd; echo SENTINEL; }` — the sentinel lands after the binary exits
+            # whatever its exit status, so polling terminates on failure too.
+            ssh(port, f"nohup sh -c '{{ {cmd}; echo __EX_DONE__; }} > {out_path} 2>&1' "
+                      f"> /dev/null 2>&1 &")
+            deadline = time.time() + 420
+            out = ""
+            while time.time() < deadline:
+                time.sleep(5)
+                _, out = ssh(port, f"cat {out_path} 2>/dev/null")
+                if "__EX_DONE__" in out:
+                    break
+            if "__EX_DONE__" not in out:
+                results[key] = "TIMEOUT (still running after 420s)"
+                continue
+            results[key] = "ok" if healthy in out else "UNEXPECTED"
             if healthy not in out:
-                tail = [l for l in out.splitlines() if l.strip()][-1:] or ["(no output)"]
-                results[key + ".tail"] = tail[0][:110]
+                lines = [l for l in out.splitlines() if l.strip() and "__EX_DONE__" not in l]
+                results[key + ".tail"] = (lines[-1] if lines else "(no output)")[:110]
         except subprocess.TimeoutExpired:
-            results[key] = "TIMEOUT"
+            results[key] = "TIMEOUT (ssh)"
 
 
 def main():

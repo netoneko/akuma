@@ -9320,7 +9320,13 @@ fn test_retired_reclaim_pressure_ab() {
         {
             akuma_exec::threading::blocking_relax();
         }
-
+        // No further wait is needed before sampling, and one was tried and removed:
+        // `reclaim_retired_processes` drops the `Process` (freeing its frames) BEFORE
+        // it lowers `retired_process_count`, so by the time the loop above exits the
+        // free count has already settled. A 500 ms "wait for free_count to stabilise"
+        // loop was measured to change neither outcome (still 745p at SMP=1, 1029p at
+        // SMP=4) and only cost boot time. See the bar below for what the two values
+        // actually mean.
         result[idx] = (
             pmm::free_count().saturating_sub(free_parked),
             retired_process_count(),
@@ -9346,13 +9352,25 @@ fn test_retired_reclaim_pressure_ab() {
     // compared against PARK rather than against each other, so a change that breaks
     // BOTH sides fails instead of looking like a null result.
     //
-    // The ON side recovers slightly less than PARK, by design of the measurement rather
-    // than of the mechanism: the workload IS a process, and at the moment we sample,
-    // `/bin/hello` is an ACTIVE zombie awaiting `wait4` — its own footprint has not been
-    // reaped yet and is netted out of the free count. Measured ~55 pages of it, so the
-    // bar is three quarters, and the retired-slot counts printed alongside are the
-    // noise-free confirmation (1 left vs 0 left).
-    let ok = off_recovered < PARK / 4 && on_recovered >= PARK * 3 / 4;
+    // The ON side recovers less than PARK whenever the workload's own footprint is
+    // still out: `/bin/hello` is an ACTIVE zombie awaiting a `wait4` this test never
+    // performs, and an ACTIVE zombie's pages are not reclaimable at all, so they are
+    // netted out of the free count. Whether that has happened by sampling time depends
+    // on scheduling, not on how long we wait — which is why waiting does not help.
+    //
+    // The bar is HALF, and the previous comment here had the arithmetic wrong: it
+    // claimed that footprint was "~55 pages", so it set the bar at three quarters
+    // (768p). Measured over 12 boots (SMP=1 and SMP=4, this branch, an unmodified
+    // worktree at the same commit, and `main`) the ON side is strictly **bimodal** —
+    // 1029p or 745p, never anything between — so the footprint is **~284 pages**, five
+    // times the estimate. 768p therefore sat 23 pages inside the noise, and this test
+    // failed on roughly half of all boots, on unmodified trees. The two modes are both
+    // legitimate settled values, not a sampling race.
+    //
+    // Half separates the mechanism by a wide margin regardless: the OFF side measures
+    // 0p in every run on record, so a PASS still needs a >=512p gap between the two
+    // sides. The retired-slot counts printed alongside are the corroborating signal.
+    let ok = off_recovered < PARK / 4 && on_recovered >= PARK / 2;
 
     if ok {
         crate::safe_print!(256,
@@ -9362,7 +9380,7 @@ fn test_retired_reclaim_pressure_ab() {
         crate::safe_print!(256,
             "  [FAIL] retired_reclaim_ab: parked {}p, OFF recovered {}p (retired {}), ON recovered {}p (retired {}) — expected OFF to strand (<{}p) and ON to recover (>={}p)\n",
             PARK, off_recovered, off_retired, on_recovered, on_retired,
-            PARK / 4, PARK * 3 / 4);
+            PARK / 4, PARK / 2);
     }
 }
 

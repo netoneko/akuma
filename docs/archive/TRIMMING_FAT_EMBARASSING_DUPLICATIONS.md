@@ -1040,11 +1040,46 @@ is lower than assumed. Tests per crate, against size:
 and it is the crate holding the tree's one hand-rolled virtqueue. Closed to 3;
 see §6.2.
 
-The remaining large untested files are genuinely hardware- or scheduler-bound
-(`threading/mod.rs` 5,128, `process/mod.rs` 3,361, `mmu/mod.rs` 2,176,
-`children.rs` 2,054, `smoltcp_net.rs` 1,115). The lesson from §6.1 still applies
+The remaining large files were described here as "genuinely hardware- or
+scheduler-bound" (`threading/mod.rs` 5,128, `process/mod.rs` 3,361, `mmu/mod.rs`
+2,176, `children.rs` 2,054, `smoltcp_net.rs` 1,115). The lesson from §6.1 applies
 to them piecewise: the untestable part is usually a thin shell around arithmetic
 that is not, and splitting the arithmetic out is cheap.
+
+> **Correction (2026-08-13): `threading/mod.rs` is not untested, and listing it
+> here was discouraging work that is already possible.** It carries **19 host
+> tests** in six modules — `signal_mask_tests` (`:4533`), `pending_kill_tests`
+> (`:4564`), `itimer_tests` (`:4612`), `park_wake_race_tests` (`:4689`),
+> `state_transition_guard_tests` (`:4813`), `thread_contexts_invariant_tests`
+> (`:5020`) — plus **22** in `threading/types.rs`. Between them they pin the
+> park/wake race, a stale waker reviving a recycled slot, `WakeHandle` tid
+> generations, terminated-thread resurrection, slot double-claim under contention,
+> and lock-free context publication ordering: i.e. the scheduler defect classes
+> that actually cost time, not incidental helpers.
+>
+> The reason it *is* testable, and the PMM is not, is worth stating because it
+> generalises: the scheduler's state is plain atomic arrays, so a host test can
+> drive it directly, whereas the PMM's state only exists behind a live allocator
+> (see [`PMM_EXTRACT.md`](PMM_EXTRACT.md) §6). The genuinely boot-only surface in
+> `threading/mod.rs` is small — **13 `target_os = "none"` gates and 12 `asm!`
+> sites in 5,128 lines**, about 0.5%.
+>
+> On extracting the scheduler into its own crate: feasible, and the coupling is
+> thin — `threading` needs only **7 symbols** from `process`
+> (`pid_for_thread`, `find_pid_by_thread`, `lookup_process_shared`,
+> `is_current_interrupted`, `raise_sigchld_for_parent`, `reclaim::clear_draining`,
+> `dump_orphan_processes`, all lookups or upcalls) while `process` makes **73**
+> references the other way, so the dependency already points the right way and
+> extraction means inverting 7 hook-shaped edges. `bkl.rs` (514) and `sync.rs`
+> (1,683) both reference `threading` and would move with it: ~7,900 lines total.
+>
+> **But it fails this document's own criterion, twice.** Nothing outside
+> `akuma-exec` consumes the scheduler (the only hits are five doc comments in
+> `akuma-primitives/src/preempt.rs`), so there is no `cargo tree` edge to cut; and
+> testability is not blocked, as the 41 existing tests show. A scheduler crate
+> buys **decomposition** — ~7.9k lines out of a 23.8k crate, and compile time —
+> not correctness or coverage. Worth doing, second in line behind the PMM, and for
+> a different reason than the PMM.
 
 ## 5.11 The memory arithmetic wants a crate — and one test already proves it (raised + DONE 2026-08-13)
 
