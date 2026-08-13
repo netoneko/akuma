@@ -233,6 +233,65 @@ pub fn config() -> ExecConfig {
         .expect("akuma-exec: ExecConfig not registered — call akuma_exec::init() first")
 }
 
+/// Register **only** the config half, for host unit tests.
+///
+/// Host tests cannot call [`crate::init`]: that also wants an [`ExecRuntime`],
+/// which is 27 kernel function pointers with no meaningful stub. But plenty of
+/// this crate's pure logic reads `config()` and nothing else, and it should not
+/// have to grow a production-side "is anything registered?" branch just to be
+/// reachable from a test — inject the dependency instead of teaching the code
+/// to live without it.
+///
+/// `OnceCopy::set` is idempotent (a second `set` is a silent no-op), so every
+/// test can call this unconditionally even though `cargo test` runs them in
+/// parallel threads of one process. First writer wins; they all write
+/// [`ExecConfig::for_test`], so there is nothing to race over.
+#[cfg(test)]
+pub(crate) fn register_config_for_test() {
+    CONFIG.set(ExecConfig::for_test());
+}
+
+#[cfg(test)]
+impl ExecConfig {
+    /// Plausible host-test config. Deliberately a full struct literal with no
+    /// `..Default::default()`: adding a field to `ExecConfig` should break this
+    /// and make someone choose a test value, rather than silently defaulting to
+    /// zero for something a test then depends on.
+    ///
+    /// `syscall_debug_info_enabled` is **on** so the tracing paths are actually
+    /// executed rather than skipped by their own gate. On the host
+    /// `safe_print!` writes to an unregistered console hook, which discards.
+    pub(crate) fn for_test() -> Self {
+        Self {
+            max_threads: 256,
+            reserved_threads: 8,
+            kernel_stack_size: 64 * 1024,
+            boot_stack_base: 0,
+            boot_stack_top: 0,
+            default_thread_stack_size: 64 * 1024,
+            system_thread_stack_size: 96 * 1024,
+            user_thread_stack_size: 64 * 1024,
+            user_stack_size: 1024 * 1024,
+            enable_stack_canaries: false,
+            stack_canary: 0xDEAD_BEEF_CAFE_BABE,
+            canary_words: 2,
+            network_thread_ratio: 4,
+            prioritize_never_scheduled: false,
+            deferred_thread_cleanup: false,
+            thread_cleanup_cooldown_us: 0,
+            process_reclaim_cooldown_us: 0,
+            syscall_debug_info_enabled: true,
+            fork_brk_serial_progress: false,
+            enable_sgi_debug_prints: false,
+            proc_stdin_max_size: 64 * 1024,
+            proc_stdout_max_size: 64 * 1024,
+            cow_fork_enabled: true,
+            vfork_fastpath_enabled: true,
+            pthread_kill_eintr_enabled: true,
+        }
+    }
+}
+
 /// Local-IRQ masking, re-exported from `akuma_primitives::irq`.
 ///
 /// This crate carried its own `IrqGuard` — one of two under that name, the other

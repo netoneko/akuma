@@ -859,6 +859,92 @@ Each `cow_ref_dec` sits immediately past its function's flagged block.
    fault/CoW paths even if 150 is right for the tree at large — small clones in
    dangerous code outrank large clones in safe code.
 
+## 5.7 Open audit: errno spellings in the syscall layer (raised 2026-08-13)
+
+**Not yet done — this is a scoped audit to run while the syscall layer is open**
+(alongside Phase 5's user-copy sweep, which is already in `src/syscall/*`).
+Return values should use named constants; today three spellings coexist and one
+file uses two of them.
+
+**Three tables, one of them a third of a table:**
+
+| where | form | count |
+|---|---|---|
+| `src/syscall/mod.rs:405` | `const E*: u64`, **pre-negated** (`(-22i64) as u64`), private to the bin crate | 27 |
+| `crates/akuma-net/src/socket.rs:966` `pub mod libc_errno` | `pub const E*: i32`, **positive**, re-exported and used across the bin crate | 25 |
+| `src/syscall/msgqueue.rs:17` | two more pre-negated consts, local to the module | 2 |
+
+17 names are defined in both of the first two, in two different
+representations, bridged by `neg_errno()`. `E2BIG` in `msgqueue.rs:18` is
+byte-identical to `mod.rs:410`, one module away.
+
+**Plus 109 raw negative literals** that bypass all three:
+
+| file | sites |
+|---|---:|
+| `src/process_tests.rs` | 62 |
+| `src/syscall/term.rs` | 11 |
+| `src/fs_tests.rs` | 11 |
+| `src/tests.rs` | 8 |
+| `src/sync_tests.rs` | 8 |
+| `src/pthread_tests.rs` | 5 |
+| `src/syscall/msgqueue.rs`, `proc.rs`, `fs.rs` | 4 |
+
+`term.rs` is the sharp example: `(-(25i64)) as u64 // ENOTTY` eleven times, and
+`libc_errno::ENOMEM` at `:291` — both spellings, same file. `ENOTTY` is in
+*neither* table, which is why the literal kept getting re-typed.
+
+**Why this is a duplication finding and not just style.** The comment carries
+the meaning and the number carries the behaviour, so they can drift silently and
+a wrong number is indistinguishable from a right one at the call site. It is the
+same failure mode as §6's dead `log::debug!` traces: the code *looks* annotated.
+And CPD cannot see any of it — every one of these is a token-level literal.
+
+**Suggested shape** (settle before starting, same as `ClientMem`'s home in §8
+item 7): one positive-valued table in a crate both sides can reach, `neg_errno`
+as the only place negation happens, and the pre-negated `u64` consts derived
+from it rather than hand-written. Then convert the 15 production sites; the 94
+in test files are a separate, mechanical pass.
+
+## 5.8 Open: the runtime-registration machinery is written three times
+
+**Not yet done.** Found 2026-08-13 while asking why `channel.rs` could not read
+its config from a host test (§6.1). The answer to "extract `ExecConfig` into
+`akuma-primitives`" is: extract the **registry**, not the payload.
+
+Three crates implement the same "kernel registers callbacks once at boot, then
+everything reads them" pattern, and they do not agree on how:
+
+| crate | machinery | read cost |
+|---|---|---|
+| `akuma-exec/src/runtime.rs:189` | `OnceCopy<ExecRuntime>` + `OnceCopy<ExecConfig>`; `register` / `runtime()` / `config()` / `is_registered()` | lock-free |
+| `akuma-net/src/runtime.rs:52` | `Spinlock<Option<NetRuntime>>`; `register` / `runtime()` / `try_runtime()` | **spinlock on every access** |
+| `akuma-ext2/src/ext2.rs:357` | `OnceCopy<ThreadHooks>` | lock-free |
+
+Same four operations each time: register-once, get-or-panic-with-a-crate-name,
+get-as-`Option`, and a boolean probe. CPD sees none of it — different type
+names, different container.
+
+**The divergence has a measurable cost, and akuma-net already knows.** Its own
+`NetRuntime` doc comment explains that `virt_to_phys`/`phys_to_virt` were pulled
+*out* of the struct because the indirection "cost a spinlocked struct read on the
+per-packet DMA path" — while the struct is still reached through exactly that
+spinlocked read. `akuma-ext2` calls `OnceCopy` "the crate-wide answer to exactly
+this shape". Two crates got the answer; the one on the hottest path did not.
+
+**Suggested shape:** a `Registered<T: Copy>` in `akuma-primitives` wrapping
+`OnceCopy` with the name baked in for the panic message —
+`register`/`get`/`expect`/`is_registered`. Three definitions collapse, akuma-net
+drops a lock from a per-packet path, and the test-injection question §6.1 had to
+solve per-crate becomes a property of the primitive (registration is idempotent,
+so tests inject freely) instead of a `#[cfg(test)]` hook in each crate.
+
+Note this is the *opposite* direction from §4's "nothing in `akuma-vfs` belongs
+in `akuma-primitives`" finding, and for the stated reason: extraction pays when
+the duplicator cannot reach the canonical version. `akuma-net` and `akuma-ext2`
+cannot reach `akuma-exec`'s registry — that edge is precisely what the leaf crate
+exists to avoid — so here the criterion is met.
+
 ## 6. What CPD cannot see
 
 Two worked examples, both real, both missed:
@@ -897,6 +983,107 @@ outcome — the fix lands on one copy.
 > The lesson for the rest of this document: "the duplicated copy is probably not
 > reachable" is a claim about *today's* callers, and it can be true for a reason
 > that is itself a bug. The asymmetry was worth fixing on its own terms.
+
+**Merged 2026-08-13, and the survey above named the wrong pair.** Three
+corrections, each a different way to be wrong about a clone:
+
+1. **Phase 0 moved the target.** The survey says `write` ↔ `write_stdin`. That
+   was true when it was written; Phase 0 item 5 then converted `write_stdin`
+   from drop-oldest to short-write, which made it a clone of **`write_bounded`**
+   and left `write`'s drop-oldest body the only copy of itself. Fixing half of a
+   clone pair does not remove the clone, it *repoints* it — and a survey entry
+   is stale the moment a phase edits either side.
+2. **The clone family was twice the size.** Beyond the two named pairs:
+   `has_stdout_data` ↔ `has_stdin_data`, `try_read` ↔ `read_all` (both
+   drain-all, differing only in `Option` vs `Vec`), and at the bottom of the
+   file **seven** registry accessors that are three bodies over two statics —
+   including `register_system_thread_channel`, byte-identical to
+   `register_channel` one function away. Now 13 methods over five FIFO helpers
+   and three generic registry accessors.
+3. **"Restore the missing traces" was the wrong instruction.** The two traces
+   that existed were `log::debug!`, and **this tree never registers a `log`
+   logger** — all 68 `log::*` sites in `src/` and `crates/` are no-ops. So the
+   asymmetry was not "stdout is traced and stdin is not"; it was "nothing is
+   traced and one copy looks like it is." Duplicating a dead trace onto the
+   stdin side would have doubled the false promise. They are now one
+   `trace_transfer` on `safe_print!`, live for both directions.
+
+   The dead trace was also hiding a latent hazard: `read`'s copy ran **inside**
+   the `with_irqs_disabled` + `buffer.lock()` region. Emitting a real console
+   write from there is exactly the permanent-freeze shape `wake_pollers`
+   documents. The merge moved every trace outside the lock, because the shared
+   helper returns the count and the caller traces after.
+
+**One allocation removed, not a clone but found by merging.** `write` copied
+`data` into a fresh `Vec` before its critical section "to prevent page faults
+while holding a spinlock" — but all four callers pass kernel memory, and
+`write_bounded` takes *the same slice* at `syscall/fs.rs:894`/`:907` with no
+copy at all. One of the two had to be wrong. The invariant is now stated at the
+boundary (`fifo_push_drop_oldest`'s doc comment) instead of paid for with a heap
+allocation on every terminal stdout write.
+
+**The remaining divergence is deliberate and now pinned by a test.**
+`read_stdin` registers no poller and wakes none, where `read` does both. That is
+correct — `pollers` is one set shared by both directions, and stdin has no
+parked writer to release — so it is documented at the method and guarded by
+`stdin_drain_neither_registers_nor_wakes_pollers`, rather than "tidied" into
+symmetry by the next reader.
+
+### 6.1 The scheduler was never the reason this could not be host-tested
+
+The prior plan of record held that `channel.rs` could not move or be host-tested
+because it needs `crate::threading::{WakeHandle, wake_handle_for_thread,
+wake_by_handle, current_thread_id}` — "the wake, which is the *operation*, not a
+diagnostic that can degrade." That conflates the scheduler with three functions
+that merely live near it:
+
+| dependency | what it actually is on the host |
+|---|---|
+| `with_irqs_disabled` | already a no-op outside `target_os = "none"` (`akuma_primitives::irq`) |
+| `current_thread_id()` | `akuma_primitives::preempt::current_tid()` — already in the leaf crate |
+| `wake_handle_for_thread` / `wake_by_handle` | atomic-array bookkeeping over `SLOT_GEN` / `THREAD_STATES`; a CAS on a state word, no context switch |
+
+`akuma-exec` already ran 202 host tests. The only thing actually blocking
+`channel.rs` was `config()` panicking when unregistered.
+
+**And the first fix for that was the wrong one.** It guarded `trace_transfer`
+with the existing `runtime::is_registered()` probe, justified as "a diagnostic
+must degrade when its config is absent, not panic." That reads well and does not
+survive contact: `trace_transfer` is only reachable from channel I/O, which only
+happens after processes exist, which is after `init()` — so the panic it guarded
+against was unreachable in the kernel. It was a production branch added to solve
+a *test-setup* problem, dressed as a design principle.
+
+The fix is to **inject the dependency**, not to teach the code to run without
+it: `runtime::register_config_for_test()` sets the `CONFIG` half only, with a
+full-literal `ExecConfig::for_test()` next to the struct so adding a field
+breaks it and someone has to choose a value. `OnceCopy::set` is already
+idempotent, so parallel tests can all call it unconditionally with nothing to
+race over. `ExecRuntime` — 27 kernel function pointers — is never needed,
+because this logic reads config and nothing else.
+
+That is strictly better than the guard, for a reason beyond tidiness: the test
+config sets `syscall_debug_info_enabled = true`, so the tests now **execute**
+the tracing path. The `is_registered()` version made every host test skip it, so
+the branch it existed to enable was the one branch it guaranteed would never
+run. The formatting is also now a pure `trace_snippet(&[u8], &mut [u8; 32])`,
+unit-tested over control bytes, DEL, high bytes, oversized input and empty
+input — including that its output is always valid UTF-8, which `trace_transfer`
+depends on and nothing previously checked.
+
+**The real line is narrower than "needs a scheduler": everything up to the point
+a thread must actually stop and resume is host-testable.** Registering a waiter,
+signalling one, refusing a stale generation — all of it. Only `schedule_blocking`
+needs the boot suite. So the seven new host tests cover the FIFO shape, the
+lock separation, the cap arithmetic and the poller policy in ~20 ms, and
+`test_process_channel_write_bounded_backpressure` in `src/process_tests.rs`
+stays as the in-VM half that proves a woken writer actually runs.
+
+Where the old argument does hold: a *diagnostic* hook that degrades to nothing
+is free, but a **wake** hook that silently no-ops is a hang, not a lost log
+line. Hoisting the wake into a leaf crate needs a mandatory-registration
+contract, not the console hook's optional one. That is a design cost — not an
+impossibility, which is what it had been recorded as.
 
 **Implication for tooling.** Do not treat 5,370 as the number. Treat it as the
 lower bound that a tool with no semantic understanding can prove. Type-2
@@ -958,7 +1145,7 @@ ELF-loading path into one.
 | # | Item | Lines | Effort | Risk |
 |---|---|---:|---|---|
 | 1 | virtio scaffolding: shared `Hal`, `virtio::probe`, one `VIRTIO_MMIO_ADDRS` | ~90 | small | low |
-| 2 | `channel.rs` stdout/stdin FIFO → one helper; ~~decide whether `write_stdin` needs the `write_bounded` treatment~~ **(decided + shipped 2026-08-13, §8.5 Phase 0 item 5)** — the FIFO-merge half is still open | ~40 | small | low, but see §6 |
+| 2 | ~~`channel.rs` stdout/stdin FIFO → one helper~~ **DONE 2026-08-13** — five shared bodies, 13 methods collapsed onto them, plus 7 host tests the file never had; the survey named the wrong pair (see §6) | 0 left | — | — |
 | 3 | ~~`akuma-isolation`/`akuma-vfs` `mount.rs` → shared half into `akuma-vfs`~~ **DONE 2026-08-13** — one `MountSet<const MAX>`, both names as type aliases, −145 code lines across 4 files; the bin crate's third path normaliser went with it (§4) | 0 left | — | — |
 | 4 | ~~The `X`/`X_from_path` **quartet**~~ **DONE 2026-08-13** — `elf/mod.rs` ×3 in Phase 2a (−151 code lines, 12 clone blocks → 0), `process/mod.rs` + `process/image.rs` in Phase 2b (−105 code lines, the pairs' 60- and 47-line clone blocks → absent) | 0 left | — | — |
 | 5 | `exceptions.rs` duplicated `Drop` impls (`:3703` / `:4315`) | ~142 | medium | **high** — exception path |
@@ -966,6 +1153,8 @@ ELF-loading path into one.
 | 7 | `rump_proxy.rs` / `akuma-rump` `sysproxy.rs` | ~23 | small | low |
 | 8 | `mmu/mod.rs` `map_user_page` / `_no_flush` and the three walk clones | ~80 | medium | **high** — see `UNSAFE_AUDIT.md` §5.1 |
 | 9 | Test-file clones (`tests.rs`, `process_tests.rs`) | ~669 | medium | low |
+| 12 | **Runtime-registration machinery (§5.8)** — the same register-once/get-or-panic/probe written in 3 crates; `akuma-net` still pays a spinlock per read where the other two are lock-free. One `Registered<T>` in `akuma-primitives` | 3 defs | small | low |
+| 11 | **Errno spellings (§5.7)** — three tables (17 names defined twice, in two representations) + 109 raw negative literals. Run with the Phase 5 syscall sweep | ~130 sites | medium | low |
 | 10 | Trait-impl clusters (§5.5): `ClientMem`/`NoMem` across crates, duplicate `IrqGuard`, BKL guard family → one generic guard, `impl_display!` macro, duplicate `MultiPollFuture`. **In progress — `akuma-primitives` rungs 1–2 done (§5.555); the `~180` is the wrong metric, see there** | ~180 | small–medium | low |
 
 Items 1–3 are ~190 lines for an afternoon, and item 1 is the same work as
@@ -1425,6 +1614,11 @@ destination hole), then 167 mechanical conversions. All in `src/syscall/*`, so
 it overlaps nothing above — but it is a large diff, so do not hold it open
 alongside Phase 2's.
 
+**Run the §5.7 errno audit in the same pass.** It is the same files, and both
+are "the call site says one thing and the literal does another" problems. Settle
+the single errno table first, then let the two conversions ride together rather
+than touching every syscall arm twice.
+
 ### Phase 6 — remaining duplication — IN PROGRESS
 
 **DONE 2026-08-13:** the `mount.rs` shared half into `akuma-vfs` (§8 item 3) as
@@ -1432,11 +1626,16 @@ one `MountSet<const MAX: usize>`, and with it the bin crate's third path
 normaliser — which turned out to be a real inconsistency, not a spelling
 difference: `.`/`..` were resolved only when a process was current (§4).
 
+**DONE 2026-08-13:** the `channel.rs` FIFO merge (§8 item 2) — five shared
+bodies (`fifo_push_bounded`, `fifo_push_drop_oldest`, `fifo_drain_into`,
+`fifo_drain_all`, `fifo_len`) plus one `trace_transfer`, and three generic
+registry accessors under them. See §6 for the three things the survey had wrong
+and §6.1 for the host-testability finding that came out of it.
+
 **Still open, in the order they are worth doing:**
 
 | Item | Notes |
 |---|---|
-| `channel.rs` FIFO merge + restore the missing traces (§8 item 2) | the `write_stdin` backpressure half already shipped in Phase 0 item 5; this is the remaining stdout/stdin body merge |
 | `box_mod` `access.rs` / `hierarchy.rs` (§8 item 6, ~60 lines) | low risk |
 | `rump_proxy.rs` / `akuma-rump` `sysproxy.rs` (§8 item 7, ~23 lines) | overlaps Phase 4's `ClientMem`/`NoMem` question — settle `ClientMem`'s home once, for both |
 | `src/console.rs` `print_dec` / `print_u64` | a genuine 21-line / 82-token **Type-1** clone differing only in `usize` vs `u64`; CPD has always reported it. Found during the `akuma-primitives` work, unrelated to it |
