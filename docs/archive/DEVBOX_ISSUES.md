@@ -601,6 +601,152 @@ condition it's hitting. Given the pattern of other Issue entries here
 guess is the trigger calling something Akuma's syscall surface doesn't
 support yet — but that's a guess, not a finding; confirm before acting on it.
 
+## Issue 9: no IPv6 in the stack — `cargo` cannot reach crates.io, though `curl` can
+
+**Status: OPEN, and it is a missing feature rather than a defect.** Found
+2026-08-13 while trying to run a self-host kernel build on devbox-smoltcp.
+
+### Symptom
+
+`cargo build` / `cargo fetch` inside the VM never gets past the registry
+fetch, failing every attempt in ~300 ms:
+
+```
+warning: spurious network error (16 tries remaining): [7] Could not connect to
+server (Failed to connect to index.crates.io:443 after 289 ms: Could not
+connect to server)
+```
+
+It exhausts all retries (`CARGO_NET_RETRY=20` was tried) and exits `101`
+before compiling a single crate. `CARGO_HTTP_MULTIPLEXING=false` and
+`CARGO_HTTP_TIMEOUT=120` do not help.
+
+### Why it is confusing
+
+The network is demonstrably fine, and `curl` reaches **the same host**:
+
+```
+$ curl -sS https://index.crates.io/config.json -o /dev/null -w '%{http_code} %{time_total}'
+200 0.253642
+$ curl -4 ... https://index.crates.io/config.json     ipv4=200
+$ curl -6 ... https://index.crates.io/config.json     could not resolve host
+```
+
+So HTTPS, DNS and TLS all work — an in-VM `git clone --depth 1` of this repo
+over HTTPS succeeds too (19 MB, rc=0), as does `apk add redis`.
+
+### Cause
+
+**The stack has no IPv6 at all, and never has.** `crates/akuma-net/Cargo.toml`
+builds smoltcp with `proto-ipv4` only — no `proto-ipv6` — and there is not a
+single `Ipv6`/`ipv6` identifier anywhere in `crates/akuma-net/src/`. It is an
+unimplemented feature, not a regression.
+
+`index.crates.io` is Fastly-hosted and its DNS answer is IPv6-heavy
+(`nslookup` returns `2a04:4e42:600::649`, `2a04:4e42:200::649`, …). Standalone
+`curl` recovers because its happy-eyeballs falls back to the A record; cargo's
+bundled libcurl evidently attempts the AAAA addresses and gives up rather than
+falling back, which is exactly the ~300 ms connect failure above.
+
+### Consequence
+
+**In-VM `cargo` builds against a live crates.io are blocked**, which blocks the
+network path of the self-host flow (`../runbooks/selfhost-kernel-build.md`).
+The runbook's `--offline` route with vendored deps is unaffected and remains
+the way to self-host — that is what §2's `cargo vendor` step is for.
+
+### Fix options, cheapest first
+
+1. **Vendor the deps** and build `--offline`. No kernel work; already the
+   documented self-host recipe.
+2. **Suppress AAAA in the guest resolver** so cargo only ever sees A records.
+3. **Implement `proto-ipv6`** in `akuma-net`. The real fix, and much the
+   largest — it is a new address family through smoltcp, the socket layer and
+   the syscall surface, not a feature-flag flip.
+
+### Note for whoever picks this up
+
+Do not diagnose this from `cargo`'s error text — "Could not connect to server"
+reads like a routing or firewall problem and sends you looking at QEMU's user
+networking. The decisive probe is `curl -4` vs `curl -6` against the failing
+host, which separates "no route" from "no address family" in one command.
+
+## Issue 10: rump devbox — ssh sessions reset at kex, no rump DHCP lease
+
+**Status: OPEN. Pre-existing — A/B-confirmed 2026-08-13, NOT a regression.**
+Found while verifying the `akuma-virtio` crate extraction (Phase 3 of
+[`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)),
+which is why the A/B below exists — the extraction was the initial suspect and
+was cleared.
+
+### Symptom
+
+`overlays/devbox/run.sh` (rump devbox, `RUMP_NIC=1`, ssh on host `:2223`) boots
+fine, but every ssh attempt dies before authentication:
+
+```
+$ ssh -p 2223 root@localhost uname -a
+kex_exchange_identification: read: Connection reset by peer
+```
+
+Reproduced on three attempts spanning ~90 s after boot.
+
+### What is working
+
+Everything up to the network:
+
+```
+[rump] /dev/net/tap0 bound to NIC1 (bus.4), MAC 52:54:00:12:34:57
+[RUMP-SP] rump-default: rump_server tid=8 registered as network
+[herd] Started sshd (pid= 3)
+```
+
+`rump_server` is alive and busy (36,183 syscalls in 30 s), and sshd is in a
+healthy idle accept loop — `accept=798` paired with `nanosleep=796` over 30 s is
+the non-blocking poll cadence, not a spin. `[FUTEX-DUMP] table empty`, no
+`PANIC`, no `[WILD-DA]`. The virtio drivers all come up
+(`virtio-blk` slot 1 / 6144 MB, `virtio-rng` slot 2).
+
+### The actual lead
+
+**There is no rump DHCP lease in the log.** `run.sh` itself says to wait for one
+("Once you see the rump DHCP lease + userspace sshd listening…"), and no lease
+line ever appears — the only rump networking line is the tap0 bind above. Host
+`:2223` forwards to *rump*:22, so with no address on the rump interface the
+forwarded connection has nowhere coherent to land, which is consistent with a
+reset at kex rather than a refusal.
+
+So the suspicion is the **rump DHCP path**, not sshd. sshd resetting at kex is
+the downstream symptom.
+
+### A/B: it is pre-existing
+
+Both arms were rebuilt from source and booted against the same `devbox.img`:
+
+| arm | tree | ssh `-p 2223` |
+|---|---|---|
+| **new** | `9e22ea2` (akuma-virtio extracted) | `kex_exchange_identification: read: Connection reset by peer` |
+| **clean** | `f09de7d` (parent; no `crates/akuma-virtio`, `src/virtio_hal.rs` still present) | **identical reset**, 3/3 attempts |
+
+Both arms also produce the identical rump line set — `tap0 bound to NIC1
+(bus.4)`, same MAC — and neither logs a DHCP lease. So the extraction is
+cleared, and the fault predates it.
+
+Corroborating: the *smoltcp* sibling is fully healthy on the **new** tree — ssh,
+`curl` HTTP **and** HTTPS, `apk add`, an in-VM `git clone --depth 1`, and a
+512 MB redis memtest all pass — so the shared virtio layer both stacks now use is
+demonstrably fine. The fault is specific to the rump path.
+
+CLAUDE.md lists the rump devbox as **deferred**, so this is not a routinely
+exercised path and plausibly broke some time ago unnoticed. Nobody has bisected
+it, so the breaking commit and date are unknown.
+
+### Where to look
+
+The rump DHCP path, not sshd. `rump_server` runs and sshd's accept loop is
+healthy, but the rump interface never gets an address, and host `:2223` forwards
+to *rump*:22.
+
 ## Background
 
 - `docs/archive/GIT_MISSING_SYSCALLS.md` — Issues 11-14, the CLONE_THREAD /

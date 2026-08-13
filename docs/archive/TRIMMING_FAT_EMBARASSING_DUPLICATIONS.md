@@ -11,8 +11,9 @@ deleted code has no `unsafe` in it.
 **This doc tracks.** It is a live work list, not a frozen investigation — unlike
 its neighbours in `archive/`, update it as phases land.
 
-**Progress: Phases 0, 1, 2a and 2b all done (2026-08-13). Phase 3 (virtio
-consolidation) is next.** See §8.5 for per-item status.
+**Progress: Phases 0, 1, 2a, 2b and 3 all done (2026-08-13). Phase 4
+(trait-impl clusters) is next — but read §5.55 before starting it.** See §8.5
+for per-item status.
 
 **Known blocker, owned by no phase:** ssh sessions die instantly on the
 extreme-size profile. It is a **degradation of unknown origin** — not bisected,
@@ -979,13 +980,78 @@ Phase 6 candidate with a real hazard behind it (a field added to `Process` has
 four initialisers to find), but it is a different pair-of-eyes problem from the
 `X`/`X_from_path` pattern and was left alone.
 
-### Phase 3 — virtio consolidation (≈ −28 `unsafe`, −90 lines)
+### Phase 3 — virtio consolidation
 
-`NetHal` → direct `akuma_exec::mmu` calls; drop the two translators from
-`NetRuntime`; delete `src/virtio_hal.rs`; extract `virtio::probe` + one
-`VIRTIO_MMIO_ADDRS`; drop the redundant `UnsafeCell` in `block.rs` / `audio.rs`.
-Also removes a spinlock and an 80-byte struct copy from the per-packet DMA path.
-Needs `src/main.rs` — check the other agent is clear first.
+**DONE 2026-08-13**, and it went further than planned: rather than merging the
+duplicated pieces in place, they moved into a new leaf crate,
+**`crates/akuma-virtio`** — `hal.rs` (the one `Hal`), `probe.rs`, `print.rs`,
+plus the `block` / `rng` / `audio` drivers lifted out of the bin crate.
+
+**Why a crate and not an `akuma-exec` submodule.** The `Hal`'s entire dependency
+surface is `virtio_drivers::Hal`, `alloc`, and
+`akuma_exec::mmu::{virt_to_phys, phys_to_virt}` — and *both translators are the
+identity* (`paddr as *mut u8` / `vaddr`, `#[inline(always)]`). So either home was
+viable. The crate won because the drivers moved too: at ~120 lines it would have
+been the smallest crate in the tree, but with `rng` (596) + `audio` (359) +
+`block` (336) it is ~1,400, comparable to `akuma-vfs`. Putting the `Hal` in
+`akuma-exec` instead would have meant the driver crate depending on `akuma-exec`
+for it anyway — the same edge, worse layering.
+
+**What was actually duplicated** was worse than §5 counted: not 3 copies of
+`VIRTIO_MMIO_ADDRS` but **5** (the 4th inline in `main.rs`, the 5th implied by
+`rump_tap.rs`), and **2** spellings of the device-id offset (`0x008` literal vs
+`VIRTIO_MMIO_DEVICE_ID_OFFSET`).
+
+**Four things the merge had to resolve** — none of them visible to CPD:
+
+1. **`log::` is not a printing mechanism in this tree.** Every crate pins `log`
+   with `max_level_off` and the kernel registers no logger, so `log::info!`
+   compiles to nothing — which is why `akuma-ext2` "prints nothing" and
+   `akuma-net`'s `[SmolNet]` lines never appear. Following that pattern would
+   have silently deleted every `[Block] Capacity: …` / `[RNG] Found …` line from
+   the boot log. The drivers use a `vprint!` shim over `akuma-exec`'s registered
+   `print_str` hook, preserving CLAUDE.md's no-alloc console rule.
+2. **`probe()` alone would have changed behaviour.** `block.rs`/`audio.rs` kept
+   scanning when a matching slot failed to yield a working device; a
+   find-first-then-build helper silently turns "try the next virtio-blk" into
+   "give up". Hence `probe_with`, which preserves the retry.
+3. **`smoltcp_net.rs` aborted the entire scan** on transport-init failure where
+   block/audio skipped the slot. Converged on skip-and-continue (strictly more
+   forgiving), with the skip logged so a failure on the slot you cared about
+   stays visible.
+4. **`FmtBuf` had to become `pub`** so the drivers could format without
+   hand-rolling a *fifth* stack writer — the same "reuse rather than invent"
+   move Phase 0 item 3 made with `OnceCopy`. See §5.55.
+
+`NetRuntime`'s `virt_to_phys`/`phys_to_virt` are gone (zero readers outside the
+deleted `hal.rs`), as is `src/virtio_hal.rs`. The `mmio_addrs` parameter is gone
+from `akuma_net::init` / `smoltcp_net::init` / `rump_tap::init` — every caller
+passed the same table.
+
+**Not done:** the redundant `UnsafeCell` in `block.rs`/`audio.rs` was listed in
+the original plan and left alone; it is unrelated to the duplication and wants
+its own look.
+
+**Verification.** `cargo clippy` clean on `--release`, `extreme-size`,
+devbox-rump and devbox-smoltcp, plus `akuma-net` × 3 feature sets and
+`akuma-virtio` × 2; 414 host tests green. QEMU `MEMORY=2048`: all three drivers
+init through the shared probe, 93 `[PASS]`, failure set identical to a clean
+tree (`retired_reclaim_ab` only). On devbox-smoltcp at SMP=4: `curl` HTTP **and**
+HTTPS (the latter exercising the moved RNG through the TLS handshake),
+`apk add redis`, an in-VM `git clone --depth 1` of this repo, and
+`redis-server --test-memory 512` ("Your memory passed this test").
+
+**Two things this verification turned up, both pre-existing:**
+
+- **The rump devbox cannot ssh** — `kex_exchange_identification: Connection
+  reset by peer`, no rump DHCP lease. **A/B-confirmed pre-existing** (identical
+  on `f09de7d`, the parent commit). `DEVBOX_ISSUES.md` Issue 10.
+- **No IPv6 anywhere in the stack**, which blocks in-VM `cargo` against a live
+  crates.io (Fastly's DNS answer is IPv6-heavy; standalone `curl` falls back to
+  IPv4, cargo's libcurl does not). Never implemented — `akuma-net` builds
+  smoltcp `proto-ipv4` only. `DEVBOX_ISSUES.md` Issue 9. This is what blocked
+  the in-VM self-host build; the runbook's vendored `--offline` route is
+  unaffected.
 
 ### Phase 4 — trait-impl clusters (§5.5, ≈ −180 lines)
 
