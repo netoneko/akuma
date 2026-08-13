@@ -15,10 +15,17 @@ its neighbours in `archive/`, update it as phases land.
 (trait-impl clusters) is next — but read §5.55 before starting it.** See §8.5
 for per-item status.
 
-**Known blocker, owned by no phase:** ssh sessions die instantly on the
-extreme-size profile. It is a **degradation of unknown origin** — not bisected,
-not attributable to any phase here — and it blocks
-`acceptance/05_meow_tcc_extreme_4mb.md`. Details in §8.5 Phase 2a.
+**~~Known blocker, owned by no phase:~~ FIXED 2026-08-13.** ssh sessions died
+instantly on the extreme-size profile, blocking
+`acceptance/05_meow_tcc_extreme_4mb.md`. Root cause: the profile's 64 KB
+user-thread **kernel stack** was ~10 KB too small for the sshd session path
+(measured 74 KB), and the overrun zeroed three PTEs in the session process's own
+L3 page table — surfacing as a SIGSEGV with no relationship to the corruption.
+It was never a duplication/cleanup regression; the §8.5 Phase 2a A/B that cleared
+this work was right. Fixed by sizing the stack to the measurement **and** by
+giving the long-painted-but-never-checked stack canary its first caller.
+Full autopsy: [`EXTREME_SSHD_KERNEL_STACK_OVERFLOW.md`](EXTREME_SSHD_KERNEL_STACK_OVERFLOW.md).
+The playbook is runnable again.
 
 ---
 
@@ -1043,9 +1050,15 @@ HTTPS (the latter exercising the moved RNG through the TLS handshake),
 
 **Two things this verification turned up, both pre-existing:**
 
-- **The rump devbox cannot ssh** — `kex_exchange_identification: Connection
-  reset by peer`, no rump DHCP lease. **A/B-confirmed pre-existing** (identical
-  on `f09de7d`, the parent commit). `DEVBOX_ISSUES.md` Issue 10.
+- **~~The rump devbox cannot ssh~~ FIXED 2026-08-13** —
+  `kex_exchange_identification: Connection reset by peer`. **A/B-confirmed
+  pre-existing** (identical on `f09de7d`, the parent commit), and the A/B was
+  right. Root cause had nothing to do with DHCP (which was working the whole
+  time — `rump_server` logs to a file, not the console): `RumpSocket` was the one
+  fd family `clone_deep_for_fork` did not refcount, so sshd's post-`fork`
+  `drop(stream)` closed the socket out from under its own session child.
+  `DEVBOX_ISSUES.md` Issue 10 →
+  [`RUMP_SSHD_FORKED_SESSION_CLOSES_SOCKET.md`](RUMP_SSHD_FORKED_SESSION_CLOSES_SOCKET.md).
 - **No IPv6 anywhere in the stack**, which blocks in-VM `cargo` against a live
   crates.io (Fastly's DNS answer is IPv6-heavy; standalone `curl` falls back to
   IPv4, cargo's libcurl does not). Never implemented — `akuma-net` builds

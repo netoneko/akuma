@@ -147,6 +147,10 @@ pub struct ExecRuntime {
     // `pipe_clone_ref`: without it the first close of a fork-inherited socket fd
     // destroys the socket under the other holders.
     pub socket_clone_ref: fn(usize),
+    /// Take one reference on a `stack=rump` box's socket, keyed `(box_id, rump_fd)`.
+    /// The rump counterpart of `socket_clone_ref`: `fork` duplicates the descriptor,
+    /// so the rump-side socket must outlive the first `close` of the two.
+    pub rump_socket_clone_ref: fn(u64, i32),
 
     // Syscall helpers
     pub futex_wake: fn(u32, usize, i32),

@@ -44,6 +44,7 @@ pub fn ensure_test_runtime() {
         on_process_exit: |_| {},
         remove_socket: |_| {},
         socket_clone_ref: |_| {},
+        rump_socket_clone_ref: |_, _| {},
         futex_wake: |_, _, _| {},
         pipe_close_write: |_| {},
         pipe_close_read: |_| {},

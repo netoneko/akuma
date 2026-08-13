@@ -157,6 +157,14 @@ const STACK_SENTINEL: u64 = 0xABAB_ABAB_ABAB_ABAB;
 // (live long-running system threads). Only meaningful when STACK_USAGE_PROBE.
 static STACK_PEAK_SYSTEM: AtomicUsize = AtomicUsize::new(0);
 static STACK_PEAK_USER: AtomicUsize = AtomicUsize::new(0);
+
+// Per-slot latch for `report_overrun_stack_canaries`: the stack base this slot's
+// overflow was last announced for, so a periodic sweep prints once per broken
+// stack rather than once per sweep. `0` = nothing reported yet (no stack is ever
+// based at 0 — `StackInfo::empty()` uses it as the unallocated marker).
+#[allow(clippy::declare_interior_mutable_const)]
+const ATOMIC_USIZE_ZERO: AtomicUsize = AtomicUsize::new(0);
+static CANARY_REPORTED_BASE: [AtomicUsize; MAX_THREADS] = [ATOMIC_USIZE_ZERO; MAX_THREADS];
 // Boot-stack (thread 0) bounds, recorded by `paint_boot_stack` so the report can
 // scan it. The boot stack is the 1 MB elephant; its true high-water decides
 // whether it can be halved for the extreme target.
@@ -2444,6 +2452,26 @@ impl ThreadPool {
                 }
                 record_stack_peak(slot_idx, top - first_used);
             }
+            // Overflow verdict, taken here because this is the last moment the
+            // evidence exists — the frames go back to the PMM on the next line and
+            // are handed to somebody else. `init_stack_canary` paints the canary at
+            // every stack's base and nothing repaints it while the thread lives, so
+            // a broken pattern is proof this thread ran off the bottom, and the
+            // bytes below it belonged to whatever the PMM had placed there.
+            //
+            // Reported rather than merely counted because the alternative is what
+            // this check was added for: a 10 KB run-off past a 64 KB user-thread
+            // stack landed in a *user process's L3 page table*, zeroed three PTEs
+            // mid-`sys_spawn`, and surfaced as an unrelated SIGSEGV in the process
+            // whose mapping had vanished. Nothing anywhere said "stack overflow" —
+            // `check_all_stack_canaries` existed but had no callers.
+            // See `docs/archive/EXTREME_SSHD_KERNEL_STACK_OVERFLOW.md`.
+            if config().enable_stack_canaries && !check_stack_canary(stack.base) {
+                safe_print!(160,
+                    "[STACK-OVERFLOW] tid={} ran off its {}KB kernel stack (base={:#x}) — \
+                     kernel memory below it was corrupted\n",
+                    slot_idx, stack.size / 1024, stack.base);
+            }
             let page_size = 4096;
             let pages = (stack.size + page_size - 1) / page_size;
             let phys_addr = crate::mmu::virt_to_phys(stack.base);
@@ -4443,6 +4471,67 @@ pub fn check_all_stack_canaries() -> Vec<usize> {
         }
     }
     bad
+}
+
+/// Report every **live** thread whose stack canary has been overrun, once per
+/// thread, and return how many new ones were found.
+///
+/// The teardown check in `ThreadPool::free_stack_for_slot` only fires when a
+/// thread exits, which is exactly the case an overflow can prevent: if the run-off
+/// corrupts something that hangs or panics the box, the thread never reaches
+/// teardown and the report is never printed. This is the periodic counterpart —
+/// cheap enough for the idle loop (one `canary_words`-word read per allocated
+/// slot, no allocation, no `POOL` lock held across the reads) and latched per slot
+/// so a broken canary is announced once, not every sweep.
+///
+/// The latch key is the reported stack's **base**, not just its slot: a slot whose
+/// stack was freed and re-allocated (`WARM_FREE_USER == 0` does that on every user
+/// process exit) comes back at a different base with a freshly painted canary, and
+/// must be able to report again. Keying on the base also keeps this lock-free —
+/// there is no re-arm hook to place inside `init_stack_canary`, which runs under
+/// the `POOL` lock and could not take it again. See
+/// `docs/archive/EXTREME_SSHD_KERNEL_STACK_OVERFLOW.md`.
+pub fn report_overrun_stack_canaries() -> usize {
+    if !config().enable_stack_canaries {
+        return 0;
+    }
+    let stacks: [StackInfo; MAX_THREADS] = with_irqs_disabled(|| POOL.lock().stacks);
+    let mut found = 0;
+    for (i, stack) in stacks.iter().enumerate().skip(1) {
+        if !stack.is_allocated() {
+            continue;
+        }
+        if check_stack_canary(stack.base) {
+            // Intact ⇒ disarm. Covers a repainted (recycled) stack, and keeps a
+            // one-off corruption — including the boot suite's own deliberate one
+            // in `test_stack_canary_overrun_is_reported` — from leaving this slot
+            // permanently unable to report a later, real overflow.
+            CANARY_REPORTED_BASE[i].store(0, Ordering::Relaxed);
+            continue;
+        }
+        if CANARY_REPORTED_BASE[i].swap(stack.base, Ordering::Relaxed) == stack.base {
+            continue;
+        }
+        found += 1;
+        safe_print!(160,
+            "[STACK-OVERFLOW] tid={} ran off its {}KB kernel stack (base={:#x}) — \
+             kernel memory below it was corrupted\n",
+            i, stack.size / 1024, stack.base);
+    }
+    found
+}
+
+/// A slot that has a stack allocated but is not running anything: `(slot, base)`.
+///
+/// Exists for `test_stack_canary_overrun_is_reported`, which needs a real stack
+/// whose canary it can break and restore without disturbing a live thread. Skips
+/// slot 0 (the boot stack, which `check_stack_canary` treats as always-intact).
+pub fn first_idle_stack_base() -> Option<(usize, usize)> {
+    let stacks: [StackInfo; MAX_THREADS] = with_irqs_disabled(|| POOL.lock().stacks);
+    (1..MAX_THREADS).find_map(|i| {
+        let free = THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE;
+        (free && stacks[i].is_allocated()).then_some((i, stacks[i].base))
+    })
 }
 
 /// Check if there are any threads ready to run

@@ -384,6 +384,8 @@ pub(crate) fn build_exec_runtime(
     // No-op shim for gated-out Tier 2 FD-teardown callbacks (see ExecRuntime below).
     #[cfg(not(all(feature = "sc-eventfd", feature = "sc-epoll", feature = "sc-pidfd")))]
     fn noop_u32(_id: u32) {}
+    #[cfg(not(feature = "rump"))]
+    fn noop_u64_i32(_box_id: u64, _rump_fd: i32) {}
 
     let rt = akuma_exec::ExecRuntime {
         uptime_us: timer::uptime_us,
@@ -437,6 +439,13 @@ pub(crate) fn build_exec_runtime(
         on_process_exit: |_pid| {},
         remove_socket: akuma_net::socket::remove_socket,
         socket_clone_ref: akuma_net::socket::socket_clone_ref,
+        // Only ever invoked for a `FileDescriptor::RumpSocket`, which no build
+        // without the rump proxy can construct — same "exists so the struct
+        // compiles" arrangement as the Tier 2 callbacks below.
+        #[cfg(feature = "rump")]
+        rump_socket_clone_ref: crate::rump_proxy::rump_fd_ref_clone,
+        #[cfg(not(feature = "rump"))]
+        rump_socket_clone_ref: noop_u64_i32,
         futex_wake: crate::syscall::futex_wake,
         pipe_close_write: crate::syscall::pipe::pipe_close_write,
         pipe_close_read: crate::syscall::pipe::pipe_close_read,
@@ -1098,6 +1107,12 @@ fn run_async_main_preemptive() -> ! {
                     // held here — this is the same context that already runs
                     // `cleanup_terminated`'s kernel-stack frees.
                     akuma_exec::process::reclaim::drain_retired_if_requested();
+                    // Announce any live thread that has overrun its kernel stack.
+                    // Latched per stack, so this is one canary read per allocated
+                    // slot and at most one line per overflow. The idle loop is the
+                    // right home: an overflow whose damage hangs or panics the box
+                    // never reaches the teardown check in `free_stack_for_slot`.
+                    threading::report_overrun_stack_canaries();
                 }
                 
                 // Heartbeat every 1000 iterations to show thread 0 is alive

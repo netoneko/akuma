@@ -171,7 +171,17 @@ pub enum FileDescriptor {
     /// fd ⇄ the server's `rump_fd`. `nonblock` mirrors the requested socket type
     /// bit (the proxy keeps the rump socket blocking and emulates nonblock).
     /// Unconditional (like `Tap`) so non-rump builds still match exhaustively.
-    RumpSocket { rump_fd: i32, nonblock: bool },
+    /// A socket living in a `stack=rump` box's `rump_server`, addressed by the
+    /// server-side fd number.
+    ///
+    /// `box_id` is carried on the descriptor because the rump fd number alone does
+    /// not identify a socket: each box has its own `rump_server`, and two servers
+    /// hand out the same small integers. Anything that keys per-socket state (the
+    /// cross-fork reference count in `rump_proxy`) therefore needs the pair, and
+    /// `SharedFdTable::clone_deep_for_fork` — which sees descriptors, not the
+    /// process they belong to — has no other way to learn which server this fd is
+    /// on. See `docs/archive/RUMP_SSHD_FORKED_SESSION_CLOSES_SOCKET.md`.
+    RumpSocket { rump_fd: i32, nonblock: bool, box_id: u64 },
     TimerFd(u32),
     EpollFd(u32),
     PidFd(u32),

@@ -490,9 +490,11 @@ fn proxy_socket(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
     });
     match res {
         Ok([fd, _]) if fd >= 0 => {
+            rump_fd_ref_init(box_id, fd as i32);
             let box_fd = proc.alloc_fd(process::FileDescriptor::RumpSocket {
                 rump_fd: fd as i32,
                 nonblock,
+                box_id,
             });
             u64::from(box_fd)
         }
@@ -501,15 +503,63 @@ fn proxy_socket(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
     }
 }
 
+/// How many descriptors across all processes still refer to a given box's rump
+/// socket, keyed `(box_id, rump_fd)`.
+///
+/// The native stack keeps this count inside the socket object
+/// (`akuma_net::socket::socket_clone_ref`); a rump socket has no kernel-side
+/// object to hang it on — it lives in `rump_server` and the kernel holds only an
+/// integer — so the count lives here. Absent key ⇒ one reference, so the common
+/// never-forked socket costs nothing.
+static RUMP_FD_REFS: Spinlock<BTreeMap<(u64, i32), u32>> = Spinlock::new(BTreeMap::new());
+
+/// Start tracking a freshly created/accepted rump socket at one reference.
+pub fn rump_fd_ref_init(box_id: u64, rump_fd: i32) {
+    RUMP_FD_REFS.lock().insert((box_id, rump_fd), 1);
+}
+
+/// Take a reference — `fork` duplicating the descriptor. Called through
+/// `runtime().rump_socket_clone_ref` from `SharedFdTable::clone_deep_for_fork`.
+pub fn rump_fd_ref_clone(box_id: u64, rump_fd: i32) {
+    *RUMP_FD_REFS.lock().entry((box_id, rump_fd)).or_insert(1) += 1;
+}
+
+/// Drop a reference; `true` when this was the last one and the caller must issue
+/// the real NetBSD `close`.
+pub fn rump_fd_ref_drop(box_id: u64, rump_fd: i32) -> bool {
+    let mut refs = RUMP_FD_REFS.lock();
+    match refs.get_mut(&(box_id, rump_fd)) {
+        Some(n) if *n > 1 => {
+            *n -= 1;
+            false
+        }
+        // 1, or untracked (a socket that predates tracking): this close is the last.
+        _ => {
+            refs.remove(&(box_id, rump_fd));
+            true
+        }
+    }
+}
+
 /// `close(fd)` on a rump socket: drop the box fd, then close the rump fd on the
-/// server. The local drop happens first so the fd is freed even if the server
-/// is gone.
+/// server **iff this was the last descriptor referring to it**. The local drop
+/// happens first so the fd is freed even if the server is gone.
+///
+/// The refcount gate is what makes `fork` usable over a rump stack. Without it the
+/// parent's post-`fork` `close` of an accepted socket tore the socket down in
+/// `rump_server` while the child still held a descriptor for it — sshd's
+/// process-per-session model does exactly that, and every ssh session on the rump
+/// devbox died at kex as a result
+/// (`docs/archive/RUMP_SSHD_FORKED_SESSION_CLOSES_SOCKET.md`).
 fn proxy_close(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
     let box_fd = args[0] as u32;
     let Some(process::FileDescriptor::RumpSocket { rump_fd, .. }) = proc.get_fd(box_fd) else {
         return neg_linux_errno(LINUX_EBADF);
     };
     proc.remove_fd(box_fd);
+    if !rump_fd_ref_drop(box_id, rump_fd) {
+        return 0; // another process still holds this socket
+    }
     let Some(proxy) = ensure_box_proxy(box_id) else {
         return 0; // server gone; fd already dropped locally
     };
@@ -617,7 +667,7 @@ fn proxy_and_fd(
 ) -> Result<(Arc<BoxProxy>, i32, bool), u64> {
     let fd = args[0] as u32;
     let (rump_fd, nonblock) = match proc.get_fd(fd) {
-        Some(process::FileDescriptor::RumpSocket { rump_fd, nonblock }) => (rump_fd, nonblock),
+        Some(process::FileDescriptor::RumpSocket { rump_fd, nonblock, .. }) => (rump_fd, nonblock),
         _ => return Err(neg_linux_errno(LINUX_EBADF)),
     };
     // The box socket is non-blocking if it was created SOCK_NONBLOCK (the struct
@@ -859,9 +909,11 @@ fn proxy_accept(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
                 // still gets kernel-side blocking via proxy_transfer).
                 set_rump_sock_nonblock(&proxy, newfd as i32, false);
                 set_rump_sock_nodelay(&proxy, newfd as i32);
+                rump_fd_ref_init(box_id, newfd as i32);
                 let box_fd = proc.alloc_fd(process::FileDescriptor::RumpSocket {
                     rump_fd: newfd as i32,
                     nonblock: false,
+                    box_id,
                 });
                 rsp_trace!(96, "[RUMP-SP] accept -> box_fd={} rump_fd={}\n", box_fd, newfd);
                 return u64::from(box_fd);

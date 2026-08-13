@@ -157,8 +157,57 @@ fn test_effective_poll_interval_rump_meaningfully_shorter() {
     console::print("  [PASS] test_effective_poll_interval_rump_meaningfully_shorter\n");
 }
 
+/// T6: a rump socket must survive `fork` — the reference the child's descriptor
+/// takes has to outlive the parent's `close`.
+///
+/// Drives `rump_proxy`'s reference count directly through the exact sequence
+/// `sshd`'s process-per-session accept loop produces: accept (init), fork
+/// (clone), parent `drop(stream)` (drop → must NOT be the last), child exit
+/// (drop → must be the last, so the NetBSD `close` finally goes out).
+///
+/// Before the count existed, the parent's close was reported as last and
+/// `proxy_close` tore the socket down inside `rump_server` while the child was
+/// still mid-kex; every rump-devbox ssh session died with
+/// `kex_exchange_identification: Connection reset by peer`. See
+/// `docs/archive/RUMP_SSHD_FORKED_SESSION_CLOSES_SOCKET.md`.
+fn test_rump_fd_ref_survives_fork() {
+    // A (box_id, rump_fd) pair no live socket can be using.
+    const BOX: u64 = 0xFFFF_FF01;
+    const FD: i32 = 0x7EED;
+
+    crate::rump_proxy::rump_fd_ref_init(BOX, FD);
+    crate::rump_proxy::rump_fd_ref_clone(BOX, FD); // fork duplicates the descriptor
+    assert!(
+        !crate::rump_proxy::rump_fd_ref_drop(BOX, FD),
+        "parent's post-fork close must NOT be the last reference — closing the rump \
+         socket here is what killed every forked ssh session at kex"
+    );
+    assert!(
+        crate::rump_proxy::rump_fd_ref_drop(BOX, FD),
+        "child's close must be the last reference, or the rump fd leaks in rump_server"
+    );
+
+    // Two boxes' servers hand out the same small fd numbers; the count must not
+    // conflate them, or a close in one box is deferred by a reference in another.
+    crate::rump_proxy::rump_fd_ref_init(BOX, FD);
+    crate::rump_proxy::rump_fd_ref_init(BOX + 1, FD);
+    assert!(
+        crate::rump_proxy::rump_fd_ref_drop(BOX, FD),
+        "per-box counts must be independent"
+    );
+    assert!(crate::rump_proxy::rump_fd_ref_drop(BOX + 1, FD));
+
+    // An untracked pair (a socket predating tracking) must still close, not leak.
+    assert!(
+        crate::rump_proxy::rump_fd_ref_drop(BOX, FD + 1),
+        "an untracked rump fd must report its close as the last one"
+    );
+    console::print("  [PASS] test_rump_fd_ref_survives_fork\n");
+}
+
 pub fn run_all_tests() {
     console::print("\n--- Rump Tests ---\n");
+    test_rump_fd_ref_survives_fork();
     test_run_async_main_skips_network_thread_id_under_rump_default();
     test_start_default_stack_registers_rump_server_tid();
     test_effective_poll_interval_default_for_non_rump();

@@ -9313,30 +9313,35 @@ pub fn test_thread_terminated_detection() -> bool {
     // We'll temporarily modify its state and restore it
     let test_slot = 62usize; // Near end of thread array
     let original_state = get_thread_state(test_slot);
-    
-    // Test 1: TERMINATED state should return true
-    set_thread_state(test_slot, thread_state::TERMINATED);
-    let terminated_detected = is_thread_terminated(test_slot);
+
+    // The whole fabricate-and-restore window runs with IRQs masked, and the
+    // prints are deferred until after it. `THREAD_STATES` is the scheduler's
+    // live run queue, not a private variable: parking slot 62 in `READY` (test 4)
+    // makes it *eligible*, and it has no context — a timer SGI landing anywhere
+    // in this window picks a thread whose saved SP is 0 and the box dies with
+    // `[SGI-S FATAL] new_sp=0x0 invalid!` mid-suite. That was a real, if rare,
+    // boot-suite kill, and it is a race in the test rather than in anything it
+    // tests. Masking IRQs closes the window on this core; a peer core cannot
+    // reach it because the boot suite runs before secondaries schedule userspace.
+    let (terminated_detected, free_detected, running_detected, ready_detected) =
+        akuma_exec::runtime::with_irqs_disabled(|| {
+            set_thread_state(test_slot, thread_state::TERMINATED);
+            let t = is_thread_terminated(test_slot);
+            set_thread_state(test_slot, thread_state::FREE);
+            let f = is_thread_terminated(test_slot);
+            set_thread_state(test_slot, thread_state::RUNNING);
+            let r = is_thread_terminated(test_slot);
+            set_thread_state(test_slot, thread_state::READY);
+            let y = is_thread_terminated(test_slot);
+            set_thread_state(test_slot, original_state);
+            (t, f, r, y)
+        });
+
     crate::safe_print!(64, "  TERMINATED state: is_thread_terminated={} (expected true)\n", terminated_detected);
-    
-    // Test 2: FREE state should return true
-    set_thread_state(test_slot, thread_state::FREE);
-    let free_detected = is_thread_terminated(test_slot);
     crate::safe_print!(64, "  FREE state: is_thread_terminated={} (expected true)\n", free_detected);
-    
-    // Test 3: RUNNING state should return false
-    set_thread_state(test_slot, thread_state::RUNNING);
-    let running_detected = is_thread_terminated(test_slot);
     crate::safe_print!(64, "  RUNNING state: is_thread_terminated={} (expected false)\n", running_detected);
-    
-    // Test 4: READY state should return false  
-    set_thread_state(test_slot, thread_state::READY);
-    let ready_detected = is_thread_terminated(test_slot);
     crate::safe_print!(64, "  READY state: is_thread_terminated={} (expected false)\n", ready_detected);
-    
-    // Restore original state
-    set_thread_state(test_slot, original_state);
-    
+
     let ok = terminated_detected && free_detected && !running_detected && !ready_detected;
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok

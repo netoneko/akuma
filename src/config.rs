@@ -136,13 +136,11 @@ pub const SYSTEM_THREAD_STACK_SIZE: usize = 512 * 1024;
 #[cfg(kernel_profile_extreme)]
 pub const SYSTEM_THREAD_STACK_SIZE: usize = 96 * 1024;
 
-/// Stack size for user process threads (128KB release, 64KB size profile)
+/// Stack size for user process threads.
 ///
 /// Used for threads RESERVED_THREADS through MAX_THREADS-1.
 /// User processes have their own user-space stack; this is for kernel-side
-/// syscall handling only.  tcc's syscall depth is shallow (open/read/write/
-/// mmap/brk); 64 KB is sufficient.  Keep `ENABLE_STACK_CANARIES` true so an
-/// undersized stack trips a canary rather than corrupting silently.
+/// syscall handling only.
 ///
 /// Halving the per-slot cost doubles how many user-thread slots fit the same
 /// PMM budget, paying for the `reserved + 6` floor in compute_thread_limit.
@@ -151,8 +149,34 @@ pub const SYSTEM_THREAD_STACK_SIZE: usize = 96 * 1024;
 // IRQ trap frame; 512 KB removes overflow as a variable. Lazily allocated.
 #[cfg(not(kernel_profile_extreme))]
 pub const USER_THREAD_STACK_SIZE: usize = 512 * 1024;
+// extreme: 128 KB (was 64 KB). 64 KB was sized for tcc's shallow syscall depth
+// (open/read/write/mmap/brk) back when the deep path — SSH exec / shell spawn —
+// ran on an SSH *system* thread and was therefore covered by the 96 KB
+// `SYSTEM_THREAD_STACK_SIZE` measured for it. Moving sshd to userspace with
+// process-per-session (`userspace/sshd`, `fork-sessions`) moved that same path
+// onto a *user* thread: each session is a forked process whose syscalls run on a
+// user-thread kernel stack. `report_stack_high_water` measures that path at
+// 74 KB (the same probe measured 79 KB when it drove the system stack), so 64 KB
+// overflowed it by ~10 KB on every session.
+//
+// Nothing caught the overflow, because the stack pool comes from the PMM and the
+// pages below a stack are ordinary allocations: the run-off wrote into whatever
+// happened to sit there. On the extreme profile that was the session process's
+// own L3 page table — three PTEs zeroed mid-`sys_spawn` (inside
+// `vfs::resolve_symlinks`), unmapping the child's malloc arena, so every ssh
+// session died instantly with a SIGSEGV whose faulting address had nothing to do
+// with the corruption. That is the failure
+// `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` recorded as "ssh
+// sessions die instantly on extreme-size, degradation of unknown origin"; see
+// `docs/archive/EXTREME_SSHD_KERNEL_STACK_OVERFLOW.md`.
+//
+// 128 KB rather than 96 KB: the system stack's 96 KB leaves only a 17 KB margin
+// over the same measurement, and a user thread additionally carries a nested IRQ
+// trap frame. Stacks are allocated on demand here (`WARM_FREE_USER == 0`), so the
+// cost is per *live* user thread, not per slot — at the 4 MB floor that is one or
+// two threads.
 #[cfg(kernel_profile_extreme)]
-pub const USER_THREAD_STACK_SIZE: usize = 64 * 1024;
+pub const USER_THREAD_STACK_SIZE: usize = 128 * 1024;
 
 /// Maximum length (bytes) of a single `argv`/`envp` string copied in by
 /// `execve`/`spawn`. Linux's `MAX_ARG_STRLEN` is 32 pages (128 KB); cargo/rustc

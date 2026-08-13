@@ -115,6 +115,10 @@ fn test_socket_refcount_survives_first_close() {
 pub fn run_all_tests() {
     console::print("\n--- Process Execution Tests ---\n");
 
+    // Stack-overflow reporting must be wired. Cheap, no spawning, and the guard
+    // for a whole class of silent cross-subsystem corruption.
+    test_stack_canary_overrun_is_reported();
+
     // Real (shared-kernel) SMP M0: confirm every secondary the DTB reported came up
     // on the shared kernel. Runs FIRST so it is observed even if a later, unrelated
     // memory-pressure test aborts the suite. No-op on a single-CPU boot.
@@ -16349,6 +16353,54 @@ fn test_pmm_heap_lock_order_smp() {
     crate::safe_print!(
         96,
         "[Test] pmm_heap_lock_order_smp {}\n",
+        if pass { "PASSED" } else { "FAILED" }
+    );
+}
+
+/// Kernel stack overflow must be *reported*, not silent.
+///
+/// The canary has been painted at every stack base for a long time, but
+/// `check_all_stack_canaries` had no callers anywhere in the tree — so when the
+/// extreme profile's 64 KB user-thread stack was overrun by ~10 KB on the sshd
+/// session path, the run-off silently zeroed three PTEs in a *user process's* L3
+/// page table and surfaced as an unrelated SIGSEGV. Nothing in any log said
+/// "stack". See `docs/archive/EXTREME_SSHD_KERNEL_STACK_OVERFLOW.md`.
+///
+/// Two halves, and the first matters as much as the second: no false positive on
+/// a healthy boot (a reporter that cried wolf would be turned off again), and a
+/// real detection when a canary is actually broken.
+fn test_stack_canary_overrun_is_reported() {
+    use akuma_exec::threading;
+
+    // Half 1: a healthy boot reports nothing.
+    let spurious = threading::report_overrun_stack_canaries();
+
+    // Half 2: break the canary of a slot that is allocated but not running, then
+    // confirm the sweep names it. `slot` is chosen from the FREE-but-stacked set
+    // so nothing is executing on it; the canary words sit at the very base, below
+    // any frame, so writing them cannot disturb a future occupant — and the value
+    // is restored immediately, before any thread can claim the slot (this runs
+    // with the suite's other tests, not concurrently with a spawn storm).
+    let mut detected = 0usize;
+    let mut exercised = false;
+    if let Some((slot, base)) = threading::first_idle_stack_base() {
+        let saved = unsafe { (base as *const u64).read_volatile() };
+        unsafe { (base as *mut u64).write_volatile(!saved) };
+        detected = threading::report_overrun_stack_canaries();
+        unsafe { (base as *mut u64).write_volatile(saved) };
+        exercised = true;
+        crate::safe_print!(96, "  broke canary on idle slot {} (base={:#x})\n", slot, base);
+    }
+
+    let pass = spurious == 0 && (!exercised || detected == 1);
+    crate::safe_print!(
+        160,
+        "  spurious={} exercised={} detected={}\n",
+        spurious, exercised, detected
+    );
+    crate::safe_print!(
+        96,
+        "[Test] stack_canary_overrun_is_reported {}\n",
         if pass { "PASSED" } else { "FAILED" }
     );
 }

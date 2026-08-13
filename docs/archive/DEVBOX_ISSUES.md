@@ -673,7 +673,22 @@ host, which separates "no route" from "no address family" in one command.
 
 ## Issue 10: rump devbox — ssh sessions reset at kex, no rump DHCP lease
 
-**Status: OPEN. Pre-existing — A/B-confirmed 2026-08-13, NOT a regression.**
+**Status: FIXED 2026-08-13 —
+[`RUMP_SSHD_FORKED_SESSION_CLOSES_SOCKET.md`](RUMP_SSHD_FORKED_SESSION_CLOSES_SOCKET.md).**
+The "Where to look" conclusion below is **wrong** and is left as written for the
+record. DHCP was never broken: `rump_server` logs to
+`/var/log/box/0/rump_server.log` inside the image, not the console, and that file
+shows the lease being taken (`dhcp: virt0: adding IP address 10.0.2.15/24`) on
+every one of these boots. The missing console line is a logging destination.
+
+The real cause was in sshd's direction after all: `RumpSocket` was the only fd
+family `SharedFdTable::clone_deep_for_fork` did not take a reference on, so the
+parent's post-`fork` `drop(stream)` sent a real NetBSD `close` and destroyed the
+socket its own session child was about to speak SSH over. Fixed with a
+`(box_id, rump_fd)` reference count in `rump_proxy`.
+
+**Original report follows. Pre-existing — A/B-confirmed 2026-08-13, NOT a
+regression** (that part was correct).
 Found while verifying the `akuma-virtio` crate extraction (Phase 3 of
 [`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)),
 which is why the A/B below exists — the extraction was the initial suspect and

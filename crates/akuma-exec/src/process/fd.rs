@@ -68,6 +68,19 @@ impl SharedFdTable {
                 // real reference, so the first close (child exit / exec cloexec
                 // sweep) must not destroy the socket under the parent's live fd.
                 FileDescriptor::Socket(idx) => (crate::runtime::runtime().socket_clone_ref)(*idx),
+                // Rump sockets need the same reference the native ones take, and for
+                // the same reason — but they were the one refcounted family missing
+                // from this list, so the child's copy was a bare alias. sshd's
+                // process-per-session pattern is exactly the shape that breaks on
+                // that: the parent `drop`s its copy of the accepted socket right
+                // after `fork`, expecting the refcount to keep the child's alive,
+                // and instead `proxy_close` sent a real NetBSD `close(rump_fd)` to
+                // `rump_server` and destroyed the socket the child was about to
+                // speak SSH over. Every session died at kex on the rump devbox
+                // (`docs/archive/RUMP_SSHD_FORKED_SESSION_CLOSES_SOCKET.md`).
+                FileDescriptor::RumpSocket { rump_fd, box_id, .. } => {
+                    (crate::runtime::runtime().rump_socket_clone_ref)(*box_id, *rump_fd);
+                }
                 _ => {}
             }
         }
