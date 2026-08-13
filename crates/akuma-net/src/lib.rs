@@ -4,7 +4,6 @@
 extern crate alloc;
 
 pub mod runtime;
-pub mod hal;
 // The native smoltcp stack + the smoltcp-coupled protocol modules. Optional so a
 // rump-only build (devbox) compiles them out; the rump path below is smoltcp-free.
 #[cfg(feature = "smoltcp")]
@@ -34,17 +33,15 @@ pub use runtime::NetRuntime;
 /// brings up the smoltcp device + interface).
 ///
 /// # Arguments
-/// * `rt` — Kernel runtime callbacks (timer, yield, RNG, address translation, etc.)
-/// * `mmio_addrs` — `VirtIO` MMIO addresses to probe for a net device
+/// * `rt` — Kernel runtime callbacks (timer, yield, RNG, etc.)
 /// * `enable_dhcp` — Whether to enable DHCP (vs static IP fallback)
+///
+/// The MMIO slots to probe are no longer a parameter: they are
+/// `akuma_virtio::VIRTIO_MMIO_ADDRS`, which every caller passed anyway.
 #[cfg(feature = "smoltcp")]
-pub fn init(
-    rt: NetRuntime,
-    mmio_addrs: &[usize],
-    enable_dhcp: bool,
-) -> Result<(), &'static str> {
+pub fn init(rt: NetRuntime, enable_dhcp: bool) -> Result<(), &'static str> {
     runtime::register(rt);
-    smoltcp_net::init(mmio_addrs, enable_dhcp)
+    smoltcp_net::init(enable_dhcp)
 }
 
 /// Smoltcp-free variant of [`init`].
@@ -54,11 +51,7 @@ pub fn init(
 /// and timers work. NIC1/`/dev/net/tap0` is bound separately by the kernel's
 /// `rump` feature.
 #[cfg(not(feature = "smoltcp"))]
-pub fn init(
-    rt: NetRuntime,
-    _mmio_addrs: &[usize],
-    _enable_dhcp: bool,
-) -> Result<(), &'static str> {
+pub fn init(rt: NetRuntime, _enable_dhcp: bool) -> Result<(), &'static str> {
     runtime::register(rt);
     Ok(())
 }

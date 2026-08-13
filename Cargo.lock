@@ -13,6 +13,7 @@ dependencies = [
  "akuma-rump",
  "akuma-terminal",
  "akuma-vfs",
+ "akuma-virtio",
  "arm_pl031",
  "embedded-io-async",
  "fdt",
@@ -58,6 +59,7 @@ version = "0.1.0"
 dependencies = [
  "akuma-exec",
  "akuma-rump",
+ "akuma-virtio",
  "embedded-io-async",
  "log",
  "smoltcp",
@@ -81,6 +83,15 @@ name = "akuma-vfs"
 version = "0.1.0"
 dependencies = [
  "spinning_top",
+]
+
+[[package]]
+name = "akuma-virtio"
+version = "0.1.0"
+dependencies = [
+ "akuma-exec",
+ "spinning_top",
+ "virtio-drivers",
 ]
 
 [[package]]

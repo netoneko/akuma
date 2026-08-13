@@ -73,7 +73,20 @@ use crate::mmu::{self, UserAddressSpace};
 use crate::runtime::{PhysFrame, FrameSource, runtime, config, with_irqs_disabled};
 use akuma_terminal as terminal;
 
-pub(crate) struct FmtBuf<'a> { pub(crate) buf: &'a mut [u8], pub(crate) pos: &'a mut usize }
+/// A `core::fmt::Write` sink over a caller-supplied stack buffer, truncating on
+/// overflow rather than allocating.
+///
+/// `pub` so `akuma-virtio`'s drivers can format their boot diagnostics under the
+/// same no-alloc console discipline the kernel requires (CLAUDE.md § "Kernel
+/// conventions": no `format!`/`String` on any path ending at the console)
+/// without hand-rolling a fifth copy of this type. It is exposed for reuse for
+/// the same reason `runtime::OnceCopy` was — see
+/// `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §8.5 Phase 0 item 3.
+///
+/// There are four near-identical stack writers in the tree (`StackWriter`,
+/// `LazyDebugWriter`, `FmtBuf`, `Buf`); collapsing them into one is Phase 4 of
+/// that document (§5.5). Prefer this one when adding a fifth is the alternative.
+pub struct FmtBuf<'a> { pub buf: &'a mut [u8], pub pos: &'a mut usize }
 impl core::fmt::Write for FmtBuf<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         let bytes = s.as_bytes();

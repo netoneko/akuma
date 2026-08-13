@@ -16,26 +16,11 @@ use core::sync::atomic::{AtomicU16, Ordering, fence};
 use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use spinning_top::Spinlock;
 
-use crate::console;
+use crate::probe;
 
 // ============================================================================
 // Constants
 // ============================================================================
-
-/// QEMU virt machine virtio MMIO addresses (remapped via L0[1])
-const VIRTIO_MMIO_ADDRS: [usize; 8] = [
-    akuma_exec::mmu::DEV_VIRTIO_VA,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0x200,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0x400,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0x600,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0x800,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0xa00,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0xc00,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0xe00,
-];
-
-/// VirtIO device ID for RNG devices (entropy device)
-const VIRTIO_DEVICE_ID_RNG: u32 = 4;
 
 /// Queue size (must be power of 2)
 const QUEUE_SIZE: usize = 2;
@@ -43,7 +28,6 @@ const QUEUE_SIZE: usize = 2;
 // VirtIO MMIO register offsets (modern / version 2 transport).
 const VIRTIO_MMIO_MAGIC_VALUE: usize = 0x000;
 const VIRTIO_MMIO_VERSION: usize = 0x004;
-const VIRTIO_MMIO_DEVICE_ID: usize = 0x008;
 const VIRTIO_MMIO_DEVICE_FEATURES: usize = 0x010;
 const VIRTIO_MMIO_DEVICE_FEATURES_SEL: usize = 0x014; // Modern only
 const VIRTIO_MMIO_DRIVER_FEATURES: usize = 0x020;
@@ -328,9 +312,18 @@ impl VirtioRngDevice {
             return Err(RngError::TransportError);
         }
 
-        let desc = unsafe { queue_mem.add(desc_offset) }.cast::<VirtqDesc>();
-        let avail = unsafe { queue_mem.add(avail_offset) }.cast::<VirtqAvail>();
-        let used = unsafe { queue_mem.add(used_offset) }.cast::<VirtqUsed>();
+        // `cast_ptr_alignment`: `queue_mem` is `PAGE_SIZE`-aligned by the layout
+        // above, and `calc_queue_layout` places all three rings at offsets that
+        // satisfy the virtio 16/2/4-byte requirements (see its comment), so each
+        // cast lands on a correctly-aligned address. The kernel bin crate
+        // blanket-allowed this lint crate-wide; scoped to the three casts that
+        // actually need it now that the driver lives in its own crate.
+        #[allow(clippy::cast_ptr_alignment)]
+        let (desc, avail, used) = (
+            unsafe { queue_mem.add(desc_offset) }.cast::<VirtqDesc>(),
+            unsafe { queue_mem.add(avail_offset) }.cast::<VirtqAvail>(),
+            unsafe { queue_mem.add(used_offset) }.cast::<VirtqUsed>(),
+        );
 
         // Program the queue with three independent 64-bit physical addresses,
         // then mark it ready.
@@ -535,16 +528,16 @@ static RNG_DEVICE: Spinlock<Option<VirtioRngDevice>> = Spinlock::new(None);
 pub fn init() -> Result<(), RngError> {
     log("[RNG] Initializing RNG device driver...\n");
 
-    // Find virtio-rng device
-    for (i, &addr) in VIRTIO_MMIO_ADDRS.iter().enumerate() {
-        // SAFETY: Reading from MMIO registers at known QEMU virt machine addresses
-        let device_id = unsafe { read_volatile((addr + VIRTIO_MMIO_DEVICE_ID) as *const u32) };
-        if device_id != VIRTIO_DEVICE_ID_RNG {
+    // Find virtio-rng device. This driver hand-rolls its virtqueue against the
+    // raw base address rather than using an `MmioTransport`, so it scans slots
+    // itself instead of going through `probe::probe_with`.
+    for (i, (addr, device_id)) in probe::scan().into_iter().enumerate() {
+        if device_id != probe::device_id::RNG {
             continue;
         }
 
         log("[RNG] Found virtio-rng at slot ");
-        crate::safe_print!(32, "{}\n", i);
+        crate::vprint!(32, "{}\n", i);
 
         match VirtioRngDevice::new(addr) {
             Ok(mut device) => {
@@ -552,7 +545,7 @@ pub fn init() -> Result<(), RngError> {
                 let mut test_buf = [0u8; 8];
                 if let Err(e) = device.read_bytes(&mut test_buf) {
                     log("[RNG] Test read failed: ");
-                    crate::safe_print!(32, "{}\n", e);
+                    crate::vprint!(32, "{}\n", e);
                     continue;
                 }
                 log("[RNG] Test read successful\n");
@@ -564,7 +557,7 @@ pub fn init() -> Result<(), RngError> {
             }
             Err(e) => {
                 log("[RNG] Failed to init virtio device: ");
-                crate::safe_print!(32, "{}\n", e);
+                crate::vprint!(32, "{}\n", e);
             }
         }
     }
@@ -592,5 +585,5 @@ pub fn fill_bytes(buf: &mut [u8]) -> Result<(), RngError> {
 // ============================================================================
 
 fn log(msg: &str) {
-    console::print(msg);
+    crate::print::print_str(msg);
 }

@@ -11,8 +11,13 @@ deleted code has no `unsafe` in it.
 **This doc tracks.** It is a live work list, not a frozen investigation — unlike
 its neighbours in `archive/`, update it as phases land.
 
-**Progress: Phase 0 done (2026-08-13), Phase 1 done, Phase 2a done (2026-08-13).
-Phase 2b is next.** See §8.5 for per-item status.
+**Progress: Phases 0, 1, 2a and 2b all done (2026-08-13). Phase 3 (virtio
+consolidation) is next.** See §8.5 for per-item status.
+
+**Known blocker, owned by no phase:** ssh sessions die instantly on the
+extreme-size profile. It is a **degradation of unknown origin** — not bisected,
+not attributable to any phase here — and it blocks
+`acceptance/05_meow_tcc_extreme_4mb.md`. Details in §8.5 Phase 2a.
 
 ---
 
@@ -416,6 +421,56 @@ guard family, the duplicated `IrqGuard`, the four `fmt::Write` buffers, the
 `Display` cluster and `MultiPollFuture` — all renamed-identifier clones. Running
 both axes is the point; neither subsumes the other.
 
+## 5.55 Primitives that want a leaf crate
+
+§5.5 catalogues duplicated trait impls. This is a different cut through some of
+the same evidence, and it has a single cause worth naming:
+
+> **Most of these copies exist because the canonical version lives in a crate the
+> duplicator cannot depend on.** The bin crate owns `console::StackWriter`, and
+> `src/main.rs:1656` even carries a comment telling you to use it rather than
+> hand-rolling a local buffer. `akuma-exec` cannot — depending on the bin crate
+> is a cycle — so it grew **three** of its own. This is not carelessness; it is
+> a missing crate.
+
+The same shape produced the `akuma-ext2 → akuma-exec` edge: `PreemptGuard` needed
+a home when it was lifted out of `akuma-net`, `akuma-exec` was the only crate that
+owned both it and `threading`, and now three crates compile the 23.8k-line
+execution crate to get a ~40-line RAII guard.
+
+A leaf crate — `akuma-primitives`, depending on nothing but `core` — is the fix.
+Candidates, with what actually blocks each:
+
+### Tier A — movable today, no blockers
+
+| Primitive | Copies | Where |
+|---|---:|---|
+| Stack `fmt::Write` buffers | **5** | `src/console.rs:205` `StackWriter<N>`; `akuma-exec/src/threading/mod.rs:35` `StackWriter<N>` (**same name, second copy**); `akuma-exec/src/process/mod.rs:89` `FmtBuf`; `akuma-exec/src/process/children.rs:1039` `LazyDebugWriter<N>`; `akuma-exec/src/mmu/mod.rs:340` `Buf` (function-local) |
+| `OnceCopy<T>` | 1, wanted by 2+ | `akuma-exec/src/runtime.rs`; already reached across a crate boundary by `akuma-ext2/src/ext2.rs:48` |
+| `irq_save_mask` / `irq_restore` | 1 | `akuma-exec/src/sync.rs:17,30` — pure asm, no state |
+| `IrqGuard` | **2** | `src/irq.rs:12` and `akuma-exec/src/runtime.rs:276` — same name, two crates |
+
+§5.5 counted four stack writers; there are five. The fifth
+(`threading/mod.rs:35`) shares a *name* with the bin crate's, which is how it
+stayed hidden — a grep for the type name looks like one definition and its use
+sites.
+
+### Tier B — blocked, and the block is the interesting part
+
+| Primitive | Blocker |
+|---|---|
+| `PreemptGuard` | Calls `threading::disable_preemption`, which is not a standalone counter: it indexes `PREEMPTION_DISABLED[tid]` by `get_current_thread_register()` (TPIDRRO_EL0) and maintains two diagnostic arrays beside it. That is scheduler state. Moving the guard means moving the thread-slot table, or reintroducing the callback pointer that was deliberately removed (`sync.rs:159` explains why: a direct call works during early boot and in host tests, a registered callback does not). |
+| `NoMem` / `DiscardMem` | `src/rump_proxy.rs:1258,1353` and `akuma-rump/src/sysproxy.rs:487` — `NoMem` is implemented identically in two crates, but the `ClientMem` trait's home has to be settled first. |
+
+**What this is worth, stated honestly.** Not line count — Tier A is maybe 120
+lines of actual duplication. The payoff is that `akuma-ext2` and `akuma-net` could
+stop depending on `akuma-exec` altogether, which is what makes "depends on the
+execution crate" mean something again. But **Tier A alone does not achieve that**:
+ext2 needs `OnceCopy` *and* `PreemptGuard`, and `PreemptGuard` is Tier B. The
+guard is the long pole for the whole untangling, so if this is ever picked up,
+start by deciding what happens to the thread-slot table — not by moving the easy
+four.
+
 ## 5.6 Case study: the CoW refcount underflow (2026-08-12)
 
 Everything above argues that copy-paste here decays *comments and
@@ -797,8 +852,25 @@ A/B-confirmed by stashing the whole diff, rebuilding extreme-size and getting
 byte-identical fault registers. So the branch was exercised instead by adding a
 throwaway crate feature that forces `ElfSource::Path` on the release profile,
 where ssh works — same code, drivable box. The feature was removed afterwards.
-(The extreme-size sshd fault is not this phase's to fix, but it is a live bug
-and nothing else in the repo records it.)
+
+> **The extreme-size sshd fault is a degradation, and "pre-existing" undersells
+> it.** All the A/B above establishes is that *this phase* did not cause it. It
+> is not pre-existing in the sense of never having worked:
+> `acceptance/05_meow_tcc_extreme_4mb.md` — one of the four live playbooks —
+> drives `ssh()` against this exact profile throughout (`pkg install`,
+> `exec /tmp/hello_c`), so it was written against a working extreme-size sshd.
+> **That playbook is therefore currently unrunnable.**
+>
+> Nobody has bisected it, so the breaking change and its date are unknown, and
+> no phase in §8.5 owns it. Two things make it easy to under-rate: it is invisible
+> on every other profile (release, devbox and rump builds ssh fine), and the
+> extreme-size profile is the one nothing routinely boots. Treat the cost as "one
+> acceptance playbook is dark", not "one profile has a cosmetic fault".
+>
+> What is known: every session dies at `FAR=0x10 ELR=0x415330` inside sshd,
+> interactive PTY included, and `FAR=0x10` is a null-ish struct-field
+> dereference rather than a wild pointer. Bisecting wants the extreme-size build
+> (`scripts/build_extreme_size.sh`), not the default one.
 
 **Disk state note.** Verifying the interpreter needed a dynamically-linked
 binary, and `disk.img` had none — no `/lib/ld-musl-aarch64.so.1` at all, which
@@ -921,6 +993,11 @@ Needs `src/main.rs` — check the other agent is clear first.
 BKL guard family → one generic guard; an `impl_display!` macro for the error
 enums; the twice-defined `MultiPollFuture`. Spread across `akuma-net`,
 `akuma-rump`, `akuma-ext2` and `src/syscall/` — low contention.
+
+**Read §5.55 first.** Several of these are not "merge two impls" but "there is
+no crate these can live in" — including the five stack writers, which §5.5
+undercounted at four. Merging them in place without deciding on
+`akuma-primitives` just moves the copy around.
 
 ### Phase 5 — the user-copy sweep (−167 `unsafe`, 19% of the tree)
 

@@ -56,6 +56,9 @@ akuma-rump = { path = "../akuma-rump", optional = true }
 # from this crate's runtime.rs so the VFS BKL-drop path can reuse it). Always
 # pulled in — the net crate's `PreemptGuard` re-export comes from here.
 akuma-exec = { path = "../akuma-exec" }
+# The shared `Hal` impl and MMIO probe. Both used to be duplicated here — see
+# akuma-virtio's hal.rs for why this crate no longer carries its own.
+akuma-virtio = { path = "../akuma-virtio" }
 smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
 virtio-drivers = { version = "0.7", default-features = false }
 embedded-io-async = { version = "0.6", default-features = false }

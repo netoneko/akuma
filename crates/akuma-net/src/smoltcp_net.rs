@@ -17,9 +17,9 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
 use virtio_drivers::device::net::VirtIONetRaw;
-use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
+use virtio_drivers::transport::mmio::MmioTransport;
 
-use crate::hal::NetHal;
+use akuma_virtio::VirtioHal;
 use crate::runtime::runtime;
 use crate::runtime::PreemptGuard;
 
@@ -228,7 +228,7 @@ static mut SOCKET_STORAGE: [SocketStorage<'static>; MAX_SOCKETS] = [SocketStorag
 // ============================================================================
 
 pub struct VirtioSmoltcpDevice {
-    inner: VirtIONetRaw<NetHal, MmioTransport, 16>,
+    inner: VirtIONetRaw<VirtioHal, MmioTransport, 16>,
     rx_buffer: [u8; 2048],
     tx_buffer: [u8; 2048],
     /// Token for a pending `VirtIO` receive buffer that has been submitted to the device.
@@ -240,7 +240,7 @@ pub struct VirtioSmoltcpDevice {
 
 impl VirtioSmoltcpDevice {
     #[must_use] 
-    pub const fn new(inner: VirtIONetRaw<NetHal, MmioTransport, 16>) -> Self {
+    pub const fn new(inner: VirtIONetRaw<VirtioHal, MmioTransport, 16>) -> Self {
         Self {
             inner,
             rx_buffer: [0u8; 2048],
@@ -325,7 +325,7 @@ impl smoltcp::phy::RxToken for VirtioRxToken<'_> {
 }
 
 pub struct VirtioTxToken<'a> {
-    inner: &'a mut VirtIONetRaw<NetHal, MmioTransport, 16>,
+    inner: &'a mut VirtIONetRaw<VirtioHal, MmioTransport, 16>,
     buffer: &'a mut [u8],
 }
 
@@ -494,7 +494,7 @@ impl smoltcp::phy::RxToken for LoopbackAwareRxToken<'_> {
 }
 
 pub struct LoopbackAwareTxToken<'a> {
-    virtio_inner: &'a mut VirtIONetRaw<NetHal, MmioTransport, 16>,
+    virtio_inner: &'a mut VirtIONetRaw<VirtioHal, MmioTransport, 16>,
     virtio_buffer: &'a mut [u8],
     loopback_queue: &'a mut VecDeque<Vec<u8>>,
 }
@@ -525,25 +525,16 @@ impl smoltcp::phy::TxToken for LoopbackAwareTxToken<'_> {
 // ============================================================================
 
 #[allow(clippy::cast_possible_wrap)]
-pub fn init(mmio_addrs: &[usize], enable_dhcp: bool) -> Result<(), &'static str> {
+pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
     log::info!("[SmolNet] Initializing network stack...");
     DHCP_ENABLED.store(enable_dhcp, Ordering::Relaxed);
 
-    let mut found_device: Option<VirtIONetRaw<NetHal, MmioTransport, 16>> = None;
+    let mut found_device: Option<VirtIONetRaw<VirtioHal, MmioTransport, 16>> = None;
 
-    for (i, &addr) in mmio_addrs.iter().enumerate() {
-        let device_id = unsafe { core::ptr::read_volatile((addr + 0x008) as *const u32) };
-        if device_id != 1 { continue; }
-
+    if let Some((i, transport)) = akuma_virtio::probe::probe(akuma_virtio::device_id::NET) {
         log::info!("[SmolNet] Found virtio-net at slot {i}");
-
-        let Some(header_ptr) = core::ptr::NonNull::new(addr as *mut VirtIOHeader) else { continue };
-
-        let transport = unsafe { MmioTransport::new(header_ptr) }.map_err(|_| "Transport init failed")?;
-        
         if let Ok(dev) = VirtIONetRaw::new(transport) {
             found_device = Some(dev);
-            break;
         }
     }
 

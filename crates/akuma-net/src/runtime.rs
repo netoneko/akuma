@@ -8,8 +8,13 @@ use spinning_top::Spinlock;
 /// for the lifetime of the kernel (they are plain `fn` pointers, not closures).
 #[derive(Clone, Copy)]
 pub struct NetRuntime {
-    pub virt_to_phys: fn(usize) -> usize,
-    pub phys_to_virt: fn(usize) -> *mut u8,
+    // `virt_to_phys`/`phys_to_virt` used to live here, dispatching this crate's
+    // `Hal` impl to the kernel's translators so akuma-net would not need to
+    // depend on akuma-exec. That decoupling was already spent — akuma-exec is an
+    // unconditional dependency now, for the `PreemptGuard` re-export — and the
+    // indirection cost a spinlocked struct read on the per-packet DMA path to
+    // reach two identity functions. The `Hal` moved to `akuma-virtio` and calls
+    // `akuma_exec::mmu` directly. See that crate's `hal.rs`.
     pub uptime_us: fn() -> u64,
     pub utc_seconds: fn() -> Option<u64>,
     pub yield_now: fn(),

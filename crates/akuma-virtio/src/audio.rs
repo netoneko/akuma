@@ -77,26 +77,12 @@ mod imp {
 
     use spinning_top::Spinlock;
     use virtio_drivers::device::sound::{PcmFeatures, PcmFormat, PcmRate, VirtIOSound};
-    use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
+    use virtio_drivers::transport::mmio::MmioTransport;
 
-    use crate::console;
-    use crate::virtio_hal::VirtioHal;
+    use crate::hal::VirtioHal;
+    use crate::probe;
 
-    /// QEMU virt machine virtio MMIO addresses (remapped via L0[1]); same scan
-    /// table as block.rs / rng.rs.
-    const VIRTIO_MMIO_ADDRS: [usize; 8] = [
-        akuma_exec::mmu::DEV_VIRTIO_VA,
-        akuma_exec::mmu::DEV_VIRTIO_VA + 0x200,
-        akuma_exec::mmu::DEV_VIRTIO_VA + 0x400,
-        akuma_exec::mmu::DEV_VIRTIO_VA + 0x600,
-        akuma_exec::mmu::DEV_VIRTIO_VA + 0x800,
-        akuma_exec::mmu::DEV_VIRTIO_VA + 0xa00,
-        akuma_exec::mmu::DEV_VIRTIO_VA + 0xc00,
-        akuma_exec::mmu::DEV_VIRTIO_VA + 0xe00,
-    ];
 
-    /// VirtIO device ID for sound devices.
-    const VIRTIO_DEVICE_ID_SOUND: u32 = 25;
 
     /// Bytes per PCM period. Small + bounded so total in-flight DMA stays well
     /// under ~128 KB even with the crate's 32-entry tx queue. This is the kernel's
@@ -207,42 +193,27 @@ mod imp {
     /// Initialize the sound driver: scan for virtio-snd (id 25), pick the first
     /// output stream. Non-fatal: returns Err if no device / no output stream.
     pub fn init() -> Result<(), AudioError> {
-        for (i, &addr) in VIRTIO_MMIO_ADDRS.iter().enumerate() {
-            // SAFETY: reading MMIO device-id register at a known QEMU address.
-            let device_id = unsafe { core::ptr::read_volatile((addr + 0x008) as *const u32) };
-            if device_id != VIRTIO_DEVICE_ID_SOUND {
-                continue;
-            }
+        // `probe_with` keeps scanning when a matching slot does not yield a
+        // usable device, which is what the hand-rolled loop did.
+        let device = probe::probe_with(probe::device_id::SOUND, |i, transport| {
+            crate::vprint!(48, "[SND] Found virtio-snd at slot {}\n", i);
 
-            crate::safe_print!(48, "[SND] Found virtio-snd at slot {}\n", i);
-
-            let header_ptr = match core::ptr::NonNull::new(addr as *mut VirtIOHeader) {
-                Some(p) => p,
-                None => continue,
+            let Ok(mut snd) = VirtIOSound::<VirtioHal, MmioTransport>::new(transport) else {
+                crate::print::print_str("[SND] Failed to init virtio-snd device\n");
+                return None;
             };
 
-            // SAFETY: building MmioTransport over a verified virtio device header.
-            let transport = if let Ok(t) = unsafe { MmioTransport::new(header_ptr) } { t } else {
-                console::print("[SND] Failed to create transport\n");
-                continue;
+            let Ok(outputs) = snd.output_streams() else {
+                crate::print::print_str("[SND] Failed to query output streams\n");
+                return None;
             };
 
-            let mut snd = if let Ok(s) = VirtIOSound::<VirtioHal, MmioTransport>::new(transport) { s } else {
-                console::print("[SND] Failed to init virtio-snd device\n");
-                continue;
+            let Some(&out_stream) = outputs.first() else {
+                crate::print::print_str("[SND] No output streams advertised\n");
+                return None;
             };
 
-            let outputs = if let Ok(v) = snd.output_streams() { v } else {
-                console::print("[SND] Failed to query output streams\n");
-                continue;
-            };
-
-            let out_stream = if let Some(&s) = outputs.first() { s } else {
-                console::print("[SND] No output streams advertised\n");
-                continue;
-            };
-
-            crate::safe_print!(
+            crate::vprint!(
                 96,
                 "[SND] jacks={} streams={} chmaps={} output_stream={}\n",
                 snd.jacks(),
@@ -251,17 +222,17 @@ mod imp {
                 out_stream
             );
 
-            let device = VirtioSoundDevice {
+            Some(VirtioSoundDevice {
                 inner: UnsafeCell::new(snd),
                 out_stream,
                 params: UnsafeCell::new(Params::default()),
                 prepared: UnsafeCell::new(false),
-            };
-            *SOUND_DEVICE.lock() = Some(device);
-            return Ok(());
-        }
+            })
+        });
 
-        Err(AudioError::NotFound)
+        let Some(device) = device else { return Err(AudioError::NotFound) };
+        *SOUND_DEVICE.lock() = Some(device);
+        Ok(())
     }
 
     /// True once a sound device has been found and initialized.
@@ -338,6 +309,7 @@ mod imp {
     pub fn init() -> Result<(), AudioError> {
         Err(AudioError::NotInitialized)
     }
+    #[must_use]
     pub fn is_available() -> bool {
         false
     }

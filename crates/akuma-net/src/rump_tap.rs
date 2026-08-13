@@ -7,7 +7,7 @@
 //! TCP/IP stack over it.
 //!
 //! This module is the **hardware** half: it implements [`akuma_rump::RawNic`]
-//! over virtio-drivers' `VirtIONetRaw` (real DMA via [`NetHal`]) and owns the
+//! over virtio-drivers' `VirtIONetRaw` (real DMA via [`akuma_virtio::VirtioHal`]) and owns the
 //! global instance. The **device-independent** orchestration — NIC selection,
 //! the RX two-phase state machine, the malformed-length bounds guard — lives in
 //! the `akuma-rump` crate, where it is unit-tested on the host with a mock NIC.
@@ -21,17 +21,14 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use spinning_top::Spinlock;
 use virtio_drivers::device::net::VirtIONetRaw;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
-use alloc::vec::Vec;
-use crate::hal::NetHal;
+use akuma_virtio::VirtioHal;
 use akuma_rump::{NicError, RawNic, TapNic};
-
-const VIRTIO_MMIO_DEVICE_ID_OFFSET: usize = 0x008;
 
 /// The real raw NIC: a virtio-net device driven without buffer management.
 /// Wraps the `unsafe` `VirtIONetRaw` calls in the safe [`RawNic`] trait so the
 /// `akuma-rump` orchestration (and its host tests) need no virtio knowledge.
 struct VirtioRawNic {
-    inner: VirtIONetRaw<NetHal, MmioTransport, 16>,
+    inner: VirtIONetRaw<VirtioHal, MmioTransport, 16>,
 }
 
 impl VirtioRawNic {
@@ -63,17 +60,9 @@ static READY: AtomicBool = AtomicBool::new(false);
 /// Probes the virtio-mmio slots for their device ids, then asks `akuma-rump`
 /// which address is the **second** virtio-net (the first is smoltcp's NIC0).
 /// Returns the NIC1 MAC on success, or `Err` if no second virtio-net exists.
-pub fn init(mmio_addrs: &[usize]) -> Result<[u8; 6], &'static str> {
+pub fn init() -> Result<[u8; 6], &'static str> {
     // Probe device ids (hardware-bound) and let akuma-rump pick the slot.
-    let slots: Vec<(usize, u32)> = mmio_addrs
-        .iter()
-        .map(|&addr| {
-            let id = unsafe {
-                core::ptr::read_volatile((addr + VIRTIO_MMIO_DEVICE_ID_OFFSET) as *const u32)
-            };
-            (addr, id)
-        })
-        .collect();
+    let slots = akuma_virtio::probe::scan();
 
     let addr = akuma_rump::select_second_net_addr(&slots)
         .ok_or("tap: no second virtio-net (NIC1) device found")?;

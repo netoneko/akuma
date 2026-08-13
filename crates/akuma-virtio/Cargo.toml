@@ -1,0 +1,27 @@
+[package]
+name = "akuma-virtio"
+version = "0.1.0"
+edition = "2024"
+description = "Shared virtio scaffolding for no_std kernels: the DMA HAL, MMIO device probing, and the virtio-mmio drivers"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The `Hal` trait this crate implements, plus the transport/device types the
+# probe helper and the drivers are written against. Must stay on the same
+# version the kernel and akuma-net use, or the `Hal` impl here does not satisfy
+# *their* `virtio_drivers::Hal` bound — the types would be from distinct crates.
+virtio-drivers = { version = "0.7", default-features = false }
+spinning_top = "0.3"
+# For `mmu::{virt_to_phys, phys_to_virt}` (the DMA address seam) and
+# `mmu::DEV_VIRTIO_VA` (the MMIO scan base). Both translators are identity
+# functions today; see hal.rs for why this crate calls them anyway rather than
+# open-coding the identity.
+akuma-exec = { path = "../akuma-exec" }
+
+[features]
+# The virtio-snd driver. Off by default: it needs virtio-drivers' `alloc`
+# feature, which gates that crate's `sound` module. Forwarded from the kernel's
+# own `sound` feature.
+sound = ["virtio-drivers/alloc"]

@@ -7,10 +7,10 @@ use core::cell::UnsafeCell;
 
 use spinning_top::Spinlock;
 use virtio_drivers::device::blk::VirtIOBlk;
-use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
+use virtio_drivers::transport::mmio::MmioTransport;
 
-use crate::console;
-use crate::virtio_hal::VirtioHal;
+use crate::hal::VirtioHal;
+use crate::probe;
 
 // ============================================================================
 // Constants
@@ -19,20 +19,6 @@ use crate::virtio_hal::VirtioHal;
 /// Sector size in bytes (standard for VirtIO block devices)
 pub const SECTOR_SIZE: usize = 512;
 
-/// QEMU virt machine virtio MMIO addresses (remapped via L0[1])
-const VIRTIO_MMIO_ADDRS: [usize; 8] = [
-    akuma_exec::mmu::DEV_VIRTIO_VA,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0x200,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0x400,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0x600,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0x800,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0xa00,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0xc00,
-    akuma_exec::mmu::DEV_VIRTIO_VA + 0xe00,
-];
-
-/// VirtIO device ID for block devices
-const VIRTIO_DEVICE_ID_BLK: u32 = 2;
 
 // ============================================================================
 // Block Device Error
@@ -120,13 +106,13 @@ impl VirtioBlockDevice {
     /// * `buf` - Buffer to read into (must be a multiple of SECTOR_SIZE)
     pub fn read_sectors(&self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         if !buf.len().is_multiple_of(SECTOR_SIZE) {
-            crate::safe_print!(96, "[Block] read_sectors: buf len {} not sector-aligned\n", buf.len());
+            crate::vprint!(96, "[Block] read_sectors: buf len {} not sector-aligned\n", buf.len());
             return Err(BlockError::InvalidOffset);
         }
 
         let num_sectors = buf.len() / SECTOR_SIZE;
         if sector + num_sectors as u64 > self.capacity_sectors {
-            crate::safe_print!(96, "[Block] read_sectors: sector {}+{} > capacity {}\n",
+            crate::vprint!(96, "[Block] read_sectors: sector {}+{} > capacity {}\n",
                 sector, num_sectors, self.capacity_sectors);
             return Err(BlockError::InvalidOffset);
         }
@@ -134,7 +120,7 @@ impl VirtioBlockDevice {
         let inner = self.inner_mut();
 
         if let Err(e) = inner.read_blocks(sector as usize, buf) {
-            crate::safe_print!(96, "[Block] read_blocks FAILED: sector={}, len={}, err={:?}\n",
+            crate::vprint!(96, "[Block] read_blocks FAILED: sector={}, len={}, err={:?}\n",
                 sector, buf.len(), e);
             return Err(BlockError::ReadError);
         }
@@ -149,13 +135,13 @@ impl VirtioBlockDevice {
     /// * `buf` - Buffer to write from (must be a multiple of SECTOR_SIZE)
     pub fn write_sectors(&self, sector: u64, buf: &[u8]) -> Result<(), BlockError> {
         if !buf.len().is_multiple_of(SECTOR_SIZE) {
-            crate::safe_print!(96, "[Block] write_sectors: buf len {} not sector-aligned\n", buf.len());
+            crate::vprint!(96, "[Block] write_sectors: buf len {} not sector-aligned\n", buf.len());
             return Err(BlockError::InvalidOffset);
         }
 
         let num_sectors = buf.len() / SECTOR_SIZE;
         if sector + num_sectors as u64 > self.capacity_sectors {
-            crate::safe_print!(96, "[Block] write_sectors: sector {}+{} > capacity {}\n",
+            crate::vprint!(96, "[Block] write_sectors: sector {}+{} > capacity {}\n",
                 sector, num_sectors, self.capacity_sectors);
             return Err(BlockError::InvalidOffset);
         }
@@ -163,7 +149,7 @@ impl VirtioBlockDevice {
         let inner = self.inner_mut();
 
         if let Err(e) = inner.write_blocks(sector as usize, buf) {
-            crate::safe_print!(96, "[Block] write_blocks FAILED: sector={}, len={}, err={:?}\n",
+            crate::vprint!(96, "[Block] write_blocks FAILED: sector={}, len={}, err={:?}\n",
                 sector, buf.len(), e);
             return Err(BlockError::WriteError);
         }
@@ -229,7 +215,7 @@ impl VirtioBlockDevice {
 /// ([`VirtioBlockDevice::read_sectors`] busy-polls the virtqueue; it never yields), so it
 /// must not be stranded by a context switch or nested exception on a core running an fs
 /// syscall *without* the Big Kernel Lock. It isn't, and not by accident: every path that
-/// reaches it does so through the [`crate::vfs::ext2`] `BlockDevice` impl, i.e. from
+/// reaches it does so through the kernel's `vfs::ext2` `BlockDevice` impl, i.e. from
 /// inside `akuma-ext2`'s `read_block`/`write_block`/`write_superblock`, all of which
 /// require an `Ext2State` guard — and that guard carries the `PreemptGuard` (preemption
 /// off + IRQs masked) under `no-bkl-vfs`. So the hold is already covered transitively and
@@ -252,46 +238,28 @@ static BLOCK_DEVICE: Spinlock<Option<VirtioBlockDevice>> = Spinlock::new(None);
 pub fn init() -> Result<(), BlockError> {
     log("[Block] Initializing block device driver...\n");
 
-    // Find virtio-blk device
-    let mut found_device: Option<VirtioBlockDevice> = None;
-
-    for (i, &addr) in VIRTIO_MMIO_ADDRS.iter().enumerate() {
-        // SAFETY: Reading from MMIO registers at known QEMU virt machine addresses
-        let device_id = unsafe { core::ptr::read_volatile((addr + 0x008) as *const u32) };
-        if device_id != VIRTIO_DEVICE_ID_BLK {
-            continue;
-        }
-
+    // Find virtio-blk device. `probe_with` keeps scanning if a matching slot
+    // fails to yield a working device, which is what the hand-rolled loop did.
+    let found_device = probe::probe_with(probe::device_id::BLOCK, |i, transport| {
         log("[Block] Found virtio-blk at slot ");
-        crate::safe_print!(32, "{}\n", i);
+        crate::vprint!(32, "{}\n", i);
 
-        let header_ptr = match core::ptr::NonNull::new(addr as *mut VirtIOHeader) {
-            Some(p) => p,
-            None => continue,
-        };
-
-        // SAFETY: Creating MmioTransport for verified virtio device
-        let transport = if let Ok(t) = unsafe { MmioTransport::new(header_ptr) } { t } else {
-            log("[Block] Failed to create transport\n");
-            continue;
-        };
-
-        let blk = if let Ok(b) = VirtIOBlk::<VirtioHal, MmioTransport>::new(transport) { b } else {
+        let Ok(blk) = VirtIOBlk::<VirtioHal, MmioTransport>::new(transport) else {
             log("[Block] Failed to init virtio device\n");
-            continue;
+            return None;
         };
 
         let device = VirtioBlockDevice::new(blk);
         log("[Block] Capacity: ");
-        crate::safe_print!(64, 
+        crate::vprint!(
+            64,
             "{} MB ({} sectors)\n",
             device.capacity_bytes() / 1024 / 1024,
             device.capacity_sectors()
         );
 
-        found_device = Some(device);
-        break;
-    }
+        Some(device)
+    });
 
     let device = found_device.ok_or(BlockError::NotFound)?;
 
@@ -332,5 +300,5 @@ pub fn write_bytes(offset: u64, buf: &[u8]) -> Result<(), BlockError> {
 // ============================================================================
 
 fn log(msg: &str) {
-    console::print(msg);
+    crate::print::print_str(msg);
 }

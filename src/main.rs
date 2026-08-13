@@ -20,13 +20,11 @@ extern crate alloc;
 
 mod akuma;
 mod allocator;
-mod audio;
 // mod async_net;
 #[cfg(kernel_tests)]
 mod async_tests;
 #[cfg(kernel_bkl_profile)]
 mod bkl_profile;
-mod block;
 mod boot;
 mod config;
 #[macro_use]
@@ -58,7 +56,6 @@ mod process_tests;
 mod pthread_tests;
 #[cfg(feature = "sc-framebuffer")]
 mod ramfb;
-mod rng;
 #[cfg(feature = "rump")]
 mod rump_proxy;
 #[cfg(all(
@@ -78,8 +75,12 @@ mod syscall;
 #[cfg(kernel_tests)]
 mod tests;
 mod timer;
+
+// The virtio drivers moved to `akuma-virtio` together with the `Hal` and the
+// MMIO probe loop they shared (docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md
+// Phase 3). Re-bound here so existing `crate::block::…` paths still resolve.
+pub(crate) use akuma_virtio::{audio, block, rng};
 mod vfs;
-mod virtio_hal;
 
 use core::sync::atomic::AtomicU64;
 
@@ -1212,21 +1213,10 @@ fn run_async_main() -> ! {
     // =========================================================================
     console::print("\n--- Network Initialization ---\n");
 
-    // Initialize the akuma-net networking stack
-    let mmio_addrs: [usize; 8] = [
-        mmu::DEV_VIRTIO_VA,
-        mmu::DEV_VIRTIO_VA + 0x200,
-        mmu::DEV_VIRTIO_VA + 0x400,
-        mmu::DEV_VIRTIO_VA + 0x600,
-        mmu::DEV_VIRTIO_VA + 0x800,
-        mmu::DEV_VIRTIO_VA + 0xa00,
-        mmu::DEV_VIRTIO_VA + 0xc00,
-        mmu::DEV_VIRTIO_VA + 0xe00,
-    ];
+    // Initialize the akuma-net networking stack. The MMIO slot table lives in
+    // `akuma_virtio::VIRTIO_MMIO_ADDRS` now — this used to be a fifth copy of it.
     if let Err(e) = akuma_net::init(
         akuma_net::NetRuntime {
-            virt_to_phys: mmu::virt_to_phys,
-            phys_to_virt: |pa| mmu::phys_to_virt(pa),
             uptime_us: timer::uptime_us,
             utc_seconds: timer::utc_seconds,
             yield_now: threading::yield_now,
@@ -1238,7 +1228,6 @@ fn run_async_main() -> ! {
             rng_fill: |buf| rng::fill_bytes(buf).expect("RNG required for networking"),
             current_thread_id: || threading::current_thread_id() as u32,
         },
-        &mmio_addrs,
         config::ENABLE_DHCP,
     ) {
         console::print("[Net] Network init failed: ");
