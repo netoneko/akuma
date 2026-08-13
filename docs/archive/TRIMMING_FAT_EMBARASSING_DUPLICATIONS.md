@@ -11,9 +11,11 @@ deleted code has no `unsafe` in it.
 **This doc tracks.** It is a live work list, not a frozen investigation — unlike
 its neighbours in `archive/`, update it as phases land.
 
-**Progress: Phases 0, 1, 2a, 2b and 3 all done (2026-08-13). Phase 4
-(trait-impl clusters) is next — but read §5.55 before starting it.** See §8.5
-for per-item status.
+**Progress: Phases 0, 1, 2a, 2b, 3 and 4 rungs 1–2 done (2026-08-13). Phase 4 is
+in progress: `akuma-primitives` exists and owns `OnceCopy` + the console
+primitives; rungs 3–5 (DAIF, the clock hook, the thread-slot table +
+`PreemptGuard`) are next.** See §8.5 for per-item status, and §5.55 for the
+five-rung plan and why it is ordered that way.
 
 **~~Known blocker, owned by no phase:~~ FIXED 2026-08-13.** ssh sessions died
 instantly on the extreme-size profile, blocking
@@ -431,6 +433,12 @@ both axes is the point; neither subsumes the other.
 
 ## 5.55 Primitives that want a leaf crate
 
+> **Status: decided and started, 2026-08-13.** `crates/akuma-primitives` exists —
+> no dependencies, `core` only. Rungs 1 and 2 have landed; the plan, the
+> corrections to the analysis below, and the measurements are in **§5.555**.
+> The short version: the table *can* move, but three smaller things had to move
+> first, and most of the actual duplication turned out to be in those three.
+
 §5.5 catalogues duplicated trait impls. This is a different cut through some of
 the same evidence, and it has a single cause worth naming:
 
@@ -478,6 +486,204 @@ ext2 needs `OnceCopy` *and* `PreemptGuard`, and `PreemptGuard` is Tier B. The
 guard is the long pole for the whole untangling, so if this is ever picked up,
 start by deciding what happens to the thread-slot table — not by moving the easy
 four.
+
+## 5.555 `akuma-primitives`: the decision, and rungs 1–2 (2026-08-13)
+
+§5.55 ends with "if this is ever picked up, start by deciding what happens to the
+thread-slot table — not by moving the easy four." That was the right instruction
+and it produced the wrong-sounding answer: **the table can move, but only after
+three smaller things move first, and those three are where most of the real
+duplication was.** Hence five rungs, ordered so each unblocks the next.
+
+`crates/akuma-primitives` depends on **nothing but `core`**, by rule. Where a
+primitive needs something only the kernel has — a console, a clock — it takes it
+as a boot-registered `OnceCopy` hook and **degrades** when unregistered rather
+than panicking. That property is what each of the copies below was hand-rolling.
+
+| Rung | Contents | Status |
+|---|---|---|
+| 1 | `OnceCopy<T>` | **DONE** |
+| 2 | console hook + one `StackWriter` + one `FmtBuf` + one `safe_print!` | **DONE** |
+| 3 | DAIF: `irq_save_mask`/`irq_restore` + one `IrqGuard` | next |
+| 4 | the clock hook (`OnceCopy<fn() -> u64>`) | |
+| 5 | `MAX_THREADS`, the tid **read**, `PREEMPTION_DISABLED*`, `PreemptGuard` | frees `akuma-ext2` |
+| 6 | the identity `virt_to_phys`/`phys_to_virt` (+ maybe `DEV_VIRTIO_VA`) | frees `akuma-virtio`, and only then `akuma-net` |
+
+### The payoff is measurable, and §5.55 stated it as a hope
+
+§5.55 said Tier A "does not achieve" the untangling and named `PreemptGuard` the
+long pole. Both true, and the size of the pole is now exact:
+
+- **`akuma-net`'s entire *direct* dependency on `akuma-exec` is one line** —
+  `pub use akuma_exec::sync::PreemptGuard;` at `akuma-net/src/runtime.rs:50`.
+  Every other `akuma_exec` mention in that crate is a comment.
+- **`akuma-ext2`'s is three references to two symbols** — `OnceCopy`
+  (`ext2.rs:48`; rung 1 moved the definition, so this is now just an import to
+  repoint) and `PreemptGuard` (`:579`, `:601`).
+
+> **Read `cargo tree`, not just the import list.** The first draft of this
+> section claimed rung 5 frees *both* crates. It frees **one**. `akuma-net`
+> depends unconditionally on `akuma-virtio`, and `akuma-virtio` depends on
+> `akuma-exec` — so `akuma-net → akuma-virtio → akuma-exec` survives deleting
+> `runtime.rs:50` and `akuma-exec` stays in its build regardless. Counting
+> `use` statements measures *coupling*; only the dependency graph measures what
+> gets compiled, and the whole point of §5.55 was compile cost.
+
+So rung 5 frees **`akuma-ext2`** (its remaining deps are `akuma-vfs` +
+`spinning_top`) and cuts `akuma-net`'s direct edge without changing what it
+builds.
+
+**Rung 6, if `akuma-net` is wanted too.** After rung 5, `akuma-virtio`'s entire
+remaining need is three `mmu` items: `virt_to_phys`, `phys_to_virt` and
+`DEV_VIRTIO_VA`. Both translators are literally the identity
+(`mmu/mod.rs:171-178`, `#[inline(always)]`), which is what made Phase 3's "either
+home was viable" note true. The constraint to respect: Phase 3 **deliberately
+deleted** the indirection over them — `NetRuntime`'s function pointers cost "a
+spinlocked struct read on the per-packet DMA path to reach two identity
+functions" — so rung 6 must move them as plain inline fns with an `akuma-exec`
+re-export, never as hooks. That relocates the identity-map assumption into the
+leaf crate rather than introducing it. `DEV_VIRTIO_VA` is the weaker half of the
+case: the `DEV_*_VA` layout is the L0[1] device mapping, genuinely `mmu`'s
+business, and may be better passed in than moved.
+
+### Rung 5's blocker, restated precisely
+
+`PreemptGuard::new()` → `threading::disable_preemption()`, which indexes
+`PREEMPTION_DISABLED[tid]` by `get_current_thread_register()` and maintains two
+diagnostic arrays beside it. What a leaf crate needs before that can move:
+
+1. **A console** — `get_current_thread_register` `safe_print!`s a `[FATAL]
+   TPIDRRO_EL0 CORRUPT` line and halts (`threading/mod.rs:886`), and
+   `check_preemption_watchdog` prints. Rung 2.
+2. **A clock** — the *only* reason `disable_preemption` touches `runtime()` is a
+   diagnostic timestamp on the 0→1 transition (`threading/mod.rs:1856`), and it
+   already degrades to `0` when unregistered. Rung 4. This is **not** the
+   callback `sync.rs` deliberately removed: that one dispatched the guard's own
+   operation, so it had to work during early boot; this reads a clock,
+   conditionally, for a log line.
+3. **IRQ masking** — `irq_save_mask`/`irq_restore`. Rung 3.
+
+The clean seam is **read vs write of `TPIDRRO_EL0`**. The read
+(`get_current_thread_register`) is a bounds-checked `mrs` and moves. The write
+(`set_current_thread_register`) does **not**: it also re-points the per-core BKL
+attribution cache (`load_thread_tag_to_core`, `threading/mod.rs:907`), which is
+scheduler state. `scrub_thread_slot`'s three preemption stores (`:984-986`)
+become a call into the leaf crate; `threading` re-exports everything so no call
+site moves.
+
+### What rung 2 actually found: not four writers, not five — five *and three macros*
+
+§5.5 counted four stack writers, §5.55 corrected it to five. Both undercounted,
+because they counted *writers* and the duplication was in the **macro** on top:
+
+| copy | sink |
+|---|---|
+| `src/console.rs:251` `safe_print!` + `:205` `StackWriter<N>` | `console::print` |
+| `akuma-exec` `threading/mod.rs:68` `safe_print!` + `:35` `StackWriter<N>` | `runtime().print_str` |
+| `akuma-virtio` `print.rs:24` `vprint!` | `runtime().print_str`, guarded |
+| `akuma-exec` `process/mod.rs:89` `FmtBuf<'a>` | caller's buffer |
+| `akuma-exec` `process/children.rs:1039` `LazyDebugWriter<N>` | `runtime().print_str` |
+| `akuma-exec` `mmu/mod.rs:340` `Buf<'a>` (function-local) | `runtime().print_str` |
+
+Three copies of the same six-line macro, and two `StackWriter<N>`s **with the
+same name in different crates** — which is how the second stayed hidden, exactly
+as §5.55 predicted for that pair.
+
+`akuma-virtio/src/print.rs` deserves quoting, because it is §5.55's diagnosis
+written by the duplicate itself: *"A library crate cannot reach that macro, and
+the obvious substitute — `log::info!` … is not one."* It then reproduces
+`safe_print!`'s contract in full. It is deleted now; there is a leaf crate that
+can hold the macro.
+
+**Result: five writers → two shapes, three macros → one.**
+`StackWriter<N>` owns its buffer; `FmtBuf<'a>` borrows the caller's (kept
+because `[PSTATS]`'s top-N line builds two side by side in one stack frame).
+`tprint!` stays in the bin crate on purpose — its `[T<secs>.<cs>]` stamp comes
+from `crate::timer::uptime_us()`, and rung 2 has no clock yet.
+
+### The one real behaviour change, and where it was dangerous
+
+The `akuma-exec` writers called `(runtime().print_str)(s)` directly, which
+**panics** if unregistered. The shared `print_str` is a no-op instead —
+`akuma-virtio` already guarded that way, and this makes its caution the rule.
+Strictly safer, except in one direction that mattered:
+
+`akuma_exec::init` is at `src/main.rs:754`. Everything between the kernel's Rust
+entry (`rust_start`, `:151`) and there prints — DTB scan, memory detection, MMU
+and heap bring-up, the layout assertions — and **all of it would have been
+silently swallowed** if the bin crate's 1,405 `safe_print!` sites had waited for
+that registration. So `rust_start` installs the hook as its **first statement**,
+before any output at all. `console::print` needs no initialisation (a const MMIO
+base and a volatile store), so there is nothing to order it after, and
+`OnceCopy::set` ignores the later duplicate from `init`. Verified in the boot
+log: `Akuma Kernel starting…`, `Kernel binary: …`, the `WARNING: Kernel is within
+4MB of stack!` line and the whole `=== Memory Layout ===` block are all present,
+and every one of them is pre-`init`.
+
+Call sites did not move. `#[macro_use] extern crate akuma_primitives;` in
+`main.rs` reproduces what `#[macro_use] mod console;` did for the bare
+`safe_print!(…)` spelling, and a `pub use` at the crate root covers the
+`crate::safe_print!(…)` spelling; both were in use. In `akuma-exec`,
+`threading/mod.rs`'s ~39 bare calls needed one `use crate::safe_print;` because
+they used to resolve to a `macro_rules!` a few lines below them.
+
+### CPD scores this phase at 6%, and that is the finding
+
+Whole-tree CPD at 50 tokens, before and after — a `git worktree` at `HEAD`
+against the working tree, so it is a controlled A/B and not a recollection:
+
+| | blocks | duplicated lines |
+|---|---:|---:|
+| before | 434 | 4,856 |
+| after | **433** | **4,848** |
+
+**One block. Eight lines.** That block is the `flush()` body shared by
+`threading::StackWriter` and `LazyDebugWriter` — the only two of the six copies
+that were byte-identical anywhere. The other ~120 lines of the cluster differ by
+type name, field name, and `N` versus `self.buf.len()`, so CPD never saw them.
+
+This is §1 and §6's caveat turned into a controlled measurement rather than two
+worked examples: **on the Type-2 axis, CPD measured 6% of what was there.** The
+practical consequence for the rest of Phase 4 is that CPD is the wrong
+instrument for it — count code lines and count *definitions*, and do not expect
+the §9 baseline to move.
+
+Code lines (non-blank, non-comment): the 14 touched files go **9,943 → 9,721,
+−222**; the new crate adds **127** non-test lines. **Net −95**, plus **113 lines
+of tests the five writers never had** (truncation, mid-codepoint UTF-8 that
+would make a naive `as_str` panic, the unregistered-hook no-op, two `FmtBuf`s
+sharing one buffer).
+
+### Verification
+
+`cargo clippy --release` and `--profile extreme-size --no-default-features
+--features no-tests,smoltcp,extreme,userspace-sshd` both warning-clean. **421
+host tests green** (414 before; +12 new in `akuma-primitives`, −5 as `OnceCopy`'s
+moved with it). QEMU `MEMORY=2048`: 94 `[PASS]`, failure set identical to a clean
+tree (`retired_reclaim_ab` only — §8.5 Phase 0's known-bad threshold), and
+`ssh` `uname -a` / `busybox echo` / `tcc -v` all fine.
+
+Every rewired sink confirmed live in one boot, which matters because Phase 3
+already showed how quietly console output can vanish:
+
+| path | evidence in the log |
+|---|---|
+| bin crate, pre-`init` | `Akuma Kernel starting…` + `=== Memory Layout ===` |
+| bin crate `tprint!` | 122 `[T<n>.<n>]` lines |
+| `akuma-exec` `threading` | 631 `[Cleanup]` lines |
+| `as_trace` → `print_args::<160>` | 348 `[AS-NEW]`/`[AS-FREE]`/`[AS-EXEC]`/`[AS-DEFER]` |
+| `FmtBuf` (two into one buffer) | the `[PSTATS]` top-N syscall lines |
+| `akuma-virtio` (was `vprint!`) | `[RNG] Found virtio-rng at slot 2`, `[Block] Capacity: 3072 MB`, `[SND]` |
+
+That last row is the one Phase 3 warned about: following `akuma-net`'s `log::`
+pattern would have deleted those lines silently, since every crate pins `log`
+with `max_level_off` and no logger is ever registered.
+
+**Found and not fixed:** `src/console.rs`'s `print_dec` (`:160`) and `print_u64`
+(`:180`) are a genuine 21-line / 82-token Type-1 clone — CPD has always reported
+it — differing only in `usize` vs `u64`. Untouched here because it is unrelated
+to the writer cluster. It is a Phase 6 one-liner (`print_u64` delegating, or one
+generic over `Into<u64>`).
 
 ## 5.6 Case study: the CoW refcount underflow (2026-08-12)
 
@@ -639,7 +845,7 @@ ELF-loading path into one.
 | 7 | `rump_proxy.rs` / `akuma-rump` `sysproxy.rs` | ~23 | small | low |
 | 8 | `mmu/mod.rs` `map_user_page` / `_no_flush` and the three walk clones | ~80 | medium | **high** — see `UNSAFE_AUDIT.md` §5.1 |
 | 9 | Test-file clones (`tests.rs`, `process_tests.rs`) | ~669 | medium | low |
-| 10 | Trait-impl clusters (§5.5): `ClientMem`/`NoMem` across crates, duplicate `IrqGuard`, BKL guard family → one generic guard, `impl_display!` macro, duplicate `MultiPollFuture` | ~180 | small–medium | low |
+| 10 | Trait-impl clusters (§5.5): `ClientMem`/`NoMem` across crates, duplicate `IrqGuard`, BKL guard family → one generic guard, `impl_display!` macro, duplicate `MultiPollFuture`. **In progress — `akuma-primitives` rungs 1–2 done (§5.555); the `~180` is the wrong metric, see there** | ~180 | small–medium | low |
 
 Items 1–3 are ~190 lines for an afternoon, and item 1 is the same work as
 `UNSAFE_AUDIT.md`'s tier A — do it once, count it twice.
@@ -1066,17 +1272,30 @@ HTTPS (the latter exercising the moved RNG through the TLS handshake),
   the in-VM self-host build; the runbook's vendored `--offline` route is
   unaffected.
 
-### Phase 4 — trait-impl clusters (§5.5, ≈ −180 lines)
+### Phase 4 — trait-impl clusters (§5.5) — IN PROGRESS
 
-`ClientMem`/`NoMem` duplicated across two crates; the duplicate `IrqGuard`; the
-BKL guard family → one generic guard; an `impl_display!` macro for the error
-enums; the twice-defined `MultiPollFuture`. Spread across `akuma-net`,
-`akuma-rump`, `akuma-ext2` and `src/syscall/` — low contention.
+**Read §5.555**, which is the plan of record: `akuma-primitives` exists, rungs 1
+(`OnceCopy`) and 2 (one console hook, one `StackWriter`, one `FmtBuf`, one
+`safe_print!`) have landed, and rungs 3–5 are what remains of the blocked half.
 
-**Read §5.55 first.** Several of these are not "merge two impls" but "there is
-no crate these can live in" — including the five stack writers, which §5.5
-undercounted at four. Merging them in place without deciding on
-`akuma-primitives` just moves the copy around.
+**§5.5's "≈ −180 lines" is not the right target and never was.** Rung 2 removed
+five writers and three macro copies for a **net −95** code lines, because a leaf
+crate that has to *earn* its console (a registered hook, degrading when
+unregistered) is 127 lines of new seam. Same failure mode as §3's estimates for
+Phase 2a (3× optimistic) and 2b (1.6×), one step further: when the point of the
+work is to build a seam, the seam is most of what you "save". Judge Phase 4 by
+definitions collapsed and dependency edges cut, not by line count — and do not
+expect CPD to register it at all (§5.555 measured 6%).
+
+Still open on the **unblocked** half — none of these need a new crate, and all
+four are mop-up once rungs 3–5 settle the hard part:
+
+| Item | Why it is unblocked |
+|---|---|
+| `impl_display!` for `BlockError`/`RngError`/`AudioError` | Phase 3 collected all three into `akuma-virtio`; it is now an intra-crate macro |
+| BKL guard family → one generic guard | 4 of the 5 (`Net`/`Mm`/`Vfs`/`Driver`) are in `src/syscall/`; only `ProcessBklGuard` is in `akuma-exec` |
+| twice-defined `MultiPollFuture` | both copies are in `src/tests.rs` (`:2663`, `:9182`) |
+| `ClientMem`/`NoMem` across two crates | needs `ClientMem`'s home settled (`src/rump_proxy.rs` vs `akuma-rump`), not `akuma-primitives` |
 
 ### Phase 5 — the user-copy sweep (−167 `unsafe`, 19% of the tree)
 

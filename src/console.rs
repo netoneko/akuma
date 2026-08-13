@@ -1,6 +1,5 @@
 use crate::alloc::string::ToString;
 use alloc::vec::Vec;
-use core::fmt::Write;
 #[cfg(kernel_console_lock)]
 use core::sync::atomic::{AtomicU8, Ordering};
 #[cfg(kernel_console_lock)]
@@ -201,63 +200,24 @@ pub fn print_u64(n: u64) {
 // ============================================================================
 
 /// A stack-allocated buffer for formatting without heap allocation.
-/// Use with `core::fmt::Write`.
-pub struct StackWriter<const N: usize> {
-    buf: [u8; N],
-    pos: usize,
-}
-
-impl<const N: usize> StackWriter<N> {
-    /// Create a new stack writer with the given buffer size
-    pub const fn new() -> Self {
-        Self {
-            buf: [0; N],
-            pos: 0,
-        }
-    }
-
-    /// Get the formatted string (returns empty on invalid UTF-8)
-    pub fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.buf[..self.pos]).unwrap_or("")
-    }
-
-    /// Print the buffer contents to console and clear
-    pub fn flush(&mut self) {
-        print(self.as_str());
-        self.pos = 0;
-    }
-}
-
-impl<const N: usize> Write for StackWriter<N> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let remaining = self.buf.len() - self.pos;
-        let to_copy = bytes.len().min(remaining);
-        self.buf[self.pos..self.pos + to_copy].copy_from_slice(&bytes[..to_copy]);
-        self.pos += to_copy;
-        // Don't return error on truncation - just truncate silently for safety
-        Ok(())
-    }
-}
-
-/// Safe formatting macro that writes to a stack buffer and prints.
-/// Unlike `format!`, this cannot panic from allocation failures.
 ///
-/// Usage:
-/// ```
-/// safe_print!(64, "[Thread0] loop={} | zombies={}\n", counter, zombies);
-/// ```
-#[macro_export]
-macro_rules! safe_print {
-    ($size:expr, $($arg:tt)*) => {{
-        use core::fmt::Write;
-        let mut writer = $crate::console::StackWriter::<$size>::new();
-        let _ = write!(writer, $($arg)*);
-        writer.flush();
-    }};
-}
+/// Re-exported from `akuma_primitives::console`, which now owns the tree's one
+/// copy — this crate's was one of five, and its `safe_print!` one of three (see
+/// that module's header). Kept as a re-export so `console::StackWriter::<N>` and
+/// `tprint!` below resolve unchanged.
+///
+/// One behavioural note: this version's `flush` called [`print`] directly, while
+/// the shared one goes through a registered hook. `rust_start` installs
+/// [`print`] as that hook before its own first output, so the two are the same
+/// function from the first instruction onward — and an unregistered hook
+/// discards rather than panicking, which is strictly safer than what the
+/// `akuma-exec` copies did.
+pub use akuma_primitives::console::StackWriter;
 
-/// Like safe_print but prepends a `[T<secs>.<cs>]` uptime timestamp.
+/// Like `safe_print!` but prepends a `[T<secs>.<cs>]` uptime timestamp.
+///
+/// Stays in this crate rather than moving to `akuma-primitives`: the timestamp
+/// comes from `crate::timer::uptime_us()`, and a leaf crate has no clock.
 #[macro_export]
 macro_rules! tprint {
     ($size:expr, $($arg:tt)*) => {{

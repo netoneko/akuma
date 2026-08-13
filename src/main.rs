@@ -18,6 +18,20 @@
 
 extern crate alloc;
 
+/// Brings `safe_print!` into textual scope for the whole crate, which is exactly
+/// what `#[macro_use] mod console;` did for it when this crate owned a copy of
+/// the macro. The definition now lives in `akuma_primitives::console` — one for
+/// the tree instead of three (see that module's header). 1,405 call sites in
+/// `src/` are unchanged.
+#[macro_use]
+extern crate akuma_primitives;
+
+/// …and this puts it in the crate root's *path* namespace, for the call sites
+/// that spell it `crate::safe_print!`. Both spellings are in use across `src/`
+/// and both worked before, because `#[macro_export]` on a crate-root
+/// `macro_rules!` provides each.
+pub use akuma_primitives::safe_print;
+
 mod akuma;
 mod allocator;
 // mod async_net;
@@ -149,6 +163,19 @@ unsafe extern "C" {
 /// Minimal unsafe entry point - immediately delegates to safe kernel_main
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
+    // FIRST statement in the kernel's Rust entry, before any output at all: point
+    // the shared `safe_print!` at the PL011.
+    //
+    // Why here and not in `akuma_exec::init` (which also registers it, from the
+    // same `ExecRuntime::print_str = console::print`): that call is at
+    // `kernel_main`'s line ~754, and everything between here and there —
+    // DTB scan, memory detection, the MMU and heap bring-up, the layout
+    // assertions — prints. Registering there would have silently swallowed all
+    // of it, because the shared macro discards when unregistered. `console::print`
+    // needs no initialisation (a const MMIO base and a volatile store), so there
+    // is nothing to order this after. `OnceCopy::set` ignores the later duplicate.
+    akuma_primitives::console::set_print_hook(console::print);
+
     // Early debug: print raw DTB pointer before anything else
     console::print("DTB ptr from boot (x0 arg): 0x");
     console::print_hex(dtb_ptr as u64);

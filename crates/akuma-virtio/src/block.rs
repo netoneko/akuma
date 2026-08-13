@@ -106,13 +106,13 @@ impl VirtioBlockDevice {
     /// * `buf` - Buffer to read into (must be a multiple of SECTOR_SIZE)
     pub fn read_sectors(&self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         if !buf.len().is_multiple_of(SECTOR_SIZE) {
-            crate::vprint!(96, "[Block] read_sectors: buf len {} not sector-aligned\n", buf.len());
+            crate::safe_print!(96, "[Block] read_sectors: buf len {} not sector-aligned\n", buf.len());
             return Err(BlockError::InvalidOffset);
         }
 
         let num_sectors = buf.len() / SECTOR_SIZE;
         if sector + num_sectors as u64 > self.capacity_sectors {
-            crate::vprint!(96, "[Block] read_sectors: sector {}+{} > capacity {}\n",
+            crate::safe_print!(96, "[Block] read_sectors: sector {}+{} > capacity {}\n",
                 sector, num_sectors, self.capacity_sectors);
             return Err(BlockError::InvalidOffset);
         }
@@ -120,7 +120,7 @@ impl VirtioBlockDevice {
         let inner = self.inner_mut();
 
         if let Err(e) = inner.read_blocks(sector as usize, buf) {
-            crate::vprint!(96, "[Block] read_blocks FAILED: sector={}, len={}, err={:?}\n",
+            crate::safe_print!(96, "[Block] read_blocks FAILED: sector={}, len={}, err={:?}\n",
                 sector, buf.len(), e);
             return Err(BlockError::ReadError);
         }
@@ -135,13 +135,13 @@ impl VirtioBlockDevice {
     /// * `buf` - Buffer to write from (must be a multiple of SECTOR_SIZE)
     pub fn write_sectors(&self, sector: u64, buf: &[u8]) -> Result<(), BlockError> {
         if !buf.len().is_multiple_of(SECTOR_SIZE) {
-            crate::vprint!(96, "[Block] write_sectors: buf len {} not sector-aligned\n", buf.len());
+            crate::safe_print!(96, "[Block] write_sectors: buf len {} not sector-aligned\n", buf.len());
             return Err(BlockError::InvalidOffset);
         }
 
         let num_sectors = buf.len() / SECTOR_SIZE;
         if sector + num_sectors as u64 > self.capacity_sectors {
-            crate::vprint!(96, "[Block] write_sectors: sector {}+{} > capacity {}\n",
+            crate::safe_print!(96, "[Block] write_sectors: sector {}+{} > capacity {}\n",
                 sector, num_sectors, self.capacity_sectors);
             return Err(BlockError::InvalidOffset);
         }
@@ -149,7 +149,7 @@ impl VirtioBlockDevice {
         let inner = self.inner_mut();
 
         if let Err(e) = inner.write_blocks(sector as usize, buf) {
-            crate::vprint!(96, "[Block] write_blocks FAILED: sector={}, len={}, err={:?}\n",
+            crate::safe_print!(96, "[Block] write_blocks FAILED: sector={}, len={}, err={:?}\n",
                 sector, buf.len(), e);
             return Err(BlockError::WriteError);
         }
@@ -242,7 +242,7 @@ pub fn init() -> Result<(), BlockError> {
     // fails to yield a working device, which is what the hand-rolled loop did.
     let found_device = probe::probe_with(probe::device_id::BLOCK, |i, transport| {
         log("[Block] Found virtio-blk at slot ");
-        crate::vprint!(32, "{}\n", i);
+        crate::safe_print!(32, "{}\n", i);
 
         let Ok(blk) = VirtIOBlk::<VirtioHal, MmioTransport>::new(transport) else {
             log("[Block] Failed to init virtio device\n");
@@ -251,7 +251,7 @@ pub fn init() -> Result<(), BlockError> {
 
         let device = VirtioBlockDevice::new(blk);
         log("[Block] Capacity: ");
-        crate::vprint!(
+        crate::safe_print!(
             64,
             "{} MB ({} sectors)\n",
             device.capacity_bytes() / 1024 / 1024,
@@ -300,5 +300,5 @@ pub fn write_bytes(offset: u64, buf: &[u8]) -> Result<(), BlockError> {
 // ============================================================================
 
 fn log(msg: &str) {
-    crate::print::print_str(msg);
+    akuma_primitives::console::print_str(msg);
 }

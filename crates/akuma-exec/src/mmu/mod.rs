@@ -337,22 +337,11 @@ fn asid_exhausted_warn() {
 /// stuck core's TTBR0 (ASID + L0 physical), and these lines are what link that
 /// L0 back to a pid and a teardown path in the console log.
 pub(crate) fn as_trace(args: core::fmt::Arguments) {
-    struct Buf<'a> { buf: &'a mut [u8], pos: &'a mut usize }
-    impl core::fmt::Write for Buf<'_> {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let bytes = s.as_bytes();
-            let n = core::cmp::min(bytes.len(), self.buf.len() - *self.pos);
-            self.buf[*self.pos..*self.pos + n].copy_from_slice(&bytes[..n]);
-            *self.pos += n;
-            Ok(())
-        }
-    }
-    let mut buf = [0u8; 160];
-    let mut pos = 0usize;
-    let _ = core::fmt::write(&mut Buf { buf: &mut buf, pos: &mut pos }, args);
-    if let Ok(s) = core::str::from_utf8(&buf[..pos]) {
-        (runtime().print_str)(s);
-    }
+    // Was a fifth function-local copy of the stack writer. `print_args` is the
+    // `Arguments`-shaped entry point to the shared one — this helper takes
+    // pre-built `Arguments` rather than being a macro, so it can't use
+    // `safe_print!` directly.
+    akuma_primitives::console::print_args::<160>(args);
 }
 
 // ===== Per-core live-TTBR0 registry =====

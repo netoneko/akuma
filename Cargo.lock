@@ -10,6 +10,7 @@ dependencies = [
  "akuma-ext2",
  "akuma-isolation",
  "akuma-net",
+ "akuma-primitives",
  "akuma-rump",
  "akuma-terminal",
  "akuma-vfs",
@@ -28,6 +29,7 @@ name = "akuma-exec"
 version = "0.1.0"
 dependencies = [
  "akuma-isolation",
+ "akuma-primitives",
  "akuma-terminal",
  "elf",
  "embedded-io-async",
@@ -68,6 +70,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-primitives"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-rump"
 version = "0.1.0"
 
@@ -90,6 +96,7 @@ name = "akuma-virtio"
 version = "0.1.0"
 dependencies = [
  "akuma-exec",
+ "akuma-primitives",
  "spinning_top",
  "virtio-drivers",
 ]

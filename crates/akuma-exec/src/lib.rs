@@ -106,6 +106,12 @@ pub mod kernel_tests;
 
 pub use runtime::{ExecRuntime, ExecConfig, PhysFrame, FrameSource};
 
+/// The tree's one heap-free print macro, re-exported so this crate's ~66
+/// existing `crate::safe_print!(…)` call sites resolve unchanged. The
+/// definition, and the census of the copies it replaced, are in
+/// `akuma_primitives::console`.
+pub use akuma_primitives::safe_print;
+
 /// Initialize the exec subsystem.
 ///
 /// # Arguments

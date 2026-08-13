@@ -1,0 +1,12 @@
+[package]
+name = "akuma-primitives"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+# No dependencies, by design. This is the leaf every other crate may depend on,
+# so anything added here is added to the whole tree's dependency closure. If a
+# primitive needs a crate, it does not belong here.
+[dependencies]

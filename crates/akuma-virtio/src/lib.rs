@@ -13,7 +13,6 @@
 extern crate alloc;
 
 pub mod hal;
-pub mod print;
 pub mod probe;
 
 // The virtio-mmio device drivers. These lived in the kernel bin crate until they
@@ -25,7 +24,10 @@ pub mod audio;
 pub use hal::VirtioHal;
 pub use probe::{VIRTIO_MMIO_ADDRS, device_id};
 
-// Re-exported so the `vprint!` macro expands to a path that works in every
-// consumer without each one having to depend on `akuma-exec` directly.
-#[doc(hidden)]
-pub use akuma_exec::process::FmtBuf;
+/// The tree's one heap-free print macro, re-exported so this crate's
+/// `crate::safe_print!(…)` call sites resolve.
+///
+/// This crate used to carry its own copy as `print::vprint!` — because, as that
+/// module's header put it, "a library crate cannot reach that macro". There is
+/// now a leaf crate that can hold it, so the copy is gone.
+pub use akuma_primitives::safe_print;

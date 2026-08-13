@@ -1,57 +1,12 @@
 #![allow(clippy::missing_safety_doc)]
 
-use core::cell::UnsafeCell;
-use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, Ordering};
-
-/// Single-shot, lock-free cell for `Copy` types.
+/// Single-shot, lock-free cell for boot-registered `Copy` values.
 ///
-/// Set once at init, then read freely from any context (including IRQ
-/// handlers). No spinlock — readers must never block on writers, because
-/// reading `RUNTIME`/`CONFIG` from inside an IRQ that interrupted code
-/// holding the same lock would self-deadlock on a single CPU.
-///
-/// Public so other crates registering kernel callbacks at boot get the same
-/// guarantee instead of re-deriving it: `akuma-ext2`'s thread hooks use it.
-pub struct OnceCopy<T: Copy> {
-    initialized: AtomicBool,
-    value: UnsafeCell<MaybeUninit<T>>,
-}
-
-unsafe impl<T: Copy + Send + Sync> Sync for OnceCopy<T> {}
-
-impl<T: Copy> OnceCopy<T> {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            initialized: AtomicBool::new(false),
-            value: UnsafeCell::new(MaybeUninit::uninit()),
-        }
-    }
-
-    /// Write the value. Must be called exactly once before any `get()`.
-    /// Second call is silently ignored — callers shouldn't rely on that.
-    pub fn set(&self, v: T) {
-        if self.initialized.load(Ordering::Acquire) {
-            return;
-        }
-        // SAFETY: we are the only writer (single-shot at boot); readers
-        // observe the value only after the Release store below.
-        unsafe { (*self.value.get()).write(v) };
-        self.initialized.store(true, Ordering::Release);
-    }
-
-    #[must_use]
-    pub fn get(&self) -> Option<T> {
-        if self.initialized.load(Ordering::Acquire) {
-            // SAFETY: initialized=true means the value was fully written
-            // before the Release store; T: Copy lets us read a copy.
-            Some(unsafe { (*self.value.get()).assume_init_read() })
-        } else {
-            None
-        }
-    }
-}
+/// Re-exported from `akuma-primitives`, where it now lives so that crates
+/// wanting it (`akuma-ext2`'s thread hooks) don't have to depend on the whole
+/// execution crate to get it. Kept as a re-export so existing
+/// `akuma_exec::runtime::OnceCopy` imports keep working.
+pub use akuma_primitives::OnceCopy;
 
 /// Physical page frame (mirrors kernel pmm::PhysFrame).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +194,12 @@ static CONFIG: OnceCopy<ExecConfig> = OnceCopy::new();
 pub fn register(rt: ExecRuntime, cfg: ExecConfig) {
     RUNTIME.set(rt);
     CONFIG.set(cfg);
+    // Point the shared `safe_print!` at the same sink `runtime()` hands out, so
+    // every crate's heap-free console output lights up at exactly this moment —
+    // which is when it lit up before, back when each crate's own writer called
+    // `(runtime().print_str)(…)` directly. Before this call those macros are
+    // silent rather than panicking; see `akuma_primitives::console`.
+    akuma_primitives::console::set_print_hook(rt.print_str);
 }
 
 /// Access the registered runtime. Panics if not yet registered.
@@ -312,70 +273,4 @@ impl Drop for IrqGuard {
     }
 }
 
-#[cfg(test)]
-mod once_copy_tests {
-    use super::OnceCopy;
-
-    #[test]
-    fn get_returns_none_before_set() {
-        let cell: OnceCopy<u32> = OnceCopy::new();
-        assert!(cell.get().is_none());
-    }
-
-    #[test]
-    fn get_returns_value_after_set() {
-        let cell: OnceCopy<u32> = OnceCopy::new();
-        cell.set(0xc0ffee);
-        assert_eq!(cell.get(), Some(0xc0ffee));
-    }
-
-    #[test]
-    fn second_set_is_ignored() {
-        let cell: OnceCopy<u32> = OnceCopy::new();
-        cell.set(1);
-        cell.set(2);
-        assert_eq!(cell.get(), Some(1));
-    }
-
-    #[test]
-    fn many_reads_return_same_value() {
-        let cell: OnceCopy<u64> = OnceCopy::new();
-        cell.set(0xdead_beef_cafe_babe);
-        for _ in 0..10_000 {
-            assert_eq!(cell.get(), Some(0xdead_beef_cafe_babe));
-        }
-    }
-
-    #[test]
-    fn concurrent_readers_after_set_never_block() {
-        // Lock-free contract: many threads reading concurrently must each
-        // observe the value with no spinning, no panics. If anyone ever
-        // reintroduced a Spinlock-on-read, this would still pass (no
-        // contention), but combined with the "called from IRQ" kernel
-        // test it nails down the invariant.
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::thread;
-
-        let cell: Arc<OnceCopy<u32>> = Arc::new(OnceCopy::new());
-        cell.set(42);
-
-        let hits = Arc::new(AtomicUsize::new(0));
-        let mut handles = vec![];
-        for _ in 0..8 {
-            let cell = Arc::clone(&cell);
-            let hits = Arc::clone(&hits);
-            handles.push(thread::spawn(move || {
-                for _ in 0..10_000 {
-                    if cell.get() == Some(42) {
-                        hits.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-        assert_eq!(hits.load(Ordering::Relaxed), 8 * 10_000);
-    }
-}
+// `OnceCopy`'s unit tests moved with it to `akuma-primitives::once`.

@@ -537,7 +537,7 @@ pub fn init() -> Result<(), RngError> {
         }
 
         log("[RNG] Found virtio-rng at slot ");
-        crate::vprint!(32, "{}\n", i);
+        crate::safe_print!(32, "{}\n", i);
 
         match VirtioRngDevice::new(addr) {
             Ok(mut device) => {
@@ -545,7 +545,7 @@ pub fn init() -> Result<(), RngError> {
                 let mut test_buf = [0u8; 8];
                 if let Err(e) = device.read_bytes(&mut test_buf) {
                     log("[RNG] Test read failed: ");
-                    crate::vprint!(32, "{}\n", e);
+                    crate::safe_print!(32, "{}\n", e);
                     continue;
                 }
                 log("[RNG] Test read successful\n");
@@ -557,7 +557,7 @@ pub fn init() -> Result<(), RngError> {
             }
             Err(e) => {
                 log("[RNG] Failed to init virtio device: ");
-                crate::vprint!(32, "{}\n", e);
+                crate::safe_print!(32, "{}\n", e);
             }
         }
     }
@@ -585,5 +585,5 @@ pub fn fill_bytes(buf: &mut [u8]) -> Result<(), RngError> {
 // ============================================================================
 
 fn log(msg: &str) {
-    crate::print::print_str(msg);
+    akuma_primitives::console::print_str(msg);
 }

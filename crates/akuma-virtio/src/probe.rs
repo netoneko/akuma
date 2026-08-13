@@ -111,7 +111,7 @@ pub fn probe_with<T>(
         // mapping whose DeviceID we just matched, so the transport is being
         // built over a real device of the expected kind.
         let Ok(transport) = (unsafe { MmioTransport::new(header) }) else {
-            crate::vprint!(64, "[virtio] slot {i}: device {device_id} transport init failed\n");
+            crate::safe_print!(64, "[virtio] slot {i}: device {device_id} transport init failed\n");
             continue;
         };
 

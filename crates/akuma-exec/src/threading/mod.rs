@@ -19,6 +19,10 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, 
 use spinning_top::Spinlock;
 
 use crate::runtime::{runtime, config, with_irqs_disabled, IrqGuard};
+// This module's ~39 `safe_print!` calls used to resolve to a `macro_rules!`
+// defined a few lines below them. The macro now lives in `akuma-primitives`
+// (one copy for the tree instead of three), so it needs importing.
+use crate::safe_print;
 
 /// Set the current exception stack pointer (TPIDR_EL1).
 #[cfg(target_os = "none")]
@@ -31,48 +35,10 @@ pub fn set_current_exception_stack(stack_top: u64) {
 #[inline]
 pub fn set_current_exception_stack(_stack_top: u64) {}
 
-/// Stack-based writer for formatting without heap allocation.
-pub(crate) struct StackWriter<const N: usize> {
-    buf: [u8; N],
-    pos: usize,
-}
-
-impl<const N: usize> StackWriter<N> {
-    pub(crate) const fn new() -> Self {
-        Self { buf: [0; N], pos: 0 }
-    }
-    pub(crate) fn flush(&mut self) {
-        if let Ok(s) = core::str::from_utf8(&self.buf[..self.pos]) {
-            (runtime().print_str)(s);
-        }
-        self.pos = 0;
-    }
-}
-
-impl<const N: usize> core::fmt::Write for StackWriter<N> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let remaining = N - self.pos;
-        let len = bytes.len().min(remaining);
-        self.buf[self.pos..self.pos + len].copy_from_slice(&bytes[..len]);
-        self.pos += len;
-        Ok(())
-    }
-}
-
-/// Crate-wide safe formatting macro (mirrors `src/console.rs`'s `safe_print!` in
-/// the kernel crate): writes to a stack buffer and prints, no heap allocation.
-/// `#[macro_export]` makes this reachable as `crate::safe_print!` from any
-/// module in this crate, not just `threading` and its descendants.
-#[macro_export]
-macro_rules! safe_print {
-    ($size:expr, $($arg:tt)*) => {{
-        use core::fmt::Write;
-        let mut writer = $crate::threading::StackWriter::<$size>::new();
-        let _ = write!(writer, $($arg)*);
-        writer.flush();
-    }};
-}
+// `StackWriter` and this crate's `safe_print!` copy both moved to
+// `akuma-primitives::console` — one writer and one macro for the whole tree
+// instead of five and three. `crate::safe_print!` still resolves: `lib.rs`
+// re-exports the macro. See that module's header for the census.
 
 // ============================================================================
 // Lock-Free Thread State Management

@@ -196,24 +196,24 @@ mod imp {
         // `probe_with` keeps scanning when a matching slot does not yield a
         // usable device, which is what the hand-rolled loop did.
         let device = probe::probe_with(probe::device_id::SOUND, |i, transport| {
-            crate::vprint!(48, "[SND] Found virtio-snd at slot {}\n", i);
+            crate::safe_print!(48, "[SND] Found virtio-snd at slot {}\n", i);
 
             let Ok(mut snd) = VirtIOSound::<VirtioHal, MmioTransport>::new(transport) else {
-                crate::print::print_str("[SND] Failed to init virtio-snd device\n");
+                akuma_primitives::console::print_str("[SND] Failed to init virtio-snd device\n");
                 return None;
             };
 
             let Ok(outputs) = snd.output_streams() else {
-                crate::print::print_str("[SND] Failed to query output streams\n");
+                akuma_primitives::console::print_str("[SND] Failed to query output streams\n");
                 return None;
             };
 
             let Some(&out_stream) = outputs.first() else {
-                crate::print::print_str("[SND] No output streams advertised\n");
+                akuma_primitives::console::print_str("[SND] No output streams advertised\n");
                 return None;
             };
 
-            crate::vprint!(
+            crate::safe_print!(
                 96,
                 "[SND] jacks={} streams={} chmaps={} output_stream={}\n",
                 snd.jacks(),

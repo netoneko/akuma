@@ -1035,30 +1035,8 @@ pub fn lazy_region_lookup_for_page_fault(pid: Pid, va: usize) -> Option<(u64, La
     lazy_region_lookup_for_pid(pid, va)
 }
 
-/// Stack-local writer for visible kernel output without heap allocation.
-struct LazyDebugWriter<const N: usize> {
-    buf: [u8; N],
-    pos: usize,
-}
-impl<const N: usize> LazyDebugWriter<N> {
-    const fn new() -> Self { Self { buf: [0; N], pos: 0 } }
-    fn flush(&mut self) {
-        if let Ok(s) = core::str::from_utf8(&self.buf[..self.pos]) {
-            (runtime().print_str)(s);
-        }
-        self.pos = 0;
-    }
-}
-impl<const N: usize> core::fmt::Write for LazyDebugWriter<N> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let remaining = N - self.pos;
-        let len = core::cmp::min(bytes.len(), remaining);
-        self.buf[self.pos..self.pos + len].copy_from_slice(&bytes[..len]);
-        self.pos += len;
-        Ok(())
-    }
-}
+// `LazyDebugWriter` was a third copy of the stack writer; `lazy_region_debug`
+// below uses the shared `akuma_primitives::console::StackWriter` instead.
 
 pub fn lazy_region_debug(va: usize) {
     use core::fmt::Write;
@@ -1070,7 +1048,7 @@ pub fn lazy_region_debug(va: usize) {
     with_irqs_disabled(|| {
         let g = proc.lazy_regions.lock();
         let count = g.len();
-        let mut w = LazyDebugWriter::<256>::new();
+        let mut w = akuma_primitives::console::StackWriter::<256>::new();
         let _ = write!(w, "[DP] lazy miss: pid={} va={:#x} regions={} [", pid, va, count);
         let mut i = 0;
         g.for_each_debug(|sv, sz| {
@@ -1308,7 +1286,7 @@ pub fn update_eager_region_flags(pid: Pid, range_start: usize, range_size: usize
     });
     if let Some((reg_start, reg_len, old_flags)) = widened {
         EAGER_FLAG_WIDENED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let mut w = LazyDebugWriter::<224>::new();
+        let mut w = akuma_primitives::console::StackWriter::<224>::new();
         let _ = core::fmt::Write::write_fmt(&mut w, format_args!(
             "[MPROT-WIDEN] pid={} region=[{:#x}+{:#x}) mprotect=[{:#x}+{:#x}) old={:#x} new={:#x} \
              — {} pages outside the call are now recorded writable\n",

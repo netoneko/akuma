@@ -6,6 +6,7 @@ default-members = [
     "crates/akuma-ext2",
     "crates/akuma-isolation",
     "crates/akuma-net",
+    "crates/akuma-primitives",
     "crates/akuma-rump",
     "crates/akuma-terminal",
     "crates/akuma-vfs",
@@ -414,6 +415,8 @@ akuma-net = { path = "crates/akuma-net", default-features = false }
 # virtio Hal + MMIO probe + the block/rng/audio drivers.
 akuma-virtio = { path = "crates/akuma-virtio" }
 akuma-exec = { path = "crates/akuma-exec" }
+# The dependency-free leaf: `OnceCopy`, the one stack writer + `safe_print!`.
+akuma-primitives = { path = "crates/akuma-primitives" }
 # Kernel-side sysproxy client (rumpsp wire + Linux↔NetBSD translation); only the
 # `rump` feature needs it directly (akuma-net already pulls it for rump_tap).
 akuma-rump = { path = "crates/akuma-rump", optional = true }
