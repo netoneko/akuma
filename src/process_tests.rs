@@ -460,12 +460,11 @@ pub fn run_all_tests() {
 
     // fork_process copy math (overflow / cap helpers; see fork loop in akuma-exec)
     test_fork_page_count_for_len();
-    test_fork_brk_cap_pages_ordering();
-    // fork code_start regression: Go ARM64 binaries load below 0x400000
-    test_fork_code_start_low_va_is_covered();
-    test_fork_code_start_not_skipped_when_brk_lt_400k();
-    test_fork_code_start_large_binary_unchanged();
-    test_fork_brk_len_no_underflow_go_binary();
+    // `fork_code_start` + the brk cap ordering are now HOST tests in
+    // akuma-exec (`process::mod::fork_copy_math_tests`, 8 of them). They were
+    // five boot tests here, four of which exercised a mirror of the production
+    // expression defined in this file rather than the production code itself —
+    // see docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.11.
     // fork THREAD_PID_MAP and clone_thread CoW-safe write regressions
     test_fork_thread_pid_map_invariant();
     test_clone_thread_tid_write_cow_safe();
@@ -9037,24 +9036,14 @@ fn test_dup3_no_einval_for_valid_args() {
 fn test_oom_user_page_reserve() {
     use crate::pmm;
 
-    // Boundary predicate: deny at/below the reserve, allow one page above it.
-    assert!(pmm::user_alloc_would_starve(0),
-        "test_oom: must deny user alloc at 0 free pages");
-    assert!(pmm::user_alloc_would_starve(pmm::USER_PAGE_RESERVE),
-        "test_oom: must deny at exactly the reserve ({} pages)", pmm::USER_PAGE_RESERVE);
-    assert!(!pmm::user_alloc_would_starve(pmm::USER_PAGE_RESERVE + 1),
-        "test_oom: must allow one page above the reserve");
+    // The boundary arithmetic (`user_alloc_would_starve` / `user_readahead_budget`
+    // at 0, at the reserve, and above it) is now host-tested in
+    // `akuma_exec::memmath` — it needed no VM, and asserting it here cost a boot.
+    // What stays is the part that genuinely needs a live PMM: that the real
+    // allocator hands back a usable zeroed frame and that the reserve-exempt
+    // path still works. See docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.11.
 
-    // Readahead budget: a file-backed fault may batch at most (free - reserve)
-    // pages, so it can never drain the PMM below the kernel reserve.
-    assert_eq!(pmm::user_readahead_budget(0), 0,
-        "test_oom: zero free -> zero readahead budget");
-    assert_eq!(pmm::user_readahead_budget(pmm::USER_PAGE_RESERVE), 0,
-        "test_oom: at the reserve -> zero readahead budget");
-    assert_eq!(pmm::user_readahead_budget(pmm::USER_PAGE_RESERVE + 5), 5,
-        "test_oom: 5 pages above the reserve -> budget of 5");
-
-    // Live smoke: with ample free pages (boot suite runs at >= 32 MB) the user
+    // Live: with ample free pages (boot suite runs at >= 32 MB) the user
     // allocator returns a usable, zeroed page; free it back.
     let free = pmm::free_count();
     assert!(free > pmm::USER_PAGE_RESERVE + 1,
@@ -11850,132 +11839,14 @@ fn test_syscall_name_linux_nrs() {
     }
 }
 
-/// Sanity-check that brk span page count compares correctly to the kernel cap constant.
-/// (The cap lives in `akuma_exec::process`; we only verify ordering invariants here.)
-fn test_fork_brk_cap_pages_ordering() {
-    use akuma_exec::process::fork_page_count_for_len;
-
-    // 32 GiB of pages at 4K = 8M pages — same order as MAX_FORK_BRK_COPY_PAGES in fork_process.
-    const MIB: usize = 1024 * 1024;
-    const GIB: usize = 1024 * MIB;
-    const PAGES_32GIB: usize = (32 * GIB) / 4096;
-
-    let pages_32g = fork_page_count_for_len(32 * GIB);
-    let ok = pages_32g == Some(PAGES_32GIB)
-        && PAGES_32GIB == 8 * 1024 * 1024
-        && fork_page_count_for_len(32 * GIB + 1).is_some_and(|p| p > PAGES_32GIB);
-
-    if ok {
-        console::print("[Test] fork_brk_cap_pages_ordering PASSED\n");
-    } else {
-        crate::safe_print!(128,
-            "[Test] fork_brk_cap_pages_ordering FAILED: pages_32g={:?} expect {}\n",
-            pages_32g, PAGES_32GIB);
-    }
-}
-
-/// Helper mirroring the fork_process code_start selection logic.
-fn fork_code_start(code_end: usize) -> usize {
-    use akuma_exec::mmu::PAGE_SIZE;
-    if code_end >= 0x1000_0000 {
-        0x1000_0000
-    } else if code_end < 0x400000 {
-        PAGE_SIZE   // Go ARM64: binary loads below 4 MB
-    } else {
-        0x400000
-    }
-}
-
-/// Regression: fork code_start was 0x400000 but Go ARM64 binaries load below 4 MB
-/// (brk=0x229000).  The condition `brk > code_start` was false, so no code pages were
-/// ever shared with the child — child faulted at 0xa4600 (SIGSEGV).
-///
-/// Fix: when code_end < 0x400000, use PAGE_SIZE as the floor instead.
-fn test_fork_code_start_low_va_is_covered() {
-    use akuma_exec::mmu::PAGE_SIZE;
-
-    // Go ARM64 forktest_parent layout
-    let code_end: usize = 0x229000;
-    let crash_va: usize = 0xa4600;
-    let code_start = fork_code_start(code_end);
-
-    // code_start must be PAGE_SIZE for this binary
-    let start_ok = code_start == PAGE_SIZE;
-    // crash_va must fall within [code_start, code_end)
-    let covered = crash_va >= code_start && crash_va < code_end;
-    // documents why the old code (0x400000) skipped this range
-    let old_would_skip = code_end <= 0x400000;
-
-    if start_ok && covered && old_would_skip {
-        console::print("[Test] fork_code_start_low_va_is_covered PASSED\n");
-    } else {
-        crate::safe_print!(128,
-            "[Test] fork_code_start_low_va_is_covered FAILED: start_ok={} covered={} old_would_skip={}\n",
-            start_ok, covered, old_would_skip);
-    }
-}
-
-/// With the fix, `brk > code_start` must be true for a Go binary so the copy proceeds.
-fn test_fork_code_start_not_skipped_when_brk_lt_400k() {
-    let code_end: usize = 0x229000;
-    let brk: usize = 0x229000;
-    let code_start = fork_code_start(code_end);
-
-    if brk > code_start {
-        console::print("[Test] fork_code_start_not_skipped_when_brk_lt_400k PASSED\n");
-    } else {
-        crate::safe_print!(128,
-            "[Test] fork_code_start_not_skipped_when_brk_lt_400k FAILED: brk=0x{:x} code_start=0x{:x}\n",
-            brk, code_start);
-    }
-}
-
-/// Standard binary (0x400000 <= code_end < 0x1000_0000) must still use 0x400000.
-/// This ensures the fix doesn't regress normal musl/TCC binaries.
-fn test_fork_code_start_large_binary_unchanged() {
-    // Standard static binary (e.g. elftest) and large PIE binary
-    let cases: &[(usize, usize)] = &[
-        (0x405000, 0x400000),       // typical musl static binary
-        (0x2000_0000, 0x1000_0000), // large PIE binary
-    ];
-    let mut ok = true;
-    for &(code_end, expected) in cases {
-        let got = fork_code_start(code_end);
-        if got != expected {
-            crate::safe_print!(128,
-                "[Test] fork_code_start_large_binary_unchanged FAILED: code_end=0x{:x} expected=0x{:x} got=0x{:x}\n",
-                code_end, expected, got);
-            ok = false;
-        }
-    }
-    if ok {
-        console::print("[Test] fork_code_start_large_binary_unchanged PASSED\n");
-    }
-}
-
-/// Old code: brk=0x229000 < code_start=0x400000 → copy skipped.
-/// New code: brk > PAGE_SIZE → copy proceeds with correct non-zero brk_len.
-fn test_fork_brk_len_no_underflow_go_binary() {
-    use akuma_exec::mmu::PAGE_SIZE;
-
-    let code_end: usize = 0x229000;
-    let brk: usize = 0x229000;
-    let old_code_start: usize = 0x400000;
-    let new_code_start: usize = fork_code_start(code_end);
-
-    let old_skipped = brk <= old_code_start;
-    let new_proceeds = brk > new_code_start;
-    let brk_len = brk - new_code_start;
-    let expected_len = 0x229000usize - PAGE_SIZE;
-
-    if old_skipped && new_proceeds && brk_len == expected_len && brk_len > 0 {
-        console::print("[Test] fork_brk_len_no_underflow_go_binary PASSED\n");
-    } else {
-        crate::safe_print!(128,
-            "[Test] fork_brk_len_no_underflow_go_binary FAILED: old_skipped={} new_proceeds={} brk_len=0x{:x} expected=0x{:x}\n",
-            old_skipped, new_proceeds, brk_len, expected_len);
-    }
-}
+// `test_fork_brk_cap_pages_ordering`, the `fork_code_start` mirror helper and the
+// four `test_fork_code_start_*` / `test_fork_brk_len_no_underflow_go_binary` boot
+// tests lived here. They are now 8 HOST tests in
+// `crates/akuma-exec/src/process/mod.rs` (`fork_copy_math_tests`), run against the
+// real `akuma_exec::process::fork_code_start` — which is also now the single
+// definition both `fork_process` arms call, instead of an inline expression
+// written twice. The mirror meant these tests could not fail when production
+// drifted; see docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.11.
 
 /// Regression: fork_process was missing THREAD_PID_MAP.insert(tid, child_pid).
 /// Without it, current_process_shared() for the child thread returned the parent PID,

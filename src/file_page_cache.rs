@@ -106,14 +106,13 @@ pub fn init(total_ram_bytes: usize) {
     crate::tprint!(128, "[fpcache] shared file-page cache enabled, cap={} pages\n", cap);
 }
 
-/// Is a page mapped with `flags` shareable? True only for mappings that give EL0
-/// no write access (`AP_RO_ALL`), i.e. `user_flags::RO` and `user_flags::RX`.
-#[inline]
-pub fn is_shareable_mapping(map_flags: u64) -> bool {
-    const AP_MASK: u64 = 3 << 6;
-    crate::config::SHARED_FILE_PAGES_ENABLED
-        && (map_flags & AP_MASK) == akuma_exec::mmu::flags::AP_RO_ALL
-}
+// The eligibility predicate (AP-field test + the `SHARED_FILE_PAGES_ENABLED`
+// gate) lives in `akuma_exec::memmath`, where both halves are host-tested — the
+// gate reaches it through the injectable `ExecConfig` rather than
+// `crate::config`, which is what let the whole function move instead of leaving a
+// wrapper behind (docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.11).
+// Re-exported so `file_page_cache::is_shareable_mapping` call sites are unchanged.
+pub use akuma_exec::memmath::is_shareable_mapping;
 
 /// Look up a cached page and take a reference for a new mapper.
 ///

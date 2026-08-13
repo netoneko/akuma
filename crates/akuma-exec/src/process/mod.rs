@@ -122,6 +122,39 @@ pub fn fork_page_count_for_len(len: usize) -> Option<usize> {
     len.checked_add(mmu::PAGE_SIZE - 1)?.checked_div(mmu::PAGE_SIZE)
 }
 
+/// Lowest VA [`fork_process`] scans for the child's code+data (`code_start`), from
+/// the parent's `memory.code_end`.
+///
+/// Three binary layouts, and the middle one is a regression fix rather than a
+/// tidy default:
+///
+/// - `code_end >= 256 MB` — a large PIE binary, loaded at or above `0x1000_0000`.
+/// - `code_end < 4 MB` — **Go AArch64 binaries load at ~`0x40000`**, so the scan
+///   must start at [`mmu::PAGE_SIZE`], not `0x400000`. It used to return
+///   `0x400000` unconditionally for this case, which made `fork_process`'s
+///   `if parent.brk > code_start` **false** for a Go binary (`brk = 0x229000`) —
+///   so no code page was ever shared with the child, and the child SIGSEGV'd on
+///   its own text at `0xa4600`. Anything that lowers this floor back above a Go
+///   binary's `brk` reinstates that crash.
+/// - otherwise — a typical musl/TCC static binary at `0x400000`.
+///
+/// Pure, and deliberately so: both fork arms call it and its four regression
+/// cases are host tests in this file. It previously existed as an inline
+/// expression in each arm plus a **third copy in the boot suite**
+/// (`src/process_tests.rs`, a `fork_code_start` helper the tests exercised
+/// *instead of* this logic — so they could not fail when production drifted).
+/// See `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.11.
+#[must_use]
+pub fn fork_code_start(code_end: usize) -> usize {
+    if code_end >= 0x1000_0000 {
+        0x1000_0000
+    } else if code_end < 0x400000 {
+        mmu::PAGE_SIZE // binary loads below 4 MB (e.g. Go AArch64 at ~0x40000)
+    } else {
+        0x400000
+    }
+}
+
 /// Upper bound on **brk/heap** pages copied eagerly during [`fork_process`].
 /// Without this, a huge `brk` (common for Go) can spend minutes in the copy
 /// loop and appear as a full-system hang. Raise if legitimate workloads exceed
@@ -2215,18 +2248,9 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         let mut total_shared: usize = 0;
 
 
-        // code_start is the lowest VA we need to scan for code/data pages:
-        //   - Large binaries (code_end >= 256 MB): loaded at or above 0x1000_0000.
-        //   - Typical musl/TCC binaries: loaded at 0x400000, scan from 0x400000.
-        //   - Go ARM64 binaries: loaded at ~0x40000 (code_end < 0x400000), so
-        //     scan from PAGE_SIZE to cover the actual text segment.
-        let code_start = if parent.memory.code_end >= 0x1000_0000 {
-            0x1000_0000
-        } else if parent.memory.code_end < 0x400000 {
-            mmu::PAGE_SIZE  // binary loads below 4 MB (e.g. Go ARM64 at ~0x40000)
-        } else {
-            0x400000
-        };
+        // Lowest VA to scan for code/data pages — see `fork_code_start`, which
+        // carries the three layouts and the Go-AArch64 regression it exists for.
+        let code_start = fork_code_start(parent.memory.code_end);
         let interp_base = 0x3000_0000usize;
         let interp_scan_size = 2 * 1024 * 1024;
 
@@ -2400,13 +2424,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         )?;
         lifecycle_trace("[FORK-DBG] step4: stack done\n");
 
-        let code_start = if parent.memory.code_end >= 0x1000_0000 {
-            0x1000_0000
-        } else if parent.memory.code_end < 0x400000 {
-            mmu::PAGE_SIZE
-        } else {
-            0x400000
-        };
+        let code_start = fork_code_start(parent.memory.code_end);
         if parent.brk > code_start {
             let brk_len = parent.brk - code_start;
             if lifecycle_trace_on() {
@@ -3274,6 +3292,110 @@ pub extern "C" fn entry_point_trampoline() -> ! {
 
 
 
+
+#[cfg(test)]
+mod fork_copy_math_tests {
+    //! Host tests for [`fork_code_start`] and [`fork_page_count_for_len`] — the
+    //! pure arithmetic behind `fork_process`'s copy range.
+    //!
+    //! These four `code_start` cases were **boot** tests in `src/process_tests.rs`
+    //! (`test_fork_code_start_*`, `test_fork_brk_len_no_underflow_go_binary`) that
+    //! exercised a `fork_code_start` helper defined *in the test file* — a mirror
+    //! of the production expression, so they could not fail when production
+    //! drifted, and they cost a 60 s VM boot to check integer comparisons. Moved
+    //! here against the real function: `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.11.
+    use super::*;
+
+    /// The Go AArch64 layout this floor exists for. `forktest_parent` has
+    /// `code_end = brk = 0x229000`, and the pre-fix `0x400000` made
+    /// `brk > code_start` false, so no code page was shared and the child
+    /// SIGSEGV'd on its own text at `0xa4600`.
+    const GO_CODE_END: usize = 0x229000;
+    const GO_CRASH_VA: usize = 0xa4600;
+
+    #[test]
+    fn go_binary_scans_from_page_size_and_covers_the_crash_va() {
+        let code_start = fork_code_start(GO_CODE_END);
+        assert_eq!(code_start, mmu::PAGE_SIZE, "Go layout must scan from PAGE_SIZE");
+        assert!(
+            GO_CRASH_VA >= code_start && GO_CRASH_VA < GO_CODE_END,
+            "the observed crash VA must fall inside the scanned range"
+        );
+        // Documents why the old 0x400000 floor skipped this binary entirely.
+        assert!(GO_CODE_END <= 0x400000, "the regression only bites below 4 MB");
+    }
+
+    /// `fork_process` guards the code+brk share with `if parent.brk > code_start`,
+    /// so the floor must leave that true for a Go binary or the share is skipped.
+    #[test]
+    fn go_binary_brk_exceeds_code_start_so_the_share_proceeds() {
+        assert!(GO_CODE_END > fork_code_start(GO_CODE_END));
+    }
+
+    /// The resulting `brk_len` must be non-zero and must not underflow — the
+    /// subtraction is `parent.brk - code_start`.
+    #[test]
+    fn go_binary_brk_len_is_nonzero_and_does_not_underflow() {
+        let code_start = fork_code_start(GO_CODE_END);
+        let brk_len = GO_CODE_END - code_start;
+        assert_eq!(brk_len, 0x229000 - mmu::PAGE_SIZE);
+        assert!(brk_len > 0);
+        // The old floor would have underflowed this subtraction had it not been
+        // guarded by `brk > code_start`.
+        assert!(GO_CODE_END <= 0x400000);
+    }
+
+    /// Ordinary musl/TCC static binaries and large PIE binaries must be
+    /// unaffected by the Go floor.
+    #[test]
+    fn standard_and_large_binaries_keep_their_floors() {
+        assert_eq!(fork_code_start(0x405000), 0x400000, "typical musl static");
+        assert_eq!(fork_code_start(0x2000_0000), 0x1000_0000, "large PIE");
+    }
+
+    /// The three branches are selected on `code_end`, so pin the exact boundaries
+    /// — an off-by-one either way silently changes which binaries share code.
+    #[test]
+    fn floor_boundaries_are_exact() {
+        assert_eq!(fork_code_start(0x400000 - 1), mmu::PAGE_SIZE);
+        assert_eq!(fork_code_start(0x400000), 0x400000);
+        assert_eq!(fork_code_start(0x1000_0000 - 1), 0x400000);
+        assert_eq!(fork_code_start(0x1000_0000), 0x1000_0000);
+    }
+
+    /// A zero `code_end` (no image recorded) must still yield a usable floor
+    /// rather than 0 — scanning from VA 0 would walk the process-info page.
+    #[test]
+    fn zero_code_end_still_yields_a_nonzero_floor() {
+        assert_eq!(fork_code_start(0), mmu::PAGE_SIZE);
+    }
+
+    /// `fork_page_count_for_len` rounds up, and must report `None` rather than
+    /// wrapping — a wrapped count loops the copy forever.
+    #[test]
+    fn page_count_rounds_up_and_refuses_to_wrap() {
+        assert_eq!(fork_page_count_for_len(0), Some(0));
+        assert_eq!(fork_page_count_for_len(1), Some(1));
+        assert_eq!(fork_page_count_for_len(mmu::PAGE_SIZE), Some(1));
+        assert_eq!(fork_page_count_for_len(mmu::PAGE_SIZE + 1), Some(2));
+        assert_eq!(fork_page_count_for_len(usize::MAX), None);
+    }
+
+    /// The brk cap is expressed in pages, so the page count for a 32 GiB span has
+    /// to line up with `MAX_FORK_BRK_COPY_PAGES` — the ordering check the boot
+    /// suite used to make.
+    #[test]
+    fn brk_cap_matches_a_32gib_span_in_pages() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let pages_32g = fork_page_count_for_len(32 * GIB);
+        assert_eq!(pages_32g, Some(MAX_FORK_BRK_COPY_PAGES));
+        assert_eq!(MAX_FORK_BRK_COPY_PAGES, 8 * 1024 * 1024);
+        assert!(
+            fork_page_count_for_len(32 * GIB + 1).is_some_and(|p| p > MAX_FORK_BRK_COPY_PAGES),
+            "one byte past the cap must exceed it, so the cap can actually reject"
+        );
+    }
+}
 
 #[cfg(test)]
 mod grace_kill_tests {

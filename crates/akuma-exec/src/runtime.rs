@@ -183,6 +183,16 @@ pub struct ExecConfig {
     /// Let a `tkill`/`tgkill` (`pthread_kill`) signal interrupt a blocking
     /// syscall with `EINTR`. See `config::PTHREAD_KILL_EINTR_ENABLED`.
     pub pthread_kill_eintr_enabled: bool,
+
+    /// Share physical frames between read-only file-backed mappings. Gates
+    /// [`crate::memmath::is_shareable_mapping`]. See
+    /// `config::SHARED_FILE_PAGES_ENABLED`.
+    pub shared_file_pages_enabled: bool,
+
+    /// Fill freed frames with a PA-keyed poison word and hold them in quarantine,
+    /// so a write through a stale mapping is detectable. Gates
+    /// [`crate::memmath::poison_word_frame`]. See `config::PMM_UAF_QUARANTINE`.
+    pub pmm_uaf_quarantine: bool,
 }
 
 // Lock-free single-shot cells: must be safe to read from IRQ context.
@@ -289,6 +299,11 @@ impl ExecConfig {
             cow_fork_enabled: true,
             vfork_fastpath_enabled: true,
             pthread_kill_eintr_enabled: true,
+            // Both **on**, for the same reason as `syscall_debug_info_enabled`
+            // above: a gate left off makes every test of the gated path skip the
+            // one branch it exists to cover. `memmath`'s tests rely on this.
+            shared_file_pages_enabled: true,
+            pmm_uaf_quarantine: true,
         }
     }
 }

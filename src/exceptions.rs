@@ -3760,6 +3760,12 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         _ => akuma_exec::mmu::user_flags::RW_NO_EXEC,
                     };
                     let is_exec = (map_flags & akuma_exec::mmu::flags::UXN) == 0;
+                    // Hoisted out of the per-page readahead loops below: `map_flags`
+                    // is loop-invariant, and the predicate now reads the registered
+                    // `ExecConfig` (which `config()` returns **by value** — the whole
+                    // struct), so evaluating it per page cost a ~45-field copy up to
+                    // 512 times per fault. Once per fault instead.
+                    let shareable_mapping = crate::file_page_cache::is_shareable_mapping(map_flags);
 
                     if let akuma_exec::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
                         const READAHEAD_PAGES: usize = 256;
@@ -3790,7 +3796,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                     // disagree about its contents.
                                     let full = va >= segment_va
                                         && va + 0x1000 <= segment_va + filesz;
-                                    let hit = if full && crate::file_page_cache::is_shareable_mapping(map_flags) {
+                                    let hit = if full && shareable_mapping {
                                         let file_off = file_offset + (va - segment_va);
                                         crate::file_page_cache::lookup_and_ref(inode, file_off, is_exec)
                                     } else {
@@ -3935,7 +3941,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             // can map this frame the instant it lands in the table.
                             if cur_va >= segment_va
                                 && cur_va + 0x1000 <= segment_va + filesz
-                                && crate::file_page_cache::is_shareable_mapping(map_flags)
+                                && shareable_mapping
                             {
                                 let file_off = file_offset + (cur_va - segment_va);
                                 crate::file_page_cache::insert(inode, file_off, pf, is_exec);
@@ -4382,7 +4388,9 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         }
                         _ => akuma_exec::mmu::user_flags::RX,
                     };
-
+                    // Hoisted for the same reason as the data-abort arm: loop-invariant,
+                    // and `config()` returns `ExecConfig` by value.
+                    let shareable_mapping = crate::file_page_cache::is_shareable_mapping(map_flags);
 
                     if let akuma_exec::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
                         if crate::config::DEMAND_PAGE_LOG_ENABLED {
@@ -4408,7 +4416,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                 if !akuma_exec::mmu::is_current_user_page_mapped(va) {
                                     let full = va >= segment_va
                                         && va + 0x1000 <= segment_va + filesz;
-                                    let hit = if full && crate::file_page_cache::is_shareable_mapping(map_flags) {
+                                    let hit = if full && shareable_mapping {
                                         let file_off = file_offset + (va - segment_va);
                                         crate::file_page_cache::lookup_and_ref(inode, file_off, true)
                                     } else {
@@ -4522,7 +4530,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             // arm). `icache_done: true` — this arm always maintains.
                             if cur_va >= segment_va
                                 && cur_va + 0x1000 <= segment_va + filesz
-                                && crate::file_page_cache::is_shareable_mapping(map_flags)
+                                && shareable_mapping
                             {
                                 let file_off = file_offset + (cur_va - segment_va);
                                 crate::file_page_cache::insert(inode, file_off, pf, true);

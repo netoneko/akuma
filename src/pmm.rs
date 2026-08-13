@@ -764,14 +764,12 @@ pub fn is_page_free(pa: usize) -> bool {
 /// window between a premature free and the first write through the stale mapping.
 const QUARANTINE_SLOTS: usize = 512;
 
-/// Poison base; XORed with the PA so a frame written with *another* frame's
-/// poison (a stale copy, a mis-targeted memset) is still a mismatch.
-const POISON_MAGIC: u64 = 0xFEED_FACE_DEAD_0000;
-
-#[inline]
-fn poison_word(pa: usize) -> u64 {
-    POISON_MAGIC ^ (pa as u64)
-}
+// The poison codec (`POISON_MAGIC`, `poison_word`, `poison_word_frame`) lives in
+// `akuma_exec::memmath`, where the XOR/alignment/RAM-window decode is host-tested
+// against the observed crash values instead of only from a booted kernel
+// (docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.11).
+use akuma_exec::memmath::poison_word;
+pub use akuma_exec::memmath::poison_word_frame;
 
 struct Quarantine {
     pa: [usize; QUARANTINE_SLOTS],
@@ -823,39 +821,6 @@ fn verify_poison(pa: usize) -> Option<(usize, u64)> {
         }
     }
     None
-}
-
-/// If `word` is a quarantine poison word, the frame it was written for.
-///
-/// `poison_word` XORs the magic with the frame's own PA precisely so a stray word
-/// can be traced back to its frame, and this is the reverse. The check that makes
-/// it trustworthy is **page alignment**: an arbitrary 64-bit value that happens to
-/// carry the `0xFEEDFACE` prefix still has to XOR down to a 4 KiB-aligned,
-/// in-range PA, which is a 1-in-4096 accident on top of a 1-in-2^32 one.
-///
-/// This is what turns the null-`Rc` crash from "a qword read back as garbage" into
-/// "frame P, freed by thread T at free-seq S". The value that motivated it was
-/// `0xfeedfacea8d0e010` — a poisoned pointer for frame `0x767de000`, dereferenced
-/// at `+0x10` (`docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` §13.8).
-pub fn poison_word_frame(word: u64) -> Option<usize> {
-    if !crate::config::PMM_UAF_QUARANTINE {
-        return None;
-    }
-    // Cheap reject first: everything else here is only reached for a word that
-    // already carries the magic's high half.
-    if word >> 32 != POISON_MAGIC >> 32 {
-        return None;
-    }
-    let pa = (word ^ POISON_MAGIC) as usize;
-    if pa & (PAGE_SIZE - 1) != 0 {
-        return None;
-    }
-    // Lock-free bounds (plain atomics with a compile-time fallback), so this stays
-    // callable from the fault path without taking the PMM's own `Spinlock`.
-    if pa < akuma_exec::mmu::ram_base() || pa >= akuma_exec::mmu::ram_end() {
-        return None;
-    }
-    Some(pa)
 }
 
 /// Report a value that decoded as quarantine poison, naming the frame it belonged
@@ -1342,35 +1307,13 @@ pub fn alloc_page_zeroed() -> Option<PhysFrame> {
     Some(frame)
 }
 
-/// Pages held back from *user* demand-paging so kernel-critical work can always
-/// make progress when a process tries to consume all of RAM: the page tables to
-/// complete an in-flight fault, kernel-heap growth, and the OOM process-kill path
-/// itself. Without this, a memory-hungry process (tcc, meow) drains the PMM to
-/// near-zero and the kernel's *own* next allocation fails — and a failed kernel
-/// allocation aborts the whole kernel (a `BRK` trap) instead of the offending
-/// process being killed. 16 pages = 64 KB: small enough not to raise the working
-/// floor, large enough for one minimal heap-growth + the kill path's bookkeeping.
-pub const USER_PAGE_RESERVE: usize = 16;
-
-/// Reserve predicate: would handing a page to *user* demand-paging starve the
-/// kernel reserve? Pure fn over the free-page count so it can be unit-tested at
-/// the boundary without actually draining RAM.
-#[inline]
-pub fn user_alloc_would_starve(free: usize) -> bool {
-    free <= USER_PAGE_RESERVE
-}
-
-/// Max pages a *user* readahead batch may take right now without driving free
-/// PMM below [`USER_PAGE_RESERVE`]. File-backed demand paging batches many pages
-/// per fault (readahead), so it must clamp the batch to this budget — otherwise
-/// an mmap larger than RAM drains the PMM to 0 and a later kernel-side alloc
-/// (IRQ/scheduler, no current process) panics into a whole-kernel `BRK` abort
-/// instead of the offending process being SIGSEGV'd. Pure fn over the free count
-/// so the boundary is unit-testable without draining real RAM.
-#[inline]
-pub fn user_readahead_budget(free: usize) -> usize {
-    free.saturating_sub(USER_PAGE_RESERVE)
-}
+// The reserve, its predicate and the readahead budget now live in
+// `akuma_exec::memmath` — pure arithmetic, host-tested there instead of from the
+// boot suite (docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.11).
+// Re-exported so every existing `pmm::USER_PAGE_RESERVE` /
+// `pmm::user_alloc_would_starve` / `pmm::user_readahead_budget` caller is
+// unchanged and there is still exactly one definition.
+pub use akuma_exec::memmath::{USER_PAGE_RESERVE, user_alloc_would_starve, user_readahead_budget};
 
 /// Allocate a zeroed page for a **user** demand-paging fault (anonymous fill,
 /// ELF demand-load, reserved-region commit). Returns `None` once free PMM has

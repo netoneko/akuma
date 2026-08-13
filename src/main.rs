@@ -545,6 +545,8 @@ pub(crate) fn build_exec_runtime(
         cow_fork_enabled: config::COW_FORK_ENABLED,
         vfork_fastpath_enabled: config::VFORK_FASTPATH_ENABLED,
         pthread_kill_eintr_enabled: config::PTHREAD_KILL_EINTR_ENABLED,
+        shared_file_pages_enabled: config::SHARED_FILE_PAGES_ENABLED,
+        pmm_uaf_quarantine: config::PMM_UAF_QUARANTINE,
     };
     (rt, cfg)
 }

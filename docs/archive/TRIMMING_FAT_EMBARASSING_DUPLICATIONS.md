@@ -1046,7 +1046,61 @@ The remaining large untested files are genuinely hardware- or scheduler-bound
 to them piecewise: the untestable part is usually a thin shell around arithmetic
 that is not, and splitting the arithmetic out is cheap.
 
-## 5.11 The memory arithmetic wants a crate — and one test already proves it (raised 2026-08-13)
+## 5.11 The memory arithmetic wants a crate — and one test already proves it (raised + DONE 2026-08-13)
+
+**DONE 2026-08-13.** Verdict: **`akuma-exec`, not a new crate** — nothing outside
+`akuma-exec` and `src/` consumes this arithmetic, so a crate would cut no
+`cargo tree` edge, which is the one criterion `addr.rs` records for having moved
+things to `akuma-primitives` in the first place. What landed:
+
+- `process::fork_code_start` — one definition, called by **both** `fork_process`
+  arms (`:2251`, `:2427`) instead of an inline expression written twice, plus the
+  test file's third copy deleted. The Go-AArch64 rationale moved onto the
+  function, where the arms can see it.
+- `memmath.rs` (new) — `USER_PAGE_RESERVE`, `user_alloc_would_starve`,
+  `user_readahead_budget`, the quarantine poison codec (`POISON_MAGIC`,
+  `poison_word`, `poison_decode`, `poison_word_frame`) and the mapping predicates
+  (`mapping_is_read_only_to_user`, `is_shareable_mapping`). `src/pmm.rs` and
+  `src/file_page_cache.rs` now re-export, so every call site is unchanged and
+  there is exactly one definition of each.
+- **The config gates moved too**, rather than staying behind as `src/` wrappers:
+  `ExecConfig` gained `shared_file_pages_enabled` and `pmm_uaf_quarantine`, and
+  `ExecConfig::for_test()` sets both **on** so the tests execute the gated path
+  instead of skipping it — the §6.1 lesson applied. A gate is not a reason to
+  leave a decision host-unreachable when the config is injectable.
+- **19 new host tests** (`fork_copy_math_tests` 8, `memmath::tests` 11); five boot
+  tests deleted and the pure half of `test_oom_user_page_reserve` moved out,
+  leaving its live-allocator half in the VM where it belongs. Host total
+  467 → 486; boot `PASSED` markers 273 → 268 (the `[PASS]` count the runbook
+  gates on is unchanged — the deleted tests used the other marker format).
+
+### The one trap found doing it: `config()` returns `ExecConfig` **by value**
+
+`runtime::config()` is `CONFIG.require()`, and `OnceCopy::get` does
+`assume_init_read()` — so **every call copies the whole ~45-field struct**. That
+is fine once per fork or once per syscall, and it is *not* fine per page:
+`is_shareable_mapping` is called from the readahead loops in both demand-paging
+arms, up to 256 pages per fault in each of two passes, where it had previously
+folded to a compile-time constant.
+
+Moving the gate therefore came with hoisting the call out of those loops
+(`map_flags` is loop-invariant, so it was always redundant per-page work):
+`let shareable_mapping = …` once per fault, `exceptions.rs:3768` and `:4393`.
+Net effect is *fewer* per-page operations than before the move, but the hazard
+generalises — **never put a bare `config()` read inside a per-page or per-packet
+loop.** Related: §5.10, since without `lto` on `[profile.release]` that call does
+not inline across the crate boundary either.
+
+Verified: 4 clippy configs clean, 486/0 host tests, boot suite SMP=1 and SMP=4
+with the failure set unchanged (`{retired_reclaim_ab}`) and BKL-stuck lines at 93
+(identical to pristine, HEAD and `main`), `cowstale`/`bssfork`/`forkprobe`/
+`elftest` green at SMP=4, and `[FPCACHE] entries=263 hits=2630 misses=263` —
+which is the check that the moved gate is actually live, since a mis-wired
+`shared_file_pages_enabled` would read `entries=0 hits=0` and otherwise look fine.
+
+The original argument follows.
+
+### Why it needed doing at all
 
 **Raised as a question ("could all this memory arithmetic be moved to a separate
 crate?") while auditing the fork/CoW pile.** The answer is yes, and the argument
@@ -1110,6 +1164,42 @@ point both fork arms at it, delete the test's mirror, and let the four existing
 tests become host tests. That is a ~20-line change that converts four
 can't-fail boot tests into four real host tests, and it settles whether the leaf
 crate is the right home before anything larger is moved.
+
+**Outcome (see the DONE note above):** `akuma-exec` won on the `cargo tree`
+criterion. `akuma-primitives` would also have imported its four forwarded
+features and the silent feature-forward hazard (§6-adjacent: a broken forwarding
+chain turned `PreemptGuard` into a zero-sized no-op) onto code that needs no
+`cfg` at all. If a second crate ever needs page math, promoting a self-contained
+module to a crate is mechanical; the reverse is not.
+
+### Still open here
+
+`pmm::alloc_page_zeroed_user`'s **four-rung reclaim ladder** (gate →
+`drain_retired_under_pressure` → `reclaim_clean_file_pages` → `file_page_cache::shrink`
+→ give up) is untested in either place, and its own boot test says why:
+*"Actually draining RAM to the reserve is unsafe inside the boot suite."* So the
+rungs that convert an OOM into a clean SIGSEGV — instead of a whole-kernel `BRK`
+abort, the 4.5 MB meow+tcc crash — have never been exercised by a test, only by
+production incidents. Three of its five dependencies are already injectable
+(`free_count`, `alloc_page_zeroed` via `ExecRuntime`; two reclaim calls already in
+`akuma-exec`); only `file_page_cache::shrink` would need a hook. Two candidate
+shapes, and the choice matters:
+
+1. Move the whole ladder into `akuma-exec` and register a working fake allocator
+   in `test_support` (one whose free count the test drives). Tests every rung —
+   but converts `free_count()` from a direct in-crate call into a fn-pointer call
+   on the fault path, 1–4 times per user page, with no `lto` (§5.10).
+2. Extract only the *decision* — `next_reclaim_rung(free, tried) -> Rung` — as a
+   pure fn, leaving the effects in `src/`. Captures the bug class that actually
+   bites here (a missing re-check between rungs, or the wrong order), needs no
+   runtime hook, and adds nothing to the fault path. Same shape as
+   `completion_copy_len` and `trace_snippet`.
+
+Shape 2 is the better trade on current evidence and is the recommendation; it is
+still a fault-path control-flow change and wants its own SMP=4 verification, so
+it was deliberately not bundled into the move above.
+
+### Why it needed doing at all — the original argument
 
 ## 5.10 Open audit: `#[inline]` across the crate boundary (raised 2026-08-13)
 

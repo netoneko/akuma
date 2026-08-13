@@ -91,6 +91,8 @@ pub fn ensure_test_runtime() {
         cow_fork_enabled: false,
         vfork_fastpath_enabled: false,
         pthread_kill_eintr_enabled: true,
+        shared_file_pages_enabled: true,
+        pmm_uaf_quarantine: true,
     };
     register(rt, cfg);
 }

@@ -95,6 +95,7 @@ mod bkl_model;
 #[cfg(test)]
 pub mod test_support;
 pub mod mmu;
+pub mod memmath;
 #[path = "elf/mod.rs"]
 pub mod elf_loader;
 pub mod threading;

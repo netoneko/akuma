@@ -54,10 +54,16 @@ cargo test --target "$HOST" 2>&1 \
   | paste -sd+ - | bc
 ```
 
-> **Baseline as of 2026-08-13: 467** — was 455 when this runbook was written,
-> then 463 before the Phase 6 item 5 guard merge and 467 after it (+4 for
-> `FaultSlot::reclaim_report`). Re-measure rather than trusting this line; it has
-> gone stale twice already. Original composition below.
+> **Baseline as of 2026-08-13: 486** — was 455 when this runbook was written, 463
+> before the Phase 6 item 5 guard merge, 467 after it (+4 `FaultSlot::reclaim_report`),
+> then 486 after the memory-math move (+8 `fork_copy_math_tests`, +11
+> `memmath::tests`). Re-measure rather than trusting this line; it has gone stale
+> three times already. Original composition below.
+>
+> Note the two boot-log marker formats: `[PASS]` (what the Tier 2 gate counts) and
+> `[Test] <name> PASSED`. Deleting a boot test may move only the second — the
+> memory-math move took `PASSED` from 273 to 268 while `[PASS]` stayed at 94.
+> Check both when you remove or add boot tests.
 >
 > **Superseded: 455** (akuma-exec 210, ext2 52, isolation 43,
 > net 25, primitives 28, rump 37, terminal 21, vfs 39). Do not sum these by
