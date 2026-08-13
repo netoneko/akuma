@@ -11,11 +11,16 @@ deleted code has no `unsafe` in it.
 **This doc tracks.** It is a live work list, not a frozen investigation — unlike
 its neighbours in `archive/`, update it as phases land.
 
-**Progress: Phases 0, 1, 2a, 2b, 3 and 4 rungs 1–2 done (2026-08-13). Phase 4 is
-in progress: `akuma-primitives` exists and owns `OnceCopy` + the console
-primitives; rungs 3–5 (DAIF, the clock hook, the thread-slot table +
-`PreemptGuard`) are next.** See §8.5 for per-item status, and §5.55 for the
-five-rung plan and why it is ordered that way.
+**Progress: Phases 0, 1, 2a, 2b, 3 all done, and Phase 4's blocked half is
+COMPLETE (2026-08-13).** `crates/akuma-primitives` exists and all six rungs
+landed: `OnceCopy`, the console primitives, every DAIF access in the tree, the
+clock hook, the thread-slot preemption table + `PreemptGuard`, and the identity
+phys/virt translators. **Three crates — `akuma-ext2`, `akuma-virtio`,
+`akuma-net` — no longer depend on `akuma-exec` at all.** Full writeup:
+[`AKUMA_PRIMITIVES_EXTRACTION.md`](AKUMA_PRIMITIVES_EXTRACTION.md); current-state
+reference: [`../reference/subsystems/primitives.md`](../reference/subsystems/primitives.md).
+What remains of Phase 4 is the *unblocked* half (§8.5) — none of it needs a new
+crate. See §8.5 for per-item status.
 
 **~~Known blocker, owned by no phase:~~ FIXED 2026-08-13.** ssh sessions died
 instantly on the extreme-size profile, blocking
@@ -352,6 +357,52 @@ most: `akuma-vfs` is the leaf that `akuma-isolation` depends on, so the shared
 half belongs in `akuma-vfs` and there is no dependency obstacle to putting it
 there.
 
+### Three path normalisers, two of them in `akuma-vfs` itself (found 2026-08-13)
+
+Turned up while checking whether anything in `akuma-vfs` wanted to move to
+`akuma-primitives` (nothing did — see below). CPD cannot see these: different
+return types, renamed identifiers.
+
+| | behaviour |
+|---|---|
+| `akuma-vfs/src/path.rs:9` `canonicalize_path` | full `.`/`..` resolution → `String` |
+| `akuma-vfs/src/mount.rs:185` `normalize_path` | trims trailing `/` only → `&str` |
+| `src/vfs/mod.rs:128` `normalize_path_owned` | trims trailing `/` **and prepends a leading `/`** → `String` |
+
+The last two are the problem: same name, same stated intent, **different
+results.** A mount path arriving without a leading `/` normalises differently
+depending on which one sees it — the bin crate's forces the slash, `akuma-vfs`'s
+does not. Reconcile on its own terms; it is a correctness question, not a line
+count. Phase 6, next to the `mount.rs` merge above.
+
+### Nothing in `akuma-vfs` belongs in `akuma-primitives`
+
+Asked and answered 2026-08-13, because the chain `akuma-exec → akuma-isolation →
+akuma-vfs` invites the question. Three reasons it does not pay:
+
+1. **`akuma-vfs` is already at the bottom of that chain.** Extraction pays when
+   the duplicator *cannot reach* the canonical version (§5.55's criterion).
+   Everything above vfs can already reach vfs, so moving code down cuts no edge.
+2. **`akuma-vfs` is not dependency-free.** `memfs.rs` holds
+   `spinning_top::Spinlock<FsNode>` and the crate uses `alloc` throughout, so its
+   two largest files cannot enter a `core`-only crate without breaking that
+   crate's one rule.
+3. **`path.rs` is the only plausible candidate and it has ~51 call sites, all
+   above vfs** — `src/syscall/fs.rs` (25), `src/vfs/mod.rs` (12),
+   `src/syscall/container.rs` (5), `akuma-ext2` (3),
+   `akuma-isolation/subdir_fs.rs` (3) — every one in a crate that already depends
+   on `akuma-vfs`. Zero edges cut, and it returns `String`.
+
+**The chain itself looks like the `PreemptGuard` shape and is not.**
+`akuma-exec`'s entire use of `akuma-isolation` is two symbols out of 1,655 lines
+(`Namespace` ×3, `global_namespace` ×3), and `akuma-exec` does not declare
+`akuma-vfs` at all — it reaches vfs types through isolation's re-exports. But
+`Namespace` holds `Spinlock<MountNamespace>` + `NetworkNamespace`, and
+`MountNamespace` genuinely needs vfs's `Filesystem` trait. `PreemptGuard` only
+*looked* like scheduler state; `Namespace` really is filesystem state. Cutting
+this edge means inverting the mount table out of the execution crate — a design
+change, not an extraction, and out of scope for Phase 4.
+
 ---
 
 ## 5. The virtio driver layer
@@ -433,11 +484,12 @@ both axes is the point; neither subsumes the other.
 
 ## 5.55 Primitives that want a leaf crate
 
-> **Status: decided and started, 2026-08-13.** `crates/akuma-primitives` exists —
-> no dependencies, `core` only. Rungs 1 and 2 have landed; the plan, the
-> corrections to the analysis below, and the measurements are in **§5.555**.
-> The short version: the table *can* move, but three smaller things had to move
-> first, and most of the actual duplication turned out to be in those three.
+> **Status: DONE, 2026-08-13.** `crates/akuma-primitives` exists — no
+> dependencies, `core` only — and all six rungs landed. The short version: the
+> table *can* move, but three smaller things had to move first, and most of the
+> actual duplication turned out to be in those three. §5.555 is the summary;
+> [`AKUMA_PRIMITIVES_EXTRACTION.md`](AKUMA_PRIMITIVES_EXTRACTION.md) is the full
+> account, including the two places the plan below was wrong.
 
 §5.5 catalogues duplicated trait impls. This is a different cut through some of
 the same evidence, and it has a single cause worth naming:
@@ -500,14 +552,28 @@ primitive needs something only the kernel has — a console, a clock — it take
 as a boot-registered `OnceCopy` hook and **degrades** when unregistered rather
 than panicking. That property is what each of the copies below was hand-rolling.
 
-| Rung | Contents | Status |
+| Rung | Contents | Cuts |
 |---|---|---|
-| 1 | `OnceCopy<T>` | **DONE** |
-| 2 | console hook + one `StackWriter` + one `FmtBuf` + one `safe_print!` | **DONE** |
-| 3 | DAIF: `irq_save_mask`/`irq_restore` + one `IrqGuard` | next |
-| 4 | the clock hook (`OnceCopy<fn() -> u64>`) | |
-| 5 | `MAX_THREADS`, the tid **read**, `PREEMPTION_DISABLED*`, `PreemptGuard` | frees `akuma-ext2` |
-| 6 | the identity `virt_to_phys`/`phys_to_virt` (+ maybe `DEV_VIRTIO_VA`) | frees `akuma-virtio`, and only then `akuma-net` |
+| 1 | `OnceCopy<T>` | — |
+| 2 | console hook + one `StackWriter` + one `FmtBuf` + one `safe_print!` | — |
+| 3 | **every** DAIF access in the tree — not just the 3 guards, see below | — |
+| 4 | the clock hook (`OnceCopy<fn() -> u64>`) | — |
+| 5 | `MAX_THREADS`, the tid **read**, `PREEMPTION_DISABLED*`, `PreemptGuard` | **`akuma-ext2`** |
+| 6 | the identity `virt_to_phys`/`phys_to_virt` + the `DEV_*_VA` window | **`akuma-virtio`**, and via it **`akuma-net`** |
+
+All six DONE 2026-08-13 (`13f5263` rungs 1–2, `069f1f0` rungs 3–6).
+
+**Rung 3 was scoped wrong and grew.** "Three DAIF implementations" counted
+*guards*; counting every DAIF *access* found nine more sites across six files,
+plus a bare `mrs daif` read. Two findings fell out: `src/irq.rs`'s `disable_irqs`
+and `enable_irqs` had **zero callers**, and two of the six open-coded `msr
+daifclr` sites were in `akuma-exec`, which cannot reach the bin crate's
+`enable_irqs` — the §5.55 shape for the third time in this phase. Everything now
+routes through `akuma_primitives::irq` except `src/exceptions.rs`'s
+vector-install block, where the `msr vbar_el1` / `isb` sequence must stay one asm
+unit. The `isb`-vs-no-`isb` divergence between `IrqGuard` and `irq_save_mask` is
+**preserved deliberately** — resolving it either way is a hot-path behaviour
+change that wants a measurement, not a cleanup.
 
 ### The payoff is measurable, and §5.55 stated it as a hope
 
