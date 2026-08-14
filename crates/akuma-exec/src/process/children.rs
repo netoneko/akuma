@@ -1005,7 +1005,7 @@ pub fn reclaim_clean_file_pages(want: usize) -> usize {
             // an unbounded wait" rule (docs/reference/subsystems/locking.md).
             let evicted = proc.with_address_space(|aspace| aspace.try_evict_ro_page(va));
             if let Some(frame) = evicted {
-                (runtime().free_page)(frame);
+                akuma_pmm::free_page(frame.addr, akuma_primitives::preempt::current_tid() as u32);
                 freed += 1;
             }
             va += 0x1000;

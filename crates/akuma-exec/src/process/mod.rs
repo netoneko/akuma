@@ -70,7 +70,7 @@ pub static FORK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 use spinning_top::Spinlock;
 
 use crate::mmu::{self, UserAddressSpace};
-use crate::runtime::{PhysFrame, FrameSource, runtime, config, with_irqs_disabled};
+use crate::runtime::{PhysFrame, FrameSource, runtime, config, with_irqs_disabled, track_frame};
 use akuma_terminal as terminal;
 
 /// A `core::fmt::Write` sink over a caller-supplied stack buffer, truncating on
@@ -295,7 +295,7 @@ pub fn cow_share_and_demote_range(
                     continue;
                 }
                 // Inserts with count=2 on first share.
-                (runtime().cow_ref_inc)(pa);
+                akuma_pmm::cow_ref_inc(pa);
             }
             // SAFETY: `parent_l0` is the live L0 root of the address space this
             // `as_lock` guards (see the preconditions above).
@@ -855,9 +855,8 @@ impl Process {
                     // Allocate the frame OUTSIDE `as_lock` (the PMM OOM/reclaim path can
                     // re-enter it), then install it under the hold so a concurrent
                     // BKL-free fault on this address space excludes correctly.
-                    let rt = runtime();
-                    if let Some(frame) = (rt.alloc_page_zeroed)() {
-                        (rt.track_frame)(frame, FrameSource::ElfLoader);
+                    if let Some(frame) = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new) {
+                        track_frame(frame, FrameSource::ElfLoader);
                         let _ = self.with_address_space(|aspace| {
                             aspace.map_and_track(page, frame, crate::mmu::user_flags::RW_NO_EXEC)
                         });
@@ -889,7 +888,7 @@ impl Drop for Process {
         // Free any remaining dynamically allocated page table frames
         // This handles the case where the process is dropped without execute() being called
         for frame in self.dynamic_page_tables.drain(..) {
-            (runtime().free_page)(frame);
+            akuma_pmm::free_page(frame.addr, akuma_primitives::preempt::current_tid() as u32);
         }
     }
 }
@@ -2071,8 +2070,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         child_pid, new_address_space.l0_phys(), new_address_space.asid(), parent_pid));
 
     // 2. Allocate process info page
-    let process_info_frame = (runtime().alloc_page_zeroed)().ok_or("OOM process info")?;
-    (runtime().track_frame)(process_info_frame, FrameSource::UserData);
+    let process_info_frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or("OOM process info")?;
+    track_frame(process_info_frame, FrameSource::UserData);
     
     new_address_space
         .map_page(
@@ -2494,9 +2493,9 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                     ok = false;
                     break;
                 }
-                match (runtime().alloc_page_zeroed)() {
+                match akuma_pmm::alloc_page_zeroed().map(PhysFrame::new) {
                     Some(frame) => {
-                        (runtime().track_frame)(frame, FrameSource::UserData);
+                        track_frame(frame, FrameSource::UserData);
                         unsafe {
                             let src = mmu::phys_to_virt(pf.addr) as *const u8;
                             let dst = mmu::phys_to_virt(frame.addr);

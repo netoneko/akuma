@@ -6,6 +6,7 @@ default-members = [
     "crates/akuma-ext2",
     "crates/akuma-isolation",
     "crates/akuma-net",
+    "crates/akuma-pmm",
     "crates/akuma-primitives",
     "crates/akuma-rump",
     "crates/akuma-terminal",
@@ -415,6 +416,9 @@ akuma-net = { path = "crates/akuma-net", default-features = false }
 # virtio Hal + MMIO probe + the block/rng/audio drivers.
 akuma-virtio = { path = "crates/akuma-virtio" }
 akuma-exec = { path = "crates/akuma-exec" }
+# Physical memory manager: bitmap allocator, frame tracking, UAF quarantine,
+# free/CoW event ledgers. `src/pmm.rs` is now a thin shim over this crate.
+akuma-pmm = { path = "crates/akuma-pmm" }
 # The dependency-free leaf: `OnceCopy`, the one stack writer + `safe_print!`.
 akuma-primitives = { path = "crates/akuma-primitives" }
 # Kernel-side sysproxy client (rumpsp wire + Linux↔NetBSD translation); only the

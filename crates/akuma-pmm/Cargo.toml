@@ -1,0 +1,12 @@
+[package]
+name = "akuma-pmm"
+version = "0.1.0"
+edition = "2024"
+description = "Physical memory manager: bitmap allocator, frame tracking, UAF quarantine, CoW/free ledgers"
+
+[lints]
+workspace = true
+
+[dependencies]
+akuma-primitives = { path = "../akuma-primitives" }
+spinning_top = "0.3"

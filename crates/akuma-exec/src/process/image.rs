@@ -10,7 +10,7 @@ use spinning_top::Spinlock;
 
 use crate::elf_loader::{self, DeferredLazySegment, ElfError, LoadedWithStack};
 use crate::mmu;
-use crate::runtime::{runtime, config, FrameSource};
+use crate::runtime::{runtime, config, track_frame, FrameSource, PhysFrame};
 use crate::process::types::{ProcessMemory, LazySource, SignalHandler, SignalAction, PROCESS_INFO_ADDR, ProcessInfo, Pid};
 use crate::process::lifecycle::LifecycleGuard;
 use super::{
@@ -51,7 +51,7 @@ pub(crate) fn compute_heap_lazy_size(brk: usize, memory: &ProcessMemory) -> usiz
     const MIN_HEAP: usize = 16 * 1024 * 1024;
     const RESERVE_PAGES: usize = 2048; // 8MB
 
-    let (_, _, free) = (runtime().pmm_stats)();
+    let (_, _, free) = akuma_pmm::stats();
     let phys_cap = free.saturating_sub(RESERVE_PAGES) * crate::mmu::PAGE_SIZE;
     let va_cap = memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed).saturating_sub(brk);
 
@@ -192,8 +192,8 @@ impl Process {
         self.context = crate::process::UserContext::new(loaded.entry_point, loaded.sp);
 
         // Re-write process info page in the NEW address space
-        let process_info_frame = (runtime().alloc_page_zeroed)().ok_or("OOM process info")?;
-        (runtime().track_frame)(process_info_frame, FrameSource::UserData);
+        let process_info_frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or("OOM process info")?;
+        track_frame(process_info_frame, FrameSource::UserData);
 
         self.address_space
             .map_page(
@@ -268,8 +268,8 @@ impl Process {
         let mut lazy_regions = LazyRegionMap::new();
         push_deferred_regions(&mut lazy_regions, &loaded.deferred_segments);
 
-        let process_info_frame = (runtime().alloc_page_zeroed)().ok_or(ElfError::OutOfMemory)?;
-        (runtime().track_frame)(process_info_frame, FrameSource::UserData);
+        let process_info_frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or(ElfError::OutOfMemory)?;
+        track_frame(process_info_frame, FrameSource::UserData);
 
         loaded.address_space
             .map_page(

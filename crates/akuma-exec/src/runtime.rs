@@ -42,10 +42,42 @@ pub enum FrameSource {
     Unknown,
 }
 
+/// Direct call into `akuma_pmm::track_frame`, converting [`FrameSource`] at the
+/// boundary — this crate's enum and the crate's `akuma_pmm::FrameSource` are
+/// separate types (the crate sits below `akuma-exec` and cannot name this one).
+/// Mirrors `src/pmm.rs`'s identical wrapper for `src/`'s own call sites.
+pub fn track_frame(frame: PhysFrame, source: FrameSource) {
+    let src = match source {
+        FrameSource::Kernel => akuma_pmm::FrameSource::Kernel,
+        FrameSource::UserPageTable => akuma_pmm::FrameSource::UserPageTable,
+        FrameSource::UserData => akuma_pmm::FrameSource::UserData,
+        FrameSource::ElfLoader => akuma_pmm::FrameSource::ElfLoader,
+        FrameSource::Unknown => akuma_pmm::FrameSource::Unknown,
+    };
+    akuma_pmm::track_frame(frame.addr, src);
+}
+
 /// Kernel-provided callbacks for the exec crate.
 ///
 /// Registered once during init. All function pointers must remain valid
 /// for the lifetime of the kernel (they are plain `fn` pointers, not closures).
+///
+/// **The 12 PMM fields this used to carry are gone** (`docs/archive/PMM_EXTRACT.md`
+/// §7 Step 5, 2026-08-14): `akuma-pmm` is a crate now, this crate depends on it
+/// directly, and every call site that used to read one of these fields off
+/// `runtime()` calls `akuma_pmm::*` directly instead, converting `PhysFrame` at
+/// the boundary the same way `src/pmm.rs` does for `src/`'s own call sites.
+///
+/// `is_memory_low` is the one PMM-shaped field the plan's inventory counted as
+/// a 13th but that could not move with the rest: its implementation
+/// (`allocator::is_memory_low`) lives in `src/`, not in `akuma_pmm` — it checks
+/// `pmm::free_count()` once the PMM is up, but falls back to the kernel heap's
+/// own byte accounting before that (`is_pmm_ready()`), which is `src/allocator.rs`
+/// state this crate has no way to reach. Turning it into a direct call would mean
+/// dropping that pre-init fallback, a real behaviour change this
+/// behaviour-preserving step must not make. It stays a hook, correctly — this is
+/// the ordinary direction for `ExecRuntime`, a hook down into `src/`, not the
+/// leftover-from-when-PMM-lived-in-`src/` indirection the other 12 were.
 #[derive(Clone, Copy)]
 pub struct ExecRuntime {
     // Timer
@@ -66,17 +98,6 @@ pub struct ExecRuntime {
     // thread's last-known core) so its scheduler picks up the just-READY thread
     // without waiting for the ~10 ms timer tick. No-op on single-core / non-SMP.
     pub wake_core: fn(u8),
-
-    // PMM
-    pub alloc_page_zeroed: fn() -> Option<PhysFrame>,
-    pub alloc_page: fn() -> Option<PhysFrame>,
-    pub free_page: fn(PhysFrame),
-    pub pmm_stats: fn() -> (usize, usize, usize),
-    pub track_frame: fn(PhysFrame, FrameSource),
-    pub free_count: fn() -> usize,
-    pub total_count: fn() -> usize,
-    pub alloc_pages_contiguous_zeroed: fn(usize) -> Option<PhysFrame>,
-    pub free_pages_contiguous: fn(PhysFrame, usize),
 
     // Allocator
     pub heap_stats: fn() -> (usize, usize),
@@ -130,14 +151,15 @@ pub struct ExecRuntime {
 
     // Console fallback
     pub print_str: fn(&str),
-
-    // Copy-on-Write fork
-    pub cow_ref_inc: fn(usize),
-    pub cow_ref_dec: fn(usize) -> bool,
-    pub cow_ref_get: fn(usize) -> u16,
 }
 
 /// Compile-time kernel configuration, passed once at init.
+///
+/// **`pmm_uaf_quarantine` is gone** (`docs/archive/PMM_EXTRACT.md` §7 Step 6):
+/// its only reader was `memmath::poison_word_frame`'s gate, and that function
+/// moved to `src/pmm.rs` and gates on `akuma_pmm::config().pmm_uaf_quarantine`
+/// instead — the crate's own copy of the same kernel constant
+/// (`config::PMM_UAF_QUARANTINE` feeds both; `src/main.rs` only sets one now).
 #[derive(Clone, Copy)]
 pub struct ExecConfig {
     pub max_threads: usize,
@@ -185,11 +207,6 @@ pub struct ExecConfig {
     /// [`crate::memmath::is_shareable_mapping`]. See
     /// `config::SHARED_FILE_PAGES_ENABLED`.
     pub shared_file_pages_enabled: bool,
-
-    /// Fill freed frames with a PA-keyed poison word and hold them in quarantine,
-    /// so a write through a stale mapping is detectable. Gates
-    /// [`crate::memmath::poison_word_frame`]. See `config::PMM_UAF_QUARANTINE`.
-    pub pmm_uaf_quarantine: bool,
 }
 
 // Lock-free single-shot cells: must be safe to read from IRQ context.
@@ -296,11 +313,10 @@ impl ExecConfig {
             cow_fork_enabled: true,
             vfork_fastpath_enabled: true,
             pthread_kill_eintr_enabled: true,
-            // Both **on**, for the same reason as `syscall_debug_info_enabled`
-            // above: a gate left off makes every test of the gated path skip the
-            // one branch it exists to cover. `memmath`'s tests rely on this.
+            // **On**, for the same reason as `syscall_debug_info_enabled` above:
+            // a gate left off makes every test of the gated path skip the one
+            // branch it exists to cover. `memmath`'s tests rely on this.
             shared_file_pages_enabled: true,
-            pmm_uaf_quarantine: true,
         }
     }
 }

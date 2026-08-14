@@ -10,6 +10,7 @@ dependencies = [
  "akuma-ext2",
  "akuma-isolation",
  "akuma-net",
+ "akuma-pmm",
  "akuma-primitives",
  "akuma-rump",
  "akuma-terminal",
@@ -29,6 +30,7 @@ name = "akuma-exec"
 version = "0.1.0"
 dependencies = [
  "akuma-isolation",
+ "akuma-pmm",
  "akuma-primitives",
  "akuma-terminal",
  "elf",
@@ -67,6 +69,14 @@ dependencies = [
  "smoltcp",
  "spinning_top",
  "virtio-drivers",
+]
+
+[[package]]
+name = "akuma-pmm"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+ "spinning_top",
 ]
 
 [[package]]

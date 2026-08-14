@@ -43,6 +43,7 @@ no-bkl-process = []
 
 [dependencies]
 akuma-primitives = { path = "../akuma-primitives" }
+akuma-pmm = { path = "../akuma-pmm" }
 spinning_top = "0.3"
 lock_api = "0.4"
 log = { version = "0.4", default-features = false }

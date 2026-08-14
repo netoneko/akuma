@@ -439,15 +439,6 @@ pub(crate) fn build_exec_runtime(
         wake_core: smp_shared::wake_core,
         #[cfg(not(kernel_smp_shared))]
         wake_core: |_| {},
-        alloc_page_zeroed: || pmm::alloc_page_zeroed(),
-        alloc_page: || pmm::alloc_page(),
-        free_page: pmm::free_page,
-        pmm_stats: pmm::stats,
-        track_frame: pmm::track_frame,
-        free_count: pmm::free_count,
-        total_count: pmm::total_count,
-        alloc_pages_contiguous_zeroed: pmm::alloc_pages_contiguous_zeroed,
-        free_pages_contiguous: pmm::free_pages_contiguous,
         heap_stats: || {
             let s = allocator::stats();
             (s.heap_size, s.allocated)
@@ -503,9 +494,6 @@ pub(crate) fn build_exec_runtime(
         set_spawn_namespace: crate::vfs::set_spawn_namespace,
         clear_spawn_namespace: crate::vfs::clear_spawn_namespace,
         print_str: console::print,
-        cow_ref_inc: pmm::cow_ref_inc,
-        cow_ref_dec: pmm::cow_ref_dec,
-        cow_ref_get: pmm::cow_ref_get,
     };
     let cfg = akuma_exec::ExecConfig {
         max_threads: config::MAX_THREADS,
@@ -544,7 +532,6 @@ pub(crate) fn build_exec_runtime(
         vfork_fastpath_enabled: config::VFORK_FASTPATH_ENABLED,
         pthread_kill_eintr_enabled: config::PTHREAD_KILL_EINTR_ENABLED,
         shared_file_pages_enabled: config::SHARED_FILE_PAGES_ENABLED,
-        pmm_uaf_quarantine: config::PMM_UAF_QUARANTINE,
     };
     (rt, cfg)
 }
@@ -743,6 +730,29 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         halt();
     }
     console::print("Allocator initialized (talc mode)\n");
+
+    // Register the PMM's config + reclaim hooks before `pmm::init`, which reads
+    // the config immediately (the CoW-ever bitset's COW_REF_LEDGER gate). The
+    // hooks themselves are plain fn items — safe to register this early, since
+    // registering costs nothing and they are only invoked later, under user
+    // memory pressure, which cannot occur before userspace exists.
+    pmm::register_config(pmm::PmmConfig {
+        cow_ref_ledger: config::COW_REF_LEDGER,
+        pmm_uaf_quarantine: config::PMM_UAF_QUARANTINE,
+        pmm_premature_free_check: config::PMM_PREMATURE_FREE_CHECK,
+    });
+    pmm::register_hooks(pmm::PmmHooks {
+        heap_reclaim: allocator::reclaim_to_pmm,
+        drain_retired: akuma_exec::process::reclaim::drain_retired_under_pressure,
+        evict_clean_file_pages: akuma_exec::process::reclaim_clean_file_pages,
+        shrink_page_cache: file_page_cache::shrink,
+    });
+    // The permanent bridge hook `akuma-pmm` needs (see the crate's module doc
+    // "Extraction status"): `surviving_mapper` walks the process table, which
+    // can never move into a crate below `akuma-exec`. The `cow_ref_get` bridge
+    // Step 2 needed here too is gone as of Step 3 — `COW_REFCOUNTS` is
+    // crate-native now.
+    akuma_pmm::register_surviving_mapper_hook(pmm::surviving_mapper);
 
     // Initialize Physical Memory Manager
     // After this, the allocator can switch to page-based allocation

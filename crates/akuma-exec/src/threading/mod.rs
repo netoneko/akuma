@@ -2159,7 +2159,7 @@ impl ThreadPool {
         // the boot stack was already in use before we could reserve space.
         // Allocate from PMM to avoid using kernel heap for stacks.
         let exc_pages = (EXCEPTION_STACK_SIZE + 4095) / 4096;
-        let exc_frame = (runtime().alloc_pages_contiguous_zeroed)(exc_pages)
+        let exc_frame = akuma_pmm::alloc_pages_contiguous_zeroed(exc_pages).map(crate::PhysFrame::new)
             .expect("Failed to allocate boot exception stack from PMM");
         let boot_exception_stack_ptr = crate::mmu::phys_to_virt(exc_frame.addr);
         let boot_exception_stack_top = unsafe {
@@ -2246,7 +2246,7 @@ impl ThreadPool {
         let alloc_size = pages * page_size;
 
         // Allocate contiguous physical pages from PMM (bypasses kernel heap)
-        let frame = match (runtime().alloc_pages_contiguous_zeroed)(pages) {
+        let frame = match akuma_pmm::alloc_pages_contiguous_zeroed(pages).map(crate::PhysFrame::new) {
             Some(f) => f,
             None => return false,
         };
@@ -2320,8 +2320,7 @@ impl ThreadPool {
             let page_size = 4096;
             let pages = (stack.size + page_size - 1) / page_size;
             let phys_addr = crate::mmu::virt_to_phys(stack.base);
-            let frame = crate::PhysFrame::new(phys_addr);
-            (runtime().free_pages_contiguous)(frame, pages);
+            akuma_pmm::free_pages_contiguous(phys_addr, pages);
             self.stacks[slot_idx] = StackInfo::empty();
         }
     }
@@ -2707,7 +2706,7 @@ pub fn init() {
     // Verify the thread-stack pool fits in free PMM (stacks are allocated from
     // PMM via alloc_pages_contiguous_zeroed, NOT the kernel heap). The pool size
     // tracks thread_limit(), which is scaled to RAM before this runs.
-    let (_total, _alloc, free_pages) = (runtime().pmm_stats)();
+    let (_total, _alloc, free_pages) = akuma_pmm::stats();
     let free_bytes = free_pages.saturating_mul(crate::mmu::PAGE_SIZE);
     if let Err(msg) = verify_stack_memory(free_bytes) {
         panic!("Stack allocation failed: {}", msg);

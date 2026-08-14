@@ -60,15 +60,22 @@ CLIPPY_CONFIGS = [
     ("devbox-rump", None),  # features scraped from scripts/build_devbox.sh below
 ]
 
-# Self-reporting binaries already on disk.img. Value is the healthy substring.
-# `bssfork spread=1` is deliberately absent: it fails on an unmodified `main`
-# (failures=7) and worse on trim-some-more-fat (failures=8, no thread runs), so it
-# cannot serve as a control until that is diagnosed. See the runbook's Tier 3 table.
+# Self-reporting binaries already on disk.img, as (result-key, command, healthy
+# substring). `bssfork`'s CLI is positional (`bssfork [rounds] [threads]
+# [spread]`), NOT `key=value` — the literal command `bssfork spread=1` feeds
+# "spread=1" into `rounds`, which `strtoul` parses as 0, so the fork loop never
+# runs and the liveness check flags every thread `[never ran]` before the
+# scheduler gets to them. That mis-invocation is what produced the
+# "BROKEN PRE-EXISTING" verdict recorded in this repo's history (failures=7/8,
+# ticks=0, on both `main` and this branch) — corrected 2026-08-14, see
+# docs/archive/PMM_EXTRACT.md §8. `bssfork 20 8 1` is the real spread=1 control
+# and passes cleanly; keep both entries so a regression in either shape is caught.
 EXERCISES = [
-    ("cowstale", "cowstale PASS"),
-    ("bssfork", "bssfork PASS"),
-    ("forkprobe", "forkprobe: ALL PASS"),
-    ("elftest", "elftest: ALL tests PASSED"),
+    ("cowstale", "cowstale", "cowstale PASS"),
+    ("bssfork", "bssfork", "bssfork PASS"),
+    ("bssfork_spread1", "bssfork 20 8 1", "bssfork PASS"),
+    ("forkprobe", "forkprobe", "forkprobe: ALL PASS"),
+    ("elftest", "elftest", "elftest: ALL tests PASSED"),
 ]
 
 # Known-flaky, threshold-driven: fails on an unmodified tree, and passes on one
@@ -294,8 +301,7 @@ def exercise_suite(port, smp, results):
     Polling reads the output file and looks for a sentinel the shell appends after
     the binary exits. Do NOT poll with `pgrep <name>`: the ssh command line
     contains the name, so pgrep matches itself and the job looks eternal."""
-    for cmd, healthy in EXERCISES:
-        name = cmd.split()[0]
+    for name, cmd, healthy in EXERCISES:
         key = f"smp{smp}.ex.{name}"
         out_path = f"/tmp/verify_ex_{name}.log"
         try:
