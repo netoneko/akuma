@@ -167,21 +167,48 @@ def tier1_clippy(results):
             results[f"clippy.{name}.first"] = diags[0][:120]
 
 
-def tier1_tests(results):
+def tier1_tests(results, logdir="/tmp"):
     host = sh(["rustc", "-vV"]).stdout
     triple = next(l.split()[1] for l in host.splitlines() if l.startswith("host:"))
     results["host.triple"] = triple
 
     r = sh(["cargo", "test", "--target", triple], timeout=2400)
+    out = r.stdout + r.stderr
     total = 0
     failed = 0
-    for line in (r.stdout + r.stderr).splitlines():
+    for line in out.splitlines():
         m = re.match(r"^test result: (\w+)\. (\d+) passed; (\d+) failed", line)
         if m:
             total += int(m.group(2))
             failed += int(m.group(3))
     results["host.tests"] = total
     results["host.failed"] = failed
+
+    # Name the failures, and keep the raw output.
+    #
+    # This block exists because the counts alone were useless the one time they
+    # mattered: a 2026-08-14 run reported `host.failed: 1` with the total down
+    # 533 -> 430, and the output was already gone — so which test failed, and
+    # which binary aborted (an aborted binary prints no `test result:` line at
+    # all, which is what a 100-test drop looks like), could not be answered. It
+    # never reproduced in four re-runs. The runbook had listed saving this output
+    # as the change that "would turn this from noise into a finding"; a
+    # non-reproducing failure with no name attached is the worst of both.
+    #
+    # Written unconditionally, not only on failure: a *passing* run's file is the
+    # baseline you diff the next failure against.
+    names = re.findall(r"^(\S+) stdout ----$|^test (\S+) \.\.\. FAILED$", out, re.M)
+    failed_names = sorted({a or b for a, b in names if (a or b)})
+    if failed_names:
+        results["host.failed_names"] = ",".join(failed_names)
+    path = os.path.join(logdir, "verify_host_tests.log")
+    try:
+        with open(path, "w") as f:
+            f.write(out)
+        if failed:
+            results["host.output"] = path
+    except OSError:
+        pass  # never let logging break the gate
 
 
 def wait_for_marker(log_path, timeout=480):
@@ -489,7 +516,7 @@ def main():
     t0 = time.time()
     if args.tier in ("1", "all"):
         tier1_clippy(results)
-        tier1_tests(results)
+        tier1_tests(results, logdir)
     if args.tier in ("2", "all"):
         for smp in [int(s) for s in args.smp.split(",") if s.strip()]:
             boot_once(smp, args.instance, args.memory, logdir, results,

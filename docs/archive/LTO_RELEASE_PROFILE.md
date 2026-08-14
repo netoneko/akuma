@@ -1,17 +1,20 @@
 # Should `[profile.release]` set `lto`? (started 2026-08-14)
 
-> **Status: IN PROGRESS — measured, verified correct, decision not made.** Three
-> arms built and sized (§3); **`lto = "fat"` passes the full gate clean at SMP=1 and
-> SMP=4** (§5.1). What is missing is the *speed* measurement that would justify it
-> and the *self-host* measurement that could rule it out (§5.2–5.3) — i.e. both
-> halves of the actual decision. Handed off from a session that ran out of budget.
+> **Status: DECIDED 2026-08-14 — `[profile.release]` now sets `lto = "thin"`.**
+> Both LTO arms pass the full gate clean at SMP=1 and SMP=4 (§5.1). **Thin was
+> chosen over fat on peak linker memory, not on code quality:** fat peaks at
+> ~1.09 GB against thin's ~779 MB, and this kernel builds itself (acceptance 10),
+> so fat will not link on a 1 GB guest where thin will. Fat also costs 3.6× the
+> link time per iteration against thin's 2.0×.
 >
-> `Cargo.toml` is left at the **baseline** (no `lto` key) so nothing is silently in
-> effect. To re-apply the arm that works, add one line under `[profile.release]`:
+> `extreme-size` keeps `lto = true` (fat) — it declares it explicitly, so it
+> overrides the inherited value; verified byte-identical after the change (§5.5).
+> Every other profile and feature set inherits thin.
 >
-> ```toml
-> lto = "fat"
-> ```
+> **Still unmeasured, and still the point:** the *speed* win this was supposed to
+> buy (§5.2). The image and the inlining evidence say LTO is doing real work; no
+> benchmark yet says it is faster. Also unmeasured: the self-host build itself
+> under thin (§5.3) — the memory argument above is a host-side proxy for it.
 
 ## 1. Why this question exists, and what it decides
 
@@ -110,13 +113,19 @@ If (2) fails, the answer is **not** "no LTO" — it is a separate `release-lto`
 profile, leaving the self-host path on the cheap default. That keeps the decision
 from being all-or-nothing, and it is a smaller change than either alternative.
 
-On the thin-vs-fat axis specifically, **fat currently looks better than thin on every
-axis except build cost**: smaller image, smaller `.text` growth, smaller `.rodata`.
-Thin's usual selling point is being most of the win for a fraction of the cost, and
-here it is *neither* — 10.5% `.text` growth for a 234 KB bigger image. That is worth
-a second look before trusting it; a plausible explanation is that ThinLTO's
-summary-based inlining is duplicating across modules without fat's whole-program view
-to clean up after it, but that is a hypothesis, not a measurement.
+**How that resolved: thin, on memory.** Fat is better on every code-quality axis
+here — smaller image, smaller `.text` growth, smaller `.rodata` — and thin is, oddly,
+*neither* cheap nor small (10.5% `.text` growth for a 234 KB bigger image than
+baseline, which is not what ThinLTO's usual pitch predicts; a plausible explanation
+is summary-based inlining duplicating across modules without fat's whole-program view
+to clean up after it, but that is a hypothesis, not a measurement).
+
+None of that outweighs the one axis this build cares about: **fat peaks at ~1.09 GB
+of linker memory and thin at ~779 MB.** A kernel that compiles itself must link on a
+1 GB machine, so fat is disqualified regardless of producing nicer code, and thin's
+2.0× link cost is the cheaper of the two tolls. If the self-host build later proves
+comfortable with more memory than assumed, fat is a one-word change and §3 has its
+numbers ready.
 
 ## 5. What is NOT done yet
 
@@ -128,9 +137,23 @@ to clean up after it, but that is a hypothesis, not a measurement.
    Phase 7 adds (528 → 533) and `bkl_stuck` (96 → 93, load-driven noise). So fat LTO
    does **not** disturb this kernel's observable behaviour on the gate's coverage.
 
-   **`lto = "thin"` has NOT been gate-tested** — only built and sized. Given fat beats
-   it on every axis except build cost (§3), the thin arm is probably not worth the
-   run; if you disagree, run it before trusting the numbers in §3 for anything.
+   **Thin: DONE and clean too (2026-08-14).** Same result — four clippy configs
+   clean, both SMP widths booted, `[PASS]` 95 and empty failure sets at both, all
+   seven exercises `ok`, 533/0 host tests. So the choice between the two is *not* a
+   correctness question on this coverage; it is the memory/time question in §4.
+
+   One scare on the way, worth knowing about: thin's **first** gate run reported
+   `host.failed: 1` with the total at 430 instead of 533. It did not reproduce in
+   four re-runs, and it is **not LTO** — the same failure with the **identical
+   103-test gap** is recorded in the runbook from the Phase 5 sweep, on a tree with
+   no `lto` key at all. `tier1_tests` now saves `verify_host_tests.log` on every run
+   and reports `host.failed_names`, so the third occurrence should be diagnosable;
+   see the runbook's "One reading this gate produced that nobody could reproduce".
+
+5. **`extreme-size` is unaffected**, as intended: it declares `lto = true`
+   explicitly, so it overrides the inherited `"thin"`. Rebuilt after the change and
+   compared byte for byte — `file=628376 .text=454976 .rodata=66791`, identical to
+   the pre-change build. The 4.0 MB floor acceptance 05 gates on is untouched.
 
    Caveat on what "clean" covers: the gate exercises fork/CoW, ELF loading, mmap and
    the stdio paths. It does **not** cover the self-host build, the devbox profiles, or
@@ -155,16 +178,23 @@ to clean up after it, but that is a hypothesis, not a measurement.
 
 The cheap order, given what is already known:
 
-1. Re-apply `lto = "fat"`, run the full gate, diff against a baseline summary. If
-   the failure sets differ **at all**, that is the finding — stop and investigate,
-   because it means LTO surfaced something real.
-2. Same for `lto = "thin"` only if fat fails or self-host rules it out; on these
-   numbers thin has no advantage worth the extra arm.
-3. Only then measure speed (§5.2). If the win is not visible on a path that
-   demonstrably lost a real call, close §5.10 rather than doing it.
+Both arms are gate-verified, so the remaining work is the two measurements that
+actually justify the setting:
 
-Do not skip step 1 for step 3. A faster kernel that boots differently is not a
-faster kernel.
+1. **Run the self-host build (acceptance 10) under `lto = "thin"`.** This is the
+   constraint the choice was made on, measured only by host-side proxy. If it
+   fails at the link step, the answer is a separate `release-lto` profile, not
+   reverting — see §4.
+2. **Measure the speed win** (§5.2), timed with the
+   `PSTATS_TIMING_PREEMPTION_ARTIFACT` method rather than PSTATS, on a path that
+   demonstrably lost a real call — the signal frame's `save_regs`/`restore_regs`
+   are the cleanest candidates. **If there is no measurable win, that is a result:
+   close §5.10's `#[inline]` audit rather than doing it**, and reconsider whether
+   thin is worth 2× link time at all.
+3. Boot the two devbox profiles, which inherit thin and have only been compiled.
+
+Do not reorder 1 ahead of nothing: a kernel that cannot build itself is worse than
+one that inlines poorly.
 
 ## Background
 

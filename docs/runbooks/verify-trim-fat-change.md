@@ -343,10 +343,29 @@ test failing. Five subsequent runs on the identical tree (three bare
 three times.
 
 It is recorded because it is unexplained, not because it was explained away: the
-gate does not capture `cargo test`'s output, so there is no evidence to diagnose
+gate did not capture `cargo test`'s output, so there was no evidence to diagnose
 after the fact. **If you see a short total with `host.failed: 1`, re-run before
-believing it — and consider teaching `tier1_tests` to save the failing output**,
-which is the change that would turn this from noise into a finding.
+believing it.**
+
+> **It recurred on 2026-08-14, and the delta is the finding: 103, both times.**
+> Second occurrence was on the `lto = "thin"` arm — `host.failed: 1`,
+> `host.tests: 430` against the 533 the same tree scores, i.e. **exactly the same
+> 103-test gap** as the first occurrence's 418-against-521, on a different tree,
+> a different commit and a different profile. Four re-runs scored 533/0.
+>
+> That the gap is *identical* while the tree's total grew by 12 rules out a whole
+> test binary being lost — a binary's own count moved between the two dates, and
+> 103 did not. So it is the same ~103 tests going missing from the same point,
+> which is a much narrower hypothesis than "something aborted".
+>
+> It is **not** LTO: the first occurrence predates that change entirely (Phase 5
+> sweep, no `lto` key anywhere).
+>
+> `tier1_tests` now **writes `verify_host_tests.log` into the gate's log dir on
+> every run** and reports `host.failed_names` plus `host.output` when anything
+> fails — the change this section used to ask for. A passing run's file is the
+> baseline to diff the next failure against, so on the third occurrence this
+> should be answerable in one command instead of a session.
 
 ## Before calling anything a regression
 
