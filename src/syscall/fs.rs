@@ -1,11 +1,11 @@
 use super::*;
-use akuma_net::socket::libc_errno;
-// The `socket` module alias is only used by the smoltcp socket read/write arms.
+// Both of these are only used by the smoltcp socket read/write arms: the module
+// alias, and `libc_errno` for the positive-form error a socket call returns. The
+// negated forms this file returns to userspace come from `super::*`
+// (`akuma_primitives::errno::negated`).
 #[cfg(feature = "smoltcp")]
-use akuma_net::socket;
+use akuma_net::socket::{self, libc_errno};
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
-
-const EROFS: u64 = (-30i64) as u64;
 
 /// RAII guard that runs a VFS syscall **without** the Big Kernel Lock — Phase 4 of
 /// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md. Mirrors
@@ -2107,7 +2107,7 @@ pub(super) fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         let cwd_bytes = proc.cwd.as_bytes();
         if cwd_bytes.len() + 1 > size {
-            return i64::from(-libc_errno::ERANGE) as u64;
+            return ERANGE;
         }
         let mut temp = alloc::vec![0u8; cwd_bytes.len() + 1];
         temp[..cwd_bytes.len()].copy_from_slice(cwd_bytes);

@@ -908,10 +908,24 @@ Each `cow_ref_dec` sits immediately past its function's flagged block.
    fault/CoW paths even if 150 is right for the tree at large — small clones in
    dangerous code outrank large clones in safe code.
 
-## 5.7 Open audit: errno spellings in the syscall layer (raised 2026-08-13)
+## 5.7 Errno spellings in the syscall layer (raised 2026-08-13, DONE 2026-08-14)
 
-**Not yet done — this is a scoped audit to run while the syscall layer is open**
-(alongside Phase 5's user-copy sweep, which is already in `src/syscall/*`).
+> **Status: DONE 2026-08-14.** One table, in `akuma_primitives::errno`, with the
+> pre-negated `u64` forms **generated** from the positive `i32` ones by
+> `neg_errno` at compile time — so the two representations can no longer disagree.
+> 57 production definitions across four modules in two crates and 59 more
+> re-declarations inside five test files collapsed onto 39 names; 120 raw negated
+> literals and 30 hand-rolled `i64::from(-libc_errno::X) as u64` negations are
+> gone. 5 host tests (512 → 517). What the audit below got wrong, and the two
+> comment/value drifts it correctly predicted, are recorded after it.
+>
+> **It was run on its own, ahead of Phase 5's user-copy sweep, not with it.**
+> The sequencing argument below still holds — both passes touch the same syscall
+> arms — but settling the table first means the sweep rewrites each arm once, and
+> a 213-line diff that changes no behaviour is worth A/B-ing by itself rather
+> than inside a 167-site `unsafe` conversion.
+
+**The audit as raised** (the counts are the ones it got wrong; see below).
 Return values should use named constants; today three spellings coexist and one
 file uses two of them.
 
@@ -954,6 +968,105 @@ item 7): one positive-valued table in a crate both sides can reach, `neg_errno`
 as the only place negation happens, and the pre-negated `u64` consts derived
 from it rather than hand-written. Then convert the 15 production sites; the 94
 in test files are a separate, mechanical pass.
+
+### What the audit got wrong
+
+The suggested shape was right and was implemented as written. The *inventory* was
+low on every axis, in the same direction each time — it counted the spellings
+someone had thought to grep for:
+
+| The audit said | Actually |
+|---|---|
+| three tables | **five**. `src/syscall/fs.rs:8` carried a fourth (`EROFS`), one module away from the bin crate's own table, and the five test files carried a fifth spread across 59 per-function declarations |
+| "109 raw negative literals", 15 of them production | **120 raw negated literals** plus **30** sites of an entirely uncounted fourth spelling: `i64::from(-libc_errno::X) as u64`, which reaches the *positive* table and then hand-rolls the negation the `neg_errno()` helper exists to do. `proc.rs` had 13 of these, `term.rs` 9, `fb.rs` 7 |
+| — | a fifth spelling: `neg_errno(95)` in `mod.rs`'s xattr arm — the right helper called with a raw number, which is how a named table gets bypassed by someone who *is* using it |
+| "17 names defined in both" | 17 confirmed, and they are now pinned by `merged_names_kept_the_value_both_old_tables_had`. Picking the wrong side for any one of them would silently change a syscall's errno and nothing else in the tree would have noticed |
+
+`term.rs` also lost its `akuma_net::socket::libc_errno` import entirely, along
+with `fb.rs`'s and `proc.rs`'s: three syscall modules no longer reach into the
+networking crate to find out what `ENOMEM` is. No `cargo tree` edge was cut —
+`akuma-net` already depended on `akuma-primitives` — so judge this one on
+definitions collapsed (116 → 39) and on the drift it made impossible.
+
+### The comment/value drift was real, and there were two
+
+The argument for doing this at all was that "the comment carries the meaning and
+the number carries the behaviour, so they can drift silently". Both halves of the
+tree had already done it:
+
+1. **`term.rs`'s `TIOCSWINSZ` arm returned `-12` (`ENOMEM`) under a comment
+   reading `// ENXIO — no terminal attached`.** `ENXIO` is 6. The five sibling
+   "no terminal state" arms in the same function return the same `-12` with no
+   comment at all, so the *value* is consistent and only the comment was ever
+   wrong. **Not fixed** — Linux returns `ENOTTY` for an ioctl on something that is
+   not a terminal, so changing it is a behaviour change and does not belong in a
+   deduplication pass. The arm now says `ENOMEM` in code with the divergence
+   written down next to it. Anyone picking this up should check what busybox and
+   musl's `isatty` do with `ENOMEM` first.
+2. **`mod.rs`'s xattr comment said `x0 = -95` is `0xffffffa9`.** It is
+   `0xffffffa1`. The rest of that comment — that `!95` is `-96`
+   (`0xffffffa0 = EPFNOSUPPORT`) and breaks musl and Go callers — is correct, and
+   is now a host test rather than a comment
+   (`eopnotsupp_encodes_as_negation_not_complement`).
+
+### Two traps in the mechanical test-file pass
+
+Both would have been silent behaviour changes, and both look exactly like the
+thing being swept:
+
+- **`const AT_FDCWD: u64 = (-100i64) as u64;`** (twice in `process_tests.rs`) is
+  not an errno — and `100` is `ENETDOWN`'s value, so a name-blind sweep renames it
+  to a plausible-looking wrong constant. The converter matched on the *name* and
+  cross-checked the value against the table, and reported both as `SKIP`.
+- **`(-1i64) as u64` in `sync_tests.rs:1968`** is `epoll_wait`'s infinite
+  timeout, not `EPERM`. Left alone.
+
+Also deleted: two commented-out const declarations in `sync_tests.rs` that were a
+sixth copy of the table in comment form.
+
+The `_neg` / `_val` / `_UNSIGNED` locals in the tests were **kept** as bindings
+(`let enosys_neg: u64 = ENOSYS;`) rather than inlined. Their names carry what the
+test is about — that a negated errno has bits 32+ set — and the duplication was
+the literal, which is gone.
+
+### The one check the merge removed, and where it went
+
+Worth stating because it argues against the obvious reading of "delete 59 copies
+of the table". Each of those per-test `const EINVAL: u64 = (-22i64) as u64;`
+declarations was, however badly it scaled, an **independent restatement** of the
+expected number: if a syscall returned the wrong errno, the comparison failed.
+After the merge the boot tests import the same constant the kernel returns, so a
+mistyped digit in the table would move both sides together and all 59 comparisons
+would still pass.
+
+So the merge is only safe with that check re-established in one place:
+`errno::tests::every_value_is_the_linux_number` restates all 39 values as
+literals, and asserts its own list is the same length as the table so a name
+cannot be added without being pinned. It is a deliberate duplication of the
+table, and it is the reason this change is verifiable at all.
+
+### Verification (`docs/runbooks/verify-trim-fat-change.md`)
+
+A/B against a `git worktree` at the parent commit (`9bc2dda8`), Tiers 1–3, both
+arms via `scripts/verify_trim.py`. The summaries differ in **one line**:
+
+```
+7c7
+< host.tests: 512      (baseline)
+> host.tests: 517      (this change)
+```
+
+Everything else is identical arm for arm: 4/4 clippy configurations clean,
+`fail_set` **empty** at SMP=1 *and* SMP=4, `pass_marker` 95 on both,
+`passed_marker` 276 (SMP=1) / 283 (SMP=4) on both, all six Tier 3 exercises `ok`
+(`elftest`, `forkprobe`, `cowstale`, `bssfork`, `bssfork 20 8 1`, `madvshared`),
+`host_timejumps: 0` on both, and `bkl_stuck` 0 / 96 matching. Tier 4 not run:
+nothing here touches the PMM, the fault path or the reclaim escalation.
+
+The final tree measures **516**, not 517: two of the five new tests were merged
+into `every_value_is_the_linux_number` after the arms ran. That is a `#[cfg(test)]`
+change in `akuma-primitives`, which does not compile into the kernel, so the Tier
+2/3 arms stand; Tier 1 was re-run (516 tests, 0 failures, clippy clean).
 
 ## 5.8 The runtime-registration machinery was written three times
 
@@ -1522,7 +1635,7 @@ ELF-loading path into one.
 | 8 | `mmu/mod.rs` `map_user_page` / `_no_flush` and the three walk clones | ~80 | medium | **high** — see `UNSAFE_AUDIT.md` §5.1 |
 | 9 | ~~Test-file clones (`tests.rs`, `process_tests.rs`)~~ **DONE 2026-08-14** — 11 clone families → 11 helpers, absorbing item 6. CPD test-only blocks **17 → 1**; the one left is declined with a reason. Host tests unchanged at 508 and boot tests unchanged at 275/282: every merge extracted a *helper*, none collapsed a test. **The row's framing was wrong** — the duplication is not *between* the two files (they share no identically-named function); all 17 blocks were within-file. Found and fixed two real defects on the way. See §10 | 0 left | — | — |
 | 12 | ~~Runtime-registration machinery (§5.8)~~ **DONE 2026-08-13** — one `akuma_primitives::Registered<T>`; 3 definitions → 1 and **21 spinlock acquisitions removed** from `akuma-net`'s poll/socket paths. Line count a wash; judge it on the locks | 0 left | — | — |
-| 11 | **Errno spellings (§5.7)** — three tables (17 names defined twice, in two representations) + 109 raw negative literals. Run with the Phase 5 syscall sweep | ~130 sites | medium | low |
+| 11 | ~~**Errno spellings (§5.7)**~~ **DONE 2026-08-14** — one `akuma_primitives::errno` table with the negated forms *generated* from the positive ones; 116 definitions → 39, 150 hand-written negations → 0, +5 host tests. It was **five** tables and **four** spellings, not three and two, and the predicted comment/value drift existed in two places (`term.rs` returning `ENOMEM` under an `// ENXIO` comment, recorded and deliberately not fixed). Run **before** the Phase 5 sweep rather than with it, so each syscall arm is rewritten once | 0 left | — | — |
 | 13 | **`#[inline]` audit (§5.10)** — deferred by request 2026-08-13. Both directions: missing attrs on cross-crate hot paths (`[profile.release]` sets no `lto`), and 33 `#[inline(always)]` fighting the `extreme-size` floor. Judge on IMAGE size + a microbenchmark, not counts | ~700 fns surveyed | medium | low |
 | 14 | ~~**The fork/CoW pile ([`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md))**~~ **DONE 2026-08-14** — every row in that document's §9 findings table is closed: F1/F1b/F2/F3/F8 earlier that day, then F4 (six open-coded `dc cvau`/`ic ivau` sequences → one `mmu::sync_icache_range`, which also moved the completion barrier to the correct side of publication), F5 (**retired — not a defect**, §11.2 there), F6 (`FaultSlot::AlreadyHeld`) and F7 (already fixed). The merges landed as §8.1 (CoW-break middle) and §8.2 (`inherit_from` + `spawn_child_thread_and_publish`). **What is left is not this row**: §8 item 5's ~330-line DA/IA body merge and item 8 below, both still high-risk | 0 left | — | — |
 | 10 | Trait-impl clusters (§5.5): `ClientMem`/`NoMem` across crates, duplicate `IrqGuard`, BKL guard family → one generic guard, `impl_display!` macro, duplicate `MultiPollFuture`. **In progress — `akuma-primitives` rungs 1–2 done (§5.555); the `~180` is the wrong metric, see there** | ~180 | small–medium | low |
@@ -1984,10 +2097,16 @@ destination hole), then 167 mechanical conversions. All in `src/syscall/*`, so
 it overlaps nothing above — but it is a large diff, so do not hold it open
 alongside Phase 2's.
 
-**Run the §5.7 errno audit in the same pass.** It is the same files, and both
-are "the call site says one thing and the literal does another" problems. Settle
-the single errno table first, then let the two conversions ride together rather
-than touching every syscall arm twice.
+**The §5.7 errno audit is DONE (2026-08-14) and landed first, on its own.** The
+argument for running them together was that both are "the call site says one thing
+and the literal does another" problems in the same files. What actually happened:
+settling the table is a 213-line diff that changes no behaviour anywhere, which is
+exactly the kind of change that wants its own A/B — bundling it into 167 `unsafe`
+conversions would have made every failure ambiguous. So the sequencing lesson is
+narrower than the row claimed: **settle the table first, then sweep.** The sweep
+now rewrites each arm once, and every arm it touches already returns a named
+constant, so a converted arm's return value is reviewable without re-deriving a
+number.
 
 ### Phase 6 — remaining duplication — IN PROGRESS
 

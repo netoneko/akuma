@@ -400,46 +400,20 @@ pub struct ThreadCpuStat {
     pub name: [u8; 16],
 }
 
-// Linux-compatible negated errno values. The AArch64 syscall ABI returns
-// `-errno` in x0 on failure; userspace decodes via `if ((long)ret < 0) errno = -(int)ret`.
-const EPERM: u64 = (-1i64) as u64;
-const ENOENT: u64 = (-2i64) as u64;
-const ESRCH: u64 = (-3i64) as u64;
-const EINTR: u64 = (-4i64) as u64;
-const EIO: u64 = (-5i64) as u64;
-const E2BIG: u64 = (-7i64) as u64;
-const ENOEXEC: u64 = (-8i64) as u64;
-const EBADF: u64 = (-9i64) as u64;
-const EAGAIN: u64 = (-11i64) as u64;
-const ENOMEM: u64 = (-12i64) as u64;
-const EACCES: u64 = (-13i64) as u64;
-const EFAULT: u64 = (-14i64) as u64;
-const EEXIST: u64 = (-17i64) as u64;
-#[cfg(feature = "sc-containers")]
-const ENODEV: u64 = (-19i64) as u64;
-const ENOTDIR: u64 = (-20i64) as u64;
-const EISDIR: u64 = (-21i64) as u64;
-const EINVAL: u64 = (-22i64) as u64;
-const EMFILE: u64 = (-24i64) as u64;
-const ENOSPC: u64 = (-28i64) as u64;
-const ESPIPE: u64 = (-29i64) as u64;
-const ENOSYS: u64 = (-38i64) as u64;
-const ENOTEMPTY: u64 = (-39i64) as u64;
-const EAFNOSUPPORT: u64 = (-97i64) as u64;
-// Reserved for future socket_bind / socket_listen paths that distinguish a
-// duplicate-bind failure from a generic EINVAL. Kept here so call sites can
-// adopt the symbolic name without re-deriving the negated value each time.
-#[allow(dead_code)]
-const EADDRINUSE: u64 = (-98i64) as u64;
-const ETIMEDOUT: u64 = (-110i64) as u64;
-const EINPROGRESS: u64 = (-115i64) as u64;
-
-/// Encode a positive `libc` errno value as the negated form expected on
-/// the AArch64 syscall ABI return register (`x0 = -errno`).
-#[inline]
-pub fn neg_errno(e: i32) -> u64 {
-    (-i64::from(e)) as u64
-}
+// The negated errno values every syscall arm returns (`x0 = -errno`; userspace
+// decodes via `if ((long)ret < 0) errno = -(int)ret`). These used to be 29
+// hand-written consts here, which is how `E2BIG` came to be defined a second time
+// in `msgqueue.rs` and `EROFS` a third in `fs.rs`: this table was private to the
+// bin crate, so anything outside it — including `akuma-net`, which needs the same
+// values positively signed — had to write its own.
+//
+// One table now, in the dependency-free leaf, with the negated forms generated
+// from the positive ones so they cannot drift. Re-exported rather than imported
+// per-module: the submodules below reach these through `use super::*`, which is
+// how they always saw them.
+// See `akuma_primitives::errno` and TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
+pub use akuma_primitives::errno::negated::*;
+pub use akuma_primitives::errno::neg_errno;
 
 /// ENETDOWN as the syscall ABI expects it. Used by the AF_INET dispatch arms on a
 /// rump-only build (smoltcp compiled out): a socket syscall that somehow reaches
@@ -1055,12 +1029,13 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(feature = "sc-aio")]
         4 => aio::sys_io_getevents(args[0], args[1] as i64, args[2] as i64, args[3], args[4]),
         // Extended attributes syscalls (5-16) - return EOPNOTSUPP (95) on Linux
-        // AArch64. Must be encoded as `x0 = -95` (0xffffffa9), never `!95`
+        // AArch64. Must be encoded as `x0 = -95` (0xffffffa1), never `!95`
         // which is `-96` (0xffffffa0 = EPFNOSUPPORT) and breaks musl/Go callers.
+        // Pinned by `errno::tests::eopnotsupp_encodes_as_negation_not_complement`.
         5..=16 => {
             // setxattr, lsetxattr, fsetxattr, getxattr, lgetxattr, fgetxattr
             // listxattr, llistxattr, flistxattr, removexattr, lremovexattr, fremovexattr
-            neg_errno(95)
+            EOPNOTSUPP
         }
         nr::INOTIFY_INIT1 | nr::INOTIFY_ADD_WATCH | nr::INOTIFY_RM_WATCH => {
             crate::tprint!(128, "[ENOSYS] nr={} (inotify) pid={}\n", syscall_num,

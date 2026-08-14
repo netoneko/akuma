@@ -8,6 +8,14 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use akuma_exec::threading;
 
 use crate::console;
+// The one errno table (`akuma_primitives::errno`), in the negated form a
+// syscall returns. Every test here used to declare its own local consts from
+// raw literals — 94 of them across the five test files, which is how a
+// comment and a number get to disagree. See
+// docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
+use akuma_primitives::errno::negated::{
+    EAGAIN, EFAULT, EINTR, EINVAL, ETIMEDOUT,
+};
 
 const NR_FUTEX: u64 = 98;
 const NR_SIGALTSTACK: u64 = 132;
@@ -28,12 +36,6 @@ const FUTEX_WAKE_PRIVATE: u64 = FUTEX_WAKE | FUTEX_PRIVATE_FLAG;
 const FUTEX_REQUEUE_PRIVATE: u64 = FUTEX_REQUEUE | FUTEX_PRIVATE_FLAG;
 const FUTEX_CMP_REQUEUE_PRIVATE: u64 = FUTEX_CMP_REQUEUE | FUTEX_PRIVATE_FLAG;
 
-const EAGAIN: u64 = (-11i64) as u64;
-const ETIMEDOUT: u64 = (-110i64) as u64;
-const EINVAL: u64 = (-22i64) as u64;
-const EFAULT: u64 = (-14i64) as u64;
-//const EPIPE: u64 = (-32i64) as u64;
-//const EBADF: u64 = (-9i64) as u64;
 
 /// Helper: enable / disable pointer bypass.
 fn set_bypass(v: bool) {
@@ -1923,7 +1925,6 @@ fn test_epoll_eintr_when_signal_pending() {
     const NR_EPOLL_PWAIT: u64 = 22;
     const EPOLL_CTL_ADD: u64 = 1;
     const EPOLLIN: u32 = 0x001;
-    const EINTR: u64 = (-4i64) as u64;
 
     let tid = current_thread_id();
     let pid = 7010u32;

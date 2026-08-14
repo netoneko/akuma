@@ -16,6 +16,14 @@ use alloc::sync::Arc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+// The one errno table (`akuma_primitives::errno`), in the negated form a
+// syscall returns. Every test here used to declare its own local consts from
+// raw literals — 94 of them across the five test files, which is how a
+// comment and a number get to disagree. See
+// docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
+use akuma_primitives::errno::negated::{
+    EFAULT, EINVAL, ENOSYS, ESRCH,
+};
 
 /// Run memory tests (allocator, mmap) - can run before filesystem init
 /// Returns true if all pass
@@ -7122,7 +7130,6 @@ fn test_enosys_syscalls_return_proper_errno() -> bool {
     console::print("\n[TEST] ENOSYS syscalls return proper errno\n");
 
     // ENOSYS = -38 = 0xFFFFFFFFFFFFFFDA (64-bit two's complement)
-    const ENOSYS: u64 = (-38i64) as u64;
 
     // Test io_uring syscalls (NR 425, 426, 427)
     // Bun probes io_uring support at startup and should fall back to epoll
@@ -7141,7 +7148,7 @@ fn test_enosys_syscalls_return_proper_errno() -> bool {
 
     // Test pidfd_open (NR 434) — now implemented; returns ESRCH for non-child pid=1
     let pidfd_open_result = crate::syscall::handle_syscall(434, &[1, 0, 0, 0, 0, 0]);
-    let esrch: u64 = (-3i64) as u64;
+    let esrch: u64 = ESRCH;
     crate::safe_print!(128, "  pidfd_open(434) = {:#x} (expect {:#x} ESRCH)\n",
         pidfd_open_result, esrch);
 
@@ -7193,7 +7200,7 @@ fn test_enosys_is_negative_38() -> bool {
     console::print("\n[TEST] ENOSYS is -38 (crash pattern documentation)\n");
 
     const ENOSYS_SIGNED: i64 = -38;
-    const ENOSYS_UNSIGNED: u64 = (-38i64) as u64;
+    const ENOSYS_UNSIGNED: u64 = ENOSYS;
     const EXPECTED_FAR: u64 = 0xFFFFFFFFFFFFFFDA;
 
     crate::safe_print!(128, "  ENOSYS as i64 = {}\n", ENOSYS_SIGNED);
@@ -7221,8 +7228,6 @@ fn test_enosys_is_negative_38() -> bool {
 fn test_io_setup_and_destroy() -> bool {
     console::print("\n[TEST] io_setup and io_destroy\n");
 
-    const EINVAL: u64 = (-22i64) as u64;
-    const EFAULT: u64 = (-14i64) as u64;
 
     // nr_events=0 must return EINVAL
     let r = crate::syscall::handle_syscall(0, &[0, 0, 0, 0, 0, 0]);
@@ -7843,7 +7848,6 @@ fn test_mmap_einval_through_handle_syscall() -> bool {
     console::print("\n[TEST] handle_syscall mmap EINVAL paths (len==0 / fixed+unaligned)\n");
     use crate::syscall::{MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE};
     const NR_MMAP: u64 = 222;
-    const EINVAL: u64 = (-22i64) as u64;
 
     // mmap(addr=0, len=0, prot=0, flags=0, fd=-1, off=0) → EINVAL (len check).
     let len_zero = crate::syscall::handle_syscall(NR_MMAP, &[0, 0, 0, 0, !0u64, 0]);
@@ -8354,7 +8358,6 @@ fn test_aio_stubs_invalid_ctx_returns_einval() -> bool {
     // CRITICAL: AIO stubs must NEVER return negative values for any ctx.
     // Go treats negative returns as pointers: EINVAL(-22) → *(x0+16) = *(-6) → WILD-DA.
     // All stubs return 0 ("nothing happened") regardless of ctx validity.
-    const ENOSYS: u64 = (-38i64) as u64;
 
     let bad_ctxs: &[u64] = &[0, 0xdeadbeef, 0xffffffffffffffff, 1, 0x1000];
 
@@ -8412,7 +8415,6 @@ fn test_aio_stubs_invalid_ctx_returns_einval() -> bool {
 fn test_aio_stubs_valid_ctx_returns_zero() -> bool {
     console::print("\n[TEST] AIO stubs with valid ctx return 0\n");
 
-    const EFAULT: u64 = (-14i64) as u64;
 
     // Kernel-test stacks are kernel VA; io_setup(null ctx_idp) → EFAULT.
     // io_destroy without io_setup (unknown ctx) → 0 — must not return EINVAL

@@ -963,30 +963,16 @@ pub fn list_sockets() -> Vec<SocketStat> {
 // Error Numbers
 // ============================================================================
 
-pub mod libc_errno {
-    pub const EPERM: i32 = 1;
-    pub const ENOENT: i32 = 2;
-    pub const ESRCH: i32 = 3;
-    pub const EINTR: i32 = 4;
-    pub const EIO: i32 = 5;
-    pub const ENOEXEC: i32 = 8;
-    pub const EBADF: i32 = 9;
-    pub const ECHILD: i32 = 10;
-    pub const EAGAIN: i32 = 11;
-    pub const ENOMEM: i32 = 12;
-    pub const EACCES: i32 = 13;
-    pub const EFAULT: i32 = 14;
-    pub const EEXIST: i32 = 17;
-    pub const EINVAL: i32 = 22;
-    pub const EMFILE: i32 = 24;
-    pub const EPIPE: i32 = 32;
-    pub const ERANGE: i32 = 34;
-    pub const EDESTADDRREQ: i32 = 89;
-    pub const EADDRINUSE: i32 = 98;
-    pub const ENETDOWN: i32 = 100;
-    pub const ECONNABORTED: i32 = 103;
-    pub const ENOTCONN: i32 = 107;
-    pub const ETIMEDOUT: i32 = 110;
-    pub const ECONNREFUSED: i32 = 111;
-    pub const EINPROGRESS: i32 = 115;
-}
+/// Positive `libc` errno values, as the socket layer's `Result<_, i32>` errors
+/// carry them.
+///
+/// These 25 consts used to be defined here, and that was the reason the bin crate
+/// kept a second, pre-negated table of its own: a library crate cannot reach the
+/// bin crate's privates, so whichever side wrote first, the other side copied. The
+/// table now lives in the dependency-free leaf and this is an alias, kept because
+/// `libc_errno::EINVAL` reads correctly at the ~100 call sites that already spell
+/// it that way. New code may use either path — they are the same items.
+///
+/// See `akuma_primitives::errno` and
+/// `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.7.
+pub use akuma_primitives::errno as libc_errno;

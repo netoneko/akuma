@@ -84,7 +84,9 @@ cargo test --target "$HOST" 2>&1 \
   | paste -sd+ - | bc
 ```
 
-> **Baseline as of 2026-08-14: 512** — the arm-2 count of that day's DA/IA
+> **Baseline as of 2026-08-14: 516** — after the §5.7 errno-table merge (+4 in
+> `akuma-primitives`). Was **512** earlier the same day: the arm-2 count of that
+> day's DA/IA
 > demand-paging body merge (`COW_PILE_AUDIT.md` §12.3), whose baseline arm measured
 > **508** on the same tree an hour earlier. Two moves on one day: 506 → 508 → 512, so
 > re-measure. 506 was measured on both arms of that day's `MADV_DONTNEED` A/B —

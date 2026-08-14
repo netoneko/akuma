@@ -1,28 +1,27 @@
-use akuma_net::socket::libc_errno;
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 use super::validate_user_ptr;
-use super::EFAULT;
+use super::{EFAULT, EINVAL, EIO};
 
 pub(super) fn sys_fb_init(width: u32, height: u32) -> u64 {
     if width == 0 || height == 0 || width > 1920 || height > 1080 {
-        return i64::from(-libc_errno::EINVAL) as u64;
+        return EINVAL;
     }
 
     let _drv_bkl = super::fs::DriverBklGuard::new();
     match crate::ramfb::init(width, height) {
         Ok(()) => 0,
-        Err(_) => i64::from(-libc_errno::EIO) as u64,
+        Err(_) => EIO,
     }
 }
 
 pub(super) fn sys_fb_draw(buf_ptr: u64, buf_len: usize) -> u64 {
     if buf_ptr == 0 || buf_len == 0 {
-        return i64::from(-libc_errno::EINVAL) as u64;
+        return EINVAL;
     }
     if !validate_user_ptr(buf_ptr, buf_len) { return EFAULT; }
 
     if !crate::ramfb::is_initialized() {
-        return i64::from(-libc_errno::EIO) as u64;
+        return EIO;
     }
 
     let _drv_bkl = super::fs::DriverBklGuard::new();
@@ -40,7 +39,7 @@ pub(super) fn sys_fb_draw(buf_ptr: u64, buf_len: usize) -> u64 {
         let copied = crate::ramfb::draw(&kernel_buf[..this_chunk]);
         if copied == 0 {
             if total_copied > 0 { return total_copied as u64; }
-            return i64::from(-libc_errno::EIO) as u64;
+            return EIO;
         }
         total_copied += this_chunk;
     }
@@ -49,7 +48,7 @@ pub(super) fn sys_fb_draw(buf_ptr: u64, buf_len: usize) -> u64 {
 
 pub(super) fn sys_fb_info(info_ptr: u64) -> u64 {
     if info_ptr == 0 {
-        return i64::from(-libc_errno::EINVAL) as u64;
+        return EINVAL;
     }
     if !validate_user_ptr(info_ptr, core::mem::size_of::<crate::ramfb::FBInfo>()) { return EFAULT; }
 
@@ -61,6 +60,6 @@ pub(super) fn sys_fb_info(info_ptr: u64) -> u64 {
             }
             0
         }
-        None => i64::from(-libc_errno::EIO) as u64,
+        None => EIO,
     }
 }

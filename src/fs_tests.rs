@@ -7,6 +7,14 @@ use alloc::format;
 
 use crate::console;
 use crate::fs;
+// The one errno table (`akuma_primitives::errno`), in the negated form a
+// syscall returns. Every test here used to declare its own local consts from
+// raw literals — 94 of them across the five test files, which is how a
+// comment and a number get to disagree. See
+// docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
+use akuma_primitives::errno::negated::{
+    EACCES, EEXIST, EINVAL, EIO, EISDIR, EMFILE, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, EROFS,
+};
 
 // ============================================================================
 // Test Runner
@@ -440,17 +448,17 @@ fn test_fs_error_to_errno_mapping() -> bool {
     log("[FS Tests] Test: fs_error_to_errno_mapping\n");
 
     // Linux errno values (negated, as u64)
-    let enoent: u64 = (-2i64) as u64;
-    let eio: u64 = (-5i64) as u64;
-    let eexist: u64 = (-17i64) as u64;
-    let enotdir: u64 = (-20i64) as u64;
-    let eisdir: u64 = (-21i64) as u64;
-    let einval: u64 = (-22i64) as u64;
-    let eacces: u64 = (-13i64) as u64;
-    let emfile: u64 = (-24i64) as u64;
-    let enospc: u64 = (-28i64) as u64;
-    let erofs: u64 = (-30i64) as u64;
-    let enotempty: u64 = (-39i64) as u64;
+    let enoent: u64 = ENOENT;
+    let eio: u64 = EIO;
+    let eexist: u64 = EEXIST;
+    let enotdir: u64 = ENOTDIR;
+    let eisdir: u64 = EISDIR;
+    let einval: u64 = EINVAL;
+    let eacces: u64 = EACCES;
+    let emfile: u64 = EMFILE;
+    let enospc: u64 = ENOSPC;
+    let erofs: u64 = EROFS;
+    let enotempty: u64 = ENOTEMPTY;
 
     let cases: &[(FsError, u64, &str)] = &[
         (FsError::NotFound, enoent, "NotFound -> ENOENT"),

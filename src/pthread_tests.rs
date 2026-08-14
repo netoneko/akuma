@@ -29,6 +29,15 @@
 //! thread (tid 0) — which SSH/networking run on — in a pristine state. A final
 //! safety reset in `run_all_tests` enforces this regardless of test outcome.
 
+// The one errno table (`akuma_primitives::errno`), in the negated form a
+// syscall returns. Every test here used to declare its own local consts from
+// raw literals — 94 of them across the five test files, which is how a
+// comment and a number get to disagree. See
+// docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
+use akuma_primitives::errno::negated::{
+    EFAULT, EINTR, EINVAL, ENOMEM, ENOSYS,
+};
+
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use akuma_exec::threading;
@@ -61,10 +70,6 @@ const SIGTERM: u32 = 15;
 const SIGSTOP: u32 = 19;
 
 // --- errnos -----------------------------------------------------------------
-const EINVAL: u64 = (-22i64) as u64;
-const EFAULT: u64 = (-14i64) as u64;
-const ENOMEM: u64 = (-12i64) as u64;
-const ENOSYS: u64 = (-38i64) as u64;
 
 /// `sigset` bit for a signal number (POSIX: signal N → bit N-1).
 const fn bit(sig: u32) -> u64 {
@@ -630,7 +635,7 @@ fn test_rt_sigsuspend_blocks_then_eintr() {
     assert!(spin_until(&DONE, 20000), "rt_sigsuspend never woke");
     let r = RET.load(Ordering::Acquire);
     assert!(
-        r == (-4i64) as u64, // EINTR
+        r == EINTR,
         "rt_sigsuspend must return -EINTR, got {r:#x}"
     );
     console::print("  [PASS] test_rt_sigsuspend_blocks_then_eintr\n");

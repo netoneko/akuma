@@ -14,9 +14,6 @@ const MSG_NOERROR: i32 = 0o10000;
 const MSGMAX: usize = 8192;
 const MSGMNB: usize = 16384;
 
-const ENOMSG: u64 = (-42i64) as u64;
-const E2BIG: u64 = (-7i64) as u64;
-
 struct KernelMsg {
     mtype: i64,
     data: alloc::vec::Vec<u8>,

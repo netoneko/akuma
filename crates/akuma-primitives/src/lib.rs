@@ -42,6 +42,7 @@
 pub mod addr;
 pub mod clock;
 pub mod console;
+pub mod errno;
 pub mod irq;
 pub mod once;
 pub mod preempt;

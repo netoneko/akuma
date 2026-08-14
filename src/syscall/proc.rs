@@ -1,5 +1,4 @@
 use super::*;
-use akuma_net::socket::libc_errno;
 
 // Maps child PID → the parent thread's generation-tagged WakeHandle for processes
 // created with CLONE_VFORK. The parent blocks after fork until the child calls
@@ -922,7 +921,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
 
     let current_pid = match akuma_exec::process::read_current_pid() {
         Some(p) => p,
-        None => return i64::from(-libc_errno::ECHILD) as u64,
+        None => return ECHILD,
     };
 
     let waiter_tid = akuma_exec::threading::current_thread_id();
@@ -933,7 +932,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
         // fail with ECHILD, not block — see is_child_of_group.
         let waiter_tgid = akuma_exec::process::current_process_shared().map_or(current_pid, |pr| pr.tgid);
         if !akuma_exec::process::is_child_of_group(p, waiter_tgid) {
-            return i64::from(-libc_errno::ECHILD) as u64;
+            return ECHILD;
         }
         if let Some(ch) = akuma_exec::process::get_child_channel(p) {
             loop {
@@ -987,7 +986,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                 crate::safe_print!(128, "[syscall] wait4: no children for PID {}\n", current_pid);
             }
-            return i64::from(-libc_errno::ECHILD) as u64;
+            return ECHILD;
         }
 
         loop {
@@ -1042,7 +1041,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[syscall] wait4: no child found for PID {}\n", pid);
     }
-    i64::from(-libc_errno::ECHILD) as u64
+    ECHILD
 }
 
 pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 {
@@ -1074,7 +1073,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
 
     let current_pid = match akuma_exec::process::read_current_pid() {
         Some(p) => p,
-        None => return i64::from(-libc_errno::ECHILD) as u64,
+        None => return ECHILD,
     };
 
     let waiter_tid = akuma_exec::threading::current_thread_id();
@@ -1084,7 +1083,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
     let result: Option<(u32, i32)> = match idtype {
         P_PID => {
             if !akuma_exec::process::is_child_of_group(id, waiter_tgid) {
-                return i64::from(-libc_errno::ECHILD) as u64;
+                return ECHILD;
             }
             if let Some(ch) = akuma_exec::process::get_child_channel(id) {
                 loop {
@@ -1100,12 +1099,12 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                     akuma_exec::threading::schedule_blocking(u64::MAX);
                 }
             } else {
-                return i64::from(-libc_errno::ECHILD) as u64;
+                return ECHILD;
             }
         }
         P_ALL => {
             if !akuma_exec::process::has_children(current_pid) {
-                return i64::from(-libc_errno::ECHILD) as u64;
+                return ECHILD;
             }
             loop {
                 if let Some((cpid, ch)) = akuma_exec::process::find_exited_child(current_pid) {
@@ -1130,20 +1129,20 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                     Some(akuma_exec::process::FileDescriptor::PidFd(pidfd_id)) => {
                         match super::pidfd::pidfd_get_pid(pidfd_id) {
                             Some(p) => p,
-                            None => return i64::from(-libc_errno::ECHILD) as u64,
+                            None => return ECHILD,
                         }
                     }
                     _ => return EBADF,
                 }
             } else {
-                return i64::from(-libc_errno::ECHILD) as u64;
+                return ECHILD;
             };
             // A pidfd can reference any live process (e.g. Go's os/exec probe opens
             // a pidfd of ITSELF), but waitid on one that is not our child must
             // fail with ECHILD, exactly like Linux — blocking would deadlock the
             // prober against its own exit.
             if !akuma_exec::process::is_child_of_group(target_pid, waiter_tgid) {
-                return i64::from(-libc_errno::ECHILD) as u64;
+                return ECHILD;
             }
             if let Some(ch) = akuma_exec::process::get_child_channel(target_pid) {
                 loop {
@@ -1159,10 +1158,10 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
                     akuma_exec::threading::schedule_blocking(u64::MAX);
                 }
             } else {
-                return i64::from(-libc_errno::ECHILD) as u64;
+                return ECHILD;
             }
         }
-        _ => return i64::from(-libc_errno::EINVAL) as u64,
+        _ => return EINVAL,
     };
 
     if let Some((child_pid, code)) = result {
@@ -1275,7 +1274,7 @@ pub(super) fn sys_getpid() -> u64 {
 /// shared-kernel SMP, so this stub stays for ABI compatibility.
 pub(super) fn sys_core_init(core_idx: usize, init_program_ptr: u64) -> u64 {
     let _ = (core_idx, init_program_ptr);
-    (-38i64) as u64 // ENOSYS
+    ENOSYS
 }
 
 pub(super) fn sys_getppid() -> u64 {

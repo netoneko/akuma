@@ -1,5 +1,4 @@
 use super::*;
-use akuma_net::socket::libc_errno;
 use akuma_terminal::mode_flags;
 use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
@@ -118,14 +117,21 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                     s.term_height = height;
                     return 0;
                 }
-                None => return (-(12i64)) as u64, // ENXIO — no terminal attached
+                // ENOMEM, which is what this arm has always returned — the
+                // comment here read `ENXIO` and never matched the number. Linux
+                // returns ENOTTY for an ioctl on something that is not a
+                // terminal; changing it is a behaviour change, so it is recorded
+                // in TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.7 and not made
+                // here. The other five "no terminal state" arms below return the
+                // same value.
+                None => return ENOMEM,
             }
         }
         SNDCTL_DSP_SPEED | SNDCTL_DSP_SETFMT | SNDCTL_DSP_CHANNELS => {
             // OSS audio params on /dev/dsp. arg is *mut i32 (in/out): the desired
             // value in, the accepted value out (we accept what was requested).
             if !matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::DevDsp)) {
-                return (-(25i64)) as u64; // ENOTTY — not a dsp fd
+                return ENOTTY; // not a dsp fd
             }
             if !validate_user_ptr(arg, 4) { return EFAULT; }
             let mut val: i32 = 0;
@@ -154,7 +160,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             // already the (only) tap, so accept it as a no-op success. Reject
             // on any non-tap fd with ENOTTY.
             if !matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::Tap { .. })) {
-                return (-(25i64)) as u64; // ENOTTY — not a tap fd
+                return ENOTTY; // not a tap fd
             }
             return 0;
         }
@@ -162,7 +168,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     }
 
     if fd > 2 {
-        return (-(25i64)) as u64; // ENOTTY for terminal ioctls on non-TTY fds
+        return ENOTTY; // terminal ioctls on non-TTY fds
     }
 
     // A spawned child's stdin/stdout is a pipe (ProcessChannel), not a real
@@ -173,7 +179,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     if let Some(ch) = akuma_exec::process::current_channel()
         && !ch.is_terminal()
     {
-        return (-(25i64)) as u64; // ENOTTY — fd 0/1/2 are a pipe, not a tty
+        return ENOTTY; // fd 0/1/2 are a pipe, not a tty
     }
 
     let result = match cmd {
@@ -181,7 +187,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             if !validate_user_ptr(arg, 36) { return EFAULT; }
             let term_state_lock = match akuma_exec::process::current_terminal_state() {
                 Some(state) => state,
-                None => return (-(12i64)) as u64,
+                None => return ENOMEM,
             };
             let ts = term_state_lock.lock();
             let mut kernel_buf = [0u32; 9]; // 4 flags + 5 u32 for 20 bytes CC
@@ -201,7 +207,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             if !validate_user_ptr(arg, 36) { return EFAULT; }
             let term_state_lock = match akuma_exec::process::current_terminal_state() {
                 Some(state) => state,
-                None => return (-(12i64)) as u64,
+                None => return ENOMEM,
             };
             let mut kernel_buf = [0u32; 9];
             if unsafe { copy_from_user_safe(kernel_buf.as_mut_ptr().cast::<u8>(), arg as *const u8, 36).is_err() } {
@@ -234,7 +240,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             if !validate_user_ptr(arg, 8) { return EFAULT; }
             let term_state_lock = match akuma_exec::process::current_terminal_state() {
                 Some(state) => state,
-                None => return (-(12i64)) as u64,
+                None => return ENOMEM,
             };
             let ts = term_state_lock.lock();
             let kernel_winsz = [ts.term_height, ts.term_width, 0, 0];
@@ -247,7 +253,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             if !validate_user_ptr(arg, 4) { return EFAULT; }
             let term_state_lock = match akuma_exec::process::current_terminal_state() {
                 Some(state) => state,
-                None => return (-(12i64)) as u64,
+                None => return ENOMEM,
             };
             let ts = term_state_lock.lock();
             let pgid = ts.foreground_pgid;
@@ -263,7 +269,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             if !validate_user_ptr(arg, 4) { return EFAULT; }
             let term_state_lock = match akuma_exec::process::current_terminal_state() {
                 Some(state) => state,
-                None => return (-(12i64)) as u64,
+                None => return ENOMEM,
             };
             let mut pgid: u32 = 0;
             if unsafe { copy_from_user_safe((&raw mut pgid).cast::<u8>(), arg as *const u8, 4).is_err() } {
@@ -276,7 +282,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             ts.foreground_pgid = pgid;
             0
         }
-        _ => (-(25i64)) as u64,
+        _ => ENOTTY,
     };
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
@@ -288,7 +294,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
 fn write_to_process_channel(data: &[u8]) -> u64 {
     let proc_channel = match akuma_exec::process::current_channel() {
         Some(channel) => channel,
-        None => return i64::from(-libc_errno::ENOMEM) as u64,
+        None => return ENOMEM,
     };
     proc_channel.write(data);
     data.len() as u64
@@ -297,7 +303,7 @@ fn write_to_process_channel(data: &[u8]) -> u64 {
 pub(super) fn sys_set_terminal_attributes(_fd: u64, action: u64, mode_flags_arg: u64) -> u64 {
     let term_state_lock = match akuma_exec::process::current_terminal_state() {
         Some(state) => state,
-        None => return i64::from(-libc_errno::ENOMEM) as u64,
+        None => return ENOMEM,
     };
 
     let mut term_state = term_state_lock.lock();
@@ -311,7 +317,7 @@ pub(super) fn sys_set_terminal_attributes(_fd: u64, action: u64, mode_flags_arg:
 
     let proc_channel = match akuma_exec::process::current_channel() {
         Some(channel) => channel,
-        None => return i64::from(-libc_errno::ENOMEM) as u64,
+        None => return ENOMEM,
     };
     proc_channel.set_raw_mode(!term_state.is_canonical());
 
@@ -324,13 +330,13 @@ pub(super) fn sys_set_terminal_attributes(_fd: u64, action: u64, mode_flags_arg:
 
 pub(super) fn sys_get_terminal_attributes(_fd: u64, attr_ptr: u64) -> u64 {
     if attr_ptr == 0 {
-        return i64::from(-libc_errno::EINVAL) as u64;
+        return EINVAL;
     }
     if !validate_user_ptr(attr_ptr, 8) { return EFAULT; }
 
     let term_state_lock = match akuma_exec::process::current_terminal_state() {
         Some(state) => state,
-        None => return i64::from(-libc_errno::ENOMEM) as u64,
+        None => return ENOMEM,
     };
 
     let term_state = term_state_lock.lock();
@@ -375,19 +381,19 @@ pub(super) fn sys_clear_screen() -> u64 {
 
 pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64) -> u64 {
     if buf_ptr == 0 || buf_len == 0 {
-        return i64::from(-libc_errno::EINVAL) as u64;
+        return EINVAL;
     }
     if !validate_user_ptr(buf_ptr, buf_len) { return EFAULT; }
 
 
     let proc_channel = match akuma_exec::process::current_channel() {
         Some(channel) => channel,
-        None => return i64::from(-libc_errno::ENOMEM) as u64,
+        None => return ENOMEM,
     };
 
     let term_state_lock = match akuma_exec::process::current_terminal_state() {
         Some(state) => state,
-        None => return i64::from(-libc_errno::EBADF) as u64,
+        None => return EBADF,
     };
 
     let mut kernel_buf = alloc::vec![0u8; buf_len];
@@ -426,7 +432,7 @@ pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64
 
             if akuma_exec::process::should_interrupt_blocking_syscall() {
                 akuma_exec::sync::lock_bounded(&term_state_lock).input_waker.lock().take();
-                return i64::from(-libc_errno::EINTR) as u64;
+                return EINTR;
             }
 
             if crate::timer::uptime_us() >= deadline {

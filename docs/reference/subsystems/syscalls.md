@@ -75,6 +75,16 @@ See [`../../runbooks/add-syscall-feature.md`](../../runbooks/add-syscall-feature
   line means that number isn't dispatched — decode it against the table.
 - **errno compliance:** negative return values are `-errno`. Tracked in
   `archive/SYSCALL_ERRNO_COMPLIANCE_CHANGES.md` + `archive/SYSCALL_HARDENING.md`.
+- **Where the values come from (one table, since 2026-08-14):**
+  `akuma_primitives::errno`. Use the pre-negated `errno::negated::*` form when
+  returning from a syscall arm — the `src/syscall/` modules already have them in
+  scope through `use super::*` — and the positive form for an error carried inside
+  the kernel (a `Result<_, i32>`), negated once at the boundary with
+  `neg_errno()`. `akuma_net::socket::libc_errno` is an alias of the same table.
+  **Do not write `(-22i64) as u64` or `i64::from(-libc_errno::EINVAL) as u64`**:
+  both spellings existed here, across five tables, and one of them had drifted
+  from its own comment (`archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.7).
+  A name missing from the table is added there, not at the call site.
 - **musl compatibility:** `archive/MUSL_COMPATIBILITY.md`. musl is the userspace
   libc; the kernel aims to run unmodified musl-linked binaries.
 - **`MAX_ARG_STRLEN`:** 128 KB release / 8 KB size / 4 KB extreme (`config.rs:147`). The Go forktest 128 KB fix is a notable regression guard.

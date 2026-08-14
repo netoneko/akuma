@@ -8,6 +8,15 @@ use crate::fs;
 use akuma_exec::process;
 use alloc::string::ToString;
 use alloc::format;
+// The one errno table (`akuma_primitives::errno`), in the negated form a
+// syscall returns. Every test here used to declare its own local consts from
+// raw literals — 94 of them across the five test files, which is how a
+// comment and a number get to disagree. See
+// docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
+use akuma_primitives::errno::negated::{
+    EAFNOSUPPORT, EAGAIN, EBADF, EEXIST, EFAULT, EINTR, EINVAL, EISDIR, ENOENT, ENOSYS, EOPNOTSUPP,
+    EPERM, EPFNOSUPPORT, ESPIPE, ESRCH,
+};
 
 /// Run process tests that require the network stack (call after network init)
 pub fn run_network_tests() {
@@ -2403,9 +2412,6 @@ fn unregister_at_syscall_process(pid: u32, tid: usize) {
 fn test_unlinkat() {
     use crate::syscall::{handle_syscall, nr::UNLINKAT};
 
-    const EBADF: u64 = (-9i64) as u64;
-    const ENOENT: u64 = (-2i64) as u64;
-    const EISDIR: u64 = (-21i64) as u64;
     const AT_FDCWD: i32 = -100;
     const AT_REMOVEDIR: u32 = 0x200;
     const ROOT: &str = "/tmp/unlinkat_selftest";
@@ -2522,8 +2528,6 @@ fn test_openat() {
     use crate::syscall::{handle_syscall, nr};
     use akuma_exec::process::open_flags;
 
-    const EBADF: u64 = (-9i64) as u64;
-    const ENOENT: u64 = (-2i64) as u64;
     const AT_FDCWD: i32 = -100;
     const ROOT: &str = "/tmp/openat_selftest";
     const LEFTOVERS: [&str; 6] = ["creat.txt", "trunc.txt", "sub/rel.txt", "cwd.txt", "link.txt", "target.txt"];
@@ -2687,8 +2691,6 @@ fn test_openat() {
 fn test_renameat() {
     use crate::syscall::{handle_syscall, nr};
 
-    const ENOENT: u64 = (-2i64) as u64;
-    const EEXIST: u64 = (-17i64) as u64;
     const AT_FDCWD: i32 = -100;
     const RENAME_NOREPLACE: u32 = 1;
     const ROOT: &str = "/tmp/renameat_selftest";
@@ -2798,9 +2800,6 @@ fn test_renameat() {
 fn test_mkdirat() {
     use crate::syscall::{handle_syscall, nr};
 
-    const ENOENT: u64 = (-2i64) as u64;
-    const EEXIST: u64 = (-17i64) as u64;
-    const EBADF: u64 = (-9i64) as u64;
     const AT_FDCWD: i32 = -100;
     const ROOT: &str = "/tmp/mkdirat_selftest";
     const LEFTOVERS: [&str; 3] = ["abs_dir", "rel_dir", "sub/dirfd_dir"];
@@ -2903,7 +2902,6 @@ fn test_box_isolation_syscall_guards() {
     use alloc::string::String;
     use core::sync::atomic::Ordering;
 
-    const EPERM: u64 = (-1i64) as u64;
     const BOX_A: u64 = 0x005E_C00A;
     const BOX_B: u64 = 0x005E_C00B;
     const BOX_NESTED: u64 = 0x005E_C00C;
@@ -3102,8 +3100,6 @@ fn test_box_isolation_syscall_guards() {
 fn test_fchmodat() {
     use crate::syscall::{handle_syscall, nr};
 
-    const ENOENT: u64 = (-2i64) as u64;
-    const EBADF: u64 = (-9i64) as u64;
     const AT_FDCWD: i32 = -100;
     const ROOT: &str = "/tmp/fchmodat_selftest";
     const LEFTOVERS: [&str; 3] = ["abs.txt", "rel.txt", "sub/dirfd.txt"];
@@ -3566,8 +3562,6 @@ fn test_mm_bkl_drop() {
     use akuma_exec::threading::current_thread_id;
     use crate::syscall::{handle_syscall, nr};
 
-    const EINVAL: u64 = (-22i64) as u64;
-    const EFAULT: u64 = (-14i64) as u64;
     const MADV_WILLNEED: u64 = 3;
     const MAP_PRIVATE: u64 = 0x02;
     const MAP_ANONYMOUS: u64 = 0x20;
@@ -3679,8 +3673,6 @@ fn test_drivers_bkl_drop() {
     use akuma_exec::threading::current_thread_id;
     use crate::syscall::{handle_syscall, nr};
 
-    const EFAULT: u64 = (-14i64) as u64;
-    const EINVAL: u64 = (-22i64) as u64;
 
     let tid = current_thread_id();
     let pid: u32 = 7704;
@@ -3828,8 +3820,6 @@ fn test_poll_bkl_drop() {
     use crate::syscall::{handle_syscall, nr, BYPASS_VALIDATION};
     use core::sync::atomic::Ordering;
 
-    const EINVAL: u64 = (-22i64) as u64;
-    const EBADF: u64 = (-9i64) as u64;
     const POLLOUT: i16 = 4;
 
     #[repr(C)]
@@ -3988,7 +3978,6 @@ fn test_syscall_bkl_optout() {
     use crate::syscall::{handle_syscall, nr, BYPASS_VALIDATION};
     use core::sync::atomic::Ordering;
 
-    const EFAULT: u64 = (-14i64) as u64;
 
     let tid = current_thread_id();
     let pid: u32 = 7706;
@@ -6188,7 +6177,7 @@ fn test_rt_sigtimedwait_timeout() {
     unregister_thread_pid(tid);
 
     // EAGAIN is 11. In Akuma it's stored as (-11i64) as u64
-    let eagain = (-11i64) as u64;
+    let eagain = EAGAIN;
     if res == eagain {
         console::print("[Test] rt_sigtimedwait_timeout PASSED (returned EAGAIN)\n");
     } else {
@@ -7007,7 +6996,6 @@ fn test_waitid_stub() {
 /// check if a thread exists.  Any wired implementation returns 0; ENOSYS
 /// returns 0xffffffffffffffda (-38).
 fn test_tgkill_not_enosys() {
-    const ENOSYS: u64 = (-38i64) as u64;
     // nr=131 (TGKILL), args: tgid=0, tid=0, sig=0
     let result = crate::syscall::handle_syscall(131, &[0, 0, 0, 0, 0, 0]);
     if result != ENOSYS {
@@ -7135,7 +7123,6 @@ fn test_rump_tap() {
     const AT_FDCWD: u64 = (-100i64) as u64;
     const O_RDWR: u64 = 2;
     const O_NONBLOCK: u64 = 0x800;
-    const EAGAIN: u64 = (-11i64) as u64;
 
     let tid = current_thread_id();
     let pid = 7060;
@@ -7261,13 +7248,6 @@ fn test_syscall_errno_compliance() {
     const NR_SETXATTR: u64 = 5;
     const NR_LSETXATTR: u64 = 6;
     const NR_FREMOVEXATTR: u64 = 16;
-    const EPERM: u64 = (-1i64) as u64;
-    const ESRCH: u64 = (-3i64) as u64;
-    const EBADF: u64 = (-9i64) as u64;
-    const EFAULT: u64 = (-14i64) as u64;
-    const EINVAL: u64 = (-22i64) as u64;
-    const EOPNOTSUPP: u64 = (-95i64) as u64;
-    const EPFNOSUPPORT: u64 = (-96i64) as u64;
 
     // mmap(addr=0, len=0, ...) must return -EINVAL, not -EPERM.
     let mmap_ret = crate::syscall::handle_syscall(NR_MMAP, &[0, 0, 0, 0, !0u64, 0]);
@@ -7302,7 +7282,6 @@ fn test_syscall_errno_compliance() {
     // form (>= 0 so it can't look like an errno); setpriority succeeds.
     const NR_SETPRIORITY: u64 = 140;
     const NR_GETPRIORITY: u64 = 141;
-    const ENOSYS: u64 = (-38i64) as u64;
     let getprio_ret = crate::syscall::handle_syscall(NR_GETPRIORITY, &[0, 0, 0, 0, 0, 0]);
     let setprio_ret = crate::syscall::handle_syscall(NR_SETPRIORITY, &[0, 0, 0, 0, 0, 0]);
     let prio_ok = getprio_ret != ENOSYS && (getprio_ret as i64) >= 0
@@ -7416,7 +7395,6 @@ fn test_msgqueue_send_recv() {
 /// (second msgget without IPC_EXCL returns the existing one).
 /// A third call with IPC_EXCL returns EEXIST.
 fn test_msgqueue_box_isolation() {
-    const EEXIST: u64 = (-17i64) as u64;
     let key: u64 = 0xdeadbeef_u64;
     let flags = IPC_CREAT | 0o600;
 
@@ -7449,7 +7427,6 @@ fn test_msgqueue_box_isolation() {
 /// sys_clone_pidfd returns !0u64 (EFAULT-ish) rather than a child PID — but
 /// that is distinct from ENOSYS (-38), proving the dispatch arm is wired.
 fn test_vfork_dispatch() {
-    const ENOSYS: u64 = (-38i64) as u64;
     const CLONE_VFORK: u64 = 0x4000;
     const CLONE_VM: u64 = 0x100;
     // nr=56 (clone), flags=CLONE_VFORK|CLONE_VM|SIGCHLD
@@ -8678,9 +8655,6 @@ fn test_lseek_nonseekable_returns_espipe() {
     use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid};
     const NR_LSEEK: u64 = 62;
     const SEEK_CUR: u64 = 1;
-    const ESPIPE: u64 = (-29i64) as u64;
-    const EBADF: u64 = (-9i64) as u64;
-    const EINVAL: u64 = (-22i64) as u64;
 
     // The boot suite has no current process; register a throwaway one bound to
     // this thread so the lseek syscall has a process/fd-table to operate on.
@@ -9231,7 +9205,6 @@ fn test_pipe_double_close_no_panic() {
 /// dispatched, not return ENOSYS. (A null sv pointer yields EFAULT, which still
 /// proves the arm is wired — same shape as test_vfork_dispatch.)
 fn test_socketpair_not_enosys() {
-    const ENOSYS: u64 = (-38i64) as u64;
     // socketpair(AF_UNIX=1, SOCK_STREAM=1, proto=0, sv=NULL)
     let result = crate::syscall::handle_syscall(199, &[1, 1, 0, 0, 0, 0]);
     if result != ENOSYS {
@@ -9243,7 +9216,6 @@ fn test_socketpair_not_enosys() {
 
 /// Only AF_UNIX is supported; AF_INET must be rejected with EAFNOSUPPORT.
 fn test_socketpair_domain_rejected() {
-    const EAFNOSUPPORT: u64 = (-97i64) as u64;
     // socketpair(AF_INET=2, SOCK_STREAM=1, 0, NULL)
     let result = crate::syscall::handle_syscall(199, &[2, 1, 0, 0, 0, 0]);
     if result == EAFNOSUPPORT {
@@ -9325,7 +9297,6 @@ fn test_socketpair_recv_send_via_socket_syscalls() {
     const NR_RECVFROM: u64 = 207;
     const NR_SENDMSG: u64 = 211;
     const NR_RECVMSG: u64 = 212;
-    const EBADF: u64 = (-9i64) as u64;
 
     // Local mirrors of the kernel's #[repr(C)] MsgHdr / IoVec layouts.
     #[repr(C)]
@@ -9577,8 +9548,6 @@ fn test_dup3_no_einval_for_valid_args() {
 
     const NR_DUP3: u64 = 24;
     const O_CLOEXEC: u64 = 0x80000;
-    const EINVAL: u64 = (-22i64) as u64;
-    const EBADF: u64 = (-9i64) as u64;
 
     let tid = akuma_exec::threading::current_thread_id();
     let pid = 7001u32;
@@ -12372,10 +12341,10 @@ fn test_blocked_sibling_woken_by_cross_thread_signal() {
 /// Verify the logic: if interrupted, the EINTR constant matches Linux's value.
 fn test_nanosleep_returns_eintr_on_interrupt() {
     // EINTR on ARM64 Linux = 4, returned as -4 (negative errno)
-    let eintr: u64 = (-4i64) as u64;
+    let eintr: u64 = EINTR;
 
     // Verify the constant matches what nanosleep returns
-    let expected_eintr = (-4i64) as u64;
+    let expected_eintr = EINTR;
 
     // The nanosleep loop:
     //   if is_current_interrupted() { return EINTR; }
@@ -12595,9 +12564,9 @@ fn test_clone_thread_tid_write_cow_safe() {
     //
     // Verify: all negative error codes (which have CoW-RO risk) are caught by
     // the bits-32+ guard BEFORE reaching clone_thread.
-    let enosys: u64 = (-38i64) as u64;
-    let eagain: u64 = (-11i64) as u64;
-    let einval: u64 = (-22i64) as u64;
+    let enosys: u64 = ENOSYS;
+    let eagain: u64 = EAGAIN;
+    let einval: u64 = EINVAL;
 
     let all_caught = (enosys >> 32 != 0) && (eagain >> 32 != 0) && (einval >> 32 != 0);
 
@@ -12643,8 +12612,8 @@ fn test_clone_flags_routing() {
         (CLONE_VFORK | CLONE_VM | SIGCHLD, "fork"),  // Go's vfork (0x4111)
         (CLONE_THREAD | CLONE_VM,        "thread"),  // minimal thread
         (0x50f00,                        "thread"),  // Go's full thread flags
-        ((-38i64) as u64,                "enosys"),  // garbage -ENOSYS: bits 32+ set
-        ((-11i64) as u64,                "enosys"),  // garbage -EAGAIN: bits 32+ set
+        (ENOSYS,                         "enosys"),  // garbage -ENOSYS: bits 32+ set
+        (EAGAIN,                         "enosys"),  // garbage -EAGAIN: bits 32+ set
         (0x36,                           "enosys"),  // garbage PID-as-flags
     ];
 
@@ -12675,7 +12644,7 @@ fn test_clone_thread_rejects_zero_stack() {
     // enter clone_thread, but stack=0 should be rejected.
     const CLONE_VM: u64 = 0x100;
     const CLONE_THREAD: u64 = 0x10000;
-    const ENOSYS_NEG: u64 = (-38i64) as u64; // 0xffffffffffffffda
+    const ENOSYS_NEG: u64 = ENOSYS; // 0xffffffffffffffda
 
     // Verify -ENOSYS has CLONE_THREAD|CLONE_VM bits
     let has_thread = ENOSYS_NEG & CLONE_THREAD != 0;
@@ -12706,8 +12675,8 @@ fn test_clone_thread_rejects_zero_stack() {
 /// Before the stack=0 guard returned EAGAIN, -11 looped back into clone_thread.
 /// Now: bits-32+ guard catches all negative values immediately → ENOSYS.
 fn test_clone_garbage_flags_cascade() {
-    let enosys_neg: u64 = (-38i64) as u64;  // 0xffffffffffffffda
-    let eagain_neg: u64 = (-11i64) as u64;  // 0xfffffffffffffff5
+    let enosys_neg: u64 = ENOSYS;  // 0xffffffffffffffda
+    let eagain_neg: u64 = EAGAIN;  // 0xfffffffffffffff5
 
     // All negative error codes have bits 32+ set
     let enosys_caught = enosys_neg >> 32 != 0;
@@ -13649,7 +13618,6 @@ fn test_sigaltstack_set_and_query() {
 /// Go's runtime gracefully falls back to sysmon+tgkill for goroutine preemption,
 /// but documenting this gap is important.
 fn test_timer_create_returns_enosys() {
-    const ENOSYS: u64 = (-38i64) as u64;
     let result = crate::syscall::handle_syscall(107, &[0, 0, 0, 0, 0, 0]);
     if result == ENOSYS {
         console::print("[Test] timer_create_returns_enosys PASSED (expected gap)\n");
@@ -13663,8 +13631,6 @@ fn test_timer_create_returns_enosys() {
 /// Go's runtime calls this after signal delivery interrupts a syscall.
 /// Returning ENOSYS causes Go to crash.
 fn test_restart_syscall_returns_eintr() {
-    const ENOSYS: u64 = (-38i64) as u64;
-    const EINTR: u64 = (-4i64) as u64;
     let result = crate::syscall::handle_syscall(128, &[0, 0, 0, 0, 0, 0]);
     if result == EINTR {
         console::print("[Test] restart_syscall_returns_eintr PASSED\n");
@@ -13679,7 +13645,6 @@ fn test_restart_syscall_returns_eintr() {
 /// Verify handle_syscall returns ENOSYS for unknown syscall numbers,
 /// and that the known Go-critical syscalls are all wired.
 fn test_go_critical_syscalls_not_enosys() {
-    const ENOSYS: u64 = (-38i64) as u64;
     // AArch64 Linux syscall numbers that Go's runtime depends on.
     // EXCLUDES exit(93), exit_group(94), clone(220), execve(221) — calling
     // those with zero args would terminate or fork the test process.
@@ -14449,7 +14414,7 @@ fn test_tgid_leader_vs_member_cleanup() {
 /// Prior syscall returns -22 (EINVAL) which leaks into R0.
 /// clone(-22) has bits 32+ set → ENOSYS (not clone_thread crash).
 fn test_bits32_guard_catches_einval_leakage() {
-    let einval_neg: u64 = (-22i64) as u64; // 0xffffffffffffffea
+    let einval_neg: u64 = EINVAL; // 0xffffffffffffffea
     let caught = einval_neg >> 32 != 0;
 
     // The real flags (0x50f00) would NOT be caught
@@ -14457,7 +14422,7 @@ fn test_bits32_guard_catches_einval_leakage() {
     let real_passes = real_flags >> 32 == 0;
 
     // All negative errnos must be caught
-    let all_neg_caught = [(-1i64) as u64, (-11i64) as u64, (-22i64) as u64, (-38i64) as u64]
+    let all_neg_caught = [EPERM, EAGAIN, EINVAL, ENOSYS]
         .iter()
         .all(|&v| v >> 32 != 0);
 
@@ -14508,8 +14473,8 @@ fn test_futex_wait_unmapped_returns_eagain() {
 
     // For unmapped address: should return EAGAIN, not EFAULT
     // (verified by the fix in src/syscall/sync.rs)
-    let eagain_val: u64 = (-11i64) as u64;
-    let efault_val: u64 = (-14i64) as u64;
+    let eagain_val: u64 = EAGAIN;
+    let efault_val: u64 = EFAULT;
     let returns_eagain = eagain_val != efault_val; // different values
 
     if is_wait && returns_eagain {
