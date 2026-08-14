@@ -107,7 +107,7 @@ they run on more than one core.
 > leak a ticket and hard-deadlock all cores even with `sched_bklfree_el0` OFF —
 > `[BKL] RECOVERED` log lines are live sightings of that still-unfixed leak. The fork-hammer's
 > surviving crash family is now null-deref data corruption (CoW/TLB, hypothesis 4 in
-> [`../../runbooks/debug-smp-fork-corruption.md`](../../runbooks/debug-smp-fork-corruption.md)).
+> [`../../archive/SMP_FORK_EXEC_CORRUPTION_FIX.md`](../../archive/SMP_FORK_EXEC_CORRUPTION_FIX.md)).
 >
 > The earlier "full devbox-smoltcp boot to sshd stalls under active secondaries" item was the
 > M4 open item and is **resolved** by M5a (see below) — boot-to-sshd works at SMP=2 (reliable)
@@ -173,7 +173,7 @@ separately:
   genuinely-parallel **EL0** over fork-CoW-shared frames. The user-PC-=-kernel-addr signature
   resolves exactly to `rust_sync_el0_handler_inner+0x0`, a value never stored as a pointer in the
   source ⇒ context-memory corruption/aliasing. **Full dossier + rank-ordered hypotheses + repro:
-  [`../../runbooks/debug-smp-fork-corruption.md`](../../runbooks/debug-smp-fork-corruption.md).**
+  [`../../archive/SMP_FORK_EXEC_CORRUPTION_FIX.md`](../../archive/SMP_FORK_EXEC_CORRUPTION_FIX.md).**
 
 ## Background
 

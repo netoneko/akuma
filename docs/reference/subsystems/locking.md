@@ -977,5 +977,5 @@ Driving workload: `net4` (concurrent downloads → net + ext2 write), `read4`
 - [`smp-shared.md`](smp-shared.md) — current-state milestone status for
   shared-kernel SMP.
 - [`../../runbooks/debug-smp.md`](../../runbooks/debug-smp.md) and
-  [`../../runbooks/debug-smp-fork-corruption.md`](../../runbooks/debug-smp-fork-corruption.md)
+  [`../../archive/SMP_FORK_EXEC_CORRUPTION_FIX.md`](../../archive/SMP_FORK_EXEC_CORRUPTION_FIX.md)
   — action-first procedures for BKL wedges and fork/CoW corruption.

@@ -1503,7 +1503,7 @@ Recommendation: before touching `fork_process`'s locking, first audit which of i
 (`FORK-DBG step1`..`step8` in the debug logging) touch state that already has its own lock vs.
 state that's genuinely BKL-dependent for cross-core CoW correctness — the same audit VFS got for
 free (every subsystem already had a lock; process/CoW state might not). That audit, plus reading
-`docs/runbooks/debug-smp-fork-corruption.md` in full first, is the right-sized next task — not a
+`archive/SMP_FORK_EXEC_CORRUPTION_FIX.md` in full first, is the right-sized next task — not a
 guard-and-measure cycle straight off this doc's playbook.
 
 **[2026-07-31] That audit is now complete: see

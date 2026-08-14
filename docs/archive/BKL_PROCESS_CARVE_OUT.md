@@ -24,7 +24,7 @@ code path does not meet. Per §16.5's own framing, this is a legitimate outcome.
 three-mechanism fix combination (`LifecycleGuard` + DSB barrier + per-PA
 `COW_FAULT_LOCK`) was confirmed by a fork-hammer at SMP=4: 3 boots × 10 rounds,
 0 fault signatures. See
-[`docs/runbooks/debug-smp-fork-corruption.md`](../runbooks/debug-smp-fork-corruption.md)
+[`SMP_FORK_EXEC_CORRUPTION_FIX.md`](SMP_FORK_EXEC_CORRUPTION_FIX.md)
 for the full validation report. Prerequisite (a) for a BKL carve-out is now
 met; prerequisite (b) (a real process-table lock) remains the blocking item.
 
@@ -93,7 +93,7 @@ any observer**: if another core reads a shared page between the PTE demotion and
 the TLB flush, it may use a stale cached RW TLB entry and write through to the
 shared frame, silently corrupting the child's snapshot. This is exactly the
 class of bug the runbook's "Missing DSB barrier in `demote_range_to_ro`" fix
-(`docs/runbooks/debug-smp-fork-corruption.md` hypothesis 4) addressed — and that
+(`archive/SMP_FORK_EXEC_CORRUPTION_FIX.md` hypothesis 4) addressed — and that
 fix relies on the BKL being held to serialize the demotion against all EL1
 readers.
 
@@ -237,7 +237,7 @@ Not worth pursuing for the SMP contention campaign.
 
 ## 5. The `LifecycleGuard` finding — why the BKL is not redundant here
 
-The fork-corruption runbook (`docs/runbooks/debug-smp-fork-corruption.md`) says
+The fork-corruption runbook (`archive/SMP_FORK_EXEC_CORRUPTION_FIX.md`) says
 in its middle "Status" block: *"Tree state now: LifecycleGuard is a documented
 no-op on every build."* **That statement is stale.** The current code
 (`crates/akuma-exec/src/process/lifecycle.rs:84–90`) shows:
@@ -344,7 +344,7 @@ is structural — it is the lock, not a redundant wrapper around one.
 Two stale claims found during the audit, neither changing the audit's
 conclusion:
 
-1. **`docs/runbooks/debug-smp-fork-corruption.md` "Tree state now" block**: says
+1. **`archive/SMP_FORK_EXEC_CORRUPTION_FIX.md` "Tree state now" block**: says
    *"LifecycleGuard is a documented no-op on every build."* The code
    (`lifecycle.rs:85–86`) shows it calling `disable_preemption()` under
    `cfg(kernel_smp_shared)` — it is **active**, not a no-op. This matches the
@@ -720,7 +720,7 @@ FAILED: crashed during boot 1
 ```
 
 The "3 boots × 10 rounds, 0 faults" line at the top of
-`docs/runbooks/debug-smp-fork-corruption.md` is therefore **not corroborated by
+`archive/SMP_FORK_EXEC_CORRUPTION_FIX.md` is therefore **not corroborated by
 the harness it cites** and should be re-derived before being relied on.
 
 ### 9.9 Feature wiring

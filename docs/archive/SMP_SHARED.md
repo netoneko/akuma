@@ -652,7 +652,7 @@ with 0 stuck.
 ## Lifecycle preemption guard + two liveness fixes (2026-07-21)
 
 A full debugging session on the SMP=4 fork-hammer corruption
-(`docs/runbooks/debug-smp-fork-corruption.md` is the detailed dossier; this is the
+(`archive/SMP_FORK_EXEC_CORRUPTION_FIX.md` is the detailed dossier; this is the
 progress-log summary). Net result: the **mixed-EL context corruption stopped appearing**,
 two previously-unknown **whole-box deadlocks were root-caused and fixed** (one in the BKL
 itself), and the surviving crash population changed shape — pointing the next session at
@@ -749,14 +749,14 @@ fails and never advances the queue).
 
  **Files:** `crates/akuma-exec/src/process/{lifecycle,spawn,image,mod}.rs`,
  `crates/akuma-exec/src/threading/mod.rs`, `crates/akuma-exec/src/sync.rs`,
- `src/timer.rs`, `docs/runbooks/debug-smp-fork-corruption.md`.
+ `src/timer.rs`, `archive/SMP_FORK_EXEC_CORRUPTION_FIX.md`.
 
 ## Cross-core CoW/TLB protocol fixes (2026-07-21 evening)
 
  **Problem:** The surviving crash family under SMP=4 fork-hammer: shells die with
  `WILD-DA FAR=0x0` at valid busybox PCs ~1s into life (`last_sc=ppoll`) — DATA
  corruption, not context corruption. Lead hypothesis was cross-core CoW/TLB
- coherence in `fork_process` (hypothesis 4 in `debug-smp-fork-corruption.md`).
+ coherence in `fork_process` (hypothesis 4 in `SMP_FORK_EXEC_CORRUPTION_FIX.md`).
 
  **Root causes found and fixed:**
 
