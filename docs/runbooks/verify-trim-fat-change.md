@@ -84,7 +84,10 @@ cargo test --target "$HOST" 2>&1 \
   | paste -sd+ - | bc
 ```
 
-> **Baseline as of 2026-08-13: 486** — was 455 when this runbook was written, 463
+> **Baseline as of 2026-08-14: 506** — measured on both arms of that day's
+> `MADV_DONTNEED` A/B — identical on both arms, so it is the count on a clean tree
+> and not something that change moved. Was **486** on 2026-08-13, before the
+> `akuma-pmm` extraction landed. Previously 455 when this runbook was written, 463
 > before the Phase 6 item 5 guard merge, 467 after it (+4 `FaultSlot::reclaim_report`),
 > then 486 after the memory-math move (+8 `fork_copy_math_tests`, +11
 > `memmath::tests`). Re-measure rather than trusting this line; it has gone stale
@@ -221,6 +224,7 @@ Memory / fork / CoW binaries already on `disk.img` — all self-reporting:
 | `bssfork` | `failures=0` … `bssfork PASS` |
 | `bssfork 20 8 1` | `failures=0` … `bssfork PASS`. **Not `bssfork spread=1`** — the binary's CLI is positional (`bssfork [rounds] [threads] [spread]`), not `key=value`; running the literal string `spread=1` feeds it into `rounds`, `strtoul` parses that as `0`, and `spread` silently defaults to `0` too. `rounds=0` skips the fork loop entirely, so `g_stop` fires almost instantly and the liveness check flags threads `[never ran]` before they get scheduled at all — nothing to do with CoW or the kernel. **Corrected 2026-08-14**: the "BROKEN PRE-EXISTING" verdict recorded here on 2026-08-13 (`failures=7`/`8`, `ticks=0`, "unexplained regression") was this same mis-invocation on both `main` and the branch; the real control, invoked correctly, passed 8/8 clean runs at SMP=4 on first re-check. See `docs/archive/PMM_EXTRACT.md` §8 for the full correction |
 | `cowstale` | `reader_faults=0 failures=0` … `cowstale PASS` |
+| `madvshared` | `madvshared: ALL PASS`. `MADV_DONTNEED` on a CoW-shared frame must not touch the peer's page — the null-`Rc` mechanism (`proposals/CARGO_HEAP_NULL_RC.md`), fixed 2026-08-14. Deterministic, milliseconds, no allocator involved, and **calibrated**: the identical static binary PASSes all three phases on real Linux arm64 (`docker run --rm --platform linux/arm64 -v "$PWD:/w:ro" alpine /w/madvshared`), so a FAIL is the kernel, not the probe. Before the fix it reported `2 FAIL` at both SMP=1 and SMP=4 |
 | `mmapsum <path>` | three digests (`madv:`/`mtA:`/`mtB:`); **needs a path argument** |
 | `forktest_parent -duration=20s` | `All children processed via epoll. Parent exiting.` |
 

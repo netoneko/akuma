@@ -84,26 +84,40 @@ pub const MAP_FIXED_NOREPLACE: u32 = 0x100000;
 pub const PROT_NONE: u32 = 0;
 pub const PROT_WRITE: u32 = 0x2;
 
-// ── `MADV_DONTNEED` divergence audit ─────────────────────────────────────────
+// ── `MADV_DONTNEED` share-breaking audit ─────────────────────────────────────
 //
-// Akuma's `MADV_DONTNEED` zeroes the *physical frame* in place, where Linux drops
-// the *mapping* and lets the next touch fault in a fresh zero page. The two agree
-// for a page owned by one address space and disagree — destructively — for a
-// shared one. These counters say whether that divergence is actually being
-// exercised, which is what separates theory 3 in proposals/CARGO_HEAP_NULL_RC.md
-// from the refcount theories above it. Both are expected to read 0; a non-zero
-// value is a lead, not noise.
+// Akuma's `MADV_DONTNEED` used to zero the *physical frame* in place. That agrees
+// with Linux for a page owned by one address space and disagrees — destructively —
+// for a shared one: the peer's live page went to zeroes too. That was the
+// null-`Rc` mechanism (proposals/CARGO_HEAP_NULL_RC.md), demonstrated
+// deterministically by `userspace/forktest/c_stress/madvshared.c` and fixed
+// 2026-08-14 by [`dontneed_page_action`] — a shared page now gets a private zero
+// frame of its own and the peer keeps its data.
+//
+// These counters stay because they are how the fix is observed from the outside:
+// `dontneed_share_break` climbing on a fork-heavy workload is the corruption that
+// is no longer happening.
 
 /// `MADV_DONTNEED` calls whose start address was not page-aligned. Linux rejects
 /// these with `EINVAL`; rounding the start DOWN pulls the caller's live head page
-/// into the zeroed range.
+/// into the zeroed range. Still unfixed — deliberately a separate cycle
+/// (`CARGO_HEAP_NULL_RC.md` § "The fix", follow-on 1); it has never read non-zero.
 pub static DONTNEED_UNALIGNED: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-/// Pages zeroed by `MADV_DONTNEED` whose frame carried a share reference
-/// (`cow_ref > 0`) — i.e. a post-fork CoW page or a `file_page_cache` page. Each
-/// one wiped a frame some other address space still maps.
+/// Pages whose frame was shared with another address space (`cow_ref >= 2` — a
+/// post-fork CoW page or a `file_page_cache` page) and which therefore took the
+/// share-breaking path instead of being zeroed in place. Before 2026-08-14 every
+/// one of these wiped a frame some other address space still maps.
 pub static DONTNEED_SHARED_FRAME: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Shared pages left **untouched** because no replacement frame was available:
+/// the PMM had none (`MADV_DONTNEED` is advisory, so failing to zero beats
+/// wiping a peer), or a fork landed between this handler's classify and apply
+/// passes and made a page shared that was private a moment earlier. Expected 0;
+/// a climbing value means memory pressure is reaching this path.
+pub static DONTNEED_SHARE_BREAK_SKIPPED: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 /// The page range `MADV_DONTNEED` actually zeroes for `(addr, len)`, as
@@ -123,6 +137,43 @@ pub fn dontneed_zero_range(addr: usize, len: usize) -> (usize, usize) {
     (start, (end - start) / 4096)
 }
 
+/// What `MADV_DONTNEED` must do with one page of the range, given the page's
+/// state. Pure so the rule can be host-tested at the boundary instead of being
+/// inferred from the handler (same reasoning as [`dontneed_zero_range`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DontneedAction {
+    /// Nothing mapped at this VA: a lazy region (or a later fault) already
+    /// yields zeroes, so there is nothing to do.
+    Nothing,
+    /// This address space is the frame's only holder — zeroing it in place is
+    /// indistinguishable from Linux's drop-and-refault and costs no allocation.
+    ZeroInPlace,
+    /// Another address space maps this frame too. Zeroing it would wipe *their*
+    /// live page, which is the null-`Rc` corruption. Give this address space a
+    /// private zero frame instead and drop its share reference.
+    BreakSharing,
+}
+
+/// The per-page rule, over the two facts the handler can observe: whether the VA
+/// is mapped, and how many address spaces hold the frame.
+///
+/// `cow_ref` counts **address spaces**, and the first share inserts 2 (see
+/// `akuma_pmm::cow_ref_inc`) — so `>= 2` is the only value that means "someone
+/// else can see this frame". `1` is a peer that has already gone away (a
+/// `file_page_cache` entry mapped nowhere else, or a fork sibling that exited or
+/// broke CoW), and `0` is a frame that was never shared; neither has a peer to
+/// corrupt, so both take the cheap path.
+#[must_use]
+pub fn dontneed_page_action(mapped: bool, cow_ref: u16) -> DontneedAction {
+    if !mapped {
+        DontneedAction::Nothing
+    } else if cow_ref >= 2 {
+        DontneedAction::BreakSharing
+    } else {
+        DontneedAction::ZeroInPlace
+    }
+}
+
 /// One-line summary of the `MADV_DONTNEED` audit counters for the PSTATS block.
 /// Writes into the caller's buffer instead of returning a `String` — same
 /// heap-free rationale as `file_page_cache::stats_line`.
@@ -130,9 +181,10 @@ pub fn dontneed_audit_line(w: &mut dyn core::fmt::Write) {
     use core::sync::atomic::Ordering;
     let _ = writeln!(
         w,
-        "[MADV] dontneed_unaligned={} dontneed_shared_frame={}",
+        "[MADV] dontneed_unaligned={} dontneed_shared_frame={} dontneed_skipped={}",
         DONTNEED_UNALIGNED.load(Ordering::Relaxed),
         DONTNEED_SHARED_FRAME.load(Ordering::Relaxed),
+        DONTNEED_SHARE_BREAK_SKIPPED.load(Ordering::Relaxed),
     );
 }
 
@@ -755,6 +807,197 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
     }
 }
 
+/// How many pages of `[aligned_addr, +pages)` need a private replacement frame —
+/// pass 1 of [`madvise_dontneed_range`], and the number of frames to allocate
+/// before pass 2 takes `as_lock` again.
+///
+/// Allocation-free by construction: the caller runs this inside the `as_lock`
+/// hold, which masks IRQs, so touching the heap here would be a lock-order
+/// violation waiting to happen.
+pub fn dontneed_count_shared(
+    aspace: &akuma_exec::mmu::UserAddressSpace,
+    aligned_addr: usize,
+    pages: usize,
+) -> usize {
+    let mut n = 0usize;
+    for i in 0..pages {
+        let pa = aspace.translate(aligned_addr + i * 4096).map(|pa| pa & !0xFFF);
+        let cow = pa.map_or(0, crate::pmm::cow_ref_get);
+        if dontneed_page_action(pa.is_some(), cow) == DontneedAction::BreakSharing {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// What pass 2 did, for the audit counters and for returning the unused spares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DontneedOutcome {
+    /// Replacement frames consumed — the first `used` entries of `spares` are now
+    /// installed in the address space and must NOT be freed by the caller.
+    pub used: usize,
+    /// Pages whose share was broken (a peer's frame left intact).
+    pub broke: usize,
+    /// Shared pages left untouched for want of a replacement frame.
+    pub skipped: usize,
+}
+
+/// Pass 2 of [`madvise_dontneed_range`]: apply the per-page rule, consuming
+/// `spares` in order for the pages that need a private frame and pushing every
+/// frame the caller must return to the PMM onto `to_free`.
+///
+/// Split out of the closure so the boot suite can drive it against a real
+/// `UserAddressSpace` and a real CoW-shared frame — the defect is a
+/// *cross-address-space* one, and a test on either ledger alone cannot see it.
+pub fn dontneed_apply(
+    aspace: &mut akuma_exec::mmu::UserAddressSpace,
+    aligned_addr: usize,
+    pages: usize,
+    spares: &[crate::pmm::PhysFrame],
+    to_free: &mut alloc::vec::Vec<crate::pmm::PhysFrame>,
+) -> DontneedOutcome {
+    let mut out = DontneedOutcome::default();
+    for i in 0..pages {
+        let va = aligned_addr + i * 4096;
+        let pa = aspace.translate(va).map(|pa| pa & !0xFFF);
+        let cow = pa.map_or(0, crate::pmm::cow_ref_get);
+        match dontneed_page_action(pa.is_some(), cow) {
+            DontneedAction::Nothing => {}
+            DontneedAction::ZeroInPlace => {
+                aspace.zero_mapped_page(va);
+            }
+            DontneedAction::BreakSharing => {
+                let Some(new_frame) = spares.get(out.used).copied() else {
+                    out.skipped += 1;
+                    continue;
+                };
+                out.used += 1;
+                // Clear the PTE and give up this address space's reference to the
+                // shared frame. `unmap_and_free_page` reports `Some` only when it
+                // dropped the frame's LAST VA here — the same `released_last_va`
+                // gate `complete_cow_break` uses, and the only thing standing
+                // between this and the §5.6 refcount underflow. `pmm::free_page`
+                // then routes through `cow_ref_dec` and declines to free the
+                // physical frame while the peer still holds it.
+                if let Some(old) = aspace.unmap_and_free_page(va) {
+                    to_free.push(old);
+                }
+                // RW_NO_EXEC, matching `complete_cow_break`: a CoW-shared page is
+                // mapped RO regardless of the region's real protection, so the old
+                // PTE's bits cannot be copied forward — an RO replacement would
+                // take a write fault with `cow_ref=0` and no lazy region, the
+                // unrecoverable `[WPF] … lazy_self=NONE` shape.
+                if aspace
+                    .map_page(va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
+                    .is_ok()
+                {
+                    aspace.track_user_frame(new_frame);
+                    out.broke += 1;
+                } else {
+                    to_free.push(new_frame);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `MADV_DONTNEED` over `[aligned_addr, aligned_addr + pages*4096)`: every mapped
+/// page in the range reads back as zeroes afterwards, **and no page any other
+/// address space maps is written to**.
+///
+/// The second half is the whole point. This handler used to `memset` the physical
+/// frame in place, which is correct only while the frame has exactly one holder.
+/// After a `fork` it does not: parent and child share the frame CoW, and zeroing
+/// it destroyed the peer's live page — 0 of 4096 bytes surviving, measured. That
+/// is the null-`Rc` crash in cargo's `-j4` self-host build
+/// (proposals/CARGO_HEAP_NULL_RC.md): cargo forks per rustc invocation, so its
+/// heap is full of CoW-shared frames, and jemalloc reaches `MADV_DONTNEED` by
+/// probing `MADV_FREE` and falling back on its `EINVAL`. `madvshared` is the
+/// deterministic probe; `cowstale`/`bssfork` are the no-regression check.
+///
+/// A shared page is handled by **breaking the share, not by dropping the
+/// mapping**. Linux drops the mapping and lets the next touch refault, and the
+/// proposal proposed exactly that — but it does not survive contact with this
+/// kernel: eager `mmap`s (anything ≤ `config::MMAP_EAGER_MAX_PAGES`, which is
+/// every page `madvshared` and most allocators' small runs touch) register **no**
+/// lazy region, so `ensure_user_page_mapped` has nothing to demand-page from and
+/// the next touch is a SIGSEGV instead of a zero page. Installing a private zero
+/// frame gives the caller the identical observable result — mapped, readable,
+/// all zeroes — with no dependency on the region bookkeeping, so it is uniform
+/// across eager and lazy mappings alike.
+///
+/// Two-pass because of the lock rules: frames must be allocated **outside**
+/// `as_lock` (the PMM's reclaim path re-enters it and the `Spinlock` is not
+/// reentrant), and the page state that says how many frames are needed can only
+/// be read from the page tables. Pass 1 counts under the hold, the allocation
+/// happens between the holds, pass 2 re-reads every page and acts on what it
+/// finds *then* — so a peer that broke CoW in the window is simply seen as
+/// unshared, and a page that became shared in the window (a concurrent `fork`)
+/// finds no spare frame and is skipped rather than wiped.
+fn madvise_dontneed_range(
+    proc: &akuma_exec::process::Process,
+    aligned_addr: usize,
+    pages: usize,
+) {
+    use core::sync::atomic::Ordering;
+
+    // Pass 1 — count the pages that need a private replacement frame. No
+    // allocation: `as_lock` is held with IRQs masked, so this closure must not
+    // touch the heap.
+    let shared_pages =
+        proc.with_address_space(|aspace| dontneed_count_shared(aspace, aligned_addr, pages));
+
+    // Between the holds: allocate. `alloc_pages_zeroed` is the batch path (one
+    // PMM acquisition); if it cannot serve the whole batch, take what the
+    // reclaim-aware per-page allocator will give and skip the remainder — the
+    // advice is advisory, and not zeroing a page is a far better failure than
+    // zeroing someone else's.
+    let mut spares: alloc::vec::Vec<crate::pmm::PhysFrame> = if shared_pages == 0 {
+        alloc::vec::Vec::new()
+    } else if let Some(v) = crate::pmm::alloc_pages_zeroed(shared_pages) {
+        v
+    } else {
+        let mut v = alloc::vec::Vec::with_capacity(shared_pages);
+        for _ in 0..shared_pages {
+            match crate::pmm::alloc_page_zeroed_user() {
+                Some(f) => v.push(f),
+                None => break,
+            }
+        }
+        v
+    };
+    for frame in &spares {
+        crate::pmm::track_frame(*frame, akuma_exec::runtime::FrameSource::UserData);
+    }
+
+    // Old frames whose last VA in this address space went away, and any
+    // replacement that could not be installed. Freed after the hold; the `Vec` is
+    // pre-reserved so the pushes inside it never hit the allocator.
+    let mut to_free: alloc::vec::Vec<crate::pmm::PhysFrame> =
+        alloc::vec::Vec::with_capacity(spares.len() * 2);
+
+    // Pass 2 — apply. `translate` / `zero_mapped_page` / `unmap_and_free_page`
+    // all read page-table state, so the hold is what keeps a concurrent BKL-free
+    // fault from editing the tables underneath them.
+    let DontneedOutcome { used, broke, skipped } = proc.with_address_space(|aspace| {
+        dontneed_apply(aspace, aligned_addr, pages, &spares, &mut to_free)
+    });
+
+    for frame in spares.drain(used..) {
+        crate::pmm::free_page(frame);
+    }
+    for frame in to_free {
+        crate::pmm::free_page(frame);
+    }
+    if broke > 0 {
+        DONTNEED_SHARED_FRAME.fetch_add(broke, Ordering::Relaxed);
+    }
+    if skipped > 0 {
+        DONTNEED_SHARE_BREAK_SKIPPED.fetch_add(skipped, Ordering::Relaxed);
+    }
+}
+
 pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
     const MADV_WILLNEED: i32 = 3;
     const MADV_DONTNEED: i32 = 4;
@@ -832,31 +1075,15 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
             };
             let _mm_window = MmBklGuard::new();
             let (aligned_addr, pages) = dontneed_zero_range(addr, len);
-            // Audit both ways this handler can differ from Linux and wipe live data
-            // (proposals/CARGO_HEAP_NULL_RC.md, theory 3). Counters only — behaviour
-            // is unchanged until the evidence says which one fires.
             if addr & 0xFFF != 0 {
                 // Linux returns EINVAL for an unaligned start; rounding it DOWN
-                // instead means the partial head page — someone else's live data —
-                // is inside the range about to be zeroed.
+                // instead means the partial head page — the caller's live data — is
+                // inside the range about to be zeroed. Counted, not fixed: a
+                // separate divergence with its own verification cycle, and it has
+                // never read non-zero (`CARGO_HEAP_NULL_RC.md`, follow-on 1).
                 DONTNEED_UNALIGNED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
-            // `zero_mapped_page` reads page-table state to find each frame; hold
-            // `as_lock` so a concurrent BKL-free fault can't edit the tables under it.
-            proc.with_address_space(|aspace| {
-                for i in 0..pages {
-                    let va = aligned_addr + i * 4096;
-                    // Linux drops the *mapping*; this handler memsets the *frame*. On
-                    // a frame shared with another address space — CoW after fork, or a
-                    // `file_page_cache` page — that wipes the peer's live copy too.
-                    if let Some(pa) = aspace.translate(va)
-                        && crate::pmm::cow_ref_get(pa & !0xFFF) > 0
-                    {
-                        DONTNEED_SHARED_FRAME.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    }
-                    aspace.zero_mapped_page(va);
-                }
-            });
+            madvise_dontneed_range(proc, aligned_addr, pages);
             0
         }
         // Akuma does not implement MADV_FREE, so say so instead of fabricating

@@ -83,7 +83,16 @@ CLIPPY_CONFIGS = [
 # ticks=0, on both `main` and this branch) — corrected 2026-08-14, see
 # docs/archive/PMM_EXTRACT.md §8. `bssfork 20 8 1` is the real spread=1 control
 # and passes cleanly; keep both entries so a regression in either shape is caught.
+#
+# `madvshared` is the pass condition for the MADV_DONTNEED share-breaking fix
+# (proposals/CARGO_HEAP_NULL_RC.md): it builds a CoW-shared frame by hand, with no
+# allocator in the way, and reports whether a peer's page survived the advise. It
+# runs in milliseconds and it is calibrated — the identical static binary PASSes
+# all three phases on real Linux arm64, so a FAIL here is the kernel, not the
+# probe. On a tree without the fix it reports two FAILs; `cowstale`/`bssfork` are
+# the no-regression check beside it.
 EXERCISES = [
+    ("madvshared", "madvshared", "madvshared: ALL PASS"),
     ("cowstale", "cowstale", "cowstale PASS"),
     ("bssfork", "bssfork", "bssfork PASS"),
     ("bssfork_spread1", "bssfork 20 8 1", "bssfork PASS"),

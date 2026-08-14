@@ -704,6 +704,7 @@ pub fn run_all_tests() {
     test_fork_cow_share_incs_once_per_frame();
     test_cow_ref_ledger_records_history();
     test_madvise_dontneed_range_semantics();
+    test_madvise_dontneed_spares_shared_frame();
 
     // A write fault the page table already permits must be absorbed, not turned
     // into SIGSEGV — the fix for proposals/COWSTALE_FORK_THREAD_SEGV.md.
@@ -5402,7 +5403,131 @@ fn test_madvise_dontneed_range_semantics() {
     // Zero length still clears the head page when the start is unaligned.
     assert!(dontneed_zero_range(0x4800, 0) == (0x4000, 1));
 
+    // The per-page rule. `cow_ref` counts ADDRESS SPACES and the first share
+    // inserts 2, so 2 is the smallest value that means "someone else can see this
+    // frame" — and the only one where zeroing in place would destroy a peer's
+    // page. 1 is a peer that has already gone (exited, or broke CoW itself), 0 was
+    // never shared; both are ours alone and take the cheap path.
+    use crate::syscall::mem::{DontneedAction, dontneed_page_action};
+    assert!(dontneed_page_action(false, 0) == DontneedAction::Nothing);
+    assert!(dontneed_page_action(false, 7) == DontneedAction::Nothing,
+        "an unmapped VA has nothing to break, whatever the frame's count says");
+    assert!(dontneed_page_action(true, 0) == DontneedAction::ZeroInPlace);
+    assert!(dontneed_page_action(true, 1) == DontneedAction::ZeroInPlace);
+    assert!(dontneed_page_action(true, 2) == DontneedAction::BreakSharing);
+    assert!(dontneed_page_action(true, u16::MAX) == DontneedAction::BreakSharing);
+
     console::print("[Test] madvise_dontneed_range PASSED\n");
+}
+
+/// `MADV_DONTNEED` on a CoW-shared page must leave the **peer's** page alone.
+///
+/// This is the root cause of the cargo null-`Rc` crash
+/// (proposals/CARGO_HEAP_NULL_RC.md): the handler used to `memset` the physical
+/// frame, which after a `fork` is the same frame the peer is still reading — 0 of
+/// 4096 bytes survived, measured in-guest by
+/// `userspace/forktest/c_stress/madvshared.c` and PASSing on real Linux arm64 with
+/// the identical binary. jemalloc reaches `MADV_DONTNEED` by probing `MADV_FREE`
+/// and falling back on its `EINVAL`, and cargo forks per rustc invocation, so its
+/// heap is exactly the shape this destroys.
+///
+/// Driven against a real `UserAddressSpace` and a real CoW-shared frame, both
+/// arms in one test, because the bug is a *cross-address-space* one: the peer's
+/// bytes are the assertion, and neither ledger alone can show them.
+fn test_madvise_dontneed_spares_shared_frame() {
+    use crate::syscall::mem::{dontneed_apply, dontneed_count_shared};
+
+    const SHARED_VA: usize = 0xC000_0000;
+    const PRIVATE_VA: usize = 0xC000_1000;
+    const PATTERN: u8 = 0xA5;
+
+    fn fill(frame: crate::pmm::PhysFrame, byte: u8) {
+        unsafe {
+            core::ptr::write_bytes(
+                akuma_exec::mmu::phys_to_virt(frame.addr).cast::<u8>(), byte, 4096);
+        }
+    }
+    fn all_bytes_are(pa: usize, byte: u8) -> bool {
+        let p = akuma_exec::mmu::phys_to_virt(pa).cast::<u8>();
+        (0..4096).all(|i| unsafe { p.add(i).read_volatile() } == byte)
+    }
+
+    let (Some(shared), Some(private), Some(spare)) =
+        (crate::pmm::alloc_page(), crate::pmm::alloc_page(), crate::pmm::alloc_page_zeroed())
+    else {
+        console::print("[Test] madvise_dontneed_spares_shared_frame SKIPPED (no frames)\n");
+        return;
+    };
+    let Some(mut aspace) = crate::mmu::UserAddressSpace::new() else {
+        for f in [shared, private, spare] { crate::pmm::free_page(f); }
+        console::print("[Test] madvise_dontneed_spares_shared_frame SKIPPED (no aspace)\n");
+        return;
+    };
+
+    // Two pages, both dirty with the same pattern. One is CoW-shared with a peer
+    // address space (`cow_ref_inc` on a fresh pa inserts 2 — "parent + child");
+    // the other is ours alone, and is the control that keeps a PASS from meaning
+    // "the handler stopped doing anything".
+    fill(shared, PATTERN);
+    fill(private, PATTERN);
+    let flags = akuma_exec::mmu::user_flags::RW_NO_EXEC;
+    let mapped = aspace.map_page(SHARED_VA, shared.addr, flags).is_ok()
+        && aspace.map_page(PRIVATE_VA, private.addr, flags).is_ok();
+    if !mapped {
+        drop(aspace);
+        for f in [shared, private, spare] { crate::pmm::free_page(f); }
+        console::print("[Test] madvise_dontneed_spares_shared_frame SKIPPED (map failed)\n");
+        return;
+    }
+    aspace.track_user_frame(shared);
+    aspace.track_user_frame(private);
+    crate::pmm::cow_ref_inc(shared.addr);
+
+    // Pass 1 must ask for exactly one replacement frame: the shared page.
+    let want = dontneed_count_shared(&aspace, SHARED_VA, 2);
+
+    let spares = [spare];
+    let mut to_free: alloc::vec::Vec<crate::pmm::PhysFrame> = alloc::vec::Vec::new();
+    let outcome = dontneed_apply(&mut aspace, SHARED_VA, 2, &spares, &mut to_free);
+
+    // The peer's frame: still fully intact. This single line is the whole defect.
+    let peer_intact = all_bytes_are(shared.addr, PATTERN);
+    // The caller's view of the same VA: a different, private, zeroed frame.
+    let now_private = aspace.translate(SHARED_VA).map(|pa| pa & !0xFFF) == Some(spare.addr);
+    let reads_zero = all_bytes_are(spare.addr, 0);
+    // The control page was zeroed in place — same frame, no allocation spent.
+    let control_same_frame =
+        aspace.translate(PRIVATE_VA).map(|pa| pa & !0xFFF) == Some(private.addr);
+    let control_zeroed = all_bytes_are(private.addr, 0);
+    // Our share reference is handed back; the peer's is not, so the frame must not
+    // be returned to the PMM even though `unmap_and_free_page` offered it up.
+    let handed_back = to_free.len() == 1 && to_free[0].addr == shared.addr;
+    for f in to_free { crate::pmm::free_page(f); }
+    let peer_keeps_ref = crate::pmm::cow_ref_get(shared.addr) == 1;
+    let peer_intact_after_free = all_bytes_are(shared.addr, PATTERN);
+
+    // Teardown: drop the peer's reference, then everything this test still holds.
+    let peer_owns_free = crate::pmm::cow_ref_dec(shared.addr);
+    let _ = aspace.remove_user_frame(spare);
+    let _ = aspace.remove_user_frame(private);
+    drop(aspace);
+    for f in [shared, private, spare] { crate::pmm::free_page(f); }
+
+    if want == 1 && outcome.used == 1 && outcome.broke == 1 && outcome.skipped == 0
+        && peer_intact && now_private && reads_zero
+        && control_same_frame && control_zeroed
+        && handed_back && peer_keeps_ref && peer_intact_after_free && peer_owns_free
+    {
+        console::print("[Test] madvise_dontneed_spares_shared_frame PASSED\n");
+    } else {
+        crate::safe_print!(256,
+            "[Test] madvise_dontneed_spares_shared_frame FAILED: want={} used={} broke={} \
+             skipped={} peer_intact={} now_private={} reads_zero={} control_same={} \
+             control_zeroed={} handed_back={} peer_keeps_ref={} peer_intact_after={}\n",
+            want, outcome.used, outcome.broke, outcome.skipped, peer_intact, now_private,
+            reads_zero, control_same_frame, control_zeroed, handed_back, peer_keeps_ref,
+            peer_intact_after_free);
+    }
 }
 
 fn test_pmm_conserved_across_spawn_exit_reap() {
