@@ -544,6 +544,30 @@ same tree.
 - **Nightly is mandatory** (panic-immediate-abort cargo-feature). Host must be
   `aarch64-unknown-linux-musl`.
 - **`cargo build --release`** is the realistic target — no `build-std` needed.
+- **`[profile.release]` sets `lto = "thin"` since 2026-08-14, and this build is the
+  reason it is thin rather than fat.** LTO's cost lands here twice — a longer link
+  and, decisively, higher peak linker memory. Measured on the host (macOS,
+  cross-compiling; treat the ordering as transferable and the absolute numbers as
+  not), rebuild-and-relink after touching one file:
+
+  | `[profile.release]` | image | `.text` | rebuild+link | **peak RSS** |
+  |---|---:|---:|---:|---:|
+  | no `lto` (pre-2026-08-14) | 3,480,848 | 2,175,428 | 5.3 s | 738 MB |
+  | **`lto = "thin"`** (current) | 3,715,496 | 2,404,116 | 10.6 s (2.0×) | **779 MB** |
+  | `lto = "fat"` | 3,355,824 | 2,289,896 | 19.0 s (3.6×) | **1,090 MB** |
+
+  Fat wins on image size and loses on the only axis this build cares about: it
+  peaks over **1 GB**, so it will not link on a 1 GB guest, where thin's ~780 MB
+  will. That is the whole reason for the choice. Fat also costs 3.6× the link time
+  per iteration, which compounds across a full kernel build.
+
+  Budget accordingly: **thin roughly doubles link time versus no LTO**, and the
+  in-VM figure will be worse than the host's 2.0×. If a self-host build starts
+  failing at the link step after this date, drop `lto` from `[profile.release]`
+  before suspecting anything else — that is a one-line bisect. `extreme-size`
+  keeps `lto = true` (fat) and is unaffected: it is size-gated and never
+  self-hosted. Full A/B and what is still unmeasured:
+  [`../archive/LTO_RELEASE_PROFILE.md`](../archive/LTO_RELEASE_PROFILE.md).
 - **`fs-cache` feature** is already **on** — it is in `default`, so
   `--features devbox-smoltcp,no-tests` includes it. Nothing to add. The lever is
   its *size*: `src/fs.rs` caps it at `min(RAM/8, 384 MB)` at mount. The ceiling

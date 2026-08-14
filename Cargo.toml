@@ -73,6 +73,16 @@ test = false
 
 [profile.release]
 panic = "abort"
+# ThinLTO across the whole graph, not just within each crate. Without it a call
+# from `src/` into `crates/akuma-*` crosses a codegen-unit boundary and is inlined
+# only if the callee carries `#[inline]` — which just ~10% of `crates/`' `pub fn`
+# do, while the hot paths (mmu, the fault helpers, the Phase 7e accessors) all
+# live there. Fat is measurably better on image size but peaks at ~1.1 GB of
+# linker memory against thin's ~780 MB, which is the difference between building
+# on a 1 GB machine and not — and this kernel builds itself (acceptance 10).
+# `extreme-size` overrides this with `lto = true` (fat): it is size-gated, built
+# rarely, and never self-hosted. Measurements: docs/archive/LTO_RELEASE_PROFILE.md
+lto = "thin"
 
 
 # The only size-optimised profile (the `size` profile was removed 2026-08-10: it

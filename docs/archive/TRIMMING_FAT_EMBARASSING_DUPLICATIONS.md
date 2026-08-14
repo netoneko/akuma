@@ -1325,7 +1325,35 @@ chain turned `PreemptGuard` into a zero-sized no-op) onto code that needs no
 `cfg` at all. If a second crate ever needs page math, promoting a self-contained
 module to a crate is mechanical; the reverse is not.
 
-### Still open here
+### Still open here — **CLOSED 2026-08-14, by the `akuma-pmm` extraction**
+
+> **This section is stale and its recommendation was already carried out.** Shape 2
+> below ("extract only the *decision* — `next_reclaim_step(free, done) -> ReclaimStep`
+> — as a pure fn") is what `PMM_EXTRACT.md` Step 6 did: the decision lives in
+> `crates/akuma-pmm/src/lib.rs`'s private `reclaim_escalation` module (`:1819`), and
+> the duplicate that Step 4 had temporarily left in `akuma_exec::memmath` is deleted.
+> It is **not** untested, in either half:
+>
+> - *Decision* — `escalation_walks_every_rung_in_cheapest_first_order` (`:1866`)
+>   walks the whole ladder and asserts the exact rung sequence;
+>   `free_above_the_reserve_allocates_from_every_rung` (`:1888`) asserts the
+>   re-check after each rung returns `Allocate` rather than continuing — the
+>   "premature give-up" half.
+> - *Effects* — `escalation_walks_all_four_hooks_in_order_then_gives_up` (`:2074`)
+>   drives a **real** arena down to `USER_PAGE_RESERVE` and calls the **real**
+>   `alloc_page_zeroed_user`, asserting all four hooks fire exactly once, in
+>   cheapest-first order, before `None`. It is deliberately fused into one `#[test]`
+>   with the quarantine test, because `cargo test`'s parallelism would otherwise
+>   interleave its `free_count()` re-checks with the other's alloc/free churn.
+>
+> The boot-suite objection quoted below still stands and is why the *effects* test
+> lives in the crate over a leaked host arena rather than in `process_tests.rs`. The
+> per-rung real effects keep their own boot tests
+> (`test_retired_reclaim_pressure_rung_frees_parked_pages`,
+> `test_mmap_file_oom_survives`), so the host tests cover the ladder's control flow
+> and the boot tests cover what each rung actually frees.
+>
+> Kept below verbatim as the reasoning that produced the choice.
 
 `pmm::alloc_page_zeroed_user`'s **four-step recovery escalation** (gate →
 `drain_retired_under_pressure` → `reclaim_clean_file_pages` → `file_page_cache::shrink`
