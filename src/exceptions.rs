@@ -1108,9 +1108,9 @@ fn drop_surplus_shared_ref(as_owner: u32, pf: crate::pmm::PhysFrame) {
 /// the PTE-write mechanism on the fault path, which is not what F1 asked for.
 enum CowRemap<'a> {
     /// The EL1 paths ([`ensure_cow_page_writable`] and [`try_resolve_el1_cow_fault`]):
-    /// take `as_lock` via `with_address_space` for the PTE overwrite and the frame
-    /// bookkeeping. The 4 KiB copy stays *outside* that hold — see
-    /// [`copy_page_under_as_lock`] for why F1 is not applied yet.
+    /// take `as_lock` via `with_address_space` for the copy, the PTE overwrite and
+    /// the frame bookkeeping (F1, applied 2026-08-14 — see
+    /// [`copy_page_under_as_lock`]).
     TakingAsLock(&'a akuma_exec::process::Process),
     /// The EL0 fault path: the caller already holds `as_lock` (`AsLockHold`) across
     /// the whole break, so the helper must not take it again — and it remaps through
@@ -1120,30 +1120,22 @@ enum CowRemap<'a> {
 
 /// Copy a 4 KiB page between two physical frames — the CoW break's payload.
 ///
-/// **The EL0 arm calls this under `as_lock`; the EL1 arm does not, and that is F1.**
-/// The hold is what makes `old_pa` valid for the duration of the read: without it a
-/// peer core's `munmap` or CoW break can free `old_pa` mid-copy, and the copy then
-/// reads a frame that is back on the PMM free list — picking up quarantine poison
+/// **Both arms call this under `as_lock` (F1, applied 2026-08-14).** The hold is what
+/// makes `old_pa` valid for the duration of the read: without it a peer core's `munmap`
+/// or CoW break can free `old_pa` mid-copy, and the copy then reads a frame that is
+/// back on the PMM free list — picking up quarantine poison
 /// (`0xFEEDFACEDEAD0000 ^ pa`) or a recycled frame's contents. That is the signature
 /// class of the open `CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md` defect.
 ///
-/// # Why F1 is not fixed here yet
+/// # Why F1 was held back until 2026-08-14
 ///
 /// Moving this call inside `with_address_space` for the EL1 arm — §8 row 6's exact
-/// prescription — was implemented and **backed out on 2026-08-13**. With it applied the
-/// VM wedged in 3 of 4 SMP=1 exercise-suite runs: the guest stops emitting console
-/// output entirely (a spin with IRQs masked, not host descheduling — one wedge had zero
-/// `[WATCHDOG] Time jump` lines on an idle host), always at the transition *between*
-/// exercises, where sshd forks the next one. With the copy left outside, the same suite
-/// passed. That is 3-of-4 versus 1-of-1, which is suggestive but **not** a measurement:
-/// the wedge is intermittent at roughly one suite in two, so neither result is
-/// conclusive and the same shape was seen once before F1 existed.
-///
-/// Do not re-apply F1 without first measuring the wedge rate over several runs per
-/// variant, and note that `COW_PILE_AUDIT.md` §4 F1b is a plausible mechanism: the EL1
-/// arm still resolves `old_pa` *outside* the hold, so moving the copy inside makes the
-/// handler hold a non-reentrant lock across a read of a page that may already be
-/// invalid — and anything that faults in there re-enters the same lock.
+/// prescription — was first implemented and backed out on 2026-08-13: with it applied,
+/// the SMP=1 exercise suite wedged in ~3 of 4 runs. F1 was never the defect — it was an
+/// *amplifier* for F8 (`COW_PILE_AUDIT.md` §10): the scheduler SGI could install a
+/// freed L0 from a zombie's saved context, and F1 widened the preempted-mid-exit window
+/// that arms that race. With the saved-context free gate landed, 10 of 10 amplified
+/// suite runs and 3 of 3 unamplified ones were clean, so the copy moved inside for good.
 ///
 /// It is a function so the requirement has one statement instead of three, and so the
 /// two `CowRemap` arms cannot drift on it silently.
@@ -1197,15 +1189,15 @@ fn complete_cow_break(
 ) {
     crate::pmm::track_frame(new_frame, akuma_exec::runtime::FrameSource::UserData);
 
-    // F1 IS NOT APPLIED HERE, deliberately — see `copy_page_under_as_lock`. The copy
-    // for the EL1 arm stays outside the hold, which is the pre-F1 behaviour, until the
-    // intermittent VM wedge described there is either attributed or ruled out.
-    if matches!(remap, CowRemap::TakingAsLock(_)) {
-        copy_page_under_as_lock(old_pa, new_frame);
-    }
-
     let released_last_va = match remap {
         CowRemap::TakingAsLock(owner) => owner.with_address_space(|aspace| {
+            // F1 (COW_PILE_AUDIT.md §4/§8 row 6): the copy runs INSIDE the
+            // `as_lock` hold, so `old_pa` cannot be freed by a peer's munmap or
+            // CoW break mid-copy. Held back until 2026-08-14 because it amplified
+            // the F8 wedge (§10.2 — it widens the preempted-mid-exit window);
+            // with the saved-context free gate landed, 10/10 amplified suite
+            // runs were clean and this is safe.
+            copy_page_under_as_lock(old_pa, new_frame);
             let _ = aspace.map_page(
                 page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
             );
