@@ -249,6 +249,7 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_procfs_fd_symlink_resolution, "procfs_fd_symlink_resolution");
     run_test!(test_map_user_page_already_mapped, "map_user_page_already_mapped");
     run_test!(test_kernel_va_rejected_as_user_pointer, "kernel_va_rejected_as_user_pointer");
+    run_test!(test_read_current_pid_rejects_bare_address_space, "read_current_pid_bare_address_space");
     run_test!(test_epoll_event_is_16_bytes_on_arm64, "epoll_event_is_16_bytes_on_arm64");
     run_test!(test_epoll_infinite_wait_uses_bounded_deadline, "epoll_infinite_wait_bounded_deadline");
     run_test!(test_kill_process_cascades_to_children, "kill_process_cascades_to_children");
@@ -7114,11 +7115,14 @@ fn test_kernel_va_rejected_as_user_pointer() -> bool {
     // A REGISTERED process, and we activate ITS address space rather than a bare
     // one. That is not fixture ceremony — `validate_user_range`'s `Prefault::Yes`
     // arm reaches `address_space_owner_pid_for_fault`, whose fallback
-    // `read_current_pid` dereferences user VA `PROCESS_INFO_ADDR` (0x1000) guarded
-    // only by "TTBR0 is not the *boot* TTBR0". Under a bare `UserAddressSpace`
-    // nothing is mapped at 0x1000, so that guard passes and the read is a wild EL1
-    // access that wedges the VM. Owning the address space makes the TTBR0→pid
-    // lookup succeed, so the fallback is never reached.
+    // `read_current_pid` reads user VA `PROCESS_INFO_ADDR` (0x1000). The first
+    // version of this test used a bare `UserAddressSpace`, where nothing is mapped
+    // at 0x1000, and that read was a wild EL1 access that wedged the VM; the guard
+    // was "TTBR0 is not the *boot* TTBR0", which is not the same question. That
+    // hazard is fixed (`read_current_pid` now checks the mapping — see
+    // `test_read_current_pid_rejects_bare_address_space`), but owning the address
+    // space is still the right fixture here: it makes the TTBR0→pid lookup succeed
+    // so this test exercises the AP-bit check and not the fallback.
     let pid: u32 = 7712;
     let tid = akuma_exec::threading::current_thread_id();
     register_process(pid, crate::process_tests::make_test_process(pid));
@@ -7187,6 +7191,53 @@ fn test_kernel_va_rejected_as_user_pointer() -> bool {
     crate::safe_print!(160, "  kernel_va=0x{:x} present={} rejected={}\n", kernel_va, kernel_present, kernel_rejected);
     crate::safe_print!(160, "  user_accepted={} prot_none_rejected={} prefault_rejected={}\n",
         user_accepted, prot_none_rejected, prefault_rejected);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: `read_current_pid` returns `None` under a bare address space instead of
+/// wildly reading user VA `PROCESS_INFO_ADDR`.
+///
+/// `read_current_pid`'s page-read fallback used to be gated only on "TTBR0 is not
+/// the *boot* TTBR0", which is not the same question as "is there a process here".
+/// A bare `UserAddressSpace::new()` — several boot tests build one and `activate()`
+/// it — is a non-boot TTBR0 with nothing mapped at 0x1000, so the guard passed and
+/// the read was a wild EL1 access: the VM wedged with no output at all. That is how
+/// the first version of `test_kernel_va_rejected_as_user_pointer` died, reaching
+/// here through `address_space_owner_pid_for_fault`'s fallback
+/// (docs/archive/USER_COPY_FOLD.md §7).
+///
+/// The assertion is deliberately two-part. `pid == None` alone would pass against a
+/// build that never reached the fallback at all, so the test also asserts the thing
+/// that makes the address space dangerous — that nothing is mapped at
+/// `PROCESS_INFO_ADDR`. **On an unfixed kernel this test does not FAIL, it hangs**,
+/// which is the honest failure mode for a wild read and is why it prints before it
+/// activates.
+fn test_read_current_pid_rejects_bare_address_space() -> bool {
+    console::print("\n[TEST] read_current_pid: bare address space -> None, not a wild read\n");
+
+    use akuma_exec::mmu::{UserAddressSpace, is_current_user_page_mapped};
+    use akuma_exec::process::{PROCESS_INFO_ADDR, read_current_pid};
+
+    // Precondition: the `THREAD_PID_MAP` fast path must be cold for this thread, or
+    // `read_current_pid` returns from it and never reaches the fallback under test.
+    // On boot TTBR0 the fallback returns `None`, so `Some` here means a map entry
+    // exists — and then the test would prove nothing rather than something.
+    if read_current_pid().is_some() {
+        console::print("  SKIP: this thread has a THREAD_PID_MAP entry\n");
+        return true;
+    }
+
+    let addr_space = if let Some(a) = UserAddressSpace::new() { a } else { console::print("  OOM (addr_space)\n"); return false; };
+
+    addr_space.activate();
+    let info_mapped = is_current_user_page_mapped(PROCESS_INFO_ADDR);
+    let pid = read_current_pid();
+    UserAddressSpace::deactivate();
+
+    let pass = !info_mapped && pid.is_none();
+    crate::safe_print!(160, "  info_page_mapped={} pid_is_none={} pid={}\n",
+        info_mapped, pid.is_none(), pid.unwrap_or(0));
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }

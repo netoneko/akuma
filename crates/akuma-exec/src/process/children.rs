@@ -350,19 +350,21 @@ pub fn should_interrupt_blocking_syscall() -> bool {
         && current_thread_has_pending_interrupt()
 }
 
-/// Read the current process PID from the process info page
-///
-/// During a syscall, TTBR0 is still set to the user's page tables,
-/// so reading from PROCESS_INFO_ADDR gives us the calling process's PID.
-/// This prevents PID spoofing since the page is read-only for userspace.
-///
-/// Returns None if TTBR0 points to boot page tables (no user process context).
 /// Count of `read_current_pid` tgid resolutions that fell back to the thread's own pid
 /// because the process table would not resolve the mapped pid. Non-zero is the signature
 /// of the identity-degradation window described at the fallback site.
 pub static TGID_RESOLVE_MISSES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Read the current process PID from the process info page.
+///
+/// During a syscall, TTBR0 is still set to the user's page tables, so reading
+/// from `PROCESS_INFO_ADDR` gives us the calling process's PID. This prevents PID
+/// spoofing since the page is read-only for userspace.
+///
+/// Returns `None` when there is no user process context: TTBR0 is the boot page
+/// tables, or the live TTBR0 has no process info page mapped (a bare
+/// `UserAddressSpace`), or the page says pid 0.
 pub fn read_current_pid() -> Option<Pid> {
     // vfork fast-path: a shared-AS child reads the *parent's* PROCESS_INFO page,
     // so the page no longer uniquely identifies the caller.  THREAD_PID_MAP is
@@ -424,9 +426,40 @@ pub fn read_current_pid() -> Option<Pid> {
     if ttbr0_addr == boot_ttbr0 {
         return None; // Boot TTBR0 - no user process context
     }
-    
+
+    // "Not the boot address space" is NOT "there is a process here". A bare
+    // `UserAddressSpace::new()` — which several boot tests construct and
+    // `activate()` — is a non-boot TTBR0 with nothing mapped at 0x1000, so the
+    // check above passes and the read below is a wild EL1 access that wedges the
+    // VM with no output (docs/archive/USER_COPY_FOLD.md §7; the first version of
+    // `test_kernel_va_rejected_as_user_pointer` died exactly this way, reaching
+    // here through `address_space_owner_pid_for_fault`'s fallback).
+    //
+    // So ask the page tables directly, which is the question the `unsafe` below
+    // actually depends on. §7 proposed `owner_pid_for_l0_phys` ("is this L0 owned
+    // by a live process") instead; that answers a strictly different question —
+    // identity, not mappedness — and costs an O(MAX_PROCESSES) table scan on a
+    // path kernel threads take repeatedly, where this costs a four-level walk.
+    // It also would not have caught anything this misses: an L0 with no process
+    // info page mapped is exactly the case that wedges.
+    //
+    // The AP-gated predicate rather than the presence one because this is a read
+    // *of user memory from EL1* — the same question `validate_user_range` asks of
+    // any syscall buffer. Reaching it through `user_access` would recurse
+    // (`validate_user_range` → `address_space_owner_pid_for_fault` → here), hence
+    // the raw `mmu` call. The page is mapped `user_flags::RO` (`AP_RO_ALL`, EL0
+    // bit set) at every site that maps it — `image.rs` on exec, `mod.rs` on fork
+    // and on the post-CoW re-map — so it passes.
+    if !crate::mmu::is_current_user_range_mapped(
+        PROCESS_INFO_ADDR,
+        core::mem::size_of::<ProcessInfo>(),
+    ) {
+        return None;
+    }
+
     // Read from the fixed address in the current address space
-    // SAFETY: TTBR0 is user page tables, so PROCESS_INFO_ADDR is mapped
+    // SAFETY: checked directly above — PROCESS_INFO_ADDR is mapped and EL0-accessible
+    // in the live TTBR0, so this read cannot fault.
     let pid = unsafe { (*(PROCESS_INFO_ADDR as *const ProcessInfo)).pid };
     if pid == 0 { None } else { Some(pid) }
 }

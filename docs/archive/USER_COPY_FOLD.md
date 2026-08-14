@@ -331,7 +331,7 @@ it.
 > pair leaves that one thread's slot on. Per-thread makes that a bounded, local bug
 > instead of a kernel-wide one; the guard is what fixes it, one site at a time.
 >
-> **A latent hazard the test walked straight into, worth knowing about.**
+> **A latent hazard the test walked straight into — FIXED 2026-08-14.**
 > `read_current_pid` (`process/children.rs`) ends by dereferencing user VA
 > `PROCESS_INFO_ADDR` (0x1000), and the only thing gating that read is
 > `ttbr0 != boot_ttbr0`. "Not the boot address space" is **not** the same as "there
@@ -342,9 +342,33 @@ it.
 > `address_space_owner_pid_for_fault`'s fallback; the VM wedged with no output, and
 > the only reason it was easy to localize was per-step console prints. The test now
 > registers a process and activates **its** address space, so the TTBR0→pid lookup
-> succeeds and the fallback is never reached. The hazard itself is untouched and
-> still there for the next caller: the correct guard is "is this L0 owned by a live
-> process", which `owner_pid_for_l0_phys` already answers.
+> succeeds and the fallback is never reached.
+>
+> `read_current_pid` now asks the page tables before it reads them:
+> `is_current_user_range_mapped(PROCESS_INFO_ADDR, size_of::<ProcessInfo>())`, and
+> `None` if that fails. **Not** the `owner_pid_for_l0_phys` guard this paragraph
+> originally proposed — writing it down made clear that "is this L0 owned by a live
+> process" is a different question from the one the `unsafe` depends on, answers it
+> with an O(`MAX_PROCESSES`) table scan on a path kernel threads take repeatedly
+> (where a four-level walk suffices), and would not have caught one case this
+> misses: an L0 with no info page mapped is *exactly* what wedges. The AP-gated
+> predicate rather than the presence one because this is a read of user memory from
+> EL1, the same question `validate_user_range` asks of any syscall buffer — but
+> reached through `mmu` directly, since going through `user_access` would recurse
+> (`validate_user_range` → `address_space_owner_pid_for_fault` → here). Every site
+> that maps the page (`image.rs` on exec, `mod.rs` on fork and on the post-CoW
+> re-map) uses `user_flags::RO` = `AP_RO_ALL`, EL0 bit set, so it passes.
+>
+> Regression test: `test_read_current_pid_rejects_bare_address_space`
+> (`src/tests.rs`), which activates a bare address space and calls
+> `read_current_pid` — **on an unfixed kernel it hangs rather than failing**, the
+> honest failure mode for a wild read. It asserts two things, because `pid == None`
+> alone would also pass against a build that never reached the fallback; the second
+> assertion is that nothing is mapped at `PROCESS_INFO_ADDR`. It skips itself if the
+> running thread has a `THREAD_PID_MAP` entry, which would return from the fast path
+> above and prove nothing. Verified with the same `verify_trim.py` A/B as the rest of
+> §10a: `fail_set` empty at SMP=1 and SMP=4, host 528, clippy 4/4 clean, every
+> counter unmoved.
 
 The audit's "second win" was that folding closes the unchecked-destination hole.
 **It does not**, and this is the most important thing in this document.
