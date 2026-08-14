@@ -7106,17 +7106,40 @@ fn test_kernel_va_rejected_as_user_pointer() -> bool {
         UserAddressSpace, is_current_user_page_mapped, is_current_user_range_mapped,
         map_user_page, user_flags,
     };
+    use akuma_exec::process::{
+        lookup_process_shared, register_process, register_thread_pid, unregister_process,
+        unregister_thread_pid,
+    };
 
-    let Some(addr_space) = UserAddressSpace::new() else {
-        crate::safe_print!(64, "  SKIP: failed to allocate address space\n");
+    // A REGISTERED process, and we activate ITS address space rather than a bare
+    // one. That is not fixture ceremony — `validate_user_range`'s `Prefault::Yes`
+    // arm reaches `address_space_owner_pid_for_fault`, whose fallback
+    // `read_current_pid` dereferences user VA `PROCESS_INFO_ADDR` (0x1000) guarded
+    // only by "TTBR0 is not the *boot* TTBR0". Under a bare `UserAddressSpace`
+    // nothing is mapped at 0x1000, so that guard passes and the read is a wild EL1
+    // access that wedges the VM. Owning the address space makes the TTBR0→pid
+    // lookup succeed, so the fallback is never reached.
+    let pid: u32 = 7712;
+    let tid = akuma_exec::threading::current_thread_id();
+    register_process(pid, crate::process_tests::make_test_process(pid));
+    register_thread_pid(tid, pid);
+    let Some(proc) = lookup_process_shared(pid) else {
+        unregister_process(pid);
+        unregister_thread_pid(tid);
+        crate::safe_print!(64, "  SKIP: test process did not register\n");
         return true;
     };
+
     let Some(user_page) = crate::pmm::alloc_page_zeroed() else {
+        unregister_process(pid);
+        unregister_thread_pid(tid);
         crate::safe_print!(64, "  SKIP: failed to allocate page\n");
         return true;
     };
     let Some(none_page) = crate::pmm::alloc_page_zeroed() else {
         crate::pmm::free_page(user_page);
+        unregister_process(pid);
+        unregister_thread_pid(tid);
         crate::safe_print!(64, "  SKIP: failed to allocate second page\n");
         return true;
     };
@@ -7129,41 +7152,36 @@ fn test_kernel_va_rejected_as_user_pointer() -> bool {
     let user_va = 0x1000_0000usize;
     let none_va = 0x1001_0000usize;
 
-    console::print("  step: activate\n");
-    addr_space.activate();
+    proc.address_space.activate();
 
     let (frames, _) = unsafe { map_user_page(user_va, user_page.addr, user_flags::RW) };
-    addr_space.track_user_frame(user_page);
-    for f in frames { addr_space.track_page_table_frame(f); }
+    proc.address_space.track_user_frame(user_page);
+    for f in frames { proc.address_space.track_page_table_frame(f); }
     let (frames, _) = unsafe { map_user_page(none_va, none_page.addr, user_flags::NONE) };
-    addr_space.track_user_frame(none_page);
-    for f in frames { addr_space.track_page_table_frame(f); }
-    console::print("  step: mapped\n");
+    proc.address_space.track_user_frame(none_page);
+    for f in frames { proc.address_space.track_page_table_frame(f); }
 
     // 1. The kernel VA really is mapped in this user address space...
     let kernel_present = is_current_user_page_mapped(kernel_va);
-    console::print("  step: present\n");
     // 2. ...and must nonetheless be refused as a user range.
     let kernel_rejected = !is_current_user_range_mapped(kernel_va, 128);
-    console::print("  step: rejected\n");
     // 3. A real user page still passes — the check must not be "reject everything".
     let user_accepted = is_current_user_range_mapped(user_va, 128);
     // 4. A PROT_NONE page (AP_RO_EL1) is refused too, which is what Linux does.
     let prot_none_rejected = !is_current_user_range_mapped(none_va, 128);
-    console::print("  step: user+none\n");
 
-    // The whole check is defeated unless `validate_user_range` re-asserts the range
-    // after prefaulting: `prefault_user_range` skips pages that are already present,
-    // so on its own it reports success for this very address. Drive the validator
-    // directly rather than a syscall entry point — the entry points take BKL
-    // carve-out guards, which need process/thread registration this fixture has not
-    // set up.
+    // 5. The whole change is defeated unless `validate_user_range` re-asserts the
+    // range AFTER prefaulting: `prefault_user_range` skips pages that are already
+    // present — deliberately, so it never re-maps a guard page — so on its own it
+    // reports success for this very address, on every `Prefault::Yes` path, which is
+    // most syscalls.
     let prefault_rejected = !akuma_exec::mmu::user_access::validate_user_range(
         kernel_va as u64, 128, akuma_exec::mmu::user_access::Prefault::Yes);
-    console::print("  step: prefault\n");
 
     UserAddressSpace::deactivate();
     drop(kernel_buf);
+    unregister_process(pid);
+    unregister_thread_pid(tid);
 
     let pass = kernel_present && kernel_rejected && user_accepted && prot_none_rejected && prefault_rejected;
     crate::safe_print!(160, "  kernel_va=0x{:x} present={} rejected={}\n", kernel_va, kernel_present, kernel_rejected);

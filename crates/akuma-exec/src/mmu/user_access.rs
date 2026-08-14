@@ -92,9 +92,96 @@ pub const USER_VA_LIMIT: u64 = 0x0000_FFFF_FFFF_FFFF;
 /// `handle_syscall` directly with kernel-stack buffers.
 ///
 /// Lives here rather than in the bin crate's syscall module because the check it
-/// disables lives here now; `syscall::BYPASS_VALIDATION` is a re-export, so the ~50
+/// disables lives here now; `syscall::BYPASS_VALIDATION` is a re-export, so the ~85
 /// boot-test call sites are unchanged.
-pub static BYPASS_VALIDATION: AtomicBool = AtomicBool::new(false);
+///
+/// # Per thread, not per kernel (2026-08-14)
+///
+/// This was a single kernel-wide `AtomicBool`, flipped by ~85 hand-paired
+/// `store(true)`/`store(false)` sites — so while any one thread had it on,
+/// validation was off for **every thread on every core**. `USER_COPY_FOLD.md` §11
+/// item 3 recorded that as a defect with "no live leak path today", because a
+/// kernel VA passed validation anyway and turning the bypass off early cost nothing.
+///
+/// The AP-bit fix (§7 there) made it live, and `test_futex_wake_one_of_two` caught
+/// it within one boot. That test is the only futex test with **two** syscalls inside
+/// one bypass window: `FUTEX_WAKE(1)`, then `FUTEX_WAKE(INT_MAX)`. The waiter woken
+/// by the first runs in between and ends with its own `store(false)` — which, on a
+/// global flag, closed the *main thread's* window. Its second wake then validated a
+/// kernel `.bss` address for real, got `EFAULT`, and the second waiter was never
+/// woken. Under the old presence-only check the same race happened and was simply
+/// invisible.
+///
+/// Making the flag per-thread fixes that by construction and needs no call-site
+/// changes: `store`/`load` keep the `AtomicBool` signatures and address the calling
+/// thread's slot. **Still open** from that item: the pairs are hand-written, so an
+/// abnormal exit between a `store(true)` and its `store(false)` leaves that thread's
+/// slot on — an RAII guard is what closes it.
+pub struct BypassValidation {
+    per_thread: [AtomicBool; akuma_primitives::preempt::MAX_THREADS],
+}
+
+impl BypassValidation {
+    const fn new() -> Self {
+        Self { per_thread: [const { AtomicBool::new(false) }; akuma_primitives::preempt::MAX_THREADS] }
+    }
+
+    /// Turn the bypass on or off **for the calling thread**.
+    ///
+    /// An out-of-range tid is ignored rather than panicking, matching every other
+    /// per-thread table in the tree (`DroppedWindowLedger`, the thread-state arrays).
+    #[inline]
+    pub fn store(&self, on: bool, order: Ordering) {
+        if let Some(slot) = self.per_thread.get(akuma_primitives::preempt::current_tid()) {
+            slot.store(on, order);
+        }
+    }
+
+    /// Whether the calling thread is inside a bypass window. An out-of-range tid
+    /// reads as `false` — validation on, the safe answer.
+    #[inline]
+    #[must_use]
+    pub fn load(&self, order: Ordering) -> bool {
+        self.per_thread
+            .get(akuma_primitives::preempt::current_tid())
+            .is_some_and(|slot| slot.load(order))
+    }
+}
+
+pub static BYPASS_VALIDATION: BypassValidation = BypassValidation::new();
+
+/// RAII form of [`BYPASS_VALIDATION`]: on for the calling thread until dropped, and
+/// **restoring what it found** rather than forcing `false`, so windows nest.
+///
+/// The other half of `USER_COPY_FOLD.md` §11 item 3. Nothing enforces the pairing of
+/// the ~85 raw `store(true)`/`store(false)` sites, so a `?`, an early `return`, or a
+/// panic between a pair leaves that thread's bypass on for whatever runs in the
+/// thread next. Prefer this at any new site.
+#[must_use]
+pub struct BypassValidationGuard {
+    prev: bool,
+}
+
+impl BypassValidationGuard {
+    /// Bypass user-pointer validation on this thread until the guard drops.
+    pub fn new() -> Self {
+        let prev = BYPASS_VALIDATION.load(Ordering::Acquire);
+        BYPASS_VALIDATION.store(true, Ordering::Release);
+        Self { prev }
+    }
+}
+
+impl Default for BypassValidationGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for BypassValidationGuard {
+    fn drop(&mut self) {
+        BYPASS_VALIDATION.store(self.prev, Ordering::Release);
+    }
+}
 
 /// Whether a validated range should have its lazy pages faulted in before the copy.
 ///
@@ -456,6 +543,41 @@ mod tests {
     // this shape live — an off-by-one on the limit, a missed overflow — so the
     // split is the point, not a compromise. See §6.1 of
     // `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`.
+
+    // `BYPASS_VALIDATION` is the exception to the note above: it reads no TTBR0 and
+    // touches no frames, and its nesting contract is exactly what went wrong when
+    // the AP-bit check (§7 of `USER_COPY_FOLD.md`) made a leaked window observable.
+    // `current_tid()` is 0 on the host, so these pin the guard's save/restore rather
+    // than the per-thread indexing — which is the half that was hand-written and got
+    // it wrong.
+
+    /// One test, not two: `current_tid()` is 0 on the host, so every host test
+    /// shares slot 0 and two of these running on cargo's test threads would race
+    /// each other on the very state they assert about.
+    #[test]
+    fn bypass_guard_restores_and_nests() {
+        assert!(!BYPASS_VALIDATION.load(Ordering::Acquire), "must start off");
+
+        let outer = BypassValidationGuard::new();
+        assert!(BYPASS_VALIDATION.load(Ordering::Acquire));
+        {
+            // The failure this rules out: an inner window closing the outer one,
+            // which is precisely what a global flag did across *threads* in
+            // `test_futex_wake_one_of_two`.
+            let _inner = BypassValidationGuard::new();
+            assert!(BYPASS_VALIDATION.load(Ordering::Acquire));
+        }
+        assert!(
+            BYPASS_VALIDATION.load(Ordering::Acquire),
+            "the inner guard's drop must not close the outer window"
+        );
+
+        drop(outer);
+        assert!(
+            !BYPASS_VALIDATION.load(Ordering::Acquire),
+            "the outermost guard restores what it found, rather than forcing a value"
+        );
+    }
 
     #[test]
     fn rejects_the_null_page() {

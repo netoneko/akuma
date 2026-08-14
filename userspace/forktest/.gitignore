@@ -1,6 +1,7 @@
 forktest_child
 forktest_parent
 pattern2_minimal.bin
+c_stress/mremapmove
 c_stress/madvshared
 c_stress/segvgroup
 c_stress/eager_mprotect_probe

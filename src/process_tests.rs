@@ -10296,6 +10296,12 @@ fn test_two_child_sequential_exit() {
 /// Test that epoll_pwait is woken immediately by a socket event.
 fn test_epoll_socket_waker() {
     use crate::syscall::poll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait};
+    // The `epoll_event` buffers below are kernel STACK addresses, which are
+    // EL1-only in every user address space — so since the AP-bit user-pointer
+    // check (USER_COPY_FOLD.md §7) `epoll_ctl`/`epoll_pwait` correctly reject
+    // them with EFAULT. That is what `BYPASS_VALIDATION` is for; it is per-thread
+    // and RAII now, so taking it here cannot leak to another test or thread.
+    let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
     use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid, FileDescriptor};
     
     let tid = akuma_exec::threading::current_thread_id();
@@ -10487,6 +10493,14 @@ fn test_epoll_multi_poller_pipe() {
     use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid, FileDescriptor};
     use core::sync::atomic::{AtomicU32, Ordering};
 
+    // The `epoll_event` buffers below are kernel STACK addresses, which are
+    // EL1-only in every user address space — so since the AP-bit user-pointer
+    // check (USER_COPY_FOLD.md §7) `epoll_ctl`/`epoll_pwait` correctly reject
+    // them with EFAULT. That is what `BYPASS_VALIDATION` is for; it is per-thread
+    // and RAII now, so taking it here cannot leak to another test or thread.
+    // The two poller threads below need their OWN guard for exactly that reason.
+    let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
+
     let tid = akuma_exec::threading::current_thread_id();
     let pid = 8002u32;
     let proc = make_test_process(pid);
@@ -10516,6 +10530,8 @@ fn test_epoll_multi_poller_pipe() {
     let _thread1 = akuma_exec::threading::spawn_user_thread_fn(move || {
         let my_tid = akuma_exec::threading::current_thread_id();
         akuma_exec::process::register_thread_pid(my_tid, pid);
+        // Per-thread bypass: the parent's guard covers the parent only.
+        let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
         let mut out = [crate::syscall::poll::EpollEvent { events: 0, _pad: 0, data: 0 }; 1];
         if sys_epoll_pwait(epfd1 as u32, out.as_mut_ptr() as usize, 1, 5000) == 1 {
             WOKEN_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -10528,6 +10544,8 @@ fn test_epoll_multi_poller_pipe() {
     let _thread2 = akuma_exec::threading::spawn_user_thread_fn(move || {
         let my_tid = akuma_exec::threading::current_thread_id();
         akuma_exec::process::register_thread_pid(my_tid, pid);
+        // Per-thread bypass: the parent's guard covers the parent only.
+        let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
         let mut out = [crate::syscall::poll::EpollEvent { events: 0, _pad: 0, data: 0 }; 1];
         if sys_epoll_pwait(epfd2 as u32, out.as_mut_ptr() as usize, 1, 5000) == 1 {
             WOKEN_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -13698,6 +13716,12 @@ fn assert_eq_print(got: bool, expected: bool, label: &str) {
 /// the full epoll_pwait path (not just the pipe helper).
 fn test_epoll_pipe_close_write_triggers_epollin() {
     use crate::syscall::poll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait};
+    // The `epoll_event` buffers below are kernel STACK addresses, which are
+    // EL1-only in every user address space — so since the AP-bit user-pointer
+    // check (USER_COPY_FOLD.md §7) `epoll_ctl`/`epoll_pwait` correctly reject
+    // them with EFAULT. That is what `BYPASS_VALIDATION` is for; it is per-thread
+    // and RAII now, so taking it here cannot leak to another test or thread.
+    let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
     use crate::syscall::pipe::{pipe_create, pipe_close_write, pipe_close_read};
     use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid, FileDescriptor};
 
@@ -13765,6 +13789,12 @@ fn test_epoll_pipe_close_write_triggers_epollin() {
 /// Test that writing to an eventfd triggers EPOLLIN via epoll_pwait.
 fn test_epoll_eventfd_write_triggers_event() {
     use crate::syscall::poll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait};
+    // The `epoll_event` buffers below are kernel STACK addresses, which are
+    // EL1-only in every user address space — so since the AP-bit user-pointer
+    // check (USER_COPY_FOLD.md §7) `epoll_ctl`/`epoll_pwait` correctly reject
+    // them with EFAULT. That is what `BYPASS_VALIDATION` is for; it is per-thread
+    // and RAII now, so taking it here cannot leak to another test or thread.
+    let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
     use crate::syscall::eventfd::{eventfd_create, eventfd_write, eventfd_close};
     use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid, FileDescriptor};
 
@@ -13816,6 +13846,12 @@ fn test_epoll_eventfd_write_triggers_event() {
 /// epoll_pwait calls no longer report events for it.
 fn test_epoll_del_removes_interest() {
     use crate::syscall::poll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait};
+    // The `epoll_event` buffers below are kernel STACK addresses, which are
+    // EL1-only in every user address space — so since the AP-bit user-pointer
+    // check (USER_COPY_FOLD.md §7) `epoll_ctl`/`epoll_pwait` correctly reject
+    // them with EFAULT. That is what `BYPASS_VALIDATION` is for; it is per-thread
+    // and RAII now, so taking it here cannot leak to another test or thread.
+    let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
     use crate::syscall::eventfd::{eventfd_create, eventfd_write, eventfd_close};
     use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid, FileDescriptor};
 

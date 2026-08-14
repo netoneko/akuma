@@ -15,8 +15,10 @@ because folding does not close it.
 - **Result:** `src/syscall/` **192 → 24** `unsafe`; `rump_proxy.rs` 12 → 0;
   `exceptions.rs` 107 → 97; `akuma-exec/src/process/mod.rs` 36 → 34. Host tests
   516 → 521.
-- **Not fixed:** a mapped *kernel* VA still passes validation (§7). Recorded, not
-  papered over.
+- **Not fixed by the fold, fixed later the same day:** a mapped *kernel* VA passed
+  validation, because the check tested presence and not EL0-accessibility. §7 has
+  the AP-bit fix, what it broke on the way in, and what it dragged in with it
+  (`BYPASS_VALIDATION` had to become per-thread).
 
 ---
 
@@ -81,8 +83,8 @@ Two steps, no connection between them. 126 validate calls against 167 copies.
 | a TTBR1 kernel address (bit 63 set) | false (past the 48-bit limit) | — |
 | **a mapped kernel RAM VA (e.g. `0x4100_0000`)** | **true** | **copied. silent kernel corruption** |
 
-Row 3 is a live bug class at every unchecked site. Row 8 is §7, and it survives
-the fold.
+Row 3 is a live bug class at every unchecked site. Row 8 is §7: it survived the
+fold, and was fixed separately — see that section.
 
 ---
 
@@ -290,11 +292,59 @@ it.
 > read-only user page still passes — the test is EL0 *reachability*, not
 > writability, and an EL1 write to a read-only user page is how a CoW break starts.
 >
-> Boot test: `kernel_va_rejected_as_user_pointer` (`src/tests.rs`). It asserts the
-> kernel VA is **present** as well as rejected — asserting only the rejection would
-> pass just as well against an unmapped address and prove nothing — plus a real user
-> page still accepted, a `PROT_NONE` page rejected, and `getrandom` into the kernel
-> VA returning `EFAULT` end-to-end through `handle_syscall`.
+> Boot test: `kernel_va_rejected_as_user_pointer` (`src/tests.rs`), five legs. It
+> asserts the kernel VA is **present** as well as rejected — asserting only the
+> rejection would pass just as well against an unmapped address and prove nothing —
+> plus a real user page still accepted, a `PROT_NONE` page rejected, and
+> `validate_user_range(.., Prefault::Yes)` rejecting it, which is the leg that pins
+> the re-check above.
+>
+> **It broke two classes of boot self-test, and both were the change working.**
+> Neither showed up in review; both showed up on the first clean boot. Recorded
+> because "the AP test is contained, `is_page_mapped_ptr` already walks to the leaf"
+> was true of the *diff* and badly understated the blast radius.
+>
+> 1. **`test_futex_wake_one_of_two` — `BYPASS_VALIDATION` is global.** It is the only
+>    futex test with **two** syscalls inside one bypass window (`FUTEX_WAKE(1)`, then
+>    `FUTEX_WAKE(INT_MAX)`). The waiter woken by the first runs in between and ends
+>    with its own `BYPASS_VALIDATION.store(false)` — which, on a kernel-wide flag,
+>    closed the *main thread's* window. Its second wake then validated a kernel
+>    `.bss` address for real, took `EFAULT`, and the second waiter was never woken:
+>    `only 1/2 threads unblocked`. That race was always there; under a presence-only
+>    check it simply had no effect. **This is §11 item 3 — "no live leak path today"
+>    — becoming live**, and it is why the flag is now per-thread (see below).
+> 2. **Five `epoll` tests pass kernel-STACK buffers with no bypass at all.**
+>    `test_epoll_socket_waker`, `test_epoll_multi_poller_pipe`,
+>    `epoll_pipe_close_write`, `epoll_eventfd_write_triggers_event`,
+>    `epoll_del_removes_interest` all hand `&raw const ev` to `epoll_ctl`/`epoll_pwait`.
+>    Kernel stacks are in the identity-mapped window, so they are EL1-only and now
+>    correctly `EFAULT` (`err=0xff…f2`). They had simply never needed the bypass.
+>    Each takes a `BypassValidationGuard` now — and `test_epoll_multi_poller_pipe`
+>    needs **three**, one per poller thread, which is the per-thread flag being
+>    correct rather than convenient.
+>
+> **`BYPASS_VALIDATION` is per-thread as of this change**, with the same
+> `store`/`load` signatures, so none of the ~85 call sites changed. There is also a
+> `BypassValidationGuard` (RAII, restores what it found, so windows nest) — the other
+> half of §11 item 3. What is **still open** there: the ~85 raw `store(true)` /
+> `store(false)` pairs are still hand-written, so an early return or panic between a
+> pair leaves that one thread's slot on. Per-thread makes that a bounded, local bug
+> instead of a kernel-wide one; the guard is what fixes it, one site at a time.
+>
+> **A latent hazard the test walked straight into, worth knowing about.**
+> `read_current_pid` (`process/children.rs`) ends by dereferencing user VA
+> `PROCESS_INFO_ADDR` (0x1000), and the only thing gating that read is
+> `ttbr0 != boot_ttbr0`. "Not the boot address space" is **not** the same as "there
+> is a process here": a bare `UserAddressSpace::new()` — which several boot tests
+> construct and `activate()` — is a non-boot TTBR0 with nothing mapped at 0x1000, so
+> the guard passes and the read is a wild EL1 access. The first version of this test
+> activated such an address space and reached that read through
+> `address_space_owner_pid_for_fault`'s fallback; the VM wedged with no output, and
+> the only reason it was easy to localize was per-step console prints. The test now
+> registers a process and activates **its** address space, so the TTBR0→pid lookup
+> succeeds and the fallback is never reached. The hazard itself is untouched and
+> still there for the next caller: the correct guard is "is this L0 owned by a live
+> process", which `owner_pid_for_l0_phys` already answers.
 
 The audit's "second win" was that folding closes the unchecked-destination hole.
 **It does not**, and this is the most important thing in this document.
@@ -371,6 +421,46 @@ boundary, Go's 130 GB arena addresses, and zero-length ranges.
 
 ## 10. Verification
 
+### 10a. The AP-bit follow-up (§7), verified 2026-08-14
+
+`scripts/verify_trim.py` on both arms — this tree against a worktree at `edd91fe7`
+— carrying §7's AP-bit check, the per-thread `BYPASS_VALIDATION`, §5's
+`mremapmove` probe and the `mmu` walk merge
+(`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §8 item 8). **The whole diff:**
+
+```
+< host.tests: 521            > host.tests: 527
+                             > smp1.ex.mremapmove: ok
+< smp4.bkl_stuck: 108        > smp4.bkl_stuck: 95
+                             > smp4.ex.mremapmove: ok
+```
+
+Every other line is byte-identical, which for a change that alters *what a syscall
+accepts* is the whole point:
+
+- 4/4 clippy configurations clean on both arms.
+- `fail_set` **empty** at SMP=1 *and* SMP=4, both arms.
+- `pass_marker` **95**, `passed_marker` **276** (SMP=1) / **283** (SMP=4) — the
+  same on both arms, and the same as §10's numbers below.
+- All six original Tier 3 exercises `ok` at both SMP levels on both arms, plus the
+  new `mremapmove` on this one.
+- `host_timejumps: 0` everywhere. `bkl_stuck` 108 → 95 at SMP=4 is load-driven
+  (`BKL_TAG511_STORM` — it moves on an unmodified tree too).
+- `stack_overflow: 1` on every arm is the detector's own self-test firing
+  (`exercised=true detected=1`), not a fault.
+- Host tests are **528** on the tree as it stands: the gate's 527 was built before
+  the bypass guard's nesting test was added. 521 → +6 for the `ToggledGuard` merge,
+  +1 for that.
+
+**Getting there took three boots, and the first two are the interesting part** —
+both failures were the change working, and both are written up in §7: a global
+`BYPASS_VALIDATION` window closed by another thread (`test_futex_wake_one_of_two`),
+and five `epoll` tests handing kernel *stack* buffers to syscalls with no bypass at
+all. A behaviour change to user-pointer validation cannot be judged on the diff; it
+has to be booted.
+
+### 10b. The original fold
+
 `docs/runbooks/verify-trim-fat-change.md`, Tiers 1–3, A/B against a worktree at
 `9bc2dda8` (so the diff spans the errno merge *and* this sweep):
 
@@ -403,7 +493,7 @@ noise into a finding.
 |---|---|---|
 | 1 | ~~**AP-bit test in `is_current_user_range_mapped`** (§7)~~ **DONE 2026-08-14** — see the status block on §7 for what it actually took: one shared `resolve_user_leaf`, two *differently named* predicates, and a re-check after `prefault_user_range` without which the change is a no-op | 0 left |
 | 2 | ~~**`mremap` destination regression test** (§5)~~ **DONE 2026-08-14** — `userspace/forktest/c_stress/mremapmove.c`, three phases (resident grow, grown-tail-zero, sparse grow), calibrated `ALL PASS` on real Linux arm64 and added to `verify_trim.py`'s Tier 3 `EXERCISES`. Megabyte regions on purpose: a fix that only prefaulted the head would still fail phase 1 | 0 left |
-| 3 | Make `BYPASS_VALIDATION` per-thread with an RAII guard | it is a kernel-wide flag flipped by ~50 hand-paired `store(true)`/`store(false)` sites in the boot tests, so while it is on, validation is off for **every core**. No live leak path today (the "early returns" between pairs are all matches inside comments), but nothing enforces the pairing. The flag moved in this change, which is why the defect is written down here |
+| 3 | ~~Make `BYPASS_VALIDATION` per-thread with an RAII guard~~ **MOSTLY DONE 2026-08-14** — it was a kernel-wide flag flipped by ~85 hand-paired `store(true)`/`store(false)` sites, so while any thread had it on, validation was off for **every thread on every core**. This row said "no live leak path today"; the §7 AP-bit fix made one, and `test_futex_wake_one_of_two` found it on the first boot (a woken waiter's `store(false)` closing the main thread's window mid-test). It is now a per-thread array behind the same `store`/`load` signatures — **zero call-site changes** — plus a `BypassValidationGuard` (RAII, restores what it found so windows nest). **Still open:** the ~85 raw pairs are still hand-written, so an early return or panic between a pair leaves that *one thread's* slot on. Per-thread turns a kernel-wide hole into a bounded local one; converting the pairs to the guard is what closes it | mostly |
 | 4 | Fix the three §6 divergences | each is a behaviour change |
 | 5 | `timerfd_settime`'s prefault under `TIMERFD_TABLE` (§6) | pre-existing lock-ordering fix, unrelated to the copy API |
 | 6 | P1: `#[repr(C)]` `Statx` + `SigFrame` (`UNSAFE_AUDIT.md`) | next item in that audit; the signal frame's 1120 bytes want one `copy_to_user` on the stack, which this API now makes trivial |
