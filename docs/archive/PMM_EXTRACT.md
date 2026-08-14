@@ -54,6 +54,12 @@ called through the runtime table at all** — `cow_ref_inc` (`process/mod.rs:298
 only live CoW pointer. [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §5 found this and
 reported "3 of 4"; measured, it was **4 dead of 5**, and the §8.1 merge deleted two of
 the four (`cow_fault_lock`, `cow_fault_unlock`), leaving these two for step 5.
+**Step 5 landed (`eb19f23`) and took all 13**, these two with them — `ExecRuntime` has
+no `cow_ref_*` field left and `akuma-exec` calls `akuma_pmm::cow_ref_inc` directly.
+Note for anyone re-reading this paragraph: it is about the runtime **fn-pointer
+fields**, not the functions. `cow_ref_dec`/`cow_ref_get` themselves are alive and
+heavily used (`exceptions.rs`, `file_page_cache.rs`, `syscall/mem.rs`); only the
+indirection through the table was dead.
 
 ## 2. Feasibility: no cycle, and the leaf already has what PMM needs
 

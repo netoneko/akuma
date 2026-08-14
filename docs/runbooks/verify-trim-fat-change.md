@@ -28,8 +28,15 @@ git worktree add /tmp/base <parent-commit>
 diff /tmp/base.txt mine.txt
 ```
 
-`--instance 1` shifts the forwarded ports and snapshots the disk, so the baseline
-worktree can boot without touching `disk.img`. The exit status is **not** a
+`--instance 1` shifts the forwarded ports and opens the **main** worktree's
+`disk.img` in snapshot mode (writes discarded), so the baseline worktree can boot
+without touching it. A linked worktree has no `disk.img` of its own — it is 3 GB
+and gitignored — and until 2026-08-14 the script pointed `DISK` at the worktree's
+own path, so every baseline run reported `smp1.booted: False` / `smp4.booted:
+False` / `pass_marker: 0` while Tier 1 passed. **That is a missing file, not a
+broken baseline commit**; the script now fails with `ERROR no disk image at …`
+instead. If you see the old symptom on an older checkout, this is why. The exit
+status is **not** a
 verdict — only the diff is. The prose below is what the script automates, kept
 because it says *why* each step is shaped the way it is, and because Tier 4 is not
 automated.

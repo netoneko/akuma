@@ -51,6 +51,19 @@ import time
 REPO = subprocess.run(["git", "rev-parse", "--show-toplevel"],
                       capture_output=True, text=True, check=True).stdout.strip()
 
+# The MAIN worktree, which is where `disk.img` lives. When this script runs from a
+# baseline `git worktree` -- which is exactly what the runbook's A/B procedure tells
+# you to do -- `REPO` is the linked worktree, and that has no `disk.img` (3 GB,
+# gitignored, never copied). Pointing `DISK` at `REPO/disk.img` there makes QEMU exit
+# with "Could not open ... No such file or directory", which this script reported as
+# `booted: False` -- indistinguishable from "the baseline commit is broken", the most
+# alarming possible misreading of a baseline arm. `--git-common-dir` resolves to the
+# main repo's `.git` from either side, so its parent is the main worktree.
+_COMMON_GIT_DIR = subprocess.run(
+    ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+    capture_output=True, text=True, check=True).stdout.strip()
+MAIN_REPO = os.path.dirname(_COMMON_GIT_DIR) or REPO
+
 # profile + feature set are always chosen together; see docs/reference/build-profiles.md
 CLIPPY_CONFIGS = [
     ("release", ["--release"]),
@@ -185,8 +198,15 @@ def boot_once(smp, instance, memory, logdir, results, run_exercises):
     env.update({"SMP": str(smp), "MEMORY": str(memory)})
     if instance:
         env["INSTANCE"] = str(instance)
-        # Snapshot mode is implied for INSTANCE>0; point at the main repo's disk.
-        env.setdefault("DISK", os.path.join(REPO, "disk.img"))
+        # Snapshot mode is implied for INSTANCE>0; point at the MAIN worktree's disk
+        # (see MAIN_REPO -- a linked baseline worktree has no disk.img of its own).
+        env.setdefault("DISK", os.path.join(MAIN_REPO, "disk.img"))
+    # Fail loudly instead of letting QEMU exit on a missing disk, which surfaces here
+    # as `booted: False` and reads as a broken commit rather than a missing file.
+    disk = env.get("DISK", os.path.join(REPO, "disk.img"))
+    if not os.path.exists(disk):
+        results[f"smp{smp}.booted"] = f"ERROR no disk image at {disk}"
+        return
     vm = subprocess.Popen(["cargo", "run", "--release"], cwd=REPO, env=env,
                           stdout=log, stderr=subprocess.STDOUT)
     try:

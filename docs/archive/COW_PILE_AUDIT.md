@@ -547,7 +547,12 @@ is already in agreement on the part that matters (`released_last_va`).
 >   of 5.** The five are `cow_ref_inc`/`dec`/`get`/`fault_lock`/`fault_unlock`, and
 >   only `cow_ref_inc` is called through the table (`process/mod.rs:298`). Deleting
 >   `fault_lock`/`unlock` leaves two still-dead fields (`cow_ref_dec`, `cow_ref_get`)
->   for `PMM_EXTRACT.md` to remove with the other 13.
+>   for `PMM_EXTRACT.md` to remove with the other 13. **DONE — `PMM_EXTRACT.md` step 5
+>   landed in `eb19f23` and removed all 13**, these two included. `ExecRuntime` now has
+>   no `cow_ref_*` field at all and `akuma-exec` calls `akuma_pmm::cow_ref_inc` directly
+>   (`process/mod.rs:298`). Verified 2026-08-14: `grep -rn 'register_cow\|cow_ref.*hook'
+>   src crates` returns only past-tense comments describing the deletion. There is
+>   nothing left here to pick up.
 > - **Two in-code comments cross-referenced `try_break_cow_for_kernel_write`, a
 >   function that does not exist** in this tree under that name — the EL1 pre-flight
 >   is `ensure_cow_page_writable`. Both cross-references are gone: they now point at
