@@ -601,7 +601,7 @@ pub const SYSCALL_DEBUG_IO_ENABLED: bool = false;
 /// Poison-and-quarantine freed physical frames to catch use-after-free writes
 /// (`pmm::quarantine_push`).
 ///
-/// On for the cargo null-`Rc` investigation (proposals/CARGO_HEAP_NULL_RC.md):
+/// On for the cargo null-`Rc` investigation (docs/archive/CARGO_HEAP_NULL_RC.md):
 /// that defect's signature is a heap qword reading back as zero, which is what a
 /// frame handed to the PMM while a process still maps it looks like once the next
 /// `alloc_page_zeroed` wipes it. With this on, the still-mapped owner's next write
@@ -648,7 +648,7 @@ pub const PMM_PREMATURE_FREE_CHECK: bool = false;
 /// is a page whose count reached **0** while its owner still maps it read-only —
 /// one decrement more than there were shares. The counter alone cannot say who
 /// over-decremented it; the history can, and it names the thread behind each
-/// event. See proposals/CARGO_HEAP_NULL_RC.md.
+/// event. See docs/archive/CARGO_HEAP_NULL_RC.md.
 ///
 /// ~98 KB of BSS and two relaxed stores per refcount operation, so it is gated off
 /// on the low-RAM profiles alongside the quarantine.

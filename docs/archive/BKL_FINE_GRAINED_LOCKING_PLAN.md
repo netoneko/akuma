@@ -660,7 +660,8 @@ post-BKL world are ones someone decided to keep rather than ones nobody re-exami
   compute/mmap-bound and barely touches process lifecycle. A Rust build hammers exactly
   the un-carved holders (`execve`, `clone`, `openat`). Baseline it **before** starting 7a
   — harness + prompt in
-  [`../runbooks/bkl-phase7-workplan.md`](../runbooks/bkl-phase7-workplan.md), results in
+  `bkl-phase7-workplan.md` (deleted — a workplan is not a runbook; the live
+remaining-work list is [`BKL_PHASE7F_OPTOUT_LIST.md`](BKL_PHASE7F_OPTOUT_LIST.md) §11), results in
   `BKL_RUSTC_SCALING_BASELINE.md`. If that curve turns out to be flat for reasons other
   than the BKL (e.g. ext2-read-bound), it re-orders this phase — which is exactly why it
   goes first.

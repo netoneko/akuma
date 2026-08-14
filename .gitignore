@@ -15,7 +15,6 @@ tmp
 __pycache__
 models
 selfhost_vendor
-proposals
 logs_*.txt
 
 akuma_*.bin

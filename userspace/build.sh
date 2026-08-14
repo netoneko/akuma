@@ -291,7 +291,7 @@ echo "mmap_file (C) copied to bootstrap/bin/"
 # translation); clonearg checks that a cloned thread sees the memory its parent
 # wrote just before the clone. Tiny; built unconditionally.
 # madvshared: the deterministic probe for MADV_DONTNEED on a CoW-shared frame
-# (proposals/CARGO_HEAP_NULL_RC.md theory 3 — the null-`Rc` mechanism). Replaces a
+# (docs/archive/CARGO_HEAP_NULL_RC.md theory 3 — the null-`Rc` mechanism). Replaces a
 # ~1-in-5 crash during a full in-guest cargo build as the instrument for that
 # question. Calibrated ALL PASS on real Linux arm64; a FAIL here is the kernel.
 echo "Building mprotectlb + clonearg + cowstale + bssfork + madvshared (C, thread-spawn/mprotect/CoW probes)..."

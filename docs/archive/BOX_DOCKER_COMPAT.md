@@ -7,7 +7,7 @@ image, sharing layers between containers. Sanity target: `curl` from Docker Hub
 making an HTTPS request from inside a box. Both achieved; the interesting part
 is what was in the way.
 
-Plan and open follow-ups: [`../../proposals/BOX_RUN_OVERLAYFS.md`](../../proposals/BOX_RUN_OVERLAYFS.md).
+Plan and open follow-ups: [`BOX_RUN_OVERLAYFS.md`](BOX_RUN_OVERLAYFS.md).
 Current-state reference: [`../reference/subsystems/containers.md`](../reference/subsystems/containers.md)
 -> "OCI images and the overlay root". Procedure:
 [`../runbooks/run-docker-image.md`](../runbooks/run-docker-image.md).

@@ -9,7 +9,10 @@ analysis of `docs/GOLANG_IPC.md` identified three classes of remaining problems:
 2. **Performance bottlenecks** — per-page TLB flushes, no batch allocation in IA handler, eager full fork copy
 3. **Missing syscall flags** — CLONE_SETTLS, CLONE_CHILD_CLEARTID, MAP_POPULATE silently ignored
 
-See also `proposals/FASTER_MEMORY_MAPPING.md` for the original CoW/huge-page/background-zeroing proposal.
+The original CoW/huge-page/background-zeroing proposal (`proposals/FASTER_MEMORY_MAPPING.md`)
+has been deleted; for where that work actually landed see
+[`../reference/subsystems/memory.md`](../reference/subsystems/memory.md) and
+[`COW_OPTIMIZATIONS.md`](COW_OPTIMIZATIONS.md).
 
 ---
 

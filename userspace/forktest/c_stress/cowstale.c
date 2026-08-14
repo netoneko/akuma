@@ -1,7 +1,7 @@
 // cowstale — after a copy-on-write break, can a write land in the WRONG frame?
 //
 // Background: the cargo null-`Rc` defect
-// (proposals/CARGO_HEAP_NULL_RC.md) is a live pointer qword in cargo's heap
+// (docs/archive/CARGO_HEAP_NULL_RC.md) is a live pointer qword in cargo's heap
 // reading back as zero, with no fault at the moment of corruption. Every
 // allocator-side theory for it has been ruled out by instrumentation: no
 // premature free, no refcount desync, no bad protection record. What survives is

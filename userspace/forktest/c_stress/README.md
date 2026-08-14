@@ -105,7 +105,7 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   Usage: `bssfork [rounds] [threads] [spread]`. Calibrate:
   `docker run --rm --platform linux/arm64 -v "$PWD/bssfork:/bssfork:ro" alpine /bssfork 20 8`.
 - `cowstale` — **deterministic reproducer for the `EXIT=139` / `[WPF] cow_ref=0
-  lazy_self=NONE` class** (proposals/COWSTALE_FORK_THREAD_SEGV.md). Forks
+  lazy_self=NONE` class** (docs/archive/COWSTALE_FORK_THREAD_SEGV.md). Forks
   repeatedly from a process that has live reader threads, so several cores hold
   translations for a range while fork demotes it to read-only; parent and child
   each write their own pattern and verify the other's is never visible. Written

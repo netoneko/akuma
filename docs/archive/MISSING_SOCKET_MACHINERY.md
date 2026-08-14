@@ -108,6 +108,6 @@ add it, roughly in order of how contained the change is:
    simplest to reason about for a fixed spawn-then-serve pattern.
 
 None of this is scoped or committed to; it exists to save the next
-investigation from re-deriving it. See `proposals/CLEANUP.md` for where this
+investigation from re-deriving it. See `TRIM_FAT_REMOVAL_FEASIBILITY.md` for where this
 matters (a possible process-per-session model for userspace `sshd`) and
 `userspace/sshd/docs/OPTIONAL_PARALLELISM.md` for that design's tradeoffs.

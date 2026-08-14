@@ -2442,7 +2442,7 @@ pub fn stale_write_fault_absorbed_in(l0: *const u64, page_va: usize, tid: usize)
 /// Forensic probe of the physical page behind a live user VA, printed at an
 /// anomaly.
 ///
-/// This exists for the cargo null-`Rc` defect (proposals/CARGO_HEAP_NULL_RC.md),
+/// This exists for the cargo null-`Rc` defect (docs/archive/CARGO_HEAP_NULL_RC.md),
 /// whose signature is a heap qword that reads back as zero with **no fault at the
 /// moment of corruption**. The mechanism that produces that silently is a frame
 /// returned to the PMM while a process still maps it: the next
@@ -4362,7 +4362,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     // (`ldr x8,[x0,#288]` with x0 in cargo's heap), so probe the page
                     // behind the argument registers most likely to hold that base.
                     // Frames on the PMM free list here are the null-`Rc` defect
-                    // caught in the act (proposals/CARGO_HEAP_NULL_RC.md).
+                    // caught in the act (docs/archive/CARGO_HEAP_NULL_RC.md).
                     // Before anything else: is the faulting value the PMM's own
                     // quarantine poison? `poison_word` XORs the magic with the
                     // frame's PA, so a poisoned pointer carries the identity of the

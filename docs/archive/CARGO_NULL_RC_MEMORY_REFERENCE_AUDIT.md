@@ -1,6 +1,6 @@
 # cargo null-`Rc` — memory reference & flag audit (in progress, 2026-08-08)
 
-Working notes for the defect in [`proposals/CARGO_HEAP_NULL_RC.md`](../../proposals/CARGO_HEAP_NULL_RC.md):
+Working notes for the defect in [`CARGO_HEAP_NULL_RC.md`](CARGO_HEAP_NULL_RC.md):
 during an in-guest `-j4` self-host build, `cargo` dereferences a null `Rc` and the
 build dies with `EXIT=139`. Safe Rust cannot construct a null `Rc`, so a live
 pointer qword in cargo's anonymous heap read back as zero — a kernel
@@ -16,7 +16,7 @@ permission fault against state a sibling thread had already moved past (§12).
 Whether that was also cargo's null `Rc` is a separate question, still open.
 
 **Active brief for continuing this work:**
-[`proposals/COWSTALE_FORK_THREAD_SEGV.md`](../../proposals/COWSTALE_FORK_THREAD_SEGV.md).
+[`COWSTALE_FORK_THREAD_SEGV.md`](COWSTALE_FORK_THREAD_SEGV.md).
 
 > **§0.2 below is wrong and is kept only because it shaped a day of work.** The
 > faulting address was a `.bss` global, not a corrupted pointer. §12 has the
@@ -511,7 +511,7 @@ mostly a matter of reusing that helper for the flags case, plus:
 
 ## 11. Next steps
 
-Now driven by [`proposals/COWSTALE_FORK_THREAD_SEGV.md`](../../proposals/COWSTALE_FORK_THREAD_SEGV.md).
+Now driven by [`COWSTALE_FORK_THREAD_SEGV.md`](COWSTALE_FORK_THREAD_SEGV.md).
 Highest-value first step: wire `print_page_forensics` into the `[WPF]`/SIGSEGV
 path, since that is where the deterministic reproducer lands and it would
 immediately say what is mapped at the faulting VA with no region record.
@@ -1524,7 +1524,7 @@ cargo), which says whether the crash is inside the allocator's own metadata walk
    `detach_eager_regions_in_range` (`akuma-exec`); §5.1 of this audit
    fixed one variant (D8) — worth a re-read.
 
-If any of these lands, the deliverable per `proposals/CARGO_HEAP_NULL_RC.md`
+If any of these lands, the deliverable per `CARGO_HEAP_NULL_RC.md`
 is: root cause with evidence, a fix, a regression test in
 `userspace/forktest/c_stress/` calibrated against Linux, and an update to
 this section (§13) — not a new doc.
@@ -1533,7 +1533,7 @@ this section (§13) — not a new doc.
 
 ## Background
 
-- [`proposals/CARGO_HEAP_NULL_RC.md`](../../proposals/CARGO_HEAP_NULL_RC.md) — the
+- [`CARGO_HEAP_NULL_RC.md`](CARGO_HEAP_NULL_RC.md) — the
   original problem statement and reproduction recipe.
 - [`../runbooks/selfhost-kernel-build.md`](../runbooks/selfhost-kernel-build.md) —
   "Status (2026-08-07)", Defect A and B.

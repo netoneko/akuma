@@ -1,6 +1,6 @@
 # akuma-isolation — Implementation Details
 
-This document covers the design decisions, internals, and integration points of the `akuma-isolation` crate. For usage and API overview, see the [README](../README.md). For the original proposal, see [`proposals/MOUNT_NAMESPACE_PROPOSAL.md`](../../../proposals/MOUNT_NAMESPACE_PROPOSAL.md).
+This document covers the design decisions, internals, and integration points of the `akuma-isolation` crate. For usage and API overview, see the [README](../README.md). The original `proposals/MOUNT_NAMESPACE_PROPOSAL.md` has been deleted; the surviving design record is [`docs/archive/NAMESPACES.md`](../../../docs/archive/NAMESPACES.md).
 
 ## What Was Implemented (Phases 1–3)
 

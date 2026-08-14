@@ -2,7 +2,9 @@
 
 Investigation record for the crash class tracked in
 [`../runbooks/debug-thread-spawn-segv.md`](../runbooks/debug-thread-spawn-segv.md)
-and prompted by [`../../proposals/THREAD_SPAWN_SIGSEGV.md`](../../proposals/THREAD_SPAWN_SIGSEGV.md).
+and prompted by the thread-spawn SIGSEGV hunt, whose proposal has since been
+deleted — the surviving writeup is
+[`../runbooks/debug-thread-spawn-segv.md`](../runbooks/debug-thread-spawn-segv.md).
 Archived verbatim; the runbook §2e carries the maintained summary.
 
 ## Symptom

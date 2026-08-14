@@ -10,7 +10,8 @@ This is 7a of the decomposition in
 [`BKL_PHASE7_AUDIT.md`](BKL_PHASE7_AUDIT.md) §5: "give `ALARM_QUEUE` a real
 `Spinlock`, and make the `critical_section` impl per-core — or drop the
 `critical_section` dependency entirely." Executed per the prompt in
-[`../runbooks/bkl-phase7-workplan.md`](../runbooks/bkl-phase7-workplan.md).
+`bkl-phase7-workplan.md` (deleted — a workplan is not a runbook; the live
+remaining-work list is [`BKL_PHASE7F_OPTOUT_LIST.md`](BKL_PHASE7F_OPTOUT_LIST.md) §11).
 
 ## 1. What changed
 
@@ -169,7 +170,7 @@ the BKL-held path if that's ever needed again.
 
 ## 7. What's next (7b–7f)
 
-`../runbooks/bkl-phase7-workplan.md`'s Prompt C is the ready-to-run prompt for
+`bkl-phase7-workplan.md`'s Prompt C (that file is deleted) is the ready-to-run prompt for
 7b, scoping it to all three affected syscalls (`sys_ppoll`, `sys_pselect6`,
 `sys_epoll_pwait` — not just `ppoll`) and separating the low-risk
 `netpoll_drain`-style fix from the higher-risk full-syscall carve.
@@ -199,7 +200,8 @@ change without re-measuring).
   decomposition.
 - [`BKL_FINE_GRAINED_LOCKING_PLAN.md`](BKL_FINE_GRAINED_LOCKING_PLAN.md) §7 —
   the replanned Phase 7; §7.3 is the inversion approach for 7f.
-- [`../runbooks/bkl-phase7-workplan.md`](../runbooks/bkl-phase7-workplan.md) —
+- `bkl-phase7-workplan.md` (deleted — a workplan is not a runbook; the live
+remaining-work list is [`BKL_PHASE7F_OPTOUT_LIST.md`](BKL_PHASE7F_OPTOUT_LIST.md) §11) —
   the work plan and agent prompts this session executed (Prompt B, starting
   at 7a).
 - [`../reference/subsystems/locking.md`](../reference/subsystems/locking.md)

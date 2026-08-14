@@ -240,7 +240,8 @@ docker run -d --name dbench --platform linux/arm64 --cpus=4 -m 4g -v /tmp/dbench
   attribution table this baseline complements.
 - [`BKL_FINE_GRAINED_LOCKING_PLAN.md`](BKL_FINE_GRAINED_LOCKING_PLAN.md) §7.4 — success
   criteria, which now reference this curve.
-- [`../runbooks/bkl-phase7-workplan.md`](../runbooks/bkl-phase7-workplan.md) — the agent
+- `bkl-phase7-workplan.md` (deleted — a workplan is not a runbook; the live
+  remaining-work list is [`BKL_PHASE7F_OPTOUT_LIST.md`](BKL_PHASE7F_OPTOUT_LIST.md) §11) — the agent
   prompt this executes.
 - [`BKL_MM_CARVE_OUT.md`](BKL_MM_CARVE_OUT.md) §4 — the llama.cpp Akuma-vs-Linux
   comparison, the other throughput datapoint.

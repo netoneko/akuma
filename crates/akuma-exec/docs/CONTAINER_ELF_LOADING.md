@@ -50,4 +50,6 @@ This is a minimal fix to get container binaries loading. Full process isolation 
 - **Network namespace**: All containers share the host network stack.
 - **User namespace / UID mapping**: No UID remapping. All processes run as the same user.
 
-See also: `proposals/DEMO_PROPOSAL.md` and `proposals/FUSE_PROPOSAL.md` for broader container roadmap ideas.
+(`proposals/DEMO_PROPOSAL.md` and `proposals/FUSE_PROPOSAL.md`, once cited here for
+broader container roadmap ideas, have been deleted. Current container reference:
+[`../../../docs/reference/subsystems/containers.md`](../../../docs/reference/subsystems/containers.md).)

@@ -1480,7 +1480,7 @@ fn run_async_main() -> ! {
                 crate::file_page_cache::stats_line(&mut w);
                 w.flush();
             }
-            // `MADV_DONTNEED` divergence audit (proposals/CARGO_HEAP_NULL_RC.md).
+            // `MADV_DONTNEED` divergence audit (docs/archive/CARGO_HEAP_NULL_RC.md).
             // Both counters are expected to stay 0; either going non-zero means
             // this handler is zeroing frames Linux would have left alone.
             {
@@ -1490,7 +1490,7 @@ fn run_async_main() -> ! {
             }
             // Write faults on pages the page table already allows — i.e. absorbed
             // stale TLB entries. `repeats` must stay 0; a non-zero value means the
-            // flush is not what is resolving them (proposals/CARGO_HEAP_NULL_RC.md).
+            // flush is not what is resolving them (docs/archive/CARGO_HEAP_NULL_RC.md).
             {
                 use core::sync::atomic::Ordering;
                 crate::safe_print!(128, "[TLB] stale_write_faults={} repeats={}\n",
@@ -1755,7 +1755,7 @@ async fn memory_monitor() -> ! {
         if reclaimed_pages > 0 {
             let _ = write!(buf, " | reclaimed={}KB", reclaimed_pages * 4);
         }
-        // UAF quarantine (proposals/CARGO_HEAP_NULL_RC.md): `quar` is how many
+        // UAF quarantine (docs/archive/CARGO_HEAP_NULL_RC.md): `quar` is how many
         // frames are parked awaiting their poison check, `UAF` how many were
         // written after being freed. `UAF` is the number that matters and must be
         // 0; it is shown only when the instrument is armed.

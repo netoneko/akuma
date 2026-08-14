@@ -8,7 +8,8 @@ as the whole of 7b") — this is that stop, triggered empirically rather than by
 audit.
 
 Executed per the prompt in
-[`../runbooks/bkl-phase7-workplan.md`](../runbooks/bkl-phase7-workplan.md) (Prompt C).
+`bkl-phase7-workplan.md` (deleted — a workplan is not a runbook; the live
+remaining-work list is [`BKL_PHASE7F_OPTOUT_LIST.md`](BKL_PHASE7F_OPTOUT_LIST.md) §11) (Prompt C).
 
 ## 1. What changed
 
@@ -199,5 +200,6 @@ gap was never in the fd-type lock audit.
 - [`../reference/subsystems/locking.md`](../reference/subsystems/locking.md) — the
   playbook and the dropped-window-ledger correctness rules; the "leaked depth" note this
   doc's §4 relies on.
-- [`../runbooks/bkl-phase7-workplan.md`](../runbooks/bkl-phase7-workplan.md) — Prompt C,
+- `bkl-phase7-workplan.md` (deleted — a workplan is not a runbook; the live
+remaining-work list is [`BKL_PHASE7F_OPTOUT_LIST.md`](BKL_PHASE7F_OPTOUT_LIST.md) §11) — Prompt C,
   the prompt this session executed.

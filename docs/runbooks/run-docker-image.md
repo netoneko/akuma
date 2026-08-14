@@ -174,6 +174,6 @@ image's `layers` file is missing from `/var/lib/box/layers/`. Re-pull.
   -> "mount_in_ns" — the `overlay` fstype and its option string.
 - [`../../userspace/box/docs/OCI_IMAGE_PULL.md`](../../userspace/box/docs/OCI_IMAGE_PULL.md),
   [`../../userspace/box/docs/BOX_RUN.md`](../../userspace/box/docs/BOX_RUN.md).
-- [`../../proposals/BOX_RUN_OVERLAYFS.md`](../../proposals/BOX_RUN_OVERLAYFS.md)
+- [`../archive/BOX_RUN_OVERLAYFS.md`](../archive/BOX_RUN_OVERLAYFS.md)
   — the plan this was built from, its open follow-ups, and the two bugs found
   bringing it up.

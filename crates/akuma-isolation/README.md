@@ -78,4 +78,5 @@ When spawning a process inside a box, the environment automatically includes `HO
 ## Further Reading
 
 - [Implementation Details](docs/IMPLEMENTATION_DETAILS.md) — design decisions, kernel integration, internals
-- [Mount Namespace Proposal](../../../proposals/MOUNT_NAMESPACE_PROPOSAL.md) — original design document (Phases 1–6)
+- [Namespaces](../../docs/archive/NAMESPACES.md) — the surviving design record (the original
+  `proposals/MOUNT_NAMESPACE_PROPOSAL.md`, Phases 1–6, has been deleted)

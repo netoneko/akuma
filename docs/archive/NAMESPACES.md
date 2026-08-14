@@ -2,7 +2,7 @@
 
 Per-box mount namespaces allow each container (box) to have its own filesystem mounts (e.g., `/proc`, `/tmp`) independent of the host. Box definitions persist on disk as OCI bundles and are manually started by herd or users.
 
-See also: [Mount Namespace Proposal](../proposals/MOUNT_NAMESPACE_PROPOSAL.md), [Box Containers](BOX_CONTAINERS.md)
+See also: [Box Containers](BOX_CONTAINERS.md), [`akuma-isolation` implementation details](../../crates/akuma-isolation/docs/IMPLEMENTATION_DETAILS.md)
 
 ## How It Works
 

@@ -2064,6 +2064,36 @@ relocation not removal), the `Pte`/`PageTable` newtype (~−50). Specifically do
 **not** pick up `Mmio<T>` while in the driver layer for Phase 3 — it reaches into
 GIC, console and pmm and has a different blast radius.
 
+### Deferred, inherited from BKL Phase 7: the **7g atomics audit**
+
+**Which locks can just be atomics?** Added to
+[`BKL_FINE_GRAINED_LOCKING_PLAN.md`](BKL_FINE_GRAINED_LOCKING_PLAN.md) §7.3a and
+never started. It belongs on this list because a lock that should have been an
+atomic is the same category of fat as a definition that should have been one: a
+structure carried for no reason, paid for on every hot path.
+
+It is not speculative — Phase 7f tranche 3 found a live instance while doing
+something else (`UTC_OFFSET_US`, converted to an atomic in
+[`BKL_PHASE7F_OPTOUT_LIST.md`](BKL_PHASE7F_OPTOUT_LIST.md) §8.3), which is what
+motivated the phase. That is one confirmed hit from an unsystematic look, so the
+audit's job is to find the rest before `KernelLock` is deleted — after which
+every remaining lock is load-bearing by definition and the question gets harder
+to ask.
+
+**Sequencing.** Ahead of it in Phase 7f §11 sits the higher-value item:
+**IRQ-mask `terminal_state`/`input_waker`**, which blocks `read` — the biggest
+measured un-converted BKL holder (2.9–4.4% on the standing regimen, 56.4% in one
+7b run). Verified still open 2026-08-14: `crates/akuma-exec/src/process/mod.rs`
+takes it via `lock_bounded` with no `IrqGuard`, and `src/syscall/fs.rs`'s read
+side still uses `disable_preemption`, which stops the scheduler but not IRQs.
+
+**Where the live list lives.** `docs/runbooks/bkl-phase7-workplan.md` was deleted
+in `c4f16a8e` — correctly, a workplan is not a runbook — but the deletion was a
+*filing* decision, not a closure: the remaining-work list survives in
+[`BKL_PHASE7F_OPTOUT_LIST.md`](BKL_PHASE7F_OPTOUT_LIST.md) §11, unstruck, and
+[`BKL_PHASE7_AUDIT.md`](BKL_PHASE7_AUDIT.md) still declines to green-light
+deleting `KernelLock` on two independently disqualifying findings.
+
 ### Running total
 
 Phases 0–5 land roughly **−240 `unsafe` (27%)** and **−800 lines**, and close

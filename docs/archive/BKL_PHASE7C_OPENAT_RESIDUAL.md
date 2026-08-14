@@ -10,7 +10,8 @@ This is 7c of the decomposition in [`BKL_PHASE7_AUDIT.md`](BKL_PHASE7_AUDIT.md)
 converted syscall's prologue/epilogue is high enough that either the window
 starts too late or the re-acquire is costing more than expected. Measurement
 first, not code." Executed per
-[`../runbooks/bkl-phase7-workplan.md`](../runbooks/bkl-phase7-workplan.md).
+`bkl-phase7-workplan.md` (deleted — a workplan is not a runbook; the live
+remaining-work list is [`BKL_PHASE7F_OPTOUT_LIST.md`](BKL_PHASE7F_OPTOUT_LIST.md) §11).
 
 ## 1. The measurement, before touching any code
 
@@ -168,5 +169,6 @@ remainder to measure before assuming.
   phase touches originally landed.
 - [`../reference/subsystems/locking.md`](../reference/subsystems/locking.md)
   — the playbook and the load-bearing inventory.
-- [`../runbooks/bkl-phase7-workplan.md`](../runbooks/bkl-phase7-workplan.md) —
+- `bkl-phase7-workplan.md` (deleted — a workplan is not a runbook; the live
+remaining-work list is [`BKL_PHASE7F_OPTOUT_LIST.md`](BKL_PHASE7F_OPTOUT_LIST.md) §11) —
   the work plan this session executed, resuming at 7c.

@@ -1,6 +1,6 @@
 // madvshared — does MADV_DONTNEED on a CoW-shared page wipe the PEER's copy?
 //
-// The deterministic probe for theory 3 of proposals/CARGO_HEAP_NULL_RC.md.
+// The deterministic probe for theory 3 of docs/archive/CARGO_HEAP_NULL_RC.md.
 //
 // Akuma's MADV_DONTNEED zeroes the *physical frame* in place; Linux drops the
 // *mapping* and lets the next touch fault in a fresh zero page. The two agree
@@ -173,7 +173,7 @@ static void phase_control_self(void)
 int main(void)
 {
     printf("madvshared: MADV_DONTNEED on a CoW-shared frame "
-           "(proposals/CARGO_HEAP_NULL_RC.md theory 3)\n");
+           "(docs/archive/CARGO_HEAP_NULL_RC.md theory 3)\n");
     phase_child_advises();
     phase_parent_advises();
     phase_control_self();

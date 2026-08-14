@@ -2,7 +2,8 @@
 
 This document describes the kernel subsystems implemented to support libuv,
 the event loop library underpinning Node.js (and Bun's fallback paths). Based
-on the analysis in `proposals/LIBUV_INFRASTRUCTURE.md`.
+on the analysis in `proposals/LIBUV_INFRASTRUCTURE.md` (since deleted; what it
+concluded is recorded below).
 
 ## What Was Built
 

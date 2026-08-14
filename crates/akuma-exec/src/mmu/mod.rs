@@ -1920,7 +1920,7 @@ pub fn translate_user_va(l0_ptr: *const u64, va: usize) -> Option<usize> {
 /// `AP_RO_ALL` (read-only to everyone), `AP_RO_EL1`/`user_flags::NONE` (a
 /// `PROT_NONE` guard page), and `AP_RW_EL1` (kernel-only, EL0 no access) all fault
 /// on a user write and mean very different things. Returning the descriptor lets
-/// the caller name which one it is. See proposals/CARGO_HEAP_NULL_RC.md.
+/// the caller name which one it is. See docs/archive/CARGO_HEAP_NULL_RC.md.
 pub fn user_pte_raw(l0_ptr: *const u64, va: usize) -> Option<u64> {
     let l0_idx = (va >> 39) & 0x1FF;
     let l1_idx = (va >> 30) & 0x1FF;

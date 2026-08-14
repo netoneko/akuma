@@ -4,7 +4,7 @@ Companion to [`../reference/scripts/`](../reference/scripts/README.md) (the
 current-state index) and [`../reference/overlay/`](../reference/overlay/README.md)
 (the devbox overlays). This is the detailed pass behind both: per-script
 history, the evidence for each removal, and the reasoning for everything kept
-as-is. Driven by `proposals/CLEANUP.md`'s Scripts section ("clean up the
+as-is. Driven by `TRIM_FAT_REMOVAL_FEASIBILITY.md`'s Scripts section ("clean up the
 scripts that are not relevant anymore… reference useful scripts in
 docs/reference/ and delete useless ones" + "Move scripts/*_repro to
 akuma-playground or remove outright, need to understand usefulness").
@@ -194,7 +194,8 @@ fault signature.
 - **`bkl_rustc_bench/`, `bkl_smp_regimen/`** — self-contained campaign
   harnesses, each with its own `README.md` explaining its pieces; not
   duplicated here or in the reference index. Both are live tooling for the
-  ongoing BKL Phase 7 work (`docs/runbooks/bkl-phase7-workplan.md`).
+  ongoing BKL Phase 7 work (`docs/archive/BKL_PHASE7F_OPTOUT_LIST.md` §11 — the
+  workplan runbook that used to be cited here has been deleted).
 - **`docker/`, `build_docker.sh`, `sqlite/`'s sibling directory `docker/`**
   (unrelated to the removed `sqlite/schema.sql`) — `build_docker.sh` copies
   the kernel binary into `scripts/docker/` and builds the `akuma-qemu`
@@ -235,7 +236,7 @@ audit changed.
 
 ## Background
 
-- `proposals/CLEANUP.md` — the source of this whole pass (Userspace,
+- `TRIM_FAT_REMOVAL_FEASIBILITY.md` — the source of this whole pass (Userspace,
   Scripts, and Kernel sections; only Scripts + Userspace were done here).
 - [`../reference/scripts/`](../reference/scripts/README.md) — the
   current-state index this doc backs.

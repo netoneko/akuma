@@ -1,7 +1,7 @@
 // bssfork — after a fork, can the process's own threads still write its globals?
 //
 // The narrowest statement of the defect in
-// proposals/COWSTALE_FORK_THREAD_SEGV.md. `cowstale` found that defect while
+// docs/archive/COWSTALE_FORK_THREAD_SEGV.md. `cowstale` found that defect while
 // looking for something else, so it carries an mmap region, two patterns and a
 // verification pass that have nothing to do with it. This probe carries none of
 // that: no mmap, no patterns, nothing but threads, `.bss`, and `fork`.

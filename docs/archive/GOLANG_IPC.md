@@ -200,9 +200,10 @@ Add entry #57 for FUTEX_PRIVATE fix.
 
 ---
 
-## Note on `proposals/FIX_FUTEX_SUBSYSTEM.md`
+## Note on the "fix futex subsystem" proposal
 
-That proposal is named misleadingly — it documents the **SA_RESTART ELR bug**,
+`proposals/FIX_FUTEX_SUBSYSTEM.md` has since been deleted; this note is what
+survived of it, and it was named misleadingly — it documented the **SA_RESTART ELR bug**,
 not a futex implementation bug. Symptom: `[futex] EINVAL: uaddr=0x1` after a
 FUTEX_WAKE returned 1, which got re-executed as `FUTEX_WAKE(uaddr=1)` due to
 ELR being backed up unconditionally on SA_RESTART. Fix: gate the ELR-4 backup

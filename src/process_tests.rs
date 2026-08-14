@@ -671,7 +671,7 @@ pub fn run_all_tests() {
     // the BTreeMap user_frames refcount and deferred-TLB teardown path.
     test_munmap_teardown_conserves_pmm();
     // munmap must drain EVERY eager region a range touches, not just one matched by
-    // exact start_va (proposals/CARGO_HEAP_NULL_RC.md D8).
+    // exact start_va (docs/archive/CARGO_HEAP_NULL_RC.md D8).
     test_munmap_spans_multiple_eager_regions();
     test_aliased_pa_not_double_freed();
     test_unmap_and_free_respects_refcount();
@@ -695,7 +695,7 @@ pub fn run_all_tests() {
     test_pmm_conserved_across_spawn_exit_reap();
 
     // Use-after-free instrumentation for the cargo null-`Rc` defect
-    // (proposals/CARGO_HEAP_NULL_RC.md): the poison quarantine must catch a write
+    // (docs/archive/CARGO_HEAP_NULL_RC.md): the poison quarantine must catch a write
     // through a freed frame, and `MADV_DONTNEED`'s range divergence from Linux
     // must stay pinned, or a clean run proves nothing.
     test_uaf_quarantine_instrument();
@@ -707,7 +707,7 @@ pub fn run_all_tests() {
     test_madvise_dontneed_spares_shared_frame();
 
     // A write fault the page table already permits must be absorbed, not turned
-    // into SIGSEGV — the fix for proposals/COWSTALE_FORK_THREAD_SEGV.md.
+    // into SIGSEGV — the fix for docs/archive/COWSTALE_FORK_THREAD_SEGV.md.
     test_stale_write_fault_absorbed();
 
     // Boot-stack reservation is now derived from the linked image size in
@@ -4368,7 +4368,7 @@ fn test_ensure_user_pages_mapped_as_lock() {
 /// remainder mapped with its VA never recycled. A leftover region is also a live
 /// protection record for an address that has moved on, which
 /// `eager_region_flags_for_page_fault` will answer from — see
-/// proposals/CARGO_HEAP_NULL_RC.md (D8/D9). Host tests in `akuma-exec` cover the
+/// docs/archive/CARGO_HEAP_NULL_RC.md (D8/D9). Host tests in `akuma-exec` cover the
 /// clipping shapes; this one pins the kernel-side integration: real frames, the
 /// real region list under `vm_lock`, and PMM conservation across the whole cycle.
 fn test_munmap_spans_multiple_eager_regions() {
@@ -4944,7 +4944,7 @@ fn test_heap_no_runaway_on_page_multiple_alloc() {
 /// user page, an unfreed page-table frame, a non-reclaimable heap span) shows up
 /// as a monotonic decline of `free_count` across the repeated cycles.
 /// The UAF instrument for the cargo null-`Rc` defect
-/// (proposals/CARGO_HEAP_NULL_RC.md) must actually detect a write through a
+/// (docs/archive/CARGO_HEAP_NULL_RC.md) must actually detect a write through a
 /// stale mapping — otherwise a clean `UAF=0` on a self-host build proves nothing.
 ///
 /// Covers the whole chain on one frame: the free-list probe
@@ -5242,7 +5242,7 @@ fn test_fork_cow_share_incs_once_per_frame() {
 }
 
 /// The CoW reference ledger must record the increment/decrement history that the
-/// `EAGER-UPGRADE` report reads back (proposals/CARGO_HEAP_NULL_RC.md).
+/// `EAGER-UPGRADE` report reads back (docs/archive/CARGO_HEAP_NULL_RC.md).
 ///
 /// The anomaly under investigation is a page whose share count sits at 0 while its
 /// owner still maps it, i.e. one decrement too many — a claim only provable from
@@ -5309,7 +5309,7 @@ fn test_cow_ref_ledger_records_history() {
 /// A write fault on a page the page table ALREADY permits writing must be
 /// absorbed, never escalated to SIGSEGV.
 ///
-/// This is the fix for proposals/COWSTALE_FORK_THREAD_SEGV.md. When a threaded
+/// This is the fix for docs/archive/COWSTALE_FORK_THREAD_SEGV.md. When a threaded
 /// process forks, every thread that writes a shared page faults at once; the first
 /// one through breaks CoW (new frame, PTE now writable, `cow_ref` consumed) and the
 /// rest arrive holding a fault for a write that has since become legal. Nothing
@@ -5380,7 +5380,7 @@ fn test_stale_write_fault_absorbed() {
 
 /// `MADV_DONTNEED` zeroes a strict superset of the range Linux would clear when
 /// the start address is unaligned — the head page it pulls in belongs to the
-/// caller and holds live bytes (theory 3 of proposals/CARGO_HEAP_NULL_RC.md).
+/// caller and holds live bytes (theory 3 of docs/archive/CARGO_HEAP_NULL_RC.md).
 ///
 /// Pins the divergence as a fact rather than a reading of the handler, so the
 /// audit counter it feeds has a defined meaning.
@@ -5423,7 +5423,7 @@ fn test_madvise_dontneed_range_semantics() {
 /// `MADV_DONTNEED` on a CoW-shared page must leave the **peer's** page alone.
 ///
 /// This is the root cause of the cargo null-`Rc` crash
-/// (proposals/CARGO_HEAP_NULL_RC.md): the handler used to `memset` the physical
+/// (docs/archive/CARGO_HEAP_NULL_RC.md): the handler used to `memset` the physical
 /// frame, which after a `fork` is the same frame the peer is still reading — 0 of
 /// 4096 bytes survived, measured in-guest by
 /// `userspace/forktest/c_stress/madvshared.c` and PASSing on real Linux arm64 with

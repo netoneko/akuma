@@ -1202,7 +1202,7 @@ pub fn eager_region_flags_for_page_fault(pid: Pid, va: usize) -> Option<u64> {
 /// region's pages, returned success, and left the rest mapped with their VA never
 /// recycled. A leftover region is also a live protection record for an address
 /// that has moved on, which `eager_region_flags_for_page_fault` will happily answer
-/// from. See proposals/CARGO_HEAP_NULL_RC.md (D8/D9).
+/// from. See docs/archive/CARGO_HEAP_NULL_RC.md (D8/D9).
 ///
 /// Page counts come from `MmapRegion::pages`, never `frames.len()`: a CoW-inherited
 /// region has every page mapped but owns no frames.
@@ -1266,7 +1266,7 @@ pub fn detach_eager_regions_in_range(
 /// fault handler's side, from a page whose protection was legitimately recorded.
 /// This exists so an anomaly report can say how many regions actually claim the
 /// address: more than one is a bookkeeping bug, not a close call. See
-/// proposals/CARGO_HEAP_NULL_RC.md.
+/// docs/archive/CARGO_HEAP_NULL_RC.md.
 pub fn eager_regions_containing(pid: Pid, va: usize) -> alloc::vec::Vec<(usize, usize, u64)> {
     let owner = address_space_owner_pid_for_fault().unwrap_or(pid);
     let collect = |p: Pid| -> alloc::vec::Vec<(usize, usize, u64)> {
@@ -1302,7 +1302,7 @@ pub fn update_eager_region_flags(pid: Pid, range_start: usize, range_size: usize
     // which is precisely the input the fault handler uses to grant a write. Report
     // each occurrence (with the region it lies about) so the `[EAGER-UPGRADE]`
     // repairs seen during a self-host build can be attributed to it or ruled out.
-    // See proposals/CARGO_HEAP_NULL_RC.md.
+    // See docs/archive/CARGO_HEAP_NULL_RC.md.
     let grants_write = new_flags & crate::mmu::flags::AP_MASK == crate::mmu::flags::AP_RW_ALL;
     let mut widened: Option<(usize, usize, u64)> = None;
     proc.vm_with_regions(|r| {

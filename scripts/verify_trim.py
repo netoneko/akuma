@@ -85,7 +85,7 @@ CLIPPY_CONFIGS = [
 # and passes cleanly; keep both entries so a regression in either shape is caught.
 #
 # `madvshared` is the pass condition for the MADV_DONTNEED share-breaking fix
-# (proposals/CARGO_HEAP_NULL_RC.md): it builds a CoW-shared frame by hand, with no
+# (docs/archive/CARGO_HEAP_NULL_RC.md): it builds a CoW-shared frame by hand, with no
 # allocator in the way, and reports whether a peer's page survived the advise. It
 # runs in milliseconds and it is calibrated — the identical static binary PASSes
 # all three phases on real Linux arm64, so a FAIL here is the kernel, not the

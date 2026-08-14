@@ -81,7 +81,7 @@ discussion threads.
 
 ---
 
-## 4. The dev cycle that emerged (visible in `docs/runbooks/bkl-phase7-workplan.md`)
+## 4. The dev cycle that emerged (was visible in `docs/runbooks/bkl-phase7-workplan.md`, since deleted)
 
 The current, most mature form of the cycle, observed on the BKL-removal campaign:
 
@@ -277,9 +277,9 @@ only one that pays off across all of them.
 
 Based on: `git log --oneline`, `git shortlog -sn`, `git branch -a`, `git tag`,
 per-month commit counts on `main`; `docs/README.md`, `docs/reference/README.md`,
-`docs/runbooks/README.md`, `docs/runbooks/bkl-phase7-workplan.md`,
+`docs/runbooks/README.md`, `docs/runbooks/bkl-phase7-workplan.md` (both since deleted),
 `docs/reference/subsystems/locking.md`; `docs/archive/BUG_FIX_LIST.md` in full,
 plus direct reads of `AI_DEBUGGING.md`, `ARCHITECTURE_QUESTIONS.md`,
 `KNOWN_ISSUES.md`, `HIJACK_VS_KERNEL_PROXY.md`, `EMBASSY_REMOVAL.md`,
 `DEAD_CODE_ANALYSIS.md`, `TRIM_FAT_PART_1.md`, `BKL_PHASE7_AUDIT.md`; root
-`README.md`, `GEMINI.md`, `proposals/CLEANUP.md`, `acceptance/03_two_vms_agent_workflow.md`.
+`README.md`, `GEMINI.md`, `TRIM_FAT_REMOVAL_FEASIBILITY.md`, `acceptance/03_two_vms_agent_workflow.md`.

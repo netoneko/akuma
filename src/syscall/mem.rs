@@ -89,7 +89,7 @@ pub const PROT_WRITE: u32 = 0x2;
 // Akuma's `MADV_DONTNEED` used to zero the *physical frame* in place. That agrees
 // with Linux for a page owned by one address space and disagrees — destructively —
 // for a shared one: the peer's live page went to zeroes too. That was the
-// null-`Rc` mechanism (proposals/CARGO_HEAP_NULL_RC.md), demonstrated
+// null-`Rc` mechanism (docs/archive/CARGO_HEAP_NULL_RC.md), demonstrated
 // deterministically by `userspace/forktest/c_stress/madvshared.c` and fixed
 // 2026-08-14 by [`dontneed_page_action`] — a shared page now gets a private zero
 // frame of its own and the peer keeps its data.
@@ -911,7 +911,7 @@ pub fn dontneed_apply(
 /// After a `fork` it does not: parent and child share the frame CoW, and zeroing
 /// it destroyed the peer's live page — 0 of 4096 bytes surviving, measured. That
 /// is the null-`Rc` crash in cargo's `-j4` self-host build
-/// (proposals/CARGO_HEAP_NULL_RC.md): cargo forks per rustc invocation, so its
+/// (docs/archive/CARGO_HEAP_NULL_RC.md): cargo forks per rustc invocation, so its
 /// heap is full of CoW-shared frames, and jemalloc reaches `MADV_DONTNEED` by
 /// probing `MADV_FREE` and falling back on its `EINVAL`. `madvshared` is the
 /// deterministic probe; `cowstale`/`bssfork` are the no-regression check.
@@ -1215,7 +1215,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     // for flags, a stale region left by an earlier clipped unmap) turns it into a
     // silent leak, and a leftover region also lets an obsolete protection record
     // shadow the live one in `eager_region_flags_for_page_fault`. See
-    // proposals/CARGO_HEAP_NULL_RC.md (D8/D9).
+    // docs/archive/CARGO_HEAP_NULL_RC.md (D8/D9).
     //
     // Page counts come from `MmapRegion::pages`, not the frame count: a CoW-inherited
     // region has every page mapped but owns no frames, and sizing the unmap by

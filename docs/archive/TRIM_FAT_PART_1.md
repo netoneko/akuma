@@ -4,7 +4,8 @@
 
 Removed `userspace/xbps/` and restructured `userspace/apk-tools/` as the first
 step in the infrastructure optimization described in
-[`proposals/TRIM_SOME_FAT.md`](../proposals/TRIM_SOME_FAT.md).
+`proposals/TRIM_SOME_FAT.md` (since deleted; this file and its
+`TRIM_FAT_PART_2`/`_3` siblings are what survived of it).
 
 The acceptance criterion — `apk add busybox` running to completion inside the
 VM — has been verified and passes.
