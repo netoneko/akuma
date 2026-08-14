@@ -456,6 +456,13 @@ process mapping an already-held frame hands the surplus back —
 `exceptions::drop_surplus_shared_ref`, gated on `AddressSpace::tracks_user_frame`.
 Removing that guard leaks a frame per occurrence.
 
+That invariant is also what makes `cow_ref >= 2` a sound test for "another
+address space can see this frame", which `MADV_DONTNEED` relies on
+([`syscalls/mem.md`](syscalls/mem.md)): a cached page with one mapper reads 2,
+and a cached page with `cow_ref == 1` is mapped nowhere, so no VA can reach it.
+Writing through a frame without checking that test is what corrupted cargo's heap
+([`../../archive/MADV_DONTNEED_SHARED_FRAME.md`](../../archive/MADV_DONTNEED_SHARED_FRAME.md)).
+
 ### Eligibility is deliberately narrow
 
 Each rule rules out a correctness bug, not merely a risk:

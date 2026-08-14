@@ -707,20 +707,27 @@ unattributable.
 
 | id | finding | status | verify with |
 |---|---|---|---|
-| F3 | `cow_fault_lock` provides no mutual exclusion; 3 of 4 CoW runtime fn pointers are dead | **CONFIRMED** | `grep -rn COW_FAULT_LOCK src crates` → 3 hits, all in `pmm.rs` |
+| F3 | `cow_fault_lock` provides no mutual exclusion; 3 of 4 CoW runtime fn pointers are dead | **DONE 2026-08-14** — deleted with the `akuma-pmm` extraction ([`PMM_EXTRACT.md`](PMM_EXTRACT.md)); the last two dead `ExecRuntime` fields (`cow_ref_dec`, `cow_ref_get`) went with it. `cow_fork_enabled` is the only `cow*` name left in `runtime.rs` | `grep -rn COW_FAULT_LOCK src crates` → **0 hits** |
 | F2 | `try_resolve_el1_cow_fault` resolves the owner with `read_current_pid()`; for `CLONE_VM` workers this leaks two frames per kernel-side CoW break and takes a lock nobody waits on | **FIXED 2026-08-13** (mechanism was CONFIRMED, consequence still NEEDS-REPRO) | PMM drift across a threaded workload taking kernel-side user writes; `[AS-*]` traces |
 | F1 | both EL1 CoW-break paths copy 4 KiB from `old_pa` outside the lock the EL0 path documents as required for `old_pa`'s validity | **FIXED 2026-08-14** — copy moved inside `with_address_space`; unblocked by the F8 fix (F1 was F8's amplifier, §10.2, never the defect). Verified: 10/10 amplified + 3/3 unamplified clean suites | `cowstale`, `bssfork spread=1` at SMP=4; poison decode in `[WILD-DA]` |
 | F8 | the SMP=1 exercise suite wedges intermittently: console output stops, one core spins at 100%, **zero** time-jump lines on an idle host. Root cause: the scheduler SGI installed a **freed** L0 into TTBR0 from a zombie thread's saved context — the page-table-UAF free gate only saw TTBR0s live on cores, never saved contexts (§10.1–10.2: `TTBR0_EL1` at the wedge == the last `[AS-FREE]` line's L0; ESR=0x86000004, recursive vector-fetch abort) | **ROOT-CAUSED + FIXED 2026-08-14** (§10.3: saved-context arm on the free gate + drain re-check; boot test `as_drop_defers_while_saved_ctx_on_l0`) | `scripts/f8_wedge_repro.py`; `[SGI-S FREED-L0]` must never print; `[AS-FREE-DEFER] ... held_by_ctx` lines are the gate working |
-| F1b | the EL1 paths still translate the VA and read the refcount outside `as_lock`, so `old_pa` can be stale before the hold begins — the residue F1's prescribed fix cannot reach | **FIXED 2026-08-14** — §4 option 1: the `TakingAsLock` arm re-validates translate + refcount under the hold and declines the break (frees the unused frame, changes nothing) on a miss; boot test `cow_break_declines_stale_old_pa` | re-measure the cargo null-Rc rate (`CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md`) — this window was its best remaining candidate route |
+| F1b | the EL1 paths still translate the VA and read the refcount outside `as_lock`, so `old_pa` can be stale before the hold begins — the residue F1's prescribed fix cannot reach | **FIXED 2026-08-14** — §4 option 1: the `TakingAsLock` arm re-validates translate + refcount under the hold and declines the break (frees the unused frame, changes nothing) on a miss; boot test `cow_break_declines_stale_old_pa` | **The prescribed re-measurement was done 2026-08-14 and answered a different question: the cargo null-`Rc` was not this window.** It was `MADV_DONTNEED` zeroing a CoW-shared frame out from under the peer — [`MADV_DONTNEED_SHARED_FRAME.md`](MADV_DONTNEED_SHARED_FRAME.md). F1b remains a real narrowed window and its fix stands; it is simply no longer the null-`Rc` candidate, and nothing here is gated on that measurement any more |
 | F4 | DA single-page fallback places `dsb ish; isb` before the PTE install, disagreeing with its own batch path and with the IA arm | **CONFIRMED** | inspection; no known symptom |
 | F5 | IA arm claims `icache_done: true` into `file_page_cache` for pages it may map non-exec | **CONFIRMED** | inspection; no known symptom |
 | F6 | re-entrant `fault_slot_acquire` on one page by one thread lets the inner release drop the outer's entry | **CONFIRMED** | inspection; no known trigger |
 | F7 | survey errors: item 5 is three guards not two, ~24 lines not 142; `log_fault_reclaim`'s rustdoc opens with another function's sentence | **CONFIRMED** | §7 |
 
-None of F1–F6 is being fixed in this document's change. F1, F2 and F4–F6 are
-recorded here because they are invisible from any single call site and only
-surface when the copies are read side by side — which is the argument for §8's
-items 3 and 4.
+None of F1–F6 was being fixed in this document's original change. F1, F2 and
+F4–F6 are recorded here because they are invisible from any single call site and
+only surface when the copies are read side by side — which is the argument for
+§8's items 3 and 4.
+
+> **Status as of 2026-08-14: F1, F1b, F2, F3 and F8 are closed.** What is left is
+> **F4** (barrier ordering in the DA single-page fallback), **F5** (`icache_done`
+> claimed for possibly-non-exec pages) and **F6** (re-entrant
+> `fault_slot_acquire`) — all CONFIRMED by inspection, none with a known symptom
+> or trigger, all small. F7 is survey bookkeeping. Nothing in that set is blocked
+> on a measurement any more.
 
 ## 10. F8 — the suite wedge, localized (2026-08-14)
 

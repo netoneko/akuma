@@ -154,6 +154,21 @@ management (a zeroed or wrong page handed back), the same family as the fixed
 teardown-only curiosity; it is not teardown-only, it fired at T72 mid-build and
 killed the run.
 
+> **FIXED 2026-08-14.** The guess above was the right family and nearly the right
+> call: it was `madvise`, the sibling advice value. `MADV_DONTNEED` `memset` the
+> **physical frame**, which after a `fork` is the frame the peer is still reading
+> — the peer's whole page went to zeroes, 0 of 4096 bytes surviving. cargo forks
+> per rustc invocation, so its heap is exactly the shape this destroys. Proven
+> deterministically in milliseconds by `userspace/forktest/c_stress/madvshared.c`
+> rather than by re-running this ~1-in-5, 15-minute repro. **The corruption is
+> proven; that Defect B took this route is inference** — when you next run a build
+> here, read `dontneed_shared_frame` out of the `[MADV]` PSTATS line and settle it.
+> See
+> [`../archive/MADV_DONTNEED_SHARED_FRAME.md`](../archive/MADV_DONTNEED_SHARED_FRAME.md),
+> whose "Method lessons" are the part worth reading before chasing the next
+> stochastic defect here. Defect **A**, the unexplained all-core wedge in the same
+> table, is a separate open item — do not conflate them.
+
 ## Prerequisites
 
 - Host: `ollama serve` is NOT needed for self-host (that's for meow). You need
@@ -559,7 +574,7 @@ same tree.
 | Build restarts lose all progress; ssh dies ~every 5 min | remote cargo killed with the ssh session | Run detached + poll (§5.2) |
 | `qemu-system-aarch64: Assertion failed: (isv), hvf.c:1883` | guest touched MMIO with an instruction HVF can't decode, after the kernel went off the rails | Symptom of the ld-musl class — [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) |
 | All 4 vCPUs at 100 %, **serial log stops advancing**, sshd accepts TCP but sends no banner, heartbeat gone | Defect A — unexplained all-core wedge. Not KTG (zero `[KTG-STALE-CH]`), not OOM (PMM 89 % free) | **OPEN** — boot with `GDB=1` and take an lldb dump of all vCPUs. Log staleness is the signal; SSH timeouts alone are not (§"Status (2026-08-07)") |
-| Build dies `EXIT=139`; `[WILD-DA] pid=<cargo> FAR=0x0` at a fixed `ELR` | Defect B — a pointer in cargo's heap read back as zero (null `Rc` in `drop_glue`); heap corruption, not a cargo bug | **OPEN** — decode `ELR` against `seg_va=0x10000000 filesz=0x1da1c6c`; suspect page management (§"Status (2026-08-07)") |
+| Build dies `EXIT=139`; `[WILD-DA] pid=<cargo> FAR=0x0` at a fixed `ELR` | Defect B — a pointer in cargo's heap read back as zero (null `Rc` in `drop_glue`); heap corruption, not a cargo bug | **FIXED 2026-08-14** — `MADV_DONTNEED` was zeroing a CoW-shared frame out from under the peer: [`../archive/MADV_DONTNEED_SHARED_FRAME.md`](../archive/MADV_DONTNEED_SHARED_FRAME.md). If it recurs, first run `madvshared` (expect `ALL PASS`), then decode `ELR` against `seg_va=0x10000000 filesz=0x1da1c6c` |
 
 ## Background
 

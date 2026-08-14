@@ -83,14 +83,78 @@ didn't move", so there's nothing to signal.
 `addr`/`len` are page-rounded; unmapping an address with nothing mapped there
 is **not** an error (matches Linux — silently succeeds).
 
-**`madvise`** (`sys_madvise`, `mem.rs:509`): never returns an error. All of
-`MADV_WILLNEED`, `MADV_DONTNEED`, `MADV_FREE`, and any unrecognized advice
-value return `0` unconditionally — advice is just that, and OOM during
-`MADV_WILLNEED` pre-faulting is silently swallowed. **Semantic gap:**
-`MADV_DONTNEED` here zeroes already-mapped pages in place
-(`zero_mapped_page`) rather than unmapping and returning them to the PMM as
-Linux does — a caller relying on `MADV_DONTNEED` to actually shrink RSS will
-not see that effect.
+**`madvise`** (`sys_madvise`, `mem.rs:1001`): `MADV_FREE` returns `EINVAL`
+(deliberately — see below); everything else returns `0` unconditionally, and OOM
+during `MADV_WILLNEED` pre-faulting is silently swallowed.
+
+`MADV_FREE`'s `EINVAL` is not a gap, it is the correct answer and load-bearing:
+Redis probes `MADV_FREE`, reads `EINVAL` as "older kernel, presumably
+unaffected", and starts — where a fabricated `0` sent it into a THP-corruption
+self-check it cannot pass without `/proc/<pid>/smaps`
+(`../../../archive/LONG_ROAD_TO_REDIS.md` §5). The **consequence** is that
+`MADV_FREE`-probing allocators (jemalloc, mimalloc) fall back to
+`MADV_DONTNEED`, so all of that traffic lands on the arm below.
+
+### `MADV_DONTNEED` — breaks sharing, does not drop the mapping
+
+`madvise_dontneed_range` (`mem.rs:938`). Per page, the rule is
+`dontneed_page_action(mapped, cow_ref)`:
+
+| `cow_ref` | What it means | Action |
+|---|---|---|
+| 0 | never shared | zero the frame in place, no allocation |
+| 1 | the peer already went away (exited, or broke CoW itself) | zero in place |
+| **≥ 2** | **another address space maps this frame** | **break the share** |
+
+`cow_ref` counts **address spaces**, and the first share inserts 2
+(`akuma_pmm::cow_ref_inc`), so 2 is the smallest value meaning "someone else can
+see this frame". Breaking the share = `unmap_and_free_page(va)` — the usual
+`released_last_va` gate, so `pmm::free_page` routes through `cow_ref_dec` and
+declines to free the frame while the peer holds it — then a freshly zeroed
+private frame mapped at the same VA, `RW_NO_EXEC`.
+
+**Until 2026-08-14 every page in that bottom row was `memset` in place**, which
+after a `fork` wrote through the frame the peer was still reading: the peer's
+page went to zeroes, 0 of 4096 bytes surviving. That is the mechanism behind the
+cargo null-`Rc` crash — cargo forks per rustc invocation, so its heap is exactly
+that shape. (The corruption is proven; that the crash *took* this route is a
+strong inference, and `dontneed_shared_frame` during a build is what settles it.)
+See
+[`../../../archive/MADV_DONTNEED_SHARED_FRAME.md`](../../../archive/MADV_DONTNEED_SHARED_FRAME.md).
+
+**Why not Linux's drop-the-mapping.** Linux unmaps and lets the next touch
+refault. That does not work here: **eager `mmap`s register no lazy region**
+(≤ `config::MMAP_EAGER_MAX_PAGES` = 16 pages), so `ensure_user_page_mapped` would
+have nothing to demand-page from and the next touch would be SIGSEGV rather than
+a zero page. A private zero frame gives the caller the identical observable
+result — mapped, readable, all zeroes — uniformly across eager and lazy mappings.
+
+**Two passes, and why.** Frames must be allocated **outside** `as_lock` (the
+PMM's reclaim path re-enters it and the `Spinlock` is not reentrant), but the
+state that says how many are needed is in the page tables. So
+`dontneed_count_shared` counts under the hold, the allocation happens between the
+holds, and `dontneed_apply` re-reads every page and acts on what it finds *then*.
+A peer that broke CoW inside that window is simply seen as unshared; a page that
+became shared inside it (a concurrent `fork`) finds no spare frame and is
+**skipped**, never wiped. The same skip absorbs a PMM that cannot serve the
+batch — the advice is advisory, and failing to zero the caller's own page beats
+zeroing someone else's.
+
+**Counters** (`dontneed_audit_line`, in the PSTATS `[MADV]` line):
+
+| Counter | Reads |
+|---|---|
+| `dontneed_shared_frame` | pages whose share was broken — before the fix, each one was a corruption |
+| `dontneed_skipped` | shared pages left untouched for want of a frame. Expected 0; climbing means memory pressure is reaching this path |
+| `dontneed_unaligned` | **still-open divergence**: Linux rejects a non-page-aligned `start` with `EINVAL`, this rounds it **down** (`dontneed_zero_range`), so the cleared range is a strict superset of Linux's and includes the caller's live head page. Has never read non-zero |
+
+**Semantic gap (unchanged by the fix):** `MADV_DONTNEED` does not return pages to
+the PMM, so a caller relying on it to shrink RSS will not see that effect. Doing
+so would require teaching the eager path to register a region first.
+
+**Regression coverage:** `madvshared` (in `verify_trim.py`'s `EXERCISES`, and
+calibrated against real Linux arm64) and the boot test
+`madvise_dontneed_spares_shared_frame`.
 
 **`msync`** (`sys_msync`, `mem.rs:94`): always returns `0`, even for a range
 with no writable `MAP_SHARED` file mapping (matches Linux: a no-op on a
