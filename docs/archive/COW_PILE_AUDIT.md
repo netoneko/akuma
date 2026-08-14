@@ -74,6 +74,13 @@ Two notes on the dispatch that are easy to misread as bugs and are not:
 
 ## 2. Three duplication primitives — and one 45-field literal written four times
 
+> **MERGED 2026-08-14 (§8 items 3–4; the record is §8.2 below).**
+> The three literals are now one `Process::inherit_from`; the shared tail is one
+> `spawn_child_thread_and_publish`. Read §8.2 before trusting the two tables below:
+> the divergence count is **six**, not nine (the three locks are identical at all
+> three sites), the tail's `child_ctx.ttbr0` row is wrong for `clone_thread`, and
+> the literal was written **six** times, not four.
+
 | primitive | file:line | lines | address space | thread group |
 |---|---|---:|---|---|
 | `fork_process` | `process/mod.rs:2006` | 702 | **new**, CoW-shared from parent | new (`tgid = child_pid`) |
@@ -495,15 +502,17 @@ identical, which is most of them.** In risk order, cheapest and safest first:
 |---|---|---:|---|---|
 | 1 | **`FaultSlotGuard`** — one guard + one `fault_slot_hold(pid, as_owner, page_va)` acquire-and-guard fn, replacing 3 structs, 3 impls and 3 log+acquire pairs | −24 | low | Phase 6 item 5 as literally scoped. Behaviour-preserving. Fixes the `pid`/`as_owner` misnomer and gives the release contract one home |
 | 2 | **Delete `cow_fault_lock`/`unlock`** + `CowFaultLockGuard` + 2 dead runtime fields; move the stated purpose onto the `released_last_va` comment | −25 | low | §5. It is a counter nobody reads. Deleting it is strictly clarifying |
-| 3 | **`spawn_child_thread_and_publish(...)`** — the ~40-line tail of §2, shared by all three primitives with `clone_thread`'s two documented opt-outs as parameters | −80 | medium | Highest structural payoff in the pile. One place for the ttbr0 fix, the `THREAD_PID_MAP` ordering, and the signal-mask seed that must precede `mark_thread_ready` |
-| 4 | **`Process::inherit_from(parent, overrides)`** — one constructor, 36 inherited fields in one place, 9 explicit | −120 | medium | Kills the four-45-field-literal problem. Do it *after* 3 so the tail is already shared. Must not become a `Default` — every one of the 9 must stay a compile error if unset |
+| 3 | **`spawn_child_thread_and_publish(...)`** — the ~40-line tail of §2, shared by all three primitives with `clone_thread`'s two documented opt-outs as parameters | −80 | medium | **DONE 2026-08-14 (§8.2).** Highest structural payoff in the pile. One place for the `THREAD_PID_MAP` ordering and the signal-mask seed that must precede `mark_thread_ready`. ~~the ttbr0 fix~~ — that one stayed per-site; §8.2 says why. Opt-outs turned out to be two enums **plus** a `before_ready` hook for three extra `clone_thread` steps |
+| 4 | **`Process::inherit_from(parent, overrides)`** — one constructor, 36 inherited fields in one place, 9 explicit | −120 | medium | **DONE 2026-08-14 (§8.2).** Kills the four-45-field-literal problem (it was six literals). Done *after* 3, which was the right order. Not a `Default`: **7** mandatory override fields, not 9 — the three locks never differed. Measured **−26** net code lines, not −120; §8.2 explains why that is the wrong metric |
 | 5 | **F2's owner resolution** (`read_current_pid` → `address_space_owner_pid_for_fault`) | 1 line | medium | A one-line fix to a two-frame-per-fault leak. Needs the boot suite at SMP=4 and a PMM drift check, not a merge |
 | 6 | **F1's copy-under-lock** — move the 4 KiB copy inside `with_address_space` in both EL1 paths | ~10 | **high** | Extends a lock hold to cover a 4 KiB copy on the kernel-write path. Correct per the EL0 path's own invariant, but it is a hold-time change in the fault path and needs measurement |
 | 7 | **The DA/IA demand-paging bodies** (§6) | −330 | **high** | Biggest number here and the most tempting. Do not do it as hygiene: answer the `is_exec` and barrier-placement questions first, on purpose, with SMP=4 evidence |
 
 Items 1 and 2 are an afternoon and are pure clarification. Items 3 and 4 are the
 ones that change how this code ages — after them, a new `Process` field is one
-edit and the child-publish ordering has one definition. Items 5–7 are defect work
+edit and the child-publish ordering has one definition. (Both landed 2026-08-14;
+the "one edit" is `inherit_from`, plus `Process::from_elf`, which builds from an
+ELF image rather than from a parent and so cannot share it — see §8.2.) Items 5–7 are defect work
 wearing a refactor costume and should be scheduled as defect work.
 
 **What must not be merged:** the three CoW-break *entry conditions*. The EL0 path
@@ -554,8 +563,8 @@ is already in agreement on the part that matters (`released_last_va`).
 > and been verified, the wedge could be A/B'd against a known-good baseline within
 > minutes, and the answer — "this is neither of your two fixes" — was reachable at all.
 >
-> Items 3–4 of §8 (`spawn_child_thread_and_publish`, `Process::inherit_from`) and item 7
-> (the DA/IA merge) remain open, as scoped.
+> ~~Items 3–4 of §8 (`spawn_child_thread_and_publish`, `Process::inherit_from`)~~ and item 7
+> (the DA/IA merge) remain open, as scoped. **Items 3–4 landed 2026-08-14 — see §8.2.**
 
 Two of §8's rows do not belong in a change called a CoW merge, and bundling them
 would make it unverifiable:
@@ -596,6 +605,98 @@ The reason for two cycles rather than one: `cowstale`/`bssfork` and the BKL-stuc
 line count are the only instruments here, and if the merge, the owner change and a
 longer `as_lock` hold all land together, a regression in any of them is
 unattributable.
+
+## 8.2 The fork-lifecycle merge — §8 items 3–4, **LANDED 2026-08-14**
+
+> **Status: both in the tree.** `crates/akuma-exec/src/process/mod.rs` only —
+> `fork_process`, `vfork_process` and `clone_thread` now share one constructor and
+> one publish tail. No CoW-break path, no `exceptions.rs` line, and none of
+> F1/F1b/F2/F8's fixes were touched; this is the construction/publish half of the
+> pile, exactly as §8.1 scoped it.
+>
+> - **Item 4** → `Process::inherit_from(parent, InheritOverrides)` (`mod.rs`,
+>   in the `impl Process` block). One 45-field literal; the caller supplies a
+>   struct with **seven mandatory fields** and no `Default`, no builder and no
+>   `..rest` pattern, so an eighth divergence is a compile error at all three
+>   sites rather than a silently wrong inherited value at two of them.
+> - **Item 3** → `spawn_child_thread_and_publish(new_proc, &child_ctx, parent_tid,
+>   ChildSigaltstack, ChildReaping, before_ready)`. The two `clone_thread` opt-outs
+>   are two-variant enums rather than bools, so a future fourth primitive has to
+>   state which contract it wants and cannot inherit a default.
+>
+> Done in §8's prescribed order (tail first, then the literal), which was the right
+> call: with the tail already extracted, the literal merge was a pure field-by-field
+> substitution with nothing else moving.
+>
+> ### What this section and §2 got wrong
+>
+> - **"Nine fields differ" is six.** Diffing the three struct literals
+>   mechanically (strip comments, sort, `diff`) gives exactly six disagreements:
+>   `tgid`, `address_space`, `process_info_phys`, `fds`, `signal_actions`,
+>   `clear_child_tid` — §2's six "deliberate" rows, and only those. The three
+>   flagged as **suspect** (`fault_mutex`, `as_lock`, `vm_lock`) are byte-identical
+>   `fresh` at all three sites, so they are a *design* concern, not a divergence.
+>   `inherit_from` therefore owns them rather than making them overrides, and the
+>   argument for fresh-per-child — the fault path resolves the owner through
+>   `address_space_owner_pid_for_fault()`, never through `self`, so a `CLONE_VM`
+>   member's own copy is never the lock anyone waits on — now lives in one comment
+>   next to the three of them instead of only under `fork_process`. §2's row stands
+>   as a *question*; nothing about it changed here.
+> - **`fork` and `vfork`'s literals differ in exactly ONE field**
+>   (`process_info_phys`). §2's table implies `address_space` differs too; it does
+>   not — both sites move a locally-built `UserAddressSpace` into the same field.
+>   What differs is the *construction* above the literal (`new()` + CoW share vs
+>   `new_shared()`), which stays at the call sites.
+> - **§2's tail listing gets `child_ctx.ttbr0` wrong.** It records
+>   `child_ctx.ttbr0 = <own AS>.ttbr0()` for all three. `clone_thread` does **not**
+>   do that: it uses `parent.address_space.ttbr0()` (captured as `shared_ttbr0`
+>   before `shared_as` is moved), which carries the **parent's ASID** — while
+>   `new_shared()` gave the child its own new ASID. `fork`/`vfork` use their own
+>   address space's `ttbr0()`. So the stale-ttbr0 fix is one *idea* explained three
+>   times but not one *expression*, and child-context construction stayed at the
+>   call sites. The shared tail begins at `new_proc.context = child_ctx`.
+> - **`clone_thread` diverges three more ways than the "two documented opt-outs".**
+>   It also runs three extra steps in the tail: `record_clone_snapshot` (the
+>   thread-spawn SIGSEGV hand-off diagnostic), `clone_lazy_regions`, and the
+>   `CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID` tid publication. These are handled
+>   by a `before_ready(tid)` hook that runs after `register_process` and before the
+>   signal-mask seed — the last window in which the child provably has not executed
+>   an instruction. `fork`/`vfork` pass a no-op.
+> - **Two orderings had to be picked, and the doc did not know they disagreed.**
+>   (a) The `THREAD_PID_MAP` insert: `fork`/`vfork` do it immediately after
+>   `thread_id = Some(tid)`; `clone_thread` did it *after* `register_channel`. The
+>   merged tail uses fork's position. (b) `record_clone_snapshot` moved from
+>   immediately-after-spawn into `before_ready`, i.e. after `register_process`.
+>   Both moves are inside the INITIALIZING window where the child cannot run, and
+>   nothing between the old and new positions touches the parent's address space or
+>   the user stack the snapshot reads — but they are the only two behavioural
+>   deltas in this change, so they are named here rather than buried.
+> - **Two `[FORK-DBG]` trace strings are gone.** `step8: registering process` and
+>   `step8: marking child READY` are replaced by `[FORK-DBG] child-publish: …`
+>   lines emitted from the shared tail for all three callers (a `step8` printed
+>   during a `pthread_create` would be a lie). `step7: spawning child thread` is
+>   preserved verbatim at fork's call site.
+>   [`BKL_PROCESS_CARVE_OUT.md`](BKL_PROCESS_CARVE_OUT.md) §2's "`step1`..`step8`
+>   markers delimit eight logical phases" should now be read as step1..step7 plus
+>   `child-publish`.
+> - **§2 says the 45-field literal is "written four times"; it was six.**
+>   `fork_process`, `vfork_process`, `clone_thread`, `Process::from_elf`
+>   (`image.rs`), **and two boot-test fixtures** (`src/tests.rs`,
+>   `src/process_tests.rs`). Four remain. `from_elf` is deliberately not a caller
+>   of `inherit_from`: it builds from an ELF image, not from a parent, so there is
+>   nothing to inherit. The test fixtures are left alone on purpose — they exist to
+>   fabricate *unusual* `Process` states, which is the one job `inherit_from` must
+>   not make easy.
+> - **§8's line estimates (−80 and −120) are wrong, and the metric is wrong.**
+>   Measured: **+403 / −321**, i.e. **−26 net non-comment lines**. The estimate was
+>   counting the duplicated *comments* as savings — the 17-line POSIX signal-mask
+>   block written twice, the ttbr0 rationale three times — and those really were
+>   removed, but what replaces them is longer, because one comment now has to
+>   explain both contracts (why `fork` inherits a sigaltstack *and* why
+>   `clone_thread` must not) where each copy previously explained only its own.
+>   The duplication actually removed is ~135 struct-literal lines and ~80 tail
+>   lines. **Judge this item by "how many places must change to add a `Process`
+>   field" — was 6, now 4, of which 2 are test fixtures — not by line count.**
 
 ## 9. Findings summary
 

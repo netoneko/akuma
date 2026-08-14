@@ -522,6 +522,57 @@ pub struct Process {
     pub syscall_stats: ProcessSyscallStats,
 }
 
+/// The fields a clone-family child does **not** take verbatim from its parent.
+///
+/// [`fork_process`], [`vfork_process`] and [`clone_thread`] used to each write all
+/// 45 `pub` fields of [`Process`] as a struct literal. Diffing those three
+/// literals, exactly **six** values disagreed — the ones below, plus the child's
+/// own `pid`. Everything else was either byte-identical inheritance from the
+/// parent or a fresh per-child constant, and now lives in one place:
+/// [`Process::inherit_from`]. (`docs/archive/COW_PILE_AUDIT.md` §2 counted nine
+/// divergences; the other three — `fault_mutex`, `as_lock`, `vm_lock` — are
+/// `fresh` at all three sites and so are not divergences at all. See
+/// `inherit_from` for why fresh-per-child is deliberate even on a shared
+/// address space.)
+///
+/// Every field here is **mandatory**. There is deliberately no `Default`, no
+/// builder and no `..parent` rest-pattern: a seventh divergence discovered later
+/// must be added to this struct, which makes it a compile error at all three call
+/// sites rather than a silently-wrong inherited value at two of them. That is the
+/// property the four hand-written literals never had — the compiler could tell
+/// you a field was *missing*, never that it held the wrong value for that path.
+pub struct InheritOverrides {
+    /// The child's own pid. `fork`/`vfork` are handed one by the syscall layer;
+    /// `clone_thread` allocates its own via [`allocate_pid`].
+    pub pid: Pid,
+    /// Thread-group leader. `child_pid` for `fork`/`vfork` (a new process, so
+    /// `tgid == pid`); the **parent's** `tgid` for `clone_thread`, which creates a
+    /// thread inside the parent's group, not a process. `kill()`/`exit_group()`
+    /// fan out by this field, and lazy regions are keyed by it.
+    pub tgid: Pid,
+    /// `fork`: a fresh [`UserAddressSpace`] with the parent's pages CoW-shared
+    /// into it. `vfork`/`clone_thread`: `UserAddressSpace::new_shared(parent_l0)`
+    /// — the same L0 table under a new ASID.
+    pub address_space: UserAddressSpace,
+    /// `fork`: a freshly allocated frame, mapped at `PROCESS_INFO_ADDR` and
+    /// written with the child's identity. `vfork`/`clone_thread`: the **parent's**
+    /// frame — they see it through the shared L0, so remapping it would corrupt
+    /// the parent's own pid; their identity is resolved through `THREAD_PID_MAP`
+    /// instead (see `read_current_pid`).
+    pub process_info_phys: usize,
+    /// `fork`/`vfork`: `Arc::new(parent.fds.clone_deep_for_fork())` — a private
+    /// copy. `clone_thread`: `parent.fds.clone()`, i.e. the same table shared by
+    /// `Arc` (`CLONE_FILES`).
+    pub fds: Arc<SharedFdTable>,
+    /// `fork`/`vfork`: a fresh [`SharedSignalTable`]. `clone_thread`: the
+    /// parent's, shared by `Arc` (`CLONE_SIGHAND`).
+    pub signal_actions: Arc<SharedSignalTable>,
+    /// `0` for `fork`/`vfork`. For `clone_thread`, `child_tid_ptr` — but only when
+    /// the caller passed `CLONE_CHILD_CLEARTID`, which is what earns the
+    /// zero-and-futex-wake at exit.
+    pub clear_child_tid: u64,
+}
+
 /// Shared signal action table for CLONE_SIGHAND semantics.
 ///
 /// When threads are created with CLONE_THREAD (pthreads), they share this table
@@ -572,6 +623,107 @@ impl<'a> AsLockHold<'a> {
 }
 
 impl Process {
+    /// Build a clone-family child from `parent`, with the six values the three
+    /// primitives disagree about supplied explicitly in `o`.
+    ///
+    /// This is the single constructor behind [`fork_process`], [`vfork_process`]
+    /// and [`clone_thread`] — `docs/archive/COW_PILE_AUDIT.md` §8 item 4. Adding a
+    /// `Process` field is now one edit here (plus `Process::from_elf`, which
+    /// builds from an ELF image rather than from a parent and so is not a caller).
+    ///
+    /// Fallible allocation (`Box::try_new`) on purpose: fork under memory pressure
+    /// must return ENOMEM to the caller, not panic the kernel.
+    pub fn inherit_from(
+        parent: &Process,
+        o: InheritOverrides,
+    ) -> Result<Box<Process>, &'static str> {
+        Box::try_new(Process {
+            // ── the six that differ per primitive, plus the child's pid ──
+            pid: o.pid,
+            tgid: o.tgid,
+            address_space: o.address_space,
+            process_info_phys: o.process_info_phys,
+            fds: o.fds,
+            signal_actions: o.signal_actions,
+            clear_child_tid: o.clear_child_tid,
+
+            // ── inherited verbatim from the parent ──
+            pgid: parent.pgid,
+            parent_pid: parent.pid,
+            name: parent.name.clone(),
+            entry_point: parent.entry_point,
+            brk: parent.brk,
+            initial_brk: parent.initial_brk,
+            memory: parent.memory.clone(),
+            args: parent.args.clone(),
+            cwd: parent.cwd.clone(),
+            stdin: parent.stdin.clone(),   // shared
+            stdout: parent.stdout.clone(), // shared
+            spawner_pid: parent.spawner_pid,
+            terminal_state: parent.terminal_state.clone(),
+            box_id: parent.box_id,
+            namespace: parent.namespace.clone(),
+            // The child keeps the parent's I/O channel so its stdout lands on the
+            // same SSH stream. Exit notification uses a *separate* channel, created
+            // in `spawn_child_thread_and_publish`, to avoid contaminating this one.
+            channel: parent.channel.clone(),
+            signal_mask: parent.signal_mask,
+            sigaltstack_sp: parent.sigaltstack_sp,
+            sigaltstack_flags: parent.sigaltstack_flags,
+            sigaltstack_size: parent.sigaltstack_size,
+
+            // ── fresh for every child, regardless of primitive ──
+            state: ProcessState::Ready,
+            // Overwritten by `spawn_child_thread_and_publish`, which the
+            // `entry_point_trampoline` reads out of the registered `Process`.
+            context: UserContext::default(),
+            exited: false,
+            exit_code: 0,
+            dynamic_page_tables: Vec::new(),
+            // `fork` replaces this with `inherit_mmap_regions_for_cow_child`;
+            // `vfork`/`clone_thread` leave it empty and see the parent's mappings
+            // through the shared L0.
+            mmap_regions: Vec::new(),
+            // Per-process, dropped in `Process::drop`. `fork` propagates the
+            // parent thread-group leader's descriptors into it before
+            // registration; `clone_thread` calls `clone_lazy_regions` after.
+            lazy_regions: Spinlock::new(LazyRegionMap::new()),
+            thread_id: None,
+            delegate_pid: None,
+            robust_list_head: 0,
+            robust_list_len: 0,
+
+            // The three locks are fresh for EVERY child, including the two
+            // primitives whose child SHARES its parent's address space. That is
+            // deliberate and load-bearing, not an oversight:
+            //
+            // `as_lock`/`fault_mutex` belong to the thread-group LEADER, and every
+            // fault-path caller resolves the owning `Process` through
+            // `address_space_owner_pid_for_fault()` rather than through `self` —
+            // so a `CLONE_VM` member's own copy is never the lock anyone waits on.
+            // Handing the child the parent's `Spinlock` instead would not help
+            // (the fault path still would not reach it through the child) and
+            // would need `Process` to hold them behind an `Arc`, which is a
+            // different change. See `Process::as_lock`'s field doc,
+            // `fork_process`'s `as_lock` resolution, and COW_PILE_AUDIT.md §2's
+            // "three fresh locks on a shared address space" row — which flags this
+            // as suspect precisely because the reason lives at one call site.
+            //
+            // `vm_lock` guards `mmap_regions`/`ProcessMemory::free_regions`, both
+            // of which ARE per-`Process` (see the empty `mmap_regions` above), so a
+            // fresh lock is simply correct there.
+            fault_mutex: Spinlock::new(BTreeMap::new()),
+            vm_lock: Spinlock::new(()),
+            as_lock: Spinlock::new(()),
+
+            start_time_us: (runtime().uptime_us)(),
+            current_syscall: AtomicU64::new(!0),
+            last_syscall: AtomicU64::new(0),
+            syscall_stats: ProcessSyscallStats::new(),
+        })
+        .map_err(|_| "Failed to allocate Process struct (ENOMEM)")
+    }
+
     /// Run `f` with exclusive access to [`Process::mmap_regions`], serialized by
     /// [`Process::vm_lock`] with IRQs disabled. This is the ONLY sanctioned way to
     /// touch `mmap_regions` — it prevents the data race where CLONE_VM threads
@@ -2026,6 +2178,142 @@ pub fn waitpid(pid: Pid) -> Option<(Pid, i32)> {
     None
 }
 
+/// Whether a clone-family child inherits the creating thread's alternate signal
+/// stack — one of the two ways `clone_thread`'s publish tail diverges from
+/// `fork`/`vfork`'s. A parameter rather than a defaulted flag on purpose: a
+/// future fourth primitive must state which contract it wants.
+pub enum ChildSigaltstack {
+    /// `fork`/`vfork`: the child thread inherits the creating thread's alt stack.
+    Inherit,
+    /// `clone_thread`: Linux does **not** inherit `sigaltstack` across `clone(2)`,
+    /// and Go depends on that. Each Go M-thread installs its own during `mstart1`,
+    /// and the SIGURG guard reads a non-zero `alt_sp` as "this thread is ready for
+    /// signal delivery" — a copied stack makes that guard lie while the M is still
+    /// uninitialised, so a handler would run on a half-built thread. Slot reuse
+    /// should already have scrubbed the child's; this forces `SS_DISABLE` if not.
+    ForceDisabled,
+}
+
+/// Whether a clone-family child is a `wait4`-reapable child process or a member of
+/// the parent's thread group — the second `clone_thread` divergence.
+pub enum ChildReaping {
+    /// `fork`/`vfork`: register the exit channel in `CHILD_CHANNELS` too, so the
+    /// parent's `wait4`/`waitpid` can observe the child's exit.
+    Reapable,
+    /// `clone_thread`: `CLONE_THREAD` threads are NOT visible to `waitpid` on
+    /// Linux — they belong to the same thread group and are never reaped by the
+    /// parent. Registering them in `CHILD_CHANNELS` made `wait4(-1)` block forever
+    /// on git's sideband demux pthread, which never exits because it waits on a
+    /// pipe git itself holds open.
+    ThreadGroupMember,
+}
+
+/// Give a freshly built child `Process` a thread, wire up its identity and
+/// channels, publish it, and make it runnable — the ~40-line tail
+/// [`fork_process`], [`vfork_process`] and [`clone_thread`] each carried a
+/// near-verbatim copy of (`docs/archive/COW_PILE_AUDIT.md` §8 item 3).
+///
+/// Returns the child's **thread id** (kernel slot), which is `clone(2)`'s return
+/// value; `fork`/`vfork` return `new_proc.pid` to their own callers instead.
+///
+/// The ordering here is the load-bearing part, and every step of it has cost a
+/// bug at some point:
+///
+/// - `new_proc.context` is written **before** the thread is spawned, because
+///   `entry_point_trampoline` erets to `proc.context`.
+/// - `THREAD_PID_MAP` is populated **before** the child can run. Without it the
+///   child's first `read_current_pid()` falls back to reading `PROCESS_INFO_ADDR`
+///   — which for `vfork`/`clone_thread` is the *parent's* page — and resolves to
+///   the parent, firing `vfork_complete` on the wrong pid and stranding the parent.
+/// - `register_process` completes **before** `mark_thread_ready`, so the child's
+///   first `THREAD_PID_MAP` → `with_process(child_pid)` lookup resolves.
+/// - `seed_thread_signal_mask` runs **before** `mark_thread_ready`. POSIX: the
+///   child inherits the creating thread's mask, and it must be in place before the
+///   child is runnable — the slot claim scrubs the mask to 0, and the syscall
+///   layer's own seed lands after this function returns, so without this the child
+///   is briefly runnable with everything UNBLOCKED. `Command::spawn` blocks all
+///   signals right before forking precisely to keep the pre-exec child from taking
+///   one, and on SMP the child really can be executing by then.
+///
+/// `before_ready` runs after `register_process` and before the signal-mask seed and
+/// `mark_thread_ready`, i.e. in the last window where the child provably has not
+/// executed an instruction. It exists for `clone_thread`'s three extra steps
+/// (lazy-region clone, the `CLONE_*_SETTID` tid publication, and the hand-off
+/// diagnostic snapshot); `fork`/`vfork` pass a no-op.
+fn spawn_child_thread_and_publish(
+    mut new_proc: Box<Process>,
+    child_ctx: &UserContext,
+    parent_tid: usize,
+    sigaltstack: ChildSigaltstack,
+    reaping: ChildReaping,
+    before_ready: impl FnOnce(usize),
+) -> Result<usize, &'static str> {
+    // Both are set by `Process::inherit_from` (`pid: o.pid`, `parent_pid:
+    // parent.pid`) and were passed separately by all three call sites; reading
+    // them back off the struct removes the chance of a call site disagreeing with
+    // the `Process` it just built.
+    let child_pid = new_proc.pid;
+    let parent_pid = new_proc.parent_pid;
+
+    // `entry_point_trampoline` erets to `proc.context`, so this must land before
+    // the thread exists.
+    new_proc.context = *child_ctx;
+
+    lifecycle_trace("[FORK-DBG] child-publish: spawning child thread\n");
+    // Allocate the thread slot but keep it INITIALIZING until everything below is
+    // in place.
+    let tid = crate::threading::spawn_user_thread_initializing(
+        entry_point_trampoline as extern "C" fn() -> !,
+        core::ptr::null_mut(),
+    )?;
+    new_proc.thread_id = Some(tid);
+
+    // See the doc comment: this is what makes `current_process_shared()` resolve to
+    // the child rather than to whatever `PROCESS_INFO_ADDR` currently says.
+    with_irqs_disabled(|| {
+        THREAD_PID_MAP.lock().insert(tid, child_pid);
+    });
+
+    match sigaltstack {
+        ChildSigaltstack::Inherit => {
+            let (parent_sp, parent_size, parent_flags) =
+                crate::threading::get_sigaltstack(parent_tid);
+            crate::threading::set_sigaltstack(tid, parent_sp, parent_size, parent_flags);
+        }
+        ChildSigaltstack::ForceDisabled => {
+            // Should already be clean from the thread-slot reuse scrub; force it if not.
+            let (alt_sp, _, _) = crate::threading::get_sigaltstack(tid);
+            if alt_sp != 0 {
+                crate::threading::set_sigaltstack(tid, 0, 0, 2); // SS_DISABLE
+            }
+        }
+    }
+
+    crate::threading::update_thread_context(tid, child_ctx);
+
+    // A ProcessChannel for exit notification only — deliberately NOT the child's
+    // I/O channel, which it inherited from the parent in `Process::inherit_from`.
+    let exit_channel = Arc::new(ProcessChannel::new());
+    match reaping {
+        ChildReaping::Reapable => {
+            register_channel(tid, exit_channel.clone());
+            register_child_channel(child_pid, exit_channel, parent_pid);
+        }
+        ChildReaping::ThreadGroupMember => register_channel(tid, exit_channel),
+    }
+
+    lifecycle_trace("[FORK-DBG] child-publish: registering process\n");
+    register_process(child_pid, new_proc);
+
+    before_ready(tid);
+
+    lifecycle_trace("[FORK-DBG] child-publish: marking child READY\n");
+    crate::threading::seed_thread_signal_mask(tid, crate::threading::thread_signal_mask());
+    crate::threading::mark_thread_ready(tid);
+
+    Ok(tid)
+}
+
 /// Fork the current process (deep copy)
 /// Returns the new PID to the parent.
 ///
@@ -2083,54 +2371,16 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     new_address_space.track_user_frame(process_info_frame);
 
     // 3. Create Process struct (fallible allocation to avoid kernel panic on OOM)
-    let mut new_proc = Box::try_new(Process {
+    let mut new_proc = Process::inherit_from(parent, InheritOverrides {
         pid: child_pid,
-        pgid: parent.pgid,
         tgid: child_pid, // fork creates a new thread group
-        name: parent.name.clone(),
-        parent_pid: parent_pid,
-        state: ProcessState::Ready,
-        context: UserContext::default(), // Will be updated below
         address_space: new_address_space,
-        entry_point: parent.entry_point,
-        brk: parent.brk,
-        initial_brk: parent.initial_brk,
-        memory: parent.memory.clone(),
         process_info_phys: process_info_frame.addr,
-        args: parent.args.clone(),
-        cwd: parent.cwd.clone(),
-        stdin: parent.stdin.clone(), // Share!
-        stdout: parent.stdout.clone(), // Share!
-        exited: false,
-        exit_code: 0,
-        dynamic_page_tables: Vec::new(),
-        mmap_regions: Vec::new(),
-        lazy_regions: Spinlock::new(LazyRegionMap::new()),
         fds: Arc::new(parent.fds.clone_deep_for_fork()),
-        thread_id: None,
-        spawner_pid: parent.spawner_pid,
-        terminal_state: parent.terminal_state.clone(),
-        box_id: parent.box_id,
-        namespace: parent.namespace.clone(),
-        channel: parent.channel.clone(),
-        delegate_pid: None,
-        clear_child_tid: 0,
-        robust_list_head: 0,
-        robust_list_len: 0,
         signal_actions: Arc::new(SharedSignalTable::new()), // Fork creates fresh table
-        signal_mask: parent.signal_mask,
-        fault_mutex: Spinlock::new(BTreeMap::new()),
-        vm_lock: Spinlock::new(()),
-        as_lock: Spinlock::new(()),
-        sigaltstack_sp: parent.sigaltstack_sp,
-        sigaltstack_flags: parent.sigaltstack_flags,
-        sigaltstack_size: parent.sigaltstack_size,
-        start_time_us: (runtime().uptime_us)(),
-        current_syscall: core::sync::atomic::AtomicU64::new(!0),
-        last_syscall: core::sync::atomic::AtomicU64::new(0),
-        syscall_stats: ProcessSyscallStats::new(),
-    }).map_err(|_| "Failed to allocate Process struct (ENOMEM)")?;
-    
+        clear_child_tid: 0,
+    })?;
+
     // 4. Perform memory copy
     let stack_top = parent.memory.stack_top;
     let stack_size = config().user_stack_size; 
@@ -2643,59 +2893,22 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // `new_proc.address_space.ttbr0()`, captured here before `new_proc` is consumed.
     child_ctx.ttbr0 = new_proc.address_space.ttbr0();
 
-    // Store context in the Process struct (entry_point_trampoline uses proc.context)
-    new_proc.context = child_ctx;
-
+    // 7./8. Spawn the child thread, publish the process, make it runnable — the
+    // shared tail. No `clone_lazy_regions(parent_pid, child_pid)` in `before_ready`:
+    // both fork arms above already propagated the parent *thread-group leader*'s
+    // descriptors into `new_proc` before registration. Re-cloning from `parent_pid`
+    // would replace that with the forking thread's own (per-thread, possibly stale)
+    // map — lazy regions are tgid-keyed (`sys_mmap` uses `proc.tgid`), so the
+    // leader's map is the authoritative one.
     lifecycle_trace("[FORK-DBG] step7: spawning child thread\n");
-    // 7. Allocate thread but keep it INITIALIZING
-    let tid = crate::threading::spawn_user_thread_initializing(
-        entry_point_trampoline as extern "C" fn() -> !,
-        core::ptr::null_mut(),
+    spawn_child_thread_and_publish(
+        new_proc,
+        &child_ctx,
+        parent_tid,
+        ChildSigaltstack::Inherit,
+        ChildReaping::Reapable,
+        |_tid| {},
     )?;
-
-    new_proc.thread_id = Some(tid);
-
-    // Register in THREAD_PID_MAP so current_process_shared() returns child PID for this thread.
-    // Without this, current_process_shared() falls back to reading the parent's PROCESS_INFO_ADDR
-    // (not yet updated) and returns the parent PID, causing vfork_complete to fire on the
-    // wrong child PID and leaving the parent permanently blocked.
-    with_irqs_disabled(|| {
-        THREAD_PID_MAP.lock().insert(tid, child_pid);
-    });
-
-    // Copy sigaltstack from parent thread to child thread
-    let (parent_sp, parent_size, parent_flags) = crate::threading::get_sigaltstack(parent_tid);
-    crate::threading::set_sigaltstack(tid, parent_sp, parent_size, parent_flags);
-
-    crate::threading::update_thread_context(tid, &child_ctx);
-
-    // 8. Create a ProcessChannel for exit notification only.
-    // The child keeps parent.channel (set in struct init above) for I/O so its
-    // stdout writes are visible on the same SSH stream as the parent.
-    // The exit-tracking channel is separate to avoid contaminating the I/O channel.
-    let exit_channel = Arc::new(ProcessChannel::new());
-    register_channel(tid, exit_channel.clone());
-    register_child_channel(child_pid, exit_channel, parent_pid);
-
-    // Register process BEFORE marking thread READY
-    lifecycle_trace("[FORK-DBG] step8: registering process\n");
-    register_process(child_pid, new_proc);
-    // No `clone_lazy_regions(parent_pid, child_pid)` here: both fork arms above
-    // already propagated the parent *thread-group leader*'s descriptors into
-    // `new_proc` before registration. Re-cloning from `parent_pid` would replace
-    // that with the forking thread's own (per-thread, possibly stale) map — lazy
-    // regions are tgid-keyed (`sys_mmap` uses `proc.tgid`), so the leader's map is
-    // the authoritative one.
-    
-    // Now safe to start the thread
-    lifecycle_trace("[FORK-DBG] step8: marking child READY\n");
-    // POSIX: a fork()/vfork() child inherits the parent's signal mask, and it must be
-    // in place BEFORE the child can run — the slot claim scrubs the mask to 0, and the
-    // syscall-layer seed lands after this point, so without this the child is briefly
-    // runnable with everything UNBLOCKED. `Command::spawn` blocks all signals right
-    // before forking precisely to keep the pre-exec child from taking one.
-    crate::threading::seed_thread_signal_mask(tid, crate::threading::thread_signal_mask());
-    crate::threading::mark_thread_ready(tid);
     lifecycle_trace("[FORK-DBG] fork_process EXIT ok\n");
 
     Ok(child_pid)
@@ -2740,55 +2953,19 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
     mmu::as_trace(format_args!("[AS-NEW] pid={} l0=0x{:x} asid=0x{:x} via=vfork parent={}\n",
         child_pid, parent_l0_phys, new_address_space.asid(), parent_pid));
 
-    let mut new_proc = Box::try_new(Process {
+    let new_proc = Process::inherit_from(parent, InheritOverrides {
         pid: child_pid,
-        pgid: parent.pgid,
         tgid: child_pid, // a new process (own thread group), not a thread
-        name: parent.name.clone(),
-        parent_pid,
-        state: ProcessState::Ready,
-        context: UserContext::default(), // set below
         address_space: new_address_space,
-        entry_point: parent.entry_point,
-        brk: parent.brk,
-        initial_brk: parent.initial_brk,
-        memory: parent.memory.clone(),
         // Shares the parent's ProcessInfo page; identity comes from
         // THREAD_PID_MAP.  exec installs a fresh page.
         process_info_phys: parent.process_info_phys,
-        args: parent.args.clone(),
-        cwd: parent.cwd.clone(),
-        stdin: parent.stdin.clone(),
-        stdout: parent.stdout.clone(),
-        exited: false,
-        exit_code: 0,
-        dynamic_page_tables: Vec::new(),
-        mmap_regions: Vec::new(),  // shares parent's via the shared L0
-        lazy_regions: Spinlock::new(LazyRegionMap::new()),
         fds: Arc::new(parent.fds.clone_deep_for_fork()),
-        thread_id: None,
-        spawner_pid: parent.spawner_pid,
-        terminal_state: parent.terminal_state.clone(),
-        box_id: parent.box_id,
-        namespace: parent.namespace.clone(),
-        channel: parent.channel.clone(),
-        delegate_pid: None,
-        clear_child_tid: 0,
-        robust_list_head: 0,
-        robust_list_len: 0,
         signal_actions: Arc::new(SharedSignalTable::new()),
-        signal_mask: parent.signal_mask,
-        fault_mutex: Spinlock::new(BTreeMap::new()),
-        vm_lock: Spinlock::new(()),
-        as_lock: Spinlock::new(()),
-        sigaltstack_sp: parent.sigaltstack_sp,
-        sigaltstack_flags: parent.sigaltstack_flags,
-        sigaltstack_size: parent.sigaltstack_size,
-        start_time_us: (runtime().uptime_us)(),
-        current_syscall: core::sync::atomic::AtomicU64::new(!0),
-        last_syscall: core::sync::atomic::AtomicU64::new(0),
-        syscall_stats: ProcessSyscallStats::new(),
-    }).map_err(|_| "Failed to allocate Process struct (ENOMEM)")?;
+        clear_child_tid: 0,
+    })?;
+    // `mmap_regions` is left empty by `inherit_from`: the child sees the parent's
+    // mappings through the shared L0.
 
     // Child context: inherit the parent's, return 0, clean EL0t, optional new SP.
     let parent_tid = crate::threading::current_thread_id();
@@ -2806,40 +2983,18 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
     // above), so new_proc.address_space.ttbr0() is the live, canonical value —
     // use that instead of the possibly-stale inherited one.
     child_ctx.ttbr0 = new_proc.address_space.ttbr0();
-    new_proc.context = child_ctx;
 
-    let tid = crate::threading::spawn_user_thread_initializing(
-        entry_point_trampoline as extern "C" fn() -> !,
-        core::ptr::null_mut(),
+    // The shared publish tail. `THREAD_PID_MAP` in particular must be populated
+    // before the child runs: the shared ProcessInfo page still shows the parent's
+    // pid, so the map is the child's only identity.
+    spawn_child_thread_and_publish(
+        new_proc,
+        &child_ctx,
+        parent_tid,
+        ChildSigaltstack::Inherit,
+        ChildReaping::Reapable,
+        |_tid| {},
     )?;
-    new_proc.thread_id = Some(tid);
-
-    // Register tid→pid BEFORE the thread runs so read_current_pid/current_process
-    // resolve the child's identity from its first instruction (the shared
-    // ProcessInfo page shows the parent's pid).
-    with_irqs_disabled(|| {
-        THREAD_PID_MAP.lock().insert(tid, child_pid);
-    });
-
-    let (parent_sp, parent_size, parent_flags) = crate::threading::get_sigaltstack(parent_tid);
-    crate::threading::set_sigaltstack(tid, parent_sp, parent_size, parent_flags);
-    crate::threading::update_thread_context(tid, &child_ctx);
-
-    let exit_channel = Arc::new(ProcessChannel::new());
-    register_channel(tid, exit_channel.clone());
-    register_child_channel(child_pid, exit_channel, parent_pid);
-
-    // register_process must complete before mark_thread_ready so the child's
-    // first read_current_pid → THREAD_PID_MAP → with_process(child_pid) resolves.
-    register_process(child_pid, new_proc);
-
-    // POSIX: a fork()/vfork() child inherits the parent's signal mask, and it must be
-    // in place BEFORE the child can run — the slot claim scrubs the mask to 0, and the
-    // syscall-layer seed lands after this point, so without this the child is briefly
-    // runnable with everything UNBLOCKED. `Command::spawn` blocks all signals right
-    // before forking precisely to keep the pre-exec child from taking one.
-    crate::threading::seed_thread_signal_mask(tid, crate::threading::thread_signal_mask());
-    crate::threading::mark_thread_ready(tid);
     Ok(child_pid)
 }
 
@@ -3012,54 +3167,16 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     let shared_ttbr0 = parent.address_space.ttbr0();
 
     let parent_tgid = parent.tgid; // inherit thread group leader
-    let mut new_proc = Box::try_new(Process {
+    let new_proc = Process::inherit_from(parent, InheritOverrides {
         pid: child_pid,
-        pgid: parent.pgid,
         tgid: parent_tgid, // same thread group as parent
-        name: parent.name.clone(),
-        parent_pid: parent_pid,
-        state: ProcessState::Ready,
-        context: UserContext::default(),
         address_space: shared_as,
-        entry_point: parent.entry_point,
-        brk: parent.brk,
-        initial_brk: parent.initial_brk,
-        memory: parent.memory.clone(),
         process_info_phys: parent.process_info_phys,
-        args: parent.args.clone(),
-        cwd: parent.cwd.clone(),
-        stdin: parent.stdin.clone(), // Share!
-        stdout: parent.stdout.clone(), // Share!
-        exited: false,
-        exit_code: 0,
-        dynamic_page_tables: Vec::new(),
-        mmap_regions: Vec::new(),
-        lazy_regions: Spinlock::new(LazyRegionMap::new()), // per-process; dropped in Process::drop
         fds: parent.fds.clone(), // Arc::clone — shared fd table (CLONE_FILES)
-        thread_id: None,
-        spawner_pid: parent.spawner_pid,
-        terminal_state: parent.terminal_state.clone(),
-        box_id: parent.box_id,
-        namespace: parent.namespace.clone(),
-        channel: parent.channel.clone(),
-        delegate_pid: None,
+        signal_actions: parent.signal_actions.clone(), // Shared table (Arc clone)
         // Only a CLONE_CHILD_CLEARTID caller gets the zero-and-wake at exit.
         clear_child_tid: if flags & CLONE_CHILD_CLEARTID != 0 { child_tid_ptr } else { 0 },
-        robust_list_head: 0,
-        robust_list_len: 0,
-        signal_actions: parent.signal_actions.clone(), // Shared table (Arc clone)
-        signal_mask: parent.signal_mask,
-        fault_mutex: Spinlock::new(BTreeMap::new()),
-        vm_lock: Spinlock::new(()),
-        as_lock: Spinlock::new(()),
-        sigaltstack_sp: parent.sigaltstack_sp,
-        sigaltstack_flags: parent.sigaltstack_flags,
-        sigaltstack_size: parent.sigaltstack_size,
-        start_time_us: (runtime().uptime_us)(),
-        current_syscall: core::sync::atomic::AtomicU64::new(!0),
-        last_syscall: core::sync::atomic::AtomicU64::new(0),
-        syscall_stats: ProcessSyscallStats::new(),
-    }).map_err(|_| "Failed to allocate Process struct (ENOMEM)")?;
+    })?;
 
     let parent_tid = crate::threading::current_thread_id();
     let parent_ctx = crate::threading::get_saved_user_context(parent_tid).ok_or("No saved context")?;
@@ -3073,120 +3190,85 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     // shared address-space ttbr0 — see the comment where `shared_ttbr0` is captured.
     child_ctx.ttbr0 = shared_ttbr0;
 
-    new_proc.context = child_ctx;
+    // The shared publish tail, with `clone_thread`'s two documented opt-outs
+    // (`ForceDisabled` sigaltstack, `ThreadGroupMember` reaping — see those
+    // variants' docs for the Go-M-thread and git-sideband regressions they encode)
+    // and its three extra steps in `before_ready`, which runs after the process is
+    // registered and before the child can execute an instruction.
+    let tid = spawn_child_thread_and_publish(
+        new_proc,
+        &child_ctx,
+        parent_tid,
+        ChildSigaltstack::ForceDisabled,
+        ChildReaping::ThreadGroupMember,
+        |tid| {
+            // Snapshot musl's `[entry, arg]` pair while we are still in the parent's
+            // address space — the thread-spawn SIGSEGV diagnostic; see
+            // `record_clone_snapshot` and docs/runbooks/debug-thread-spawn-segv.md.
+            record_clone_snapshot(tid, stack, parent_pid, parent_tid, shared_ttbr0);
 
-    let tid = crate::threading::spawn_user_thread_initializing(
-        entry_point_trampoline as extern "C" fn() -> !,
-        core::ptr::null_mut(),
+            clone_lazy_regions(parent_pid, child_pid);
+
+            // Publish the child's TID — but ONLY where the caller asked for it.
+            //
+            // Linux keeps three tid flags strictly separate, and the difference is
+            // load-bearing for musl:
+            //   CLONE_PARENT_SETTID  write child tid to `parent_tid_ptr` at clone
+            //   CLONE_CHILD_SETTID   write child tid to `child_tid_ptr`  at clone
+            //   CLONE_CHILD_CLEARTID write *zero* to `child_tid_ptr` at **exit**, + futex wake
+            //
+            // Akuma used to write `child_tid_ptr` unconditionally, i.e. it treated
+            // CLEARTID as if it also implied SETTID. musl's `pthread_create` passes
+            // CLEARTID *without* SETTID, and the pointer it passes is
+            // `&__thread_list_lock` — a global mutex word, not a tid slot. So every
+            // thread spawn stamped the new thread's own tid into the thread-list lock.
+            //
+            // That is worse than garbage, because of musl's `__tl_lock`:
+            //     int val = __thread_list_lock;
+            //     if (val == tid) { tl_lock_count++; return; }   // "already mine"
+            // The value we wrote is *exactly* the child's tid, so the child's very
+            // first `__tl_lock()` — the one at the top of `__pthread_exit` — took the
+            // recursive fast path and returned **without the lock**, while the parent
+            // still held it and was mid-way through linking the child into the thread
+            // list. The child then ran the unlink against `self->prev == NULL`:
+            //     ldp x0, x1, [x19, #8]   ;  str x0, [x1, #8]
+            // and died writing to address 0x8. Second-order damage: the bogus
+            // `tl_lock_count++` is never undone, so the parent's `__tl_unlock` only
+            // decrements the count and never releases — every later pthread operation
+            // in that process blocks forever. Repro:
+            // userspace/forktest/c_stress/spawnalias.c;
+            // diagnosis in docs/runbooks/debug-thread-spawn-segv.md.
+            //
+            // Go's `newosproc` passes 0 for both pointers, so it is unaffected either way.
+            //
+            // This MUST be the kernel thread slot `tid`, not `child_pid`. The slot is
+            // Akuma's thread-id namespace: `gettid()` returns `current_thread_id()`, and
+            // every per-thread array — pending signals, signal masks, sigaltstacks,
+            // wakers — is indexed by it. `child_pid` is a *process-table* id from a
+            // different counter, and the two only coincide by accident.
+            //
+            // Publishing `child_pid` here made musl cache the wrong value in
+            // `pthread_self()->tid`, so every later `tkill(self->tid, …)` addressed an
+            // unrelated slot: `abort()` on a spawned thread pended SIGABRT on some other
+            // process's thread (observed landing on sshd, which then spun forever with a
+            // stuck pending signal) while the aborting thread saw nothing and fell
+            // through to musl's `a_crash()`. Repro: userspace/forktest/c_stress/abortsig.c.
+            //
+            // Plain EL1 store is safe here: the bits-32+ guard in sys_clone_pidfd
+            // prevents garbage flags from entering clone_thread, so the caller is
+            // always a legitimate CLONE_THREAD|CLONE_VM request with writable pages.
+            // copy_to_user_safe was tried here but its byte-by-byte strb through
+            // the fault-handler mechanism silently returned EFAULT on some pages,
+            // leaving mp.procid=0 and crashing the Go runtime.
+            let child_tid = tid as u32;
+            if parent_tid_ptr != 0 && flags & CLONE_PARENT_SETTID != 0 {
+                unsafe { core::ptr::write(parent_tid_ptr as *mut u32, child_tid); }
+            }
+            if child_tid_ptr != 0 && flags & CLONE_CHILD_SETTID != 0 {
+                unsafe { core::ptr::write(child_tid_ptr as *mut u32, child_tid); }
+            }
+        },
     )?;
-
-    new_proc.thread_id = Some(tid);
-
-    // Snapshot musl's `[entry, arg]` pair while we are still in the parent's
-    // address space — the thread-spawn SIGSEGV diagnostic; see
-    // `record_clone_snapshot` and docs/runbooks/debug-thread-spawn-segv.md.
-    record_clone_snapshot(tid, stack, parent_pid, parent_tid, shared_ttbr0);
-
-    // DO NOT copy sigaltstack from parent thread to child thread.
-    // Each Go M-thread must set up its own sigaltstack during mstart1.
-    // If we copy the parent's sigaltstack, the SIGURG guard (alt_sp == 0 check)
-    // will think the child is ready for signal delivery, but it actually isn't -
-    // Go's M-thread initialization hasn't completed and signal handlers would
-    // corrupt the thread's state. Linux also doesn't inherit sigaltstack on clone.
-    
-    // Verify sigaltstack is clean (should be 0 from thread slot reuse cleanup)
-    let (alt_sp, _, _) = crate::threading::get_sigaltstack(tid);
-    if alt_sp != 0 {
-        // If not clean, force-clear it
-        crate::threading::set_sigaltstack(tid, 0, 0, 2); // SS_DISABLE
-    }
-
-    crate::threading::update_thread_context(tid, &child_ctx);
-
-    let exit_channel = Arc::new(ProcessChannel::new());
-    register_channel(tid, exit_channel);
-    // CLONE_THREAD threads are NOT visible to waitpid on Linux — they belong to the same
-    // thread group and are never reaped by the parent. Registering them in CHILD_CHANNELS
-    // caused wait4(-1) to block forever on git's sideband demux pthread, which never exited
-    // because it was waiting for data from a pipe whose write-end git itself held open.
-
-    // Register in THREAD_PID_MAP so current_process_shared() works for this thread
-    with_irqs_disabled(|| {
-        THREAD_PID_MAP.lock().insert(tid, child_pid);
-    });
-
-    register_process(child_pid, new_proc);
-    clone_lazy_regions(parent_pid, child_pid);
-
-    // Publish the child's TID — but ONLY where the caller asked for it.
-    //
-    // Linux keeps three tid flags strictly separate, and the difference is
-    // load-bearing for musl:
-    //   CLONE_PARENT_SETTID  write child tid to `parent_tid_ptr` at clone
-    //   CLONE_CHILD_SETTID   write child tid to `child_tid_ptr`  at clone
-    //   CLONE_CHILD_CLEARTID write *zero* to `child_tid_ptr` at **exit**, + futex wake
-    //
-    // Akuma used to write `child_tid_ptr` unconditionally, i.e. it treated
-    // CLEARTID as if it also implied SETTID. musl's `pthread_create` passes
-    // CLEARTID *without* SETTID, and the pointer it passes is
-    // `&__thread_list_lock` — a global mutex word, not a tid slot. So every
-    // thread spawn stamped the new thread's own tid into the thread-list lock.
-    //
-    // That is worse than garbage, because of musl's `__tl_lock`:
-    //     int val = __thread_list_lock;
-    //     if (val == tid) { tl_lock_count++; return; }   // "already mine"
-    // The value we wrote is *exactly* the child's tid, so the child's very
-    // first `__tl_lock()` — the one at the top of `__pthread_exit` — took the
-    // recursive fast path and returned **without the lock**, while the parent
-    // still held it and was mid-way through linking the child into the thread
-    // list. The child then ran the unlink against `self->prev == NULL`:
-    //     ldp x0, x1, [x19, #8]   ;  str x0, [x1, #8]
-    // and died writing to address 0x8. Second-order damage: the bogus
-    // `tl_lock_count++` is never undone, so the parent's `__tl_unlock` only
-    // decrements the count and never releases — every later pthread operation
-    // in that process blocks forever. Repro:
-    // userspace/forktest/c_stress/spawnalias.c;
-    // diagnosis in docs/runbooks/debug-thread-spawn-segv.md.
-    //
-    // Go's `newosproc` passes 0 for both pointers, so it is unaffected either way.
-    //
-    // This MUST be the kernel thread slot `tid`, not `child_pid`. The slot is
-    // Akuma's thread-id namespace: `gettid()` returns `current_thread_id()`, and
-    // every per-thread array — pending signals, signal masks, sigaltstacks,
-    // wakers — is indexed by it. `child_pid` is a *process-table* id from a
-    // different counter, and the two only coincide by accident.
-    //
-    // Publishing `child_pid` here made musl cache the wrong value in
-    // `pthread_self()->tid`, so every later `tkill(self->tid, …)` addressed an
-    // unrelated slot: `abort()` on a spawned thread pended SIGABRT on some other
-    // process's thread (observed landing on sshd, which then spun forever with a
-    // stuck pending signal) while the aborting thread saw nothing and fell
-    // through to musl's `a_crash()`. Repro: userspace/forktest/c_stress/abortsig.c.
-    //
-    // Plain EL1 store is safe here: the bits-32+ guard in sys_clone_pidfd
-    // prevents garbage flags from entering clone_thread, so the caller is
-    // always a legitimate CLONE_THREAD|CLONE_VM request with writable pages.
-    // copy_to_user_safe was tried here but its byte-by-byte strb through
-    // the fault-handler mechanism silently returned EFAULT on some pages,
-    // leaving mp.procid=0 and crashing the Go runtime.
-    let child_tid = tid as u32;
-    if parent_tid_ptr != 0 && flags & CLONE_PARENT_SETTID != 0 {
-        unsafe { core::ptr::write(parent_tid_ptr as *mut u32, child_tid); }
-    }
-    if child_tid_ptr != 0 && flags & CLONE_CHILD_SETTID != 0 {
-        unsafe { core::ptr::write(child_tid_ptr as *mut u32, child_tid); }
-    }
-
-    // POSIX: the new thread inherits the CREATING thread's signal mask — and it must be
-    // in place BEFORE the thread can run. `sys_clone` also seeds it on the way out, but
-    // that lands *after* `mark_thread_ready` below, so on SMP the child can already be
-    // executing with a zeroed mask (slot claim scrubs it) and take a signal its creator
-    // had deliberately blocked. Seeding here closes that window; the caller's seed then
-    // becomes a harmless idempotent repeat. We are running in the parent's context, so
-    // `thread_signal_mask()` is the creating thread's.
-    crate::threading::seed_thread_signal_mask(tid, crate::threading::thread_signal_mask());
-
-    crate::threading::mark_thread_ready(tid);
 
     if config().syscall_debug_info_enabled {
         log::debug!("[syscall] clone_thread: PID {} -> thread PID {} (tid {})", parent_pid, child_pid, tid);
@@ -3194,7 +3276,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
 
     // Linux returns the child's TID from clone(2), and it must agree with what
     // `gettid()` and CLONE_PARENT_SETTID report — see the TID note above.
-    Ok(child_tid)
+    Ok(tid as u32)
 }
 
 /// Allocate a new unique PID (uses the same global counter as Process::from_elf)
