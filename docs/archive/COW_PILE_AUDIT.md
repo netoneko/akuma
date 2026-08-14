@@ -600,7 +600,7 @@ unattributable.
 | F3 | `cow_fault_lock` provides no mutual exclusion; 3 of 4 CoW runtime fn pointers are dead | **CONFIRMED** | `grep -rn COW_FAULT_LOCK src crates` → 3 hits, all in `pmm.rs` |
 | F2 | `try_resolve_el1_cow_fault` resolves the owner with `read_current_pid()`; for `CLONE_VM` workers this leaks two frames per kernel-side CoW break and takes a lock nobody waits on | **FIXED 2026-08-13** (mechanism was CONFIRMED, consequence still NEEDS-REPRO) | PMM drift across a threaded workload taking kernel-side user writes; `[AS-*]` traces |
 | F1 | both EL1 CoW-break paths copy 4 KiB from `old_pa` outside the lock the EL0 path documents as required for `old_pa`'s validity | **STILL OPEN** — fix implemented and backed out 2026-08-13, blocked by F8 | `cowstale`, `bssfork spread=1` at SMP=4; poison decode in `[WILD-DA]` |
-| F8 | the SMP=1 exercise suite wedges intermittently: console output stops, one core spins at 100%, **zero** time-jump lines on an idle host. **Localized 2026-08-14** to an EL1 sync-fault loop inside `sgi_scheduler_handler_with_sp` — see below. Rate ~1 in 7 on the committed tree, ~3 in 4 with F1 applied, which is why F1 is held back | **CONFIRMED + LOCALIZED**, faulting instruction not yet identified, **OPEN** | `scratchpad/f8_repro.py` (gdbstub + lldb snapshot on stall); a wedged run's log simply stops growing mid-suite |
+| F8 | the SMP=1 exercise suite wedges intermittently: console output stops, one core spins at 100%, **zero** time-jump lines on an idle host. Root cause: the scheduler SGI installed a **freed** L0 into TTBR0 from a zombie thread's saved context — the page-table-UAF free gate only saw TTBR0s live on cores, never saved contexts (§10.1–10.2: `TTBR0_EL1` at the wedge == the last `[AS-FREE]` line's L0; ESR=0x86000004, recursive vector-fetch abort) | **ROOT-CAUSED + FIXED 2026-08-14** (§10.3: saved-context arm on the free gate + drain re-check; boot test `as_drop_defers_while_saved_ctx_on_l0`) | `scripts/f8_wedge_repro.py`; `[SGI-S FREED-L0]` must never print; `[AS-FREE-DEFER] ... held_by_ctx` lines are the gate working |
 | F1b | the EL1 paths still translate the VA and read the refcount outside `as_lock`, so `old_pa` can be stale before the hold begins — the residue F1's prescribed fix cannot reach | **CONFIRMED** mechanism, **NEEDS-REPRO** consequence, **OPEN** | same instruments as F1; the fix is §4 F1b option 1 or 2 |
 | F4 | DA single-page fallback places `dsb ish; isb` before the PTE install, disagreeing with its own batch path and with the IA arm | **CONFIRMED** | inspection; no known symptom |
 | F5 | IA arm claims `icache_done: true` into `file_page_cache` for pages it may map non-exec | **CONFIRMED** | inspection; no known symptom |
@@ -614,8 +614,10 @@ items 3 and 4.
 
 ## 10. F8 — the suite wedge, localized (2026-08-14)
 
-**Status: the hang *shape* is proven; the faulting access is inferred, not identified.
-The guard below is hardening, and is NOT verified to fix F8.**
+**Status: ROOT-CAUSED and FIXED 2026-08-14 — see §10.1 below for the registers that
+named the defect, §10.2 for the mechanism, §10.3 for the fix. The rest of this
+section is the investigation record as it stood before the catch, kept verbatim;
+its "inferred, not identified" caveats are resolved by §10.1.**
 
 ### What was measured
 
@@ -685,6 +687,111 @@ Run the harness until it catches again and read `ELR_EL1`/`ESR_EL1`/`FAR_EL1`. I
 on the tripwire read or the restore `ldp`, the inference is confirmed and the guard is the
 fix; if it lands elsewhere, the fault is a different access inside the handler and the
 guard is merely hardening that happened to be worth having.
+
+## 10.1 The registers (caught 2026-08-14, `scripts/f8_wedge_repro.py`, F1 amplifier applied)
+
+The harness caught a wedge during `cowstale` and `register read --all` delivered what the
+first capture lacked:
+
+```
+pc        = 0x401c1200   exception_vector_table + 0x200   (8 of 8 samples)
+ELR_EL1   = 0x401c1200   exception_vector_table + 0x200   ← the vector entry ITSELF
+FAR_EL1   = 0x401c1200                                    ← faulting on its own fetch
+ESR_EL1   = 0x86000004   EC=0x21 instruction abort (same EL), translation fault level 0
+TTBR0_EL1 = 0x0041_0000_605dd000                          ← ASID 0x41, L0 base 0x605dd000
+TTBR1_EL1 = 0x4045b000   boot_page_tables                 ← kernel high half intact
+x30       = sgi_scheduler_handler_with_sp + 424           ← the installer
+```
+
+And the wedged run's boot log ends:
+
+```
+[AS-NEW]  pid=132 l0=0x605dd000 asid=0x41 via=fork parent=121
+[PROC-EXIT] pid=132 ... code=0
+[KTG] my_pid=132 my_tgid=132 by_tid=9 code=0 ...
+[TERM] tid=9 pid=Some(132) by_tid=14 state=1 ...      ← state 1 = READY at reap time
+[AS-FREE] l0=0x605dd000 asid=0x41 path=owner core=0   ← the L0 in TTBR0_EL1, freed
+<silence>
+```
+
+The live `TTBR0_EL1` **is the L0 the last log line freed**, ASID and all. Kernel text
+lives in the TTBR0 low half, so once the freed (PMM-quarantine-poisoned) L0 is installed,
+no kernel instruction can be fetched — including the vector entry, which is why the
+recursion pins `PC = ELR = FAR = vector+0x200` with a level-0 translation fault. The
+earlier §10 symptom table follows verbatim. `x30` names the installer: the scheduler SGI's
+context restore (`msr ttbr0_el1` from `(*new_ctx).ttbr0`).
+
+## 10.2 The mechanism
+
+The page-table-UAF free gate (`mmu::any_core_on_l0`, `ACTIVE_L0`/`PREV_L0`) checks only
+TTBR0 values **live on cores**. But the scheduler installs `ctx.ttbr0` **verbatim from
+saved thread contexts** — and a saved context is a reference the gate cannot see:
+
+1. A process's thread is preempted inside its exit path *before* `deactivate()` — or is
+   killed externally and never runs an exit path at all. Its saved `ctx.ttbr0` is the
+   dying address space's L0, and it parks READY (the `[TERM] ... state=1` above).
+2. The parent's `wait4` reap runs (`publish_child_exit` fires long before `deactivate()`
+   in both exit routes), retires the process; reclaim drops the `Process`, and the gate
+   sees no core on the L0 — the single core is running the reaper — so it frees and
+   poisons the frames.
+3. The zombie thread is resumed (a `[REVIVE]`-class transition: the reaper's TERMINATED
+   is overwritten by the unconditional WAITING publication in
+   `publish_waiting_and_take_pending_wake`, and a waker's WAITING→READY CAS completes the
+   resurrection that `mark_thread_ready`/`commit_switch` refuse) — or any other slot whose
+   saved context still names the L0 is switched in. The SGI installs the freed L0. Wedge.
+
+Instrumented sweeps (`held_by_ctx` defers, clean suite runs) measure ~30–50 address-space
+frees per suite where some slot's saved context still holds the dying L0 at free time —
+including several per run in state READY. Every one of those was a loaded gun on the old
+code; which run wedged was purely which one got switched in before its context was
+re-saved or zeroed.
+
+Why SMP=1 only: at SMP>1 the dying thread is frequently *running* its teardown on another
+core at reap time, so its live TTBR0 is on that core and the per-core gate defers the
+free. At SMP=1 the reaper running means the zombie is off-core by definition — the gate
+passes exactly when the saved-context reference is invisible.
+
+Why F1 amplifies: moving the CoW copy inside `with_address_space` lengthens the exit-path
+window between `publish_child_exit` and `deactivate()` under `cowstale`'s fork storm,
+making "preempted mid-exit with the dying L0 still saved" far more likely (~3 in 4 suites
+versus ~1 in 7).
+
+## 10.3 The fix, tripwires, and verification
+
+**Fix** — the free gate now has a second arm: `threading::any_saved_ctx_on_l0` scans every
+slot's saved `ctx.ttbr0`, and `mmu::free_or_defer_as_frames` parks the frames if ANY slot
+still references the dying L0 (`[AS-FREE-DEFER] ... held_by_ctx tid=N state=S`).
+`drain_pending_ttbr_frees` re-checks BOTH arms before releasing. Every state blocks, on
+purpose: FREE/INITIALIZING contexts are overwritten by spawn before the slot can go READY,
+TERMINATED contexts are zeroed by the recycler, and live threads re-save at their next
+switch-out — so a parked entry always drains, while trusting the state machine costs the
+machine if it has a revival route the model missed (it does — see `[REVIVE]`).
+
+**Tripwires kept** (all `safe_print!`, bounded, lock-free):
+- `[SGI-S FREED-L0]` — the SGI checks the incoming `ctx.ttbr0` against a 16-entry ring of
+  recently freed L0 bases (`mmu::l0_recently_freed`; entries cleared when the frame is
+  re-issued as a new L0). This is the wedge one instruction before it happens; it printing
+  means the gate has a hole.
+- `[REVIVE]` — `mark_thread_waiting`/`mark_thread_running` report when they overwrite a
+  cross-thread TERMINATED (the resurrection route measured in §10.2 step 3; left in place
+  because abandoning a mid-teardown thread strands whatever it holds).
+- `[SGI-S PICKED-TERMINATED]` — `commit_switch` reports a TERMINATED landing between the
+  pick scan and the commit.
+- The tightened `new_sp` guard from the original §10 stays (real unrecoverable path).
+
+**Boot self-test** — `test_as_drop_defers_while_saved_ctx_on_l0` (src/process_tests.rs),
+sibling of `test_as_drop_defers_while_core_on_l0`: plants a dying L0 in a parked slot's
+saved context via `threading::test_swap_saved_ctx_ttbr0`, asserts the drop parks the
+frames, that a drain refuses while the reference stands, and that clearing it releases
+everything with PMM conserved.
+
+**The revival itself is deliberately NOT closed here.** A reaped-mid-exit thread must
+finish its teardown (it may hold the lifecycle guard and other locks); the measured trace
+shows revived threads complete their exit tail and self-park. With the saved-context gate,
+a revived thread's TTBR0 install targets a deferred-not-freed L0 — intact tables — so the
+revival is safe from the page-table side. Closing it for real (refusing the WAITING
+publication over TERMINATED) changes exit semantics and needs its own verification
+campaign; the `[REVIVE]` tracer is there to size the problem first.
 
 ## Background
 

@@ -639,6 +639,7 @@ pub fn run_all_tests() {
     // The free-side gate for the same storm family: dropping an AS whose L0 a
     // core's TTBR0 still shows must park the frames, not free+poison them.
     test_as_drop_defers_while_core_on_l0();
+    test_as_drop_defers_while_saved_ctx_on_l0();
     // Recycled-tid channel stamp forged an exit for a live process (-j4 hang)
     test_ktg_stale_tid_channel_not_stamped();
     test_mark_terminated_ignores_large_ids();
@@ -4575,6 +4576,81 @@ fn test_as_drop_defers_while_core_on_l0() {
     } else {
         crate::safe_print!(160,
             "[Test] as_drop_defers_while_core_on_l0 FAILED: {} ({} vs {})\n",
+            msg, d1, d2);
+    }
+}
+
+/// The F8 gate (`COW_PILE_AUDIT.md` §10): `UserAddressSpace::drop` must NOT
+/// free page-table frames while some thread slot's SAVED context still carries
+/// the dying L0 in its `ctx.ttbr0`. The per-core gate above cannot see saved
+/// contexts, and the scheduler SGI installs them verbatim on switch-in — a
+/// freed (PMM-poisoned) L0 installed into TTBR0 unmaps kernel text and the
+/// core wedges in a recursive fetch abort at `vector+0x200` (ESR=0x86000004).
+/// The saved-context gate (`threading::any_saved_ctx_on_l0` in
+/// `free_or_defer_as_frames` AND in the drain's re-check) parks the frames
+/// until the reference dissolves. Faked here via `test_swap_saved_ctx_ttbr0`
+/// on the top slot, which boot-suite-time spawns (low-first claim) never use.
+fn test_as_drop_defers_while_saved_ctx_on_l0() {
+    use akuma_exec::{mmu, threading};
+    const SLOT: usize = akuma_exec::threading::MAX_THREADS - 1;
+
+    // Start from a drained state so the parked-entry accounting below is ours.
+    mmu::drain_pending_ttbr_frees();
+    let (parked0, _, _) = mmu::pending_ttbr_free_stats();
+
+    let (ok, msg, d1, d2) = crate::irq::with_irqs_disabled(|| {
+        let (_t, _a, free_before) = crate::pmm::stats();
+
+        let Some(mut as_space) = mmu::UserAddressSpace::new() else {
+            return (false, "OOM allocating AS", 0usize, 0usize);
+        };
+        let l0 = as_space.l0_phys();
+        if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+            if as_space.map_page(BENCH_VA_BASE, frame.addr, akuma_exec::mmu::user_flags::RW).is_ok() {
+                as_space.track_user_frame(frame);
+            } else {
+                crate::pmm::free_page(frame);
+            }
+        }
+
+        // Plant the dying L0 in a parked slot's saved context (the shape a
+        // thread preempted before its exit-path `deactivate()` leaves behind,
+        // reaped by its parent while off-CPU), then tear down.
+        let prev_ctx_ttbr0 = threading::test_swap_saved_ctx_ttbr0(SLOT, l0 as u64);
+        drop(as_space);
+
+        // 1. The frames must be parked, not freed.
+        let (parked_now, _, _) = mmu::pending_ttbr_free_stats();
+        if parked_now <= parked0 {
+            threading::test_swap_saved_ctx_ttbr0(SLOT, prev_ctx_ttbr0);
+            return (false, "drop freed frames despite saved-ctx reference (gate missing)", 0, 0);
+        }
+        // 2. A drain while the context still holds the L0 must not release them.
+        mmu::drain_pending_ttbr_frees();
+        let (parked_held, _, _) = mmu::pending_ttbr_free_stats();
+        if parked_held <= parked0 {
+            threading::test_swap_saved_ctx_ttbr0(SLOT, prev_ctx_ttbr0);
+            return (false, "drain released frames while saved ctx still on L0", 0, 0);
+        }
+        // 3. Context reference dissolves → drain releases everything; PMM conserved.
+        threading::test_swap_saved_ctx_ttbr0(SLOT, prev_ctx_ttbr0);
+        mmu::drain_pending_ttbr_frees();
+        let (parked_after, _, _) = mmu::pending_ttbr_free_stats();
+        if parked_after != parked0 {
+            return (false, "entry still parked after ctx reference cleared", parked_after, parked0);
+        }
+        let (_t2, _a2, free_after) = crate::pmm::stats();
+        if free_after != free_before {
+            return (false, "PMM free count not conserved", free_before, free_after);
+        }
+        (true, "", 0, 0)
+    });
+
+    if ok {
+        console::print("[Test] as_drop_defers_while_saved_ctx_on_l0 PASSED\n");
+    } else {
+        crate::safe_print!(160,
+            "[Test] as_drop_defers_while_saved_ctx_on_l0 FAILED: {} ({} vs {})\n",
             msg, d1, d2);
     }
 }
@@ -11459,7 +11535,15 @@ fn test_unregister_skips_recycled_thread_slot() {
     akuma_exec::runtime::with_irqs_disabled(|| {
         THREAD_PID_MAP.lock().insert(stolen_tid, victim_pid);
     });
-    set_thread_state(stolen_tid, thread_state::READY);
+    // WAITING, not READY: this is a bare claimed slot with a ZEROED context, and
+    // `unregister_process` below prints over the UART — milliseconds during which
+    // a timer SGI (this core) or a peer core's scheduler would happily dispatch a
+    // READY slot and restore sp=0, halting the kernel at `[SGI-S FATAL]` (the
+    // intermittent boot-suite no-boot in verify-trim-fat-change.md's known-benign
+    // table). WAITING with no deadline (WAKE_TIMES stays 0 from the claim scrub)
+    // is never dispatched and never woken, and the decision under test — terminate
+    // versus skip, keyed on THREAD_PID_MAP — is state-independent.
+    set_thread_state(stolen_tid, thread_state::WAITING);
 
     let _ = unregister_process(dead_pid);
 
@@ -11474,7 +11558,8 @@ fn test_unregister_skips_recycled_thread_slot() {
     akuma_exec::runtime::with_irqs_disabled(|| {
         THREAD_PID_MAP.lock().insert(own_tid, solo_pid);
     });
-    set_thread_state(own_tid, thread_state::READY);
+    // WAITING for the same reason as `stolen_tid` above — never dispatchable.
+    set_thread_state(own_tid, thread_state::WAITING);
 
     let _ = unregister_process(solo_pid);
     let own_thread_terminated = get_thread_state(own_tid) == thread_state::TERMINATED;

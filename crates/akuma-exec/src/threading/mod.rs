@@ -1339,17 +1339,34 @@ impl ThreadPool {
 }
 
 /// Mark a thread as running (lock-free)
+#[track_caller]
 fn mark_thread_running(idx: usize) {
     if idx < MAX_THREADS {
-        THREAD_STATES[idx].store(thread_state::RUNNING, Ordering::SeqCst);
+        let prev = THREAD_STATES[idx].swap(thread_state::RUNNING, Ordering::SeqCst);
+        if prev == thread_state::TERMINATED {
+            let loc = core::panic::Location::caller();
+            safe_print!(160, "[REVIVE] tid={} TERMINATED->RUNNING at={}:{} by_tid={}\n",
+                idx, loc.file(), loc.line(), get_current_thread_register());
+        }
     }
 }
 
 /// Mark a thread as waiting with a wake time (lock-free)
+#[track_caller]
 fn mark_thread_waiting(idx: usize, wake_time_us: u64) {
     if idx < MAX_THREADS {
         WAKE_TIMES[idx].store(wake_time_us, Ordering::SeqCst);
-        THREAD_STATES[idx].store(thread_state::WAITING, Ordering::SeqCst);
+        let prev = THREAD_STATES[idx].swap(thread_state::WAITING, Ordering::SeqCst);
+        if prev == thread_state::TERMINATED {
+            // F8 evidence tripwire: an unconditional WAITING publication can
+            // overwrite a cross-thread TERMINATED (the reap-mid-exit race); a
+            // waker's WAITING->READY CAS then completes a resurrection the
+            // guarded paths (`mark_thread_ready`, `commit_switch`,
+            // `resume_running_unless_terminated`) all refuse.
+            let loc = core::panic::Location::caller();
+            safe_print!(160, "[REVIVE] tid={} TERMINATED->WAITING at={}:{} by_tid={}\n",
+                idx, loc.file(), loc.line(), get_current_thread_register());
+        }
     }
 }
 
@@ -2549,7 +2566,15 @@ impl ThreadPool {
             |s| (s != thread_state::TERMINATED && s != thread_state::WAITING)
                 .then_some(thread_state::READY),
         );
-        THREAD_STATES[next_idx].store(thread_state::RUNNING, Ordering::SeqCst);
+        let prev = THREAD_STATES[next_idx].swap(thread_state::RUNNING, Ordering::SeqCst);
+        if prev == thread_state::TERMINATED {
+            // F8 evidence tripwire: the pick scan only accepts READY, so a
+            // TERMINATED here means a cross-thread kill landed between the scan
+            // and this commit — the switch will now run a thread whose teardown
+            // (and possibly address space) is already being reclaimed.
+            safe_print!(128, "[SGI-S PICKED-TERMINATED] new_tid={} old_tid={}\n",
+                next_idx, current_idx);
+        }
         // Record the core the incoming thread is now running on. commit_switch always
         // runs on the core that will run next_idx (single runqueue, each core schedules
         // itself), so current_core_id() is authoritative.
@@ -3012,6 +3037,19 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
                 }
             }
 
+            // F8 tripwire: an incoming context whose TTBR0 names a FREED L0 is the
+            // fault-loop wedge one instruction before it happens — installing it
+            // unmaps kernel text (kernel runs in the TTBR0 low half), the next
+            // fetch aborts, and the vector entry's own fetch aborts recursively
+            // (PC pinned at vector+0x200, ESR=0x86000004). Print the culprit pair
+            // BEFORE the install so the wedge is attributable from the log.
+            if crate::mmu::l0_recently_freed(new_ttbr0 & TTBR0_L0_MASK) {
+                safe_print!(160,
+                    "[SGI-S FREED-L0] new_ttbr0={:#x} old_tid={} new_tid={} new_state={}\n",
+                    new_ttbr0, old_idx, new_idx,
+                    THREAD_STATES[new_idx].load(Ordering::SeqCst));
+            }
+
             // Publish the transition to the per-core live-TTBR0 registry (the
             // page-table-UAF free gate, see mmu::any_core_on_l0): PREV covers the
             // outgoing table across the msr window, ACTIVE covers the incoming one
@@ -3094,6 +3132,44 @@ pub extern "C" fn rust_switch_finished() {
         if tid < MAX_THREADS {
             ON_CPU[tid].store(0, Ordering::Release);
         }
+    }
+}
+
+/// Is `l0_base` still referenced by any thread slot's SAVED context? Returns the
+/// first `(tid, state)` found. The address-space free path consults this in
+/// addition to the per-core gate (`mmu::any_core_on_l0`): a live core's TTBR0 is
+/// not the only reference the scheduler can turn back into hardware state — the
+/// SGI switch installs `ctx.ttbr0` verbatim from the incoming thread's saved
+/// context, so a saved reference to a freed L0 is a machine-wedging fault loop
+/// waiting for its switch-in (F8, `COW_PILE_AUDIT.md` §10: recursive instruction
+/// abort at `vector+0x200`, ESR=0x86000004, kernel text unmapped by the install).
+///
+/// Every state is a blocker on purpose, even the "unschedulable" ones: FREE and
+/// INITIALIZING contexts are overwritten by spawn before the slot can go READY,
+/// and TERMINATED contexts are zeroed by the recycler — both of which UNPIN a
+/// deferred free at the next `drain_pending_ttbr_frees` — so treating them as
+/// blockers costs only a short deferral, while trusting the state machine costs
+/// the machine if any revival route exists that the model missed.
+/// Bounded loop, no heap, no locks.
+pub fn any_saved_ctx_on_l0(l0_base: u64) -> Option<(usize, u8)> {
+    if l0_base == 0 {
+        return None;
+    }
+    (0..MAX_THREADS).find_map(|i| {
+        let ttbr0 = unsafe { (*get_context(i)).ttbr0 };
+        (ttbr0 & TTBR0_L0_MASK == l0_base)
+            .then(|| (i, THREAD_STATES[i].load(Ordering::SeqCst)))
+    })
+}
+
+/// Test hook: swap a slot's saved-context TTBR0, returning the previous value
+/// (boot-suite self-tests only — they can't get a real thread parked with a
+/// chosen stale TTBR0 in its saved context).
+#[doc(hidden)]
+pub fn test_swap_saved_ctx_ttbr0(slot: usize, ttbr0: u64) -> u64 {
+    unsafe {
+        let ctx = &mut *get_context_mut(slot % MAX_THREADS);
+        core::mem::replace(&mut ctx.ttbr0, ttbr0)
     }
 }
 

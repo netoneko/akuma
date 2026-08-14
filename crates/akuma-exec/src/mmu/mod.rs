@@ -427,6 +427,37 @@ pub fn test_publish_core_l0(core: usize, l0_phys: usize) {
     ACTIVE_L0[core % TTBR_TRACK_CORES].store(l0_phys as u64 & L0_BASE_MASK, Ordering::SeqCst);
 }
 
+/// Ring of the most recently freed L0 bases (F8 tripwire). The scheduler checks
+/// an incoming context's TTBR0 against this before installing it: a hit means a
+/// saved context still references a torn-down address space, which is the freed-
+/// L0-into-TTBR0 wedge (`COW_PILE_AUDIT.md` §10) about to happen. Entries are
+/// cleared when the PMM hands the frame back out as a NEW L0 (`UserAddressSpace::
+/// new`), so reuse doesn't false-positive; reuse as a non-L0 page keeps the entry,
+/// which is exactly when installing it is most destructive.
+const FREED_L0_RING: usize = 16;
+static RECENT_FREED_L0: [AtomicU64; FREED_L0_RING] = [ATOMIC_U64_ZERO; FREED_L0_RING];
+static RECENT_FREED_L0_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+fn note_freed_l0(l0_base: u64) {
+    let i = RECENT_FREED_L0_NEXT.fetch_add(1, Ordering::Relaxed) % FREED_L0_RING;
+    RECENT_FREED_L0[i].store(l0_base, Ordering::SeqCst);
+}
+
+fn unnote_freed_l0(l0_base: u64) {
+    for slot in &RECENT_FREED_L0 {
+        let _ = slot.compare_exchange(l0_base, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
+/// Was `l0_base` (a masked L0 base) freed recently and not since re-issued as an
+/// L0? Scheduler-side arm of the F8 tripwire; lock-free, bounded.
+pub fn l0_recently_freed(l0_base: u64) -> bool {
+    l0_base != 0
+        && RECENT_FREED_L0
+            .iter()
+            .any(|s| s.load(Ordering::SeqCst) == l0_base)
+}
+
 /// Frames of a torn-down address space whose free was deferred because some
 /// core's TTBR0 was still resident on the L0 (see module comment above).
 struct PendingAsFree {
@@ -479,6 +510,26 @@ fn free_or_defer_as_frames(
         });
         return;
     }
+    // Second gate, saved contexts (the F8 fix, `COW_PILE_AUDIT.md` §10): a thread
+    // preempted before its exit path's `deactivate()` — or killed without ever
+    // running it — parks with the dying L0 in its SAVED `ctx.ttbr0`, where the
+    // per-core scan above cannot see it and the scheduler SGI will install it
+    // verbatim on switch-in. Freeing under such a reference wedges the machine
+    // (recursive fetch abort at vector+0x200) the moment that slot is scheduled.
+    // Park the frames instead; the reference dissolves at the slot's next
+    // context save (post-`deactivate()` switch-out), recycle (context zeroed) or
+    // spawn re-seed, and the next drain frees them.
+    if let Some((tid, state)) = crate::threading::any_saved_ctx_on_l0(l0_addr as u64 & L0_BASE_MASK) {
+        as_trace(format_args!(
+            "[AS-FREE-DEFER] l0=0x{:x} asid=0x{:x} path={} held_by_ctx tid={} state={}\n",
+            l0_addr, asid, path, tid, state));
+        with_irqs_disabled(|| {
+            let mut pending = PENDING_TTBR_FREES.lock();
+            pending.push(PendingAsFree { l0_frame, user_frames, pt_frames, asid });
+            PENDING_TTBR_FREE_COUNT.store(pending.len(), Ordering::Release);
+        });
+        return;
+    }
     as_trace(format_args!("[AS-FREE] l0=0x{:x} asid=0x{:x} path={} core={}\n",
         l0_addr, asid, path, crate::bkl::current_core_id()));
     free_as_frames_now(l0_frame, &user_frames, &pt_frames);
@@ -486,6 +537,7 @@ fn free_or_defer_as_frames(
 
 /// Unconditional frame release — only reachable through the liveness gate.
 fn free_as_frames_now(l0_frame: PhysFrame, user_frames: &BTreeMap<usize, u32>, pt_frames: &[PhysFrame]) {
+    note_freed_l0(l0_frame.addr as u64 & L0_BASE_MASK);
     let rt = runtime();
     {
         let _irq = IrqGuard::new();
@@ -515,7 +567,14 @@ pub fn drain_pending_ttbr_frees() -> usize {
         let mut ready = Vec::new();
         let mut i = 0;
         while i < pending.len() {
-            if any_core_on_l0(pending[i].l0_frame.addr).is_none() {
+            // Same two gates as `free_or_defer_as_frames`: no core's live TTBR0
+            // on the L0, and no thread's saved context either — releasing on the
+            // core check alone would re-open the F8 window this list exists to
+            // close for entries parked by the saved-context gate.
+            let l0 = pending[i].l0_frame.addr;
+            if any_core_on_l0(l0).is_none()
+                && crate::threading::any_saved_ctx_on_l0(l0 as u64 & L0_BASE_MASK).is_none()
+            {
                 ready.push(pending.swap_remove(i));
             } else {
                 i += 1;
@@ -588,6 +647,9 @@ impl UserAddressSpace {
     pub fn new() -> Option<Self> {
         let rt = runtime();
         let l0_frame = (rt.alloc_page_zeroed)()?;
+        // This frame is a live L0 again — drop it from the freed-L0 tripwire ring
+        // so the scheduler doesn't flag the new owner's legitimate installs.
+        unnote_freed_l0(l0_frame.addr as u64 & L0_BASE_MASK);
         (rt.track_frame)(l0_frame, FrameSource::UserPageTable);
         let asid = match with_irqs_disabled(|| ASID_ALLOCATOR.lock().alloc()) {
             Some(a) => a,
