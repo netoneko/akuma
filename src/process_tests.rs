@@ -2313,6 +2313,30 @@ fn test_shared_file_mmap_writeback() {
     }
 }
 
+/// Remove `leftovers` (paths relative to `root`), then `root/sub`, then `root` —
+/// the best-effort clean slate every `*at()` test runs *twice*: once before it
+/// starts, because a crashed prior run may have left the tree behind, and once as
+/// teardown.
+///
+/// Each entry is tried as both a file and a directory, so one list covers
+/// `test_mkdirat`'s directories and everything else's files without the caller
+/// having to say which is which. Order matters and is fixed here: entries first
+/// (some live under `sub`), then `sub`, then `root`.
+///
+/// Both calls take the SAME list, which is the point. They did not: `test_openat`'s
+/// teardown removed `link.txt` and `target.txt` while its setup did not, so a run
+/// that crashed after the symlink case left that case's inputs in place for the next
+/// boot to trip over. One list per test now, named once.
+fn clean_at_test_tree(root: &str, leftovers: &[&str]) {
+    for entry in leftovers {
+        let path = format!("{root}/{entry}");
+        let _ = crate::fs::remove_file(&path);
+        let _ = crate::fs::remove_dir(&path);
+    }
+    let _ = crate::fs::remove_dir(&format!("{root}/sub"));
+    let _ = crate::fs::remove_dir(root);
+}
+
 /// NUL-terminate a path into a heap buffer the syscall layer's
 /// `copy_from_user_str` can read.
 ///
@@ -2382,13 +2406,10 @@ fn test_unlinkat() {
     const AT_FDCWD: i32 = -100;
     const AT_REMOVEDIR: u32 = 0x200;
     const ROOT: &str = "/tmp/unlinkat_selftest";
+    const LEFTOVERS: [&str; 3] = ["sub/f.txt", "plaindir", "emptydir"];
 
     // Best-effort clean slate (a crashed prior run may have left the tree).
-    let _ = crate::fs::remove_file(&format!("{ROOT}/sub/f.txt"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/plaindir"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/emptydir"));
-    let _ = crate::fs::remove_dir(ROOT);
+    clean_at_test_tree(ROOT, &LEFTOVERS);
     let _ = crate::fs::create_dir(ROOT);
     let _ = crate::fs::create_dir(&format!("{ROOT}/sub"));
 
@@ -2474,11 +2495,7 @@ fn test_unlinkat() {
     unregister_at_syscall_process(pid, tid);
 
     // Cleanup (best-effort; the test verdict is the case results above, not this).
-    let _ = crate::fs::remove_file(&format!("{ROOT}/sub/f.txt"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/plaindir"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/emptydir"));
-    let _ = crate::fs::remove_dir(ROOT);
+    clean_at_test_tree(ROOT, &LEFTOVERS);
 
     if fails == 0 {
         crate::safe_print!(128, "[Test] unlinkat PASSED (8 cases: abs/cwd-rel/dirfd/AT_REMOVEDIR/dir-as-file/EBADFx2/ENOENT)\n");
@@ -2506,14 +2523,10 @@ fn test_openat() {
     const ENOENT: u64 = (-2i64) as u64;
     const AT_FDCWD: i32 = -100;
     const ROOT: &str = "/tmp/openat_selftest";
+    const LEFTOVERS: [&str; 6] = ["creat.txt", "trunc.txt", "sub/rel.txt", "cwd.txt", "link.txt", "target.txt"];
 
     // Best-effort clean slate (a crashed prior run may have left the tree).
-    let _ = crate::fs::remove_file(&format!("{ROOT}/creat.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/trunc.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/sub/rel.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/cwd.txt"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
-    let _ = crate::fs::remove_dir(ROOT);
+    clean_at_test_tree(ROOT, &LEFTOVERS);
     let _ = crate::fs::create_dir(ROOT);
     let _ = crate::fs::create_dir(&format!("{ROOT}/sub"));
 
@@ -2647,14 +2660,7 @@ fn test_openat() {
     unregister_at_syscall_process(pid, tid);
 
     // Cleanup (best-effort; the test verdict is the case results above, not this).
-    let _ = crate::fs::remove_file(&format!("{ROOT}/creat.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/trunc.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/sub/rel.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/cwd.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/link.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/target.txt"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
-    let _ = crate::fs::remove_dir(ROOT);
+    clean_at_test_tree(ROOT, &LEFTOVERS);
 
     if fails == 0 {
         crate::safe_print!(128, "[Test] openat PASSED (8 cases: O_CREAT/O_TRUNC/dirfd/cwd-rel/dev-null/EBADF/ENOENT/symlink)\n");
@@ -2683,15 +2689,10 @@ fn test_renameat() {
     const AT_FDCWD: i32 = -100;
     const RENAME_NOREPLACE: u32 = 1;
     const ROOT: &str = "/tmp/renameat_selftest";
+    const LEFTOVERS: [&str; 5] = ["abs_dst.txt", "rel_dst.txt", "sub/dirfd_dst.txt", "noreplace_src.txt", "noreplace_dst.txt"];
 
     // Best-effort clean slate (a crashed prior run may have left the tree).
-    let _ = crate::fs::remove_file(&format!("{ROOT}/abs_dst.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/rel_dst.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/sub/dirfd_dst.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/noreplace_src.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/noreplace_dst.txt"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
-    let _ = crate::fs::remove_dir(ROOT);
+    clean_at_test_tree(ROOT, &LEFTOVERS);
     let _ = crate::fs::create_dir(ROOT);
     let _ = crate::fs::create_dir(&format!("{ROOT}/sub"));
 
@@ -2781,13 +2782,7 @@ fn test_renameat() {
     unregister_at_syscall_process(pid, tid);
 
     // Cleanup (best-effort; the test verdict is the case results above, not this).
-    let _ = crate::fs::remove_file(&format!("{ROOT}/abs_dst.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/rel_dst.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/sub/dirfd_dst.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/noreplace_src.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/noreplace_dst.txt"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
-    let _ = crate::fs::remove_dir(ROOT);
+    clean_at_test_tree(ROOT, &LEFTOVERS);
 
     if fails == 0 {
         crate::safe_print!(128, "[Test] renameat PASSED (6 cases: abs/cwd-rel/dirfd/NOREPLACE/unopen-dirfd/ENOENT)\n");
@@ -2805,13 +2800,10 @@ fn test_mkdirat() {
     const EBADF: u64 = (-9i64) as u64;
     const AT_FDCWD: i32 = -100;
     const ROOT: &str = "/tmp/mkdirat_selftest";
+    const LEFTOVERS: [&str; 3] = ["abs_dir", "rel_dir", "sub/dirfd_dir"];
 
     // Best-effort clean slate (a crashed prior run may have left the tree).
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/abs_dir"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/rel_dir"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub/dirfd_dir"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
-    let _ = crate::fs::remove_dir(ROOT);
+    clean_at_test_tree(ROOT, &LEFTOVERS);
     let _ = crate::fs::create_dir(ROOT);
     let _ = crate::fs::create_dir(&format!("{ROOT}/sub"));
 
@@ -2880,11 +2872,7 @@ fn test_mkdirat() {
     unregister_at_syscall_process(pid, tid);
 
     // Cleanup (best-effort; the test verdict is the case results above, not this).
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/abs_dir"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/rel_dir"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub/dirfd_dir"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
-    let _ = crate::fs::remove_dir(ROOT);
+    clean_at_test_tree(ROOT, &LEFTOVERS);
 
     if fails == 0 {
         crate::safe_print!(128, "[Test] mkdirat PASSED (6 cases: abs/cwd-rel/dirfd/unopen-dirfd/EEXIST/ENOENT)\n");
@@ -3115,13 +3103,10 @@ fn test_fchmodat() {
     const EBADF: u64 = (-9i64) as u64;
     const AT_FDCWD: i32 = -100;
     const ROOT: &str = "/tmp/fchmodat_selftest";
+    const LEFTOVERS: [&str; 3] = ["abs.txt", "rel.txt", "sub/dirfd.txt"];
 
     // Best-effort clean slate (a crashed prior run may have left the tree).
-    let _ = crate::fs::remove_file(&format!("{ROOT}/abs.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/rel.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/sub/dirfd.txt"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
-    let _ = crate::fs::remove_dir(ROOT);
+    clean_at_test_tree(ROOT, &LEFTOVERS);
     let _ = crate::fs::create_dir(ROOT);
     let _ = crate::fs::create_dir(&format!("{ROOT}/sub"));
     let _ = crate::fs::write_file(&format!("{ROOT}/abs.txt"), b"a");
@@ -3195,11 +3180,7 @@ fn test_fchmodat() {
     unregister_at_syscall_process(pid, tid);
 
     // Cleanup (best-effort; the test verdict is the case results above, not this).
-    let _ = crate::fs::remove_file(&format!("{ROOT}/abs.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/rel.txt"));
-    let _ = crate::fs::remove_file(&format!("{ROOT}/sub/dirfd.txt"));
-    let _ = crate::fs::remove_dir(&format!("{ROOT}/sub"));
-    let _ = crate::fs::remove_dir(ROOT);
+    clean_at_test_tree(ROOT, &LEFTOVERS);
 
     if fails == 0 {
         crate::safe_print!(128, "[Test] fchmodat PASSED (6 cases: abs/cwd-rel/dirfd/unopen-dirfd/ENOENT/dev-null)\n");
@@ -4440,6 +4421,29 @@ fn test_munmap_teardown_conserves_pmm() {
     }
 }
 
+/// Build a fresh `UserAddressSpace` with exactly one mapped user page, and return
+/// it alongside its L0 physical address.
+///
+/// Both deferred-free gate tests need the user-frame half of the teardown exercised
+/// alongside the page-table frames, so the mapped page is not incidental — an AS
+/// with no user frames would only prove half of what `free_or_defer_as_frames`
+/// does. A page that fails to map is freed rather than leaked, and the AS is still
+/// returned: the page-table half of the test is still valid without it.
+///
+/// Returns `None` only if the address space itself could not be allocated.
+fn new_as_with_one_mapped_page() -> Option<(akuma_exec::mmu::UserAddressSpace, usize)> {
+    let mut as_space = akuma_exec::mmu::UserAddressSpace::new()?;
+    let l0 = as_space.l0_phys();
+    if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+        if as_space.map_page(BENCH_VA_BASE, frame.addr, akuma_exec::mmu::user_flags::RW).is_ok() {
+            as_space.track_user_frame(frame);
+        } else {
+            crate::pmm::free_page(frame);
+        }
+    }
+    Some((as_space, l0))
+}
+
 /// The page-table-UAF liveness gate: `UserAddressSpace::drop` must NOT free
 /// page-table frames while some core's live `TTBR0_EL1` is still resident on
 /// the dying L0 — freeing (and PMM-poisoning) them under a running core is
@@ -4459,19 +4463,9 @@ fn test_as_drop_defers_while_core_on_l0() {
     let (ok, msg, d1, d2) = crate::irq::with_irqs_disabled(|| {
         let (_t, _a, free_before) = crate::pmm::stats();
 
-        let Some(mut as_space) = mmu::UserAddressSpace::new() else {
+        let Some((as_space, l0)) = new_as_with_one_mapped_page() else {
             return (false, "OOM allocating AS", 0usize, 0usize);
         };
-        let l0 = as_space.l0_phys();
-        // One mapped user page so the user-frame half of the deferred free is
-        // exercised alongside the page-table frames.
-        if let Some(frame) = crate::pmm::alloc_page_zeroed() {
-            if as_space.map_page(BENCH_VA_BASE, frame.addr, akuma_exec::mmu::user_flags::RW).is_ok() {
-                as_space.track_user_frame(frame);
-            } else {
-                crate::pmm::free_page(frame);
-            }
-        }
 
         // Fake a peer core parked with TTBR0 on this L0, then tear down.
         mmu::test_publish_core_l0(7, l0);
@@ -4534,17 +4528,9 @@ fn test_as_drop_defers_while_saved_ctx_on_l0() {
     let (ok, msg, d1, d2) = crate::irq::with_irqs_disabled(|| {
         let (_t, _a, free_before) = crate::pmm::stats();
 
-        let Some(mut as_space) = mmu::UserAddressSpace::new() else {
+        let Some((as_space, l0)) = new_as_with_one_mapped_page() else {
             return (false, "OOM allocating AS", 0usize, 0usize);
         };
-        let l0 = as_space.l0_phys();
-        if let Some(frame) = crate::pmm::alloc_page_zeroed() {
-            if as_space.map_page(BENCH_VA_BASE, frame.addr, akuma_exec::mmu::user_flags::RW).is_ok() {
-                as_space.track_user_frame(frame);
-            } else {
-                crate::pmm::free_page(frame);
-            }
-        }
 
         // Plant the dying L0 in a parked slot's saved context (the shape a
         // thread preempted before its exit-path `deactivate()` leaves behind,
@@ -5998,6 +5984,67 @@ fn test_forktest_parent_mmap() {
     }
 
     akuma_exec::threading::cleanup_terminated();
+}
+
+/// Register a fresh parent/child pair and return their pids.
+///
+/// Pids come from the real `NEXT_PID` rather than fixed constants so these tests
+/// can run in any order and repeatedly without colliding with each other or with a
+/// live process. Was written out three times identically.
+///
+/// `test_crash_goroutine_exit_kills_group` deliberately does **not** use this: it
+/// names its parent, and the surviving name is what that test asserts on — the
+/// fixture is the assertion there, so folding it in would hide the point.
+fn register_parent_and_child() -> (u32, u32) {
+    use akuma_exec::process::register_process;
+    use core::sync::atomic::Ordering;
+
+    let parent_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, Ordering::SeqCst);
+    let child_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, Ordering::SeqCst);
+    register_process(parent_pid, make_test_process(parent_pid));
+    let mut child = make_test_process(child_pid);
+    child.parent_pid = parent_pid;
+    register_process(child_pid, child);
+    (parent_pid, child_pid)
+}
+
+/// [`register_parent_and_child`] plus the child channel `wait4` polls — the fixture
+/// for every "does the exit reach the parent" test. Returns the channel so the
+/// caller can read `has_exited()` before and after whatever it does.
+fn register_parent_child_with_channel(
+) -> (u32, u32, alloc::sync::Arc<akuma_exec::process::channel::ProcessChannel>) {
+    use akuma_exec::process::channel::ProcessChannel;
+    use akuma_exec::process::register_child_channel;
+
+    let (parent_pid, child_pid) = register_parent_and_child();
+    let ch = alloc::sync::Arc::new(ProcessChannel::new());
+    register_child_channel(child_pid, ch.clone(), parent_pid);
+    (parent_pid, child_pid, ch)
+}
+
+/// Register a thread-group leader and two siblings that share the leader's `tgid` —
+/// the Go-runtime shape (`m` goroutine threads under one process) these tests exist
+/// to pin. Returns `(leader, g1, g2)`.
+///
+/// Only the `tgid` makes them a group: each sibling is otherwise an independent
+/// `Process` slot, which is exactly the thing `kill_thread_group` has to get right.
+fn register_thread_group_of_three() -> (u32, u32, u32) {
+    use akuma_exec::process::register_process;
+    use core::sync::atomic::Ordering;
+
+    let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, Ordering::SeqCst);
+    let g1_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, Ordering::SeqCst);
+    let g2_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, Ordering::SeqCst);
+
+    let mut leader = make_test_process(leader_pid);
+    leader.tgid = leader_pid;
+    register_process(leader_pid, leader);
+    for pid in [g1_pid, g2_pid] {
+        let mut g = make_test_process(pid);
+        g.tgid = leader_pid;
+        register_process(pid, g);
+    }
+    (leader_pid, g1_pid, g2_pid)
 }
 
 /// Helper to create a minimal Process for testing logic without loading a real ELF.
@@ -7700,15 +7747,24 @@ fn test_icache_sync_rewrites_code() {
 /// tail *is* that pair — so the maintenance completes before the frame is
 /// published, at every site, by construction.
 ///
-/// What this test can and cannot prove: barrier *ordering* is not observable under
-/// QEMU TCG, which has a coherent I-cache. What it does pin is the **call shape**
-/// the fix introduced, and that shape is genuinely uncovered today —
-/// `icache_sync_rewrites_code` above passes `len = 8`, so nothing executes code
-/// from anywhere but the first cache line of the range. The fault path maintains a
-/// whole page and then jumps into an arbitrary offset in it. So: rewrite and run a
-/// stub in the page's *second half*, maintaining the whole page each time. A
-/// `sync_icache_range` that walked the wrong number of lines, or a fault-path call
-/// that passed the wrong length, fails here and passes there.
+/// This runs on real cores — the runner defaults to `-accel hvf -cpu host` — and
+/// Apple's I-cache is not coherent with the D-cache, which is why the maintenance
+/// sequence exists at all (see `icache_sync_rewrites_code` above and the "x8 race",
+/// `docs/AKUMA_SELF_HOSTING.md` §7j). So the stubs below are a genuine test of
+/// visibility, not a smoke test.
+///
+/// The gap it closes: `icache_sync_rewrites_code` passes `len = 8`, so nothing ever
+/// executes code from outside the **first 64-byte line** of the range. The fault
+/// path maintains a whole page and then jumps to an arbitrary offset in it. So:
+/// rewrite and run stubs in the page's second half, maintaining the whole page each
+/// time. A `sync_icache_range` that walked the wrong number of lines, or a
+/// fault-path call that passed the wrong length, fails here and passes there.
+///
+/// What it does **not** pin is the cross-PE ordering F4 is actually about — a peer
+/// core fetching from a frame published before this core's `ic ivau` completed. That
+/// window is a few instructions wide and needs a peer to hit it, so it is a race to
+/// provoke rather than an invariant to assert; the defence is structural (one
+/// `sync_icache_range`, whose tail *is* the completion barrier), not this test.
 fn test_icache_sync_whole_page_offsets() {
     // AArch64: `movz x0, #imm` = 0xD2800000 | (imm << 5); `ret` = 0xD65F03C0.
     fn stub(imm: u16) -> [u32; 2] {
@@ -13874,6 +13930,31 @@ fn test_epoll_pidfd_with_kill_thread_group() {
 // Message Queue Waker Tests
 // ============================================================================
 
+/// Find `n` free thread slots for a test that needs to fabricate waiting threads.
+///
+/// Starts at index 8 to skip the system threads (0 = bootstrap, 1 = network,
+/// 2-7 = system): seeding one of those as WAITING would park a thread the kernel
+/// is relying on. Returns fewer than `n` entries if the pool is that busy, which
+/// every caller treats as SKIPPED rather than FAILED — slot availability is a
+/// property of the boot, not of the code under test.
+///
+/// Was open-coded four times in the msgqueue tests, three times for one slot and
+/// once for two.
+fn find_free_thread_slots(n: usize) -> alloc::vec::Vec<usize> {
+    use akuma_exec::threading::{self, thread_state};
+
+    let mut out = alloc::vec::Vec::new();
+    for i in 8..threading::MAX_THREADS {
+        if threading::get_thread_state(i) == thread_state::FREE {
+            out.push(i);
+            if out.len() == n {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Test: msgqueue_push_direct wakes recv pollers
 #[allow(dead_code)]
 fn test_msgqueue_send_wakes_receiver() {
@@ -13886,15 +13967,8 @@ fn test_msgqueue_send_wakes_receiver() {
 
     let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666) as u32;
 
-    // Find a free thread slot to simulate a waiting receiver
-    // IMPORTANT: Start at index 8 to skip system threads (0=bootstrap, 1=network, 2-7=system)
-    let mut test_tid = None;
-    for i in 8..threading::MAX_THREADS {
-        if threading::get_thread_state(i) == thread_state::FREE {
-            test_tid = Some(i);
-            break;
-        }
-    }
+    // A free slot stands in for a receiver parked in msgrcv.
+    let test_tid = find_free_thread_slots(1).first().copied();
     let tid = if let Some(t) = test_tid { t } else {
         console::print("[Test] msgqueue_send_wakes_receiver SKIPPED: no free thread slot\n");
         sys_msgctl(msqid, IPC_RMID, 0);
@@ -13948,15 +14022,8 @@ fn test_msgqueue_recv_wakes_sender() {
     // Put a message in the queue so we can pop it
     msgqueue_push_direct(0, msqid, 1, b"data");
 
-    // Find a free thread slot to simulate a waiting sender
-    let mut test_tid = None;
-    // Start at 8 to skip system threads (0=bootstrap, 1=network, 2-7=system)
-    for i in 8..threading::MAX_THREADS {
-        if threading::get_thread_state(i) == thread_state::FREE {
-            test_tid = Some(i);
-            break;
-        }
-    }
+    // A free slot stands in for a sender parked in msgsnd.
+    let test_tid = find_free_thread_slots(1).first().copied();
     let tid = if let Some(t) = test_tid { t } else {
         console::print("[Test] msgqueue_recv_wakes_sender SKIPPED: no free thread slot\n");
         sys_msgctl(msqid, IPC_RMID, 0);
@@ -14001,15 +14068,7 @@ fn test_msgqueue_rmid_wakes_pollers() {
 
     let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666) as u32;
 
-    // Find two free thread slots
-    let mut tids = alloc::vec::Vec::new();
-    // Start at 8 to skip system threads (0=bootstrap, 1=network, 2-7=system)
-    for i in 8..threading::MAX_THREADS {
-        if threading::get_thread_state(i) == thread_state::FREE {
-            tids.push(i);
-            if tids.len() == 2 { break; }
-        }
-    }
+    let tids = find_free_thread_slots(2);
     if tids.len() < 2 {
         console::print("[Test] msgqueue_rmid_wakes_pollers SKIPPED: need 2 free thread slots\n");
         sys_msgctl(msqid, IPC_RMID, 0);
@@ -14089,14 +14148,7 @@ fn test_msgqueue_waker_idempotent() {
 
     let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666) as u32;
 
-    let mut test_tid = None;
-    // Start at 8 to skip system threads (0=bootstrap, 1=network, 2-7=system)
-    for i in 8..threading::MAX_THREADS {
-        if threading::get_thread_state(i) == thread_state::FREE {
-            test_tid = Some(i);
-            break;
-        }
-    }
+    let test_tid = find_free_thread_slots(1).first().copied();
     let tid = if let Some(t) = test_tid { t } else {
         console::print("[Test] msgqueue_waker_idempotent SKIPPED: no free thread slot\n");
         sys_msgctl(msqid, IPC_RMID, 0);
@@ -14144,23 +14196,9 @@ fn test_msgqueue_waker_idempotent() {
 /// from the table and their thread IDs from THREAD_PID_MAP.
 /// After cleanup, list_processes must not crash (no dangling pointers).
 fn test_goroutine_crash_kills_thread_group() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared, list_processes};
+    use akuma_exec::process::{unregister_process, lookup_process_shared, list_processes};
 
-    let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-    let g1_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-    let g2_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-
-    let mut leader = make_test_process(leader_pid);
-    leader.tgid = leader_pid;
-    register_process(leader_pid, leader);
-
-    let mut g1 = make_test_process(g1_pid);
-    g1.tgid = leader_pid;
-    register_process(g1_pid, g1);
-
-    let mut g2 = make_test_process(g2_pid);
-    g2.tgid = leader_pid;
-    register_process(g2_pid, g2);
+    let (leader_pid, g1_pid, g2_pid) = register_thread_group_of_three();
 
     // Count before kill
     let count_before = akuma_exec::process::table::process_count();
@@ -15476,21 +15514,8 @@ fn test_slot_recycling() {
 /// as running after SIGKILL" — the thread channel was notified but NOT the
 /// child channel that wait4 actually polls.
 fn test_kill_process_notifies_child_channel() {
-    use akuma_exec::process::{register_process, register_child_channel};
-    use akuma_exec::process::channel::ProcessChannel;
 
-    let parent_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-    let child_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-
-    // Register parent and child
-    register_process(parent_pid, make_test_process(parent_pid));
-    let mut child = make_test_process(child_pid);
-    child.parent_pid = parent_pid;
-    register_process(child_pid, child);
-
-    // Register a child channel (what wait4 polls)
-    let ch = alloc::sync::Arc::new(ProcessChannel::new());
-    register_child_channel(child_pid, ch.clone(), parent_pid);
+    let (parent_pid, child_pid, ch) = register_parent_child_with_channel();
 
     // Before kill: channel should NOT be exited
     let before = ch.has_exited();
@@ -15523,24 +15548,9 @@ fn test_kill_process_notifies_child_channel() {
 /// cleaned up but the process table must not contain dangling pointers.
 /// Verify by killing a process then scanning the table for corruption.
 fn test_sigkill_goroutine_does_not_kill_leader() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared, list_processes};
+    use akuma_exec::process::{unregister_process, lookup_process_shared, list_processes};
 
-    let leader_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-    let g1_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-    let g2_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-
-    // Leader + 2 goroutines in same thread group
-    let mut leader = make_test_process(leader_pid);
-    leader.tgid = leader_pid;
-    register_process(leader_pid, leader);
-
-    let mut g1 = make_test_process(g1_pid);
-    g1.tgid = leader_pid;
-    register_process(g1_pid, g1);
-
-    let mut g2 = make_test_process(g2_pid);
-    g2.tgid = leader_pid;
-    register_process(g2_pid, g2);
+    let (leader_pid, g1_pid, g2_pid) = register_thread_group_of_three();
 
     // SIGKILL the leader (what the parent does)
     akuma_exec::process::kill_thread_group(leader_pid, 0, 0);
@@ -15611,15 +15621,9 @@ fn test_zombie_stays_for_wait4_reap() {
 /// the expected behavior: orphaned children remain in the process table until
 /// explicitly cleaned up.
 fn test_orphan_children_become_zombies() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
+    use akuma_exec::process::{unregister_process, lookup_process_shared};
 
-    let parent_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-    let child_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-
-    register_process(parent_pid, make_test_process(parent_pid));
-    let mut child = make_test_process(child_pid);
-    child.parent_pid = parent_pid;
-    register_process(child_pid, child);
+    let (parent_pid, child_pid) = register_parent_and_child();
 
     // Parent exits — kill_process marks it as zombie
     let _ = akuma_exec::process::kill_process(parent_pid);
@@ -15697,21 +15701,9 @@ fn test_process_table_capacity() {
 /// Without wait4 reaping, zombies accumulate and the 256-slot table fills up,
 /// causing go build to fail when spawning compile processes.
 fn test_wait4_reaps_zombie() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared,
-        register_child_channel};
-    use akuma_exec::process::channel::ProcessChannel;
+    use akuma_exec::process::{unregister_process, lookup_process_shared};
 
-    let parent_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-    let child_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-
-    // Setup: parent + child + child channel
-    register_process(parent_pid, make_test_process(parent_pid));
-    let mut child = make_test_process(child_pid);
-    child.parent_pid = parent_pid;
-    register_process(child_pid, child);
-
-    let ch = alloc::sync::Arc::new(ProcessChannel::new());
-    register_child_channel(child_pid, ch.clone(), parent_pid);
+    let (parent_pid, child_pid, ch) = register_parent_child_with_channel();
 
     // Step 1: kill → zombie (stays in table, channel notified)
     let _ = akuma_exec::process::kill_process_with_signal(child_pid, 9);

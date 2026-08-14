@@ -1008,15 +1008,44 @@ ad-hoc trailing pairs are gone; the return to EL0 is still synchronized because
 `map_user_page` ends in `flush_tlb_page` and Pass C in `flush_tlb_range`, and
 both of those end in `dsb ish; isb`.
 
-**What the test can and cannot show.** Barrier ordering is not observable under
-QEMU TCG, which has a coherent I-cache — no boot test can fail on this. What is
-observable, and was untested, is the **call shape**: the existing
-`icache_sync_rewrites_code` passes `len = 8`, so nothing ever executed code from
-outside the first 64-byte line, while the fault path maintains a whole page and
-then jumps to an arbitrary offset in it. `icache_sync_whole_page_offsets` runs
-stubs at `0x800` and `PAGE_SIZE - 8`, twice each, maintaining the whole page —
-it catches a wrong length or a wrong line walk, and it is honest about not
-catching a wrong barrier position.
+**This is real hardware, not an emulator.** `scripts/cargo_runner.sh` defaults
+`HVF=auto`, which on Darwin/arm64 selects `-accel hvf -cpu host`, so the guest's
+vCPUs are Apple Silicon cores and every `dc cvau` / `ic ivau` / `dsb` / `isb`
+above executes natively at EL1 with the hardware's own semantics. Apple's I-cache
+is **not** coherent with the D-cache — which is the entire reason this maintenance
+sequence exists here, and why `icache_sync_rewrites_code` exists as a regression
+test for the "x8 race" (`AKUMA_SELF_HOSTING.md` §7j: code bytes still dirty in the
+D-cache, `ic ivau` refilling the I-cache from a stale Point of Unification,
+surfacing as a corrupted `mov x8, #imm` → wrong syscall number → SIGSEGV,
+intermittently and only under load). So F4 was **not** a theoretical ordering
+tidy-up: at `-smp N` a peer core could observe a frame published to
+`file_page_cache` — with `icache_done: true`, so it does no maintenance of its own
+— and fetch from it before the publishing core's `ic ivau` had completed
+inner-shareable. That is the same defect class as the x8 race, one publication
+earlier.
+
+**What the test can and cannot show.** Single-PE visibility is genuinely tested:
+`icache_sync_whole_page_offsets` writes instructions through the D-cache and then
+executes them on a real core, twice per offset so the second round reuses a
+physical line the first round populated. That was a live coverage hole — the
+existing `icache_sync_rewrites_code` passes `len = 8`, so nothing ever executed
+code from outside the *first 64-byte line*, while the fault path maintains a whole
+page and then jumps to an arbitrary offset in it. A wrong length or a wrong line
+walk now fails on hardware that will actually notice.
+
+What no boot test here pins is the **cross-PE ordering** F4 is really about. That
+window is a few instructions wide on the publishing core and needs a peer to fetch
+inside it, so it is a race to provoke, not an invariant to assert — which is an
+argument for the structural fix (one `sync_icache_range`, ordering impossible to
+get wrong per site) rather than for a flaky test.
+
+> An earlier draft of this section said barrier ordering "is not observable under
+> QEMU TCG, which has a coherent I-cache". **Both halves were wrong for this
+> tree**: the runner defaults to HVF, not TCG, and the reason the hazard is hard
+> to test is that it is a narrow cross-core race — not that the platform is
+> immune to it. Recorded rather than silently edited, because that mistake
+> understates F4's severity, and a reader who believed it would conclude the fix
+> was cosmetic.
 
 ### 11.2 F5 — retired: the claim was already true
 

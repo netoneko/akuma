@@ -5765,6 +5765,32 @@ static NEON_TEST_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 /// Test: NEON registers survive voluntary yields.
 ///
+/// One thread of the FPCR-preservation test: set the rounding mode to `fpcr_val`
+/// and re-read it across 30 yields, counting every yield that came back with a
+/// different mode.
+///
+/// FPCR is the *control* half of the NEON state — a kernel that saves the Q
+/// registers but not FPCR passes [`neon_yield_thread`] and fails here, which is why
+/// this is a separate test rather than more assertions in that one. Only bits 23:22
+/// (RMode) are compared; the rest of FPCR is not under test.
+fn fpcr_rmode_thread(fpcr_val: u64, done: &'static AtomicBool) -> ! {
+    let mut errors: u32 = 0;
+    unsafe { core::arch::asm!("msr fpcr, {}", in(reg) fpcr_val); }
+
+    for _ in 0..30 {
+        threading::yield_now();
+        let mut read_back: u64;
+        unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) read_back); }
+        if (read_back & (3 << 22)) != (fpcr_val & (3 << 22)) {
+            errors += 1;
+        }
+    }
+    if errors > 0 { NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed); }
+    done.store(true, Ordering::Release);
+    threading::mark_current_terminated();
+    loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
+}
+
 /// One thread of [`test_neon_regs_across_yield`]: fill **Q0-Q3** with `pattern`,
 /// yield 50 times, and count every yield that came back with a register changed.
 ///
@@ -5976,47 +6002,13 @@ fn test_fpcr_fpsr_across_yield() -> bool {
     F_DONE_B.store(false, Ordering::SeqCst);
 
     // Thread A: FPCR rounding mode = Round to Nearest (RMode=00, bits 23:22)
-    match threading::spawn_fn(|| {
-        let fpcr_val: u64 = 0 << 22; // RN
-        let mut errors: u32 = 0;
-        unsafe { core::arch::asm!("msr fpcr, {}", in(reg) fpcr_val); }
-
-        for _ in 0..30 {
-            threading::yield_now();
-            let mut read_back: u64;
-            unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) read_back); }
-            if (read_back & (3 << 22)) != (fpcr_val & (3 << 22)) {
-                errors += 1;
-            }
-        }
-        if errors > 0 { NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed); }
-        F_DONE_A.store(true, Ordering::Release);
-        threading::mark_current_terminated();
-        loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
-    }) {
+    match threading::spawn_fn(|| fpcr_rmode_thread(0 << 22, &F_DONE_A)) {
         Ok(_) => {}
         Err(e) => { crate::safe_print!(64, "  Spawn A failed: {}\n", e); return false; }
     }
 
     // Thread B: FPCR rounding mode = Round towards Plus Infinity (RMode=01)
-    match threading::spawn_fn(|| {
-        let fpcr_val: u64 = 1 << 22; // RP
-        let mut errors: u32 = 0;
-        unsafe { core::arch::asm!("msr fpcr, {}", in(reg) fpcr_val); }
-
-        for _ in 0..30 {
-            threading::yield_now();
-            let mut read_back: u64;
-            unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) read_back); }
-            if (read_back & (3 << 22)) != (fpcr_val & (3 << 22)) {
-                errors += 1;
-            }
-        }
-        if errors > 0 { NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed); }
-        F_DONE_B.store(true, Ordering::Release);
-        threading::mark_current_terminated();
-        loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
-    }) {
+    match threading::spawn_fn(|| fpcr_rmode_thread(1 << 22, &F_DONE_B)) {
         Ok(_) => {}
         Err(e) => { crate::safe_print!(64, "  Spawn B failed: {}\n", e); return false; }
     }

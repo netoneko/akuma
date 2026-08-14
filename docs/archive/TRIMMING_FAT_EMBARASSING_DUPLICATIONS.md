@@ -1517,10 +1517,10 @@ ELF-loading path into one.
 | 3 | ~~`akuma-isolation`/`akuma-vfs` `mount.rs` → shared half into `akuma-vfs`~~ **DONE 2026-08-13** — one `MountSet<const MAX>`, both names as type aliases, −145 code lines across 4 files; the bin crate's third path normaliser went with it (§4) | 0 left | — | — |
 | 4 | ~~The `X`/`X_from_path` **quartet**~~ **DONE 2026-08-13** — `elf/mod.rs` ×3 in Phase 2a (−151 code lines, 12 clone blocks → 0), `process/mod.rs` + `process/image.rs` in Phase 2b (−105 code lines, the pairs' 60- and 47-line clone blocks → absent) | 0 left | — | — |
 | 5 | `exceptions.rs` duplicated `Drop` impls — **misdescribed on both counts, see [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §7**: there are **three** guards (`:3511`, `:3716`, `:4348`), their `Drop` bodies are byte-identical and 6 lines each, so the guard merge is ~24 lines. The `~142` was measuring the **demand-paging bodies** the guards sit at the top of (DA `:3708-4086` vs IA `:4337-4659`, ~330 lines) — a separate, genuinely high-risk merge with two *behavioural* divergences (§6 there) | ~24 + ~330 | small / large | low / **high** |
-| 6 | `box_mod` `access.rs` / `hierarchy.rs` — **misdescribed, see §4**: the two *functions* share nothing; the byte-identical thing is `make_test_registry()` in both test modules. Folds into item 9 | ~60 (tests) | small | low |
+| 6 | ~~`box_mod` `access.rs` / `hierarchy.rs`~~ **DONE 2026-08-14** with item 9 — one `#[cfg(test)] pub(crate) make_test_registry()` in `box_mod/mod.rs`, both test modules importing it. As §4 predicted, it was the *fixture* and not the two named functions | 0 left | — | — |
 | 7 | ~~`rump_proxy.rs` / `akuma-rump` `sysproxy.rs`~~ **DONE 2026-08-13** — 3 impls → 1 `pub NoMem` with `faulting()`/`discarding()`; there was no home to settle (§4). Also closes Phase 4's `ClientMem`/`NoMem` row | 0 left | — | — |
 | 8 | `mmu/mod.rs` `map_user_page` / `_no_flush` and the three walk clones | ~80 | medium | **high** — see `UNSAFE_AUDIT.md` §5.1 |
-| 9 | Test-file clones (`tests.rs`, `process_tests.rs`) | ~669 | medium | low |
+| 9 | ~~Test-file clones (`tests.rs`, `process_tests.rs`)~~ **DONE 2026-08-14** — 11 clone families → 11 helpers, absorbing item 6. CPD test-only blocks **17 → 1**; the one left is declined with a reason. Host tests unchanged at 508 and boot tests unchanged at 275/282: every merge extracted a *helper*, none collapsed a test. **The row's framing was wrong** — the duplication is not *between* the two files (they share no identically-named function); all 17 blocks were within-file. Found and fixed two real defects on the way. See §10 | 0 left | — | — |
 | 12 | ~~Runtime-registration machinery (§5.8)~~ **DONE 2026-08-13** — one `akuma_primitives::Registered<T>`; 3 definitions → 1 and **21 spinlock acquisitions removed** from `akuma-net`'s poll/socket paths. Line count a wash; judge it on the locks | 0 left | — | — |
 | 11 | **Errno spellings (§5.7)** — three tables (17 names defined twice, in two representations) + 109 raw negative literals. Run with the Phase 5 syscall sweep | ~130 sites | medium | low |
 | 13 | **`#[inline]` audit (§5.10)** — deferred by request 2026-08-13. Both directions: missing attrs on cross-crate hot paths (`[profile.release]` sets no `lto`), and 33 `#[inline(always)]` fighting the `extreme-size` floor. Judge on IMAGE size + a microbenchmark, not counts | ~700 fns surveyed | medium | low |
@@ -2145,6 +2145,107 @@ Baseline to compare against, 2026-08-12 on a clean tree:
 ```
 
 ---
+
+## 10. Items 9 + 6 — the test-file clones (2026-08-14)
+
+### What the row got wrong
+
+**Item 9 names two files as if the duplication were between them. It is not.**
+`src/tests.rs` and `src/process_tests.rs` share **zero** identically-named
+top-level functions, and every one of CPD's 17 test-only blocks had both sites in
+the *same* file. The row reads as "these two files are copies of each other";
+what it actually measured is two large files that each repeat themselves. That
+matters for how you work it — there is no cross-file home to settle, only eleven
+local fixtures to name.
+
+The `~669` is also not a thing that can be "removed": it is CPD's *covered* line
+count across test files at 50 tokens, which counts every instance of every block.
+Removable at 100 tokens was **397**, and 397 is what got worked.
+
+### What was collapsed
+
+Eleven families, all replaced by a named helper rather than a merged test:
+
+| clone | sites | now |
+|---|---:|---|
+| `*at()` syscall fixture (cwd=`/tmp`, fd 7 → `sub`, `BYPASS_VALIDATION`) | 5 | `register_at_syscall_process` / `unregister_at_syscall_process` |
+| `cstr()` NUL-terminating closure | 5 | one `cstr` fn |
+| `*at()` tree clean-slate + teardown | 10 | `clean_at_test_tree(root, &LEFTOVERS)` |
+| boot-TTBR0 page-table teardown walk | 4 | `clear_boot_ttbr0_pte(va, PtClear)` |
+| free-thread-slot scan (msgqueue) | 4 | `find_free_thread_slots(n)` |
+| eager-mmap region fixture | 3 | `alloc_eager_region` |
+| NEON Q0-Q3 / Q4-Q7 thread bodies | 2+2 | `neon_yield_thread`, `neon_preempt_thread` |
+| FPCR rounding-mode thread body | 2 | `fpcr_rmode_thread` |
+| BKL spawn-storm phase + wait-by-holder report | 2+2 | `bkl_spawn_storm_spins`, `print_bkl_wait_by_holder` |
+| parent/child (+ channel) process fixtures | 3+2 | `register_parent_and_child`, `register_parent_child_with_channel` |
+| thread-group-of-three fixture | 2 | `register_thread_group_of_three` |
+| deferred-free AS fixture | 2 | `new_as_with_one_mapped_page` |
+| `make_test_registry` (**item 6**) | 2 | one `pub(crate)` fixture in `box_mod/mod.rs` |
+
+CPD at 100 tokens: **67 → 50** blocks tree-wide, **17 → 1** test-only, removable
+test lines **397 → 12**.
+
+### Two real defects, both the "the fix lives in one copy" shape
+
+Neither was the point of the task; both are the reason the task is worth doing.
+
+1. **Three of four boot-TTBR0 teardowns cleared only the L3 entry** — and then
+   freed the page-table frames `map_user_page` had returned. Exactly one copy
+   (`test_map_user_page_roundtrip`) also cleared L2 and L1, and carried the comment
+   saying why: otherwise the boot L1 keeps pointing at a freed L2, and when that
+   frame is reused as a new `UserAddressSpace`'s L1 the boot `TTBR0` aliases the new
+   address space's tables and later tests take spurious translation faults. The
+   other three had the hazard and no comment. All four now go through
+   `clear_boot_ttbr0_pte`, and the depth is an explicit `PtClear` argument because
+   one caller genuinely needs `LeafOnly` — it unmaps eight pages sharing one L3
+   table, so cutting the branch on page 0 would strand the other seven. That
+   caller now clears its leaves, then cuts the branch once.
+2. **`test_openat`'s teardown removed two files its setup did not.** The symlink
+   case creates `link.txt`/`target.txt`; the clean-slate block at the top never
+   knew about them, so a crashed run left that case's inputs in place for the next
+   boot. One `LEFTOVERS` list per test now, used by both calls, so they cannot
+   drift again.
+
+### Differences found between copies, and the decision for each
+
+- **NEON Q0-Q3 vs Q4-Q7** — kept as two helpers, not one parameterised body.
+  `asm!` register names cannot be parameters, but the real reason is coverage: the
+  two banks are saved by different code paths, and folding them would quietly halve
+  what the tests watch.
+- **`test_crash_goroutine_exit_kills_group` names its parent** — excluded from
+  `register_parent_and_child`. The surviving name is what that test asserts on, so
+  the fixture *is* the assertion there.
+- **`bkl_spawn_storm_spins`'s `args`** were computed inside the per-copy loop in the
+  fault test though loop-invariant; hoisted.
+- **Comment asymmetry, again.** `test_unlinkat` and `test_openat` carried the
+  load-bearing note about `BYPASS_VALIDATION` and `copy_from_user_str`; the other
+  three `*at()` tests carried only "same shape as test_unlinkat". The reasoning now
+  lives once, on `register_at_syscall_process`.
+- **Two `*at()` teardowns ordered `unregister_process`/`unregister_thread_pid`
+  differently from a neighbouring non-`*at()` test.** The five agreed with each
+  other, so the helper took their order; the neighbour was left alone.
+
+### Declined, with a reason
+
+`pthread_tests.rs:695/739` — the four-line reset of a two-worker test's
+`(tid, done)` statics. The statics must be declared per test, so only the reset is
+shareable; the third site's shape differs (`A_READY`/`B_READY` plus a `FINISH`
+flag). The helper would be `reset_worker_slots([&A_TID, &B_TID], [&A_DONE,
+&B_DONE])` — noisier at the call site than the two obvious stores it replaces, for
+~6 net lines, at 107 tokens (barely over threshold). This is §5.5's "noise — do not
+chase" tail, and leaving it is the finding: not every CPD block is worth a seam.
+
+### Verification
+
+`scripts/verify_trim.py` A/B against `075ee16f` (the commit before this whole body
+of work). Diff is four lines, all from the *previous* change: `host.tests` 506→508
+and `passed_marker` +2 at both SMP levels, both of which are `COW_PILE_AUDIT.md`
+§11's new tests, plus `smp4.bkl_stuck` 93→96 (load noise). **Items 9 and 6 moved no
+counter at all** — 4/4 clippy configs clean, `fail_set: (empty)` at SMP=1 and
+SMP=4, `host_timejumps: 0` on all four boots, `pass_marker: 95`, and all six Tier 3
+exercises `ok`. That zero is the result: the constraint was that a test-clone merge
+must not cost coverage, and the way to satisfy it is to extract helpers rather than
+parameterise tests together.
 
 ## Background
 
