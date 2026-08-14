@@ -185,6 +185,33 @@ actually justify the setting:
    constraint the choice was made on, measured only by host-side proxy. If it
    fails at the link step, the answer is a separate `release-lto` profile, not
    reverting — see §4.
+
+   **Attempted 2026-08-14 and BLOCKED — by something unrelated to LTO.** A
+   devbox-smoltcp self-host run at **1024 MB** under `lto = "thin"` produced two
+   rustc ICEs (`decode error: Expected header tag [79, 68, 72, 84]`, i.e. `ODHT`,
+   `but found [0, 0, 0, 0]` — zeros where a dependency's metadata should be, in
+   `zerocopy-derive` and `enumn`, two parallel proc-macro jobs, within one second
+   of each other) and then a `Segmentation fault`. A later run **hung** after
+   `akuma-exec` finished: `cargo build --release -p akuma` alive with **no `rustc`
+   child process at all**, no progress.
+
+   **LTO is not the cause of the hang** — it reproduces with the `lto` key
+   commented out. The hang is the known self-host wedge shape
+   (`../runbooks/selfhost-kernel-build.md` §5.1). The ICE is unattributed: it has
+   the shape of a *read* returning zeros under memory pressure rather than a
+   corrupt file, but that was not established (see the method warning below).
+
+   So this item is still open, and it is now **blocked on the self-host wedge**,
+   not on a measurement anyone can just take.
+
+   > **Method warning, learned the hard way in that session.** Do **not** test a
+   > guest-built rlib for corruption with `grep -c ODHT`. That tag is not stored
+   > literally in artifacts produced by the guest toolchain: its **own sysroot**
+   > `libcore.rlib` — known-good by definition — also scores 0. A scan using it
+   > reported "112 of 112 artifacts corrupt", including a 5 KB file, on a build
+   > whose crates had demonstrably read each other's metadata successfully.
+   > Establish the control **on an artifact from the same toolchain** before
+   > believing any corruption test.
 2. **Measure the speed win** (§5.2), timed with the
    `PSTATS_TIMING_PREEMPTION_ARTIFACT` method rather than PSTATS, on a path that
    demonstrably lost a real call — the signal frame's `save_regs`/`restore_regs`

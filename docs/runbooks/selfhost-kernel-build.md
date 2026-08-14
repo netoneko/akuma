@@ -403,6 +403,42 @@ parse the last `[FUTEX-DUMP]` block out of the serial log and treat any
 `queued_for=(\d+)us` over ~300 s as wedged. That fires in minutes instead of
 burning the 90-minute timeout.
 
+### 5.3a The hang with **no `rustc` running** — check the process table first
+
+Observed 2026-08-14 on devbox-smoltcp: the build stopped after
+`akuma-exec (lib) generated 4 warnings`, and the guest showed
+
+```
+  PID  PPID STAT COMMAND
+  334     ? RW   /usr/local/bin/cargo build --release -p akuma --manifest-path /tmp/akuma/Cargo.toml
+  335     ? RW   {futures-timer} /usr/local/bin/cargo build ...
+  337     ? RW   /usr/local/bin/cargo build ...
+```
+
+— **cargo alive, and not one `rustc` process.** That distinguishes the two wedge
+families in one command, so run it before anything else:
+
+| What `ps` shows | What it means |
+|---|---|
+| `rustc` present, burning CPU | a slow or looping *compile* — not this class; check `[FSCACHE]` and memory |
+| `rustc` present, idle | the lost-wakeup deadlock, §5.1 |
+| **no `rustc` at all**, cargo alive | cargo is waiting on a child that is gone — the orphan/reaping class. `wait4` never returns, or the child died without cargo being woken |
+
+Do not diagnose this from the guest alone — read the kernel console for the
+`[KTG]`/`[TERM]`/`[Cleanup]` lines around the last successful crate, per §5.3.
+
+**Not caused by `lto = "thin"`** (added to `[profile.release]` the same day): it
+reproduces with that key commented out. Same session also saw two rustc ICEs at
+**1024 MB** — `decode error: Expected header tag [79, 68, 72, 84] ... found
+[0, 0, 0, 0]`, zeros where a dependency's metadata should be, in two parallel
+proc-macro jobs a second apart, followed by `Segmentation fault`. Unattributed;
+it has the shape of a *read* serving zeros under memory pressure rather than a
+corrupt file on disk, but that was never established.
+[`../archive/LTO_RELEASE_PROFILE.md`](../archive/LTO_RELEASE_PROFILE.md) §5.1
+carries the detail, including a corruption test that looked conclusive and was
+not — `grep -c ODHT` scores **0 on the guest toolchain's own known-good
+`libcore.rlib`**, so it cannot tell a corrupt artifact from a healthy one.
+
 ### 5.4 A 0-byte artifact will block one crate forever
 
 A crash mid-link leaves a **0-byte `build-script-build`** that cargo still
