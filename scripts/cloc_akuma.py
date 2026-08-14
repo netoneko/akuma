@@ -31,10 +31,29 @@ bare metal, not under ``cargo test``); it is gated on the absence of the
 ``no-tests`` feature. That gate is therefore treated as a test gate too. Pass
 ``--no-kernel-test-gate`` to count those lines as production instead.
 
+``--rev`` counts a git revision's tree instead of the working tree, and ``--vs``
+prints a production/test delta between two of them. That pair exists because the
+obvious way to ask "did the refactor cut code?" — eyeball two numbers, or count
+`.rs` lines with grep — gets the answer *backwards* on this repo. Extracting a
+subsystem into a host-testable crate moves its `#[cfg(test)] mod tests` from a
+`*_tests.rs` file into `crates/<name>/src/lib.rs`, so any counter that splits
+prod from test **by filename** re-labels hundreds of test lines as production.
+The `akuma-pmm` extraction (`eb19f23`) reads as **+501 production lines** that
+way and **+221** once the inline test module is attributed correctly — the same
+commit, off by more than 2x. This script's scanner already gets that right; the
+only thing missing was being able to point it at two commits.
+
+The published numbers this feeds live in ``docs/archive/LINE_COUNT_ANALYSIS.md``,
+which is a *living* document — re-measure and rewrite it in place rather than
+appending a new snapshot.
+
 Usage:
     scripts/cloc_akuma.py                      # defaults to src/ crates/
     scripts/cloc_akuma.py src crates --by-file
     scripts/cloc_akuma.py --json
+    scripts/cloc_akuma.py --rev HEAD~5         # count a revision's tree
+    scripts/cloc_akuma.py --vs main            # delta: main -> working tree
+    scripts/cloc_akuma.py --rev HEAD --vs HEAD~1   # delta across one commit
 """
 
 from __future__ import annotations
@@ -496,7 +515,10 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
 def count_file(path: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> FileCount:
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         text = fh.read()
+    return count_text(text, relpath, spec, kernel_gate)
 
+
+def count_text(text: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> FileCount:
     nlines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
     code, comment, test, inner_test = scan(text, spec, kernel_gate)
 
@@ -544,6 +566,99 @@ def walk(paths: list, kernel_gate: bool):
                     continue
                 files.append(count_file(full, full, spec, kernel_gate))
     return files, ignored
+
+
+def walk_rev(paths: list, kernel_gate: bool, rev: str):
+    """Same as `walk`, but reads a git revision's tree instead of the checkout.
+
+    Uses `git ls-tree`/`git show` rather than a temporary checkout so it never
+    touches the working tree — the whole point is to compare "before the refactor"
+    against uncommitted work in progress.
+    """
+    import subprocess
+
+    listing = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", rev],
+        capture_output=True, text=True,
+    )
+    if listing.returncode != 0:
+        raise SystemExit(f"error: cannot read revision {rev!r}: "
+                         f"{listing.stderr.strip()}")
+
+    prefixes = tuple(p.rstrip(os.sep) for p in paths)
+    files: list = []
+    ignored = 0
+    for rel in listing.stdout.splitlines():
+        if not rel.startswith(prefixes) and rel not in prefixes:
+            continue
+        parts = rel.split(os.sep)
+        if any(p in SKIP_DIRS or p.startswith(".") for p in parts[:-1]):
+            continue
+        spec = EXT_LANGS.get(os.path.splitext(rel)[1])
+        if spec is None:
+            ignored += 1
+            continue
+        blob = subprocess.run(["git", "show", f"{rev}:{rel}"],
+                              capture_output=True, text=True, errors="replace")
+        if blob.returncode != 0:
+            continue
+        files.append(count_text(blob.stdout, rel, spec, kernel_gate))
+    return files, ignored
+
+
+def print_delta(old_files: list, new_files: list, old_label: str, new_label: str) -> None:
+    """Production/test deltas, whole-tree and per component.
+
+    Production code is the headline because it is the number a refactor claims to
+    move; test code and comments are shown beside it because on this repo they are
+    usually where the growth actually went, and reporting prod alone invites the
+    "we cut nothing" misreading.
+    """
+    def agg_by_comp(files):
+        out: dict = {}
+        for fc in files:
+            out.setdefault(component_of(fc.path), Agg()).add(fc)
+        return out
+
+    old_total, new_total = Agg(), Agg()
+    for fc in old_files:
+        old_total.add(fc)
+    for fc in new_files:
+        new_total.add(fc)
+    old_comp, new_comp = agg_by_comp(old_files), agg_by_comp(new_files)
+
+    W = 79
+    print(rule(W))
+    print(f"Delta: {old_label}  ->  {new_label}")
+    print(rule(W))
+    print(f"{'Bucket':<24}{old_label[:11]:>13}{new_label[:11]:>13}{'delta':>11}")
+    print(rule(W))
+    for label, attr in (("Production code", "code"),
+                        ("Test code", "test_code"),
+                        ("Comments", "total_comment"),
+                        ("Files", "files")):
+        o, n = getattr(old_total, attr), getattr(new_total, attr)
+        print(f"{label:<24}{o:>13}{n:>13}{n - o:>+11}")
+    print(rule(W))
+
+    print()
+    print(rule(W))
+    print(f"{'Component':<32}{'prod code':>13}{'delta':>10}{'test delta':>12}")
+    print(rule(W))
+    rows = []
+    for comp in sorted(set(old_comp) | set(new_comp)):
+        o = old_comp.get(comp, Agg())
+        n = new_comp.get(comp, Agg())
+        if o.code == n.code and o.test_code == n.test_code:
+            continue
+        rows.append((n.code - o.code, comp, n.code, n.test_code - o.test_code))
+    for d, comp, now, td in sorted(rows):
+        print(f"{comp:<32}{now:>13}{d:>+10}{td:>+12}")
+    print(rule(W))
+    print("A component that grew in `prod code` while shrinking overall usually "
+          "gained\nan inline #[cfg(test)] module — check `test delta` beside it "
+          "before concluding\nthe refactor added production code.")
+    print(rule(W))
 
 
 def component_of(relpath: str) -> str:
@@ -741,18 +856,36 @@ def main() -> int:
         action="store_true",
         help='count #[cfg(not(any(feature = "no-tests", ...)))] items as production code',
     )
+    ap.add_argument("--rev", help="count this git revision's tree instead of the working tree")
+    ap.add_argument("--vs", metavar="REV",
+                    help="also count REV and print the delta REV -> (--rev or working tree)")
     args = ap.parse_args()
 
     paths = args.paths or ["src", "crates"]
-    missing = [p for p in paths if not os.path.exists(p)]
-    if missing:
-        print(f"error: no such path: {', '.join(missing)}", file=sys.stderr)
-        return 1
+    kernel_gate = not args.no_kernel_test_gate
 
-    files, ignored = walk(paths, kernel_gate=not args.no_kernel_test_gate)
+    if args.rev:
+        files, ignored = walk_rev(paths, kernel_gate, args.rev)
+        label = args.rev
+    else:
+        missing = [p for p in paths if not os.path.exists(p)]
+        if missing:
+            print(f"error: no such path: {', '.join(missing)}", file=sys.stderr)
+            return 1
+        files, ignored = walk(paths, kernel_gate)
+        label = "working tree"
+
     if not files:
         print("error: no recognised source files found", file=sys.stderr)
         return 1
+
+    if args.vs:
+        old_files, _ = walk_rev(paths, kernel_gate, args.vs)
+        if not old_files:
+            print(f"error: no recognised source files at {args.vs}", file=sys.stderr)
+            return 1
+        print_delta(old_files, files, args.vs, label)
+        print()
 
     if args.json:
         emit_json(files, paths)

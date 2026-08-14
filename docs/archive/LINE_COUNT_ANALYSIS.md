@@ -3,7 +3,9 @@
 **This is a living document, not a historical record.** Unlike most of
 `docs/archive/`, the numbers and analysis below are kept current — re-measured
 and rewritten in place whenever the tree changes enough to matter, most
-recently 2026-08-10. It's used as a real competitive comparison against other
+recently **2026-08-14** (top-line only — see the re-measurement block below;
+the per-area table is still the 2026-08-10 figure). It's used as a real
+competitive comparison against other
 kernels, so stale numbers here aren't "history," they're just wrong. Past
 snapshots (the original 2026-08-07 measurement at commit `d3f28d6`, the
 2026-08-10 in-kernel-SSH/shell/editor removal, the 2026-08-10 multikernel
@@ -19,6 +21,56 @@ readings of the numbers survive contact with context. Several don't.
 Companion doc: the profile/image-size half of this investigation — what a
 profile's *bytes* cost, which is a different question with a different answer —
 lives in [`reference/build-profiles.md`](../reference/build-profiles.md).
+
+> ## Re-measured 2026-08-14, branch `trim-some-more-fat`, commit `9f7110b`
+>
+> ```
+> scripts/cloc_akuma.py --vs ebfb73f       # the --vs/--rev flags were added for this
+> ```
+>
+> | bucket | `ebfb73f` (2026-08-10) | `9f7110b` (2026-08-14) | delta |
+> |---|---:|---:|---:|
+> | **Production code** | 38,579 | **39,021** | **+442** |
+> | Test code | 24,680 | 26,630 | +1,950 |
+> | Comments | 22,073 | 25,063 | +2,990 |
+> | Files | 131 | 149 | +18 |
+>
+> **Production code went UP 442 lines (+1.1%) across a period of work called
+> "trim the fat", and that is not a contradiction.** The accounting:
+>
+> | | prod code |
+> |---|---:|
+> | three new extracted crates (`akuma-pmm` 1,039, `akuma-virtio` 858, `akuma-primitives` 513) | **+2,410** |
+> | the components they were extracted *from* (`src` −1,670, `akuma-exec` −467, `akuma-net` −105, `akuma-rump` −10) | **−2,252** |
+> | genuinely new code in existing components (`akuma-isolation` +235, `src/syscall` +24, `akuma-vfs` +21, …) | **+284** |
+> | **net** | **+442** |
+>
+> So **extraction cost +158 lines across 2,252 moved** — about 7%, which is the
+> `Cargo.toml` / `lib.rs` / public API / runtime-injection glue a standalone
+> `no_std` crate needs, plus the forwarding shim left behind (`src/pmm.rs` is now
+> 153 lines that used to be 898). The other +284 is real new production code and
+> was never a refactor.
+>
+> **Beware the filename-based prod/test split — it gets this backwards.** Counting
+> production as "everything not in `*_tests.rs`/`tests/`" reports the `akuma-pmm`
+> extraction as **+501 production lines**; attributing its inline
+> `#[cfg(test)] mod tests` correctly gives **+221**. Extraction into a
+> host-testable crate is exactly the move that relocates test code *into* a
+> production-named file, so a naive counter reads a test-coverage win as
+> production bloat. [`scripts/cloc_akuma.py`](../../scripts/cloc_akuma.py) has
+> always handled this (it evaluates `cfg` predicates rather than trusting
+> filenames); what it lacked, and now has, is `--rev`/`--vs` so the comparison can
+> be made at all without checking out two trees.
+>
+> The real story of this period is the bottom two rows of the first table: **test
+> code +1,950 and comments +2,990 against production +442.** Extracting
+> `pmm`/`primitives`/`virtio` into host-testable crates is what bought those, and
+> it is what the work was for.
+>
+> **The per-area table and the ratios below are still the `ebfb73f` measurement**
+> and have not been re-derived — the area groupings are file-pattern based and
+> three new crates need placing. Treat the body's `38,579` / `24,680` as the
+> 2026-08-10 snapshot until that is redone.
 
 **Measured 2026-08-10, branch `better-sshd-and-networking`, commit `ebfb73f`**
 (`scripts/cloc_akuma.py src crates`).
