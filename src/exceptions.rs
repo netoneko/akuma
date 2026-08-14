@@ -673,25 +673,19 @@ mod esr {
 const SA_SIGINFO: u64 = 4;
 const SA_ONSTACK: u64 = 0x08000000;
 const SA_NODEFER: u64 = 0x40000000;
-// siginfo_t: 128 bytes
-// ucontext_t header (uc_flags..uc_sigmask + __unused): 168 bytes
-// sigcontext (fault_address + regs[31] + sp + pc + pstate): 280 bytes
-// FPSIMD extension record: _aarch64_ctx(8) + fpsr(4) + fpcr(4) + vregs[32](512) = 528 bytes
-// Null terminator _aarch64_ctx{0,0}: 8 bytes
-// AArch64 rt_sigframe layout (matches Linux kernel):
-// siginfo_t:   128 bytes
-// ucontext_t:  176 bytes header (uc_flags, uc_link, uc_stack, uc_sigmask, _pad, _pad2)
-// sigcontext:  280 bytes (fault_address, regs[31], sp, pc, pstate, __reserved[8])
-// FPSIMD:      528 bytes (_aarch64_ctx header + fpsr + fpcr + vregs[32])
-// Null term:   8 bytes
-const SIGFRAME_SIZE: usize = 128 + 176 + 280 + 528 + 8; // 1120 bytes
-const SIGFRAME_SIGINFO: usize = 0;
-const SIGFRAME_UCONTEXT: usize = 128;
-// uc_mcontext is at offset 176 within ucontext_t (not 168!)
-// Layout: uc_flags(8) + uc_link(8) + uc_stack(24) + uc_sigmask(8) + _pad(120) + _pad2(8) = 176
-const SIGFRAME_MCONTEXT: usize = SIGFRAME_UCONTEXT + 176; // 304
-const SIGFRAME_FPSIMD: usize = SIGFRAME_MCONTEXT + 280;   // 584
-const FPSIMD_MAGIC: u32 = 0x46508001;
+
+/// The `rt_sigframe` itself — `#[repr(C)]` types plus the offsets derived from them,
+/// which is where the layout comment that used to sit here now lives (including the
+/// two deliberate divergences from Linux's `sigcontext`). The literals below were the
+/// only definition until Phase 7; they are now re-exports, and any drift between the
+/// struct and them is a compile error inside that module.
+use akuma_exec::threading::sigframe;
+
+// `SIGFRAME_MCONTEXT`/`SIGFRAME_FPSIMD` are deliberately not imported here: the
+// struct owns those offsets now, and the only remaining users are the
+// `kernel_tests` re-exports below, which spell them out. Importing them made the
+// three `no-tests` profiles fail on an unused import.
+use sigframe::{FPSIMD_MAGIC, SIGFRAME_SIGINFO, SIGFRAME_SIZE, SIGFRAME_UCONTEXT};
 
 // Exposed for kernel layout tests.
 #[cfg(kernel_tests)]
@@ -699,12 +693,12 @@ pub const TEST_SIGFRAME_SIZE: usize = SIGFRAME_SIZE;
 #[cfg(kernel_tests)]
 pub const TEST_SIGFRAME_UCONTEXT: usize = SIGFRAME_UCONTEXT;
 #[cfg(kernel_tests)]
-pub const TEST_SIGFRAME_MCONTEXT: usize = SIGFRAME_MCONTEXT;
+pub const TEST_SIGFRAME_MCONTEXT: usize = sigframe::SIGFRAME_MCONTEXT;
 #[cfg(kernel_tests)]
-pub const TEST_SIGFRAME_FPSIMD: usize = SIGFRAME_FPSIMD;
+pub const TEST_SIGFRAME_FPSIMD: usize = sigframe::SIGFRAME_FPSIMD;
 /// Byte offset of uc_sigmask within the signal frame (ucontext_t + 40).
 #[cfg(kernel_tests)]
-pub const TEST_SIGFRAME_UC_SIGMASK: usize = SIGFRAME_UCONTEXT + 40;
+pub const TEST_SIGFRAME_UC_SIGMASK: usize = sigframe::SIGFRAME_UC_SIGMASK;
 
 /// Log when a per-page demand-paging slot had to be reclaimed from a previous
 /// holder. A `Dead` cause is the smoking gun for the build-script deadlock
@@ -2097,118 +2091,100 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     }
     if last_page != first_page { ensure_cow_page_writable(pid, last_page); }
 
-    unsafe {
-        let base = new_sp as *mut u8;
-        core::ptr::write_bytes(base, 0, SIGFRAME_SIZE);
+    // Build the whole frame on the kernel stack, then copy it out once. The
+    // `#[repr(C)]` layout and every offset in it are checked at compile time in
+    // `akuma_exec::threading::sigframe`; what used to be ~130 `write(base.add(N))`
+    // calls straight into user memory is now field assignment plus one copy.
+    let mut sf = sigframe::RtSigFrame::zeroed();
 
-        // siginfo_t
-        let si = base.add(SIGFRAME_SIGINFO);
-        core::ptr::write(si.add(0).cast::<i32>(), signal as i32);   // si_signo
-        core::ptr::write(si.add(4).cast::<i32>(), 0i32);            // si_errno = 0
-        const CLD_EXITED: i32 = 1;
-        const CLD_KILLED: i32 = 2;
-        if signal == 17 /* SIGCHLD */ {
-            // Fill the `_sigchld` union. On LP64 the union is 8-byte aligned, so
-            // it starts at offset 16 (si_addr's slot) — si_pid=16, si_uid=20,
-            // si_status=24. The payload was stashed by `raise_sigchld_for_parent`
-            // in the per-thread `LAST_SIGCHLD` side-channel; peek (not take) so a
-            // signal that re-pends (SA_ONSTACK before sigaltstack) still finds it.
-            let (child_pid, raw_code) =
-                akuma_exec::threading::peek_last_sigchld(thread_slot).unwrap_or((0, 0));
-            // Negative raw_code ⇒ killed by signal (-raw_code); else clean exit.
-            let (si_code, si_status) = if raw_code < 0 {
-                (CLD_KILLED, -raw_code)
-            } else {
-                (CLD_EXITED, raw_code)
-            };
-            core::ptr::write(si.add(8).cast::<i32>(), si_code);
-            core::ptr::write(si.add(16).cast::<u32>(), child_pid);  // si_pid
-            core::ptr::write(si.add(20).cast::<u32>(), 0u32);       // si_uid (root)
-            core::ptr::write(si.add(24).cast::<i32>(), si_status);  // si_status
+    // siginfo_t
+    sf.info.si_signo = signal as i32;
+    sf.info.si_errno = 0;
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+    if signal == 17 /* SIGCHLD */ {
+        // Fill the `_sigchld` union arm. The payload was stashed by
+        // `raise_sigchld_for_parent` in the per-thread `LAST_SIGCHLD` side-channel;
+        // peek (not take) so a signal that re-pends (SA_ONSTACK before sigaltstack)
+        // still finds it.
+        let (child_pid, raw_code) =
+            akuma_exec::threading::peek_last_sigchld(thread_slot).unwrap_or((0, 0));
+        // Negative raw_code ⇒ killed by signal (-raw_code); else clean exit.
+        let (si_code, si_status) = if raw_code < 0 {
+            (CLD_KILLED, -raw_code)
         } else {
-            core::ptr::write(si.add(8).cast::<i32>(),               // si_code
-                i32::from(is_fault));                // SEGV_MAPERR=1, SI_USER=0
-            core::ptr::write(si.add(16).cast::<u64>(), fault_addr); // si_addr
-        }
+            (CLD_EXITED, raw_code)
+        };
+        sf.info.si_code = si_code;
+        // si_uid = 0: every process here runs as root.
+        sf.info.fields.chld = sigframe::SigchldFields::new(child_pid, 0, si_status);
+    } else {
+        sf.info.si_code = i32::from(is_fault); // SEGV_MAPERR=1, SI_USER=0
+        sf.info.fields.fault = sigframe::SigfaultFields { si_addr: fault_addr };
+    }
 
-        // ucontext.uc_stack (stack_t) — Go runtime reads this to determine
-        // whether the signal arrived on the sigaltstack.  All-zero confuses
-        // Go's panic recovery and can produce corrupted SP/PSTATE on sigreturn.
-        let uc = base.add(SIGFRAME_UCONTEXT);
-        let on_altstack = stack_top != user_sp;
-        core::ptr::write(uc.add(16).cast::<u64>(), alt_sp);                   // ss_sp
-        core::ptr::write(uc.add(24).cast::<i32>(),
-            i32::from(on_altstack));                          // ss_flags (SS_ONSTACK=1)
-        core::ptr::write(uc.add(32).cast::<u64>(), alt_size);                  // ss_size
-        // uc_sigmask — the mask `rt_sigreturn` will restore. Normally the current
-        // per-thread mask (NOT proc.signal_mask, which is shared across CLONE_THREAD
-        // siblings via the owner PID) — see docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D.
-        // If rt_sigsuspend armed a restore-mask, save THAT instead so sigreturn
-        // restores the pre-suspend mask (POSIX sigsuspend semantics, §7k.5).
-        let uc_sigmask_val = akuma_exec::threading::take_restore_sigmask()
-            .unwrap_or_else(akuma_exec::threading::thread_signal_mask);
-        core::ptr::write(uc.add(40).cast::<u64>(), uc_sigmask_val);            // uc_sigmask
+    // ucontext.uc_stack (stack_t) — Go runtime reads this to determine
+    // whether the signal arrived on the sigaltstack.  All-zero confuses
+    // Go's panic recovery and can produce corrupted SP/PSTATE on sigreturn.
+    let on_altstack = stack_top != user_sp;
+    sf.uc.uc_stack.ss_sp = alt_sp;
+    sf.uc.uc_stack.ss_flags = if on_altstack { sigframe::SS_ONSTACK } else { 0 };
+    sf.uc.uc_stack.ss_size = alt_size;
+    // uc_sigmask — the mask `rt_sigreturn` will restore. Normally the current
+    // per-thread mask (NOT proc.signal_mask, which is shared across CLONE_THREAD
+    // siblings via the owner PID) — see docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D.
+    // If rt_sigsuspend armed a restore-mask, save THAT instead so sigreturn
+    // restores the pre-suspend mask (POSIX sigsuspend semantics, §7k.5).
+    //
+    // This *takes* the armed mask, and the copy below can now fail where the old
+    // per-field writes could not — so a failed copy consumes it. That path declines
+    // delivery, which ends in the default action (termination for every signal that
+    // reaches it), so there is no thread left to restore the mask into.
+    sf.uc.uc_sigmask = akuma_exec::threading::take_restore_sigmask()
+        .unwrap_or_else(akuma_exec::threading::thread_signal_mask);
 
-        // mcontext_t (sigcontext) - Zeroed by write_bytes(base, 0, ...)
-        let mc = base.add(SIGFRAME_MCONTEXT);
-        core::ptr::write(mc.cast::<u64>(), fault_addr);
-        let regs_base = mc.add(8).cast::<u64>();
-        core::ptr::write(regs_base.add(0), frame_ref.x0);
-        core::ptr::write(regs_base.add(1), frame_ref.x1);
-        core::ptr::write(regs_base.add(2), frame_ref.x2);
-        core::ptr::write(regs_base.add(3), frame_ref.x3);
-        core::ptr::write(regs_base.add(4), frame_ref.x4);
-        core::ptr::write(regs_base.add(5), frame_ref.x5);
-        core::ptr::write(regs_base.add(6), frame_ref.x6);
-        core::ptr::write(regs_base.add(7), frame_ref.x7);
-        core::ptr::write(regs_base.add(8), frame_ref.x8);
-        core::ptr::write(regs_base.add(9), frame_ref.x9);
-        core::ptr::write(regs_base.add(10), frame_ref.x10);
-        core::ptr::write(regs_base.add(11), frame_ref.x11);
-        core::ptr::write(regs_base.add(12), frame_ref.x12);
-        core::ptr::write(regs_base.add(13), frame_ref.x13);
-        core::ptr::write(regs_base.add(14), frame_ref.x14);
-        core::ptr::write(regs_base.add(15), frame_ref.x15);
-        core::ptr::write(regs_base.add(16), frame_ref.x16);
-        core::ptr::write(regs_base.add(17), frame_ref.x17);
-        core::ptr::write(regs_base.add(18), frame_ref.x18);
-        core::ptr::write(regs_base.add(19), frame_ref.x19);
-        core::ptr::write(regs_base.add(20), frame_ref.x20);
-        core::ptr::write(regs_base.add(21), frame_ref.x21);
-        core::ptr::write(regs_base.add(22), frame_ref.x22);
-        core::ptr::write(regs_base.add(23), frame_ref.x23);
-        core::ptr::write(regs_base.add(24), frame_ref.x24);
-        core::ptr::write(regs_base.add(25), frame_ref.x25);
-        core::ptr::write(regs_base.add(26), frame_ref.x26);
-        core::ptr::write(regs_base.add(27), frame_ref.x27);
-        core::ptr::write(regs_base.add(28), frame_ref.x28);
-        core::ptr::write(regs_base.add(29), frame_ref.x29);
-        core::ptr::write(regs_base.add(30), frame_ref.x30);
-        core::ptr::write(mc.add(256).cast::<u64>(), frame_ref.sp_el0);   // sp
-        core::ptr::write(mc.add(264).cast::<u64>(), frame_ref.elr_el1);  // pc
-        core::ptr::write(mc.add(272).cast::<u64>(), frame_ref.spsr_el1); // pstate
+    // mcontext_t (sigcontext): the interrupted user context, x0–x30 + sp/pc/pstate.
+    sf.save_regs(frame_ref, fault_addr);
 
-        // FPSIMD extension record at SIGFRAME_FPSIMD.
-        // sync_el0_handler saves Q0-Q31 at frame+304 (16 bytes each), fpcr at frame+816,
-        // fpsr at frame+824.  The kernel never uses FP so those values are the user's.
-        let kernel_neon = (frame as *const u8).add(304);
-        let fp = base.add(SIGFRAME_FPSIMD);
-        core::ptr::write(fp.cast::<u32>(), FPSIMD_MAGIC);       // _aarch64_ctx.magic
-        core::ptr::write(fp.add(4).cast::<u32>(), 528u32);      // _aarch64_ctx.size
-        // fpsr at +8, fpcr at +12 (stored as 64-bit on kernel stack, lower 32 bits used)
-        let fpsr_val = core::ptr::read((frame as *const u8).add(824).cast::<u32>());
-        let fpcr_val = core::ptr::read((frame as *const u8).add(816).cast::<u32>());
-        core::ptr::write(fp.add(8).cast::<u32>(), fpsr_val);
-        core::ptr::write(fp.add(12).cast::<u32>(), fpcr_val);
-        // vregs[0..31]: 16 bytes each.  Use byte copy to avoid ldp q / stp q
-        // which requires 16-byte alignment; vregs_dst is only 8-byte aligned here
-        // (new_sp + SIGFRAME_FPSIMD + 16 = new_sp + 600, and 600 % 16 == 8).
-        let vregs_dst = fp.add(16);
-        core::ptr::copy_nonoverlapping(kernel_neon, vregs_dst, 32 * 16);
-        // Null terminator _aarch64_ctx{0,0}
-        let null_term = fp.add(528);
-        core::ptr::write(null_term.cast::<u64>(), 0u64);
+    // FPSIMD extension record. The kernel never uses FP, so what `sync_el0_handler`
+    // saved in this trap frame's NEON area is still the user's.
+    //
+    // SAFETY: every `try_deliver_signal` caller is in the EL0 **sync** handler, whose
+    // 832-byte frame is the layout `sync_frame_neon` names. (The EL0 *IRQ* frame is
+    // also 832 bytes and puts its NEON block 16 bytes earlier.)
+    let neon = unsafe { &*sigframe::sync_frame_neon(frame) };
+    sf.fpsimd.magic = FPSIMD_MAGIC;
+    sf.fpsimd.size = 528;
+    // FPSR/FPCR are 32-bit registers stored in 64-bit slots on the kernel stack.
+    sf.fpsimd.fpsr = neon.fpsr as u32;
+    sf.fpsimd.fpcr = neon.fpcr as u32;
+    sf.fpsimd.vregs = neon.vregs;
+    // The `_aarch64_ctx{0,0}` terminator after the record is already zero.
 
+    // One copy out, in place of ~130 individual writes into user memory.
+    //
+    // `Prefault::No` because this runs on a fault-handling stack, where
+    // `prefault_user_range`'s frame allocation and `as_lock` acquisition are not
+    // allowed — the `ensure_user_page_mapped` + `ensure_cow_page_writable` pre-flight
+    // above is the fault-safe form of the same job, and it has already run for both
+    // pages this frame can span.
+    if akuma_exec::mmu::user_access::write_user_val_with(
+        new_sp as u64,
+        &sf,
+        akuma_exec::mmu::user_access::Prefault::No,
+    )
+    .is_err()
+    {
+        // The pre-flight just mapped and CoW-resolved both pages, so this fires only
+        // when `new_sp` is not EL0-accessible at all — a stack pointer inside an
+        // EL1-only mapping, which the old open-coded writes followed into kernel
+        // memory (`USER_COPY_FOLD.md` §7). Declining delivery here means the caller
+        // applies the default action instead.
+        crate::tprint!(128, "[signal] sig {} frame copy to {:#x} failed\n", signal, new_sp);
+        return false;
+    }
+
+    unsafe {
         // Redirect execution to the signal handler
         (*frame).elr_el1 = handler_addr as u64;
         (*frame).sp_el0 = new_sp as u64;
@@ -2357,118 +2333,88 @@ fn fatal_signal_group_exit(code: i32) -> ! {
 /// immediately after sigreturn is handled in the **`syscall_num == 139`** branch in
 /// `rust_sync_el0_handler`.
 fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
-    let frame_ref = unsafe { &*frame };
-    let sigframe_sp = frame_ref.sp_el0 as usize;
+    // SAFETY: the EL0 sync handler passes its own trap frame, live for this call, and
+    // nothing else holds a reference to it. One borrow for the whole function so the
+    // field accesses below need no further `unsafe`.
+    let f = unsafe { &mut *frame };
+    let sigframe_sp = f.sp_el0;
 
-    let first_page = sigframe_sp & !0xFFF;
-    let last_page = (sigframe_sp + SIGFRAME_SIZE - 1) & !0xFFF;
-    if !akuma_exec::mmu::is_current_user_page_mapped(first_page) {
+    // Read the frame in one copy instead of ~40 `read(sigframe_sp + N)`s.
+    //
+    // `Prefault::No` keeps the old behaviour: this used to require both frame pages to
+    // be *present* and gave up otherwise, and a sigframe SP pointing at an unfaulted
+    // lazy page is a corrupt frame, not something to demand-page. What the validated
+    // read adds over the old presence test is the AP check — a frame SP inside an
+    // EL1-only mapping is now rejected instead of read (`USER_COPY_FOLD.md` §7).
+    let mut sf = sigframe::RtSigFrame::zeroed();
+    if akuma_exec::mmu::user_access::read_user_into_with(
+        &mut sf,
+        sigframe_sp,
+        akuma_exec::mmu::user_access::Prefault::No,
+    )
+    .is_err()
+    {
         return None;
     }
-    if last_page != first_page && !akuma_exec::mmu::is_current_user_page_mapped(last_page) {
-        return None;
+
+    // Full GPR restore including x8 — see the doc comment: a wrong register here shows
+    // up as the *next* SVC seeing a bogus syscall number.
+    let restored_spsr = sf.restore_regs(f);
+
+    // Validate SPSR: must be EL0t (M[4:0] = 0).  Go's signal handler can
+    // corrupt the signal frame (the delivery path notes "Go's panic recovery
+    // can produce corrupted SP/PSTATE on sigreturn").  If M[4]=1 (AArch32
+    // mode) or any other invalid mode bits are set, ERET would crash the
+    // kernel.  Force clean EL0t instead.
+    if restored_spsr & 0x1F != 0 {
+        crate::tprint!(128,
+            "[sigreturn] WARNING: corrupted SPSR={:#x} (mode bits={:#x}), forcing EL0t\n",
+            restored_spsr, restored_spsr & 0x1F);
+        // Clear only the M[4:0] mode bits; preserve NZCV, DAIF, and other flags
+        // so that Go's signal-handler modifications to pstate (e.g. NZCV) survive.
+        f.spsr_el1 = restored_spsr & !0x1F;
+    } else {
+        f.spsr_el1 = restored_spsr;
     }
 
-    unsafe {
-        let mc = (sigframe_sp + SIGFRAME_MCONTEXT) as *const u8;
-        let regs_base = mc.add(8).cast::<u64>();
+    crate::tprint!(256,
+        "[sigreturn] restoring: sp={:#x} pc={:#x} pstate={:#x} sigframe_sp={:#x}\n",
+        f.sp_el0, f.elr_el1, f.spsr_el1, sigframe_sp);
 
-        (*frame).x0 = core::ptr::read(regs_base.add(0));
-        (*frame).x1 = core::ptr::read(regs_base.add(1));
-        (*frame).x2 = core::ptr::read(regs_base.add(2));
-        (*frame).x3 = core::ptr::read(regs_base.add(3));
-        (*frame).x4 = core::ptr::read(regs_base.add(4));
-        (*frame).x5 = core::ptr::read(regs_base.add(5));
-        (*frame).x6 = core::ptr::read(regs_base.add(6));
-        (*frame).x7 = core::ptr::read(regs_base.add(7));
-        (*frame).x8 = core::ptr::read(regs_base.add(8));
-        (*frame).x9 = core::ptr::read(regs_base.add(9));
-        (*frame).x10 = core::ptr::read(regs_base.add(10));
-        (*frame).x11 = core::ptr::read(regs_base.add(11));
-        (*frame).x12 = core::ptr::read(regs_base.add(12));
-        (*frame).x13 = core::ptr::read(regs_base.add(13));
-        (*frame).x14 = core::ptr::read(regs_base.add(14));
-        (*frame).x15 = core::ptr::read(regs_base.add(15));
-        (*frame).x16 = core::ptr::read(regs_base.add(16));
-        (*frame).x17 = core::ptr::read(regs_base.add(17));
-        (*frame).x18 = core::ptr::read(regs_base.add(18));
-        (*frame).x19 = core::ptr::read(regs_base.add(19));
-        (*frame).x20 = core::ptr::read(regs_base.add(20));
-        (*frame).x21 = core::ptr::read(regs_base.add(21));
-        (*frame).x22 = core::ptr::read(regs_base.add(22));
-        (*frame).x23 = core::ptr::read(regs_base.add(23));
-        (*frame).x24 = core::ptr::read(regs_base.add(24));
-        (*frame).x25 = core::ptr::read(regs_base.add(25));
-        (*frame).x26 = core::ptr::read(regs_base.add(26));
-        (*frame).x27 = core::ptr::read(regs_base.add(27));
-        (*frame).x28 = core::ptr::read(regs_base.add(28));
-        (*frame).x29 = core::ptr::read(regs_base.add(29));
-        (*frame).x30 = core::ptr::read(regs_base.add(30));
-
-        (*frame).sp_el0 = core::ptr::read(mc.add(256).cast::<u64>());
-        (*frame).elr_el1 = core::ptr::read(mc.add(264).cast::<u64>());
-        let restored_spsr = core::ptr::read(mc.add(272).cast::<u64>());
-
-        // Validate SPSR: must be EL0t (M[4:0] = 0).  Go's signal handler can
-        // corrupt the signal frame (the code above notes "Go's panic recovery
-        // can produce corrupted SP/PSTATE on sigreturn").  If M[4]=1 (AArch32
-        // mode) or any other invalid mode bits are set, ERET would crash the
-        // kernel.  Force clean EL0t instead.
-        if restored_spsr & 0x1F != 0 {
-            crate::tprint!(128,
-                "[sigreturn] WARNING: corrupted SPSR={:#x} (mode bits={:#x}), forcing EL0t\n",
-                restored_spsr, restored_spsr & 0x1F);
-            // Clear only the M[4:0] mode bits; preserve NZCV, DAIF, and other flags
-            // so that Go's signal-handler modifications to pstate (e.g. NZCV) survive.
-            (*frame).spsr_el1 = restored_spsr & !0x1F;
-        } else {
-            (*frame).spsr_el1 = restored_spsr;
-        }
-
-        crate::tprint!(256,
-            "[sigreturn] restoring: sp={:#x} pc={:#x} pstate={:#x} sigframe_sp={:#x}\n",
-            (*frame).sp_el0, (*frame).elr_el1, (*frame).spsr_el1, sigframe_sp);
-
-        if crate::config::DEBUG_PATTERN2_TRAP_TRACE && syscall_stub_elr_in_diag_window((*frame).elr_el1) {
-            let rp = akuma_exec::process::read_current_pid().unwrap_or(0);
-            let slot = akuma_exec::threading::current_thread_id();
-            crate::tprint!(
-                224,
-                "[pattern2-sigreturn] pid={} slot={} restored_pc={:#x} x8={:#x} ({}) sigframe_sp={:#x}\n",
-                rp,
-                slot,
-                (*frame).elr_el1,
-                (*frame).x8,
-                syscall_nr_pattern2_hint((*frame).x8),
-                sigframe_sp,
-            );
-        }
-
-        // Restore signal mask from uc_sigmask (ucontext+40) into the PER-THREAD mask
-        // (set_thread_signal_mask drops SIGKILL/SIGSTOP). Restoring into the shared
-        // proc.signal_mask is the bug that let one sibling's sigreturn clobber another
-        // thread's block — docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D.
-        let uc_sigmask_ptr = (sigframe_sp + SIGFRAME_UCONTEXT + 40) as *const u64;
-        let saved_mask = core::ptr::read(uc_sigmask_ptr);
-        akuma_exec::threading::set_thread_signal_mask(saved_mask);
-
-        // Restore FPSIMD state from signal frame into kernel stack NEON save area.
-        // sync_el0_handler will restore NEON from frame+304 after rust_sync_el0_handler returns.
-        let fp = (sigframe_sp + SIGFRAME_FPSIMD) as *const u8;
-        let magic = core::ptr::read(fp.cast::<u32>());
-        if magic == FPSIMD_MAGIC {
-            let fpsr_val = u64::from(core::ptr::read(fp.add(8).cast::<u32>()));
-            let fpcr_val = u64::from(core::ptr::read(fp.add(12).cast::<u32>()));
-            core::ptr::write(frame.cast::<u8>().add(824).cast::<u64>(), fpsr_val);
-            core::ptr::write(frame.cast::<u8>().add(816).cast::<u64>(), fpcr_val);
-            let vregs_src = fp.add(16);
-            let kernel_neon = frame.cast::<u8>().add(304);
-            core::ptr::copy_nonoverlapping(vregs_src, kernel_neon, 32 * 16);
-        }
-
-        let saved_x0 = (*frame).x0;
-        Some(saved_x0)
+    if crate::config::DEBUG_PATTERN2_TRAP_TRACE && syscall_stub_elr_in_diag_window(f.elr_el1) {
+        let rp = akuma_exec::process::read_current_pid().unwrap_or(0);
+        let slot = akuma_exec::threading::current_thread_id();
+        crate::tprint!(
+            224,
+            "[pattern2-sigreturn] pid={} slot={} restored_pc={:#x} x8={:#x} ({}) sigframe_sp={:#x}\n",
+            rp,
+            slot,
+            f.elr_el1,
+            f.x8,
+            syscall_nr_pattern2_hint(f.x8),
+            sigframe_sp,
+        );
     }
+
+    // Restore signal mask from uc_sigmask into the PER-THREAD mask
+    // (set_thread_signal_mask drops SIGKILL/SIGSTOP). Restoring into the shared
+    // proc.signal_mask is the bug that let one sibling's sigreturn clobber another
+    // thread's block — docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D.
+    akuma_exec::threading::set_thread_signal_mask(sf.uc.uc_sigmask);
+
+    // Restore FPSIMD state from the signal frame into the trap frame's NEON save area;
+    // sync_el0_handler restores the registers from there after this returns.
+    if sf.fpsimd.magic == FPSIMD_MAGIC {
+        // SAFETY: `do_rt_sigreturn` is called only from the EL0 sync handler, so `frame`
+        // is the 832-byte sync frame whose layout `sync_frame_neon` names. The `&mut f`
+        // borrow above covers only the GPR block, which this area sits past.
+        let neon = unsafe { &mut *sigframe::sync_frame_neon(frame) };
+        neon.fpsr = u64::from(sf.fpsimd.fpsr);
+        neon.fpcr = u64::from(sf.fpsimd.fpcr);
+        neon.vregs = sf.fpsimd.vregs;
+    }
+
+    Some(sf.uc.uc_mcontext.regs[0])
 }
 
 /// Install exception vector table

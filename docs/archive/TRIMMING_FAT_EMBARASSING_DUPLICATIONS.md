@@ -2201,9 +2201,39 @@ weaker result than a positive trace and is reported as such.
 | ~~`exceptions.rs`'s duplicated `Drop` impls (§8 item 5)~~ | **DONE — both halves.** Guard half 2026-08-13 (above); the ~330-line DA/IA demand-paging body merge landed 2026-08-14 as one `demand_page_lazy_region` + an `akuma_exec::mmu::FaultAccess` entry-point seam, with the policy half (`lazy_map_flags`, `user_flags::is_exec`) moved into `akuma-exec` so it is host-testable — 4 new host tests + 1 boot test. Full record, all eight differences and their decisions, the `is_exec` reasoning and the verification numbers: [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §12. Two new findings out of it (F9, F10 in §9 there), recorded and not fixed. **What the three previous declines got wrong:** the two "behavioural divergences" that supposedly blocked it were a copy-paste artifact and a category error; the real work was scoping where the shared body starts and stops (the `PROT_NONE` arm and the lazy-region-miss branch stay per-arm, and should) |
 | ~~The fork/CoW pile (§8 items 13–14)~~ | **DONE 2026-08-14** — all of [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §9 is closed, including the `cow_fault_lock` finding (deleted with the `akuma-pmm` extraction). Six more open-coded `dc cvau`/`ic ivau` sequences in `exceptions.rs` collapsed onto the existing `mmu::sync_icache_range` on the way out (F4) |
 
-### Phase 7 — `#[repr(C)]` `Statx` + `SigFrame`
+### Phase 7 — `#[repr(C)]` `Statx` + `SigFrame` — DONE 2026-08-14
 
-Three blocks, −281 unsafe *operations*. Judge by §3.3, not by line count.
+Three blocks, −281 unsafe *operations*. Judge by §3.3, not by line count — and
+that framing earned itself twice over here, because the **block** count in
+`exceptions.rs` went *up* by one (90 → 91) while raw pointer operations went
+110 → 13 and `(*frame)` derefs 75 → 34. Full record:
+[`REPR_C_SIGFRAME_STATX.md`](REPR_C_SIGFRAME_STATX.md).
+
+What the row did not anticipate, in order of how much it mattered:
+
+- **There was a fourth block.** `do_rt_sigreturn` reads the frame back with ~40
+  hand-offset reads; P1 counted only the two writers and `statx`. It converts the
+  same way and shares the struct, which is the point.
+- **The pre-flight does not go away.** `UNSAFE_AUDIT.md` P1's headline extra win —
+  one `copy_to_user` "deletes the `ensure_cow_page_writable` pre-flight dance" — is
+  wrong, and not by a little: `is_current_user_range_mapped` tests EL0
+  *accessibility*, not writability (its own doc comment says a read-only page must
+  pass, "because an EL1 write to one is how a CoW break gets triggered"). A
+  CoW-demoted stack page validates clean, and the copy helpers' fault trampoline
+  returns `EFAULT` before the EL1 CoW recovery can fire. The pre-flight is what
+  makes the copy succeed.
+- **Writing the ABI out as a type found two divergences from Linux**, both
+  pre-existing and both left alone: the FPSIMD record at frame+584 instead of +592
+  (Linux pads `sigcontext` to a 16-byte-aligned `__reserved`), and `__reserved`
+  sized 536 rather than 4096.
+- **The layout moved into `akuma-exec`, so it is host-testable** (+5 tests,
+  528 → 533): offsets, byte positions, and a per-register round trip through
+  `save_regs`/`restore_regs`, which is where 62 hand-written assignments could
+  hide a transposition.
+- **`UserTrapFrame` must not absorb the NEON block.** The EL0 sync and EL0 IRQ
+  frames are both 832 bytes with *different* NEON offsets (+304 vs +288); folding
+  it in would have silently given IRQ frames the sync layout. It is a separate
+  `SyncFrameNeon` + one `unsafe fn` whose contract names the frame kind.
 
 ### Phase 8 — quality floor
 
@@ -2214,6 +2244,40 @@ per §5.6.
 
 The `#[inline]` audit (§5.10) belongs here too, but only after the `lto = "thin"`
 question is settled — deciding that first may delete most of the work.
+
+### Deferred audit: bare `unwrap()` / `expect()` in kernel code (raised 2026-08-14)
+
+Raised while writing Phase 7's host tests, where `try_into().unwrap()` is fine (a
+panic in a test *is* the failure report) and the same call in kernel code is a
+`panic!` on a path with no unwinder. Not started. **Counted first, and the count
+is the finding — it is a finishable list, not a sweep:**
+
+| | Sites | Note |
+|---|---:|---|
+| `src/`, excluding `*_tests.rs` | **8** | the entire bin crate |
+| `crates/`, all files | 335 | but ~all inside `#[cfg(test)]` — three files sampled (`akuma-primitives/src/console.rs`, `akuma-exec/src/mmu/asid.rs`, `akuma-isolation/src/overlay_fs.rs`) had **0** before their test module and 9/6/26 after |
+| `.expect(` | 5 in `src/`, 46 in `crates/` | same split, unverified |
+
+So the audit's real job is to **separate the two populations properly** (the
+sampling above is three files, not a pass) and then judge the production
+remainder. The `src/` eight, already listed:
+
+- **Infallible by construction (5).** `try_into().unwrap()` on a constant-width
+  slice range — `rump_proxy.rs:1124,1234,1250,1251`, and `ramfb.rs:66`'s
+  `Layout::from_size_align` on a page-aligned size. These want
+  `unwrap_or`/`let else` only if the audit decides zero tolerance; they cannot
+  fire.
+- **Worth an actual look (3).** `vfs/mod.rs:434` (`table.as_mut().unwrap()` on a
+  global `Option`), `syscall/msgqueue.rs:229,244` (`best.unwrap()` guarded by an
+  `is_none()` in the same expression, and `remove(idx).unwrap()`). Each is a
+  claim about an invariant that is *probably* true — which is exactly the class
+  that turns into a kernel panic the day it stops being true.
+
+It belongs on this list for the same reason as the 7g atomics audit: a `panic!`
+reachable from a syscall arm is fat of the same kind as a lock that should have
+been an atomic — a failure mode carried for no reason, on a path that has no way
+to report it. Pair it with Phase 8, whose `undocumented_unsafe_blocks` ratchet
+walks the same files.
 
 ### Promoted out of "deferred" — then DONE 2026-08-14
 

@@ -1,5 +1,18 @@
 # Fork-from-a-threaded-process kills the process — SOLVED 2026-08-08
 
+> **Residual at SMP=2, found 2026-08-14.** The fix below holds at SMP=1 and SMP=4
+> (the gate's default widths, clean on every run since). At **SMP=2**, `cowstale`
+> still reproduces the original signature — `FAR=0x420908 ELR=0x403a90 ISS=0x4f`,
+> `[WPF] va=0x420000 cow_ref=0 … ap_rw=true` — at **~40% per run (2/5)**, measured on
+> two independent trees, while `stale_write_fault_absorbed`'s own boot test passes
+> in the same boot. `ap_rw=true` says the absorb's premise still holds (the PTE
+> grants the write); what is not established is why the absorb does not catch this
+> one. It prints no `[TLB-STALE]` exhaustion line, so it is either returning early
+> (`user_pte_raw` → `None`, or the AP read losing a race with the peer's repair) or
+> the fault is reaching the fatal arm by a route that never calls it. Found while
+> A/B-ing an unrelated change; not investigated further.
+> Rate and method: [`REPR_C_SIGFRAME_STATX.md`](REPR_C_SIGFRAME_STATX.md) §6.
+
 > **Status: root-caused and fixed.** Full writeup, evidence and numbers:
 > [`docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md`](CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md) §12.
 >

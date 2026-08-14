@@ -194,6 +194,67 @@ pub(super) struct IoVec {
 
 #[repr(C)] #[derive(Clone, Copy, Default)] pub struct Stat { pub st_dev: u64, pub st_ino: u64, pub st_mode: u32, pub st_nlink: u32, pub st_uid: u32, pub st_gid: u32, pub st_rdev: u64, pub __pad1: u64, pub st_size: i64, pub st_blksize: i32, pub __pad2: i32, pub st_blocks: i64, pub st_atime: i64, pub st_atime_nsec: i64, pub st_mtime: i64, pub st_mtime_nsec: i64, pub st_ctime: i64, pub st_ctime_nsec: i64, pub __unused: [i32; 2] }
 
+/// `struct statx_timestamp` — 16 bytes, and the `__reserved` word is why it is not
+/// just a pair.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct StatxTimestamp {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    pub __reserved: i32,
+}
+
+/// `struct statx` (256 bytes), the `statx(2)` buffer.
+///
+/// `sys_statx` used to fill this with 20 `core::ptr::write(p.add(N).cast::<T>())` calls
+/// into a stack buffer, each offset a literal beside a comment naming the field —
+/// `UNSAFE_AUDIT.md` §4 P1's third block. The offsets are now the struct's, and the
+/// assertions below pin the ones the old comments claimed.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Statx {
+    pub stx_mask: u32,
+    pub stx_blksize: u32,
+    pub stx_attributes: u64,
+    pub stx_nlink: u32,
+    pub stx_uid: u32,
+    pub stx_gid: u32,
+    pub stx_mode: u16,
+    pub __spare0: u16,
+    pub stx_ino: u64,
+    pub stx_size: u64,
+    pub stx_blocks: u64,
+    pub stx_attributes_mask: u64,
+    pub stx_atime: StatxTimestamp,
+    pub stx_btime: StatxTimestamp,
+    pub stx_ctime: StatxTimestamp,
+    pub stx_mtime: StatxTimestamp,
+    pub stx_rdev_major: u32,
+    pub stx_rdev_minor: u32,
+    pub stx_dev_major: u32,
+    pub stx_dev_minor: u32,
+    pub stx_mnt_id: u64,
+    pub stx_dio_mem_align: u32,
+    pub stx_dio_offset_align: u32,
+    pub __spare3: [u64; 12],
+}
+
+// The offsets `sys_statx` used to spell as literals. A layout change that moves any of
+// them is now a build failure rather than a userspace `stat` reading the wrong field.
+const _: () = assert!(core::mem::size_of::<Statx>() == 256);
+const _: () = assert!(core::mem::offset_of!(Statx, stx_nlink) == 16);
+const _: () = assert!(core::mem::offset_of!(Statx, stx_mode) == 28);
+const _: () = assert!(core::mem::offset_of!(Statx, stx_ino) == 32);
+const _: () = assert!(core::mem::offset_of!(Statx, stx_size) == 40);
+const _: () = assert!(core::mem::offset_of!(Statx, stx_blocks) == 48);
+const _: () = assert!(core::mem::offset_of!(Statx, stx_atime) == 64);
+const _: () = assert!(core::mem::offset_of!(Statx, stx_btime) == 80);
+const _: () = assert!(core::mem::offset_of!(Statx, stx_ctime) == 96);
+const _: () = assert!(core::mem::offset_of!(Statx, stx_mtime) == 112);
+const _: () = assert!(core::mem::offset_of!(Statx, stx_rdev_major) == 128);
+const _: () = assert!(core::mem::offset_of!(Statx, stx_dev_major) == 136);
+const _: () = assert!(core::mem::offset_of!(Statx, stx_mnt_id) == 144);
+
 const fn makedev(major: u64, minor: u64) -> u64 {
     (major << 8) | minor
 }
@@ -1878,8 +1939,9 @@ pub(super) fn sys_truncate(path_ptr: u64, length: i64) -> u64 {
 }
 
 pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64) -> u64 {
-    const STATX_SIZE: usize = 256;
-    if !validate_user_ptr(buf_ptr, STATX_SIZE) { return EFAULT; }
+    // Early-out before any fs work; the copy at the end validates again for real. Sized
+    // from the struct so the two can no longer disagree.
+    if !validate_user_ptr(buf_ptr, core::mem::size_of::<Statx>()) { return EFAULT; }
 
     let path = match copy_from_user_str(path_ptr, 512) {
         Ok(p) => p,
@@ -1965,47 +2027,30 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
     // STATX_BASIC_STATS covers type/mode/nlink/uid/gid/ino/size/blocks/times
     const STATX_BASIC_STATS: u32 = 0x07ff;
 
-    let mut buf = [0u8; STATX_SIZE];
-    unsafe {
-        let p = buf.as_mut_ptr();
-        // stx_mask (u32 @ 0)
-        core::ptr::write(p.add(0).cast::<u32>(), STATX_BASIC_STATS);
-        // stx_blksize (u32 @ 4)
-        core::ptr::write(p.add(4).cast::<u32>(), blksize);
-        // stx_attributes (u64 @ 8) — none
-        // stx_nlink (u32 @ 16)
-        core::ptr::write(p.add(16).cast::<u32>(), nlink);
-        // stx_uid (u32 @ 20)
-        // stx_gid (u32 @ 24)
-        // stx_mode (u16 @ 28)
-        core::ptr::write(p.add(28).cast::<u16>(), mode);
-        // stx_ino (u64 @ 32)
-        core::ptr::write(p.add(32).cast::<u64>(), ino);
-        // stx_size (u64 @ 40)
-        core::ptr::write(p.add(40).cast::<u64>(), size);
-        // stx_blocks (u64 @ 48)
-        core::ptr::write(p.add(48).cast::<u64>(), blocks);
-        // stx_attributes_mask (u64 @ 56) — none
-        // stx_atime (statx_timestamp @ 64): tv_sec(i64) + tv_nsec(u32) + __reserved(i32) = 16 bytes
-        core::ptr::write(p.add(64).cast::<i64>(), atime);
-        // stx_btime (@ 80)
-        // stx_ctime (@ 96)
-        core::ptr::write(p.add(96).cast::<i64>(), ctime);
-        // stx_mtime (@ 112)
-        core::ptr::write(p.add(112).cast::<i64>(), mtime);
-        // stx_rdev_major (u32 @ 128)
-        core::ptr::write(p.add(128).cast::<u32>(), rdev_major);
-        // stx_rdev_minor (u32 @ 132)
-        core::ptr::write(p.add(132).cast::<u32>(), rdev_minor);
-        // stx_dev_major (u32 @ 136)
-        core::ptr::write(p.add(136).cast::<u32>(), 0);
-        // stx_dev_minor (u32 @ 140)
-        core::ptr::write(p.add(140).cast::<u32>(), 1);
-        // stx_mnt_id (u64 @ 144)
-        core::ptr::write(p.add(144).cast::<u64>(), 1);
-    }
+    // Only the fields STATX_BASIC_STATS advertises are filled; the rest stay zero, as
+    // they did when this was a zeroed byte buffer. `stx_uid`/`stx_gid` are 0 (root) and
+    // `stx_attributes`/`stx_attributes_mask` are unsupported, so both stay zero too.
+    let statx = Statx {
+        stx_mask: STATX_BASIC_STATS,
+        stx_blksize: blksize,
+        stx_nlink: nlink,
+        stx_mode: mode,
+        stx_ino: ino,
+        stx_size: size,
+        stx_blocks: blocks,
+        stx_atime: StatxTimestamp { tv_sec: atime, ..Default::default() },
+        stx_ctime: StatxTimestamp { tv_sec: ctime, ..Default::default() },
+        stx_mtime: StatxTimestamp { tv_sec: mtime, ..Default::default() },
+        stx_rdev_major: rdev_major,
+        stx_rdev_minor: rdev_minor,
+        // The device the file lives on: 0:1, matching `sys_newfstatat`'s `st_dev`.
+        stx_dev_major: 0,
+        stx_dev_minor: 1,
+        stx_mnt_id: 1,
+        ..Default::default()
+    };
 
-    if copy_to_user(buf_ptr, &buf[..STATX_SIZE]).is_err() {
+    if write_user_val(buf_ptr, &statx).is_err() {
         return EFAULT;
     }
     0

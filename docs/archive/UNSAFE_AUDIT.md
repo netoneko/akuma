@@ -276,6 +276,17 @@ correctly where a range exclusion would not. Rationale and the rest:
 
 ### P1 — `#[repr(C)]` structs instead of hand-offset byte writes: 3 blocks, 281 unsafe ops
 
+> **DONE 2026-08-14** — all three blocks, plus the reader half this section did
+> not count (`do_rt_sigreturn`'s ~40 hand-offset reads). Full record:
+> [`REPR_C_SIGFRAME_STATX.md`](REPR_C_SIGFRAME_STATX.md). **One claim below is
+> wrong and the record says why:** the single `copy_to_user` does *not* delete the
+> `ensure_cow_page_writable` pre-flight. Validation tests EL0 *accessibility*, not
+> writability — a CoW-demoted page passes it, deliberately — and the copy helpers'
+> fault trampoline returns `EFAULT` before the EL1 CoW recovery can fire, so the
+> pre-flight is what makes the copy succeed and it stays. The rest of the section
+> held: the offsets are `offset_of!` assertions now, and the boot tests that
+> consume `TEST_SIGFRAME_*` were the guard it recommended.
+
 **Where:** `src/syscall/fs.rs:1999` (`statx`, 30 ops),
 `src/exceptions.rs:1415` and `:1644` (signal frame, 120 + 131 ops).
 

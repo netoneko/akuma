@@ -179,6 +179,20 @@ Repro: `userspace/forktest/c_stress/pthread_kill_eintr.c` (A/B'd 2026-08-04 — 
 `read()` never returns, handler runs 0 times; flag on: `-1 EINTR` after 1 handler
 run, with the `SA_RESTART` control unaffected in both).
 
+## The `rt_sigframe` itself
+
+The frame is a `#[repr(C)]` type,
+`akuma_exec::threading::sigframe::RtSigFrame` — 1120 bytes: `siginfo_t` (128) +
+`ucontext_t` header (176) + `sigcontext` (280) + an FPSIMD extension record (528) +
+an `_aarch64_ctx` null terminator (8). **Read the layout there, not from offsets in
+`exceptions.rs`**: the offsets are derived from the struct with `offset_of!` and
+pinned by compile-time assertions, and both the builder and `rt_sigreturn` reach
+user memory through a single validated copy each.
+
+Two deliberate divergences from Linux, documented in that module and unchanged:
+the FPSIMD record sits at frame+584 rather than +592 (Linux's `sigcontext` pads to
+a 16-byte-aligned `__reserved`), and `__reserved` is 536 bytes rather than 4096.
+
 ## rt_sigreturn (frame unwind)
 
 `sys_rt_sigreturn` (NR 139) is handled directly in `rust_sync_el0_handler`

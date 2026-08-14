@@ -58,6 +58,14 @@ built and torn down entirely in the assembly stubs — there is no separate
   single fixed-offset block, unified between the EL0 and EL1 IRQ paths so
   `rust_irq_handler_with_sp` doesn't need to know which one fired.
 
+The two NEON blocks are at **different offsets** — sync at `+304` (FPCR `+816`,
+FPSR `+824`), IRQ at `+288` (FPCR `+800`, FPSR `+808`) — so the frames are not
+interchangeable despite sharing a size. Rust code that reads the sync frame's FP
+state (the signal paths, which save it into the sigframe and restore it back) goes
+through `akuma_exec::threading::sigframe::SyncFrameNeon` and its
+`sync_frame_neon(frame)` accessor rather than open-coding those offsets; the
+accessor's safety contract is "sync frame only", for exactly this reason.
+
 Both stubs **always** save/restore the full NEON/FPSIMD register file on
 every trap, including plain syscalls — there is no lazy FPSIMD save. Both
 clear SPSR_EL1's IL bit (bit 20) before `eret`; leaving it set produces a

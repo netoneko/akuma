@@ -7,6 +7,7 @@
 // Must match KERNEL_PHYS_BASE in src/config.rs and KERNEL_PHYS_BASE in linker.ld.
 const KERNEL_PHYS_BASE: usize = 0x4010_0000;
 
+pub mod sigframe;
 pub mod types;
 
 pub use types::*;
