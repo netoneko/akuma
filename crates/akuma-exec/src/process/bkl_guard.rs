@@ -54,6 +54,7 @@
 //! [`Process::as_lock`]: crate::process::Process::as_lock
 //! [`FORK_AS_CHUNK_PAGES`]: crate::process::FORK_AS_CHUNK_PAGES
 
+use akuma_primitives::{GuardToggle, ToggledGuard};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Runtime toggle (default **on**) for the `no-bkl-process` fork page-copy BKL-drop.
@@ -78,66 +79,49 @@ pub fn set_process_bkl_drop_enabled(on: bool) {
     PROCESS_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
 }
 
+/// The `no-bkl-process` carve-out, as a [`GuardToggle`] marker.
+///
+/// The guard body — latch the toggle at construction, re-acquire the BKL on every
+/// return path, never re-read the toggle in `drop` — is
+/// [`akuma_primitives::ToggledGuard`]'s, stated once for all five carve-outs. What is
+/// specific to *this* carve-out is only the three lines below, plus the correctness
+/// argument in the module header: `as_lock` held in bounded chunks over every
+/// parent-page-table access, and read+`cow_ref_inc`+demote as one atom.
+///
+/// [`enter`](GuardToggle::enter)/[`exit`](GuardToggle::exit) go through
+/// [`crate::bkl::dropped_window_open`]/[`close`](crate::bkl::dropped_window_close), so
+/// the per-thread ledger restores the dropped state after a nested IRQ, fault, or
+/// context switch. A bare `leave_kernel`/`enter_kernel` pair would be balanced, but
+/// the first timer tick inside the window would silently re-hold the BKL for the
+/// remainder — the `[BKL] stuck` regression, `BKL_VFS_CARVE_OUT.md` §8.
+pub struct ProcessBkl;
+
+impl GuardToggle for ProcessBkl {
+    const COMPILED_IN: bool = cfg!(all(kernel_smp_shared, kernel_no_bkl_process));
+    #[inline]
+    fn enabled() -> bool {
+        process_bkl_drop_enabled()
+    }
+    #[inline]
+    fn enter() {
+        crate::bkl::dropped_window_open();
+    }
+    #[inline]
+    fn exit() {
+        crate::bkl::dropped_window_close();
+    }
+}
+
 /// RAII guard that runs `fork_process`'s page-copy window **without** the Big Kernel
-/// Lock. The `ProcessBklGuard` counterpart to `VfsBklGuard` / `NetBklGuard`.
+/// Lock. The `ProcessBklGuard` counterpart to `VfsBklGuard` / `NetBklGuard` — all five
+/// are now the same [`ToggledGuard`] over a different marker.
 ///
-/// `new()` drops the BKL; `drop()` re-acquires it on every return path (including the
-/// `?` early-returns inside the copy loop), keeping the syscall wrapper's single
-/// `leave_kernel` balanced. Both go through [`crate::bkl::dropped_window_open`] /
-/// [`close`](crate::bkl::dropped_window_close) so the per-thread ledger restores the
-/// dropped state after a nested IRQ, fault, or context switch — a bare
-/// `leave_kernel`/`enter_kernel` pair would be balanced but the first timer tick inside
-/// the window would silently re-hold the BKL for the remainder (the `[BKL] stuck`
-/// regression, `BKL_VFS_CARVE_OUT.md` §8).
+/// `new()` drops the BKL; `drop()` re-acquires it on every return path, including the
+/// `?` early-returns inside the copy loop, keeping the syscall wrapper's single
+/// `leave_kernel` balanced.
 ///
-/// Zero-cost no-op unless BOTH `kernel_smp_shared` and `kernel_no_bkl_process` are set
-/// (or the runtime toggle is off): the struct is empty and `new`/`drop` compile to
-/// nothing, so default, `size`, `extreme`, and plain `smp-shared` builds are
-/// byte-for-byte unchanged.
-pub struct ProcessBklGuard {
-    /// Whether `new()` actually dropped the BKL, **latched at construction**.
-    ///
-    /// `drop()` must not re-read [`process_bkl_drop_enabled`]. The toggle is genuinely
-    /// flipped while guards are live (the boot self-test flips it between phases), and a
-    /// guard that asked twice would, on an ON→OFF flip mid-fork, leave the BKL released
-    /// for the rest of the syscall — the wrapper's `leave_kernel` would then advance
-    /// `now_serving` for a ticket nobody owns and corrupt the FIFO for every core.
-    /// Latching makes the guard balanced by construction. (`BKL_VFS_CARVE_OUT.md` §2.4.)
-    #[cfg(all(kernel_smp_shared, kernel_no_bkl_process))]
-    dropped_bkl: bool,
-}
-
-impl ProcessBklGuard {
-    #[inline]
-    #[must_use]
-    pub fn new() -> Self {
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_process))]
-        let dropped_bkl = process_bkl_drop_enabled();
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_process))]
-        if dropped_bkl {
-            crate::bkl::dropped_window_open();
-        }
-        Self {
-            #[cfg(all(kernel_smp_shared, kernel_no_bkl_process))]
-            dropped_bkl,
-        }
-    }
-}
-
-impl Default for ProcessBklGuard {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for ProcessBklGuard {
-    #[inline]
-    fn drop(&mut self) {
-        // Latched in `new()` — deliberately NOT a fresh `process_bkl_drop_enabled()` read.
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_process))]
-        if self.dropped_bkl {
-            crate::bkl::dropped_window_close();
-        }
-    }
-}
+/// No-op unless BOTH `kernel_smp_shared` and `kernel_no_bkl_process` are set (or the
+/// runtime toggle is off): `COMPILED_IN` is then a constant `false`, so `new`/`drop`
+/// fold away and default, `size`, `extreme`, and plain `smp-shared` builds are
+/// unchanged.
+pub type ProcessBklGuard = ToggledGuard<ProcessBkl>;

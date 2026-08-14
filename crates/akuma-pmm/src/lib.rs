@@ -1705,12 +1705,6 @@ pub fn alloc_page_zeroed() -> Option<usize> {
 // (`PmmHooks`) stay indirect (`docs/archive/PMM_EXTRACT.md` §4).
 // ============================================================================
 
-/// **Temporary duplicate of `akuma_exec::memmath::{ReclaimStep, next_reclaim_step}`
-/// — see the module doc's "Extraction status" section.** The decision does not
-/// move until Step 6, alongside `USER_PAGE_RESERVE`; it is pure arithmetic over
-/// an integer, small enough that duplicating it for one step carries none of the
-/// drift risk a real duplication would (same reasoning as [`poison_word`]).
-/// Private: `alloc_page_zeroed_user` below is the only caller either copy has.
 // ============================================================================
 // The user-page reserve. Migrated here for real in Step 6
 // (`docs/archive/PMM_EXTRACT.md` §7) from `akuma_exec::memmath`, where it

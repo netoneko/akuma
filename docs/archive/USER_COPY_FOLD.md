@@ -228,11 +228,14 @@ faulted, `break`-ed out of the copy loop, and **silently truncated the moved
 region** — the loop's `break` is indistinguishable from completion at the call
 site. `copy_to_user` now prefaults it.
 
-**No regression test.** The boot suite and the Tier 3 fork/CoW binaries pass
-unchanged, which shows the sweep preserved behaviour, but neither exercises "move a
-mapping whose destination pages are still lazy". A `userspace/` probe that
-`mremap`s a large region and verifies the moved bytes is what would pin it; the
-truncation was silent, so nothing fails loudly without one.
+**No regression test — added 2026-08-14.** The boot suite and the Tier 3 fork/CoW
+binaries passed unchanged, which showed the sweep preserved behaviour, but neither
+exercised "move a mapping whose destination pages are still lazy". That probe now
+exists: `userspace/forktest/c_stress/mremapmove.c`, in `verify_trim.py`'s Tier 3
+list. It grows a 4 MB region to 8 MB with `MREMAP_MAYMOVE` — the destination of a
+grow is a brand-new anonymous mapping and so is lazy in its entirety — and checks
+every byte, the zero tail, and a sparsely-touched source. `ALL PASS` on real Linux
+arm64.
 
 ---
 
@@ -261,7 +264,37 @@ it.
 
 ---
 
-## 7. STILL OPEN: the check is unskippable, but it is the wrong check
+## 7. The check was unskippable but wrong — FIXED 2026-08-14
+
+> **Status: DONE.** `is_current_user_range_mapped` tests the leaf PTE's AP bits.
+> Recorded below as it was written, because the reasoning for *why an AP test and
+> not a range exclusion* is the part worth keeping. What landed, and the two things
+> that were not obvious until it was built:
+>
+> - **The walk is shared, so the two questions had to be separated by name.**
+>   `is_page_mapped_ptr` (presence) and `is_page_user_accessible_ptr` (AP-gated) are
+>   now two one-line callers of one `resolve_user_leaf`. Only the *range* check —
+>   the user-pointer path — moved to the strict one. `is_current_user_page_mapped`
+>   stays presence, and that is load-bearing: its callers are demand-paging and
+>   teardown paths asking "is this VA filled in yet", and a `PROT_NONE` page reading
+>   as *un*mapped there would make the next fault re-map it read-write.
+> - **`prefault_user_range` had to be re-checked afterwards.** It skips pages that
+>   are already present — deliberately, for the same reason — so on its own it
+>   reports success for a range that is mapped but EL1-only, which is precisely the
+>   case being closed. `validate_user_range` now re-asserts
+>   `is_current_user_range_mapped` after a successful prefault. Without that line the
+>   whole change is defeated on every `Prefault::Yes` path, which is most syscalls.
+>
+> A second, correct consequence fell out: a `PROT_NONE` page (`user_flags::NONE` is
+> `AP_RO_EL1`) is now rejected as a syscall buffer, which is what Linux does. A
+> read-only user page still passes — the test is EL0 *reachability*, not
+> writability, and an EL1 write to a read-only user page is how a CoW break starts.
+>
+> Boot test: `kernel_va_rejected_as_user_pointer` (`src/tests.rs`). It asserts the
+> kernel VA is **present** as well as rejected — asserting only the rejection would
+> pass just as well against an unmapped address and prove nothing — plus a real user
+> page still accepted, a `PROT_NONE` page rejected, and `getrandom` into the kernel
+> VA returning `EFAULT` end-to-end through `handle_syscall`.
 
 The audit's "second win" was that folding closes the unchecked-destination hole.
 **It does not**, and this is the most important thing in this document.
@@ -368,8 +401,8 @@ noise into a finding.
 
 | | Item | Why it is not done here |
 |---|---|---|
-| 1 | **AP-bit test in `is_current_user_range_mapped`** (§7) | behaviour change; own A/B + boot test |
-| 2 | **`mremap` destination regression test** (§5) | needs a `userspace/` probe; the bug was silent |
+| 1 | ~~**AP-bit test in `is_current_user_range_mapped`** (§7)~~ **DONE 2026-08-14** — see the status block on §7 for what it actually took: one shared `resolve_user_leaf`, two *differently named* predicates, and a re-check after `prefault_user_range` without which the change is a no-op | 0 left |
+| 2 | ~~**`mremap` destination regression test** (§5)~~ **DONE 2026-08-14** — `userspace/forktest/c_stress/mremapmove.c`, three phases (resident grow, grown-tail-zero, sparse grow), calibrated `ALL PASS` on real Linux arm64 and added to `verify_trim.py`'s Tier 3 `EXERCISES`. Megabyte regions on purpose: a fix that only prefaulted the head would still fail phase 1 | 0 left |
 | 3 | Make `BYPASS_VALIDATION` per-thread with an RAII guard | it is a kernel-wide flag flipped by ~50 hand-paired `store(true)`/`store(false)` sites in the boot tests, so while it is on, validation is off for **every core**. No live leak path today (the "early returns" between pairs are all matches inside comments), but nothing enforces the pairing. The flag moved in this change, which is why the defect is written down here |
 | 4 | Fix the three §6 divergences | each is a behaviour change |
 | 5 | `timerfd_settime`'s prefault under `TIMERFD_TABLE` (§6) | pre-existing lock-ordering fix, unrelated to the copy API |

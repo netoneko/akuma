@@ -248,6 +248,7 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_direntry_has_is_symlink_field, "direntry_has_is_symlink_field");
     run_test!(test_procfs_fd_symlink_resolution, "procfs_fd_symlink_resolution");
     run_test!(test_map_user_page_already_mapped, "map_user_page_already_mapped");
+    run_test!(test_kernel_va_rejected_as_user_pointer, "kernel_va_rejected_as_user_pointer");
     run_test!(test_epoll_event_is_16_bytes_on_arm64, "epoll_event_is_16_bytes_on_arm64");
     run_test!(test_epoll_infinite_wait_uses_bounded_deadline, "epoll_infinite_wait_bounded_deadline");
     run_test!(test_kill_process_cascades_to_children, "kill_process_cascades_to_children");
@@ -2652,42 +2653,71 @@ pub fn test_waker_mechanism() -> bool {
 
 /// Test: Block-on executor with no-op waker
 ///
+/// Poll counter for [`MultiPollFuture`]. Reset by [`MultiPollFuture::new`], read
+/// back by the two `block_on` tests — which run sequentially in the boot suite, so
+/// one counter serves both.
+static MULTI_POLL_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// A future that returns `Pending` until it has been polled `polls_needed` times,
+/// then `Ready(polls_done)`.
+///
+/// Both `block_on` tests below need exactly this, and each used to declare its own
+/// copy — identical apart from the one line that matters: `wake_self`. The no-op
+/// waker test must *not* wake, because its whole point is that the executor keeps
+/// polling anyway; the real-`ThreadWaker` test must, because that is what tells a
+/// real executor to re-poll. Making that the one field keeps the difference stated
+/// rather than buried in a second copy of the body.
+struct MultiPollFuture {
+    polls_needed: usize,
+    polls_done: usize,
+    wake_self: bool,
+}
+
+impl MultiPollFuture {
+    /// Also zeroes [`MULTI_POLL_COUNT`], so a test can never read a previous
+    /// test's tally.
+    fn new(polls_needed: usize, wake_self: bool) -> Self {
+        MULTI_POLL_COUNT.store(0, core::sync::atomic::Ordering::SeqCst);
+        Self { polls_needed, polls_done: 0, wake_self }
+    }
+
+    fn polls_seen() -> usize {
+        MULTI_POLL_COUNT.load(core::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl core::future::Future for MultiPollFuture {
+    type Output = usize;
+
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<usize> {
+        self.polls_done += 1;
+        MULTI_POLL_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+
+        if self.polls_done >= self.polls_needed {
+            core::task::Poll::Ready(self.polls_done)
+        } else {
+            if self.wake_self {
+                // Wake ourselves so the executor knows to re-poll.
+                cx.waker().wake_by_ref();
+            }
+            core::task::Poll::Pending
+        }
+    }
+}
+
 /// Tests that a block_on style executor works even with a no-op waker
-/// (which is what we use in SSH sessions). Verifies the polling loop 
+/// (which is what we use in SSH sessions). Verifies the polling loop
 /// continues despite wake() doing nothing.
 pub fn test_block_on_noop_waker() -> bool {
     use core::future::Future;
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    
+
     console::print("\n[TEST] Block-on with no-op waker\n");
-    
-    static POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
-    
-    POLL_COUNT.store(0, Ordering::SeqCst);
-    
-    // A future that requires multiple polls
-    struct MultiPollFuture {
-        polls_needed: usize,
-        polls_done: usize,
-    }
-    
-    impl Future for MultiPollFuture {
-        type Output = usize;
-        
-        fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
-            self.polls_done += 1;
-            POLL_COUNT.fetch_add(1, Ordering::SeqCst);
-            
-            if self.polls_done >= self.polls_needed {
-                Poll::Ready(self.polls_done)
-            } else {
-                Poll::Pending
-            }
-        }
-    }
-    
+
     // No-op waker (like we use in block_on)
     static VTABLE: RawWakerVTable = RawWakerVTable::new(
         |_| RawWaker::new(core::ptr::null(), &VTABLE),
@@ -2716,10 +2746,10 @@ pub fn test_block_on_noop_waker() -> bool {
         None
     }
     
-    let future = MultiPollFuture { polls_needed: 5, polls_done: 0 };
+    let future = MultiPollFuture::new(5, false);
     let result = block_on_limited(future, 10);
-    
-    let poll_count = POLL_COUNT.load(Ordering::SeqCst);
+
+    let poll_count = MultiPollFuture::polls_seen();
     crate::safe_print!(64, "  Total polls: {} (expected 5)\n", poll_count);
     crate::safe_print!(64, "  Result: {:?} (expected Some(5))\n", result);
     
@@ -7057,6 +7087,92 @@ fn test_map_user_page_already_mapped() -> bool {
     pass
 }
 
+/// Test: a mapped **kernel** VA is rejected as a user pointer.
+///
+/// `AddressSpace::add_kernel_mappings` identity-maps kernel RAM as EL1-only 2 MB
+/// blocks into *every* user address space, so a kernel VA is genuinely present in
+/// TTBR0. User-pointer validation used to test presence only, so such an address
+/// passed — and the EL1-only permission stopped nothing, because the copy loop runs
+/// at EL1. Nothing but the user VA allocator's layout convention kept it unreachable
+/// (docs/archive/USER_COPY_FOLD.md §7). The fix tests the leaf PTE's AP bits.
+///
+/// Four cases, and the first two are the pair that matters: the kernel VA must be
+/// **present** and **not user-accessible**. Asserting only the second would pass
+/// just as well against an address that happens to be unmapped, which proves nothing.
+fn test_kernel_va_rejected_as_user_pointer() -> bool {
+    console::print("\n[TEST] kernel VA rejected as a user pointer (AP-bit check)\n");
+
+    use akuma_exec::mmu::{
+        UserAddressSpace, is_current_user_page_mapped, is_current_user_range_mapped,
+        map_user_page, user_flags,
+    };
+
+    let Some(addr_space) = UserAddressSpace::new() else {
+        crate::safe_print!(64, "  SKIP: failed to allocate address space\n");
+        return true;
+    };
+    let Some(user_page) = crate::pmm::alloc_page_zeroed() else {
+        crate::safe_print!(64, "  SKIP: failed to allocate page\n");
+        return true;
+    };
+    let Some(none_page) = crate::pmm::alloc_page_zeroed() else {
+        crate::pmm::free_page(user_page);
+        crate::safe_print!(64, "  SKIP: failed to allocate second page\n");
+        return true;
+    };
+
+    // A kernel heap allocation: certainly inside the identity-mapped RAM window,
+    // and certainly mapped, without hard-coding an address.
+    let kernel_buf = alloc::vec![0u8; 128];
+    let kernel_va = kernel_buf.as_ptr() as usize;
+
+    let user_va = 0x1000_0000usize;
+    let none_va = 0x1001_0000usize;
+
+    console::print("  step: activate\n");
+    addr_space.activate();
+
+    let (frames, _) = unsafe { map_user_page(user_va, user_page.addr, user_flags::RW) };
+    addr_space.track_user_frame(user_page);
+    for f in frames { addr_space.track_page_table_frame(f); }
+    let (frames, _) = unsafe { map_user_page(none_va, none_page.addr, user_flags::NONE) };
+    addr_space.track_user_frame(none_page);
+    for f in frames { addr_space.track_page_table_frame(f); }
+    console::print("  step: mapped\n");
+
+    // 1. The kernel VA really is mapped in this user address space...
+    let kernel_present = is_current_user_page_mapped(kernel_va);
+    console::print("  step: present\n");
+    // 2. ...and must nonetheless be refused as a user range.
+    let kernel_rejected = !is_current_user_range_mapped(kernel_va, 128);
+    console::print("  step: rejected\n");
+    // 3. A real user page still passes — the check must not be "reject everything".
+    let user_accepted = is_current_user_range_mapped(user_va, 128);
+    // 4. A PROT_NONE page (AP_RO_EL1) is refused too, which is what Linux does.
+    let prot_none_rejected = !is_current_user_range_mapped(none_va, 128);
+    console::print("  step: user+none\n");
+
+    // The whole check is defeated unless `validate_user_range` re-asserts the range
+    // after prefaulting: `prefault_user_range` skips pages that are already present,
+    // so on its own it reports success for this very address. Drive the validator
+    // directly rather than a syscall entry point — the entry points take BKL
+    // carve-out guards, which need process/thread registration this fixture has not
+    // set up.
+    let prefault_rejected = !akuma_exec::mmu::user_access::validate_user_range(
+        kernel_va as u64, 128, akuma_exec::mmu::user_access::Prefault::Yes);
+    console::print("  step: prefault\n");
+
+    UserAddressSpace::deactivate();
+    drop(kernel_buf);
+
+    let pass = kernel_present && kernel_rejected && user_accepted && prot_none_rejected && prefault_rejected;
+    crate::safe_print!(160, "  kernel_va=0x{:x} present={} rejected={}\n", kernel_va, kernel_present, kernel_rejected);
+    crate::safe_print!(160, "  user_accepted={} prot_none_rejected={} prefault_rejected={}\n",
+        user_accepted, prot_none_rejected, prefault_rejected);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
 /// Test: epoll_event struct is 16 bytes on ARM64
 ///
 /// On ARM64, epoll_event is NOT packed (unlike x86_64).
@@ -9068,43 +9184,16 @@ pub fn test_thread_waker_roundtrip() -> bool {
 
 /// Test: block_on-style executor with real ThreadWaker completes a multi-poll future
 pub fn test_block_on_real_waker() -> bool {
-    use core::future::Future;
     use core::pin::Pin;
     use core::task::{Context, Poll};
-    use core::sync::atomic::{AtomicUsize, Ordering};
 
     console::print("\n[TEST] Block-on with real ThreadWaker\n");
-
-    static POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
-    POLL_COUNT.store(0, Ordering::SeqCst);
-
-    struct MultiPollFuture {
-        polls_needed: usize,
-        polls_done: usize,
-    }
-
-    impl Future for MultiPollFuture {
-        type Output = usize;
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
-            self.polls_done += 1;
-            POLL_COUNT.fetch_add(1, Ordering::SeqCst);
-
-            if self.polls_done >= self.polls_needed {
-                Poll::Ready(self.polls_done)
-            } else {
-                // Wake ourselves so the executor knows to re-poll
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-    }
 
     // Use a real ThreadWaker (same as the new SSH block_on)
     let waker = akuma_exec::threading::current_thread_waker();
     let mut cx = Context::from_waker(&waker);
 
-    let mut future = MultiPollFuture { polls_needed: 5, polls_done: 0 };
+    let mut future = MultiPollFuture::new(5, true);
     let mut future = unsafe { Pin::new_unchecked(&mut future) };
 
     let mut result = None;
@@ -9115,7 +9204,7 @@ pub fn test_block_on_real_waker() -> bool {
         }
     }
 
-    let poll_count = POLL_COUNT.load(Ordering::SeqCst);
+    let poll_count = MultiPollFuture::polls_seen();
     crate::safe_print!(64, "  Total polls: {} (expected 5)\n", poll_count);
     crate::safe_print!(64, "  Result: {:?} (expected Some(5))\n", result);
 

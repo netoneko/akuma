@@ -12,6 +12,32 @@
 
 extern crate alloc;
 
+/// A `Display` impl for a fieldless error enum, from a variant → message table.
+///
+/// The three driver error types below (`BlockError`, `RngError`, `AudioError`)
+/// each hand-wrote the same `fmt` → `match self` → `write!(f, "…")` body over a
+/// list of unit variants; the only thing that differed was the list. Defined
+/// here rather than in `akuma-primitives` because all three consumers are in
+/// this crate — it stops being intra-crate the moment a fourth appears
+/// elsewhere, and that is when to move it.
+///
+/// `f.write_str` rather than `write!`: every message is a literal with no
+/// arguments, so there is nothing to format.
+///
+/// Declared before the `mod` items on purpose — a crate-root `macro_rules!` is
+/// only in scope for modules declared after it in source order.
+macro_rules! impl_display {
+    ($ty:ty { $($variant:ident => $msg:literal),+ $(,)? }) => {
+        impl core::fmt::Display for $ty {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str(match self {
+                    $(Self::$variant => $msg,)+
+                })
+            }
+        }
+    };
+}
+
 pub mod hal;
 pub mod probe;
 

@@ -39,17 +39,13 @@ pub enum BlockError {
     InvalidOffset,
 }
 
-impl core::fmt::Display for BlockError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::NotFound => write!(f, "Block device not found"),
-            Self::ReadError => write!(f, "Read error"),
-            Self::WriteError => write!(f, "Write error"),
-            Self::NotInitialized => write!(f, "Device not initialized"),
-            Self::InvalidOffset => write!(f, "Invalid offset"),
-        }
-    }
-}
+impl_display!(BlockError {
+    NotFound => "Block device not found",
+    ReadError => "Read error",
+    WriteError => "Write error",
+    NotInitialized => "Device not initialized",
+    InvalidOffset => "Invalid offset",
+});
 
 // ============================================================================
 // VirtIO Block Device Wrapper

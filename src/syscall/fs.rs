@@ -1,4 +1,5 @@
 use super::*;
+use akuma_primitives::{GuardToggle, ToggledGuard};
 // Both of these are only used by the smoltcp socket read/write arms: the module
 // alias, and `libc_errno` for the positive-form error a socket call returns. The
 // negated forms this file returns to userspace come from `super::*`
@@ -6,150 +7,107 @@ use super::*;
 #[cfg(feature = "smoltcp")]
 use akuma_net::socket::{self, libc_errno};
 
-/// RAII guard that runs a VFS syscall **without** the Big Kernel Lock — Phase 4 of
-/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md. Mirrors
-/// [`super::net::NetBklGuard`] (the proven `no-bkl-network` template).
+/// The `no-bkl-vfs` carve-out (Phase 4 of
+/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), as a [`GuardToggle`] marker.
+///
+/// Correctness rests on the state these syscalls mutate already carrying its own
+/// fine-grained locks — the per-process fd table (`SharedFdTable`'s `Spinlock`, every
+/// access already wrapped in `with_irqs_disabled`), the mount table (`MOUNT_TABLE`,
+/// released before any I/O in `with_fs`), the ext2 superblock/BGD
+/// (`Ext2Filesystem::state` RwSpinlock), the block cache
+/// (`Ext2Filesystem::block_cache` Spinlock), and the block device (`BLOCK_DEVICE`
+/// Spinlock) — so the BKL is redundant for them; dropping it lets non-fs work on
+/// other cores proceed in parallel.
+///
+/// The runtime toggle lets a boot image with the feature compiled in still A/B
+/// against the BKL-held path without a rebuild; [`ToggledGuard`] states the latching
+/// discipline that makes such a flip safe mid-syscall.
+pub(super) struct VfsBkl;
+
+impl GuardToggle for VfsBkl {
+    const COMPILED_IN: bool = cfg!(all(kernel_smp_shared, kernel_no_bkl_vfs));
+    #[inline]
+    fn enabled() -> bool {
+        #[cfg(kernel_smp_shared)]
+        {
+            crate::smp_shared::vfs_bkl_drop_enabled()
+        }
+        #[cfg(not(kernel_smp_shared))]
+        {
+            false
+        }
+    }
+    #[inline]
+    fn enter() {
+        akuma_exec::bkl::dropped_window_open();
+    }
+    #[inline]
+    fn exit() {
+        akuma_exec::bkl::dropped_window_close();
+    }
+}
+
+/// RAII guard that runs a VFS syscall **without** the Big Kernel Lock.
 ///
 /// Constructed at the top of each fs syscall: `new()` DROPS the BKL so this core
 /// runs the syscall concurrently with peer cores, and `drop()` RE-ACQUIRES it on
-/// every return path. Correctness rests on the state these syscalls mutate already
-/// carrying its own fine-grained locks — the per-process fd table
-/// (`SharedFdTable`'s `Spinlock`, every access already wrapped in
-/// `with_irqs_disabled`), the mount table (`MOUNT_TABLE`, released before any I/O
-/// in `with_fs`), the ext2 superblock/BGD (`Ext2Filesystem::state` RwSpinlock),
-/// the block cache (`Ext2Filesystem::block_cache` Spinlock), and the block device
-/// (`BLOCK_DEVICE` Spinlock) — so the BKL is redundant for them; dropping it lets
-/// non-fs work on other cores proceed in parallel.
+/// every return path, keeping the syscall wrapper's single `leave_kernel`
+/// (`rust_sync_el0_handler` in exceptions.rs) balanced.
 ///
-/// Re-acquiring on drop keeps the syscall wrapper's single `leave_kernel`
-/// (`rust_sync_el0_handler` in exceptions.rs) balanced. The drop/re-acquire pair goes
-/// through `bkl::dropped_window_open`/`close`, which registers the window in the
-/// per-thread ledger so a nested IRQ, page fault, or context switch RESTORES the
-/// dropped state on its way back in. (The first version used bare
-/// `leave_kernel`/`enter_kernel`: balanced, but the first timer tick inside the window
-/// re-held the BKL for the syscall's remainder — tens of ms for bulk ext2 I/O — which
-/// was the `[BKL] stuck` regression, docs/archive/BKL_VFS_CARVE_OUT.md §8.)
+/// `new_if(on_disk)` takes the guard only where the on-disk work spans a whole
+/// function rather than sitting in one `match` arm (`sys_write`'s per-chunk loop,
+/// `sys_lseek`'s `update_fd` closure). It mirrors how `sys_sendto` routes pipe-backed
+/// fds *before* taking `NetBklGuard`: an fd that isn't a real file (tty, pipe, socket,
+/// eventfd, `/dev/null`) must keep the BKL, since its path touches terminal/pipe state
+/// this carve-out has not audited.
+pub(super) type VfsBklGuard = ToggledGuard<VfsBkl>;
+
+/// The `no-bkl-drivers` carve-out (Phase 6 of
+/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), as a [`GuardToggle`] marker.
 ///
-/// Zero-cost no-op unless BOTH `kernel_smp_shared` and `kernel_no_bkl_vfs` are set
-/// (or the runtime toggle `vfs_bkl_drop_enabled()` is off) — the struct is empty
-/// and `new`/`drop` compile to nothing, so default, `size`, `extreme`, and plain
-/// `smp-shared` builds are byte-for-byte unchanged. The runtime toggle lets a boot
-/// image with the feature compiled in still A/B against the BKL-held path without
-/// a rebuild.
-pub(super) struct VfsBklGuard {
-    /// Whether `new()` actually dropped the BKL, **latched at construction**.
-    ///
-    /// `drop()` must not re-read `vfs_bkl_drop_enabled()`: unlike [`super::net::NetBklGuard`]
-    /// — which is purely compile-time gated and so cannot go out of balance — this guard
-    /// consults a runtime toggle, and that toggle really does get flipped while guards are
-    /// live (the A/B boot self-tests flip it between phases, and it doubles as a kill
-    /// switch). A guard that asked the toggle twice would, on a flip from ON to OFF between
-    /// its `new` and its `drop`, leave the BKL released for the rest of the syscall — and
-    /// the syscall wrapper's single `leave_kernel` would then release a lock this core no
-    /// longer holds, advancing `now_serving` for a ticket nobody owns. Latching makes the
-    /// guard balanced by construction, whatever the toggle does mid-syscall.
-    #[cfg(all(kernel_smp_shared, kernel_no_bkl_vfs))]
-    dropped_bkl: bool,
-}
-
-impl VfsBklGuard {
-    #[inline]
-    pub(super) fn new() -> Self {
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_vfs))]
-        let dropped_bkl = crate::smp_shared::vfs_bkl_drop_enabled();
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_vfs))]
-        if dropped_bkl {
-            akuma_exec::bkl::dropped_window_open();
-        }
-        Self {
-            #[cfg(all(kernel_smp_shared, kernel_no_bkl_vfs))]
-            dropped_bkl,
-        }
-    }
-
-    /// Take the guard only if `on_disk` — i.e. this call really is going to touch the
-    /// on-disk VFS.
-    ///
-    /// Used where the on-disk work spans a whole function rather than sitting in one
-    /// `match` arm (`sys_write`'s per-chunk loop, `sys_lseek`'s `update_fd` closure), so
-    /// the arm-local placement used elsewhere isn't available. Mirrors how `sys_sendto`
-    /// routes pipe-backed fds *before* taking `NetBklGuard`: an fd that isn't a real file
-    /// (tty, pipe, socket, eventfd, `/dev/null`) must keep the BKL, since its path touches
-    /// terminal/pipe state this carve-out has not audited.
-    #[inline]
-    pub(super) fn new_if(on_disk: bool) -> Option<Self> {
-        on_disk.then(Self::new)
-    }
-}
-
-impl Drop for VfsBklGuard {
-    #[inline]
-    fn drop(&mut self) {
-        // Latched in `new()` — deliberately NOT a fresh `vfs_bkl_drop_enabled()` read.
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_vfs))]
-        if self.dropped_bkl {
-            akuma_exec::bkl::dropped_window_close();
-        }
-    }
-}
-
-/// RAII guard that runs a device-driver syscall **without** the Big Kernel Lock
-/// — Phase 6 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md. Mirrors
-/// [`MmBklGuard`] (and `VfsBklGuard`) exactly, including the latching discipline.
-///
-/// Constructed inside the device-driver syscall paths (`sys_getrandom`, the
-/// `DevUrandom` arm of `sys_read`/`sys_pread64`, the `DevDsp` arm of `sys_write`,
-/// and `sys_fb_init`/`sys_fb_draw`/`sys_fb_info`): `new()` DROPS the BKL so this
-/// core runs the device I/O concurrently with peer cores, and `drop()`
-/// RE-ACQUIRES it on every return path. Correctness rests on each driver's state
+/// Covers the device-driver syscall paths — `sys_getrandom`, the `DevUrandom` arm of
+/// `sys_read`/`sys_pread64`, the `DevDsp` arm of `sys_write`, and
+/// `sys_fb_init`/`sys_fb_draw`/`sys_fb_info`. Correctness rests on each driver's state
 /// already carrying its own fine-grained Spinlock — `RNG_DEVICE` (virtio-rng,
 /// `src/rng.rs`), `SOUND_DEVICE` (virtio-sound, `src/audio.rs`), and `FB_STATE`
 /// (ramfb, `src/ramfb.rs`) — so the BKL is redundant for them. The block device
 /// (`BLOCK_DEVICE`) and network device (`NETWORK`) are already BKL-free via
-/// `no-bkl-vfs` / `no-bkl-network`; this guard covers the remaining drivers.
+/// `no-bkl-vfs` / `no-bkl-network`; this window covers the remaining drivers.
 ///
-/// All virtio devices in this kernel are **polling-based** (no virtio IRQ
-/// handlers are registered — only the timer IRQ 27), so device I/O is a
-/// synchronous busy-wait under the driver's Spinlock, not an interrupt-driven
-/// completion. The BKL-drop lets peer cores run while this core polls.
-///
-/// Like `MmBklGuard`, none of the driver Spinlocks need to know a BKL-free window
-/// is calling them — their acquisition is already unconditional. Zero-cost no-op
-/// unless BOTH `kernel_smp_shared` and `kernel_no_bkl_drivers` are set (or the
-/// runtime toggle `drivers_bkl_drop_enabled()` is off).
-pub(super) struct DriverBklGuard {
-    /// Whether `new()` actually dropped the BKL, **latched at construction** —
-    /// same reasoning as `VfsBklGuard::dropped_bkl` / `MmBklGuard::dropped_bkl`.
-    #[cfg(all(kernel_smp_shared, kernel_no_bkl_drivers))]
-    dropped_bkl: bool,
-}
+/// All virtio devices in this kernel are **polling-based** (no virtio IRQ handlers are
+/// registered — only the timer IRQ 27), so device I/O is a synchronous busy-wait under
+/// the driver's Spinlock, not an interrupt-driven completion. The BKL-drop lets peer
+/// cores run while this core polls. Like [`MmBkl`](super::mem::MmBkl), none of the
+/// driver Spinlocks need to know a BKL-free window is calling them — their acquisition
+/// is already unconditional.
+pub(super) struct DriverBkl;
 
-impl DriverBklGuard {
+impl GuardToggle for DriverBkl {
+    const COMPILED_IN: bool = cfg!(all(kernel_smp_shared, kernel_no_bkl_drivers));
     #[inline]
-    pub(super) fn new() -> Self {
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_drivers))]
-        let dropped_bkl = crate::smp_shared::drivers_bkl_drop_enabled();
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_drivers))]
-        if dropped_bkl {
-            akuma_exec::bkl::dropped_window_open();
+    fn enabled() -> bool {
+        #[cfg(kernel_smp_shared)]
+        {
+            crate::smp_shared::drivers_bkl_drop_enabled()
         }
-        Self {
-            #[cfg(all(kernel_smp_shared, kernel_no_bkl_drivers))]
-            dropped_bkl,
+        #[cfg(not(kernel_smp_shared))]
+        {
+            false
         }
+    }
+    #[inline]
+    fn enter() {
+        akuma_exec::bkl::dropped_window_open();
+    }
+    #[inline]
+    fn exit() {
+        akuma_exec::bkl::dropped_window_close();
     }
 }
 
-impl Drop for DriverBklGuard {
-    #[inline]
-    fn drop(&mut self) {
-        // Latched in `new()` — deliberately NOT a fresh `drivers_bkl_drop_enabled()` read.
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_drivers))]
-        if self.dropped_bkl {
-            akuma_exec::bkl::dropped_window_close();
-        }
-    }
-}
+/// RAII guard that runs a device-driver syscall **without** the Big Kernel Lock.
+/// See [`DriverBkl`] for what makes that safe.
+pub(super) type DriverBklGuard = ToggledGuard<DriverBkl>;
 
 /// Bounded, always-on diagnostic counter for `read()` returning EBADF.
 ///

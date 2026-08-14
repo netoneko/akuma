@@ -79,16 +79,12 @@ pub enum RngError {
     TransportError,
 }
 
-impl core::fmt::Display for RngError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::NotFound => write!(f, "RNG device not found"),
-            Self::NotInitialized => write!(f, "RNG device not initialized"),
-            Self::ReadError => write!(f, "Failed to read random bytes"),
-            Self::TransportError => write!(f, "VirtIO transport error"),
-        }
-    }
-}
+impl_display!(RngError {
+    NotFound => "RNG device not found",
+    NotInitialized => "RNG device not initialized",
+    ReadError => "Failed to read random bytes",
+    TransportError => "VirtIO transport error",
+});
 
 // ============================================================================
 // VirtIO Data Structures (split-virtqueue layout; identical for v1 and v2)

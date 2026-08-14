@@ -36,16 +36,12 @@ pub enum AudioError {
     InvalidParam,
 }
 
-impl core::fmt::Display for AudioError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::NotFound => write!(f, "Sound device not found"),
-            Self::NotInitialized => write!(f, "Sound device not initialized"),
-            Self::IoError => write!(f, "Sound I/O error"),
-            Self::InvalidParam => write!(f, "Invalid audio parameter"),
-        }
-    }
-}
+impl_display!(AudioError {
+    NotFound => "Sound device not found",
+    NotInitialized => "Sound device not initialized",
+    IoError => "Sound I/O error",
+    InvalidParam => "Invalid audio parameter",
+});
 
 // ============================================================================
 // OSS ioctl constants + format codes (shared; userspace mirrors these)

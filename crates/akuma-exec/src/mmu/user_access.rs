@@ -149,7 +149,17 @@ pub fn validate_user_range(ptr: u64, len: usize, prefault: Prefault) -> bool {
         return true;
     }
     match prefault {
-        Prefault::Yes => prefault_user_range(ptr as usize, len),
+        // Re-assert the real predicate after the fill. `prefault_user_range` skips
+        // pages that are already *present* — deliberately, so it never re-maps a
+        // `PROT_NONE` guard or a lazily-filled page twice — so on its own it would
+        // report success for a range that is mapped but not EL0-accessible, which is
+        // exactly the case the AP test in `is_current_user_range_mapped` exists to
+        // reject. The second walk only runs on a path that just did per-page frame
+        // allocation and possibly file I/O.
+        Prefault::Yes => {
+            prefault_user_range(ptr as usize, len)
+                && super::is_current_user_range_mapped(ptr as usize, len)
+        }
         Prefault::No => false,
     }
 }

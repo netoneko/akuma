@@ -46,8 +46,10 @@ pub mod errno;
 pub mod irq;
 pub mod once;
 pub mod preempt;
+pub mod toggled_guard;
 
 pub use addr::{phys_to_virt, virt_to_phys};
+pub use toggled_guard::{GuardToggle, ToggledGuard};
 pub use console::{FmtBuf, StackWriter};
 pub use preempt::{MAX_THREADS, PreemptGuard};
 pub use irq::{

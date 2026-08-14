@@ -849,11 +849,14 @@ That last row is the one Phase 3 warned about: following `akuma-net`'s `log::`
 pattern would have deleted those lines silently, since every crate pins `log`
 with `max_level_off` and no logger is ever registered.
 
-**Found and not fixed:** `src/console.rs`'s `print_dec` (`:160`) and `print_u64`
-(`:180`) are a genuine 21-line / 82-token Type-1 clone — CPD has always reported
-it — differing only in `usize` vs `u64`. Untouched here because it is unrelated
-to the writer cluster. It is a Phase 6 one-liner (`print_u64` delegating, or one
-generic over `Into<u64>`).
+**Found and not fixed here — fixed 2026-08-14:** `src/console.rs`'s `print_dec`
+(`:160`) and `print_u64` (`:180`) were a genuine 21-line / 82-token Type-1 clone
+— CPD has always reported it — differing only in `usize` vs `u64`. Left alone in
+this phase because it is unrelated to the writer cluster; closed later as the
+predicted Phase 6 one-liner, `print_dec` delegating with an `n as u64` widening
+cast. Neither a generic nor a trait bound: `usize` is 64-bit on every target this
+kernel builds for, so the cast is total and the second digit loop was pure
+duplication.
 
 ## 5.6 Case study: the CoW refcount underflow (2026-08-12)
 
@@ -1634,13 +1637,13 @@ ELF-loading path into one.
 | 5 | ~~`exceptions.rs` duplicated `Drop` impls + the demand-paging bodies~~ **DONE — both halves.** Guard half 2026-08-13 (three byte-identical guards → one `FaultSlotGuard` + `fault_slot_hold`, ~24 lines, not the `~142` the survey claimed — corrections in [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §7). Body half 2026-08-14: the ~330-line DA/IA demand-paging merge, declined three times, is one `demand_page_lazy_region` + an `akuma_exec::mmu::FaultAccess` seam (§12 there). It found **eight** differences, not §6's two — six were formatting and observability — and produced two new findings (F9 W^X on the IA permission upgrade, F10 asymmetric miss recovery), both recorded, neither fixed. `extreme-size` image −8,192 bytes; `host.tests` 508 → 512; `fail_set` identical at SMP=1 and SMP=4; Tier 4 `redis.stage: ok` | 0 left | — | — |
 | 6 | ~~`box_mod` `access.rs` / `hierarchy.rs`~~ **DONE 2026-08-14** with item 9 — one `#[cfg(test)] pub(crate) make_test_registry()` in `box_mod/mod.rs`, both test modules importing it. As §4 predicted, it was the *fixture* and not the two named functions | 0 left | — | — |
 | 7 | ~~`rump_proxy.rs` / `akuma-rump` `sysproxy.rs`~~ **DONE 2026-08-13** — 3 impls → 1 `pub NoMem` with `faulting()`/`discarding()`; there was no home to settle (§4). Also closes Phase 4's `ClientMem`/`NoMem` row | 0 left | — | — |
-| 8 | `mmu/mod.rs` `map_user_page` / `_no_flush` and the three walk clones | ~80 | medium | **high** — see `UNSAFE_AUDIT.md` §5.1 |
+| 8 | ~~`mmu/mod.rs` `map_user_page` / `_no_flush` and the three walk clones~~ **DONE 2026-08-14** — −28 net lines, and it was **three** clone families rather than one: (a) `map_user_page`/`_no_flush`, 43 identical lines apart from one TLB invalidation, onto one `#[inline] map_user_page_inner(.., flush)`; (b) the sparse *range* walk written out three times — `collect_mapped_pages_sparse`, `collect_mapped_pages_with_flags_into`, `demote_range_to_ro` — onto one `for_each_mapped_user_pte(l0, va, pages, f)` that hands the callback `(page_va, entry, *mut pte)`, so the one copy that *writes* PTEs in the fork/CoW path shares its index arithmetic with the two that read; (c) the fixed L0→L3 walk written out five times, split by what it wanted from the leaf — `translate_user_va`/`user_pte_raw`/`is_page_mapped_ptr` onto `resolve_user_leaf` returning a `UserLeaf`, and `update_current_user_page_flags`/`remap_current_user_page` onto `current_user_l3_pte`. **Found one latent defect**: `update_current_user_page_flags` never checked `TABLE` at L1/L2, so a block descriptor's output address would have been walked as a table base; the merged helper checks, as `remap_current_user_page` always did. `resolve_user_leaf` is also what made the `USER_COPY_FOLD.md` §7 AP-bit fix a two-line change | 0 left | — | — |
 | 9 | ~~Test-file clones (`tests.rs`, `process_tests.rs`)~~ **DONE 2026-08-14** — 11 clone families → 11 helpers, absorbing item 6. CPD test-only blocks **17 → 1**; the one left is declined with a reason. Host tests unchanged at 508 and boot tests unchanged at 275/282: every merge extracted a *helper*, none collapsed a test. **The row's framing was wrong** — the duplication is not *between* the two files (they share no identically-named function); all 17 blocks were within-file. Found and fixed two real defects on the way. See §10 | 0 left | — | — |
 | 12 | ~~Runtime-registration machinery (§5.8)~~ **DONE 2026-08-13** — one `akuma_primitives::Registered<T>`; 3 definitions → 1 and **21 spinlock acquisitions removed** from `akuma-net`'s poll/socket paths. Line count a wash; judge it on the locks | 0 left | — | — |
 | 11 | ~~**Errno spellings (§5.7)**~~ **DONE 2026-08-14** — one `akuma_primitives::errno` table with the negated forms *generated* from the positive ones; 116 definitions → 39, 150 hand-written negations → 0, +5 host tests. It was **five** tables and **four** spellings, not three and two, and the predicted comment/value drift existed in two places (`term.rs` returning `ENOMEM` under an `// ENXIO` comment, recorded and deliberately not fixed). Run **before** the Phase 5 sweep rather than with it, so each syscall arm is rewritten once | 0 left | — | — |
 | 13 | **`#[inline]` audit (§5.10)** — deferred by request 2026-08-13. Both directions: missing attrs on cross-crate hot paths (`[profile.release]` sets no `lto`), and 33 `#[inline(always)]` fighting the `extreme-size` floor. Judge on IMAGE size + a microbenchmark, not counts | ~700 fns surveyed | medium | low |
 | 14 | ~~**The fork/CoW pile ([`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md))**~~ **DONE 2026-08-14** — every row in that document's §9 findings table is closed: F1/F1b/F2/F3/F8 earlier that day, then F4 (six open-coded `dc cvau`/`ic ivau` sequences → one `mmu::sync_icache_range`, which also moved the completion barrier to the correct side of publication), F5 (**retired — not a defect**, §11.2 there), F6 (`FaultSlot::AlreadyHeld`) and F7 (already fixed). The merges landed as §8.1 (CoW-break middle) and §8.2 (`inherit_from` + `spawn_child_thread_and_publish`). **What is left is not this row**: §8 item 5's ~330-line DA/IA body merge and item 8 below, both still high-risk | 0 left | — | — |
-| 10 | Trait-impl clusters (§5.5): `ClientMem`/`NoMem` across crates, duplicate `IrqGuard`, BKL guard family → one generic guard, `impl_display!` macro, duplicate `MultiPollFuture`. **In progress — `akuma-primitives` rungs 1–2 done (§5.555); the `~180` is the wrong metric, see there** | ~180 | small–medium | low |
+| 10 | ~~Trait-impl clusters (§5.5)~~ **DONE 2026-08-14** — the last three rows closed together. `impl_display!` is a crate-root `macro_rules!` in `akuma-virtio` and stays intra-crate because all three consumers are (`BlockError`/`RngError`/`AudioError`, and it uses `f.write_str` — every message is an argument-free literal). `MultiPollFuture` is one module-level helper in `src/tests.rs`; the two copies differed in exactly one line, so `wake_self: bool` is now the only field that states it. The **BKL guard family** became `akuma_primitives::ToggledGuard<T>` + a `GuardToggle` marker per carve-out: `NetBklGuard`/`VfsBklGuard`/`ProcessBklGuard`/`MmBklGuard`/`DriverBklGuard` survive as type aliases, so every call site is unchanged, and the latching rule that used to be restated in four doc comments is stated once. It lives in the leaf crate because it names no lock — `enter`/`exit` come from the marker (§5.555's rule) — and `+6 host tests` came with it, including the ON→OFF and OFF→ON mid-guard toggle flips that are the whole reason for latching. `ClientMem`/`NoMem` and the `fmt::Write` buffers closed earlier (items 7 and §5.555 rung 2) | 0 left | — | — |
 
 Items 1–3 are ~190 lines for an afternoon, and item 1 is the same work as
 `UNSAFE_AUDIT.md`'s tier A — do it once, count it twice.
@@ -2194,7 +2197,7 @@ weaker result than a positive trace and is reported as such.
 
 | Item | Notes |
 |---|---|
-| `src/console.rs` `print_dec` / `print_u64` | a genuine 21-line / 82-token **Type-1** clone differing only in `usize` vs `u64`; CPD has always reported it. Found during the `akuma-primitives` work, unrelated to it |
+| ~~`src/console.rs` `print_dec` / `print_u64`~~ | **DONE 2026-08-14** — `print_dec` is now `print_u64(n as u64)`. It was a genuine 21-line / 82-token **Type-1** clone differing only in `usize` vs `u64`; CPD had always reported it |
 | ~~`exceptions.rs`'s duplicated `Drop` impls (§8 item 5)~~ | **DONE — both halves.** Guard half 2026-08-13 (above); the ~330-line DA/IA demand-paging body merge landed 2026-08-14 as one `demand_page_lazy_region` + an `akuma_exec::mmu::FaultAccess` entry-point seam, with the policy half (`lazy_map_flags`, `user_flags::is_exec`) moved into `akuma-exec` so it is host-testable — 4 new host tests + 1 boot test. Full record, all eight differences and their decisions, the `is_exec` reasoning and the verification numbers: [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §12. Two new findings out of it (F9, F10 in §9 there), recorded and not fixed. **What the three previous declines got wrong:** the two "behavioural divergences" that supposedly blocked it were a copy-paste artifact and a category error; the real work was scoping where the shared body starts and stops (the `PROT_NONE` arm and the lazy-region-miss branch stay per-arm, and should) |
 | ~~The fork/CoW pile (§8 items 13–14)~~ | **DONE 2026-08-14** — all of [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §9 is closed, including the `cow_fault_lock` finding (deleted with the `akuma-pmm` extraction). Six more open-coded `dc cvau`/`ic ivau` sequences in `exceptions.rs` collapsed onto the existing `mmu::sync_icache_range` on the way out (F4) |
 
@@ -2212,12 +2215,19 @@ per §5.6.
 The `#[inline]` audit (§5.10) belongs here too, but only after the `lto = "thin"`
 question is settled — deciding that first may delete most of the work.
 
-### Promoted out of "deferred"
+### Promoted out of "deferred" — then DONE 2026-08-14
 
 The CoW/`mmu` cluster (`map_user_page` / `_no_flush` and the walk clones) was
-parked as high-risk-low-payoff. §5.6 is the payoff: that cluster demonstrably
-produces memory corruption. Still do not touch it while the other agent is in
-`exceptions.rs` — but it is no longer optional.
+parked as high-risk-low-payoff. §5.6 was the payoff: that cluster demonstrably
+produces memory corruption. Promoted on that basis, and closed as §8 item 8 — three
+clone families, not one, and the merge turned up a latent block-descriptor bug in
+`update_current_user_page_flags` that no copy of the walk had ever checked for.
+
+The `Pte`/`PageTable` newtype (`UNSAFE_AUDIT.md` §5.1) is a **different, still-open**
+item and this does not subsume it: item 8 removed duplicate *walks*, not the raw
+`read_volatile`/`write_volatile` at each level. What it did do is concentrate them —
+the file now has one range walk and two fixed walks instead of eight — so the
+newtype, if it is ever done, has far fewer sites to convert.
 
 Still deferred, genuinely: `Mmio<T>` (~−25 `unsafe`), safe sysreg readers (~−27,
 relocation not removal), the `Pte`/`PageTable` newtype (~−50). Specifically do

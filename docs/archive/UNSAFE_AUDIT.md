@@ -172,7 +172,7 @@ value target in the tree.
 >    `[KERNEL_VA_START, kernel_va_end())` — a layout convention, not a check. The
 >    real fix is to test the leaf PTE's AP bits ("mapped *as user memory*"), which
 >    is a contained change to `is_current_user_range_mapped` but a **behaviour
->    change** and wants its own A/B. **Still open**; see §4.0a below.
+>    change** and wants its own A/B. **Done 2026-08-14**; see §4.0a below.
 > 2. **The "it can't move, the prefault is bin-crate logic" objection was wrong.**
 >    Raised while planning, and disproved by looking: `akuma-exec` already depends
 >    on `akuma-pmm` directly, `as_lock`/`with_as_locked` are its own `Process`
@@ -247,9 +247,19 @@ validated its *destination*, so a lazy page in the new mapping silently truncate
 the move — and three Linux divergences plus one pre-existing lock-ordering defect
 were recorded without being changed.
 
-### 4.0a Still open: the check is unskippable, but it is the wrong check
+### 4.0a The check was unskippable but wrong — FIXED 2026-08-14
 
-`user_range_ok` + `is_current_user_range_mapped` cannot distinguish a user page
+> **Status: DONE.** `is_current_user_range_mapped` tests the leaf PTE's AP bits
+> (bit 6 — set for `AP_RW_ALL`/`AP_RO_ALL`, clear for the two EL1-only encodings),
+> so a kernel VA as a syscall buffer now returns `EFAULT`. Boot test
+> `kernel_va_rejected_as_user_pointer`. Two things the plan below did not foresee:
+> the *page*-granular `is_current_user_page_mapped` had to stay a presence test
+> (its callers are demand-paging paths where a `PROT_NONE` page must read as
+> present), and `validate_user_range` had to re-check after `prefault_user_range`,
+> which skips already-present pages and would otherwise wave the kernel VA through
+> on every `Prefault::Yes` path. Record: [`USER_COPY_FOLD.md`](USER_COPY_FOLD.md) §7.
+
+`user_range_ok` + `is_current_user_range_mapped` could not distinguish a user page
 from a kernel page: `add_kernel_mappings` (`mmu/mod.rs:710`) identity-maps kernel
 RAM as EL1-only 2 MB blocks in **every** user address space, the mapped-ness test
 checks presence only, and the copy loop runs at EL1 where the EL1-only permission

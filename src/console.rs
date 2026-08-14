@@ -155,24 +155,13 @@ pub fn print_hex(n: u64) {
     emit(&buf[i..]);
 }
 
-/// Print a number in decimal (no heap allocation)
+/// Print a number in decimal (no heap allocation).
+///
+/// `usize` is 64-bit on every target this kernel builds for, so this is
+/// [`print_u64`] with a widening cast rather than a second digit loop.
+#[inline]
 pub fn print_dec(n: usize) {
-    let mut buf = [0u8; 20];
-    let mut i = 20;
-    let mut val = n;
-
-    if val == 0 {
-        emit(b"0");
-        return;
-    }
-
-    while val > 0 && i > 0 {
-        i -= 1;
-        buf[i] = b'0' + (val % 10) as u8;
-        val /= 10;
-    }
-
-    emit(&buf[i..]);
+    print_u64(n as u64);
 }
 
 /// Print a u64 in decimal (no heap allocation)

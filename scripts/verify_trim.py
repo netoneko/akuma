@@ -91,8 +91,15 @@ CLIPPY_CONFIGS = [
 # all three phases on real Linux arm64, so a FAIL here is the kernel, not the
 # probe. On a tree without the fix it reports two FAILs; `cowstale`/`bssfork` are
 # the no-regression check beside it.
+#
+# `mremapmove` is the regression guard USER_COPY_FOLD.md §5 asked for: `sys_mremap`
+# copies the payload into a brand-new (entirely lazy) destination mapping, and it
+# used to truncate at the first page that faulted, silently — a `break` in the copy
+# loop is indistinguishable from completion at the call site. Also calibrated ALL
+# PASS on real Linux arm64, so a FAIL is the kernel.
 EXERCISES = [
     ("madvshared", "madvshared", "madvshared: ALL PASS"),
+    ("mremapmove", "mremapmove", "mremapmove: ALL PASS"),
     ("cowstale", "cowstale", "cowstale PASS"),
     ("bssfork", "bssfork", "bssfork PASS"),
     ("bssfork_spread1", "bssfork 20 8 1", "bssfork PASS"),

@@ -294,7 +294,12 @@ echo "mmap_file (C) copied to bootstrap/bin/"
 # (docs/archive/CARGO_HEAP_NULL_RC.md theory 3 — the null-`Rc` mechanism). Replaces a
 # ~1-in-5 crash during a full in-guest cargo build as the instrument for that
 # question. Calibrated ALL PASS on real Linux arm64; a FAIL here is the kernel.
-echo "Building mprotectlb + clonearg + cowstale + bssfork + madvshared (C, thread-spawn/mprotect/CoW probes)..."
+# mremapmove: the regression guard for `sys_mremap`'s payload move silently
+# truncating at the first lazy page of its freshly-created destination
+# (docs/archive/USER_COPY_FOLD.md §5 — the bug the user-copy fold found, which
+# shipped without a test because a truncation looks exactly like a completion).
+# Calibrated ALL PASS on real Linux arm64; a FAIL here is the kernel.
+echo "Building mprotectlb + clonearg + cowstale + bssfork + madvshared + mremapmove (C, thread-spawn/mprotect/CoW/mremap probes)..."
 (
     cd forktest/c_stress
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o mprotectlb mprotectlb.c
@@ -302,13 +307,15 @@ echo "Building mprotectlb + clonearg + cowstale + bssfork + madvshared (C, threa
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o cowstale cowstale.c -pthread
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o bssfork bssfork.c -pthread
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o madvshared madvshared.c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o mremapmove mremapmove.c
 )
 cp forktest/c_stress/mprotectlb ../bootstrap/bin/
 cp forktest/c_stress/clonearg ../bootstrap/bin/
 cp forktest/c_stress/cowstale ../bootstrap/bin/
 cp forktest/c_stress/bssfork ../bootstrap/bin/
 cp forktest/c_stress/madvshared ../bootstrap/bin/
-echo "mprotectlb + clonearg + cowstale + bssfork + madvshared (C) copied to bootstrap/bin/"
+cp forktest/c_stress/mremapmove ../bootstrap/bin/
+echo "mprotectlb + clonearg + cowstale + bssfork + madvshared + mremapmove (C) copied to bootstrap/bin/"
 
 # spawnalias: the address-space identity canary for the thread-spawn SIGSEGV
 # class. Unlike clonearg (which proved the clone *handoff* is sound and would

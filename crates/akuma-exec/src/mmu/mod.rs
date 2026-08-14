@@ -1472,7 +1472,23 @@ pub unsafe fn shatter_block_to_pages(l3_frame_addr: usize, block_entry: u64) {
 /// - `installed`: `true` if this call installed the PTE, `false` if the PTE was
 ///   already valid (another thread won the race).  When `false`, the caller's
 ///   data frame was NOT mapped and should be freed.
-pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> (Vec<PhysFrame>, bool) { unsafe {
+pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> (Vec<PhysFrame>, bool) {
+    unsafe { map_user_page_inner(va, pa, user_flags_val, true) }
+}
+
+/// The body behind [`map_user_page`] and [`map_user_page_no_flush`]. The two were
+/// 43 identical lines apart from one thing: whether the successful-install arm issues
+/// the per-page TLB invalidation.
+///
+/// `flush` is a literal at both call sites and this is `#[inline]` into two one-line
+/// wrappers, so the branch is constant-folded away in each.
+#[inline]
+unsafe fn map_user_page_inner(
+    va: usize,
+    pa: usize,
+    user_flags_val: u64,
+    flush: bool,
+) -> (Vec<PhysFrame>, bool) { unsafe {
     let _irq_guard = IrqGuard::new();
     let mut allocated_tables = Vec::new();
     let ttbr0: u64;
@@ -1509,14 +1525,16 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> (Vec<P
     let cas_result = pte_atomic.compare_exchange(existing, entry,
         core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire);
     if cas_result.is_ok() {
-        // All-ASID (`vaae1is`), for the reason spelled out on `flush_tlb_range`:
-        // `vale1is` takes its ASID from operand bits [63:48], which `va >> 12`
-        // leaves zero, so it never matched the non-zero ASID a user process
-        // actually runs under. Benign here (this arm only runs when the PTE was
-        // *invalid*, and a faulting translation may not be cached), but it must
-        // not look like it targets an ASID it cannot reach.
-        #[cfg(target_os = "none")]
-        { core::arch::asm!("dsb ishst", "tlbi vaae1is, {va}", "dsb ish", "isb", va = in(reg) va >> 12); }
+        if flush {
+            // All-ASID (`vaae1is`), for the reason spelled out on `flush_tlb_range`:
+            // `vale1is` takes its ASID from operand bits [63:48], which `va >> 12`
+            // leaves zero, so it never matched the non-zero ASID a user process
+            // actually runs under. Benign here (this arm only runs when the PTE was
+            // *invalid*, and a faulting translation may not be cached), but it must
+            // not look like it targets an ASID it cannot reach.
+            #[cfg(target_os = "none")]
+            { core::arch::asm!("dsb ishst", "tlbi vaae1is, {va}", "dsb ish", "isb", va = in(reg) va >> 12); }
+        }
         (allocated_tables, true)
     } else {
         // CAS failed: another path installed a page between our check and CAS.
@@ -1531,34 +1549,53 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> (Vec<P
 /// page isn't fully mapped. Serialize with the per-AS `as_lock` under shared-kernel SMP.
 pub fn update_current_user_page_flags(va: usize, new_flags: u64) {
     let _irq_guard = IrqGuard::new();
+    const PERM_MASK: u64 = flags::AP_RO_ALL | flags::AP_RW_ALL | flags::UXN | flags::PXN;
+    let Some(pte) = current_user_l3_pte(va) else { return };
+    unsafe {
+        let old_entry = pte.read_volatile();
+        // Unlike `remap_current_user_page`, this only *edits* permissions, so there
+        // has to be an entry to edit.
+        if old_entry & flags::VALID == 0 { return; }
+        pte.write_volatile((old_entry & !PERM_MASK) | new_flags);
+    }
+    flush_tlb_page(va);
+}
+
+/// Resolve `va`'s **L3 entry slot** in the current address space, creating nothing.
+///
+/// Returns `None` if any intermediate level is absent, or if the VA resolves through
+/// an L1/L2 block rather than a table — in which case there is no L3 slot to point at,
+/// and writing one would mean treating a block's output address as a table base.
+/// Both callers below edit page tables from the fault path with only a shared
+/// `&Process`, which is why they resolve the L0 from `TTBR0_EL1` rather than taking
+/// `&mut UserAddressSpace`; serialize with the per-AS `as_lock` under shared-kernel SMP.
+///
+/// The L3 entry itself is returned unvalidated: `remap_current_user_page` deliberately
+/// overwrites an invalid one, `update_current_user_page_flags` deliberately does not.
+fn current_user_l3_pte(va: usize) -> Option<*mut u64> {
+    const TABLE_PA: u64 = 0x0000_FFFF_FFFF_F000;
     let ttbr0: u64;
     #[cfg(target_os = "none")]
     { unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); } }
     #[cfg(not(target_os = "none"))]
     { ttbr0 = 0; }
-    let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
     let l0_idx = (va >> 39) & 0x1FF;
     let l1_idx = (va >> 30) & 0x1FF;
     let l2_idx = (va >> 21) & 0x1FF;
     let l3_idx = (va >> 12) & 0x1FF;
-    const PERM_MASK: u64 = flags::AP_RO_ALL | flags::AP_RW_ALL | flags::UXN | flags::PXN;
     unsafe {
-        let l0_ptr = phys_to_virt(l0_addr) as *mut u64;
+        let l0_ptr = phys_to_virt((ttbr0 & TABLE_PA) as usize) as *mut u64;
         let l0_entry = l0_ptr.add(l0_idx).read_volatile();
-        if l0_entry & flags::VALID == 0 { return; }
-        let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+        if l0_entry & flags::VALID == 0 { return None; }
+        let l1_ptr = phys_to_virt((l0_entry & TABLE_PA) as usize) as *mut u64;
         let l1_entry = l1_ptr.add(l1_idx).read_volatile();
-        if l1_entry & flags::VALID == 0 { return; }
-        let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
+        if l1_entry & flags::VALID == 0 || l1_entry & flags::TABLE == 0 { return None; }
+        let l2_ptr = phys_to_virt((l1_entry & TABLE_PA) as usize) as *mut u64;
         let l2_entry = l2_ptr.add(l2_idx).read_volatile();
-        if l2_entry & flags::VALID == 0 { return; }
-        let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-        let old_entry = l3_ptr.add(l3_idx).read_volatile();
-        if old_entry & flags::VALID == 0 { return; }
-        let entry = (old_entry & !PERM_MASK) | new_flags;
-        l3_ptr.add(l3_idx).write_volatile(entry);
+        if l2_entry & flags::VALID == 0 || l2_entry & flags::TABLE == 0 { return None; }
+        let l3_ptr = phys_to_virt((l2_entry & TABLE_PA) as usize) as *mut u64;
+        Some(l3_ptr.add(l3_idx))
     }
-    flush_tlb_page(va);
 }
 
 /// Overwrite the current address space's PTE for an ALREADY-MAPPED `va` with a new
@@ -1569,29 +1606,10 @@ pub fn update_current_user_page_flags(va: usize, new_flags: u64) {
 /// serialize with the per-AS `as_lock` under shared-kernel SMP.
 pub fn remap_current_user_page(va: usize, pa: usize, user_flags_val: u64) -> bool {
     let _irq_guard = IrqGuard::new();
-    let ttbr0: u64;
-    #[cfg(target_os = "none")]
-    { unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); } }
-    #[cfg(not(target_os = "none"))]
-    { ttbr0 = 0; }
-    let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
-    let l0_idx = (va >> 39) & 0x1FF;
-    let l1_idx = (va >> 30) & 0x1FF;
-    let l2_idx = (va >> 21) & 0x1FF;
-    let l3_idx = (va >> 12) & 0x1FF;
+    let Some(pte) = current_user_l3_pte(va) else { return false };
     unsafe {
-        let l0_ptr = phys_to_virt(l0_addr) as *mut u64;
-        let l0_entry = l0_ptr.add(l0_idx).read_volatile();
-        if l0_entry & flags::VALID == 0 { return false; }
-        let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-        let l1_entry = l1_ptr.add(l1_idx).read_volatile();
-        if l1_entry & flags::VALID == 0 || l1_entry & flags::TABLE == 0 { return false; }
-        let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-        let l2_entry = l2_ptr.add(l2_idx).read_volatile();
-        if l2_entry & flags::VALID == 0 || l2_entry & flags::TABLE == 0 { return false; }
-        let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
         let entry = (pa as u64) | flags::VALID | flags::TABLE | flags::AF | flags::NG | attr_index(MAIR_NORMAL_WB) | flags::SH_INNER | user_flags_val;
-        l3_ptr.add(l3_idx).write_volatile(entry);
+        pte.write_volatile(entry);
     }
     flush_tlb_page(va);
     true
@@ -1605,49 +1623,10 @@ pub fn remap_current_user_page(va: usize, pa: usize, user_flags_val: u64) -> boo
 ///
 /// The caller is responsible for issuing the TLB flush before the new
 /// mappings can be safely used by userspace.
-pub unsafe fn map_user_page_no_flush(va: usize, pa: usize, user_flags_val: u64) -> (Vec<PhysFrame>, bool) { unsafe {
-    let _irq_guard = IrqGuard::new();
-    let mut allocated_tables = Vec::new();
-    let ttbr0: u64;
-    #[cfg(target_os = "none")]
-    { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
-    #[cfg(not(target_os = "none"))]
-    { ttbr0 = 0; }
-    let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
-    let l0_idx = (va >> 39) & 0x1FF;
-    let l1_idx = (va >> 30) & 0x1FF;
-    let l2_idx = (va >> 21) & 0x1FF;
-    let l3_idx = (va >> 12) & 0x1FF;
-    let l0_ptr = phys_to_virt(l0_addr) as *mut u64;
-    let (l1_addr, l1_frame) = get_or_create_table_atomic(l0_ptr, l0_idx);
-    if let Some(frame) = l1_frame { allocated_tables.push(frame); }
-    let l1_ptr = phys_to_virt(l1_addr) as *mut u64;
-    let (l2_addr, l2_frame) = get_or_create_table_atomic(l1_ptr, l1_idx);
-    if let Some(frame) = l2_frame { allocated_tables.push(frame); }
-    let l2_ptr = phys_to_virt(l2_addr) as *mut u64;
-    let (l3_addr, l3_frame) = get_or_create_table_atomic(l2_ptr, l2_idx);
-    if let Some(frame) = l3_frame { allocated_tables.push(frame); }
-    let l3_ptr = phys_to_virt(l3_addr) as *mut u64;
-    let pte_atomic = &*((l3_ptr.add(l3_idx)) as *const core::sync::atomic::AtomicU64);
-    let existing = pte_atomic.load(core::sync::atomic::Ordering::Acquire);
-    if existing & flags::VALID != 0 {
-        let existing_pa = (existing & 0x0000_FFFF_FFFF_F000) as usize;
-        if existing_pa != pa {
-            log::debug!("[MMU] WARN: va=0x{:x} already mapped to pa=0x{:x}, wanted pa=0x{:x}",
-                va, existing_pa, pa);
-        }
-        return (allocated_tables, false);
-    }
-    let entry = (pa as u64) | flags::VALID | flags::TABLE | flags::AF | flags::NG | attr_index(MAIR_NORMAL_WB) | flags::SH_INNER | user_flags_val;
-    let cas_result = pte_atomic.compare_exchange(existing, entry,
-        core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire);
-    if cas_result.is_ok() {
-        // No TLB flush here — caller must call flush_tlb_range after mapping all pages.
-        (allocated_tables, true)
-    } else {
-        (allocated_tables, false)
-    }
-}}
+pub unsafe fn map_user_page_no_flush(va: usize, pa: usize, user_flags_val: u64) -> (Vec<PhysFrame>, bool) {
+    // No TLB flush — caller must call flush_tlb_range after mapping all pages.
+    unsafe { map_user_page_inner(va, pa, user_flags_val, false) }
+}
 
 /// Flush TLB entries for a contiguous range of virtual addresses.
 ///
@@ -1860,6 +1839,27 @@ pub fn get_current_ttbr0() -> usize {
 #[cfg(not(target_os = "none"))]
 pub fn get_current_ttbr0() -> usize { 0 }
 
+/// Is every page of `[va_start, va_start+len)` mapped **as user memory** in the
+/// current address space?
+///
+/// This is the page-table half of user-pointer validation
+/// ([`user_access::validate_user_range`]), and it tests EL0 accessibility rather
+/// than mere presence — which used to be a real hole.
+/// [`AddressSpace::add_kernel_mappings`] identity-maps kernel RAM as **EL1-only
+/// 2 MB blocks in every user address space**, so a kernel VA is present in TTBR0 and
+/// passed a presence test; the EL1-only permission then failed to stop anything,
+/// because the copy loop runs at EL1. All that kept it unreachable was the user VA
+/// allocator avoiding `[KERNEL_VA_START, kernel_va_end())` — a layout convention,
+/// not a check (docs/archive/USER_COPY_FOLD.md §7).
+///
+/// Testing AP rather than excluding a VA range is what makes this correct in the
+/// presence of the case that killed the range-exclusion attempt: Bun's JSC `mmap`s
+/// at `0x5000_0000`, which overlaps kernel RAM's identity window, and every such
+/// pointer is legitimate. Those are genuine user pages with `AP_RW_ALL`, so they
+/// pass; the kernel's own EL1-only blocks at the same addresses do not.
+///
+/// It also, correctly, now rejects a `PROT_NONE` page (`user_flags::NONE` is
+/// `AP_RO_EL1`) as a syscall buffer — Linux returns `EFAULT` there too.
 pub fn is_current_user_range_mapped(va_start: usize, len: usize) -> bool {
     let ttbr0 = get_current_ttbr0();
     if ttbr0 == 0 { return false; }
@@ -1869,11 +1869,13 @@ pub fn is_current_user_range_mapped(va_start: usize, len: usize) -> bool {
     let num_pages = (end_page - start_page) / PAGE_SIZE;
     let l0_ptr = phys_to_virt(l0_addr) as *const u64;
     for i in 0..num_pages {
-        if !is_page_mapped_ptr(l0_ptr, start_page + i * PAGE_SIZE) { return false; }
+        if !is_page_user_accessible_ptr(l0_ptr, start_page + i * PAGE_SIZE) { return false; }
     }
     true
 }
 
+/// Is anything mapped at `va` in the current address space? **Presence** — see
+/// [`is_page_mapped_ptr`] for why this one is not the AP-gated question.
 pub fn is_current_user_page_mapped(va: usize) -> bool {
     let ttbr0 = get_current_ttbr0();
     if ttbr0 == 0 { return false; }
@@ -1882,37 +1884,98 @@ pub fn is_current_user_page_mapped(va: usize) -> bool {
     is_page_mapped_ptr(l0_ptr, va & !(PAGE_SIZE - 1))
 }
 
-/// Translate a user VA to its physical address using the given L0 page table.
-/// Returns None if the page is not mapped.
-pub fn translate_user_va(l0_ptr: *const u64, va: usize) -> Option<usize> {
+/// The leaf descriptor a user VA resolves to, and the granule it was found at.
+///
+/// Three functions used to walk L0→L3 by hand to answer three different questions
+/// about that leaf — "what PA?" ([`translate_user_va`]), "what descriptor?"
+/// ([`user_pte_raw`]), "is anything there?" ([`is_page_mapped_ptr`]) — and each
+/// re-derived the same four indices, the same four `read_volatile`s and the same
+/// four validity tests, differing only in what they did on a block descriptor.
+/// [`resolve_user_leaf`] does the walk; the three keep their signatures and answer
+/// from this.
+#[derive(Clone, Copy)]
+pub struct UserLeaf {
+    /// The raw leaf descriptor.
+    pub entry: u64,
+    /// Selects the output address within [`Self::entry`] at this granule.
+    pa_mask: u64,
+    /// Selects the byte offset within the granule from the VA. `0xFFF` for an L3
+    /// page, wider for an L1 (1 GB) or L2 (2 MB) block.
+    offset_mask: usize,
+}
+
+impl UserLeaf {
+    /// `true` if this is a 4 KiB L3 page rather than an L1/L2 block descriptor.
+    ///
+    /// User VAs are always L3: [`map_user_page`] only ever writes L3 entries, and
+    /// [`get_or_create_table_atomic`] shatters any block it walks through. A block
+    /// leaf under a user VA therefore means a *kernel* mapping —
+    /// [`AddressSpace::add_kernel_mappings`] identity-maps kernel RAM as EL1-only
+    /// 2 MB blocks in every address space.
+    #[must_use]
+    pub fn is_page(self) -> bool {
+        self.offset_mask == 0xFFF
+    }
+
+    /// The physical address `va` translates to through this leaf.
+    #[must_use]
+    pub fn phys(self, va: usize) -> usize {
+        ((self.entry & self.pa_mask) as usize) | (va & self.offset_mask)
+    }
+
+    /// Whether **EL0** may access this mapping at all.
+    ///
+    /// AP is a two-bit field and bit 6 is the "EL0 gets the same access as EL1" bit:
+    /// `AP_RW_ALL` (0b01) and `AP_RO_ALL` (0b11) have it set, `AP_RW_EL1` (0b00) and
+    /// `AP_RO_EL1` (0b10) do not. So this is a test for *reachability from
+    /// userspace*, not for writability — a read-only user page passes, which it must,
+    /// because an EL1 write to one is how a CoW break gets triggered.
+    #[must_use]
+    pub fn user_accessible(self) -> bool {
+        self.entry & flags::AP_RW_ALL != 0
+    }
+}
+
+/// Walk `l0_ptr` for `va` and return whatever leaf it lands on — an L1 block, an L2
+/// block, or an L3 page — or `None` if any level is invalid.
+fn resolve_user_leaf(l0_ptr: *const u64, va: usize) -> Option<UserLeaf> {
+    const TABLE_PA: u64 = 0x0000_FFFF_FFFF_F000;
     let l0_idx = (va >> 39) & 0x1FF;
     let l1_idx = (va >> 30) & 0x1FF;
     let l2_idx = (va >> 21) & 0x1FF;
     let l3_idx = (va >> 12) & 0x1FF;
-    let offset = va & 0xFFF;
     unsafe {
         let l0_entry = l0_ptr.add(l0_idx).read_volatile();
         if l0_entry & flags::VALID == 0 { return None; }
-        let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l1_ptr = phys_to_virt((l0_entry & TABLE_PA) as usize) as *const u64;
         let l1_entry = l1_ptr.add(l1_idx).read_volatile();
         if l1_entry & flags::VALID == 0 { return None; }
         if l1_entry & flags::TABLE == 0 {
-            return Some(((l1_entry & 0x0000_FFFF_C000_0000) as usize) | (va & 0x3FFF_FFFF));
+            // 1 GB block.
+            return Some(UserLeaf { entry: l1_entry, pa_mask: 0x0000_FFFF_C000_0000, offset_mask: 0x3FFF_FFFF });
         }
-        let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l2_ptr = phys_to_virt((l1_entry & TABLE_PA) as usize) as *const u64;
         let l2_entry = l2_ptr.add(l2_idx).read_volatile();
         if l2_entry & flags::VALID == 0 { return None; }
         if l2_entry & flags::TABLE == 0 {
-            return Some(((l2_entry & 0x0000_FFFF_FFE0_0000) as usize) | (va & 0x1F_FFFF));
+            // 2 MB block.
+            return Some(UserLeaf { entry: l2_entry, pa_mask: 0x0000_FFFF_FFE0_0000, offset_mask: 0x1F_FFFF });
         }
-        let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l3_ptr = phys_to_virt((l2_entry & TABLE_PA) as usize) as *const u64;
         let l3_entry = l3_ptr.add(l3_idx).read_volatile();
         if l3_entry & flags::VALID == 0 { return None; }
-        Some(((l3_entry & 0x0000_FFFF_FFFF_F000) as usize) | offset)
+        Some(UserLeaf { entry: l3_entry, pa_mask: TABLE_PA, offset_mask: 0xFFF })
     }
 }
 
-/// The raw L3 descriptor for `va`, or `None` if any level is invalid.
+/// Translate a user VA to its physical address using the given L0 page table.
+/// Returns None if the page is not mapped.
+pub fn translate_user_va(l0_ptr: *const u64, va: usize) -> Option<usize> {
+    resolve_user_leaf(l0_ptr, va).map(|leaf| leaf.phys(va))
+}
+
+/// The raw L3 descriptor for `va`, or `None` if any level is invalid **or** the VA
+/// resolves through a block descriptor rather than an L3 page.
 ///
 /// [`translate_user_va`] masks the entry down to its physical address, which throws
 /// away the field an anomaly report most needs: the AP bits. "Write faulted on a
@@ -1922,24 +1985,9 @@ pub fn translate_user_va(l0_ptr: *const u64, va: usize) -> Option<usize> {
 /// on a user write and mean very different things. Returning the descriptor lets
 /// the caller name which one it is. See docs/archive/CARGO_HEAP_NULL_RC.md.
 pub fn user_pte_raw(l0_ptr: *const u64, va: usize) -> Option<u64> {
-    let l0_idx = (va >> 39) & 0x1FF;
-    let l1_idx = (va >> 30) & 0x1FF;
-    let l2_idx = (va >> 21) & 0x1FF;
-    let l3_idx = (va >> 12) & 0x1FF;
-    unsafe {
-        let l0_entry = l0_ptr.add(l0_idx).read_volatile();
-        if l0_entry & flags::VALID == 0 { return None; }
-        let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
-        let l1_entry = l1_ptr.add(l1_idx).read_volatile();
-        if l1_entry & flags::VALID == 0 || l1_entry & flags::TABLE == 0 { return None; }
-        let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
-        let l2_entry = l2_ptr.add(l2_idx).read_volatile();
-        if l2_entry & flags::VALID == 0 || l2_entry & flags::TABLE == 0 { return None; }
-        let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
-        let l3_entry = l3_ptr.add(l3_idx).read_volatile();
-        if l3_entry & flags::VALID == 0 { return None; }
-        Some(l3_entry)
-    }
+    resolve_user_leaf(l0_ptr, va)
+        .filter(|leaf| leaf.is_page())
+        .map(|leaf| leaf.entry)
 }
 
 /// Human-readable name for a PTE's access-permission field.
@@ -1952,6 +2000,83 @@ pub fn ap_name(pte: u64) -> &'static str {
     }
 }
 
+/// Visit every **mapped L3 entry** in `[va_start, va_start + pages*PAGE_SIZE)`,
+/// skipping unmapped L0 (512 GB), L1 (1 GB) and L2 (2 MB) regions wholesale rather
+/// than walking them page by page. Much faster than `translate_user_va` per page for
+/// sparse regions (e.g. Go heap arenas).
+///
+/// `f` receives `(page_va, entry, pte)` — the raw descriptor and a pointer to it, so
+/// a caller can rewrite it in place. Invalid entries are filtered out before `f` runs,
+/// and block descriptors are skipped entirely (user VAs never resolve through one —
+/// see [`UserLeaf::is_page`]).
+///
+/// This skeleton existed three times verbatim — the two `collect_mapped_pages_*`
+/// functions and [`demote_range_to_ro`] — differing only in the body of the innermost
+/// loop. Since one of the three *writes* PTEs in the fork/CoW path, three copies of
+/// the index arithmetic was the highest-consequence duplication left in this file
+/// (`docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §8 item 8, §5.6).
+///
+/// # Safety
+/// `l0_ptr` must be a valid L0 table for a live address space, and the tables it
+/// reaches must not be freed for the duration of the walk.
+unsafe fn for_each_mapped_user_pte(
+    l0_ptr: *const u64,
+    va_start: usize,
+    pages: usize,
+    mut f: impl FnMut(usize, u64, *mut u64),
+) { unsafe {
+    const TABLE_PA: u64 = 0x0000_FFFF_FFFF_F000;
+    if pages == 0 { return; }
+    let Some(va_end) = va_start.checked_add(pages.saturating_mul(PAGE_SIZE)) else { return };
+
+    // Walk at L2 granularity (2MB = 512 pages).
+    let mut va = va_start;
+    while va < va_end {
+        let l0_idx = (va >> 39) & 0x1FF;
+        let l1_idx = (va >> 30) & 0x1FF;
+        let l2_idx = (va >> 21) & 0x1FF;
+
+        let l0_entry = l0_ptr.add(l0_idx).read_volatile();
+        if l0_entry & flags::VALID == 0 {
+            // Skip entire L0 region (512GB) — clamp to va_end
+            va = ((va | 0x7F_FFFF_FFFF) + 1).min(va_end);
+            continue;
+        }
+        let l1_ptr = phys_to_virt((l0_entry & TABLE_PA) as usize) as *const u64;
+        let l1_entry = l1_ptr.add(l1_idx).read_volatile();
+        // Skip the entire L1 region (1GB) when it is unmapped, or when it is a 1GB
+        // block mapping — a block is never a user page.
+        if l1_entry & flags::VALID == 0 || l1_entry & flags::TABLE == 0 {
+            va = ((va | 0x3FFF_FFFF) + 1).min(va_end);
+            continue;
+        }
+        let l2_ptr = phys_to_virt((l1_entry & TABLE_PA) as usize) as *const u64;
+        let l2_entry = l2_ptr.add(l2_idx).read_volatile();
+        // Same, one level down: unmapped or a 2MB block, skip the whole 2MB.
+        if l2_entry & flags::VALID == 0 || l2_entry & flags::TABLE == 0 {
+            va = ((va | 0x1F_FFFF) + 1).min(va_end);
+            continue;
+        }
+        // Valid L3 table — scan pages within this 2MB range
+        let l3_ptr = phys_to_virt((l2_entry & TABLE_PA) as usize) as *mut u64;
+        let l3_start = (va >> 12) & 0x1FF;
+        let l2_range_end = ((va | 0x1F_FFFF) + 1).min(va_end);
+        let l3_end_idx = if l2_range_end == va_end {
+            ((va_end.wrapping_sub(1) >> 12) & 0x1FF) + 1
+        } else {
+            512
+        };
+        for l3_idx in l3_start..l3_end_idx {
+            let pte = l3_ptr.add(l3_idx);
+            let entry = pte.read_volatile();
+            if entry & flags::VALID != 0 {
+                f((va & !0x1F_FFFF) | (l3_idx << 12), entry, pte);
+            }
+        }
+        va = l2_range_end;
+    }
+}}
+
 /// Collect (va, pa) pairs for mapped pages in [va_start, va_start + pages*PAGE_SIZE),
 /// skipping empty L2 entries (2MB / 512 pages at a time).  Much faster than calling
 /// `translate_user_va` per page for sparse regions (e.g. Go heap arenas).
@@ -1961,74 +2086,12 @@ pub fn collect_mapped_pages_sparse(
     pages: usize,
 ) -> alloc::vec::Vec<(usize, usize)> {
     let mut result = alloc::vec::Vec::new();
-    if pages == 0 { return result; }
-    let va_end = match va_start.checked_add(pages.saturating_mul(PAGE_SIZE)) {
-        Some(e) => e,
-        None => return result,
-    };
-
-    // Walk at L2 granularity (2MB = 512 pages).
-    let mut va = va_start;
-    while va < va_end {
-        let l0_idx = (va >> 39) & 0x1FF;
-        let l1_idx = (va >> 30) & 0x1FF;
-        let l2_idx = (va >> 21) & 0x1FF;
-
-        unsafe {
-            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
-            if l0_entry & flags::VALID == 0 {
-                // Skip entire L0 region (512GB) — clamp to va_end
-                let next = (va | 0x7F_FFFF_FFFF) + 1;
-                va = next.min(va_end);
-                continue;
-            }
-            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
-            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
-            if l1_entry & flags::VALID == 0 {
-                // Skip entire L1 region (1GB) — clamp to va_end
-                let next = (va | 0x3FFF_FFFF) + 1;
-                va = next.min(va_end);
-                continue;
-            }
-            if l1_entry & flags::TABLE == 0 {
-                // 1GB block mapping — unlikely for user pages, skip
-                let next = (va | 0x3FFF_FFFF) + 1;
-                va = next.min(va_end);
-                continue;
-            }
-            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
-            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
-            if l2_entry & flags::VALID == 0 {
-                // Skip entire 2MB L2 region (512 pages)
-                let next = (va | 0x1F_FFFF) + 1;
-                va = next.min(va_end);
-                continue;
-            }
-            if l2_entry & flags::TABLE == 0 {
-                // 2MB block mapping — unlikely for user pages, skip
-                let next = (va | 0x1F_FFFF) + 1;
-                va = next.min(va_end);
-                continue;
-            }
-            // Valid L3 table — scan pages within this 2MB range
-            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
-            let l3_start = (va >> 12) & 0x1FF;
-            let l2_range_end = ((va | 0x1F_FFFF) + 1).min(va_end);
-            let l3_end_idx = if l2_range_end == va_end {
-                ((va_end.wrapping_sub(1) >> 12) & 0x1FF) + 1
-            } else {
-                512
-            };
-            for l3_idx in l3_start..l3_end_idx {
-                let l3_entry = l3_ptr.add(l3_idx).read_volatile();
-                if l3_entry & flags::VALID != 0 {
-                    let page_va = (va & !0x1F_FFFF) | (l3_idx << 12);
-                    let pa = ((l3_entry & 0x0000_FFFF_FFFF_F000) as usize) | (page_va & 0xFFF);
-                    result.push((page_va, pa));
-                }
-            }
-            va = l2_range_end;
-        }
+    // SAFETY: same contract this function has always had on `l0_ptr`; the callback
+    // only reads.
+    unsafe {
+        for_each_mapped_user_pte(l0_ptr, va_start, pages, |page_va, entry, _pte| {
+            result.push((page_va, ((entry & 0x0000_FFFF_FFFF_F000) as usize) | (page_va & 0xFFF)));
+        });
     }
     result
 }
@@ -2060,60 +2123,16 @@ pub fn collect_mapped_pages_with_flags_into(
     pages: usize,
     out: &mut alloc::vec::Vec<(usize, usize, u64)>,
 ) {
-    let result = out;
-    result.clear();
-    if pages == 0 { return; }
-    let va_end = match va_start.checked_add(pages.saturating_mul(PAGE_SIZE)) {
-        Some(e) => e,
-        None => return,
-    };
-    let mut va = va_start;
-    while va < va_end {
-        let l0_idx = (va >> 39) & 0x1FF;
-        let l1_idx = (va >> 30) & 0x1FF;
-        let l2_idx = (va >> 21) & 0x1FF;
-        unsafe {
-            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
-            if l0_entry & flags::VALID == 0 {
-                va = ((va | 0x7F_FFFF_FFFF) + 1).min(va_end); continue;
-            }
-            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
-            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
-            if l1_entry & flags::VALID == 0 {
-                va = ((va | 0x3FFF_FFFF) + 1).min(va_end); continue;
-            }
-            if l1_entry & flags::TABLE == 0 {
-                va = ((va | 0x3FFF_FFFF) + 1).min(va_end); continue;
-            }
-            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
-            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
-            if l2_entry & flags::VALID == 0 {
-                va = ((va | 0x1F_FFFF) + 1).min(va_end); continue;
-            }
-            if l2_entry & flags::TABLE == 0 {
-                va = ((va | 0x1F_FFFF) + 1).min(va_end); continue;
-            }
-            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
-            let l3_start = (va >> 12) & 0x1FF;
-            let l2_range_end = ((va | 0x1F_FFFF) + 1).min(va_end);
-            let l3_end_idx = if l2_range_end == va_end {
-                ((va_end.wrapping_sub(1) >> 12) & 0x1FF) + 1
-            } else {
-                512
-            };
-            for l3_idx in l3_start..l3_end_idx {
-                let l3_entry = l3_ptr.add(l3_idx).read_volatile();
-                if l3_entry & flags::VALID != 0 {
-                    let page_va = (va & !0x1F_FFFF) | (l3_idx << 12);
-                    let pa = (l3_entry & 0x0000_FFFF_FFFF_F000) as usize;
-                    // Extract only user-relevant permission bits (AP + UXN + PXN).
-                    // map_page() adds VALID/TABLE/AF/NG/attr_index/SH_INNER itself.
-                    let pte_flags = l3_entry & (flags::AP_RO_ALL | flags::UXN | flags::PXN);
-                    result.push((page_va, pa, pte_flags));
-                }
-            }
-            va = l2_range_end;
-        }
+    out.clear();
+    // SAFETY: same contract this function has always had on `l0_ptr`; the callback
+    // only reads.
+    unsafe {
+        for_each_mapped_user_pte(l0_ptr, va_start, pages, |page_va, entry, _pte| {
+            // Extract only user-relevant permission bits (AP + UXN + PXN).
+            // map_page() adds VALID/TABLE/AF/NG/attr_index/SH_INNER itself.
+            let pte_flags = entry & (flags::AP_RO_ALL | flags::UXN | flags::PXN);
+            out.push((page_va, (entry & 0x0000_FFFF_FFFF_F000) as usize, pte_flags));
+        });
     }
 }
 
@@ -2132,57 +2151,13 @@ pub fn collect_mapped_pages_with_flags_into(
 pub unsafe fn demote_range_to_ro(l0_ptr: *mut u64, va_start: usize, pages: usize) -> usize { unsafe {
     const AP_MASK: u64 = flags::AP_RO_ALL | flags::AP_RW_ALL; // bits [7:6]
     let mut demoted = 0usize;
-    if pages == 0 { return 0; }
-    let va_end = match va_start.checked_add(pages.saturating_mul(PAGE_SIZE)) {
-        Some(e) => e,
-        None => return 0,
-    };
-    let mut va = va_start;
-    while va < va_end {
-        let l0_idx = (va >> 39) & 0x1FF;
-        let l1_idx = (va >> 30) & 0x1FF;
-        let l2_idx = (va >> 21) & 0x1FF;
-        let l0_entry = l0_ptr.add(l0_idx).read_volatile();
-        if l0_entry & flags::VALID == 0 {
-            va = ((va | 0x7F_FFFF_FFFF) + 1).min(va_end); continue;
+    for_each_mapped_user_pte(l0_ptr, va_start, pages, |_page_va, entry, pte| {
+        if entry & AP_MASK == flags::AP_RW_ALL {
+            // Demote RW → RO: clear AP_RW_ALL, set AP_RO_ALL
+            pte.write_volatile((entry & !AP_MASK) | flags::AP_RO_ALL);
+            demoted += 1;
         }
-        let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-        let l1_entry = l1_ptr.add(l1_idx).read_volatile();
-        if l1_entry & flags::VALID == 0 {
-            va = ((va | 0x3FFF_FFFF) + 1).min(va_end); continue;
-        }
-        if l1_entry & flags::TABLE == 0 {
-            va = ((va | 0x3FFF_FFFF) + 1).min(va_end); continue;
-        }
-        let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-        let l2_entry = l2_ptr.add(l2_idx).read_volatile();
-        if l2_entry & flags::VALID == 0 {
-            va = ((va | 0x1F_FFFF) + 1).min(va_end); continue;
-        }
-        if l2_entry & flags::TABLE == 0 {
-            va = ((va | 0x1F_FFFF) + 1).min(va_end); continue;
-        }
-        let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-        let l3_start = (va >> 12) & 0x1FF;
-        let l2_range_end = ((va | 0x1F_FFFF) + 1).min(va_end);
-        let l3_end_idx = if l2_range_end == va_end {
-            ((va_end.wrapping_sub(1) >> 12) & 0x1FF) + 1
-        } else {
-            512
-        };
-        for l3_idx in l3_start..l3_end_idx {
-            let entry = l3_ptr.add(l3_idx).read_volatile();
-            if entry & flags::VALID == 0 { continue; }
-            let ap = entry & AP_MASK;
-            if ap == flags::AP_RW_ALL {
-                // Demote RW → RO: clear AP_RW_ALL, set AP_RO_ALL
-                let new_entry = (entry & !AP_MASK) | flags::AP_RO_ALL;
-                l3_ptr.add(l3_idx).write_volatile(new_entry);
-                demoted += 1;
-            }
-        }
-        va = l2_range_end;
-    }
+    });
     // Ensure all PTE writes are visible before returning. Under kernel_smp_shared,
     // the caller will issue flush_tlb_all() which includes DSB, but this DSB here
     // guarantees ordering even if the call pattern changes.
@@ -2191,26 +2166,23 @@ pub unsafe fn demote_range_to_ro(l0_ptr: *mut u64, va_start: usize, pages: usize
     demoted
 }}
 
+/// Is *anything* mapped at `va` — a page or a block, at any permission?
+///
+/// **Presence, deliberately.** Its callers are demand-paging and teardown paths
+/// asking "has this VA already been filled in", and a `PROT_NONE` guard page must
+/// read as present there or the next fault would re-map it read-write. The question
+/// a user *pointer* needs is the stricter [`is_page_user_accessible_ptr`].
 fn is_page_mapped_ptr(l0_ptr: *const u64, va: usize) -> bool {
-    let l0_idx = (va >> 39) & 0x1FF;
-    let l1_idx = (va >> 30) & 0x1FF;
-    let l2_idx = (va >> 21) & 0x1FF;
-    let l3_idx = (va >> 12) & 0x1FF;
-    unsafe {
-        let l0_entry = l0_ptr.add(l0_idx).read_volatile();
-        if l0_entry & flags::VALID == 0 { return false; }
-        let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
-        let l1_entry = l1_ptr.add(l1_idx).read_volatile();
-        if l1_entry & flags::VALID == 0 { return false; }
-        if l1_entry & flags::TABLE == 0 { return true; } 
-        let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
-        let l2_entry = l2_ptr.add(l2_idx).read_volatile();
-        if l2_entry & flags::VALID == 0 { return false; }
-        if l2_entry & flags::TABLE == 0 { return true; } 
-        let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
-        let l3_entry = l3_ptr.add(l3_idx).read_volatile();
-        l3_entry & flags::VALID != 0
-    }
+    resolve_user_leaf(l0_ptr, va).is_some()
+}
+
+/// Is `va` mapped **and reachable from EL0**?
+///
+/// The predicate a user pointer has to satisfy, and the one
+/// [`is_page_mapped_ptr`] is not. See [`UserLeaf::user_accessible`] for the AP
+/// encoding and [`is_current_user_range_mapped`] for the hole this closes.
+fn is_page_user_accessible_ptr(l0_ptr: *const u64, va: usize) -> bool {
+    resolve_user_leaf(l0_ptr, va).is_some_and(UserLeaf::user_accessible)
 }
 
 #[cfg(test)]

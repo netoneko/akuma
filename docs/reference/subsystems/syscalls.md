@@ -102,9 +102,18 @@ See [`../../runbooks/add-syscall-feature.md`](../../runbooks/add-syscall-feature
   - The raw `copy_{to,from}_user_safe` are the byte loop plus a fault trampoline and
     check **nothing**; the only deliberate caller left is `copy_from_user_byte`
     (NUL-terminated strings have no range to validate up front).
-  - Known limitation: the range check cannot tell a user page from a kernel page,
-    because kernel RAM is mapped EL1-only into every user address space and the
-    check tests presence only (`UNSAFE_AUDIT.md` §4.0a).
+  - **The range check tests the leaf PTE's AP bits, not mere presence** (since
+    2026-08-14). Kernel RAM is identity-mapped EL1-only into every user address
+    space, so a kernel VA *is* present in TTBR0 and used to pass — with nothing to
+    stop the copy, because the byte loop runs at EL1. `is_current_user_range_mapped`
+    now requires AP bit 6 (`AP_RW_ALL`/`AP_RO_ALL`), i.e. reachable from EL0. Two
+    consequences: a kernel VA as a syscall buffer returns `EFAULT`, and so does a
+    `PROT_NONE` page — as on Linux. A read-only user page still passes, deliberately:
+    an EL1 write to one is how a CoW break is triggered.
+    `archive/USER_COPY_FOLD.md` §7; boot test `kernel_va_rejected_as_user_pointer`.
+  - `is_current_user_**page**_mapped` is the other question — plain presence — and
+    stays that way: its callers are demand-paging and teardown paths asking "has
+    this VA been filled in yet", where a `PROT_NONE` guard must read as present.
 - **musl compatibility:** `archive/MUSL_COMPATIBILITY.md`. musl is the userspace
   libc; the kernel aims to run unmodified musl-linked binaries.
 - **`MAX_ARG_STRLEN`:** 128 KB release / 8 KB size / 4 KB extreme (`config.rs:147`). The Go forktest 128 KB fix is a notable regression guard.

@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "smoltcp")]
+use akuma_primitives::{GuardToggle, ToggledGuard};
 // Socket types/errnos are only used by the smoltcp socket ops below; the copyin/
 // copyout helpers are also used by the Tier-A bounce/socketpair paths and the
 // rump-only UnixSocket `sendmsg` variant, so they stay ungated.
@@ -52,53 +54,57 @@ pub fn net_bounce_size_plan(want: usize) -> [usize; 2] {
     [full, single_page]
 }
 
-/// RAII guard that runs a native (smoltcp) network syscall **without** the Big
-/// Kernel Lock — Phase 2 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md.
+/// The `no-bkl-network` carve-out (Phase 2 of
+/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), as a [`GuardToggle`] marker —
+/// the original of the five, and the template the other four were written from.
 ///
-/// Constructed at the top of each net syscall: `new()` DROPS the BKL so this core
-/// runs the syscall concurrently with peer cores, and `drop()` RE-ACQUIRES it on
-/// every return path. Correctness rests on the state these syscalls mutate already
-/// carrying its own fine-grained locks — the per-process fd table
-/// (`SharedFdTable`'s spinlocks), the socket descriptor table
-/// (`akuma_net::socket::SOCKET_TABLE`), and the network stack
+/// Correctness rests on the state these syscalls mutate already carrying its own
+/// fine-grained locks — the per-process fd table (`SharedFdTable`'s spinlocks), the
+/// socket descriptor table (`akuma_net::socket::SOCKET_TABLE`), and the network stack
 /// (`akuma_net::smoltcp_net::NETWORK`, held under a `PreemptGuard`) — so the BKL is
 /// redundant for them; dropping it lets non-network work on other cores proceed in
 /// parallel. Blocking waits (`accept`/`connect`/`recv`/DNS) hold none of the inner
 /// spinlocks across the wait, so two cores can block in network syscalls at once
 /// without wedging (unlike wrapping the whole syscall in one coarse lock).
 ///
-/// Re-acquiring on drop keeps the syscall wrapper's single `leave_kernel`
-/// (`rust_sync_el0_handler` in exceptions.rs) balanced. The pair goes through
-/// `bkl::dropped_window_open`/`close`, registering the window in the per-thread ledger
-/// so a nested IRQ, page fault, blocking wait, or context switch RESTORES the dropped
-/// state on resume instead of silently re-holding the BKL for the window's remainder
-/// (the `[BKL] stuck` conversion, docs/archive/BKL_VFS_CARVE_OUT.md §8 — net's blocking
-/// recv/accept windows were converted on every wake before the ledger existed).
-///
-/// Zero-cost no-op unless BOTH `kernel_smp_shared` and `kernel_no_bkl_network` are
-/// set — the struct is empty and `new`/`drop` compile to nothing, so default,
-/// `size`, `extreme`, and plain `smp-shared` builds are byte-for-byte unchanged.
+/// **The one with no runtime toggle.** [`enabled`](GuardToggle::enabled) is a
+/// constant `true`: this phase shipped before the A/B toggles existed and never grew
+/// one, so it is purely compile-time gated. The latching machinery costs it nothing —
+/// `COMPILED_IN && true` folds to `COMPILED_IN`.
 #[cfg(feature = "smoltcp")]
-pub(super) struct NetBklGuard;
+pub(super) struct NetBkl;
 
 #[cfg(feature = "smoltcp")]
-impl NetBklGuard {
+impl GuardToggle for NetBkl {
+    const COMPILED_IN: bool = cfg!(all(kernel_smp_shared, kernel_no_bkl_network));
     #[inline]
-    pub(super) fn new() -> Self {
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
-        akuma_exec::bkl::dropped_window_open();
-        Self
+    fn enabled() -> bool {
+        true
     }
-}
-
-#[cfg(feature = "smoltcp")]
-impl Drop for NetBklGuard {
     #[inline]
-    fn drop(&mut self) {
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+    fn enter() {
+        akuma_exec::bkl::dropped_window_open();
+    }
+    #[inline]
+    fn exit() {
         akuma_exec::bkl::dropped_window_close();
     }
 }
+
+/// RAII guard that runs a native (smoltcp) network syscall **without** the Big
+/// Kernel Lock.
+///
+/// Constructed at the top of each net syscall: `new()` DROPS the BKL so this core
+/// runs the syscall concurrently with peer cores, and `drop()` RE-ACQUIRES it on
+/// every return path, keeping the syscall wrapper's single `leave_kernel`
+/// (`rust_sync_el0_handler` in exceptions.rs) balanced. The pair registers the window
+/// in the per-thread ledger so a nested IRQ, page fault, blocking wait, or context
+/// switch RESTORES the dropped state on resume instead of silently re-holding the BKL
+/// for the window's remainder (the `[BKL] stuck` conversion,
+/// docs/archive/BKL_VFS_CARVE_OUT.md §8 — net's blocking recv/accept windows were
+/// converted on every wake before the ledger existed).
+#[cfg(feature = "smoltcp")]
+pub(super) type NetBklGuard = ToggledGuard<NetBkl>;
 
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {

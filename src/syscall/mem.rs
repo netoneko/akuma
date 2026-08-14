@@ -1,17 +1,12 @@
 use super::*;
+use akuma_primitives::{GuardToggle, ToggledGuard};
 use akuma_exec::process::MmapRegion;
 
-/// RAII guard that runs a memory-management syscall **without** the Big Kernel
-/// Lock — Phase 5 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md. Mirrors
-/// [`super::fs::VfsBklGuard`] exactly, including the latching discipline.
+/// The `no-bkl-mm` carve-out (Phase 5 of
+/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), as a [`GuardToggle`] marker.
 ///
-/// Constructed at the top of `sys_mprotect`/`sys_madvise`/`sys_munmap`/
-/// `sys_mremap`/`sys_mmap` (after early-error/arg-validation returns — an
-/// early `EINVAL` on a malformed length never touches the state this guard
-/// exists to protect, so it shouldn't pay for a drop+reacquire): `new()` DROPS
-/// the BKL so this core runs the syscall concurrently with peer cores, and
-/// `drop()` RE-ACQUIRES it on every return path. Correctness rests on the state
-/// these syscalls mutate already carrying its own fine-grained lock —
+/// Correctness rests on the state `sys_mprotect`/`sys_madvise`/`sys_munmap`/
+/// `sys_mremap`/`sys_mmap` mutate already carrying its own fine-grained lock —
 /// `Process::as_lock` (page-table PTE edits, via `Process::with_address_space`),
 /// `Process::vm_lock` (`mmap_regions` AND the mmap free-list, via
 /// `vm_with_regions`/`vm_alloc_mmap`/`vm_free_mmap`), `Process::lazy_regions`, PMM/
@@ -27,45 +22,39 @@ use akuma_exec::process::MmapRegion;
 /// already unconditional (not gated on being reachable from a dropped-BKL window
 /// the way `PreemptGuard` is, see BKL_VFS_CARVE_OUT.md §19.3), so there is no
 /// AB-BA nested-IRQ hazard analogous to the one that gate exists to close.
+pub(super) struct MmBkl;
+
+impl GuardToggle for MmBkl {
+    const COMPILED_IN: bool = cfg!(all(kernel_smp_shared, kernel_no_bkl_mm));
+    #[inline]
+    fn enabled() -> bool {
+        #[cfg(kernel_smp_shared)]
+        {
+            crate::smp_shared::mm_bkl_drop_enabled()
+        }
+        #[cfg(not(kernel_smp_shared))]
+        {
+            false
+        }
+    }
+    #[inline]
+    fn enter() {
+        akuma_exec::bkl::dropped_window_open();
+    }
+    #[inline]
+    fn exit() {
+        akuma_exec::bkl::dropped_window_close();
+    }
+}
+
+/// RAII guard that runs a memory-management syscall **without** the Big Kernel Lock.
 ///
-/// Zero-cost no-op unless BOTH `kernel_smp_shared` and `kernel_no_bkl_mm` are set
-/// (or the runtime toggle `mm_bkl_drop_enabled()` is off) — the struct is empty
-/// and `new`/`drop` compile to nothing.
-pub(super) struct MmBklGuard {
-    /// Whether `new()` actually dropped the BKL, **latched at construction** —
-    /// same reasoning as `VfsBklGuard::dropped_bkl`: `drop()` must not re-read
-    /// `mm_bkl_drop_enabled()`, since a toggle flip mid-syscall would otherwise
-    /// unbalance the syscall wrapper's single `leave_kernel`.
-    #[cfg(all(kernel_smp_shared, kernel_no_bkl_mm))]
-    dropped_bkl: bool,
-}
-
-impl MmBklGuard {
-    #[inline]
-    pub(super) fn new() -> Self {
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_mm))]
-        let dropped_bkl = crate::smp_shared::mm_bkl_drop_enabled();
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_mm))]
-        if dropped_bkl {
-            akuma_exec::bkl::dropped_window_open();
-        }
-        Self {
-            #[cfg(all(kernel_smp_shared, kernel_no_bkl_mm))]
-            dropped_bkl,
-        }
-    }
-}
-
-impl Drop for MmBklGuard {
-    #[inline]
-    fn drop(&mut self) {
-        // Latched in `new()` — deliberately NOT a fresh `mm_bkl_drop_enabled()` read.
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_mm))]
-        if self.dropped_bkl {
-            akuma_exec::bkl::dropped_window_close();
-        }
-    }
-}
+/// Constructed at the top of `sys_mprotect`/`sys_madvise`/`sys_munmap`/
+/// `sys_mremap`/`sys_mmap` — but **after** the early-error/arg-validation returns: an
+/// early `EINVAL` on a malformed length never touches the state this guard exists to
+/// protect, so it shouldn't pay for a drop+reacquire. See [`MmBkl`] for why dropping
+/// the lock there is safe.
+pub(super) type MmBklGuard = ToggledGuard<MmBkl>;
 
 // ── Linux mmap flag constants ────────────────────────────────────────────────
 //
